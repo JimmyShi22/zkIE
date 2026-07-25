@@ -1322,3 +1322,35 @@ exact code, discovered via real `cargo test` runs rather than guessed in advance
 
 Everything else matches the plan as written and compiled/passed on the first or second
 `cargo test` run per task.
+
+## Addendum (2026-07-26): critical soundness fix discovered during sub-project 2
+
+While building sub-project 2's `DivChip`, a subagent discovered that `RangeCheckChip::assign`
+witnesses its own copy of the value being range-checked in a fresh region — and none of
+`EltwiseAddChip`, `EltwiseMulChip`, `ReduceSumChip`, `ReduceMeanChip`, or `DotProductChip`
+ever tied that witnessed cell back to the cell used in their own arithmetic gates via
+`region.constrain_equal`. Confirmed exploitable with a direct `MockProver` probe: a proof
+whose range-check regions held a disconnected, all-zero decoy witness verified successfully
+alongside an unrelated, never-actually-checked value in the main gate.
+
+All five affected chips were fixed (commits `d25b2f8`, `34c2533`, `3c14c43`): the column
+holding a value that needs both to participate in a gate and to be range-checked now carries
+its signed-shifted representation directly in the main gate's region (gate polynomials
+adjusted to match), and the assigned cell is explicitly `region.constrain_equal`'d to
+`RangeCheckChip`'s returned cell. Each chip gained a regression test that calls
+`constrain_equal` with a deliberately mismatched decoy value and confirms the permutation
+argument rejects it — proving the link is real, not just syntactically present (a naive
+"assign a disconnected decoy and never call constrain_equal" test is not a meaningful probe,
+since it doesn't exercise the mechanism under test at all).
+
+`LookupChip` and `DivChip` were unaffected/already-fixed respectively: `LookupChip` doesn't
+use `RangeCheckChip` (the lookup argument itself is the check, evaluated on the same cells
+that are witnessed, so there's no cross-region disconnect possible), and `DivChip`'s own
+implementing agent found and fixed this independently before the pattern was recognized as
+crate-wide.
+
+**Lesson for future chip work**: any time a value must both feed a polynomial gate and be
+range-checked via `RangeCheckChip` (or any future composed sub-chip that witnesses its own
+copy of a value), the two cells must be tied together with `region.constrain_equal` —
+this is not optional plumbing, it is the difference between a real range check and a
+decorative one.
