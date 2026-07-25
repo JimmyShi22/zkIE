@@ -3,6 +3,9 @@ pub mod onnx {
     include!(concat!(env!("OUT_DIR"), "/onnx.rs"));
 }
 
+pub mod onnx_parser;
+pub mod op_mapper;
+
 #[cfg(test)]
 mod tests {
     use super::onnx::ModelProto;
