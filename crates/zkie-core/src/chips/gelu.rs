@@ -2,7 +2,7 @@ use crate::chips::lookup::{build_domain, LookupChip, LookupConfig, LookupError};
 use crate::field_convert::Fr;
 use crate::fixed_point::I18;
 use halo2_proofs::circuit::Layouter;
-use halo2_proofs::plonk::{Advice, Column, ConstraintSystem, ErrorFront};
+use halo2_proofs::plonk::{Advice, Column, ConstraintSystem, ErrorFront, Selector};
 
 /// Host-side (`f64`) approximation of the Gauss error function `erf(x)`,
 /// using Abramowitz & Stegun formula 7.1.26 (Handbook of Mathematical
@@ -75,6 +75,16 @@ impl GeluConfig {
     /// The advice column `GeluChip::assign` witnesses its output on.
     pub fn output_column(&self) -> Column<Advice> {
         self.output
+    }
+
+    /// The selector that gates the lookup argument (see `LookupConfig`'s
+    /// doc comment in `chips/lookup.rs`): callers that witness a row on
+    /// `input_column()`/`output_column()` directly (bypassing
+    /// `GeluChip::assign`) must enable this selector, or the lookup
+    /// argument silently collapses that row to the always-satisfied
+    /// padding entry instead of actually checking the witnessed values.
+    pub fn selector(&self) -> Selector {
+        self.lookup.selector
     }
 }
 
@@ -322,6 +332,12 @@ mod tests {
                 layouter.assign_region(
                     || "forged gelu lookup",
                     |mut region| {
+                        // Must enable the selector: the lookup is gated (see
+                        // `GeluConfig::selector`'s doc comment), so this
+                        // forged row would otherwise silently collapse to
+                        // the always-satisfied padding row instead of
+                        // actually checking the forged values below.
+                        gelu_config.selector().enable(&mut region, 0)?;
                         region.assign_advice(
                             || "input",
                             gelu_config.input_column(),
