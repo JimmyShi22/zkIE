@@ -53,7 +53,9 @@ impl Circuit<Fr> for AddCircuit {
         config: Self::Config,
         layouter: impl Layouter<Fr>,
     ) -> Result<(), ErrorFront> {
-        EltwiseAddChip::construct(config.add).assign(layouter, self.a, self.b)
+        EltwiseAddChip::construct(config.add)
+            .assign(layouter, self.a, self.b)
+            .map(|_| ())
     }
 }
 
@@ -95,7 +97,9 @@ impl Circuit<Fr> for MulCircuit {
         config: Self::Config,
         layouter: impl Layouter<Fr>,
     ) -> Result<(), ErrorFront> {
-        EltwiseMulChip::construct(config.mul).assign(layouter, self.a, self.b)
+        EltwiseMulChip::construct(config.mul)
+            .assign(layouter, self.a, self.b)
+            .map(|_| ())
     }
 }
 

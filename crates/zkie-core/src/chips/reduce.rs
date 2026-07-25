@@ -301,14 +301,25 @@ impl ReduceMeanChip {
 
     /// Assigns the running-sum region for `inputs`, then rescales the sum by
     /// the precomputed `1/k` reciprocal, range-checking the quotient (the
-    /// I18 mean) and remainder/slack. Returns the mean as an `I18`.
+    /// I18 mean) and remainder/slack. Returns the mean as an `I18`, the
+    /// `AssignedCell` holding the (signed-shifted) mean -- the same
+    /// representation `RangeCheckChip`/this chip's own rescale gate use, see
+    /// `chips/eltwise.rs`'s soundness note -- and the per-input
+    /// `AssignedCell`s (in `inputs` order) holding `ReduceSumChip`'s own
+    /// witnessed copies of each input, mirroring `ReduceSumChip::assign`'s
+    /// own return shape. Composing chips (e.g. `LayerNormChip`, which calls
+    /// this twice: once over raw inputs, once over squared deviations) must
+    /// `region.constrain_equal` these cells to any cell where they re-derive
+    /// or re-witness the same value, rather than leaving this chip's copies
+    /// disconnected from them.
+    #[allow(clippy::type_complexity)]
     pub fn assign(
         &self,
         mut layouter: impl Layouter<Fr>,
         inputs: &[I18],
-    ) -> Result<I18, ErrorFront> {
+    ) -> Result<(I18, AssignedCell<Fr, Fr>, Vec<AssignedCell<Fr, Fr>>), ErrorFront> {
         let sum_chip = ReduceSumChip::construct(self.config.sum.clone());
-        let (sum, sum_cell, _value_cells) =
+        let (sum, sum_cell, value_cells) =
             sum_chip.assign(layouter.namespace(|| "mean sum"), inputs)?;
 
         let (mean, r) =
@@ -377,7 +388,7 @@ impl ReduceMeanChip {
             },
         )?;
 
-        Ok(mean)
+        Ok((mean, q_cell, value_cells))
     }
 }
 

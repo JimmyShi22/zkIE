@@ -64,6 +64,10 @@ impl Circuit<Fr> for LayerNormCircuit {
         let bits = meta.advice_column();
         let rsqrt_input = meta.advice_column();
         let rsqrt_output = meta.advice_column();
+        let mean_link = meta.advice_column();
+        let neg_mean = meta.advice_column();
+        let unshift_in = meta.advice_column();
+        let unshift_out = meta.advice_column();
 
         LayerNormCircuitConfig {
             layer_norm: LayerNormChip::configure(
@@ -85,6 +89,10 @@ impl Circuit<Fr> for LayerNormCircuit {
                 bits,
                 rsqrt_input,
                 rsqrt_output,
+                mean_link,
+                neg_mean,
+                unshift_in,
+                unshift_out,
                 K_INPUTS,
                 EPSILON_MILLI,
                 RSQRT_DOMAIN_MIN,

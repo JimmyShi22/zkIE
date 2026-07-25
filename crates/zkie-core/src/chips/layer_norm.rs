@@ -49,22 +49,47 @@
 //! 7. `EltwiseMulChip` (the same instance used for squaring) computes each
 //!    `output_i = diff_i * rsqrt_value`.
 //!
-//! Because [`crate::chips::eltwise::EltwiseAddChip::assign`] and
-//! [`crate::chips::eltwise::EltwiseMulChip::assign`] only *witness and
-//! constrain* a region from host-supplied `I18` values (they don't hand back
-//! an `AssignedCell` for their output the way
-//! [`crate::chips::dot_general::DotProductChip::assign`] or
-//! [`crate::chips::reduce::ReduceMeanChip::assign`] do), this chip's `assign`
-//! must independently recompute each intermediate host-side value (`diff_i`,
-//! `sq_i`, `variance_plus_eps`, `output_i`) using *exactly* the same
-//! arithmetic those chips' own gates enforce (plain `i64` addition for sums,
-//! [`crate::fixed_point::requantize_mul`] for products) before feeding it
-//! into the next step. This mirrors the same pattern
-//! [`crate::chips::reduce::ReduceMeanChip::assign`] already uses internally
-//! (it recomputes `mean`/`r`/`slack` host-side with the identical formula its
-//! own gate checks, then witnesses those exact values) -- there is no gap
-//! here relative to the rest of the crate, just the same discipline applied
-//! one level up the composition.
+//! ## Soundness: linking cells across composed-chip boundaries
+//!
+//! [`crate::chips::eltwise::EltwiseAddChip::assign`] and
+//! [`crate::chips::eltwise::EltwiseMulChip::assign`] now return an
+//! `AssignedCell` for their output (mirroring
+//! [`crate::chips::dot_general::DotProductChip::assign`] and
+//! [`crate::chips::reduce::ReduceMeanChip::assign`]), and
+//! [`crate::chips::reduce::ReduceMeanChip::assign`] additionally returns the
+//! per-input `AssignedCell`s it re-witnesses internally. `LayerNormChip`'s
+//! own `assign` still independently recomputes each intermediate host-side
+//! value (`diff_i`, `sq_i`, `variance_plus_eps`, `output_i`), but critically
+//! it **also** ties every one of those recomputed values' cells back to the
+//! producing chip's real cell via `region.constrain_equal` -- exactly the
+//! same discipline [`crate::chips::softmax::SoftmaxChip`] applies one level
+//! down (see that module's docs), applied here one level up across five more
+//! composed chip calls. Two wrinkles specific to this chip, not present in
+//! `SoftmaxChip`:
+//!
+//! - `EltwiseAddChip`'s `a`/`b`/`c` columns all hold the *signed-shifted*
+//!   representation (`raw + 2^63`), while `EltwiseMulChip`'s `a`/`b` and
+//!   `crate::chips::lookup::LookupChip`'s `input`/`output` hold the
+//!   *unshifted* natural representation -- so a value produced in shifted
+//!   form (e.g. `diff_i`, out of `EltwiseAddChip`) needs a small dedicated
+//!   "unshift bridge" gadget (a linear gate `unshifted + 2^63 == shifted`)
+//!   before it can be tied into an unshifted consumer. See `assign_unshift`
+//!   below.
+//! - Computing `diff_i = x_i - mean` needs `-mean` as an operand, but
+//!   `mean`'s only produced cell holds the shifted `mean_raw + 2^63`; a
+//!   small dedicated "negation bridge" gate (`neg_mean_shift + mean_shift ==
+//!   2 * 2^63`) ties a freshly witnessed shifted `-mean` cell back to the
+//!   real mean cell. See the `s_neg_mean` gate below.
+//!
+//! Because `EltwiseAddChip::assign`/`EltwiseMulChip::assign` only expose
+//! their *output* cell (not their `a`/`b` input cells), the specific
+//! Add/Mul rows that need their *input* cells linked (the diff computation,
+//! the variance+epsilon computation, and both squaring/scaling
+//! multiplications) are assigned directly against `EltwiseAddConfig`'s and
+//! `EltwiseMulConfig`'s columns/selectors (`assign_add_row`/
+//! `assign_mul_row` below) rather than through `EltwiseAddChip::assign`/
+//! `EltwiseMulChip::assign` as black boxes -- mirroring the precedent
+//! `DotProductConfig` already set for this in `dot_general.rs`.
 //!
 //! ## CRITICAL NUMERIC LIMITATION -- I18's representable range
 //!
@@ -135,11 +160,13 @@
 
 use crate::chips::eltwise::{EltwiseAddChip, EltwiseAddConfig, EltwiseMulChip, EltwiseMulConfig};
 use crate::chips::lookup::{build_domain, LookupChip, LookupConfig, LookupError};
+use crate::chips::range_check::RangeCheckChip;
 use crate::chips::reduce::{ReduceMeanChip, ReduceMeanConfig};
-use crate::field_convert::Fr;
-use crate::fixed_point::{requantize_mul, I18};
-use halo2_proofs::circuit::Layouter;
-use halo2_proofs::plonk::{Advice, Column, ConstraintSystem, ErrorFront, Selector};
+use crate::field_convert::{i128_to_fr, i64_to_fr, shifted_i64_witness, Fr, SIGNED_SHIFT};
+use crate::fixed_point::{requantize_mul, I18, SCALE_18};
+use halo2_proofs::circuit::{AssignedCell, Layouter, Value};
+use halo2_proofs::plonk::{Advice, Column, ConstraintSystem, ErrorFront, Expression, Selector};
+use halo2_proofs::poly::Rotation;
 use std::fmt;
 
 /// Host-side (`f64`) `rsqrt(x) = 1 / sqrt(x)`, used only to *generate* the
@@ -303,6 +330,24 @@ pub struct LayerNormConfig {
     rsqrt_domain_min: f64,
     rsqrt_domain_max: f64,
     rsqrt_domain_n: usize,
+    // "Negation bridge": ties a freshly witnessed shifted `-mean` cell
+    // (`neg_mean`) back to `ReduceMeanChip`'s own returned (shifted) mean
+    // cell (copied into `mean_link` for the gate below) via
+    // `neg_mean + mean_link == 2 * SIGNED_SHIFT` -- see this module's
+    // top-level soundness docs.
+    mean_link: Column<Advice>,
+    neg_mean: Column<Advice>,
+    s_neg_mean: Selector,
+    // "Unshift bridge": ties a value produced in `EltwiseAddChip`'s
+    // signed-shifted representation (`unshift_in`) to a fresh unshifted
+    // copy (`unshift_out`) via `unshift_out + SIGNED_SHIFT == unshift_in`,
+    // so it can be linked into an `EltwiseMulChip`/`LookupChip` consumer,
+    // whose columns hold the unshifted representation. Reused (like
+    // `RangeCheckChip`'s columns) across every value that needs this
+    // bridge, each in its own small region.
+    unshift_in: Column<Advice>,
+    unshift_out: Column<Advice>,
+    s_unshift: Selector,
 }
 
 pub struct LayerNormChip {
@@ -340,6 +385,10 @@ impl LayerNormChip {
         bits: Column<Advice>,
         rsqrt_input: Column<Advice>,
         rsqrt_output: Column<Advice>,
+        mean_link: Column<Advice>,
+        neg_mean: Column<Advice>,
+        unshift_in: Column<Advice>,
+        unshift_out: Column<Advice>,
         k: usize,
         epsilon_milli: u64,
         rsqrt_domain_min: f64,
@@ -363,6 +412,37 @@ impl LayerNormChip {
         let epsilon = I18::from_f64(epsilon_milli as f64 / 1000.0)
             .expect("epsilon_milli / 1000 must be representable as an I18 fixed-point value");
 
+        meta.enable_equality(mean_link);
+        meta.enable_equality(neg_mean);
+        meta.enable_equality(unshift_in);
+        meta.enable_equality(unshift_out);
+
+        // See this module's top-level soundness docs: neg_mean_shift +
+        // mean_shift == 2 * SIGNED_SHIFT, i.e. neg_mean_shift ==
+        // 2*SIGNED_SHIFT - mean_shift == SIGNED_SHIFT - mean_raw ==
+        // (-mean_raw) + SIGNED_SHIFT, the shifted representation of -mean.
+        let s_neg_mean = meta.selector();
+        meta.create_gate("layer norm mean negation bridge", |meta| {
+            let mean_link_expr = meta.query_advice(mean_link, Rotation::cur());
+            let neg_mean_expr = meta.query_advice(neg_mean, Rotation::cur());
+            let s_neg_mean = meta.query_selector(s_neg_mean);
+            let two_shift = Expression::Constant(i128_to_fr(2 * SIGNED_SHIFT));
+            vec![s_neg_mean * (mean_link_expr + neg_mean_expr - two_shift)]
+        });
+
+        // unshifted_out == shifted_in - SIGNED_SHIFT, i.e. unshifted_out +
+        // SIGNED_SHIFT == shifted_in. Reused across every value produced in
+        // `EltwiseAddChip`'s shifted representation that needs bridging into
+        // an unshifted consumer (see this module's top-level docs).
+        let s_unshift = meta.selector();
+        meta.create_gate("layer norm unshift bridge", |meta| {
+            let shifted_expr = meta.query_advice(unshift_in, Rotation::cur());
+            let unshifted_expr = meta.query_advice(unshift_out, Rotation::cur());
+            let s_unshift = meta.query_selector(s_unshift);
+            let shift = Expression::Constant(i128_to_fr(SIGNED_SHIFT));
+            vec![s_unshift * (unshifted_expr + shift - shifted_expr)]
+        });
+
         LayerNormConfig {
             reduce_mean,
             add,
@@ -373,6 +453,12 @@ impl LayerNormChip {
             rsqrt_domain_min,
             rsqrt_domain_max,
             rsqrt_domain_n,
+            mean_link,
+            neg_mean,
+            s_neg_mean,
+            unshift_in,
+            unshift_out,
+            s_unshift,
         }
     }
 
@@ -397,9 +483,12 @@ impl LayerNormChip {
     /// Assigns the full layer-norm pipeline for `inputs` (must have length
     /// `k`, the count fixed at `configure` time) and returns the
     /// length-`k` normalized output vector. See the module-level docs for
-    /// the exact sequence of composed sub-chip calls and why each
-    /// intermediate value is independently recomputed host-side (matching
-    /// the sub-chips' own gate arithmetic exactly) between calls.
+    /// the exact sequence of composed sub-chip calls, and for why every
+    /// intermediate value that crosses a chip boundary is both
+    /// independently recomputed host-side (matching the sub-chips' own gate
+    /// arithmetic exactly) *and* tied back to the producing chip's real
+    /// cell via `region.constrain_equal` (using a shift/negation "bridge"
+    /// gadget where the two chips' columns hold different representations).
     pub fn assign(
         &self,
         mut layouter: impl Layouter<Fr>,
@@ -414,55 +503,163 @@ impl LayerNormChip {
         }
 
         let mean_chip = ReduceMeanChip::construct(self.config.reduce_mean.clone());
-        let add_chip = EltwiseAddChip::construct(self.config.add.clone());
-        let mul_chip = EltwiseMulChip::construct(self.config.mul.clone());
 
-        // Step 1: mean = (1/k) * sum_i x_i.
-        let mean = mean_chip.assign(layouter.namespace(|| "layer norm mean"), inputs)?;
+        // Step 1: mean = (1/k) * sum_i x_i. `mean_cell` holds the *signed-
+        // shifted* representation (mean.raw() + SIGNED_SHIFT) -- the same
+        // representation `ReduceMeanChip`'s own rescale gate/range check
+        // use -- and `mean_input_cells[i]` are `ReduceSumChip`'s own
+        // (unshifted) re-witnessed copies of each `inputs[i]`.
+        let (mean, mean_cell, mean_input_cells) =
+            mean_chip.assign(layouter.namespace(|| "layer norm mean"), inputs)?;
 
-        // Step 2: diff_i = x_i - mean = x_i + (-mean), for each i. `assign`
-        // only witnesses/constrains the region -- it does not hand back the
-        // sum -- so `diff_i` is independently recomputed here with the
-        // exact same `checked_add` arithmetic `EltwiseAddChip::assign` uses
-        // internally, guaranteeing this value matches what the gate
-        // enforces.
+        // Negation bridge: prove `neg_mean` (shifted) is genuinely `-mean`,
+        // tied to the real `mean_cell` above via the `s_neg_mean` gate +
+        // constrain_equal, rather than host-recomputing `-mean.raw()` and
+        // re-witnessing it disconnected from the real mean.
         let neg_mean = I18::from_raw(-mean.raw());
+        let (mean_shift_fr, _) = shifted_i64_witness(mean.raw());
+        let (neg_mean_shift_fr, _) = shifted_i64_witness(neg_mean.raw());
+        let (mean_link_cell, neg_mean_cell) = layouter.assign_region(
+            || "layer norm mean negation bridge",
+            |mut region| {
+                self.config.s_neg_mean.enable(&mut region, 0)?;
+                let mean_link_cell = region.assign_advice(
+                    || "mean link",
+                    self.config.mean_link,
+                    0,
+                    || mean_shift_fr,
+                )?;
+                let neg_mean_cell = region.assign_advice(
+                    || "neg mean",
+                    self.config.neg_mean,
+                    0,
+                    || neg_mean_shift_fr,
+                )?;
+                Ok((mean_link_cell, neg_mean_cell))
+            },
+        )?;
+        layouter.assign_region(
+            || "layer norm mean negation bridge link",
+            |mut region| region.constrain_equal(mean_link_cell.cell(), mean_cell.cell()),
+        )?;
+
+        // Step 2: diff_i = x_i - mean = x_i + neg_mean, for each i.
+        // Reimplements `EltwiseAddChip::assign`'s internal region directly
+        // (via `assign_add_row`) so this call site can capture the `a`/`b`
+        // operand cells and tie `a` back to `x_i`'s own `ReduceSumChip`
+        // witness (via an unshift bridge) and `b` back to `neg_mean_cell`
+        // above.
         let mut diffs = Vec::with_capacity(k);
+        let mut diff_cells = Vec::with_capacity(k);
         for (i, x) in inputs.iter().enumerate() {
-            add_chip.assign(
+            let (a_cell, b_cell, c_cell) = assign_add_row(
+                &self.config.add,
                 layouter.namespace(|| format!("layer norm diff {i}")),
-                *x,
-                neg_mean,
+                x.raw(),
+                neg_mean.raw(),
             )?;
+
+            let x_unshifted_cell = assign_unshift(
+                &self.config,
+                layouter.namespace(|| format!("layer norm diff {i} input unshift")),
+                &a_cell,
+                x.raw(),
+            )?;
+
+            layouter.assign_region(
+                || format!("layer norm diff {i} links"),
+                |mut region| {
+                    region.constrain_equal(x_unshifted_cell.cell(), mean_input_cells[i].cell())?;
+                    region.constrain_equal(b_cell.cell(), neg_mean_cell.cell())?;
+                    Ok(())
+                },
+            )?;
+
             let diff_raw = x
                 .raw()
                 .checked_add(neg_mean.raw())
                 .expect("I18 layer norm diff overflow");
             diffs.push(I18::from_raw(diff_raw));
+            diff_cells.push(c_cell);
         }
 
-        // Step 3: sq_i = diff_i^2, for each i.
+        // Step 3: sq_i = diff_i^2, for each i. Reimplements
+        // `EltwiseMulChip::assign`'s internal region directly (via
+        // `assign_mul_row`) so both the `a` and `b` operand cells can be
+        // linked back to `diff_i`'s real (shifted) `c_cell` above -- via an
+        // unshift bridge, since `EltwiseAddChip`'s `c` column holds the
+        // shifted representation while `EltwiseMulChip`'s `a`/`b` hold the
+        // unshifted one.
         let mut squares = Vec::with_capacity(k);
+        let mut square_cells = Vec::with_capacity(k);
+        let mut diff_unshifted_cells = Vec::with_capacity(k);
         for (i, diff) in diffs.iter().enumerate() {
-            mul_chip.assign(
+            let diff_unshifted_cell = assign_unshift(
+                &self.config,
+                layouter.namespace(|| format!("layer norm diff {i} unshift")),
+                &diff_cells[i],
+                diff.raw(),
+            )?;
+
+            let (mul_a_cell, mul_b_cell, sq_cell) = assign_mul_row(
+                &self.config.mul,
                 layouter.namespace(|| format!("layer norm square {i}")),
                 *diff,
                 *diff,
             )?;
+            layouter.assign_region(
+                || format!("layer norm square {i} diff links"),
+                |mut region| {
+                    region.constrain_equal(mul_a_cell.cell(), diff_unshifted_cell.cell())?;
+                    region.constrain_equal(mul_b_cell.cell(), diff_unshifted_cell.cell())?;
+                    Ok(())
+                },
+            )?;
+
             let (sq, _) = requantize_mul(*diff, *diff).expect("I18 layer norm square overflow");
             squares.push(sq);
+            square_cells.push(sq_cell);
+            diff_unshifted_cells.push(diff_unshifted_cell);
         }
 
         // Step 4: variance = (1/k) * sum_i sq_i (same `mean_chip` instance,
         // reused: mean of k values is mean of k values, whether they're the
-        // raw inputs or their squared deviations).
-        let variance = mean_chip.assign(layouter.namespace(|| "layer norm variance"), &squares)?;
+        // raw inputs or their squared deviations). `sq_input_cells[i]` are
+        // `ReduceSumChip`'s own re-witnessed (unshifted) copies of `sq_i`
+        // inside this second mean call -- link each back to the real
+        // (shifted) `square_cells[i]` via an unshift bridge.
+        let (variance, variance_cell, sq_input_cells) =
+            mean_chip.assign(layouter.namespace(|| "layer norm variance"), &squares)?;
+        for (i, sq) in squares.iter().enumerate() {
+            let sq_unshifted_cell = assign_unshift(
+                &self.config,
+                layouter.namespace(|| format!("layer norm square {i} unshift")),
+                &square_cells[i],
+                sq.raw(),
+            )?;
+            layouter.assign_region(
+                || format!("layer norm variance input {i} link"),
+                |mut region| {
+                    region.constrain_equal(sq_unshifted_cell.cell(), sq_input_cells[i].cell())
+                },
+            )?;
+        }
 
-        // Step 5: variance_plus_eps = variance + epsilon.
-        add_chip.assign(
+        // Step 5: variance_plus_eps = variance + epsilon. `variance_cell`
+        // (the shifted mean cell `ReduceMeanChip` returned above) is tied
+        // directly into this Add row's `a` operand -- both hold the shifted
+        // representation, so no bridge is needed. `epsilon` is a
+        // compile-time constant, so its `b` operand needs no producer-cell
+        // link.
+        let (vpe_a_cell, _vpe_b_cell, vpe_cell) = assign_add_row(
+            &self.config.add,
             layouter.namespace(|| "layer norm variance plus epsilon"),
-            variance,
-            self.config.epsilon,
+            variance.raw(),
+            self.config.epsilon.raw(),
+        )?;
+        layouter.assign_region(
+            || "layer norm variance plus epsilon link",
+            |mut region| region.constrain_equal(vpe_a_cell.cell(), variance_cell.cell()),
         )?;
         let variance_plus_eps_raw = variance
             .raw()
@@ -471,21 +668,70 @@ impl LayerNormChip {
         let variance_plus_eps = I18::from_raw(variance_plus_eps_raw);
 
         // Step 6: rsqrt_value = rsqrt(variance_plus_eps), via the lookup
-        // argument.
+        // argument. The `rsqrt_chip.assign` call recovers the correct I18
+        // value (with a typed error for off-domain inputs); a second,
+        // explicitly linked row on the same lookup columns re-checks the
+        // pair and ties `variance_plus_eps`'s real cell (via an unshift
+        // bridge from `vpe_cell`) into the lookup argument's input.
         let rsqrt_value = self
             .rsqrt_chip
             .assign(layouter.namespace(|| "layer norm rsqrt"), variance_plus_eps)
             .map_err(LayerNormError::Rsqrt)?;
 
+        let vpe_unshifted_cell = assign_unshift(
+            &self.config,
+            layouter.namespace(|| "layer norm variance plus epsilon unshift"),
+            &vpe_cell,
+            variance_plus_eps.raw(),
+        )?;
+
+        let rsqrt_config = self.config.rsqrt.clone();
+        let (rsqrt_input_cell, rsqrt_output_cell) = layouter.assign_region(
+            || "layer norm rsqrt link row",
+            |mut region| {
+                rsqrt_config.selector().enable(&mut region, 0)?;
+                let input_cell = region.assign_advice(
+                    || "rsqrt input",
+                    rsqrt_config.input_column(),
+                    0,
+                    || Value::known(i64_to_fr(variance_plus_eps.raw())),
+                )?;
+                let output_cell = region.assign_advice(
+                    || "rsqrt output",
+                    rsqrt_config.output_column(),
+                    0,
+                    || Value::known(i64_to_fr(rsqrt_value.raw())),
+                )?;
+                Ok((input_cell, output_cell))
+            },
+        )?;
+        layouter.assign_region(
+            || "layer norm rsqrt input link",
+            |mut region| region.constrain_equal(rsqrt_input_cell.cell(), vpe_unshifted_cell.cell()),
+        )?;
+
         // Step 7: output_i = diff_i * rsqrt_value, for each i (same
-        // `mul_chip` instance, reused from the squaring step).
+        // Mul-row shape as the squaring step, reused). `diff_i`'s unshifted
+        // cell is reused from step 3; `rsqrt_value`'s cell comes straight
+        // from the lookup output above (both already unshifted, so no
+        // bridge is needed for either operand here).
         let mut outputs = Vec::with_capacity(k);
         for (i, diff) in diffs.iter().enumerate() {
-            mul_chip.assign(
+            let (out_a_cell, out_b_cell, _out_cell) = assign_mul_row(
+                &self.config.mul,
                 layouter.namespace(|| format!("layer norm scale {i}")),
                 *diff,
                 rsqrt_value,
             )?;
+            layouter.assign_region(
+                || format!("layer norm scale {i} links"),
+                |mut region| {
+                    region.constrain_equal(out_a_cell.cell(), diff_unshifted_cells[i].cell())?;
+                    region.constrain_equal(out_b_cell.cell(), rsqrt_output_cell.cell())?;
+                    Ok(())
+                },
+            )?;
+
             let (out, _) =
                 requantize_mul(*diff, rsqrt_value).expect("I18 layer norm output overflow");
             outputs.push(out);
@@ -493,6 +739,180 @@ impl LayerNormChip {
 
         Ok(outputs)
     }
+}
+
+/// Reimplements `EltwiseAddChip::assign`'s internal region + range-check +
+/// link logic directly against a shared `EltwiseAddConfig`, but -- unlike
+/// `EltwiseAddChip::assign` itself, which only exposes its output cell --
+/// also returns the `a`/`b` operand cells, so `LayerNormChip::assign` can
+/// tie each operand to whichever other chip's cell produced it (see this
+/// module's top-level soundness docs). Mirrors `DotProductConfig`'s
+/// already-established precedent (in `dot_general.rs`) for composed chips
+/// reaching into a shared sub-chip's raw columns/selector.
+#[allow(clippy::type_complexity)]
+fn assign_add_row(
+    add: &EltwiseAddConfig,
+    mut layouter: impl Layouter<Fr>,
+    a_raw: i64,
+    b_raw: i64,
+) -> Result<
+    (
+        AssignedCell<Fr, Fr>,
+        AssignedCell<Fr, Fr>,
+        AssignedCell<Fr, Fr>,
+    ),
+    ErrorFront,
+> {
+    let c_raw = a_raw
+        .checked_add(b_raw)
+        .expect("I18 layer norm add overflow");
+    let (a_shift_fr, a_shift_raw) = shifted_i64_witness(a_raw);
+    let (b_shift_fr, b_shift_raw) = shifted_i64_witness(b_raw);
+    let (c_shift_fr, c_shift_raw) = shifted_i64_witness(c_raw);
+
+    let (a_cell, b_cell, c_cell) = layouter.assign_region(
+        || "layer norm add row",
+        |mut region| {
+            add.s_add.enable(&mut region, 0)?;
+            let a_cell = region.assign_advice(|| "a", add.a, 0, || a_shift_fr)?;
+            let b_cell = region.assign_advice(|| "b", add.b, 0, || b_shift_fr)?;
+            let c_cell = region.assign_advice(|| "c", add.c, 0, || c_shift_fr)?;
+            Ok((a_cell, b_cell, c_cell))
+        },
+    )?;
+
+    let range_a_chip = RangeCheckChip::construct(add.range_a.clone());
+    let a_range_cell =
+        range_a_chip.assign(layouter.namespace(|| "range a"), a_shift_fr, a_shift_raw)?;
+    let range_b_chip = RangeCheckChip::construct(add.range_b.clone());
+    let b_range_cell =
+        range_b_chip.assign(layouter.namespace(|| "range b"), b_shift_fr, b_shift_raw)?;
+    let range_c_chip = RangeCheckChip::construct(add.range_c.clone());
+    let c_range_cell =
+        range_c_chip.assign(layouter.namespace(|| "range c"), c_shift_fr, c_shift_raw)?;
+
+    layouter.assign_region(
+        || "layer norm add row range check links",
+        |mut region| {
+            region.constrain_equal(a_cell.cell(), a_range_cell.cell())?;
+            region.constrain_equal(b_cell.cell(), b_range_cell.cell())?;
+            region.constrain_equal(c_cell.cell(), c_range_cell.cell())?;
+            Ok(())
+        },
+    )?;
+
+    Ok((a_cell, b_cell, c_cell))
+}
+
+/// Reimplements `EltwiseMulChip::assign`'s internal region + range-check +
+/// link logic directly against a shared `EltwiseMulConfig`, but -- unlike
+/// `EltwiseMulChip::assign` itself, which only exposes its output cell --
+/// also returns the `a`/`b` operand cells, so `LayerNormChip::assign` can
+/// tie each operand to whichever other chip's cell produced it. See
+/// `assign_add_row`'s doc comment for the same reasoning.
+#[allow(clippy::type_complexity)]
+fn assign_mul_row(
+    mul: &EltwiseMulConfig,
+    mut layouter: impl Layouter<Fr>,
+    a_val: I18,
+    b_val: I18,
+) -> Result<
+    (
+        AssignedCell<Fr, Fr>,
+        AssignedCell<Fr, Fr>,
+        AssignedCell<Fr, Fr>,
+    ),
+    ErrorFront,
+> {
+    let (q, r) = requantize_mul(a_val, b_val).expect("I18 layer norm mul overflow");
+    let slack = SCALE_18 - 1 - r;
+    let (q_shift_fr, q_shift_raw) = shifted_i64_witness(q.raw());
+
+    let (a_cell, b_cell, q_cell, r_cell, slack_cell) = layouter.assign_region(
+        || "layer norm mul row",
+        |mut region| {
+            mul.s_mul.enable(&mut region, 0)?;
+            mul.s_slack.enable(&mut region, 0)?;
+            let a_cell =
+                region.assign_advice(|| "a", mul.a, 0, || Value::known(i64_to_fr(a_val.raw())))?;
+            let b_cell =
+                region.assign_advice(|| "b", mul.b, 0, || Value::known(i64_to_fr(b_val.raw())))?;
+            let q_cell = region.assign_advice(|| "q", mul.q, 0, || q_shift_fr)?;
+            let r_cell = region.assign_advice(|| "r", mul.r, 0, || Value::known(i128_to_fr(r)))?;
+            let slack_cell = region.assign_advice(
+                || "slack",
+                mul.slack,
+                0,
+                || Value::known(i128_to_fr(slack)),
+            )?;
+            Ok((a_cell, b_cell, q_cell, r_cell, slack_cell))
+        },
+    )?;
+
+    let range_q_chip = RangeCheckChip::construct(mul.range_q.clone());
+    let q_range_cell =
+        range_q_chip.assign(layouter.namespace(|| "range q"), q_shift_fr, q_shift_raw)?;
+    let range_r_chip = RangeCheckChip::construct(mul.range_r.clone());
+    let r_range_cell = range_r_chip.assign(
+        layouter.namespace(|| "range r"),
+        Value::known(i128_to_fr(r)),
+        Value::known(r),
+    )?;
+    let range_r_slack_chip = RangeCheckChip::construct(mul.range_r_slack.clone());
+    let slack_range_cell = range_r_slack_chip.assign(
+        layouter.namespace(|| "range r slack"),
+        Value::known(i128_to_fr(slack)),
+        Value::known(slack),
+    )?;
+
+    layouter.assign_region(
+        || "layer norm mul row range check links",
+        |mut region| {
+            region.constrain_equal(q_cell.cell(), q_range_cell.cell())?;
+            region.constrain_equal(r_cell.cell(), r_range_cell.cell())?;
+            region.constrain_equal(slack_cell.cell(), slack_range_cell.cell())?;
+            Ok(())
+        },
+    )?;
+
+    Ok((a_cell, b_cell, q_cell))
+}
+
+/// Bridges a value produced in `EltwiseAddChip`'s signed-shifted
+/// representation (`shifted_cell`, holding `raw_value + SIGNED_SHIFT`) into
+/// a fresh cell holding the unshifted `raw_value` -- tied together by the
+/// `s_unshift` gate configured in `LayerNormChip::configure` and a
+/// `region.constrain_equal` back to `shifted_cell`. Needed because
+/// `EltwiseMulChip`'s `a`/`b` and `LookupChip`'s `input`/`output` columns
+/// hold the unshifted representation, unlike `EltwiseAddChip`'s columns
+/// (see this module's top-level soundness docs).
+fn assign_unshift(
+    config: &LayerNormConfig,
+    mut layouter: impl Layouter<Fr>,
+    shifted_cell: &AssignedCell<Fr, Fr>,
+    raw_value: i64,
+) -> Result<AssignedCell<Fr, Fr>, ErrorFront> {
+    let (shifted_fr, _) = shifted_i64_witness(raw_value);
+    let unshifted_fr = Value::known(i64_to_fr(raw_value));
+
+    let (shifted_copy_cell, unshifted_cell) = layouter.assign_region(
+        || "layer norm unshift",
+        |mut region| {
+            config.s_unshift.enable(&mut region, 0)?;
+            let shifted_copy_cell =
+                region.assign_advice(|| "shifted in", config.unshift_in, 0, || shifted_fr)?;
+            let unshifted_cell =
+                region.assign_advice(|| "unshifted out", config.unshift_out, 0, || unshifted_fr)?;
+            Ok((shifted_copy_cell, unshifted_cell))
+        },
+    )?;
+
+    layouter.assign_region(
+        || "layer norm unshift link",
+        |mut region| region.constrain_equal(shifted_copy_cell.cell(), shifted_cell.cell()),
+    )?;
+
+    Ok(unshifted_cell)
 }
 
 #[cfg(test)]
@@ -569,6 +989,10 @@ mod tests {
             let bits = meta.advice_column();
             let rsqrt_input = meta.advice_column();
             let rsqrt_output = meta.advice_column();
+            let mean_link = meta.advice_column();
+            let neg_mean = meta.advice_column();
+            let unshift_in = meta.advice_column();
+            let unshift_out = meta.advice_column();
 
             LayerNormTestConfig {
                 layer_norm: LayerNormChip::configure(
@@ -590,6 +1014,10 @@ mod tests {
                     bits,
                     rsqrt_input,
                     rsqrt_output,
+                    mean_link,
+                    neg_mean,
+                    unshift_in,
+                    unshift_out,
                     K,
                     EPSILON_MILLI,
                     RSQRT_DOMAIN_MIN,
@@ -818,5 +1246,112 @@ mod tests {
         };
         let prover = MockProver::run(CIRCUIT_K, &circuit, vec![]).unwrap();
         assert!(prover.verify().is_err());
+    }
+
+    /// Regression test proving `region.constrain_equal` genuinely binds
+    /// `diff_i`'s real cell to the squaring step's `a`/`b` operand cells
+    /// (the link `LayerNormChip::assign`'s step 3 establishes via
+    /// `assign_unshift`/`assign_mul_row`) -- mirroring the exact reasoning
+    /// of `chips/eltwise.rs`'s own `*_constrain_equal_rejects_mismatched_range_check_witness`
+    /// tests: a synthesize that merely *omitted* the constrain_equal call
+    /// would prove nothing (MockProver only checks permutation ties that
+    /// were actually registered during that circuit's own synthesis), so
+    /// this reproduces the real mean -> diff -> square structure honestly up
+    /// through `diff_0`'s real (linked) cell, then squares a deliberately
+    /// mismatched decoy value (`diff_0 + 1`) instead of the real one --
+    /// while STILL calling `constrain_equal` between the (mismatched) `a`/`b`
+    /// operand cells and the real `diff_0` cell, exactly as production code
+    /// would if it accidentally computed the wrong value to square. The
+    /// permutation argument must reject that mismatch.
+    #[test]
+    fn diff_to_square_constrain_equal_rejects_mismatched_decoy_value() {
+        struct MismatchedSquareCircuit {
+            inputs: Vec<I18>,
+        }
+
+        impl Circuit<Fr> for MismatchedSquareCircuit {
+            type Config = LayerNormTestConfig;
+            type FloorPlanner = SimpleFloorPlanner;
+
+            fn without_witnesses(&self) -> Self {
+                MismatchedSquareCircuit {
+                    inputs: vec![I18::from_raw(0); self.inputs.len()],
+                }
+            }
+
+            fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
+                LayerNormTestCircuit::configure(meta)
+            }
+
+            fn synthesize(
+                &self,
+                config: Self::Config,
+                mut layouter: impl Layouter<Fr>,
+            ) -> Result<(), ErrorFront> {
+                // The rsqrt lookup table must still be loaded: its lookup
+                // argument applies to every row of the circuit (see
+                // `LookupConfig`'s doc comment), even though this test never
+                // touches the rsqrt columns.
+                let layer_norm = config.layer_norm.clone();
+                let chip = LayerNormChip::construct(config.layer_norm);
+                chip.load_table(layouter.namespace(|| "table"))?;
+
+                // Honestly compute mean and diff_0 = inputs[0] - mean, with
+                // the exact same real links `LayerNormChip::assign` itself
+                // establishes for steps 1-2.
+                let mean_chip = ReduceMeanChip::construct(layer_norm.reduce_mean.clone());
+                let (mean, _mean_cell, _mean_input_cells) =
+                    mean_chip.assign(layouter.namespace(|| "mean"), &self.inputs)?;
+                let neg_mean = I18::from_raw(-mean.raw());
+
+                let (_a_cell, _b_cell, diff_cell) = assign_add_row(
+                    &layer_norm.add,
+                    layouter.namespace(|| "diff 0"),
+                    self.inputs[0].raw(),
+                    neg_mean.raw(),
+                )?;
+                let diff_raw = self.inputs[0]
+                    .raw()
+                    .checked_add(neg_mean.raw())
+                    .expect("diff overflow");
+
+                let diff_unshifted_cell = assign_unshift(
+                    &layer_norm,
+                    layouter.namespace(|| "diff 0 unshift"),
+                    &diff_cell,
+                    diff_raw,
+                )?;
+
+                // Mismatch: square a decoy value (diff_0 + 1) instead of the
+                // real diff_0, but still link both operand cells via
+                // constrain_equal to the real diff_0 cell above.
+                let decoy_diff = I18::from_raw(diff_raw + 1);
+                let (mul_a_cell, mul_b_cell, _sq_cell) = assign_mul_row(
+                    &layer_norm.mul,
+                    layouter.namespace(|| "decoy square"),
+                    decoy_diff,
+                    decoy_diff,
+                )?;
+                layouter.assign_region(
+                    || "decoy square links",
+                    |mut region| {
+                        region.constrain_equal(mul_a_cell.cell(), diff_unshifted_cell.cell())?;
+                        region.constrain_equal(mul_b_cell.cell(), diff_unshifted_cell.cell())?;
+                        Ok(())
+                    },
+                )?;
+
+                Ok(())
+            }
+        }
+
+        let circuit = MismatchedSquareCircuit {
+            inputs: sample_inputs(),
+        };
+        let prover = MockProver::run(CIRCUIT_K, &circuit, vec![]).unwrap();
+        assert!(
+            prover.verify().is_err(),
+            "constrain_equal must reject a squared decoy diff tied to the real diff cell"
+        );
     }
 }

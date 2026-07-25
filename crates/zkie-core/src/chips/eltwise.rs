@@ -1,7 +1,7 @@
 use crate::chips::range_check::{RangeCheckChip, RangeCheckConfig};
 use crate::field_convert::{i128_to_fr, i64_to_fr, shifted_i64_witness, Fr, SIGNED_SHIFT};
 use crate::fixed_point::{requantize_mul, I18, SCALE_18};
-use halo2_proofs::circuit::{Layouter, Value};
+use halo2_proofs::circuit::{AssignedCell, Layouter, Value};
 use halo2_proofs::plonk::{Advice, Column, ConstraintSystem, ErrorFront, Expression, Selector};
 use halo2_proofs::poly::Rotation;
 
@@ -31,13 +31,20 @@ const REMAINDER_BITS: usize = 60; // 2^60 > SCALE_18 - 1.
 
 #[derive(Clone, Debug)]
 pub struct EltwiseAddConfig {
-    a: Column<Advice>,
-    b: Column<Advice>,
-    c: Column<Advice>,
-    s_add: Selector,
-    range_a: RangeCheckConfig,
-    range_b: RangeCheckConfig,
-    range_c: RangeCheckConfig,
+    // Crate-visible (not fully private) so that composed chips such as
+    // `LayerNormChip` (which needs to witness its own `a`/`b`/`c` cells
+    // directly, rather than only receiving the output cell back from
+    // `EltwiseAddChip::assign`, in order to link an operand to whichever
+    // other chip produced it) and their tests can reach into the raw
+    // region layout — mirroring `DotProductConfig`'s precedent in
+    // `dot_general.rs`.
+    pub(crate) a: Column<Advice>,
+    pub(crate) b: Column<Advice>,
+    pub(crate) c: Column<Advice>,
+    pub(crate) s_add: Selector,
+    pub(crate) range_a: RangeCheckConfig,
+    pub(crate) range_b: RangeCheckConfig,
+    pub(crate) range_c: RangeCheckConfig,
 }
 
 pub struct EltwiseAddChip {
@@ -89,12 +96,19 @@ impl EltwiseAddChip {
         EltwiseAddChip { config }
     }
 
+    /// Assigns `a + b` in this chip's region, range-checks each of `a`, `b`,
+    /// `c`, and links every range-checked witness back to the cell used in
+    /// the main gate. Returns the assigned (signed-shifted) `c` (output)
+    /// cell -- composing chips (e.g. `LayerNormChip`) must
+    /// `region.constrain_equal` this cell to any cell where they re-witness
+    /// the same value, rather than re-assigning it disconnected from this
+    /// one (see the soundness note at the top of this file).
     pub fn assign(
         &self,
         mut layouter: impl Layouter<Fr>,
         a: I18,
         b: I18,
-    ) -> Result<(), ErrorFront> {
+    ) -> Result<AssignedCell<Fr, Fr>, ErrorFront> {
         let c_raw = a.raw().checked_add(b.raw()).expect("I18 add overflow");
 
         let (a_shift_fr, a_shift_raw) = shifted_i64_witness(a.raw());
@@ -134,22 +148,26 @@ impl EltwiseAddChip {
             },
         )?;
 
-        Ok(())
+        Ok(c_cell)
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct EltwiseMulConfig {
-    a: Column<Advice>,
-    b: Column<Advice>,
-    q: Column<Advice>,
-    r: Column<Advice>,
-    slack: Column<Advice>,
-    s_mul: Selector,
-    s_slack: Selector,
-    range_q: RangeCheckConfig,
-    range_r: RangeCheckConfig,
-    range_r_slack: RangeCheckConfig,
+    // Crate-visible for the same reason as `EltwiseAddConfig`'s fields above
+    // -- `LayerNormChip` needs direct access to witness its own `a`/`b`
+    // operand cells so it can link them to whichever chip produced that
+    // operand's value.
+    pub(crate) a: Column<Advice>,
+    pub(crate) b: Column<Advice>,
+    pub(crate) q: Column<Advice>,
+    pub(crate) r: Column<Advice>,
+    pub(crate) slack: Column<Advice>,
+    pub(crate) s_mul: Selector,
+    pub(crate) s_slack: Selector,
+    pub(crate) range_q: RangeCheckConfig,
+    pub(crate) range_r: RangeCheckConfig,
+    pub(crate) range_r_slack: RangeCheckConfig,
 }
 
 pub struct EltwiseMulChip {
@@ -223,12 +241,20 @@ impl EltwiseMulChip {
         EltwiseMulChip { config }
     }
 
+    /// Assigns `a * b` (via the quotient/remainder rescale gadget) in this
+    /// chip's region, range-checks `q`/`r`/`slack`, and links every
+    /// range-checked witness back to the cell used in the main gate.
+    /// Returns the assigned (signed-shifted) `q` (output/quotient) cell --
+    /// composing chips (e.g. `LayerNormChip`) must `region.constrain_equal`
+    /// this cell to any cell where they re-witness the same value, rather
+    /// than re-assigning it disconnected from this one (see the soundness
+    /// note at the top of this file).
     pub fn assign(
         &self,
         mut layouter: impl Layouter<Fr>,
         a: I18,
         b: I18,
-    ) -> Result<(), ErrorFront> {
+    ) -> Result<AssignedCell<Fr, Fr>, ErrorFront> {
         let (q, r) = requantize_mul(a, b).expect("I18 mul overflow");
         let slack = SCALE_18 - 1 - r;
         let (q_shift_fr, q_shift_raw) = shifted_i64_witness(q.raw());
@@ -295,7 +321,7 @@ impl EltwiseMulChip {
             },
         )?;
 
-        Ok(())
+        Ok(q_cell)
     }
 }
 
@@ -344,7 +370,7 @@ mod tests {
             layouter: impl Layouter<Fr>,
         ) -> Result<(), ErrorFront> {
             let chip = EltwiseAddChip::construct(config.add);
-            chip.assign(layouter, self.a, self.b)
+            chip.assign(layouter, self.a, self.b).map(|_| ())
         }
     }
 
@@ -568,7 +594,7 @@ mod tests {
             layouter: impl Layouter<Fr>,
         ) -> Result<(), ErrorFront> {
             let chip = EltwiseMulChip::construct(config.mul);
-            chip.assign(layouter, self.a, self.b)
+            chip.assign(layouter, self.a, self.b).map(|_| ())
         }
     }
 
