@@ -1,5 +1,6 @@
 /target
 /.omc
 /models
+/.spike-test
 Cargo.lock
 *.log
