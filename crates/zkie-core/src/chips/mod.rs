@@ -1,6 +1,7 @@
 pub mod div;
 pub mod dot_general;
 pub mod eltwise;
+pub mod gelu;
 pub mod lookup;
 pub mod patch_embed;
 pub mod range_check;
