@@ -1,3 +1,5 @@
+pub mod fixed_point;
+
 #[cfg(test)]
 mod tests {
     #[test]
