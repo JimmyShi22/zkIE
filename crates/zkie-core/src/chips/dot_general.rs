@@ -6,24 +6,15 @@
 //! sub-project will instantiate this chip once per output element.
 
 use crate::chips::range_check::{RangeCheckChip, RangeCheckConfig};
-use crate::field_convert::{i128_to_fr, i64_to_fr, Fr};
+use crate::field_convert::{i128_to_fr, i64_to_fr, shifted_i64_witness, Fr};
 use crate::fixed_point::{requantize_raw, FixedPointError, I18, SCALE_18};
 use halo2_proofs::circuit::{Layouter, Value};
 use halo2_proofs::plonk::{Advice, Column, ConstraintSystem, ErrorFront, Expression, Selector};
 use halo2_proofs::poly::Rotation;
 use std::fmt;
 
-// Same "shift by 2^63" trick used by `chips::eltwise` to range-check a signed
-// i64 value: add 2^63 so the shifted value is always non-negative and fits in
-// 64 bits, then range-check the shifted value.
-const SIGNED_SHIFT: i128 = 1i128 << 63;
 // 2^60 > SCALE_18 - 1, so 60 bits is enough to bound a remainder in [0, SCALE_18).
 const REMAINDER_BITS: usize = 60;
-
-fn shifted_i64_witness(v: i64) -> (Value<Fr>, Value<i128>) {
-    let shifted = (v as i128) + SIGNED_SHIFT;
-    (Value::known(i128_to_fr(shifted)), Value::known(shifted))
-}
 
 /// Errors that can occur while assigning a `DotProductChip` region.
 #[derive(Debug)]
