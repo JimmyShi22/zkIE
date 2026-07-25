@@ -1,0 +1,490 @@
+use crate::field_convert::{i64_to_fr, Fr};
+use crate::fixed_point::I18;
+use halo2_proofs::circuit::{Layouter, Value};
+use halo2_proofs::plonk::{Advice, Column, ConstraintSystem, ErrorFront, TableColumn};
+use halo2_proofs::poly::Rotation;
+use std::fmt;
+
+/// Error raised by [`LookupChip::assign`] when the requested input is not an
+/// exact point of the chip's quantized domain, or when the underlying circuit
+/// synthesis fails.
+#[derive(Debug)]
+pub enum LookupError {
+    /// The witnessed input does not exactly match any domain point loaded
+    /// into the lookup table.
+    InputNotInDomain(I18),
+    /// Wraps a synthesis-time error from the halo2 layouter.
+    Synthesis(ErrorFront),
+}
+
+impl fmt::Display for LookupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LookupError::InputNotInDomain(input) => {
+                write!(
+                    f,
+                    "input {} is not a point of the lookup domain",
+                    input.to_f64()
+                )
+            }
+            LookupError::Synthesis(err) => write!(f, "lookup synthesis error: {err:?}"),
+        }
+    }
+}
+
+impl std::error::Error for LookupError {}
+
+impl From<ErrorFront> for LookupError {
+    fn from(err: ErrorFront) -> Self {
+        LookupError::Synthesis(err)
+    }
+}
+
+/// Configuration for a [`LookupChip`]: two advice columns (`input`, `output`)
+/// constrained via a lookup argument to be a row of a fixed table
+/// (`table_input`, `table_output`) representing a quantized function
+/// `f: I18 -> I18`.
+#[derive(Clone, Debug)]
+pub struct LookupConfig {
+    input: Column<Advice>,
+    output: Column<Advice>,
+    table_input: TableColumn,
+    table_output: TableColumn,
+}
+
+/// A generic chip that proves "I correctly evaluated a fixed, public,
+/// quantized function `f` at a quantized point" via a halo2 lookup argument.
+///
+/// The chip is parameterized over the domain/value pairs supplied at
+/// construction time, so the same chip machinery can back GELU, softmax's
+/// `exp`, layer norm's `rsqrt`, or any other function with a precomputed
+/// lookup table.
+pub struct LookupChip {
+    config: LookupConfig,
+    /// `(domain point, f(domain point))` pairs, in the order they will be
+    /// loaded into the table.
+    domain: Vec<(I18, I18)>,
+}
+
+impl LookupChip {
+    /// Configures the lookup argument: witnessed `(input, output)` pairs on
+    /// the given advice columns must match a row of the table loaded by
+    /// [`LookupChip::load_table`].
+    pub fn configure(
+        meta: &mut ConstraintSystem<Fr>,
+        input: Column<Advice>,
+        output: Column<Advice>,
+    ) -> LookupConfig {
+        meta.enable_equality(input);
+        meta.enable_equality(output);
+
+        let table_input = meta.lookup_table_column();
+        let table_output = meta.lookup_table_column();
+
+        meta.lookup("input/output is a row of the function table", |meta| {
+            let input_expr = meta.query_advice(input, Rotation::cur());
+            let output_expr = meta.query_advice(output, Rotation::cur());
+            vec![(input_expr, table_input), (output_expr, table_output)]
+        });
+
+        LookupConfig {
+            input,
+            output,
+            table_input,
+            table_output,
+        }
+    }
+
+    /// Builds a chip backed by the given quantized domain and precomputed
+    /// function values (`values[i] == f(domain[i])`). `domain` and `values`
+    /// must have the same length.
+    pub fn construct(config: LookupConfig, domain: Vec<I18>, values: Vec<I18>) -> Self {
+        assert_eq!(
+            domain.len(),
+            values.len(),
+            "domain and values must have the same length"
+        );
+        let pairs = domain.into_iter().zip(values).collect();
+        LookupChip {
+            config,
+            domain: pairs,
+        }
+    }
+
+    /// Loads the fixed `(input, output)` table backing the lookup argument.
+    /// Must be called exactly once per circuit synthesis, independently of
+    /// any [`LookupChip::assign`] calls (which only witness rows to be
+    /// checked against this table).
+    pub fn load_table(&self, mut layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
+        layouter.assign_table(
+            || "lookup function table",
+            |mut table| {
+                for (i, (input, output)) in self.domain.iter().enumerate() {
+                    table.assign_cell(
+                        || "table input",
+                        self.config.table_input,
+                        i,
+                        || Value::known(i64_to_fr(input.raw())),
+                    )?;
+                    table.assign_cell(
+                        || "table output",
+                        self.config.table_output,
+                        i,
+                        || Value::known(i64_to_fr(output.raw())),
+                    )?;
+                }
+                Ok(())
+            },
+        )
+    }
+
+    /// Witnesses `input` and its precomputed `f(input)` so that the lookup
+    /// argument checks the pair against the table, and returns `f(input)`.
+    ///
+    /// Returns [`LookupError::InputNotInDomain`] without touching the
+    /// layouter if `input` is not an exact point of the chip's domain.
+    pub fn assign(&self, mut layouter: impl Layouter<Fr>, input: I18) -> Result<I18, LookupError> {
+        let output = self
+            .domain
+            .iter()
+            .find(|(x, _)| x.raw() == input.raw())
+            .map(|(_, y)| *y)
+            .ok_or(LookupError::InputNotInDomain(input))?;
+
+        layouter.assign_region(
+            || "lookup assign",
+            |mut region| {
+                region.assign_advice(
+                    || "input",
+                    self.config.input,
+                    0,
+                    || Value::known(i64_to_fr(input.raw())),
+                )?;
+                region.assign_advice(
+                    || "output",
+                    self.config.output,
+                    0,
+                    || Value::known(i64_to_fr(output.raw())),
+                )?;
+                Ok(())
+            },
+        )?;
+
+        Ok(output)
+    }
+}
+
+/// Evenly quantizes `[min, max]` into `n` points and evaluates `f` (a host
+/// side `f64 -> f64` function, e.g. `f64::exp`, a GELU implementation, or
+/// `|v| 1.0 / v.sqrt()`) at each, producing the `(domain, values)` I18
+/// vectors used to build a [`LookupChip`].
+pub fn build_domain(f: impl Fn(f64) -> f64, min: f64, max: f64, n: usize) -> (Vec<I18>, Vec<I18>) {
+    assert!(n > 0, "domain must have at least one point");
+    let mut domain = Vec::with_capacity(n);
+    let mut values = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = if n == 1 {
+            0.0
+        } else {
+            i as f64 / (n - 1) as f64
+        };
+        let x = min + t * (max - min);
+        let y = f(x);
+        domain.push(I18::from_f64(x).expect("domain point must fit in I18 range"));
+        values.push(I18::from_f64(y).expect("function value must fit in I18 range"));
+    }
+    (domain, values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use halo2_proofs::circuit::SimpleFloorPlanner;
+    use halo2_proofs::dev::MockProver;
+    use halo2_proofs::plonk::{Circuit, ConstraintSystem, ErrorFront};
+
+    /// A small 16-point domain over [0.0, 2.0] with f(x) = x * x (max output
+    /// 4.0, comfortably within I18's representable range), in the spirit of
+    /// the spike this task references.
+    fn square_domain() -> (Vec<I18>, Vec<I18>) {
+        build_domain(|x| x * x, 0.0, 2.0, 16)
+    }
+
+    #[derive(Clone)]
+    struct LookupTestConfig {
+        lookup: LookupConfig,
+    }
+
+    struct LookupTestCircuit {
+        domain: Vec<I18>,
+        values: Vec<I18>,
+        input: I18,
+    }
+
+    impl Circuit<Fr> for LookupTestCircuit {
+        type Config = LookupTestConfig;
+        type FloorPlanner = SimpleFloorPlanner;
+
+        fn without_witnesses(&self) -> Self {
+            LookupTestCircuit {
+                domain: self.domain.clone(),
+                values: self.values.clone(),
+                input: I18::from_raw(0),
+            }
+        }
+
+        fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
+            let input = meta.advice_column();
+            let output = meta.advice_column();
+            LookupTestConfig {
+                lookup: LookupChip::configure(meta, input, output),
+            }
+        }
+
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            mut layouter: impl Layouter<Fr>,
+        ) -> Result<(), ErrorFront> {
+            let chip =
+                LookupChip::construct(config.lookup, self.domain.clone(), self.values.clone());
+            chip.load_table(layouter.namespace(|| "table"))?;
+            chip.assign(layouter.namespace(|| "assign"), self.input)
+                .expect("input should be an exact domain point in this test");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn valid_lookup_at_domain_point_is_satisfied() {
+        let (domain, values) = square_domain();
+        let circuit = LookupTestCircuit {
+            input: domain[5],
+            domain,
+            values,
+        };
+        let prover = MockProver::run(6, &circuit, vec![]).unwrap();
+        prover.assert_satisfied();
+    }
+
+    #[test]
+    fn valid_lookup_at_first_domain_point_is_satisfied() {
+        let (domain, values) = square_domain();
+        let circuit = LookupTestCircuit {
+            input: domain[0],
+            domain,
+            values,
+        };
+        let prover = MockProver::run(6, &circuit, vec![]).unwrap();
+        prover.assert_satisfied();
+    }
+
+    #[test]
+    fn assign_rejects_input_not_in_domain_at_the_rust_level() {
+        // Exercises the host-side domain-membership guard directly: `assign`
+        // must refuse an out-of-domain input by returning a typed error,
+        // without ever generating an invalid circuit region.
+        struct GuardTestCircuit {
+            domain: Vec<I18>,
+            values: Vec<I18>,
+            off_domain_input: I18,
+        }
+
+        impl Circuit<Fr> for GuardTestCircuit {
+            type Config = LookupTestConfig;
+            type FloorPlanner = SimpleFloorPlanner;
+
+            fn without_witnesses(&self) -> Self {
+                GuardTestCircuit {
+                    domain: self.domain.clone(),
+                    values: self.values.clone(),
+                    off_domain_input: self.off_domain_input,
+                }
+            }
+
+            fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
+                LookupTestCircuit::configure(meta)
+            }
+
+            fn synthesize(
+                &self,
+                config: Self::Config,
+                mut layouter: impl Layouter<Fr>,
+            ) -> Result<(), ErrorFront> {
+                let chip =
+                    LookupChip::construct(config.lookup, self.domain.clone(), self.values.clone());
+                chip.load_table(layouter.namespace(|| "table"))?;
+                match chip.assign(layouter.namespace(|| "assign"), self.off_domain_input) {
+                    Err(LookupError::InputNotInDomain(input)) => {
+                        assert_eq!(input, self.off_domain_input);
+                    }
+                    other => panic!("expected InputNotInDomain, got {other:?}"),
+                }
+                Ok(())
+            }
+        }
+
+        let (domain, values) = square_domain();
+        // Halfway between two grid points: not an exact domain point.
+        let step = (domain[1].to_f64() - domain[0].to_f64()) / 2.0;
+        let off_domain_input = I18::from_f64(domain[0].to_f64() + step).unwrap();
+
+        let circuit = GuardTestCircuit {
+            domain,
+            values,
+            off_domain_input,
+        };
+        let prover = MockProver::run(6, &circuit, vec![]).unwrap();
+        prover.assert_satisfied();
+    }
+
+    #[test]
+    fn forged_output_for_a_valid_input_is_rejected() {
+        // Bypasses `assign` and directly witnesses a valid domain input
+        // paired with the wrong output, confirming the lookup argument
+        // (not just Rust-level bookkeeping) enforces correctness.
+        struct ForgedOutputCircuit {
+            domain: Vec<I18>,
+            values: Vec<I18>,
+            input: I18,
+            forged_output: I18,
+        }
+
+        impl Circuit<Fr> for ForgedOutputCircuit {
+            type Config = LookupTestConfig;
+            type FloorPlanner = SimpleFloorPlanner;
+
+            fn without_witnesses(&self) -> Self {
+                ForgedOutputCircuit {
+                    domain: self.domain.clone(),
+                    values: self.values.clone(),
+                    input: self.input,
+                    forged_output: self.forged_output,
+                }
+            }
+
+            fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
+                LookupTestCircuit::configure(meta)
+            }
+
+            fn synthesize(
+                &self,
+                config: Self::Config,
+                mut layouter: impl Layouter<Fr>,
+            ) -> Result<(), ErrorFront> {
+                let lookup_config = config.lookup.clone();
+                let chip =
+                    LookupChip::construct(config.lookup, self.domain.clone(), self.values.clone());
+                chip.load_table(layouter.namespace(|| "table"))?;
+                layouter.assign_region(
+                    || "forged lookup",
+                    |mut region| {
+                        region.assign_advice(
+                            || "input",
+                            lookup_config.input,
+                            0,
+                            || Value::known(i64_to_fr(self.input.raw())),
+                        )?;
+                        region.assign_advice(
+                            || "output",
+                            lookup_config.output,
+                            0,
+                            || Value::known(i64_to_fr(self.forged_output.raw())),
+                        )
+                    },
+                )?;
+                Ok(())
+            }
+        }
+
+        let (domain, values) = square_domain();
+        let input = domain[5];
+        let correct_output = values[5];
+        // Off by one raw unit: not equal to f(input), and (input, forged)
+        // is not a row of the table since domain inputs are unique.
+        let forged_output = I18::from_raw(correct_output.raw() + 1);
+
+        let circuit = ForgedOutputCircuit {
+            domain,
+            values,
+            input,
+            forged_output,
+        };
+        let prover = MockProver::run(6, &circuit, vec![]).unwrap();
+        assert!(prover.verify().is_err());
+    }
+
+    #[test]
+    fn forged_input_not_in_domain_is_rejected() {
+        // Bypasses `assign` and directly witnesses an input that is not any
+        // domain point at all, confirming MockProver rejects it regardless
+        // of what output is paired with it.
+        struct ForgedInputCircuit {
+            domain: Vec<I18>,
+            values: Vec<I18>,
+            off_domain_input: I18,
+            paired_output: I18,
+        }
+
+        impl Circuit<Fr> for ForgedInputCircuit {
+            type Config = LookupTestConfig;
+            type FloorPlanner = SimpleFloorPlanner;
+
+            fn without_witnesses(&self) -> Self {
+                ForgedInputCircuit {
+                    domain: self.domain.clone(),
+                    values: self.values.clone(),
+                    off_domain_input: self.off_domain_input,
+                    paired_output: self.paired_output,
+                }
+            }
+
+            fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
+                LookupTestCircuit::configure(meta)
+            }
+
+            fn synthesize(
+                &self,
+                config: Self::Config,
+                mut layouter: impl Layouter<Fr>,
+            ) -> Result<(), ErrorFront> {
+                let lookup_config = config.lookup.clone();
+                let chip =
+                    LookupChip::construct(config.lookup, self.domain.clone(), self.values.clone());
+                chip.load_table(layouter.namespace(|| "table"))?;
+                layouter.assign_region(
+                    || "forged lookup",
+                    |mut region| {
+                        region.assign_advice(
+                            || "input",
+                            lookup_config.input,
+                            0,
+                            || Value::known(i64_to_fr(self.off_domain_input.raw())),
+                        )?;
+                        region.assign_advice(
+                            || "output",
+                            lookup_config.output,
+                            0,
+                            || Value::known(i64_to_fr(self.paired_output.raw())),
+                        )
+                    },
+                )?;
+                Ok(())
+            }
+        }
+
+        let (domain, values) = square_domain();
+        let step = (domain[1].to_f64() - domain[0].to_f64()) / 2.0;
+        let off_domain_input = I18::from_f64(domain[0].to_f64() + step).unwrap();
+
+        let paired_output = values[0];
+        let circuit = ForgedInputCircuit {
+            domain,
+            values,
+            off_domain_input,
+            paired_output,
+        };
+        let prover = MockProver::run(6, &circuit, vec![]).unwrap();
+        assert!(prover.verify().is_err());
+    }
+}
