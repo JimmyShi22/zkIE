@@ -51,7 +51,7 @@
 use crate::chips::range_check::{RangeCheckChip, RangeCheckConfig};
 use crate::field_convert::{i128_to_fr, i64_to_fr, shifted_i64_witness, Fr, SIGNED_SHIFT};
 use crate::fixed_point::{FixedPointError, I18, SCALE_18};
-use halo2_proofs::circuit::{Layouter, Value};
+use halo2_proofs::circuit::{AssignedCell, Layouter, Value};
 use halo2_proofs::plonk::{Advice, Column, ConstraintSystem, ErrorFront, Expression, Selector};
 use halo2_proofs::poly::Rotation;
 use std::fmt;
@@ -243,33 +243,40 @@ impl DivChip {
     /// of them, and links every range-checked cell back to the cell used in
     /// the main gates via `region.constrain_equal` (see module docs for why
     /// this differs from the sibling chips' pattern). Returns the quotient
-    /// as an `I18`, or a typed `DivError` -- never panics -- if `divisor` is
-    /// not strictly positive or the quotient overflows I18's range.
+    /// as an `I18`, along with the `AssignedCell`s holding the `numerator`
+    /// and `divisor` witnessed here -- composing chips (e.g. `SoftmaxChip`,
+    /// whose divisor is a `ReduceSumChip` sum) must `region.constrain_equal`
+    /// these back to the cell holding the same value elsewhere, rather than
+    /// leave this chip's copy disconnected from it -- or a typed `DivError`
+    /// -- never panics -- if `divisor` is not strictly positive or the
+    /// quotient overflows I18's range.
+    #[allow(clippy::type_complexity)]
     pub fn assign(
         &self,
         mut layouter: impl Layouter<Fr>,
         numerator: I18,
         divisor: I18,
-    ) -> Result<I18, DivError> {
+    ) -> Result<(I18, AssignedCell<Fr, Fr>, AssignedCell<Fr, Fr>), DivError> {
         let (quotient, r_i128) = div_quotient_remainder(numerator, divisor)?;
         let d_i128 = divisor.raw() as i128;
         let slack = d_i128 - 1 - r_i128;
         let dm1 = d_i128 - 1;
         let (q_shift_fr, q_shift_raw) = shifted_i64_witness(quotient.raw());
 
-        let (q_shift_cell, r_cell, slack_cell, dm1_cell) = layouter.assign_region(
+        let (numerator_cell, divisor_cell, q_shift_cell, r_cell, slack_cell, dm1_cell) = layouter
+            .assign_region(
             || "div core",
             |mut region| {
                 self.config.s_div.enable(&mut region, 0)?;
                 self.config.s_slack.enable(&mut region, 0)?;
                 self.config.s_dm1.enable(&mut region, 0)?;
-                region.assign_advice(
+                let numerator_cell = region.assign_advice(
                     || "numerator",
                     self.config.numerator,
                     0,
                     || Value::known(i64_to_fr(numerator.raw())),
                 )?;
-                region.assign_advice(
+                let divisor_cell = region.assign_advice(
                     || "divisor",
                     self.config.divisor,
                     0,
@@ -295,7 +302,14 @@ impl DivChip {
                     0,
                     || Value::known(i128_to_fr(dm1)),
                 )?;
-                Ok((q_shift_cell, r_cell, slack_cell, dm1_cell))
+                Ok((
+                    numerator_cell,
+                    divisor_cell,
+                    q_shift_cell,
+                    r_cell,
+                    slack_cell,
+                    dm1_cell,
+                ))
             },
         )?;
 
@@ -341,7 +355,7 @@ impl DivChip {
             },
         )?;
 
-        Ok(quotient)
+        Ok((quotient, numerator_cell, divisor_cell))
     }
 }
 

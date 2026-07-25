@@ -219,7 +219,7 @@ impl EmbedLookupChip {
         let mut outputs = Vec::with_capacity(self.config.embed_dim);
         for dim in 0..self.config.embed_dim {
             let chip = self.lookup_chip_for_dim(dim, embedding_table);
-            let out = chip
+            let (out, _cell) = chip
                 .assign(
                     layouter.namespace(|| format!("embed lookup dim {dim}")),
                     index_i18,

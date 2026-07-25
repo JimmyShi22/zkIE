@@ -151,9 +151,13 @@ impl GeluChip {
 
     /// Witnesses `input` and its precomputed `gelu_f64(input)`, checked by
     /// the lookup argument, and returns the looked-up output. Delegates to
-    /// [`LookupChip::assign`].
+    /// [`LookupChip::assign`], discarding the `AssignedCell` it also returns
+    /// (GELU is not currently composed into a larger chip, unlike
+    /// `SoftmaxChip`'s use of the same underlying `LookupChip::assign`).
     pub fn assign(&self, layouter: impl Layouter<Fr>, input: I18) -> Result<I18, LookupError> {
-        self.inner.assign(layouter, input)
+        self.inner
+            .assign(layouter, input)
+            .map(|(value, _cell)| value)
     }
 }
 

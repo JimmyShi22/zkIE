@@ -103,16 +103,20 @@ impl ReduceSumChip {
 
     /// Assigns the running-sum region for `inputs` (must have length `k`,
     /// the count fixed at `configure` time), range-checks the final sum as
-    /// a signed 64-bit value, and returns the sum as an `I18` along with the
-    /// `AssignedCell` holding the (raw, unshifted) final sum -- composing
-    /// chips (e.g. `ReduceMeanChip`) must `region.constrain_equal` this cell
-    /// to any cell where they re-witness the same sum value, rather than
-    /// re-assigning it disconnected from this one.
+    /// a signed 64-bit value, and returns the sum as an `I18`, the
+    /// `AssignedCell` holding the (raw, unshifted) final sum, and the
+    /// per-input `AssignedCell`s (in `inputs` order) holding this region's
+    /// own witnessed copies of each input value -- composing chips (e.g.
+    /// `ReduceMeanChip` for the sum cell, `SoftmaxChip` for both) must
+    /// `region.constrain_equal` these cells to any cell where they
+    /// re-witness the same value, rather than re-assigning it disconnected
+    /// from this one.
+    #[allow(clippy::type_complexity)]
     pub fn assign(
         &self,
         mut layouter: impl Layouter<Fr>,
         inputs: &[I18],
-    ) -> Result<(I18, AssignedCell<Fr, Fr>), ErrorFront> {
+    ) -> Result<(I18, AssignedCell<Fr, Fr>, Vec<AssignedCell<Fr, Fr>>), ErrorFront> {
         assert_eq!(
             inputs.len(),
             self.config.k,
@@ -137,17 +141,19 @@ impl ReduceSumChip {
             .expect("k >= 1 guarantees a last element");
         let (sum_shift_fr, sum_shift_raw) = shifted_i64_witness(sum_raw);
 
-        let (sum_cell, sum_shift_cell) = layouter.assign_region(
+        let (sum_cell, sum_shift_cell, value_cells) = layouter.assign_region(
             || "reduce sum",
             |mut region| {
                 let mut last_sum_cell = None;
+                let mut value_cells = Vec::with_capacity(inputs.len());
                 for (i, (v, s)) in inputs.iter().zip(partial_sums.iter()).enumerate() {
-                    region.assign_advice(
+                    let value_cell = region.assign_advice(
                         || format!("value {i}"),
                         self.config.values,
                         i,
                         || Value::known(i64_to_fr(v.raw())),
                     )?;
+                    value_cells.push(value_cell);
                     if i == 0 {
                         self.config.s_first.enable(&mut region, 0)?;
                     } else {
@@ -169,7 +175,7 @@ impl ReduceSumChip {
                     last_row,
                     || sum_shift_fr,
                 )?;
-                Ok((last_sum_cell.expect("k >= 1"), sum_shift_cell))
+                Ok((last_sum_cell.expect("k >= 1"), sum_shift_cell, value_cells))
             },
         )?;
 
@@ -185,7 +191,7 @@ impl ReduceSumChip {
             |mut region| region.constrain_equal(sum_shift_cell.cell(), range_cell.cell()),
         )?;
 
-        Ok((I18::from_raw(sum_raw), sum_cell))
+        Ok((I18::from_raw(sum_raw), sum_cell, value_cells))
     }
 }
 
@@ -302,7 +308,8 @@ impl ReduceMeanChip {
         inputs: &[I18],
     ) -> Result<I18, ErrorFront> {
         let sum_chip = ReduceSumChip::construct(self.config.sum.clone());
-        let (sum, sum_cell) = sum_chip.assign(layouter.namespace(|| "mean sum"), inputs)?;
+        let (sum, sum_cell, _value_cells) =
+            sum_chip.assign(layouter.namespace(|| "mean sum"), inputs)?;
 
         let (mean, r) =
             requantize_mul(sum, self.config.reciprocal).expect("I18 mean rescale overflow");
@@ -719,7 +726,7 @@ mod tests {
                 mut layouter: impl Layouter<Fr>,
             ) -> Result<(), ErrorFront> {
                 let sum_chip = ReduceSumChip::construct(config.reduce.sum.clone());
-                let (sum, _sum_cell) =
+                let (sum, _sum_cell, _value_cells) =
                     sum_chip.assign(layouter.namespace(|| "mean sum"), &self.inputs)?;
 
                 let (q, r) =
@@ -795,7 +802,7 @@ mod tests {
                 mut layouter: impl Layouter<Fr>,
             ) -> Result<(), ErrorFront> {
                 let sum_chip = ReduceSumChip::construct(config.reduce.sum.clone());
-                let (sum, sum_cell) =
+                let (sum, sum_cell, _value_cells) =
                     sum_chip.assign(layouter.namespace(|| "mean sum"), &self.inputs)?;
 
                 let (mean, r) =

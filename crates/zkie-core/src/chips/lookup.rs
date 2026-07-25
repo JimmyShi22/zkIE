@@ -1,6 +1,6 @@
 use crate::field_convert::{i64_to_fr, Fr};
 use crate::fixed_point::I18;
-use halo2_proofs::circuit::{Layouter, Value};
+use halo2_proofs::circuit::{AssignedCell, Layouter, Value};
 use halo2_proofs::plonk::{
     Advice, Column, ConstraintSystem, ErrorFront, Expression, Selector, TableColumn,
 };
@@ -209,11 +209,20 @@ impl LookupChip {
     }
 
     /// Witnesses `input` and its precomputed `f(input)` so that the lookup
-    /// argument checks the pair against the table, and returns `f(input)`.
+    /// argument checks the pair against the table, and returns `f(input)`
+    /// along with the `AssignedCell` holding the output -- composing chips
+    /// (e.g. `SoftmaxChip`) must `region.constrain_equal` this cell to any
+    /// cell where they re-witness the same value, rather than re-assigning
+    /// it disconnected from this one (see the soundness notes in
+    /// `chips/reduce.rs` and `chips/div.rs`).
     ///
     /// Returns [`LookupError::InputNotInDomain`] without touching the
     /// layouter if `input` is not an exact point of the chip's domain.
-    pub fn assign(&self, mut layouter: impl Layouter<Fr>, input: I18) -> Result<I18, LookupError> {
+    pub fn assign(
+        &self,
+        mut layouter: impl Layouter<Fr>,
+        input: I18,
+    ) -> Result<(I18, AssignedCell<Fr, Fr>), LookupError> {
         let output = self
             .domain
             .iter()
@@ -221,7 +230,7 @@ impl LookupChip {
             .map(|(_, y)| *y)
             .ok_or(LookupError::InputNotInDomain(input))?;
 
-        layouter.assign_region(
+        let output_cell = layouter.assign_region(
             || "lookup assign",
             |mut region| {
                 self.config.selector.enable(&mut region, 0)?;
@@ -236,12 +245,11 @@ impl LookupChip {
                     self.config.output,
                     0,
                     || Value::known(i64_to_fr(output.raw())),
-                )?;
-                Ok(())
+                )
             },
         )?;
 
-        Ok(output)
+        Ok((output, output_cell))
     }
 }
 
