@@ -1,0 +1,5 @@
+/target
+/.omc
+/models
+Cargo.lock
+*.log
