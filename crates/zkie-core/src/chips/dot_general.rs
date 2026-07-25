@@ -59,16 +59,21 @@ impl From<ErrorFront> for DotProductError {
 
 #[derive(Clone, Debug)]
 pub struct DotProductConfig {
-    a: Column<Advice>,
-    b: Column<Advice>,
-    accumulator: Column<Advice>,
-    q: Column<Advice>,
-    r: Column<Advice>,
-    slack: Column<Advice>,
-    s_acc_start: Selector,
-    s_acc_step: Selector,
-    s_final: Selector,
-    s_slack: Selector,
+    // Crate-visible (not fully private) so that composed chips such as
+    // `PatchEmbedChip` (which reuses a single configured `DotProductChip`
+    // across several regions) and their tests can reach into the raw region
+    // layout, e.g. to forge a witness in one region for a negative test —
+    // mirroring the pattern used in this module's own `tests` submodule.
+    pub(crate) a: Column<Advice>,
+    pub(crate) b: Column<Advice>,
+    pub(crate) accumulator: Column<Advice>,
+    pub(crate) q: Column<Advice>,
+    pub(crate) r: Column<Advice>,
+    pub(crate) slack: Column<Advice>,
+    pub(crate) s_acc_start: Selector,
+    pub(crate) s_acc_step: Selector,
+    pub(crate) s_final: Selector,
+    pub(crate) s_slack: Selector,
     range_q: RangeCheckConfig,
     range_r: RangeCheckConfig,
     range_r_slack: RangeCheckConfig,
