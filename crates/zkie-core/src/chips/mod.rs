@@ -3,6 +3,7 @@ pub mod dot_general;
 pub mod eltwise;
 pub mod embed_lookup;
 pub mod gelu;
+pub mod layer_norm;
 pub mod lookup;
 pub mod patch_embed;
 pub mod range_check;
