@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["crates/zkie-core"]
+members = ["crates/zkie-core", "crates/zkie-compiler"]
