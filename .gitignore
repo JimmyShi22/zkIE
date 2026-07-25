@@ -3,5 +3,6 @@
 /.claude/worktrees
 /models
 /.spike-test
+/.venv-timesfm
 Cargo.lock
 *.log
