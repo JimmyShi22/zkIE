@@ -1,3 +1,4 @@
+pub mod field_convert;
 pub mod fixed_point;
 
 #[cfg(test)]
