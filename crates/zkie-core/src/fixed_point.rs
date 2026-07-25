@@ -44,21 +44,33 @@ impl I18 {
     }
 }
 
+/// Requantizes a raw (Q36-scaled, or any SCALE_18-multiple-scaled) `i128` value
+/// back down to I18 (Q18), returning the quotient (as I18) and the Euclidean
+/// remainder (`0 <= remainder < SCALE_18`). Returns an error if the quotient
+/// overflows I18's `i64` range.
+pub fn requantize_raw(raw_value: i128) -> Result<(I18, i128), FixedPointError> {
+    let quotient = raw_value.div_euclid(SCALE_18);
+    let remainder = raw_value.rem_euclid(SCALE_18);
+    if quotient < i64::MIN as i128 || quotient > i64::MAX as i128 {
+        return Err(FixedPointError(format!(
+            "raw value {raw_value} requantizes to a quotient that overflows I18 range"
+        )));
+    }
+    Ok((I18(quotient as i64), remainder))
+}
+
 /// Computes `a * b` in I18 fixed point, returning the requantized I18 result
 /// (`quotient`) and the Euclidean remainder (`0 <= remainder < SCALE_18`).
 /// Returns an error if the requantized quotient overflows I18's range.
 pub fn requantize_mul(a: I18, b: I18) -> Result<(I18, i128), FixedPointError> {
     let raw_product: i128 = (a.raw() as i128) * (b.raw() as i128);
-    let quotient = raw_product.div_euclid(SCALE_18);
-    let remainder = raw_product.rem_euclid(SCALE_18);
-    if quotient < i64::MIN as i128 || quotient > i64::MAX as i128 {
-        return Err(FixedPointError(format!(
+    requantize_raw(raw_product).map_err(|_| {
+        FixedPointError(format!(
             "product of {} and {} overflows I18 range",
             a.to_f64(),
             b.to_f64()
-        )));
-    }
-    Ok((I18(quotient as i64), remainder))
+        ))
+    })
 }
 
 #[cfg(test)]
