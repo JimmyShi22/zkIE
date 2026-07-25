@@ -11,7 +11,9 @@ use halo2_proofs::transcript::{
     Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer,
 };
 use rand_core::OsRng;
-use zkie_core::chips::eltwise::{EltwiseAddChip, EltwiseAddConfig, EltwiseMulChip, EltwiseMulConfig};
+use zkie_core::chips::eltwise::{
+    EltwiseAddChip, EltwiseAddConfig, EltwiseMulChip, EltwiseMulConfig,
+};
 use zkie_core::field_convert::Fr;
 use zkie_core::fixed_point::I18;
 
@@ -30,7 +32,10 @@ impl Circuit<Fr> for AddCircuit {
     type FloorPlanner = SimpleFloorPlanner;
 
     fn without_witnesses(&self) -> Self {
-        AddCircuit { a: I18::from_raw(0), b: I18::from_raw(0) }
+        AddCircuit {
+            a: I18::from_raw(0),
+            b: I18::from_raw(0),
+        }
     }
 
     fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
@@ -38,10 +43,16 @@ impl Circuit<Fr> for AddCircuit {
         let b = meta.advice_column();
         let c = meta.advice_column();
         let bits = meta.advice_column();
-        AddCircuitConfig { add: EltwiseAddChip::configure(meta, a, b, c, bits) }
+        AddCircuitConfig {
+            add: EltwiseAddChip::configure(meta, a, b, c, bits),
+        }
     }
 
-    fn synthesize(&self, config: Self::Config, layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
+    fn synthesize(
+        &self,
+        config: Self::Config,
+        layouter: impl Layouter<Fr>,
+    ) -> Result<(), ErrorFront> {
         EltwiseAddChip::construct(config.add).assign(layouter, self.a, self.b)
     }
 }
@@ -61,7 +72,10 @@ impl Circuit<Fr> for MulCircuit {
     type FloorPlanner = SimpleFloorPlanner;
 
     fn without_witnesses(&self) -> Self {
-        MulCircuit { a: I18::from_raw(0), b: I18::from_raw(0) }
+        MulCircuit {
+            a: I18::from_raw(0),
+            b: I18::from_raw(0),
+        }
     }
 
     fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
@@ -71,10 +85,16 @@ impl Circuit<Fr> for MulCircuit {
         let r = meta.advice_column();
         let slack = meta.advice_column();
         let bits = meta.advice_column();
-        MulCircuitConfig { mul: EltwiseMulChip::configure(meta, a, b, q, r, slack, bits) }
+        MulCircuitConfig {
+            mul: EltwiseMulChip::configure(meta, a, b, q, r, slack, bits),
+        }
     }
 
-    fn synthesize(&self, config: Self::Config, layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
+    fn synthesize(
+        &self,
+        config: Self::Config,
+        layouter: impl Layouter<Fr>,
+    ) -> Result<(), ErrorFront> {
         EltwiseMulChip::construct(config.mul).assign(layouter, self.a, self.b)
     }
 }
@@ -83,9 +103,14 @@ impl Circuit<Fr> for MulCircuit {
 fn eltwise_add_real_kzg_roundtrip() {
     let k = 10;
     let mut rng = OsRng;
-    let circuit = AddCircuit { a: I18::from_f64(2.0).unwrap(), b: I18::from_f64(3.5).unwrap() };
+    let circuit = AddCircuit {
+        a: I18::from_f64(2.0).unwrap(),
+        b: I18::from_f64(3.5).unwrap(),
+    };
 
-    MockProver::run(k, &circuit, vec![]).unwrap().assert_satisfied();
+    MockProver::run(k, &circuit, vec![])
+        .unwrap()
+        .assert_satisfied();
 
     let params = ParamsKZG::<Bn256>::setup(k, &mut rng);
     let vk = keygen_vk(&params, &circuit).expect("keygen_vk should not fail");
@@ -113,14 +138,21 @@ fn eltwise_add_real_kzg_roundtrip() {
         &[vec![]],
         &mut verifier_transcript,
     );
-    assert!(result.is_ok(), "eltwise add proof failed to verify: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "eltwise add proof failed to verify: {:?}",
+        result
+    );
 }
 
 #[test]
 fn eltwise_add_tampered_proof_fails_verification() {
     let k = 10;
     let mut rng = OsRng;
-    let circuit = AddCircuit { a: I18::from_f64(2.0).unwrap(), b: I18::from_f64(3.5).unwrap() };
+    let circuit = AddCircuit {
+        a: I18::from_f64(2.0).unwrap(),
+        b: I18::from_f64(3.5).unwrap(),
+    };
 
     let params = ParamsKZG::<Bn256>::setup(k, &mut rng);
     let vk = keygen_vk(&params, &circuit).expect("keygen_vk should not fail");
@@ -150,16 +182,24 @@ fn eltwise_add_tampered_proof_fails_verification() {
         &[vec![]],
         &mut verifier_transcript,
     );
-    assert!(result.is_err(), "tampered add proof should fail verification");
+    assert!(
+        result.is_err(),
+        "tampered add proof should fail verification"
+    );
 }
 
 #[test]
 fn eltwise_mul_real_kzg_roundtrip() {
     let k = 10;
     let mut rng = OsRng;
-    let circuit = MulCircuit { a: I18::from_f64(2.0).unwrap(), b: I18::from_f64(3.0).unwrap() };
+    let circuit = MulCircuit {
+        a: I18::from_f64(2.0).unwrap(),
+        b: I18::from_f64(3.0).unwrap(),
+    };
 
-    MockProver::run(k, &circuit, vec![]).unwrap().assert_satisfied();
+    MockProver::run(k, &circuit, vec![])
+        .unwrap()
+        .assert_satisfied();
 
     let params = ParamsKZG::<Bn256>::setup(k, &mut rng);
     let vk = keygen_vk(&params, &circuit).expect("keygen_vk should not fail");
@@ -187,14 +227,21 @@ fn eltwise_mul_real_kzg_roundtrip() {
         &[vec![]],
         &mut verifier_transcript,
     );
-    assert!(result.is_ok(), "eltwise mul proof failed to verify: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "eltwise mul proof failed to verify: {:?}",
+        result
+    );
 }
 
 #[test]
 fn eltwise_mul_tampered_proof_fails_verification() {
     let k = 10;
     let mut rng = OsRng;
-    let circuit = MulCircuit { a: I18::from_f64(2.0).unwrap(), b: I18::from_f64(3.0).unwrap() };
+    let circuit = MulCircuit {
+        a: I18::from_f64(2.0).unwrap(),
+        b: I18::from_f64(3.0).unwrap(),
+    };
 
     let params = ParamsKZG::<Bn256>::setup(k, &mut rng);
     let vk = keygen_vk(&params, &circuit).expect("keygen_vk should not fail");
@@ -224,5 +271,8 @@ fn eltwise_mul_tampered_proof_fails_verification() {
         &[vec![]],
         &mut verifier_transcript,
     );
-    assert!(result.is_err(), "tampered mul proof should fail verification");
+    assert!(
+        result.is_err(),
+        "tampered mul proof should fail verification"
+    );
 }

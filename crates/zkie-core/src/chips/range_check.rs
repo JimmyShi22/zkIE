@@ -51,7 +51,13 @@ impl RangeCheckChip {
             vec![s_sum * (sum - value)]
         });
 
-        RangeCheckConfig { value, bits, s_bit, s_sum, n_bits }
+        RangeCheckConfig {
+            value,
+            bits,
+            s_bit,
+            s_sum,
+            n_bits,
+        }
     }
 
     pub fn construct(config: RangeCheckConfig) -> Self {
@@ -109,7 +115,11 @@ mod tests {
         type FloorPlanner = SimpleFloorPlanner;
 
         fn without_witnesses(&self) -> Self {
-            TestCircuit { value: Value::unknown(), raw_value: Value::unknown(), n_bits: self.n_bits }
+            TestCircuit {
+                value: Value::unknown(),
+                raw_value: Value::unknown(),
+                n_bits: self.n_bits,
+            }
         }
 
         fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
@@ -133,21 +143,33 @@ mod tests {
 
     #[test]
     fn value_within_8_bit_range_is_satisfied() {
-        let circuit = TestCircuit { value: Value::known(Fr::from(200u64)), raw_value: Value::known(200i128), n_bits: 8 };
+        let circuit = TestCircuit {
+            value: Value::known(Fr::from(200u64)),
+            raw_value: Value::known(200i128),
+            n_bits: 8,
+        };
         let prover = MockProver::run(6, &circuit, vec![]).unwrap();
         prover.assert_satisfied();
     }
 
     #[test]
     fn value_equal_to_zero_is_satisfied() {
-        let circuit = TestCircuit { value: Value::known(Fr::zero()), raw_value: Value::known(0i128), n_bits: 8 };
+        let circuit = TestCircuit {
+            value: Value::known(Fr::zero()),
+            raw_value: Value::known(0i128),
+            n_bits: 8,
+        };
         let prover = MockProver::run(6, &circuit, vec![]).unwrap();
         prover.assert_satisfied();
     }
 
     #[test]
     fn value_at_max_of_range_is_satisfied() {
-        let circuit = TestCircuit { value: Value::known(Fr::from(255u64)), raw_value: Value::known(255i128), n_bits: 8 };
+        let circuit = TestCircuit {
+            value: Value::known(Fr::from(255u64)),
+            raw_value: Value::known(255i128),
+            n_bits: 8,
+        };
         let prover = MockProver::run(6, &circuit, vec![]).unwrap();
         prover.assert_satisfied();
     }
@@ -157,7 +179,11 @@ mod tests {
         // 256 does not fit in 8 bits: the running-sum decomposition of the
         // claimed bits cannot equal 256 if all 8 bits are constrained boolean,
         // so the assigned `value` witness (256) will mismatch the sum (<=255).
-        let circuit = TestCircuit { value: Value::known(Fr::from(256u64)), raw_value: Value::known(256i128), n_bits: 8 };
+        let circuit = TestCircuit {
+            value: Value::known(Fr::from(256u64)),
+            raw_value: Value::known(256i128),
+            n_bits: 8,
+        };
         let prover = MockProver::run(6, &circuit, vec![]).unwrap();
         assert!(prover.verify().is_err());
     }
@@ -177,14 +203,19 @@ mod tests {
         type FloorPlanner = SimpleFloorPlanner;
 
         fn without_witnesses(&self) -> Self {
-            WideTestCircuit { value: Value::unknown(), raw_value: Value::unknown() }
+            WideTestCircuit {
+                value: Value::unknown(),
+                raw_value: Value::unknown(),
+            }
         }
 
         fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
             let value = meta.advice_column();
             let bits = meta.advice_column();
             meta.enable_equality(value);
-            WideTestConfig { range: RangeCheckChip::configure(meta, value, bits, 64) }
+            WideTestConfig {
+                range: RangeCheckChip::configure(meta, value, bits, 64),
+            }
         }
 
         fn synthesize(

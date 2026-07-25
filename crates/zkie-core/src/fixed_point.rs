@@ -106,7 +106,7 @@ mod tests {
         let a = I18::from_f64(0.1).unwrap();
         let b = I18::from_f64(0.1).unwrap();
         let (_, r) = requantize_mul(a, b).unwrap();
-        assert!(r >= 0 && r < SCALE_18);
+        assert!((0..SCALE_18).contains(&r));
     }
 
     #[test]
@@ -115,6 +115,6 @@ mod tests {
         let b = I18::from_f64(2.0).unwrap();
         let (q, r) = requantize_mul(a, b).unwrap();
         assert!((q.to_f64() - (-5.0)).abs() < 1e-9);
-        assert!(r >= 0 && r < SCALE_18);
+        assert!((0..SCALE_18).contains(&r));
     }
 }

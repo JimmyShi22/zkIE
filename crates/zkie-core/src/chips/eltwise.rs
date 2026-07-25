@@ -53,23 +53,51 @@ impl EltwiseAddChip {
         let range_b = RangeCheckChip::configure(meta, b, bits, 64);
         let range_c = RangeCheckChip::configure(meta, c, bits, 64);
 
-        EltwiseAddConfig { a, b, c, s_add, range_a, range_b, range_c }
+        EltwiseAddConfig {
+            a,
+            b,
+            c,
+            s_add,
+            range_a,
+            range_b,
+            range_c,
+        }
     }
 
     pub fn construct(config: EltwiseAddConfig) -> Self {
         EltwiseAddChip { config }
     }
 
-    pub fn assign(&self, mut layouter: impl Layouter<Fr>, a: I18, b: I18) -> Result<(), ErrorFront> {
+    pub fn assign(
+        &self,
+        mut layouter: impl Layouter<Fr>,
+        a: I18,
+        b: I18,
+    ) -> Result<(), ErrorFront> {
         let c_raw = a.raw().checked_add(b.raw()).expect("I18 add overflow");
 
         layouter.assign_region(
             || "eltwise add",
             |mut region| {
                 self.config.s_add.enable(&mut region, 0)?;
-                region.assign_advice(|| "a", self.config.a, 0, || Value::known(i64_to_fr(a.raw())))?;
-                region.assign_advice(|| "b", self.config.b, 0, || Value::known(i64_to_fr(b.raw())))?;
-                region.assign_advice(|| "c", self.config.c, 0, || Value::known(i64_to_fr(c_raw)))?;
+                region.assign_advice(
+                    || "a",
+                    self.config.a,
+                    0,
+                    || Value::known(i64_to_fr(a.raw())),
+                )?;
+                region.assign_advice(
+                    || "b",
+                    self.config.b,
+                    0,
+                    || Value::known(i64_to_fr(b.raw())),
+                )?;
+                region.assign_advice(
+                    || "c",
+                    self.config.c,
+                    0,
+                    || Value::known(i64_to_fr(c_raw)),
+                )?;
                 Ok(())
             },
         )?;
@@ -168,7 +196,12 @@ impl EltwiseMulChip {
         EltwiseMulChip { config }
     }
 
-    pub fn assign(&self, mut layouter: impl Layouter<Fr>, a: I18, b: I18) -> Result<(), ErrorFront> {
+    pub fn assign(
+        &self,
+        mut layouter: impl Layouter<Fr>,
+        a: I18,
+        b: I18,
+    ) -> Result<(), ErrorFront> {
         let (q, r) = requantize_mul(a, b).expect("I18 mul overflow");
         let slack = SCALE_18 - 1 - r;
 
@@ -177,11 +210,31 @@ impl EltwiseMulChip {
             |mut region| {
                 self.config.s_mul.enable(&mut region, 0)?;
                 self.config.s_slack.enable(&mut region, 0)?;
-                region.assign_advice(|| "a", self.config.a, 0, || Value::known(i64_to_fr(a.raw())))?;
-                region.assign_advice(|| "b", self.config.b, 0, || Value::known(i64_to_fr(b.raw())))?;
-                region.assign_advice(|| "q", self.config.q, 0, || Value::known(i64_to_fr(q.raw())))?;
+                region.assign_advice(
+                    || "a",
+                    self.config.a,
+                    0,
+                    || Value::known(i64_to_fr(a.raw())),
+                )?;
+                region.assign_advice(
+                    || "b",
+                    self.config.b,
+                    0,
+                    || Value::known(i64_to_fr(b.raw())),
+                )?;
+                region.assign_advice(
+                    || "q",
+                    self.config.q,
+                    0,
+                    || Value::known(i64_to_fr(q.raw())),
+                )?;
                 region.assign_advice(|| "r", self.config.r, 0, || Value::known(i128_to_fr(r)))?;
-                region.assign_advice(|| "slack", self.config.slack, 0, || Value::known(i128_to_fr(slack)))?;
+                region.assign_advice(
+                    || "slack",
+                    self.config.slack,
+                    0,
+                    || Value::known(i128_to_fr(slack)),
+                )?;
                 Ok(())
             },
         )?;
@@ -191,7 +244,11 @@ impl EltwiseMulChip {
         range_q_chip.assign(layouter.namespace(|| "range q"), q_shift_fr, q_shift_raw)?;
 
         let range_r_chip = RangeCheckChip::construct(self.config.range_r.clone());
-        range_r_chip.assign(layouter.namespace(|| "range r"), Value::known(i128_to_fr(r)), Value::known(r))?;
+        range_r_chip.assign(
+            layouter.namespace(|| "range r"),
+            Value::known(i128_to_fr(r)),
+            Value::known(r),
+        )?;
 
         let range_r_slack_chip = RangeCheckChip::construct(self.config.range_r_slack.clone());
         range_r_slack_chip.assign(
@@ -227,7 +284,10 @@ mod tests {
         type FloorPlanner = SimpleFloorPlanner;
 
         fn without_witnesses(&self) -> Self {
-            AddTestCircuit { a: I18::from_raw(0), b: I18::from_raw(0) }
+            AddTestCircuit {
+                a: I18::from_raw(0),
+                b: I18::from_raw(0),
+            }
         }
 
         fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
@@ -235,10 +295,16 @@ mod tests {
             let b = meta.advice_column();
             let c = meta.advice_column();
             let bits = meta.advice_column();
-            AddTestConfig { add: EltwiseAddChip::configure(meta, a, b, c, bits) }
+            AddTestConfig {
+                add: EltwiseAddChip::configure(meta, a, b, c, bits),
+            }
         }
 
-        fn synthesize(&self, config: Self::Config, layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            layouter: impl Layouter<Fr>,
+        ) -> Result<(), ErrorFront> {
             let chip = EltwiseAddChip::construct(config.add);
             chip.assign(layouter, self.a, self.b)
         }
@@ -246,14 +312,20 @@ mod tests {
 
     #[test]
     fn add_positive_plus_positive_satisfied() {
-        let circuit = AddTestCircuit { a: I18::from_f64(2.0).unwrap(), b: I18::from_f64(3.5).unwrap() };
+        let circuit = AddTestCircuit {
+            a: I18::from_f64(2.0).unwrap(),
+            b: I18::from_f64(3.5).unwrap(),
+        };
         let prover = MockProver::run(10, &circuit, vec![]).unwrap();
         prover.assert_satisfied();
     }
 
     #[test]
     fn add_negative_plus_positive_satisfied() {
-        let circuit = AddTestCircuit { a: I18::from_f64(-2.0).unwrap(), b: I18::from_f64(3.5).unwrap() };
+        let circuit = AddTestCircuit {
+            a: I18::from_f64(-2.0).unwrap(),
+            b: I18::from_f64(3.5).unwrap(),
+        };
         let prover = MockProver::run(10, &circuit, vec![]).unwrap();
         prover.assert_satisfied();
     }
@@ -270,7 +342,10 @@ mod tests {
             type FloorPlanner = SimpleFloorPlanner;
 
             fn without_witnesses(&self) -> Self {
-                ForgedAddCircuit { a: I18::from_raw(0), b: I18::from_raw(0) }
+                ForgedAddCircuit {
+                    a: I18::from_raw(0),
+                    b: I18::from_raw(0),
+                }
             }
 
             fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
@@ -286,17 +361,35 @@ mod tests {
                     || "forged add",
                     |mut region| {
                         config.add.s_add.enable(&mut region, 0)?;
-                        region.assign_advice(|| "a", config.add.a, 0, || Value::known(i64_to_fr(self.a.raw())))?;
-                        region.assign_advice(|| "b", config.add.b, 0, || Value::known(i64_to_fr(self.b.raw())))?;
+                        region.assign_advice(
+                            || "a",
+                            config.add.a,
+                            0,
+                            || Value::known(i64_to_fr(self.a.raw())),
+                        )?;
+                        region.assign_advice(
+                            || "b",
+                            config.add.b,
+                            0,
+                            || Value::known(i64_to_fr(self.b.raw())),
+                        )?;
                         let forged_c = self.a.raw() + self.b.raw() + 1;
-                        region.assign_advice(|| "c", config.add.c, 0, || Value::known(i64_to_fr(forged_c)))
+                        region.assign_advice(
+                            || "c",
+                            config.add.c,
+                            0,
+                            || Value::known(i64_to_fr(forged_c)),
+                        )
                     },
                 )?;
                 Ok(())
             }
         }
 
-        let circuit = ForgedAddCircuit { a: I18::from_f64(2.0).unwrap(), b: I18::from_f64(3.0).unwrap() };
+        let circuit = ForgedAddCircuit {
+            a: I18::from_f64(2.0).unwrap(),
+            b: I18::from_f64(3.0).unwrap(),
+        };
         let prover = MockProver::run(10, &circuit, vec![]).unwrap();
         assert!(prover.verify().is_err());
     }
@@ -316,7 +409,10 @@ mod tests {
         type FloorPlanner = SimpleFloorPlanner;
 
         fn without_witnesses(&self) -> Self {
-            MulTestCircuit { a: I18::from_raw(0), b: I18::from_raw(0) }
+            MulTestCircuit {
+                a: I18::from_raw(0),
+                b: I18::from_raw(0),
+            }
         }
 
         fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
@@ -326,10 +422,16 @@ mod tests {
             let r = meta.advice_column();
             let slack = meta.advice_column();
             let bits = meta.advice_column();
-            MulTestConfig { mul: EltwiseMulChip::configure(meta, a, b, q, r, slack, bits) }
+            MulTestConfig {
+                mul: EltwiseMulChip::configure(meta, a, b, q, r, slack, bits),
+            }
         }
 
-        fn synthesize(&self, config: Self::Config, layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            layouter: impl Layouter<Fr>,
+        ) -> Result<(), ErrorFront> {
             let chip = EltwiseMulChip::construct(config.mul);
             chip.assign(layouter, self.a, self.b)
         }
@@ -337,14 +439,20 @@ mod tests {
 
     #[test]
     fn mul_positive_times_positive_satisfied() {
-        let circuit = MulTestCircuit { a: I18::from_f64(2.0).unwrap(), b: I18::from_f64(3.0).unwrap() };
+        let circuit = MulTestCircuit {
+            a: I18::from_f64(2.0).unwrap(),
+            b: I18::from_f64(3.0).unwrap(),
+        };
         let prover = MockProver::run(10, &circuit, vec![]).unwrap();
         prover.assert_satisfied();
     }
 
     #[test]
     fn mul_negative_times_positive_satisfied() {
-        let circuit = MulTestCircuit { a: I18::from_f64(-2.5).unwrap(), b: I18::from_f64(2.0).unwrap() };
+        let circuit = MulTestCircuit {
+            a: I18::from_f64(-2.5).unwrap(),
+            b: I18::from_f64(2.0).unwrap(),
+        };
         let prover = MockProver::run(10, &circuit, vec![]).unwrap();
         prover.assert_satisfied();
     }
@@ -361,7 +469,10 @@ mod tests {
             type FloorPlanner = SimpleFloorPlanner;
 
             fn without_witnesses(&self) -> Self {
-                ForgedMulCircuit { a: I18::from_raw(0), b: I18::from_raw(0) }
+                ForgedMulCircuit {
+                    a: I18::from_raw(0),
+                    b: I18::from_raw(0),
+                }
             }
 
             fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
@@ -380,19 +491,47 @@ mod tests {
                     |mut region| {
                         config.mul.s_mul.enable(&mut region, 0)?;
                         config.mul.s_slack.enable(&mut region, 0)?;
-                        region.assign_advice(|| "a", config.mul.a, 0, || Value::known(i64_to_fr(self.a.raw())))?;
-                        region.assign_advice(|| "b", config.mul.b, 0, || Value::known(i64_to_fr(self.b.raw())))?;
-                        region.assign_advice(|| "q", config.mul.q, 0, || Value::known(i64_to_fr(forged_q)))?;
-                        region.assign_advice(|| "r", config.mul.r, 0, || Value::known(i128_to_fr(r)))?;
+                        region.assign_advice(
+                            || "a",
+                            config.mul.a,
+                            0,
+                            || Value::known(i64_to_fr(self.a.raw())),
+                        )?;
+                        region.assign_advice(
+                            || "b",
+                            config.mul.b,
+                            0,
+                            || Value::known(i64_to_fr(self.b.raw())),
+                        )?;
+                        region.assign_advice(
+                            || "q",
+                            config.mul.q,
+                            0,
+                            || Value::known(i64_to_fr(forged_q)),
+                        )?;
+                        region.assign_advice(
+                            || "r",
+                            config.mul.r,
+                            0,
+                            || Value::known(i128_to_fr(r)),
+                        )?;
                         let slack = SCALE_18 - 1 - r;
-                        region.assign_advice(|| "slack", config.mul.slack, 0, || Value::known(i128_to_fr(slack)))
+                        region.assign_advice(
+                            || "slack",
+                            config.mul.slack,
+                            0,
+                            || Value::known(i128_to_fr(slack)),
+                        )
                     },
                 )?;
                 Ok(())
             }
         }
 
-        let circuit = ForgedMulCircuit { a: I18::from_f64(2.0).unwrap(), b: I18::from_f64(3.0).unwrap() };
+        let circuit = ForgedMulCircuit {
+            a: I18::from_f64(2.0).unwrap(),
+            b: I18::from_f64(3.0).unwrap(),
+        };
         let prover = MockProver::run(10, &circuit, vec![]).unwrap();
         assert!(prover.verify().is_err());
     }
