@@ -64,6 +64,12 @@ pub enum OnnxParseError {
         value: f32,
         source: FixedPointError,
     },
+    /// A requested weight name was not present in an extracted initializer
+    /// map. This does not indicate a malformed ONNX model — it means a
+    /// caller (e.g. `graph_compiler::CompiledProgram::weight_as_i18`) asked
+    /// for a weight tensor name that doesn't exist among the graph's
+    /// initializers.
+    WeightNotFound(String),
 }
 
 impl fmt::Display for OnnxParseError {
@@ -93,6 +99,10 @@ impl fmt::Display for OnnxParseError {
             } => write!(
                 f,
                 "weight value {value} at index {index} does not fit in I18 fixed-point range: {source}"
+            ),
+            OnnxParseError::WeightNotFound(name) => write!(
+                f,
+                "no weight named '{name}' was found among this model's initializers"
             ),
         }
     }
