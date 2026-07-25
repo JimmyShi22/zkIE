@@ -1,3 +1,4 @@
+use halo2_proofs::circuit::Value;
 pub use halo2_proofs::halo2curves::bn256::Fr;
 use halo2_proofs::halo2curves::ff::PrimeField;
 
@@ -15,6 +16,19 @@ pub fn i128_to_fr(v: i128) -> Fr {
     } else {
         -Fr::from_u128((-v) as u128)
     }
+}
+
+/// Shift applied to signed i64 values before range-checking them with
+/// `RangeCheckChip`, which only supports unsigned ranges: adding `2^63` maps
+/// the full `i64` range onto `[0, 2^64)`.
+pub const SIGNED_SHIFT: i128 = 1i128 << 63;
+
+/// Shifts a signed `i64` by `SIGNED_SHIFT` and returns both the field-element
+/// witness and the raw shifted value (needed by `RangeCheckChip::assign`'s
+/// bit-decomposition), so a signed value can be range-checked as unsigned.
+pub fn shifted_i64_witness(v: i64) -> (Value<Fr>, Value<i128>) {
+    let shifted = (v as i128) + SIGNED_SHIFT;
+    (Value::known(i128_to_fr(shifted)), Value::known(shifted))
 }
 
 #[cfg(test)]

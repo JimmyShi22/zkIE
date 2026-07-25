@@ -1,17 +1,11 @@
 use crate::chips::range_check::{RangeCheckChip, RangeCheckConfig};
-use crate::field_convert::{i128_to_fr, i64_to_fr, Fr};
+use crate::field_convert::{i128_to_fr, i64_to_fr, shifted_i64_witness, Fr};
 use crate::fixed_point::{requantize_mul, I18, SCALE_18};
 use halo2_proofs::circuit::{Layouter, Value};
 use halo2_proofs::plonk::{Advice, Column, ConstraintSystem, ErrorFront, Expression, Selector};
 use halo2_proofs::poly::Rotation;
 
-const SIGNED_SHIFT: i128 = 1i128 << 63;
 const REMAINDER_BITS: usize = 60; // 2^60 > SCALE_18 - 1.
-
-fn shifted_i64_witness(v: i64) -> (Value<Fr>, Value<i128>) {
-    let shifted = (v as i128) + SIGNED_SHIFT;
-    (Value::known(i128_to_fr(shifted)), Value::known(shifted))
-}
 
 #[derive(Clone, Debug)]
 pub struct EltwiseAddConfig {
