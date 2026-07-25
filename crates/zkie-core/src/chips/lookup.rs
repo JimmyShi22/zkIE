@@ -1,9 +1,22 @@
 use crate::field_convert::{i64_to_fr, Fr};
 use crate::fixed_point::I18;
 use halo2_proofs::circuit::{Layouter, Value};
-use halo2_proofs::plonk::{Advice, Column, ConstraintSystem, ErrorFront, TableColumn};
+use halo2_proofs::plonk::{
+    Advice, Column, ConstraintSystem, ErrorFront, Expression, Selector, TableColumn,
+};
 use halo2_proofs::poly::Rotation;
 use std::fmt;
+
+/// Sentinel raw `I18` value reserved as the lookup argument's "disabled row"
+/// fallback (see [`LookupConfig`]). Chosen as `i64::MIN` because it is not a
+/// value any realistic fixed-point domain point would legitimately take (it
+/// corresponds to an astronomically large-magnitude negative real number),
+/// so it can never collide with a genuine caller-supplied domain point.
+const PAD_INPUT_RAW: i64 = i64::MIN;
+/// Fallback output paired with [`PAD_INPUT_RAW`] in the reserved padding
+/// table row. The value is arbitrary (never observed by a real query) but
+/// fixed so the padding row is a single well-defined table entry.
+const PAD_OUTPUT_RAW: i64 = 0;
 
 /// Error raised by [`LookupChip::assign`] when the requested input is not an
 /// exact point of the chip's quantized domain, or when the underlying circuit
@@ -44,10 +57,29 @@ impl From<ErrorFront> for LookupError {
 /// constrained via a lookup argument to be a row of a fixed table
 /// (`table_input`, `table_output`) representing a quantized function
 /// `f: I18 -> I18`.
+///
+/// The lookup argument is gated by `selector`: on rows where `assign` enables
+/// it, the actual `(input, output)` pair is checked against the table. On
+/// every other row of the circuit (including rows this chip's columns never
+/// touch, which halo2 treats as holding field-zero), the check instead
+/// trivially collapses to the reserved `(PAD_INPUT_RAW, PAD_OUTPUT_RAW)` row
+/// that `load_table` always loads. Without this gating, a halo2 lookup
+/// argument applies unconditionally to *every* row of the whole circuit, so
+/// any row this chip's dedicated columns don't explicitly assign would
+/// otherwise have to satisfy `(0, 0) ∈ table` — which is false whenever the
+/// domain doesn't happen to map `0 -> 0`, silently making the circuit
+/// unsatisfiable for otherwise-correct witnesses. See the `padding` tests
+/// below.
 #[derive(Clone, Debug)]
 pub struct LookupConfig {
-    input: Column<Advice>,
-    output: Column<Advice>,
+    // Crate-visible (not fully private) so that composed chips such as
+    // `EmbedLookupChip` (which configures several independent `LookupChip`s,
+    // one per output dimension) and their tests can reach into the raw
+    // region layout, e.g. to forge a witness for a negative test — mirroring
+    // the pattern used by `DotProductConfig` in `dot_general.rs`.
+    pub(crate) input: Column<Advice>,
+    pub(crate) output: Column<Advice>,
+    pub(crate) selector: Selector,
     table_input: TableColumn,
     table_output: TableColumn,
 }
@@ -78,18 +110,39 @@ impl LookupChip {
         meta.enable_equality(input);
         meta.enable_equality(output);
 
+        // A complex selector is required (rather than a simple one) because
+        // it appears inside a lookup argument expression below.
+        let selector = meta.complex_selector();
         let table_input = meta.lookup_table_column();
         let table_output = meta.lookup_table_column();
 
         meta.lookup("input/output is a row of the function table", |meta| {
+            let s = meta.query_selector(selector);
+            let one = Expression::Constant(Fr::from(1u64));
             let input_expr = meta.query_advice(input, Rotation::cur());
             let output_expr = meta.query_advice(output, Rotation::cur());
-            vec![(input_expr, table_input), (output_expr, table_output)]
+            let pad_input = Expression::Constant(i64_to_fr(PAD_INPUT_RAW));
+            let pad_output = Expression::Constant(i64_to_fr(PAD_OUTPUT_RAW));
+            // On disabled rows (`s == 0`), the checked pair collapses to the
+            // fixed `(PAD_INPUT_RAW, PAD_OUTPUT_RAW)` row, which `load_table`
+            // always includes — trivially satisfied regardless of the
+            // (irrelevant, possibly zero-valued) advice cells at that row.
+            vec![
+                (
+                    s.clone() * input_expr + (one.clone() - s.clone()) * pad_input,
+                    table_input,
+                ),
+                (
+                    s.clone() * output_expr + (one - s) * pad_output,
+                    table_output,
+                ),
+            ]
         });
 
         LookupConfig {
             input,
             output,
+            selector,
             table_input,
             table_output,
         }
@@ -133,6 +186,23 @@ impl LookupChip {
                         || Value::known(i64_to_fr(output.raw())),
                     )?;
                 }
+                // Reserved padding row (see `LookupConfig`'s doc comment):
+                // every row of the circuit outside an `assign`-enabled row
+                // collapses to this pair, so it must always be a member of
+                // the table, independently of the caller-supplied domain.
+                let pad_row = self.domain.len();
+                table.assign_cell(
+                    || "table input (padding)",
+                    self.config.table_input,
+                    pad_row,
+                    || Value::known(i64_to_fr(PAD_INPUT_RAW)),
+                )?;
+                table.assign_cell(
+                    || "table output (padding)",
+                    self.config.table_output,
+                    pad_row,
+                    || Value::known(i64_to_fr(PAD_OUTPUT_RAW)),
+                )?;
                 Ok(())
             },
         )
@@ -154,6 +224,7 @@ impl LookupChip {
         layouter.assign_region(
             || "lookup assign",
             |mut region| {
+                self.config.selector.enable(&mut region, 0)?;
                 region.assign_advice(
                     || "input",
                     self.config.input,
@@ -379,6 +450,12 @@ mod tests {
                 layouter.assign_region(
                     || "forged lookup",
                     |mut region| {
+                        // Must enable the selector here too: the lookup is
+                        // gated (see `LookupConfig`'s doc comment), so this
+                        // forged row would otherwise silently collapse to
+                        // the always-satisfied padding row instead of
+                        // actually checking the forged values below.
+                        lookup_config.selector.enable(&mut region, 0)?;
                         region.assign_advice(
                             || "input",
                             lookup_config.input,
@@ -455,6 +532,11 @@ mod tests {
                 layouter.assign_region(
                     || "forged lookup",
                     |mut region| {
+                        // See the comment in `forged_output_for_a_valid_input_is_rejected`:
+                        // the lookup is gated, so the selector must be
+                        // enabled for this row's forged values to actually
+                        // be checked.
+                        lookup_config.selector.enable(&mut region, 0)?;
                         region.assign_advice(
                             || "input",
                             lookup_config.input,
@@ -486,5 +568,24 @@ mod tests {
         };
         let prover = MockProver::run(6, &circuit, vec![]).unwrap();
         assert!(prover.verify().is_err());
+    }
+
+    #[test]
+    fn domain_not_mapping_zero_to_zero_is_still_satisfied() {
+        // Regression test for the "unassigned rows default to (0, 0)" trap:
+        // a halo2 lookup argument applies to every row of the circuit, not
+        // just the one row `assign` touches. Before the selector-gating fix,
+        // this would fail on every one of the circuit's other (unassigned,
+        // hence zero-valued) rows unless the domain happened to map 0 -> 0.
+        // This domain deliberately does not: it starts at raw input 1.
+        let domain: Vec<I18> = (1..=16).map(I18::from_raw).collect();
+        let values: Vec<I18> = domain.iter().map(|x| I18::from_raw(x.raw() * 10)).collect();
+        let circuit = LookupTestCircuit {
+            input: domain[3],
+            domain,
+            values,
+        };
+        let prover = MockProver::run(6, &circuit, vec![]).unwrap();
+        prover.assert_satisfied();
     }
 }
