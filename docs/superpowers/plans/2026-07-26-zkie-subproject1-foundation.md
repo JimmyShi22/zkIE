@@ -1,6 +1,6 @@
 # zkIE Sub-Project 1 Foundation Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Build `zkie-core`'s foundation layer (fixed-point numbers, a generic range-check
 gate, the ELTWISE Add/Mul chips, the ISA/Chip scaffolding, and Tensor) and prove it works
@@ -16,7 +16,7 @@ follow the standard halo2 `Config`/`Circuit` pattern.
 
 ## Global Constraints
 
-- `halo2_proofs` dependency: `{ git = "https://github.com/privacy-scaling-explorations/halo2.git", tag = "v0.4.0" }` — verified to compile and pass tests in this environment (see `.spike-test/`, not committed).
+- `halo2_proofs` dependency: `{ git = "https://github.com/privacy-scaling-explorations/halo2.git", tag = "v0.4.0" }` — verified to compile and pass tests in this environment via a throwaway spike (`.spike-test/`, gitignored, deleted once this plan's own tests passed).
 - Use `halo2_proofs::halo2curves::bn256::{Fr, G1Affine, Bn256}` (the re-export), not a separate direct `halo2curves` dependency — avoids version-mismatch risk.
 - **Cargo/build commands must be run from inside `/Users/jimmyshi/code/zkie/...`, never from `/tmp` or the scratchpad** — local security software SIGKILLs build scripts (`build.rs`) run from temp paths. See root `CLAUDE.md`.
 - `Circuit::synthesize` returns `halo2_proofs::plonk::ErrorFront` in this version (not the plain `Error` alias used in older halo2 tutorials).
@@ -39,7 +39,7 @@ follow the standard halo2 `Config`/`Circuit` pattern.
 **Interfaces:**
 - Produces: an empty `zkie-core` lib crate that `cargo test` can run against.
 
-- [ ] **Step 1: Create the workspace manifest**
+- [x] **Step 1: Create the workspace manifest**
 
 `Cargo.toml`:
 ```toml
@@ -48,7 +48,7 @@ resolver = "2"
 members = ["crates/zkie-core"]
 ```
 
-- [ ] **Step 2: Create the `zkie-core` crate manifest**
+- [x] **Step 2: Create the `zkie-core` crate manifest**
 
 `crates/zkie-core/Cargo.toml`:
 ```toml
@@ -62,7 +62,7 @@ halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2.gi
 rand_core = { version = "0.6", features = ["getrandom"] }
 ```
 
-- [ ] **Step 3: Create an empty lib with a placeholder test**
+- [x] **Step 3: Create an empty lib with a placeholder test**
 
 `crates/zkie-core/src/lib.rs`:
 ```rust
@@ -75,12 +75,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: Run test to verify the workspace builds**
+- [x] **Step 4: Run test to verify the workspace builds**
 
 Run (from `/Users/jimmyshi/code/zkie`): `cargo test -p zkie-core`
 Expected: `test tests::crate_compiles ... ok` (first run downloads/compiles `halo2_proofs` and its dependency tree — can take a few minutes).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Cargo.toml crates/zkie-core/Cargo.toml crates/zkie-core/src/lib.rs
@@ -103,7 +103,7 @@ git commit -m "chore: scaffold zkie-core cargo workspace"
   - `pub fn requantize_mul(a: I18, b: I18) -> Result<(I18, i128), FixedPointError>` returning `(quotient_as_I18, remainder)` where `remainder` satisfies `0 <= remainder < SCALE_18`
   - Later tasks (3+) consume `I18::raw()` (an `i64`) to build circuit witnesses, and `requantize_mul` to compute the expected `(q, r)` witness pair for the Mul chip.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[cfg(test)]
@@ -165,12 +165,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p zkie-core fixed_point`
 Expected: FAIL with "cannot find function/struct" compile errors (module doesn't exist yet).
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 use std::fmt;
@@ -237,18 +237,18 @@ pub fn requantize_mul(a: I18, b: I18) -> Result<(I18, i128), FixedPointError> {
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p zkie-core fixed_point`
 Expected: all tests `ok`.
 
-- [ ] **Step 5: Add the module to `lib.rs`**
+- [x] **Step 5: Add the module to `lib.rs`**
 
 ```rust
 pub mod fixed_point;
 ```
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/zkie-core/src/fixed_point.rs crates/zkie-core/src/lib.rs
@@ -267,7 +267,7 @@ git commit -m "feat: add I18 fixed-point number system"
 - Consumes: nothing from earlier tasks.
 - Produces: `pub fn i64_to_fr(v: i64) -> Fr` and `pub fn i128_to_fr(v: i128) -> Fr` (used by Task 4/5 to build circuit witnesses from `I18::raw()` / remainder values). `Fr` re-exported as `pub use halo2_proofs::halo2curves::bn256::Fr;` from this module for convenience.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[cfg(test)]
@@ -299,12 +299,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p zkie-core field_convert`
 Expected: FAIL — module/functions don't exist.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 pub use halo2_proofs::halo2curves::bn256::Fr;
@@ -332,19 +332,19 @@ from Step 4 will name the correct trait/method — adjust the two branches above
 whatever the compiler suggests (e.g. decomposing into two `u64` limbs) and re-run. Do not
 guess further method names beyond what the compiler reports.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p zkie-core field_convert`
 Expected: all tests `ok`. If `from_u128`/`PrimeField` import path errors surface, fix per
 the compiler's suggestion and re-run this step before moving on.
 
-- [ ] **Step 5: Add the module to `lib.rs`**
+- [x] **Step 5: Add the module to `lib.rs`**
 
 ```rust
 pub mod field_convert;
 ```
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/zkie-core/src/field_convert.rs crates/zkie-core/src/lib.rs
@@ -370,7 +370,7 @@ git commit -m "feat: add i64/i128 to Fr conversion helpers"
     - `fn assign(&self, layouter: impl Layouter<Fr>, value: Value<Fr>, raw_value: Value<i128>) -> Result<AssignedCell<Fr, Fr>, ErrorFront>` — assigns `value` into the `value` column, decomposes `raw_value` (an unsigned, already-shifted-if-signed magnitude, known only in the witness-generation context) into `n_bits` boolean cells in `bits` (one row per bit, using `n_bits` rows total within its own region), and enforces (via `s_sum` at the last bit row, referencing all prior rows through `Rotation`) that the running sum of `bit_i * 2^i` equals `value`. Returns the assigned `value` cell so callers can `copy_advice`/`constrain_instance` it elsewhere.
   - Later tasks (5) call `RangeCheckChip::configure`/`assign` twice per Eltwise chip (once for each range-checked quantity), and use the "shift by `2^63`" trick for signed 64-bit values, and the "double decomposition" trick (two `RangeCheckChip` instances: one on `r`, one on `SCALE_18 - 1 - r`, both with `n_bits = 60`) for the Mul remainder bound.
 
-- [ ] **Step 1: Write the failing tests (in `range_check.rs`, using `MockProver`)**
+- [x] **Step 1: Write the failing tests (in `range_check.rs`, using `MockProver`)**
 
 ```rust
 #[cfg(test)]
@@ -452,12 +452,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p zkie-core range_check`
 Expected: FAIL — `RangeCheckChip`/`RangeCheckConfig` don't exist yet.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 use crate::field_convert::Fr;
@@ -552,12 +552,12 @@ cell for one `assign` call live in the same region at consecutive rows `0..n_bit
 placing `value` at row `0` and bits at rows `1..=n_bits` with positive rotations instead —
 follow the compiler's actual error rather than guessing further.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p zkie-core range_check`
 Expected: all 4 tests `ok`, including the negative case failing verification.
 
-- [ ] **Step 5: Wire up `chips/mod.rs` and `lib.rs`**
+- [x] **Step 5: Wire up `chips/mod.rs` and `lib.rs`**
 
 `crates/zkie-core/src/chips/mod.rs`:
 ```rust
@@ -566,7 +566,7 @@ pub mod range_check;
 
 `lib.rs`: add `pub mod chips;`
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/zkie-core/src/chips crates/zkie-core/src/lib.rs
@@ -590,7 +590,7 @@ git commit -m "feat: add generic bit-decomposition RangeCheckChip"
   - `pub struct EltwiseMulChip { config: EltwiseMulConfig }` with analogous `configure`/`construct`/`assign(&self, layouter, a: I18, b: I18) -> Result<(), ErrorFront>` implementing the quotient/remainder rescale gate `a*b - q*SCALE_18 - r = 0`, range-checking `q` as signed 64-bit and `r`/`SCALE_18-1-r` each as unsigned 60-bit (the double-decomposition bound).
   - Later tasks (7) instantiate these chips inside a top-level `Circuit` impl for the KZG roundtrip test.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[cfg(test)]
@@ -703,12 +703,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p zkie-core eltwise`
 Expected: FAIL — chips don't exist yet.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 use crate::chips::range_check::{RangeCheckChip, RangeCheckConfig};
@@ -888,12 +888,12 @@ error, give `range_r_slack` its own dedicated advice column (add a `slack` colum
 instead of reusing `r`, and witness `slack` explicitly. Follow the actual compiler/MockProver
 error, not this note, as the source of truth.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p zkie-core eltwise`
 Expected: all 4 tests `ok`.
 
-- [ ] **Step 5: Add negative tests (bad witnesses must fail verification)**
+- [x] **Step 5: Add negative tests (bad witnesses must fail verification)**
 
 ```rust
     #[test]
@@ -943,12 +943,12 @@ normally, then in `synthesize` assign `a`, `b`, and a forged `c != a+b` directly
 `MockProver::run(...).verify().is_err()`. Do the same for `EltwiseMulChip` with a forged
 `q`/`r` pair that doesn't satisfy `a*b == q*SCALE_18+r`.
 
-- [ ] **Step 6: Run tests to verify the negative cases pass**
+- [x] **Step 6: Run tests to verify the negative cases pass**
 
 Run: `cargo test -p zkie-core eltwise`
 Expected: all tests `ok`, including the new negative cases failing verification as expected.
 
-- [ ] **Step 7: Wire up module and commit**
+- [x] **Step 7: Wire up module and commit**
 
 `chips/mod.rs`: add `pub mod eltwise;`
 
@@ -971,7 +971,7 @@ git commit -m "feat: add EltwiseAddChip and EltwiseMulChip"
 - Consumes: nothing structurally new (this task defines the shared vocabulary; `EltwiseAddChip`/`EltwiseMulChip` from Task 5 are the only ones that currently implement `Chip`).
 - Produces: `pub enum Instruction { DotGeneral { .. }, Softmax { .. }, Gelu, LayerNorm { .. }, Eltwise { op: EltwiseOp }, Reduce { .. }, EmbedLookup { .. }, PatchEmbed { .. } }` (fields per the parent design doc §3.1), `pub enum EltwiseOp { Add, Mul, Relu }`, `pub trait Chip { type Input; fn assign(&self, layouter: impl Layouter<Fr>, input: Self::Input) -> Result<(), ErrorFront>; }`, `pub struct Tensor<T> { pub shape: Vec<usize>, pub data: Vec<T> }` with `Tensor::new(shape, data) -> Result<Self, String>` (validates `data.len() == shape.iter().product()`).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // isa.rs
@@ -1004,12 +1004,12 @@ mod tensor_tests {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p zkie-core isa tensor`
 Expected: FAIL — types don't exist yet.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `isa.rs`:
 ```rust
@@ -1085,12 +1085,12 @@ if it's a trivial signature match; otherwise leave `Chip` as a documented-but-un
 placeholder for sub-project 2, where the remaining chips will implement it directly. Do not
 force an awkward retrofit just to satisfy the trait.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p zkie-core isa tensor`
 Expected: all tests `ok`.
 
-- [ ] **Step 5: Wire up `lib.rs` and commit**
+- [x] **Step 5: Wire up `lib.rs` and commit**
 
 ```rust
 pub mod isa;
@@ -1114,7 +1114,7 @@ git commit -m "feat: add ISA Instruction enum, Chip trait, and Tensor type"
 - Consumes: `EltwiseAddChip`/`EltwiseAddConfig`, `EltwiseMulChip`/`EltwiseMulConfig` from Task 5, `I18` from Task 2, `Fr` from Task 3. Uses the exact KZG setup/keygen/prove/verify sequence already verified working in `.spike-test/` (see plan's Global Constraints for the API quirks already resolved there — `ErrorFront`, `TranscriptReadBuffer`/`TranscriptWriterBuffer` imports, `Vec<Vec<Fr>>` instances shape, `&verifier_params`).
 - Produces: nothing consumed by later tasks — this is the sub-project's terminal deliverable.
 
-- [ ] **Step 1: Write the test file**
+- [x] **Step 1: Write the test file**
 
 ```rust
 use halo2_proofs::circuit::{Layouter, SimpleFloorPlanner, Value};
@@ -1258,26 +1258,26 @@ swapping in `EltwiseMulChip`/`EltwiseMulConfig` and `EltwiseMulChip::configure`'
 signature (`a, b, q, r, bits` columns instead of `a, b, c, bits`). This is mechanical
 repetition of an already-fully-specified pattern, not an unresolved design question.
 
-- [ ] **Step 2: Run to verify it fails first (module doesn't exist / chips not public yet)**
+- [x] **Step 2: Run to verify it fails first (module doesn't exist / chips not public yet)**
 
 Run: `cargo test -p zkie-core --test kzg_roundtrip`
 Expected: FAIL initially if `chips`/`fixed_point`/`field_convert` modules or their contents
 aren't `pub` yet — fix visibility (`pub mod`, `pub struct`, `pub fn`) as needed rather than
 changing the test.
 
-- [ ] **Step 3: Run tests to verify they pass**
+- [x] **Step 3: Run tests to verify they pass**
 
 Run: `cargo test -p zkie-core --test kzg_roundtrip`
 Expected: all 4 tests (`eltwise_add_real_kzg_roundtrip`, `eltwise_add_tampered_proof_fails_verification`,
 `eltwise_mul_real_kzg_roundtrip`, `eltwise_mul_tampered_proof_fails_verification`) `ok`.
 
-- [ ] **Step 4: Run the full workspace test suite**
+- [x] **Step 4: Run the full workspace test suite**
 
 Run: `cargo test --workspace`
 Expected: every test across `fixed_point`, `field_convert`, `range_check`, `eltwise`, `isa`,
 `tensor`, and `kzg_roundtrip` passes.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/zkie-core/tests/kzg_roundtrip.rs
@@ -1288,8 +1288,37 @@ git commit -m "test: add real KZG setup/prove/verify roundtrip for ELTWISE chips
 
 ## Definition of Done
 
-- `cargo test --workspace` passes from `/Users/jimmyshi/code/zkie` (not `/tmp`).
-- The KZG roundtrip test proves and verifies real (non-mocked) proofs for both
+- [x] `cargo test --workspace` passes from `/Users/jimmyshi/code/zkie` (not `/tmp`) — 31 tests pass (27 unit + 4 KZG integration).
+- [x] The KZG roundtrip test proves and verifies real (non-mocked) proofs for both
   `EltwiseAddChip` and `EltwiseMulChip`, plus tampered-proof negative cases.
-- `.spike-test/` (gitignored) can be deleted once Task 7 passes — it served its purpose of
-  de-risking the halo2 API before writing this plan.
+- [x] `.spike-test/` (gitignored) deleted — it served its purpose of de-risking the halo2 API
+  before writing this plan.
+- [x] `cargo fmt --all` and `cargo clippy --workspace --all-targets` are clean (zero warnings).
+
+## Status: Complete (2026-07-26)
+
+All 7 tasks executed inline in this session (no user available to review between tasks —
+they stepped away and asked for autonomous execution). Notable deviations from the plan's
+exact code, discovered via real `cargo test` runs rather than guessed in advance:
+
+- The `RangeCheckChip` running-sum gate's rotation offsets were initially reversed relative
+  to `assign`'s row layout (row `i` holds bit `i`, LSB-first) — first `cargo test` run caught
+  this via a `MockProver` constraint-not-satisfied failure with the exact cell values,
+  which made the fix (`Rotation(-((n_bits - 1 - i) as i32))` instead of `Rotation(-(i as
+  i32))`) obvious from the printed cell layout.
+- `MockProver::run(k, ...)`'s `k` needed to be larger than planned: `k=8` was enough for a
+  single 64-bit range check, but the Add chip's 3 range checks (a, b, c) together need more
+  usable rows than `2^8` provides once blinding-factor rows are subtracted; bumped to `k=10`
+  for all Eltwise-level tests.
+- `EltwiseMulConfig` uses a dedicated `slack` column (not a second `RangeCheckChip` reusing
+  the `r` column) for the `SCALE_18 - 1 - r` double-decomposition bound — the plan flagged
+  this as a likely fallback if column-sharing caused a conflict, and it was simpler to just
+  do it that way from the start.
+- The Task 5 Step 5 negative tests (`add_with_forged_sum_is_rejected`,
+  `mul_with_forged_quotient_is_rejected`) turned out not to need the "design note" fallback
+  the plan sketched — `EltwiseAddConfig`/`EltwiseMulConfig`'s fields are private but visible
+  to the same crate's `#[cfg(test)] mod tests`, so the tests access `config.add.s_add`,
+  `config.add.a`, etc. directly without any exposed test-only accessors.
+
+Everything else matches the plan as written and compiled/passed on the first or second
+`cargo test` run per task.
