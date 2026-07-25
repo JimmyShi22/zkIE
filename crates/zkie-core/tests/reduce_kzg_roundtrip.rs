@@ -39,9 +39,10 @@ impl Circuit<Fr> for SumCircuit {
     fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
         let values = meta.advice_column();
         let sum = meta.advice_column();
+        let sum_shift = meta.advice_column();
         let bits = meta.advice_column();
         SumCircuitConfig {
-            reduce: ReduceSumChip::configure(meta, values, sum, bits, K_INPUTS),
+            reduce: ReduceSumChip::configure(meta, values, sum, sum_shift, bits, K_INPUTS),
         }
     }
 
@@ -77,12 +78,15 @@ impl Circuit<Fr> for MeanCircuit {
     fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
         let values = meta.advice_column();
         let sum = meta.advice_column();
+        let sum_shift = meta.advice_column();
         let q = meta.advice_column();
         let r = meta.advice_column();
         let slack = meta.advice_column();
         let bits = meta.advice_column();
         MeanCircuitConfig {
-            reduce: ReduceMeanChip::configure(meta, values, sum, q, r, slack, bits, K_INPUTS),
+            reduce: ReduceMeanChip::configure(
+                meta, values, sum, sum_shift, q, r, slack, bits, K_INPUTS,
+            ),
         }
     }
 
