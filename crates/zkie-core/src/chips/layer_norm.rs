@@ -749,8 +749,13 @@ impl LayerNormChip {
 /// module's top-level soundness docs). Mirrors `DotProductConfig`'s
 /// already-established precedent (in `dot_general.rs`) for composed chips
 /// reaching into a shared sub-chip's raw columns/selector.
+///
+/// `pub(crate)` (not private): `crate::assembler::AssemblerChip` reuses this
+/// exact helper for its own `Eltwise { op: Add }` dispatch, rather than
+/// duplicating it -- the composition need (an operand-cell-exposing variant
+/// of `EltwiseAddChip::assign`) is identical one level up.
 #[allow(clippy::type_complexity)]
-fn assign_add_row(
+pub(crate) fn assign_add_row(
     add: &EltwiseAddConfig,
     mut layouter: impl Layouter<Fr>,
     a_raw: i64,
@@ -810,8 +815,11 @@ fn assign_add_row(
 /// also returns the `a`/`b` operand cells, so `LayerNormChip::assign` can
 /// tie each operand to whichever other chip's cell produced it. See
 /// `assign_add_row`'s doc comment for the same reasoning.
+///
+/// `pub(crate)` for the same reason as `assign_add_row`: reused directly by
+/// `crate::assembler::AssemblerChip`.
 #[allow(clippy::type_complexity)]
-fn assign_mul_row(
+pub(crate) fn assign_mul_row(
     mul: &EltwiseMulConfig,
     mut layouter: impl Layouter<Fr>,
     a_val: I18,

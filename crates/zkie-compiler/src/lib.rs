@@ -3,6 +3,7 @@ pub mod onnx {
     include!(concat!(env!("OUT_DIR"), "/onnx.rs"));
 }
 
+pub mod circuit_binding;
 pub mod graph_compiler;
 pub mod onnx_parser;
 pub mod op_mapper;

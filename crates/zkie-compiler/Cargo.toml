@@ -7,6 +7,14 @@ edition = "2021"
 zkie-core = { path = "../zkie-core" }
 prost = "0.13"
 
+[dev-dependencies]
+# Only used by integration tests (see tests/circuit_binding_pipeline.rs) to
+# drive `zkie_core::assembler::AssemblerChip` end-to-end via MockProver --
+# production code in this crate has no halo2 dependency (see
+# circuit_binding.rs's own module docs on why the assembler itself lives in
+# zkie-core, not here).
+halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2.git", tag = "v0.4.0" }
+
 [build-dependencies]
 prost-build = "0.13"
 protobuf-src = "2"

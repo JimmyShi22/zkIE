@@ -1,3 +1,4 @@
+pub mod assembler;
 pub mod chip;
 pub mod chips;
 pub mod field_convert;

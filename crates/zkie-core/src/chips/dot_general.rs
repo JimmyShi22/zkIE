@@ -81,10 +81,17 @@ pub struct DotProductConfig {
     pub(crate) s_acc_step: Selector,
     pub(crate) s_final: Selector,
     pub(crate) s_slack: Selector,
-    range_q: RangeCheckConfig,
-    range_r: RangeCheckConfig,
-    range_r_slack: RangeCheckConfig,
-    k: usize,
+    // Crate-visible for the same reason as the columns/selectors above --
+    // `AssemblerChip` (see `crate::assembler`) needs to build its own fully
+    // per-element-linked dot-product rows (mirroring `LayerNormChip`'s
+    // `assign_add_row`/`assign_mul_row` precedent for `EltwiseAddConfig`/
+    // `EltwiseMulConfig`), which requires witnessing the range checks
+    // directly against these configs rather than only through
+    // `DotProductChip::assign`'s black-box API.
+    pub(crate) range_q: RangeCheckConfig,
+    pub(crate) range_r: RangeCheckConfig,
+    pub(crate) range_r_slack: RangeCheckConfig,
+    pub(crate) k: usize,
 }
 
 pub struct DotProductChip {
