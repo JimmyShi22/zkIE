@@ -235,9 +235,14 @@ impl RsqrtChip {
 
     /// Witnesses `input` and its precomputed `rsqrt_f64(input)`, checked by
     /// the lookup argument, and returns the looked-up output. Delegates to
-    /// [`LookupChip::assign`].
+    /// [`LookupChip::assign`], discarding the `AssignedCell` it also returns
+    /// (this chip's own output is independently recomputed and re-witnessed
+    /// by its caller, the same discipline `EltwiseAddChip`/`EltwiseMulChip`
+    /// already require of their callers -- see `LayerNormChip::assign`).
     pub fn assign(&self, layouter: impl Layouter<Fr>, input: I18) -> Result<I18, LookupError> {
-        self.inner.assign(layouter, input)
+        self.inner
+            .assign(layouter, input)
+            .map(|(value, _cell)| value)
     }
 }
 
