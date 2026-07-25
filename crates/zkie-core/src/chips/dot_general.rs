@@ -6,7 +6,7 @@
 //! sub-project will instantiate this chip once per output element.
 
 use crate::chips::range_check::{RangeCheckChip, RangeCheckConfig};
-use crate::field_convert::{i128_to_fr, i64_to_fr, shifted_i64_witness, Fr};
+use crate::field_convert::{i128_to_fr, i64_to_fr, shifted_i64_witness, Fr, SIGNED_SHIFT};
 use crate::fixed_point::{requantize_raw, FixedPointError, I18, SCALE_18};
 use halo2_proofs::circuit::{Layouter, Value};
 use halo2_proofs::plonk::{Advice, Column, ConstraintSystem, ErrorFront, Expression, Selector};
@@ -15,6 +15,13 @@ use std::fmt;
 
 // 2^60 > SCALE_18 - 1, so 60 bits is enough to bound a remainder in [0, SCALE_18).
 const REMAINDER_BITS: usize = 60;
+
+// See the soundness note in chips/eltwise.rs: `q` holds the *signed-shifted*
+// representation directly so it can be range-checked and then
+// `region.constrain_equal`'d back to the cell used in the `s_final` gate --
+// `RangeCheckChip::assign` on its own only witnesses a disconnected cell in
+// its own region. `r`/`slack` don't need shifting (non-negative by
+// construction) so only the copy-constraint link is needed for them.
 
 /// Errors that can occur while assigning a `DotProductChip` region.
 #[derive(Debug)]
@@ -131,15 +138,17 @@ impl DotProductChip {
         });
 
         // At the final row (K - 1): final_accumulator = q * SCALE_18 + r,
-        // the same quotient/remainder rescale gadget as EltwiseMulChip.
+        // the same quotient/remainder rescale gadget as EltwiseMulChip, with
+        // `q` held in its shifted representation (see module note).
         let s_final = meta.selector();
-        meta.create_gate("dot product final rescale", |meta| {
+        meta.create_gate("dot product final rescale (shifted q)", |meta| {
             let acc = meta.query_advice(accumulator, Rotation::cur());
-            let q = meta.query_advice(q, Rotation::cur());
+            let q_shift = meta.query_advice(q, Rotation::cur());
             let r = meta.query_advice(r, Rotation::cur());
             let s_final = meta.query_selector(s_final);
             let scale = Expression::Constant(i128_to_fr(SCALE_18));
-            vec![s_final * (acc - q * scale - r)]
+            let shift_scaled = Expression::Constant(i128_to_fr(SIGNED_SHIFT * SCALE_18));
+            vec![s_final * (acc - (q_shift * scale.clone() - shift_scaled) - r)]
         });
 
         // slack = (SCALE_18 - 1) - r, enforced at the same row as s_final.
@@ -210,8 +219,9 @@ impl DotProductChip {
 
         let (q, r) = requantize_raw(raw_sum).map_err(DotProductError::Overflow)?;
         let slack = SCALE_18 - 1 - r;
+        let (q_shift_fr, q_shift_raw) = shifted_i64_witness(q.raw());
 
-        layouter.assign_region(
+        let (q_cell, r_cell, slack_cell) = layouter.assign_region(
             || "dot product accumulation",
             |mut region| {
                 for i in 0..k {
@@ -243,44 +253,49 @@ impl DotProductChip {
                 let last = k - 1;
                 self.config.s_final.enable(&mut region, last)?;
                 self.config.s_slack.enable(&mut region, last)?;
-                region.assign_advice(
-                    || "q",
-                    self.config.q,
-                    last,
-                    || Value::known(i64_to_fr(q.raw())),
-                )?;
-                region.assign_advice(
+                let q_cell = region.assign_advice(|| "q", self.config.q, last, || q_shift_fr)?;
+                let r_cell = region.assign_advice(
                     || "r",
                     self.config.r,
                     last,
                     || Value::known(i128_to_fr(r)),
                 )?;
-                region.assign_advice(
+                let slack_cell = region.assign_advice(
                     || "slack",
                     self.config.slack,
                     last,
                     || Value::known(i128_to_fr(slack)),
                 )?;
-                Ok(())
+                Ok((q_cell, r_cell, slack_cell))
             },
         )?;
 
-        let (q_shift_fr, q_shift_raw) = shifted_i64_witness(q.raw());
         let range_q_chip = RangeCheckChip::construct(self.config.range_q.clone());
-        range_q_chip.assign(layouter.namespace(|| "range q"), q_shift_fr, q_shift_raw)?;
+        let q_range_cell =
+            range_q_chip.assign(layouter.namespace(|| "range q"), q_shift_fr, q_shift_raw)?;
 
         let range_r_chip = RangeCheckChip::construct(self.config.range_r.clone());
-        range_r_chip.assign(
+        let r_range_cell = range_r_chip.assign(
             layouter.namespace(|| "range r"),
             Value::known(i128_to_fr(r)),
             Value::known(r),
         )?;
 
         let range_r_slack_chip = RangeCheckChip::construct(self.config.range_r_slack.clone());
-        range_r_slack_chip.assign(
+        let slack_range_cell = range_r_slack_chip.assign(
             layouter.namespace(|| "range r slack"),
             Value::known(i128_to_fr(slack)),
             Value::known(slack),
+        )?;
+
+        layouter.assign_region(
+            || "dot product range check links",
+            |mut region| {
+                region.constrain_equal(q_cell.cell(), q_range_cell.cell())?;
+                region.constrain_equal(r_cell.cell(), r_range_cell.cell())?;
+                region.constrain_equal(slack_cell.cell(), slack_range_cell.cell())?;
+                Ok(())
+            },
         )?;
 
         Ok(q)
@@ -486,6 +501,7 @@ mod tests {
                 }
                 let (q, r) = requantize_raw(raw_sum).unwrap();
                 let forged_q = q.raw() + 1; // violates final_accumulator == q*SCALE_18 + r
+                let (forged_q_shift_fr, _) = shifted_i64_witness(forged_q);
                 let slack = SCALE_18 - 1 - r;
 
                 layouter.assign_region(
@@ -519,12 +535,7 @@ mod tests {
                         let last = K - 1;
                         config.dot.s_final.enable(&mut region, last)?;
                         config.dot.s_slack.enable(&mut region, last)?;
-                        region.assign_advice(
-                            || "q",
-                            config.dot.q,
-                            last,
-                            || Value::known(i64_to_fr(forged_q)),
-                        )?;
+                        region.assign_advice(|| "q", config.dot.q, last, || forged_q_shift_fr)?;
                         region.assign_advice(
                             || "r",
                             config.dot.r,
@@ -557,5 +568,155 @@ mod tests {
         };
         let prover = MockProver::run(10, &circuit, vec![]).unwrap();
         assert!(prover.verify().is_err());
+    }
+
+    #[test]
+    fn dot_product_constrain_equal_rejects_mismatched_range_check_witness() {
+        // See the analogous test in chips/eltwise.rs for why this must
+        // actually call `constrain_equal` (with mismatched values) rather
+        // than merely omit the link, to be a meaningful probe.
+        struct MismatchedLinkCircuit {
+            a: Vec<I18>,
+            b: Vec<I18>,
+        }
+
+        impl Circuit<Fr> for MismatchedLinkCircuit {
+            type Config = DotTestConfig;
+            type FloorPlanner = SimpleFloorPlanner;
+
+            fn without_witnesses(&self) -> Self {
+                MismatchedLinkCircuit {
+                    a: vec![I18::from_raw(0); K],
+                    b: vec![I18::from_raw(0); K],
+                }
+            }
+
+            fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
+                DotTestCircuit::configure(meta)
+            }
+
+            fn synthesize(
+                &self,
+                config: Self::Config,
+                mut layouter: impl Layouter<Fr>,
+            ) -> Result<(), ErrorFront> {
+                let a = &self.a;
+                let b = &self.b;
+                let raw_sum: i128 = a
+                    .iter()
+                    .zip(b.iter())
+                    .map(|(x, y)| (x.raw() as i128) * (y.raw() as i128))
+                    .sum();
+                let mut partial_sums = Vec::with_capacity(K);
+                let mut acc = 0i128;
+                for i in 0..K {
+                    acc += (a[i].raw() as i128) * (b[i].raw() as i128);
+                    partial_sums.push(acc);
+                }
+                let (q, r) = requantize_raw(raw_sum).unwrap();
+                let slack = SCALE_18 - 1 - r;
+                let (q_shift_fr, _) = shifted_i64_witness(q.raw());
+
+                let (q_cell, r_cell, slack_cell) = layouter.assign_region(
+                    || "dot product accumulation",
+                    |mut region| {
+                        for i in 0..K {
+                            region.assign_advice(
+                                || format!("a_{i}"),
+                                config.dot.a,
+                                i,
+                                || Value::known(i64_to_fr(a[i].raw())),
+                            )?;
+                            region.assign_advice(
+                                || format!("b_{i}"),
+                                config.dot.b,
+                                i,
+                                || Value::known(i64_to_fr(b[i].raw())),
+                            )?;
+                            region.assign_advice(
+                                || format!("accumulator_{i}"),
+                                config.dot.accumulator,
+                                i,
+                                || Value::known(i128_to_fr(partial_sums[i])),
+                            )?;
+                            if i == 0 {
+                                config.dot.s_acc_start.enable(&mut region, i)?;
+                            } else {
+                                config.dot.s_acc_step.enable(&mut region, i)?;
+                            }
+                        }
+                        let last = K - 1;
+                        config.dot.s_final.enable(&mut region, last)?;
+                        config.dot.s_slack.enable(&mut region, last)?;
+                        let q_cell =
+                            region.assign_advice(|| "q", config.dot.q, last, || q_shift_fr)?;
+                        let r_cell = region.assign_advice(
+                            || "r",
+                            config.dot.r,
+                            last,
+                            || Value::known(i128_to_fr(r)),
+                        )?;
+                        let slack_cell = region.assign_advice(
+                            || "slack",
+                            config.dot.slack,
+                            last,
+                            || Value::known(i128_to_fr(slack)),
+                        )?;
+                        Ok((q_cell, r_cell, slack_cell))
+                    },
+                )?;
+
+                let range_r_chip = RangeCheckChip::construct(config.dot.range_r.clone());
+                let r_range_cell = range_r_chip.assign(
+                    layouter.namespace(|| "range r"),
+                    Value::known(i128_to_fr(r)),
+                    Value::known(r),
+                )?;
+                let range_r_slack_chip =
+                    RangeCheckChip::construct(config.dot.range_r_slack.clone());
+                let slack_range_cell = range_r_slack_chip.assign(
+                    layouter.namespace(|| "range r slack"),
+                    Value::known(i128_to_fr(slack)),
+                    Value::known(slack),
+                )?;
+
+                // Mismatch: range-check a decoy (0) for `q` instead of the
+                // real shifted q, but still link it via constrain_equal.
+                let (decoy_fr, decoy_raw) = shifted_i64_witness(0);
+                let range_q_chip = RangeCheckChip::construct(config.dot.range_q.clone());
+                let q_range_cell =
+                    range_q_chip.assign(layouter.namespace(|| "range q"), decoy_fr, decoy_raw)?;
+
+                layouter.assign_region(
+                    || "dot product range check links",
+                    |mut region| {
+                        region.constrain_equal(q_cell.cell(), q_range_cell.cell())?;
+                        region.constrain_equal(r_cell.cell(), r_range_cell.cell())?;
+                        region.constrain_equal(slack_cell.cell(), slack_range_cell.cell())?;
+                        Ok(())
+                    },
+                )?;
+
+                Ok(())
+            }
+        }
+
+        let circuit = MismatchedLinkCircuit {
+            a: vec![
+                I18::from_f64(2.0).unwrap(),
+                I18::from_f64(-3.0).unwrap(),
+                I18::from_f64(1.5).unwrap(),
+            ],
+            b: vec![
+                I18::from_f64(3.0).unwrap(),
+                I18::from_f64(2.0).unwrap(),
+                I18::from_f64(-4.0).unwrap(),
+            ],
+        };
+        let prover = MockProver::run(10, &circuit, vec![]).unwrap();
+        assert!(
+            prover.verify().is_err(),
+            "constrain_equal must reject a q cell tied to a mismatched decoy range-check value"
+        );
     }
 }

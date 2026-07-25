@@ -165,7 +165,7 @@ impl PatchEmbedChip {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::field_convert::{i128_to_fr, i64_to_fr};
+    use crate::field_convert::{i128_to_fr, i64_to_fr, shifted_i64_witness};
     use crate::fixed_point::{requantize_raw, SCALE_18};
     use halo2_proofs::circuit::{SimpleFloorPlanner, Value};
     use halo2_proofs::dev::MockProver;
@@ -521,12 +521,8 @@ mod tests {
                             let last = PATCH_LEN - 1;
                             dot.dot.s_final.enable(&mut region, last)?;
                             dot.dot.s_slack.enable(&mut region, last)?;
-                            region.assign_advice(
-                                || "q",
-                                dot.dot.q,
-                                last,
-                                || Value::known(i64_to_fr(forged_q)),
-                            )?;
+                            let (forged_q_shift_fr, _) = shifted_i64_witness(forged_q);
+                            region.assign_advice(|| "q", dot.dot.q, last, || forged_q_shift_fr)?;
                             region.assign_advice(
                                 || "r",
                                 dot.dot.r,
