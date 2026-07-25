@@ -1,5 +1,6 @@
 /target
 /.omc
+/.claude/worktrees
 /models
 /.spike-test
 Cargo.lock
