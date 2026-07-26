@@ -66,7 +66,9 @@
 //! reasoning, which is not repeated verbatim in this file.
 
 use crate::chips::eltwise::{EltwiseAddConfig, EltwiseMulConfig};
-use crate::chips::layer_norm::{assign_add_row, assign_mul_row, RsqrtChip, RsqrtConfig};
+use crate::chips::layer_norm::{
+    assign_add_row, assign_mul_row, RsqrtChip, RsqrtConfig, RsqrtDomain,
+};
 use crate::chips::lookup::LookupError;
 use crate::chips::reduce::{ReduceMeanChip, ReduceMeanConfig};
 use crate::field_convert::{i64_to_fr, shifted_i64_witness, Fr};
@@ -120,9 +122,7 @@ pub struct RmsNormConfig {
     rsqrt: RsqrtConfig,
     k: usize,
     epsilon: I18,
-    rsqrt_domain_min: f64,
-    rsqrt_domain_max: f64,
-    rsqrt_domain_n: usize,
+    rsqrt_domain: RsqrtDomain,
     // Pure witness-anchor columns for the chip's two genuine external
     // inputs (`x_i`, `weight_i`) -- see this module's top-level docs on why
     // `LayerNormChip`'s `mean_input_cells` trick doesn't apply here.
@@ -187,9 +187,7 @@ impl RmsNormChip {
         unshift_out: Column<Advice>,
         k: usize,
         epsilon_milli: u64,
-        rsqrt_domain_min: f64,
-        rsqrt_domain_max: f64,
-        rsqrt_domain_n: usize,
+        rsqrt_domain: RsqrtDomain,
     ) -> RmsNormConfig {
         assert!(k >= 1, "RmsNormChip requires at least one input");
 
@@ -228,9 +226,7 @@ impl RmsNormChip {
             rsqrt,
             k,
             epsilon,
-            rsqrt_domain_min,
-            rsqrt_domain_max,
-            rsqrt_domain_n,
+            rsqrt_domain,
             x_anchor,
             weight_anchor,
             unshift_in,
@@ -240,12 +236,8 @@ impl RmsNormChip {
     }
 
     pub fn construct(config: RmsNormConfig) -> Self {
-        let rsqrt_chip = RsqrtChip::construct(
-            config.rsqrt.clone(),
-            config.rsqrt_domain_min,
-            config.rsqrt_domain_max,
-            config.rsqrt_domain_n,
-        );
+        let rsqrt_chip =
+            RsqrtChip::construct_with_domain(config.rsqrt.clone(), config.rsqrt_domain.clone());
         RmsNormChip { config, rsqrt_chip }
     }
 
@@ -608,9 +600,11 @@ mod tests {
             unshift_out,
             K,
             EPSILON_MILLI,
-            RSQRT_DOMAIN_MIN,
-            RSQRT_DOMAIN_MAX,
-            RSQRT_DOMAIN_N,
+            RsqrtDomain::Range {
+                min: RSQRT_DOMAIN_MIN,
+                max: RSQRT_DOMAIN_MAX,
+                n: RSQRT_DOMAIN_N,
+            },
         );
         RmsNormTestConfig { rms }
     }

@@ -253,6 +253,38 @@ impl LookupChip {
     }
 }
 
+/// Builds a domain from explicit RAW `I18` anchor points (`raw_points`),
+/// evaluating `f` at each point's own `to_f64()` value.
+///
+/// # Why this exists, distinct from [`build_domain`]
+///
+/// `build_domain` derives every domain point via `I18::from_f64(some_f64)`.
+/// That is fundamentally unable to hit an arbitrary, already-known raw `i64`
+/// target exactly at magnitudes around `1e18`: `f64` multiplication by
+/// `SCALE_18` (`1e18`, itself exactly representable) still produces a
+/// *product* that is itself a representable `f64`, and `f64`'s ULP spacing
+/// at that magnitude is roughly `128`-`256` raw units -- so most individual
+/// raw integers (spaced `1` apart) are simply not reachable as `(value *
+/// SCALE_18).round()` for *any* `f64` value, no matter how finely `value` is
+/// searched. This was discovered empirically composing `RmsNormChip` against
+/// a real, already-computed `mean(x^2) + epsilon` raw value (see
+/// `crates/zkie-compiler/tests/rms_norm_fintext_real_weights.rs` and the
+/// accompanying report) -- a real, non-hypothetical gap in `build_domain`'s
+/// applicability, not merely a theoretical concern. This function sidesteps
+/// it entirely by constructing domain points directly via [`I18::from_raw`]
+/// (exact, no `f64` round-trip at all) -- [`LookupChip::assign`]'s own match
+/// is already a plain `raw() == raw()` integer comparison (see its
+/// implementation above), so a domain built this way works identically to
+/// one built via `build_domain`, just without the reachability gap.
+pub fn build_domain_from_raw(f: impl Fn(f64) -> f64, raw_points: &[i64]) -> (Vec<I18>, Vec<I18>) {
+    let domain: Vec<I18> = raw_points.iter().map(|&r| I18::from_raw(r)).collect();
+    let values: Vec<I18> = domain
+        .iter()
+        .map(|d| I18::from_f64(f(d.to_f64())).expect("function value must fit in I18 range"))
+        .collect();
+    (domain, values)
+}
+
 /// Evenly quantizes `[min, max]` into `n` points and evaluates `f` (a host
 /// side `f64 -> f64` function, e.g. `f64::exp`, a GELU implementation, or
 /// `|v| 1.0 / v.sqrt()`) at each, producing the `(domain, values)` I18
@@ -273,6 +305,27 @@ pub fn build_domain(f: impl Fn(f64) -> f64, min: f64, max: f64, n: usize) -> (Ve
         values.push(I18::from_f64(y).expect("function value must fit in I18 range"));
     }
     (domain, values)
+}
+
+#[cfg(test)]
+mod build_domain_from_raw_tests {
+    use super::*;
+
+    #[test]
+    fn anchors_exactly_at_an_unreachable_via_f64_raw_target() {
+        // A raw value deliberately NOT of the form `(v * 1e18).round()` for
+        // any convenient `f64` `v` -- an arbitrary large-magnitude odd raw
+        // integer, matching the real-world shape this function exists for
+        // (see its own module docs).
+        let target_raw: i64 = 1_012_174_153_815_396_446;
+        let (domain, values) = build_domain_from_raw(|x| 1.0 / x.sqrt(), &[target_raw]);
+        assert_eq!(domain.len(), 1);
+        assert_eq!(domain[0].raw(), target_raw);
+        // Sanity: the looked-up value is a real rsqrt evaluation, not zero
+        // or garbage.
+        let expected = 1.0 / I18::from_raw(target_raw).to_f64().sqrt();
+        assert!((values[0].to_f64() - expected).abs() < 1e-9);
+    }
 }
 
 #[cfg(test)]

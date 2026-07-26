@@ -14,6 +14,9 @@ prost = "0.13"
 # circuit_binding.rs's own module docs on why the assembler itself lives in
 # zkie-core, not here).
 halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2.git", tag = "v0.4.0" }
+# Only used by tests/rms_norm_fintext_real_weights.rs's real KZG setup/prove
+# (matching zkie-core's own real-KZG tests' RNG source).
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [build-dependencies]
 prost-build = "0.13"

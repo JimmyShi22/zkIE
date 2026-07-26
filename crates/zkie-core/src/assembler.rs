@@ -94,7 +94,7 @@ use std::fmt;
 
 use crate::chips::dot_general::{DotProductChip, DotProductConfig};
 use crate::chips::eltwise::{EltwiseAddChip, EltwiseAddConfig, EltwiseMulChip, EltwiseMulConfig};
-use crate::chips::layer_norm::{assign_add_row, assign_mul_row};
+use crate::chips::layer_norm::{assign_add_row, assign_mul_row, RsqrtDomain};
 use crate::chips::range_check::RangeCheckChip;
 use crate::chips::rms_norm::{RmsNormChip, RmsNormConfig, RmsNormError};
 use crate::field_convert::{i128_to_fr, i64_to_fr, shifted_i64_witness, Fr, SIGNED_SHIFT};
@@ -292,7 +292,7 @@ pub struct AssemblerConfig {
     /// One [`RmsNormConfig`] per distinct `(dim, epsilon_milli)` pair seen
     /// among the program's `RmsNorm` instructions, each built with whichever
     /// `rsqrt` lookup domain [`AssemblerChip::configure_with_rms_norm_domains`]
-    /// was given for that pair (or [`RMS_NORM_DEFAULT_RSQRT_DOMAIN`] if none
+    /// was given for that pair (or `rms_norm_default_rsqrt_domain()` if none
     /// was given, e.g. via the plain [`AssemblerChip::configure`]) -- see
     /// `crate::chips::rms_norm`'s "CRITICAL NUMERIC LIMITATION" docs on why
     /// the domain must be chosen to include the exact `mean(x^2)+epsilon`
@@ -312,9 +312,17 @@ pub struct AssemblerConfig {
 /// doesn't panic on an unrecognized `RmsNorm` shape -- callers with real
 /// `RmsNorm` data (whose exact `mean(x^2)+epsilon` will essentially never
 /// land on a coarse, arbitrary grid -- see `chips::rms_norm`'s numeric-
-/// limitation docs) must call `configure_with_rms_norm_domains` with a
-/// domain constructed to actually include their real target value.
-const RMS_NORM_DEFAULT_RSQRT_DOMAIN: (f64, f64, usize) = (0.1, 10.0, 21);
+/// limitation docs, and `RsqrtDomain::RawAnchors` for the exact-anchor
+/// construction real callers should use instead) must call
+/// `configure_with_rms_norm_domains` with a domain constructed to actually
+/// include their real target value.
+fn rms_norm_default_rsqrt_domain() -> RsqrtDomain {
+    RsqrtDomain::Range {
+        min: 0.1,
+        max: 10.0,
+        n: 21,
+    }
+}
 
 pub struct AssemblerChip {
     config: AssemblerConfig,
@@ -345,7 +353,7 @@ impl AssemblerChip {
     pub fn configure_with_rms_norm_domains(
         meta: &mut ConstraintSystem<Fr>,
         instructions: &[AssemblerInstruction],
-        rms_norm_domains: &HashMap<(usize, u64), (f64, f64, usize)>,
+        rms_norm_domains: &HashMap<(usize, u64), RsqrtDomain>,
     ) -> AssemblerConfig {
         // Shared `bits` column across every composed chip's internal range
         // checks -- safe because `RangeCheckChip::configure` creates a fresh,
@@ -400,10 +408,10 @@ impl AssemblerChip {
 
         let mut rms_norm = HashMap::with_capacity(rms_norm_keys.len());
         for (dim, epsilon_milli) in rms_norm_keys {
-            let (domain_min, domain_max, domain_n) = rms_norm_domains
+            let rsqrt_domain = rms_norm_domains
                 .get(&(dim, epsilon_milli))
-                .copied()
-                .unwrap_or(RMS_NORM_DEFAULT_RSQRT_DOMAIN);
+                .cloned()
+                .unwrap_or_else(rms_norm_default_rsqrt_domain);
 
             let rms_values = meta.advice_column();
             let rms_sum = meta.advice_column();
@@ -451,9 +459,7 @@ impl AssemblerChip {
                 rms_unshift_out,
                 dim,
                 epsilon_milli,
-                domain_min,
-                domain_max,
-                domain_n,
+                rsqrt_domain,
             );
             rms_norm.insert((dim, epsilon_milli), rms_cfg);
         }

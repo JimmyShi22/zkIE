@@ -159,7 +159,9 @@
 //! use elsewhere.
 
 use crate::chips::eltwise::{EltwiseAddChip, EltwiseAddConfig, EltwiseMulChip, EltwiseMulConfig};
-use crate::chips::lookup::{build_domain, LookupChip, LookupConfig, LookupError};
+use crate::chips::lookup::{
+    build_domain, build_domain_from_raw, LookupChip, LookupConfig, LookupError,
+};
 use crate::chips::range_check::RangeCheckChip;
 use crate::chips::reduce::{ReduceMeanChip, ReduceMeanConfig};
 use crate::field_convert::{i128_to_fr, i64_to_fr, shifted_i64_witness, Fr, SIGNED_SHIFT};
@@ -213,6 +215,21 @@ impl RsqrtConfig {
     }
 }
 
+/// How an [`RsqrtChip`]'s lookup domain is specified -- see
+/// [`RsqrtChip::construct_with_domain`].
+#[derive(Clone)]
+pub enum RsqrtDomain {
+    /// `n` points evenly quantized over `[min, max]` (`min` strictly
+    /// positive) -- the original, `f64`-based construction
+    /// [`RsqrtChip::construct`] also uses.
+    Range { min: f64, max: f64, n: usize },
+    /// Exact raw `I18` anchor points -- see
+    /// `crate::chips::lookup::build_domain_from_raw`'s docs on why this
+    /// exists (an `f64`-based range cannot always hit an arbitrary,
+    /// already-known raw target exactly).
+    RawAnchors(Vec<i64>),
+}
+
 /// A chip that proves "I looked up the exact precomputed `rsqrt` value for
 /// this exact quantized input" via a halo2 lookup argument -- a thin
 /// [`LookupChip`] wrapper in the exact spirit of
@@ -250,6 +267,23 @@ impl RsqrtChip {
         );
         let (domain, values) = build_domain(rsqrt_f64, domain_min, domain_max, n);
         let inner = LookupChip::construct(config.lookup, domain, values);
+        RsqrtChip { inner }
+    }
+
+    /// Builds a chip from an explicit [`RsqrtDomain`] spec -- either the
+    /// same evenly-quantized-range construction as [`RsqrtChip::construct`],
+    /// or an exact-raw-anchor domain (see [`RsqrtDomain::RawAnchors`] and
+    /// `crate::chips::lookup::build_domain_from_raw`'s docs on why the
+    /// latter exists).
+    pub fn construct_with_domain(config: RsqrtConfig, domain: RsqrtDomain) -> Self {
+        let (points, values) = match domain {
+            RsqrtDomain::Range { min, max, n } => {
+                assert!(min > 0.0, "rsqrt domain minimum must be strictly positive");
+                build_domain(rsqrt_f64, min, max, n)
+            }
+            RsqrtDomain::RawAnchors(raw_points) => build_domain_from_raw(rsqrt_f64, &raw_points),
+        };
+        let inner = LookupChip::construct(config.lookup, points, values);
         RsqrtChip { inner }
     }
 

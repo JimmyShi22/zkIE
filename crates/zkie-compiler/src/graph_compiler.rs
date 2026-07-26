@@ -29,12 +29,13 @@
 //!   it could otherwise successfully compile. Callers convert on demand via
 //!   [`CompiledProgram::weight_as_i18`].
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
 use crate::onnx::{GraphProto, ModelProto};
 use crate::onnx_parser::{self, OnnxParseError, WeightTensor};
 use crate::op_mapper::{self, MappedOp, MetadataOp, OpMapperError};
+use crate::rms_norm_fusion::{self, RmsNormFusion};
 use zkie_core::fixed_point::I18;
 use zkie_core::isa::Instruction;
 
@@ -271,10 +272,50 @@ pub fn compile_graph(graph: &GraphProto) -> Result<CompiledProgram, GraphCompile
         );
     }
 
+    // RMSNorm fusion pre-pass: recognizes the real 7-node
+    // `Pow`/`ReduceMean`/`Add`/`Sqrt`/`Reciprocal`/`Mul`/`Mul` decomposition
+    // (see `rms_norm_fusion`'s module docs) and folds each match into a
+    // single `Instruction::RmsNorm`, emitted when the topological order
+    // reaches the group's `Pow` node; the other six nodes in each match are
+    // skipped entirely by the main loop below (never passed to
+    // `op_mapper::map_node`).
+    let fusions = rms_norm_fusion::detect_rms_norm_fusions(graph, &weights);
+    let mut fusion_by_pow_idx: HashMap<usize, RmsNormFusion> = HashMap::new();
+    let mut fusion_consumed: HashSet<usize> = HashSet::new();
+    for fusion in fusions {
+        fusion_consumed.extend(fusion.consumed_node_indices.iter().copied());
+        fusion_by_pow_idx.insert(fusion.pow_node_idx, fusion);
+    }
+
     let order = topological_order(graph)?;
     let mut instructions: Vec<CompiledInstruction> = Vec::new();
 
     for node_idx in order {
+        if let Some(fusion) = fusion_by_pow_idx.get(&node_idx) {
+            let x_register = resolve(&registers, "rms_norm_fusion", "RmsNorm", &fusion.input_name)?;
+            let weight_register = resolve(
+                &registers,
+                "rms_norm_fusion",
+                "RmsNorm",
+                &fusion.weight_name,
+            )?;
+
+            let program_index = instructions.len();
+            instructions.push(CompiledInstruction {
+                instruction: Instruction::RmsNorm {
+                    dim: fusion.dim,
+                    epsilon_milli: fusion.epsilon_milli,
+                },
+                inputs: vec![x_register, weight_register],
+                output_name: fusion.output_name.clone(),
+            });
+            registers.insert(fusion.output_name.clone(), Register::Virtual(program_index));
+            continue;
+        }
+        if fusion_consumed.contains(&node_idx) {
+            continue;
+        }
+
         let node = &graph.node[node_idx];
         match op_mapper::map_node(node, &shapes)? {
             MappedOp::Instruction {

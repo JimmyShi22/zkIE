@@ -31,6 +31,7 @@ use rand_core::OsRng;
 use zkie_core::assembler::{
     AssemblerChip, AssemblerConfig, AssemblerInstruction, AssemblerProgram, RegisterRef,
 };
+use zkie_core::chips::layer_norm::RsqrtDomain;
 use zkie_core::field_convert::Fr;
 use zkie_core::fixed_point::I18;
 use zkie_core::isa::Instruction;
@@ -74,11 +75,15 @@ fn rms_norm_program() -> AssemblerProgram {
     }
 }
 
-fn domains() -> HashMap<(usize, u64), (f64, f64, usize)> {
+fn domains() -> HashMap<(usize, u64), RsqrtDomain> {
     let mut m = HashMap::new();
     m.insert(
         (DIM, EPSILON_MILLI),
-        (RSQRT_DOMAIN_MIN, RSQRT_DOMAIN_MAX, RSQRT_DOMAIN_N),
+        RsqrtDomain::Range {
+            min: RSQRT_DOMAIN_MIN,
+            max: RSQRT_DOMAIN_MAX,
+            n: RSQRT_DOMAIN_N,
+        },
     );
     m
 }
