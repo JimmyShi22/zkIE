@@ -1,0 +1,19 @@
+[package]
+name = "zkie-evm-verifier-poc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Empty [workspace] table makes this crate its own workspace root, so it does
+# NOT get pulled into the parent repo's root Cargo.toml workspace (which pins
+# halo2_proofs to git tag v0.4.0). This crate intentionally pins a DIFFERENT
+# halo2_proofs revision (v0.3.0) because that's the only version
+# halo2-solidity-verifier's main branch can build against (see
+# docs/superpowers/specs/2026-07-26-zkie-evm-verifier-attempt.md for why).
+[workspace]
+
+[dependencies]
+halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2.git", tag = "v0.3.0" }
+halo2_solidity_verifier = { git = "https://github.com/privacy-scaling-explorations/halo2-solidity-verifier.git" }
+rand_core = { version = "0.6", features = ["getrandom"] }
+hex = "0.4"
