@@ -96,6 +96,7 @@ use crate::chips::dot_general::{DotProductChip, DotProductConfig};
 use crate::chips::eltwise::{EltwiseAddChip, EltwiseAddConfig, EltwiseMulChip, EltwiseMulConfig};
 use crate::chips::layer_norm::{assign_add_row, assign_mul_row};
 use crate::chips::range_check::RangeCheckChip;
+use crate::chips::rms_norm::{RmsNormChip, RmsNormConfig, RmsNormError};
 use crate::field_convert::{i128_to_fr, i64_to_fr, shifted_i64_witness, Fr, SIGNED_SHIFT};
 use crate::fixed_point::{requantize_mul, requantize_raw, FixedPointError, I18, SCALE_18};
 use crate::isa::{EltwiseOp, Instruction};
@@ -175,6 +176,22 @@ pub enum AssemblerError {
     Overflow(String),
     /// A halo2 circuit-synthesis error occurred while assigning cells.
     Circuit(ErrorFront),
+    /// An `RmsNorm` instruction did not have exactly 2 inputs (`x`, `weight`).
+    RmsNormInputCount { expected: usize, got: usize },
+    /// An `RmsNorm` instruction's `x`/`weight` register lengths didn't match
+    /// its own `dim`.
+    RmsNormShapeMismatch {
+        dim: usize,
+        got_x: usize,
+        got_weight: usize,
+    },
+    /// No [`RmsNormConfig`] was configured for a `RmsNorm` instruction's
+    /// `(dim, epsilon_milli)` pair (only possible if `assign` is called with
+    /// a program whose instructions differ from the one passed to
+    /// `configure`).
+    UnconfiguredRmsNorm { dim: usize, epsilon_milli: u64 },
+    /// A wrapped error from [`RmsNormChip::assign`].
+    RmsNorm(RmsNormError),
 }
 
 impl fmt::Display for AssemblerError {
@@ -214,6 +231,22 @@ impl fmt::Display for AssemblerError {
             }
             AssemblerError::Overflow(msg) => write!(f, "assembler overflow: {msg}"),
             AssemblerError::Circuit(e) => write!(f, "assembler circuit error: {e:?}"),
+            AssemblerError::RmsNormInputCount { expected, got } => {
+                write!(f, "RmsNorm expects {expected} inputs, got {got}")
+            }
+            AssemblerError::RmsNormShapeMismatch {
+                dim,
+                got_x,
+                got_weight,
+            } => write!(
+                f,
+                "RmsNorm input shape mismatch: dim={dim}, got x.len()={got_x}, weight.len()={got_weight}"
+            ),
+            AssemblerError::UnconfiguredRmsNorm { dim, epsilon_milli } => write!(
+                f,
+                "no RmsNormConfig was configured for dim={dim}, epsilon_milli={epsilon_milli}"
+            ),
+            AssemblerError::RmsNorm(e) => write!(f, "assembler rms norm error: {e}"),
         }
     }
 }
@@ -256,11 +289,32 @@ pub struct AssemblerConfig {
     dot: HashMap<usize, DotProductConfig>,
     add: EltwiseAddConfig,
     mul: EltwiseMulConfig,
+    /// One [`RmsNormConfig`] per distinct `(dim, epsilon_milli)` pair seen
+    /// among the program's `RmsNorm` instructions, each built with whichever
+    /// `rsqrt` lookup domain [`AssemblerChip::configure_with_rms_norm_domains`]
+    /// was given for that pair (or [`RMS_NORM_DEFAULT_RSQRT_DOMAIN`] if none
+    /// was given, e.g. via the plain [`AssemblerChip::configure`]) -- see
+    /// `crate::chips::rms_norm`'s "CRITICAL NUMERIC LIMITATION" docs on why
+    /// the domain must be chosen to include the exact `mean(x^2)+epsilon`
+    /// value real inputs will produce.
+    rms_norm: HashMap<(usize, u64), RmsNormConfig>,
     boundary: Column<Advice>,
     bridge_unshifted: Column<Advice>,
     bridge_shifted: Column<Advice>,
     s_bridge: Selector,
 }
+
+/// Default `rsqrt` lookup domain used by [`AssemblerChip::configure`] (which
+/// has no way to accept per-program domain overrides) for any `RmsNorm`
+/// instruction whose `(dim, epsilon_milli)` isn't explicitly given a domain
+/// via [`AssemblerChip::configure_with_rms_norm_domains`]. Deliberately
+/// modest (`n = 21` grid points) since it exists only so `configure()`
+/// doesn't panic on an unrecognized `RmsNorm` shape -- callers with real
+/// `RmsNorm` data (whose exact `mean(x^2)+epsilon` will essentially never
+/// land on a coarse, arbitrary grid -- see `chips::rms_norm`'s numeric-
+/// limitation docs) must call `configure_with_rms_norm_domains` with a
+/// domain constructed to actually include their real target value.
+const RMS_NORM_DEFAULT_RSQRT_DOMAIN: (f64, f64, usize) = (0.1, 10.0, 21);
 
 pub struct AssemblerChip {
     config: AssemblerConfig,
@@ -275,6 +329,23 @@ impl AssemblerChip {
     pub fn configure(
         meta: &mut ConstraintSystem<Fr>,
         instructions: &[AssemblerInstruction],
+    ) -> AssemblerConfig {
+        Self::configure_with_rms_norm_domains(meta, instructions, &HashMap::new())
+    }
+
+    /// Like [`AssemblerChip::configure`], but additionally accepts an
+    /// explicit `rsqrt` lookup domain (`(domain_min, domain_max, n)`, see
+    /// [`crate::chips::rms_norm::RmsNormChip::configure`]) for whichever
+    /// `RmsNorm` `(dim, epsilon_milli)` pairs `instructions` contains. Any
+    /// pair not present in `rms_norm_domains` falls back to
+    /// [`RMS_NORM_DEFAULT_RSQRT_DOMAIN`]. Real callers with genuine `RmsNorm`
+    /// data should always supply an explicit domain here -- see this
+    /// module's `RMS_NORM_DEFAULT_RSQRT_DOMAIN` docs on why the default is
+    /// unlikely to fit real data.
+    pub fn configure_with_rms_norm_domains(
+        meta: &mut ConstraintSystem<Fr>,
+        instructions: &[AssemblerInstruction],
+        rms_norm_domains: &HashMap<(usize, u64), (f64, f64, usize)>,
     ) -> AssemblerConfig {
         // Shared `bits` column across every composed chip's internal range
         // checks -- safe because `RangeCheckChip::configure` creates a fresh,
@@ -317,6 +388,76 @@ impl AssemblerChip {
         let mul_slack = meta.advice_column();
         let mul = EltwiseMulChip::configure(meta, mul_a, mul_b, mul_q, mul_r, mul_slack, bits);
 
+        let mut rms_norm_keys: Vec<(usize, u64)> = instructions
+            .iter()
+            .filter_map(|instr| match &instr.instruction {
+                Instruction::RmsNorm { dim, epsilon_milli } => Some((*dim, *epsilon_milli)),
+                _ => None,
+            })
+            .collect();
+        rms_norm_keys.sort_unstable();
+        rms_norm_keys.dedup();
+
+        let mut rms_norm = HashMap::with_capacity(rms_norm_keys.len());
+        for (dim, epsilon_milli) in rms_norm_keys {
+            let (domain_min, domain_max, domain_n) = rms_norm_domains
+                .get(&(dim, epsilon_milli))
+                .copied()
+                .unwrap_or(RMS_NORM_DEFAULT_RSQRT_DOMAIN);
+
+            let rms_values = meta.advice_column();
+            let rms_sum = meta.advice_column();
+            let rms_sum_shift = meta.advice_column();
+            let rms_mean_q = meta.advice_column();
+            let rms_mean_r = meta.advice_column();
+            let rms_mean_slack = meta.advice_column();
+            let rms_add_a = meta.advice_column();
+            let rms_add_b = meta.advice_column();
+            let rms_add_c = meta.advice_column();
+            let rms_mul_a = meta.advice_column();
+            let rms_mul_b = meta.advice_column();
+            let rms_mul_q = meta.advice_column();
+            let rms_mul_r = meta.advice_column();
+            let rms_mul_slack = meta.advice_column();
+            let rms_rsqrt_input = meta.advice_column();
+            let rms_rsqrt_output = meta.advice_column();
+            let rms_x_anchor = meta.advice_column();
+            let rms_weight_anchor = meta.advice_column();
+            let rms_unshift_in = meta.advice_column();
+            let rms_unshift_out = meta.advice_column();
+
+            let rms_cfg = RmsNormChip::configure(
+                meta,
+                rms_values,
+                rms_sum,
+                rms_sum_shift,
+                rms_mean_q,
+                rms_mean_r,
+                rms_mean_slack,
+                rms_add_a,
+                rms_add_b,
+                rms_add_c,
+                rms_mul_a,
+                rms_mul_b,
+                rms_mul_q,
+                rms_mul_r,
+                rms_mul_slack,
+                bits,
+                rms_rsqrt_input,
+                rms_rsqrt_output,
+                rms_x_anchor,
+                rms_weight_anchor,
+                rms_unshift_in,
+                rms_unshift_out,
+                dim,
+                epsilon_milli,
+                domain_min,
+                domain_max,
+                domain_n,
+            );
+            rms_norm.insert((dim, epsilon_milli), rms_cfg);
+        }
+
         let boundary = meta.advice_column();
         meta.enable_equality(boundary);
 
@@ -341,6 +482,7 @@ impl AssemblerChip {
             dot,
             add,
             mul,
+            rms_norm,
             boundary,
             bridge_unshifted,
             bridge_shifted,
@@ -350,6 +492,21 @@ impl AssemblerChip {
 
     pub fn construct(config: AssemblerConfig) -> Self {
         AssemblerChip { config }
+    }
+
+    /// Must be called exactly once per circuit synthesis if `program`
+    /// contains any `RmsNorm` instruction (loads every distinct configured
+    /// `RmsNormConfig`'s `rsqrt` lookup table) -- mirroring
+    /// `RmsNormChip::load_table`'s own one-per-synthesis requirement.
+    /// Distinct from [`AssemblerChip::assign`] (rather than folded into it)
+    /// so callers whose program has no `RmsNorm` instruction pay no extra
+    /// cost and need not call this at all.
+    pub fn load_rms_norm_tables(&self, mut layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
+        for (key, cfg) in self.config.rms_norm.iter() {
+            let chip = RmsNormChip::construct(cfg.clone());
+            chip.load_table(layouter.namespace(|| format!("assembler rms norm table {key:?}")))?;
+        }
+        Ok(())
     }
 
     /// Witnesses every `program.input_values`/`program.weight_values` tensor
@@ -422,6 +579,15 @@ impl AssemblerChip {
                     &weight_regs,
                     &virtual_regs,
                     op,
+                )?,
+                Instruction::RmsNorm { dim, epsilon_milli } => self.assign_rms_norm(
+                    layouter.namespace(|| format!("assembler instr {idx} rms_norm")),
+                    &instr.inputs,
+                    &input_regs,
+                    &weight_regs,
+                    &virtual_regs,
+                    *dim,
+                    *epsilon_milli,
                 )?,
                 other => return Err(AssemblerError::UnsupportedInstruction(format!("{other:?}"))),
             };
@@ -757,6 +923,97 @@ impl AssemblerChip {
 
         Ok(RegisterCells {
             values: out_values,
+            cells: out_cells,
+        })
+    }
+
+    /// Dispatches `Instruction::RmsNorm { dim, epsilon_milli }` to a
+    /// configured [`RmsNormChip`]. `inputs` must resolve to exactly two
+    /// registers: `x` (the `dim` values to normalize) and `weight` (the
+    /// `dim` learned per-channel scale values) -- see `crate::isa::Instruction::RmsNorm`'s
+    /// docs. Both `RmsNormChip::assign`'s returned `input_cells`/
+    /// `weight_cells` (already unshifted, matching this assembler's
+    /// canonical register-cell representation, same as `EltwiseMulChip`'s
+    /// `a`/`b`) are linked directly via `region.constrain_equal` -- no
+    /// bridge needed for either. The chip's `output_cells` (shifted, mul `q`
+    /// convention) are bridged to fresh unshifted cells exactly like
+    /// `DotGeneral`/`Eltwise`'s own outputs.
+    #[allow(clippy::too_many_arguments)]
+    fn assign_rms_norm(
+        &self,
+        mut layouter: impl Layouter<Fr>,
+        inputs: &[RegisterRef],
+        input_regs: &[RegisterCells],
+        weight_regs: &[RegisterCells],
+        virtual_regs: &[RegisterCells],
+        dim: usize,
+        epsilon_milli: u64,
+    ) -> Result<RegisterCells, AssemblerError> {
+        if inputs.len() != 2 {
+            return Err(AssemblerError::RmsNormInputCount {
+                expected: 2,
+                got: inputs.len(),
+            });
+        }
+
+        let x_reg = resolve(&inputs[0], input_regs, weight_regs, virtual_regs)?;
+        let weight_reg = resolve(&inputs[1], input_regs, weight_regs, virtual_regs)?;
+
+        if x_reg.values.len() != dim || weight_reg.values.len() != dim {
+            return Err(AssemblerError::RmsNormShapeMismatch {
+                dim,
+                got_x: x_reg.values.len(),
+                got_weight: weight_reg.values.len(),
+            });
+        }
+
+        let rms_config = self
+            .config
+            .rms_norm
+            .get(&(dim, epsilon_milli))
+            .ok_or(AssemblerError::UnconfiguredRmsNorm { dim, epsilon_milli })?
+            .clone();
+        let chip = RmsNormChip::construct(rms_config);
+
+        let result = chip
+            .assign(
+                layouter.namespace(|| "assembler rms_norm"),
+                &x_reg.values,
+                &weight_reg.values,
+            )
+            .map_err(AssemblerError::RmsNorm)?;
+
+        layouter.assign_region(
+            || "assembler rms_norm input/weight links",
+            |mut region| {
+                for i in 0..dim {
+                    region.constrain_equal(result.input_cells[i].cell(), x_reg.cells[i].cell())?;
+                    region.constrain_equal(
+                        result.weight_cells[i].cell(),
+                        weight_reg.cells[i].cell(),
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
+
+        let mut out_cells = Vec::with_capacity(dim);
+        for (i, out) in result.outputs.iter().enumerate() {
+            let (out_unshift_cell, out_shift_cell) = self.assign_bridge(
+                layouter.namespace(|| format!("assembler rms_norm {i} output bridge")),
+                out.raw(),
+            )?;
+            layouter.assign_region(
+                || format!("assembler rms_norm {i} output link"),
+                |mut region| {
+                    region.constrain_equal(out_shift_cell.cell(), result.output_cells[i].cell())
+                },
+            )?;
+            out_cells.push(out_unshift_cell);
+        }
+
+        Ok(RegisterCells {
+            values: result.outputs,
             cells: out_cells,
         })
     }

@@ -8,4 +8,5 @@ pub mod lookup;
 pub mod patch_embed;
 pub mod range_check;
 pub mod reduce;
+pub mod rms_norm;
 pub mod softmax;

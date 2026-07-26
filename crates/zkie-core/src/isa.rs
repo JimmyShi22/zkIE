@@ -29,6 +29,16 @@ pub enum Instruction {
         dim: usize,
         epsilon_milli: u64,
     },
+    /// RMS normalization (TimesFM's `RMSNorm`, `add_unit_offset=False`):
+    /// `output_i = x_i * rsqrt(mean(x^2) + epsilon) * weight_i`. See
+    /// `crate::chips::rms_norm::RmsNormChip`. Unlike [`Instruction::LayerNorm`],
+    /// this takes a second `RegisterRef` input (`weight`, one value per
+    /// channel) alongside the normalized values -- see
+    /// `crate::assembler::AssemblerChip`'s `RmsNorm` dispatch.
+    RmsNorm {
+        dim: usize,
+        epsilon_milli: u64,
+    },
     Eltwise {
         op: EltwiseOp,
     },
