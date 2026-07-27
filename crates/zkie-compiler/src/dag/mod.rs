@@ -4,5 +4,7 @@
 //! `docs/superpowers/specs/2026-07-27-zkie-dag-sharding-aggregation-design.md`.
 
 pub mod model;
+pub mod prover;
 
 pub use model::{build_dag, BuildDagError, Dag, Edge, EdgeKind, Shard, ShardSpec};
+pub use prover::{Commitment, MockProver, Prover, ShardProof, Witness};

@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 zkie-core = { path = "../zkie-core" }
 prost = "0.13"
+blake3 = "1"
 
 [dev-dependencies]
 # Only used by integration tests (see tests/circuit_binding_pipeline.rs) to
