@@ -313,4 +313,84 @@ mod tests {
         let result = build_dag(&program, &[]);
         assert_eq!(result, Err(BuildDagError::NoShards));
     }
+
+    #[test]
+    fn register_consumed_by_two_shards_is_broadcast() {
+        // Mirrors TimesFM's attention mask: produced once by the prologue,
+        // read independently by every layer shard.
+        let program = program_of(vec![
+            add_instr(vec![], "mask"),                           // instr0, shard0
+            add_instr(vec![Register::Virtual(0)], "layer0_out"), // instr1, shard1
+            add_instr(vec![Register::Virtual(0)], "layer1_out"), // instr2, shard2
+        ]);
+        let specs = vec![
+            ShardSpec {
+                name: "prologue".into(),
+                range: 0..1,
+            },
+            ShardSpec {
+                name: "layer0".into(),
+                range: 1..2,
+            },
+            ShardSpec {
+                name: "layer1".into(),
+                range: 2..3,
+            },
+        ];
+
+        let dag = build_dag(&program, &specs).expect("valid specs");
+
+        let broadcast_edges: Vec<_> = dag
+            .edges
+            .iter()
+            .filter(|e| e.register == Register::Virtual(0))
+            .collect();
+        assert_eq!(broadcast_edges.len(), 2);
+        assert!(broadcast_edges
+            .iter()
+            .all(|e| e.kind == EdgeKind::Broadcast));
+        assert_eq!(dag.shards[0].outputs, vec![Register::Virtual(0)]);
+    }
+
+    #[test]
+    fn single_far_consumer_that_skips_shards_is_broadcast_not_sequential() {
+        // Mirrors TimesFM's denormalization stats: produced by the
+        // prologue, consumed only by the epilogue, skipping every
+        // transformer layer in between.
+        let program = program_of(vec![
+            add_instr(vec![], "denorm_stats"), // instr0, shard0
+            add_instr(vec![Register::GraphInput("x".into())], "l0"), // instr1, shard1
+            add_instr(vec![Register::Virtual(1)], "l1"), // instr2, shard2
+            add_instr(vec![Register::Virtual(0), Register::Virtual(2)], "out"), // instr3, shard3
+        ]);
+        let specs = vec![
+            ShardSpec {
+                name: "prologue".into(),
+                range: 0..1,
+            },
+            ShardSpec {
+                name: "layer0".into(),
+                range: 1..2,
+            },
+            ShardSpec {
+                name: "layer1".into(),
+                range: 2..3,
+            },
+            ShardSpec {
+                name: "epilogue".into(),
+                range: 3..4,
+            },
+        ];
+
+        let dag = build_dag(&program, &specs).expect("valid specs");
+
+        let edge = dag
+            .edges
+            .iter()
+            .find(|e| e.register == Register::Virtual(0))
+            .expect("edge exists");
+        assert_eq!(edge.producer, 0);
+        assert_eq!(edge.consumer, 3);
+        assert_eq!(edge.kind, EdgeKind::Broadcast);
+    }
 }
