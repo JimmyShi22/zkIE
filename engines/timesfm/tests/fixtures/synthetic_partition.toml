@@ -1,0 +1,37 @@
+# NOT the real TimesFM 200M partition file -- op_mapper coverage gaps
+# (Split, Sub, and prologue-specific ops like Where/Cast/ArgMax) currently
+# block compiling the real ONNX graph end-to-end (see the design doc,
+# section on scope). This fixture matches the synthetic, TimesFM-shaped
+# `CompiledProgram` built by `zkie_ie_timesfm::fixtures::synthetic_program`
+# (see src/fixtures.rs) -- it exists to exercise the Dag/Prover/Linker
+# machinery with realistic Sequential + Broadcast edge shapes (a mask
+# broadcast to every layer, denormalization stats broadcast only to the
+# epilogue), not to prove the real model.
+
+[[shard]]
+name = "prologue"
+start = 0
+end = 3
+
+[[shard]]
+name = "layer_0"
+group = "layer"
+start = 3
+end = 13
+
+[[shard]]
+name = "layer_1"
+group = "layer"
+start = 13
+end = 23
+
+[[shard]]
+name = "layer_2"
+group = "layer"
+start = 23
+end = 33
+
+[[shard]]
+name = "epilogue"
+start = 33
+end = 34
