@@ -4,6 +4,7 @@ pub mod onnx {
 }
 
 pub mod circuit_binding;
+pub mod dag;
 pub mod graph_compiler;
 pub mod onnx_parser;
 pub mod op_mapper;
