@@ -152,14 +152,14 @@ fn main() {
     // and the requantized I18 range regardless of DOT_LEN or n_instances
     // (each instance's dot product is independent; there is no
     // cross-instance accumulation to overflow).
-    let a: Vec<I18> = (0..DOT_LEN).map(|_| I18::from_f64(0.0001).unwrap()).collect();
-    let b: Vec<I18> = (0..DOT_LEN).map(|_| I18::from_f64(0.0002).unwrap()).collect();
+    let a: Vec<I18> = (0..DOT_LEN)
+        .map(|_| I18::from_f64(0.0001).unwrap())
+        .collect();
+    let b: Vec<I18> = (0..DOT_LEN)
+        .map(|_| I18::from_f64(0.0002).unwrap())
+        .collect();
 
-    let circuit = BenchCircuit {
-        a,
-        b,
-        n_instances,
-    };
+    let circuit = BenchCircuit { a, b, n_instances };
 
     // Correctness check first (cheap relative to the real KZG phases) so a
     // shape/overflow bug surfaces immediately instead of silently corrupting
@@ -231,7 +231,9 @@ fn main() {
 
         let proc_path = format!("{dir}/srs_k{k}_processed.bin");
         let mut f2 = File::create(&proc_path).unwrap();
-        params.write_custom(&mut f2, SerdeFormat::Processed).unwrap();
+        params
+            .write_custom(&mut f2, SerdeFormat::Processed)
+            .unwrap();
         drop(f2);
         let proc_size = std::fs::metadata(&proc_path).unwrap().len();
         println!("srs_processed_bytes={proc_size} path={proc_path}");
