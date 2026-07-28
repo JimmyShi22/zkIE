@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use rayon::prelude::*;
-use zkie_compiler::dag::{build_dag, link, Commitment, MockProver, Prover};
+use zkie_compiler::dag::{build_dag, link, Commitment, LinkError, MockProver, Prover};
 use zkie_ie_timesfm::{fixtures, partition};
 
 fn fixture_partition_path() -> &'static Path {
@@ -53,7 +53,15 @@ fn corrupting_one_layer_shard_output_is_caught_by_link() {
     let layer1_output = dag.shards[2].outputs[0].clone();
     proofs[2]
         .output_commitments
-        .insert(layer1_output, Commitment([0xFF; 32]));
+        .insert(layer1_output.clone(), Commitment([0xFF; 32]));
 
-    assert!(link(&dag, &proofs).is_err());
+    // layer_1 (shard 2) outputs Virtual(22), which is consumed by layer_2 (shard 3).
+    // Corrupting layer_1's output should cause link to fail with:
+    // CommitmentMismatch { producer: 2, consumer: 3, register: Virtual(22) }
+    let expected_error = LinkError::CommitmentMismatch {
+        producer: 2,
+        consumer: 3,
+        register: layer1_output,
+    };
+    assert_eq!(link(&dag, &proofs), Err(expected_error));
 }
