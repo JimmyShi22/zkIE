@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use rayon::prelude::*;
-use zkie_compiler::dag::{build_dag, link, Commitment, LinkError, MockProver, Prover};
+use zkie_compiler::dag::{build_dag, link, Commitment, EdgeKind, LinkError, MockProver, Prover};
+use zkie_compiler::graph_compiler::Register;
 use zkie_ie_timesfm::{fixtures, partition};
 
 fn fixture_partition_path() -> &'static Path {
@@ -22,6 +23,39 @@ fn synthetic_timesfm_shaped_program_links_successfully() {
     // + 3 mask broadcast edges (prologue->each layer) + 1 denorm-stats
     // broadcast edge (prologue->epilogue) = 8 edges.
     assert_eq!(dag.edges.len(), 8);
+
+    let sequential_edges: Vec<_> = dag
+        .edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Sequential)
+        .collect();
+    assert_eq!(sequential_edges.len(), 4);
+
+    // The mask (Virtual(1)) is broadcast from the prologue (shard 0) to
+    // every one of the 3 layer shards (1, 2, 3).
+    let mask_edges: Vec<_> = dag
+        .edges
+        .iter()
+        .filter(|e| e.register == Register::Virtual(1))
+        .collect();
+    assert_eq!(mask_edges.len(), 3);
+    assert!(mask_edges.iter().all(|e| e.kind == EdgeKind::Broadcast));
+    assert!(mask_edges.iter().all(|e| e.producer == 0));
+    let mask_consumers: std::collections::BTreeSet<usize> =
+        mask_edges.iter().map(|e| e.consumer).collect();
+    assert_eq!(mask_consumers, std::collections::BTreeSet::from([1, 2, 3]));
+
+    // denorm_stats (Virtual(2)) is produced by the prologue (shard 0) and
+    // consumed only by the epilogue (shard 4), skipping every layer.
+    let denorm_edges: Vec<_> = dag
+        .edges
+        .iter()
+        .filter(|e| e.register == Register::Virtual(2))
+        .collect();
+    assert_eq!(denorm_edges.len(), 1);
+    assert_eq!(denorm_edges[0].kind, EdgeKind::Broadcast);
+    assert_eq!(denorm_edges[0].producer, 0);
+    assert_eq!(denorm_edges[0].consumer, 4);
 
     let witness = fixtures::synthetic_witness();
     // Every shard's proof is independent of every other's -- prove them

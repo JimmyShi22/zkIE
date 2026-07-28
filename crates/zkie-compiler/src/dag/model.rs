@@ -94,6 +94,15 @@ pub enum BuildDagError {
         got_start: usize,
         shard_index: usize,
     },
+    /// An instruction's input is `Register::Virtual(i)` where `i` is not
+    /// the index of any instruction in `program.instructions` -- e.g. a
+    /// hand-built `CompiledProgram` with an out-of-range or forward
+    /// reference. This must be rejected before `shard_of` is called on
+    /// `i`, rather than panicking.
+    UnknownRegister {
+        consumer_instruction: usize,
+        register: Register,
+    },
 }
 
 impl fmt::Display for BuildDagError {
@@ -107,6 +116,13 @@ impl fmt::Display for BuildDagError {
             } => write!(
                 f,
                 "shard {shard_index} starts at {got_start}, expected {expected_start} (specs must exactly and contiguously cover every instruction)"
+            ),
+            BuildDagError::UnknownRegister {
+                consumer_instruction,
+                register,
+            } => write!(
+                f,
+                "instruction {consumer_instruction} references {register:?}, which is not produced by any instruction in the program"
             ),
         }
     }
@@ -160,6 +176,12 @@ pub fn build_dag(program: &CompiledProgram, specs: &[ShardSpec]) -> Result<Dag, 
         let consumer_shard = shard_of(consumer_instr_idx);
         for input in &instr.inputs {
             if let Register::Virtual(producer_instr_idx) = input {
+                if *producer_instr_idx >= program.instructions.len() {
+                    return Err(BuildDagError::UnknownRegister {
+                        consumer_instruction: consumer_instr_idx,
+                        register: Register::Virtual(*producer_instr_idx),
+                    });
+                }
                 let producer_shard = shard_of(*producer_instr_idx);
                 if producer_shard != consumer_shard {
                     let entry = consumers_of.entry(*producer_instr_idx).or_default();
@@ -392,5 +414,27 @@ mod tests {
         assert_eq!(edge.producer, 0);
         assert_eq!(edge.consumer, 3);
         assert_eq!(edge.kind, EdgeKind::Broadcast);
+    }
+
+    #[test]
+    fn out_of_range_virtual_register_is_a_typed_error_not_a_panic() {
+        // instr1 (the only instruction) references Virtual(5), but there
+        // is no instruction 5 -- e.g. a hand-built `CompiledProgram` with
+        // an off-by-one register index.
+        let program = program_of(vec![add_instr(vec![Register::Virtual(5)], "a")]);
+        let specs = vec![ShardSpec {
+            name: "s0".into(),
+            range: 0..1,
+        }];
+
+        let result = build_dag(&program, &specs);
+
+        assert_eq!(
+            result,
+            Err(BuildDagError::UnknownRegister {
+                consumer_instruction: 0,
+                register: Register::Virtual(5),
+            })
+        );
     }
 }

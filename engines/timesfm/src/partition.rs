@@ -6,6 +6,11 @@
 //! and the compiler/exporter code, not on trained weight values, so they
 //! only need to be regenerated (and re-reviewed) when that code changes --
 //! not on every re-run.
+//!
+//! No real `engines/timesfm/partition.toml` exists yet for the actual
+//! TimesFM model -- only the synthetic test fixture at
+//! `tests/fixtures/synthetic_partition.toml` exists today (see the
+//! `fixtures` module docs for why the real model isn't compiled yet).
 
 use std::fmt;
 use std::fs;
@@ -86,6 +91,13 @@ mod tests {
         ))
     }
 
+    fn malformed_fixture_path() -> &'static Path {
+        Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/malformed_partition.toml"
+        ))
+    }
+
     #[test]
     fn loads_fixture_partition_file() {
         let specs = load_partition_file(fixture_path()).expect("fixture should parse");
@@ -107,7 +119,7 @@ mod tests {
 
     #[test]
     fn malformed_toml_is_a_typed_parse_error() {
-        let result: Result<PartitionFile, _> = toml::from_str("this is not [[ valid toml");
-        assert!(result.is_err());
+        let result = load_partition_file(malformed_fixture_path());
+        assert!(matches!(result, Err(PartitionError::Toml(_))));
     }
 }

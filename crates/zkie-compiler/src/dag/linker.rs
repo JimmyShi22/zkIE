@@ -25,6 +25,19 @@ pub enum LinkError {
     /// to `link` (caller error: `proofs` must contain exactly one entry
     /// per `dag.shards`, indexed by `shard.id`).
     MissingProof { shard_id: usize },
+    /// `proofs[shard_id]` exists but its own `shard_id` field does not
+    /// match the index it was found at -- the caller passed a
+    /// permuted/mismatched `proofs` vector.
+    ShardIdMismatch { expected: usize, found: usize },
+    /// A shard's proof does not contain a commitment for a register that
+    /// `dag` says it produces or consumes -- either the proof was built
+    /// against a different partitioning than `dag`, or the `Prover`
+    /// implementation is buggy.
+    MissingCommitment {
+        shard_id: usize,
+        register: Register,
+        side: &'static str,
+    },
 }
 
 impl fmt::Display for LinkError {
@@ -44,6 +57,18 @@ impl fmt::Display for LinkError {
             LinkError::MissingProof { shard_id } => {
                 write!(f, "no proof supplied for shard {shard_id}")
             }
+            LinkError::ShardIdMismatch { expected, found } => write!(
+                f,
+                "proof at index {expected} has shard_id {found} (proofs must be indexed by their own shard_id)"
+            ),
+            LinkError::MissingCommitment {
+                shard_id,
+                register,
+                side,
+            } => write!(
+                f,
+                "shard {shard_id} has no {side} commitment for {register:?}"
+            ),
         }
     }
 }
@@ -58,9 +83,16 @@ impl std::error::Error for LinkError {}
 /// `proofs[i]` must be the `ShardProof` for `dag.shards[i]`.
 pub fn link(dag: &Dag, proofs: &[ShardProof]) -> Result<(), LinkError> {
     let get_proof = |shard_id: usize| -> Result<&ShardProof, LinkError> {
-        proofs
+        let proof = proofs
             .get(shard_id)
-            .ok_or(LinkError::MissingProof { shard_id })
+            .ok_or(LinkError::MissingProof { shard_id })?;
+        if proof.shard_id != shard_id {
+            return Err(LinkError::ShardIdMismatch {
+                expected: shard_id,
+                found: proof.shard_id,
+            });
+        }
+        Ok(proof)
     };
 
     for shard in &dag.shards {
@@ -77,21 +109,19 @@ pub fn link(dag: &Dag, proofs: &[ShardProof]) -> Result<(), LinkError> {
         let produced: &Commitment = producer_proof
             .output_commitments
             .get(&edge.register)
-            .unwrap_or_else(|| {
-                panic!(
-                    "producer shard {} has no output commitment for {:?} (Prover implementation bug)",
-                    edge.producer, edge.register
-                )
-            });
+            .ok_or_else(|| LinkError::MissingCommitment {
+                shard_id: edge.producer,
+                register: edge.register.clone(),
+                side: "output",
+            })?;
         let consumed: &Commitment = consumer_proof
             .input_commitments
             .get(&edge.register)
-            .unwrap_or_else(|| {
-                panic!(
-                    "consumer shard {} has no input commitment for {:?} (Prover implementation bug)",
-                    edge.consumer, edge.register
-                )
-            });
+            .ok_or_else(|| LinkError::MissingCommitment {
+                shard_id: edge.consumer,
+                register: edge.register.clone(),
+                side: "input",
+            })?;
 
         if produced != consumed {
             return Err(LinkError::CommitmentMismatch {
@@ -258,6 +288,74 @@ mod tests {
                 producer: 0,
                 consumer: 2,
                 register: Register::Virtual(0),
+            })
+        );
+    }
+
+    #[test]
+    fn missing_output_commitment_is_reported_precisely_not_a_panic() {
+        let (dag, witness) = linear_chain_fixture();
+        let mut proofs: Vec<_> = dag
+            .shards
+            .iter()
+            .map(|s| MockProver.prove(s, &witness))
+            .collect();
+
+        // Simulates a proof built against a different partitioning: the
+        // producer's proof simply never committed to the register the
+        // `Dag` says it produces.
+        proofs[0].output_commitments.remove(&Register::Virtual(0));
+
+        assert_eq!(
+            link(&dag, &proofs),
+            Err(LinkError::MissingCommitment {
+                shard_id: 0,
+                register: Register::Virtual(0),
+                side: "output",
+            })
+        );
+    }
+
+    #[test]
+    fn missing_input_commitment_is_reported_precisely_not_a_panic() {
+        let (dag, witness) = linear_chain_fixture();
+        let mut proofs: Vec<_> = dag
+            .shards
+            .iter()
+            .map(|s| MockProver.prove(s, &witness))
+            .collect();
+
+        proofs[1].input_commitments.remove(&Register::Virtual(0));
+
+        assert_eq!(
+            link(&dag, &proofs),
+            Err(LinkError::MissingCommitment {
+                shard_id: 1,
+                register: Register::Virtual(0),
+                side: "input",
+            })
+        );
+    }
+
+    #[test]
+    fn mismatched_shard_id_at_a_position_is_rejected() {
+        let (dag, witness) = linear_chain_fixture();
+        let mut proofs: Vec<_> = dag
+            .shards
+            .iter()
+            .map(|s| MockProver.prove(s, &witness))
+            .collect();
+
+        // A caller who permutes `proofs` gets each proof's own `shard_id`
+        // out of sync with its array position -- `link` must catch this
+        // rather than silently verifying against the wrong shard.
+        proofs.swap(0, 1);
+
+        assert_eq!(
+            link(&dag, &proofs),
+            Err(LinkError::ShardIdMismatch {
+                expected: 0,
+                found: 1,
             })
         );
     }
