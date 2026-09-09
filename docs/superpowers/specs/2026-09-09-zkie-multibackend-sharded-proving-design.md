@@ -1,7 +1,7 @@
 # zkIE 多后端分片证明与资源感知调度设计
 
-**日期：** 2026-09-09  
-**状态：** brainstorming 已确认，待实施计划  
+**日期：** 2026-09-09
+**状态：** brainstorming 已确认，实施计划已完成
 **替代范围：** 本设计扩展并部分替代 `2026-07-27-zkie-dag-sharding-aggregation-design.md` 中的静态人工分片、进程内并行、Mock-only Prover 和 native-only Linker 方案。
 
 ## 1. 目标与结论
