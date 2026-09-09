@@ -373,15 +373,22 @@ impl AssemblerChip {
         dot_ks.dedup();
 
         let mut dot = HashMap::with_capacity(dot_ks.len());
-        for k in dot_ks {
+        if !dot_ks.is_empty() {
+            // One shared set of six advice columns across every `k`: each
+            // `DotProductChip::configure` call still creates its own selectors
+            // and range-check configs, so each `k` keeps an independent
+            // `DotProductConfig` with distinct selectors, range_q/r/slack, and
+            // `config.k`.
             let a = meta.advice_column();
             let b = meta.advice_column();
             let accumulator = meta.advice_column();
             let q = meta.advice_column();
             let r = meta.advice_column();
             let slack = meta.advice_column();
-            let cfg = DotProductChip::configure(meta, a, b, accumulator, q, r, slack, bits, k);
-            dot.insert(k, cfg);
+            for k in dot_ks {
+                let cfg = DotProductChip::configure(meta, a, b, accumulator, q, r, slack, bits, k);
+                dot.insert(k, cfg);
+            }
         }
 
         let add_a = meta.advice_column();
@@ -1203,6 +1210,55 @@ mod tests {
 
     fn i18(v: f64) -> I18 {
         I18::from_f64(v).unwrap()
+    }
+
+    #[test]
+    fn distinct_dot_lengths_share_advice_columns() {
+        let dot = |k| AssemblerInstruction {
+            instruction: Instruction::DotGeneral {
+                m: 1,
+                n: 1,
+                k,
+                batch_dims: vec![],
+                trans_a: false,
+                trans_b: false,
+            },
+            inputs: vec![RegisterRef::Input(0), RegisterRef::Input(1)],
+        };
+        let mut meta = ConstraintSystem::<Fr>::default();
+        let config = AssemblerChip::configure(&mut meta, &[dot(2), dot(3)]);
+        let k2 = config.dot.get(&2).expect("k=2 config");
+        let k3 = config.dot.get(&3).expect("k=3 config");
+
+        assert_eq!(k2.a, k3.a, "dot a column must be shared across k");
+        assert_eq!(k2.b, k3.b, "dot b column must be shared across k");
+        assert_eq!(
+            k2.accumulator, k3.accumulator,
+            "dot accumulator column must be shared across k"
+        );
+        assert_eq!(k2.q, k3.q, "dot q column must be shared across k");
+        assert_eq!(k2.r, k3.r, "dot r column must be shared across k");
+        assert_eq!(
+            k2.slack, k3.slack,
+            "dot slack column must be shared across k"
+        );
+    }
+
+    #[test]
+    fn dot_free_program_does_not_allocate_dot_advice_columns() {
+        let instructions = vec![AssemblerInstruction {
+            instruction: Instruction::Eltwise { op: EltwiseOp::Add },
+            inputs: vec![RegisterRef::Input(0), RegisterRef::Input(1)],
+        }];
+        let mut meta = ConstraintSystem::<Fr>::default();
+
+        AssemblerChip::configure(&mut meta, &instructions);
+
+        assert_eq!(
+            meta.num_advice_columns(),
+            12,
+            "a dot-free program must not allocate the six shared dot columns"
+        );
     }
 
     // ---- DotGeneral in isolation ------------------------------------------
