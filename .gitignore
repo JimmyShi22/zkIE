@@ -1,6 +1,7 @@
 /target
 /.omc
 /.claude/worktrees
+/.worktrees
 /models
 /.spike-test
 /.venv-timesfm
