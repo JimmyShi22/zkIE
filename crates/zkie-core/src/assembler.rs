@@ -1832,6 +1832,177 @@ mod tests {
         )));
     }
 
+    /// Mirrors `assign_dot_row` for a single-element dot product, but takes
+    /// the operands as raw `i128` so a value outside `i64` can reach the
+    /// operand range check the way a forged witness would. Test-only, like
+    /// `assign_raw_mul_for_test` above.
+    fn assign_raw_dot_for_test(
+        chip: &AssemblerChip,
+        mut layouter: impl Layouter<Fr>,
+        a_raw: i128,
+        b_raw: i128,
+    ) -> Result<(), ErrorFront> {
+        chip.load_range_tables(layouter.namespace(|| "assembler operand range tables"))?;
+        let dot = &chip.config.dot[&1];
+
+        let product = a_raw * b_raw;
+        let q_raw = product.div_euclid(SCALE_18);
+        let r = product.rem_euclid(SCALE_18);
+        let slack = SCALE_18 - 1 - r;
+        let q_raw = i64::try_from(q_raw).expect("test quotient must fit i64");
+        let (q_shift_fr, q_shift_raw) = shifted_i64_witness(q_raw);
+        let a_shift_raw = a_raw + SIGNED_SHIFT;
+        let b_shift_raw = b_raw + SIGNED_SHIFT;
+
+        let (q_cell, r_cell, slack_cell, a_shift_cell, b_shift_cell) = layouter.assign_region(
+            || "assembler raw dot",
+            |mut region| {
+                region.assign_advice(|| "a_0", dot.a, 0, || Value::known(i128_to_fr(a_raw)))?;
+                region.assign_advice(|| "b_0", dot.b, 0, || Value::known(i128_to_fr(b_raw)))?;
+                dot.s_shift.enable(&mut region, 0)?;
+                let a_shift_cell = region.assign_advice(
+                    || "a_shift_0",
+                    dot.a_shift,
+                    0,
+                    || Value::known(i128_to_fr(a_shift_raw)),
+                )?;
+                let b_shift_cell = region.assign_advice(
+                    || "b_shift_0",
+                    dot.b_shift,
+                    0,
+                    || Value::known(i128_to_fr(b_shift_raw)),
+                )?;
+                region.assign_advice(
+                    || "accumulator_0",
+                    dot.accumulator,
+                    0,
+                    || Value::known(i128_to_fr(product)),
+                )?;
+                dot.s_acc_start.enable(&mut region, 0)?;
+                dot.s_final.enable(&mut region, 0)?;
+                dot.s_slack.enable(&mut region, 0)?;
+                let q_cell = region.assign_advice(|| "q", dot.q, 0, || q_shift_fr)?;
+                let r_cell =
+                    region.assign_advice(|| "r", dot.r, 0, || Value::known(i128_to_fr(r)))?;
+                let slack_cell = region.assign_advice(
+                    || "slack",
+                    dot.slack,
+                    0,
+                    || Value::known(i128_to_fr(slack)),
+                )?;
+                Ok((q_cell, r_cell, slack_cell, a_shift_cell, b_shift_cell))
+            },
+        )?;
+
+        let a_range_cell = LookupRangeCheckChip::construct(dot.range_a.clone()).assign(
+            layouter.namespace(|| "range a_0"),
+            Value::known(i128_to_fr(a_shift_raw)),
+            Value::known(a_shift_raw),
+        )?;
+        let b_range_cell = LookupRangeCheckChip::construct(dot.range_b.clone()).assign(
+            layouter.namespace(|| "range b_0"),
+            Value::known(i128_to_fr(b_shift_raw)),
+            Value::known(b_shift_raw),
+        )?;
+        let q_range_cell = RangeCheckChip::construct(dot.range_q.clone()).assign(
+            layouter.namespace(|| "range q"),
+            q_shift_fr,
+            q_shift_raw,
+        )?;
+        let r_range_cell = RangeCheckChip::construct(dot.range_r.clone()).assign(
+            layouter.namespace(|| "range r"),
+            Value::known(i128_to_fr(r)),
+            Value::known(r),
+        )?;
+        let slack_range_cell = RangeCheckChip::construct(dot.range_r_slack.clone()).assign(
+            layouter.namespace(|| "range r slack"),
+            Value::known(i128_to_fr(slack)),
+            Value::known(slack),
+        )?;
+
+        layouter.assign_region(
+            || "assembler raw dot links",
+            |mut region| {
+                region.constrain_equal(a_shift_cell.cell(), a_range_cell.cell())?;
+                region.constrain_equal(b_shift_cell.cell(), b_range_cell.cell())?;
+                region.constrain_equal(q_cell.cell(), q_range_cell.cell())?;
+                region.constrain_equal(r_cell.cell(), r_range_cell.cell())?;
+                region.constrain_equal(slack_cell.cell(), slack_range_cell.cell())
+            },
+        )
+    }
+
+    struct RawDotOperandCircuit {
+        a_raw: i128,
+        b_raw: i128,
+    }
+
+    impl Circuit<Fr> for RawDotOperandCircuit {
+        type Params = ();
+
+        type Config = AssemblerConfig;
+        type FloorPlanner = SimpleFloorPlanner;
+
+        fn without_witnesses(&self) -> Self {
+            RawDotOperandCircuit { a_raw: 0, b_raw: 0 }
+        }
+
+        fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
+            AssemblerChip::configure(
+                meta,
+                &[AssemblerInstruction {
+                    instruction: Instruction::DotGeneral {
+                        m: 1,
+                        n: 1,
+                        k: 1,
+                        batch_dims: vec![],
+                        trans_a: false,
+                        trans_b: false,
+                    },
+                    inputs: vec![RegisterRef::Input(0), RegisterRef::Input(1)],
+                }],
+            )
+        }
+
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            layouter: impl Layouter<Fr>,
+        ) -> Result<(), ErrorFront> {
+            assign_raw_dot_for_test(
+                &AssemblerChip::construct(config),
+                layouter,
+                self.a_raw,
+                self.b_raw,
+            )
+        }
+    }
+
+    #[test]
+    fn assembler_dot_rejects_raw_field_operand_outside_i64() {
+        let control = RawDotOperandCircuit {
+            a_raw: 9 * SCALE_18,
+            b_raw: 1,
+        };
+        MockProver::run(CIRCUIT_K, &control, vec![])
+            .unwrap()
+            .assert_satisfied();
+
+        let forged = RawDotOperandCircuit {
+            a_raw: 10 * SCALE_18,
+            b_raw: 1,
+        };
+        let failures = MockProver::run(CIRCUIT_K, &forged, vec![])
+            .unwrap()
+            .verify()
+            .expect_err("a dot operand above i64::MAX must be rejected");
+        assert!(failures.iter().all(|failure| matches!(
+            failure,
+            VerifyFailure::ConstraintNotSatisfied { constraint, .. }
+                if constraint.to_string().contains("limbs recompose to value")
+        )));
+    }
+
     #[test]
     fn lone_eltwise_add_instruction_is_satisfied_and_correct() {
         let a = vec![i18(2.0)];

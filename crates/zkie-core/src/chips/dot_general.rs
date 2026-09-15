@@ -594,6 +594,14 @@ mod tests {
                 config: Self::Config,
                 mut layouter: impl Layouter<Fr>,
             ) -> Result<(), ErrorFront> {
+                // Load the byte tables the operand range checks look up against.
+                // Without them the lookup fails for lack of a table and the circuit
+                // is rejected for the wrong reason, so the forgery below would never
+                // be the thing this test exercises.
+                LookupRangeCheckChip::construct(config.dot.range_a.clone())
+                    .load_table(layouter.namespace(|| "byte table a"))?;
+                LookupRangeCheckChip::construct(config.dot.range_b.clone())
+                    .load_table(layouter.namespace(|| "byte table b"))?;
                 let a = &self.a;
                 let b = &self.b;
                 let raw_sum: i128 = a
@@ -710,6 +718,14 @@ mod tests {
                 config: Self::Config,
                 mut layouter: impl Layouter<Fr>,
             ) -> Result<(), ErrorFront> {
+                // Load the byte tables the operand range checks look up against.
+                // Without them the lookup fails for lack of a table and the circuit
+                // is rejected for the wrong reason, so the forgery below would never
+                // be the thing this test exercises.
+                LookupRangeCheckChip::construct(config.dot.range_a.clone())
+                    .load_table(layouter.namespace(|| "byte table a"))?;
+                LookupRangeCheckChip::construct(config.dot.range_b.clone())
+                    .load_table(layouter.namespace(|| "byte table b"))?;
                 let a = &self.a;
                 let b = &self.b;
                 let raw_sum: i128 = a

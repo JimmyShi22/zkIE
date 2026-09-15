@@ -831,6 +831,14 @@ mod tests {
                 config: Self::Config,
                 mut layouter: impl Layouter<Fr>,
             ) -> Result<(), ErrorFront> {
+                // Load the byte tables the operand range checks look up against.
+                // Without them the lookup fails for lack of a table and the circuit
+                // is rejected for the wrong reason, so the forgery below would never
+                // be the thing this test exercises.
+                LookupRangeCheckChip::construct(config.mul.range_a.clone())
+                    .load_table(layouter.namespace(|| "byte table a"))?;
+                LookupRangeCheckChip::construct(config.mul.range_b.clone())
+                    .load_table(layouter.namespace(|| "byte table b"))?;
                 let (q, r) = requantize_mul(self.a, self.b).unwrap();
                 let forged_q = q.raw() + 1; // violates a*b == q*SCALE_18 + r
                 let (forged_q_shift_fr, _) = shifted_i64_witness(forged_q);
@@ -913,6 +921,14 @@ mod tests {
                 config: Self::Config,
                 mut layouter: impl Layouter<Fr>,
             ) -> Result<(), ErrorFront> {
+                // Load the byte tables the operand range checks look up against.
+                // Without them the lookup fails for lack of a table and the circuit
+                // is rejected for the wrong reason, so the forgery below would never
+                // be the thing this test exercises.
+                LookupRangeCheckChip::construct(config.mul.range_a.clone())
+                    .load_table(layouter.namespace(|| "byte table a"))?;
+                LookupRangeCheckChip::construct(config.mul.range_b.clone())
+                    .load_table(layouter.namespace(|| "byte table b"))?;
                 let (q, r) = requantize_mul(self.a, self.b).unwrap();
                 let slack = SCALE_18 - 1 - r;
                 let (q_shift_fr, _) = shifted_i64_witness(q.raw());
