@@ -1,0 +1,8 @@
+[package]
+name = "zkie-gkr"
+version = "0.1.0"
+edition = "2021"
+description = "GKR/sum-check prototype for verifiable ML inference (matmul layer)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
