@@ -9,9 +9,11 @@
 
 pub mod field;
 pub mod fri;
+pub mod lookup;
 pub mod matmul;
 pub mod merkle;
 pub mod mle;
+pub mod softmax;
 pub mod sumcheck;
 
 pub use field::F31;

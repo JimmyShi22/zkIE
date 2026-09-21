@@ -46,6 +46,9 @@ Implemented and tested:
 - `fri.rs` — the FRI building blocks: multilinear-to-univariate coefficient
   lift, Horner evaluation, LDE evaluation, LDE commitment, and the
   degree-halving fold.
+- `lookup.rs` — a LogUp (log-derivative) lookup argument: proves
+  `y_i = table[x_i]` as a parallel sum-of-rationals check, no permutation/sort.
+- `softmax.rs` — quantized softmax as `exp lookup + reduction + division`.
 
 ## What is *not* here yet (deliberately)
 
@@ -68,6 +71,8 @@ Implemented and tested:
 - `src/matmul.rs` — single-layer matmul reduction.
 - `src/merkle.rs` — Merkle commitment.
 - `src/fri.rs` — FRI primitives (lift, LDE, fold).
+- `src/lookup.rs` — LogUp lookup argument.
+- `src/softmax.rs` — softmax via exp lookup.
 - `examples/bench_matmul.rs` — the Halo2-vs-GKR comparison.
 
 ## Run
@@ -75,4 +80,5 @@ Implemented and tested:
 ```bash
 cargo test -p zkie-gkr
 cargo run -p zkie-gkr --release --example bench_matmul
+cargo run -p zkie-gkr --release --example bench_softmax
 ```
