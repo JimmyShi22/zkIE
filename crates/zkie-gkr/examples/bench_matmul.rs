@@ -6,21 +6,21 @@
 //! checks). GKR overhead here is the partial-MLE folding (`m*k + k*n` field
 //! ops) plus the `O(k)` sum-check.
 
-use zkie_gkr::field::{F31, XorShift64};
+use zkie_gkr::field::{F64, XorShift64};
 use zkie_gkr::{matmul, mle};
 
 fn main() {
     let (m, k, n) = (512usize, 512usize, 512usize);
     let mut rng = XorShift64::new(0xfeed);
 
-    let a: Vec<F31> = (0..m * k).map(|_| rng.field()).collect();
-    let b: Vec<F31> = (0..k * n).map(|_| rng.field()).collect();
+    let a: Vec<F64> = (0..m * k).map(|_| rng.field()).collect();
+    let b: Vec<F64> = (0..k * n).map(|_| rng.field()).collect();
     let c = dense(&a, &b, m, k, n);
     let at = transpose(&a, m, k);
 
-    let u: Vec<F31> = (0..m.trailing_zeros()).map(|_| rng.field()).collect();
-    let v: Vec<F31> = (0..n.trailing_zeros()).map(|_| rng.field()).collect();
-    let challenges: Vec<F31> = (0..k.trailing_zeros()).map(|_| rng.field()).collect();
+    let u: Vec<F64> = (0..m.trailing_zeros()).map(|_| rng.field()).collect();
+    let v: Vec<F64> = (0..n.trailing_zeros()).map(|_| rng.field()).collect();
+    let challenges: Vec<F64> = (0..k.trailing_zeros()).map(|_| rng.field()).collect();
 
     let t0 = std::time::Instant::now();
     let proof = matmul::prove(&at, &b, &c, m, k, n, &u, &v, &challenges);
@@ -44,11 +44,11 @@ fn main() {
     println!("gkr_prove_wall_secs={prove_secs:.4}");
 }
 
-fn dense(a: &[F31], b: &[F31], m: usize, k: usize, n: usize) -> Vec<F31> {
-    let mut c = vec![F31::ZERO; m * n];
+fn dense(a: &[F64], b: &[F64], m: usize, k: usize, n: usize) -> Vec<F64> {
+    let mut c = vec![F64::ZERO; m * n];
     for i in 0..m {
         for j in 0..n {
-            let mut acc = F31::ZERO;
+            let mut acc = F64::ZERO;
             for w in 0..k {
                 acc = acc + a[i * k + w] * b[w * n + j];
             }
@@ -58,8 +58,8 @@ fn dense(a: &[F31], b: &[F31], m: usize, k: usize, n: usize) -> Vec<F31> {
     c
 }
 
-fn transpose(a: &[F31], m: usize, k: usize) -> Vec<F31> {
-    let mut at = vec![F31::ZERO; k * m];
+fn transpose(a: &[F64], m: usize, k: usize) -> Vec<F64> {
+    let mut at = vec![F64::ZERO; k * m];
     for i in 0..m {
         for w in 0..k {
             at[w * m + i] = a[i * k + w];

@@ -5,24 +5,24 @@
 //! row-major (`k x m`), so fixing the row index reduces to `partial_eval` of
 //! the low bits.
 
-use crate::field::F31;
+use crate::field::F64;
 use crate::{mle, sumcheck, sumcheck::SumcheckProof};
 
 pub struct MatmulProof {
-    pub claimed: F31,
+    pub claimed: F64,
     pub sumcheck: SumcheckProof,
 }
 
 pub fn prove(
-    at: &[F31],
-    b: &[F31],
-    c: &[F31],
+    at: &[F64],
+    b: &[F64],
+    c: &[F64],
     m: usize,
     k: usize,
     n: usize,
-    u: &[F31],
-    v: &[F31],
-    challenges: &[F31],
+    u: &[F64],
+    v: &[F64],
+    challenges: &[F64],
 ) -> MatmulProof {
     assert_eq!(at.len(), k * m);
     assert_eq!(b.len(), k * n);
@@ -46,9 +46,9 @@ pub fn prove(
 
 pub fn verify(
     proof: &MatmulProof,
-    challenges: &[F31],
-    f_eval: F31,
-    h_eval: F31,
+    challenges: &[F64],
+    f_eval: F64,
+    h_eval: F64,
 ) -> bool {
     sumcheck::verify(&proof.sumcheck, proof.claimed, challenges, f_eval, h_eval)
 }

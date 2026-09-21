@@ -16,4 +16,4 @@ pub mod mle;
 pub mod softmax;
 pub mod sumcheck;
 
-pub use field::F31;
+pub use field::F64;

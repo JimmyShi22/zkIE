@@ -5,13 +5,13 @@
 //! hash (Poseidon / Rescue) or a native hash (SHA-256 / Blake3); the tree
 //! structure and opening logic are identical either way.
 
-use crate::field::F31;
+use crate::field::F64;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 pub type Digest = u64;
 
-pub fn hash_leaf(v: F31) -> Digest {
+pub fn hash_leaf(v: F64) -> Digest {
     let mut h = DefaultHasher::new();
     v.val().hash(&mut h);
     h.finish()
@@ -24,7 +24,7 @@ pub fn hash_pair(a: Digest, b: Digest) -> Digest {
     h.finish()
 }
 
-pub fn commit(values: &[F31]) -> Digest {
+pub fn commit(values: &[F64]) -> Digest {
     let n = values.len();
     assert!(n.is_power_of_two(), "merkle commit needs a power-of-two length");
     let mut level: Vec<Digest> = values.iter().map(|&v| hash_leaf(v)).collect();
@@ -41,11 +41,11 @@ pub fn commit(values: &[F31]) -> Digest {
 #[derive(Clone, Debug)]
 pub struct Opening {
     pub index: usize,
-    pub value: F31,
+    pub value: F64,
     pub siblings: Vec<Digest>,
 }
 
-pub fn open(values: &[F31], index: usize) -> Opening {
+pub fn open(values: &[F64], index: usize) -> Opening {
     let n = values.len();
     assert!(index < n);
     assert!(n.is_power_of_two());
@@ -90,13 +90,13 @@ mod tests {
     #[test]
     fn merkle_open_verify() {
         let mut rng = XorShift64::new(9);
-        let values: Vec<F31> = (0..64).map(|_| rng.field()).collect();
+        let values: Vec<F64> = (0..64).map(|_| rng.field()).collect();
         let root = commit(&values);
         for index in [0usize, 1, 31, 32, 63] {
             let opening = open(&values, index);
             assert!(verify(root, &opening));
             let mut bad = opening.clone();
-            bad.value = bad.value + F31::ONE;
+            bad.value = bad.value + F64::ONE;
             assert!(!verify(root, &bad));
         }
     }

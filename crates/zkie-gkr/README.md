@@ -33,11 +33,12 @@ halo2_rows          = 182,452,224
 ratio               = 346x
 ```
 
-## Commitment progress (BabyBear + Merkle + FRI primitives)
+## Field choice: Goldilocks (64-bit) for int16
 
-The field is now **BabyBear** (`p = 2^31 - 2^27 + 1`), not M31: FRI needs a
-large 2-adic multiplicative subgroup, and BabyBear's `p - 1 = 2^27 * 15`
-provides it while staying 31-bit.
+The field is **Goldilocks** (`p = 2^64 - 2^32 + 1`). For large-model inference
+we target `int16` fixed-point: products are 32-bit and a length-K dot product
+adds `log2(K)` bits, so 64-bit arithmetic holds the accumulation with plenty of
+margin. `p - 1 = 2^32 * (2^32 - 1)` gives the 2-adic subgroup FRI needs.
 
 Implemented and tested:
 
@@ -56,8 +57,8 @@ Implemented and tested:
   evaluations in `O(k)`. The fold/commit primitives are in place; the remaining
   piece is the DEEP-FRI evaluation proof that turns those into `O(polylog k)`
   openings.
-- **Small-field soundness**: BabyBear is 31-bit; real deployments need a larger
-  field or an extension field.
+- **Soundness field size**: Goldilocks is 64-bit; production soundness still
+  needs a larger field, an extension field, or more FRI queries.
 - **Softmax / activations**: not yet; those reduce to lookup arguments (Lasso /
   LogUp), which compose cleanly on top of this sum-check.
 - **Folding across layers**: not yet; a transformer's repeated layers map to
@@ -65,7 +66,7 @@ Implemented and tested:
 
 ## Layout
 
-- `src/field.rs` — BabyBear field + xorshift PRNG.
+- `src/field.rs` — Goldilocks (64-bit) field + xorshift PRNG.
 - `src/mle.rs` — multilinear extension evaluation.
 - `src/sumcheck.rs` — degree-2 sum-check prover/verifier.
 - `src/matmul.rs` — single-layer matmul reduction.

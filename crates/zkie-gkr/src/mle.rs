@@ -1,11 +1,11 @@
-//! Multilinear-extension evaluation over the Mersenne-31 field.
+//! Multilinear-extension evaluation over the Goldilocks field.
 //!
 //! Conventions: variable `0` is the least-significant bit of the flattened
 //! index; `partial_eval` fixes the *first* `fix.len()` variables.
 
-use crate::field::F31;
+use crate::field::F64;
 
-pub fn eval(values: &[F31], point: &[F31]) -> F31 {
+pub fn eval(values: &[F64], point: &[F64]) -> F64 {
     let t = point.len();
     assert_eq!(values.len(), 1 << t, "mle eval: length mismatch");
     let mut buf = values.to_vec();
@@ -22,7 +22,7 @@ pub fn eval(values: &[F31], point: &[F31]) -> F31 {
     buf[0]
 }
 
-pub fn partial_eval(values: &[F31], fix: &[F31]) -> Vec<F31> {
+pub fn partial_eval(values: &[F64], fix: &[F64]) -> Vec<F64> {
     assert!(fix.len() <= values.len().trailing_zeros() as usize);
     let mut buf = values.to_vec();
     for &p in fix {
@@ -45,8 +45,8 @@ mod tests {
     #[test]
     fn partial_then_full_matches_full() {
         let mut rng = XorShift64::new(2);
-        let values: Vec<F31> = (0..16).map(|_| rng.field()).collect();
-        let point: Vec<F31> = (0..4).map(|_| rng.field()).collect();
+        let values: Vec<F64> = (0..16).map(|_| rng.field()).collect();
+        let point: Vec<F64> = (0..4).map(|_| rng.field()).collect();
 
         let rest = partial_eval(&values, &point[..2]);
         assert_eq!(rest.len(), 4);
