@@ -8,6 +8,7 @@
 //! expands every output element into `K + 184` Plonkish rows.
 
 pub mod field;
+pub mod fixed_point;
 pub mod fri;
 pub mod lookup;
 pub mod matmul;
