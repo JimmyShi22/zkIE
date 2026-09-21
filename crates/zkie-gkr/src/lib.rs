@@ -8,7 +8,9 @@
 //! expands every output element into `K + 184` Plonkish rows.
 
 pub mod field;
+pub mod fri;
 pub mod matmul;
+pub mod merkle;
 pub mod mle;
 pub mod sumcheck;
 

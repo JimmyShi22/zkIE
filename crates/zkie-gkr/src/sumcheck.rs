@@ -26,7 +26,7 @@ pub struct SumcheckProof {
     pub h_eval: F31,
 }
 
-const INV2: F31 = F31(1 << 30);
+const INV2: F31 = F31(crate::field::P / 2 + 1); // (p + 1) / 2
 
 pub fn prove(f: &[F31], h: &[F31], _claimed_sum: F31, challenges: &[F31]) -> SumcheckProof {
     let t = f.len().trailing_zeros() as usize;

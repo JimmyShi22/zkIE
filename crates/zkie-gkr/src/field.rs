@@ -1,13 +1,13 @@
-//! Mersenne-31 field (`p = 2^31 - 1`) plus a tiny xorshift PRNG.
+//! BabyBear field (`p = 2^31 - 2^27 + 1`) plus a tiny xorshift PRNG.
 //!
-//! This is deliberately the "small field" end of the design space: 32-bit
-//! native arithmetic, no elliptic-curve MSM. In a real deployment you would
-//! use BabyBear / a larger field (or an extension field) for soundness, but
-//! that is orthogonal to the arithmetization comparison this crate measures.
+//! We use BabyBear rather than M31 because it has a large 2-adic multiplicative
+//! subgroup (`p - 1 = 2^27 * 15`), which FRI requires. It is still a 31-bit
+//! field, so the "native 32-bit, no elliptic curve" point is unchanged. A real
+//! deployment might use a larger field or an extension field for soundness.
 
 use std::ops::{Add, Mul, Neg, Sub};
 
-pub const P: u32 = 0x7fff_ffff;
+pub const P: u32 = 0x7800_0001; // 2^31 - 2^27 + 1 = 2013265921
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct F31(pub u32);
@@ -34,7 +34,8 @@ impl F31 {
 
     #[inline]
     pub fn add(self, rhs: F31) -> F31 {
-        F31(reduce(self.0 as u64 + rhs.0 as u64))
+        let s = self.0 + rhs.0;
+        F31(if s >= P { s - P } else { s })
     }
 
     #[inline]
@@ -45,7 +46,7 @@ impl F31 {
 
     #[inline]
     pub fn mul(self, rhs: F31) -> F31 {
-        F31(reduce(self.0 as u64 * rhs.0 as u64))
+        F31(((self.0 as u64 * rhs.0 as u64) % P as u64) as u32)
     }
 
     #[inline]
@@ -72,14 +73,8 @@ impl F31 {
 }
 
 #[inline]
-fn reduce(mut x: u64) -> u32 {
-    x = (x >> 31) + (x & 0x7fff_ffff);
-    x = (x >> 31) + (x & 0x7fff_ffff);
-    let mut x = x as u32;
-    if x >= P {
-        x -= P;
-    }
-    x
+fn reduce(x: u64) -> u32 {
+    (x % P as u64) as u32
 }
 
 impl Add for F31 {
@@ -123,6 +118,23 @@ impl From<u32> for F31 {
 impl From<u64> for F31 {
     fn from(x: u64) -> F31 {
         F31::from_u64(x)
+    }
+}
+
+/// A primitive `2^log_n`-th root of unity in BabyBear's multiplicative group.
+///
+/// `p - 1 = 2^27 * 15`, so we find a generator of the full group and raise it
+/// to the 15th power to obtain a primitive `2^27`-th root, then take the
+/// appropriate power for the requested `log_n`.
+pub fn two_adic_root(log_n: usize) -> F31 {
+    assert!(log_n <= 27, "BabyBear only supports 2-adic roots up to 2^27");
+    let mut g = F31::new(2);
+    loop {
+        let omega = g.pow(15);
+        if omega.pow(1 << 26).val() == P - 1 {
+            return omega.pow(1 << (27 - log_n));
+        }
+        g = F31::new(g.val() + 1);
     }
 }
 
@@ -174,6 +186,14 @@ mod tests {
 
     #[test]
     fn inverse_of_two() {
-        assert_eq!(F31::TWO * F31::new(1 << 30), F31::ONE);
+        // 2^-1 = (p + 1) / 2.
+        assert_eq!(F31::TWO * F31::new((P + 1) / 2), F31::ONE);
+    }
+
+    #[test]
+    fn two_adic_root_is_primitive() {
+        let omega = two_adic_root(27);
+        assert_eq!(omega.pow(1 << 27), F31::ONE);
+        assert_eq!(omega.pow(1 << 26).val(), P - 1);
     }
 }

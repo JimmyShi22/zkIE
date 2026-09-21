@@ -33,12 +33,28 @@ halo2_rows          = 182,452,224
 ratio               = 346x
 ```
 
+## Commitment progress (BabyBear + Merkle + FRI primitives)
+
+The field is now **BabyBear** (`p = 2^31 - 2^27 + 1`), not M31: FRI needs a
+large 2-adic multiplicative subgroup, and BabyBear's `p - 1 = 2^27 * 15`
+provides it while staying 31-bit.
+
+Implemented and tested:
+
+- `merkle.rs` — Merkle commit/open/verify over field elements (hash is a
+  deterministic placeholder; swap in Poseidon/Blake3 for production).
+- `fri.rs` — the FRI building blocks: multilinear-to-univariate coefficient
+  lift, Horner evaluation, LDE evaluation, LDE commitment, and the
+  degree-halving fold.
+
 ## What is *not* here yet (deliberately)
 
-- **Commitment / FRI**: the verifier currently recomputes the MLE evaluations
-  in `O(k)`; in production these become FRI or Merkle openings in `O(polylog k)`.
-- **Small-field soundness**: this uses M31 (`p = 2^31 - 1`). Real deployments
-  need a larger field or an extension field.
+- **FRI opening (evaluation proof)**: the verifier currently recomputes the MLE
+  evaluations in `O(k)`. The fold/commit primitives are in place; the remaining
+  piece is the DEEP-FRI evaluation proof that turns those into `O(polylog k)`
+  openings.
+- **Small-field soundness**: BabyBear is 31-bit; real deployments need a larger
+  field or an extension field.
 - **Softmax / activations**: not yet; those reduce to lookup arguments (Lasso /
   LogUp), which compose cleanly on top of this sum-check.
 - **Folding across layers**: not yet; a transformer's repeated layers map to
@@ -46,10 +62,12 @@ ratio               = 346x
 
 ## Layout
 
-- `src/field.rs` — M31 field + xorshift PRNG.
+- `src/field.rs` — BabyBear field + xorshift PRNG.
 - `src/mle.rs` — multilinear extension evaluation.
 - `src/sumcheck.rs` — degree-2 sum-check prover/verifier.
 - `src/matmul.rs` — single-layer matmul reduction.
+- `src/merkle.rs` — Merkle commitment.
+- `src/fri.rs` — FRI primitives (lift, LDE, fold).
 - `examples/bench_matmul.rs` — the Halo2-vs-GKR comparison.
 
 ## Run
