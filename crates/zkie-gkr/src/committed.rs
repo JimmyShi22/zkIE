@@ -232,6 +232,102 @@ pub fn prove_layer_norm(
     true
 }
 
+/// Derive the quantized RMSNorm rsqrt table index from the true `n_real` signed
+/// i32 inputs (ignoring padding): `s = mean(x^2)` at scale 2^32, index at scale
+/// 2^14 (`s >> 18`). RMSNorm has no mean subtraction, so this is a pure
+/// sum-of-squares reduction — the same single non-arithmetic lookup as LayerNorm.
+fn rms_norm_scalars_i32(x_i32: &[i32], n_real: usize) -> u32 {
+    let sqsum: i64 = x_i32[..n_real]
+        .iter()
+        .map(|&v| {
+            let d = v as i64;
+            d * d
+        })
+        .sum();
+    let s = div_round(sqsum, n_real as i64);
+    div_round(s, 1 << 18) as u32
+}
+
+/// Compute the raw RMSNorm product `raw = x * rstd * w` (scale 2^48) together
+/// with the rsqrt value and index, so a caller can commit `raw` and then run
+/// [`prove_rms_norm`]. `rstd` is read from `rsqrt_table` at the index of
+/// `mean(x^2) + eps` (not trusted).
+pub fn rms_norm_raw(
+    x: &[Goldilocks],
+    weight: &[Goldilocks],
+    n_real: usize,
+    rsqrt_table: &[Goldilocks],
+) -> (Vec<Goldilocks>, Goldilocks, u32) {
+    assert_eq!(x.len(), weight.len());
+    let x_i32: Vec<i32> = x.iter().map(|&v| to_i32(v)).collect();
+    let s_index = rms_norm_scalars_i32(&x_i32, n_real);
+    assert!((s_index as usize) < rsqrt_table.len(), "mean(x^2) out of rsqrt table range");
+    let rstd = rsqrt_table[s_index as usize];
+    let raw = x
+        .iter()
+        .zip(weight)
+        .map(|(&xv, &w)| xv * rstd * w)
+        .collect();
+    (raw, rstd, s_index)
+}
+
+/// Prove the raw RMSNorm product `raw = x * rstd * w` (scale 2^48) against WHIR
+/// commitments, in the O(N)-opening PoC form. `mean(x^2)` is recomputed from the
+/// *committed* `x`, and `rstd = 1/sqrt(mean(x^2) + eps)` is bound to it by a
+/// LogUp lookup into `rsqrt_table` — the single non-arithmetic scalar of the
+/// input RMSNorm (TimesFM's `input_layernorm`), not a trusted input.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_rms_norm(
+    whir_x: &Whir,
+    x: &Committed,
+    whir_raw: &Whir,
+    raw: &Committed,
+    weight: &[Goldilocks],
+    n_real: usize,
+    rsqrt_table: &[Goldilocks],
+    alpha: Goldilocks,
+    beta: Goldilocks,
+) -> bool {
+    let n = weight.len();
+    let d = n.trailing_zeros() as usize;
+    let mut xv: Vec<Goldilocks> = Vec::with_capacity(n);
+    for i in 0..n {
+        let point: Vec<Goldilocks> = (0..d)
+            .map(|b| Goldilocks::from_bool((i >> b) & 1 == 1))
+            .collect();
+        let (x_open, xv_i) = whir_x.open(x.prover_data.clone(), &x.protocol, &point);
+        if whir_x.verify(&x.commitment, &x_open, &x.protocol, &point).unwrap() != xv_i {
+            return false;
+        }
+        xv.push(xv_i);
+    }
+
+    let x_i32: Vec<i32> = xv.iter().map(|&v| to_i32(v)).collect();
+    let s_index = rms_norm_scalars_i32(&x_i32, n_real);
+    if (s_index as usize) >= rsqrt_table.len() {
+        return false;
+    }
+    let rstd = rsqrt_table[s_index as usize];
+    let lk = lookup::prove(&[s_index], &[rstd], rsqrt_table, alpha, beta);
+    if !lookup::verify(&lk) {
+        return false;
+    }
+
+    for i in 0..n {
+        let point: Vec<Goldilocks> = (0..d)
+            .map(|b| Goldilocks::from_bool((i >> b) & 1 == 1))
+            .collect();
+        let (raw_open, rv) = whir_raw.open(raw.prover_data.clone(), &raw.protocol, &point);
+        if whir_raw.verify(&raw.commitment, &raw_open, &raw.protocol, &point).unwrap() != rv {
+            return false;
+        }
+        if rv != xv[i] * rstd * weight[i] {
+            return false;
+        }
+    }
+    true
+}
+
 /// Prove `out = f(round(in / 2^shift) + bias)` against WHIR commitments, in the
 /// O(N)-opening PoC form, where `f` is either the identity (`relu == false`) or
 /// ReLU (`relu == true`). `in` is a raw dot-product output embedded as signed
@@ -420,6 +516,43 @@ mod tests {
         bad[0] += Goldilocks::ONE;
         let c_bad = commit(&whir, &bad);
         assert!(!prove_layer_norm(
+            &whir, &cx, &whir, &c_bad, &weight, n_real, &rsqrt_table, alpha, beta,
+        ));
+    }
+
+    #[test]
+    fn committed_rms_norm_roundtrip() {
+        let mut rng = XorShift64::new(0x567);
+        let n = 64usize;
+        let x: Vec<Goldilocks> = (0..n)
+            .map(|_| from_i32((rng.next_u64() % 65536) as i32))
+            .collect();
+        let weight: Vec<Goldilocks> = (0..n)
+            .map(|_| from_i32((rng.next_u64() % 65536) as i32))
+            .collect();
+        let table_size = 1 << 17;
+        let rsqrt_table: Vec<Goldilocks> = (0..table_size)
+            .map(|j| {
+                let s = j as f64 / 16384.0 + 1e-6;
+                from_i32((1.0 / s.sqrt() * 65536.0).round() as i32)
+            })
+            .collect();
+        let n_real = n;
+        let (raw, _rstd, _s_index) = rms_norm_raw(&x, &weight, n_real, &rsqrt_table);
+
+        let whir = Whir::new_testing(6);
+        let cx = commit(&whir, &x);
+        let c_raw = commit(&whir, &raw);
+        let alpha = rng.field();
+        let beta = rng.field();
+        assert!(prove_rms_norm(
+            &whir, &cx, &whir, &c_raw, &weight, n_real, &rsqrt_table, alpha, beta,
+        ));
+
+        let mut bad = raw.clone();
+        bad[0] += Goldilocks::ONE;
+        let c_bad = commit(&whir, &bad);
+        assert!(!prove_rms_norm(
             &whir, &cx, &whir, &c_bad, &weight, n_real, &rsqrt_table, alpha, beta,
         ));
     }
