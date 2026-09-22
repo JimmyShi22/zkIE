@@ -65,7 +65,8 @@ def main():
 
     import torch  # noqa: E402
 
-    from timesfm_base import TimesFm, TimesFmCheckpoint, TimesFmHparams  # noqa: E402
+    from timesfm_base import TimesFmCheckpoint, TimesFmHparams  # noqa: E402
+    from timesfm_torch import TimesFmTorch  # noqa: E402
 
     hparams = TimesFmHparams(
         context_len=512,
@@ -73,6 +74,7 @@ def main():
         input_patch_len=32,
         output_patch_len=128,
         num_layers=20,
+        num_heads=16,
         model_dims=1280,
         per_core_batch_size=1,
         backend="cpu",
@@ -81,7 +83,8 @@ def main():
         huggingface_repo_id="google/timesfm-1.0-200m-pytorch"
     )
     print("loading checkpoint (this downloads ~814MB on first run)...")
-    tfm = TimesFm(hparams=hparams, checkpoint=checkpoint)
+    tfm = TimesFmTorch(hparams=hparams, checkpoint=checkpoint)
+    tfm.load_from_checkpoint(checkpoint)
     model = tfm._model
     n_params = sum(p.numel() for p in model.parameters())
     print(f"loaded {type(model).__name__} with {n_params:,} parameters")
