@@ -203,7 +203,7 @@ pub fn softmax_raw(
 ) -> (Vec<Goldilocks>, Vec<u32>, Goldilocks) {
     let indices: Vec<u32> = shifted
         .iter()
-        .map(|&v| (to_i32(v) as i64 + offset as i64) as u32)
+        .map(|&v| (to_i32(v) as i64 + offset as i64).clamp(0, exp_table.len() as i64 - 1) as u32)
         .collect();
     let e: Vec<Goldilocks> = indices.iter().map(|&i| exp_table[i as usize]).collect();
     let sum = e.iter().fold(Goldilocks::ZERO, |a, &v| a + v);
@@ -272,6 +272,141 @@ pub fn prove_softmax(
         return false;
     }
     y_r == e_r * sum.inverse()
+}
+
+/// The equality polynomial over the first `log n_rows` variables of a
+/// `n_rows x n_cols` hypercube, broadcast to the full flattened tensor. Used to
+/// reduce the row-wise softmax sum over the column dimension.
+fn eq_row_broadcast(r_row: &[Goldilocks], n_rows: usize, n_cols: usize) -> Vec<Goldilocks> {
+    let dr = r_row.len();
+    (0..n_rows * n_cols)
+        .map(|i| {
+            let row = i / n_cols;
+            (0..dr).fold(Goldilocks::ONE, |acc, k| {
+                let bit = if (row >> k) & 1 == 1 { Goldilocks::ONE } else { Goldilocks::ZERO };
+                acc * (bit * r_row[k] + (Goldilocks::ONE - bit) * (Goldilocks::ONE - r_row[k]))
+            })
+        })
+        .collect()
+}
+
+/// Prove the row-wise softmax over a `n_rows x n_cols` tensor: for each row,
+/// `out[r,c] = exp(scores[r,c] - c[r]) / sum_c exp(scores[r,c] - c[r])`. `c` is
+/// the per-row shift (the max, committed as a public scalar for numerical
+/// stability; softmax is shift-invariant so any valid shift is sound).
+#[allow(clippy::too_many_arguments)]
+pub fn prove_softmax_rows(
+    whir: &Whir,
+    whir_row: &Whir,
+    scores: &Committed,
+    scores_plain: &[Goldilocks],
+    c: &Committed,
+    c_plain: &[Goldilocks],
+    shifted: &Committed,
+    shifted_plain: &[Goldilocks],
+    e: &Committed,
+    e_plain: &[Goldilocks],
+    sum: &Committed,
+    sum_plain: &[Goldilocks],
+    sum_broadcast: &Committed,
+    sum_broadcast_plain: &[Goldilocks],
+    out: &Committed,
+    out_plain: &[Goldilocks],
+    exp_table: &[Goldilocks],
+    offset: u32,
+    n_rows: usize,
+    n_cols: usize,
+    alpha: Goldilocks,
+    beta: Goldilocks,
+    rng: &mut XorShift64,
+) -> bool {
+    let n = n_rows * n_cols;
+    let dr = n_rows.trailing_zeros() as usize;
+    let dc = n_cols.trailing_zeros() as usize;
+    let d = dr + dc;
+
+    // 1. shifted = scores - c (broadcast over columns), single-point.
+    let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let r_row = &r[dc..];
+    let (sc_open, sc_r) = whir.open(scores.prover_data.clone(), &scores.protocol, &r);
+    let (c_open, c_r) = whir_row.open(c.prover_data.clone(), &c.protocol, r_row);
+    let (sh_open, sh_r) = whir.open(shifted.prover_data.clone(), &shifted.protocol, &r);
+    if whir.verify(&scores.commitment, &sc_open, &scores.protocol, &r).unwrap() != sc_r
+        || whir_row.verify(&c.commitment, &c_open, &c.protocol, r_row).unwrap() != c_r
+        || whir.verify(&shifted.commitment, &sh_open, &shifted.protocol, &r).unwrap() != sh_r
+    {
+        return false;
+    }
+    if sh_r != sc_r - c_r {
+        return false;
+    }
+
+    // 2. e = exp_table[shifted + offset] (lookup).
+    let indices: Vec<u32> = shifted_plain
+        .iter()
+        .map(|&v| (to_i32(v) as i64 + offset as i64).clamp(0, exp_table.len() as i64 - 1) as u32)
+        .collect();
+    let idx_field: Vec<Goldilocks> = indices.iter().map(|&i| from_i32(i as i32)).collect();
+    let c_idx = commit(whir, &idx_field);
+    if !prove_lookup(whir, &c_idx, &idx_field, whir, e, e_plain, &indices, exp_table, alpha, beta, rng) {
+        return false;
+    }
+
+    // 3. sum = row-wise sum of e. Pick a fixed row point r_row (the eq selector
+    // and the claimed sum), then a full d-bit sumcheck challenge r_full.
+    let r_row: Vec<Goldilocks> = (0..dr).map(|_| rng.field()).collect();
+    let eq_row = eq_row_broadcast(&r_row, n_rows, n_cols);
+    let claimed_sum = mle::eval(sum_plain, &r_row);
+    let r_full: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let proof_sum = sumcheck::prove(e_plain, &eq_row, claimed_sum, &r_full);
+    let (e_open, e_r) = whir.open(e.prover_data.clone(), &e.protocol, &r_full);
+    let (sum_open, sum_r) = whir_row.open(sum.prover_data.clone(), &sum.protocol, &r_row);
+    if whir.verify(&e.commitment, &e_open, &e.protocol, &r_full).unwrap() != e_r
+        || whir_row.verify(&sum.commitment, &sum_open, &sum.protocol, &r_row).unwrap() != sum_r
+    {
+        return false;
+    }
+    let eq_row_r = mle::eval(&eq_row, &r_full);
+    if !sumcheck::verify(&proof_sum, claimed_sum, &r_full, e_r, eq_row_r) || sum_r != claimed_sum {
+        return false;
+    }
+
+    // 4. sum_broadcast = broadcast of sum over columns (single-point).
+    let r3: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let r3_row = &r3[dc..];
+    let (sb_open, sb_r) = whir.open(sum_broadcast.prover_data.clone(), &sum_broadcast.protocol, &r3);
+    let (s2_open, s2_r) = whir_row.open(sum.prover_data.clone(), &sum.protocol, r3_row);
+    if whir.verify(&sum_broadcast.commitment, &sb_open, &sum_broadcast.protocol, &r3).unwrap() != sb_r
+        || whir_row.verify(&sum.commitment, &s2_open, &sum.protocol, r3_row).unwrap() != s2_r
+    {
+        return false;
+    }
+    if sb_r != s2_r {
+        return false;
+    }
+
+    // 5. out * sum_broadcast = e (degree-3 zero-check).
+    let eq = mle::eq_evals(&r3);
+    let eq_r = mle::eval(&eq, &r3);
+    let c1 = eq.iter().zip(out_plain).zip(sum_broadcast_plain).fold(Goldilocks::ZERO, |a, ((&ei, &oi), &si)| a + ei * oi * si);
+    let c2 = eq.iter().zip(e_plain).fold(Goldilocks::ZERO, |a, (&ei, &vi)| a + ei * vi);
+    let proof_c1 = sumcheck::prove3(&eq, out_plain, sum_broadcast_plain, c1, &r3);
+    let proof_c2 = sumcheck::prove(&eq, e_plain, c2, &r3);
+    let (o_open, o_r) = whir.open(out.prover_data.clone(), &out.protocol, &r3);
+    let (e2_open, e2_r) = whir.open(e.prover_data.clone(), &e.protocol, &r3);
+    if whir.verify(&out.commitment, &o_open, &out.protocol, &r3).unwrap() != o_r
+        || whir.verify(&e.commitment, &e2_open, &e.protocol, &r3).unwrap() != e2_r
+    {
+        return false;
+    }
+    if !sumcheck::verify3(&proof_c1, c1, &r3, eq_r, o_r, sb_r)
+        || !sumcheck::verify(&proof_c2, c2, &r3, eq_r, e2_r)
+        || c1 != c2
+    {
+        return false;
+    }
+    let _ = (n, shifted, c_plain, scores_plain);
+    true
 }
 
 /// Round `a / b` to the nearest integer, ties toward +inf (round half up), for
@@ -1109,6 +1244,76 @@ mod tests {
         let c_bad = commit(&whir, &bad);
         assert!(!prove_softmax(
             &whir, &cx, &shifted, &whir, &ce, &e, &whir, &c_bad, sum, &exp_table, offset, alpha, beta, &mut rng,
+        ));
+    }
+
+    #[test]
+    fn committed_softmax_rows_roundtrip() {
+        let mut rng = XorShift64::new(0x891);
+        let (n_rows, n_cols) = (32usize, 32usize);
+        let offset = 1u32 << 18;
+        let table_size = 1usize << 18;
+        let exp_table: Vec<Goldilocks> = (0..table_size)
+            .map(|j| {
+                let x = (j as f64 - offset as f64) / 65536.0;
+                from_i32((x.exp() * 65536.0).round() as i32)
+            })
+            .collect();
+        // scores as i32 (scale 2^16), with a per-row max for the shift.
+        let scores: Vec<Goldilocks> = (0..n_rows * n_cols)
+            .map(|_| from_i32((rng.next_u64() % 200000) as i32 - 100000))
+            .collect();
+        let c: Vec<Goldilocks> = (0..n_rows)
+            .map(|r| {
+                let row_max = (0..n_cols)
+                    .map(|k| to_i32(scores[r * n_cols + k]))
+                    .max()
+                    .unwrap();
+                from_i32(row_max)
+            })
+            .collect();
+        let shifted: Vec<Goldilocks> = scores
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| s - c[i / n_cols])
+            .collect();
+        let (e, indices, _) = softmax_raw(&shifted, &exp_table, offset);
+        let sum: Vec<Goldilocks> = (0..n_rows)
+            .map(|r| (0..n_cols).fold(Goldilocks::ZERO, |a, k| a + e[r * n_cols + k]))
+            .collect();
+        let sum_broadcast: Vec<Goldilocks> = (0..n_rows * n_cols)
+            .map(|i| sum[i / n_cols])
+            .collect();
+        let out: Vec<Goldilocks> = e
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| v * sum[i / n_cols].inverse())
+            .collect();
+
+        let whir = Whir::new_testing(10);
+        let whir_r = Whir::new_testing(5);
+        let cs = commit(&whir, &scores);
+        let cc = commit(&whir_r, &c);
+        let csh = commit(&whir, &shifted);
+        let ce = commit(&whir, &e);
+        let csum = commit(&whir_r, &sum);
+        let csb = commit(&whir, &sum_broadcast);
+        let cout = commit(&whir, &out);
+        let alpha = rng.field();
+        let beta = rng.field();
+        assert!(prove_softmax_rows(
+            &whir, &whir_r, &cs, &scores, &cc, &c, &csh, &shifted, &ce, &e,
+            &csum, &sum, &csb, &sum_broadcast, &cout, &out, &exp_table, offset, n_rows, n_cols,
+            alpha, beta, &mut rng,
+        ));
+
+        let mut bad = out.clone();
+        bad[0] += Goldilocks::ONE;
+        let c_bad = commit(&whir, &bad);
+        assert!(!prove_softmax_rows(
+            &whir, &whir_r, &cs, &scores, &cc, &c, &csh, &shifted, &ce, &e,
+            &csum, &sum, &csb, &sum_broadcast, &c_bad, &bad, &exp_table, offset, n_rows, n_cols,
+            alpha, beta, &mut rng,
         ));
     }
 
