@@ -5,7 +5,7 @@
 //! ctx32 TimesFM model runs every layer with batch/sequence `m == 1`, so the
 //! left operand is a vector and needs no transpose point-swap.
 
-use crate::field::{Goldilocks, XorShift64};
+use crate::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64};
 use crate::whir::{Commitment, OpeningProtocol, ProverData, Whir};
 use crate::{matmul, mle};
 
@@ -62,6 +62,53 @@ pub fn prove_matmul(
     f_ok && h_ok && c_ok && evals_ok && claimed == proof.claimed && matmul::verify(&proof, &ch, f, h)
 }
 
+/// Prove `outputs[i] == table[indices[i]]` against WHIR commitments, in the
+/// O(N)-opening PoC form: open the committed index and output columns at every
+/// hypercube point and recompute the LogUp left-hand side from those bound
+/// values. `x` holds the indices embedded as field values, `y` the outputs.
+pub fn prove_lookup(
+    whir_x: &Whir,
+    x: &Committed,
+    whir_y: &Whir,
+    y: &Committed,
+    indices: &[u32],
+    table: &[Goldilocks],
+    alpha: Goldilocks,
+    beta: Goldilocks,
+) -> bool {
+    let n = indices.len();
+    let d = n.trailing_zeros() as usize;
+    let mut lhs = Goldilocks::ZERO;
+    for i in 0..n {
+        let point: Vec<Goldilocks> = (0..d)
+            .map(|b| Goldilocks::from_bool((i >> b) & 1 == 1))
+            .collect();
+        let (x_open, xv) = whir_x.open(x.prover_data.clone(), &x.protocol, &point);
+        let (y_open, yv) = whir_y.open(y.prover_data.clone(), &y.protocol, &point);
+        if whir_x.verify(&x.commitment, &x_open, &x.protocol, &point).unwrap() != xv {
+            return false;
+        }
+        if whir_y.verify(&y.commitment, &y_open, &y.protocol, &point).unwrap() != yv {
+            return false;
+        }
+        let key = xv + beta * yv;
+        lhs = lhs + (alpha + key).inverse();
+    }
+
+    let mut m = vec![Goldilocks::ZERO; table.len()];
+    for &i in indices {
+        m[i as usize] = m[i as usize] + Goldilocks::ONE;
+    }
+    let rhs = table
+        .iter()
+        .enumerate()
+        .fold(Goldilocks::ZERO, |acc, (j, &t)| {
+            let tkey = Goldilocks::from_u64(j as u64) + beta * t;
+            acc + m[j] * (alpha + tkey).inverse()
+        });
+    lhs == rhs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,5 +139,23 @@ mod tests {
         assert!(prove_matmul(
             &whir_a, &ca, &whir_b, &cb, &whir_c, &cc, &a, &b, &c, k, n, &mut rng,
         ));
+    }
+
+    #[test]
+    fn committed_lookup_roundtrip() {
+        let mut rng = XorShift64::new(0xdef);
+        let n = 64usize;
+        let table_size = 64usize;
+        let table: Vec<Goldilocks> = (0..table_size).map(|_| rng.field()).collect();
+        let indices: Vec<u32> = (0..n).map(|_| (rng.next_u64() % table_size as u64) as u32).collect();
+        let outputs: Vec<Goldilocks> = indices.iter().map(|&i| table[i as usize]).collect();
+        let idx_vals: Vec<Goldilocks> = indices.iter().map(|&i| Goldilocks::from_u64(i as u64)).collect();
+
+        let whir = Whir::new_testing(6);
+        let cx = commit(&whir, &idx_vals);
+        let cy = commit(&whir, &outputs);
+        let alpha = rng.field();
+        let beta = rng.field();
+        assert!(prove_lookup(&whir, &cx, &whir, &cy, &indices, &table, alpha, beta));
     }
 }
