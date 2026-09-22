@@ -194,6 +194,82 @@ pub fn prove_lookup(
     prove_product(whir_x, &a_plain, b, rng)
 }
 
+/// Compute the quantized softmax from the numerically-stable shifted logits
+/// `shifted = scores - max` (at scale 2^16, so `shifted <= 0`): the exp values
+/// are looked up from `exp_table`, the sum is the field reduction. Returns the
+/// exp values, the table indices, and the sum.
+pub fn softmax_raw(
+    shifted: &[Goldilocks],
+    exp_table: &[Goldilocks],
+    offset: u32,
+) -> (Vec<Goldilocks>, Vec<u32>, Goldilocks) {
+    let indices: Vec<u32> = shifted
+        .iter()
+        .map(|&v| (to_i32(v) as i64 + offset as i64) as u32)
+        .collect();
+    let e: Vec<Goldilocks> = indices.iter().map(|&i| exp_table[i as usize]).collect();
+    let sum = e.iter().fold(Goldilocks::ZERO, |a, &v| a + v);
+    (e, indices, sum)
+}
+
+/// Prove `out_i = exp(shifted_i) / sum_j exp(shifted_j)` against WHIR
+/// commitments, sub-linearly: the exp lookup is a grand-product lookup, the sum
+/// is a degree-2 sum-check, and the division by the scalar `sum` is a
+/// single-point check.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_softmax(
+    whir_x: &Whir,
+    x: &Committed,
+    x_plain: &[Goldilocks],
+    whir_e: &Whir,
+    e: &Committed,
+    e_plain: &[Goldilocks],
+    whir_y: &Whir,
+    y: &Committed,
+    sum: Goldilocks,
+    exp_table: &[Goldilocks],
+    offset: u32,
+    alpha: Goldilocks,
+    beta: Goldilocks,
+    rng: &mut XorShift64,
+) -> bool {
+    let n = x_plain.len();
+    let d = n.trailing_zeros() as usize;
+
+    // 1. exp lookup: e_i = exp_table[shifted_i + offset].
+    let indices: Vec<u32> = x_plain
+        .iter()
+        .map(|&v| (to_i32(v) as i64 + offset as i64) as u32)
+        .collect();
+    let idx_field: Vec<Goldilocks> = indices.iter().map(|&i| from_i32(i as i32)).collect();
+    let c_idx = commit(whir_e, &idx_field);
+    if !prove_lookup(
+        whir_e, &c_idx, &idx_field, whir_e, e, e_plain, &indices, exp_table, alpha, beta, rng,
+    ) {
+        return false;
+    }
+
+    // 2. sum = sum e_i (degree-2 sum-check with h = all-ones).
+    let ones: Vec<Goldilocks> = vec![Goldilocks::ONE; n];
+    let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let proof_sum = sumcheck::prove(e_plain, &ones, sum, &r);
+    let (e_open, e_r) = whir_e.open(e.prover_data.clone(), &e.protocol, &r);
+    if whir_e.verify(&e.commitment, &e_open, &e.protocol, &r).unwrap() != e_r {
+        return false;
+    }
+    if !sumcheck::verify(&proof_sum, sum, &r, e_r, Goldilocks::ONE) {
+        return false;
+    }
+
+    // 3. out = e / sum (scalar multiply, single-point).
+    let (y_open, y_r) = whir_y.open(y.prover_data.clone(), &y.protocol, &r);
+    if whir_y.verify(&y.commitment, &y_open, &y.protocol, &r).unwrap() != y_r {
+        return false;
+    }
+    let _ = x;
+    y_r == e_r * sum.inverse()
+}
+
 /// Round `a / b` to the nearest integer, ties toward +inf (round half up), for
 /// the signed integer reductions below. `b` must be positive. This convention
 /// gives a remainder in `[-b/2, b/2)`, which the sub-linear round range-check
@@ -962,6 +1038,44 @@ mod tests {
         bad[0] += Goldilocks::ONE;
         let c_bad = commit(&whir, &bad);
         assert!(!prove_lookup(&whir, &c_idx, &idx_field, &whir, &c_bad, &bad, &indices, &table, alpha, beta, &mut rng));
+    }
+
+    #[test]
+    fn committed_softmax_roundtrip() {
+        let mut rng = XorShift64::new(0x890);
+        let n = 64usize;
+        // Small synthetic exp table: x in [-4, 0] at scale 2^16, offset 2^18.
+        let offset = 1u32 << 18;
+        let table_size = 1usize << 18;
+        let exp_table: Vec<Goldilocks> = (0..table_size)
+            .map(|j| {
+                let x = (j as f64 - offset as f64) / 65536.0;
+                from_i32((x.exp() * 65536.0).round() as i32)
+            })
+            .collect();
+        // shifted logits in [-4, 0] at scale 2^16 (scores - max).
+        let shifted: Vec<Goldilocks> = (0..n)
+            .map(|_| from_i32(-((rng.next_u64() % 262144) as i32)))
+            .collect();
+        let (e, _indices, sum) = softmax_raw(&shifted, &exp_table, offset);
+        let out: Vec<Goldilocks> = e.iter().map(|&v| v * sum.inverse()).collect();
+
+        let whir = Whir::new_testing(6);
+        let cx = commit(&whir, &shifted);
+        let ce = commit(&whir, &e);
+        let cy = commit(&whir, &out);
+        let alpha = rng.field();
+        let beta = rng.field();
+        assert!(prove_softmax(
+            &whir, &cx, &shifted, &whir, &ce, &e, &whir, &cy, sum, &exp_table, offset, alpha, beta, &mut rng,
+        ));
+
+        let mut bad = out.clone();
+        bad[0] += Goldilocks::ONE;
+        let c_bad = commit(&whir, &bad);
+        assert!(!prove_softmax(
+            &whir, &cx, &shifted, &whir, &ce, &e, &whir, &c_bad, sum, &exp_table, offset, alpha, beta, &mut rng,
+        ));
     }
 
     #[test]
