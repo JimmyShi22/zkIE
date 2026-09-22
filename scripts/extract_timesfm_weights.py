@@ -13,7 +13,7 @@ import os
 import numpy as np
 import onnx
 
-SCALE = 4096.0  # 2^12
+SCALE = 65536.0  # 2^16, matching the activation extraction
 
 
 def next_pow2(n: int) -> int:
