@@ -17,9 +17,7 @@ use p3_matrix::dense::RowMajorMatrix;
 use p3_merkle_tree::MerkleTreeMmcs;
 use p3_multilinear_util::point::Point;
 use p3_sumcheck::layout::{Layout as _, SuffixProver, Table};
-use p3_sumcheck::{
-    OpeningBatch, OpeningProtocol, PointSchedule, PrescribedPointPcs, TableShape, TableSpec,
-};
+use p3_sumcheck::{OpeningBatch, PointSchedule, PrescribedPointPcs, TableShape, TableSpec};
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
 use p3_whir::fiat_shamir::domain_separator::DomainSeparator;
 use p3_whir::parameters::{
@@ -44,6 +42,7 @@ type MyPcs = WhirProver<EF, F, MyDft, MyMmcs, MyChallenger, MyLayout>;
 pub type Commitment = <MyPcs as MultilinearPcs<EF, MyChallenger>>::Commitment;
 pub type ProverData = <MyPcs as MultilinearPcs<EF, MyChallenger>>::ProverData;
 pub type Proof = <MyPcs as MultilinearPcs<EF, MyChallenger>>::Proof;
+pub use p3_sumcheck::OpeningProtocol;
 
 /// A WHIR PCS over Goldilocks configured for a single `2^num_variables` MLE.
 pub struct Whir {
