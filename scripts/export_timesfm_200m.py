@@ -49,8 +49,12 @@ def fetch_sources():
             continue
         urllib.request.urlretrieve(base + name, dest)
         print(f"  {name}: fetched")
-    # The vendored package must not collide with an installed `timesfm`
-    # distribution: rewrite the one intra-package import.
+    # The vendored files use intra-package relative imports, so they must be
+    # imported as a package. The rewrite below also covers the July-era
+    # sources, which imported `from timesfm import timesfm_base` (and would
+    # collide with an installed `timesfm` distribution).
+    with open(os.path.join(SPIKE, "__init__.py"), "w") as f:
+        f.write("")
     torch_path = os.path.join(SPIKE, "timesfm_torch.py")
     with open(torch_path) as f:
         src = f.read()
@@ -61,12 +65,12 @@ def fetch_sources():
 
 def main():
     fetch_sources()
-    sys.path.insert(0, SPIKE)
+    sys.path.insert(0, os.path.dirname(SPIKE))  # .spike-test (package parent)
 
     import torch  # noqa: E402
 
-    from timesfm_base import TimesFmCheckpoint, TimesFmHparams  # noqa: E402
-    from timesfm_torch import TimesFmTorch  # noqa: E402
+    from timesfm_v1.timesfm_base import TimesFmCheckpoint, TimesFmHparams  # noqa: E402
+    from timesfm_v1.timesfm_torch import TimesFmTorch  # noqa: E402
 
     hparams = TimesFmHparams(
         context_len=512,
