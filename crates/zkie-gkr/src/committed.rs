@@ -290,10 +290,65 @@ fn eq_row_broadcast(r_row: &[Goldilocks], n_rows: usize, n_cols: usize) -> Vec<G
         .collect()
 }
 
+/// Prove that `a * x + b * y` is non-negative at every hypercube point, where
+/// `x` and `y` are committed and the linear combination is known non-negative on
+/// the honest execution. The combination is bit-decomposed and range-checked to
+/// `[0, 2^31)` with the same single-point reconstruction [`prove_bits_range`]
+/// uses; by Schwartz-Zippel, agreeing at a random point proves the polynomial
+/// identity, so the bound holds at every point.
+#[allow(clippy::too_many_arguments)]
+fn prove_linear_nonneg(
+    whir: &Whir,
+    x: &Committed,
+    x_plain: &[Goldilocks],
+    y: &Committed,
+    y_plain: &[Goldilocks],
+    a: Goldilocks,
+    b: Goldilocks,
+    rng: &mut XorShift64,
+) -> bool {
+    const BITS: usize = 31;
+    let n = x_plain.len();
+    let d = n.trailing_zeros() as usize;
+    assert_eq!(y_plain.len(), n);
+
+    let lhs: Vec<Goldilocks> = x_plain
+        .iter()
+        .zip(y_plain)
+        .map(|(&xv, &yv)| a * xv + b * yv)
+        .collect();
+    let mut bits: Vec<Vec<Goldilocks>> = vec![vec![Goldilocks::ZERO; n]; BITS];
+    for i in 0..n {
+        // Honest lhs is in [0, 2^31); a negative value (dishonest prover) turns
+        // into a huge u64 here and fails the reconstruction check below.
+        let v = to_i32(lhs[i]) as i64 as u64;
+        for (j, bj) in bits.iter_mut().enumerate() {
+            bj[i] = from_i32(((v >> j) & 1) as i32);
+        }
+    }
+    let c_bits: Vec<Committed> = bits.iter().map(|b| commit(whir, b)).collect();
+
+    let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let s = mle::eq_evals(&r);
+    let s_r = mle::eval(&s, &r);
+    let (x_open, x_r) = whir.open(x.prover_data.clone(), &x.protocol, &r);
+    let (y_open, y_r) = whir.open(y.prover_data.clone(), &y.protocol, &r);
+    if whir.verify(&x.commitment, &x_open, &x.protocol, &r).unwrap() != x_r
+        || whir.verify(&y.commitment, &y_open, &y.protocol, &r).unwrap() != y_r
+    {
+        return false;
+    }
+    let value_at_r = a * x_r + b * y_r;
+    prove_bits_range(whir, &bits, &c_bits, value_at_r, &r, &s, s_r)
+}
+
 /// Prove the row-wise softmax over a `n_rows x n_cols` tensor: for each row,
-/// `out[r,c] = exp(scores[r,c] - c[r]) / sum_c exp(scores[r,c] - c[r])`. `c` is
-/// the per-row shift (the max, committed as a public scalar for numerical
-/// stability; softmax is shift-invariant so any valid shift is sound).
+/// `out[r,c] = round(2^16 * exp(scores[r,c] - c[r]) / sum_c exp(scores[r,c] - c[r]))`.
+/// The output is the probability rescaled to scale 2^16 and rounded half-up
+/// (matching the fixed-point convention `round(e * 2^16 / sum)`), so it chains
+/// directly into the next matmul. `c` is the per-row shift (the max, committed
+/// as a public scalar for numerical stability; softmax is shift-invariant so any
+/// valid shift is sound).
 #[allow(clippy::too_many_arguments)]
 pub fn prove_softmax_rows(
     whir: &Whir,
@@ -385,26 +440,59 @@ pub fn prove_softmax_rows(
         return false;
     }
 
-    // 5. out * sum_broadcast = e (degree-3 zero-check).
+    // 5. out = round(e * 2^16 / sum): prove out * sum_broadcast = e * 2^16 - rem
+    // with |rem| <= sum_broadcast / 2 (round-half-up), so out is the *integer*
+    // probability at scale 2^16 rather than an exact field rational (which would
+    // wrap the field when chained into the next matmul).
+    let scale_f = from_i64(1i64 << 16);
+    let rem: Vec<Goldilocks> = e_plain
+        .iter()
+        .zip(out_plain)
+        .zip(sum_broadcast_plain)
+        .map(|((&ev, &ov), &sv)| ev * scale_f - ov * sv)
+        .collect();
+    let c_rem = commit(whir, &rem);
+
     let eq = mle::eq_evals(&r3);
     let eq_r = mle::eval(&eq, &r3);
     let c1 = eq.iter().zip(out_plain).zip(sum_broadcast_plain).fold(Goldilocks::ZERO, |a, ((&ei, &oi), &si)| a + ei * oi * si);
-    let c2 = eq.iter().zip(e_plain).fold(Goldilocks::ZERO, |a, (&ei, &vi)| a + ei * vi);
+    let ce = eq.iter().zip(e_plain).fold(Goldilocks::ZERO, |a, (&ei, &vi)| a + ei * vi);
+    let cr = eq.iter().zip(&rem).fold(Goldilocks::ZERO, |a, (&ei, &vi)| a + ei * vi);
     let proof_c1 = sumcheck::prove3(&eq, out_plain, sum_broadcast_plain, c1, &r3);
-    let proof_c2 = sumcheck::prove(&eq, e_plain, c2, &r3);
+    let proof_ce = sumcheck::prove(&eq, e_plain, ce, &r3);
+    let proof_cr = sumcheck::prove(&eq, &rem, cr, &r3);
     let (o_open, o_r) = whir.open(out.prover_data.clone(), &out.protocol, &r3);
     let (e2_open, e2_r) = whir.open(e.prover_data.clone(), &e.protocol, &r3);
+    let (rem_open, rem_r) = whir.open(c_rem.prover_data.clone(), &c_rem.protocol, &r3);
     if whir.verify(&out.commitment, &o_open, &out.protocol, &r3).unwrap() != o_r
         || whir.verify(&e.commitment, &e2_open, &e.protocol, &r3).unwrap() != e2_r
+        || whir.verify(&c_rem.commitment, &rem_open, &c_rem.protocol, &r3).unwrap() != rem_r
     {
         return false;
     }
     if !sumcheck::verify3(&proof_c1, c1, &r3, eq_r, o_r, sb_r)
-        || !sumcheck::verify(&proof_c2, c2, &r3, eq_r, e2_r)
-        || c1 != c2
+        || !sumcheck::verify(&proof_ce, ce, &r3, eq_r, e2_r)
+        || !sumcheck::verify(&proof_cr, cr, &r3, eq_r, rem_r)
+        || c1 != scale_f * ce - cr
     {
         return false;
     }
+
+    // |rem| <= sum_broadcast / 2  <=>  2*rem + sum_broadcast >= 0  and
+    // sum_broadcast - 2*rem >= 0, each proven by a sub-linear range check.
+    let two = from_i64(2);
+    let neg_two = from_i64(-2);
+    if !prove_linear_nonneg(
+        whir, &c_rem, &rem, sum_broadcast, sum_broadcast_plain, two, Goldilocks::ONE, rng,
+    ) {
+        return false;
+    }
+    if !prove_linear_nonneg(
+        whir, sum_broadcast, sum_broadcast_plain, &c_rem, &rem, Goldilocks::ONE, neg_two, rng,
+    ) {
+        return false;
+    }
+
     let _ = (n, shifted, c_plain, scores_plain);
     true
 }
@@ -1277,7 +1365,7 @@ mod tests {
             .enumerate()
             .map(|(i, &s)| s - c[i / n_cols])
             .collect();
-        let (e, indices, _) = softmax_raw(&shifted, &exp_table, offset);
+        let (e, _indices, _) = softmax_raw(&shifted, &exp_table, offset);
         let sum: Vec<Goldilocks> = (0..n_rows)
             .map(|r| (0..n_cols).fold(Goldilocks::ZERO, |a, k| a + e[r * n_cols + k]))
             .collect();
@@ -1287,7 +1375,12 @@ mod tests {
         let out: Vec<Goldilocks> = e
             .iter()
             .enumerate()
-            .map(|(i, &v)| v * sum[i / n_cols].inverse())
+            .map(|(i, &v)| {
+                from_i32(div_round(
+                    to_i32(v) as i64 * 65536,
+                    to_i32(sum[i / n_cols]) as i64,
+                ) as i32)
+            })
             .collect();
 
         let whir = Whir::new_testing(10);
@@ -1315,6 +1408,177 @@ mod tests {
             &csum, &sum, &csb, &sum_broadcast, &c_bad, &bad, &exp_table, offset, n_rows, n_cols,
             alpha, beta, &mut rng,
         ));
+    }
+
+    #[test]
+    fn committed_attention_roundtrip() {
+        // Multi-head attention: per-head scores = Q @ K^T (scale 2^32), rescaled
+        // to 2^16, a row-wise softmax over all (head, query) rows (scale 2^16),
+        // then attn_raw = softmax @ V (scale 2^32) rescaled to 2^16. Verifies the
+        // m>1 matmul + row-wise softmax + rescale primitives compose into a real
+        // attention block. Sizes stay >= 2^5 because the WHIR folding factor is 5.
+        let mut rng = XorShift64::new(0x892);
+        let (heads, seq, hdim) = (4usize, 8usize, 8usize);
+        let offset = 1u32 << 18;
+        let table_size = 1usize << 18;
+        let exp_table: Vec<Goldilocks> = (0..table_size)
+            .map(|j| {
+                let x = (j as f64 - offset as f64) / 65536.0;
+                from_i32((x.exp() * 65536.0).round() as i32)
+            })
+            .collect();
+
+        // Q [heads, seq, hdim], K [heads, hdim, seq], V [heads, seq, hdim] (scale 2^16).
+        // Small magnitudes keep QK^T logits inside the exp-table range.
+        let qv: Vec<Goldilocks> = (0..heads * seq * hdim)
+            .map(|_| from_i32((rng.next_u64() % 2000) as i32 - 1000))
+            .collect();
+        let kv: Vec<Goldilocks> = (0..heads * hdim * seq)
+            .map(|_| from_i32((rng.next_u64() % 2000) as i32 - 1000))
+            .collect();
+        let vv: Vec<Goldilocks> = (0..heads * seq * hdim)
+            .map(|_| from_i32((rng.next_u64() % 2000) as i32 - 1000))
+            .collect();
+
+        // Host-side forward pass: scores_raw -> scores -> softmax -> attn.
+        let mut scores_raw = vec![Goldilocks::ZERO; heads * seq * seq];
+        let mut scores = vec![Goldilocks::ZERO; heads * seq * seq];
+        for h in 0..heads {
+            let qh = &qv[h * seq * hdim..(h + 1) * seq * hdim];
+            let kh = &kv[h * hdim * seq..(h + 1) * hdim * seq];
+            for q in 0..seq {
+                for k in 0..seq {
+                    let mut acc = Goldilocks::ZERO;
+                    for d in 0..hdim {
+                        acc = acc + qh[q * hdim + d] * kh[d * seq + k];
+                    }
+                    scores_raw[(h * seq + q) * seq + k] = acc;
+                    scores[(h * seq + q) * seq + k] =
+                        from_i32(div_round(to_i64(acc), 1 << 16) as i32);
+                }
+            }
+        }
+
+        // Row-wise softmax over all (head, query) rows, seq keys each.
+        let n_rows = heads * seq;
+        let c: Vec<Goldilocks> = (0..n_rows)
+            .map(|r| {
+                from_i32(
+                    (0..seq)
+                        .map(|k| to_i32(scores[r * seq + k]))
+                        .max()
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let shifted: Vec<Goldilocks> = scores
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| s - c[i / seq])
+            .collect();
+        let e: Vec<Goldilocks> = shifted
+            .iter()
+            .map(|&s| {
+                let idx =
+                    (to_i32(s) as i64 + offset as i64).clamp(0, table_size as i64 - 1) as usize;
+                exp_table[idx]
+            })
+            .collect();
+        let sum: Vec<Goldilocks> = (0..n_rows)
+            .map(|r| (0..seq).fold(Goldilocks::ZERO, |a, k| a + e[r * seq + k]))
+            .collect();
+        let sum_broadcast: Vec<Goldilocks> = (0..n_rows * seq).map(|i| sum[i / seq]).collect();
+        let sm: Vec<Goldilocks> = e
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                from_i32(div_round(
+                    to_i32(v) as i64 * 65536,
+                    to_i32(sum[i / seq]) as i64,
+                ) as i32)
+            })
+            .collect();
+
+        // PV: attn_raw = sm @ V (scale 2^32), then rescale to 2^16.
+        let mut attn_raw = vec![Goldilocks::ZERO; heads * seq * hdim];
+        let mut attn = vec![Goldilocks::ZERO; heads * seq * hdim];
+        for h in 0..heads {
+            let vh = &vv[h * seq * hdim..(h + 1) * seq * hdim];
+            for q in 0..seq {
+                for d in 0..hdim {
+                    let mut acc = Goldilocks::ZERO;
+                    for k in 0..seq {
+                        acc = acc + sm[(h * seq + q) * seq + k] * vh[k * hdim + d];
+                    }
+                    attn_raw[(h * seq + q) * hdim + d] = acc;
+                    attn[(h * seq + q) * hdim + d] =
+                        from_i32(div_round(to_i64(acc), 1 << 16) as i32);
+                }
+            }
+        }
+
+        // Whir instances (all >= 2^5 because the folding factor is 5).
+        let whir_hd = Whir::new_testing(6); // seq*hdim = 64
+        let whir_k = Whir::new_testing(6); // hdim*seq = 64
+        let whir_sq = Whir::new_testing(6); // seq*seq = 64
+        let whir_soft = Whir::new_testing(8); // heads*seq*seq = 256
+        let whir_row = Whir::new_testing(5); // heads*seq = 32
+        let alpha = rng.field();
+        let beta = rng.field();
+
+        // Per-head QK^T + rescale.
+        for h in 0..heads {
+            let qh = &qv[h * seq * hdim..(h + 1) * seq * hdim];
+            let kh = &kv[h * hdim * seq..(h + 1) * hdim * seq];
+            let srh = &scores_raw[h * seq * seq..(h + 1) * seq * seq];
+            let sh = &scores[h * seq * seq..(h + 1) * seq * seq];
+            let cq = commit(&whir_hd, qh);
+            let ck = commit(&whir_k, kh);
+            let csr = commit(&whir_sq, srh);
+            assert!(prove_matmul(
+                &whir_hd, &cq, &whir_k, &ck, &whir_sq, &csr, qh, kh, srh, seq, hdim, seq,
+                &mut rng,
+            ));
+            let cs = commit(&whir_sq, sh);
+            let zero = vec![Goldilocks::ZERO; seq * seq];
+            assert!(prove_affine(
+                &whir_sq, &csr, srh, &whir_sq, &cs, sh, &zero, 16, &mut rng,
+            ));
+        }
+
+        // Row-wise softmax over the whole (heads*seq) x seq score tensor.
+        let cs_all = commit(&whir_soft, &scores);
+        let cc = commit(&whir_row, &c);
+        let csh = commit(&whir_soft, &shifted);
+        let ce = commit(&whir_soft, &e);
+        let csum = commit(&whir_row, &sum);
+        let csb = commit(&whir_soft, &sum_broadcast);
+        let csm = commit(&whir_soft, &sm);
+        assert!(prove_softmax_rows(
+            &whir_soft, &whir_row, &cs_all, &scores, &cc, &c, &csh, &shifted, &ce, &e,
+            &csum, &sum, &csb, &sum_broadcast, &csm, &sm, &exp_table, offset, n_rows, seq,
+            alpha, beta, &mut rng,
+        ));
+
+        // Per-head PV: attn_raw = sm @ V, then rescale to scale 2^16.
+        for h in 0..heads {
+            let vh = &vv[h * seq * hdim..(h + 1) * seq * hdim];
+            let smh = &sm[h * seq * seq..(h + 1) * seq * seq];
+            let arh = &attn_raw[h * seq * hdim..(h + 1) * seq * hdim];
+            let ah = &attn[h * seq * hdim..(h + 1) * seq * hdim];
+            let cv = commit(&whir_hd, vh);
+            let car = commit(&whir_hd, arh);
+            let ca = commit(&whir_hd, ah);
+            let csmh = commit(&whir_sq, smh);
+            assert!(prove_matmul(
+                &whir_sq, &csmh, &whir_hd, &cv, &whir_hd, &car, smh, vh, arh, seq, seq, hdim,
+                &mut rng,
+            ));
+            let zero = vec![Goldilocks::ZERO; seq * hdim];
+            assert!(prove_affine(
+                &whir_hd, &car, arh, &whir_hd, &ca, ah, &zero, 16, &mut rng,
+            ));
+        }
     }
 
     #[test]
