@@ -18,7 +18,7 @@ from onnx import helper, TensorProto
 def main() -> None:
     m = onnx.load("models/timesfm_8m_fintext_ctx32.onnx")
     g = m.graph
-    key = ["mul_9", "val_95", "matmul", "softmax", "matmul_1", "val_123", "layer_norm", "val_127", "relu", "val_129"]
+    key = ["mul_9", "val_95", "matmul", "softmax", "matmul_1", "view_5", "val_123", "layer_norm", "val_127", "relu", "val_129"]
     for name in key:
         g.output.append(helper.make_tensor_value_info(name, TensorProto.FLOAT, None))
     m2 = helper.make_model(g, opset_imports=m.opset_import)

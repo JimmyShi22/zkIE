@@ -45,7 +45,7 @@ fn main() {
 
     // Activations (padded int32, scale 2^16).
     let input = load_i32(&format!("{a}mul_9_512_i32.bin"));
-    let qkv_out = load_i32(&format!("{a}val_95_1024_i32.bin")); // QKV output [792] -> [1024]
+    let o_in = load_i32(&format!("{a}view_5_512_i32.bin")); // attention output (o_proj input)
     let ffn_in = load_i32(&format!("{a}layer_norm_512_i32.bin"));
     let relu = load_i32(&format!("{a}relu_1024_i32.bin"));
 
@@ -85,18 +85,14 @@ fn main() {
         &relu, &down, &down_raw, 1024, 512, &mut rng,
     ));
 
-    // o_proj: V slice [512] @ o_proj [512,512] = o_raw [512].
-    // V = QKV output columns 528..792; use the committed qkv output slice.
-    let v_slice: Vec<Goldilocks> = qkv_out[528..792].to_vec();
-    let mut v_pad = vec![Goldilocks::ZERO; 512];
-    v_pad[..v_slice.len()].copy_from_slice(&v_slice);
-    let o_raw = dense(&v_pad, &o_proj, 512, 512);
-    let c_v = commit(&whir9, &v_pad);
+    // o_proj: attention output [512] @ o_proj [512,512] = o_raw [512].
+    let o_raw = dense(&o_in, &o_proj, 512, 512);
+    let c_o_in = commit(&whir9, &o_in);
     let c_o_proj = commit(&whir18, &o_proj);
     let c_o_raw = commit(&whir9, &o_raw);
     assert!(prove_matmul(
-        &whir9, &c_v, &whir18, &c_o_proj, &whir9, &c_o_raw,
-        &v_pad, &o_proj, &o_raw, 512, 512, &mut rng,
+        &whir9, &c_o_in, &whir18, &c_o_proj, &whir9, &c_o_raw,
+        &o_in, &o_proj, &o_raw, 512, 512, &mut rng,
     ));
 
     println!("TimesFM layer 0: QKV + o_proj + gate + down matmuls verified from WHIR commitments");
