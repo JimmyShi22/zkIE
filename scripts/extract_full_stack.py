@@ -116,7 +116,32 @@ def main() -> None:
     u2 = float(np.asarray(r3[names3.index("unsqueeze_2")]).reshape(-1)[0])
     np.array([round(u4 * SCALE), round(u2 * SCALE)], dtype=np.int64).tofile(f"{out_dir}/scale_i64.bin")
 
-    print(f"dumped full-stack + epilogue tensors under {out_dir}/")
+    # Prologue: cat (embedded input, 64) -> SiLU input FFN -> add, then +gather
+    # +embedding (freq) -> add_2. `cat`, `gather`, `embedding` are the fixed
+    # embedded inputs for this input/freq; the SiLU FFN and additions are proven.
+    g3 = m.graph
+    for name in ("cat", "gather", "embedding"):
+        g3.output.append(helper.make_tensor_value_info(name, TensorProto.FLOAT, None))
+    m4 = helper.make_model(g3, opset_imports=m.opset_import)
+    onnx.save(m4, "/tmp/tsfm_prologue.onnx")
+    sess4 = ort.InferenceSession("/tmp/tsfm_prologue.onnx", providers=["CPUExecutionProvider"])
+    names4 = [o.name for o in m4.graph.output]
+    r4 = sess4.run(names4, {"input_ts": inp, "input_padding": pad_in, "freq": np.array([[0]], dtype=np.int64)})
+    cat = r4[names4.index("cat")].reshape(-1)
+    gather = r4[names4.index("gather")].reshape(-1)
+    embedding = r4[names4.index("embedding")].reshape(-1)
+
+    pad1(q(cat), 64).tofile(f"{out_dir}/cat_i32.bin")
+    pad2(q(inits["val_49"]), 64, 1024).tofile(f"{out_dir}/pro_hid_w_i32.bin")
+    q(inits["input_ff_layer.hidden_layer.0.bias"]).tofile(f"{out_dir}/pro_hid_b_i32.bin")
+    pad2(q(inits["val_52"]), 1024, 512).tofile(f"{out_dir}/pro_out_w_i32.bin")
+    pad1(q(inits["input_ff_layer.output_layer.bias"]), 512).tofile(f"{out_dir}/pro_out_b_i32.bin")
+    pad2(q(inits["val_54"]), 64, 512).tofile(f"{out_dir}/pro_res_w_i32.bin")
+    pad1(q(inits["input_ff_layer.residual_layer.bias"]), 512).tofile(f"{out_dir}/pro_res_b_i32.bin")
+    pad1(q(gather), 512).tofile(f"{out_dir}/gather_i32.bin")
+    pad1(q(embedding), 512).tofile(f"{out_dir}/embedding_i32.bin")
+
+    print(f"dumped full-stack + epilogue + prologue tensors under {out_dir}/")
 
 
 if __name__ == "__main__":

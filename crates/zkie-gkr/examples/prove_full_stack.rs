@@ -47,15 +47,73 @@ fn main() {
     let zero_bias = vec![from_i32(0); 512];
 
     let mut rng = XorShift64::new(0x7ee);
+    let whir6 = Whir::new_testing(6);
     let whir9 = Whir::new_testing(9);
     let whir10 = Whir::new_testing(10);
     let whir11 = Whir::new_testing(11);
+    let whir15 = Whir::new_testing(15);
+    let whir16 = Whir::new_testing(16);
     let whir18 = Whir::new_testing(18);
     let whir19 = Whir::new_testing(19);
     let whir20 = Whir::new_testing(20);
     let whir21 = Whir::new_testing(21);
 
-    let mut x = load_i32(&format!("{stack}x_i32.bin"));
+    let silu_table = load_i32(&format!("{base}silu_table_i32.bin"));
+    const SILU_OFFSET: u32 = 1 << 19;
+
+    // Prologue: cat (embedded input) -> SiLU FFN -> add, then +gather +embedding
+    // (freq) -> add_2.
+    let cat = load_i32(&format!("{stack}cat_i32.bin"));
+    let pro_hid_w = load_i32(&format!("{stack}pro_hid_w_i32.bin"));
+    let pro_hid_b = load_i32(&format!("{stack}pro_hid_b_i32.bin"));
+    let pro_out_w = load_i32(&format!("{stack}pro_out_w_i32.bin"));
+    let pro_out_b = load_i32(&format!("{stack}pro_out_b_i32.bin"));
+    let pro_res_w = load_i32(&format!("{stack}pro_res_w_i32.bin"));
+    let pro_res_b = load_i32(&format!("{stack}pro_res_b_i32.bin"));
+    let gather = load_i32(&format!("{stack}gather_i32.bin"));
+    let embedding = load_i32(&format!("{stack}embedding_i32.bin"));
+
+    let hid_raw = dense(&cat, &pro_hid_w, 64, 1024);
+    let linear = affine_raw(&hid_raw, &pro_hid_b, 16, false);
+    let (silu_idx, silu) = silu_raw(&linear, &silu_table, SILU_OFFSET);
+    let out_raw = dense(&silu, &pro_out_w, 1024, 512);
+    let linear_1 = affine_raw(&out_raw, &pro_out_b, 16, false);
+    let res_raw = dense(&cat, &pro_res_w, 64, 512);
+    let linear_2 = affine_raw(&res_raw, &pro_res_b, 16, false);
+    let add = add_vec(&linear_1, &linear_2);
+    let add_1 = add_vec(&add, &gather);
+    let add_2 = add_vec(&add_1, &embedding);
+
+    let c_cat = commit(&whir6, &cat);
+    let c_hidw = commit(&whir16, &pro_hid_w);
+    let c_hidraw = commit(&whir10, &hid_raw);
+    assert!(prove_matmul(&whir6, &c_cat, &whir16, &c_hidw, &whir10, &c_hidraw, &cat, &pro_hid_w, &hid_raw, 64, 1024, &mut rng));
+    let c_linear = commit(&whir10, &linear);
+    assert!(prove_affine(&whir10, &c_hidraw, &whir10, &c_linear, &pro_hid_b, 16, false));
+    let idx_field: Vec<Goldilocks> = silu_idx.iter().map(|&i| from_i32(i as i32)).collect();
+    let c_idx = commit(&whir10, &idx_field);
+    let c_silu = commit(&whir10, &silu);
+    assert!(prove_lookup(&whir10, &c_idx, &whir10, &c_silu, &silu_idx, &silu_table, rng.field(), rng.field()));
+    let c_outw = commit(&whir19, &pro_out_w);
+    let c_outraw = commit(&whir9, &out_raw);
+    assert!(prove_matmul(&whir10, &c_silu, &whir19, &c_outw, &whir9, &c_outraw, &silu, &pro_out_w, &out_raw, 1024, 512, &mut rng));
+    let c_lin1 = commit(&whir9, &linear_1);
+    assert!(prove_affine(&whir9, &c_outraw, &whir9, &c_lin1, &pro_out_b, 16, false));
+    let c_resw = commit(&whir15, &pro_res_w);
+    let c_resraw = commit(&whir9, &res_raw);
+    assert!(prove_matmul(&whir6, &c_cat, &whir15, &c_resw, &whir9, &c_resraw, &cat, &pro_res_w, &res_raw, 64, 512, &mut rng));
+    let c_lin2 = commit(&whir9, &linear_2);
+    assert!(prove_affine(&whir9, &c_resraw, &whir9, &c_lin2, &pro_res_b, 16, false));
+    let c_add = commit(&whir9, &add);
+    assert!(prove_add(&whir9, &c_lin1, &whir9, &c_lin2, &whir9, &c_add, 512));
+    let c_gather = commit(&whir9, &gather);
+    let c_add1 = commit(&whir9, &add_1);
+    assert!(prove_add(&whir9, &c_add, &whir9, &c_gather, &whir9, &c_add1, 512));
+    let c_emb = commit(&whir9, &embedding);
+    let c_add2 = commit(&whir9, &add_2);
+    assert!(prove_add(&whir9, &c_add1, &whir9, &c_emb, &whir9, &c_add2, 512));
+
+    let mut x = add_2;
 
     for li in 0..7 {
         let lnw = load_i32(&format!("{stack}L{li}_lnw_i32.bin"));
@@ -135,11 +193,9 @@ fn main() {
     let out_b = load_i32(&format!("{stack}head_out_b_i32.bin"));
     let res_w = load_i32(&format!("{stack}head_res_w_i32.bin"));
     let res_b = load_i32(&format!("{stack}head_res_b_i32.bin"));
-    let silu_table = load_i32(&format!("{base}silu_table_i32.bin"));
     let scale_bytes = std::fs::read(format!("{stack}scale_i64.bin")).expect("scale file");
     let scale_q = i64::from_le_bytes(scale_bytes[0..8].try_into().unwrap());
     let bias_q = i64::from_le_bytes(scale_bytes[8..16].try_into().unwrap());
-    const SILU_OFFSET: u32 = 1 << 19;
 
     let hid_raw = dense(&x, &hid_w, 512, 1024);
     let lin31 = affine_raw(&hid_raw, &hid_b, 16, false);
@@ -177,5 +233,5 @@ fn main() {
     let c_out = commit(&whir11, &output_ts);
     assert!(prove_scale(&whir11, &c_add31, &whir11, &c_out, scale_q, &bias_bcast));
 
-    println!("TimesFM 8M: 7-layer stack + output head verified from WHIR commitments");
+    println!("TimesFM 8M: prologue + 7-layer stack + output head verified from WHIR commitments");
 }
