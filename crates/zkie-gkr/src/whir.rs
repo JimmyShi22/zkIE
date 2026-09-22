@@ -49,6 +49,8 @@ pub struct Whir {
     pcs: MyPcs,
     perm: Perm,
     folding_factor: FoldingFactor,
+    /// (commits, total seconds) spent inside `commit`, for performance telemetry.
+    commit_stats: std::cell::Cell<(u64, f64)>,
 }
 
 impl Whir {
@@ -99,7 +101,13 @@ impl Whir {
             pcs,
             perm,
             folding_factor,
+            commit_stats: std::cell::Cell::new((0, 0.0)),
         }
+    }
+
+    /// Number of `commit` calls and total wall-clock seconds spent inside them.
+    pub fn commit_stats(&self) -> (u64, f64) {
+        self.commit_stats.get()
     }
 
     fn fresh_challenger(&self) -> MyChallenger {
@@ -113,6 +121,7 @@ impl Whir {
     /// Commit to a flat MLE. Returns the commitment, prover data, and the public
     /// opening protocol (single table, single column, one point) used for open/verify.
     pub fn commit(&self, evals: &[Goldilocks]) -> (Commitment, ProverData, OpeningProtocol) {
+        let t0 = std::time::Instant::now();
         let num_vars = evals.len().trailing_zeros() as usize;
         assert_eq!(evals.len(), 1 << num_vars, "MLE length must be a power of two");
 
@@ -135,6 +144,9 @@ impl Whir {
                 witness,
                 &mut self.fresh_challenger(),
             );
+        let (n, secs) = self.commit_stats.get();
+        self.commit_stats
+            .set((n + 1, secs + t0.elapsed().as_secs_f64()));
         (commitment, prover_data, protocol)
     }
 

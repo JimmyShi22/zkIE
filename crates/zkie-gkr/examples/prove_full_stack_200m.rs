@@ -319,7 +319,30 @@ fn main() {
     let zero_hd = vec![from_i32(0); SEQ * HDIM_PAD];
     let mut x = x;
 
+    let t_stack = std::time::Instant::now();
+    let stats_before = || {
+        [
+            ("whir8", whir8.commit_stats()),
+            ("whir10", whir10.commit_stats()),
+            ("whir11", whir11.commit_stats()),
+            ("whir12", whir12.commit_stats()),
+            ("whir15", whir15.commit_stats()),
+            ("whir17", whir17.commit_stats()),
+            ("whir22", whir22.commit_stats()),
+        ]
+    };
+    let fmt_stats = |s: [(&str, (u64, f64)); 7]| {
+        let total: f64 = s.iter().map(|(_, (_, t))| t).sum();
+        let per: Vec<String> = s
+            .iter()
+            .map(|(name, (n, t))| format!("{name}={t:.1}s/{n}"))
+            .collect();
+        format!("whir commits: {total:.1}s [{}]", per.join(", "))
+    };
+    let mut prev_stats = stats_before();
+
     for li in 0..N_LAYERS {
+        let t_layer = std::time::Instant::now();
         let lnw = load_i32(&format!("{stack}L{li}_lnw_i32.bin"));
         let q_w = load_i32(&format!("{stack}L{li}_q_w_i32.bin"));
         let k_w = load_i32(&format!("{stack}L{li}_k_w_i32.bin"));
@@ -495,8 +518,19 @@ fn main() {
         assert!(prove_add(&whir15, &c_add5, &whir15, &c_ffnout, &whir15, &c_next, SEQ * H_PAD, &mut rng));
 
         x = next_x;
-        println!("layer {li} verified");
+        let now = stats_before();
+        println!(
+            "layer {li} verified in {:.1}s | {}",
+            t_layer.elapsed().as_secs_f64(),
+            fmt_stats(now)
+        );
+        prev_stats = now;
     }
+    println!(
+        "20-layer stack done in {:.1}s | {}",
+        t_stack.elapsed().as_secs_f64(),
+        fmt_stats(prev_stats)
+    );
 
     // --- Epilogue: horizon FFN output head -> rescale.
     let hid_w = load_i32(&format!("{stack}head_hid_w_i32.bin"));
