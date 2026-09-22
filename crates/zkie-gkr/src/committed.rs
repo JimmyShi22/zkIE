@@ -748,7 +748,9 @@ pub fn silu_raw(
 ) -> (Vec<u32>, Vec<Goldilocks>) {
     let indices: Vec<u32> = x
         .iter()
-        .map(|&v| (to_i32(v) as i64 + offset as i64) as u32)
+        .map(|&v| {
+            (to_i32(v) as i64 + offset as i64).clamp(0, table.len() as i64 - 1) as u32
+        })
         .collect();
     let outputs: Vec<Goldilocks> = indices.iter().map(|&i| table[i as usize]).collect();
     (indices, outputs)

@@ -54,7 +54,9 @@ def main():
     # Attention constants: per-head_dim Q scale and the causal mask.
     q_scale = pad1(q(inits["unsqueeze_29"].reshape(HDIM)), HDIM_PAD)
     q_scale.tofile(f"{out_dir}/q_scale_i32.bin")
-    mask = q(np.triu(np.full((SEQ, SEQ), -1e30), k=1))
+    # Masked (future) positions: use -2^21 (= -32 in the exp table's scale) so
+    # softmax -> ~0 without overflowing i32 when a negative logit is added.
+    mask = np.triu(np.full((SEQ, SEQ), -(1 << 21)), k=1).astype(np.int32)
     mask.tofile(f"{out_dir}/mask_q_i32.bin")
 
     # Input FFN: cat [SEQ, 64] -> SiLU FFN -> add. The cat input is the RevIN
@@ -97,7 +99,7 @@ def main():
     pad1(q(cat), 64 * SEQ).tofile(f"{out_dir}/cat_i32.bin")
     pad2(q(gather), SEQ, H_PAD).tofile(f"{out_dir}/gather_i32.bin")
     pad1(q(embedding), H_PAD).tofile(f"{out_dir}/embedding_i32.bin")
-    np.array([round(u2 * SCALE), round(u4 * SCALE)], dtype=np.int64).tofile(f"{out_dir}/scale_i64.bin")
+    np.array([round(u4 * SCALE), round(u2 * SCALE)], dtype=np.int64).tofile(f"{out_dir}/scale_i64.bin")
 
     print(f"dumped prologue/epilogue/attention constants under {out_dir}/")
 
