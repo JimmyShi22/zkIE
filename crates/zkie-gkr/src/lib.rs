@@ -9,6 +9,7 @@
 
 pub mod field;
 pub mod fixed_point;
+pub mod committed;
 pub mod gelu;
 pub mod lookup;
 pub mod matmul;
