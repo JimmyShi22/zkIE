@@ -309,6 +309,63 @@ pub fn silu_raw(
     (indices, outputs)
 }
 
+/// Compute `out = round(in * scale / 2^16) + bias` (the output-head rescale of
+/// the horizon FFN), matching [`prove_scale`]. `in` and `bias` are at scale
+/// 2^16, `scale` is an integer at scale 2^16 (e.g. `round(1.0487 * 2^16)`).
+pub fn scale_raw(input: &[Goldilocks], scale: i64, bias: &[Goldilocks]) -> Vec<Goldilocks> {
+    assert_eq!(input.len(), bias.len());
+    input
+        .iter()
+        .zip(bias)
+        .map(|(&iv, &bv)| {
+            let v = div_round(to_i64(iv) * scale, 1i64 << 16) + to_i32(bv) as i64;
+            from_i32(v as i32)
+        })
+        .collect()
+}
+
+/// Prove `out = round(in * scale / 2^16) + bias` against WHIR commitments, in
+/// the O(N)-opening PoC form. The scalar multiply is a deterministic host-side
+/// integer operation (no lookup), exactly like the rescale in [`prove_affine`].
+#[allow(clippy::too_many_arguments)]
+pub fn prove_scale(
+    whir_in: &Whir,
+    input: &Committed,
+    whir_out: &Whir,
+    output: &Committed,
+    scale: i64,
+    bias: &[Goldilocks],
+) -> bool {
+    let n = bias.len();
+    let d = n.trailing_zeros() as usize;
+    for i in 0..n {
+        let point: Vec<Goldilocks> = (0..d)
+            .map(|b| Goldilocks::from_bool((i >> b) & 1 == 1))
+            .collect();
+        let (in_open, inv) = whir_in.open(input.prover_data.clone(), &input.protocol, &point);
+        let (out_open, ov) = whir_out.open(output.prover_data.clone(), &output.protocol, &point);
+        if whir_in
+            .verify(&input.commitment, &in_open, &input.protocol, &point)
+            .unwrap()
+            != inv
+        {
+            return false;
+        }
+        if whir_out
+            .verify(&output.commitment, &out_open, &output.protocol, &point)
+            .unwrap()
+            != ov
+        {
+            return false;
+        }
+        let expected = div_round(to_i64(inv) * scale, 1i64 << 16) + to_i32(bias[i]) as i64;
+        if to_i32(ov) as i64 != expected {
+            return false;
+        }
+    }
+    true
+}
+
 /// Prove the raw RMSNorm product `raw = x * rstd * w` (scale 2^48) against WHIR
 /// commitments, in the O(N)-opening PoC form. `mean(x^2)` is recomputed from the
 /// *committed* `x`, and `rstd = 1/sqrt(mean(x^2) + eps)` is bound to it by a
@@ -627,6 +684,30 @@ mod tests {
         bad[0] += Goldilocks::ONE;
         let c_bad = commit(&whir, &bad);
         assert!(!prove_lookup(&whir, &c_idx, &whir, &c_bad, &indices, &table, alpha, beta));
+    }
+
+    #[test]
+    fn committed_scale_roundtrip() {
+        let mut rng = XorShift64::new(0x789);
+        let n = 64usize;
+        let input: Vec<Goldilocks> = (0..n)
+            .map(|_| from_i32((rng.next_u64() % 200000) as i32 - 100000))
+            .collect();
+        let bias: Vec<Goldilocks> = (0..n)
+            .map(|_| from_i32((rng.next_u64() % 65536) as i32 - 32768))
+            .collect();
+        let scale = 68729i64; // round(1.0487 * 2^16)
+        let out = scale_raw(&input, scale, &bias);
+
+        let whir = Whir::new_testing(6);
+        let c_in = commit(&whir, &input);
+        let c_out = commit(&whir, &out);
+        assert!(prove_scale(&whir, &c_in, &whir, &c_out, scale, &bias));
+
+        let mut bad = out.clone();
+        bad[0] += Goldilocks::ONE;
+        let c_bad = commit(&whir, &bad);
+        assert!(!prove_scale(&whir, &c_in, &whir, &c_bad, scale, &bias));
     }
 
     #[test]
