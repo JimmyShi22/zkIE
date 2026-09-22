@@ -386,6 +386,46 @@ pub fn scale_raw(input: &[Goldilocks], scale: i64, bias: &[Goldilocks]) -> Vec<G
 /// Prove `out = round(in * scale / 2^16) + bias` against WHIR commitments, in
 /// the O(N)-opening PoC form. The scalar multiply is a deterministic host-side
 /// integer operation (no lookup), exactly like the rescale in [`prove_affine`].
+/// Prove `bits` are all in {0,1} and that `value_at_r = sum_j bits_j(r) * 2^j`,
+/// i.e. the value whose bits are given is in `[0, 2^bits.len())`. The bit-check
+/// uses `sum eq b (b-1) = 0 <=> sum eq b^2 == sum eq b`, and the reconstruction
+/// is a single random-point linear check.
+fn prove_bits_range(
+    whir: &Whir,
+    bits: &[Vec<Goldilocks>],
+    c_bits: &[Committed],
+    value_at_r: Goldilocks,
+    r: &[Goldilocks],
+    s: &[Goldilocks],
+    s_r: Goldilocks,
+) -> bool {
+    for (j, bj) in bits.iter().enumerate() {
+        let c_bb: Goldilocks = s.iter().zip(bj).zip(bj).fold(Goldilocks::ZERO, |a, ((&si, &xi), &yi)| a + si * xi * yi);
+        let c_b: Goldilocks = s.iter().zip(bj).fold(Goldilocks::ZERO, |a, (&si, &xi)| a + si * xi);
+        let proof_bb = sumcheck::prove3(s, bj, bj, c_bb, r);
+        let proof_b = sumcheck::prove(s, bj, c_b, r);
+        let (b_open, b_r) = whir.open(c_bits[j].prover_data.clone(), &c_bits[j].protocol, r);
+        if whir.verify(&c_bits[j].commitment, &b_open, &c_bits[j].protocol, r).unwrap() != b_r {
+            return false;
+        }
+        if !sumcheck::verify3(&proof_bb, c_bb, r, s_r, b_r, b_r)
+            || !sumcheck::verify(&proof_b, c_b, r, s_r, b_r)
+            || c_bb != c_b
+        {
+            return false;
+        }
+    }
+    let mut rhs = Goldilocks::ZERO;
+    for (j, c_b) in c_bits.iter().enumerate() {
+        let (b_open, b_r) = whir.open(c_b.prover_data.clone(), &c_b.protocol, r);
+        if whir.verify(&c_b.commitment, &b_open, &c_b.protocol, r).unwrap() != b_r {
+            return false;
+        }
+        rhs = rhs + b_r * from_i64(1i64 << j);
+    }
+    value_at_r == rhs
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prove_round(
     whir_in: &Whir,
@@ -423,28 +463,6 @@ fn prove_round(
     let s = mle::eq_evals(&r);
     let s_r = mle::eval(&s, &r);
 
-    // Each bit is in {0,1}: sum eq b (b-1) = 0  <=>  sum eq b^2 == sum eq b.
-    for (j, bj) in bits.iter().enumerate() {
-        let c_bb: Goldilocks = s.iter().zip(bj).zip(bj).fold(Goldilocks::ZERO, |a, ((&si, &xi), &yi)| a + si * xi * yi);
-        let c_b: Goldilocks = s.iter().zip(bj).fold(Goldilocks::ZERO, |a, (&si, &xi)| a + si * xi);
-        let proof_bb = sumcheck::prove3(&s, bj, bj, c_bb, &r);
-        let proof_b = sumcheck::prove(&s, bj, c_b, &r);
-        let (b_open, b_r) = whir_out.open(c_bits[j].prover_data.clone(), &c_bits[j].protocol, &r);
-        if whir_out.verify(&c_bits[j].commitment, &b_open, &c_bits[j].protocol, &r).unwrap() != b_r {
-            return false;
-        }
-        if !sumcheck::verify3(&proof_bb, c_bb, &r, s_r, b_r, b_r) {
-            return false;
-        }
-        if !sumcheck::verify(&proof_b, c_b, &r, s_r, b_r) {
-            return false;
-        }
-        if c_bb != c_b {
-            return false;
-        }
-    }
-
-    // Linear relation at r: rem_off(r) = sum_j b_j(r) * 2^j.
     let (in_open, in_r) = whir_in.open(input.prover_data.clone(), &input.protocol, &r);
     let (out_open, out_r) = whir_out.open(output.prover_data.clone(), &output.protocol, &r);
     if whir_in.verify(&input.commitment, &in_open, &input.protocol, &r).unwrap() != in_r {
@@ -454,16 +472,8 @@ fn prove_round(
         return false;
     }
     let bias_r = mle::eval(bias, &r);
-    let lhs = in_r * scale_f - (out_r - bias_r) * two_shift + half;
-    let mut rhs = Goldilocks::ZERO;
-    for (j, c_b) in c_bits.iter().enumerate() {
-        let (b_open, b_r) = whir_out.open(c_b.prover_data.clone(), &c_b.protocol, &r);
-        if whir_out.verify(&c_b.commitment, &b_open, &c_b.protocol, &r).unwrap() != b_r {
-            return false;
-        }
-        rhs = rhs + b_r * from_i64(1i64 << j);
-    }
-    lhs == rhs
+    let value_at_r = in_r * scale_f - (out_r - bias_r) * two_shift + half;
+    prove_bits_range(whir_out, &bits, &c_bits, value_at_r, &r, &s, s_r)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -590,46 +600,94 @@ pub fn prove_affine(
 }
 
 /// Prove `out = ReLU(round(in / 2^16) + bias)` (the gate ReLU step) against WHIR
-/// commitments, still in the O(N)-opening PoC form. The round is sub-linear but
-/// the ReLU sign check is the remaining non-arithmetic step.
+/// commitments, sub-linearly. The round is proven by [`prove_round`], then
+/// `pre = rescaled + bias` and `abs = |pre|` are committed, `abs` is range-
+/// checked to `[0, 2^31)`, `abs^2 = pre^2` is proven by a degree-3 zero-check
+/// (so `abs = ±pre`, hence `|pre|` given the range), and `out = (pre + abs)/2`.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_relu(
     whir_in: &Whir,
     input: &Committed,
+    in_plain: &[Goldilocks],
     whir_out: &Whir,
     output: &Committed,
+    _out_plain: &[Goldilocks],
     bias: &[Goldilocks],
+    rng: &mut XorShift64,
 ) -> bool {
     let n = bias.len();
     let d = n.trailing_zeros() as usize;
-    for (i, &bias_i) in bias.iter().enumerate() {
-        let point: Vec<Goldilocks> = (0..d)
-            .map(|b| Goldilocks::from_bool((i >> b) & 1 == 1))
-            .collect();
-        let (in_open, inv) = whir_in.open(input.prover_data.clone(), &input.protocol, &point);
-        let (out_open, ov) = whir_out.open(output.prover_data.clone(), &output.protocol, &point);
-        if whir_in
-            .verify(&input.commitment, &in_open, &input.protocol, &point)
-            .unwrap()
-            != inv
-        {
-            return false;
-        }
-        if whir_out
-            .verify(&output.commitment, &out_open, &output.protocol, &point)
-            .unwrap()
-            != ov
-        {
-            return false;
-        }
-        let val_q = div_round(to_i64(inv), 1i64 << 16);
-        let linear = val_q + to_i32(bias_i) as i64;
-        let expected = linear.max(0);
-        if to_i32(ov) as i64 != expected {
-            return false;
+    const SHIFT: usize = 16;
+    const BITS: usize = 31;
+
+    let rescaled: Vec<Goldilocks> = in_plain
+        .iter()
+        .map(|&iv| from_i32(div_round(to_i64(iv), 1i64 << SHIFT) as i32))
+        .collect();
+    let pre: Vec<Goldilocks> = rescaled.iter().zip(bias).map(|(&r, &b)| r + b).collect();
+    let abs_pre: Vec<Goldilocks> = pre
+        .iter()
+        .map(|&p| from_i32((to_i32(p) as i64).abs() as i32))
+        .collect();
+    let mut bits: Vec<Vec<Goldilocks>> = vec![vec![Goldilocks::ZERO; n]; BITS];
+    for i in 0..n {
+        let a = (to_i32(pre[i]) as i64).abs();
+        for (j, bj) in bits.iter_mut().enumerate() {
+            bj[i] = from_i32(((a >> j) & 1) as i32);
         }
     }
-    true
+
+    let c_rescaled = commit(whir_out, &rescaled);
+    let c_pre = commit(whir_out, &pre);
+    let c_abs = commit(whir_out, &abs_pre);
+    let c_bits: Vec<Committed> = bits.iter().map(|b| commit(whir_out, b)).collect();
+
+    // 1. rescaled = round(in / 2^16).
+    let zero_bias = vec![from_i32(0); n];
+    if !prove_round(
+        whir_in, input, in_plain, whir_out, &c_rescaled, &rescaled, 1, &zero_bias, SHIFT, rng,
+    ) {
+        return false;
+    }
+
+    let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let s = mle::eq_evals(&r);
+    let s_r = mle::eval(&s, &r);
+
+    let (res_open, res_r) = whir_out.open(c_rescaled.prover_data.clone(), &c_rescaled.protocol, &r);
+    let (pre_open, pre_r) = whir_out.open(c_pre.prover_data.clone(), &c_pre.protocol, &r);
+    let (abs_open, abs_r) = whir_out.open(c_abs.prover_data.clone(), &c_abs.protocol, &r);
+    let (out_open, out_r) = whir_out.open(output.prover_data.clone(), &output.protocol, &r);
+    if whir_out.verify(&c_rescaled.commitment, &res_open, &c_rescaled.protocol, &r).unwrap() != res_r
+        || whir_out.verify(&c_pre.commitment, &pre_open, &c_pre.protocol, &r).unwrap() != pre_r
+        || whir_out.verify(&c_abs.commitment, &abs_open, &c_abs.protocol, &r).unwrap() != abs_r
+        || whir_out.verify(&output.commitment, &out_open, &output.protocol, &r).unwrap() != out_r
+    {
+        return false;
+    }
+    let bias_r = mle::eval(bias, &r);
+
+    // 2. pre = rescaled + bias.
+    if pre_r != res_r + bias_r {
+        return false;
+    }
+    // 3. abs_pre ∈ [0, 2^31).
+    if !prove_bits_range(whir_out, &bits, &c_bits, abs_r, &r, &s, s_r) {
+        return false;
+    }
+    // 4. abs^2 = pre^2 (degree-3 zero-check).
+    let c_aa: Goldilocks = s.iter().zip(&abs_pre).zip(&abs_pre).fold(Goldilocks::ZERO, |a, ((&si, &xi), &yi)| a + si * xi * yi);
+    let c_pp: Goldilocks = s.iter().zip(&pre).zip(&pre).fold(Goldilocks::ZERO, |a, ((&si, &xi), &yi)| a + si * xi * yi);
+    let proof_aa = sumcheck::prove3(&s, &abs_pre, &abs_pre, c_aa, &r);
+    let proof_pp = sumcheck::prove3(&s, &pre, &pre, c_pp, &r);
+    if !sumcheck::verify3(&proof_aa, c_aa, &r, s_r, abs_r, abs_r)
+        || !sumcheck::verify3(&proof_pp, c_pp, &r, s_r, pre_r, pre_r)
+        || c_aa != c_pp
+    {
+        return false;
+    }
+    // 5. out = (pre + abs)/2  <=>  2 out = pre + abs.
+    out_r * from_i64(2) == pre_r + abs_r
 }
 
 /// Prove the element-wise field addition `c = a + b` against WHIR commitments
@@ -873,12 +931,12 @@ mod tests {
         let whir = Whir::new_testing(6);
         let c_in = commit(&whir, &raw);
         let c_out = commit(&whir, &out);
-        assert!(prove_relu(&whir, &c_in, &whir, &c_out, &bias));
+        assert!(prove_relu(&whir, &c_in, &raw, &whir, &c_out, &out, &bias, &mut rng));
 
         let mut bad = out.clone();
         bad[0] += Goldilocks::ONE;
         let c_bad = commit(&whir, &bad);
-        assert!(!prove_relu(&whir, &c_in, &whir, &c_bad, &bias));
+        assert!(!prove_relu(&whir, &c_in, &raw, &whir, &c_bad, &bad, &bias, &mut rng));
     }
 
     #[test]

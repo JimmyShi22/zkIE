@@ -78,7 +78,7 @@ fn main() {
 
     // rescale (2^32 -> 2^16) + gate bias + ReLU.
     let c_relu = commit(&whir10, &relu);
-    assert!(prove_relu(&whir10, &c_gate_raw, &whir10, &c_relu, &gate_bias));
+    assert!(prove_relu(&whir10, &c_gate_raw, &gate_raw, &whir10, &c_relu, &relu, &gate_bias, &mut rng));
 
     // down: relu @ down = down_raw (2^32).
     let c_down = commit(&whir19, &down);

@@ -172,7 +172,7 @@ fn main() {
         let c_gateraw = commit(&whir10, &gate_raw);
         assert!(prove_matmul(&whir9, &c_lnout, &whir19, &c_gatew, &whir10, &c_gateraw, &ln_out, &gate_w, &gate_raw, 512, 1024, &mut rng));
         let c_relu = commit(&whir10, &relu);
-        assert!(prove_relu(&whir10, &c_gateraw, &whir10, &c_relu, &gate_b));
+        assert!(prove_relu(&whir10, &c_gateraw, &gate_raw, &whir10, &c_relu, &relu, &gate_b, &mut rng));
         let c_downw = commit(&whir19, &down_w);
         let c_downraw = commit(&whir9, &down_raw);
         assert!(prove_matmul(&whir10, &c_relu, &whir19, &c_downw, &whir9, &c_downraw, &relu, &down_w, &down_raw, 1024, 512, &mut rng));
