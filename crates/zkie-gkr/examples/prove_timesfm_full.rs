@@ -96,7 +96,7 @@ fn main() {
             let ci = commit(win, &input);
             let cw = commit(ww, &weight);
             let co = commit(wo, &out);
-            assert!(prove_matmul(win, &ci, ww, &cw, wo, &co, &input, &weight, &out, k, n, &mut rng));
+            assert!(prove_matmul(win, &ci, ww, &cw, wo, &co, &input, &weight, &out, 1, k, n, &mut rng));
         }
     }
     println!("TimesFM 8M full proof: 7 layers x (LayerNorm + 4 matmuls) verified from WHIR commitments");

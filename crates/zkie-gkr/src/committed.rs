@@ -31,36 +31,34 @@ pub fn commit(whir: &Whir, values: &[Goldilocks]) -> Committed {
 /// `C` of shape `1 x n`, all committed. Returns `true` iff every opening and
 /// the sum-check verify.
 #[allow(clippy::too_many_arguments)]
-pub fn prove_matmul(
-    whir_a: &Whir,
-    a: &Committed,
-    whir_b: &Whir,
-    b: &Committed,
-    whir_c: &Whir,
-    c: &Committed,
-    a_mat: &[Goldilocks],
-    b_mat: &[Goldilocks],
-    c_mat: &[Goldilocks],
-    k: usize,
-    n: usize,
-    rng: &mut XorShift64,
-) -> bool {
+pub fn prove_matmul(whir_a: &Whir, a: &Committed, whir_b: &Whir, b: &Committed, whir_c: &Whir, c: &Committed, a_mat: &[Goldilocks], b_mat: &[Goldilocks], c_mat: &[Goldilocks], m: usize, k: usize, n: usize, rng: &mut XorShift64, ) -> bool {
+    // A is m x k (row-major). The sum-check works on the transposed k x m, and
+    // restricts the row (m) dimension with the `u` challenges.
+    let at: Vec<Goldilocks> = (0..k)
+        .flat_map(|j| (0..m).map(move |i| a_mat[i * k + j]))
+        .collect();
     let ch: Vec<Goldilocks> = (0..k.trailing_zeros() as usize).map(|_| rng.field()).collect();
     let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
-    let proof = matmul::prove(a_mat, b_mat, c_mat, 1, k, n, &[], &v, &ch);
+    let u: Vec<Goldilocks> = (0..m.trailing_zeros() as usize).map(|_| rng.field()).collect();
+    let proof = matmul::prove(&at, b_mat, c_mat, m, k, n, &u, &v, &ch);
 
-    let (a_open, f) = whir_a.open(a.prover_data.clone(), &a.protocol, &ch);
+    // A's MLE is indexed (column k, row m): point = ch ++ u.
+    let mut ap = ch.clone();
+    ap.extend_from_slice(&u);
+    let (a_open, f) = whir_a.open(a.prover_data.clone(), &a.protocol, &ap);
     let mut bp = v.clone();
     bp.extend_from_slice(&ch);
     let (b_open, h) = whir_b.open(b.prover_data.clone(), &b.protocol, &bp);
-    let (c_open, claimed) = whir_c.open(c.prover_data.clone(), &c.protocol, &v);
+    let mut cp = v.clone();
+    cp.extend_from_slice(&u);
+    let (c_open, claimed) = whir_c.open(c.prover_data.clone(), &c.protocol, &cp);
 
-    let f_ok = whir_a.verify(&a.commitment, &a_open, &a.protocol, &ch).unwrap() == f;
+    let f_ok = whir_a.verify(&a.commitment, &a_open, &a.protocol, &ap).unwrap() == f;
     let h_ok = whir_b.verify(&b.commitment, &b_open, &b.protocol, &bp).unwrap() == h;
-    let c_ok = whir_c.verify(&c.commitment, &c_open, &c.protocol, &v).unwrap() == claimed;
-    let evals_ok = f == mle::eval(a_mat, &ch)
+    let c_ok = whir_c.verify(&c.commitment, &c_open, &c.protocol, &cp).unwrap() == claimed;
+    let evals_ok = f == mle::eval(a_mat, &ap)
         && h == mle::eval(b_mat, &bp)
-        && claimed == mle::eval(c_mat, &v);
+        && claimed == mle::eval(c_mat, &cp);
     f_ok && h_ok && c_ok && evals_ok && claimed == proof.claimed && matmul::verify(&proof, &ch, f, h)
 }
 
@@ -253,11 +251,18 @@ pub fn prove_softmax(
     let ones: Vec<Goldilocks> = vec![Goldilocks::ONE; n];
     let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
     let proof_sum = sumcheck::prove(e_plain, &ones, sum, &r);
+    let (x_open, x_r) = whir_x.open(x.prover_data.clone(), &x.protocol, &r);
     let (e_open, e_r) = whir_e.open(e.prover_data.clone(), &e.protocol, &r);
+    if whir_x.verify(&x.commitment, &x_open, &x.protocol, &r).unwrap() != x_r {
+        return false;
+    }
     if whir_e.verify(&e.commitment, &e_open, &e.protocol, &r).unwrap() != e_r {
         return false;
     }
     if !sumcheck::verify(&proof_sum, sum, &r, e_r, Goldilocks::ONE) {
+        return false;
+    }
+    if x_r != mle::eval(x_plain, &r) {
         return false;
     }
 
@@ -266,7 +271,6 @@ pub fn prove_softmax(
     if whir_y.verify(&y.commitment, &y_open, &y.protocol, &r).unwrap() != y_r {
         return false;
     }
-    let _ = x;
     y_r == e_r * sum.inverse()
 }
 
@@ -905,9 +909,39 @@ mod tests {
         let cb = commit(&whir_b, &b);
         let cc = commit(&whir_c, &c);
 
-        assert!(prove_matmul(
-            &whir_a, &ca, &whir_b, &cb, &whir_c, &cc, &a, &b, &c, k, n, &mut rng,
-        ));
+        assert!(prove_matmul(&whir_a, &ca, &whir_b, &cb, &whir_c, &cc, &a, &b, &c, 1, k, n, &mut rng, ));
+    }
+
+    #[test]
+    fn committed_matmul_m_roundtrip() {
+        let mut rng = XorShift64::new(0xabd);
+        let (m, k, n) = (4usize, 64usize, 32usize);
+        let a: Vec<Goldilocks> = (0..m * k).map(|_| rng.field()).collect();
+        let b: Vec<Goldilocks> = (0..k * n).map(|_| rng.field()).collect();
+        let mut c = vec![Goldilocks::ZERO; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = Goldilocks::ZERO;
+                for w in 0..k {
+                    acc = acc + a[i * k + w] * b[w * n + j];
+                }
+                c[i * n + j] = acc;
+            }
+        }
+
+        let whir_a = Whir::new_testing(8);
+        let whir_b = Whir::new_testing(11);
+        let whir_c = Whir::new_testing(7);
+        let ca = commit(&whir_a, &a);
+        let cb = commit(&whir_b, &b);
+        let cc = commit(&whir_c, &c);
+
+        assert!(prove_matmul(&whir_a, &ca, &whir_b, &cb, &whir_c, &cc, &a, &b, &c, m, k, n, &mut rng));
+
+        let mut bad = c.clone();
+        bad[0] += Goldilocks::ONE;
+        let c_bad = commit(&whir_c, &bad);
+        assert!(!prove_matmul(&whir_a, &ca, &whir_b, &cb, &whir_c, &c_bad, &a, &b, &bad, m, k, n, &mut rng));
     }
 
     #[test]

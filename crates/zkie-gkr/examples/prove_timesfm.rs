@@ -76,10 +76,7 @@ fn main() {
             let c_in = commit(whir_in, &input);
             let c_w = commit(whir_w, &weight);
             let c_raw = commit(whir_out, &raw);
-            assert!(prove_matmul(
-                whir_in, &c_in, whir_w, &c_w, whir_out, &c_raw,
-                &input, &weight, &raw, k, n, &mut rng,
-            ));
+            assert!(prove_matmul(whir_in, &c_in, whir_w, &c_w, whir_out, &c_raw, &input, &weight, &raw, 1, k, n, &mut rng, ));
         }
     }
     println!("TimesFM 8M: 7 layers x 4 matmuls verified from WHIR commitments");

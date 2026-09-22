@@ -70,10 +70,7 @@ fn main() {
     // V matmul: v_raw = mul9 @ v_w (2^32).
     let c_vw = commit(&whir18, &v_w);
     let c_v_raw = commit(&whir9, &v_raw);
-    assert!(prove_matmul(
-        &whir9, &c_mul9, &whir18, &c_vw, &whir9, &c_v_raw,
-        &mul9, &v_w, &v_raw, 512, 512, &mut rng,
-    ));
+    assert!(prove_matmul(&whir9, &c_mul9, &whir18, &c_vw, &whir9, &c_v_raw, &mul9, &v_w, &v_raw, 1, 512, 512, &mut rng, ));
 
     // rescale (2^32 -> 2^16) + V bias.
     let c_lin3v = commit(&whir9, &lin3v);
@@ -82,10 +79,7 @@ fn main() {
     // o_proj matmul: op_raw = lin3v @ op_w (2^32).
     let c_opw = commit(&whir18, &op_w);
     let c_op_raw = commit(&whir9, &op_raw);
-    assert!(prove_matmul(
-        &whir9, &c_lin3v, &whir18, &c_opw, &whir9, &c_op_raw,
-        &lin3v, &op_w, &op_raw, 512, 512, &mut rng,
-    ));
+    assert!(prove_matmul(&whir9, &c_lin3v, &whir18, &c_opw, &whir9, &c_op_raw, &lin3v, &op_w, &op_raw, 1, 512, 512, &mut rng, ));
 
     // rescale (2^32 -> 2^16) + o_proj bias.
     let c_lin4 = commit(&whir9, &lin4);

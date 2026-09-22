@@ -75,14 +75,14 @@ fn main() {
     let c_ln = commit(&whir9, &lnout);
     let c_gate = commit(&whir19, &gate);
     let c_v127 = commit(&whir10, &v127_raw);
-    assert!(prove_matmul(&whir9, &c_ln, &whir19, &c_gate, &whir10, &c_v127, &lnout, &gate, &v127_raw, 512, 1024, &mut rng));
+    assert!(prove_matmul(&whir9, &c_ln, &whir19, &c_gate, &whir10, &c_v127, &lnout, &gate, &v127_raw, 1, 512, 1024, &mut rng));
 
     // down: relu @ down = val_129 (raw 2^32).
     let v129_raw = dense(&relu, &down, 1024, 512);
     let c_relu = commit(&whir10, &relu);
     let c_down = commit(&whir19, &down);
     let c_v129 = commit(&whir9, &v129_raw);
-    assert!(prove_matmul(&whir10, &c_relu, &whir19, &c_down, &whir9, &c_v129, &relu, &down, &v129_raw, 1024, 512, &mut rng));
+    assert!(prove_matmul(&whir10, &c_relu, &whir19, &c_down, &whir9, &c_v129, &relu, &down, &v129_raw, 1, 1024, 512, &mut rng));
 
     let _ = v127;
     println!("FFN tail (LayerNorm -> gate -> ReLU -> down) verified from WHIR commitments");

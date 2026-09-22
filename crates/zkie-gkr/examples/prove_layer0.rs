@@ -60,40 +60,28 @@ fn main() {
     let c_in = commit(&whir9, &input);
     let c_qkv = commit(&whir19, &qkv);
     let c_qkv_raw = commit(&whir10, &qkv_raw);
-    assert!(prove_matmul(
-        &whir9, &c_in, &whir19, &c_qkv, &whir10, &c_qkv_raw,
-        &input, &qkv, &qkv_raw, 512, 1024, &mut rng,
-    ));
+    assert!(prove_matmul(&whir9, &c_in, &whir19, &c_qkv, &whir10, &c_qkv_raw, &input, &qkv, &qkv_raw, 1, 512, 1024, &mut rng, ));
 
     // gate: ffn_in [512] @ gate [512,1024] = gate_raw [1024].
     let gate_raw = dense(&ffn_in, &gate, 512, 1024);
     let c_ffn_in = commit(&whir9, &ffn_in);
     let c_gate = commit(&whir19, &gate);
     let c_gate_raw = commit(&whir10, &gate_raw);
-    assert!(prove_matmul(
-        &whir9, &c_ffn_in, &whir19, &c_gate, &whir10, &c_gate_raw,
-        &ffn_in, &gate, &gate_raw, 512, 1024, &mut rng,
-    ));
+    assert!(prove_matmul(&whir9, &c_ffn_in, &whir19, &c_gate, &whir10, &c_gate_raw, &ffn_in, &gate, &gate_raw, 1, 512, 1024, &mut rng, ));
 
     // down: relu [1024] @ down [1024,512] = down_raw [512].
     let down_raw = dense(&relu, &down, 1024, 512);
     let c_relu = commit(&whir10, &relu);
     let c_down = commit(&whir19, &down);
     let c_down_raw = commit(&whir9, &down_raw);
-    assert!(prove_matmul(
-        &whir10, &c_relu, &whir19, &c_down, &whir9, &c_down_raw,
-        &relu, &down, &down_raw, 1024, 512, &mut rng,
-    ));
+    assert!(prove_matmul(&whir10, &c_relu, &whir19, &c_down, &whir9, &c_down_raw, &relu, &down, &down_raw, 1, 1024, 512, &mut rng, ));
 
     // o_proj: attention output [512] @ o_proj [512,512] = o_raw [512].
     let o_raw = dense(&o_in, &o_proj, 512, 512);
     let c_o_in = commit(&whir9, &o_in);
     let c_o_proj = commit(&whir18, &o_proj);
     let c_o_raw = commit(&whir9, &o_raw);
-    assert!(prove_matmul(
-        &whir9, &c_o_in, &whir18, &c_o_proj, &whir9, &c_o_raw,
-        &o_in, &o_proj, &o_raw, 512, 512, &mut rng,
-    ));
+    assert!(prove_matmul(&whir9, &c_o_in, &whir18, &c_o_proj, &whir9, &c_o_raw, &o_in, &o_proj, &o_raw, 1, 512, 512, &mut rng, ));
 
     println!("TimesFM layer 0: QKV + o_proj + gate + down matmuls verified from WHIR commitments");
 }

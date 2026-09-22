@@ -71,10 +71,7 @@ fn main() {
     // gate: norm_out @ gate = gate_raw (2^32).
     let c_gate = commit(&whir19, &gate);
     let c_gate_raw = commit(&whir10, &gate_raw);
-    assert!(prove_matmul(
-        &whir9, &c_norm_out, &whir19, &c_gate, &whir10, &c_gate_raw,
-        &norm_out, &gate, &gate_raw, 512, 1024, &mut rng,
-    ));
+    assert!(prove_matmul(&whir9, &c_norm_out, &whir19, &c_gate, &whir10, &c_gate_raw, &norm_out, &gate, &gate_raw, 1, 512, 1024, &mut rng, ));
 
     // rescale (2^32 -> 2^16) + gate bias + ReLU.
     let c_relu = commit(&whir10, &relu);
@@ -83,10 +80,7 @@ fn main() {
     // down: relu @ down = down_raw (2^32).
     let c_down = commit(&whir19, &down);
     let c_down_raw = commit(&whir9, &down_raw);
-    assert!(prove_matmul(
-        &whir10, &c_relu, &whir19, &c_down, &whir9, &c_down_raw,
-        &relu, &down, &down_raw, 1024, 512, &mut rng,
-    ));
+    assert!(prove_matmul(&whir10, &c_relu, &whir19, &c_down, &whir9, &c_down_raw, &relu, &down, &down_raw, 1, 1024, 512, &mut rng, ));
 
     // rescale (2^32 -> 2^16) + down bias.
     let c_ffn_out = commit(&whir9, &ffn_out);
