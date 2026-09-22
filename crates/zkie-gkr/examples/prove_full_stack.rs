@@ -47,6 +47,7 @@ fn main() {
     let zero_bias = vec![from_i32(0); 512];
 
     let mut rng = XorShift64::new(0x7ee);
+    let whir5 = Whir::new_testing(5);
     let whir6 = Whir::new_testing(6);
     let whir9 = Whir::new_testing(9);
     let whir10 = Whir::new_testing(10);
@@ -61,9 +62,28 @@ fn main() {
     let silu_table = load_i32(&format!("{base}silu_table_i32.bin"));
     const SILU_OFFSET: u32 = 1 << 19;
 
-    // Prologue: cat (embedded input) -> SiLU FFN -> add, then +gather +embedding
-    // (freq) -> add_2.
-    let cat = load_i32(&format!("{stack}cat_i32.bin"));
+    // Input embedding: cat = [LayerNorm(input_ts) (32), padding mask (32 zeros)].
+    let input_ts = load_i32(&format!("{stack}input_ts_i32.bin"));
+    let input_pad = load_i32(&format!("{stack}input_pad_i32.bin"));
+    let w_identity = vec![from_i32(65536); 32];
+    let (raw_norm, _m, _r, _s) = layer_norm_raw(&input_ts, &w_identity, 32, &rsqrt_table);
+    let zero32 = vec![from_i32(0); 32];
+    let normalized = affine_raw(&raw_norm, &zero32, 32, false);
+    let mut cat = normalized.clone();
+    cat.extend_from_slice(&input_pad);
+
+    let c_ts = commit(&whir5, &input_ts);
+    let c_raw_norm = commit(&whir5, &raw_norm);
+    assert!(prove_layer_norm(
+        &whir5, &c_ts, &input_ts, &whir5, &c_raw_norm, &raw_norm, &w_identity, 32, &rsqrt_table,
+        rng.field(), rng.field(), &mut rng,
+    ));
+    let c_norm = commit(&whir5, &normalized);
+    assert!(prove_affine(
+        &whir5, &c_raw_norm, &raw_norm, &whir5, &c_norm, &normalized, &zero32, 32, &mut rng,
+    ));
+
+    // Prologue: cat -> SiLU FFN -> add, then +gather +embedding (freq) -> add_2.
     let pro_hid_w = load_i32(&format!("{stack}pro_hid_w_i32.bin"));
     let pro_hid_b = load_i32(&format!("{stack}pro_hid_b_i32.bin"));
     let pro_out_w = load_i32(&format!("{stack}pro_out_w_i32.bin"));

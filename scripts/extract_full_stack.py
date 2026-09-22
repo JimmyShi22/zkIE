@@ -131,6 +131,11 @@ def main() -> None:
     gather = r4[names4.index("gather")].reshape(-1)
     embedding = r4[names4.index("embedding")].reshape(-1)
 
+    # Raw input (input_ts) and the padding mask (where_1, all zeros for the
+    # fixed input). The input embedding is a LayerNorm over the 32 timestamps
+    # plus a concat with the mask; the Rust proof computes it from these.
+    pad1(q(inp.reshape(-1)), 32).tofile(f"{out_dir}/input_ts_i32.bin")
+    pad1(np.zeros(32, dtype=np.int32), 32).tofile(f"{out_dir}/input_pad_i32.bin")
     pad1(q(cat), 64).tofile(f"{out_dir}/cat_i32.bin")
     pad2(q(inits["val_49"]), 64, 1024).tofile(f"{out_dir}/pro_hid_w_i32.bin")
     q(inits["input_ff_layer.hidden_layer.0.bias"]).tofile(f"{out_dir}/pro_hid_b_i32.bin")
