@@ -69,11 +69,11 @@ def main():
     pad1(q(inits["input_ff_layer.residual_layer.bias"]), H_PAD).tofile(f"{out_dir}/pro_res_b_i32.bin")
 
     # Output head (horizon FFN) + rescale scalars.
-    pad2(q(inits["val_837"]), H_PAD, H_PAD).tofile(f"{out_dir}/head_hid_w_i32.bin")
+    pad2(q(inits["val_850"]), H_PAD, H_PAD).tofile(f"{out_dir}/head_hid_w_i32.bin")
     pad1(q(inits["horizon_ff_layer.hidden_layer.0.bias"]), H_PAD).tofile(f"{out_dir}/head_hid_b_i32.bin")
-    pad2(q(inits["val_840"]), H_PAD, H_PAD).tofile(f"{out_dir}/head_out_w_i32.bin")
+    pad2(q(inits["val_853"]), H_PAD, H_PAD).tofile(f"{out_dir}/head_out_w_i32.bin")
     pad1(q(inits["horizon_ff_layer.output_layer.bias"]), H_PAD).tofile(f"{out_dir}/head_out_b_i32.bin")
-    pad2(q(inits["val_842"]), H_PAD, H_PAD).tofile(f"{out_dir}/head_res_w_i32.bin")
+    pad2(q(inits["val_855"]), H_PAD, H_PAD).tofile(f"{out_dir}/head_res_w_i32.bin")
     pad1(q(inits["horizon_ff_layer.residual_layer.bias"]), H_PAD).tofile(f"{out_dir}/head_res_b_i32.bin")
 
     # Runtime tensors for a fixed input (freq=0): cat, gather, embedding, and
