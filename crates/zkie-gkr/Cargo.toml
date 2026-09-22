@@ -24,4 +24,8 @@ zkie-cuda = { path = "../zkie-cuda", optional = true }
 
 [features]
 default = []
-cuda = ["dep:zkie-cuda"]
+cuda = ["dep:zkie-cuda", "zkie-cuda/cuda"]
+
+[[example]]
+name = "bench_whir_cuda"
+required-features = ["cuda"]

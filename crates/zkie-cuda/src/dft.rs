@@ -23,10 +23,7 @@ use p3_matrix::Matrix;
 #[cfg(feature = "cuda")]
 use crate::buffer::SharedBuffer;
 #[cfg(feature = "cuda")]
-use crate::ffi::{
-    cudaDeviceSynchronize, cudaMemcpy, zkie_ntt_forward_goldilocks, CUDART_OK,
-    MEMCPY_DEVICE_TO_HOST, MEMCPY_HOST_TO_DEVICE,
-};
+use crate::ffi::{cudaDeviceSynchronize, cudaMemcpy, zkie_ntt_forward_goldilocks, CUDART_OK, MEMCPY_DEVICE_TO_HOST, MEMCPY_HOST_TO_DEVICE};
 
 #[cfg(feature = "cuda")]
 const P: u64 = 0xffffffff00000001;
@@ -198,11 +195,6 @@ impl CudaDft {
             return None;
         }
         let rc = unsafe { zkie_ntt_forward_goldilocks(d_mat, d_temp, lg, w as u64, d_tw) };
-        let rc = if rc == CUDART_OK {
-            unsafe { cudaDeviceSynchronize() }
-        } else {
-            rc
-        };
         if rc != CUDART_OK {
             return None;
         }
