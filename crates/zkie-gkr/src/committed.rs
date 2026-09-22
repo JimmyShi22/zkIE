@@ -387,7 +387,7 @@ pub fn scale_raw(input: &[Goldilocks], scale: i64, bias: &[Goldilocks]) -> Vec<G
 /// the O(N)-opening PoC form. The scalar multiply is a deterministic host-side
 /// integer operation (no lookup), exactly like the rescale in [`prove_affine`].
 #[allow(clippy::too_many_arguments)]
-pub fn prove_scale(
+fn prove_round(
     whir_in: &Whir,
     input: &Committed,
     in_plain: &[Goldilocks],
@@ -396,23 +396,23 @@ pub fn prove_scale(
     out_plain: &[Goldilocks],
     scale: i64,
     bias: &[Goldilocks],
+    shift: usize,
     rng: &mut XorShift64,
 ) -> bool {
     let n = bias.len();
     let d = n.trailing_zeros() as usize;
-    const SHIFT: usize = 16;
     let scale_f = from_i64(scale);
-    let two16 = from_i64(1i64 << 16);
-    let two15 = from_i64(1i64 << 15);
+    let two_shift = from_i64(1i64 << shift);
+    let half = from_i64(1i64 << (shift - 1));
 
-    // Host-side: decompose rem_off = in*scale - (out-bias)*2^16 + 2^15 into bits.
-    let mut bits: Vec<Vec<Goldilocks>> = vec![vec![Goldilocks::ZERO; n]; SHIFT];
+    // Host-side: decompose rem_off = in*scale - (out-bias)*2^shift + 2^(shift-1).
+    let mut bits: Vec<Vec<Goldilocks>> = vec![vec![Goldilocks::ZERO; n]; shift];
     for i in 0..n {
         let in_i = to_i64(in_plain[i]);
         let out_i = to_i32(out_plain[i]) as i64;
         let b_i = to_i32(bias[i]) as i64;
-        let rem = in_i * scale - (out_i - b_i) * (1i64 << 16);
-        let rem_off = rem + (1i64 << 15);
+        let rem = in_i * scale - (out_i - b_i) * (1i64 << shift);
+        let rem_off = rem + (1i64 << (shift - 1));
         for (j, bj) in bits.iter_mut().enumerate() {
             bj[i] = from_i32(((rem_off >> j) & 1) as i32);
         }
@@ -454,7 +454,7 @@ pub fn prove_scale(
         return false;
     }
     let bias_r = mle::eval(bias, &r);
-    let lhs = in_r * scale_f - (out_r - bias_r) * two16 + two15;
+    let lhs = in_r * scale_f - (out_r - bias_r) * two_shift + half;
     let mut rhs = Goldilocks::ZERO;
     for (j, c_b) in c_bits.iter().enumerate() {
         let (b_open, b_r) = whir_out.open(c_b.prover_data.clone(), &c_b.protocol, &r);
@@ -464,6 +464,21 @@ pub fn prove_scale(
         rhs = rhs + b_r * from_i64(1i64 << j);
     }
     lhs == rhs
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_scale(
+    whir_in: &Whir,
+    input: &Committed,
+    in_plain: &[Goldilocks],
+    whir_out: &Whir,
+    output: &Committed,
+    out_plain: &[Goldilocks],
+    scale: i64,
+    bias: &[Goldilocks],
+    rng: &mut XorShift64,
+) -> bool {
+    prove_round(whir_in, input, in_plain, whir_out, output, out_plain, scale, bias, 16, rng)
 }
 
 /// Prove the raw RMSNorm product `raw = x * rstd * w` (scale 2^48) against WHIR
@@ -555,22 +570,35 @@ pub fn prove_rms_norm(
     true
 }
 
-/// Prove `out = f(round(in / 2^shift) + bias)` against WHIR commitments, in the
-/// O(N)-opening PoC form, where `f` is either the identity (`relu == false`) or
-/// ReLU (`relu == true`). `in` is a raw dot-product output embedded as signed
-/// i64 (scale 2^32 for matmuls, 2^48 for the LayerNorm raw product), `bias` and
-/// `out` are at scale 2^16. The rescale is ties-to-even (matching the Python
-/// reference), and the ReLU is a deterministic host-side sign check — no lookup,
-/// exactly like the mean/variance reduction in `prove_layer_norm`.
+/// Prove `out = round(in / 2^shift) + bias` (the non-ReLU affine/rescale step)
+/// with a sub-linear bit-decomposition range check, exactly like [`prove_round`].
 #[allow(clippy::too_many_arguments)]
 pub fn prove_affine(
+    whir_in: &Whir,
+    input: &Committed,
+    in_plain: &[Goldilocks],
+    whir_out: &Whir,
+    output: &Committed,
+    out_plain: &[Goldilocks],
+    bias: &[Goldilocks],
+    shift: u32,
+    rng: &mut XorShift64,
+) -> bool {
+    prove_round(
+        whir_in, input, in_plain, whir_out, output, out_plain, 1, bias, shift as usize, rng,
+    )
+}
+
+/// Prove `out = ReLU(round(in / 2^16) + bias)` (the gate ReLU step) against WHIR
+/// commitments, still in the O(N)-opening PoC form. The round is sub-linear but
+/// the ReLU sign check is the remaining non-arithmetic step.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_relu(
     whir_in: &Whir,
     input: &Committed,
     whir_out: &Whir,
     output: &Committed,
     bias: &[Goldilocks],
-    shift: u32,
-    relu: bool,
 ) -> bool {
     let n = bias.len();
     let d = n.trailing_zeros() as usize;
@@ -594,27 +622,14 @@ pub fn prove_affine(
         {
             return false;
         }
-        let val_q = div_round(to_i64(inv), 1i64 << shift);
+        let val_q = div_round(to_i64(inv), 1i64 << 16);
         let linear = val_q + to_i32(bias_i) as i64;
-        let expected = if relu { linear.max(0) } else { linear };
+        let expected = linear.max(0);
         if to_i32(ov) as i64 != expected {
             return false;
         }
     }
     true
-}
-
-/// Convenience wrapper over [`prove_affine`] for the ReLU step: `out =
-/// ReLU(round(in / 2^16) + bias)` with `in` a raw matmul output at scale 2^32.
-#[allow(clippy::too_many_arguments)]
-pub fn prove_relu(
-    whir_in: &Whir,
-    input: &Committed,
-    whir_out: &Whir,
-    output: &Committed,
-    bias: &[Goldilocks],
-) -> bool {
-    prove_affine(whir_in, input, whir_out, output, bias, 16, true)
 }
 
 /// Prove the element-wise field addition `c = a + b` against WHIR commitments
@@ -892,7 +907,7 @@ mod tests {
         let whir = Whir::new_testing(6);
         let c_in = commit(&whir, &raw);
         let c_out = commit(&whir, &out);
-        assert!(prove_affine(&whir, &c_in, &whir, &c_out, &bias, 32, false));
+        assert!(prove_affine(&whir, &c_in, &raw, &whir, &c_out, &out, &bias, 32, &mut rng));
     }
 
     #[test]

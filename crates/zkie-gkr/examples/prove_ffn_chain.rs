@@ -66,7 +66,7 @@ fn main() {
 
     // rescale raw (2^48 -> 2^16) and add the LayerNorm bias.
     let c_norm_out = commit(&whir9, &norm_out);
-    assert!(prove_affine(&whir9, &c_norm_raw, &whir9, &c_norm_out, &nb, 32, false));
+    assert!(prove_affine(&whir9, &c_norm_raw, &norm_raw, &whir9, &c_norm_out, &norm_out, &nb, 32, &mut rng));
 
     // gate: norm_out @ gate = gate_raw (2^32).
     let c_gate = commit(&whir19, &gate);
@@ -90,7 +90,7 @@ fn main() {
 
     // rescale (2^32 -> 2^16) + down bias.
     let c_ffn_out = commit(&whir9, &ffn_out);
-    assert!(prove_affine(&whir9, &c_down_raw, &whir9, &c_ffn_out, &down_bias, 16, false));
+    assert!(prove_affine(&whir9, &c_down_raw, &down_raw, &whir9, &c_ffn_out, &ffn_out, &down_bias, 16, &mut rng));
 
     // residual: add_6 = ffn_out + add_5.
     let c_residual = commit(&whir9, &residual);

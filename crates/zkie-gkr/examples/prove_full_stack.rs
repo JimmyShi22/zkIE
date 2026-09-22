@@ -89,7 +89,7 @@ fn main() {
     let c_hidraw = commit(&whir10, &hid_raw);
     assert!(prove_matmul(&whir6, &c_cat, &whir16, &c_hidw, &whir10, &c_hidraw, &cat, &pro_hid_w, &hid_raw, 64, 1024, &mut rng));
     let c_linear = commit(&whir10, &linear);
-    assert!(prove_affine(&whir10, &c_hidraw, &whir10, &c_linear, &pro_hid_b, 16, false));
+    assert!(prove_affine(&whir10, &c_hidraw, &hid_raw, &whir10, &c_linear, &linear, &pro_hid_b, 16, &mut rng));
     let idx_field: Vec<Goldilocks> = silu_idx.iter().map(|&i| from_i32(i as i32)).collect();
     let c_idx = commit(&whir10, &idx_field);
     let c_silu = commit(&whir10, &silu);
@@ -98,12 +98,12 @@ fn main() {
     let c_outraw = commit(&whir9, &out_raw);
     assert!(prove_matmul(&whir10, &c_silu, &whir19, &c_outw, &whir9, &c_outraw, &silu, &pro_out_w, &out_raw, 1024, 512, &mut rng));
     let c_lin1 = commit(&whir9, &linear_1);
-    assert!(prove_affine(&whir9, &c_outraw, &whir9, &c_lin1, &pro_out_b, 16, false));
+    assert!(prove_affine(&whir9, &c_outraw, &out_raw, &whir9, &c_lin1, &linear_1, &pro_out_b, 16, &mut rng));
     let c_resw = commit(&whir15, &pro_res_w);
     let c_resraw = commit(&whir9, &res_raw);
     assert!(prove_matmul(&whir6, &c_cat, &whir15, &c_resw, &whir9, &c_resraw, &cat, &pro_res_w, &res_raw, 64, 512, &mut rng));
     let c_lin2 = commit(&whir9, &linear_2);
-    assert!(prove_affine(&whir9, &c_resraw, &whir9, &c_lin2, &pro_res_b, 16, false));
+    assert!(prove_affine(&whir9, &c_resraw, &res_raw, &whir9, &c_lin2, &linear_2, &pro_res_b, 16, &mut rng));
     let c_add = commit(&whir9, &add);
     assert!(prove_add(&whir9, &c_lin1, &whir9, &c_lin2, &whir9, &c_add, 512, &mut rng));
     let c_gather = commit(&whir9, &gather);
@@ -141,17 +141,17 @@ fn main() {
         let c_rms = commit(&whir9, &rms_raw);
         assert!(prove_rms_norm(&whir9, &c_x, &x, &whir9, &c_rms, &rms_raw, &lnw, N_REAL, &rsqrt_table, rng.field(), rng.field(), &mut rng));
         let c_mul9 = commit(&whir9, &mul9);
-        assert!(prove_affine(&whir9, &c_rms, &whir9, &c_mul9, &zero_bias, 32, false));
+        assert!(prove_affine(&whir9, &c_rms, &rms_raw, &whir9, &c_mul9, &mul9, &zero_bias, 32, &mut rng));
         let c_vw = commit(&whir18, &v_w);
         let c_vraw = commit(&whir9, &v_raw);
         assert!(prove_matmul(&whir9, &c_mul9, &whir18, &c_vw, &whir9, &c_vraw, &mul9, &v_w, &v_raw, 512, 512, &mut rng));
         let c_lin3v = commit(&whir9, &lin3v);
-        assert!(prove_affine(&whir9, &c_vraw, &whir9, &c_lin3v, &v_b, 16, false));
+        assert!(prove_affine(&whir9, &c_vraw, &v_raw, &whir9, &c_lin3v, &lin3v, &v_b, 16, &mut rng));
         let c_opw = commit(&whir18, &op_w);
         let c_opraw = commit(&whir9, &op_raw);
         assert!(prove_matmul(&whir9, &c_lin3v, &whir18, &c_opw, &whir9, &c_opraw, &lin3v, &op_w, &op_raw, 512, 512, &mut rng));
         let c_lin4 = commit(&whir9, &lin4);
-        assert!(prove_affine(&whir9, &c_opraw, &whir9, &c_lin4, &op_b, 16, false));
+        assert!(prove_affine(&whir9, &c_opraw, &op_raw, &whir9, &c_lin4, &lin4, &op_b, 16, &mut rng));
         let c_add5 = commit(&whir9, &add5);
         assert!(prove_add(&whir9, &c_x, &whir9, &c_lin4, &whir9, &c_add5, 512, &mut rng));
 
@@ -167,7 +167,7 @@ fn main() {
         let c_lnraw = commit(&whir9, &ln_raw);
         assert!(prove_layer_norm(&whir9, &c_add5, &add5, &whir9, &c_lnraw, &ln_raw, &mlp_w, N_REAL, &rsqrt_table, rng.field(), rng.field(), &mut rng));
         let c_lnout = commit(&whir9, &ln_out);
-        assert!(prove_affine(&whir9, &c_lnraw, &whir9, &c_lnout, &mlp_b, 32, false));
+        assert!(prove_affine(&whir9, &c_lnraw, &ln_raw, &whir9, &c_lnout, &ln_out, &mlp_b, 32, &mut rng));
         let c_gatew = commit(&whir19, &gate_w);
         let c_gateraw = commit(&whir10, &gate_raw);
         assert!(prove_matmul(&whir9, &c_lnout, &whir19, &c_gatew, &whir10, &c_gateraw, &ln_out, &gate_w, &gate_raw, 512, 1024, &mut rng));
@@ -177,7 +177,7 @@ fn main() {
         let c_downraw = commit(&whir9, &down_raw);
         assert!(prove_matmul(&whir10, &c_relu, &whir19, &c_downw, &whir9, &c_downraw, &relu, &down_w, &down_raw, 1024, 512, &mut rng));
         let c_ffnout = commit(&whir9, &ffn_out);
-        assert!(prove_affine(&whir9, &c_downraw, &whir9, &c_ffnout, &down_b, 16, false));
+        assert!(prove_affine(&whir9, &c_downraw, &down_raw, &whir9, &c_ffnout, &ffn_out, &down_b, 16, &mut rng));
         let c_next = commit(&whir9, &next_x);
         assert!(prove_add(&whir9, &c_add5, &whir9, &c_ffnout, &whir9, &c_next, 512, &mut rng));
 
@@ -213,7 +213,7 @@ fn main() {
     let c_hidraw = commit(&whir10, &hid_raw);
     assert!(prove_matmul(&whir9, &c_x, &whir19, &c_hidw, &whir10, &c_hidraw, &x, &hid_w, &hid_raw, 512, 1024, &mut rng));
     let c_lin31 = commit(&whir10, &lin31);
-    assert!(prove_affine(&whir10, &c_hidraw, &whir10, &c_lin31, &hid_b, 16, false));
+    assert!(prove_affine(&whir10, &c_hidraw, &hid_raw, &whir10, &c_lin31, &lin31, &hid_b, 16, &mut rng));
     let idx_field: Vec<Goldilocks> = silu_idx.iter().map(|&i| from_i32(i as i32)).collect();
     let c_idx = commit(&whir10, &idx_field);
     let c_silu = commit(&whir10, &silu1);
@@ -222,12 +222,12 @@ fn main() {
     let c_outraw = commit(&whir11, &out_raw);
     assert!(prove_matmul(&whir10, &c_silu, &whir21, &c_outw, &whir11, &c_outraw, &silu1, &out_w, &out_raw, 1024, 2048, &mut rng));
     let c_lin32 = commit(&whir11, &lin32);
-    assert!(prove_affine(&whir11, &c_outraw, &whir11, &c_lin32, &out_b, 16, false));
+    assert!(prove_affine(&whir11, &c_outraw, &out_raw, &whir11, &c_lin32, &lin32, &out_b, 16, &mut rng));
     let c_resw = commit(&whir20, &res_w);
     let c_resraw = commit(&whir11, &res_raw);
     assert!(prove_matmul(&whir9, &c_x, &whir20, &c_resw, &whir11, &c_resraw, &x, &res_w, &res_raw, 512, 2048, &mut rng));
     let c_lin33 = commit(&whir11, &lin33);
-    assert!(prove_affine(&whir11, &c_resraw, &whir11, &c_lin33, &res_b, 16, false));
+    assert!(prove_affine(&whir11, &c_resraw, &res_raw, &whir11, &c_lin33, &lin33, &res_b, 16, &mut rng));
     let c_add31 = commit(&whir11, &add31);
     assert!(prove_add(&whir11, &c_lin32, &whir11, &c_lin33, &whir11, &c_add31, 2048, &mut rng));
     let c_out = commit(&whir11, &output_ts);

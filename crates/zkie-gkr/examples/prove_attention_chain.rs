@@ -65,7 +65,7 @@ fn main() {
     // rescale raw (2^48 -> 2^16); RMSNorm has no bias.
     let c_mul9 = commit(&whir9, &mul9);
     let zero_bias = vec![from_i32(0); 512];
-    assert!(prove_affine(&whir9, &c_rms_raw, &whir9, &c_mul9, &zero_bias, 32, false));
+    assert!(prove_affine(&whir9, &c_rms_raw, &rms_raw, &whir9, &c_mul9, &mul9, &zero_bias, 32, &mut rng));
 
     // V matmul: v_raw = mul9 @ v_w (2^32).
     let c_vw = commit(&whir18, &v_w);
@@ -77,7 +77,7 @@ fn main() {
 
     // rescale (2^32 -> 2^16) + V bias.
     let c_lin3v = commit(&whir9, &lin3v);
-    assert!(prove_affine(&whir9, &c_v_raw, &whir9, &c_lin3v, &v_b, 16, false));
+    assert!(prove_affine(&whir9, &c_v_raw, &v_raw, &whir9, &c_lin3v, &lin3v, &v_b, 16, &mut rng));
 
     // o_proj matmul: op_raw = lin3v @ op_w (2^32).
     let c_opw = commit(&whir18, &op_w);
@@ -89,7 +89,7 @@ fn main() {
 
     // rescale (2^32 -> 2^16) + o_proj bias.
     let c_lin4 = commit(&whir9, &lin4);
-    assert!(prove_affine(&whir9, &c_op_raw, &whir9, &c_lin4, &op_b, 16, false));
+    assert!(prove_affine(&whir9, &c_op_raw, &op_raw, &whir9, &c_lin4, &lin4, &op_b, 16, &mut rng));
 
     // residual: add_5 = add_2 + linear_4.
     let c_add5 = commit(&whir9, &add5);
