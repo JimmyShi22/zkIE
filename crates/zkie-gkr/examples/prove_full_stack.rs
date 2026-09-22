@@ -7,7 +7,7 @@
 
 use zkie_gkr::committed::{
     affine_raw, commit, layer_norm_raw, prove_add, prove_affine, prove_layer_norm, prove_matmul,
-    prove_relu, prove_rms_norm, rms_norm_raw,
+    prove_lookup, prove_relu, prove_rms_norm, prove_scale, rms_norm_raw, scale_raw, silu_raw,
 };
 use zkie_gkr::field::{Goldilocks, PrimeCharacteristicRing, XorShift64};
 use zkie_gkr::fixed_point::from_i32;
@@ -49,8 +49,11 @@ fn main() {
     let mut rng = XorShift64::new(0x7ee);
     let whir9 = Whir::new_testing(9);
     let whir10 = Whir::new_testing(10);
+    let whir11 = Whir::new_testing(11);
     let whir18 = Whir::new_testing(18);
     let whir19 = Whir::new_testing(19);
+    let whir20 = Whir::new_testing(20);
+    let whir21 = Whir::new_testing(21);
 
     let mut x = load_i32(&format!("{stack}x_i32.bin"));
 
@@ -124,5 +127,55 @@ fn main() {
         println!("layer {li} block verified");
     }
 
-    println!("TimesFM 8M full stack: 7 layers x (attention + FFN) verified from WHIR commitments");
+    // Epilogue (horizon FFN output head): hidden -> SiLU -> output + residual ->
+    // rescale. `x` is now add_30 (layer-6 residual).
+    let hid_w = load_i32(&format!("{stack}head_hid_w_i32.bin"));
+    let hid_b = load_i32(&format!("{stack}head_hid_b_i32.bin"));
+    let out_w = load_i32(&format!("{stack}head_out_w_i32.bin"));
+    let out_b = load_i32(&format!("{stack}head_out_b_i32.bin"));
+    let res_w = load_i32(&format!("{stack}head_res_w_i32.bin"));
+    let res_b = load_i32(&format!("{stack}head_res_b_i32.bin"));
+    let silu_table = load_i32(&format!("{base}silu_table_i32.bin"));
+    let scale_bytes = std::fs::read(format!("{stack}scale_i64.bin")).expect("scale file");
+    let scale_q = i64::from_le_bytes(scale_bytes[0..8].try_into().unwrap());
+    let bias_q = i64::from_le_bytes(scale_bytes[8..16].try_into().unwrap());
+    const SILU_OFFSET: u32 = 1 << 19;
+
+    let hid_raw = dense(&x, &hid_w, 512, 1024);
+    let lin31 = affine_raw(&hid_raw, &hid_b, 16, false);
+    let (silu_idx, silu1) = silu_raw(&lin31, &silu_table, SILU_OFFSET);
+    let out_raw = dense(&silu1, &out_w, 1024, 2048);
+    let lin32 = affine_raw(&out_raw, &out_b, 16, false);
+    let res_raw = dense(&x, &res_w, 512, 2048);
+    let lin33 = affine_raw(&res_raw, &res_b, 16, false);
+    let add31 = add_vec(&lin32, &lin33);
+    let bias_bcast = vec![from_i32(bias_q as i32); 2048];
+    let output_ts = scale_raw(&add31, scale_q, &bias_bcast);
+
+    let c_x = commit(&whir9, &x);
+    let c_hidw = commit(&whir19, &hid_w);
+    let c_hidraw = commit(&whir10, &hid_raw);
+    assert!(prove_matmul(&whir9, &c_x, &whir19, &c_hidw, &whir10, &c_hidraw, &x, &hid_w, &hid_raw, 512, 1024, &mut rng));
+    let c_lin31 = commit(&whir10, &lin31);
+    assert!(prove_affine(&whir10, &c_hidraw, &whir10, &c_lin31, &hid_b, 16, false));
+    let idx_field: Vec<Goldilocks> = silu_idx.iter().map(|&i| from_i32(i as i32)).collect();
+    let c_idx = commit(&whir10, &idx_field);
+    let c_silu = commit(&whir10, &silu1);
+    assert!(prove_lookup(&whir10, &c_idx, &whir10, &c_silu, &silu_idx, &silu_table, rng.field(), rng.field()));
+    let c_outw = commit(&whir21, &out_w);
+    let c_outraw = commit(&whir11, &out_raw);
+    assert!(prove_matmul(&whir10, &c_silu, &whir21, &c_outw, &whir11, &c_outraw, &silu1, &out_w, &out_raw, 1024, 2048, &mut rng));
+    let c_lin32 = commit(&whir11, &lin32);
+    assert!(prove_affine(&whir11, &c_outraw, &whir11, &c_lin32, &out_b, 16, false));
+    let c_resw = commit(&whir20, &res_w);
+    let c_resraw = commit(&whir11, &res_raw);
+    assert!(prove_matmul(&whir9, &c_x, &whir20, &c_resw, &whir11, &c_resraw, &x, &res_w, &res_raw, 512, 2048, &mut rng));
+    let c_lin33 = commit(&whir11, &lin33);
+    assert!(prove_affine(&whir11, &c_resraw, &whir11, &c_lin33, &res_b, 16, false));
+    let c_add31 = commit(&whir11, &add31);
+    assert!(prove_add(&whir11, &c_lin32, &whir11, &c_lin33, &whir11, &c_add31, 2048));
+    let c_out = commit(&whir11, &output_ts);
+    assert!(prove_scale(&whir11, &c_add31, &whir11, &c_out, scale_q, &bias_bcast));
+
+    println!("TimesFM 8M: 7-layer stack + output head verified from WHIR commitments");
 }

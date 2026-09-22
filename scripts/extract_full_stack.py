@@ -93,7 +93,30 @@ def main() -> None:
     })[0].reshape(-1)
     pad1(q(add2), 512).tofile(f"{out_dir}/x_i32.bin")
 
-    print(f"dumped full-stack weights/biases/input under {out_dir}/")
+    # Epilogue (horizon FFN output head): hidden -> SiLU -> output + residual ->
+    # rescale. Dump the weights/biases and the scalar rescale factors.
+    pad2(q(inits["val_352"]), 512, 1024).tofile(f"{out_dir}/head_hid_w_i32.bin")
+    pad2(q(inits["val_355"]), 1024, 2048).tofile(f"{out_dir}/head_out_w_i32.bin")
+    pad2(q(inits["val_357"]), 512, 2048).tofile(f"{out_dir}/head_res_w_i32.bin")
+    q(inits["horizon_ff_layer.hidden_layer.0.bias"]).tofile(f"{out_dir}/head_hid_b_i32.bin")
+    pad1(q(inits["horizon_ff_layer.output_layer.bias"]), 2048).tofile(f"{out_dir}/head_out_b_i32.bin")
+    pad1(q(inits["horizon_ff_layer.residual_layer.bias"]), 2048).tofile(f"{out_dir}/head_res_b_i32.bin")
+
+    # The rescale scalars (unsqueeze_4, unsqueeze_2) depend on the input
+    # normalization; extract them for this fixed input.
+    g2 = m.graph
+    for name in ("unsqueeze_4", "unsqueeze_2"):
+        g2.output.append(helper.make_tensor_value_info(name, TensorProto.FLOAT, None))
+    m3 = helper.make_model(g2, opset_imports=m.opset_import)
+    onnx.save(m3, "/tmp/tsfm_scalars.onnx")
+    sess3 = ort.InferenceSession("/tmp/tsfm_scalars.onnx", providers=["CPUExecutionProvider"])
+    names3 = [o.name for o in m3.graph.output]
+    r3 = sess3.run(names3, {"input_ts": inp, "input_padding": pad_in, "freq": np.array([[0]], dtype=np.int64)})
+    u4 = float(np.asarray(r3[names3.index("unsqueeze_4")]).reshape(-1)[0])
+    u2 = float(np.asarray(r3[names3.index("unsqueeze_2")]).reshape(-1)[0])
+    np.array([round(u4 * SCALE), round(u2 * SCALE)], dtype=np.int64).tofile(f"{out_dir}/scale_i64.bin")
+
+    print(f"dumped full-stack + epilogue tensors under {out_dir}/")
 
 
 if __name__ == "__main__":
