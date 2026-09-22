@@ -2,9 +2,10 @@
 """Verify the attention chain (QK^T -> softmax -> PV) for the ctx32 model.
 
 At seq=1 the attention is degenerate: QK^T yields one score per head, softmax of
-a single value is 1, so PV = V. Confirms the structure and that the attention is
-trivial for this context length; a longer context would need the head_dim=66
-padded to a power of two for the GKR matmul.
+a single value is 1, so PV = V. Crucially, QK^T is a *batched dot product*
+(element-wise multiply then per-head sum), not a GKR matmul, so it is covered by
+plain field arithmetic rather than a sum-check. A longer context would make the
+attention non-degenerate (and head_dim=66 would need padding to a power of two).
 
 Usage: .venv-timesfm/bin/python scripts/verify_attention.py
 """
@@ -34,7 +35,7 @@ def main() -> None:
     sm = res[names.index("softmax")].reshape(-1)
     v = res[names.index("transpose_2")].reshape(-1)
     pv = res[names.index("matmul_1")].reshape(-1)
-    # per-head dot product (4 heads x 66 head_dim)
+    # per-head dot product (4 heads x 66 head_dim): element-wise mul + reduce sum
     qh = q.reshape(4, 66)
     kh = kt.reshape(4, 66)
     scores_recon = np.sum(qh * kh, axis=1)
