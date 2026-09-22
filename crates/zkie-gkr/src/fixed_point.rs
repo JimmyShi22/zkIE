@@ -25,6 +25,27 @@ pub fn to_i16(x: Goldilocks) -> i16 {
     }
 }
 
+/// Embed a signed `i32` fixed-point value in the field. The values must stay
+/// bounded by the chosen scale so a length-K dot product does not wrap the
+/// 64-bit field; TimesFM activations span ~[-3.4, 3.4], so a scale of 2^12..2^16
+/// keeps K=264 accumulations well inside Goldilocks.
+pub fn from_i32(x: i32) -> Goldilocks {
+    if x >= 0 {
+        Goldilocks::from_u64(x as u64)
+    } else {
+        Goldilocks::from_u64(P - (x.unsigned_abs() as u64))
+    }
+}
+
+pub fn to_i32(x: Goldilocks) -> i32 {
+    let v = x.as_canonical_u64();
+    if v <= i32::MAX as u64 {
+        v as i32
+    } else {
+        -((P - v) as i32)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,5 +83,14 @@ mod tests {
             field_sum.as_canonical_u64() as i64
         };
         assert_eq!(as_signed, int_sum);
+    }
+
+    #[test]
+    fn int32_roundtrip() {
+        let mut rng = XorShift64::new(22);
+        for _ in 0..1000 {
+            let x = (rng.next_u64() % (1u64 << 32)) as u32 as i32;
+            assert_eq!(to_i32(from_i32(x)), x);
+        }
     }
 }
