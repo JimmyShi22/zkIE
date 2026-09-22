@@ -57,6 +57,16 @@ impl Whir {
     /// polynomial. Security parameters are PoC-grade (90-bit, default PoW); the
     /// proof stays small enough that a `2^10` commitment runs in a couple seconds.
     pub fn new(num_variables: usize) -> Self {
+        Self::with_params(num_variables, 90, DEFAULT_MAX_POW)
+    }
+
+    /// Fast, low-security instance for tests and local iteration. Do not use for
+    /// anything that needs real soundness.
+    pub fn new_testing(num_variables: usize) -> Self {
+        Self::with_params(num_variables, 32, 10)
+    }
+
+    fn with_params(num_variables: usize, security_level: usize, pow_bits: usize) -> Self {
         let folding_factor = FoldingFactor::Constant(5);
         let (num_rounds, _) = folding_factor
             .compute_number_of_rounds(num_variables)
@@ -68,8 +78,8 @@ impl Whir {
             round_log_inv_rates.push(rate);
         }
         let params = ProtocolParameters {
-            security_level: 90,
-            pow_bits: DEFAULT_MAX_POW,
+            security_level,
+            pow_bits,
             folding_factor: folding_factor.clone(),
             soundness_type: SecurityAssumption::CapacityBound,
             starting_log_inv_rate: 1,
