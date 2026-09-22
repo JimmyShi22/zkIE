@@ -3,6 +3,7 @@ pub mod chip;
 pub mod chips;
 pub mod field_convert;
 pub mod fixed_point;
+pub mod goldilocks;
 pub mod isa;
 pub mod tensor;
 
