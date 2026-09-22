@@ -109,20 +109,20 @@ pub fn prove_lookup(
     lhs == rhs
 }
 
-/// Prove `y = (x - mean) / rstd^-1 * w + b` (standard LayerNorm) against WHIR
-/// commitments, in the O(N)-opening PoC form: open the committed input column at
-/// every hypercube point and recompute each output from the opened value and the
-/// host-side `mean`/`rstd` scalars. `rstd = 1/sqrt(var+eps)` is the single
-/// non-arithmetic scalar (a lookup in the full protocol).
+/// Prove the raw LayerNorm product `raw = (x - mean) * rstd * w` (scale 2^48,
+/// before the two `2^16` rescales) against WHIR commitments, in the O(N)-opening
+/// PoC form. This mirrors `prove_matmul`: the cryptographic proof covers the
+/// exact field product, and the host-side caller applies the rescale and bias.
+/// `rstd = 1/sqrt(var+eps)` is the single non-arithmetic scalar (a lookup in the
+/// full protocol).
 pub fn prove_layer_norm(
     whir_x: &Whir,
     x: &Committed,
-    whir_y: &Whir,
-    y: &Committed,
+    whir_raw: &Whir,
+    raw: &Committed,
     mean: Goldilocks,
     rstd: Goldilocks,
     weight: &[Goldilocks],
-    bias: &[Goldilocks],
 ) -> bool {
     let n = weight.len();
     let d = n.trailing_zeros() as usize;
@@ -131,15 +131,15 @@ pub fn prove_layer_norm(
             .map(|b| Goldilocks::from_bool((i >> b) & 1 == 1))
             .collect();
         let (x_open, xv) = whir_x.open(x.prover_data.clone(), &x.protocol, &point);
-        let (y_open, yv) = whir_y.open(y.prover_data.clone(), &y.protocol, &point);
+        let (raw_open, rv) = whir_raw.open(raw.prover_data.clone(), &raw.protocol, &point);
         if whir_x.verify(&x.commitment, &x_open, &x.protocol, &point).unwrap() != xv {
             return false;
         }
-        if whir_y.verify(&y.commitment, &y_open, &y.protocol, &point).unwrap() != yv {
+        if whir_raw.verify(&raw.commitment, &raw_open, &raw.protocol, &point).unwrap() != rv {
             return false;
         }
-        let expected = (xv - mean) * rstd * weight[i] + bias[i];
-        if yv != expected {
+        let expected = (xv - mean) * rstd * weight[i];
+        if rv != expected {
             return false;
         }
     }
@@ -202,19 +202,17 @@ mod tests {
         let n = 64usize;
         let x: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
         let weight: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
-        let bias: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
         let mean = rng.field();
         let rstd = rng.field();
-        let y: Vec<Goldilocks> = x
+        let raw: Vec<Goldilocks> = x
             .iter()
             .zip(&weight)
-            .zip(&bias)
-            .map(|((&xv, &w), &b)| (xv - mean) * rstd * w + b)
+            .map(|(&xv, &w)| (xv - mean) * rstd * w)
             .collect();
 
         let whir = Whir::new_testing(6);
         let cx = commit(&whir, &x);
-        let cy = commit(&whir, &y);
-        assert!(prove_layer_norm(&whir, &cx, &whir, &cy, mean, rstd, &weight, &bias));
+        let c_raw = commit(&whir, &raw);
+        assert!(prove_layer_norm(&whir, &cx, &whir, &c_raw, mean, rstd, &weight));
     }
 }
