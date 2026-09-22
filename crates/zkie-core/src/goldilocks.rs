@@ -8,7 +8,7 @@
 
 use crate::chips::range_check::{RangeCheckChip, RangeCheckConfig};
 use crate::field_convert::Fr;
-use halo2_proofs::circuit::{Layouter, Value};
+use halo2_proofs::circuit::{AssignedCell, Layouter, Value};
 use halo2_proofs::plonk::{Advice, Column, ConstraintSystem, ErrorFront, Expression, Selector};
 use halo2_proofs::poly::Rotation;
 
@@ -88,16 +88,15 @@ impl GoldilocksMulChip {
         b: u64,
         c: u64,
         q: u64,
-    ) -> Result<(), ErrorFront> {
-        layouter.assign_region(
+    ) -> Result<AssignedCell<Fr, Fr>, ErrorFront> {
+        let c_cell = layouter.assign_region(
             || "goldilocks mul",
             |mut region| {
                 self.config.s_mul.enable(&mut region, 0)?;
                 region.assign_advice(|| "a", self.config.a, 0, || Value::known(Fr::from(a)))?;
                 region.assign_advice(|| "b", self.config.b, 0, || Value::known(Fr::from(b)))?;
-                region.assign_advice(|| "c", self.config.c, 0, || Value::known(Fr::from(c)))?;
                 region.assign_advice(|| "q", self.config.q, 0, || Value::known(Fr::from(q)))?;
-                Ok(())
+                region.assign_advice(|| "c", self.config.c, 0, || Value::known(Fr::from(c)))
             },
         )?;
 
@@ -123,7 +122,7 @@ impl GoldilocksMulChip {
             fr(q),
             raw(q),
         )?;
-        Ok(())
+        Ok(c_cell)
     }
 }
 
@@ -132,6 +131,129 @@ pub fn mul_mod(a: u64, b: u64) -> (u64, u64) {
     let prod = (a as u128) * (b as u128);
     let p = GOLDILOCKS_P as u128;
     ((prod % p) as u64, (prod / p) as u64)
+}
+
+#[derive(Clone, Debug)]
+pub struct GoldilocksAddConfig {
+    a: Column<Advice>,
+    b: Column<Advice>,
+    c: Column<Advice>,
+    ov: Column<Advice>,
+    s_add: Selector,
+    s_ov_bit: Selector,
+    range_a: RangeCheckConfig,
+    range_b: RangeCheckConfig,
+    range_c: RangeCheckConfig,
+}
+
+pub struct GoldilocksAddChip {
+    config: GoldilocksAddConfig,
+}
+
+impl GoldilocksAddChip {
+    pub fn configure(meta: &mut ConstraintSystem<Fr>) -> GoldilocksAddConfig {
+        let a = meta.advice_column();
+        let b = meta.advice_column();
+        let c = meta.advice_column();
+        let ov = meta.advice_column();
+        for col in [a, b, c] {
+            meta.enable_equality(col);
+        }
+
+        let s_ov_bit = meta.selector();
+        meta.create_gate("ov is boolean", |meta| {
+            let ov = meta.query_advice(ov, Rotation::cur());
+            let s = meta.query_selector(s_ov_bit);
+            let one = Expression::Constant(Fr::one());
+            vec![s * ov.clone() * (one - ov)]
+        });
+
+        let s_add = meta.selector();
+        meta.create_gate("a + b = c + ov*p", |meta| {
+            let a = meta.query_advice(a, Rotation::cur());
+            let b = meta.query_advice(b, Rotation::cur());
+            let c = meta.query_advice(c, Rotation::cur());
+            let ov = meta.query_advice(ov, Rotation::cur());
+            let s = meta.query_selector(s_add);
+            let p = Expression::Constant(Fr::from(GOLDILOCKS_P));
+            vec![s * (a + b - c - ov * p)]
+        });
+
+        let a_bits = meta.advice_column();
+        let b_bits = meta.advice_column();
+        let c_bits = meta.advice_column();
+        let range_a = RangeCheckChip::configure(meta, a, a_bits, 64);
+        let range_b = RangeCheckChip::configure(meta, b, b_bits, 64);
+        let range_c = RangeCheckChip::configure(meta, c, c_bits, 64);
+
+        GoldilocksAddConfig {
+            a,
+            b,
+            c,
+            ov,
+            s_add,
+            s_ov_bit,
+            range_a,
+            range_b,
+            range_c,
+        }
+    }
+
+    pub fn construct(config: GoldilocksAddConfig) -> Self {
+        GoldilocksAddChip { config }
+    }
+
+    /// Witness `a + b = c + ov*p` with `ov in {0,1}`.
+    pub fn assign(
+        &self,
+        mut layouter: impl Layouter<Fr>,
+        a: u64,
+        b: u64,
+        c: u64,
+        ov: u64,
+    ) -> Result<AssignedCell<Fr, Fr>, ErrorFront> {
+        let c_cell = layouter.assign_region(
+            || "goldilocks add",
+            |mut region| {
+                self.config.s_add.enable(&mut region, 0)?;
+                self.config.s_ov_bit.enable(&mut region, 0)?;
+                region.assign_advice(|| "a", self.config.a, 0, || Value::known(Fr::from(a)))?;
+                region.assign_advice(|| "b", self.config.b, 0, || Value::known(Fr::from(b)))?;
+                region.assign_advice(|| "ov", self.config.ov, 0, || Value::known(Fr::from(ov)))?;
+                region.assign_advice(|| "c", self.config.c, 0, || Value::known(Fr::from(c)))
+            },
+        )?;
+
+        let fr = |v: u64| Value::known(Fr::from(v));
+        let raw = |v: u64| Value::known(v as i128);
+        RangeCheckChip::construct(self.config.range_a.clone()).assign(
+            layouter.namespace(|| "range a"),
+            fr(a),
+            raw(a),
+        )?;
+        RangeCheckChip::construct(self.config.range_b.clone()).assign(
+            layouter.namespace(|| "range b"),
+            fr(b),
+            raw(b),
+        )?;
+        RangeCheckChip::construct(self.config.range_c.clone()).assign(
+            layouter.namespace(|| "range c"),
+            fr(c),
+            raw(c),
+        )?;
+        Ok(c_cell)
+    }
+}
+
+/// Host-side helper: `(c, ov)` such that `a + b = ov*p + c` and `0 <= c < p`.
+pub fn add_mod(a: u64, b: u64) -> (u64, u64) {
+    let sum = (a as u128) + (b as u128);
+    let p = GOLDILOCKS_P as u128;
+    if sum >= p {
+        ((sum - p) as u64, 1)
+    } else {
+        (sum as u64, 0)
+    }
 }
 
 #[cfg(test)]
@@ -183,7 +305,8 @@ mod tests {
                 self.b,
                 self.c,
                 self.q,
-            )
+            )?;
+            Ok(())
         }
     }
 
@@ -214,5 +337,62 @@ mod tests {
         let wrong_c = 36u64; // 5*7 != 36 mod p
         let prover = MockProver::run(12, &TestCircuit { a, b, c: wrong_c, q }, vec![]).unwrap();
         assert!(prover.verify().is_err());
+    }
+
+    #[derive(Clone)]
+    struct AddTestConfig {
+        add: GoldilocksAddConfig,
+    }
+
+    struct AddTestCircuit {
+        a: u64,
+        b: u64,
+        c: u64,
+        ov: u64,
+    }
+
+    impl Circuit<Fr> for AddTestCircuit {
+        type Config = AddTestConfig;
+        type FloorPlanner = SimpleFloorPlanner;
+
+        fn without_witnesses(&self) -> Self {
+            AddTestCircuit { a: 0, b: 0, c: 0, ov: 0 }
+        }
+
+        fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
+            AddTestConfig {
+                add: GoldilocksAddChip::configure(meta),
+            }
+        }
+
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            layouter: impl Layouter<Fr>,
+        ) -> Result<(), ErrorFront> {
+            GoldilocksAddChip::construct(config.add).assign(
+                layouter, self.a, self.b, self.c, self.ov,
+            )?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn add_without_wraparound_is_satisfied() {
+        let (a, b) = (5u64, 7u64);
+        let (c, ov) = add_mod(a, b);
+        assert_eq!((c, ov), (12, 0));
+        let prover = MockProver::run(12, &AddTestCircuit { a, b, c, ov }, vec![]).unwrap();
+        prover.assert_satisfied();
+    }
+
+    #[test]
+    fn add_with_wraparound_is_satisfied() {
+        let a = GOLDILOCKS_P - 1;
+        let b = 2u64;
+        let (c, ov) = add_mod(a, b);
+        assert_eq!((c, ov), (1, 1));
+        let prover = MockProver::run(12, &AddTestCircuit { a, b, c, ov }, vec![]).unwrap();
+        prover.assert_satisfied();
     }
 }

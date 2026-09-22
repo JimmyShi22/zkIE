@@ -5,6 +5,7 @@ pub mod field_convert;
 pub mod fixed_point;
 pub mod goldilocks;
 pub mod isa;
+pub mod sumcheck_verify;
 pub mod tensor;
 
 #[cfg(test)]
