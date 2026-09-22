@@ -292,6 +292,23 @@ pub fn affine_raw(
         .collect()
 }
 
+/// Compute the SiLU lookup indices (`x + offset`, non-negative) and the
+/// corresponding table outputs, so a caller can commit them and run
+/// [`prove_lookup`] against the quantized SiLU table. `SiLU(x) = x * sigmoid(x)`
+/// is the one non-arithmetic activation of the input/horizon FFNs.
+pub fn silu_raw(
+    x: &[Goldilocks],
+    table: &[Goldilocks],
+    offset: u32,
+) -> (Vec<u32>, Vec<Goldilocks>) {
+    let indices: Vec<u32> = x
+        .iter()
+        .map(|&v| (to_i32(v) as i64 + offset as i64) as u32)
+        .collect();
+    let outputs: Vec<Goldilocks> = indices.iter().map(|&i| table[i as usize]).collect();
+    (indices, outputs)
+}
+
 /// Prove the raw RMSNorm product `raw = x * rstd * w` (scale 2^48) against WHIR
 /// commitments, in the O(N)-opening PoC form. `mean(x^2)` is recomputed from the
 /// *committed* `x`, and `rstd = 1/sqrt(mean(x^2) + eps)` is bound to it by a
@@ -576,6 +593,40 @@ mod tests {
         assert!(!prove_rms_norm(
             &whir, &cx, &whir, &c_bad, &weight, n_real, &rsqrt_table, alpha, beta,
         ));
+    }
+
+    #[test]
+    fn committed_silu_lookup_roundtrip() {
+        let mut rng = XorShift64::new(0x678);
+        let n = 64usize;
+        // Small synthetic SiLU table: x in [-2, 2) at scale 2^16, offset 2^17.
+        let offset = 1u32 << 17;
+        let table_size = 1usize << 18;
+        let table: Vec<Goldilocks> = (0..table_size)
+            .map(|j| {
+                let xf = (j as f64 - offset as f64) / 65536.0;
+                let s = xf / (1.0 + (-xf).exp());
+                from_i32((s * 65536.0).round() as i32)
+            })
+            .collect();
+        // x_q in [-1.5, 1.5) at scale 2^16.
+        let x: Vec<Goldilocks> = (0..n)
+            .map(|_| from_i32((rng.next_u64() % 196608) as i32 - 98304))
+            .collect();
+        let (indices, outputs) = silu_raw(&x, &table, offset);
+        let idx_field: Vec<Goldilocks> = indices.iter().map(|&i| from_i32(i as i32)).collect();
+
+        let whir = Whir::new_testing(6);
+        let c_idx = commit(&whir, &idx_field);
+        let c_out = commit(&whir, &outputs);
+        let alpha = rng.field();
+        let beta = rng.field();
+        assert!(prove_lookup(&whir, &c_idx, &whir, &c_out, &indices, &table, alpha, beta));
+
+        let mut bad = outputs.clone();
+        bad[0] += Goldilocks::ONE;
+        let c_bad = commit(&whir, &bad);
+        assert!(!prove_lookup(&whir, &c_idx, &whir, &c_bad, &indices, &table, alpha, beta));
     }
 
     #[test]
