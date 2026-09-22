@@ -139,7 +139,7 @@ fn main() {
 
         let c_x = commit(&whir9, &x);
         let c_rms = commit(&whir9, &rms_raw);
-        assert!(prove_rms_norm(&whir9, &c_x, &whir9, &c_rms, &lnw, N_REAL, &rsqrt_table, rng.field(), rng.field()));
+        assert!(prove_rms_norm(&whir9, &c_x, &x, &whir9, &c_rms, &rms_raw, &lnw, N_REAL, &rsqrt_table, rng.field(), rng.field(), &mut rng));
         let c_mul9 = commit(&whir9, &mul9);
         assert!(prove_affine(&whir9, &c_rms, &whir9, &c_mul9, &zero_bias, 32, false));
         let c_vw = commit(&whir18, &v_w);
@@ -165,7 +165,7 @@ fn main() {
         let next_x = add_vec(&add5, &ffn_out);
 
         let c_lnraw = commit(&whir9, &ln_raw);
-        assert!(prove_layer_norm(&whir9, &c_add5, &whir9, &c_lnraw, &mlp_w, N_REAL, &rsqrt_table, rng.field(), rng.field()));
+        assert!(prove_layer_norm(&whir9, &c_add5, &add5, &whir9, &c_lnraw, &ln_raw, &mlp_w, N_REAL, &rsqrt_table, rng.field(), rng.field(), &mut rng));
         let c_lnout = commit(&whir9, &ln_out);
         assert!(prove_affine(&whir9, &c_lnraw, &whir9, &c_lnout, &mlp_b, 32, false));
         let c_gatew = commit(&whir19, &gate_w);

@@ -59,7 +59,7 @@ fn main() {
     let c_add2 = commit(&whir9, &add2);
     let c_rms_raw = commit(&whir9, &rms_raw);
     assert!(prove_rms_norm(
-        &whir9, &c_add2, &whir9, &c_rms_raw, &ln_w, N_REAL, &rsqrt_table, rng.field(), rng.field(),
+        &whir9, &c_add2, &add2, &whir9, &c_rms_raw, &rms_raw, &ln_w, N_REAL, &rsqrt_table, rng.field(), rng.field(), &mut rng,
     ));
 
     // rescale raw (2^48 -> 2^16); RMSNorm has no bias.
@@ -93,7 +93,7 @@ fn main() {
 
     // residual: add_5 = add_2 + linear_4.
     let c_add5 = commit(&whir9, &add5);
-    assert!(prove_add(&whir9, &c_add2, &whir9, &c_lin4, &whir9, &c_add5, 512));
+    assert!(prove_add(&whir9, &c_add2, &whir9, &c_lin4, &whir9, &c_add5, 512, &mut rng));
 
     println!("layer-0 attention chain (RMSNorm -> V -> o_proj -> residual) verified from WHIR commitments");
 }

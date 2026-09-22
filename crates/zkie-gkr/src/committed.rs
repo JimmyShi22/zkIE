@@ -6,10 +6,10 @@
 //! left operand is a vector and needs no transpose point-swap.
 
 use crate::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64};
-use crate::fixed_point::{from_i32, to_i32, to_i64};
+use crate::fixed_point::{from_i32, from_i64, to_i32, to_i64};
 use crate::lookup;
 use crate::whir::{Commitment, OpeningProtocol, ProverData, Whir};
-use crate::{matmul, mle};
+use crate::{matmul, mle, sumcheck};
 
 /// A committed tensor (commitment + prover data + opening protocol).
 pub struct Committed {
@@ -175,59 +175,117 @@ pub fn layer_norm_raw(
 /// Prove the raw LayerNorm product `raw = (x - mean) * rstd * w` (scale 2^48,
 /// before the two `2^16` rescales) against WHIR commitments, in the O(N)-opening
 /// PoC form. `mean` and `var` are recomputed from the *committed* `x` (integer
-/// reduction over the first `n_real` entries, ignoring padding), and `rstd =
-/// 1/sqrt(var + eps)` is bound to that variance by a LogUp lookup into
-/// `rsqrt_table` — the single non-arithmetic scalar is no longer a trusted input.
+/// reduction over the first `n_real` entries, ignoring padding) via a pair of
+/// degree-2 sum-checks, `rstd = 1/sqrt(var + eps)` is bound by a LogUp lookup,
+/// and the pointwise product `raw = rstd (x - mean) w` is proven by a degree-3
+/// zero-check sum-check — the prover runs O(N) field work but the verifier opens
+/// `x`/`raw` at only a constant number of random points.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_layer_norm(
     whir_x: &Whir,
     x: &Committed,
+    x_plain: &[Goldilocks],
     whir_raw: &Whir,
     raw: &Committed,
+    raw_plain: &[Goldilocks],
     weight: &[Goldilocks],
     n_real: usize,
     rsqrt_table: &[Goldilocks],
     alpha: Goldilocks,
     beta: Goldilocks,
+    rng: &mut XorShift64,
 ) -> bool {
     let n = weight.len();
     let d = n.trailing_zeros() as usize;
-    let mut xv: Vec<Goldilocks> = Vec::with_capacity(n);
-    for i in 0..n {
-        let point: Vec<Goldilocks> = (0..d)
-            .map(|b| Goldilocks::from_bool((i >> b) & 1 == 1))
-            .collect();
-        let (x_open, xv_i) = whir_x.open(x.prover_data.clone(), &x.protocol, &point);
-        if whir_x.verify(&x.commitment, &x_open, &x.protocol, &point).unwrap() != xv_i {
-            return false;
-        }
-        xv.push(xv_i);
-    }
+    assert_eq!(x_plain.len(), n);
+    assert_eq!(raw_plain.len(), n);
+    let ones: Vec<Goldilocks> = vec![Goldilocks::ONE; n];
 
-    let x_i32: Vec<i32> = xv.iter().map(|&v| to_i32(v)).collect();
-    let (mean, s_index) = layer_norm_scalars_i32(&x_i32, n_real);
+    // mean: S_x = sum x(i) via degree-2 sum-check (f = x, h = 1).
+    let s_x: i64 = x_plain[..n_real].iter().map(|&v| to_i32(v) as i64).sum();
+    let s_x_f = from_i64(s_x);
+    let r1: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let proof_x = sumcheck::prove(x_plain, &ones, s_x_f, &r1);
+    let (x_open1, x_r1) = whir_x.open(x.prover_data.clone(), &x.protocol, &r1);
+    if whir_x.verify(&x.commitment, &x_open1, &x.protocol, &r1).unwrap() != x_r1 {
+        return false;
+    }
+    if !sumcheck::verify(&proof_x, s_x_f, &r1, x_r1, Goldilocks::ONE) {
+        return false;
+    }
+    let mean = div_round(s_x, n_real as i64) as i32;
+    let mean_f = from_i32(mean);
+
+    // var: S_x2 = sum x(i)^2 via degree-2 sum-check (f = x, h = x); then
+    // var = E[x^2] - mean^2 (padding is zero, so the full sum equals the real sum).
+    let s_x2: i64 = x_plain[..n_real]
+        .iter()
+        .map(|&v| {
+            let d = to_i32(v) as i64;
+            d * d
+        })
+        .sum();
+    let s_x2_f = from_i64(s_x2);
+    let r2: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let proof_x2 = sumcheck::prove(x_plain, x_plain, s_x2_f, &r2);
+    let (x_open2, x_r2) = whir_x.open(x.prover_data.clone(), &x.protocol, &r2);
+    if whir_x.verify(&x.commitment, &x_open2, &x.protocol, &r2).unwrap() != x_r2 {
+        return false;
+    }
+    if !sumcheck::verify(&proof_x2, s_x2_f, &r2, x_r2, x_r2) {
+        return false;
+    }
+    // sqsum = sum (x_i - mean)^2 = S_x2 - 2 mean S_x + n_real mean^2.
+    let m = mean as i64;
+    let sqsum = s_x2 - 2 * m * s_x + (n_real as i64) * m * m;
+    let var = div_round(sqsum, n_real as i64);
+    let s_index = div_round(var, 1 << 18) as u32;
     if (s_index as usize) >= rsqrt_table.len() {
         return false;
     }
-    let mean_f = from_i32(mean);
     let rstd = rsqrt_table[s_index as usize];
     let lk = lookup::prove(&[s_index], &[rstd], rsqrt_table, alpha, beta);
     if !lookup::verify(&lk) {
         return false;
     }
 
-    for i in 0..n {
-        let point: Vec<Goldilocks> = (0..d)
-            .map(|b| Goldilocks::from_bool((i >> b) & 1 == 1))
-            .collect();
-        let (raw_open, rv) = whir_raw.open(raw.prover_data.clone(), &raw.protocol, &point);
-        if whir_raw.verify(&raw.commitment, &raw_open, &raw.protocol, &point).unwrap() != rv {
-            return false;
-        }
-        let expected = (xv[i] - mean_f) * rstd * weight[i];
-        if rv != expected {
-            return false;
-        }
+    // raw = rstd (x - mean) w via a degree-3 zero-check:
+    //   sum eq(x,r) raw(x) == rstd (sum eq(x,r) x(x) w(x) - mean sum eq(x,r) w(x)).
+    let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let s = mle::eq_evals(&r);
+    let c_raw: Goldilocks = s.iter().zip(raw_plain).fold(Goldilocks::ZERO, |a, (&si, &ri)| a + si * ri);
+    let c_xw: Goldilocks = s
+        .iter()
+        .zip(x_plain)
+        .zip(weight)
+        .fold(Goldilocks::ZERO, |a, ((&si, &xi), &wi)| a + si * xi * wi);
+    let c_w: Goldilocks = s.iter().zip(weight).fold(Goldilocks::ZERO, |a, (&si, &wi)| a + si * wi);
+
+    let proof_raw = sumcheck::prove(&s, raw_plain, c_raw, &r);
+    let proof_xw = sumcheck::prove3(&s, x_plain, weight, c_xw, &r);
+    let proof_w = sumcheck::prove(&s, weight, c_w, &r);
+
+    let (x_open, xr) = whir_x.open(x.prover_data.clone(), &x.protocol, &r);
+    let (raw_open, rv) = whir_raw.open(raw.prover_data.clone(), &raw.protocol, &r);
+    if whir_x.verify(&x.commitment, &x_open, &x.protocol, &r).unwrap() != xr {
+        return false;
+    }
+    if whir_raw.verify(&raw.commitment, &raw_open, &raw.protocol, &r).unwrap() != rv {
+        return false;
+    }
+    let s_r = mle::eval(&s, &r);
+    let w_r = mle::eval(weight, &r);
+    if !sumcheck::verify(&proof_raw, c_raw, &r, s_r, rv) {
+        return false;
+    }
+    if !sumcheck::verify3(&proof_xw, c_xw, &r, s_r, xr, w_r) {
+        return false;
+    }
+    if !sumcheck::verify(&proof_w, c_w, &r, s_r, w_r) {
+        return false;
+    }
+    if c_raw != rstd * (c_xw - mean_f * c_w) {
+        return false;
     }
     true
 }
@@ -375,30 +433,41 @@ pub fn prove_scale(
 pub fn prove_rms_norm(
     whir_x: &Whir,
     x: &Committed,
+    x_plain: &[Goldilocks],
     whir_raw: &Whir,
     raw: &Committed,
+    raw_plain: &[Goldilocks],
     weight: &[Goldilocks],
     n_real: usize,
     rsqrt_table: &[Goldilocks],
     alpha: Goldilocks,
     beta: Goldilocks,
+    rng: &mut XorShift64,
 ) -> bool {
     let n = weight.len();
     let d = n.trailing_zeros() as usize;
-    let mut xv: Vec<Goldilocks> = Vec::with_capacity(n);
-    for i in 0..n {
-        let point: Vec<Goldilocks> = (0..d)
-            .map(|b| Goldilocks::from_bool((i >> b) & 1 == 1))
-            .collect();
-        let (x_open, xv_i) = whir_x.open(x.prover_data.clone(), &x.protocol, &point);
-        if whir_x.verify(&x.commitment, &x_open, &x.protocol, &point).unwrap() != xv_i {
-            return false;
-        }
-        xv.push(xv_i);
-    }
+    assert_eq!(x_plain.len(), n);
+    assert_eq!(raw_plain.len(), n);
 
-    let x_i32: Vec<i32> = xv.iter().map(|&v| to_i32(v)).collect();
-    let s_index = rms_norm_scalars_i32(&x_i32, n_real);
+    // mean(x^2): S_x2 = sum x(i)^2 via degree-2 sum-check (f = x, h = x).
+    let s_x2: i64 = x_plain[..n_real]
+        .iter()
+        .map(|&v| {
+            let d = to_i32(v) as i64;
+            d * d
+        })
+        .sum();
+    let s_x2_f = from_i64(s_x2);
+    let r2: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let proof_x2 = sumcheck::prove(x_plain, x_plain, s_x2_f, &r2);
+    let (x_open2, x_r2) = whir_x.open(x.prover_data.clone(), &x.protocol, &r2);
+    if whir_x.verify(&x.commitment, &x_open2, &x.protocol, &r2).unwrap() != x_r2 {
+        return false;
+    }
+    if !sumcheck::verify(&proof_x2, s_x2_f, &r2, x_r2, x_r2) {
+        return false;
+    }
+    let s_index = div_round(div_round(s_x2, n_real as i64), 1 << 18) as u32;
     if (s_index as usize) >= rsqrt_table.len() {
         return false;
     }
@@ -408,17 +477,38 @@ pub fn prove_rms_norm(
         return false;
     }
 
-    for i in 0..n {
-        let point: Vec<Goldilocks> = (0..d)
-            .map(|b| Goldilocks::from_bool((i >> b) & 1 == 1))
-            .collect();
-        let (raw_open, rv) = whir_raw.open(raw.prover_data.clone(), &raw.protocol, &point);
-        if whir_raw.verify(&raw.commitment, &raw_open, &raw.protocol, &point).unwrap() != rv {
-            return false;
-        }
-        if rv != xv[i] * rstd * weight[i] {
-            return false;
-        }
+    // raw = rstd x w via a degree-3 zero-check:
+    //   sum eq(x,r) raw(x) == rstd sum eq(x,r) x(x) w(x).
+    let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let s = mle::eq_evals(&r);
+    let c_raw: Goldilocks = s.iter().zip(raw_plain).fold(Goldilocks::ZERO, |a, (&si, &ri)| a + si * ri);
+    let c_xw: Goldilocks = s
+        .iter()
+        .zip(x_plain)
+        .zip(weight)
+        .fold(Goldilocks::ZERO, |a, ((&si, &xi), &wi)| a + si * xi * wi);
+
+    let proof_raw = sumcheck::prove(&s, raw_plain, c_raw, &r);
+    let proof_xw = sumcheck::prove3(&s, x_plain, weight, c_xw, &r);
+
+    let (x_open, xr) = whir_x.open(x.prover_data.clone(), &x.protocol, &r);
+    let (raw_open, rv) = whir_raw.open(raw.prover_data.clone(), &raw.protocol, &r);
+    if whir_x.verify(&x.commitment, &x_open, &x.protocol, &r).unwrap() != xr {
+        return false;
+    }
+    if whir_raw.verify(&raw.commitment, &raw_open, &raw.protocol, &r).unwrap() != rv {
+        return false;
+    }
+    let s_r = mle::eval(&s, &r);
+    let w_r = mle::eval(weight, &r);
+    if !sumcheck::verify(&proof_raw, c_raw, &r, s_r, rv) {
+        return false;
+    }
+    if !sumcheck::verify3(&proof_xw, c_xw, &r, s_r, xr, w_r) {
+        return false;
+    }
+    if c_raw != rstd * c_xw {
+        return false;
     }
     true
 }
@@ -593,7 +683,7 @@ mod tests {
         let alpha = rng.field();
         let beta = rng.field();
         assert!(prove_layer_norm(
-            &whir, &cx, &whir, &c_raw, &weight, n_real, &rsqrt_table, alpha, beta,
+            &whir, &cx, &x, &whir, &c_raw, &raw, &weight, n_real, &rsqrt_table, alpha, beta, &mut rng,
         ));
 
         // Corrupt the committed raw -> the pointwise check must fail.
@@ -601,7 +691,7 @@ mod tests {
         bad[0] += Goldilocks::ONE;
         let c_bad = commit(&whir, &bad);
         assert!(!prove_layer_norm(
-            &whir, &cx, &whir, &c_bad, &weight, n_real, &rsqrt_table, alpha, beta,
+            &whir, &cx, &x, &whir, &c_bad, &bad, &weight, n_real, &rsqrt_table, alpha, beta, &mut rng,
         ));
     }
 
@@ -631,14 +721,14 @@ mod tests {
         let alpha = rng.field();
         let beta = rng.field();
         assert!(prove_rms_norm(
-            &whir, &cx, &whir, &c_raw, &weight, n_real, &rsqrt_table, alpha, beta,
+            &whir, &cx, &x, &whir, &c_raw, &raw, &weight, n_real, &rsqrt_table, alpha, beta, &mut rng,
         ));
 
         let mut bad = raw.clone();
         bad[0] += Goldilocks::ONE;
         let c_bad = commit(&whir, &bad);
         assert!(!prove_rms_norm(
-            &whir, &cx, &whir, &c_bad, &weight, n_real, &rsqrt_table, alpha, beta,
+            &whir, &cx, &x, &whir, &c_bad, &bad, &weight, n_real, &rsqrt_table, alpha, beta, &mut rng,
         ));
     }
 

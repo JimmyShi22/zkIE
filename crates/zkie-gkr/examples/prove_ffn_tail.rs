@@ -58,13 +58,16 @@ fn main() {
     assert!(prove_layer_norm(
         &whir9,
         &c_add5,
+        &add5,
         &whir9,
         &c_raw,
+        &raw,
         &ln_w,
         N_REAL,
         &rsqrt_table,
         alpha,
         beta,
+        &mut rng,
     ));
 
     // gate: layer_norm @ gate = val_127 (raw 2^32).

@@ -61,7 +61,7 @@ fn main() {
     let cx = commit(&whir9, &x);
     let c_norm_raw = commit(&whir9, &norm_raw);
     assert!(prove_layer_norm(
-        &whir9, &cx, &whir9, &c_norm_raw, &nw, N_REAL, &rsqrt_table, rng.field(), rng.field(),
+        &whir9, &cx, &x, &whir9, &c_norm_raw, &norm_raw, &nw, N_REAL, &rsqrt_table, rng.field(), rng.field(), &mut rng,
     ));
 
     // rescale raw (2^48 -> 2^16) and add the LayerNorm bias.
@@ -94,7 +94,7 @@ fn main() {
 
     // residual: add_6 = ffn_out + add_5.
     let c_residual = commit(&whir9, &residual);
-    assert!(prove_add(&whir9, &c_ffn_out, &whir9, &cx, &whir9, &c_residual, 512));
+    assert!(prove_add(&whir9, &c_ffn_out, &whir9, &cx, &whir9, &c_residual, 512, &mut rng));
 
     println!("layer-0 FFN chain (LayerNorm -> gate -> bias -> ReLU -> down -> bias -> residual) verified from WHIR commitments");
 }

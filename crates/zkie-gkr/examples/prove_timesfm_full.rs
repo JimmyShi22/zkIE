@@ -67,13 +67,16 @@ fn main() {
         assert!(prove_layer_norm(
             &whir9,
             &cx,
+            &x,
             &whir9,
             &c_raw,
+            &raw,
             &nw,
             N_REAL,
             &rsqrt_table,
             alpha,
             beta,
+            &mut rng,
         ));
 
         // Four weight matmuls.

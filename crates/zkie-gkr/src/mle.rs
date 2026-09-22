@@ -3,7 +3,7 @@
 //! Conventions: variable `0` is the least-significant bit of the flattened
 //! index; `partial_eval` fixes the *first* `fix.len()` variables.
 
-use crate::field::Goldilocks;
+use crate::field::{Goldilocks, PrimeCharacteristicRing};
 
 pub fn eval(values: &[Goldilocks], point: &[Goldilocks]) -> Goldilocks {
     let t = point.len();
@@ -35,6 +35,23 @@ pub fn partial_eval(values: &[Goldilocks], fix: &[Goldilocks]) -> Vec<Goldilocks
         buf.truncate(half);
     }
     buf
+}
+
+/// Evaluate the equality (Lagrange-basis) polynomial `eq(x, r)` at every
+/// hypercube point `x = i` for a fixed `r`: `eq_i(r) = prod_j (bit_j(i) * r_j +
+/// (1 - bit_j(i)) * (1 - r_j))`. Used as the random selector in the
+/// zero-check sumchecks.
+pub fn eq_evals(r: &[Goldilocks]) -> Vec<Goldilocks> {
+    let d = r.len();
+    let n = 1 << d;
+    let mut eq = vec![Goldilocks::ONE; n];
+    for j in 0..d {
+        let one_minus = Goldilocks::ONE - r[j];
+        for i in 0..n {
+            eq[i] = eq[i] * if (i >> j) & 1 == 1 { r[j] } else { one_minus };
+        }
+    }
+    eq
 }
 
 #[cfg(test)]
