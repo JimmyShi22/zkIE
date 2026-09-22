@@ -14,5 +14,6 @@ pub mod matmul;
 pub mod mle;
 pub mod softmax;
 pub mod sumcheck;
+pub mod whir;
 
 pub use field::Goldilocks;
