@@ -33,15 +33,15 @@ def build_silu(s):
     return np.clip(np.round((x / (1 + np.exp(-x))) * (1 << s)), -(2**31), 2**31 - 1).astype(np.int32), n
 
 
-def build_rsqrt(s):
-    # index at scale 2^14, value at scale 2^s.
-    n = 1 << 19
+def build_rsqrt(s, index_bits):
+    # index at scale 2^index_bits, value at scale 2^s.
+    n = 32 << index_bits
     idx = np.arange(n)
-    v = idx / 16384.0 + 1e-6
+    v = idx / (1 << index_bits) + 1e-6
     return np.clip(np.round((1 / np.sqrt(v)) * (1 << s)), -(2**31), 2**31 - 1).astype(np.int32)
 
 
-def run(s):
+def run(s, index_bits=14):
     SCALE = 1 << s
     def q(x):
         return np.clip(np.round(x * SCALE), -(2**31), 2**31 - 1).astype(np.int64)
@@ -50,7 +50,7 @@ def run(s):
 
     exp_t, exp_off = build_exp(s)
     silu_t, silu_off = build_silu(s)
-    rsqrt = build_rsqrt(s)
+    rsqrt = build_rsqrt(s, index_bits)
 
     base = "models"
     m = onnx.load(f"{base}/timesfm_1_0_200m.onnx")
@@ -77,13 +77,13 @@ def run(s):
     def rms_norm(x, w):
         sq = (x**2).sum(axis=-1)
         s2 = dr(sq, H)
-        rstd = rsqrt[dr(s2, 1 << (2 * s - 14))][:, None]
+        rstd = rsqrt[dr(s2, 1 << (2 * s - index_bits))][:, None]
         return rs(x * rstd * w, 2 * s)
 
     def layer_norm(x, w, b):
         mean = dr(x.sum(axis=-1), H)
         var = dr(((x - mean[:, None]) ** 2).sum(axis=-1), H)
-        rstd = rsqrt[dr(var, 1 << (2 * s - 14))][:, None]
+        rstd = rsqrt[dr(var, 1 << (2 * s - index_bits))][:, None]
         return rs((x - mean[:, None]) * rstd * w, 2 * s) + b
 
     def attention(x, qkv_w, qkv_b, o_w, o_b):
@@ -117,7 +117,7 @@ def run(s):
     ts = inp.reshape(SEQ, 32)
     refq = q(ts[0])
     mean = dr(refq.sum(), 32)
-    rstd = int(rsqrt[dr(dr(((refq - mean) ** 2).sum(), 32), 1 << (2 * s - 14))])
+    rstd = int(rsqrt[dr(dr(((refq - mean) ** 2).sum(), 32), 1 << (2 * s - index_bits))])
     norm = rs((q(ts) - mean) * rstd, s)
     cat = np.concatenate([norm, np.zeros((SEQ, 32), dtype=np.int64)], axis=1)
     hid = rs(cat @ q(inits["val_50"]), s) + q(inits["input_ff_layer.hidden_layer.0.bias"])
@@ -151,6 +151,8 @@ def run(s):
         gate = rs(ln @ g_w, s) + g_b
         relu = np.maximum(gate, 0)
         x = x + rs(relu @ d_w, s) + d_b
+        if L == 0:
+            print(f"  [s={s}] L0 x residual magnitude:", int(np.abs(x).max()), "lsb")
 
     hid = rs(x @ q(inits["val_837"]), s) + q(inits["horizon_ff_layer.hidden_layer.0.bias"])
     silu = silu_t[np.clip(hid + silu_off, 0, len(silu_t) - 1)]
@@ -162,6 +164,6 @@ def run(s):
 
 
 if __name__ == "__main__":
-    for s in (16, 18, 20):
-        err = run(s)
-        print(f"scale 2^{s}: final max err = {err:.4e}")
+    for s, ib in ((16, 14), (18, 14), (18, 16), (18, 18)):
+        err = run(s, ib)
+        print(f"scale 2^{s} (rsqrt index 2^{ib}): final max err = {err:.4e}")
