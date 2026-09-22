@@ -105,13 +105,13 @@ fn main() {
     let c_lin2 = commit(&whir9, &linear_2);
     assert!(prove_affine(&whir9, &c_resraw, &whir9, &c_lin2, &pro_res_b, 16, false));
     let c_add = commit(&whir9, &add);
-    assert!(prove_add(&whir9, &c_lin1, &whir9, &c_lin2, &whir9, &c_add, 512));
+    assert!(prove_add(&whir9, &c_lin1, &whir9, &c_lin2, &whir9, &c_add, 512, &mut rng));
     let c_gather = commit(&whir9, &gather);
     let c_add1 = commit(&whir9, &add_1);
-    assert!(prove_add(&whir9, &c_add, &whir9, &c_gather, &whir9, &c_add1, 512));
+    assert!(prove_add(&whir9, &c_add, &whir9, &c_gather, &whir9, &c_add1, 512, &mut rng));
     let c_emb = commit(&whir9, &embedding);
     let c_add2 = commit(&whir9, &add_2);
-    assert!(prove_add(&whir9, &c_add1, &whir9, &c_emb, &whir9, &c_add2, 512));
+    assert!(prove_add(&whir9, &c_add1, &whir9, &c_emb, &whir9, &c_add2, 512, &mut rng));
 
     let mut x = add_2;
 
@@ -153,7 +153,7 @@ fn main() {
         let c_lin4 = commit(&whir9, &lin4);
         assert!(prove_affine(&whir9, &c_opraw, &whir9, &c_lin4, &op_b, 16, false));
         let c_add5 = commit(&whir9, &add5);
-        assert!(prove_add(&whir9, &c_x, &whir9, &c_lin4, &whir9, &c_add5, 512));
+        assert!(prove_add(&whir9, &c_x, &whir9, &c_lin4, &whir9, &c_add5, 512, &mut rng));
 
         // FFN half: LayerNorm -> gate -> ReLU -> down -> residual.
         let (ln_raw, _, _, _) = layer_norm_raw(&add5, &mlp_w, N_REAL, &rsqrt_table);
@@ -179,7 +179,7 @@ fn main() {
         let c_ffnout = commit(&whir9, &ffn_out);
         assert!(prove_affine(&whir9, &c_downraw, &whir9, &c_ffnout, &down_b, 16, false));
         let c_next = commit(&whir9, &next_x);
-        assert!(prove_add(&whir9, &c_add5, &whir9, &c_ffnout, &whir9, &c_next, 512));
+        assert!(prove_add(&whir9, &c_add5, &whir9, &c_ffnout, &whir9, &c_next, 512, &mut rng));
 
         x = next_x;
         println!("layer {li} block verified");
@@ -229,7 +229,7 @@ fn main() {
     let c_lin33 = commit(&whir11, &lin33);
     assert!(prove_affine(&whir11, &c_resraw, &whir11, &c_lin33, &res_b, 16, false));
     let c_add31 = commit(&whir11, &add31);
-    assert!(prove_add(&whir11, &c_lin32, &whir11, &c_lin33, &whir11, &c_add31, 2048));
+    assert!(prove_add(&whir11, &c_lin32, &whir11, &c_lin33, &whir11, &c_add31, 2048, &mut rng));
     let c_out = commit(&whir11, &output_ts);
     assert!(prove_scale(&whir11, &c_add31, &whir11, &c_out, scale_q, &bias_bcast));
 

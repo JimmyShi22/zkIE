@@ -485,10 +485,12 @@ pub fn prove_relu(
     prove_affine(whir_in, input, whir_out, output, bias, 16, true)
 }
 
-/// Prove the element-wise field addition `c = a + b` against WHIR commitments,
-/// in the O(N)-opening PoC form. Used for bias additions and residual
-/// connections once the intermediate tensors are chained: both operands are
-/// committed, and the verifier recomputes the sum at every hypercube point.
+/// Prove the element-wise field addition `c = a + b` against WHIR commitments
+/// with a single random-point opening. Because `a`, `b`, `c` are multilinear
+/// extensions and `c(x) = a(x) + b(x)` as polynomials iff `c_i = a_i + b_i` at
+/// every hypercube point, checking `c(r) = a(r) + b(r)` at one random `r` is
+/// sound by Schwartz–Zippel (error ~ n / |F|). This replaces the O(N)-opening
+/// PoC with a sub-linear check — the same shape `prove_matmul` uses.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_add(
     whir_a: &Whir,
@@ -498,29 +500,17 @@ pub fn prove_add(
     whir_c: &Whir,
     c: &Committed,
     n: usize,
+    rng: &mut XorShift64,
 ) -> bool {
     let d = n.trailing_zeros() as usize;
-    for i in 0..n {
-        let point: Vec<Goldilocks> = (0..d)
-            .map(|b| Goldilocks::from_bool((i >> b) & 1 == 1))
-            .collect();
-        let (a_open, av) = whir_a.open(a.prover_data.clone(), &a.protocol, &point);
-        let (b_open, bv) = whir_b.open(b.prover_data.clone(), &b.protocol, &point);
-        let (c_open, cv) = whir_c.open(c.prover_data.clone(), &c.protocol, &point);
-        if whir_a.verify(&a.commitment, &a_open, &a.protocol, &point).unwrap() != av {
-            return false;
-        }
-        if whir_b.verify(&b.commitment, &b_open, &b.protocol, &point).unwrap() != bv {
-            return false;
-        }
-        if whir_c.verify(&c.commitment, &c_open, &c.protocol, &point).unwrap() != cv {
-            return false;
-        }
-        if cv != av + bv {
-            return false;
-        }
-    }
-    true
+    let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let (a_open, av) = whir_a.open(a.prover_data.clone(), &a.protocol, &r);
+    let (b_open, bv) = whir_b.open(b.prover_data.clone(), &b.protocol, &r);
+    let (c_open, cv) = whir_c.open(c.prover_data.clone(), &c.protocol, &r);
+    let a_ok = whir_a.verify(&a.commitment, &a_open, &a.protocol, &r).unwrap() == av;
+    let b_ok = whir_b.verify(&b.commitment, &b_open, &b.protocol, &r).unwrap() == bv;
+    let c_ok = whir_c.verify(&c.commitment, &c_open, &c.protocol, &r).unwrap() == cv;
+    a_ok && b_ok && c_ok && cv == av + bv
 }
 
 #[cfg(test)]
@@ -785,11 +775,11 @@ mod tests {
         let ca = commit(&whir, &a);
         let cb = commit(&whir, &b);
         let cc = commit(&whir, &c);
-        assert!(prove_add(&whir, &ca, &whir, &cb, &whir, &cc, n));
+        assert!(prove_add(&whir, &ca, &whir, &cb, &whir, &cc, n, &mut rng));
 
         let mut bad = c.clone();
         bad[0] += Goldilocks::ONE;
         let c_bad = commit(&whir, &bad);
-        assert!(!prove_add(&whir, &ca, &whir, &cb, &whir, &c_bad, n));
+        assert!(!prove_add(&whir, &ca, &whir, &cb, &whir, &c_bad, n, &mut rng));
     }
 }
