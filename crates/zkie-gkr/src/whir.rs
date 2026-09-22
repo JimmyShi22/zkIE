@@ -11,7 +11,7 @@ use p3_challenger::DuplexChallenger;
 use p3_commit::MultilinearPcs;
 use p3_dft::Radix2DFTSmallBatch;
 use p3_field::extension::BinomialExtensionField;
-use p3_field::Field;
+use p3_field::{ExtensionField, Field};
 use p3_goldilocks::{Goldilocks, Poseidon2Goldilocks};
 use p3_matrix::dense::RowMajorMatrix;
 use p3_merkle_tree::MerkleTreeMmcs;
@@ -136,7 +136,7 @@ impl Whir {
         prover_data: ProverData,
         protocol: &OpeningProtocol,
         point: &[Goldilocks],
-    ) -> (Proof, EF) {
+    ) -> (Proof, Goldilocks) {
         let ef_point = to_ef_point(point);
         let proof = self.pcs.open_at(
             prover_data,
@@ -145,7 +145,7 @@ impl Whir {
             &mut self.fresh_challenger(),
         );
         let opened = proof.evals[0].current()[0];
-        (proof, opened)
+        (proof, opened.as_base().expect("base-field MLE opens to a base element"))
     }
 
     /// Verify the opening proof at `point` and return the opened evaluation.
@@ -155,7 +155,7 @@ impl Whir {
         proof: &Proof,
         protocol: &OpeningProtocol,
         point: &[Goldilocks],
-    ) -> Result<EF, <MyPcs as MultilinearPcs<EF, MyChallenger>>::Error> {
+    ) -> Result<Goldilocks, <MyPcs as MultilinearPcs<EF, MyChallenger>>::Error> {
         let ef_point = to_ef_point(point);
         let evals = self.pcs.verify_at(
             commitment,
@@ -164,7 +164,7 @@ impl Whir {
             std::slice::from_ref(&ef_point),
             &mut self.fresh_challenger(),
         )?;
-        Ok(evals[0].current()[0])
+        Ok(evals[0].current()[0].as_base().expect("base-field MLE opens to a base element"))
     }
 }
 
@@ -196,6 +196,6 @@ mod tests {
         let verified = whir.verify(&commitment, &proof, &protocol, &point).unwrap();
 
         assert_eq!(opened, verified);
-        assert_eq!(verified, EF::from(mle::eval(&evals, &point)));
+        assert_eq!(verified, mle::eval(&evals, &point));
     }
 }
