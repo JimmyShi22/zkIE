@@ -1,7 +1,7 @@
 //! Prove the complete FFN tail (LayerNorm -> gate -> ReLU -> down) from WHIR
 //! commitments: the norm's raw product plus the two matmuls, using real data.
 
-use zkie_gkr::committed::{commit, prove_layer_norm, prove_matmul};
+use zkie_gkr::committed::{commit, layer_norm_raw, prove_layer_norm, prove_matmul};
 use zkie_gkr::field::{Goldilocks, PrimeCharacteristicRing, XorShift64};
 use zkie_gkr::fixed_point::from_i32;
 use zkie_gkr::whir::Whir;
@@ -35,8 +35,8 @@ fn main() {
 
     let add5 = load_i32(&format!("{m}norm_in.bin"));
     let ln_w = load_i32(&format!("{m}norm_w.bin"));
-    let scalars = load_i32(&format!("{m}norm_scalars_i32.bin"));
-    let (mean, rstd) = (scalars[0], scalars[1]);
+    let rsqrt_table = load_i32(&format!("{m}rsqrt_table_i32.bin"));
+    const N_REAL: usize = 264;
     let lnout = load_i32(&format!("{a}layer_norm_512_i32.bin"));
     let gate = load_i32(&format!("{w}val_126_512x1024_i32.bin"));
     let down = load_i32(&format!("{w}val_128_1024x512_i32.bin"));
@@ -48,15 +48,24 @@ fn main() {
     let whir10 = Whir::new_testing(10);
     let whir19 = Whir::new_testing(19);
 
-    // Norm raw product: raw[i] = (add5[i] - mean) * rstd * ln_w[i]  (scale 2^48).
-    let raw: Vec<Goldilocks> = add5
-        .iter()
-        .zip(&ln_w)
-        .map(|(&x, &w)| (x - mean) * rstd * w)
-        .collect();
+    // Norm raw product: raw[i] = (add5[i] - mean) * rstd * ln_w[i]  (scale 2^48),
+    // with mean derived from x and rstd bound by an rsqrt lookup.
+    let (raw, _mean, _rstd, _s_index) = layer_norm_raw(&add5, &ln_w, N_REAL, &rsqrt_table);
     let c_add5 = commit(&whir9, &add5);
     let c_raw = commit(&whir9, &raw);
-    assert!(prove_layer_norm(&whir9, &c_add5, &whir9, &c_raw, mean, rstd, &ln_w));
+    let alpha = rng.field();
+    let beta = rng.field();
+    assert!(prove_layer_norm(
+        &whir9,
+        &c_add5,
+        &whir9,
+        &c_raw,
+        &ln_w,
+        N_REAL,
+        &rsqrt_table,
+        alpha,
+        beta,
+    ));
 
     // gate: layer_norm @ gate = val_127 (raw 2^32).
     let v127_raw = dense(&lnout, &gate, 512, 1024);

@@ -1,7 +1,7 @@
 //! Prove the complete TimesFM 8M: 7 layers, each with a LayerNorm and four
 //! weight matmuls, all bound to WHIR commitments using real quantized data.
 
-use zkie_gkr::committed::{commit, prove_layer_norm, prove_matmul};
+use zkie_gkr::committed::{commit, layer_norm_raw, prove_layer_norm, prove_matmul};
 use zkie_gkr::field::{Goldilocks, PrimeCharacteristicRing, XorShift64};
 use zkie_gkr::fixed_point::from_i32;
 use zkie_gkr::whir::Whir;
@@ -14,16 +14,6 @@ fn load_i32(path: &str) -> Vec<Goldilocks> {
         out.push(from_i32(v));
     }
     out
-}
-
-fn load_scalars(path: &str) -> (Goldilocks, Goldilocks) {
-    let bytes = std::fs::read(path).unwrap();
-    let mean = f64::from_le_bytes(bytes[0..8].try_into().unwrap());
-    let rstd = f64::from_le_bytes(bytes[8..16].try_into().unwrap());
-    (
-        from_i32((mean * 65536.0).round() as i32),
-        from_i32((rstd * 65536.0).round() as i32),
-    )
 }
 
 fn dense(a: &[Goldilocks], b: &[Goldilocks], k: usize, n: usize) -> Vec<Goldilocks> {
@@ -54,6 +44,10 @@ fn main() {
     const KEYS: [&str; 4] = ["qkv", "o_proj", "gate", "down"];
 
     let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/");
+    // rsqrt lookup table: index at scale 2^14, rstd at scale 2^16.
+    let rsqrt_table = load_i32(&format!("{base}rsqrt_table_i32.bin"));
+    // TimesFM hidden dim is 264, padded to 512 for the WHIR power-of-two length.
+    const N_REAL: usize = 264;
     let mut rng = XorShift64::new(0x7ee);
     let whir9 = Whir::new_testing(9);
     let whir10 = Whir::new_testing(10);
@@ -61,14 +55,26 @@ fn main() {
     let whir19 = Whir::new_testing(19);
 
     for (li, layer) in WEIGHTS.iter().enumerate() {
-        // LayerNorm: raw = (x - mean) * rstd * w.
+        // LayerNorm: mean is derived from committed x, rstd is bound to var+eps
+        // by an rsqrt lookup (not a trusted scalar).
         let x = load_i32(&format!("{base}norms/L{li}_in.bin"));
         let nw = load_i32(&format!("{base}norms/L{li}_w.bin"));
-        let (mean, rstd) = load_scalars(&format!("{base}norms/L{li}_scalars_f64.bin"));
-        let raw: Vec<Goldilocks> = x.iter().zip(&nw).map(|(&xv, &w)| (xv - mean) * rstd * w).collect();
+        let (raw, _mean, _rstd, _s_index) = layer_norm_raw(&x, &nw, N_REAL, &rsqrt_table);
         let cx = commit(&whir9, &x);
         let c_raw = commit(&whir9, &raw);
-        assert!(prove_layer_norm(&whir9, &cx, &whir9, &c_raw, mean, rstd, &nw));
+        let alpha = rng.field();
+        let beta = rng.field();
+        assert!(prove_layer_norm(
+            &whir9,
+            &cx,
+            &whir9,
+            &c_raw,
+            &nw,
+            N_REAL,
+            &rsqrt_table,
+            alpha,
+            beta,
+        ));
 
         // Four weight matmuls.
         for (mi, key) in KEYS.iter().enumerate() {
