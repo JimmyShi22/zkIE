@@ -93,7 +93,7 @@ fn main() {
     let idx_field: Vec<Goldilocks> = silu_idx.iter().map(|&i| from_i32(i as i32)).collect();
     let c_idx = commit(&whir10, &idx_field);
     let c_silu = commit(&whir10, &silu);
-    assert!(prove_lookup(&whir10, &c_idx, &whir10, &c_silu, &silu_idx, &silu_table, rng.field(), rng.field()));
+    assert!(prove_lookup(&whir10, &c_idx, &idx_field, &whir10, &c_silu, &silu, &silu_idx, &silu_table, rng.field(), rng.field(), &mut rng));
     let c_outw = commit(&whir19, &pro_out_w);
     let c_outraw = commit(&whir9, &out_raw);
     assert!(prove_matmul(&whir10, &c_silu, &whir19, &c_outw, &whir9, &c_outraw, &silu, &pro_out_w, &out_raw, 1024, 512, &mut rng));
@@ -217,7 +217,7 @@ fn main() {
     let idx_field: Vec<Goldilocks> = silu_idx.iter().map(|&i| from_i32(i as i32)).collect();
     let c_idx = commit(&whir10, &idx_field);
     let c_silu = commit(&whir10, &silu1);
-    assert!(prove_lookup(&whir10, &c_idx, &whir10, &c_silu, &silu_idx, &silu_table, rng.field(), rng.field()));
+    assert!(prove_lookup(&whir10, &c_idx, &idx_field, &whir10, &c_silu, &silu1, &silu_idx, &silu_table, rng.field(), rng.field(), &mut rng));
     let c_outw = commit(&whir21, &out_w);
     let c_outraw = commit(&whir11, &out_raw);
     assert!(prove_matmul(&whir10, &c_silu, &whir21, &c_outw, &whir11, &c_outraw, &silu1, &out_w, &out_raw, 1024, 2048, &mut rng));

@@ -68,47 +68,130 @@ pub fn prove_matmul(
 /// O(N)-opening PoC form: open the committed index and output columns at every
 /// hypercube point and recompute the LogUp left-hand side from those bound
 /// values. `x` holds the indices embedded as field values, `y` the outputs.
+/// Prove `prod_i a_i = c` for a committed `a` of length `2^n` via the grand
+/// product argument: normalize `a'` so `prod a' = 1`, then prove the cyclic
+/// running-product recurrence `r(σ(i)) = r(i) a'(i)` by checking, at a random
+/// challenge, `sum eq r a' == sum r eq_shift` (both sides are the MLE of
+/// `r ⊙ a'` and `r ∘ σ` evaluated at the challenge). `eq_shift` is the public
+/// shifted equality polynomial `eq(x-1 mod N, chal)`.
+fn prove_product(
+    whir: &Whir,
+    a_plain: &[Goldilocks],
+    c: Goldilocks,
+    rng: &mut XorShift64,
+) -> bool {
+    let n = a_plain.len();
+    let d = n.trailing_zeros() as usize;
+
+    // a' = a with the last entry divided by c, so prod a' = 1.
+    let mut a_norm = a_plain.to_vec();
+    a_norm[n - 1] = a_norm[n - 1] * c.inverse();
+    // running product r_i = prod_{j < i} a'_j.
+    let mut r = vec![Goldilocks::ONE; n];
+    for i in 1..n {
+        r[i] = r[i - 1] * a_norm[i - 1];
+    }
+
+    let c_a = commit(whir, &a_norm);
+    let c_r = commit(whir, &r);
+    let chal: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let eq = mle::eq_evals(&chal);
+    // eq_shift[i] = eq(x = (i-1) mod n, chal).
+    let eq_shift: Vec<Goldilocks> = (0..n)
+        .map(|i| {
+            let pred = (i + n - 1) % n;
+            (0..d).fold(Goldilocks::ONE, |acc, k| {
+                let bit = if (pred >> k) & 1 == 1 { Goldilocks::ONE } else { Goldilocks::ZERO };
+                acc * (bit * chal[k] + (Goldilocks::ONE - bit) * (Goldilocks::ONE - chal[k]))
+            })
+        })
+        .collect();
+
+    let c1: Goldilocks = eq.iter().zip(&r).zip(&a_norm).fold(Goldilocks::ZERO, |acc, ((&e, &ri), &ai)| acc + e * ri * ai);
+    let c2: Goldilocks = r.iter().zip(&eq_shift).fold(Goldilocks::ZERO, |acc, (&ri, &ei)| acc + ri * ei);
+    let proof1 = sumcheck::prove3(&eq, &r, &a_norm, c1, &chal);
+    let proof2 = sumcheck::prove(&r, &eq_shift, c2, &chal);
+
+    let (a_open, a_chal) = whir.open(c_a.prover_data.clone(), &c_a.protocol, &chal);
+    let (r_open, r_chal) = whir.open(c_r.prover_data.clone(), &c_r.protocol, &chal);
+    if whir.verify(&c_a.commitment, &a_open, &c_a.protocol, &chal).unwrap() != a_chal {
+        return false;
+    }
+    if whir.verify(&c_r.commitment, &r_open, &c_r.protocol, &chal).unwrap() != r_chal {
+        return false;
+    }
+    let eq_r = mle::eval(&eq, &chal);
+    let eq_shift_r = mle::eval(&eq_shift, &chal);
+    if !sumcheck::verify3(&proof1, c1, &chal, eq_r, r_chal, a_chal)
+        || !sumcheck::verify(&proof2, c2, &chal, r_chal, eq_shift_r)
+        || c1 != c2
+    {
+        return false;
+    }
+    // r_0 = 1.
+    let zero_point = vec![Goldilocks::ZERO; d];
+    let (r0_open, r0) = whir.open(c_r.prover_data.clone(), &c_r.protocol, &zero_point);
+    whir.verify(&c_r.commitment, &r0_open, &c_r.protocol, &zero_point).unwrap() == r0 && r0 == Goldilocks::ONE
+}
+
+/// Prove `y_i == table[x_i]` for every `i` sub-linearly: commit the keys
+/// `a_i = alpha + x_i + beta y_i`, bind them to the committed `x`/`y` by a
+/// single-point check, then prove `prod_i a_i` equals the public table product
+/// `prod_j (alpha + j + beta table[j])^{m_j}` via [`prove_product`]. This is the
+/// grand-product form of the LogUp lookup argument.
+#[allow(clippy::too_many_arguments)]
 pub fn prove_lookup(
     whir_x: &Whir,
     x: &Committed,
+    x_plain: &[Goldilocks],
     whir_y: &Whir,
     y: &Committed,
+    y_plain: &[Goldilocks],
     indices: &[u32],
     table: &[Goldilocks],
     alpha: Goldilocks,
     beta: Goldilocks,
+    rng: &mut XorShift64,
 ) -> bool {
     let n = indices.len();
     let d = n.trailing_zeros() as usize;
-    let mut lhs = Goldilocks::ZERO;
-    for i in 0..n {
-        let point: Vec<Goldilocks> = (0..d)
-            .map(|b| Goldilocks::from_bool((i >> b) & 1 == 1))
-            .collect();
-        let (x_open, xv) = whir_x.open(x.prover_data.clone(), &x.protocol, &point);
-        let (y_open, yv) = whir_y.open(y.prover_data.clone(), &y.protocol, &point);
-        if whir_x.verify(&x.commitment, &x_open, &x.protocol, &point).unwrap() != xv {
-            return false;
+    let a_plain: Vec<Goldilocks> = x_plain
+        .iter()
+        .zip(y_plain)
+        .map(|(&xv, &yv)| alpha + xv + beta * yv)
+        .collect();
+    let c_a = commit(whir_x, &a_plain);
+
+    // Public table product with multiplicities.
+    let mut m = vec![0u64; table.len()];
+    for &i in indices {
+        m[i as usize] += 1;
+    }
+    let mut b = Goldilocks::ONE;
+    for (j, &t) in table.iter().enumerate() {
+        let tkey = Goldilocks::from_u64(j as u64) + beta * t;
+        let factor = alpha + tkey;
+        for _ in 0..m[j] {
+            b = b * factor;
         }
-        if whir_y.verify(&y.commitment, &y_open, &y.protocol, &point).unwrap() != yv {
-            return false;
-        }
-        let key = xv + beta * yv;
-        lhs = lhs + (alpha + key).inverse();
     }
 
-    let mut m = vec![Goldilocks::ZERO; table.len()];
-    for &i in indices {
-        m[i as usize] = m[i as usize] + Goldilocks::ONE;
+    // Bind a to the committed x, y at one random point.
+    let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let (x_open, xr) = whir_x.open(x.prover_data.clone(), &x.protocol, &r);
+    let (y_open, yr) = whir_y.open(y.prover_data.clone(), &y.protocol, &r);
+    let (a_open, ar) = whir_x.open(c_a.prover_data.clone(), &c_a.protocol, &r);
+    if whir_x.verify(&x.commitment, &x_open, &x.protocol, &r).unwrap() != xr
+        || whir_y.verify(&y.commitment, &y_open, &y.protocol, &r).unwrap() != yr
+        || whir_x.verify(&c_a.commitment, &a_open, &c_a.protocol, &r).unwrap() != ar
+    {
+        return false;
     }
-    let rhs = table
-        .iter()
-        .enumerate()
-        .fold(Goldilocks::ZERO, |acc, (j, &t)| {
-            let tkey = Goldilocks::from_u64(j as u64) + beta * t;
-            acc + m[j] * (alpha + tkey).inverse()
-        });
-    lhs == rhs
+    if ar != alpha + xr + beta * yr {
+        return false;
+    }
+
+    prove_product(whir_x, &a_plain, b, rng)
 }
 
 /// Round `a / b` to the nearest integer, ties toward +inf (round half up), for
@@ -766,7 +849,7 @@ mod tests {
         let cy = commit(&whir, &outputs);
         let alpha = rng.field();
         let beta = rng.field();
-        assert!(prove_lookup(&whir, &cx, &whir, &cy, &indices, &table, alpha, beta));
+        assert!(prove_lookup(&whir, &cx, &idx_vals, &whir, &cy, &outputs, &indices, &table, alpha, beta, &mut rng));
     }
 
     #[test]
@@ -873,12 +956,12 @@ mod tests {
         let c_out = commit(&whir, &outputs);
         let alpha = rng.field();
         let beta = rng.field();
-        assert!(prove_lookup(&whir, &c_idx, &whir, &c_out, &indices, &table, alpha, beta));
+        assert!(prove_lookup(&whir, &c_idx, &idx_field, &whir, &c_out, &outputs, &indices, &table, alpha, beta, &mut rng));
 
         let mut bad = outputs.clone();
         bad[0] += Goldilocks::ONE;
         let c_bad = commit(&whir, &bad);
-        assert!(!prove_lookup(&whir, &c_idx, &whir, &c_bad, &indices, &table, alpha, beta));
+        assert!(!prove_lookup(&whir, &c_idx, &idx_field, &whir, &c_bad, &bad, &indices, &table, alpha, beta, &mut rng));
     }
 
     #[test]
