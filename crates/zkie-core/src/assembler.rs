@@ -94,19 +94,14 @@ use std::fmt;
 
 use crate::chips::dot_general::{DotProductChip, DotProductConfig};
 use crate::chips::eltwise::{EltwiseAddChip, EltwiseAddConfig, EltwiseMulChip, EltwiseMulConfig};
-use crate::chips::layer_norm::{
-    assign_add_row_with_witnesses, assign_mul_row_with_witnesses, RsqrtDomain,
-};
-use crate::chips::lookup_range_check::LookupRangeCheckChip;
+use crate::chips::layer_norm::{assign_add_row, assign_mul_row, RsqrtDomain};
 use crate::chips::range_check::RangeCheckChip;
 use crate::chips::rms_norm::{RmsNormChip, RmsNormConfig, RmsNormError};
 use crate::field_convert::{i128_to_fr, i64_to_fr, shifted_i64_witness, Fr, SIGNED_SHIFT};
 use crate::fixed_point::{requantize_mul, requantize_raw, FixedPointError, I18, SCALE_18};
 use crate::isa::{EltwiseOp, Instruction};
 use halo2_proofs::circuit::{AssignedCell, Layouter, Value};
-use halo2_proofs::plonk::{
-    Advice, Column, ConstraintSystem, ErrorFront, Expression, Instance, Selector,
-};
+use halo2_proofs::plonk::{Advice, Column, ConstraintSystem, ErrorFront, Expression, Selector};
 use halo2_proofs::poly::Rotation;
 
 /// Identifies where an [`AssemblerInstruction`]'s input value comes from --
@@ -128,7 +123,7 @@ pub enum RegisterRef {
 /// The instruction's own program-order index (implicit -- its position in
 /// [`AssemblerProgram::instructions`]) is what later instructions reference
 /// via `RegisterRef::Virtual`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct AssemblerInstruction {
     pub instruction: Instruction,
     pub inputs: Vec<RegisterRef>,
@@ -139,7 +134,7 @@ pub struct AssemblerInstruction {
 /// element weights/inputs (e.g. a whole weight matrix) are represented as a
 /// single flat vector, with `Instruction`-specific shape parameters (e.g.
 /// `DotGeneral`'s `m`/`n`/`k`) determining how the assembler indexes into it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct AssemblerProgram {
     pub instructions: Vec<AssemblerInstruction>,
     pub input_values: Vec<Vec<I18>>,
@@ -280,24 +275,6 @@ struct RegisterCells {
     cells: Vec<AssignedCell<Fr, Fr>>,
 }
 
-/// A tensor together with the canonical cells that carry its constrained
-/// values. The cells are deliberately the assembler's register cells, rather
-/// than newly witnessed copies, so callers can safely extend the circuit.
-#[derive(Clone)]
-pub struct AssignedTensor {
-    pub values: Vec<I18>,
-    pub cells: Vec<AssignedCell<Fr, Fr>>,
-}
-
-/// The concrete circuit boundary and virtual registers created while
-/// assigning an [`AssemblerProgram`].
-#[derive(Clone)]
-pub struct AssignedProgram {
-    pub inputs: Vec<AssignedTensor>,
-    pub weights: Vec<AssignedTensor>,
-    pub virtuals: Vec<AssignedTensor>,
-}
-
 /// Configuration for an [`AssemblerChip`]: one [`DotProductConfig`] per
 /// distinct `k` seen among the program's `DotGeneral` instructions (mirroring
 /// how `PatchEmbedChip`/`SoftmaxChip` reuse one configured chip across many
@@ -325,7 +302,6 @@ pub struct AssemblerConfig {
     bridge_unshifted: Column<Advice>,
     bridge_shifted: Column<Advice>,
     s_bridge: Selector,
-    pub(crate) public_instance: Option<Column<Instance>>,
 }
 
 /// Default `rsqrt` lookup domain used by [`AssemblerChip::configure`] (which
@@ -378,23 +354,6 @@ impl AssemblerChip {
         meta: &mut ConstraintSystem<Fr>,
         instructions: &[AssemblerInstruction],
         rms_norm_domains: &HashMap<(usize, u64), RsqrtDomain>,
-    ) -> AssemblerConfig {
-        Self::configure_internal(meta, instructions, rms_norm_domains, false)
-    }
-
-    pub fn configure_with_rms_norm_domains_and_public_instances(
-        meta: &mut ConstraintSystem<Fr>,
-        instructions: &[AssemblerInstruction],
-        rms_norm_domains: &HashMap<(usize, u64), RsqrtDomain>,
-    ) -> AssemblerConfig {
-        Self::configure_internal(meta, instructions, rms_norm_domains, true)
-    }
-
-    fn configure_internal(
-        meta: &mut ConstraintSystem<Fr>,
-        instructions: &[AssemblerInstruction],
-        rms_norm_domains: &HashMap<(usize, u64), RsqrtDomain>,
-        expose_public_instances: bool,
     ) -> AssemblerConfig {
         // Shared `bits` column across every composed chip's internal range
         // checks -- safe because `RangeCheckChip::configure` creates a fresh,
@@ -519,11 +478,6 @@ impl AssemblerChip {
         let bridge_shifted = meta.advice_column();
         meta.enable_equality(bridge_unshifted);
         meta.enable_equality(bridge_shifted);
-        let public_instance = expose_public_instances.then(|| {
-            let instance = meta.instance_column();
-            meta.enable_equality(instance);
-            instance
-        });
 
         // shifted == unshifted + SIGNED_SHIFT. Reused (like `RangeCheckChip`'s
         // columns) across every register boundary that needs bridging -- see
@@ -546,7 +500,6 @@ impl AssemblerChip {
             bridge_unshifted,
             bridge_shifted,
             s_bridge,
-            public_instance,
         }
     }
 
@@ -554,24 +507,13 @@ impl AssemblerChip {
         AssemblerChip { config }
     }
 
-    /// Loads the byte tables backing every configured dot product's and the
-    /// multiply's operand range checks. Unlike
-    /// [`AssemblerChip::load_rms_norm_tables`] this is unconditional: the
-    /// dot and multiply configs exist for every program.
-    fn load_range_tables(&self, mut layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
-        for (k, cfg) in self.config.dot.iter() {
-            DotProductChip::construct(cfg.clone()).load_range_table(
-                layouter.namespace(|| format!("assembler dot range table {k}")),
-            )?;
-        }
-        crate::chips::eltwise::load_mul_operand_range_table(
-            &self.config.mul,
-            layouter.namespace(|| "assembler mul range tables"),
-        )
-    }
-
-    /// Loads RMSNorm fixed tables once for this synthesis. Operand range
-    /// tables are instead owned by [`Self::assign_with_cells`].
+    /// Must be called exactly once per circuit synthesis if `program`
+    /// contains any `RmsNorm` instruction (loads every distinct configured
+    /// `RmsNormConfig`'s `rsqrt` lookup table) -- mirroring
+    /// `RmsNormChip::load_table`'s own one-per-synthesis requirement.
+    /// Distinct from [`AssemblerChip::assign`] (rather than folded into it)
+    /// so callers whose program has no `RmsNorm` instruction pay no extra
+    /// cost and need not call this at all.
     pub fn load_rms_norm_tables(&self, mut layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
         for (key, cfg) in self.config.rms_norm.iter() {
             let chip = RmsNormChip::construct(cfg.clone());
@@ -590,44 +532,14 @@ impl AssemblerChip {
     /// callers to compare against an independently computed expected result.
     pub fn assign(
         &self,
-        layouter: impl Layouter<Fr>,
-        program: &AssemblerProgram,
-    ) -> Result<Vec<Vec<I18>>, AssemblerError> {
-        Ok(self
-            .assign_with_cells(layouter, program)?
-            .virtuals
-            .into_iter()
-            .map(|tensor| tensor.values)
-            .collect())
-    }
-
-    /// Like [`Self::assign`], but also returns each input, weight, and virtual
-    /// register's canonical constrained cells. No value is re-witnessed for
-    /// this API: these are the exact cells linked to downstream instructions.
-    /// It initializes operand range tables for this assignment lifecycle.
-    pub fn assign_with_cells(
-        &self,
-        layouter: impl Layouter<Fr>,
-        program: &AssemblerProgram,
-    ) -> Result<AssignedProgram, AssemblerError> {
-        self.assign_with_cells_with_witnesses(layouter, program, true)
-    }
-
-    /// Assigns the exact same regions and constraints as [`Self::assign_with_cells`],
-    /// optionally leaving every advice witness unknown for key generation.
-    pub(crate) fn assign_with_cells_with_witnesses(
-        &self,
         mut layouter: impl Layouter<Fr>,
         program: &AssemblerProgram,
-        witnesses_known: bool,
-    ) -> Result<AssignedProgram, AssemblerError> {
-        self.load_range_tables(layouter.namespace(|| "assembler operand range tables"))?;
+    ) -> Result<Vec<Vec<I18>>, AssemblerError> {
         let mut input_regs = Vec::with_capacity(program.input_values.len());
         for (idx, tensor) in program.input_values.iter().enumerate() {
             let cells = self.assign_boundary(
                 layouter.namespace(|| format!("assembler input {idx}")),
                 tensor,
-                witnesses_known,
             )?;
             input_regs.push(RegisterCells {
                 values: tensor.clone(),
@@ -640,7 +552,6 @@ impl AssemblerChip {
             let cells = self.assign_boundary(
                 layouter.namespace(|| format!("assembler weight {idx}")),
                 tensor,
-                witnesses_known,
             )?;
             weight_regs.push(RegisterCells {
                 values: tensor.clone(),
@@ -671,7 +582,6 @@ impl AssemblerChip {
                     batch_dims,
                     *trans_a,
                     *trans_b,
-                    witnesses_known,
                 )?,
                 Instruction::Eltwise {
                     op: op @ (EltwiseOp::Add | EltwiseOp::Mul),
@@ -682,7 +592,6 @@ impl AssemblerChip {
                     &weight_regs,
                     &virtual_regs,
                     op,
-                    witnesses_known,
                 )?,
                 Instruction::RmsNorm { dim, epsilon_milli } => self.assign_rms_norm(
                     layouter.namespace(|| format!("assembler instr {idx} rms_norm")),
@@ -692,29 +601,19 @@ impl AssemblerChip {
                     &virtual_regs,
                     *dim,
                     *epsilon_milli,
-                    witnesses_known,
                 )?,
                 other => return Err(AssemblerError::UnsupportedInstruction(format!("{other:?}"))),
             };
             virtual_regs.push(out);
         }
 
-        let into_tensor = |register: RegisterCells| AssignedTensor {
-            values: register.values,
-            cells: register.cells,
-        };
-        Ok(AssignedProgram {
-            inputs: input_regs.into_iter().map(into_tensor).collect(),
-            weights: weight_regs.into_iter().map(into_tensor).collect(),
-            virtuals: virtual_regs.into_iter().map(into_tensor).collect(),
-        })
+        Ok(virtual_regs.into_iter().map(|r| r.values).collect())
     }
 
     fn assign_boundary(
         &self,
         mut layouter: impl Layouter<Fr>,
         tensor: &[I18],
-        witnesses_known: bool,
     ) -> Result<Vec<AssignedCell<Fr, Fr>>, ErrorFront> {
         layouter.assign_region(
             || "assembler boundary",
@@ -727,7 +626,7 @@ impl AssemblerChip {
                             || format!("boundary {row}"),
                             self.config.boundary,
                             row,
-                            || known_or_unknown(witnesses_known, i64_to_fr(v.raw())),
+                            || Value::known(i64_to_fr(v.raw())),
                         )
                     })
                     .collect()
@@ -744,15 +643,9 @@ impl AssemblerChip {
         &self,
         mut layouter: impl Layouter<Fr>,
         raw: i64,
-        witnesses_known: bool,
     ) -> Result<(AssignedCell<Fr, Fr>, AssignedCell<Fr, Fr>), ErrorFront> {
-        let unshifted_fr = known_or_unknown(witnesses_known, i64_to_fr(raw));
+        let unshifted_fr = Value::known(i64_to_fr(raw));
         let (shifted_fr, _) = shifted_i64_witness(raw);
-        let shifted_fr = if witnesses_known {
-            shifted_fr
-        } else {
-            Value::unknown()
-        };
         layouter.assign_region(
             || "assembler shift bridge",
             |mut region| {
@@ -788,7 +681,6 @@ impl AssemblerChip {
         batch_dims: &[usize],
         trans_a: bool,
         trans_b: bool,
-        witnesses_known: bool,
     ) -> Result<RegisterCells, AssemblerError> {
         if !batch_dims.is_empty() {
             return Err(AssemblerError::DotGeneralBatchDimsUnsupported);
@@ -865,7 +757,6 @@ impl AssemblerChip {
                     layouter.namespace(|| format!("assembler dot ({i},{j})")),
                     &a_vec,
                     &b_vec,
-                    witnesses_known,
                 )?;
 
                 layouter.assign_region(
@@ -888,7 +779,6 @@ impl AssemblerChip {
                 let (out_unshifted_cell, out_shifted_cell) = self.assign_bridge(
                     layouter.namespace(|| format!("assembler dot ({i},{j}) output bridge")),
                     q.raw(),
-                    witnesses_known,
                 )?;
                 layouter.assign_region(
                     || format!("assembler dot ({i},{j}) output link"),
@@ -906,7 +796,6 @@ impl AssemblerChip {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn assign_eltwise(
         &self,
         mut layouter: impl Layouter<Fr>,
@@ -915,7 +804,6 @@ impl AssemblerChip {
         weight_regs: &[RegisterCells],
         virtual_regs: &[RegisterCells],
         op: &EltwiseOp,
-        witnesses_known: bool,
     ) -> Result<RegisterCells, AssemblerError> {
         if inputs.len() != 2 {
             return Err(AssemblerError::EltwiseInputCount {
@@ -959,7 +847,6 @@ impl AssemblerChip {
                     let (a_unshift_cell, a_shift_cell) = self.assign_bridge(
                         layouter.namespace(|| format!("assembler add {idx} a bridge")),
                         a_val.raw(),
-                        witnesses_known,
                     )?;
                     layouter.assign_region(
                         || format!("assembler add {idx} a link"),
@@ -970,7 +857,6 @@ impl AssemblerChip {
                     let (b_unshift_cell, b_shift_cell) = self.assign_bridge(
                         layouter.namespace(|| format!("assembler add {idx} b bridge")),
                         b_val.raw(),
-                        witnesses_known,
                     )?;
                     layouter.assign_region(
                         || format!("assembler add {idx} b link"),
@@ -979,12 +865,11 @@ impl AssemblerChip {
                         },
                     )?;
 
-                    let (a_cell, b_cell, c_cell) = assign_add_row_with_witnesses(
+                    let (a_cell, b_cell, c_cell) = assign_add_row(
                         &self.config.add,
                         layouter.namespace(|| format!("assembler add {idx}")),
                         a_val.raw(),
                         b_val.raw(),
-                        witnesses_known,
                     )?;
                     layouter.assign_region(
                         || format!("assembler add {idx} operand links"),
@@ -998,7 +883,6 @@ impl AssemblerChip {
                     let (out_unshift_cell, out_shift_cell) = self.assign_bridge(
                         layouter.namespace(|| format!("assembler add {idx} output bridge")),
                         c_raw,
-                        witnesses_known,
                     )?;
                     layouter.assign_region(
                         || format!("assembler add {idx} output link"),
@@ -1015,12 +899,11 @@ impl AssemblerChip {
                     // representation -- the same as this assembler's
                     // canonical register cells -- so no bridge is needed for
                     // the operands, only for the (shifted) output.
-                    let (a_cell, b_cell, q_cell) = assign_mul_row_with_witnesses(
+                    let (a_cell, b_cell, q_cell) = assign_mul_row(
                         &self.config.mul,
                         layouter.namespace(|| format!("assembler mul {idx}")),
                         a_val,
                         b_val,
-                        witnesses_known,
                     )?;
                     layouter.assign_region(
                         || format!("assembler mul {idx} operand links"),
@@ -1034,7 +917,6 @@ impl AssemblerChip {
                     let (out_unshift_cell, out_shift_cell) = self.assign_bridge(
                         layouter.namespace(|| format!("assembler mul {idx} output bridge")),
                         q.raw(),
-                        witnesses_known,
                     )?;
                     layouter.assign_region(
                         || format!("assembler mul {idx} output link"),
@@ -1079,7 +961,6 @@ impl AssemblerChip {
         virtual_regs: &[RegisterCells],
         dim: usize,
         epsilon_milli: u64,
-        witnesses_known: bool,
     ) -> Result<RegisterCells, AssemblerError> {
         if inputs.len() != 2 {
             return Err(AssemblerError::RmsNormInputCount {
@@ -1108,11 +989,10 @@ impl AssemblerChip {
         let chip = RmsNormChip::construct(rms_config);
 
         let result = chip
-            .assign_with_witnesses(
+            .assign(
                 layouter.namespace(|| "assembler rms_norm"),
                 &x_reg.values,
                 &weight_reg.values,
-                witnesses_known,
             )
             .map_err(AssemblerError::RmsNorm)?;
 
@@ -1135,7 +1015,6 @@ impl AssemblerChip {
             let (out_unshift_cell, out_shift_cell) = self.assign_bridge(
                 layouter.namespace(|| format!("assembler rms_norm {i} output bridge")),
                 out.raw(),
-                witnesses_known,
             )?;
             layouter.assign_region(
                 || format!("assembler rms_norm {i} output link"),
@@ -1205,7 +1084,6 @@ fn assign_dot_row(
     mut layouter: impl Layouter<Fr>,
     a: &[I18],
     b: &[I18],
-    witnesses_known: bool,
 ) -> Result<
     (
         Vec<AssignedCell<Fr, Fr>>,
@@ -1235,157 +1113,70 @@ fn assign_dot_row(
     let (q, r) = requantize_raw(raw_sum).expect("assembler dot product overflow");
     let slack = SCALE_18 - 1 - r;
     let (q_shift_fr, q_shift_raw) = shifted_i64_witness(q.raw());
-    let q_shift_fr = if witnesses_known {
-        q_shift_fr
-    } else {
-        Value::unknown()
-    };
-    let q_shift_raw = if witnesses_known {
-        q_shift_raw
-    } else {
-        Value::unknown()
-    };
 
-    let (a_cells, b_cells, q_cell, r_cell, slack_cell, a_shift_cells, b_shift_cells) = layouter
-        .assign_region(
-            || "assembler dot product",
-            |mut region| {
-                let mut a_cells = Vec::with_capacity(k);
-                let mut b_cells = Vec::with_capacity(k);
-                let mut a_shift_cells = Vec::with_capacity(k);
-                let mut b_shift_cells = Vec::with_capacity(k);
-                for i in 0..k {
-                    let a_cell = region.assign_advice(
-                        || format!("a_{i}"),
-                        dot.a,
-                        i,
-                        || known_or_unknown(witnesses_known, i64_to_fr(a[i].raw())),
-                    )?;
-                    let b_cell = region.assign_advice(
-                        || format!("b_{i}"),
-                        dot.b,
-                        i,
-                        || known_or_unknown(witnesses_known, i64_to_fr(b[i].raw())),
-                    )?;
-                    dot.s_shift.enable(&mut region, i)?;
-                    let (a_shift_fr, _) = shifted_i64_witness(a[i].raw());
-                    let (b_shift_fr, _) = shifted_i64_witness(b[i].raw());
-                    a_shift_cells.push(region.assign_advice(
-                        || format!("a_shift_{i}"),
-                        dot.a_shift,
-                        i,
-                        || {
-                            if witnesses_known {
-                                a_shift_fr
-                            } else {
-                                Value::unknown()
-                            }
-                        },
-                    )?);
-                    b_shift_cells.push(region.assign_advice(
-                        || format!("b_shift_{i}"),
-                        dot.b_shift,
-                        i,
-                        || {
-                            if witnesses_known {
-                                b_shift_fr
-                            } else {
-                                Value::unknown()
-                            }
-                        },
-                    )?);
-                    region.assign_advice(
-                        || format!("accumulator_{i}"),
-                        dot.accumulator,
-                        i,
-                        || known_or_unknown(witnesses_known, i128_to_fr(partial_sums[i])),
-                    )?;
-                    if i == 0 {
-                        dot.s_acc_start.enable(&mut region, i)?;
-                    } else {
-                        dot.s_acc_step.enable(&mut region, i)?;
-                    }
-                    a_cells.push(a_cell);
-                    b_cells.push(b_cell);
+    let (a_cells, b_cells, q_cell, r_cell, slack_cell) = layouter.assign_region(
+        || "assembler dot product",
+        |mut region| {
+            let mut a_cells = Vec::with_capacity(k);
+            let mut b_cells = Vec::with_capacity(k);
+            for i in 0..k {
+                let a_cell = region.assign_advice(
+                    || format!("a_{i}"),
+                    dot.a,
+                    i,
+                    || Value::known(i64_to_fr(a[i].raw())),
+                )?;
+                let b_cell = region.assign_advice(
+                    || format!("b_{i}"),
+                    dot.b,
+                    i,
+                    || Value::known(i64_to_fr(b[i].raw())),
+                )?;
+                region.assign_advice(
+                    || format!("accumulator_{i}"),
+                    dot.accumulator,
+                    i,
+                    || Value::known(i128_to_fr(partial_sums[i])),
+                )?;
+                if i == 0 {
+                    dot.s_acc_start.enable(&mut region, i)?;
+                } else {
+                    dot.s_acc_step.enable(&mut region, i)?;
                 }
+                a_cells.push(a_cell);
+                b_cells.push(b_cell);
+            }
 
-                let last = k - 1;
-                dot.s_final.enable(&mut region, last)?;
-                dot.s_slack.enable(&mut region, last)?;
-                let q_cell = region.assign_advice(|| "q", dot.q, last, || q_shift_fr)?;
-                let r_cell = region.assign_advice(
-                    || "r",
-                    dot.r,
-                    last,
-                    || known_or_unknown(witnesses_known, i128_to_fr(r)),
-                )?;
-                let slack_cell = region.assign_advice(
-                    || "slack",
-                    dot.slack,
-                    last,
-                    || known_or_unknown(witnesses_known, i128_to_fr(slack)),
-                )?;
-                Ok((
-                    a_cells,
-                    b_cells,
-                    q_cell,
-                    r_cell,
-                    slack_cell,
-                    a_shift_cells,
-                    b_shift_cells,
-                ))
-            },
-        )?;
+            let last = k - 1;
+            dot.s_final.enable(&mut region, last)?;
+            dot.s_slack.enable(&mut region, last)?;
+            let q_cell = region.assign_advice(|| "q", dot.q, last, || q_shift_fr)?;
+            let r_cell =
+                region.assign_advice(|| "r", dot.r, last, || Value::known(i128_to_fr(r)))?;
+            let slack_cell = region.assign_advice(
+                || "slack",
+                dot.slack,
+                last,
+                || Value::known(i128_to_fr(slack)),
+            )?;
+            Ok((a_cells, b_cells, q_cell, r_cell, slack_cell))
+        },
+    )?;
 
-    let range_a_chip = LookupRangeCheckChip::construct(dot.range_a.clone());
-    let range_b_chip = LookupRangeCheckChip::construct(dot.range_b.clone());
-    let mut operand_links = Vec::with_capacity(2 * k);
-    for i in 0..k {
-        let (a_shift_fr, a_shift_raw) = shifted_i64_witness(a[i].raw());
-        let cell = range_a_chip.assign(
-            layouter.namespace(|| format!("range a_{i}")),
-            if witnesses_known {
-                a_shift_fr
-            } else {
-                Value::unknown()
-            },
-            if witnesses_known {
-                a_shift_raw
-            } else {
-                Value::unknown()
-            },
-        )?;
-        operand_links.push((a_shift_cells[i].cell(), cell.cell()));
-        let (b_shift_fr, b_shift_raw) = shifted_i64_witness(b[i].raw());
-        let cell = range_b_chip.assign(
-            layouter.namespace(|| format!("range b_{i}")),
-            if witnesses_known {
-                b_shift_fr
-            } else {
-                Value::unknown()
-            },
-            if witnesses_known {
-                b_shift_raw
-            } else {
-                Value::unknown()
-            },
-        )?;
-        operand_links.push((b_shift_cells[i].cell(), cell.cell()));
-    }
     let range_q_chip = RangeCheckChip::construct(dot.range_q.clone());
     let q_range_cell =
         range_q_chip.assign(layouter.namespace(|| "range q"), q_shift_fr, q_shift_raw)?;
     let range_r_chip = RangeCheckChip::construct(dot.range_r.clone());
     let r_range_cell = range_r_chip.assign(
         layouter.namespace(|| "range r"),
-        known_or_unknown(witnesses_known, i128_to_fr(r)),
-        known_or_unknown(witnesses_known, r),
+        Value::known(i128_to_fr(r)),
+        Value::known(r),
     )?;
     let range_r_slack_chip = RangeCheckChip::construct(dot.range_r_slack.clone());
     let slack_range_cell = range_r_slack_chip.assign(
         layouter.namespace(|| "range r slack"),
-        known_or_unknown(witnesses_known, i128_to_fr(slack)),
-        known_or_unknown(witnesses_known, slack),
+        Value::known(i128_to_fr(slack)),
+        Value::known(slack),
     )?;
 
     layouter.assign_region(
@@ -1394,9 +1185,6 @@ fn assign_dot_row(
             region.constrain_equal(q_cell.cell(), q_range_cell.cell())?;
             region.constrain_equal(r_cell.cell(), r_range_cell.cell())?;
             region.constrain_equal(slack_cell.cell(), slack_range_cell.cell())?;
-            for (lhs, rhs) in &operand_links {
-                region.constrain_equal(*lhs, *rhs)?;
-            }
             Ok(())
         },
     )?;
@@ -1404,20 +1192,11 @@ fn assign_dot_row(
     Ok((a_cells, b_cells, q_cell))
 }
 
-fn known_or_unknown<T: Copy>(known: bool, value: T) -> Value<T> {
-    if known {
-        Value::known(value)
-    } else {
-        Value::unknown()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chips::layer_norm::assign_add_row;
     use halo2_proofs::circuit::SimpleFloorPlanner;
-    use halo2_proofs::dev::{MockProver, VerifyFailure};
+    use halo2_proofs::dev::MockProver;
     use halo2_proofs::plonk::{Circuit, ConstraintSystem, ErrorFront};
 
     const CIRCUIT_K: u32 = 12;
@@ -1466,32 +1245,19 @@ mod tests {
     }
 
     #[test]
-    fn dot_free_program_allocates_only_the_columns_needed_by_eltwise() {
-        let eltwise = vec![AssemblerInstruction {
+    fn dot_free_program_does_not_allocate_dot_advice_columns() {
+        let instructions = vec![AssemblerInstruction {
             instruction: Instruction::Eltwise { op: EltwiseOp::Add },
             inputs: vec![RegisterRef::Input(0), RegisterRef::Input(1)],
         }];
-        let dot = vec![AssemblerInstruction {
-            instruction: Instruction::DotGeneral {
-                m: 1,
-                n: 1,
-                k: 2,
-                batch_dims: vec![],
-                trans_a: false,
-                trans_b: false,
-            },
-            inputs: vec![RegisterRef::Input(0), RegisterRef::Input(1)],
-        }];
-        let mut eltwise_meta = ConstraintSystem::<Fr>::default();
-        let mut dot_meta = ConstraintSystem::<Fr>::default();
+        let mut meta = ConstraintSystem::<Fr>::default();
 
-        AssemblerChip::configure(&mut eltwise_meta, &eltwise);
-        AssemblerChip::configure(&mut dot_meta, &dot);
+        AssemblerChip::configure(&mut meta, &instructions);
 
         assert_eq!(
-            dot_meta.num_advice_columns() - eltwise_meta.num_advice_columns(),
-            8,
-            "dot configuration adds six DotProduct columns plus its two operand-range shift columns"
+            meta.num_advice_columns(),
+            12,
+            "a dot-free program must not allocate the six shared dot columns"
         );
     }
 
@@ -1502,8 +1268,6 @@ mod tests {
     }
 
     impl Circuit<Fr> for DotOnlyCircuit {
-        type Params = ();
-
         type Config = AssemblerConfig;
         type FloorPlanner = SimpleFloorPlanner;
 
@@ -1580,8 +1344,6 @@ mod tests {
     }
 
     impl Circuit<Fr> for EltwiseOnlyCircuit {
-        type Params = ();
-
         type Config = AssemblerConfig;
         type FloorPlanner = SimpleFloorPlanner;
 
@@ -1613,394 +1375,6 @@ mod tests {
                 .map(|_| ())
                 .map_err(|e| panic!("assembler assign failed: {e}"))
         }
-    }
-
-    /// Test-only raw-field entry point for the assembler's multiply path.
-    /// Production programs cannot construct an [`I18`] outside `i64`, so a
-    /// malicious witness needs this lower-level path to exercise the circuit
-    /// constraints rather than the host type's constructor.
-    fn assign_raw_mul_for_test(
-        chip: &AssemblerChip,
-        mut layouter: impl Layouter<Fr>,
-        a_raw: i128,
-        b_raw: i128,
-    ) -> Result<(), ErrorFront> {
-        chip.load_range_tables(layouter.namespace(|| "assembler operand range tables"))?;
-
-        let (a_boundary, b_boundary) = layouter.assign_region(
-            || "assembler raw boundary",
-            |mut region| {
-                let a = region.assign_advice(
-                    || "a",
-                    chip.config.boundary,
-                    0,
-                    || Value::known(i128_to_fr(a_raw)),
-                )?;
-                let b = region.assign_advice(
-                    || "b",
-                    chip.config.boundary,
-                    1,
-                    || Value::known(i128_to_fr(b_raw)),
-                )?;
-                Ok((a, b))
-            },
-        )?;
-
-        let product = a_raw * b_raw;
-        let q_raw = product.div_euclid(SCALE_18);
-        let r = product.rem_euclid(SCALE_18);
-        let slack = SCALE_18 - 1 - r;
-        let q_raw = i64::try_from(q_raw).expect("test quotient must fit i64");
-        let (q_shift_fr, q_shift_raw) = shifted_i64_witness(q_raw);
-        let a_shift_raw = a_raw + SIGNED_SHIFT;
-        let b_shift_raw = b_raw + SIGNED_SHIFT;
-
-        let (a_cell, b_cell, q_cell, r_cell, slack_cell, a_shift_cell, b_shift_cell) = layouter
-            .assign_region(
-                || "assembler raw mul",
-                |mut region| {
-                    chip.config.mul.s_mul.enable(&mut region, 0)?;
-                    chip.config.mul.s_slack.enable(&mut region, 0)?;
-                    chip.config.mul.s_shift.enable(&mut region, 0)?;
-                    let a_cell = region.assign_advice(
-                        || "a",
-                        chip.config.mul.a,
-                        0,
-                        || Value::known(i128_to_fr(a_raw)),
-                    )?;
-                    let b_cell = region.assign_advice(
-                        || "b",
-                        chip.config.mul.b,
-                        0,
-                        || Value::known(i128_to_fr(b_raw)),
-                    )?;
-                    let q_cell =
-                        region.assign_advice(|| "q", chip.config.mul.q, 0, || q_shift_fr)?;
-                    let r_cell = region.assign_advice(
-                        || "r",
-                        chip.config.mul.r,
-                        0,
-                        || Value::known(i128_to_fr(r)),
-                    )?;
-                    let slack_cell = region.assign_advice(
-                        || "slack",
-                        chip.config.mul.slack,
-                        0,
-                        || Value::known(i128_to_fr(slack)),
-                    )?;
-                    let a_shift_cell = region.assign_advice(
-                        || "a_shift",
-                        chip.config.mul.a_shift,
-                        0,
-                        || Value::known(i128_to_fr(a_shift_raw)),
-                    )?;
-                    let b_shift_cell = region.assign_advice(
-                        || "b_shift",
-                        chip.config.mul.b_shift,
-                        0,
-                        || Value::known(i128_to_fr(b_shift_raw)),
-                    )?;
-                    Ok((
-                        a_cell,
-                        b_cell,
-                        q_cell,
-                        r_cell,
-                        slack_cell,
-                        a_shift_cell,
-                        b_shift_cell,
-                    ))
-                },
-            )?;
-
-        let q_range_cell = RangeCheckChip::construct(chip.config.mul.range_q.clone()).assign(
-            layouter.namespace(|| "range q"),
-            q_shift_fr,
-            q_shift_raw,
-        )?;
-        let r_range_cell = RangeCheckChip::construct(chip.config.mul.range_r.clone()).assign(
-            layouter.namespace(|| "range r"),
-            Value::known(i128_to_fr(r)),
-            Value::known(r),
-        )?;
-        let slack_range_cell = RangeCheckChip::construct(chip.config.mul.range_r_slack.clone())
-            .assign(
-                layouter.namespace(|| "range r slack"),
-                Value::known(i128_to_fr(slack)),
-                Value::known(slack),
-            )?;
-        let a_range_cell = LookupRangeCheckChip::construct(chip.config.mul.range_a.clone())
-            .assign(
-                layouter.namespace(|| "range a"),
-                Value::known(i128_to_fr(a_shift_raw)),
-                Value::known(a_shift_raw),
-            )?;
-        let b_range_cell = LookupRangeCheckChip::construct(chip.config.mul.range_b.clone())
-            .assign(
-                layouter.namespace(|| "range b"),
-                Value::known(i128_to_fr(b_shift_raw)),
-                Value::known(b_shift_raw),
-            )?;
-
-        layouter.assign_region(
-            || "assembler raw mul links",
-            |mut region| {
-                region.constrain_equal(a_cell.cell(), a_boundary.cell())?;
-                region.constrain_equal(b_cell.cell(), b_boundary.cell())?;
-                region.constrain_equal(a_shift_cell.cell(), a_range_cell.cell())?;
-                region.constrain_equal(b_shift_cell.cell(), b_range_cell.cell())?;
-                region.constrain_equal(q_cell.cell(), q_range_cell.cell())?;
-                region.constrain_equal(r_cell.cell(), r_range_cell.cell())?;
-                region.constrain_equal(slack_cell.cell(), slack_range_cell.cell())?;
-                Ok(())
-            },
-        )?;
-
-        let (out_unshifted, out_shifted) = chip.assign_bridge(
-            layouter.namespace(|| "assembler raw mul output bridge"),
-            q_raw,
-            true,
-        )?;
-        layouter.assign_region(
-            || "assembler raw mul output link",
-            |mut region| region.constrain_equal(out_shifted.cell(), q_cell.cell()),
-        )?;
-        let _ = out_unshifted;
-        Ok(())
-    }
-
-    struct RawMulOperandCircuit {
-        a_raw: i128,
-        b_raw: i128,
-    }
-
-    impl Circuit<Fr> for RawMulOperandCircuit {
-        type Params = ();
-
-        type Config = AssemblerConfig;
-        type FloorPlanner = SimpleFloorPlanner;
-
-        fn without_witnesses(&self) -> Self {
-            RawMulOperandCircuit { a_raw: 0, b_raw: 0 }
-        }
-
-        fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
-            AssemblerChip::configure(
-                meta,
-                &[AssemblerInstruction {
-                    instruction: Instruction::Eltwise { op: EltwiseOp::Mul },
-                    inputs: vec![RegisterRef::Input(0), RegisterRef::Input(1)],
-                }],
-            )
-        }
-
-        fn synthesize(
-            &self,
-            config: Self::Config,
-            layouter: impl Layouter<Fr>,
-        ) -> Result<(), ErrorFront> {
-            assign_raw_mul_for_test(
-                &AssemblerChip::construct(config),
-                layouter,
-                self.a_raw,
-                self.b_raw,
-            )
-        }
-    }
-
-    #[test]
-    fn assembler_mul_rejects_raw_field_operand_outside_i64() {
-        let control = RawMulOperandCircuit {
-            a_raw: 9 * SCALE_18,
-            b_raw: 1,
-        };
-        MockProver::run(CIRCUIT_K, &control, vec![])
-            .unwrap()
-            .assert_satisfied();
-
-        let forged = RawMulOperandCircuit {
-            a_raw: 10 * SCALE_18,
-            b_raw: 1,
-        };
-        let failures = MockProver::run(CIRCUIT_K, &forged, vec![])
-            .unwrap()
-            .verify()
-            .expect_err("an operand above i64::MAX must be rejected");
-        assert!(failures.iter().all(|failure| matches!(
-            failure,
-            VerifyFailure::ConstraintNotSatisfied { constraint, .. }
-                if constraint.to_string().contains("limbs recompose to value")
-        )));
-    }
-
-    /// Mirrors `assign_dot_row` for a single-element dot product, but takes
-    /// the operands as raw `i128` so a value outside `i64` can reach the
-    /// operand range check the way a forged witness would. Test-only, like
-    /// `assign_raw_mul_for_test` above.
-    fn assign_raw_dot_for_test(
-        chip: &AssemblerChip,
-        mut layouter: impl Layouter<Fr>,
-        a_raw: i128,
-        b_raw: i128,
-    ) -> Result<(), ErrorFront> {
-        chip.load_range_tables(layouter.namespace(|| "assembler operand range tables"))?;
-        let dot = &chip.config.dot[&1];
-
-        let product = a_raw * b_raw;
-        let q_raw = product.div_euclid(SCALE_18);
-        let r = product.rem_euclid(SCALE_18);
-        let slack = SCALE_18 - 1 - r;
-        let q_raw = i64::try_from(q_raw).expect("test quotient must fit i64");
-        let (q_shift_fr, q_shift_raw) = shifted_i64_witness(q_raw);
-        let a_shift_raw = a_raw + SIGNED_SHIFT;
-        let b_shift_raw = b_raw + SIGNED_SHIFT;
-
-        let (q_cell, r_cell, slack_cell, a_shift_cell, b_shift_cell) = layouter.assign_region(
-            || "assembler raw dot",
-            |mut region| {
-                region.assign_advice(|| "a_0", dot.a, 0, || Value::known(i128_to_fr(a_raw)))?;
-                region.assign_advice(|| "b_0", dot.b, 0, || Value::known(i128_to_fr(b_raw)))?;
-                dot.s_shift.enable(&mut region, 0)?;
-                let a_shift_cell = region.assign_advice(
-                    || "a_shift_0",
-                    dot.a_shift,
-                    0,
-                    || Value::known(i128_to_fr(a_shift_raw)),
-                )?;
-                let b_shift_cell = region.assign_advice(
-                    || "b_shift_0",
-                    dot.b_shift,
-                    0,
-                    || Value::known(i128_to_fr(b_shift_raw)),
-                )?;
-                region.assign_advice(
-                    || "accumulator_0",
-                    dot.accumulator,
-                    0,
-                    || Value::known(i128_to_fr(product)),
-                )?;
-                dot.s_acc_start.enable(&mut region, 0)?;
-                dot.s_final.enable(&mut region, 0)?;
-                dot.s_slack.enable(&mut region, 0)?;
-                let q_cell = region.assign_advice(|| "q", dot.q, 0, || q_shift_fr)?;
-                let r_cell =
-                    region.assign_advice(|| "r", dot.r, 0, || Value::known(i128_to_fr(r)))?;
-                let slack_cell = region.assign_advice(
-                    || "slack",
-                    dot.slack,
-                    0,
-                    || Value::known(i128_to_fr(slack)),
-                )?;
-                Ok((q_cell, r_cell, slack_cell, a_shift_cell, b_shift_cell))
-            },
-        )?;
-
-        let a_range_cell = LookupRangeCheckChip::construct(dot.range_a.clone()).assign(
-            layouter.namespace(|| "range a_0"),
-            Value::known(i128_to_fr(a_shift_raw)),
-            Value::known(a_shift_raw),
-        )?;
-        let b_range_cell = LookupRangeCheckChip::construct(dot.range_b.clone()).assign(
-            layouter.namespace(|| "range b_0"),
-            Value::known(i128_to_fr(b_shift_raw)),
-            Value::known(b_shift_raw),
-        )?;
-        let q_range_cell = RangeCheckChip::construct(dot.range_q.clone()).assign(
-            layouter.namespace(|| "range q"),
-            q_shift_fr,
-            q_shift_raw,
-        )?;
-        let r_range_cell = RangeCheckChip::construct(dot.range_r.clone()).assign(
-            layouter.namespace(|| "range r"),
-            Value::known(i128_to_fr(r)),
-            Value::known(r),
-        )?;
-        let slack_range_cell = RangeCheckChip::construct(dot.range_r_slack.clone()).assign(
-            layouter.namespace(|| "range r slack"),
-            Value::known(i128_to_fr(slack)),
-            Value::known(slack),
-        )?;
-
-        layouter.assign_region(
-            || "assembler raw dot links",
-            |mut region| {
-                region.constrain_equal(a_shift_cell.cell(), a_range_cell.cell())?;
-                region.constrain_equal(b_shift_cell.cell(), b_range_cell.cell())?;
-                region.constrain_equal(q_cell.cell(), q_range_cell.cell())?;
-                region.constrain_equal(r_cell.cell(), r_range_cell.cell())?;
-                region.constrain_equal(slack_cell.cell(), slack_range_cell.cell())
-            },
-        )
-    }
-
-    struct RawDotOperandCircuit {
-        a_raw: i128,
-        b_raw: i128,
-    }
-
-    impl Circuit<Fr> for RawDotOperandCircuit {
-        type Params = ();
-
-        type Config = AssemblerConfig;
-        type FloorPlanner = SimpleFloorPlanner;
-
-        fn without_witnesses(&self) -> Self {
-            RawDotOperandCircuit { a_raw: 0, b_raw: 0 }
-        }
-
-        fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
-            AssemblerChip::configure(
-                meta,
-                &[AssemblerInstruction {
-                    instruction: Instruction::DotGeneral {
-                        m: 1,
-                        n: 1,
-                        k: 1,
-                        batch_dims: vec![],
-                        trans_a: false,
-                        trans_b: false,
-                    },
-                    inputs: vec![RegisterRef::Input(0), RegisterRef::Input(1)],
-                }],
-            )
-        }
-
-        fn synthesize(
-            &self,
-            config: Self::Config,
-            layouter: impl Layouter<Fr>,
-        ) -> Result<(), ErrorFront> {
-            assign_raw_dot_for_test(
-                &AssemblerChip::construct(config),
-                layouter,
-                self.a_raw,
-                self.b_raw,
-            )
-        }
-    }
-
-    #[test]
-    fn assembler_dot_rejects_raw_field_operand_outside_i64() {
-        let control = RawDotOperandCircuit {
-            a_raw: 9 * SCALE_18,
-            b_raw: 1,
-        };
-        MockProver::run(CIRCUIT_K, &control, vec![])
-            .unwrap()
-            .assert_satisfied();
-
-        let forged = RawDotOperandCircuit {
-            a_raw: 10 * SCALE_18,
-            b_raw: 1,
-        };
-        let failures = MockProver::run(CIRCUIT_K, &forged, vec![])
-            .unwrap()
-            .verify()
-            .expect_err("a dot operand above i64::MAX must be rejected");
-        assert!(failures.iter().all(|failure| matches!(
-            failure,
-            VerifyFailure::ConstraintNotSatisfied { constraint, .. }
-                if constraint.to_string().contains("limbs recompose to value")
-        )));
     }
 
     #[test]
@@ -2054,8 +1428,6 @@ mod tests {
     }
 
     impl Circuit<Fr> for LinearLayerCircuit {
-        type Params = ();
-
         type Config = AssemblerConfig;
         type FloorPlanner = SimpleFloorPlanner;
 
@@ -2194,8 +1566,6 @@ mod tests {
     }
 
     impl Circuit<Fr> for MismatchedWiringCircuit {
-        type Params = ();
-
         type Config = AssemblerConfig;
         type FloorPlanner = SimpleFloorPlanner;
 
@@ -2216,7 +1586,6 @@ mod tests {
             mut layouter: impl Layouter<Fr>,
         ) -> Result<(), ErrorFront> {
             let chip = AssemblerChip::construct(config.clone());
-            chip.load_range_tables(layouter.namespace(|| "range tables"))?;
 
             let x = &self.program.input_values[0];
             let w = &self.program.weight_values[0];
@@ -2224,9 +1593,9 @@ mod tests {
 
             // Honestly witness the boundary values and the real MatMul
             // (DotGeneral) output, exactly as `AssemblerChip::assign` would.
-            let x_cells = chip.assign_boundary(layouter.namespace(|| "x"), x, true)?;
-            let w_cells = chip.assign_boundary(layouter.namespace(|| "w"), w, true)?;
-            let _b_cells = chip.assign_boundary(layouter.namespace(|| "b"), b, true)?;
+            let x_cells = chip.assign_boundary(layouter.namespace(|| "x"), x)?;
+            let w_cells = chip.assign_boundary(layouter.namespace(|| "w"), w)?;
+            let _b_cells = chip.assign_boundary(layouter.namespace(|| "b"), b)?;
 
             let k = 2;
             let dot_config = config.dot.get(&k).unwrap().clone();
@@ -2239,7 +1608,6 @@ mod tests {
                 layouter.namespace(|| "dot (0,0)"),
                 &a_vec,
                 &b_vec,
-                true,
             )?;
             layouter.assign_region(
                 || "dot (0,0) input links",
@@ -2258,11 +1626,8 @@ mod tests {
                 .map(|(xv, wv)| (xv.raw() as i128) * (wv.raw() as i128))
                 .sum();
             let (y00, _) = requantize_raw(raw_sum).unwrap();
-            let (y00_unshift_cell, y00_shift_cell) = chip.assign_bridge(
-                layouter.namespace(|| "dot (0,0) output bridge"),
-                y00.raw(),
-                true,
-            )?;
+            let (y00_unshift_cell, y00_shift_cell) =
+                chip.assign_bridge(layouter.namespace(|| "dot (0,0) output bridge"), y00.raw())?;
             layouter.assign_region(
                 || "dot (0,0) output link",
                 |mut region| region.constrain_equal(y00_shift_cell.cell(), q_cell.cell()),
@@ -2278,7 +1643,7 @@ mod tests {
                 .checked_add(1)
                 .expect("decoy should not overflow in this small test");
             let (decoy_unshift_cell, decoy_shift_cell) =
-                chip.assign_bridge(layouter.namespace(|| "decoy bridge"), decoy_raw, true)?;
+                chip.assign_bridge(layouter.namespace(|| "decoy bridge"), decoy_raw)?;
             layouter.assign_region(
                 || "decoy link to real y00",
                 |mut region| {

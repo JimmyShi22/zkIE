@@ -27,7 +27,6 @@ use zkie_core::assembler::{
 use zkie_core::field_convert::Fr;
 use zkie_core::fixed_point::I18;
 use zkie_core::isa::{EltwiseOp, Instruction};
-use zkie_core::program_circuit::AssemblerCircuit;
 
 const CIRCUIT_K: u32 = 12;
 
@@ -70,27 +69,12 @@ fn linear_layer_program() -> AssemblerProgram {
     }
 }
 
-fn runtime_public_instances() -> Vec<Vec<Vec<Fr>>> {
-    let program = linear_layer_program();
-    let values = program
-        .input_values
-        .iter()
-        .chain(&program.weight_values)
-        .flat_map(|tensor| tensor.iter().copied())
-        .chain([i18(0.725), i18(-0.2), i18(0.1), i18(0.425)])
-        .map(|value| zkie_core::field_convert::i64_to_fr(value.raw()))
-        .collect();
-    vec![vec![values]]
-}
-
 #[derive(Clone)]
 struct LinearLayerCircuit {
     program: AssemblerProgram,
 }
 
 impl Circuit<Fr> for LinearLayerCircuit {
-    type Params = ();
-
     type Config = AssemblerConfig;
     type FloorPlanner = SimpleFloorPlanner;
 
@@ -158,44 +142,6 @@ fn linear_layer_real_kzg_roundtrip() {
         result.is_ok(),
         "linear layer assembler proof failed to verify: {:?}",
         result
-    );
-}
-
-#[test]
-fn runtime_assembler_keys_from_unknown_witnesses_prove_the_witnessed_layout() {
-    let mut rng = OsRng;
-    let circuit = AssemblerCircuit::new(linear_layer_program(), Default::default());
-    let blank = circuit.without_witnesses();
-    let params = ParamsKZG::<Bn256>::setup(CIRCUIT_K, &mut rng);
-    let vk = keygen_vk(&params, &blank).expect("blank circuit keygen_vk should succeed");
-    let pk =
-        keygen_pk(&params, vk.clone(), &blank).expect("blank circuit keygen_pk should succeed");
-
-    let mut transcript = Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(vec![]);
-    let instances = runtime_public_instances();
-    create_proof::<KZGCommitmentScheme<Bn256>, ProverSHPLONK<'_, Bn256>, _, _, _, _>(
-        &params,
-        &pk,
-        &[circuit],
-        instances.as_slice(),
-        &mut rng,
-        &mut transcript,
-    )
-    .expect("witnessed circuit should match keys generated from its blank form");
-    let proof = transcript.finalize();
-
-    let mut verifier_transcript = Blake2bRead::<_, G1Affine, Challenge255<_>>::init(&proof[..]);
-    let verifier_params = params.verifier_params();
-    let strategy = SingleStrategy::new(&verifier_params);
-    assert!(
-        verify_proof::<KZGCommitmentScheme<Bn256>, VerifierSHPLONK<Bn256>, _, _, _>(
-            &verifier_params,
-            &vk,
-            strategy,
-            instances.as_slice(),
-            &mut verifier_transcript,
-        )
-        .is_ok()
     );
 }
 

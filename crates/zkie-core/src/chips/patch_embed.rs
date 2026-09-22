@@ -22,7 +22,7 @@ use crate::chips::dot_general::{DotProductChip, DotProductConfig, DotProductErro
 use crate::field_convert::Fr;
 use crate::fixed_point::I18;
 use halo2_proofs::circuit::Layouter;
-use halo2_proofs::plonk::{Advice, Column, ConstraintSystem, ErrorFront};
+use halo2_proofs::plonk::{Advice, Column, ConstraintSystem};
 use std::fmt;
 
 /// Errors that can occur while assigning a `PatchEmbedChip` region.
@@ -115,12 +115,6 @@ impl PatchEmbedChip {
     /// length `patch_len` — i.e. `weights[j]` is the weight column for output
     /// dimension `j`), returning the length-`embed_dim` requantized I18
     /// output vector.
-    /// Loads the byte table backing the inner dot product's operand range
-    /// checks. Must be called once per circuit synthesis.
-    pub fn load_range_table(&self, layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
-        DotProductChip::construct(self.config.dot.clone()).load_range_table(layouter)
-    }
-
     pub fn assign(
         &self,
         mut layouter: impl Layouter<Fr>,
@@ -191,8 +185,6 @@ mod tests {
     }
 
     impl Circuit<Fr> for PatchEmbedTestCircuit {
-        type Params = ();
-
         type Config = PatchEmbedTestConfig;
         type FloorPlanner = SimpleFloorPlanner;
 
@@ -230,10 +222,9 @@ mod tests {
         fn synthesize(
             &self,
             config: Self::Config,
-            mut layouter: impl Layouter<Fr>,
+            layouter: impl Layouter<Fr>,
         ) -> Result<(), ErrorFront> {
             let chip = PatchEmbedChip::construct(config.embed);
-            chip.load_range_table(layouter.namespace(|| "range tables"))?;
             chip.assign(layouter, &self.patch, &self.weights)
                 .map(|_| ())
                 .map_err(|e| panic!("patch embed assign failed: {e}"))
@@ -279,7 +270,7 @@ mod tests {
             patch: patch.clone(),
             weights: weights.clone(),
         };
-        let prover = MockProver::run(11, &circuit, vec![]).unwrap();
+        let prover = MockProver::run(10, &circuit, vec![]).unwrap();
         prover.assert_satisfied();
 
         assert!((expected[0].to_f64() - 1.0).abs() < 1e-9);
@@ -291,7 +282,7 @@ mod tests {
         let patch = vec![I18::from_raw(0); PATCH_LEN];
         let weights = vec![vec![I18::from_raw(0); PATCH_LEN]; EMBED_DIM];
         let circuit = PatchEmbedTestCircuit { patch, weights };
-        let prover = MockProver::run(11, &circuit, vec![]).unwrap();
+        let prover = MockProver::run(10, &circuit, vec![]).unwrap();
         prover.assert_satisfied();
     }
 
@@ -303,8 +294,6 @@ mod tests {
         }
 
         impl Circuit<Fr> for LenTestCircuit {
-            type Params = ();
-
             type Config = PatchEmbedTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -341,7 +330,7 @@ mod tests {
             patch: vec![I18::from_raw(1); PATCH_LEN - 1],
             weights: vec![vec![I18::from_raw(1); PATCH_LEN]; EMBED_DIM],
         };
-        let _ = MockProver::run(11, &circuit, vec![]);
+        let _ = MockProver::run(10, &circuit, vec![]);
     }
 
     #[test]
@@ -352,8 +341,6 @@ mod tests {
         }
 
         impl Circuit<Fr> for LenTestCircuit {
-            type Params = ();
-
             type Config = PatchEmbedTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -390,7 +377,7 @@ mod tests {
             patch: vec![I18::from_raw(1); PATCH_LEN],
             weights: vec![vec![I18::from_raw(1); PATCH_LEN]; EMBED_DIM - 1],
         };
-        let _ = MockProver::run(11, &circuit, vec![]);
+        let _ = MockProver::run(10, &circuit, vec![]);
     }
 
     #[test]
@@ -401,8 +388,6 @@ mod tests {
         }
 
         impl Circuit<Fr> for LenTestCircuit {
-            type Params = ();
-
             type Config = PatchEmbedTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -442,7 +427,7 @@ mod tests {
             patch: vec![I18::from_raw(1); PATCH_LEN],
             weights,
         };
-        let _ = MockProver::run(11, &circuit, vec![]);
+        let _ = MockProver::run(10, &circuit, vec![]);
     }
 
     /// Forges the final-row quotient witness for one output dimension's
@@ -461,8 +446,6 @@ mod tests {
         }
 
         impl Circuit<Fr> for ForgedPatchEmbedCircuit {
-            type Params = ();
-
             type Config = PatchEmbedTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -578,7 +561,7 @@ mod tests {
                 ],
             ],
         };
-        let prover = MockProver::run(11, &circuit, vec![]).unwrap();
+        let prover = MockProver::run(10, &circuit, vec![]).unwrap();
         assert!(prover.verify().is_err());
     }
 }

@@ -33,8 +33,6 @@ struct LookupCircuit {
 }
 
 impl Circuit<Fr> for LookupCircuit {
-    type Params = ();
-
     type Config = LookupCircuitConfig;
     type FloorPlanner = SimpleFloorPlanner;
 

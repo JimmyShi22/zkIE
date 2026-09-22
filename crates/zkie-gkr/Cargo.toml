@@ -1,0 +1,31 @@
+[package]
+name = "zkie-gkr"
+version = "0.1.0"
+edition = "2021"
+description = "GKR/sum-check prototype for verifiable ML inference (matmul layer)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+p3-challenger = "0.7.0"
+p3-commit = "0.7.0"
+p3-dft = { version = "0.7.0", features = ["parallel"] }
+p3-field = "0.7.0"
+p3-goldilocks = "0.7.0"
+p3-matrix = "0.7.0"
+p3-maybe-rayon = { version = "0.7.0", features = ["parallel"] }
+p3-merkle-tree = "0.7.0"
+p3-multilinear-util = "0.7.0"
+p3-sumcheck = "0.7.0"
+p3-symmetric = "0.7.0"
+p3-util = "0.7.0"
+p3-whir = "0.7.0"
+rand = "0.10.1"
+zkie-cuda = { path = "../zkie-cuda", optional = true }
+
+[features]
+default = []
+cuda = ["dep:zkie-cuda", "zkie-cuda/cuda"]
+
+[[example]]
+name = "bench_whir_cuda"
+required-features = ["cuda"]

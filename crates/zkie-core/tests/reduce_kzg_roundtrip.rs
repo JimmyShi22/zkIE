@@ -27,8 +27,6 @@ struct SumCircuit {
 }
 
 impl Circuit<Fr> for SumCircuit {
-    type Params = ();
-
     type Config = SumCircuitConfig;
     type FloorPlanner = SimpleFloorPlanner;
 
@@ -68,8 +66,6 @@ struct MeanCircuit {
 }
 
 impl Circuit<Fr> for MeanCircuit {
-    type Params = ();
-
     type Config = MeanCircuitConfig;
     type FloorPlanner = SimpleFloorPlanner;
 

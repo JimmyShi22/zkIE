@@ -186,8 +186,6 @@ struct MyCircuit<F: Field> {
 }
 
 impl<F: Field> Circuit<F> for MyCircuit<F> {
-    type Params = ();
-
     type Config = FieldConfig;
     type FloorPlanner = SimpleFloorPlanner;
 

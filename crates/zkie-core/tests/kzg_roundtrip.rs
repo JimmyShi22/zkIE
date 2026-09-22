@@ -28,8 +28,6 @@ struct AddCircuit {
 }
 
 impl Circuit<Fr> for AddCircuit {
-    type Params = ();
-
     type Config = AddCircuitConfig;
     type FloorPlanner = SimpleFloorPlanner;
 
@@ -72,8 +70,6 @@ struct MulCircuit {
 }
 
 impl Circuit<Fr> for MulCircuit {
-    type Params = ();
-
     type Config = MulCircuitConfig;
     type FloorPlanner = SimpleFloorPlanner;
 
@@ -99,11 +95,11 @@ impl Circuit<Fr> for MulCircuit {
     fn synthesize(
         &self,
         config: Self::Config,
-        mut layouter: impl Layouter<Fr>,
+        layouter: impl Layouter<Fr>,
     ) -> Result<(), ErrorFront> {
-        let chip = EltwiseMulChip::construct(config.mul);
-        chip.load_range_table(layouter.namespace(|| "range tables"))?;
-        chip.assign(layouter, self.a, self.b).map(|_| ())
+        EltwiseMulChip::construct(config.mul)
+            .assign(layouter, self.a, self.b)
+            .map(|_| ())
     }
 }
 

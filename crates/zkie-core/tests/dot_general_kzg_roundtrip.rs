@@ -28,8 +28,6 @@ struct DotCircuit {
 }
 
 impl Circuit<Fr> for DotCircuit {
-    type Params = ();
-
     type Config = DotCircuitConfig;
     type FloorPlanner = SimpleFloorPlanner;
 
@@ -56,11 +54,10 @@ impl Circuit<Fr> for DotCircuit {
     fn synthesize(
         &self,
         config: Self::Config,
-        mut layouter: impl Layouter<Fr>,
+        layouter: impl Layouter<Fr>,
     ) -> Result<(), ErrorFront> {
-        let chip = DotProductChip::construct(config.dot);
-        chip.load_range_table(layouter.namespace(|| "range tables"))?;
-        chip.assign(layouter, self.a.clone(), self.b.clone())
+        DotProductChip::construct(config.dot)
+            .assign(layouter, self.a.clone(), self.b.clone())
             .map(|_| ())
             .map_err(|e| panic!("dot product assign failed: {e}"))
     }

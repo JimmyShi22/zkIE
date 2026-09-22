@@ -1,7 +1,3 @@
-//! Structural TimesFM-shaped mock coverage. The executable supported-ONNX to automatic-shards,
-//! CPU-witness, real-KZG, native-manifest proof graph lives in
-//! `crates/zkie-prover/tests/sharded_kzg_pipeline.rs`.
-
 use std::path::Path;
 
 use rayon::prelude::*;

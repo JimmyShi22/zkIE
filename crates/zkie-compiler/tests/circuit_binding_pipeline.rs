@@ -111,8 +111,6 @@ struct PipelineCircuit {
 }
 
 impl Circuit<Fr> for PipelineCircuit {
-    type Params = ();
-
     type Config = AssemblerConfig;
     type FloorPlanner = SimpleFloorPlanner;
 

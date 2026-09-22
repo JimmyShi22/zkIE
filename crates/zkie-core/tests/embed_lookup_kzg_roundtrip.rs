@@ -44,8 +44,6 @@ struct EmbedLookupCircuit {
 }
 
 impl Circuit<Fr> for EmbedLookupCircuit {
-    type Params = ();
-
     type Config = EmbedLookupCircuitConfig;
     type FloorPlanner = SimpleFloorPlanner;
 

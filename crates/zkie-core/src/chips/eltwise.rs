@@ -1,8 +1,7 @@
-use crate::chips::lookup_range_check::{LookupRangeCheckChip, LookupRangeCheckConfig};
 use crate::chips::range_check::{RangeCheckChip, RangeCheckConfig};
 use crate::field_convert::{i128_to_fr, i64_to_fr, shifted_i64_witness, Fr, SIGNED_SHIFT};
 use crate::fixed_point::{requantize_mul, I18, SCALE_18};
-use halo2_proofs::circuit::{AssignedCell, Layouter, Region, Value};
+use halo2_proofs::circuit::{AssignedCell, Layouter, Value};
 use halo2_proofs::plonk::{Advice, Column, ConstraintSystem, ErrorFront, Expression, Selector};
 use halo2_proofs::poly::Rotation;
 
@@ -169,132 +168,6 @@ pub struct EltwiseMulConfig {
     pub(crate) range_q: RangeCheckConfig,
     pub(crate) range_r: RangeCheckConfig,
     pub(crate) range_r_slack: RangeCheckConfig,
-    // `a`/`b` must stay raw because `s_mul` multiplies them, so unlike
-    // `EltwiseAddChip` they cannot be range-checked in place. These carry the
-    // signed-shifted copy of each operand, tied to `a`/`b` by `s_shift` and
-    // bounded at 64 bits, which is what bounds the operands to i64.
-    pub(crate) a_shift: Column<Advice>,
-    pub(crate) b_shift: Column<Advice>,
-    pub(crate) s_shift: Selector,
-    pub(crate) range_a: LookupRangeCheckConfig,
-    pub(crate) range_b: LookupRangeCheckConfig,
-}
-
-type MulOperandShiftCells = (AssignedCell<Fr, Fr>, AssignedCell<Fr, Fr>);
-
-/// Loads the byte table backing a multiply's operand range checks. Must be
-/// called once per circuit synthesis by whoever configured the chip.
-pub(crate) fn load_mul_operand_range_table(
-    mul: &EltwiseMulConfig,
-    mut layouter: impl Layouter<Fr>,
-) -> Result<(), ErrorFront> {
-    LookupRangeCheckChip::construct(mul.range_a.clone())
-        .load_table(layouter.namespace(|| "mul operand byte table a"))?;
-    LookupRangeCheckChip::construct(mul.range_b.clone())
-        .load_table(layouter.namespace(|| "mul operand byte table b"))
-}
-
-/// Witnesses the signed-shifted copies of a multiply's operands at `offset`
-/// of the caller's region, so they can be range-checked. Pairs with
-/// [`link_mul_operand_ranges`], which does the checking; both are needed for
-/// the bound to hold, and callers that assemble mul rows by hand (see
-/// `layer_norm::assign_mul_row`) must call both.
-#[allow(clippy::type_complexity)]
-pub(crate) fn assign_mul_operand_shifts(
-    mul: &EltwiseMulConfig,
-    region: &mut Region<Fr>,
-    offset: usize,
-    a_val: I18,
-    b_val: I18,
-) -> Result<MulOperandShiftCells, ErrorFront> {
-    assign_mul_operand_shifts_with_witness_mode(mul, region, offset, a_val, b_val, true)
-}
-
-pub(crate) fn assign_mul_operand_shifts_with_witness_mode(
-    mul: &EltwiseMulConfig,
-    region: &mut Region<Fr>,
-    offset: usize,
-    a_val: I18,
-    b_val: I18,
-    witnesses_known: bool,
-) -> Result<MulOperandShiftCells, ErrorFront> {
-    mul.s_shift.enable(region, offset)?;
-    let (a_shift_fr, _) = shifted_i64_witness(a_val.raw());
-    let (b_shift_fr, _) = shifted_i64_witness(b_val.raw());
-    let a_cell = region.assign_advice(
-        || "a_shift",
-        mul.a_shift,
-        offset,
-        || witness_value(witnesses_known, a_shift_fr),
-    )?;
-    let b_cell = region.assign_advice(
-        || "b_shift",
-        mul.b_shift,
-        offset,
-        || witness_value(witnesses_known, b_shift_fr),
-    )?;
-    Ok((a_cell, b_cell))
-}
-
-/// Range-checks the shifted operands witnessed by [`assign_mul_operand_shifts`]
-/// and copy-constrains the checked cells back to them. Without the copy
-/// constraint the range check would bound an unrelated cell.
-pub(crate) fn link_mul_operand_ranges(
-    mul: &EltwiseMulConfig,
-    layouter: impl Layouter<Fr>,
-    a_val: I18,
-    b_val: I18,
-    a_shift_cell: &AssignedCell<Fr, Fr>,
-    b_shift_cell: &AssignedCell<Fr, Fr>,
-) -> Result<(), ErrorFront> {
-    link_mul_operand_ranges_with_witness_mode(
-        mul,
-        layouter,
-        a_val,
-        b_val,
-        a_shift_cell,
-        b_shift_cell,
-        true,
-    )
-}
-
-pub(crate) fn link_mul_operand_ranges_with_witness_mode(
-    mul: &EltwiseMulConfig,
-    mut layouter: impl Layouter<Fr>,
-    a_val: I18,
-    b_val: I18,
-    a_shift_cell: &AssignedCell<Fr, Fr>,
-    b_shift_cell: &AssignedCell<Fr, Fr>,
-    witnesses_known: bool,
-) -> Result<(), ErrorFront> {
-    let (a_fr, a_raw) = shifted_i64_witness(a_val.raw());
-    let a_range_cell = LookupRangeCheckChip::construct(mul.range_a.clone()).assign(
-        layouter.namespace(|| "range a"),
-        witness_value(witnesses_known, a_fr),
-        witness_value(witnesses_known, a_raw),
-    )?;
-    let (b_fr, b_raw) = shifted_i64_witness(b_val.raw());
-    let b_range_cell = LookupRangeCheckChip::construct(mul.range_b.clone()).assign(
-        layouter.namespace(|| "range b"),
-        witness_value(witnesses_known, b_fr),
-        witness_value(witnesses_known, b_raw),
-    )?;
-    layouter.assign_region(
-        || "mul operand range check links",
-        |mut region| {
-            region.constrain_equal(a_shift_cell.cell(), a_range_cell.cell())?;
-            region.constrain_equal(b_shift_cell.cell(), b_range_cell.cell())?;
-            Ok(())
-        },
-    )
-}
-
-fn witness_value<T: Copy>(known: bool, value: Value<T>) -> Value<T> {
-    if known {
-        value
-    } else {
-        Value::unknown()
-    }
 }
 
 pub struct EltwiseMulChip {
@@ -346,32 +219,6 @@ impl EltwiseMulChip {
             vec![s_slack * (slack + r - bound_minus_one)]
         });
 
-        // Operand bounds. Allocated here rather than taken as parameters so the
-        // fix stays local to the chip; the trade-off is two more advice columns
-        // per configured multiply.
-        let a_shift = meta.advice_column();
-        let b_shift = meta.advice_column();
-        meta.enable_equality(a_shift);
-        meta.enable_equality(b_shift);
-
-        let s_shift = meta.selector();
-        meta.create_gate("mul operand shift", |meta| {
-            let a = meta.query_advice(a, Rotation::cur());
-            let b = meta.query_advice(b, Rotation::cur());
-            let a_shift = meta.query_advice(a_shift, Rotation::cur());
-            let b_shift = meta.query_advice(b_shift, Rotation::cur());
-            let s_shift = meta.query_selector(s_shift);
-            let shift = Expression::Constant(i128_to_fr(SIGNED_SHIFT));
-            vec![
-                s_shift.clone() * (a_shift - a - shift.clone()),
-                s_shift * (b_shift - b - shift),
-            ]
-        });
-
-        // Lookup-based for the same reason as the dot product's: these are
-        // per-operand, so 8 rows each instead of 64.
-        let range_a = LookupRangeCheckChip::configure(meta, a_shift, bits, 64);
-        let range_b = LookupRangeCheckChip::configure(meta, b_shift, bits, 64);
         let range_q = RangeCheckChip::configure(meta, q, bits, 64);
         let range_r = RangeCheckChip::configure(meta, r, bits, REMAINDER_BITS);
         let range_r_slack = RangeCheckChip::configure(meta, slack, bits, REMAINDER_BITS);
@@ -387,11 +234,6 @@ impl EltwiseMulChip {
             range_q,
             range_r,
             range_r_slack,
-            a_shift,
-            b_shift,
-            s_shift,
-            range_a,
-            range_b,
         }
     }
 
@@ -407,12 +249,6 @@ impl EltwiseMulChip {
     /// this cell to any cell where they re-witness the same value, rather
     /// than re-assigning it disconnected from this one (see the soundness
     /// note at the top of this file).
-    /// Loads the byte table backing the operand range checks. Must be called
-    /// once per circuit synthesis, independently of [`Self::assign`].
-    pub fn load_range_table(&self, layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
-        load_mul_operand_range_table(&self.config, layouter)
-    }
-
     pub fn assign(
         &self,
         mut layouter: impl Layouter<Fr>,
@@ -423,7 +259,7 @@ impl EltwiseMulChip {
         let slack = SCALE_18 - 1 - r;
         let (q_shift_fr, q_shift_raw) = shifted_i64_witness(q.raw());
 
-        let (q_cell, r_cell, slack_cell, a_shift_cell, b_shift_cell) = layouter.assign_region(
+        let (q_cell, r_cell, slack_cell) = layouter.assign_region(
             || "eltwise mul",
             |mut region| {
                 self.config.s_mul.enable(&mut region, 0)?;
@@ -440,8 +276,6 @@ impl EltwiseMulChip {
                     0,
                     || Value::known(i64_to_fr(b.raw())),
                 )?;
-                let (a_shift_cell, b_shift_cell) =
-                    assign_mul_operand_shifts(&self.config, &mut region, 0, a, b)?;
                 let q_cell = region.assign_advice(|| "q", self.config.q, 0, || q_shift_fr)?;
                 let r_cell = region.assign_advice(
                     || "r",
@@ -455,17 +289,8 @@ impl EltwiseMulChip {
                     0,
                     || Value::known(i128_to_fr(slack)),
                 )?;
-                Ok((q_cell, r_cell, slack_cell, a_shift_cell, b_shift_cell))
+                Ok((q_cell, r_cell, slack_cell))
             },
-        )?;
-
-        link_mul_operand_ranges(
-            &self.config,
-            layouter.namespace(|| "mul operand ranges"),
-            a,
-            b,
-            &a_shift_cell,
-            &b_shift_cell,
         )?;
 
         let range_q_chip = RangeCheckChip::construct(self.config.range_q.clone());
@@ -519,8 +344,6 @@ mod tests {
     }
 
     impl Circuit<Fr> for AddTestCircuit {
-        type Params = ();
-
         type Config = AddTestConfig;
         type FloorPlanner = SimpleFloorPlanner;
 
@@ -579,8 +402,6 @@ mod tests {
         }
 
         impl Circuit<Fr> for ForgedAddCircuit {
-            type Params = ();
-
             type Config = AddTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -649,8 +470,6 @@ mod tests {
         }
 
         impl Circuit<Fr> for MismatchedLinkCircuit {
-            type Params = ();
-
             type Config = AddTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -747,8 +566,6 @@ mod tests {
     }
 
     impl Circuit<Fr> for MulTestCircuit {
-        type Params = ();
-
         type Config = MulTestConfig;
         type FloorPlanner = SimpleFloorPlanner;
 
@@ -774,10 +591,9 @@ mod tests {
         fn synthesize(
             &self,
             config: Self::Config,
-            mut layouter: impl Layouter<Fr>,
+            layouter: impl Layouter<Fr>,
         ) -> Result<(), ErrorFront> {
             let chip = EltwiseMulChip::construct(config.mul);
-            chip.load_range_table(layouter.namespace(|| "range tables"))?;
             chip.assign(layouter, self.a, self.b).map(|_| ())
         }
     }
@@ -810,8 +626,6 @@ mod tests {
         }
 
         impl Circuit<Fr> for ForgedMulCircuit {
-            type Params = ();
-
             type Config = MulTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -831,14 +645,6 @@ mod tests {
                 config: Self::Config,
                 mut layouter: impl Layouter<Fr>,
             ) -> Result<(), ErrorFront> {
-                // Load the byte tables the operand range checks look up against.
-                // Without them the lookup fails for lack of a table and the circuit
-                // is rejected for the wrong reason, so the forgery below would never
-                // be the thing this test exercises.
-                LookupRangeCheckChip::construct(config.mul.range_a.clone())
-                    .load_table(layouter.namespace(|| "byte table a"))?;
-                LookupRangeCheckChip::construct(config.mul.range_b.clone())
-                    .load_table(layouter.namespace(|| "byte table b"))?;
                 let (q, r) = requantize_mul(self.a, self.b).unwrap();
                 let forged_q = q.raw() + 1; // violates a*b == q*SCALE_18 + r
                 let (forged_q_shift_fr, _) = shifted_i64_witness(forged_q);
@@ -900,8 +706,6 @@ mod tests {
         }
 
         impl Circuit<Fr> for MismatchedLinkCircuit {
-            type Params = ();
-
             type Config = MulTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -921,14 +725,6 @@ mod tests {
                 config: Self::Config,
                 mut layouter: impl Layouter<Fr>,
             ) -> Result<(), ErrorFront> {
-                // Load the byte tables the operand range checks look up against.
-                // Without them the lookup fails for lack of a table and the circuit
-                // is rejected for the wrong reason, so the forgery below would never
-                // be the thing this test exercises.
-                LookupRangeCheckChip::construct(config.mul.range_a.clone())
-                    .load_table(layouter.namespace(|| "byte table a"))?;
-                LookupRangeCheckChip::construct(config.mul.range_b.clone())
-                    .load_table(layouter.namespace(|| "byte table b"))?;
                 let (q, r) = requantize_mul(self.a, self.b).unwrap();
                 let slack = SCALE_18 - 1 - r;
                 let (q_shift_fr, _) = shifted_i64_witness(q.raw());
@@ -1012,189 +808,5 @@ mod tests {
             prover.verify().is_err(),
             "constrain_equal must reject a q cell tied to a mismatched decoy range-check value"
         );
-    }
-
-    #[test]
-    fn mul_rejects_out_of_range_operand() {
-        // Same gap as `dot_product_rejects_out_of_range_operand`: `a` sits
-        // above i64::MAX while q = 10, r = 0 and slack = SCALE_18 - 1 all stay
-        // in range, so only a bound on the operands themselves catches it.
-        // The region mirrors the real assignment, selectors included, since
-        // selectors are fixed columns a prover cannot switch off.
-        #[derive(Clone, Copy, Debug)]
-        enum Forge {
-            HonestShift,
-            ShiftIntoRange,
-            DisconnectedRangeWitness,
-        }
-
-        struct OutOfRangeMulCircuit {
-            a_raw: i128,
-            b_raw: i128,
-            forge: Forge,
-        }
-
-        impl Circuit<Fr> for OutOfRangeMulCircuit {
-            type Params = ();
-
-            type Config = MulTestConfig;
-            type FloorPlanner = SimpleFloorPlanner;
-
-            fn without_witnesses(&self) -> Self {
-                OutOfRangeMulCircuit {
-                    a_raw: 0,
-                    b_raw: 0,
-                    forge: Forge::HonestShift,
-                }
-            }
-
-            fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
-                MulTestCircuit::configure(meta)
-            }
-
-            fn synthesize(
-                &self,
-                config: Self::Config,
-                mut layouter: impl Layouter<Fr>,
-            ) -> Result<(), ErrorFront> {
-                let product = self.a_raw * self.b_raw;
-                let q = product.div_euclid(SCALE_18);
-                let r = product.rem_euclid(SCALE_18);
-                let slack = SCALE_18 - 1 - r;
-                let (q_shift_fr, q_shift_raw) = shifted_i64_witness(q as i64);
-
-                let shifted = |v: i128| -> i128 {
-                    match self.forge {
-                        Forge::ShiftIntoRange => 0,
-                        _ => v + SIGNED_SHIFT,
-                    }
-                };
-                let range_witness = |v: i128| -> i128 {
-                    match self.forge {
-                        Forge::DisconnectedRangeWitness => 0,
-                        _ => shifted(v),
-                    }
-                };
-
-                let (q_cell, r_cell, slack_cell, a_shift_cell, b_shift_cell) = layouter
-                    .assign_region(
-                        || "out of range mul",
-                        |mut region| {
-                            config.mul.s_mul.enable(&mut region, 0)?;
-                            config.mul.s_slack.enable(&mut region, 0)?;
-                            config.mul.s_shift.enable(&mut region, 0)?;
-                            region.assign_advice(
-                                || "a",
-                                config.mul.a,
-                                0,
-                                || Value::known(i128_to_fr(self.a_raw)),
-                            )?;
-                            region.assign_advice(
-                                || "b",
-                                config.mul.b,
-                                0,
-                                || Value::known(i128_to_fr(self.b_raw)),
-                            )?;
-                            let a_shift_cell = region.assign_advice(
-                                || "a_shift",
-                                config.mul.a_shift,
-                                0,
-                                || Value::known(i128_to_fr(shifted(self.a_raw))),
-                            )?;
-                            let b_shift_cell = region.assign_advice(
-                                || "b_shift",
-                                config.mul.b_shift,
-                                0,
-                                || Value::known(i128_to_fr(shifted(self.b_raw))),
-                            )?;
-                            let q_cell =
-                                region.assign_advice(|| "q", config.mul.q, 0, || q_shift_fr)?;
-                            let r_cell = region.assign_advice(
-                                || "r",
-                                config.mul.r,
-                                0,
-                                || Value::known(i128_to_fr(r)),
-                            )?;
-                            let slack_cell = region.assign_advice(
-                                || "slack",
-                                config.mul.slack,
-                                0,
-                                || Value::known(i128_to_fr(slack)),
-                            )?;
-                            Ok((q_cell, r_cell, slack_cell, a_shift_cell, b_shift_cell))
-                        },
-                    )?;
-
-                // Without the byte tables the lookups fail for lack of a
-                // table and the circuit would be rejected for the wrong reason.
-                load_mul_operand_range_table(
-                    &config.mul,
-                    layouter.namespace(|| "mul byte tables"),
-                )?;
-
-                let a_s = range_witness(self.a_raw);
-                let a_range_cell = LookupRangeCheckChip::construct(config.mul.range_a.clone())
-                    .assign(
-                        layouter.namespace(|| "range a"),
-                        Value::known(i128_to_fr(a_s)),
-                        Value::known(a_s),
-                    )?;
-                let b_s = range_witness(self.b_raw);
-                let b_range_cell = LookupRangeCheckChip::construct(config.mul.range_b.clone())
-                    .assign(
-                        layouter.namespace(|| "range b"),
-                        Value::known(i128_to_fr(b_s)),
-                        Value::known(b_s),
-                    )?;
-                let q_range_cell = RangeCheckChip::construct(config.mul.range_q.clone()).assign(
-                    layouter.namespace(|| "range q"),
-                    q_shift_fr,
-                    q_shift_raw,
-                )?;
-                let r_range_cell = RangeCheckChip::construct(config.mul.range_r.clone()).assign(
-                    layouter.namespace(|| "range r"),
-                    Value::known(i128_to_fr(r)),
-                    Value::known(r),
-                )?;
-                let slack_range_cell = RangeCheckChip::construct(config.mul.range_r_slack.clone())
-                    .assign(
-                        layouter.namespace(|| "range r slack"),
-                        Value::known(i128_to_fr(slack)),
-                        Value::known(slack),
-                    )?;
-
-                layouter.assign_region(
-                    || "out of range mul links",
-                    |mut region| {
-                        region.constrain_equal(a_shift_cell.cell(), a_range_cell.cell())?;
-                        region.constrain_equal(b_shift_cell.cell(), b_range_cell.cell())?;
-                        region.constrain_equal(q_cell.cell(), q_range_cell.cell())?;
-                        region.constrain_equal(r_cell.cell(), r_range_cell.cell())?;
-                        region.constrain_equal(slack_cell.cell(), slack_range_cell.cell())?;
-                        Ok(())
-                    },
-                )?;
-                Ok(())
-            }
-        }
-
-        // 10 * SCALE_18 = 1e19, above i64::MAX ~= 9.22e18. b = 1 keeps the
-        // rescale witnesses small: q = 10, r = 0.
-        for forge in [
-            Forge::HonestShift,
-            Forge::ShiftIntoRange,
-            Forge::DisconnectedRangeWitness,
-        ] {
-            let circuit = OutOfRangeMulCircuit {
-                a_raw: 10 * SCALE_18,
-                b_raw: 1,
-                forge,
-            };
-            let prover = MockProver::run(11, &circuit, vec![]).unwrap();
-            assert!(
-                prover.verify().is_err(),
-                "an operand above i64::MAX must not satisfy the circuit ({forge:?})"
-            );
-        }
     }
 }

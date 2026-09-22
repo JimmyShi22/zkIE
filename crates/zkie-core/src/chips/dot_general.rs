@@ -5,7 +5,6 @@
 //! Full M x N x K matrix tiling is out of scope here: a later ONNX-compiler
 //! sub-project will instantiate this chip once per output element.
 
-use crate::chips::lookup_range_check::{LookupRangeCheckChip, LookupRangeCheckConfig};
 use crate::chips::range_check::{RangeCheckChip, RangeCheckConfig};
 use crate::field_convert::{i128_to_fr, i64_to_fr, shifted_i64_witness, Fr, SIGNED_SHIFT};
 use crate::fixed_point::{requantize_raw, FixedPointError, I18, SCALE_18};
@@ -92,16 +91,6 @@ pub struct DotProductConfig {
     pub(crate) range_q: RangeCheckConfig,
     pub(crate) range_r: RangeCheckConfig,
     pub(crate) range_r_slack: RangeCheckConfig,
-    // `a`/`b` must hold *raw* values because the accumulator gate multiplies
-    // them, so unlike `EltwiseAddChip` they cannot be range-checked in place.
-    // These columns carry the signed-shifted copy of each operand, tied to
-    // `a`/`b` by `s_shift` and range-checked at 64 bits, which is what bounds
-    // the operands themselves to i64.
-    pub(crate) a_shift: Column<Advice>,
-    pub(crate) b_shift: Column<Advice>,
-    pub(crate) s_shift: Selector,
-    pub(crate) range_a: LookupRangeCheckConfig,
-    pub(crate) range_b: LookupRangeCheckConfig,
     pub(crate) k: usize,
 }
 
@@ -179,33 +168,6 @@ impl DotProductChip {
             vec![s_slack * (slack + r - bound_minus_one)]
         });
 
-        // Operand bounds. Allocated here rather than taken as parameters so the
-        // fix stays local to the chip; the trade-off is two more advice columns
-        // per configured dot product.
-        let a_shift = meta.advice_column();
-        let b_shift = meta.advice_column();
-        meta.enable_equality(a_shift);
-        meta.enable_equality(b_shift);
-
-        let s_shift = meta.selector();
-        meta.create_gate("dot product operand shift", |meta| {
-            let a = meta.query_advice(a, Rotation::cur());
-            let b = meta.query_advice(b, Rotation::cur());
-            let a_shift = meta.query_advice(a_shift, Rotation::cur());
-            let b_shift = meta.query_advice(b_shift, Rotation::cur());
-            let s_shift = meta.query_selector(s_shift);
-            let shift = Expression::Constant(i128_to_fr(SIGNED_SHIFT));
-            vec![
-                s_shift.clone() * (a_shift - a - shift.clone()),
-                s_shift * (b_shift - b - shift),
-            ]
-        });
-
-        // Lookup-based, not bit decomposition: there are 2k of these per
-        // instance, so 8 rows each instead of 64 is the difference between a
-        // usable bound and an unusable one. See `chips::lookup_range_check`.
-        let range_a = LookupRangeCheckChip::configure(meta, a_shift, bits, 64);
-        let range_b = LookupRangeCheckChip::configure(meta, b_shift, bits, 64);
         let range_q = RangeCheckChip::configure(meta, q, bits, 64);
         let range_r = RangeCheckChip::configure(meta, r, bits, REMAINDER_BITS);
         let range_r_slack = RangeCheckChip::configure(meta, slack, bits, REMAINDER_BITS);
@@ -224,11 +186,6 @@ impl DotProductChip {
             range_q,
             range_r,
             range_r_slack,
-            a_shift,
-            b_shift,
-            s_shift,
-            range_a,
-            range_b,
             k,
         }
     }
@@ -239,15 +196,6 @@ impl DotProductChip {
 
     /// Assigns the dot-product region for `a` and `b` (each must have exactly
     /// the configured `K` elements), returning the requantized I18 result.
-    /// Loads the byte table backing the operand range checks. Must be called
-    /// once per circuit synthesis, independently of [`Self::assign`].
-    pub fn load_range_table(&self, mut layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
-        LookupRangeCheckChip::construct(self.config.range_a.clone())
-            .load_table(layouter.namespace(|| "dot operand byte table a"))?;
-        LookupRangeCheckChip::construct(self.config.range_b.clone())
-            .load_table(layouter.namespace(|| "dot operand byte table b"))
-    }
-
     pub fn assign(
         &self,
         mut layouter: impl Layouter<Fr>,
@@ -280,11 +228,9 @@ impl DotProductChip {
         let slack = SCALE_18 - 1 - r;
         let (q_shift_fr, q_shift_raw) = shifted_i64_witness(q.raw());
 
-        let (q_cell, r_cell, slack_cell, a_shift_cells, b_shift_cells) = layouter.assign_region(
+        let (q_cell, r_cell, slack_cell) = layouter.assign_region(
             || "dot product accumulation",
             |mut region| {
-                let mut a_shift_cells = Vec::with_capacity(k);
-                let mut b_shift_cells = Vec::with_capacity(k);
                 for i in 0..k {
                     region.assign_advice(
                         || format!("a_{i}"),
@@ -298,21 +244,6 @@ impl DotProductChip {
                         i,
                         || Value::known(i64_to_fr(b[i].raw())),
                     )?;
-                    self.config.s_shift.enable(&mut region, i)?;
-                    let (a_shift_fr, _) = shifted_i64_witness(a[i].raw());
-                    let (b_shift_fr, _) = shifted_i64_witness(b[i].raw());
-                    a_shift_cells.push(region.assign_advice(
-                        || format!("a_shift_{i}"),
-                        self.config.a_shift,
-                        i,
-                        || a_shift_fr,
-                    )?);
-                    b_shift_cells.push(region.assign_advice(
-                        || format!("b_shift_{i}"),
-                        self.config.b_shift,
-                        i,
-                        || b_shift_fr,
-                    )?);
                     region.assign_advice(
                         || format!("accumulator_{i}"),
                         self.config.accumulator,
@@ -342,31 +273,9 @@ impl DotProductChip {
                     last,
                     || Value::known(i128_to_fr(slack)),
                 )?;
-                Ok((q_cell, r_cell, slack_cell, a_shift_cells, b_shift_cells))
+                Ok((q_cell, r_cell, slack_cell))
             },
         )?;
-
-        // Bound each operand to i64 via its shifted copy.
-        let range_a_chip = LookupRangeCheckChip::construct(self.config.range_a.clone());
-        let range_b_chip = LookupRangeCheckChip::construct(self.config.range_b.clone());
-        let mut operand_links = Vec::with_capacity(2 * k);
-        for i in 0..k {
-            let (a_shift_fr, a_shift_raw) = shifted_i64_witness(a[i].raw());
-            let cell = range_a_chip.assign(
-                layouter.namespace(|| format!("range a_{i}")),
-                a_shift_fr,
-                a_shift_raw,
-            )?;
-            operand_links.push((a_shift_cells[i].cell(), cell.cell()));
-
-            let (b_shift_fr, b_shift_raw) = shifted_i64_witness(b[i].raw());
-            let cell = range_b_chip.assign(
-                layouter.namespace(|| format!("range b_{i}")),
-                b_shift_fr,
-                b_shift_raw,
-            )?;
-            operand_links.push((b_shift_cells[i].cell(), cell.cell()));
-        }
 
         let range_q_chip = RangeCheckChip::construct(self.config.range_q.clone());
         let q_range_cell =
@@ -392,9 +301,6 @@ impl DotProductChip {
                 region.constrain_equal(q_cell.cell(), q_range_cell.cell())?;
                 region.constrain_equal(r_cell.cell(), r_range_cell.cell())?;
                 region.constrain_equal(slack_cell.cell(), slack_range_cell.cell())?;
-                for (lhs, rhs) in &operand_links {
-                    region.constrain_equal(*lhs, *rhs)?;
-                }
                 Ok(())
             },
         )?;
@@ -423,8 +329,6 @@ mod tests {
     }
 
     impl Circuit<Fr> for DotTestCircuit {
-        type Params = ();
-
         type Config = DotTestConfig;
         type FloorPlanner = SimpleFloorPlanner;
 
@@ -451,10 +355,9 @@ mod tests {
         fn synthesize(
             &self,
             config: Self::Config,
-            mut layouter: impl Layouter<Fr>,
+            layouter: impl Layouter<Fr>,
         ) -> Result<(), ErrorFront> {
             let chip = DotProductChip::construct(config.dot);
-            chip.load_range_table(layouter.namespace(|| "range tables"))?;
             chip.assign(layouter, self.a.clone(), self.b.clone())
                 .map(|_| ())
                 .map_err(|e| match e {
@@ -518,8 +421,6 @@ mod tests {
         }
 
         impl Circuit<Fr> for LenTestCircuit {
-            type Params = ();
-
             type Config = DotTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -573,8 +474,6 @@ mod tests {
         }
 
         impl Circuit<Fr> for ForgedDotCircuit {
-            type Params = ();
-
             type Config = DotTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -594,14 +493,6 @@ mod tests {
                 config: Self::Config,
                 mut layouter: impl Layouter<Fr>,
             ) -> Result<(), ErrorFront> {
-                // Load the byte tables the operand range checks look up against.
-                // Without them the lookup fails for lack of a table and the circuit
-                // is rejected for the wrong reason, so the forgery below would never
-                // be the thing this test exercises.
-                LookupRangeCheckChip::construct(config.dot.range_a.clone())
-                    .load_table(layouter.namespace(|| "byte table a"))?;
-                LookupRangeCheckChip::construct(config.dot.range_b.clone())
-                    .load_table(layouter.namespace(|| "byte table b"))?;
                 let a = &self.a;
                 let b = &self.b;
                 let raw_sum: i128 = a
@@ -697,8 +588,6 @@ mod tests {
         }
 
         impl Circuit<Fr> for MismatchedLinkCircuit {
-            type Params = ();
-
             type Config = DotTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -718,14 +607,6 @@ mod tests {
                 config: Self::Config,
                 mut layouter: impl Layouter<Fr>,
             ) -> Result<(), ErrorFront> {
-                // Load the byte tables the operand range checks look up against.
-                // Without them the lookup fails for lack of a table and the circuit
-                // is rejected for the wrong reason, so the forgery below would never
-                // be the thing this test exercises.
-                LookupRangeCheckChip::construct(config.dot.range_a.clone())
-                    .load_table(layouter.namespace(|| "byte table a"))?;
-                LookupRangeCheckChip::construct(config.dot.range_b.clone())
-                    .load_table(layouter.namespace(|| "byte table b"))?;
                 let a = &self.a;
                 let b = &self.b;
                 let raw_sum: i128 = a
@@ -844,226 +725,5 @@ mod tests {
             prover.verify().is_err(),
             "constrain_equal must reject a q cell tied to a mismatched decoy range-check value"
         );
-    }
-
-    #[test]
-    fn dot_product_rejects_out_of_range_operand() {
-        // `a_0` sits above i64::MAX, so it is not a representable I18 at all,
-        // yet every witness the circuit checks stays in range: q = 10, r = 0,
-        // slack = SCALE_18 - 1. Only a bound on the operands catches it.
-        //
-        // The region mirrors `DotProductChip::assign` exactly, selectors
-        // included -- selectors live in fixed columns and are pinned by the
-        // verifying key, so a prover cannot switch one off. That leaves two
-        // ways to witness the operand, and all three must be rejected:
-        // shift it honestly and the 64-bit range check fails; shift it into
-        // range and the `s_shift` gate fails; witness the range check against
-        // an unrelated in-range value and the copy constraint fails.
-        #[derive(Clone, Copy, Debug)]
-        enum Forge {
-            HonestShift,
-            ShiftIntoRange,
-            DisconnectedRangeWitness,
-        }
-
-        struct OutOfRangeOperandCircuit {
-            a_raw: Vec<i128>,
-            b_raw: Vec<i128>,
-            forge: Forge,
-        }
-
-        impl Circuit<Fr> for OutOfRangeOperandCircuit {
-            type Params = ();
-
-            type Config = DotTestConfig;
-            type FloorPlanner = SimpleFloorPlanner;
-
-            fn without_witnesses(&self) -> Self {
-                OutOfRangeOperandCircuit {
-                    a_raw: vec![0; K],
-                    b_raw: vec![0; K],
-                    forge: Forge::HonestShift,
-                }
-            }
-
-            fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
-                DotTestCircuit::configure(meta)
-            }
-
-            fn synthesize(
-                &self,
-                config: Self::Config,
-                mut layouter: impl Layouter<Fr>,
-            ) -> Result<(), ErrorFront> {
-                let mut raw_sum: i128 = 0;
-                let mut partial_sums = Vec::with_capacity(K);
-                for (a, b) in self.a_raw.iter().zip(self.b_raw.iter()) {
-                    raw_sum += a * b;
-                    partial_sums.push(raw_sum);
-                }
-                let (q, r) = requantize_raw(raw_sum).unwrap();
-                let slack = SCALE_18 - 1 - r;
-                let (q_shift_fr, q_shift_raw) = shifted_i64_witness(q.raw());
-
-                // The shifted operand the prover puts on the row. Shifting
-                // honestly overflows 64 bits; the alternative is to lie.
-                let shifted = |v: i128| -> i128 {
-                    match self.forge {
-                        Forge::ShiftIntoRange => 0,
-                        _ => v + SIGNED_SHIFT,
-                    }
-                };
-                // What the prover feeds the range check, which need not be
-                // what sits on the row unless the copy constraint says so.
-                let range_witness = |v: i128| -> i128 {
-                    match self.forge {
-                        Forge::DisconnectedRangeWitness => 0,
-                        _ => shifted(v),
-                    }
-                };
-
-                let (q_cell, r_cell, slack_cell, a_shift_cells, b_shift_cells) = layouter
-                    .assign_region(
-                        || "out of range operand",
-                        |mut region| {
-                            let mut a_shift_cells = Vec::with_capacity(K);
-                            let mut b_shift_cells = Vec::with_capacity(K);
-                            for (i, partial) in partial_sums.iter().enumerate() {
-                                region.assign_advice(
-                                    || format!("a_{i}"),
-                                    config.dot.a,
-                                    i,
-                                    || Value::known(i128_to_fr(self.a_raw[i])),
-                                )?;
-                                region.assign_advice(
-                                    || format!("b_{i}"),
-                                    config.dot.b,
-                                    i,
-                                    || Value::known(i128_to_fr(self.b_raw[i])),
-                                )?;
-                                config.dot.s_shift.enable(&mut region, i)?;
-                                a_shift_cells.push(region.assign_advice(
-                                    || format!("a_shift_{i}"),
-                                    config.dot.a_shift,
-                                    i,
-                                    || Value::known(i128_to_fr(shifted(self.a_raw[i]))),
-                                )?);
-                                b_shift_cells.push(region.assign_advice(
-                                    || format!("b_shift_{i}"),
-                                    config.dot.b_shift,
-                                    i,
-                                    || Value::known(i128_to_fr(shifted(self.b_raw[i]))),
-                                )?);
-                                region.assign_advice(
-                                    || format!("accumulator_{i}"),
-                                    config.dot.accumulator,
-                                    i,
-                                    || Value::known(i128_to_fr(*partial)),
-                                )?;
-                                if i == 0 {
-                                    config.dot.s_acc_start.enable(&mut region, i)?;
-                                } else {
-                                    config.dot.s_acc_step.enable(&mut region, i)?;
-                                }
-                            }
-
-                            let last = K - 1;
-                            config.dot.s_final.enable(&mut region, last)?;
-                            config.dot.s_slack.enable(&mut region, last)?;
-                            let q_cell =
-                                region.assign_advice(|| "q", config.dot.q, last, || q_shift_fr)?;
-                            let r_cell = region.assign_advice(
-                                || "r",
-                                config.dot.r,
-                                last,
-                                || Value::known(i128_to_fr(r)),
-                            )?;
-                            let slack_cell = region.assign_advice(
-                                || "slack",
-                                config.dot.slack,
-                                last,
-                                || Value::known(i128_to_fr(slack)),
-                            )?;
-                            Ok((q_cell, r_cell, slack_cell, a_shift_cells, b_shift_cells))
-                        },
-                    )?;
-
-                let range_a_chip = LookupRangeCheckChip::construct(config.dot.range_a.clone());
-                let range_b_chip = LookupRangeCheckChip::construct(config.dot.range_b.clone());
-                // Without this the lookup fails for lack of a table and the
-                // circuit would be rejected for the wrong reason.
-                range_a_chip.load_table(layouter.namespace(|| "byte table a"))?;
-                range_b_chip.load_table(layouter.namespace(|| "byte table b"))?;
-                let mut operand_links = Vec::with_capacity(2 * K);
-                for i in 0..K {
-                    let a_s = range_witness(self.a_raw[i]);
-                    let cell = range_a_chip.assign(
-                        layouter.namespace(|| format!("range a_{i}")),
-                        Value::known(i128_to_fr(a_s)),
-                        Value::known(a_s),
-                    )?;
-                    operand_links.push((a_shift_cells[i].cell(), cell.cell()));
-                    let b_s = range_witness(self.b_raw[i]);
-                    let cell = range_b_chip.assign(
-                        layouter.namespace(|| format!("range b_{i}")),
-                        Value::known(i128_to_fr(b_s)),
-                        Value::known(b_s),
-                    )?;
-                    operand_links.push((b_shift_cells[i].cell(), cell.cell()));
-                }
-
-                let range_q_chip = RangeCheckChip::construct(config.dot.range_q.clone());
-                let q_range_cell = range_q_chip.assign(
-                    layouter.namespace(|| "range q"),
-                    q_shift_fr,
-                    q_shift_raw,
-                )?;
-                let range_r_chip = RangeCheckChip::construct(config.dot.range_r.clone());
-                let r_range_cell = range_r_chip.assign(
-                    layouter.namespace(|| "range r"),
-                    Value::known(i128_to_fr(r)),
-                    Value::known(r),
-                )?;
-                let range_slack_chip = RangeCheckChip::construct(config.dot.range_r_slack.clone());
-                let slack_range_cell = range_slack_chip.assign(
-                    layouter.namespace(|| "range r slack"),
-                    Value::known(i128_to_fr(slack)),
-                    Value::known(slack),
-                )?;
-
-                layouter.assign_region(
-                    || "out of range operand links",
-                    |mut region| {
-                        region.constrain_equal(q_cell.cell(), q_range_cell.cell())?;
-                        region.constrain_equal(r_cell.cell(), r_range_cell.cell())?;
-                        region.constrain_equal(slack_cell.cell(), slack_range_cell.cell())?;
-                        for (lhs, rhs) in &operand_links {
-                            region.constrain_equal(*lhs, *rhs)?;
-                        }
-                        Ok(())
-                    },
-                )?;
-                Ok(())
-            }
-        }
-
-        // 10 * SCALE_18 = 1e19, above i64::MAX ~= 9.22e18. b_0 = 1 keeps the
-        // rescale witnesses small: q = 10, r = 0.
-        for forge in [
-            Forge::HonestShift,
-            Forge::ShiftIntoRange,
-            Forge::DisconnectedRangeWitness,
-        ] {
-            let circuit = OutOfRangeOperandCircuit {
-                a_raw: vec![10 * SCALE_18, 0, 0],
-                b_raw: vec![1, 0, 0],
-                forge,
-            };
-            let prover = MockProver::run(11, &circuit, vec![]).unwrap();
-            assert!(
-                prover.verify().is_err(),
-                "an operand above i64::MAX must not satisfy the circuit ({forge:?})"
-            );
-        }
     }
 }

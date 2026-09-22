@@ -49,7 +49,6 @@ use halo2_proofs::SerdeFormat;
 use rand_core::OsRng;
 
 use zkie_core::chips::dot_general::{DotProductChip, DotProductConfig};
-use zkie_core::chips::lookup_range_check::LIMB_BITS;
 use zkie_core::field_convert::Fr;
 use zkie_core::fixed_point::I18;
 
@@ -62,15 +61,7 @@ const DOT_LEN: usize = 264;
 /// `DotProductChip::configure`'s fixed range-check overhead: 64 bits for `q`,
 /// `REMAINDER_BITS = 60` for `r`, and 60 for `slack` (see
 /// `crates/zkie-core/src/chips/dot_general.rs`). Independent of `DOT_LEN`.
-///
-/// The per-operand bounds are *not* fixed overhead: they cost
-/// `2 * DOT_LEN * (64 / LIMB_BITS)` rows, which dominates at realistic
-/// contraction lengths. See `OPERAND_RANGE_ROWS_PER_ELEMENT`.
 const RANGE_CHECK_OVERHEAD_ROWS: usize = 64 + 60 + 60;
-
-/// Rows spent bounding one element's two operands to i64, via
-/// `LookupRangeCheckChip` at `LIMB_BITS = 8`.
-const OPERAND_RANGE_ROWS_PER_ELEMENT: usize = 2 * (64 / LIMB_BITS);
 
 #[derive(Clone)]
 struct BenchConfig {
@@ -84,8 +75,6 @@ struct BenchCircuit {
 }
 
 impl Circuit<Fr> for BenchCircuit {
-    type Params = ();
-
     type Config = BenchConfig;
     type FloorPlanner = SimpleFloorPlanner;
 
@@ -116,7 +105,6 @@ impl Circuit<Fr> for BenchCircuit {
         mut layouter: impl Layouter<Fr>,
     ) -> Result<(), ErrorFront> {
         let chip = DotProductChip::construct(config.dot);
-        chip.load_range_table(layouter.namespace(|| "bench range tables"))?;
         for i in 0..self.n_instances {
             chip.assign(
                 layouter.namespace(|| format!("bench dot {i}")),
@@ -144,8 +132,7 @@ fn main() {
     let dump_srs = args.get(3).map(|s| s == "dump-srs").unwrap_or(false);
 
     let max_rows = 1u64 << k;
-    let rows_per_instance =
-        (DOT_LEN * (1 + OPERAND_RANGE_ROWS_PER_ELEMENT) + RANGE_CHECK_OVERHEAD_ROWS) as u64;
+    let rows_per_instance = (DOT_LEN + RANGE_CHECK_OVERHEAD_ROWS) as u64;
     let n_instances =
         (((max_rows as f64) * fill_fraction) / (rows_per_instance as f64)).floor() as usize;
     let n_instances = n_instances.max(1);

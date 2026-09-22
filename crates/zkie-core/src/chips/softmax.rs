@@ -333,8 +333,6 @@ mod tests {
     }
 
     impl Circuit<Fr> for SoftmaxTestCircuit {
-        type Params = ();
-
         type Config = SoftmaxTestConfig;
         type FloorPlanner = SimpleFloorPlanner;
 
@@ -454,8 +452,6 @@ mod tests {
         }
 
         impl Circuit<Fr> for CountTestCircuit {
-            type Params = ();
-
             type Config = SoftmaxTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -516,8 +512,6 @@ mod tests {
         }
 
         impl Circuit<Fr> for ForgedExpCircuit {
-            type Params = ();
-
             type Config = SoftmaxTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 

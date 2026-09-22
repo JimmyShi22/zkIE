@@ -179,7 +179,7 @@ git commit -m "feat: bind compiled programs into local shards"
 
 - [ ] **Step 1: Add native known-answer and circuit-equality tests**
 
-Add `light-poseidon = "0.4.0"`, `ark-bn254 = "0.5.0"` and `ark-ff = "0.5.0"` as the parameter-source dependencies for Circom-compatible BN254 x5 Poseidon. Add a known-answer test for two inputs and a `MockProver` test showing the circuit output equals the native result. The comparable tensor-value commitment is role- and routing-neutral so producer and consumer endpoints can agree; bind role, edge IDs, and graph-output routing as separate descriptor public fields. Add negative tests for changed descriptor binding, dtype, shape, quantization scale, tensor length and value.
+Add `light-poseidon = "0.4.0"`, `ark-bn254 = "0.5.0"` and `ark-ff = "0.5.0"` as the parameter-source dependencies for Circom-compatible BN254 x5 Poseidon. Add a known-answer test for two inputs and a `MockProver` test showing the circuit output equals the native result. Add negative tests for changed role, dtype, shape, quantization scale, tensor length and value.
 
 - [ ] **Step 2: Run and observe missing commitment support**
 
@@ -193,15 +193,14 @@ Define the commitment as repeated two-input Poseidon compression:
 
 ```text
 state_0 = protocol_domain_field
-state_1 = Poseidon(state_0, dtype)
-state_2 = Poseidon(state_1, rank)
+state_1 = Poseidon(state_0, tensor_role)
+state_2 = Poseidon(state_1, dtype)
+state_3 = Poseidon(state_2, rank)
 state_* = Poseidon(state, each dimension)
 state_* = Poseidon(state, quantization scale)
 state_* = Poseidon(state, element count)
 commitment = fold(Poseidon(state, canonical_field(raw_i18)))
 ```
-
-The circuit also exposes a versioned digest of the full descriptor (role, register, edge IDs, graph-output names, dtype, shape and scale) as public fields. This routing binding is deliberately not part of the value commitment compared across an edge.
 
 Convert the published `light-poseidon` round constants and MDS entries into `halo2curves::bn256::Fr` using canonical little-endian field representations. Constrain every x5 S-box and MDS round inside `PoseidonBoundaryChip`; do not accept a host-computed hash as advice without round constraints.
 
@@ -259,8 +258,6 @@ pub fn merge_verified_claims(
 ```
 
 Order leaves by topological shard order, preserve model block groups when they fit, and never use dummy children. Each node stores ordered child IDs and actual arity. Encode N, actual arity and node topology in the plan digest.
-
-For this phase, a validated `PlannedShard` is the only trusted model-block grouping unit exposed by `PartitionPlan`; boundary-hint labels are not retained in the plan. Aggregation therefore never splits or reorders a planned shard, but does not infer larger groups from shard names or model instructions. Preserving larger cross-shard model-block groups is deferred until the compiler persists explicit, digest-bound group metadata.
 
 - [ ] **Step 4: Close cross-shard edges exactly once**
 

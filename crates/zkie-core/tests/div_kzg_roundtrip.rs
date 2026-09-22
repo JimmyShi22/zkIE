@@ -26,8 +26,6 @@ struct DivCircuit {
 }
 
 impl Circuit<Fr> for DivCircuit {
-    type Params = ();
-
     type Config = DivCircuitConfig;
     type FloorPlanner = SimpleFloorPlanner;
 

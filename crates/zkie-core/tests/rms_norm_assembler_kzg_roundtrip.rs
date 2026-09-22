@@ -94,8 +94,6 @@ struct RmsNormCircuit {
 }
 
 impl Circuit<Fr> for RmsNormCircuit {
-    type Params = ();
-
     type Config = AssemblerConfig;
     type FloorPlanner = SimpleFloorPlanner;
 

@@ -27,7 +27,6 @@
 ## File Structure
 
 - Modify `Cargo.toml`: add `crates/zkie-types` and `crates/zkie-prover` to the workspace.
-- Modify `.gitignore`: stop ignoring the workspace `Cargo.lock` now that the workspace will ship a CLI/runtime and needs reproducible dependency resolution.
 - Create `crates/zkie-types/Cargo.toml` and `src/lib.rs`.
 - Create `crates/zkie-types/src/identity.rs`: stable IDs and digests.
 - Create `crates/zkie-types/src/resource.rs`: resource quantities and checked arithmetic.
@@ -47,7 +46,6 @@
 
 **Files:**
 - Modify: `Cargo.toml`
-- Modify: `.gitignore`
 - Create: `crates/zkie-types/Cargo.toml`
 - Create: `crates/zkie-types/src/lib.rs`
 - Create: `crates/zkie-types/src/identity.rs`
@@ -116,8 +114,6 @@ impl ResourceCapacity {
 ```
 
 Define `ModelVisibility::{PublicModel, PrivateModel}` and a `RunIdentity` containing model/weights/compiler/ISA/quantization/partition/aggregation digests, proof flavor, visibility, fan-in and public-input schema version. Its canonical digest must change when any field changes. Reject zero CPU, GPU VRAM with zero GPUs, and arithmetic overflow. Add serde derives so the same representations can cross the worker boundary.
-
-Remove the `Cargo.lock` ignore rule and add the generated workspace lockfile. Keep all target/build directories ignored.
 
 - [ ] **Step 4: Run the crate tests**
 
@@ -236,7 +232,7 @@ git commit -m "feat: add runtime-shaped assembler circuit"
 
 **Interfaces:**
 - Consumes: Task 1 IDs/resources; compiler `Shard`; `AssemblerProgram`.
-- Produces: `WitnessJob`, `WitnessArtifact`, `PrepareJob`, `ProofJob`, `UnverifiedProof`, `VerifiedProof`, `KeyMaterialStore`, `WitnessBackend`, `ProofBackend`, typed backend errors.
+- Produces: `WitnessJob`, `WitnessArtifact`, `PrepareJob`, `ProofJob`, `UnverifiedProof`, `VerifiedProof`, `WitnessBackend`, `ProofBackend`, typed backend errors.
 
 - [ ] **Step 1: Add a compile-time contract test with a fake backend**
 
@@ -269,18 +265,6 @@ Run the Task 1 test command. Expected: missing trait/type errors.
 `UnverifiedProof` contains proof path/digest, public-statement bytes/digest, circuit digest, VK digest, flavor, backend ID and shard ID. `VerifiedProof` has private fields and is constructible only by a backend verifier. Define `BackendError` variants for unsupported instruction, invalid job, missing key, I/O and proving failure; define `VerificationError` separately so callers cannot convert it into a successful boolean.
 
 Use object-safe trait methods and owned serializable job specs so implementations can run in an independent process later.
-
-Define the storage seam used before the durable runtime exists:
-
-```rust
-pub trait KeyMaterialStore {
-    fn read(&self, identity: &KeyIdentity) -> Result<Option<Vec<u8>>, BackendError>;
-    fn write_if_absent(&self, identity: &KeyIdentity, bytes: &[u8])
-        -> Result<(), BackendError>;
-}
-```
-
-Provide an in-memory implementation under `#[cfg(test)]`; Plan 3's atomic `KeyStore` implements this trait.
 
 - [ ] **Step 4: Add negative tests**
 

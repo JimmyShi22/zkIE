@@ -72,15 +72,21 @@
 #![allow(clippy::excessive_precision)]
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
-use std::fs;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
 use halo2_proofs::circuit::{Layouter, SimpleFloorPlanner};
 use halo2_proofs::dev::MockProver;
-use halo2_proofs::plonk::{Circuit, ConstraintSystem, ErrorFront};
-use rand_core::{OsRng, RngCore};
+use halo2_proofs::halo2curves::bn256::{Bn256, G1Affine};
+use halo2_proofs::plonk::{
+    create_proof, keygen_pk, keygen_vk, verify_proof, Circuit, ConstraintSystem, ErrorFront,
+};
+use halo2_proofs::poly::kzg::commitment::{KZGCommitmentScheme, ParamsKZG};
+use halo2_proofs::poly::kzg::multiopen::{ProverSHPLONK, VerifierSHPLONK};
+use halo2_proofs::poly::kzg::strategy::SingleStrategy;
+use halo2_proofs::transcript::{
+    Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer,
+};
+use rand_core::OsRng;
 
 use zkie_compiler::circuit_binding::to_assembler_program;
 use zkie_compiler::graph_compiler::compile_graph;
@@ -89,12 +95,6 @@ use zkie_core::assembler::{AssemblerChip, AssemblerConfig, AssemblerProgram};
 use zkie_core::chips::layer_norm::RsqrtDomain;
 use zkie_core::field_convert::Fr;
 use zkie_core::fixed_point::I18;
-use zkie_prover::{
-    verify_proof, BackendError, BoundaryShapeManifest, Digest32, Halo2KzgCpuBackend, KeyIdentity,
-    KeyMaterialStore, KeyWriteOutcome, ModelVisibility, PrepareJob, ProofBackend, ProofFlavorId,
-    ProofJob, RunIdentity, SrsPolicy, VerificationExpectation, VerificationJob, WitnessBackend,
-    WitnessJob, ZkieIsaCpuWitnessBackend,
-};
 
 // dim=8 (first 8 real channels of FinText layer0 input_layernorm's real
 // activation + weight -- none of these needed exclusion for I18 range).
@@ -279,8 +279,6 @@ struct RmsNormFinTextCircuit {
 }
 
 impl Circuit<Fr> for RmsNormFinTextCircuit {
-    type Params = ();
-
     type Config = AssemblerConfig;
     type FloorPlanner = SimpleFloorPlanner;
 
@@ -332,11 +330,7 @@ impl Circuit<Fr> for RmsNormFinTextCircuit {
     }
 }
 
-fn build_program_and_domain() -> (
-    zkie_compiler::graph_compiler::CompiledProgram,
-    AssemblerProgram,
-    RsqrtDomain,
-) {
+fn build_program_and_domain() -> (AssemblerProgram, RsqrtDomain) {
     let graph = rms_norm_graph();
     let compiled = compile_graph(&graph).expect("should compile the real RMSNorm subgraph");
 
@@ -357,16 +351,12 @@ fn build_program_and_domain() -> (
         .expect("should convert to an assembler program");
 
     let target = exact_mean_sq_plus_eps(&FINTEXT_LAYER0_RMS_NORM_X, EPSILON_MILLI);
-    (
-        compiled,
-        program,
-        RsqrtDomain::RawAnchors(vec![target.raw()]),
-    )
+    (program, RsqrtDomain::RawAnchors(vec![target.raw()]))
 }
 
 #[test]
 fn compiles_real_fintext_rms_norm_subgraph_via_fusion() {
-    let (_compiled, program, _domain) = build_program_and_domain();
+    let (program, _domain) = build_program_and_domain();
     // Real weight (258 real trained floats) resolved through the real
     // pipeline.
     assert_eq!(program.weight_values[0].len(), DIM);
@@ -375,10 +365,10 @@ fn compiles_real_fintext_rms_norm_subgraph_via_fusion() {
 
 #[test]
 fn fintext_rms_norm_real_weights_kzg_roundtrip_matches_pytorch() {
-    let (compiled, program, domain) = build_program_and_domain();
+    let (program, domain) = build_program_and_domain();
     let circuit = RmsNormFinTextCircuit {
         program: program.clone(),
-        domain: domain.clone(),
+        domain,
         captured_outputs: RefCell::new(None),
     };
 
@@ -407,145 +397,55 @@ fn fintext_rms_norm_real_weights_kzg_roundtrip_matches_pytorch() {
         "zkIE's proven RmsNorm output diverges from the real PyTorch computation: max_diff={max_diff}"
     );
 
-    // The real KZG ceremony is owned by Halo2KzgCpuBackend. Feed it the same
-    // compiled FinText shard through the Task 4 typed CPU witness artifact.
-    let run = fintext_run_identity();
-    let shard = zkie_compiler::dag::Shard {
-        id: 0,
-        name: "fintext-layer0-rmsnorm".into(),
-        range: 0..compiled.instructions.len(),
-        inputs: vec![],
-        outputs: vec![zkie_compiler::graph_compiler::Register::Virtual(0)],
-    };
-    let mut domains = HashMap::new();
-    domains.insert((DIM, EPSILON_MILLI), domain);
-    let cpu = Arc::new(
-        ZkieIsaCpuWitnessBackend::new(
-            Arc::new(compiled),
-            shard,
-            domains.clone(),
-            run,
-            BoundaryShapeManifest::new(BTreeMap::from([("x".into(), DIM)]), BTreeMap::new())
-                .unwrap(),
-        )
-        .unwrap(),
+    // Real (non-mocked) KZG setup -> prove -> verify.
+    let mut rng = OsRng;
+    let params = ParamsKZG::<Bn256>::setup(k, &mut rng);
+    let vk = keygen_vk(&params, &circuit).expect("keygen_vk should not fail");
+    let pk = keygen_pk(&params, vk.clone(), &circuit).expect("keygen_pk should not fail");
+
+    let mut transcript = Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(vec![]);
+    create_proof::<KZGCommitmentScheme<Bn256>, ProverSHPLONK<'_, Bn256>, _, _, _, _>(
+        &params,
+        &pk,
+        std::slice::from_ref(&circuit),
+        &[vec![]],
+        &mut rng,
+        &mut transcript,
+    )
+    .expect("proof generation should not fail");
+    let proof = transcript.finalize();
+
+    let verifier_params = params.verifier_params();
+    let mut verifier_transcript = Blake2bRead::<_, G1Affine, Challenge255<_>>::init(&proof[..]);
+    let strategy = SingleStrategy::new(&verifier_params);
+    let result = verify_proof::<KZGCommitmentScheme<Bn256>, VerifierSHPLONK<Bn256>, _, _, _>(
+        &verifier_params,
+        &vk,
+        strategy,
+        &[vec![]],
+        &mut verifier_transcript,
     );
-    let dir = temp_dir();
-    let input_path = dir.join("input.json");
-    let raw_x = FINTEXT_LAYER0_RMS_NORM_X
-        .iter()
-        .map(|v| i18(*v).raw())
-        .collect::<Vec<_>>();
-    fs::write(
-        &input_path,
-        serde_json::json!({"schema_version":1,"graph_inputs":{"x":raw_x},"virtual_inputs":{}})
-            .to_string(),
-    )
-    .unwrap();
-    let witness_job = WitnessJob::new(
-        cpu.run_identity().clone(),
-        cpu.shard_identity().clone(),
-        input_path,
-        cpu.circuit_digest(),
-    )
-    .unwrap();
-    let witness = cpu.generate(witness_job, dir.join("witness.json")).unwrap();
-    let backend = Halo2KzgCpuBackend::new(
-        cpu.clone(),
-        program,
-        domains,
-        k,
-        SrsPolicy::DevelopmentGenerate,
-    )
-    .unwrap();
-    let prepare = PrepareJob::new_development_generate(
-        cpu.run_identity().clone(),
-        cpu.shard_identity().clone(),
-        k,
-    )
-    .unwrap();
-    let keys = backend.prepare(prepare, &TestKeyStore::default()).unwrap();
-    let proof_job = ProofJob::new(
-        cpu.run_identity().clone(),
-        cpu.shard_identity().clone(),
-        witness,
-        keys,
-    )
-    .unwrap();
-    let proof = backend
-        .prove(proof_job.clone(), dir.join("proof.bin"))
-        .unwrap();
-    let proof_bytes = fs::read(proof.proof_path()).unwrap();
-    let expectation = VerificationExpectation::from_proof_job(
-        &proof_job,
-        backend.capabilities().execution_backend().clone(),
-        proof.public_statement().to_vec(),
-        proof.proof_digest(),
-        proof.artifact_manifest().to_vec(),
-    )
-    .unwrap();
-    verify_proof(
-        &backend,
-        VerificationJob::new(expectation, proof.clone(), proof_bytes).unwrap(),
-    )
-    .unwrap();
-    let mut tampered = fs::read(proof.proof_path()).unwrap();
-    let mid = tampered.len() / 2;
-    tampered[mid] ^= 0xff;
-    fs::write(proof.proof_path(), tampered).unwrap();
     assert!(
-        backend.verify(&proof).is_err(),
+        result.is_ok(),
+        "real FinText RmsNorm proof failed to verify: {:?}",
+        result
+    );
+
+    // Tampered-proof negative test.
+    let mut tampered = proof.clone();
+    let mid = tampered.len() / 2;
+    tampered[mid] ^= 0xFF;
+    let mut tampered_transcript = Blake2bRead::<_, G1Affine, Challenge255<_>>::init(&tampered[..]);
+    let tampered_strategy = SingleStrategy::new(&verifier_params);
+    let tampered_result = verify_proof::<KZGCommitmentScheme<Bn256>, VerifierSHPLONK<Bn256>, _, _, _>(
+        &verifier_params,
+        &vk,
+        tampered_strategy,
+        &[vec![]],
+        &mut tampered_transcript,
+    );
+    assert!(
+        tampered_result.is_err(),
         "tampered proof should fail to verify"
     );
-    fs::remove_dir_all(dir).unwrap();
-}
-
-#[derive(Default)]
-struct TestKeyStore(Mutex<HashMap<KeyIdentity, Vec<u8>>>);
-impl KeyMaterialStore for TestKeyStore {
-    fn read(&self, id: &KeyIdentity) -> Result<Option<Vec<u8>>, BackendError> {
-        Ok(self.0.lock().unwrap().get(id).cloned())
-    }
-    fn write_if_absent(
-        &self,
-        id: &KeyIdentity,
-        bytes: &[u8],
-    ) -> Result<KeyWriteOutcome, BackendError> {
-        let mut values = self.0.lock().unwrap();
-        match values.get(id) {
-            Some(v) if v == bytes => Ok(KeyWriteOutcome::AlreadyPresentIdentical),
-            Some(_) => Err(BackendError::KeyConflict),
-            None => {
-                values.insert(id.clone(), bytes.to_vec());
-                Ok(KeyWriteOutcome::Inserted)
-            }
-        }
-    }
-}
-fn digest(byte: u8) -> Digest32 {
-    Digest32::new([byte; 32])
-}
-fn fintext_run_identity() -> RunIdentity {
-    RunIdentity {
-        model_graph_digest: digest(1),
-        weights_digest: digest(2),
-        compiler_digest: digest(3),
-        isa_digest: digest(4),
-        quantization_digest: digest(5),
-        partition_plan_digest: digest(6),
-        aggregation_plan_digest: digest(7),
-        proof_flavor: ProofFlavorId::parse("halo2-kzg-bn256-shplonk-v1").unwrap(),
-        model_visibility: ModelVisibility::PublicModel,
-        aggregation_fan_in: 2,
-        public_input_schema_version: 1,
-    }
-}
-fn temp_dir() -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "zkie-fintext-{}-{}",
-        std::process::id(),
-        OsRng.next_u64()
-    ));
-    fs::create_dir(&path).unwrap();
-    path
 }

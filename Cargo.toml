@@ -1,10 +1,9 @@
 [workspace]
 resolver = "2"
-members = [
-    "crates/zkie-core",
-    "crates/zkie-compiler",
-    "crates/zkie-prover",
-    "crates/zkie-runtime",
-    "crates/zkie-types",
-    "engines/timesfm",
-]
+members = ["crates/zkie-core", "crates/zkie-compiler", "crates/zkie-gkr", "crates/zkie-cuda", "engines/timesfm"]
+
+# The vendored copy adds one doc-hidden constructor (`MerkleTree::from_parts`)
+# used by zkie-cuda to wrap GPU-computed digest layers; everything else is
+# the unmodified crates.io 0.7.0 source. See crates/zkie-cuda/README.md.
+[patch.crates-io]
+p3-merkle-tree = { path = "crates/zkie-cuda/vendor/p3-merkle-tree" }

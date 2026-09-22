@@ -57,18 +57,8 @@ pub enum EdgeKind {
     Broadcast,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct EdgeId(String);
-
-impl EdgeId {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edge {
-    pub id: EdgeId,
     pub producer: usize,
     pub consumer: usize,
     pub register: Register,
@@ -113,10 +103,6 @@ pub enum BuildDagError {
         consumer_instruction: usize,
         register: Register,
     },
-    ForwardRegister {
-        consumer_instruction: usize,
-        register: Register,
-    },
 }
 
 impl fmt::Display for BuildDagError {
@@ -137,13 +123,6 @@ impl fmt::Display for BuildDagError {
             } => write!(
                 f,
                 "instruction {consumer_instruction} references {register:?}, which is not produced by any instruction in the program"
-            ),
-            BuildDagError::ForwardRegister {
-                consumer_instruction,
-                register,
-            } => write!(
-                f,
-                "instruction {consumer_instruction} references non-prior {register:?}"
             ),
         }
     }
@@ -203,12 +182,6 @@ pub fn build_dag(program: &CompiledProgram, specs: &[ShardSpec]) -> Result<Dag, 
                         register: Register::Virtual(*producer_instr_idx),
                     });
                 }
-                if *producer_instr_idx >= consumer_instr_idx {
-                    return Err(BuildDagError::ForwardRegister {
-                        consumer_instruction: consumer_instr_idx,
-                        register: Register::Virtual(*producer_instr_idx),
-                    });
-                }
                 let producer_shard = shard_of(*producer_instr_idx);
                 if producer_shard != consumer_shard {
                     let entry = consumers_of.entry(*producer_instr_idx).or_default();
@@ -244,7 +217,6 @@ pub fn build_dag(program: &CompiledProgram, specs: &[ShardSpec]) -> Result<Dag, 
         for &consumer_shard in consumers {
             inputs_by_shard[consumer_shard].push(register.clone());
             edges.push(Edge {
-                id: EdgeId(String::new()),
                 producer: producer_shard,
                 consumer: consumer_shard,
                 register: register.clone(),
@@ -252,29 +224,6 @@ pub fn build_dag(program: &CompiledProgram, specs: &[ShardSpec]) -> Result<Dag, 
             });
         }
     }
-
-    edges.sort_unstable_by(|left, right| {
-        (
-            left.producer,
-            left.consumer,
-            register_sort_key(&left.register),
-        )
-            .cmp(&(
-                right.producer,
-                right.consumer,
-                register_sort_key(&right.register),
-            ))
-    });
-    for edge in &mut edges {
-        let Register::Virtual(index) = edge.register else {
-            unreachable!("DAG edges are only virtual dependencies")
-        };
-        edge.id = EdgeId(format!(
-            "edge-v1:{:020}:{:020}:virtual:{index:020}",
-            edge.producer, edge.consumer
-        ));
-    }
-    edges.sort_unstable_by(|left, right| left.id.cmp(&right.id));
 
     let shards = specs
         .iter()
@@ -289,14 +238,6 @@ pub fn build_dag(program: &CompiledProgram, specs: &[ShardSpec]) -> Result<Dag, 
         .collect();
 
     Ok(Dag { shards, edges })
-}
-
-fn register_sort_key(register: &Register) -> (u8, &str, usize) {
-    match register {
-        Register::GraphInput(name) => (0, name, 0),
-        Register::Weight(name) => (1, name, 0),
-        Register::Virtual(index) => (2, "", *index),
-    }
 }
 
 #[cfg(test)]

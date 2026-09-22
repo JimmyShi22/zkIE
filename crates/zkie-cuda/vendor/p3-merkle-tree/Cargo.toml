@@ -1,0 +1,31 @@
+# Vendored p3-merkle-tree 0.7.0 (crates.io), patched with one doc-hidden
+# constructor (`MerkleTree::from_parts`) so zkie-cuda can build the tree's
+# digests on the GPU and reuse the upstream open/verify logic unchanged.
+# See crates/zkie-cuda/README.md and the [patch.crates-io] entry in the
+# workspace root manifest.
+
+[package]
+edition = "2024"
+name = "p3-merkle-tree"
+version = "0.7.0"
+description = "A Merkle tree implementation providing commitment scheme functionality for cryptographic proofs. (vendored for zkIE)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Plonky3/Plonky3"
+
+[lib]
+name = "p3_merkle_tree"
+path = "src/lib.rs"
+
+[dependencies]
+itertools = { version = "0.15.0", features = ["use_alloc"], default-features = false }
+p3-commit = "0.7.0"
+p3-field = "0.7.0"
+p3-matrix = "0.7.0"
+p3-maybe-rayon = "0.7.0"
+p3-symmetric = "0.7.0"
+p3-util = "0.7.0"
+rand = { version = "0.10.1", features = ["std_rng"], default-features = false }
+serde = { version = "1.0", features = ["alloc"], default-features = false }
+spin = "0.12.0"
+thiserror = { version = "2.0", default-features = false }
+tracing = { version = "0.1.44", features = ["attributes"], default-features = false }

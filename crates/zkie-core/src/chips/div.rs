@@ -377,8 +377,6 @@ mod tests {
     }
 
     impl Circuit<Fr> for DivTestCircuit {
-        type Params = ();
-
         type Config = DivTestConfig;
         type FloorPlanner = SimpleFloorPlanner;
 
@@ -488,8 +486,6 @@ mod tests {
         }
 
         impl Circuit<Fr> for ForgedDivCircuit {
-            type Params = ();
-
             type Config = DivTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -623,8 +619,6 @@ mod tests {
         }
 
         impl Circuit<Fr> for ForgedRemainderCircuit {
-            type Params = ();
-
             type Config = DivTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -761,8 +755,6 @@ mod tests {
         struct ForgedZeroDivisorCircuit;
 
         impl Circuit<Fr> for ForgedZeroDivisorCircuit {
-            type Params = ();
-
             type Config = DivTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -860,8 +852,6 @@ mod tests {
         }
 
         impl Circuit<Fr> for CrossRegionForgeCircuit {
-            type Params = ();
-
             type Config = DivTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 

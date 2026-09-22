@@ -67,8 +67,7 @@
 
 use crate::chips::eltwise::{EltwiseAddConfig, EltwiseMulConfig};
 use crate::chips::layer_norm::{
-    assign_add_row_with_witnesses, assign_mul_row_with_witnesses, RsqrtChip, RsqrtConfig,
-    RsqrtDomain,
+    assign_add_row, assign_mul_row, RsqrtChip, RsqrtConfig, RsqrtDomain,
 };
 use crate::chips::lookup::LookupError;
 use crate::chips::reduce::{ReduceMeanChip, ReduceMeanConfig};
@@ -242,16 +241,10 @@ impl RmsNormChip {
         RmsNormChip { config, rsqrt_chip }
     }
 
-    /// Loads the fixed `rsqrt` table and the byte table backing this chip's
-    /// multiply operand range checks. Must be called exactly once per
-    /// circuit synthesis.
-    pub fn load_table(&self, mut layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
-        self.rsqrt_chip
-            .load_table(layouter.namespace(|| "rms norm rsqrt table"))?;
-        crate::chips::eltwise::load_mul_operand_range_table(
-            &self.config.mul,
-            layouter.namespace(|| "rms norm mul operand tables"),
-        )
+    /// Loads the fixed `rsqrt` table. Must be called exactly once per
+    /// circuit synthesis. Delegates to [`RsqrtChip::load_table`].
+    pub fn load_table(&self, layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
+        self.rsqrt_chip.load_table(layouter)
     }
 
     fn unshift(
@@ -259,15 +252,9 @@ impl RmsNormChip {
         mut layouter: impl Layouter<Fr>,
         shifted_cell: &AssignedCell<Fr, Fr>,
         raw_value: i64,
-        witnesses_known: bool,
     ) -> Result<AssignedCell<Fr, Fr>, ErrorFront> {
         let (shifted_fr, _) = shifted_i64_witness(raw_value);
-        let unshifted_fr = witness_value(witnesses_known, i64_to_fr(raw_value));
-        let shifted_fr = if witnesses_known {
-            shifted_fr
-        } else {
-            Value::unknown()
-        };
+        let unshifted_fr = Value::known(i64_to_fr(raw_value));
         let (shifted_copy_cell, unshifted_cell) = layouter.assign_region(
             || "rms norm unshift",
             |mut region| {
@@ -300,19 +287,9 @@ impl RmsNormChip {
     /// see [`RmsNormOutput`] and this module's top-level soundness docs.
     pub fn assign(
         &self,
-        layouter: impl Layouter<Fr>,
-        inputs: &[I18],
-        weight: &[I18],
-    ) -> Result<RmsNormOutput, RmsNormError> {
-        self.assign_with_witnesses(layouter, inputs, weight, true)
-    }
-
-    pub fn assign_with_witnesses(
-        &self,
         mut layouter: impl Layouter<Fr>,
         inputs: &[I18],
         weight: &[I18],
-        witnesses_known: bool,
     ) -> Result<RmsNormOutput, RmsNormError> {
         let k = self.config.k;
         if inputs.len() != k {
@@ -340,13 +317,13 @@ impl RmsNormChip {
                         || "x anchor",
                         self.config.x_anchor,
                         0,
-                        || witness_value(witnesses_known, i64_to_fr(x.raw())),
+                        || Value::known(i64_to_fr(x.raw())),
                     )?;
                     let wc = region.assign_advice(
                         || "weight anchor",
                         self.config.weight_anchor,
                         0,
-                        || witness_value(witnesses_known, i64_to_fr(w.raw())),
+                        || Value::known(i64_to_fr(w.raw())),
                     )?;
                     Ok((xc, wc))
                 },
@@ -361,12 +338,11 @@ impl RmsNormChip {
         let mut squares = Vec::with_capacity(k);
         let mut square_cells = Vec::with_capacity(k);
         for (i, x) in inputs.iter().enumerate() {
-            let (a_cell, b_cell, sq_cell) = assign_mul_row_with_witnesses(
+            let (a_cell, b_cell, sq_cell) = assign_mul_row(
                 &self.config.mul,
                 layouter.namespace(|| format!("rms norm square {i}")),
                 *x,
                 *x,
-                witnesses_known,
             )?;
             layouter.assign_region(
                 || format!("rms norm square {i} anchor links"),
@@ -383,17 +359,13 @@ impl RmsNormChip {
         }
 
         // Step 2: mean_sq = (1/k) * sum_i sq_i.
-        let (mean_sq, mean_sq_cell, sq_input_cells) = mean_chip.assign_with_witness_mode(
-            layouter.namespace(|| "rms norm mean of squares"),
-            &squares,
-            witnesses_known,
-        )?;
+        let (mean_sq, mean_sq_cell, sq_input_cells) =
+            mean_chip.assign(layouter.namespace(|| "rms norm mean of squares"), &squares)?;
         for (i, sq) in squares.iter().enumerate() {
             let sq_unshifted_cell = self.unshift(
                 layouter.namespace(|| format!("rms norm square {i} unshift")),
                 &square_cells[i],
                 sq.raw(),
-                witnesses_known,
             )?;
             layouter.assign_region(
                 || format!("rms norm mean input {i} link"),
@@ -406,12 +378,11 @@ impl RmsNormChip {
         // Step 3: variance_plus_eps = mean_sq + epsilon. Both `mean_sq_cell`
         // (from `ReduceMeanChip`) and `EltwiseAddChip`'s `a` operand hold the
         // shifted representation, so no bridge is needed here.
-        let (vpe_a_cell, _vpe_b_cell, vpe_cell) = assign_add_row_with_witnesses(
+        let (vpe_a_cell, _vpe_b_cell, vpe_cell) = assign_add_row(
             &self.config.add,
             layouter.namespace(|| "rms norm variance plus epsilon"),
             mean_sq.raw(),
             self.config.epsilon.raw(),
-            witnesses_known,
         )?;
         layouter.assign_region(
             || "rms norm variance plus epsilon link",
@@ -426,18 +397,13 @@ impl RmsNormChip {
         // Step 4: rsqrt_value = rsqrt(variance_plus_eps).
         let rsqrt_value = self
             .rsqrt_chip
-            .assign_with_witness_mode(
-                layouter.namespace(|| "rms norm rsqrt"),
-                vpe,
-                witnesses_known,
-            )
+            .assign(layouter.namespace(|| "rms norm rsqrt"), vpe)
             .map_err(RmsNormError::Rsqrt)?;
 
         let vpe_unshifted_cell = self.unshift(
             layouter.namespace(|| "rms norm variance plus epsilon unshift"),
             &vpe_cell,
             vpe.raw(),
-            witnesses_known,
         )?;
 
         let rsqrt_config = self.config.rsqrt.clone();
@@ -449,13 +415,13 @@ impl RmsNormChip {
                     || "rsqrt input",
                     rsqrt_config.input_column(),
                     0,
-                    || witness_value(witnesses_known, i64_to_fr(vpe.raw())),
+                    || Value::known(i64_to_fr(vpe.raw())),
                 )?;
                 let output_cell = region.assign_advice(
                     || "rsqrt output",
                     rsqrt_config.output_column(),
                     0,
-                    || witness_value(witnesses_known, i64_to_fr(rsqrt_value.raw())),
+                    || Value::known(i64_to_fr(rsqrt_value.raw())),
                 )?;
                 Ok((input_cell, output_cell))
             },
@@ -469,12 +435,11 @@ impl RmsNormChip {
         let mut normed = Vec::with_capacity(k);
         let mut normed_cells = Vec::with_capacity(k);
         for (i, x) in inputs.iter().enumerate() {
-            let (a_cell, b_cell, normed_cell) = assign_mul_row_with_witnesses(
+            let (a_cell, b_cell, normed_cell) = assign_mul_row(
                 &self.config.mul,
                 layouter.namespace(|| format!("rms norm scale {i}")),
                 *x,
                 rsqrt_value,
-                witnesses_known,
             )?;
             layouter.assign_region(
                 || format!("rms norm scale {i} links"),
@@ -497,14 +462,12 @@ impl RmsNormChip {
                 layouter.namespace(|| format!("rms norm normed {i} unshift")),
                 &normed_cells[i],
                 n.raw(),
-                witnesses_known,
             )?;
-            let (a_cell, b_cell, out_cell) = assign_mul_row_with_witnesses(
+            let (a_cell, b_cell, out_cell) = assign_mul_row(
                 &self.config.mul,
                 layouter.namespace(|| format!("rms norm weight scale {i}")),
                 *n,
                 weight[i],
-                witnesses_known,
             )?;
             layouter.assign_region(
                 || format!("rms norm weight scale {i} links"),
@@ -528,18 +491,9 @@ impl RmsNormChip {
     }
 }
 
-fn witness_value<T: Copy>(known: bool, value: T) -> Value<T> {
-    if known {
-        Value::known(value)
-    } else {
-        Value::unknown()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chips::layer_norm::assign_mul_row;
     use halo2_proofs::circuit::{SimpleFloorPlanner, Value};
     use halo2_proofs::dev::MockProver;
     use halo2_proofs::plonk::{Circuit, ConstraintSystem, ErrorFront};
@@ -555,7 +509,7 @@ mod tests {
     const RSQRT_DOMAIN_MAX: f64 = 3.0;
     const RSQRT_DOMAIN_N: usize = 101;
 
-    const CIRCUIT_K: u32 = 13;
+    const CIRCUIT_K: u32 = 12;
 
     fn sample_inputs() -> Vec<I18> {
         // x^2: 2.25, 0.25, 0.25, 2.25 -> mean = 1.25 exactly.
@@ -668,8 +622,6 @@ mod tests {
     }
 
     impl Circuit<Fr> for RmsNormTestCircuit {
-        type Params = ();
-
         type Config = RmsNormTestConfig;
         type FloorPlanner = SimpleFloorPlanner;
 
@@ -735,8 +687,6 @@ mod tests {
     fn assign_rejects_wrong_input_count_at_the_rust_level() {
         struct GuardCircuit;
         impl Circuit<Fr> for GuardCircuit {
-            type Params = ();
-
             type Config = RmsNormTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -788,8 +738,6 @@ mod tests {
     fn forged_weight_link_is_rejected() {
         struct MismatchedWeightCircuit;
         impl Circuit<Fr> for MismatchedWeightCircuit {
-            type Params = ();
-
             type Config = RmsNormTestConfig;
             type FloorPlanner = SimpleFloorPlanner;
 

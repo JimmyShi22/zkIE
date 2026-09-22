@@ -9,7 +9,6 @@ pub mod graph_compiler;
 pub mod onnx_parser;
 pub mod op_mapper;
 pub mod rms_norm_fusion;
-pub mod shard_binding;
 
 #[cfg(test)]
 mod tests {
