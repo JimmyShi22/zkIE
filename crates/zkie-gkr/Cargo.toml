@@ -20,3 +20,8 @@ p3-symmetric = "0.7.0"
 p3-util = "0.7.0"
 p3-whir = "0.7.0"
 rand = "0.10.1"
+zkie-cuda = { path = "../zkie-cuda", optional = true }
+
+[features]
+default = []
+cuda = ["dep:zkie-cuda"]

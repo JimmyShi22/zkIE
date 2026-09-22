@@ -34,9 +34,20 @@ type MerkleHash = PaddingFreeSponge<Perm, 16, 8, 8>;
 type MerkleCompress = TruncatedPermutation<Perm, 2, 8, 16>;
 type MyChallenger = DuplexChallenger<F, Perm, 16, 8>;
 type PackedF = <F as Field>::Packing;
-type MyMmcs = MerkleTreeMmcs<PackedF, PackedF, MerkleHash, MerkleCompress, 2, 8>;
-type MyDft = Radix2DFTSmallBatch<F>;
 type MyLayout = SuffixProver<F, EF>;
+
+// The DFT and Merkle engines are swappable at the type level: with the
+// `cuda` feature they are the GPU-backed implementations (which internally
+// fall back to the CPU paths when no device is available or a kernel
+// fails), otherwise the pure-CPU p3 implementations.
+#[cfg(not(feature = "cuda"))]
+type MyMmcs = MerkleTreeMmcs<PackedF, PackedF, MerkleHash, MerkleCompress, 2, 8>;
+#[cfg(feature = "cuda")]
+type MyMmcs = zkie_cuda::merkle::CudaMerkleTreeMmcs;
+#[cfg(not(feature = "cuda"))]
+type MyDft = Radix2DFTSmallBatch<F>;
+#[cfg(feature = "cuda")]
+type MyDft = zkie_cuda::dft::CudaDft;
 type MyPcs = WhirProver<EF, F, MyDft, MyMmcs, MyChallenger, MyLayout>;
 
 pub type Commitment = <MyPcs as MultilinearPcs<EF, MyChallenger>>::Commitment;
@@ -94,7 +105,10 @@ impl Whir {
             0,
         );
         let config = WhirConfig::<EF, F, MyChallenger>::new(num_variables, params).unwrap();
+        #[cfg(not(feature = "cuda"))]
         let dft = MyDft::new(1 << config.max_fft_size());
+        #[cfg(feature = "cuda")]
+        let dft = MyDft::new();
         let pcs = MyPcs::new(config, dft, mmcs);
 
         Whir {
