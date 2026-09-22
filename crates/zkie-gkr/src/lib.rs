@@ -9,9 +9,11 @@
 
 pub mod field;
 pub mod fixed_point;
+pub mod gelu;
 pub mod lookup;
 pub mod matmul;
 pub mod mle;
+pub mod rmsnorm;
 pub mod softmax;
 pub mod sumcheck;
 pub mod whir;
