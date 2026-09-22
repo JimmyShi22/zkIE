@@ -271,6 +271,27 @@ pub fn rms_norm_raw(
     (raw, rstd, s_index)
 }
 
+/// Compute `out = f(round(in / 2^shift) + bias)` with the same rounding rules
+/// [`prove_affine`] checks, so a caller can commit the output and then run
+/// `prove_affine` against it. `f` is the identity (`relu == false`) or ReLU.
+pub fn affine_raw(
+    input: &[Goldilocks],
+    bias: &[Goldilocks],
+    shift: u32,
+    relu: bool,
+) -> Vec<Goldilocks> {
+    assert_eq!(input.len(), bias.len());
+    input
+        .iter()
+        .zip(bias)
+        .map(|(&iv, &bv)| {
+            let v = div_round(to_i64(iv), 1i64 << shift) + to_i32(bv) as i64;
+            let v = if relu { v.max(0) } else { v };
+            from_i32(v as i32)
+        })
+        .collect()
+}
+
 /// Prove the raw RMSNorm product `raw = x * rstd * w` (scale 2^48) against WHIR
 /// commitments, in the O(N)-opening PoC form. `mean(x^2)` is recomputed from the
 /// *committed* `x`, and `rstd = 1/sqrt(mean(x^2) + eps)` is bound to it by a
