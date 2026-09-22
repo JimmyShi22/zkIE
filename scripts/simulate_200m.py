@@ -123,13 +123,14 @@ def main():
     for L in range(20):
         p = f"stacked_transformer.layers.{L}"
         lnw = q(inits[f"{p}.input_layernorm.weight"])
+        residual = x
         x = rms_norm(x, lnw, rsqrt)
         qkv_w, o_w, g_w, d_w = [q(inits[w]) for w in layer_weights[L]]
         qkv_b = q(inits[f"{p}.self_attn.qkv_proj.bias"])
         o_b = q(inits[f"{p}.self_attn.o_proj.bias"])
         g_b = q(inits[f"{p}.mlp.gate_proj.bias"])
         d_b = q(inits[f"{p}.mlp.down_proj.bias"])
-        x = x + attention(x, qkv_w, qkv_b, o_w, o_b, q_scale, mask_q, exp_t)
+        x = residual + attention(x, qkv_w, qkv_b, o_w, o_b, q_scale, mask_q, exp_t)
         if L == 0:
             e0 = np.abs(x.astype(np.float64) / SCALE - add5_ref.reshape(SEQ, -1)).max()
             print(f"layer 0 attention output err = {e0:.3e}")
