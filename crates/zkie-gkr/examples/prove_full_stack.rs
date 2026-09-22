@@ -231,7 +231,7 @@ fn main() {
     let c_add31 = commit(&whir11, &add31);
     assert!(prove_add(&whir11, &c_lin32, &whir11, &c_lin33, &whir11, &c_add31, 2048, &mut rng));
     let c_out = commit(&whir11, &output_ts);
-    assert!(prove_scale(&whir11, &c_add31, &whir11, &c_out, scale_q, &bias_bcast));
+    assert!(prove_scale(&whir11, &c_add31, &add31, &whir11, &c_out, &output_ts, scale_q, &bias_bcast, &mut rng));
 
     println!("TimesFM 8M: prologue + 7-layer stack + output head verified from WHIR commitments");
 }

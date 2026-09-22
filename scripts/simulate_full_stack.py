@@ -20,12 +20,7 @@ SCALE = 65536.0
 
 def div_round(a: int, b: int) -> int:
     q, r = divmod(a, b)
-    twice = r * 2
-    if twice > b:
-        return q + 1
-    if twice < b:
-        return q
-    return q if q % 2 == 0 else q + 1
+    return q + 1 if r * 2 >= b else q
 
 
 def pad1(arr: np.ndarray, n: int) -> np.ndarray:
