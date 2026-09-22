@@ -6,7 +6,7 @@
 //! left operand is a vector and needs no transpose point-swap.
 
 use crate::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64};
-use crate::fixed_point::{from_i32, to_i32};
+use crate::fixed_point::{from_i32, to_i32, to_i64};
 use crate::lookup;
 use crate::whir::{Commitment, OpeningProtocol, ProverData, Whir};
 use crate::{matmul, mle};
@@ -232,10 +232,111 @@ pub fn prove_layer_norm(
     true
 }
 
+/// Prove `out = f(round(in / 2^shift) + bias)` against WHIR commitments, in the
+/// O(N)-opening PoC form, where `f` is either the identity (`relu == false`) or
+/// ReLU (`relu == true`). `in` is a raw dot-product output embedded as signed
+/// i64 (scale 2^32 for matmuls, 2^48 for the LayerNorm raw product), `bias` and
+/// `out` are at scale 2^16. The rescale is ties-to-even (matching the Python
+/// reference), and the ReLU is a deterministic host-side sign check — no lookup,
+/// exactly like the mean/variance reduction in `prove_layer_norm`.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_affine(
+    whir_in: &Whir,
+    input: &Committed,
+    whir_out: &Whir,
+    output: &Committed,
+    bias: &[Goldilocks],
+    shift: u32,
+    relu: bool,
+) -> bool {
+    let n = bias.len();
+    let d = n.trailing_zeros() as usize;
+    for (i, &bias_i) in bias.iter().enumerate() {
+        let point: Vec<Goldilocks> = (0..d)
+            .map(|b| Goldilocks::from_bool((i >> b) & 1 == 1))
+            .collect();
+        let (in_open, inv) = whir_in.open(input.prover_data.clone(), &input.protocol, &point);
+        let (out_open, ov) = whir_out.open(output.prover_data.clone(), &output.protocol, &point);
+        if whir_in
+            .verify(&input.commitment, &in_open, &input.protocol, &point)
+            .unwrap()
+            != inv
+        {
+            return false;
+        }
+        if whir_out
+            .verify(&output.commitment, &out_open, &output.protocol, &point)
+            .unwrap()
+            != ov
+        {
+            return false;
+        }
+        let val_q = div_round(to_i64(inv), 1i64 << shift);
+        let linear = val_q + to_i32(bias_i) as i64;
+        let expected = if relu { linear.max(0) } else { linear };
+        if to_i32(ov) as i64 != expected {
+            return false;
+        }
+    }
+    true
+}
+
+/// Convenience wrapper over [`prove_affine`] for the ReLU step: `out =
+/// ReLU(round(in / 2^16) + bias)` with `in` a raw matmul output at scale 2^32.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_relu(
+    whir_in: &Whir,
+    input: &Committed,
+    whir_out: &Whir,
+    output: &Committed,
+    bias: &[Goldilocks],
+) -> bool {
+    prove_affine(whir_in, input, whir_out, output, bias, 16, true)
+}
+
+/// Prove the element-wise field addition `c = a + b` against WHIR commitments,
+/// in the O(N)-opening PoC form. Used for bias additions and residual
+/// connections once the intermediate tensors are chained: both operands are
+/// committed, and the verifier recomputes the sum at every hypercube point.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_add(
+    whir_a: &Whir,
+    a: &Committed,
+    whir_b: &Whir,
+    b: &Committed,
+    whir_c: &Whir,
+    c: &Committed,
+    n: usize,
+) -> bool {
+    let d = n.trailing_zeros() as usize;
+    for i in 0..n {
+        let point: Vec<Goldilocks> = (0..d)
+            .map(|b| Goldilocks::from_bool((i >> b) & 1 == 1))
+            .collect();
+        let (a_open, av) = whir_a.open(a.prover_data.clone(), &a.protocol, &point);
+        let (b_open, bv) = whir_b.open(b.prover_data.clone(), &b.protocol, &point);
+        let (c_open, cv) = whir_c.open(c.prover_data.clone(), &c.protocol, &point);
+        if whir_a.verify(&a.commitment, &a_open, &a.protocol, &point).unwrap() != av {
+            return false;
+        }
+        if whir_b.verify(&b.commitment, &b_open, &b.protocol, &point).unwrap() != bv {
+            return false;
+        }
+        if whir_c.verify(&c.commitment, &c_open, &c.protocol, &point).unwrap() != cv {
+            return false;
+        }
+        if cv != av + bv {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::field::PrimeCharacteristicRing;
+    use crate::fixed_point::from_i64;
 
     #[test]
     fn committed_matmul_roundtrip() {
@@ -321,5 +422,88 @@ mod tests {
         assert!(!prove_layer_norm(
             &whir, &cx, &whir, &c_bad, &weight, n_real, &rsqrt_table, alpha, beta,
         ));
+    }
+
+    #[test]
+    fn committed_relu_roundtrip() {
+        let mut rng = XorShift64::new(0x234);
+        let n = 64usize;
+        // Raw matmul output at scale 2^32 (signed i64), bias at scale 2^16.
+        let raw: Vec<Goldilocks> = (0..n)
+            .map(|_| {
+                let v = (rng.next_u64() % (1u64 << 34)) as i64 - (1i64 << 33);
+                from_i64(v)
+            })
+            .collect();
+        let bias: Vec<Goldilocks> = (0..n)
+            .map(|_| from_i32((rng.next_u64() % 65536) as i32 - 32768))
+            .collect();
+        let out: Vec<Goldilocks> = raw
+            .iter()
+            .zip(&bias)
+            .map(|(&r, &b)| {
+                let linear = div_round(to_i64(r), 1 << 16) + to_i32(b) as i64;
+                from_i32(linear.max(0) as i32)
+            })
+            .collect();
+
+        let whir = Whir::new_testing(6);
+        let c_in = commit(&whir, &raw);
+        let c_out = commit(&whir, &out);
+        assert!(prove_relu(&whir, &c_in, &whir, &c_out, &bias));
+
+        let mut bad = out.clone();
+        bad[0] += Goldilocks::ONE;
+        let c_bad = commit(&whir, &bad);
+        assert!(!prove_relu(&whir, &c_in, &whir, &c_bad, &bias));
+    }
+
+    #[test]
+    fn committed_affine_rescale_roundtrip() {
+        let mut rng = XorShift64::new(0x456);
+        let n = 64usize;
+        // Raw LayerNorm product at scale 2^48, rescale by 2^32, then bias.
+        let raw: Vec<Goldilocks> = (0..n)
+            .map(|_| {
+                let v = (rng.next_u64() % (1u64 << 50)) as i64 - (1i64 << 49);
+                from_i64(v)
+            })
+            .collect();
+        let bias: Vec<Goldilocks> = (0..n)
+            .map(|_| from_i32((rng.next_u64() % 65536) as i32 - 32768))
+            .collect();
+        let out: Vec<Goldilocks> = raw
+            .iter()
+            .zip(&bias)
+            .map(|(&r, &b)| {
+                let v = div_round(to_i64(r), 1i64 << 32) + to_i32(b) as i64;
+                from_i32(v as i32)
+            })
+            .collect();
+
+        let whir = Whir::new_testing(6);
+        let c_in = commit(&whir, &raw);
+        let c_out = commit(&whir, &out);
+        assert!(prove_affine(&whir, &c_in, &whir, &c_out, &bias, 32, false));
+    }
+
+    #[test]
+    fn committed_add_roundtrip() {
+        let mut rng = XorShift64::new(0x345);
+        let n = 64usize;
+        let a: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let b: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let c: Vec<Goldilocks> = a.iter().zip(&b).map(|(&x, &y)| x + y).collect();
+
+        let whir = Whir::new_testing(6);
+        let ca = commit(&whir, &a);
+        let cb = commit(&whir, &b);
+        let cc = commit(&whir, &c);
+        assert!(prove_add(&whir, &ca, &whir, &cb, &whir, &cc, n));
+
+        let mut bad = c.clone();
+        bad[0] += Goldilocks::ONE;
+        let c_bad = commit(&whir, &bad);
+        assert!(!prove_add(&whir, &ca, &whir, &cb, &whir, &c_bad, n));
     }
 }

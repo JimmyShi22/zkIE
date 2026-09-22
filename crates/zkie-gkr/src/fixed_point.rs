@@ -46,6 +46,29 @@ pub fn to_i32(x: Goldilocks) -> i32 {
     }
 }
 
+/// Embed a signed `i64` value in the field. Used for raw dot-product outputs at
+/// scale 2^32 (a `2^16` activation dot a `2^16` weight summed over K terms),
+/// which stay inside `(-2^63, 2^63)` for the TimesFM shapes and therefore never
+/// wrap the 64-bit field.
+pub fn from_i64(x: i64) -> Goldilocks {
+    if x >= 0 {
+        Goldilocks::from_u64(x as u64)
+    } else {
+        Goldilocks::from_u64(P - x.unsigned_abs())
+    }
+}
+
+/// Recover the signed `i64` value embedded by [`from_i64`]. Values must lie in
+/// `(-2^63, 2^63)` so the sign convention is unambiguous.
+pub fn to_i64(x: Goldilocks) -> i64 {
+    let v = x.as_canonical_u64();
+    if v <= i64::MAX as u64 {
+        v as i64
+    } else {
+        -((P - v) as i64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,6 +114,15 @@ mod tests {
         for _ in 0..1000 {
             let x = (rng.next_u64() % (1u64 << 32)) as u32 as i32;
             assert_eq!(to_i32(from_i32(x)), x);
+        }
+    }
+
+    #[test]
+    fn int64_roundtrip() {
+        let mut rng = XorShift64::new(23);
+        for _ in 0..1000 {
+            let x = (rng.next_u64() % (1u64 << 60)) as i64 - (1i64 << 59);
+            assert_eq!(to_i64(from_i64(x)), x);
         }
     }
 }
