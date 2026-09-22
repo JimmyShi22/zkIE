@@ -4,39 +4,39 @@
 //! which is a table lookup; the sum and division are plain field operations
 //! (the division is a single batch inversion in a real circuit).
 
-use crate::field::F64;
+use crate::field::{Field, Goldilocks, PrimeCharacteristicRing};
 use crate::lookup::{self, LookupProof};
 
 pub struct SoftmaxProof {
     pub lookup: LookupProof,
     /// `sum_i e_i`.
-    pub sum: F64,
+    pub sum: Goldilocks,
 }
 
 /// Run quantized softmax over table indices and produce a lookup proof that
 /// every `exp` value really came from the table.
 pub fn softmax(
     indices: &[u32],
-    table: &[F64],
-    alpha: F64,
-    beta: F64,
-) -> (Vec<F64>, SoftmaxProof) {
-    let e: Vec<F64> = indices.iter().map(|&i| table[i as usize]).collect();
-    let sum = e.iter().fold(F64::ZERO, |acc, &v| acc + v);
-    let inv = sum.inv();
-    let y: Vec<F64> = e.iter().map(|&v| v * inv).collect();
+    table: &[Goldilocks],
+    alpha: Goldilocks,
+    beta: Goldilocks,
+) -> (Vec<Goldilocks>, SoftmaxProof) {
+    let e: Vec<Goldilocks> = indices.iter().map(|&i| table[i as usize]).collect();
+    let sum = e.iter().fold(Goldilocks::ZERO, |acc, &v| acc + v);
+    let inv = sum.inverse();
+    let y: Vec<Goldilocks> = e.iter().map(|&v| v * inv).collect();
     let lookup = lookup::prove(indices, &e, table, alpha, beta);
     (y, SoftmaxProof { lookup, sum })
 }
 
 /// Verify that the outputs sum to one and that the exp lookup is consistent.
-pub fn verify(indices: &[u32], table: &[F64], y: &[F64], proof: &SoftmaxProof) -> bool {
+pub fn verify(indices: &[u32], table: &[Goldilocks], y: &[Goldilocks], proof: &SoftmaxProof) -> bool {
     // Outputs must sum to 1 (the softmax normalization).
-    if y.iter().fold(F64::ZERO, |acc, &v| acc + v) != F64::ONE {
+    if y.iter().fold(Goldilocks::ZERO, |acc, &v| acc + v) != Goldilocks::ONE {
         return false;
     }
     // Recover e_i = y_i * sum, then check the lookup e_i == table[x_i].
-    let e: Vec<F64> = y.iter().map(|&v| v * proof.sum).collect();
+    let e: Vec<Goldilocks> = y.iter().map(|&v| v * proof.sum).collect();
     lookup::verify(&proof.lookup)
         && e.iter().zip(indices).all(|(&ev, &i)| ev == table[i as usize])
 }
@@ -50,14 +50,14 @@ mod tests {
     fn softmax_roundtrip() {
         let mut rng = XorShift64::new(13);
         let n = 128usize;
-        let table: Vec<F64> = (0..n).map(|_| rng.field()).collect();
+        let table: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
         let indices: Vec<u32> = (0..n).map(|_| (rng.next_u64() % n as u64) as u32).collect();
         let (y, proof) = softmax(&indices, &table, rng.field(), rng.field());
         assert!(verify(&indices, &table, &y, &proof));
 
         // Corrupt one output and confirm verification fails.
         let mut bad = y.clone();
-        bad[0] = bad[0] + F64::ONE;
+        bad[0] = bad[0] + Goldilocks::ONE;
         assert!(!verify(&indices, &table, &bad, &proof));
     }
 }

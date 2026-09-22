@@ -6,18 +6,18 @@
 //! `(-P/2, P/2)` the field result is the integer result with no wrap, which is
 //! exactly the condition Goldilocks satisfies for int16 accumulation.
 
-use crate::field::{F64, P};
+use crate::field::{Goldilocks, P, PrimeCharacteristicRing, PrimeField64};
 
-pub fn from_i16(x: i16) -> F64 {
+pub fn from_i16(x: i16) -> Goldilocks {
     if x >= 0 {
-        F64::new(x as u64)
+        Goldilocks::from_u64(x as u64)
     } else {
-        F64::new(P - (x.unsigned_abs() as u64))
+        Goldilocks::from_u64(P - (x.unsigned_abs() as u64))
     }
 }
 
-pub fn to_i16(x: F64) -> i16 {
-    let v = x.val();
+pub fn to_i16(x: Goldilocks) -> i16 {
+    let v = x.as_canonical_u64();
     if v <= i16::MAX as u64 {
         v as i16
     } else {
@@ -54,12 +54,12 @@ mod tests {
         let field_sum = a
             .iter()
             .zip(&b)
-            .fold(F64::ZERO, |acc, (&x, &y)| acc + from_i16(x) * from_i16(y));
+            .fold(Goldilocks::ZERO, |acc, (&x, &y)| acc + from_i16(x) * from_i16(y));
 
-        let as_signed = if field_sum.val() > i64::MAX as u64 {
-            -((P - field_sum.val()) as i64)
+        let as_signed = if field_sum.as_canonical_u64() > i64::MAX as u64 {
+            -((P - field_sum.as_canonical_u64()) as i64)
         } else {
-            field_sum.val() as i64
+            field_sum.as_canonical_u64() as i64
         };
         assert_eq!(as_signed, int_sum);
     }

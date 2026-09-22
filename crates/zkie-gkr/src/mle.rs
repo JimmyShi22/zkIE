@@ -3,9 +3,9 @@
 //! Conventions: variable `0` is the least-significant bit of the flattened
 //! index; `partial_eval` fixes the *first* `fix.len()` variables.
 
-use crate::field::F64;
+use crate::field::Goldilocks;
 
-pub fn eval(values: &[F64], point: &[F64]) -> F64 {
+pub fn eval(values: &[Goldilocks], point: &[Goldilocks]) -> Goldilocks {
     let t = point.len();
     assert_eq!(values.len(), 1 << t, "mle eval: length mismatch");
     let mut buf = values.to_vec();
@@ -22,7 +22,7 @@ pub fn eval(values: &[F64], point: &[F64]) -> F64 {
     buf[0]
 }
 
-pub fn partial_eval(values: &[F64], fix: &[F64]) -> Vec<F64> {
+pub fn partial_eval(values: &[Goldilocks], fix: &[Goldilocks]) -> Vec<Goldilocks> {
     assert!(fix.len() <= values.len().trailing_zeros() as usize);
     let mut buf = values.to_vec();
     for &p in fix {
@@ -45,8 +45,8 @@ mod tests {
     #[test]
     fn partial_then_full_matches_full() {
         let mut rng = XorShift64::new(2);
-        let values: Vec<F64> = (0..16).map(|_| rng.field()).collect();
-        let point: Vec<F64> = (0..4).map(|_| rng.field()).collect();
+        let values: Vec<Goldilocks> = (0..16).map(|_| rng.field()).collect();
+        let point: Vec<Goldilocks> = (0..4).map(|_| rng.field()).collect();
 
         let rest = partial_eval(&values, &point[..2]);
         assert_eq!(rest.len(), 4);

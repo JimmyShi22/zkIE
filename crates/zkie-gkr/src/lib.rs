@@ -9,12 +9,10 @@
 
 pub mod field;
 pub mod fixed_point;
-pub mod fri;
 pub mod lookup;
 pub mod matmul;
-pub mod merkle;
 pub mod mle;
 pub mod softmax;
 pub mod sumcheck;
 
-pub use field::F64;
+pub use field::Goldilocks;

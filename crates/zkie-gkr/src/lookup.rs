@@ -7,43 +7,43 @@
 //! sum-check already handles, so it slots into the GKR pipeline as another
 //! parallel reduction rather than a sorting/permutation argument.
 
-use crate::field::F64;
+use crate::field::{Field, Goldilocks, PrimeCharacteristicRing};
 
 #[derive(Clone, Debug)]
 pub struct LookupProof {
     /// `sum_i 1/(alpha + (x_i + beta*y_i))`.
-    pub lhs: F64,
+    pub lhs: Goldilocks,
     /// `sum_j m_j / (alpha + (j + beta*table[j]))`.
-    pub rhs: F64,
-    pub alpha: F64,
-    pub beta: F64,
+    pub rhs: Goldilocks,
+    pub alpha: Goldilocks,
+    pub beta: Goldilocks,
 }
 
 /// Build the lookup proof for `outputs[i] == table[indices[i]]`.
 pub fn prove(
     indices: &[u32],
-    outputs: &[F64],
-    table: &[F64],
-    alpha: F64,
-    beta: F64,
+    outputs: &[Goldilocks],
+    table: &[Goldilocks],
+    alpha: Goldilocks,
+    beta: Goldilocks,
 ) -> LookupProof {
     assert_eq!(indices.len(), outputs.len());
 
     // Multiplicities: m[j] = number of lookups hitting table index j.
-    let mut m = vec![F64::ZERO; table.len()];
+    let mut m = vec![Goldilocks::ZERO; table.len()];
     for &i in indices {
         assert!((i as usize) < table.len(), "lookup index out of table range");
-        m[i as usize] = m[i as usize] + F64::ONE;
+        m[i as usize] = m[i as usize] + Goldilocks::ONE;
     }
 
-    let lhs = indices.iter().zip(outputs).fold(F64::ZERO, |acc, (&i, &y)| {
-        let key = F64::new(i as u64) + beta * y;
-        acc + (alpha + key).inv()
+    let lhs = indices.iter().zip(outputs).fold(Goldilocks::ZERO, |acc, (&i, &y)| {
+        let key = Goldilocks::from_u64(i as u64) + beta * y;
+        acc + (alpha + key).inverse()
     });
 
-    let rhs = table.iter().enumerate().fold(F64::ZERO, |acc, (j, &t)| {
-        let tkey = F64::new(j as u64) + beta * t;
-        acc + m[j] * (alpha + tkey).inv()
+    let rhs = table.iter().enumerate().fold(Goldilocks::ZERO, |acc, (j, &t)| {
+        let tkey = Goldilocks::from_u64(j as u64) + beta * t;
+        acc + m[j] * (alpha + tkey).inverse()
     });
 
     LookupProof { lhs, rhs, alpha, beta }
@@ -62,9 +62,9 @@ mod tests {
     fn lookup_completeness_and_soundness() {
         let mut rng = XorShift64::new(12);
         let n = 256usize;
-        let table: Vec<F64> = (0..n).map(|_| rng.field()).collect();
+        let table: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
         let indices: Vec<u32> = (0..n).map(|_| (rng.next_u64() % n as u64) as u32).collect();
-        let outputs: Vec<F64> = indices.iter().map(|&i| table[i as usize]).collect();
+        let outputs: Vec<Goldilocks> = indices.iter().map(|&i| table[i as usize]).collect();
 
         let alpha = rng.field();
         let beta = rng.field();
@@ -74,7 +74,7 @@ mod tests {
         // Corrupt one output -> the batched key leaves the table, so the logUp
         // identity fails with high probability over (alpha, beta).
         let mut bad = outputs.clone();
-        bad[0] = bad[0] + F64::ONE;
+        bad[0] = bad[0] + Goldilocks::ONE;
         let bad_proof = prove(&indices, &bad, &table, alpha, beta);
         assert!(!verify(&bad_proof));
     }

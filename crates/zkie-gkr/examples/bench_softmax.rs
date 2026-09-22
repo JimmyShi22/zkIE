@@ -1,6 +1,6 @@
 //! Benchmarks the logUp-based exp lookup + softmax normalization.
 
-use zkie_gkr::field::{F64, XorShift64};
+use zkie_gkr::field::{Goldilocks, XorShift64};
 use zkie_gkr::softmax;
 
 fn main() {
@@ -9,7 +9,7 @@ fn main() {
     let n = 4096usize;
     let mut rng = XorShift64::new(0xbeef);
 
-    let table: Vec<F64> = (0..table_size).map(|_| rng.field()).collect();
+    let table: Vec<Goldilocks> = (0..table_size).map(|_| rng.field()).collect();
     let indices: Vec<u32> = (0..n).map(|_| (rng.next_u64() % table_size as u64) as u32).collect();
 
     let t0 = std::time::Instant::now();

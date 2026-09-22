@@ -5,24 +5,24 @@
 //! row-major (`k x m`), so fixing the row index reduces to `partial_eval` of
 //! the low bits.
 
-use crate::field::F64;
+use crate::field::Goldilocks;
 use crate::{mle, sumcheck, sumcheck::SumcheckProof};
 
 pub struct MatmulProof {
-    pub claimed: F64,
+    pub claimed: Goldilocks,
     pub sumcheck: SumcheckProof,
 }
 
 pub fn prove(
-    at: &[F64],
-    b: &[F64],
-    c: &[F64],
+    at: &[Goldilocks],
+    b: &[Goldilocks],
+    c: &[Goldilocks],
     m: usize,
     k: usize,
     n: usize,
-    u: &[F64],
-    v: &[F64],
-    challenges: &[F64],
+    u: &[Goldilocks],
+    v: &[Goldilocks],
+    challenges: &[Goldilocks],
 ) -> MatmulProof {
     assert_eq!(at.len(), k * m);
     assert_eq!(b.len(), k * n);
@@ -46,9 +46,9 @@ pub fn prove(
 
 pub fn verify(
     proof: &MatmulProof,
-    challenges: &[F64],
-    f_eval: F64,
-    h_eval: F64,
+    challenges: &[Goldilocks],
+    f_eval: Goldilocks,
+    h_eval: Goldilocks,
 ) -> bool {
     sumcheck::verify(&proof.sumcheck, proof.claimed, challenges, f_eval, h_eval)
 }
