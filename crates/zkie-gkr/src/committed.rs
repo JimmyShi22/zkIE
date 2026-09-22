@@ -109,6 +109,43 @@ pub fn prove_lookup(
     lhs == rhs
 }
 
+/// Prove `y = (x - mean) / rstd^-1 * w + b` (standard LayerNorm) against WHIR
+/// commitments, in the O(N)-opening PoC form: open the committed input column at
+/// every hypercube point and recompute each output from the opened value and the
+/// host-side `mean`/`rstd` scalars. `rstd = 1/sqrt(var+eps)` is the single
+/// non-arithmetic scalar (a lookup in the full protocol).
+pub fn prove_layer_norm(
+    whir_x: &Whir,
+    x: &Committed,
+    whir_y: &Whir,
+    y: &Committed,
+    mean: Goldilocks,
+    rstd: Goldilocks,
+    weight: &[Goldilocks],
+    bias: &[Goldilocks],
+) -> bool {
+    let n = weight.len();
+    let d = n.trailing_zeros() as usize;
+    for i in 0..n {
+        let point: Vec<Goldilocks> = (0..d)
+            .map(|b| Goldilocks::from_bool((i >> b) & 1 == 1))
+            .collect();
+        let (x_open, xv) = whir_x.open(x.prover_data.clone(), &x.protocol, &point);
+        let (y_open, yv) = whir_y.open(y.prover_data.clone(), &y.protocol, &point);
+        if whir_x.verify(&x.commitment, &x_open, &x.protocol, &point).unwrap() != xv {
+            return false;
+        }
+        if whir_y.verify(&y.commitment, &y_open, &y.protocol, &point).unwrap() != yv {
+            return false;
+        }
+        let expected = (xv - mean) * rstd * weight[i] + bias[i];
+        if yv != expected {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +194,27 @@ mod tests {
         let alpha = rng.field();
         let beta = rng.field();
         assert!(prove_lookup(&whir, &cx, &whir, &cy, &indices, &table, alpha, beta));
+    }
+
+    #[test]
+    fn committed_layer_norm_roundtrip() {
+        let mut rng = XorShift64::new(0x123);
+        let n = 64usize;
+        let x: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let weight: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let bias: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let mean = rng.field();
+        let rstd = rng.field();
+        let y: Vec<Goldilocks> = x
+            .iter()
+            .zip(&weight)
+            .zip(&bias)
+            .map(|((&xv, &w), &b)| (xv - mean) * rstd * w + b)
+            .collect();
+
+        let whir = Whir::new_testing(6);
+        let cx = commit(&whir, &x);
+        let cy = commit(&whir, &y);
+        assert!(prove_layer_norm(&whir, &cx, &whir, &cy, mean, rstd, &weight, &bias));
     }
 }
