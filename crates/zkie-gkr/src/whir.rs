@@ -36,18 +36,194 @@ type MyChallenger = DuplexChallenger<F, Perm, 16, 8>;
 type PackedF = <F as Field>::Packing;
 type MyLayout = SuffixProver<F, EF>;
 
-// The DFT and Merkle engines are swappable at the type level: with the
-// `cuda` feature they are the GPU-backed implementations (which internally
-// fall back to the CPU paths when no device is available or a kernel
-// fails), otherwise the pure-CPU p3 implementations.
-#[cfg(not(feature = "cuda"))]
-type MyMmcs = MerkleTreeMmcs<PackedF, PackedF, MerkleHash, MerkleCompress, 2, 8>;
+type CpuMmcs = MerkleTreeMmcs<PackedF, PackedF, MerkleHash, MerkleCompress, 2, 8>;
+type CpuDft = Radix2DFTSmallBatch<F>;
+
+// The DFT and Merkle engines are swappable at the type level. Without the
+// `cuda` feature these are the pure-CPU p3 implementations. With it, they
+// are runtime-dispatched enums: measured on the 64-core dev box the GPU
+// path is launch/transfer-bound and *slower* than 64-thread rayon for the
+// 200M proof's many small commitments (548.7s vs 402.5s end-to-end), so the
+// CPU engines stay the default and the GPU path is opt-in via
+// `ZKIE_CUDA=1` (e.g. for thread-constrained deployments, where a 2^22
+// commit measures 25.9x faster than single-threaded CPU).
 #[cfg(feature = "cuda")]
-type MyMmcs = zkie_cuda::merkle::CudaMerkleTreeMmcs;
+mod backend {
+    use super::*;
+    use p3_commit::Mmcs as _;
+    use p3_dft::TwoAdicSubgroupDft;
+    use p3_matrix::Matrix as _;
+
+    /// Whether the GPU engines should be used for this process.
+    pub fn use_cuda() -> bool {
+        matches!(std::env::var("ZKIE_CUDA"), Ok(v) if v == "1" || v == "true")
+    }
+
+    pub enum DftBackend {
+        Cpu(CpuDft),
+        #[cfg(feature = "cuda")]
+        Cuda(zkie_cuda::dft::CudaDft),
+    }
+
+    impl Clone for DftBackend {
+        fn clone(&self) -> Self {
+            match self {
+                Self::Cpu(d) => Self::Cpu(d.clone()),
+                #[cfg(feature = "cuda")]
+                Self::Cuda(d) => Self::Cuda(d.clone()),
+            }
+        }
+    }
+
+    impl Default for DftBackend {
+        fn default() -> Self {
+            Self::Cpu(CpuDft::default())
+        }
+    }
+
+    impl TwoAdicSubgroupDft<F> for DftBackend {
+        type Evaluations = RowMajorMatrix<F>;
+
+        fn dft_batch(&self, mat: RowMajorMatrix<F>) -> Self::Evaluations {
+            match self {
+                Self::Cpu(d) => d.dft_batch(mat),
+                #[cfg(feature = "cuda")]
+                Self::Cuda(d) => d.dft_batch(mat),
+            }
+        }
+    }
+
+    pub enum MmcsBackend {
+        Cpu(CpuMmcs),
+        #[cfg(feature = "cuda")]
+        Cuda(zkie_cuda::merkle::CudaMerkleTreeMmcs),
+    }
+
+    impl Clone for MmcsBackend {
+        fn clone(&self) -> Self {
+            match self {
+                Self::Cpu(m) => Self::Cpu(m.clone()),
+                #[cfg(feature = "cuda")]
+                Self::Cuda(m) => Self::Cuda(m.clone()),
+            }
+        }
+    }
+
+    impl p3_commit::Mmcs<F> for MmcsBackend {
+        type ProverData<M> = p3_merkle_tree::MerkleTree<F, F, M, 2, 8>;
+        type Commitment = p3_symmetric::MerkleCap<F, [F; 8]>;
+        type Proof = Vec<[F; 8]>;
+        type MultiProof = p3_merkle_tree::PrunedMerklePaths<F, 8>;
+        type Error = p3_merkle_tree::MerkleTreeError;
+
+        fn commit<M: p3_matrix::Matrix<F>>(
+            &self,
+            inputs: Vec<M>,
+        ) -> (Self::Commitment, Self::ProverData<M>) {
+            match self {
+                Self::Cpu(m) => m.commit(inputs),
+                #[cfg(feature = "cuda")]
+                Self::Cuda(m) => m.commit(inputs),
+            }
+        }
+
+        fn open_batch<M: p3_matrix::Matrix<F>>(
+            &self,
+            index: usize,
+            prover_data: &Self::ProverData<M>,
+        ) -> p3_commit::BatchOpening<F, Self> {
+            match self {
+                Self::Cpu(m) => {
+                    let o = m.open_batch(index, prover_data);
+                    p3_commit::BatchOpening::new(o.opened_values, o.opening_proof)
+                }
+                #[cfg(feature = "cuda")]
+                Self::Cuda(m) => {
+                    let o = m.open_batch(index, prover_data);
+                    p3_commit::BatchOpening::new(o.opened_values, o.opening_proof)
+                }
+            }
+        }
+
+        fn get_matrices<'a, M: p3_matrix::Matrix<F>>(
+            &self,
+            prover_data: &'a Self::ProverData<M>,
+        ) -> Vec<&'a M> {
+            match self {
+                Self::Cpu(m) => m.get_matrices(prover_data),
+                #[cfg(feature = "cuda")]
+                Self::Cuda(m) => m.get_matrices(prover_data),
+            }
+        }
+
+        fn verify_batch(
+            &self,
+            commit: &Self::Commitment,
+            dimensions: &[p3_matrix::Dimensions],
+            index: usize,
+            batch_opening: p3_commit::BatchOpeningRef<'_, F, Self>,
+        ) -> Result<(), Self::Error> {
+            match self {
+                Self::Cpu(m) => {
+                    let o = p3_commit::BatchOpeningRef::<'_, F, CpuMmcs>::new(
+                        batch_opening.opened_values,
+                        batch_opening.opening_proof,
+                    );
+                    m.verify_batch(commit, dimensions, index, o)
+                }
+                #[cfg(feature = "cuda")]
+                Self::Cuda(m) => {
+                    let o = p3_commit::BatchOpeningRef::<
+                        '_,
+                        F,
+                        zkie_cuda::merkle::CudaMerkleTreeMmcs,
+                    >::new(batch_opening.opened_values, batch_opening.opening_proof);
+                    m.verify_batch(commit, dimensions, index, o)
+                }
+            }
+        }
+
+        fn verify_multi_batch<R: AsRef<[F]> + PartialEq>(
+            &self,
+            commit: &Self::Commitment,
+            dimensions: &[p3_matrix::Dimensions],
+            indices: &[usize],
+            opened_values: &[Vec<R>],
+            proof: &Self::MultiProof,
+        ) -> Result<(), Self::Error> {
+            match self {
+                Self::Cpu(m) => m.verify_multi_batch(
+                    commit, dimensions, indices, opened_values, proof,
+                ),
+                #[cfg(feature = "cuda")]
+                Self::Cuda(m) => m.verify_multi_batch(
+                    commit, dimensions, indices, opened_values, proof,
+                ),
+            }
+        }
+
+        fn open_multi_batch<M: p3_matrix::Matrix<F>>(
+            &self,
+            indices: &[usize],
+            prover_data: &Self::ProverData<M>,
+        ) -> (Vec<Vec<Vec<F>>>, Self::MultiProof) {
+            match self {
+                Self::Cpu(m) => m.open_multi_batch(indices, prover_data),
+                #[cfg(feature = "cuda")]
+                Self::Cuda(m) => m.open_multi_batch(indices, prover_data),
+            }
+        }
+    }
+}
+
 #[cfg(not(feature = "cuda"))]
-type MyDft = Radix2DFTSmallBatch<F>;
+type MyMmcs = CpuMmcs;
 #[cfg(feature = "cuda")]
-type MyDft = zkie_cuda::dft::CudaDft;
+type MyMmcs = backend::MmcsBackend;
+#[cfg(not(feature = "cuda"))]
+type MyDft = CpuDft;
+#[cfg(feature = "cuda")]
+type MyDft = backend::DftBackend;
 type MyPcs = WhirProver<EF, F, MyDft, MyMmcs, MyChallenger, MyLayout>;
 
 pub type Commitment = <MyPcs as MultilinearPcs<EF, MyChallenger>>::Commitment;
@@ -99,16 +275,33 @@ impl Whir {
         };
 
         let perm = Perm::new_from_rng_128(&mut SmallRng::seed_from_u64(1));
+        #[cfg(not(feature = "cuda"))]
         let mmcs = MyMmcs::new(
             MerkleHash::new(perm.clone()),
             MerkleCompress::new(perm.clone()),
             0,
         );
+        #[cfg(feature = "cuda")]
+        let mmcs = {
+            let hash = MerkleHash::new(perm.clone());
+            let compress = MerkleCompress::new(perm.clone());
+            if backend::use_cuda() {
+                MyMmcs::Cuda(zkie_cuda::merkle::CudaMerkleTreeMmcs::new(hash, compress, 0))
+            } else {
+                MyMmcs::Cpu(CpuMmcs::new(hash, compress, 0))
+            }
+        };
         let config = WhirConfig::<EF, F, MyChallenger>::new(num_variables, params).unwrap();
         #[cfg(not(feature = "cuda"))]
         let dft = MyDft::new(1 << config.max_fft_size());
         #[cfg(feature = "cuda")]
-        let dft = MyDft::new();
+        let dft = {
+            if backend::use_cuda() {
+                MyDft::Cuda(zkie_cuda::dft::CudaDft::new())
+            } else {
+                MyDft::Cpu(CpuDft::new(1 << config.max_fft_size()))
+            }
+        };
         let pcs = MyPcs::new(config, dft, mmcs);
 
         Whir {
