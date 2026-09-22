@@ -5,7 +5,7 @@
 //! the corresponding precomputed GELU value), so it needs no extra field
 //! arithmetic — the same shape as `softmax`'s `exp`, minus the normalization.
 
-use crate::field::{Goldilocks, PrimeCharacteristicRing};
+use crate::field::Goldilocks;
 use crate::lookup::{self, LookupProof};
 
 pub struct GeluProof {
@@ -42,6 +42,7 @@ pub fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::field::PrimeCharacteristicRing;
     use crate::field::XorShift64;
 
     #[test]
