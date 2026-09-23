@@ -58,7 +58,8 @@ GKR proving primitives (have)
   ↑ fixed-point semantics contract (missing, the foundation)
   ↑ fixed-point program IR + executor (missing)
   ↑ one builder per model (missing, thin)
-  ↑ sharding + linking (dag skeleton exists, needs a real Prover)
+  ↑ sharding: autotuning loop (cut → measure → iterate), not a static planner
+  ↑ linking across shards: shared commitment (glue, see §5.5)
   ↑ aggregation (missing, recursive composition, added last)
   ↑ on-chain convergence (missing, done last)
 ```
@@ -119,7 +120,28 @@ ample memory → smaller shards (more parallel). The glue is WHIR prescribed-poi
 upstream shard's output commitment is opened at a random point → used as the starting point of
 the downstream shard's GKR reduction → reduced to its output → committed again.
 
-### 5.6 Aggregation via recursive composition, added last
+### 5.6 Sharding is an autotuning loop, not a static planner
+
+Because sharding is free to change (no per-shard circuit/keygen, §5.4), the cut should be found
+by **measuring**, not estimated by a static cost model. Static models mispredict the factors that
+actually dominate proving time (memory pressure, cache, GPU launch/transfer, parallel
+scheduling), so an empirical search beats a deterministic planner.
+
+Approach: an **autotuning loop** that repeatedly proposes a partition, measures its proving time
+(or a cheap proxy), and lets an optimizer/search pick the next cut until the time converges:
+
+- **Cheap cost proxy**: measure commit + sumcheck time on representative shards, not the whole
+  end-to-end proof every iteration.
+- **Search strategy**: start from a coarse per-layer cut; split the slowest bottleneck shard and
+  merge overly small shards; iterate. Escalate to Bayesian optimization / evolutionary search if
+  needed.
+- **Stopping condition**: stop when improvement drops below a threshold for N consecutive rounds.
+
+The "AI" here is best realized as an optimizer (local search / Bayesian / evolutionary) over the
+structured shard-boundary space, not necessarily an LLM; an LLM can act as a candidate proposer
+but is optional. The concrete methodology is TBD (see §7).
+
+### 5.7 Aggregation via recursive composition, added last
 
 Cross-shard shared commitment only solves "linking", not "converging into one final proof".
 Whether to then fold the N shard proofs into one succinct root via recursive composition is an
@@ -146,3 +168,5 @@ independent decision, added last and kept off the critical path.
 - The recursive-aggregation proof-system choice (ties into on-chain convergence; needs a
   feasibility study).
 - The on-chain convergence route (Goldilocks GKR/WHIR → EVM-verifiable) option selection.
+- The sharding autotuning methodology: cost-proxy design, search-strategy choice, and the
+  convergence/stopping criteria.
