@@ -76,6 +76,7 @@ impl Exec {
     }
 
     pub fn input(&mut self, plain: Vec<Goldilocks>, group: usize) -> usize {
+        let group = if plain.len() >= (1 << 16) { self.fresh_group() } else { group };
         let (size, group, index) = self.bb.push_group(plain.clone(), group);
         let id = self.plain.len();
         self.plain.push(plain);
