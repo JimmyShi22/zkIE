@@ -1308,6 +1308,84 @@ pub fn prove_relu(
     out_r * from_i64(2) == pre_r + abs_r
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn prove_relu_batch(
+    in_batch: &BatchCtx,
+    in_idx: usize,
+    in_plain: &[Goldilocks],
+    out_batch: &BatchCtx,
+    out_idx: usize,
+    mid_batch: &BatchCtx,
+    bits_batch: &BatchCtx,
+    zero_bits_batch: &BatchCtx,
+    bias: &[Goldilocks],
+    rng: &mut XorShift64,
+) -> bool {
+    let n = bias.len();
+    let d = n.trailing_zeros() as usize;
+    const SHIFT: usize = 16;
+    const BITS: usize = 31;
+
+    let rescaled: Vec<Goldilocks> = in_plain
+        .iter()
+        .map(|&iv| from_i32(div_round(to_i64(iv), 1i64 << SHIFT) as i32))
+        .collect();
+    let pre: Vec<Goldilocks> = rescaled.iter().zip(bias).map(|(&r, &b)| r + b).collect();
+    let abs_pre: Vec<Goldilocks> = pre
+        .iter()
+        .map(|&p| from_i32((to_i32(p) as i64).abs() as i32))
+        .collect();
+    let mut bits: Vec<Vec<Goldilocks>> = vec![vec![Goldilocks::ZERO; n]; BITS];
+    for i in 0..n {
+        let a = (to_i32(pre[i]) as i64).abs();
+        for (j, bj) in bits.iter_mut().enumerate() {
+            bj[i] = from_i32(((a >> j) & 1) as i32);
+        }
+    }
+
+    let zero_bias = vec![from_i32(0); n];
+    if !prove_round_batch(
+        in_batch, in_idx, in_plain, mid_batch, 0, &rescaled, zero_bits_batch, 1, &zero_bias, SHIFT, rng,
+    ) {
+        return false;
+    }
+
+    let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let s = mle::eq_evals(&r);
+    let s_r = mle::eval(&s, &r);
+
+    let (res_open, res_r) = mid_batch.whir.open_batch(mid_batch.prover_data.clone(), &mid_batch.protocol, 0, mid_batch.num_tables, &r);
+    let (pre_open, pre_r) = mid_batch.whir.open_batch(mid_batch.prover_data.clone(), &mid_batch.protocol, 1, mid_batch.num_tables, &r);
+    let (abs_open, abs_r) = mid_batch.whir.open_batch(mid_batch.prover_data.clone(), &mid_batch.protocol, 2, mid_batch.num_tables, &r);
+    let (out_open, out_r) = out_batch.whir.open_batch(out_batch.prover_data.clone(), &out_batch.protocol, out_idx, out_batch.num_tables, &r);
+    if mid_batch.whir.verify_batch(&mid_batch.commitment, &res_open, &mid_batch.protocol, 0, mid_batch.num_tables, &r).unwrap() != res_r
+        || mid_batch.whir.verify_batch(&mid_batch.commitment, &pre_open, &mid_batch.protocol, 1, mid_batch.num_tables, &r).unwrap() != pre_r
+        || mid_batch.whir.verify_batch(&mid_batch.commitment, &abs_open, &mid_batch.protocol, 2, mid_batch.num_tables, &r).unwrap() != abs_r
+        || out_batch.whir.verify_batch(&out_batch.commitment, &out_open, &out_batch.protocol, out_idx, out_batch.num_tables, &r).unwrap() != out_r
+    {
+        return false;
+    }
+    let bias_r = mle::eval(bias, &r);
+
+    if pre_r != res_r + bias_r {
+        return false;
+    }
+    if !prove_bits_range_batch(bits_batch, &bits, abs_r, &r, &s, s_r) {
+        return false;
+    }
+    let c_aa: Goldilocks = s.iter().zip(&abs_pre).zip(&abs_pre).fold(Goldilocks::ZERO, |a, ((&si, &xi), &yi)| a + si * xi * yi);
+    let c_pp: Goldilocks = s.iter().zip(&pre).zip(&pre).fold(Goldilocks::ZERO, |a, ((&si, &xi), &yi)| a + si * xi * yi);
+    let proof_aa = sumcheck::prove3(&s, &abs_pre, &abs_pre, c_aa, &r);
+    let proof_pp = sumcheck::prove3(&s, &pre, &pre, c_pp, &r);
+    if !sumcheck::verify3(&proof_aa, c_aa, &r, s_r, abs_r, abs_r)
+        || !sumcheck::verify3(&proof_pp, c_pp, &r, s_r, pre_r, pre_r)
+        || c_aa != c_pp
+    {
+        return false;
+    }
+    out_r * from_i64(2) == pre_r + abs_r
+}
+
 /// Prove the element-wise field addition `c = a + b` against WHIR commitments
 /// with a single random-point opening. Because `a`, `b`, `c` are multilinear
 /// extensions and `c(x) = a(x) + b(x)` as polynomials iff `c_i = a_i + b_i` at
@@ -1341,6 +1419,58 @@ mod tests {
     use super::*;
     use crate::field::PrimeCharacteristicRing;
     use crate::fixed_point::from_i64;
+
+    #[test]
+    fn batch_relu_roundtrip() {
+        let mut rng = XorShift64::new(0xdead);
+        let n = 64usize;
+        let in_plain: Vec<Goldilocks> =
+            (0..n).map(|_| from_i64((rng.next_u64() % (1u64 << 32)) as i64)).collect();
+        let bias: Vec<Goldilocks> =
+            (0..n).map(|_| from_i32((rng.next_u64() % 1000) as i32 - 500)).collect();
+        let out_plain = affine_raw(&in_plain, &bias, 16, true);
+
+        let rescaled: Vec<Goldilocks> =
+            in_plain.iter().map(|&iv| from_i32(div_round(to_i64(iv), 1i64 << 16) as i32)).collect();
+        let pre: Vec<Goldilocks> = rescaled.iter().zip(&bias).map(|(&r, &b)| r + b).collect();
+        let abs_pre: Vec<Goldilocks> =
+            pre.iter().map(|&p| from_i32((to_i32(p) as i64).abs() as i32)).collect();
+        let mut bits: Vec<Vec<Goldilocks>> = vec![vec![Goldilocks::ZERO; n]; 31];
+        for i in 0..n {
+            let a = (to_i32(pre[i]) as i64).abs();
+            for (j, bj) in bits.iter_mut().enumerate() {
+                bj[i] = from_i32(((a >> j) & 1) as i32);
+            }
+        }
+        let mut zbits: Vec<Vec<Goldilocks>> = vec![vec![Goldilocks::ZERO; n]; 16];
+        for i in 0..n {
+            let in_i = to_i64(in_plain[i]);
+            let out_i = to_i32(rescaled[i]) as i64;
+            let rem = in_i - out_i * (1i64 << 16);
+            let rem_off = rem + (1i64 << 15);
+            for (j, bj) in zbits.iter_mut().enumerate() {
+                bj[i] = from_i32(((rem_off >> j) & 1) as i32);
+            }
+        }
+
+        let whir = Whir::new_testing(6);
+        let io_refs = [in_plain.as_slice(), out_plain.as_slice()];
+        let (io_c, io_pd, io_p, io_w) = whir.commit_batch(&io_refs);
+        let io_batch = BatchCtx { commitment: io_c, prover_data: io_pd, protocol: io_p, whir: io_w, num_tables: 2 };
+        let mid_refs = [rescaled.as_slice(), pre.as_slice(), abs_pre.as_slice()];
+        let (mid_c, mid_pd, mid_p, mid_w) = whir.commit_batch(&mid_refs);
+        let mid_batch = BatchCtx { commitment: mid_c, prover_data: mid_pd, protocol: mid_p, whir: mid_w, num_tables: 3 };
+        let bits_refs: Vec<&[Goldilocks]> = bits.iter().map(|b| b.as_slice()).collect();
+        let (bits_c, bits_pd, bits_p, bits_w) = whir.commit_batch(&bits_refs);
+        let bits_batch = BatchCtx { commitment: bits_c, prover_data: bits_pd, protocol: bits_p, whir: bits_w, num_tables: 31 };
+        let zb_refs: Vec<&[Goldilocks]> = zbits.iter().map(|b| b.as_slice()).collect();
+        let (zb_c, zb_pd, zb_p, zb_w) = whir.commit_batch(&zb_refs);
+        let zb_batch = BatchCtx { commitment: zb_c, prover_data: zb_pd, protocol: zb_p, whir: zb_w, num_tables: 16 };
+
+        assert!(prove_relu_batch(
+            &io_batch, 0, &in_plain, &io_batch, 1, &mid_batch, &bits_batch, &zb_batch, &bias, &mut rng,
+        ));
+    }
 
     #[test]
     fn batch_affine_roundtrip() {
