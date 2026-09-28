@@ -5,7 +5,6 @@
 /models
 /.spike-test
 /.venv-timesfm
-Cargo.lock
 *.log
 
 # zkie-evm-verifier-poc (standalone crate, own workspace; see

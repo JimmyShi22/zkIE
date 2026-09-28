@@ -1,17 +1,23 @@
 # zkIE — Project Notes
 
-## Hard constraint: where to run builds
+## What this is
 
-Local security software blocks (SIGKILLs) build-script execution (`build.rs`, e.g.
-`libc`, `crossbeam-utils`, `num-traits`, etc.) when the process runs under
-`/tmp` / `/private/tmp` (including this session's scratchpad directory). This is a
-hard limit — do not run `cargo build`/`cargo test`/anything that compiles a crate
-with a build script from a `/tmp`-based path.
+GKR / sum-check route for verifiable ML inference (non-ZK). The proof stack is
+Goldilocks + WHIR/FRI + LogUp lookup; the public interface is the unified op layer
+in crates/zkie-gkr/src/ops.rs. See README.md.
 
-**Always run cargo commands from inside this project directory**
-(`/Users/jimmyshi/code/zkie/...`), not from `/tmp` or the scratchpad. If a
-throwaway spike is needed, create it as a subdirectory inside the project (e.g.
-`.spike-test/`, gitignored) rather than under `/tmp`.
+## Layout
 
-Alternative if the above ever fails again: run the build inside a Docker
-container — container execution is not subject to this restriction.
+- crates/zkie-gkr: proving primitives + op interface + examples
+- crates/zkie-cuda: optional CUDA backend (NTT + Merkle)
+- scripts/: ONNX extraction / fixed-point simulation / fidelity checks
+- docs/superpowers/specs/: fixed-point semantics contract
+
+## Build / test
+
+    cargo build --workspace
+    cargo test -p zkie-gkr
+    cargo build --release --example prove_200m_ops
+
+The TimesFM 200M example reads extracted tensors from models/ (gitignored); run
+the extract scripts first to populate it.
