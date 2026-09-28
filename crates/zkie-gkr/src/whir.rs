@@ -359,6 +359,48 @@ impl Whir {
 
     /// Open the committed MLE at `point` (base-field coordinates) and return the
     /// opening proof together with the claimed evaluation (in the extension field).
+    /// Commit to multiple flat MLEs of the same size in a single WHIR witness.
+    /// This amortizes the per-commit launch/transfer overhead, which is the
+    /// dominant cost on the GPU path for many small commitments.
+    pub fn commit_batch(
+        &self,
+        evals_batch: &[&[Goldilocks]],
+    ) -> (Commitment, ProverData, OpeningProtocol) {
+        let t0 = std::time::Instant::now();
+        assert!(!evals_batch.is_empty(), "batch must not be empty");
+        let arity = evals_batch[0].len().trailing_zeros() as usize;
+        for e in evals_batch {
+            assert_eq!(e.len(), 1 << arity, "all MLEs in a batch must have the same size");
+        }
+        let total_slots = evals_batch.len() * (1usize << arity);
+        let total_num_vars = total_slots.next_power_of_two().trailing_zeros() as usize;
+
+        let whir = Whir::new_testing(total_num_vars);
+        let tables: Vec<Table<F>> = evals_batch
+            .iter()
+            .map(|e| Table::new(RowMajorMatrix::new(e.to_vec(), 1 << arity)))
+            .collect();
+        let folding = whir.folding_factor.at_round(0);
+        let witness = MyLayout::new_witness(tables, folding);
+
+        let point_schedule: PointSchedule =
+            std::iter::once(OpeningBatch::new(vec![0], Vec::new())).collect();
+        let specs: Vec<TableSpec> = (0..evals_batch.len())
+            .map(|_| TableSpec::new(TableShape::new(arity, 1), point_schedule.clone()))
+            .collect();
+        let protocol = OpeningProtocol::new(specs).pad_to_min_num_variables(folding);
+
+        let (commitment, prover_data) = <MyPcs as MultilinearPcs<EF, MyChallenger>>::commit(
+            &whir.pcs,
+            witness,
+            &mut whir.fresh_challenger(),
+        );
+        let (n, secs) = self.commit_stats.get();
+        self.commit_stats
+            .set((n + evals_batch.len() as u64, secs + t0.elapsed().as_secs_f64()));
+        (commitment, prover_data, protocol)
+    }
+
     pub fn open(
         &self,
         prover_data: ProverData,
