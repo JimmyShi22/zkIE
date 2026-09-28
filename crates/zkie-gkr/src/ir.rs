@@ -6,8 +6,9 @@
 
 use std::collections::HashMap;
 
-use crate::committed::{affine_raw, layer_norm_raw, prove_add_batch, prove_affine_batch, prove_layer_norm_batch, prove_matmul_batch, prove_relu_batch, prove_rms_norm_batch, prove_scale_batch, rms_norm_raw, scale_raw, BatchCtx};
-use crate::field::{Goldilocks, PrimeCharacteristicRing, XorShift64};
+use crate::committed::{affine_raw, layer_norm_raw, prove_add_batch, prove_affine_batch, prove_layer_norm_batch, prove_matmul_batch, prove_relu_batch, prove_lookup_batch, prove_rms_norm_batch, prove_scale_batch, rms_norm_raw, scale_raw, BatchCtx};
+use crate::committed::prove_softmax_rows_batch;
+use crate::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64};
 use crate::fixed_point::{from_i32, from_i64, to_i32, to_i64};
 use crate::ops::{add_vec, dense_m, BatchBuilder};
 use crate::whir::Whir;
@@ -27,6 +28,27 @@ pub enum Op {
     Relu { x: usize, out: usize, mid_group: (usize, usize), bits_group: (usize, usize), zero_bits_group: (usize, usize), bias: Vec<Goldilocks> },
     RmsNorm { x: usize, raw: usize, weight: Vec<Goldilocks>, n_real: usize },
     LayerNorm { x: usize, raw: usize, weight: Vec<Goldilocks>, n_real: usize },
+    Lookup { x: usize, y: usize, a: usize, prod_group: (usize, usize), indices: Vec<u32>, table: Vec<Goldilocks>, alpha: Goldilocks, beta: Goldilocks },
+    Softmax {
+        scores: usize,
+        c: usize,
+        shifted: usize,
+        e: usize,
+        sum: usize,
+        sum_broadcast: usize,
+        out: usize,
+        big_group: (usize, usize),
+        row_group: (usize, usize),
+        prod_group: (usize, usize),
+        bits1_group: (usize, usize),
+        bits2_group: (usize, usize),
+        exp_table: Vec<Goldilocks>,
+        offset: u32,
+        n_rows: usize,
+        n_cols: usize,
+        alpha: Goldilocks,
+        beta: Goldilocks,
+    },
 }
 
 pub struct Exec {
@@ -192,6 +214,158 @@ impl Exec {
         raw_id
     }
 
+    pub fn lookup(&mut self, indices: &[u32], table: &[Goldilocks], rng: &mut XorShift64) -> usize {
+        let alpha = rng.field();
+        let beta = rng.field();
+        let n = indices.len();
+        let idx_field: Vec<Goldilocks> = indices.iter().map(|&i| from_i32(i as i32)).collect();
+        let y: Vec<Goldilocks> = indices.iter().map(|&i| table[i as usize]).collect();
+        let a: Vec<Goldilocks> = idx_field.iter().zip(&y).map(|(&xv, &yv)| alpha + xv + beta * yv).collect();
+
+        let mut m = vec![0u64; table.len()];
+        for &i in indices {
+            m[i as usize] += 1;
+        }
+        let mut b = Goldilocks::ONE;
+        for (j, &t) in table.iter().enumerate() {
+            let tkey = Goldilocks::from_u64(j as u64) + beta * t;
+            let factor = alpha + tkey;
+            for _ in 0..m[j] {
+                b = b * factor;
+            }
+        }
+        let mut a_norm = a.clone();
+        a_norm[n - 1] = a_norm[n - 1] * b.inverse();
+        let mut r = vec![Goldilocks::ONE; n];
+        for i in 1..n {
+            r[i] = r[i - 1] * a_norm[i - 1];
+        }
+
+        let g_xy = self.fresh_group();
+        let idx_id = self.input(idx_field, g_xy);
+        let y_id = self.input(y, g_xy);
+        let a_id = self.input(a, g_xy);
+        let g_prod = self.fresh_group();
+        self.input(a_norm, g_prod);
+        self.input(r, g_prod);
+
+        self.ops.push(Op::Lookup {
+            x: idx_id,
+            y: y_id,
+            a: a_id,
+            prod_group: (n, g_prod),
+            indices: indices.to_vec(),
+            table: table.to_vec(),
+            alpha,
+            beta,
+        });
+        y_id
+    }
+
+    pub fn softmax(&mut self, scores: usize, exp_table: &[Goldilocks], offset: u32, n_rows: usize, n_cols: usize, rng: &mut XorShift64) -> usize {
+        let n = n_rows * n_cols;
+        let scores_plain = self.plain[scores].clone();
+
+        let c: Vec<Goldilocks> = (0..n_rows)
+            .map(|r| {
+                let row_max = (0..n_cols).map(|k| to_i32(scores_plain[r * n_cols + k])).max().unwrap();
+                from_i32(row_max)
+            })
+            .collect();
+        let shifted: Vec<Goldilocks> = scores_plain.iter().enumerate().map(|(i, &s)| s - c[i / n_cols]).collect();
+        let indices: Vec<u32> = shifted
+            .iter()
+            .map(|&v| (to_i32(v) as i64 + offset as i64).clamp(0, exp_table.len() as i64 - 1) as u32)
+            .collect();
+        let idx_field: Vec<Goldilocks> = indices.iter().map(|&i| from_i32(i as i32)).collect();
+        let e: Vec<Goldilocks> = indices.iter().map(|&i| exp_table[i as usize]).collect();
+        let sum: Vec<Goldilocks> = (0..n_rows).map(|r| (0..n_cols).fold(Goldilocks::ZERO, |a, k| a + e[r * n_cols + k])).collect();
+        let sum_broadcast: Vec<Goldilocks> = (0..n).map(|i| sum[i / n_cols]).collect();
+        let out: Vec<Goldilocks> = e.iter().enumerate().map(|(i, &v)| {
+            from_i32(round_half_up(to_i32(v) as i64 * 65536, to_i32(sum[i / n_cols]) as i64) as i32)
+        }).collect();
+        let rem: Vec<Goldilocks> = e.iter().zip(&out).zip(&sum_broadcast)
+            .map(|((&ev, &ov), &sv)| ev * from_i64(65536) - ov * sv).collect();
+
+        let alpha = rng.field();
+        let beta = rng.field();
+        let a_plain: Vec<Goldilocks> = idx_field.iter().zip(&e).map(|(&xv, &yv)| alpha + xv + beta * yv).collect();
+
+        let mut m = vec![0u64; exp_table.len()];
+        for &i in &indices { m[i as usize] += 1; }
+        let mut b = Goldilocks::ONE;
+        for (j, &t) in exp_table.iter().enumerate() {
+            let tkey = Goldilocks::from_u64(j as u64) + beta * t;
+            let factor = alpha + tkey;
+            for _ in 0..m[j] { b = b * factor; }
+        }
+        let mut a_norm = a_plain.clone();
+        a_norm[n - 1] = a_norm[n - 1] * b.inverse();
+        let mut r = vec![Goldilocks::ONE; n];
+        for i in 1..n { r[i] = r[i - 1] * a_norm[i - 1]; }
+
+        let two = from_i64(2);
+        let neg_two = from_i64(-2);
+        let lhs1: Vec<Goldilocks> = rem.iter().zip(&sum_broadcast).map(|(&rv, &sv)| two * rv + sv).collect();
+        let lhs2: Vec<Goldilocks> = sum_broadcast.iter().zip(&rem).map(|(&sv, &rv)| sv + neg_two * rv).collect();
+        let mut bits1: Vec<Vec<Goldilocks>> = vec![vec![Goldilocks::ZERO; n]; 31];
+        let mut bits2: Vec<Vec<Goldilocks>> = vec![vec![Goldilocks::ZERO; n]; 31];
+        for i in 0..n {
+            let v1 = to_i32(lhs1[i]) as i64 as u64;
+            let v2 = to_i32(lhs2[i]) as i64 as u64;
+            for j in 0..31 {
+                bits1[j][i] = from_i32(((v1 >> j) & 1) as i32);
+                bits2[j][i] = from_i32(((v2 >> j) & 1) as i32);
+            }
+        }
+
+        let g_big = self.fresh_group();
+        self.input(scores_plain.clone(), g_big);
+        let shifted_id = self.input(shifted, g_big);
+        let e_id = self.input(e, g_big);
+        let sb_id = self.input(sum_broadcast, g_big);
+        self.input(out.clone(), g_big);
+        self.input(idx_field, g_big);
+        self.input(rem, g_big);
+        self.input(a_plain, g_big);
+
+        let g_row = self.fresh_group();
+        let c_id = self.input(c, g_row);
+        let sum_id = self.input(sum, g_row);
+
+        let g_prod = self.fresh_group();
+        self.input(a_norm, g_prod);
+        self.input(r, g_prod);
+
+        let g_b1 = self.fresh_group();
+        for bc in &bits1 { self.input(bc.clone(), g_b1); }
+        let g_b2 = self.fresh_group();
+        for bc in &bits2 { self.input(bc.clone(), g_b2); }
+
+        let out_id = self.input(out, 0);
+
+        self.ops.push(Op::Softmax {
+            scores,
+            c: c_id,
+            shifted: shifted_id,
+            e: e_id,
+            sum: sum_id,
+            sum_broadcast: sb_id,
+            out: out_id,
+            big_group: (n, g_big),
+            row_group: (n_rows, g_row),
+            prod_group: (n, g_prod),
+            bits1_group: (n, g_b1),
+            bits2_group: (n, g_b2),
+            exp_table: exp_table.to_vec(),
+            offset,
+            n_rows,
+            n_cols,
+            alpha,
+            beta,
+        });
+        out_id
+    }
     pub fn prove(&self, whir: &Whir, rng: &mut XorShift64) {
         let batches: HashMap<(usize, usize), BatchCtx> = self.bb.commit(whir);
         for op in &self.ops {
@@ -241,6 +415,18 @@ impl Exec {
                         x_b, x_i, &self.plain[*x], o_b, o_i, mid_b, bits_b, zb_b, bias, rng,
                     ));
                 }
+                Op::Lookup { x, y, a, prod_group, indices, table, alpha, beta } => {
+                    let (x_sz, x_g, x_i) = self.meta[*x];
+                    let (y_sz, y_g, y_i) = self.meta[*y];
+                    let (a_sz, a_g, a_i) = self.meta[*a];
+                    let x_b = &batches[&(x_sz, x_g)];
+                    let y_b = &batches[&(y_sz, y_g)];
+                    let a_b = &batches[&(a_sz, a_g)];
+                    let prod_b = &batches[&prod_group];
+                    assert!(prove_lookup_batch(
+                        x_b, x_i, &self.plain[*x], y_b, y_i, &self.plain[*y], a_b, a_i, prod_b, indices, table, *alpha, *beta, rng,
+                    ));
+                }
                 Op::RmsNorm { x, raw, weight, n_real } => {
                     let rsqrt = self.rsqrt_table.as_ref().unwrap();
                     let alpha = rng.field();
@@ -273,6 +459,24 @@ impl Exec {
                     let bits_b = &batches[&bits_group];
                     assert!(prove_affine_batch(
                         x_b, x_i, &self.plain[*x], o_b, o_i, &self.plain[*out], bits_b, bias, *shift, rng,
+                    ));
+                }
+                Op::Softmax { scores, c, shifted, e, sum, sum_broadcast, out, big_group, row_group, prod_group, bits1_group, bits2_group, exp_table, offset, n_rows, n_cols, alpha, beta } => {
+                    let big_b = &batches[&big_group];
+                    let row_b = &batches[&row_group];
+                    let prod_b = &batches[&prod_group];
+                    let b1_b = &batches[&bits1_group];
+                    let b2_b = &batches[&bits2_group];
+                    assert!(prove_softmax_rows_batch(
+                        big_b, row_b, prod_b, b1_b, b2_b,
+                        &self.plain[*scores],
+                        &self.plain[*c],
+                        &self.plain[*shifted],
+                        &self.plain[*e],
+                        &self.plain[*sum],
+                        &self.plain[*sum_broadcast],
+                        &self.plain[*out],
+                        exp_table, *offset, *n_rows, *n_cols, *alpha, *beta, rng,
                     ));
                 }
             }
@@ -361,6 +565,46 @@ mod tests {
         let _e_id = ex.add(c_id, d_id);
 
         let whir = Whir::new_testing(6);
+        ex.prove(&whir, &mut rng);
+    }
+
+    #[test]
+    fn ir_two_phase_lookup() {
+        let mut rng = XorShift64::new(0x8888);
+        let n = 32usize;
+        let table: Vec<Goldilocks> = (0..16).map(|i| from_i32(i as i32)).collect();
+        let indices: Vec<u32> = (0..n).map(|_| (rng.next_u64() % 16) as u32).collect();
+
+        let mut ex = Exec::new();
+        let _y = ex.lookup(&indices, &table, &mut rng);
+
+        let whir = Whir::new_testing(5);
+        ex.prove(&whir, &mut rng);
+    }
+
+    #[test]
+    fn ir_two_phase_softmax() {
+        let mut rng = XorShift64::new(0x9999);
+        let (n_rows, n_cols) = (32usize, 32usize);
+        let n = n_rows * n_cols;
+        let offset = 1u32 << 18;
+        let table_size = 1usize << 18;
+        let exp_table: Vec<Goldilocks> = (0..table_size)
+            .map(|j| {
+                let x = (j as f64 - offset as f64) / 65536.0;
+                from_i32((x.exp() * 65536.0).round() as i32)
+            })
+            .collect();
+
+        let scores: Vec<Goldilocks> = (0..n)
+            .map(|_| from_i32((rng.next_u64() % 200000) as i32 - 100000))
+            .collect();
+
+        let mut ex = Exec::new();
+        let scores_id = ex.input(scores, 1);
+        let _out = ex.softmax(scores_id, &exp_table, offset, n_rows, n_cols, &mut rng);
+
+        let whir = Whir::new_testing(10);
         ex.prove(&whir, &mut rng);
     }
 }
