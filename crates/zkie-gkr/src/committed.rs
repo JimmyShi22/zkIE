@@ -566,6 +566,46 @@ fn prove_linear_nonneg(
     prove_bits_range(whir, &bits, &c_bits, value_at_r, &r, &s, s_r)
 }
 
+fn prove_linear_nonneg_batch(
+    x_batch: &BatchCtx,
+    x_idx: usize,
+    x_plain: &[Goldilocks],
+    y_batch: &BatchCtx,
+    y_idx: usize,
+    y_plain: &[Goldilocks],
+    bits_batch: &BatchCtx,
+    a: Goldilocks,
+    b: Goldilocks,
+    rng: &mut XorShift64,
+) -> bool {
+    const BITS: usize = 31;
+    let n = x_plain.len();
+    let d = n.trailing_zeros() as usize;
+    assert_eq!(y_plain.len(), n);
+
+    let lhs: Vec<Goldilocks> = x_plain.iter().zip(y_plain).map(|(&xv, &yv)| a * xv + b * yv).collect();
+    let mut bits: Vec<Vec<Goldilocks>> = vec![vec![Goldilocks::ZERO; n]; BITS];
+    for i in 0..n {
+        let v = to_i32(lhs[i]) as i64 as u64;
+        for (j, bj) in bits.iter_mut().enumerate() {
+            bj[i] = from_i32(((v >> j) & 1) as i32);
+        }
+    }
+
+    let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let s = mle::eq_evals(&r);
+    let s_r = mle::eval(&s, &r);
+    let (x_open, x_r) = x_batch.whir.open_batch(x_batch.prover_data.clone(), &x_batch.protocol, x_idx, x_batch.num_tables, &r);
+    let (y_open, y_r) = y_batch.whir.open_batch(y_batch.prover_data.clone(), &y_batch.protocol, y_idx, y_batch.num_tables, &r);
+    if x_batch.whir.verify_batch(&x_batch.commitment, &x_open, &x_batch.protocol, x_idx, x_batch.num_tables, &r).unwrap() != x_r
+        || y_batch.whir.verify_batch(&y_batch.commitment, &y_open, &y_batch.protocol, y_idx, y_batch.num_tables, &r).unwrap() != y_r
+    {
+        return false;
+    }
+    let value_at_r = a * x_r + b * y_r;
+    prove_bits_range_batch(bits_batch, &bits, value_at_r, &r, &s, s_r)
+}
+
 /// Prove the row-wise softmax over a `n_rows x n_cols` tensor: for each row,
 /// `out[r,c] = round(2^16 * exp(scores[r,c] - c[r]) / sum_c exp(scores[r,c] - c[r]))`.
 /// The output is the probability rescaled to scale 2^16 and rounded half-up
@@ -792,6 +832,140 @@ pub fn layer_norm_raw(
 /// zero-check sum-check — the prover runs O(N) field work but the verifier opens
 /// `x`/`raw` at only a constant number of random points.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+pub fn prove_softmax_rows_batch(
+    big_batch: &BatchCtx,
+    row_batch: &BatchCtx,
+    prod_batch: &BatchCtx,
+    bits1_batch: &BatchCtx,
+    bits2_batch: &BatchCtx,
+    scores_plain: &[Goldilocks],
+    c_plain: &[Goldilocks],
+    shifted_plain: &[Goldilocks],
+    e_plain: &[Goldilocks],
+    sum_plain: &[Goldilocks],
+    sum_broadcast_plain: &[Goldilocks],
+    out_plain: &[Goldilocks],
+    exp_table: &[Goldilocks],
+    offset: u32,
+    n_rows: usize,
+    n_cols: usize,
+    alpha: Goldilocks,
+    beta: Goldilocks,
+    rng: &mut XorShift64,
+) -> bool {
+    let n = n_rows * n_cols;
+    let dr = n_rows.trailing_zeros() as usize;
+    let dc = n_cols.trailing_zeros() as usize;
+    let d = dr + dc;
+
+    // 1. shifted = scores - c (broadcast over columns).
+    let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let r_row = &r[dc..];
+    let (sc_open, sc_r) = big_batch.whir.open_batch(big_batch.prover_data.clone(), &big_batch.protocol, 0, big_batch.num_tables, &r);
+    let (c_open, c_r) = row_batch.whir.open_batch(row_batch.prover_data.clone(), &row_batch.protocol, 0, row_batch.num_tables, r_row);
+    let (sh_open, sh_r) = big_batch.whir.open_batch(big_batch.prover_data.clone(), &big_batch.protocol, 1, big_batch.num_tables, &r);
+    if big_batch.whir.verify_batch(&big_batch.commitment, &sc_open, &big_batch.protocol, 0, big_batch.num_tables, &r).unwrap() != sc_r
+        || row_batch.whir.verify_batch(&row_batch.commitment, &c_open, &row_batch.protocol, 0, row_batch.num_tables, r_row).unwrap() != c_r
+        || big_batch.whir.verify_batch(&big_batch.commitment, &sh_open, &big_batch.protocol, 1, big_batch.num_tables, &r).unwrap() != sh_r
+    {
+        return false;
+    }
+    if sh_r != sc_r - c_r {
+        return false;
+    }
+
+    // 2. e = exp_table[shifted + offset] (lookup). big: idx(5), e(2).
+    let indices: Vec<u32> = shifted_plain
+        .iter()
+        .map(|&v| (to_i32(v) as i64 + offset as i64).clamp(0, exp_table.len() as i64 - 1) as u32)
+        .collect();
+    let idx_field: Vec<Goldilocks> = indices.iter().map(|&i| from_i32(i as i32)).collect();
+    if !prove_lookup_batch(
+        big_batch, 5, &idx_field, big_batch, 2, e_plain, big_batch, 7, prod_batch, &indices, exp_table, alpha, beta, rng,
+    ) {
+        return false;
+    }
+
+    // 3. sum = row-wise sum of e. big: e(2); row: sum(1).
+    let r_row2: Vec<Goldilocks> = (0..dr).map(|_| rng.field()).collect();
+    let eq_row = eq_row_broadcast(&r_row2, n_rows, n_cols);
+    let claimed_sum = mle::eval(sum_plain, &r_row2);
+    let r_full: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let proof_sum = sumcheck::prove(e_plain, &eq_row, claimed_sum, &r_full);
+    let (e_open, e_r) = big_batch.whir.open_batch(big_batch.prover_data.clone(), &big_batch.protocol, 2, big_batch.num_tables, &r_full);
+    let (sum_open, sum_r) = row_batch.whir.open_batch(row_batch.prover_data.clone(), &row_batch.protocol, 1, row_batch.num_tables, &r_row2);
+    if big_batch.whir.verify_batch(&big_batch.commitment, &e_open, &big_batch.protocol, 2, big_batch.num_tables, &r_full).unwrap() != e_r
+        || row_batch.whir.verify_batch(&row_batch.commitment, &sum_open, &row_batch.protocol, 1, row_batch.num_tables, &r_row2).unwrap() != sum_r
+    {
+        return false;
+    }
+    let eq_row_r = mle::eval(&eq_row, &r_full);
+    if !sumcheck::verify(&proof_sum, claimed_sum, &r_full, e_r, eq_row_r) || sum_r != claimed_sum {
+        return false;
+    }
+
+    // 4. sum_broadcast = broadcast of sum over columns. big: sb(3); row: sum(1).
+    let r3: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let r3_row = &r3[dc..];
+    let (sb_open, sb_r) = big_batch.whir.open_batch(big_batch.prover_data.clone(), &big_batch.protocol, 3, big_batch.num_tables, &r3);
+    let (s2_open, s2_r) = row_batch.whir.open_batch(row_batch.prover_data.clone(), &row_batch.protocol, 1, row_batch.num_tables, r3_row);
+    if big_batch.whir.verify_batch(&big_batch.commitment, &sb_open, &big_batch.protocol, 3, big_batch.num_tables, &r3).unwrap() != sb_r
+        || row_batch.whir.verify_batch(&row_batch.commitment, &s2_open, &row_batch.protocol, 1, row_batch.num_tables, r3_row).unwrap() != s2_r
+    {
+        return false;
+    }
+    if sb_r != s2_r {
+        return false;
+    }
+
+    // 5. out = round(e * 2^16 / sum). big: out(4), e(2), rem(6).
+    let scale_f = from_i64(1i64 << 16);
+    let rem: Vec<Goldilocks> = e_plain
+        .iter()
+        .zip(out_plain)
+        .zip(sum_broadcast_plain)
+        .map(|((&ev, &ov), &sv)| ev * scale_f - ov * sv)
+        .collect();
+
+    let eq = mle::eq_evals(&r3);
+    let eq_r = mle::eval(&eq, &r3);
+    let c1 = eq.iter().zip(out_plain).zip(sum_broadcast_plain).fold(Goldilocks::ZERO, |a, ((&ei, &oi), &si)| a + ei * oi * si);
+    let ce = eq.iter().zip(e_plain).fold(Goldilocks::ZERO, |a, (&ei, &vi)| a + ei * vi);
+    let cr = eq.iter().zip(&rem).fold(Goldilocks::ZERO, |a, (&ei, &vi)| a + ei * vi);
+    let proof_c1 = sumcheck::prove3(&eq, out_plain, sum_broadcast_plain, c1, &r3);
+    let proof_ce = sumcheck::prove(&eq, e_plain, ce, &r3);
+    let proof_cr = sumcheck::prove(&eq, &rem, cr, &r3);
+    let (o_open, o_r) = big_batch.whir.open_batch(big_batch.prover_data.clone(), &big_batch.protocol, 4, big_batch.num_tables, &r3);
+    let (e2_open, e2_r) = big_batch.whir.open_batch(big_batch.prover_data.clone(), &big_batch.protocol, 2, big_batch.num_tables, &r3);
+    let (rem_open, rem_r) = big_batch.whir.open_batch(big_batch.prover_data.clone(), &big_batch.protocol, 6, big_batch.num_tables, &r3);
+    if big_batch.whir.verify_batch(&big_batch.commitment, &o_open, &big_batch.protocol, 4, big_batch.num_tables, &r3).unwrap() != o_r
+        || big_batch.whir.verify_batch(&big_batch.commitment, &e2_open, &big_batch.protocol, 2, big_batch.num_tables, &r3).unwrap() != e2_r
+        || big_batch.whir.verify_batch(&big_batch.commitment, &rem_open, &big_batch.protocol, 6, big_batch.num_tables, &r3).unwrap() != rem_r
+    {
+        return false;
+    }
+    if !sumcheck::verify3(&proof_c1, c1, &r3, eq_r, o_r, sb_r)
+        || !sumcheck::verify(&proof_ce, ce, &r3, eq_r, e2_r)
+        || !sumcheck::verify(&proof_cr, cr, &r3, eq_r, rem_r)
+        || c1 != scale_f * ce - cr
+    {
+        return false;
+    }
+
+    let two = from_i64(2);
+    let neg_two = from_i64(-2);
+    if !prove_linear_nonneg_batch(big_batch, 6, &rem, big_batch, 3, sum_broadcast_plain, bits1_batch, two, Goldilocks::ONE, rng) {
+        return false;
+    }
+    if !prove_linear_nonneg_batch(big_batch, 3, sum_broadcast_plain, big_batch, 6, &rem, bits2_batch, Goldilocks::ONE, neg_two, rng) {
+        return false;
+    }
+
+    let _ = (n, c_plain, scores_plain);
+    true
+}
+
 pub fn prove_layer_norm(
     whir_x: &Whir,
     x: &Committed,
@@ -2237,6 +2411,101 @@ mod tests {
             &whir, &whir_r, &cs, &scores, &cc, &c, &csh, &shifted, &ce, &e,
             &csum, &sum, &csb, &sum_broadcast, &c_bad, &bad, &exp_table, offset, n_rows, n_cols,
             alpha, beta, &mut rng,
+        ));
+    }
+
+    #[test]
+    fn batch_softmax_rows_roundtrip() {
+        let mut rng = XorShift64::new(0x2222);
+        let (n_rows, n_cols) = (32usize, 32usize);
+        let n = n_rows * n_cols;
+        let offset = 1u32 << 18;
+        let table_size = 1usize << 18;
+        let exp_table: Vec<Goldilocks> = (0..table_size)
+            .map(|j| {
+                let x = (j as f64 - offset as f64) / 65536.0;
+                from_i32((x.exp() * 65536.0).round() as i32)
+            })
+            .collect();
+
+        let scores: Vec<Goldilocks> = (0..n)
+            .map(|_| from_i32((rng.next_u64() % 200000) as i32 - 100000))
+            .collect();
+        let c: Vec<Goldilocks> = (0..n_rows)
+            .map(|r| {
+                let row_max = (0..n_cols).map(|k| to_i32(scores[r * n_cols + k])).max().unwrap();
+                from_i32(row_max)
+            })
+            .collect();
+        let shifted: Vec<Goldilocks> = scores.iter().enumerate().map(|(i, &s)| s - c[i / n_cols]).collect();
+        let indices: Vec<u32> = shifted
+            .iter()
+            .map(|&v| (to_i32(v) as i64 + offset as i64).clamp(0, exp_table.len() as i64 - 1) as u32)
+            .collect();
+        let idx_field: Vec<Goldilocks> = indices.iter().map(|&i| from_i32(i as i32)).collect();
+        let e: Vec<Goldilocks> = indices.iter().map(|&i| exp_table[i as usize]).collect();
+        let sum: Vec<Goldilocks> = (0..n_rows).map(|r| (0..n_cols).fold(Goldilocks::ZERO, |a, k| a + e[r * n_cols + k])).collect();
+        let sum_broadcast: Vec<Goldilocks> = (0..n).map(|i| sum[i / n_cols]).collect();
+        let out: Vec<Goldilocks> = e.iter().enumerate().map(|(i, &v)| {
+            from_i32(div_round(to_i32(v) as i64 * 65536, to_i32(sum[i / n_cols]) as i64) as i32)
+        }).collect();
+        let rem: Vec<Goldilocks> = e.iter().zip(&out).zip(&sum_broadcast)
+            .map(|((&ev, &ov), &sv)| ev * from_i64(65536) - ov * sv).collect();
+
+        let alpha = rng.field();
+        let beta = rng.field();
+        let a_plain: Vec<Goldilocks> = idx_field.iter().zip(&e).map(|(&xv, &yv)| alpha + xv + beta * yv).collect();
+
+        let mut m = vec![0u64; exp_table.len()];
+        for &i in &indices { m[i as usize] += 1; }
+        let mut b = Goldilocks::ONE;
+        for (j, &t) in exp_table.iter().enumerate() {
+            let tkey = Goldilocks::from_u64(j as u64) + beta * t;
+            let factor = alpha + tkey;
+            for _ in 0..m[j] { b = b * factor; }
+        }
+        let mut a_norm = a_plain.clone();
+        a_norm[n - 1] = a_norm[n - 1] * b.inverse();
+        let mut r = vec![Goldilocks::ONE; n];
+        for i in 1..n { r[i] = r[i - 1] * a_norm[i - 1]; }
+
+        let two = from_i64(2);
+        let neg_two = from_i64(-2);
+        let lhs1: Vec<Goldilocks> = rem.iter().zip(&sum_broadcast).map(|(&rv, &sv)| two * rv + sv).collect();
+        let lhs2: Vec<Goldilocks> = sum_broadcast.iter().zip(&rem).map(|(&sv, &rv)| sv + neg_two * rv).collect();
+        let mut bits1: Vec<Vec<Goldilocks>> = vec![vec![Goldilocks::ZERO; n]; 31];
+        let mut bits2: Vec<Vec<Goldilocks>> = vec![vec![Goldilocks::ZERO; n]; 31];
+        for i in 0..n {
+            let v1 = to_i32(lhs1[i]) as i64 as u64;
+            let v2 = to_i32(lhs2[i]) as i64 as u64;
+            for j in 0..31 {
+                bits1[j][i] = from_i32(((v1 >> j) & 1) as i32);
+                bits2[j][i] = from_i32(((v2 >> j) & 1) as i32);
+            }
+        }
+
+        let whir = Whir::new_testing(10);
+        let whir_r = Whir::new_testing(5);
+        let big_refs = [scores.as_slice(), shifted.as_slice(), e.as_slice(), sum_broadcast.as_slice(), out.as_slice(), idx_field.as_slice(), rem.as_slice(), a_plain.as_slice()];
+        let (big_c, big_pd, big_p, big_w) = whir.commit_batch(&big_refs);
+        let big = BatchCtx { commitment: big_c, prover_data: big_pd, protocol: big_p, whir: big_w, num_tables: 8 };
+        let row_refs = [c.as_slice(), sum.as_slice()];
+        let (row_c, row_pd, row_p, row_w) = whir_r.commit_batch(&row_refs);
+        let row = BatchCtx { commitment: row_c, prover_data: row_pd, protocol: row_p, whir: row_w, num_tables: 2 };
+        let prod_refs = [a_norm.as_slice(), r.as_slice()];
+        let (prod_c, prod_pd, prod_p, prod_w) = whir.commit_batch(&prod_refs);
+        let prod = BatchCtx { commitment: prod_c, prover_data: prod_pd, protocol: prod_p, whir: prod_w, num_tables: 2 };
+        let b1_refs: Vec<&[Goldilocks]> = bits1.iter().map(|x| x.as_slice()).collect();
+        let (b1_c, b1_pd, b1_p, b1_w) = whir.commit_batch(&b1_refs);
+        let b1 = BatchCtx { commitment: b1_c, prover_data: b1_pd, protocol: b1_p, whir: b1_w, num_tables: 31 };
+        let b2_refs: Vec<&[Goldilocks]> = bits2.iter().map(|x| x.as_slice()).collect();
+        let (b2_c, b2_pd, b2_p, b2_w) = whir.commit_batch(&b2_refs);
+        let b2 = BatchCtx { commitment: b2_c, prover_data: b2_pd, protocol: b2_p, whir: b2_w, num_tables: 31 };
+
+        assert!(prove_softmax_rows_batch(
+            &big, &row, &prod, &b1, &b2,
+            &scores, &c, &shifted, &e, &sum, &sum_broadcast, &out,
+            &exp_table, offset, n_rows, n_cols, alpha, beta, &mut rng,
         ));
     }
 
