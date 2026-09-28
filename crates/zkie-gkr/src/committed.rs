@@ -901,6 +901,103 @@ pub fn prove_layer_norm(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn prove_layer_norm_batch(
+    x_batch: &BatchCtx,
+    x_idx: usize,
+    x_plain: &[Goldilocks],
+    raw_batch: &BatchCtx,
+    raw_idx: usize,
+    raw_plain: &[Goldilocks],
+    weight: &[Goldilocks],
+    n_real: usize,
+    rsqrt_table: &[Goldilocks],
+    alpha: Goldilocks,
+    beta: Goldilocks,
+    rng: &mut XorShift64,
+) -> bool {
+    let n = weight.len();
+    let d = n.trailing_zeros() as usize;
+    assert_eq!(x_plain.len(), n);
+    assert_eq!(raw_plain.len(), n);
+    let ones: Vec<Goldilocks> = vec![Goldilocks::ONE; n];
+
+    let s_x: i64 = x_plain[..n_real].iter().map(|&v| to_i32(v) as i64).sum();
+    let s_x_f = from_i64(s_x);
+    let r1: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let proof_x = sumcheck::prove(x_plain, &ones, s_x_f, &r1);
+    let (x_open1, x_r1) = x_batch.whir.open_batch(x_batch.prover_data.clone(), &x_batch.protocol, x_idx, x_batch.num_tables, &r1);
+    if x_batch.whir.verify_batch(&x_batch.commitment, &x_open1, &x_batch.protocol, x_idx, x_batch.num_tables, &r1).unwrap() != x_r1 {
+        return false;
+    }
+    if !sumcheck::verify(&proof_x, s_x_f, &r1, x_r1, Goldilocks::ONE) {
+        return false;
+    }
+    let mean = div_round(s_x, n_real as i64) as i32;
+    let mean_f = from_i32(mean);
+
+    let s_x2: i64 = x_plain[..n_real]
+        .iter()
+        .map(|&v| {
+            let d = to_i32(v) as i64;
+            d * d
+        })
+        .sum();
+    let s_x2_f = from_i64(s_x2);
+    let r2: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let proof_x2 = sumcheck::prove(x_plain, x_plain, s_x2_f, &r2);
+    let (x_open2, x_r2) = x_batch.whir.open_batch(x_batch.prover_data.clone(), &x_batch.protocol, x_idx, x_batch.num_tables, &r2);
+    if x_batch.whir.verify_batch(&x_batch.commitment, &x_open2, &x_batch.protocol, x_idx, x_batch.num_tables, &r2).unwrap() != x_r2 {
+        return false;
+    }
+    if !sumcheck::verify(&proof_x2, s_x2_f, &r2, x_r2, x_r2) {
+        return false;
+    }
+    let m = mean as i64;
+    let sqsum = s_x2 - 2 * m * s_x + (n_real as i64) * m * m;
+    let var = div_round(sqsum, n_real as i64);
+    let s_index = div_round(var, 1 << 18) as u32;
+    if (s_index as usize) >= rsqrt_table.len() {
+        return false;
+    }
+    let rstd = rsqrt_table[s_index as usize];
+    let lk = lookup::prove(&[s_index], &[rstd], rsqrt_table, alpha, beta);
+    if !lookup::verify(&lk) {
+        return false;
+    }
+
+    let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let s = mle::eq_evals(&r);
+    let c_raw: Goldilocks = s.iter().zip(raw_plain).fold(Goldilocks::ZERO, |a, (&si, &ri)| a + si * ri);
+    let c_xw: Goldilocks = s.iter().zip(x_plain).zip(weight).fold(Goldilocks::ZERO, |a, ((&si, &xi), &wi)| a + si * xi * wi);
+    let c_w: Goldilocks = s.iter().zip(weight).fold(Goldilocks::ZERO, |a, (&si, &wi)| a + si * wi);
+
+    let proof_raw = sumcheck::prove(&s, raw_plain, c_raw, &r);
+    let proof_xw = sumcheck::prove3(&s, x_plain, weight, c_xw, &r);
+    let proof_w = sumcheck::prove(&s, weight, c_w, &r);
+
+    let (x_open, xr) = x_batch.whir.open_batch(x_batch.prover_data.clone(), &x_batch.protocol, x_idx, x_batch.num_tables, &r);
+    let (raw_open, rv) = raw_batch.whir.open_batch(raw_batch.prover_data.clone(), &raw_batch.protocol, raw_idx, raw_batch.num_tables, &r);
+    if x_batch.whir.verify_batch(&x_batch.commitment, &x_open, &x_batch.protocol, x_idx, x_batch.num_tables, &r).unwrap() != xr {
+        return false;
+    }
+    if raw_batch.whir.verify_batch(&raw_batch.commitment, &raw_open, &raw_batch.protocol, raw_idx, raw_batch.num_tables, &r).unwrap() != rv {
+        return false;
+    }
+    let s_r = mle::eval(&s, &r);
+    let w_r = mle::eval(weight, &r);
+    if !sumcheck::verify(&proof_raw, c_raw, &r, s_r, rv) {
+        return false;
+    }
+    if !sumcheck::verify3(&proof_xw, c_xw, &r, s_r, xr, w_r) {
+        return false;
+    }
+    if !sumcheck::verify(&proof_w, c_w, &r, s_r, w_r) {
+        return false;
+    }
+    c_raw == rstd * (c_xw - mean_f * c_w)
+}
+
 /// Derive the quantized RMSNorm rsqrt table index from the true `n_real` signed
 /// i32 inputs (ignoring padding): `s = mean(x^2)` at scale 2^32, index at scale
 /// 2^14 (`s >> 18`). RMSNorm has no mean subtraction, so this is a pure
@@ -1602,6 +1699,34 @@ mod tests {
     use super::*;
     use crate::field::PrimeCharacteristicRing;
     use crate::fixed_point::from_i64;
+
+    #[test]
+    fn batch_layer_norm_roundtrip() {
+        let mut rng = XorShift64::new(0xbabe);
+        let n = 64usize;
+        let n_real = n;
+        let x: Vec<Goldilocks> = (0..n).map(|_| from_i32((rng.next_u64() % 65536) as i32)).collect();
+        let weight: Vec<Goldilocks> = (0..n).map(|_| from_i32((rng.next_u64() % 65536) as i32)).collect();
+        let table_size = 1usize << 17;
+        let rsqrt_table: Vec<Goldilocks> = (0..table_size)
+            .map(|j| {
+                let s = j as f64 / 16384.0 + 1e-6;
+                from_i32((1.0 / s.sqrt() * 65536.0).round() as i32)
+            })
+            .collect();
+        let (raw, _, _, _) = layer_norm_raw(&x, &weight, n_real, &rsqrt_table);
+
+        let whir = Whir::new_testing(6);
+        let refs = [x.as_slice(), raw.as_slice()];
+        let (commitment, pd, protocol, w) = whir.commit_batch(&refs);
+        let batch = BatchCtx { commitment, prover_data: pd, protocol, whir: w, num_tables: 2 };
+        let alpha = rng.field();
+        let beta = rng.field();
+
+        assert!(prove_layer_norm_batch(
+            &batch, 0, &x, &batch, 1, &raw, &weight, n_real, &rsqrt_table, alpha, beta, &mut rng,
+        ));
+    }
 
     #[test]
     fn batch_rms_norm_roundtrip() {
