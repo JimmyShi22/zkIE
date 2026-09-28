@@ -159,7 +159,7 @@ fn main() {
     let mask = load_i32(&format!("{stack}mask_q_i32.bin"));
     let zero_hd = vec![from_i32(0); SEQ * HDIM_PAD];
 
-    for li in 0..N_LAYERS {
+    for li in 0..std::env::var("ZKIE_LAYERS").ok().and_then(|v| v.parse().ok()).unwrap_or(N_LAYERS) {
         let lnw = load_i32(&format!("{stack}L{li}_lnw_i32.bin"));
         let q_w = ex.input(load_i32(&format!("{stack}L{li}_q_w_i32.bin")), 0);
         let k_w = ex.input(load_i32(&format!("{stack}L{li}_k_w_i32.bin")), 0);
