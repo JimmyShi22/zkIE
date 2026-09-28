@@ -993,6 +993,122 @@ pub fn prove_scale(
     prove_round(whir_in, input, in_plain, whir_out, output, out_plain, scale, bias, 16, rng)
 }
 
+fn prove_bits_range_batch(
+    bits_batch: &BatchCtx,
+    bits: &[Vec<Goldilocks>],
+    value_at_r: Goldilocks,
+    r: &[Goldilocks],
+    s: &[Goldilocks],
+    s_r: Goldilocks,
+) -> bool {
+    for (j, bj) in bits.iter().enumerate() {
+        let c_bb: Goldilocks = s.iter().zip(bj).zip(bj).fold(Goldilocks::ZERO, |a, ((&si, &xi), &yi)| a + si * xi * yi);
+        let c_b: Goldilocks = s.iter().zip(bj).fold(Goldilocks::ZERO, |a, (&si, &xi)| a + si * xi);
+        let proof_bb = sumcheck::prove3(s, bj, bj, c_bb, r);
+        let proof_b = sumcheck::prove(s, bj, c_b, r);
+        let (b_open, b_r) = bits_batch.whir.open_batch(bits_batch.prover_data.clone(), &bits_batch.protocol, j, bits_batch.num_tables, r);
+        if bits_batch.whir.verify_batch(&bits_batch.commitment, &b_open, &bits_batch.protocol, j, bits_batch.num_tables, r).unwrap() != b_r {
+            return false;
+        }
+        if !sumcheck::verify3(&proof_bb, c_bb, r, s_r, b_r, b_r)
+            || !sumcheck::verify(&proof_b, c_b, r, s_r, b_r)
+            || c_bb != c_b
+        {
+            return false;
+        }
+    }
+    let mut rhs = Goldilocks::ZERO;
+    for j in 0..bits.len() {
+        let (b_open, b_r) = bits_batch.whir.open_batch(bits_batch.prover_data.clone(), &bits_batch.protocol, j, bits_batch.num_tables, r);
+        if bits_batch.whir.verify_batch(&bits_batch.commitment, &b_open, &bits_batch.protocol, j, bits_batch.num_tables, r).unwrap() != b_r {
+            return false;
+        }
+        rhs = rhs + b_r * from_i64(1i64 << j);
+    }
+    value_at_r == rhs
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_round_batch(
+    in_batch: &BatchCtx,
+    in_idx: usize,
+    in_plain: &[Goldilocks],
+    out_batch: &BatchCtx,
+    out_idx: usize,
+    out_plain: &[Goldilocks],
+    bits_batch: &BatchCtx,
+    scale: i64,
+    bias: &[Goldilocks],
+    shift: usize,
+    rng: &mut XorShift64,
+) -> bool {
+    let n = bias.len();
+    let d = n.trailing_zeros() as usize;
+    let scale_f = from_i64(scale);
+    let two_shift = from_i64(1i64 << shift);
+    let half = from_i64(1i64 << (shift - 1));
+
+    let mut bits: Vec<Vec<Goldilocks>> = vec![vec![Goldilocks::ZERO; n]; shift];
+    for i in 0..n {
+        let in_i = to_i64(in_plain[i]);
+        let out_i = to_i32(out_plain[i]) as i64;
+        let b_i = to_i32(bias[i]) as i64;
+        let rem = in_i * scale - (out_i - b_i) * (1i64 << shift);
+        let rem_off = rem + (1i64 << (shift - 1));
+        for (j, bj) in bits.iter_mut().enumerate() {
+            bj[i] = from_i32(((rem_off >> j) & 1) as i32);
+        }
+    }
+
+    let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let s = mle::eq_evals(&r);
+    let s_r = mle::eval(&s, &r);
+
+    let (in_open, in_r) = in_batch.whir.open_batch(in_batch.prover_data.clone(), &in_batch.protocol, in_idx, in_batch.num_tables, &r);
+    let (out_open, out_r) = out_batch.whir.open_batch(out_batch.prover_data.clone(), &out_batch.protocol, out_idx, out_batch.num_tables, &r);
+    if in_batch.whir.verify_batch(&in_batch.commitment, &in_open, &in_batch.protocol, in_idx, in_batch.num_tables, &r).unwrap() != in_r {
+        return false;
+    }
+    if out_batch.whir.verify_batch(&out_batch.commitment, &out_open, &out_batch.protocol, out_idx, out_batch.num_tables, &r).unwrap() != out_r {
+        return false;
+    }
+    let bias_r = mle::eval(bias, &r);
+    let value_at_r = in_r * scale_f - (out_r - bias_r) * two_shift + half;
+    prove_bits_range_batch(bits_batch, &bits, value_at_r, &r, &s, s_r)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_affine_batch(
+    in_batch: &BatchCtx,
+    in_idx: usize,
+    in_plain: &[Goldilocks],
+    out_batch: &BatchCtx,
+    out_idx: usize,
+    out_plain: &[Goldilocks],
+    bits_batch: &BatchCtx,
+    bias: &[Goldilocks],
+    shift: u32,
+    rng: &mut XorShift64,
+) -> bool {
+    prove_round_batch(in_batch, in_idx, in_plain, out_batch, out_idx, out_plain, bits_batch, 1, bias, shift as usize, rng)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_scale_batch(
+    in_batch: &BatchCtx,
+    in_idx: usize,
+    in_plain: &[Goldilocks],
+    out_batch: &BatchCtx,
+    out_idx: usize,
+    out_plain: &[Goldilocks],
+    bits_batch: &BatchCtx,
+    scale: i64,
+    bias: &[Goldilocks],
+    rng: &mut XorShift64,
+) -> bool {
+    prove_round_batch(in_batch, in_idx, in_plain, out_batch, out_idx, out_plain, bits_batch, scale, bias, 16, rng)
+}
+
 /// Prove the raw RMSNorm product `raw = x * rstd * w` (scale 2^48) against WHIR
 /// commitments, in the O(N)-opening PoC form. `mean(x^2)` is recomputed from the
 /// *committed* `x`, and `rstd = 1/sqrt(mean(x^2) + eps)` is bound to it by a
@@ -1225,6 +1341,42 @@ mod tests {
     use super::*;
     use crate::field::PrimeCharacteristicRing;
     use crate::fixed_point::from_i64;
+
+    #[test]
+    fn batch_affine_roundtrip() {
+        let mut rng = XorShift64::new(0xabcd);
+        let n = 64usize;
+        let shift = 16u32;
+        let in_plain: Vec<Goldilocks> =
+            (0..n).map(|_| from_i64((rng.next_u64() % (1u64 << 32)) as i64)).collect();
+        let bias: Vec<Goldilocks> =
+            (0..n).map(|_| from_i32((rng.next_u64() % 1000) as i32)).collect();
+        let out_plain = affine_raw(&in_plain, &bias, shift, false);
+
+        let mut bits: Vec<Vec<Goldilocks>> = vec![vec![Goldilocks::ZERO; n]; shift as usize];
+        for i in 0..n {
+            let in_i = to_i64(in_plain[i]);
+            let out_i = to_i32(out_plain[i]) as i64;
+            let b_i = to_i32(bias[i]) as i64;
+            let rem = in_i - (out_i - b_i) * (1i64 << shift);
+            let rem_off = rem + (1i64 << (shift - 1));
+            for (j, bj) in bits.iter_mut().enumerate() {
+                bj[i] = from_i32(((rem_off >> j) & 1) as i32);
+            }
+        }
+
+        let whir = Whir::new_testing(6);
+        let io_refs = [in_plain.as_slice(), out_plain.as_slice()];
+        let (io_c, io_pd, io_p, io_w) = whir.commit_batch(&io_refs);
+        let io_batch = BatchCtx { commitment: io_c, prover_data: io_pd, protocol: io_p, whir: io_w, num_tables: 2 };
+        let bit_refs: Vec<&[Goldilocks]> = bits.iter().map(|b| b.as_slice()).collect();
+        let (bits_c, bits_pd, bits_p, bits_w) = whir.commit_batch(&bit_refs);
+        let bits_batch = BatchCtx { commitment: bits_c, prover_data: bits_pd, protocol: bits_p, whir: bits_w, num_tables: shift as usize };
+
+        assert!(prove_affine_batch(
+            &io_batch, 0, &in_plain, &io_batch, 1, &out_plain, &bits_batch, &bias, shift, &mut rng,
+        ));
+    }
 
     #[test]
     fn batch_add_roundtrip() {
