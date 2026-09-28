@@ -59,10 +59,12 @@ impl Ctx {
     }
 }
 
-/// Collects plain tensors during the forward pass and commits them in size
-/// groups, so the proving phase can open each tensor by (batch, table index).
+/// Collects plain tensors during the forward pass and commits them in
+/// (size, group) buckets, so the proving phase can open each tensor by
+/// (size, group, table index). The group lets callers separate same-size
+/// tensors of different kinds (weights, activations, bit columns).
 pub struct BatchBuilder {
-    pending: HashMap<usize, Vec<Vec<Goldilocks>>>,
+    pending: HashMap<(usize, usize), Vec<Vec<Goldilocks>>>,
 }
 
 impl BatchBuilder {
@@ -70,22 +72,27 @@ impl BatchBuilder {
         BatchBuilder { pending: HashMap::new() }
     }
 
-    /// Record a plain tensor and return (size, table index within that size group).
-    pub fn push(&mut self, plain: Vec<Goldilocks>) -> (usize, usize) {
-        let size = plain.len();
-        let group = self.pending.entry(size).or_default();
-        group.push(plain);
-        (size, group.len() - 1)
+    /// Record a plain tensor into group 0; returns (size, group, index).
+    pub fn push(&mut self, plain: Vec<Goldilocks>) -> (usize, usize, usize) {
+        self.push_group(plain, 0)
     }
 
-    /// Commit every collected tensor, grouped by size.
-    pub fn commit(&self, whir: &Whir) -> HashMap<usize, BatchCtx> {
+    /// Record a plain tensor into an explicit group.
+    pub fn push_group(&mut self, plain: Vec<Goldilocks>, group: usize) -> (usize, usize, usize) {
+        let size = plain.len();
+        let bucket = self.pending.entry((size, group)).or_default();
+        bucket.push(plain);
+        (size, group, bucket.len() - 1)
+    }
+
+    /// Commit every collected tensor, grouped by (size, group).
+    pub fn commit(&self, whir: &Whir) -> HashMap<(usize, usize), BatchCtx> {
         let mut batches = HashMap::new();
-        for (&size, tensors) in &self.pending {
+        for (&(size, group), tensors) in &self.pending {
             let refs: Vec<&[Goldilocks]> = tensors.iter().map(|t| t.as_slice()).collect();
             let (commitment, prover_data, protocol, w) = whir.commit_batch(&refs);
             batches.insert(
-                size,
+                (size, group),
                 BatchCtx { commitment, prover_data, protocol, whir: w, num_tables: refs.len() },
             );
         }

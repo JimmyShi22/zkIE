@@ -33,10 +33,10 @@ fn main() {
 
     // --- phase 2: batch commit, grouped by size ---
     let mut bb = BatchBuilder::new();
-    let (a_sz, a_i) = bb.push(a.clone());
-    let (b_sz, b_i) = bb.push(b.clone());
-    let (c_sz, c_i) = bb.push(c.clone());
-    let (o_sz, o_i) = bb.push(out.clone());
+    let (a_sz, _, a_i) = bb.push(a.clone());
+    let (b_sz, _, b_i) = bb.push(b.clone());
+    let (c_sz, _, c_i) = bb.push(c.clone());
+    let (o_sz, _, o_i) = bb.push(out.clone());
     let whir = Whir::new_testing(8);
     let batches = bb.commit(&whir);
 
@@ -47,13 +47,13 @@ fn main() {
     let zbatches = zbb.commit(&whir);
 
     // --- phase 3: prove ---
-    let a_b = &batches[&a_sz];
-    let b_b = &batches[&b_sz];
-    let c_b = &batches[&c_sz];
-    let o_b = &batches[&o_sz];
+    let a_b = &batches[&(a_sz, 0)];
+    let b_b = &batches[&(b_sz, 0)];
+    let c_b = &batches[&(c_sz, 0)];
+    let o_b = &batches[&(o_sz, 0)];
     assert!(prove_matmul_batch(a_b, a_i, b_b, b_i, c_b, c_i, &a, &b, &c, m, k, n, &mut rng));
 
-    let zb = &zbatches[&(m * n)];
+    let zb = &zbatches[&(m * n, 0)];
     assert!(prove_affine_batch(c_b, c_i, &c, o_b, o_i, &out, zb, &bias, 16, &mut rng));
 
     println!("two-phase matmul + affine proved over batch commitments");
