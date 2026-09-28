@@ -83,6 +83,10 @@ impl Exec {
         id
     }
 
+    pub fn get(&self, id: usize) -> &[Goldilocks] {
+        &self.plain[id]
+    }
+
     pub fn matmul(&mut self, a: usize, b: usize, m: usize, k: usize, n: usize) -> usize {
         let c_plain = dense_m(&self.plain[a], &self.plain[b], m, k, n);
         let c = self.input(c_plain, 0);
