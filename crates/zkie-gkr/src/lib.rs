@@ -7,6 +7,7 @@
 //! matmul's `O(m*n*k)` work), whereas the current Halo2 `DotProductChip`
 //! expands every output element into `K + 184` Plonkish rows.
 
+pub mod ir;
 pub mod field;
 pub mod fixed_point;
 pub mod committed;
