@@ -1308,6 +1308,79 @@ pub fn prove_rms_norm(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn prove_rms_norm_batch(
+    x_batch: &BatchCtx,
+    x_idx: usize,
+    x_plain: &[Goldilocks],
+    raw_batch: &BatchCtx,
+    raw_idx: usize,
+    raw_plain: &[Goldilocks],
+    weight: &[Goldilocks],
+    n_real: usize,
+    rsqrt_table: &[Goldilocks],
+    alpha: Goldilocks,
+    beta: Goldilocks,
+    rng: &mut XorShift64,
+) -> bool {
+    let n = weight.len();
+    let d = n.trailing_zeros() as usize;
+    assert_eq!(x_plain.len(), n);
+    assert_eq!(raw_plain.len(), n);
+
+    let s_x2: i64 = x_plain[..n_real]
+        .iter()
+        .map(|&v| {
+            let vv = to_i32(v) as i64;
+            vv * vv
+        })
+        .sum();
+    let s_x2_f = from_i64(s_x2);
+    let r2: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let proof_x2 = sumcheck::prove(x_plain, x_plain, s_x2_f, &r2);
+    let (x_open2, x_r2) = x_batch.whir.open_batch(x_batch.prover_data.clone(), &x_batch.protocol, x_idx, x_batch.num_tables, &r2);
+    if x_batch.whir.verify_batch(&x_batch.commitment, &x_open2, &x_batch.protocol, x_idx, x_batch.num_tables, &r2).unwrap() != x_r2 {
+        return false;
+    }
+    if !sumcheck::verify(&proof_x2, s_x2_f, &r2, x_r2, x_r2) {
+        return false;
+    }
+    let s_index = div_round(div_round(s_x2, n_real as i64), 1 << 18) as u32;
+    if (s_index as usize) >= rsqrt_table.len() {
+        return false;
+    }
+    let rstd = rsqrt_table[s_index as usize];
+    let lk = lookup::prove(&[s_index], &[rstd], rsqrt_table, alpha, beta);
+    if !lookup::verify(&lk) {
+        return false;
+    }
+
+    let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let s = mle::eq_evals(&r);
+    let c_raw: Goldilocks = s.iter().zip(raw_plain).fold(Goldilocks::ZERO, |a, (&si, &ri)| a + si * ri);
+    let c_xw: Goldilocks = s.iter().zip(x_plain).zip(weight).fold(Goldilocks::ZERO, |a, ((&si, &xi), &wi)| a + si * xi * wi);
+    let proof_raw = sumcheck::prove(&s, raw_plain, c_raw, &r);
+    let proof_xw = sumcheck::prove3(&s, x_plain, weight, c_xw, &r);
+
+    let (x_open, xr) = x_batch.whir.open_batch(x_batch.prover_data.clone(), &x_batch.protocol, x_idx, x_batch.num_tables, &r);
+    let (raw_open, rv) = raw_batch.whir.open_batch(raw_batch.prover_data.clone(), &raw_batch.protocol, raw_idx, raw_batch.num_tables, &r);
+    if x_batch.whir.verify_batch(&x_batch.commitment, &x_open, &x_batch.protocol, x_idx, x_batch.num_tables, &r).unwrap() != xr {
+        return false;
+    }
+    if raw_batch.whir.verify_batch(&raw_batch.commitment, &raw_open, &raw_batch.protocol, raw_idx, raw_batch.num_tables, &r).unwrap() != rv {
+        return false;
+    }
+    let s_r = mle::eval(&s, &r);
+    let w_r = mle::eval(weight, &r);
+    if !sumcheck::verify(&proof_raw, c_raw, &r, s_r, rv) {
+        return false;
+    }
+    if !sumcheck::verify3(&proof_xw, c_xw, &r, s_r, xr, w_r) {
+        return false;
+    }
+    c_raw == rstd * c_xw
+}
+
 /// Prove `out = round(in / 2^shift) + bias` (the non-ReLU affine/rescale step)
 /// with a sub-linear bit-decomposition range check, exactly like [`prove_round`].
 #[allow(clippy::too_many_arguments)]
@@ -1529,6 +1602,34 @@ mod tests {
     use super::*;
     use crate::field::PrimeCharacteristicRing;
     use crate::fixed_point::from_i64;
+
+    #[test]
+    fn batch_rms_norm_roundtrip() {
+        let mut rng = XorShift64::new(0xcafe);
+        let n = 64usize;
+        let n_real = n;
+        let x: Vec<Goldilocks> = (0..n).map(|_| from_i32((rng.next_u64() % 65536) as i32)).collect();
+        let weight: Vec<Goldilocks> = (0..n).map(|_| from_i32((rng.next_u64() % 65536) as i32)).collect();
+        let table_size = 1usize << 17;
+        let rsqrt_table: Vec<Goldilocks> = (0..table_size)
+            .map(|j| {
+                let s = j as f64 / 16384.0 + 1e-6;
+                from_i32((1.0 / s.sqrt() * 65536.0).round() as i32)
+            })
+            .collect();
+        let (raw, _, _) = rms_norm_raw(&x, &weight, n_real, &rsqrt_table);
+
+        let whir = Whir::new_testing(6);
+        let refs = [x.as_slice(), raw.as_slice()];
+        let (commitment, pd, protocol, w) = whir.commit_batch(&refs);
+        let batch = BatchCtx { commitment, prover_data: pd, protocol, whir: w, num_tables: 2 };
+        let alpha = rng.field();
+        let beta = rng.field();
+
+        assert!(prove_rms_norm_batch(
+            &batch, 0, &x, &batch, 1, &raw, &weight, n_real, &rsqrt_table, alpha, beta, &mut rng,
+        ));
+    }
 
     #[test]
     fn batch_lookup_roundtrip() {
