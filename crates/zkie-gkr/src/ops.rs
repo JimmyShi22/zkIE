@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use crate::committed::{
     affine_raw, commit, prove_add, prove_affine, prove_lookup, prove_matmul, prove_relu,
-    prove_scale, scale_raw, layer_norm_raw, rms_norm_raw, prove_layer_norm, prove_rms_norm, prove_softmax_rows, Committed,
+    prove_scale, scale_raw, layer_norm_raw, rms_norm_raw, prove_layer_norm, prove_rms_norm, prove_softmax_rows, BatchCtx, Committed,
 };
 use crate::field::{Goldilocks, PrimeCharacteristicRing, XorShift64};
 use crate::fixed_point::{from_i32, to_i32};
@@ -56,6 +56,40 @@ impl Ctx {
         self.ensure_whir(log2);
         let committed = commit(&self.whirs[&log2], &plain);
         Tensor { plain, committed }
+    }
+}
+
+/// Collects plain tensors during the forward pass and commits them in size
+/// groups, so the proving phase can open each tensor by (batch, table index).
+pub struct BatchBuilder {
+    pending: HashMap<usize, Vec<Vec<Goldilocks>>>,
+}
+
+impl BatchBuilder {
+    pub fn new() -> Self {
+        BatchBuilder { pending: HashMap::new() }
+    }
+
+    /// Record a plain tensor and return (size, table index within that size group).
+    pub fn push(&mut self, plain: Vec<Goldilocks>) -> (usize, usize) {
+        let size = plain.len();
+        let group = self.pending.entry(size).or_default();
+        group.push(plain);
+        (size, group.len() - 1)
+    }
+
+    /// Commit every collected tensor, grouped by size.
+    pub fn commit(&self, whir: &Whir) -> HashMap<usize, BatchCtx> {
+        let mut batches = HashMap::new();
+        for (&size, tensors) in &self.pending {
+            let refs: Vec<&[Goldilocks]> = tensors.iter().map(|t| t.as_slice()).collect();
+            let (commitment, prover_data, protocol, w) = whir.commit_batch(&refs);
+            batches.insert(
+                size,
+                BatchCtx { commitment, prover_data, protocol, whir: w, num_tables: refs.len() },
+            );
+        }
+        batches
     }
 }
 
