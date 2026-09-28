@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::committed::{affine_raw, prove_add_batch, prove_affine_batch, prove_matmul_batch, prove_relu_batch, prove_scale_batch, scale_raw, BatchCtx};
+use crate::committed::{affine_raw, layer_norm_raw, prove_add_batch, prove_affine_batch, prove_layer_norm_batch, prove_matmul_batch, prove_relu_batch, prove_rms_norm_batch, prove_scale_batch, rms_norm_raw, scale_raw, BatchCtx};
 use crate::field::{Goldilocks, PrimeCharacteristicRing, XorShift64};
 use crate::fixed_point::{from_i32, from_i64, to_i32, to_i64};
 use crate::ops::{add_vec, dense_m, BatchBuilder};
@@ -25,6 +25,8 @@ pub enum Op {
     Affine { x: usize, out: usize, bits_group: (usize, usize), bias: Vec<Goldilocks>, shift: u32 },
     Scale { x: usize, out: usize, bits_group: (usize, usize), scale: i64, bias: Vec<Goldilocks> },
     Relu { x: usize, out: usize, mid_group: (usize, usize), bits_group: (usize, usize), zero_bits_group: (usize, usize), bias: Vec<Goldilocks> },
+    RmsNorm { x: usize, raw: usize, weight: Vec<Goldilocks>, n_real: usize },
+    LayerNorm { x: usize, raw: usize, weight: Vec<Goldilocks>, n_real: usize },
 }
 
 pub struct Exec {
@@ -33,17 +35,22 @@ pub struct Exec {
     ops: Vec<Op>,
     bb: BatchBuilder,
     next_group: usize,
+    rsqrt_table: Option<Vec<Goldilocks>>,
 }
 
 impl Exec {
     pub fn new() -> Self {
-        Exec { plain: Vec::new(), meta: Vec::new(), ops: Vec::new(), bb: BatchBuilder::new(), next_group: 2 }
+        Exec { plain: Vec::new(), meta: Vec::new(), ops: Vec::new(), bb: BatchBuilder::new(), next_group: 2, rsqrt_table: None }
     }
 
     fn fresh_group(&mut self) -> usize {
         let g = self.next_group;
         self.next_group += 1;
         g
+    }
+
+    pub fn set_rsqrt(&mut self, table: Vec<Goldilocks>) {
+        self.rsqrt_table = Some(table);
     }
 
     pub fn input(&mut self, plain: Vec<Goldilocks>, group: usize) -> usize {
@@ -169,6 +176,22 @@ impl Exec {
         out
     }
 
+    pub fn rms_norm(&mut self, x: usize, weight: Vec<Goldilocks>, n_real: usize) -> usize {
+        let rsqrt = self.rsqrt_table.as_ref().expect("set_rsqrt first");
+        let (raw, _, _) = rms_norm_raw(&self.plain[x], &weight, n_real, rsqrt);
+        let raw_id = self.input(raw, 0);
+        self.ops.push(Op::RmsNorm { x, raw: raw_id, weight, n_real });
+        raw_id
+    }
+
+    pub fn layer_norm(&mut self, x: usize, weight: Vec<Goldilocks>, n_real: usize) -> usize {
+        let rsqrt = self.rsqrt_table.as_ref().expect("set_rsqrt first");
+        let (raw, _, _, _) = layer_norm_raw(&self.plain[x], &weight, n_real, rsqrt);
+        let raw_id = self.input(raw, 0);
+        self.ops.push(Op::LayerNorm { x, raw: raw_id, weight, n_real });
+        raw_id
+    }
+
     pub fn prove(&self, whir: &Whir, rng: &mut XorShift64) {
         let batches: HashMap<(usize, usize), BatchCtx> = self.bb.commit(whir);
         for op in &self.ops {
@@ -218,6 +241,30 @@ impl Exec {
                         x_b, x_i, &self.plain[*x], o_b, o_i, mid_b, bits_b, zb_b, bias, rng,
                     ));
                 }
+                Op::RmsNorm { x, raw, weight, n_real } => {
+                    let rsqrt = self.rsqrt_table.as_ref().unwrap();
+                    let alpha = rng.field();
+                    let beta = rng.field();
+                    let (x_sz, x_g, x_i) = self.meta[*x];
+                    let (r_sz, r_g, r_i) = self.meta[*raw];
+                    let x_b = &batches[&(x_sz, x_g)];
+                    let r_b = &batches[&(r_sz, r_g)];
+                    assert!(prove_rms_norm_batch(
+                        x_b, x_i, &self.plain[*x], r_b, r_i, &self.plain[*raw], weight, *n_real, rsqrt, alpha, beta, rng,
+                    ));
+                }
+                Op::LayerNorm { x, raw, weight, n_real } => {
+                    let rsqrt = self.rsqrt_table.as_ref().unwrap();
+                    let alpha = rng.field();
+                    let beta = rng.field();
+                    let (x_sz, x_g, x_i) = self.meta[*x];
+                    let (r_sz, r_g, r_i) = self.meta[*raw];
+                    let x_b = &batches[&(x_sz, x_g)];
+                    let r_b = &batches[&(r_sz, r_g)];
+                    assert!(prove_layer_norm_batch(
+                        x_b, x_i, &self.plain[*x], r_b, r_i, &self.plain[*raw], weight, *n_real, rsqrt, alpha, beta, rng,
+                    ));
+                }
                 Op::Affine { x, out, bits_group, bias, shift } => {
                     let (x_sz, x_g, x_i) = self.meta[*x];
                     let (o_sz, o_g, o_i) = self.meta[*out];
@@ -255,6 +302,31 @@ mod tests {
         let relu_bias: Vec<Goldilocks> = (0..n).map(|_| from_i32((rng.next_u64() % 1000) as i32 - 500)).collect();
         let r_id = ex.input(relu_in, 1);
         let _r = ex.relu(r_id, relu_bias);
+
+        let whir = Whir::new_testing(6);
+        ex.prove(&whir, &mut rng);
+    }
+
+    #[test]
+    fn ir_two_phase_norm() {
+        let mut rng = XorShift64::new(0x7777);
+        let n = 64usize;
+        let n_real = n;
+        let x: Vec<Goldilocks> = (0..n).map(|_| from_i32((rng.next_u64() % 65536) as i32)).collect();
+        let weight: Vec<Goldilocks> = (0..n).map(|_| from_i32((rng.next_u64() % 65536) as i32)).collect();
+        let table_size = 1usize << 17;
+        let rsqrt_table: Vec<Goldilocks> = (0..table_size)
+            .map(|j| {
+                let s = j as f64 / 16384.0 + 1e-6;
+                from_i32((1.0 / s.sqrt() * 65536.0).round() as i32)
+            })
+            .collect();
+
+        let mut ex = Exec::new();
+        ex.set_rsqrt(rsqrt_table);
+        let x_id = ex.input(x, 1);
+        let _r = ex.rms_norm(x_id, weight.clone(), n_real);
+        let _l = ex.layer_norm(x_id, weight, n_real);
 
         let whir = Whir::new_testing(6);
         ex.prove(&whir, &mut rng);
