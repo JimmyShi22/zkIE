@@ -365,7 +365,7 @@ impl Whir {
     pub fn commit_batch(
         &self,
         evals_batch: &[&[Goldilocks]],
-    ) -> (Commitment, ProverData, OpeningProtocol) {
+    ) -> (Commitment, ProverData, OpeningProtocol, Whir) {
         let t0 = std::time::Instant::now();
         assert!(!evals_batch.is_empty(), "batch must not be empty");
         let arity = evals_batch[0].len().trailing_zeros() as usize;
@@ -398,7 +398,7 @@ impl Whir {
         let (n, secs) = self.commit_stats.get();
         self.commit_stats
             .set((n + evals_batch.len() as u64, secs + t0.elapsed().as_secs_f64()));
-        (commitment, prover_data, protocol)
+        (commitment, prover_data, protocol, whir)
     }
 
     pub fn open(
@@ -436,6 +436,58 @@ impl Whir {
         )?;
         Ok(evals[0].current()[0].as_base().expect("base-field MLE opens to a base element"))
     }
+    /// Open the `table_index`-th MLE in a batch at `point`.
+    pub fn open_batch(
+        &self,
+        prover_data: ProverData,
+        protocol: &OpeningProtocol,
+        table_index: usize,
+        num_tables: usize,
+        point: &[Goldilocks],
+    ) -> (Proof, Goldilocks) {
+        let arity = point.len();
+        let target = to_ef_point(point);
+        let dummy = Point::new(vec![EF::from(Goldilocks::new(0)); arity]);
+        let points: Vec<Point<EF>> = (0..num_tables)
+            .map(|i| if i == table_index { target.clone() } else { dummy.clone() })
+            .collect();
+        let proof = self.pcs.open_at(
+            prover_data,
+            protocol,
+            &points,
+            &mut self.fresh_challenger(),
+        );
+        let opened = proof.evals[table_index].current()[0];
+        (proof, opened.as_base().expect("base-field MLE opens to a base element"))
+    }
+
+    /// Verify the batch opening of the `table_index`-th MLE at `point`.
+    pub fn verify_batch(
+        &self,
+        commitment: &Commitment,
+        proof: &Proof,
+        protocol: &OpeningProtocol,
+        table_index: usize,
+        num_tables: usize,
+        point: &[Goldilocks],
+    ) -> Result<Goldilocks, <MyPcs as MultilinearPcs<EF, MyChallenger>>::Error> {
+        let arity = point.len();
+        let target = to_ef_point(point);
+        let dummy = Point::new(vec![EF::from(Goldilocks::new(0)); arity]);
+        let points: Vec<Point<EF>> = (0..num_tables)
+            .map(|i| if i == table_index { target.clone() } else { dummy.clone() })
+            .collect();
+        let evals = self.pcs.verify_at(
+            commitment,
+            proof,
+            protocol,
+            &points,
+            &mut self.fresh_challenger(),
+        )?;
+        Ok(evals[table_index].current()[0].as_base().expect("base-field MLE opens to a base element"))
+    }
+
+
 }
 
 /// Embed base-field coordinates into the degree-2 extension field.
@@ -452,6 +504,28 @@ mod tests {
     use super::*;
     use crate::field::{Goldilocks, XorShift64};
     use crate::mle;
+
+    #[test]
+    fn whir_batch_open_matches_mle_eval() {
+        let mut rng = XorShift64::new(0xbeef);
+        let whir = Whir::new_testing(8);
+        let n = 4usize;
+        let arity = 8usize;
+        let evals: Vec<Vec<Goldilocks>> = (0..n)
+            .map(|_| (0..(1usize << arity)).map(|_| rng.field()).collect())
+            .collect();
+        let refs: Vec<&[Goldilocks]> = evals.iter().map(|e| e.as_slice()).collect();
+        let (commitment, prover_data, protocol, batch_whir) = whir.commit_batch(&refs);
+        for i in 0..n {
+            let point: Vec<Goldilocks> = (0..arity).map(|_| rng.field()).collect();
+            let (proof, opened) = batch_whir.open_batch(prover_data.clone(), &protocol, i, n, &point);
+            let verified = batch_whir
+                .verify_batch(&commitment, &proof, &protocol, i, n, &point)
+                .unwrap();
+            assert_eq!(opened, verified);
+            assert_eq!(verified, mle::eval(&evals[i], &point));
+        }
+    }
 
     #[test]
     fn whir_prescribed_open_matches_mle_eval() {

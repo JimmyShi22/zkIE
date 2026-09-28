@@ -19,7 +19,7 @@ fn run(rng: &mut XorShift64, whir: &Whir, size: usize, n: usize, label: &str) {
 
     let refs: Vec<&[Goldilocks]> = tensors.iter().map(|t| t.as_slice()).collect();
     let t0 = Instant::now();
-    let _ = whir.commit_batch(&refs);
+    let _ = whir.commit_batch(let _ = whir.commit_batch(&refs).3;refs);
     let batch = t0.elapsed().as_secs_f64();
 
     println!(
