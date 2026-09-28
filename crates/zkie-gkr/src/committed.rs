@@ -62,6 +62,90 @@ pub fn prove_matmul(whir_a: &Whir, a: &Committed, whir_b: &Whir, b: &Committed, 
     f_ok && h_ok && c_ok && evals_ok && claimed == proof.claimed && matmul::verify(&proof, &ch, f, h)
 }
 
+/// A committed batch of same-size MLEs: one commitment plus the shared prover
+/// data, opening protocol, and the batch-sized Whir used to open any table.
+pub struct BatchCtx {
+    pub commitment: Commitment,
+    pub prover_data: ProverData,
+    pub protocol: OpeningProtocol,
+    pub whir: Whir,
+    pub num_tables: usize,
+}
+
+/// Prove `C = A @ B` where A, B, C are each a table inside a batch commitment.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_matmul_batch(
+    a_batch: &BatchCtx,
+    a_idx: usize,
+    b_batch: &BatchCtx,
+    b_idx: usize,
+    c_batch: &BatchCtx,
+    c_idx: usize,
+    a_mat: &[Goldilocks],
+    b_mat: &[Goldilocks],
+    c_mat: &[Goldilocks],
+    m: usize,
+    k: usize,
+    n: usize,
+    rng: &mut XorShift64,
+) -> bool {
+    let at: Vec<Goldilocks> = (0..k)
+        .flat_map(|j| (0..m).map(move |i| a_mat[i * k + j]))
+        .collect();
+    let ch: Vec<Goldilocks> = (0..k.trailing_zeros() as usize).map(|_| rng.field()).collect();
+    let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
+    let u: Vec<Goldilocks> = (0..m.trailing_zeros() as usize).map(|_| rng.field()).collect();
+    let proof = matmul::prove(&at, b_mat, c_mat, m, k, n, &u, &v, &ch);
+
+    let mut ap = ch.clone();
+    ap.extend_from_slice(&u);
+    let (a_open, f) = a_batch.whir.open_batch(
+        a_batch.prover_data.clone(),
+        &a_batch.protocol,
+        a_idx,
+        a_batch.num_tables,
+        &ap,
+    );
+    let mut bp = v.clone();
+    bp.extend_from_slice(&ch);
+    let (b_open, h) = b_batch.whir.open_batch(
+        b_batch.prover_data.clone(),
+        &b_batch.protocol,
+        b_idx,
+        b_batch.num_tables,
+        &bp,
+    );
+    let mut cp = v.clone();
+    cp.extend_from_slice(&u);
+    let (c_open, claimed) = c_batch.whir.open_batch(
+        c_batch.prover_data.clone(),
+        &c_batch.protocol,
+        c_idx,
+        c_batch.num_tables,
+        &cp,
+    );
+
+    let f_ok = a_batch
+        .whir
+        .verify_batch(&a_batch.commitment, &a_open, &a_batch.protocol, a_idx, a_batch.num_tables, &ap)
+        .unwrap()
+        == f;
+    let h_ok = b_batch
+        .whir
+        .verify_batch(&b_batch.commitment, &b_open, &b_batch.protocol, b_idx, b_batch.num_tables, &bp)
+        .unwrap()
+        == h;
+    let c_ok = c_batch
+        .whir
+        .verify_batch(&c_batch.commitment, &c_open, &c_batch.protocol, c_idx, c_batch.num_tables, &cp)
+        .unwrap()
+        == claimed;
+    let evals_ok = f == mle::eval(a_mat, &ap)
+        && h == mle::eval(b_mat, &bp)
+        && claimed == mle::eval(c_mat, &cp);
+    f_ok && h_ok && c_ok && evals_ok && claimed == proof.claimed && matmul::verify(&proof, &ch, f, h)
+}
+
 /// Prove `outputs[i] == table[indices[i]]` against WHIR commitments, in the
 /// O(N)-opening PoC form: open the committed index and output columns at every
 /// hypercube point and recompute the LogUp left-hand side from those bound
@@ -1111,6 +1195,46 @@ mod tests {
     use super::*;
     use crate::field::PrimeCharacteristicRing;
     use crate::fixed_point::from_i64;
+
+    #[test]
+    fn batch_matmul_roundtrip() {
+        let mut rng = XorShift64::new(0x1234);
+        let m = 4usize;
+        let k = 16usize;
+        let n = 16usize;
+        let a: Vec<Goldilocks> = (0..m * k).map(|_| rng.field()).collect();
+        let b: Vec<Goldilocks> = (0..k * n).map(|_| rng.field()).collect();
+        let c: Vec<Goldilocks> = (0..m * n)
+            .map(|i| {
+                let (r, col) = (i / n, i % n);
+                (0..k).fold(Goldilocks::ZERO, |acc, w| acc + a[r * k + w] * b[w * n + col])
+            })
+            .collect();
+
+        let whir = Whir::new_testing(6);
+        let ac_refs = [a.as_slice(), c.as_slice()];
+        let (ac_c, ac_pd, ac_p, ac_w) = whir.commit_batch(&ac_refs);
+        let ac = BatchCtx {
+            commitment: ac_c,
+            prover_data: ac_pd,
+            protocol: ac_p,
+            whir: ac_w,
+            num_tables: 2,
+        };
+        let b_refs = [b.as_slice()];
+        let (b_c, b_pd, b_p, b_w) = whir.commit_batch(&b_refs);
+        let bctx = BatchCtx {
+            commitment: b_c,
+            prover_data: b_pd,
+            protocol: b_p,
+            whir: b_w,
+            num_tables: 1,
+        };
+
+        assert!(prove_matmul_batch(
+            &ac, 0, &bctx, 0, &ac, 1, &a, &b, &c, m, k, n, &mut rng,
+        ));
+    }
 
     #[test]
     fn committed_matmul_roundtrip() {
