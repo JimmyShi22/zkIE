@@ -246,6 +246,116 @@ fn prove_product(
     whir.verify(&c_r.commitment, &r0_open, &c_r.protocol, &zero_point).unwrap() == r0 && r0 == Goldilocks::ONE
 }
 
+fn prove_product_batch(
+    prod_batch: &BatchCtx,
+    a_plain: &[Goldilocks],
+    c: Goldilocks,
+    rng: &mut XorShift64,
+) -> bool {
+    let n = a_plain.len();
+    let d = n.trailing_zeros() as usize;
+
+    let mut a_norm = a_plain.to_vec();
+    a_norm[n - 1] = a_norm[n - 1] * c.inverse();
+    let mut r = vec![Goldilocks::ONE; n];
+    for i in 1..n {
+        r[i] = r[i - 1] * a_norm[i - 1];
+    }
+
+    let chal: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let eq = mle::eq_evals(&chal);
+    let eq_shift: Vec<Goldilocks> = (0..n)
+        .map(|i| {
+            let pred = (i + n - 1) % n;
+            (0..d).fold(Goldilocks::ONE, |acc, k| {
+                let bit = if (pred >> k) & 1 == 1 { Goldilocks::ONE } else { Goldilocks::ZERO };
+                acc * (bit * chal[k] + (Goldilocks::ONE - bit) * (Goldilocks::ONE - chal[k]))
+            })
+        })
+        .collect();
+
+    let c1: Goldilocks = eq.iter().zip(&r).zip(&a_norm).fold(Goldilocks::ZERO, |acc, ((&e, &ri), &ai)| acc + e * ri * ai);
+    let c2: Goldilocks = r.iter().zip(&eq_shift).fold(Goldilocks::ZERO, |acc, (&ri, &ei)| acc + ri * ei);
+    let proof1 = sumcheck::prove3(&eq, &r, &a_norm, c1, &chal);
+    let proof2 = sumcheck::prove(&r, &eq_shift, c2, &chal);
+
+    let (a_open, a_chal) = prod_batch.whir.open_batch(prod_batch.prover_data.clone(), &prod_batch.protocol, 0, prod_batch.num_tables, &chal);
+    let (r_open, r_chal) = prod_batch.whir.open_batch(prod_batch.prover_data.clone(), &prod_batch.protocol, 1, prod_batch.num_tables, &chal);
+    if prod_batch.whir.verify_batch(&prod_batch.commitment, &a_open, &prod_batch.protocol, 0, prod_batch.num_tables, &chal).unwrap() != a_chal {
+        return false;
+    }
+    if prod_batch.whir.verify_batch(&prod_batch.commitment, &r_open, &prod_batch.protocol, 1, prod_batch.num_tables, &chal).unwrap() != r_chal {
+        return false;
+    }
+    let eq_r = mle::eval(&eq, &chal);
+    let eq_shift_r = mle::eval(&eq_shift, &chal);
+    if !sumcheck::verify3(&proof1, c1, &chal, eq_r, r_chal, a_chal)
+        || !sumcheck::verify(&proof2, c2, &chal, r_chal, eq_shift_r)
+        || c1 != c2
+    {
+        return false;
+    }
+    let zero_point = vec![Goldilocks::ZERO; d];
+    let (r0_open, r0) = prod_batch.whir.open_batch(prod_batch.prover_data.clone(), &prod_batch.protocol, 1, prod_batch.num_tables, &zero_point);
+    prod_batch.whir.verify_batch(&prod_batch.commitment, &r0_open, &prod_batch.protocol, 1, prod_batch.num_tables, &zero_point).unwrap() == r0
+        && r0 == Goldilocks::ONE
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_lookup_batch(
+    x_batch: &BatchCtx,
+    x_idx: usize,
+    x_plain: &[Goldilocks],
+    y_batch: &BatchCtx,
+    y_idx: usize,
+    y_plain: &[Goldilocks],
+    a_batch: &BatchCtx,
+    a_idx: usize,
+    prod_batch: &BatchCtx,
+    indices: &[u32],
+    table: &[Goldilocks],
+    alpha: Goldilocks,
+    beta: Goldilocks,
+    rng: &mut XorShift64,
+) -> bool {
+    let n = indices.len();
+    let d = n.trailing_zeros() as usize;
+    let a_plain: Vec<Goldilocks> = x_plain
+        .iter()
+        .zip(y_plain)
+        .map(|(&xv, &yv)| alpha + xv + beta * yv)
+        .collect();
+
+    let mut m = vec![0u64; table.len()];
+    for &i in indices {
+        m[i as usize] += 1;
+    }
+    let mut b = Goldilocks::ONE;
+    for (j, &t) in table.iter().enumerate() {
+        let tkey = Goldilocks::from_u64(j as u64) + beta * t;
+        let factor = alpha + tkey;
+        for _ in 0..m[j] {
+            b = b * factor;
+        }
+    }
+
+    let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let (x_open, xr) = x_batch.whir.open_batch(x_batch.prover_data.clone(), &x_batch.protocol, x_idx, x_batch.num_tables, &r);
+    let (y_open, yr) = y_batch.whir.open_batch(y_batch.prover_data.clone(), &y_batch.protocol, y_idx, y_batch.num_tables, &r);
+    let (a_open, ar) = a_batch.whir.open_batch(a_batch.prover_data.clone(), &a_batch.protocol, a_idx, a_batch.num_tables, &r);
+    if x_batch.whir.verify_batch(&x_batch.commitment, &x_open, &x_batch.protocol, x_idx, x_batch.num_tables, &r).unwrap() != xr
+        || y_batch.whir.verify_batch(&y_batch.commitment, &y_open, &y_batch.protocol, y_idx, y_batch.num_tables, &r).unwrap() != yr
+        || a_batch.whir.verify_batch(&a_batch.commitment, &a_open, &a_batch.protocol, a_idx, a_batch.num_tables, &r).unwrap() != ar
+    {
+        return false;
+    }
+    if ar != alpha + xr + beta * yr {
+        return false;
+    }
+
+    prove_product_batch(prod_batch, &a_plain, b, rng)
+}
+
 /// Prove `y_i == table[x_i]` for every `i` sub-linearly: commit the keys
 /// `a_i = alpha + x_i + beta y_i`, bind them to the committed `x`/`y` by a
 /// single-point check, then prove `prod_i a_i` equals the public table product
@@ -1419,6 +1529,48 @@ mod tests {
     use super::*;
     use crate::field::PrimeCharacteristicRing;
     use crate::fixed_point::from_i64;
+
+    #[test]
+    fn batch_lookup_roundtrip() {
+        let mut rng = XorShift64::new(0xface);
+        let n = 32usize;
+        let table: Vec<Goldilocks> = (0..16).map(|i| from_i32(i as i32)).collect();
+        let indices: Vec<u32> = (0..n).map(|_| (rng.next_u64() % 16) as u32).collect();
+        let y_plain: Vec<Goldilocks> = indices.iter().map(|&i| table[i as usize]).collect();
+        let x_plain: Vec<Goldilocks> = indices.iter().map(|&i| from_i32(i as i32)).collect();
+        let alpha = rng.field();
+        let beta = rng.field();
+        let a_plain: Vec<Goldilocks> = x_plain.iter().zip(&y_plain).map(|(&xv, &yv)| alpha + xv + beta * yv).collect();
+
+        let mut m = vec![0u64; table.len()];
+        for &i in &indices { m[i as usize] += 1; }
+        let mut b = Goldilocks::ONE;
+        for (j, &t) in table.iter().enumerate() {
+            let tkey = Goldilocks::from_u64(j as u64) + beta * t;
+            let factor = alpha + tkey;
+            for _ in 0..m[j] { b = b * factor; }
+        }
+        let mut a_norm = a_plain.clone();
+        a_norm[n - 1] = a_norm[n - 1] * b.inverse();
+        let mut r = vec![Goldilocks::ONE; n];
+        for i in 1..n { r[i] = r[i - 1] * a_norm[i - 1]; }
+
+        let whir = Whir::new_testing(5);
+        let xy_refs = [x_plain.as_slice(), y_plain.as_slice()];
+        let (xy_c, xy_pd, xy_p, xy_w) = whir.commit_batch(&xy_refs);
+        let xy_batch = BatchCtx { commitment: xy_c, prover_data: xy_pd, protocol: xy_p, whir: xy_w, num_tables: 2 };
+        let a_refs = [a_plain.as_slice()];
+        let (a_c, a_pd, a_p, a_w) = whir.commit_batch(&a_refs);
+        let a_batch = BatchCtx { commitment: a_c, prover_data: a_pd, protocol: a_p, whir: a_w, num_tables: 1 };
+        let prod_refs = [a_norm.as_slice(), r.as_slice()];
+        let (prod_c, prod_pd, prod_p, prod_w) = whir.commit_batch(&prod_refs);
+        let prod_batch = BatchCtx { commitment: prod_c, prover_data: prod_pd, protocol: prod_p, whir: prod_w, num_tables: 2 };
+
+        assert!(prove_lookup_batch(
+            &xy_batch, 0, &x_plain, &xy_batch, 1, &y_plain, &a_batch, 0, &prod_batch,
+            &indices, &table, alpha, beta, &mut rng,
+        ));
+    }
 
     #[test]
     fn batch_relu_roundtrip() {
