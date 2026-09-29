@@ -1382,6 +1382,7 @@ fn prove_bits_range_batch(
     s: &[Goldilocks],
     s_r: Goldilocks,
 ) -> bool {
+    let mut opened_bits = Vec::with_capacity(bits.len());
     for (j, bj) in bits.iter().enumerate() {
         let c_bb: Goldilocks = s.iter().zip(bj).zip(bj).fold(Goldilocks::ZERO, |a, ((&si, &xi), &yi)| a + si * xi * yi);
         let c_b: Goldilocks = s.iter().zip(bj).fold(Goldilocks::ZERO, |a, (&si, &xi)| a + si * xi);
@@ -1397,13 +1398,10 @@ fn prove_bits_range_batch(
         {
             return false;
         }
+        opened_bits.push(b_r);
     }
     let mut rhs = Goldilocks::ZERO;
-    for j in 0..bits.len() {
-        let (b_open, b_r) = bits_batch.whir.open_batch(bits_batch.prover_data.clone(), &bits_batch.protocol, j, bits_batch.num_tables, r);
-        if bits_batch.whir.verify_batch(&bits_batch.commitment, &b_open, &bits_batch.protocol, j, bits_batch.num_tables, r).unwrap() != b_r {
-            return false;
-        }
+    for (j, &b_r) in opened_bits.iter().enumerate() {
         rhs = rhs + b_r * from_i64(1i64 << j);
     }
     value_at_r == rhs
