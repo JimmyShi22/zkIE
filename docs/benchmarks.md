@@ -74,3 +74,26 @@ The only GPU-friendly stage left is the forward `dense_m` matmul, which is
 the hybrid ceiling at ~3%. The dominant cost is the WHIR opening proofs
 (Poseidon2 re-commits), which can only be reduced by batching/aggregating
 openings, not by backend selection.
+
+## Opening-cost optimizations (2026-09-29)
+
+The IR batch executor was initially ~6x slower than the per-tensor baseline
+because `open_batch` padded every opening with `num_tables - 1` dummy points,
+so each opening paid `num_tables` FRI evaluations instead of one. Three fixes
+brought it back past parity (all tests green, 42/42):
+
+| step | full 20-layer 200M |
+|---|---|
+| per-tensor baseline | ~404 s |
+| IR before fixes | ~42 min |
+| + avoid double-opening bit columns (`2641af7`) | ~31 min |
+| + batch bit-column openings (`b2ebab2`) | ~18.6 min |
+| + isolate default tensors to single-point opens (`f61c6a8`) | **~302 s (5.0 min)** |
+
+Per-layer `prove()` ops dropped from 121 s to ~13.7 s (layer_norm 4.0 s,
+rms_norm 4.0 s, matmul 2.8 s, affine 2.2 s, everything else sub-second).
+
+Remaining bottleneck: the forward `dense_m` matmul is serial and now dominates
+(~250 s of the 302 s). Peak RSS is also still ~34 GB vs the baseline ~1.4 GB
+because the two-phase executor holds `self.plain` and the BatchBuilder copy
+simultaneously; both are independent follow-ups.
