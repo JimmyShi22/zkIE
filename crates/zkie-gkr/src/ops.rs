@@ -14,6 +14,7 @@ use crate::committed::{
 use crate::field::{Goldilocks, PrimeCharacteristicRing, XorShift64};
 use crate::fixed_point::{from_i32, to_i32};
 use crate::whir::Whir;
+use std::sync::Arc;
 
 /// A committed tensor: plain field values plus their WHIR commitment.
 pub struct Tensor {
@@ -64,7 +65,7 @@ impl Ctx {
 /// (size, group, table index). The group lets callers separate same-size
 /// tensors of different kinds (weights, activations, bit columns).
 pub struct BatchBuilder {
-    pending: HashMap<(usize, usize), Vec<Vec<Goldilocks>>>,
+    pending: HashMap<(usize, usize), Vec<Arc<Vec<Goldilocks>>>>,
 }
 
 impl BatchBuilder {
@@ -74,11 +75,11 @@ impl BatchBuilder {
 
     /// Record a plain tensor into group 0; returns (size, group, index).
     pub fn push(&mut self, plain: Vec<Goldilocks>) -> (usize, usize, usize) {
-        self.push_group(plain, 0)
+        self.push_group(Arc::new(plain), 0)
     }
 
     /// Record a plain tensor into an explicit group.
-    pub fn push_group(&mut self, plain: Vec<Goldilocks>, group: usize) -> (usize, usize, usize) {
+    pub fn push_group(&mut self, plain: Arc<Vec<Goldilocks>>, group: usize) -> (usize, usize, usize) {
         let size = plain.len();
         let bucket = self.pending.entry((size, group)).or_default();
         bucket.push(plain);

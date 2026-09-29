@@ -5,6 +5,7 @@
 //! opens each tensor by its (size, group, index) to run the batch proof.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::committed::{affine_raw, layer_norm_raw, prove_add_batch, prove_affine_batch, prove_layer_norm_batch, prove_matmul_batch, prove_relu_batch, prove_lookup_batch, prove_rms_norm_batch, prove_scale_batch, rms_norm_raw, scale_raw, BatchCtx};
 use crate::committed::prove_softmax_rows_batch;
@@ -52,7 +53,7 @@ pub enum Op {
 }
 
 pub struct Exec {
-    plain: Vec<Vec<Goldilocks>>,
+    plain: Vec<Arc<Vec<Goldilocks>>>,
     meta: Vec<(usize, usize, usize)>,
     ops: Vec<Op>,
     bb: BatchBuilder,
@@ -77,15 +78,16 @@ impl Exec {
 
     pub fn input(&mut self, plain: Vec<Goldilocks>, group: usize) -> usize {
         let group = if group == 0 { self.fresh_group() } else { group };
-        let (size, group, index) = self.bb.push_group(plain.clone(), group);
+        let arc = Arc::new(plain);
+        let (size, group, index) = self.bb.push_group(arc.clone(), group);
         let id = self.plain.len();
-        self.plain.push(plain);
+        self.plain.push(arc);
         self.meta.push((size, group, index));
         id
     }
 
     pub fn get(&self, id: usize) -> &[Goldilocks] {
-        &self.plain[id]
+        self.plain[id].as_slice()
     }
 
     pub fn matmul(&mut self, a: usize, b: usize, m: usize, k: usize, n: usize) -> usize {
@@ -269,7 +271,7 @@ impl Exec {
 
     pub fn softmax(&mut self, scores: usize, exp_table: &[Goldilocks], offset: u32, n_rows: usize, n_cols: usize, rng: &mut XorShift64) -> usize {
         let n = n_rows * n_cols;
-        let scores_plain = self.plain[scores].clone();
+        let scores_plain = self.plain[scores].as_slice().to_vec();
 
         let c: Vec<Goldilocks> = (0..n_rows)
             .map(|r| {
