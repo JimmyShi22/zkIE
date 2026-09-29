@@ -102,17 +102,19 @@ impl BatchBuilder {
 
 /// Row-major dense matmul C[m,n] = A[m,k] @ B[k,n] in the field.
 pub fn dense_m(a: &[Goldilocks], b: &[Goldilocks], m: usize, k: usize, n: usize) -> Vec<Goldilocks> {
-    let mut c = vec![Goldilocks::ZERO; m * n];
-    for i in 0..m {
-        for j in 0..n {
+    use p3_maybe_rayon::prelude::*;
+    (0..m * n)
+        .into_par_iter()
+        .map(|idx| {
+            let i = idx / n;
+            let j = idx % n;
             let mut acc = Goldilocks::ZERO;
             for w in 0..k {
                 acc = acc + a[i * k + w] * b[w * n + j];
             }
-            c[i * n + j] = acc;
-        }
-    }
-    c
+            acc
+        })
+        .collect()
 }
 
 /// Elementwise add, equal length.
