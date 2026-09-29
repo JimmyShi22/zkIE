@@ -163,8 +163,10 @@ fn main() {
     };
     println!("TimesFM 200M (IR): prologue verified");
 
-    // ---- 20 layers, each in a fresh executor, carrying only the residual.
+    // ---- 20 layers: phase 1 forward (compute residual chain + executors).
+    let mut execs: Vec<(Exec, XorShift64)> = Vec::new();
     for li in 0..n_layers {
+        let mut rng_li = XorShift64::new(0x200 + 1 + li as u64);
         let mut ex = Exec::new();
         ex.set_rsqrt(rsqrt_table.clone());
         let x = ex.input(x_plain.clone(), 0);
@@ -210,7 +212,7 @@ fn main() {
         let scores = ex.input(scores_plain, 0);
 
         // Whole softmax over HEADS * SEQ rows.
-        let sm = ex.softmax(scores, &exp_table, EXP_OFFSET, HEADS * SEQ, SEQ, &mut rng);
+        let sm = ex.softmax(scores, &exp_table, EXP_OFFSET, HEADS * SEQ, SEQ, &mut rng_li);
 
         // Per-head attention output PV.
         let mut attn_all = Vec::with_capacity(HEADS * SEQ * HDIM_PAD);
@@ -234,10 +236,19 @@ fn main() {
         let down_raw = ex.matmul(act, down_w, SEQ, H_PAD, H_PAD);
         let ffn_out = ex.affine(down_raw, down_b, 16);
         let x_new = ex.add(add5, ffn_out);
-        ex.prove(&whir, &mut rng);
         x_plain = ex.get(x_new).to_vec();
-        println!("layer {li} verified");
+        execs.push((ex, rng_li));
     }
+
+    // ---- 20 layers: phase 2 prove, each layer in parallel.
+    {
+        use p3_maybe_rayon::prelude::*;
+        execs.into_par_iter().for_each(|(ex, mut rng_li)| {
+            let whir = Whir::new_testing(16);
+            ex.prove(&whir, &mut rng_li);
+        });
+    }
+    println!("TimesFM 200M (IR): 20 layers proved");
 
     // ---- Epilogue: horizon FFN output head (fresh executor).
     {
