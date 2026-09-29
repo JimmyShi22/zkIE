@@ -43,3 +43,34 @@ targets the wrong stage. The real cost is the many small FRI opening proofs.
 A meaningful speedup needs either (a) aggregating openings across ops, or
 (b) a PCS with cheaper/fewer openings, rather than further GPU-izing the
 commit.
+
+## Hybrid backend autotuning (2026-09-29)
+
+Decoupled the WHIR DFT and Merkle backends (`ZKIE_CUDA_DFT` / `ZKIE_CUDA_MMCS`,
+commit `0330656`) and swept all four combinations. 1 layer, release build,
+`cuda` feature enabled.
+
+| config | commit | ops (GKR + open/verify) |
+|---|---|---|
+| cpu_cpu | 1.865 s | **121.1 s** |
+| gpu_gpu | 2.064 s | 157.6 s |
+| gpu_cpu (DFT=GPU, Merkle=CPU) | 1.853 s | 124.7 s |
+| cpu_gpu (DFT=CPU, Merkle=GPU) | 2.047 s | 161.7 s |
+
+Conclusion:
+
+- **DFT is backend-neutral.** GPU DFT gives no measurable benefit and is ~3%
+  slower on the ops phase.
+- **Merkle (Poseidon2) is decisively CPU.** GPU Merkle is ~33% slower on ops
+  and ~10% slower on commit.
+- The autotuner converges to **all-CPU**. The GPU provides no speedup for this
+  GKR + WHIR(Poseidon2) proof.
+- The ops phase is ~121 s per layer, so the full 20-layer 200M proof is
+  **~40 min**, correcting the earlier ~9-10 min estimate (which extrapolated
+  from an uncompleted run).
+
+The only GPU-friendly stage left is the forward `dense_m` matmul, which is
+~3% of the total (~75 s of ~40 min), so even a perfect GPU matmul would cap
+the hybrid ceiling at ~3%. The dominant cost is the WHIR opening proofs
+(Poseidon2 re-commits), which can only be reduced by batching/aggregating
+openings, not by backend selection.
