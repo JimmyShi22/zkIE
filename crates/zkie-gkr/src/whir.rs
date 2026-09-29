@@ -506,6 +506,57 @@ impl Whir {
         Ok(evals[table_index].current()[0].as_base().expect("base-field MLE opens to a base element"))
     }
 
+    /// Open every MLE in a batch at the same `point` in a single FRI proof,
+    /// amortizing the O(N log N) folding across all tables instead of paying
+    /// it once per table. Returns `(proof, evals)` where `evals[i]` is the
+    /// opening of table `i`.
+    pub fn open_batch_multi(
+        &self,
+        prover_data: ProverData,
+        protocol: &OpeningProtocol,
+        num_tables: usize,
+        point: &[Goldilocks],
+    ) -> (Proof, Vec<Goldilocks>) {
+        let target = to_ef_point(point);
+        let points: Vec<Point<EF>> = (0..num_tables).map(|_| target.clone()).collect();
+        let proof = self.pcs.open_at(
+            prover_data,
+            protocol,
+            &points,
+            &mut self.fresh_challenger(),
+        );
+        let opened: Vec<Goldilocks> = proof
+            .evals
+            .iter()
+            .map(|e| e.current()[0].as_base().expect("base-field MLE opens to a base element"))
+            .collect();
+        (proof, opened)
+    }
+
+    /// Verify a batched opening of every MLE in the batch at the same `point`.
+    pub fn verify_batch_multi(
+        &self,
+        commitment: &Commitment,
+        proof: &Proof,
+        protocol: &OpeningProtocol,
+        num_tables: usize,
+        point: &[Goldilocks],
+    ) -> Result<Vec<Goldilocks>, <MyPcs as MultilinearPcs<EF, MyChallenger>>::Error> {
+        let target = to_ef_point(point);
+        let points: Vec<Point<EF>> = (0..num_tables).map(|_| target.clone()).collect();
+        let evals = self.pcs.verify_at(
+            commitment,
+            proof,
+            protocol,
+            &points,
+            &mut self.fresh_challenger(),
+        )?;
+        Ok(evals
+            .iter()
+            .map(|e| e.current()[0].as_base().expect("base-field MLE opens to a base element"))
+            .collect())
+    }
+
 
 }
 

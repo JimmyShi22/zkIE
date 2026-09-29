@@ -1382,26 +1382,41 @@ fn prove_bits_range_batch(
     s: &[Goldilocks],
     s_r: Goldilocks,
 ) -> bool {
-    let mut opened_bits = Vec::with_capacity(bits.len());
-    for (j, bj) in bits.iter().enumerate() {
+    // Open every bit column at `r` in one FRI proof, amortizing the O(N log N)
+    // folding across all columns instead of repeating it per column.
+    let (bits_open, bits_evals) = bits_batch.whir.open_batch_multi(
+        bits_batch.prover_data.clone(),
+        &bits_batch.protocol,
+        bits_batch.num_tables,
+        r,
+    );
+    if bits_batch
+        .whir
+        .verify_batch_multi(
+            &bits_batch.commitment,
+            &bits_open,
+            &bits_batch.protocol,
+            bits_batch.num_tables,
+            r,
+        )
+        .unwrap()
+        != bits_evals
+    {
+        return false;
+    }
+
+    let mut rhs = Goldilocks::ZERO;
+    for (j, (bj, &b_r)) in bits.iter().zip(&bits_evals).enumerate() {
         let c_bb: Goldilocks = s.iter().zip(bj).zip(bj).fold(Goldilocks::ZERO, |a, ((&si, &xi), &yi)| a + si * xi * yi);
         let c_b: Goldilocks = s.iter().zip(bj).fold(Goldilocks::ZERO, |a, (&si, &xi)| a + si * xi);
         let proof_bb = sumcheck::prove3(s, bj, bj, c_bb, r);
         let proof_b = sumcheck::prove(s, bj, c_b, r);
-        let (b_open, b_r) = bits_batch.whir.open_batch(bits_batch.prover_data.clone(), &bits_batch.protocol, j, bits_batch.num_tables, r);
-        if bits_batch.whir.verify_batch(&bits_batch.commitment, &b_open, &bits_batch.protocol, j, bits_batch.num_tables, r).unwrap() != b_r {
-            return false;
-        }
         if !sumcheck::verify3(&proof_bb, c_bb, r, s_r, b_r, b_r)
             || !sumcheck::verify(&proof_b, c_b, r, s_r, b_r)
             || c_bb != c_b
         {
             return false;
         }
-        opened_bits.push(b_r);
-    }
-    let mut rhs = Goldilocks::ZERO;
-    for (j, &b_r) in opened_bits.iter().enumerate() {
         rhs = rhs + b_r * from_i64(1i64 << j);
     }
     value_at_r == rhs
