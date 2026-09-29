@@ -97,3 +97,98 @@ Remaining bottleneck: the forward `dense_m` matmul is serial and now dominates
 (~250 s of the 302 s). Peak RSS is also still ~34 GB vs the baseline ~1.4 GB
 because the two-phase executor holds `self.plain` and the BatchBuilder copy
 simultaneously; both are independent follow-ups.
+
+## GPT-2 124M (2026-09-29)
+
+First decoder-only Transformer through the unified ops interface
+(`prove_gpt2_ops`). Full forward pass: token+positional embeddings (precomputed),
+12 transformer blocks (causal attention + GELU FFN), final LayerNorm, and the LM
+head (tied embeddings, 50257 vocab padded to 65536). seq=16.
+
+Machine: 64-thread CPU, 495 GB RAM.
+
+| metric | value |
+|---|---|
+| wall time | ~1 min 53 s |
+| CPU time | ~4380 s (~42 threads) |
+| peak RSS | ~7.6 GB |
+| correctness | argmax matches onnxruntime ground truth on all 16 tokens |
+
+Adaptations vs TimesFM:
+
+- GELU (`gelu_new`, tanh form) is a single LogUp lookup; its input range reaches
+  ~[-64, 64], so the table spans [-128, 128] (offset 2^23, size 2^24).
+- Causal self-attention with a fused QKV projection split into q/k/v matmuls,
+  and per-head head_dim=64. heads=12 is padded to HEADS_PAD=16 so the all-heads
+  softmax batch is a power-of-two size.
+- Attention scale 1/sqrt(64) is folded into the QK^T `affine` shift (19 = 16 + 3).
+- LayerNorm `rsqrt` lookup table must cover per-position variance up to ~13294
+  (GPT-2 outlier dimensions), so it is widened to 2^28 entries (max var 16384);
+  this is backward-compatible with the TimesFM 2^19 table.
+- `lookup::prove` now sums over the *distinct* indices instead of the whole
+  table, so a single-element LayerNorm lookup is O(1) and the large tables do
+  not slow the proof.
+### GPT-2 124M per-op timing + memory (post rsqrt optimization)
+
+seq=16, 64-thread CPU. Same run after switching the LayerNorm `rsqrt` table from
+uniform 2^28 entries to piecewise 2^21 entries (1 GB -> 8 MB on disk).
+
+| metric | value |
+|---|---|
+| wall time | ~1 min 53 s |
+| peak RSS | ~5.6 GB (was ~7.6 GB before the rsqrt shrink) |
+
+WHIR timing (aggregate across all ops):
+
+| stage | count | seconds | share |
+|---|---|---|---|
+| commit (Merkle) | 23800 | 14.0 | 12% |
+| open (FRI) | 46123 | 70.7 | 63% |
+| verify (FRI) | 46123 | 18.5 | 16% |
+| GKR + lookup + forward (rest) | - | ~9.5 | 8% |
+
+Conclusion: WHIR FRI opening dominates (~63%), exactly as in TimesFM. GKR
+sumcheck is not the bottleneck, so the GPU (which only accelerates
+commit/forward) does not help this proof.
+## Cross-model comparison (TimesFM 200M vs GPT-2 124M)
+
+Both measured on the same 64-thread CPU / 495 GB RAM machine, seq=16, through
+the same GKR/WHIR/LogUp op interface.
+
+| model | layers | params | wall time | peak RSS |
+|---|---|---|---|---|
+| TimesFM 200M | 20 | 200M | ~5 min (302 s) | ~1.4 GB |
+| GPT-2 124M | 12 | 124M | ~1 min 53 s | ~5.6 GB |
+
+GPT-2 is ~2.7x faster, but the comparison is not like-for-like:
+
+- GPT-2 has fewer layers (12 vs 20) and a smaller hidden dim (768 vs 1280), so
+  it does less work per layer.
+- GPT-2 additionally proves a 50257 -> 65536 (padded) vocab LM head, which
+  TimesFM does not have; that head is the main reason GPT-2's memory is higher
+  (~5.6 GB vs ~1.4 GB).
+- Both are dominated by WHIR FRI opening (GPT-2: 63% of wall time), so the
+  speedup comes from model size, not a faster proof system. A fair comparison
+  needs matched sequence length and parameter count.
+## GPT-2 124M @ seq=512 (2026-09-29)
+
+Scaled context from 16 to 512 tokens.
+
+| metric | value |
+|---|---|
+| wall time | ~43 min 43 s |
+| peak RSS | ~8.4 GB |
+| correctness | argmax matches onnxruntime on 511/512 tokens |
+
+seq=512 fix:
+
+- Causal mask deepened from -2^21 (-32) to -2^30 (-16384). GPT-2's QK^T/8
+  attention scores reach ~304 (layer 4), so the old -32 additive mask let
+  future tokens leak into the softmax and flip argmax. The deeper mask fully
+  suppresses them (the exp table clamps at -32).
+- One remaining mismatch (pos 172: 262 vs 257) is a close call, consistent with
+  2^16 fixed-point quantization accumulating over 512 positions (a precision
+  artifact, not a logic bug).
+
+The wall-clock bottleneck is WHIR FRI opening (60% of wall time), the same
+bottleneck as TimesFM, not the GKR sumcheck.

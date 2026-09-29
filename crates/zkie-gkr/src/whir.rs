@@ -257,6 +257,8 @@ pub struct Whir {
     folding_factor: FoldingFactor,
     /// (commits, total seconds) spent inside `commit`, for performance telemetry.
     commit_stats: std::cell::Cell<(u64, f64)>,
+    open_stats: std::cell::Cell<(u64, f64)>,
+    verify_stats: std::cell::Cell<(u64, f64)>,
 }
 
 impl Whir {
@@ -328,12 +330,20 @@ impl Whir {
             perm,
             folding_factor,
             commit_stats: std::cell::Cell::new((0, 0.0)),
+            open_stats: std::cell::Cell::new((0, 0.0)),
+            verify_stats: std::cell::Cell::new((0, 0.0)),
         }
     }
 
     /// Number of `commit` calls and total wall-clock seconds spent inside them.
     pub fn commit_stats(&self) -> (u64, f64) {
         self.commit_stats.get()
+    }
+    pub fn open_stats(&self) -> (u64, f64) {
+        self.open_stats.get()
+    }
+    pub fn verify_stats(&self) -> (u64, f64) {
+        self.verify_stats.get()
     }
 
     fn fresh_challenger(&self) -> MyChallenger {
@@ -426,6 +436,7 @@ impl Whir {
         protocol: &OpeningProtocol,
         point: &[Goldilocks],
     ) -> (Proof, Goldilocks) {
+        let t0 = std::time::Instant::now();
         let ef_point = to_ef_point(point);
         let proof = self.pcs.open_at(
             prover_data,
@@ -434,6 +445,8 @@ impl Whir {
             &mut self.fresh_challenger(),
         );
         let opened = proof.evals[0].current()[0];
+        let (n, secs) = self.open_stats.get();
+        self.open_stats.set((n + 1, secs + t0.elapsed().as_secs_f64()));
         (proof, opened.as_base().expect("base-field MLE opens to a base element"))
     }
 
@@ -445,6 +458,7 @@ impl Whir {
         protocol: &OpeningProtocol,
         point: &[Goldilocks],
     ) -> Result<Goldilocks, <MyPcs as MultilinearPcs<EF, MyChallenger>>::Error> {
+        let t0 = std::time::Instant::now();
         let ef_point = to_ef_point(point);
         let evals = self.pcs.verify_at(
             commitment,
@@ -453,6 +467,8 @@ impl Whir {
             std::slice::from_ref(&ef_point),
             &mut self.fresh_challenger(),
         )?;
+        let (n, secs) = self.verify_stats.get();
+        self.verify_stats.set((n + 1, secs + t0.elapsed().as_secs_f64()));
         Ok(evals[0].current()[0].as_base().expect("base-field MLE opens to a base element"))
     }
     /// Open the `table_index`-th MLE in a batch at `point`.

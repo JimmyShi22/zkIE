@@ -51,6 +51,24 @@ impl Ctx {
             .or_insert_with(|| Whir::new_testing(log2_len));
     }
 
+    /// Aggregate WHIR timing across all instances:
+    /// (commits, commit_s, opens, open_s, verifies, verify_s).
+    pub fn stats(&self) -> (u64, f64, u64, f64, u64, f64) {
+        let (mut cn, mut cs, mut on, mut os, mut vn, mut vs) = (0, 0.0, 0, 0.0, 0, 0.0);
+        for w in self.whirs.values() {
+            let (n, s) = w.commit_stats();
+            cn += n;
+            cs += s;
+            let (n, s) = w.open_stats();
+            on += n;
+            os += s;
+            let (n, s) = w.verify_stats();
+            vn += n;
+            vs += s;
+        }
+        (cn, cs, on, os, vn, vs)
+    }
+
     /// Commit raw field values into a [Tensor].
     pub fn commit(&mut self, plain: Vec<Goldilocks>) -> Tensor {
         let log2 = plain.len().trailing_zeros() as usize;

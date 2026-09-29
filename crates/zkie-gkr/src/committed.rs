@@ -780,6 +780,21 @@ fn div_round(a: i64, b: i64) -> i64 {
 /// inputs (ignoring the power-of-two padding tail): `mean` at scale 2^16 and the
 /// `rsqrt_table` index for `1/sqrt(var + eps)`. The variance is accumulated at
 /// scale 2^32, then the index is taken at scale 2^14 (`var_q >> 18`).
+/// Map a 2^32-scale variance to the piecewise rsqrt table index.
+///
+/// The raw index is `var >> 18` (2^14 scale). To keep the table small while
+/// still covering the large variances of GPT-2's outlier dimensions, indices
+/// below 2^20 are stored at full resolution (step 1), and larger indices are
+/// quantized with step 2^8 (the rsqrt curve is nearly flat there).
+fn rsqrt_index(var: i64) -> u32 {
+    const FINE: u32 = 1 << 20;
+    let raw = div_round(var, 1 << 18) as u32;
+    if raw < FINE {
+        raw
+    } else {
+        FINE + ((raw - FINE) >> 8)
+    }
+}
 fn layer_norm_scalars_i32(x_i32: &[i32], n_real: usize) -> (i32, u32) {
     let sum: i64 = x_i32[..n_real].iter().map(|&v| v as i64).sum();
     let mean = div_round(sum, n_real as i64) as i32;
@@ -791,7 +806,7 @@ fn layer_norm_scalars_i32(x_i32: &[i32], n_real: usize) -> (i32, u32) {
         })
         .sum();
     let var = div_round(sqsum, n_real as i64);
-    let s_index = div_round(var, 1 << 18) as u32;
+    let s_index = rsqrt_index(var);
     (mean, s_index)
 }
 
@@ -1024,7 +1039,7 @@ pub fn prove_layer_norm(
     let m = mean as i64;
     let sqsum = s_x2 - 2 * m * s_x + (n_real as i64) * m * m;
     let var = div_round(sqsum, n_real as i64);
-    let s_index = div_round(var, 1 << 18) as u32;
+    let s_index = rsqrt_index(var);
     if (s_index as usize) >= rsqrt_table.len() {
         return false;
     }
@@ -1130,7 +1145,7 @@ pub fn prove_layer_norm_batch(
     let m = mean as i64;
     let sqsum = s_x2 - 2 * m * s_x + (n_real as i64) * m * m;
     let var = div_round(sqsum, n_real as i64);
-    let s_index = div_round(var, 1 << 18) as u32;
+    let s_index = rsqrt_index(var);
     if (s_index as usize) >= rsqrt_table.len() {
         return false;
     }
@@ -1185,7 +1200,7 @@ fn rms_norm_scalars_i32(x_i32: &[i32], n_real: usize) -> u32 {
         })
         .sum();
     let s = div_round(sqsum, n_real as i64);
-    div_round(s, 1 << 18) as u32
+    rsqrt_index(s)
 }
 
 /// Compute the raw RMSNorm product `raw = x * rstd * w` (scale 2^48) together
@@ -1546,7 +1561,7 @@ pub fn prove_rms_norm(
     if !sumcheck::verify(&proof_x2, s_x2_f, &r2, x_r2, x_r2) {
         return false;
     }
-    let s_index = div_round(div_round(s_x2, n_real as i64), 1 << 18) as u32;
+    let s_index = rsqrt_index(div_round(s_x2, n_real as i64));
     if (s_index as usize) >= rsqrt_table.len() {
         return false;
     }
@@ -1629,7 +1644,7 @@ pub fn prove_rms_norm_batch(
     if !sumcheck::verify(&proof_x2, s_x2_f, &r2, x_r2, x_r2) {
         return false;
     }
-    let s_index = div_round(div_round(s_x2, n_real as i64), 1 << 18) as u32;
+    let s_index = rsqrt_index(div_round(s_x2, n_real as i64));
     if (s_index as usize) >= rsqrt_table.len() {
         return false;
     }
