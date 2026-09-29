@@ -2799,4 +2799,13 @@ mod tests {
         let c_bad = commit(&whir, &bad);
         assert!(!prove_add(&whir, &ca, &whir, &cb, &whir, &c_bad, n, &mut rng));
     }
+    #[test]
+    fn commit_is_deterministic() {
+        let whir = crate::whir::Whir::new_testing(5);
+        let vals: Vec<Goldilocks> = (0..32).map(|i| Goldilocks::from_u64(i as u64)).collect();
+        let (c1, _, _) = whir.commit(&vals);
+        let (c2, _, _) = whir.commit(&vals);
+        assert_eq!(c1, c2);
+    }
+
 }
