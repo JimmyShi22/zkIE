@@ -127,39 +127,48 @@ fn main() {
     let rsqrt_table = load_i32(&format!("{base}rsqrt_table_i32.bin"));
     let silu_table = load_i32(&format!("{base}silu_table_i32.bin"));
     let exp_table = load_i32(&format!("{base}exp_table_i32.bin"));
-
-    let mut rng = XorShift64::new(0x200);
-    let mut ex = Exec::new();
-    ex.set_rsqrt(rsqrt_table);
-
-    // ---- Prologue: RevIN embedding is precomputed; proof starts from cat.
-    let cat = ex.input(load_i32(&format!("{stack}cat_i32.bin")), 0);
-    let pro_hid_w = ex.input(load_i32(&format!("{stack}pro_hid_w_i32.bin")), 0);
-    let pro_out_w = ex.input(load_i32(&format!("{stack}pro_out_w_i32.bin")), 0);
-    let pro_res_w = ex.input(load_i32(&format!("{stack}pro_res_w_i32.bin")), 0);
-    let gather = ex.input(load_i32(&format!("{stack}gather_i32.bin")), 0);
-    let embedding = ex.input(broadcast_bias(&load_i32(&format!("{stack}embedding_i32.bin")), SEQ), 0);
-    let pro_hid_b = broadcast_bias(&load_i32(&format!("{stack}pro_hid_b_i32.bin")), SEQ);
-    let pro_out_b = broadcast_bias(&load_i32(&format!("{stack}pro_out_b_i32.bin")), SEQ);
-    let pro_res_b = broadcast_bias(&load_i32(&format!("{stack}pro_res_b_i32.bin")), SEQ);
-
-    let hid_raw = ex.matmul(cat, pro_hid_w, SEQ, 64, H_PAD);
-    let linear = ex.affine(hid_raw, pro_hid_b, 16);
-    let silu_idx = silu_raw(ex.get(linear), &silu_table, SILU_OFFSET).0;
-    let silu_t = ex.lookup(&silu_idx, &silu_table, &mut rng);
-    let out_raw = ex.matmul(silu_t, pro_out_w, SEQ, H_PAD, H_PAD);
-    let linear_1 = ex.affine(out_raw, pro_out_b, 16);
-    let res_raw = ex.matmul(cat, pro_res_w, SEQ, 64, H_PAD);
-    let linear_2 = ex.affine(res_raw, pro_res_b, 16);
-    let add_a = ex.add(linear_1, linear_2);
-    let add_1 = ex.add(add_a, gather);
-    let mut x = ex.add(add_1, embedding);
-    println!("TimesFM 200M (IR): prologue verified");
-
     let mask = load_i32(&format!("{stack}mask_q_i32.bin"));
     let zero_hd = vec![from_i32(0); SEQ * HDIM_PAD];
+    let whir = Whir::new_testing(16);
+    let mut rng = XorShift64::new(0x200);
+    let n_layers: usize = std::env::var("ZKIE_LAYERS").ok().and_then(|v| v.parse().ok()).unwrap_or(N_LAYERS);
 
-    for li in 0..std::env::var("ZKIE_LAYERS").ok().and_then(|v| v.parse().ok()).unwrap_or(N_LAYERS) {
+    // ---- Prologue: fresh executor, proven and dropped immediately.
+    let mut x_plain: Vec<Goldilocks> = {
+        let mut ex = Exec::new();
+        ex.set_rsqrt(rsqrt_table.clone());
+        let cat = ex.input(load_i32(&format!("{stack}cat_i32.bin")), 0);
+        let pro_hid_w = ex.input(load_i32(&format!("{stack}pro_hid_w_i32.bin")), 0);
+        let pro_out_w = ex.input(load_i32(&format!("{stack}pro_out_w_i32.bin")), 0);
+        let pro_res_w = ex.input(load_i32(&format!("{stack}pro_res_w_i32.bin")), 0);
+        let gather = ex.input(load_i32(&format!("{stack}gather_i32.bin")), 0);
+        let embedding = ex.input(broadcast_bias(&load_i32(&format!("{stack}embedding_i32.bin")), SEQ), 0);
+        let pro_hid_b = broadcast_bias(&load_i32(&format!("{stack}pro_hid_b_i32.bin")), SEQ);
+        let pro_out_b = broadcast_bias(&load_i32(&format!("{stack}pro_out_b_i32.bin")), SEQ);
+        let pro_res_b = broadcast_bias(&load_i32(&format!("{stack}pro_res_b_i32.bin")), SEQ);
+
+        let hid_raw = ex.matmul(cat, pro_hid_w, SEQ, 64, H_PAD);
+        let linear = ex.affine(hid_raw, pro_hid_b, 16);
+        let silu_idx = silu_raw(ex.get(linear), &silu_table, SILU_OFFSET).0;
+        let silu_t = ex.lookup(&silu_idx, &silu_table, &mut rng);
+        let out_raw = ex.matmul(silu_t, pro_out_w, SEQ, H_PAD, H_PAD);
+        let linear_1 = ex.affine(out_raw, pro_out_b, 16);
+        let res_raw = ex.matmul(cat, pro_res_w, SEQ, 64, H_PAD);
+        let linear_2 = ex.affine(res_raw, pro_res_b, 16);
+        let add_a = ex.add(linear_1, linear_2);
+        let add_1 = ex.add(add_a, gather);
+        let x = ex.add(add_1, embedding);
+        ex.prove(&whir, &mut rng);
+        ex.get(x).to_vec()
+    };
+    println!("TimesFM 200M (IR): prologue verified");
+
+    // ---- 20 layers, each in a fresh executor, carrying only the residual.
+    for li in 0..n_layers {
+        let mut ex = Exec::new();
+        ex.set_rsqrt(rsqrt_table.clone());
+        let x = ex.input(x_plain.clone(), 0);
+
         let lnw = load_i32(&format!("{stack}L{li}_lnw_i32.bin"));
         let q_w = ex.input(load_i32(&format!("{stack}L{li}_q_w_i32.bin")), 0);
         let k_w = ex.input(load_i32(&format!("{stack}L{li}_k_w_i32.bin")), 0);
@@ -224,34 +233,38 @@ fn main() {
         let act = ex.relu(gate_raw, gate_b);
         let down_raw = ex.matmul(act, down_w, SEQ, H_PAD, H_PAD);
         let ffn_out = ex.affine(down_raw, down_b, 16);
-        x = ex.add(add5, ffn_out);
+        let x_new = ex.add(add5, ffn_out);
+        ex.prove(&whir, &mut rng);
+        x_plain = ex.get(x_new).to_vec();
         println!("layer {li} verified");
     }
 
-    // ---- Epilogue: horizon FFN output head.
-    let hid_w = ex.input(load_i32(&format!("{stack}head_hid_w_i32.bin")), 0);
-    let out_w = ex.input(load_i32(&format!("{stack}head_out_w_i32.bin")), 0);
-    let res_w = ex.input(load_i32(&format!("{stack}head_res_w_i32.bin")), 0);
-    let hid_b = broadcast_bias(&load_i32(&format!("{stack}head_hid_b_i32.bin")), SEQ);
-    let out_b = broadcast_bias(&load_i32(&format!("{stack}head_out_b_i32.bin")), SEQ);
-    let res_b = broadcast_bias(&load_i32(&format!("{stack}head_res_b_i32.bin")), SEQ);
-    let scale_bytes = std::fs::read(format!("{stack}scale_i64.bin")).expect("scale file");
-    let scale_q = i64::from_le_bytes(scale_bytes[0..8].try_into().unwrap());
-    let bias_q = i64::from_le_bytes(scale_bytes[8..16].try_into().unwrap());
+    // ---- Epilogue: horizon FFN output head (fresh executor).
+    {
+        let mut ex = Exec::new();
+        ex.set_rsqrt(rsqrt_table.clone());
+        let x = ex.input(x_plain.clone(), 0);
+        let hid_w = ex.input(load_i32(&format!("{stack}head_hid_w_i32.bin")), 0);
+        let out_w = ex.input(load_i32(&format!("{stack}head_out_w_i32.bin")), 0);
+        let res_w = ex.input(load_i32(&format!("{stack}head_res_w_i32.bin")), 0);
+        let hid_b = broadcast_bias(&load_i32(&format!("{stack}head_hid_b_i32.bin")), SEQ);
+        let out_b = broadcast_bias(&load_i32(&format!("{stack}head_out_b_i32.bin")), SEQ);
+        let res_b = broadcast_bias(&load_i32(&format!("{stack}head_res_b_i32.bin")), SEQ);
+        let scale_bytes = std::fs::read(format!("{stack}scale_i64.bin")).expect("scale file");
+        let scale_q = i64::from_le_bytes(scale_bytes[0..8].try_into().unwrap());
+        let bias_q = i64::from_le_bytes(scale_bytes[8..16].try_into().unwrap());
 
-    let hid_raw = ex.matmul(x, hid_w, SEQ, H_PAD, H_PAD);
-    let lin31 = ex.affine(hid_raw, hid_b, 16);
-    let silu1_idx = silu_raw(ex.get(lin31), &silu_table, SILU_OFFSET).0;
-    let silu1_t = ex.lookup(&silu1_idx, &silu_table, &mut rng);
-    let out_raw = ex.matmul(silu1_t, out_w, SEQ, H_PAD, H_PAD);
-    let lin32 = ex.affine(out_raw, out_b, 16);
-    let res_raw = ex.matmul(x, res_w, SEQ, H_PAD, H_PAD);
-    let lin33 = ex.affine(res_raw, res_b, 16);
-    let add31 = ex.add(lin32, lin33);
-    let _output_ts = ex.scale(add31, scale_q, vec![from_i32(bias_q as i32); SEQ * H_PAD]);
-
-    // Phase 2: batch-commit every recorded tensor and run the whole op list.
-    let whir = Whir::new_testing(16);
-    ex.prove(&whir, &mut rng);
+        let hid_raw = ex.matmul(x, hid_w, SEQ, H_PAD, H_PAD);
+        let lin31 = ex.affine(hid_raw, hid_b, 16);
+        let silu1_idx = silu_raw(ex.get(lin31), &silu_table, SILU_OFFSET).0;
+        let silu1_t = ex.lookup(&silu1_idx, &silu_table, &mut rng);
+        let out_raw = ex.matmul(silu1_t, out_w, SEQ, H_PAD, H_PAD);
+        let lin32 = ex.affine(out_raw, out_b, 16);
+        let res_raw = ex.matmul(x, res_w, SEQ, H_PAD, H_PAD);
+        let lin33 = ex.affine(res_raw, res_b, 16);
+        let add31 = ex.add(lin32, lin33);
+        let _output_ts = ex.scale(add31, scale_q, vec![from_i32(bias_q as i32); SEQ * H_PAD]);
+        ex.prove(&whir, &mut rng);
+    }
     println!("TimesFM 200M (IR): prologue + 20 layers + output head verified");
 }
