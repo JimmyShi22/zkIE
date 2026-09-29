@@ -59,6 +59,25 @@ mod backend {
         matches!(std::env::var("ZKIE_CUDA"), Ok(v) if v == "1" || v == "true")
     }
 
+    /// Resolve a per-engine override (`ZKIE_CUDA_DFT` / `ZKIE_CUDA_MMCS`),
+    /// falling back to the global `ZKIE_CUDA` switch. This lets autotuning
+    /// pin the DFT and Merkle engines independently of each other.
+    fn pick_backend(name: &str, fallback: bool) -> bool {
+        match std::env::var(name).ok().as_deref() {
+            Some("1") | Some("true") | Some("cuda") => true,
+            Some("0") | Some("false") | Some("cpu") => false,
+            _ => fallback,
+        }
+    }
+
+    pub fn use_cuda_dft() -> bool {
+        pick_backend("ZKIE_CUDA_DFT", use_cuda())
+    }
+
+    pub fn use_cuda_mmcs() -> bool {
+        pick_backend("ZKIE_CUDA_MMCS", use_cuda())
+    }
+
     pub enum DftBackend {
         Cpu(CpuDft),
         #[cfg(feature = "cuda")]
@@ -285,7 +304,7 @@ impl Whir {
         let mmcs = {
             let hash = MerkleHash::new(perm.clone());
             let compress = MerkleCompress::new(perm.clone());
-            if backend::use_cuda() {
+            if backend::use_cuda_mmcs() {
                 MyMmcs::Cuda(zkie_cuda::merkle::CudaMerkleTreeMmcs::new(hash, compress, 0))
             } else {
                 MyMmcs::Cpu(CpuMmcs::new(hash, compress, 0))
@@ -296,7 +315,7 @@ impl Whir {
         let dft = MyDft::new(1 << config.max_fft_size());
         #[cfg(feature = "cuda")]
         let dft = {
-            if backend::use_cuda() {
+            if backend::use_cuda_dft() {
                 MyDft::Cuda(zkie_cuda::dft::CudaDft::new())
             } else {
                 MyDft::Cpu(CpuDft::new(1 << config.max_fft_size()))
