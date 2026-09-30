@@ -16,6 +16,7 @@ pub mod lookup;
 pub mod matmul;
 pub mod mle;
 pub mod ops;
+pub mod par;
 pub mod rmsnorm;
 pub mod softmax;
 pub mod sumcheck;
