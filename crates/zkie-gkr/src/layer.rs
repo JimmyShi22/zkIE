@@ -76,4 +76,50 @@ mod tests {
         let tensors_bad: Vec<&[Goldilocks]> = vec![&x, &b, &w, &y, &bad_z];
         assert!(!verify_layer(&proof, &tensors_bad, &ops, &r));
     }
+    #[test]
+    fn affine_round_layer() {
+        let mut rng = XorShift64::new(0xAFFE);
+        let n = 1usize << 5;
+        let shift = 16u32;
+        let half = Goldilocks::from_u64(1u64 << (shift - 1));
+        let two_shift = Goldilocks::from_u64(1u64 << shift);
+        let div_round = |a: i64, b: i64| -> i64 { let q = a.div_euclid(b); let rr = a.rem_euclid(b); if rr * 2 >= b { q + 1 } else { q } };
+        let input: Vec<Goldilocks> = (0..n).map(|_| from_i64((rng.next_u64() % (1u64 << 30)) as i64)).collect();
+        let bias: Vec<Goldilocks> = (0..n).map(|_| from_i64((rng.next_u64() % 2000) as i64 - 1000)).collect();
+        let out: Vec<Goldilocks> = (0..n).map(|i| from_i64(div_round(crate::fixed_point::to_i64(input[i]), 1i64 << shift) + crate::fixed_point::to_i64(bias[i]))).collect();
+        let rem_off: Vec<Goldilocks> = (0..n).map(|i| {
+            let in_i = crate::fixed_point::to_i64(input[i]);
+            let out_i = crate::fixed_point::to_i64(out[i]);
+            let b_i = crate::fixed_point::to_i64(bias[i]);
+            from_i64(in_i - (out_i - b_i) * (1i64 << shift) + (1i64 << (shift - 1)))
+        }).collect();
+        for &v in &rem_off {
+            let iv = crate::fixed_point::to_i32(v);
+            assert!(iv >= 0 && iv < (1i32 << shift));
+        }
+        let t = n.trailing_zeros() as usize;
+        let r: Vec<Goldilocks> = (0..t).map(|_| rng.field()).collect();
+        let neg = from_i64(-1);
+        let constraint = vec![
+            (Goldilocks::from_u64(1), vec![3usize]),
+            (neg, vec![0usize]),
+            (two_shift, vec![2usize]),
+            (neg * two_shift, vec![1usize]),
+            (neg * half, vec![4usize]),
+        ];
+        let ones = vec![Goldilocks::from_u64(1); n];
+        let tensors: Vec<&[Goldilocks]> = vec![&input, &bias, &out, &rem_off, &ones];
+        let lc = prove_layer_circuit(&tensors, std::slice::from_ref(&constraint), &r, &mut rng);
+        assert!(verify_layer_circuit(&lc, &tensors, std::slice::from_ref(&constraint), &r));
+        let table: Vec<Goldilocks> = (0..(1usize << shift)).map(|j| Goldilocks::from_u64(j as u64)).collect();
+        let idx: Vec<u32> = rem_off.iter().map(|&v| crate::fixed_point::to_i32(v) as u32).collect();
+        let alpha = rng.field();
+        let beta = rng.field();
+        let frac = crate::logup_gkr::prove_lookup_fractional(&idx, &rem_off, &table, alpha, beta, &mut rng);
+        assert!(crate::logup_gkr::verify_lookup_fractional(&frac, &idx, &rem_off, &table, alpha, beta));
+        let mut bad_out = out.clone();
+        bad_out[0] = bad_out[0] + Goldilocks::from_u64(1);
+        let tensors_bad: Vec<&[Goldilocks]> = vec![&input, &bias, &bad_out, &rem_off, &ones];
+        assert!(!verify_layer_circuit(&lc, &tensors_bad, std::slice::from_ref(&constraint), &r));
+    }
 }
