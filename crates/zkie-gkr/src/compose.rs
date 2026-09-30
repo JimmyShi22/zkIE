@@ -572,6 +572,11 @@ pub enum Op {
         m: usize,
         n: usize,
     },
+    SoftmaxIndex {
+        x: T,
+        out: T,
+        table_len: usize,
+    },
     Layernorm {
         x: T,
         w: T,
@@ -592,6 +597,7 @@ pub enum OpProof {
     Add(VirtualProof, Vec<Goldilocks>),
     Lookup(FractionalProof, Goldilocks, Goldilocks),
     Softmax(SoftmaxScaledProof),
+    SoftmaxIndex,
     Layernorm(LayernormChainProof),
 }
 
@@ -665,6 +671,13 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                     .collect();
                 store.v[e] = ev;
                 store.v[out] = o;
+            }
+            Op::SoftmaxIndex { x, out, table_len } => {
+                let indices: Vec<u32> = store.get(x)
+                    .iter()
+                    .map(|&s| ((to_i64(s).max(0)) as u64 % table_len as u64) as u32)
+                    .collect();
+                store.idx[out] = indices;
             }
             Op::Layernorm { x, w, b, out, rsqrt_table, m, d } => {
                 let xv = store.get(x);
@@ -778,6 +791,9 @@ pub fn prove_shard(store: &mut Store, ops: &[Op], boundary: &[T], rng: &mut XorS
                 );
                 claims.push((out, p.r_scale.clone(), mle::eval(store.get(out), &p.r_scale)));
                 op_proofs.push(OpProof::Softmax(p));
+            }
+            Op::SoftmaxIndex { .. } => {
+                op_proofs.push(OpProof::SoftmaxIndex);
             }
             Op::Layernorm { x, w, b, out, rsqrt_table, m, d } => {
                 let p = prove_layernorm_chain(
@@ -921,6 +937,9 @@ pub fn verify_shard(store: &Store, ops: &[Op], proof: &OpShardProof) -> bool {
                     return false;
                 }
                 claims.push((*out, sp.r_scale.clone(), mle::eval(ws.get(*out), &sp.r_scale)));
+            }
+            (Op::SoftmaxIndex { .. }, OpProof::SoftmaxIndex) => {
+                // No proof: the verifier recomputes `idx = softmax_index(scores)`.
             }
             (Op::Layernorm { x, w, b, out, rsqrt_table, m, d }, OpProof::Layernorm(lp)) => {
                 if !verify_layernorm_chain(
@@ -1743,6 +1762,56 @@ mod tests {
 
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
         bad.v[q_t][0] = bad.v[q_t][0] + Goldilocks::ONE;
+        assert!(!verify_shard(&bad, &ops, &proof));
+    }
+
+    #[test]
+    fn op_shard_attention_block_roundtrip() {
+        // Single-head attention: Q/K/V projections -> scores = Q@K^T -> softmax
+        // -> attn = probs@V, all folded into one g.
+        use crate::field::PrimeCharacteristicRing;
+        let mut rng = XorShift64::new(0x1A1A);
+        let (m, d, dh, shift) = (4usize, 8usize, 4usize, 8u32);
+        let table_len = 1usize << 8;
+        let mut store = Store::new();
+
+        let x = store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let exp_table = store.push((0..table_len).map(|j| from_i64((j % 255 + 1) as i64)).collect());
+        let mut ws = Vec::new();
+        let mut bs = Vec::new();
+        for _ in 0..3 {
+            ws.push(store.push((0..d * dh).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect()));
+            bs.push(store.push((0..m * dh).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect()));
+        }
+        let mut outs = Vec::new();
+        let mut rems = Vec::new();
+        for _ in 0..3 {
+            outs.push(store.push(vec![]));
+            rems.push(store.push(vec![]));
+        }
+        let kt = store.push(vec![]);
+        let scores = store.push(vec![]);
+        let idx = store.push_idx(vec![]);
+        let e = store.push(vec![]);
+        let probs = store.push(vec![]);
+        let attn = store.push(vec![]);
+
+        let ops = vec![
+            Op::Projection { x, w: ws[0], bias: bs[0], out: outs[0], rem: rems[0], m, k: d, n: dh, shift },
+            Op::Projection { x, w: ws[1], bias: bs[1], out: outs[1], rem: rems[1], m, k: d, n: dh, shift },
+            Op::Projection { x, w: ws[2], bias: bs[2], out: outs[2], rem: rems[2], m, k: d, n: dh, shift },
+            Op::Transpose { x: outs[1], out: kt, m, k: dh },
+            Op::MatMul { a: outs[0], b: kt, c: scores, m, k: dh, n: m },
+            Op::SoftmaxIndex { x: scores, out: idx, table_len },
+            Op::Softmax { idx, e, out: probs, table: exp_table, m, n: m },
+            Op::MatMul { a: probs, b: outs[2], c: attn, m, k: m, n: dh },
+        ];
+
+        let proof = prove_shard(&mut store, &ops, &[attn], &mut rng);
+        assert!(verify_shard(&store, &ops, &proof));
+
+        let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
+        bad.v[ws[0]][0] = bad.v[ws[0]][0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
     }
 }
