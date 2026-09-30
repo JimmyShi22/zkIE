@@ -22,6 +22,7 @@ pub mod sumcheck;
 pub mod logup_gkr;
 pub mod layer_circuit;
 pub mod layer;
+pub mod same_poly;
 pub mod batch_open;
 pub mod whir;
 
