@@ -4,6 +4,7 @@ use zkie_gkr::committed::silu_raw;
 use zkie_gkr::field::{Goldilocks, PrimeCharacteristicRing, XorShift64};
 use zkie_gkr::fixed_point::{from_i32, to_i64};
 use zkie_gkr::ir::Exec;
+use std::time::Instant;
 use zkie_gkr::whir::Whir;
 
 const H_PAD: usize = 1024;
@@ -191,6 +192,7 @@ fn forward_final(
 }
 
 fn main() {
+    let t0 = Instant::now();
     let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/");
     let stack = format!("{base}gpt2_stack/");
     let rsqrt_table = load_i32(&format!("{base}rsqrt_table_i32.bin"));
@@ -211,7 +213,7 @@ fn main() {
         );
         x = x_new;
         ex_li.prove(&whir, &mut rng);
-        eprintln!("layer {li} proved");
+        eprintln!("layer {li} proved at {:.2}s", t0.elapsed().as_secs_f64());
     }
 
     let (ex_f, logits) = forward_final(&x, &rsqrt_table, &stack);
@@ -219,6 +221,10 @@ fn main() {
     println!("GPT-2 124M (IR): argmax {:?}", argmax);
     ex_f.prove(&whir, &mut rng);
     println!("GPT-2 124M (IR): verified; global_open_count = {}", zkie_gkr::whir::global_open_count());
+    let (cn, cs) = whir.commit_stats();
+    let (on, os) = whir.open_stats();
+    let (vn, vs) = whir.verify_stats();
+    eprintln!("TIMING total={:.2}s commit={cn} {cs:.2}s open={on} {os:.2}s verify={vn} {vs:.2}s", t0.elapsed().as_secs_f64());
 }
 
 fn argmax_vocab(logits: &[Goldilocks]) -> Vec<usize> {
