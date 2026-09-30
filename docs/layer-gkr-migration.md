@@ -183,3 +183,54 @@ Findings:
   fraction tree is); single-threaded; real gelu/exp tables are 2^21..2^23 (the
   bench used 2^16..2^18). N-ary sharding + layer parallelism + GPU are still to
   be added on top.
+
+
+## IE engine: current status (recorded Oct 1 2026)
+
+### Architecture — complete
+The goal is an autotunable inference-proving engine (IE), not a fixed
+layer-granularity POC. All pieces are built and unit-tested (84 lib tests green):
+
+- **op stays as a thin IR shell** (`ir.rs`); the shared proof primitives are
+  matmul GKR reduction (`matmul.rs`), logUp fractional lookup (`logup_gkr.rs`),
+  and the rounding range check (logUp).
+- **full GKR + logUp**: intermediate activations are virtual MLEs (never
+  committed), claims chain between sumchecks, logUp is a fractional sumcheck
+  (no standalone grand-product).
+- **one g per layer**: `transformer_chain.rs` chains layernorm + attention + FFN
+  + residuals into a single claim chain (`prove_transformer_layer`). Sub-chains:
+  `layernorm_chain.rs`, `attention_chain.rs`, `ffn_chain.rs`, `softmax_scaled.rs`.
+- **cross-shard binding**: `same_poly.rs` merges multiple claims on the same
+  tensor; `shard.rs` builds a shard DAG with boundary binding.
+- **engine** (`engine.rs`): `compile_shard_dag` (tunable granularity
+  Op/Layers/WholeModel), per-stage `StageSchedule` (Forward/Commit/Sumcheck/Open
+  CPU vs GPU), and `autotune` / `autotune_with` (real-measurement hook).
+
+### Performance journey (GPT-2 512 scale, synthetic weights, single-head, post-norm, plain model)
+| step | per-layer | notes |
+| --- | --- | --- |
+| op granularity (old baseline) | ~19.6 min total | every op committed/sumchecked/opened |
+| layer granularity (claim-chained, single-threaded) | 58.9s | one g per layer, virtual intermediates |
+| + row-parallel matmul (64 cores, `par::mm_par`) | 6.55s | 9x |
+| + parallel sumcheck (`prove_virtual` hot loops) | 3.62s | 1.8x |
+| 12-layer end-to-end (layer-parallel proof) | ~32s | witness 9.4s + proof 22.6s |
+
+Key findings:
+- The bottleneck is elementwise work (forward matmul and the affine+logUp
+  sumcheck), not the matmul GKR reduction or the WHIR commit/open. Both are
+  embarrassingly parallel across rows/elements, so 64 CPU cores give ~30x.
+- WHIR commit+open is ~0.30s/projection (testing params) and GPU commit is only
+  ~1.1-1.4x (launch/transfer-bound) — the real lever is CPU parallelism, not
+  the GPU commit path.
+- Claim chaining (same_poly) adds ~7s/layer over independent proofs — the
+  "eliminate claim merge overhead" target.
+
+### Caveats / not yet done
+- The 12-layer proof does not scale to the theoretical ~6s (measured 22.6s):
+  nested parallelism (12 std threads x rayon pool) contends; switching the outer
+  loop to `rayon::par_iter` is applied but not yet confirmed effective.
+- Synthetic random weights; single-head attention; post-norm (GPT-2 is pre-norm);
+  plain model (no WHIR commit of boundary/weights).
+- Remaining: quantization (12-bit/adaptive), real GPT-2 weights + multi-head +
+  pre-norm + WHIR commit, autotune over the full granularity x backend x layout
+  space with real measurement.
