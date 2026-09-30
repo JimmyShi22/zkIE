@@ -529,6 +529,12 @@ impl Store {
 /// `Add` = elementwise `c = a + b`; `Lookup` = `out[i] = table[idx[i]]`.
 #[derive(Clone, Debug)]
 pub enum Op {
+    Transpose {
+        x: T,
+        out: T,
+        m: usize,
+        k: usize,
+    },
     MatMul {
         a: T,
         b: T,
@@ -580,6 +586,7 @@ pub enum Op {
 /// A proof for one op, kept heterogeneous because the primitives have different
 /// proof shapes.
 pub enum OpProof {
+    Transpose,
     MatMul(MatmulProof, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>),
     Projection(ProjectionProof),
     Add(VirtualProof, Vec<Goldilocks>),
@@ -605,6 +612,9 @@ pub struct OpShardProof {
 fn forward_ops(store: &mut Store, ops: &[Op]) {
     for op in ops.iter().cloned() {
         match op {
+            Op::Transpose { x, out, m, k } => {
+                store.v[out] = transpose(store.get(x), m, k);
+            }
             Op::MatMul { a, b, c, m, k, n } => {
                 let cval = crate::par::mm_par(store.get(a), store.get(b), m, k, n, 64);
                 store.v[c] = cval;
@@ -697,6 +707,9 @@ pub fn prove_shard(store: &mut Store, ops: &[Op], boundary: &[T], rng: &mut XorS
 
     for op in ops {
         match *op {
+            Op::Transpose { .. } => {
+                op_proofs.push(OpProof::Transpose);
+            }
             Op::MatMul { a, b, c, m, k, n } => {
                 let at = transpose(store.get(a), m, k);
                 let u: Vec<Goldilocks> = (0..m.trailing_zeros() as usize).map(|_| rng.field()).collect();
@@ -826,6 +839,11 @@ pub fn verify_shard(store: &Store, ops: &[Op], proof: &OpShardProof) -> bool {
     let mut claims: Vec<(T, Vec<Goldilocks>, Goldilocks)> = Vec::new();
     for (op, p) in ops.iter().zip(&proof.ops) {
         match (op, p) {
+            (Op::Transpose { .. }, OpProof::Transpose) => {
+                // No proof: the verifier recomputes `out = transpose(x)` in
+                // forward_ops, and the downstream op's claim on `out` is checked
+                // against that recomputed value.
+            }
             (Op::MatMul { a, b, c, m, k, n: _ }, OpProof::MatMul(mp, u, v, ch)) => {
                 let at = transpose(ws.get(*a), *m, *k);
                 let a_restricted = mle::partial_eval(&at, u);
@@ -1703,6 +1721,28 @@ mod tests {
 
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
         bad.v[a][0] = bad.v[a][0] + Goldilocks::ONE;
+        assert!(!verify_shard(&bad, &ops, &proof));
+    }
+
+    #[test]
+    fn op_shard_transpose_matmul_roundtrip() {
+        // scores = Q @ K^T  (the core of attention): transpose K, then matmul.
+        let mut rng = XorShift64::new(0x1919);
+        let (m, kd) = (4usize, 8usize);
+        let mut store = Store::new();
+        let q_t = store.push((0..m * kd).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let k_t = store.push((0..m * kd).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let kt_t = store.push(vec![]);
+        let scores_t = store.push(vec![]);
+        let ops = vec![
+            Op::Transpose { x: k_t, out: kt_t, m, k: kd },
+            Op::MatMul { a: q_t, b: kt_t, c: scores_t, m, k: kd, n: m },
+        ];
+        let proof = prove_shard(&mut store, &ops, &[scores_t], &mut rng);
+        assert!(verify_shard(&store, &ops, &proof));
+
+        let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
+        bad.v[q_t][0] = bad.v[q_t][0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
     }
 }
