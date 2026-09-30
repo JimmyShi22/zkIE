@@ -132,6 +132,19 @@ Remaining (mechanical, no new primitives):
 3. Rewrite Exec/committed.rs to use the layer circuit (integration).
 4. N-ary tree sharding + agg + layer parallelism + cross-shard binding.
 
+## Autotunable shard DAG (IE engine) — next phase
+The proof unit is a *shard*, not a hardcoded layer. `shard::prove_shard` folds a
+group of ops' constraints into one `g` (one sumcheck); `shard::prove_shard_dag`
+chains shards and binds each boundary via `same_poly` (cross-shard binding: a
+shard's input claim == the upstream shard's output claim). Granularity is a
+public parameter: one op / one layer / a few layers / the whole model are all
+the same code path (see `shard::tests::single_shard_is_op_granularity`).
+
+Autotuning loop to build on top (each knob public):
+1. shard granularity (op / layer / multi-layer / model),
+2. per-shard backend (CPU vs CUDA WHIR/FRI dispatch),
+3. layout / N-ary sharding + layer parallelism.
+Search `granularity x backend x layout`, cache the best (tune once per model).
 ## Benchmarks at GPT-2 scale (layer circuit, plain model, single-threaded)
 
 Examples in `crates/zkie-gkr/examples/`:
@@ -151,7 +164,10 @@ Findings:
   (field-inverse `out*sum_broadcast = e`, sum as a separate tensor) in 0.16s at
   seq=512. This removes the 2^27 (infeasible) flattened rescale.
 - Full transformer layer (single-head attention + FFN + 2 residual adds, plain
-  model, no layernorm yet): 27.57s/layer at seq=512, so ~5.5 min for 12 layers.
+  model, no layernorm yet): 27.57s/layer proof. 12-layer end-to-end (incl.
+  witness generation) = 624s (~10.4 min) via bench_gpt2_12layer; proof-only is
+  ~5.5 min. Witness gen (forward matmul) is ~half the wall time and is a
+  separate optimizable axis (GPU/parallel), not part of the proof.
   Matches the extrapolation. Multi-head (12x the softmax/matmul, ~+2s) and
   layernorm are still to be wired on top.
 - Full layer extrapolation: attention (~6s projections + ~1.7s softmax) + FFN
