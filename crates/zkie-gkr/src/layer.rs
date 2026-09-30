@@ -304,4 +304,59 @@ mod tests {
         let final_evals = vec![crate::mle::eval(&eq_b, &challenges), crate::mle::eval(&out_b, &challenges), crate::mle::eval(&e_b, &challenges)];
         assert!(crate::sumcheck::verify_virtual(&proof, &terms, claimed, &challenges, &final_evals));
     }
+    #[test]
+    fn matmul_matmul_chain_no_commit_c() {
+        let mut rng = XorShift64::new(0x8888);
+        let (m, k, n, l) = (2usize, 2usize, 2usize, 2usize);
+        let a: Vec<Goldilocks> = (0..m * k).map(|_| rng.field()).collect();
+        let b: Vec<Goldilocks> = (0..k * n).map(|_| rng.field()).collect();
+        let d: Vec<Goldilocks> = (0..n * l).map(|_| rng.field()).collect();
+        let mut c = vec![Goldilocks::from_u64(0); m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = Goldilocks::from_u64(0);
+                for kk in 0..k {
+                    acc = acc + a[i * k + kk] * b[kk * n + j];
+                }
+                c[i * n + j] = acc;
+            }
+        }
+        let mut e = vec![Goldilocks::from_u64(0); m * l];
+        for i in 0..m {
+            for ll in 0..l {
+                let mut acc = Goldilocks::from_u64(0);
+                for j in 0..n {
+                    acc = acc + c[i * n + j] * d[j * l + ll];
+                }
+                e[i * l + ll] = acc;
+            }
+        }
+        let r: Vec<Goldilocks> = (0..(m * l).trailing_zeros() as usize).map(|_| rng.field()).collect();
+        let eq2 = crate::mle::eq_evals(&r);
+        let dom = m * k * n * l;
+        let mut eq_b = vec![Goldilocks::from_u64(0); dom];
+        let mut a_b = vec![Goldilocks::from_u64(0); dom];
+        let mut b_b = vec![Goldilocks::from_u64(0); dom];
+        let mut d_b = vec![Goldilocks::from_u64(0); dom];
+        for i in 0..m {
+            for kk in 0..k {
+                for j in 0..n {
+                    for ll in 0..l {
+                        let idx = ((i * k + kk) * n + j) * l + ll;
+                        eq_b[idx] = eq2[i * l + ll];
+                        a_b[idx] = a[i * k + kk];
+                        b_b[idx] = b[kk * n + j];
+                        d_b[idx] = d[j * l + ll];
+                    }
+                }
+            }
+        }
+        let terms = vec![(Goldilocks::from_u64(1), vec![0usize, 1usize, 2usize, 3usize])];
+        let mles: Vec<&[Goldilocks]> = vec![&eq_b, &a_b, &b_b, &d_b];
+        let claimed = crate::mle::eval(&e, &r);
+        let challenges: Vec<Goldilocks> = (0..dom.trailing_zeros() as usize).map(|_| rng.field()).collect();
+        let proof = crate::sumcheck::prove_virtual(&mles, &terms, claimed, &challenges);
+        let final_evals = vec![crate::mle::eval(&eq_b, &challenges), crate::mle::eval(&a_b, &challenges), crate::mle::eval(&b_b, &challenges), crate::mle::eval(&d_b, &challenges)];
+        assert!(crate::sumcheck::verify_virtual(&proof, &terms, claimed, &challenges, &final_evals));
+    }
 }
