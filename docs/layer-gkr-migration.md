@@ -118,15 +118,15 @@ convention throughout, or add a transpose layer.
 | add / residual | arithmetic constraint | layer::compile_add_mul_affine |
 | claim merge | same_poly | same_poly::same_poly_roundtrip |
 
-All of the above are unit-tested (61 lib tests green). No new primitive remains.
-The only UN-demonstrated chaining pattern is matmul -> matmul (attention
-Q -> scores = Q@K^T): the first matmul's output Q is a virtual MLE consumed by
-the second matmul's bilinear reduction. This is a composed bilinear form
-(degree 4 in A,B,D), and it is the last piece before wiring the full attention.
+All of the above are unit-tested (72 lib tests green). No new primitive remains.
+The matmul -> matmul chain (attention Q -> scores = Q@K^T) is implemented as
+`matmul::prove_chain` / `verify_chain`: the first matmul's output C = A@B is a
+virtual MLE consumed by the second matmul E = C@D, proven by two chained
+single-contraction sumchecks (O(n) + O(k) rounds), never committing C. See
+`matmul::tests::nested_chain_roundtrip`.
 
 Remaining (mechanical, no new primitives):
-1. matmul -> matmul chaining (nested virtual reduction).
-2. Wire the full GPT-2 layer (q/k/v/o/fc/proj + attention softmax + residual
+1. Wire the full GPT-2 layer (q/k/v/o/fc/proj + attention softmax + residual
    adds) using the map above.
 3. Rewrite Exec/committed.rs to use the layer circuit (integration).
 4. N-ary tree sharding + agg + layer parallelism + cross-shard binding.
