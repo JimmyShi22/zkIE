@@ -26,6 +26,7 @@ pub mod same_poly;
 pub mod shard;
 pub mod projection;
 pub mod ffn;
+pub mod ffn_chain;
 pub mod softmax_circuit;
 pub mod softmax_scaled;
 pub mod attention;
