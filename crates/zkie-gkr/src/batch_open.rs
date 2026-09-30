@@ -70,6 +70,55 @@ pub fn batch_open(
     evals_ok && sumcheck::verify_sum_of_products(&proof, claimed_sum, &challenges, expected)
 }
 
+/// General multi-point reduction on an *already committed* batch. `table_idxs[i]`
+/// maps the i-th tensor to its table index in the batch (duplicates allowed, so
+/// the same table can be opened at several points). Pays one FRI proof.
+pub fn batch_open_committed(
+    batch: &crate::committed::BatchCtx,
+    table_idxs: &[usize],
+    tensors: &[Vec<Goldilocks>],
+    points: &[Vec<Goldilocks>],
+    claimed: &[Goldilocks],
+    rng: &mut XorShift64,
+) -> bool {
+    let n = tensors.len();
+    assert_eq!(table_idxs.len(), n);
+    assert_eq!(points.len(), n);
+    assert_eq!(claimed.len(), n);
+    let d = tensors[0].len().trailing_zeros() as usize;
+
+    let gamma = rng.field();
+    let mut weights: Vec<Vec<Goldilocks>> = Vec::with_capacity(n);
+    let mut gamma_pow = Goldilocks::ONE;
+    let mut claimed_sum = Goldilocks::ZERO;
+    for i in 0..n {
+        let eq = mle::eq_evals(&points[i]);
+        let w: Vec<Goldilocks> = eq.iter().map(|&x| gamma_pow * x).collect();
+        weights.push(w);
+        claimed_sum = claimed_sum + gamma_pow * claimed[i];
+        gamma_pow = gamma_pow * gamma;
+    }
+
+    let challenges: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let proof = sumcheck::prove_sum_of_products(&weights, tensors, claimed_sum, &challenges);
+
+    let (open_proof, evals) = batch.whir.open_batch_multi(batch.prover_data.clone(), &batch.protocol, batch.num_tables, &challenges);
+    let evals_ok = batch
+        .whir
+        .verify_batch_multi(&batch.commitment, &open_proof, &batch.protocol, batch.num_tables, &challenges)
+        .map(|v| v == evals)
+        .unwrap_or(false);
+
+    let mut expected = Goldilocks::ZERO;
+    let mut gamma_pow = Goldilocks::ONE;
+    for i in 0..n {
+        let eq = mle::eq_poly(&points[i], &challenges);
+        expected = expected + gamma_pow * eq * evals[table_idxs[i]];
+        gamma_pow = gamma_pow * gamma;
+    }
+    evals_ok && sumcheck::verify_sum_of_products(&proof, claimed_sum, &challenges, expected)
+}
+
 /// Open a single committed table at multiple points via the standard
 /// multi-point-to-single-point reduction, paying one FRI proof instead of one
 /// per point. Returns the verified evaluations `f(points[i])` in order.

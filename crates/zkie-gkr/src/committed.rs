@@ -279,12 +279,19 @@ fn prove_product_batch(
     let proof1 = sumcheck::prove3(&eq, &r, &a_norm, c1, &chal);
     let proof2 = sumcheck::prove(&r, &eq_shift, c2, &chal);
 
-    let (chal_open, chal_evals) = prod_batch.whir.open_batch_multi(prod_batch.prover_data.clone(), &prod_batch.protocol, prod_batch.num_tables, &chal);
-    if prod_batch.whir.verify_batch_multi(&prod_batch.commitment, &chal_open, &prod_batch.protocol, prod_batch.num_tables, &chal).unwrap() != chal_evals {
+    let a_chal = mle::eval(&a_norm, &chal);
+    let r_chal = mle::eval(&r, &chal);
+    let zero_point = vec![Goldilocks::ZERO; d];
+    if !crate::batch_open::batch_open_committed(
+        prod_batch,
+        &[0, 1, 1],
+        &[a_norm.clone(), r.clone(), r.clone()],
+        &[chal.clone(), chal.clone(), zero_point],
+        &[a_chal, r_chal, Goldilocks::ONE],
+        rng,
+    ) {
         return false;
     }
-    let a_chal = chal_evals[0];
-    let r_chal = chal_evals[1];
     let eq_r = mle::eval(&eq, &chal);
     let eq_shift_r = mle::eval(&eq_shift, &chal);
     if !sumcheck::verify3(&proof1, c1, &chal, eq_r, r_chal, a_chal)
@@ -293,10 +300,7 @@ fn prove_product_batch(
     {
         return false;
     }
-    let zero_point = vec![Goldilocks::ZERO; d];
-    let (r0_open, r0) = prod_batch.whir.open_batch(prod_batch.prover_data.clone(), &prod_batch.protocol, 1, prod_batch.num_tables, &zero_point);
-    prod_batch.whir.verify_batch(&prod_batch.commitment, &r0_open, &prod_batch.protocol, 1, prod_batch.num_tables, &zero_point).unwrap() == r0
-        && r0 == Goldilocks::ONE
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
