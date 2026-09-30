@@ -941,13 +941,14 @@ pub fn prove_softmax_rows_batch(
     // 4. sum_broadcast = broadcast of sum over columns. big: sb(3); row: sum(1).
     let r3: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
     let r3_row = &r3[dc..];
-    let (sb_open, sb_r) = big_batch.whir.open_batch(big_batch.prover_data.clone(), &big_batch.protocol, 3, big_batch.num_tables, &r3);
+    let (r3_open, r3_evals) = big_batch.whir.open_batch_multi(big_batch.prover_data.clone(), &big_batch.protocol, big_batch.num_tables, &r3);
     let (s2_open, s2_r) = row_batch.whir.open_batch(row_batch.prover_data.clone(), &row_batch.protocol, 1, row_batch.num_tables, r3_row);
-    if big_batch.whir.verify_batch(&big_batch.commitment, &sb_open, &big_batch.protocol, 3, big_batch.num_tables, &r3).unwrap() != sb_r
+    if big_batch.whir.verify_batch_multi(&big_batch.commitment, &r3_open, &big_batch.protocol, big_batch.num_tables, &r3).unwrap() != r3_evals
         || row_batch.whir.verify_batch(&row_batch.commitment, &s2_open, &row_batch.protocol, 1, row_batch.num_tables, r3_row).unwrap() != s2_r
     {
         return false;
     }
+    let sb_r = r3_evals[3];
     if sb_r != s2_r {
         return false;
     }
@@ -969,10 +970,6 @@ pub fn prove_softmax_rows_batch(
     let proof_c1 = sumcheck::prove3(&eq, out_plain, sum_broadcast_plain, c1, &r3);
     let proof_ce = sumcheck::prove(&eq, e_plain, ce, &r3);
     let proof_cr = sumcheck::prove(&eq, &rem, cr, &r3);
-    let (r3_open, r3_evals) = big_batch.whir.open_batch_multi(big_batch.prover_data.clone(), &big_batch.protocol, big_batch.num_tables, &r3);
-    if big_batch.whir.verify_batch_multi(&big_batch.commitment, &r3_open, &big_batch.protocol, big_batch.num_tables, &r3).unwrap() != r3_evals {
-        return false;
-    }
     let o_r = r3_evals[4];
     let e2_r = r3_evals[2];
     let rem_r = r3_evals[6];
