@@ -338,15 +338,26 @@ pub fn prove_lookup_batch(
     }
 
     let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
-    let (x_open, xr) = x_batch.whir.open_batch(x_batch.prover_data.clone(), &x_batch.protocol, x_idx, x_batch.num_tables, &r);
-    let (y_open, yr) = y_batch.whir.open_batch(y_batch.prover_data.clone(), &y_batch.protocol, y_idx, y_batch.num_tables, &r);
-    let (a_open, ar) = a_batch.whir.open_batch(a_batch.prover_data.clone(), &a_batch.protocol, a_idx, a_batch.num_tables, &r);
-    if x_batch.whir.verify_batch(&x_batch.commitment, &x_open, &x_batch.protocol, x_idx, x_batch.num_tables, &r).unwrap() != xr
-        || y_batch.whir.verify_batch(&y_batch.commitment, &y_open, &y_batch.protocol, y_idx, y_batch.num_tables, &r).unwrap() != yr
-        || a_batch.whir.verify_batch(&a_batch.commitment, &a_open, &a_batch.protocol, a_idx, a_batch.num_tables, &r).unwrap() != ar
+    let (xr, yr, ar) = if std::ptr::eq(x_batch as *const BatchCtx, y_batch as *const BatchCtx)
+        && std::ptr::eq(x_batch as *const BatchCtx, a_batch as *const BatchCtx)
     {
-        return false;
-    }
+        let (open, evals) = x_batch.whir.open_batch_multi(x_batch.prover_data.clone(), &x_batch.protocol, x_batch.num_tables, &r);
+        if x_batch.whir.verify_batch_multi(&x_batch.commitment, &open, &x_batch.protocol, x_batch.num_tables, &r).unwrap() != evals {
+            return false;
+        }
+        (evals[x_idx], evals[y_idx], evals[a_idx])
+    } else {
+        let (x_open, xr) = x_batch.whir.open_batch(x_batch.prover_data.clone(), &x_batch.protocol, x_idx, x_batch.num_tables, &r);
+        let (y_open, yr) = y_batch.whir.open_batch(y_batch.prover_data.clone(), &y_batch.protocol, y_idx, y_batch.num_tables, &r);
+        let (a_open, ar) = a_batch.whir.open_batch(a_batch.prover_data.clone(), &a_batch.protocol, a_idx, a_batch.num_tables, &r);
+        if x_batch.whir.verify_batch(&x_batch.commitment, &x_open, &x_batch.protocol, x_idx, x_batch.num_tables, &r).unwrap() != xr
+            || y_batch.whir.verify_batch(&y_batch.commitment, &y_open, &y_batch.protocol, y_idx, y_batch.num_tables, &r).unwrap() != yr
+            || a_batch.whir.verify_batch(&a_batch.commitment, &a_open, &a_batch.protocol, a_idx, a_batch.num_tables, &r).unwrap() != ar
+        {
+            return false;
+        }
+        (xr, yr, ar)
+    };
     if ar != alpha + xr + beta * yr {
         return false;
     }
