@@ -105,3 +105,28 @@ Chaining matmul -> add (`D = C + bias`), only committing A, B, bias, D:
 Point order is the subtle part: C's MLE is indexed n-first (`c_point = v ++ u`),
 so the add's eq selector must be `eq(v ++ u, (j,i))` (n-dim first). Keep this
 convention throughout, or add a transpose layer.
+
+## Wiring map (every GPT-2 op -> demonstrated primitive)
+
+| GPT-2 op | mechanism | test |
+| --- | --- | --- |
+| matmul (projection) | bilinear reduction (virtual MLE, C not committed) | layer::matmul_add_chain_no_commit_c, matmul_affine_chain_no_commit_c |
+| softmax exp / gelu / layernorm rsqrt | logUp fractional lookup | logup_gkr::lookup_fractional_roundtrip |
+| softmax row-sum / layernorm mean | linear reduction (broadcast eq) | layer::row_sum_reduction_virtual |
+| softmax rescale out=round(e*2^16/sum) | product with virtual reduction (broadcast over (i,j,j')) | layer::product_with_virtual_row_sum |
+| affine rounding | arithmetic constraint + logUp range check | layer::affine_round_layer |
+| add / residual | arithmetic constraint | layer::compile_add_mul_affine |
+| claim merge | same_poly | same_poly::same_poly_roundtrip |
+
+All of the above are unit-tested (61 lib tests green). No new primitive remains.
+The only UN-demonstrated chaining pattern is matmul -> matmul (attention
+Q -> scores = Q@K^T): the first matmul's output Q is a virtual MLE consumed by
+the second matmul's bilinear reduction. This is a composed bilinear form
+(degree 4 in A,B,D), and it is the last piece before wiring the full attention.
+
+Remaining (mechanical, no new primitives):
+1. matmul -> matmul chaining (nested virtual reduction).
+2. Wire the full GPT-2 layer (q/k/v/o/fc/proj + attention softmax + residual
+   adds) using the map above.
+3. Rewrite Exec/committed.rs to use the layer circuit (integration).
+4. N-ary tree sharding + agg + layer parallelism + cross-shard binding.
