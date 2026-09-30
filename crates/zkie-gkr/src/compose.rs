@@ -1192,6 +1192,97 @@ pub fn verify_weight_batch(
     ev == mle::eval(tensor, point)
 }
 
+/// A projection block proven with committed weights: the matmul keeps the
+/// intermediate `h = x @ w` virtual (plain GKR claim), but `w` and `bias` are
+/// opened against their global batch commitments at the prescribed claim points.
+pub struct CommittedProjectionProof {
+    pub plain: ProjectionProof,
+    pub w_open: (crate::whir::Proof, Goldilocks),
+    pub bias_open: (crate::whir::Proof, Goldilocks),
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_projection_committed(
+    x: &[Goldilocks],
+    w_batch: &crate::committed::BatchCtx,
+    w_idx: usize,
+    bias_batch: &crate::committed::BatchCtx,
+    bias_idx: usize,
+    w: &[Goldilocks],
+    bias: &[Goldilocks],
+    out: &[Goldilocks],
+    rem: &[Goldilocks],
+    m: usize,
+    k: usize,
+    n: usize,
+    shift: u32,
+    rng: &mut XorShift64,
+) -> CommittedProjectionProof {
+    let plain = prove_projection(x, w, bias, out, rem, m, k, n, shift, rng);
+    // The matmul opens the weight `w` (k x n) at `v ++ ch`.
+    let mut w_pt = plain.v.clone();
+    w_pt.extend_from_slice(&plain.ch);
+    let w_open = w_batch.whir.open_batch(
+        w_batch.prover_data.clone(),
+        &w_batch.protocol,
+        w_idx,
+        w_batch.num_tables,
+        &w_pt,
+    );
+    // The affine opens `bias` (m x n) at `pt = v ++ u`.
+    let bias_open = bias_batch.whir.open_batch(
+        bias_batch.prover_data.clone(),
+        &bias_batch.protocol,
+        bias_idx,
+        bias_batch.num_tables,
+        &plain.pt,
+    );
+    CommittedProjectionProof { plain, w_open, bias_open }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn verify_projection_committed(
+    proof: &CommittedProjectionProof,
+    x: &[Goldilocks],
+    w_batch: &crate::committed::BatchCtx,
+    w_idx: usize,
+    bias_batch: &crate::committed::BatchCtx,
+    bias_idx: usize,
+    w: &[Goldilocks],
+    bias: &[Goldilocks],
+    out: &[Goldilocks],
+    rem: &[Goldilocks],
+    m: usize,
+    k: usize,
+    n: usize,
+    shift: u32,
+) -> bool {
+    if !verify_projection(&proof.plain, x, w, bias, out, rem, m, k, n, shift) {
+        return false;
+    }
+    let mut w_pt = proof.plain.v.clone();
+    w_pt.extend_from_slice(&proof.plain.ch);
+    if w_batch
+        .whir
+        .verify_batch(&w_batch.commitment, &proof.w_open.0, &w_batch.protocol, w_idx, w_batch.num_tables, &w_pt)
+        .ok()
+        != Some(proof.w_open.1)
+        || proof.w_open.1 != mle::eval(w, &w_pt)
+    {
+        return false;
+    }
+    if bias_batch
+        .whir
+        .verify_batch(&bias_batch.commitment, &proof.bias_open.0, &bias_batch.protocol, bias_idx, bias_batch.num_tables, &proof.plain.pt)
+        .ok()
+        != Some(proof.bias_open.1)
+        || proof.bias_open.1 != mle::eval(bias, &proof.plain.pt)
+    {
+        return false;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1502,5 +1593,39 @@ mod tests {
         let mut bad = weights[0].clone();
         bad[0] = bad[0] + Goldilocks::ONE;
         assert!(!verify_weight_batch(&batch, 0, &bad, &point));
+    }
+
+    #[test]
+    fn committed_projection_roundtrip() {
+        use crate::field::PrimeCharacteristicRing;
+        use crate::whir::Whir;
+
+        let mut rng = XorShift64::new(0x1717);
+        let (m, d, shift) = (4usize, 8usize, 8u32);
+        let x: Vec<Goldilocks> = (0..m * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect();
+        let w: Vec<Goldilocks> = (0..d * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect();
+        let bias: Vec<Goldilocks> = (0..m * d).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect();
+        let step = ProjectionStep::new(m, d, d, shift, w.clone(), bias.clone());
+        let (out, rem) = projection_fwd(&x, &step);
+
+        // Weights (d*d) and biases (m*d) are different sizes -> two batches.
+        let whir_w = Whir::new_testing((d * d).trailing_zeros() as usize);
+        let w_batch = commit_weights_batch(&whir_w, &[&w]);
+        let whir_b = Whir::new_testing((m * d).trailing_zeros() as usize);
+        let bias_batch = commit_weights_batch(&whir_b, &[&bias]);
+
+        let proof = prove_projection_committed(
+            &x, &w_batch, 0, &bias_batch, 0, &w, &bias, &out, &rem, m, d, d, shift, &mut rng,
+        );
+        assert!(verify_projection_committed(
+            &proof, &x, &w_batch, 0, &bias_batch, 0, &w, &bias, &out, &rem, m, d, d, shift,
+        ));
+
+        // Wrong weight at the committed index must fail.
+        let mut bad_w = w.clone();
+        bad_w[0] = bad_w[0] + Goldilocks::ONE;
+        assert!(!verify_projection_committed(
+            &proof, &x, &w_batch, 0, &bias_batch, 0, &bad_w, &bias, &out, &rem, m, d, d, shift,
+        ));
     }
 }
