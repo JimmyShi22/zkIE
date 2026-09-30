@@ -635,6 +635,19 @@ pub fn causal_mask(m: usize) -> Vec<Goldilocks> {
         .collect()
 }
 
+/// Piecewise rsqrt-table index for a 2^32-scale LayerNorm variance: the raw
+/// index is `round(var / 2^18)` (2^14 scale); indices below 2^20 are full
+/// resolution, larger ones are quantized with step 2^8.
+pub fn rsqrt_index(var: i64) -> u32 {
+    const FINE: i64 = 1 << 20;
+    let raw = round_div(var, 1 << 18);
+    if raw < FINE {
+        raw.max(0) as u32
+    } else {
+        (FINE + ((raw - FINE) >> 8)) as u32
+    }
+}
+
 /// A shard proof: per-op proofs plus the `same_poly` bindings on every
 /// multiply-consumed activation tensor.
 pub struct OpShardProof {
@@ -2117,5 +2130,16 @@ mod tests {
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
         bad.v[x][0] = bad.v[x][0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
+    }
+
+    #[test]
+    fn rsqrt_index_piecewise() {
+        // Below the fine boundary: raw index = round(var / 2^18).
+        assert_eq!(rsqrt_index(0), 0);
+        assert_eq!(rsqrt_index((1 << 18) / 2), 1);
+        assert_eq!(rsqrt_index((1 << 20) << 18), 1 << 20);
+        // Above the boundary: step 2^8.
+        let var_large = ((1 << 20) + 256) << 18;
+        assert_eq!(rsqrt_index(var_large), (1 << 20) + 1);
     }
 }
