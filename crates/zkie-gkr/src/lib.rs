@@ -32,5 +32,6 @@ pub mod attention;
 pub mod batch_open;
 pub mod whir;
 pub mod autotune;
+pub mod engine;
 
 pub use field::Goldilocks;
