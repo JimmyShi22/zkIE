@@ -25,17 +25,7 @@ pub struct FfnChainProof {
 }
 
 fn mm(a: &[Goldilocks], b: &[Goldilocks], m: usize, k: usize, n: usize) -> Vec<Goldilocks> {
-    let mut c = vec![Goldilocks::ZERO; m * n];
-    for i in 0..m {
-        for j in 0..n {
-            let mut acc = Goldilocks::ZERO;
-            for kk in 0..k {
-                acc = acc + a[i * k + kk] * b[kk * n + j];
-            }
-            c[i * n + j] = acc;
-        }
-    }
-    c
+    crate::par::mm_par(a, b, m, k, n, 64)
 }
 
 fn round_div(a: i64, b: i64) -> i64 {
