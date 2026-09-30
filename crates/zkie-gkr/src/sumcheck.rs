@@ -3,6 +3,7 @@
 //! Proves `H = sum_{x in {0,1}^t} f(x) * h(x)`. Each round polynomial has
 //! degree at most two, so the prover sends three coefficients per round.
 
+use rayon::prelude::*;
 use crate::field::{Field, Goldilocks, PrimeCharacteristicRing};
 use crate::fixed_point::from_i64;
 
@@ -377,30 +378,42 @@ pub fn prove_virtual(
     let mut rounds = Vec::with_capacity(t);
     for &r in challenges {
         let half = bufs[0].len() / 2;
-        let mut pvals = vec![Goldilocks::ZERO; max_deg + 1];
-        for s in 0..half {
-            for (coeff, idxs) in terms {
-                for k in 0..=max_deg {
-                    let mut prod = *coeff;
-                    for &j in idxs {
-                        let f0 = bufs[j][2 * s];
-                        let f1 = bufs[j][2 * s + 1];
-                        let fk = from_i64(k as i64) * f1 - from_i64(k as i64 - 1) * f0;
-                        prod = prod * fk;
+        let pvals: Vec<Goldilocks> = (0..half)
+            .into_par_iter()
+            .map(|s| {
+                let mut p = vec![Goldilocks::ZERO; max_deg + 1];
+                for (coeff, idxs) in terms {
+                    for k in 0..=max_deg {
+                        let mut prod = *coeff;
+                        for &j in idxs {
+                            let f0 = bufs[j][2 * s];
+                            let f1 = bufs[j][2 * s + 1];
+                            let fk = from_i64(k as i64) * f1 - from_i64(k as i64 - 1) * f0;
+                            prod = prod * fk;
+                        }
+                        p[k] = p[k] + prod;
                     }
-                    pvals[k] = pvals[k] + prod;
                 }
-            }
-        }
+                p
+            })
+            .reduce(
+                || vec![Goldilocks::ZERO; max_deg + 1],
+                |mut a, b| {
+                    for i in 0..=max_deg {
+                        a[i] = a[i] + b[i];
+                    }
+                    a
+                },
+            );
         rounds.push(pvals);
-        for j in 0..bufs.len() {
+        bufs.par_iter_mut().for_each(|buf| {
             for s in 0..half {
-                let f0 = bufs[j][2 * s];
-                let f1 = bufs[j][2 * s + 1];
-                bufs[j][s] = (Goldilocks::ONE - r) * f0 + r * f1;
+                let f0 = buf[2 * s];
+                let f1 = buf[2 * s + 1];
+                buf[s] = (Goldilocks::ONE - r) * f0 + r * f1;
             }
-            bufs[j].truncate(half);
-        }
+            buf.truncate(half);
+        });
     }
     let final_evals = bufs.iter().map(|b| b[0]).collect();
     VirtualProof { rounds, final_evals }
