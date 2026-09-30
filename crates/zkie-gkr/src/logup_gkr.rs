@@ -81,6 +81,67 @@ pub fn verify_fractional(proof: &FractionalProof, num: &[Goldilocks], den: &[Gol
     }
     proof.final_num == claimed * proof.final_den
 }
+
+/// Prove `y_i == table[x_i]` for every `i` via the fractional-sumcheck logUp:
+/// `sum_i 1/(alpha+x_i+beta*y_i) = sum_j m_j/(alpha+j+beta*table[j])`, encoded as
+/// a combined fraction list whose sum is 0 and proven with `prove_fractional`.
+/// This replaces the standalone grand-product form (`prove_product`).
+pub fn prove_lookup_fractional(
+    x: &[u32],
+    y: &[Goldilocks],
+    table: &[Goldilocks],
+    alpha: Goldilocks,
+    beta: Goldilocks,
+    rng: &mut XorShift64,
+) -> FractionalProof {
+    assert_eq!(x.len(), y.len());
+    let n = x.len();
+    let t = table.len();
+    let total = (n + t).next_power_of_two();
+    let mut num = vec![Goldilocks::from_u64(0); total];
+    let mut den = vec![Goldilocks::from_u64(1); total];
+    for i in 0..n {
+        num[i] = Goldilocks::from_u64(1);
+        den[i] = alpha + Goldilocks::from_u64(x[i] as u64) + beta * y[i];
+    }
+    let mut m = vec![0u64; t];
+    for &i in x {
+        m[i as usize] += 1;
+    }
+    for j in 0..t {
+        num[n + j] = from_i64(-(m[j] as i64));
+        den[n + j] = alpha + Goldilocks::from_u64(j as u64) + beta * table[j];
+    }
+    prove_fractional(&num, &den, rng)
+}
+pub fn verify_lookup_fractional(
+    proof: &FractionalProof,
+    x: &[u32],
+    y: &[Goldilocks],
+    table: &[Goldilocks],
+    alpha: Goldilocks,
+    beta: Goldilocks,
+) -> bool {
+    assert_eq!(x.len(), y.len());
+    let n = x.len();
+    let t = table.len();
+    let total = (n + t).next_power_of_two();
+    let mut num = vec![Goldilocks::from_u64(0); total];
+    let mut den = vec![Goldilocks::from_u64(1); total];
+    for i in 0..n {
+        num[i] = Goldilocks::from_u64(1);
+        den[i] = alpha + Goldilocks::from_u64(x[i] as u64) + beta * y[i];
+    }
+    let mut m = vec![0u64; t];
+    for &i in x {
+        m[i as usize] += 1;
+    }
+    for j in 0..t {
+        num[n + j] = from_i64(-(m[j] as i64));
+        den[n + j] = alpha + Goldilocks::from_u64(j as u64) + beta * table[j];
+    }
+    verify_fractional(proof, &num, &den, Goldilocks::from_u64(0))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,5 +156,22 @@ mod tests {
         assert!(verify_fractional(&proof, &num, &den, claimed));
         let tampered = FractionalProof { final_num: proof.final_num + Goldilocks::from_u64(1), final_den: proof.final_den, layers: proof.layers };
         assert!(!verify_fractional(&tampered, &num, &den, claimed));
+    }
+    #[test]
+    fn lookup_fractional_roundtrip() {
+        let mut rng = XorShift64::new(0x10AD);
+        let n = 64usize;
+        let t = 16usize;
+        let table: Vec<Goldilocks> = (0..t).map(|_| rng.field()).collect();
+        let x: Vec<u32> = (0..n).map(|_| (rng.next_u64() % t as u64) as u32).collect();
+        let y: Vec<Goldilocks> = x.iter().map(|&i| table[i as usize]).collect();
+        let alpha = rng.field();
+        let beta = rng.field();
+        let proof = prove_lookup_fractional(&x, &y, &table, alpha, beta, &mut rng);
+        assert!(verify_lookup_fractional(&proof, &x, &y, &table, alpha, beta));
+        let mut bad_y = y.clone();
+        bad_y[0] = bad_y[0] + Goldilocks::from_u64(1);
+        let proof_bad = prove_lookup_fractional(&x, &bad_y, &table, alpha, beta, &mut rng);
+        assert!(!verify_lookup_fractional(&proof_bad, &x, &bad_y, &table, alpha, beta));
     }
 }
