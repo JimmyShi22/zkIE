@@ -60,11 +60,37 @@ pub struct Exec {
     bb: BatchBuilder,
     next_group: usize,
     rsqrt_table: Option<Vec<Goldilocks>>,
+    layer_ends: Vec<usize>,
 }
 
 impl Exec {
     pub fn new() -> Self {
-        Exec { plain: Vec::new(), meta: Vec::new(), ops: Vec::new(), bb: BatchBuilder::new(), next_group: 2, rsqrt_table: None }
+        Exec { plain: Vec::new(), meta: Vec::new(), ops: Vec::new(), bb: BatchBuilder::new(), next_group: 2, rsqrt_table: None, layer_ends: Vec::new() }
+    }
+
+    /// Mark the end of the current layer: records the current op count as the
+    /// layer's exclusive upper bound. Returns the layer index (0-based).
+    pub fn finish_layer(&mut self) -> usize {
+        let idx = self.layer_ends.len();
+        self.layer_ends.push(self.ops.len());
+        idx
+    }
+
+    /// Op ranges [start, end) per finished layer, plus any trailing ops as a
+    /// final implicit layer. Layer boundaries are the shard boundaries: the
+    /// tensor(s) produced in one layer and consumed in the next are the
+    /// cross-shard binding points.
+    pub fn layer_spans(&self) -> Vec<(usize, usize)> {
+        let mut spans = Vec::with_capacity(self.layer_ends.len() + 1);
+        let mut start = 0usize;
+        for &end in &self.layer_ends {
+            spans.push((start, end));
+            start = end;
+        }
+        if start < self.ops.len() {
+            spans.push((start, self.ops.len()));
+        }
+        spans
     }
 
     fn fresh_group(&mut self) -> usize {
@@ -657,5 +683,18 @@ mod tests {
 
         let whir = Whir::new_testing(10);
         ex.prove(&whir, &mut rng);
+    }
+
+    #[test]
+    fn ir_layer_spans() {
+        let mut ex = Exec::new();
+        let a: Vec<Goldilocks> = (0..8).map(|_| from_i32(0)).collect();
+        let b: Vec<Goldilocks> = (0..8).map(|_| from_i32(0)).collect();
+        let a_id = ex.input(a, 1);
+        let b_id = ex.input(b, 1);
+        let c_id = ex.matmul(a_id, b_id, 2, 2, 2);
+        ex.finish_layer();
+        let _d = ex.add(c_id, c_id);
+        assert_eq!(ex.layer_spans(), vec![(0, 1), (1, 2)]);
     }
 }
