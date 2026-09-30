@@ -628,6 +628,55 @@ fn prove_linear_nonneg_batch(
     prove_bits_range_batch(bits_batch, &bits, value_at_r, &r, &s, s_r)
 }
 
+
+/// Prove `lhs[i]` is a valid non-negative integer in `[0, 2^32)` using a 16-bit
+/// limb decomposition plus a LogUp lookup per limb, instead of committing
+/// `shift` binary columns. This is the range-check primitive behind
+/// `prove_linear_nonneg*` and `prove_round*`; it cuts the witness from
+/// `shift*n` to `2*n` (plus lookup keys/products).
+fn prove_limbs_range(
+    whir: &Whir,
+    lhs: &[Goldilocks],
+    rng: &mut XorShift64,
+) -> bool {
+    const LIMBS: usize = 2; // 16-bit limbs => 32-bit range
+    let n = lhs.len();
+    let d = n.trailing_zeros() as usize;
+    assert!(n.is_power_of_two());
+
+    let mut limbs: Vec<Vec<Goldilocks>> = vec![vec![Goldilocks::ZERO; n]; LIMBS];
+    for i in 0..n {
+        let v = to_i32(lhs[i]) as i64 as u64;
+        limbs[0][i] = from_i32((v & 0xFFFF) as i32);
+        limbs[1][i] = from_i32(((v >> 16) & 0xFFFF) as i32);
+    }
+    let c_limbs: Vec<Committed> = limbs.iter().map(|l| commit(whir, l)).collect();
+
+    let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+    let value_at_r = mle::eval(lhs, &r);
+    let mut rhs = Goldilocks::ZERO;
+    for (j, c) in c_limbs.iter().enumerate() {
+        let (open, ev) = whir.open(c.prover_data.clone(), &c.protocol, &r);
+        if whir.verify(&c.commitment, &open, &c.protocol, &r).unwrap() != ev {
+            return false;
+        }
+        rhs = rhs + ev * from_i64(1i64 << (16 * j));
+    }
+    if value_at_r != rhs {
+        return false;
+    }
+
+    let table: Vec<Goldilocks> = (0..(1usize << 16)).map(|j| from_i32(j as i32)).collect();
+    for (j, limb) in limbs.iter().enumerate() {
+        let indices: Vec<u32> = limb.iter().map(|&v| to_i32(v) as u32).collect();
+        let alpha = rng.field();
+        let beta = rng.field();
+        if !prove_lookup(whir, &c_limbs[j], limb, whir, &c_limbs[j], limb, &indices, &table, alpha, beta, rng) {
+            return false;
+        }
+    }
+    true
+}
 /// Prove the row-wise softmax over a `n_rows x n_cols` tensor: for each row,
 /// `out[r,c] = round(2^16 * exp(scores[r,c] - c[r]) / sum_c exp(scores[r,c] - c[r]))`.
 /// The output is the probability rescaled to scale 2^16 and rounded half-up
@@ -2314,6 +2363,19 @@ mod tests {
         assert!(prove_matmul_batch(
             &ac, 0, &bctx, 0, &ac, 1, &a, &b, &c, m, k, n, &mut rng,
         ));
+    }
+
+    #[test]
+    fn limbs_range_roundtrip() {
+        let mut rng = XorShift64::new(0xAAAA);
+        let n = 256usize;
+        let whir = Whir::new_testing(n.trailing_zeros() as usize);
+        let lhs: Vec<Goldilocks> = (0..n).map(|_| from_i32((rng.next_u64() % (1u64 << 30)) as i32)).collect();
+        assert!(prove_limbs_range(&whir, &lhs, &mut rng));
+
+        let mut bad = lhs.clone();
+        bad[0] = from_i32(-1);
+        assert!(!prove_limbs_range(&whir, &bad, &mut rng));
     }
 
     #[test]
