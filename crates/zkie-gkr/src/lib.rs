@@ -30,6 +30,7 @@ pub mod ffn_chain;
 pub mod softmax_circuit;
 pub mod softmax_scaled;
 pub mod attention;
+pub mod attention_chain;
 pub mod batch_open;
 pub mod whir;
 pub mod autotune;
