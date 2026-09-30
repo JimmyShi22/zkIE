@@ -19,6 +19,7 @@ pub mod ops;
 pub mod rmsnorm;
 pub mod softmax;
 pub mod sumcheck;
+pub mod logup_gkr;
 pub mod batch_open;
 pub mod whir;
 
