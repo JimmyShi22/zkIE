@@ -25,6 +25,7 @@ pub mod layer;
 pub mod same_poly;
 pub mod projection;
 pub mod ffn;
+pub mod softmax_circuit;
 pub mod batch_open;
 pub mod whir;
 
