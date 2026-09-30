@@ -577,6 +577,24 @@ pub enum Op {
         out: T,
         table_len: usize,
     },
+    /// Correct GPT-2 gelu index: `idx = (to_i64(x) + offset).clamp(0, table_len-1)`.
+    GeluIndex {
+        x: T,
+        out: T,
+        offset: i64,
+        table_len: usize,
+    },
+    /// Numerically-stable softmax index with a causal mask:
+    /// `idx = (to_i64(x + mask) - row_max + offset).clamp(0, table_len-1)`.
+    StableSoftmaxIndex {
+        x: T,
+        mask: T,
+        out: T,
+        offset: i64,
+        table_len: usize,
+        m: usize,
+        n: usize,
+    },
     Layernorm {
         x: T,
         w: T,
@@ -598,7 +616,23 @@ pub enum OpProof {
     Lookup(FractionalProof, Goldilocks, Goldilocks),
     Softmax(SoftmaxScaledProof),
     SoftmaxIndex,
+    GeluIndex,
+    StableSoftmaxIndex,
     Layernorm(LayernormChainProof),
+}
+
+/// Upper-triangular causal mask as field values (`-(1<<30)` for `j > i`).
+pub fn causal_mask(m: usize) -> Vec<Goldilocks> {
+    (0..m * m)
+        .map(|ij| {
+            let (i, j) = (ij / m, ij % m);
+            if j > i {
+                from_i64(-(1i64 << 30))
+            } else {
+                Goldilocks::ZERO
+            }
+        })
+        .collect()
 }
 
 /// A shard proof: per-op proofs plus the `same_poly` bindings on every
@@ -676,6 +710,33 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 let indices: Vec<u32> = store.get(x)
                     .iter()
                     .map(|&s| ((to_i64(s).max(0)) as u64 % table_len as u64) as u32)
+                    .collect();
+                store.idx[out] = indices;
+            }
+            Op::GeluIndex { x, out, offset, table_len } => {
+                let indices: Vec<u32> = store.get(x)
+                    .iter()
+                    .map(|&v| (to_i64(v) + offset).clamp(0, table_len as i64 - 1) as u32)
+                    .collect();
+                store.idx[out] = indices;
+            }
+            Op::StableSoftmaxIndex { x, mask, out, offset, table_len, m, n } => {
+                let xv = store.get(x);
+                let mv = store.get(mask);
+                let masked: Vec<Goldilocks> = xv.iter().zip(mv).map(|(a, b)| *a + *b).collect();
+                let row_max: Vec<Goldilocks> = (0..m)
+                    .map(|i| {
+                        (0..n).fold(masked[i * n], |acc, j| {
+                            let v = masked[i * n + j];
+                            if to_i64(v) > to_i64(acc) { v } else { acc }
+                        })
+                    })
+                    .collect();
+                let indices: Vec<u32> = (0..m * n)
+                    .map(|ij| {
+                        let shifted = to_i64(masked[ij]) - to_i64(row_max[ij / n]);
+                        (shifted + offset).clamp(0, table_len as i64 - 1) as u32
+                    })
                     .collect();
                 store.idx[out] = indices;
             }
@@ -794,6 +855,12 @@ pub fn prove_shard(store: &mut Store, ops: &[Op], boundary: &[T], rng: &mut XorS
             }
             Op::SoftmaxIndex { .. } => {
                 op_proofs.push(OpProof::SoftmaxIndex);
+            }
+            Op::GeluIndex { .. } => {
+                op_proofs.push(OpProof::GeluIndex);
+            }
+            Op::StableSoftmaxIndex { .. } => {
+                op_proofs.push(OpProof::StableSoftmaxIndex);
             }
             Op::Layernorm { x, w, b, out, rsqrt_table, m, d } => {
                 let p = prove_layernorm_chain(
@@ -941,6 +1008,8 @@ pub fn verify_shard(store: &Store, ops: &[Op], proof: &OpShardProof) -> bool {
             (Op::SoftmaxIndex { .. }, OpProof::SoftmaxIndex) => {
                 // No proof: the verifier recomputes `idx = softmax_index(scores)`.
             }
+            (Op::GeluIndex { .. }, OpProof::GeluIndex) => {}
+            (Op::StableSoftmaxIndex { .. }, OpProof::StableSoftmaxIndex) => {}
             (Op::Layernorm { x, w, b, out, rsqrt_table, m, d }, OpProof::Layernorm(lp)) => {
                 if !verify_layernorm_chain(
                     lp,
