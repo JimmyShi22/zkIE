@@ -19,6 +19,10 @@ use crate::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
 use crate::logup_gkr::{prove_lookup_fractional, verify_lookup_fractional, FractionalProof};
 use crate::softmax_scaled::{prove_softmax_scaled, verify_softmax_scaled, SoftmaxScaledProof};
 use crate::layernorm_chain::{prove_layernorm_chain, verify_layernorm_chain, LayernormChainProof};
+use crate::layer_norm_centered::{
+    layer_norm_forward as layer_norm_centered_forward,
+    prove_layer_norm_centered, verify_layer_norm_centered, LayerNormCenteredProof,
+};
 
 fn transpose(a: &[Goldilocks], m: usize, k: usize) -> Vec<Goldilocks> {
     let mut t = vec![Goldilocks::ZERO; k * m];
@@ -604,6 +608,15 @@ pub enum Op {
         m: usize,
         d: usize,
     },
+    LayerNormCentered {
+        x: T,
+        w: T,
+        b: T,
+        out: T,
+        rsqrt_table: T,
+        m: usize,
+        d: usize,
+    },
 }
 
 /// A proof for one op, kept heterogeneous because the primitives have different
@@ -619,6 +632,7 @@ pub enum OpProof {
     GeluIndex,
     StableSoftmaxIndex,
     Layernorm(LayernormChainProof),
+    LayerNormCentered(LayerNormCenteredProof),
 }
 
 /// Upper-triangular causal mask as field values (`-(1<<30)` for `j > i`).
@@ -770,6 +784,11 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 let o: Vec<Goldilocks> = (0..m * d).map(|ij| xv[ij] * scale[ij] + bv[ij]).collect();
                 store.v[out] = o;
             }
+            Op::LayerNormCentered { x, w, b, out, rsqrt_table, m, d } => {
+                let (_, _, _, _, _, o, _, _, _, _, _) =
+                    layer_norm_centered_forward(store.get(x), store.get(w), store.get(b), store.get(rsqrt_table), m, d);
+                store.v[out] = o;
+            }
         }
     }
 }
@@ -887,6 +906,19 @@ pub fn prove_shard(store: &mut Store, ops: &[Op], boundary: &[T], rng: &mut XorS
                 );
                 claims.push((out, p.r_out.clone(), mle::eval(store.get(out), &p.r_out)));
                 op_proofs.push(OpProof::Layernorm(p));
+            }
+            Op::LayerNormCentered { x, w, b, out, rsqrt_table, m, d } => {
+                let p = prove_layer_norm_centered(
+                    store.get(x),
+                    store.get(w),
+                    store.get(b),
+                    store.get(rsqrt_table),
+                    m,
+                    d,
+                    rng,
+                );
+                claims.push((out, p.r_out.clone(), mle::eval(store.get(out), &p.r_out)));
+                op_proofs.push(OpProof::LayerNormCentered(p));
             }
         }
     }
@@ -1025,6 +1057,20 @@ pub fn verify_shard(store: &Store, ops: &[Op], proof: &OpShardProof) -> bool {
             (Op::StableSoftmaxIndex { .. }, OpProof::StableSoftmaxIndex) => {}
             (Op::Layernorm { x, w, b, out, rsqrt_table, m, d }, OpProof::Layernorm(lp)) => {
                 if !verify_layernorm_chain(
+                    lp,
+                    ws.get(*x),
+                    ws.get(*w),
+                    ws.get(*b),
+                    ws.get(*rsqrt_table),
+                    *m,
+                    *d,
+                ) {
+                    return false;
+                }
+                claims.push((*out, lp.r_out.clone(), mle::eval(ws.get(*out), &lp.r_out)));
+            }
+            (Op::LayerNormCentered { x, w, b, out, rsqrt_table, m, d }, OpProof::LayerNormCentered(lp)) => {
+                if !verify_layer_norm_centered(
                     lp,
                     ws.get(*x),
                     ws.get(*w),
