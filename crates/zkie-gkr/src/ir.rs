@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::committed::{affine_raw, layer_norm_raw, prove_add_batch, prove_affine_batch, prove_layer_norm_batch, prove_matmul_batch, prove_relu_batch, prove_lookup_batch, prove_rms_norm_batch, prove_scale_batch, rms_norm_raw, scale_raw, BatchCtx};
+use crate::committed::{affine_raw, layer_norm_raw, prove_add_batch, prove_affine_batch, prove_layer_norm_batch, prove_layer_norm_rows_batch, prove_matmul_batch, prove_relu_batch, prove_lookup_batch, prove_rms_norm_batch, prove_scale_batch, rms_norm_raw, scale_raw, BatchCtx};
 use crate::committed::prove_softmax_rows_batch;
 use crate::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64};
 use crate::fixed_point::{from_i32, from_i64, to_i32, to_i64};
@@ -29,6 +29,7 @@ pub enum Op {
     Relu { x: usize, out: usize, mid_group: (usize, usize), bits_group: (usize, usize), zero_bits_group: (usize, usize), bias: Vec<Goldilocks> },
     RmsNorm { x: usize, raw: usize, weight: Vec<Goldilocks>, n_real: usize },
     LayerNorm { x: usize, raw: usize, weight: Vec<Goldilocks>, n_real: usize },
+    LayerNormRows { x_group: (usize, usize), raw_group: (usize, usize), weight: Vec<Goldilocks>, n_real: usize, n_rows: usize, x_ids: Vec<usize>, raw_ids: Vec<usize> },
     Lookup { x: usize, y: usize, a: usize, prod_group: (usize, usize), indices: Vec<u32>, table: Vec<Goldilocks>, alpha: Goldilocks, beta: Goldilocks },
     Softmax {
         scores: usize,
@@ -70,6 +71,10 @@ impl Exec {
         let g = self.next_group;
         self.next_group += 1;
         g
+    }
+
+    pub fn alloc_group(&mut self) -> usize {
+        self.fresh_group()
     }
 
     pub fn set_rsqrt(&mut self, table: Vec<Goldilocks>) {
@@ -219,6 +224,33 @@ impl Exec {
         let raw_id = self.input(raw, 0);
         self.ops.push(Op::LayerNorm { x, raw: raw_id, weight, n_real });
         raw_id
+    }
+
+    pub fn layer_norm_rows_grouped(&mut self, x: usize, weight: Vec<Goldilocks>, n_real: usize, n_rows: usize) -> Vec<usize> {
+        let rsqrt = self.rsqrt_table.as_ref().expect("set_rsqrt first").clone();
+        let h = self.plain[x].len() / n_rows;
+        const CHUNK: usize = 16;
+        let mut raw_ids = Vec::with_capacity(n_rows);
+        let mut s = 0;
+        while s < n_rows {
+            let end = (s + CHUNK).min(n_rows);
+            let g_x = self.fresh_group();
+            let g_raw = self.fresh_group();
+            let mut x_ids = Vec::with_capacity(end - s);
+            let mut raw_chunk = Vec::with_capacity(end - s);
+            for t in s..end {
+                let row = self.plain[x][t * h..(t + 1) * h].to_vec();
+                let row_id = self.input(row, g_x);
+                let (raw, _, _, _) = layer_norm_raw(&self.plain[row_id], &weight, n_real, &rsqrt);
+                let raw_id = self.input(raw, g_raw);
+                x_ids.push(row_id);
+                raw_chunk.push(raw_id);
+            }
+            self.ops.push(Op::LayerNormRows { x_group: (h, g_x), raw_group: (h, g_raw), weight: weight.clone(), n_real, n_rows: end - s, x_ids, raw_ids: raw_chunk.clone() });
+            raw_ids.extend(raw_chunk);
+            s = end;
+        }
+        raw_ids
     }
 
     pub fn lookup(&mut self, indices: &[u32], table: &[Goldilocks], rng: &mut XorShift64) -> usize {
@@ -456,6 +488,18 @@ impl Exec {
                     let r_b = &batches[&(r_sz, r_g)];
                     assert!(prove_layer_norm_batch(
                         x_b, x_i, &self.plain[*x], r_b, r_i, &self.plain[*raw], weight, *n_real, rsqrt, alpha, beta, rng,
+                    ));
+                }
+                Op::LayerNormRows { x_group, raw_group, weight, n_real, x_ids, raw_ids, .. } => {
+                    let rsqrt = self.rsqrt_table.as_ref().unwrap();
+                    let alpha = rng.field();
+                    let beta = rng.field();
+                    let x_b = &batches[&x_group];
+                    let raw_b = &batches[&raw_group];
+                    let x_plains: Vec<Vec<Goldilocks>> = x_ids.iter().map(|&id| self.plain[id].to_vec()).collect();
+                    let raw_plains: Vec<Vec<Goldilocks>> = raw_ids.iter().map(|&id| self.plain[id].to_vec()).collect();
+                    assert!(prove_layer_norm_rows_batch(
+                        x_b, raw_b, &x_plains, &raw_plains, weight, *n_real, rsqrt, alpha, beta, rng,
                     ));
                 }
                 Op::Affine { x, out, bits_group, bias, shift } => {

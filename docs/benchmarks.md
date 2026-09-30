@@ -236,3 +236,29 @@ Key findings:
 - The remaining ~1200 openings are the matmul A/B/C evaluations: three tensors
   of three different sizes, each opened once per matmul, which cannot be merged
   within a single matmul and are mostly unique across ops.
+
+## GPT-2 124M seq=512 LayerNorm opening aggregation (2026-09-30)
+
+Batched LayerNorm rows into per-chunk groups (16 rows per chunk) so each
+LayerNorm's many per-row openings collapse into a handful of multi-point
+batch openings (`prove_layer_norm_rows_batch` + `batch_open_committed`).
+
+seq=512, 64-thread CPU, `Whir::new_testing`:
+
+| metric | before | after |
+| --- | --- | --- |
+| global_open_count | 53435 | 29435 |
+| wall time | 21.85 min | 33.8 min (incl. ~4 min manual suspend/resume) |
+| peak RSS | 30.1 GB | 30.1 GB |
+| argmax vs ground truth | - | 511/512 (1 near-tie, fixed-point) |
+
+Notes:
+
+- Opening count drops ~45% (LayerNorm rows 2x12800 -> 32 chunks x 2), which
+  lowers verification cost, but prover wall time does not improve: the CPU
+  prover is dominated by the FRI commit over the total witness plus the GKR
+  matmul sumchecks, neither of which the opening count changes.
+- A single all-rows batch (512 tables, 2^19 codeword) was ~10x slower on CPU;
+  chunk=16 keeps each batch at a 2^14 codeword.
+- GPU (`ZKIE_CUDA=1`) is slower still here: the matmul/affine commitments are
+  many and small, so the CUDA Merkle/DFT path is launch-bound.

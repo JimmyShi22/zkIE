@@ -1925,6 +1925,151 @@ pub fn prove_add(
     a_ok && b_ok && c_ok && cv == av + bv
 }
 
+
+/// Prove a whole batch of layer-norm rows with a single multi-point opening
+/// for the x batch and one for the raw batch (instead of one opening per row).
+pub fn prove_layer_norm_rows_batch(
+    x_batch: &BatchCtx,
+    raw_batch: &BatchCtx,
+    x_plains: &[Vec<Goldilocks>],
+    raw_plains: &[Vec<Goldilocks>],
+    weight: &[Goldilocks],
+    n_real: usize,
+    rsqrt_table: &[Goldilocks],
+    alpha: Goldilocks,
+    beta: Goldilocks,
+    rng: &mut XorShift64,
+) -> bool {
+    let n_rows = x_plains.len();
+    assert_eq!(raw_plains.len(), n_rows);
+    let n = weight.len();
+    let d = n.trailing_zeros() as usize;
+    let ones: Vec<Goldilocks> = vec![Goldilocks::ONE; n];
+
+    struct Row {
+        proof_x: sumcheck::SumcheckProof,
+        proof_x2: sumcheck::SumcheckProof,
+        proof_raw: sumcheck::SumcheckProof,
+        proof_xw: sumcheck::SumcheckProof3,
+        proof_w: sumcheck::SumcheckProof,
+        x_r1: Goldilocks,
+        x_r2: Goldilocks,
+        x_r: Goldilocks,
+        raw_r: Goldilocks,
+        s_x_f: Goldilocks,
+        s_x2_f: Goldilocks,
+        mean_f: Goldilocks,
+        rstd: Goldilocks,
+        c_raw: Goldilocks,
+        c_xw: Goldilocks,
+        c_w: Goldilocks,
+        s_r: Goldilocks,
+        w_r: Goldilocks,
+        r1: Vec<Goldilocks>,
+        r2: Vec<Goldilocks>,
+        r: Vec<Goldilocks>,
+    }
+
+    let mut x_idxs: Vec<usize> = Vec::with_capacity(n_rows * 3);
+    let mut x_points: Vec<Vec<Goldilocks>> = Vec::with_capacity(n_rows * 3);
+    let mut x_claimed: Vec<Goldilocks> = Vec::with_capacity(n_rows * 3);
+    let mut x_tensors: Vec<Vec<Goldilocks>> = Vec::with_capacity(n_rows * 3);
+    let mut raw_idxs: Vec<usize> = Vec::with_capacity(n_rows);
+    let mut raw_points: Vec<Vec<Goldilocks>> = Vec::with_capacity(n_rows);
+    let mut raw_claimed: Vec<Goldilocks> = Vec::with_capacity(n_rows);
+    let mut raw_tensors: Vec<Vec<Goldilocks>> = Vec::with_capacity(n_rows);
+    let mut rows: Vec<Row> = Vec::with_capacity(n_rows);
+
+    for (s, (x_plain, raw_plain)) in x_plains.iter().zip(raw_plains).enumerate() {
+        let s_x: i64 = x_plain[..n_real].iter().map(|&v| to_i32(v) as i64).sum();
+        let s_x_f = from_i64(s_x);
+        let mean = div_round(s_x, n_real as i64) as i32;
+        let mean_f = from_i32(mean);
+        let s_x2: i64 = x_plain[..n_real].iter().map(|&v| { let d = to_i32(v) as i64; d * d }).sum();
+        let s_x2_f = from_i64(s_x2);
+        let m = mean as i64;
+        let sqsum = s_x2 - 2 * m * s_x + (n_real as i64) * m * m;
+        let var = div_round(sqsum, n_real as i64);
+        let s_index = rsqrt_index(var);
+        if (s_index as usize) >= rsqrt_table.len() {
+            return false;
+        }
+        let rstd = rsqrt_table[s_index as usize];
+        let lk = lookup::prove(&[s_index], &[rstd], rsqrt_table, alpha, beta);
+        if !lookup::verify(&lk) {
+            return false;
+        }
+
+        let r1: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+        let r2: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+        let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
+        let s_vec = mle::eq_evals(&r);
+
+        let proof_x = sumcheck::prove(x_plain, &ones, s_x_f, &r1);
+        let proof_x2 = sumcheck::prove(x_plain, x_plain, s_x2_f, &r2);
+        let c_raw: Goldilocks = s_vec.iter().zip(raw_plain).fold(Goldilocks::ZERO, |a, (&si, &ri)| a + si * ri);
+        let c_xw: Goldilocks = s_vec.iter().zip(x_plain).zip(weight).fold(Goldilocks::ZERO, |a, ((&si, &xi), &wi)| a + si * xi * wi);
+        let c_w: Goldilocks = s_vec.iter().zip(weight).fold(Goldilocks::ZERO, |a, (&si, &wi)| a + si * wi);
+        let proof_raw = sumcheck::prove(&s_vec, raw_plain, c_raw, &r);
+        let proof_xw = sumcheck::prove3(&s_vec, x_plain, weight, c_xw, &r);
+        let proof_w = sumcheck::prove(&s_vec, weight, c_w, &r);
+
+        let x_r1 = mle::eval(x_plain, &r1);
+        let x_r2 = mle::eval(x_plain, &r2);
+        let x_r = mle::eval(x_plain, &r);
+        let raw_r = mle::eval(raw_plain, &r);
+        let s_r = mle::eval(&s_vec, &r);
+        let w_r = mle::eval(weight, &r);
+
+        for (p, claimed) in [(r1.clone(), x_r1), (r2.clone(), x_r2), (r.clone(), x_r)] {
+            x_idxs.push(s);
+            x_points.push(p);
+            x_claimed.push(claimed);
+            x_tensors.push(x_plain.clone());
+        }
+        raw_idxs.push(s);
+        raw_points.push(r.clone());
+        raw_claimed.push(raw_r);
+        raw_tensors.push(raw_plain.clone());
+
+        rows.push(Row {
+            proof_x, proof_x2, proof_raw, proof_xw, proof_w,
+            x_r1, x_r2, x_r, raw_r,
+            s_x_f, s_x2_f, mean_f, rstd, c_raw, c_xw, c_w, s_r, w_r,
+            r1, r2, r,
+        });
+    }
+
+    if !crate::batch_open::batch_open_committed(x_batch, &x_idxs, &x_tensors, &x_points, &x_claimed, rng) {
+        return false;
+    }
+    if !crate::batch_open::batch_open_committed(raw_batch, &raw_idxs, &raw_tensors, &raw_points, &raw_claimed, rng) {
+        return false;
+    }
+
+    for row in &rows {
+        if !sumcheck::verify(&row.proof_x, row.s_x_f, &row.r1, row.x_r1, Goldilocks::ONE) {
+            return false;
+        }
+        if !sumcheck::verify(&row.proof_x2, row.s_x2_f, &row.r2, row.x_r2, row.x_r2) {
+            return false;
+        }
+        if !sumcheck::verify(&row.proof_raw, row.c_raw, &row.r, row.s_r, row.raw_r) {
+            return false;
+        }
+        if !sumcheck::verify3(&row.proof_xw, row.c_xw, &row.r, row.s_r, row.x_r, row.w_r) {
+            return false;
+        }
+        if !sumcheck::verify(&row.proof_w, row.c_w, &row.r, row.s_r, row.w_r) {
+            return false;
+        }
+        if row.c_raw != row.rstd * (row.c_xw - row.mean_f * row.c_w) {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

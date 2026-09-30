@@ -10,7 +10,7 @@ const H_PAD: usize = 1024;
 const FFN_PAD: usize = 4096;
 const VOCAB_PAD: usize = 65536;
 const VOCAB: usize = 50257;
-const SEQ: usize = 16;
+const SEQ: usize = 512;
 const HEADS: usize = 12;
 const HEADS_PAD: usize = 16;
 const HDIM: usize = 64;
@@ -82,12 +82,9 @@ fn layer_norm_rows_ir(
     n_real: usize,
     n_rows: usize,
 ) -> usize {
-    let h = ex.get(x).len() / n_rows;
+    let raw_ids = ex.layer_norm_rows_grouped(x, weight.to_vec(), n_real, n_rows);
     let mut out = Vec::with_capacity(ex.get(x).len());
-    for s in 0..n_rows {
-        let row = ex.get(x)[s * h..(s + 1) * h].to_vec();
-        let row_id = ex.input(row, 0);
-        let raw_id = ex.layer_norm(row_id, weight.to_vec(), n_real);
+    for raw_id in raw_ids {
         let out_id = ex.affine(raw_id, bias.to_vec(), 32);
         out.extend_from_slice(ex.get(out_id));
     }
@@ -214,7 +211,7 @@ fn main() {
         );
         x = x_new;
         ex_li.prove(&whir, &mut rng);
-        println!("layer {li} proved");
+        eprintln!("layer {li} proved");
     }
 
     let (ex_f, logits) = forward_final(&x, &rsqrt_table, &stack);
