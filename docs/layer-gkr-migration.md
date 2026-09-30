@@ -130,3 +130,25 @@ Remaining (mechanical, no new primitives):
    adds) using the map above.
 3. Rewrite Exec/committed.rs to use the layer circuit (integration).
 4. N-ary tree sharding + agg + layer parallelism + cross-shard binding.
+
+## Benchmarks at GPT-2 scale (layer circuit, plain model, single-threaded)
+
+Examples in `crates/zkie-gkr/examples/`:
+
+| block | dims | time |
+| --- | --- | --- |
+| projection (matmul + affine + logUp) | 512x1024x1024 | 2.06s |
+| full FFN (2 projections + gelu) | 512x1024x4096 + 512x4096x1024 | 18.55s |
+| softmax (exp lookup + row-sum) | seq=512, table 2^18 | 0.14s |
+
+Findings:
+- softmax is cheap (0.14s); the dominant cost is the projection affine + logUp
+  range check (O(m*n) elementwise sumcheck + fraction tree), not the matmul GKR
+  (O(contraction dim), ~0.03s).
+- Full layer extrapolation: attention (~6s projections + ~1.7s softmax) + FFN
+  (18.55s) + layernorm (~1s) ~= 27s/layer, ~5.4 min for 12 layers, ~3.5x faster
+  than the op-granularity 19.6 min.
+- Caveats: plain model (affine base tensors not WHIR-committed, only the logUp
+  fraction tree is); single-threaded; real gelu/exp tables are 2^21..2^23 (the
+  bench used 2^16..2^18). N-ary sharding + layer parallelism + GPU are still to
+  be added on top.
