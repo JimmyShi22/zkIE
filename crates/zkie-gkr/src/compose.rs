@@ -1034,6 +1034,125 @@ pub fn committed_cross_bind(
     Some(prove_same_poly(tensor, claims, rng))
 }
 
+/// Verify a [`committed_cross_bind`] proof: open each claim against the
+/// commitment, then verify the merged `same_poly`.
+pub fn verify_committed_cross_bind(
+    whir: &crate::whir::Whir,
+    committed: &crate::committed::Committed,
+    tensor: &[Goldilocks],
+    claims: &[(Vec<Goldilocks>, Goldilocks)],
+    proof: &SamePolyProof,
+) -> bool {
+    for (pt, expected) in claims {
+        let (open, opened) = whir.open(committed.prover_data.clone(), &committed.protocol, pt);
+        if whir
+            .verify(&committed.commitment, &open, &committed.protocol, pt)
+            .ok()
+            != Some(opened)
+        {
+            return false;
+        }
+        if opened != *expected || opened != mle::eval(tensor, pt) {
+            return false;
+        }
+    }
+    verify_same_poly(proof, tensor, claims).is_some()
+}
+
+/// A committed shard-DAG proof: every shard proven as before (plain sumchecks,
+/// virtual intermediates), plus a WHIR commitment per cross-shard boundary tensor
+/// and a committed cross-shard binding. Only boundary tensors are committed; this
+/// is the "only shard boundaries + global weights commit" model.
+pub struct CommittedShardDagProof {
+    pub shards: Vec<OpShardProof>,
+    pub boundary_tensors: Vec<T>,
+    pub boundary_commitments: Vec<crate::committed::Committed>,
+    pub cross_binds: Vec<SamePolyProof>,
+}
+
+pub fn prove_committed_shard_dag(
+    store: &mut Store,
+    ops: &[Op],
+    ops_per_shard: usize,
+    whir: &crate::whir::Whir,
+    rng: &mut XorShift64,
+) -> CommittedShardDagProof {
+    let plain = prove_shard_dag(store, ops, ops_per_shard, rng);
+    let boundary_tensors = plain.cross_tensors.clone();
+
+    let mut boundary_commitments = Vec::with_capacity(boundary_tensors.len());
+    for &t in &boundary_tensors {
+        boundary_commitments.push(crate::committed::commit(whir, store.get(t)));
+    }
+
+    let mut cross_binds = Vec::with_capacity(boundary_tensors.len());
+    for (i, &t) in boundary_tensors.iter().enumerate() {
+        let mut claims = Vec::new();
+        for shard in &plain.shards {
+            for (tt, pt, ev) in &shard.claims {
+                if *tt == t {
+                    claims.push((pt.clone(), *ev));
+                }
+            }
+        }
+        let sp = committed_cross_bind(whir, &boundary_commitments[i], store.get(t), &claims, rng)
+            .expect("honest committed bind");
+        cross_binds.push(sp);
+    }
+
+    CommittedShardDagProof {
+        shards: plain.shards,
+        boundary_tensors,
+        boundary_commitments,
+        cross_binds,
+    }
+}
+
+pub fn verify_committed_shard_dag(
+    store: &Store,
+    ops: &[Op],
+    ops_per_shard: usize,
+    whir: &crate::whir::Whir,
+    proof: &CommittedShardDagProof,
+) -> bool {
+    let ranges = shard_ranges(ops.len(), ops_per_shard);
+    if proof.shards.len() != ranges.len()
+        || proof.boundary_tensors.len() != proof.boundary_commitments.len()
+        || proof.boundary_tensors.len() != proof.cross_binds.len()
+    {
+        return false;
+    }
+    for (i, (s, e)) in ranges.iter().enumerate() {
+        if !verify_shard(store, &ops[*s..*e], &proof.shards[i]) {
+            return false;
+        }
+    }
+
+    let mut ws = Store { v: store.v.clone(), idx: store.idx.clone() };
+    forward_ops(&mut ws, ops);
+
+    for (i, &t) in proof.boundary_tensors.iter().enumerate() {
+        let mut claims = Vec::new();
+        for shard in &proof.shards {
+            for (tt, pt, ev) in &shard.claims {
+                if *tt == t {
+                    claims.push((pt.clone(), *ev));
+                }
+            }
+        }
+        if !verify_committed_cross_bind(
+            whir,
+            &proof.boundary_commitments[i],
+            ws.get(t),
+            &claims,
+            &proof.cross_binds[i],
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1279,5 +1398,45 @@ mod tests {
             (p1.clone(), mle::eval(&f, &p1)),
         ];
         assert!(committed_cross_bind(&whir, &c, &f, &bad, &mut rng).is_none());
+    }
+
+    #[test]
+    fn committed_shard_dag_roundtrip() {
+        use crate::field::PrimeCharacteristicRing;
+        use crate::whir::Whir;
+
+        let mut rng = XorShift64::new(0x1515);
+        let (m, d, shift) = (4usize, 8usize, 8u32);
+        let mut store = Store::new();
+        let x = store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let mut ws = Vec::new();
+        let mut bs = Vec::new();
+        for _ in 0..4 {
+            ws.push(store.push((0..d * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect()));
+            bs.push(store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect()));
+        }
+        let mut outs = Vec::new();
+        let mut rems = Vec::new();
+        for _ in 0..4 {
+            outs.push(store.push(vec![]));
+            rems.push(store.push(vec![]));
+        }
+        let ops = vec![
+            Op::Projection { x, w: ws[0], bias: bs[0], out: outs[0], rem: rems[0], m, k: d, n: d, shift },
+            Op::Projection { x: outs[0], w: ws[1], bias: bs[1], out: outs[1], rem: rems[1], m, k: d, n: d, shift },
+            Op::Projection { x: outs[1], w: ws[2], bias: bs[2], out: outs[2], rem: rems[2], m, k: d, n: d, shift },
+            Op::Projection { x: outs[2], w: ws[3], bias: bs[3], out: outs[3], rem: rems[3], m, k: d, n: d, shift },
+        ];
+
+        let whir = Whir::new_testing(5); // m*d = 32 = 2^5
+        let proof = prove_committed_shard_dag(&mut store, &ops, 2, &whir, &mut rng);
+        assert_eq!(proof.boundary_tensors.len(), 1);
+        assert_eq!(proof.boundary_commitments.len(), 1);
+        assert_eq!(proof.cross_binds.len(), 1);
+        assert!(verify_committed_shard_dag(&store, &ops, 2, &whir, &proof));
+
+        let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
+        bad.v[ws[1]][0] = bad.v[ws[1]][0] + Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag(&bad, &ops, 2, &whir, &proof));
     }
 }
