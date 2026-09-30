@@ -7,6 +7,16 @@
 //! matmul verifier needs for the two sum-check evaluations it would otherwise
 //! recompute in `O(k)`.
 
+/// Global count of FRI opening proofs across all Whir instances (batch Whirs are
+/// transient, so per-instance stats do not accumulate). Used for telemetry.
+static GLOBAL_OPEN_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Total number of FRI opening proofs produced so far in this process.
+pub fn global_open_count() -> u64 {
+    GLOBAL_OPEN_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+
 use p3_challenger::DuplexChallenger;
 use p3_commit::MultilinearPcs;
 use p3_dft::Radix2DFTSmallBatch;
@@ -447,6 +457,7 @@ impl Whir {
         let opened = proof.evals[0].current()[0];
         let (n, secs) = self.open_stats.get();
         self.open_stats.set((n + 1, secs + t0.elapsed().as_secs_f64()));
+        GLOBAL_OPEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         (proof, opened.as_base().expect("base-field MLE opens to a base element"))
     }
 
@@ -480,6 +491,7 @@ impl Whir {
         num_tables: usize,
         point: &[Goldilocks],
     ) -> (Proof, Goldilocks) {
+        let t0 = std::time::Instant::now();
         let arity = point.len();
         let target = to_ef_point(point);
         let dummy = Point::new(vec![EF::from(Goldilocks::new(0)); arity]);
@@ -493,6 +505,9 @@ impl Whir {
             &mut self.fresh_challenger(),
         );
         let opened = proof.evals[table_index].current()[0];
+        let (n, secs) = self.open_stats.get();
+        self.open_stats.set((n + 1, secs + t0.elapsed().as_secs_f64()));
+        GLOBAL_OPEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         (proof, opened.as_base().expect("base-field MLE opens to a base element"))
     }
 
@@ -533,6 +548,7 @@ impl Whir {
         num_tables: usize,
         point: &[Goldilocks],
     ) -> (Proof, Vec<Goldilocks>) {
+        let t0 = std::time::Instant::now();
         let target = to_ef_point(point);
         let points: Vec<Point<EF>> = (0..num_tables).map(|_| target.clone()).collect();
         let proof = self.pcs.open_at(
@@ -546,6 +562,9 @@ impl Whir {
             .iter()
             .map(|e| e.current()[0].as_base().expect("base-field MLE opens to a base element"))
             .collect();
+        let (n, secs) = self.open_stats.get();
+        self.open_stats.set((n + 1, secs + t0.elapsed().as_secs_f64()));
+        GLOBAL_OPEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         (proof, opened)
     }
 

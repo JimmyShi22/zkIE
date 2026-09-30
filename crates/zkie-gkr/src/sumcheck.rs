@@ -28,7 +28,7 @@ pub struct SumcheckProof {
 
 const INV2: Goldilocks = Goldilocks::new(crate::field::P / 2 + 1); // (p + 1) / 2
 
-pub fn prove(f: &[Goldilocks], h: &[Goldilocks], _claimed_sum: Goldilocks, challenges: &[Goldilocks]) -> SumcheckProof {
+pub fn prove(f: &[Goldilocks], h: &[Goldilocks], _claimed_sum: Goldilocks, #[allow(unused_variables)] challenges: &[Goldilocks]) -> SumcheckProof {
     let t = f.len().trailing_zeros() as usize;
     assert_eq!(f.len(), 1 << t, "f length must be a power of two");
     assert_eq!(h.len(), f.len());
@@ -83,7 +83,7 @@ fn fold(buf: &mut Vec<Goldilocks>, p: Goldilocks) {
 
 pub fn verify(
     proof: &SumcheckProof,
-    claimed_sum: Goldilocks,
+    claimed_sum: Goldilocks, #[allow(unused_variables)]
     challenges: &[Goldilocks],
     f_eval: Goldilocks,
     h_eval: Goldilocks,
@@ -156,7 +156,7 @@ pub fn prove3(
     f: &[Goldilocks],
     g: &[Goldilocks],
     h: &[Goldilocks],
-    _claimed_sum: Goldilocks,
+    _claimed_sum: Goldilocks, #[allow(unused_variables)]
     challenges: &[Goldilocks],
 ) -> SumcheckProof3 {
     let t = f.len().trailing_zeros() as usize;
@@ -203,7 +203,7 @@ pub fn prove3(
 
 pub fn verify3(
     proof: &SumcheckProof3,
-    claimed_sum: Goldilocks,
+    claimed_sum: Goldilocks, #[allow(unused_variables)]
     challenges: &[Goldilocks],
     f_eval: Goldilocks,
     g_eval: Goldilocks,
@@ -222,6 +222,84 @@ pub fn verify3(
         prev = rp.eval(r);
     }
     prev == f_eval * g_eval * h_eval
+}
+
+
+/// Sum-check proof for `H = sum_x sum_i w_i(x) * v_i(x)` (a sum of products of
+/// two multilinears), used by the multi-point-to-one-point batch opening.
+#[derive(Clone, Debug)]
+pub struct SumcheckProofBatch {
+    pub rounds: Vec<RoundPoly>,
+    pub b_eval: Goldilocks,
+}
+
+/// Prove `sum_x sum_i weights[i][x] * values[i][x] == claimed_sum`.
+pub fn prove_sum_of_products(
+    weights: &[Vec<Goldilocks>],
+    values: &[Vec<Goldilocks>],
+    claimed_sum: Goldilocks, #[allow(unused_variables)]
+    challenges: &[Goldilocks],
+) -> SumcheckProofBatch {
+    let n = weights.len();
+    assert!(n > 0, "empty batch");
+    assert_eq!(values.len(), n);
+    let t = weights[0].len().trailing_zeros() as usize;
+    assert_eq!(challenges.len(), t, "challenge count mismatch");
+    let mut w_bufs = weights.to_vec();
+    let mut v_bufs = values.to_vec();
+    let mut rounds = Vec::with_capacity(t);
+    for &r in challenges {
+        let half = w_bufs[0].len() / 2;
+        let mut p0 = Goldilocks::ZERO;
+        let mut p1 = Goldilocks::ZERO;
+        let mut p2 = Goldilocks::ZERO;
+        for i in 0..n {
+            let w = &w_bufs[i];
+            let v = &v_bufs[i];
+            for s in 0..half {
+                let (w0, w1) = (w[2 * s], w[2 * s + 1]);
+                let (v0, v1) = (v[2 * s], v[2 * s + 1]);
+                p0 = p0 + w0 * v0;
+                p1 = p1 + w1 * v1;
+                let w2 = Goldilocks::TWO * w1 - w0;
+                let v2 = Goldilocks::TWO * v1 - v0;
+                p2 = p2 + w2 * v2;
+            }
+        }
+        let c0 = p0;
+        let c1 = (Goldilocks::from_u64(4) * p1 - p2 - Goldilocks::from_u64(3) * p0) * INV2;
+        let c2 = (p2 - Goldilocks::TWO * p1 + p0) * INV2;
+        rounds.push(RoundPoly { c0, c1, c2 });
+        for i in 0..n {
+            fold(&mut w_bufs[i], r);
+            fold(&mut v_bufs[i], r);
+        }
+    }
+    let b_eval = (0..n).fold(Goldilocks::ZERO, |acc, i| acc + w_bufs[i][0] * v_bufs[i][0]);
+    SumcheckProofBatch { rounds, b_eval }
+}
+
+/// Verify the sum-of-products sumcheck. `expected_b_eval` is the independent
+/// recomputation of `B(r)` from the opened `f_i(r)` values.
+pub fn verify_sum_of_products(
+    proof: &SumcheckProofBatch,
+    claimed_sum: Goldilocks, #[allow(unused_variables)]
+    challenges: &[Goldilocks],
+    expected_b_eval: Goldilocks,
+) -> bool {
+    if proof.rounds.len() != challenges.len() {
+        return false;
+    }
+    let mut prev = claimed_sum;
+    for (rp, r) in proof.rounds.iter().zip(challenges.iter().copied()) {
+        let p0 = rp.c0;
+        let p1 = rp.c0 + rp.c1 + rp.c2;
+        if p0 + p1 != prev {
+            return false;
+        }
+        prev = rp.eval(r);
+    }
+    prev == proof.b_eval && proof.b_eval == expected_b_eval
 }
 
 #[cfg(test)]

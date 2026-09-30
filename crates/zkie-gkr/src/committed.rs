@@ -279,14 +279,12 @@ fn prove_product_batch(
     let proof1 = sumcheck::prove3(&eq, &r, &a_norm, c1, &chal);
     let proof2 = sumcheck::prove(&r, &eq_shift, c2, &chal);
 
-    let (a_open, a_chal) = prod_batch.whir.open_batch(prod_batch.prover_data.clone(), &prod_batch.protocol, 0, prod_batch.num_tables, &chal);
-    let (r_open, r_chal) = prod_batch.whir.open_batch(prod_batch.prover_data.clone(), &prod_batch.protocol, 1, prod_batch.num_tables, &chal);
-    if prod_batch.whir.verify_batch(&prod_batch.commitment, &a_open, &prod_batch.protocol, 0, prod_batch.num_tables, &chal).unwrap() != a_chal {
+    let (chal_open, chal_evals) = prod_batch.whir.open_batch_multi(prod_batch.prover_data.clone(), &prod_batch.protocol, prod_batch.num_tables, &chal);
+    if prod_batch.whir.verify_batch_multi(&prod_batch.commitment, &chal_open, &prod_batch.protocol, prod_batch.num_tables, &chal).unwrap() != chal_evals {
         return false;
     }
-    if prod_batch.whir.verify_batch(&prod_batch.commitment, &r_open, &prod_batch.protocol, 1, prod_batch.num_tables, &chal).unwrap() != r_chal {
-        return false;
-    }
+    let a_chal = chal_evals[0];
+    let r_chal = chal_evals[1];
     let eq_r = mle::eval(&eq, &chal);
     let eq_shift_r = mle::eval(&eq_shift, &chal);
     if !sumcheck::verify3(&proof1, c1, &chal, eq_r, r_chal, a_chal)
@@ -951,15 +949,13 @@ pub fn prove_softmax_rows_batch(
     let proof_c1 = sumcheck::prove3(&eq, out_plain, sum_broadcast_plain, c1, &r3);
     let proof_ce = sumcheck::prove(&eq, e_plain, ce, &r3);
     let proof_cr = sumcheck::prove(&eq, &rem, cr, &r3);
-    let (o_open, o_r) = big_batch.whir.open_batch(big_batch.prover_data.clone(), &big_batch.protocol, 4, big_batch.num_tables, &r3);
-    let (e2_open, e2_r) = big_batch.whir.open_batch(big_batch.prover_data.clone(), &big_batch.protocol, 2, big_batch.num_tables, &r3);
-    let (rem_open, rem_r) = big_batch.whir.open_batch(big_batch.prover_data.clone(), &big_batch.protocol, 6, big_batch.num_tables, &r3);
-    if big_batch.whir.verify_batch(&big_batch.commitment, &o_open, &big_batch.protocol, 4, big_batch.num_tables, &r3).unwrap() != o_r
-        || big_batch.whir.verify_batch(&big_batch.commitment, &e2_open, &big_batch.protocol, 2, big_batch.num_tables, &r3).unwrap() != e2_r
-        || big_batch.whir.verify_batch(&big_batch.commitment, &rem_open, &big_batch.protocol, 6, big_batch.num_tables, &r3).unwrap() != rem_r
-    {
+    let (r3_open, r3_evals) = big_batch.whir.open_batch_multi(big_batch.prover_data.clone(), &big_batch.protocol, big_batch.num_tables, &r3);
+    if big_batch.whir.verify_batch_multi(&big_batch.commitment, &r3_open, &big_batch.protocol, big_batch.num_tables, &r3).unwrap() != r3_evals {
         return false;
     }
+    let o_r = r3_evals[4];
+    let e2_r = r3_evals[2];
+    let rem_r = r3_evals[6];
     if !sumcheck::verify3(&proof_c1, c1, &r3, eq_r, o_r, sb_r)
         || !sumcheck::verify(&proof_ce, ce, &r3, eq_r, e2_r)
         || !sumcheck::verify(&proof_cr, cr, &r3, eq_r, rem_r)

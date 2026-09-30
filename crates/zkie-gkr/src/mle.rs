@@ -54,6 +54,18 @@ pub fn eq_evals(r: &[Goldilocks]) -> Vec<Goldilocks> {
     eq
 }
 
+
+/// Evaluate the equality polynomial `eq(r, x) = prod_j (x_j r_j + (1-x_j)(1-r_j))`
+/// at a single point `x`. Used by the multi-point batch opening.
+pub fn eq_poly(r: &[Goldilocks], x: &[Goldilocks]) -> Goldilocks {
+    assert_eq!(r.len(), x.len());
+    r.iter()
+        .zip(x)
+        .fold(Goldilocks::ONE, |acc, (&ri, &xi)| {
+            acc * (xi * ri + (Goldilocks::ONE - xi) * (Goldilocks::ONE - ri))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
