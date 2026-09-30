@@ -192,3 +192,47 @@ seq=512 fix:
 
 The wall-clock bottleneck is WHIR FRI opening (60% of wall time), the same
 bottleneck as TimesFM, not the GKR sumcheck.
+
+## GPT-2 124M opening reduction (2026-09-30)
+
+Optimized the GPT-2 124M seq=16 proof (IR two-phase executor, `prove_gpt2_ir`)
+by reducing the number of WHIR opening proofs. Results verified against the
+reference argmax.
+
+Machine: 64-thread CPU, 3x NVIDIA L20, 495 GB RAM, release build.
+
+| Metric | Before | After | Change |
+|---|---|---|---|
+| WHIR openings | 5659 | 3835 | -32.2% |
+| CPU wall time | 53.1 s | 48.5 s | -9% |
+| Peak host memory | 16.2 GB | 6.1 GB | -62% |
+| GPU wall time | - | 72.9 s | launch-bound |
+
+Two kinds of opening reduction, with very different payoff:
+
+- **Same-point merge** (different tables opened at one point via
+  `open_batch_multi`): affine in/out, lookup x/y/a, softmax steps. Saves only
+  the per-proof fixed overhead, so the wall-time gain is small.
+- **Single-table multi-point reduction** (the same table opened at several
+  different points, reduced to one FRI proof plus one sum-of-products
+  sumcheck): the real win. LayerNorm opens `x` at three points per row; merging
+  them cut 800 openings (-17%). Implemented as `open_table_multi_point` and
+  `batch_open_committed` in `zkie_gkr::batch_open`.
+
+Other changes:
+
+- Streaming per-layer proof (`prove_gpt2_ir`): forward + prove each layer with
+  a fresh executor, dropping it before the next layer, cutting peak memory from
+  16.2 GB to 6.1 GB.
+- Fixed a double-count in `GLOBAL_OPEN_COUNT` (was reporting 2x the real opens).
+- `CudaDft` now falls back to the CPU DFT for codewords larger than the fixed
+  twiddle buffer (MAX_LG), instead of panicking (e.g. the 2^26 lm_head weight).
+
+Key findings:
+
+- At seq=16 the codewords are small, so the GPU is launch/transfer-bound and
+  slower than the 64-thread CPU (72.9 s vs 48.5 s). GPU acceleration is expected
+  to win at larger sequence lengths / models where the codewords are bigger.
+- The remaining ~1200 openings are the matmul A/B/C evaluations: three tensors
+  of three different sizes, each opened once per matmul, which cannot be merged
+  within a single matmul and are mostly unique across ops.
