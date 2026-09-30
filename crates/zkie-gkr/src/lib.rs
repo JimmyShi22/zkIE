@@ -38,5 +38,7 @@ pub mod batch_open;
 pub mod whir;
 pub mod autotune;
 pub mod engine;
+pub mod claim;
+pub mod compose;
 
 pub use field::Goldilocks;
