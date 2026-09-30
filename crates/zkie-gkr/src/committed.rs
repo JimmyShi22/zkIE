@@ -586,28 +586,16 @@ fn prove_linear_nonneg_batch(
     y_batch: &BatchCtx,
     y_idx: usize,
     y_plain: &[Goldilocks],
-    bits_batch: &BatchCtx,
     a: Goldilocks,
     b: Goldilocks,
     rng: &mut XorShift64,
 ) -> bool {
-    const BITS: usize = 31;
     let n = x_plain.len();
     let d = n.trailing_zeros() as usize;
     assert_eq!(y_plain.len(), n);
 
     let lhs: Vec<Goldilocks> = x_plain.iter().zip(y_plain).map(|(&xv, &yv)| a * xv + b * yv).collect();
-    let mut bits: Vec<Vec<Goldilocks>> = vec![vec![Goldilocks::ZERO; n]; BITS];
-    for i in 0..n {
-        let v = to_i32(lhs[i]) as i64 as u64;
-        for (j, bj) in bits.iter_mut().enumerate() {
-            bj[i] = from_i32(((v >> j) & 1) as i32);
-        }
-    }
-
     let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
-    let s = mle::eq_evals(&r);
-    let s_r = mle::eval(&s, &r);
     let (x_r, y_r) = if std::ptr::eq(x_batch as *const BatchCtx, y_batch as *const BatchCtx) {
         let (open, evals) = x_batch.whir.open_batch_multi(x_batch.prover_data.clone(), &x_batch.protocol, x_batch.num_tables, &r);
         if x_batch.whir.verify_batch_multi(&x_batch.commitment, &open, &x_batch.protocol, x_batch.num_tables, &r).unwrap() != evals {
@@ -625,7 +613,7 @@ fn prove_linear_nonneg_batch(
         (x_r, y_r)
     };
     let value_at_r = a * x_r + b * y_r;
-    prove_bits_range_batch(bits_batch, &bits, value_at_r, &r, &s, s_r)
+    prove_limbs_range(&lhs, value_at_r, &r, rng)
 }
 
 
@@ -635,14 +623,15 @@ fn prove_linear_nonneg_batch(
 /// `prove_linear_nonneg*` and `prove_round*`; it cuts the witness from
 /// `shift*n` to `2*n` (plus lookup keys/products).
 fn prove_limbs_range(
-    whir: &Whir,
     lhs: &[Goldilocks],
+    value_at_r: Goldilocks,
+    r: &[Goldilocks],
     rng: &mut XorShift64,
 ) -> bool {
     const LIMBS: usize = 2; // 16-bit limbs => 32-bit range
     let n = lhs.len();
-    let d = n.trailing_zeros() as usize;
     assert!(n.is_power_of_two());
+    let whir = Whir::new_testing(n.trailing_zeros() as usize);
 
     let mut limbs: Vec<Vec<Goldilocks>> = vec![vec![Goldilocks::ZERO; n]; LIMBS];
     for i in 0..n {
@@ -650,14 +639,12 @@ fn prove_limbs_range(
         limbs[0][i] = from_i32((v & 0xFFFF) as i32);
         limbs[1][i] = from_i32(((v >> 16) & 0xFFFF) as i32);
     }
-    let c_limbs: Vec<Committed> = limbs.iter().map(|l| commit(whir, l)).collect();
+    let c_limbs: Vec<Committed> = limbs.iter().map(|l| commit(&whir, l)).collect();
 
-    let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
-    let value_at_r = mle::eval(lhs, &r);
     let mut rhs = Goldilocks::ZERO;
     for (j, c) in c_limbs.iter().enumerate() {
-        let (open, ev) = whir.open(c.prover_data.clone(), &c.protocol, &r);
-        if whir.verify(&c.commitment, &open, &c.protocol, &r).unwrap() != ev {
+        let (open, ev) = whir.open(c.prover_data.clone(), &c.protocol, r);
+        if whir.verify(&c.commitment, &open, &c.protocol, r).unwrap() != ev {
             return false;
         }
         rhs = rhs + ev * from_i64(1i64 << (16 * j));
@@ -671,7 +658,7 @@ fn prove_limbs_range(
         let indices: Vec<u32> = limb.iter().map(|&v| to_i32(v) as u32).collect();
         let alpha = rng.field();
         let beta = rng.field();
-        if !prove_lookup(whir, &c_limbs[j], limb, whir, &c_limbs[j], limb, &indices, &table, alpha, beta, rng) {
+        if !prove_lookup(&whir, &c_limbs[j], limb, &whir, &c_limbs[j], limb, &indices, &table, alpha, beta, rng) {
             return false;
         }
     }
@@ -923,8 +910,6 @@ pub fn prove_softmax_rows_batch(
     big_batch: &BatchCtx,
     row_batch: &BatchCtx,
     prod_batch: &BatchCtx,
-    bits1_batch: &BatchCtx,
-    bits2_batch: &BatchCtx,
     scores_plain: &[Goldilocks],
     c_plain: &[Goldilocks],
     shifted_plain: &[Goldilocks],
@@ -1035,10 +1020,10 @@ pub fn prove_softmax_rows_batch(
 
     let two = from_i64(2);
     let neg_two = from_i64(-2);
-    if !prove_linear_nonneg_batch(big_batch, 6, &rem, big_batch, 3, sum_broadcast_plain, bits1_batch, two, Goldilocks::ONE, rng) {
+    if !prove_linear_nonneg_batch(big_batch, 6, &rem, big_batch, 3, sum_broadcast_plain, two, Goldilocks::ONE, rng) {
         return false;
     }
-    if !prove_linear_nonneg_batch(big_batch, 3, sum_broadcast_plain, big_batch, 6, &rem, bits2_batch, Goldilocks::ONE, neg_two, rng) {
+    if !prove_linear_nonneg_batch(big_batch, 3, sum_broadcast_plain, big_batch, 6, &rem, Goldilocks::ONE, neg_two, rng) {
         return false;
     }
 
@@ -2369,13 +2354,15 @@ mod tests {
     fn limbs_range_roundtrip() {
         let mut rng = XorShift64::new(0xAAAA);
         let n = 256usize;
-        let whir = Whir::new_testing(n.trailing_zeros() as usize);
         let lhs: Vec<Goldilocks> = (0..n).map(|_| from_i32((rng.next_u64() % (1u64 << 30)) as i32)).collect();
-        assert!(prove_limbs_range(&whir, &lhs, &mut rng));
+        let r: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
+        let value_at_r = mle::eval(&lhs, &r);
+        assert!(prove_limbs_range(&lhs, value_at_r, &r, &mut rng));
 
         let mut bad = lhs.clone();
         bad[0] = from_i32(-1);
-        assert!(!prove_limbs_range(&whir, &bad, &mut rng));
+        let bad_r = mle::eval(&bad, &r);
+        assert!(!prove_limbs_range(&bad, bad_r, &r, &mut rng));
     }
 
     #[test]
@@ -2733,20 +2720,6 @@ mod tests {
         let mut r = vec![Goldilocks::ONE; n];
         for i in 1..n { r[i] = r[i - 1] * a_norm[i - 1]; }
 
-        let two = from_i64(2);
-        let neg_two = from_i64(-2);
-        let lhs1: Vec<Goldilocks> = rem.iter().zip(&sum_broadcast).map(|(&rv, &sv)| two * rv + sv).collect();
-        let lhs2: Vec<Goldilocks> = sum_broadcast.iter().zip(&rem).map(|(&sv, &rv)| sv + neg_two * rv).collect();
-        let mut bits1: Vec<Vec<Goldilocks>> = vec![vec![Goldilocks::ZERO; n]; 31];
-        let mut bits2: Vec<Vec<Goldilocks>> = vec![vec![Goldilocks::ZERO; n]; 31];
-        for i in 0..n {
-            let v1 = to_i32(lhs1[i]) as i64 as u64;
-            let v2 = to_i32(lhs2[i]) as i64 as u64;
-            for j in 0..31 {
-                bits1[j][i] = from_i32(((v1 >> j) & 1) as i32);
-                bits2[j][i] = from_i32(((v2 >> j) & 1) as i32);
-            }
-        }
 
         let whir = Whir::new_testing(10);
         let whir_r = Whir::new_testing(5);
@@ -2759,15 +2732,9 @@ mod tests {
         let prod_refs = [a_norm.as_slice(), r.as_slice()];
         let (prod_c, prod_pd, prod_p, prod_w) = whir.commit_batch(&prod_refs);
         let prod = BatchCtx { commitment: prod_c, prover_data: prod_pd, protocol: prod_p, whir: prod_w, num_tables: 2 };
-        let b1_refs: Vec<&[Goldilocks]> = bits1.iter().map(|x| x.as_slice()).collect();
-        let (b1_c, b1_pd, b1_p, b1_w) = whir.commit_batch(&b1_refs);
-        let b1 = BatchCtx { commitment: b1_c, prover_data: b1_pd, protocol: b1_p, whir: b1_w, num_tables: 31 };
-        let b2_refs: Vec<&[Goldilocks]> = bits2.iter().map(|x| x.as_slice()).collect();
-        let (b2_c, b2_pd, b2_p, b2_w) = whir.commit_batch(&b2_refs);
-        let b2 = BatchCtx { commitment: b2_c, prover_data: b2_pd, protocol: b2_p, whir: b2_w, num_tables: 31 };
 
         assert!(prove_softmax_rows_batch(
-            &big, &row, &prod, &b1, &b2,
+            &big, &row, &prod,
             &scores, &c, &shifted, &e, &sum, &sum_broadcast, &out,
             &exp_table, offset, n_rows, n_cols, alpha, beta, &mut rng,
         ));

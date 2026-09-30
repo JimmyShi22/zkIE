@@ -42,8 +42,6 @@ pub enum Op {
         big_group: (usize, usize),
         row_group: (usize, usize),
         prod_group: (usize, usize),
-        bits1_group: (usize, usize),
-        bits2_group: (usize, usize),
         exp_table: Vec<Goldilocks>,
         offset: u32,
         n_rows: usize,
@@ -369,20 +367,6 @@ impl Exec {
         let mut r = vec![Goldilocks::ONE; n];
         for i in 1..n { r[i] = r[i - 1] * a_norm[i - 1]; }
 
-        let two = from_i64(2);
-        let neg_two = from_i64(-2);
-        let lhs1: Vec<Goldilocks> = rem.iter().zip(&sum_broadcast).map(|(&rv, &sv)| two * rv + sv).collect();
-        let lhs2: Vec<Goldilocks> = sum_broadcast.iter().zip(&rem).map(|(&sv, &rv)| sv + neg_two * rv).collect();
-        let mut bits1: Vec<Vec<Goldilocks>> = vec![vec![Goldilocks::ZERO; n]; 31];
-        let mut bits2: Vec<Vec<Goldilocks>> = vec![vec![Goldilocks::ZERO; n]; 31];
-        for i in 0..n {
-            let v1 = to_i32(lhs1[i]) as i64 as u64;
-            let v2 = to_i32(lhs2[i]) as i64 as u64;
-            for j in 0..31 {
-                bits1[j][i] = from_i32(((v1 >> j) & 1) as i32);
-                bits2[j][i] = from_i32(((v2 >> j) & 1) as i32);
-            }
-        }
 
         let g_big = self.fresh_group();
         self.input(scores_plain.clone(), g_big);
@@ -402,10 +386,6 @@ impl Exec {
         self.input(a_norm, g_prod);
         self.input(r, g_prod);
 
-        let g_b1 = self.fresh_group();
-        for bc in &bits1 { self.input(bc.clone(), g_b1); }
-        let g_b2 = self.fresh_group();
-        for bc in &bits2 { self.input(bc.clone(), g_b2); }
 
         let out_id = self.input(out, 0);
 
@@ -420,8 +400,6 @@ impl Exec {
             big_group: (n, g_big),
             row_group: (n_rows, g_row),
             prod_group: (n, g_prod),
-            bits1_group: (n, g_b1),
-            bits2_group: (n, g_b2),
             exp_table: exp_table.to_vec(),
             offset,
             n_rows,
@@ -538,14 +516,12 @@ impl Exec {
                         x_b, x_i, &self.plain[*x], o_b, o_i, &self.plain[*out], bits_b, bias, *shift, rng,
                     ));
                 }
-                Op::Softmax { scores, c, shifted, e, sum, sum_broadcast, out, big_group, row_group, prod_group, bits1_group, bits2_group, exp_table, offset, n_rows, n_cols, alpha, beta } => {
+                Op::Softmax { scores, c, shifted, e, sum, sum_broadcast, out, big_group, row_group, prod_group, exp_table, offset, n_rows, n_cols, alpha, beta } => {
                     let big_b = &batches[&big_group];
                     let row_b = &batches[&row_group];
                     let prod_b = &batches[&prod_group];
-                    let b1_b = &batches[&bits1_group];
-                    let b2_b = &batches[&bits2_group];
                     assert!(prove_softmax_rows_batch(
-                        big_b, row_b, prod_b, b1_b, b2_b,
+                        big_b, row_b, prod_b,
                         &self.plain[*scores],
                         &self.plain[*c],
                         &self.plain[*shifted],
