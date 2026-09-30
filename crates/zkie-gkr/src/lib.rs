@@ -23,6 +23,7 @@ pub mod logup_gkr;
 pub mod layer_circuit;
 pub mod layer;
 pub mod same_poly;
+pub mod shard;
 pub mod projection;
 pub mod ffn;
 pub mod softmax_circuit;
