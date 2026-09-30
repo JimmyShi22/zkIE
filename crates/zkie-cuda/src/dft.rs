@@ -86,6 +86,11 @@ impl CudaNtt {
     /// device pointer to its slot.
     fn ensure_twiddles(&self, lg: u32) -> Option<*mut u64> {
         const MAX_LG: u32 = 18;
+        // Gracefully fall back to the CPU DFT for codewords larger than the
+        // fixed twiddle buffer, instead of panicking in make_twiddles.
+        if lg > MAX_LG {
+            return None;
+        }
         const SLOT: usize = 1 << MAX_LG;
         let mut uploaded = self.uploaded.lock().ok()?;
         if !uploaded.contains_key(&lg) {
