@@ -122,4 +122,60 @@ mod tests {
         let tensors_bad: Vec<&[Goldilocks]> = vec![&input, &bias, &bad_out, &rem_off, &ones];
         assert!(!verify_layer_circuit(&lc, &tensors_bad, std::slice::from_ref(&constraint), &r));
     }
+    #[test]
+    fn matmul_add_chain_no_commit_c() {
+        let mut rng = XorShift64::new(0x1234);
+        let (m, k, n) = (2usize, 2usize, 2usize);
+        let a: Vec<Goldilocks> = (0..m * k).map(|_| rng.field()).collect();
+        let b: Vec<Goldilocks> = (0..k * n).map(|_| rng.field()).collect();
+        let bias: Vec<Goldilocks> = (0..m * n).map(|_| rng.field()).collect();
+        let mut c = vec![Goldilocks::from_u64(0); m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = Goldilocks::from_u64(0);
+                for kk in 0..k {
+                    acc = acc + a[i * k + kk] * b[kk * n + j];
+                }
+                c[i * n + j] = acc;
+            }
+        }
+        let d: Vec<Goldilocks> = c.iter().zip(&bias).map(|(&cv, &bv)| cv + bv).collect();
+        let mut at = vec![Goldilocks::from_u64(0); k * m];
+        for kk in 0..k {
+            for i in 0..m {
+                at[kk * m + i] = a[i * k + kk];
+            }
+        }
+        let u = vec![rng.field()];
+        let v = vec![rng.field()];
+        let ch = vec![rng.field()];
+        let mat = crate::matmul::prove(&at, &b, &c, m, k, n, &u, &v, &ch);
+        let c_claim = mat.claimed;
+        let pt = vec![v[0], u[0]];
+        let eq = crate::mle::eq_evals(&pt);
+        let neg = from_i64(-1);
+        let terms = vec![
+            (Goldilocks::from_u64(1), vec![0usize, 1usize]),
+            (neg, vec![0usize, 2usize]),
+            (neg, vec![0usize, 3usize]),
+        ];
+        let mles: Vec<&[Goldilocks]> = vec![&eq, &d, &c, &bias];
+        let add_proof = crate::sumcheck::prove_virtual(&mles, &terms, Goldilocks::from_u64(0), &pt);
+        let final_evals = vec![
+            crate::mle::eval(&eq, &pt),
+            crate::mle::eval(&d, &pt),
+            c_claim,
+            crate::mle::eval(&bias, &pt),
+        ];
+        assert!(crate::sumcheck::verify_virtual(&add_proof, &terms, Goldilocks::from_u64(0), &pt, &final_evals));
+        let a_restricted = crate::mle::partial_eval(&at, &u);
+        let b_restricted = crate::mle::partial_eval(&b, &v);
+        let f_eval = crate::mle::eval(&a_restricted, &ch);
+        let h_eval = crate::mle::eval(&b_restricted, &ch);
+        assert!(crate::matmul::verify(&mat, &ch, f_eval, h_eval));
+        let mut bad_d = d.clone();
+        bad_d[0] = bad_d[0] + Goldilocks::from_u64(1);
+        let bad_evals = vec![crate::mle::eval(&eq, &pt), crate::mle::eval(&bad_d, &pt), c_claim, crate::mle::eval(&bias, &pt)];
+        assert!(!crate::sumcheck::verify_virtual(&add_proof, &terms, Goldilocks::from_u64(0), &pt, &bad_evals));
+    }
 }
