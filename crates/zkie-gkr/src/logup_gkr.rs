@@ -174,4 +174,25 @@ mod tests {
         let proof_bad = prove_lookup_fractional(&x, &bad_y, &table, alpha, beta, &mut rng);
         assert!(!verify_lookup_fractional(&proof_bad, &x, &bad_y, &table, alpha, beta));
     }
+    #[test]
+    fn committed_lookup_roundtrip() {
+        use crate::whir::Whir;
+        use crate::committed::commit;
+        let mut rng = XorShift64::new(0xEE33);
+        let n = 32usize;
+        let t = 16usize;
+        let table: Vec<Goldilocks> = (0..t).map(|_| rng.field()).collect();
+        let x: Vec<u32> = (0..n).map(|_| (rng.next_u64() % t as u64) as u32).collect();
+        let y: Vec<Goldilocks> = x.iter().map(|&i| table[i as usize]).collect();
+        let alpha = rng.field();
+        let beta = rng.field();
+        let proof = prove_lookup_fractional(&x, &y, &table, alpha, beta, &mut rng);
+        assert!(verify_lookup_fractional(&proof, &x, &y, &table, alpha, beta));
+        let whir = Whir::new_testing(n.trailing_zeros() as usize);
+        let c_y = commit(&whir, &y);
+        let r: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
+        let (open, ev) = whir.open(c_y.prover_data.clone(), &c_y.protocol, &r);
+        assert_eq!(whir.verify(&c_y.commitment, &open, &c_y.protocol, &r).unwrap(), ev);
+        assert_eq!(ev, crate::mle::eval(&y, &r));
+    }
 }
