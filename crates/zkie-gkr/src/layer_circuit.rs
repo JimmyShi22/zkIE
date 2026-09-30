@@ -107,4 +107,43 @@ mod tests {
         let proof = prove_layer_circuit(&mles, &constraints, &r, &mut rng);
         assert!(verify_layer_circuit(&proof, &mles, &constraints, &r));
     }
+    #[test]
+    fn committed_layer_circuit_roundtrip() {
+        use crate::whir::Whir;
+        use crate::committed::commit;
+        let mut rng = XorShift64::new(0xCC11);
+        let n = 1usize << 5;
+        let x: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let b: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let c: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let y: Vec<Goldilocks> = x.iter().zip(&b).map(|(&xv, &bv)| xv + bv).collect();
+        let z: Vec<Goldilocks> = y.iter().zip(&c).map(|(&yv, &cv)| yv * cv).collect();
+        let t = n.trailing_zeros() as usize;
+        let r: Vec<Goldilocks> = (0..t).map(|_| rng.field()).collect();
+        let constraints: Vec<Vec<(Goldilocks, Vec<usize>)>> = vec![
+            vec![
+                (Goldilocks::from_u64(1), vec![2usize]),
+                (from_i64(-1), vec![0usize]),
+                (from_i64(-1), vec![1usize]),
+            ],
+            vec![
+                (Goldilocks::from_u64(1), vec![4usize]),
+                (from_i64(-1), vec![2usize, 3usize]),
+            ],
+        ];
+        let mles: Vec<&[Goldilocks]> = vec![&x, &b, &y, &c, &z];
+        let proof = prove_layer_circuit(&mles, &constraints, &r, &mut rng);
+        let whir = Whir::new_testing(t);
+        let comms: Vec<_> = mles.iter().map(|m| commit(&whir, m)).collect();
+        let mut opened_evals = Vec::new();
+        for cc in &comms {
+            let (open, ev) = whir.open(cc.prover_data.clone(), &cc.protocol, &r);
+            assert_eq!(whir.verify(&cc.commitment, &open, &cc.protocol, &r).unwrap(), ev);
+            opened_evals.push(ev);
+        }
+        for i in 0..mles.len() {
+            assert_eq!(opened_evals[i], crate::mle::eval(mles[i], &r));
+        }
+        let _ = proof;
+    }
 }
