@@ -1005,6 +1005,35 @@ pub fn verify_shard_dag(
     true
 }
 
+/// Committed cross-shard binding: open a committed boundary tensor at every
+/// claim point, verify each opening against the commitment, and merge the claims
+/// with `same_poly`. The commitment itself ties the two shards' claims to one
+/// tensor; the merge collapses them toward a single future opening. This is the
+/// "boundary commit" form of cross-shard binding (the Commit/Open stages) that
+/// the plain `prove_shard_dag` defers.
+pub fn committed_cross_bind(
+    whir: &crate::whir::Whir,
+    committed: &crate::committed::Committed,
+    tensor: &[Goldilocks],
+    claims: &[(Vec<Goldilocks>, Goldilocks)],
+    rng: &mut XorShift64,
+) -> Option<SamePolyProof> {
+    for (pt, expected) in claims {
+        let (open, opened) = whir.open(committed.prover_data.clone(), &committed.protocol, pt);
+        if whir
+            .verify(&committed.commitment, &open, &committed.protocol, pt)
+            .ok()?
+            != opened
+        {
+            return None;
+        }
+        if opened != *expected || opened != mle::eval(tensor, pt) {
+            return None;
+        }
+    }
+    Some(prove_same_poly(tensor, claims, rng))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1220,5 +1249,35 @@ mod tests {
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
         bad.v[weights[1]][0] = bad.v[weights[1]][0] + Goldilocks::ONE;
         assert!(!verify_shard_dag(&bad, &ops, 2, &proof));
+    }
+
+    #[test]
+    fn committed_cross_bind_roundtrip() {
+        use crate::committed::commit;
+        use crate::field::PrimeCharacteristicRing;
+        use crate::whir::Whir;
+
+        let mut rng = XorShift64::new(0x1414);
+        let n = 1usize << 6;
+        let f: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let whir = Whir::new_testing(6);
+        let c = commit(&whir, &f);
+
+        let p0: Vec<Goldilocks> = (0..6).map(|_| rng.field()).collect();
+        let p1: Vec<Goldilocks> = (0..6).map(|_| rng.field()).collect();
+        let claims = vec![
+            (p0.clone(), mle::eval(&f, &p0)),
+            (p1.clone(), mle::eval(&f, &p1)),
+        ];
+
+        let proof = committed_cross_bind(&whir, &c, &f, &claims, &mut rng).expect("honest bind");
+        assert_eq!(proof.coeffs.len(), 2);
+
+        // A wrong claimed eval must fail the commitment check.
+        let bad = vec![
+            (p0.clone(), mle::eval(&f, &p0) + Goldilocks::ONE),
+            (p1.clone(), mle::eval(&f, &p1)),
+        ];
+        assert!(committed_cross_bind(&whir, &c, &f, &bad, &mut rng).is_none());
     }
 }
