@@ -1153,6 +1153,45 @@ pub fn verify_committed_shard_dag(
     true
 }
 
+/// Batch-commit same-size weight/bias tensors into ONE commitment — the "global
+/// weights commit": commit once, open per-use. The verifier opens a weight
+/// against this single commitment instead of trusting raw values.
+pub fn commit_weights_batch(
+    whir: &crate::whir::Whir,
+    tensors: &[&[Goldilocks]],
+) -> crate::committed::BatchCtx {
+    let (commitment, prover_data, protocol, w) = whir.commit_batch(tensors);
+    crate::committed::BatchCtx {
+        commitment,
+        prover_data,
+        protocol,
+        whir: w,
+        num_tables: tensors.len(),
+    }
+}
+
+/// Open the `idx`-th weight of a batch commitment at `point` and verify it
+/// equals `tensor`'s MLE evaluation there.
+pub fn verify_weight_batch(
+    batch: &crate::committed::BatchCtx,
+    idx: usize,
+    tensor: &[Goldilocks],
+    point: &[Goldilocks],
+) -> bool {
+    let (open, ev) = batch
+        .whir
+        .open_batch(batch.prover_data.clone(), &batch.protocol, idx, batch.num_tables, point);
+    if batch
+        .whir
+        .verify_batch(&batch.commitment, &open, &batch.protocol, idx, batch.num_tables, point)
+        .ok()
+        != Some(ev)
+    {
+        return false;
+    }
+    ev == mle::eval(tensor, point)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1438,5 +1477,30 @@ mod tests {
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
         bad.v[ws[1]][0] = bad.v[ws[1]][0] + Goldilocks::ONE;
         assert!(!verify_committed_shard_dag(&bad, &ops, 2, &whir, &proof));
+    }
+
+    #[test]
+    fn global_weights_batch_commit_roundtrip() {
+        use crate::field::PrimeCharacteristicRing;
+        use crate::whir::Whir;
+
+        let mut rng = XorShift64::new(0x1616);
+        let n = 1usize << 6;
+        let weights: Vec<Vec<Goldilocks>> = (0..4).map(|_| (0..n).map(|_| rng.field()).collect()).collect();
+        let refs: Vec<&[Goldilocks]> = weights.iter().map(|w| w.as_slice()).collect();
+
+        let whir = Whir::new_testing(6);
+        let batch = commit_weights_batch(&whir, &refs);
+        assert_eq!(batch.num_tables, 4);
+
+        let point: Vec<Goldilocks> = (0..6).map(|_| rng.field()).collect();
+        for (i, w) in weights.iter().enumerate() {
+            assert!(verify_weight_batch(&batch, i, w, &point));
+        }
+
+        // A wrong tensor at a table index must fail.
+        let mut bad = weights[0].clone();
+        bad[0] = bad[0] + Goldilocks::ONE;
+        assert!(!verify_weight_batch(&batch, 0, &bad, &point));
     }
 }
