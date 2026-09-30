@@ -148,6 +148,12 @@ Findings:
 - Full layer extrapolation: attention (~6s projections + ~1.7s softmax) + FFN
   (18.55s) + layernorm (~1s) ~= 27s/layer, ~5.4 min for 12 layers, ~3.5x faster
   than the op-granularity 19.6 min.
+
+- Committed cost (testing Whir params): committing + opening one projection's
+  5 tensors (x,w,bias,out,rem) = 0.30s vs 2.06s proving, so WHIR commitment is
+  ~15% overhead. The affine + logUp range check (O(m*n)) dominates, not the
+  openings; aggregate-openings is a second-order win on CPU, and layer-boundary
+  commitment (one WHIR per layer) removes most of the per-op commit cost anyway.
 - Caveats: plain model (affine base tensors not WHIR-committed, only the logUp
   fraction tree is); single-threaded; real gelu/exp tables are 2^21..2^23 (the
   bench used 2^16..2^18). N-ary sharding + layer parallelism + GPU are still to
