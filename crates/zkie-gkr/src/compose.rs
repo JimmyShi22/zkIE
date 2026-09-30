@@ -575,6 +575,9 @@ pub struct OpShardProof {
     /// `binds[j]` merges the claims of tensor `bound[j]`.
     pub bound: Vec<T>,
     pub binds: Vec<SamePolyProof>,
+    /// Raw `(tensor, point, eval)` claims emitted by this shard's ops, used by
+    /// the shard-DAG composer for cross-shard binding.
+    pub claims: Vec<(T, Vec<Goldilocks>, Goldilocks)>,
 }
 
 /// Run the forward pass for all ops; materializes every `out`/`rem`/`c` into the
@@ -740,6 +743,7 @@ pub fn prove_shard(store: &mut Store, ops: &[Op], boundary: &[T], rng: &mut XorS
 
     // Group claims by tensor and bind those with >1 distinct point (and not a
     // committed boundary tensor).
+    let raw_claims = claims.clone();
     let boundary_set: std::collections::HashSet<T> = boundary.iter().copied().collect();
     let mut by_tensor: std::collections::BTreeMap<T, Vec<(Vec<Goldilocks>, Goldilocks)>> =
         std::collections::BTreeMap::new();
@@ -758,7 +762,7 @@ pub fn prove_shard(store: &mut Store, ops: &[Op], boundary: &[T], rng: &mut XorS
         binds.push(sp);
     }
 
-    OpShardProof { ops: op_proofs, bound, binds }
+    OpShardProof { ops: op_proofs, bound, binds, claims: raw_claims }
 }
 
 /// Verify a shard proof.
@@ -878,6 +882,123 @@ pub fn verify_shard(store: &Store, ops: &[Op], proof: &OpShardProof) -> bool {
     }
     for (i, &t) in proof.bound.iter().enumerate() {
         if verify_same_poly(&proof.binds[i], ws.get(t), &bound_claims[i]).is_none() {
+            return false;
+        }
+    }
+    true
+}
+
+/// A whole-model shard-DAG proof: every shard folded into one g, plus
+/// `same_poly` cross-shard bindings on every tensor claimed by more than one
+/// shard. `ops_per_shard` is the public granularity parameter.
+pub struct ShardDagProof {
+    pub shards: Vec<OpShardProof>,
+    pub cross_tensors: Vec<T>,
+    pub cross_binds: Vec<SamePolyProof>,
+}
+
+/// Split `op_count` into contiguous `[start, end)` ranges of `ops_per_shard`.
+pub fn shard_ranges(op_count: usize, ops_per_shard: usize) -> Vec<(usize, usize)> {
+    let ops_per_shard = ops_per_shard.max(1);
+    let mut out = Vec::new();
+    let mut s = 0;
+    while s < op_count {
+        let e = (s + ops_per_shard).min(op_count);
+        out.push((s, e));
+        s = e;
+    }
+    out
+}
+
+pub fn prove_shard_dag(
+    store: &mut Store,
+    ops: &[Op],
+    ops_per_shard: usize,
+    rng: &mut XorShift64,
+) -> ShardDagProof {
+    let ranges = shard_ranges(ops.len(), ops_per_shard);
+    let mut shards = Vec::with_capacity(ranges.len());
+    for (s, e) in &ranges {
+        shards.push(prove_shard(store, &ops[*s..*e], &[], rng));
+    }
+
+    // Group raw claims by tensor across shards; bind tensors claimed by >1 shard.
+    let mut by_tensor: std::collections::BTreeMap<T, Vec<(Vec<Goldilocks>, Goldilocks)>> =
+        std::collections::BTreeMap::new();
+    for shard in shards.iter() {
+        for (t, pt, ev) in &shard.claims {
+            by_tensor.entry(*t).or_default().push((pt.clone(), *ev));
+        }
+    }
+    // Recompute per-tensor shard count with a set (a tensor may be claimed twice
+    // by one shard, so a plain counter would overcount).
+    let mut tensor_shards: std::collections::BTreeMap<T, std::collections::HashSet<usize>> =
+        std::collections::BTreeMap::new();
+    for (si, shard) in shards.iter().enumerate() {
+        for (t, _, _) in &shard.claims {
+            tensor_shards.entry(*t).or_default().insert(si);
+        }
+    }
+
+    let mut cross_tensors = Vec::new();
+    let mut cross_binds = Vec::new();
+    for (t, claims) in by_tensor {
+        if tensor_shards.get(&t).map(|s| s.len()).unwrap_or(0) > 1 {
+            let sp = prove_same_poly(store.get(t), &claims, rng);
+            cross_tensors.push(t);
+            cross_binds.push(sp);
+        }
+    }
+    ShardDagProof { shards, cross_tensors, cross_binds }
+}
+
+pub fn verify_shard_dag(
+    store: &Store,
+    ops: &[Op],
+    ops_per_shard: usize,
+    proof: &ShardDagProof,
+) -> bool {
+    let ranges = shard_ranges(ops.len(), ops_per_shard);
+    if proof.shards.len() != ranges.len() || proof.cross_tensors.len() != proof.cross_binds.len() {
+        return false;
+    }
+    for (i, (s, e)) in ranges.iter().enumerate() {
+        if !verify_shard(store, &ops[*s..*e], &proof.shards[i]) {
+            return false;
+        }
+    }
+
+    // Recompute the witness to get fresh tensor values for binding evals.
+    let mut ws = Store { v: store.v.clone(), idx: store.idx.clone() };
+    forward_ops(&mut ws, ops);
+
+    // Rebuild the same cross-shard grouping (points only; evals recomputed).
+    let mut by_tensor: std::collections::BTreeMap<T, Vec<Vec<Goldilocks>>> =
+        std::collections::BTreeMap::new();
+    let mut tensor_shards: std::collections::BTreeMap<T, std::collections::HashSet<usize>> =
+        std::collections::BTreeMap::new();
+    for (si, shard) in proof.shards.iter().enumerate() {
+        for (t, pt, _) in &shard.claims {
+            by_tensor.entry(*t).or_default().push(pt.clone());
+            tensor_shards.entry(*t).or_default().insert(si);
+        }
+    }
+
+    let mut expected_cross: Vec<T> = Vec::new();
+    for (t, _) in &by_tensor {
+        if tensor_shards.get(t).map(|s| s.len()).unwrap_or(0) > 1 {
+            expected_cross.push(*t);
+        }
+    }
+    if expected_cross != proof.cross_tensors {
+        return false;
+    }
+    for (ci, &t) in proof.cross_tensors.iter().enumerate() {
+        let claims: Vec<(Vec<Goldilocks>, Goldilocks)> = by_tensor[&t]
+            .iter()
+            .map(|pt| (pt.clone(), mle::eval(ws.get(t), pt)))
+            .collect();
+        if verify_same_poly(&proof.cross_binds[ci], ws.get(t), &claims).is_none() {
             return false;
         }
     }
@@ -1064,5 +1185,40 @@ mod tests {
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
         bad.v[x][0] = bad.v[x][0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
+    }
+
+    #[test]
+    fn op_shard_dag_projection_chain() {
+        let mut rng = XorShift64::new(0x1212);
+        let (m, d, shift) = (4usize, 8usize, 8u32);
+        let mut store = Store::new();
+        let x = store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let mut weights = Vec::new();
+        let mut biases = Vec::new();
+        for _ in 0..4 {
+            weights.push(store.push((0..d * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect()));
+            biases.push(store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect()));
+        }
+        let mut outs = Vec::new();
+        let mut rems = Vec::new();
+        for _ in 0..4 {
+            outs.push(store.push(vec![]));
+            rems.push(store.push(vec![]));
+        }
+        let ops = vec![
+            Op::Projection { x, w: weights[0], bias: biases[0], out: outs[0], rem: rems[0], m, k: d, n: d, shift },
+            Op::Projection { x: outs[0], w: weights[1], bias: biases[1], out: outs[1], rem: rems[1], m, k: d, n: d, shift },
+            Op::Projection { x: outs[1], w: weights[2], bias: biases[2], out: outs[2], rem: rems[2], m, k: d, n: d, shift },
+            Op::Projection { x: outs[2], w: weights[3], bias: biases[3], out: outs[3], rem: rems[3], m, k: d, n: d, shift },
+        ];
+
+        let proof = prove_shard_dag(&mut store, &ops, 2, &mut rng);
+        assert_eq!(proof.shards.len(), 2);
+        assert_eq!(proof.cross_tensors.len(), 1, "only y2 spans the shard boundary");
+        assert!(verify_shard_dag(&store, &ops, 2, &proof));
+
+        let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
+        bad.v[weights[1]][0] = bad.v[weights[1]][0] + Goldilocks::ONE;
+        assert!(!verify_shard_dag(&bad, &ops, 2, &proof));
     }
 }
