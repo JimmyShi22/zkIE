@@ -604,13 +604,22 @@ fn prove_linear_nonneg_batch(
     let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
     let s = mle::eq_evals(&r);
     let s_r = mle::eval(&s, &r);
-    let (x_open, x_r) = x_batch.whir.open_batch(x_batch.prover_data.clone(), &x_batch.protocol, x_idx, x_batch.num_tables, &r);
-    let (y_open, y_r) = y_batch.whir.open_batch(y_batch.prover_data.clone(), &y_batch.protocol, y_idx, y_batch.num_tables, &r);
-    if x_batch.whir.verify_batch(&x_batch.commitment, &x_open, &x_batch.protocol, x_idx, x_batch.num_tables, &r).unwrap() != x_r
-        || y_batch.whir.verify_batch(&y_batch.commitment, &y_open, &y_batch.protocol, y_idx, y_batch.num_tables, &r).unwrap() != y_r
-    {
-        return false;
-    }
+    let (x_r, y_r) = if std::ptr::eq(x_batch as *const BatchCtx, y_batch as *const BatchCtx) {
+        let (open, evals) = x_batch.whir.open_batch_multi(x_batch.prover_data.clone(), &x_batch.protocol, x_batch.num_tables, &r);
+        if x_batch.whir.verify_batch_multi(&x_batch.commitment, &open, &x_batch.protocol, x_batch.num_tables, &r).unwrap() != evals {
+            return false;
+        }
+        (evals[x_idx], evals[y_idx])
+    } else {
+        let (x_open, x_r) = x_batch.whir.open_batch(x_batch.prover_data.clone(), &x_batch.protocol, x_idx, x_batch.num_tables, &r);
+        let (y_open, y_r) = y_batch.whir.open_batch(y_batch.prover_data.clone(), &y_batch.protocol, y_idx, y_batch.num_tables, &r);
+        if x_batch.whir.verify_batch(&x_batch.commitment, &x_open, &x_batch.protocol, x_idx, x_batch.num_tables, &r).unwrap() != x_r
+            || y_batch.whir.verify_batch(&y_batch.commitment, &y_open, &y_batch.protocol, y_idx, y_batch.num_tables, &r).unwrap() != y_r
+        {
+            return false;
+        }
+        (x_r, y_r)
+    };
     let value_at_r = a * x_r + b * y_r;
     prove_bits_range_batch(bits_batch, &bits, value_at_r, &r, &s, s_r)
 }
@@ -886,15 +895,15 @@ pub fn prove_softmax_rows_batch(
     // 1. shifted = scores - c (broadcast over columns).
     let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
     let r_row = &r[dc..];
-    let (sc_open, sc_r) = big_batch.whir.open_batch(big_batch.prover_data.clone(), &big_batch.protocol, 0, big_batch.num_tables, &r);
+    let (r_open, r_evals) = big_batch.whir.open_batch_multi(big_batch.prover_data.clone(), &big_batch.protocol, big_batch.num_tables, &r);
     let (c_open, c_r) = row_batch.whir.open_batch(row_batch.prover_data.clone(), &row_batch.protocol, 0, row_batch.num_tables, r_row);
-    let (sh_open, sh_r) = big_batch.whir.open_batch(big_batch.prover_data.clone(), &big_batch.protocol, 1, big_batch.num_tables, &r);
-    if big_batch.whir.verify_batch(&big_batch.commitment, &sc_open, &big_batch.protocol, 0, big_batch.num_tables, &r).unwrap() != sc_r
+    if big_batch.whir.verify_batch_multi(&big_batch.commitment, &r_open, &big_batch.protocol, big_batch.num_tables, &r).unwrap() != r_evals
         || row_batch.whir.verify_batch(&row_batch.commitment, &c_open, &row_batch.protocol, 0, row_batch.num_tables, r_row).unwrap() != c_r
-        || big_batch.whir.verify_batch(&big_batch.commitment, &sh_open, &big_batch.protocol, 1, big_batch.num_tables, &r).unwrap() != sh_r
     {
         return false;
     }
+    let sc_r = r_evals[0];
+    let sh_r = r_evals[1];
     if sh_r != sc_r - c_r {
         return false;
     }
