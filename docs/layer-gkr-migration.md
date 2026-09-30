@@ -126,8 +126,9 @@ single-contraction sumchecks (O(n) + O(k) rounds), never committing C. See
 `matmul::tests::nested_chain_roundtrip`.
 
 Remaining (mechanical, no new primitives):
-1. Wire the full GPT-2 layer (q/k/v/o/fc/proj + attention softmax + residual
-   adds) using the map above.
+1. Wire the full GPT-2 layer (multi-head attention + layernorm + residual adds):
+   single-head plain-model layer is done (bench_transformer_layer, 27.6s);
+   multi-head split and layernorm (rsqrt lookup + mean) remain.
 3. Rewrite Exec/committed.rs to use the layer circuit (integration).
 4. N-ary tree sharding + agg + layer parallelism + cross-shard binding.
 
@@ -145,6 +146,14 @@ Findings:
 - softmax is cheap (0.14s); the dominant cost is the projection affine + logUp
   range check (O(m*n) elementwise sumcheck + fraction tree), not the matmul GKR
   (O(contraction dim), ~0.03s).
+- Softmax rescale is now O(m*n) (NOT the O(m*n*n) flattened product):
+  `softmax_scaled::prove_softmax_scaled` proves exp lookup + row-sum + rescale
+  (field-inverse `out*sum_broadcast = e`, sum as a separate tensor) in 0.16s at
+  seq=512. This removes the 2^27 (infeasible) flattened rescale.
+- Full transformer layer (single-head attention + FFN + 2 residual adds, plain
+  model, no layernorm yet): 27.57s/layer at seq=512, so ~5.5 min for 12 layers.
+  Matches the extrapolation. Multi-head (12x the softmax/matmul, ~+2s) and
+  layernorm are still to be wired on top.
 - Full layer extrapolation: attention (~6s projections + ~1.7s softmax) + FFN
   (18.55s) + layernorm (~1s) ~= 27s/layer, ~5.4 min for 12 layers, ~3.5x faster
   than the op-granularity 19.6 min.
