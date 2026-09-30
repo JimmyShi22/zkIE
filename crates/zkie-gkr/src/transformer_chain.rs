@@ -8,6 +8,9 @@ use crate::attention_chain::{
     prove_attention_chain, verify_attention_chain, AttentionChainProof,
 };
 use crate::ffn_chain::{prove_ffn_chain, verify_ffn_chain, FfnChainProof};
+use crate::layernorm_chain::{
+    prove_layernorm_chain, verify_layernorm_chain, LayernormChainProof,
+};
 use crate::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64};
 use crate::fixed_point::{from_i64, to_i64};
 use crate::mle;
@@ -17,6 +20,15 @@ pub struct TransformerChainProof {
     pub attention: AttentionChainProof,
     pub ffn: FfnChainProof,
     pub same_y: SamePolyProof,
+}
+
+/// Full post-norm transformer layer: h = layernorm(x) -> attention+FFN on h.
+/// The layernorm output `h` is claimed by the layernorm (out) and by the
+/// attention (its merged same_x point), bound via `same_poly`.
+pub struct TransformerLayerProof {
+    pub layernorm: LayernormChainProof,
+    pub block: TransformerChainProof,
+    pub same_h: SamePolyProof,
 }
 
 fn mm(a: &[Goldilocks], b: &[Goldilocks], m: usize, k: usize, n: usize) -> Vec<Goldilocks> {
@@ -171,6 +183,111 @@ pub fn verify_transformer_chain(
     verify_same_poly(&proof.same_y, &y, &claims).is_some()
 }
 
+/// RMSNorm forward (witness) matching `layernorm_chain`.
+#[allow(clippy::too_many_arguments)]
+fn layernorm_forward(
+    x: &[Goldilocks],
+    w: &[Goldilocks],
+    b: &[Goldilocks],
+    rsqrt_table: &[Goldilocks],
+    m: usize,
+    d: usize,
+) -> Vec<Goldilocks> {
+    let mean_sq: Vec<Goldilocks> = (0..m)
+        .map(|i| (0..d).fold(Goldilocks::ZERO, |a, j| a + x[i * d + j] * x[i * d + j]))
+        .collect();
+    let rsqrt: Vec<Goldilocks> = mean_sq
+        .iter()
+        .map(|&v| rsqrt_table[((to_i64(v).max(0)) as u64 % rsqrt_table.len() as u64) as usize])
+        .collect();
+    let scale: Vec<Goldilocks> = (0..m * d).map(|ij| rsqrt[ij / d] * w[ij]).collect();
+    (0..m * d).map(|ij| x[ij] * scale[ij] + b[ij]).collect()
+}
+
+/// Full post-norm transformer layer: h = layernorm(x), then attention + FFN on h,
+/// with `same_poly` binding the layernorm output `h` to the attention's input.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_transformer_layer(
+    x: &[Goldilocks],
+    wq: &[Goldilocks],
+    wk: &[Goldilocks],
+    wv: &[Goldilocks],
+    wo: &[Goldilocks],
+    bias: &[Goldilocks],
+    exp_table: &[Goldilocks],
+    fc_w: &[Goldilocks],
+    fc_b: &[Goldilocks],
+    proj_w: &[Goldilocks],
+    proj_b: &[Goldilocks],
+    gelu_table: &[Goldilocks],
+    ln_w: &[Goldilocks],
+    ln_b: &[Goldilocks],
+    rsqrt_table: &[Goldilocks],
+    m: usize,
+    d: usize,
+    ffn: usize,
+    shift: u32,
+    rng: &mut XorShift64,
+) -> TransformerLayerProof {
+    let h = layernorm_forward(x, ln_w, ln_b, rsqrt_table, m, d);
+    let layernorm = prove_layernorm_chain(x, ln_w, ln_b, rsqrt_table, m, d, rng);
+    let block = prove_transformer_chain(
+        &h, wq, wk, wv, wo, bias, exp_table, fc_w, fc_b, proj_w, proj_b, gelu_table, m, d, ffn, shift, rng,
+    );
+    let claims = vec![
+        (layernorm.r_out.clone(), mle::eval(&h, &layernorm.r_out)),
+        (
+            block.attention.same_x.merged_point.clone(),
+            block.attention.same_x.merged_eval,
+        ),
+    ];
+    let same_h = prove_same_poly(&h, &claims, rng);
+    TransformerLayerProof { layernorm, block, same_h }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn verify_transformer_layer(
+    proof: &TransformerLayerProof,
+    x: &[Goldilocks],
+    wq: &[Goldilocks],
+    wk: &[Goldilocks],
+    wv: &[Goldilocks],
+    wo: &[Goldilocks],
+    bias: &[Goldilocks],
+    exp_table: &[Goldilocks],
+    fc_w: &[Goldilocks],
+    fc_b: &[Goldilocks],
+    proj_w: &[Goldilocks],
+    proj_b: &[Goldilocks],
+    gelu_table: &[Goldilocks],
+    ln_w: &[Goldilocks],
+    ln_b: &[Goldilocks],
+    rsqrt_table: &[Goldilocks],
+    m: usize,
+    d: usize,
+    ffn: usize,
+    shift: u32,
+) -> bool {
+    let h = layernorm_forward(x, ln_w, ln_b, rsqrt_table, m, d);
+    if !verify_layernorm_chain(&proof.layernorm, x, ln_w, ln_b, rsqrt_table, m, d) {
+        return false;
+    }
+    if !verify_transformer_chain(
+        &proof.block, &h, wq, wk, wv, wo, bias, exp_table, fc_w, fc_b, proj_w, proj_b, gelu_table,
+        m, d, ffn, shift,
+    ) {
+        return false;
+    }
+    let claims = vec![
+        (proof.layernorm.r_out.clone(), mle::eval(&h, &proof.layernorm.r_out)),
+        (
+            proof.block.attention.same_x.merged_point.clone(),
+            proof.block.attention.same_x.merged_eval,
+        ),
+    ];
+    verify_same_poly(&proof.same_h, &h, &claims).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,6 +316,36 @@ mod tests {
         assert!(verify_transformer_chain(
             &proof, &x, &wq, &wk, &wv, &wo, &bias, &exp_table, &fc_w, &fc_b, &proj_w, &proj_b,
             &gelu_table, m, d, ffn, shift
+        ));
+    }
+
+    #[test]
+    fn transformer_layer_roundtrip() {
+        let mut rng = XorShift64::new(0xB7B7);
+        let (m, d, ffn) = (4usize, 4usize, 4usize);
+        let shift = 8u32;
+        let x: Vec<Goldilocks> = (0..m * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect();
+        let wq: Vec<Goldilocks> = (0..d * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect();
+        let wk: Vec<Goldilocks> = (0..d * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect();
+        let wv: Vec<Goldilocks> = (0..d * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect();
+        let wo: Vec<Goldilocks> = (0..d * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect();
+        let bias: Vec<Goldilocks> = (0..m * d).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect();
+        let exp_table: Vec<Goldilocks> = (0..(1usize << 8)).map(|_| rng.field()).collect();
+        let fc_w: Vec<Goldilocks> = (0..d * ffn).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect();
+        let fc_b: Vec<Goldilocks> = (0..m * ffn).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect();
+        let proj_w: Vec<Goldilocks> = (0..ffn * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect();
+        let proj_b: Vec<Goldilocks> = (0..m * d).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect();
+        let gelu_table: Vec<Goldilocks> = (0..64).map(|j| from_i64((j as i64).pow(2) % 1000)).collect();
+        let ln_w: Vec<Goldilocks> = (0..m * d).map(|_| from_i64((rng.next_u64() % 5) as i64 + 1)).collect();
+        let ln_b: Vec<Goldilocks> = (0..m * d).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect();
+        let rsqrt_table: Vec<Goldilocks> = (0..(1usize << 8)).map(|_| rng.field()).collect();
+        let proof = prove_transformer_layer(
+            &x, &wq, &wk, &wv, &wo, &bias, &exp_table, &fc_w, &fc_b, &proj_w, &proj_b,
+            &gelu_table, &ln_w, &ln_b, &rsqrt_table, m, d, ffn, shift, &mut rng,
+        );
+        assert!(verify_transformer_layer(
+            &proof, &x, &wq, &wk, &wv, &wo, &bias, &exp_table, &fc_w, &fc_b, &proj_w, &proj_b,
+            &gelu_table, &ln_w, &ln_b, &rsqrt_table, m, d, ffn, shift
         ));
     }
 }
