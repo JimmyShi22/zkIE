@@ -77,4 +77,36 @@ mod tests {
         let fe: Vec<Goldilocks> = mles.iter().map(|mm| crate::mle::eval(mm, &ch)).collect();
         assert!(verify_virtual(&proof, &terms, Goldilocks::from_u64(0), &ch, &fe));
     }
+    #[test]
+    fn committed_softmax_broadcast_open() {
+        use crate::whir::Whir;
+        use crate::committed::commit;
+        let mut rng = XorShift64::new(0x55AA);
+        let (m, n) = (8usize, 8usize);
+        let lg = m.trailing_zeros() as usize;
+        let scores: Vec<Goldilocks> = (0..m * n).map(|_| rng.field()).collect();
+        let probs: Vec<Goldilocks> = (0..m * n).map(|_| rng.field()).collect();
+        let rem: Vec<Goldilocks> = (0..m * n).map(|_| rng.field()).collect();
+        let whir = Whir::new_testing((m * n).trailing_zeros() as usize);
+        let c_scores = commit(&whir, &scores);
+        let c_probs = commit(&whir, &probs);
+        let c_rem = commit(&whir, &rem);
+        let ch: Vec<Goldilocks> = (0..(m * n * n).trailing_zeros() as usize).map(|_| rng.field()).collect();
+        let p_ji: Vec<Goldilocks> = ch[lg..3 * lg].to_vec();
+        let mut p_ji_p = ch[0..lg].to_vec();
+        p_ji_p.extend_from_slice(&ch[2 * lg..3 * lg]);
+        let (o1, s1) = whir.open(c_scores.prover_data.clone(), &c_scores.protocol, &p_ji);
+        assert_eq!(whir.verify(&c_scores.commitment, &o1, &c_scores.protocol, &p_ji).unwrap(), s1);
+        assert_eq!(s1, crate::mle::eval(&scores, &p_ji));
+        let (o2, s2) = whir.open(c_scores.prover_data.clone(), &c_scores.protocol, &p_ji_p);
+        assert_eq!(whir.verify(&c_scores.commitment, &o2, &c_scores.protocol, &p_ji_p).unwrap(), s2);
+        assert_eq!(s2, crate::mle::eval(&scores, &p_ji_p));
+        let (o3, p1) = whir.open(c_probs.prover_data.clone(), &c_probs.protocol, &p_ji);
+        assert_eq!(whir.verify(&c_probs.commitment, &o3, &c_probs.protocol, &p_ji).unwrap(), p1);
+        assert_eq!(p1, crate::mle::eval(&probs, &p_ji));
+        let (o4, r1) = whir.open(c_rem.prover_data.clone(), &c_rem.protocol, &p_ji);
+        assert_eq!(whir.verify(&c_rem.commitment, &o4, &c_rem.protocol, &p_ji).unwrap(), r1);
+        assert_eq!(r1, crate::mle::eval(&rem, &p_ji));
+        assert!(s1 != s2);
+    }
 }
