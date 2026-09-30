@@ -896,68 +896,24 @@ pub fn prove_softmax_rows_batch(
     let dc = n_cols.trailing_zeros() as usize;
     let d = dr + dc;
 
-    // 1. shifted = scores - c (broadcast over columns).
     let r: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
     let r_row = &r[dc..];
-    let (r_open, r_evals) = big_batch.whir.open_batch_multi(big_batch.prover_data.clone(), &big_batch.protocol, big_batch.num_tables, &r);
-    let (c_open, c_r) = row_batch.whir.open_batch(row_batch.prover_data.clone(), &row_batch.protocol, 0, row_batch.num_tables, r_row);
-    if big_batch.whir.verify_batch_multi(&big_batch.commitment, &r_open, &big_batch.protocol, big_batch.num_tables, &r).unwrap() != r_evals
-        || row_batch.whir.verify_batch(&row_batch.commitment, &c_open, &row_batch.protocol, 0, row_batch.num_tables, r_row).unwrap() != c_r
-    {
-        return false;
-    }
-    let sc_r = r_evals[0];
-    let sh_r = r_evals[1];
-    if sh_r != sc_r - c_r {
-        return false;
-    }
-
-    // 2. e = exp_table[shifted + offset] (lookup). big: idx(5), e(2).
-    let indices: Vec<u32> = shifted_plain
-        .iter()
-        .map(|&v| (to_i32(v) as i64 + offset as i64).clamp(0, exp_table.len() as i64 - 1) as u32)
-        .collect();
-    let idx_field: Vec<Goldilocks> = indices.iter().map(|&i| from_i32(i as i32)).collect();
-    if !prove_lookup_batch(
-        big_batch, 5, &idx_field, big_batch, 2, e_plain, big_batch, 7, prod_batch, &indices, exp_table, alpha, beta, rng,
-    ) {
-        return false;
-    }
-
-    // 3. sum = row-wise sum of e. big: e(2); row: sum(1).
     let r_row2: Vec<Goldilocks> = (0..dr).map(|_| rng.field()).collect();
-    let eq_row = eq_row_broadcast(&r_row2, n_rows, n_cols);
-    let claimed_sum = mle::eval(sum_plain, &r_row2);
     let r_full: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
-    let proof_sum = sumcheck::prove(e_plain, &eq_row, claimed_sum, &r_full);
-    let (e_open, e_r) = big_batch.whir.open_batch(big_batch.prover_data.clone(), &big_batch.protocol, 2, big_batch.num_tables, &r_full);
-    let (sum_open, sum_r) = row_batch.whir.open_batch(row_batch.prover_data.clone(), &row_batch.protocol, 1, row_batch.num_tables, &r_row2);
-    if big_batch.whir.verify_batch(&big_batch.commitment, &e_open, &big_batch.protocol, 2, big_batch.num_tables, &r_full).unwrap() != e_r
-        || row_batch.whir.verify_batch(&row_batch.commitment, &sum_open, &row_batch.protocol, 1, row_batch.num_tables, &r_row2).unwrap() != sum_r
-    {
-        return false;
-    }
-    let eq_row_r = mle::eval(&eq_row, &r_full);
-    if !sumcheck::verify(&proof_sum, claimed_sum, &r_full, e_r, eq_row_r) || sum_r != claimed_sum {
-        return false;
-    }
-
-    // 4. sum_broadcast = broadcast of sum over columns. big: sb(3); row: sum(1).
     let r3: Vec<Goldilocks> = (0..d).map(|_| rng.field()).collect();
     let r3_row = &r3[dc..];
-    let (r3_open, r3_evals) = big_batch.whir.open_batch_multi(big_batch.prover_data.clone(), &big_batch.protocol, big_batch.num_tables, &r3);
-    let (s2_open, s2_r) = row_batch.whir.open_batch(row_batch.prover_data.clone(), &row_batch.protocol, 1, row_batch.num_tables, r3_row);
-    if big_batch.whir.verify_batch_multi(&big_batch.commitment, &r3_open, &big_batch.protocol, big_batch.num_tables, &r3).unwrap() != r3_evals
-        || row_batch.whir.verify_batch(&row_batch.commitment, &s2_open, &row_batch.protocol, 1, row_batch.num_tables, r3_row).unwrap() != s2_r
-    {
-        return false;
-    }
-    let sb_r = r3_evals[3];
-    if sb_r != s2_r {
-        return false;
-    }
 
-    // 5. out = round(e * 2^16 / sum). big: out(4), e(2), rem(6).
+    let sc_r = mle::eval(scores_plain, &r);
+    let sh_r = mle::eval(shifted_plain, &r);
+    let c_r = mle::eval(c_plain, r_row);
+
+    let eq_row = eq_row_broadcast(&r_row2, n_rows, n_cols);
+    let claimed_sum = mle::eval(sum_plain, &r_row2);
+    let proof_sum = sumcheck::prove(e_plain, &eq_row, claimed_sum, &r_full);
+    let e_r = mle::eval(e_plain, &r_full);
+    let sum_r = mle::eval(sum_plain, &r_row2);
+    let eq_row_r = mle::eval(&eq_row, &r_full);
+
     let scale_f = from_i64(1i64 << 16);
     let rem: Vec<Goldilocks> = e_plain
         .iter()
@@ -965,7 +921,6 @@ pub fn prove_softmax_rows_batch(
         .zip(sum_broadcast_plain)
         .map(|((&ev, &ov), &sv)| ev * scale_f - ov * sv)
         .collect();
-
     let eq = mle::eq_evals(&r3);
     let eq_r = mle::eval(&eq, &r3);
     let c1 = eq.iter().zip(out_plain).zip(sum_broadcast_plain).fold(Goldilocks::ZERO, |a, ((&ei, &oi), &si)| a + ei * oi * si);
@@ -974,14 +929,58 @@ pub fn prove_softmax_rows_batch(
     let proof_c1 = sumcheck::prove3(&eq, out_plain, sum_broadcast_plain, c1, &r3);
     let proof_ce = sumcheck::prove(&eq, e_plain, ce, &r3);
     let proof_cr = sumcheck::prove(&eq, &rem, cr, &r3);
-    let o_r = r3_evals[4];
-    let e2_r = r3_evals[2];
-    let rem_r = r3_evals[6];
+    let sb_r = mle::eval(sum_broadcast_plain, &r3);
+    let o_r = mle::eval(out_plain, &r3);
+    let e2_r = mle::eval(e_plain, &r3);
+    let rem_r = mle::eval(&rem, &r3);
+    let s2_r = mle::eval(sum_plain, r3_row);
+
+    if !crate::batch_open::batch_open_committed(
+        big_batch,
+        &[0, 1, 2, 2, 3, 4, 6],
+        &[scores_plain.to_vec(), shifted_plain.to_vec(), e_plain.to_vec(), e_plain.to_vec(), sum_broadcast_plain.to_vec(), out_plain.to_vec(), rem.clone()],
+        &[r.clone(), r.clone(), r_full.clone(), r3.clone(), r3.clone(), r3.clone(), r3.clone()],
+        &[sc_r, sh_r, e_r, e2_r, sb_r, o_r, rem_r],
+        rng,
+    ) {
+        return false;
+    }
+    if !crate::batch_open::batch_open_committed(
+        row_batch,
+        &[0, 1, 1],
+        &[c_plain.to_vec(), sum_plain.to_vec(), sum_plain.to_vec()],
+        &[r_row.to_vec(), r_row2.clone(), r3_row.to_vec()],
+        &[c_r, sum_r, s2_r],
+        rng,
+    ) {
+        return false;
+    }
+
+    if sh_r != sc_r - c_r {
+        return false;
+    }
+    if !sumcheck::verify(&proof_sum, claimed_sum, &r_full, e_r, eq_row_r) || sum_r != claimed_sum {
+        return false;
+    }
+    if sb_r != s2_r {
+        return false;
+    }
     if !sumcheck::verify3(&proof_c1, c1, &r3, eq_r, o_r, sb_r)
         || !sumcheck::verify(&proof_ce, ce, &r3, eq_r, e2_r)
         || !sumcheck::verify(&proof_cr, cr, &r3, eq_r, rem_r)
         || c1 != scale_f * ce - cr
     {
+        return false;
+    }
+
+    let indices: Vec<u32> = shifted_plain
+        .iter()
+        .map(|&v| (to_i32(v) as i64 + offset as i64).clamp(0, exp_table.len() as i64 - 1) as u32)
+        .collect();
+    let idx_field: Vec<Goldilocks> = indices.iter().map(|&i| from_i32(i as i32)).collect();
+    if !prove_lookup_batch(
+        big_batch, 5, &idx_field, big_batch, 2, e_plain, big_batch, 7, prod_batch, &indices, exp_table, alpha, beta, rng,
+    ) {
         return false;
     }
 
@@ -997,6 +996,7 @@ pub fn prove_softmax_rows_batch(
     let _ = (n, c_plain, scores_plain);
     true
 }
+
 
 pub fn prove_layer_norm(
     whir_x: &Whir,
