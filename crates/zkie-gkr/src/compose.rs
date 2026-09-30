@@ -1880,4 +1880,48 @@ mod tests {
         bad.v[x][0] = bad.v[x][0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
     }
+
+    #[test]
+    fn op_shard_prenorm_ffn_roundtrip() {
+        // GPT-2 pre-norm FFN block: h = layernorm(x) -> fc = proj(h) ->
+        // act = gelu(fc) -> proj2 = proj(act) -> out = x + proj2.
+        use crate::field::PrimeCharacteristicRing;
+        let mut rng = XorShift64::new(0x1C1C);
+        let (m, d, ffn, shift) = (4usize, 8usize, 16usize, 8u32);
+        let mut store = Store::new();
+        let x = store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let ln_w = store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 5) as i64 + 1)).collect());
+        let ln_b = store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
+        let rsqrt_table = store.push((0..(1usize << 8)).map(|j| from_i64((j % 255 + 1) as i64)).collect());
+        let fc_w = store.push((0..d * ffn).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let fc_b = store.push((0..m * ffn).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
+        let proj_w = store.push((0..ffn * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let proj_b = store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
+        let gelu_table = store.push((0..64).map(|j| from_i64((j as i64).pow(2) % 1000)).collect());
+
+        let h = store.push(vec![]);
+        let fc = store.push(vec![]);
+        let fc_rem = store.push(vec![]);
+        let gelu_idx = store.push_idx(vec![]);
+        let act = store.push(vec![]);
+        let proj2 = store.push(vec![]);
+        let proj2_rem = store.push(vec![]);
+        let out = store.push(vec![]);
+
+        let ops = vec![
+            Op::Layernorm { x, w: ln_w, b: ln_b, out: h, rsqrt_table, m, d },
+            Op::Projection { x: h, w: fc_w, bias: fc_b, out: fc, rem: fc_rem, m, k: d, n: ffn, shift },
+            Op::SoftmaxIndex { x: fc, out: gelu_idx, table_len: 64 },
+            Op::Lookup { idx: gelu_idx, out: act, table: gelu_table },
+            Op::Projection { x: act, w: proj_w, bias: proj_b, out: proj2, rem: proj2_rem, m, k: ffn, n: d, shift },
+            Op::Add { a: x, b: proj2, c: out },
+        ];
+
+        let proof = prove_shard(&mut store, &ops, &[out], &mut rng);
+        assert!(verify_shard(&store, &ops, &proof));
+
+        let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
+        bad.v[ln_w][0] = bad.v[ln_w][0] + Goldilocks::ONE;
+        assert!(!verify_shard(&bad, &ops, &proof));
+    }
 }
