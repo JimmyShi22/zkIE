@@ -271,4 +271,37 @@ mod tests {
         let final_evals = vec![crate::mle::eval(&eq_broadcast, &challenges), crate::mle::eval(&e, &challenges)];
         assert!(crate::sumcheck::verify_virtual(&proof, &terms, claimed, &challenges, &final_evals));
     }
+    #[test]
+    fn product_with_virtual_row_sum() {
+        let mut rng = XorShift64::new(0x7777);
+        let (m, n) = (4usize, 4usize);
+        let e: Vec<Goldilocks> = (0..m * n).map(|_| rng.field()).collect();
+        let out: Vec<Goldilocks> = (0..m * n).map(|_| rng.field()).collect();
+        let sum: Vec<Goldilocks> = (0..m).map(|i| (0..n).fold(Goldilocks::from_u64(0), |acc, j| acc + e[i * n + j])).collect();
+        let check: Vec<Goldilocks> = (0..m * n).map(|idx| out[idx] * sum[idx / n]).collect();
+        let t2 = (m * n).trailing_zeros() as usize;
+        let r: Vec<Goldilocks> = (0..t2).map(|_| rng.field()).collect();
+        let eq2 = crate::mle::eq_evals(&r);
+        let n3 = m * n * n;
+        let mut eq_b: Vec<Goldilocks> = vec![Goldilocks::from_u64(0); n3];
+        let mut out_b: Vec<Goldilocks> = vec![Goldilocks::from_u64(0); n3];
+        let mut e_b: Vec<Goldilocks> = vec![Goldilocks::from_u64(0); n3];
+        for i in 0..m {
+            for j in 0..n {
+                for jp in 0..n {
+                    let idx = (i * n + j) * n + jp;
+                    eq_b[idx] = eq2[i * n + j];
+                    out_b[idx] = out[i * n + j];
+                    e_b[idx] = e[i * n + jp];
+                }
+            }
+        }
+        let terms = vec![(Goldilocks::from_u64(1), vec![0usize, 1usize, 2usize])];
+        let mles: Vec<&[Goldilocks]> = vec![&eq_b, &out_b, &e_b];
+        let claimed = crate::mle::eval(&check, &r);
+        let challenges: Vec<Goldilocks> = (0..n3.trailing_zeros() as usize).map(|_| rng.field()).collect();
+        let proof = crate::sumcheck::prove_virtual(&mles, &terms, claimed, &challenges);
+        let final_evals = vec![crate::mle::eval(&eq_b, &challenges), crate::mle::eval(&out_b, &challenges), crate::mle::eval(&e_b, &challenges)];
+        assert!(crate::sumcheck::verify_virtual(&proof, &terms, claimed, &challenges, &final_evals));
+    }
 }
