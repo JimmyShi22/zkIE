@@ -262,3 +262,25 @@ Notes:
   chunk=16 keeps each batch at a 2^14 codeword.
 - GPU (`ZKIE_CUDA=1`) is slower still here: the matmul/affine commitments are
   many and small, so the CUDA Merkle/DFT path is launch-bound.
+
+## GPT-2 124M seq=512: LogUp limb range check (2026-09-30)
+
+Replaced the softmax 31-binary-column range check with two 16-bit limbs plus a
+LogUp lookup per limb (`prove_limbs_range`), reusing the existing
+`prove_lookup` grand-product argument. This drops the softmax range-check
+witness from `31*n` to roughly `8*n` per side and removes the per-bit sumchecks
+(62 -> ~6 per range check).
+
+64-thread CPU, `Whir::new_testing`:
+
+| metric | before (31-bit) | after (LogUp limbs) |
+| --- | --- | --- |
+| layer 0 wall time | 125.2 s | 99.7 s |
+| full seq=512 wall time | ~27 min | 19.6 min (1175 s) |
+| global_open_count | 29435 | 29747 |
+| commit time (all batches) | - | 112.3 s |
+
+The commit (Merkle over the total witness) is now only ~10% of wall time; the
+rest is GKR/sumcheck work plus the FRI opens. Next levers: replace the
+affine/scale bit decomposition (`prove_round_batch`) the same way, then attack
+the matmul/sumcheck hot path.
