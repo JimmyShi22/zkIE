@@ -484,4 +484,19 @@ mod virtual_tests {
         bad[0] = bad[0] + Goldilocks::ONE;
         assert!(!verify_virtual(&proof, &terms, claimed, &challenges, &bad));
     }
+    #[test]
+    fn eq_weighted_sumcheck() {
+        let mut rng = XorShift64::new(0xC0DE);
+        let n = 1usize << 5;
+        let f: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let t = n.trailing_zeros() as usize;
+        let r: Vec<Goldilocks> = (0..t).map(|_| rng.field()).collect();
+        let eq: Vec<Goldilocks> = crate::mle::eq_evals(&r);
+        let claimed = crate::mle::eval(&f, &r);
+        let mles: Vec<&[Goldilocks]> = vec![&eq, &f];
+        let terms = vec![(Goldilocks::ONE, vec![0usize, 1])];
+        let challenges: Vec<Goldilocks> = r.clone();
+        let proof = prove_virtual(&mles, &terms, claimed, &challenges);
+        assert!(verify_virtual(&proof, &terms, claimed, &challenges, &proof.final_evals));
+    }
 }
