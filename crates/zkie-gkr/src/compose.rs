@@ -15,6 +15,7 @@ use crate::mle;
 use crate::projection::{prove_projection, verify_projection, ProjectionProof};
 use crate::same_poly::{prove_same_poly, verify_same_poly, SamePolyProof};
 use crate::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
+use crate::logup_gkr::{prove_lookup_fractional, verify_lookup_fractional, FractionalProof};
 
 /// One projection step's shape + weights. `w` is `k x n`, `bias` is `m x n`.
 #[derive(Clone, Debug)]
@@ -378,6 +379,308 @@ pub fn verify_residual_chain(
     true
 }
 
+// ===========================================================================
+// General data-driven shard composer: fold a list of op primitives into ONE g.
+// The op list (and therefore the shard granularity) is a public parameter; this
+// is what makes "shard = a group of ops" tunable instead of hand-wired per model.
+// ===========================================================================
+
+/// Tensor id in the shard's tensor store.
+pub type T = usize;
+
+/// A shard's tensor store: `v[id]` is a Goldilocks tensor; `idx[id]` is an
+/// integer index tensor (used by `Lookup`).
+#[derive(Default)]
+pub struct Store {
+    pub v: Vec<Vec<Goldilocks>>,
+    pub idx: Vec<Vec<u32>>,
+}
+
+impl Store {
+    pub fn new() -> Self {
+        Store::default()
+    }
+    pub fn push(&mut self, t: Vec<Goldilocks>) -> T {
+        let id = self.v.len();
+        self.v.push(t);
+        id
+    }
+    pub fn push_idx(&mut self, t: Vec<u32>) -> T {
+        let id = self.idx.len();
+        self.idx.push(t);
+        id
+    }
+    pub fn get(&self, id: T) -> &[Goldilocks] {
+        &self.v[id]
+    }
+}
+
+/// One op primitive. `Projection` = matmul + affine + round + range check;
+/// `Add` = elementwise `c = a + b`; `Lookup` = `out[i] = table[idx[i]]`.
+#[derive(Clone, Debug)]
+pub enum Op {
+    Projection {
+        x: T,
+        w: T,
+        bias: T,
+        out: T,
+        rem: T,
+        m: usize,
+        k: usize,
+        n: usize,
+        shift: u32,
+    },
+    Add {
+        a: T,
+        b: T,
+        c: T,
+    },
+    Lookup {
+        idx: T,
+        out: T,
+        table: T,
+    },
+}
+
+/// A proof for one op, kept heterogeneous because the primitives have different
+/// proof shapes.
+pub enum OpProof {
+    Projection(ProjectionProof),
+    Add(VirtualProof, Vec<Goldilocks>),
+    Lookup(FractionalProof, Goldilocks, Goldilocks),
+}
+
+/// A shard proof: per-op proofs plus the `same_poly` bindings on every
+/// multiply-consumed activation tensor.
+pub struct OpShardProof {
+    pub ops: Vec<OpProof>,
+    /// `binds[j]` merges the claims of tensor `bound[j]`.
+    pub bound: Vec<T>,
+    pub binds: Vec<SamePolyProof>,
+}
+
+/// Run the forward pass for all ops; materializes every `out`/`rem`/`c` into the
+/// store. Input tensors (`x`, `w`, `bias`, `idx`, `table`) must already exist.
+fn forward_ops(store: &mut Store, ops: &[Op]) {
+    for op in ops.iter().cloned() {
+        match op {
+            Op::Projection { x, w, bias, out, rem, m, k, n, shift } => {
+                let h = crate::par::mm_par(store.get(x), store.get(w), m, k, n, 64);
+                let o: Vec<Goldilocks> = (0..m * n)
+                    .map(|ij| {
+                        from_i64(round_div(to_i64(h[ij]), 1i64 << shift) + to_i64(store.get(bias)[ij]))
+                    })
+                    .collect();
+                let r: Vec<Goldilocks> = (0..m * n)
+                    .map(|ij| {
+                        from_i64(
+                            to_i64(h[ij]) - (to_i64(o[ij]) - to_i64(store.get(bias)[ij])) * (1i64 << shift)
+                                + (1i64 << (shift - 1)),
+                        )
+                    })
+                    .collect();
+                store.v[out] = o;
+                store.v[rem] = r;
+            }
+            Op::Add { a, b, c } => {
+                let s: Vec<Goldilocks> = store.get(a)
+                    .iter()
+                    .zip(store.get(b))
+                    .map(|(x, y)| *x + *y)
+                    .collect();
+                store.v[c] = s;
+            }
+            Op::Lookup { idx, out, table } => {
+                let o: Vec<Goldilocks> = store.idx[idx]
+                    .iter()
+                    .map(|&i| store.get(table)[i as usize])
+                    .collect();
+                store.v[out] = o;
+            }
+        }
+    }
+}
+
+/// Prove a shard: run forward, prove each op, collect the claims each op makes
+/// on activation tensors, and `same_poly`-bind every tensor claimed more than
+/// once (at different points). `boundary` marks the shard output tensor(s) that
+/// are committed at the boundary and therefore not bound internally.
+pub fn prove_shard(store: &mut Store, ops: &[Op], boundary: &[T], rng: &mut XorShift64) -> OpShardProof {
+    forward_ops(store, ops);
+
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    let add_terms = vec![
+        (Goldilocks::ONE, vec![2usize]),
+        (neg, vec![0usize]),
+        (neg, vec![1usize]),
+    ];
+
+    // (tensor_id, point, eval) claims emitted by each op's proof.
+    let mut claims: Vec<(T, Vec<Goldilocks>, Goldilocks)> = Vec::new();
+    let mut op_proofs = Vec::with_capacity(ops.len());
+
+    for op in ops {
+        match *op {
+            Op::Projection { x, w, bias, out, rem, m, k, n, shift } => {
+                let p = prove_projection(
+                    store.get(x),
+                    store.get(w),
+                    store.get(bias),
+                    store.get(out),
+                    store.get(rem),
+                    m, k, n, shift, rng,
+                );
+                let mut in_pt = p.ch.clone();
+                in_pt.extend_from_slice(&p.u);
+                claims.push((x, in_pt.clone(), mle::eval(store.get(x), &in_pt)));
+                claims.push((out, p.pt.clone(), mle::eval(store.get(out), &p.pt)));
+                op_proofs.push(OpProof::Projection(p));
+            }
+            Op::Add { a, b, c } => {
+                let r: Vec<Goldilocks> = (0..store.get(c).len().trailing_zeros() as usize)
+                    .map(|_| rng.field())
+                    .collect();
+                let mles: Vec<&[Goldilocks]> = vec![store.get(a), store.get(b), store.get(c)];
+                let proof = prove_virtual(&mles, &add_terms, Goldilocks::ZERO, &r);
+                claims.push((a, r.clone(), mle::eval(store.get(a), &r)));
+                claims.push((b, r.clone(), mle::eval(store.get(b), &r)));
+                claims.push((c, r.clone(), mle::eval(store.get(c), &r)));
+                op_proofs.push(OpProof::Add(proof, r));
+            }
+            Op::Lookup { idx, out, table } => {
+                let alpha = rng.field();
+                let beta = rng.field();
+                let p = prove_lookup_fractional(
+                    &store.idx[idx],
+                    store.get(out),
+                    store.get(table),
+                    alpha,
+                    beta,
+                    rng,
+                );
+                op_proofs.push(OpProof::Lookup(p, alpha, beta));
+            }
+        }
+    }
+
+    // Group claims by tensor and bind those with >1 distinct point (and not a
+    // committed boundary tensor).
+    let boundary_set: std::collections::HashSet<T> = boundary.iter().copied().collect();
+    let mut by_tensor: std::collections::BTreeMap<T, Vec<(Vec<Goldilocks>, Goldilocks)>> =
+        std::collections::BTreeMap::new();
+    for (t, pt, ev) in claims {
+        by_tensor.entry(t).or_default().push((pt, ev));
+    }
+
+    let mut bound = Vec::new();
+    let mut binds = Vec::new();
+    for (t, cs) in by_tensor {
+        if boundary_set.contains(&t) || cs.len() < 2 {
+            continue;
+        }
+        let sp = prove_same_poly(store.get(t), &cs, rng);
+        bound.push(t);
+        binds.push(sp);
+    }
+
+    OpShardProof { ops: op_proofs, bound, binds }
+}
+
+/// Verify a shard proof.
+pub fn verify_shard(store: &Store, ops: &[Op], proof: &OpShardProof) -> bool {
+    assert_eq!(proof.ops.len(), ops.len());
+    assert_eq!(proof.bound.len(), proof.binds.len());
+
+    // Recompute forward on a scratch store (the input tensors are read-only; the
+    // op outputs are recomputed to check the proof against a fresh witness).
+    let mut ws = Store { v: store.v.clone(), idx: store.idx.clone() };
+    forward_ops(&mut ws, ops);
+
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    let add_terms = vec![
+        (Goldilocks::ONE, vec![2usize]),
+        (neg, vec![0usize]),
+        (neg, vec![1usize]),
+    ];
+
+    let mut claims: Vec<(T, Vec<Goldilocks>, Goldilocks)> = Vec::new();
+    for (op, p) in ops.iter().zip(&proof.ops) {
+        match (op, p) {
+            (
+                Op::Projection { x, w, bias, out, rem, m, k, n, shift },
+                OpProof::Projection(pp),
+            ) => {
+                if !verify_projection(
+                    pp,
+                    ws.get(*x),
+                    ws.get(*w),
+                    ws.get(*bias),
+                    ws.get(*out),
+                    ws.get(*rem),
+                    *m, *k, *n, *shift,
+                ) {
+                    return false;
+                }
+                let mut in_pt = pp.ch.clone();
+                in_pt.extend_from_slice(&pp.u);
+                claims.push((*x, in_pt.clone(), mle::eval(ws.get(*x), &in_pt)));
+                claims.push((*out, pp.pt.clone(), mle::eval(ws.get(*out), &pp.pt)));
+            }
+            (Op::Add { a, b, c }, OpProof::Add(vp, r)) => {
+                let fe = vec![
+                    mle::eval(ws.get(*a), r),
+                    mle::eval(ws.get(*b), r),
+                    mle::eval(ws.get(*c), r),
+                ];
+                if !verify_virtual(vp, &add_terms, Goldilocks::ZERO, r, &fe) {
+                    return false;
+                }
+                claims.push((*a, r.clone(), mle::eval(ws.get(*a), r)));
+                claims.push((*b, r.clone(), mle::eval(ws.get(*b), r)));
+                claims.push((*c, r.clone(), mle::eval(ws.get(*c), r)));
+            }
+            (Op::Lookup { idx, out, table }, OpProof::Lookup(fp, alpha, beta)) => {
+                if !verify_lookup_fractional(
+                    fp,
+                    &ws.idx[*idx],
+                    ws.get(*out),
+                    ws.get(*table),
+                    *alpha,
+                    *beta,
+                ) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+
+    // Rebuild the same grouping as prove_shard and verify each binding.
+    let mut by_tensor: std::collections::BTreeMap<T, Vec<(Vec<Goldilocks>, Goldilocks)>> =
+        std::collections::BTreeMap::new();
+    for (t, pt, ev) in claims {
+        by_tensor.entry(t).or_default().push((pt, ev));
+    }
+    // Recompute which tensors are bound (same rule: >1 claim). We rely on the
+    // proof's `bound` list to be the canonical order.
+    let mut bound_claims: Vec<Vec<(Vec<Goldilocks>, Goldilocks)>> = Vec::new();
+    for &t in &proof.bound {
+        match by_tensor.get(&t) {
+            Some(cs) if cs.len() >= 2 => bound_claims.push(cs.clone()),
+            _ => return false,
+        }
+    }
+    if bound_claims.len() != proof.binds.len() {
+        return false;
+    }
+    for (i, &t) in proof.bound.iter().enumerate() {
+        if verify_same_poly(&proof.binds[i], ws.get(t), &bound_claims[i]).is_none() {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,5 +745,58 @@ mod tests {
         let mut bad_steps = steps.clone();
         bad_steps[1].w[0] = bad_steps[1].w[0] + Goldilocks::ONE;
         assert!(!verify_residual_chain(&proof, &x, &bad_steps));
+    }
+
+    #[test]
+    fn op_shard_ffn_roundtrip() {
+        let mut rng = XorShift64::new(0x0E0E);
+        let (m, d, ffn, shift) = (4usize, 8usize, 16usize, 8u32);
+        let mut store = Store::new();
+        let x = store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let fc_w = store.push((0..d * ffn).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let fc_b = store.push((0..m * ffn).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
+        let proj_w = store.push((0..ffn * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let proj_b = store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
+        let gelu_table = store.push((0..64).map(|j| from_i64((j as i64).pow(2) % 1000)).collect());
+        // Reserve output/witness slots (values overwritten by forward_ops).
+        let fc = store.push(vec![]);
+        let fc_rem = store.push(vec![]);
+        let act_idx = store.push_idx(vec![]);
+        let act = store.push(vec![]);
+        let proj2 = store.push(vec![]);
+        let proj2_rem = store.push(vec![]);
+        let out = store.push(vec![]);
+
+        // fc = projection(x); act = gelu(fc); proj2 = projection(act); out = x + proj2.
+        // The gelu index is derived from fc in the forward (same simplification as
+        // ffn_chain: index = fc % 64, wired via the idx tensor).
+        let ops = vec![
+            Op::Projection { x, w: fc_w, bias: fc_b, out: fc, rem: fc_rem, m, k: d, n: ffn, shift },
+            Op::Lookup { idx: act_idx, out: act, table: gelu_table },
+            Op::Projection { x: act, w: proj_w, bias: proj_b, out: proj2, rem: proj2_rem, m, k: ffn, n: d, shift },
+            Op::Add { a: x, b: proj2, c: out },
+        ];
+
+        // Fill the gelu idx tensor (derived from fc) before proving.
+        let fc_val = {
+            let h = crate::par::mm_par(store.get(x), store.get(fc_w), m, d, ffn, 64);
+            (0..m * ffn)
+                .map(|ij| from_i64(round_div(to_i64(h[ij]), 1i64 << shift) + to_i64(store.get(fc_b)[ij])))
+                .collect::<Vec<_>>()
+        };
+        let idx: Vec<u32> = fc_val
+            .iter()
+            .map(|&v| ((to_i64(v).max(0)) as u64 % 64) as u32)
+            .collect();
+        store.idx[act_idx] = idx;
+
+        let proof = prove_shard(&mut store, &ops, &[out], &mut rng);
+        assert!(!proof.bound.is_empty(), "residual x must be bound");
+        assert!(verify_shard(&store, &ops, &proof));
+
+        // Tamper with an intermediate weight -> must fail.
+        let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
+        bad.v[fc_w][0] = bad.v[fc_w][0] + Goldilocks::ONE;
+        assert!(!verify_shard(&bad, &ops, &proof));
     }
 }
