@@ -11,6 +11,7 @@
 
 use crate::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64};
 use crate::fixed_point::{from_i64, to_i64};
+use crate::matmul::{prove as matmul_prove, verify as matmul_verify, MatmulProof};
 use crate::mle;
 use crate::projection::{prove_projection, verify_projection, ProjectionProof};
 use crate::same_poly::{prove_same_poly, verify_same_poly, SamePolyProof};
@@ -18,6 +19,16 @@ use crate::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
 use crate::logup_gkr::{prove_lookup_fractional, verify_lookup_fractional, FractionalProof};
 use crate::softmax_scaled::{prove_softmax_scaled, verify_softmax_scaled, SoftmaxScaledProof};
 use crate::layernorm_chain::{prove_layernorm_chain, verify_layernorm_chain, LayernormChainProof};
+
+fn transpose(a: &[Goldilocks], m: usize, k: usize) -> Vec<Goldilocks> {
+    let mut t = vec![Goldilocks::ZERO; k * m];
+    for i in 0..m {
+        for kk in 0..k {
+            t[kk * m + i] = a[i * k + kk];
+        }
+    }
+    t
+}
 
 /// One projection step's shape + weights. `w` is `k x n`, `bias` is `m x n`.
 #[derive(Clone, Debug)]
@@ -518,6 +529,14 @@ impl Store {
 /// `Add` = elementwise `c = a + b`; `Lookup` = `out[i] = table[idx[i]]`.
 #[derive(Clone, Debug)]
 pub enum Op {
+    MatMul {
+        a: T,
+        b: T,
+        c: T,
+        m: usize,
+        k: usize,
+        n: usize,
+    },
     Projection {
         x: T,
         w: T,
@@ -561,6 +580,7 @@ pub enum Op {
 /// A proof for one op, kept heterogeneous because the primitives have different
 /// proof shapes.
 pub enum OpProof {
+    MatMul(MatmulProof, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>),
     Projection(ProjectionProof),
     Add(VirtualProof, Vec<Goldilocks>),
     Lookup(FractionalProof, Goldilocks, Goldilocks),
@@ -585,6 +605,10 @@ pub struct OpShardProof {
 fn forward_ops(store: &mut Store, ops: &[Op]) {
     for op in ops.iter().cloned() {
         match op {
+            Op::MatMul { a, b, c, m, k, n } => {
+                let cval = crate::par::mm_par(store.get(a), store.get(b), m, k, n, 64);
+                store.v[c] = cval;
+            }
             Op::Projection { x, w, bias, out, rem, m, k, n, shift } => {
                 let h = crate::par::mm_par(store.get(x), store.get(w), m, k, n, 64);
                 let o: Vec<Goldilocks> = (0..m * n)
@@ -673,6 +697,23 @@ pub fn prove_shard(store: &mut Store, ops: &[Op], boundary: &[T], rng: &mut XorS
 
     for op in ops {
         match *op {
+            Op::MatMul { a, b, c, m, k, n } => {
+                let at = transpose(store.get(a), m, k);
+                let u: Vec<Goldilocks> = (0..m.trailing_zeros() as usize).map(|_| rng.field()).collect();
+                let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
+                let ch: Vec<Goldilocks> = (0..k.trailing_zeros() as usize).map(|_| rng.field()).collect();
+                let p = matmul_prove(&at, store.get(b), store.get(c), m, k, n, &u, &v, &ch);
+                let mut ap = ch.clone();
+                ap.extend_from_slice(&u);
+                claims.push((a, ap.clone(), mle::eval(store.get(a), &ap)));
+                let mut bp = v.clone();
+                bp.extend_from_slice(&ch);
+                claims.push((b, bp.clone(), mle::eval(store.get(b), &bp)));
+                let mut cp = v.clone();
+                cp.extend_from_slice(&u);
+                claims.push((c, cp.clone(), mle::eval(store.get(c), &cp)));
+                op_proofs.push(OpProof::MatMul(p, u, v, ch));
+            }
             Op::Projection { x, w, bias, out, rem, m, k, n, shift } => {
                 let p = prove_projection(
                     store.get(x),
@@ -785,6 +826,25 @@ pub fn verify_shard(store: &Store, ops: &[Op], proof: &OpShardProof) -> bool {
     let mut claims: Vec<(T, Vec<Goldilocks>, Goldilocks)> = Vec::new();
     for (op, p) in ops.iter().zip(&proof.ops) {
         match (op, p) {
+            (Op::MatMul { a, b, c, m, k, n: _ }, OpProof::MatMul(mp, u, v, ch)) => {
+                let at = transpose(ws.get(*a), *m, *k);
+                let a_restricted = mle::partial_eval(&at, u);
+                let b_restricted = mle::partial_eval(ws.get(*b), v);
+                let f_eval = mle::eval(&a_restricted, ch);
+                let h_eval = mle::eval(&b_restricted, ch);
+                if !matmul_verify(mp, ch, f_eval, h_eval) {
+                    return false;
+                }
+                let mut ap = ch.clone();
+                ap.extend_from_slice(u);
+                claims.push((*a, ap.clone(), mle::eval(ws.get(*a), &ap)));
+                let mut bp = v.clone();
+                bp.extend_from_slice(ch);
+                claims.push((*b, bp.clone(), mle::eval(ws.get(*b), &bp)));
+                let mut cp = v.clone();
+                cp.extend_from_slice(u);
+                claims.push((*c, cp.clone(), mle::eval(ws.get(*c), &cp)));
+            }
             (
                 Op::Projection { x, w, bias, out, rem, m, k, n, shift },
                 OpProof::Projection(pp),
@@ -1627,5 +1687,22 @@ mod tests {
         assert!(!verify_projection_committed(
             &proof, &x, &w_batch, 0, &bias_batch, 0, &bad_w, &bias, &out, &rem, m, d, d, shift,
         ));
+    }
+
+    #[test]
+    fn op_shard_matmul_roundtrip() {
+        let mut rng = XorShift64::new(0x1818);
+        let (m, k, n) = (4usize, 8usize, 8usize);
+        let mut store = Store::new();
+        let a = store.push((0..m * k).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let b = store.push((0..k * n).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let c = store.push(vec![]);
+        let ops = vec![Op::MatMul { a, b, c, m, k, n }];
+        let proof = prove_shard(&mut store, &ops, &[c], &mut rng);
+        assert!(verify_shard(&store, &ops, &proof));
+
+        let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
+        bad.v[a][0] = bad.v[a][0] + Goldilocks::ONE;
+        assert!(!verify_shard(&bad, &ops, &proof));
     }
 }
