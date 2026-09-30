@@ -204,6 +204,40 @@ fn layernorm_forward(
     (0..m * d).map(|ij| x[ij] * scale[ij] + b[ij]).collect()
 }
 
+/// Full post-norm transformer layer forward (witness): x -> x_new, exposed so a
+/// caller can generate all witnesses sequentially and then prove in parallel.
+#[allow(clippy::too_many_arguments)]
+pub fn transformer_layer_forward(
+    x: &[Goldilocks],
+    wq: &[Goldilocks],
+    wk: &[Goldilocks],
+    wv: &[Goldilocks],
+    wo: &[Goldilocks],
+    bias: &[Goldilocks],
+    exp_table: &[Goldilocks],
+    fc_w: &[Goldilocks],
+    fc_b: &[Goldilocks],
+    proj_w: &[Goldilocks],
+    proj_b: &[Goldilocks],
+    gelu_table: &[Goldilocks],
+    ln_w: &[Goldilocks],
+    ln_b: &[Goldilocks],
+    rsqrt_table: &[Goldilocks],
+    m: usize,
+    d: usize,
+    ffn: usize,
+    shift: u32,
+) -> Vec<Goldilocks> {
+    let h = layernorm_forward(x, ln_w, ln_b, rsqrt_table, m, d);
+    let y = attention_forward(&h, wq, wk, wv, wo, bias, exp_table, m, d, shift);
+    // FFN on y (post-norm residual), reusing ffn_chain's forward.
+    let fc = projection_fp(&y, fc_w, fc_b, m, d, ffn, shift);
+    let gelu_idx: Vec<u32> = fc.iter().map(|&v| ((to_i64(v).max(0)) as u64 % 64) as u32).collect();
+    let act: Vec<Goldilocks> = gelu_idx.iter().map(|&i| gelu_table[i as usize]).collect();
+    let proj = projection_fp(&act, proj_w, proj_b, m, ffn, d, shift);
+    (0..m * d).map(|i| y[i] + proj[i]).collect()
+}
+
 /// Full post-norm transformer layer: h = layernorm(x), then attention + FFN on h,
 /// with `same_poly` binding the layernorm output `h` to the attention's input.
 #[allow(clippy::too_many_arguments)]
