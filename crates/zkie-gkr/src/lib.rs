@@ -26,6 +26,7 @@ pub mod same_poly;
 pub mod projection;
 pub mod ffn;
 pub mod softmax_circuit;
+pub mod softmax_scaled;
 pub mod attention;
 pub mod batch_open;
 pub mod whir;
