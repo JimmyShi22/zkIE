@@ -254,4 +254,21 @@ mod tests {
         let frac = crate::logup_gkr::prove_lookup_fractional(&idx, &rem_off, &table, alpha, beta, &mut rng);
         assert!(crate::logup_gkr::verify_lookup_fractional(&frac, &idx, &rem_off, &table, alpha, beta));
     }
+    #[test]
+    fn row_sum_reduction_virtual() {
+        let mut rng = XorShift64::new(0x9ABC);
+        let (m, n) = (4usize, 4usize);
+        let e: Vec<Goldilocks> = (0..m * n).map(|_| rng.field()).collect();
+        let sum: Vec<Goldilocks> = (0..m).map(|i| (0..n).fold(Goldilocks::from_u64(0), |acc, j| acc + e[i * n + j])).collect();
+        let r: Vec<Goldilocks> = (0..m.trailing_zeros() as usize).map(|_| rng.field()).collect();
+        let eq_i = crate::mle::eq_evals(&r);
+        let eq_broadcast: Vec<Goldilocks> = (0..m * n).map(|idx| eq_i[idx / n]).collect();
+        let terms = vec![(Goldilocks::from_u64(1), vec![0usize, 1usize])];
+        let mles: Vec<&[Goldilocks]> = vec![&eq_broadcast, &e];
+        let claimed = crate::mle::eval(&sum, &r);
+        let challenges: Vec<Goldilocks> = (0..(m * n).trailing_zeros() as usize).map(|_| rng.field()).collect();
+        let proof = crate::sumcheck::prove_virtual(&mles, &terms, claimed, &challenges);
+        let final_evals = vec![crate::mle::eval(&eq_broadcast, &challenges), crate::mle::eval(&e, &challenges)];
+        assert!(crate::sumcheck::verify_virtual(&proof, &terms, claimed, &challenges, &final_evals));
+    }
 }
