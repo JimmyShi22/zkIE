@@ -279,6 +279,31 @@ pub fn autotune(model: &Model, granularities: &[Granularity]) -> TuningResult {
     best.expect("non-empty granularity set")
 }
 
+/// Autotune with a caller-supplied measurement function instead of the cost
+/// model. This is the "real" loop: the caller runs the actual proof at each
+/// (granularity, schedule) config and returns the measured `TuningResult`; the
+/// engine only searches and returns the lowest-total one. Tune once per model
+/// and cache the returned result.
+pub fn autotune_with<F>(
+    granularities: &[Granularity],
+    schedules: &[StageSchedule],
+    mut measure: F,
+) -> TuningResult
+where
+    F: FnMut(Granularity, StageSchedule) -> TuningResult,
+{
+    let mut best: Option<TuningResult> = None;
+    for &g in granularities {
+        for &sched in schedules {
+            let r = measure(g, sched);
+            if best.as_ref().map_or(true, |b| r.total_s < b.total_s) {
+                best = Some(r);
+            }
+        }
+    }
+    best.expect("non-empty config set")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
