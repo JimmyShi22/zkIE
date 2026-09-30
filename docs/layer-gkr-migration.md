@@ -84,3 +84,24 @@ Concrete next steps (in order):
 3. Chain matmul -> affine -> add for a minimal m=k=n=2 case, only committing
    A, B, bias, D (not C).
 4. Wire the whole layer compiler into the GPT-2 path (Exec -> layer circuit).
+
+## Matmul chaining protocol (exact)
+
+`matmul::prove` already returns `claimed = C(v,u)` plus the sumcheck proving
+`C(v,u) = sum_k A(u,k)*B(k,v)`. The current `prove_matmul` then OPENS C at
+`cp = v ++ u`. To avoid committing C, skip that opening and pass `C(v,u)` as a
+claim to the downstream layer.
+
+Chaining matmul -> add (`D = C + bias`), only committing A, B, bias, D:
+1. matmul GKR: proves `C(v,u) = sum_k A(u,k)B(k,v)`; leaves claims on A at
+   `ch ++ u`, B at `v ++ ch`, and the scalar C(v,u).
+2. add eq-weighted sumcheck at the SAME point `p = v ++ u`:
+   `sum_{i,j} eq(p,(i,j)) * (D(i,j) - C(i,j) - bias(i,j)) = 0`, reducing to
+   `D(p) - C(p) - bias(p) = 0`. C here is the virtual MLE (prover computes
+   C = A@B in plain, verifier never commits it).
+3. binding: C(v,u) from step 1 == C(p) from step 2 (same point p = v ++ u).
+4. open A, B, bias, D only.
+
+Point order is the subtle part: C's MLE is indexed n-first (`c_point = v ++ u`),
+so the add's eq selector must be `eq(v ++ u, (j,i))` (n-dim first). Keep this
+convention throughout, or add a transpose layer.
