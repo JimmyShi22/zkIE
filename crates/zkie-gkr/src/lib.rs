@@ -24,6 +24,7 @@ pub mod logup_gkr;
 pub mod layer_circuit;
 pub mod layer;
 pub mod layernorm_chain;
+pub mod layer_norm_centered;
 pub mod same_poly;
 pub mod attention_chain;
 pub mod transformer_chain;
