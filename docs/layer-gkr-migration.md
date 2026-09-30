@@ -27,3 +27,28 @@ folded into the sumcheck. Acceptance: GPT-2 512 runs and produces a time.
    claim; only commit the layer boundary (unified tensor, one WHIR).
 5. N-ary tree sharding (N public) + agg + layer parallelism + cross-shard
    binding.
+
+## Claim chaining (step 4) design notes
+
+Primitives are all built and unit-tested (54 lib tests green). The remaining
+work is the integration.
+
+- Arithmetic layers (add / hadamard-mul / affine): the intermediate can be
+  substituted away, so "claim chaining" = write the composed constraint and
+  prove with `prove_layer_circuit`, opening only the boundary
+  (see `layer_circuit::tests::claim_chain_no_intermediate`).
+- Lookup layers (softmax exp / gelu / layernorm rsqrt): the intermediate is a
+  table lookup (not substitutable). Chain via `prove_lookup_fractional`, and
+  pass the intermediate claim (a fraction at the random point) between layers
+  with a same_poly / claim-merge step (consistent random point across layers).
+- The eq-weighted sumcheck's final check carries an `eq(r,r)` factor (not 1 for
+  non-boolean r); `verify_virtual` handles this because both sides use the same
+  `eq(r,r)`. Soundness is the FIRST round check `p[0]+p[1] == claimed`, which is
+  the MLE interpolation identity.
+
+### Remaining (the big integration)
+1. GPT-2 layer compiler: matmul (separate GKR reduction over the contraction
+   index) chained with the elementwise/lookup layers into one per-layer circuit.
+2. Unified tensor + one WHIR commit per layer; only the boundary is committed.
+3. N-ary tree sharding (N public) + agg + layer parallelism + cross-shard
+   binding (downstream input commitment == upstream output commitment).
