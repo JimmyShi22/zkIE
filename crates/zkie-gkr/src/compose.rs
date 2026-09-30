@@ -192,6 +192,103 @@ pub fn verify_projection_chain(
     true
 }
 
+/// A sharded projection chain: split a linear chain of projections into shards
+/// of `ops_per_shard` ops, prove each shard independently (folding its ops into
+/// one g), and `same_poly`-bind every cross-shard boundary tensor. This is the
+/// "shard granularity drives the proof" mechanism: `ops_per_shard` is a public
+/// parameter, and the cross-shard bindings enforce composition soundness.
+pub struct ProjectionShardedProof {
+    pub shards: Vec<ProjectionChainProof>,
+    pub cross_binds: Vec<SamePolyProof>,
+    /// Global step index of each cross-shard boundary tensor `ys[b]`.
+    pub boundary_steps: Vec<usize>,
+}
+
+pub fn prove_projection_sharded(
+    x: &[Goldilocks],
+    steps: &[ProjectionStep],
+    ops_per_shard: usize,
+    rng: &mut XorShift64,
+) -> ProjectionShardedProof {
+    assert!(!steps.is_empty(), "chain needs at least one projection");
+    let ops_per_shard = ops_per_shard.max(1);
+    let (ys, _) = forward(x, steps);
+
+    let mut shards = Vec::new();
+    let mut boundary_steps = Vec::new();
+    let mut start = 0;
+    while start < steps.len() {
+        let end = (start + ops_per_shard).min(steps.len());
+        let input: &[Goldilocks] = if start == 0 { x } else { &ys[start - 1] };
+        shards.push(prove_projection_chain(input, &steps[start..end], rng));
+        start = end;
+        if start < steps.len() {
+            boundary_steps.push(start - 1);
+        }
+    }
+
+    let mut cross_binds = Vec::with_capacity(boundary_steps.len());
+    for &b in &boundary_steps {
+        let prev_shard = b / ops_per_shard;
+        let next_shard = prev_shard + 1;
+        let prev = shards[prev_shard].steps.last().unwrap();
+        let next = shards[next_shard].steps.first().unwrap();
+        let out_pt = prev.pt.clone();
+        let mut in_pt = next.ch.clone();
+        in_pt.extend_from_slice(&next.u);
+        let claims = vec![
+            (out_pt.clone(), mle::eval(&ys[b], &out_pt)),
+            (in_pt.clone(), mle::eval(&ys[b], &in_pt)),
+        ];
+        cross_binds.push(prove_same_poly(&ys[b], &claims, rng));
+    }
+
+    ProjectionShardedProof { shards, cross_binds, boundary_steps }
+}
+
+pub fn verify_projection_sharded(
+    proof: &ProjectionShardedProof,
+    x: &[Goldilocks],
+    steps: &[ProjectionStep],
+    ops_per_shard: usize,
+) -> bool {
+    let ops_per_shard = ops_per_shard.max(1);
+    let (ys, _) = forward(x, steps);
+
+    let mut start = 0;
+    let mut si = 0;
+    while start < steps.len() {
+        let end = (start + ops_per_shard).min(steps.len());
+        let input: &[Goldilocks] = if start == 0 { x } else { &ys[start - 1] };
+        if !verify_projection_chain(&proof.shards[si], input, &steps[start..end]) {
+            return false;
+        }
+        si += 1;
+        start = end;
+    }
+
+    if proof.cross_binds.len() != proof.boundary_steps.len() {
+        return false;
+    }
+    for (ci, &b) in proof.boundary_steps.iter().enumerate() {
+        let prev_shard = b / ops_per_shard;
+        let next_shard = prev_shard + 1;
+        let prev = proof.shards[prev_shard].steps.last().unwrap();
+        let next = proof.shards[next_shard].steps.first().unwrap();
+        let out_pt = prev.pt.clone();
+        let mut in_pt = next.ch.clone();
+        in_pt.extend_from_slice(&next.u);
+        let claims = vec![
+            (out_pt.clone(), mle::eval(&ys[b], &out_pt)),
+            (in_pt.clone(), mle::eval(&ys[b], &in_pt)),
+        ];
+        if verify_same_poly(&proof.cross_binds[ci], &ys[b], &claims).is_none() {
+            return false;
+        }
+    }
+    true
+}
+
 /// A chain of residual projection blocks, folded into one g:
 /// `p_i = projection(x_{i-1})`, `x_i = x_{i-1} + p_i`. This is the first
 /// *branching* shape: each `x_{i-1}` is consumed by both the projection and the
@@ -830,6 +927,31 @@ mod tests {
         let mut bad_steps = steps.clone();
         bad_steps[1].w[0] = bad_steps[1].w[0] + Goldilocks::ONE;
         assert!(!verify_projection_chain(&proof, &x, &bad_steps));
+    }
+
+    #[test]
+    fn projection_sharded_granularity() {
+        let mut rng = XorShift64::new(0x1111);
+        let (m, d, shift) = (4usize, 8usize, 8u32);
+        let x: Vec<Goldilocks> = (0..m * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect();
+        let steps: Vec<ProjectionStep> = (0..8).map(|_| step(m, d, d, shift, &mut rng)).collect();
+
+        let ops_per_shard = 2;
+        let proof = prove_projection_sharded(&x, &steps, ops_per_shard, &mut rng);
+        assert_eq!(proof.shards.len(), 4, "8 ops / 2 per shard = 4 shards");
+        assert_eq!(proof.cross_binds.len(), 3, "3 cross-shard boundaries");
+        assert!(verify_projection_sharded(&proof, &x, &steps, ops_per_shard));
+
+        // A single altered weight in the middle breaks the affected shard.
+        let mut bad_steps = steps.clone();
+        bad_steps[3].w[0] = bad_steps[3].w[0] + Goldilocks::ONE;
+        assert!(!verify_projection_sharded(&proof, &x, &bad_steps, ops_per_shard));
+
+        // Whole-model granularity = one shard, no cross-bindings.
+        let whole = prove_projection_sharded(&x, &steps, steps.len(), &mut rng);
+        assert_eq!(whole.shards.len(), 1);
+        assert!(whole.cross_binds.is_empty());
+        assert!(verify_projection_sharded(&whole, &x, &steps, steps.len()));
     }
 
     #[test]
