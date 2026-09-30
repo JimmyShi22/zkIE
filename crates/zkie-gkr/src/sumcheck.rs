@@ -4,6 +4,7 @@
 //! degree at most two, so the prover sends three coefficients per round.
 
 use crate::field::{Field, Goldilocks, PrimeCharacteristicRing};
+use crate::fixed_point::from_i64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RoundPoly {
@@ -347,5 +348,140 @@ mod tests {
 
         let wrong = true_sum + Goldilocks::ONE;
         assert!(!verify3(&proof, wrong, &challenges, f_eval, g_eval, h_eval));
+    }
+}
+
+// ==== virtual-polynomial sumcheck (sum of products of MLEs) ====
+/// A sum of products of multilinear polynomials: g(x) = sum_i coeff_i * prod_{j in term_i} f_j(x).
+/// Proves sum_{x in {0,1}^t} g(x) = claimed with a single sumcheck whose round
+/// polynomial has degree max_i |term_i|.
+pub struct VirtualProof {
+    pub rounds: Vec<Vec<Goldilocks>>,
+    pub final_evals: Vec<Goldilocks>,
+}
+pub fn prove_virtual(
+    mles: &[&[Goldilocks]],
+    terms: &[(Goldilocks, Vec<usize>)],
+    claimed: Goldilocks,
+    challenges: &[Goldilocks],
+) -> VirtualProof {
+    let n = mles[0].len();
+    let t = n.trailing_zeros() as usize;
+    assert!(n.is_power_of_two());
+    for m in mles {
+        assert_eq!(m.len(), n);
+    }
+    assert_eq!(challenges.len(), t);
+    let max_deg = terms.iter().map(|(_, idxs)| idxs.len()).max().unwrap_or(0);
+    let mut bufs: Vec<Vec<Goldilocks>> = mles.iter().map(|m| m.to_vec()).collect();
+    let mut rounds = Vec::with_capacity(t);
+    for &r in challenges {
+        let half = bufs[0].len() / 2;
+        let mut pvals = vec![Goldilocks::ZERO; max_deg + 1];
+        for s in 0..half {
+            for (coeff, idxs) in terms {
+                for k in 0..=max_deg {
+                    let mut prod = *coeff;
+                    for &j in idxs {
+                        let f0 = bufs[j][2 * s];
+                        let f1 = bufs[j][2 * s + 1];
+                        let fk = from_i64(k as i64) * f1 - from_i64(k as i64 - 1) * f0;
+                        prod = prod * fk;
+                    }
+                    pvals[k] = pvals[k] + prod;
+                }
+            }
+        }
+        rounds.push(pvals);
+        for j in 0..bufs.len() {
+            for s in 0..half {
+                let f0 = bufs[j][2 * s];
+                let f1 = bufs[j][2 * s + 1];
+                bufs[j][s] = (Goldilocks::ONE - r) * f0 + r * f1;
+            }
+            bufs[j].truncate(half);
+        }
+    }
+    let final_evals = bufs.iter().map(|b| b[0]).collect();
+    VirtualProof { rounds, final_evals }
+}
+fn interpolate(vals: &[Goldilocks], x: Goldilocks, d: usize) -> Goldilocks {
+    let mut out = Goldilocks::ZERO;
+    for k in 0..=d {
+        let mut term = vals[k];
+        for j in 0..=d {
+            if j != k {
+                let num = x - from_i64(j as i64);
+                let den = from_i64(k as i64) - from_i64(j as i64);
+                term = term * num * den.inverse();
+            }
+        }
+        out = out + term;
+    }
+    out
+}
+pub fn verify_virtual(
+    proof: &VirtualProof,
+    terms: &[(Goldilocks, Vec<usize>)],
+    claimed: Goldilocks,
+    challenges: &[Goldilocks],
+    final_evals: &[Goldilocks],
+) -> bool {
+    let max_deg = terms.iter().map(|(_, idxs)| idxs.len()).max().unwrap_or(0);
+    if proof.rounds.len() != challenges.len() {
+        return false;
+    }
+    let mut current = claimed;
+    for (pvals, &r) in proof.rounds.iter().zip(challenges) {
+        if pvals.len() != max_deg + 1 {
+            return false;
+        }
+        if pvals[0] + pvals[1] != current {
+            return false;
+        }
+        current = interpolate(pvals, r, max_deg);
+    }
+    let mut final_val = Goldilocks::ZERO;
+    for (coeff, idxs) in terms {
+        let mut prod = *coeff;
+        for &j in idxs {
+            prod = prod * final_evals[j];
+        }
+        final_val = final_val + prod;
+    }
+    current == final_val
+}
+
+#[cfg(test)]
+mod virtual_tests {
+    use super::*;
+    use crate::field::XorShift64;
+    #[test]
+    fn virtual_sumcheck_roundtrip() {
+        let mut rng = XorShift64::new(0xBEEF);
+        let n = 1usize << 6;
+        let f: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let g: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let h: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let t = n.trailing_zeros() as usize;
+        let challenges: Vec<Goldilocks> = (0..t).map(|_| rng.field()).collect();
+        let terms: Vec<(Goldilocks, Vec<usize>)> = vec![
+            (Goldilocks::from_u64(3), vec![0, 1]),
+            (from_i64(-2), vec![1, 2]),
+            (Goldilocks::ONE, vec![0, 1, 2]),
+        ];
+        let claimed: Goldilocks = (0..n).map(|i| {
+            Goldilocks::from_u64(3) * f[i] * g[i] + from_i64(-2) * g[i] * h[i] + f[i] * g[i] * h[i]
+        }).sum();
+        let mles: Vec<&[Goldilocks]> = vec![&f, &g, &h];
+        let proof = prove_virtual(&mles, &terms, claimed, &challenges);
+        for (m, &ev) in mles.iter().zip(&proof.final_evals) {
+            let ev2 = crate::mle::eval(m, &challenges);
+            assert_eq!(ev, ev2);
+        }
+        assert!(verify_virtual(&proof, &terms, claimed, &challenges, &proof.final_evals));
+        let mut bad = proof.final_evals.clone();
+        bad[0] = bad[0] + Goldilocks::ONE;
+        assert!(!verify_virtual(&proof, &terms, claimed, &challenges, &bad));
     }
 }
