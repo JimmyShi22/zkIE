@@ -1380,6 +1380,108 @@ pub fn verify_projection_committed(
     true
 }
 
+/// Build a full pre-norm GPT-2 transformer layer as an op list:
+/// `h = layernorm(x)` -> multi-head attention -> `x2 = x + attn` ->
+/// `h2 = layernorm(x2)` -> FFN (fc -> gelu -> proj) -> `out = x2 + ffn_out`.
+/// Returns the op list and the output tensor id. `heads` is the number of
+/// attention heads (`d` must be divisible by `heads`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_gpt2_layer(
+    store: &mut Store,
+    x: T,
+    heads: usize,
+    m: usize,
+    d: usize,
+    ffn: usize,
+    shift: u32,
+    exp_table: T,
+    gelu_table: T,
+    rsqrt_table: T,
+    rng: &mut XorShift64,
+) -> (Vec<Op>, T) {
+    let dh = d / heads;
+    let mut ops = Vec::new();
+
+    // pre-norm for attention
+    let ln1_w = store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 5) as i64 + 1)).collect());
+    let ln1_b = store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
+    let h = store.push(vec![]);
+    ops.push(Op::Layernorm { x, w: ln1_w, b: ln1_b, out: h, rsqrt_table, m, d });
+
+    // multi-head attention on h
+    let mut head_outs = Vec::new();
+    for _ in 0..heads {
+        let wq = store.push((0..d * dh).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let wk = store.push((0..d * dh).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let wv = store.push((0..d * dh).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let wo = store.push((0..dh * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let bq = store.push((0..m * dh).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
+        let bk = store.push((0..m * dh).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
+        let bv = store.push((0..m * dh).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
+        let bo = store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
+        let q = store.push(vec![]);
+        let k = store.push(vec![]);
+        let v = store.push(vec![]);
+        let qr = store.push(vec![]);
+        let kr = store.push(vec![]);
+        let vr = store.push(vec![]);
+        let kt = store.push(vec![]);
+        let scores = store.push(vec![]);
+        let idx = store.push_idx(vec![]);
+        let e = store.push(vec![]);
+        let probs = store.push(vec![]);
+        let attn = store.push(vec![]);
+        let out_h = store.push(vec![]);
+        let out_h_rem = store.push(vec![]);
+        ops.push(Op::Projection { x: h, w: wq, bias: bq, out: q, rem: qr, m, k: d, n: dh, shift });
+        ops.push(Op::Projection { x: h, w: wk, bias: bk, out: k, rem: kr, m, k: d, n: dh, shift });
+        ops.push(Op::Projection { x: h, w: wv, bias: bv, out: v, rem: vr, m, k: d, n: dh, shift });
+        ops.push(Op::Transpose { x: k, out: kt, m, k: dh });
+        ops.push(Op::MatMul { a: q, b: kt, c: scores, m, k: dh, n: m });
+        ops.push(Op::SoftmaxIndex { x: scores, out: idx, table_len: 1 << 8 });
+        ops.push(Op::Softmax { idx, e, out: probs, table: exp_table, m, n: m });
+        ops.push(Op::MatMul { a: probs, b: v, c: attn, m, k: m, n: dh });
+        ops.push(Op::Projection { x: attn, w: wo, bias: bo, out: out_h, rem: out_h_rem, m, k: dh, n: d, shift });
+        head_outs.push(out_h);
+    }
+    let mut attn_acc = head_outs[0];
+    for &ho in &head_outs[1..] {
+        let sum = store.push(vec![]);
+        ops.push(Op::Add { a: attn_acc, b: ho, c: sum });
+        attn_acc = sum;
+    }
+    // residual
+    let x2 = store.push(vec![]);
+    ops.push(Op::Add { a: x, b: attn_acc, c: x2 });
+
+    // pre-norm for FFN
+    let ln2_w = store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 5) as i64 + 1)).collect());
+    let ln2_b = store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
+    let h2 = store.push(vec![]);
+    ops.push(Op::Layernorm { x: x2, w: ln2_w, b: ln2_b, out: h2, rsqrt_table, m, d });
+
+    // FFN
+    let fc_w = store.push((0..d * ffn).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+    let fc_b = store.push((0..m * ffn).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
+    let proj_w = store.push((0..ffn * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+    let proj_b = store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
+    let fc = store.push(vec![]);
+    let fc_rem = store.push(vec![]);
+    let gelu_idx = store.push_idx(vec![]);
+    let act = store.push(vec![]);
+    let proj2 = store.push(vec![]);
+    let proj2_rem = store.push(vec![]);
+    ops.push(Op::Projection { x: h2, w: fc_w, bias: fc_b, out: fc, rem: fc_rem, m, k: d, n: ffn, shift });
+    ops.push(Op::SoftmaxIndex { x: fc, out: gelu_idx, table_len: 64 });
+    ops.push(Op::Lookup { idx: gelu_idx, out: act, table: gelu_table });
+    ops.push(Op::Projection { x: act, w: proj_w, bias: proj_b, out: proj2, rem: proj2_rem, m, k: ffn, n: d, shift });
+
+    // residual
+    let out = store.push(vec![]);
+    ops.push(Op::Add { a: x2, b: proj2, c: out });
+    (ops, out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1922,6 +2024,29 @@ mod tests {
 
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
         bad.v[ln_w][0] = bad.v[ln_w][0] + Goldilocks::ONE;
+        assert!(!verify_shard(&bad, &ops, &proof));
+    }
+
+    #[test]
+    fn build_gpt2_layer_roundtrip() {
+        use crate::field::PrimeCharacteristicRing;
+        let mut rng = XorShift64::new(0x1D1D);
+        let (m, d, ffn, heads, shift) = (4usize, 8usize, 16usize, 2usize, 8u32);
+        let table_len = 1usize << 8;
+        let mut store = Store::new();
+        let x = store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let exp_table = store.push((0..table_len).map(|j| from_i64((j % 255 + 1) as i64)).collect());
+        let gelu_table = store.push((0..64).map(|j| from_i64((j as i64).pow(2) % 1000)).collect());
+        let rsqrt_table = store.push((0..table_len).map(|j| from_i64((j % 255 + 1) as i64)).collect());
+
+        let (ops, out) = build_gpt2_layer(
+            &mut store, x, heads, m, d, ffn, shift, exp_table, gelu_table, rsqrt_table, &mut rng,
+        );
+        let proof = prove_shard(&mut store, &ops, &[out], &mut rng);
+        assert!(verify_shard(&store, &ops, &proof));
+
+        let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
+        bad.v[x][0] = bad.v[x][0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
     }
 }
