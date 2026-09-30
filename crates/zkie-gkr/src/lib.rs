@@ -21,6 +21,7 @@ pub mod softmax;
 pub mod sumcheck;
 pub mod logup_gkr;
 pub mod layer_circuit;
+pub mod layer;
 pub mod batch_open;
 pub mod whir;
 
