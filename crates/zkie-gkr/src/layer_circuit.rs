@@ -86,4 +86,25 @@ mod tests {
         let mles_bad: Vec<&[Goldilocks]> = vec![&x, &b, &y, &c, &bad_z];
         assert!(!verify_layer_circuit(&proof, &mles_bad, &constraints, &r));
     }
+    #[test]
+    fn claim_chain_no_intermediate() {
+        let mut rng = XorShift64::new(0xBEEF);
+        let n = 1usize << 5;
+        let x: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let b: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let c: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let z: Vec<Goldilocks> = (0..n).map(|i| (x[i] + b[i]) * c[i]).collect();
+        let t = n.trailing_zeros() as usize;
+        let r: Vec<Goldilocks> = (0..t).map(|_| rng.field()).collect();
+        let constraints: Vec<Vec<(Goldilocks, Vec<usize>)>> = vec![
+            vec![
+                (Goldilocks::from_u64(1), vec![3usize]),
+                (from_i64(-1), vec![0usize, 2usize]),
+                (from_i64(-1), vec![1usize, 2usize]),
+            ],
+        ];
+        let mles: Vec<&[Goldilocks]> = vec![&x, &b, &c, &z];
+        let proof = prove_layer_circuit(&mles, &constraints, &r, &mut rng);
+        assert!(verify_layer_circuit(&proof, &mles, &constraints, &r));
+    }
 }
