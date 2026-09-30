@@ -1469,14 +1469,23 @@ fn prove_round_batch(
     let s = mle::eq_evals(&r);
     let s_r = mle::eval(&s, &r);
 
-    let (in_open, in_r) = in_batch.whir.open_batch(in_batch.prover_data.clone(), &in_batch.protocol, in_idx, in_batch.num_tables, &r);
-    let (out_open, out_r) = out_batch.whir.open_batch(out_batch.prover_data.clone(), &out_batch.protocol, out_idx, out_batch.num_tables, &r);
-    if in_batch.whir.verify_batch(&in_batch.commitment, &in_open, &in_batch.protocol, in_idx, in_batch.num_tables, &r).unwrap() != in_r {
-        return false;
-    }
-    if out_batch.whir.verify_batch(&out_batch.commitment, &out_open, &out_batch.protocol, out_idx, out_batch.num_tables, &r).unwrap() != out_r {
-        return false;
-    }
+    let (in_r, out_r) = if std::ptr::eq(in_batch as *const BatchCtx, out_batch as *const BatchCtx) {
+        let (open, evals) = in_batch.whir.open_batch_multi(in_batch.prover_data.clone(), &in_batch.protocol, in_batch.num_tables, &r);
+        if in_batch.whir.verify_batch_multi(&in_batch.commitment, &open, &in_batch.protocol, in_batch.num_tables, &r).unwrap() != evals {
+            return false;
+        }
+        (evals[in_idx], evals[out_idx])
+    } else {
+        let (in_open, in_r) = in_batch.whir.open_batch(in_batch.prover_data.clone(), &in_batch.protocol, in_idx, in_batch.num_tables, &r);
+        let (out_open, out_r) = out_batch.whir.open_batch(out_batch.prover_data.clone(), &out_batch.protocol, out_idx, out_batch.num_tables, &r);
+        if in_batch.whir.verify_batch(&in_batch.commitment, &in_open, &in_batch.protocol, in_idx, in_batch.num_tables, &r).unwrap() != in_r {
+            return false;
+        }
+        if out_batch.whir.verify_batch(&out_batch.commitment, &out_open, &out_batch.protocol, out_idx, out_batch.num_tables, &r).unwrap() != out_r {
+            return false;
+        }
+        (in_r, out_r)
+    };
     let bias_r = mle::eval(bias, &r);
     let value_at_r = in_r * scale_f - (out_r - bias_r) * two_shift + half;
     prove_bits_range_batch(bits_batch, &bits, value_at_r, &r, &s, s_r)

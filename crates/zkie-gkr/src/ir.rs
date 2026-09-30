@@ -122,7 +122,7 @@ impl Exec {
         for bc in &bit_columns {
             self.input(bc.clone(), g);
         }
-        let out = self.input(out_plain, 0);
+        let out = self.input(out_plain, self.meta[x].1);
         self.ops.push(Op::Affine { x, out, bits_group: (n, g), bias, shift });
         out
     }
