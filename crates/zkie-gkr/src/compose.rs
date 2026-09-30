@@ -1814,4 +1814,70 @@ mod tests {
         bad.v[ws[0]][0] = bad.v[ws[0]][0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
     }
+
+    #[test]
+    fn op_shard_multihead_attention_roundtrip() {
+        // 2-head attention: per-head Q/K/V -> Q@K^T -> softmax -> probs@V ->
+        // per-head output projection, then sum heads.
+        use crate::field::PrimeCharacteristicRing;
+        let mut rng = XorShift64::new(0x1B1B);
+        let (heads, m, d, shift) = (2usize, 4usize, 8usize, 8u32);
+        let dh = d / heads;
+        let table_len = 1usize << 8;
+        let mut store = Store::new();
+        let x = store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let exp_table = store.push((0..table_len).map(|j| from_i64((j % 255 + 1) as i64)).collect());
+
+        let mut ops = Vec::new();
+        let mut head_outs = Vec::new();
+        for _h in 0..heads {
+            let wq = store.push((0..d * dh).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+            let wk = store.push((0..d * dh).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+            let wv = store.push((0..d * dh).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+            let wo = store.push((0..dh * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+            let bq = store.push((0..m * dh).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
+            let bk = store.push((0..m * dh).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
+            let bv = store.push((0..m * dh).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
+            let bo = store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
+            let q = store.push(vec![]);
+            let k = store.push(vec![]);
+            let v = store.push(vec![]);
+            let qr = store.push(vec![]);
+            let kr = store.push(vec![]);
+            let vr = store.push(vec![]);
+            let kt = store.push(vec![]);
+            let scores = store.push(vec![]);
+            let idx = store.push_idx(vec![]);
+            let e = store.push(vec![]);
+            let probs = store.push(vec![]);
+            let attn = store.push(vec![]);
+            let out_h = store.push(vec![]);
+            let out_h_rem = store.push(vec![]);
+
+            ops.push(Op::Projection { x, w: wq, bias: bq, out: q, rem: qr, m, k: d, n: dh, shift });
+            ops.push(Op::Projection { x, w: wk, bias: bk, out: k, rem: kr, m, k: d, n: dh, shift });
+            ops.push(Op::Projection { x, w: wv, bias: bv, out: v, rem: vr, m, k: d, n: dh, shift });
+            ops.push(Op::Transpose { x: k, out: kt, m, k: dh });
+            ops.push(Op::MatMul { a: q, b: kt, c: scores, m, k: dh, n: m });
+            ops.push(Op::SoftmaxIndex { x: scores, out: idx, table_len });
+            ops.push(Op::Softmax { idx, e, out: probs, table: exp_table, m, n: m });
+            ops.push(Op::MatMul { a: probs, b: v, c: attn, m, k: m, n: dh });
+            ops.push(Op::Projection { x: attn, w: wo, bias: bo, out: out_h, rem: out_h_rem, m, k: dh, n: d, shift });
+            head_outs.push(out_h);
+        }
+
+        let mut acc = head_outs[0];
+        for &h in &head_outs[1..] {
+            let sum = store.push(vec![]);
+            ops.push(Op::Add { a: acc, b: h, c: sum });
+            acc = sum;
+        }
+
+        let proof = prove_shard(&mut store, &ops, &[acc], &mut rng);
+        assert!(verify_shard(&store, &ops, &proof));
+
+        let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
+        bad.v[x][0] = bad.v[x][0] + Goldilocks::ONE;
+        assert!(!verify_shard(&bad, &ops, &proof));
+    }
 }
