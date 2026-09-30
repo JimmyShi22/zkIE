@@ -178,4 +178,80 @@ mod tests {
         let bad_evals = vec![crate::mle::eval(&eq, &pt), crate::mle::eval(&bad_d, &pt), c_claim, crate::mle::eval(&bias, &pt)];
         assert!(!crate::sumcheck::verify_virtual(&add_proof, &terms, Goldilocks::from_u64(0), &pt, &bad_evals));
     }
+    #[test]
+    fn matmul_affine_chain_no_commit_c() {
+        let mut rng = XorShift64::new(0x5678);
+        let (m, k, n) = (2usize, 2usize, 2usize);
+        let shift = 4u32;
+        let half = Goldilocks::from_u64(1u64 << (shift - 1));
+        let two_shift = Goldilocks::from_u64(1u64 << shift);
+        let div_round = |x: i64, b: i64| -> i64 { let q = x.div_euclid(b); let rr = x.rem_euclid(b); if rr * 2 >= b { q + 1 } else { q } };
+        let a: Vec<Goldilocks> = (0..m * k).map(|_| from_i64((rng.next_u64() % 100) as i64)).collect();
+        let b: Vec<Goldilocks> = (0..k * n).map(|_| from_i64((rng.next_u64() % 100) as i64)).collect();
+        let bias: Vec<Goldilocks> = (0..m * n).map(|_| from_i64((rng.next_u64() % 20) as i64 - 10)).collect();
+        let mut c = vec![Goldilocks::from_u64(0); m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = Goldilocks::from_u64(0);
+                for kk in 0..k {
+                    acc = acc + a[i * k + kk] * b[kk * n + j];
+                }
+                c[i * n + j] = acc;
+            }
+        }
+        let out: Vec<Goldilocks> = (0..m * n).map(|ij| from_i64(div_round(crate::fixed_point::to_i64(c[ij]), 1i64 << shift) + crate::fixed_point::to_i64(bias[ij]))).collect();
+        let rem_off: Vec<Goldilocks> = (0..m * n).map(|ij| {
+            let c_i = crate::fixed_point::to_i64(c[ij]);
+            let o_i = crate::fixed_point::to_i64(out[ij]);
+            let b_i = crate::fixed_point::to_i64(bias[ij]);
+            from_i64(c_i - (o_i - b_i) * (1i64 << shift) + (1i64 << (shift - 1)))
+        }).collect();
+        for &vv in &rem_off {
+            assert!(crate::fixed_point::to_i32(vv) >= 0 && crate::fixed_point::to_i32(vv) < (1i32 << shift));
+        }
+        let mut at = vec![Goldilocks::from_u64(0); k * m];
+        for kk in 0..k {
+            for i in 0..m {
+                at[kk * m + i] = a[i * k + kk];
+            }
+        }
+        let u = vec![rng.field()];
+        let v = vec![rng.field()];
+        let ch = vec![rng.field()];
+        let mat = crate::matmul::prove(&at, &b, &c, m, k, n, &u, &v, &ch);
+        let c_claim = mat.claimed;
+        let pt = vec![v[0], u[0]];
+        let eq = crate::mle::eq_evals(&pt);
+        let ones = vec![Goldilocks::from_u64(1); m * n];
+        let neg = from_i64(-1);
+        let terms = vec![
+            (Goldilocks::from_u64(1), vec![0usize, 1usize]),
+            (neg, vec![0usize, 2usize]),
+            (two_shift, vec![0usize, 3usize]),
+            (neg * two_shift, vec![0usize, 4usize]),
+            (neg * half, vec![0usize, 5usize]),
+        ];
+        let mles: Vec<&[Goldilocks]> = vec![&eq, &rem_off, &c, &out, &bias, &ones];
+        let affine_proof = crate::sumcheck::prove_virtual(&mles, &terms, Goldilocks::from_u64(0), &pt);
+        let final_evals = vec![
+            crate::mle::eval(&eq, &pt),
+            crate::mle::eval(&rem_off, &pt),
+            c_claim,
+            crate::mle::eval(&out, &pt),
+            crate::mle::eval(&bias, &pt),
+            crate::mle::eval(&ones, &pt),
+        ];
+        assert!(crate::sumcheck::verify_virtual(&affine_proof, &terms, Goldilocks::from_u64(0), &pt, &final_evals));
+        let a_restricted = crate::mle::partial_eval(&at, &u);
+        let b_restricted = crate::mle::partial_eval(&b, &v);
+        let f_eval = crate::mle::eval(&a_restricted, &ch);
+        let h_eval = crate::mle::eval(&b_restricted, &ch);
+        assert!(crate::matmul::verify(&mat, &ch, f_eval, h_eval));
+        let table: Vec<Goldilocks> = (0..(1usize << shift)).map(|j| Goldilocks::from_u64(j as u64)).collect();
+        let idx: Vec<u32> = rem_off.iter().map(|&vv| crate::fixed_point::to_i32(vv) as u32).collect();
+        let alpha = rng.field();
+        let beta = rng.field();
+        let frac = crate::logup_gkr::prove_lookup_fractional(&idx, &rem_off, &table, alpha, beta, &mut rng);
+        assert!(crate::logup_gkr::verify_lookup_fractional(&frac, &idx, &rem_off, &table, alpha, beta));
+    }
 }
