@@ -52,3 +52,35 @@ work is the integration.
 2. Unified tensor + one WHIR commit per layer; only the boundary is committed.
 3. N-ary tree sharding (N public) + agg + layer parallelism + cross-shard
    binding (downstream input commitment == upstream output commitment).
+
+## Reduction chaining (matmul / softmax-sum / layernorm-mean) — the hard part
+
+Elementwise compiler is complete: Add/Mul/linear-Affine fold into
+`prove_layer_circuit`; rounding-Affine = arithmetic constraint + logUp range
+check (`layer::tests::affine_round_layer`). The remaining ops are the
+REDUCTIONS (matmul contraction, softmax row-sum, layernorm mean), which are
+structurally different.
+
+Reduction chaining = the "virtual polynomial" approach (DeepProve/ceno):
+- The reduction output (e.g. matmul C) is NOT committed. Its MLE is defined
+  virtually as C(u,v) = sum_k A(u,k)*B(k,v).
+- The elementwise layer on top (e.g. D = C + bias) is proven by an eq-weighted
+  sumcheck over D's constraint, where C(x) is the virtual MLE, NOT an MLE in
+  the witness list.
+- The verifier chains the claim D(u,v) -> C(u,v) + bias(u,v) -> C(u,v), then
+  verifies C(u,v) via the matmul GKR (reducing to A, B claims at the SAME
+  point u,v).
+
+Key missing primitive: `same_poly` (DeepProve zkml/src/iop/same_poly.rs) —
+merge several claims on the same tensor at different points into one, so the
+matmul's output point and the elementwise layer's input point are consistent.
+
+Concrete next steps (in order):
+1. `same_poly`: prove claims (r1,v1), (r2,v2) are evaluations of the same MLE,
+   and merge to a fresh challenge point. (Two eq-weighted sumchecks + merge.)
+2. Virtual reduction: extend `prove_virtual` (or a new helper) so a term can be
+   a "sum over an index" of products (the matmul contraction), producing a
+   virtual MLE without committing it.
+3. Chain matmul -> affine -> add for a minimal m=k=n=2 case, only committing
+   A, B, bias, D (not C).
+4. Wire the whole layer compiler into the GPT-2 path (Exec -> layer circuit).
