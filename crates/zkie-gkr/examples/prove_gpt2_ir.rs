@@ -94,6 +94,105 @@ fn layer_norm_rows_ir(
     ex.input(out, 0)
 }
 
+fn forward_layer(
+    li: usize,
+    x_plain: &[Goldilocks],
+    rng: &mut XorShift64,
+    rsqrt_table: &[Goldilocks],
+    exp_table: &[Goldilocks],
+    gelu_table: &[Goldilocks],
+    mask: &[Goldilocks],
+    zero_hd: &[Goldilocks],
+    stack: &str,
+) -> (Exec, Vec<Goldilocks>) {
+    let mut ex = Exec::new();
+    ex.set_rsqrt(rsqrt_table.to_vec());
+    let x = ex.input(x_plain.to_vec(), 0);
+
+    let ln1_w = load_i32(&format!("{stack}L{li}_ln1_w_i32.bin"));
+    let ln1_b = load_i32(&format!("{stack}L{li}_ln1_b_i32.bin"));
+    let q_w = ex.input(load_i32(&format!("{stack}L{li}_q_w_i32.bin")), 0);
+    let k_w = ex.input(load_i32(&format!("{stack}L{li}_k_w_i32.bin")), 0);
+    let v_w = ex.input(load_i32(&format!("{stack}L{li}_v_w_i32.bin")), 0);
+    let o_w = ex.input(load_i32(&format!("{stack}L{li}_o_proj_w_i32.bin")), 0);
+    let ln2_w = load_i32(&format!("{stack}L{li}_ln2_w_i32.bin"));
+    let ln2_b = load_i32(&format!("{stack}L{li}_ln2_b_i32.bin"));
+    let fc_w = ex.input(load_i32(&format!("{stack}L{li}_fc_w_i32.bin")), 0);
+    let proj_w = ex.input(load_i32(&format!("{stack}L{li}_proj_w_i32.bin")), 0);
+
+    let q_b = broadcast_bias(&load_i32(&format!("{stack}L{li}_q_b_i32.bin")), SEQ);
+    let k_b = broadcast_bias(&load_i32(&format!("{stack}L{li}_k_b_i32.bin")), SEQ);
+    let v_b = broadcast_bias(&load_i32(&format!("{stack}L{li}_v_b_i32.bin")), SEQ);
+    let o_b = broadcast_bias(&load_i32(&format!("{stack}L{li}_o_proj_b_i32.bin")), SEQ);
+    let fc_b = broadcast_bias(&load_i32(&format!("{stack}L{li}_fc_b_i32.bin")), SEQ);
+    let proj_b = broadcast_bias(&load_i32(&format!("{stack}L{li}_proj_b_i32.bin")), SEQ);
+
+    let ln1 = layer_norm_rows_ir(&mut ex, x, &ln1_w, &ln1_b, N_REAL, SEQ);
+    let q_raw = ex.matmul(ln1, q_w, SEQ, H_PAD, H_PAD);
+    let q = ex.affine(q_raw, q_b, 16);
+    let k_raw = ex.matmul(ln1, k_w, SEQ, H_PAD, H_PAD);
+    let k = ex.affine(k_raw, k_b, 16);
+    let v_raw = ex.matmul(ln1, v_w, SEQ, H_PAD, H_PAD);
+    let v = ex.affine(v_raw, v_b, 16);
+
+    let qh = split_heads_q(ex.get(q));
+    let kh = split_heads_k(ex.get(k));
+    let vh = split_heads_q(ex.get(v));
+
+    let mut scores_plain = Vec::with_capacity(HEADS_PAD * SEQ * SEQ);
+    for h in 0..HEADS_PAD {
+        let qh_h = ex.input(qh[h * SEQ * HDIM..(h + 1) * SEQ * HDIM].to_vec(), 0);
+        let kh_h = ex.input(kh[h * HDIM * SEQ..(h + 1) * HDIM * SEQ].to_vec(), 0);
+        let sr = ex.matmul(qh_h, kh_h, SEQ, HDIM, SEQ);
+        let sc = ex.affine(sr, mask.to_vec(), 19);
+        scores_plain.extend_from_slice(ex.get(sc));
+    }
+    let scores = ex.input(scores_plain, 0);
+    let sm = ex.softmax(scores, exp_table, EXP_OFFSET, HEADS_PAD * SEQ, SEQ, rng);
+
+    let mut attn_all = Vec::with_capacity(HEADS * SEQ * HDIM);
+    for h in 0..HEADS {
+        let sm_h = ex.input(ex.get(sm)[h * SEQ * SEQ..(h + 1) * SEQ * SEQ].to_vec(), 0);
+        let vh_h = ex.input(vh[h * SEQ * HDIM..(h + 1) * SEQ * HDIM].to_vec(), 0);
+        let ar = ex.matmul(sm_h, vh_h, SEQ, SEQ, HDIM);
+        let at = ex.affine(ar, zero_hd.to_vec(), 16);
+        attn_all.extend_from_slice(ex.get(at));
+    }
+    let attn_full = ex.input(concat_heads(&attn_all), 0);
+    let op_raw = ex.matmul(attn_full, o_w, SEQ, H_PAD, H_PAD);
+    let op = ex.affine(op_raw, o_b, 16);
+    let add1 = ex.add(x, op);
+
+    let ln2 = layer_norm_rows_ir(&mut ex, add1, &ln2_w, &ln2_b, N_REAL, SEQ);
+    let fc_raw = ex.matmul(ln2, fc_w, SEQ, H_PAD, FFN_PAD);
+    let fc = ex.affine(fc_raw, fc_b, 16);
+    let gelu_idx = silu_raw(ex.get(fc), gelu_table, GELU_OFFSET).0;
+    let act = ex.lookup(&gelu_idx, gelu_table, rng);
+    let proj_raw = ex.matmul(act, proj_w, SEQ, FFN_PAD, H_PAD);
+    let ffn_out = ex.affine(proj_raw, proj_b, 16);
+    let x_new = ex.add(add1, ffn_out);
+
+    let out = ex.get(x_new).to_vec();
+    (ex, out)
+}
+
+fn forward_final(
+    x_plain: &[Goldilocks],
+    rsqrt_table: &[Goldilocks],
+    stack: &str,
+) -> (Exec, Vec<Goldilocks>) {
+    let mut ex = Exec::new();
+    ex.set_rsqrt(rsqrt_table.to_vec());
+    let x = ex.input(x_plain.to_vec(), 0);
+    let ln_f_w = load_i32(&format!("{stack}ln_f_w_i32.bin"));
+    let ln_f_b = load_i32(&format!("{stack}ln_f_b_i32.bin"));
+    let lm_head_w = ex.input(load_i32(&format!("{stack}lm_head_w_i32.bin")), 0);
+    let ln_f = layer_norm_rows_ir(&mut ex, x, &ln_f_w, &ln_f_b, N_REAL, SEQ);
+    let logits = ex.matmul(ln_f, lm_head_w, SEQ, H_PAD, VOCAB_PAD);
+    let out = ex.get(logits).to_vec();
+    (ex, out)
+}
+
 fn main() {
     let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/");
     let stack = format!("{base}gpt2_stack/");
@@ -104,89 +203,24 @@ fn main() {
 
     let whir = Whir::new_testing(16);
     let mut rng = XorShift64::new(0x200);
-
-    let mut ex = Exec::new();
-    ex.set_rsqrt(rsqrt_table.clone());
-
-    let mut x = ex.input(load_i32(&format!("{stack}embedding_i32.bin")), 0);
     let zero_hd = vec![from_i32(0); SEQ * HDIM];
 
+    let mut x = load_i32(&format!("{stack}embedding_i32.bin"));
+
+    // Streaming: forward + prove each layer, dropping its executor to bound memory.
     for li in 0..N_LAYERS {
-        let ln1_w = load_i32(&format!("{stack}L{li}_ln1_w_i32.bin"));
-        let ln1_b = load_i32(&format!("{stack}L{li}_ln1_b_i32.bin"));
-        let q_w = ex.input(load_i32(&format!("{stack}L{li}_q_w_i32.bin")), 0);
-        let k_w = ex.input(load_i32(&format!("{stack}L{li}_k_w_i32.bin")), 0);
-        let v_w = ex.input(load_i32(&format!("{stack}L{li}_v_w_i32.bin")), 0);
-        let o_w = ex.input(load_i32(&format!("{stack}L{li}_o_proj_w_i32.bin")), 0);
-        let ln2_w = load_i32(&format!("{stack}L{li}_ln2_w_i32.bin"));
-        let ln2_b = load_i32(&format!("{stack}L{li}_ln2_b_i32.bin"));
-        let fc_w = ex.input(load_i32(&format!("{stack}L{li}_fc_w_i32.bin")), 0);
-        let proj_w = ex.input(load_i32(&format!("{stack}L{li}_proj_w_i32.bin")), 0);
-
-        let q_b = broadcast_bias(&load_i32(&format!("{stack}L{li}_q_b_i32.bin")), SEQ);
-        let k_b = broadcast_bias(&load_i32(&format!("{stack}L{li}_k_b_i32.bin")), SEQ);
-        let v_b = broadcast_bias(&load_i32(&format!("{stack}L{li}_v_b_i32.bin")), SEQ);
-        let o_b = broadcast_bias(&load_i32(&format!("{stack}L{li}_o_proj_b_i32.bin")), SEQ);
-        let fc_b = broadcast_bias(&load_i32(&format!("{stack}L{li}_fc_b_i32.bin")), SEQ);
-        let proj_b = broadcast_bias(&load_i32(&format!("{stack}L{li}_proj_b_i32.bin")), SEQ);
-
-        let ln1 = layer_norm_rows_ir(&mut ex, x, &ln1_w, &ln1_b, N_REAL, SEQ);
-        let q_raw = ex.matmul(ln1, q_w, SEQ, H_PAD, H_PAD);
-        let q = ex.affine(q_raw, q_b, 16);
-        let k_raw = ex.matmul(ln1, k_w, SEQ, H_PAD, H_PAD);
-        let k = ex.affine(k_raw, k_b, 16);
-        let v_raw = ex.matmul(ln1, v_w, SEQ, H_PAD, H_PAD);
-        let v = ex.affine(v_raw, v_b, 16);
-
-        let qh = split_heads_q(ex.get(q));
-        let kh = split_heads_k(ex.get(k));
-        let vh = split_heads_q(ex.get(v));
-
-        let mut scores_plain = Vec::with_capacity(HEADS_PAD * SEQ * SEQ);
-        for h in 0..HEADS_PAD {
-            let qh_h = ex.input(qh[h * SEQ * HDIM..(h + 1) * SEQ * HDIM].to_vec(), 0);
-            let kh_h = ex.input(kh[h * HDIM * SEQ..(h + 1) * HDIM * SEQ].to_vec(), 0);
-            let sr = ex.matmul(qh_h, kh_h, SEQ, HDIM, SEQ);
-            let sc = ex.affine(sr, mask.clone(), 19);
-            scores_plain.extend_from_slice(ex.get(sc));
-        }
-        let scores = ex.input(scores_plain, 0);
-        let sm = ex.softmax(scores, &exp_table, EXP_OFFSET, HEADS_PAD * SEQ, SEQ, &mut rng);
-
-        let mut attn_all = Vec::with_capacity(HEADS * SEQ * HDIM);
-        for h in 0..HEADS {
-            let sm_h = ex.input(ex.get(sm)[h * SEQ * SEQ..(h + 1) * SEQ * SEQ].to_vec(), 0);
-            let vh_h = ex.input(vh[h * SEQ * HDIM..(h + 1) * SEQ * HDIM].to_vec(), 0);
-            let ar = ex.matmul(sm_h, vh_h, SEQ, SEQ, HDIM);
-            let at = ex.affine(ar, zero_hd.clone(), 16);
-            attn_all.extend_from_slice(ex.get(at));
-        }
-        let attn_full = ex.input(concat_heads(&attn_all), 0);
-        let op_raw = ex.matmul(attn_full, o_w, SEQ, H_PAD, H_PAD);
-        let op = ex.affine(op_raw, o_b, 16);
-        let add1 = ex.add(x, op);
-
-        let ln2 = layer_norm_rows_ir(&mut ex, add1, &ln2_w, &ln2_b, N_REAL, SEQ);
-        let fc_raw = ex.matmul(ln2, fc_w, SEQ, H_PAD, FFN_PAD);
-        let fc = ex.affine(fc_raw, fc_b, 16);
-        let gelu_idx = silu_raw(ex.get(fc), &gelu_table, GELU_OFFSET).0;
-        let act = ex.lookup(&gelu_idx, &gelu_table, &mut rng);
-        let proj_raw = ex.matmul(act, proj_w, SEQ, FFN_PAD, H_PAD);
-        let ffn_out = ex.affine(proj_raw, proj_b, 16);
-        x = ex.add(add1, ffn_out);
-        println!("layer {li} declared");
+        let (ex_li, x_new) = forward_layer(
+            li, &x, &mut rng, &rsqrt_table, &exp_table, &gelu_table, &mask, &zero_hd, &stack,
+        );
+        x = x_new;
+        ex_li.prove(&whir, &mut rng);
+        println!("layer {li} proved");
     }
 
-    let ln_f_w = load_i32(&format!("{stack}ln_f_w_i32.bin"));
-    let ln_f_b = load_i32(&format!("{stack}ln_f_b_i32.bin"));
-    let lm_head_w = ex.input(load_i32(&format!("{stack}lm_head_w_i32.bin")), 0);
-    let ln_f = layer_norm_rows_ir(&mut ex, x, &ln_f_w, &ln_f_b, N_REAL, SEQ);
-    let logits = ex.matmul(ln_f, lm_head_w, SEQ, H_PAD, VOCAB_PAD);
-
-    let argmax = argmax_vocab(ex.get(logits));
+    let (ex_f, logits) = forward_final(&x, &rsqrt_table, &stack);
+    let argmax = argmax_vocab(&logits);
     println!("GPT-2 124M (IR): argmax {:?}", argmax);
-
-    ex.prove(&whir, &mut rng);
+    ex_f.prove(&whir, &mut rng);
     println!("GPT-2 124M (IR): verified; global_open_count = {}", zkie_gkr::whir::global_open_count());
 }
 
