@@ -73,7 +73,7 @@ fn projection_fp(
     (out, rem)
 }
 
-type Fwd = (
+pub type Fwd = (
     Vec<Goldilocks>,
     Vec<Goldilocks>,
     Vec<u32>,
@@ -84,7 +84,7 @@ type Fwd = (
 );
 
 #[allow(clippy::too_many_arguments)]
-fn ffn_forward(
+pub fn ffn_forward(
     x: &[Goldilocks],
     fc_w: &[Goldilocks],
     fc_b: &[Goldilocks],
@@ -118,8 +118,26 @@ pub fn prove_ffn_chain(
     shift: u32,
     rng: &mut XorShift64,
 ) -> FfnChainProof {
-    let (fc, fc_rem, act_idx, act, proj, proj_rem, out) =
-        ffn_forward(x, fc_w, fc_b, proj_w, proj_b, gelu_table, m, d, ffn, shift);
+    let fwd = ffn_forward(x, fc_w, fc_b, proj_w, proj_b, gelu_table, m, d, ffn, shift);
+    prove_ffn_chain_witness(x, &fwd, fc_w, fc_b, proj_w, proj_b, gelu_table, m, d, ffn, shift, rng)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_ffn_chain_witness(
+    x: &[Goldilocks],
+    fwd: &Fwd,
+    fc_w: &[Goldilocks],
+    fc_b: &[Goldilocks],
+    proj_w: &[Goldilocks],
+    proj_b: &[Goldilocks],
+    gelu_table: &[Goldilocks],
+    m: usize,
+    d: usize,
+    ffn: usize,
+    shift: u32,
+    rng: &mut XorShift64,
+) -> FfnChainProof {
+    let (fc, fc_rem, act_idx, act, proj, proj_rem, out) = fwd.clone();
 
     let fc_p = prove_projection(x, fc_w, fc_b, &fc, &fc_rem, m, d, ffn, shift, rng);
     let gelu_alpha = rng.field();
