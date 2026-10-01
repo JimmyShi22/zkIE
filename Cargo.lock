@@ -859,6 +859,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zkie-models-gemma3"
+version = "0.1.0"
+dependencies = [
+ "zkie-core",
+ "zkie-engine",
+ "zkie-ops",
+]
+
+[[package]]
 name = "zkie-models-gpt2"
 version = "0.1.0"
 dependencies = [
