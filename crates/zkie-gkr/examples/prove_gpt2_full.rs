@@ -7,7 +7,7 @@ use std::fs;
 
 use zkie_gkr::compose::{causal_mask, prove_shard, verify_shard, Op, Store};
 use zkie_gkr::field::{Goldilocks, XorShift64};
-use zkie_gkr::fixed_point::{from_i32, from_i64};
+use zkie_gkr::fixed_point::from_i32;
 
 const D: usize = 1024;
 const FFN: usize = 4096;
@@ -142,15 +142,19 @@ fn build_layer(
 
 fn main() {
     let mut rng = XorShift64::new(0xBEEF);
-    let (m, shift) = (4usize, 16u32);
+    let (m, shift) = (16usize, 16u32);
     let dir = "models/gpt2_stack";
 
     let exp_table = load_i32("models/exp_table_i32.bin");
     let rsqrt_table = load_i32("models/rsqrt_table_i32.bin");
     let gelu_table = load_i32(&format!("{dir}/gelu_table_i32.bin"));
+    let embedding = load_i32(&format!("{dir}/embedding_i32.bin"));
+    let lnf_w = load_i32(&format!("{dir}/ln_f_w_i32.bin"));
+    let lnf_b = load_i32(&format!("{dir}/ln_f_b_i32.bin"));
+    let lm_head_w = load_i32(&format!("{dir}/lm_head_w_i32.bin"));
 
     let mut store = Store::new();
-    let x0 = store.push((0..m * D).map(|_| from_i64((rng.next_u64() % 100) as i64)).collect());
+    let x0 = store.push(embedding[..m * D].to_vec());
     let exp_t = store.push(exp_table);
     let rsqrt_t = store.push(rsqrt_table);
     let gelu_t = store.push(gelu_table);
@@ -162,12 +166,21 @@ fn main() {
         x_cur = build_layer(&mut store, &mut ops, x_cur, layer, m, shift, exp_t, gelu_t, rsqrt_t, mask_t);
     }
 
+    // Final layernorm + lm_head (bare matmul, no bias).
+    let lnf_w_t = store.push(broadcast(&lnf_w, m));
+    let lnf_b_t = store.push(broadcast(&lnf_b, m));
+    let h_final = store.push(vec![]);
+    ops.push(Op::LayerNormCentered { x: x_cur, w: lnf_w_t, b: lnf_b_t, out: h_final, rsqrt_table: rsqrt_t, m, d: D });
+    let lm_w_t = store.push(lm_head_w);
+    let logits = store.push(vec![]);
+    ops.push(Op::MatMul { a: h_final, b: lm_w_t, c: logits, m, k: D, n: 65536 });
+
     let t0 = std::time::Instant::now();
-    let proof = prove_shard(&mut store, &ops, &[x_cur], &mut rng);
+    let proof = prove_shard(&mut store, &ops, &[logits], &mut rng);
     let prove_t = t0.elapsed();
     let t1 = std::time::Instant::now();
     assert!(verify_shard(&store, &ops, &proof), "full GPT-2 proof failed");
     let verify_t = t1.elapsed();
-    println!("full GPT-2 ({} layers, m={}, {} heads, {} ops): prove {:?}, verify {:?}",
+    println!("full GPT-2+lm_head ({} layers, m={}, {} heads, {} ops): prove {:?}, verify {:?}",
         LAYERS, m, HEADS, ops.len(), prove_t, verify_t);
 }
