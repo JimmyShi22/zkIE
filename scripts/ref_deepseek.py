@@ -76,10 +76,10 @@ def main():
         k_pe = apply_rope(k_pe[:, None, :], cos[:, None, :], sin[:, None, :])  # [seq,1,64]
         query = np.concatenate([q_nope, q_pe], axis=-1)  # [seq,16,192]
         key = np.concatenate([k_nope, np.broadcast_to(k_pe, (SEQ, HEADS, QK_ROPE))], axis=-1)
-        scores = query @ key.transpose(0, 2, 1) * softmax_scale  # [seq,16,seq]
+        scores = np.einsum("ihd,jhd->ihj", query, key) * softmax_scale  # [seq,16,seq]
         mask = np.triu(np.full((SEQ, SEQ), -1e30), k=1)
-        probs = softmax(scores + mask, axis=-1)
-        attn = probs @ v  # [seq,16,128]
+        probs = softmax(scores + mask[:, None, :], axis=-1)
+        attn = np.einsum("ihk,khd->ihd", probs, v)  # [seq,16,128]
         attn = attn.reshape(SEQ, HEADS * V_HEAD) @ o_w.T  # [seq,2048]
         x = residual + attn
 
@@ -119,6 +119,7 @@ def main():
             sh = silu(h @ sg.T) * (h @ su.T)
             mlp = mlp + sh @ sd.T
         x = residual + mlp
+        print("L%d max=%.4f mean(x^2)=%.6f" % (L, np.abs(x).max(), (x*x).mean()))
 
     x = rms_norm(x, S.arr("model.norm.weight").astype(np.float64))
     logits = x @ S.arr("lm_head.weight").astype(np.float64).T  # [seq, vocab]
