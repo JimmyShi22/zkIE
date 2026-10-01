@@ -114,12 +114,14 @@ To add a new model, see [docs/adding-a-model.md](docs/adding-a-model.md).
 Measured on a 64-thread CPU. Full detail and the reasoning behind the numbers
 is in [`docs/benchmarks.md`](docs/benchmarks.md).
 
-| Model | Setup | Wall time | Peak RSS |
-| --- | --- | --- | --- |
-| GPT-2 124M | seq=16, 13 shards (per layer) | ~0.45 min | ~38 GB |
-| GPT-2 124M | seq=512, 13 shards (per layer) | **~0.92 min** | ~43 GB |
-| TimesFM 1.0 200M | seq=16, 20 shards (per layer) | ~0.62 min | ~25.5 GB |
-| Gemma 3 270M | adapting | - | - |
+| Model | Active / Total params | Setup | Wall time | Peak RSS |
+| --- | --- | --- | --- | --- |
+| GPT-2 124M | 124M / 124M | seq=16, 13 shards (per layer) | ~0.45 min | ~38 GB |
+| GPT-2 124M | 124M / 124M | seq=512, 13 shards (per layer) | **~0.92 min** | ~43 GB |
+| TimesFM 1.0 200M | 200M / 200M | seq=16, 20 shards (per layer) | ~0.62 min | ~25.5 GB |
+| Gemma 3 270M | 270M / 270M | adapting | - | - |
+| DeepSeek-V2-Lite | 2.4B / 15.7B | MoE + MLA (planned) | - | - |
+| DeepSeek-V4.1-Flash | 8B/16B* / 552B | MoE + CSA2 + vision (planned) | - | - |
 
 All rows are the per-layer shard configuration picked by the autotuner
 (`zkie-models-gpt2/examples/bench_autotune.rs` /
@@ -128,7 +130,7 @@ uses real weights, multi-head attention and pre-norm; argmax matches ground
 truth (511/512 at seq=512, 16/16 at seq=16). seq=512 beats DeepProve (~7.6 min)
 by roughly 8x. TimesFM 200M (prologue + 20 layers + horizon head) proves end to
 end on the same op-primitive shard-DAG path, output matching the ONNX float
-reference to ~1 LSB. Gemma 3 is the reuse target.
+reference to ~1 LSB. Gemma 3 is the reuse target. *DeepSeek-V4.1-Flash active params: 8B prefill / 16B decode.
 
 Status: GPT-2 512 (~0.92 min at 13 shards) and TimesFM 200M (~0.62 min at
 20 shards) both prove end to end; GPT-2 512 beats DeepProve (~7.6 min) by
