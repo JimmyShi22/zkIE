@@ -10,6 +10,12 @@ use crate::logup_gkr::{prove_lookup_fractional, verify_lookup_fractional, Fracti
 use crate::mle;
 use crate::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
 
+fn round_div(a: i64, b: i64) -> i64 {
+    let q = a.div_euclid(b);
+    let r = a.rem_euclid(b);
+    if r * 2 >= b { q + 1 } else { q }
+}
+
 pub struct LayerNormCenteredProof {
     pub mean: VirtualProof,
     pub centered: VirtualProof,
@@ -51,7 +57,7 @@ pub fn layer_norm_forward(
     let mean: Vec<Goldilocks> = (0..m)
         .map(|r| {
             let s: i64 = (0..d).map(|j| to_i64(x[r * d + j])).sum();
-            from_i64(s.div_euclid(d as i64))
+            from_i64(round_div(s, d as i64))
         })
         .collect();
     let centered: Vec<Goldilocks> = (0..m * d).map(|ij| x[ij] - mean[ij / d]).collect();
@@ -61,22 +67,22 @@ pub fn layer_norm_forward(
                 let c = to_i64(centered[r * d + j]);
                 c * c
             }).sum();
-            from_i64(s.div_euclid(d as i64))
+            from_i64(round_div(s, d as i64))
         })
         .collect();
     let s_index: Vec<u32> = var.iter().map(|&v| rsqrt_index(to_i64(v))).collect();
     let rstd: Vec<Goldilocks> = s_index.iter().map(|&i| rsqrt_table[i as usize]).collect();
     let raw: Vec<Goldilocks> = (0..m * d).map(|ij| centered[ij] * rstd[ij / d] * w[ij]).collect();
     let out: Vec<Goldilocks> = (0..m * d)
-        .map(|ij| from_i64(to_i64(raw[ij]).div_euclid(1 << 32) + to_i64(b[ij])))
+        .map(|ij| from_i64(round_div(to_i64(raw[ij]), 1 << 32) + to_i64(b[ij])))
         .collect();
     let rem_out: Vec<Goldilocks> = (0..m * d)
-        .map(|ij| from_i64(to_i64(raw[ij]) - (to_i64(out[ij]) - to_i64(b[ij])) * (1i64 << 32)))
+        .map(|ij| from_i64(to_i64(raw[ij]) - (to_i64(out[ij]) - to_i64(b[ij])) * (1i64 << 32) + (1i64 << 31)))
         .collect();
     let sum_mean: Vec<Goldilocks> = (0..m).map(|r| (0..d).fold(Goldilocks::ZERO, |a, j| a + x[r * d + j])).collect();
-    let rem_mean: Vec<Goldilocks> = (0..m).map(|r| from_i64(to_i64(sum_mean[r]) - to_i64(mean[r]) * d as i64)).collect();
+    let rem_mean: Vec<Goldilocks> = (0..m).map(|r| from_i64(to_i64(sum_mean[r]) - to_i64(mean[r]) * d as i64 + (d as i64 / 2))).collect();
     let sum_var: Vec<Goldilocks> = (0..m).map(|r| (0..d).fold(Goldilocks::ZERO, |a, j| a + centered[r * d + j] * centered[r * d + j])).collect();
-    let rem_var: Vec<Goldilocks> = (0..m).map(|r| from_i64(to_i64(sum_var[r]) - to_i64(var[r]) * d as i64)).collect();
+    let rem_var: Vec<Goldilocks> = (0..m).map(|r| from_i64(to_i64(sum_var[r]) - to_i64(var[r]) * d as i64 + (d as i64 / 2))).collect();
     (mean, centered, var, s_index, rstd, out, rem_out, sum_mean, rem_mean, sum_var, rem_var)
 }
 
@@ -93,6 +99,8 @@ pub fn prove_layer_norm_centered(
     let (mean, centered, var, s_index, rstd, out, rem_out, sum_mean, rem_mean, sum_var, rem_var) =
         layer_norm_forward(x, w, b, rsqrt_table, m, d);
     let d_f = Goldilocks::from_u64(d as u64);
+    let half_d = Goldilocks::from_u64((d / 2) as u64);
+    let half32 = Goldilocks::from_u64(1u64 << 31);
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
 
     // mean reduction: sum_mean(r) = sum_j x(r,j).
@@ -108,12 +116,14 @@ pub fn prove_layer_norm_centered(
     );
     // mean truncation: mean*d + rem_mean = sum_mean (elementwise on [m]).
     let m_ch: Vec<Goldilocks> = (0..m.trailing_zeros() as usize).map(|_| rng.field()).collect();
+    let ones_m: Vec<Goldilocks> = vec![Goldilocks::ONE; m];
     let mean_proof = prove_virtual(
-        &[&mean, &rem_mean, &sum_mean],
+        &[&mean, &rem_mean, &sum_mean, &ones_m],
         &[
             (d_f, vec![0usize]),
             (Goldilocks::ONE, vec![1usize]),
             (neg, vec![2usize]),
+            (neg * half_d, vec![3usize]),
         ],
         Goldilocks::ZERO,
         &m_ch,
@@ -142,11 +152,12 @@ pub fn prove_layer_norm_centered(
     );
     let v_ch: Vec<Goldilocks> = (0..m.trailing_zeros() as usize).map(|_| rng.field()).collect();
     let var_proof = prove_virtual(
-        &[&var, &rem_var, &sum_var],
+        &[&var, &rem_var, &sum_var, &ones_m],
         &[
             (d_f, vec![0usize]),
             (Goldilocks::ONE, vec![1usize]),
             (neg, vec![2usize]),
+            (neg * half_d, vec![3usize]),
         ],
         Goldilocks::ZERO,
         &v_ch,
@@ -162,8 +173,9 @@ pub fn prove_layer_norm_centered(
     let raw: Vec<Goldilocks> = (0..m * d).map(|ij| centered[ij] * rstd[ij / d] * w[ij]).collect();
     let r_out: Vec<Goldilocks> = (0..(m * d).trailing_zeros() as usize).map(|_| rng.field()).collect();
     let two32 = Goldilocks::from_u64(1u64 << 32);
+    let ones_md: Vec<Goldilocks> = vec![Goldilocks::ONE; m * d];
     let out_proof = prove_virtual(
-        &[&centered, &rstd_b, w, b, &raw, &out, &rem_out],
+        &[&centered, &rstd_b, w, b, &raw, &out, &rem_out, &ones_md],
         &[
             (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
             (neg, vec![4usize]),
@@ -171,6 +183,7 @@ pub fn prove_layer_norm_centered(
             (neg * two32, vec![5usize]),
             (two32, vec![3usize]),
             (neg, vec![6usize]),
+            (half32, vec![7usize]),
         ],
         Goldilocks::ZERO,
         &r_out,
@@ -206,7 +219,10 @@ pub fn verify_layer_norm_centered(
     let (mean, centered, var, s_index, rstd, out, rem_out, sum_mean, rem_mean, sum_var, rem_var) =
         layer_norm_forward(x, w, b, rsqrt_table, m, d);
     let d_f = Goldilocks::from_u64(d as u64);
+    let half_d = Goldilocks::from_u64((d / 2) as u64);
+    let half32 = Goldilocks::from_u64(1u64 << 31);
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    let ones_m: Vec<Goldilocks> = vec![Goldilocks::ONE; m];
 
     // mean truncation.
     if !verify_virtual(
@@ -215,10 +231,11 @@ pub fn verify_layer_norm_centered(
             (d_f, vec![0usize]),
             (Goldilocks::ONE, vec![1usize]),
             (neg, vec![2usize]),
+            (neg * half_d, vec![3usize]),
         ],
         Goldilocks::ZERO,
         &proof.mean_ch,
-        &[mle::eval(&mean, &proof.mean_ch), mle::eval(&rem_mean, &proof.mean_ch), mle::eval(&sum_mean, &proof.mean_ch)],
+        &[mle::eval(&mean, &proof.mean_ch), mle::eval(&rem_mean, &proof.mean_ch), mle::eval(&sum_mean, &proof.mean_ch), mle::eval(&ones_m, &proof.mean_ch)],
     ) {
         return false;
     }
@@ -240,10 +257,11 @@ pub fn verify_layer_norm_centered(
             (d_f, vec![0usize]),
             (Goldilocks::ONE, vec![1usize]),
             (neg, vec![2usize]),
+            (neg * half_d, vec![3usize]),
         ],
         Goldilocks::ZERO,
         &proof.var_ch,
-        &[mle::eval(&var, &proof.var_ch), mle::eval(&rem_var, &proof.var_ch), mle::eval(&sum_var, &proof.var_ch)],
+        &[mle::eval(&var, &proof.var_ch), mle::eval(&rem_var, &proof.var_ch), mle::eval(&sum_var, &proof.var_ch), mle::eval(&ones_m, &proof.var_ch)],
     ) {
         return false;
     }
@@ -255,6 +273,7 @@ pub fn verify_layer_norm_centered(
     let rstd_b: Vec<Goldilocks> = (0..m * d).map(|ij| rstd[ij / d]).collect();
     let raw: Vec<Goldilocks> = (0..m * d).map(|ij| centered[ij] * rstd[ij / d] * w[ij]).collect();
     let two32 = Goldilocks::from_u64(1u64 << 32);
+    let ones_md: Vec<Goldilocks> = vec![Goldilocks::ONE; m * d];
     verify_virtual(
         &proof.out,
         &[
@@ -264,6 +283,7 @@ pub fn verify_layer_norm_centered(
             (neg * two32, vec![5usize]),
             (two32, vec![3usize]),
             (neg, vec![6usize]),
+            (half32, vec![7usize]),
         ],
         Goldilocks::ZERO,
         &proof.r_out,
@@ -275,6 +295,7 @@ pub fn verify_layer_norm_centered(
             mle::eval(&raw, &proof.r_out),
             mle::eval(&out, &proof.r_out),
             mle::eval(&rem_out, &proof.r_out),
+            mle::eval(&ones_md, &proof.r_out),
         ],
     )
 }
