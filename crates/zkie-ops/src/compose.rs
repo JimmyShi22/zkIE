@@ -547,6 +547,16 @@ pub enum Op {
         factor: i64,
         shift: u32,
     },
+    ScaleVec {
+        x: T,
+        scale: T,
+        out: T,
+        shift: u32,
+    },
+    Relu {
+        x: T,
+        out: T,
+    },
     MatMul {
         a: T,
         b: T,
@@ -642,6 +652,8 @@ pub enum Op {
 pub enum OpProof {
     Transpose,
     Scale,
+    ScaleVec,
+    Relu,
     MatMul(MatmulProof, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>),
     Projection(ProjectionProof),
     Add(VirtualProof, Vec<Goldilocks>),
@@ -706,6 +718,22 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 let o: Vec<Goldilocks> = store.get(x)
                     .iter()
                     .map(|&v| from_i64(round_div(to_i64(v) * factor, 1i64 << shift)))
+                    .collect();
+                store.v[out] = o;
+            }
+            Op::ScaleVec { x, scale, out, shift } => {
+                let sv = store.get(scale);
+                let o: Vec<Goldilocks> = store.get(x)
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| from_i64(round_div(to_i64(v) * to_i64(sv[i % sv.len()]), 1i64 << shift)))
+                    .collect();
+                store.v[out] = o;
+            }
+            Op::Relu { x, out } => {
+                let o: Vec<Goldilocks> = store.get(x)
+                    .iter()
+                    .map(|&v| if to_i64(v) > 0 { v } else { Goldilocks::ZERO })
                     .collect();
                 store.v[out] = o;
             }
@@ -862,6 +890,12 @@ pub fn prove_shard_precomputed(
             }
             Op::Scale { .. } => {
                 op_proofs.push(OpProof::Scale);
+            }
+            Op::ScaleVec { .. } => {
+                op_proofs.push(OpProof::ScaleVec);
+            }
+            Op::Relu { .. } => {
+                op_proofs.push(OpProof::Relu);
             }
             Op::MatMul { a, b, c, m, k, n } => {
                 let at = transpose(store.get(a), m, k);
@@ -1039,6 +1073,8 @@ pub fn verify_shard_precomputed(store: &Store, ops: &[Op], proof: &OpShardProof)
                 // against that recomputed value.
             }
             (Op::Scale { .. }, OpProof::Scale) => {}
+            (Op::ScaleVec { .. }, OpProof::ScaleVec) => {}
+            (Op::Relu { .. }, OpProof::Relu) => {}
             (Op::MatMul { a, b, c, m, k, n: _ }, OpProof::MatMul(mp, u, v, ch)) => {
                 let at = transpose(ws.get(*a), *m, *k);
                 let a_restricted = mle::partial_eval(&at, u);
