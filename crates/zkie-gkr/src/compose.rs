@@ -980,15 +980,19 @@ pub fn prove_shard_precomputed(
     OpShardProof { ops: op_proofs, bound, binds, claims: raw_claims }
 }
 
-/// Verify a shard proof.
+/// Verify a shard proof (recomputes the witness first).
 pub fn verify_shard(store: &Store, ops: &[Op], proof: &OpShardProof) -> bool {
-    assert_eq!(proof.ops.len(), ops.len());
-    assert_eq!(proof.bound.len(), proof.binds.len());
-
-    // Recompute forward on a scratch store (the input tensors are read-only; the
-    // op outputs are recomputed to check the proof against a fresh witness).
     let mut ws = Store { v: store.v.clone(), idx: store.idx.clone() };
     forward_ops(&mut ws, ops);
+    verify_shard_precomputed(&ws, ops, proof)
+}
+
+/// Verify a shard proof against an already-materialized witness store. Read-only
+/// on `store`, so shards can be verified in parallel.
+pub fn verify_shard_precomputed(store: &Store, ops: &[Op], proof: &OpShardProof) -> bool {
+    let ws = store;
+    assert_eq!(proof.ops.len(), ops.len());
+    assert_eq!(proof.bound.len(), proof.binds.len());
 
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
     let add_terms = vec![
@@ -1234,15 +1238,20 @@ pub fn verify_shard_dag(
     if proof.shards.len() != ranges.len() || proof.cross_tensors.len() != proof.cross_binds.len() {
         return false;
     }
-    for (i, (s, e)) in ranges.iter().enumerate() {
-        if !verify_shard(store, &ops[*s..*e], &proof.shards[i]) {
-            return false;
-        }
-    }
 
     // Recompute the witness to get fresh tensor values for binding evals.
     let mut ws = Store { v: store.v.clone(), idx: store.idx.clone() };
     forward_ops(&mut ws, ops);
+
+    // Verify each shard in parallel against the shared fresh witness.
+    let all_ok = ranges
+        .par_iter()
+        .enumerate()
+        .map(|(i, &(s, e))| verify_shard_precomputed(&ws, &ops[s..e], &proof.shards[i]))
+        .all(|ok| ok);
+    if !all_ok {
+        return false;
+    }
 
     // Rebuild the same cross-shard grouping (points only; evals recomputed).
     let mut by_tensor: std::collections::BTreeMap<T, Vec<Vec<Goldilocks>>> =
