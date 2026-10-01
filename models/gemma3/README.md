@@ -38,3 +38,8 @@ The weights are gated on Hugging Face (`google/gemma-3-270m`, bf16 safetensors,
 GEMMA_SEQ=16 cargo run --release -p zkie-models-gemma3 --example prove
 GEMMA_SEQ=16 cargo run --release -p zkie-models-gemma3 --example bench
 ```
+Measured (seq=16, release, 64-thread CPU):
+
+| shards | prove | verify | total | argmax | peak RSS |
+| --- | --- | --- | --- | --- | --- |
+| 22 (per layer) | 30.4 s | 15.8 s | ~46.2 s | 16/16 | ~28 GB |

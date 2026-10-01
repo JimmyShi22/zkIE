@@ -42,7 +42,7 @@ fn main() {
 
     let mut best_time = f64::MAX;
     let mut best_pps = 0usize;
-    for &pps in &[total, 53usize, 106, 212, 424, 848] {
+    for &pps in &[53usize, 106, 212, 424, 848] {
         let mut rng = XorShift64::new(0xBEEF);
         let t0 = std::time::Instant::now();
         let proof = prove_shard_dag(&mut store, &ops, pps, &mut rng);
