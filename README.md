@@ -88,6 +88,25 @@ stays on the CPU.
 | Lookup | LogUp fractional sumcheck |
 | Affine (fixed-point rounding) | rounding range check (LogUp) |
 
+## Usage
+
+Build and run the real GPT-2 512 end-to-end proof (weights/tables are under
+`models/gpt2_stack/`, expected at the crate working directory):
+
+```bash
+# full GPT-2 512 proof: argmax sanity check + prove/verify time
+cargo run --release --example prove_gpt2_full
+
+# shard-granularity sweep (1 shard vs 13 shards)
+cargo run --release --example bench_gpt2_sharded
+
+# autotune over shard granularities
+cargo run --release --example bench_gpt2_autotune
+
+# library tests
+cargo test --lib
+```
+
 ## Benchmarks
 
 Measured on a 64-thread CPU. Full detail and the reasoning behind the numbers
@@ -110,6 +129,28 @@ flow.
 Status: GPT-2 512 proves end to end with a measured time (~0.92 min at 13
 shards), and after autotuning is faster than the layer-granularity pipeline and
 faster than DeepProve (~7.6 min) by roughly 8x.
+
+## Repository layout
+
+- `crates/zkie-gkr/` — the proving engine:
+  - `src/compose.rs` — op primitives (`Op`, `prove_shard`, `prove_shard_dag`,
+    cross-shard `same_poly` binding, weight batch commit).
+  - `src/engine.rs` — shard granularity, per-stage schedule, and the autotune
+    loop.
+  - `src/projection.rs`, `src/layer_norm_centered.rs`, `src/softmax_scaled.rs`,
+    `src/layernorm_chain.rs` — op-level proof primitives.
+  - `src/sumcheck.rs`, `src/matmul.rs`, `src/logup_gkr.rs`, `src/same_poly.rs`,
+    `src/mle.rs` — the reduction substrate.
+  - `src/whir.rs`, `src/batch_open.rs`, `src/committed.rs` — WHIR/FRI
+    polynomial commitments.
+  - `src/par.rs` — the i64 fixed-point forward matmul (cache-friendly, with
+    field fallback).
+  - `examples/` — `prove_gpt2_full`, `bench_gpt2_sharded`,
+    `bench_gpt2_autotune`, and micro-benchmarks.
+- `crates/zkie-cuda/` — optional CUDA backend (Sppark DFT + Poseidon2 Merkle)
+  behind the `cuda` feature.
+- `models/` — GPT-2 512 weights and lookup tables (i32 fixed-point).
+- `docs/` — `spec.md` (design), `benchmarks.md` (measurements), `roadmap.md`.
 
 ## License
 
