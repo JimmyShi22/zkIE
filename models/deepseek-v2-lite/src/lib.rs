@@ -167,9 +167,30 @@ fn build_moe(
     m: usize,
     shift: u32,
     silu_t: usize,
+    exp_t: usize,
 ) -> usize {
     let dir = "models/deepseek-v2-lite/weights";
     let gate = load_i32(&format!("{dir}/L{layer}_gate_i32.bin"));
+
+    // committed precomputed gate, verified against the computed top-k below
+    let gate_t = store.push(gate.clone());
+    let router = load_i32(&format!("{dir}/L{layer}_router_i32.bin"));
+    let router_t = store.push(router);
+    let logits = store.push(vec![]);
+    ops.push(Op::MatMul { a: x, b: router_t, c: logits, m, k: H, n: N_ROUTED });
+    let logits_16 = store.push(vec![]);
+    ops.push(Op::Scale { x: logits, out: logits_16, factor: 1, shift: 16 });
+    let zero_mask = store.push(zeros(m * N_ROUTED));
+    let scores_idx = store.push_idx(vec![]);
+    ops.push(Op::StableSoftmaxIndex { x: logits_16, mask: zero_mask, out: scores_idx, offset: 1 << 21, table_len: 1 << 21, m, n: N_ROUTED });
+    let scores_e = store.push(vec![]);
+    let scores = store.push(vec![]);
+    ops.push(Op::Softmax { idx: scores_idx, e: scores_e, out: scores, table: exp_t, m, n: N_ROUTED });
+    let sel = store.push(vec![]);
+    let thr = store.push(vec![]);
+    let d1 = store.push(vec![]);
+    let d2 = store.push(vec![]);
+    ops.push(Op::TopKSelect { x: scores, sel, thr, gate: gate_t, d1, d2, m, n: N_ROUTED, k: 6 });
     let shared_g = load_i32(&format!("{dir}/L{layer}_shared_gate_i32.bin"));
     let shared_u = load_i32(&format!("{dir}/L{layer}_shared_up_i32.bin"));
     let shared_d = load_i32(&format!("{dir}/L{layer}_shared_down_i32.bin"));
@@ -177,8 +198,11 @@ fn build_moe(
     let eu = load_i32(&format!("{dir}/L{layer}_experts_up_i32.bin"));
     let ed = load_i32(&format!("{dir}/L{layer}_experts_down_i32.bin"));
 
+    let routed: Vec<usize> = (0..N_ROUTED)
+        .filter(|&e| (0..m).any(|t| gate[t * N_ROUTED + e] != Goldilocks::ZERO))
+        .collect();
     let mut acc: Option<usize> = None;
-    for expert in 0..N_ROUTED {
+    for expert in routed {
         let eg_w = store.push(eg[expert * H * MOE_PAD..(expert + 1) * H * MOE_PAD].to_vec());
         let eu_w = store.push(eu[expert * H * MOE_PAD..(expert + 1) * H * MOE_PAD].to_vec());
         let ed_w = store.push(ed[expert * MOE_PAD * H..(expert + 1) * MOE_PAD * H].to_vec());
@@ -272,7 +296,7 @@ pub fn build_deepseek(store: &mut Store, ops: &mut Vec<Op>, dir: &str, m: usize,
         let ff = if layer == 0 {
             build_dense_ffn(store, ops, h2, m, shift, silu_t)
         } else {
-            build_moe(store, ops, h2, layer, m, shift, silu_t)
+            build_moe(store, ops, h2, layer, m, shift, silu_t, exp_t)
         };
         let x3 = store.push(vec![]);
         ops.push(Op::Add { a: x2, b: ff, c: x3 });

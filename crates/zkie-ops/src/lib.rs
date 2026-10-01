@@ -7,3 +7,4 @@ pub mod layernorm_chain;
 pub mod softmax_scaled;
 pub mod rms_norm;
 pub mod rope;
+pub mod topk;
