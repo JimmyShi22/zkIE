@@ -3,7 +3,7 @@
 
 use zkie_core::common::field::XorShift64;
 use zkie_core::common::fixed_point::{to_i32, to_i64};
-use zkie_engine::models::gpt2::{build_gpt2, load_i32};
+use zkie_models_gpt2::{build_gpt2, load_i32};
 use zkie_ops::compose::{prove_shard_dag, verify_shard_dag, Store};
 
 fn main() {

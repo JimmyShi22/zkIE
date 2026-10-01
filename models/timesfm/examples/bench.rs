@@ -2,7 +2,7 @@
 //! prove/verify wall time + peak RSS, to pick the optimal multi-shard config.
 
 use zkie_core::common::field::{PrimeCharacteristicRing, XorShift64};
-use zkie_engine::models::timesfm::build_timesfm;
+use zkie_models_timesfm::build_timesfm;
 use zkie_ops::compose::{prove_shard_dag, verify_shard_dag, Store};
 
 fn peak_rss_kb() -> u64 {

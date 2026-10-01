@@ -2,7 +2,7 @@
 /.omc
 /.claude/worktrees
 /.worktrees
-/models
+/models/gpt2_graph.txt
 /.spike-test
 /.venv-timesfm
 *.log
