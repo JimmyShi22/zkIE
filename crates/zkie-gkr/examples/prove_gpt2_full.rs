@@ -87,6 +87,8 @@ fn build_layer(
         let q = store.push(vec![]);
         let k = store.push(vec![]);
         let v = store.push(vec![]);
+        let q_scaled = store.push(vec![]);
+        let k_scaled = store.push(vec![]);
         let qr = store.push(vec![]);
         let kr = store.push(vec![]);
         let vr = store.push(vec![]);
@@ -103,9 +105,11 @@ fn build_layer(
         ops.push(Op::Projection { x: h, w: qh, bias: qb, out: q, rem: qr, m, k: D, n: DH, shift });
         ops.push(Op::Projection { x: h, w: kh, bias: kb, out: k, rem: kr, m, k: D, n: DH, shift });
         ops.push(Op::Projection { x: h, w: vh, bias: vb, out: v, rem: vr, m, k: D, n: DH, shift });
-        ops.push(Op::Transpose { x: k, out: kt, m, k: DH });
-        ops.push(Op::MatMul { a: q, b: kt, c: scores, m, k: DH, n: m });
-        ops.push(Op::Scale { x: scores, out: scores_16, factor: 1, shift: 19 });
+        ops.push(Op::Scale { x: q, out: q_scaled, factor: 23170, shift: 16 });
+        ops.push(Op::Scale { x: k, out: k_scaled, factor: 23170, shift: 16 });
+        ops.push(Op::Transpose { x: k_scaled, out: kt, m, k: DH });
+        ops.push(Op::MatMul { a: q_scaled, b: kt, c: scores, m, k: DH, n: m });
+        ops.push(Op::Scale { x: scores, out: scores_16, factor: 1, shift: 16 });
         ops.push(Op::StableSoftmaxIndex { x: scores_16, mask: mask_t, out: idx, offset: 1 << 21, table_len, m, n: m });
         ops.push(Op::Softmax { idx, e, out: probs, table: exp_t, m, n: m });
         ops.push(Op::MatMul { a: probs, b: v, c: attn, m, k: m, n: DH });
