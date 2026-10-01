@@ -1,89 +1,43 @@
-//! Benchmark the GKR prover on TimesFM-shaped matmuls (power-of-2 padded).
-//!
-//! TimesFM 8M: hidden=264 (pad to 512), intermediate=1024, 16 patches/context,
-//! 7 layers. The dominant work is the FFN (264x1024 -> 512x1024) and QKV
-//! (264x264 -> 512x512) matmuls. This reports the GKR sum-check prover cost and
-//! the WHIR commitment cost for one FFN weight matrix, then extrapolates.
+//! Sweep shard granularity (ops_per_shard) for TimesFM 200M and report
+//! prove/verify wall time + peak RSS, to pick the optimal multi-shard config.
 
-use std::time::Instant;
+use zkie_core::common::field::{PrimeCharacteristicRing, XorShift64};
+use zkie_engine::models::timesfm::build_timesfm;
+use zkie_ops::compose::{prove_shard_dag, verify_shard_dag, Store};
 
-use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64};
-use zkie_core::pcs::whir::Whir;
-use {zkie_core::common::matmul, zkie_core::common::mle};
-
-fn dense(a: &[Goldilocks], b: &[Goldilocks], m: usize, k: usize, n: usize) -> Vec<Goldilocks> {
-    let mut c = vec![Goldilocks::ZERO; m * n];
-    for i in 0..m {
-        for j in 0..n {
-            let mut acc = Goldilocks::ZERO;
-            for w in 0..k {
-                acc = acc + a[i * k + w] * b[w * n + j];
-            }
-            c[i * n + j] = acc;
+fn peak_rss_kb() -> u64 {
+    let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    for line in s.lines() {
+        if let Some(v) = line.strip_prefix("VmHWM:") {
+            return v.trim().trim_end_matches(" kB").parse().unwrap_or(0);
         }
     }
-    c
-}
-
-fn transpose(a: &[Goldilocks], m: usize, k: usize) -> Vec<Goldilocks> {
-    let mut at = vec![Goldilocks::ZERO; k * m];
-    for i in 0..m {
-        for w in 0..k {
-            at[w * m + i] = a[i * k + w];
-        }
-    }
-    at
-}
-
-fn bench_matmul(m: usize, k: usize, n: usize, rng: &mut XorShift64) -> f64 {
-    let a: Vec<Goldilocks> = (0..m * k).map(|_| rng.field()).collect();
-    let b: Vec<Goldilocks> = (0..k * n).map(|_| rng.field()).collect();
-    let c = dense(&a, &b, m, k, n);
-    let at = transpose(&a, m, k);
-    let u: Vec<Goldilocks> = (0..m.trailing_zeros() as usize).map(|_| rng.field()).collect();
-    let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
-    let ch: Vec<Goldilocks> = (0..k.trailing_zeros() as usize).map(|_| rng.field()).collect();
-
-    let t0 = Instant::now();
-    let proof = matmul::prove(&at, &b, &c, m, k, n, &u, &v, &ch);
-    let secs = t0.elapsed().as_secs_f64();
-    assert!(matmul::verify(&proof, &ch, mle::eval(&at, &{ let mut p = u; p.extend_from_slice(&ch); p }), mle::eval(&b, &{ let mut p = v; p.extend_from_slice(&ch); p })));
-    secs
+    0
 }
 
 fn main() {
-    let mut rng = XorShift64::new(0x71f);
+    let dir = "models/timesfm/weights";
+    let mut store = Store::new();
+    let mut ops = Vec::new();
+    build_timesfm(&mut store, &mut ops, dir, 16);
+    let total = ops.len();
+    println!("total ops: {total}");
 
-    // TimesFM 8M shapes, power-of-2 padded.
-    let (seq, hidden_pad, intermediate) = (16usize, 512usize, 1024usize);
-
-    // FFN up-projection: (seq x hidden) @ (hidden x intermediate).
-    let ffn_up = bench_matmul(seq, hidden_pad, intermediate, &mut rng);
-    // FFN down-projection: (seq x intermediate) @ (intermediate x hidden).
-    let ffn_down = bench_matmul(seq, intermediate, hidden_pad, &mut rng);
-    // QKV as three separate projections (hidden -> hidden each); the fused
-    // 3*hidden output is not a power of two, so it must be split.
-    let qkv = bench_matmul(seq, hidden_pad, hidden_pad, &mut rng) * 3.0;
-
-    println!("padded matmul sum-check prover (one layer, 16 patches):");
-    println!("  ffn_up   {ffn_up:.4}s");
-    println!("  ffn_down {ffn_down:.4}s");
-    println!("  qkv      {qkv:.4}s");
-    let attention = bench_matmul(seq, hidden_pad, seq, &mut rng) * 2.0;
-    let per_layer = ffn_up + ffn_down + qkv + attention;
-    println!("  per-layer sumcheck ~{per_layer:.4}s, 7 layers ~{:.2}s", per_layer * 7.0);
-
-    // WHIR commitment cost for one FFN weight matrix (512 x 1024 = 524288 elems).
-    let whir = Whir::new_testing(19); // 2^19 = 524288
-    let w: Vec<Goldilocks> = (0..hidden_pad * intermediate).map(|_| rng.field()).collect();
-    let t0 = Instant::now();
-    let (_commitment, _pd, _proto) = whir.commit(&w);
-    let commit_secs = t0.elapsed().as_secs_f64();
-    println!("whir commit 512x1024 (524288 elems, testing security): {commit_secs:.3}s");
-    // TimesFM 8M has ~8M weights + activations; each element is hashed once.
-    let total_elems = 8_000_000u64;
-    println!(
-        "  extrapolated commit for 8M elems ~{:.1}s (testing security; 90-bit PoW adds per-proof overhead)",
-        commit_secs * total_elems as f64 / 524288.0
-    );
+    let mut best_time = f64::MAX;
+    let mut best_pps = 0usize;
+    for &pps in &[108usize, 216, 432, 1080, 2160, total] {
+        let mut s = Store { v: store.v.clone(), idx: store.idx.clone() };
+        let mut rng = XorShift64::new(0xBEEF);
+        let t0 = std::time::Instant::now();
+        let proof = prove_shard_dag(&mut s, &ops, pps, &mut rng);
+        let prove_t = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        assert!(verify_shard_dag(&s, &ops, pps, &proof));
+        let verify_t = t1.elapsed();
+        let total_t = (prove_t + verify_t).as_secs_f64();
+        println!("pps={pps:5} prove={prove_t:?} verify={verify_t:?} total={total_t:.2}s rss={}kB",
+            peak_rss_kb());
+        if total_t < best_time { best_time = total_t; best_pps = pps; }
+    }
+    println!("best ops_per_shard: {best_pps} ({:.2}s total)", best_time);
 }
