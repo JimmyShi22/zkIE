@@ -1,0 +1,13 @@
+[package]
+name = "zkie-models-deepseek-v2-lite"
+version = "0.1.0"
+edition = "2021"
+description = "zkIE DeepSeek-V2-Lite (MLA + MoE) op-graph builder + prove/bench examples"
+license = "Apache-2.0"
+
+[dependencies]
+zkie-core = { path = "../../crates/zkie-core" }
+zkie-ops = { path = "../../crates/zkie-ops" }
+
+[dev-dependencies]
+zkie-engine = { path = "../../crates/zkie-engine" }

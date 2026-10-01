@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/zkie-core", "crates/zkie-ops", "crates/zkie-engine", "models/gpt2", "models/timesfm", "models/gemma3"]
+members = ["crates/zkie-core", "crates/zkie-ops", "crates/zkie-engine", "models/gpt2", "models/timesfm", "models/gemma3", "models/deepseek-v2-lite"]
 
 [patch.crates-io]
 p3-merkle-tree = { path = "crates/zkie-core/vendor/p3-merkle-tree" }
