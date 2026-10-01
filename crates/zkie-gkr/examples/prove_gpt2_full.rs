@@ -83,7 +83,7 @@ fn build_layer(
         let qb = store.push(broadcast(&q_b[head * DH..(head + 1) * DH], m));
         let kb = store.push(broadcast(&k_b[head * DH..(head + 1) * DH], m));
         let vb = store.push(broadcast(&v_b[head * DH..(head + 1) * DH], m));
-        let ob = store.push(broadcast(&o_b, m));
+        let ob = store.push(broadcast(&vec![from_i32(0); D], m));
         let q = store.push(vec![]);
         let k = store.push(vec![]);
         let v = store.push(vec![]);
@@ -123,8 +123,13 @@ fn build_layer(
         ops.push(Op::Add { a: attn_acc, b: ho, c: s });
         attn_acc = s;
     }
+    // Add the attention output-projection bias ONCE (after summing heads),
+    // matching the float reference `x2 = x + sum(attn_heads) + o_b`.
+    let o_b_t = store.push(broadcast(&o_b, m));
+    let attn_biased = store.push(vec![]);
+    ops.push(Op::Add { a: attn_acc, b: o_b_t, c: attn_biased });
     let x2 = store.push(vec![]);
-    ops.push(Op::Add { a: x, b: attn_acc, c: x2 });
+    ops.push(Op::Add { a: x, b: attn_biased, c: x2 });
 
     let ln2_w_t = store.push(broadcast(&ln2_w, m));
     let ln2_b_t = store.push(broadcast(&ln2_b, m));
@@ -171,8 +176,12 @@ fn main() {
 
     let mut ops = Vec::new();
     let mut x_cur = x0;
+    let mut layer0_out = x0;
     for layer in 0..LAYERS {
         x_cur = build_layer(&mut store, &mut ops, x_cur, layer, m, shift, exp_t, gelu_t, rsqrt_t, mask_t);
+        if layer == 0 {
+            layer0_out = x_cur;
+        }
     }
 
     // Final layernorm + lm_head (bare matmul, no bias).
@@ -192,6 +201,14 @@ fn main() {
     let verify_t = t1.elapsed();
     println!("full GPT-2+lm_head ({} layers, m={}, {} heads, {} ops): prove {:?}, verify {:?}",
         LAYERS, m, HEADS, ops.len(), prove_t, verify_t);
+
+    // Debug: layer0 output after the witness is computed.
+    let h0 = store.get(layer0_out);
+    print!("layer0 out[0..8] = ");
+    for &v in &h0[0..8] {
+        print!("{} ", zkie_gkr::fixed_point::to_i64(v));
+    }
+    println!();
 
     // Compare argmax to ground truth.
     let gt = load_i32(&format!("{dir}/gt_argmax_512_i32.bin"));
