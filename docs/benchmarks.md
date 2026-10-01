@@ -284,3 +284,68 @@ The commit (Merkle over the total witness) is now only ~10% of wall time; the
 rest is GKR/sumcheck work plus the FRI opens. Next levers: replace the
 affine/scale bit decomposition (`prove_round_batch`) the same way, then attack
 the matmul/sumcheck hot path.
+
+## Layer-granularity GPT-2 512: per-block costs (2026-10-01)
+
+Layer circuit, plain model, single-threaded. Examples in
+`crates/zkie-gkr/examples/`:
+
+| block | dims | time |
+| --- | --- | --- |
+| projection (matmul + affine + logUp) | 512x1024x1024 | 2.06s |
+| full FFN (2 projections + gelu) | 512x1024x4096 + 512x4096x1024 | 18.55s |
+| softmax (exp lookup + row-sum) | seq=512, table 2^18 | 0.14s |
+
+Findings:
+
+- softmax is cheap (0.14s); the dominant cost is the projection affine + logUp
+  range check (O(m*n) elementwise sumcheck + fraction tree), not the matmul GKR
+  (O(contraction dim), ~0.03s).
+- Softmax rescale is now O(m*n) (NOT the O(m*n*n) flattened product):
+  `softmax_scaled::prove_softmax_scaled` proves exp lookup + row-sum + rescale
+  (field-inverse `out*sum_broadcast = e`, sum as a separate tensor) in 0.16s at
+  seq=512. This removes the 2^27 (infeasible) flattened rescale.
+- Full transformer layer (single-head attention + FFN + 2 residual adds, plain
+  model, no layernorm yet): 27.57s/layer proof. 12-layer end-to-end (incl.
+  witness generation) = 624s (~10.4 min) via `bench_gpt2_12layer`; proof-only is
+  ~5.5 min. Witness gen (forward matmul) is ~half the wall time and is a
+  separate optimizable axis (GPU/parallel), not part of the proof. Multi-head
+  (12x the softmax/matmul, ~+2s) and layernorm were still to be wired on top.
+- Full layer extrapolation: attention (~6s projections + ~1.7s softmax) + FFN
+  (18.55s) + layernorm (~1s) ~= 27s/layer, ~5.4 min for 12 layers, ~3.5x faster
+  than the op-granularity 19.6 min.
+- Committed cost (testing Whir params): committing + opening one projection's
+  5 tensors (x,w,bias,out,rem) = 0.30s vs 2.06s proving, so WHIR commitment is
+  ~15% overhead. The affine + logUp range check (O(m*n)) dominates, not the
+  openings; aggregate-openings is a second-order win on CPU, and layer-boundary
+  commitment (one WHIR per layer) removes most of the per-op commit cost anyway.
+- Caveats: plain model (affine base tensors not WHIR-committed, only the logUp
+  fraction tree is); single-threaded; real gelu/exp tables are 2^21..2^23 (the
+  bench used 2^16..2^18). N-ary sharding + layer parallelism + GPU were still to
+  be added on top.
+
+## Layer-granularity GPT-2 512: performance journey (2026-10-01)
+
+GPT-2 512 scale, synthetic weights, single-head, post-norm, plain model.
+
+| step | per-layer | notes |
+| --- | --- | --- |
+| op granularity (old baseline) | ~19.6 min total | every op committed/sumchecked/opened |
+| layer granularity (claim-chained, single-threaded) | 58.9s | one g per layer, virtual intermediates |
+| + row-parallel matmul (64 cores, `par::mm_par`) | 6.55s | 9x |
+| + parallel sumcheck (`prove_virtual` hot loops) | 3.62s | 1.8x |
+| 12-layer end-to-end (layer-parallel proof) | ~32s | witness 9.4s + proof 22.6s |
+
+Key findings:
+
+- The bottleneck is elementwise work (forward matmul and the affine+logUp
+  sumcheck), not the matmul GKR reduction or the WHIR commit/open. Both are
+  embarrassingly parallel across rows/elements, so 64 CPU cores give ~30x.
+- WHIR commit+open is ~0.30s/projection (testing params) and GPU commit is only
+  ~1.1-1.4x (launch/transfer-bound) — the real lever is CPU parallelism, not
+  the GPU commit path.
+- Claim chaining (same_poly) adds ~7s/layer over independent proofs — the
+  "eliminate claim merge overhead" target.
+- The 12-layer proof does not scale to the theoretical ~6s (measured 22.6s):
+  nested parallelism (12 std threads x rayon pool) contends; switching the outer
+  loop to `rayon::par_iter` is applied but not yet confirmed effective.
