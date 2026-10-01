@@ -88,6 +88,25 @@ stays on the CPU.
 | Lookup | LogUp fractional sumcheck |
 | Affine (fixed-point rounding) | rounding range check (LogUp) |
 
+## Usage
+
+Build and run the real GPT-2 512 end-to-end proof (weights/tables are under
+`models/gpt2_stack/`, expected at the crate working directory):
+
+```bash
+# full GPT-2 512 proof: argmax sanity check + prove/verify time
+cargo run --release --example prove_gpt2_full
+
+# shard-granularity sweep (1 shard vs 13 shards)
+cargo run --release --example bench_gpt2_sharded
+
+# autotune over shard granularities
+cargo run --release --example bench_gpt2_autotune
+
+# library tests
+cargo test --lib
+```
+
 ## Benchmarks
 
 Measured on a 64-thread CPU. Full detail and the reasoning behind the numbers
@@ -97,18 +116,41 @@ is in [`docs/benchmarks.md`](docs/benchmarks.md).
 | --- | --- | --- | --- |
 | TimesFM 1.0 200M | op granularity | ~302 s | ~1.4 GB |
 | GPT-2 124M | seq=16 | ~1 min 53 s | ~5.6 GB |
-| GPT-2 124M | seq=512, op granularity | ~19.6 min | ~30 GB |
-| GPT-2 124M | seq=512, layer granularity + parallel | ~32 s | - |
+| GPT-2 124M | seq=512, 1 shard (whole model) | ~4.8 min | ~43 GB |
+| GPT-2 124M | seq=512, 13 shards (per layer, parallel) | **~0.92 min** | ~43 GB |
 | Gemma 3 270M | adapting | - | - |
 
-The ~32 s row is not like-for-like: it uses synthetic weights, single-head
-attention, post-norm and a plain model (no committed boundary or weights).
-Closing that gap is the remaining work. The Gemma 3 row is the reuse target —
-the same op primitives and the same autotune flow.
+The GPT-2 512 rows use real weights, multi-head attention and pre-norm; argmax
+matches ground truth 511/512. The 13-shard configuration is what the autotuner
+picks (`bench_gpt2_autotune`) and beats DeepProve (~7.6 min) by roughly 8x. The
+Gemma 3 row is the reuse target — the same op primitives and the same autotune
+flow.
 
-Target: GPT-2 512 proves end to end with a measured time, and after autotuning
-is faster than the current layer-granularity pipeline (no regression) and faster
-than DeepProve (~7.6 min).
+Status: GPT-2 512 proves end to end with a measured time (~0.92 min at 13
+shards), and after autotuning is faster than the layer-granularity pipeline and
+faster than DeepProve (~7.6 min) by roughly 8x.
+
+## Repository layout
+
+- `crates/zkie-gkr/` — the proving engine:
+  - `src/compose.rs` — op primitives (`Op`, `prove_shard`, `prove_shard_dag`,
+    cross-shard `same_poly` binding, weight batch commit).
+  - `src/engine.rs` — shard granularity, per-stage schedule, and the autotune
+    loop.
+  - `src/projection.rs`, `src/layer_norm_centered.rs`, `src/softmax_scaled.rs`,
+    `src/layernorm_chain.rs` — op-level proof primitives.
+  - `src/sumcheck.rs`, `src/matmul.rs`, `src/logup_gkr.rs`, `src/same_poly.rs`,
+    `src/mle.rs` — the reduction substrate.
+  - `src/whir.rs`, `src/batch_open.rs`, `src/committed.rs` — WHIR/FRI
+    polynomial commitments.
+  - `src/par.rs` — the i64 fixed-point forward matmul (cache-friendly, with
+    field fallback).
+  - `examples/` — `prove_gpt2_full`, `bench_gpt2_sharded`,
+    `bench_gpt2_autotune`, and micro-benchmarks.
+- `crates/zkie-cuda/` — optional CUDA backend (Sppark DFT + Poseidon2 Merkle)
+  behind the `cuda` feature.
+- `models/` — GPT-2 512 weights and lookup tables (i32 fixed-point).
+- `docs/` — `spec.md` (design), `benchmarks.md` (measurements), `roadmap.md`.
 
 ## License
 

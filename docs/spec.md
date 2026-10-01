@@ -154,7 +154,7 @@ layers above expose, run by an AI agent.
 
 ## 7. Implementation status
 
-- 84 lib tests in `zkie-gkr`; 32 examples.
+- 106 lib tests in `zkie-gkr`; 35 examples.
 - End-to-end programs: `prove_200m_ops` / `prove_200m_ir` (TimesFM 1.0 200M,
   20 layers) and `prove_gpt2_ops` / `prove_gpt2_ir` (GPT-2 124M, 12 layers,
   seq=512, 12 heads).
@@ -164,12 +164,15 @@ layers above expose, run by an AI agent.
 
 ## 8. What remains
 
-1. **Real GPT-2**: multi-head attention, pre-norm (today's layer chain is
-   post-norm), real weights, and WHIR commitments for the boundary and weights.
+1. **Real GPT-2 is DONE**: multi-head attention, pre-norm, real weights
+   lm_head, seq=512; `prove_gpt2_full` / `bench_gpt2_sharded` / `bench_gpt2_autotune`
+   prove the full model end to end, argmax 511/512. WHIR commitments for the
+   boundary and weights are not yet wired into this path.
 2. **Quantization**: 12-bit / adaptive bit width.
 3. **GPU tuning** for the large-codeword FRI commit.
-4. **Remove the claim-chaining overhead**: `same_poly` currently costs roughly
-   7 s per layer.
+4. **Remove the remaining claim-chaining overhead**: `same_poly` binding is
+   parallelized per shard, but cross-shard bindings and per-op logUp lookups
+   still dominate the GKR phase.
 5. **Autotune for real** over granularity × per-stage backend × layout using
    `autotune_with`, with the winning configuration cached per model.
 6. **A new model end to end** (Gemma 3 first) through the same primitives and the
@@ -180,7 +183,7 @@ Open items:
 - **Soundness parameters.** Today's benchmarks use `Whir::new_testing`
   (32-bit); production runs need `Whir::new` (90-bit) or equivalent, and the
   fixed-point tables (exp / gelu / rsqrt) are sized for the test instances.
-- **Layer parallelism does not scale linearly.** 12 layers measured 22.6 s
+- **Layer parallelism does not scale linearly.** the 13-shard GPT-2 512 prove is ~34 s (forward ~5.5 s + parallel GKR ~27 s)
   against a ~6 s ideal: the layer loop and the rayon pool still contend.
 
 ## 9. Module map

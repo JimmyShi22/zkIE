@@ -72,6 +72,21 @@ pub enum Granularity {
     WholeModel,
 }
 
+impl Granularity {
+    /// Map this granularity to a concrete `ops_per_shard`. `layers` is the model
+    /// depth (used to turn `Layers(n)` into an op count).
+    pub fn ops_per_shard(self, op_count: usize, layers: usize) -> usize {
+        match self {
+            Granularity::Ops(n) => n.max(1),
+            Granularity::Layers(n) => {
+                let ops_per_layer = op_count / layers.max(1);
+                (n.saturating_mul(ops_per_layer)).max(1)
+            }
+            Granularity::WholeModel => op_count.max(1),
+        }
+    }
+}
+
 /// A shard: a contiguous op range + its schedule.
 #[derive(Clone, Debug)]
 pub struct Shard {
@@ -98,14 +113,7 @@ pub fn compile_shard_dag(
     granularity: Granularity,
     schedule: StageSchedule,
 ) -> ShardDag {
-    let ops_per_shard = match granularity {
-        Granularity::Ops(n) => n.max(1),
-        Granularity::Layers(n) => {
-            let ops_per_layer = op_count / layers.max(1);
-            (n.saturating_mul(ops_per_layer)).max(1)
-        }
-        Granularity::WholeModel => op_count.max(1),
-    };
+    let ops_per_shard = granularity.ops_per_shard(op_count, layers);
 
     let mut shards = Vec::new();
     let mut s = 0;
@@ -117,6 +125,32 @@ pub fn compile_shard_dag(
     let boundaries: Vec<(usize, usize)> =
         (0..shards.len().saturating_sub(1)).map(|i| (i, i + 1)).collect();
     ShardDag { shards, boundaries }
+}
+
+/// Prove a whole model (flat op list) at the given granularity, driving the real
+/// shard-DAG composer. This is the bridge between the autotuner's `Granularity`
+/// knob and the actual proof — the granularity is no longer just op counting.
+pub fn prove_model(
+    store: &mut crate::compose::Store,
+    ops: &[crate::compose::Op],
+    granularity: Granularity,
+    layers: usize,
+    rng: &mut crate::field::XorShift64,
+) -> crate::compose::ShardDagProof {
+    let ops_per_shard = granularity.ops_per_shard(ops.len(), layers);
+    crate::compose::prove_shard_dag(store, ops, ops_per_shard, rng)
+}
+
+/// Verify a whole-model proof produced by [`prove_model`].
+pub fn verify_model(
+    store: &crate::compose::Store,
+    ops: &[crate::compose::Op],
+    granularity: Granularity,
+    layers: usize,
+    proof: &crate::compose::ShardDagProof,
+) -> bool {
+    let ops_per_shard = granularity.ops_per_shard(ops.len(), layers);
+    crate::compose::verify_shard_dag(store, ops, ops_per_shard, proof)
 }
 
 /// Per-stage CPU costs. `Forward`/`Sumcheck` are per op; `Commit`/`Open` are per
@@ -351,5 +385,43 @@ mod tests {
         // autotune finds something at least as good as both uniforms.
         let best = autotune(&m, &[Granularity::Layers(1)]);
         assert!(best.total_s <= uniform_gpu.total_s && best.total_s <= uniform_cpu.total_s);
+    }
+
+    #[test]
+    fn granularity_drives_real_shard_dag() {
+        use crate::compose::{Op, Store};
+        use crate::field::XorShift64;
+        use crate::fixed_point::from_i64;
+
+        let mut rng = XorShift64::new(0x1313);
+        let (m, d, shift) = (4usize, 8usize, 8u32);
+        let mut store = Store::new();
+        let x = store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let mut ws = Vec::new();
+        let mut bs = Vec::new();
+        for _ in 0..4 {
+            ws.push(store.push((0..d * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect()));
+            bs.push(store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect()));
+        }
+        let mut outs = Vec::new();
+        let mut rems = Vec::new();
+        for _ in 0..4 {
+            outs.push(store.push(vec![]));
+            rems.push(store.push(vec![]));
+        }
+        let ops = vec![
+            Op::Projection { x, w: ws[0], bias: bs[0], out: outs[0], rem: rems[0], m, k: d, n: d, shift },
+            Op::Projection { x: outs[0], w: ws[1], bias: bs[1], out: outs[1], rem: rems[1], m, k: d, n: d, shift },
+            Op::Projection { x: outs[1], w: ws[2], bias: bs[2], out: outs[2], rem: rems[2], m, k: d, n: d, shift },
+            Op::Projection { x: outs[2], w: ws[3], bias: bs[3], out: outs[3], rem: rems[3], m, k: d, n: d, shift },
+        ];
+
+        let p_op = prove_model(&mut store, &ops, Granularity::Ops(1), 1, &mut rng);
+        assert_eq!(p_op.shards.len(), 4);
+        assert!(verify_model(&store, &ops, Granularity::Ops(1), 1, &p_op));
+
+        let p_whole = prove_model(&mut store, &ops, Granularity::WholeModel, 1, &mut rng);
+        assert_eq!(p_whole.shards.len(), 1);
+        assert!(verify_model(&store, &ops, Granularity::WholeModel, 1, &p_whole));
     }
 }
