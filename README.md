@@ -1,3 +1,7 @@
+<div align="center">
+    <img width="3265" height="994" alt="e89e95aa8ed6a99833394682c6632cb7" src="https://github.com/user-attachments/assets/9ed2ab1a-aab5-4133-a5e2-5bcbdad0ffea" />
+</div>
+
 # zkIE
 
 > **Under development.** zkIE is not a usable release. The proof primitives, the
