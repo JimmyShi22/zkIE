@@ -91,7 +91,7 @@ mod backend {
     pub enum DftBackend {
         Cpu(CpuDft),
         #[cfg(feature = "cuda")]
-        Cuda(zkie_cuda::dft::CudaDft),
+        Cuda(crate::pcs::dft_cuda::CudaDft),
     }
 
     impl Clone for DftBackend {
@@ -125,7 +125,7 @@ mod backend {
     pub enum MmcsBackend {
         Cpu(CpuMmcs),
         #[cfg(feature = "cuda")]
-        Cuda(zkie_cuda::merkle::CudaMerkleTreeMmcs),
+        Cuda(crate::pcs::merkle_cuda::CudaMerkleTreeMmcs),
     }
 
     impl Clone for MmcsBackend {
@@ -205,7 +205,7 @@ mod backend {
                     let o = p3_commit::BatchOpeningRef::<
                         '_,
                         F,
-                        zkie_cuda::merkle::CudaMerkleTreeMmcs,
+                        crate::pcs::merkle_cuda::CudaMerkleTreeMmcs,
                     >::new(batch_opening.opened_values, batch_opening.opening_proof);
                     m.verify_batch(commit, dimensions, index, o)
                 }
@@ -317,7 +317,7 @@ impl Whir {
             let hash = MerkleHash::new(perm.clone());
             let compress = MerkleCompress::new(perm.clone());
             if backend::use_cuda_mmcs() {
-                MyMmcs::Cuda(zkie_cuda::merkle::CudaMerkleTreeMmcs::new(hash, compress, 0))
+                MyMmcs::Cuda(crate::pcs::merkle_cuda::CudaMerkleTreeMmcs::new(hash, compress, 0))
             } else {
                 MyMmcs::Cpu(CpuMmcs::new(hash, compress, 0))
             }
@@ -328,7 +328,7 @@ impl Whir {
         #[cfg(feature = "cuda")]
         let dft = {
             if backend::use_cuda_dft() {
-                MyDft::Cuda(zkie_cuda::dft::CudaDft::new())
+                MyDft::Cuda(crate::pcs::dft_cuda::CudaDft::new())
             } else {
                 MyDft::Cpu(CpuDft::new(1 << config.max_fft_size()))
             }

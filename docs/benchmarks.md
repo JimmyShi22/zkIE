@@ -248,7 +248,7 @@ Two kinds of opening reduction, with very different payoff:
   different points, reduced to one FRI proof plus one sum-of-products
   sumcheck): the real win. LayerNorm opens `x` at three points per row; merging
   them cut 800 openings (-17%). Implemented as `open_table_multi_point` and
-  `batch_open_committed` in `zkie_gkr::batch_open`.
+  `batch_open_committed` in `zkie_core::pcs::batch_open`.
 
 Other changes:
 
@@ -319,7 +319,7 @@ the matmul/sumcheck hot path.
 ## Layer-granularity GPT-2 512: per-block costs (2026-10-01)
 
 Layer circuit, plain model, single-threaded. Examples in
-`crates/zkie-gkr/examples/`:
+`crates/zkie-engine/examples/`:
 
 | block | dims | time |
 | --- | --- | --- |

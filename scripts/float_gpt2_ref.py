@@ -1,6 +1,6 @@
 import numpy as np
 def load(name):
-    return np.fromfile(f"models/gpt2_stack/{name}", dtype=np.int32).astype(np.float64) / 65536.0
+    return np.fromfile(f"models/gpt2/weights/{name}", dtype=np.int32).astype(np.float64) / 65536.0
 
 D, FFN, HEADS, DH, SEQ, N_REAL = 1024, 4096, 12, 64, 512, 768
 
@@ -57,5 +57,5 @@ hf = ln(x, lnf_w, lnf_b)
 lm_w = load("lm_head_w_i32.bin").reshape(D, 65536)[:N_REAL, :]
 logits = hf @ lm_w[:, :50257]
 argmax = logits.argmax(axis=1)
-gt = np.fromfile("models/gpt2_stack/gt_argmax_512_i32.bin", dtype=np.int32)
+gt = np.fromfile("models/gpt2/weights/gt_argmax_512_i32.bin", dtype=np.int32)
 print("float argmax matches:", (argmax == gt).sum(), "/", SEQ)

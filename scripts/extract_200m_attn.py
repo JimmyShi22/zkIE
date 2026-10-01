@@ -41,10 +41,10 @@ def pad2(arr, r, c):
 
 def main():
     base = "models"
-    out_dir = f"{base}/full_stack_200m"
+    out_dir = f"{base}/timesfm/weights"
     os.makedirs(out_dir, exist_ok=True)
 
-    m = onnx.load(f"{base}/timesfm_1_0_200m.onnx")
+    m = onnx.load(f"{base}/timesfm/timesfm_1_0_200m.onnx")
     g = m.graph
     inits = {i.name: onnx.numpy_helper.to_array(i).astype(np.float64) for i in g.initializer}
     q_scale = q(inits["unsqueeze_29"].reshape(HDIM))

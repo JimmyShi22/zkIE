@@ -47,7 +47,7 @@ m = AutoModelForCausalLM.from_pretrained("your/model")
 # then torch.onnx.export(m, ...) with the right input spec
 ```
 
-The GPT-2 example in this repo uses `models/gpt2.onnx` (already exported).
+The GPT-2 example in this repo uses `models/gpt2/gpt2.onnx` (already exported).
 
 ## 2. Extract weights and tables
 
@@ -76,7 +76,7 @@ accumulation `2^32`, LayerNorm raw output `2^48`.
 ## 3. Map the op graph onto primitives
 
 Write a Rust example that walks the model op graph and pushes `compose::Op`
-primitives into a `Store`. The op set lives in `crates/zkie-gkr/src/compose.rs`:
+primitives into a `Store`. The op set lives in `crates/zkie-ops/src/compose.rs`:
 
 | ONNX op | `compose::Op` |
 | --- | --- |
@@ -90,7 +90,7 @@ primitives into a `Store`. The op set lives in `crates/zkie-gkr/src/compose.rs`:
 | LayerNorm (centered) | `LayerNormCentered` |
 | table lookup | `Lookup` |
 
-Reference: `crates/zkie-gkr/examples/prove_gpt2_full.rs` — `build_layer`
+Reference: `crates/zkie-engine/examples/prove_gpt2.rs` — `build_layer`
 assembles the full 12-layer GPT-2 graph. The residual stream and the multi-head
 attention show that multiply-consumed tensors are bound automatically via
 `same_poly`.
@@ -110,7 +110,7 @@ Sweep shard granularity with `engine::autotune_with` and keep the lowest-total
 configuration:
 
 ```rust
-use zkie_gkr::engine::{autotune_with, Backend, Granularity, StageSchedule, TuningResult};
+use zkie_engine::engine::{autotune_with, Backend, Granularity, StageSchedule, TuningResult};
 
 let granularities = [
     Granularity::WholeModel,
@@ -127,7 +127,7 @@ let best = autotune_with(&granularities, &schedules, |g, _sched| {
 });
 ```
 
-Reference: `crates/zkie-gkr/examples/bench_gpt2_autotune.rs`. Tune once per
+Reference: `crates/zkie-engine/examples/bench_gpt2_autotune.rs`. Tune once per
 model and cache the result.
 
 ## What is model-specific vs reused
@@ -140,8 +140,8 @@ Model-specific (write once per model):
 
 Reused unchanged:
 
-- all op primitives (`compose.rs`, `projection.rs`, `layer_norm_centered.rs`,
-  `softmax_scaled.rs`, `layernorm_chain.rs`);
+- all op primitives (`zkie-ops::compose`, `projection`, `layer_norm_centered`,
+  `softmax_scaled`, `layernorm_chain`);
 - the shard-DAG composer and cross-shard `same_poly` binding;
-- `engine.rs` autotune;
-- the forward matmul (`par.rs`) and WHIR commitments (`whir.rs`, `committed.rs`).
+- `zkie-engine::engine` autotune;
+- the forward matmul (`zkie-ops::par`) and WHIR commitments (`zkie-core::pcs::whir`, `committed`).

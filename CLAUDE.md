@@ -1,23 +1,22 @@
-# zkIE — Project Notes
-
 ## What this is
 
 GKR / sum-check route for verifiable ML inference (non-ZK). The proof stack is
-Goldilocks + WHIR/FRI + LogUp lookup; the public interface is the unified op layer
-in crates/zkie-gkr/src/ops.rs. See README.md.
+Goldilocks + WHIR/FRI + LogUp lookup; the public interface is the unified op
+layer in crates/zkie-ops/src/compose.rs. See README.md.
 
 ## Layout
 
-- crates/zkie-gkr: proving primitives + op interface + examples
-- crates/zkie-cuda: optional CUDA backend (NTT + Merkle)
+- crates/zkie-core: proving substrate (common reductions + WHIR/FRI PCS, optional CUDA)
+- crates/zkie-ops: op-level proof primitives (compose / projection / norms / softmax / par)
+- crates/zkie-engine: autotune engine + per-model builders + examples
 - scripts/: ONNX extraction / fixed-point simulation / fidelity checks
 - docs/: spec, benchmarks, roadmap
 
 ## Build / test
 
     cargo build --workspace
-    cargo test -p zkie-gkr
-    cargo build --release --example prove_200m_ops
+    cargo test --workspace
+    cargo run --release -p zkie-engine --example prove_gpt2
 
-The TimesFM 200M example reads extracted tensors from models/ (gitignored); run
-the extract scripts first to populate it.
+The GPT-2 512 example reads extracted tensors from models/gpt2/weights/ (gitignored);
+run the extract scripts first to populate it.

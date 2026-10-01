@@ -53,7 +53,7 @@ def run(s, index_bits=14):
     rsqrt = build_rsqrt(s, index_bits)
 
     base = "models"
-    m = onnx.load(f"{base}/timesfm_1_0_200m.onnx")
+    m = onnx.load(f"{base}/timesfm/timesfm_1_0_200m.onnx")
     inits = {i.name: onnx.numpy_helper.to_array(i).astype(np.float64) for i in m.graph.initializer}
     q_scale = q(inits["unsqueeze_29"].reshape(HDIM))
     mask_q = q(np.triu(np.full((SEQ, SEQ), -1e30), k=1))

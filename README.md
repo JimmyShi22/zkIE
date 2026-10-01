@@ -91,20 +91,20 @@ stays on the CPU.
 ## Usage
 
 Build and run the real GPT-2 512 end-to-end proof (weights/tables are under
-`models/gpt2_stack/`, expected at the crate working directory):
+`models/gpt2/weights/`, expected at the crate working directory):
 
 ```bash
 # full GPT-2 512 proof: argmax sanity check + prove/verify time
-cargo run --release --example prove_gpt2_full
+cargo run --release -p zkie-engine --example prove_gpt2
 
 # shard-granularity sweep (1 shard vs 13 shards)
-cargo run --release --example bench_gpt2_sharded
+cargo run --release -p zkie-engine --example bench_gpt2_sharded
 
 # autotune over shard granularities
-cargo run --release --example bench_gpt2_autotune
+cargo run --release -p zkie-engine --example bench_gpt2_autotune
 
 # library tests
-cargo test --lib
+cargo test --workspace
 ```
 
 To add a new model, see [docs/adding-a-model.md](docs/adding-a-model.md).
@@ -134,24 +134,28 @@ faster than DeepProve (~7.6 min) by roughly 8x.
 
 ## Repository layout
 
-- `crates/zkie-gkr/` — the proving engine:
-  - `src/compose.rs` — op primitives (`Op`, `prove_shard`, `prove_shard_dag`,
-    cross-shard `same_poly` binding, weight batch commit).
-  - `src/engine.rs` — shard granularity, per-stage schedule, and the autotune
-    loop.
-  - `src/projection.rs`, `src/layer_norm_centered.rs`, `src/softmax_scaled.rs`,
-    `src/layernorm_chain.rs` — op-level proof primitives.
-  - `src/sumcheck.rs`, `src/matmul.rs`, `src/logup_gkr.rs`, `src/same_poly.rs`,
-    `src/mle.rs` — the reduction substrate.
-  - `src/whir.rs`, `src/batch_open.rs`, `src/committed.rs` — WHIR/FRI
-    polynomial commitments.
-  - `src/par.rs` — the i64 fixed-point forward matmul (cache-friendly, with
-    field fallback).
-  - `examples/` — `prove_gpt2_full`, `bench_gpt2_sharded`,
-    `bench_gpt2_autotune`, and micro-benchmarks.
-- `crates/zkie-cuda/` — optional CUDA backend (Sppark DFT + Poseidon2 Merkle)
-  behind the `cuda` feature.
-- `models/` — GPT-2 512 weights and lookup tables (i32 fixed-point).
+- `crates/zkie-core/` — the proving substrate:
+  - `src/common/` — Goldilocks field, fixed-point embedding, MLE evaluation,
+    sumcheck, the matmul / LogUp / `same_poly` reductions, and the claim type.
+  - `src/pcs/` — the WHIR/FRI polynomial commitment scheme (`whir.rs`),
+    batch openings (`batch_open.rs`), committed tensors (`committed.rs`), and
+    the optional CUDA backend (`dft_cuda.rs`, `merkle_cuda.rs`, `cuda_ffi.rs`,
+    `cuda_buffer.rs`) behind the `cuda` feature.
+- `crates/zkie-ops/` — op-level proof primitives, one per ONNX op type:
+  - `compose.rs` — `Op`, `Store`, `prove_shard`, `prove_shard_dag`, and the
+    cross-shard `same_poly` binding.
+  - `projection.rs`, `layer_norm_centered.rs`, `softmax_scaled.rs`,
+    `layernorm_chain.rs` — the matmul/normalization/softmax primitives.
+  - `par.rs` — the i64 fixed-point forward matmul (cache-friendly, with field
+    fallback).
+- `crates/zkie-engine/` — the autotune engine and per-model builders:
+  - `src/engine.rs` — shard granularity, per-stage CPU/GPU schedule, and the
+    autotune loop.
+  - `src/models/` — op-graph builders per model (`gpt2.rs`).
+  - `examples/` — `prove_gpt2`, `bench_gpt2_sharded`, `bench_gpt2_autotune`,
+    and micro-benchmarks.
+- `models/` — GPT-2 124M and TimesFM 1.0 200M ONNX graphs and extracted
+  fixed-point weights / lookup tables.
 - `docs/` — `spec.md` (design), `benchmarks.md` (measurements),
   `adding-a-model.md` (how to add a new model), `roadmap.md`.
 
