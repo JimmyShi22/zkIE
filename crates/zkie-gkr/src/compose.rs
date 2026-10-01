@@ -539,6 +539,12 @@ pub enum Op {
         m: usize,
         k: usize,
     },
+    Scale {
+        x: T,
+        out: T,
+        factor: i64,
+        shift: u32,
+    },
     MatMul {
         a: T,
         b: T,
@@ -623,6 +629,7 @@ pub enum Op {
 /// proof shapes.
 pub enum OpProof {
     Transpose,
+    Scale,
     MatMul(MatmulProof, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>),
     Projection(ProjectionProof),
     Add(VirtualProof, Vec<Goldilocks>),
@@ -681,6 +688,13 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
         match op {
             Op::Transpose { x, out, m, k } => {
                 store.v[out] = transpose(store.get(x), m, k);
+            }
+            Op::Scale { x, out, factor, shift } => {
+                let o: Vec<Goldilocks> = store.get(x)
+                    .iter()
+                    .map(|&v| from_i64(round_div(to_i64(v) * factor, 1i64 << shift)))
+                    .collect();
+                store.v[out] = o;
             }
             Op::MatMul { a, b, c, m, k, n } => {
                 let cval = crate::par::mm_par(store.get(a), store.get(b), m, k, n, 64);
@@ -815,6 +829,9 @@ pub fn prove_shard(store: &mut Store, ops: &[Op], boundary: &[T], rng: &mut XorS
         match *op {
             Op::Transpose { .. } => {
                 op_proofs.push(OpProof::Transpose);
+            }
+            Op::Scale { .. } => {
+                op_proofs.push(OpProof::Scale);
             }
             Op::MatMul { a, b, c, m, k, n } => {
                 let at = transpose(store.get(a), m, k);
@@ -972,6 +989,7 @@ pub fn verify_shard(store: &Store, ops: &[Op], proof: &OpShardProof) -> bool {
                 // forward_ops, and the downstream op's claim on `out` is checked
                 // against that recomputed value.
             }
+            (Op::Scale { .. }, OpProof::Scale) => {}
             (Op::MatMul { a, b, c, m, k, n: _ }, OpProof::MatMul(mp, u, v, ch)) => {
                 let at = transpose(ws.get(*a), *m, *k);
                 let a_restricted = mle::partial_eval(&at, u);
