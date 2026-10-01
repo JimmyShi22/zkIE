@@ -200,7 +200,7 @@ fn main() {
     for i in 0..m {
         let mut best = 0usize;
         let mut best_v = logits[i * 65536];
-        for j in 1..65536 {
+        for j in 1..50257 {
             let v = logits[i * 65536 + j];
             if zkie_gkr::fixed_point::to_i64(v) > zkie_gkr::fixed_point::to_i64(best_v) {
                 best_v = v;
