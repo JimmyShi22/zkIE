@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use zkie_gkr::field::Goldilocks;
 use zkie_gkr::fixed_point::from_i32;
-use zkie_gkr::par::mm_par;
+use zkie_gkr::par::{mm_par, mm_par_fixed};
 
 fn load_i32(path: &str) -> Vec<Goldilocks> {
     let bytes = fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
@@ -29,6 +29,12 @@ fn main() {
         let t = Instant::now();
         let c = mm_par(&a, &lm_head_w, m, k, n, 64);
         let dt = t.elapsed();
-        println!("lm_head forward run {}: {:?} ({} elements)", run, dt, c.len());
+        println!("lm_head mm_par (field) run {}: {:?}", run, dt);
+    }
+    for run in 0..3 {
+        let t = Instant::now();
+        let c = mm_par_fixed(&a, &lm_head_w, m, k, n);
+        let dt = t.elapsed();
+        println!("lm_head mm_par_fixed (i64) run {}: {:?} ({} elements)", run, dt, c.len());
     }
 }

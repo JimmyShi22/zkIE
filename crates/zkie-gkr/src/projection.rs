@@ -20,7 +20,7 @@ pub struct ProjectionProof {
     pub ch: Vec<Goldilocks>,
 }
 fn matmul_full(x: &[Goldilocks], w: &[Goldilocks], m: usize, k: usize, n: usize) -> Vec<Goldilocks> {
-    crate::par::mm_par(x, w, m, k, n, 64)
+    crate::par::mm_par_fixed(x, w, m, k, n)
 }
 fn transpose(x: &[Goldilocks], m: usize, k: usize) -> Vec<Goldilocks> {
     let mut wt = vec![Goldilocks::from_u64(0); k * m];

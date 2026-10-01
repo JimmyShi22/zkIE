@@ -699,11 +699,11 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 store.v[out] = o;
             }
             Op::MatMul { a, b, c, m, k, n } => {
-                let cval = crate::par::mm_par(store.get(a), store.get(b), m, k, n, 64);
+                let cval = crate::par::mm_par_fixed(store.get(a), store.get(b), m, k, n);
                 store.v[c] = cval;
             }
             Op::Projection { x, w, bias, out, rem, m, k, n, shift } => {
-                let h = crate::par::mm_par(store.get(x), store.get(w), m, k, n, 64);
+                let h = crate::par::mm_par_fixed(store.get(x), store.get(w), m, k, n);
                 let o: Vec<Goldilocks> = (0..m * n)
                     .map(|ij| {
                         from_i64(round_div(to_i64(h[ij]), 1i64 << shift) + to_i64(store.get(bias)[ij]))
