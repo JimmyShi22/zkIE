@@ -3,7 +3,7 @@ name = "zkie-cuda"
 version = "0.1.0"
 edition = "2021"
 description = "CUDA acceleration for the zkIE GKR/WHIR prover: Sppark Goldilocks NTT + GPU Poseidon2 Merkle commitments"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 
 [dependencies]
 p3-commit = "0.7.0"

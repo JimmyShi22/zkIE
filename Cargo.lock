@@ -862,5 +862,6 @@ dependencies = [
  "p3-util",
  "p3-whir",
  "rand",
+ "rayon",
  "zkie-cuda",
 ]

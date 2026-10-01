@@ -26,7 +26,9 @@ Main new risk is long-sequence attention (`QK^T` is O(seq^2) and dominates as
 the context grows). Proven at seq=16 and seq=512; the seq=512 causal mask must
 be deepened (see `docs/benchmarks.md`).
 
-## Step 3 - Gemma 3 270M (current)
+## Step 3 - Gemma 3 270M (next)
 
 Same decoder-only Transformer family, adds Rotary Position Embedding (RoPE)
 and RMSNorm.
+
+Gemma 3 is the reuse target: the same op primitives and the same autotune flow.
