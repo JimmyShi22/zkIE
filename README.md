@@ -97,18 +97,19 @@ is in [`docs/benchmarks.md`](docs/benchmarks.md).
 | --- | --- | --- | --- |
 | TimesFM 1.0 200M | op granularity | ~302 s | ~1.4 GB |
 | GPT-2 124M | seq=16 | ~1 min 53 s | ~5.6 GB |
-| GPT-2 124M | seq=512, op granularity | ~19.6 min | ~30 GB |
-| GPT-2 124M | seq=512, layer granularity + parallel | ~32 s | - |
+| GPT-2 124M | seq=512, 1 shard (whole model) | ~4.8 min | ~43 GB |
+| GPT-2 124M | seq=512, 13 shards (per layer, parallel) | **~0.92 min** | ~43 GB |
 | Gemma 3 270M | adapting | - | - |
 
-The ~32 s row is not like-for-like: it uses synthetic weights, single-head
-attention, post-norm and a plain model (no committed boundary or weights).
-Closing that gap is the remaining work. The Gemma 3 row is the reuse target —
-the same op primitives and the same autotune flow.
+The GPT-2 512 rows use real weights, multi-head attention and pre-norm; argmax
+matches ground truth 511/512. The 13-shard configuration is what the autotuner
+picks (`bench_gpt2_autotune`) and beats DeepProve (~7.6 min) by roughly 8x. The
+Gemma 3 row is the reuse target — the same op primitives and the same autotune
+flow.
 
-Target: GPT-2 512 proves end to end with a measured time, and after autotuning
-is faster than the current layer-granularity pipeline (no regression) and faster
-than DeepProve (~7.6 min).
+Status: GPT-2 512 proves end to end with a measured time (~0.92 min at 13
+shards), and after autotuning is faster than the layer-granularity pipeline and
+faster than DeepProve (~7.6 min) by roughly 8x.
 
 ## License
 

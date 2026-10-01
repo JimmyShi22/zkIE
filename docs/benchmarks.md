@@ -1,3 +1,32 @@
+## GPT-2 512 full model (op-primitive shard DAG, GKR + logUp) (2026-10-01)
+
+Real GPT-2 (12 layers, 12 heads, pre-norm, real weights, lm_head), sequence
+length 512, 2114 ops, proven through the op-primitive shard-DAG composer
+(`compose::prove_shard_dag`) with `same_poly` cross-shard binding. Release build,
+64-thread CPU. This path commits only shard boundaries; intermediate activations
+are virtual MLE and nonlinearities use logUp lookups (no WHIR commit in this
+path).
+
+| shards | prove | verify | total | argmax |
+| --- | --- | --- | --- | --- |
+| 1 (whole model) | 146.7 s | 140.6 s | ~287 s (4.8 min) | 511/512 |
+| 13 (per layer) | 34.1 s | 21.3 s | ~55.3 s (0.92 min) | 511/512 |
+
+Peak host memory (whole-model run): **~43 GB RSS**.
+
+13-shard prove breakdown: forward witness ~5.5 s + parallel GKR ~27 s.
+
+Notes:
+
+- The autotuner (`bench_gpt2_autotune`) picks `Layers(1)` (13 shards) as the
+  fastest granularity.
+- This beats DeepProve (~7.6 min) by roughly **8x**.
+- The forward matmul uses the i64 fixed-point path with cache-friendly (ikj)
+  ordering and overflow-aware dispatch (`par::mm_par_fixed`).
+- The remaining bottleneck is the logUp lookups (exp / rsqrt / gelu tables) in
+  the GKR sumcheck; those tables are already at their minimum lossless size for
+  16-bit fixed point.
+
 # Benchmarks
 
 Baseline measurements for the TimesFM 200M end-to-end proof (prologue + 20 layers + output head) through the unified op interface (prove_200m_ops).
