@@ -188,4 +188,24 @@ fn main() {
     let verify_t = t1.elapsed();
     println!("full GPT-2+lm_head ({} layers, m={}, {} heads, {} ops): prove {:?}, verify {:?}",
         LAYERS, m, HEADS, ops.len(), prove_t, verify_t);
+
+    // Compare argmax to ground truth.
+    let gt = load_i32(&format!("{dir}/gt_argmax_i32.bin"));
+    let logits = store.get(logits);
+    let mut matches = 0;
+    for i in 0..m {
+        let mut best = 0usize;
+        let mut best_v = logits[i * 65536];
+        for j in 1..65536 {
+            let v = logits[i * 65536 + j];
+            if zkie_gkr::fixed_point::to_i64(v) > zkie_gkr::fixed_point::to_i64(best_v) {
+                best_v = v;
+                best = j;
+            }
+        }
+        if best as i32 == zkie_gkr::fixed_point::to_i32(gt[i]) {
+            matches += 1;
+        }
+    }
+    println!("argmax matches: {}/{}", matches, m);
 }
