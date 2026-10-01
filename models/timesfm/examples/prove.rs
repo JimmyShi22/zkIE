@@ -2,7 +2,7 @@
 
 use zkie_core::common::field::{PrimeCharacteristicRing, XorShift64};
 use zkie_core::common::fixed_point::to_i64;
-use zkie_engine::models::timesfm::build_timesfm;
+use zkie_models_timesfm::build_timesfm;
 use zkie_ops::compose::{prove_shard_dag, verify_shard_dag, Store};
 
 fn main() {

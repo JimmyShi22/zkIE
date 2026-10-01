@@ -1,0 +1,13 @@
+[package]
+name = "zkie-models-timesfm"
+version = "0.1.0"
+edition = "2021"
+description = "zkIE TimesFM 1.0 200M op-graph builder + prove/bench examples"
+license = "Apache-2.0"
+
+[dependencies]
+zkie-core = { path = "../../crates/zkie-core" }
+zkie-ops = { path = "../../crates/zkie-ops" }
+
+[dev-dependencies]
+zkie-engine = { path = "../../crates/zkie-engine" }

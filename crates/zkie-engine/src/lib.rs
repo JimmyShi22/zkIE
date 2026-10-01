@@ -1,3 +1,2 @@
-//! zkie-engine: autotune engine + model builders.
+//! zkie-engine: autotune engine.
 pub mod engine;
-pub mod models;

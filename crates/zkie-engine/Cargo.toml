@@ -8,3 +8,71 @@ license = "Apache-2.0"
 [dependencies]
 zkie-core = { path = "../zkie-core" }
 zkie-ops = { path = "../zkie-ops" }
+
+[[example]]
+name = "bench_autotune_granularity"
+path = "benchmark/bench_autotune_granularity.rs"
+
+[[example]]
+name = "bench_batch_commit"
+path = "benchmark/bench_batch_commit.rs"
+
+[[example]]
+name = "bench_batch_open"
+path = "benchmark/bench_batch_open.rs"
+
+[[example]]
+name = "bench_batch_open_multi"
+path = "benchmark/bench_batch_open_multi.rs"
+
+[[example]]
+name = "bench_engine"
+path = "benchmark/bench_engine.rs"
+
+[[example]]
+name = "bench_forward"
+path = "benchmark/bench_forward.rs"
+
+[[example]]
+name = "bench_layer_attention"
+path = "benchmark/bench_layer_attention.rs"
+
+[[example]]
+name = "bench_layer_ffn"
+path = "benchmark/bench_layer_ffn.rs"
+
+[[example]]
+name = "bench_layer_projection"
+path = "benchmark/bench_layer_projection.rs"
+
+[[example]]
+name = "bench_layer_softmax"
+path = "benchmark/bench_layer_softmax.rs"
+
+[[example]]
+name = "bench_matmul"
+path = "benchmark/bench_matmul.rs"
+
+[[example]]
+name = "bench_matmul_parallel"
+path = "benchmark/bench_matmul_parallel.rs"
+
+[[example]]
+name = "bench_projection_committed"
+path = "benchmark/bench_projection_committed.rs"
+
+[[example]]
+name = "bench_quantization"
+path = "benchmark/bench_quantization.rs"
+
+[[example]]
+name = "bench_softmax_scaled"
+path = "benchmark/bench_softmax_scaled.rs"
+
+[[example]]
+name = "bench_transformer_layer"
+path = "benchmark/bench_transformer_layer.rs"
+
+[[example]]
+name = "bench_whir"
+path = "benchmark/bench_whir.rs"

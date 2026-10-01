@@ -859,6 +859,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "zkie-models-gpt2"
+version = "0.1.0"
+dependencies = [
+ "zkie-core",
+ "zkie-engine",
+ "zkie-ops",
+]
+
+[[package]]
+name = "zkie-models-timesfm"
+version = "0.1.0"
+dependencies = [
+ "zkie-core",
+ "zkie-engine",
+ "zkie-ops",
+]
+
+[[package]]
 name = "zkie-ops"
 version = "0.1.0"
 dependencies = [

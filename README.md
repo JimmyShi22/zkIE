@@ -91,17 +91,17 @@ stays on the CPU.
 ## Usage
 
 Build and run the real GPT-2 512 end-to-end proof (weights/tables are under
-`models/gpt2/weights/`, expected at the crate working directory):
+`models/gpt2/weights/`, expected at the repo root):
 
 ```bash
 # full GPT-2 512 proof: argmax sanity check + prove/verify time
-cargo run --release -p zkie-engine --example prove_gpt2
+cargo run --release -p zkie-models-gpt2 --example prove
 
-# shard-granularity sweep (1 shard vs 13 shards)
-cargo run --release -p zkie-engine --example bench_gpt2_sharded
+# shard-granularity sweep
+cargo run --release -p zkie-models-gpt2 --example bench_sharded
 
 # autotune over shard granularities
-cargo run --release -p zkie-engine --example bench_gpt2_autotune
+cargo run --release -p zkie-models-gpt2 --example bench_autotune
 
 # library tests
 cargo test --workspace
@@ -122,7 +122,8 @@ is in [`docs/benchmarks.md`](docs/benchmarks.md).
 | Gemma 3 270M | adapting | - | - |
 
 All rows are the per-layer shard configuration picked by the autotuner
-(`bench_gpt2_autotune` / `bench_timesfm`); 1-shard numbers are omitted. GPT-2
+(`zkie-models-gpt2/examples/bench_autotune.rs` /
+`zkie-models-timesfm/examples/bench.rs`); 1-shard numbers are omitted. GPT-2
 uses real weights, multi-head attention and pre-norm; argmax matches ground
 truth (511/512 at seq=512, 16/16 at seq=16). seq=512 beats DeepProve (~7.6 min)
 by roughly 8x. TimesFM 200M (prologue + 20 layers + horizon head) proves end to
@@ -149,14 +150,15 @@ roughly 8x.
     `layernorm_chain.rs` — the matmul/normalization/softmax primitives.
   - `par.rs` — the i64 fixed-point forward matmul (cache-friendly, with field
     fallback).
-- `crates/zkie-engine/` — the autotune engine and per-model builders:
+- `crates/zkie-engine/` — the autotune engine:
   - `src/engine.rs` — shard granularity, per-stage CPU/GPU schedule, and the
     autotune loop.
-  - `src/models/` — op-graph builders per model (`gpt2.rs`).
-  - `examples/` — `prove_gpt2`, `bench_gpt2_sharded`, `bench_gpt2_autotune`,
-    and micro-benchmarks.
-- `models/` — GPT-2 124M and TimesFM 1.0 200M ONNX graphs and extracted
-  fixed-point weights / lookup tables.
+  - `benchmark/` — generic (non-model) micro-benchmarks of the primitives and
+    the WHIR/FRI PCS.
+- `models/gpt2/`, `models/timesfm/` — one crate per model; each holds the
+  op-graph builder (`src/lib.rs`), its own `examples/` (prove + benchmarks),
+  and a gitignored `weights/` (export steps + sha256 in the per-model
+  `README.md`).
 - `docs/` — `spec.md` (design), `benchmarks.md` (measurements),
   `adding-a-model.md` (how to add a new model), `roadmap.md`.
 
