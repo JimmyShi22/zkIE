@@ -153,8 +153,11 @@ fn build_layer(
         ops.push(Op::Add { a: attn_acc, b: ho, c: s });
         attn_acc = s;
     }
+    let o_b_t = store.push(broadcast(&o_b, SEQ));
+    let attn_biased = store.push(vec![]);
+    ops.push(Op::Add { a: attn_acc, b: o_b_t, c: attn_biased });
     let x2 = store.push(vec![]);
-    ops.push(Op::Add { a: x, b: attn_acc, c: x2 });
+    ops.push(Op::Add { a: x, b: attn_biased, c: x2 });
 
     // MLP: LayerNorm -> gate -> ReLU -> down -> residual
     let mlp_w_t = store.push(broadcast(&mlp_w, SEQ));
