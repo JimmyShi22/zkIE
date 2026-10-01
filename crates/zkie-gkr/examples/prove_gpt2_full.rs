@@ -151,7 +151,7 @@ fn build_layer(
 
 fn main() {
     let mut rng = XorShift64::new(0xBEEF);
-    let (m, shift) = (16usize, 16u32);
+    let (m, shift) = (512usize, 16u32);
     let dir = "models/gpt2_stack";
 
     let exp_table = load_i32("models/exp_table_i32.bin");
@@ -194,7 +194,7 @@ fn main() {
         LAYERS, m, HEADS, ops.len(), prove_t, verify_t);
 
     // Compare argmax to ground truth.
-    let gt = load_i32(&format!("{dir}/gt_argmax_i32.bin"));
+    let gt = load_i32(&format!("{dir}/gt_argmax_512_i32.bin"));
     let logits = store.get(logits);
     let mut matches = 0;
     for i in 0..m {
