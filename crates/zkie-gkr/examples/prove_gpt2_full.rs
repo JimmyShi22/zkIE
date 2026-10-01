@@ -14,6 +14,7 @@ const FFN: usize = 4096;
 const HEADS: usize = 12;
 const DH: usize = 64;
 const LAYERS: usize = 12;
+const N_REAL: usize = 768;
 
 fn load_i32(path: &str) -> Vec<Goldilocks> {
     let bytes = fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
@@ -71,7 +72,7 @@ fn build_layer(
     let ln1_w_t = store.push(broadcast(&ln1_w, m));
     let ln1_b_t = store.push(broadcast(&ln1_b, m));
     let h = store.push(vec![]);
-    ops.push(Op::LayerNormCentered { x, w: ln1_w_t, b: ln1_b_t, out: h, rsqrt_table: rsqrt_t, m, d: D });
+    ops.push(Op::LayerNormCentered { x, w: ln1_w_t, b: ln1_b_t, out: h, rsqrt_table: rsqrt_t, m, d: D, n_real: N_REAL });
 
     let mut head_outs = Vec::new();
     for head in 0..HEADS {
@@ -122,7 +123,7 @@ fn build_layer(
     let ln2_w_t = store.push(broadcast(&ln2_w, m));
     let ln2_b_t = store.push(broadcast(&ln2_b, m));
     let h2 = store.push(vec![]);
-    ops.push(Op::LayerNormCentered { x: x2, w: ln2_w_t, b: ln2_b_t, out: h2, rsqrt_table: rsqrt_t, m, d: D });
+    ops.push(Op::LayerNormCentered { x: x2, w: ln2_w_t, b: ln2_b_t, out: h2, rsqrt_table: rsqrt_t, m, d: D, n_real: N_REAL });
     let fc_w_t = store.push(fc_w);
     let fc_b_t = store.push(broadcast(&fc_b, m));
     let proj_w_t = store.push(proj_w);
@@ -172,7 +173,7 @@ fn main() {
     let lnf_w_t = store.push(broadcast(&lnf_w, m));
     let lnf_b_t = store.push(broadcast(&lnf_b, m));
     let h_final = store.push(vec![]);
-    ops.push(Op::LayerNormCentered { x: x_cur, w: lnf_w_t, b: lnf_b_t, out: h_final, rsqrt_table: rsqrt_t, m, d: D });
+    ops.push(Op::LayerNormCentered { x: x_cur, w: lnf_w_t, b: lnf_b_t, out: h_final, rsqrt_table: rsqrt_t, m, d: D, n_real: N_REAL });
     let lm_w_t = store.push(lm_head_w);
     let logits = store.push(vec![]);
     ops.push(Op::MatMul { a: h_final, b: lm_w_t, c: logits, m, k: D, n: 65536 });

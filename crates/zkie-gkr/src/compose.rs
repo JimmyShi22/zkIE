@@ -622,6 +622,7 @@ pub enum Op {
         rsqrt_table: T,
         m: usize,
         d: usize,
+        n_real: usize,
     },
 }
 
@@ -798,9 +799,9 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 let o: Vec<Goldilocks> = (0..m * d).map(|ij| xv[ij] * scale[ij] + bv[ij]).collect();
                 store.v[out] = o;
             }
-            Op::LayerNormCentered { x, w, b, out, rsqrt_table, m, d } => {
+            Op::LayerNormCentered { x, w, b, out, rsqrt_table, m, d, n_real } => {
                 let (_, _, _, _, _, o, _, _, _, _, _) =
-                    layer_norm_centered_forward(store.get(x), store.get(w), store.get(b), store.get(rsqrt_table), m, d);
+                    layer_norm_centered_forward(store.get(x), store.get(w), store.get(b), store.get(rsqrt_table), m, d, n_real);
                 store.v[out] = o;
             }
         }
@@ -924,7 +925,7 @@ pub fn prove_shard(store: &mut Store, ops: &[Op], boundary: &[T], rng: &mut XorS
                 claims.push((out, p.r_out.clone(), mle::eval(store.get(out), &p.r_out)));
                 op_proofs.push(OpProof::Layernorm(p));
             }
-            Op::LayerNormCentered { x, w, b, out, rsqrt_table, m, d } => {
+            Op::LayerNormCentered { x, w, b, out, rsqrt_table, m, d, n_real } => {
                 let p = prove_layer_norm_centered(
                     store.get(x),
                     store.get(w),
@@ -932,6 +933,7 @@ pub fn prove_shard(store: &mut Store, ops: &[Op], boundary: &[T], rng: &mut XorS
                     store.get(rsqrt_table),
                     m,
                     d,
+                    n_real,
                     rng,
                 );
                 claims.push((out, p.r_out.clone(), mle::eval(store.get(out), &p.r_out)));
@@ -1087,7 +1089,7 @@ pub fn verify_shard(store: &Store, ops: &[Op], proof: &OpShardProof) -> bool {
                 }
                 claims.push((*out, lp.r_out.clone(), mle::eval(ws.get(*out), &lp.r_out)));
             }
-            (Op::LayerNormCentered { x, w, b, out, rsqrt_table, m, d }, OpProof::LayerNormCentered(lp)) => {
+            (Op::LayerNormCentered { x, w, b, out, rsqrt_table, m, d, n_real }, OpProof::LayerNormCentered(lp)) => {
                 if !verify_layer_norm_centered(
                     lp,
                     ws.get(*x),
@@ -1096,6 +1098,7 @@ pub fn verify_shard(store: &Store, ops: &[Op], proof: &OpShardProof) -> bool {
                     ws.get(*rsqrt_table),
                     *m,
                     *d,
+                    *n_real,
                 ) {
                     return false;
                 }
