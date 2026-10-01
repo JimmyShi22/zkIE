@@ -130,9 +130,9 @@ def main():
         save("L%d_kvlora_w_i32.bin" % L, pad2(q(kv_lora.T), H, KV_LORA))
         save("L%d_kpe_w_i32.bin" % L, pad2(q(k_pe.T), H, QK_ROPE))
         save("L%d_kva_ln_i32.bin" % L, pad1(q(S.arr(p + "self_attn.kv_a_layernorm.weight")), KV_LORA))
-        kvb = S.arr(p + "self_attn.kv_b_proj.weight").astype(np.float64)
-        k_nope = kvb[:HEADS * QK_NOPE]
-        v = kvb[HEADS * QK_NOPE:]
+        kvb = S.arr(p + "self_attn.kv_b_proj.weight").astype(np.float64).reshape(HEADS, QK_NOPE + V_HEAD, KV_LORA)
+        k_nope = kvb[:, :QK_NOPE, :].reshape(HEADS * QK_NOPE, KV_LORA)
+        v = kvb[:, QK_NOPE:, :].reshape(HEADS * V_HEAD, KV_LORA)
         save("L%d_knope_w_i32.bin" % L, pad2(q(k_nope.T), KV_LORA, HEADS * QK_NOPE))
         save("L%d_v_w_i32.bin" % L, pad2(q(v.T), KV_LORA, HEADS * V_HEAD))
         save("L%d_o_w_i32.bin" % L, pad2(q(S.arr(p + "self_attn.o_proj.weight").T), O_DIM, H))
