@@ -24,6 +24,7 @@ use crate::layer_norm_centered::{
     layer_norm_forward as layer_norm_centered_forward,
     prove_layer_norm_centered, verify_layer_norm_centered, LayerNormCenteredProof,
 };
+use crate::rms_norm::{prove_rms_norm, verify_rms_norm, rms_norm_forward, RmsNormProof};
 
 fn transpose(a: &[Goldilocks], m: usize, k: usize) -> Vec<Goldilocks> {
     let mut t = vec![Goldilocks::ZERO; k * m];
@@ -625,6 +626,15 @@ pub enum Op {
         d: usize,
         n_real: usize,
     },
+    RmsNorm {
+        x: T,
+        w: T,
+        out: T,
+        rsqrt_table: T,
+        m: usize,
+        d: usize,
+        n_real: usize,
+    },
 }
 
 /// A proof for one op, kept heterogeneous because the primitives have different
@@ -642,6 +652,7 @@ pub enum OpProof {
     StableSoftmaxIndex,
     Layernorm(LayernormChainProof),
     LayerNormCentered(LayerNormCenteredProof),
+    RmsNorm(RmsNormProof),
 }
 
 /// Upper-triangular causal mask as field values (`-(1<<30)` for `j > i`).
@@ -805,6 +816,11 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                     layer_norm_centered_forward(store.get(x), store.get(w), store.get(b), store.get(rsqrt_table), m, d, n_real);
                 store.v[out] = o;
             }
+            Op::RmsNorm { x, w, out, rsqrt_table, m, d, n_real } => {
+                let (_, _, _, o, _, _, _) =
+                    rms_norm_forward(store.get(x), store.get(w), store.get(rsqrt_table), m, d, n_real);
+                store.v[out] = o;
+            }
         }
     }
 }
@@ -952,6 +968,19 @@ pub fn prove_shard_precomputed(
                 claims.push((x, p.centered_r.clone(), mle::eval(store.get(x), &p.centered_r)));
                 claims.push((out, p.r_out.clone(), mle::eval(store.get(out), &p.r_out)));
                 op_proofs.push(OpProof::LayerNormCentered(p));
+            }
+            Op::RmsNorm { x, w, out, rsqrt_table, m, d, n_real } => {
+                let p = prove_rms_norm(
+                    store.get(x),
+                    store.get(w),
+                    store.get(rsqrt_table),
+                    m,
+                    d,
+                    n_real,
+                    rng,
+                );
+                claims.push((out, p.r_out.clone(), mle::eval(store.get(out), &p.r_out)));
+                op_proofs.push(OpProof::RmsNorm(p));
             }
         }
     }
@@ -1122,6 +1151,20 @@ pub fn verify_shard_precomputed(store: &Store, ops: &[Op], proof: &OpShardProof)
                 }
                 claims.push((*x, lp.centered_r.clone(), mle::eval(ws.get(*x), &lp.centered_r)));
                 claims.push((*out, lp.r_out.clone(), mle::eval(ws.get(*out), &lp.r_out)));
+            }
+            (Op::RmsNorm { x, w, out, rsqrt_table, m, d, n_real }, OpProof::RmsNorm(p)) => {
+                if !verify_rms_norm(
+                    p,
+                    ws.get(*x),
+                    ws.get(*w),
+                    ws.get(*rsqrt_table),
+                    *m,
+                    *d,
+                    *n_real,
+                ) {
+                    return false;
+                }
+                claims.push((*out, p.r_out.clone(), mle::eval(ws.get(*out), &p.r_out)));
             }
             _ => return false,
         }
