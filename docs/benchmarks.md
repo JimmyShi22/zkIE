@@ -7,12 +7,14 @@ length 512, 2114 ops, proven through the op-primitive shard-DAG composer
 are virtual MLE and nonlinearities use logUp lookups (no WHIR commit in this
 path).
 
-| shards | prove | verify | total | argmax |
-| --- | --- | --- | --- | --- |
-| 1 (whole model) | 146.7 s | 140.6 s | ~287 s (4.8 min) | 511/512 |
-| 13 (per layer) | 34.1 s | 21.3 s | ~55.3 s (0.92 min) | 511/512 |
+| seq | shards | prove | verify | total | argmax |
+| --- | --- | --- | --- | --- | --- |
+| 16 | 13 (per layer) | 18.6 s | 8.5 s | ~27.2 s (0.45 min) | 16/16 |
+| 512 | 13 (per layer) | 32.8 s | 21.5 s | ~54.3 s (0.92 min) | 511/512 |
 
-Peak host memory (whole-model run): **~43 GB RSS**.
+Peak host memory: **~38 GB RSS** (seq=16), **~43 GB RSS** (seq=512). The memory
+is dominated by the lm_head weights/tables and the verifier's store clone, not
+by the sequence length.
 
 13-shard prove breakdown: forward witness ~5.5 s + parallel GKR ~27 s.
 
@@ -246,7 +248,7 @@ Two kinds of opening reduction, with very different payoff:
   different points, reduced to one FRI proof plus one sum-of-products
   sumcheck): the real win. LayerNorm opens `x` at three points per row; merging
   them cut 800 openings (-17%). Implemented as `open_table_multi_point` and
-  `batch_open_committed` in `zkie_gkr::batch_open`.
+  `batch_open_committed` in `zkie_core::pcs::batch_open`.
 
 Other changes:
 
@@ -317,7 +319,7 @@ the matmul/sumcheck hot path.
 ## Layer-granularity GPT-2 512: per-block costs (2026-10-01)
 
 Layer circuit, plain model, single-threaded. Examples in
-`crates/zkie-gkr/examples/`:
+`crates/zkie-engine/examples/`:
 
 | block | dims | time |
 | --- | --- | --- |

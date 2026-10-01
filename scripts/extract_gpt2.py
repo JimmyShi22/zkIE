@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Dump GPT-2 124M weights/tables for the GKR prover (mirrors TimesFM extract).
 
-Writes models/gpt2_stack/*.i32.bin: per-layer weights/biases (padded to power
+Writes models/gpt2/weights/*.i32.bin: per-layer weights/biases (padded to power
 of two), the precomputed embedding for a fixed input, the causal mask, and the
 gelu_new lookup table. Also runs onnxruntime to save ground-truth logits and
 their argmax for the prover's validation.
@@ -16,7 +16,7 @@ from onnx import numpy_helper
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS = os.path.join(ROOT, "models")
-OUT = os.path.join(MODELS, "gpt2_stack")
+OUT = os.path.join(MODELS, "gpt2/weights")
 os.makedirs(OUT, exist_ok=True)
 
 SCALE = 65536.0
@@ -56,7 +56,7 @@ def save(name, arr):
 
 
 def main():
-    m = onnx.load(os.path.join(MODELS, "gpt2.onnx"))
+    m = onnx.load(os.path.join(MODELS, "gpt2/gpt2.onnx"))
     inits = {}
     for i in m.graph.initializer:
         inits[i.name] = numpy_helper.to_array(i).astype(np.float64)
@@ -118,7 +118,7 @@ def main():
     print("  wrote %-28s %s" % ("gelu_table_i32.bin", list(gelu_table.shape)))
 
     # ground truth via onnxruntime
-    sess = ort.InferenceSession(os.path.join(MODELS, "gpt2.onnx"))
+    sess = ort.InferenceSession(os.path.join(MODELS, "gpt2/gpt2.onnx"))
     logits = sess.run(["logits"], {
         "input_ids": input_ids,
         "attention_mask": attention_mask,

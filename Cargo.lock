@@ -827,25 +827,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
-name = "zkie-cuda"
-version = "0.1.0"
-dependencies = [
- "p3-commit",
- "p3-dft",
- "p3-field",
- "p3-goldilocks",
- "p3-matrix",
- "p3-merkle-tree",
- "p3-poseidon2",
- "p3-symmetric",
- "p3-util",
- "rand",
- "sppark",
- "which",
-]
-
-[[package]]
-name = "zkie-gkr"
+name = "zkie-core"
 version = "0.1.0"
 dependencies = [
  "p3-challenger",
@@ -857,11 +839,30 @@ dependencies = [
  "p3-maybe-rayon",
  "p3-merkle-tree",
  "p3-multilinear-util",
+ "p3-poseidon2",
  "p3-sumcheck",
  "p3-symmetric",
  "p3-util",
  "p3-whir",
  "rand",
  "rayon",
- "zkie-cuda",
+ "sppark",
+ "which",
+]
+
+[[package]]
+name = "zkie-engine"
+version = "0.1.0"
+dependencies = [
+ "zkie-core",
+ "zkie-ops",
+]
+
+[[package]]
+name = "zkie-ops"
+version = "0.1.0"
+dependencies = [
+ "p3-maybe-rayon",
+ "rayon",
+ "zkie-core",
 ]

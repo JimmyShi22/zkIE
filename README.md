@@ -91,21 +91,23 @@ stays on the CPU.
 ## Usage
 
 Build and run the real GPT-2 512 end-to-end proof (weights/tables are under
-`models/gpt2_stack/`, expected at the crate working directory):
+`models/gpt2/weights/`, expected at the crate working directory):
 
 ```bash
 # full GPT-2 512 proof: argmax sanity check + prove/verify time
-cargo run --release --example prove_gpt2_full
+cargo run --release -p zkie-engine --example prove_gpt2
 
 # shard-granularity sweep (1 shard vs 13 shards)
-cargo run --release --example bench_gpt2_sharded
+cargo run --release -p zkie-engine --example bench_gpt2_sharded
 
 # autotune over shard granularities
-cargo run --release --example bench_gpt2_autotune
+cargo run --release -p zkie-engine --example bench_gpt2_autotune
 
 # library tests
-cargo test --lib
+cargo test --workspace
 ```
+
+To add a new model, see [docs/adding-a-model.md](docs/adding-a-model.md).
 
 ## Benchmarks
 
@@ -114,17 +116,17 @@ is in [`docs/benchmarks.md`](docs/benchmarks.md).
 
 | Model | Setup | Wall time | Peak RSS |
 | --- | --- | --- | --- |
-| TimesFM 1.0 200M | op granularity | ~302 s | ~1.4 GB |
-| GPT-2 124M | seq=16 | ~1 min 53 s | ~5.6 GB |
-| GPT-2 124M | seq=512, 1 shard (whole model) | ~4.8 min | ~43 GB |
-| GPT-2 124M | seq=512, 13 shards (per layer, parallel) | **~0.92 min** | ~43 GB |
+| GPT-2 124M | seq=16, 13 shards (per layer) | ~0.45 min | ~38 GB |
+| GPT-2 124M | seq=512, 13 shards (per layer) | **~0.92 min** | ~43 GB |
+| TimesFM 1.0 200M | pending (re-implementation in progress) | - | - |
 | Gemma 3 270M | adapting | - | - |
 
-The GPT-2 512 rows use real weights, multi-head attention and pre-norm; argmax
-matches ground truth 511/512. The 13-shard configuration is what the autotuner
-picks (`bench_gpt2_autotune`) and beats DeepProve (~7.6 min) by roughly 8x. The
-Gemma 3 row is the reuse target — the same op primitives and the same autotune
-flow.
+All rows are the 13-shard (per-layer) configuration picked by the autotuner
+(`bench_gpt2_autotune`); 1-shard numbers are omitted. GPT-2 uses real weights,
+multi-head attention and pre-norm; argmax matches ground truth (511/512 at
+seq=512, 16/16 at seq=16). seq=512 beats DeepProve (~7.6 min) by roughly 8x.
+TimesFM 200M is being re-implemented on the current op-primitive shard-DAG path
+(its SwiGLU FFN needs a SiLU op). Gemma 3 is the reuse target.
 
 Status: GPT-2 512 proves end to end with a measured time (~0.92 min at 13
 shards), and after autotuning is faster than the layer-granularity pipeline and
@@ -132,25 +134,30 @@ faster than DeepProve (~7.6 min) by roughly 8x.
 
 ## Repository layout
 
-- `crates/zkie-gkr/` — the proving engine:
-  - `src/compose.rs` — op primitives (`Op`, `prove_shard`, `prove_shard_dag`,
-    cross-shard `same_poly` binding, weight batch commit).
-  - `src/engine.rs` — shard granularity, per-stage schedule, and the autotune
-    loop.
-  - `src/projection.rs`, `src/layer_norm_centered.rs`, `src/softmax_scaled.rs`,
-    `src/layernorm_chain.rs` — op-level proof primitives.
-  - `src/sumcheck.rs`, `src/matmul.rs`, `src/logup_gkr.rs`, `src/same_poly.rs`,
-    `src/mle.rs` — the reduction substrate.
-  - `src/whir.rs`, `src/batch_open.rs`, `src/committed.rs` — WHIR/FRI
-    polynomial commitments.
-  - `src/par.rs` — the i64 fixed-point forward matmul (cache-friendly, with
-    field fallback).
-  - `examples/` — `prove_gpt2_full`, `bench_gpt2_sharded`,
-    `bench_gpt2_autotune`, and micro-benchmarks.
-- `crates/zkie-cuda/` — optional CUDA backend (Sppark DFT + Poseidon2 Merkle)
-  behind the `cuda` feature.
-- `models/` — GPT-2 512 weights and lookup tables (i32 fixed-point).
-- `docs/` — `spec.md` (design), `benchmarks.md` (measurements), `roadmap.md`.
+- `crates/zkie-core/` — the proving substrate:
+  - `src/common/` — Goldilocks field, fixed-point embedding, MLE evaluation,
+    sumcheck, the matmul / LogUp / `same_poly` reductions, and the claim type.
+  - `src/pcs/` — the WHIR/FRI polynomial commitment scheme (`whir.rs`),
+    batch openings (`batch_open.rs`), committed tensors (`committed.rs`), and
+    the optional CUDA backend (`dft_cuda.rs`, `merkle_cuda.rs`, `cuda_ffi.rs`,
+    `cuda_buffer.rs`) behind the `cuda` feature.
+- `crates/zkie-ops/` — op-level proof primitives, one per ONNX op type:
+  - `compose.rs` — `Op`, `Store`, `prove_shard`, `prove_shard_dag`, and the
+    cross-shard `same_poly` binding.
+  - `projection.rs`, `layer_norm_centered.rs`, `softmax_scaled.rs`,
+    `layernorm_chain.rs` — the matmul/normalization/softmax primitives.
+  - `par.rs` — the i64 fixed-point forward matmul (cache-friendly, with field
+    fallback).
+- `crates/zkie-engine/` — the autotune engine and per-model builders:
+  - `src/engine.rs` — shard granularity, per-stage CPU/GPU schedule, and the
+    autotune loop.
+  - `src/models/` — op-graph builders per model (`gpt2.rs`).
+  - `examples/` — `prove_gpt2`, `bench_gpt2_sharded`, `bench_gpt2_autotune`,
+    and micro-benchmarks.
+- `models/` — GPT-2 124M and TimesFM 1.0 200M ONNX graphs and extracted
+  fixed-point weights / lookup tables.
+- `docs/` — `spec.md` (design), `benchmarks.md` (measurements),
+  `adding-a-model.md` (how to add a new model), `roadmap.md`.
 
 ## License
 

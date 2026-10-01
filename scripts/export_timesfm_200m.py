@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export TimesFM 1.0-200M to models/timesfm_1_0_200m.onnx (+ .onnx.data).
+"""Export TimesFM 1.0-200M to models/timesfm/timesfm/timesfm_1_0_200m.onnx (+ .onnx.data).
 
 Reproduces the procedure documented in
 docs/superpowers/specs/2026-07-26-zkie-timesfm-onnx-export-attempt.md:
@@ -97,7 +97,7 @@ def main():
     input_ts = torch.randn(1, 512)
     input_padding = torch.zeros(1, 512)
     freq = torch.zeros(1, 1, dtype=torch.int64)
-    out_path = os.path.join(MODELS, "timesfm_1_0_200m.onnx")
+    out_path = os.path.join(MODELS, "timesfm/timesfm_1_0_200m.onnx")
     print("exporting (torch dynamo, opset 18)...")
     torch.onnx.export(
         model,

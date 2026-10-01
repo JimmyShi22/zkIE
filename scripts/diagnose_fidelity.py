@@ -59,7 +59,7 @@ def attention(x, qkv_w, qkv_b, o_w, o_b, q_scale, mask_q, exp_t):
 
 def main():
     base = "models"
-    m = onnx.load(f"{base}/timesfm_1_0_200m.onnx")
+    m = onnx.load(f"{base}/timesfm/timesfm_1_0_200m.onnx")
     inits = {i.name: onnx.numpy_helper.to_array(i).astype(np.float64) for i in m.graph.initializer}
     rsqrt = np.fromfile(f"{base}/rsqrt_table_i32.bin", dtype=np.int32).astype(np.int64)
     exp_t = np.fromfile(f"{base}/exp_table_i32.bin", dtype=np.int32).astype(np.int64)

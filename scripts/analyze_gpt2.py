@@ -4,7 +4,7 @@ import os
 import onnx
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-m = onnx.load(os.path.join(ROOT, "models", "gpt2.onnx"), load_external_data=False)
+m = onnx.load(os.path.join(ROOT, "models", "gpt2/gpt2.onnx"), load_external_data=False)
 g = m.graph
 inits = {i.name: [d for d in i.dims] for i in g.initializer}
 

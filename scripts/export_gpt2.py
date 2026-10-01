@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export GPT-2 (124M) to models/gpt2.onnx (+ .onnx.data) and print the op histogram.
+"""Export GPT-2 (124M) to models/gpt2/gpt2/gpt2.onnx (+ .onnx.data) and print the op histogram.
 
 Loads HuggingFace gpt2 (GPT2LMHeadModel), runs one static forward pass with
 use_cache=False, and torch.onnx.export (dynamo, opset 18) writes a fixed-shape
@@ -47,7 +47,7 @@ def main():
     position_ids = torch.arange(0, SEQ, dtype=torch.long).unsqueeze(0)
 
     os.makedirs(MODELS, exist_ok=True)
-    out_path = os.path.join(MODELS, "gpt2.onnx")
+    out_path = os.path.join(MODELS, "gpt2/gpt2.onnx")
     print(f"exporting seq={SEQ} (torch dynamo, opset 18)...")
     torch.onnx.export(
         Wrapper(model),

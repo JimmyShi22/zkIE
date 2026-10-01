@@ -4,7 +4,7 @@ D, FFN, HEADS, DH, SEQ = 1024, 4096, 12, 64, 512
 N_REAL = 768
 
 def load(name):
-    return np.fromfile(f"models/gpt2_stack/{name}", dtype=np.int32).astype(np.int64)
+    return np.fromfile(f"models/gpt2/weights/{name}", dtype=np.int32).astype(np.int64)
 
 def dr(a, b):
     a = np.asarray(a, dtype=np.int64)
@@ -32,7 +32,7 @@ def layer_norm(x, w, b, rsqrt_t, m, d, n_real):
 def main():
     rsqrt_t = np.fromfile("models/rsqrt_table_i32.bin", dtype=np.int32).astype(np.int64)
     exp_t = np.fromfile("models/exp_table_i32.bin", dtype=np.int32).astype(np.int64)
-    gelu_t = np.fromfile("models/gpt2_stack/gelu_table_i32.bin", dtype=np.int32).astype(np.int64)
+    gelu_t = np.fromfile("models/gpt2/weights/gelu_table_i32.bin", dtype=np.int32).astype(np.int64)
     embed = load("embedding_i32.bin").reshape(SEQ, D)
     x = embed.astype(np.int64)
 
@@ -89,7 +89,7 @@ def main():
     lm_w = load("lm_head_w_i32.bin").reshape(D, 65536)
     logits = hf @ lm_w
     argmax = logits.argmax(axis=1)
-    gt = np.fromfile("models/gpt2_stack/gt_argmax_512_i32.bin", dtype=np.int32)
+    gt = np.fromfile("models/gpt2/weights/gt_argmax_512_i32.bin", dtype=np.int32)
     print("argmax matches:", (argmax == gt).sum(), "/", SEQ)
 
 if __name__ == "__main__":
