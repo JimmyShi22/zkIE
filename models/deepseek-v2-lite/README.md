@@ -27,3 +27,12 @@ per-layer routing gate and ground-truth argmax/logits.
 cargo run --release -p zkie-models-deepseek-v2-lite --example prove
 cargo run --release -p zkie-models-deepseek-v2-lite --example bench
 ```
+
+## Benchmark (seq=16, release, 64-thread CPU)
+
+| shards | prove | argmax | peak RSS |
+| --- | --- | --- | --- |
+| 29 (per layer) | 806.7 s (~13.4 min) | 16/16 | ~272 GB |
+
+The dense-MoE assembly (all 64 routed experts) drives the op count (20604 ops)
+and memory. The top-k routing proof and lazy expert opening are the next steps.
