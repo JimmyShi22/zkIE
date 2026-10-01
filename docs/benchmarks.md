@@ -29,6 +29,20 @@ Notes:
   the GKR sumcheck; those tables are already at their minimum lossless size for
   16-bit fixed point.
 
+## TimesFM 1.0 200M full model (op-primitive shard DAG) (2026-10-01)
+Real TimesFM 1.0 200M (20 layers, 16 heads x 80, H=1280), sequence length 16,
+4316 ops, proven through `compose::prove_shard_dag` with `same_poly`
+cross-shard binding (RMSNorm / LayerNorm / SiLU / ReLU / causal attention).
+Release build, 64-thread CPU.
+
+| seq | shards | prove | verify | total |
+| --- | --- | --- | --- | --- |
+| 16 | 20 (per layer) | 26.9 s | 10.6 s | ~37.5 s (0.62 min) |
+
+Peak host memory: **~25.5 GB RSS**. Finer granularity (40 shards) is tied
+(~37.6 s); coarser granularity is slower (4 shards ~68.7 s), so the autotuner
+picks per-layer. Output matches the ONNX float reference to ~1 LSB.
+
 # Benchmarks
 
 Baseline measurements for the TimesFM 200M end-to-end proof (prologue + 20 layers + output head) through the unified op interface (prove_200m_ops).

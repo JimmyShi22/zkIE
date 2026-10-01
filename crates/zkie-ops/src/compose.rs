@@ -24,6 +24,7 @@ use crate::layer_norm_centered::{
     layer_norm_forward as layer_norm_centered_forward,
     prove_layer_norm_centered, verify_layer_norm_centered, LayerNormCenteredProof,
 };
+use crate::rms_norm::{prove_rms_norm, verify_rms_norm, rms_norm_forward, RmsNormProof};
 
 fn transpose(a: &[Goldilocks], m: usize, k: usize) -> Vec<Goldilocks> {
     let mut t = vec![Goldilocks::ZERO; k * m];
@@ -546,6 +547,16 @@ pub enum Op {
         factor: i64,
         shift: u32,
     },
+    ScaleVec {
+        x: T,
+        scale: T,
+        out: T,
+        shift: u32,
+    },
+    Relu {
+        x: T,
+        out: T,
+    },
     MatMul {
         a: T,
         b: T,
@@ -625,6 +636,15 @@ pub enum Op {
         d: usize,
         n_real: usize,
     },
+    RmsNorm {
+        x: T,
+        w: T,
+        out: T,
+        rsqrt_table: T,
+        m: usize,
+        d: usize,
+        n_real: usize,
+    },
 }
 
 /// A proof for one op, kept heterogeneous because the primitives have different
@@ -632,6 +652,8 @@ pub enum Op {
 pub enum OpProof {
     Transpose,
     Scale,
+    ScaleVec,
+    Relu,
     MatMul(MatmulProof, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>),
     Projection(ProjectionProof),
     Add(VirtualProof, Vec<Goldilocks>),
@@ -642,6 +664,7 @@ pub enum OpProof {
     StableSoftmaxIndex,
     Layernorm(LayernormChainProof),
     LayerNormCentered(LayerNormCenteredProof),
+    RmsNorm(RmsNormProof),
 }
 
 /// Upper-triangular causal mask as field values (`-(1<<30)` for `j > i`).
@@ -695,6 +718,22 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 let o: Vec<Goldilocks> = store.get(x)
                     .iter()
                     .map(|&v| from_i64(round_div(to_i64(v) * factor, 1i64 << shift)))
+                    .collect();
+                store.v[out] = o;
+            }
+            Op::ScaleVec { x, scale, out, shift } => {
+                let sv = store.get(scale);
+                let o: Vec<Goldilocks> = store.get(x)
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| from_i64(round_div(to_i64(v) * to_i64(sv[i % sv.len()]), 1i64 << shift)))
+                    .collect();
+                store.v[out] = o;
+            }
+            Op::Relu { x, out } => {
+                let o: Vec<Goldilocks> = store.get(x)
+                    .iter()
+                    .map(|&v| if to_i64(v) > 0 { v } else { Goldilocks::ZERO })
                     .collect();
                 store.v[out] = o;
             }
@@ -805,6 +844,11 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                     layer_norm_centered_forward(store.get(x), store.get(w), store.get(b), store.get(rsqrt_table), m, d, n_real);
                 store.v[out] = o;
             }
+            Op::RmsNorm { x, w, out, rsqrt_table, m, d, n_real } => {
+                let (_, _, _, o, _, _, _) =
+                    rms_norm_forward(store.get(x), store.get(w), store.get(rsqrt_table), m, d, n_real);
+                store.v[out] = o;
+            }
         }
     }
 }
@@ -846,6 +890,12 @@ pub fn prove_shard_precomputed(
             }
             Op::Scale { .. } => {
                 op_proofs.push(OpProof::Scale);
+            }
+            Op::ScaleVec { .. } => {
+                op_proofs.push(OpProof::ScaleVec);
+            }
+            Op::Relu { .. } => {
+                op_proofs.push(OpProof::Relu);
             }
             Op::MatMul { a, b, c, m, k, n } => {
                 let at = transpose(store.get(a), m, k);
@@ -953,6 +1003,19 @@ pub fn prove_shard_precomputed(
                 claims.push((out, p.r_out.clone(), mle::eval(store.get(out), &p.r_out)));
                 op_proofs.push(OpProof::LayerNormCentered(p));
             }
+            Op::RmsNorm { x, w, out, rsqrt_table, m, d, n_real } => {
+                let p = prove_rms_norm(
+                    store.get(x),
+                    store.get(w),
+                    store.get(rsqrt_table),
+                    m,
+                    d,
+                    n_real,
+                    rng,
+                );
+                claims.push((out, p.r_out.clone(), mle::eval(store.get(out), &p.r_out)));
+                op_proofs.push(OpProof::RmsNorm(p));
+            }
         }
     }
 
@@ -1010,6 +1073,8 @@ pub fn verify_shard_precomputed(store: &Store, ops: &[Op], proof: &OpShardProof)
                 // against that recomputed value.
             }
             (Op::Scale { .. }, OpProof::Scale) => {}
+            (Op::ScaleVec { .. }, OpProof::ScaleVec) => {}
+            (Op::Relu { .. }, OpProof::Relu) => {}
             (Op::MatMul { a, b, c, m, k, n: _ }, OpProof::MatMul(mp, u, v, ch)) => {
                 let at = transpose(ws.get(*a), *m, *k);
                 let a_restricted = mle::partial_eval(&at, u);
@@ -1122,6 +1187,20 @@ pub fn verify_shard_precomputed(store: &Store, ops: &[Op], proof: &OpShardProof)
                 }
                 claims.push((*x, lp.centered_r.clone(), mle::eval(ws.get(*x), &lp.centered_r)));
                 claims.push((*out, lp.r_out.clone(), mle::eval(ws.get(*out), &lp.r_out)));
+            }
+            (Op::RmsNorm { x, w, out, rsqrt_table, m, d, n_real }, OpProof::RmsNorm(p)) => {
+                if !verify_rms_norm(
+                    p,
+                    ws.get(*x),
+                    ws.get(*w),
+                    ws.get(*rsqrt_table),
+                    *m,
+                    *d,
+                    *n_real,
+                ) {
+                    return false;
+                }
+                claims.push((*out, p.r_out.clone(), mle::eval(ws.get(*out), &p.r_out)));
             }
             _ => return false,
         }

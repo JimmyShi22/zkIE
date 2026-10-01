@@ -118,19 +118,20 @@ is in [`docs/benchmarks.md`](docs/benchmarks.md).
 | --- | --- | --- | --- |
 | GPT-2 124M | seq=16, 13 shards (per layer) | ~0.45 min | ~38 GB |
 | GPT-2 124M | seq=512, 13 shards (per layer) | **~0.92 min** | ~43 GB |
-| TimesFM 1.0 200M | pending (re-implementation in progress) | - | - |
+| TimesFM 1.0 200M | seq=16, 20 shards (per layer) | ~0.62 min | ~25.5 GB |
 | Gemma 3 270M | adapting | - | - |
 
-All rows are the 13-shard (per-layer) configuration picked by the autotuner
-(`bench_gpt2_autotune`); 1-shard numbers are omitted. GPT-2 uses real weights,
-multi-head attention and pre-norm; argmax matches ground truth (511/512 at
-seq=512, 16/16 at seq=16). seq=512 beats DeepProve (~7.6 min) by roughly 8x.
-TimesFM 200M is being re-implemented on the current op-primitive shard-DAG path
-(its SwiGLU FFN needs a SiLU op). Gemma 3 is the reuse target.
+All rows are the per-layer shard configuration picked by the autotuner
+(`bench_gpt2_autotune` / `bench_timesfm`); 1-shard numbers are omitted. GPT-2
+uses real weights, multi-head attention and pre-norm; argmax matches ground
+truth (511/512 at seq=512, 16/16 at seq=16). seq=512 beats DeepProve (~7.6 min)
+by roughly 8x. TimesFM 200M (prologue + 20 layers + horizon head) proves end to
+end on the same op-primitive shard-DAG path, output matching the ONNX float
+reference to ~1 LSB. Gemma 3 is the reuse target.
 
-Status: GPT-2 512 proves end to end with a measured time (~0.92 min at 13
-shards), and after autotuning is faster than the layer-granularity pipeline and
-faster than DeepProve (~7.6 min) by roughly 8x.
+Status: GPT-2 512 (~0.92 min at 13 shards) and TimesFM 200M (~0.62 min at
+20 shards) both prove end to end; GPT-2 512 beats DeepProve (~7.6 min) by
+roughly 8x.
 
 ## Repository layout
 
