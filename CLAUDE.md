@@ -11,7 +11,7 @@ in crates/zkie-gkr/src/ops.rs. See README.md.
 - crates/zkie-gkr: proving primitives + op interface + examples
 - crates/zkie-cuda: optional CUDA backend (NTT + Merkle)
 - scripts/: ONNX extraction / fixed-point simulation / fidelity checks
-- docs/superpowers/specs/: fixed-point semantics contract
+- docs/: benchmarks, roadmap
 
 ## Build / test
 
