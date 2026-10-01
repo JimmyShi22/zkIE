@@ -936,6 +936,7 @@ pub fn prove_shard(store: &mut Store, ops: &[Op], boundary: &[T], rng: &mut XorS
                     n_real,
                     rng,
                 );
+                claims.push((x, p.centered_r.clone(), mle::eval(store.get(x), &p.centered_r)));
                 claims.push((out, p.r_out.clone(), mle::eval(store.get(out), &p.r_out)));
                 op_proofs.push(OpProof::LayerNormCentered(p));
             }
@@ -1102,6 +1103,7 @@ pub fn verify_shard(store: &Store, ops: &[Op], proof: &OpShardProof) -> bool {
                 ) {
                     return false;
                 }
+                claims.push((*x, lp.centered_r.clone(), mle::eval(ws.get(*x), &lp.centered_r)));
                 claims.push((*out, lp.r_out.clone(), mle::eval(ws.get(*out), &lp.r_out)));
             }
             _ => return false,
