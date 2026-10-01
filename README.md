@@ -107,6 +107,8 @@ cargo run --release --example bench_gpt2_autotune
 cargo test --lib
 ```
 
+To add a new model, see [docs/adding-a-model.md](docs/adding-a-model.md).
+
 ## Benchmarks
 
 Measured on a 64-thread CPU. Full detail and the reasoning behind the numbers
@@ -150,7 +152,8 @@ faster than DeepProve (~7.6 min) by roughly 8x.
 - `crates/zkie-cuda/` — optional CUDA backend (Sppark DFT + Poseidon2 Merkle)
   behind the `cuda` feature.
 - `models/` — GPT-2 512 weights and lookup tables (i32 fixed-point).
-- `docs/` — `spec.md` (design), `benchmarks.md` (measurements), `roadmap.md`.
+- `docs/` — `spec.md` (design), `benchmarks.md` (measurements),
+  `adding-a-model.md` (how to add a new model), `roadmap.md`.
 
 ## License
 
