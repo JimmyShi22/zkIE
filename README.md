@@ -119,7 +119,8 @@ is in [`docs/benchmarks.md`](docs/benchmarks.md).
 | GPT-2 124M | 124M / 124M | seq=16, 13 shards (per layer) | ~27.2 s | ~38 GB |
 | GPT-2 124M | 124M / 124M | seq=512, 13 shards (per layer) | **~54.3 s** | ~43 GB |
 | TimesFM 1.0 200M | 200M / 200M | seq=16, 20 shards (per layer) | ~37.5 s | ~25.5 GB |
-| Gemma 3 270M | 270M / 270M | adapting | - | - |
+| Gemma 3 270M | 270M / 270M | seq=16, 22 shards (per layer) | ~46.2 s | ~28 GB |
+| Gemma 3 270M | 270M / 270M | seq=512, 22 shards (per layer) | ~90.4 s | ~39 GB |
 | DeepSeek-V2-Lite | 2.4B / 15.7B | MoE + MLA (planned) | - | - |
 | DeepSeek-V4.1-Flash | 8B/16B* / 552B | MoE + CSA2 + vision (planned) | - | - |
 

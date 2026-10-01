@@ -394,3 +394,19 @@ Key findings:
 - The 12-layer proof does not scale to the theoretical ~6s (measured 22.6s):
   nested parallelism (12 std threads x rayon pool) contends; switching the outer
   loop to `rayon::par_iter` is applied but not yet confirmed effective.
+## Gemma 3 270M full model (op-primitive shard DAG) (2026-10-01)
+
+Real Gemma 3 270M (18 layers, GQA 4 heads x head_dim 256, QK RMSNorm, RoPE,
+post-norm sandwich, gated-GELU MLP), sequence length 16, 1154 ops, proven through
+`compose::prove_shard_dag` with `same_poly` cross-shard binding. Release build,
+64-thread CPU. This is the first model exercising the RoPE primitive and the
+Gemma "1 + gamma" RMSNorm convention.
+
+| seq | shards | prove | verify | total | argmax | peak RSS |
+| --- | --- | --- | --- | --- | --- | --- |
+| 16 | 22 (per layer) | 30.4 s | 15.8 s | ~46.2 s (0.77 min) | 16/16 | ~28 GB |
+| 512 | 22 (per layer) | 52.5 s | 37.9 s | ~90.4 s (1.51 min) | 469/512 | ~39 GB |
+
+The per-layer granularity (22 shards) is the fastest of the swept
+configurations; coarser granularities (fewer, larger shards) are slower because
+each shard's same-poly binding cost grows with shard size.

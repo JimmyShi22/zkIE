@@ -25,6 +25,7 @@ use crate::layer_norm_centered::{
     prove_layer_norm_centered, verify_layer_norm_centered, LayerNormCenteredProof,
 };
 use crate::rms_norm::{prove_rms_norm, verify_rms_norm, rms_norm_forward, RmsNormProof};
+use crate::rope::{prove_rope, verify_rope, rope_forward, RoPEProof};
 
 fn transpose(a: &[Goldilocks], m: usize, k: usize) -> Vec<Goldilocks> {
     let mut t = vec![Goldilocks::ZERO; k * m];
@@ -645,6 +646,15 @@ pub enum Op {
         d: usize,
         n_real: usize,
     },
+    RoPE {
+        x: T,
+        cos: T,
+        sin: T,
+        out: T,
+        m: usize,
+        d: usize,
+        shift: u32,
+    },
 }
 
 /// A proof for one op, kept heterogeneous because the primitives have different
@@ -665,6 +675,7 @@ pub enum OpProof {
     Layernorm(LayernormChainProof),
     LayerNormCentered(LayerNormCenteredProof),
     RmsNorm(RmsNormProof),
+    RoPE(RoPEProof),
 }
 
 /// Upper-triangular causal mask as field values (`-(1<<30)` for `j > i`).
@@ -690,7 +701,7 @@ pub fn rsqrt_index(var: i64) -> u32 {
     if raw < FINE {
         raw.max(0) as u32
     } else {
-        (FINE + ((raw - FINE) >> 8)) as u32
+        (FINE + ((raw - FINE) >> 16)) as u32
     }
 }
 
@@ -847,6 +858,11 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
             Op::RmsNorm { x, w, out, rsqrt_table, m, d, n_real } => {
                 let (_, _, _, o, _, _, _) =
                     rms_norm_forward(store.get(x), store.get(w), store.get(rsqrt_table), m, d, n_real);
+                store.v[out] = o;
+            }
+            Op::RoPE { x, cos, sin, out, m, d, shift } => {
+                let (o, _, _) =
+                    rope_forward(store.get(x), store.get(cos), store.get(sin), m, d, shift);
                 store.v[out] = o;
             }
         }
@@ -1015,6 +1031,20 @@ pub fn prove_shard_precomputed(
                 );
                 claims.push((out, p.r_out.clone(), mle::eval(store.get(out), &p.r_out)));
                 op_proofs.push(OpProof::RmsNorm(p));
+            }
+            Op::RoPE { x, cos, sin, out, m, d, shift } => {
+                let p = prove_rope(
+                    store.get(x),
+                    store.get(cos),
+                    store.get(sin),
+                    store.get(out),
+                    m,
+                    d,
+                    shift,
+                    rng,
+                );
+                claims.push((out, p.r_out.clone(), mle::eval(store.get(out), &p.r_out)));
+                op_proofs.push(OpProof::RoPE(p));
             }
         }
     }
@@ -1197,6 +1227,21 @@ pub fn verify_shard_precomputed(store: &Store, ops: &[Op], proof: &OpShardProof)
                     *m,
                     *d,
                     *n_real,
+                ) {
+                    return false;
+                }
+                claims.push((*out, p.r_out.clone(), mle::eval(ws.get(*out), &p.r_out)));
+            }
+            (Op::RoPE { x, cos, sin, out, m, d, shift }, OpProof::RoPE(p)) => {
+                if !verify_rope(
+                    p,
+                    ws.get(*x),
+                    ws.get(*cos),
+                    ws.get(*sin),
+                    ws.get(*out),
+                    *m,
+                    *d,
+                    *shift,
                 ) {
                     return false;
                 }
