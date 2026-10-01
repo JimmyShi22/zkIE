@@ -10,6 +10,7 @@
 //! the "one op per shard" case when `N == 1` (no internal binding).
 
 use crate::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64};
+use rayon::prelude::*;
 use crate::fixed_point::{from_i64, to_i64};
 use crate::matmul::{prove as matmul_prove, verify as matmul_verify, MatmulProof};
 use crate::mle;
@@ -814,6 +815,18 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
 /// are committed at the boundary and therefore not bound internally.
 pub fn prove_shard(store: &mut Store, ops: &[Op], boundary: &[T], rng: &mut XorShift64) -> OpShardProof {
     forward_ops(store, ops);
+    prove_shard_precomputed(store, ops, boundary, rng)
+}
+
+/// Prove a shard whose witness is already materialized in `store` (the forward
+/// pass has already run). Read-only on `store`, so shards can be proven in
+/// parallel by the shard-DAG composer.
+pub fn prove_shard_precomputed(
+    store: &Store,
+    ops: &[Op],
+    boundary: &[T],
+    rng: &mut XorShift64,
+) -> OpShardProof {
 
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
     let add_terms = vec![
@@ -1165,10 +1178,21 @@ pub fn prove_shard_dag(
     rng: &mut XorShift64,
 ) -> ShardDagProof {
     let ranges = shard_ranges(ops.len(), ops_per_shard);
-    let mut shards = Vec::with_capacity(ranges.len());
-    for (s, e) in &ranges {
-        shards.push(prove_shard(store, &ops[*s..*e], &[], rng));
-    }
+
+    // Materialize every op output once, then prove each shard's sumchecks in
+    // parallel (read-only on the store). Per-shard RNGs are seeded
+    // deterministically from the caller's RNG, so the proof stays reproducible.
+    forward_ops(store, ops);
+    let store_ref: &Store = store;
+    let seeds: Vec<u64> = (0..ranges.len()).map(|_| rng.next_u64()).collect();
+    let shards: Vec<OpShardProof> = ranges
+        .par_iter()
+        .zip(seeds.par_iter())
+        .map(|(&(s, e), &seed)| {
+            let mut srng = XorShift64::new(seed);
+            prove_shard_precomputed(store_ref, &ops[s..e], &[], &mut srng)
+        })
+        .collect();
 
     // Group raw claims by tensor across shards; bind tensors claimed by >1 shard.
     let mut by_tensor: std::collections::BTreeMap<T, Vec<(Vec<Goldilocks>, Goldilocks)>> =
