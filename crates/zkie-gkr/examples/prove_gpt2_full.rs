@@ -98,6 +98,7 @@ fn build_layer(
         let e = store.push(vec![]);
         let probs = store.push(vec![]);
         let attn = store.push(vec![]);
+        let attn_16 = store.push(vec![]);
         let out_h = store.push(vec![]);
         let out_rem = store.push(vec![]);
         ops.push(Op::Projection { x: h, w: qh, bias: qb, out: q, rem: qr, m, k: D, n: DH, shift });
@@ -110,7 +111,8 @@ fn build_layer(
         ops.push(Op::StableSoftmaxIndex { x: scores_16, mask: mask_t, out: idx, offset: 1 << 21, table_len, m, n: m });
         ops.push(Op::Softmax { idx, e, out: probs, table: exp_t, m, n: m });
         ops.push(Op::MatMul { a: probs, b: v, c: attn, m, k: m, n: DH });
-        ops.push(Op::Projection { x: attn, w: oh, bias: ob, out: out_h, rem: out_rem, m, k: DH, n: D, shift });
+        ops.push(Op::Scale { x: attn, out: attn_16, factor: 1, shift: 16 });
+        ops.push(Op::Projection { x: attn_16, w: oh, bias: ob, out: out_h, rem: out_rem, m, k: DH, n: D, shift });
         head_outs.push(out_h);
     }
     let mut attn_acc = head_outs[0];
