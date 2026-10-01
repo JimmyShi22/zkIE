@@ -1,0 +1,10 @@
+[package]
+name = "zkie-engine"
+version = "0.1.0"
+edition = "2021"
+description = "zkIE autotune engine + per-model op-graph builders"
+license = "Apache-2.0"
+
+[dependencies]
+zkie-core = { path = "../zkie-core" }
+zkie-ops = { path = "../zkie-ops" }

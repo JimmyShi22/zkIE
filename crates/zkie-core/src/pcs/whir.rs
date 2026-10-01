@@ -607,8 +607,8 @@ fn to_ef_point(point: &[Goldilocks]) -> Point<EF> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::field::{Goldilocks, XorShift64};
-    use crate::mle;
+    use crate::common::field::{Goldilocks, XorShift64};
+    use crate::common::mle;
 
     #[test]
     fn whir_batch_open_matches_mle_eval() {

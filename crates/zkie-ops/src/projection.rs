@@ -3,11 +3,11 @@
 //! affine rounding as an arithmetic constraint, and the range check as a logUp
 //! lookup. This is the first reusable integration building block for the full
 //! GPT-2 layer circuit.
-use crate::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64};
-use crate::fixed_point::{from_i64, to_i32};
-use crate::logup_gkr::{prove_lookup_fractional, verify_lookup_fractional, FractionalProof};
-use crate::matmul::{prove as matmul_prove, verify as matmul_verify, MatmulProof};
-use crate::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
+use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64};
+use zkie_core::common::fixed_point::{from_i64, to_i32};
+use zkie_core::common::logup_gkr::{prove_lookup_fractional, verify_lookup_fractional, FractionalProof};
+use zkie_core::common::matmul::{prove as matmul_prove, verify as matmul_verify, MatmulProof};
+use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
 pub struct ProjectionProof {
     pub matmul: MatmulProof,
     pub affine: VirtualProof,
@@ -53,7 +53,7 @@ pub fn prove_projection(
     let matmul = matmul_prove(&wt, w, &h, m, k, n, &u, &v, &ch);
     let mut pt = v.clone();
     pt.extend_from_slice(&u);
-    let eq = crate::mle::eq_evals(&pt);
+    let eq = zkie_core::common::mle::eq_evals(&pt);
     let ones = vec![Goldilocks::from_u64(1); m * n];
     let neg = from_i64(-1);
     let terms = vec![
@@ -87,7 +87,7 @@ pub fn verify_projection(
     let half = Goldilocks::from_u64(1u64 << (shift - 1));
     let two_shift = Goldilocks::from_u64(1u64 << shift);
     let h = matmul_full(x, w, m, k, n);
-    let eq = crate::mle::eq_evals(&proof.pt);
+    let eq = zkie_core::common::mle::eq_evals(&proof.pt);
     let ones = vec![Goldilocks::from_u64(1); m * n];
     let neg = from_i64(-1);
     let terms = vec![
@@ -98,17 +98,17 @@ pub fn verify_projection(
         (neg * half, vec![0usize, 5usize]),
     ];
     let mles: Vec<&[Goldilocks]> = vec![&eq, &rem_off, &h, &out, &bias, &ones];
-    let final_evals: Vec<Goldilocks> = mles.iter().map(|mm| crate::mle::eval(mm, &proof.pt)).collect();
+    let final_evals: Vec<Goldilocks> = mles.iter().map(|mm| zkie_core::common::mle::eval(mm, &proof.pt)).collect();
     let mut fe = final_evals;
     fe[2] = proof.matmul.claimed;
     if !verify_virtual(&proof.affine, &terms, Goldilocks::from_u64(0), &proof.pt, &fe) {
         return false;
     }
     let wt = transpose(x, m, k);
-    let a_restricted = crate::mle::partial_eval(&wt, &proof.u);
-    let b_restricted = crate::mle::partial_eval(w, &proof.v);
-    let f_eval = crate::mle::eval(&a_restricted, &proof.ch);
-    let h_eval = crate::mle::eval(&b_restricted, &proof.ch);
+    let a_restricted = zkie_core::common::mle::partial_eval(&wt, &proof.u);
+    let b_restricted = zkie_core::common::mle::partial_eval(w, &proof.v);
+    let f_eval = zkie_core::common::mle::eval(&a_restricted, &proof.ch);
+    let h_eval = zkie_core::common::mle::eval(&b_restricted, &proof.ch);
     if !matmul_verify(&proof.matmul, &proof.ch, f_eval, h_eval) {
         return false;
     }
@@ -131,11 +131,11 @@ mod tests {
         let w: Vec<Goldilocks> = (0..k * n).map(|_| from_i64((rng.next_u64() % 100) as i64)).collect();
         let bias: Vec<Goldilocks> = (0..m * n).map(|_| from_i64((rng.next_u64() % 20) as i64 - 10)).collect();
         let h = matmul_full(&x, &w, m, k, n);
-        let out: Vec<Goldilocks> = (0..m * n).map(|ij| from_i64(div_round(crate::fixed_point::to_i64(h[ij]), 1i64 << shift) + crate::fixed_point::to_i64(bias[ij]))).collect();
+        let out: Vec<Goldilocks> = (0..m * n).map(|ij| from_i64(div_round(zkie_core::common::fixed_point::to_i64(h[ij]), 1i64 << shift) + zkie_core::common::fixed_point::to_i64(bias[ij]))).collect();
         let rem_off: Vec<Goldilocks> = (0..m * n).map(|ij| {
-            let h_i = crate::fixed_point::to_i64(h[ij]);
-            let o_i = crate::fixed_point::to_i64(out[ij]);
-            let b_i = crate::fixed_point::to_i64(bias[ij]);
+            let h_i = zkie_core::common::fixed_point::to_i64(h[ij]);
+            let o_i = zkie_core::common::fixed_point::to_i64(out[ij]);
+            let b_i = zkie_core::common::fixed_point::to_i64(bias[ij]);
             from_i64(h_i - (o_i - b_i) * (1i64 << shift) + (1i64 << (shift - 1)))
         }).collect();
         for &vv in &rem_off {
@@ -150,9 +150,9 @@ mod tests {
     }
     #[test]
     fn committed_projection_roundtrip() {
-        use crate::whir::Whir;
-        use crate::committed::commit;
-        use crate::matmul::{prove as mm_prove, verify as mm_verify};
+        use zkie_core::pcs::whir::Whir;
+        use zkie_core::pcs::committed::commit;
+        use zkie_core::common::matmul::{prove as mm_prove, verify as mm_verify};
         let mut rng = XorShift64::new(0xDD22);
         let (m, k, n) = (8usize, 8usize, 8usize);
         let shift = 4u32;
@@ -163,11 +163,11 @@ mod tests {
         let w: Vec<Goldilocks> = (0..k * n).map(|_| from_i64((rng.next_u64() % 100) as i64)).collect();
         let bias: Vec<Goldilocks> = (0..m * n).map(|_| from_i64((rng.next_u64() % 20) as i64 - 10)).collect();
         let h = matmul_full(&x, &w, m, k, n);
-        let out: Vec<Goldilocks> = (0..m * n).map(|ij| from_i64(div_round(crate::fixed_point::to_i64(h[ij]), 1i64 << shift) + crate::fixed_point::to_i64(bias[ij]))).collect();
+        let out: Vec<Goldilocks> = (0..m * n).map(|ij| from_i64(div_round(zkie_core::common::fixed_point::to_i64(h[ij]), 1i64 << shift) + zkie_core::common::fixed_point::to_i64(bias[ij]))).collect();
         let rem_off: Vec<Goldilocks> = (0..m * n).map(|ij| {
-            let h_i = crate::fixed_point::to_i64(h[ij]);
-            let o_i = crate::fixed_point::to_i64(out[ij]);
-            let b_i = crate::fixed_point::to_i64(bias[ij]);
+            let h_i = zkie_core::common::fixed_point::to_i64(h[ij]);
+            let o_i = zkie_core::common::fixed_point::to_i64(out[ij]);
+            let b_i = zkie_core::common::fixed_point::to_i64(bias[ij]);
             from_i64(h_i - (o_i - b_i) * (1i64 << shift) + (1i64 << (shift - 1)))
         }).collect();
         let mut at = vec![Goldilocks::from_u64(0); k * m];
@@ -192,16 +192,16 @@ mod tests {
         ap.extend_from_slice(&u);
         let (a_open, a_ev) = whir_km.open(c_at.prover_data.clone(), &c_at.protocol, &ap);
         assert_eq!(whir_km.verify(&c_at.commitment, &a_open, &c_at.protocol, &ap).unwrap(), a_ev);
-        assert_eq!(a_ev, crate::mle::eval(&x, &ap));
+        assert_eq!(a_ev, zkie_core::common::mle::eval(&x, &ap));
         let mut bp = v.clone();
         bp.extend_from_slice(&ch);
         let (b_open, b_ev) = whir_kn.open(c_w.prover_data.clone(), &c_w.protocol, &bp);
         assert_eq!(whir_kn.verify(&c_w.commitment, &b_open, &c_w.protocol, &bp).unwrap(), b_ev);
-        assert_eq!(b_ev, crate::mle::eval(&w, &bp));
+        assert_eq!(b_ev, zkie_core::common::mle::eval(&w, &bp));
         assert!(mm_verify(&mm, &ch, a_ev, b_ev));
         let mut pt = v.clone();
         pt.extend_from_slice(&u);
-        let eq = crate::mle::eq_evals(&pt);
+        let eq = zkie_core::common::mle::eq_evals(&pt);
         let ones = vec![Goldilocks::from_u64(1); m * n];
         let neg = from_i64(-1);
         let terms = vec![
@@ -212,7 +212,7 @@ mod tests {
             (neg * half, vec![0usize, 5usize]),
         ];
         let mles: Vec<&[Goldilocks]> = vec![&eq, &rem_off, &h, &out, &bias, &ones];
-        let affine_proof = crate::sumcheck::prove_virtual(&mles, &terms, Goldilocks::from_u64(0), &pt);
+        let affine_proof = zkie_core::common::sumcheck::prove_virtual(&mles, &terms, Goldilocks::from_u64(0), &pt);
         let rem_ev = {
             let (o, e) = whir_mn.open(c_rem.prover_data.clone(), &c_rem.protocol, &pt);
             assert_eq!(whir_mn.verify(&c_rem.commitment, &o, &c_rem.protocol, &pt).unwrap(), e);
@@ -228,7 +228,7 @@ mod tests {
             assert_eq!(whir_mn.verify(&c_bias.commitment, &o, &c_bias.protocol, &pt).unwrap(), e);
             e
         };
-        let fe = vec![crate::mle::eval(&eq, &pt), rem_ev, mm.claimed, out_ev, bias_ev, crate::mle::eval(&ones, &pt)];
-        assert!(crate::sumcheck::verify_virtual(&affine_proof, &terms, Goldilocks::from_u64(0), &pt, &fe));
+        let fe = vec![zkie_core::common::mle::eval(&eq, &pt), rem_ev, mm.claimed, out_ev, bias_ev, zkie_core::common::mle::eval(&ones, &pt)];
+        assert!(zkie_core::common::sumcheck::verify_virtual(&affine_proof, &terms, Goldilocks::from_u64(0), &pt, &fe));
     }
 }

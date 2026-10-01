@@ -4,8 +4,8 @@
 //! degree at most two, so the prover sends three coefficients per round.
 
 use rayon::prelude::*;
-use crate::field::{Field, Goldilocks, PrimeCharacteristicRing};
-use crate::fixed_point::from_i64;
+use crate::common::field::{Field, Goldilocks, PrimeCharacteristicRing};
+use crate::common::fixed_point::from_i64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RoundPoly {
@@ -28,7 +28,7 @@ pub struct SumcheckProof {
     pub h_eval: Goldilocks,
 }
 
-const INV2: Goldilocks = Goldilocks::new(crate::field::P / 2 + 1); // (p + 1) / 2
+const INV2: Goldilocks = Goldilocks::new(crate::common::field::P / 2 + 1); // (p + 1) / 2
 
 pub fn prove(f: &[Goldilocks], h: &[Goldilocks], _claimed_sum: Goldilocks, #[allow(unused_variables)] challenges: &[Goldilocks]) -> SumcheckProof {
     let t = f.len().trailing_zeros() as usize;
@@ -307,7 +307,7 @@ pub fn verify_sum_of_products(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::field::XorShift64;
+    use crate::common::field::XorShift64;
 
     #[test]
     fn sumcheck_completeness_and_soundness() {
@@ -319,8 +319,8 @@ mod tests {
         let challenges: Vec<Goldilocks> = (0..t).map(|_| rng.field()).collect();
 
         let proof = prove(&f, &h, true_sum, &challenges);
-        let f_eval = crate::mle::eval(&f, &challenges);
-        let h_eval = crate::mle::eval(&h, &challenges);
+        let f_eval = crate::common::mle::eval(&f, &challenges);
+        let h_eval = crate::common::mle::eval(&h, &challenges);
         assert!(verify(&proof, true_sum, &challenges, f_eval, h_eval));
 
         let wrong = true_sum + Goldilocks::ONE;
@@ -342,9 +342,9 @@ mod tests {
         let challenges: Vec<Goldilocks> = (0..t).map(|_| rng.field()).collect();
 
         let proof = prove3(&f, &g, &h, true_sum, &challenges);
-        let f_eval = crate::mle::eval(&f, &challenges);
-        let g_eval = crate::mle::eval(&g, &challenges);
-        let h_eval = crate::mle::eval(&h, &challenges);
+        let f_eval = crate::common::mle::eval(&f, &challenges);
+        let g_eval = crate::common::mle::eval(&g, &challenges);
+        let h_eval = crate::common::mle::eval(&h, &challenges);
         assert!(verify3(&proof, true_sum, &challenges, f_eval, g_eval, h_eval));
 
         let wrong = true_sum + Goldilocks::ONE;
@@ -468,7 +468,7 @@ pub fn verify_virtual(
 #[cfg(test)]
 mod virtual_tests {
     use super::*;
-    use crate::field::XorShift64;
+    use crate::common::field::XorShift64;
     #[test]
     fn virtual_sumcheck_roundtrip() {
         let mut rng = XorShift64::new(0xBEEF);
@@ -489,7 +489,7 @@ mod virtual_tests {
         let mles: Vec<&[Goldilocks]> = vec![&f, &g, &h];
         let proof = prove_virtual(&mles, &terms, claimed, &challenges);
         for (m, &ev) in mles.iter().zip(&proof.final_evals) {
-            let ev2 = crate::mle::eval(m, &challenges);
+            let ev2 = crate::common::mle::eval(m, &challenges);
             assert_eq!(ev, ev2);
         }
         assert!(verify_virtual(&proof, &terms, claimed, &challenges, &proof.final_evals));
@@ -504,8 +504,8 @@ mod virtual_tests {
         let f: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
         let t = n.trailing_zeros() as usize;
         let r: Vec<Goldilocks> = (0..t).map(|_| rng.field()).collect();
-        let eq: Vec<Goldilocks> = crate::mle::eq_evals(&r);
-        let claimed = crate::mle::eval(&f, &r);
+        let eq: Vec<Goldilocks> = crate::common::mle::eq_evals(&r);
+        let claimed = crate::common::mle::eval(&f, &r);
         let mles: Vec<&[Goldilocks]> = vec![&eq, &f];
         let terms = vec![(Goldilocks::ONE, vec![0usize, 1])];
         let challenges: Vec<Goldilocks> = r.clone();

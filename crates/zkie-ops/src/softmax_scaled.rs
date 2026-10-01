@@ -7,11 +7,11 @@
 //! `sum_j e_ij = sum_i`, rescale gives `sum_j out_ij * sum_i = sum_j e_ij`,
 //! so `sum_j out_ij = 1` (sum != 0).
 
-use crate::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64};
-use crate::fixed_point::from_i64;
-use crate::logup_gkr::{prove_lookup_fractional, verify_lookup_fractional, FractionalProof};
-use crate::mle;
-use crate::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
+use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64};
+use zkie_core::common::fixed_point::from_i64;
+use zkie_core::common::logup_gkr::{prove_lookup_fractional, verify_lookup_fractional, FractionalProof};
+use zkie_core::common::mle;
+use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
 
 pub struct SoftmaxScaledProof {
     pub lookup: FractionalProof,
@@ -64,7 +64,7 @@ pub fn prove_softmax_rounded(
     let sum_broadcast: Vec<Goldilocks> = (0..m * n).map(|idx| sum[idx / n]).collect();
     let rem: Vec<Goldilocks> = (0..m * n)
         .map(|ij| {
-            from_i64(crate::fixed_point::to_i64(e[ij]) * (1i64 << 16) - crate::fixed_point::to_i64(out[ij]) * crate::fixed_point::to_i64(sum_broadcast[ij]))
+            from_i64(zkie_core::common::fixed_point::to_i64(e[ij]) * (1i64 << 16) - zkie_core::common::fixed_point::to_i64(out[ij]) * zkie_core::common::fixed_point::to_i64(sum_broadcast[ij]))
         })
         .collect();
     let r_scale: Vec<Goldilocks> = (0..(m * n).trailing_zeros() as usize).map(|_| rng.field()).collect();
@@ -106,7 +106,7 @@ pub fn verify_softmax_rounded(
     let sum_broadcast: Vec<Goldilocks> = (0..m * n).map(|idx| sum[idx / n]).collect();
     let rem: Vec<Goldilocks> = (0..m * n)
         .map(|ij| {
-            from_i64(crate::fixed_point::to_i64(e[ij]) * (1i64 << 16) - crate::fixed_point::to_i64(out[ij]) * crate::fixed_point::to_i64(sum_broadcast[ij]))
+            from_i64(zkie_core::common::fixed_point::to_i64(e[ij]) * (1i64 << 16) - zkie_core::common::fixed_point::to_i64(out[ij]) * zkie_core::common::fixed_point::to_i64(sum_broadcast[ij]))
         })
         .collect();
     let two16 = Goldilocks::from_u64(1u64 << 16);

@@ -8,8 +8,8 @@
 //! a public parameter; the claim type is what lets that folding be data-driven
 //! rather than hand-wired per model structure.
 
-use crate::field::Goldilocks;
-use crate::mle;
+use crate::common::field::Goldilocks;
+use crate::common::mle;
 
 /// A tensor evaluated at a point: `eval == MLE(tensor)(point)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,16 +29,16 @@ impl Claim {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::field::PrimeCharacteristicRing;
+    use crate::common::field::PrimeCharacteristicRing;
 
     #[test]
     fn claim_evaluates_tensor_at_point() {
-        let mut rng = crate::field::XorShift64::new(0x0C0C);
+        let mut rng = crate::common::field::XorShift64::new(0x0C0C);
         let n = 1usize << 5;
         let f: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
         let point: Vec<Goldilocks> = (0..5).map(|_| rng.field()).collect();
         let c = Claim::new(&f, point.clone());
         assert_eq!(c.point, point);
-        assert_eq!(c.eval, crate::mle::eval(&f, &point));
+        assert_eq!(c.eval, crate::common::mle::eval(&f, &point));
     }
 }

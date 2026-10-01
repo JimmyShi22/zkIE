@@ -1,8 +1,8 @@
 //! logUp GKR: prove sum_i num[i]/den[i] == C via the fraction-addition tree
 //! with eq-weighted virtual sumchecks (DeepProve "fractional sumcheck").
-use crate::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64};
-use crate::fixed_point::from_i64;
-use crate::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
+use crate::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64};
+use crate::common::fixed_point::from_i64;
+use crate::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
 pub struct FractionalLayer {
     pub r: Vec<Goldilocks>,
     pub c: Goldilocks,
@@ -40,7 +40,7 @@ pub fn prove_fractional(num: &[Goldilocks], den: &[Goldilocks], rng: &mut XorShi
         let m = half.trailing_zeros() as usize;
         let r: Vec<Goldilocks> = (0..m).map(|_| rng.field()).collect();
         let c = rng.field();
-        let eq: Vec<Goldilocks> = crate::mle::eq_evals(&r);
+        let eq: Vec<Goldilocks> = crate::common::mle::eq_evals(&r);
         let mles: Vec<&[Goldilocks]> = vec![&eq, &next_num, &next_den, &num_low, &num_high, &den_low, &den_high];
         let terms = build_terms(c);
         let proof = prove_virtual(&mles, &terms, Goldilocks::from_u64(0), &r);
@@ -61,17 +61,17 @@ pub fn verify_fractional(proof: &FractionalProof, num: &[Goldilocks], den: &[Gol
         let den_high = &cur_den[half..];
         let next_num: Vec<Goldilocks> = (0..half).map(|s| num_low[s] * den_high[s] + num_high[s] * den_low[s]).collect();
         let next_den: Vec<Goldilocks> = (0..half).map(|s| den_low[s] * den_high[s]).collect();
-        let eq: Vec<Goldilocks> = crate::mle::eq_evals(&layer.r);
+        let eq: Vec<Goldilocks> = crate::common::mle::eq_evals(&layer.r);
         let mles: Vec<&[Goldilocks]> = vec![&eq, &next_num, &next_den, num_low, num_high, den_low, den_high];
         let terms = build_terms(layer.c);
         let final_evals = vec![
-            crate::mle::eval(&eq, &layer.r),
-            crate::mle::eval(&next_num, &layer.r),
-            crate::mle::eval(&next_den, &layer.r),
-            crate::mle::eval(num_low, &layer.r),
-            crate::mle::eval(num_high, &layer.r),
-            crate::mle::eval(den_low, &layer.r),
-            crate::mle::eval(den_high, &layer.r),
+            crate::common::mle::eval(&eq, &layer.r),
+            crate::common::mle::eval(&next_num, &layer.r),
+            crate::common::mle::eval(&next_den, &layer.r),
+            crate::common::mle::eval(num_low, &layer.r),
+            crate::common::mle::eval(num_high, &layer.r),
+            crate::common::mle::eval(den_low, &layer.r),
+            crate::common::mle::eval(den_high, &layer.r),
         ];
         if !verify_virtual(&layer.proof, &terms, Goldilocks::from_u64(0), &layer.r, &final_evals) {
             return false;
@@ -176,8 +176,8 @@ mod tests {
     }
     #[test]
     fn committed_lookup_roundtrip() {
-        use crate::whir::Whir;
-        use crate::committed::commit;
+        use crate::pcs::whir::Whir;
+        use crate::pcs::committed::commit;
         let mut rng = XorShift64::new(0xEE33);
         let n = 32usize;
         let t = 16usize;
@@ -193,6 +193,6 @@ mod tests {
         let r: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
         let (open, ev) = whir.open(c_y.prover_data.clone(), &c_y.protocol, &r);
         assert_eq!(whir.verify(&c_y.commitment, &open, &c_y.protocol, &r).unwrap(), ev);
-        assert_eq!(ev, crate::mle::eval(&y, &r));
+        assert_eq!(ev, crate::common::mle::eval(&y, &r));
     }
 }

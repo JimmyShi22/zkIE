@@ -6,7 +6,7 @@
 //! `(-P/2, P/2)` the field result is the integer result with no wrap, which is
 //! exactly the condition Goldilocks satisfies for int16 accumulation.
 
-use crate::field::{Goldilocks, P, PrimeCharacteristicRing, PrimeField64};
+use crate::common::field::{Goldilocks, P, PrimeCharacteristicRing, PrimeField64};
 
 pub fn from_i16(x: i16) -> Goldilocks {
     if x >= 0 {
@@ -72,7 +72,7 @@ pub fn to_i64(x: Goldilocks) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::field::XorShift64;
+    use crate::common::field::XorShift64;
 
     #[test]
     fn int16_roundtrip() {

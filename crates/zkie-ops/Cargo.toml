@@ -1,0 +1,11 @@
+[package]
+name = "zkie-ops"
+version = "0.1.0"
+edition = "2021"
+description = "zkIE op-level proof primitives"
+license = "Apache-2.0"
+
+[dependencies]
+rayon = "1.10"
+p3-maybe-rayon = { version = "0.7.0", features = ["parallel"] }
+zkie-core = { path = "../zkie-core" }

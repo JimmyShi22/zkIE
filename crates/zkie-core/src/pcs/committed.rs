@@ -5,8 +5,8 @@
 //! commitment plus the shared prover data and opening protocol for a group of
 //! same-size tables.
 
-use crate::field::Goldilocks;
-use crate::whir::{Commitment, OpeningProtocol, ProverData, Whir};
+use crate::common::field::Goldilocks;
+use crate::pcs::whir::{Commitment, OpeningProtocol, ProverData, Whir};
 
 /// A committed tensor (commitment + prover data + opening protocol).
 pub struct Committed {

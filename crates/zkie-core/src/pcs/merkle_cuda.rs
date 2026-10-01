@@ -28,9 +28,9 @@ use p3_merkle_tree::{MerkleCap, MerkleTree, MerkleTreeMmcs};
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
 
 #[cfg(feature = "cuda")]
-use crate::buffer::SharedBuffer;
+use crate::pcs::cuda_buffer::SharedBuffer;
 #[cfg(feature = "cuda")]
-use crate::ffi::{
+use crate::pcs::cuda_ffi::{
     cudaDeviceSynchronize, cudaMemcpy, cudaMemset, zkie_p2_compress_batch,
     zkie_p2_compress_scalar, zkie_p2_leaf_batch, zkie_p2_leaf_scalar,
     zkie_p2_upload_constants, CUDART_OK, MEMCPY_DEVICE_TO_HOST, MEMCPY_HOST_TO_DEVICE,
@@ -105,7 +105,7 @@ impl GpuMerkle {
             return None;
         }
         Some(Self {
-            arena: SharedBuffer::new(Mutex::new(crate::buffer::CudaBuffer::new(1 << 20)?)),
+            arena: SharedBuffer::new(Mutex::new(crate::pcs::cuda_buffer::CudaBuffer::new(1 << 20)?)),
         })
     }
 }

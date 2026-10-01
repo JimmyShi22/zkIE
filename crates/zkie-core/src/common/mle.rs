@@ -3,7 +3,7 @@
 //! Conventions: variable `0` is the least-significant bit of the flattened
 //! index; `partial_eval` fixes the *first* `fix.len()` variables.
 
-use crate::field::{Goldilocks, PrimeCharacteristicRing};
+use crate::common::field::{Goldilocks, PrimeCharacteristicRing};
 
 pub fn eval(values: &[Goldilocks], point: &[Goldilocks]) -> Goldilocks {
     let t = point.len();
@@ -69,7 +69,7 @@ pub fn eq_poly(r: &[Goldilocks], x: &[Goldilocks]) -> Goldilocks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::field::XorShift64;
+    use crate::common::field::XorShift64;
 
     #[test]
     fn partial_then_full_matches_full() {

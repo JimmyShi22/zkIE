@@ -131,26 +131,26 @@ pub fn compile_shard_dag(
 /// shard-DAG composer. This is the bridge between the autotuner's `Granularity`
 /// knob and the actual proof — the granularity is no longer just op counting.
 pub fn prove_model(
-    store: &mut crate::compose::Store,
-    ops: &[crate::compose::Op],
+    store: &mut zkie_ops::compose::Store,
+    ops: &[zkie_ops::compose::Op],
     granularity: Granularity,
     layers: usize,
-    rng: &mut crate::field::XorShift64,
-) -> crate::compose::ShardDagProof {
+    rng: &mut zkie_core::common::field::XorShift64,
+) -> zkie_ops::compose::ShardDagProof {
     let ops_per_shard = granularity.ops_per_shard(ops.len(), layers);
-    crate::compose::prove_shard_dag(store, ops, ops_per_shard, rng)
+    zkie_ops::compose::prove_shard_dag(store, ops, ops_per_shard, rng)
 }
 
 /// Verify a whole-model proof produced by [`prove_model`].
 pub fn verify_model(
-    store: &crate::compose::Store,
-    ops: &[crate::compose::Op],
+    store: &zkie_ops::compose::Store,
+    ops: &[zkie_ops::compose::Op],
     granularity: Granularity,
     layers: usize,
-    proof: &crate::compose::ShardDagProof,
+    proof: &zkie_ops::compose::ShardDagProof,
 ) -> bool {
     let ops_per_shard = granularity.ops_per_shard(ops.len(), layers);
-    crate::compose::verify_shard_dag(store, ops, ops_per_shard, proof)
+    zkie_ops::compose::verify_shard_dag(store, ops, ops_per_shard, proof)
 }
 
 /// Per-stage CPU costs. `Forward`/`Sumcheck` are per op; `Commit`/`Open` are per
@@ -389,9 +389,9 @@ mod tests {
 
     #[test]
     fn granularity_drives_real_shard_dag() {
-        use crate::compose::{Op, Store};
-        use crate::field::XorShift64;
-        use crate::fixed_point::from_i64;
+        use zkie_ops::compose::{Op, Store};
+        use zkie_core::common::field::XorShift64;
+        use zkie_core::common::fixed_point::from_i64;
 
         let mut rng = XorShift64::new(0x1313);
         let (m, d, shift) = (4usize, 8usize, 8u32);

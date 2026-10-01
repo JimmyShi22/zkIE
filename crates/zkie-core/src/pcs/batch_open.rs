@@ -5,10 +5,10 @@
 //! same-point opening (`open_batch_multi`) at a fresh point, so the FRI folding
 //! is paid once instead of N times.
 
-use crate::field::{Goldilocks, PrimeCharacteristicRing, XorShift64};
-use crate::mle;
-use crate::sumcheck;
-use crate::whir::Whir;
+use crate::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64};
+use crate::common::mle;
+use crate::common::sumcheck;
+use crate::pcs::whir::Whir;
 
 /// Prove + verify the batch opening. Returns true iff all `f_i(r_i) == y_i`.
 #[allow(clippy::too_many_arguments)]
@@ -74,7 +74,7 @@ pub fn batch_open(
 /// maps the i-th tensor to its table index in the batch (duplicates allowed, so
 /// the same table can be opened at several points). Pays one FRI proof.
 pub fn batch_open_committed(
-    batch: &crate::committed::BatchCtx,
+    batch: &crate::pcs::committed::BatchCtx,
     table_idxs: &[usize],
     tensors: &[Vec<Goldilocks>],
     points: &[Vec<Goldilocks>],
@@ -123,7 +123,7 @@ pub fn batch_open_committed(
 /// multi-point-to-single-point reduction, paying one FRI proof instead of one
 /// per point. Returns the verified evaluations `f(points[i])` in order.
 pub fn open_table_multi_point(
-    batch: &crate::committed::BatchCtx,
+    batch: &crate::pcs::committed::BatchCtx,
     table_idx: usize,
     tensor: &[Goldilocks],
     points: &[Vec<Goldilocks>],
@@ -173,8 +173,8 @@ pub fn open_table_multi_point(
 
 mod tests {
     use super::*;
-    use crate::field::XorShift64;
-    use crate::mle;
+    use crate::common::field::XorShift64;
+    use crate::common::mle;
 
     #[test]
     fn batch_open_completeness_and_soundness() {
@@ -199,8 +199,8 @@ mod tests {
 
     #[test]
     fn open_table_multi_point_completeness() {
-        use crate::committed::BatchCtx;
-        use crate::whir::Whir;
+        use crate::pcs::committed::BatchCtx;
+        use crate::pcs::whir::Whir;
         let mut rng = XorShift64::new(42);
         let d = 8usize;
         let tensor: Vec<Goldilocks> = (0..(1usize << d)).map(|_| rng.field()).collect();

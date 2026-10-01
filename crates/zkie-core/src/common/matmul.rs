@@ -5,8 +5,8 @@
 //! row-major (`k x m`), so fixing the row index reduces to `partial_eval` of
 //! the low bits.
 
-use crate::field::{Goldilocks, PrimeCharacteristicRing};
-use crate::{mle, sumcheck, sumcheck::SumcheckProof};
+use crate::common::field::{Goldilocks, PrimeCharacteristicRing};
+use crate::{common::mle, common::sumcheck, common::sumcheck::SumcheckProof};
 
 pub struct MatmulProof {
     pub claimed: Goldilocks,
@@ -117,7 +117,7 @@ pub fn verify_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::field::XorShift64;
+    use crate::common::field::XorShift64;
 
     fn mm(a: &[Goldilocks], b: &[Goldilocks], m: usize, k: usize, n: usize) -> Vec<Goldilocks> {
         let mut c = vec![Goldilocks::ZERO; m * n];
@@ -161,13 +161,13 @@ mod tests {
 
         let mut p_ak = ch_k.clone();
         p_ak.extend_from_slice(&u);
-        let a_eval = crate::mle::eval(&a, &p_ak); // A[u][ch_k]
+        let a_eval = crate::common::mle::eval(&a, &p_ak); // A[u][ch_k]
         let mut p_b = ch_n.clone();
         p_b.extend_from_slice(&ch_k);
-        let b_eval = crate::mle::eval(&b, &p_b); // B[ch_k][ch_n]
+        let b_eval = crate::common::mle::eval(&b, &p_b); // B[ch_k][ch_n]
         let mut p_d = l_pt.clone();
         p_d.extend_from_slice(&ch_n);
-        let d_eval = crate::mle::eval(&d, &p_d); // D[ch_n][l_pt]
+        let d_eval = crate::common::mle::eval(&d, &p_d); // D[ch_n][l_pt]
 
         assert!(verify_chain(&proof, &ch_n, &ch_k, a_eval, b_eval, d_eval));
         assert!(!verify_chain(&proof, &ch_n, &ch_k, a_eval, b_eval + Goldilocks::ONE, d_eval));

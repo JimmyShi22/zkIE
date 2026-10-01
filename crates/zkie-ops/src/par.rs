@@ -2,8 +2,8 @@
 //! global work-stealing pool so nested parallelism (parallel proof across layers
 //! calling parallel matmul inside) does not oversubscribe.
 
-use crate::field::{Goldilocks, PrimeCharacteristicRing};
-use crate::fixed_point::{from_i64, to_i64};
+use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing};
+use zkie_core::common::fixed_point::{from_i64, to_i64};
 use rayon::prelude::*;
 
 /// Row-parallel matrix multiplication over the `Goldilocks` field. This is the

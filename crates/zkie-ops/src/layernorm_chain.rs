@@ -3,11 +3,11 @@
 //! (affine). This is the last op type: a reduction + a lookup + an affine, the
 //! same shape as softmax, wired as one chain with virtual intermediates.
 
-use crate::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64};
-use crate::fixed_point::{from_i64, to_i64};
-use crate::logup_gkr::{prove_lookup_fractional, verify_lookup_fractional, FractionalProof};
-use crate::mle;
-use crate::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
+use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64};
+use zkie_core::common::fixed_point::{from_i64, to_i64};
+use zkie_core::common::logup_gkr::{prove_lookup_fractional, verify_lookup_fractional, FractionalProof};
+use zkie_core::common::mle;
+use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
 
 pub struct LayernormChainProof {
     pub mean_sq: VirtualProof,

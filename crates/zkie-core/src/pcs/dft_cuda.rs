@@ -21,9 +21,9 @@ use p3_matrix::dense::RowMajorMatrix;
 use p3_matrix::Matrix;
 
 #[cfg(feature = "cuda")]
-use crate::buffer::SharedBuffer;
+use crate::pcs::cuda_buffer::SharedBuffer;
 #[cfg(feature = "cuda")]
-use crate::ffi::{cudaDeviceSynchronize, cudaMemcpy, zkie_ntt_forward_goldilocks, CUDART_OK, MEMCPY_DEVICE_TO_HOST, MEMCPY_HOST_TO_DEVICE};
+use crate::pcs::cuda_ffi::{cudaDeviceSynchronize, cudaMemcpy, zkie_ntt_forward_goldilocks, CUDART_OK, MEMCPY_DEVICE_TO_HOST, MEMCPY_HOST_TO_DEVICE};
 
 #[cfg(feature = "cuda")]
 const P: u64 = 0xffffffff00000001;
@@ -70,9 +70,9 @@ impl CudaNtt {
     fn try_init() -> Option<Self> {
         const MAX_LG: u32 = 18;
         const SLOT: usize = 1 << MAX_LG;
-        let buf = SharedBuffer::new(Mutex::new(crate::buffer::CudaBuffer::new(1 << 20)?));
+        let buf = SharedBuffer::new(Mutex::new(crate::pcs::cuda_buffer::CudaBuffer::new(1 << 20)?));
         // MAX_LG+1 slots: lg 0..=18.
-        let tw_buf = SharedBuffer::new(Mutex::new(crate::buffer::CudaBuffer::new(
+        let tw_buf = SharedBuffer::new(Mutex::new(crate::pcs::cuda_buffer::CudaBuffer::new(
             SLOT * (MAX_LG as usize + 1),
         )?));
         Some(Self {

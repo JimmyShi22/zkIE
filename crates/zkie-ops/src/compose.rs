@@ -9,15 +9,15 @@
 //! the degenerate "whole model folded into one g" when `N` is the full depth, and
 //! the "one op per shard" case when `N == 1` (no internal binding).
 
-use crate::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64};
+use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64};
 use rayon::prelude::*;
-use crate::fixed_point::{from_i64, to_i64};
-use crate::matmul::{prove as matmul_prove, verify as matmul_verify, MatmulProof};
-use crate::mle;
+use zkie_core::common::fixed_point::{from_i64, to_i64};
+use zkie_core::common::matmul::{prove as matmul_prove, verify as matmul_verify, MatmulProof};
+use zkie_core::common::mle;
 use crate::projection::{prove_projection, verify_projection, ProjectionProof};
-use crate::same_poly::{prove_same_poly, verify_same_poly, SamePolyProof};
-use crate::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
-use crate::logup_gkr::{prove_lookup_fractional, verify_lookup_fractional, FractionalProof};
+use zkie_core::common::same_poly::{prove_same_poly, verify_same_poly, SamePolyProof};
+use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
+use zkie_core::common::logup_gkr::{prove_lookup_fractional, verify_lookup_fractional, FractionalProof};
 use crate::softmax_scaled::{prove_softmax_rounded, verify_softmax_rounded, SoftmaxRoundedProof};
 use crate::layernorm_chain::{prove_layernorm_chain, verify_layernorm_chain, LayernormChainProof};
 use crate::layer_norm_centered::{
@@ -1293,8 +1293,8 @@ pub fn verify_shard_dag(
 /// "boundary commit" form of cross-shard binding (the Commit/Open stages) that
 /// the plain `prove_shard_dag` defers.
 pub fn committed_cross_bind(
-    whir: &crate::whir::Whir,
-    committed: &crate::committed::Committed,
+    whir: &zkie_core::pcs::whir::Whir,
+    committed: &zkie_core::pcs::committed::Committed,
     tensor: &[Goldilocks],
     claims: &[(Vec<Goldilocks>, Goldilocks)],
     rng: &mut XorShift64,
@@ -1318,8 +1318,8 @@ pub fn committed_cross_bind(
 /// Verify a [`committed_cross_bind`] proof: open each claim against the
 /// commitment, then verify the merged `same_poly`.
 pub fn verify_committed_cross_bind(
-    whir: &crate::whir::Whir,
-    committed: &crate::committed::Committed,
+    whir: &zkie_core::pcs::whir::Whir,
+    committed: &zkie_core::pcs::committed::Committed,
     tensor: &[Goldilocks],
     claims: &[(Vec<Goldilocks>, Goldilocks)],
     proof: &SamePolyProof,
@@ -1347,7 +1347,7 @@ pub fn verify_committed_cross_bind(
 pub struct CommittedShardDagProof {
     pub shards: Vec<OpShardProof>,
     pub boundary_tensors: Vec<T>,
-    pub boundary_commitments: Vec<crate::committed::Committed>,
+    pub boundary_commitments: Vec<zkie_core::pcs::committed::Committed>,
     pub cross_binds: Vec<SamePolyProof>,
 }
 
@@ -1355,7 +1355,7 @@ pub fn prove_committed_shard_dag(
     store: &mut Store,
     ops: &[Op],
     ops_per_shard: usize,
-    whir: &crate::whir::Whir,
+    whir: &zkie_core::pcs::whir::Whir,
     rng: &mut XorShift64,
 ) -> CommittedShardDagProof {
     let plain = prove_shard_dag(store, ops, ops_per_shard, rng);
@@ -1363,7 +1363,7 @@ pub fn prove_committed_shard_dag(
 
     let mut boundary_commitments = Vec::with_capacity(boundary_tensors.len());
     for &t in &boundary_tensors {
-        boundary_commitments.push(crate::committed::commit(whir, store.get(t)));
+        boundary_commitments.push(zkie_core::pcs::committed::commit(whir, store.get(t)));
     }
 
     let mut cross_binds = Vec::with_capacity(boundary_tensors.len());
@@ -1393,7 +1393,7 @@ pub fn verify_committed_shard_dag(
     store: &Store,
     ops: &[Op],
     ops_per_shard: usize,
-    whir: &crate::whir::Whir,
+    whir: &zkie_core::pcs::whir::Whir,
     proof: &CommittedShardDagProof,
 ) -> bool {
     let ranges = shard_ranges(ops.len(), ops_per_shard);
@@ -1438,11 +1438,11 @@ pub fn verify_committed_shard_dag(
 /// weights commit": commit once, open per-use. The verifier opens a weight
 /// against this single commitment instead of trusting raw values.
 pub fn commit_weights_batch(
-    whir: &crate::whir::Whir,
+    whir: &zkie_core::pcs::whir::Whir,
     tensors: &[&[Goldilocks]],
-) -> crate::committed::BatchCtx {
+) -> zkie_core::pcs::committed::BatchCtx {
     let (commitment, prover_data, protocol, w) = whir.commit_batch(tensors);
-    crate::committed::BatchCtx {
+    zkie_core::pcs::committed::BatchCtx {
         commitment,
         prover_data,
         protocol,
@@ -1454,7 +1454,7 @@ pub fn commit_weights_batch(
 /// Open the `idx`-th weight of a batch commitment at `point` and verify it
 /// equals `tensor`'s MLE evaluation there.
 pub fn verify_weight_batch(
-    batch: &crate::committed::BatchCtx,
+    batch: &zkie_core::pcs::committed::BatchCtx,
     idx: usize,
     tensor: &[Goldilocks],
     point: &[Goldilocks],
@@ -1478,16 +1478,16 @@ pub fn verify_weight_batch(
 /// opened against their global batch commitments at the prescribed claim points.
 pub struct CommittedProjectionProof {
     pub plain: ProjectionProof,
-    pub w_open: (crate::whir::Proof, Goldilocks),
-    pub bias_open: (crate::whir::Proof, Goldilocks),
+    pub w_open: (zkie_core::pcs::whir::Proof, Goldilocks),
+    pub bias_open: (zkie_core::pcs::whir::Proof, Goldilocks),
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn prove_projection_committed(
     x: &[Goldilocks],
-    w_batch: &crate::committed::BatchCtx,
+    w_batch: &zkie_core::pcs::committed::BatchCtx,
     w_idx: usize,
-    bias_batch: &crate::committed::BatchCtx,
+    bias_batch: &zkie_core::pcs::committed::BatchCtx,
     bias_idx: usize,
     w: &[Goldilocks],
     bias: &[Goldilocks],
@@ -1525,9 +1525,9 @@ pub fn prove_projection_committed(
 pub fn verify_projection_committed(
     proof: &CommittedProjectionProof,
     x: &[Goldilocks],
-    w_batch: &crate::committed::BatchCtx,
+    w_batch: &zkie_core::pcs::committed::BatchCtx,
     w_idx: usize,
-    bias_batch: &crate::committed::BatchCtx,
+    bias_batch: &zkie_core::pcs::committed::BatchCtx,
     bias_idx: usize,
     w: &[Goldilocks],
     bias: &[Goldilocks],
@@ -1669,7 +1669,7 @@ pub fn build_gpt2_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::field::PrimeCharacteristicRing;
+    use zkie_core::common::field::PrimeCharacteristicRing;
 
     fn step(m: usize, k: usize, n: usize, shift: u32, rng: &mut XorShift64) -> ProjectionStep {
         let w: Vec<Goldilocks> = (0..k * n).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect();
@@ -1885,9 +1885,9 @@ mod tests {
 
     #[test]
     fn committed_cross_bind_roundtrip() {
-        use crate::committed::commit;
-        use crate::field::PrimeCharacteristicRing;
-        use crate::whir::Whir;
+        use zkie_core::pcs::committed::commit;
+        use zkie_core::common::field::PrimeCharacteristicRing;
+        use zkie_core::pcs::whir::Whir;
 
         let mut rng = XorShift64::new(0x1414);
         let n = 1usize << 6;
@@ -1915,8 +1915,8 @@ mod tests {
 
     #[test]
     fn committed_shard_dag_roundtrip() {
-        use crate::field::PrimeCharacteristicRing;
-        use crate::whir::Whir;
+        use zkie_core::common::field::PrimeCharacteristicRing;
+        use zkie_core::pcs::whir::Whir;
 
         let mut rng = XorShift64::new(0x1515);
         let (m, d, shift) = (4usize, 8usize, 8u32);
@@ -1955,8 +1955,8 @@ mod tests {
 
     #[test]
     fn global_weights_batch_commit_roundtrip() {
-        use crate::field::PrimeCharacteristicRing;
-        use crate::whir::Whir;
+        use zkie_core::common::field::PrimeCharacteristicRing;
+        use zkie_core::pcs::whir::Whir;
 
         let mut rng = XorShift64::new(0x1616);
         let n = 1usize << 6;
@@ -1980,8 +1980,8 @@ mod tests {
 
     #[test]
     fn committed_projection_roundtrip() {
-        use crate::field::PrimeCharacteristicRing;
-        use crate::whir::Whir;
+        use zkie_core::common::field::PrimeCharacteristicRing;
+        use zkie_core::pcs::whir::Whir;
 
         let mut rng = XorShift64::new(0x1717);
         let (m, d, shift) = (4usize, 8usize, 8u32);
@@ -2055,7 +2055,7 @@ mod tests {
     fn op_shard_attention_block_roundtrip() {
         // Single-head attention: Q/K/V projections -> scores = Q@K^T -> softmax
         // -> attn = probs@V, all folded into one g.
-        use crate::field::PrimeCharacteristicRing;
+        use zkie_core::common::field::PrimeCharacteristicRing;
         let mut rng = XorShift64::new(0x1A1A);
         let (m, d, dh, shift) = (4usize, 8usize, 4usize, 8u32);
         let table_len = 1usize << 8;
@@ -2105,7 +2105,7 @@ mod tests {
     fn op_shard_multihead_attention_roundtrip() {
         // 2-head attention: per-head Q/K/V -> Q@K^T -> softmax -> probs@V ->
         // per-head output projection, then sum heads.
-        use crate::field::PrimeCharacteristicRing;
+        use zkie_core::common::field::PrimeCharacteristicRing;
         let mut rng = XorShift64::new(0x1B1B);
         let (heads, m, d, shift) = (2usize, 4usize, 8usize, 8u32);
         let dh = d / heads;
@@ -2171,7 +2171,7 @@ mod tests {
     fn op_shard_prenorm_ffn_roundtrip() {
         // GPT-2 pre-norm FFN block: h = layernorm(x) -> fc = proj(h) ->
         // act = gelu(fc) -> proj2 = proj(act) -> out = x + proj2.
-        use crate::field::PrimeCharacteristicRing;
+        use zkie_core::common::field::PrimeCharacteristicRing;
         let mut rng = XorShift64::new(0x1C1C);
         let (m, d, ffn, shift) = (4usize, 8usize, 16usize, 8u32);
         let mut store = Store::new();
@@ -2213,7 +2213,7 @@ mod tests {
 
     #[test]
     fn build_gpt2_layer_roundtrip() {
-        use crate::field::PrimeCharacteristicRing;
+        use zkie_core::common::field::PrimeCharacteristicRing;
         let mut rng = XorShift64::new(0x1D1D);
         let (m, d, ffn, heads, shift) = (4usize, 8usize, 16usize, 2usize, 8u32);
         let table_len = 1usize << 8;
