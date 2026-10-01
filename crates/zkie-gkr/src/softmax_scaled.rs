@@ -8,6 +8,7 @@
 //! so `sum_j out_ij = 1` (sum != 0).
 
 use crate::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64};
+use crate::fixed_point::from_i64;
 use crate::logup_gkr::{prove_lookup_fractional, verify_lookup_fractional, FractionalProof};
 use crate::mle;
 use crate::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
@@ -21,6 +22,106 @@ pub struct SoftmaxScaledProof {
     pub r_sum: Vec<Goldilocks>,
     pub sum_ch: Vec<Goldilocks>,
     pub r_scale: Vec<Goldilocks>,
+}
+
+/// Rounded softmax output (GPT-2 semantics): `out = round(e * 2^16 / sum)` at
+/// scale 2^16, with `rem = e * 2^16 - out * sum` as a witness (not range-checked).
+pub struct SoftmaxRoundedProof {
+    pub lookup: FractionalProof,
+    pub row_sum: VirtualProof,
+    pub rescale: VirtualProof,
+    pub alpha: Goldilocks,
+    pub beta: Goldilocks,
+    pub r_sum: Vec<Goldilocks>,
+    pub sum_ch: Vec<Goldilocks>,
+    pub r_scale: Vec<Goldilocks>,
+}
+
+pub fn prove_softmax_rounded(
+    indices: &[u32],
+    e: &[Goldilocks],
+    out: &[Goldilocks],
+    table: &[Goldilocks],
+    m: usize,
+    n: usize,
+    rng: &mut XorShift64,
+) -> SoftmaxRoundedProof {
+    assert_eq!(indices.len(), m * n);
+    assert_eq!(e.len(), m * n);
+    assert_eq!(out.len(), m * n);
+
+    let alpha = rng.field();
+    let beta = rng.field();
+    let lookup = prove_lookup_fractional(indices, e, table, alpha, beta, rng);
+
+    let sum: Vec<Goldilocks> = (0..m).map(|i| (0..n).fold(Goldilocks::ZERO, |a, j| a + e[i * n + j])).collect();
+    let r_sum: Vec<Goldilocks> = (0..m.trailing_zeros() as usize).map(|_| rng.field()).collect();
+    let eq_i = mle::eq_evals(&r_sum);
+    let eq_broadcast: Vec<Goldilocks> = (0..m * n).map(|idx| eq_i[idx / n]).collect();
+    let sum_ch: Vec<Goldilocks> = (0..(m * n).trailing_zeros() as usize).map(|_| rng.field()).collect();
+    let row_sum = prove_virtual(&[&eq_broadcast, e], &[(Goldilocks::ONE, vec![0usize, 1usize])], mle::eval(&sum, &r_sum), &sum_ch);
+
+    let sum_broadcast: Vec<Goldilocks> = (0..m * n).map(|idx| sum[idx / n]).collect();
+    let rem: Vec<Goldilocks> = (0..m * n)
+        .map(|ij| {
+            from_i64(crate::fixed_point::to_i64(e[ij]) * (1i64 << 16) - crate::fixed_point::to_i64(out[ij]) * crate::fixed_point::to_i64(sum_broadcast[ij]))
+        })
+        .collect();
+    let r_scale: Vec<Goldilocks> = (0..(m * n).trailing_zeros() as usize).map(|_| rng.field()).collect();
+    let two16 = Goldilocks::from_u64(1u64 << 16);
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    // out * sum_broadcast - e * 2^16 - rem = 0
+    let rescale = prove_virtual(
+        &[out, e, &sum_broadcast, &rem],
+        &[
+            (Goldilocks::ONE, vec![0usize, 2usize]),
+            (neg * two16, vec![1usize]),
+            (Goldilocks::ONE, vec![3usize]),
+        ],
+        Goldilocks::ZERO,
+        &r_scale,
+    );
+
+    SoftmaxRoundedProof { lookup, row_sum, rescale, alpha, beta, r_sum, sum_ch, r_scale }
+}
+
+pub fn verify_softmax_rounded(
+    proof: &SoftmaxRoundedProof,
+    indices: &[u32],
+    e: &[Goldilocks],
+    out: &[Goldilocks],
+    table: &[Goldilocks],
+    m: usize,
+    n: usize,
+) -> bool {
+    if !verify_lookup_fractional(&proof.lookup, indices, e, table, proof.alpha, proof.beta) {
+        return false;
+    }
+    let sum: Vec<Goldilocks> = (0..m).map(|i| (0..n).fold(Goldilocks::ZERO, |a, j| a + e[i * n + j])).collect();
+    let eq_i = mle::eq_evals(&proof.r_sum);
+    let eq_broadcast: Vec<Goldilocks> = (0..m * n).map(|idx| eq_i[idx / n]).collect();
+    if !verify_virtual(&proof.row_sum, &[(Goldilocks::ONE, vec![0usize, 1usize])], mle::eval(&sum, &proof.r_sum), &proof.sum_ch, &[mle::eval(&eq_broadcast, &proof.sum_ch), mle::eval(e, &proof.sum_ch)]) {
+        return false;
+    }
+    let sum_broadcast: Vec<Goldilocks> = (0..m * n).map(|idx| sum[idx / n]).collect();
+    let rem: Vec<Goldilocks> = (0..m * n)
+        .map(|ij| {
+            from_i64(crate::fixed_point::to_i64(e[ij]) * (1i64 << 16) - crate::fixed_point::to_i64(out[ij]) * crate::fixed_point::to_i64(sum_broadcast[ij]))
+        })
+        .collect();
+    let two16 = Goldilocks::from_u64(1u64 << 16);
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    verify_virtual(
+        &proof.rescale,
+        &[
+            (Goldilocks::ONE, vec![0usize, 2usize]),
+            (neg * two16, vec![1usize]),
+            (Goldilocks::ONE, vec![3usize]),
+        ],
+        Goldilocks::ZERO,
+        &proof.r_scale,
+        &[mle::eval(out, &proof.r_scale), mle::eval(e, &proof.r_scale), mle::eval(&sum_broadcast, &proof.r_scale), mle::eval(&rem, &proof.r_scale)],
+    )
 }
 
 pub fn prove_softmax_scaled(

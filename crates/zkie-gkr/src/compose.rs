@@ -17,7 +17,7 @@ use crate::projection::{prove_projection, verify_projection, ProjectionProof};
 use crate::same_poly::{prove_same_poly, verify_same_poly, SamePolyProof};
 use crate::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
 use crate::logup_gkr::{prove_lookup_fractional, verify_lookup_fractional, FractionalProof};
-use crate::softmax_scaled::{prove_softmax_scaled, verify_softmax_scaled, SoftmaxScaledProof};
+use crate::softmax_scaled::{prove_softmax_rounded, verify_softmax_rounded, SoftmaxRoundedProof};
 use crate::layernorm_chain::{prove_layernorm_chain, verify_layernorm_chain, LayernormChainProof};
 use crate::layer_norm_centered::{
     layer_norm_forward as layer_norm_centered_forward,
@@ -635,7 +635,7 @@ pub enum OpProof {
     Projection(ProjectionProof),
     Add(VirtualProof, Vec<Goldilocks>),
     Lookup(FractionalProof, Goldilocks, Goldilocks),
-    Softmax(SoftmaxScaledProof),
+    Softmax(SoftmaxRoundedProof),
     SoftmaxIndex,
     GeluIndex,
     StableSoftmaxIndex,
@@ -743,7 +743,7 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                     .map(|i| (0..n).fold(Goldilocks::ZERO, |acc, j| acc + ev[i * n + j]))
                     .collect();
                 let o: Vec<Goldilocks> = (0..m * n)
-                    .map(|ij| ev[ij] * sum[ij / n].inverse())
+                    .map(|ij| from_i64(round_div(to_i64(ev[ij]) * (1i64 << 16), to_i64(sum[ij / n]))))
                     .collect();
                 store.v[e] = ev;
                 store.v[out] = o;
@@ -891,7 +891,7 @@ pub fn prove_shard(store: &mut Store, ops: &[Op], boundary: &[T], rng: &mut XorS
                 op_proofs.push(OpProof::Lookup(p, alpha, beta));
             }
             Op::Softmax { idx, e, out, table, m, n } => {
-                let p = prove_softmax_scaled(
+                let p = prove_softmax_rounded(
                     &store.idx[idx],
                     store.get(e),
                     store.get(out),
@@ -1057,7 +1057,7 @@ pub fn verify_shard(store: &Store, ops: &[Op], proof: &OpShardProof) -> bool {
                 }
             }
             (Op::Softmax { idx, e, out, table, m, n }, OpProof::Softmax(sp)) => {
-                if !verify_softmax_scaled(
+                if !verify_softmax_rounded(
                     sp,
                     &ws.idx[*idx],
                     ws.get(*e),
