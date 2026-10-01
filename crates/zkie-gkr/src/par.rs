@@ -48,17 +48,12 @@ pub fn mm_par_fixed(
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), k * n);
 
-    // Every value must be small (16-bit fixed point) for the i64 accumulation to
-    // be exact; otherwise fall back to the general field path.
-    const SMALL: i64 = 1 << 20;
-    let all_small = a
-        .iter()
-        .chain(b.iter())
-        .all(|&v| {
-            let x = to_i64(v);
-            x > -SMALL && x < SMALL
-        });
-    if !all_small {
+    // The i64 accumulation is exact only if the worst-case dot product fits in
+    // i64: max|a| * max|b| * k < 2^63. Otherwise fall back to the field path.
+    let max_a = a.iter().map(|&v| to_i64(v).unsigned_abs()).max().unwrap_or(0) as i128;
+    let max_b = b.iter().map(|&v| to_i64(v).unsigned_abs()).max().unwrap_or(0) as i128;
+    if max_a * max_b * (k as i128) >= (1i128 << 63) {
+        eprintln!("[mm_par_fixed] overflow fallback to field (m={} k={} n={}, max_a={} max_b={})", m, k, n, max_a, max_b);
         return mm_par(a, b, m, k, n, 64);
     }
 
@@ -66,12 +61,17 @@ pub fn mm_par_fixed(
     let bi: Vec<i64> = b.iter().map(|&v| to_i64(v)).collect();
     let mut c = vec![0i64; m * n];
     c.par_chunks_mut(n).enumerate().for_each(|(i, cij)| {
+        // "ikj" order: stream each row of B contiguously instead of striding
+        // across it (the naive ijk order thrashes the cache for large n).
         for j in 0..n {
-            let mut acc = 0i64;
-            for kk in 0..k {
-                acc += ai[i * k + kk] * bi[kk * n + j];
+            cij[j] = 0;
+        }
+        for kk in 0..k {
+            let a_val = ai[i * k + kk];
+            let brow = &bi[kk * n..(kk + 1) * n];
+            for j in 0..n {
+                cij[j] += a_val * brow[j];
             }
-            cij[j] = acc;
         }
     });
     c.into_iter().map(from_i64).collect()
