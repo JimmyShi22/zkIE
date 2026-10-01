@@ -1093,15 +1093,17 @@ pub fn prove_shard_precomputed(
                 claims.push((out, p.r_out.clone(), mle::eval(store.get(out), &p.r_out)));
                 op_proofs.push(OpProof::RoPE(p));
             }
-            Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, k: _ } => {
+            Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, k } => {
                 let p = prove_topk(
                     store.get(x),
                     store.get(sel),
+                    store.get(thr),
                     store.get(gate),
                     store.get(d1),
                     store.get(d2),
                     m,
                     n,
+                    k,
                     rng,
                 );
                 claims.push((x, p.r.clone(), mle::eval(store.get(x), &p.r)));
@@ -1311,8 +1313,8 @@ pub fn verify_shard_precomputed(store: &Store, ops: &[Op], proof: &OpShardProof)
                 }
                 claims.push((*out, p.r_out.clone(), mle::eval(ws.get(*out), &p.r_out)));
             }
-            (Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, k: _ }, OpProof::TopKSelect(p)) => {
-                if !verify_topk(p, ws.get(*x), ws.get(*sel), ws.get(*gate), ws.get(*d1), ws.get(*d2), *m, *n) {
+            (Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, k }, OpProof::TopKSelect(p)) => {
+                if !verify_topk(p, ws.get(*x), ws.get(*sel), ws.get(*thr), ws.get(*gate), ws.get(*d1), ws.get(*d2), *m, *n, *k) {
                     return false;
                 }
                 claims.push((*x, p.r.clone(), mle::eval(ws.get(*x), &p.r)));

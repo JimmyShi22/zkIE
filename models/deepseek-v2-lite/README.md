@@ -5,7 +5,9 @@ attention + MoE FFN) as an op-primitive shard DAG.
 
 The MoE is assembled lazily (only routed experts are opened) and the top-k
 routing is proven in-circuit: a `TopKSelect` op enforces the gate equals the
-softmax scores on the selected experts, so the gate is not a trusted constant.
+softmax scores on the selected experts, the selection is binary and
+threshold-consistent, and exactly `k=6` experts are selected per row, so the
+gate is not a trusted constant.
 
 ## Weights
 
@@ -32,7 +34,7 @@ cargo run --release -p zkie-models-deepseek-v2-lite --example bench
 
 | shards | prove | verify | argmax | peak RSS |
 | --- | --- | --- | --- | --- |
-| 21 (per layer) | 486.2 s (~8.1 min) | 270.5 s (~4.5 min) | 16/16 | ~242 GB |
+| 21 (per layer) | 489.8 s (~8.2 min) | 268.5 s (~4.5 min) | 16/16 | ~242 GB |
 
 Lazy expert opening (only routed experts) brings the op count down to 14638 and
 prove time to 486.2 s; the top-k routing is proven in-circuit.

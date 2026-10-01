@@ -121,7 +121,7 @@ is in [`docs/benchmarks.md`](docs/benchmarks.md).
 | TimesFM 1.0 200M | 200M / 200M | seq=16, 20 shards (per layer) | ~37.5 s | ~25.5 GB |
 | Gemma 3 270M | 270M / 270M | seq=16, 22 shards (per layer) | ~46.2 s | ~28 GB |
 | Gemma 3 270M | 270M / 270M | seq=512, 22 shards (per layer) | ~90.4 s | ~39 GB |
-| DeepSeek-V2-Lite | 2.4B / 15.7B | seq=16, 21 shards (lazy-open MoE, top-k routing) | ~486 s prove / ~271 s verify | ~242 GB |
+| DeepSeek-V2-Lite | 2.4B / 15.7B | seq=16, 21 shards (lazy-open MoE, top-k routing) | ~490 s prove / ~269 s verify | ~242 GB |
 | DeepSeek-V4.1-Flash | 8B/16B* / 552B | MoE + CSA2 + vision (planned) | - | - |
 
 * DeepSeek-V4.1-Flash active params: 8B prefill / 16B decode.
