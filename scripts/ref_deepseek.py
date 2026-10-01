@@ -11,7 +11,7 @@ import os
 import numpy as np
 
 from extract_deepseek import (
-    Sharded, H, VOCAB, HEADS, QK_NOPE, QK_ROPE, V_HEAD, KV_LORA,
+    Sharded, SCALE, H, VOCAB, HEADS, QK_NOPE, QK_ROPE, V_HEAD, KV_LORA,
     N_ROUTED, TOPK, MOE_INTER, DENSE_INTER, SHARED_INTER, ROPE_BASE, SEQ,
 )
 
@@ -100,6 +100,12 @@ def main():
             scores = softmax(logits, axis=-1)
             topi = np.argsort(-scores, axis=-1)[:, :TOPK]  # [seq,6]
             topw = np.take_along_axis(scores, topi, axis=-1)  # [seq,6]
+            gate = np.zeros((SEQ, N_ROUTED))
+            for t in range(SEQ):
+                for k in range(TOPK):
+                    gate[t, topi[t, k]] = topw[t, k]
+            np.clip(np.round(gate * SCALE), -(2 ** 31), 2 ** 31 - 1).astype(np.int32).tofile(
+                os.path.join(OUT, "L%d_gate_i32.bin" % L))
             mlp = np.zeros_like(h)
             for e in range(N_ROUTED):
                 eg = S.arr(p + "mlp.experts.%d.gate_proj.weight" % e).astype(np.float64)

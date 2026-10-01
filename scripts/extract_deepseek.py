@@ -119,10 +119,22 @@ def main():
 
     for L in range(LAYERS):
         p = "model.layers.%d." % L
-        save("L%d_q_w_i32.bin" % L, pad2(q(S.arr(p + "self_attn.q_proj.weight").T), H, Q_PAD))
-        save("L%d_kva_w_i32.bin" % L, pad2(q(S.arr(p + "self_attn.kv_a_proj_with_mqa.weight").T), H, KVA_PAD))
+        q_w = S.arr(p + "self_attn.q_proj.weight").astype(np.float64).reshape(HEADS, QK_NOPE + QK_ROPE, H)
+        q_nope = q_w[:, :QK_NOPE, :].reshape(HEADS * QK_NOPE, H)
+        q_pe = q_w[:, QK_NOPE:, :].reshape(HEADS * QK_ROPE, H)
+        save("L%d_qnope_w_i32.bin" % L, pad2(q(q_nope.T), H, HEADS * QK_NOPE))
+        save("L%d_qpe_w_i32.bin" % L, pad2(q(q_pe.T), H, HEADS * QK_ROPE))
+        kva = S.arr(p + "self_attn.kv_a_proj_with_mqa.weight").astype(np.float64)
+        kv_lora = kva[:KV_LORA]
+        k_pe = kva[KV_LORA:KV_LORA + QK_ROPE]
+        save("L%d_kvlora_w_i32.bin" % L, pad2(q(kv_lora.T), H, KV_LORA))
+        save("L%d_kpe_w_i32.bin" % L, pad2(q(k_pe.T), H, QK_ROPE))
         save("L%d_kva_ln_i32.bin" % L, pad1(q(S.arr(p + "self_attn.kv_a_layernorm.weight")), KV_LORA))
-        save("L%d_kvb_w_i32.bin" % L, pad2(q(S.arr(p + "self_attn.kv_b_proj.weight").T), KV_LORA, KVB))
+        kvb = S.arr(p + "self_attn.kv_b_proj.weight").astype(np.float64)
+        k_nope = kvb[:HEADS * QK_NOPE]
+        v = kvb[HEADS * QK_NOPE:]
+        save("L%d_knope_w_i32.bin" % L, pad2(q(k_nope.T), KV_LORA, HEADS * QK_NOPE))
+        save("L%d_v_w_i32.bin" % L, pad2(q(v.T), KV_LORA, HEADS * V_HEAD))
         save("L%d_o_w_i32.bin" % L, pad2(q(S.arr(p + "self_attn.o_proj.weight").T), O_DIM, H))
         save("L%d_in_norm_i32.bin" % L, pad1(q(S.arr(p + "input_layernorm.weight")), H))
         save("L%d_post_attn_norm_i32.bin" % L, pad1(q(S.arr(p + "post_attention_layernorm.weight")), H))
