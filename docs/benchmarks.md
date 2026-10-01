@@ -414,16 +414,19 @@ each shard's same-poly binding cost grows with shard size.
 ## DeepSeek-V2-Lite full model (op-primitive shard DAG) (2026-10-02)
 
 DeepSeek-V2-Lite (27 layers, MLA attention + DeepSeekMoE: 64 routed experts top-6
-+ 2 shared experts), sequence length 16, 20604 ops, proven through
++ 2 shared experts), sequence length 16, 14638 ops, proven through
 `compose::prove_shard_dag` with `same_poly` cross-shard binding. Release build,
-64-thread CPU. The MoE is currently assembled densely (all 64 experts computed,
-scaled by a precomputed top-6 gate); the top-k routing proof is deferred.
+64-thread CPU. The MoE is assembled lazily (only routed experts are opened), and
+the top-k routing is proven in-circuit: a `TopKSelect` op enforces that the gate
+equals the softmax scores on the selected experts (binary selection + threshold
+range checks), so the gate is no longer a trusted constant.
 
 | seq | shards | prove | verify | total | argmax | peak RSS |
 | --- | --- | --- | --- | --- | --- | --- |
-| 16 | 29 (per layer) | 806.7 s | - | ~13.4 min | 16/16 | ~272 GB |
+| 16 | 21 (per layer) | 486.2 s | 270.5 s | ~12.6 min | 16/16 | ~242 GB |
 
-The per-layer granularity (29 shards) is used; the dense MoE dominates both the
-op count (20604 ops) and peak memory. Lazy expert opening (commit-all /
-open-routed) is the next memory lever to bring the footprint toward the ~2.4B
-active-parameter count.
+Lazy expert opening drops the op count from 20604 (dense) to 14638 and peak
+memory from ~272 GB to ~242 GB, while prove time falls from 806.7 s to 486.2 s.
+The remaining footprint is still dominated by the committed expert weights;
+committing the full expert set while opening only the routed experts is the next
+lever toward the ~2.4B active-parameter count.

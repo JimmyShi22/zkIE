@@ -123,13 +123,18 @@ def main():
             ff = projection(act, dw)
         else:
             router = li("L%d_router_i32.bin" % L).reshape(H, N_ROUTED)
-            lg = (h2.astype(np.float64)/F) @ (router.astype(np.float64)/F)
-            s = np.exp(lg - lg.max(-1, keepdims=True)); s /= s.sum(-1, keepdims=True)
+            logits = (h2 @ router).astype(np.float64)
+            logits_16 = rd(logits, F)
+            row_max = logits_16.max(-1, keepdims=True)
+            shifted = np.clip((logits_16 - row_max) + (1 << 21), 0, (1 << 21) - 1).astype(np.int64)
+            ev = exp_t[shifted]
+            s = rd(ev * F, ev.sum(-1, keepdims=True))
             topi = np.argsort(-s, axis=-1)[:, :6]
             gate = np.zeros((16, N_ROUTED))
             for t in range(16):
                 gate[t, topi[t]] = s[t, topi[t]]
-            gate = np.clip(np.round(gate * F), -(2**31), 2**31-1).astype(np.int64)
+            gate = gate.astype(np.int64)
+            np.asarray(gate, dtype=np.int32).tofile(DS + "/L%d_gate_i32.bin" % L)
             eg = li("L%d_experts_gate_i32.bin" % L).reshape(N_ROUTED, H, MOE_PAD)
             eu = li("L%d_experts_up_i32.bin" % L).reshape(N_ROUTED, H, MOE_PAD)
             ed = li("L%d_experts_down_i32.bin" % L).reshape(N_ROUTED, MOE_PAD, H)

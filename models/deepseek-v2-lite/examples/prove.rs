@@ -6,7 +6,7 @@ use std::fs;
 use zkie_core::common::field::{Goldilocks, XorShift64};
 use zkie_core::common::fixed_point::{from_i32, to_i32, to_i64};
 use zkie_models_deepseek_v2_lite::{build_deepseek, VOCAB, VOCAB_PAD};
-use zkie_ops::compose::{prove_shard_dag, Store};
+use zkie_ops::compose::{prove_shard_dag, verify_shard_dag, Store};
 
 fn load_i32(path: &str) -> Vec<Goldilocks> {
     let bytes = fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
@@ -56,8 +56,11 @@ fn main() {
             matches += 1;
         }
     }
+    let t1 = std::time::Instant::now();
+    assert!(verify_shard_dag(&store, &ops, 718, &proof), "verify failed");
+    let verify_t = t1.elapsed();
     println!(
-        "prove {prove_t:?} shards={} argmax={matches}/{m} rss={}kB",
+        "prove {prove_t:?} verify {verify_t:?} shards={} argmax={matches}/{m} rss={}kB",
         proof.shards.len(),
         peak_rss_kb()
     );

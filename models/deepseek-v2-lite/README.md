@@ -3,9 +3,9 @@
 `zkie-models-deepseek-v2-lite` builds the DeepSeek-V2-Lite forward (MLA
 attention + MoE FFN) as an op-primitive shard DAG.
 
-The MoE is currently assembled densely (all 64 routed experts are computed and
-scaled by a precomputed top-6 gate); the top-k routing proof is not yet wired,
-so the gate is a trusted constant for now.
+The MoE is assembled lazily (only routed experts are opened) and the top-k
+routing is proven in-circuit: a `TopKSelect` op enforces the gate equals the
+softmax scores on the selected experts, so the gate is not a trusted constant.
 
 ## Weights
 
@@ -19,7 +19,7 @@ DS_SEQ=16 /usr/bin/python3.11 scripts/ref_deepseek.py
 
 `extract_deepseek.py` writes the padded int32 weights + RoPE/SiLU tables + `x0`
 under `models/deepseek-v2-lite/weights/` (~84 GB). `ref_deepseek.py` writes the
-per-layer routing gate and ground-truth argmax/logits.
+per-layer routing mask and ground-truth argmax/logits.
 
 ## Prove / benchmark
 
@@ -30,9 +30,9 @@ cargo run --release -p zkie-models-deepseek-v2-lite --example bench
 
 ## Benchmark (seq=16, release, 64-thread CPU)
 
-| shards | prove | argmax | peak RSS |
-| --- | --- | --- | --- |
-| 29 (per layer) | 806.7 s (~13.4 min) | 16/16 | ~272 GB |
+| shards | prove | verify | argmax | peak RSS |
+| --- | --- | --- | --- | --- |
+| 21 (per layer) | 486.2 s (~8.1 min) | 270.5 s (~4.5 min) | 16/16 | ~242 GB |
 
-The dense-MoE assembly (all 64 routed experts) drives the op count (20604 ops)
-and memory. The top-k routing proof and lazy expert opening are the next steps.
+Lazy expert opening (only routed experts) brings the op count down to 14638 and
+prove time to 486.2 s; the top-k routing is proven in-circuit.

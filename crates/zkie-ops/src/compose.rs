@@ -667,6 +667,16 @@ pub enum Op {
         n: usize,
         k: usize,
     },
+    ScaleGate {
+        x: T,
+        gate: T,
+        col: usize,
+        out: T,
+        m: usize,
+        n: usize,
+        h: usize,
+        shift: u32,
+    },
 }
 
 /// A proof for one op, kept heterogeneous because the primitives have different
@@ -689,6 +699,7 @@ pub enum OpProof {
     RmsNorm(RmsNormProof),
     RoPE(RoPEProof),
     TopKSelect(TopKSelectProof),
+    ScaleGate,
 }
 
 /// Upper-triangular causal mask as field values (`-(1<<30)` for `j > i`).
@@ -751,6 +762,18 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                     .iter()
                     .enumerate()
                     .map(|(i, &v)| from_i64(round_div(to_i64(v) * to_i64(sv[i % sv.len()]), 1i64 << shift)))
+                    .collect();
+                store.v[out] = o;
+            }
+            Op::ScaleGate { x, gate, col, out, m, n, h, shift } => {
+                let gv = store.get(gate);
+                let o: Vec<Goldilocks> = store.get(x)
+                    .iter()
+                    .enumerate()
+                    .map(|(ij, &v)| {
+                        let t = ij / h;
+                        from_i64(round_div(to_i64(v) * to_i64(gv[t * n + col]), 1i64 << shift))
+                    })
                     .collect();
                 store.v[out] = o;
             }
@@ -879,12 +902,12 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 store.v[out] = o;
             }
             Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, k } => {
-                let (thr_v, sel_v, _gate_v, d1_v, d2_v) = topk_forward(store.get(x), m, n, k);
+                let (thr_v, sel_v, gate_v, d1_v, d2_v) = topk_forward(store.get(x), m, n, k);
                 store.v[thr] = thr_v;
                 store.v[sel] = sel_v;
+                store.v[gate] = gate_v;
                 store.v[d1] = d1_v;
                 store.v[d2] = d2_v;
-                // gate is a committed input, verified == x * sel by the proof
             }
         }
     }
@@ -930,6 +953,9 @@ pub fn prove_shard_precomputed(
             }
             Op::ScaleVec { .. } => {
                 op_proofs.push(OpProof::ScaleVec);
+            }
+            Op::ScaleGate { .. } => {
+                op_proofs.push(OpProof::ScaleGate);
             }
             Op::Relu { .. } => {
                 op_proofs.push(OpProof::Relu);
@@ -1078,6 +1104,8 @@ pub fn prove_shard_precomputed(
                     n,
                     rng,
                 );
+                claims.push((x, p.r.clone(), mle::eval(store.get(x), &p.r)));
+                claims.push((sel, p.r.clone(), mle::eval(store.get(sel), &p.r)));
                 claims.push((gate, p.r.clone(), mle::eval(store.get(gate), &p.r)));
                 op_proofs.push(OpProof::TopKSelect(p));
             }
@@ -1139,6 +1167,7 @@ pub fn verify_shard_precomputed(store: &Store, ops: &[Op], proof: &OpShardProof)
             }
             (Op::Scale { .. }, OpProof::Scale) => {}
             (Op::ScaleVec { .. }, OpProof::ScaleVec) => {}
+            (Op::ScaleGate { .. }, OpProof::ScaleGate) => {}
             (Op::Relu { .. }, OpProof::Relu) => {}
             (Op::MatMul { a, b, c, m, k, n: _ }, OpProof::MatMul(mp, u, v, ch)) => {
                 let at = transpose(ws.get(*a), *m, *k);
@@ -1286,6 +1315,8 @@ pub fn verify_shard_precomputed(store: &Store, ops: &[Op], proof: &OpShardProof)
                 if !verify_topk(p, ws.get(*x), ws.get(*sel), ws.get(*gate), ws.get(*d1), ws.get(*d2), *m, *n) {
                     return false;
                 }
+                claims.push((*x, p.r.clone(), mle::eval(ws.get(*x), &p.r)));
+                claims.push((*sel, p.r.clone(), mle::eval(ws.get(*sel), &p.r)));
                 claims.push((*gate, p.r.clone(), mle::eval(ws.get(*gate), &p.r)));
             }
             _ => return false,

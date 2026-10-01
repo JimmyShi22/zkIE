@@ -49,10 +49,6 @@ fn broadcast(b: &[Goldilocks], rows: usize) -> Vec<Goldilocks> {
     (0..rows).flat_map(|_| b.iter().copied()).collect()
 }
 
-fn broadcast_token(b: &[Goldilocks], cols: usize) -> Vec<Goldilocks> {
-    (0..b.len()).flat_map(|t| (0..cols).map(move |_| b[t])).collect()
-}
-
 fn zeros(n: usize) -> Vec<Goldilocks> {
     vec![Goldilocks::ZERO; n]
 }
@@ -170,10 +166,8 @@ fn build_moe(
     exp_t: usize,
 ) -> usize {
     let dir = "models/deepseek-v2-lite/weights";
-    let gate = load_i32(&format!("{dir}/L{layer}_gate_i32.bin"));
+    let gate_mask = load_i32(&format!("{dir}/L{layer}_gate_i32.bin"));
 
-    // committed precomputed gate, verified against the computed top-k below
-    let gate_t = store.push(gate.clone());
     let router = load_i32(&format!("{dir}/L{layer}_router_i32.bin"));
     let router_t = store.push(router);
     let logits = store.push(vec![]);
@@ -188,9 +182,10 @@ fn build_moe(
     ops.push(Op::Softmax { idx: scores_idx, e: scores_e, out: scores, table: exp_t, m, n: N_ROUTED });
     let sel = store.push(vec![]);
     let thr = store.push(vec![]);
+    let gate = store.push(vec![]);
     let d1 = store.push(vec![]);
     let d2 = store.push(vec![]);
-    ops.push(Op::TopKSelect { x: scores, sel, thr, gate: gate_t, d1, d2, m, n: N_ROUTED, k: 6 });
+    ops.push(Op::TopKSelect { x: scores, sel, thr, gate, d1, d2, m, n: N_ROUTED, k: 6 });
     let shared_g = load_i32(&format!("{dir}/L{layer}_shared_gate_i32.bin"));
     let shared_u = load_i32(&format!("{dir}/L{layer}_shared_up_i32.bin"));
     let shared_d = load_i32(&format!("{dir}/L{layer}_shared_down_i32.bin"));
@@ -199,7 +194,7 @@ fn build_moe(
     let ed = load_i32(&format!("{dir}/L{layer}_experts_down_i32.bin"));
 
     let routed: Vec<usize> = (0..N_ROUTED)
-        .filter(|&e| (0..m).any(|t| gate[t * N_ROUTED + e] != Goldilocks::ZERO))
+        .filter(|&e| (0..m).any(|t| gate_mask[t * N_ROUTED + e] != Goldilocks::ZERO))
         .collect();
     let mut acc: Option<usize> = None;
     for expert in routed {
@@ -221,10 +216,8 @@ fn build_moe(
         ops.push(Op::Lookup { idx: silu_idx, out: silu, table: silu_t });
         ops.push(Op::ScaleVec { x: silu, scale: u, out: act, shift: 16 });
         ops.push(Op::Projection { x: act, w: ed_w, bias: store.push(zeros(m * H)), out: d, rem: d_rem, m, k: MOE_PAD, n: H, shift });
-        let gate_col: Vec<Goldilocks> = (0..m).map(|t| gate[t * N_ROUTED + expert]).collect();
-        let ge = store.push(broadcast_token(&gate_col, H));
         let weighted = store.push(vec![]);
-        ops.push(Op::ScaleVec { x: d, scale: ge, out: weighted, shift: 16 });
+        ops.push(Op::ScaleGate { x: d, gate, col: expert, out: weighted, m, n: N_ROUTED, h: H, shift: 16 });
         match acc {
             None => acc = Some(weighted),
             Some(a) => {
