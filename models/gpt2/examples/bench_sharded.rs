@@ -196,7 +196,7 @@ fn main() {
         let proof = prove_shard_dag(&mut store, &ops, ops_per_shard, &mut rng);
         let prove_t = t0.elapsed();
         let t1 = std::time::Instant::now();
-        assert!(verify_shard_dag(&store, &ops, ops_per_shard, &proof), "sharded proof failed");
+        assert!(verify_shard_dag(&mut store, &ops, ops_per_shard, &proof), "sharded proof failed");
         let verify_t = t1.elapsed();
 
         let logits = store.get(logits);

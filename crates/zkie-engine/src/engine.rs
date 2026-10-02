@@ -143,7 +143,7 @@ pub fn prove_model(
 
 /// Verify a whole-model proof produced by [`prove_model`].
 pub fn verify_model(
-    store: &zkie_ops::compose::Store,
+    store: &mut zkie_ops::compose::Store,
     ops: &[zkie_ops::compose::Op],
     granularity: Granularity,
     layers: usize,
@@ -418,10 +418,10 @@ mod tests {
 
         let p_op = prove_model(&mut store, &ops, Granularity::Ops(1), 1, &mut rng);
         assert_eq!(p_op.shards.len(), 4);
-        assert!(verify_model(&store, &ops, Granularity::Ops(1), 1, &p_op));
+        assert!(verify_model(&mut store, &ops, Granularity::Ops(1), 1, &p_op));
 
         let p_whole = prove_model(&mut store, &ops, Granularity::WholeModel, 1, &mut rng);
         assert_eq!(p_whole.shards.len(), 1);
-        assert!(verify_model(&store, &ops, Granularity::WholeModel, 1, &p_whole));
+        assert!(verify_model(&mut store, &ops, Granularity::WholeModel, 1, &p_whole));
     }
 }

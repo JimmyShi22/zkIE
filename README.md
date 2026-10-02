@@ -121,8 +121,8 @@ is in [`docs/benchmarks.md`](docs/benchmarks.md).
 | GPT-2 124M | 124M / 124M | seq=512, 13 shards (per layer) | **~34.3 s** | **~21.2 s** | ~42.5 GB |
 | Gemma 3 270M | 270M / 270M | seq=16, 22 shards (per layer) | ~33.6 s | ~16.9 s | ~24.3 GB |
 | Gemma 3 270M | 270M / 270M | seq=512, 22 shards (per layer) | ~58.5 s | ~38.6 s | ~34.4 GB |
-| DeepSeek-V2-Lite | 2.4B / 15.7B | seq=16, 21 shards (lazy-open MoE, mmap weights) | ~512.9 s | - | ~125.3 GB |
-| DeepSeek-V2-Lite | 2.4B / 15.7B | seq=512, 28 shards (lazy-open MoE, mmap weights) | ~1544.7 s (~25.7 min) | - | ~374.2 GB |
+| DeepSeek-V2-Lite | 2.4B / 15.7B | seq=16, 21 shards (lazy-open MoE, mmap weights) | ~515.2 s | ~268.1 s | ~124.9 GB |
+| DeepSeek-V2-Lite | 2.4B / 15.7B | seq=512, 28 shards (lazy-open MoE, mmap weights) | ~1547.3 s (~25.8 min) | ~1065.3 s (~17.8 min) | ~374.4 GB |
 | DeepSeek-V4.1-Flash | 8B/16B* / 552B | MoE + CSA2 + vision (planned) | - | - | - |
 
 * DeepSeek-V4.1-Flash active params: 8B prefill / 16B decode.

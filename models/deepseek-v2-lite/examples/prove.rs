@@ -66,7 +66,7 @@ fn main() {
     let _ = std::io::stdout().flush();
     if std::env::var("VERIFY").is_ok() {
         let t1 = std::time::Instant::now();
-        assert!(verify_shard_dag(&store, &ops, shard, &proof), "verify failed");
+        assert!(verify_shard_dag(&mut store, &ops, shard, &proof), "verify failed");
         println!("verify {:?}", t1.elapsed());
         let _ = std::io::stdout().flush();
     }

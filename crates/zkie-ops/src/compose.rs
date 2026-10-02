@@ -1386,7 +1386,7 @@ pub fn verify_shard_precomputed(store: &Store, ops: &[Op], proof: &OpShardProof)
         return false;
     }
     for (i, &t) in proof.bound.iter().enumerate() {
-        if verify_same_poly(&proof.binds[i], ws.get(t), &bound_claims[i]).is_none() {
+        if verify_same_poly(&proof.binds[i], store.get(t), &bound_claims[i]).is_none() {
             return false;
         }
     }
@@ -1469,7 +1469,7 @@ pub fn prove_shard_dag(
 }
 
 pub fn verify_shard_dag(
-    store: &Store,
+    store: &mut Store,
     ops: &[Op],
     ops_per_shard: usize,
     proof: &ShardDagProof,
@@ -1479,15 +1479,15 @@ pub fn verify_shard_dag(
         return false;
     }
 
-    // Recompute the witness to get fresh tensor values for binding evals.
-    let mut ws = Store { v: store.v.clone(), idx: store.idx.clone() };
-    forward_ops(&mut ws, ops);
+    // Recompute the witness in-place to get fresh tensor values for binding evals.
+    forward_ops(store, ops);
+    let store: &Store = &*store;
 
     // Verify each shard in parallel against the shared fresh witness.
     let all_ok = ranges
         .par_iter()
         .enumerate()
-        .map(|(i, &(s, e))| verify_shard_precomputed(&ws, &ops[s..e], &proof.shards[i]))
+        .map(|(i, &(s, e))| verify_shard_precomputed(store, &ops[s..e], &proof.shards[i]))
         .all(|ok| ok);
     if !all_ok {
         return false;
@@ -1517,9 +1517,9 @@ pub fn verify_shard_dag(
     for (ci, &t) in proof.cross_tensors.iter().enumerate() {
         let claims: Vec<(Vec<Goldilocks>, Goldilocks)> = by_tensor[&t]
             .iter()
-            .map(|pt| (pt.clone(), mle::eval(ws.get(t), pt)))
+            .map(|pt| (pt.clone(), mle::eval(store.get(t), pt)))
             .collect();
-        if verify_same_poly(&proof.cross_binds[ci], ws.get(t), &claims).is_none() {
+        if verify_same_poly(&proof.cross_binds[ci], store.get(t), &claims).is_none() {
             return false;
         }
     }
@@ -1664,7 +1664,7 @@ pub fn verify_committed_shard_dag(
         if !verify_committed_cross_bind(
             whir,
             &proof.boundary_commitments[i],
-            ws.get(t),
+            store.get(t),
             &claims,
             &proof.cross_binds[i],
         ) {
@@ -2116,11 +2116,11 @@ mod tests {
         let proof = prove_shard_dag(&mut store, &ops, 2, &mut rng);
         assert_eq!(proof.shards.len(), 2);
         assert_eq!(proof.cross_tensors.len(), 1, "only y2 spans the shard boundary");
-        assert!(verify_shard_dag(&store, &ops, 2, &proof));
+        assert!(verify_shard_dag(&mut store, &ops, 2, &proof));
 
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
         bad.get_mut(weights[1])[0] = bad.get_mut(weights[1])[0] + Goldilocks::ONE;
-        assert!(!verify_shard_dag(&bad, &ops, 2, &proof));
+        assert!(!verify_shard_dag(&mut bad, &ops, 2, &proof));
     }
 
     #[test]

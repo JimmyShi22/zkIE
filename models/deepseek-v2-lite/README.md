@@ -34,13 +34,13 @@ cargo run --release -p zkie-models-deepseek-v2-lite --example bench
 
 | seq | shards | prove | verify | argmax | peak RSS |
 | --- | --- | --- | --- | --- | --- |
-| 16 | 21 (per layer, mmap weights) | 512.4 s (~8.5 min) | - | 16/16 | ~126 GB |
-| 512 | 28 (per layer, mmap weights) | 1588.1 s (~26.5 min) | - | 512/512 | ~377 GB |
+| 16 | 21 (per layer, mmap weights) | 515.2 s (~8.6 min) | 268.1 s (~4.5 min) | 16/16 | ~124.9 GB |
+| 512 | 28 (per layer, mmap weights) | 1547.3 s (~25.8 min) | 1065.3 s (~17.8 min) | 512/512 | ~374.4 GB |
 
 Lazy expert opening (only routed experts) brings the op count down to 14638 at
 seq=16 and 19854 at seq=512; the top-k routing is proven in-circuit. At seq=512
 the top-6 routing spans 58 of 64 experts, so lazy opening approaches dense; the
 MoE expert weights are memory-mapped (file-backed, i32 read + converted on
 demand) so the full 64-thread pool runs without OOM (26.5 min instead of 77 min
-at 8 threads). `verify` is still skipped (it clones the full store, ~2x
+at 8 threads). `verify` recomputes the witness in-place (no store clone), so
 memory).
