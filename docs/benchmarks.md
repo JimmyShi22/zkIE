@@ -404,8 +404,8 @@ Gemma "1 + gamma" RMSNorm convention.
 
 | seq | shards | prove | verify | total | argmax | peak RSS |
 | --- | --- | --- | --- | --- | --- | --- |
-| 16 | 22 (per layer) | 29.9 s | 15.7 s | ~45.6 s (0.76 min) | 16/16 | ~28 GB |
-| 512 | 22 (per layer) | 53.4 s | 36.7 s | ~90.1 s (1.50 min) | 469/512 | ~39.5 GB |
+| 16 | 22 (per layer) | 33.6 s | 16.9 s | ~50.5 s (0.84 min) | 16/16 | ~24.3 GB |
+| 512 | 22 (per layer) | 58.5 s | 38.6 s | ~97.1 s (1.62 min) | 505/512 | ~34.4 GB |
 
 The per-layer granularity (22 shards) is the fastest of the swept
 configurations; coarser granularities (fewer, larger shards) are slower because

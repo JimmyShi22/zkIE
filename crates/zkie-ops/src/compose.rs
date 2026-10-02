@@ -750,14 +750,18 @@ pub fn causal_mask(m: usize) -> Vec<Goldilocks> {
 
 /// Piecewise rsqrt-table index for a 2^32-scale LayerNorm variance: the raw
 /// index is `round(var / 2^18)` (2^14 scale); indices below 2^20 are full
-/// resolution, larger ones are quantized with step 2^8.
+/// resolution, raw in [2^20, 2^30) use step 2^8, and raw >= 2^30 use step 2^16.
 pub fn rsqrt_index(var: i64) -> u32 {
     const FINE: i64 = 1 << 20;
+    const COARSE: i64 = 1 << 22;
+    const COARSE_END: i64 = FINE + COARSE * (1 << 8);
     let raw = round_div(var, 1 << 18);
     if raw < FINE {
         raw.max(0) as u32
-    } else {
+    } else if raw < COARSE_END {
         (FINE + ((raw - FINE) >> 8)) as u32
+    } else {
+        (FINE + COARSE + ((raw - COARSE_END) >> 16)) as u32
     }
 }
 
