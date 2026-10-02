@@ -27,7 +27,8 @@ fn peak_rss_kb() -> u64 {
 }
 
 fn main() {
-    let m = 16usize;
+    let m: usize = std::env::var("M").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let shard: usize = std::env::var("SHARD").ok().and_then(|v| v.parse().ok()).unwrap_or(718);
     let dir = "models/deepseek-v2-lite/weights";
     let mut store = Store::new();
     let mut ops = Vec::new();
@@ -37,7 +38,7 @@ fn main() {
     let gt = load_i32(&format!("{dir}/gt_argmax_i32.bin"));
     let mut rng = XorShift64::new(0xD5EED);
     let t0 = std::time::Instant::now();
-    let proof = prove_shard_dag(&mut store, &ops, 718, &mut rng);
+    let proof = prove_shard_dag(&mut store, &ops, shard, &mut rng);
     let prove_t = t0.elapsed();
 
     let lg = store.get(logits);
@@ -56,12 +57,17 @@ fn main() {
             matches += 1;
         }
     }
-    let t1 = std::time::Instant::now();
-    assert!(verify_shard_dag(&store, &ops, 718, &proof), "verify failed");
-    let verify_t = t1.elapsed();
     println!(
-        "prove {prove_t:?} verify {verify_t:?} shards={} argmax={matches}/{m} rss={}kB",
+        "prove {prove_t:?} shards={} argmax={matches}/{m} rss={}kB",
         proof.shards.len(),
         peak_rss_kb()
     );
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    if std::env::var("VERIFY").is_ok() {
+        let t1 = std::time::Instant::now();
+        assert!(verify_shard_dag(&store, &ops, shard, &proof), "verify failed");
+        println!("verify {:?}", t1.elapsed());
+        let _ = std::io::stdout().flush();
+    }
 }

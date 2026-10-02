@@ -30,11 +30,15 @@ cargo run --release -p zkie-models-deepseek-v2-lite --example prove
 cargo run --release -p zkie-models-deepseek-v2-lite --example bench
 ```
 
-## Benchmark (seq=16, release, 64-thread CPU)
+## Benchmark (release)
 
-| shards | prove | verify | argmax | peak RSS |
-| --- | --- | --- | --- | --- |
-| 21 (per layer) | 489.8 s (~8.2 min) | 268.5 s (~4.5 min) | 16/16 | ~242 GB |
+| seq | shards | prove | verify | argmax | peak RSS |
+| --- | --- | --- | --- | --- | --- |
+| 16 | 21 (per layer) | 489.8 s (~8.2 min) | 268.5 s (~4.5 min) | 16/16 | ~242 GB |
+| 512 | 28 (per layer, 8 threads) | 4621.9 s (~77 min) | - | 512/512 | ~397 GB |
 
-Lazy expert opening (only routed experts) brings the op count down to 14638 and
-prove time to 486.2 s; the top-k routing is proven in-circuit.
+Lazy expert opening (only routed experts) brings the op count down to 14638 at
+seq=16 and 19854 at seq=512; the top-k routing is proven in-circuit. At seq=512
+the top-6 routing spans 58 of 64 experts, so lazy opening approaches dense, and
+the prove is run with `RAYON_NUM_THREADS=8` (the default thread pool OOMs) and
+`verify` skipped (it clones the full store, ~2x memory).
