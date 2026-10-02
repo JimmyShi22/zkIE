@@ -189,18 +189,18 @@ fn build_moe(
     let shared_g = load_i32(&format!("{dir}/L{layer}_shared_gate_i32.bin"));
     let shared_u = load_i32(&format!("{dir}/L{layer}_shared_up_i32.bin"));
     let shared_d = load_i32(&format!("{dir}/L{layer}_shared_down_i32.bin"));
-    let eg = load_i32(&format!("{dir}/L{layer}_experts_gate_i32.bin"));
-    let eu = load_i32(&format!("{dir}/L{layer}_experts_up_i32.bin"));
-    let ed = load_i32(&format!("{dir}/L{layer}_experts_down_i32.bin"));
+    let eg = std::sync::Arc::new(zkie_core::common::weights_io::WeightMmap::open(&format!("{dir}/L{layer}_experts_gate_i32.bin")).unwrap());
+    let eu = std::sync::Arc::new(zkie_core::common::weights_io::WeightMmap::open(&format!("{dir}/L{layer}_experts_up_i32.bin")).unwrap());
+    let ed = std::sync::Arc::new(zkie_core::common::weights_io::WeightMmap::open(&format!("{dir}/L{layer}_experts_down_i32.bin")).unwrap());
 
     let routed: Vec<usize> = (0..N_ROUTED)
         .filter(|&e| (0..m).any(|t| gate_mask[t * N_ROUTED + e] != Goldilocks::ZERO))
         .collect();
     let mut acc: Option<usize> = None;
     for expert in routed {
-        let eg_w = store.push(eg[expert * H * MOE_PAD..(expert + 1) * H * MOE_PAD].to_vec());
-        let eu_w = store.push(eu[expert * H * MOE_PAD..(expert + 1) * H * MOE_PAD].to_vec());
-        let ed_w = store.push(ed[expert * MOE_PAD * H..(expert + 1) * MOE_PAD * H].to_vec());
+        let eg_w = store.push_mmap(eg.clone(), expert * H * MOE_PAD, H * MOE_PAD);
+        let eu_w = store.push_mmap(eu.clone(), expert * H * MOE_PAD, H * MOE_PAD);
+        let ed_w = store.push_mmap(ed.clone(), expert * MOE_PAD * H, MOE_PAD * H);
         let g = store.push(vec![]);
         let g_rem = store.push(vec![]);
         let u = store.push(vec![]);
