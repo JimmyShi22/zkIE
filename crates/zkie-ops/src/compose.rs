@@ -9,6 +9,10 @@
 //! the degenerate "whole model folded into one g" when `N` is the full depth, and
 //! the "one op per shard" case when `N == 1` (no internal binding).
 
+use std::borrow::Cow;
+use std::sync::Arc;
+
+use zkie_core::common::weights_io::WeightMmap;
 use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64};
 use rayon::prelude::*;
 use zkie_core::common::fixed_point::{from_i64, to_i64};
@@ -506,11 +510,19 @@ pub fn verify_residual_chain(
 /// Tensor id in the shard's tensor store.
 pub type T = usize;
 
+/// A tensor datum: owned (activations, small weights) or a memory-mapped i32
+/// weight slice that is converted to Goldilocks on demand.
+#[derive(Clone)]
+pub enum TensorData {
+    Owned(Vec<Goldilocks>),
+    Mmap { mmap: Arc<WeightMmap>, start: usize, len: usize },
+}
+
 /// A shard's tensor store: `v[id]` is a Goldilocks tensor; `idx[id]` is an
 /// integer index tensor (used by `Lookup`).
 #[derive(Default)]
 pub struct Store {
-    pub v: Vec<Vec<Goldilocks>>,
+    pub v: Vec<TensorData>,
     pub idx: Vec<Vec<u32>>,
 }
 
@@ -520,7 +532,12 @@ impl Store {
     }
     pub fn push(&mut self, t: Vec<Goldilocks>) -> T {
         let id = self.v.len();
-        self.v.push(t);
+        self.v.push(TensorData::Owned(t));
+        id
+    }
+    pub fn push_mmap(&mut self, mmap: Arc<WeightMmap>, start: usize, len: usize) -> T {
+        let id = self.v.len();
+        self.v.push(TensorData::Mmap { mmap, start, len });
         id
     }
     pub fn push_idx(&mut self, t: Vec<u32>) -> T {
@@ -529,7 +546,16 @@ impl Store {
         id
     }
     pub fn get(&self, id: T) -> &[Goldilocks] {
-        &self.v[id]
+        match &self.v[id] {
+            TensorData::Owned(v) => v,
+            TensorData::Mmap { .. } => panic!("get() on mmap-backed tensor; use materialize()"),
+        }
+    }
+    pub fn materialize(&self, id: T) -> Cow<'_, [Goldilocks]> {
+        match &self.v[id] {
+            TensorData::Owned(v) => Cow::Borrowed(v),
+            TensorData::Mmap { mmap, start, len } => Cow::Owned(mmap.read_goldilocks(*start, *len)),
+        }
     }
 }
 
@@ -747,14 +773,14 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
     for op in ops.iter().cloned() {
         match op {
             Op::Transpose { x, out, m, k } => {
-                store.v[out] = transpose(store.get(x), m, k);
+                store.v[out] = TensorData::Owned(transpose(store.get(x), m, k));
             }
             Op::Scale { x, out, factor, shift } => {
                 let o: Vec<Goldilocks> = store.get(x)
                     .iter()
                     .map(|&v| from_i64(round_div(to_i64(v) * factor, 1i64 << shift)))
                     .collect();
-                store.v[out] = o;
+                store.v[out] = TensorData::Owned(o);
             }
             Op::ScaleVec { x, scale, out, shift } => {
                 let sv = store.get(scale);
@@ -763,7 +789,7 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                     .enumerate()
                     .map(|(i, &v)| from_i64(round_div(to_i64(v) * to_i64(sv[i % sv.len()]), 1i64 << shift)))
                     .collect();
-                store.v[out] = o;
+                store.v[out] = TensorData::Owned(o);
             }
             Op::ScaleGate { x, gate, col, out, m, n, h, shift } => {
                 let gv = store.get(gate);
@@ -775,21 +801,23 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                         from_i64(round_div(to_i64(v) * to_i64(gv[t * n + col]), 1i64 << shift))
                     })
                     .collect();
-                store.v[out] = o;
+                store.v[out] = TensorData::Owned(o);
             }
             Op::Relu { x, out } => {
                 let o: Vec<Goldilocks> = store.get(x)
                     .iter()
                     .map(|&v| if to_i64(v) > 0 { v } else { Goldilocks::ZERO })
                     .collect();
-                store.v[out] = o;
+                store.v[out] = TensorData::Owned(o);
             }
             Op::MatMul { a, b, c, m, k, n } => {
-                let cval = crate::par::mm_par_fixed(store.get(a), store.get(b), m, k, n);
-                store.v[c] = cval;
+                let bv = store.materialize(b);
+                let cval = crate::par::mm_par_fixed(store.get(a), bv.as_ref(), m, k, n);
+                store.v[c] = TensorData::Owned(cval);
             }
             Op::Projection { x, w, bias, out, rem, m, k, n, shift } => {
-                let h = crate::par::mm_par_fixed(store.get(x), store.get(w), m, k, n);
+                let wv = store.materialize(w);
+                let h = crate::par::mm_par_fixed(store.get(x), wv.as_ref(), m, k, n);
                 let o: Vec<Goldilocks> = (0..m * n)
                     .map(|ij| {
                         from_i64(round_div(to_i64(h[ij]), 1i64 << shift) + to_i64(store.get(bias)[ij]))
@@ -803,8 +831,8 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                         )
                     })
                     .collect();
-                store.v[out] = o;
-                store.v[rem] = r;
+                store.v[out] = TensorData::Owned(o);
+                store.v[rem] = TensorData::Owned(r);
             }
             Op::Add { a, b, c } => {
                 let s: Vec<Goldilocks> = store.get(a)
@@ -812,14 +840,14 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                     .zip(store.get(b))
                     .map(|(x, y)| *x + *y)
                     .collect();
-                store.v[c] = s;
+                store.v[c] = TensorData::Owned(s);
             }
             Op::Lookup { idx, out, table } => {
                 let o: Vec<Goldilocks> = store.idx[idx]
                     .iter()
                     .map(|&i| store.get(table)[i as usize])
                     .collect();
-                store.v[out] = o;
+                store.v[out] = TensorData::Owned(o);
             }
             Op::Softmax { idx, e, out, table, m, n } => {
                 let ev: Vec<Goldilocks> = store.idx[idx]
@@ -832,8 +860,8 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 let o: Vec<Goldilocks> = (0..m * n)
                     .map(|ij| from_i64(round_div(to_i64(ev[ij]) * (1i64 << 16), to_i64(sum[ij / n]))))
                     .collect();
-                store.v[e] = ev;
-                store.v[out] = o;
+                store.v[e] = TensorData::Owned(ev);
+                store.v[out] = TensorData::Owned(o);
             }
             Op::SoftmaxIndex { x, out, table_len } => {
                 let indices: Vec<u32> = store.get(x)
@@ -884,30 +912,30 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 let rsqrt: Vec<Goldilocks> = rsqrt_idx.iter().map(|&i| table[i as usize]).collect();
                 let scale: Vec<Goldilocks> = (0..m * d).map(|ij| rsqrt[ij / d] * wv[ij]).collect();
                 let o: Vec<Goldilocks> = (0..m * d).map(|ij| xv[ij] * scale[ij] + bv[ij]).collect();
-                store.v[out] = o;
+                store.v[out] = TensorData::Owned(o);
             }
             Op::LayerNormCentered { x, w, b, out, rsqrt_table, m, d, n_real } => {
                 let (_, _, _, _, _, o, _, _, _, _, _) =
                     layer_norm_centered_forward(store.get(x), store.get(w), store.get(b), store.get(rsqrt_table), m, d, n_real);
-                store.v[out] = o;
+                store.v[out] = TensorData::Owned(o);
             }
             Op::RmsNorm { x, w, out, rsqrt_table, m, d, n_real } => {
                 let (_, _, _, o, _, _, _) =
                     rms_norm_forward(store.get(x), store.get(w), store.get(rsqrt_table), m, d, n_real);
-                store.v[out] = o;
+                store.v[out] = TensorData::Owned(o);
             }
             Op::RoPE { x, cos, sin, out, m, d, shift } => {
                 let (o, _, _) =
                     rope_forward(store.get(x), store.get(cos), store.get(sin), m, d, shift);
-                store.v[out] = o;
+                store.v[out] = TensorData::Owned(o);
             }
             Op::TopKSelect { x, sel, thr, gate, d1, d2, m, n, k } => {
                 let (thr_v, sel_v, gate_v, d1_v, d2_v) = topk_forward(store.get(x), m, n, k);
-                store.v[thr] = thr_v;
-                store.v[sel] = sel_v;
-                store.v[gate] = gate_v;
-                store.v[d1] = d1_v;
-                store.v[d2] = d2_v;
+                store.v[thr] = TensorData::Owned(thr_v);
+                store.v[sel] = TensorData::Owned(sel_v);
+                store.v[gate] = TensorData::Owned(gate_v);
+                store.v[d1] = TensorData::Owned(d1_v);
+                store.v[d2] = TensorData::Owned(d2_v);
             }
         }
     }
@@ -962,25 +990,27 @@ pub fn prove_shard_precomputed(
             }
             Op::MatMul { a, b, c, m, k, n } => {
                 let at = transpose(store.get(a), m, k);
+                let bv = store.materialize(b);
                 let u: Vec<Goldilocks> = (0..m.trailing_zeros() as usize).map(|_| rng.field()).collect();
                 let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
                 let ch: Vec<Goldilocks> = (0..k.trailing_zeros() as usize).map(|_| rng.field()).collect();
-                let p = matmul_prove(&at, store.get(b), store.get(c), m, k, n, &u, &v, &ch);
+                let p = matmul_prove(&at, bv.as_ref(), store.get(c), m, k, n, &u, &v, &ch);
                 let mut ap = ch.clone();
                 ap.extend_from_slice(&u);
                 claims.push((a, ap.clone(), mle::eval(store.get(a), &ap)));
                 let mut bp = v.clone();
                 bp.extend_from_slice(&ch);
-                claims.push((b, bp.clone(), mle::eval(store.get(b), &bp)));
+                claims.push((b, bp.clone(), mle::eval(bv.as_ref(), &bp)));
                 let mut cp = v.clone();
                 cp.extend_from_slice(&u);
                 claims.push((c, cp.clone(), mle::eval(store.get(c), &cp)));
                 op_proofs.push(OpProof::MatMul(p, u, v, ch));
             }
             Op::Projection { x, w, bias, out, rem, m, k, n, shift } => {
+                let wv = store.materialize(w);
                 let p = prove_projection(
                     store.get(x),
-                    store.get(w),
+                    wv.as_ref(),
                     store.get(bias),
                     store.get(out),
                     store.get(rem),
@@ -1174,7 +1204,8 @@ pub fn verify_shard_precomputed(store: &Store, ops: &[Op], proof: &OpShardProof)
             (Op::MatMul { a, b, c, m, k, n: _ }, OpProof::MatMul(mp, u, v, ch)) => {
                 let at = transpose(ws.get(*a), *m, *k);
                 let a_restricted = mle::partial_eval(&at, u);
-                let b_restricted = mle::partial_eval(ws.get(*b), v);
+                let bv = ws.materialize(*b);
+                let b_restricted = mle::partial_eval(bv.as_ref(), v);
                 let f_eval = mle::eval(&a_restricted, ch);
                 let h_eval = mle::eval(&b_restricted, ch);
                 if !matmul_verify(mp, ch, f_eval, h_eval) {
@@ -1185,7 +1216,7 @@ pub fn verify_shard_precomputed(store: &Store, ops: &[Op], proof: &OpShardProof)
                 claims.push((*a, ap.clone(), mle::eval(ws.get(*a), &ap)));
                 let mut bp = v.clone();
                 bp.extend_from_slice(ch);
-                claims.push((*b, bp.clone(), mle::eval(ws.get(*b), &bp)));
+                claims.push((*b, bp.clone(), mle::eval(bv.as_ref(), &bp)));
                 let mut cp = v.clone();
                 cp.extend_from_slice(u);
                 claims.push((*c, cp.clone(), mle::eval(ws.get(*c), &cp)));
@@ -1194,10 +1225,11 @@ pub fn verify_shard_precomputed(store: &Store, ops: &[Op], proof: &OpShardProof)
                 Op::Projection { x, w, bias, out, rem, m, k, n, shift },
                 OpProof::Projection(pp),
             ) => {
+                let wv = ws.materialize(*w);
                 if !verify_projection(
                     pp,
                     ws.get(*x),
-                    ws.get(*w),
+                    wv.as_ref(),
                     ws.get(*bias),
                     ws.get(*out),
                     ws.get(*rem),

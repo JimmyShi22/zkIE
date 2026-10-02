@@ -425,12 +425,13 @@ row, so the gate is no longer a trusted constant.
 | seq | shards | prove | verify | total | argmax | peak RSS |
 | --- | --- | --- | --- | --- | --- | --- |
 | 16 | 21 (per layer) | 489.8 s | 268.5 s | ~12.6 min | 16/16 | ~242 GB |
-| 512 | 28 (per layer, 8 threads) | 4621.9 s | - | ~77 min | 512/512 | ~397 GB |
+| 512 | 28 (per layer, mmap weights) | 1588.1 s | - | ~26.5 min | 512/512 | ~377 GB |
 
 Lazy expert opening drops the op count from 20604 (dense) to 14638 at seq=16
 (19854 at seq=512) and peak memory from ~272 GB to ~242 GB at seq=16. At seq=512
 the top-6 routing spans 58 of 64 experts, so lazy opening approaches dense; the
-prove runs with `RAYON_NUM_THREADS=8` (the default thread pool OOMs at this
-sequence length) and `verify` is skipped because it clones the full store (~2x
-memory). Committing the full expert set while opening only the routed experts is
-the next lever toward the ~2.4B active-parameter count.
+MoE expert weights are memory-mapped (file-backed, i32 read + converted on
+demand), so the kernel pages them in/out instead of keeping them resident. That
+lets the full 64-thread pool run without OOM, cutting prove from ~77 min (8
+threads) to ~26.5 min. `verify` is still skipped because it clones the full
+store (~2x memory).
