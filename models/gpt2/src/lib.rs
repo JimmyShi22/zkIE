@@ -5,9 +5,11 @@
 //! `models/gpt2/weights/` (i32 fixed-point `.bin` files).
 
 use std::fs;
+use std::sync::Arc;
 
 use zkie_core::common::field::{Goldilocks, XorShift64};
 use zkie_core::common::fixed_point::from_i32;
+use zkie_core::common::weights_io::WeightMmap;
 use zkie_ops::compose::{causal_mask, Op, Store};
 
 pub const D: usize = 1024;
@@ -64,9 +66,9 @@ pub fn build_layer(
     let ln1_b = load_i32(&format!("{dir}/L{layer}_ln1_b_i32.bin"));
     let ln2_w = load_i32(&format!("{dir}/L{layer}_ln2_w_i32.bin"));
     let ln2_b = load_i32(&format!("{dir}/L{layer}_ln2_b_i32.bin"));
-    let fc_w = load_i32(&format!("{dir}/L{layer}_fc_w_i32.bin"));
+    let fc_w = Arc::new(WeightMmap::open(&format!("{dir}/L{layer}_fc_w_i32.bin")).unwrap());
     let fc_b = load_i32(&format!("{dir}/L{layer}_fc_b_i32.bin"));
-    let proj_w = load_i32(&format!("{dir}/L{layer}_proj_w_i32.bin"));
+    let proj_w = Arc::new(WeightMmap::open(&format!("{dir}/L{layer}_proj_w_i32.bin")).unwrap());
     let proj_b = load_i32(&format!("{dir}/L{layer}_proj_b_i32.bin"));
 
     let table_len = 1usize << 21;
@@ -134,9 +136,9 @@ pub fn build_layer(
     let ln2_b_t = store.push(broadcast(&ln2_b, m));
     let h2 = store.push(vec![]);
     ops.push(Op::LayerNormCentered { x: x2, w: ln2_w_t, b: ln2_b_t, out: h2, rsqrt_table: rsqrt_t, m, d: D, n_real: N_REAL });
-    let fc_w_t = store.push(fc_w);
+    let fc_w_t = store.push_mmap(fc_w.clone(), 0, fc_w.len());
     let fc_b_t = store.push(broadcast(&fc_b, m));
-    let proj_w_t = store.push(proj_w);
+    let proj_w_t = store.push_mmap(proj_w.clone(), 0, proj_w.len());
     let proj_b_t = store.push(broadcast(&proj_b, m));
     let fc = store.push(vec![]);
     let fc_rem = store.push(vec![]);
@@ -162,7 +164,7 @@ pub fn build_gpt2(store: &mut Store, ops: &mut Vec<Op>, dir: &str, m: usize, shi
     let embedding = load_i32(&format!("{dir}/embedding_i32.bin"));
     let lnf_w = load_i32(&format!("{dir}/ln_f_w_i32.bin"));
     let lnf_b = load_i32(&format!("{dir}/ln_f_b_i32.bin"));
-    let lm_head_w = load_i32(&format!("{dir}/lm_head_w_i32.bin"));
+    let lm_head_w = Arc::new(WeightMmap::open(&format!("{dir}/lm_head_w_i32.bin")).unwrap());
 
     let x0 = store.push(embedding[..m * D].to_vec());
     let exp_t = store.push(exp_table);
@@ -179,7 +181,7 @@ pub fn build_gpt2(store: &mut Store, ops: &mut Vec<Op>, dir: &str, m: usize, shi
     let lnf_b_t = store.push(broadcast(&lnf_b, m));
     let h_final = store.push(vec![]);
     ops.push(Op::LayerNormCentered { x: x_cur, w: lnf_w_t, b: lnf_b_t, out: h_final, rsqrt_table: rsqrt_t, m, d: D, n_real: N_REAL });
-    let lm_w_t = store.push(lm_head_w);
+    let lm_w_t = store.push_mmap(lm_head_w.clone(), 0, lm_head_w.len());
     let logits = store.push(vec![]);
     ops.push(Op::MatMul { a: h_final, b: lm_w_t, c: logits, m, k: D, n: 65536 });
     (x0, logits)

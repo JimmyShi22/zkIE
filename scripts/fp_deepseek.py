@@ -45,7 +45,7 @@ def rd(a, b):
 def rsqrt_index(var):
     raw = rd(var, 1 << 18)
     fine = raw < (1 << 20)
-    idx = np.where(fine, np.maximum(raw, 0), (1 << 20) + ((raw - (1 << 20)) / (1 << 16)).astype(np.int64))
+    idx = np.where(fine, np.maximum(raw, 0), (1 << 20) + ((raw - (1 << 20)) / (1 << 8)).astype(np.int64))
     return idx.astype(np.int64)
 
 

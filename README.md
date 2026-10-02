@@ -114,16 +114,16 @@ To add a new model, see [docs/adding-a-model.md](docs/adding-a-model.md).
 Measured on a 64-thread CPU. Full detail and the reasoning behind the numbers
 is in [`docs/benchmarks.md`](docs/benchmarks.md).
 
-| Model | Active / Total params | Setup | Wall time | Peak RSS |
-| --- | --- | --- | --- | --- |
-| GPT-2 124M | 124M / 124M | seq=16, 13 shards (per layer) | ~29.5 s | ~38 GB |
-| GPT-2 124M | 124M / 124M | seq=512, 13 shards (per layer) | **~57.5 s** | ~46 GB |
-| TimesFM 1.0 200M | 200M / 200M | seq=16, 20 shards (per layer) | ~41.4 s | ~19.5 GB |
-| Gemma 3 270M | 270M / 270M | seq=16, 22 shards (per layer) | ~45.6 s | ~28 GB |
-| Gemma 3 270M | 270M / 270M | seq=512, 22 shards (per layer) | ~90.1 s | ~39.5 GB |
-| DeepSeek-V2-Lite | 2.4B / 15.7B | seq=16, 21 shards (lazy-open MoE, mmap weights) | ~512 s prove | ~126 GB |
-| DeepSeek-V2-Lite | 2.4B / 15.7B | seq=512, 28 shards (lazy-open MoE, mmap weights) | ~1588 s prove (~26.5 min) | ~377 GB |
-| DeepSeek-V4.1-Flash | 8B/16B* / 552B | MoE + CSA2 + vision (planned) | - | - |
+| Model | Active / Total params | Setup | Prove | Verify | Peak RSS |
+| --- | --- | --- | --- | --- | --- |
+| TimesFM 1.0 200M | 200M / 200M | seq=16, 20 shards (per layer) | ~28.2 s | ~11.0 s | ~13.8 GB |
+| GPT-2 124M | 124M / 124M | seq=16, 13 shards (per layer) | ~18.7 s | ~8.5 s | ~39.3 GB |
+| GPT-2 124M | 124M / 124M | seq=512, 13 shards (per layer) | **~34.3 s** | **~21.2 s** | ~42.5 GB |
+| Gemma 3 270M | 270M / 270M | seq=16, 22 shards (per layer) | re-measuring | - | - |
+| Gemma 3 270M | 270M / 270M | seq=512, 22 shards (per layer) | re-measuring | - | - |
+| DeepSeek-V2-Lite | 2.4B / 15.7B | seq=16, 21 shards (lazy-open MoE, mmap weights) | ~512.9 s | - | ~125.3 GB |
+| DeepSeek-V2-Lite | 2.4B / 15.7B | seq=512, 28 shards (lazy-open MoE, mmap weights) | ~1544.7 s (~25.7 min) | - | ~374.2 GB |
+| DeepSeek-V4.1-Flash | 8B/16B* / 552B | MoE + CSA2 + vision (planned) | - | - | - |
 
 * DeepSeek-V4.1-Flash active params: 8B prefill / 16B decode.
 

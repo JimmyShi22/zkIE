@@ -13,7 +13,8 @@
 //! output keeps the natural layout, so it can feed the attention matmul.
 
 use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64};
-use zkie_core::common::fixed_point::{from_i64, to_i64};
+use zkie_core::common::fixed_point::{from_i64, to_i32, to_i64};
+use zkie_core::common::logup_gkr::{prove_lookup_fractional, verify_lookup_fractional, FractionalProof};
 use zkie_core::common::mle;
 use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
 
@@ -26,9 +27,15 @@ fn round_div(a: i64, b: i64) -> i64 {
 pub struct RoPEProof {
     pub first: VirtualProof,
     pub second: VirtualProof,
+    pub frac_f: FractionalProof,
+    pub frac_s: FractionalProof,
     pub r_first: Vec<Goldilocks>,
     pub r_second: Vec<Goldilocks>,
     pub r_out: Vec<Goldilocks>,
+    pub alpha_f: Goldilocks,
+    pub beta_f: Goldilocks,
+    pub alpha_s: Goldilocks,
+    pub beta_s: Goldilocks,
 }
 
 fn heads_of(x_len: usize, m: usize, d: usize) -> usize {
@@ -168,7 +175,31 @@ pub fn prove_rope(
     let r_out: Vec<Goldilocks> =
         (0..out.len().trailing_zeros() as usize).map(|_| rng.field()).collect();
 
-    RoPEProof { first, second, r_first: r_f, r_second: r_s, r_out }
+    // range-check the rounding remainders so the rounding is constrained to the
+    // honest round(.. / 2^shift) value (mirrors projection.rs).
+    let table: Vec<Goldilocks> = (0..(1usize << shift)).map(|j| Goldilocks::from_u64(j as u64)).collect();
+    let idx_f: Vec<u32> = rem_f.iter().map(|&v| to_i32(v) as u32).collect();
+    let idx_s: Vec<u32> = rem_s.iter().map(|&v| to_i32(v) as u32).collect();
+    let alpha_f = rng.field();
+    let beta_f = rng.field();
+    let frac_f = prove_lookup_fractional(&idx_f, &rem_f, &table, alpha_f, beta_f, rng);
+    let alpha_s = rng.field();
+    let beta_s = rng.field();
+    let frac_s = prove_lookup_fractional(&idx_s, &rem_s, &table, alpha_s, beta_s, rng);
+
+    RoPEProof {
+        first,
+        second,
+        frac_f,
+        frac_s,
+        r_first: r_f,
+        r_second: r_s,
+        r_out,
+        alpha_f,
+        beta_f,
+        alpha_s,
+        beta_s,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -233,7 +264,14 @@ pub fn verify_rope(
         mle::eval(&rem_s, &proof.r_second),
         mle::eval(&ones, &proof.r_second),
     ];
-    verify_virtual(&proof.second, &second_terms, Goldilocks::ZERO, &proof.r_second, &second_fe)
+    if !verify_virtual(&proof.second, &second_terms, Goldilocks::ZERO, &proof.r_second, &second_fe) {
+        return false;
+    }
+    let table: Vec<Goldilocks> = (0..(1usize << shift)).map(|j| Goldilocks::from_u64(j as u64)).collect();
+    let idx_f: Vec<u32> = rem_f.iter().map(|&v| to_i32(v) as u32).collect();
+    let idx_s: Vec<u32> = rem_s.iter().map(|&v| to_i32(v) as u32).collect();
+    verify_lookup_fractional(&proof.frac_f, &idx_f, &rem_f, &table, proof.alpha_f, proof.beta_f)
+        && verify_lookup_fractional(&proof.frac_s, &idx_s, &rem_s, &table, proof.alpha_s, proof.beta_s)
 }
 
 #[cfg(test)]

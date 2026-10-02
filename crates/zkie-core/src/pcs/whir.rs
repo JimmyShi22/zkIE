@@ -31,7 +31,7 @@ use p3_sumcheck::{OpeningBatch, PointSchedule, PrescribedPointPcs, TableShape, T
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
 use p3_whir::fiat_shamir::domain_separator::DomainSeparator;
 use p3_whir::parameters::{
-    FoldingFactor, ProtocolParameters, SecurityAssumption, WhirConfig, DEFAULT_MAX_POW,
+    FoldingFactor, ProtocolParameters, SecurityAssumption, WhirConfig,
 };
 use p3_whir::pcs::prover::WhirProver;
 use rand::rngs::SmallRng;
@@ -276,7 +276,7 @@ impl Whir {
     /// polynomial. Security parameters are PoC-grade (90-bit, default PoW); the
     /// proof stays small enough that a `2^10` commitment runs in a couple seconds.
     pub fn new(num_variables: usize) -> Self {
-        Self::with_params(num_variables, 90, DEFAULT_MAX_POW)
+        Self::with_params(num_variables, 90, 32)
     }
 
     /// Fast, low-security instance for tests and local iteration. Do not use for

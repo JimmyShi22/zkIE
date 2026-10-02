@@ -4,9 +4,11 @@
 //! `models/gemma3/weights/` (i32 fixed-point `.bin` files).
 
 use std::fs;
+use std::sync::Arc;
 
 use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing};
 use zkie_core::common::fixed_point::from_i32;
+use zkie_core::common::weights_io::WeightMmap;
 use zkie_ops::compose::{causal_mask, Op, Store};
 
 pub const H: usize = 640;
@@ -66,12 +68,12 @@ fn build_layer(
 ) -> usize {
     let dir = "models/gemma3/weights";
     let q_w = load_i32(&format!("{dir}/L{layer}_q_w_i32.bin"));
-    let k_w = load_i32(&format!("{dir}/L{layer}_k_w_i32.bin"));
-    let v_w = load_i32(&format!("{dir}/L{layer}_v_w_i32.bin"));
+    let k_w = Arc::new(WeightMmap::open(&format!("{dir}/L{layer}_k_w_i32.bin")).unwrap());
+    let v_w = Arc::new(WeightMmap::open(&format!("{dir}/L{layer}_v_w_i32.bin")).unwrap());
     let o_w = load_i32(&format!("{dir}/L{layer}_o_w_i32.bin"));
-    let gate_w = load_i32(&format!("{dir}/L{layer}_gate_w_i32.bin"));
-    let up_w = load_i32(&format!("{dir}/L{layer}_up_w_i32.bin"));
-    let down_w = load_i32(&format!("{dir}/L{layer}_down_w_i32.bin"));
+    let gate_w = Arc::new(WeightMmap::open(&format!("{dir}/L{layer}_gate_w_i32.bin")).unwrap());
+    let up_w = Arc::new(WeightMmap::open(&format!("{dir}/L{layer}_up_w_i32.bin")).unwrap());
+    let down_w = Arc::new(WeightMmap::open(&format!("{dir}/L{layer}_down_w_i32.bin")).unwrap());
     let in_norm = load_i32(&format!("{dir}/L{layer}_in_norm_i32.bin"));
     let post_attn_norm = load_i32(&format!("{dir}/L{layer}_post_attn_norm_i32.bin"));
     let pre_ffn_norm = load_i32(&format!("{dir}/L{layer}_pre_ffn_norm_i32.bin"));
@@ -85,8 +87,8 @@ fn build_layer(
     ops.push(Op::RmsNorm { x, w: in_norm_t, out: h, rsqrt_table: rsqrt_t, m, d: H_PAD, n_real: H });
 
     // K/V projections (single KV head, shared across the 4 query heads)
-    let k_w_t = store.push(k_w);
-    let v_w_t = store.push(v_w);
+    let k_w_t = store.push_mmap(k_w.clone(), 0, k_w.len());
+    let v_w_t = store.push_mmap(v_w.clone(), 0, v_w.len());
     let k_b = store.push(zeros(m * HDIM));
     let v_b = store.push(zeros(m * HDIM));
     let k = store.push(vec![]);
@@ -158,9 +160,9 @@ fn build_layer(
     let pre_ffn_t = store.push(broadcast(&pre_ffn_norm, m));
     let h2 = store.push(vec![]);
     ops.push(Op::RmsNorm { x: x2, w: pre_ffn_t, out: h2, rsqrt_table: rsqrt_t, m, d: H_PAD, n_real: H });
-    let gate_w_t = store.push(gate_w);
-    let up_w_t = store.push(up_w);
-    let down_w_t = store.push(down_w);
+    let gate_w_t = store.push_mmap(gate_w.clone(), 0, gate_w.len());
+    let up_w_t = store.push_mmap(up_w.clone(), 0, up_w.len());
+    let down_w_t = store.push_mmap(down_w.clone(), 0, down_w.len());
     let gate_b = store.push(zeros(m * INTER));
     let up_b = store.push(zeros(m * INTER));
     let down_b = store.push(zeros(m * H_PAD));
@@ -195,7 +197,7 @@ pub fn build_gemma3(store: &mut Store, ops: &mut Vec<Op>, dir: &str, m: usize, s
     let rsqrt_table = load_i32("models/gpt2/weights/rsqrt_table_i32.bin");
     let gelu_table = load_i32("models/gpt2/weights/gelu_table_i32.bin");
     let x0 = load_i32(&format!("{dir}/x0_i32.bin"));
-    let lm_head = load_i32(&format!("{dir}/lm_head_i32.bin"));
+    let lm_head = Arc::new(WeightMmap::open(&format!("{dir}/lm_head_i32.bin")).unwrap());
     let final_norm = load_i32(&format!("{dir}/final_norm_i32.bin"));
     let cos_local = load_i32(&format!("{dir}/rope_cos_local_i32.bin"));
     let sin_local = load_i32(&format!("{dir}/rope_sin_local_i32.bin"));
@@ -225,7 +227,7 @@ pub fn build_gemma3(store: &mut Store, ops: &mut Vec<Op>, dir: &str, m: usize, s
     let final_norm_t = store.push(broadcast(&final_norm, m));
     let h_final = store.push(vec![]);
     ops.push(Op::RmsNorm { x: x_cur, w: final_norm_t, out: h_final, rsqrt_table: rsqrt_t, m, d: H_PAD, n_real: H });
-    let lm_t = store.push(lm_head);
+    let lm_t = store.push_mmap(lm_head.clone(), 0, lm_head.len());
     let logits = store.push(vec![]);
     ops.push(Op::MatMul { a: h_final, b: lm_t, c: logits, m, k: H_PAD, n: VOCAB });
     (x0_t, logits)

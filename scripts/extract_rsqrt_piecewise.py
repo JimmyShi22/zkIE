@@ -18,7 +18,7 @@ INDEX_SCALE = 1 << 14
 EPS = 1e-6
 FINE = 1 << 20          # step-1 region
 COARSE_STEP = 1 << 8
-COARSE = 1 << 20        # number of coarse entries; total = 2^21
+COARSE = 1 << 22        # number of coarse entries; total = 2^21
 
 def main() -> None:
     fine_idx = np.arange(FINE, dtype=np.float64)
@@ -32,7 +32,7 @@ def main() -> None:
 
     table = np.concatenate([fine_rstd, coarse_rstd])
     table = np.clip(np.round(table * SCALE), 0, 2**31 - 1).astype(np.int32)
-    table.tofile("models/rsqrt_table_i32.bin")
+    table.tofile("models/gpt2/weights/rsqrt_table_i32.bin")
     max_var = (FINE + (COARSE - 1) * COARSE_STEP) / INDEX_SCALE
     print(f"wrote {len(table)} piecewise rsqrt entries; max var = {max_var:.1f}")
 

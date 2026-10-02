@@ -557,6 +557,12 @@ impl Store {
             TensorData::Mmap { mmap, start, len } => Cow::Owned(mmap.read_goldilocks(*start, *len)),
         }
     }
+    pub fn get_mut(&mut self, id: T) -> &mut [Goldilocks] {
+        match &mut self.v[id] {
+            TensorData::Owned(v) => v,
+            TensorData::Mmap { .. } => panic!("get_mut() on mmap-backed tensor"),
+        }
+    }
 }
 
 /// One op primitive. `Projection` = matmul + affine + round + range check;
@@ -751,7 +757,7 @@ pub fn rsqrt_index(var: i64) -> u32 {
     if raw < FINE {
         raw.max(0) as u32
     } else {
-        (FINE + ((raw - FINE) >> 16)) as u32
+        (FINE + ((raw - FINE) >> 8)) as u32
     }
 }
 
@@ -920,7 +926,7 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 store.v[out] = TensorData::Owned(o);
             }
             Op::RmsNorm { x, w, out, rsqrt_table, m, d, n_real } => {
-                let (_, _, _, o, _, _, _) =
+                let (_, _, _, o, _, _, _, _, _) =
                     rms_norm_forward(store.get(x), store.get(w), store.get(rsqrt_table), m, d, n_real);
                 store.v[out] = TensorData::Owned(o);
             }
@@ -2036,7 +2042,7 @@ mod tests {
 
         // Tamper with an intermediate weight -> must fail.
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
-        bad.v[fc_w][0] = bad.v[fc_w][0] + Goldilocks::ONE;
+        bad.get_mut(fc_w)[0] = bad.get_mut(fc_w)[0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
     }
 
@@ -2074,7 +2080,7 @@ mod tests {
         assert!(verify_shard(&store, &ops, &proof));
 
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
-        bad.v[x][0] = bad.v[x][0] + Goldilocks::ONE;
+        bad.get_mut(x)[0] = bad.get_mut(x)[0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
     }
 
@@ -2109,7 +2115,7 @@ mod tests {
         assert!(verify_shard_dag(&store, &ops, 2, &proof));
 
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
-        bad.v[weights[1]][0] = bad.v[weights[1]][0] + Goldilocks::ONE;
+        bad.get_mut(weights[1])[0] = bad.get_mut(weights[1])[0] + Goldilocks::ONE;
         assert!(!verify_shard_dag(&bad, &ops, 2, &proof));
     }
 
@@ -2179,7 +2185,7 @@ mod tests {
         assert!(verify_committed_shard_dag(&store, &ops, 2, &whir, &proof));
 
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
-        bad.v[ws[1]][0] = bad.v[ws[1]][0] + Goldilocks::ONE;
+        bad.get_mut(ws[1])[0] = bad.get_mut(ws[1])[0] + Goldilocks::ONE;
         assert!(!verify_committed_shard_dag(&bad, &ops, 2, &whir, &proof));
     }
 
@@ -2255,7 +2261,7 @@ mod tests {
         assert!(verify_shard(&store, &ops, &proof));
 
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
-        bad.v[a][0] = bad.v[a][0] + Goldilocks::ONE;
+        bad.get_mut(a)[0] = bad.get_mut(a)[0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
     }
 
@@ -2277,7 +2283,7 @@ mod tests {
         assert!(verify_shard(&store, &ops, &proof));
 
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
-        bad.v[q_t][0] = bad.v[q_t][0] + Goldilocks::ONE;
+        bad.get_mut(q_t)[0] = bad.get_mut(q_t)[0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
     }
 
@@ -2327,7 +2333,7 @@ mod tests {
         assert!(verify_shard(&store, &ops, &proof));
 
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
-        bad.v[ws[0]][0] = bad.v[ws[0]][0] + Goldilocks::ONE;
+        bad.get_mut(ws[0])[0] = bad.get_mut(ws[0])[0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
     }
 
@@ -2393,7 +2399,7 @@ mod tests {
         assert!(verify_shard(&store, &ops, &proof));
 
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
-        bad.v[x][0] = bad.v[x][0] + Goldilocks::ONE;
+        bad.get_mut(x)[0] = bad.get_mut(x)[0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
     }
 
@@ -2437,7 +2443,7 @@ mod tests {
         assert!(verify_shard(&store, &ops, &proof));
 
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
-        bad.v[ln_w][0] = bad.v[ln_w][0] + Goldilocks::ONE;
+        bad.get_mut(ln_w)[0] = bad.get_mut(ln_w)[0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
     }
 
@@ -2460,7 +2466,7 @@ mod tests {
         assert!(verify_shard(&store, &ops, &proof));
 
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
-        bad.v[x][0] = bad.v[x][0] + Goldilocks::ONE;
+        bad.get_mut(x)[0] = bad.get_mut(x)[0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
     }
 
