@@ -751,7 +751,7 @@ pub fn rsqrt_index(var: i64) -> u32 {
     if raw < FINE {
         raw.max(0) as u32
     } else {
-        (FINE + ((raw - FINE) >> 16)) as u32
+        (FINE + ((raw - FINE) >> 8)) as u32
     }
 }
 
