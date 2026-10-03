@@ -813,6 +813,86 @@ pub struct OpShardProof {
 
 /// Run the forward pass for all ops; materializes every `out`/`rem`/`c` into the
 /// store. Input tensors (`x`, `w`, `bias`, `idx`, `table`) must already exist.
+impl Op {
+    /// Tensors this op READS. Together with [`Op::writes`] this is the
+    /// dependency edge set of the op graph.
+    ///
+    /// Needed to split witness computation per shard: a shard's *inputs* are the
+    /// tensors its ops read but do not themselves write, and those are exactly
+    /// the values that must cross a node boundary. Today `forward_ops`
+    /// materialises the whole graph into one store, so nothing needs to ask this
+    /// question; splitting it is what makes the question necessary.
+    pub fn reads(&self) -> Vec<T> {
+        match *self {
+            Op::Transpose { x, .. } => vec![x],
+            Op::Scale { x, .. } => vec![x],
+            Op::ScaleVec { x, scale, .. } => vec![x, scale],
+            Op::Relu { x, .. } => vec![x],
+            Op::MatMul { a, b, .. } => vec![a, b],
+            Op::Projection { x, w, bias, .. } => vec![x, w, bias],
+            Op::Add { a, b, .. } => vec![a, b],
+            Op::Lookup { idx, table, .. } => vec![idx, table],
+            Op::Softmax { idx, table, .. } => vec![idx, table],
+            Op::SoftmaxIndex { x, .. } => vec![x],
+            Op::GeluIndex { x, .. } => vec![x],
+            Op::StableSoftmaxIndex { x, mask, .. } => vec![x, mask],
+            Op::Layernorm { x, w, b, rsqrt_table, .. } => vec![x, w, b, rsqrt_table],
+            Op::LayerNormCentered { x, w, b, rsqrt_table, .. } => vec![x, w, b, rsqrt_table],
+            Op::RmsNorm { x, w, rsqrt_table, .. } => vec![x, w, rsqrt_table],
+            Op::RoPE { x, cos, sin, .. } => vec![x, cos, sin],
+            Op::TopKSelect { x, .. } => vec![x],
+            Op::ScaleGate { x, gate, .. } => vec![x, gate],
+        }
+    }
+
+    /// Tensors this op WRITES. Most ops write one; `Projection` writes its
+    /// output and a remainder, `Softmax` its exponentials and its output, and
+    /// `TopKSelect` five. Derived from what `forward_ops` actually assigns, not
+    /// from the field names — `Softmax::e` and `Projection::rem` are outputs
+    /// despite reading like inputs.
+    pub fn writes(&self) -> Vec<T> {
+        match *self {
+            Op::Transpose { out, .. }
+            | Op::Scale { out, .. }
+            | Op::ScaleVec { out, .. }
+            | Op::Relu { out, .. }
+            | Op::Lookup { out, .. }
+            | Op::SoftmaxIndex { out, .. }
+            | Op::GeluIndex { out, .. }
+            | Op::StableSoftmaxIndex { out, .. }
+            | Op::Layernorm { out, .. }
+            | Op::LayerNormCentered { out, .. }
+            | Op::RmsNorm { out, .. }
+            | Op::RoPE { out, .. }
+            | Op::ScaleGate { out, .. } => vec![out],
+            Op::MatMul { c, .. } | Op::Add { c, .. } => vec![c],
+            Op::Projection { out, rem, .. } => vec![out, rem],
+            Op::Softmax { e, out, .. } => vec![e, out],
+            Op::TopKSelect { sel, thr, gate, d1, d2, .. } => vec![sel, thr, gate, d1, d2],
+        }
+    }
+}
+
+/// Tensors a shard must be GIVEN: read inside `ops[range]` but not written there.
+///
+/// These are the values that cross a node boundary when shards are proven on
+/// separate machines. Weights and lookup tables appear here too — they are
+/// read and never written — so a caller distributing work can separate the two
+/// by checking which are produced by an earlier op.
+pub fn shard_inputs(ops: &[Op], range: std::ops::Range<usize>) -> Vec<T> {
+    let mut written = std::collections::BTreeSet::new();
+    for op in &ops[range.clone()] {
+        for t in op.writes() { written.insert(t); }
+    }
+    let mut need = std::collections::BTreeSet::new();
+    for op in &ops[range] {
+        for t in op.reads() {
+            if !written.contains(&t) { need.insert(t); }
+        }
+    }
+    need.into_iter().collect()
+}
+
 fn forward_ops(store: &mut Store, ops: &[Op]) {
     for op in ops.iter().cloned() {
         match op {
@@ -2506,6 +2586,136 @@ mod tests {
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
         bad.get_mut(x)[0] = bad.get_mut(x)[0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
+    }
+
+    /// A real op graph to test against: one full GPT-2 layer, which exercises
+    /// Layernorm, Projection (two outputs), MatMul, Transpose, Softmax (two
+    /// outputs), GeluIndex and Add. Reusing the existing builder rather than
+    /// hand-rolling a graph means the test tracks the real op set as it grows.
+    fn real_layer_graph() -> (Store, Vec<Op>) {
+        let mut rng = XorShift64::new(0x09501);
+        let (m, d, ffn, heads, shift) = (4usize, 8usize, 16usize, 2usize, 8u32);
+        let table_len = 1usize << 8;
+        let mut store = Store::new();
+        let x = store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let exp_table = store.push((0..table_len).map(|j| from_i64((j % 255 + 1) as i64)).collect());
+        let gelu_table = store.push((0..64).map(|j| from_i64((j as i64).pow(2) % 1000)).collect());
+        let rsqrt_table = store.push((0..table_len).map(|j| from_i64((j % 255 + 1) as i64)).collect());
+        let (ops, _out) = build_gpt2_layer(
+            &mut store, x, heads, m, d, ffn, shift, exp_table, gelu_table, rsqrt_table, &mut rng,
+        );
+        (store, ops)
+    }
+
+    /// `writes()` must match what `forward_ops` ACTUALLY assigns, so the test
+    /// runs each op for real and diffs the store.
+    ///
+    /// An earlier version of this test checked only that every read was produced
+    /// by some earlier op. That passes even when an output is mislabelled as an
+    /// input, because output slots are pre-allocated with `store.push(vec![])`
+    /// before the op runs - so the mislabelled tensor looks like a legitimate
+    /// pre-existing read. A mutation (calling `Softmax::e` a read) survived it.
+    /// Diffing against the real forward pass is what actually discriminates.
+    #[test]
+    fn writes_match_what_forward_ops_assigns() {
+        let (mut store, ops) = real_layer_graph();
+        for (i, op) in ops.iter().enumerate() {
+            let before: Vec<Vec<Goldilocks>> =
+                (0..store.v.len()).map(|t| store.get(t).to_vec()).collect();
+            forward_ops(&mut store, std::slice::from_ref(op));
+            let changed: std::collections::BTreeSet<T> = (0..store.v.len())
+                .filter(|&t| store.get(t) != before[t].as_slice())
+                .collect();
+            let declared: std::collections::BTreeSet<T> = op.writes().into_iter().collect();
+            // Every tensor that actually changed must be declared. (The converse
+            // can legitimately fail: a write may happen to reproduce the same
+            // bytes, e.g. writing zeros over an empty slot.)
+            for t in &changed {
+                assert!(
+                    declared.contains(t),
+                    "op {i} ({op:?}) wrote tensor {t} but writes() does not declare it"
+                );
+            }
+            let _ = i;
+        }
+    }
+
+    /// `reads()` must not UNDER-declare: if an op truly depends on a tensor it
+    /// did not list, a shard could be handed an incomplete input set and still
+    /// work on one machine, failing only once split across nodes.
+    ///
+    /// Checked by perturbation, with op `i` run IN ISOLATION against a fixed
+    /// pre-state. Running the whole prefix instead makes every perturbation
+    /// propagate transitively - the model input reaches almost every output -
+    /// and the test reports dependencies that are real but indirect.
+    #[test]
+    fn reads_does_not_under_declare() {
+        let (base, ops) = real_layer_graph();
+        let clone_store = |s: &Store| {
+            let mut c = Store { v: Vec::with_capacity(s.v.len()), idx: s.idx.clone() };
+            for t in 0..s.v.len() { c.v.push(TensorData::Owned(s.get(t).to_vec())); }
+            c
+        };
+        for (i, op) in ops.iter().enumerate() {
+            // state immediately before op i
+            let mut pre = clone_store(&base);
+            forward_ops(&mut pre, &ops[..i]);
+
+            let reads: std::collections::BTreeSet<T> = op.reads().into_iter().collect();
+            let writes: Vec<T> = op.writes();
+
+            let mut want = clone_store(&pre);
+            forward_ops(&mut want, std::slice::from_ref(op));
+            let want_out: Vec<Vec<Goldilocks>> = writes.iter().map(|&t| want.get(t).to_vec()).collect();
+
+            for cand in 0..pre.v.len() {
+                if reads.contains(&cand) || writes.contains(&cand) { continue; }
+                if pre.get(cand).is_empty() { continue; }
+                let mut s1 = clone_store(&pre);
+                let mut tampered = s1.get(cand).to_vec();
+                tampered[0] = tampered[0] + Goldilocks::ONE;
+                s1.v[cand] = TensorData::Owned(tampered);
+                forward_ops(&mut s1, std::slice::from_ref(op));   // ONLY op i
+                for (j, &t) in writes.iter().enumerate() {
+                    assert_eq!(
+                        s1.get(t), want_out[j].as_slice(),
+                        "op {i} ({op:?}) output {t} changed when tensor {cand} was perturbed, \
+                         but reads() does not list it"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A shard's inputs are what must cross a node boundary. Two properties that
+    /// must hold for any split, checked over every single-op window and a few
+    /// wider ones.
+    #[test]
+    fn shard_inputs_are_exactly_the_unmet_reads() {
+        let (_store, ops) = real_layer_graph();
+        for lo in 0..ops.len() {
+            for hi in (lo + 1)..=ops.len() {
+                let got: std::collections::BTreeSet<T> =
+                    shard_inputs(&ops, lo..hi).into_iter().collect();
+                let written: std::collections::BTreeSet<T> =
+                    ops[lo..hi].iter().flat_map(|o| o.writes()).collect();
+                let read: std::collections::BTreeSet<T> =
+                    ops[lo..hi].iter().flat_map(|o| o.reads()).collect();
+                // nothing the shard produces itself is an input
+                assert!(got.is_disjoint(&written), "{lo}..{hi}: an input is also produced here");
+                // every read it cannot satisfy IS an input
+                for t in read.difference(&written) {
+                    assert!(got.contains(t), "{lo}..{hi}: unmet read {t} missing from inputs");
+                }
+            }
+        }
+        // the whole graph needs only what pre-exists: weights, tables, the input
+        let all = shard_inputs(&ops, 0..ops.len());
+        let produced_anywhere: std::collections::BTreeSet<T> =
+            ops.iter().flat_map(|o| o.writes()).collect();
+        for t in &all {
+            assert!(!produced_anywhere.contains(t), "tensor {t} is both pre-existing and produced");
+        }
     }
 
     #[test]
