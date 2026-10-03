@@ -16,7 +16,7 @@ fn peak_rss_kb() -> u64 {
 }
 
 fn main() {
-    let m = std::env::var("DEEPSEEK_SEQ")
+    let m = std::env::var("M")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(16usize);

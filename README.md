@@ -90,18 +90,27 @@ stays on the CPU.
 
 ## Usage
 
-Build and run the real GPT-2 512 end-to-end proof (weights/tables are under
-`models/gpt2/weights/`, expected at the repo root):
+Each model has its own crate under `models/`. Weights and lookup tables are
+gitignored and expected under each model's `weights/` directory (export steps
+and sha256 are in the per-model `README.md`).
 
 ```bash
-# full GPT-2 512 proof: argmax sanity check + prove/verify time
+# GPT-2 124M - end-to-end proof, shard sweep, and autotune
 cargo run --release -p zkie-models-gpt2 --example prove
-
-# shard-granularity sweep
 cargo run --release -p zkie-models-gpt2 --example bench_sharded
-
-# autotune over shard granularities
 cargo run --release -p zkie-models-gpt2 --example bench_autotune
+
+# TimesFM 1.0 200M
+cargo run --release -p zkie-models-timesfm --example prove
+cargo run --release -p zkie-models-timesfm --example bench
+
+# Gemma 3 270M (sequence length via GEMMA_SEQ, default 16)
+GEMMA_SEQ=16 cargo run --release -p zkie-models-gemma3 --example prove
+GEMMA_SEQ=16 cargo run --release -p zkie-models-gemma3 --example bench
+
+# DeepSeek-V2-Lite (sequence length via M, default 16)
+M=16 cargo run --release -p zkie-models-deepseek-v2-lite --example prove
+M=16 cargo run --release -p zkie-models-deepseek-v2-lite --example bench
 
 # library tests
 cargo test --workspace
@@ -148,10 +157,10 @@ is in [`docs/benchmarks.md`](docs/benchmarks.md).
     autotune loop.
   - `benchmark/` — generic (non-model) micro-benchmarks of the primitives and
     the WHIR/FRI PCS.
-- `models/gpt2/`, `models/timesfm/` — one crate per model; each holds the
-  op-graph builder (`src/lib.rs`), its own `examples/` (prove + benchmarks),
-  and a gitignored `weights/` (export steps + sha256 in the per-model
-  `README.md`).
+- `models/gpt2/`, `models/timesfm/`, `models/gemma3/`,
+  `models/deepseek-v2-lite/` — one crate per model; each holds the op-graph
+  builder (`src/lib.rs`), its own `examples/` (prove + benchmarks), and a
+  gitignored `weights/` (export steps + sha256 in the per-model `README.md`).
 - `docs/` — `spec.md` (design), `benchmarks.md` (measurements),
   `adding-a-model.md` (how to add a new model), `roadmap.md`.
 
