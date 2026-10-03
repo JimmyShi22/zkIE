@@ -28,7 +28,7 @@ fn main() {
     let proof = prove_shard_dag(&mut store, &ops, 53, &mut rng);
     let prove_t = t0.elapsed();
     let t1 = std::time::Instant::now();
-    assert!(verify_shard_dag(&store, &ops, 53, &proof));
+    assert!(verify_shard_dag(&mut store, &ops, 53, &proof));
     let verify_t = t1.elapsed();
 
     let gt = load_i32(&format!("{dir}/gt_argmax_i32.bin"));

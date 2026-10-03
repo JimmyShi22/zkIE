@@ -557,6 +557,12 @@ impl Store {
             TensorData::Mmap { mmap, start, len } => Cow::Owned(mmap.read_goldilocks(*start, *len)),
         }
     }
+    pub fn get_mut(&mut self, id: T) -> &mut [Goldilocks] {
+        match &mut self.v[id] {
+            TensorData::Owned(v) => v,
+            TensorData::Mmap { .. } => panic!("get_mut() on mmap-backed tensor"),
+        }
+    }
 }
 
 /// One op primitive. `Projection` = matmul + affine + round + range check;
@@ -744,17 +750,15 @@ pub fn causal_mask(m: usize) -> Vec<Goldilocks> {
 
 /// Piecewise rsqrt-table index for a 2^32-scale LayerNorm variance: the raw
 /// index is `round(var / 2^18)` (2^14 scale); indices below 2^20 are full
-/// resolution, larger ones are quantized with step 2^8.
+/// resolution, raw in [2^20, 2^30) use step 2^8, and raw >= 2^30 use step 2^16.
 /// Number of entries in the piecewise rsqrt table, fixed by
-/// `scripts/extract_rsqrt_piecewise.py`: 2^20 step-1 entries followed by 2^20
-/// coarse entries at step 2^8.
-pub const RSQRT_TABLE_LEN: usize = (1 << 20) + (1 << 20);
+/// `scripts/extract_rsqrt_piecewise.py`: 2^20 step-1 entries, followed by 2^22
+/// coarse entries at step 2^8 and 2^21 coarse entries at step 2^16.
+pub const RSQRT_TABLE_LEN: usize = (1 << 20) + (1 << 22) + (1 << 21);
 
 /// Largest real variance the generated table covers:
-/// `(FINE + (COARSE - 1) * COARSE_STEP) / INDEX_SCALE`
-/// = `(2^20 + (2^20 - 1) * 2^8) / 2^14`. The generator prints this rounded to
-/// one decimal ("16448.0"); the exact value is below.
-pub const RSQRT_MAX_VARIANCE: f64 = 16447.984375;
+/// `(FINE + COARSE * COARSE_STEP + (COARSE2 - 1) * COARSE_STEP2) / INDEX_SCALE`.
+pub const RSQRT_MAX_VARIANCE: f64 = 8454204.0;
 
 /// Check a loaded rsqrt table covers the indices about to be read from it.
 ///
@@ -771,22 +775,27 @@ pub fn check_rsqrt_table(table: &[Goldilocks], max_index: u32) {
     assert!(
         (max_index as usize) < table.len(),
         "rsqrt table has {} entries but the forward pass needs index {}. \
-         Regenerate with scripts/extract_rsqrt_piecewise.py (2^21 entries, covering \
+         Regenerate with scripts/extract_rsqrt_piecewise.py ({} entries, covering \
          variance up to {:.6}) - NOT extract_rsqrt_table.py, which is superseded and \
          emits 2^19 uniform entries.",
         table.len(),
         max_index,
+        RSQRT_TABLE_LEN,
         RSQRT_MAX_VARIANCE
     );
 }
 
 pub fn rsqrt_index(var: i64) -> u32 {
     const FINE: i64 = 1 << 20;
+    const COARSE: i64 = 1 << 22;
+    const COARSE_END: i64 = FINE + COARSE * (1 << 8);
     let raw = round_div(var, 1 << 18);
     if raw < FINE {
         raw.max(0) as u32
-    } else {
+    } else if raw < COARSE_END {
         (FINE + ((raw - FINE) >> 8)) as u32
+    } else {
+        (FINE + COARSE + ((raw - COARSE_END) >> 16)) as u32
     }
 }
 
@@ -955,7 +964,7 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 store.v[out] = TensorData::Owned(o);
             }
             Op::RmsNorm { x, w, out, rsqrt_table, m, d, n_real } => {
-                let (_, _, _, o, _, _, _) =
+                let (_, _, _, o, _, _, _, _, _) =
                     rms_norm_forward(store.get(x), store.get(w), store.get(rsqrt_table), m, d, n_real);
                 store.v[out] = TensorData::Owned(o);
             }
@@ -1411,7 +1420,7 @@ pub fn verify_shard_precomputed(store: &Store, ops: &[Op], proof: &OpShardProof)
         return false;
     }
     for (i, &t) in proof.bound.iter().enumerate() {
-        if verify_same_poly(&proof.binds[i], ws.get(t), &bound_claims[i]).is_none() {
+        if verify_same_poly(&proof.binds[i], store.get(t), &bound_claims[i]).is_none() {
             return false;
         }
     }
@@ -1494,7 +1503,7 @@ pub fn prove_shard_dag(
 }
 
 pub fn verify_shard_dag(
-    store: &Store,
+    store: &mut Store,
     ops: &[Op],
     ops_per_shard: usize,
     proof: &ShardDagProof,
@@ -1504,15 +1513,15 @@ pub fn verify_shard_dag(
         return false;
     }
 
-    // Recompute the witness to get fresh tensor values for binding evals.
-    let mut ws = Store { v: store.v.clone(), idx: store.idx.clone() };
-    forward_ops(&mut ws, ops);
+    // Recompute the witness in-place to get fresh tensor values for binding evals.
+    forward_ops(store, ops);
+    let store: &Store = &*store;
 
     // Verify each shard in parallel against the shared fresh witness.
     let all_ok = ranges
         .par_iter()
         .enumerate()
-        .map(|(i, &(s, e))| verify_shard_precomputed(&ws, &ops[s..e], &proof.shards[i]))
+        .map(|(i, &(s, e))| verify_shard_precomputed(store, &ops[s..e], &proof.shards[i]))
         .all(|ok| ok);
     if !all_ok {
         return false;
@@ -1542,9 +1551,9 @@ pub fn verify_shard_dag(
     for (ci, &t) in proof.cross_tensors.iter().enumerate() {
         let claims: Vec<(Vec<Goldilocks>, Goldilocks)> = by_tensor[&t]
             .iter()
-            .map(|pt| (pt.clone(), mle::eval(ws.get(t), pt)))
+            .map(|pt| (pt.clone(), mle::eval(store.get(t), pt)))
             .collect();
-        if verify_same_poly(&proof.cross_binds[ci], ws.get(t), &claims).is_none() {
+        if verify_same_poly(&proof.cross_binds[ci], store.get(t), &claims).is_none() {
             return false;
         }
     }
@@ -1689,7 +1698,7 @@ pub fn verify_committed_shard_dag(
         if !verify_committed_cross_bind(
             whir,
             &proof.boundary_commitments[i],
-            ws.get(t),
+            store.get(t),
             &claims,
             &proof.cross_binds[i],
         ) {
@@ -1933,17 +1942,6 @@ pub fn build_gpt2_layer(
 
 #[cfg(test)]
 mod tests {
-
-    /// Tamper with element 0 of a tensor so a negative test can assert failure.
-    ///
-    /// `Store.v` became `Vec<TensorData>` when weights gained an mmap-backed
-    /// variant, so `store.v[id][0]` no longer indexes. Reads go through
-    /// `Store::get`; this writes the result back as an owned tensor.
-    fn bump(store: &mut Store, id: T) {
-        let mut t = store.get(id).to_vec();
-        t[0] = t[0] + Goldilocks::ONE;
-        store.v[id] = TensorData::Owned(t);
-    }
     use super::*;
     use zkie_core::common::field::PrimeCharacteristicRing;
 
@@ -2082,7 +2080,7 @@ mod tests {
 
         // Tamper with an intermediate weight -> must fail.
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
-        bump(&mut bad, fc_w);
+        bad.get_mut(fc_w)[0] = bad.get_mut(fc_w)[0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
     }
 
@@ -2120,7 +2118,7 @@ mod tests {
         assert!(verify_shard(&store, &ops, &proof));
 
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
-        bump(&mut bad, x);
+        bad.get_mut(x)[0] = bad.get_mut(x)[0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
     }
 
@@ -2152,11 +2150,11 @@ mod tests {
         let proof = prove_shard_dag(&mut store, &ops, 2, &mut rng);
         assert_eq!(proof.shards.len(), 2);
         assert_eq!(proof.cross_tensors.len(), 1, "only y2 spans the shard boundary");
-        assert!(verify_shard_dag(&store, &ops, 2, &proof));
+        assert!(verify_shard_dag(&mut store, &ops, 2, &proof));
 
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
-        bump(&mut bad, weights[1]);
-        assert!(!verify_shard_dag(&bad, &ops, 2, &proof));
+        bad.get_mut(weights[1])[0] = bad.get_mut(weights[1])[0] + Goldilocks::ONE;
+        assert!(!verify_shard_dag(&mut bad, &ops, 2, &proof));
     }
 
     #[test]
@@ -2225,7 +2223,7 @@ mod tests {
         assert!(verify_committed_shard_dag(&store, &ops, 2, &whir, &proof));
 
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
-        bump(&mut bad, ws[1]);
+        bad.get_mut(ws[1])[0] = bad.get_mut(ws[1])[0] + Goldilocks::ONE;
         assert!(!verify_committed_shard_dag(&bad, &ops, 2, &whir, &proof));
     }
 
@@ -2301,7 +2299,7 @@ mod tests {
         assert!(verify_shard(&store, &ops, &proof));
 
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
-        bump(&mut bad, a);
+        bad.get_mut(a)[0] = bad.get_mut(a)[0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
     }
 
@@ -2323,7 +2321,7 @@ mod tests {
         assert!(verify_shard(&store, &ops, &proof));
 
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
-        bump(&mut bad, q_t);
+        bad.get_mut(q_t)[0] = bad.get_mut(q_t)[0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
     }
 
@@ -2373,7 +2371,7 @@ mod tests {
         assert!(verify_shard(&store, &ops, &proof));
 
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
-        bump(&mut bad, ws[0]);
+        bad.get_mut(ws[0])[0] = bad.get_mut(ws[0])[0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
     }
 
@@ -2439,7 +2437,7 @@ mod tests {
         assert!(verify_shard(&store, &ops, &proof));
 
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
-        bump(&mut bad, x);
+        bad.get_mut(x)[0] = bad.get_mut(x)[0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
     }
 
@@ -2483,7 +2481,7 @@ mod tests {
         assert!(verify_shard(&store, &ops, &proof));
 
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
-        bump(&mut bad, ln_w);
+        bad.get_mut(ln_w)[0] = bad.get_mut(ln_w)[0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
     }
 
@@ -2506,42 +2504,32 @@ mod tests {
         assert!(verify_shard(&store, &ops, &proof));
 
         let mut bad = Store { v: store.v.clone(), idx: store.idx.clone() };
-        bump(&mut bad, x);
+        bad.get_mut(x)[0] = bad.get_mut(x)[0] + Goldilocks::ONE;
         assert!(!verify_shard(&bad, &ops, &proof));
     }
 
     #[test]
-    /// The table is finite. Every variance the generator claims to cover must
-    /// land inside it, and the model with the largest documented variance must
-    /// fit with room to spare.
-    ///
     /// This is the check that makes the coarse-step choice decidable rather than
     /// a judgement call: halving the step doubles the index range consumed, so a
     /// step that is correct for one model can silently run a larger one off the
     /// end of the table.
     #[test]
     fn rsqrt_index_stays_inside_the_generated_table() {
-        // Mirrors scripts/extract_rsqrt_piecewise.py.
         const FINE: i64 = 1 << 20;
-        const COARSE: i64 = 1 << 20;
+        const COARSE: i64 = 1 << 22;
         const COARSE_STEP: i64 = 1 << 8;
+        const COARSE2: i64 = 1 << 21;
+        const COARSE_STEP2: i64 = 1 << 16;
         const INDEX_SCALE: i64 = 1 << 14;
-        assert_eq!(RSQRT_TABLE_LEN, (FINE + COARSE) as usize);
-
-        // The largest raw index the generator emits an entry for.
-        let max_raw = FINE + (COARSE - 1) * COARSE_STEP;
-        // rsqrt_index takes variance at 2^32 scale; raw = var / 2^18.
+        assert_eq!(RSQRT_TABLE_LEN, (FINE + COARSE + COARSE2) as usize);
+        let coarse2_start = FINE + COARSE * COARSE_STEP;
+        let max_raw = coarse2_start + (COARSE2 - 1) * COARSE_STEP2;
         let max_var = max_raw << 18;
         assert!(
             (rsqrt_index(max_var) as usize) < RSQRT_TABLE_LEN,
             "the generator's own maximum variance indexes past the end of its table"
         );
         assert_eq!(max_raw as f64 / INDEX_SCALE as f64, RSQRT_MAX_VARIANCE);
-        // (the generator prints this rounded to 16448.0; the exact value is above)
-
-        // GPT-2's documented worst case (~13294, per the generator docstring)
-        // must fit. If a future model exceeds RSQRT_MAX_VARIANCE this is the
-        // test that should fail, rather than a forward pass panicking.
         let gpt2_max = (13_294i64 * INDEX_SCALE) << 18;
         assert!(
             (rsqrt_index(gpt2_max) as usize) < RSQRT_TABLE_LEN,
@@ -2549,15 +2537,11 @@ mod tests {
         );
     }
 
-    /// Prove the guard can actually fail. A check that cannot reject anything
-    /// is not a check -- and a wrong-sized table is a live mistake: the
-    /// superseded scripts/extract_rsqrt_table.py emits 2^19 uniform entries,
-    /// which reaches a forward pass and dies as a bare index-out-of-bounds.
+    /// Prove the guard can actually fail.
     #[test]
     #[should_panic(expected = "rsqrt table has")]
     fn check_rsqrt_table_rejects_the_superseded_uniform_table() {
         let superseded = vec![Goldilocks::ZERO; 1 << 19];
-        // an index a real GPT-2 forward pass reaches, past the end of the short table
         check_rsqrt_table(&superseded, 1 << 20);
     }
 

@@ -42,7 +42,7 @@ fn main() {
         let t0 = Instant::now();
         let proof = prove_model(&mut store, &ops, Granularity::Ops(g), 1, &mut rng);
         let dt = t0.elapsed();
-        assert!(verify_model(&store, &ops, Granularity::Ops(g), 1, &proof), "verify failed at {g}");
+        assert!(verify_model(&mut store, &ops, Granularity::Ops(g), 1, &proof), "verify failed at {g}");
         println!("ops_per_shard={:>2}: {:>8.1?}  ({} shards)", g, dt, proof.shards.len());
         if dt < best.1 {
             best = (g, dt);

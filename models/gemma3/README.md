@@ -42,5 +42,5 @@ Measured (seq=16, release, 64-thread CPU):
 
 | shards | prove | verify | total | argmax | peak RSS |
 | --- | --- | --- | --- | --- | --- |
-| 22 (per layer) | 30.4 s | 15.8 s | ~46.2 s | 16/16 | ~28 GB |
-| 22 (per layer) | 52.5 s | 37.9 s | ~90.4 s | 469/512 | ~39 GB |
+| 22 (per layer) | 33.6 s | 16.9 s | ~50.5 s | 16/16 | ~24.3 GB |
+| 22 (per layer) | 58.5 s | 38.6 s | ~97.1 s | 505/512 | ~34.4 GB |

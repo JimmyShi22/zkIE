@@ -1,9 +1,9 @@
-//! Prove the full DeepSeek-V2-Lite graph at per-layer granularity and report
-//! prove time + peak RSS.
+//! Prove + verify the full DeepSeek-V2-Lite graph at per-layer granularity and
+//! report prove/verify time + peak RSS.
 
 use zkie_core::common::field::XorShift64;
 use zkie_models_deepseek_v2_lite::build_deepseek;
-use zkie_ops::compose::{prove_shard_dag, Store};
+use zkie_ops::compose::{prove_shard_dag, verify_shard_dag, Store};
 
 fn peak_rss_kb() -> u64 {
     let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
@@ -16,7 +16,10 @@ fn peak_rss_kb() -> u64 {
 }
 
 fn main() {
-    let m = 16usize;
+    let m = std::env::var("M")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16usize);
     let dir = "models/deepseek-v2-lite/weights";
     let mut store = Store::new();
     let mut ops = Vec::new();
@@ -29,4 +32,9 @@ fn main() {
     let proof = prove_shard_dag(&mut store, &ops, 718, &mut rng);
     let prove_t = t0.elapsed();
     println!("prove {prove_t:?} shards={} rss={}kB", proof.shards.len(), peak_rss_kb());
+
+    let t1 = std::time::Instant::now();
+    let ok = verify_shard_dag(&mut store, &ops, 718, &proof);
+    let verify_t = t1.elapsed();
+    println!("verify {verify_t:?} ok={ok} rss={}kB", peak_rss_kb());
 }

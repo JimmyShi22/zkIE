@@ -3,9 +3,11 @@
 //! + horizon SiLU head + rescale. Assembles into `Vec<compose::Op>`.
 
 use std::fs;
+use std::sync::Arc;
 
 use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing};
 use zkie_core::common::fixed_point::{from_i32, from_i64};
+use zkie_core::common::weights_io::WeightMmap;
 use zkie_ops::compose::{Op, Store};
 
 pub const H: usize = 1280;
@@ -92,9 +94,9 @@ fn build_layer(
     let qkv_b = load_i32(&format!("{dir}/L{layer}_qkv_b_i32.bin"));
     let o_w = load_i32(&format!("{dir}/L{layer}_o_proj_w_i32.bin"));
     let o_b = load_i32(&format!("{dir}/L{layer}_o_proj_b_i32.bin"));
-    let gate_w = load_i32(&format!("{dir}/L{layer}_gate_w_i32.bin"));
+    let gate_w = Arc::new(WeightMmap::open(&format!("{dir}/L{layer}_gate_w_i32.bin")).unwrap());
     let gate_b = load_i32(&format!("{dir}/L{layer}_gate_b_i32.bin"));
-    let down_w = load_i32(&format!("{dir}/L{layer}_down_w_i32.bin"));
+    let down_w = Arc::new(WeightMmap::open(&format!("{dir}/L{layer}_down_w_i32.bin")).unwrap());
     let down_b = load_i32(&format!("{dir}/L{layer}_down_b_i32.bin"));
     let lnw = load_i32(&format!("{dir}/L{layer}_lnw_i32.bin"));
     let mlp_w = load_i32(&format!("{dir}/L{layer}_mlp_w_i32.bin"));
@@ -164,9 +166,9 @@ fn build_layer(
     let mlp_b_t = store.push(broadcast(&mlp_b, SEQ));
     let ln = store.push(vec![]);
     ops.push(Op::LayerNormCentered { x: x2, w: mlp_w_t, b: mlp_b_t, out: ln, rsqrt_table: rsqrt_t, m: SEQ, d: H_PAD, n_real: H });
-    let gate_w_t = store.push(gate_w);
+    let gate_w_t = store.push_mmap(gate_w.clone(), 0, gate_w.len());
     let gate_b_t = store.push(broadcast(&gate_b, SEQ));
-    let down_w_t = store.push(down_w);
+    let down_w_t = store.push_mmap(down_w.clone(), 0, down_w.len());
     let down_b_t = store.push(broadcast(&down_b, SEQ));
     let gate = store.push(vec![]);
     let gate_rem = store.push(vec![]);

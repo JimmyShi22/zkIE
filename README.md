@@ -90,18 +90,27 @@ stays on the CPU.
 
 ## Usage
 
-Build and run the real GPT-2 512 end-to-end proof (weights/tables are under
-`models/gpt2/weights/`, expected at the repo root):
+Each model has its own crate under `models/`. Weights and lookup tables are
+gitignored and expected under each model's `weights/` directory (export steps
+and sha256 are in the per-model `README.md`).
 
 ```bash
-# full GPT-2 512 proof: argmax sanity check + prove/verify time
+# GPT-2 124M - end-to-end proof, shard sweep, and autotune
 cargo run --release -p zkie-models-gpt2 --example prove
-
-# shard-granularity sweep
 cargo run --release -p zkie-models-gpt2 --example bench_sharded
-
-# autotune over shard granularities
 cargo run --release -p zkie-models-gpt2 --example bench_autotune
+
+# TimesFM 1.0 200M
+cargo run --release -p zkie-models-timesfm --example prove
+cargo run --release -p zkie-models-timesfm --example bench
+
+# Gemma 3 270M (sequence length via GEMMA_SEQ, default 16)
+GEMMA_SEQ=16 cargo run --release -p zkie-models-gemma3 --example prove
+GEMMA_SEQ=16 cargo run --release -p zkie-models-gemma3 --example bench
+
+# DeepSeek-V2-Lite (sequence length via M, default 16)
+M=16 cargo run --release -p zkie-models-deepseek-v2-lite --example prove
+M=16 cargo run --release -p zkie-models-deepseek-v2-lite --example bench
 
 # library tests
 cargo test --workspace
@@ -114,16 +123,16 @@ To add a new model, see [docs/adding-a-model.md](docs/adding-a-model.md).
 Measured on a 64-thread CPU. Full detail and the reasoning behind the numbers
 is in [`docs/benchmarks.md`](docs/benchmarks.md).
 
-| Model | Active / Total params | Setup | Wall time | Peak RSS |
-| --- | --- | --- | --- | --- |
-| GPT-2 124M | 124M / 124M | seq=16, 13 shards (per layer) | ~27.2 s | ~38 GB |
-| GPT-2 124M | 124M / 124M | seq=512, 13 shards (per layer) | **~54.3 s** | ~43 GB |
-| TimesFM 1.0 200M | 200M / 200M | seq=16, 20 shards (per layer) | ~37.5 s | ~25.5 GB |
-| Gemma 3 270M | 270M / 270M | seq=16, 22 shards (per layer) | ~46.2 s | ~28 GB |
-| Gemma 3 270M | 270M / 270M | seq=512, 22 shards (per layer) | ~90.4 s | ~39 GB |
-| DeepSeek-V2-Lite | 2.4B / 15.7B | seq=16, 21 shards (lazy-open MoE, top-k routing) | ~490 s prove / ~269 s verify | ~242 GB |
-| DeepSeek-V2-Lite | 2.4B / 15.7B | seq=512, 28 shards (lazy-open MoE, mmap weights) | ~1588 s prove (~26.5 min) | ~377 GB |
-| DeepSeek-V4.1-Flash | 8B/16B* / 552B | MoE + CSA2 + vision (planned) | - | - |
+| Model | Active / Total params | Setup | Prove | Verify | Peak RSS |
+| --- | --- | --- | --- | --- | --- |
+| TimesFM 1.0 200M | 200M / 200M | seq=16, 20 shards (per layer) | ~28.2 s | ~11.0 s | ~13.8 GB |
+| GPT-2 124M | 124M / 124M | seq=16, 13 shards (per layer) | ~18.7 s | ~8.5 s | ~39.3 GB |
+| GPT-2 124M | 124M / 124M | seq=512, 13 shards (per layer) | **~34.3 s** | **~21.2 s** | ~42.5 GB |
+| Gemma 3 270M | 270M / 270M | seq=16, 22 shards (per layer) | ~33.6 s | ~16.9 s | ~24.3 GB |
+| Gemma 3 270M | 270M / 270M | seq=512, 22 shards (per layer) | ~58.5 s | ~38.6 s | ~34.4 GB |
+| DeepSeek-V2-Lite | 2.4B / 15.7B | seq=16, 21 shards (lazy-open MoE, mmap weights) | ~515.2 s | ~268.1 s | ~124.9 GB |
+| DeepSeek-V2-Lite | 2.4B / 15.7B | seq=512, 28 shards (lazy-open MoE, mmap weights) | ~1547.3 s (~25.8 min) | ~1065.3 s (~17.8 min) | ~374.4 GB |
+| DeepSeek-V4.1-Flash | 8B/16B* / 552B | MoE + CSA2 + vision (planned) | - | - | - |
 
 * DeepSeek-V4.1-Flash active params: 8B prefill / 16B decode.
 
@@ -148,10 +157,10 @@ is in [`docs/benchmarks.md`](docs/benchmarks.md).
     autotune loop.
   - `benchmark/` — generic (non-model) micro-benchmarks of the primitives and
     the WHIR/FRI PCS.
-- `models/gpt2/`, `models/timesfm/` — one crate per model; each holds the
-  op-graph builder (`src/lib.rs`), its own `examples/` (prove + benchmarks),
-  and a gitignored `weights/` (export steps + sha256 in the per-model
-  `README.md`).
+- `models/gpt2/`, `models/timesfm/`, `models/gemma3/`,
+  `models/deepseek-v2-lite/` — one crate per model; each holds the op-graph
+  builder (`src/lib.rs`), its own `examples/` (prove + benchmarks), and a
+  gitignored `weights/` (export steps + sha256 in the per-model `README.md`).
 - `docs/` — `spec.md` (design), `benchmarks.md` (measurements),
   `adding-a-model.md` (how to add a new model), `roadmap.md`.
 
