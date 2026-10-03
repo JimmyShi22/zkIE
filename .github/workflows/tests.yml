@@ -1,0 +1,57 @@
+# Minimal CI: compile the workspace and run the library tests.
+#
+# Scope is deliberately small. It is `--workspace --lib`, not `--workspace`,
+# because `gpt2`, `gemma3` and `timesfm` each ship examples named `prove` and
+# `bench` which all link to the same `target/debug/examples/prove` path. That
+# collision makes a bare `cargo test --workspace` abort before any test runs.
+# Renaming them is worth doing, but it changes documented commands, so it is
+# left as a separate decision rather than folded in here.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Deliberately NOT `RUSTFLAGS: -D warnings`. The tree currently has warnings,
+  # so that would make this red on arrival and the first instinct would be to
+  # switch CI off. Worth turning on once the tree is clean, as a separate call.
+
+jobs:
+  test:
+    name: cargo test --workspace --lib
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # The workspace crates are edition 2021, but the vendored
+      # crates/zkie-core/vendor/p3-merkle-tree is edition 2024, which needs
+      # Rust >= 1.85. Reading the workspace manifests alone hides that, so it is
+      # checked explicitly rather than left to fail as a confusing parse error.
+      - name: Check toolchain
+        run: |
+          rustc --version
+          cargo --version
+          rustc -vV | grep -q 'release: 1\.\(8[5-9]\|9[0-9]\|[0-9]\{3\}\)' || {
+            echo "::error::Rust >= 1.85 is required (vendored p3-merkle-tree is edition 2024)"
+            exit 1
+          }
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build
+        run: cargo build --workspace --lib --locked
+
+      - name: Test
+        run: cargo test --workspace --lib --locked
