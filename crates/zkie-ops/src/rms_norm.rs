@@ -3,7 +3,7 @@
 //! `rstd = rsqrt_table[rsqrt_index(ms)]`. Mirrors `LayerNormCentered`'s
 //! actually-verified chain: ms truncation + rsqrt lookup + out affine.
 
-use crate::compose::rsqrt_index;
+use crate::compose::{check_rsqrt_table, rsqrt_index};
 use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64};
 use zkie_core::common::fixed_point::{from_i64, to_i64};
 use zkie_core::common::logup_gkr::{
@@ -58,6 +58,7 @@ pub fn rms_norm_forward(
         })
         .collect();
     let s_index: Vec<u32> = ms.iter().map(|&v| rsqrt_index(to_i64(v))).collect();
+    check_rsqrt_table(rsqrt_table, s_index.iter().copied().max().unwrap_or(0));
     let rstd: Vec<Goldilocks> = s_index.iter().map(|&i| rsqrt_table[i as usize]).collect();
     let raw: Vec<Goldilocks> = (0..m * d).map(|ij| x[ij] * rstd[ij / d] * w[ij]).collect();
     let out: Vec<Goldilocks> = (0..m * d)
