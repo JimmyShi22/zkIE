@@ -751,6 +751,40 @@ pub fn causal_mask(m: usize) -> Vec<Goldilocks> {
 /// Piecewise rsqrt-table index for a 2^32-scale LayerNorm variance: the raw
 /// index is `round(var / 2^18)` (2^14 scale); indices below 2^20 are full
 /// resolution, raw in [2^20, 2^30) use step 2^8, and raw >= 2^30 use step 2^16.
+/// Number of entries in the piecewise rsqrt table, fixed by
+/// `scripts/extract_rsqrt_piecewise.py`: 2^20 step-1 entries, followed by 2^22
+/// coarse entries at step 2^8 and 2^21 coarse entries at step 2^16.
+pub const RSQRT_TABLE_LEN: usize = (1 << 20) + (1 << 22) + (1 << 21);
+
+/// Largest real variance the generated table covers:
+/// `(FINE + COARSE * COARSE_STEP + (COARSE2 - 1) * COARSE_STEP2) / INDEX_SCALE`.
+pub const RSQRT_MAX_VARIANCE: f64 = 8454204.0;
+
+/// Check a loaded rsqrt table covers the indices about to be read from it.
+///
+/// Deliberately a bounds check and not `len() == RSQRT_TABLE_LEN`: the ops work
+/// with any table large enough for the data, and the unit tests legitimately use
+/// smaller ones. What must never happen is reading past the end.
+///
+/// Without this a short table fails as a bare `index out of bounds` from inside
+/// a forward pass, minutes into a run and a long way from the cause. It is a
+/// live mistake rather than a hypothetical one: two generators exist, and the
+/// superseded `scripts/extract_rsqrt_table.py` emits 2^19 uniform entries, so
+/// running the wrong one produces a file that looks perfectly normal.
+pub fn check_rsqrt_table(table: &[Goldilocks], max_index: u32) {
+    assert!(
+        (max_index as usize) < table.len(),
+        "rsqrt table has {} entries but the forward pass needs index {}. \
+         Regenerate with scripts/extract_rsqrt_piecewise.py ({} entries, covering \
+         variance up to {:.6}) - NOT extract_rsqrt_table.py, which is superseded and \
+         emits 2^19 uniform entries.",
+        table.len(),
+        max_index,
+        RSQRT_TABLE_LEN,
+        RSQRT_MAX_VARIANCE
+    );
+}
+
 pub fn rsqrt_index(var: i64) -> u32 {
     const FINE: i64 = 1 << 20;
     const COARSE: i64 = 1 << 22;
@@ -2475,6 +2509,42 @@ mod tests {
     }
 
     #[test]
+    /// This is the check that makes the coarse-step choice decidable rather than
+    /// a judgement call: halving the step doubles the index range consumed, so a
+    /// step that is correct for one model can silently run a larger one off the
+    /// end of the table.
+    #[test]
+    fn rsqrt_index_stays_inside_the_generated_table() {
+        const FINE: i64 = 1 << 20;
+        const COARSE: i64 = 1 << 22;
+        const COARSE_STEP: i64 = 1 << 8;
+        const COARSE2: i64 = 1 << 21;
+        const COARSE_STEP2: i64 = 1 << 16;
+        const INDEX_SCALE: i64 = 1 << 14;
+        assert_eq!(RSQRT_TABLE_LEN, (FINE + COARSE + COARSE2) as usize);
+        let coarse2_start = FINE + COARSE * COARSE_STEP;
+        let max_raw = coarse2_start + (COARSE2 - 1) * COARSE_STEP2;
+        let max_var = max_raw << 18;
+        assert!(
+            (rsqrt_index(max_var) as usize) < RSQRT_TABLE_LEN,
+            "the generator's own maximum variance indexes past the end of its table"
+        );
+        assert_eq!(max_raw as f64 / INDEX_SCALE as f64, RSQRT_MAX_VARIANCE);
+        let gpt2_max = (13_294i64 * INDEX_SCALE) << 18;
+        assert!(
+            (rsqrt_index(gpt2_max) as usize) < RSQRT_TABLE_LEN,
+            "GPT-2's documented maximum variance does not fit the table"
+        );
+    }
+
+    /// Prove the guard can actually fail.
+    #[test]
+    #[should_panic(expected = "rsqrt table has")]
+    fn check_rsqrt_table_rejects_the_superseded_uniform_table() {
+        let superseded = vec![Goldilocks::ZERO; 1 << 19];
+        check_rsqrt_table(&superseded, 1 << 20);
+    }
+
     fn rsqrt_index_piecewise() {
         // Below the fine boundary: raw index = round(var / 2^18).
         assert_eq!(rsqrt_index(0), 0);
