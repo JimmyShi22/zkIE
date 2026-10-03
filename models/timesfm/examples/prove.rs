@@ -18,7 +18,7 @@ fn main() {
     let proof = prove_shard_dag(&mut store, &ops, ops_per_shard, &mut rng);
     let prove_t = t0.elapsed();
     let t1 = std::time::Instant::now();
-    assert!(verify_shard_dag(&store, &ops, ops_per_shard, &proof));
+    assert!(verify_shard_dag(&mut store, &ops, ops_per_shard, &proof));
     let verify_t = t1.elapsed();
     println!("prove {:?}, verify {:?}", prove_t, verify_t);
 

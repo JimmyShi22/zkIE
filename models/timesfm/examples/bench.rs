@@ -32,7 +32,7 @@ fn main() {
         let proof = prove_shard_dag(&mut s, &ops, pps, &mut rng);
         let prove_t = t0.elapsed();
         let t1 = std::time::Instant::now();
-        assert!(verify_shard_dag(&s, &ops, pps, &proof));
+        assert!(verify_shard_dag(&mut s, &ops, pps, &proof));
         let verify_t = t1.elapsed();
         let total_t = (prove_t + verify_t).as_secs_f64();
         println!("pps={pps:5} prove={prove_t:?} verify={verify_t:?} total={total_t:.2}s rss={}kB",
