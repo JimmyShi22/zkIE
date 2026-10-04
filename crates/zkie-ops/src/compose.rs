@@ -919,10 +919,26 @@ impl Store {
 /// crosses a node boundary and there is nothing for another node to lie about -
 /// the verifier's recomputation remains the soundness anchor, unchanged.
 ///
-/// Contrast [`forward_ops`], which materialises the whole graph and holds it:
-/// that is the ~90 % of peak memory this exists to avoid. The cost is that each
-/// node redundantly recomputes the prefix before its own shard, which is cheap
-/// (forward is a small fraction of proving) and perfectly parallel.
+/// Contrast [`forward_ops`], which materialises the whole graph and holds it.
+/// Measured on DeepSeek-V2-Lite (Deucalion, one node, `bench_forward_shard`):
+///
+/// | seq | whole-graph forward | worst-case shard | saving |
+/// |-----|--------------------|------------------|--------|
+/// | 512 | 223.2 GiB          | 121.7 GiB        | 45 %   |
+/// | 16  | 51.4 GiB           | 50.3 GiB         | 2 %    |
+///
+/// The saving is strongly sequence-dependent, and that matters for anyone
+/// testing this: at short sequences the resident weights dominate and liveness
+/// has almost nothing to release, so a small fixture will suggest this does
+/// nothing. The win only appears once activations outweigh weights.
+///
+/// Note the worst case is the LAST shard, not the largest: this runs
+/// `ops[..shard.end]`, so the final shard pays the high-water mark of the whole
+/// prefix even though its own live set is the smallest.
+///
+/// The cost is that each node redundantly recomputes the prefix before its own
+/// shard, which is cheap (forward is a small fraction of proving) and perfectly
+/// parallel.
 ///
 /// After this returns, the tensors read or written by `ops[shard]` hold exactly
 /// the values `forward_ops` would have produced. Everything else is released.

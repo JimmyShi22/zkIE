@@ -1,9 +1,24 @@
 //! Does `forward_shard` actually remove the global-materialisation floor?
 //!
-//! On Deucalion, DeepSeek-V2-Lite at seq=512 peaks at ~330 GiB and that floor is
-//! ~90 % of total memory - measured over three granularities, and it barely moves
-//! with shard count because `forward_ops` materialises the whole graph before any
-//! shard is proven. `forward_shard` is supposed to collapse exactly that.
+//! Context: on Deucalion, DeepSeek-V2-Lite PROVE at seq=512 peaks at ~315 GiB, and
+//! that peak barely moves with shard count (318 / 315 / 291 GiB at 14 / 28 / 56
+//! shards) because `prove_shard_dag` calls `forward_ops` first and materialises
+//! the whole graph before any shard is proven. `forward_shard` exists to collapse
+//! that part.
+//!
+//! RESULT (this benchmark, one node, ref e7eab84):
+//!
+//!   seq=512   whole-graph forward 223.2 GiB  ->  worst-case shard 121.7 GiB  (-45 %)
+//!   seq=16    whole-graph forward  51.4 GiB  ->  worst-case shard  50.3 GiB  (-2 %)
+//!
+//! Two things that are easy to get wrong when reading this:
+//!
+//!   1. Forward is 71 % of the PROVE peak at seq=512, not all of it. The remaining
+//!      ~92 GiB is proving work for all shards running concurrently on one shared
+//!      store. This benchmark does not measure that; `bench_prove_shard` does.
+//!   2. The saving is sequence-dependent and nearly vanishes at seq=16, where
+//!      resident weights dominate and liveness has nothing to release. A small
+//!      fixture will therefore suggest this change does nothing.
 //!
 //! ONE MODE PER PROCESS, deliberately: VmHWM is a high-water mark that never
 //! decreases, so running both in one process would report the larger of the two
