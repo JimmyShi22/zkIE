@@ -2744,6 +2744,25 @@ mod tests {
         assert!(live > 0, "test is vacuous - the shard needs nothing");
     }
 
+    /// The benchmark uses `forward_shard(.., 0..ops.len())` as its "full forward"
+    /// baseline, on the grounds that a whole-graph keep-set releases nothing.
+    /// That equivalence is load-bearing for the comparison, so assert it rather
+    /// than assume it.
+    #[test]
+    fn forward_shard_over_the_whole_graph_equals_a_full_forward() {
+        let (base, ops) = real_layer_graph();
+        let clone_store = |s: &Store| {
+            let mut c = Store { v: Vec::with_capacity(s.v.len()), idx: s.idx.clone() };
+            for t in 0..s.v.len() { c.v.push(TensorData::Owned(s.get(t).to_vec())); }
+            c
+        };
+        let mut a = clone_store(&base); forward_ops(&mut a, &ops);
+        let mut b = clone_store(&base); forward_shard(&mut b, &ops, 0..ops.len());
+        for t in 0..a.v.len() {
+            assert_eq!(a.get(t), b.get(t), "tensor {t} differs: the baseline is not equivalent");
+        }
+    }
+
     /// The saving, measured rather than asserted in prose.
     ///
     /// Counts live tensor elements after a full forward against after a sharded
