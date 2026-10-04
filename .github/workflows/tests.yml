@@ -56,11 +56,17 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      # --release is REQUIRED, not an optimisation. In debug the WHIR/PCS tests in
+      # zkie-core are pathologically slow - unoptimised field arithmetic - and the
+      # suite consumes ~11 CPU-hours where release takes 35 s. On a 2-core runner
+      # that is ~5.5 hours against any sane timeout, so debug CI could never pass
+      # on any commit with any cache. Measured on a 32-thread box: 26 minutes and
+      # still unfinished, 16 of 21 tests done, five individually past 60 s.
       - name: Build
-        run: cargo build --workspace --lib --locked
+        run: cargo build --release --workspace --lib --locked
 
       - name: Test
-        run: cargo test --workspace --lib --locked
+        run: cargo test --release --workspace --lib --locked
 
       - name: Save cargo cache
         if: always()        # especially on timeout - see the note above
