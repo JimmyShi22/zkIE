@@ -23,7 +23,7 @@ jobs:
   test:
     name: cargo test --workspace --lib
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -40,8 +40,14 @@ jobs:
             exit 1
           }
 
-      - name: Cache cargo registry and target
-        uses: actions/cache@v4
+      # restore/save split, not actions/cache, deliberately: actions/cache only
+      # writes on success, so a run that times out saves nothing and the NEXT run
+      # is cold too. That is self-perpetuating - the first 30-minute timeout
+      # guaranteed every later run would also time out. Saving with `if: always()`
+      # breaks the cycle.
+      - name: Restore cargo cache
+        id: cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -55,3 +61,13 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --lib --locked
+
+      - name: Save cargo cache
+        if: always()        # especially on timeout - see the note above
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
