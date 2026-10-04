@@ -2829,6 +2829,75 @@ mod tests {
         );
     }
 
+    /// Which ops carry a proof of their own, and which are checked ONLY because the
+    /// verifier recomputes the forward pass.
+    ///
+    /// The eight payload-free `OpProof` variants are exactly the ops with no proof.
+    /// They are sound today only because `verify_shard` / `verify_shard_dag` call
+    /// `forward_ops` first — which is why verification costs ~90 % of proving at
+    /// seq=512 (measured on Deucalion, job 1978268). A claim-driven verifier needs a
+    /// claim-transfer rule for each of them, so **this set must not grow without
+    /// someone deciding that it should**.
+    ///
+    /// The match is deliberately EXHAUSTIVE with no wildcard: adding an `OpProof`
+    /// variant will not compile until it is classified here. That turns "this op has
+    /// no proof" from something you discover by reading into something the build
+    /// forces you to state.
+    fn carries_its_own_proof(p: &OpProof) -> bool {
+        match p {
+            // No proof of their own. Transpose is free (a claim maps across it by
+            // relabelling variables). Scale / ScaleVec / ScaleGate each apply
+            // `round_div`, so they need a rounding remainder and a range check, as
+            // `Projection` already does with `rem`. Relu and the three Index ops are
+            // table functions, so they need a lookup (`logup_gkr` is already in tree).
+            OpProof::Transpose
+            | OpProof::Scale
+            | OpProof::ScaleVec
+            | OpProof::ScaleGate
+            | OpProof::Relu
+            | OpProof::SoftmaxIndex
+            | OpProof::GeluIndex
+            | OpProof::StableSoftmaxIndex => false,
+            // Carry their own argument.
+            OpProof::MatMul(..)
+            | OpProof::Projection(..)
+            | OpProof::Add(..)
+            | OpProof::Lookup(..)
+            | OpProof::Softmax(..)
+            | OpProof::Layernorm(..)
+            | OpProof::LayerNormCentered(..)
+            | OpProof::RmsNorm(..)
+            | OpProof::RoPE(..)
+            | OpProof::TopKSelect(..) => true,
+        }
+    }
+
+    /// Pins the unproven set at eight. Fails in BOTH directions: if an op gains a
+    /// real proof its variant takes a payload and this array stops compiling; if a
+    /// ninth unproven op is added, `carries_its_own_proof` stops compiling until it
+    /// is classified, and then this count fails.
+    #[test]
+    fn ops_without_their_own_proof_are_the_known_eight() {
+        let unproven = [
+            OpProof::Transpose,
+            OpProof::Scale,
+            OpProof::ScaleVec,
+            OpProof::ScaleGate,
+            OpProof::Relu,
+            OpProof::SoftmaxIndex,
+            OpProof::GeluIndex,
+            OpProof::StableSoftmaxIndex,
+        ];
+        assert_eq!(
+            unproven.len(),
+            8,
+            "the set of ops with no proof of their own changed; see the succinct-verification thread before adjusting"
+        );
+        for p in &unproven {
+            assert!(!carries_its_own_proof(p), "classified as proven but has no payload");
+        }
+    }
+
     /// `writes()` must match what `forward_ops` ACTUALLY assigns, so the test
     /// runs each op for real and diffs the store.
     ///
