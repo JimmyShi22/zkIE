@@ -34,8 +34,9 @@ proof that the output is what the model computes. Today the verifier still
 recomputes the forward pass to obtain its interior evaluations (`verify_shard` /
 `verify_shard_dag`, `compose.rs`), so verifying costs about as much as proving
 (measured: verify ~90% of prove at seq=512, CPU); making verification succinct,
-with no re-run, is the open design item tracked in #15. Weights and activations are public: the current
-route targets correctness and succinctness rather than witness hiding.
+with no re-run, is the open design item tracked in #15. Weights and activations
+are public: the current route targets correctness and succinctness rather than
+witness hiding.
 
 ## How it works
 
