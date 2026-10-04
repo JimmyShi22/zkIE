@@ -893,6 +893,71 @@ pub fn shard_inputs(ops: &[Op], range: std::ops::Range<usize>) -> Vec<T> {
     need.into_iter().collect()
 }
 
+impl Store {
+    /// Drop a tensor's data, keeping its slot. Used by [`forward_shard`] to
+    /// release intermediates the moment nothing downstream reads them.
+    ///
+    /// The slot stays so tensor ids remain stable - ids are indices, and
+    /// renumbering them would invalidate every `Op` in the graph.
+    pub fn release(&mut self, id: T) {
+        self.v[id] = TensorData::Owned(Vec::new());
+    }
+}
+
+/// Materialise what one shard needs, releasing every intermediate as soon as
+/// nothing downstream reads it.
+///
+/// This is the distributed path. Each node runs the forward from the start up to
+/// its own shard and proves against tensors it computed itself, so no value
+/// crosses a node boundary and there is nothing for another node to lie about -
+/// the verifier's recomputation remains the soundness anchor, unchanged.
+///
+/// Contrast [`forward_ops`], which materialises the whole graph and holds it:
+/// that is the ~90 % of peak memory this exists to avoid. The cost is that each
+/// node redundantly recomputes the prefix before its own shard, which is cheap
+/// (forward is a small fraction of proving) and perfectly parallel.
+///
+/// After this returns, the tensors read or written by `ops[shard]` hold exactly
+/// the values `forward_ops` would have produced. Everything else is released.
+pub fn forward_shard(store: &mut Store, ops: &[Op], shard: std::ops::Range<usize>) {
+    assert!(shard.end <= ops.len(), "shard range past the end of the graph");
+    let prefix = &ops[..shard.end];
+
+    // What the shard's proof will read: its ops' inputs and outputs.
+    let keep: std::collections::BTreeSet<T> = ops[shard.clone()]
+        .iter()
+        .flat_map(|o| o.reads().into_iter().chain(o.writes()))
+        .collect();
+
+    // Last op index that reads each tensor, over the prefix we are about to run.
+    // A tensor with no later reader is dead the moment its last reader is done.
+    let mut last_read: std::collections::BTreeMap<T, usize> = Default::default();
+    for (i, op) in prefix.iter().enumerate() {
+        for t in op.reads() {
+            last_read.insert(t, i);
+        }
+    }
+
+    for (i, op) in prefix.iter().enumerate() {
+        forward_ops(store, std::slice::from_ref(op));
+        // Release what this op was the last to read, unless the shard needs it.
+        // Note this frees weights and lookup tables too once they are finished
+        // with, which on a large model is most of the footprint.
+        for (&t, &last) in last_read.iter() {
+            if last == i && !keep.contains(&t) {
+                store.release(t);
+            }
+        }
+        // An op's own outputs can also be dead on arrival: produced inside the
+        // prefix, never read again, and not needed by the shard.
+        for t in op.writes() {
+            if !keep.contains(&t) && !last_read.contains_key(&t) {
+                store.release(t);
+            }
+        }
+    }
+}
+
 fn forward_ops(store: &mut Store, ops: &[Op]) {
     for op in ops.iter().cloned() {
         match op {
@@ -2605,6 +2670,118 @@ mod tests {
             &mut store, x, heads, m, d, ffn, shift, exp_table, gelu_table, rsqrt_table, &mut rng,
         );
         (store, ops)
+    }
+
+    /// `forward_shard` must leave the shard's tensors holding EXACTLY what the
+    /// full forward would have produced. If liveness is wrong and something is
+    /// released too early, a later op reads an empty tensor and the values
+    /// diverge - which is the failure this has to exclude, because on a cluster
+    /// it would surface as a proof that verifies against the wrong witness.
+    #[test]
+    fn forward_shard_matches_full_forward_for_every_shard() {
+        let (base, ops) = real_layer_graph();
+        let clone_store = |s: &Store| {
+            let mut c = Store { v: Vec::with_capacity(s.v.len()), idx: s.idx.clone() };
+            for t in 0..s.v.len() { c.v.push(TensorData::Owned(s.get(t).to_vec())); }
+            c
+        };
+        let mut full = clone_store(&base);
+        forward_ops(&mut full, &ops);
+
+        for lo in 0..ops.len() {
+            for hi in (lo + 1)..=ops.len() {
+                let mut part = clone_store(&base);
+                forward_shard(&mut part, &ops, lo..hi);
+                let needed: std::collections::BTreeSet<T> = ops[lo..hi]
+                    .iter()
+                    .flat_map(|o| o.reads().into_iter().chain(o.writes()))
+                    .collect();
+                for &t in &needed {
+                    assert_eq!(
+                        part.get(t), full.get(t),
+                        "shard {lo}..{hi}: tensor {t} differs from the full forward"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The whole point is releasing memory, so assert it actually happens.
+    /// A `forward_shard` that is merely correct and frees nothing would pass the
+    /// test above and be useless.
+    #[test]
+    fn forward_shard_actually_releases_what_the_shard_does_not_need() {
+        let (base, ops) = real_layer_graph();
+        let mut part = Store { v: Vec::new(), idx: base.idx.clone() };
+        for t in 0..base.v.len() { part.v.push(TensorData::Owned(base.get(t).to_vec())); }
+
+        // the LAST shard: everything before it should be releasable
+        let lo = ops.len() - 1;
+        forward_shard(&mut part, &ops, lo..ops.len());
+
+        let needed: std::collections::BTreeSet<T> = ops[lo..]
+            .iter()
+            .flat_map(|o| o.reads().into_iter().chain(o.writes()))
+            .collect();
+
+        let mut released = 0usize;
+        let mut live = 0usize;
+        for t in 0..part.v.len() {
+            if needed.contains(&t) { live += 1; } else if part.get(t).is_empty() { released += 1; }
+        }
+        assert!(
+            released > 0,
+            "forward_shard released nothing - it is not saving any memory"
+        );
+        // and it must not have released anything the shard needs
+        for &t in &needed {
+            let produced_in_prefix = ops[..lo].iter().any(|o| o.writes().contains(&t));
+            let preexisting = t < base.v.len() && !base.get(t).is_empty();
+            if produced_in_prefix || preexisting {
+                assert!(!part.get(t).is_empty(), "released tensor {t} that the shard needs");
+            }
+        }
+        assert!(live > 0, "test is vacuous - the shard needs nothing");
+    }
+
+    /// The saving, measured rather than asserted in prose.
+    ///
+    /// Counts live tensor elements after a full forward against after a sharded
+    /// one, on a real layer graph. This is the quantity that becomes the ~330 GiB
+    /// floor at DeepSeek scale, so a regression here is a regression in the whole
+    /// point of the distributed path.
+    #[test]
+    fn forward_shard_holds_less_than_a_full_forward() {
+        let (base, ops) = real_layer_graph();
+        let clone_store = |s: &Store| {
+            let mut c = Store { v: Vec::with_capacity(s.v.len()), idx: s.idx.clone() };
+            for t in 0..s.v.len() { c.v.push(TensorData::Owned(s.get(t).to_vec())); }
+            c
+        };
+        let live = |s: &Store| -> usize { (0..s.v.len()).map(|t| s.get(t).len()).sum() };
+
+        let mut full = clone_store(&base);
+        forward_ops(&mut full, &ops);
+        let full_live = live(&full);
+
+        // middle shard: the interesting case, with a prefix to stream and a
+        // suffix never computed at all
+        let lo = ops.len() / 2;
+        let hi = (lo + 3).min(ops.len());
+        let mut part = clone_store(&base);
+        forward_shard(&mut part, &ops, lo..hi);
+        let part_live = live(&part);
+
+        println!(
+            "live elements: full forward {full_live}, shard {lo}..{hi} {part_live} \
+             ({:.0}% of full)",
+            part_live as f64 / full_live as f64 * 100.0
+        );
+        assert!(
+            part_live < full_live,
+            "forward_shard holds {part_live} elements vs {full_live} for a full forward - \
+             no saving at all"
+        );
     }
 
     /// `writes()` must match what `forward_ops` ACTUALLY assigns, so the test
