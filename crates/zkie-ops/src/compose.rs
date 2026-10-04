@@ -937,8 +937,11 @@ impl Store {
 /// prefix even though its own live set is the smallest.
 ///
 /// The cost is that each node redundantly recomputes the prefix before its own
-/// shard, which is cheap (forward is a small fraction of proving) and perfectly
-/// parallel.
+/// shard. That recompute is perfectly parallel across nodes, but it is NOT cheap:
+/// measured on the seq=512 worst-case shard (`bench_prove_shard`), forward took
+/// 1178 s against 380 s to prove that shard - so the prefix is 76 % of a node's
+/// work, not a small fraction of it. It buys the memory reduction above; it does
+/// not come free, and it caps how much wall-clock distributing this can recover.
 ///
 /// After this returns, the tensors read or written by `ops[shard]` hold exactly
 /// the values `forward_ops` would have produced. Everything else is released.
