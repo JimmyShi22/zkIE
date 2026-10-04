@@ -900,7 +900,14 @@ impl Store {
     /// The slot stays so tensor ids remain stable - ids are indices, and
     /// renumbering them would invalidate every `Op` in the graph.
     pub fn release(&mut self, id: T) {
-        self.v[id] = TensorData::Owned(Vec::new());
+        // Only owned data is worth releasing. An mmap-backed tensor is
+        // file-backed: its pages are already reclaimable by the OS, so dropping
+        // it frees nothing measurable - and it would discard the backing, losing
+        // state that cannot be recovered if the liveness analysis is ever wrong.
+        // Weights on a large model are mmap-backed, so this is the common case.
+        if matches!(self.v[id], TensorData::Owned(_)) {
+            self.v[id] = TensorData::Owned(Vec::new());
+        }
     }
 }
 

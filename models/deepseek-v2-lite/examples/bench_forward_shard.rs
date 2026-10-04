@@ -66,7 +66,15 @@ fn main() {
     }
     let dt = t0.elapsed();
 
-    let live: usize = (0..store.v.len()).map(|t| store.get(t).len()).sum();
+    // Count OWNED elements only. store.get() panics on mmap-backed tensors, and
+    // counting them would be wrong anyway: they are file-backed and already cost
+    // almost nothing resident, which is the quantity this is measuring.
+    let live: usize = (0..store.v.len())
+        .map(|t| match &store.v[t] {
+            zkie_ops::compose::TensorData::Owned(v) => v.len(),
+            _ => 0,
+        })
+        .sum();
     let (s, e) = ranges[idx];
     println!(
         "mode={mode} M={m} ops={} shards={} shard_idx={idx} range={s}..{e} \
