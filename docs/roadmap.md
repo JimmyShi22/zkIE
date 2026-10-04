@@ -54,9 +54,10 @@ New capabilities to prove:
    routing. Memory scales with *active* parameters, not total. This is the only
    lever that lets MoE scale.
 3. **op list built per-forward from the route** - the static chain becomes a
-   data-dependent chain. Since a proof is already for one concrete forward and
-   the verifier only checks the proof (does not re-run), this only changes the
-   build flow, not the proof abstraction.
+   data-dependent chain. Since a proof is already for one concrete forward, this
+   only changes the build flow, not the proof abstraction. (The verifier currently
+   recomputes that forward to read interior evaluations; succinct verification,
+   with no re-run, is tracked in #15.)
 
 Expected order of magnitude (extrapolated from current calibration):
 prove ~10-14 min (seq=512), peak memory ~50-150 GB (fully-resident commitment
