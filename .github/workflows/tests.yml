@@ -23,7 +23,7 @@ jobs:
   test:
     name: cargo test --workspace --lib
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -40,8 +40,14 @@ jobs:
             exit 1
           }
 
-      - name: Cache cargo registry and target
-        uses: actions/cache@v4
+      # restore/save split, not actions/cache, deliberately: actions/cache only
+      # writes on success, so a run that times out saves nothing and the NEXT run
+      # is cold too. That is self-perpetuating - the first 30-minute timeout
+      # guaranteed every later run would also time out. Saving with `if: always()`
+      # breaks the cycle.
+      - name: Restore cargo cache
+        id: cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -50,8 +56,24 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      # --release is REQUIRED, not an optimisation. In debug the WHIR/PCS tests in
+      # zkie-core are pathologically slow - unoptimised field arithmetic - and the
+      # suite consumes ~11 CPU-hours where release takes 35 s. On a 2-core runner
+      # that is ~5.5 hours against any sane timeout, so debug CI could never pass
+      # on any commit with any cache. Measured on a 32-thread box: 26 minutes and
+      # still unfinished, 16 of 21 tests done, five individually past 60 s.
       - name: Build
-        run: cargo build --workspace --lib --locked
+        run: cargo build --release --workspace --lib --locked
 
       - name: Test
-        run: cargo test --workspace --lib --locked
+        run: cargo test --release --workspace --lib --locked
+
+      - name: Save cargo cache
+        if: always()        # especially on timeout - see the note above
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
