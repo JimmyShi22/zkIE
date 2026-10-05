@@ -30,9 +30,13 @@ time and memory, both still far above the cost of the inference itself.
 **How it is used.** Export the model to ONNX — architecture, weights and op
 graph — and zkIE composes the proving logic for that model's inference circuit
 out of op-level proof primitives. For any input, that circuit then yields a
-succinct proof that the output is what the model computes; verifying it is cheap
-and does not re-run the model. Weights and activations are public: the current
-route targets correctness and succinctness rather than witness hiding.
+proof that the output is what the model computes. Today the verifier still
+recomputes the forward pass to obtain its interior evaluations (`verify_shard` /
+`verify_shard_dag`, `compose.rs`), so verifying costs about as much as proving
+(measured: verify ~90% of prove at seq=512, CPU); making verification succinct,
+with no re-run, is the open design item tracked in #15. Weights and activations
+are public: the current route targets correctness and succinctness rather than
+witness hiding.
 
 ## How it works
 
