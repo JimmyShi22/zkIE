@@ -367,6 +367,11 @@ impl Whir {
     /// Commit to a flat MLE. Returns the commitment, prover data, and the public
     /// opening protocol (single table, single column, one point) used for open/verify.
     pub fn commit(&self, evals: &[Goldilocks]) -> (Commitment, ProverData, OpeningProtocol) {
+        self.commit_with_points(evals, 1)
+    }
+
+    /// Commit with a prescribed multi-point opening protocol (one opening per point).
+    pub fn commit_with_points(&self, evals: &[Goldilocks], num_points: usize) -> (Commitment, ProverData, OpeningProtocol) {
         let t0 = std::time::Instant::now();
         let num_vars = evals.len().trailing_zeros() as usize;
         assert_eq!(evals.len(), 1 << num_vars, "MLE length must be a power of two");
@@ -377,7 +382,7 @@ impl Whir {
         let witness = MyLayout::new_witness(vec![table], folding);
 
         let point_schedule: PointSchedule =
-            std::iter::once(OpeningBatch::new(vec![0], Vec::new())).collect();
+            (0..num_points).map(|_| OpeningBatch::new(vec![0], Vec::new())).collect();
         let protocol = OpeningProtocol::new(vec![TableSpec::new(
             TableShape::new(num_vars, 1),
             point_schedule,
@@ -482,6 +487,58 @@ impl Whir {
         self.verify_stats.set((n + 1, secs + t0.elapsed().as_secs_f64()));
         Ok(evals[0].current()[0].as_base().expect("base-field MLE opens to a base element"))
     }
+    /// Open the committed MLE at multiple points in one batched opening proof.
+    /// Open the committed MLE at multiple points in one batched opening proof.
+    pub fn open_multi(
+        &self,
+        prover_data: ProverData,
+        protocol: &OpeningProtocol,
+        points: &[Vec<Goldilocks>],
+    ) -> (Proof, Vec<Goldilocks>) {
+        let t0 = std::time::Instant::now();
+        let ef_points: Vec<Point<EF>> = points.iter().map(|p| to_ef_point(p)).collect();
+        let proof = self.pcs.open_at(
+            prover_data,
+            protocol,
+            &ef_points,
+            &mut self.fresh_challenger(),
+        );
+        let opened: Vec<Goldilocks> = proof
+            .evals
+            .iter()
+            .map(|e| e.current()[0].as_base().expect("base-field MLE opens to a base element"))
+            .collect();
+        let (n, secs) = self.open_stats.get();
+        self.open_stats.set((n + points.len() as u64, secs + t0.elapsed().as_secs_f64()));
+        GLOBAL_OPEN_COUNT.fetch_add(points.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        (proof, opened)
+    }
+
+    /// Verify a multi-point opening proof and return every opened evaluation.
+    pub fn verify_multi(
+        &self,
+        commitment: &Commitment,
+        proof: &Proof,
+        protocol: &OpeningProtocol,
+        points: &[Vec<Goldilocks>],
+    ) -> Result<Vec<Goldilocks>, <MyPcs as MultilinearPcs<EF, MyChallenger>>::Error> {
+        let t0 = std::time::Instant::now();
+        let ef_points: Vec<Point<EF>> = points.iter().map(|p| to_ef_point(p)).collect();
+        let evals = self.pcs.verify_at(
+            commitment,
+            proof,
+            protocol,
+            &ef_points,
+            &mut self.fresh_challenger(),
+        )?;
+        let (n, secs) = self.verify_stats.get();
+        self.verify_stats.set((n + points.len() as u64, secs + t0.elapsed().as_secs_f64()));
+        Ok(evals
+            .iter()
+            .map(|e| e.current()[0].as_base().expect("base-field MLE opens to a base element"))
+            .collect())
+    }
+
     /// Open the `table_index`-th MLE in a batch at `point`.
     pub fn open_batch(
         &self,

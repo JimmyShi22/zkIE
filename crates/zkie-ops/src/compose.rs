@@ -1744,16 +1744,13 @@ pub fn committed_cross_bind(
     claims: &[(Vec<Goldilocks>, Goldilocks)],
     rng: &mut XorShift64,
 ) -> Option<SamePolyProof> {
-    for (pt, expected) in claims {
-        let (open, opened) = whir.open(committed.prover_data.clone(), &committed.protocol, pt);
-        if whir
-            .verify(&committed.commitment, &open, &committed.protocol, pt)
-            .ok()?
-            != opened
-        {
-            return None;
-        }
-        if opened != *expected || opened != mle::eval(tensor, pt) {
+    let points: Vec<Vec<Goldilocks>> = claims.iter().map(|(pt, _)| pt.clone()).collect();
+    let (open_proof, opened) = whir.open_multi(committed.prover_data.clone(), &committed.protocol, &points);
+    let verified = whir
+        .verify_multi(&committed.commitment, &open_proof, &committed.protocol, &points)
+        .ok()?;
+    for (i, (pt, expected)) in claims.iter().enumerate() {
+        if verified[i] != opened[i] || opened[i] != *expected || opened[i] != mle::eval(tensor, pt) {
             return None;
         }
     }
@@ -1769,16 +1766,14 @@ pub fn verify_committed_cross_bind(
     claims: &[(Vec<Goldilocks>, Goldilocks)],
     proof: &SamePolyProof,
 ) -> bool {
-    for (pt, expected) in claims {
-        let (open, opened) = whir.open(committed.prover_data.clone(), &committed.protocol, pt);
-        if whir
-            .verify(&committed.commitment, &open, &committed.protocol, pt)
-            .ok()
-            != Some(opened)
-        {
-            return false;
-        }
-        if opened != *expected || opened != mle::eval(tensor, pt) {
+    let points: Vec<Vec<Goldilocks>> = claims.iter().map(|(pt, _)| pt.clone()).collect();
+    let (open_proof, opened) = whir.open_multi(committed.prover_data.clone(), &committed.protocol, &points);
+    let verified = match whir.verify_multi(&committed.commitment, &open_proof, &committed.protocol, &points) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    for (i, (pt, expected)) in claims.iter().enumerate() {
+        if verified[i] != opened[i] || opened[i] != *expected || opened[i] != mle::eval(tensor, pt) {
             return false;
         }
     }
@@ -1806,13 +1801,11 @@ pub fn prove_committed_shard_dag(
     let plain = prove_shard_dag(store, ops, ops_per_shard, rng);
     let boundary_tensors = plain.cross_tensors.clone();
 
-    let mut boundary_commitments = Vec::with_capacity(boundary_tensors.len());
+    // Collect each boundary's claims first so each commit can size its
+    // multi-point opening protocol to the exact number of openings needed.
+    let mut all_claims: Vec<Vec<(Vec<Goldilocks>, Goldilocks)>> =
+        Vec::with_capacity(boundary_tensors.len());
     for &t in &boundary_tensors {
-        boundary_commitments.push(zkie_core::pcs::committed::commit(whir, store.get(t)));
-    }
-
-    let mut cross_binds = Vec::with_capacity(boundary_tensors.len());
-    for (i, &t) in boundary_tensors.iter().enumerate() {
         let mut claims = Vec::new();
         for shard in &plain.shards {
             for (tt, pt, ev) in &shard.claims {
@@ -1821,8 +1814,29 @@ pub fn prove_committed_shard_dag(
                 }
             }
         }
-        let sp = committed_cross_bind(whir, &boundary_commitments[i], store.get(t), &claims, rng)
-            .expect("honest committed bind");
+        all_claims.push(claims);
+    }
+
+    let mut boundary_commitments = Vec::with_capacity(boundary_tensors.len());
+    for (i, &t) in boundary_tensors.iter().enumerate() {
+        let num_points = all_claims[i].len().max(1);
+        boundary_commitments.push(zkie_core::pcs::committed::commit_with_points(
+            whir,
+            store.get(t),
+            num_points,
+        ));
+    }
+
+    let mut cross_binds = Vec::with_capacity(boundary_tensors.len());
+    for (i, &t) in boundary_tensors.iter().enumerate() {
+        let sp = committed_cross_bind(
+            whir,
+            &boundary_commitments[i],
+            store.get(t),
+            &all_claims[i],
+            rng,
+        )
+        .expect("honest committed bind");
         cross_binds.push(sp);
     }
 

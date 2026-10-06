@@ -24,6 +24,17 @@ pub fn commit(whir: &Whir, values: &[Goldilocks]) -> Committed {
     }
 }
 
+/// Commit a tensor with a prescribed multi-point opening protocol (one opening
+/// per point), so a single WHIR opening proof can open it at many points.
+pub fn commit_with_points(whir: &Whir, values: &[Goldilocks], num_points: usize) -> Committed {
+    let (commitment, prover_data, protocol) = whir.commit_with_points(values, num_points);
+    Committed {
+        commitment,
+        prover_data,
+        protocol,
+    }
+}
+
 /// A committed batch of same-size MLEs: one commitment plus the shared prover
 /// data, opening protocol, and the batch-sized `Whir` used to open any table.
 pub struct BatchCtx {
