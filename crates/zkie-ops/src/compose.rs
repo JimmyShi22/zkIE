@@ -1862,14 +1862,20 @@ pub fn verify_committed_shard_dag(
     {
         return false;
     }
-    for (i, (s, e)) in ranges.iter().enumerate() {
-        if !verify_shard(store, &ops[*s..*e], &proof.shards[i]) {
-            return false;
-        }
-    }
-
+    // Recompute the witness once, then verify each shard in parallel against
+    // the shared fresh witness (mirrors the plain `verify_shard_dag` path and
+    // avoids a full-store clone + forward pass per shard).
     let mut ws = Store { v: store.v.clone(), idx: store.idx.clone() };
     forward_ops(&mut ws, ops);
+
+    let all_ok = ranges
+        .par_iter()
+        .enumerate()
+        .map(|(i, &(s, e))| verify_shard_precomputed(&ws, &ops[s..e], &proof.shards[i]))
+        .all(|ok| ok);
+    if !all_ok {
+        return false;
+    }
 
     for (i, &t) in proof.boundary_tensors.iter().enumerate() {
         let mut claims = Vec::new();
@@ -1883,7 +1889,7 @@ pub fn verify_committed_shard_dag(
         if !verify_committed_cross_bind(
             whir,
             &proof.boundary_commitments[i],
-            store.get(t),
+            ws.get(t),
             &claims,
             &proof.cross_binds[i],
         ) {
@@ -2344,7 +2350,7 @@ mod tests {
 
     #[test]
     fn committed_cross_bind_roundtrip() {
-        use zkie_core::pcs::committed::commit;
+        use zkie_core::pcs::committed::commit_with_points;
         use zkie_core::common::field::PrimeCharacteristicRing;
         use zkie_core::pcs::whir::Whir;
 
@@ -2352,7 +2358,7 @@ mod tests {
         let n = 1usize << 6;
         let f: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
         let whir = Whir::new_testing(6);
-        let c = commit(&whir, &f);
+        let c = commit_with_points(&whir, &f, 2);
 
         let p0: Vec<Goldilocks> = (0..6).map(|_| rng.field()).collect();
         let p1: Vec<Goldilocks> = (0..6).map(|_| rng.field()).collect();
