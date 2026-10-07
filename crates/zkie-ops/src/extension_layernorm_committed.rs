@@ -374,3 +374,57 @@ mod tests {
         assert!(LayernormWhir::new(2, 2, 32, 32, 10).is_none());
     }
 }
+
+use crate::compose::{Op, Store};
+use zkie_core::common::field::PrimeField64;
+
+/// Op adapter: recognize `Op::Layernorm` and materialize x/w/b/out/rsqrt_table
+/// from a real Store, compute the derived intermediates (mean_sq, q, idx, rsqrt,
+/// scale — the forward), and run the root-bound committed layernorm. No forward
+/// recomputation on the verifier side.
+pub fn prove_op_layernorm(
+    whir: &LayernormWhir,
+    op: &Op,
+    store: &Store,
+    rng: &mut XorShift64,
+) -> Option<(LayernormStatement, LayernormCommittedProof)> {
+    let Op::Layernorm { x, w, b, out, rsqrt_table, m, d } = op else {
+        return None;
+    };
+    let xv = store.materialize(*x);
+    let wv = store.materialize(*w);
+    let bv = store.materialize(*b);
+    let ov = store.materialize(*out);
+    let tv = store.materialize(*rsqrt_table);
+    if xv.len() != *m * *d || wv.len() != *m * *d || bv.len() != *m * *d || ov.len() != *m * *d {
+        return None;
+    }
+    let t = tv.len();
+    let table_u64: Vec<u64> = tv.iter().map(|&x| x.as_canonical_u64()).collect();
+
+    let mean_sq: Vec<Goldilocks> = (0..*m)
+        .map(|i| (0..*d).fold(Goldilocks::ZERO, |a, j| a + xv[i * *d + j] * xv[i * *d + j]))
+        .collect();
+    let q: Vec<Goldilocks> = mean_sq.iter().map(|&v| from_i64(to_i64(v) / t as i64)).collect();
+    let idx: Vec<Goldilocks> = mean_sq.iter().map(|&v| from_i64(to_i64(v) % t as i64)).collect();
+    let idx_u32: Vec<u32> = idx.iter().map(|&v| to_i64(v) as u32).collect();
+    let rsqrt: Vec<Goldilocks> = idx_u32.iter().map(|&i| from_i64(table_u64[i as usize] as i64)).collect();
+    let scale: Vec<Goldilocks> = (0..*m * *d).map(|ij| rsqrt[ij / *d] * wv[ij]).collect();
+
+    prove(
+        whir,
+        xv.as_ref(),
+        wv.as_ref(),
+        bv.as_ref(),
+        ov.as_ref(),
+        &mean_sq,
+        &q,
+        &idx,
+        &rsqrt,
+        &scale,
+        &table_u64,
+        *m,
+        *d,
+        rng,
+    )
+}
