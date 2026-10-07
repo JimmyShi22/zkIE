@@ -7,6 +7,7 @@ pub mod extension_schedule;
 pub mod extension_lookup_fractional;
 pub mod extension_fractional_chain;
 pub mod extension_logup_multiset;
+pub mod extension_direct_lookup;
 pub mod projection;
 pub mod layer_norm_centered;
 pub mod layernorm_chain;
