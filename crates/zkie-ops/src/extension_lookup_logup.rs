@@ -42,11 +42,13 @@
 //!   two rational equalities (Schwartz–Zippel over gamma / (alpha, beta)).
 //!
 //! Verifier = `(lookup_whir, statement, proof)` ONLY: no witness, no Store,
-//! no raw tensors, no `open` calls. This is the generic relation proof;
-//! there is NO `Op::Lookup` adapter here yet (the direct bridge in
-//! `extension_direct_lookup` remains the Op-facing seam). Legacy modules
+//! no raw tensors, no `open` calls. A generic actual-IR adapter
+//! (`prove_op_lookup`) recognizes `Op::Lookup` and materializes the three
+//! logical tensors from a real `Store` (validated, mmap-safe). The direct
+//! bridge in `extension_direct_lookup` and all legacy modules remain
 //! untouched.
 
+use crate::compose::{Op, Store, TensorData};
 use crate::extension_lookup_fractional::{fold_ef, gen, to_p3_point};
 use zkie_core::common::field::{
     BasedVectorSpace, EF, Field, Goldilocks, PrimeCharacteristicRing, PrimeField64,
@@ -645,6 +647,83 @@ pub fn prove(
     prove_with_m(lw, idx, out, table, &m)
 }
 
+/// Pre-materialize metadata check for one tensor id (caller has already
+/// bounds-checked the id): the logical length must be exactly `expected`,
+/// and for mmap-backed tensors the claimed `[start, start + len)` range
+/// must exist inside the mapping via checked arithmetic — validated BEFORE
+/// any read.
+fn tensor_metadata_ok(store: &Store, id: usize, expected: usize) -> bool {
+    match &store.v[id] {
+        TensorData::Owned(v) => v.len() == expected,
+        TensorData::Mmap { mmap, start, len } => {
+            *len == expected && start.checked_add(*len).is_some_and(|end| end <= mmap.len())
+        }
+    }
+}
+
+/// Actual-IR adapter: recognize `Op::Lookup { idx, out, table }` and
+/// materialize the three logical tensors from a REAL `Store`. Validates
+/// every logical shape BEFORE reads: `P = idx.len() == out.len()` and
+/// `T = table.len()` are exact powers of two (`>= 2`), every `idx[i] < T`,
+/// and the output/table tensor METADATA (Owned length / mmap range with
+/// checked arithmetic) is sound. The exact histogram `m` is derived only
+/// AFTER the idx domain validation, then the existing root-bound `prove`
+/// path runs (root-only `verify` unchanged). Materializes ONLY the three
+/// logical tensors — no production-size claim.
+pub fn prove_op_lookup(
+    lw: &LookupWhir,
+    op: &Op,
+    store: &Store,
+) -> Option<(LookupStatement, LookupProof)> {
+    let Op::Lookup { idx, out, table } = op else {
+        return None;
+    };
+    if *idx >= store.idx.len() || *out >= store.v.len() || *table >= store.v.len() {
+        return None;
+    }
+    let idxs = &store.idx[*idx];
+    let p = idxs.len();
+    if !p.is_power_of_two() || p < 2 {
+        return None;
+    }
+    // The table's declared length (from metadata, before any read).
+    let t = match &store.v[*table] {
+        TensorData::Owned(v) => v.len(),
+        TensorData::Mmap { len, .. } => *len,
+    };
+    if !t.is_power_of_two() || t < 2 {
+        return None;
+    }
+    // Cheap config check BEFORE any materialization or histogram work: the
+    // two WHIR domains must be able to hold the logical sizes.
+    if lw.rows.num_variables() < p.trailing_zeros() as usize
+        || lw.entries.num_variables() < t.trailing_zeros() as usize
+    {
+        return None;
+    }
+    // Idx domain validation BEFORE the histogram.
+    if idxs.iter().any(|&i| i as usize >= t) {
+        return None;
+    }
+    // Metadata BEFORE materialize (both output and table).
+    if !tensor_metadata_ok(store, *out, p) || !tensor_metadata_ok(store, *table, t) {
+        return None;
+    }
+    let out_t = store.materialize(*out);
+    let tbl_t = store.materialize(*table);
+    if out_t.len() != p || tbl_t.len() != t {
+        return None;
+    }
+    let idx_u32: Vec<u32> = idxs.clone();
+    let out_u64: Vec<u64> = out_t.iter().map(|g| g.as_canonical_u64()).collect();
+    let table_u64: Vec<u64> = tbl_t.iter().map(|g| g.as_canonical_u64()).collect();
+    let mut m = vec![0u64; t];
+    for &i in &idx_u32 {
+        m[i as usize] += 1;
+    }
+    prove_with_m(lw, &idx_u32, &out_u64, &table_u64, &m)
+}
+
 /// Verify the generic LogUp lookup from `(lookup_whir, statement, proof)`
 /// ONLY: validates dims/arity/domain, replays the transcript (roots,
 /// challenges, claimed sums), checks the eight relations, and closes the
@@ -852,5 +931,181 @@ mod tests {
             let reference = fold_ef(&head(32, arity), &z) * v[0] * v[1];
             assert_eq!(expr, reference);
         }
+    }
+
+    /// A REAL store + `Op::Lookup` fixture (P = 16, T = 32): idx tensor,
+    /// table tensor, materialized output `out[i] = table[idx[i]]`.
+    fn op_fixture(out_wrong: bool) -> (Store, Op) {
+        let mut store = Store::new();
+        let table: Vec<Goldilocks> = (0..T).map(|j| Goldilocks::from_u64((j % 100) as u64)).collect();
+        let idxs: Vec<u32> = (0..P).map(|i| ((i * 7 + 3) % T as usize) as u32).collect();
+        let mut out_vals: Vec<Goldilocks> = idxs.iter().map(|&i| table[i as usize]).collect();
+        if out_wrong {
+            out_vals[0] = out_vals[0] + Goldilocks::ONE;
+        }
+        let idx_id = store.push_idx(idxs);
+        let tbl_id = store.push(table);
+        let out_id = store.push(out_vals);
+        (store, Op::Lookup { idx: idx_id, out: out_id, table: tbl_id })
+    }
+
+    /// End-to-end through the real IR: `Op::Lookup` + Store -> adapter ->
+    /// Store/op dropped -> root-only verifier accepts and never opens.
+    #[test]
+    fn op_adapter_roundtrip_after_ir_dropped() {
+        let lw = LookupWhir::new(P, T, 90, 0).expect("valid dims");
+        let (store, op) = op_fixture(false);
+        let (s, p) = prove_op_lookup(&lw, &op, &store).expect("adapter prove");
+        drop(store);
+        drop(op);
+        let before: Vec<_> = all_whirs(&lw).iter().map(|w| w.open_stats()).collect();
+        assert!(verify(&lw, &s, &p));
+        let after: Vec<_> = all_whirs(&lw).iter().map(|w| w.open_stats()).collect();
+        assert_eq!(before, after, "verifier must never open");
+    }
+
+    /// An IR fixture with a WRONG output tensor still emits an artifact
+    /// (the adapter is honest about the store), but the verifier rejects it
+    /// via the pair relation.
+    #[test]
+    fn op_adapter_wrong_output_rejected() {
+        let lw = LookupWhir::new(P, T, 90, 0).expect("valid dims");
+        let (store, op) = op_fixture(true);
+        let (s, p) = prove_op_lookup(&lw, &op, &store).expect("adapter prove");
+        drop(store);
+        drop(op);
+        assert!(!verify(&lw, &s, &p));
+    }
+
+    /// RAII temp file (unique name per construction, create_new, removed on
+    /// drop) — local copy of the safe pattern.
+    struct TempFile(std::path::PathBuf);
+    static TMP_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    impl TempFile {
+        fn write_i32(vals: &[i32]) -> Self {
+            use std::io::Write as _;
+            use std::sync::atomic::Ordering;
+            let mut bytes = Vec::with_capacity(vals.len() * 4);
+            for &v in vals {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            for _ in 0..16 {
+                let n = TMP_N.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "zkie_logup_mmap_{}_{}_{}.bin",
+                    std::process::id(),
+                    n,
+                    vals.len()
+                ));
+                let mut f = match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    Ok(f) => f,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("temp file creation failed: {e}"),
+                };
+                f.write_all(&bytes).expect("write temp file");
+                return TempFile(path);
+            }
+            panic!("could not create a unique temp file after 16 attempts");
+        }
+    }
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Malformed IR shapes and mmap metadata are rejected by the adapter
+    /// (`None`), never a panic and never a read past the declared range:
+    /// non-Lookup ops, non-power-of-two logical sizes, an out-of-range
+    /// index, a declared mmap len over the backing data, and an
+    /// overflowing mmap start.
+    #[test]
+    fn op_adapter_malformed_rejected() {
+        use std::sync::Arc;
+        use zkie_core::common::weights_io::WeightMmap;
+        let lw = LookupWhir::new(P, T, 90, 0).expect("valid dims");
+        let (store, _) = op_fixture(false);
+        // A non-Lookup op.
+        let add = Op::Add { a: 0, b: 1, c: 2 };
+        assert!(prove_op_lookup(&lw, &add, &store).is_none());
+        // Non-power-of-two idx length.
+        let mut store_bad = Store::new();
+        let table: Vec<Goldilocks> = (0..T).map(|j| Goldilocks::from_u64((j % 100) as u64)).collect();
+        let idx12 = store_bad.push_idx(vec![0; 12]);
+        let tbl = store_bad.push(table);
+        let out12 = store_bad.push(vec![Goldilocks::ZERO; 12]);
+        let bad = Op::Lookup { idx: idx12, out: out12, table: tbl };
+        assert!(prove_op_lookup(&lw, &bad, &store_bad).is_none());
+        // An index >= T.
+        let mut store_bad = Store::new();
+        let table: Vec<Goldilocks> = (0..T).map(|j| Goldilocks::from_u64((j % 100) as u64)).collect();
+        let mut idxs: Vec<u32> = (0..P).map(|i| (i % T as usize) as u32).collect();
+        idxs[0] = T as u32;
+        let idx_id = store_bad.push_idx(idxs);
+        let tbl_id = store_bad.push(table);
+        let out_id = store_bad.push(vec![Goldilocks::ZERO; P]);
+        let bad = Op::Lookup { idx: idx_id, out: out_id, table: tbl_id };
+        assert!(prove_op_lookup(&lw, &bad, &store_bad).is_none());
+
+        // Mmap-backed table with a POWER-OF-TWO declared len (32) over the
+        // backing data (16) -> the checked bound rejects before any read.
+        let backing: Vec<i32> = (0..16).map(|j| j + 3).collect();
+        let tmp = TempFile::write_i32(&backing);
+        let mmap = Arc::new(WeightMmap::open(&tmp.0).expect("open mmap"));
+        let mut store_m = Store::new();
+        let idx_m = store_m.push_idx(vec![0; P]);
+        let tbl_m = store_m.push_mmap(mmap.clone(), 0, T); // declared 32, backed by 16
+        let out_m = store_m.push(vec![Goldilocks::ZERO; P]);
+        let bad = Op::Lookup { idx: idx_m, out: out_m, table: tbl_m };
+        assert!(prove_op_lookup(&lw, &bad, &store_m).is_none());
+        // Malformed OUTPUT mmap metadata: declared P = 16 backed by 8.
+        let backing8: Vec<i32> = (0..8).map(|j| j + 3).collect();
+        let tmp8 = TempFile::write_i32(&backing8);
+        let mmap8 = Arc::new(WeightMmap::open(&tmp8.0).expect("open mmap"));
+        let mut store_m = Store::new();
+        let idx_m = store_m.push_idx(vec![0; P]);
+        let table_m: Vec<Goldilocks> =
+            (0..T).map(|j| Goldilocks::from_u64((j % 100) as u64)).collect();
+        let tbl_m = store_m.push(table_m);
+        let out_m = store_m.push_mmap(mmap8, 0, P); // declared 16, backed by 8
+        let bad = Op::Lookup { idx: idx_m, out: out_m, table: tbl_m };
+        assert!(prove_op_lookup(&lw, &bad, &store_m).is_none());
+        // Overflowing mmap start.
+        let mut store_m = Store::new();
+        let idx_m = store_m.push_idx(vec![0; P]);
+        let tbl_m = store_m.push_mmap(mmap.clone(), usize::MAX, T);
+        let out_m = store_m.push(vec![Goldilocks::ZERO; P]);
+        let bad = Op::Lookup { idx: idx_m, out: out_m, table: tbl_m };
+        assert!(prove_op_lookup(&lw, &bad, &store_m).is_none());
+    }
+
+    /// A VALID mmap-backed IR fixture (BOTH output and table from mmap,
+    /// exact power-of-two declared lengths over exact backing data)
+    /// round-trips through the adapter and verifies.
+    #[test]
+    fn op_adapter_mmap_roundtrip() {
+        use std::sync::Arc;
+        use zkie_core::common::weights_io::WeightMmap;
+        let lw = LookupWhir::new(P, T, 90, 0).expect("valid dims");
+        let idxs: Vec<u32> = (0..P).map(|i| ((i * 7 + 3) % T as usize) as u32).collect();
+        let table_vals: Vec<i32> = (0..T).map(|j| (j % 100) as i32).collect();
+        let out_vals: Vec<i32> = idxs.iter().map(|&i| table_vals[i as usize]).collect();
+        let tmp_t = TempFile::write_i32(&table_vals);
+        let tmp_o = TempFile::write_i32(&out_vals);
+        let mmap_t = Arc::new(WeightMmap::open(&tmp_t.0).expect("open mmap"));
+        let mmap_o = Arc::new(WeightMmap::open(&tmp_o.0).expect("open mmap"));
+        let mut store = Store::new();
+        let idx_id = store.push_idx(idxs);
+        let tbl_id = store.push_mmap(mmap_t, 0, T);
+        let out_id = store.push_mmap(mmap_o, 0, P);
+        let op = Op::Lookup { idx: idx_id, out: out_id, table: tbl_id };
+        let (s, p) = prove_op_lookup(&lw, &op, &store).expect("adapter prove");
+        drop(store);
+        drop(op);
+        assert!(verify(&lw, &s, &p));
     }
 }
