@@ -39,3 +39,12 @@ zkIE verify bottleneck is Layer 1: the verifier recomputes the forward pass.
 
 Doing ReedWeave before the claim-driven verifier optimises the ~2.5% tail while
 the ~90% head (the forward recompute) is untouched.
+
+## Update: real security parameters flip the conclusion - 2026-10-07
+
+The "WHIR open ~0.5 s / ~2.5%" premise is at `new_testing` (pow_bits 10). At
+`Whir::new(19)` (security 90, pow_bits 32) the open's PoW grind is 2^32, and
+GPT-2 512 prove did not finish within ~2 h (testing: ~36 s). Under real
+parameters the WHIR open IS the dominant cost - exactly what ReedWeave
+optimises. ReedWeave moves from "Priority 3 (tail)" to "Priority 1" once real
+security parameters are used.

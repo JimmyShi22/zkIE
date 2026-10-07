@@ -42,3 +42,22 @@ WHIR open + verify is ~0.56 s (~2.5% of verify). The rest (~20 s) is the single
   a claim-driven verifier (#15) removes.
 - `batch-opening` and `ReedWeave` only move the 0.56 s Layer-2 term; they cannot
   reduce verify meaningfully while the verifier still recomputes the forward.
+
+## Real-security-parameter check (partial) - 2026-10-07
+
+The ~0.56 s / ~2.5% PCS share above is under `Whir::new_testing(19)` (security
+32, pow_bits 10). Re-running the same GPT-2 512 / 13 shards with `Whir::new(19)`
+(security 90, pow_bits 32) does not finish: prove was still running at ~2 h
+(killed), versus ~36 s under testing params. The forward + sumcheck part is
+unchanged (~35 s); the extra time is the WHIR commit/open proof-of-work (2^32
+vs 2^10 grinding) across the 12 boundary commitments.
+
+Conclusion reversal: "PCS is a Layer-2 tail, forward recompute is the
+bottleneck" only holds at testing security. At real security the WHIR open (PoW)
+dominates, so the PCS share must be quoted with its security parameter.
+
+Design issue exposed: `verify_committed_cross_bind` calls `open_multi` (re-runs
+the prover-side opening, including PoW) instead of verifying the opening proof
+already produced during prove. Free at testing params, but under real params the
+verifier would re-pay an hours-long PoW. Fix: carry the opening proof in the
+committed proof and only run `verify_multi` at verify time.
