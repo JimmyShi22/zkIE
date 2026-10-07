@@ -2,6 +2,7 @@
 pub mod par;
 pub mod compose;
 pub mod extension_chain;
+pub mod extension_linear;
 pub mod projection;
 pub mod layer_norm_centered;
 pub mod layernorm_chain;

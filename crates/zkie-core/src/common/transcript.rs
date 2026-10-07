@@ -49,6 +49,11 @@ impl ETranscript {
         self.challenger.observe_algebra_element(v);
     }
 
+    /// Absorb a base-field element (public scalars like op factors/constants).
+    pub fn absorb_base(&mut self, v: Goldilocks) {
+        self.challenger.observe(v);
+    }
+
     /// Absorb a degree-2 round polynomial (three coefficients).
     pub fn absorb_round(&mut self, r: &RoundPolyF<EF>) {
         self.absorb(r.c0);
