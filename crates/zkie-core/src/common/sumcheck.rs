@@ -31,6 +31,9 @@ pub struct SumcheckProof {
 const INV2: Goldilocks = Goldilocks::new(crate::common::field::P / 2 + 1); // (p + 1) / 2
 
 pub fn prove(f: &[Goldilocks], h: &[Goldilocks], _claimed_sum: Goldilocks, #[allow(unused_variables)] challenges: &[Goldilocks]) -> SumcheckProof {
+    // Base-field instantiation of the shared generic round circuit
+    // (`product_round_f` / `fold_f`): inline loop, no intermediate
+    // `RoundPolyF` vector conversion allocated.
     let t = f.len().trailing_zeros() as usize;
     assert_eq!(f.len(), 1 << t, "f length must be a power of two");
     assert_eq!(h.len(), f.len());
@@ -39,33 +42,12 @@ pub fn prove(f: &[Goldilocks], h: &[Goldilocks], _claimed_sum: Goldilocks, #[all
     let mut f_buf = f.to_vec();
     let mut h_buf = h.to_vec();
     let mut rounds = Vec::with_capacity(t);
-
-    for r in challenges.iter().copied() {
-        let half = f_buf.len() / 2;
-        let mut y0 = Goldilocks::ZERO;
-        let mut y1 = Goldilocks::ZERO;
-        let mut y2 = Goldilocks::ZERO;
-        for s in 0..half {
-            let f0 = f_buf[2 * s];
-            let f1 = f_buf[2 * s + 1];
-            let h0 = h_buf[2 * s];
-            let h1 = h_buf[2 * s + 1];
-            y0 = y0 + f0 * h0;
-            y1 = y1 + f1 * h1;
-            let f2 = Goldilocks::TWO * f1 - f0;
-            let h2 = Goldilocks::TWO * h1 - h0;
-            y2 = y2 + f2 * h2;
-        }
-
-        let c0 = y0;
-        let c1 = (Goldilocks::from_u64(4) * y1 - y2 - Goldilocks::from_u64(3) * y0) * INV2;
-        let c2 = (y2 - Goldilocks::TWO * y1 + y0) * INV2;
-        rounds.push(RoundPoly { c0, c1, c2 });
-
-        fold(&mut f_buf, r);
-        fold(&mut h_buf, r);
+    for &r in challenges {
+        let rp = product_round_f(&f_buf, &h_buf);
+        rounds.push(RoundPoly { c0: rp.c0, c1: rp.c1, c2: rp.c2 });
+        fold_f(&mut f_buf, r);
+        fold_f(&mut h_buf, r);
     }
-
     SumcheckProof {
         rounds,
         f_eval: f_buf[0],
@@ -90,11 +72,120 @@ pub fn verify(
     f_eval: Goldilocks,
     h_eval: Goldilocks,
 ) -> bool {
+    // Inline loop — no round-vector conversion allocation.
     if proof.rounds.len() != challenges.len() {
         return false;
     }
     let mut prev = claimed_sum;
-    for (rp, r) in proof.rounds.iter().zip(challenges.iter().copied()) {
+    for (rp, &r) in proof.rounds.iter().zip(challenges.iter()) {
+        let p0 = rp.c0;
+        let p1 = rp.c0 + rp.c1 + rp.c2;
+        if p0 + p1 != prev {
+            return false;
+        }
+        prev = rp.eval(r);
+    }
+    prev == f_eval * h_eval
+}
+
+// ==== generic-field product-sumcheck round algebra ====
+//
+// The same degree-2 round polynomial for `sum_x f(x) h(x)` instantiated over
+// ANY field `F`. The Goldilocks entry points above are the base instantiation;
+// the EF extension chain instantiates these with `F = EF`. One circuit, two
+// fields — no duplicated round algebra.
+
+/// Degree-2 round polynomial over an arbitrary field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoundPolyF<F> {
+    pub c0: F,
+    pub c1: F,
+    pub c2: F,
+}
+
+impl<F: Field + PrimeCharacteristicRing + Copy> RoundPolyF<F> {
+    #[inline]
+    pub fn eval(&self, x: F) -> F {
+        self.c0 + self.c1 * x + self.c2 * x * x
+    }
+}
+
+/// Compute the degree-2 round polynomial of `sum f(x) h(x)` over the current
+/// (partially folded) buffers, for any field `F`.
+pub fn product_round_f<F: Field + PrimeCharacteristicRing + Copy>(f: &[F], h: &[F]) -> RoundPolyF<F> {
+    // Direct coefficient formula for the degree-2 round polynomial of
+    // `sum f(x) h(x)` — no inverse, no per-round division:
+    //   c0 = sum a0*b0
+    //   c1 = sum a0*(b1-b0) + (a1-a0)*b0
+    //   c2 = sum (a1-a0)*(b1-b0)
+    // which is the Lagrange interpolant through q(0), q(1), q(2).
+    let half = f.len() / 2;
+    let mut c0 = F::ZERO;
+    let mut c1 = F::ZERO;
+    let mut c2 = F::ZERO;
+    for s in 0..half {
+        let a0 = f[2 * s];
+        let a1 = f[2 * s + 1];
+        let b0 = h[2 * s];
+        let b1 = h[2 * s + 1];
+        let da = a1 - a0;
+        let db = b1 - b0;
+        c0 = c0 + a0 * b0;
+        c1 = c1 + a0 * db + da * b0;
+        c2 = c2 + da * db;
+    }
+    RoundPolyF { c0, c1, c2 }
+}
+
+/// Fold a buffer by one variable at challenge `p` (any field).
+pub fn fold_f<F: Field + PrimeCharacteristicRing + Copy>(buf: &mut Vec<F>, p: F) {
+    let half = buf.len() / 2;
+    for i in 0..half {
+        let a = buf[2 * i];
+        let b = buf[2 * i + 1];
+        buf[i] = a + p * (b - a);
+    }
+    buf.truncate(half);
+}
+
+/// Run the generic product sumcheck to its terminal evals; returns
+/// `(rounds, f_eval, h_eval)`.
+pub fn prove_product_f<F: Field + PrimeCharacteristicRing + Copy>(
+    f: &[F],
+    h: &[F],
+    challenges: &[F],
+) -> (Vec<RoundPolyF<F>>, F, F) {
+    let t = f.len().trailing_zeros() as usize;
+    assert_eq!(f.len(), 1 << t, "f length must be a power of two");
+    assert_eq!(h.len(), f.len());
+    assert_eq!(challenges.len(), t);
+
+    let mut f_buf = f.to_vec();
+    let mut h_buf = h.to_vec();
+    let mut rounds = Vec::with_capacity(t);
+    for &r in challenges {
+        rounds.push(product_round_f(&f_buf, &h_buf));
+        fold_f(&mut f_buf, r);
+        fold_f(&mut h_buf, r);
+    }
+    (rounds, f_buf[0], h_buf[0])
+}
+
+/// Verify the generic product sumcheck: `claimed = sum_x f(x) h(x)` with
+/// terminal evals `f_eval`, `h_eval` (authenticated out-of-band, e.g. by PCS
+/// openings).
+pub fn verify_product_f<F: Field + PrimeCharacteristicRing + Copy>(
+    rounds: &[RoundPolyF<F>],
+    claimed: F,
+    challenges: &[F],
+    f_eval: F,
+    h_eval: F,
+) -> bool {
+    if rounds.len() != challenges.len() {
+        return false;
+    }
+    let mut prev = claimed;
+    for (rp, &r) in rounds.iter().zip(challenges.iter()) {
         let p0 = rp.c0;
         let p1 = rp.c0 + rp.c1 + rp.c2;
         if p0 + p1 != prev {
@@ -308,6 +399,47 @@ pub fn verify_sum_of_products(
 mod tests {
     use super::*;
     use crate::common::field::XorShift64;
+
+    /// The direct coefficient formula must equal the Lagrange-interpolation
+    /// reference `(y0, y1, y2) -> c0, c1, c2` (with explicit inverse-of-two),
+    /// and the base prove/verify must roundtrip the same values.
+    #[test]
+    fn direct_coefficients_match_interpolation_reference() {
+        let mut rng = XorShift64::new(0x5C1);
+        let t = 4;
+        let f: Vec<Goldilocks> = (0..(1 << t)).map(|_| rng.field()).collect();
+        let h: Vec<Goldilocks> = (0..(1 << t)).map(|_| rng.field()).collect();
+
+        let rp = product_round_f(&f, &h);
+        let half = f.len() / 2;
+        let two = Goldilocks::TWO;
+        let inv2 = Goldilocks::TWO.inverse();
+        let mut y0 = Goldilocks::ZERO;
+        let mut y1 = Goldilocks::ZERO;
+        let mut y2 = Goldilocks::ZERO;
+        for s in 0..half {
+            let f0 = f[2 * s];
+            let f1 = f[2 * s + 1];
+            let h0 = h[2 * s];
+            let h1 = h[2 * s + 1];
+            y0 = y0 + f0 * h0;
+            y1 = y1 + f1 * h1;
+            let f2 = two * f1 - f0;
+            let h2 = two * h1 - h0;
+            y2 = y2 + f2 * h2;
+        }
+        let three = Goldilocks::ONE + Goldilocks::TWO;
+        let four = Goldilocks::TWO + Goldilocks::TWO;
+        assert_eq!(rp.c0, y0);
+        assert_eq!(rp.c1, (four * y1 - y2 - three * y0) * inv2);
+        assert_eq!(rp.c2, (y2 - two * y1 + y0) * inv2);
+
+        // Roundtrip through the base API with the same tables.
+        let true_sum: Goldilocks = f.iter().zip(&h).fold(Goldilocks::ZERO, |acc, (&a, &b)| acc + a * b);
+        let challenges: Vec<Goldilocks> = (0..t).map(|_| rng.field()).collect();
+        let proof = prove(&f, &h, true_sum, &challenges);
+        assert!(verify(&proof, true_sum, &challenges, proof.f_eval, proof.h_eval));
+    }
 
     #[test]
     fn sumcheck_completeness_and_soundness() {

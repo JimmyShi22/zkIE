@@ -7,8 +7,15 @@
 //! (products are 32-bit, a length-K dot product adds `log2(K)` bits), and
 //! `p - 1 = 2^32 * (2^32 - 1)` gives a large 2-adic subgroup for FRI/WHIR.
 
-pub use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
+pub use p3_field::{BasedVectorSpace, ExtensionField, Field, PrimeCharacteristicRing, PrimeField64};
 pub use p3_goldilocks::Goldilocks;
+pub use p3_field::extension::BinomialExtensionField;
+
+/// The quadratic extension field over Goldilocks: the challenge/evaluation
+/// field of the extension-chain GKR protocol and of WHIR internally. Tensor
+/// storage stays in the base field; only challenges, round coefficients, and
+/// terminal claims live in `EF`.
+pub type EF = BinomialExtensionField<Goldilocks, 2>;
 
 /// Field characteristic `p = 2^64 - 2^32 + 1`.
 pub const P: u64 = Goldilocks::ORDER_U64;

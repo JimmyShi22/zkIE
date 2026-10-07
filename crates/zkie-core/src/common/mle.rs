@@ -37,6 +37,44 @@ pub fn partial_eval(values: &[Goldilocks], fix: &[Goldilocks]) -> Vec<Goldilocks
     buf
 }
 
+/// Extension-field lift: evaluates a base-field-stored table as an MLE over
+/// `EF`. Tensor storage stays base Goldilocks; only the evaluation arithmetic
+/// is lifted. Same LSB-first coordinate convention as [`eval`].
+pub fn eval_ef(values: &[Goldilocks], point: &[crate::common::field::EF]) -> crate::common::field::EF {
+    let t = point.len();
+    assert_eq!(values.len(), 1 << t, "mle eval_ef: length mismatch");
+    let mut buf: Vec<crate::common::field::EF> = values.iter().map(|&v| v.into()).collect();
+    let mut size = values.len();
+    for &p in point {
+        let half = size / 2;
+        for i in 0..half {
+            let a = buf[2 * i];
+            let b = buf[2 * i + 1];
+            buf[i] = a + p * (b - a);
+        }
+        size = half;
+    }
+    buf[0]
+}
+
+/// Extension-field lift of [`partial_eval`]: fixes the first `fix.len()`
+/// variables of a base-field-stored table using EF points, returning the
+/// remaining evaluations as EF elements.
+pub fn partial_eval_ef(values: &[Goldilocks], fix: &[crate::common::field::EF]) -> Vec<crate::common::field::EF> {
+    assert!(fix.len() <= values.len().trailing_zeros() as usize);
+    let mut buf: Vec<crate::common::field::EF> = values.iter().map(|&v| v.into()).collect();
+    for &p in fix {
+        let half = buf.len() / 2;
+        for i in 0..half {
+            let a = buf[2 * i];
+            let b = buf[2 * i + 1];
+            buf[i] = a + p * (b - a);
+        }
+        buf.truncate(half);
+    }
+    buf
+}
+
 /// Evaluate the equality (Lagrange-basis) polynomial `eq(x, r)` at every
 /// hypercube point `x = i` for a fixed `r`: `eq_i(r) = prod_j (bit_j(i) * r_j +
 /// (1 - bit_j(i)) * (1 - r_j))`. Used as the random selector in the

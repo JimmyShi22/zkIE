@@ -2,6 +2,7 @@ pub mod field;
 pub mod fixed_point;
 pub mod mle;
 pub mod sumcheck;
+pub mod transcript;
 pub mod matmul;
 pub mod logup_gkr;
 pub mod same_poly;

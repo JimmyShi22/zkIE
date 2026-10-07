@@ -17,7 +17,7 @@ pub fn global_open_count() -> u64 {
 }
 
 
-use p3_challenger::DuplexChallenger;
+use p3_challenger::{CanObserve, DuplexChallenger};
 use p3_commit::MultilinearPcs;
 use p3_dft::Radix2DFTSmallBatch;
 use p3_field::extension::BinomialExtensionField;
@@ -25,7 +25,7 @@ use p3_field::{ExtensionField, Field};
 use p3_goldilocks::{Goldilocks, Poseidon2Goldilocks};
 use p3_matrix::dense::RowMajorMatrix;
 use p3_merkle_tree::MerkleTreeMmcs;
-use p3_multilinear_util::point::Point;
+pub use p3_multilinear_util::point::Point;
 use p3_sumcheck::layout::{Layout as _, SuffixProver, Table};
 use p3_sumcheck::{OpeningBatch, PointSchedule, PrescribedPointPcs, TableShape, TableSpec};
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
@@ -302,11 +302,48 @@ impl Whir {
         Self::with_params(num_variables, 32, 10)
     }
 
+    /// Explicit configuration with a caller-chosen security target and PoW
+    /// budget (e.g. `new_target(n, 90, 0)` for the PCS-target-90 low-PoW
+    /// prototype configuration). Genuinely fallible: returns `None` (never
+    /// panics) when the folding schedule does not fit the variable count
+    /// (tiny arity), the derived PoW schedule exceeds the budget, or the FFT
+    /// domain would be absurdly large. No fallback or automatic downgrade.
+    pub fn new_target(num_variables: usize, security_level: usize, pow_budget: usize) -> Option<Self> {
+        Self::try_with_params(num_variables, security_level, pow_budget)
+    }
+
+    /// Whether the derived PoW schedule fits inside the configured budget
+    /// (`WhirConfig::check_pow_bits`). False means the requested security
+    /// target is not met by this instance.
+    pub fn pow_bits_ok(&self) -> bool {
+        self.pcs.config.check_pow_bits()
+    }
+
+    /// The derived maximum PoW bits across the schedule (capped by the budget
+    /// when the construction succeeded).
+    pub fn max_pow_bits(&self) -> usize {
+        self.pcs.config.max_pow_bits()
+    }
+
+    /// Reject FFT domains above this many variables: `MyDft::new` would need
+    /// `2^max_fft_size` elements, and anything beyond 2^32 is far outside
+    /// anything this crate can run (and `1 << 33` no longer fits a 32-bit
+    /// allocation graph). Kept well below `usize` shift limits.
+    const MAX_FFT_VARIABLES: usize = 32;
+
     pub(crate) fn with_params(num_variables: usize, security_level: usize, pow_bits: usize) -> Self {
+        // Legacy constructor (kept for `new` / `new_testing` and batch paths):
+        // panics on configuration errors exactly as before. New code should
+        // use the fallible `new_target`.
+        Self::try_with_params(num_variables, security_level, pow_bits)
+            .expect("invalid WHIR configuration")
+    }
+
+    fn try_with_params(num_variables: usize, security_level: usize, pow_bits: usize) -> Option<Self> {
         let folding_factor = FoldingFactor::Constant(5);
         let (num_rounds, _) = folding_factor
             .compute_number_of_rounds(num_variables)
-            .expect("valid folding schedule");
+            .ok()?;
         let mut round_log_inv_rates = Vec::with_capacity(num_rounds);
         let mut rate = 1;
         for round in 0..num_rounds {
@@ -339,20 +376,23 @@ impl Whir {
                 MyMmcs::Cpu(CpuMmcs::new(hash, compress, 0))
             }
         };
-        let config = WhirConfig::<EF, F, MyChallenger>::new(num_variables, params).unwrap();
+        let config = WhirConfig::<EF, F, MyChallenger>::new(num_variables, params).ok()?;
+        if config.max_fft_size() > Self::MAX_FFT_VARIABLES {
+            return None;
+        }
         #[cfg(not(feature = "cuda"))]
-        let dft = MyDft::new(1 << config.max_fft_size());
+        let dft = MyDft::new(1usize.checked_shl(config.max_fft_size() as u32)?);
         #[cfg(feature = "cuda")]
         let dft = {
             if backend::use_cuda_dft() {
                 MyDft::Cuda(crate::pcs::dft_cuda::CudaDft::new())
             } else {
-                MyDft::Cpu(CpuDft::new(1 << config.max_fft_size()))
+                MyDft::Cpu(CpuDft::new(1usize.checked_shl(config.max_fft_size() as u32)?))
             }
         };
         let pcs = MyPcs::new(config, dft, mmcs);
 
-        Whir {
+        Some(Whir {
             pcs,
             perm,
             folding_factor,
@@ -361,7 +401,7 @@ impl Whir {
             commit_stats: std::cell::Cell::new((0, 0.0)),
             open_stats: std::cell::Cell::new((0, 0.0)),
             verify_stats: std::cell::Cell::new((0, 0.0)),
-        }
+        })
     }
 
     /// The security parameters this instance was configured with:
@@ -546,6 +586,72 @@ impl Whir {
         self.verify_stats.set((n + 1, secs + t0.elapsed().as_secs_f64()));
         Ok(evals[0].current()[0].as_base().expect("base-field MLE opens to a base element"))
     }
+    /// Open the committed MLE at a FULL extension-field point: the point and
+    /// the returned evaluation are genuine `EF` elements (no base embedding,
+    /// no downcast). The transcript is bound to the commitment before the
+    /// opening, matching `commit`'s state.
+    pub fn open_ef(
+        &self,
+        commitment: &Commitment,
+        prover_data: ProverData,
+        protocol: &OpeningProtocol,
+        point: &Point<EF>,
+    ) -> (Proof, EF) {
+        let t0 = std::time::Instant::now();
+        let mut challenger = self.fresh_challenger();
+        challenger.observe(commitment);
+        let proof = self.pcs.open_at(
+            prover_data,
+            protocol,
+            std::slice::from_ref(point),
+            &mut challenger,
+        );
+        let opened = proof.evals[0].current()[0];
+        let (n, secs) = self.open_stats.get();
+        self.open_stats.set((n + 1, secs + t0.elapsed().as_secs_f64()));
+        GLOBAL_OPEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (proof, opened)
+    }
+
+    /// Verify a full-extension-field opening: returns the verified evaluation
+    /// as an `EF` element. Verifier-only — never regenerates the opening.
+    ///
+    /// Pre-validates the public metadata BEFORE calling upstream `verify_at`
+    /// (which asserts on mismatches): the point must have exactly
+    /// `num_variables` coordinates and the protocol must be the canonical
+    /// single-opening protocol for this instance.
+    pub fn verify_ef(
+        &self,
+        commitment: &Commitment,
+        proof: &Proof,
+        protocol: &OpeningProtocol,
+        point: &Point<EF>,
+    ) -> Result<EF, WhirVerifyError> {
+        if point.as_slice().len() != self.num_variables() {
+            return Err(WhirVerifyError::Malformed("point arity does not match this Whir instance"));
+        }
+        if *protocol != self.opening_protocol(self.num_variables(), 1) {
+            return Err(WhirVerifyError::Malformed(
+                "protocol is not the canonical single-opening schedule",
+            ));
+        }
+        let t0 = std::time::Instant::now();
+        let mut challenger = self.fresh_challenger();
+        challenger.observe(commitment);
+        let evals = self.pcs
+            .verify_at(
+                commitment,
+                proof,
+                protocol,
+                std::slice::from_ref(point),
+                &mut challenger,
+            )
+            .map_err(WhirVerifyError::Pcs)?;
+        let (n, secs) = self.verify_stats.get();
+        self.verify_stats.set((n + 1, secs + t0.elapsed().as_secs_f64()));
+        Ok(evals[0].current()[0])
+    }
+
     /// Open the committed MLE at multiple points in one batched opening proof.
     /// Open the committed MLE at multiple points in one batched opening proof.
     pub fn open_multi(
@@ -807,6 +913,46 @@ mod tests {
             assert_eq!(opened, verified);
             assert_eq!(verified, mle::eval(&evals[i], &point));
         }
+    }
+
+    /// `new_target` is genuinely fallible: tiny arities (below the folding
+    /// factor), PoW schedules exceeding the budget, and absurd FFT domains
+    /// must yield `None`, never a panic.
+    #[test]
+    fn new_target_is_fallible() {
+        assert!(Whir::new_target(4, 32, 10).is_none(), "arity below folding factor");
+        // 90-bit with budget 0 IS valid at arity 6 (97 final queries cover
+        // it); a 200-bit target with budget 0 needs >0 PoW bits and must be
+        // rejected instead.
+        assert!(Whir::new_target(6, 200, 0).is_none(), "PoW budget insufficient");
+        assert!(Whir::new_target(40, 90, 32).is_none(), "FFT domain too large");
+        let w = Whir::new_target(6, 90, 32).expect("valid configuration");
+        assert!(w.pow_bits_ok());
+    }
+
+    /// `verify_ef` pre-validates point arity and the canonical single-opening
+    /// protocol, returning `Err(Malformed)` instead of hitting upstream
+    /// asserts.
+    #[test]
+    fn verify_ef_rejects_malformed_metadata() {
+        let mut rng = XorShift64::new(0x7EE);
+        let whir = Whir::new_testing(6);
+        let evals: Vec<Goldilocks> = (0..(1 << 6)).map(|_| rng.field()).collect();
+        let (root, pd, proto) = whir.commit(&evals);
+        let point = Point::new(vec![EF::from(Goldilocks::new(7)); 6]);
+        let (proof, _) = whir.open_ef(&root, pd, &proto, &point);
+
+        let bad_pt = Point::new(vec![EF::from(Goldilocks::new(7)); 5]);
+        assert!(matches!(
+            whir.verify_ef(&root, &proof, &proto, &bad_pt),
+            Err(WhirVerifyError::Malformed(_))
+        ));
+        let bad_proto = whir.opening_protocol(6, 2);
+        assert!(matches!(
+            whir.verify_ef(&root, &proof, &bad_proto, &point),
+            Err(WhirVerifyError::Malformed(_))
+        ));
+        assert!(whir.verify_ef(&root, &proof, &proto, &point).is_ok());
     }
 
     /// Batch commits must inherit the caller's security parameters instead of
