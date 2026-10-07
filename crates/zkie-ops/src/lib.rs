@@ -12,6 +12,7 @@ pub mod claim_driven_shard;
 pub mod extension_two_shard_chain_dag;
 pub mod non_recursive_two_shard_aggregation;
 pub mod extension_lookup_logup;
+pub mod extension_matmul_committed;
 pub mod projection;
 pub mod layer_norm_centered;
 pub mod layernorm_chain;
