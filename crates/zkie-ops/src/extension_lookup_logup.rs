@@ -165,8 +165,22 @@ pub struct RelationProof {
     pub opens: Vec<TensorOpen>,
 }
 
+/// Prover-side phase timings (diagnostics only — the root-only verifier
+/// never reads them). `derived_inverse_commit_secs` covers the four inverse
+/// tensor COMMITS only; the inverse ARITHMETIC is not included. Likewise
+/// `terminal_open_secs` is the opening time inside the relations (subtracted
+/// from `relation_prove_secs`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProveTimings {
+    pub initial_commit_secs: f64,
+    pub derived_inverse_commit_secs: f64,
+    pub relation_prove_secs: f64,
+    pub terminal_open_secs: f64,
+}
+
 /// The transported proof: the four claimed sums (absorbed before any
-/// relation challenge) and the eight relation transcripts.
+/// relation challenge), the eight relation transcripts, and the prover-side
+/// phase timings (ignored by `verify`).
 #[derive(Clone)]
 pub struct LookupProof {
     pub s_idx_row: EF,
@@ -174,6 +188,7 @@ pub struct LookupProof {
     pub s_pair_row: EF,
     pub s_pair_entry: EF,
     pub relations: Vec<RelationProof>,
+    pub timings: ProveTimings,
 }
 
 struct Data {
@@ -203,6 +218,19 @@ fn commit_ef_pair(w: &Whir, values: &[EF], arity: usize) -> Data {
         values: values.to_vec(),
         arity,
     }
+}
+
+/// Reuse scratch buffer `idx` (preserving its allocation): refill it from
+/// `src`. `clear` keeps the capacity; the caller's later `truncate` never
+/// shrinks the allocation either — so one prove reuses the same buffers for
+/// every relation.
+fn refill_scratch(scratch: &mut Vec<Vec<EF>>, src: &[EF], idx: usize) {
+    if idx >= scratch.len() {
+        scratch.push(Vec::with_capacity(src.len()));
+    }
+    let b = &mut scratch[idx];
+    b.clear();
+    b.extend_from_slice(src);
 }
 
 fn open_at(w: &Whir, d: &Data, z: &[EF]) -> TensorOpen {
@@ -298,62 +326,128 @@ fn relation_meta(id: usize) -> (bool, bool, Vec<usize>) {
     }
 }
 
-/// Prover-side buffers and terms for relation `id`.
-/// Tensor slots: 0 = iq_idx, 1 = it_idx, 2 = iq_pair, 3 = it_pair,
-/// 4 = idx, 5 = out, 6 = table, 7 = m.
-fn relation_bufs_terms(
+/// Term marker for the public affine index buffer `J` (never materialized
+/// on the prover side — see `virtual_round_pvals_affine_j`).
+const J_MARK: usize = usize::MAX;
+
+/// Which tensor slots a relation reads (buffer order), and whether its
+/// virtual polynomial uses the public affine J source.
+/// Slots: 0 = iq_idx, 1 = it_idx, 2 = iq_pair, 3 = it_pair, 4 = idx,
+/// 5 = out, 6 = table, 7 = m.
+fn relation_srcs(id: usize) -> (Vec<usize>, bool) {
+    match id {
+        INV_IDX_ROW => (vec![0, 4], false),
+        INV_IDX_ENTRY => (vec![1], true),
+        INV_PAIR_ROW => (vec![2, 4, 5], false),
+        INV_PAIR_ENTRY => (vec![3, 6], true),
+        SUM_IDX_ROW => (vec![0], false),
+        SUM_IDX_ENTRY => (vec![7, 1], false),
+        SUM_PAIR_ROW => (vec![2], false),
+        SUM_PAIR_ENTRY => (vec![7, 3], false),
+        _ => unreachable!(),
+    }
+}
+
+/// The head mask length for a sum relation, or `None` when the head covers
+/// the FULL domain (constant one — the mask buffer is omitted entirely).
+fn head_len(id: usize, p: usize, t: usize, arity: usize) -> Option<usize> {
+    let len = match id {
+        SUM_IDX_ROW | SUM_PAIR_ROW => p,
+        SUM_IDX_ENTRY | SUM_PAIR_ENTRY => t,
+        _ => return None,
+    };
+    (len < (1usize << arity)).then_some(len)
+}
+
+/// Per-relation virtual-polynomial terms. Buffer layout: the slots from
+/// `relation_srcs`, then the head mask (if `has_head`), then the eq buffer
+/// (inverse relations). `J_MARK` denotes the affine J factor. The term
+/// SUMS are identical to the previously materialized-J/head layout
+/// (equivalence-tested), so the absorbed round polynomials are bit-identical.
+fn relation_terms(
     id: usize,
-    arity: usize,
-    p: usize,
-    t: usize,
     gamma: EF,
     alpha: EF,
     beta: EF,
-    d: &[Data; 8],
-    r: &[EF],
-) -> (Vec<Vec<EF>>, Vec<(EF, Vec<usize>)>) {
+    has_head: bool,
+) -> Vec<(EF, Vec<usize>)> {
     let neg = EF::ZERO - EF::ONE;
-    let buf = |i: usize| d[i].values.clone();
-    let eq = eq_values(r, arity);
     match id {
-        INV_IDX_ROW => (
-            vec![buf(0), buf(4), eq],
-            vec![(gamma, vec![2, 0]), (EF::ONE, vec![2, 0, 1]), (neg, vec![2])],
-        ),
-        INV_IDX_ENTRY => (
-            vec![buf(1), j_values(arity), eq],
-            vec![(gamma, vec![2, 0]), (EF::ONE, vec![2, 0, 1]), (neg, vec![2])],
-        ),
-        INV_PAIR_ROW => (
-            vec![buf(2), buf(4), buf(5), eq],
-            vec![
-                (alpha, vec![3, 0]),
-                (EF::ONE, vec![3, 0, 1]),
-                (beta, vec![3, 0, 2]),
-                (neg, vec![3]),
-            ],
-        ),
-        INV_PAIR_ENTRY => (
-            vec![buf(3), j_values(arity), buf(6), eq],
-            vec![
-                (alpha, vec![3, 0]),
-                (EF::ONE, vec![3, 0, 1]),
-                (beta, vec![3, 0, 2]),
-                (neg, vec![3]),
-            ],
-        ),
-        SUM_IDX_ROW => (vec![buf(0), head(p, arity)], vec![(EF::ONE, vec![1, 0])]),
-        SUM_IDX_ENTRY => (
-            vec![buf(7), buf(1), head(t, arity)],
-            vec![(EF::ONE, vec![2, 0, 1])],
-        ),
-        SUM_PAIR_ROW => (vec![buf(2), head(p, arity)], vec![(EF::ONE, vec![1, 0])]),
-        SUM_PAIR_ENTRY => (
-            vec![buf(7), buf(3), head(t, arity)],
-            vec![(EF::ONE, vec![2, 0, 1])],
-        ),
+        INV_IDX_ROW => vec![(gamma, vec![2, 0]), (EF::ONE, vec![2, 0, 1]), (neg, vec![2])],
+        // New entry-inverse layout [inv(0), eq(1)] with J affine: the J
+        // factor appears ONLY in the mixed term; the coefficient terms keep
+        // eq (same products as the old materialized layout).
+        INV_IDX_ENTRY => {
+            vec![(gamma, vec![1, 0]), (EF::ONE, vec![1, 0, J_MARK]), (neg, vec![1])]
+        }
+        INV_PAIR_ROW => vec![
+            (alpha, vec![3, 0]),
+            (EF::ONE, vec![3, 0, 1]),
+            (beta, vec![3, 0, 2]),
+            (neg, vec![3]),
+        ],
+        // New entry-inverse layout [inv(0), table(1), eq(2)] with J affine.
+        INV_PAIR_ENTRY => vec![
+            (alpha, vec![2, 0]),
+            (EF::ONE, vec![2, 0, J_MARK]),
+            (beta, vec![2, 0, 1]),
+            (neg, vec![2]),
+        ],
+        SUM_IDX_ROW if has_head => vec![(EF::ONE, vec![1, 0])],
+        SUM_IDX_ROW => vec![(EF::ONE, vec![0])],
+        SUM_IDX_ENTRY if has_head => vec![(EF::ONE, vec![2, 0, 1])],
+        SUM_IDX_ENTRY => vec![(EF::ONE, vec![0, 1])],
+        SUM_PAIR_ROW if has_head => vec![(EF::ONE, vec![1, 0])],
+        SUM_PAIR_ROW => vec![(EF::ONE, vec![0])],
+        SUM_PAIR_ENTRY if has_head => vec![(EF::ONE, vec![2, 0, 1])],
+        SUM_PAIR_ENTRY => vec![(EF::ONE, vec![0, 1])],
         _ => unreachable!(),
     }
+}
+
+/// Round-polynomial values at `0..=max_deg` for a virtual sumcheck whose
+/// buffers EXCLUDE the public affine index buffer `J(k) = k` (LSB-first
+/// flat index). Terms may use `J_MARK` as a factor: after `round` folds at
+/// challenges `z_0..z_{round-1}`, the J factor's linear extension over the
+/// current pair `(2s, 2s+1)` is
+/// `fk(J) = j_base + s * 2^{round+1} + X * 2^round`
+/// where `j_base = sum_{b<round} 2^b z_b` and `X` is the current variable
+/// (the pair's original indices differ exactly in bit `round`). This is
+/// BIT-IDENTICAL to materializing J as a buffer (equivalence-tested) and
+/// never allocates the 2^arity J vector.
+fn virtual_round_pvals_affine_j(
+    bufs: &[Vec<EF>],
+    terms: &[(EF, Vec<usize>)],
+    max_deg: usize,
+    round: usize,
+    j_base: EF,
+) -> Vec<EF> {
+    let half = bufs[0].len() / 2;
+    let mut pvals = vec![EF::ZERO; max_deg + 1];
+    let two_j = EF::from(Goldilocks::from_u64((1usize << round) as u64));
+    let two_j1 = EF::from(Goldilocks::from_u64((1usize << (round + 1)) as u64));
+    for k in 0..=max_deg {
+        let xk = EF::from(Goldilocks::from_u64(k as u64));
+        let one_minus = EF::ONE - xk;
+        for s in 0..half {
+            let j_fk = j_base + EF::from(Goldilocks::from_u64(s as u64)) * two_j1 + xk * two_j;
+            for (coeff, idxs) in terms {
+                let mut prod = *coeff;
+                for &j in idxs {
+                    let fk = if j == J_MARK {
+                        j_fk
+                    } else {
+                        // k*f1 - (k-1)*f0 == xk*f1 + (1-xk)*f0 (same as the
+                        // generic virtual_round_pvals_f).
+                        xk * bufs[j][2 * s + 1] + one_minus * bufs[j][2 * s]
+                    };
+                    prod = prod * fk;
+                }
+                pvals[k] = pvals[k] + prod;
+            }
+        }
+    }
+    pvals
 }
 
 /// Verifier-side terminal expression for relation `id` from the opened
@@ -394,34 +488,66 @@ fn prove_relation(
     alpha: EF,
     beta: EF,
     d: &[Data; 8],
-    claimed0: EF,
     id: usize,
     tx: &mut TwoPhaseTranscript,
+    scratch: &mut Vec<Vec<EF>>,
+    open_secs: &mut f64,
 ) -> RelationProof {
     let (is_rows, has_r, open_ids) = relation_meta(id);
     let arity = if is_rows { lw.rows.num_variables() } else { lw.entries.num_variables() };
     let r = if has_r { tx.sample_vec(arity) } else { vec![] };
-    let (mut bufs, terms) = relation_bufs_terms(id, arity, p, t, gamma, alpha, beta, d, &r);
+    let (slots, uses_j) = relation_srcs(id);
+    let mask = head_len(id, p, t, arity);
+    let terms = relation_terms(id, gamma, alpha, beta, mask.is_some());
+    // Reusable scratch: the committed `Data.values` are only READ; the fold
+    // working set lives in scratch buffers whose ALLOCATIONS are preserved
+    // across relations (`clear` keeps capacity, the fold's `truncate` never
+    // shrinks the allocation, and `refill_scratch` reuses the same buffer).
+    // The public J source is affine (never materialized) and a full-domain
+    // head mask is constant one (omitted).
+    let mut used = 0usize;
+    for &s in &slots {
+        refill_scratch(scratch, &d[s].values, used);
+        used += 1;
+    }
+    if let Some(len) = mask {
+        let h = head(len, arity);
+        refill_scratch(scratch, &h, used);
+        used += 1;
+    }
+    if has_r {
+        let eq = eq_values(&r, arity);
+        refill_scratch(scratch, &eq, used);
+        used += 1;
+    }
     let mut rounds = Vec::with_capacity(arity);
     let mut z = Vec::with_capacity(arity);
-    for _ in 0..arity {
-        let pvals = virtual_round_pvals_f(&bufs, &terms, 3);
+    let mut j_base = EF::ZERO;
+    for round in 0..arity {
+        let pvals = if uses_j {
+            virtual_round_pvals_affine_j(&scratch[..used], &terms, 3, round, j_base)
+        } else {
+            virtual_round_pvals_f(&scratch[..used], &terms, 3)
+        };
         for &x in &pvals {
             tx.absorb(x);
         }
         let c = tx.sample();
-        let half = bufs[0].len() / 2;
-        for b in &mut bufs {
+        let half = scratch[0].len() / 2;
+        for b in scratch[..used].iter_mut() {
             for i in 0..half {
                 b[i] = b[2 * i] + c * (b[2 * i + 1] - b[2 * i]);
             }
             b.truncate(half);
         }
+        j_base = j_base + EF::from(Goldilocks::from_u64((1usize << round) as u64)) * c;
         rounds.push(pvals);
         z.push(c);
     }
     let w = if is_rows { &lw.rows } else { &lw.entries };
+    let t0 = std::time::Instant::now();
     let opens: Vec<TensorOpen> = open_ids.iter().map(|&i| open_at(w, &d[i], &z)).collect();
+    *open_secs += t0.elapsed().as_secs_f64();
     RelationProof { r, rounds, z, opens }
 }
 
@@ -539,10 +665,12 @@ pub fn prove_with_m(
         m_vals[j] = to_ef(m[j]);
     }
     // Initial commitments (roots BEFORE the challenges).
+    let t0 = std::time::Instant::now();
     let d_idx = commit_ef_pair(&lw.rows, &idx_vals, ar_r);
     let d_out = commit_ef_pair(&lw.rows, &out_vals, ar_r);
     let d_table = commit_ef_pair(&lw.entries, &table_vals, ar_e);
     let d_m = commit_ef_pair(&lw.entries, &m_vals, ar_e);
+    let initial_commit_secs = t0.elapsed().as_secs_f64();
 
     // Initial roots (BEFORE the challenges) — the transcript is built from
     // them directly.
@@ -580,10 +708,12 @@ pub fn prove_with_m(
         it_idx_vals[j] = (gamma + jv[j]).inverse();
         it_pair_vals[j] = (alpha + jv[j] + beta * table_vals[j]).inverse();
     }
+    let t0 = std::time::Instant::now();
     let d_iq_idx = commit_ef_pair(&lw.rows, &iq_idx_vals, ar_r);
     let d_it_idx = commit_ef_pair(&lw.entries, &it_idx_vals, ar_e);
     let d_iq_pair = commit_ef_pair(&lw.rows, &iq_pair_vals, ar_r);
     let d_it_pair = commit_ef_pair(&lw.entries, &it_pair_vals, ar_e);
+    let derived_inverse_commit_secs = t0.elapsed().as_secs_f64();
 
     let stmt = LookupStatement {
         p,
@@ -612,11 +742,16 @@ pub fn prove_with_m(
     let d = [
         d_iq_idx, d_it_idx, d_iq_pair, d_it_pair, d_idx, d_out, d_table, d_m,
     ];
-    let claimed = [EF::ZERO, EF::ZERO, EF::ZERO, EF::ZERO, s_idx_row, s_idx_entry, s_pair_row, s_pair_entry];
+    let mut scratch: Vec<Vec<EF>> = Vec::new();
+    let mut open_secs = 0.0f64;
+    let t_rel = std::time::Instant::now();
     let mut relations = Vec::with_capacity(RELATIONS);
     for id in 0..RELATIONS {
-        relations.push(prove_relation(lw, p, t, gamma, alpha, beta, &d, claimed[id], id, &mut tx));
+        relations.push(prove_relation(
+            lw, p, t, gamma, alpha, beta, &d, id, &mut tx, &mut scratch, &mut open_secs,
+        ));
     }
+    let relation_prove_secs = t_rel.elapsed().as_secs_f64() - open_secs;
     Some((
         stmt,
         LookupProof {
@@ -625,6 +760,12 @@ pub fn prove_with_m(
             s_pair_row,
             s_pair_entry,
             relations,
+            timings: ProveTimings {
+                initial_commit_secs,
+                derived_inverse_commit_secs,
+                relation_prove_secs,
+                terminal_open_secs: open_secs,
+            },
         },
     ))
 }
@@ -931,6 +1072,119 @@ mod tests {
             let reference = fold_ef(&head(32, arity), &z) * v[0] * v[1];
             assert_eq!(expr, reference);
         }
+    }
+
+    /// The affine-J round polynomials are BIT-IDENTICAL to materializing J
+    /// as a buffer: at every round, across arities, with the J buffer folded
+    /// alongside the other buffers in the reference and `j_base` tracked
+    /// from the same fold challenges.
+    #[test]
+    fn affine_j_pvals_match_materialized_reference() {
+        let mut rng = XorShift64::new(0xA11);
+        let rand_ef = |rng: &mut XorShift64| EF::from(rng.field()) + gen() * EF::from(rng.field());
+        let (alpha, beta) = (rand_ef(&mut rng), rand_ef(&mut rng));
+        for arity in 5..=8 {
+            let n = 1usize << arity;
+            // INV_PAIR_ENTRY layout: new bufs [it(0), table(1), eq(2)] with
+            // J_MARK terms; old bufs [it(0), J(1), table(2), eq(3)].
+            let terms_new = vec![
+                (alpha, vec![2, 0]),
+                (EF::ONE, vec![2, 0, J_MARK]),
+                (beta, vec![2, 0, 1]),
+                (EF::ZERO - EF::ONE, vec![2]),
+            ];
+            let terms_old = vec![
+                (alpha, vec![3, 0]),
+                (EF::ONE, vec![3, 0, 1]),
+                (beta, vec![3, 0, 2]),
+                (EF::ZERO - EF::ONE, vec![3]),
+            ];
+            let mut it: Vec<EF> = (0..n).map(|_| rand_ef(&mut rng)).collect();
+            let mut table: Vec<EF> = (0..n).map(|_| rand_ef(&mut rng)).collect();
+            let mut eq: Vec<EF> = (0..n).map(|_| rand_ef(&mut rng)).collect();
+            let mut jmat = j_values(arity);
+            let mut j_base = EF::ZERO;
+            for round in 0..arity {
+                let p_new = virtual_round_pvals_affine_j(
+                    &[it.clone(), table.clone(), eq.clone()],
+                    &terms_new,
+                    3,
+                    round,
+                    j_base,
+                );
+                let p_old = virtual_round_pvals_f(
+                    &[it.clone(), jmat.clone(), table.clone(), eq.clone()],
+                    &terms_old,
+                    3,
+                );
+                assert_eq!(p_new, p_old, "round {round} arity {arity}");
+                // Fold everything (J included) at a fresh challenge.
+                let zc = rand_ef(&mut rng);
+                let fold_in_place = |b: &mut Vec<EF>| {
+                    let half = b.len() / 2;
+                    for i in 0..half {
+                        b[i] = b[2 * i] + zc * (b[2 * i + 1] - b[2 * i]);
+                    }
+                    b.truncate(half);
+                };
+                fold_in_place(&mut it);
+                fold_in_place(&mut table);
+                fold_in_place(&mut eq);
+                fold_in_place(&mut jmat);
+                j_base = j_base
+                    + EF::from(Goldilocks::from_u64((1usize << round) as u64)) * zc;
+            }
+        }
+    }
+
+    /// A FULL-domain head mask is omitted (constant one): the sum-relation
+    /// round polynomials match the old materialized all-ones head buffer.
+    #[test]
+    fn full_domain_head_omission_matches_reference() {
+        let mut rng = XorShift64::new(0xA22);
+        let rand_ef = |rng: &mut XorShift64| EF::from(rng.field()) + gen() * EF::from(rng.field());
+        for arity in 5..=8 {
+            let n = 1usize << arity;
+            let m: Vec<EF> = (0..n).map(|_| rand_ef(&mut rng)).collect();
+            let it: Vec<EF> = (0..n).map(|_| rand_ef(&mut rng)).collect();
+            let head_ones = vec![EF::ONE; n];
+            let p_new = virtual_round_pvals_f(&[m.clone(), it.clone()], &[(EF::ONE, vec![0, 1])], 3);
+            let p_old = virtual_round_pvals_f(
+                &[m.clone(), it.clone(), head_ones],
+                &[(EF::ONE, vec![2, 0, 1])],
+                3,
+            );
+            assert_eq!(p_new, p_old, "arity {arity}");
+        }
+    }
+
+    /// The scratch refill preserves inner allocations across relations:
+    /// after the first fill, repeated refill + fold (truncate) + refill
+    /// cycles never reallocate (capacity invariant — no allocator hooks
+    /// needed) and the contents always match the source.
+    #[test]
+    fn scratch_refill_preserves_allocations() {
+        let mut rng = XorShift64::new(0x5C4);
+        let n = 1usize << 6;
+        let src_a: Vec<EF> = (0..n).map(|_| EF::from(rng.field())).collect();
+        let src_b: Vec<EF> = (0..n).map(|_| EF::from(rng.field())).collect();
+        let mut scratch: Vec<Vec<EF>> = Vec::new();
+        refill_scratch(&mut scratch, &src_a, 0);
+        let cap = scratch[0].capacity();
+        assert!(cap >= n);
+        assert_eq!(&scratch[0][..], &src_a[..]);
+        // Fold in place like the relation rounds, then refill from another
+        // source: the allocation must survive.
+        for _ in 0..6 {
+            let half = scratch[0].len() / 2;
+            for i in 0..half {
+                scratch[0][i] = scratch[0][2 * i] + scratch[0][2 * i + 1];
+            }
+            scratch[0].truncate(half);
+        }
+        refill_scratch(&mut scratch, &src_b, 0);
+        assert_eq!(scratch[0].capacity(), cap, "inner allocation reused, no realloc");
+        assert_eq!(&scratch[0][..], &src_b[..]);
     }
 
     /// A REAL store + `Op::Lookup` fixture (P = 16, T = 32): idx tensor,
