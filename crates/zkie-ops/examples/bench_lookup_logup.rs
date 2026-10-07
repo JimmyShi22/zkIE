@@ -24,7 +24,7 @@ use zkie_ops::extension_lookup_logup::{prove_op_lookup, verify, LookupWhir};
 const DEFAULT_ROWS_LOG: usize = 10;
 const DEFAULT_TABLE_LOG: usize = 12;
 const MAX_LOG: usize = 20;
-const SECURITY_LEVEL: usize = 90;
+const DEFAULT_SECURITY_LEVEL: usize = 90;
 const DEFAULT_POW_BUDGET: usize = 32;
 
 fn env_log(name: &str, default: usize) -> usize {
@@ -58,11 +58,12 @@ fn main() {
     let rows_log = env_log("ROWS_LOG", DEFAULT_ROWS_LOG);
     let table_log = env_log("TABLE_LOG", DEFAULT_TABLE_LOG);
     let pow_budget = env_usize("POW_BUDGET", DEFAULT_POW_BUDGET);
+    let security_level = env_usize("SECURITY_LEVEL", DEFAULT_SECURITY_LEVEL);
     let p = 1usize << rows_log;
     let t = 1usize << table_log;
     println!(
         "lookup_logup bench: rows=2^{}={} table=2^{}={} security={} pow_budget={}",
-        rows_log, p, table_log, t, SECURITY_LEVEL, pow_budget
+        rows_log, p, table_log, t, security_level, pow_budget
     );
 
     // Deterministic witness built through the actual IR.
@@ -80,7 +81,7 @@ fn main() {
         table: tbl_id,
     };
 
-    let Some(lw) = LookupWhir::new(p, t, SECURITY_LEVEL, pow_budget) else {
+    let Some(lw) = LookupWhir::new(p, t, security_level, pow_budget) else {
         eprintln!("LookupWhir::new rejected the configuration (security/budget infeasible)");
         std::process::exit(1);
     };
