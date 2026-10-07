@@ -243,3 +243,37 @@ mod tests {
         assert!(MatmulWhir::new(2, 2, 2, 32, 10).is_none(), "arity below folding floor");
     }
 }
+
+use crate::compose::{Op, Store};
+
+/// Op adapter: recognize `Op::MatMul` and materialize a/b/c from a real Store,
+/// then run the root-bound committed matmul. Returns the committed statement,
+/// proof, and the three challenge vectors (u, v, ch) the verifier needs — the
+/// caller (a shard-DAG verifier) must carry them. No forward recomputation.
+pub fn prove_op_matmul(
+    whir: &MatmulWhir,
+    op: &Op,
+    store: &Store,
+    rng: &mut XorShift64,
+) -> Option<(
+    MatmulStatement,
+    MatmulCommittedProof,
+    Vec<Goldilocks>,
+    Vec<Goldilocks>,
+    Vec<Goldilocks>,
+)> {
+    let Op::MatMul { a, b, c, m, k, n } = op else {
+        return None;
+    };
+    let av = store.materialize(*a);
+    let bv = store.materialize(*b);
+    let cv = store.materialize(*c);
+    if av.len() != *m * *k || bv.len() != *k * *n || cv.len() != *m * *n {
+        return None;
+    }
+    let u: Vec<Goldilocks> = (0..m.trailing_zeros() as usize).map(|_| rng.field()).collect();
+    let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
+    let ch: Vec<Goldilocks> = (0..k.trailing_zeros() as usize).map(|_| rng.field()).collect();
+    let (stmt, proof) = prove(whir, av.as_ref(), bv.as_ref(), cv.as_ref(), *m, *k, *n, &u, &v, &ch);
+    Some((stmt, proof, u, v, ch))
+}
