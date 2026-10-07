@@ -17,6 +17,7 @@ pub mod extension_projection_committed;
 pub mod extension_layernorm_committed;
 pub mod extension_divmod_committed;
 pub mod extension_softmax_committed;
+pub mod extension_shard_matmul_lookup;
 pub mod projection;
 pub mod layer_norm_centered;
 pub mod layernorm_chain;
