@@ -292,3 +292,48 @@ mod tests {
         assert!(SoftmaxWhir::new(2, 2, 32, 32, 10).is_none());
     }
 }
+
+use crate::compose::{Op, Store};
+use zkie_core::common::field::PrimeField64;
+
+/// Op adapter: recognize `Op::Softmax` and materialize idx/e/out/table from a
+/// real Store, compute the derived `sum`/`rem` intermediates (the forward), and
+/// run the root-bound committed softmax. No forward recomputation on the
+/// verifier side.
+pub fn prove_op_softmax(
+    whir: &SoftmaxWhir,
+    op: &Op,
+    store: &Store,
+    rng: &mut XorShift64,
+) -> Option<(SoftmaxStatement, SoftmaxCommittedProof)> {
+    let Op::Softmax { idx, e, out, table, m, n } = op else {
+        return None;
+    };
+    let idxs = store.idx.get(*idx)?;
+    let ev = store.materialize(*e);
+    let ov = store.materialize(*out);
+    let tv = store.materialize(*table);
+    if idxs.len() != *m * *n || ev.len() != *m * *n || ov.len() != *m * *n {
+        return None;
+    }
+    let sum: Vec<Goldilocks> = (0..*m)
+        .map(|i| (0..*n).fold(Goldilocks::ZERO, |a, j| a + ev[i * *n + j]))
+        .collect();
+    let two16 = Goldilocks::from_u64(1u64 << 16);
+    let rem: Vec<Goldilocks> = (0..*m * *n)
+        .map(|ij| ev[ij] * two16 - ov[ij] * sum[ij / *n])
+        .collect();
+    let table_u64: Vec<u64> = tv.iter().map(|&x| x.as_canonical_u64()).collect();
+    prove(
+        whir,
+        idxs,
+        ev.as_ref(),
+        ov.as_ref(),
+        &sum,
+        &rem,
+        &table_u64,
+        *m,
+        *n,
+        rng,
+    )
+}
