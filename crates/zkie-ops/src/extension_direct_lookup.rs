@@ -282,6 +282,90 @@ pub fn verify(w: &Whir, stmt: &Statement, proof: &LookupProof) -> bool {
     (0..N).all(|k| vtbl[k] == vout[k])
 }
 
+/// Pre-committed padded table tensor (root pair + prover data) for the
+/// shared-table constructor: the tensor is NOT re-committed, so the
+/// statement's table roots ARE these roots — enabling byte-structural root
+/// sharing with another relation (e.g. a linear op whose padded output IS
+/// the table).
+#[derive(Clone)]
+pub struct PrecommittedTable {
+    pub root: TensorCommitment,
+    pub re_pd: ProverData,
+    pub im_pd: ProverData,
+}
+
+impl PrecommittedTable {
+    /// Build from an ALREADY-committed base tensor: its commitment becomes
+    /// the table's re component; the zero imaginary component is committed
+    /// here.
+    pub fn from_committed_base(w: &Whir, re_root: Commitment, re_pd: ProverData) -> Self {
+        let (im_root, im_pd, _) = w.commit(&vec![Goldilocks::ZERO; PAD]);
+        PrecommittedTable {
+            root: TensorCommitment { re: re_root, im: im_root },
+            re_pd,
+            im_pd,
+        }
+    }
+
+    /// Prove the fixed N=8 lookup with THIS pre-committed tensor as the
+    /// table. Mirrors `prove` exactly (same bits/output tensors, same batch
+    /// opens), except the table is never re-committed — the legacy `prove`
+    /// is untouched.
+    pub fn prove_lookup_with_table(
+        &self,
+        w: &Whir,
+        indices: &[u8],
+        out: &[u64],
+    ) -> Option<(Statement, LookupProof)> {
+        if w.num_variables() != ARITY
+            || indices.len() != N
+            || out.len() != N
+            || indices.iter().any(|&i| i as usize >= N)
+        {
+            return None;
+        }
+        let mut b0 = vec![Goldilocks::ZERO; PAD];
+        let mut b1 = vec![Goldilocks::ZERO; PAD];
+        let mut b2 = vec![Goldilocks::ZERO; PAD];
+        let mut out_pad = vec![Goldilocks::ZERO; PAD];
+        for i in 0..N {
+            let j = indices[i] as usize;
+            b0[i] = Goldilocks::from_u64((j & 1) as u64);
+            b1[i] = Goldilocks::from_u64(((j >> 1) & 1) as u64);
+            b2[i] = Goldilocks::from_u64(((j >> 2) & 1) as u64);
+            out_pad[i] = Goldilocks::from_u64(out[i]);
+        }
+        let d_b0 = commit(w, b0);
+        let d_b1 = commit(w, b1);
+        let d_b2 = commit(w, b2);
+        let d_out = commit(w, out_pad);
+        // The shared table tensor is used as-is (never re-committed).
+        let d_tbl = Data {
+            root: self.root.clone(),
+            re_pd: self.re_pd.clone(),
+            im_pd: self.im_pd.clone(),
+        };
+        let stmt = Statement {
+            b0: d_b0.root.clone(),
+            b1: d_b1.root.clone(),
+            b2: d_b2.root.clone(),
+            out: d_out.root.clone(),
+            tbl: d_tbl.root.clone(),
+        };
+        let proto = w.opening_protocol(ARITY, N);
+        let row_vertices: Vec<Vec<EF>> = (0..N).map(vertex_of).collect();
+        let tbl_points: Vec<Vec<EF>> = indices.iter().map(|&i| vertex_of(i as usize)).collect();
+        let proof = LookupProof {
+            b0: batch_open(w, &d_b0, &proto, &row_vertices),
+            b1: batch_open(w, &d_b1, &proto, &row_vertices),
+            b2: batch_open(w, &d_b2, &proto, &row_vertices),
+            out: batch_open(w, &d_out, &proto, &row_vertices),
+            tbl: batch_open(w, &d_tbl, &proto, &tbl_points),
+        };
+        Some((stmt, proof))
+    }
+}
+
 // ==== dispatch seam (Op::Lookup / compose integration point) ====
 //
 // The seam below is the integration surface for future compose paths. A

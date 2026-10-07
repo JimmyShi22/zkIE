@@ -29,7 +29,7 @@
 use zkie_core::common::field::{EF, Goldilocks, PrimeCharacteristicRing, PrimeField64};
 use zkie_core::common::mle;
 use zkie_core::common::transcript::ETranscript;
-use zkie_core::pcs::whir::{Commitment, Point, Proof, Whir};
+use zkie_core::pcs::whir::{Commitment, OpeningProtocol, Point, Proof, ProverData, Whir};
 
 /// The supported linear op kinds. Public scalars live IN the statement and are
 /// bound by the transcript — no unbound caller data.
@@ -86,6 +86,17 @@ fn log2_pow2(v: usize) -> Option<usize> {
     } else {
         None
     }
+}
+
+/// Pre-committed output tensor for the shared-output constructor: root plus
+/// the prover-side data to open it. The claim-driven shard commits the
+/// shared tensor ONCE and hands it to both the linear and the lookup
+/// relations, so the shared root is byte-structural, not prover-supplied
+/// pairing.
+pub struct PrecommittedTensor {
+    pub root: Commitment,
+    pub prover_data: ProverData,
+    pub protocol: OpeningProtocol,
 }
 
 /// p3 WHIR points are MSB-first; our MLE convention is LSB-first.
@@ -227,6 +238,84 @@ pub fn prove(
             open_out,
             open_a,
             open_b,
+        },
+    ))
+}
+
+/// Prove `Add` (`m x k`) with the OUTPUT taken from a pre-committed tensor
+/// (shared with another relation, e.g. a lookup whose table IS this output).
+/// The sources `a`/`b` are committed here; the output is NOT re-committed —
+/// the statement's `root_out` is `shared.root` verbatim. `out` supplies the
+/// claimed output VALUES for the transcript claims only (the shared opening
+/// must match them or `None` is returned). The transcript, claims, and
+/// openings otherwise mirror `prove` for `LinearOpKind::Add` exactly; the
+/// existing `verify` verifies the result unchanged.
+pub fn prove_add_shared_out(
+    whir: &Whir,
+    m: usize,
+    k: usize,
+    a: &[Goldilocks],
+    b: &[Goldilocks],
+    out: &[Goldilocks],
+    shared: &PrecommittedTensor,
+) -> Option<(LinearStatement, LinearProof)> {
+    let (lm, lk) = (log2_pow2(m)?, log2_pow2(k)?);
+    let arity = lm + lk;
+    if whir.num_variables() != arity {
+        return None;
+    }
+    let sz = m.checked_mul(k)?;
+    if sz != a.len() || sz != b.len() || sz != out.len() {
+        return None;
+    }
+    let (root_a, pd_a, proto_a) = whir.commit(a);
+    let (root_b, pd_b, proto_b) = whir.commit(b);
+
+    let stmt = LinearStatement {
+        kind: LinearOpKind::Add,
+        m,
+        k,
+        root_a: root_a.clone(),
+        root_b: Some(root_b.clone()),
+        root_out: shared.root.clone(),
+    };
+    let roots: Vec<&Commitment> = vec![&root_a, &root_b, &shared.root];
+    let mut t = ETranscript::new(LinearOpKind::Add.label(), &[m, k], &roots);
+    let out_point = t.sample_vec(arity);
+    let y_claim = mle::eval_ef(out, &out_point);
+    t.absorb(y_claim);
+
+    let a_point = input_point(&LinearOpKind::Add, &out_point, lm);
+    let a_claim = mle::eval_ef(a, &a_point);
+    let b_claim = mle::eval_ef(b, &out_point);
+
+    // The shared opening must match the claimed values of the shared tensor.
+    let open_out = whir.open_ef(
+        &shared.root,
+        shared.prover_data.clone(),
+        &shared.protocol,
+        &to_p3_point(&out_point),
+    );
+    if open_out.1 != y_claim {
+        return None;
+    }
+    let open_a = whir.open_ef(&root_a, pd_a, &proto_a, &to_p3_point(&a_point));
+    if open_a.1 != a_claim {
+        return None;
+    }
+    t.absorb(a_claim);
+    let open_b = whir.open_ef(&root_b, pd_b, &proto_b, &to_p3_point(&out_point));
+    if open_b.1 != b_claim {
+        return None;
+    }
+    t.absorb(b_claim);
+
+    Some((
+        stmt,
+        LinearProof {
+            open_out,
+            open_a,
+            open_b: Some(open_b),
         },
     ))
 }
