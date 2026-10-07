@@ -85,11 +85,11 @@ pub struct LayerProof {
     pub opens: Vec<LeafPair>,
 }
 
-fn to_p3_point(our_point: &[EF]) -> Point<EF> {
+pub fn to_p3_point(our_point: &[EF]) -> Point<EF> {
     Point::new(our_point.iter().rev().cloned().collect())
 }
 
-fn gen() -> EF {
+pub fn gen() -> EF {
     EF::from_basis_coefficients_slice(&[Goldilocks::ZERO, Goldilocks::ONE]).unwrap()
 }
 
@@ -97,7 +97,7 @@ fn stored_pair(re: Goldilocks, im: Goldilocks) -> EF {
     EF::from(re) + gen() * EF::from(im)
 }
 
-fn open_pair(re: EF, im: EF) -> EF {
+pub fn open_pair(re: EF, im: EF) -> EF {
     re + gen() * im
 }
 
@@ -121,7 +121,7 @@ fn eq_evals(r: &[EF]) -> Vec<EF> {
     eq
 }
 
-fn layer_terms(c: EF) -> Vec<(EF, Vec<usize>)> {
+pub fn layer_terms(c: EF) -> Vec<(EF, Vec<usize>)> {
     let neg = EF::ZERO - EF::ONE;
     vec![
         (EF::ONE, vec![0usize, 1]),
@@ -145,7 +145,7 @@ fn sub_point(offset: usize, sub_len: usize, local: &[EF], arity: usize) -> Vec<E
 }
 
 /// Fold an EF array at a point (direct MLE evaluation, LSB-first).
-fn fold_ef(values: &[EF], point: &[EF]) -> EF {
+pub(crate) fn fold_ef(values: &[EF], point: &[EF]) -> EF {
     let mut buf = values.to_vec();
     let mut size = buf.len();
     for &x in point {
@@ -192,40 +192,102 @@ fn build_arrays() -> (Vec<Vec<EF>>, Vec<Goldilocks>, Vec<Goldilocks>) {
     (arrays, re, im)
 }
 
-/// Prove the layer identity with the interactive FS loop. Returns
-/// `(statement, proof)` or `None` for malformed inputs.
-pub fn prove(whir: &Whir) -> Option<(LayerStatement, LayerProof)> {
-    if whir.num_variables() != LAYOUT_ARITY {
+/// A layer's location inside a (possibly multi-layer) combined tree tensor.
+/// `half` is the sub-array length; `arity` is the committed tensor's arity.
+/// The six sub-arrays are `next_num/next_den` at their offsets and
+/// `num_low/num_high/den_low/den_high` as the two halves of `num/den`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LayerSpec {
+    pub arity: usize,
+    pub num_off: usize,
+    pub den_off: usize,
+    pub next_num_off: usize,
+    pub next_den_off: usize,
+    pub half: usize,
+}
+
+/// Validate a `LayerSpec` against the WHIR arity and the eq-point length
+/// BEFORE any arithmetic, so an externally supplied layout can never panic or
+/// silently select the wrong slices:
+/// - the WHIR arity must equal `spec.arity` exactly (r and WHIR dimensions);
+/// - `half` must be a nonzero power of two;
+/// - every offset must be `half`-aligned with `offset + len` inside the
+///   committed tensor (`num`/`den` span `2*half`, `next_*` span `half`) via
+///   checked arithmetic;
+/// - the four source ranges must be pairwise disjoint;
+/// - the eq point must have exactly `log2(half)` coordinates.
+/// The prover maps `false` to `None`, the verifier to `false`.
+fn validate_spec(whir: &Whir, spec: &LayerSpec, r_len: usize) -> bool {
+    if whir.num_variables() != spec.arity || !spec.half.is_power_of_two() {
+        return false;
+    }
+    if r_len != spec.half.trailing_zeros() as usize {
+        return false;
+    }
+    let Some(size) = 1usize.checked_shl(spec.arity as u32) else {
+        return false;
+    };
+    let Some(num_len) = spec.half.checked_mul(2) else {
+        return false;
+    };
+    let mut ranges = [
+        (spec.num_off, num_len),
+        (spec.den_off, num_len),
+        (spec.next_num_off, spec.half),
+        (spec.next_den_off, spec.half),
+    ];
+    for (off, len) in ranges {
+        if off % spec.half != 0 {
+            return false; // sub-point encoding requires half-aligned offsets
+        }
+        let Some(end) = off.checked_add(len) else {
+            return false;
+        };
+        if end > size {
+            return false;
+        }
+    }
+    ranges.sort_unstable();
+    ranges.windows(2).all(|w| w[0].0 + w[0].1 <= w[1].0)
+}
+
+/// Prove ONE layer identity segment against the given committed roots, at
+/// the caller-provided eq point `r`, continuing the shared transcript.
+/// Reused by both the single-layer entry point and the multi-layer chain.
+/// Returns `None` for any invalid spec, eq-point length, or sub-array shape
+/// (never panics, never proves a wrongly selected slice).
+pub(crate) fn prove_layer_segment(
+    whir: &Whir,
+    stmt: &LayerStatement,
+    pd_re: &zkie_core::pcs::whir::ProverData,
+    pd_im: &zkie_core::pcs::whir::ProverData,
+    proto: &zkie_core::pcs::whir::OpeningProtocol,
+    t: &mut TwoPhaseTranscript,
+    spec: &LayerSpec,
+    arrays: &[Vec<EF>; 6],
+    r: &[EF],
+) -> Option<LayerProof> {
+    if !validate_spec(whir, spec, r.len()) {
         return None;
     }
-    let (arrays, re, im) = build_arrays();
-    let (root_re, pd_re, proto_re) = whir.commit(&re);
-    let (root_im, pd_im, proto_im) = whir.commit(&im);
-
-    let mut s = TwoPhaseTranscript::new(PROTOCOL, &[HALF], &[&root_re, &root_im]);
-    let (alpha, beta) = s.sample_derived_challenges();
-    // No derived commitments in this slice: the tree IS the statement.
-    s.absorb_derived_roots(&[]);
-
-    // The eq point r (first two coordinates = the derived challenges), then
-    // the circuit combining challenge c.
-    let mut r = vec![alpha, beta];
-    r.extend(s.sample_vec(ROUNDS - 2));
-    let c = s.sample();
-
-    // Interactive FS rounds: absorb every round-polynomial coefficient, then
-    // sample the fresh fold challenge.
-    let eq = eq_evals(&r);
+    // Every sub-array must span exactly the spec'd segment, otherwise the
+    // folding below would silently operate on mismatched slices.
+    if arrays.iter().any(|a| a.len() != spec.half) {
+        return None;
+    }
+    let m = spec.half.trailing_zeros() as usize;
+    let c = t.sample();
+    let eq = eq_evals(r);
     let mut bufs: Vec<Vec<EF>> = vec![eq];
     bufs.extend(arrays.iter().cloned());
-    let mut rounds = Vec::with_capacity(ROUNDS);
-    let mut z = Vec::with_capacity(ROUNDS);
-    for _ in 0..ROUNDS {
+    let mut rounds = Vec::with_capacity(m);
+    let mut z = Vec::with_capacity(m);
+    for _ in 0..m {
         let pvals = virtual_round_pvals_f(&bufs, &layer_terms(c), 3);
         for &p in &pvals {
-            s.absorb(p);
+            t.absorb(p);
         }
-        let zi = s.sample();
+        let zi = t.sample();
         let half = bufs[0].len() / 2;
         for buf in bufs.iter_mut() {
             for i in 0..half {
@@ -238,73 +300,75 @@ pub fn prove(whir: &Whir) -> Option<(LayerStatement, LayerProof)> {
         rounds.push(pvals);
         z.push(zi);
     }
-
-    // Terminal claims at the final fold point z (absorbed after the folds).
     let claimed: Vec<EF> = arrays.iter().map(|a| fold_ef(a, &z)).collect();
     for &cl in &claimed {
-        s.absorb(cl);
+        t.absorb(cl);
     }
-
-    // Openings at z.
+    let offsets = [
+        spec.next_num_off,
+        spec.next_den_off,
+        spec.num_off,
+        spec.num_off + spec.half,
+        spec.den_off,
+        spec.den_off + spec.half,
+    ];
     let opens: Vec<LeafPair> = (0..6)
         .map(|i| {
-            let pt = sub_point(OFFSETS[i], HALF, &z, LAYOUT_ARITY);
+            let pt = sub_point(offsets[i], spec.half, &z, spec.arity);
             let p3 = to_p3_point(&pt);
-            let open_re = whir.open_ef(&root_re, pd_re.clone(), &proto_re, &p3);
-            let open_im = whir.open_ef(&root_im, pd_im.clone(), &proto_im, &p3);
+            let open_re = whir.open_ef(&stmt.root_re, pd_re.clone(), proto, &p3);
+            let open_im = whir.open_ef(&stmt.root_im, pd_im.clone(), proto, &p3);
             LeafPair { open_re, open_im }
         })
         .collect();
-
-    Some((
-        LayerStatement { root_re, root_im },
-        LayerProof {
-            r,
-            c,
-            rounds,
-            z,
-            claimed,
-            opens,
-        },
-    ))
+    LayerProof {
+        r: r.to_vec(),
+        c,
+        rounds,
+        z,
+        claimed,
+        opens,
+    }
+    .into()
 }
 
-/// Verify the layer identity against the statement. Statement and proof only
-/// — no witness, no recomputation, no `open` calls. Malformed shapes return
-/// `false` (never panic).
-pub fn verify(whir: &Whir, stmt: &LayerStatement, proof: &LayerProof) -> bool {
-    if whir.num_variables() != LAYOUT_ARITY
+/// Verify ONE layer identity segment, continuing the shared transcript. The
+/// caller supplies the expected eq point `r` (derived before the segment).
+/// Malformed specs, eq points, and proof shapes return `false` (never panic).
+pub(crate) fn verify_layer_segment(
+    whir: &Whir,
+    stmt: &LayerStatement,
+    t: &mut TwoPhaseTranscript,
+    spec: &LayerSpec,
+    proof: &LayerProof,
+    expect_r: &[EF],
+) -> bool {
+    if !validate_spec(whir, spec, expect_r.len()) {
+        return false;
+    }
+    let m = spec.half.trailing_zeros() as usize;
+    if proof.r != expect_r
         || proof.claimed.len() != 6
         || proof.opens.len() != 6
-        || proof.r.len() != ROUNDS
-        || proof.z.len() != ROUNDS
-        || proof.rounds.len() != ROUNDS
+        || proof.rounds.len() != m
+        || proof.z.len() != m
     {
         return false;
     }
-    let mut s = TwoPhaseTranscript::new(PROTOCOL, &[HALF], &[&stmt.root_re, &stmt.root_im]);
-    let (alpha, beta) = s.sample_derived_challenges();
-    s.absorb_derived_roots(&[]);
-    let mut r = vec![alpha, beta];
-    r.extend(s.sample_vec(ROUNDS - 2));
-    let c = s.sample();
-    // Direct equality of the eq point and the combining challenge.
-    if proof.r != r || proof.c != c {
+    let c = t.sample();
+    if proof.c != c {
         return false;
     }
-
-    // The interactive FS chain: absorb the claimed round coefficients, sample
-    // the fold challenge, and run the round check.
     let mut prev = EF::ZERO;
-    let mut z = Vec::with_capacity(ROUNDS);
+    let mut z = Vec::with_capacity(proof.rounds.len());
     for pvals in &proof.rounds {
         if pvals.len() != 4 {
             return false;
         }
         for &p in pvals {
-            s.absorb(p);
+            t.absorb(p);
         }
-        let zi = s.sample();
+        let zi = t.sample();
         if pvals[0] + pvals[1] != prev {
             return false;
         }
@@ -315,14 +379,21 @@ pub fn verify(whir: &Whir, stmt: &LayerStatement, proof: &LayerProof) -> bool {
         return false;
     }
     for &cl in &proof.claimed {
-        s.absorb(cl);
+        t.absorb(cl);
     }
 
-    // Verify the six openings at z and recombine the EF values.
-    let proto = whir.opening_protocol(LAYOUT_ARITY, 1);
+    let proto = whir.opening_protocol(spec.arity, 1);
+    let offsets = [
+        spec.next_num_off,
+        spec.next_den_off,
+        spec.num_off,
+        spec.num_off + spec.half,
+        spec.den_off,
+        spec.den_off + spec.half,
+    ];
     let mut evals = Vec::with_capacity(6);
     for (i, leaf) in proof.opens.iter().enumerate() {
-        let pt = sub_point(OFFSETS[i], HALF, &z, LAYOUT_ARITY);
+        let pt = sub_point(offsets[i], spec.half, &z, spec.arity);
         let p3 = to_p3_point(&pt);
         if whir.verify_ef(&stmt.root_re, &leaf.open_re.0, &proto, &p3).ok() != Some(leaf.open_re.1)
             || whir.verify_ef(&stmt.root_im, &leaf.open_im.0, &proto, &p3).ok() != Some(leaf.open_im.1)
@@ -335,14 +406,68 @@ pub fn verify(whir: &Whir, stmt: &LayerStatement, proof: &LayerProof) -> bool {
         }
         evals.push(v);
     }
-
-    // Final check: prev == eq(r, z) * identity(z), with eq(r, z) the DIRECT
-    // polynomial value and identity(z) the circuit combination of the opened
-    // values.
     let identity = evals[0] - evals[2] * evals[5] - evals[3] * evals[4]
         + c * evals[1]
         - c * evals[4] * evals[5];
-    prev == eq_point(&r, &z) * identity
+    prev == eq_point(&proof.r, &z) * identity
+}
+
+/// Prove the single-layer identity (fixed N = 32 segment). Returns
+/// `(statement, proof)` or `None` for malformed inputs.
+pub fn prove(whir: &Whir) -> Option<(LayerStatement, LayerProof)> {
+    if whir.num_variables() != LAYOUT_ARITY {
+        return None;
+    }
+    let (arrays, re, im) = build_arrays();
+    let (root_re, pd_re, proto_re) = whir.commit(&re);
+    let (root_im, pd_im, proto_im) = whir.commit(&im);
+    let stmt = LayerStatement { root_re, root_im };
+    let mut s = TwoPhaseTranscript::new(PROTOCOL, &[HALF], &[&stmt.root_re, &stmt.root_im]);
+    let (alpha, beta) = s.sample_derived_challenges();
+    // No derived commitments in this slice: the tree IS the statement.
+    s.absorb_derived_roots(&[]);
+    let mut r = vec![alpha, beta];
+    r.extend(s.sample_vec(ROUNDS - 2));
+    let spec = LayerSpec {
+        arity: LAYOUT_ARITY,
+        num_off: OFFSETS[2],
+        den_off: OFFSETS[4],
+        next_num_off: OFFSETS[0],
+        next_den_off: OFFSETS[1],
+        half: HALF,
+    };
+    let arrays_ref: &[Vec<EF>; 6] = arrays.as_slice().try_into().expect("six arrays");
+    let proof = prove_layer_segment(
+        whir, &stmt, &pd_re, &pd_im, &proto_re, &mut s, &spec, arrays_ref, &r,
+    )?;
+    Some((stmt, proof))
+}
+
+/// Verify the layer identity against the statement. Statement and proof only
+/// — no witness, no recomputation, no `open` calls. Malformed shapes return
+/// `false` (never panic).
+pub fn verify(whir: &Whir, stmt: &LayerStatement, proof: &LayerProof) -> bool {
+    if whir.num_variables() != LAYOUT_ARITY
+        || proof.r.len() != ROUNDS
+        || proof.z.len() != ROUNDS
+        || proof.rounds.len() != ROUNDS
+    {
+        return false;
+    }
+    let mut s = TwoPhaseTranscript::new(PROTOCOL, &[HALF], &[&stmt.root_re, &stmt.root_im]);
+    let (alpha, beta) = s.sample_derived_challenges();
+    s.absorb_derived_roots(&[]);
+    let mut r = vec![alpha, beta];
+    r.extend(s.sample_vec(ROUNDS - 2));
+    let spec = LayerSpec {
+        arity: LAYOUT_ARITY,
+        num_off: OFFSETS[2],
+        den_off: OFFSETS[4],
+        next_num_off: OFFSETS[0],
+        next_den_off: OFFSETS[1],
+        half: HALF,
+    };
+    verify_layer_segment(whir, stmt, &mut s, &spec, proof, &r)
 }
 
 #[cfg(test)]
@@ -424,6 +549,76 @@ mod tests {
         // Wrong arity whir instance.
         let whir2 = Whir::new_target(6, 90, 0).expect("valid arity");
         assert!(prove(&whir2).is_none());
+    }
+
+    /// The parameterized segment helpers must reject invalid external
+    /// layouts: the prover returns `None`, the verifier returns `false` —
+    /// never panicking and never silently selecting the wrong slices.
+    #[test]
+    fn segment_helpers_reject_invalid_layouts() {
+        let (whir, stmt, proof) = fixture();
+        let spec = LayerSpec {
+            arity: LAYOUT_ARITY,
+            num_off: OFFSETS[2],
+            den_off: OFFSETS[4],
+            next_num_off: OFFSETS[0],
+            next_den_off: OFFSETS[1],
+            half: HALF,
+        };
+        let mut ready = || {
+            let mut s =
+                TwoPhaseTranscript::new(PROTOCOL, &[HALF], &[&stmt.root_re, &stmt.root_im]);
+            let _ = s.sample_derived_challenges();
+            s.absorb_derived_roots(&[]);
+            // Mirror verify()'s r derivation (alpha/beta tail) so the
+            // pre-segment transcript state is identical.
+            s.sample_vec(ROUNDS - 2);
+            s
+        };
+        let mut bads = vec![];
+        let mut b = spec;
+        b.half = 0; // not a nonzero power of two
+        bads.push(b);
+        let mut b = spec;
+        b.half = 12; // not a power of two
+        bads.push(b);
+        let mut b = spec;
+        b.next_num_off = 128; // offset + half out of bounds
+        bads.push(b);
+        let mut b = spec;
+        b.next_num_off = spec.num_off; // overlapping segments
+        bads.push(b);
+        let mut b = spec;
+        b.arity = 6; // spec arity != WHIR arity
+        bads.push(b);
+        for bad in &bads {
+            assert!(!verify_layer_segment(&whir, &stmt, &mut ready(), bad, &proof, &proof.r));
+        }
+        // Wrong eq-point length on the verifier side.
+        assert!(!verify_layer_segment(&whir, &stmt, &mut ready(), &spec, &proof, &proof.r[..3]));
+
+        // Prover side: invalid layouts yield `None` (never a proof).
+        let (arrays, re, im) = build_arrays();
+        let (_, pd_re, proto_re) = whir.commit(&re);
+        let (_, pd_im, _) = whir.commit(&im);
+        let arrays_ref: &[Vec<EF>; 6] = arrays.as_slice().try_into().expect("six arrays");
+        for bad in &bads {
+            let mut s = ready();
+            assert!(prove_layer_segment(&whir, &stmt, &pd_re, &pd_im, &proto_re, &mut s, bad, arrays_ref, &proof.r).is_none());
+        }
+        // Wrong eq-point length / wrong sub-array length on the prover side.
+        let mut s = ready();
+        assert!(prove_layer_segment(&whir, &stmt, &pd_re, &pd_im, &proto_re, &mut s, &spec, arrays_ref, &proof.r[..3]).is_none());
+        let mut short = arrays.clone();
+        short[0].pop();
+        let short_ref: &[Vec<EF>; 6] = short.as_slice().try_into().expect("six arrays");
+        let mut s = ready();
+        assert!(prove_layer_segment(&whir, &stmt, &pd_re, &pd_im, &proto_re, &mut s, &spec, short_ref, &proof.r).is_none());
+
+        // Sanity: the honest spec still round-trips through the segment
+        // helpers.
+        let mut s = ready();
+        assert!(verify_layer_segment(&whir, &stmt, &mut s, &spec, &proof, &proof.r));
     }
 
     /// Forgery regression (same-statement malicious construction): commit
