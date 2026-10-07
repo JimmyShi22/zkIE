@@ -37,8 +37,9 @@
 //! verifier dispatches `verify_with_whir` with WHIR only. The seam does NOT
 //! change the fixed N = 8, non-succinct scope of this module.
 
+use crate::compose::{Op, Store, TensorData};
 use crate::extension_lookup_fractional::{gen, to_p3_point};
-use zkie_core::common::field::{EF, Goldilocks, PrimeCharacteristicRing};
+use zkie_core::common::field::{EF, Goldilocks, PrimeCharacteristicRing, PrimeField64};
 use zkie_core::pcs::whir::{Commitment, OpeningProtocol, Point, Proof, ProverData, Whir};
 
 /// Logical table/query size (fixed).
@@ -278,6 +279,65 @@ impl LookupWitnessN8 {
             table: table.try_into().expect("length checked"),
         })
     }
+
+    /// Prover-side extraction from a REAL `Op::Lookup` IR node. Matches only
+    /// `Op::Lookup { idx, out, table }`; validates the tensor ids, the exact
+    /// logical length N = 8, every index < 8, and the tensor METADATA
+    /// (Owned length / mmap range with checked arithmetic) BEFORE
+    /// materializing; then materializes the output/table tensors
+    /// (mmap-safe) and converts Goldilocks values to their canonical u64
+    /// representatives. Any other op or any out-of-contract shape yields
+    /// `None`. This only READS tensors on prover extraction; the legacy
+    /// compose paths are untouched.
+    pub fn from_op_lookup(op: &Op, store: &Store) -> Option<Self> {
+        let Op::Lookup { idx, out, table } = op else {
+            return None;
+        };
+        if *idx >= store.idx.len() || *out >= store.v.len() || *table >= store.v.len() {
+            return None;
+        }
+        let idxs = &store.idx[*idx];
+        if idxs.len() != N || idxs.iter().any(|&i| i as usize >= N) {
+            return None;
+        }
+        // Validate metadata BEFORE `materialize`: a lying or overflowing
+        // mmap range must never reach the read. Applied to BOTH output and
+        // table.
+        if !tensor_metadata_ok(store, *out) || !tensor_metadata_ok(store, *table) {
+            return None;
+        }
+        let out_t = store.materialize(*out);
+        let tbl_t = store.materialize(*table);
+        if out_t.len() != N || tbl_t.len() != N {
+            return None;
+        }
+        let mut indices = [0u8; N];
+        let mut out_arr = [0u64; N];
+        let mut table_arr = [0u64; N];
+        for i in 0..N {
+            indices[i] = idxs[i] as u8;
+            out_arr[i] = out_t[i].as_canonical_u64();
+            table_arr[i] = tbl_t[i].as_canonical_u64();
+        }
+        Some(LookupWitnessN8 {
+            indices,
+            out: out_arr,
+            table: table_arr,
+        })
+    }
+}
+
+/// Pre-materialize metadata check for one tensor id (caller has already
+/// bounds-checked the id): the logical length must be exactly N = 8, and
+/// for mmap-backed tensors the claimed `[start, start + len)` range must
+/// exist inside the mapping via checked arithmetic.
+fn tensor_metadata_ok(store: &Store, id: usize) -> bool {
+    match &store.v[id] {
+        TensorData::Owned(v) => v.len() == N,
+        TensorData::Mmap { mmap, start, len } => {
+            *len == N && start.checked_add(*len).is_some_and(|end| end <= mmap.len())
+        }
+    }
 }
 
 /// Typed committed lookup statement. One variant per proof system; the
@@ -301,6 +361,18 @@ pub fn dispatch_prove(
 ) -> Option<(CommittedLookupStatement, CommittedLookupProof)> {
     let (s, p) = prove(w, &wit.indices, &wit.out, &wit.table)?;
     Some((CommittedLookupStatement::DirectN8(s), CommittedLookupProof::DirectN8(p)))
+}
+
+/// Prover-side dispatch from a real `Op::Lookup` IR node: extract the fixed
+/// N = 8 witness from the store (validated, mmap-safe) and emit the typed
+/// committed artifact. `None` for a non-Lookup op or out-of-contract shapes.
+pub fn dispatch_op_lookup_n8(
+    w: &Whir,
+    op: &Op,
+    store: &Store,
+) -> Option<(CommittedLookupStatement, CommittedLookupProof)> {
+    let wit = LookupWitnessN8::from_op_lookup(op, store)?;
+    dispatch_prove(w, &wit)
 }
 
 /// Verifier-side dispatch: verify a committed lookup proof against its
@@ -561,5 +633,202 @@ mod tests {
         };
         inner.rows.pop();
         assert!(!CommittedLookupProof::DirectN8(inner).verify_with_whir(&w, &stmt));
+    }
+
+    /// A REAL store + `Op::Lookup` fixture: idx tensor, table tensor, and
+    /// the materialized output `out[i] = table[idx[i]]`.
+    fn op_fixture(out_wrong: bool) -> (Store, Op) {
+        let mut store = Store::new();
+        let table: Vec<Goldilocks> = (0..N).map(|j| Goldilocks::from_u64((j + 3) as u64)).collect();
+        let idxs: Vec<u32> = vec![3, 0, 7, 2, 5, 1, 6, 4];
+        let mut out_vals: Vec<Goldilocks> = idxs
+            .iter()
+            .map(|&i| table[i as usize])
+            .collect();
+        if out_wrong {
+            out_vals[0] = out_vals[0] + Goldilocks::ONE;
+        }
+        let idx_id = store.push_idx(idxs);
+        let tbl_id = store.push(table);
+        let out_id = store.push(out_vals);
+        (store, Op::Lookup { idx: idx_id, out: out_id, table: tbl_id })
+    }
+
+    /// End-to-end through the real IR: `Op::Lookup` + Store -> dispatch ->
+    /// Store/op/witness dropped -> verifier accepts from statement + proof
+    /// only and never opens.
+    #[test]
+    fn dispatch_op_lookup_n8_roundtrip_after_ir_dropped() {
+        let w = Whir::new_target(ARITY, 90, 0).expect("valid arity");
+        let (store, op) = op_fixture(false);
+        // The extraction reads exactly the store's lookup triple.
+        let wit = LookupWitnessN8::from_op_lookup(&op, &store).expect("extract witness");
+        assert_eq!(wit.indices, [3, 0, 7, 2, 5, 1, 6, 4]);
+        assert_eq!(wit.out[0], 6); // table[3]
+        let (stmt, proof) = dispatch_op_lookup_n8(&w, &op, &store).expect("dispatch");
+        drop(store);
+        drop(op);
+        drop(wit);
+        let before = w.open_stats();
+        assert!(proof.verify_with_whir(&w, &stmt));
+        assert_eq!(w.open_stats(), before, "verifier must never open");
+    }
+
+    /// A real IR fixture whose output tensor is WRONG (out[0] !=
+    /// table[idx[0]]) still dispatches (prover-side extraction is honest
+    /// about the store), but the committed relation fails verification.
+    #[test]
+    fn dispatch_op_lookup_n8_wrong_output_rejected() {
+        let w = Whir::new_target(ARITY, 90, 0).expect("valid arity");
+        let (store, op) = op_fixture(true);
+        let (stmt, proof) = dispatch_op_lookup_n8(&w, &op, &store).expect("dispatch");
+        drop(store);
+        drop(op);
+        assert!(!proof.verify_with_whir(&w, &stmt));
+    }
+
+    /// Non-Lookup ops and out-of-contract shapes are rejected by the
+    /// extraction (`None`), never a panic.
+    #[test]
+    fn dispatch_op_lookup_n8_bad_shapes_rejected() {
+        let w = Whir::new_target(ARITY, 90, 0).expect("valid arity");
+        let (store, _) = op_fixture(false);
+        // A non-Lookup op.
+        let add = Op::Add { a: 0, b: 1, c: 2 };
+        assert!(LookupWitnessN8::from_op_lookup(&add, &store).is_none());
+        assert!(dispatch_op_lookup_n8(&w, &add, &store).is_none());
+        // Out-of-range tensor ids.
+        let bad_ids = Op::Lookup { idx: 7, out: 0, table: 0 };
+        assert!(LookupWitnessN8::from_op_lookup(&bad_ids, &store).is_none());
+        let bad_ids = Op::Lookup { idx: 0, out: 99, table: 0 };
+        assert!(LookupWitnessN8::from_op_lookup(&bad_ids, &store).is_none());
+        // Wrong logical length (idx tensor of length 7).
+        let mut store7 = Store::new();
+        let table7: Vec<Goldilocks> =
+            (0..N).map(|j| Goldilocks::from_u64((j + 3) as u64)).collect();
+        let idx7 = store7.push_idx(vec![3, 0, 7, 2, 5, 1, 6]);
+        let tbl7 = store7.push(table7);
+        let out7 = store7.push(vec![Goldilocks::ZERO; N]);
+        let short = Op::Lookup { idx: idx7, out: out7, table: tbl7 };
+        assert!(LookupWitnessN8::from_op_lookup(&short, &store7).is_none());
+        assert!(dispatch_op_lookup_n8(&w, &short, &store7).is_none());
+        // An index >= 8.
+        let mut store_bad = Store::new();
+        let table_bad: Vec<Goldilocks> =
+            (0..N).map(|j| Goldilocks::from_u64((j + 3) as u64)).collect();
+        let idx_bad = store_bad.push_idx(vec![3, 0, 9, 2, 5, 1, 6, 4]);
+        let tbl_bad = store_bad.push(table_bad);
+        let out_bad = store_bad.push(vec![Goldilocks::ZERO; N]);
+        let bad_idx = Op::Lookup { idx: idx_bad, out: out_bad, table: tbl_bad };
+        assert!(LookupWitnessN8::from_op_lookup(&bad_idx, &store_bad).is_none());
+        // A table tensor of length 7.
+        let mut store_t7 = Store::new();
+        let table_t7: Vec<Goldilocks> =
+            (0..N - 1).map(|j| Goldilocks::from_u64((j + 3) as u64)).collect();
+        let idx_t7 = store_t7.push_idx(vec![3, 0, 7, 2, 5, 1, 6, 4]);
+        let tbl_t7 = store_t7.push(table_t7);
+        let out_t7 = store_t7.push(vec![Goldilocks::ZERO; N]);
+        let short_tbl = Op::Lookup { idx: idx_t7, out: out_t7, table: tbl_t7 };
+        assert!(LookupWitnessN8::from_op_lookup(&short_tbl, &store_t7).is_none());
+    }
+
+    /// RAII temp file (unique name per construction), removed on drop.
+    struct TempFile(std::path::PathBuf);
+    static TMP_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    impl TempFile {
+        fn write_i32(vals: &[i32]) -> Self {
+            use std::io::Write as _;
+            use std::sync::atomic::Ordering;
+            let mut bytes = Vec::with_capacity(vals.len() * 4);
+            for &v in vals {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            // Bounded retry over fresh atomic-counter paths: create_new(true)
+            // fails with AlreadyExists if anything (including a symlink) is
+            // already at the path, so this never follows or truncates a
+            // pre-existing file, and the guard only ever removes a path it
+            // created.
+            for _ in 0..16 {
+                let n = TMP_N.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "zkie_direct_lookup_mmap_{}_{}_{}.bin",
+                    std::process::id(),
+                    n,
+                    vals.len()
+                ));
+                let mut f = match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    Ok(f) => f,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("temp file creation failed: {e}"),
+                };
+                f.write_all(&bytes).expect("write temp file");
+                return TempFile(path);
+            }
+            panic!("could not create a unique temp file after 16 attempts");
+        }
+    }
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Mmap-backed output/table metadata is validated BEFORE materialize:
+    /// a declared len 9 backed by 8 i32 values is rejected, an overflowing
+    /// start is rejected, and an exact start 0 / len 8 range on BOTH output
+    /// and table succeeds through the real dispatch and verifies.
+    #[test]
+    fn mmap_metadata_validated_before_materialize() {
+        use std::sync::Arc;
+        use zkie_core::common::weights_io::WeightMmap;
+        let w = Whir::new_target(ARITY, 90, 0).expect("valid arity");
+        let idxs: Vec<u32> = vec![3, 0, 7, 2, 5, 1, 6, 4];
+        // Eight i32 LE values on disk (table 3..=10).
+        let table_vals: Vec<i32> = (0..N as i32).map(|j| j + 3).collect();
+        let tmp = TempFile::write_i32(&table_vals);
+        let mmap = Arc::new(WeightMmap::open(&tmp.0).expect("open mmap"));
+
+        // Declared len 9 backed by 8 -> rejected before materialize.
+        let mut store = Store::new();
+        let idx_id = store.push_idx(idxs.clone());
+        let tbl_id = store.push_mmap(mmap.clone(), 0, 9);
+        let out_id = store.push(vec![Goldilocks::ZERO; N]);
+        let op = Op::Lookup { idx: idx_id, out: out_id, table: tbl_id };
+        assert!(LookupWitnessN8::from_op_lookup(&op, &store).is_none());
+
+        // start = usize::MAX -> checked_add overflow -> rejected.
+        let mut store = Store::new();
+        let idx_id = store.push_idx(idxs.clone());
+        let tbl_id = store.push_mmap(mmap.clone(), usize::MAX, N);
+        let out_id = store.push(vec![Goldilocks::ZERO; N]);
+        let op = Op::Lookup { idx: idx_id, out: out_id, table: tbl_id };
+        assert!(LookupWitnessN8::from_op_lookup(&op, &store).is_none());
+
+        // The same metadata check applies to the OUTPUT tensor slot.
+        let mut store = Store::new();
+        let idx_id = store.push_idx(idxs.clone());
+        let tbl_id = store.push_mmap(mmap.clone(), 0, N);
+        let out_id = store.push_mmap(mmap.clone(), 0, 9);
+        let op = Op::Lookup { idx: idx_id, out: out_id, table: tbl_id };
+        assert!(LookupWitnessN8::from_op_lookup(&op, &store).is_none());
+
+        // Valid exact start 0 / len 8 for BOTH output and table succeeds
+        // through the real Op dispatch and verifies.
+        let out_vals: Vec<i32> = idxs.iter().map(|&i| table_vals[i as usize]).collect();
+        let tmp_out = TempFile::write_i32(&out_vals);
+        let mmap_out = Arc::new(WeightMmap::open(&tmp_out.0).expect("open mmap"));
+        let mut store = Store::new();
+        let idx_id = store.push_idx(idxs);
+        let tbl_id = store.push_mmap(mmap.clone(), 0, N);
+        let out_id = store.push_mmap(mmap_out, 0, N);
+        let op = Op::Lookup { idx: idx_id, out: out_id, table: tbl_id };
+        let (stmt, proof) = dispatch_op_lookup_n8(&w, &op, &store).expect("dispatch");
+        drop(store);
+        drop(op);
+        assert!(proof.verify_with_whir(&w, &stmt));
     }
 }
