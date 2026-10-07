@@ -10,6 +10,7 @@ pub mod extension_logup_multiset;
 pub mod extension_direct_lookup;
 pub mod claim_driven_shard;
 pub mod extension_two_shard_chain_dag;
+pub mod non_recursive_two_shard_aggregation;
 pub mod projection;
 pub mod layer_norm_centered;
 pub mod layernorm_chain;
