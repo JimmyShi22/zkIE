@@ -1,22 +1,20 @@
-//! Root-bound committed projection block (matmul + affine), with the matmul
-//! output `h = x @ W` kept VIRTUAL (never committed — its value at the affine
-//! point is the GKR claim). Five committed tensors: x, w, bias, out, rem.
+//! Root-bound committed projection block: matmul + affine + range check, with
+//! the matmul output `h = x @ W` kept VIRTUAL (never committed). Five committed
+//! tensors: x, w, bias, out, rem.
 //!
-//! Relations proven:
-//! - matmul: `h = x @ W` via one GKR sumcheck, leaving terminal claims on x and w;
+//! Relations:
+//! - matmul: `h = x @ W` via one GKR sumcheck (terminal claims on x, w);
 //! - affine: `rem = h - (out - bias) * 2^shift + half` via one virtual sumcheck,
-//!   with `h` supplied by the GKR claim and out/rem/bias by committed openings.
+//!   with `h` supplied by the GKR claim and out/rem/bias by committed openings;
+//! - range check: `rem in [0, 2^shift)` via the root-bound logUp lookup, with
+//!   idx = rem and out = rem, and — critically — the SAME rem commitment. The
+//!   verifier checks `lookup.idx.re == root_rem` and `lookup.out.re == root_rem`
+//!   (same_poly binding), so a prover cannot use one `rem` in the affine and a
+//!   different one in the range check.
 //!
-//! The verifier holds `(whir, statement, proof)` only — no witness, no Store,
-//! no forward recomputation. Every value it uses comes from a WHIR opening or a
-//! public constant.
-//!
-//! NOTE (soundness of "rounding"): this module proves the affine + matmul
-//! relation, but the RANGE CHECK `rem in [0, 2^shift)` — which is what makes
-//! `out` the actual round-half-up value rather than an arbitrary affine image —
-//! is a separate committed logUp lookup layered on top (reusing
-//! `extension_lookup_logup`). Without it a cheating prover could pick a
-//! non-rounded `out` and a compensating `rem`.
+//! Soundness: the range check makes `out` the actual round-half-up value, not an
+//! arbitrary affine image. Every verifier value comes from a WHIR opening or a
+//! public constant; no witness, no Store, no forward recomputation.
 
 use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64};
 use zkie_core::common::fixed_point::{from_i64, to_i64};
@@ -27,6 +25,10 @@ use zkie_core::common::mle;
 use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
 use zkie_core::pcs::whir::{Commitment, Proof as WhirProof, Whir};
 
+use crate::extension_lookup_logup::{
+    prove as lookup_prove, verify as lookup_verify, LookupProof, LookupStatement, LookupWhir,
+};
+
 pub const PROTOCOL: &str = "zkie/ext-projection-committed/v1";
 
 pub struct ProjectionWhir {
@@ -35,11 +37,12 @@ pub struct ProjectionWhir {
     pub bias: Whir,
     pub out: Whir,
     pub rem: Whir,
+    pub range: LookupWhir,
 }
 
 impl ProjectionWhir {
-    pub fn new(m: usize, k: usize, n: usize, security_level: usize, pow_budget: usize) -> Option<Self> {
-        if !m.is_power_of_two() || !k.is_power_of_two() || !n.is_power_of_two() {
+    pub fn new(m: usize, k: usize, n: usize, shift: u32, security_level: usize, pow_budget: usize) -> Option<Self> {
+        if !m.is_power_of_two() || !k.is_power_of_two() || !n.is_power_of_two() || shift == 0 {
             return None;
         }
         let ar_x = (m * k).trailing_zeros() as usize;
@@ -54,6 +57,7 @@ impl ProjectionWhir {
             bias: Whir::new_target(ar_y, security_level, pow_budget)?,
             out: Whir::new_target(ar_y, security_level, pow_budget)?,
             rem: Whir::new_target(ar_y, security_level, pow_budget)?,
+            range: LookupWhir::new(m * n, 1usize << shift, security_level, pow_budget)?,
         })
     }
 }
@@ -69,6 +73,7 @@ pub struct ProjectionStatement {
     pub root_bias: Commitment,
     pub root_out: Commitment,
     pub root_rem: Commitment,
+    pub lookup: LookupStatement,
 }
 
 pub struct ProjectionCommittedProof {
@@ -79,6 +84,7 @@ pub struct ProjectionCommittedProof {
     pub open_rem: (WhirProof, Goldilocks),
     pub open_out: (WhirProof, Goldilocks),
     pub open_bias: (WhirProof, Goldilocks),
+    pub lookup: LookupProof,
     pub u: Vec<Goldilocks>,
     pub v: Vec<Goldilocks>,
     pub ch: Vec<Goldilocks>,
@@ -121,7 +127,7 @@ pub fn prove(
     n: usize,
     shift: u32,
     rng: &mut XorShift64,
-) -> (ProjectionStatement, ProjectionCommittedProof) {
+) -> Option<(ProjectionStatement, ProjectionCommittedProof)> {
     assert_eq!(x.len(), m * k);
     assert_eq!(w.len(), k * n);
     assert_eq!(bias.len(), m * n);
@@ -145,7 +151,6 @@ pub fn prove(
     let at = transpose(x, m, k);
     let matmul = matmul_prove(&at, w, &h, m, k, n, &u, &v, &ch);
 
-    // Matmul terminal points (LSB-first): x at [ch, u], w at [v, ch].
     let mut xp = ch.clone();
     xp.extend_from_slice(&u);
     let mut wp = v.clone();
@@ -153,7 +158,6 @@ pub fn prove(
     let open_x = whir.x.open(pd_x, &proto_x, &xp);
     let open_w = whir.w.open(pd_w, &proto_w, &wp);
 
-    // Affine relation over [eq, rem, h, out, bias, ones] at point pt.
     let eq = mle::eq_evals(&pt);
     let ones = vec![Goldilocks::from_u64(1); m * n];
     let half = Goldilocks::from_u64(1u64 << (shift - 1));
@@ -173,22 +177,34 @@ pub fn prove(
     let open_out = whir.out.open(pd_out, &proto_out, &pt);
     let open_bias = whir.bias.open(pd_bias, &proto_bias, &pt);
 
-    (
-        ProjectionStatement { m, k, n, shift, root_x, root_w, root_bias, root_out, root_rem },
-        ProjectionCommittedProof {
-            matmul, affine, open_x, open_w, open_rem, open_out, open_bias, u, v, ch, pt,
+    // Range check lookup: idx = rem, out = rem, table = [0, 2^shift).
+    let idx: Vec<u32> = rem.iter().map(|&r| to_i64(r) as u32).collect();
+    let rem_u64: Vec<u64> = rem.iter().map(|&r| to_i64(r) as u64).collect();
+    let table: Vec<u64> = (0..(1u64 << shift)).collect();
+    let (lookup_stmt, lookup_proof) = lookup_prove(&whir.range, &idx, &rem_u64, &table)?;
+
+    Some((
+        ProjectionStatement {
+            m, k, n, shift, root_x, root_w, root_bias, root_out, root_rem, lookup: lookup_stmt,
         },
-    )
+        ProjectionCommittedProof {
+            matmul, affine, open_x, open_w, open_rem, open_out, open_bias,
+            lookup: lookup_proof, u, v, ch, pt,
+        },
+    ))
 }
 
-pub fn verify(
-    whir: &ProjectionWhir,
-    stmt: &ProjectionStatement,
-    proof: &ProjectionCommittedProof,
-) -> bool {
+pub fn verify(whir: &ProjectionWhir, stmt: &ProjectionStatement, proof: &ProjectionCommittedProof) -> bool {
     let (m, k, n) = (stmt.m, stmt.k, stmt.n);
 
-    // Matmul terminal points.
+    // same_poly binding: the lookup's idx/out are the SAME committed rem.
+    if stmt.lookup.idx.re != stmt.root_rem || stmt.lookup.out.re != stmt.root_rem {
+        return false;
+    }
+    if !lookup_verify(&whir.range, &stmt.lookup, &proof.lookup) {
+        return false;
+    }
+
     let mut xp = proof.ch.clone();
     xp.extend_from_slice(&proof.u);
     let mut wp = proof.v.clone();
@@ -199,15 +215,13 @@ pub fn verify(
     let ar_y = (m * n).trailing_zeros() as usize;
     let proto_x = whir.x.opening_protocol(ar_x, 1);
     let proto_w = whir.w.opening_protocol(ar_w, 1);
-    let proto_y = whir.bias.opening_protocol(ar_y, 1);
+    let proto_y = whir.rem.opening_protocol(ar_y, 1);
 
     let f_eval = match whir.x.verify(&stmt.root_x, &proof.open_x.0, &proto_x, &xp) {
-        Ok(v) => v,
-        Err(_) => return false,
+        Ok(v) => v, Err(_) => return false,
     };
     let h_eval = match whir.w.verify(&stmt.root_w, &proof.open_w.0, &proto_w, &wp) {
-        Ok(v) => v,
-        Err(_) => return false,
+        Ok(v) => v, Err(_) => return false,
     };
     if f_eval != proof.open_x.1 || h_eval != proof.open_w.1 {
         return false;
@@ -217,16 +231,13 @@ pub fn verify(
     }
 
     let rem_pt = match whir.rem.verify(&stmt.root_rem, &proof.open_rem.0, &proto_y, &proof.pt) {
-        Ok(v) => v,
-        Err(_) => return false,
+        Ok(v) => v, Err(_) => return false,
     };
     let out_pt = match whir.out.verify(&stmt.root_out, &proof.open_out.0, &proto_y, &proof.pt) {
-        Ok(v) => v,
-        Err(_) => return false,
+        Ok(v) => v, Err(_) => return false,
     };
     let bias_pt = match whir.bias.verify(&stmt.root_bias, &proof.open_bias.0, &proto_y, &proof.pt) {
-        Ok(v) => v,
-        Err(_) => return false,
+        Ok(v) => v, Err(_) => return false,
     };
     if rem_pt != proof.open_rem.1 || out_pt != proof.open_out.1 || bias_pt != proof.open_bias.1 {
         return false;
@@ -235,12 +246,12 @@ pub fn verify(
     let eq = mle::eq_evals(&proof.pt);
     let ones = vec![Goldilocks::from_u64(1); m * n];
     let fe = vec![
-        mle::eval(&eq, &proof.pt),   // eq(pt) == 1
-        rem_pt,                       // rem(pt)
-        proof.matmul.claimed,         // h(pt) from the GKR claim
-        out_pt,                       // out(pt)
-        bias_pt,                      // bias(pt)
-        mle::eval(&ones, &proof.pt),  // ones(pt) == 1
+        mle::eval(&eq, &proof.pt),
+        rem_pt,
+        proof.matmul.claimed,
+        out_pt,
+        bias_pt,
+        mle::eval(&ones, &proof.pt),
     ];
     let half = Goldilocks::from_u64(1u64 << (stmt.shift - 1));
     let two_shift = Goldilocks::from_u64(1u64 << stmt.shift);
@@ -268,8 +279,6 @@ mod tests {
     fn witness(rng: &mut XorShift64, m: usize, k: usize, n: usize, shift: u32)
         -> (Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>)
     {
-        let half = Goldilocks::from_u64(1u64 << (shift - 1));
-        let two_shift = Goldilocks::from_u64(1u64 << shift);
         let x: Vec<Goldilocks> = (0..m * k).map(|_| from_i64((rng.next_u64() % 100) as i64)).collect();
         let w: Vec<Goldilocks> = (0..k * n).map(|_| from_i64((rng.next_u64() % 100) as i64)).collect();
         let bias: Vec<Goldilocks> = (0..m * n).map(|_| from_i64((rng.next_u64() % 20) as i64 - 10)).collect();
@@ -283,38 +292,37 @@ mod tests {
             let b_i = to_i64(bias[ij]);
             from_i64(h_i - (o_i - b_i) * (1i64 << shift) + (1i64 << (shift - 1)))
         }).collect();
-        let _ = (half, two_shift);
         (x, w, bias, out, rem)
     }
 
     #[test]
     fn honest_roundtrip() {
         let (m, k, n, shift) = (8usize, 8usize, 8usize, 8u32);
-        let whir = ProjectionWhir::new(m, k, n, 32, 10).expect("valid dims");
+        let whir = ProjectionWhir::new(m, k, n, shift, 32, 10).expect("valid dims");
         let mut rng = XorShift64::new(0xABCD);
         let (x, w, bias, out, rem) = witness(&mut rng, m, k, n, shift);
-        let (stmt, proof) = prove(&whir, &x, &w, &bias, &out, &rem, m, k, n, shift, &mut rng);
+        let (stmt, proof) = prove(&whir, &x, &w, &bias, &out, &rem, m, k, n, shift, &mut rng).expect("prove");
         assert!(verify(&whir, &stmt, &proof));
     }
 
     #[test]
     fn wrong_out_rejected() {
         let (m, k, n, shift) = (8usize, 8usize, 8usize, 8u32);
-        let whir = ProjectionWhir::new(m, k, n, 32, 10).expect("valid dims");
+        let whir = ProjectionWhir::new(m, k, n, shift, 32, 10).expect("valid dims");
         let mut rng = XorShift64::new(0xBEEF);
         let (x, w, bias, mut out, rem) = witness(&mut rng, m, k, n, shift);
         out[0] = out[0] + Goldilocks::ONE;
-        let (stmt, proof) = prove(&whir, &x, &w, &bias, &out, &rem, m, k, n, shift, &mut rng);
+        let (stmt, proof) = prove(&whir, &x, &w, &bias, &out, &rem, m, k, n, shift, &mut rng).expect("prove");
         assert!(!verify(&whir, &stmt, &proof));
     }
 
     #[test]
     fn tampered_root_rejected() {
         let (m, k, n, shift) = (8usize, 8usize, 8usize, 8u32);
-        let whir = ProjectionWhir::new(m, k, n, 32, 10).expect("valid dims");
+        let whir = ProjectionWhir::new(m, k, n, shift, 32, 10).expect("valid dims");
         let mut rng = XorShift64::new(0xC0FFEE);
         let (x, w, bias, out, rem) = witness(&mut rng, m, k, n, shift);
-        let (stmt, proof) = prove(&whir, &x, &w, &bias, &out, &rem, m, k, n, shift, &mut rng);
+        let (stmt, proof) = prove(&whir, &x, &w, &bias, &out, &rem, m, k, n, shift, &mut rng).expect("prove");
         let fake: Vec<Goldilocks> = (0..m * n).map(|_| rng.field()).collect();
         let (fake_root, _, _) = whir.out.commit(&fake);
         let mut bad = stmt;
@@ -324,8 +332,8 @@ mod tests {
 
     #[test]
     fn malformed_dims_rejected() {
-        assert!(ProjectionWhir::new(8, 8, 8, 32, 10).is_some());
-        assert!(ProjectionWhir::new(3, 8, 8, 32, 10).is_none());
-        assert!(ProjectionWhir::new(2, 2, 2, 32, 10).is_none());
+        assert!(ProjectionWhir::new(8, 8, 8, 8, 32, 10).is_some());
+        assert!(ProjectionWhir::new(3, 8, 8, 8, 32, 10).is_none());
+        assert!(ProjectionWhir::new(2, 2, 2, 8, 32, 10).is_none());
     }
 }
