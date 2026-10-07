@@ -652,6 +652,89 @@ impl Whir {
         Ok(evals[0].current()[0])
     }
 
+    /// Open the committed MLE at MULTIPLE full-extension-field points in one
+    /// batched opening proof: every point and returned evaluation is a
+    /// genuine `EF` element (no base embedding, no downcast). The transcript
+    /// is bound to the commitment before the opening, matching `commit`'s,
+    /// `open_ef`'s, and `verify_ef`'s state.
+    ///
+    /// Rejects contract violations up front (prover-side assert): an empty
+    /// point list, a point whose arity does not match this instance, or a
+    /// protocol that is not the canonical multi-opening schedule for
+    /// `points.len()`.
+    pub fn open_ef_multi(
+        &self,
+        commitment: &Commitment,
+        prover_data: ProverData,
+        protocol: &OpeningProtocol,
+        points: &[Point<EF>],
+    ) -> (Proof, Vec<EF>) {
+        assert!(!points.is_empty(), "open_ef_multi: empty point list");
+        for p in points {
+            assert_eq!(
+                p.as_slice().len(),
+                self.num_variables(),
+                "open_ef_multi: point arity does not match this Whir instance"
+            );
+        }
+        assert_eq!(
+            *protocol,
+            self.opening_protocol(self.num_variables(), points.len()),
+            "open_ef_multi: protocol is not the canonical multi-opening schedule"
+        );
+        let t0 = std::time::Instant::now();
+        let mut challenger = self.fresh_challenger();
+        challenger.observe(commitment);
+        let proof = self.pcs.open_at(prover_data, protocol, points, &mut challenger);
+        let opened: Vec<EF> = proof.evals.iter().map(|e| e.current()[0]).collect();
+        let (n, secs) = self.open_stats.get();
+        self.open_stats.set((n + points.len() as u64, secs + t0.elapsed().as_secs_f64()));
+        GLOBAL_OPEN_COUNT.fetch_add(points.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        (proof, opened)
+    }
+
+    /// Verify a multi-point full-extension-field opening: returns the
+    /// verified evaluations as `EF` elements. Verifier-only — never
+    /// regenerates the opening.
+    ///
+    /// Pre-validates the public metadata BEFORE calling upstream `verify_at`
+    /// (which asserts on mismatches): a non-empty point list, every point
+    /// with exactly `num_variables` coordinates, and the canonical
+    /// multi-opening protocol for `points.len()`.
+    pub fn verify_ef_multi(
+        &self,
+        commitment: &Commitment,
+        proof: &Proof,
+        protocol: &OpeningProtocol,
+        points: &[Point<EF>],
+    ) -> Result<Vec<EF>, WhirVerifyError> {
+        if points.is_empty() {
+            return Err(WhirVerifyError::Malformed("empty point list"));
+        }
+        for p in points {
+            if p.as_slice().len() != self.num_variables() {
+                return Err(WhirVerifyError::Malformed(
+                    "point arity does not match this Whir instance",
+                ));
+            }
+        }
+        if *protocol != self.opening_protocol(self.num_variables(), points.len()) {
+            return Err(WhirVerifyError::Malformed(
+                "protocol is not the canonical multi-opening schedule",
+            ));
+        }
+        let t0 = std::time::Instant::now();
+        let mut challenger = self.fresh_challenger();
+        challenger.observe(commitment);
+        let evals = self
+            .pcs
+            .verify_at(commitment, proof, protocol, points, &mut challenger)
+            .map_err(WhirVerifyError::Pcs)?;
+        let (n, secs) = self.verify_stats.get();
+        self.verify_stats.set((n + points.len() as u64, secs + t0.elapsed().as_secs_f64()));
+        Ok(evals.iter().map(|e| e.current()[0]).collect())
+    }
+
     /// Open the committed MLE at multiple points in one batched opening proof.
     /// Open the committed MLE at multiple points in one batched opening proof.
     pub fn open_multi(
@@ -953,6 +1036,77 @@ mod tests {
             Err(WhirVerifyError::Malformed(_))
         ));
         assert!(whir.verify_ef(&root, &proof, &proto, &point).is_ok());
+    }
+
+    /// `open_ef_multi`/`verify_ef_multi` roundtrip at two full-EF points —
+    /// one with GENUINE extension coordinates (`base + W * base`) — with the
+    /// commitment bound into the challenger: the opened evals match an
+    /// independent EF MLE evaluation, a proof opened under root A fails
+    /// against root B, a tampered point rejects, and malformed metadata
+    /// (empty points, arity mismatch, wrong protocol) is rejected up front.
+    #[test]
+    fn ef_multi_open_roundtrip_and_binding() {
+        let mut rng = XorShift64::new(0xEF7);
+        let whir = Whir::new_testing(6);
+        let evals: Vec<Goldilocks> = (0..(1 << 6)).map(|_| rng.field()).collect();
+        let (root, pd, proto) = whir.commit(&evals);
+        // Point 0: every coordinate a genuine extension element.
+        let ext: Vec<EF> = (0..6)
+            .map(|i| {
+                EF::from(Goldilocks::new(7 + i as u64))
+                    + EF::GENERATOR * EF::from(Goldilocks::new(11 + i as u64))
+            })
+            .collect();
+        // Point 1: a normal base-embedded point.
+        let plain: Vec<EF> = vec![EF::from(Goldilocks::new(13)); 6];
+        let points = vec![Point::new(ext), Point::new(plain)];
+        let multi_proto = whir.opening_protocol(6, 2);
+        let (proof, opened) = whir.open_ef_multi(&root, pd, &multi_proto, &points);
+        assert_eq!(opened.len(), 2);
+        assert_eq!(
+            whir.verify_ef_multi(&root, &proof, &multi_proto, &points).unwrap(),
+            opened
+        );
+        // Independent reference: EF MLE evaluation of the base-stored tensor
+        // at each full-EF point. The PCS evaluates in MSB-first variable
+        // order, `mle::eval_ef` in our LSB-first order — so the reference
+        // evaluation uses the REVERSED point (same convention as the base
+        // `open_multi` path, which reverses once internally).
+        for (pt, &opened_v) in points.iter().zip(&opened) {
+            let rev: Vec<EF> = pt.as_slice().iter().rev().cloned().collect();
+            assert_eq!(mle::eval_ef(&evals, &rev), opened_v);
+        }
+
+        // A different root must reject the same proof (commitment-bound
+        // transcript).
+        let other: Vec<Goldilocks> = (0..(1 << 6)).map(|_| rng.field()).collect();
+        let (other_root, _, _) = whir.commit(&other);
+        assert!(whir
+            .verify_ef_multi(&other_root, &proof, &multi_proto, &points)
+            .is_err());
+
+        // A tampered point (same proof, shifted coordinate) must reject.
+        let mut tampered_pt = points[0].as_slice().to_vec();
+        tampered_pt[0] = tampered_pt[0] + EF::from(Goldilocks::new(1));
+        let tampered = vec![Point::new(tampered_pt), points[1].clone()];
+        assert!(whir
+            .verify_ef_multi(&root, &proof, &multi_proto, &tampered)
+            .is_err());
+
+        // Malformed metadata: empty points, wrong arity, wrong protocol.
+        assert!(matches!(
+            whir.verify_ef_multi(&root, &proof, &multi_proto, &[]),
+            Err(WhirVerifyError::Malformed(_))
+        ));
+        let bad_pt = Point::new(vec![EF::from(Goldilocks::new(7)); 5]);
+        assert!(matches!(
+            whir.verify_ef_multi(&root, &proof, &multi_proto, &[bad_pt]),
+            Err(WhirVerifyError::Malformed(_))
+        ));
+        assert!(matches!(
+            whir.verify_ef_multi(&root, &proof, &proto, &points),
+            Err(WhirVerifyError::Malformed(_))
+        ));
     }
 
     /// Batch commits must inherit the caller's security parameters instead of

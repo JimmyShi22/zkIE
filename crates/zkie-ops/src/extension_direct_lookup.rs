@@ -6,29 +6,37 @@
 //! with zeros) selects a row of the committed static table, and the committed
 //! output `out[i]` equals `table[idx[i]]`.
 //!
-//! Proof shape: for every logical `i`, five WHIR opening pairs (re/im) at
-//! Boolean vertices —
-//! - `b0`, `b1`, `b2`, `out` opened at the vertex of flat index `i`
-//!   (LSB-first point `[bit0(i), bit1(i), bit2(i), 0, 0, 0, 0]`, converted to
-//!   the PCS order by the shared `to_p3_point` reversal);
-//! - `table` opened at `[b0_i, b1_i, b2_i, 0, 0, 0, 0]` built from the
-//!   AUTHENTICATED bit values, so the table row is selected by the committed
-//!   index, not by anything the prover can relabel.
+//! Proof shape: per tensor root component ONE batched WHIR multi-opening in
+//! the BASE field (all points are Boolean vertices) — `LookupProof` carries
+//! 10 `Proof` objects (5 tensors x re/im), each with its 8 claimed
+//! base-field evals:
+//! - `b0`, `b1`, `b2`, `out` opened at the canonical row vertices
+//!   (LSB-first `[bit0(i), bit1(i), bit2(i), 0, 0, 0, 0]`);
+//! - `table` opened at the 8 points `[b0_i, b1_i, b2_i, 0, 0, 0, 0]` built
+//!   from the AUTHENTICATED bit evals, so the table rows are selected by the
+//!   committed indices, not by anything the prover can relabel.
+//!
+//! Batching (`w.opening_protocol(ARITY, N)` + the root-bound EF multi APIs
+//! `open_ef_multi`/`verify_ef_multi`) reduces the transport from 80
+//! individual WHIR opening proofs to 10 batched multi-opening proofs; the
+//! LOGICAL checks (exact 0/1 bits, `table == out` per row) are unchanged.
+//! The witness lives in the real part of the EF pair commitments: any
+//! authenticated nonzero imaginary component is rejected.
 //!
 //! Verifier = statement (five root pairs) + proof only: no witness vectors,
-//! no host recomputation, no `open` calls. It checks, per row: both opening
-//! components verify against the right roots at the right points; the opened
-//! bits are exactly 0/1; the table value at the bit-selected vertex equals
-//! the opened output value.
+//! no host recomputation, no `open` calls. It checks, per batch: the
+//! multi-opening verifies against the right root at the right points and
+//! equals the claimed evals; then the opened bits are exactly 0/1 and the
+//! table values at the bit-selected vertices equal the opened output values.
 //!
 //! Soundness statement: this bridge is sound as a pointwise relation proof
 //! under WHIR binding — the relation checked is exactly "for each of the
 //! eight logical positions, `out` at that position equals `table` at the
 //! vertex selected by the committed bits, which are 0/1". There is NO
 //! sumcheck and NO Fiat–Shamir challenge here; all points are fixed Boolean
-//! vertices. The cost is O(N) openings (8 rows x 5 tensors x re+im = 80 WHIR
-//! openings) and the logical size is hard-wired to N = 8. This is a
-//! bridge to `Op::Lookup`, not a scalable lookup argument.
+//! vertices. The cost is O(N) logical point openings (80, batched into 10
+//! multi-opening proofs) and the logical size is hard-wired to N = 8. This
+//! is a bridge to `Op::Lookup`, not a scalable lookup argument.
 //!
 //! Dispatch seam: `LookupWitnessN8` / `CommittedLookupStatement` /
 //! `CommittedLookupProof` / `dispatch_prove` / `LookupProofDispatch` form the
@@ -38,7 +46,6 @@
 //! change the fixed N = 8, non-succinct scope of this module.
 
 use crate::compose::{Op, Store, TensorData};
-use crate::extension_lookup_fractional::{gen, to_p3_point};
 use zkie_core::common::field::{EF, Goldilocks, PrimeCharacteristicRing, PrimeField64};
 use zkie_core::pcs::whir::{Commitment, OpeningProtocol, Point, Proof, ProverData, Whir};
 
@@ -64,84 +71,107 @@ pub struct Statement {
     pub tbl: TensorCommitment,
 }
 
-/// One opening pair (re/im) at one point.
+/// ONE batched multi-opening for a root component: a single WHIR `Proof`
+/// plus the 8 claimed full-EF evals (in point order).
 #[derive(Clone)]
-pub struct LeafOpen {
-    pub re: (Proof, EF),
-    pub im: (Proof, EF),
+pub struct BatchOpen {
+    pub proof: Proof,
+    pub evals: Vec<EF>,
 }
 
-/// One logical row: the five opening pairs described in the module header.
+/// One tensor's batched openings: re and im root components.
 #[derive(Clone)]
-pub struct RowProof {
-    pub opens_b0: LeafOpen,
-    pub opens_b1: LeafOpen,
-    pub opens_b2: LeafOpen,
-    pub opens_out: LeafOpen,
-    pub opens_tbl: LeafOpen,
+pub struct TensorBatch {
+    pub re: BatchOpen,
+    pub im: BatchOpen,
 }
 
-/// The transported proof: one `RowProof` per logical row, in row order
-/// (row position `k` fixes the Boolean vertex, so rows cannot be reordered
-/// or omitted without breaking the WHIR openings).
+/// The transported proof: FIVE tensors x (re, im) = 10 batched
+/// multi-opening proofs — one `Proof` object per root component, NOT 80
+/// individual openings.
 #[derive(Clone)]
 pub struct LookupProof {
-    pub rows: Vec<RowProof>,
+    pub b0: TensorBatch,
+    pub b1: TensorBatch,
+    pub b2: TensorBatch,
+    pub out: TensorBatch,
+    pub tbl: TensorBatch,
 }
 
 struct Data {
     root: TensorCommitment,
     re_pd: ProverData,
     im_pd: ProverData,
-    proto: OpeningProtocol,
 }
 
 fn commit(w: &Whir, vals: Vec<Goldilocks>) -> Data {
-    let (re_root, re_pd, proto) = w.commit(&vals);
+    let (re_root, re_pd, _) = w.commit(&vals);
     let (im_root, im_pd, _) = w.commit(&vec![Goldilocks::ZERO; PAD]);
     Data {
         root: TensorCommitment { re: re_root, im: im_root },
         re_pd,
         im_pd,
-        proto,
     }
 }
 
-fn field_bits(bits: &[u64]) -> Vec<EF> {
-    bits.iter()
-        .map(|&b| EF::from(Goldilocks::from_u64(b)))
-        .collect()
-}
-
-/// Our-convention (LSB-first) Boolean vertex of flat index `k`: the low
-/// three coordinates carry the bits of `k`, the high four are zero.
-fn vertex_of(k: usize) -> Vec<EF> {
-    let mut v = field_bits(&[(k & 1) as u64, ((k >> 1) & 1) as u64, ((k >> 2) & 1) as u64]);
-    v.extend(vec![EF::ZERO; ARITY - 3]);
+/// Our-convention (LSB-first) Boolean vertex of flat index `k` as BASE-field
+/// coordinates: the low three coordinates carry the bits of `k`, the high
+/// four are zero.
+fn vertex_of_base(k: usize) -> Vec<Goldilocks> {
+    let mut v = vec![
+        Goldilocks::from_u64((k & 1) as u64),
+        Goldilocks::from_u64(((k >> 1) & 1) as u64),
+        Goldilocks::from_u64(((k >> 2) & 1) as u64),
+    ];
+    v.extend(vec![Goldilocks::ZERO; ARITY - 3]);
     v
 }
 
-fn open_pair(w: &Whir, d: &Data, pt: &[EF]) -> LeafOpen {
-    let p3 = to_p3_point(pt);
-    LeafOpen {
-        re: w.open_ef(&d.root.re, d.re_pd.clone(), &d.proto, &p3),
-        im: w.open_ef(&d.root.im, d.im_pd.clone(), &d.proto, &p3),
+/// Our-convention vertex as full-EF coordinates (base-lifted).
+fn vertex_of(k: usize) -> Vec<EF> {
+    vertex_of_base(k).iter().map(|&c| EF::from(c)).collect()
+}
+
+/// Convert OUR LSB-first point vectors to PCS-order `Point<EF>`s (single
+/// local reversal, then lift — the `open_ef_multi`/`verify_ef_multi` APIs
+/// take PCS-order EF points directly).
+fn p3_points(pts: &[Vec<EF>]) -> Vec<Point<EF>> {
+    pts.iter().map(|p| Point::new(p.iter().rev().cloned().collect())).collect()
+}
+
+/// Batch-open one tensor's re and im components at `pts` (root-bound EF
+/// multi-openings).
+fn batch_open(w: &Whir, d: &Data, proto: &OpeningProtocol, pts: &[Vec<EF>]) -> TensorBatch {
+    let p3 = p3_points(pts);
+    let (proof_re, evals_re) = w.open_ef_multi(&d.root.re, d.re_pd.clone(), proto, &p3);
+    let (proof_im, evals_im) = w.open_ef_multi(&d.root.im, d.im_pd.clone(), proto, &p3);
+    TensorBatch {
+        re: BatchOpen { proof: proof_re, evals: evals_re },
+        im: BatchOpen { proof: proof_im, evals: evals_im },
     }
 }
 
-/// Verify both components of an opening at `pt` against `root` and return
-/// the recombined EF value, or `None` on any mismatch.
-fn verify_pair(
+/// Verify both components of a batch at `pts` against `root` and return the
+/// authenticated real-part EF evals (equaling the claimed evals), or `None`
+/// on any mismatch. The witness lives in the real part: any authenticated
+/// nonzero imaginary component is rejected.
+fn verify_batch(
     w: &Whir,
     root: &TensorCommitment,
-    leaf: &LeafOpen,
-    pt: &[EF],
+    b: &TensorBatch,
     proto: &OpeningProtocol,
-) -> Option<EF> {
-    let p3 = to_p3_point(pt);
-    let re = w.verify_ef(&root.re, &leaf.re.0, proto, &p3).ok()?;
-    let im = w.verify_ef(&root.im, &leaf.im.0, proto, &p3).ok()?;
-    (re == leaf.re.1 && im == leaf.im.1).then(|| leaf.re.1 + gen() * leaf.im.1)
+    pts: &[Vec<EF>],
+) -> Option<Vec<EF>> {
+    let p3 = p3_points(pts);
+    let re = w.verify_ef_multi(&root.re, &b.re.proof, proto, &p3).ok()?;
+    let im = w.verify_ef_multi(&root.im, &b.im.proof, proto, &p3).ok()?;
+    if re != b.re.evals || im != b.im.evals {
+        return None;
+    }
+    if im.iter().any(|&x| x != EF::ZERO) {
+        return None;
+    }
+    Some(re)
 }
 
 /// Prove the fixed N = 8 indexed lookup. Returns `(statement, proof)` or
@@ -189,63 +219,67 @@ pub fn prove(
         out: d_out.root.clone(),
         tbl: d_tbl.root.clone(),
     };
-    let mut rows = Vec::with_capacity(N);
-    for k in 0..N {
-        let vertex = vertex_of(k);
-        // The table point is the vertex of the WITNESS index: the prover
-        // knows `indices[k]`; the verifier rebuilds the same point from the
-        // authenticated bit openings.
-        let tbl_pt = vertex_of(indices[k] as usize);
-        rows.push(RowProof {
-            opens_b0: open_pair(w, &d_b0, &vertex),
-            opens_b1: open_pair(w, &d_b1, &vertex),
-            opens_b2: open_pair(w, &d_b2, &vertex),
-            opens_out: open_pair(w, &d_out, &vertex),
-            opens_tbl: open_pair(w, &d_tbl, &tbl_pt),
-        });
-    }
-    Some((stmt, LookupProof { rows }))
+    // The batch protocol (N points), NOT the single protocol from commit.
+    let proto = w.opening_protocol(ARITY, N);
+    // Canonical row vertices, and the table points from the KNOWN witness
+    // indices (the verifier rebuilds the same points from the authenticated
+    // bit evals).
+    let row_vertices: Vec<Vec<EF>> = (0..N).map(vertex_of).collect();
+    let tbl_points: Vec<Vec<EF>> = indices.iter().map(|&i| vertex_of(i as usize)).collect();
+    let proof = LookupProof {
+        b0: batch_open(w, &d_b0, &proto, &row_vertices),
+        b1: batch_open(w, &d_b1, &proto, &row_vertices),
+        b2: batch_open(w, &d_b2, &proto, &row_vertices),
+        out: batch_open(w, &d_out, &proto, &row_vertices),
+        tbl: batch_open(w, &d_tbl, &proto, &tbl_points),
+    };
+    Some((stmt, proof))
 }
 
 /// Verify the fixed N = 8 indexed lookup from statement and proof only.
 /// Malformed shapes return `false` (never panic).
 pub fn verify(w: &Whir, stmt: &Statement, proof: &LookupProof) -> bool {
-    if w.num_variables() != ARITY || proof.rows.len() != N {
+    if w.num_variables() != ARITY {
         return false;
     }
-    let proto = w.opening_protocol(ARITY, 1);
-    for (k, row) in proof.rows.iter().enumerate() {
-        let vertex = vertex_of(k);
-        let Some(vb0) = verify_pair(w, &stmt.b0, &row.opens_b0, &vertex, &proto) else {
-            return false;
-        };
-        let Some(vb1) = verify_pair(w, &stmt.b1, &row.opens_b1, &vertex, &proto) else {
-            return false;
-        };
-        let Some(vb2) = verify_pair(w, &stmt.b2, &row.opens_b2, &vertex, &proto) else {
-            return false;
-        };
-        if vb0 != EF::ZERO && vb0 != EF::ONE {
-            return false;
-        }
-        if vb1 != EF::ZERO && vb1 != EF::ONE {
-            return false;
-        }
-        if vb2 != EF::ZERO && vb2 != EF::ONE {
-            return false;
-        }
-        let Some(vout) = verify_pair(w, &stmt.out, &row.opens_out, &vertex, &proto) else {
-            return false;
-        };
-        let tbl_pt = vec![vb0, vb1, vb2, EF::ZERO, EF::ZERO, EF::ZERO, EF::ZERO];
-        let Some(vtbl) = verify_pair(w, &stmt.tbl, &row.opens_tbl, &tbl_pt, &proto) else {
-            return false;
-        };
-        if vtbl != vout {
+    let proto = w.opening_protocol(ARITY, N);
+    let row_vertices: Vec<Vec<EF>> = (0..N).map(vertex_of).collect();
+    let Some(vb0) = verify_batch(w, &stmt.b0, &proof.b0, &proto, &row_vertices) else {
+        return false;
+    };
+    let Some(vb1) = verify_batch(w, &stmt.b1, &proof.b1, &proto, &row_vertices) else {
+        return false;
+    };
+    let Some(vb2) = verify_batch(w, &stmt.b2, &proof.b2, &proto, &row_vertices) else {
+        return false;
+    };
+    let Some(vout) = verify_batch(w, &stmt.out, &proof.out, &proto, &row_vertices) else {
+        return false;
+    };
+    // Exact 0/1 bits, and the table points from the AUTHENTICATED bit evals.
+    let mut tbl_points = Vec::with_capacity(N);
+    for k in 0..N {
+        let (b0k, b1k, b2k) = (vb0[k], vb1[k], vb2[k]);
+        if (b0k != EF::ZERO && b0k != EF::ONE)
+            || (b1k != EF::ZERO && b1k != EF::ONE)
+            || (b2k != EF::ZERO && b2k != EF::ONE)
+        {
             return false;
         }
+        tbl_points.push(vec![
+            b0k,
+            b1k,
+            b2k,
+            EF::ZERO,
+            EF::ZERO,
+            EF::ZERO,
+            EF::ZERO,
+        ]);
     }
-    true
+    let Some(vtbl) = verify_batch(w, &stmt.tbl, &proof.tbl, &proto, &tbl_points) else {
+        return false;
+    };
+    (0..N).all(|k| vtbl[k] == vout[k])
 }
 
 // ==== dispatch seam (Op::Lookup / compose integration point) ====
@@ -427,9 +461,34 @@ mod tests {
         assert_eq!(w.open_stats(), before, "verifier must never open");
     }
 
+    /// Batching shape: proving records 80 LOGICAL point openings (10 batch
+    /// opens x 8 points) but transports only 10 WHIR proof objects (5
+    /// tensors x re/im — one batched multi-opening proof per root
+    /// component), not 80 individual proofs. The logical relation checks are
+    /// unchanged.
+    #[test]
+    fn batched_openings_shape() {
+        let w = Whir::new_target(ARITY, 90, 0).expect("valid arity");
+        let (indices, out, table) = witness();
+        let before = w.open_stats().0;
+        let (s, p) = prove(&w, &indices, &out, &table).expect("prove");
+        let after = w.open_stats().0;
+        assert_eq!(after - before, 80, "10 batched opens x 8 points");
+        // Exactly ten proof objects live in the transport.
+        let proofs = [
+            &p.b0.re.proof, &p.b0.im.proof,
+            &p.b1.re.proof, &p.b1.im.proof,
+            &p.b2.re.proof, &p.b2.im.proof,
+            &p.out.re.proof, &p.out.im.proof,
+            &p.tbl.re.proof, &p.tbl.im.proof,
+        ];
+        assert_eq!(proofs.len(), 10);
+        assert!(verify(&w, &s, &p));
+    }
+
     /// Build a statement/proof pair that MIRRORS `prove` exactly, except that
-    /// the committed `b0[0]` value is `bad` and row 0's table opening point
-    /// is computed from the b0 = 0 bit (so every PCS opening is authentic,
+    /// the committed `b0[0]` value is `bad` and row 0's table point is
+    /// computed from the b0 = 0 bit (so every batched opening is authentic,
     /// even when the committed bit violates the relation).
     fn proof_with_b0_zero(w: &Whir, bad: Goldilocks) -> (Statement, LookupProof) {
         let (indices, out, table) = witness();
@@ -459,35 +518,39 @@ mod tests {
             out: d_out.root.clone(),
             tbl: d_tbl.root.clone(),
         };
-        let mut rows = Vec::with_capacity(N);
+        let proto = w.opening_protocol(ARITY, N);
+        let row_vertices: Vec<Vec<EF>> = (0..N).map(vertex_of).collect();
+        // Row 0's table point uses the b0 = 0 bit (the point stays a
+        // Boolean vertex); all other rows use the witness bits.
+        let mut tbl_points = Vec::with_capacity(N);
         for k in 0..N {
-            let vertex = vertex_of(k);
-            // Row 0's table point uses the b0 = 0 bit (the point stays a
-            // Boolean vertex); all other rows use the witness bits.
             let j0 = if k == 0 { 0 + 2 * bits(1)[0] + 4 * bits(2)[0] } else { indices[k] as u64 };
-            rows.push(RowProof {
-                opens_b0: open_pair(w, &d_b0, &vertex),
-                opens_b1: open_pair(w, &d_b1, &vertex),
-                opens_b2: open_pair(w, &d_b2, &vertex),
-                opens_out: open_pair(w, &d_out, &vertex),
-                opens_tbl: open_pair(w, &d_tbl, &vertex_of(j0 as usize)),
-            });
+            tbl_points.push(vertex_of(j0 as usize));
         }
-        (stmt, LookupProof { rows })
+        let proof = LookupProof {
+            b0: batch_open(w, &d_b0, &proto, &row_vertices),
+            b1: batch_open(w, &d_b1, &proto, &row_vertices),
+            b2: batch_open(w, &d_b2, &proto, &row_vertices),
+            out: batch_open(w, &d_out, &proto, &row_vertices),
+            tbl: batch_open(w, &d_tbl, &proto, &tbl_points),
+        };
+        (stmt, proof)
     }
 
     /// An HONESTLY committed non-Boolean bit (value 2) with authentic WHIR
-    /// openings: the opening layer accepts it (verify_pair returns 2), but
-    /// the relation's Boolean gate rejects it.
+    /// openings: the batch opening layer accepts it (verify_multi returns
+    /// the committed 2), but the relation's Boolean gate rejects it.
     #[test]
     fn committed_nonboolean_bit_rejected() {
         let w = Whir::new_target(ARITY, 90, 0).expect("valid arity");
         let (s, p) = proof_with_b0_zero(&w, Goldilocks::from_u64(2));
         // The opening IS authentic: it verifies and yields the committed 2.
-        let proto = w.opening_protocol(ARITY, 1);
-        let vb0 = verify_pair(&w, &s.b0, &p.rows[0].opens_b0, &vertex_of(0), &proto)
-            .expect("authentic opening of the committed value");
-        assert_eq!(vb0, EF::from(Goldilocks::from_u64(2)));
+        let proto = w.opening_protocol(ARITY, N);
+        let row_vertices: Vec<Vec<EF>> = (0..N).map(vertex_of).collect();
+        let evals = w
+            .verify_ef_multi(&s.b0.re, &p.b0.re.proof, &proto, &p3_points(&row_vertices))
+            .expect("authentic batched opening of the committed value");
+        assert_eq!(evals[0], EF::from(Goldilocks::from_u64(2)));
         // ...but the relation's Boolean gate rejects the whole proof.
         assert!(!verify(&w, &s, &p));
     }
@@ -502,6 +565,66 @@ mod tests {
         assert!(!verify(&w, &s, &p));
     }
 
+    /// An AUTHENTIC nonzero imaginary b0 component: the b0 im batch's root,
+    /// proof, and claimed evals are all consistent (the batch verifies and
+    /// yields the committed imaginary value), but the outer relation rejects
+    /// it because the witness must live in the real part.
+    #[test]
+    fn committed_nonzero_imaginary_b0_rejected() {
+        let w = Whir::new_target(ARITY, 90, 0).expect("valid arity");
+        let (indices, out, table) = witness();
+        let pad = |vals: &[u64]| -> Vec<Goldilocks> {
+            let mut v = vec![Goldilocks::ZERO; PAD];
+            for (i, &x) in vals.iter().enumerate() {
+                v[i] = Goldilocks::from_u64(x);
+            }
+            v
+        };
+        let bits = |sh: u32| -> Vec<u64> {
+            indices.iter().map(|&i| ((i as u64) >> sh) & 1).collect()
+        };
+        // b0 committed with a NONZERO imaginary part (5 at row 0).
+        let b0_re = pad(&bits(0));
+        let mut b0_im = vec![Goldilocks::ZERO; PAD];
+        b0_im[0] = Goldilocks::from_u64(5);
+        let (b0_re_root, b0_re_pd, _) = w.commit(&b0_re);
+        let (b0_im_root, b0_im_pd, _) = w.commit(&b0_im);
+        let d_b0 = Data {
+            root: TensorCommitment { re: b0_re_root, im: b0_im_root },
+            re_pd: b0_re_pd,
+            im_pd: b0_im_pd,
+        };
+        let d_b1 = commit(&w, pad(&bits(1)));
+        let d_b2 = commit(&w, pad(&bits(2)));
+        let d_out = commit(&w, pad(&out));
+        let d_tbl = commit(&w, pad(&table));
+        let stmt = Statement {
+            b0: d_b0.root.clone(),
+            b1: d_b1.root.clone(),
+            b2: d_b2.root.clone(),
+            out: d_out.root.clone(),
+            tbl: d_tbl.root.clone(),
+        };
+        let proto = w.opening_protocol(ARITY, N);
+        let row_vertices: Vec<Vec<EF>> = (0..N).map(vertex_of).collect();
+        let tbl_points: Vec<Vec<EF>> =
+            indices.iter().map(|&i| vertex_of(i as usize)).collect();
+        let proof = LookupProof {
+            b0: batch_open(&w, &d_b0, &proto, &row_vertices),
+            b1: batch_open(&w, &d_b1, &proto, &row_vertices),
+            b2: batch_open(&w, &d_b2, &proto, &row_vertices),
+            out: batch_open(&w, &d_out, &proto, &row_vertices),
+            tbl: batch_open(&w, &d_tbl, &proto, &tbl_points),
+        };
+        // The b0 im batch IS authentic: root + proof + claim all consistent.
+        let im_evals = w
+            .verify_ef_multi(&stmt.b0.im, &proof.b0.im.proof, &proto, &p3_points(&row_vertices))
+            .expect("authentic imaginary batch");
+        assert_eq!(im_evals[0], EF::from(Goldilocks::from_u64(5)));
+        // ...but the outer relation rejects the nonzero imaginary component.
+        assert!(!verify(&w, &stmt, &proof));
+    }
+
     /// An HONESTLY committed wrong output (out[0] = table[indices[0]] + 1)
     /// with fully authentic openings: the equality gate rejects.
     #[test]
@@ -513,24 +636,33 @@ mod tests {
         assert!(!verify(&w, &s, &p));
     }
 
-    /// Malformed proof shape: a wrong row count must be rejected.
+    /// Malformed proof shape: a claimed-evals vector of the wrong length or
+    /// a tampered claimed eval must be rejected (the batch claim no longer
+    /// matches the WHIR-verified evals).
     #[test]
-    fn malformed_row_count_rejected() {
+    fn malformed_batch_shape_rejected() {
         let (w, s, mut p) = fixture();
-        p.rows.pop();
+        p.b0.re.evals.pop();
         assert!(!verify(&w, &s, &p));
         let (w, s, mut p) = fixture();
-        p.rows.push(p.rows[0].clone());
+        p.out.im.evals[0] = p.out.im.evals[0] + Goldilocks::ONE;
         assert!(!verify(&w, &s, &p));
     }
 
-    /// A table opening substituted from another row is bound to the wrong
-    /// point: WHIR rejects it before any value comparison.
+    /// A table batch substituted from a proof of a DIFFERENT witness is
+    /// bound to its own table points: WHIR rejects it at this statement's
+    /// reconstructed points before any value comparison.
     #[test]
     fn substituted_table_opening_rejected() {
-        let (w, s, mut p) = fixture();
-        p.rows[0].opens_tbl = p.rows[1].opens_tbl.clone();
-        assert!(!verify(&w, &s, &p));
+        let w = Whir::new_target(ARITY, 90, 0).expect("valid arity");
+        let (indices, out, table) = witness();
+        let (s, p) = prove(&w, &indices, &out, &table).expect("prove");
+        let indices2 = vec![0, 1, 2, 3, 4, 5, 6, 7];
+        let out2: Vec<u64> = indices2.iter().map(|&i| table[i as usize]).collect();
+        let (_, p2) = prove(&w, &indices2, &out2, &table).expect("prove");
+        let mut bad = p.clone();
+        bad.tbl = p2.tbl.clone();
+        assert!(!verify(&w, &s, &bad));
     }
 
     /// A tampered statement root must be rejected.
@@ -560,20 +692,23 @@ mod tests {
         assert!(prove(&w2, &indices, &out, &table).is_none());
     }
 
-    /// The honest proof's table points equal the witness index vertices
-    /// (spot reference: row k's table opening equals table[indices[k]]).
+    /// The honest proof's table batch verifies at the witness index
+    /// vertices (spot reference: row k's table eval equals
+    /// table[indices[k]]).
     #[test]
     fn honest_table_points_match_witness() {
         let (w, s, p) = fixture();
         assert!(verify(&w, &s, &p));
         let (indices, out, table) = witness();
-        let proto = w.opening_protocol(ARITY, 1);
-        for (k, row) in p.rows.iter().enumerate() {
-            let j = indices[k] as usize;
-            let vtbl = verify_pair(&w, &s.tbl, &row.opens_tbl, &vertex_of(j), &proto)
-                .expect("honest table opening verifies at the witness vertex");
-            assert_eq!(vtbl, EF::from(Goldilocks::from_u64(table[j])));
-            assert_eq!(vtbl, EF::from(Goldilocks::from_u64(out[k])));
+        let proto = w.opening_protocol(ARITY, N);
+        let tbl_points: Vec<Vec<EF>> =
+            indices.iter().map(|&i| vertex_of(i as usize)).collect();
+        let evals = w
+            .verify_ef_multi(&s.tbl.re, &p.tbl.re.proof, &proto, &p3_points(&tbl_points))
+            .expect("honest table batch verifies at the witness vertices");
+        for (k, &j) in indices.iter().enumerate() {
+            assert_eq!(evals[k], EF::from(Goldilocks::from_u64(table[j as usize])));
+            assert_eq!(evals[k], EF::from(Goldilocks::from_u64(out[k])));
         }
     }
 
@@ -631,7 +766,7 @@ mod tests {
         let CommittedLookupProof::DirectN8(mut inner) = proof else {
             unreachable!("single variant")
         };
-        inner.rows.pop();
+        inner.b0.re.evals.pop();
         assert!(!CommittedLookupProof::DirectN8(inner).verify_with_whir(&w, &stmt));
     }
 
