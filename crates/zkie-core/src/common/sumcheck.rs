@@ -635,7 +635,7 @@ fn small_int_f<F: PrimeCharacteristicRing + Copy>(v: i64) -> F {
 /// Lagrange-interpolate the degree-`d` polynomial through `vals[0..=d]` at
 /// `x`. The inverse denominators depend only on `d` and are precomputed once
 /// per call (fewer inversions than the base per-evaluation Lagrange).
-fn interpolate_f<F: Field + PrimeCharacteristicRing + Copy>(vals: &[F], x: F, d: usize) -> F {
+pub fn interpolate_f<F: Field + PrimeCharacteristicRing + Copy>(vals: &[F], x: F, d: usize) -> F {
     let mut inv_dens = Vec::with_capacity(d + 1);
     for k in 0..=d {
         let mut den = F::ONE;
@@ -657,6 +657,34 @@ fn interpolate_f<F: Field + PrimeCharacteristicRing + Copy>(vals: &[F], x: F, d:
         out = out + term * inv_dens[k];
     }
     out
+}
+
+/// Compute the round-polynomial values at `0..=max_deg` for the current
+/// (partially folded) buffers of a virtual sumcheck. This is the per-round
+/// core shared by [`prove_virtual_f`] and interactive Fiat–Shamir loops that
+/// absorb each round message before sampling the next challenge.
+pub fn virtual_round_pvals_f<F: Field + PrimeCharacteristicRing + Copy>(
+    bufs: &[Vec<F>],
+    terms: &[(F, Vec<usize>)],
+    max_deg: usize,
+) -> Vec<F> {
+    let half = bufs[0].len() / 2;
+    let mut pvals = vec![F::ZERO; max_deg + 1];
+    for s in 0..half {
+        for (coeff, idxs) in terms {
+            for k in 0..=max_deg {
+                let mut prod = *coeff;
+                for &j in idxs {
+                    let f0 = bufs[j][2 * s];
+                    let f1 = bufs[j][2 * s + 1];
+                    let fk = small_int_f::<F>(k as i64) * f1 - small_int_f::<F>(k as i64 - 1) * f0;
+                    prod = prod * fk;
+                }
+                pvals[k] = pvals[k] + prod;
+            }
+        }
+    }
+    pvals
 }
 
 /// Prove `sum_x sum_i coeff_i * prod_{j in term_i} f_j(x) == claimed` over any
@@ -700,24 +728,7 @@ pub fn prove_virtual_f<F: Field + PrimeCharacteristicRing + Copy>(
     let mut rounds = Vec::with_capacity(t);
     for &r in challenges {
         let half = bufs[0].len() / 2;
-        let mut pvals = vec![F::ZERO; max_deg + 1];
-        for s in 0..half {
-            for (coeff, idxs) in terms {
-                for k in 0..=max_deg {
-                    let mut prod = *coeff;
-                    for &j in idxs {
-                        let f0 = bufs[j][2 * s];
-                        let f1 = bufs[j][2 * s + 1];
-                        // Linear extension of f at the integer point k:
-                        // f(k) = k*f1 - (k-1)*f0.
-                        let fk = small_int_f::<F>(k as i64) * f1 - small_int_f::<F>(k as i64 - 1) * f0;
-                        prod = prod * fk;
-                    }
-                    pvals[k] = pvals[k] + prod;
-                }
-            }
-        }
-        rounds.push(pvals);
+        rounds.push(virtual_round_pvals_f(&bufs, terms, max_deg));
         for buf in bufs.iter_mut() {
             for s in 0..half {
                 let f0 = buf[2 * s];
