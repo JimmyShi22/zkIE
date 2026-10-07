@@ -1,0 +1,43 @@
+# Standalone experiment workspace — NOT part of the main zkIE workspace.
+#
+# PCS comparison only: (1) ark-poly-commit 0.5 multilinear PC over ark-bn254
+# 0.5 (KZG-style), (2) upstream p3-whir 0.7 over Goldilocks with quadratic
+# extension challenges. Benchmark-only code; see README.md.
+
+[workspace]
+
+[package]
+name = "pcs-comparison"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# KZG side (BN254 multilinear PC)
+ark-bn254 = "0.5"
+ark-poly-commit = "0.5"
+ark-poly = "0.5"
+ark-serialize = "0.5"
+ark-std = "0.5"
+rand08 = { package = "rand", version = "0.8" }
+
+# WHIR side (Goldilocks base + quadratic extension)
+p3-challenger = "0.7.0"
+p3-commit = "0.7.0"
+p3-dft = { version = "0.7.0", features = ["parallel"] }
+p3-field = "0.7.0"
+p3-goldilocks = "0.7.0"
+p3-matrix = "0.7.0"
+p3-merkle-tree = "0.7.0"
+p3-multilinear-util = "0.7.0"
+p3-poseidon2 = "0.7.0"
+p3-symmetric = "0.7.0"
+p3-sumcheck = "0.7.0"
+p3-whir = "0.7.0"
+rand = "0.10.1"
+
+# Serialized proof-size measurement
+postcard = { version = "1", features = ["alloc"] }
+rayon = "1"
+
+[profile.release]
+opt-level = 3

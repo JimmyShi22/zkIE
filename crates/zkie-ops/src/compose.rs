@@ -1731,19 +1731,27 @@ pub fn verify_shard_dag(
     true
 }
 
+/// A committed cross-shard binding: the transported WHIR multi-opening proof
+/// plus the merged `same_poly` proof. Both travel to the verifier; the verifier
+/// checks the opening against the commitment and the merge against the claims.
+pub struct CommittedBindProof {
+    pub open_proof: zkie_core::pcs::whir::Proof,
+    pub same: SamePolyProof,
+}
+
 /// Committed cross-shard binding: open a committed boundary tensor at every
-/// claim point, verify each opening against the commitment, and merge the claims
-/// with `same_poly`. The commitment itself ties the two shards' claims to one
-/// tensor; the merge collapses them toward a single future opening. This is the
-/// "boundary commit" form of cross-shard binding (the Commit/Open stages) that
-/// the plain `prove_shard_dag` defers.
+/// claim point, verify each opening against the commitment (prover-side sanity
+/// check), and merge the claims with `same_poly`. The commitment itself ties the
+/// two shards' claims to one tensor; the merge collapses them toward a single
+/// future opening. This is the "boundary commit" form of cross-shard binding
+/// (the Commit/Open stages) that the plain `prove_shard_dag` defers.
 pub fn committed_cross_bind(
     whir: &zkie_core::pcs::whir::Whir,
     committed: &zkie_core::pcs::committed::Committed,
     tensor: &[Goldilocks],
     claims: &[(Vec<Goldilocks>, Goldilocks)],
     rng: &mut XorShift64,
-) -> Option<SamePolyProof> {
+) -> Option<CommittedBindProof> {
     let points: Vec<Vec<Goldilocks>> = claims.iter().map(|(pt, _)| pt.clone()).collect();
     let (open_proof, opened) = whir.open_multi(committed.prover_data.clone(), &committed.protocol, &points);
     let verified = whir
@@ -1754,41 +1762,74 @@ pub fn committed_cross_bind(
             return None;
         }
     }
-    Some(prove_same_poly(tensor, claims, rng))
+    Some(CommittedBindProof {
+        open_proof,
+        same: prove_same_poly(tensor, claims, rng),
+    })
 }
 
-/// Verify a [`committed_cross_bind`] proof: open each claim against the
-/// commitment, then verify the merged `same_poly`.
+/// Verify a [`committed_cross_bind`] proof. Takes the verifier-only
+/// [`CommittedPublic`] context (no `prover_data`) and the *transported* opening
+/// proof: this function only verifies, it never regenerates openings.
+///
+/// Data binding: the transported protocol must equal the canonical protocol for
+/// `(tensor arity, claim count)` — both are public, so any deviation is a
+/// malformed proof. The transported opening proof is checked against the
+/// commitment at every claim point, each verified value must equal the claimed
+/// eval and the tensor's own MLE evaluation there, and the merged `same_poly`
+/// must verify.
 pub fn verify_committed_cross_bind(
     whir: &zkie_core::pcs::whir::Whir,
-    committed: &zkie_core::pcs::committed::Committed,
+    committed: &zkie_core::pcs::committed::CommittedPublic,
     tensor: &[Goldilocks],
     claims: &[(Vec<Goldilocks>, Goldilocks)],
-    proof: &SamePolyProof,
+    open_proof: &zkie_core::pcs::whir::Proof,
+    same: &SamePolyProof,
 ) -> bool {
+    // Reject malformed inputs before any MLE evaluation or PCS verification:
+    // `mle::eval` and upstream `verify_at` assert (rather than error) on
+    // dimension mismatches, so a verifier must pre-validate.
+    if tensor.is_empty() || !tensor.len().is_power_of_two() {
+        return false;
+    }
+    let num_vars = tensor.len().trailing_zeros() as usize;
+    if claims.is_empty() {
+        return false;
+    }
     let points: Vec<Vec<Goldilocks>> = claims.iter().map(|(pt, _)| pt.clone()).collect();
-    let (open_proof, opened) = whir.open_multi(committed.prover_data.clone(), &committed.protocol, &points);
-    let verified = match whir.verify_multi(&committed.commitment, &open_proof, &committed.protocol, &points) {
+    if points.iter().any(|pt| pt.len() != num_vars) {
+        return false;
+    }
+    if committed.protocol != whir.opening_protocol(num_vars, points.len()) {
+        return false;
+    }
+    let verified = match whir.verify_multi(&committed.commitment, open_proof, &committed.protocol, &points) {
         Ok(v) => v,
         Err(_) => return false,
     };
     for (i, (pt, expected)) in claims.iter().enumerate() {
-        if verified[i] != opened[i] || opened[i] != *expected || opened[i] != mle::eval(tensor, pt) {
+        if verified[i] != *expected || verified[i] != mle::eval(tensor, pt) {
             return false;
         }
     }
-    verify_same_poly(proof, tensor, claims).is_some()
+    verify_same_poly(same, tensor, claims).is_some()
 }
 
 /// A committed shard-DAG proof: every shard proven as before (plain sumchecks,
 /// virtual intermediates), plus a WHIR commitment per cross-shard boundary tensor
 /// and a committed cross-shard binding. Only boundary tensors are committed; this
 /// is the "only shard boundaries + global weights commit" model.
+///
+/// `boundary_commitments` carry only the verifier-side public context
+/// (commitment + protocol, no `prover_data`); `cross_open_proofs[i]` is the
+/// transported WHIR opening proof for `boundary_tensors[i]`, aligned with
+/// `cross_binds[i]`.
 pub struct CommittedShardDagProof {
     pub shards: Vec<OpShardProof>,
     pub boundary_tensors: Vec<T>,
-    pub boundary_commitments: Vec<zkie_core::pcs::committed::Committed>,
+    pub boundary_commitments: Vec<zkie_core::pcs::committed::CommittedPublic>,
     pub cross_binds: Vec<SamePolyProof>,
+    pub cross_open_proofs: Vec<zkie_core::pcs::whir::Proof>,
 }
 
 pub fn prove_committed_shard_dag(
@@ -1827,9 +1868,13 @@ pub fn prove_committed_shard_dag(
         ));
     }
 
+    // The proof carries only the public commitment context; the prover-side
+    // `Committed` (with `prover_data`) stays local to this function.
+    let mut boundary_public = Vec::with_capacity(boundary_tensors.len());
     let mut cross_binds = Vec::with_capacity(boundary_tensors.len());
+    let mut cross_open_proofs = Vec::with_capacity(boundary_tensors.len());
     for (i, &t) in boundary_tensors.iter().enumerate() {
-        let sp = committed_cross_bind(
+        let bp = committed_cross_bind(
             whir,
             &boundary_commitments[i],
             store.get(t),
@@ -1837,14 +1882,17 @@ pub fn prove_committed_shard_dag(
             rng,
         )
         .expect("honest committed bind");
-        cross_binds.push(sp);
+        boundary_public.push(boundary_commitments[i].to_public());
+        cross_binds.push(bp.same);
+        cross_open_proofs.push(bp.open_proof);
     }
 
     CommittedShardDagProof {
         shards: plain.shards,
         boundary_tensors,
-        boundary_commitments,
+        boundary_commitments: boundary_public,
         cross_binds,
+        cross_open_proofs,
     }
 }
 
@@ -1859,6 +1907,7 @@ pub fn verify_committed_shard_dag(
     if proof.shards.len() != ranges.len()
         || proof.boundary_tensors.len() != proof.boundary_commitments.len()
         || proof.boundary_tensors.len() != proof.cross_binds.len()
+        || proof.boundary_tensors.len() != proof.cross_open_proofs.len()
     {
         return false;
     }
@@ -1877,6 +1926,27 @@ pub fn verify_committed_shard_dag(
         return false;
     }
 
+    // The set of bound tensors is fully determined by the shard claims: every
+    // tensor claimed by more than one shard must appear in `boundary_tensors`,
+    // exactly once, and nothing else may (mirrors the plain `verify_shard_dag`
+    // cross-tensor check). This closes the "unbound cross-shard tensor" gap.
+    let mut by_tensor: std::collections::BTreeMap<T, std::collections::HashSet<usize>> =
+        std::collections::BTreeMap::new();
+    for (si, shard) in proof.shards.iter().enumerate() {
+        for (t, _, _) in &shard.claims {
+            by_tensor.entry(*t).or_default().insert(si);
+        }
+    }
+    let mut expected_cross: Vec<T> = Vec::new();
+    for (t, shards) in &by_tensor {
+        if shards.len() > 1 {
+            expected_cross.push(*t);
+        }
+    }
+    if expected_cross != proof.boundary_tensors {
+        return false;
+    }
+
     for (i, &t) in proof.boundary_tensors.iter().enumerate() {
         let mut claims = Vec::new();
         for shard in &proof.shards {
@@ -1891,6 +1961,7 @@ pub fn verify_committed_shard_dag(
             &proof.boundary_commitments[i],
             ws.get(t),
             &claims,
+            &proof.cross_open_proofs[i],
             &proof.cross_binds[i],
         ) {
             return false;
@@ -1916,26 +1987,49 @@ pub fn commit_weights_batch(
     }
 }
 
-/// Open the `idx`-th weight of a batch commitment at `point` and verify it
-/// equals `tensor`'s MLE evaluation there.
-pub fn verify_weight_batch(
+/// Open the `idx`-th weight of a batch commitment at `point` (prover side):
+/// produces the `(proof, value)` pair that travels to the verifier.
+pub fn open_weight_batch(
     batch: &zkie_core::pcs::committed::BatchCtx,
+    idx: usize,
+    point: &[Goldilocks],
+) -> (zkie_core::pcs::whir::Proof, Goldilocks) {
+    batch
+        .whir
+        .open_batch(batch.prover_data.clone(), &batch.protocol, idx, batch.num_tables, point)
+}
+
+/// Verify a transported weight opening (verifier side): takes the verifier-only
+/// [`BatchPublic`] context (no `prover_data`) and the `(proof, value)` pair from
+/// `open_weight_batch`. Only verifies — never regenerates the opening.
+///
+/// Malformed public metadata (non-canonical protocol, zero table count,
+/// out-of-range index, wrong point dimension) and malformed tensors are
+/// rejected with `false` before any MLE evaluation or PCS verification;
+/// upstream `verify_at` asserts on such mismatches, so the pre-checks keep the
+/// verifier panic-free.
+pub fn verify_weight_batch(
+    batch: &zkie_core::pcs::committed::BatchPublic,
     idx: usize,
     tensor: &[Goldilocks],
     point: &[Goldilocks],
+    open: &(zkie_core::pcs::whir::Proof, Goldilocks),
 ) -> bool {
-    let (open, ev) = batch
-        .whir
-        .open_batch(batch.prover_data.clone(), &batch.protocol, idx, batch.num_tables, point);
-    if batch
-        .whir
-        .verify_batch(&batch.commitment, &open, &batch.protocol, idx, batch.num_tables, point)
-        .ok()
-        != Some(ev)
+    if tensor.is_empty()
+        || !tensor.len().is_power_of_two()
+        || tensor.len().trailing_zeros() as usize != point.len()
     {
         return false;
     }
-    ev == mle::eval(tensor, point)
+    if batch
+        .whir
+        .verify_batch_checked(&batch.commitment, &open.0, &batch.protocol, idx, batch.num_tables, point)
+        .ok()
+        != Some(open.1)
+    {
+        return false;
+    }
+    open.1 == mle::eval(tensor, point)
 }
 
 /// A projection block proven with committed weights: the matmul keeps the
@@ -1990,9 +2084,9 @@ pub fn prove_projection_committed(
 pub fn verify_projection_committed(
     proof: &CommittedProjectionProof,
     x: &[Goldilocks],
-    w_batch: &zkie_core::pcs::committed::BatchCtx,
+    w_batch: &zkie_core::pcs::committed::BatchPublic,
     w_idx: usize,
-    bias_batch: &zkie_core::pcs::committed::BatchCtx,
+    bias_batch: &zkie_core::pcs::committed::BatchPublic,
     bias_idx: usize,
     w: &[Goldilocks],
     bias: &[Goldilocks],
@@ -2010,7 +2104,7 @@ pub fn verify_projection_committed(
     w_pt.extend_from_slice(&proof.plain.ch);
     if w_batch
         .whir
-        .verify_batch(&w_batch.commitment, &proof.w_open.0, &w_batch.protocol, w_idx, w_batch.num_tables, &w_pt)
+        .verify_batch_checked(&w_batch.commitment, &proof.w_open.0, &w_batch.protocol, w_idx, w_batch.num_tables, &w_pt)
         .ok()
         != Some(proof.w_open.1)
         || proof.w_open.1 != mle::eval(w, &w_pt)
@@ -2019,7 +2113,7 @@ pub fn verify_projection_committed(
     }
     if bias_batch
         .whir
-        .verify_batch(&bias_batch.commitment, &proof.bias_open.0, &bias_batch.protocol, bias_idx, bias_batch.num_tables, &proof.plain.pt)
+        .verify_batch_checked(&bias_batch.commitment, &proof.bias_open.0, &bias_batch.protocol, bias_idx, bias_batch.num_tables, &proof.plain.pt)
         .ok()
         != Some(proof.bias_open.1)
         || proof.bias_open.1 != mle::eval(bias, &proof.plain.pt)
@@ -2368,14 +2462,55 @@ mod tests {
         ];
 
         let proof = committed_cross_bind(&whir, &c, &f, &claims, &mut rng).expect("honest bind");
-        assert_eq!(proof.coeffs.len(), 2);
+        assert_eq!(proof.same.coeffs.len(), 2);
 
-        // A wrong claimed eval must fail the commitment check.
+        // A wrong claimed eval must fail the commitment check (prover side).
         let bad = vec![
             (p0.clone(), mle::eval(&f, &p0) + Goldilocks::ONE),
             (p1.clone(), mle::eval(&f, &p1)),
         ];
         assert!(committed_cross_bind(&whir, &c, &f, &bad, &mut rng).is_none());
+
+        // Verifier side: the transported proof verifies against the public
+        // context, and never regenerates an opening.
+        let pubc = c.to_public();
+        let opens_before = whir.open_stats();
+        assert!(verify_committed_cross_bind(&whir, &pubc, &f, &claims, &proof.open_proof, &proof.same));
+        assert_eq!(whir.open_stats(), opens_before, "verifier regenerated openings");
+
+        // Tampered opening proof (OOD answers are always transcript-checked).
+        {
+            let mut bad_open = proof.open_proof.clone();
+            bad_open.whir.initial_ood_answers[0] = bad_open.whir.initial_ood_answers[0]
+                + bad_open.whir.initial_ood_answers[0];
+            assert!(!verify_committed_cross_bind(&whir, &pubc, &f, &claims, &bad_open, &proof.same));
+        }
+
+        // Tampered commitment root.
+        {
+            let mut badc = pubc.clone();
+            let roots = badc.commitment.roots().to_vec();
+            let mut bad_roots = roots.clone();
+            bad_roots[0][0] = bad_roots[0][0] + Goldilocks::ONE;
+            badc.commitment = zkie_core::pcs::whir::Commitment::from(bad_roots);
+            assert!(!verify_committed_cross_bind(&whir, &badc, &f, &claims, &proof.open_proof, &proof.same));
+        }
+
+        // Tampered same_poly coeff. (SamePolyProof is not Clone: rebuild it
+        // field-by-field with one coeff flipped.)
+        {
+            let mut bad_same = SamePolyProof {
+                coeffs: proof.same.coeffs.clone(),
+                proof: VirtualProof {
+                    rounds: proof.same.proof.rounds.clone(),
+                    final_evals: proof.same.proof.final_evals.clone(),
+                },
+                merged_point: proof.same.merged_point.clone(),
+                merged_eval: proof.same.merged_eval,
+            };
+            bad_same.coeffs[0] = bad_same.coeffs[0] + Goldilocks::ONE;
+            assert!(!verify_committed_cross_bind(&whir, &pubc, &f, &claims, &proof.open_proof, &bad_same));
+        }
     }
 
     #[test]
@@ -2418,6 +2553,261 @@ mod tests {
         assert!(!verify_committed_shard_dag(&bad, &ops, 2, &whir, &proof));
     }
 
+    /// Regression: the committed shard-DAG verifier must only VERIFY transported
+    /// opening proofs — it must never regenerate openings (that is prover work
+    /// requiring `prover_data`), and every transported piece must be bound:
+    /// commitment root, claim evals, the same_poly merge, and the opening proof
+    /// itself. `open_stats`/`verify_stats` are per-`Whir`-instance cells, so the
+    /// assertions are robust to parallel tests.
+    #[test]
+    fn committed_two_shard_verify_never_opens() {
+        use zkie_core::common::field::PrimeCharacteristicRing;
+        use zkie_core::pcs::whir::Whir;
+
+        let mut rng = XorShift64::new(0x2525);
+        let (m, d, shift) = (4usize, 8usize, 8u32);
+        let mut store = Store::new();
+        let x = store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let mut ws = Vec::new();
+        let mut bs = Vec::new();
+        for _ in 0..4 {
+            ws.push(store.push((0..d * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect()));
+            bs.push(store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect()));
+        }
+        let mut outs = Vec::new();
+        let mut rems = Vec::new();
+        for _ in 0..4 {
+            outs.push(store.push(vec![]));
+            rems.push(store.push(vec![]));
+        }
+        let ops = vec![
+            Op::Projection { x, w: ws[0], bias: bs[0], out: outs[0], rem: rems[0], m, k: d, n: d, shift },
+            Op::Projection { x: outs[0], w: ws[1], bias: bs[1], out: outs[1], rem: rems[1], m, k: d, n: d, shift },
+            Op::Projection { x: outs[1], w: ws[2], bias: bs[2], out: outs[2], rem: rems[2], m, k: d, n: d, shift },
+            Op::Projection { x: outs[2], w: ws[3], bias: bs[3], out: outs[3], rem: rems[3], m, k: d, n: d, shift },
+        ];
+
+        let whir = Whir::new_testing(5); // boundary tensor m*d = 32 = 2^5
+        let proof = prove_committed_shard_dag(&mut store, &ops, 2, &whir, &mut rng);
+        assert_eq!(proof.boundary_tensors.len(), 1);
+        let boundary = proof.boundary_tensors[0];
+
+        // The verifier must not produce any opening proof: its open stats stay
+        // flat while its verify stats advance.
+        let opens_before = whir.open_stats();
+        let verifies_before = whir.verify_stats();
+        assert!(verify_committed_shard_dag(&store, &ops, 2, &whir, &proof));
+        assert_eq!(whir.open_stats(), opens_before, "verifier regenerated openings");
+        assert!(whir.verify_stats().0 > verifies_before.0, "verifier made no verify calls");
+
+        // Each tamper starts from an independent re-prove (identical seed ->
+        // identical proof; the store forward pass is deterministic), so no
+        // Clone derive is needed on the proof structs.
+        let reprove = |store: &mut Store| {
+            let mut r = XorShift64::new(0x2525);
+            prove_committed_shard_dag(store, &ops, 2, &whir, &mut r)
+        };
+
+        // Tampered commitment root must be rejected.
+        {
+            let mut p = reprove(&mut store);
+            let roots = p.boundary_commitments[0].commitment.roots().to_vec();
+            let mut bad_roots = roots.clone();
+            bad_roots[0][0] = bad_roots[0][0] + Goldilocks::ONE;
+            p.boundary_commitments[0].commitment = zkie_core::pcs::whir::Commitment::from(bad_roots);
+            assert!(!verify_committed_shard_dag(&store, &ops, 2, &whir, &p),
+                "tampered commitment root accepted");
+        }
+
+        // Tampered claim eval must be rejected.
+        {
+            let mut p = reprove(&mut store);
+            for shard in p.shards.iter_mut() {
+                if let Some(c) = shard.claims.iter_mut().find(|(t, _, _)| *t == boundary) {
+                    c.2 = c.2 + Goldilocks::ONE;
+                }
+            }
+            assert!(!verify_committed_shard_dag(&store, &ops, 2, &whir, &p),
+                "tampered claim eval accepted");
+        }
+
+        // Tampered same_poly merge must be rejected.
+        {
+            let mut p = reprove(&mut store);
+            p.cross_binds[0].coeffs[0] = p.cross_binds[0].coeffs[0] + Goldilocks::ONE;
+            assert!(!verify_committed_shard_dag(&store, &ops, 2, &whir, &p),
+                "tampered same_poly coeff accepted");
+        }
+
+        // Substituting a commitment to a different same-size tensor must be rejected.
+        {
+            let mut p = reprove(&mut store);
+            let g: Vec<Goldilocks> = (0..(1 << 5)).map(|_| rng.field()).collect();
+            let other = zkie_core::pcs::committed::commit_with_points(&whir, &g, 2);
+            p.boundary_commitments[0] = other.to_public();
+            assert!(!verify_committed_shard_dag(&store, &ops, 2, &whir, &p),
+                "substituted commitment accepted");
+        }
+
+        // Tampered transported opening proof (OOD answers are always
+        // transcript-checked) must be rejected.
+        {
+            let mut p = reprove(&mut store);
+            let ood = &mut p.cross_open_proofs[0].whir.initial_ood_answers;
+            ood[0] = ood[0] + ood[0];
+            assert!(!verify_committed_shard_dag(&store, &ops, 2, &whir, &p),
+                "tampered opening proof accepted");
+        }
+
+        // A transported protocol that deviates from the canonical one for
+        // (tensor arity, claim count) must be rejected.
+        {
+            let mut p = reprove(&mut store);
+            p.boundary_commitments[0].protocol = whir.opening_protocol(5, 4);
+            assert!(!verify_committed_shard_dag(&store, &ops, 2, &whir, &p),
+                "non-canonical protocol accepted");
+        }
+    }
+
+    /// Regression: the weight-batch verifier must verify a transported opening,
+    /// never regenerate one from `prover_data`.
+    #[test]
+    fn verify_weight_batch_never_opens() {
+        use zkie_core::common::field::PrimeCharacteristicRing;
+        use zkie_core::pcs::whir::Whir;
+
+        let mut rng = XorShift64::new(0x2626);
+        let n = 1usize << 6;
+        let w: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let whir = Whir::new_testing(6);
+        let batch = commit_weights_batch(&whir, &[&w]);
+        let point: Vec<Goldilocks> = (0..6).map(|_| rng.field()).collect();
+
+        // Prover opens; the (proof, value) pair travels to the verifier, which
+        // only holds the public context.
+        let open = open_weight_batch(&batch, 0, &point);
+        let pub_ctx = batch.to_public();
+        let opens_before = pub_ctx.whir.open_stats();
+        assert!(verify_weight_batch(&pub_ctx, 0, &w, &point, &open));
+        assert_eq!(pub_ctx.whir.open_stats(), opens_before, "verifier regenerated the weight opening");
+
+        // Tampered opened value must be rejected.
+        let mut bad_open = open.clone();
+        bad_open.1 = bad_open.1 + Goldilocks::ONE;
+        assert!(!verify_weight_batch(&pub_ctx, 0, &w, &point, &bad_open));
+
+        // Wrong tensor at the committed index must be rejected.
+        let mut badw = w.clone();
+        badw[0] = badw[0] + Goldilocks::ONE;
+        assert!(!verify_weight_batch(&pub_ctx, 0, &badw, &point, &open));
+    }
+
+    /// Malformed batch metadata must yield `false`, never a panic: upstream
+    /// `verify_at` asserts on protocol/opening-count and index mismatches, so
+    /// these all exercise the pre-verification metadata checks.
+    #[test]
+    fn verify_weight_batch_rejects_malformed_metadata() {
+        use zkie_core::common::field::PrimeCharacteristicRing;
+        use zkie_core::pcs::whir::Whir;
+
+        let mut rng = XorShift64::new(0x2727);
+        let n = 1usize << 6;
+        let w: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let whir = Whir::new_testing(6);
+        let batch = commit_weights_batch(&whir, &[&w]);
+        let point: Vec<Goldilocks> = (0..6).map(|_| rng.field()).collect();
+        let open = open_weight_batch(&batch, 0, &point);
+        let pub_ctx = batch.to_public();
+        assert!(verify_weight_batch(&pub_ctx, 0, &w, &point, &open));
+
+        // Zero table count.
+        let mut zero_tables = batch.to_public();
+        zero_tables.num_tables = 0;
+        assert!(!verify_weight_batch(&zero_tables, 0, &w, &point, &open),
+            "zero num_tables accepted");
+
+        // Out-of-range table index.
+        assert!(!verify_weight_batch(&batch.to_public(), 1, &w, &point, &open),
+            "out-of-range index accepted");
+
+        // Wrong point dimension (arity 5 vs committed arity 6).
+        let short_point: Vec<Goldilocks> = point[..5].to_vec();
+        assert!(!verify_weight_batch(&batch.to_public(), 0, &w, &short_point, &open),
+            "wrong point dimension accepted");
+
+        // Non-canonical transported protocol (two openings per table instead
+        // of one; a one-opening single-table protocol would be canonical).
+        let mut bad_protocol = batch.to_public();
+        bad_protocol.protocol = whir.opening_protocol(6, 2);
+        assert!(!verify_weight_batch(&bad_protocol, 0, &w, &point, &open),
+            "non-canonical protocol accepted");
+
+        // Tensor not power-of-two (63 elements) — rejected before mle::eval.
+        let mut badw = w[..63].to_vec();
+        assert!(!verify_weight_batch(&batch.to_public(), 0, &badw, &point, &open),
+            "non-power-of-two tensor accepted");
+
+        // Tensor of the wrong (but power-of-two) size — rejected before mle::eval.
+        let badw2: Vec<Goldilocks> = (0..(1 << 5)).map(|_| rng.field()).collect();
+        assert!(!verify_weight_batch(&batch.to_public(), 0, &badw2, &point, &open),
+            "wrong-size tensor accepted");
+
+        // num_tables = usize::MAX with an empty point: the batch size overflows
+        // usize on the way to the next power of two and must be rejected, not
+        // panic. Uses a 1-element tensor so the tensor guard (arity 0) passes
+        // and the metadata check is exercised.
+        let one: Vec<Goldilocks> = vec![Goldilocks::ONE];
+        let mut huge = batch.to_public();
+        huge.num_tables = usize::MAX;
+        assert!(!verify_weight_batch(&huge, 0, &one, &[], &open),
+            "overflowing batch size accepted");
+    }
+
+    /// Malformed boundary-path inputs must yield `false`, never a panic:
+    /// empty/non-power-of-two tensors and wrong claim dimensions are rejected
+    /// before `mle::eval` or PCS verification.
+    #[test]
+    fn verify_committed_cross_bind_rejects_malformed_inputs() {
+        use zkie_core::common::field::PrimeCharacteristicRing;
+        use zkie_core::pcs::whir::Whir;
+
+        let mut rng = XorShift64::new(0x2828);
+        let n = 1usize << 6;
+        let f: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let whir = Whir::new_testing(6);
+        let c = zkie_core::pcs::committed::commit_with_points(&whir, &f, 2);
+        let pubc = c.to_public();
+        let p0: Vec<Goldilocks> = (0..6).map(|_| rng.field()).collect();
+        let p1: Vec<Goldilocks> = (0..6).map(|_| rng.field()).collect();
+        let claims = vec![
+            (p0.clone(), mle::eval(&f, &p0)),
+            (p1.clone(), mle::eval(&f, &p1)),
+        ];
+        let proof = committed_cross_bind(&whir, &c, &f, &claims, &mut rng).expect("honest bind");
+        assert!(verify_committed_cross_bind(&whir, &pubc, &f, &claims, &proof.open_proof, &proof.same));
+
+        // Empty tensor.
+        assert!(!verify_committed_cross_bind(&whir, &pubc, &[], &claims, &proof.open_proof, &proof.same),
+            "empty tensor accepted");
+
+        // Non-power-of-two tensor.
+        let f63: Vec<Goldilocks> = f[..63].to_vec();
+        assert!(!verify_committed_cross_bind(&whir, &pubc, &f63, &claims, &proof.open_proof, &proof.same),
+            "non-power-of-two tensor accepted");
+
+        // Wrong claim dimension (arity 5 vs tensor arity 6).
+        let bad_claims = vec![
+            (vec![Goldilocks::ZERO; 5], Goldilocks::ZERO),
+            (vec![Goldilocks::ZERO; 5], Goldilocks::ZERO),
+        ];
+        assert!(!verify_committed_cross_bind(&whir, &pubc, &f, &bad_claims, &proof.open_proof, &proof.same),
+            "wrong claim dimension accepted");
+
+        // Empty claims.
+        assert!(!verify_committed_cross_bind(&whir, &pubc, &f, &[], &proof.open_proof, &proof.same),
+            "empty claims accepted");
+    }
+
     #[test]
     fn global_weights_batch_commit_roundtrip() {
         use zkie_core::common::field::PrimeCharacteristicRing;
@@ -2433,14 +2823,17 @@ mod tests {
         assert_eq!(batch.num_tables, 4);
 
         let point: Vec<Goldilocks> = (0..6).map(|_| rng.field()).collect();
+        let pub_ctx = batch.to_public();
         for (i, w) in weights.iter().enumerate() {
-            assert!(verify_weight_batch(&batch, i, w, &point));
+            let open = open_weight_batch(&batch, i, &point);
+            assert!(verify_weight_batch(&pub_ctx, i, w, &point, &open));
         }
 
         // A wrong tensor at a table index must fail.
         let mut bad = weights[0].clone();
         bad[0] = bad[0] + Goldilocks::ONE;
-        assert!(!verify_weight_batch(&batch, 0, &bad, &point));
+        let open = open_weight_batch(&batch, 0, &point);
+        assert!(!verify_weight_batch(&pub_ctx, 0, &bad, &point, &open));
     }
 
     #[test]
@@ -2466,14 +2859,14 @@ mod tests {
             &x, &w_batch, 0, &bias_batch, 0, &w, &bias, &out, &rem, m, d, d, shift, &mut rng,
         );
         assert!(verify_projection_committed(
-            &proof, &x, &w_batch, 0, &bias_batch, 0, &w, &bias, &out, &rem, m, d, d, shift,
+            &proof, &x, &w_batch.to_public(), 0, &bias_batch.to_public(), 0, &w, &bias, &out, &rem, m, d, d, shift,
         ));
 
         // Wrong weight at the committed index must fail.
         let mut bad_w = w.clone();
         bad_w[0] = bad_w[0] + Goldilocks::ONE;
         assert!(!verify_projection_committed(
-            &proof, &x, &w_batch, 0, &bias_batch, 0, &bad_w, &bias, &out, &rem, m, d, d, shift,
+            &proof, &x, &w_batch.to_public(), 0, &bias_batch.to_public(), 0, &bad_w, &bias, &out, &rem, m, d, d, shift,
         ));
     }
 
