@@ -29,6 +29,13 @@
 //! vertices. The cost is O(N) openings (8 rows x 5 tensors x re+im = 80 WHIR
 //! openings) and the logical size is hard-wired to N = 8. This is a
 //! bridge to `Op::Lookup`, not a scalable lookup argument.
+//!
+//! Dispatch seam: `LookupWitnessN8` / `CommittedLookupStatement` /
+//! `CommittedLookupProof` / `dispatch_prove` / `LookupProofDispatch` form the
+//! integration surface for a future `Op::Lookup` / compose path. That path
+//! emits a typed committed artifact (statement + proof, no witness) and the
+//! verifier dispatches `verify_with_whir` with WHIR only. The seam does NOT
+//! change the fixed N = 8, non-succinct scope of this module.
 
 use crate::extension_lookup_fractional::{gen, to_p3_point};
 use zkie_core::common::field::{EF, Goldilocks, PrimeCharacteristicRing};
@@ -240,6 +247,81 @@ pub fn verify(w: &Whir, stmt: &Statement, proof: &LookupProof) -> bool {
     true
 }
 
+// ==== dispatch seam (Op::Lookup / compose integration point) ====
+//
+// The seam below is the integration surface for future compose paths. A
+// future succinct variant extends the two enums; the verifier call site
+// (`verify_with_whir`) does not change.
+
+/// Fixed-N=8 logical witness for the direct lookup bridge (arrays keep the
+/// logical size exactly 8). Values must be below the Goldilocks modulus.
+#[derive(Clone, Debug)]
+pub struct LookupWitnessN8 {
+    pub indices: [u8; N],
+    pub out: [u64; N],
+    pub table: [u64; N],
+}
+
+impl LookupWitnessN8 {
+    /// Build from slices of logical length exactly 8; any other length or an
+    /// index >= 8 yields `None` (logical N stays exactly 8).
+    pub fn from_slices(indices: &[u8], out: &[u64], table: &[u64]) -> Option<Self> {
+        if indices.len() != N || out.len() != N || table.len() != N {
+            return None;
+        }
+        if indices.iter().any(|&i| i as usize >= N) {
+            return None;
+        }
+        Some(LookupWitnessN8 {
+            indices: indices.try_into().expect("length checked"),
+            out: out.try_into().expect("length checked"),
+            table: table.try_into().expect("length checked"),
+        })
+    }
+}
+
+/// Typed committed lookup statement. One variant per proof system; the
+/// current variant wraps the direct fixed-N=8 statement.
+#[derive(Clone, Debug)]
+pub enum CommittedLookupStatement {
+    DirectN8(Statement),
+}
+
+/// Typed committed lookup proof (statement + proof only — no witness).
+#[derive(Clone)]
+pub enum CommittedLookupProof {
+    DirectN8(LookupProof),
+}
+
+/// Produce a typed committed lookup artifact pair from the fixed-N=8
+/// witness. `None` for a malformed witness (index out of range).
+pub fn dispatch_prove(
+    w: &Whir,
+    wit: &LookupWitnessN8,
+) -> Option<(CommittedLookupStatement, CommittedLookupProof)> {
+    let (s, p) = prove(w, &wit.indices, &wit.out, &wit.table)?;
+    Some((CommittedLookupStatement::DirectN8(s), CommittedLookupProof::DirectN8(p)))
+}
+
+/// Verifier-side dispatch: verify a committed lookup proof against its
+/// statement using WHIR only — no witness, no host recomputation, no `open`
+/// calls. Variant/pairing mismatches return `false`.
+pub trait LookupProofDispatch {
+    fn verify_with_whir(&self, w: &Whir, stmt: &CommittedLookupStatement) -> bool;
+}
+
+impl LookupProofDispatch for CommittedLookupProof {
+    fn verify_with_whir(&self, w: &Whir, stmt: &CommittedLookupStatement) -> bool {
+        match (self, stmt) {
+            (CommittedLookupProof::DirectN8(p), CommittedLookupStatement::DirectN8(s)) => {
+                verify(w, s, p)
+            }
+            // Future variants must pair identically; anything else rejects.
+            _ => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,5 +503,63 @@ mod tests {
             assert_eq!(vtbl, EF::from(Goldilocks::from_u64(table[j])));
             assert_eq!(vtbl, EF::from(Goldilocks::from_u64(out[k])));
         }
+    }
+
+    /// The dispatch seam end-to-end: witness -> dispatched artifact -> witness
+    /// DROPPED -> the verifier accepts from statement + proof only, and never
+    /// opens.
+    #[test]
+    fn dispatch_roundtrip_after_witness_dropped() {
+        let w = Whir::new_target(ARITY, 90, 0).expect("valid arity");
+        let (indices, out, table) = witness();
+        let wit = LookupWitnessN8::from_slices(&indices, &out, &table).expect("valid witness");
+        let (stmt, proof) = dispatch_prove(&w, &wit).expect("dispatch prove");
+        drop(wit); // the verifier holds statement + proof only
+        let before = w.open_stats();
+        assert!(proof.verify_with_whir(&w, &stmt));
+        assert_eq!(w.open_stats(), before, "verifier must never open");
+    }
+
+    /// The witness constructor rejects anything that is not exactly N = 8 or
+    /// contains an out-of-range index.
+    #[test]
+    fn dispatch_witness_slices_validated() {
+        let (indices, out, table) = witness();
+        assert!(LookupWitnessN8::from_slices(&indices, &out, &table).is_some());
+        assert!(LookupWitnessN8::from_slices(&indices[..7], &out, &table).is_none());
+        assert!(LookupWitnessN8::from_slices(&indices, &out[..7], &table).is_none());
+        assert!(LookupWitnessN8::from_slices(&indices, &out, &table[..7]).is_none());
+        let bad = vec![3, 0, 9, 2, 5, 1, 6, 4]; // index 9 out of range
+        assert!(LookupWitnessN8::from_slices(&bad, &out, &table).is_none());
+    }
+
+    /// Cross-witness pairing (statement from witness A, proof from witness
+    /// B) must be rejected: the opening roots no longer match.
+    #[test]
+    fn dispatch_cross_witness_pairing_rejected() {
+        let w = Whir::new_target(ARITY, 90, 0).expect("valid arity");
+        let (i0, o0, t0) = witness();
+        let wit0 = LookupWitnessN8::from_slices(&i0, &o0, &t0).expect("valid witness");
+        let i1 = vec![0, 1, 2, 3, 4, 5, 6, 7];
+        let o1: Vec<u64> = i1.iter().map(|&i| t0[i as usize]).collect();
+        let wit1 = LookupWitnessN8::from_slices(&i1, &o1, &t0).expect("valid witness");
+        let (s0, _) = dispatch_prove(&w, &wit0).expect("dispatch prove");
+        let (_, p1) = dispatch_prove(&w, &wit1).expect("dispatch prove");
+        assert!(!p1.verify_with_whir(&w, &s0));
+    }
+
+    /// A malformed inner proof is rejected through the dispatch (delegation
+    /// to the legacy `verify`).
+    #[test]
+    fn dispatch_malformed_proof_rejected() {
+        let w = Whir::new_target(ARITY, 90, 0).expect("valid arity");
+        let (indices, out, table) = witness();
+        let wit = LookupWitnessN8::from_slices(&indices, &out, &table).expect("valid witness");
+        let (stmt, proof) = dispatch_prove(&w, &wit).expect("dispatch prove");
+        let CommittedLookupProof::DirectN8(mut inner) = proof else {
+            unreachable!("single variant")
+        };
+        inner.rows.pop();
+        assert!(!CommittedLookupProof::DirectN8(inner).verify_with_whir(&w, &stmt));
     }
 }
