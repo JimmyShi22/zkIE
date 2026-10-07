@@ -15,6 +15,16 @@ const DH: usize = 64;
 const LAYERS: usize = 12;
 const N_REAL: usize = 768;
 
+fn peak_rss_kb() -> u64 {
+    let s = fs::read_to_string("/proc/self/status").unwrap_or_default();
+    for line in s.lines() {
+        if let Some(v) = line.strip_prefix("VmHWM:") {
+            return v.trim().trim_end_matches(" kB").parse().unwrap_or(0);
+        }
+    }
+    0
+}
+
 fn load_i32(path: &str) -> Vec<Goldilocks> {
     let bytes = fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     bytes
@@ -217,14 +227,15 @@ fn main() {
         }
 
         println!(
-            "ops_per_shard={} ({} shards, {} cross-binds): prove {:?}, verify {:?}, argmax {}/{}",
+            "ops_per_shard={} ({} shards, {} cross-binds): prove {:?}, verify {:?}, argmax {}/{}, rss={}kB",
             ops_per_shard,
             proof.shards.len(),
             proof.cross_tensors.len(),
             prove_t,
             verify_t,
             matches,
-            m
+            m,
+            peak_rss_kb()
         );
     }
 }

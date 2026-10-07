@@ -9,10 +9,10 @@ path).
 
 | seq | shards | prove | verify | total | argmax |
 | --- | --- | --- | --- | --- | --- |
-| 16 | 13 (per layer) | 20.2 s | 9.3 s | ~29.5 s (0.49 min) | 15/16 |
-| 512 | 13 (per layer) | 35.6 s | 21.9 s | ~57.5 s (0.96 min) | 509/512 |
+| 16 | 13 (per layer) | 20.0 s | 8.8 s | ~28.9 s (0.48 min) | 16/16 |
+| 512 | 13 (per layer) | 34.1 s | 19.5 s | ~53.6 s (0.89 min) | 511/512 |
 
-Peak host memory: **~38 GB RSS** (seq=16), **~43 GB RSS** (seq=512). The memory
+Peak host memory: **~36.9 GB RSS** (seq=16), **~39.3 GB RSS** (seq=512). The memory
 is dominated by the lm_head weights/tables and the verifier's store clone, not
 by the sequence length.
 
@@ -37,7 +37,7 @@ Release build, 64-thread CPU.
 
 | seq | shards | prove | verify | total |
 | --- | --- | --- | --- | --- |
-| 16 | 20 (per layer) | 29.7 s | 11.7 s | ~41.4 s (0.69 min) |
+| 16 | 20 (per layer) | 29.9 s | 11.1 s | ~40.9 s (0.68 min) |
 
 Peak host memory: **~19.5 GB RSS**. Finer granularity (40 shards) is tied
 (~37.6 s); coarser granularity is slower (4 shards ~68.7 s), so the autotuner
@@ -404,8 +404,8 @@ Gemma "1 + gamma" RMSNorm convention.
 
 | seq | shards | prove | verify | total | argmax | peak RSS |
 | --- | --- | --- | --- | --- | --- | --- |
-| 16 | 22 (per layer) | 33.6 s | 16.9 s | ~50.5 s (0.84 min) | 16/16 | ~24.3 GB |
-| 512 | 22 (per layer) | 58.5 s | 38.6 s | ~97.1 s (1.62 min) | 505/512 | ~34.4 GB |
+| 16 | 22 (per layer) | 33.4 s | 16.6 s | ~50.0 s (0.83 min) | 16/16 | ~25.1 GB |
+| 512 | 22 (per layer) | 56.5 s | 36.7 s | ~93.1 s (1.55 min) | 505/512 | ~27.4 GB |
 
 The per-layer granularity (22 shards) is the fastest of the swept
 configurations; coarser granularities (fewer, larger shards) are slower because
@@ -424,8 +424,8 @@ row, so the gate is no longer a trusted constant.
 
 | seq | shards | prove | verify | total | argmax | peak RSS |
 | --- | --- | --- | --- | --- | --- | --- |
-| 16 | 21 (per layer) | 515.2 s | 268.1 s | ~13.1 min | 16/16 | ~124.9 GB |
-| 512 | 28 (per layer, mmap weights) | 1547.3 s | 1065.3 s | ~43.5 min | 512/512 | ~374.4 GB |
+| 16 | 21 (per layer) | 516.5 s | 270.8 s | ~13.1 min | 16/16 | ~124.5 GB |
+| 512 | 28 (per layer, mmap weights) | 1552.5 s | 1081.4 s | ~43.9 min | 512/512 | ~372.2 GB |
 
 Lazy expert opening drops the op count from 20604 (dense) to 14638 at seq=16
 (19854 at seq=512) and peak memory from ~272 GB to ~242 GB at seq=16. At seq=512
