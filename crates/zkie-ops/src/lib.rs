@@ -14,6 +14,7 @@ pub mod non_recursive_two_shard_aggregation;
 pub mod extension_lookup_logup;
 pub mod extension_matmul_committed;
 pub mod extension_projection_committed;
+pub mod extension_layernorm_committed;
 pub mod projection;
 pub mod layer_norm_centered;
 pub mod layernorm_chain;
