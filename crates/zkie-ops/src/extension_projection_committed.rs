@@ -337,3 +337,45 @@ mod tests {
         assert!(ProjectionWhir::new(2, 2, 2, 8, 32, 10).is_none());
     }
 }
+
+use crate::compose::{Op, Store};
+
+/// Op adapter: recognize `Op::Projection` and materialize x/w/bias/out/rem from
+/// a real Store, then run the root-bound committed projection. The challenges
+/// (u/v/ch/pt) live inside the returned proof. No forward recomputation.
+pub fn prove_op_projection(
+    whir: &ProjectionWhir,
+    op: &Op,
+    store: &Store,
+    rng: &mut XorShift64,
+) -> Option<(ProjectionStatement, ProjectionCommittedProof)> {
+    let Op::Projection { x, w, bias, out, rem, m, k, n, shift } = op else {
+        return None;
+    };
+    let xv = store.materialize(*x);
+    let wv = store.materialize(*w);
+    let bv = store.materialize(*bias);
+    let ov = store.materialize(*out);
+    let rv = store.materialize(*rem);
+    if xv.len() != *m * *k
+        || wv.len() != *k * *n
+        || bv.len() != *m * *n
+        || ov.len() != *m * *n
+        || rv.len() != *m * *n
+    {
+        return None;
+    }
+    prove(
+        whir,
+        xv.as_ref(),
+        wv.as_ref(),
+        bv.as_ref(),
+        ov.as_ref(),
+        rv.as_ref(),
+        *m,
+        *k,
+        *n,
+        *shift,
+        rng,
+    )
+}
