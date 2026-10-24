@@ -84,6 +84,7 @@ def main():
     for name in ("cat", "gather", "embedding", "unsqueeze_2", "unsqueeze_4"):
         g2.output.append(helper.make_tensor_value_info(name, TensorProto.FLOAT, None))
     m2 = helper.make_model(g2, opset_imports=m.opset_import)
+    m2.ir_version = 13
     onnx.save(m2, "/tmp/s200_full.onnx")
     sess = ort.InferenceSession("/tmp/s200_full.onnx", providers=["CPUExecutionProvider"])
     names = [o.name for o in m2.graph.output]

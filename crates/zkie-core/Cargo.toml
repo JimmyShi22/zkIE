@@ -21,8 +21,11 @@ p3-poseidon2 = "0.7.0"
 p3-sumcheck = "0.7.0"
 p3-symmetric = "0.7.0"
 p3-util = "0.7.0"
-p3-whir = "0.7.0"
+p3-whir = { path = "vendor/p3-whir" }
 rand = "0.10.1"
+bincode = "1.3.3"
+sha2 = "0.10.9"
+serde = { version = "1.0", features = ["derive"] }
 sppark = { version = "=0.1.15", optional = true }
 
 [build-dependencies]

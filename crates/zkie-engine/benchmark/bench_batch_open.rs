@@ -31,5 +31,8 @@ fn main() {
 
     println!("separate: {n} commit+open = {separate:?}");
     println!("batch:    1 commit_batch + 1 open_batch_multi = {batch:?}");
-    println!("speedup: {:.1}x", separate.as_secs_f64() / batch.as_secs_f64());
+    println!(
+        "speedup: {:.1}x",
+        separate.as_secs_f64() / batch.as_secs_f64()
+    );
 }

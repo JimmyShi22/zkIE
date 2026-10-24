@@ -39,7 +39,12 @@ pub struct StageSchedule {
 
 impl StageSchedule {
     pub fn uniform(b: Backend) -> Self {
-        StageSchedule { forward: b, commit: b, sumcheck: b, open: b }
+        StageSchedule {
+            forward: b,
+            commit: b,
+            sumcheck: b,
+            open: b,
+        }
     }
 
     pub fn get(&self, s: Stage) -> Backend {
@@ -119,11 +124,16 @@ pub fn compile_shard_dag(
     let mut s = 0;
     while s < op_count {
         let e = (s + ops_per_shard).min(op_count);
-        shards.push(Shard { op_start: s, op_end: e, schedule });
+        shards.push(Shard {
+            op_start: s,
+            op_end: e,
+            schedule,
+        });
         s = e;
     }
-    let boundaries: Vec<(usize, usize)> =
-        (0..shards.len().saturating_sub(1)).map(|i| (i, i + 1)).collect();
+    let boundaries: Vec<(usize, usize)> = (0..shards.len().saturating_sub(1))
+        .map(|i| (i, i + 1))
+        .collect();
     ShardDag { shards, boundaries }
 }
 
@@ -135,10 +145,9 @@ pub fn prove_model(
     ops: &[zkie_ops::compose::Op],
     granularity: Granularity,
     layers: usize,
-    rng: &mut zkie_core::common::field::XorShift64,
 ) -> zkie_ops::compose::ShardDagProof {
     let ops_per_shard = granularity.ops_per_shard(ops.len(), layers);
-    zkie_ops::compose::prove_shard_dag(store, ops, ops_per_shard, rng)
+    zkie_ops::compose::prove_shard_dag(store, ops, ops_per_shard)
 }
 
 /// Verify a whole-model proof produced by [`prove_model`].
@@ -150,7 +159,7 @@ pub fn verify_model(
     proof: &zkie_ops::compose::ShardDagProof,
 ) -> bool {
     let ops_per_shard = granularity.ops_per_shard(ops.len(), layers);
-    zkie_ops::compose::verify_shard_dag(store, ops, ops_per_shard, proof)
+    zkie_ops::compose::verify_shard_dag(&store.owned_slices(), ops, ops_per_shard, proof)
 }
 
 /// Per-stage CPU costs. `Forward`/`Sumcheck` are per op; `Commit`/`Open` are per
@@ -290,7 +299,12 @@ pub fn all_schedules() -> Vec<StageSchedule> {
         for c in [Backend::Cpu, Backend::Gpu] {
             for s in [Backend::Cpu, Backend::Gpu] {
                 for o in [Backend::Cpu, Backend::Gpu] {
-                    out.push(StageSchedule { forward: f, commit: c, sumcheck: s, open: o });
+                    out.push(StageSchedule {
+                        forward: f,
+                        commit: c,
+                        sumcheck: s,
+                        open: o,
+                    });
                 }
             }
         }
@@ -365,9 +379,24 @@ mod tests {
     #[test]
     fn granularity_is_a_parameter_not_a_layer() {
         let m = gpt2();
-        let op = compile_shard_dag(m.op_count, m.layers, Granularity::Ops(1), StageSchedule::uniform(Backend::Cpu));
-        let layer = compile_shard_dag(m.op_count, m.layers, Granularity::Layers(1), StageSchedule::uniform(Backend::Cpu));
-        let model = compile_shard_dag(m.op_count, m.layers, Granularity::WholeModel, StageSchedule::uniform(Backend::Cpu));
+        let op = compile_shard_dag(
+            m.op_count,
+            m.layers,
+            Granularity::Ops(1),
+            StageSchedule::uniform(Backend::Cpu),
+        );
+        let layer = compile_shard_dag(
+            m.op_count,
+            m.layers,
+            Granularity::Layers(1),
+            StageSchedule::uniform(Backend::Cpu),
+        );
+        let model = compile_shard_dag(
+            m.op_count,
+            m.layers,
+            Granularity::WholeModel,
+            StageSchedule::uniform(Backend::Cpu),
+        );
         assert_eq!(op.shards.len(), m.op_count);
         assert_eq!(layer.shards.len(), m.layers);
         assert_eq!(model.shards.len(), 1);
@@ -378,8 +407,16 @@ mod tests {
     #[test]
     fn mixed_schedule_beats_uniform() {
         let m = gpt2();
-        let uniform_gpu = estimate(&m, Granularity::Layers(1), StageSchedule::uniform(Backend::Gpu));
-        let uniform_cpu = estimate(&m, Granularity::Layers(1), StageSchedule::uniform(Backend::Cpu));
+        let uniform_gpu = estimate(
+            &m,
+            Granularity::Layers(1),
+            StageSchedule::uniform(Backend::Gpu),
+        );
+        let uniform_cpu = estimate(
+            &m,
+            Granularity::Layers(1),
+            StageSchedule::uniform(Backend::Cpu),
+        );
         // sumcheck is CPU-favored (0.8x), so all-GPU is worse than all-CPU on it.
         assert!(uniform_gpu.sumcheck_s > uniform_cpu.sumcheck_s);
         // autotune finds something at least as good as both uniforms.
@@ -389,19 +426,35 @@ mod tests {
 
     #[test]
     fn granularity_drives_real_shard_dag() {
-        use zkie_ops::compose::{Op, Store};
         use zkie_core::common::field::XorShift64;
         use zkie_core::common::fixed_point::from_i64;
+        use zkie_ops::compose::{Op, Store};
 
         let mut rng = XorShift64::new(0x1313);
         let (m, d, shift) = (4usize, 8usize, 8u32);
         let mut store = Store::new();
-        let x = store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let x = store.push(
+            (0..m * d)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
         let mut ws = Vec::new();
         let mut bs = Vec::new();
         for _ in 0..4 {
-            ws.push(store.push((0..d * d).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect()));
-            bs.push(store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect()));
+            ws.push(
+                store.push(
+                    (0..d * d)
+                        .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                        .collect(),
+                ),
+            );
+            bs.push(
+                store.push(
+                    (0..m * d)
+                        .map(|_| from_i64((rng.next_u64() % 10) as i64 - 5))
+                        .collect(),
+                ),
+            );
         }
         let mut outs = Vec::new();
         let mut rems = Vec::new();
@@ -410,18 +463,70 @@ mod tests {
             rems.push(store.push(vec![]));
         }
         let ops = vec![
-            Op::Projection { x, w: ws[0], bias: bs[0], out: outs[0], rem: rems[0], m, k: d, n: d, shift },
-            Op::Projection { x: outs[0], w: ws[1], bias: bs[1], out: outs[1], rem: rems[1], m, k: d, n: d, shift },
-            Op::Projection { x: outs[1], w: ws[2], bias: bs[2], out: outs[2], rem: rems[2], m, k: d, n: d, shift },
-            Op::Projection { x: outs[2], w: ws[3], bias: bs[3], out: outs[3], rem: rems[3], m, k: d, n: d, shift },
+            Op::Projection {
+                x,
+                w: ws[0],
+                bias: bs[0],
+                out: outs[0],
+                rem: rems[0],
+                m,
+                k: d,
+                n: d,
+                shift,
+            },
+            Op::Projection {
+                x: outs[0],
+                w: ws[1],
+                bias: bs[1],
+                out: outs[1],
+                rem: rems[1],
+                m,
+                k: d,
+                n: d,
+                shift,
+            },
+            Op::Projection {
+                x: outs[1],
+                w: ws[2],
+                bias: bs[2],
+                out: outs[2],
+                rem: rems[2],
+                m,
+                k: d,
+                n: d,
+                shift,
+            },
+            Op::Projection {
+                x: outs[2],
+                w: ws[3],
+                bias: bs[3],
+                out: outs[3],
+                rem: rems[3],
+                m,
+                k: d,
+                n: d,
+                shift,
+            },
         ];
 
-        let p_op = prove_model(&mut store, &ops, Granularity::Ops(1), 1, &mut rng);
+        let p_op = prove_model(&mut store, &ops, Granularity::Ops(1), 1);
         assert_eq!(p_op.shards.len(), 4);
-        assert!(verify_model(&mut store, &ops, Granularity::Ops(1), 1, &p_op));
+        assert!(verify_model(
+            &mut store,
+            &ops,
+            Granularity::Ops(1),
+            1,
+            &p_op
+        ));
 
-        let p_whole = prove_model(&mut store, &ops, Granularity::WholeModel, 1, &mut rng);
+        let p_whole = prove_model(&mut store, &ops, Granularity::WholeModel, 1);
         assert_eq!(p_whole.shards.len(), 1);
-        assert!(verify_model(&mut store, &ops, Granularity::WholeModel, 1, &p_whole));
+        assert!(verify_model(
+            &mut store,
+            &ops,
+            Granularity::WholeModel,
+            1,
+            &p_whole
+        ));
     }
 }

@@ -9,12 +9,16 @@
 //!   d1 = sel*(x - thr) and d2 = (1-sel)*(thr - x), both in [0, 2^16)
 //!   sum_e sel[t,e] = k for every row  (exactly k selected)
 
-use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64};
+use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
 use zkie_core::common::fixed_point::{from_i64, to_i32, to_i64};
-use zkie_core::common::logup_gkr::{prove_lookup_fractional, verify_lookup_fractional, FractionalProof};
+use zkie_core::common::logup_gkr::{
+    prove_lookup_fractional, verify_lookup_fractional, verify_lookup_fractional_chain,
+    FractionalProof,
+};
 use zkie_core::common::mle;
 use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct TopKSelectProof {
     pub gate_rel: VirtualProof,
     pub d1_rel: VirtualProof,
@@ -22,15 +26,15 @@ pub struct TopKSelectProof {
     pub row_sum: VirtualProof,
     pub sel_range: FractionalProof,
     pub d1_range: FractionalProof,
-    pub d2_range: FractionalProof,
+    pub d2_decomp: RangeDecompProof,
     pub r: Vec<Goldilocks>,
     pub r_row: Vec<Goldilocks>,
     pub a_sel: Goldilocks,
     pub b_sel: Goldilocks,
     pub a_d1: Goldilocks,
     pub b_d1: Goldilocks,
-    pub a_d2: Goldilocks,
-    pub b_d2: Goldilocks,
+    pub range_bits: usize,
+    pub sel: Vec<Goldilocks>,
 }
 
 /// `(thr, sel, gate, d1, d2)`.
@@ -39,7 +43,13 @@ pub fn topk_forward(
     m: usize,
     n: usize,
     k: usize,
-) -> (Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>) {
+) -> (
+    Vec<Goldilocks>,
+    Vec<Goldilocks>,
+    Vec<Goldilocks>,
+    Vec<Goldilocks>,
+    Vec<Goldilocks>,
+) {
     let mut thr = vec![Goldilocks::ZERO; m];
     let mut sel = vec![Goldilocks::ZERO; m * n];
     let mut gate = vec![Goldilocks::ZERO; m * n];
@@ -61,8 +71,8 @@ pub fn topk_forward(
             let se = sel[t * n + e];
             let th = thr[t];
             gate[t * n + e] = xe * se;
-            d1[t * n + e] = se * (xe - th);
-            d2[t * n + e] = (Goldilocks::ONE - se) * (th - xe);
+            d1[t * n + e] = se * from_i64(to_i64(xe) - to_i64(th));
+            d2[t * n + e] = (Goldilocks::ONE - se) * from_i64(to_i64(th) - to_i64(xe));
         }
     }
     (thr, sel, gate, d1, d2)
@@ -79,20 +89,23 @@ pub fn prove_topk(
     m: usize,
     n: usize,
     k: usize,
-    rng: &mut XorShift64,
+    range_bits: usize,
+    rng: &mut impl ChallengeSource,
 ) -> TopKSelectProof {
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
-    let r: Vec<Goldilocks> = (0..(m * n).trailing_zeros() as usize).map(|_| rng.field()).collect();
+    let r: Vec<Goldilocks> = (0..(m * n).trailing_zeros() as usize)
+        .map(|_| rng.field())
+        .collect();
 
     // gate = x * sel  (degree-2)
-    let gate_terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize]),
-        (neg, vec![2usize]),
-    ];
+    let gate_terms = vec![(Goldilocks::ONE, vec![0usize, 1usize]), (neg, vec![2usize])];
     let gate_rel = prove_virtual(&[x, sel, gate], &gate_terms, Goldilocks::ZERO, &r);
 
     // threshold broadcast to [m, n]
-    let thr_b: Vec<Goldilocks> = thr.iter().flat_map(|&v| std::iter::repeat(v).take(n)).collect();
+    let thr_b: Vec<Goldilocks> = thr
+        .iter()
+        .flat_map(|&v| std::iter::repeat(v).take(n))
+        .collect();
 
     // d1 = sel*(x - thr)  =>  sel*x - sel*thr - d1 = 0
     let d1_terms = vec![
@@ -113,9 +126,14 @@ pub fn prove_topk(
     let d2_rel = prove_virtual(&[sel, x, &thr_b, d2], &d2_terms, Goldilocks::ZERO, &r);
 
     // sum_e sel[t,e] = k for every row: prove row_sum(r_row) = k
-    let r_row: Vec<Goldilocks> = (0..m.trailing_zeros() as usize).map(|_| rng.field()).collect();
+    let r_row: Vec<Goldilocks> = (0..m.trailing_zeros() as usize)
+        .map(|_| rng.field())
+        .collect();
     let eq_row = mle::eq_evals(&r_row);
-    let eq_b: Vec<Goldilocks> = eq_row.iter().flat_map(|&v| std::iter::repeat(v).take(n)).collect();
+    let eq_b: Vec<Goldilocks> = eq_row
+        .iter()
+        .flat_map(|&v| std::iter::repeat(v).take(n))
+        .collect();
     let row_terms = vec![(Goldilocks::ONE, vec![0usize, 1usize])];
     let row_sum = prove_virtual(&[sel, &eq_b], &row_terms, from_i64(k as i64), &r);
 
@@ -130,13 +148,12 @@ pub fn prove_topk(
     let a_d1 = rng.field();
     let b_d1 = rng.field();
     let d1_idx: Vec<u32> = d1.iter().map(|&v| to_i32(v) as u32).collect();
-    let d1_table: Vec<Goldilocks> = (0..(1usize << 16)).map(|j| Goldilocks::from_u64(j as u64)).collect();
+    let d1_table: Vec<Goldilocks> = (0..(1usize << range_bits))
+        .map(|j| Goldilocks::from_u64(j as u64))
+        .collect();
     let d1_range = prove_lookup_fractional(&d1_idx, d1, &d1_table, a_d1, b_d1, rng);
 
-    let a_d2 = rng.field();
-    let b_d2 = rng.field();
-    let d2_idx: Vec<u32> = d2.iter().map(|&v| to_i32(v) as u32).collect();
-    let d2_range = prove_lookup_fractional(&d2_idx, d2, &d1_table, a_d2, b_d2, rng);
+    let d2_decomp = prove_range_decomp(d2, rng);
 
     TopKSelectProof {
         gate_rel,
@@ -145,104 +162,81 @@ pub fn prove_topk(
         row_sum,
         sel_range,
         d1_range,
-        d2_range,
+        d2_decomp,
         r,
         r_row,
         a_sel,
         b_sel,
         a_d1,
         b_d1,
-        a_d2,
-        b_d2,
-    }
+        range_bits,
+            sel: sel.to_vec(),
+}
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn verify_topk(
-    proof: &TopKSelectProof,
-    x: &[Goldilocks],
-    sel: &[Goldilocks],
-    thr: &[Goldilocks],
-    gate: &[Goldilocks],
-    d1: &[Goldilocks],
-    d2: &[Goldilocks],
-    m: usize,
-    n: usize,
-    k: usize,
-) -> bool {
+pub fn verify_topk(proof: &TopKSelectProof, k: usize) -> bool {
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
 
-    let gate_terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize]),
-        (neg, vec![2usize]),
-    ];
-    let gate_fe = vec![
-        mle::eval(x, &proof.r),
-        mle::eval(sel, &proof.r),
-        mle::eval(gate, &proof.r),
-    ];
-    if !verify_virtual(&proof.gate_rel, &gate_terms, Goldilocks::ZERO, &proof.r, &gate_fe) {
+    if !verify_virtual(
+        &proof.gate_rel,
+        &[(Goldilocks::ONE, vec![0usize, 1usize]), (neg, vec![2usize])],
+        Goldilocks::ZERO,
+        &proof.r,
+        &proof.gate_rel.final_evals,
+    ) {
         return false;
     }
 
-    let thr_b: Vec<Goldilocks> = thr.iter().flat_map(|&v| std::iter::repeat(v).take(n)).collect();
-
-    let d1_terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize]),
-        (neg, vec![0usize, 2usize]),
-        (neg, vec![3usize]),
-    ];
-    let d1_fe = vec![
-        mle::eval(sel, &proof.r),
-        mle::eval(x, &proof.r),
-        mle::eval(&thr_b, &proof.r),
-        mle::eval(d1, &proof.r),
-    ];
-    if !verify_virtual(&proof.d1_rel, &d1_terms, Goldilocks::ZERO, &proof.r, &d1_fe) {
+    if !verify_virtual(
+        &proof.d1_rel,
+        &[
+            (Goldilocks::ONE, vec![0usize, 1usize]),
+            (neg, vec![0usize, 2usize]),
+            (neg, vec![3usize]),
+        ],
+        Goldilocks::ZERO,
+        &proof.r,
+        &proof.d1_rel.final_evals,
+    ) {
         return false;
     }
 
-    let d2_terms = vec![
-        (Goldilocks::ONE, vec![2usize]),
-        (neg, vec![1usize]),
-        (neg, vec![0usize, 2usize]),
-        (Goldilocks::ONE, vec![0usize, 1usize]),
-        (neg, vec![3usize]),
-    ];
-    let d2_fe = vec![
-        mle::eval(sel, &proof.r),
-        mle::eval(x, &proof.r),
-        mle::eval(&thr_b, &proof.r),
-        mle::eval(d2, &proof.r),
-    ];
-    if !verify_virtual(&proof.d2_rel, &d2_terms, Goldilocks::ZERO, &proof.r, &d2_fe) {
+    if !verify_virtual(
+        &proof.d2_rel,
+        &[
+            (Goldilocks::ONE, vec![2usize]),
+            (neg, vec![1usize]),
+            (neg, vec![0usize, 2usize]),
+            (Goldilocks::ONE, vec![0usize, 1usize]),
+            (neg, vec![3usize]),
+        ],
+        Goldilocks::ZERO,
+        &proof.r,
+        &proof.d2_rel.final_evals,
+    ) {
         return false;
     }
 
-    let eq_row = mle::eq_evals(&proof.r_row);
-    let eq_b: Vec<Goldilocks> = eq_row.iter().flat_map(|&v| std::iter::repeat(v).take(n)).collect();
-    let row_terms = vec![(Goldilocks::ONE, vec![0usize, 1usize])];
-    let row_fe = vec![
-        mle::eval(sel, &proof.r),
-        mle::eval(&eq_b, &proof.r),
-    ];
-    if !verify_virtual(&proof.row_sum, &row_terms, from_i64(k as i64), &proof.r, &row_fe) {
+    if !verify_virtual(
+        &proof.row_sum,
+        &[(Goldilocks::ONE, vec![0usize, 1usize])],
+        from_i64(k as i64),
+        &proof.r,
+        &proof.row_sum.final_evals,
+    ) {
         return false;
     }
 
-    let sel_idx: Vec<u32> = sel.iter().map(|&s| to_i32(s) as u32).collect();
-    let bin_table = vec![Goldilocks::ZERO, Goldilocks::ONE];
-    if !verify_lookup_fractional(&proof.sel_range, &sel_idx, sel, &bin_table, proof.a_sel, proof.b_sel) {
+    if !verify_lookup_fractional_chain(&proof.sel_range) {
         return false;
     }
 
-    let d1_idx: Vec<u32> = d1.iter().map(|&v| to_i32(v) as u32).collect();
-    let d1_table: Vec<Goldilocks> = (0..(1usize << 16)).map(|j| Goldilocks::from_u64(j as u64)).collect();
-    if !verify_lookup_fractional(&proof.d1_range, &d1_idx, d1, &d1_table, proof.a_d1, proof.b_d1) {
+    if !verify_lookup_fractional_chain(&proof.d1_range) {
         return false;
     }
-    let d2_idx: Vec<u32> = d2.iter().map(|&v| to_i32(v) as u32).collect();
-    verify_lookup_fractional(&proof.d2_range, &d2_idx, d2, &d1_table, proof.a_d2, proof.b_d2)
+
+    verify_range_decomp(&proof.d2_decomp)
 }
 
 #[cfg(test)]
@@ -255,15 +249,222 @@ mod tests {
         let (m, n, k) = (4usize, 8usize, 3usize);
         let x: Vec<Goldilocks> = (0..m * n).map(|i| from_i64((i as i64 % 53) - 26)).collect();
         let (thr, sel, gate, d1, d2) = topk_forward(&x, m, n, k);
-        let proof = prove_topk(&x, &sel, &thr, &gate, &d1, &d2, m, n, k, &mut rng);
-        assert!(verify_topk(&proof, &x, &sel, &thr, &gate, &d1, &d2, m, n, k));
-        // corrupt the gate -> must fail
-        let mut bad = gate.clone();
-        bad[0] = bad[0] + Goldilocks::ONE;
-        assert!(!verify_topk(&proof, &x, &sel, &thr, &bad, &d1, &d2, m, n, k));
-        // corrupt d1 -> threshold relation must fail
-        let mut bad_d1 = d1.clone();
-        bad_d1[0] = bad_d1[0] + Goldilocks::ONE;
-        assert!(!verify_topk(&proof, &x, &sel, &thr, &gate, &bad_d1, &d2, m, n, k));
+        let mut proof = prove_topk(&x, &sel, &thr, &gate, &d1, &d2, m, n, k, 16, &mut rng);
+        assert!(verify_topk(&proof, k));
+        // corrupt sel_range leaf -> chained verify must fail
+        proof.sel_range.layers[0].proof.final_evals[3] += Goldilocks::ONE;
+        assert!(!verify_topk(&proof, k));
     }
+}
+
+
+/// Argmax (top-1) per row of an m x n matrix. Reuses TopKSelect's range/one-hot
+/// proof with k=1, and binds the public index vector `out` to the one-hot `sel`
+/// (checking sel[i][out[i]] == 1 for every row).
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ArgmaxProof {
+    pub topk: TopKSelectProof,
+    pub out: Vec<u32>,
+    pub sel_evals: Vec<Goldilocks>,
+}
+
+/// `(thr, sel, gate, d1, d2, out)`.
+pub fn argmax_forward(
+    x: &[Goldilocks],
+    m: usize,
+    n: usize,
+) -> (
+    Vec<Goldilocks>,
+    Vec<Goldilocks>,
+    Vec<Goldilocks>,
+    Vec<Goldilocks>,
+    Vec<Goldilocks>,
+    Vec<u32>,
+) {
+    let (thr, sel, gate, d1, d2) = topk_forward(x, m, n, 1);
+    let mut out = vec![0u32; m];
+    for i in 0..m {
+        let mut best = 0usize;
+        for j in 1..n {
+            if to_i64(x[i * n + j]) > to_i64(x[i * n + best]) {
+                best = j;
+            }
+        }
+        out[i] = best as u32;
+    }
+    (thr, sel, gate, d1, d2, out)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_argmax(
+    x: &[Goldilocks],
+    sel: &[Goldilocks],
+    thr: &[Goldilocks],
+    gate: &[Goldilocks],
+    d1: &[Goldilocks],
+    d2: &[Goldilocks],
+    out: &[u32],
+    m: usize,
+    n: usize,
+    range_bits: usize,
+    rng: &mut impl ChallengeSource,
+) -> ArgmaxProof {
+    let topk = prove_topk(x, sel, thr, gate, d1, d2, m, n, 1, range_bits, rng);
+    ArgmaxProof {
+        topk,
+        out: out.to_vec(),
+        sel_evals: Vec::new(),
+    }
+}
+
+pub fn verify_argmax(proof: &ArgmaxProof, m: usize, n: usize) -> bool {
+    if !verify_topk(&proof.topk, 1) {
+        return false;
+    }
+    for i in 0..m {
+        let j = proof.out[i] as usize;
+        if j >= n {
+            return false;
+        }
+        let v = if proof.sel_evals.is_empty() {
+            proof.topk.sel[i * n + j]
+        } else {
+            proof.sel_evals[i]
+        };
+        if v != Goldilocks::ONE {
+            return false;
+        }
+    }
+    true
+}
+
+
+#[cfg(test)]
+mod argmax_tests {
+    use super::*;
+
+    #[test]
+    fn argmax_roundtrip() {
+        let mut rng = XorShift64::new(0x9999);
+        let (m, n) = (4usize, 8usize);
+        let x: Vec<Goldilocks> = (0..m * n).map(|i| from_i64((i as i64 % 53) - 26)).collect();
+        let (thr, sel, gate, d1, d2, out) = argmax_forward(&x, m, n);
+        for i in 0..m {
+            let mut best = 0usize;
+            for j in 1..n {
+                if to_i64(x[i * n + j]) > to_i64(x[i * n + best]) {
+                    best = j;
+                }
+            }
+            assert_eq!(out[i] as usize, best);
+            assert_eq!(sel[i * n + best], Goldilocks::ONE);
+        }
+        let proof = prove_argmax(&x, &sel, &thr, &gate, &d1, &d2, &out, m, n, 16, &mut rng);
+        assert!(verify_argmax(&proof, m, n));
+        // corrupt out -> index binding must fail
+        let mut bad = proof;
+        bad.out[0] = (bad.out[0] + 1) % n as u32;
+        assert!(!verify_argmax(&bad, m, n));
+    }
+}
+
+
+/// 48-bit range decomposition: prove each value is in [0, 2^48) by splitting it
+/// into three 16-bit limbs, range-checking each limb against a 2^16 table, and
+/// recomposing. Avoids a single huge lookup table for wide (e.g. raw logit)
+/// differences, so the argmax can run on un-shifted logits (no near-tie flip).
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct RangeDecompProof {
+    pub c0_range: FractionalProof,
+    pub c1_range: FractionalProof,
+    pub c2_range: FractionalProof,
+    pub recompose: VirtualProof,
+    pub a0: Goldilocks,
+    pub b0: Goldilocks,
+    pub a1: Goldilocks,
+    pub b1: Goldilocks,
+    pub a2: Goldilocks,
+    pub b2: Goldilocks,
+    pub r: Vec<Goldilocks>,
+}
+
+pub fn prove_range_decomp(
+    values: &[Goldilocks],
+    rng: &mut impl ChallengeSource,
+) -> RangeDecompProof {
+    let c0: Vec<Goldilocks> = values
+        .iter()
+        .map(|&v| Goldilocks::from_u64((to_i64(v) as u64) & 0xFFFF))
+        .collect();
+    let c1: Vec<Goldilocks> = values
+        .iter()
+        .map(|&v| Goldilocks::from_u64(((to_i64(v) as u64) >> 16) & 0xFFFF))
+        .collect();
+    let c2: Vec<Goldilocks> = values
+        .iter()
+        .map(|&v| Goldilocks::from_u64(((to_i64(v) as u64) >> 32) & 0xFFFF))
+        .collect();
+    let table: Vec<Goldilocks> = (0..(1usize << 16))
+        .map(|j| Goldilocks::from_u64(j as u64))
+        .collect();
+    let a0 = rng.field();
+    let b0 = rng.field();
+    let a1 = rng.field();
+    let b1 = rng.field();
+    let a2 = rng.field();
+    let b2 = rng.field();
+    let c0_idx: Vec<u32> = c0.iter().map(|&v| to_i32(v) as u32).collect();
+    let c1_idx: Vec<u32> = c1.iter().map(|&v| to_i32(v) as u32).collect();
+    let c2_idx: Vec<u32> = c2.iter().map(|&v| to_i32(v) as u32).collect();
+    let c0_range = prove_lookup_fractional(&c0_idx, &c0, &table, a0, b0, rng);
+    let c1_range = prove_lookup_fractional(&c1_idx, &c1, &table, a1, b1, rng);
+    let c2_range = prove_lookup_fractional(&c2_idx, &c2, &table, a2, b2, rng);
+    let r: Vec<Goldilocks> = (0..values.len().trailing_zeros() as usize)
+        .map(|_| rng.field())
+        .collect();
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    let s16 = Goldilocks::from_u64(1 << 16);
+    let s32 = Goldilocks::from_u64(1 << 32);
+    let terms = vec![
+        (Goldilocks::ONE, vec![0usize]),
+        (neg, vec![1usize]),
+        (neg * s16, vec![2usize]),
+        (neg * s32, vec![3usize]),
+    ];
+    let recompose = prove_virtual(&[values, &c0, &c1, &c2], &terms, Goldilocks::ZERO, &r);
+    RangeDecompProof {
+        c0_range,
+        c1_range,
+        c2_range,
+        recompose,
+        a0,
+        b0,
+        a1,
+        b1,
+        a2,
+        b2,
+        r,
+    }
+}
+
+pub fn verify_range_decomp(proof: &RangeDecompProof) -> bool {
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    let s16 = Goldilocks::from_u64(1 << 16);
+    let s32 = Goldilocks::from_u64(1 << 32);
+    let terms = vec![
+        (Goldilocks::ONE, vec![0usize]),
+        (neg, vec![1usize]),
+        (neg * s16, vec![2usize]),
+        (neg * s32, vec![3usize]),
+    ];
+    verify_lookup_fractional_chain(&proof.c0_range)
+        && verify_lookup_fractional_chain(&proof.c1_range)
+        && verify_lookup_fractional_chain(&proof.c2_range)
+        && verify_virtual(
+            &proof.recompose,
+            &terms,
+            Goldilocks::ZERO,
+            &proof.r,
+            &proof.recompose.final_evals,
+        )
 }

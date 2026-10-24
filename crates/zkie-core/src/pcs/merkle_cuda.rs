@@ -31,9 +31,9 @@ use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
 use crate::pcs::cuda_buffer::SharedBuffer;
 #[cfg(feature = "cuda")]
 use crate::pcs::cuda_ffi::{
-    cudaDeviceSynchronize, cudaMemcpy, cudaMemset, zkie_p2_compress_batch,
-    zkie_p2_compress_scalar, zkie_p2_leaf_batch, zkie_p2_leaf_scalar,
-    zkie_p2_upload_constants, CUDART_OK, MEMCPY_DEVICE_TO_HOST, MEMCPY_HOST_TO_DEVICE,
+    cudaDeviceSynchronize, cudaMemcpy, cudaMemset, zkie_p2_compress_batch, zkie_p2_compress_scalar,
+    zkie_p2_leaf_batch, zkie_p2_leaf_scalar, zkie_p2_upload_constants, CUDART_OK,
+    MEMCPY_DEVICE_TO_HOST, MEMCPY_HOST_TO_DEVICE,
 };
 
 type F = Goldilocks;
@@ -44,7 +44,8 @@ pub type MerkleCompress = TruncatedPermutation<Perm, 2, 8, 16>;
 pub const MERKLE_ARITY: usize = 2;
 pub const DIGEST_ELEMS: usize = 8;
 
-pub type CpuMerkleTreeMmcs = MerkleTreeMmcs<PackedF, PackedF, MerkleHash, MerkleCompress, MERKLE_ARITY, DIGEST_ELEMS>;
+pub type CpuMerkleTreeMmcs =
+    MerkleTreeMmcs<PackedF, PackedF, MerkleHash, MerkleCompress, MERKLE_ARITY, DIGEST_ELEMS>;
 
 /// Round constants derived exactly like `Perm::new_from_rng_128(&mut
 /// SmallRng::seed_from_u64(1))` (8 external + 22 internal rounds), flattened
@@ -55,8 +56,8 @@ pub fn derive_poseidon2_constants() -> ([u64; 4 * 16], [u64; 4 * 16], [u64; 22],
     use p3_poseidon2::ExternalLayerConstants;
     use rand::distr::{Distribution, StandardUniform};
     use rand::rngs::SmallRng;
-    use rand::SeedableRng;
     use rand::RngExt;
+    use rand::SeedableRng;
 
     let mut rng = SmallRng::seed_from_u64(1);
     let external = ExternalLayerConstants::<Goldilocks, 16>::new_from_rng(8, &mut rng);
@@ -100,12 +101,18 @@ impl GpuMerkle {
                 diag15,
             )
         };
-        let rc = if rc == CUDART_OK { unsafe { cudaDeviceSynchronize() } } else { rc };
+        let rc = if rc == CUDART_OK {
+            unsafe { cudaDeviceSynchronize() }
+        } else {
+            rc
+        };
         if rc != CUDART_OK {
             return None;
         }
         Some(Self {
-            arena: SharedBuffer::new(Mutex::new(crate::pcs::cuda_buffer::CudaBuffer::new(1 << 20)?)),
+            arena: SharedBuffer::new(Mutex::new(crate::pcs::cuda_buffer::CudaBuffer::new(
+                1 << 20,
+            )?)),
         })
     }
 }
@@ -171,7 +178,13 @@ impl CudaMerkleTreeMmcs {
         &self,
         gpu: &GpuMerkle,
         m: M,
-    ) -> Result<(MerkleCap<F, [F; DIGEST_ELEMS]>, MerkleTree<F, F, M, MERKLE_ARITY, DIGEST_ELEMS>), M> {
+    ) -> Result<
+        (
+            MerkleCap<F, [F; DIGEST_ELEMS]>,
+            MerkleTree<F, F, M, MERKLE_ARITY, DIGEST_ELEMS>,
+        ),
+        M,
+    > {
         let w = m.width();
         if w == 0 {
             return Err(m);
@@ -217,9 +230,7 @@ impl CudaMerkleTreeMmcs {
         }
         // Padded layer tails must be zero digests (upstream initializes the
         // whole padded layer with the default digest).
-        let rc = unsafe {
-            cudaMemset(d_layers[0], 0, layer_lens[0] * DIGEST_ELEMS * 8)
-        };
+        let rc = unsafe { cudaMemset(d_layers[0], 0, layer_lens[0] * DIGEST_ELEMS * 8) };
         if rc != CUDART_OK {
             return Err(m);
         }
@@ -230,13 +241,7 @@ impl CudaMerkleTreeMmcs {
             return Err(m);
         }
         let rc = unsafe {
-            zkie_p2_leaf_scalar(
-                d_mat,
-                d_layers[0],
-                (batches * 8) as u32,
-                h as u32,
-                w as u32,
-            )
+            zkie_p2_leaf_scalar(d_mat, d_layers[0], (batches * 8) as u32, h as u32, w as u32)
         };
         if rc != CUDART_OK {
             return Err(m);
@@ -244,9 +249,8 @@ impl CudaMerkleTreeMmcs {
 
         for i in 0..layer_lens.len() - 1 {
             let next_len_raw = layer_lens[i] / MERKLE_ARITY;
-            let rc = unsafe {
-                cudaMemset(d_layers[i + 1], 0, layer_lens[i + 1] * DIGEST_ELEMS * 8)
-            };
+            let rc =
+                unsafe { cudaMemset(d_layers[i + 1], 0, layer_lens[i + 1] * DIGEST_ELEMS * 8) };
             if rc != CUDART_OK {
                 return Err(m);
             }
@@ -296,9 +300,7 @@ impl CudaMerkleTreeMmcs {
             }
             let digests: Vec<[F; DIGEST_ELEMS]> = layer
                 .chunks_exact(DIGEST_ELEMS)
-                .map(|c| {
-                    std::array::from_fn(|j| F::new(c[j]))
-                })
+                .map(|c| std::array::from_fn(|j| F::new(c[j])))
                 .collect();
             digest_layers.push(digests);
         }
@@ -361,8 +363,10 @@ impl Mmcs<F> for CudaMerkleTreeMmcs {
         index: usize,
         batch_opening: p3_commit::BatchOpeningRef<'_, F, Self>,
     ) -> Result<(), Self::Error> {
-        let fallback_opening =
-            p3_commit::BatchOpeningRef::new(batch_opening.opened_values, batch_opening.opening_proof);
+        let fallback_opening = p3_commit::BatchOpeningRef::new(
+            batch_opening.opened_values,
+            batch_opening.opening_proof,
+        );
         self.fallback
             .verify_batch(commit, dimensions, index, fallback_opening)
     }

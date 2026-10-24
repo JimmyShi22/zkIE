@@ -6,7 +6,7 @@
 //! `(-P/2, P/2)` the field result is the integer result with no wrap, which is
 //! exactly the condition Goldilocks satisfies for int16 accumulation.
 
-use crate::common::field::{Goldilocks, P, PrimeCharacteristicRing, PrimeField64};
+use crate::common::field::{Goldilocks, PrimeCharacteristicRing, PrimeField64, P};
 
 pub fn from_i16(x: i16) -> Goldilocks {
     if x >= 0 {
@@ -95,10 +95,9 @@ mod tests {
             .zip(&b)
             .fold(0i64, |acc, (&x, &y)| acc + x as i64 * y as i64);
 
-        let field_sum = a
-            .iter()
-            .zip(&b)
-            .fold(Goldilocks::ZERO, |acc, (&x, &y)| acc + from_i16(x) * from_i16(y));
+        let field_sum = a.iter().zip(&b).fold(Goldilocks::ZERO, |acc, (&x, &y)| {
+            acc + from_i16(x) * from_i16(y)
+        });
 
         let as_signed = if field_sum.as_canonical_u64() > i64::MAX as u64 {
             -((P - field_sum.as_canonical_u64()) as i64)

@@ -3,11 +3,11 @@
 //! Proves `H = sum_{x in {0,1}^t} f(x) * h(x)`. Each round polynomial has
 //! degree at most two, so the prover sends three coefficients per round.
 
-use rayon::prelude::*;
 use crate::common::field::{Field, Goldilocks, PrimeCharacteristicRing};
 use crate::common::fixed_point::from_i64;
+use rayon::prelude::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RoundPoly {
     pub c0: Goldilocks,
     pub c1: Goldilocks,
@@ -21,7 +21,7 @@ impl RoundPoly {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SumcheckProof {
     pub rounds: Vec<RoundPoly>,
     pub f_eval: Goldilocks,
@@ -30,7 +30,12 @@ pub struct SumcheckProof {
 
 const INV2: Goldilocks = Goldilocks::new(crate::common::field::P / 2 + 1); // (p + 1) / 2
 
-pub fn prove(f: &[Goldilocks], h: &[Goldilocks], _claimed_sum: Goldilocks, #[allow(unused_variables)] challenges: &[Goldilocks]) -> SumcheckProof {
+pub fn prove(
+    f: &[Goldilocks],
+    h: &[Goldilocks],
+    _claimed_sum: Goldilocks,
+    #[allow(unused_variables)] challenges: &[Goldilocks],
+) -> SumcheckProof {
     let t = f.len().trailing_zeros() as usize;
     assert_eq!(f.len(), 1 << t, "f length must be a power of two");
     assert_eq!(h.len(), f.len());
@@ -85,8 +90,8 @@ fn fold(buf: &mut Vec<Goldilocks>, p: Goldilocks) {
 
 pub fn verify(
     proof: &SumcheckProof,
-    claimed_sum: Goldilocks, #[allow(unused_variables)]
-    challenges: &[Goldilocks],
+    claimed_sum: Goldilocks,
+    #[allow(unused_variables)] challenges: &[Goldilocks],
     f_eval: Goldilocks,
     h_eval: Goldilocks,
 ) -> bool {
@@ -107,7 +112,7 @@ pub fn verify(
 
 /// A degree-3 round polynomial `c0 + c1 x + c2 x^2 + c3 x^3` for the triple
 /// product sum-check `H = sum f(x) g(x) h(x)`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RoundPoly3 {
     pub c0: Goldilocks,
     pub c1: Goldilocks,
@@ -122,7 +127,7 @@ impl RoundPoly3 {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SumcheckProof3 {
     pub rounds: Vec<RoundPoly3>,
     pub f_eval: Goldilocks,
@@ -158,8 +163,8 @@ pub fn prove3(
     f: &[Goldilocks],
     g: &[Goldilocks],
     h: &[Goldilocks],
-    _claimed_sum: Goldilocks, #[allow(unused_variables)]
-    challenges: &[Goldilocks],
+    _claimed_sum: Goldilocks,
+    #[allow(unused_variables)] challenges: &[Goldilocks],
 ) -> SumcheckProof3 {
     let t = f.len().trailing_zeros() as usize;
     assert_eq!(f.len(), 1 << t, "f length must be a power of two");
@@ -205,8 +210,8 @@ pub fn prove3(
 
 pub fn verify3(
     proof: &SumcheckProof3,
-    claimed_sum: Goldilocks, #[allow(unused_variables)]
-    challenges: &[Goldilocks],
+    claimed_sum: Goldilocks,
+    #[allow(unused_variables)] challenges: &[Goldilocks],
     f_eval: Goldilocks,
     g_eval: Goldilocks,
     h_eval: Goldilocks,
@@ -226,10 +231,9 @@ pub fn verify3(
     prev == f_eval * g_eval * h_eval
 }
 
-
 /// Sum-check proof for `H = sum_x sum_i w_i(x) * v_i(x)` (a sum of products of
 /// two multilinears), used by the multi-point-to-one-point batch opening.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SumcheckProofBatch {
     pub rounds: Vec<RoundPoly>,
     pub b_eval: Goldilocks,
@@ -239,8 +243,8 @@ pub struct SumcheckProofBatch {
 pub fn prove_sum_of_products(
     weights: &[Vec<Goldilocks>],
     values: &[Vec<Goldilocks>],
-    claimed_sum: Goldilocks, #[allow(unused_variables)]
-    challenges: &[Goldilocks],
+    claimed_sum: Goldilocks,
+    #[allow(unused_variables)] challenges: &[Goldilocks],
 ) -> SumcheckProofBatch {
     let n = weights.len();
     assert!(n > 0, "empty batch");
@@ -285,8 +289,8 @@ pub fn prove_sum_of_products(
 /// recomputation of `B(r)` from the opened `f_i(r)` values.
 pub fn verify_sum_of_products(
     proof: &SumcheckProofBatch,
-    claimed_sum: Goldilocks, #[allow(unused_variables)]
-    challenges: &[Goldilocks],
+    claimed_sum: Goldilocks,
+    #[allow(unused_variables)] challenges: &[Goldilocks],
     expected_b_eval: Goldilocks,
 ) -> bool {
     if proof.rounds.len() != challenges.len() {
@@ -315,7 +319,10 @@ mod tests {
         let t = 8;
         let f: Vec<Goldilocks> = (0..(1 << t)).map(|_| rng.field()).collect();
         let h: Vec<Goldilocks> = (0..(1 << t)).map(|_| rng.field()).collect();
-        let true_sum: Goldilocks = f.iter().zip(&h).fold(Goldilocks::ZERO, |acc, (&a, &b)| acc + a * b);
+        let true_sum: Goldilocks = f
+            .iter()
+            .zip(&h)
+            .fold(Goldilocks::ZERO, |acc, (&a, &b)| acc + a * b);
         let challenges: Vec<Goldilocks> = (0..t).map(|_| rng.field()).collect();
 
         let proof = prove(&f, &h, true_sum, &challenges);
@@ -345,7 +352,14 @@ mod tests {
         let f_eval = crate::common::mle::eval(&f, &challenges);
         let g_eval = crate::common::mle::eval(&g, &challenges);
         let h_eval = crate::common::mle::eval(&h, &challenges);
-        assert!(verify3(&proof, true_sum, &challenges, f_eval, g_eval, h_eval));
+        assert!(verify3(
+            &proof,
+            true_sum,
+            &challenges,
+            f_eval,
+            g_eval,
+            h_eval
+        ));
 
         let wrong = true_sum + Goldilocks::ONE;
         assert!(!verify3(&proof, wrong, &challenges, f_eval, g_eval, h_eval));
@@ -356,6 +370,7 @@ mod tests {
 /// A sum of products of multilinear polynomials: g(x) = sum_i coeff_i * prod_{j in term_i} f_j(x).
 /// Proves sum_{x in {0,1}^t} g(x) = claimed with a single sumcheck whose round
 /// polynomial has degree max_i |term_i|.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct VirtualProof {
     pub rounds: Vec<Vec<Goldilocks>>,
     pub final_evals: Vec<Goldilocks>,
@@ -416,7 +431,10 @@ pub fn prove_virtual(
         });
     }
     let final_evals = bufs.iter().map(|b| b[0]).collect();
-    VirtualProof { rounds, final_evals }
+    VirtualProof {
+        rounds,
+        final_evals,
+    }
 }
 fn interpolate(vals: &[Goldilocks], x: Goldilocks, d: usize) -> Goldilocks {
     let mut out = Goldilocks::ZERO;
@@ -483,16 +501,26 @@ mod virtual_tests {
             (from_i64(-2), vec![1, 2]),
             (Goldilocks::ONE, vec![0, 1, 2]),
         ];
-        let claimed: Goldilocks = (0..n).map(|i| {
-            Goldilocks::from_u64(3) * f[i] * g[i] + from_i64(-2) * g[i] * h[i] + f[i] * g[i] * h[i]
-        }).sum();
+        let claimed: Goldilocks = (0..n)
+            .map(|i| {
+                Goldilocks::from_u64(3) * f[i] * g[i]
+                    + from_i64(-2) * g[i] * h[i]
+                    + f[i] * g[i] * h[i]
+            })
+            .sum();
         let mles: Vec<&[Goldilocks]> = vec![&f, &g, &h];
         let proof = prove_virtual(&mles, &terms, claimed, &challenges);
         for (m, &ev) in mles.iter().zip(&proof.final_evals) {
             let ev2 = crate::common::mle::eval(m, &challenges);
             assert_eq!(ev, ev2);
         }
-        assert!(verify_virtual(&proof, &terms, claimed, &challenges, &proof.final_evals));
+        assert!(verify_virtual(
+            &proof,
+            &terms,
+            claimed,
+            &challenges,
+            &proof.final_evals
+        ));
         let mut bad = proof.final_evals.clone();
         bad[0] = bad[0] + Goldilocks::ONE;
         assert!(!verify_virtual(&proof, &terms, claimed, &challenges, &bad));
@@ -510,6 +538,12 @@ mod virtual_tests {
         let terms = vec![(Goldilocks::ONE, vec![0usize, 1])];
         let challenges: Vec<Goldilocks> = r.clone();
         let proof = prove_virtual(&mles, &terms, claimed, &challenges);
-        assert!(verify_virtual(&proof, &terms, claimed, &challenges, &proof.final_evals));
+        assert!(verify_virtual(
+            &proof,
+            &terms,
+            claimed,
+            &challenges,
+            &proof.final_evals
+        ));
     }
 }

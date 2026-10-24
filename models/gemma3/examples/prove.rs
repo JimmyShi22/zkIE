@@ -17,18 +17,21 @@ fn load_i32(path: &str) -> Vec<Goldilocks> {
 }
 
 fn main() {
-    let m = std::env::var("GEMMA_SEQ").ok().and_then(|s| s.parse().ok()).unwrap_or(16usize);
+    let m = std::env::var("GEMMA_SEQ")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16usize);
     let dir = "models/gemma3/weights";
     let mut store = Store::new();
     let mut ops = Vec::new();
-    let (_x0, logits) = build_gemma3(&mut store, &mut ops, dir, m, 16);
+    let (_x0, logits, _tokens, _t) = build_gemma3(&mut store, &mut ops, dir, m, 16);
 
     let mut rng = XorShift64::new(0xC0FFEE);
     let t0 = std::time::Instant::now();
-    let proof = prove_shard_dag(&mut store, &ops, 53, &mut rng);
+    let proof = prove_shard_dag(&mut store, &ops, 53);
     let prove_t = t0.elapsed();
     let t1 = std::time::Instant::now();
-    assert!(verify_shard_dag(&mut store, &ops, 53, &proof));
+    assert!(verify_shard_dag(&store.owned_slices(), &ops, 53, &proof));
     let verify_t = t1.elapsed();
 
     let gt = load_i32(&format!("{dir}/gt_argmax_i32.bin"));

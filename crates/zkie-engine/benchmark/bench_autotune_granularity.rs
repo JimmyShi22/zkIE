@@ -5,22 +5,38 @@
 
 use std::time::Instant;
 
-use zkie_ops::compose::{Op, Store};
-use zkie_engine::engine::{prove_model, verify_model, Granularity};
 use zkie_core::common::field::XorShift64;
 use zkie_core::common::fixed_point::from_i64;
+use zkie_engine::engine::{prove_model, verify_model, Granularity};
+use zkie_ops::compose::{Op, Store};
 
 fn main() {
     let mut rng = XorShift64::new(0xBEEF);
     let (m, d, shift, n) = (16usize, 128usize, 8u32, 20usize);
 
     let mut store = Store::new();
-    let x = store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 100) as i64)).collect());
+    let x = store.push(
+        (0..m * d)
+            .map(|_| from_i64((rng.next_u64() % 100) as i64))
+            .collect(),
+    );
     let mut ws = Vec::new();
     let mut bs = Vec::new();
     for _ in 0..n {
-        ws.push(store.push((0..d * d).map(|_| from_i64((rng.next_u64() % 100) as i64)).collect()));
-        bs.push(store.push((0..m * d).map(|_| from_i64((rng.next_u64() % 20) as i64 - 10)).collect()));
+        ws.push(
+            store.push(
+                (0..d * d)
+                    .map(|_| from_i64((rng.next_u64() % 100) as i64))
+                    .collect(),
+            ),
+        );
+        bs.push(
+            store.push(
+                (0..m * d)
+                    .map(|_| from_i64((rng.next_u64() % 20) as i64 - 10))
+                    .collect(),
+            ),
+        );
     }
     let mut outs = Vec::new();
     let mut rems = Vec::new();
@@ -31,7 +47,17 @@ fn main() {
     let mut ops = Vec::with_capacity(n);
     let mut prev = x;
     for i in 0..n {
-        ops.push(Op::Projection { x: prev, w: ws[i], bias: bs[i], out: outs[i], rem: rems[i], m, k: d, n: d, shift });
+        ops.push(Op::Projection {
+            x: prev,
+            w: ws[i],
+            bias: bs[i],
+            out: outs[i],
+            rem: rems[i],
+            m,
+            k: d,
+            n: d,
+            shift,
+        });
         prev = outs[i];
     }
 
@@ -40,10 +66,18 @@ fn main() {
     let mut best = (usize::MAX, std::time::Duration::MAX);
     for &g in &granularities {
         let t0 = Instant::now();
-        let proof = prove_model(&mut store, &ops, Granularity::Ops(g), 1, &mut rng);
+        let proof = prove_model(&mut store, &ops, Granularity::Ops(g), 1);
         let dt = t0.elapsed();
-        assert!(verify_model(&mut store, &ops, Granularity::Ops(g), 1, &proof), "verify failed at {g}");
-        println!("ops_per_shard={:>2}: {:>8.1?}  ({} shards)", g, dt, proof.shards.len());
+        assert!(
+            verify_model(&mut store, &ops, Granularity::Ops(g), 1, &proof),
+            "verify failed at {g}"
+        );
+        println!(
+            "ops_per_shard={:>2}: {:>8.1?}  ({} shards)",
+            g,
+            dt,
+            proof.shards.len()
+        );
         if dt < best.1 {
             best = (g, dt);
         }

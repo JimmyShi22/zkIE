@@ -36,15 +36,40 @@ fn main() {
     let (m, d) = (512usize, 1024usize);
     let shift = 16u32;
     let mut rng = XorShift64::new(0x5678);
-    let q: Vec<Goldilocks> = (0..m * d).map(|_| from_i64((rng.next_u64() % 100) as i64)).collect();
-    let k: Vec<Goldilocks> = (0..m * d).map(|_| from_i64((rng.next_u64() % 100) as i64)).collect();
-    let v: Vec<Goldilocks> = (0..m * d).map(|_| from_i64((rng.next_u64() % 100) as i64)).collect();
+    let q: Vec<Goldilocks> = (0..m * d)
+        .map(|_| from_i64((rng.next_u64() % 100) as i64))
+        .collect();
+    let k: Vec<Goldilocks> = (0..m * d)
+        .map(|_| from_i64((rng.next_u64() % 100) as i64))
+        .collect();
+    let v: Vec<Goldilocks> = (0..m * d)
+        .map(|_| from_i64((rng.next_u64() % 100) as i64))
+        .collect();
     let kt = transpose(&k, m, d);
-    let div_round = |a: i64, b: i64| -> i64 { let q = a.div_euclid(b); let rr = a.rem_euclid(b); if rr * 2 >= b { q + 1 } else { q } };
+    let div_round = |a: i64, b: i64| -> i64 {
+        let q = a.div_euclid(b);
+        let rr = a.rem_euclid(b);
+        if rr * 2 >= b {
+            q + 1
+        } else {
+            q
+        }
+    };
     let scores = matmul(&q, &kt, m, d, m);
-    let sum: Vec<Goldilocks> = (0..m).map(|i| (0..m).fold(from_i64(0), |acc, j| acc + scores[i * m + j])).collect();
-    let probs: Vec<Goldilocks> = (0..m * m).map(|ij| from_i64(div_round(to_i64(scores[ij]) * (1i64 << shift), to_i64(sum[ij / m])))).collect();
-    let rem: Vec<Goldilocks> = (0..m * m).map(|ij| scores[ij] * from_i64(1i64 << shift) - probs[ij] * sum[ij / m]).collect();
+    let sum: Vec<Goldilocks> = (0..m)
+        .map(|i| (0..m).fold(from_i64(0), |acc, j| acc + scores[i * m + j]))
+        .collect();
+    let probs: Vec<Goldilocks> = (0..m * m)
+        .map(|ij| {
+            from_i64(div_round(
+                to_i64(scores[ij]) * (1i64 << shift),
+                to_i64(sum[ij / m]),
+            ))
+        })
+        .collect();
+    let rem: Vec<Goldilocks> = (0..m * m)
+        .map(|ij| scores[ij] * from_i64(1i64 << shift) - probs[ij] * sum[ij / m])
+        .collect();
     let attn = matmul(&probs, &v, m, m, d);
     let qt = transpose(&q, m, d);
     let pt = transpose(&probs, m, m);
@@ -58,9 +83,17 @@ fn main() {
     let sum_claim = zkie_core::common::mle::eval(&sum, &ch9);
     let sum_mles: Vec<&[Goldilocks]> = vec![&eq_b, &scores];
     let sum_terms = vec![(from_i64(1), vec![0usize, 1usize])];
-    let sum_ch: Vec<Goldilocks> = (0..(m * m).trailing_zeros() as usize).map(|_| rng.field()).collect();
+    let sum_ch: Vec<Goldilocks> = (0..(m * m).trailing_zeros() as usize)
+        .map(|_| rng.field())
+        .collect();
     let _sum_p = prove_virtual(&sum_mles, &sum_terms, sum_claim, &sum_ch);
     let dt = t0.elapsed();
-    println!("attention m={} d={} shift={} proving={:.2}s (2 matmul GKR + softmax row-sum)", m, d, shift, dt.as_secs_f64());
+    println!(
+        "attention m={} d={} shift={} proving={:.2}s (2 matmul GKR + softmax row-sum)",
+        m,
+        d,
+        shift,
+        dt.as_secs_f64()
+    );
     let _ = (scores, probs, rem, attn);
 }

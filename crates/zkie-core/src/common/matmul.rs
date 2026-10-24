@@ -8,6 +8,7 @@
 use crate::common::field::{Goldilocks, PrimeCharacteristicRing};
 use crate::{common::mle, common::sumcheck, common::sumcheck::SumcheckProof};
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct MatmulProof {
     pub claimed: Goldilocks,
     pub sumcheck: SumcheckProof,
@@ -44,13 +45,14 @@ pub fn prove(
     MatmulProof { claimed, sumcheck }
 }
 
-pub fn verify(
-    proof: &MatmulProof,
-    challenges: &[Goldilocks],
-    f_eval: Goldilocks,
-    h_eval: Goldilocks,
-) -> bool {
-    sumcheck::verify(&proof.sumcheck, proof.claimed, challenges, f_eval, h_eval)
+pub fn verify(proof: &MatmulProof, challenges: &[Goldilocks]) -> bool {
+    sumcheck::verify(
+        &proof.sumcheck,
+        proof.claimed,
+        challenges,
+        proof.sumcheck.f_eval,
+        proof.sumcheck.h_eval,
+    )
 }
 
 /// Nested matmul reduction: prove `E = (A @ B) @ D` with the intermediate
@@ -58,6 +60,7 @@ pub fn verify(
 /// single-contraction sumchecks: step1 proves `E = C @ D` over `n` and leaves a
 /// claim `C(u, ch_n)`; step2 proves `C = A @ B` over `k` at that same point and
 /// leaves claims on `A` and `B`. Cost is O(n) + O(k) rounds, not O(m*k*n*l).
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct MatmulChainProof {
     pub claimed: Goldilocks,
     pub step1: MatmulProof,
@@ -103,15 +106,11 @@ pub fn verify_chain(
     proof: &MatmulChainProof,
     ch_n: &[Goldilocks],
     ch_k: &[Goldilocks],
-    a_eval: Goldilocks,
-    b_eval: Goldilocks,
-    d_eval: Goldilocks,
 ) -> bool {
-    let c_eval = proof.step2.claimed;
-    if !verify(&proof.step2, ch_k, a_eval, b_eval) {
+    if !verify(&proof.step2, ch_k) {
         return false;
     }
-    verify(&proof.step1, ch_n, c_eval, d_eval)
+    verify(&proof.step1, ch_n)
 }
 
 #[cfg(test)]
@@ -153,11 +152,19 @@ mod tests {
         let c = mm(&a, &b, m, k, n);
         let e = mm(&c, &d, m, n, l);
         let at = transpose(&a, m, k);
-        let u: Vec<Goldilocks> = (0..m.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let l_pt: Vec<Goldilocks> = (0..l.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let ch_n: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let ch_k: Vec<Goldilocks> = (0..k.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let proof = prove_chain(&at, &b, &c, &d, &e, m, k, n, l, &u, &l_pt, &ch_n, &ch_k);
+        let u: Vec<Goldilocks> = (0..m.trailing_zeros() as usize)
+            .map(|_| rng.field())
+            .collect();
+        let l_pt: Vec<Goldilocks> = (0..l.trailing_zeros() as usize)
+            .map(|_| rng.field())
+            .collect();
+        let ch_n: Vec<Goldilocks> = (0..n.trailing_zeros() as usize)
+            .map(|_| rng.field())
+            .collect();
+        let ch_k: Vec<Goldilocks> = (0..k.trailing_zeros() as usize)
+            .map(|_| rng.field())
+            .collect();
+        let mut proof = prove_chain(&at, &b, &c, &d, &e, m, k, n, l, &u, &l_pt, &ch_n, &ch_k);
 
         let mut p_ak = ch_k.clone();
         p_ak.extend_from_slice(&u);
@@ -169,7 +176,8 @@ mod tests {
         p_d.extend_from_slice(&ch_n);
         let d_eval = crate::common::mle::eval(&d, &p_d); // D[ch_n][l_pt]
 
-        assert!(verify_chain(&proof, &ch_n, &ch_k, a_eval, b_eval, d_eval));
-        assert!(!verify_chain(&proof, &ch_n, &ch_k, a_eval, b_eval + Goldilocks::ONE, d_eval));
+        assert!(verify_chain(&proof, &ch_n, &ch_k));
+        proof.step2.claimed = proof.step2.claimed + Goldilocks::ONE;
+        assert!(!verify_chain(&proof, &ch_n, &ch_k));
     }
 }

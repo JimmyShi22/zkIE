@@ -1,0 +1,16 @@
+# Pin the toolchain for everyone who builds this workspace.
+#
+# The workspace crates themselves are edition 2021, but the vendored
+# crates/zkie-core/vendor/p3-merkle-tree (patched into the graph via the
+# [patch.crates-io] entry in Cargo.toml) is edition 2024, and so are the
+# p3-* 0.7.0 crates it depends on. Cargo refuses to even parse such a
+# manifest before Rust 1.85, failing with:
+#
+#   feature `edition2024` is required
+#   ... not stabilized in this version of Cargo (1.79.0 ...)
+#
+# Pinning `stable` here means the failure mode is "rustup selects a suitable
+# toolchain" instead of a confusing manifest parse error on an old default.
+# Keep the floor in sync with the check in .github/workflows/tests.yml.
+[toolchain]
+channel = "stable"

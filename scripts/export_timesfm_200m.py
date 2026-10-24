@@ -34,14 +34,9 @@ FILES = ["pytorch_patched_decoder.py", "timesfm_base.py", "timesfm_torch.py"]
 
 def fetch_sources():
     os.makedirs(SPIKE, exist_ok=True)
-    with urllib.request.urlopen(
-        "https://api.github.com/repos/google-research/timesfm/commits/master",
-        timeout=30,
-    ) as resp:
-        head = json.loads(resp.read().decode())
-    sha = head["sha"]
-    print(f"vendoring google-research/timesfm v1 sources at {sha[:12]}")
-    base = f"https://raw.githubusercontent.com/google-research/timesfm/{sha}/v1/src/timesfm/"
+    sha = "master"
+    print("vendoring google-research/timesfm v1 sources at master")
+    base = "https://cdn.jsdelivr.net/gh/google-research/timesfm@master/v1/src/timesfm/"
     for name in FILES:
         dest = os.path.join(SPIKE, name)
         if os.path.exists(dest):

@@ -27,18 +27,24 @@ fn peak_rss_kb() -> u64 {
 }
 
 fn main() {
-    let m: usize = std::env::var("M").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
-    let shard: usize = std::env::var("SHARD").ok().and_then(|v| v.parse().ok()).unwrap_or(718);
+    let m: usize = std::env::var("M")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
+    let shard: usize = std::env::var("SHARD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(718);
     let dir = "models/deepseek-v2-lite/weights";
     let mut store = Store::new();
     let mut ops = Vec::new();
-    let (_x0, logits) = build_deepseek(&mut store, &mut ops, dir, m, 16);
+    let (_x0, logits, _tokens, _t) = build_deepseek(&mut store, &mut ops, dir, m, 16);
     println!("total ops: {}", ops.len());
 
     let gt = load_i32(&format!("{dir}/gt_argmax_i32.bin"));
     let mut rng = XorShift64::new(0xD5EED);
     let t0 = std::time::Instant::now();
-    let proof = prove_shard_dag(&mut store, &ops, shard, &mut rng);
+    let proof = prove_shard_dag(&mut store, &ops, shard);
     let prove_t = t0.elapsed();
 
     let lg = store.get(logits);
@@ -66,7 +72,10 @@ fn main() {
     let _ = std::io::stdout().flush();
     if std::env::var("VERIFY").is_ok() {
         let t1 = std::time::Instant::now();
-        assert!(verify_shard_dag(&mut store, &ops, shard, &proof), "verify failed");
+        assert!(
+            verify_shard_dag(&store.owned_slices(), &ops, shard, &proof),
+            "verify failed"
+        );
         println!("verify {:?}", t1.elapsed());
         let _ = std::io::stdout().flush();
     }

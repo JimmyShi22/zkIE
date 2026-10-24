@@ -8,6 +8,7 @@ license = "Apache-2.0"
 [dependencies]
 zkie-core = { path = "../../crates/zkie-core" }
 zkie-ops = { path = "../../crates/zkie-ops" }
+bincode = "1.3"
 
 [dev-dependencies]
 zkie-engine = { path = "../../crates/zkie-engine" }

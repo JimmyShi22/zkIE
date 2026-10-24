@@ -55,3 +55,22 @@ mod tests {
         }
     }
 }
+/// A deterministic challenge source (Fiat-Shamir). Both the test PRNG
+/// `XorShift64` and the SHA-256 `Transcript` implement this, so prove/verify
+/// can be generic over the challenge source.
+pub trait ChallengeSource {
+    fn field(&mut self) -> Goldilocks;
+    fn next_u64(&mut self) -> u64;
+    fn field_vec(&mut self, n: usize) -> Vec<Goldilocks> {
+        (0..n).map(|_| self.field()).collect()
+    }
+}
+
+impl ChallengeSource for XorShift64 {
+    fn field(&mut self) -> Goldilocks {
+        XorShift64::field(self)
+    }
+    fn next_u64(&mut self) -> u64 {
+        XorShift64::next_u64(self)
+    }
+}

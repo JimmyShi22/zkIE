@@ -213,6 +213,74 @@ impl<F: Clone + Send + Sync, W: Clone, M: Matrix<F>, const N: usize, const DIGES
         }
     }
 
+    fn read_le_u64(bytes: &[u8], pos: &mut usize) -> u64 {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&bytes[*pos..*pos + 8]);
+        *pos += 8;
+        u64::from_le_bytes(b)
+    }
+
+    /// Serialize only the digest layers and the arity schedule (skipping the
+    /// leaves) as a flat, fixed little-endian byte stream. Leaves are rebuilt
+    /// from the source matrices on restore, so they are never written.
+    pub fn write_digest_layers(&self) -> Vec<u8>
+    where
+        W: Copy,
+    {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(self.digest_layers.len() as u64).to_le_bytes());
+        for layer in &self.digest_layers {
+            out.extend_from_slice(&(layer.len() as u64).to_le_bytes());
+        }
+        for &arity in &self.arity_schedule {
+            out.extend_from_slice(&(arity as u64).to_le_bytes());
+        }
+        for layer in &self.digest_layers {
+            let byte_len = layer.len() * core::mem::size_of::<[W; DIGEST_ELEMS]>();
+            let bytes =
+                unsafe { core::slice::from_raw_parts(layer.as_ptr() as *const u8, byte_len) };
+            out.extend_from_slice(bytes);
+        }
+        out
+    }
+
+    /// Read a tree serialized by [`Self::write_digest_layers`], with an empty
+    /// `leaves` vector (they are rebuilt by the caller from source matrices).
+    pub fn read_digest_layers(bytes: &[u8], leaves: Vec<M>) -> Self
+    where
+        W: Copy,
+    {
+        let mut pos = 0usize;
+        let num_layers = Self::read_le_u64(bytes, &mut pos) as usize;
+        let mut layer_lens = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            layer_lens.push(Self::read_le_u64(bytes, &mut pos) as usize);
+        }
+        let mut arity_schedule = Vec::with_capacity(num_layers.saturating_sub(1));
+        for _ in 0..num_layers.saturating_sub(1) {
+            arity_schedule.push(Self::read_le_u64(bytes, &mut pos) as usize);
+        }
+        let mut digest_layers = Vec::with_capacity(num_layers);
+        for &len in &layer_lens {
+            let byte_len = len * core::mem::size_of::<[W; DIGEST_ELEMS]>();
+            let layer = unsafe {
+                core::slice::from_raw_parts(
+                    bytes[pos..pos + byte_len].as_ptr() as *const [W; DIGEST_ELEMS],
+                    len,
+                )
+                .to_vec()
+            };
+            pos += byte_len;
+            digest_layers.push(layer);
+        }
+        Self::from_parts(leaves, digest_layers, arity_schedule)
+    }
+
+    /// Borrow the committed leaf matrices (used to rebuild geometry on restore).
+    pub fn leaves(&self) -> &[M] {
+        &self.leaves
+    }
+
     /// Return the root digest of the tree.
     #[must_use]
     pub fn root(&self) -> Hash<F, W, DIGEST_ELEMS>

@@ -2,9 +2,9 @@
 //! global work-stealing pool so nested parallelism (parallel proof across layers
 //! calling parallel matmul inside) does not oversubscribe.
 
+use rayon::prelude::*;
 use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing};
 use zkie_core::common::fixed_point::{from_i64, to_i64};
-use rayon::prelude::*;
 
 /// Row-parallel matrix multiplication over the `Goldilocks` field. This is the
 /// general, always-correct path (used by tests and any non-fixed-point tensor).
@@ -50,10 +50,21 @@ pub fn mm_par_fixed(
 
     // The i64 accumulation is exact only if the worst-case dot product fits in
     // i64: max|a| * max|b| * k < 2^63. Otherwise fall back to the field path.
-    let max_a = a.iter().map(|&v| to_i64(v).unsigned_abs()).max().unwrap_or(0) as i128;
-    let max_b = b.iter().map(|&v| to_i64(v).unsigned_abs()).max().unwrap_or(0) as i128;
+    let max_a = a
+        .iter()
+        .map(|&v| to_i64(v).unsigned_abs())
+        .max()
+        .unwrap_or(0) as i128;
+    let max_b = b
+        .iter()
+        .map(|&v| to_i64(v).unsigned_abs())
+        .max()
+        .unwrap_or(0) as i128;
     if max_a * max_b * (k as i128) >= (1i128 << 63) {
-        eprintln!("[mm_par_fixed] overflow fallback to field (m={} k={} n={}, max_a={} max_b={})", m, k, n, max_a, max_b);
+        eprintln!(
+            "[mm_par_fixed] overflow fallback to field (m={} k={} n={}, max_a={} max_b={})",
+            m, k, n, max_a, max_b
+        );
         return mm_par(a, b, m, k, n, 64);
     }
 

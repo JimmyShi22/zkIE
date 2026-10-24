@@ -1,3 +1,37 @@
+# Current committed-path results (2026-10-24)
+
+Measured on a 128-vCPU Alibaba Cloud machine with `-C target-cpu=native` and
+64 Rayon threads. The GPT-2 and Gemma 3 rows use the checked-in real
+prompt+response vectors. `-` means the value was not measured in this run.
+
+| Model | Seq | Commit | Prove | Verify | Argmax | Peak RSS | Proof |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| TimesFM 1.0 200M | 16 | 12.4 s | 104.8 s | 3.2 s | - | ~21.6 GB | ~114.6 MB |
+| GPT-2 124M | 16 | 10.8 s | 82.3 s | 0.6 s | 16/16 | ~24.7 GB | ~20.8 MB |
+| GPT-2 124M | 512 | 18.7 s | 418.0 s | 2.8 s | 512/512 | ~43.5 GB | ~96.1 MB |
+| Gemma 3 270M | 16 | 22.3 s | 218.4 s | 1.6 s | 16/16 | ~60.3 GB | ~42.5 MB |
+| Gemma 3 270M | 512 | 30.5 s | 2348.3 s | 4.3 s | 512/512 | ~87.4 GB | ~130.2 MB |
+| DeepSeek-V2-Lite* | 16 | 79.3 s | 651.8 s | 3.6 s | 16/16 | ~156.6 GB | ~96.0 MB |
+| DeepSeek-V2-Lite* | 512 | 88.3 s | 8329.0 s | 11.0 s | 511/512 | ~389 GB | ~224.8 MB |
+
+`*` DeepSeek rows are ported from the `verify-no-forward` 64-thread CPU
+baseline and have not been rerun with the native build.
+
+The sections below are historical measurements from earlier paths and dates;
+they are retained for design history rather than current performance claims.
+
+### DeepSeek-V2-Lite committed-path seq512 and argmax baseline
+
+The latest `verify-no-forward` run uses the committed store-free
+`bench_committed` path, 12 expert-major MoE shards, mmap weights, and the real
+prompt plus greedy response.
+
+The committed `gt_argmax_512_i32.bin` is the fixed-point reference from
+`scripts/fp_deepseek.py`, which mirrors the Rust prover. Comparing the Rust
+fixed-point model against the float HF argmax from `scripts/gen_ds_real.py`
+gives 286/512; this is the fixed-point versus fp32 fidelity gap, not a prover
+bug. Comparing against the fixed-point reference gives 511/512.
+
 ## GPT-2 512 full model (op-primitive shard DAG, GKR + logUp) (2026-10-01)
 
 Real GPT-2 (12 layers, 12 heads, pre-norm, real weights, lm_head), sequence
@@ -435,3 +469,146 @@ demand), so the kernel pages them in/out instead of keeping them resident. That
 lets the full 64-thread pool run without OOM, cutting prove from ~77 min (8
 threads) to ~26.5 min. `verify` recomputes the witness in-place (no store clone), so it no longer
 doubles memory.
+
+
+## Store-free verification (P0-P4) (2026-10-22)
+
+The verifier no longer re-runs the forward pass and reads no Store / witness.
+Challenges are derived from a Fiat-Shamir transcript, each op verifier uses the
+claimed evaluations written into the proof, and the entry points take only
+(statement, lookup tables, proof bytes). The plain `verify_shard_dag` /
+`verify_shard_dag_bytes` path is functionally store-free; full soundness against
+a lying prover is the committed path (`prove_committed_shard_dag` /
+`verify_committed_shard_dag`, P3), which verifies WHIR openings for weights and
+shard boundaries. That committed verifier is root-only: it holds only the
+commitment roots and the WHIR opening proofs shipped in the proof, never the
+committed tensor data. It is covered by the store-free soundness unit tests
+(tampered boundary / weight / opening all rejected).
+
+Release build, 64-thread CPU. Same per-layer shard granularities as the
+op-primitive rows above.
+
+| model | seq | shards | prove | verify | total | argmax | peak RSS |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| TimesFM 1.0 200M | 16 | 108 ops/shard | 14.9 s | 2.9 s | ~17.8 s | - | ~17.3 GB |
+| GPT-2 124M | 16 | 13 (per layer) | 11.8 s | 4.8 s | ~16.6 s | 16/16 | - |
+| GPT-2 124M | 512 | 13 (per layer) | 26.5 s | 6.3 s | ~32.8 s | 511/512 | - |
+| Gemma 3 270M | 16 | 22 (per layer) | 16.8 s | 4.7 s | ~21.5 s | 16/16 | ~37.1 GB |
+| Gemma 3 270M | 512 | 22 (per layer) | 40.5 s | 11.1 s | ~51.6 s | 505/512 | ~35.4 GB |
+
+Store-free verification drops verify time 3-6x versus the forward-recompute
+path above (GPT-2 512 verify 19.4 s -> 6.3 s; Gemma 3 512 verify 35.7 s ->
+11.1 s), because the verifier no longer recomputes the witness. Prove time also
+improved on this branch via batch LogUp / batch opening (GPT-2 512 prove
+47.8 s -> 26.5 s; Gemma 3 512 prove 73.0 s -> 40.5 s). Peak RSS for Gemma 3
+rose (~25.6 -> ~37.1 GB at seq=16) and is tracked as a follow-up.
+
+## DeepSeek-V2-Lite MoE (expert-major) (2026-10-23)
+
+The MoE FFN is rewritten from dense (all 64 routed experts computed over every
+token, then `ScaleGate`-masked) to expert-major: `scatter -> per-expert dense
+segments -> weighted gather`, cutting the proof domain from ~64*m to ~6*m
+(top-6). Per-position expert weights go through a streaming `GatherMatMul`
+(eq-selector sumcheck + linear-combination binding over N_ROUTED experts), so
+the S x H x MOE_PAD weight gather is never materialized.
+
+Release build, 64-thread CPU. Random-input baseline: argmax at seq=512 is
+510/512 (two near-ties in the fixed-point logits). The argmax near-tie
+range-decomposition is now wired for DeepSeek; the real-input run below
+reports 511/512.
+
+| model | seq | shards | prove | verify | argmax | peak RSS |
+| --- | --- | --- | --- | --- | --- | --- |
+| DeepSeek-V2-Lite | 16 | 12 | 322.8 s | 55.6 s | 16/16 | ~141 GB |
+| DeepSeek-V2-Lite | 512 | 12 | 5602 s | 72.7 s | 510/512 | ~209 GB |
+
+
+## Gemma 3 real-input sequence certification (2026-10-23)
+
+Real prompt + greedy autoregressive response (teacher-forced), generated by
+`scripts/gen_gemma_real.py` (GemmaTokenizer via `HF_TOKEN` + `AutoModelForCausalLM`
+from the local safetensors). Real text has no near-tie, so argmax fully aligns:
+the random-token-id 505/512 becomes 512/512.
+
+| model | seq | prove | verify | argmax |
+| --- | --- | --- | --- | --- |
+| Gemma 3 270M | 16 | 42.2 s | 44.7 s | 16/16 |
+| Gemma 3 270M | 512 | 154.9 s | 113.0 s | 512/512 |
+
+## DeepSeek-V2-Lite real-input sequence certification (2026-10-23)
+
+Real prompt + greedy autoregressive response (teacher-forced), generated by
+`scripts/gen_ds_real.py` (DeepSeek tokenizer via `HF_TOKEN` +
+`AutoModelForCausalLM`), with the embedding (`scripts/gen_ds_x0.py`) and RoPE
+(`scripts/gen_ds_rope.py`) tables regenerated for the sequence length. The
+fixed-point ground-truth argmax comes from `scripts/fp_deepseek.py`: the float
+transformers reference only reaches 5/16 on seq=16, while the fixed-point
+reference matches 16/16.
+
+Measured on `b2ddac3`, release build, 64-thread CPU, 12 shards (expert-major).
+
+| model | seq | prove | verify | argmax | peak RSS |
+| --- | --- | --- | --- | --- | --- |
+| DeepSeek-V2-Lite | 16 | 358.7 s | 55.5 s | 16/16 | ~143 GB |
+| DeepSeek-V2-Lite | 512 | 5640.0 s | 72.1 s | 511/512 | ~207 GB |
+
+## GPT-2 124M real-input sequence certification (2026-10-23)
+
+Real prompt + greedy autoregressive response (teacher-forced), generated by
+`scripts/extract_gpt2.py`. Real text has no near-tie, so argmax fully aligns:
+seq=16 is 16/16 and seq=512 is 512/512 (the random-token 511/512 near-tie is
+gone).
+
+Release build, 64-thread CPU, 13 shards (per layer), plain store-free path
+(`prove_shard_dag` / `verify_shard_dag`).
+
+| model | seq | prove | verify | argmax | peak RSS |
+| --- | --- | --- | --- | --- | --- |
+| GPT-2 124M | 16 | 17.4 s | 14.4 s | 16/16 | ~31.3 GB |
+| GPT-2 124M | 512 | 49.4 s | 26.7 s | 512/512 | ~29.6 GB |
+
+## DeepSeek-V2-Lite committed-path seq512 + argmax baseline note (2026-10-24)
+
+Committed store-free path (`bench_committed`), 64-thread CPU, 12 shards
+(expert-major MoE, mmap weights), real prompt + greedy response.
+
+| model | seq | commit | prove | verify | argmax | peak RSS | proof size |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| DeepSeek-V2-Lite | 512 | ~88.3 s | ~8329 s (~2.31 h) | ~11.0 s | 511/512 | ~389 GB | ~224.8 MB |
+
+Argmax baseline: the ground-truth argmax is the **fixed-point reference**
+(`scripts/fp_deepseek.py`, which mirrors the Rust prover), not the float
+transformers argmax. Comparing the Rust fixed-point model against the float
+HF argmax (`scripts/gen_ds_real.py`) gives ~286/512 — that is the fixed-point
+vs fp32 fidelity gap, not a prover bug. Comparing against the fixed-point
+reference gives 511/512. The `gt_argmax_512_i32.bin` committed here is the
+fixed-point reference; `fp_deepseek.py` now writes the per-seq suffix so it no
+longer clobbers the float-generated file.
+
+## DeepSeek-V2-Lite seq512 real prompt/response content (2026-10-24)
+
+The committed `tokens_i32.bin` (512 tokens) is:
+
+- **prompt**: `"The sky is"` = 3 tokens `[549, 9539, 317]` (`The` / ` sky` / ` is`)
+- **response**: 509 tokens of greedy autoregressive generation (HF DeepSeek model)
+
+The greedy response degenerates into a repeating loop. Representative excerpt
+(full decode ~1.9 KB):
+
+    The sky is the limit for the future of the 2017-18 season.
+    The 2017-18 season is the first season of the new NHL.
+    The NHL is the most popular sport in the world.
+    ...
+    The average salary is $100 million for a player in a Major League Baseball team.
+    The average salary is $100 million for a player in a Major League Soccer team.
+    The average salary is $100 million for a player in a Major League Hockey team.
+    ... (the "Baseball / Soccer / Hockey" cycle repeats until token 512)
+
+The 512th token ends mid-sentence at `"... Major League Baseball"` (last token
+id `46555` = `"Baseball"`), missing the trailing `" team."`.
+
+Why this matters: the repetitive loop makes every next-token prediction a
+near-tie among `Baseball / Soccer / Hockey / team`, so small fixed-point
+quantization errors flip the argmax. This is the direct cause of the
+fixed-point-vs-fp32 argmax being ~286/512 (the fixed-point-reference argmax is
+511/512).

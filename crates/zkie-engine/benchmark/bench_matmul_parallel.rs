@@ -5,13 +5,7 @@ use std::time::Instant;
 use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64};
 use zkie_core::common::fixed_point::from_i64;
 
-fn mm_naive(
-    a: &[Goldilocks],
-    b: &[Goldilocks],
-    m: usize,
-    k: usize,
-    n: usize,
-) -> Vec<Goldilocks> {
+fn mm_naive(a: &[Goldilocks], b: &[Goldilocks], m: usize, k: usize, n: usize) -> Vec<Goldilocks> {
     let mut c = vec![Goldilocks::ZERO; m * n];
     for i in 0..m {
         for j in 0..n {
@@ -62,8 +56,12 @@ fn main() {
     // GPT-2 FFN matmul: 512 x 1024 x 4096 (the biggest matmul in the layer).
     let (m, k, n) = (512usize, 1024usize, 4096usize);
     let mut rng = XorShift64::new(0x0DE1);
-    let a: Vec<Goldilocks> = (0..m * k).map(|_| from_i64((rng.next_u64() % 100) as i64)).collect();
-    let b: Vec<Goldilocks> = (0..k * n).map(|_| from_i64((rng.next_u64() % 100) as i64)).collect();
+    let a: Vec<Goldilocks> = (0..m * k)
+        .map(|_| from_i64((rng.next_u64() % 100) as i64))
+        .collect();
+    let b: Vec<Goldilocks> = (0..k * n)
+        .map(|_| from_i64((rng.next_u64() % 100) as i64))
+        .collect();
 
     let t0 = Instant::now();
     let c1 = mm_naive(&a, &b, m, k, n);

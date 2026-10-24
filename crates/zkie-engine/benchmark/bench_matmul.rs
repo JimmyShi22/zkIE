@@ -32,7 +32,7 @@ fn main() {
     let mut h_point = v.clone();
     h_point.extend_from_slice(&challenges);
     let h_eval = mle::eval(&b, &h_point);
-    assert!(matmul::verify(&proof, &challenges, f_eval, h_eval));
+    assert!(matmul::verify(&proof, &challenges));
 
     let gkr_field_ops = m * k + k * n + 6 * k;
     let halo2_rows = m * n * (k + 184);
@@ -40,7 +40,10 @@ fn main() {
     println!("matmul m={m} k={k} n={n}");
     println!("gkr_proof_field_ops={gkr_field_ops}");
     println!("halo2_rows={halo2_rows}");
-    println!("halo2_over_gkr_ratio={:.1}", halo2_rows as f64 / gkr_field_ops as f64);
+    println!(
+        "halo2_over_gkr_ratio={:.1}",
+        halo2_rows as f64 / gkr_field_ops as f64
+    );
     println!("gkr_prove_wall_secs={prove_secs:.4}");
 }
 

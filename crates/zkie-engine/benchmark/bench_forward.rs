@@ -23,7 +23,9 @@ fn main() {
     assert_eq!(lm_head_w.len(), k * n);
 
     // A synthetic activation (h_final) of the right shape.
-    let a: Vec<Goldilocks> = (0..m * k).map(|i| from_i32((i % 997) as i32 - 500)).collect();
+    let a: Vec<Goldilocks> = (0..m * k)
+        .map(|i| from_i32((i % 997) as i32 - 500))
+        .collect();
 
     for run in 0..3 {
         let t = Instant::now();
@@ -35,6 +37,11 @@ fn main() {
         let t = Instant::now();
         let c = mm_par_fixed(&a, &lm_head_w, m, k, n);
         let dt = t.elapsed();
-        println!("lm_head mm_par_fixed (i64) run {}: {:?} ({} elements)", run, dt, c.len());
+        println!(
+            "lm_head mm_par_fixed (i64) run {}: {:?} ({} elements)",
+            run,
+            dt,
+            c.len()
+        );
     }
 }

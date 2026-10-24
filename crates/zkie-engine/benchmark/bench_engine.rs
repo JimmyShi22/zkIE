@@ -1,4 +1,6 @@
-use zkie_engine::engine::{autotune, Backend, Granularity, Model, StageCosts, StageSchedule, GpuSpeedup, estimate};
+use zkie_engine::engine::{
+    autotune, estimate, Backend, GpuSpeedup, Granularity, Model, StageCosts, StageSchedule,
+};
 
 fn main() {
     let gpt2 = Model {
@@ -27,8 +29,16 @@ fn main() {
     ];
 
     println!("GPT-2 512 autotuning (granularity x per-stage schedule):");
-    let uniform_cpu = estimate(&gpt2, Granularity::Layers(1), StageSchedule::uniform(Backend::Cpu));
-    let uniform_gpu = estimate(&gpt2, Granularity::Layers(1), StageSchedule::uniform(Backend::Gpu));
+    let uniform_cpu = estimate(
+        &gpt2,
+        Granularity::Layers(1),
+        StageSchedule::uniform(Backend::Cpu),
+    );
+    let uniform_gpu = estimate(
+        &gpt2,
+        Granularity::Layers(1),
+        StageSchedule::uniform(Backend::Gpu),
+    );
     println!("  uniform cpu: {}", uniform_cpu);
     println!("  uniform gpu: {}", uniform_gpu);
 

@@ -1,18 +1,28 @@
 use std::time::Instant;
-use zkie_core::pcs::committed::commit;
 use zkie_core::common::field::{Goldilocks, XorShift64};
 use zkie_core::common::fixed_point::from_i64;
+use zkie_core::pcs::committed::commit;
 use zkie_core::pcs::whir::Whir;
 
 fn main() {
     let (m, k, n) = (512usize, 1024usize, 1024usize);
     let shift = 16u32;
     let mut rng = XorShift64::new(0xABCD);
-    let x: Vec<Goldilocks> = (0..m * k).map(|_| from_i64((rng.next_u64() % 100) as i64)).collect();
-    let w: Vec<Goldilocks> = (0..k * n).map(|_| from_i64((rng.next_u64() % 100) as i64)).collect();
-    let bias: Vec<Goldilocks> = (0..m * n).map(|_| from_i64((rng.next_u64() % 20) as i64 - 10)).collect();
-    let out: Vec<Goldilocks> = (0..m * n).map(|_| from_i64((rng.next_u64() % 100) as i64)).collect();
-    let rem: Vec<Goldilocks> = (0..m * n).map(|_| from_i64((rng.next_u64() % 100) as i64)).collect();
+    let x: Vec<Goldilocks> = (0..m * k)
+        .map(|_| from_i64((rng.next_u64() % 100) as i64))
+        .collect();
+    let w: Vec<Goldilocks> = (0..k * n)
+        .map(|_| from_i64((rng.next_u64() % 100) as i64))
+        .collect();
+    let bias: Vec<Goldilocks> = (0..m * n)
+        .map(|_| from_i64((rng.next_u64() % 20) as i64 - 10))
+        .collect();
+    let out: Vec<Goldilocks> = (0..m * n)
+        .map(|_| from_i64((rng.next_u64() % 100) as i64))
+        .collect();
+    let rem: Vec<Goldilocks> = (0..m * n)
+        .map(|_| from_i64((rng.next_u64() % 100) as i64))
+        .collect();
 
     let whir_km = Whir::new_testing((k * m).trailing_zeros() as usize);
     let whir_kn = Whir::new_testing((k * n).trailing_zeros() as usize);
@@ -26,9 +36,15 @@ fn main() {
     let c_rem = commit(&whir_mn, &rem);
     let commit_time = t0.elapsed();
 
-    let u: Vec<Goldilocks> = (0..m.trailing_zeros() as usize).map(|_| rng.field()).collect();
-    let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
-    let ch: Vec<Goldilocks> = (0..k.trailing_zeros() as usize).map(|_| rng.field()).collect();
+    let u: Vec<Goldilocks> = (0..m.trailing_zeros() as usize)
+        .map(|_| rng.field())
+        .collect();
+    let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize)
+        .map(|_| rng.field())
+        .collect();
+    let ch: Vec<Goldilocks> = (0..k.trailing_zeros() as usize)
+        .map(|_| rng.field())
+        .collect();
     let mut ap = ch.clone();
     ap.extend_from_slice(&u);
     let mut bp = v.clone();

@@ -15,10 +15,10 @@ fn main() {
     let ops_per_shard = 214; // start with whole-model (1 shard), then tune
     let mut rng = XorShift64::new(0xBEEF);
     let t0 = std::time::Instant::now();
-    let proof = prove_shard_dag(&mut store, &ops, ops_per_shard, &mut rng);
+    let proof = prove_shard_dag(&mut store, &ops, ops_per_shard);
     let prove_t = t0.elapsed();
     let t1 = std::time::Instant::now();
-    assert!(verify_shard_dag(&mut store, &ops, ops_per_shard, &proof));
+    assert!(verify_shard_dag(&store.owned_slices(), &ops, ops_per_shard, &proof));
     let verify_t = t1.elapsed();
     println!("prove {:?}, verify {:?}", prove_t, verify_t);
 

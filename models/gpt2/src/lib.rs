@@ -8,7 +8,7 @@ use std::fs;
 use std::sync::Arc;
 
 use zkie_core::common::field::{Goldilocks, XorShift64};
-use zkie_core::common::fixed_point::from_i32;
+use zkie_core::common::fixed_point::{from_i32, from_i64, to_i32};
 use zkie_core::common::weights_io::WeightMmap;
 use zkie_ops::compose::{causal_mask, Op, Store};
 
@@ -29,11 +29,15 @@ pub fn load_i32(path: &str) -> Vec<Goldilocks> {
 
 fn slice_cols(m: &[Goldilocks], cols: usize, c0: usize, c1: usize) -> Vec<Goldilocks> {
     let rows = m.len() / cols;
-    (0..rows).flat_map(|i| (c0..c1).map(move |j| m[i * cols + j])).collect()
+    (0..rows)
+        .flat_map(|i| (c0..c1).map(move |j| m[i * cols + j]))
+        .collect()
 }
 
 fn slice_rows(m: &[Goldilocks], cols: usize, r0: usize, r1: usize) -> Vec<Goldilocks> {
-    (r0..r1).flat_map(|i| (0..cols).map(move |j| m[i * cols + j])).collect()
+    (r0..r1)
+        .flat_map(|i| (0..cols).map(move |j| m[i * cols + j]))
+        .collect()
 }
 
 fn broadcast(b: &[Goldilocks], rows: usize) -> Vec<Goldilocks> {
@@ -75,7 +79,16 @@ pub fn build_layer(
     let ln1_w_t = store.push(broadcast(&ln1_w, m));
     let ln1_b_t = store.push(broadcast(&ln1_b, m));
     let h = store.push(vec![]);
-    ops.push(Op::LayerNormCentered { x, w: ln1_w_t, b: ln1_b_t, out: h, rsqrt_table: rsqrt_t, m, d: D, n_real: N_REAL });
+    ops.push(Op::LayerNormCentered {
+        x,
+        w: ln1_w_t,
+        b: ln1_b_t,
+        out: h,
+        rsqrt_table: rsqrt_t,
+        m,
+        d: D,
+        n_real: N_REAL,
+    });
 
     let mut head_outs = Vec::new();
     for head in 0..HEADS {
@@ -105,37 +118,152 @@ pub fn build_layer(
         let attn_16 = store.push(vec![]);
         let out_h = store.push(vec![]);
         let out_rem = store.push(vec![]);
-        ops.push(Op::Projection { x: h, w: qh, bias: qb, out: q, rem: qr, m, k: D, n: DH, shift });
-        ops.push(Op::Projection { x: h, w: kh, bias: kb, out: k, rem: kr, m, k: D, n: DH, shift });
-        ops.push(Op::Projection { x: h, w: vh, bias: vb, out: v, rem: vr, m, k: D, n: DH, shift });
-        ops.push(Op::Scale { x: q, out: q_scaled, factor: 23170, shift: 16 });
-        ops.push(Op::Scale { x: k, out: k_scaled, factor: 23170, shift: 16 });
-        ops.push(Op::Transpose { x: k_scaled, out: kt, m, k: DH });
-        ops.push(Op::MatMul { a: q_scaled, b: kt, c: scores, m, k: DH, n: m });
-        ops.push(Op::Scale { x: scores, out: scores_16, factor: 1, shift: 16 });
-        ops.push(Op::StableSoftmaxIndex { x: scores_16, mask: mask_t, out: idx, offset: 1 << 21, table_len, m, n: m });
-        ops.push(Op::Softmax { idx, e, out: probs, table: exp_t, m, n: m });
-        ops.push(Op::MatMul { a: probs, b: v, c: attn, m, k: m, n: DH });
-        ops.push(Op::Scale { x: attn, out: attn_16, factor: 1, shift: 16 });
-        ops.push(Op::Projection { x: attn_16, w: oh, bias: ob, out: out_h, rem: out_rem, m, k: DH, n: D, shift });
+        ops.push(Op::Projection {
+            x: h,
+            w: qh,
+            bias: qb,
+            out: q,
+            rem: qr,
+            m,
+            k: D,
+            n: DH,
+            shift,
+        });
+        ops.push(Op::Projection {
+            x: h,
+            w: kh,
+            bias: kb,
+            out: k,
+            rem: kr,
+            m,
+            k: D,
+            n: DH,
+            shift,
+        });
+        ops.push(Op::Projection {
+            x: h,
+            w: vh,
+            bias: vb,
+            out: v,
+            rem: vr,
+            m,
+            k: D,
+            n: DH,
+            shift,
+        });
+        ops.push(Op::Scale {
+            x: q,
+            out: q_scaled,
+            factor: 23170,
+            shift: 16,
+        });
+        ops.push(Op::Scale {
+            x: k,
+            out: k_scaled,
+            factor: 23170,
+            shift: 16,
+        });
+        ops.push(Op::Transpose {
+            x: k_scaled,
+            out: kt,
+            m,
+            k: DH,
+        });
+        ops.push(Op::MatMul {
+            a: q_scaled,
+            b: kt,
+            c: scores,
+            m,
+            k: DH,
+            n: m,
+        });
+        ops.push(Op::Scale {
+            x: scores,
+            out: scores_16,
+            factor: 1,
+            shift: 16,
+        });
+        ops.push(Op::StableSoftmaxIndex {
+            x: scores_16,
+            mask: mask_t,
+            out: idx,
+            offset: 1 << 21,
+            table_len,
+            m,
+            n: m,
+        });
+        ops.push(Op::Softmax {
+            idx,
+            e,
+            out: probs,
+            table: exp_t,
+            m,
+            n: m,
+        });
+        ops.push(Op::MatMul {
+            a: probs,
+            b: v,
+            c: attn,
+            m,
+            k: m,
+            n: DH,
+        });
+        ops.push(Op::Scale {
+            x: attn,
+            out: attn_16,
+            factor: 1,
+            shift: 16,
+        });
+        ops.push(Op::Projection {
+            x: attn_16,
+            w: oh,
+            bias: ob,
+            out: out_h,
+            rem: out_rem,
+            m,
+            k: DH,
+            n: D,
+            shift,
+        });
         head_outs.push(out_h);
     }
     let mut attn_acc = head_outs[0];
     for &ho in &head_outs[1..] {
         let s = store.push(vec![]);
-        ops.push(Op::Add { a: attn_acc, b: ho, c: s });
+        ops.push(Op::Add {
+            a: attn_acc,
+            b: ho,
+            c: s,
+        });
         attn_acc = s;
     }
     let o_b_t = store.push(broadcast(&o_b, m));
     let attn_biased = store.push(vec![]);
-    ops.push(Op::Add { a: attn_acc, b: o_b_t, c: attn_biased });
+    ops.push(Op::Add {
+        a: attn_acc,
+        b: o_b_t,
+        c: attn_biased,
+    });
     let x2 = store.push(vec![]);
-    ops.push(Op::Add { a: x, b: attn_biased, c: x2 });
+    ops.push(Op::Add {
+        a: x,
+        b: attn_biased,
+        c: x2,
+    });
 
     let ln2_w_t = store.push(broadcast(&ln2_w, m));
     let ln2_b_t = store.push(broadcast(&ln2_b, m));
     let h2 = store.push(vec![]);
-    ops.push(Op::LayerNormCentered { x: x2, w: ln2_w_t, b: ln2_b_t, out: h2, rsqrt_table: rsqrt_t, m, d: D, n_real: N_REAL });
+    ops.push(Op::LayerNormCentered {
+        x: x2,
+        w: ln2_w_t,
+        b: ln2_b_t,
+        out: h2,
+        rsqrt_table: rsqrt_t,
+        m,
+        d: D,
+        n_real: N_REAL,
+    });
     let fc_w_t = store.push_mmap(fc_w.clone(), 0, fc_w.len());
     let fc_b_t = store.push(broadcast(&fc_b, m));
     let proj_w_t = store.push_mmap(proj_w.clone(), 0, proj_w.len());
@@ -146,27 +274,92 @@ pub fn build_layer(
     let act = store.push(vec![]);
     let proj2 = store.push(vec![]);
     let proj2_rem = store.push(vec![]);
-    ops.push(Op::Projection { x: h2, w: fc_w_t, bias: fc_b_t, out: fc, rem: fc_rem, m, k: D, n: FFN, shift });
-    ops.push(Op::GeluIndex { x: fc, out: gelu_idx, offset: 1 << 23, table_len: 1 << 24 });
-    ops.push(Op::Lookup { idx: gelu_idx, out: act, table: gelu_t });
-    ops.push(Op::Projection { x: act, w: proj_w_t, bias: proj_b_t, out: proj2, rem: proj2_rem, m, k: FFN, n: D, shift });
+    ops.push(Op::Projection {
+        x: h2,
+        w: fc_w_t,
+        bias: fc_b_t,
+        out: fc,
+        rem: fc_rem,
+        m,
+        k: D,
+        n: FFN,
+        shift,
+    });
+    ops.push(Op::GeluIndex {
+        x: fc,
+        out: gelu_idx,
+        offset: 1 << 23,
+        table_len: 1 << 24,
+    });
+    ops.push(Op::Lookup {
+        idx: gelu_idx,
+        out: act,
+        table: gelu_t,
+    });
+    ops.push(Op::Projection {
+        x: act,
+        w: proj_w_t,
+        bias: proj_b_t,
+        out: proj2,
+        rem: proj2_rem,
+        m,
+        k: FFN,
+        n: D,
+        shift,
+    });
     let out = store.push(vec![]);
-    ops.push(Op::Add { a: x2, b: proj2, c: out });
+    ops.push(Op::Add {
+        a: x2,
+        b: proj2,
+        c: out,
+    });
     out
 }
 
 /// Assemble the full GPT-2 graph (embedding + 12 layers + final LayerNorm +
 /// lm_head). Returns `(x0_id, logits_id)`.
-pub fn build_gpt2(store: &mut Store, ops: &mut Vec<Op>, dir: &str, m: usize, shift: u32) -> (usize, usize) {
+pub fn build_gpt2(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    dir: &str,
+    m: usize,
+    shift: u32,
+) -> (usize, usize, usize, usize) {
     let exp_table = load_i32("models/gpt2/weights/exp_table_i32.bin");
     let rsqrt_table = load_i32("models/gpt2/weights/rsqrt_table_i32.bin");
     let gelu_table = load_i32(&format!("{dir}/gelu_table_i32.bin"));
-    let embedding = load_i32(&format!("{dir}/embedding_i32.bin"));
     let lnf_w = load_i32(&format!("{dir}/ln_f_w_i32.bin"));
     let lnf_b = load_i32(&format!("{dir}/ln_f_b_i32.bin"));
     let lm_head_w = Arc::new(WeightMmap::open(&format!("{dir}/lm_head_w_i32.bin")).unwrap());
 
-    let x0 = store.push(embedding[..m * D].to_vec());
+    // Token ids are a public input; the input embedding is wte[tokens] + pos_emb.
+    // wte is tied with the (transposed) lm_head weight, so we reuse lm_head
+    // directly via a transposed gather index (emb_idx[i*D + d] = d*VOCAB + token).
+    // pos_emb is the input-independent residual (precomputed) and is added after.
+    let tokens_raw = load_i32(&format!("{dir}/tokens_i32.bin"));
+    let tokens = store.push_idx(tokens_raw.iter().map(|&v| to_i32(v) as u32).collect());
+    let emb_idx: Vec<u32> = (0..m)
+        .flat_map(|i| {
+            let ti = to_i32(tokens_raw[i]) as u32;
+            (0..D).map(move |d| (d * 65536) as u32 + ti)
+        })
+        .collect();
+    let emb_idx_t = store.push_idx(emb_idx);
+    let wte_owned = store.push(load_i32(&format!("{dir}/lm_head_w_i32.bin")));
+    let token_emb = store.push(vec![]);
+    ops.push(Op::Lookup {
+        idx: emb_idx_t,
+        out: token_emb,
+        table: wte_owned,
+    });
+    let pos_emb = load_i32(&format!("{dir}/pos_emb_i32.bin"));
+    let pos_emb_t = store.push(pos_emb[..m * D].to_vec());
+    let x0 = store.push(vec![]);
+    ops.push(Op::Add {
+        a: token_emb,
+        b: pos_emb_t,
+        c: x0,
+    });
     let exp_t = store.push(exp_table);
     let rsqrt_t = store.push(rsqrt_table);
     let gelu_t = store.push(gelu_table);
@@ -174,15 +367,70 @@ pub fn build_gpt2(store: &mut Store, ops: &mut Vec<Op>, dir: &str, m: usize, shi
 
     let mut x_cur = x0;
     for layer in 0..LAYERS {
-        x_cur = build_layer(store, ops, x_cur, layer, m, shift, exp_t, gelu_t, rsqrt_t, mask_t);
+        x_cur = build_layer(
+            store, ops, x_cur, layer, m, shift, exp_t, gelu_t, rsqrt_t, mask_t,
+        );
     }
 
     let lnf_w_t = store.push(broadcast(&lnf_w, m));
     let lnf_b_t = store.push(broadcast(&lnf_b, m));
     let h_final = store.push(vec![]);
-    ops.push(Op::LayerNormCentered { x: x_cur, w: lnf_w_t, b: lnf_b_t, out: h_final, rsqrt_table: rsqrt_t, m, d: D, n_real: N_REAL });
+    ops.push(Op::LayerNormCentered {
+        x: x_cur,
+        w: lnf_w_t,
+        b: lnf_b_t,
+        out: h_final,
+        rsqrt_table: rsqrt_t,
+        m,
+        d: D,
+        n_real: N_REAL,
+    });
     let lm_w_t = store.push_mmap(lm_head_w.clone(), 0, lm_head_w.len());
     let logits = store.push(vec![]);
-    ops.push(Op::MatMul { a: h_final, b: lm_w_t, c: logits, m, k: D, n: 65536 });
-    (x0, logits)
+    ops.push(Op::MatMul {
+        a: h_final,
+        b: lm_w_t,
+        c: logits,
+        m,
+        k: D,
+        n: 65536,
+    });
+    // Mask the padded vocab columns (50257..65536) to a large negative so the
+    // argmax never lands on padding; the value stays within the range-check.
+    let mask: Vec<Goldilocks> = (0..65536)
+        .map(|j| {
+            if j < 50257 {
+                from_i32(0)
+            } else {
+                from_i64(-(1i64 << 41))
+            }
+        })
+        .collect();
+    let mask_t = store.push(broadcast(&mask, m));
+    let logits_masked = store.push(vec![]);
+    ops.push(Op::Add {
+        a: logits,
+        b: mask_t,
+        c: logits_masked,
+    });
+
+    // n-position argmax over the scaled logits rows -> public index tensor t.
+    let arg_sel = store.push(vec![]);
+    let arg_thr = store.push(vec![]);
+    let arg_gate = store.push(vec![]);
+    let arg_d1 = store.push(vec![]);
+    let arg_d2 = store.push(vec![]);
+    let t = store.push_idx(vec![]);
+    ops.push(Op::Argmax {
+        x: logits_masked,
+        sel: arg_sel,
+        thr: arg_thr,
+        gate: arg_gate,
+        d1: arg_d1,
+        d2: arg_d2,
+        out: t,
+        m,
+        n: 65536,
+    });
+    (x0, logits, tokens, t)
 }

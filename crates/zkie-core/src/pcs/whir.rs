@@ -16,7 +16,6 @@ pub fn global_open_count() -> u64 {
     GLOBAL_OPEN_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-
 use p3_challenger::DuplexChallenger;
 use p3_commit::MultilinearPcs;
 use p3_dft::Radix2DFTSmallBatch;
@@ -30,9 +29,7 @@ use p3_sumcheck::layout::{Layout as _, SuffixProver, Table};
 use p3_sumcheck::{OpeningBatch, PointSchedule, PrescribedPointPcs, TableShape, TableSpec};
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
 use p3_whir::fiat_shamir::domain_separator::DomainSeparator;
-use p3_whir::parameters::{
-    FoldingFactor, ProtocolParameters, SecurityAssumption, WhirConfig,
-};
+use p3_whir::parameters::{FoldingFactor, ProtocolParameters, SecurityAssumption, WhirConfig, WhirConfigError};
 use p3_whir::pcs::prover::WhirProver;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
@@ -206,7 +203,9 @@ mod backend {
                         '_,
                         F,
                         crate::pcs::merkle_cuda::CudaMerkleTreeMmcs,
-                    >::new(batch_opening.opened_values, batch_opening.opening_proof);
+                    >::new(
+                        batch_opening.opened_values, batch_opening.opening_proof
+                    );
                     m.verify_batch(commit, dimensions, index, o)
                 }
             }
@@ -221,13 +220,13 @@ mod backend {
             proof: &Self::MultiProof,
         ) -> Result<(), Self::Error> {
             match self {
-                Self::Cpu(m) => m.verify_multi_batch(
-                    commit, dimensions, indices, opened_values, proof,
-                ),
+                Self::Cpu(m) => {
+                    m.verify_multi_batch(commit, dimensions, indices, opened_values, proof)
+                }
                 #[cfg(feature = "cuda")]
-                Self::Cuda(m) => m.verify_multi_batch(
-                    commit, dimensions, indices, opened_values, proof,
-                ),
+                Self::Cuda(m) => {
+                    m.verify_multi_batch(commit, dimensions, indices, opened_values, proof)
+                }
             }
         }
 
@@ -265,10 +264,19 @@ pub struct Whir {
     pcs: MyPcs,
     perm: Perm,
     folding_factor: FoldingFactor,
+    security_level: usize,
+    pow_bits: usize,
+    num_variables: usize,
     /// (commits, total seconds) spent inside `commit`, for performance telemetry.
     commit_stats: std::cell::Cell<(u64, f64)>,
     open_stats: std::cell::Cell<(u64, f64)>,
     verify_stats: std::cell::Cell<(u64, f64)>,
+}
+
+fn read_u64_le<R: std::io::Read>(reader: &mut R) -> std::io::Result<u64> {
+    let mut buf = [0u8; 8];
+    reader.read_exact(&mut buf)?;
+    Ok(u64::from_le_bytes(buf))
 }
 
 impl Whir {
@@ -285,7 +293,7 @@ impl Whir {
         Self::with_params(num_variables, 32, 10)
     }
 
-    fn with_params(num_variables: usize, security_level: usize, pow_bits: usize) -> Self {
+    pub fn with_params(num_variables: usize, security_level: usize, pow_bits: usize) -> Self {
         let folding_factor = FoldingFactor::Constant(5);
         let (num_rounds, _) = folding_factor
             .compute_number_of_rounds(num_variables)
@@ -317,7 +325,9 @@ impl Whir {
             let hash = MerkleHash::new(perm.clone());
             let compress = MerkleCompress::new(perm.clone());
             if backend::use_cuda_mmcs() {
-                MyMmcs::Cuda(crate::pcs::merkle_cuda::CudaMerkleTreeMmcs::new(hash, compress, 0))
+                MyMmcs::Cuda(crate::pcs::merkle_cuda::CudaMerkleTreeMmcs::new(
+                    hash, compress, 0,
+                ))
             } else {
                 MyMmcs::Cpu(CpuMmcs::new(hash, compress, 0))
             }
@@ -339,6 +349,9 @@ impl Whir {
             pcs,
             perm,
             folding_factor,
+            security_level,
+            pow_bits,
+            num_variables,
             commit_stats: std::cell::Cell::new((0, 0.0)),
             open_stats: std::cell::Cell::new((0, 0.0)),
             verify_stats: std::cell::Cell::new((0, 0.0)),
@@ -366,10 +379,70 @@ impl Whir {
 
     /// Commit to a flat MLE. Returns the commitment, prover data, and the public
     /// opening protocol (single table, single column, one point) used for open/verify.
+    pub fn security_level(&self) -> usize {
+        self.security_level
+    }
+
+    pub fn pow_bits(&self) -> usize {
+        self.pow_bits
+    }
+
+    pub fn num_variables(&self) -> usize {
+        self.num_variables
+    }
+
+    /// Reconstruct the public opening protocol for `num_tables` tables of arity
+    /// `arity`, each opened at column 0 with a caller-supplied point. This is the
+    /// exact protocol built by `commit` (num_tables == 1) and `commit_batch`.
+    pub fn opening_protocol(&self, arity: usize, num_tables: usize) -> OpeningProtocol {
+        let folding = self.folding_factor.at_round(0);
+        let point_schedule: PointSchedule =
+            std::iter::once(OpeningBatch::new(vec![0], Vec::new())).collect();
+        let specs: Vec<TableSpec> = (0..num_tables)
+            .map(|_| TableSpec::new(TableShape::new(arity, 1), point_schedule.clone()))
+            .collect();
+        OpeningProtocol::new(specs).pad_to_min_num_variables(folding)
+    }
+
+    /// Minimum proof-of-work bits required to reach `security_level` for a
+    /// commitment of `2^num_variables` evaluations (folding factor 5, capacity
+    /// bound). Models should adapt per group: pass this (or a larger) value as
+    /// the group's `pow_bits`, so a large tensor (e.g. a 2^28 lm_head) gets a
+    /// higher PoW budget while small groups stay cheap.
+    pub fn required_pow_bits(num_variables: usize, security_level: usize) -> usize {
+        let folding_factor = FoldingFactor::Constant(5);
+        let (num_rounds, _) = folding_factor
+            .compute_number_of_rounds(num_variables)
+            .expect("valid folding schedule");
+        let mut round_log_inv_rates = Vec::with_capacity(num_rounds);
+        let mut rate = 1;
+        for round in 0..num_rounds {
+            rate += folding_factor.at_round(round) - 1;
+            round_log_inv_rates.push(rate);
+        }
+        let params = ProtocolParameters {
+            security_level,
+            pow_bits: 0,
+            folding_factor: folding_factor.clone(),
+            soundness_type: SecurityAssumption::CapacityBound,
+            starting_log_inv_rate: 1,
+            round_log_inv_rates,
+        };
+        match WhirConfig::<EF, F, MyChallenger>::new(num_variables, params) {
+            Ok(config) => config.max_pow_bits(),
+            Err(WhirConfigError::PowBitsExceedBudget { required, .. }) => required,
+            Err(e) => panic!("unexpected WhirConfig error: {e:?}"),
+        }
+    }
+
     pub fn commit(&self, evals: &[Goldilocks]) -> (Commitment, ProverData, OpeningProtocol) {
         let t0 = std::time::Instant::now();
         let num_vars = evals.len().trailing_zeros() as usize;
-        assert_eq!(evals.len(), 1 << num_vars, "MLE length must be a power of two");
+        assert_eq!(
+            evals.len(),
+            1 << num_vars,
+            "MLE length must be a power of two"
+        );
 
         // One polynomial (one row) whose `2^num_vars` evaluations form the row.
         let table = Table::new(RowMajorMatrix::new(evals.to_vec(), 1 << num_vars));
@@ -384,12 +457,11 @@ impl Whir {
         )])
         .pad_to_min_num_variables(folding);
 
-        let (commitment, prover_data) =
-            <MyPcs as MultilinearPcs<EF, MyChallenger>>::commit(
-                &self.pcs,
-                witness,
-                &mut self.fresh_challenger(),
-            );
+        let (commitment, prover_data) = <MyPcs as MultilinearPcs<EF, MyChallenger>>::commit(
+            &self.pcs,
+            witness,
+            &mut self.fresh_challenger(),
+        );
         let (n, secs) = self.commit_stats.get();
         self.commit_stats
             .set((n + 1, secs + t0.elapsed().as_secs_f64()));
@@ -409,12 +481,16 @@ impl Whir {
         assert!(!evals_batch.is_empty(), "batch must not be empty");
         let arity = evals_batch[0].len().trailing_zeros() as usize;
         for e in evals_batch {
-            assert_eq!(e.len(), 1 << arity, "all MLEs in a batch must have the same size");
+            assert_eq!(
+                e.len(),
+                1 << arity,
+                "all MLEs in a batch must have the same size"
+            );
         }
         let total_slots = evals_batch.len() * (1usize << arity);
         let total_num_vars = total_slots.next_power_of_two().trailing_zeros() as usize;
 
-        let whir = Whir::new_testing(total_num_vars);
+        let whir = Whir::with_params(total_num_vars, self.security_level, self.pow_bits);
         let tables: Vec<Table<F>> = evals_batch
             .iter()
             .map(|e| Table::new(RowMajorMatrix::new(e.to_vec(), 1 << arity)))
@@ -435,9 +511,101 @@ impl Whir {
             &mut whir.fresh_challenger(),
         );
         let (n, secs) = self.commit_stats.get();
-        self.commit_stats
-            .set((n + evals_batch.len() as u64, secs + t0.elapsed().as_secs_f64()));
+        self.commit_stats.set((
+            n + evals_batch.len() as u64,
+            secs + t0.elapsed().as_secs_f64(),
+        ));
         (commitment, prover_data, protocol, whir)
+    }
+
+    /// Reconstruct the public opening protocol for a committed same-arity table group.
+    pub fn batch_opening_protocol(&self, num_tables: usize, arity: usize) -> OpeningProtocol {
+        let folding = self.folding_factor.at_round(0);
+        let point_schedule: PointSchedule =
+            std::iter::once(OpeningBatch::new(vec![0], Vec::new())).collect();
+        let specs = (0..num_tables)
+            .map(|_| TableSpec::new(TableShape::new(arity, 1), point_schedule.clone()))
+            .collect();
+        OpeningProtocol::new(specs).pad_to_min_num_variables(folding)
+    }
+
+    /// Serialize the reusable Merkle tree; reconstruct layout state from source tables on load.
+    pub fn serialize_batch_prover_data(
+        prover_data: ProverData,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut encoded = Vec::new();
+        Self::serialize_batch_prover_data_into(prover_data, &mut encoded)?;
+        Ok(encoded)
+    }
+
+    /// Stream the Merkle tree to persistent storage without cloning it into a second large buffer.
+    pub fn serialize_batch_prover_data_into<W: std::io::Write>(
+        prover_data: ProverData,
+        writer: &mut W,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_, merkle_data) = prover_data.into_parts();
+        let leaves = merkle_data.leaves();
+        writer.write_all(&(leaves.len() as u64).to_le_bytes())?;
+        for leaf in leaves {
+            writer.write_all(&(leaf.width as u64).to_le_bytes())?;
+            writer.write_all(&(leaf.values.len() as u64).to_le_bytes())?;
+            let byte_len = leaf.values.len() * std::mem::size_of::<F>();
+            let bytes =
+                unsafe { std::slice::from_raw_parts(leaf.values.as_ptr() as *const u8, byte_len) };
+            writer.write_all(bytes)?;
+        }
+        let bytes = merkle_data.write_digest_layers();
+        writer.write_all(&bytes)?;
+        Ok(())
+    }
+
+    /// Restore prover data from an encoded Merkle tree without rebuilding the commitment.
+    pub fn restore_batch_prover_data(
+        &self,
+        evals_batch: &[&[Goldilocks]],
+        encoded: &[u8],
+    ) -> Result<ProverData, Box<dyn std::error::Error>> {
+        self.restore_batch_prover_data_from(evals_batch, &mut std::io::Cursor::new(encoded))
+    }
+
+    /// Stream and restore prover data from a cache file, rebuilding only layout state.
+    pub fn restore_batch_prover_data_from<R: std::io::Read>(
+        &self,
+        evals_batch: &[&[Goldilocks]],
+        reader: &mut R,
+    ) -> Result<ProverData, Box<dyn std::error::Error>> {
+        assert!(!evals_batch.is_empty());
+        let arity = evals_batch[0].len().trailing_zeros() as usize;
+        assert!(evals_batch
+            .iter()
+            .all(|values| values.len() == 1usize << arity));
+        let num_leaves = read_u64_le(reader)? as usize;
+        let mut leaves = Vec::with_capacity(num_leaves);
+        for _ in 0..num_leaves {
+            let width = read_u64_le(reader)? as usize;
+            let len = read_u64_le(reader)? as usize;
+            let mut values = vec![Goldilocks::new(0); len];
+            let byte_len = len * std::mem::size_of::<F>();
+            reader.read_exact(unsafe {
+                std::slice::from_raw_parts_mut(values.as_mut_ptr() as *mut u8, byte_len)
+            })?;
+            leaves.push(RowMajorMatrix::new(values, width));
+        }
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        let merkle_data =
+            <MyMmcs as p3_commit::Mmcs<F>>::ProverData::<RowMajorMatrix<F>>::read_digest_layers(
+                &bytes, leaves,
+            );
+        let tables = evals_batch
+            .iter()
+            .map(|values| Table::new(RowMajorMatrix::new(values.to_vec(), 1 << arity)))
+            .collect();
+        let witness = MyLayout::new_witness(tables, self.folding_factor.at_round(0));
+        Ok(ProverData::from_parts(
+            MyLayout::from_witness(witness),
+            merkle_data,
+        ))
     }
 
     pub fn open(
@@ -456,9 +624,15 @@ impl Whir {
         );
         let opened = proof.evals[0].current()[0];
         let (n, secs) = self.open_stats.get();
-        self.open_stats.set((n + 1, secs + t0.elapsed().as_secs_f64()));
+        self.open_stats
+            .set((n + 1, secs + t0.elapsed().as_secs_f64()));
         GLOBAL_OPEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        (proof, opened.as_base().expect("base-field MLE opens to a base element"))
+        (
+            proof,
+            opened
+                .as_base()
+                .expect("base-field MLE opens to a base element"),
+        )
     }
 
     /// Verify the opening proof at `point` and return the opened evaluation.
@@ -479,8 +653,11 @@ impl Whir {
             &mut self.fresh_challenger(),
         )?;
         let (n, secs) = self.verify_stats.get();
-        self.verify_stats.set((n + 1, secs + t0.elapsed().as_secs_f64()));
-        Ok(evals[0].current()[0].as_base().expect("base-field MLE opens to a base element"))
+        self.verify_stats
+            .set((n + 1, secs + t0.elapsed().as_secs_f64()));
+        Ok(evals[0].current()[0]
+            .as_base()
+            .expect("base-field MLE opens to a base element"))
     }
     /// Open the `table_index`-th MLE in a batch at `point`.
     pub fn open_batch(
@@ -496,19 +673,28 @@ impl Whir {
         let target = to_ef_point(point);
         let dummy = Point::new(vec![EF::from(Goldilocks::new(0)); arity]);
         let points: Vec<Point<EF>> = (0..num_tables)
-            .map(|i| if i == table_index { target.clone() } else { dummy.clone() })
+            .map(|i| {
+                if i == table_index {
+                    target.clone()
+                } else {
+                    dummy.clone()
+                }
+            })
             .collect();
-        let proof = self.pcs.open_at(
-            prover_data,
-            protocol,
-            &points,
-            &mut self.fresh_challenger(),
-        );
+        let proof = self
+            .pcs
+            .open_at(prover_data, protocol, &points, &mut self.fresh_challenger());
         let opened = proof.evals[table_index].current()[0];
         let (n, secs) = self.open_stats.get();
-        self.open_stats.set((n + 1, secs + t0.elapsed().as_secs_f64()));
+        self.open_stats
+            .set((n + 1, secs + t0.elapsed().as_secs_f64()));
         GLOBAL_OPEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        (proof, opened.as_base().expect("base-field MLE opens to a base element"))
+        (
+            proof,
+            opened
+                .as_base()
+                .expect("base-field MLE opens to a base element"),
+        )
     }
 
     /// Verify the batch opening of the `table_index`-th MLE at `point`.
@@ -525,7 +711,13 @@ impl Whir {
         let target = to_ef_point(point);
         let dummy = Point::new(vec![EF::from(Goldilocks::new(0)); arity]);
         let points: Vec<Point<EF>> = (0..num_tables)
-            .map(|i| if i == table_index { target.clone() } else { dummy.clone() })
+            .map(|i| {
+                if i == table_index {
+                    target.clone()
+                } else {
+                    dummy.clone()
+                }
+            })
             .collect();
         let evals = self.pcs.verify_at(
             commitment,
@@ -534,7 +726,9 @@ impl Whir {
             &points,
             &mut self.fresh_challenger(),
         )?;
-        Ok(evals[table_index].current()[0].as_base().expect("base-field MLE opens to a base element"))
+        Ok(evals[table_index].current()[0]
+            .as_base()
+            .expect("base-field MLE opens to a base element"))
     }
 
     /// Open every MLE in a batch at the same `point` in a single FRI proof,
@@ -551,19 +745,21 @@ impl Whir {
         let t0 = std::time::Instant::now();
         let target = to_ef_point(point);
         let points: Vec<Point<EF>> = (0..num_tables).map(|_| target.clone()).collect();
-        let proof = self.pcs.open_at(
-            prover_data,
-            protocol,
-            &points,
-            &mut self.fresh_challenger(),
-        );
+        let proof = self
+            .pcs
+            .open_at(prover_data, protocol, &points, &mut self.fresh_challenger());
         let opened: Vec<Goldilocks> = proof
             .evals
             .iter()
-            .map(|e| e.current()[0].as_base().expect("base-field MLE opens to a base element"))
+            .map(|e| {
+                e.current()[0]
+                    .as_base()
+                    .expect("base-field MLE opens to a base element")
+            })
             .collect();
         let (n, secs) = self.open_stats.get();
-        self.open_stats.set((n + 1, secs + t0.elapsed().as_secs_f64()));
+        self.open_stats
+            .set((n + 1, secs + t0.elapsed().as_secs_f64()));
         GLOBAL_OPEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         (proof, opened)
     }
@@ -588,11 +784,13 @@ impl Whir {
         )?;
         Ok(evals
             .iter()
-            .map(|e| e.current()[0].as_base().expect("base-field MLE opens to a base element"))
+            .map(|e| {
+                e.current()[0]
+                    .as_base()
+                    .expect("base-field MLE opens to a base element")
+            })
             .collect())
     }
-
-
 }
 
 /// Embed base-field coordinates into the degree-2 extension field.
@@ -623,7 +821,8 @@ mod tests {
         let (commitment, prover_data, protocol, batch_whir) = whir.commit_batch(&refs);
         for i in 0..n {
             let point: Vec<Goldilocks> = (0..arity).map(|_| rng.field()).collect();
-            let (proof, opened) = batch_whir.open_batch(prover_data.clone(), &protocol, i, n, &point);
+            let (proof, opened) =
+                batch_whir.open_batch(prover_data.clone(), &protocol, i, n, &point);
             let verified = batch_whir
                 .verify_batch(&commitment, &proof, &protocol, i, n, &point)
                 .unwrap();
@@ -647,4 +846,82 @@ mod tests {
         assert_eq!(opened, verified);
         assert_eq!(verified, mle::eval(&evals, &point));
     }
+
+    #[test]
+    fn commit_batch_inherits_security_parameters() {
+        let mut rng = XorShift64::new(0xbaa7);
+        let whir = Whir::with_params(5, 64, 7);
+        let tables: Vec<Vec<Goldilocks>> = (0..3)
+            .map(|_| (0..32).map(|_| rng.field()).collect())
+            .collect();
+        let refs: Vec<&[Goldilocks]> = tables.iter().map(Vec::as_slice).collect();
+
+        let (_, _, _, batch_whir) = whir.commit_batch(&refs);
+
+        assert_eq!(batch_whir.security_level, 64);
+        assert_eq!(batch_whir.pow_bits, 7);
+    }
+
+    #[test]
+    fn committed_batch_tree_survives_serialization_roundtrip() {
+        let mut rng = XorShift64::new(0xbaa8);
+        let arity = 5usize;
+        let num_tables = 3usize;
+        let whir = Whir::new_testing(arity);
+        let tables: Vec<Vec<Goldilocks>> = (0..num_tables)
+            .map(|_| (0..(1usize << arity)).map(|_| rng.field()).collect())
+            .collect();
+        let refs: Vec<&[Goldilocks]> = tables.iter().map(Vec::as_slice).collect();
+        let (commitment, prover_data, _protocol, batch_whir) = whir.commit_batch(&refs);
+        let metadata = crate::pcs::cache::BatchCacheMetadata::new(
+            String::from("test-model"),
+            String::from("group-0"),
+            (0..num_tables)
+                .map(|i| format!("layer-{i}-weight"))
+                .collect(),
+            arity as u32,
+            num_tables as u32,
+            32,
+            10,
+            [7u8; 32],
+        );
+        let mut encoded = Vec::new();
+        crate::pcs::cache::write_header(&mut encoded, &metadata, &commitment).unwrap();
+        Whir::serialize_batch_prover_data_into(prover_data, &mut encoded).unwrap();
+        let mut cursor = std::io::Cursor::new(encoded);
+        let (loaded_metadata, commitment) = crate::pcs::cache::read_header(&mut cursor).unwrap();
+        assert_eq!(loaded_metadata, metadata);
+        let restored = batch_whir
+            .restore_batch_prover_data_from(&refs, &mut cursor)
+            .unwrap();
+        let protocol = batch_whir.batch_opening_protocol(num_tables, arity);
+        let point: Vec<Goldilocks> = (0..arity).map(|_| rng.field()).collect();
+        let (proof, opened) = batch_whir.open_batch_multi(restored, &protocol, num_tables, &point);
+        let verified = batch_whir
+            .verify_batch_multi(&commitment, &proof, &protocol, num_tables, &point)
+            .unwrap();
+        assert_eq!(opened, verified);
+        assert_eq!(verified.len(), num_tables);
+    }
 }
+
+
+impl serde::Serialize for Whir {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut t = serializer.serialize_tuple(3)?;
+        t.serialize_element(&self.num_variables)?;
+        t.serialize_element(&self.security_level)?;
+        t.serialize_element(&self.pow_bits)?;
+        t.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Whir {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (num_variables, security_level, pow_bits) =
+            <(usize, usize, usize)>::deserialize(deserializer)?;
+        Ok(Whir::with_params(num_variables, security_level, pow_bits))
+    }
+}
+
