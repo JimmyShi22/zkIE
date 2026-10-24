@@ -166,8 +166,10 @@ and the reasoning behind the numbers is in
 
 **How to read it.** The two columns that matter for deployment are **Verify** and
 **Proof size**: verification is seconds on a cheap machine, which is what makes
-on-chain or in-app checking possible at all. Proving is deliberately offline and
-batched — it is the cost you pay once per model-audit, not per query. The
+on-chain or in-app checking possible at all. Model-weight commitments are
+input-independent, but each new input/output sequence needs its own inference
+proof. The current committed benchmarks re-commit the model weights on every
+run and report commit, prove and verify separately. The
 `argmax` column is the correctness check: the proven forward pass reproduces the
 reference model's token choices exactly.
 
