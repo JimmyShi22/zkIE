@@ -167,9 +167,10 @@ def main():
     x = rms_norm(x, li("final_norm_i32.bin"), rsqrt_t)
     logits = x @ li("lm_head_i32.bin").reshape(H, VOCAB_PAD)
     argmax = np.argmax(logits[:, :VOCAB], axis=1)
-    np.asarray(argmax, dtype=np.int32).tofile(DS + "/gt_argmax_i32.bin")
+    suffix = "" if SEQ <= 16 else ("%d_" % SEQ)
+    np.asarray(argmax, dtype=np.int32).tofile(DS + ("/gt_argmax_%si32.bin" % suffix))
     print("argmax:", argmax.tolist())
-    print("saved gt_argmax_i32.bin (%d tokens)" % SEQ)
+    print("saved gt_argmax_%si32.bin (%d tokens)" % (suffix, SEQ))
 
 
 if __name__ == "__main__":
