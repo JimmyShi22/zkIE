@@ -128,7 +128,7 @@ is in [`docs/benchmarks.md`](docs/benchmarks.md).
 | Gemma 3 270M | 270M / 270M | seq=16, 22 shards (per layer, committed) | ~21.7 s | ~299.6 s | ~2.0 s | 16/16 | ~60.7 GB | ~42.6 MB |
 | Gemma 3 270M | 270M / 270M | seq=512, 22 shards (per layer, committed) | — | pending | pending | pending | pending | pending |
 | DeepSeek-V2-Lite | 2.4B / 15.7B | seq=16, 12 shards (expert-major MoE, mmap weights, committed) | ~79.3 s | ~651.8 s (~10.9 min) | ~3.6 s | 16/16 | ~156.6 GB | ~96.0 MB |
-| DeepSeek-V2-Lite | 2.4B / 15.7B | seq=512, 12 shards (expert-major MoE, mmap weights, committed) | ~76.3 s | ~8499 s (~2.36 h) | ~10.9 s | 286/512 | ~308 GB | ~224.8 MB |
+| DeepSeek-V2-Lite | 2.4B / 15.7B | seq=512, 12 shards (expert-major MoE, mmap weights, committed) | ~88.3 s | ~8329 s (~2.31 h) | ~11.0 s | 511/512 | ~389 GB | ~224.8 MB |
 | DeepSeek-V4.1-Flash | 8B/16B* / 552B | MoE + CSA2 + vision (planned) | - | - | - | - | - | — |
 
 * DeepSeek-V4.1-Flash active params: 8B prefill / 16B decode.
