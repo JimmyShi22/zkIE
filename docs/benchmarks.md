@@ -551,3 +551,32 @@ vs fp32 fidelity gap, not a prover bug. Comparing against the fixed-point
 reference gives 511/512. The `gt_argmax_512_i32.bin` committed here is the
 fixed-point reference; `fp_deepseek.py` now writes the per-seq suffix so it no
 longer clobbers the float-generated file.
+
+
+## DeepSeek-V2-Lite seq512 real prompt/response content (2026-10-24)
+
+The committed `tokens_i32.bin` (512 tokens) is:
+
+- **prompt**: `"The sky is"` = 3 tokens `[549, 9539, 317]` (`The` / ` sky` / ` is`)
+- **response**: 509 tokens of greedy autoregressive generation (HF DeepSeek model)
+
+The greedy response degenerates into a repeating loop. Representative excerpt
+(full decode ~1.9 KB):
+
+    The sky is the limit for the future of the 2017-18 season.
+    The 2017-18 season is the first season of the new NHL.
+    The NHL is the most popular sport in the world.
+    ...
+    The average salary is $100 million for a player in a Major League Baseball team.
+    The average salary is $100 million for a player in a Major League Soccer team.
+    The average salary is $100 million for a player in a Major League Hockey team.
+    ... (the "Baseball / Soccer / Hockey" cycle repeats until token 512)
+
+The 512th token ends mid-sentence at `"... Major League Baseball"` (last token
+id `46555` = `"Baseball"`), missing the trailing `" team."`.
+
+Why this matters: the repetitive loop makes every next-token prediction a
+near-tie among `Baseball / Soccer / Hockey / team`, so small fixed-point
+quantization errors flip the argmax. This is the direct cause of the
+fixed-point-vs-fp32 argmax being ~286/512 (the fixed-point-reference argmax is
+511/512).
