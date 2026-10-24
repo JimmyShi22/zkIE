@@ -10,7 +10,7 @@
 
 **zkIE** — a Zero-Knowledge Inference Engine for verifiable AI inference: instead
 of re-running a model to check its output, verify a short proof that the output
-*is* what the model computes.
+*is* exactly what the model computes.
 
 |  |  |
 | --- | --- |
