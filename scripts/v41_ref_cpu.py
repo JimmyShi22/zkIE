@@ -44,7 +44,7 @@ def dequant_fp8_weight(weight, scale, block=32):
     w = np.frombuffer(weight["data"], dtype=np.uint8).reshape(weight["shape"])
     s = np.frombuffer(scale["data"], dtype=np.uint8).reshape(scale["shape"])
     s = np.power(2.0, s.astype(np.float64) - 127.0)
-    s_big = np.repeat(s, block, axis=1)
+    s_big = np.repeat(np.repeat(s, block, axis=0), block, axis=1)
     sign = np.where((w & 0x80) != 0, -1.0, 1.0)
     exp = (w >> 3) & 0x0F
     man = (w & 0x07).astype(np.float64)
@@ -116,7 +116,7 @@ def main():
     ap.add_argument("--m", type=int, default=1)
     ap.add_argument("--k", type=int, default=4096)
     ap.add_argument("--n", type=int, default=8192)
-    ap.add_argument("--mode", choices=["matmul", "attention", "proj", "oproj", "moe_gate", "shared_expert", "routed_expert"], default="matmul")
+    ap.add_argument("--mode", choices=["matmul", "attention", "proj", "oproj", "moe_gate", "shared_expert", "routed_expert", "mlp"], default="matmul")
     ap.add_argument("--expert-id", type=int, default=240)
     args = ap.parse_args()
 
@@ -284,6 +284,49 @@ def main():
         out = hidden @ w2.T
         fixed = np.round(out * 65536.0).astype(np.int64)
         print(f"routed_expert_{eid}", fixed[0, :4].tolist())
+        return
+
+    if args.mode == "mlp":
+        m = 16
+        dim = 5120
+        inter = 2304
+        n_experts = 384
+        x = np.ones((m, dim), dtype=np.float64)
+
+        gate_w = bf16_vec(t["layers.0.ffn.gate.weight"]).reshape(n_experts, dim)
+        gate_b = np.frombuffer(t["layers.0.ffn.gate.bias"]["data"], dtype="<f4").astype(np.float64)
+        scores = np.sqrt(np.log1p(np.exp(x @ gate_w.T)))
+        biased = scores + gate_b[None, :]
+        topk = np.argsort(-biased, axis=1)[:, :6]
+        weights = np.take_along_axis(scores, topk, axis=1)
+        weights = weights / (weights.sum(axis=1, keepdims=True) + 1e-20)
+
+        sw1 = dequant_fp8_weight(t["layers.0.ffn.shared_experts.w1.weight"], t["layers.0.ffn.shared_experts.w1.scale"])
+        sw2 = dequant_fp8_weight(t["layers.0.ffn.shared_experts.w2.weight"], t["layers.0.ffn.shared_experts.w2.scale"])
+        sw3 = dequant_fp8_weight(t["layers.0.ffn.shared_experts.w3.weight"], t["layers.0.ffn.shared_experts.w3.scale"])
+        out = np.zeros((m, dim), dtype=np.float64)
+        sg = x @ sw1.T
+        su = x @ sw3.T
+        su = np.clip(su, -10.0, 10.0)
+        sg = np.clip(sg, None, 10.0)
+        out += ((sg / (1.0 + np.exp(-sg))) * su) @ sw2.T
+
+        for ti in range(m):
+            for k in range(6):
+                eid = int(topk[ti, k])
+                base = f"layers.0.ffn.experts.{eid}"
+                w1 = dequant_fp4_weight(t[f"{base}.w1.weight"], t[f"{base}.w1.scale"], dim, 32)
+                w2 = dequant_fp4_weight(t[f"{base}.w2.weight"], t[f"{base}.w2.scale"], inter, 32)
+                w3 = dequant_fp4_weight(t[f"{base}.w3.weight"], t[f"{base}.w3.scale"], dim, 32)
+                g = x[ti : ti + 1] @ w1.T
+                u = x[ti : ti + 1] @ w3.T
+                u = np.clip(u, -10.0, 10.0)
+                g = np.clip(g, None, 10.0)
+                h = (g / (1.0 + np.exp(-g))) * u
+                out[ti] += weights[ti, k] * (h @ w2.T)[0]
+
+        fixed = np.round(out * 65536.0).astype(np.int64)
+        print("mlp", fixed[0, :4].tolist())
         return
 
     winfo = t[args.weight]
