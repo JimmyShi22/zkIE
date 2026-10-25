@@ -21,6 +21,15 @@ cargo run --release -p zkie-models-deepseek-v41-flash --example bench_committed
 # layer0 投影对拍
 cargo run --release -p zkie-models-deepseek-v41-flash --example layer0_proj_ref
 python3 scripts/v41_ref_cpu.py --shard models/deepseek-v4.1-flash/raw/model-00003-of-00048.safetensors --mode proj
+
+# 其它参考模式
+python3 scripts/v41_ref_cpu.py --shard models/deepseek-v4.1-flash/raw/model-00003-of-00048.safetensors --mode attention
+python3 scripts/v41_ref_cpu.py --shard models/deepseek-v4.1-flash/raw/model-00003-of-00048.safetensors --mode oproj
+python3 scripts/v41_ref_cpu.py --shard models/deepseek-v4.1-flash/raw/model-00003-of-00048.safetensors --mode moe_gate
+
+# 生成 token / RoPE 表
+python3 scripts/extract_v41.py --raw models/deepseek-v4.1-flash/raw --out /tmp/cache --tokenizer-json models/deepseek-v4.1-flash/raw/tokenizer.json --tokens-out /tmp/tokens.bin --prompt "The sky is" --seq 16
+python3 scripts/extract_v41.py --raw models/deepseek-v4.1-flash/raw --out /tmp/cache --rope-out /tmp/rope --seq 16
 ```
 
 ## 待接
