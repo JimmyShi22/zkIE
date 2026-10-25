@@ -146,6 +146,9 @@ def main():
     ap.add_argument("--seq", type=int, default=512)
     ap.add_argument("--rope-head-dim", type=int, default=64)
     ap.add_argument("--rope-theta", type=float, default=10000.0)
+    ap.add_argument("--tokenizer-json", default="")
+    ap.add_argument("--tokens-out", default="")
+    ap.add_argument("--prompt", default="The sky is")
     args = ap.parse_args()
 
     raw = Path(args.raw)
@@ -162,6 +165,15 @@ def main():
         cos.tofile(rope_dir / "cos_i32.bin")
         sin.tofile(rope_dir / "sin_i32.bin")
         print(f"rope -> {rope_dir}/cos_i32.bin {rope_dir}/sin_i32.bin", flush=True)
+
+    if args.tokens_out and args.tokenizer_json:
+        from tokenizers import Tokenizer
+
+        tok = Tokenizer.from_file(args.tokenizer_json)
+        ids = tok.encode(args.prompt).ids
+        ids = (ids + [0] * args.seq)[: args.seq]
+        np.asarray(ids, dtype=np.int32).tofile(args.tokens_out)
+        print(f"tokens({args.prompt!r}) -> {args.tokens_out} {ids}", flush=True)
 
     if not args.out:
         return
