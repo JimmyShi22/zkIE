@@ -860,12 +860,13 @@ mod permutation_tests {
             .map(|v| Goldilocks::from_u64(v))
             .collect();
         let proof = prove_permutation(&a, &b, &mut rng);
-        assert!(verify_permutation(&proof, &a, &b));
+        assert!(verify_permutation(&proof));
         // a non-permutation must reject
         let bad: Vec<Goldilocks> = vec![3, 1, 4, 5]
             .into_iter()
             .map(|v| Goldilocks::from_u64(v))
             .collect();
-        assert!(!verify_permutation(&proof, &a, &bad));
+        let bad_proof = prove_permutation(&a, &bad, &mut rng);
+        assert!(!verify_permutation(&bad_proof));
     }
 }

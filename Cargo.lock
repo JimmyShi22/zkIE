@@ -1697,6 +1697,7 @@ dependencies = [
  "rand",
  "rayon",
  "serde",
+ "serde_json",
  "sha2",
  "sppark",
  "which",
@@ -1712,6 +1713,16 @@ dependencies = [
 
 [[package]]
 name = "zkie-models-deepseek-v2-lite"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "zkie-core",
+ "zkie-engine",
+ "zkie-ops",
+]
+
+[[package]]
+name = "zkie-models-deepseek-v41-flash"
 version = "0.1.0"
 dependencies = [
  "bincode",

@@ -37,6 +37,7 @@ use zkie_core::common::logup_gkr::{
 use zkie_core::common::matmul::{prove as matmul_prove, verify as matmul_verify, MatmulProof};
 use zkie_core::common::batched_matmul::{self as bmm, BatchedMatmulProof};
 use zkie_core::common::mle;
+use zkie_core::common::quantized_io::{QuantDtype, SafetensorFile};
 use zkie_core::common::same_poly::{prove_same_poly, verify_same_poly, SamePolyProof};
 use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
 use zkie_core::common::transcript::Transcript;
@@ -517,6 +518,17 @@ pub enum TensorData {
         start: usize,
         len: usize,
     },
+    /// A quantized safetensors weight plus its block scale, materialized on
+    /// demand into fixed-point Goldilocks. `weight` and `scale` are tensor names
+    /// in `file`; `dtype` selects FP8-E4M3 or packed FP4-E2M1.
+    Quantized {
+        file: Arc<SafetensorFile>,
+        weight: String,
+        scale: String,
+        dtype: QuantDtype,
+        logical_cols: usize,
+        block_size: usize,
+    },
 }
 
 /// A shard's tensor store: `v[id]` is a Goldilocks tensor; `idx[id]` is an
@@ -541,6 +553,26 @@ impl Store {
         self.v.push(TensorData::Mmap { mmap, start, len });
         id
     }
+    pub fn push_quantized(
+        &mut self,
+        file: Arc<SafetensorFile>,
+        weight: String,
+        scale: String,
+        dtype: QuantDtype,
+        logical_cols: usize,
+        block_size: usize,
+    ) -> T {
+        let id = self.v.len();
+        self.v.push(TensorData::Quantized {
+            file,
+            weight,
+            scale,
+            dtype,
+            logical_cols,
+            block_size,
+        });
+        id
+    }
     pub fn push_idx(&mut self, t: Vec<u32>) -> T {
         let id = self.idx.len();
         self.idx.push(t);
@@ -550,18 +582,44 @@ impl Store {
         match &self.v[id] {
             TensorData::Owned(v) => v,
             TensorData::Mmap { .. } => panic!("get() on mmap-backed tensor; use materialize()"),
+            TensorData::Quantized { .. } => {
+                panic!("get() on quantized tensor; use materialize()")
+            }
         }
     }
     pub fn materialize(&self, id: T) -> Cow<'_, [Goldilocks]> {
         match &self.v[id] {
             TensorData::Owned(v) => Cow::Borrowed(v),
             TensorData::Mmap { mmap, start, len } => Cow::Owned(mmap.read_goldilocks(*start, *len)),
+            TensorData::Quantized {
+                file,
+                weight,
+                scale,
+                dtype,
+                logical_cols,
+                block_size,
+            } => {
+                let out = match dtype {
+                    QuantDtype::Fp8E4M3 => {
+                        file.read_fp8_weight(weight, scale, *block_size)
+                    }
+                    QuantDtype::Int8 => file.read_fp4_weight(
+                        weight,
+                        scale,
+                        *logical_cols,
+                        *block_size,
+                    ),
+                    _ => panic!("unsupported quantized weight dtype {dtype:?}"),
+                };
+                Cow::Owned(out)
+            }
         }
     }
     pub fn get_mut(&mut self, id: T) -> &mut [Goldilocks] {
         match &mut self.v[id] {
             TensorData::Owned(v) => v,
             TensorData::Mmap { .. } => panic!("get_mut() on mmap-backed tensor"),
+            TensorData::Quantized { .. } => panic!("get_mut() on quantized tensor"),
         }
     }
 
@@ -573,6 +631,7 @@ impl Store {
             .map(|td| match td {
                 TensorData::Owned(v) => v.as_slice(),
                 TensorData::Mmap { .. } => &[],
+                TensorData::Quantized { .. } => &[],
             })
             .collect()
     }
@@ -611,6 +670,18 @@ pub enum Op {
         m: usize,
         k: usize,
         n: usize,
+    },
+    /// Block-quantized matmul. `w` is a [`TensorData::Quantized`] weight whose
+    /// dequantization is materialized on demand; `a` is the activation, `c` the
+    /// unrounded output. The block size is part of the public statement.
+    BlockQuantizedMatMul {
+        a: T,
+        w: T,
+        c: T,
+        m: usize,
+        k: usize,
+        n: usize,
+        block_size: usize,
     },
     Projection {
         x: T,
@@ -806,6 +877,12 @@ pub enum OpProof {
         Vec<Goldilocks>,
         Vec<Goldilocks>,
     ),
+    BlockQuantizedMatMul(
+        MatmulProof,
+        Vec<Goldilocks>,
+        Vec<Goldilocks>,
+        Vec<Goldilocks>,
+    ),
     Projection(ProjectionProof),
     Add(VirtualProof, Vec<Goldilocks>),
     Lookup,
@@ -959,6 +1036,7 @@ impl Op {
             Op::ScaleVec { x, scale, .. } => vec![x, scale],
             Op::Relu { x, .. } => vec![x],
             Op::MatMul { a, b, .. } => vec![a, b],
+            Op::BlockQuantizedMatMul { a, w, .. } => vec![a, w],
             Op::Projection { x, w, bias, .. } => vec![x, w, bias],
             Op::Add { a, b, .. } => vec![a, b],
             Op::Lookup { idx, table, .. } => vec![idx, table],
@@ -1018,7 +1096,9 @@ impl Op {
             | Op::RmsNorm { out, .. }
             | Op::RoPE { out, .. }
             | Op::ScaleGate { out, .. } => vec![out],
-            Op::MatMul { c, .. } | Op::Add { c, .. } => vec![c],
+            Op::MatMul { c, .. }
+            | Op::BlockQuantizedMatMul { c, .. }
+            | Op::Add { c, .. } => vec![c],
             Op::Projection { out, rem, .. } => vec![out, rem],
             Op::Softmax { e, out, .. } => vec![e, out],
             Op::TopKSelect {
@@ -1327,6 +1407,23 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
             Op::MatMul { a, b, c, m, k, n } => {
                 let bv = store.materialize(b);
                 let cval = crate::par::mm_par_fixed(store.get(a), bv.as_ref(), m, k, n);
+                store.v[c] = TensorData::Owned(cval);
+            }
+            Op::BlockQuantizedMatMul {
+                a,
+                w,
+                c,
+                m,
+                k,
+                n,
+                block_size: _,
+            } => {
+                // The quantized weight materializes in n x k (output rows x
+                // input cols), matching safetensors. Transpose it to the k x n
+                // layout `mm_par_fixed` expects.
+                let wv = store.materialize(w);
+                let wt = transpose(wv.as_ref(), n, k);
+                let cval = crate::par::mm_par_fixed(store.get(a), &wt, m, k, n);
                 store.v[c] = TensorData::Owned(cval);
             }
             Op::Projection {
@@ -1745,6 +1842,39 @@ pub fn prove_shard_precomputed(
                 claims.push((c, cp.clone(), mle::eval(store.get(c), &cp)));
                 op_proofs.push(OpProof::MatMul(p, u, v, ch));
             }
+            Op::BlockQuantizedMatMul {
+                a,
+                w,
+                c,
+                m,
+                k,
+                n,
+                block_size: _,
+            } => {
+                let at = transpose(store.get(a), m, k);
+                let wv = store.materialize(w);
+                let wt = transpose(wv.as_ref(), n, k);
+                let u: Vec<Goldilocks> = (0..m.trailing_zeros() as usize)
+                    .map(|_| rng.field())
+                    .collect();
+                let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize)
+                    .map(|_| rng.field())
+                    .collect();
+                let ch: Vec<Goldilocks> = (0..k.trailing_zeros() as usize)
+                    .map(|_| rng.field())
+                    .collect();
+                let p = matmul_prove(&at, &wt, store.get(c), m, k, n, &u, &v, &ch);
+                let mut ap = ch.clone();
+                ap.extend_from_slice(&u);
+                claims.push((a, ap.clone(), mle::eval(store.get(a), &ap)));
+                let mut wp = v.clone();
+                wp.extend_from_slice(&ch);
+                claims.push((w, wp.clone(), mle::eval(wv.as_ref(), &wp)));
+                let mut cp = v.clone();
+                cp.extend_from_slice(&u);
+                claims.push((c, cp.clone(), mle::eval(store.get(c), &cp)));
+                op_proofs.push(OpProof::BlockQuantizedMatMul(p, u, v, ch));
+            }
             Op::Projection {
                 x,
                 w,
@@ -2155,6 +2285,14 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
                     return false;
                 }
             }
+            (
+                Op::BlockQuantizedMatMul { .. },
+                OpProof::BlockQuantizedMatMul(mp, _, _, ch),
+            ) => {
+                if !matmul_verify(mp, ch) {
+                    return false;
+                }
+            }
             (Op::Projection { shift, .. }, OpProof::Projection(pp)) => {
                 if !verify_projection(pp, *shift) {
                     return false;
@@ -2515,6 +2653,9 @@ fn collect_weight_tensors(ops: &[Op]) -> Vec<T> {
                 if !written.contains(b) {
                     weights.insert(*b);
                 }
+            }
+            Op::BlockQuantizedMatMul { w, .. } => {
+                weights.insert(*w);
             }
             Op::Projection { w, bias, .. } => {
                 weights.insert(*w);
@@ -6504,6 +6645,7 @@ mod tests {
             | OpProof::BroadcastScale => false,
             // Carry their own argument.
             OpProof::MatMul(..)
+            | OpProof::BlockQuantizedMatMul(..)
             | OpProof::Projection(..)
             | OpProof::Add(..)
             | OpProof::Lookup
