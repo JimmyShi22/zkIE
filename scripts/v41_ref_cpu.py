@@ -117,7 +117,7 @@ def main():
     ap.add_argument("--m", type=int, default=1)
     ap.add_argument("--k", type=int, default=4096)
     ap.add_argument("--n", type=int, default=8192)
-    ap.add_argument("--mode", choices=["matmul", "attention", "proj", "oproj", "moe_gate", "shared_expert", "routed_expert", "mlp", "embedding"], default="matmul")
+    ap.add_argument("--mode", choices=["matmul", "attention", "attention_head0", "proj", "oproj", "moe_gate", "shared_expert", "routed_expert", "mlp", "embedding"], default="matmul")
     ap.add_argument("--expert-id", type=int, default=240)
     ap.add_argument("--tokenizer-json", default="")
     ap.add_argument("--prompt", default="The sky is")
@@ -196,6 +196,52 @@ def main():
         fixed = np.round(out[0] * 65536.0).astype(np.int64)
         for i in range(8):
             print(f"[{i}] {int(fixed[0, i])}")
+        return
+
+    if args.mode == "attention_head0":
+        m = 16
+        dim = 5120
+        dim_pad = 8192
+        heads = 64
+        head_dim = 512
+        q_lora = 1280
+        q_lora_pad = 2048
+        qk_rope = 64
+        def fixed_float(w):
+            s = w * 65536.0
+            return np.where(s >= 0, np.floor(s + 0.5), np.ceil(s - 0.5)).astype(np.float64) / 65536.0
+        def pad2d(w, nr, nc):
+            out = np.zeros((nr, nc), dtype=np.float64)
+            out[: w.shape[0], : w.shape[1]] = w
+            return out
+        q_norm = np.zeros(q_lora_pad)
+        q_norm[:q_lora] = bf16_vec(t["layers.0.attn.q_norm.weight"])
+        kv_norm = bf16_vec(t["layers.0.attn.kv_norm.weight"])
+        wq_a = pad2d(fixed_float(dequant_fp8_weight(t["layers.0.attn.wq_a.weight"], t["layers.0.attn.wq_a.scale"])), q_lora_pad, dim_pad)
+        wq_b = pad2d(fixed_float(dequant_fp8_weight(t["layers.0.attn.wq_b.weight"], t["layers.0.attn.wq_b.scale"])), heads * head_dim, q_lora_pad)
+        wkv = pad2d(fixed_float(dequant_fp8_weight(t["layers.0.attn.wkv.weight"], t["layers.0.attn.wkv.scale"])), head_dim, dim_pad)
+        x = np.zeros((1, m, dim_pad))
+        x[:, :, :dim] = 1.0
+        qr = rms_norm(x @ wq_a.T, q_norm)
+        q = (qr @ wq_b.T).reshape(1, m, heads, head_dim)
+        kv = rms_norm(x @ wkv.T, kv_norm)
+        pos = np.arange(m, dtype=np.float64)
+        inv = np.arange(qk_rope // 2, dtype=np.float64)
+        freqs = pos[:, None] * np.power(10000.0, -2.0 * inv / qk_rope)
+        q[..., -qk_rope:] = rope(q[..., -qk_rope:], freqs[None, :, None, :])
+        kv[..., -qk_rope:] = rope(kv[..., -qk_rope:], freqs[None, :, :])
+        # dense causal attention without sink
+        o = np.zeros_like(q)
+        scale = head_dim ** -0.5
+        for p in range(m):
+            kv_sel = kv[0, : p + 1, :]
+            scores = q[0, p] @ kv_sel.T * scale
+            scores = scores - np.max(scores, axis=1, keepdims=True)
+            probs = np.exp(scores)
+            probs = probs / probs.sum(axis=1, keepdims=True)
+            o[0, p] = probs @ kv_sel
+        fixed = np.round(o[0, 0, :8] * 65536.0).astype(np.int64)
+        print("attention_head0", fixed.tolist())
         return
 
     if args.mode == "proj":
