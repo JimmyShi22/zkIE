@@ -102,7 +102,7 @@ def main():
     ap.add_argument("--m", type=int, default=1)
     ap.add_argument("--k", type=int, default=4096)
     ap.add_argument("--n", type=int, default=8192)
-    ap.add_argument("--mode", choices=["matmul", "attention", "proj", "oproj"], default="matmul")
+    ap.add_argument("--mode", choices=["matmul", "attention", "proj", "oproj", "moe_gate"], default="matmul")
     args = ap.parse_args()
 
     t = read_safetensors(args.shard)
@@ -213,6 +213,24 @@ def main():
         s = oa.astype(np.int64) @ wb[:4, :].T
         fixed = np.floor_divide(s + (1 << 15), 1 << 16)
         print("oproj", fixed[:4].tolist())
+        return
+
+    if args.mode == "moe_gate":
+        m = 16
+        dim = 5120
+        n_experts = 384
+        gate_w = bf16_vec(t["layers.0.ffn.gate.weight"])
+        gate_w = gate_w.reshape(n_experts, dim)
+        gate_b = np.frombuffer(t["layers.0.ffn.gate.bias"]["data"], dtype="<f4").astype(np.float64)
+        x = np.ones((m, dim), dtype=np.float64)
+        scores = (x @ gate_w.T) / 1.0
+        scores = np.sqrt(np.log1p(np.exp(scores)))
+        biased = scores + gate_b[None, :]
+        topk = np.argsort(-biased, axis=1)[:, :6]
+        weights = np.take_along_axis(scores, topk, axis=1)
+        weights = weights / (weights.sum(axis=1, keepdims=True) + 1e-20)
+        print("moe_gate_topk", topk[0].tolist())
+        print("moe_gate_weights", np.round(weights[0] * 65536.0).astype(np.int64).tolist())
         return
 
     winfo = t[args.weight]
