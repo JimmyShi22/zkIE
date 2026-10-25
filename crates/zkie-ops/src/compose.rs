@@ -615,6 +615,28 @@ impl Store {
             }
         }
     }
+    pub fn len(&self, id: T) -> usize {
+        match &self.v[id] {
+            TensorData::Owned(v) => v.len(),
+            TensorData::Mmap { len, .. } => *len,
+            TensorData::Quantized {
+                file,
+                weight,
+                dtype,
+                logical_cols,
+                ..
+            } => {
+                let info = file
+                    .tensor(weight)
+                    .unwrap_or_else(|| panic!("quantized tensor {weight} not found"));
+                match dtype {
+                    QuantDtype::Fp8E4M3 => info.shape.iter().product(),
+                    QuantDtype::Int8 => info.shape[0] * *logical_cols,
+                    _ => panic!("unsupported quantized weight dtype {dtype:?}"),
+                }
+            }
+        }
+    }
     pub fn get_mut(&mut self, id: T) -> &mut [Goldilocks] {
         match &mut self.v[id] {
             TensorData::Owned(v) => v,
@@ -2711,17 +2733,17 @@ pub fn commit_model_weights(
     const SECURITY: usize = 90;
 
     let weight_tensors = collect_weight_tensors(ops);
-    let mut by_size: std::collections::BTreeMap<usize, Vec<(T, Vec<Goldilocks>)>> =
+    let mut by_size: std::collections::BTreeMap<usize, Vec<T>> =
         std::collections::BTreeMap::new();
     for &t in &weight_tensors {
-        let v = store.materialize(t).into_owned();
+        let len = store.len(t);
         // WHIR folding factor is 5, so a tensor shorter than 2^5 cannot be
         // folded; skip such tiny weights (they are negligible and have no
         // meaningful commitment).
-        if v.len() < 32 {
+        if len < 32 {
             continue;
         }
-        by_size.entry(v.len()).or_default().push((t, v));
+        by_size.entry(len).or_default().push(t);
     }
     std::fs::create_dir_all(cache_dir).expect("create weight cache dir");
 
@@ -2744,12 +2766,20 @@ pub fn commit_model_weights(
             // (e.g. a 2^28 lm_head) gets a higher budget while small groups stay
             // cheap. See Whir::required_pow_bits.
             let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, SECURITY);
-            let refs: Vec<&[Goldilocks]> = ids.iter().map(|(_, v)| v.as_slice()).collect();
+            // Materialize exactly this group, commit it, then drop the vectors
+            // before moving to the next group. This keeps peak memory near the
+            // largest single group instead of the whole 552B parameter set.
+            let materialized: Vec<Vec<Goldilocks>> = ids
+                .iter()
+                .map(|&t| store.materialize(t).into_owned())
+                .collect();
+            let refs: Vec<&[Goldilocks]> =
+                materialized.iter().map(|v| v.as_slice()).collect();
             let base_whir = zkie_core::pcs::whir::Whir::with_params(arity, SECURITY, pow_bits);
             let (commitment, prover_data, _protocol, batch_whir) =
                 base_whir.commit_batch(&refs);
             let num_vars = batch_whir.num_variables();
-            let table_ids: Vec<T> = ids.iter().map(|(t, _)| *t).collect();
+            let table_ids: Vec<T> = ids.to_vec();
             let cache_path = std::path::PathBuf::from(cache_dir).join(format!(
                 "weight-a{arity}-g{}.bin",
                 batches.len()

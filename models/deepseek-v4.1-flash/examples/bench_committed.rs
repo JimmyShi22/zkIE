@@ -9,8 +9,7 @@ use zkie_core::common::fixed_point::from_i64;
 use zkie_core::pcs::whir::Whir;
 use zkie_models_deepseek_v41_flash::{build_quantized_matmul, open_shard, push_quantized_fp8};
 use zkie_ops::compose::{
-    commit_model_weights, prove_committed_shard_dag, verify_committed_shard_dag_bytes,
-    verify_shard, Store,
+    commit_model_weights, prove_committed_shard_dag, verify_committed_shard_dag_bytes, Store,
 };
 
 fn peak_rss_kb() -> u64 {
@@ -71,33 +70,6 @@ fn main() {
 
     let t2 = std::time::Instant::now();
     let bytes = bincode::serialize(&proof).unwrap();
-    println!("shard_verify={}", verify_shard(&[], &ops, &proof.shards[0]));
-    println!("weight_batches={} openings={}", proof.weight_batches.len(), proof.weight_batch_openings.len());
-    for (i, o) in proof.weight_batch_openings.iter().enumerate() {
-        let batch = &proof.weight_batches[i];
-        let protocol = batch.whir.opening_protocol(batch.arity, batch.num_tables);
-        let ok = match &o.proof {
-            Some(p) => zkie_core::pcs::batch_open::verify_batch_open_committed(
-                &batch.whir,
-                &batch.commitment,
-                &protocol,
-                batch.num_tables,
-                &o.table_idxs,
-                &o.points,
-                &o.claimed,
-                p,
-            ),
-            None => false,
-        };
-        println!(
-            "opening[{i}] proof={} idxs={} points={} claimed={} verify={}",
-            o.proof.is_some(),
-            o.table_idxs.len(),
-            o.points.len(),
-            o.claimed.len(),
-            ok
-        );
-    }
     assert!(verify_committed_shard_dag_bytes(
         &bytes,
         &store.owned_slices(),
