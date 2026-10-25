@@ -132,6 +132,8 @@ fn main() {
             k: m,
             n: nope_pad,
         });
+        let attn_n16 = store.push(vec![]);
+        ops.push(Op::Scale { x: attn_n, out: attn_n16, factor: 1, shift: 16 });
         ops.push(Op::MatMul {
             a: probs,
             b: kvr,
@@ -140,11 +142,26 @@ fn main() {
             k: m,
             n: qk,
         });
-        head_outs.push(attn_n);
+        let attn_r16 = store.push(vec![]);
+        ops.push(Op::Scale { x: attn_r, out: attn_r16, factor: 1, shift: 16 });
+        head_outs.push(attn_n16);
     }
 
     let mut rng = zkie_core::common::field::XorShift64::new(0xACE);
     let proof = prove_shard(&mut store, &ops, &[], &mut rng);
     assert!(verify_shard(&store.owned_slices(), &ops, &proof));
     println!("ok heads={N_HEADS} m={m} ops={}", ops.len());
+    if let Some(&h0) = head_outs.first() {
+        let vals = store.get(h0);
+        let mut out = Vec::new();
+        for v in vals.iter().take(8) {
+            out.push(zkiE_i64(*v));
+        }
+        println!("attn_head0_first8={out:?}");
+    }
+}
+
+fn zkiE_i64(v: Goldilocks) -> i64 {
+    use zkie_core::common::fixed_point::to_i64;
+    to_i64(v)
 }
