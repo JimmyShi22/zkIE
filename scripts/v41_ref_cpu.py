@@ -19,6 +19,7 @@ import argparse
 import json
 import struct
 import math
+from pathlib import Path
 
 import numpy as np
 
@@ -116,11 +117,28 @@ def main():
     ap.add_argument("--m", type=int, default=1)
     ap.add_argument("--k", type=int, default=4096)
     ap.add_argument("--n", type=int, default=8192)
-    ap.add_argument("--mode", choices=["matmul", "attention", "proj", "oproj", "moe_gate", "shared_expert", "routed_expert", "mlp"], default="matmul")
+    ap.add_argument("--mode", choices=["matmul", "attention", "proj", "oproj", "moe_gate", "shared_expert", "routed_expert", "mlp", "embedding"], default="matmul")
     ap.add_argument("--expert-id", type=int, default=240)
+    ap.add_argument("--tokenizer-json", default="")
+    ap.add_argument("--prompt", default="The sky is")
     args = ap.parse_args()
 
     t = read_safetensors(args.shard)
+
+    if args.mode == "embedding":
+        from tokenizers import Tokenizer
+
+        tok = Tokenizer.from_file(args.tokenizer_json)
+        ids = tok.encode(args.prompt).ids
+        # The embedding shard is model-00002, not the layer shard.
+        raw_dir = Path(args.shard).parent
+        emb_path = raw_dir / "model-00002-of-00048.safetensors"
+        e = read_safetensors(str(emb_path))
+        w = bf16_vec(e["embed.weight"]).reshape(-1, 5120)
+        fixed = np.round(w[ids] * 65536.0).astype(np.int64)
+        print("embedding_ids", ids)
+        print("embedding[0..4]", fixed[0, :4].tolist())
+        return
 
     if args.mode == "attention":
         m = 16
