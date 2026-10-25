@@ -186,14 +186,18 @@ def main():
         m = 16
         o_lora = 1024
         o_groups = 8
-        wo_a = dequant_fp8_weight(t["layers.0.attn.wo_a.weight"], t["layers.0.attn.wo_a.scale"])
-        wo_b = dequant_fp8_weight(t["layers.0.attn.wo_b.weight"], t["layers.0.attn.wo_b.scale"])
-        o = np.ones((m, o_groups, 4096), dtype=np.float64)
-        wo_a = wo_a.reshape(o_groups, o_lora, 4096)
-        o = np.einsum("sgd,grd->sgr", o, wo_a)
-        out = o.reshape(m, -1) @ wo_b.T
-        fixed = np.round(out * 65536.0).astype(np.int64)
-        print("oproj", fixed.reshape(-1)[:4].tolist())
+        def fixed(w):
+            s = w * 65536.0
+            return np.where(s >= 0, np.floor(s + 0.5), np.ceil(s - 0.5)).astype(np.int64)
+        wa = fixed(dequant_fp8_weight(t["layers.0.attn.wo_a.weight"], t["layers.0.attn.wo_a.scale"]))
+        wb = fixed(dequant_fp8_weight(t["layers.0.attn.wo_b.weight"], t["layers.0.attn.wo_b.scale"]))
+        # wo_a is [g*r, d] with g=8, r=1024. With all-ones input at 2^16 and
+        # shift 16, each output is the exact integer sum of its weight row.
+        oa = wa.reshape(o_groups, o_lora, 4096).sum(axis=2).reshape(-1)
+        # wo_b is stored padded [8192,8192]; first 5120 output rows are real.
+        s = oa.astype(np.int64) @ wb[:4, :].T
+        fixed = np.floor_divide(s + (1 << 15), 1 << 16)
+        print("oproj", fixed[:4].tolist())
         return
 
     winfo = t[args.weight]
