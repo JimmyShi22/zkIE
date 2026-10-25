@@ -42,5 +42,5 @@ python3 scripts/extract_v41.py --raw models/deepseek-v4.1-flash/raw --out /tmp/c
   op/proof。
 - 40 层 CSA2/CED 全图、MoE、真实 seq16/seq512 端到端。
 
-注意：完整 552B 权重中 `model-00048-of-00048.safetensors` 尚未下载完整，layer14
-Engram 权重也在这个分片里，所以全量承诺和真实端到端目前仍受下载状态阻塞。
+`model-00048-of-00048.safetensors` 已下载完整（101,537,926,640 bytes），layer14
+Engram 权重现已就位，全量承诺不再受下载阻塞。
