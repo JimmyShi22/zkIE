@@ -149,6 +149,8 @@ def main():
     ap.add_argument("--tokenizer-json", default="")
     ap.add_argument("--tokens-out", default="")
     ap.add_argument("--prompt", default="The sky is")
+    ap.add_argument("--rsqrt-out", default="")
+    ap.add_argument("--limb-out", default="")
     args = ap.parse_args()
 
     raw = Path(args.raw)
@@ -165,6 +167,29 @@ def main():
         cos.tofile(rope_dir / "cos_i32.bin")
         sin.tofile(rope_dir / "sin_i32.bin")
         print(f"rope -> {rope_dir}/cos_i32.bin {rope_dir}/sin_i32.bin", flush=True)
+
+    if args.rsqrt_out:
+        out_dir = Path(args.rsqrt_out)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fine = np.arange(1 << 20, dtype=np.float64)
+        coarse = np.arange(1 << 22, dtype=np.float64)
+        coarse2 = np.arange(1 << 21, dtype=np.float64)
+        index_scale = 1 << 14
+        eps = 1e-6
+        vals = np.concatenate([
+            1.0 / np.sqrt(fine / index_scale + eps),
+            1.0 / np.sqrt(((1 << 20) + coarse * (1 << 8)) / index_scale + eps),
+            1.0 / np.sqrt(((1 << 20) + (1 << 22) * (1 << 8) + coarse2 * (1 << 16)) / index_scale + eps),
+        ])
+        table = np.clip(np.round(vals * 65536.0), 0, 2**31 - 1).astype(np.int32)
+        table.tofile(out_dir / "rsqrt_table_i32.bin")
+        print(f"rsqrt -> {out_dir}/rsqrt_table_i32.bin", flush=True)
+
+    if args.limb_out:
+        out_dir = Path(args.limb_out)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        np.arange(1 << 16, dtype=np.int32).tofile(out_dir / "limb_table_i32.bin")
+        print(f"limb -> {out_dir}/limb_table_i32.bin", flush=True)
 
     if args.tokens_out and args.tokenizer_json:
         from tokenizers import Tokenizer
