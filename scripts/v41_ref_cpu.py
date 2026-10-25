@@ -102,7 +102,7 @@ def main():
     ap.add_argument("--m", type=int, default=1)
     ap.add_argument("--k", type=int, default=4096)
     ap.add_argument("--n", type=int, default=8192)
-    ap.add_argument("--mode", choices=["matmul", "attention"], default="matmul")
+    ap.add_argument("--mode", choices=["matmul", "attention", "proj"], default="matmul")
     args = ap.parse_args()
 
     t = read_safetensors(args.shard)
@@ -148,6 +148,38 @@ def main():
         fixed = np.round(out[0] * 65536.0).astype(np.int64)
         for i in range(8):
             print(f"[{i}] {int(fixed[0, i])}")
+        return
+
+    if args.mode == "proj":
+        m = 16
+        dim = 5120
+        n_heads = 64
+        head_dim = 512
+        q_lora = 1280
+        wq_a = dequant_fp8_weight(t["layers.0.attn.wq_a.weight"], t["layers.0.attn.wq_a.scale"])
+        wq_b = dequant_fp8_weight(t["layers.0.attn.wq_b.weight"], t["layers.0.attn.wq_b.scale"])
+        wkv = dequant_fp8_weight(t["layers.0.attn.wkv.weight"], t["layers.0.attn.wkv.scale"])
+        x = np.ones((1, m, dim), dtype=np.float64)
+        def fixed(w):
+            s = w * 65536.0
+            return np.where(s >= 0, np.floor(s + 0.5), np.ceil(s - 0.5)).astype(np.int64)
+        wq_a_f = fixed(wq_a)
+        wq_b_f = fixed(wq_b)
+        wkv_f = fixed(wkv)
+        xf = np.full((1, m, dim), 65536, dtype=np.int64)
+        # Rust path: exact integer dot, then round_div by 2^16.
+        qr_h = xf @ wq_a_f.T
+        qr = np.floor_divide(qr_h + (1 << 15), 1 << 16)[0]
+        q_h = qr.astype(np.int64) @ wq_b_f.T
+        q = np.floor_divide(q_h + (1 << 15), 1 << 16)[0]
+        kv_h = xf @ wkv_f.T
+        kv = np.floor_divide(kv_h + (1 << 15), 1 << 16)[0]
+        qrf = qr
+        qf = q
+        kvf = kv
+        print("qr", qrf.reshape(-1)[:4].tolist())
+        print("q", qf.reshape(-1)[:4].tolist())
+        print("kv", kvf.reshape(-1)[:4].tolist())
         return
 
     winfo = t[args.weight]
