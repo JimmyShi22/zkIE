@@ -44,3 +44,6 @@ python3 scripts/extract_v41.py --raw models/deepseek-v4.1-flash/raw --out /tmp/c
 
 `model-00048-of-00048.safetensors` 已下载完整（101,537,926,640 bytes），layer14
 Engram 权重现已就位，全量承诺不再受下载阻塞。
+
+layer14 Engram 关键形状：`embed.weight` FP8 [384016682,256]（约 98GB），
+`q/k_weight` BF16 [4,5120]，`wkv.weight` FP8 [25600,6144]。
