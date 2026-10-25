@@ -142,10 +142,30 @@ def main():
     ap.add_argument("--layers", default="0")
     ap.add_argument("--only-text", action="store_true")
     ap.add_argument("--filter", default="", help="substring filter on tensor name")
+    ap.add_argument("--rope-out", default="", help="output directory for RoPE cos/sin i32 bins")
+    ap.add_argument("--seq", type=int, default=512)
+    ap.add_argument("--rope-head-dim", type=int, default=64)
+    ap.add_argument("--rope-theta", type=float, default=10000.0)
     args = ap.parse_args()
 
     raw = Path(args.raw)
     out = Path(args.out)
+
+    if args.rope_out:
+        rope_dir = Path(args.rope_out)
+        rope_dir.mkdir(parents=True, exist_ok=True)
+        pos = np.arange(args.seq, dtype=np.float64)[:, None]
+        inv = np.arange(args.rope_head_dim // 2, dtype=np.float64)[None, :]
+        freqs = pos * np.power(args.rope_theta, -2.0 * inv / args.rope_head_dim)
+        cos = np.clip(np.round(np.cos(freqs) * 65536.0), -(2**31), 2**31 - 1).astype(np.int32)
+        sin = np.clip(np.round(np.sin(freqs) * 65536.0), -(2**31), 2**31 - 1).astype(np.int32)
+        cos.tofile(rope_dir / "cos_i32.bin")
+        sin.tofile(rope_dir / "sin_i32.bin")
+        print(f"rope -> {rope_dir}/cos_i32.bin {rope_dir}/sin_i32.bin", flush=True)
+
+    if not args.out:
+        return
+
     layers = [int(x) for x in args.layers.split(",")]
     index_path = raw / "model.safetensors.index.json"
     index = json.loads(index_path.read_text())["weight_map"]
