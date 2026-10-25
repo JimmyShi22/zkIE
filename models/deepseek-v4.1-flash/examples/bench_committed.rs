@@ -9,7 +9,8 @@ use zkie_core::common::fixed_point::from_i64;
 use zkie_core::pcs::whir::Whir;
 use zkie_models_deepseek_v41_flash::{build_quantized_matmul, open_shard, push_quantized_fp8};
 use zkie_ops::compose::{
-    commit_model_weights, prove_committed_shard_dag, verify_committed_shard_dag_bytes, Store,
+    commit_model_weights, prove_committed_shard_dag_with_ranges,
+    verify_committed_shard_dag_with_ranges, Store,
 };
 
 fn peak_rss_kb() -> u64 {
@@ -56,10 +57,10 @@ fn main() {
     let commit_t = t0.elapsed();
 
     let t1 = std::time::Instant::now();
-    let proof = prove_committed_shard_dag(
+    let proof = prove_committed_shard_dag_with_ranges(
         &mut store,
         &ops,
-        1,
+        &[(0, 1)],
         &whir,
         &cached,
         &mut rng,
@@ -70,12 +71,12 @@ fn main() {
 
     let t2 = std::time::Instant::now();
     let bytes = bincode::serialize(&proof).unwrap();
-    assert!(verify_committed_shard_dag_bytes(
-        &bytes,
+    assert!(verify_committed_shard_dag_with_ranges(
         &store.owned_slices(),
         &ops,
-        1,
+        &[(0, 1)],
         &whir,
+        &proof,
     ));
     let verify_t = t2.elapsed();
 

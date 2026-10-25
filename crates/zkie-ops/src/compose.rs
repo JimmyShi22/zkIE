@@ -2446,6 +2446,23 @@ fn absorb_statement(t: &mut Transcript, ops: &[Op], ops_per_shard: usize) {
     }
 }
 
+fn absorb_statement_ranges(t: &mut Transcript, ops: &[Op], ranges: &[(usize, usize)]) {
+    t.absorb_u64(ranges.len() as u64);
+    t.absorb_u64(ops.len() as u64);
+    for &(s, e) in ranges {
+        t.absorb_u64(s as u64);
+        t.absorb_u64(e as u64);
+    }
+    for op in ops {
+        for id in op.reads() {
+            t.absorb_u64(id as u64);
+        }
+        for id in op.writes() {
+            t.absorb_u64(id as u64);
+        }
+    }
+}
+
 pub fn prove_shard_dag(
     store: &mut Store,
     ops: &[Op],
@@ -2482,6 +2499,61 @@ pub fn prove_shard_dag(
     }
     // Recompute per-tensor shard count with a set (a tensor may be claimed twice
     // by one shard, so a plain counter would overcount).
+    let mut tensor_shards: std::collections::BTreeMap<T, std::collections::HashSet<usize>> =
+        std::collections::BTreeMap::new();
+    for (si, shard) in shards.iter().enumerate() {
+        for (t, _, _) in &shard.claims {
+            tensor_shards.entry(*t).or_default().insert(si);
+        }
+    }
+
+    let mut cross_tensors = Vec::new();
+    let mut cross_binds = Vec::new();
+    for (t, claims) in by_tensor {
+        if tensor_shards.get(&t).map(|s| s.len()).unwrap_or(0) > 1 {
+            let sp = prove_same_poly(store.get(t), &claims, &mut master);
+            cross_tensors.push(t);
+            cross_binds.push(sp);
+        }
+    }
+    ShardDagProof {
+        shards,
+        cross_tensors,
+        cross_binds,
+    }
+}
+
+/// Like [`prove_shard_dag`], but uses explicit `[start, end)` ranges. This is
+/// what the 40-layer builder needs: shard boundaries follow layer boundaries,
+/// not a fixed op count.
+pub fn prove_shard_dag_with_ranges(
+    store: &mut Store,
+    ops: &[Op],
+    ranges: &[(usize, usize)],
+) -> ShardDagProof {
+    forward_ops(store, ops);
+    let store_ref: &Store = store;
+
+    let mut master = Transcript::new(b"zkie-shard-dag-v1");
+    absorb_statement_ranges(&mut master, ops, ranges);
+
+    let shards: Vec<OpShardProof> = ranges
+        .par_iter()
+        .enumerate()
+        .map(|(si, &(s, e))| {
+            let mut child = master.clone();
+            child.absorb_u64(si as u64);
+            prove_shard_precomputed(store_ref, &ops[s..e], &[], &mut child)
+        })
+        .collect();
+
+    let mut by_tensor: std::collections::BTreeMap<T, Vec<(Vec<Goldilocks>, Goldilocks)>> =
+        std::collections::BTreeMap::new();
+    for shard in shards.iter() {
+        for (t, pt, ev) in &shard.claims {
+            by_tensor.entry(*t).or_default().push((pt.clone(), *ev));
+        }
+    }
     let mut tensor_shards: std::collections::BTreeMap<T, std::collections::HashSet<usize>> =
         std::collections::BTreeMap::new();
     for (si, shard) in shards.iter().enumerate() {
@@ -2553,6 +2625,51 @@ pub fn verify_shard_dag(
         }
     }
 
+    let mut expected_cross: Vec<T> = Vec::new();
+    for (t, _) in &by_tensor {
+        if tensor_shards.get(t).map(|s| s.len()).unwrap_or(0) > 1 {
+            expected_cross.push(*t);
+        }
+    }
+    if expected_cross != proof.cross_tensors {
+        return false;
+    }
+    for (ci, &t) in proof.cross_tensors.iter().enumerate() {
+        if verify_same_poly(&proof.cross_binds[ci], &by_tensor[&t]).is_none() {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn verify_shard_dag_with_ranges(
+    tables: &[&[Goldilocks]],
+    ops: &[Op],
+    ranges: &[(usize, usize)],
+    proof: &ShardDagProof,
+) -> bool {
+    if proof.shards.len() != ranges.len() || proof.cross_tensors.len() != proof.cross_binds.len() {
+        return false;
+    }
+    let all_ok = ranges
+        .par_iter()
+        .enumerate()
+        .map(|(i, &(s, e))| verify_shard_precomputed(tables, &ops[s..e], &proof.shards[i]))
+        .all(|ok| ok);
+    if !all_ok {
+        return false;
+    }
+
+    let mut by_tensor: std::collections::BTreeMap<T, Vec<(Vec<Goldilocks>, Goldilocks)>> =
+        std::collections::BTreeMap::new();
+    let mut tensor_shards: std::collections::BTreeMap<T, std::collections::HashSet<usize>> =
+        std::collections::BTreeMap::new();
+    for (si, shard) in proof.shards.iter().enumerate() {
+        for (t, pt, ev) in &shard.claims {
+            by_tensor.entry(*t).or_default().push((pt.clone(), *ev));
+            tensor_shards.entry(*t).or_default().insert(si);
+        }
+    }
     let mut expected_cross: Vec<T> = Vec::new();
     for (t, _) in &by_tensor {
         if tensor_shards.get(t).map(|s| s.len()).unwrap_or(0) > 1 {
@@ -2954,17 +3071,17 @@ pub struct CommittedShardDagProof {
     pub gather_indep_batches: usize,
 }
 
-pub fn prove_committed_shard_dag(
+fn prove_committed_shard_dag_impl(
     store: &mut Store,
     ops: &[Op],
-    ops_per_shard: usize,
+    ranges: &[(usize, usize)],
     _whir: &zkie_core::pcs::whir::Whir,
     cached_weights: &[CachedWeightBatch],
     rng: &mut impl ChallengeSource,
     tokens_t: T,
     argmax_t: T,
 ) -> CommittedShardDagProof {
-    let plain = prove_shard_dag(store, ops, ops_per_shard);
+    let plain = prove_shard_dag_with_ranges(store, ops, ranges);
     let boundary_tensors = plain.cross_tensors.clone();
 
     let mut boundary_commitments = Vec::with_capacity(boundary_tensors.len());
@@ -3208,7 +3325,7 @@ pub fn prove_committed_shard_dag(
     // root, then every table root, before deriving per-lookup alpha/beta and the
     // chained-GKR leaf challenges.
     let mut ts = Transcript::new(b"zkie-committed-frac-v1");
-    absorb_statement(&mut ts, ops, ops_per_shard);
+    absorb_statement_ranges(&mut ts, ops, ranges);
     for g in &witness_groups {
         ts.absorb(&bincode::serialize(&g.x_ctx.commitment).unwrap());
         ts.absorb(&bincode::serialize(&g.y_ctx.commitment).unwrap());
@@ -3420,7 +3537,7 @@ pub fn prove_committed_shard_dag(
     // positions, so the argmax-index binding is authenticated without the
     // plaintext m x n selection matrix.
     let mut sel_openings = Vec::new();
-    let sel_ranges = shard_ranges(ops.len(), ops_per_shard);
+    let sel_ranges = ranges.to_vec();
     for (si, &(s, e)) in sel_ranges.iter().enumerate() {
         for (op, op_proof) in ops[s..e].iter().zip(shards[si].ops.iter_mut()) {
             if let (Op::Argmax { sel: sel_t, out: out_t, m, n, .. }, OpProof::Argmax(ap)) = (op, op_proof) {
@@ -3475,7 +3592,7 @@ pub fn prove_committed_shard_dag(
 
     let mut perm_ops: Vec<(usize, usize, usize)> = Vec::new(); // (si, li, arity)
     {
-        let pr = shard_ranges(ops.len(), ops_per_shard);
+        let pr = ranges.to_vec();
         for (si, &(s, e)) in pr.iter().enumerate() {
             for (li, op) in ops[s..e].iter().enumerate() {
                 if let Op::Scatter { .. } = op {
@@ -3549,7 +3666,7 @@ pub fn prove_committed_shard_dag(
     }
 
     let mut perm_ts = Transcript::new(b"zkie-committed-perm-v1");
-    absorb_statement(&mut perm_ts, ops, ops_per_shard);
+    absorb_statement_ranges(&mut perm_ts, ops, ranges);
     for g in &perm_groups {
         perm_ts.absorb(&bincode::serialize(&g.a_ctx.commitment).unwrap());
         perm_ts.absorb(&bincode::serialize(&g.b_ctx.commitment).unwrap());
@@ -3671,7 +3788,7 @@ pub fn prove_committed_shard_dag(
     //           5=out 6=gate 7=token_id
     let mut gather_ops: Vec<(usize, usize, usize, usize, usize, usize, usize)> = Vec::new();
     {
-        let gr = shard_ranges(ops.len(), ops_per_shard);
+        let gr = ranges.to_vec();
         for (si, &(s, e)) in gr.iter().enumerate() {
             for (li, op) in ops[s..e].iter().enumerate() {
                 if let (Op::Gather { m, h, .. }, OpProof::Gather(sp)) = (op, &shards[si].ops[li]) {
@@ -3741,7 +3858,7 @@ pub fn prove_committed_shard_dag(
     let gather_indep_count = gather_groups.len();
     // FS: absorb the six independent roots, then derive alpha/gamma.
     let mut ts = Transcript::new(b"zkie-committed-gather-v1");
-    absorb_statement(&mut ts, ops, ops_per_shard);
+    absorb_statement_ranges(&mut ts, ops, ranges);
     for g in &gather_groups {
         ts.absorb(&bincode::serialize(&g.ctx.commitment).unwrap());
     }
@@ -3944,14 +4061,58 @@ pub fn prove_committed_shard_dag(
     }
 }
 
-pub fn verify_committed_shard_dag(
-    tables: &[&[Goldilocks]],
+pub fn prove_committed_shard_dag(
+    store: &mut Store,
     ops: &[Op],
     ops_per_shard: usize,
+    whir: &zkie_core::pcs::whir::Whir,
+    cached_weights: &[CachedWeightBatch],
+    rng: &mut impl ChallengeSource,
+    tokens_t: T,
+    argmax_t: T,
+) -> CommittedShardDagProof {
+    let ranges = shard_ranges(ops.len(), ops_per_shard);
+    prove_committed_shard_dag_impl(
+        store,
+        ops,
+        &ranges,
+        whir,
+        cached_weights,
+        rng,
+        tokens_t,
+        argmax_t,
+    )
+}
+
+pub fn prove_committed_shard_dag_with_ranges(
+    store: &mut Store,
+    ops: &[Op],
+    ranges: &[(usize, usize)],
+    whir: &zkie_core::pcs::whir::Whir,
+    cached_weights: &[CachedWeightBatch],
+    rng: &mut impl ChallengeSource,
+    tokens_t: T,
+    argmax_t: T,
+) -> CommittedShardDagProof {
+    prove_committed_shard_dag_impl(
+        store,
+        ops,
+        ranges,
+        whir,
+        cached_weights,
+        rng,
+        tokens_t,
+        argmax_t,
+    )
+}
+
+fn verify_committed_shard_dag_impl(
+    tables: &[&[Goldilocks]],
+    ops: &[Op],
+    ranges: &[(usize, usize)],
     _whir: &zkie_core::pcs::whir::Whir,
     proof: &CommittedShardDagProof,
 ) -> bool {
-    let ranges = shard_ranges(ops.len(), ops_per_shard);
     if proof.shards.len() != ranges.len()
         || proof.boundary_tensors.len() != proof.boundary_commitments.len()
         || proof.boundary_tensors.len() != proof.cross_binds.len()
@@ -4209,7 +4370,7 @@ pub fn verify_committed_shard_dag(
     // used exactly those derived values.
     {
         let mut ts = Transcript::new(b"zkie-committed-frac-v1");
-        absorb_statement(&mut ts, ops, ops_per_shard);
+        absorb_statement_ranges(&mut ts, ops, ranges);
         for batch in &proof.witness_batches {
             ts.absorb(&bincode::serialize(&batch.commitment).unwrap());
         }
@@ -4287,7 +4448,7 @@ pub fn verify_committed_shard_dag(
     // Fiat-Shamir for permutations: verify alpha/full_r/c are transcript-derived.
     {
         let mut ts = Transcript::new(b"zkie-committed-perm-v1");
-        absorb_statement(&mut ts, ops, ops_per_shard);
+        absorb_statement_ranges(&mut ts, ops, ranges);
         for batch in &proof.perm_batches {
             ts.absorb(&bincode::serialize(&batch.commitment).unwrap());
         }
@@ -4330,7 +4491,7 @@ pub fn verify_committed_shard_dag(
     // absorbs the den roots.
     {
         let mut ts = Transcript::new(b"zkie-committed-gather-v1");
-        absorb_statement(&mut ts, ops, ops_per_shard);
+        absorb_statement_ranges(&mut ts, ops, ranges);
         for batch in proof.gather_batches.iter().take(proof.gather_indep_batches) {
             ts.absorb(&bincode::serialize(&batch.commitment).unwrap());
         }
@@ -4383,6 +4544,27 @@ pub fn verify_sequence_shift(tokens: &[u32], argmax_t: &[u32], prompt: &[u32]) -
         }
     }
     true
+}
+
+pub fn verify_committed_shard_dag(
+    tables: &[&[Goldilocks]],
+    ops: &[Op],
+    ops_per_shard: usize,
+    whir: &zkie_core::pcs::whir::Whir,
+    proof: &CommittedShardDagProof,
+) -> bool {
+    let ranges = shard_ranges(ops.len(), ops_per_shard);
+    verify_committed_shard_dag_impl(tables, ops, &ranges, whir, proof)
+}
+
+pub fn verify_committed_shard_dag_with_ranges(
+    tables: &[&[Goldilocks]],
+    ops: &[Op],
+    ranges: &[(usize, usize)],
+    whir: &zkie_core::pcs::whir::Whir,
+    proof: &CommittedShardDagProof,
+) -> bool {
+    verify_committed_shard_dag_impl(tables, ops, ranges, whir, proof)
 }
 
 pub fn verify_committed_shard_dag_bytes(
