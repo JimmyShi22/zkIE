@@ -8,7 +8,8 @@
 use std::sync::Arc;
 
 use zkie_core::common::quantized_io::{QuantDtype, SafetensorFile};
-use zkie_core::common::fixed_point::from_i64;
+use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing};
+use zkie_core::common::fixed_point::{from_i64, to_i64};
 use zkie_ops::compose::{Op, Store};
 
 // Architecture constants from DeepSeek-V4.1-Flash `config.json` / `tech_clean.txt`.
@@ -48,6 +49,24 @@ pub fn open_shard(path: &str) -> Arc<SafetensorFile> {
         SafetensorFile::open(path)
             .unwrap_or_else(|e| panic!("open safetensors shard {path}: {e}")),
     )
+}
+
+pub fn load_i32(path: &str) -> Vec<Goldilocks> {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    bytes
+        .chunks_exact(4)
+        .map(|c| from_i64(i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64))
+        .collect()
+}
+
+fn broadcast_norm(v: &[i64], m: usize, pad: usize) -> Vec<Goldilocks> {
+    let mut out = vec![Goldilocks::ZERO; m * pad];
+    for i in 0..m {
+        for j in 0..v.len().min(pad) {
+            out[i * pad + j] = from_i64(v[j]);
+        }
+    }
+    out
 }
 
 pub fn push_quantized_fp8(
@@ -142,6 +161,25 @@ pub fn build_deepseek_v41(
         "layers.0.attn.wkv.scale",
     );
 
+    let rsqrt_table = store.push(load_i32("models/gpt2/weights/rsqrt_table_i32.bin"));
+    let limb_table = store.push(
+        (0..(1usize << 16))
+            .map(|j| Goldilocks::from_u64(j as u64))
+            .collect::<Vec<_>>(),
+    );
+    let q_norm_real: Vec<i64> = file
+        .read_bf16("layers.0.attn.q_norm.weight")
+        .iter()
+        .map(|&v| to_i64(v))
+        .collect();
+    let kv_norm_real: Vec<i64> = file
+        .read_bf16("layers.0.attn.kv_norm.weight")
+        .iter()
+        .map(|&v| to_i64(v))
+        .collect();
+    let q_norm = store.push(broadcast_norm(&q_norm_real, m, Q_LORA_RANK_PAD));
+    let kv_norm = store.push(broadcast_norm(&kv_norm_real, m, HEAD_DIM));
+
     let qr_raw = build_quantized_matmul(store, ops, x, wq_a, m, DIM_PAD, Q_LORA_RANK_PAD);
     let qr = store.push(vec![]);
     ops.push(Op::Scale {
@@ -150,10 +188,21 @@ pub fn build_deepseek_v41(
         factor: 1,
         shift,
     });
+    let qrn = store.push(vec![]);
+    ops.push(Op::RmsNorm {
+        x: qr,
+        w: q_norm,
+        out: qrn,
+        rsqrt_table,
+        limb_table,
+        m,
+        d: Q_LORA_RANK_PAD,
+        n_real: Q_LORA_RANK,
+    });
     let q_raw = build_quantized_matmul(
         store,
         ops,
-        qr,
+        qrn,
         wq_b,
         m,
         Q_LORA_RANK_PAD,
@@ -175,5 +224,16 @@ pub fn build_deepseek_v41(
         factor: 1,
         shift,
     });
-    (q, kv)
+    let kvn = store.push(vec![]);
+    ops.push(Op::RmsNorm {
+        x: kv,
+        w: kv_norm,
+        out: kvn,
+        rsqrt_table,
+        limb_table,
+        m,
+        d: HEAD_DIM,
+        n_real: HEAD_DIM,
+    });
+    (q, kvn)
 }
