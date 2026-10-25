@@ -44,7 +44,7 @@ def dequant_fp8_weight(weight, scale, block=32):
     w = np.frombuffer(weight["data"], dtype=np.uint8).reshape(weight["shape"])
     s = np.frombuffer(scale["data"], dtype=np.uint8).reshape(scale["shape"])
     s = np.power(2.0, s.astype(np.float64) - 127.0)
-    s_big = np.repeat(np.repeat(s, block, axis=0), block, axis=1)
+    s_big = np.repeat(s, block, axis=1)
     sign = np.where((w & 0x80) != 0, -1.0, 1.0)
     exp = (w >> 3) & 0x0F
     man = (w & 0x07).astype(np.float64)
@@ -54,6 +54,20 @@ def dequant_fp8_weight(weight, scale, block=32):
         (1.0 + man / 8.0) * np.power(2.0, exp.astype(np.float64) - 7.0),
     )
     return sign * val * s_big
+
+
+def dequant_fp4_weight(weight, scale, logical_cols, block=32):
+    w = np.frombuffer(weight["data"], dtype=np.uint8).reshape(weight["shape"])
+    s = np.frombuffer(scale["data"], dtype=np.uint8).reshape(scale["shape"])
+    rows, packed_cols = w.shape
+    s = np.power(2.0, s.astype(np.float64) - 127.0)
+    s_big = np.repeat(s, block, axis=1)
+    low = (w & 0x0F).astype(np.int64)
+    high = (w >> 4).astype(np.int64)
+    table = np.asarray([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                        0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
+    unpacked = np.stack([table[low], table[high]], axis=-1).reshape(rows, logical_cols)
+    return unpacked * s_big
 
 
 def bf16_vec(weight):
@@ -102,7 +116,8 @@ def main():
     ap.add_argument("--m", type=int, default=1)
     ap.add_argument("--k", type=int, default=4096)
     ap.add_argument("--n", type=int, default=8192)
-    ap.add_argument("--mode", choices=["matmul", "attention", "proj", "oproj", "moe_gate", "shared_expert"], default="matmul")
+    ap.add_argument("--mode", choices=["matmul", "attention", "proj", "oproj", "moe_gate", "shared_expert", "routed_expert"], default="matmul")
+    ap.add_argument("--expert-id", type=int, default=240)
     args = ap.parse_args()
 
     t = read_safetensors(args.shard)
@@ -249,6 +264,26 @@ def main():
         out = hidden @ w2.T
         fixed = np.round(out * 65536.0).astype(np.int64)
         print("shared_expert", fixed[0, :4].tolist())
+        return
+
+    if args.mode == "routed_expert":
+        eid = args.expert_id
+        m = 16
+        dim = 5120
+        inter = 2304
+        base = f"layers.0.ffn.experts.{eid}"
+        w1 = dequant_fp4_weight(t[f"{base}.w1.weight"], t[f"{base}.w1.scale"], dim, 32)
+        w2 = dequant_fp4_weight(t[f"{base}.w2.weight"], t[f"{base}.w2.scale"], inter, 32)
+        w3 = dequant_fp4_weight(t[f"{base}.w3.weight"], t[f"{base}.w3.scale"], dim, 32)
+        x = np.ones((m, dim), dtype=np.float64)
+        gate = x @ w1.T
+        up = x @ w3.T
+        up = np.clip(up, -10.0, 10.0)
+        gate = np.clip(gate, None, 10.0)
+        hidden = (gate / (1.0 + np.exp(-gate))) * up
+        out = hidden @ w2.T
+        fixed = np.round(out * 65536.0).astype(np.int64)
+        print(f"routed_expert_{eid}", fixed[0, :4].tolist())
         return
 
     winfo = t[args.weight]
