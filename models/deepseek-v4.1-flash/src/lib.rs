@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use zkie_core::common::quantized_io::{QuantDtype, SafetensorFile};
+use zkie_core::common::fixed_point::from_i64;
 use zkie_ops::compose::{Op, Store};
 
 // Architecture constants from DeepSeek-V4.1-Flash `config.json` / `tech_clean.txt`.
@@ -106,4 +107,73 @@ pub fn build_quantized_matmul(
         block_size: QUANT_BLOCK,
     });
     c
+}
+
+/// Builder entry point. Today it implements the validated layer-0 MLA
+/// projection slice (`wq_a`, `wq_b`, `wkv`) and returns the projected `q` and
+/// `kv` tensors. Attention, `wo_a`/`wo_b`, MoE, HyperConnection, and Engram are
+/// layered on top next; this function will grow to the full 40-layer graph.
+pub fn build_deepseek_v41(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    dir: &str,
+    m: usize,
+    shift: u32,
+) -> (usize, usize) {
+    let file = open_shard(&format!("{dir}/model-00003-of-00048.safetensors"));
+    let x = store.push(vec![from_i64(1 << 16); m * DIM_PAD]);
+
+    let wq_a = push_quantized_fp8(
+        store,
+        file.clone(),
+        "layers.0.attn.wq_a.weight",
+        "layers.0.attn.wq_a.scale",
+    );
+    let wq_b = push_quantized_fp8(
+        store,
+        file.clone(),
+        "layers.0.attn.wq_b.weight",
+        "layers.0.attn.wq_b.scale",
+    );
+    let wkv = push_quantized_fp8(
+        store,
+        file.clone(),
+        "layers.0.attn.wkv.weight",
+        "layers.0.attn.wkv.scale",
+    );
+
+    let qr_raw = build_quantized_matmul(store, ops, x, wq_a, m, DIM_PAD, Q_LORA_RANK_PAD);
+    let qr = store.push(vec![]);
+    ops.push(Op::Scale {
+        x: qr_raw,
+        out: qr,
+        factor: 1,
+        shift,
+    });
+    let q_raw = build_quantized_matmul(
+        store,
+        ops,
+        qr,
+        wq_b,
+        m,
+        Q_LORA_RANK_PAD,
+        N_HEADS * HEAD_DIM,
+    );
+    let q = store.push(vec![]);
+    ops.push(Op::Scale {
+        x: q_raw,
+        out: q,
+        factor: 1,
+        shift,
+    });
+
+    let kv_raw = build_quantized_matmul(store, ops, x, wkv, m, DIM_PAD, HEAD_DIM);
+    let kv = store.push(vec![]);
+    ops.push(Op::Scale {
+        x: kv_raw,
+        out: kv,
+        factor: 1,
+        shift,
+    });
+    (q, kv)
 }
