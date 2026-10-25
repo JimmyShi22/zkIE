@@ -40,3 +40,6 @@ python3 scripts/extract_v41.py --raw models/deepseek-v4.1-flash/raw --out /tmp/c
 - `SparseAttention` / `SparseIndexer` / `HyperConnection` / `EngramLookup` 的
   op/proof。
 - 40 层 CSA2/CED 全图、MoE、真实 seq16/seq512 端到端。
+
+注意：完整 552B 权重中 `model-00048-of-00048.safetensors` 尚未下载完整，layer14
+Engram 权重也在这个分片里，所以全量承诺和真实端到端目前仍受下载状态阻塞。
