@@ -102,7 +102,7 @@ def main():
     ap.add_argument("--m", type=int, default=1)
     ap.add_argument("--k", type=int, default=4096)
     ap.add_argument("--n", type=int, default=8192)
-    ap.add_argument("--mode", choices=["matmul", "attention", "proj", "oproj", "moe_gate"], default="matmul")
+    ap.add_argument("--mode", choices=["matmul", "attention", "proj", "oproj", "moe_gate", "shared_expert"], default="matmul")
     args = ap.parse_args()
 
     t = read_safetensors(args.shard)
@@ -231,6 +231,24 @@ def main():
         weights = weights / (weights.sum(axis=1, keepdims=True) + 1e-20)
         print("moe_gate_topk", topk[0].tolist())
         print("moe_gate_weights", np.round(weights[0] * 65536.0).astype(np.int64).tolist())
+        return
+
+    if args.mode == "shared_expert":
+        m = 16
+        dim = 5120
+        inter = 2304
+        w1 = dequant_fp8_weight(t["layers.0.ffn.shared_experts.w1.weight"], t["layers.0.ffn.shared_experts.w1.scale"])
+        w2 = dequant_fp8_weight(t["layers.0.ffn.shared_experts.w2.weight"], t["layers.0.ffn.shared_experts.w2.scale"])
+        w3 = dequant_fp8_weight(t["layers.0.ffn.shared_experts.w3.weight"], t["layers.0.ffn.shared_experts.w3.scale"])
+        x = np.ones((m, dim), dtype=np.float64)
+        gate = x @ w1.T
+        up = x @ w3.T
+        up = np.clip(up, -10.0, 10.0)
+        gate = np.clip(gate, None, 10.0)
+        hidden = (gate / (1.0 + np.exp(-gate))) * up
+        out = hidden @ w2.T
+        fixed = np.round(out * 65536.0).astype(np.int64)
+        print("shared_expert", fixed[0, :4].tolist())
         return
 
     winfo = t[args.weight]
