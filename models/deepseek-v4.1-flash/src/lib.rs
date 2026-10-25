@@ -25,6 +25,22 @@ pub const MOE_INTER_DIM: usize = 2304;
 pub const SLIDING_WINDOW: usize = 128;
 pub const HC_MULT: usize = 4;
 pub const QUANT_BLOCK: usize = 32;
+pub const VOCAB: usize = 129280;
+
+// Field-level matmul/MLE primitives require power-of-two tensor lengths. These
+// are the zero-padded dimensions the builder must use consistently everywhere;
+// `Store::materialize` already pads quantized weights, and the builder must pad
+// activations and BF16/F32 weights to the same values.
+pub const DIM_PAD: usize = DIM.next_power_of_two();
+pub const Q_LORA_RANK_PAD: usize = Q_LORA_RANK.next_power_of_two();
+pub const O_LORA_RANK_PAD: usize = O_LORA_RANK.next_power_of_two();
+pub const MOE_INTER_DIM_PAD: usize = MOE_INTER_DIM.next_power_of_two();
+pub const N_ROUTED_EXPERTS_PAD: usize = N_ROUTED_EXPERTS.next_power_of_two();
+pub const VOCAB_PAD: usize = VOCAB.next_power_of_two();
+pub const HEAD_QK: usize = 64;
+pub const HEAD_NOPE: usize = HEAD_DIM - HEAD_QK;
+pub const HEAD_QK_PAD: usize = HEAD_QK.next_power_of_two();
+pub const HEAD_NOPE_PAD: usize = HEAD_NOPE.next_power_of_two();
 
 pub fn open_shard(path: &str) -> Arc<SafetensorFile> {
     Arc::new(

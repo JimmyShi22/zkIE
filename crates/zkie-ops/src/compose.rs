@@ -599,7 +599,7 @@ impl Store {
                 logical_cols,
                 block_size,
             } => {
-                let out = match dtype {
+                let mut out = match dtype {
                     QuantDtype::Fp8E4M3 => {
                         file.read_fp8_weight(weight, scale, *block_size)
                     }
@@ -611,6 +611,12 @@ impl Store {
                     ),
                     _ => panic!("unsupported quantized weight dtype {dtype:?}"),
                 };
+                // The field-level matmul/MLE primitives require power-of-two
+                // lengths. Most DeepSeek-V4.1 dimensions are not powers of two,
+                // so quantized weights are zero-padded here; the model builder
+                // must use the same padded dimensions.
+                let padded = out.len().next_power_of_two();
+                out.resize(padded, Goldilocks::ZERO);
                 Cow::Owned(out)
             }
         }
@@ -629,11 +635,12 @@ impl Store {
                 let info = file
                     .tensor(weight)
                     .unwrap_or_else(|| panic!("quantized tensor {weight} not found"));
-                match dtype {
+                let logical_len = match dtype {
                     QuantDtype::Fp8E4M3 => info.shape.iter().product(),
                     QuantDtype::Int8 => info.shape[0] * *logical_cols,
                     _ => panic!("unsupported quantized weight dtype {dtype:?}"),
-                }
+                };
+                logical_len.next_power_of_two()
             }
         }
     }
