@@ -15,7 +15,7 @@ use std::sync::Arc;
 use memmap2::Mmap;
 use serde::Deserialize;
 
-use crate::common::field::Goldilocks;
+use crate::common::field::{Goldilocks, PrimeCharacteristicRing};
 use crate::common::fixed_point::from_i64;
 
 const FIXED_SCALE: f64 = 65536.0;
@@ -176,15 +176,18 @@ impl SafetensorFile {
         assert_eq!(scale_info.shape.len(), 2, "fp8 scale must be 2D");
         let rows = info.shape[0];
         let cols = info.shape[1];
+        let padded_rows = rows.next_power_of_two();
+        let padded_cols = cols.next_power_of_two();
         let nb_cols = scale_info.shape[1];
-        let mut out = Vec::with_capacity(rows * cols);
+        let mut out = vec![Goldilocks::ZERO; padded_rows * padded_cols];
         for r in 0..rows {
             let sr = r / block_size;
             for c in 0..cols {
                 let sc = c / block_size;
                 let scale = e8m0_to_f64(scale_raw[sr * nb_cols + sc]);
                 let w = e4m3_to_f64(raw[r * cols + c]);
-                out.push(from_i64((w * scale * FIXED_SCALE).round() as i64));
+                out[r * padded_cols + c] =
+                    from_i64((w * scale * FIXED_SCALE).round() as i64);
             }
         }
         out
@@ -207,9 +210,11 @@ impl SafetensorFile {
         assert_eq!(info.shape[1] * 2, logical_cols, "fp4 packed width mismatch");
         let rows = info.shape[0];
         let packed_cols = info.shape[1];
+        let padded_rows = rows.next_power_of_two();
+        let padded_cols = logical_cols.next_power_of_two();
         let nb_cols = scale_info.shape[1];
         assert_eq!(logical_cols / block_size, nb_cols, "fp4 scale block count mismatch");
-        let mut out = Vec::with_capacity(rows * logical_cols);
+        let mut out = vec![Goldilocks::ZERO; padded_rows * padded_cols];
         for r in 0..rows {
             let sr = r / block_size;
             for c in 0..logical_cols {
@@ -218,7 +223,8 @@ impl SafetensorFile {
                 let byte = raw[r * packed_cols + c / 2];
                 let nibble = if c % 2 == 0 { byte & 0x0F } else { byte >> 4 };
                 let w = e2m1_to_f64(nibble);
-                out.push(from_i64((w * scale * FIXED_SCALE).round() as i64));
+                out[r * padded_cols + c] =
+                    from_i64((w * scale * FIXED_SCALE).round() as i64);
             }
         }
         out
