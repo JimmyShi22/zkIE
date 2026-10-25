@@ -347,4 +347,32 @@ mod tests {
         assert_eq!(got, vec![0, 32768, -393216, 32768]);
         std::fs::remove_file(path).unwrap();
     }
+
+    #[test]
+    fn pads_fp8_rows_and_cols_independently() {
+        // 3x5 weight, all 1.0. Padded rows=4, cols=8 => 32 elements, with the
+        // tail of each row zero and the trailing row all zero.
+        let weight = [0x38u8; 15];
+        let scale = [127u8];
+        let path = write_safetensors(&[
+            ("w", "F8_E4M3", &[3, 5], &weight),
+            ("s", "F8_E8M0", &[1, 1], &scale),
+        ]);
+        let file = SafetensorFile::open(&path).unwrap();
+        let out = file.read_fp8_weight("w", "s", 5);
+        assert_eq!(out.len(), 32);
+        let got: Vec<i64> = out.iter().map(|&x| to_i64(x)).collect();
+        for r in 0..3 {
+            for c in 0..5 {
+                assert_eq!(got[r * 8 + c], 65536);
+            }
+            for c in 5..8 {
+                assert_eq!(got[r * 8 + c], 0);
+            }
+        }
+        for c in 0..8 {
+            assert_eq!(got[3 * 8 + c], 0);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 }
