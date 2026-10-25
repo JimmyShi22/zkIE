@@ -47,3 +47,7 @@ Engram 权重现已就位，全量承诺不再受下载阻塞。
 
 layer14 Engram 关键形状：`embed.weight` FP8 [384016682,256]（约 98GB），
 `q/k_weight` BF16 [4,5120]，`wkv.weight` FP8 [25600,6144]。
+
+layer0 attention（q_norm/kv_norm + tail RoPE + dense causal softmax，不含 sink）
+已与 CPU 参考逐项对齐；Rust head0 前 8 值：
+`[-15616, 4475, -10946, 12939, 9102, 5881, 2056, 22170]`。
