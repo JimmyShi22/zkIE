@@ -26,6 +26,7 @@ python3 scripts/v41_ref_cpu.py --shard models/deepseek-v4.1-flash/raw/model-0000
 python3 scripts/v41_ref_cpu.py --shard models/deepseek-v4.1-flash/raw/model-00003-of-00048.safetensors --mode attention
 python3 scripts/v41_ref_cpu.py --shard models/deepseek-v4.1-flash/raw/model-00003-of-00048.safetensors --mode oproj
 python3 scripts/v41_ref_cpu.py --shard models/deepseek-v4.1-flash/raw/model-00003-of-00048.safetensors --mode moe_gate
+python3 scripts/v41_ref_cpu.py --shard models/deepseek-v4.1-flash/raw/model-00003-of-00048.safetensors --mode shared_expert
 
 # 生成 token / RoPE 表
 python3 scripts/extract_v41.py --raw models/deepseek-v4.1-flash/raw --out /tmp/cache --tokenizer-json models/deepseek-v4.1-flash/raw/tokenizer.json --tokens-out /tmp/tokens.bin --prompt "The sky is" --seq 16
