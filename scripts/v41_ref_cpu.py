@@ -102,7 +102,7 @@ def main():
     ap.add_argument("--m", type=int, default=1)
     ap.add_argument("--k", type=int, default=4096)
     ap.add_argument("--n", type=int, default=8192)
-    ap.add_argument("--mode", choices=["matmul", "attention", "proj"], default="matmul")
+    ap.add_argument("--mode", choices=["matmul", "attention", "proj", "oproj"], default="matmul")
     args = ap.parse_args()
 
     t = read_safetensors(args.shard)
@@ -180,6 +180,20 @@ def main():
         print("qr", qrf.reshape(-1)[:4].tolist())
         print("q", qf.reshape(-1)[:4].tolist())
         print("kv", kvf.reshape(-1)[:4].tolist())
+        return
+
+    if args.mode == "oproj":
+        m = 16
+        o_lora = 1024
+        o_groups = 8
+        wo_a = dequant_fp8_weight(t["layers.0.attn.wo_a.weight"], t["layers.0.attn.wo_a.scale"])
+        wo_b = dequant_fp8_weight(t["layers.0.attn.wo_b.weight"], t["layers.0.attn.wo_b.scale"])
+        o = np.ones((m, o_groups, 4096), dtype=np.float64)
+        wo_a = wo_a.reshape(o_groups, o_lora, 4096)
+        o = np.einsum("sgd,grd->sgr", o, wo_a)
+        out = o.reshape(m, -1) @ wo_b.T
+        fixed = np.round(out * 65536.0).astype(np.int64)
+        print("oproj", fixed.reshape(-1)[:4].tolist())
         return
 
     winfo = t[args.weight]
