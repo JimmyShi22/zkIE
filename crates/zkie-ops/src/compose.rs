@@ -2208,7 +2208,18 @@ pub fn prove_shard_precomputed(
             Op::Concat { .. } => {
                 op_proofs.push(OpProof::Concat);
             }
-            Op::CompressMask { .. } => {
+            Op::CompressMask { out, m, n, ratio } => {
+                let mut mask = Vec::with_capacity(m * n);
+                for i in 0..m {
+                    let vis = ((i + 1) / ratio).min(n);
+                    for j in 0..n {
+                        mask.push(if j < vis { Goldilocks::ZERO } else { from_i64(-(1i64 << 20)) });
+                    }
+                }
+                let r: Vec<Goldilocks> = (0..(m * n).trailing_zeros() as usize)
+                    .map(|_| rng.field())
+                    .collect();
+                claims.push((out, r.clone(), mle::eval(&mask, &r)));
                 op_proofs.push(OpProof::CompressMask);
             }
             Op::SortIndices { .. } => {
@@ -2831,7 +2842,23 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
             }
             (Op::Slice { .. }, OpProof::Slice) => {}
             (Op::Concat { .. }, OpProof::Concat) => {}
-            (Op::CompressMask { .. }, OpProof::CompressMask) => {}
+            (Op::CompressMask { out, m, n, ratio }, OpProof::CompressMask) => {
+                let (out, m, n, ratio) = (*out, *m, *n, *ratio);
+                let mut mask = Vec::with_capacity(m * n);
+                for i in 0..m {
+                    let vis = ((i + 1) / ratio).min(n);
+                    for j in 0..n {
+                        mask.push(if j < vis { Goldilocks::ZERO } else { from_i64(-(1i64 << 20)) });
+                    }
+                }
+                let ok = proof
+                    .claims
+                    .iter()
+                    .any(|(t, pt, ev)| *t == out && *ev == mle::eval(&mask, pt));
+                if !ok {
+                    return false;
+                }
+            }
             (Op::SortIndices { .. }, OpProof::SortIndices) => {}
             (Op::SelToIndices { .. }, OpProof::SelToIndices) => {}
             (Op::CandidateBlocks { .. }, OpProof::CandidateBlocks) => {}
