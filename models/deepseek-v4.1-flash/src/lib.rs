@@ -54,12 +54,12 @@ pub fn layer_shard(dir: &str, layer: usize) -> String {
     format!("{dir}/model-{:05}-of-00048.safetensors", layer + 3)
 }
 
-/// Per-layer compress ratio for the 40 backbone layers (0,1: 0; 2..=20: 2;
-/// 21..=39: 1), matching `config.json` `compress_ratios`.
+/// Per-layer compress ratio for the 40 backbone layers (0,1: 0; 2..=19: 2;
+/// 20..=39: 1), matching `config.json` `compress_ratios`.
 pub fn compress_ratio(layer: usize) -> usize {
-    if layer < 2 || layer >= 38 {
+    if layer < 2 {
         0
-    } else if layer <= 20 {
+    } else if layer <= 19 {
         2
     } else {
         1

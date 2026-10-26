@@ -174,7 +174,7 @@ def main():
 
     for layer in range(args.layers):
         t = shards[layer]
-        ratio = 0 if layer < 2 or layer >= 38 else (2 if layer <= 20 else 1)
+        ratio = 0 if layer < 2 else (2 if layer <= 19 else 1)
         hc_attn_fn = np.frombuffer(t[f"layers.{layer}.hc_attn_fn"]["data"], dtype="<f4").astype(np.float64).reshape(MIX_HC, HC_D)
         hc_attn_base = np.frombuffer(t[f"layers.{layer}.hc_attn_base"]["data"], dtype="<f4").astype(np.float64)
         hc_attn_scale = np.frombuffer(t[f"layers.{layer}.hc_attn_scale"]["data"], dtype="<f4").astype(np.float64)
