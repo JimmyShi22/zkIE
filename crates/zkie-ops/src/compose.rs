@@ -518,6 +518,16 @@ pub fn verify_residual_chain(
 /// Tensor id in the shard's tensor store.
 pub type T = usize;
 
+/// One expert's packed FP4 weight plus its E8M0 scale, materialized on demand.
+#[derive(Clone)]
+pub struct QuantizedExpert {
+    pub file: Arc<SafetensorFile>,
+    pub weight: String,
+    pub scale: String,
+    pub logical_cols: usize,
+    pub block_size: usize,
+}
+
 /// A tensor datum: owned (activations, small weights) or a memory-mapped i32
 /// weight slice that is converted to Goldilocks on demand.
 #[derive(Clone)]
@@ -539,6 +549,38 @@ pub enum TensorData {
         logical_cols: usize,
         block_size: usize,
     },
+    /// A stack of `[n_experts, k, n]` packed-FP4 expert weights, materialized
+    /// lazily. The forward pass dequantizes only the selected experts; the
+    /// commitment path materializes the full stack in `commit_model_weights`.
+    ExpertStack {
+        experts: Arc<Vec<QuantizedExpert>>,
+        k: usize,
+        n: usize,
+    },
+}
+
+/// Dequantize one packed-FP4 expert weight into its `[k, n]` layout (input dim
+/// x output dim), matching `GatherMatMul`'s weight indexing.
+fn materialize_expert(expert: &QuantizedExpert) -> Vec<Goldilocks> {
+    let w = expert.file.read_fp4_weight(
+        &expert.weight,
+        &expert.scale,
+        expert.logical_cols,
+        expert.block_size,
+    );
+    let info = expert
+        .file
+        .tensor(&expert.weight)
+        .expect("missing expert weight");
+    let rows_pad = info.shape[0].next_power_of_two();
+    let cols_pad = expert.logical_cols.next_power_of_two();
+    let mut out = vec![Goldilocks::ZERO; cols_pad * rows_pad];
+    for r in 0..rows_pad {
+        for c in 0..cols_pad {
+            out[c * rows_pad + r] = w[r * cols_pad + c];
+        }
+    }
+    out
 }
 
 /// A shard's tensor store: `v[id]` is a Goldilocks tensor; `idx[id]` is an
@@ -588,12 +630,29 @@ impl Store {
         self.idx.push(t);
         id
     }
+    pub fn push_expert_stack(
+        &mut self,
+        experts: Vec<QuantizedExpert>,
+        k: usize,
+        n: usize,
+    ) -> T {
+        let id = self.v.len();
+        self.v.push(TensorData::ExpertStack {
+            experts: Arc::new(experts),
+            k,
+            n,
+        });
+        id
+    }
     pub fn get(&self, id: T) -> &[Goldilocks] {
         match &self.v[id] {
             TensorData::Owned(v) => v,
             TensorData::Mmap { .. } => panic!("get() on mmap-backed tensor; use materialize()"),
             TensorData::Quantized { .. } => {
                 panic!("get() on quantized tensor; use materialize()")
+            }
+            TensorData::ExpertStack { .. } => {
+                panic!("get() on expert stack; use materialize() or materialize_expert_rows()")
             }
         }
     }
@@ -623,6 +682,13 @@ impl Store {
                 };
                 Cow::Owned(out)
             }
+            TensorData::ExpertStack { experts, .. } => {
+                let out = experts
+                    .iter()
+                    .flat_map(materialize_expert)
+                    .collect::<Vec<_>>();
+                Cow::Owned(out)
+            }
         }
     }
     pub fn len(&self, id: T) -> usize {
@@ -646,6 +712,22 @@ impl Store {
                 };
                 rows.next_power_of_two() * cols.next_power_of_two()
             }
+            TensorData::ExpertStack { experts, k, n } => experts.len() * k * n,
+        }
+    }
+    /// Materialize only the requested experts of an `ExpertStack`, in the order
+    /// of `rows`, as a dense `[rows.len(), k, n]` tensor.
+    pub fn materialize_expert_rows(&self, id: T, rows: &[u32]) -> Vec<Goldilocks> {
+        match &self.v[id] {
+            TensorData::ExpertStack { experts, k, n } => {
+                let mut out = vec![Goldilocks::ZERO; rows.len() * k * n];
+                for (i, &e) in rows.iter().enumerate() {
+                    let w = materialize_expert(&experts[e as usize]);
+                    out[i * k * n..(i + 1) * k * n].copy_from_slice(&w);
+                }
+                out
+            }
+            _ => panic!("materialize_expert_rows on non-expert-stack tensor"),
         }
     }
     pub fn get_mut(&mut self, id: T) -> &mut [Goldilocks] {
@@ -653,6 +735,7 @@ impl Store {
             TensorData::Owned(v) => v,
             TensorData::Mmap { .. } => panic!("get_mut() on mmap-backed tensor"),
             TensorData::Quantized { .. } => panic!("get_mut() on quantized tensor"),
+            TensorData::ExpertStack { .. } => panic!("get_mut() on expert stack"),
         }
     }
 
@@ -665,6 +748,7 @@ impl Store {
                 TensorData::Owned(v) => v.as_slice(),
                 TensorData::Mmap { .. } => &[],
                 TensorData::Quantized { .. } => &[],
+                TensorData::ExpertStack { .. } => &[],
             })
             .collect()
     }
@@ -1818,15 +1902,29 @@ pub fn forward_ops(store: &mut Store, ops: &[Op]) {
                 store.v[c] = TensorData::Owned(o);
             }
             Op::GatherMatMul { a, expert_of, w, c, s, k, n, n_experts } => {
-                let wv = store.materialize(w);
+                let expert_ids = &store.idx[expert_of];
+                // Dequantize only the selected experts and remap the per-position
+                // expert ids to a dense range. The matmul result is unchanged;
+                // this just avoids materializing all `n_experts` weights during
+                // the forward pass.
+                let mut remap = std::collections::HashMap::new();
+                let mut unique: Vec<u32> = Vec::new();
+                for &e in expert_ids {
+                    if !remap.contains_key(&e) {
+                        remap.insert(e, unique.len() as u32);
+                        unique.push(e);
+                    }
+                }
+                let dense_ids: Vec<u32> = expert_ids.iter().map(|&e| remap[&e]).collect();
+                let wv = store.materialize_expert_rows(w, &unique);
                 let o = bmm::gather_matmul_forward(
                     store.get(a),
-                    &store.idx[expert_of],
-                    wv.as_ref(),
+                    &dense_ids,
+                    &wv,
                     s,
                     k,
                     n,
-                    n_experts,
+                    unique.len(),
                 );
                 store.v[c] = TensorData::Owned(o);
             }

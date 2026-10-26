@@ -10,7 +10,7 @@ use std::sync::Arc;
 use zkie_core::common::quantized_io::{QuantDtype, SafetensorFile};
 use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing};
 use zkie_core::common::fixed_point::{from_i64, to_i64};
-use zkie_ops::compose::{Op, Store};
+use zkie_ops::compose::{Op, QuantizedExpert, Store};
 
 // Architecture constants from DeepSeek-V4.1-Flash `config.json` / `tech_clean.txt`.
 pub const N_LAYERS: usize = 40;
@@ -650,22 +650,17 @@ fn load_routed_expert_stack(
 ) -> usize {
     let rows_pad = rows.next_power_of_two();
     let cols_pad = cols.next_power_of_two();
-    let mut out = vec![Goldilocks::ZERO; N_ROUTED_EXPERTS * cols_pad * rows_pad];
+    let mut experts = Vec::with_capacity(N_ROUTED_EXPERTS);
     for e in 0..N_ROUTED_EXPERTS {
-        let w = file.read_fp4_weight(
-            &format!("layers.{layer}.ffn.experts.{e}.{suffix}.weight"),
-            &format!("layers.{layer}.ffn.experts.{e}.{suffix}.scale"),
-            cols,
-            QUANT_BLOCK,
-        );
-        let base = e * cols_pad * rows_pad;
-        for r in 0..rows_pad {
-            for c in 0..cols_pad {
-                out[base + c * rows_pad + r] = w[r * cols_pad + c];
-            }
-        }
+        experts.push(QuantizedExpert {
+            file: file.clone(),
+            weight: format!("layers.{layer}.ffn.experts.{e}.{suffix}.weight"),
+            scale: format!("layers.{layer}.ffn.experts.{e}.{suffix}.scale"),
+            logical_cols: cols,
+            block_size: QUANT_BLOCK,
+        });
     }
-    store.push(out)
+    store.push_expert_stack(experts, cols_pad, rows_pad)
 }
 
 /// Routed experts: gather the top-k selected rows, run each expert's SwiGLU MLP
