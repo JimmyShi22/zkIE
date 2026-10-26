@@ -1306,7 +1306,8 @@ pub fn build_mla_attention(
     let mut mask_aug = Vec::with_capacity(m * n_pad);
     for i in 0..m {
         for j in 0..m {
-            mask_aug.push(if j > i { from_i64(-(1i64 << 30)) } else { Goldilocks::ZERO });
+            let lo = i.saturating_sub(SLIDING_WINDOW - 1);
+            mask_aug.push(if j > i || j < lo { from_i64(-(1i64 << 30)) } else { Goldilocks::ZERO });
         }
         mask_aug.push(Goldilocks::ZERO);
         for _ in (m + 1)..n_pad {
@@ -1568,7 +1569,8 @@ pub fn build_mla_attention_compress(
     let mut mask_aug = Vec::with_capacity(m * n_pad);
     for i in 0..m {
         for j in 0..m {
-            mask_aug.push(if j <= i { Goldilocks::ZERO } else { from_i64(-(1i64 << 30)) });
+            let lo = i.saturating_sub(SLIDING_WINDOW - 1);
+            mask_aug.push(if j <= i && j >= lo { Goldilocks::ZERO } else { from_i64(-(1i64 << 30)) });
         }
         for j in 0..groups {
             mask_aug.push(if j <= i / ratio { Goldilocks::ZERO } else { from_i64(-(1i64 << 30)) });
@@ -2370,7 +2372,7 @@ pub fn push_embedding(store: &mut Store, path: &str, m: usize) -> usize {
         .chunks_exact(4)
         .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64)
         .collect();
-    assert_eq!(vals.len(), m * DIM, "embedding length mismatch");
+    assert!(vals.len() >= m * DIM, "embedding too short: {} < {}", vals.len(), m * DIM);
     let mut out = vec![Goldilocks::ZERO; m * DIM_PAD];
     for i in 0..m {
         for j in 0..DIM {

@@ -155,16 +155,61 @@ def build_shared_expert(t, layer, x):
     return ((g / (1.0 + np.exp(-g))) * u) @ w2.T
 
 
+def dequant_embed_rows(t, name, scale_name, rows, cols=256):
+    w = np.frombuffer(t[name]["data"], dtype=np.uint8)
+    s = np.frombuffer(t[scale_name]["data"], dtype=np.uint8)
+    nb_cols = t[scale_name]["shape"][1]
+    out = []
+    for r in rows:
+        r = int(r)
+        row = np.zeros(cols, dtype=np.float64)
+        for c in range(cols):
+            code = int(w[r * cols + c])
+            sign = -1.0 if code & 0x80 else 1.0
+            exp = (code >> 3) & 0x0F
+            man = code & 0x07
+            val = man * (2.0 ** -9) if exp == 0 else (1.0 + man / 8.0) * (2.0 ** (exp - 7))
+            scale = 2.0 ** (int(s[r * nb_cols + c // 32]) - 127)
+            row[c] = sign * val * scale
+        out.append(row)
+    return np.asarray(out, dtype=np.float64)
+
+
+def build_engram(t, layer, x4, hash_ids, m):
+    base = f"layers.{layer}.engram"
+    col0 = 0 if layer == 1 else 24
+    ids = hash_ids[:, col0 : col0 + 24].reshape(-1).astype(np.int64)
+    e = dequant_embed_rows(t, f"{base}.embed.weight", f"{base}.embed.scale", ids)
+    flat = e.reshape(m, 24 * 256)
+    wkv = dequant_fp8_weight(t[f"{base}.wkv.weight"], t[f"{base}.wkv.scale"])
+    kv = flat @ wkv.T
+    key = kv[:, : DIM * HC].reshape(m, HC, DIM)
+    value = kv[:, DIM * HC : DIM * (HC + 1)]
+    qw = bf16_vec(t[f"{base}.q_weight"]).reshape(HC, DIM)
+    kw = bf16_vec(t[f"{base}.k_weight"]).reshape(HC, DIM)
+    weight = qw * kw
+    h = x4.astype(np.float64)
+    rstd_h = 1.0 / np.sqrt(np.mean(h * h, axis=-1) + 1e-20)
+    rstd_key = 1.0 / np.sqrt(np.mean(key * key, axis=-1) + 1e-20)
+    dot = (h * weight * key).sum(-1) * rstd_h * rstd_key * (DIM ** -0.5)
+    gate = 1.0 / (1.0 + np.exp(-np.copysign(np.sqrt(np.abs(dot).clip(1e-6)), dot)))
+    return h + gate[..., None] * value[:, None, :]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--raw", required=True)
     ap.add_argument("--layers", type=int, default=3)
     ap.add_argument("--m", type=int, default=16)
     ap.add_argument("--no-routed", action="store_true")
+    ap.add_argument("--hash-ids", default="")
     args = ap.parse_args()
 
     m = args.m
     shards = {l: read_safetensors(f"{args.raw}/model-{l+3:05d}-of-00048.safetensors") for l in range(args.layers)}
+    hash_ids = None
+    if args.hash_ids:
+        hash_ids = np.fromfile(args.hash_ids, dtype=np.int32).reshape(-1, 48)[:m]
 
     x = np.ones((m, DIM), dtype=np.float64)
     x4 = np.repeat(x[:, None, :], HC, axis=1)
@@ -173,6 +218,9 @@ def main():
     compress_kv = None
 
     for layer in range(args.layers):
+        if hash_ids is not None and layer in (1, 14):
+            eng_shard = read_safetensors(f"{args.raw}/model-{47 if layer == 1 else 48:05d}-of-00048.safetensors")
+            x4 = build_engram(eng_shard, layer, x4, hash_ids, m)
         t = shards[layer]
         ratio = 0 if layer < 2 else (2 if layer <= 19 else 1)
         hc_attn_fn = np.frombuffer(t[f"layers.{layer}.hc_attn_fn"]["data"], dtype="<f4").astype(np.float64).reshape(MIX_HC, HC_D)
