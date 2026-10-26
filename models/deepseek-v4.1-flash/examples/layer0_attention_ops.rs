@@ -1,6 +1,6 @@
 use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing};
 use zkie_core::common::fixed_point::from_i64;
-use zkie_models_deepseek_v41_flash::{build_deepseek_v41, HEAD_DIM, N_HEADS};
+use zkie_models_deepseek_v41_flash::{build_deepseek_v41, open_shard, HEAD_DIM, N_HEADS};
 use zkie_ops::compose::{causal_mask, prove_shard, verify_shard, Op, Store};
 
 fn load_i32(path: &str) -> Vec<Goldilocks> {
@@ -60,6 +60,8 @@ fn main() {
     let mut store = Store::new();
     let mut ops: Vec<Op> = Vec::new();
     let (q, kv) = build_deepseek_v41(&mut store, &mut ops, &dir, m, 16);
+    let file = open_shard(&path);
+    let sink_raw = file.read_f32("layers.0.attn.attn_sink");
 
     let exp_table = store.push(load_i32("/data/zkIE/models/gpt2/weights/exp_table_i32.bin"));
     let mask = store.push(causal_mask(m));
@@ -105,6 +107,12 @@ fn main() {
         let idx = store.push_idx(vec![]);
         let e = store.push(vec![]);
         let probs = store.push(vec![]);
+        let probs_bias = store.push(vec![]);
+        let sink_fixed = {
+            let v = zkie_core::common::fixed_point::to_i64(sink_raw[head]);
+            ((v as f64 / 65536.0).exp() * 65536.0).round() as i64
+        };
+        let sink_bias = store.push(vec![from_i64(sink_fixed); m]);
         let attn_n = store.push(vec![]);
         let attn_r = store.push(vec![]);
         ops.push(Op::StableSoftmaxIndex {
@@ -124,8 +132,15 @@ fn main() {
             m,
             n: m,
         });
+        ops.push(Op::SoftmaxBias {
+            e,
+            bias: sink_bias,
+            out: probs_bias,
+            m,
+            n: m,
+        });
         ops.push(Op::MatMul {
-            a: probs,
+            a: probs_bias,
             b: kvn,
             c: attn_n,
             m,
@@ -135,7 +150,7 @@ fn main() {
         let attn_n16 = store.push(vec![]);
         ops.push(Op::Scale { x: attn_n, out: attn_n16, factor: 1, shift: 16 });
         ops.push(Op::MatMul {
-            a: probs,
+            a: probs_bias,
             b: kvr,
             c: attn_r,
             m,
