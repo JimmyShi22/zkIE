@@ -8,6 +8,7 @@ pub mod rms_norm;
 pub mod rope;
 pub mod scale;
 pub mod gather;
+pub mod gelu_index;
 pub mod scatter;
 pub mod softmax_scaled;
 pub mod topk;

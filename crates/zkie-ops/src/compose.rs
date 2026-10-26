@@ -25,6 +25,7 @@ use crate::rms_norm::{
     RmsNormProof, RsqrtProof,
 };
 use crate::scale::{prove_scale, prove_scale_vec, verify_scale, verify_scale_vec, ScaleProof, ScaleVecProof};
+use crate::gelu_index::{prove_gelu_index, verify_gelu_index, GeluIndexProof};
 use crate::rope::{prove_rope, rope_forward, verify_rope, RoPEProof};
 use crate::softmax_scaled::{
     prove_softmax_bias, prove_softmax_rounded, softmax_bias_forward, verify_softmax_bias,
@@ -971,6 +972,7 @@ pub enum Op {
         out: T,
         offset: i64,
         table_len: usize,
+        limb_table: T,
     },
     /// Numerically-stable softmax index with a causal mask:
     /// `idx = (to_i64(x + mask) - row_max + offset).clamp(0, table_len-1)`.
@@ -1173,7 +1175,7 @@ pub enum OpProof {
     SoftmaxBias(SoftmaxBiasProof),
     SumNorm(SoftmaxRoundedProof),
     SoftmaxIndex,
-    GeluIndex,
+    GeluIndex(GeluIndexProof),
     StableSoftmaxIndex,
     Layernorm(LayernormChainProof),
     LayerNormCentered(LayerNormCenteredProof),
@@ -1344,7 +1346,7 @@ impl Op {
             Op::SoftmaxBias { e, bias, .. } => vec![e, bias],
             Op::SumNorm { x, .. } => vec![x],
             Op::SoftmaxIndex { x, .. } => vec![x],
-            Op::GeluIndex { x, .. } => vec![x],
+            Op::GeluIndex { x, limb_table, .. } => vec![x, limb_table],
             Op::StableSoftmaxIndex { x, mask, .. } => vec![x, mask],
             Op::Layernorm {
                 x,
@@ -2155,6 +2157,7 @@ pub fn forward_ops(store: &mut Store, ops: &[Op]) {
                 out,
                 offset,
                 table_len,
+                ..
             } => {
                 let indices: Vec<u32> = store
                     .get(x)
@@ -2724,8 +2727,17 @@ pub fn prove_shard_precomputed(
             Op::SoftmaxIndex { .. } => {
                 op_proofs.push(OpProof::SoftmaxIndex);
             }
-            Op::GeluIndex { .. } => {
-                op_proofs.push(OpProof::GeluIndex);
+            Op::GeluIndex { x, out, offset, table_len, limb_table } => {
+                let (p, limbs) = prove_gelu_index(store.get(x), &store.idx[out], offset, table_len, rng);
+                for limb in &limbs {
+                    let idx: Vec<u32> = limb.iter().map(|&v| to_i32(v) as u32).collect();
+                    lookup_by_table
+                        .entry(limb_table)
+                        .or_insert(Vec::new())
+                        .push((idx, limb.clone()));
+                }
+                claims.push((x, p.r.clone(), mle::eval(store.get(x), &p.r)));
+                op_proofs.push(OpProof::GeluIndex(p));
             }
             Op::StableSoftmaxIndex { .. } => {
                 op_proofs.push(OpProof::StableSoftmaxIndex);
@@ -3182,7 +3194,11 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
             (Op::SoftmaxIndex { .. }, OpProof::SoftmaxIndex) => {
                 // No proof: the verifier recomputes `idx = softmax_index(scores)`.
             }
-            (Op::GeluIndex { .. }, OpProof::GeluIndex) => {}
+            (Op::GeluIndex { offset, table_len, .. }, OpProof::GeluIndex(p)) => {
+                if !verify_gelu_index(p, *offset, *table_len) {
+                    return false;
+                }
+            }
             (Op::StableSoftmaxIndex { .. }, OpProof::StableSoftmaxIndex) => {}
             (Op::Layernorm { .. }, OpProof::Layernorm(lp)) => {
                 if !verify_layernorm_chain(lp) {
@@ -7740,7 +7756,6 @@ mod tests {
             | OpProof::ScaleGate
             | OpProof::Relu
             | OpProof::SoftmaxIndex
-            | OpProof::GeluIndex
             | OpProof::StableSoftmaxIndex
             | OpProof::IdxBroadcast
             | OpProof::CombineIdx
@@ -7761,6 +7776,7 @@ mod tests {
             | OpProof::Rsqrt(..)
             | OpProof::Scale(..)
             | OpProof::ScaleVec(..)
+            | OpProof::GeluIndex(..)
             | OpProof::RoPE(..)
             | OpProof::TopKSelect(..)
             | OpProof::SparseIndexer(..)
@@ -7796,7 +7812,6 @@ mod tests {
             OpProof::ScaleGate,
             OpProof::Relu,
             OpProof::SoftmaxIndex,
-            OpProof::GeluIndex,
             OpProof::StableSoftmaxIndex,
             OpProof::IdxBroadcast,
             OpProof::CombineIdx,
@@ -7805,7 +7820,7 @@ mod tests {
         ];
         assert_eq!(
             unproven.len(),
-            22,
+            21,
             "the set of ops with no proof of their own changed; see the succinct-verification thread before adjusting"
         );
         for p in &unproven {

@@ -1,4 +1,4 @@
-use zkie_core::common::field::{Goldilocks, XorShift64};
+use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64};
 use zkie_core::common::fixed_point::{from_i64, to_i64};
 use zkie_models_deepseek_v41_flash::{
     build_moe_gate, open_shard, DIM_PAD, N_ROUTED_EXPERTS_PAD,
@@ -23,10 +23,13 @@ fn main() {
 
     let mut store = Store::new();
     let sqrt_sp = store.push(load_i32("/data/zkIE/models/sqrt_softplus_table_i32.bin"));
+    let limb_table = store.push(
+        (0..(1usize << 16)).map(|j| Goldilocks::from_u64(j as u64)).collect::<Vec<_>>(),
+    );
     let x = store.push(vec![from_i64(1 << 16); m * DIM_PAD]);
     let mut ops: Vec<Op> = Vec::new();
     let (sel, _thr, weights, _d1, _d2) =
-        build_moe_gate(&mut store, &mut ops, file, 0, x, m, shift, sqrt_sp);
+        build_moe_gate(&mut store, &mut ops, file, 0, x, m, shift, sqrt_sp, limb_table);
 
     let mut rng = XorShift64::new(0xBEEF);
     let proof = prove_shard(&mut store, &ops, &[], &mut rng);

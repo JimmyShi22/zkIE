@@ -519,6 +519,7 @@ pub fn build_moe_gate(
     m: usize,
     shift: u32,
     sqrt_softplus_table: usize,
+    limb_table: usize,
 ) -> (usize, usize, usize, usize, usize) {
     let n = N_ROUTED_EXPERTS_PAD;
     let gate_w = push_bf16_transposed(
@@ -542,7 +543,7 @@ pub fn build_moe_gate(
     ops.push(Op::Scale { x: z_raw, out: z, factor: 1, shift });
 
     let s_idx = store.push_idx(vec![]);
-    ops.push(Op::GeluIndex { x: z, out: s_idx, offset: 1 << 23, table_len: 1 << 24 });
+    ops.push(Op::GeluIndex { x: z, out: s_idx, offset: 1 << 23, table_len: 1 << 24, limb_table });
     let s = store.push(vec![]);
     ops.push(Op::Lookup { idx: s_idx, out: s, table: sqrt_softplus_table });
 
@@ -591,6 +592,7 @@ pub fn build_shared_expert(
     shift: u32,
     silu_table: usize,
     clip_table: usize,
+    limb_table: usize,
 ) -> usize {
     let w1 = push_quantized_fp8(
         store,
@@ -615,7 +617,7 @@ pub fn build_shared_expert(
     let gate = store.push(vec![]);
     ops.push(Op::Scale { x: gate_raw, out: gate, factor: 1, shift });
     let gate_idx = store.push_idx(vec![]);
-    ops.push(Op::GeluIndex { x: gate, out: gate_idx, offset: 1 << 23, table_len: 1 << 24 });
+    ops.push(Op::GeluIndex { x: gate, out: gate_idx, offset: 1 << 23, table_len: 1 << 24, limb_table });
     let gate_act = store.push(vec![]);
     ops.push(Op::Lookup { idx: gate_idx, out: gate_act, table: silu_table });
 
@@ -623,7 +625,7 @@ pub fn build_shared_expert(
     let up = store.push(vec![]);
     ops.push(Op::Scale { x: up_raw, out: up, factor: 1, shift });
     let up_idx = store.push_idx(vec![]);
-    ops.push(Op::GeluIndex { x: up, out: up_idx, offset: 1 << 23, table_len: 1 << 24 });
+    ops.push(Op::GeluIndex { x: up, out: up_idx, offset: 1 << 23, table_len: 1 << 24, limb_table });
     let up_clip = store.push(vec![]);
     ops.push(Op::Lookup { idx: up_idx, out: up_clip, table: clip_table });
 
@@ -686,6 +688,7 @@ pub fn build_routed_experts(
     shift: u32,
     silu_table: usize,
     clip_table: usize,
+    limb_table: usize,
 ) -> usize {
     let n = N_ROUTED_EXPERTS_PAD;
     let s = m * N_ACTIVATED_EXPERTS;
@@ -745,11 +748,11 @@ pub fn build_routed_experts(
     ops.push(Op::Scale { x: u, out: u16, factor: 1, shift });
 
     let g_idx = store.push_idx(vec![]);
-    ops.push(Op::GeluIndex { x: g16, out: g_idx, offset: 1 << 23, table_len: 1 << 24 });
+    ops.push(Op::GeluIndex { x: g16, out: g_idx, offset: 1 << 23, table_len: 1 << 24, limb_table });
     let gate_act = store.push(vec![]);
     ops.push(Op::Lookup { idx: g_idx, out: gate_act, table: silu_table });
     let u_idx = store.push_idx(vec![]);
-    ops.push(Op::GeluIndex { x: u16, out: u_idx, offset: 1 << 23, table_len: 1 << 24 });
+    ops.push(Op::GeluIndex { x: u16, out: u_idx, offset: 1 << 23, table_len: 1 << 24, limb_table });
     let up_clip = store.push(vec![]);
     ops.push(Op::Lookup { idx: u_idx, out: up_clip, table: clip_table });
 
@@ -1844,7 +1847,7 @@ pub fn build_engram(
     hash_ids: &[u32],
     shift: u32,
     rsqrt_table: usize,
-    _limb_table: usize,
+    limb_table: usize,
     gate_table: usize,
 ) -> usize {
     let hc = HC_MULT;
@@ -1944,7 +1947,7 @@ pub fn build_engram(
 
     // gate = sigmoid(sign(dot) * sqrt(|dot|)) via one precomputed table.
     let gate_idx = store.push_idx(vec![]);
-    ops.push(Op::GeluIndex { x: dot, out: gate_idx, offset: 1 << 23, table_len: 1 << 24 });
+    ops.push(Op::GeluIndex { x: dot, out: gate_idx, offset: 1 << 23, table_len: 1 << 24, limb_table });
     let gate = store.push(vec![]);
     ops.push(Op::Lookup { idx: gate_idx, out: gate, table: gate_table });
 
@@ -2164,6 +2167,7 @@ pub fn build_v41_layer(
         shift,
         silu_table,
         clip_table,
+        limb_table,
     );
     let ffn_out = if routed {
         let (sel, _thr, weights, _d1, _d2) = build_moe_gate(
@@ -2175,6 +2179,7 @@ pub fn build_v41_layer(
             m,
             shift,
             sqrt_softplus_table,
+            limb_table,
         );
         let routed_out = build_routed_experts(
             store,
@@ -2188,6 +2193,7 @@ pub fn build_v41_layer(
             shift,
             silu_table,
             clip_table,
+            limb_table,
         );
         let out = store.push(vec![]);
         ops.push(Op::Add { a: shared_out, b: routed_out, c: out });
@@ -2615,10 +2621,13 @@ pub fn build_block(
         shift,
         silu_table,
         clip_table,
+        limb_table,
     );
     let ffn_out = if routed {
         let (sel, _thr, weights, _d1, _d2) =
-            build_moe_gate(store, ops, file.clone(), layer, ffn_in_norm, m, shift, sqrt_softplus_table);
+            build_moe_gate(
+                store, ops, file.clone(), layer, ffn_in_norm, m, shift, sqrt_softplus_table, limb_table,
+            );
         let routed_out = build_routed_experts(
             store,
             ops,
@@ -2631,6 +2640,7 @@ pub fn build_block(
             shift,
             silu_table,
             clip_table,
+            limb_table,
         );
         let out = store.push(vec![]);
         ops.push(Op::Add { a: shared_out, b: routed_out, c: out });
