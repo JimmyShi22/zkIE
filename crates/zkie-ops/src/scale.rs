@@ -58,7 +58,7 @@ pub fn prove_scale(
 ) -> ScaleProof {
     assert_eq!(x.len(), out.len());
     assert!(x.len().is_power_of_two(), "Scale length must be a power of two");
-    let half = Goldilocks::from_u64(1u64 << (shift - 1));
+    let half = Goldilocks::from_u64(if shift > 0 { 1u64 << (shift - 1) } else { 0 });
     let two_shift = Goldilocks::from_u64(1u64 << shift);
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
     let f = from_i64(factor);
@@ -69,7 +69,7 @@ pub fn prove_scale(
         .zip(out.iter())
         .map(|(&xv, &ov)| {
             let rem = to_i64(xv) * factor - to_i64(ov) * (1i64 << shift);
-            from_i64(rem + (1i64 << (shift - 1)))
+            from_i64(rem + if shift > 0 { 1i64 << (shift - 1) } else { 0 })
         })
         .collect();
 
@@ -98,7 +98,7 @@ pub fn prove_scale(
 }
 
 pub fn verify_scale(proof: &ScaleProof, factor: i64, shift: u32) -> bool {
-    let half = Goldilocks::from_u64(1u64 << (shift - 1));
+    let half = Goldilocks::from_u64(if shift > 0 { 1u64 << (shift - 1) } else { 0 });
     let two_shift = Goldilocks::from_u64(1u64 << shift);
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
     let f = from_i64(factor);
@@ -129,7 +129,7 @@ pub fn prove_scale_vec(
     assert_eq!(x.len(), out.len());
     assert_eq!(x.len(), scale.len(), "ScaleVec proof requires same-length scale");
     assert!(x.len().is_power_of_two(), "ScaleVec length must be a power of two");
-    let half = Goldilocks::from_u64(1u64 << (shift - 1));
+    let half = Goldilocks::from_u64(if shift > 0 { 1u64 << (shift - 1) } else { 0 });
     let two_shift = Goldilocks::from_u64(1u64 << shift);
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
 
@@ -139,7 +139,7 @@ pub fn prove_scale_vec(
         .zip(out.iter())
         .map(|((&xv, &sv), &ov)| {
             let rem = to_i64(xv) * to_i64(sv) - to_i64(ov) * (1i64 << shift);
-            from_i64(rem + (1i64 << (shift - 1)))
+            from_i64(rem + if shift > 0 { 1i64 << (shift - 1) } else { 0 })
         })
         .collect();
 
@@ -166,7 +166,7 @@ pub fn prove_scale_vec(
 }
 
 pub fn verify_scale_vec(proof: &ScaleVecProof, shift: u32) -> bool {
-    let half = Goldilocks::from_u64(1u64 << (shift - 1));
+    let half = Goldilocks::from_u64(if shift > 0 { 1u64 << (shift - 1) } else { 0 });
     let two_shift = Goldilocks::from_u64(1u64 << shift);
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
     let terms = vec![

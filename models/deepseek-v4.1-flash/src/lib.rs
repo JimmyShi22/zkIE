@@ -2114,17 +2114,7 @@ pub fn build_v41_layer(
         )
     };
     let attn_out = build_oproj(store, ops, file.clone(), layer, m, shift, o);
-    let x4_attn = store.push(vec![]);
-    ops.push(Op::HyperPost {
-        y: attn_out,
-        residual: x4,
-        post: attn_post,
-        comb: attn_comb,
-        out: x4_attn,
-        m,
-        hc,
-        d: d_stored,
-    });
+    let x4_attn = build_hc_post(store, ops, attn_out, x4, attn_post, attn_comb, m, hc, d_stored);
 
     // ---- FFN sublayer ----
     let ffn_fn_t = push_f32_transposed(
@@ -2205,17 +2195,7 @@ pub fn build_v41_layer(
     } else {
         shared_out
     };
-    let x4_out = store.push(vec![]);
-    ops.push(Op::HyperPost {
-        y: ffn_out,
-        residual: x4_attn,
-        post: ffn_post,
-        comb: ffn_comb,
-        out: x4_out,
-        m,
-        hc,
-        d: d_stored,
-    });
+    let x4_out = build_hc_post(store, ops, ffn_out, x4_attn, ffn_post, ffn_comb, m, hc, d_stored);
 
     (x4_out, ffn_pre, new_compress_kv)
 }
@@ -2406,9 +2386,82 @@ fn build_hc_pre(
     hc: usize,
     d: usize,
 ) -> usize {
+    // `y[i,j] = round(sum_h pre[i,h] * x4[i,h,j] / 2^16)`. This is a per-token
+    // batched matmul (`pre` as the per-token weight), proven by `BatchedMatMul`
+    // rather than the unproven `HyperPre`.
+    let y_raw = store.push(vec![]);
+    ops.push(Op::BatchedMatMul { a: pre_in, w: x4, c: y_raw, s: m, k: hc, n: d });
     let y = store.push(vec![]);
-    ops.push(Op::HyperPre { x: x4, pre: pre_in, out: y, m, hc, d });
+    ops.push(Op::Scale { x: y_raw, out: y, factor: 1, shift: 16 });
     y
+}
+
+/// Expand the sublayer output back into `hc` residual copies: `out[i,h,j] =
+/// round((y[i,j] * post[i,h] + sum_g comb[i,h,g] * residual[i,g,j]) / 2^16)`.
+/// Assembled from proven primitives (BatchedMatMul + Lookup + ScaleVec + Add +
+/// Scale) instead of the unproven `HyperPost`.
+fn build_hc_post(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    y: usize,
+    residual: usize,
+    post: usize,
+    comb: usize,
+    m: usize,
+    hc: usize,
+    d: usize,
+) -> usize {
+    // term1[i,h,j] = y[i,j] * post[i,h] (raw Q32, no rounding).
+    let idx_y = {
+        let mut v = Vec::with_capacity(m * hc * d);
+        for i in 0..m {
+            for h in 0..hc {
+                for j in 0..d {
+                    v.push((i * d + j) as u32);
+                }
+            }
+        }
+        v
+    };
+    let y_b = gather(store, ops, y, idx_y);
+    let idx_post = {
+        let mut v = Vec::with_capacity(m * hc * d);
+        for i in 0..m {
+            for h in 0..hc {
+                for _ in 0..d {
+                    v.push((i * hc + h) as u32);
+                }
+            }
+        }
+        v
+    };
+    let post_b = gather(store, ops, post, idx_post);
+    let term1 = store.push(vec![]);
+    ops.push(Op::ScaleVec { x: y_b, scale: post_b, out: term1, shift: 0 });
+
+    // term2[i,h,j] = sum_g comb[i,h,g] * residual[i,g,j].
+    let idx_res = {
+        let mut v = Vec::with_capacity(m * hc * hc * d);
+        for i in 0..m {
+            for h in 0..hc {
+                for g in 0..hc {
+                    for j in 0..d {
+                        v.push((i * hc * d + g * d + j) as u32);
+                    }
+                }
+            }
+        }
+        v
+    };
+    let res_rep = gather(store, ops, residual, idx_res);
+    let term2 = store.push(vec![]);
+    ops.push(Op::BatchedMatMul { a: comb, w: res_rep, c: term2, s: m * hc, k: hc, n: d });
+
+    let sum = store.push(vec![]);
+    ops.push(Op::Add { a: term1, b: term2, c: sum });
+    let out = store.push(vec![]);
+    ops.push(Op::Scale { x: sum, out, factor: 1, shift: 16 });
+    out
 }
 
 /// Full Hyper-Connection block for one layer. `x4` is the `[m, HC_MULT, DIM_PAD]`
@@ -2511,17 +2564,7 @@ pub fn build_block(
         limb_table,
     );
     let attn_out = build_oproj(store, ops, file.clone(), layer, m, shift, o);
-    let x4_attn = store.push(vec![]);
-    ops.push(Op::HyperPost {
-        y: attn_out,
-        residual: x4,
-        post: attn_post,
-        comb: attn_comb,
-        out: x4_attn,
-        m,
-        hc,
-        d: d_stored,
-    });
+    let x4_attn = build_hc_post(store, ops, attn_out, x4, attn_post, attn_comb, m, hc, d_stored);
 
     // ---- FFN sublayer: mixes -> collapse(attention pre) -> norm -> MoE ----
     let ffn_fn_t = push_f32_transposed(
@@ -2595,17 +2638,7 @@ pub fn build_block(
     } else {
         shared_out
     };
-    let x4_out = store.push(vec![]);
-    ops.push(Op::HyperPost {
-        y: ffn_out,
-        residual: x4_attn,
-        post: ffn_post,
-        comb: ffn_comb,
-        out: x4_out,
-        m,
-        hc,
-        d: d_stored,
-    });
+    let x4_out = build_hc_post(store, ops, ffn_out, x4_attn, ffn_post, ffn_comb, m, hc, d_stored);
 
     (x4_out, ffn_pre, x4_attn, ffn_out)
 }
