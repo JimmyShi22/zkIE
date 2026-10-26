@@ -46,6 +46,30 @@ pub const O_LORA_RANK_PAD: usize = O_LORA_RANK.next_power_of_two();
 pub const MOE_INTER_DIM_PAD: usize = MOE_INTER_DIM.next_power_of_two();
 pub const N_ROUTED_EXPERTS_PAD: usize = N_ROUTED_EXPERTS.next_power_of_two();
 pub const VOCAB_PAD: usize = VOCAB.next_power_of_two();
+
+/// Shard file owning a layer's non-engram weights. Layer `l` lives in
+/// `model-{l+3:05d}-of-00048.safetensors` (verified against the checkpoint's
+/// `model.safetensors.index.json`).
+pub fn layer_shard(dir: &str, layer: usize) -> String {
+    format!("{dir}/model-{:05}-of-00048.safetensors", layer + 3)
+}
+
+/// Per-layer compress ratio for the 40 backbone layers (0,1: 0; 2..=20: 2;
+/// 21..=39: 1), matching `config.json` `compress_ratios`.
+pub fn compress_ratio(layer: usize) -> usize {
+    if layer < 2 || layer >= 38 {
+        0
+    } else if layer <= 20 {
+        2
+    } else {
+        1
+    }
+}
+
+/// Layers that compress their own KV and publish it into the shared cache.
+pub fn is_kv_source(layer: usize) -> bool {
+    matches!(layer, 2 | 8 | 14 | 20)
+}
 pub const HEAD_QK: usize = 64;
 pub const HEAD_NOPE: usize = HEAD_DIM - HEAD_QK;
 pub const HEAD_QK_PAD: usize = HEAD_QK.next_power_of_two();
@@ -1790,6 +1814,320 @@ pub fn build_compressor(
     }
 
     build_rms_norm(store, ops, pooled, norm_w, rsqrt_table, limb_table, groups, hd, hd)
+}
+
+/// One full Hyper-Connection block for an arbitrary layer, with sliding-window
+/// and/or compressed-KV MLA attention. `compress_kv` is the shared pre-RoPE
+/// compressed latent published by the most recent kv-source layer (or the one
+/// this layer publishes itself). Returns `(x4_out, ffn_pre, new_compress_kv)`;
+/// `new_compress_kv` is `Some` when `is_kv_source(layer)`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_v41_layer(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    file: Arc<SafetensorFile>,
+    layer: usize,
+    m: usize,
+    ratio: usize,
+    routed: bool,
+    shift: u32,
+    x4: usize,
+    pre_mix: usize,
+    compress_kv: Option<usize>,
+    cos_t: usize,
+    sin_t: usize,
+    compress_cos: usize,
+    compress_sin: usize,
+    exp_table: usize,
+    rsqrt_table: usize,
+    limb_table: usize,
+    sqrt_softplus_table: usize,
+    silu_table: usize,
+    clip_table: usize,
+) -> (usize, usize, Option<usize>) {
+    let hc = HC_MULT;
+    let d_stored = DIM_PAD;
+    let hc_d = hc * DIM;
+    let d_pad = hc_d.next_power_of_two();
+    let mix_hc = (2 + hc) * hc;
+    let mix_hc_pad = mix_hc.next_power_of_two();
+    let iters = 20usize;
+    let eps = HC_EPS_Q16;
+
+    // ---- attention sublayer ----
+    let attn_fn_t = push_f32_transposed(
+        store,
+        file.clone(),
+        &format!("layers.{layer}.hc_attn_fn"),
+        mix_hc,
+        hc_d,
+    );
+    let attn_base = push_f32_vec(store, file.clone(), &format!("layers.{layer}.hc_attn_base"));
+    let attn_scale = push_f32_vec(store, file.clone(), &format!("layers.{layer}.hc_attn_scale"));
+    let x4_flat = flatten_hc_real(store, ops, x4, m, hc, DIM, d_stored);
+    let x4_pad = pad_rows(store, ops, x4_flat, m, hc_d, d_pad);
+    let attn_mix = build_hc_mixes(
+        store,
+        ops,
+        x4_pad,
+        attn_fn_t,
+        m,
+        hc_d,
+        d_pad,
+        mix_hc_pad,
+        rsqrt_table,
+        limb_table,
+    );
+    let (attn_pre, attn_post, attn_comb) =
+        build_hc_split(store, ops, attn_mix, attn_scale, attn_base, m, hc, iters, eps);
+    let attn_in = build_hc_pre(store, ops, x4, pre_mix, m, hc, d_stored);
+    let attn_norm_w = {
+        let v: Vec<i64> = file
+            .read_bf16(&format!("layers.{layer}.attn_norm.weight"))
+            .iter()
+            .map(|&x| to_i64(x))
+            .collect();
+        store.push(broadcast_norm(&v, m, DIM_PAD))
+    };
+    let attn_in_norm =
+        build_rms_norm(store, ops, attn_in, attn_norm_w, rsqrt_table, limb_table, m, DIM_PAD, DIM);
+
+    let (q, kvn) = build_mla_qkv(
+        store,
+        ops,
+        file.clone(),
+        layer,
+        m,
+        shift,
+        attn_in_norm,
+        rsqrt_table,
+        limb_table,
+    );
+
+    // Publish this layer's compressed latent if it is a kv source.
+    let new_compress_kv = if is_kv_source(layer) {
+        Some(build_compressor(
+            store,
+            ops,
+            file.clone(),
+            layer,
+            attn_in_norm,
+            m,
+            ratio,
+            shift,
+            rsqrt_table,
+            limb_table,
+            exp_table,
+        ))
+    } else {
+        None
+    };
+    let ckv = new_compress_kv.or(compress_kv);
+
+    let o = if ratio > 0 {
+        build_mla_attention_compress(
+            store,
+            ops,
+            file.clone(),
+            layer,
+            m,
+            ratio,
+            shift,
+            q,
+            kvn,
+            ckv.expect("compressed KV must be published before a compress layer"),
+            cos_t,
+            sin_t,
+            compress_cos,
+            compress_sin,
+            exp_table,
+            limb_table,
+        )
+    } else {
+        build_mla_attention(
+            store,
+            ops,
+            file.clone(),
+            layer,
+            m,
+            shift,
+            q,
+            kvn,
+            cos_t,
+            sin_t,
+            exp_table,
+            limb_table,
+        )
+    };
+    let attn_out = build_oproj(store, ops, file.clone(), layer, m, shift, o);
+    let x4_attn = store.push(vec![]);
+    ops.push(Op::HyperPost {
+        y: attn_out,
+        residual: x4,
+        post: attn_post,
+        comb: attn_comb,
+        out: x4_attn,
+        m,
+        hc,
+        d: d_stored,
+    });
+
+    // ---- FFN sublayer ----
+    let ffn_fn_t = push_f32_transposed(
+        store,
+        file.clone(),
+        &format!("layers.{layer}.hc_ffn_fn"),
+        mix_hc,
+        hc_d,
+    );
+    let ffn_base = push_f32_vec(store, file.clone(), &format!("layers.{layer}.hc_ffn_base"));
+    let ffn_scale = push_f32_vec(store, file.clone(), &format!("layers.{layer}.hc_ffn_scale"));
+    let x4_flat2 = flatten_hc_real(store, ops, x4_attn, m, hc, DIM, d_stored);
+    let x4_pad2 = pad_rows(store, ops, x4_flat2, m, hc_d, d_pad);
+    let ffn_mix = build_hc_mixes(
+        store,
+        ops,
+        x4_pad2,
+        ffn_fn_t,
+        m,
+        hc_d,
+        d_pad,
+        mix_hc_pad,
+        rsqrt_table,
+        limb_table,
+    );
+    let (ffn_pre, ffn_post, ffn_comb) =
+        build_hc_split(store, ops, ffn_mix, ffn_scale, ffn_base, m, hc, iters, eps);
+    let ffn_in = build_hc_pre(store, ops, x4_attn, attn_pre, m, hc, d_stored);
+    let ffn_norm_w = {
+        let v: Vec<i64> = file
+            .read_bf16(&format!("layers.{layer}.ffn_norm.weight"))
+            .iter()
+            .map(|&x| to_i64(x))
+            .collect();
+        store.push(broadcast_norm(&v, m, DIM_PAD))
+    };
+    let ffn_in_norm =
+        build_rms_norm(store, ops, ffn_in, ffn_norm_w, rsqrt_table, limb_table, m, DIM_PAD, DIM);
+
+    let shared_out = build_shared_expert(
+        store,
+        ops,
+        file.clone(),
+        layer,
+        ffn_in_norm,
+        m,
+        shift,
+        silu_table,
+        clip_table,
+    );
+    let ffn_out = if routed {
+        let (sel, _thr, weights, _d1, _d2) = build_moe_gate(
+            store,
+            ops,
+            file.clone(),
+            layer,
+            ffn_in_norm,
+            m,
+            shift,
+            sqrt_softplus_table,
+        );
+        let routed_out = build_routed_experts(
+            store,
+            ops,
+            file.clone(),
+            layer,
+            ffn_in_norm,
+            sel,
+            weights,
+            m,
+            shift,
+            silu_table,
+            clip_table,
+        );
+        let out = store.push(vec![]);
+        ops.push(Op::Add { a: shared_out, b: routed_out, c: out });
+        out
+    } else {
+        shared_out
+    };
+    let x4_out = store.push(vec![]);
+    ops.push(Op::HyperPost {
+        y: ffn_out,
+        residual: x4_attn,
+        post: ffn_post,
+        comb: ffn_comb,
+        out: x4_out,
+        m,
+        hc,
+        d: d_stored,
+    });
+
+    (x4_out, ffn_pre, new_compress_kv)
+}
+
+/// Run all 40 backbone layers, returning the final `(x4, pre_mix)` before the
+/// output RMSNorm + head. `x` is the token embedding `[m, DIM_PAD]`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_v41_forward(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    dir: &str,
+    m: usize,
+    shift: u32,
+    routed: bool,
+    n_layers: usize,
+    x: usize,
+    exp_table: usize,
+    rsqrt_table: usize,
+    limb_table: usize,
+    sqrt_softplus_table: usize,
+    silu_table: usize,
+    clip_table: usize,
+) -> (usize, usize) {
+    let hc = HC_MULT;
+    let x4 = expand_to_hc(store, ops, x, m, hc, DIM_PAD);
+    let mut pre_mix = build_identity_pre_mix(store, m);
+    let mut x4 = x4;
+    let mut compress_kv: Option<usize> = None;
+
+    for layer in 0..n_layers.min(N_LAYERS) {
+        let ratio = compress_ratio(layer);
+        let file = open_shard(&layer_shard(dir, layer));
+        let (cos, sin) = build_rope_tables(store, m, HEAD_QK);
+        let groups = if ratio > 0 { m / ratio } else { 0 };
+        let cpos: Vec<usize> = (0..groups).map(|g| g * ratio).collect();
+        let (ccos, csin) = build_rope_tables_at(store, &cpos, HEAD_QK);
+        let (x4o, pre_mixo, new_ckv) = build_v41_layer(
+            store,
+            ops,
+            file,
+            layer,
+            m,
+            ratio,
+            routed,
+            shift,
+            x4,
+            pre_mix,
+            compress_kv,
+            cos,
+            sin,
+            ccos,
+            csin,
+            exp_table,
+            rsqrt_table,
+            limb_table,
+            sqrt_softplus_table,
+            silu_table,
+            clip_table,
+        );
+        x4 = x4o;
+        pre_mix = pre_mixo;
+        if new_ckv.is_some() {
+            compress_kv = new_ckv;
+        }
+    }
+    (x4, pre_mix)
 }
 
 /// One-hot initial Hyper-Connection collapse: copy 0 carries the full residual,
