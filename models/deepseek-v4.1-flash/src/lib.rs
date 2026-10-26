@@ -10,7 +10,7 @@ use std::sync::Arc;
 use zkie_core::common::quantized_io::{QuantDtype, SafetensorFile};
 use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing};
 use zkie_core::common::fixed_point::{from_i64, to_i64};
-use zkie_ops::compose::{causal_mask, Op, Store};
+use zkie_ops::compose::{Op, Store};
 
 // Architecture constants from DeepSeek-V4.1-Flash `config.json` / `tech_clean.txt`.
 pub const N_LAYERS: usize = 40;
@@ -88,15 +88,184 @@ fn slice_cols(mat: &[i64], cols: usize, c0: usize, c1: usize) -> Vec<Goldilocks>
         .collect()
 }
 
-/// RoPE cos/sin tables for a `qk`-wide rotary tail, at fixed point 2^16.
-pub fn build_rope_tables(store: &mut Store, qk: usize) -> (usize, usize) {
+/// Gather `table[idx]` into a new tensor with one proven `Lookup` op.
+fn gather(store: &mut Store, ops: &mut Vec<Op>, table: usize, idx: Vec<u32>) -> usize {
+    let idx_t = store.push_idx(idx);
+    let out = store.push(vec![]);
+    ops.push(Op::Lookup { idx: idx_t, out, table });
+    out
+}
+
+/// Stack `parts` (each `[m, d]`) into `[m, len*d]` (token-major). The input
+/// tensors are token-major `[m, d]`; the output interleaves them per token.
+fn stack_rows(store: &mut Store, ops: &mut Vec<Op>, parts: &[usize], m: usize, d: usize) -> usize {
+    let table = store.push(vec![]);
+    ops.push(Op::Concat { parts: parts.to_vec(), out: table });
+    let np = parts.len();
+    let mut idx = Vec::with_capacity(m * np * d);
+    for i in 0..m {
+        for p in 0..np {
+            for j in 0..d {
+                idx.push((p * m * d + i * d + j) as u32);
+            }
+        }
+    }
+    gather(store, ops, table, idx)
+}
+
+/// Adjacent-pair RoPE permutation index for the whole `[m, qk]` tail: each
+/// token's `qk` tail is permuted from natural interleaved order into
+/// `[even, odd]`, matching the official DeepSeek `rope`.
+fn rope_perm_rows(m: usize, qk: usize) -> Vec<u32> {
     let half = qk / 2;
-    let mut cos = Vec::with_capacity(half);
-    let mut sin = Vec::with_capacity(half);
-    for i in 0..half {
-        let theta = (10000f64).powf(-2.0 * i as f64 / qk as f64);
-        cos.push(from_i64((theta.cos() * 65536.0).round() as i64));
-        sin.push(from_i64((theta.sin() * 65536.0).round() as i64));
+    let mut p = Vec::with_capacity(m * qk);
+    for i in 0..m {
+        for j in 0..half {
+            p.push((i * qk + 2 * j) as u32);
+        }
+        for j in 0..half {
+            p.push((i * qk + 2 * j + 1) as u32);
+        }
+    }
+    p
+}
+
+/// Per-head query gather indices for head `h` over the row-major
+/// `[m, N_HEADS * HEAD_DIM]` query tensor: `(nope_idx, rope_idx)`.
+fn head_query_indices(h: usize, m: usize) -> (Vec<u32>, Vec<u32>) {
+    let stride = N_HEADS * HEAD_DIM;
+    let base = h * HEAD_DIM;
+    let mut nope = Vec::with_capacity(m * HEAD_NOPE);
+    let mut rope = Vec::with_capacity(m * HEAD_QK);
+    for i in 0..m {
+        for j in 0..HEAD_NOPE {
+            nope.push((i * stride + base + j) as u32);
+        }
+        for j in 0..HEAD_QK {
+            rope.push((i * stride + base + HEAD_NOPE + j) as u32);
+        }
+    }
+    (nope, rope)
+}
+
+/// Column-band gather indices over a row-major `[m, stride]` tensor: rows keep
+/// their order, columns `[c0, c1)` are gathered within every row.
+fn col_band(m: usize, stride: usize, c0: usize, c1: usize) -> Vec<u32> {
+    let mut idx = Vec::with_capacity(m * (c1 - c0));
+    for i in 0..m {
+        for j in c0..c1 {
+            idx.push((i * stride + j) as u32);
+        }
+    }
+    idx
+}
+
+/// Pad each row of a row-major `[m, d]` tensor to `[m, d_pad]` with zeros, via
+/// one proven `Lookup`. Unlike a flat `Concat`, the padding is interleaved
+/// per row.
+fn pad_rows(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    mat: usize,
+    m: usize,
+    d: usize,
+    d_pad: usize,
+) -> usize {
+    let zeros = store.push(vec![Goldilocks::ZERO; m * (d_pad - d)]);
+    let table = store.push(vec![]);
+    ops.push(Op::Concat { parts: vec![mat, zeros], out: table });
+    let mut idx = Vec::with_capacity(m * d_pad);
+    for i in 0..m {
+        for j in 0..d {
+            idx.push((i * d + j) as u32);
+        }
+        for j in 0..(d_pad - d) {
+            idx.push((m * d + i * (d_pad - d) + j) as u32);
+        }
+    }
+    gather(store, ops, table, idx)
+}
+
+/// Row-major interleave of two tensors `a [m, da]` and `b [m, db]` into
+/// `[m, da+db]` (each row is `a` followed by `b`), via one proven `Lookup`.
+fn interleave2(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    a: usize,
+    b: usize,
+    m: usize,
+    da: usize,
+    db: usize,
+) -> usize {
+    let table = store.push(vec![]);
+    ops.push(Op::Concat { parts: vec![a, b], out: table });
+    let mut idx = Vec::with_capacity(m * (da + db));
+    for i in 0..m {
+        for j in 0..da {
+            idx.push((i * da + j) as u32);
+        }
+        for j in 0..db {
+            idx.push((m * da + i * db + j) as u32);
+        }
+    }
+    gather(store, ops, table, idx)
+}
+
+/// Inverse of `rope_perm_rows`: map a `[m, qk]` tensor back from `[even, odd]`
+/// order into natural interleaved order.
+fn unrope_perm_rows(m: usize, qk: usize) -> Vec<u32> {
+    let half = qk / 2;
+    let mut p = Vec::with_capacity(m * qk);
+    for i in 0..m {
+        for j in 0..half {
+            p.push((i * qk + j) as u32);
+            p.push((i * qk + half + j) as u32);
+        }
+    }
+    p
+}
+
+/// Build `[m, n_pad]` where the first `m` columns are `mat [m, m]`, column `m`
+/// is `col [m]` (the per-head attention sink), and the remaining columns are
+/// zero. `n_pad` must be `(m + 1).next_power_of_two()`, keeping the softmax
+/// length a power of two. Produced via one proven `Lookup`.
+fn pad_sink_matrix(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    mat: usize,
+    col: usize,
+    m: usize,
+    n_pad: usize,
+) -> usize {
+    let fill = n_pad - m - 1;
+    let zeros = store.push(vec![Goldilocks::ZERO; m * fill]);
+    let table = store.push(vec![]);
+    ops.push(Op::Concat { parts: vec![mat, col, zeros], out: table });
+    let mut idx = Vec::with_capacity(m * n_pad);
+    for i in 0..m {
+        for j in 0..m {
+            idx.push((i * m + j) as u32);
+        }
+        idx.push((m * m + i) as u32);
+        for j in 0..fill {
+            idx.push((m * m + m + i * fill + j) as u32);
+        }
+    }
+    gather(store, ops, table, idx)
+}
+
+/// Position-dependent RoPE cos/sin tables for a `qk`-wide rotary tail, at fixed
+/// point 2^16. `cos[p*half+i] = cos(p * 10000^(-2i/qk))`.
+pub fn build_rope_tables(store: &mut Store, m: usize, qk: usize) -> (usize, usize) {
+    let half = qk / 2;
+    let mut cos = Vec::with_capacity(m * half);
+    let mut sin = Vec::with_capacity(m * half);
+    for p in 0..m {
+        for i in 0..half {
+            let theta = p as f64 * (10000f64).powf(-2.0 * i as f64 / qk as f64);
+            cos.push(from_i64((theta.cos() * 65536.0).round() as i64));
+            sin.push(from_i64((theta.sin() * 65536.0).round() as i64));
+        }
     }
     (store.push(cos), store.push(sin))
 }
@@ -947,9 +1116,12 @@ pub fn build_deepseek_v41(
 
 /// Dense multi-head attention over the projected `q` / `kv` tensors, with the
 /// per-head attention sink (`attn_sink`) applied as a softmax bias. `kv` is the
-/// shared `[m, HEAD_DIM]` latent (`nope || rope`); each head slices its own
-/// `[m, N_HEADS * HEAD_DIM]` query block and RoPE-rotates the rope tail. Returns
-/// the concatenated attention output `[m, N_HEADS * HEAD_DIM]`.
+/// shared `[m, HEAD_DIM]` latent (`nope || rope`); each head gathers its own
+/// `[m, N_HEADS * HEAD_DIM]` query block and RoPE-rotates the interleaved rope
+/// tail. The `1/sqrt(head_dim)` attention scale is split across `q` and `kv`
+/// (factor `2^16 / head_dim^0.25`, as in the GPT-2 path) before the dot product
+/// and folded back to Q16 before the softmax. Returns the concatenated attention
+/// output `[m, N_HEADS * HEAD_DIM]`.
 ///
 /// This is the current validated slice (dense causal attention + sink). The
 /// sliding-window compressed-KV top-k path (SparseAttention) is layered on top
@@ -972,31 +1144,78 @@ pub fn build_mla_attention(
     let nope = HEAD_NOPE;
     let qk = HEAD_QK;
     let nope_pad = HEAD_NOPE_PAD;
-    let mask = store.push(causal_mask(m));
+    let n_pad = (m + 1).next_power_of_two();
+    let scale = (65536.0f64 / (HEAD_DIM as f64).powf(0.25)).round() as i64;
+    // Causal mask over the `m` real columns plus one unmasked sink column, with
+    // the tail padded to `-2^30` so those positions collapse under softmax.
+    let mut mask_aug = Vec::with_capacity(m * n_pad);
+    for i in 0..m {
+        for j in 0..m {
+            mask_aug.push(if j > i { from_i64(-(1i64 << 30)) } else { Goldilocks::ZERO });
+        }
+        mask_aug.push(Goldilocks::ZERO);
+        for _ in (m + 1)..n_pad {
+            mask_aug.push(from_i64(-(1i64 << 30)));
+        }
+    }
+    let mask = store.push(mask_aug);
 
-    let kvn = store.push(vec![]);
-    let kvr = store.push(vec![]);
-    ops.push(Op::Slice { x: kv, out: kvn, start: 0, len: m * nope });
-    ops.push(Op::Slice { x: kv, out: kvr, start: m * nope, len: m * qk });
-    let zero_n = store.push(vec![Goldilocks::ZERO; m * (nope_pad - nope)]);
-    let kvn_pad = store.push(vec![]);
-    ops.push(Op::Concat { parts: vec![kvn, zero_n], out: kvn_pad });
+    // Split the shared latent into its non-rotary and rotary tails. These are
+    // column bands of the row-major `[m, HEAD_DIM]` tensor, so they must be
+    // gathered per token rather than flat-sliced.
+    let kvn = gather(store, ops, kv, col_band(m, HEAD_DIM, 0, nope));
+    let kvr = gather(store, ops, kv, col_band(m, HEAD_DIM, nope, nope + qk));
+
+    // Rotate the KV rotary tail once (interleaved pairing). The permuted output
+    // is used for the key dot product; a natural-order copy is used as the
+    // attention value.
+    let kvr_perm = gather(store, ops, kvr, rope_perm_rows(m, qk));
+    let kvr_rot = store.push(vec![]);
+    ops.push(Op::RoPE {
+        x: kvr_perm,
+        cos: cos_t,
+        sin: sin_t,
+        out: kvr_rot,
+        range_table: limb_table,
+        m,
+        d: qk,
+        shift,
+    });
+    let kvr_rot_natural = gather(store, ops, kvr_rot, unrope_perm_rows(m, qk));
+
+    // Value tensors (unscaled Q16): nope padded to a power of two, rope kept at
+    // its natural 64 columns (already a power of two).
+    let kvn_pad = pad_rows(store, ops, kvn, m, nope, nope_pad);
+    // Augment the value tensors with zero rows for the sink and padding slots.
+    let zero_rows_nope = store.push(vec![Goldilocks::ZERO; (n_pad - m) * nope_pad]);
+    let zero_rows_qk = store.push(vec![Goldilocks::ZERO; (n_pad - m) * qk]);
+    let kvn_pad_aug = store.push(vec![]);
+    ops.push(Op::Concat { parts: vec![kvn_pad, zero_rows_nope], out: kvn_pad_aug });
+    let kvr_aug = store.push(vec![]);
+    ops.push(Op::Concat { parts: vec![kvr_rot_natural, zero_rows_qk], out: kvr_aug });
+
+    // Key tensors for the score dot products (scaled by `scale`).
+    let kvn_scaled = store.push(vec![]);
+    ops.push(Op::Scale { x: kvn_pad, out: kvn_scaled, factor: scale, shift });
     let ktn = store.push(vec![]);
+    ops.push(Op::Transpose { x: kvn_scaled, out: ktn, m, k: nope_pad });
+    let kvr_scaled = store.push(vec![]);
+    ops.push(Op::Scale { x: kvr_rot, out: kvr_scaled, factor: scale, shift });
     let ktr = store.push(vec![]);
-    ops.push(Op::Transpose { x: kvn_pad, out: ktn, m, k: nope_pad });
-    ops.push(Op::Transpose { x: kvr, out: ktr, m, k: qk });
+    ops.push(Op::Transpose { x: kvr_scaled, out: ktr, m, k: qk });
 
     let mut head_outs = Vec::new();
     for head in 0..N_HEADS {
-        let qn = store.push(vec![]);
-        let qr = store.push(vec![]);
-        ops.push(Op::Slice { x: q, out: qn, start: head * HEAD_DIM, len: nope });
-        ops.push(Op::Slice { x: q, out: qr, start: head * HEAD_DIM + nope, len: qk });
-        let qn_pad = store.push(vec![]);
-        ops.push(Op::Concat { parts: vec![qn, zero_n], out: qn_pad });
+        let (nope_idx, rope_idx) = head_query_indices(head, m);
+        let qn = gather(store, ops, q, nope_idx);
+        let qr = gather(store, ops, q, rope_idx);
+        let qn_pad = pad_rows(store, ops, qn, m, nope, nope_pad);
+        let qn_scaled = store.push(vec![]);
+        ops.push(Op::Scale { x: qn_pad, out: qn_scaled, factor: scale, shift });
+        let qr_perm = gather(store, ops, qr, rope_perm_rows(m, qk));
         let qr_rot = store.push(vec![]);
         ops.push(Op::RoPE {
-            x: qr,
+            x: qr_perm,
             cos: cos_t,
             sin: sin_t,
             out: qr_rot,
@@ -1005,55 +1224,50 @@ pub fn build_mla_attention(
             d: qk,
             shift,
         });
+        let qr_scaled = store.push(vec![]);
+        ops.push(Op::Scale { x: qr_rot, out: qr_scaled, factor: scale, shift });
         let scores_n = store.push(vec![]);
         let scores_r = store.push(vec![]);
         let scores = store.push(vec![]);
-        ops.push(Op::MatMul { a: qn_pad, b: ktn, c: scores_n, m, k: nope_pad, n: m });
-        ops.push(Op::MatMul { a: qr_rot, b: ktr, c: scores_r, m, k: qk, n: m });
+        ops.push(Op::MatMul { a: qn_scaled, b: ktn, c: scores_n, m, k: nope_pad, n: m });
+        ops.push(Op::MatMul { a: qr_scaled, b: ktr, c: scores_r, m, k: qk, n: m });
         ops.push(Op::Add { a: scores_n, b: scores_r, c: scores });
+        let scores_16 = store.push(vec![]);
+        ops.push(Op::Scale { x: scores, out: scores_16, factor: 1, shift });
+        // Append the per-head attention sink as one extra softmax column. The
+        // sink score is a public model constant and enters the max-subtraction
+        // and the softmax denominator exactly like a real position.
+        let sink_score = to_i64(file.read_f32(&format!("layers.{layer}.attn.attn_sink"))[head]);
+        let sink_col = store.push(vec![from_i64(sink_score); m]);
+        let scores_aug = pad_sink_matrix(store, ops, scores_16, sink_col, m, n_pad);
         let idx = store.push_idx(vec![]);
         let e = store.push(vec![]);
         let probs = store.push(vec![]);
-        let probs_bias = store.push(vec![]);
         ops.push(Op::StableSoftmaxIndex {
-            x: scores,
+            x: scores_aug,
             mask,
             out: idx,
             offset: 1 << 21,
             table_len: 1 << 21,
             m,
-            n: m,
+            n: n_pad,
         });
-        ops.push(Op::Softmax { idx, e, out: probs, table: exp_table, m, n: m });
-        let sink_fixed = {
-            let v = to_i64(file.read_f32(&format!("layers.{layer}.attn.attn_sink"))[head]);
-            ((v as f64 / 65536.0).exp() * 65536.0).round() as i64
-        };
-        let sink_bias = store.push(vec![from_i64(sink_fixed); m]);
-        ops.push(Op::SoftmaxBias { e, bias: sink_bias, out: probs_bias, m, n: m });
+        ops.push(Op::Softmax { idx, e, out: probs, table: exp_table, m, n: n_pad });
         let attn_n = store.push(vec![]);
         let attn_r = store.push(vec![]);
-        ops.push(Op::MatMul { a: probs_bias, b: kvn_pad, c: attn_n, m, k: m, n: nope_pad });
-        ops.push(Op::MatMul { a: probs_bias, b: kvr, c: attn_r, m, k: m, n: qk });
+        ops.push(Op::MatMul { a: probs, b: kvn_pad_aug, c: attn_n, m, k: n_pad, n: nope_pad });
+        ops.push(Op::MatMul { a: probs, b: kvr_aug, c: attn_r, m, k: n_pad, n: qk });
         let attn_n16 = store.push(vec![]);
         let attn_r16 = store.push(vec![]);
         ops.push(Op::Scale { x: attn_n, out: attn_n16, factor: 1, shift });
         ops.push(Op::Scale { x: attn_r, out: attn_r16, factor: 1, shift });
-        let attn_n_sl = store.push(vec![]);
-        ops.push(Op::Slice { x: attn_n16, out: attn_n_sl, start: 0, len: m * nope });
-        let head_out = store.push(vec![]);
-        ops.push(Op::Concat { parts: vec![attn_n_sl, attn_r16], out: head_out });
+        let attn_n_sl = gather(store, ops, attn_n16, col_band(m, nope_pad, 0, nope));
+        let head_out = interleave2(store, ops, attn_n_sl, attn_r16, m, nope, qk);
         head_outs.push(head_out);
     }
 
-    // Concatenate all heads into `o` [m, N_HEADS * HEAD_DIM].
-    let mut o = head_outs[0];
-    for &h in &head_outs[1..] {
-        let cat = store.push(vec![]);
-        ops.push(Op::Concat { parts: vec![o, h], out: cat });
-        o = cat;
-    }
-    o
+    // Token-major interleave of all heads into `o` [m, N_HEADS * HEAD_DIM].
+    stack_rows(store, ops, &head_outs, m, HEAD_DIM)
 }
 
 /// MLA output projection: `o -> attention_out` through the group-interleaved
@@ -1086,13 +1300,7 @@ pub fn build_oproj(
     let per_group = N_HEADS * HEAD_DIM / O_GROUPS;
     let mut outs = Vec::with_capacity(O_GROUPS);
     for g in 0..O_GROUPS {
-        let o_g = store.push(vec![]);
-        ops.push(Op::Slice {
-            x: o,
-            out: o_g,
-            start: g * per_group,
-            len: per_group,
-        });
+        let o_g = gather(store, ops, o, col_band(m, N_HEADS * HEAD_DIM, g * per_group, (g + 1) * per_group));
         let wa_g = store.push(slice_rows(
             &wa_mat,
             per_group,

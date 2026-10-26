@@ -23,7 +23,10 @@ fn main() {
         .to_str()
         .unwrap()
         .to_string();
-    let m = 1usize;
+    let m: usize = std::env::var("ZKIE_M")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
     let shift = 16u32;
     let mut store = Store::new();
     let mut ops: Vec<Op> = Vec::new();
@@ -37,7 +40,7 @@ fn main() {
             .map(|j| Goldilocks::from_u64(j as u64))
             .collect::<Vec<_>>(),
     );
-    let (cos, sin) = zkie_models_deepseek_v41_flash::build_rope_tables(&mut store, HEAD_QK);
+    let (cos, sin) = zkie_models_deepseek_v41_flash::build_rope_tables(&mut store, m, HEAD_QK);
 
     let o = build_mla_attention(
         &mut store,
@@ -59,8 +62,9 @@ fn main() {
     let proof = prove_shard(&mut store, &ops, &[], &mut rng);
     assert!(verify_shard(&store.owned_slices(), &ops, &proof));
     println!(
-        "ok full_attention ops={} first4={:?}",
+        "ok full_attention m={} ops={} first8={:?}",
+        m,
         ops.len(),
-        store.get(acc).iter().take(4).map(|&v| to_i64(v)).collect::<Vec<_>>()
+        store.get(acc).iter().take(8).map(|&v| to_i64(v)).collect::<Vec<_>>()
     );
 }
