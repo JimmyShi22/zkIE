@@ -743,6 +743,13 @@ pub enum Op {
         hc: usize,
         d: usize,
     },
+    EngramHash {
+        tokens: T,
+        out: T,
+        seq: usize,
+        max_ngram: usize,
+        n_heads: usize,
+    },
     Scale {
         x: T,
         out: T,
@@ -991,6 +998,7 @@ pub enum OpProof {
     SinkhornSplit,
     HyperPre,
     HyperPost,
+    EngramHash,
     Scale,
     ScaleVec,
     Relu,
@@ -1166,6 +1174,7 @@ impl Op {
             Op::SinkhornSplit { mixes, scale, base, .. } => vec![mixes, scale, base],
             Op::HyperPre { x, pre, .. } => vec![x, pre],
             Op::HyperPost { y, residual, post, comb, .. } => vec![y, residual, post, comb],
+            Op::EngramHash { tokens, .. } => vec![tokens],
             Op::Scale { x, .. } => vec![x],
             Op::ScaleVec { x, scale, .. } => vec![x, scale],
             Op::Relu { x, .. } => vec![x],
@@ -1230,6 +1239,7 @@ impl Op {
             Op::SinkhornSplit { pre, post, comb, .. } => vec![pre, post, comb],
             Op::HyperPre { out, .. } => vec![out],
             Op::HyperPost { out, .. } => vec![out],
+            Op::EngramHash { out, .. } => vec![out],
             | Op::Scale { out, .. }
             | Op::ScaleVec { out, .. }
             | Op::Relu { out, .. }
@@ -1584,6 +1594,28 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                     }
                 }
                 store.v[out] = TensorData::Owned(o);
+            }
+            Op::EngramHash { tokens, out, seq, max_ngram, n_heads } => {
+                let toks: Vec<u32> = store.idx[tokens].clone();
+                let mut v = Vec::with_capacity(seq * (max_ngram - 1) * n_heads);
+                for p in 0..seq {
+                    for s in 2..=max_ngram {
+                        for h in 0..n_heads {
+                            let prime = 1_000_003u64 + (s - 2) as u64 * n_heads as u64 * 97 + h as u64 * 131;
+                            let mut hash = 0u64;
+                            for j in 0..s {
+                                if p < j {
+                                    hash = u64::MAX;
+                                    break;
+                                }
+                                let t = toks[p - j] as u64;
+                                hash = (hash + t * (j as u64 * 2 + 1)) % prime;
+                            }
+                            v.push(if hash == u64::MAX { u32::MAX } else { hash as u32 });
+                        }
+                    }
+                }
+                store.idx[out] = v;
             }
             Op::Scale {
                 x,
@@ -2096,6 +2128,9 @@ pub fn prove_shard_precomputed(
             }
             Op::HyperPost { .. } => {
                 op_proofs.push(OpProof::HyperPost);
+            }
+            Op::EngramHash { .. } => {
+                op_proofs.push(OpProof::EngramHash);
             }
             Op::Scale { .. } => {
                 op_proofs.push(OpProof::Scale);
@@ -2679,6 +2714,7 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
             (Op::SinkhornSplit { .. }, OpProof::SinkhornSplit) => {}
             (Op::HyperPre { .. }, OpProof::HyperPre) => {}
             (Op::HyperPost { .. }, OpProof::HyperPost) => {}
+            (Op::EngramHash { .. }, OpProof::EngramHash) => {}
             (Op::Scale { .. }, OpProof::Scale) => {}
             (Op::ScaleVec { .. }, OpProof::ScaleVec) => {}
             (Op::Scatter { m, n, .. }, OpProof::Scatter(p)) => {
@@ -7271,6 +7307,7 @@ mod tests {
             | OpProof::SinkhornSplit
             | OpProof::HyperPre
             | OpProof::HyperPost
+            | OpProof::EngramHash
             | OpProof::Scale
             | OpProof::ScaleVec
             | OpProof::ScaleGate
@@ -7321,6 +7358,7 @@ mod tests {
             OpProof::SinkhornSplit,
             OpProof::HyperPre,
             OpProof::HyperPost,
+            OpProof::EngramHash,
             OpProof::Scale,
             OpProof::ScaleVec,
             OpProof::ScaleGate,
@@ -7335,7 +7373,7 @@ mod tests {
         ];
         assert_eq!(
             unproven.len(),
-            21,
+            22,
             "the set of ops with no proof of their own changed; see the succinct-verification thread before adjusting"
         );
         for p in &unproven {
