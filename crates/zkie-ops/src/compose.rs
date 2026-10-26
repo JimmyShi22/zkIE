@@ -847,6 +847,15 @@ pub enum Op {
         m: usize,
         n: usize,
     },
+    /// Row normalization without an exponential: `out = round(x * 2^16 / row_sum(x))`.
+    /// This is the MoE routing-gate weights step (the values are already the
+    /// selected softplus-sqrt scores, so no `exp` table is involved).
+    SumNorm {
+        x: T,
+        out: T,
+        m: usize,
+        n: usize,
+    },
     SoftmaxIndex {
         x: T,
         out: T,
@@ -1047,6 +1056,7 @@ pub enum OpProof {
     Lookup,
     Softmax(SoftmaxRoundedProof),
     SoftmaxBias(SoftmaxBiasProof),
+    SumNorm(SoftmaxRoundedProof),
     SoftmaxIndex,
     GeluIndex,
     StableSoftmaxIndex,
@@ -1216,6 +1226,7 @@ impl Op {
             Op::Lookup { idx, table, .. } => vec![idx, table],
             Op::Softmax { idx, table, .. } => vec![idx, table],
             Op::SoftmaxBias { e, bias, .. } => vec![e, bias],
+            Op::SumNorm { x, .. } => vec![x],
             Op::SoftmaxIndex { x, .. } => vec![x],
             Op::GeluIndex { x, .. } => vec![x],
             Op::StableSoftmaxIndex { x, mask, .. } => vec![x, mask],
@@ -1292,6 +1303,7 @@ impl Op {
             Op::Projection { out, rem, .. } => vec![out, rem],
             Op::Softmax { e, out, .. } => vec![e, out],
             Op::SoftmaxBias { out, .. } => vec![out],
+            Op::SumNorm { out, .. } => vec![out],
             Op::TopKSelect {
                 sel,
                 thr,
@@ -1964,6 +1976,21 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 let (o, _sum) = softmax_bias_forward(store.get(e), store.get(bias), m, n);
                 store.v[out] = TensorData::Owned(o);
             }
+            Op::SumNorm { x, out, m, n } => {
+                let xv = store.get(x);
+                let sum: Vec<Goldilocks> = (0..m)
+                    .map(|i| (0..n).fold(Goldilocks::ZERO, |a, j| a + xv[i * n + j]))
+                    .collect();
+                let o: Vec<Goldilocks> = (0..m * n)
+                    .map(|ij| {
+                        from_i64(round_div(
+                            to_i64(xv[ij]) * (1i64 << 16),
+                            to_i64(sum[ij / n]),
+                        ))
+                    })
+                    .collect();
+                store.v[out] = TensorData::Owned(o);
+            }
             Op::SoftmaxIndex { x, out, table_len } => {
                 let indices: Vec<u32> = store
                     .get(x)
@@ -2517,6 +2544,21 @@ pub fn prove_shard_precomputed(
                 claims.push((out, p.r_scale.clone(), mle::eval(store.get(out), &p.r_scale)));
                 op_proofs.push(OpProof::SoftmaxBias(p));
             }
+            Op::SumNorm { x, out, m, n } => {
+                let dummy_idx = vec![0u32; m * n];
+                let p = prove_softmax_rounded(
+                    &dummy_idx,
+                    store.get(x),
+                    store.get(out),
+                    &[],
+                    m,
+                    n,
+                    rng,
+                );
+                claims.push((x, p.r_scale.clone(), mle::eval(store.get(x), &p.r_scale)));
+                claims.push((out, p.r_scale.clone(), mle::eval(store.get(out), &p.r_scale)));
+                op_proofs.push(OpProof::SumNorm(p));
+            }
             Op::SoftmaxIndex { .. } => {
                 op_proofs.push(OpProof::SoftmaxIndex);
             }
@@ -2946,6 +2988,11 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
             }
             (Op::SoftmaxBias { .. }, OpProof::SoftmaxBias(sp)) => {
                 if !verify_softmax_bias(sp) {
+                    return false;
+                }
+            }
+            (Op::SumNorm { .. }, OpProof::SumNorm(sp)) => {
+                if !verify_softmax_rounded(sp) {
                     return false;
                 }
             }
@@ -7488,6 +7535,7 @@ mod tests {
             | OpProof::Lookup
             | OpProof::Softmax(..)
             | OpProof::SoftmaxBias(..)
+            | OpProof::SumNorm(..)
             | OpProof::Layernorm(..)
             | OpProof::LayerNormCentered(..)
             | OpProof::RmsNorm(..)
