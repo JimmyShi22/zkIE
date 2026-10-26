@@ -828,6 +828,17 @@ pub enum Op {
         n: usize,
         k: usize,
     },
+    SparseIndexer {
+        x: T,
+        sel: T,
+        thr: T,
+        gate: T,
+        d1: T,
+        d2: T,
+        m: usize,
+        n: usize,
+        k: usize,
+    },
     Argmax {
         x: T,
         sel: T,
@@ -941,6 +952,7 @@ pub enum OpProof {
     RmsNorm(RmsNormProof),
     RoPE(RoPEProof),
     TopKSelect(TopKSelectProof),
+    SparseIndexer(TopKSelectProof),
     Argmax(ArgmaxProof),
     Scatter(ScatterProof),
     Gather(ScatterAddProof),
@@ -1112,6 +1124,7 @@ impl Op {
             } => vec![x, w, rsqrt_table, limb_table],
             Op::RoPE { x, cos, sin, range_table, .. } => vec![x, cos, sin, range_table],
             Op::TopKSelect { x, .. } => vec![x],
+            Op::SparseIndexer { x, .. } => vec![x],
             Op::Argmax { x, .. } => vec![x],
             Op::ScaleGate { x, gate, .. } => vec![x, gate],
             Op::Scatter { sel, .. } => vec![sel],
@@ -1154,6 +1167,14 @@ impl Op {
             Op::Softmax { e, out, .. } => vec![e, out],
             Op::SoftmaxBias { out, .. } => vec![out],
             Op::TopKSelect {
+                sel,
+                thr,
+                gate,
+                d1,
+                d2,
+                ..
+            } => vec![sel, thr, gate, d1, d2],
+            Op::SparseIndexer {
                 sel,
                 thr,
                 gate,
@@ -1722,6 +1743,24 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 store.v[d1] = TensorData::Owned(d1_v);
                 store.v[d2] = TensorData::Owned(d2_v);
             }
+            Op::SparseIndexer {
+                x,
+                sel,
+                thr,
+                gate,
+                d1,
+                d2,
+                m,
+                n,
+                k,
+            } => {
+                let (thr_v, sel_v, gate_v, d1_v, d2_v) = topk_forward(store.get(x), m, n, k);
+                store.v[thr] = TensorData::Owned(thr_v);
+                store.v[sel] = TensorData::Owned(sel_v);
+                store.v[gate] = TensorData::Owned(gate_v);
+                store.v[d1] = TensorData::Owned(d1_v);
+                store.v[d2] = TensorData::Owned(d2_v);
+            }
             Op::Argmax {
                 x,
                 sel,
@@ -2212,6 +2251,35 @@ pub fn prove_shard_precomputed(
                 claims.push((gate, p.r.clone(), mle::eval(store.get(gate), &p.r)));
                 op_proofs.push(OpProof::TopKSelect(p));
             }
+            Op::SparseIndexer {
+                x,
+                sel,
+                thr,
+                gate,
+                d1,
+                d2,
+                m,
+                n,
+                k,
+            } => {
+                let p = prove_topk(
+                    store.get(x),
+                    store.get(sel),
+                    store.get(thr),
+                    store.get(gate),
+                    store.get(d1),
+                    store.get(d2),
+                    m,
+                    n,
+                    k,
+                    22,
+                    rng,
+                );
+                claims.push((x, p.r.clone(), mle::eval(store.get(x), &p.r)));
+                claims.push((sel, p.r.clone(), mle::eval(store.get(sel), &p.r)));
+                claims.push((gate, p.r.clone(), mle::eval(store.get(gate), &p.r)));
+                op_proofs.push(OpProof::SparseIndexer(p));
+            }
             Op::Argmax {
                 x,
                 sel,
@@ -2444,6 +2512,11 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
                 }
             }
             (Op::TopKSelect { k, .. }, OpProof::TopKSelect(p)) => {
+                if !verify_topk(p, *k) {
+                    return false;
+                }
+            }
+            (Op::SparseIndexer { k, .. }, OpProof::SparseIndexer(p)) => {
                 if !verify_topk(p, *k) {
                     return false;
                 }
@@ -6943,6 +7016,7 @@ mod tests {
             | OpProof::RmsNorm(..)
             | OpProof::RoPE(..)
             | OpProof::TopKSelect(..)
+            | OpProof::SparseIndexer(..)
             | OpProof::Argmax(..)
             | OpProof::Scatter(..)
             | OpProof::Gather(..)
