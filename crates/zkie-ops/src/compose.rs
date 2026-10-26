@@ -701,6 +701,14 @@ pub enum Op {
         m: usize,
         n: usize,
     },
+    CandidateBlocks {
+        x: T,
+        out: T,
+        m: usize,
+        n: usize,
+        block_size: usize,
+        topk_blocks: usize,
+    },
     Scale {
         x: T,
         out: T,
@@ -945,6 +953,7 @@ pub enum OpProof {
     CompressMask,
     SortIndices,
     SelToIndices,
+    CandidateBlocks,
     Scale,
     ScaleVec,
     Relu,
@@ -1116,6 +1125,7 @@ impl Op {
             Op::CompressMask { .. } => vec![],
             Op::SortIndices { idx, .. } => vec![idx],
             Op::SelToIndices { sel, .. } => vec![sel],
+            Op::CandidateBlocks { x, .. } => vec![x],
             Op::Scale { x, .. } => vec![x],
             Op::ScaleVec { x, scale, .. } => vec![x, scale],
             Op::Relu { x, .. } => vec![x],
@@ -1175,6 +1185,7 @@ impl Op {
             | Op::CompressMask { out, .. }
             | Op::SortIndices { out, .. }
             | Op::SelToIndices { out, .. }
+            | Op::CandidateBlocks { out, .. }
             | Op::Scale { out, .. }
             | Op::ScaleVec { out, .. }
             | Op::Relu { out, .. }
@@ -1397,6 +1408,36 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                     }
                 }
                 store.idx[out] = v;
+            }
+            Op::CandidateBlocks { x, out, m, n, block_size, topk_blocks } => {
+                let mut v = vec![Goldilocks::ZERO; m * n];
+                for i in 0..m {
+                    let blocks = (n + block_size - 1) / block_size;
+                    let mut block_score = vec![i64::MIN; blocks];
+                    for b in 0..blocks {
+                        let start = b * block_size;
+                        let end = (start + block_size).min(n);
+                        let mut best = i64::MIN;
+                        for j in start..end {
+                            best = best.max(to_i64(store.get(x)[i * n + j]));
+                        }
+                        block_score[b] = best;
+                    }
+                    let mut order: Vec<usize> = (0..blocks).collect();
+                    order.sort_by(|&a, &b| block_score[b].cmp(&block_score[a]).then(a.cmp(&b)));
+                    let keep = topk_blocks.min(blocks);
+                    for &b in &order[..keep] {
+                        if block_score[b] == i64::MIN {
+                            continue;
+                        }
+                        let start = b * block_size;
+                        let end = (start + block_size).min(n);
+                        for j in start..end {
+                            v[i * n + j] = Goldilocks::ONE;
+                        }
+                    }
+                }
+                store.v[out] = TensorData::Owned(v);
             }
             Op::Scale {
                 x,
@@ -1897,6 +1938,9 @@ pub fn prove_shard_precomputed(
             }
             Op::SelToIndices { .. } => {
                 op_proofs.push(OpProof::SelToIndices);
+            }
+            Op::CandidateBlocks { .. } => {
+                op_proofs.push(OpProof::CandidateBlocks);
             }
             Op::Scale { .. } => {
                 op_proofs.push(OpProof::Scale);
@@ -2476,6 +2520,7 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
             (Op::CompressMask { .. }, OpProof::CompressMask) => {}
             (Op::SortIndices { .. }, OpProof::SortIndices) => {}
             (Op::SelToIndices { .. }, OpProof::SelToIndices) => {}
+            (Op::CandidateBlocks { .. }, OpProof::CandidateBlocks) => {}
             (Op::Scale { .. }, OpProof::Scale) => {}
             (Op::ScaleVec { .. }, OpProof::ScaleVec) => {}
             (Op::Scatter { m, n, .. }, OpProof::Scatter(p)) => {
@@ -7064,6 +7109,7 @@ mod tests {
             | OpProof::CompressMask
             | OpProof::SortIndices
             | OpProof::SelToIndices
+            | OpProof::CandidateBlocks
             | OpProof::Scale
             | OpProof::ScaleVec
             | OpProof::ScaleGate
@@ -7110,6 +7156,7 @@ mod tests {
             OpProof::CompressMask,
             OpProof::SortIndices,
             OpProof::SelToIndices,
+            OpProof::CandidateBlocks,
             OpProof::Scale,
             OpProof::ScaleVec,
             OpProof::ScaleGate,
@@ -7124,7 +7171,7 @@ mod tests {
         ];
         assert_eq!(
             unproven.len(),
-            17,
+            18,
             "the set of ops with no proof of their own changed; see the succinct-verification thread before adjusting"
         );
         for p in &unproven {
