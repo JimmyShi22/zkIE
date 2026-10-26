@@ -231,6 +231,28 @@ pub fn build_hyperconnection_mix(
     out
 }
 
+/// Engram table lookup + wkv projection. `hash_idx` is the output of
+/// `EngramHash`; `embed` is the quantized FP8 table (dequantized on demand),
+/// `wkv` is the quantized output projection weight. Gating is applied by the
+/// caller as an extra projection before this step.
+pub fn build_engram_lookup(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    hash_idx: usize,
+    embed: usize,
+    wkv: usize,
+    n: usize,
+    dim: usize,
+    out_dim: usize,
+) -> usize {
+    let e = store.push(vec![]);
+    ops.push(Op::GatherRows { idx: hash_idx, table: embed, out: e, dim });
+    let raw = build_quantized_matmul(store, ops, e, wkv, n, dim, out_dim);
+    let out = store.push(vec![]);
+    ops.push(Op::Scale { x: raw, out, factor: 1, shift: 16 });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +311,23 @@ mod tests {
         let proof = prove_shard(&mut store, &ops, &[], &mut rng);
         assert!(verify_shard(&store.owned_slices(), &ops, &proof));
         assert_eq!(store.get(out).len(), m * hc * d);
+    }
+
+    #[test]
+    fn engram_lookup_roundtrip() {
+        let n = 2usize;
+        let dim = 4usize;
+        let out_dim = 2usize;
+        let mut store = Store::new();
+        let mut ops = Vec::new();
+        let table = store.push((0..8 * dim).map(|i| from_i64((i as i64 + 1) << 16)).collect::<Vec<_>>());
+        let idx = store.push_idx(vec![0, 2]);
+        let wkv = store.push((0..out_dim * dim).map(|i| from_i64((i as i64 + 1) << 16)).collect::<Vec<_>>());
+        let out = build_engram_lookup(&mut store, &mut ops, idx, table, wkv, n, dim, out_dim);
+        let mut rng = XorShift64::new(12);
+        let proof = prove_shard(&mut store, &ops, &[], &mut rng);
+        assert!(verify_shard(&store.owned_slices(), &ops, &proof));
+        assert_eq!(store.get(out).len(), n * out_dim);
     }
 }
 

@@ -750,6 +750,12 @@ pub enum Op {
         max_ngram: usize,
         n_heads: usize,
     },
+    GatherRows {
+        idx: T,
+        table: T,
+        out: T,
+        dim: usize,
+    },
     Scale {
         x: T,
         out: T,
@@ -999,6 +1005,7 @@ pub enum OpProof {
     HyperPre,
     HyperPost,
     EngramHash,
+    GatherRows,
     Scale,
     ScaleVec,
     Relu,
@@ -1175,6 +1182,7 @@ impl Op {
             Op::HyperPre { x, pre, .. } => vec![x, pre],
             Op::HyperPost { y, residual, post, comb, .. } => vec![y, residual, post, comb],
             Op::EngramHash { tokens, .. } => vec![tokens],
+            Op::GatherRows { idx, table, .. } => vec![idx, table],
             Op::Scale { x, .. } => vec![x],
             Op::ScaleVec { x, scale, .. } => vec![x, scale],
             Op::Relu { x, .. } => vec![x],
@@ -1240,6 +1248,7 @@ impl Op {
             Op::HyperPre { out, .. } => vec![out],
             Op::HyperPost { out, .. } => vec![out],
             Op::EngramHash { out, .. } => vec![out],
+            Op::GatherRows { out, .. } => vec![out],
             | Op::Scale { out, .. }
             | Op::ScaleVec { out, .. }
             | Op::Relu { out, .. }
@@ -1616,6 +1625,14 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                     }
                 }
                 store.idx[out] = v;
+            }
+            Op::GatherRows { idx, table, out, dim } => {
+                let mut v = Vec::with_capacity(store.idx[idx].len() * dim);
+                for &i in &store.idx[idx] {
+                    let start = i as usize * dim;
+                    v.extend_from_slice(&store.get(table)[start..start + dim]);
+                }
+                store.v[out] = TensorData::Owned(v);
             }
             Op::Scale {
                 x,
@@ -2131,6 +2148,9 @@ pub fn prove_shard_precomputed(
             }
             Op::EngramHash { .. } => {
                 op_proofs.push(OpProof::EngramHash);
+            }
+            Op::GatherRows { .. } => {
+                op_proofs.push(OpProof::GatherRows);
             }
             Op::Scale { .. } => {
                 op_proofs.push(OpProof::Scale);
@@ -2715,6 +2735,7 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
             (Op::HyperPre { .. }, OpProof::HyperPre) => {}
             (Op::HyperPost { .. }, OpProof::HyperPost) => {}
             (Op::EngramHash { .. }, OpProof::EngramHash) => {}
+            (Op::GatherRows { .. }, OpProof::GatherRows) => {}
             (Op::Scale { .. }, OpProof::Scale) => {}
             (Op::ScaleVec { .. }, OpProof::ScaleVec) => {}
             (Op::Scatter { m, n, .. }, OpProof::Scatter(p)) => {
@@ -7308,6 +7329,7 @@ mod tests {
             | OpProof::HyperPre
             | OpProof::HyperPost
             | OpProof::EngramHash
+            | OpProof::GatherRows
             | OpProof::Scale
             | OpProof::ScaleVec
             | OpProof::ScaleGate
@@ -7359,6 +7381,7 @@ mod tests {
             OpProof::HyperPre,
             OpProof::HyperPost,
             OpProof::EngramHash,
+            OpProof::GatherRows,
             OpProof::Scale,
             OpProof::ScaleVec,
             OpProof::ScaleGate,
@@ -7373,7 +7396,7 @@ mod tests {
         ];
         assert_eq!(
             unproven.len(),
-            22,
+            23,
             "the set of ops with no proof of their own changed; see the succinct-verification thread before adjusting"
         );
         for p in &unproven {
