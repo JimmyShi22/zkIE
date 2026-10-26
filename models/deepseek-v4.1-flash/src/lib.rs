@@ -210,6 +210,64 @@ pub fn build_moe_gate(
     (sel, thr, weights, d1, d2)
 }
 
+/// Shared expert SwiGLU MLP: `out = (silu(clip(x @ w1^T, 10)) * clip(x @ w3^T,
+/// -10, 10)) @ w2^T`. All three weights are FP8 block-quantized; the activation
+/// and clipping are table lookups at the GELU fixed-point convention.
+pub fn build_shared_expert(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    file: Arc<SafetensorFile>,
+    layer: usize,
+    x: usize,
+    m: usize,
+    shift: u32,
+    silu_table: usize,
+    clip_table: usize,
+) -> usize {
+    let w1 = push_quantized_fp8(
+        store,
+        file.clone(),
+        &format!("layers.{layer}.ffn.shared_experts.w1.weight"),
+        &format!("layers.{layer}.ffn.shared_experts.w1.scale"),
+    );
+    let w2 = push_quantized_fp8(
+        store,
+        file.clone(),
+        &format!("layers.{layer}.ffn.shared_experts.w2.weight"),
+        &format!("layers.{layer}.ffn.shared_experts.w2.scale"),
+    );
+    let w3 = push_quantized_fp8(
+        store,
+        file.clone(),
+        &format!("layers.{layer}.ffn.shared_experts.w3.weight"),
+        &format!("layers.{layer}.ffn.shared_experts.w3.scale"),
+    );
+
+    let gate_raw = build_quantized_matmul(store, ops, x, w1, m, DIM_PAD, MOE_INTER_DIM_PAD);
+    let gate = store.push(vec![]);
+    ops.push(Op::Scale { x: gate_raw, out: gate, factor: 1, shift });
+    let gate_idx = store.push_idx(vec![]);
+    ops.push(Op::GeluIndex { x: gate, out: gate_idx, offset: 1 << 23, table_len: 1 << 24 });
+    let gate_act = store.push(vec![]);
+    ops.push(Op::Lookup { idx: gate_idx, out: gate_act, table: silu_table });
+
+    let up_raw = build_quantized_matmul(store, ops, x, w3, m, DIM_PAD, MOE_INTER_DIM_PAD);
+    let up = store.push(vec![]);
+    ops.push(Op::Scale { x: up_raw, out: up, factor: 1, shift });
+    let up_idx = store.push_idx(vec![]);
+    ops.push(Op::GeluIndex { x: up, out: up_idx, offset: 1 << 23, table_len: 1 << 24 });
+    let up_clip = store.push(vec![]);
+    ops.push(Op::Lookup { idx: up_idx, out: up_clip, table: clip_table });
+
+    let hidden = store.push(vec![]);
+    ops.push(Op::ScaleVec { x: gate_act, scale: up_clip, out: hidden, shift: 16 });
+
+    let out_raw = build_quantized_matmul(store, ops, hidden, w2, m, MOE_INTER_DIM_PAD, DIM_PAD);
+    let out = store.push(vec![]);
+    ops.push(Op::Scale { x: out_raw, out, factor: 1, shift });
+    out
+}
+
 pub fn push_quantized_fp8(
     store: &mut Store,
     file: Arc<SafetensorFile>,
