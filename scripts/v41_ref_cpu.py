@@ -164,17 +164,14 @@ def main():
             out[: w.shape[0], : w.shape[1]] = w
             return out
 
-        q_norm = np.zeros(q_lora_pad, dtype=np.float64)
-        q_norm[:q_lora] = q_norm_real
-        wq_a = pad2d(fixed_float(dequant_fp8_weight(t["layers.0.attn.wq_a.weight"], t["layers.0.attn.wq_a.scale"])), q_lora_pad, dim_pad)
-        wq_b = pad2d(fixed_float(dequant_fp8_weight(t["layers.0.attn.wq_b.weight"], t["layers.0.attn.wq_b.scale"])), n_heads * head_dim, q_lora_pad)
-        wkv = pad2d(fixed_float(dequant_fp8_weight(t["layers.0.attn.wkv.weight"], t["layers.0.attn.wkv.scale"])), head_dim, dim_pad)
+        wq_a = fixed_float(dequant_fp8_weight(t["layers.0.attn.wq_a.weight"], t["layers.0.attn.wq_a.scale"]))
+        wq_b = fixed_float(dequant_fp8_weight(t["layers.0.attn.wq_b.weight"], t["layers.0.attn.wq_b.scale"]))
+        wkv = fixed_float(dequant_fp8_weight(t["layers.0.attn.wkv.weight"], t["layers.0.attn.wkv.scale"]))
         wo_a = fixed_float(dequant_fp8_weight(t["layers.0.attn.wo_a.weight"], t["layers.0.attn.wo_a.scale"]))
         wo_b = pad2d(fixed_float(dequant_fp8_weight(t["layers.0.attn.wo_b.weight"], t["layers.0.attn.wo_b.scale"])), dim_pad, o_groups * o_lora)
 
-        x = np.zeros((1, m, dim_pad), dtype=np.float64)
-        x[:, :, :dim] = 1.0
-        qr = rms_norm(x @ wq_a.T, q_norm)
+        x = np.ones((1, m, dim), dtype=np.float64)
+        qr = rms_norm(x @ wq_a.T, q_norm_real)
         q = (qr @ wq_b.T).reshape(1, m, n_heads, head_dim)
         kv = rms_norm(x @ wkv.T, kv_norm)
 
@@ -214,14 +211,12 @@ def main():
             out = np.zeros((nr, nc), dtype=np.float64)
             out[: w.shape[0], : w.shape[1]] = w
             return out
-        q_norm = np.zeros(q_lora_pad)
-        q_norm[:q_lora] = bf16_vec(t["layers.0.attn.q_norm.weight"])
         kv_norm = bf16_vec(t["layers.0.attn.kv_norm.weight"])
-        wq_a = pad2d(fixed_float(dequant_fp8_weight(t["layers.0.attn.wq_a.weight"], t["layers.0.attn.wq_a.scale"])), q_lora_pad, dim_pad)
-        wq_b = pad2d(fixed_float(dequant_fp8_weight(t["layers.0.attn.wq_b.weight"], t["layers.0.attn.wq_b.scale"])), heads * head_dim, q_lora_pad)
-        wkv = pad2d(fixed_float(dequant_fp8_weight(t["layers.0.attn.wkv.weight"], t["layers.0.attn.wkv.scale"])), head_dim, dim_pad)
-        x = np.zeros((1, m, dim_pad))
-        x[:, :, :dim] = 1.0
+        q_norm = bf16_vec(t["layers.0.attn.q_norm.weight"])
+        wq_a = fixed_float(dequant_fp8_weight(t["layers.0.attn.wq_a.weight"], t["layers.0.attn.wq_a.scale"]))
+        wq_b = fixed_float(dequant_fp8_weight(t["layers.0.attn.wq_b.weight"], t["layers.0.attn.wq_b.scale"]))
+        wkv = fixed_float(dequant_fp8_weight(t["layers.0.attn.wkv.weight"], t["layers.0.attn.wkv.scale"]))
+        x = np.ones((1, m, dim))
         qr = rms_norm(x @ wq_a.T, q_norm)
         q = (qr @ wq_b.T).reshape(1, m, heads, head_dim)
         kv = rms_norm(x @ wkv.T, kv_norm)
