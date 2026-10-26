@@ -124,10 +124,19 @@ fn push_bf16_transposed(
     store.push(out)
 }
 
-/// Load an F32 safetensors 1-D tensor (fixed point 2^16) padded to `n_pad`.
-fn push_f32_padded(store: &mut Store, file: Arc<SafetensorFile>, name: &str, n_pad: usize) -> usize {
+/// Load an F32 safetensors 1-D tensor (fixed point 2^16) padded to `n_pad` with
+/// `pad`. The MoE gate bias uses `pad = -(1<<30)` so the 384..512 padded expert
+/// slots can never win a top-k selection (their `sqrt(softplus(0))` score is
+/// otherwise ~0.83 and would compete with real experts).
+fn push_f32_padded(
+    store: &mut Store,
+    file: Arc<SafetensorFile>,
+    name: &str,
+    n_pad: usize,
+    pad: i64,
+) -> usize {
     let v: Vec<i64> = file.read_f32(name).iter().map(|&x| to_i64(x)).collect();
-    let mut out = vec![Goldilocks::ZERO; n_pad];
+    let mut out = vec![from_i64(pad); n_pad];
     for j in 0..v.len().min(n_pad) {
         out[j] = from_i64(v[j]);
     }
@@ -169,6 +178,7 @@ pub fn build_moe_gate(
         file.clone(),
         &format!("layers.{layer}.ffn.gate.bias"),
         n,
+        -(1i64 << 30),
     );
 
     let z_raw = store.push(vec![]);
@@ -265,6 +275,164 @@ pub fn build_shared_expert(
     let out_raw = build_quantized_matmul(store, ops, hidden, w2, m, MOE_INTER_DIM_PAD, DIM_PAD);
     let out = store.push(vec![]);
     ops.push(Op::Scale { x: out_raw, out, factor: 1, shift });
+    out
+}
+
+/// Dequantize and stack all 384 routed experts' FP4 weights into the
+/// `GatherMatMul` layout `[n_experts, in_pad, out_pad]`. `rows`/`cols` are the
+/// raw safetensors shape `[out, in]`; the per-expert dequantized matrix is
+/// transposed on the fly so `w_all[e][in][out]` matches `gather_matmul_forward`.
+fn load_routed_expert_stack(
+    store: &mut Store,
+    file: Arc<SafetensorFile>,
+    layer: usize,
+    suffix: &str,
+    rows: usize,
+    cols: usize,
+) -> usize {
+    let rows_pad = rows.next_power_of_two();
+    let cols_pad = cols.next_power_of_two();
+    let mut out = vec![Goldilocks::ZERO; N_ROUTED_EXPERTS * cols_pad * rows_pad];
+    for e in 0..N_ROUTED_EXPERTS {
+        let w = file.read_fp4_weight(
+            &format!("layers.{layer}.ffn.experts.{e}.{suffix}.weight"),
+            &format!("layers.{layer}.ffn.experts.{e}.{suffix}.scale"),
+            cols,
+            QUANT_BLOCK,
+        );
+        let base = e * cols_pad * rows_pad;
+        for r in 0..rows_pad {
+            for c in 0..cols_pad {
+                out[base + c * rows_pad + r] = w[r * cols_pad + c];
+            }
+        }
+    }
+    store.push(out)
+}
+
+/// Routed experts: gather the top-k selected rows, run each expert's SwiGLU MLP
+/// via `GatherMatMul`, and aggregate with the normalized routing-gate weights.
+///
+/// ```text
+/// seg   = x[token_id]                       (gather selected token rows)
+/// g     = seg @ w1^T, u = seg @ w3^T        (FP4, GatherMatMul)
+/// h     = silu(clip(g,10)) * clip(u,-10,10)
+/// d     = h @ w2^T
+/// out   = sum_pos gate_weight[pos] * d[pos] (Gather)
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub fn build_routed_experts(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    file: Arc<SafetensorFile>,
+    layer: usize,
+    x: usize,
+    sel: usize,
+    weights: usize,
+    m: usize,
+    shift: u32,
+    silu_table: usize,
+    clip_table: usize,
+) -> usize {
+    let n = N_ROUTED_EXPERTS_PAD;
+    let s = m * N_ACTIVATED_EXPERTS;
+    let s_pad = s.next_power_of_two();
+
+    let w1_all = load_routed_expert_stack(store, file.clone(), layer, "w1", MOE_INTER_DIM, DIM);
+    let w2_all = load_routed_expert_stack(store, file.clone(), layer, "w2", DIM, MOE_INTER_DIM);
+    let w3_all = load_routed_expert_stack(store, file.clone(), layer, "w3", MOE_INTER_DIM, DIM);
+
+    let token_id = store.push_idx(vec![]);
+    let expert_of = store.push_idx(vec![]);
+    ops.push(Op::Scatter { sel, token_id, expert_of, m, n });
+
+    let token_id_pad = store.push_idx(vec![]);
+    let expert_of_pad = store.push_idx(vec![]);
+    ops.push(Op::PadIdx { base: token_id, out: token_id_pad, len: s_pad });
+    ops.push(Op::PadIdx { base: expert_of, out: expert_of_pad, len: s_pad });
+
+    let idx_seg = store.push_idx(vec![]);
+    ops.push(Op::IdxBroadcast { base: token_id_pad, out: idx_seg, b: DIM_PAD });
+    let seg = store.push(vec![]);
+    ops.push(Op::Lookup { idx: idx_seg, out: seg, table: x });
+    let mut mask = vec![Goldilocks::ZERO; s_pad];
+    for i in 0..s {
+        mask[i] = Goldilocks::ONE;
+    }
+    let mask_t = store.push(mask);
+    let seg_z = store.push(vec![]);
+    ops.push(Op::BroadcastScale { x: seg, scale: mask_t, out: seg_z, h: DIM_PAD });
+
+    let g = store.push(vec![]);
+    ops.push(Op::GatherMatMul {
+        a: seg_z,
+        expert_of: expert_of_pad,
+        w: w1_all,
+        c: g,
+        s: s_pad,
+        k: DIM_PAD,
+        n: MOE_INTER_DIM_PAD,
+        n_experts: N_ROUTED_EXPERTS,
+    });
+    let u = store.push(vec![]);
+    ops.push(Op::GatherMatMul {
+        a: seg_z,
+        expert_of: expert_of_pad,
+        w: w3_all,
+        c: u,
+        s: s_pad,
+        k: DIM_PAD,
+        n: MOE_INTER_DIM_PAD,
+        n_experts: N_ROUTED_EXPERTS,
+    });
+
+    let g16 = store.push(vec![]);
+    ops.push(Op::Scale { x: g, out: g16, factor: 1, shift });
+    let u16 = store.push(vec![]);
+    ops.push(Op::Scale { x: u, out: u16, factor: 1, shift });
+
+    let g_idx = store.push_idx(vec![]);
+    ops.push(Op::GeluIndex { x: g16, out: g_idx, offset: 1 << 23, table_len: 1 << 24 });
+    let gate_act = store.push(vec![]);
+    ops.push(Op::Lookup { idx: g_idx, out: gate_act, table: silu_table });
+    let u_idx = store.push_idx(vec![]);
+    ops.push(Op::GeluIndex { x: u16, out: u_idx, offset: 1 << 23, table_len: 1 << 24 });
+    let up_clip = store.push(vec![]);
+    ops.push(Op::Lookup { idx: u_idx, out: up_clip, table: clip_table });
+
+    let hidden = store.push(vec![]);
+    ops.push(Op::ScaleVec { x: gate_act, scale: up_clip, out: hidden, shift: 16 });
+
+    let d = store.push(vec![]);
+    ops.push(Op::GatherMatMul {
+        a: hidden,
+        expert_of: expert_of_pad,
+        w: w2_all,
+        c: d,
+        s: s_pad,
+        k: MOE_INTER_DIM_PAD,
+        n: DIM_PAD,
+        n_experts: N_ROUTED_EXPERTS,
+    });
+    let d16 = store.push(vec![]);
+    ops.push(Op::Scale { x: d, out: d16, factor: 1, shift });
+
+    let idx_gate = store.push_idx(vec![]);
+    ops.push(Op::CombineIdx { a: token_id_pad, b: expert_of_pad, out: idx_gate, scale: n });
+    let gate_pos = store.push(vec![]);
+    ops.push(Op::Lookup { idx: idx_gate, out: gate_pos, table: weights });
+
+    let acc = store.push(vec![]);
+    ops.push(Op::Gather {
+        weighted: d16,
+        token_id: token_id_pad,
+        gate: gate_pos,
+        out: acc,
+        m,
+        h: DIM_PAD,
+    });
+    let out = store.push(vec![]);
+    ops.push(Op::Scale { x: acc, out, factor: 1, shift });
     out
 }
 

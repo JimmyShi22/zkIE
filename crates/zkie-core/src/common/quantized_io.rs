@@ -216,10 +216,11 @@ impl SafetensorFile {
         assert_eq!(logical_cols / block_size, nb_cols, "fp4 scale block count mismatch");
         let mut out = vec![Goldilocks::ZERO; padded_rows * padded_cols];
         for r in 0..rows {
-            let sr = r / block_size;
             for c in 0..logical_cols {
                 let sc = c / block_size;
-                let scale = e8m0_to_f64(scale_raw[sr * nb_cols + sc]);
+                // FP4 E8M0 scale is block-quantized over columns only; its row
+                // dimension is the full weight row count (shape [rows, cols/block]).
+                let scale = e8m0_to_f64(scale_raw[r * nb_cols + sc]);
                 let byte = raw[r * packed_cols + c / 2];
                 let nibble = if c % 2 == 0 { byte & 0x0F } else { byte >> 4 };
                 let w = e2m1_to_f64(nibble);
@@ -345,6 +346,27 @@ mod tests {
         let out = file.read_fp4_weight("w", "s", 4, 4);
         let got: Vec<i64> = out.iter().map(|&x| to_i64(x)).collect();
         assert_eq!(got, vec![0, 32768, -393216, 32768]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fp4_scale_rows_are_not_blocked() {
+        // FP4 E8M0 scale is [rows, cols/block]: rows are NOT blocked, unlike
+        // FP8's [rows/block, cols/block]. Every nibble is 0.5; the per-column
+        // block scale differs per row, so the wrong row-blocking would reuse
+        // row 0's scale for row 1.
+        let weight = [0x11u8, 0x11, 0x11, 0x11]; // 2 rows x 2 packed cols
+        let scale = [127u8, 126, 125, 124]; // [2,2]: 1.0, 0.5, 0.25, 0.125
+        let path = write_safetensors(&[
+            ("w", "I8", &[2, 2], &weight),
+            ("s", "F8_E8M0", &[2, 2], &scale),
+        ]);
+        let file = SafetensorFile::open(&path).unwrap();
+        let out = file.read_fp4_weight("w", "s", 4, 2);
+        let got: Vec<i64> = out.iter().map(|&x| to_i64(x)).collect();
+        // row0: 0.5*1.0, 0.5*1.0, 0.5*0.5, 0.5*0.5
+        // row1: 0.5*0.25, 0.5*0.25, 0.5*0.125, 0.5*0.125
+        assert_eq!(got, vec![32768, 32768, 16384, 16384, 8192, 8192, 4096, 4096]);
         std::fs::remove_file(path).unwrap();
     }
 
