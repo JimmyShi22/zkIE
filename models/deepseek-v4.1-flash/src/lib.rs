@@ -1399,18 +1399,9 @@ pub fn build_mla_attention(
         let sink_score = to_i64(file.read_f32(&format!("layers.{layer}.attn.attn_sink"))[head]);
         let sink_col = store.push(vec![from_i64(sink_score); m]);
         let scores_aug = pad_sink_matrix(store, ops, scores_16, sink_col, m, m, n_pad);
-        let idx = store.push_idx(vec![]);
         let e = store.push(vec![]);
         let probs = store.push(vec![]);
-        ops.push(Op::StableSoftmaxIndex {
-            x: scores_aug,
-            mask,
-            out: idx,
-            offset: 1 << 21,
-            table_len: 1 << 21,
-            m,
-            n: n_pad,
-        });
+        let idx = build_stable_softmax_index(store, ops, scores_aug, mask, m, n_pad, 1 << 21, 1 << 21, limb_table);
         ops.push(Op::Softmax { idx, e, out: probs, table: exp_table, m, n: n_pad });
         let attn_n = store.push(vec![]);
         let attn_r = store.push(vec![]);
@@ -1618,18 +1609,9 @@ pub fn build_mla_attention_compress(
         let sink_score = to_i64(file.read_f32(&format!("layers.{layer}.attn.attn_sink"))[head]);
         let sink_col = store.push(vec![from_i64(sink_score); m]);
         let scores_aug = pad_sink_matrix(store, ops, scores_16, sink_col, m, n_kv_pad, n_pad);
-        let idx = store.push_idx(vec![]);
         let e = store.push(vec![]);
         let probs = store.push(vec![]);
-        ops.push(Op::StableSoftmaxIndex {
-            x: scores_aug,
-            mask,
-            out: idx,
-            offset: 1 << 21,
-            table_len: 1 << 21,
-            m,
-            n: n_pad,
-        });
+        let idx = build_stable_softmax_index(store, ops, scores_aug, mask, m, n_pad, 1 << 21, 1 << 21, limb_table);
         ops.push(Op::Softmax { idx, e, out: probs, table: exp_table, m, n: n_pad });
         let attn_n = store.push(vec![]);
         let attn_r = store.push(vec![]);
@@ -1793,16 +1775,9 @@ pub fn build_compressor(
 
     // Softmax over the in-group axis (no causal mask).
     let zero_mask = store.push(vec![Goldilocks::ZERO; groups * hd * ratio]);
-    let sidx = store.push_idx(vec![]);
-    ops.push(Op::StableSoftmaxIndex {
-        x: score2,
-        mask: zero_mask,
-        out: sidx,
-        offset: 1 << 21,
-        table_len: 1 << 21,
-        m: groups * hd,
-        n: ratio,
-    });
+    let sidx = build_stable_softmax_index(
+        store, ops, score2, zero_mask, groups * hd, ratio, 1 << 21, 1 << 21, limb_table,
+    );
     let e = store.push(vec![]);
     let probs = store.push(vec![]);
     ops.push(Op::Softmax { idx: sidx, e, out: probs, table: exp_table, m: groups * hd, n: ratio });
@@ -2468,6 +2443,51 @@ fn build_hc_post(
     let out = store.push(vec![]);
     ops.push(Op::Scale { x: sum, out, factor: 1, shift: 16 });
     out
+}
+
+/// Numerically-stable softmax index: `idx[i,j] = clamp(masked[i,j] - row_max[i]
+/// + offset, 0, table_len-1)`, where `masked = x + mask` and `row_max` is the
+/// per-row max. Assembled from proven primitives (`Add` + `TopKSelect(k=1)` +
+/// `Lookup` broadcast + `Scale` + `GeluIndex`) instead of the unproven
+/// `StableSoftmaxIndex`.
+fn build_stable_softmax_index(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    x: usize,
+    mask: usize,
+    m: usize,
+    n: usize,
+    offset: i64,
+    table_len: usize,
+    limb_table: usize,
+) -> usize {
+    let masked = store.push(vec![]);
+    ops.push(Op::Add { a: x, b: mask, c: masked });
+
+    // row_max = max over the n columns (TopKSelect with k=1 returns the max as
+    // its threshold).
+    let sel = store.push(vec![]);
+    let thr = store.push(vec![]);
+    let gate = store.push(vec![]);
+    let d1 = store.push(vec![]);
+    let d2 = store.push(vec![]);
+    ops.push(Op::TopKSelect { x: masked, sel, thr, gate, d1, d2, m, n, k: 1 });
+
+    // Broadcast the per-row max back to [m, n] and subtract.
+    let thr_b = gather(
+        store,
+        ops,
+        thr,
+        (0..m * n).map(|ij| (ij / n) as u32).collect::<Vec<_>>(),
+    );
+    let neg_thr = store.push(vec![]);
+    ops.push(Op::Scale { x: thr_b, out: neg_thr, factor: -1, shift: 0 });
+    let shifted = store.push(vec![]);
+    ops.push(Op::Add { a: masked, b: neg_thr, c: shifted });
+
+    let idx = store.push_idx(vec![]);
+    ops.push(Op::GeluIndex { x: shifted, out: idx, offset, table_len, limb_table });
+    idx
 }
 
 /// Full Hyper-Connection block for one layer. `x4` is the `[m, HC_MULT, DIM_PAD]`
