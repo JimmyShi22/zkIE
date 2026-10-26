@@ -101,6 +101,115 @@ pub fn build_rope_tables(store: &mut Store, qk: usize) -> (usize, usize) {
     (store.push(cos), store.push(sin))
 }
 
+/// Load a BF16 safetensors matrix (fixed point 2^16) transposed, so it can feed
+/// `MatMul`/`Projection` in `[k, n]` layout (input cols x output rows), padded
+/// to powers of two. `rows`/`cols` are the raw safetensors shape `[rows, cols]`;
+/// the returned tensor is `[cols_pad, rows_pad]`.
+fn push_bf16_transposed(
+    store: &mut Store,
+    file: Arc<SafetensorFile>,
+    name: &str,
+    rows: usize,
+    cols: usize,
+) -> usize {
+    let v: Vec<i64> = file.read_bf16(name).iter().map(|&x| to_i64(x)).collect();
+    let rows_pad = rows.next_power_of_two();
+    let cols_pad = cols.next_power_of_two();
+    let mut out = vec![Goldilocks::ZERO; cols_pad * rows_pad];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows_pad + r] = from_i64(v[r * cols + c]);
+        }
+    }
+    store.push(out)
+}
+
+/// Load an F32 safetensors 1-D tensor (fixed point 2^16) padded to `n_pad`.
+fn push_f32_padded(store: &mut Store, file: Arc<SafetensorFile>, name: &str, n_pad: usize) -> usize {
+    let v: Vec<i64> = file.read_f32(name).iter().map(|&x| to_i64(x)).collect();
+    let mut out = vec![Goldilocks::ZERO; n_pad];
+    for j in 0..v.len().min(n_pad) {
+        out[j] = from_i64(v[j]);
+    }
+    store.push(out)
+}
+
+/// MoE routing gate: `x -> top-k selection + normalized gate weights`.
+///
+/// ```
+/// z       = x @ gate_w^T
+/// s       = sqrt(softplus(z))            (table lookup)
+/// biased  = s + gate_b                    (row-broadcast)
+/// sel     = top-6(biased)
+/// weights = s * sel, then row-normalized  (SumNorm)
+/// ```
+///
+/// Returns `(sel, thr, weights, d1, d2)`; `weights` is the `[m, N_EXPERTS_PAD]`
+/// gate table (normalized scores at the selected experts, zero elsewhere).
+pub fn build_moe_gate(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    file: Arc<SafetensorFile>,
+    layer: usize,
+    x: usize,
+    m: usize,
+    shift: u32,
+    sqrt_softplus_table: usize,
+) -> (usize, usize, usize, usize, usize) {
+    let n = N_ROUTED_EXPERTS_PAD;
+    let gate_w = push_bf16_transposed(
+        store,
+        file.clone(),
+        &format!("layers.{layer}.ffn.gate.weight"),
+        N_ROUTED_EXPERTS,
+        DIM,
+    );
+    let gate_b = push_f32_padded(
+        store,
+        file.clone(),
+        &format!("layers.{layer}.ffn.gate.bias"),
+        n,
+    );
+
+    let z_raw = store.push(vec![]);
+    ops.push(Op::MatMul { a: x, b: gate_w, c: z_raw, m, k: DIM_PAD, n });
+    let z = store.push(vec![]);
+    ops.push(Op::Scale { x: z_raw, out: z, factor: 1, shift });
+
+    let s_idx = store.push_idx(vec![]);
+    ops.push(Op::GeluIndex { x: z, out: s_idx, offset: 1 << 23, table_len: 1 << 24 });
+    let s = store.push(vec![]);
+    ops.push(Op::Lookup { idx: s_idx, out: s, table: sqrt_softplus_table });
+
+    let bias_mn = store.push(vec![]);
+    ops.push(Op::Concat { parts: vec![gate_b; m], out: bias_mn });
+    let biased = store.push(vec![]);
+    ops.push(Op::Add { a: s, b: bias_mn, c: biased });
+
+    let sel = store.push(vec![]);
+    let thr = store.push(vec![]);
+    let _topk_gate = store.push(vec![]);
+    let d1 = store.push(vec![]);
+    let d2 = store.push(vec![]);
+    ops.push(Op::TopKSelect {
+        x: biased,
+        sel,
+        thr,
+        gate: _topk_gate,
+        d1,
+        d2,
+        m,
+        n,
+        k: N_ACTIVATED_EXPERTS,
+    });
+
+    let s_sel = store.push(vec![]);
+    ops.push(Op::ScaleVec { x: s, scale: sel, out: s_sel, shift: 0 });
+    let weights = store.push(vec![]);
+    ops.push(Op::SumNorm { x: s_sel, out: weights, m, n });
+    (sel, thr, weights, d1, d2)
+}
+
 pub fn push_quantized_fp8(
     store: &mut Store,
     file: Arc<SafetensorFile>,
