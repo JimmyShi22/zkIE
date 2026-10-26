@@ -51,3 +51,6 @@ layer14 Engram 关键形状：`embed.weight` FP8 [384016682,256]（约 98GB）�
 layer0 attention（q_norm/kv_norm + tail RoPE + dense causal softmax，不含 sink）
 已与 CPU 参考逐项对齐；Rust head0 前 8 值：
 `[-15616, 4475, -10946, 12939, 9102, 5881, 2056, 22170]`。
+
+attn-sink 已通过新增 `SoftmaxBias` 证明原语接入，layer0 attention 全链路
+（含 sink）op 数 714，证明通过。
