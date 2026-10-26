@@ -10,7 +10,7 @@ use std::sync::Arc;
 use zkie_core::common::quantized_io::{QuantDtype, SafetensorFile};
 use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing};
 use zkie_core::common::fixed_point::{from_i64, to_i64};
-use zkie_ops::compose::{Op, Store};
+use zkie_ops::compose::{causal_mask, Op, Store};
 
 // Architecture constants from DeepSeek-V4.1-Flash `config.json` / `tech_clean.txt`.
 pub const N_LAYERS: usize = 40;
@@ -67,6 +67,38 @@ fn broadcast_norm(v: &[i64], m: usize, pad: usize) -> Vec<Goldilocks> {
         }
     }
     out
+}
+
+/// Slice a row-major `[rows x cols]` matrix (already dequantized to `i64`) into
+/// the contiguous row band `[r0, r1)`. Used to split the group-interleaved
+/// `wo_a` weight into one `[O_LORA_RANK x per_group]` block per output group.
+fn slice_rows(mat: &[i64], cols: usize, r0: usize, r1: usize) -> Vec<Goldilocks> {
+    (r0..r1)
+        .flat_map(|r| mat[r * cols..(r + 1) * cols].iter().map(|&v| from_i64(v)))
+        .collect()
+}
+
+/// Slice a row-major `[rows x cols]` matrix into the contiguous column band
+/// `[c0, c1)`. Used to split `wo_b` into one `[DIM_PAD x O_LORA_RANK]` block per
+/// output group.
+fn slice_cols(mat: &[i64], cols: usize, c0: usize, c1: usize) -> Vec<Goldilocks> {
+    let rows = mat.len() / cols;
+    (0..rows)
+        .flat_map(|r| mat[r * cols + c0..r * cols + c1].iter().map(|&v| from_i64(v)))
+        .collect()
+}
+
+/// RoPE cos/sin tables for a `qk`-wide rotary tail, at fixed point 2^16.
+pub fn build_rope_tables(store: &mut Store, qk: usize) -> (usize, usize) {
+    let half = qk / 2;
+    let mut cos = Vec::with_capacity(half);
+    let mut sin = Vec::with_capacity(half);
+    for i in 0..half {
+        let theta = (10000f64).powf(-2.0 * i as f64 / qk as f64);
+        cos.push(from_i64((theta.cos() * 65536.0).round() as i64));
+        sin.push(from_i64((theta.sin() * 65536.0).round() as i64));
+    }
+    (store.push(cos), store.push(sin))
 }
 
 pub fn push_quantized_fp8(
@@ -367,14 +399,16 @@ mod tests {
     }
 }
 
-/// Builder entry point. Today it implements the validated layer-0 MLA
-/// projection slice (`wq_a`, `wq_b`, `wkv`) and returns the projected `q` and
-/// `kv` tensors. Attention, `wo_a`/`wo_b`, MoE, HyperConnection, and Engram are
-/// layered on top next; this function will grow to the full 40-layer graph.
+/// MLA input projection for one layer: `x -> (q, kv)` through the quantized
+/// `wq_a`, `wq_b` and `wkv` projections plus `q_norm` / `kv_norm`. `x` must
+/// already be materialized in the store as `[m, DIM_PAD]`. The returned `q` is
+/// `[m, N_HEADS * HEAD_DIM]` (each head laid out as `nope || rope`) and `kv` is
+/// `[m, HEAD_DIM]` (`nope || rope`).
 pub fn build_deepseek_v41(
     store: &mut Store,
     ops: &mut Vec<Op>,
     dir: &str,
+    layer: usize,
     m: usize,
     shift: u32,
 ) -> (usize, usize) {
@@ -384,20 +418,20 @@ pub fn build_deepseek_v41(
     let wq_a = push_quantized_fp8(
         store,
         file.clone(),
-        "layers.0.attn.wq_a.weight",
-        "layers.0.attn.wq_a.scale",
+        &format!("layers.{layer}.attn.wq_a.weight"),
+        &format!("layers.{layer}.attn.wq_a.scale"),
     );
     let wq_b = push_quantized_fp8(
         store,
         file.clone(),
-        "layers.0.attn.wq_b.weight",
-        "layers.0.attn.wq_b.scale",
+        &format!("layers.{layer}.attn.wq_b.weight"),
+        &format!("layers.{layer}.attn.wq_b.scale"),
     );
     let wkv = push_quantized_fp8(
         store,
         file.clone(),
-        "layers.0.attn.wkv.weight",
-        "layers.0.attn.wkv.scale",
+        &format!("layers.{layer}.attn.wkv.weight"),
+        &format!("layers.{layer}.attn.wkv.scale"),
     );
 
     let rsqrt_table = store.push(load_i32("models/gpt2/weights/rsqrt_table_i32.bin"));
@@ -407,12 +441,12 @@ pub fn build_deepseek_v41(
             .collect::<Vec<_>>(),
     );
     let q_norm_real: Vec<i64> = file
-        .read_bf16("layers.0.attn.q_norm.weight")
+        .read_bf16(&format!("layers.{layer}.attn.q_norm.weight"))
         .iter()
         .map(|&v| to_i64(v))
         .collect();
     let kv_norm_real: Vec<i64> = file
-        .read_bf16("layers.0.attn.kv_norm.weight")
+        .read_bf16(&format!("layers.{layer}.attn.kv_norm.weight"))
         .iter()
         .map(|&v| to_i64(v))
         .collect();
@@ -475,4 +509,181 @@ pub fn build_deepseek_v41(
         n_real: HEAD_DIM,
     });
     (q, kvn)
+}
+
+/// Dense multi-head attention over the projected `q` / `kv` tensors, with the
+/// per-head attention sink (`attn_sink`) applied as a softmax bias. `kv` is the
+/// shared `[m, HEAD_DIM]` latent (`nope || rope`); each head slices its own
+/// `[m, N_HEADS * HEAD_DIM]` query block and RoPE-rotates the rope tail. Returns
+/// the concatenated attention output `[m, N_HEADS * HEAD_DIM]`.
+///
+/// This is the current validated slice (dense causal attention + sink). The
+/// sliding-window compressed-KV top-k path (SparseAttention) is layered on top
+/// next.
+#[allow(clippy::too_many_arguments)]
+pub fn build_mla_attention(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    file: Arc<SafetensorFile>,
+    layer: usize,
+    m: usize,
+    shift: u32,
+    q: usize,
+    kv: usize,
+    cos_t: usize,
+    sin_t: usize,
+    exp_table: usize,
+    limb_table: usize,
+) -> usize {
+    let nope = HEAD_NOPE;
+    let qk = HEAD_QK;
+    let nope_pad = HEAD_NOPE_PAD;
+    let mask = store.push(causal_mask(m));
+
+    let kvn = store.push(vec![]);
+    let kvr = store.push(vec![]);
+    ops.push(Op::Slice { x: kv, out: kvn, start: 0, len: m * nope });
+    ops.push(Op::Slice { x: kv, out: kvr, start: m * nope, len: m * qk });
+    let zero_n = store.push(vec![Goldilocks::ZERO; m * (nope_pad - nope)]);
+    let kvn_pad = store.push(vec![]);
+    ops.push(Op::Concat { parts: vec![kvn, zero_n], out: kvn_pad });
+    let ktn = store.push(vec![]);
+    let ktr = store.push(vec![]);
+    ops.push(Op::Transpose { x: kvn_pad, out: ktn, m, k: nope_pad });
+    ops.push(Op::Transpose { x: kvr, out: ktr, m, k: qk });
+
+    let mut head_outs = Vec::new();
+    for head in 0..N_HEADS {
+        let qn = store.push(vec![]);
+        let qr = store.push(vec![]);
+        ops.push(Op::Slice { x: q, out: qn, start: head * HEAD_DIM, len: nope });
+        ops.push(Op::Slice { x: q, out: qr, start: head * HEAD_DIM + nope, len: qk });
+        let qn_pad = store.push(vec![]);
+        ops.push(Op::Concat { parts: vec![qn, zero_n], out: qn_pad });
+        let qr_rot = store.push(vec![]);
+        ops.push(Op::RoPE {
+            x: qr,
+            cos: cos_t,
+            sin: sin_t,
+            out: qr_rot,
+            range_table: limb_table,
+            m,
+            d: qk,
+            shift,
+        });
+        let scores_n = store.push(vec![]);
+        let scores_r = store.push(vec![]);
+        let scores = store.push(vec![]);
+        ops.push(Op::MatMul { a: qn_pad, b: ktn, c: scores_n, m, k: nope_pad, n: m });
+        ops.push(Op::MatMul { a: qr_rot, b: ktr, c: scores_r, m, k: qk, n: m });
+        ops.push(Op::Add { a: scores_n, b: scores_r, c: scores });
+        let idx = store.push_idx(vec![]);
+        let e = store.push(vec![]);
+        let probs = store.push(vec![]);
+        let probs_bias = store.push(vec![]);
+        ops.push(Op::StableSoftmaxIndex {
+            x: scores,
+            mask,
+            out: idx,
+            offset: 1 << 21,
+            table_len: 1 << 21,
+            m,
+            n: m,
+        });
+        ops.push(Op::Softmax { idx, e, out: probs, table: exp_table, m, n: m });
+        let sink_fixed = {
+            let v = to_i64(file.read_f32(&format!("layers.{layer}.attn.attn_sink"))[head]);
+            ((v as f64 / 65536.0).exp() * 65536.0).round() as i64
+        };
+        let sink_bias = store.push(vec![from_i64(sink_fixed); m]);
+        ops.push(Op::SoftmaxBias { e, bias: sink_bias, out: probs_bias, m, n: m });
+        let attn_n = store.push(vec![]);
+        let attn_r = store.push(vec![]);
+        ops.push(Op::MatMul { a: probs_bias, b: kvn_pad, c: attn_n, m, k: m, n: nope_pad });
+        ops.push(Op::MatMul { a: probs_bias, b: kvr, c: attn_r, m, k: m, n: qk });
+        let attn_n16 = store.push(vec![]);
+        let attn_r16 = store.push(vec![]);
+        ops.push(Op::Scale { x: attn_n, out: attn_n16, factor: 1, shift });
+        ops.push(Op::Scale { x: attn_r, out: attn_r16, factor: 1, shift });
+        let attn_n_sl = store.push(vec![]);
+        ops.push(Op::Slice { x: attn_n16, out: attn_n_sl, start: 0, len: m * nope });
+        let head_out = store.push(vec![]);
+        ops.push(Op::Concat { parts: vec![attn_n_sl, attn_r16], out: head_out });
+        head_outs.push(head_out);
+    }
+
+    // Concatenate all heads into `o` [m, N_HEADS * HEAD_DIM].
+    let mut o = head_outs[0];
+    for &h in &head_outs[1..] {
+        let cat = store.push(vec![]);
+        ops.push(Op::Concat { parts: vec![o, h], out: cat });
+        o = cat;
+    }
+    o
+}
+
+/// MLA output projection: `o -> attention_out` through the group-interleaved
+/// `wo_a` / `wo_b` low-rank projection (`O_GROUPS` groups of `O_LORA_RANK`).
+/// `o` is `[m, N_HEADS * HEAD_DIM]`; the result is `[m, DIM_PAD]`.
+pub fn build_oproj(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    file: Arc<SafetensorFile>,
+    layer: usize,
+    m: usize,
+    shift: u32,
+    o: usize,
+) -> usize {
+    let wa = push_quantized_fp8(
+        store,
+        file.clone(),
+        &format!("layers.{layer}.attn.wo_a.weight"),
+        &format!("layers.{layer}.attn.wo_a.scale"),
+    );
+    let wb = push_quantized_fp8(
+        store,
+        file.clone(),
+        &format!("layers.{layer}.attn.wo_b.weight"),
+        &format!("layers.{layer}.attn.wo_b.scale"),
+    );
+    let wa_mat: Vec<i64> = store.materialize(wa).iter().map(|&v| to_i64(v)).collect();
+    let wb_mat: Vec<i64> = store.materialize(wb).iter().map(|&v| to_i64(v)).collect();
+
+    let per_group = N_HEADS * HEAD_DIM / O_GROUPS;
+    let mut outs = Vec::with_capacity(O_GROUPS);
+    for g in 0..O_GROUPS {
+        let o_g = store.push(vec![]);
+        ops.push(Op::Slice {
+            x: o,
+            out: o_g,
+            start: g * per_group,
+            len: per_group,
+        });
+        let wa_g = store.push(slice_rows(
+            &wa_mat,
+            per_group,
+            g * O_LORA_RANK,
+            (g + 1) * O_LORA_RANK,
+        ));
+        let oa_raw = build_quantized_matmul(store, ops, o_g, wa_g, m, per_group, O_LORA_RANK);
+        let oa = store.push(vec![]);
+        ops.push(Op::Scale { x: oa_raw, out: oa, factor: 1, shift });
+        let wb_g = store.push(slice_cols(
+            &wb_mat,
+            O_GROUPS * O_LORA_RANK,
+            g * O_LORA_RANK,
+            (g + 1) * O_LORA_RANK,
+        ));
+        let out_raw = build_quantized_matmul(store, ops, oa, wb_g, m, O_LORA_RANK, DIM_PAD);
+        let out = store.push(vec![]);
+        ops.push(Op::Scale { x: out_raw, out, factor: 1, shift });
+        outs.push(out);
+    }
+    let mut acc = outs[0];
+    for &out in &outs[1..] {
+        let s = store.push(vec![]);
+        ops.push(Op::Add { a: acc, b: out, c: s });
+        acc = s;
+    }
+    acc
 }

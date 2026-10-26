@@ -59,7 +59,7 @@ fn main() {
     let d = HEAD_DIM;
     let mut store = Store::new();
     let mut ops: Vec<Op> = Vec::new();
-    let (q, kv) = build_deepseek_v41(&mut store, &mut ops, &dir, m, 16);
+    let (q, kv) = build_deepseek_v41(&mut store, &mut ops, &dir, 0, m, 16);
     let file = open_shard(&path);
     let sink_raw = file.read_f32("layers.0.attn.attn_sink");
 
