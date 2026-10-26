@@ -193,6 +193,37 @@ impl SafetensorFile {
         out
     }
 
+    /// Dequantize only the requested rows of an FP8 E4M3 block weight, in
+    /// row-major order. Used for the Engram embedding table (3.84e8 rows),
+    /// where materializing the whole tensor is infeasible.
+    pub fn read_fp8_rows(
+        &self,
+        name: &str,
+        scale_name: &str,
+        block_size: usize,
+        rows: &[u32],
+    ) -> Vec<Goldilocks> {
+        let info = self.tensor(name).expect("missing fp8 weight");
+        let scale_info = self.tensor(scale_name).expect("missing fp8 scale");
+        let raw = self.raw(name).expect("missing fp8 weight");
+        let scale_raw = self.raw(scale_name).expect("missing fp8 scale");
+        assert_eq!(info.shape.len(), 2, "fp8 weight must be 2D");
+        let cols = info.shape[1];
+        let nb_cols = scale_info.shape[1];
+        let mut out = Vec::with_capacity(rows.len() * cols);
+        for &row in rows {
+            let r = row as usize;
+            assert!(r < info.shape[0], "row {r} out of range");
+            for c in 0..cols {
+                let sc = c / block_size;
+                let scale = e8m0_to_f64(scale_raw[r * nb_cols + sc]);
+                let w = e4m3_to_f64(raw[r * cols + c]);
+                out.push(from_i64((w * scale * FIXED_SCALE).round() as i64));
+            }
+        }
+        out
+    }
+
     /// Dequantize a packed FP4 E2M1 block weight. The safetensors shape's
     /// second dimension is the packed byte width (`logical_cols / 2`).
     pub fn read_fp4_weight(

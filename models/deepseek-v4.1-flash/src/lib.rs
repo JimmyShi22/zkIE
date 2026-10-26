@@ -35,6 +35,8 @@ pub const ROUTE_SCALE_Q16: i64 = 98304;
 /// `hc_eps = 1e-6` in Q16 rounds to zero (one Q16 LSB is ~1.5e-5), so the
 /// Sinkhorn split runs with `eps = 0`.
 pub const HC_EPS_Q16: i64 = 0;
+pub const ENGRAM_HEAD_DIM: usize = 256;
+pub const ENGRAM_N_HASH: usize = 24;
 
 // Field-level matmul/MLE primitives require power-of-two tensor lengths. These
 // are the zero-padded dimensions the builder must use consistently everywhere;
@@ -98,6 +100,16 @@ fn broadcast_norm(v: &[i64], m: usize, pad: usize) -> Vec<Goldilocks> {
         }
     }
     out
+}
+
+fn round_div_i64(a: i64, b: i64) -> i64 {
+    let q = a.div_euclid(b);
+    let r = a.rem_euclid(b);
+    if r * 2 >= b {
+        q + 1
+    } else {
+        q
+    }
 }
 
 /// Slice a row-major `[rows x cols]` matrix (already dequantized to `i64`) into
@@ -1817,6 +1829,148 @@ pub fn build_compressor(
     }
 
     build_rms_norm(store, ops, pooled, norm_w, rsqrt_table, limb_table, groups, hd, hd)
+}
+
+/// Engram sub-block: n-gram hash lookup + FP8 embedding + wkv projection +
+/// gated write into the Hyper-Connection residual stream. `x4` is
+/// `[m, HC_MULT, DIM_PAD]`; `hash_ids` holds the `m * ENGRAM_N_HASH` row ids for
+/// this layer (precomputed by `extract_v41_engram.py`). Returns the updated
+/// `[m, HC_MULT, DIM_PAD]` residual.
+#[allow(clippy::too_many_arguments)]
+pub fn build_engram(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    file: Arc<SafetensorFile>,
+    layer: usize,
+    x4: usize,
+    m: usize,
+    hash_ids: &[u32],
+    shift: u32,
+    rsqrt_table: usize,
+    _limb_table: usize,
+    gate_table: usize,
+) -> usize {
+    let hc = HC_MULT;
+    let flat = ENGRAM_N_HASH * ENGRAM_HEAD_DIM;
+    let flat_pad = flat.next_power_of_two();
+    let out_dim = DIM * (hc + 1);
+    let out_pad = out_dim.next_power_of_two();
+    let hc_d = hc * DIM;
+    let base = format!("layers.{layer}.engram");
+
+    // Embedding row lookup (dequantize only the requested rows).
+    let e = store.push(file.read_fp8_rows(
+        &format!("{base}.embed.weight"),
+        &format!("{base}.embed.scale"),
+        32,
+        hash_ids,
+    ));
+    let e_pad = pad_rows(store, ops, e, m, flat, flat_pad);
+
+    // wkv projection.
+    let wkv = push_quantized_fp8(
+        store,
+        file.clone(),
+        &format!("{base}.wkv.weight"),
+        &format!("{base}.wkv.scale"),
+    );
+    let kv_raw = build_quantized_matmul(store, ops, e_pad, wkv, m, flat_pad, out_pad);
+    let kv = store.push(vec![]);
+    ops.push(Op::Scale { x: kv_raw, out: kv, factor: 1, shift });
+    let key_real = gather(store, ops, kv, col_band(m, out_pad, 0, hc_d));
+    let value_real = gather(store, ops, kv, col_band(m, out_pad, hc_d, hc_d + DIM));
+
+    // The residual stream, collapsed to its real columns.
+    let h_real = flatten_hc_real(store, ops, x4, m, hc, DIM, DIM_PAD);
+    // Pad the per-copy 5120-wide tensors to the field-friendly 8192. Padding
+    // is zero, so the dot-product sums and the RMSNorm `n_real` are unchanged.
+    let h = pad_rows(store, ops, h_real, m * hc, DIM, DIM_PAD);
+    let key = pad_rows(store, ops, key_real, m * hc, DIM, DIM_PAD);
+    let value = pad_rows(store, ops, value_real, m, DIM, DIM_PAD);
+
+    // weight = q_weight * k_weight (elementwise, Q16), broadcast per token.
+    // q_weight/k_weight are constants, so the product is materialized at build
+    // time rather than as a runtime op.
+    let qw: Vec<i64> = file
+        .read_bf16(&format!("{base}.q_weight"))
+        .iter()
+        .map(|&x| to_i64(x))
+        .collect();
+    let kw: Vec<i64> = file
+        .read_bf16(&format!("{base}.k_weight"))
+        .iter()
+        .map(|&x| to_i64(x))
+        .collect();
+    let weight: Vec<Goldilocks> = qw
+        .iter()
+        .zip(kw.iter())
+        .map(|(a, b)| from_i64(round_div_i64(a * b, 1 << 16)))
+        .collect();
+    let mut weight_m = Vec::with_capacity(m * hc * DIM_PAD);
+    for _ in 0..m {
+        for h in 0..hc {
+            weight_m.extend_from_slice(&weight[h * DIM..(h + 1) * DIM]);
+            weight_m.extend(std::iter::repeat(Goldilocks::ZERO).take(DIM_PAD - DIM));
+        }
+    }
+    let weight_m = store.push(weight_m);
+
+    let hw = store.push(vec![]);
+    ops.push(Op::ScaleVec { x: h, scale: weight_m, out: hw, shift: 16 });
+    let hwk = store.push(vec![]);
+    ops.push(Op::ScaleVec { x: hw, scale: key, out: hwk, shift: 16 });
+
+    // dot = (h*w*key).sum(-1) * rstd_h * rstd_key / sqrt(d), per (token, copy).
+    let ones2 = {
+        let mut v = vec![Goldilocks::ZERO; DIM_PAD * 2];
+        for j in 0..DIM_PAD {
+            v[j * 2] = from_i64(1 << 16);
+        }
+        store.push(v)
+    };
+    let sum_raw = store.push(vec![]);
+    ops.push(Op::MatMul { a: hwk, b: ones2, c: sum_raw, m: m * hc, k: DIM_PAD, n: 2 });
+    let sum_col = gather(store, ops, sum_raw, col_band(m * hc, 2, 0, 1));
+    let dot_sum = store.push(vec![]);
+    ops.push(Op::Scale { x: sum_col, out: dot_sum, factor: 1, shift });
+    let rstd_h = store.push(vec![]);
+    ops.push(Op::Rsqrt { x: h, out: rstd_h, rsqrt_table, m: m * hc, d: DIM_PAD, n_real: DIM });
+    let rstd_k = store.push(vec![]);
+    ops.push(Op::Rsqrt { x: key, out: rstd_k, rsqrt_table, m: m * hc, d: DIM_PAD, n_real: DIM });
+    let s1 = store.push(vec![]);
+    ops.push(Op::ScaleVec { x: dot_sum, scale: rstd_h, out: s1, shift: 16 });
+    let s2 = store.push(vec![]);
+    ops.push(Op::ScaleVec { x: s1, scale: rstd_k, out: s2, shift: 16 });
+    let dim_sqrt = (65536.0 / (DIM as f64).sqrt()).round() as i64;
+    let dot = store.push(vec![]);
+    ops.push(Op::Scale { x: s2, out: dot, factor: dim_sqrt, shift: 16 });
+
+    // gate = sigmoid(sign(dot) * sqrt(|dot|)) via one precomputed table.
+    let gate_idx = store.push_idx(vec![]);
+    ops.push(Op::GeluIndex { x: dot, out: gate_idx, offset: 1 << 23, table_len: 1 << 24 });
+    let gate = store.push(vec![]);
+    ops.push(Op::Lookup { idx: gate_idx, out: gate, table: gate_table });
+
+    // out = h + gate * value.
+    let value4 = expand_to_hc(store, ops, value, m, hc, DIM_PAD);
+    let gate4 = {
+        let mut idx = Vec::with_capacity(m * hc * DIM_PAD);
+        for i in 0..m {
+            for h in 0..hc {
+                for _ in 0..DIM_PAD {
+                    idx.push((i * hc + h) as u32);
+                }
+            }
+        }
+        gather(store, ops, gate, idx)
+    };
+    let term = store.push(vec![]);
+    ops.push(Op::ScaleVec { x: value4, scale: gate4, out: term, shift: 16 });
+    let out_real = store.push(vec![]);
+    ops.push(Op::Add { a: h, b: term, c: out_real });
+
+    // `out_real` is already `[m, hc, DIM_PAD]` row-major.
+    out_real
 }
 
 /// One full Hyper-Connection block for an arbitrary layer, with sliding-window
