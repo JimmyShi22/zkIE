@@ -128,6 +128,67 @@ pub fn build_quantized_matmul(
     c
 }
 
+/// Full-mode SparseIndexer assembled from existing primitives: score the
+/// candidates, apply the compress visibility mask, take top-k, then sort the
+/// selected indices into position order. `w` is `n x k` (candidate count x
+/// feature dim). Returns `(gate, sorted_indices)`.
+pub fn build_sparse_indexer_full(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    x: usize,
+    w: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    ratio: usize,
+    topk: usize,
+    shift: u32,
+) -> (usize, usize) {
+    let raw = build_quantized_matmul(store, ops, x, w, m, k, n);
+    let score = store.push(vec![]);
+    ops.push(Op::Scale { x: raw, out: score, factor: 1, shift });
+    let mask = store.push(vec![]);
+    ops.push(Op::CompressMask { out: mask, m, n, ratio });
+    let masked = store.push(vec![]);
+    ops.push(Op::Add { a: score, b: mask, c: masked });
+    let sel = store.push(vec![]);
+    let thr = store.push(vec![]);
+    let gate = store.push(vec![]);
+    let d1 = store.push(vec![]);
+    let d2 = store.push(vec![]);
+    ops.push(Op::TopKSelect { x: masked, sel, thr, gate, d1, d2, m, n, k: topk });
+    let sel_idx = store.push_idx(vec![]);
+    ops.push(Op::SelToIndices { sel, out: sel_idx, m, n });
+    let sorted = store.push_idx(vec![]);
+    ops.push(Op::SortIndices { idx: sel_idx, out: sorted, m, n: topk });
+    (gate, sorted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zkie_core::common::field::XorShift64;
+    use zkie_core::common::fixed_point::from_i64;
+    use zkie_ops::compose::{prove_shard, verify_shard};
+
+    #[test]
+    fn sparse_indexer_full_roundtrip() {
+        let m = 2usize;
+        let k = 2usize;
+        let n = 4usize;
+        let mut store = Store::new();
+        let mut ops = Vec::new();
+        let x = store.push(vec![from_i64(1 << 16); m * k]);
+        let w = store.push((0..n * k).map(|i| from_i64((i as i64 + 1) << 16)).collect::<Vec<_>>());
+        let (gate, sorted) = build_sparse_indexer_full(&mut store, &mut ops, x, w, m, k, n, 1, 2, 16);
+        let mut rng = XorShift64::new(7);
+        let proof = prove_shard(&mut store, &ops, &[], &mut rng);
+        assert!(verify_shard(&store.owned_slices(), &ops, &proof));
+        assert_eq!(store.get(gate).len(), m * n);
+        assert_eq!(store.idx[sorted].len(), m * 2);
+    }
+}
+
 /// Builder entry point. Today it implements the validated layer-0 MLA
 /// projection slice (`wq_a`, `wq_b`, `wkv`) and returns the projected `q` and
 /// `kv` tensors. Attention, `wo_a`/`wo_b`, MoE, HyperConnection, and Engram are
