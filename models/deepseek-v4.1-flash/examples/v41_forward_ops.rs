@@ -1,6 +1,8 @@
 use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing};
 use zkie_core::common::fixed_point::{from_i64, to_i64};
-use zkie_models_deepseek_v41_flash::{build_final_logits, build_v41_forward, DIM_PAD, HC_MULT};
+use zkie_models_deepseek_v41_flash::{
+    build_final_logits, build_v41_forward, push_embedding, DIM_PAD, HC_MULT,
+};
 use zkie_ops::compose::{forward_ops, Op, Store};
 
 fn load_i32(path: &str) -> Vec<Goldilocks> {
@@ -48,7 +50,15 @@ fn main() {
     let gate_table = store.push(load_i32("/data/zkIE/models/engram_gate_table_i32.bin"));
     let hash_ids = load_i32_raw("/data/zkIE/models/deepseek-v4.1-flash/cache/engram/hash_ids_i32.bin");
     let hash_ids: Vec<u32> = hash_ids.into_iter().map(|v| v as u32).collect();
-    let x = store.push(vec![from_i64(1 << 16); m * DIM_PAD]);
+    let x = if std::env::var("ZKIE_REAL").is_ok() {
+        push_embedding(
+            &mut store,
+            "/data/zkIE/models/deepseek-v4.1-flash/cache/engram/embed_prompt_i32.bin",
+            m,
+        )
+    } else {
+        store.push(vec![from_i64(1 << 16); m * DIM_PAD])
+    };
 
     let (x4, _pre_mix) = build_v41_forward(
         &mut store,

@@ -160,6 +160,26 @@ impl SafetensorFile {
             .collect()
     }
 
+    /// Read specific rows of a BF16 2-D tensor (e.g. token embeddings), in
+    /// row-major order.
+    pub fn read_bf16_rows(&self, name: &str, rows: &[u32]) -> Vec<Goldilocks> {
+        let info = self.tensor(name).expect("missing tensor");
+        assert_eq!(info.shape.len(), 2, "bf16 tensor must be 2D");
+        let cols = info.shape[1];
+        let raw = self.raw(name).expect("missing tensor");
+        let mut out = Vec::with_capacity(rows.len() * cols);
+        for &row in rows {
+            let r = row as usize;
+            assert!(r < info.shape[0], "row {r} out of range");
+            for c in 0..cols {
+                let bits = u16::from_le_bytes([raw[2 * (r * cols + c)], raw[2 * (r * cols + c) + 1]]);
+                let v = bf16_to_f32(bits) as f64;
+                out.push(from_i64((v * FIXED_SCALE).round() as i64));
+            }
+        }
+        out
+    }
+
     /// Dequantize an FP8 E4M3 block weight. `scale_name` is the matching E8M0
     /// scale tensor. `block_size` is 32 for these checkpoints.
     pub fn read_fp8_weight(

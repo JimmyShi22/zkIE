@@ -2362,6 +2362,24 @@ pub fn build_identity_pre_mix(store: &mut Store, m: usize) -> usize {
     store.push(v)
 }
 
+/// Load a precomputed prompt embedding `[m, DIM]` (i32 Q16) and row-pad it to
+/// `[m, DIM_PAD]`.
+pub fn push_embedding(store: &mut Store, path: &str, m: usize) -> usize {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let vals: Vec<i64> = bytes
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64)
+        .collect();
+    assert_eq!(vals.len(), m * DIM, "embedding length mismatch");
+    let mut out = vec![Goldilocks::ZERO; m * DIM_PAD];
+    for i in 0..m {
+        for j in 0..DIM {
+            out[i * DIM_PAD + j] = from_i64(vals[i * DIM + j]);
+        }
+    }
+    store.push(out)
+}
+
 /// Split an HC mix projection into `pre`/`post`/`comb` coefficients.
 fn build_hc_split(
     store: &mut Store,
