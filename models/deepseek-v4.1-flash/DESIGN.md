@@ -120,6 +120,18 @@ layer14 的 Engram：
 注意：`embed` 表有 3.84 亿行，完整承诺是硬目标；前向只需查 `m*24` 行，但证明要
 streaming lookup 原语 + 分片提交，这块还没实现。
 
+## Routed expert 流式化（已实现 forward 侧）
+
+- `TensorData::ExpertStack`：384 个 packed-FP4 expert 的懒加载描述符。
+- forward 只在 `GatherMatMul` 里物化被选中的 expert（`materialize_expert_rows`，
+  dense remap），输出与全量物化逐位一致；单层 routed 前向从 17min/300GB 降到
+  ~3.5min/3GB。
+- 提交侧还没做 per-expert 粒度：`collect_weight_tensors` 目前不收集
+  `GatherMatMul.w`，且 `commit_model_weights` 会把它当成一个 12.9B 元素的张量。
+  正确做法是每个 expert 的 `[k,n]` 权重单独一批提交，`weight_locs` 要改成
+  `(tensor_id, expert_idx) -> (batch, table)`，并把 GatherMatMul 证明的
+  `expert_table_evals` 改成从 per-expert 承诺打开。这是 committed 路径的下一块。
+
 # CSA2 / CED 40 层接线设计
 
 ## 共享 KV / index
