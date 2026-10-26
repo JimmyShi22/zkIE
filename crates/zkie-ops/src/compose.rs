@@ -40,7 +40,7 @@ use zkie_core::common::logup_gkr::{
     verify_lookup_fractional, verify_lookup_fractional_batch, verify_lookup_fractional_chain,
     build_lookup_table_num_den, build_perm_num_den, fractional_leaf, merge_multiplicity, pad_table,
     prove_fractional_with_challenges, prove_lookup_table, prove_lookup_witness_batch_columns,
-    verify_lookup_split, FractionalProof,
+    verify_lookup_split, prove_permutation, verify_permutation, PermutationProof, FractionalProof,
 };
 use zkie_core::common::matmul::{prove as matmul_prove, verify as matmul_verify, MatmulProof};
 use zkie_core::common::batched_matmul::{self as bmm, BatchedMatmulProof};
@@ -1141,7 +1141,7 @@ pub enum Op {
 pub enum OpProof {
     Transpose,
     Slice,
-    Concat,
+    Concat(PermutationProof, Goldilocks),
     CompressMask,
     SortIndices,
     SelToIndices,
@@ -2391,19 +2391,24 @@ pub fn prove_shard_precomputed(
                 op_proofs.push(OpProof::Slice);
             }
             Op::Concat { ref parts, out } => {
-                let merged: Vec<Goldilocks> =
-                    parts.iter().flat_map(|&p| store.get(p).to_vec()).collect();
-                // The verifier recomputes the merge and checks this claim. Only
-                // power-of-two merges can be claimed as an MLE; non-power-of-two
-                // merges (e.g. window + compressed KV) are the remaining
-                // relabeling cases handled by the lookup-table path.
-                if merged.len().is_power_of_two() {
-                    let r: Vec<Goldilocks> = (0..merged.len().trailing_zeros() as usize)
-                        .map(|_| rng.field())
-                        .collect();
-                    claims.push((out, r.clone(), mle::eval(&merged, &r)));
+                let gamma = rng.field();
+                let mut a = Vec::new();
+                let mut offset = 0usize;
+                for &p in parts {
+                    let part = store.get(p);
+                    for (i, &v) in part.iter().enumerate() {
+                        a.push(v + gamma * Goldilocks::from_u64((offset + i) as u64));
+                    }
+                    offset += part.len();
                 }
-                op_proofs.push(OpProof::Concat);
+                let out_v = store.get(out);
+                let b: Vec<Goldilocks> = out_v
+                    .iter()
+                    .enumerate()
+                    .map(|(pos, &v)| v + gamma * Goldilocks::from_u64(pos as u64))
+                    .collect();
+                let perm = prove_permutation(&a, &b, rng);
+                op_proofs.push(OpProof::Concat(perm, gamma));
             }
             Op::CompressMask { out, m, n, ratio } => {
                 let mut mask = Vec::with_capacity(m * n);
@@ -3082,19 +3087,24 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
                 // against that recomputed value.
             }
             (Op::Slice { .. }, OpProof::Slice) => {}
-            (Op::Concat { parts, out }, OpProof::Concat) => {
-                let mut merged = Vec::new();
+            (Op::Concat { parts, out }, OpProof::Concat(perm, gamma)) => {
+                let mut a = Vec::new();
+                let mut offset = 0usize;
                 for &p in parts {
-                    merged.extend_from_slice(tables[p]);
-                }
-                if merged.len().is_power_of_two() {
-                    let ok = proof
-                        .claims
-                        .iter()
-                        .any(|(t, pt, ev)| *t == *out && *ev == mle::eval(&merged, pt));
-                    if !ok {
-                        return false;
+                    let part = tables[p];
+                    for (i, &v) in part.iter().enumerate() {
+                        a.push(v + *gamma * Goldilocks::from_u64((offset + i) as u64));
                     }
+                    offset += part.len();
+                }
+                let out_v = tables[*out];
+                let b: Vec<Goldilocks> = out_v
+                    .iter()
+                    .enumerate()
+                    .map(|(pos, &v)| v + *gamma * Goldilocks::from_u64(pos as u64))
+                    .collect();
+                if perm.a != a || perm.b != b || !verify_permutation(perm) {
+                    return false;
                 }
             }
             (Op::CompressMask { out, m, n, ratio }, OpProof::CompressMask) => {
@@ -7767,7 +7777,6 @@ mod tests {
             // table functions, so they need a lookup (`logup_gkr` is already in tree).
             OpProof::Transpose
             | OpProof::Slice
-            | OpProof::Concat
             | OpProof::CompressMask
             | OpProof::SortIndices
             | OpProof::SelToIndices
@@ -7803,6 +7812,7 @@ mod tests {
             | OpProof::Scale(..)
             | OpProof::ScaleVec(..)
             | OpProof::GeluIndex(..)
+            | OpProof::Concat(..)
             | OpProof::RoPE(..)
             | OpProof::TopKSelect(..)
             | OpProof::SparseIndexer(..)
@@ -7823,7 +7833,6 @@ mod tests {
         let unproven = [
             OpProof::Transpose,
             OpProof::Slice,
-            OpProof::Concat,
             OpProof::CompressMask,
             OpProof::SortIndices,
             OpProof::SelToIndices,
@@ -7846,7 +7855,7 @@ mod tests {
         ];
         assert_eq!(
             unproven.len(),
-            21,
+            20,
             "the set of ops with no proof of their own changed; see the succinct-verification thread before adjusting"
         );
         for p in &unproven {
