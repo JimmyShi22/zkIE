@@ -56,3 +56,6 @@ attn-sink 已通过新增 `SoftmaxBias` 证明原语接入，layer0 attention �
 （含 sink）op 数 714，证明通过。
 
 下一步：`wo_a`/`wo_b` 输出投影 op graph；再往后是 MoE、HyperConnection、Engram。
+
+`wo_a`/`wo_b` 输出投影 op graph 已证明通过（8 groups，39 ops），合成输入下
+前 4 值与 CPU 参考一致。
