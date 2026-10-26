@@ -136,7 +136,7 @@ fn push_f32_padded(store: &mut Store, file: Arc<SafetensorFile>, name: &str, n_p
 
 /// MoE routing gate: `x -> top-k selection + normalized gate weights`.
 ///
-/// ```
+/// ```text
 /// z       = x @ gate_w^T
 /// s       = sqrt(softplus(z))            (table lookup)
 /// biased  = s + gate_b                    (row-broadcast)
