@@ -32,6 +32,15 @@ pub struct RmsNormProof {
     pub rem_split_ch: Vec<Goldilocks>,
 }
 
+/// Proof for the standalone per-row reciprocal-square-root op (`Op::Rsqrt`):
+/// the mean-of-squares truncation, plus the table lookup bound through the
+/// shared rsqrt-table lookup argument (exactly like `RmsNorm`).
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct RsqrtProof {
+    pub trunc: VirtualProof,
+    pub trunc_ch: Vec<Goldilocks>,
+}
+
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 pub fn rms_norm_forward(
@@ -225,6 +234,92 @@ pub fn verify_rms_norm(proof: &RmsNormProof, n_real: usize) -> bool {
         return false;
     }
     true
+}
+
+/// Compute `ms = round(mean(x^2))` and `rstd = rsqrt_table[rsqrt_index(ms)]`
+/// for each of the `m` rows (normalizing over the first `n_real` columns).
+pub fn rsqrt_forward(
+    x: &[Goldilocks],
+    rsqrt_table: &[Goldilocks],
+    m: usize,
+    d: usize,
+    n_real: usize,
+) -> (
+    Vec<Goldilocks>, // ms
+    Vec<u32>,        // s_index
+    Vec<Goldilocks>, // rstd
+    Vec<Goldilocks>, // sum_sq
+    Vec<Goldilocks>, // rem_s
+) {
+    let ms: Vec<Goldilocks> = (0..m)
+        .map(|r| {
+            let s: i64 = (0..n_real)
+                .map(|j| {
+                    let v = to_i64(x[r * d + j]);
+                    v * v
+                })
+                .sum();
+            from_i64(round_div(s, n_real as i64))
+        })
+        .collect();
+    let s_index: Vec<u32> = ms.iter().map(|&v| rsqrt_index(to_i64(v))).collect();
+    check_rsqrt_table(rsqrt_table, s_index.iter().copied().max().unwrap_or(0));
+    let rstd: Vec<Goldilocks> = s_index.iter().map(|&i| rsqrt_table[i as usize]).collect();
+    let sum_sq: Vec<Goldilocks> = (0..m)
+        .map(|r| (0..n_real).fold(Goldilocks::ZERO, |a, j| a + x[r * d + j] * x[r * d + j]))
+        .collect();
+    let rem_s: Vec<Goldilocks> = (0..m)
+        .map(|r| from_i64(to_i64(sum_sq[r]) - to_i64(ms[r]) * n_real as i64 + (n_real as i64 / 2)))
+        .collect();
+    (ms, s_index, rstd, sum_sq, rem_s)
+}
+
+pub fn prove_rsqrt(
+    x: &[Goldilocks],
+    rsqrt_table: &[Goldilocks],
+    m: usize,
+    d: usize,
+    n_real: usize,
+    rng: &mut impl ChallengeSource,
+) -> (RsqrtProof, Vec<u32>, Vec<Goldilocks>) {
+    let (ms, s_index, rstd, sum_sq, rem_s) = rsqrt_forward(x, rsqrt_table, m, d, n_real);
+    let d_f = Goldilocks::from_u64(n_real as u64);
+    let half_d = Goldilocks::from_u64((n_real / 2) as u64);
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    let ones_m: Vec<Goldilocks> = vec![Goldilocks::ONE; m];
+    let trunc_ch: Vec<Goldilocks> = (0..m.trailing_zeros() as usize)
+        .map(|_| rng.field())
+        .collect();
+    let trunc = prove_virtual(
+        &[&ms, &rem_s, &sum_sq, &ones_m],
+        &[
+            (d_f, vec![0usize]),
+            (Goldilocks::ONE, vec![1usize]),
+            (neg, vec![2usize]),
+            (neg * half_d, vec![3usize]),
+        ],
+        Goldilocks::ZERO,
+        &trunc_ch,
+    );
+    (RsqrtProof { trunc, trunc_ch }, s_index, rstd)
+}
+
+pub fn verify_rsqrt(proof: &RsqrtProof, n_real: usize) -> bool {
+    let d_f = Goldilocks::from_u64(n_real as u64);
+    let half_d = Goldilocks::from_u64((n_real / 2) as u64);
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    verify_virtual(
+        &proof.trunc,
+        &[
+            (d_f, vec![0usize]),
+            (Goldilocks::ONE, vec![1usize]),
+            (neg, vec![2usize]),
+            (neg * half_d, vec![3usize]),
+        ],
+        Goldilocks::ZERO,
+        &proof.trunc_ch,
+        &proof.trunc.final_evals,
+    )
 }
 
 #[cfg(test)]

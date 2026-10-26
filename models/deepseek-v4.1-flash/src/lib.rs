@@ -460,26 +460,29 @@ pub fn build_hc_mixes(
     d_pad: usize,
     mix_hc_pad: usize,
     rsqrt_table: usize,
-    limb_table: usize,
+    _limb_table: usize,
 ) -> usize {
-    // `RmsNorm` indexes its weight row-major over `m` rows, so the identity
-    // weight must be broadcast to `[m, d_pad]`, not a single row.
-    let ones = store.push(vec![from_i64(1 << 16); m * d_pad]);
-    let z = store.push(vec![]);
-    ops.push(Op::RmsNorm {
+    // Official `hc_mixes`: `mixes = (x @ hc_fn^T) * rsqrt`, i.e. project first
+    // and scale by the per-row rsqrt afterwards. Doing the matmul before the
+    // rsqrt avoids rounding the normalized input to Q16, which would otherwise
+    // inject ~100 Q16 of error per projection.
+    let mix_raw = store.push(vec![]);
+    ops.push(Op::MatMul { a: x4_pad, b: hc_fn_t, c: mix_raw, m, k: d_pad, n: mix_hc_pad });
+    let mix_q16 = store.push(vec![]);
+    ops.push(Op::Scale { x: mix_raw, out: mix_q16, factor: 1, shift: 16 });
+    let rstd = store.push(vec![]);
+    ops.push(Op::Rsqrt {
         x: x4_pad,
-        w: ones,
-        out: z,
+        out: rstd,
         rsqrt_table,
-        limb_table,
         m,
         d: d_pad,
         n_real: d_real,
     });
-    let mix_raw = store.push(vec![]);
-    ops.push(Op::MatMul { a: z, b: hc_fn_t, c: mix_raw, m, k: d_pad, n: mix_hc_pad });
+    let mix_scaled = store.push(vec![]);
+    ops.push(Op::BroadcastScale { x: mix_q16, scale: rstd, out: mix_scaled, h: mix_hc_pad });
     let mix = store.push(vec![]);
-    ops.push(Op::Scale { x: mix_raw, out: mix, factor: 1, shift: 16 });
+    ops.push(Op::Scale { x: mix_scaled, out: mix, factor: 1, shift: 16 });
     mix
 }
 

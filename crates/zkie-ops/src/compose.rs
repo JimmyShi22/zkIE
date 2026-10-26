@@ -20,7 +20,10 @@ use crate::layernorm_chain::{prove_layernorm_chain, verify_layernorm_chain, Laye
 use crate::gather::{gather_forward, prove_scatter_add, verify_scatter_add, ScatterAddProof};
 use crate::projection::{prove_projection, verify_projection, ProjectionProof};
 use crate::scatter::{prove_scatter, scatter_forward, verify_scatter, ScatterProof};
-use crate::rms_norm::{prove_rms_norm, rms_norm_forward, verify_rms_norm, RmsNormProof};
+use crate::rms_norm::{
+    prove_rms_norm, prove_rsqrt, rms_norm_forward, rsqrt_forward, verify_rms_norm, verify_rsqrt,
+    RmsNormProof, RsqrtProof,
+};
 use crate::rope::{prove_rope, rope_forward, verify_rope, RoPEProof};
 use crate::softmax_scaled::{
     prove_softmax_bias, prove_softmax_rounded, softmax_bias_forward, verify_softmax_bias,
@@ -908,6 +911,17 @@ pub enum Op {
         d: usize,
         n_real: usize,
     },
+    /// Per-row reciprocal square root only (`rstd = rsqrt_table[rsqrt_index(mean(x^2))]`),
+    /// without the elementwise affine. Used where a row must be scaled by its
+    /// own rsqrt *after* a matmul, which avoids rounding the normalized input.
+    Rsqrt {
+        x: T,
+        out: T,
+        rsqrt_table: T,
+        m: usize,
+        d: usize,
+        n_real: usize,
+    },
     RoPE {
         x: T,
         cos: T,
@@ -1063,6 +1077,7 @@ pub enum OpProof {
     Layernorm(LayernormChainProof),
     LayerNormCentered(LayerNormCenteredProof),
     RmsNorm(RmsNormProof),
+    Rsqrt(RsqrtProof),
     RoPE(RoPEProof),
     TopKSelect(TopKSelectProof),
     SparseIndexer(TopKSelectProof),
@@ -1247,6 +1262,7 @@ impl Op {
             Op::RmsNorm {
                 x, w, rsqrt_table, limb_table, ..
             } => vec![x, w, rsqrt_table, limb_table],
+            Op::Rsqrt { x, rsqrt_table, .. } => vec![x, rsqrt_table],
             Op::RoPE { x, cos, sin, range_table, .. } => vec![x, cos, sin, range_table],
             Op::TopKSelect { x, .. } => vec![x],
             Op::SparseIndexer { x, .. } => vec![x],
@@ -1295,6 +1311,7 @@ impl Op {
             | Op::Layernorm { out, .. }
             | Op::LayerNormCentered { out, .. }
             | Op::RmsNorm { out, .. }
+            | Op::Rsqrt { out, .. }
             | Op::RoPE { out, .. }
             | Op::ScaleGate { out, .. } => vec![out],
             Op::MatMul { c, .. }
@@ -2120,6 +2137,10 @@ pub fn forward_ops(store: &mut Store, ops: &[Op]) {
                 );
                 store.v[out] = TensorData::Owned(o);
             }
+            Op::Rsqrt { x, out, rsqrt_table, m, d, n_real } => {
+                let (_, _, rstd, _, _) = rsqrt_forward(store.get(x), store.get(rsqrt_table), m, d, n_real);
+                store.v[out] = TensorData::Owned(rstd);
+            }
             Op::RoPE {
                 x,
                 cos,
@@ -2672,6 +2693,19 @@ pub fn prove_shard_precomputed(
                 claims.push((w, p.r_out.clone(), mle::eval(store.get(w), &p.r_out)));
                 op_proofs.push(OpProof::RmsNorm(p));
             }
+            Op::Rsqrt { x, out, rsqrt_table, m, d, n_real } => {
+                let (p, ridx, rvals) =
+                    prove_rsqrt(store.get(x), store.get(rsqrt_table), m, d, n_real, rng);
+                lookup_by_table
+                    .entry(rsqrt_table)
+                    .or_insert(Vec::new())
+                    .push((ridx, rvals));
+                let r: Vec<Goldilocks> = (0..m.trailing_zeros() as usize)
+                    .map(|_| rng.field())
+                    .collect();
+                claims.push((out, r.clone(), mle::eval(store.get(out), &r)));
+                op_proofs.push(OpProof::Rsqrt(p));
+            }
             Op::RoPE {
                 x,
                 cos,
@@ -3022,6 +3056,11 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
             }
             (Op::RmsNorm { n_real, .. }, OpProof::RmsNorm(p)) => {
                 if !verify_rms_norm(p, *n_real) {
+                    return false;
+                }
+            }
+            (Op::Rsqrt { n_real, .. }, OpProof::Rsqrt(p)) => {
+                if !verify_rsqrt(p, *n_real) {
                     return false;
                 }
             }
