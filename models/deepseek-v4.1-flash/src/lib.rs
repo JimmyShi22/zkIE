@@ -202,6 +202,35 @@ pub fn build_sparse_indexer_reindex(
     (gate, sorted)
 }
 
+/// HyperConnection sublayer wrap for a precomputed `mixes` tensor. The sublayer
+/// is currently the identity (`y' = y`); attention/FFN sublayers are inserted
+/// between `HyperPre` and `HyperPost` by the full block builder.
+pub fn build_hyperconnection_mix(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    x: usize,
+    mixes: usize,
+    scale: usize,
+    base: usize,
+    m: usize,
+    hc: usize,
+    d: usize,
+    iters: usize,
+    eps: i64,
+) -> usize {
+    let pre = store.push(vec![]);
+    let post = store.push(vec![]);
+    let comb = store.push(vec![]);
+    ops.push(Op::SinkhornSplit { mixes, scale, base, pre, post, comb, m, hc, iters, eps });
+    let y = store.push(vec![]);
+    ops.push(Op::HyperPre { x, pre, out: y, m, hc, d });
+    // Identity sublayer for this slice; replace with attention/FFN output.
+    let y2 = y;
+    let out = store.push(vec![]);
+    ops.push(Op::HyperPost { y: y2, residual: x, post, comb, out, m, hc, d });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +270,25 @@ mod tests {
         assert!(verify_shard(&store.owned_slices(), &ops, &proof));
         assert_eq!(store.idx[sorted].len(), m * 2);
         assert_eq!(store.get(gate).len(), m * n);
+    }
+
+    #[test]
+    fn hyperconnection_mix_roundtrip() {
+        let m = 1usize;
+        let hc = 4usize;
+        let d = 2usize;
+        let mix_hc = (2 + hc) * hc;
+        let mut store = Store::new();
+        let mut ops = Vec::new();
+        let x = store.push((0..m * hc * d).map(|i| from_i64((i as i64 + 1) << 16)).collect::<Vec<_>>());
+        let mixes = store.push((0..m * mix_hc).map(|i| from_i64((i as i64 + 1) * 100)).collect::<Vec<_>>());
+        let scale = store.push((0..3).map(|i| from_i64(65536 / (i as i64 + 1))).collect::<Vec<_>>());
+        let base = store.push((0..mix_hc).map(|i| from_i64(i as i64 * 10)).collect::<Vec<_>>());
+        let out = build_hyperconnection_mix(&mut store, &mut ops, x, mixes, scale, base, m, hc, d, 20, 1);
+        let mut rng = XorShift64::new(11);
+        let proof = prove_shard(&mut store, &ops, &[], &mut rng);
+        assert!(verify_shard(&store.owned_slices(), &ops, &proof));
+        assert_eq!(store.get(out).len(), m * hc * d);
     }
 }
 
