@@ -725,6 +725,14 @@ pub enum Op {
         iters: usize,
         eps: i64,
     },
+    HyperPre {
+        x: T,
+        pre: T,
+        out: T,
+        m: usize,
+        hc: usize,
+        d: usize,
+    },
     Scale {
         x: T,
         out: T,
@@ -971,6 +979,7 @@ pub enum OpProof {
     SelToIndices,
     CandidateBlocks,
     SinkhornSplit,
+    HyperPre,
     Scale,
     ScaleVec,
     Relu,
@@ -1144,6 +1153,7 @@ impl Op {
             Op::SelToIndices { sel, .. } => vec![sel],
             Op::CandidateBlocks { x, .. } => vec![x],
             Op::SinkhornSplit { mixes, scale, base, .. } => vec![mixes, scale, base],
+            Op::HyperPre { x, pre, .. } => vec![x, pre],
             Op::Scale { x, .. } => vec![x],
             Op::ScaleVec { x, scale, .. } => vec![x, scale],
             Op::Relu { x, .. } => vec![x],
@@ -1206,6 +1216,7 @@ impl Op {
             | Op::CandidateBlocks { out, .. }
             => vec![out],
             Op::SinkhornSplit { pre, post, comb, .. } => vec![pre, post, comb],
+            Op::HyperPre { out, .. } => vec![out],
             | Op::Scale { out, .. }
             | Op::ScaleVec { out, .. }
             | Op::Relu { out, .. }
@@ -1526,6 +1537,21 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 store.v[pre] = TensorData::Owned(pre_v);
                 store.v[post] = TensorData::Owned(post_v);
                 store.v[comb] = TensorData::Owned(comb_v);
+            }
+            Op::HyperPre { x, pre, out, m, hc, d } => {
+                let xv = store.get(x);
+                let pv = store.get(pre);
+                let mut o = Vec::with_capacity(m * d);
+                for i in 0..m {
+                    for j in 0..d {
+                        let mut s = 0i64;
+                        for h in 0..hc {
+                            s += to_i64(xv[(i * hc + h) * d + j]) * to_i64(pv[i * hc + h]);
+                        }
+                        o.push(from_i64(round_div(s, 1i64 << 16)));
+                    }
+                }
+                store.v[out] = TensorData::Owned(o);
             }
             Op::Scale {
                 x,
@@ -2032,6 +2058,9 @@ pub fn prove_shard_precomputed(
             }
             Op::SinkhornSplit { .. } => {
                 op_proofs.push(OpProof::SinkhornSplit);
+            }
+            Op::HyperPre { .. } => {
+                op_proofs.push(OpProof::HyperPre);
             }
             Op::Scale { .. } => {
                 op_proofs.push(OpProof::Scale);
@@ -2613,6 +2642,7 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
             (Op::SelToIndices { .. }, OpProof::SelToIndices) => {}
             (Op::CandidateBlocks { .. }, OpProof::CandidateBlocks) => {}
             (Op::SinkhornSplit { .. }, OpProof::SinkhornSplit) => {}
+            (Op::HyperPre { .. }, OpProof::HyperPre) => {}
             (Op::Scale { .. }, OpProof::Scale) => {}
             (Op::ScaleVec { .. }, OpProof::ScaleVec) => {}
             (Op::Scatter { m, n, .. }, OpProof::Scatter(p)) => {
@@ -7203,6 +7233,7 @@ mod tests {
             | OpProof::SelToIndices
             | OpProof::CandidateBlocks
             | OpProof::SinkhornSplit
+            | OpProof::HyperPre
             | OpProof::Scale
             | OpProof::ScaleVec
             | OpProof::ScaleGate
@@ -7251,6 +7282,7 @@ mod tests {
             OpProof::SelToIndices,
             OpProof::CandidateBlocks,
             OpProof::SinkhornSplit,
+            OpProof::HyperPre,
             OpProof::Scale,
             OpProof::ScaleVec,
             OpProof::ScaleGate,
@@ -7265,7 +7297,7 @@ mod tests {
         ];
         assert_eq!(
             unproven.len(),
-            19,
+            20,
             "the set of ops with no proof of their own changed; see the succinct-verification thread before adjusting"
         );
         for p in &unproven {
