@@ -98,3 +98,32 @@ layer14 的 Engram：
 3. 门控是 `e` 与 `q/k` 的内积/softmax，复用现有注意力算子。
 
 建议先做 hash 的 CPU 参考和表读取路径，再决定 lookup 原语的 stream/batch 粒度。
+
+# CSA2 / CED 40 层接线设计
+
+## 共享 KV / index
+
+- `kv_source_layers = [2,8,14,20]` 各自压缩并写 `compress_kv_cache`。
+- 非 source 层读共享 cache，不重复证明压缩。
+- 证明时把 cache 作为边界张量跨层绑定，避免每个 layer 重复提交同一份 KV。
+
+## CED（第 20 层全局 KV 投影）
+
+第 20 层既是 kv source 又是 candidate source，需要：
+
+1. 用 `Compressor` 产生 latent。
+2. 用 `Indexer`（Full 模式）产生 candidate pool。
+3. 写回共享 cache，供后续层 Reindex 使用。
+
+## 层边界 shard
+
+40 层按 layer 边界切 shard，已具备
+`prove_committed_shard_dag_with_ranges`。每层内部的 attention / FFN / HC / Engram
+各自是一个 shard 的 op 序列，跨层用 boundary commitment 绑定残差流。
+
+# seq16 / seq512 端到端计划
+
+1. seq16 先跑：层0 attention + FFN 的完整层输出和 `v41_ref_cpu.py` 对齐。
+2. 再跑 40 层：先 Full-attention 的早期层，再接入 compressed/CSA2 层。
+3. seq512 只是把 `m` 放大，`ops_per_shard` 和 proof size/RSS 重新测量。
+4. 验收：`argmax=16/16`（seq16）、`verify=true`、记录 commit/prove/verify/RSS/proof size。
