@@ -2241,6 +2241,8 @@ pub fn build_v41_forward(
     sqrt_softplus_table: usize,
     silu_table: usize,
     clip_table: usize,
+    gate_table: usize,
+    hash_ids: &[u32],
 ) -> (usize, usize) {
     let hc = HC_MULT;
     let x4 = expand_to_hc(store, ops, x, m, hc, DIM_PAD);
@@ -2249,6 +2251,33 @@ pub fn build_v41_forward(
     let mut compress_kv: Option<usize> = None;
 
     for layer in 0..n_layers.min(N_LAYERS) {
+        // Engram writes into the HC residual before the block.
+        if layer == 1 || layer == 14 {
+            let eng_shard = open_shard(&format!(
+                "{dir}/model-{:05}-of-00048.safetensors",
+                if layer == 1 { 47 } else { 48 }
+            ));
+            let col0 = if layer == 1 { 0 } else { ENGRAM_N_HASH };
+            let mut layer_hash = Vec::with_capacity(m * ENGRAM_N_HASH);
+            for i in 0..m {
+                for j in 0..ENGRAM_N_HASH {
+                    layer_hash.push(hash_ids[i * (2 * ENGRAM_N_HASH) + col0 + j]);
+                }
+            }
+            x4 = build_engram(
+                store,
+                ops,
+                eng_shard,
+                layer,
+                x4,
+                m,
+                &layer_hash,
+                shift,
+                rsqrt_table,
+                limb_table,
+                gate_table,
+            );
+        }
         let ratio = compress_ratio(layer);
         let file = open_shard(&layer_shard(dir, layer));
         let (cos, sin) = build_rope_tables(store, m, HEAD_QK);

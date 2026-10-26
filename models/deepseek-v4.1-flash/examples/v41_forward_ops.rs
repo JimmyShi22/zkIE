@@ -11,6 +11,14 @@ fn load_i32(path: &str) -> Vec<Goldilocks> {
         .collect()
 }
 
+fn load_i32_raw(path: &str) -> Vec<i32> {
+    std::fs::read(path)
+        .unwrap()
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
 fn main() {
     let dir = std::env::args()
         .nth(1)
@@ -37,6 +45,9 @@ fn main() {
     let sqrt_sp = store.push(load_i32("/data/zkIE/models/sqrt_softplus_table_i32.bin"));
     let silu = store.push(load_i32("/data/zkIE/models/silu_clipped_table_i32.bin"));
     let clip = store.push(load_i32("/data/zkIE/models/clip_m10_p10_table_i32.bin"));
+    let gate_table = store.push(load_i32("/data/zkIE/models/engram_gate_table_i32.bin"));
+    let hash_ids = load_i32_raw("/data/zkIE/models/deepseek-v4.1-flash/cache/engram/hash_ids_i32.bin");
+    let hash_ids: Vec<u32> = hash_ids.into_iter().map(|v| v as u32).collect();
     let x = store.push(vec![from_i64(1 << 16); m * DIM_PAD]);
 
     let (x4, _pre_mix) = build_v41_forward(
@@ -54,6 +65,8 @@ fn main() {
         sqrt_sp,
         silu,
         clip,
+        gate_table,
+        &hash_ids,
     );
 
     forward_ops(&mut store, &ops);
