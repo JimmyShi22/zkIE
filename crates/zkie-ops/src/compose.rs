@@ -1462,7 +1462,10 @@ pub fn forward_shard(store: &mut Store, ops: &[Op], shard: std::ops::Range<usize
     }
 }
 
-fn forward_ops(store: &mut Store, ops: &[Op]) {
+/// Execute every op and materialize its outputs into `store`. This is the
+/// witness-generation half of `prove_shard`; exposing it lets builders inspect
+/// intermediate tensors without running the (expensive) sumcheck proofs.
+pub fn forward_ops(store: &mut Store, ops: &[Op]) {
     for op in ops.iter().cloned() {
         match op {
             Op::Transpose { x, out, m, k } => {
@@ -1545,23 +1548,26 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                 let sc: Vec<f64> = store.get(scale).iter().map(|&v| to_f(v)).collect();
                 let bs: Vec<f64> = store.get(base).iter().map(|&v| to_f(v)).collect();
                 let e = eps as f64 / 65536.0;
-                let mix_hc = (2 + hc) * hc;
+                // `mixes` may arrive either unpadded (`[m, mix_hc]`) or padded to
+                // a power of two (`[m, mix_hc_pad]`); derive the real row stride
+                // from the tensor length so both layouts index correctly.
+                let stride = mx.len() / m;
                 let mut pre_v = Vec::with_capacity(m * hc);
                 let mut post_v = Vec::with_capacity(m * hc);
                 let mut comb_v = Vec::with_capacity(m * hc * hc);
                 for i in 0..m {
                     for j in 0..hc {
-                        let v = sigmoid(mx[i * mix_hc + j] * sc[0] + bs[j]) + e;
+                        let v = sigmoid(mx[i * stride + j] * sc[0] + bs[j]) + e;
                         pre_v.push(from_i64((v * 65536.0).round() as i64));
                     }
                     for j in 0..hc {
-                        let v = 2.0 * sigmoid(mx[i * mix_hc + hc + j] * sc[1] + bs[hc + j]);
+                        let v = 2.0 * sigmoid(mx[i * stride + hc + j] * sc[1] + bs[hc + j]);
                         post_v.push(from_i64((v * 65536.0).round() as i64));
                     }
                     let mut c = vec![0.0; hc * hc];
                     for j in 0..hc {
                         for k in 0..hc {
-                            let idx = i * mix_hc + 2 * hc + j * hc + k;
+                            let idx = i * stride + 2 * hc + j * hc + k;
                             c[j * hc + k] = mx[idx] * sc[2] + bs[2 * hc + j * hc + k];
                         }
                     }

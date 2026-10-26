@@ -28,6 +28,13 @@ pub const SLIDING_WINDOW: usize = 128;
 pub const HC_MULT: usize = 4;
 pub const QUANT_BLOCK: usize = 32;
 pub const VOCAB: usize = 129280;
+/// MoE routed-expert scaling (`routed_scaling_factor = 1.5`) in Q16. The
+/// official `Gate.forward` multiplies the row-normalized top-k scores by this
+/// factor after normalization.
+pub const ROUTE_SCALE_Q16: i64 = 98304;
+/// `hc_eps = 1e-6` in Q16 rounds to zero (one Q16 LSB is ~1.5e-5), so the
+/// Sinkhorn split runs with `eps = 0`.
+pub const HC_EPS_Q16: i64 = 0;
 
 // Field-level matmul/MLE primitives require power-of-two tensor lengths. These
 // are the zero-padded dimensions the builder must use consistently everywhere;
@@ -223,6 +230,62 @@ fn unrope_perm_rows(m: usize, qk: usize) -> Vec<u32> {
         }
     }
     p
+}
+
+/// Expand a `[m, d]` tensor into `hc` identical copies laid out as
+/// `[m, hc, d]` (token-major, copy-major), matching the official
+/// `x.unsqueeze(2).repeat(1, 1, hc_mult, 1)` expansion.
+pub fn expand_to_hc(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    x: usize,
+    m: usize,
+    hc: usize,
+    d: usize,
+) -> usize {
+    let parts = vec![x; hc];
+    stack_rows(store, ops, &parts, m, d)
+}
+
+/// Gather the real `d_real` columns of each of the `hc` residual copies into a
+/// contiguous `[m, hc * d_real]` tensor, dropping the per-copy zero padding.
+/// `residual` is `[m, hc, d_stored]` with each copy padded to `d_stored` width.
+fn flatten_hc_real(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    residual: usize,
+    m: usize,
+    hc: usize,
+    d_real: usize,
+    d_stored: usize,
+) -> usize {
+    let mut idx = Vec::with_capacity(m * hc * d_real);
+    for i in 0..m {
+        for h in 0..hc {
+            for j in 0..d_real {
+                idx.push((i * hc * d_stored + h * d_stored + j) as u32);
+            }
+        }
+    }
+    gather(store, ops, residual, idx)
+}
+
+/// RMSNorm over the first `n_real` columns of a `[m, d_pad]` tensor with a
+/// per-row broadcast weight `w` (also `[m, d_pad]`, real entries in Q16).
+fn build_rms_norm(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    x: usize,
+    w: usize,
+    rsqrt_table: usize,
+    limb_table: usize,
+    m: usize,
+    d_pad: usize,
+    n_real: usize,
+) -> usize {
+    let out = store.push(vec![]);
+    ops.push(Op::RmsNorm { x, w, out, rsqrt_table, limb_table, m, d: d_pad, n_real });
+    out
 }
 
 /// Build `[m, n_pad]` where the first `m` columns are `mat [m, m]`, column `m`
@@ -445,8 +508,11 @@ pub fn build_moe_gate(
 
     let s_sel = store.push(vec![]);
     ops.push(Op::ScaleVec { x: s, scale: sel, out: s_sel, shift: 0 });
+    let weights_norm = store.push(vec![]);
+    ops.push(Op::SumNorm { x: s_sel, out: weights_norm, m, n });
+    // Official `Gate.forward`: `weights /= sum; weights *= route_scale`.
     let weights = store.push(vec![]);
-    ops.push(Op::SumNorm { x: s_sel, out: weights, m, n });
+    ops.push(Op::Scale { x: weights_norm, out: weights, factor: ROUTE_SCALE_Q16, shift: 16 });
     (sel, thr, weights, d1, d2)
 }
 
@@ -1007,17 +1073,17 @@ mod tests {
 /// already be materialized in the store as `[m, DIM_PAD]`. The returned `q` is
 /// `[m, N_HEADS * HEAD_DIM]` (each head laid out as `nope || rope`) and `kv` is
 /// `[m, HEAD_DIM]` (`nope || rope`).
-pub fn build_deepseek_v41(
+pub fn build_mla_qkv(
     store: &mut Store,
     ops: &mut Vec<Op>,
-    dir: &str,
+    file: Arc<SafetensorFile>,
     layer: usize,
     m: usize,
     shift: u32,
+    x: usize,
+    rsqrt_table: usize,
+    limb_table: usize,
 ) -> (usize, usize) {
-    let file = open_shard(&format!("{dir}/model-00003-of-00048.safetensors"));
-    let x = store.push(vec![from_i64(1 << 16); m * DIM_PAD]);
-
     let wq_a = push_quantized_fp8(
         store,
         file.clone(),
@@ -1037,12 +1103,6 @@ pub fn build_deepseek_v41(
         &format!("layers.{layer}.attn.wkv.scale"),
     );
 
-    let rsqrt_table = store.push(load_i32("models/gpt2/weights/rsqrt_table_i32.bin"));
-    let limb_table = store.push(
-        (0..(1usize << 16))
-            .map(|j| Goldilocks::from_u64(j as u64))
-            .collect::<Vec<_>>(),
-    );
     let q_norm_real: Vec<i64> = file
         .read_bf16(&format!("layers.{layer}.attn.q_norm.weight"))
         .iter()
@@ -1112,6 +1172,39 @@ pub fn build_deepseek_v41(
         n_real: HEAD_DIM,
     });
     (q, kvn)
+}
+
+/// Convenience wrapper for `build_mla_qkv` with an all-ones `[m, DIM_PAD]`
+/// input and locally-built `rsqrt`/limb tables. Used by the standalone
+/// attention slice examples; the full block builder calls `build_mla_qkv`
+/// directly with the normalized hidden state.
+pub fn build_deepseek_v41(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    dir: &str,
+    layer: usize,
+    m: usize,
+    shift: u32,
+) -> (usize, usize) {
+    let file = open_shard(&format!("{dir}/model-00003-of-00048.safetensors"));
+    let x = store.push(vec![from_i64(1 << 16); m * DIM_PAD]);
+    let rsqrt_table = store.push(load_i32("models/gpt2/weights/rsqrt_table_i32.bin"));
+    let limb_table = store.push(
+        (0..(1usize << 16))
+            .map(|j| Goldilocks::from_u64(j as u64))
+            .collect::<Vec<_>>(),
+    );
+    build_mla_qkv(
+        store,
+        ops,
+        file,
+        layer,
+        m,
+        shift,
+        x,
+        rsqrt_table,
+        limb_table,
+    )
 }
 
 /// Dense multi-head attention over the projected `q` / `kv` tensors, with the
@@ -1348,4 +1441,241 @@ pub fn build_oproj(
         acc = s;
     }
     acc
+}
+
+/// One-hot initial Hyper-Connection collapse: copy 0 carries the full residual,
+/// matching the official `make_identity_pre_mix`.
+pub fn build_identity_pre_mix(store: &mut Store, m: usize) -> usize {
+    let mut v = vec![Goldilocks::ZERO; m * HC_MULT];
+    for i in 0..m {
+        v[i * HC_MULT] = from_i64(1 << 16);
+    }
+    store.push(v)
+}
+
+/// Split an HC mix projection into `pre`/`post`/`comb` coefficients.
+fn build_hc_split(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    mix: usize,
+    scale: usize,
+    base: usize,
+    m: usize,
+    hc: usize,
+    iters: usize,
+    eps: i64,
+) -> (usize, usize, usize) {
+    let pre = store.push(vec![]);
+    let post = store.push(vec![]);
+    let comb = store.push(vec![]);
+    ops.push(Op::SinkhornSplit { mixes: mix, scale, base, pre, post, comb, m, hc, iters, eps });
+    (pre, post, comb)
+}
+
+/// Collapse the `hc` residual copies with the incoming `pre` coefficients.
+fn build_hc_pre(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    x4: usize,
+    pre_in: usize,
+    m: usize,
+    hc: usize,
+    d: usize,
+) -> usize {
+    let y = store.push(vec![]);
+    ops.push(Op::HyperPre { x: x4, pre: pre_in, out: y, m, hc, d });
+    y
+}
+
+/// Full Hyper-Connection block for one layer. `x4` is the `[m, HC_MULT, DIM_PAD]`
+/// residual and `pre_mix` the `[m, HC_MULT]` collapse coming from the previous
+/// layer. The attention sublayer collapses with the incoming `pre_mix`, the FFN
+/// sublayer collapses with this layer's attention `pre`, and the returned `ffn_pre`
+/// is handed to the next layer. Attention is the validated dense causal MLA path
+/// (correct for `compress_ratio == 0`, which covers layers 0, 1, 38, 39 and any
+/// `seq <= sliding_window`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_block(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    file: Arc<SafetensorFile>,
+    layer: usize,
+    m: usize,
+    shift: u32,
+    x4: usize,
+    pre_mix: usize,
+    rsqrt_table: usize,
+    limb_table: usize,
+    exp_table: usize,
+    sqrt_softplus_table: usize,
+    silu_table: usize,
+    clip_table: usize,
+) -> (usize, usize) {
+    let hc = HC_MULT;
+    let d_stored = DIM_PAD;
+    let hc_d = hc * DIM; // 20480 real flattened columns
+    let d_pad = hc_d.next_power_of_two(); // 32768
+    let mix_hc = (2 + hc) * hc; // 24
+    let mix_hc_pad = mix_hc.next_power_of_two(); // 32
+    let iters = 20usize;
+    let eps = HC_EPS_Q16;
+
+    // ---- attention sublayer: mixes -> collapse(incoming pre) -> norm -> MLA ----
+    let attn_fn_t = push_f32_transposed(
+        store,
+        file.clone(),
+        &format!("layers.{layer}.hc_attn_fn"),
+        mix_hc,
+        hc_d,
+    );
+    let attn_base = push_f32_vec(store, file.clone(), &format!("layers.{layer}.hc_attn_base"));
+    let attn_scale = push_f32_vec(store, file.clone(), &format!("layers.{layer}.hc_attn_scale"));
+    let x4_flat = flatten_hc_real(store, ops, x4, m, hc, DIM, d_stored);
+    let x4_pad = pad_rows(store, ops, x4_flat, m, hc_d, d_pad);
+    let attn_mix = build_hc_mixes(
+        store,
+        ops,
+        x4_pad,
+        attn_fn_t,
+        m,
+        hc_d,
+        d_pad,
+        mix_hc_pad,
+        rsqrt_table,
+        limb_table,
+    );
+    let (attn_pre, attn_post, attn_comb) =
+        build_hc_split(store, ops, attn_mix, attn_scale, attn_base, m, hc, iters, eps);
+    let attn_in = build_hc_pre(store, ops, x4, pre_mix, m, hc, d_stored);
+
+    let attn_norm_w = {
+        let v: Vec<i64> = file
+            .read_bf16(&format!("layers.{layer}.attn_norm.weight"))
+            .iter()
+            .map(|&x| to_i64(x))
+            .collect();
+        store.push(broadcast_norm(&v, m, DIM_PAD))
+    };
+    let attn_in_norm =
+        build_rms_norm(store, ops, attn_in, attn_norm_w, rsqrt_table, limb_table, m, DIM_PAD, DIM);
+
+    let (cos_t, sin_t) = build_rope_tables(store, m, HEAD_QK);
+    let (q, kv) = build_mla_qkv(
+        store,
+        ops,
+        file.clone(),
+        layer,
+        m,
+        shift,
+        attn_in_norm,
+        rsqrt_table,
+        limb_table,
+    );
+    let o = build_mla_attention(
+        store,
+        ops,
+        file.clone(),
+        layer,
+        m,
+        shift,
+        q,
+        kv,
+        cos_t,
+        sin_t,
+        exp_table,
+        limb_table,
+    );
+    let attn_out = build_oproj(store, ops, file.clone(), layer, m, shift, o);
+    let x4_attn = store.push(vec![]);
+    ops.push(Op::HyperPost {
+        y: attn_out,
+        residual: x4,
+        post: attn_post,
+        comb: attn_comb,
+        out: x4_attn,
+        m,
+        hc,
+        d: d_stored,
+    });
+
+    // ---- FFN sublayer: mixes -> collapse(attention pre) -> norm -> MoE ----
+    let ffn_fn_t = push_f32_transposed(
+        store,
+        file.clone(),
+        &format!("layers.{layer}.hc_ffn_fn"),
+        mix_hc,
+        hc_d,
+    );
+    let ffn_base = push_f32_vec(store, file.clone(), &format!("layers.{layer}.hc_ffn_base"));
+    let ffn_scale = push_f32_vec(store, file.clone(), &format!("layers.{layer}.hc_ffn_scale"));
+    let x4_flat2 = flatten_hc_real(store, ops, x4_attn, m, hc, DIM, d_stored);
+    let x4_pad2 = pad_rows(store, ops, x4_flat2, m, hc_d, d_pad);
+    let ffn_mix = build_hc_mixes(
+        store,
+        ops,
+        x4_pad2,
+        ffn_fn_t,
+        m,
+        hc_d,
+        d_pad,
+        mix_hc_pad,
+        rsqrt_table,
+        limb_table,
+    );
+    let (ffn_pre, ffn_post, ffn_comb) =
+        build_hc_split(store, ops, ffn_mix, ffn_scale, ffn_base, m, hc, iters, eps);
+    let ffn_in = build_hc_pre(store, ops, x4_attn, attn_pre, m, hc, d_stored);
+
+    let ffn_norm_w = {
+        let v: Vec<i64> = file
+            .read_bf16(&format!("layers.{layer}.ffn_norm.weight"))
+            .iter()
+            .map(|&x| to_i64(x))
+            .collect();
+        store.push(broadcast_norm(&v, m, DIM_PAD))
+    };
+    let ffn_in_norm =
+        build_rms_norm(store, ops, ffn_in, ffn_norm_w, rsqrt_table, limb_table, m, DIM_PAD, DIM);
+
+    let (sel, _thr, weights, _d1, _d2) =
+        build_moe_gate(store, ops, file.clone(), layer, ffn_in_norm, m, shift, sqrt_softplus_table);
+    let shared_out = build_shared_expert(
+        store,
+        ops,
+        file.clone(),
+        layer,
+        ffn_in_norm,
+        m,
+        shift,
+        silu_table,
+        clip_table,
+    );
+    let routed_out = build_routed_experts(
+        store,
+        ops,
+        file.clone(),
+        layer,
+        ffn_in_norm,
+        sel,
+        weights,
+        m,
+        shift,
+        silu_table,
+        clip_table,
+    );
+    let ffn_out = store.push(vec![]);
+    ops.push(Op::Add { a: shared_out, b: routed_out, c: ffn_out });
+    let x4_out = store.push(vec![]);
+    ops.push(Op::HyperPost {
+        y: ffn_out,
+        residual: x4_attn,
+        post: ffn_post,
+        comb: ffn_comb,
+        out: x4_out,
+        m,
+        hc,
+        d: d_stored,
+    });
+
+    (x4_out, ffn_pre)
 }
