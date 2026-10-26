@@ -114,6 +114,10 @@ fn round_div(a: i64, b: i64) -> i64 {
     }
 }
 
+fn sigmoid(x: f64) -> f64 {
+    1.0 / (1.0 + (-x).exp())
+}
+
 fn projection_fwd(x: &[Goldilocks], step: &ProjectionStep) -> (Vec<Goldilocks>, Vec<Goldilocks>) {
     let h = crate::par::mm_par(x, &step.w, step.m, step.k, step.n, 64);
     let out: Vec<Goldilocks> = (0..step.m * step.n)
@@ -709,6 +713,18 @@ pub enum Op {
         block_size: usize,
         topk_blocks: usize,
     },
+    SinkhornSplit {
+        mixes: T,
+        scale: T,
+        base: T,
+        pre: T,
+        post: T,
+        comb: T,
+        m: usize,
+        hc: usize,
+        iters: usize,
+        eps: i64,
+    },
     Scale {
         x: T,
         out: T,
@@ -954,6 +970,7 @@ pub enum OpProof {
     SortIndices,
     SelToIndices,
     CandidateBlocks,
+    SinkhornSplit,
     Scale,
     ScaleVec,
     Relu,
@@ -1126,6 +1143,7 @@ impl Op {
             Op::SortIndices { idx, .. } => vec![idx],
             Op::SelToIndices { sel, .. } => vec![sel],
             Op::CandidateBlocks { x, .. } => vec![x],
+            Op::SinkhornSplit { mixes, scale, base, .. } => vec![mixes, scale, base],
             Op::Scale { x, .. } => vec![x],
             Op::ScaleVec { x, scale, .. } => vec![x, scale],
             Op::Relu { x, .. } => vec![x],
@@ -1186,6 +1204,8 @@ impl Op {
             | Op::SortIndices { out, .. }
             | Op::SelToIndices { out, .. }
             | Op::CandidateBlocks { out, .. }
+            => vec![out],
+            Op::SinkhornSplit { pre, post, comb, .. } => vec![pre, post, comb],
             | Op::Scale { out, .. }
             | Op::ScaleVec { out, .. }
             | Op::Relu { out, .. }
@@ -1438,6 +1458,74 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                     }
                 }
                 store.v[out] = TensorData::Owned(v);
+            }
+            Op::SinkhornSplit { mixes, scale, base, pre, post, comb, m, hc, iters, eps } => {
+                let to_f = |v: Goldilocks| to_i64(v) as f64 / 65536.0;
+                let mx: Vec<f64> = store.get(mixes).iter().map(|&v| to_f(v)).collect();
+                let sc: Vec<f64> = store.get(scale).iter().map(|&v| to_f(v)).collect();
+                let bs: Vec<f64> = store.get(base).iter().map(|&v| to_f(v)).collect();
+                let e = eps as f64 / 65536.0;
+                let mix_hc = (2 + hc) * hc;
+                let mut pre_v = Vec::with_capacity(m * hc);
+                let mut post_v = Vec::with_capacity(m * hc);
+                let mut comb_v = Vec::with_capacity(m * hc * hc);
+                for i in 0..m {
+                    for j in 0..hc {
+                        let v = sigmoid(mx[i * mix_hc + j] * sc[0] + bs[j]) + e;
+                        pre_v.push(from_i64((v * 65536.0).round() as i64));
+                    }
+                    for j in 0..hc {
+                        let v = 2.0 * sigmoid(mx[i * mix_hc + hc + j] * sc[1] + bs[hc + j]);
+                        post_v.push(from_i64((v * 65536.0).round() as i64));
+                    }
+                    let mut c = vec![0.0; hc * hc];
+                    for j in 0..hc {
+                        for k in 0..hc {
+                            let idx = i * mix_hc + 2 * hc + j * hc + k;
+                            c[j * hc + k] = mx[idx] * sc[2] + bs[2 * hc + j * hc + k];
+                        }
+                    }
+                    // row softmax + eps
+                    for j in 0..hc {
+                        let max = (0..hc).fold(f64::MIN, |a, k| a.max(c[j * hc + k]));
+                        let mut sum = 0.0;
+                        for k in 0..hc {
+                            let v = (c[j * hc + k] - max).exp();
+                            c[j * hc + k] = v;
+                            sum += v;
+                        }
+                        for k in 0..hc {
+                            c[j * hc + k] = c[j * hc + k] / sum + e;
+                        }
+                    }
+                    // col normalize + eps
+                    for k in 0..hc {
+                        let sum = (0..hc).fold(0.0, |a, j| a + c[j * hc + k]);
+                        for j in 0..hc {
+                            c[j * hc + k] /= sum + e;
+                        }
+                    }
+                    for _ in 0..iters.saturating_sub(1) {
+                        for j in 0..hc {
+                            let sum = (0..hc).fold(0.0, |a, k| a + c[j * hc + k]);
+                            for k in 0..hc {
+                                c[j * hc + k] /= sum + e;
+                            }
+                        }
+                        for k in 0..hc {
+                            let sum = (0..hc).fold(0.0, |a, j| a + c[j * hc + k]);
+                            for j in 0..hc {
+                                c[j * hc + k] /= sum + e;
+                            }
+                        }
+                    }
+                    for v in c {
+                        comb_v.push(from_i64((v * 65536.0).round() as i64));
+                    }
+                }
+                store.v[pre] = TensorData::Owned(pre_v);
+                store.v[post] = TensorData::Owned(post_v);
+                store.v[comb] = TensorData::Owned(comb_v);
             }
             Op::Scale {
                 x,
@@ -1941,6 +2029,9 @@ pub fn prove_shard_precomputed(
             }
             Op::CandidateBlocks { .. } => {
                 op_proofs.push(OpProof::CandidateBlocks);
+            }
+            Op::SinkhornSplit { .. } => {
+                op_proofs.push(OpProof::SinkhornSplit);
             }
             Op::Scale { .. } => {
                 op_proofs.push(OpProof::Scale);
@@ -2521,6 +2612,7 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
             (Op::SortIndices { .. }, OpProof::SortIndices) => {}
             (Op::SelToIndices { .. }, OpProof::SelToIndices) => {}
             (Op::CandidateBlocks { .. }, OpProof::CandidateBlocks) => {}
+            (Op::SinkhornSplit { .. }, OpProof::SinkhornSplit) => {}
             (Op::Scale { .. }, OpProof::Scale) => {}
             (Op::ScaleVec { .. }, OpProof::ScaleVec) => {}
             (Op::Scatter { m, n, .. }, OpProof::Scatter(p)) => {
@@ -7110,6 +7202,7 @@ mod tests {
             | OpProof::SortIndices
             | OpProof::SelToIndices
             | OpProof::CandidateBlocks
+            | OpProof::SinkhornSplit
             | OpProof::Scale
             | OpProof::ScaleVec
             | OpProof::ScaleGate
@@ -7157,6 +7250,7 @@ mod tests {
             OpProof::SortIndices,
             OpProof::SelToIndices,
             OpProof::CandidateBlocks,
+            OpProof::SinkhornSplit,
             OpProof::Scale,
             OpProof::ScaleVec,
             OpProof::ScaleGate,
@@ -7171,7 +7265,7 @@ mod tests {
         ];
         assert_eq!(
             unproven.len(),
-            18,
+            19,
             "the set of ops with no proof of their own changed; see the succinct-verification thread before adjusting"
         );
         for p in &unproven {
