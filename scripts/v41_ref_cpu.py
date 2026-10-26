@@ -81,10 +81,13 @@ def rms_norm(x, w, eps=1e-20):
     return x * rsqrt * w
 
 
-def rope(x, freqs):
+def rope(x, freqs, inverse=False):
     half = x.shape[-1] // 2
     xr = x.reshape(*x.shape[:-1], half, 2)
-    cos, sin = np.cos(freqs), np.sin(freqs)
+    cos = np.cos(freqs)
+    sin = np.sin(freqs)
+    if inverse:
+        sin = -sin
     out = np.empty_like(xr)
     out[..., 0] = xr[..., 0] * cos - xr[..., 1] * sin
     out[..., 1] = xr[..., 0] * sin + xr[..., 1] * cos
@@ -185,6 +188,9 @@ def main():
         topk = (end - 127).clip(0) + np.arange(m)[None, :]
         topk = np.where(topk > end, -1, topk).astype(np.int64)[None, :, :]
         o = sparse_attn(q, kv, sink, topk, head_dim ** -0.5)
+        # Official Attention.forward un-rotates the output rope tail
+        # (`apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)`).
+        o[..., -qk_rope:] = rope(o[..., -qk_rope:], freqs[None, :, None, :], inverse=True)
 
         o = o.reshape(1, m, o_groups, -1)
         wo_a = wo_a.reshape(o_groups, o_lora, -1)
@@ -193,6 +199,9 @@ def main():
         fixed = np.round(out[0] * 65536.0).astype(np.int64)
         for i in range(8):
             print(f"[{i}] {int(fixed[0, i])}")
+        print("last_token")
+        for i in range(8):
+            print(f"[{i}] {int(fixed[-1, i])}")
         return
 
     if args.mode == "attention_head0":

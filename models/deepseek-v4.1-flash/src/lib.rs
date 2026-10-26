@@ -1204,6 +1204,11 @@ pub fn build_mla_attention(
     let ktr = store.push(vec![]);
     ops.push(Op::Transpose { x: kvr_scaled, out: ktr, m, k: qk });
 
+    // Negated sine table for the output inverse RoPE. The official model
+    // conjugates the query rotation (`apply_rotary_emb(..., inverse=True)`),
+    // which in fixed point is exactly a RoPE step with `sin` negated.
+    let sin_neg = store.push(store.get(sin_t).iter().map(|&v| -v).collect::<Vec<_>>());
+
     let mut head_outs = Vec::new();
     for head in 0..N_HEADS {
         let (nope_idx, rope_idx) = head_query_indices(head, m);
@@ -1262,7 +1267,22 @@ pub fn build_mla_attention(
         ops.push(Op::Scale { x: attn_n, out: attn_n16, factor: 1, shift });
         ops.push(Op::Scale { x: attn_r, out: attn_r16, factor: 1, shift });
         let attn_n_sl = gather(store, ops, attn_n16, col_band(m, nope_pad, 0, nope));
-        let head_out = interleave2(store, ops, attn_n_sl, attn_r16, m, nope, qk);
+        // Un-rotate the attention output rope tail back to natural space, so
+        // the concatenated head output matches the official MLA convention.
+        let attn_r_perm = gather(store, ops, attn_r16, rope_perm_rows(m, qk));
+        let attn_r_unrot = store.push(vec![]);
+        ops.push(Op::RoPE {
+            x: attn_r_perm,
+            cos: cos_t,
+            sin: sin_neg,
+            out: attn_r_unrot,
+            range_table: limb_table,
+            m,
+            d: qk,
+            shift,
+        });
+        let attn_r_nat = gather(store, ops, attn_r_unrot, unrope_perm_rows(m, qk));
+        let head_out = interleave2(store, ops, attn_n_sl, attn_r_nat, m, nope, qk);
         head_outs.push(head_out);
     }
 

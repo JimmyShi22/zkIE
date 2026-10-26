@@ -67,4 +67,13 @@ fn main() {
         ops.len(),
         store.get(acc).iter().take(8).map(|&v| to_i64(v)).collect::<Vec<_>>()
     );
+    let acc_vec = store.get(acc);
+    let dim_pad = zkie_models_deepseek_v41_flash::DIM_PAD;
+    println!(
+        "ok full_attention last_token_first8={:?}",
+        acc_vec[(m - 1) * dim_pad..(m - 1) * dim_pad + 8]
+            .iter()
+            .map(|&v| to_i64(v))
+            .collect::<Vec<_>>()
+    );
 }
