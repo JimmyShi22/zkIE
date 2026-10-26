@@ -253,6 +253,33 @@ pub fn build_engram_lookup(
     out
 }
 
+/// Provable row gather: one `Lookup` per column, then concat. Each column table
+/// is a public constant, so the gather is covered by the existing lookup proof.
+pub fn build_gather_rows_proven(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    idx: usize,
+    table: usize,
+    dim: usize,
+) -> usize {
+    let vals = store.materialize(table).into_owned();
+    let rows = vals.len() / dim;
+    let mut cols = Vec::with_capacity(dim);
+    for j in 0..dim {
+        let col = (0..rows).map(|r| vals[r * dim + j]).collect::<Vec<_>>();
+        cols.push(store.push(col));
+    }
+    let mut parts = Vec::with_capacity(dim);
+    for j in 0..dim {
+        let o = store.push(vec![]);
+        ops.push(Op::Lookup { idx, out: o, table: cols[j] });
+        parts.push(o);
+    }
+    let out = store.push(vec![]);
+    ops.push(Op::Concat { parts, out });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +355,19 @@ mod tests {
         let proof = prove_shard(&mut store, &ops, &[], &mut rng);
         assert!(verify_shard(&store.owned_slices(), &ops, &proof));
         assert_eq!(store.get(out).len(), n * out_dim);
+    }
+
+    #[test]
+    fn gather_rows_proven_roundtrip() {
+        let mut store = Store::new();
+        let mut ops = Vec::new();
+        let table = store.push((0..12).map(|i| from_i64((i as i64 + 1) << 16)).collect::<Vec<_>>());
+        let idx = store.push_idx(vec![0, 2]);
+        let out = build_gather_rows_proven(&mut store, &mut ops, idx, table, 4);
+        let mut rng = XorShift64::new(13);
+        let proof = prove_shard(&mut store, &ops, &[], &mut rng);
+        assert!(verify_shard(&store.owned_slices(), &ops, &proof));
+        assert_eq!(store.get(out).len(), 2 * 4);
     }
 }
 
