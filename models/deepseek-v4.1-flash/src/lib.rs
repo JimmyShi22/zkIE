@@ -642,16 +642,54 @@ pub fn build_hyperconnection_mix(
     iters: usize,
     eps: i64,
 ) -> usize {
+    let (_pre, post, comb, y) =
+        build_hc_enter(store, ops, x, mixes, scale, base, m, hc, d, iters, eps);
+    // Identity sublayer for this slice; attention/FFN insert between enter/exit.
+    let y2 = y;
+    build_hc_exit(store, ops, y2, x, post, comb, m, hc, d)
+}
+
+/// First half of a HyperConnection sublayer: Sinkhorn-split the mixes, collapse
+/// the `hc` residual streams with `pre`, and return the collapsed `y` plus the
+/// `post`/`comb` coefficients the exit step needs.
+#[allow(clippy::too_many_arguments)]
+pub fn build_hc_enter(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    x: usize,
+    mixes: usize,
+    scale: usize,
+    base: usize,
+    m: usize,
+    hc: usize,
+    d: usize,
+    iters: usize,
+    eps: i64,
+) -> (usize, usize, usize, usize) {
     let pre = store.push(vec![]);
     let post = store.push(vec![]);
     let comb = store.push(vec![]);
     ops.push(Op::SinkhornSplit { mixes, scale, base, pre, post, comb, m, hc, iters, eps });
     let y = store.push(vec![]);
     ops.push(Op::HyperPre { x, pre, out: y, m, hc, d });
-    // Identity sublayer for this slice; replace with attention/FFN output.
-    let y2 = y;
+    (pre, post, comb, y)
+}
+
+/// Second half of a HyperConnection sublayer: expand the sublayer output `y`
+/// back into `hc` residual streams with `post`/`comb`.
+pub fn build_hc_exit(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    y: usize,
+    residual: usize,
+    post: usize,
+    comb: usize,
+    m: usize,
+    hc: usize,
+    d: usize,
+) -> usize {
     let out = store.push(vec![]);
-    ops.push(Op::HyperPost { y: y2, residual: x, post, comb, out, m, hc, d });
+    ops.push(Op::HyperPost { y, residual, post, comb, out, m, hc, d });
     out
 }
 
