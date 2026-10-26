@@ -157,10 +157,8 @@ pub fn build_sparse_indexer_full(
     let d1 = store.push(vec![]);
     let d2 = store.push(vec![]);
     ops.push(Op::TopKSelect { x: masked, sel, thr, gate, d1, d2, m, n, k: topk });
-    let sel_idx = store.push_idx(vec![]);
-    ops.push(Op::SelToIndices { sel, out: sel_idx, m, n });
     let sorted = store.push_idx(vec![]);
-    ops.push(Op::SortIndices { idx: sel_idx, out: sorted, m, n: topk });
+    ops.push(Op::SortSelected { sel, out: sorted, m, n, k: topk });
     (gate, sorted)
 }
 
@@ -195,10 +193,8 @@ pub fn build_sparse_indexer_reindex(
     let d1 = store.push(vec![]);
     let d2 = store.push(vec![]);
     ops.push(Op::TopKSelect { x: gated, sel, thr, gate, d1, d2, m, n, k: topk });
-    let sel_idx = store.push_idx(vec![]);
-    ops.push(Op::SelToIndices { sel, out: sel_idx, m, n });
     let sorted = store.push_idx(vec![]);
-    ops.push(Op::SortIndices { idx: sel_idx, out: sorted, m, n: topk });
+    ops.push(Op::SortSelected { sel, out: sorted, m, n, k: topk });
     (gate, sorted)
 }
 
