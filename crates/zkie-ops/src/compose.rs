@@ -730,6 +730,22 @@ impl Store {
             _ => panic!("materialize_expert_rows on non-expert-stack tensor"),
         }
     }
+    /// Materialize a single expert of an `ExpertStack` (for streaming weight
+    /// commitment).
+    pub fn materialize_expert_one(&self, id: T, expert_idx: usize) -> Vec<Goldilocks> {
+        match &self.v[id] {
+            TensorData::ExpertStack { experts, .. } => {
+                materialize_expert(&experts[expert_idx])
+            }
+            _ => panic!("materialize_expert_one on non-expert-stack tensor"),
+        }
+    }
+    pub fn n_experts(&self, id: T) -> usize {
+        match &self.v[id] {
+            TensorData::ExpertStack { experts, .. } => experts.len(),
+            _ => 1,
+        }
+    }
     pub fn get_mut(&mut self, id: T) -> &mut [Goldilocks] {
         match &mut self.v[id] {
             TensorData::Owned(v) => v,
@@ -1902,30 +1918,43 @@ pub fn forward_ops(store: &mut Store, ops: &[Op]) {
                 store.v[c] = TensorData::Owned(o);
             }
             Op::GatherMatMul { a, expert_of, w, c, s, k, n, n_experts } => {
-                let expert_ids = &store.idx[expert_of];
-                // Dequantize only the selected experts and remap the per-position
-                // expert ids to a dense range. The matmul result is unchanged;
-                // this just avoids materializing all `n_experts` weights during
-                // the forward pass.
-                let mut remap = std::collections::HashMap::new();
-                let mut unique: Vec<u32> = Vec::new();
-                for &e in expert_ids {
-                    if !remap.contains_key(&e) {
-                        remap.insert(e, unique.len() as u32);
-                        unique.push(e);
+                let o = if store.n_experts(w) > 1 {
+                    // Dequantize only the selected experts and remap the
+                    // per-position expert ids to a dense range. The matmul
+                    // result is unchanged; this just avoids materializing all
+                    // `n_experts` weights during the forward pass.
+                    let expert_ids = &store.idx[expert_of];
+                    let mut remap = std::collections::HashMap::new();
+                    let mut unique: Vec<u32> = Vec::new();
+                    for &e in expert_ids {
+                        if !remap.contains_key(&e) {
+                            remap.insert(e, unique.len() as u32);
+                            unique.push(e);
+                        }
                     }
-                }
-                let dense_ids: Vec<u32> = expert_ids.iter().map(|&e| remap[&e]).collect();
-                let wv = store.materialize_expert_rows(w, &unique);
-                let o = bmm::gather_matmul_forward(
-                    store.get(a),
-                    &dense_ids,
-                    &wv,
-                    s,
-                    k,
-                    n,
-                    unique.len(),
-                );
+                    let dense_ids: Vec<u32> = expert_ids.iter().map(|&e| remap[&e]).collect();
+                    let wv = store.materialize_expert_rows(w, &unique);
+                    bmm::gather_matmul_forward(
+                        store.get(a),
+                        &dense_ids,
+                        &wv,
+                        s,
+                        k,
+                        n,
+                        unique.len(),
+                    )
+                } else {
+                    let wv = store.materialize(w);
+                    bmm::gather_matmul_forward(
+                        store.get(a),
+                        &store.idx[expert_of],
+                        wv.as_ref(),
+                        s,
+                        k,
+                        n,
+                        n_experts,
+                    )
+                };
                 store.v[c] = TensorData::Owned(o);
             }
             Op::IdxBroadcast { base, out, b } => {
@@ -3613,6 +3642,11 @@ fn collect_weight_tensors(ops: &[Op]) -> Vec<T> {
             Op::RmsNorm { w, .. } => {
                 weights.insert(*w);
             }
+            Op::GatherMatMul { w, .. } | Op::BatchedMatMul { w, .. } => {
+                if !written.contains(w) {
+                    weights.insert(*w);
+                }
+            }
             _ => {}
         }
     }
@@ -3636,6 +3670,9 @@ pub struct CachedWeightBatch {
     pub security: usize,
     pub pow_bits: usize,
     pub table_ids: Vec<T>,
+    /// `Some(expert_idx)` when `table_ids[i]` is one expert of an
+    /// `ExpertStack`; `None` for a whole tensor.
+    pub expert_indices: Vec<Option<usize>>,
     pub cache_path: std::path::PathBuf,
 }
 
@@ -3652,17 +3689,33 @@ pub fn commit_model_weights(
     const SECURITY: usize = 90;
 
     let weight_tensors = collect_weight_tensors(ops);
-    let mut by_size: std::collections::BTreeMap<usize, Vec<T>> =
-        std::collections::BTreeMap::new();
+    // Expand ExpertStacks into per-expert commit units so the 552B commitment
+    // streams one expert weight at a time instead of one 12.9B-element stack.
+    let mut units: Vec<(T, Option<usize>)> = Vec::new();
     for &t in &weight_tensors {
-        let len = store.len(t);
+        let n = store.n_experts(t);
+        if n > 1 {
+            for e in 0..n {
+                units.push((t, Some(e)));
+            }
+        } else {
+            units.push((t, None));
+        }
+    }
+    let mut by_size: std::collections::BTreeMap<usize, Vec<(T, Option<usize>)>> =
+        std::collections::BTreeMap::new();
+    for &(t, e) in &units {
+        let len = match e {
+            Some(_) => store.len(t) / store.n_experts(t),
+            None => store.len(t),
+        };
         // WHIR folding factor is 5, so a tensor shorter than 2^5 cannot be
         // folded; skip such tiny weights (they are negligible and have no
         // meaningful commitment).
         if len < 32 {
             continue;
         }
-        by_size.entry(len).or_default().push(t);
+        by_size.entry(len).or_default().push((t, e));
     }
     std::fs::create_dir_all(cache_dir).expect("create weight cache dir");
 
@@ -3690,7 +3743,10 @@ pub fn commit_model_weights(
             // largest single group instead of the whole 552B parameter set.
             let materialized: Vec<Vec<Goldilocks>> = ids
                 .iter()
-                .map(|&t| store.materialize(t).into_owned())
+                .map(|&(t, e)| match e {
+                    Some(ei) => store.materialize_expert_one(t, ei),
+                    None => store.materialize(t).into_owned(),
+                })
                 .collect();
             let refs: Vec<&[Goldilocks]> =
                 materialized.iter().map(|v| v.as_slice()).collect();
@@ -3698,7 +3754,8 @@ pub fn commit_model_weights(
             let (commitment, prover_data, _protocol, batch_whir) =
                 base_whir.commit_batch(&refs);
             let num_vars = batch_whir.num_variables();
-            let table_ids: Vec<T> = ids.to_vec();
+            let table_ids: Vec<T> = ids.iter().map(|&(t, _)| t).collect();
+            let expert_indices: Vec<Option<usize>> = ids.iter().map(|&(_, e)| e).collect();
             let cache_path = std::path::PathBuf::from(cache_dir).join(format!(
                 "weight-a{arity}-g{}.bin",
                 batches.len()
@@ -3717,6 +3774,7 @@ pub fn commit_model_weights(
                 security: SECURITY,
                 pow_bits,
                 table_ids,
+                expert_indices,
                 cache_path,
             });
         }
@@ -3918,7 +3976,11 @@ fn prove_committed_shard_dag_impl(
         let tensors: Vec<Vec<Goldilocks>> = cw
             .table_ids
             .iter()
-            .map(|&t| store.materialize(t).into_owned())
+            .zip(cw.expert_indices.iter())
+            .map(|(&t, &e)| match e {
+                Some(ei) => store.materialize_expert_one(t, ei),
+                None => store.materialize(t).into_owned(),
+            })
             .collect();
         for (i, &t) in cw.table_ids.iter().enumerate() {
             weight_locs.insert(t, (bi, i));
