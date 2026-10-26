@@ -2390,7 +2390,19 @@ pub fn prove_shard_precomputed(
             Op::Slice { .. } => {
                 op_proofs.push(OpProof::Slice);
             }
-            Op::Concat { .. } => {
+            Op::Concat { ref parts, out } => {
+                let merged: Vec<Goldilocks> =
+                    parts.iter().flat_map(|&p| store.get(p).to_vec()).collect();
+                // The verifier recomputes the merge and checks this claim. Only
+                // power-of-two merges can be claimed as an MLE; non-power-of-two
+                // merges (e.g. window + compressed KV) are the remaining
+                // relabeling cases handled by the lookup-table path.
+                if merged.len().is_power_of_two() {
+                    let r: Vec<Goldilocks> = (0..merged.len().trailing_zeros() as usize)
+                        .map(|_| rng.field())
+                        .collect();
+                    claims.push((out, r.clone(), mle::eval(&merged, &r)));
+                }
                 op_proofs.push(OpProof::Concat);
             }
             Op::CompressMask { out, m, n, ratio } => {
@@ -3070,7 +3082,21 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
                 // against that recomputed value.
             }
             (Op::Slice { .. }, OpProof::Slice) => {}
-            (Op::Concat { .. }, OpProof::Concat) => {}
+            (Op::Concat { parts, out }, OpProof::Concat) => {
+                let mut merged = Vec::new();
+                for &p in parts {
+                    merged.extend_from_slice(tables[p]);
+                }
+                if merged.len().is_power_of_two() {
+                    let ok = proof
+                        .claims
+                        .iter()
+                        .any(|(t, pt, ev)| *t == *out && *ev == mle::eval(&merged, pt));
+                    if !ok {
+                        return false;
+                    }
+                }
+            }
             (Op::CompressMask { out, m, n, ratio }, OpProof::CompressMask) => {
                 let (out, m, n, ratio) = (*out, *m, *n, *ratio);
                 let mut mask = Vec::with_capacity(m * n);
