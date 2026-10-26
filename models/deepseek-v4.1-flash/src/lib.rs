@@ -164,6 +164,44 @@ pub fn build_sparse_indexer_full(
     (gate, sorted)
 }
 
+pub fn build_sparse_indexer_reindex(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    x: usize,
+    w: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    ratio: usize,
+    block_size: usize,
+    topk_blocks: usize,
+    topk: usize,
+    shift: u32,
+) -> (usize, usize) {
+    let raw = build_quantized_matmul(store, ops, x, w, m, k, n);
+    let score = store.push(vec![]);
+    ops.push(Op::Scale { x: raw, out: score, factor: 1, shift });
+    let mask = store.push(vec![]);
+    ops.push(Op::CompressMask { out: mask, m, n, ratio });
+    let masked = store.push(vec![]);
+    ops.push(Op::Add { a: score, b: mask, c: masked });
+    let cand = store.push(vec![]);
+    ops.push(Op::CandidateBlocks { x: masked, out: cand, m, n, block_size, topk_blocks });
+    let gated = store.push(vec![]);
+    ops.push(Op::ScaleVec { x: masked, scale: cand, out: gated, shift: 0 });
+    let sel = store.push(vec![]);
+    let thr = store.push(vec![]);
+    let gate = store.push(vec![]);
+    let d1 = store.push(vec![]);
+    let d2 = store.push(vec![]);
+    ops.push(Op::TopKSelect { x: gated, sel, thr, gate, d1, d2, m, n, k: topk });
+    let sel_idx = store.push_idx(vec![]);
+    ops.push(Op::SelToIndices { sel, out: sel_idx, m, n });
+    let sorted = store.push_idx(vec![]);
+    ops.push(Op::SortIndices { idx: sel_idx, out: sorted, m, n: topk });
+    (gate, sorted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +224,23 @@ mod tests {
         assert!(verify_shard(&store.owned_slices(), &ops, &proof));
         assert_eq!(store.get(gate).len(), m * n);
         assert_eq!(store.idx[sorted].len(), m * 2);
+    }
+
+    #[test]
+    fn sparse_indexer_reindex_roundtrip() {
+        let m = 2usize;
+        let k = 2usize;
+        let n = 4usize;
+        let mut store = Store::new();
+        let mut ops = Vec::new();
+        let x = store.push(vec![from_i64(1 << 16); m * k]);
+        let w = store.push((0..n * k).map(|i| from_i64((i as i64 + 1) << 16)).collect::<Vec<_>>());
+        let (gate, sorted) = build_sparse_indexer_reindex(&mut store, &mut ops, x, w, m, k, n, 1, 2, 1, 2, 16);
+        let mut rng = XorShift64::new(8);
+        let proof = prove_shard(&mut store, &ops, &[], &mut rng);
+        assert!(verify_shard(&store.owned_slices(), &ops, &proof));
+        assert_eq!(store.idx[sorted].len(), m * 2);
+        assert_eq!(store.get(gate).len(), m * n);
     }
 }
 
