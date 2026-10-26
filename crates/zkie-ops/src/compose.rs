@@ -22,7 +22,10 @@ use crate::projection::{prove_projection, verify_projection, ProjectionProof};
 use crate::scatter::{prove_scatter, scatter_forward, verify_scatter, ScatterProof};
 use crate::rms_norm::{prove_rms_norm, rms_norm_forward, verify_rms_norm, RmsNormProof};
 use crate::rope::{prove_rope, rope_forward, verify_rope, RoPEProof};
-use crate::softmax_scaled::{prove_softmax_rounded, verify_softmax_rounded, SoftmaxRoundedProof};
+use crate::softmax_scaled::{
+    prove_softmax_bias, prove_softmax_rounded, softmax_bias_forward, verify_softmax_bias,
+    verify_softmax_rounded, SoftmaxBiasProof, SoftmaxRoundedProof,
+};
 use crate::topk::{argmax_forward, prove_argmax, prove_topk, topk_forward, verify_argmax, verify_topk, ArgmaxProof, TopKSelectProof};
 use rayon::prelude::*;
 use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
@@ -735,6 +738,13 @@ pub enum Op {
         m: usize,
         n: usize,
     },
+    SoftmaxBias {
+        e: T,
+        bias: T,
+        out: T,
+        m: usize,
+        n: usize,
+    },
     SoftmaxIndex {
         x: T,
         out: T,
@@ -910,6 +920,7 @@ pub enum OpProof {
     Add(VirtualProof, Vec<Goldilocks>),
     Lookup,
     Softmax(SoftmaxRoundedProof),
+    SoftmaxBias(SoftmaxBiasProof),
     SoftmaxIndex,
     GeluIndex,
     StableSoftmaxIndex,
@@ -1064,6 +1075,7 @@ impl Op {
             Op::Add { a, b, .. } => vec![a, b],
             Op::Lookup { idx, table, .. } => vec![idx, table],
             Op::Softmax { idx, table, .. } => vec![idx, table],
+            Op::SoftmaxBias { e, bias, .. } => vec![e, bias],
             Op::SoftmaxIndex { x, .. } => vec![x],
             Op::GeluIndex { x, .. } => vec![x],
             Op::StableSoftmaxIndex { x, mask, .. } => vec![x, mask],
@@ -1124,6 +1136,7 @@ impl Op {
             | Op::Add { c, .. } => vec![c],
             Op::Projection { out, rem, .. } => vec![out, rem],
             Op::Softmax { e, out, .. } => vec![e, out],
+            Op::SoftmaxBias { out, .. } => vec![out],
             Op::TopKSelect {
                 sel,
                 thr,
@@ -1521,6 +1534,10 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                     })
                     .collect();
                 store.v[e] = TensorData::Owned(ev);
+                store.v[out] = TensorData::Owned(o);
+            }
+            Op::SoftmaxBias { e, bias, out, m, n } => {
+                let (o, _sum) = softmax_bias_forward(store.get(e), store.get(bias), m, n);
                 store.v[out] = TensorData::Owned(o);
             }
             Op::SoftmaxIndex { x, out, table_len } => {
@@ -1978,6 +1995,21 @@ pub fn prove_shard_precomputed(
                     .push((store.idx[idx].clone(), store.get(e).to_vec()));
                 op_proofs.push(OpProof::Softmax(p));
             }
+            Op::SoftmaxBias { e, bias, out, m, n } => {
+                let (_, sum) = softmax_bias_forward(store.get(e), store.get(bias), m, n);
+                let p = prove_softmax_bias(
+                    store.get(e),
+                    store.get(bias),
+                    store.get(out),
+                    &sum,
+                    m,
+                    n,
+                    rng,
+                );
+                claims.push((e, p.r_scale.clone(), mle::eval(store.get(e), &p.r_scale)));
+                claims.push((out, p.r_scale.clone(), mle::eval(store.get(out), &p.r_scale)));
+                op_proofs.push(OpProof::SoftmaxBias(p));
+            }
             Op::SoftmaxIndex { .. } => {
                 op_proofs.push(OpProof::SoftmaxIndex);
             }
@@ -2340,6 +2372,11 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
             }
             (Op::Softmax { .. }, OpProof::Softmax(sp)) => {
                 if !verify_softmax_rounded(sp) {
+                    return false;
+                }
+            }
+            (Op::SoftmaxBias { .. }, OpProof::SoftmaxBias(sp)) => {
+                if !verify_softmax_bias(sp) {
                     return false;
                 }
             }
@@ -6863,6 +6900,7 @@ mod tests {
             | OpProof::Add(..)
             | OpProof::Lookup
             | OpProof::Softmax(..)
+            | OpProof::SoftmaxBias(..)
             | OpProof::Layernorm(..)
             | OpProof::LayerNormCentered(..)
             | OpProof::RmsNorm(..)
