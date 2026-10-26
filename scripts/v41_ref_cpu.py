@@ -120,7 +120,7 @@ def main():
     ap.add_argument("--m", type=int, default=1)
     ap.add_argument("--k", type=int, default=4096)
     ap.add_argument("--n", type=int, default=8192)
-    ap.add_argument("--mode", choices=["matmul", "attention", "attention_head0", "proj", "oproj", "moe_gate", "shared_expert", "routed_expert", "mlp", "block", "compressor", "embedding"], default="matmul")
+    ap.add_argument("--mode", choices=["matmul", "attention", "attention_head0", "proj", "oproj", "moe_gate", "shared_expert", "routed_expert", "mlp", "block", "compressor", "sparse_attn_full", "embedding"], default="matmul")
     ap.add_argument("--expert-id", type=int, default=240)
     ap.add_argument("--tokenizer-json", default="")
     ap.add_argument("--prompt", default="The sky is")
@@ -559,6 +559,73 @@ def main():
         latent = rms_norm(latent, norm)
         fixed = np.round(latent * 65536.0).astype(np.int64)
         print("compressor", fixed[0, :8].tolist())
+        return
+
+    if args.mode == "sparse_attn_full":
+        # Layer 2: sliding window (dense for seq16) + ratio-2 compressed KV + sink.
+        m = 16
+        dim = 5120
+        n_heads = 64
+        head_dim = 512
+        q_lora = 1280
+        qk_rope = 64
+        ratio = 2
+        window = 128
+
+        def fixed_float(w):
+            s = w * 65536.0
+            return np.where(s >= 0, np.floor(s + 0.5), np.ceil(s - 0.5)).astype(np.float64) / 65536.0
+
+        sink = np.frombuffer(t["layers.2.attn.attn_sink"]["data"], dtype="<f4").astype(np.float64)
+        q_norm = bf16_vec(t["layers.2.attn.q_norm.weight"])
+        kv_norm = bf16_vec(t["layers.2.attn.kv_norm.weight"])
+        wq_a = fixed_float(dequant_fp8_weight(t["layers.2.attn.wq_a.weight"], t["layers.2.attn.wq_a.scale"]))
+        wq_b = fixed_float(dequant_fp8_weight(t["layers.2.attn.wq_b.weight"], t["layers.2.attn.wq_b.scale"]))
+        wkv = fixed_float(dequant_fp8_weight(t["layers.2.attn.wkv.weight"], t["layers.2.attn.wkv.scale"]))
+        cwkv = bf16_vec(t["layers.2.attn.compressor.wkv.weight"]).reshape(head_dim, dim)
+        cwgate = bf16_vec(t["layers.2.attn.compressor.wgate.weight"]).reshape(head_dim, dim)
+        cnorm = bf16_vec(t["layers.2.attn.compressor.norm.weight"])
+
+        x = np.ones((m, dim), dtype=np.float64)
+        qr = rms_norm(x @ wq_a.T, q_norm)
+        q = (qr @ wq_b.T).reshape(1, m, n_heads, head_dim)
+        kv = rms_norm(x @ wkv.T, kv_norm)
+
+        pos = np.arange(m, dtype=np.float64)
+        inv = np.arange(qk_rope // 2, dtype=np.float64)
+        freqs = pos[:, None] * np.power(10000.0, -2.0 * inv / qk_rope)
+        q[..., -qk_rope:] = rope(q[..., -qk_rope:], freqs[None, :, None, :])
+        kv[..., -qk_rope:] = rope(kv[..., -qk_rope:], freqs[None, :, :])
+
+        # compressor latent (pre-RoPE), then rotate the rope tail at compressed positions.
+        groups = m // ratio
+        ckv = x @ cwkv.T
+        cscore = x @ cwgate.T
+        ckv = ckv.reshape(groups, ratio, head_dim)
+        cscore = cscore.reshape(groups, ratio, head_dim)
+        cscore = cscore - cscore.max(axis=1, keepdims=True)
+        cprob = np.exp(cscore)
+        cprob = cprob / cprob.sum(axis=1, keepdims=True)
+        latent = (ckv * cprob).sum(axis=1)
+        latent = rms_norm(latent, cnorm)
+        cpos = np.arange(groups, dtype=np.float64) * ratio
+        cfreqs = cpos[:, None] * np.power(10000.0, -2.0 * inv / qk_rope)
+        latent[..., -qk_rope:] = rope(latent[..., -qk_rope:], cfreqs[None, :, :])
+
+        kv_all = np.concatenate([kv[None], latent[None]], axis=1)  # [1, m + groups, head_dim]
+        # topk_idxs: window slots [0..m) causal, compressed slots [m..m+groups) offset.
+        end = np.arange(m)[:, None]
+        win_idxs = (end - window + 1).clip(0) + np.arange(m)[None, :]
+        win_idxs = np.where(win_idxs > end, -1, win_idxs).astype(np.int64)
+        comp_idxs = np.arange(groups)[None, :] + m
+        comp_visible = comp_idxs - m <= (end // ratio)
+        comp_idxs = np.where(comp_visible, comp_idxs, -1).astype(np.int64)
+        topk = np.concatenate([win_idxs, comp_idxs], axis=1)[None]  # [1, m, m+groups]
+
+        o = sparse_attn(q, kv_all, sink, topk, head_dim ** -0.5)
+        o[..., -qk_rope:] = rope(o[..., -qk_rope:], freqs[None, :, None, :], inverse=True)
+        fixed = np.round(o[0, 0, 0, :8] * 65536.0).astype(np.int64)
+        print("sparse_attn_full", fixed.tolist())
         return
 
     winfo = t[args.weight]
