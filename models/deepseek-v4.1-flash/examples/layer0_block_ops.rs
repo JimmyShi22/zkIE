@@ -41,6 +41,7 @@ fn main() {
     let x = store.push(vec![from_i64(1 << 16); m * DIM_PAD]);
     let x4 = expand_to_hc(&mut store, &mut ops, x, m, HC_MULT, DIM_PAD);
     let pre_mix = build_identity_pre_mix(&mut store, m);
+    let routed = std::env::var("ZKIE_NO_ROUTED").is_err();
 
     let (x4_out, ffn_pre) = build_block(
         &mut store,
@@ -49,6 +50,7 @@ fn main() {
         0,
         m,
         shift,
+        routed,
         x4,
         pre_mix,
         rsqrt_table,

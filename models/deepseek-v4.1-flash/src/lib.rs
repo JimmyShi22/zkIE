@@ -417,7 +417,9 @@ pub fn build_hc_mixes(
     rsqrt_table: usize,
     limb_table: usize,
 ) -> usize {
-    let ones = store.push(vec![from_i64(1 << 16); d_pad]);
+    // `RmsNorm` indexes its weight row-major over `m` rows, so the identity
+    // weight must be broadcast to `[m, d_pad]`, not a single row.
+    let ones = store.push(vec![from_i64(1 << 16); m * d_pad]);
     let z = store.push(vec![]);
     ops.push(Op::RmsNorm {
         x: x4_pad,
@@ -1502,6 +1504,7 @@ pub fn build_block(
     layer: usize,
     m: usize,
     shift: u32,
+    routed: bool,
     x4: usize,
     pre_mix: usize,
     rsqrt_table: usize,
@@ -1637,8 +1640,6 @@ pub fn build_block(
     let ffn_in_norm =
         build_rms_norm(store, ops, ffn_in, ffn_norm_w, rsqrt_table, limb_table, m, DIM_PAD, DIM);
 
-    let (sel, _thr, weights, _d1, _d2) =
-        build_moe_gate(store, ops, file.clone(), layer, ffn_in_norm, m, shift, sqrt_softplus_table);
     let shared_out = build_shared_expert(
         store,
         ops,
@@ -1650,21 +1651,28 @@ pub fn build_block(
         silu_table,
         clip_table,
     );
-    let routed_out = build_routed_experts(
-        store,
-        ops,
-        file.clone(),
-        layer,
-        ffn_in_norm,
-        sel,
-        weights,
-        m,
-        shift,
-        silu_table,
-        clip_table,
-    );
-    let ffn_out = store.push(vec![]);
-    ops.push(Op::Add { a: shared_out, b: routed_out, c: ffn_out });
+    let ffn_out = if routed {
+        let (sel, _thr, weights, _d1, _d2) =
+            build_moe_gate(store, ops, file.clone(), layer, ffn_in_norm, m, shift, sqrt_softplus_table);
+        let routed_out = build_routed_experts(
+            store,
+            ops,
+            file.clone(),
+            layer,
+            ffn_in_norm,
+            sel,
+            weights,
+            m,
+            shift,
+            silu_table,
+            clip_table,
+        );
+        let out = store.push(vec![]);
+        ops.push(Op::Add { a: shared_out, b: routed_out, c: out });
+        out
+    } else {
+        shared_out
+    };
     let x4_out = store.push(vec![]);
     ops.push(Op::HyperPost {
         y: ffn_out,
