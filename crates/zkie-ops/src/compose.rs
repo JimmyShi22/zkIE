@@ -756,6 +756,18 @@ pub enum Op {
         out: T,
         dim: usize,
     },
+    EngramGate {
+        x: T,
+        key: T,
+        weight: T,
+        value: T,
+        out: T,
+        m: usize,
+        hc: usize,
+        d: usize,
+        eps: i64,
+        clamp: i64,
+    },
     Scale {
         x: T,
         out: T,
@@ -1006,6 +1018,7 @@ pub enum OpProof {
     HyperPost,
     EngramHash,
     GatherRows,
+    EngramGate,
     Scale,
     ScaleVec,
     Relu,
@@ -1183,6 +1196,7 @@ impl Op {
             Op::HyperPost { y, residual, post, comb, .. } => vec![y, residual, post, comb],
             Op::EngramHash { tokens, .. } => vec![tokens],
             Op::GatherRows { idx, table, .. } => vec![idx, table],
+            Op::EngramGate { x, key, weight, value, .. } => vec![x, key, weight, value],
             Op::Scale { x, .. } => vec![x],
             Op::ScaleVec { x, scale, .. } => vec![x, scale],
             Op::Relu { x, .. } => vec![x],
@@ -1249,6 +1263,7 @@ impl Op {
             Op::HyperPost { out, .. } => vec![out],
             Op::EngramHash { out, .. } => vec![out],
             Op::GatherRows { out, .. } => vec![out],
+            Op::EngramGate { out, .. } => vec![out],
             | Op::Scale { out, .. }
             | Op::ScaleVec { out, .. }
             | Op::Relu { out, .. }
@@ -1633,6 +1648,41 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                     v.extend_from_slice(&store.get(table)[start..start + dim]);
                 }
                 store.v[out] = TensorData::Owned(v);
+            }
+            Op::EngramGate { x, key, weight, value, out, m, hc, d, eps, clamp } => {
+                let to_f = |v: Goldilocks| to_i64(v) as f64 / 65536.0;
+                let xv: Vec<f64> = store.get(x).iter().map(|&v| to_f(v)).collect();
+                let kv: Vec<f64> = store.get(key).iter().map(|&v| to_f(v)).collect();
+                let wv: Vec<f64> = store.get(weight).iter().map(|&v| to_f(v)).collect();
+                let vv: Vec<f64> = store.get(value).iter().map(|&v| to_f(v)).collect();
+                let e = eps as f64 / 65536.0;
+                let cl = clamp as f64 / 65536.0;
+                let mut o = Vec::with_capacity(m * hc * d);
+                for i in 0..m {
+                    for h in 0..hc {
+                        let mut hsum = 0.0;
+                        let mut ksum = 0.0;
+                        let mut dot = 0.0;
+                        for j in 0..d {
+                            let xvj = xv[(i * hc + h) * d + j];
+                            let kvj = kv[(i * hc + h) * d + j];
+                            let wj = wv[h * d + j];
+                            hsum += xvj * xvj;
+                            ksum += kvj * kvj;
+                            dot += xvj * wj * kvj;
+                        }
+                        let rstd = (1.0 / (hsum / d as f64 + e).sqrt())
+                            * (1.0 / (ksum / d as f64 + e).sqrt());
+                        dot = dot * rstd / (d as f64).sqrt();
+                        let sign = if dot < 0.0 { -1.0 } else { 1.0 };
+                        let gate = sigmoid(sign * dot.abs().max(cl).sqrt());
+                        for j in 0..d {
+                            let y = xv[(i * hc + h) * d + j] + gate * vv[i * d + j];
+                            o.push(from_i64((y * 65536.0).round() as i64));
+                        }
+                    }
+                }
+                store.v[out] = TensorData::Owned(o);
             }
             Op::Scale {
                 x,
@@ -2151,6 +2201,9 @@ pub fn prove_shard_precomputed(
             }
             Op::GatherRows { .. } => {
                 op_proofs.push(OpProof::GatherRows);
+            }
+            Op::EngramGate { .. } => {
+                op_proofs.push(OpProof::EngramGate);
             }
             Op::Scale { .. } => {
                 op_proofs.push(OpProof::Scale);
@@ -2736,6 +2789,7 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
             (Op::HyperPost { .. }, OpProof::HyperPost) => {}
             (Op::EngramHash { .. }, OpProof::EngramHash) => {}
             (Op::GatherRows { .. }, OpProof::GatherRows) => {}
+            (Op::EngramGate { .. }, OpProof::EngramGate) => {}
             (Op::Scale { .. }, OpProof::Scale) => {}
             (Op::ScaleVec { .. }, OpProof::ScaleVec) => {}
             (Op::Scatter { m, n, .. }, OpProof::Scatter(p)) => {
@@ -7330,6 +7384,7 @@ mod tests {
             | OpProof::HyperPost
             | OpProof::EngramHash
             | OpProof::GatherRows
+            | OpProof::EngramGate
             | OpProof::Scale
             | OpProof::ScaleVec
             | OpProof::ScaleGate
@@ -7382,6 +7437,7 @@ mod tests {
             OpProof::HyperPost,
             OpProof::EngramHash,
             OpProof::GatherRows,
+            OpProof::EngramGate,
             OpProof::Scale,
             OpProof::ScaleVec,
             OpProof::ScaleGate,
@@ -7396,7 +7452,7 @@ mod tests {
         ];
         assert_eq!(
             unproven.len(),
-            23,
+            24,
             "the set of ops with no proof of their own changed; see the succinct-verification thread before adjusting"
         );
         for p in &unproven {
