@@ -143,6 +143,67 @@ fn push_f32_padded(
     store.push(out)
 }
 
+/// Load an F32 safetensors 1-D tensor (fixed point 2^16) unpadded.
+fn push_f32_vec(store: &mut Store, file: Arc<SafetensorFile>, name: &str) -> usize {
+    store.push(file.read_f32(name))
+}
+
+/// Load an F32 safetensors matrix transposed to `[cols_pad, rows_pad]` so it
+/// can feed `MatMul` in `[k, n]` layout. `rows`/`cols` are the raw shape
+/// `[rows, cols]`.
+fn push_f32_transposed(
+    store: &mut Store,
+    file: Arc<SafetensorFile>,
+    name: &str,
+    rows: usize,
+    cols: usize,
+) -> usize {
+    let v: Vec<i64> = file.read_f32(name).iter().map(|&x| to_i64(x)).collect();
+    let rows_pad = rows.next_power_of_two();
+    let cols_pad = cols.next_power_of_two();
+    let mut out = vec![Goldilocks::ZERO; cols_pad * rows_pad];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows_pad + r] = from_i64(v[r * cols + c]);
+        }
+    }
+    store.push(out)
+}
+
+/// HyperConnection mix: `mixes = rms(x4_flat) @ hc_fn^T` (bias added inside
+/// `SinkhornSplit`). `x4_pad` is the 4-stream residual flattened and row-padded
+/// to `d_pad` (a power of two); `hc_fn_t` is `[d_pad, mix_hc_pad]`.
+pub fn build_hc_mixes(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    x4_pad: usize,
+    hc_fn_t: usize,
+    m: usize,
+    d_real: usize,
+    d_pad: usize,
+    mix_hc_pad: usize,
+    rsqrt_table: usize,
+    limb_table: usize,
+) -> usize {
+    let ones = store.push(vec![from_i64(1 << 16); d_pad]);
+    let z = store.push(vec![]);
+    ops.push(Op::RmsNorm {
+        x: x4_pad,
+        w: ones,
+        out: z,
+        rsqrt_table,
+        limb_table,
+        m,
+        d: d_pad,
+        n_real: d_real,
+    });
+    let mix_raw = store.push(vec![]);
+    ops.push(Op::MatMul { a: z, b: hc_fn_t, c: mix_raw, m, k: d_pad, n: mix_hc_pad });
+    let mix = store.push(vec![]);
+    ops.push(Op::Scale { x: mix_raw, out: mix, factor: 1, shift: 16 });
+    mix
+}
+
 /// MoE routing gate: `x -> top-k selection + normalized gate weights`.
 ///
 /// ```text
