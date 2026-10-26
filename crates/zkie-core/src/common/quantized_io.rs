@@ -232,6 +232,61 @@ impl SafetensorFile {
     }
 }
 
+/// A set of safetensors shards for one checkpoint, keyed by the HuggingFace
+/// `model.safetensors.index.json` weight map. Tensors are resolved by name
+/// across all shards; the shard files are opened once and memory-mapped, so no
+/// weight is materialized until a tensor is actually read.
+#[derive(Clone)]
+pub struct SafetensorShardSet {
+    shards: Arc<HashMap<String, Arc<SafetensorFile>>>,
+    map: Arc<HashMap<String, String>>,
+}
+
+#[derive(serde::Deserialize)]
+struct IndexWeightMap {
+    weight_map: HashMap<String, String>,
+}
+
+impl SafetensorShardSet {
+    pub fn open(dir: impl AsRef<Path>) -> std::io::Result<Self> {
+        let dir = dir.as_ref();
+        let index: IndexWeightMap = {
+            let path = dir.join("model.safetensors.index.json");
+            let text = std::fs::read_to_string(&path)?;
+            serde_json::from_str(&text).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+            })?
+        };
+        let mut shards = HashMap::new();
+        for file in index.weight_map.values() {
+            if !shards.contains_key(file) {
+                let opened = SafetensorFile::open(dir.join(file))?;
+                shards.insert(file.clone(), Arc::new(opened));
+            }
+        }
+        Ok(Self {
+            shards: Arc::new(shards),
+            map: Arc::new(index.weight_map),
+        })
+    }
+
+    /// The shard that owns `name`, for feeding the single-shard readers.
+    pub fn file(&self, name: &str) -> Arc<SafetensorFile> {
+        let file = self
+            .map
+            .get(name)
+            .unwrap_or_else(|| panic!("unknown safetensors tensor {name}"));
+        self.shards
+            .get(file)
+            .unwrap_or_else(|| panic!("shard {file} not opened"))
+            .clone()
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &String> {
+        self.map.keys()
+    }
+}
+
 fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }

@@ -120,7 +120,7 @@ def main():
     ap.add_argument("--m", type=int, default=1)
     ap.add_argument("--k", type=int, default=4096)
     ap.add_argument("--n", type=int, default=8192)
-    ap.add_argument("--mode", choices=["matmul", "attention", "attention_head0", "proj", "oproj", "moe_gate", "shared_expert", "routed_expert", "mlp", "block", "embedding"], default="matmul")
+    ap.add_argument("--mode", choices=["matmul", "attention", "attention_head0", "proj", "oproj", "moe_gate", "shared_expert", "routed_expert", "mlp", "block", "compressor", "embedding"], default="matmul")
     ap.add_argument("--expert-id", type=int, default=240)
     ap.add_argument("--tokenizer-json", default="")
     ap.add_argument("--prompt", default="The sky is")
@@ -536,6 +536,29 @@ def main():
         print("block_first8", fixed[0, 0, :8].tolist())
         print("block_last8", fixed[-1, 0, :8].tolist())
         print("ffn_pre", np.round(ffn_pre[0] * 65536.0).astype(np.int64).tolist())
+        return
+
+    if args.mode == "compressor":
+        m = 16
+        dim = 5120
+        hd = 512
+        ratio = 2
+        groups = m // ratio
+        wkv = bf16_vec(t["layers.2.attn.compressor.wkv.weight"]).reshape(hd, dim)
+        wgate = bf16_vec(t["layers.2.attn.compressor.wgate.weight"]).reshape(hd, dim)
+        norm = bf16_vec(t["layers.2.attn.compressor.norm.weight"])
+        x = np.ones((m, dim), dtype=np.float64)
+        kv = x @ wkv.T
+        score = x @ wgate.T
+        kv = kv.reshape(groups, ratio, hd)
+        score = score.reshape(groups, ratio, hd)
+        score = score - score.max(axis=1, keepdims=True)
+        probs = np.exp(score)
+        probs = probs / probs.sum(axis=1, keepdims=True)
+        latent = (kv * probs).sum(axis=1)
+        latent = rms_norm(latent, norm)
+        fixed = np.round(latent * 65536.0).astype(np.int64)
+        print("compressor", fixed[0, :8].tolist())
         return
 
     winfo = t[args.weight]

@@ -1445,6 +1445,117 @@ pub fn build_oproj(
     acc
 }
 
+/// Compressor: pool `ratio` consecutive tokens into one compressed KV latent
+/// with a learned softmax gate, then RMSNorm over `HEAD_DIM`. `ratio == 1` is a
+/// plain projection (no gate). Matches the official `Compressor.forward` for
+/// prefill (`start_pos == 0`, `seqlen % ratio == 0`). `x` is `[m, DIM_PAD]`.
+///
+/// Returns the pre-RoPE latent `[m / ratio, HEAD_DIM]` (row-major, unpadded).
+pub fn build_compressor(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    file: Arc<SafetensorFile>,
+    layer: usize,
+    x: usize,
+    m: usize,
+    ratio: usize,
+    shift: u32,
+    rsqrt_table: usize,
+    limb_table: usize,
+    exp_table: usize,
+) -> usize {
+    let hd = HEAD_DIM;
+    let groups = m / ratio;
+    let wkv_t = push_bf16_transposed(
+        store,
+        file.clone(),
+        &format!("layers.{layer}.attn.compressor.wkv.weight"),
+        hd,
+        DIM,
+    );
+    let kv_raw = store.push(vec![]);
+    ops.push(Op::MatMul { a: x, b: wkv_t, c: kv_raw, m, k: DIM_PAD, n: hd });
+    let kv = store.push(vec![]);
+    ops.push(Op::Scale { x: kv_raw, out: kv, factor: 1, shift });
+
+    let norm_w = {
+        let v: Vec<i64> = file
+            .read_bf16(&format!("layers.{layer}.attn.compressor.norm.weight"))
+            .iter()
+            .map(|&z| to_i64(z))
+            .collect();
+        store.push(broadcast_norm(&v, groups, hd))
+    };
+
+    if ratio == 1 {
+        return build_rms_norm(store, ops, kv, norm_w, rsqrt_table, limb_table, m, hd, hd);
+    }
+
+    let wgate_t = push_bf16_transposed(
+        store,
+        file.clone(),
+        &format!("layers.{layer}.attn.compressor.wgate.weight"),
+        hd,
+        DIM,
+    );
+    let score_raw = store.push(vec![]);
+    ops.push(Op::MatMul { a: x, b: wgate_t, c: score_raw, m, k: DIM_PAD, n: hd });
+    let score = store.push(vec![]);
+    ops.push(Op::Scale { x: score_raw, out: score, factor: 1, shift });
+
+    // Gather score and kv into `[groups*hd, ratio]`: row `(g, d)` holds the
+    // `ratio` in-group tokens' values for that (group, dim).
+    let mut idx = Vec::with_capacity(groups * hd * ratio);
+    for g in 0..groups {
+        for d in 0..hd {
+            for t in 0..ratio {
+                idx.push(((g * ratio + t) * hd + d) as u32);
+            }
+        }
+    }
+    let score2 = gather(store, ops, score, idx.clone());
+    let kv2 = gather(store, ops, kv, idx);
+
+    // Softmax over the in-group axis (no causal mask).
+    let zero_mask = store.push(vec![Goldilocks::ZERO; groups * hd * ratio]);
+    let sidx = store.push_idx(vec![]);
+    ops.push(Op::StableSoftmaxIndex {
+        x: score2,
+        mask: zero_mask,
+        out: sidx,
+        offset: 1 << 21,
+        table_len: 1 << 21,
+        m: groups * hd,
+        n: ratio,
+    });
+    let e = store.push(vec![]);
+    let probs = store.push(vec![]);
+    ops.push(Op::Softmax { idx: sidx, e, out: probs, table: exp_table, m: groups * hd, n: ratio });
+
+    // Pooled sum over the in-group axis. `ratio` is a power of two here, so
+    // each column can be gathered and combined with elementwise scale + add.
+    let mut pooled = store.push(vec![Goldilocks::ZERO; groups * hd]);
+    for t in 0..ratio {
+        let mut col = Vec::with_capacity(groups * hd);
+        for i in 0..groups * hd {
+            col.push((i * ratio + t) as u32);
+        }
+        let pt = gather(store, ops, probs, col.clone());
+        let kt = gather(store, ops, kv2, col);
+        let term = store.push(vec![]);
+        ops.push(Op::ScaleVec { x: kt, scale: pt, out: term, shift: 16 });
+        if t == 0 {
+            pooled = term;
+        } else {
+            let s = store.push(vec![]);
+            ops.push(Op::Add { a: pooled, b: term, c: s });
+            pooled = s;
+        }
+    }
+
+    build_rms_norm(store, ops, pooled, norm_w, rsqrt_table, limb_table, groups, hd, hd)
+}
+
 /// One-hot initial Hyper-Connection collapse: copy 0 carries the full residual,
 /// matching the official `make_identity_pre_mix`.
 pub fn build_identity_pre_mix(store: &mut Store, m: usize) -> usize {
