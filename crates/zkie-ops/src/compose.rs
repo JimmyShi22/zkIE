@@ -24,6 +24,7 @@ use crate::rms_norm::{
     prove_rms_norm, prove_rsqrt, rms_norm_forward, rsqrt_forward, verify_rms_norm, verify_rsqrt,
     RmsNormProof, RsqrtProof,
 };
+use crate::scale::{prove_scale, verify_scale, ScaleProof};
 use crate::rope::{prove_rope, rope_forward, verify_rope, RoPEProof};
 use crate::softmax_scaled::{
     prove_softmax_bias, prove_softmax_rounded, softmax_bias_forward, verify_softmax_bias,
@@ -1150,7 +1151,7 @@ pub enum OpProof {
     GatherRows,
     EngramGate,
     SortSelected(TopKSelectProof),
-    Scale,
+    Scale(ScaleProof),
     ScaleVec,
     Relu,
     MatMul(
@@ -2448,8 +2449,11 @@ pub fn prove_shard_precomputed(
                 op_proofs.push(OpProof::SortSelected(p));
                 let _ = out;
             }
-            Op::Scale { .. } => {
-                op_proofs.push(OpProof::Scale);
+            Op::Scale { x, out, factor, shift } => {
+                let p = prove_scale(store.get(x), store.get(out), factor, shift, rng);
+                claims.push((x, p.r.clone(), mle::eval(store.get(x), &p.r)));
+                claims.push((out, p.r.clone(), mle::eval(store.get(out), &p.r)));
+                op_proofs.push(OpProof::Scale(p));
             }
             Op::ScaleVec { .. } => {
                 op_proofs.push(OpProof::ScaleVec);
@@ -3082,7 +3086,11 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
                     return false;
                 }
             }
-            (Op::Scale { .. }, OpProof::Scale) => {}
+            (Op::Scale { factor, shift, .. }, OpProof::Scale(p)) => {
+                if !verify_scale(p, *factor, *shift) {
+                    return false;
+                }
+            }
             (Op::ScaleVec { .. }, OpProof::ScaleVec) => {}
             (Op::Scatter { m, n, .. }, OpProof::Scatter(p)) => {
                 if !verify_scatter(p, *m, *n) {
@@ -7721,7 +7729,6 @@ mod tests {
             | OpProof::GatherRows
             | OpProof::EngramGate
             | OpProof::SortSelected(..)
-            | OpProof::Scale
             | OpProof::ScaleVec
             | OpProof::ScaleGate
             | OpProof::Relu
@@ -7745,6 +7752,7 @@ mod tests {
             | OpProof::LayerNormCentered(..)
             | OpProof::RmsNorm(..)
             | OpProof::Rsqrt(..)
+            | OpProof::Scale(..)
             | OpProof::RoPE(..)
             | OpProof::TopKSelect(..)
             | OpProof::SparseIndexer(..)
@@ -7777,7 +7785,6 @@ mod tests {
             OpProof::GatherRows,
             OpProof::EngramGate,
             // SortSelected carries its own proof, so it is NOT in the unproven set.
-            OpProof::Scale,
             OpProof::ScaleVec,
             OpProof::ScaleGate,
             OpProof::Relu,
@@ -7791,7 +7798,7 @@ mod tests {
         ];
         assert_eq!(
             unproven.len(),
-            24,
+            23,
             "the set of ops with no proof of their own changed; see the succinct-verification thread before adjusting"
         );
         for p in &unproven {
