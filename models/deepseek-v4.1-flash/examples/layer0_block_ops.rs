@@ -43,7 +43,7 @@ fn main() {
     let pre_mix = build_identity_pre_mix(&mut store, m);
     let routed = std::env::var("ZKIE_NO_ROUTED").is_err();
 
-    let (x4_out, ffn_pre) = build_block(
+    let (x4_out, ffn_pre, _x4_attn, ffn_out) = build_block(
         &mut store,
         &mut ops,
         file,
@@ -79,6 +79,10 @@ fn main() {
     println!(
         "ffn_pre={:?}",
         store.get(ffn_pre).iter().take(4).map(|&v| to_i64(v)).collect::<Vec<_>>()
+    );
+    println!(
+        "ffn_out_first8={:?}",
+        store.get(ffn_out).iter().take(8).map(|&v| to_i64(v)).collect::<Vec<_>>()
     );
 
     if std::env::var("ZKIE_FORWARD_ONLY").is_ok() {

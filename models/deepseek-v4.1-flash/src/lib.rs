@@ -1513,7 +1513,7 @@ pub fn build_block(
     sqrt_softplus_table: usize,
     silu_table: usize,
     clip_table: usize,
-) -> (usize, usize) {
+) -> (usize, usize, usize, usize) {
     let hc = HC_MULT;
     let d_stored = DIM_PAD;
     let hc_d = hc * DIM; // 20480 real flattened columns
@@ -1685,5 +1685,5 @@ pub fn build_block(
         d: d_stored,
     });
 
-    (x4_out, ffn_pre)
+    (x4_out, ffn_pre, x4_attn, ffn_out)
 }

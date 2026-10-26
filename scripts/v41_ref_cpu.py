@@ -368,6 +368,7 @@ def main():
         topk = np.argsort(-biased, axis=1)[:, :6]
         weights = np.take_along_axis(scores, topk, axis=1)
         weights = weights / (weights.sum(axis=1, keepdims=True) + 1e-20)
+        weights = weights * 1.5
 
         sw1 = dequant_fp8_weight(t["layers.0.ffn.shared_experts.w1.weight"], t["layers.0.ffn.shared_experts.w1.scale"])
         sw2 = dequant_fp8_weight(t["layers.0.ffn.shared_experts.w2.weight"], t["layers.0.ffn.shared_experts.w2.scale"])
@@ -441,7 +442,7 @@ def main():
             return np.sum(pre[:, :, None] * x4, axis=1)
 
         def hc_post(y, residual, post, comb):
-            return post[:, :, None] * y[:, None, :] + np.einsum("mgh,mgd->mhd", comb, residual)
+            return post[:, :, None] * y[:, None, :] + np.einsum("mhg,mgd->mhd", comb, residual)
 
         sink = np.frombuffer(t["layers.0.attn.attn_sink"]["data"], dtype="<f4").astype(np.float64)
         q_norm_real = bf16_vec(t["layers.0.attn.q_norm.weight"])
@@ -528,6 +529,7 @@ def main():
         ffn_in = hc_pre(x4, attn_pre)
         ffn_in = rms_norm(ffn_in, ffn_norm_w)
         ffn_out = moe(ffn_in)
+        print("ffn_out_first8", np.round(ffn_out[0] * 65536.0).astype(np.int64).tolist()[:8])
         x4 = hc_post(ffn_out, x4, ffn_post, ffn_comb)
 
         fixed = np.round(x4 * 65536.0).astype(np.int64)
