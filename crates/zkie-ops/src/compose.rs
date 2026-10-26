@@ -683,6 +683,18 @@ pub enum Op {
         parts: Vec<T>,
         out: T,
     },
+    CompressMask {
+        out: T,
+        m: usize,
+        n: usize,
+        ratio: usize,
+    },
+    SortIndices {
+        idx: T,
+        out: T,
+        m: usize,
+        n: usize,
+    },
     Scale {
         x: T,
         out: T,
@@ -924,6 +936,8 @@ pub enum OpProof {
     Transpose,
     Slice,
     Concat,
+    CompressMask,
+    SortIndices,
     Scale,
     ScaleVec,
     Relu,
@@ -1092,6 +1106,8 @@ impl Op {
             Op::Transpose { x, .. } => vec![x],
             Op::Slice { x, .. } => vec![x],
             Op::Concat { ref parts, .. } => parts.iter().copied().collect(),
+            Op::CompressMask { .. } => vec![],
+            Op::SortIndices { idx, .. } => vec![idx],
             Op::Scale { x, .. } => vec![x],
             Op::ScaleVec { x, scale, .. } => vec![x, scale],
             Op::Relu { x, .. } => vec![x],
@@ -1148,6 +1164,8 @@ impl Op {
             Op::Transpose { out, .. }
             | Op::Slice { out, .. }
             | Op::Concat { out, .. }
+            | Op::CompressMask { out, .. }
+            | Op::SortIndices { out, .. }
             | Op::Scale { out, .. }
             | Op::ScaleVec { out, .. }
             | Op::Relu { out, .. }
@@ -1340,6 +1358,25 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                     v.extend_from_slice(store.get(p));
                 }
                 store.v[out] = TensorData::Owned(v);
+            }
+            Op::CompressMask { out, m, n, ratio } => {
+                let mut v = Vec::with_capacity(m * n);
+                for i in 0..m {
+                    let vis = ((i + 1) / ratio).min(n);
+                    for j in 0..n {
+                        v.push(if j < vis { Goldilocks::ZERO } else { from_i64(-(1i64 << 30)) });
+                    }
+                }
+                store.v[out] = TensorData::Owned(v);
+            }
+            Op::SortIndices { idx, out, m, n } => {
+                let mut v = Vec::with_capacity(m * n);
+                for i in 0..m {
+                    let mut row: Vec<u32> = store.idx[idx][i * n..(i + 1) * n].to_vec();
+                    row.sort_unstable();
+                    v.extend(row);
+                }
+                store.idx[out] = v;
             }
             Op::Scale {
                 x,
@@ -1831,6 +1868,12 @@ pub fn prove_shard_precomputed(
             }
             Op::Concat { .. } => {
                 op_proofs.push(OpProof::Concat);
+            }
+            Op::CompressMask { .. } => {
+                op_proofs.push(OpProof::CompressMask);
+            }
+            Op::SortIndices { .. } => {
+                op_proofs.push(OpProof::SortIndices);
             }
             Op::Scale { .. } => {
                 op_proofs.push(OpProof::Scale);
@@ -2407,6 +2450,8 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
             }
             (Op::Slice { .. }, OpProof::Slice) => {}
             (Op::Concat { .. }, OpProof::Concat) => {}
+            (Op::CompressMask { .. }, OpProof::CompressMask) => {}
+            (Op::SortIndices { .. }, OpProof::SortIndices) => {}
             (Op::Scale { .. }, OpProof::Scale) => {}
             (Op::ScaleVec { .. }, OpProof::ScaleVec) => {}
             (Op::Scatter { m, n, .. }, OpProof::Scatter(p)) => {
@@ -6992,6 +7037,8 @@ mod tests {
             OpProof::Transpose
             | OpProof::Slice
             | OpProof::Concat
+            | OpProof::CompressMask
+            | OpProof::SortIndices
             | OpProof::Scale
             | OpProof::ScaleVec
             | OpProof::ScaleGate
@@ -7035,6 +7082,8 @@ mod tests {
             OpProof::Transpose,
             OpProof::Slice,
             OpProof::Concat,
+            OpProof::CompressMask,
+            OpProof::SortIndices,
             OpProof::Scale,
             OpProof::ScaleVec,
             OpProof::ScaleGate,
@@ -7049,7 +7098,7 @@ mod tests {
         ];
         assert_eq!(
             unproven.len(),
-            14,
+            16,
             "the set of ops with no proof of their own changed; see the succinct-verification thread before adjusting"
         );
         for p in &unproven {
