@@ -733,6 +733,16 @@ pub enum Op {
         hc: usize,
         d: usize,
     },
+    HyperPost {
+        y: T,
+        residual: T,
+        post: T,
+        comb: T,
+        out: T,
+        m: usize,
+        hc: usize,
+        d: usize,
+    },
     Scale {
         x: T,
         out: T,
@@ -980,6 +990,7 @@ pub enum OpProof {
     CandidateBlocks,
     SinkhornSplit,
     HyperPre,
+    HyperPost,
     Scale,
     ScaleVec,
     Relu,
@@ -1154,6 +1165,7 @@ impl Op {
             Op::CandidateBlocks { x, .. } => vec![x],
             Op::SinkhornSplit { mixes, scale, base, .. } => vec![mixes, scale, base],
             Op::HyperPre { x, pre, .. } => vec![x, pre],
+            Op::HyperPost { y, residual, post, comb, .. } => vec![y, residual, post, comb],
             Op::Scale { x, .. } => vec![x],
             Op::ScaleVec { x, scale, .. } => vec![x, scale],
             Op::Relu { x, .. } => vec![x],
@@ -1217,6 +1229,7 @@ impl Op {
             => vec![out],
             Op::SinkhornSplit { pre, post, comb, .. } => vec![pre, post, comb],
             Op::HyperPre { out, .. } => vec![out],
+            Op::HyperPost { out, .. } => vec![out],
             | Op::Scale { out, .. }
             | Op::ScaleVec { out, .. }
             | Op::Relu { out, .. }
@@ -1549,6 +1562,25 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                             s += to_i64(xv[(i * hc + h) * d + j]) * to_i64(pv[i * hc + h]);
                         }
                         o.push(from_i64(round_div(s, 1i64 << 16)));
+                    }
+                }
+                store.v[out] = TensorData::Owned(o);
+            }
+            Op::HyperPost { y, residual, post, comb, out, m, hc, d } => {
+                let yv = store.get(y);
+                let rv = store.get(residual);
+                let pv = store.get(post);
+                let cv = store.get(comb);
+                let mut o = Vec::with_capacity(m * hc * d);
+                for i in 0..m {
+                    for h in 0..hc {
+                        for j in 0..d {
+                            let mut s = to_i64(yv[i * d + j]) * to_i64(pv[i * hc + h]);
+                            for g in 0..hc {
+                                s += to_i64(cv[(i * hc + h) * hc + g]) * to_i64(rv[(i * hc + g) * d + j]);
+                            }
+                            o.push(from_i64(round_div(s, 1i64 << 16)));
+                        }
                     }
                 }
                 store.v[out] = TensorData::Owned(o);
@@ -2061,6 +2093,9 @@ pub fn prove_shard_precomputed(
             }
             Op::HyperPre { .. } => {
                 op_proofs.push(OpProof::HyperPre);
+            }
+            Op::HyperPost { .. } => {
+                op_proofs.push(OpProof::HyperPost);
             }
             Op::Scale { .. } => {
                 op_proofs.push(OpProof::Scale);
@@ -2643,6 +2678,7 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
             (Op::CandidateBlocks { .. }, OpProof::CandidateBlocks) => {}
             (Op::SinkhornSplit { .. }, OpProof::SinkhornSplit) => {}
             (Op::HyperPre { .. }, OpProof::HyperPre) => {}
+            (Op::HyperPost { .. }, OpProof::HyperPost) => {}
             (Op::Scale { .. }, OpProof::Scale) => {}
             (Op::ScaleVec { .. }, OpProof::ScaleVec) => {}
             (Op::Scatter { m, n, .. }, OpProof::Scatter(p)) => {
@@ -7234,6 +7270,7 @@ mod tests {
             | OpProof::CandidateBlocks
             | OpProof::SinkhornSplit
             | OpProof::HyperPre
+            | OpProof::HyperPost
             | OpProof::Scale
             | OpProof::ScaleVec
             | OpProof::ScaleGate
@@ -7283,6 +7320,7 @@ mod tests {
             OpProof::CandidateBlocks,
             OpProof::SinkhornSplit,
             OpProof::HyperPre,
+            OpProof::HyperPost,
             OpProof::Scale,
             OpProof::ScaleVec,
             OpProof::ScaleGate,
@@ -7297,7 +7335,7 @@ mod tests {
         ];
         assert_eq!(
             unproven.len(),
-            20,
+            21,
             "the set of ops with no proof of their own changed; see the succinct-verification thread before adjusting"
         );
         for p in &unproven {
