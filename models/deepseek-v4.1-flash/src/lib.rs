@@ -139,6 +139,19 @@ fn gather(store: &mut Store, ops: &mut Vec<Op>, table: usize, idx: Vec<u32>) -> 
     out
 }
 
+/// Transpose a row-major `[m, k]` tensor into `[k, m]` via a proven `Lookup`
+/// with the public transpose index, instead of the unproven `Transpose` op.
+fn transpose_gather(store: &mut Store, ops: &mut Vec<Op>, x: usize, m: usize, k: usize) -> usize {
+    let idx = (0..k * m)
+        .map(|ji| {
+            let j = ji / m;
+            let i = ji % m;
+            (i * k + j) as u32
+        })
+        .collect::<Vec<_>>();
+    gather(store, ops, x, idx)
+}
+
 /// Stack `parts` (each `[m, d]`) into `[m, len*d]` (token-major). The input
 /// tensors are token-major `[m, d]`; the output interleaves them per token.
 fn stack_rows(store: &mut Store, ops: &mut Vec<Op>, parts: &[usize], m: usize, d: usize) -> usize {
@@ -1351,12 +1364,10 @@ pub fn build_mla_attention(
     // Key tensors for the score dot products (scaled by `scale`).
     let kvn_scaled = store.push(vec![]);
     ops.push(Op::Scale { x: kvn_pad, out: kvn_scaled, factor: scale, shift });
-    let ktn = store.push(vec![]);
-    ops.push(Op::Transpose { x: kvn_scaled, out: ktn, m, k: nope_pad });
+    let ktn = transpose_gather(store, ops, kvn_scaled, m, nope_pad);
     let kvr_scaled = store.push(vec![]);
     ops.push(Op::Scale { x: kvr_rot, out: kvr_scaled, factor: scale, shift });
-    let ktr = store.push(vec![]);
-    ops.push(Op::Transpose { x: kvr_scaled, out: ktr, m, k: qk });
+    let ktr = transpose_gather(store, ops, kvr_scaled, m, qk);
 
     // Negated sine table for the output inverse RoPE. The official model
     // conjugates the query rotation (`apply_rotary_emb(..., inverse=True)`),
@@ -1545,12 +1556,10 @@ pub fn build_mla_attention_compress(
     // Keys for scoring.
     let kvn_scaled = store.push(vec![]);
     ops.push(Op::Scale { x: kvn_full, out: kvn_scaled, factor: scale, shift });
-    let ktn = store.push(vec![]);
-    ops.push(Op::Transpose { x: kvn_scaled, out: ktn, m: n_kv_pad, k: nope_pad });
+    let ktn = transpose_gather(store, ops, kvn_scaled, n_kv_pad, nope_pad);
     let kvr_scaled = store.push(vec![]);
     ops.push(Op::Scale { x: kvr_score_full, out: kvr_scaled, factor: scale, shift });
-    let ktr = store.push(vec![]);
-    ops.push(Op::Transpose { x: kvr_scaled, out: ktr, m: n_kv_pad, k: qk });
+    let ktr = transpose_gather(store, ops, kvr_scaled, n_kv_pad, qk);
 
     // Custom causal mask: window columns 0..m (<= i), compressed columns
     // m..n_kv (<= i/ratio), KV padding columns, the sink column (always), and
