@@ -673,6 +673,16 @@ pub enum Op {
         m: usize,
         k: usize,
     },
+    Slice {
+        x: T,
+        out: T,
+        start: usize,
+        len: usize,
+    },
+    Concat {
+        parts: Vec<T>,
+        out: T,
+    },
     Scale {
         x: T,
         out: T,
@@ -901,6 +911,8 @@ pub enum Op {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum OpProof {
     Transpose,
+    Slice,
+    Concat,
     Scale,
     ScaleVec,
     Relu,
@@ -1066,6 +1078,8 @@ impl Op {
     pub fn reads(&self) -> Vec<T> {
         match *self {
             Op::Transpose { x, .. } => vec![x],
+            Op::Slice { x, .. } => vec![x],
+            Op::Concat { ref parts, .. } => parts.iter().copied().collect(),
             Op::Scale { x, .. } => vec![x],
             Op::ScaleVec { x, scale, .. } => vec![x, scale],
             Op::Relu { x, .. } => vec![x],
@@ -1119,6 +1133,8 @@ impl Op {
     pub fn writes(&self) -> Vec<T> {
         match *self {
             Op::Transpose { out, .. }
+            | Op::Slice { out, .. }
+            | Op::Concat { out, .. }
             | Op::Scale { out, .. }
             | Op::ScaleVec { out, .. }
             | Op::Relu { out, .. }
@@ -1292,6 +1308,17 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
         match op {
             Op::Transpose { x, out, m, k } => {
                 store.v[out] = TensorData::Owned(transpose(store.get(x), m, k));
+            }
+            Op::Slice { x, out, start, len } => {
+                let v = store.get(x)[start..start + len].to_vec();
+                store.v[out] = TensorData::Owned(v);
+            }
+            Op::Concat { parts, out } => {
+                let mut v = Vec::new();
+                for p in parts {
+                    v.extend_from_slice(store.get(p));
+                }
+                store.v[out] = TensorData::Owned(v);
             }
             Op::Scale {
                 x,
@@ -1759,6 +1786,12 @@ pub fn prove_shard_precomputed(
         match *op {
             Op::Transpose { .. } => {
                 op_proofs.push(OpProof::Transpose);
+            }
+            Op::Slice { .. } => {
+                op_proofs.push(OpProof::Slice);
+            }
+            Op::Concat { .. } => {
+                op_proofs.push(OpProof::Concat);
             }
             Op::Scale { .. } => {
                 op_proofs.push(OpProof::Scale);
@@ -2304,6 +2337,8 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
                 // forward_ops, and the downstream op's claim on `out` is checked
                 // against that recomputed value.
             }
+            (Op::Slice { .. }, OpProof::Slice) => {}
+            (Op::Concat { .. }, OpProof::Concat) => {}
             (Op::Scale { .. }, OpProof::Scale) => {}
             (Op::ScaleVec { .. }, OpProof::ScaleVec) => {}
             (Op::Scatter { m, n, .. }, OpProof::Scatter(p)) => {
@@ -6882,6 +6917,8 @@ mod tests {
             // `Projection` already does with `rem`. Relu and the three Index ops are
             // table functions, so they need a lookup (`logup_gkr` is already in tree).
             OpProof::Transpose
+            | OpProof::Slice
+            | OpProof::Concat
             | OpProof::Scale
             | OpProof::ScaleVec
             | OpProof::ScaleGate
@@ -6922,6 +6959,8 @@ mod tests {
     fn ops_without_their_own_proof_are_the_known_eight() {
         let unproven = [
             OpProof::Transpose,
+            OpProof::Slice,
+            OpProof::Concat,
             OpProof::Scale,
             OpProof::ScaleVec,
             OpProof::ScaleGate,
@@ -6936,7 +6975,7 @@ mod tests {
         ];
         assert_eq!(
             unproven.len(),
-            12,
+            14,
             "the set of ops with no proof of their own changed; see the succinct-verification thread before adjusting"
         );
         for p in &unproven {
