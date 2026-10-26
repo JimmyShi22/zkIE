@@ -7584,6 +7584,7 @@ mod tests {
             | OpProof::Layernorm(..)
             | OpProof::LayerNormCentered(..)
             | OpProof::RmsNorm(..)
+            | OpProof::Rsqrt(..)
             | OpProof::RoPE(..)
             | OpProof::TopKSelect(..)
             | OpProof::SparseIndexer(..)
