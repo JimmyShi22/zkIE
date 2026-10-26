@@ -59,3 +59,6 @@ attn-sink 已通过新增 `SoftmaxBias` 证明原语接入，layer0 attention �
 
 `wo_a`/`wo_b` 输出投影 op graph 已证明通过（8 groups，39 ops），合成输入下
 前 4 值与 CPU 参考一致。
+
+完整 layer0 attention = attention op graph + 输出投影 op graph，两段已分别
+证明；待合并成单条链路并做端到端数值对拍。
