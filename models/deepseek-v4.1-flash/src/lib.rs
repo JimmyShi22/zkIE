@@ -152,6 +152,24 @@ fn transpose_gather(store: &mut Store, ops: &mut Vec<Op>, x: usize, m: usize, k:
     gather(store, ops, x, idx)
 }
 
+/// Broadcast-multiply: `out[i,j] = x[i,j] * scale[i]`. Assembled from a proven
+/// `Lookup` (replicate the per-row scale) + `ScaleVec` (elementwise product),
+/// instead of the unproven `BroadcastScale`.
+fn build_broadcast_scale(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    x: usize,
+    scale: usize,
+    m: usize,
+    h: usize,
+) -> usize {
+    let idx = (0..m * h).map(|ij| (ij / h) as u32).collect::<Vec<_>>();
+    let scale_b = gather(store, ops, scale, idx);
+    let out = store.push(vec![]);
+    ops.push(Op::ScaleVec { x, scale: scale_b, out, shift: 0 });
+    out
+}
+
 /// Stack `parts` (each `[m, d]`) into `[m, len*d]` (token-major). The input
 /// tensors are token-major `[m, d]`; the output interleaves them per token.
 fn stack_rows(store: &mut Store, ops: &mut Vec<Op>, parts: &[usize], m: usize, d: usize) -> usize {
@@ -504,8 +522,7 @@ pub fn build_hc_mixes(
         d: d_pad,
         n_real: d_real,
     });
-    let mix_scaled = store.push(vec![]);
-    ops.push(Op::BroadcastScale { x: mix_q16, scale: rstd, out: mix_scaled, h: mix_hc_pad });
+    let mix_scaled = build_broadcast_scale(store, ops, mix_q16, rstd, m, mix_hc_pad);
     let mix = store.push(vec![]);
     ops.push(Op::Scale { x: mix_scaled, out: mix, factor: 1, shift: 16 });
     mix
@@ -729,8 +746,7 @@ pub fn build_routed_experts(
         mask[i] = Goldilocks::ONE;
     }
     let mask_t = store.push(mask);
-    let seg_z = store.push(vec![]);
-    ops.push(Op::BroadcastScale { x: seg, scale: mask_t, out: seg_z, h: DIM_PAD });
+    let seg_z = build_broadcast_scale(store, ops, seg, mask_t, s_pad, DIM_PAD);
 
     let g = store.push(vec![]);
     ops.push(Op::GatherMatMul {
