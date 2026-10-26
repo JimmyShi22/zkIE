@@ -54,3 +54,5 @@ layer0 attention（q_norm/kv_norm + tail RoPE + dense causal softmax，不含 si
 
 attn-sink 已通过新增 `SoftmaxBias` 证明原语接入，layer0 attention 全链路
 （含 sink）op 数 714，证明通过。
+
+下一步：`wo_a`/`wo_b` 输出投影 op graph；再往后是 MoE、HyperConnection、Engram。
