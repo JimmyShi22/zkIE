@@ -768,6 +768,13 @@ pub enum Op {
         eps: i64,
         clamp: i64,
     },
+    SortSelected {
+        sel: T,
+        out: T,
+        m: usize,
+        n: usize,
+        k: usize,
+    },
     Scale {
         x: T,
         out: T,
@@ -1019,6 +1026,7 @@ pub enum OpProof {
     EngramHash,
     GatherRows,
     EngramGate,
+    SortSelected(TopKSelectProof),
     Scale,
     ScaleVec,
     Relu,
@@ -1197,6 +1205,7 @@ impl Op {
             Op::EngramHash { tokens, .. } => vec![tokens],
             Op::GatherRows { idx, table, .. } => vec![idx, table],
             Op::EngramGate { x, key, weight, value, .. } => vec![x, key, weight, value],
+            Op::SortSelected { sel, .. } => vec![sel],
             Op::Scale { x, .. } => vec![x],
             Op::ScaleVec { x, scale, .. } => vec![x, scale],
             Op::Relu { x, .. } => vec![x],
@@ -1264,6 +1273,7 @@ impl Op {
             Op::EngramHash { out, .. } => vec![out],
             Op::GatherRows { out, .. } => vec![out],
             Op::EngramGate { out, .. } => vec![out],
+            Op::SortSelected { out, .. } => vec![out],
             | Op::Scale { out, .. }
             | Op::ScaleVec { out, .. }
             | Op::Relu { out, .. }
@@ -1683,6 +1693,29 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                     }
                 }
                 store.v[out] = TensorData::Owned(o);
+            }
+            Op::SortSelected { sel, out, m, n, k } => {
+                let selv = store.get(sel);
+                let mut x = vec![Goldilocks::ZERO; m * n];
+                for i in 0..m {
+                    for j in 0..n {
+                        x[i * n + j] = if to_i64(selv[i * n + j]) != 0 {
+                            from_i64(-(j as i64))
+                        } else {
+                            from_i64(-(1i64 << 30))
+                        };
+                    }
+                }
+                let (_thr, sel2, _gate, _d1, _d2) = topk_forward(&x, m, n, k);
+                let mut idx = Vec::with_capacity(m * k);
+                for i in 0..m {
+                    for j in 0..n {
+                        if to_i64(sel2[i * n + j]) != 0 {
+                            idx.push(j as u32);
+                        }
+                    }
+                }
+                store.idx[out] = idx;
             }
             Op::Scale {
                 x,
@@ -2204,6 +2237,24 @@ pub fn prove_shard_precomputed(
             }
             Op::EngramGate { .. } => {
                 op_proofs.push(OpProof::EngramGate);
+            }
+            Op::SortSelected { sel, out, m, n, k } => {
+                let selv = store.get(sel);
+                let mut x = vec![Goldilocks::ZERO; m * n];
+                for i in 0..m {
+                    for j in 0..n {
+                        x[i * n + j] = if to_i64(selv[i * n + j]) != 0 {
+                            from_i64(-(j as i64))
+                        } else {
+                            from_i64(-(1i64 << 30))
+                        };
+                    }
+                }
+                let (thr, sel2, gate, d1, d2) = topk_forward(&x, m, n, k);
+                let p = prove_topk(&x, &sel2, &thr, &gate, &d1, &d2, m, n, k, 22, rng);
+                claims.push((sel, p.r.clone(), mle::eval(selv, &p.r)));
+                op_proofs.push(OpProof::SortSelected(p));
+                let _ = out;
             }
             Op::Scale { .. } => {
                 op_proofs.push(OpProof::Scale);
@@ -2790,6 +2841,11 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
             (Op::EngramHash { .. }, OpProof::EngramHash) => {}
             (Op::GatherRows { .. }, OpProof::GatherRows) => {}
             (Op::EngramGate { .. }, OpProof::EngramGate) => {}
+            (Op::SortSelected { k, .. }, OpProof::SortSelected(p)) => {
+                if !verify_topk(p, *k) {
+                    return false;
+                }
+            }
             (Op::Scale { .. }, OpProof::Scale) => {}
             (Op::ScaleVec { .. }, OpProof::ScaleVec) => {}
             (Op::Scatter { m, n, .. }, OpProof::Scatter(p)) => {
@@ -7385,6 +7441,7 @@ mod tests {
             | OpProof::EngramHash
             | OpProof::GatherRows
             | OpProof::EngramGate
+            | OpProof::SortSelected(..)
             | OpProof::Scale
             | OpProof::ScaleVec
             | OpProof::ScaleGate
@@ -7438,6 +7495,7 @@ mod tests {
             OpProof::EngramHash,
             OpProof::GatherRows,
             OpProof::EngramGate,
+            // SortSelected carries its own proof, so it is NOT in the unproven set.
             OpProof::Scale,
             OpProof::ScaleVec,
             OpProof::ScaleGate,
