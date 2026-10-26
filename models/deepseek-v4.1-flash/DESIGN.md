@@ -99,6 +99,27 @@ layer14 的 Engram：
 
 建议先做 hash 的 CPU 参考和表读取路径，再决定 lookup 原语的 stream/batch 粒度。
 
+## Engram 具体参数（已核对 config / 分片）
+
+- 层：`engram_layer_ids = [1, 14]`；`max_ngram_size = 4`，`n_heads = 8`，
+  `head_dim = 256`，所以 `n_hash_cols = (4-1)*8 = 24`。
+- 表：`layers.{1,14}.engram.embed.weight` FP8 E4M3 `[384006168 | 384016682, 256]`，
+  scale E8M0 `[N, 8]`（block=32）。`wkv.weight` FP8 `[25600, 6144]`，
+  `q_weight/k_weight` BF16 `[4, 5120]`。layer 1 表在 `model-00047`，layer 14 表在 `model-00048`。
+- hash（`NgramHashState.forward`，prefill）：
+  1. `compressed = token_map[input_ids]`（token 归一化映射，需 tokenizer 预计算，
+     目标是 `engram_compressed_vocab_size = 99092`）。
+  2. 对 lookback `shift ∈ 0..4` 取 `source = compressed[pos-shift]`（越界/DEAD 用 `pad_id`）。
+  3. `products = tokens * multipliers[layer, lookback]`；`rolling` 从 shift0 起逐位
+     `xor`，每个 `i ∈ 1..4` 的 rolling 值 `% primes[layer][i-1][head]` 得到 8 个 head 的
+     hash，再加 `offsets` 得到 24 个 `hash_ids`。
+- 前向：`kv = wkv(flatten(embed[hash_ids]))`；split `key [s,4,5120]` / `value [s,5120]`；
+  `weight = q_weight*k_weight`；`dot = (h*weight*key).sum(-1) * rstd(h)*rstd(key) / sqrt(d)`；
+  `gate = sigmoid(sign(dot)*sqrt(|dot|))`；`out = h + gate*value`。
+
+注意：`embed` 表有 3.84 亿行，完整承诺是硬目标；前向只需查 `m*24` 行，但证明要
+streaming lookup 原语 + 分片提交，这块还没实现。
+
 # CSA2 / CED 40 层接线设计
 
 ## 共享 KV / index
