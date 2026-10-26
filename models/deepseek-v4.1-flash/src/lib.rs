@@ -2133,6 +2133,42 @@ pub fn build_v41_forward(
     (x4, pre_mix)
 }
 
+/// Final output head: collapse the HC stream, RMSNorm, project to logits over
+/// the vocabulary, and return `(logits, argmax_idx)`. `logits` is `[m, VOCAB_PAD]`
+/// (Q16); `argmax_idx` is the per-row argmax over the first `VOCAB` entries.
+pub fn build_final_logits(
+    store: &mut Store,
+    ops: &mut Vec<Op>,
+    dir: &str,
+    m: usize,
+    shift: u32,
+    x4: usize,
+    pre_mix: usize,
+    rsqrt_table: usize,
+    limb_table: usize,
+) -> (usize, usize) {
+    let file = open_shard(&format!("{dir}/model-00043-of-00048.safetensors"));
+    let h = build_hc_pre(store, ops, x4, pre_mix, m, HC_MULT, DIM_PAD);
+    let norm_w = {
+        let v: Vec<i64> = file.read_bf16("norm.weight").iter().map(|&x| to_i64(x)).collect();
+        store.push(broadcast_norm(&v, m, DIM_PAD))
+    };
+    let h_norm = build_rms_norm(store, ops, h, norm_w, rsqrt_table, limb_table, m, DIM_PAD, DIM);
+    let head_w = push_bf16_transposed(store, file, "head.weight", VOCAB, DIM);
+    let logits_raw = store.push(vec![]);
+    ops.push(Op::MatMul { a: h_norm, b: head_w, c: logits_raw, m, k: DIM_PAD, n: VOCAB_PAD });
+    let logits = store.push(vec![]);
+    ops.push(Op::Scale { x: logits_raw, out: logits, factor: 1, shift });
+    let argmax = store.push_idx(vec![]);
+    let sel = store.push(vec![]);
+    let thr = store.push(vec![]);
+    let gate = store.push(vec![]);
+    let d1 = store.push(vec![]);
+    let d2 = store.push(vec![]);
+    ops.push(Op::Argmax { x: logits, sel, thr, gate, d1, d2, out: argmax, m, n: VOCAB_PAD });
+    (logits, argmax)
+}
+
 /// One-hot initial Hyper-Connection collapse: copy 0 carries the full residual,
 /// matching the official `make_identity_pre_mix`.
 pub fn build_identity_pre_mix(store: &mut Store, m: usize) -> usize {

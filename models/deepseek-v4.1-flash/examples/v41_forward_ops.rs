@@ -1,6 +1,6 @@
 use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing};
 use zkie_core::common::fixed_point::{from_i64, to_i64};
-use zkie_models_deepseek_v41_flash::{build_v41_forward, DIM_PAD, HC_MULT};
+use zkie_models_deepseek_v41_flash::{build_final_logits, build_v41_forward, DIM_PAD, HC_MULT};
 use zkie_ops::compose::{forward_ops, Op, Store};
 
 fn load_i32(path: &str) -> Vec<Goldilocks> {
@@ -71,4 +71,21 @@ fn main() {
         "ok v41_forward last8={:?}",
         out[last..last + 8].iter().map(|&v| to_i64(v)).collect::<Vec<_>>()
     );
+
+    if n_layers >= 40 {
+        let (_logits, argmax) = build_final_logits(
+            &mut store,
+            &mut ops,
+            &dir,
+            m,
+            16,
+            x4,
+            _pre_mix,
+            rsqrt_table,
+            limb_table,
+        );
+        forward_ops(&mut store, &ops);
+        let am = &store.idx[argmax];
+        println!("argmax={:?}", &am[..m.min(am.len())]);
+    }
 }
