@@ -10,7 +10,7 @@
 //! the "one op per shard" case when `N == 1` (no internal binding).
 
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::layer_norm_centered::{
     layer_norm_forward as layer_norm_centered_forward, prove_layer_norm_centered,
@@ -126,6 +126,45 @@ fn round_div_i128(a: i128, b: i128) -> i128 {
         q + 1
     } else {
         q
+    }
+}
+
+/// Minimal counting semaphore used to bound the in-flight weight-group
+/// materializations during the streaming commitment. Rayon's pool bounds the
+/// number of *tasks*, but a single `commit_batch` fans out into its own nested
+/// rayon work, so the peak resident memory is bounded by a permit count rather
+/// than the thread count.
+struct Semaphore {
+    state: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl Semaphore {
+    fn new(n: usize) -> Self {
+        Semaphore { state: Mutex::new(n), cv: Condvar::new() }
+    }
+
+    fn acquire(&self) -> Permit<'_> {
+        let mut n = self.state.lock().unwrap();
+        while *n == 0 {
+            n = self.cv.wait(n).unwrap();
+        }
+        *n -= 1;
+        Permit(self)
+    }
+
+    fn release(&self) {
+        let mut n = self.state.lock().unwrap();
+        *n += 1;
+        self.cv.notify_one();
+    }
+}
+
+struct Permit<'a>(&'a Semaphore);
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        self.0.release();
     }
 }
 
@@ -4185,9 +4224,11 @@ fn prove_committed_shard_dag_impl(
     // `&self`), so the work is embarrassingly parallel; rayon's work-stealing
     // pool bounds the in-flight materializations by the thread count, keeping
     // peak memory at roughly `threads x one group` instead of the whole 552B.
+    let commit_sem = Arc::new(Semaphore::new(24));
     let weight_results: Vec<(WeightBatchCommit, WeightBatchOpening)> = (0..num_groups)
         .into_par_iter()
         .map(|bi| {
+        let _permit = commit_sem.acquire();
         let (arity, num_tables, num_vars, security, pow_bits) = match &streaming_plans {
             Some(p) => {
                 let g = &p[bi];
