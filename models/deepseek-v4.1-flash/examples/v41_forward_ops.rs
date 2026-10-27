@@ -61,7 +61,7 @@ fn main() {
         store.push(vec![from_i64(1 << 16); m * DIM_PAD])
     };
 
-    let (x4, _pre_mix, _boundaries) = build_v41_forward(
+    let (x4, pre_mix, _boundaries) = build_v41_forward(
         &mut store,
         &mut ops,
         &dir,
@@ -81,6 +81,25 @@ fn main() {
         sigmoid,
     );
 
+    // Build the output head before the (single) forward pass so `forward_ops`
+    // runs once over the whole graph instead of re-running all 40 layers.
+    let argmax = if n_layers >= 40 {
+        let (_logits, argmax) = build_final_logits(
+            &mut store,
+            &mut ops,
+            &dir,
+            m,
+            16,
+            x4,
+            pre_mix,
+            rsqrt_table,
+            limb_table,
+        );
+        argmax
+    } else {
+        store.push_idx(vec![])
+    };
+
     forward_ops(&mut store, &ops);
     let out = store.get(x4);
     println!(
@@ -98,18 +117,6 @@ fn main() {
     );
 
     if n_layers >= 40 {
-        let (_logits, argmax) = build_final_logits(
-            &mut store,
-            &mut ops,
-            &dir,
-            m,
-            16,
-            x4,
-            _pre_mix,
-            rsqrt_table,
-            limb_table,
-        );
-        forward_ops(&mut store, &ops);
         let am = &store.idx[argmax];
         println!("argmax={:?}", &am[..m.min(am.len())]);
     }
