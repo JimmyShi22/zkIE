@@ -3482,10 +3482,15 @@ pub fn prove_shard_dag(
     let mut master = Transcript::new(b"zkie-shard-dag-v1");
     absorb_statement(&mut master, ops, ops_per_shard);
 
+    // Bound the number of shards proven concurrently: each shard caches its
+    // selected experts for the MoE gather proof, so unbounded parallelism
+    // materializes many expert caches at once (~25GB each).
+    let shard_sem = Arc::new(Semaphore::new(8));
     let shards: Vec<OpShardProof> = ranges
         .par_iter()
         .enumerate()
         .map(|(si, &(s, e))| {
+            let _permit = shard_sem.acquire();
             let mut child = master.clone();
             child.absorb_u64(si as u64);
             prove_shard_precomputed(store_ref, &ops[s..e], &[], &mut child)
