@@ -17,7 +17,6 @@
 //! plus the public `eq(pos, u)` selector.
 
 use crate::common::field::{Goldilocks, PrimeCharacteristicRing};
-use crate::common::fixed_point::{from_i64, to_i64};
 use crate::common::mle;
 use crate::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
 use rayon::prelude::*;
@@ -342,23 +341,21 @@ pub fn gather_matmul_forward(
     assert_eq!(seg.len(), s * k);
     assert_eq!(expert_of.len(), s);
     assert_eq!(w_all.len(), n_experts * k * n);
-    // Fixed-point path: the FP4 expert weights and Q16 segments produce dot
-    // products far below 2^63, so accumulate in i64 in parallel instead of
-    // paying for field multiplication (the old forward's dominant cost).
-    let seg_i: Vec<i64> = seg.iter().map(|&v| to_i64(v)).collect();
-    let w_i: Vec<i64> = w_all.iter().map(|&v| to_i64(v)).collect();
-    let mut g = vec![0i64; s * n];
+    // Parallel over positions, but keep field accumulation so the result stays
+    // bit-identical to the proof path (some FP4 scales are large enough that a
+    // naive i64 accumulation would wrap).
+    let mut g = vec![Goldilocks::ZERO; s * n];
     g.par_chunks_mut(n).enumerate().for_each(|(pos, gj)| {
         let base = expert_of[pos] as usize * k * n;
         for j in 0..n {
-            let mut acc = 0i64;
+            let mut acc = Goldilocks::ZERO;
             for d in 0..k {
-                acc += seg_i[pos * k + d] * w_i[base + d * n + j];
+                acc = acc + seg[pos * k + d] * w_all[base + d * n + j];
             }
             gj[j] = acc;
         }
     });
-    g.into_iter().map(from_i64).collect()
+    g
 }
 
 /// Streaming prove: same eq-selector sumcheck as `prove`, but `w_v` is computed on
