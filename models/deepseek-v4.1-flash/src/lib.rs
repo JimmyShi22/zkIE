@@ -2242,14 +2242,16 @@ pub fn build_v41_forward(
     gate_table: usize,
     hash_ids: &[u32],
     sigmoid_table: usize,
-) -> (usize, usize) {
+) -> (usize, usize, Vec<usize>) {
     let hc = HC_MULT;
     let x4 = expand_to_hc(store, ops, x, m, hc, DIM_PAD);
     let mut pre_mix = build_identity_pre_mix(store, m);
     let mut x4 = x4;
     let mut compress_kv: Option<usize> = None;
+    let mut boundaries = Vec::with_capacity(n_layers.min(N_LAYERS) + 1);
 
     for layer in 0..n_layers.min(N_LAYERS) {
+        boundaries.push(ops.len());
         // Engram writes into the HC residual before the block.
         if layer == 1 || layer == 14 {
             let eng_shard = open_shard(&format!(
@@ -2313,7 +2315,8 @@ pub fn build_v41_forward(
             compress_kv = new_ckv;
         }
     }
-    (x4, pre_mix)
+    boundaries.push(ops.len());
+    (x4, pre_mix, boundaries)
 }
 
 /// Final output head: collapse the HC stream, RMSNorm, project to logits over

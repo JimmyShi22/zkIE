@@ -61,7 +61,7 @@ fn main() {
         store.push(vec![from_i64(1 << 16); m * DIM_PAD])
     };
 
-    let (x4, _pre_mix) = build_v41_forward(
+    let (x4, _pre_mix, _boundaries) = build_v41_forward(
         &mut store,
         &mut ops,
         &dir,
