@@ -1,6 +1,6 @@
 use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64};
 use zkie_core::common::fixed_point::{from_i64, to_i64};
-use zkie_models_deepseek_v41_flash::{build_hc_mixes, open_shard, HC_MULT};
+use zkie_models_deepseek_v41_flash::{build_hc_mixes, build_hc_split, open_shard, HC_MULT};
 use zkie_ops::compose::{prove_shard, verify_shard, Op, Store};
 
 fn load_i32(path: &str) -> Vec<Goldilocks> {
@@ -15,7 +15,7 @@ fn main() {
     let path = std::env::args().nth(1).unwrap_or_else(|| {
         "/data/zkIE/models/deepseek-v4.1-flash/raw/model-00003-of-00048.safetensors".to_string()
     });
-    let m = 1usize;
+    let m = 16usize;
     let hc = HC_MULT;
     let d = 5120usize;
     let d_real = hc * d; // 20480
@@ -69,21 +69,22 @@ fn main() {
         rsqrt_table,
         limb_table,
     );
-    let pre = store.push(vec![]);
-    let post = store.push(vec![]);
-    let comb = store.push(vec![]);
-    ops.push(Op::SinkhornSplit {
-        mixes: mix,
-        scale: hc_scale,
-        base: hc_base,
-        pre,
-        post,
-        comb,
+    let exp_table = store.push(load_i32("/data/zkIE/models/gpt2/weights/exp_table_i32.bin"));
+    let sigmoid_table = store.push(load_i32("/data/zkIE/models/sigmoid_table_i32.bin"));
+    let (pre, post, comb) = build_hc_split(
+        &mut store,
+        &mut ops,
+        mix,
+        hc_scale,
+        hc_base,
         m,
         hc,
-        iters: 20,
-        eps: 1,
-    });
+        20,
+        0,
+        sigmoid_table,
+        exp_table,
+        limb_table,
+    );
 
     let mut rng = XorShift64::new(0xABC1);
     let proof = prove_shard(&mut store, &ops, &[], &mut rng);

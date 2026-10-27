@@ -51,6 +51,7 @@ fn main() {
     let sqrt_sp = store.push(load_i32("/data/zkIE/models/sqrt_softplus_table_i32.bin"));
     let silu = store.push(load_i32("/data/zkIE/models/silu_clipped_table_i32.bin"));
     let clip = store.push(load_i32("/data/zkIE/models/clip_m10_p10_table_i32.bin"));
+    let sigmoid = store.push(load_i32("/data/zkIE/models/sigmoid_table_i32.bin"));
     let x = store.push(vec![from_i64(1 << 16); m * DIM_PAD]);
     let x4 = expand_to_hc(&mut store, &mut ops, x, m, HC_MULT, DIM_PAD);
     let pre_mix = build_identity_pre_mix(&mut store, m);
@@ -70,6 +71,7 @@ fn main() {
         sqrt_sp,
         silu,
         clip,
+        sigmoid,
     );
 
     let tokens_t = store.push_idx(vec![]);

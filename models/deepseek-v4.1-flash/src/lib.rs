@@ -152,6 +152,20 @@ fn transpose_gather(store: &mut Store, ops: &mut Vec<Op>, x: usize, m: usize, k:
     gather(store, ops, x, idx)
 }
 
+/// Swap the last two axes of a `[m, hc, hc]` tensor (j/k transpose) via a
+/// proven `Lookup` with the public permutation index.
+fn transpose_hc_jk(store: &mut Store, ops: &mut Vec<Op>, x: usize, m: usize, hc: usize) -> usize {
+    let idx = (0..m * hc * hc)
+        .map(|i| {
+            let k = i % hc;
+            let j = (i / hc) % hc;
+            let t = i / (hc * hc);
+            (t * hc * hc + k * hc + j) as u32
+        })
+        .collect::<Vec<_>>();
+    gather(store, ops, x, idx)
+}
+
 /// Broadcast-multiply: `out[i,j] = x[i,j] * scale[i]`. Assembled from a proven
 /// `Lookup` (replicate the per-row scale) + `ScaleVec` (elementwise product),
 /// instead of the unproven `BroadcastScale`.
@@ -2001,6 +2015,7 @@ pub fn build_v41_layer(
     sqrt_softplus_table: usize,
     silu_table: usize,
     clip_table: usize,
+    sigmoid_table: usize,
 ) -> (usize, usize, Option<usize>) {
     let hc = HC_MULT;
     let d_stored = DIM_PAD;
@@ -2036,7 +2051,7 @@ pub fn build_v41_layer(
         limb_table,
     );
     let (attn_pre, attn_post, attn_comb) =
-        build_hc_split(store, ops, attn_mix, attn_scale, attn_base, m, hc, iters, eps);
+        build_hc_split(store, ops, attn_mix, attn_scale, attn_base, m, hc, iters, eps, sigmoid_table, exp_table, limb_table);
     let attn_in = build_hc_pre(store, ops, x4, pre_mix, m, hc, d_stored);
     let attn_norm_w = {
         let v: Vec<i64> = file
@@ -2144,7 +2159,7 @@ pub fn build_v41_layer(
         limb_table,
     );
     let (ffn_pre, ffn_post, ffn_comb) =
-        build_hc_split(store, ops, ffn_mix, ffn_scale, ffn_base, m, hc, iters, eps);
+        build_hc_split(store, ops, ffn_mix, ffn_scale, ffn_base, m, hc, iters, eps, sigmoid_table, exp_table, limb_table);
     let ffn_in = build_hc_pre(store, ops, x4_attn, attn_pre, m, hc, d_stored);
     let ffn_norm_w = {
         let v: Vec<i64> = file
@@ -2226,6 +2241,7 @@ pub fn build_v41_forward(
     clip_table: usize,
     gate_table: usize,
     hash_ids: &[u32],
+    sigmoid_table: usize,
 ) -> (usize, usize) {
     let hc = HC_MULT;
     let x4 = expand_to_hc(store, ops, x, m, hc, DIM_PAD);
@@ -2289,6 +2305,7 @@ pub fn build_v41_forward(
             sqrt_softplus_table,
             silu_table,
             clip_table,
+            sigmoid_table,
         );
         x4 = x4o;
         pre_mix = pre_mixo;
@@ -2363,8 +2380,29 @@ pub fn push_embedding(store: &mut Store, path: &str, m: usize) -> usize {
     store.push(out)
 }
 
+/// Row-normalize a `[m*hc, hc]` matrix over its last axis via the proven
+/// `SumNorm` op: `out[i,j] = round(x[i,j] * 2^16 / sum_k x[i,k])`.
+fn hc_row_norm(store: &mut Store, ops: &mut Vec<Op>, c: usize, m: usize, hc: usize) -> usize {
+    let out = store.push(vec![]);
+    ops.push(Op::SumNorm { x: c, out, m: m * hc, n: hc });
+    out
+}
+
+/// Column-normalize a `[m, hc, hc]` tensor over its middle (j) axis, via a
+/// proven j/k `Lookup` transpose + `SumNorm` + transpose back.
+fn hc_col_norm(store: &mut Store, ops: &mut Vec<Op>, c: usize, m: usize, hc: usize) -> usize {
+    let c_t = transpose_hc_jk(store, ops, c, m, hc);
+    let out_t = store.push(vec![]);
+    ops.push(Op::SumNorm { x: c_t, out: out_t, m: m * hc, n: hc });
+    transpose_hc_jk(store, ops, out_t, m, hc)
+}
+
 /// Split an HC mix projection into `pre`/`post`/`comb` coefficients.
-fn build_hc_split(
+/// Decomposed into proven primitives (`Scale` + `Add` + `GeluIndex` + sigmoid
+/// `Lookup` for the pre/post gates, and `Softmax` + `SumNorm` Sinkhorn rounds
+/// for the comb matrix) instead of the unproven `SinkhornSplit` op. The
+/// iteration order matches the official `hc_split_sinkhorn` reference exactly.
+pub fn build_hc_split(
     store: &mut Store,
     ops: &mut Vec<Op>,
     mix: usize,
@@ -2373,13 +2411,87 @@ fn build_hc_split(
     m: usize,
     hc: usize,
     iters: usize,
-    eps: i64,
+    _eps: i64,
+    sigmoid_table: usize,
+    exp_table: usize,
+    limb_table: usize,
 ) -> (usize, usize, usize) {
+    let mix_hc = (2 + hc) * hc;
+    let mix_hc_pad = mix_hc.next_power_of_two();
+    let sc = store.materialize(scale).into_owned();
+    let bs = store.materialize(base).into_owned();
+
+    // ---- pre = sigmoid(mix[0..hc] * sc0 + base[0..hc]) ----
+    let mix_pre = gather(store, ops, mix, col_band(m, mix_hc_pad, 0, hc));
+    let pre_scaled = store.push(vec![]);
+    ops.push(Op::Scale { x: mix_pre, out: pre_scaled, factor: to_i64(sc[0]), shift: 16 });
+    let pre_bias = {
+        let mut v = Vec::with_capacity(m * hc);
+        for _ in 0..m {
+            v.extend_from_slice(&bs[0..hc]);
+        }
+        store.push(v)
+    };
+    let pre_raw = store.push(vec![]);
+    ops.push(Op::Add { a: pre_scaled, b: pre_bias, c: pre_raw });
+    let pre_idx = store.push_idx(vec![]);
+    ops.push(Op::GeluIndex { x: pre_raw, out: pre_idx, offset: 1 << 23, table_len: 1 << 24, limb_table });
     let pre = store.push(vec![]);
+    ops.push(Op::Lookup { idx: pre_idx, out: pre, table: sigmoid_table });
+
+    // ---- post = 2*sigmoid(mix[hc..2hc] * sc1 + base[hc..2hc]) ----
+    let mix_post = gather(store, ops, mix, col_band(m, mix_hc_pad, hc, 2 * hc));
+    let post_scaled = store.push(vec![]);
+    ops.push(Op::Scale { x: mix_post, out: post_scaled, factor: to_i64(sc[1]), shift: 16 });
+    let post_bias = {
+        let mut v = Vec::with_capacity(m * hc);
+        for _ in 0..m {
+            v.extend_from_slice(&bs[hc..2 * hc]);
+        }
+        store.push(v)
+    };
+    let post_raw = store.push(vec![]);
+    ops.push(Op::Add { a: post_scaled, b: post_bias, c: post_raw });
+    let post_idx = store.push_idx(vec![]);
+    ops.push(Op::GeluIndex { x: post_raw, out: post_idx, offset: 1 << 23, table_len: 1 << 24, limb_table });
+    let post_sig = store.push(vec![]);
+    ops.push(Op::Lookup { idx: post_idx, out: post_sig, table: sigmoid_table });
     let post = store.push(vec![]);
-    let comb = store.push(vec![]);
-    ops.push(Op::SinkhornSplit { mixes: mix, scale, base, pre, post, comb, m, hc, iters, eps });
-    (pre, post, comb)
+    ops.push(Op::Scale { x: post_sig, out: post, factor: 2, shift: 0 });
+
+    // ---- comb = sinkhorn(mix[2hc..] * sc2 + base[2hc..]) ----
+    let mix_comb = gather(store, ops, mix, col_band(m, mix_hc_pad, 2 * hc, mix_hc));
+    let comb_scaled = store.push(vec![]);
+    ops.push(Op::Scale { x: mix_comb, out: comb_scaled, factor: to_i64(sc[2]), shift: 16 });
+    let comb_bias = {
+        let mut v = Vec::with_capacity(m * hc * hc);
+        for _ in 0..m {
+            v.extend_from_slice(&bs[2 * hc..mix_hc]);
+        }
+        store.push(v)
+    };
+    let comb_raw = store.push(vec![]);
+    ops.push(Op::Add { a: comb_scaled, b: comb_bias, c: comb_raw });
+
+    // Row softmax over the last hc axis (`exp(c - row_max) / row_sum`).
+    let zero_mask = store.push(vec![Goldilocks::ZERO; m * hc * hc]);
+    let softmax_idx = build_stable_softmax_index(
+        store, ops, comb_raw, zero_mask, m * hc, hc, 1 << 21, 1 << 21, limb_table,
+    );
+    let e = store.push(vec![]);
+    let c_softmax = store.push(vec![]);
+    ops.push(Op::Softmax { idx: softmax_idx, e, out: c_softmax, table: exp_table, m: m * hc, n: hc });
+    let mut c = c_softmax;
+
+    // Sinkhorn: one column normalization, then iters-1 rounds of row/column
+    // normalization, matching the official hc_split_sinkhorn ordering.
+    c = hc_col_norm(store, ops, c, m, hc);
+    for _ in 0..iters.saturating_sub(1) {
+        c = hc_row_norm(store, ops, c, m, hc);
+        c = hc_col_norm(store, ops, c, m, hc);
+    }
+
+    (pre, post, c)
 }
 
 /// Collapse the `hc` residual copies with the incoming `pre` coefficients.
@@ -2539,6 +2651,7 @@ pub fn build_block(
     sqrt_softplus_table: usize,
     silu_table: usize,
     clip_table: usize,
+    sigmoid_table: usize,
 ) -> (usize, usize, usize, usize) {
     let hc = HC_MULT;
     let d_stored = DIM_PAD;
@@ -2574,7 +2687,7 @@ pub fn build_block(
         limb_table,
     );
     let (attn_pre, attn_post, attn_comb) =
-        build_hc_split(store, ops, attn_mix, attn_scale, attn_base, m, hc, iters, eps);
+        build_hc_split(store, ops, attn_mix, attn_scale, attn_base, m, hc, iters, eps, sigmoid_table, exp_table, limb_table);
     let attn_in = build_hc_pre(store, ops, x4, pre_mix, m, hc, d_stored);
 
     let attn_norm_w = {
@@ -2642,7 +2755,7 @@ pub fn build_block(
         limb_table,
     );
     let (ffn_pre, ffn_post, ffn_comb) =
-        build_hc_split(store, ops, ffn_mix, ffn_scale, ffn_base, m, hc, iters, eps);
+        build_hc_split(store, ops, ffn_mix, ffn_scale, ffn_base, m, hc, iters, eps, sigmoid_table, exp_table, limb_table);
     let ffn_in = build_hc_pre(store, ops, x4_attn, attn_pre, m, hc, d_stored);
 
     let ffn_norm_w = {

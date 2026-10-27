@@ -1,4 +1,4 @@
-use zkie_core::common::field::{Goldilocks, XorShift64};
+use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64};
 use zkie_core::common::fixed_point::{from_i64, to_i64};
 use zkie_models_deepseek_v41_flash::{
     build_quantized_matmul, open_shard, push_quantized_fp4, DIM, DIM_PAD, MOE_INTER_DIM,
@@ -29,6 +29,11 @@ fn main() {
     let mut store = Store::new();
     let silu = store.push(load_i32("/data/zkIE/models/silu_clipped_table_i32.bin"));
     let clip = store.push(load_i32("/data/zkIE/models/clip_m10_p10_table_i32.bin"));
+    let limb_table = store.push(
+        (0..(1usize << 16))
+            .map(|j| Goldilocks::from_u64(j as u64))
+            .collect::<Vec<_>>(),
+    );
     let x = store.push(vec![from_i64(1 << 16); m * DIM_PAD]);
     let mut ops: Vec<Op> = Vec::new();
 
@@ -59,7 +64,7 @@ fn main() {
     let gate = store.push(vec![]);
     ops.push(Op::Scale { x: gate_raw, out: gate, factor: 1, shift });
     let gate_idx = store.push_idx(vec![]);
-    ops.push(Op::GeluIndex { x: gate, out: gate_idx, offset: 1 << 23, table_len: 1 << 24 });
+    ops.push(Op::GeluIndex { x: gate, out: gate_idx, offset: 1 << 23, table_len: 1 << 24, limb_table });
     let gate_act = store.push(vec![]);
     ops.push(Op::Lookup { idx: gate_idx, out: gate_act, table: silu });
 
@@ -67,7 +72,7 @@ fn main() {
     let up = store.push(vec![]);
     ops.push(Op::Scale { x: up_raw, out: up, factor: 1, shift });
     let up_idx = store.push_idx(vec![]);
-    ops.push(Op::GeluIndex { x: up, out: up_idx, offset: 1 << 23, table_len: 1 << 24 });
+    ops.push(Op::GeluIndex { x: up, out: up_idx, offset: 1 << 23, table_len: 1 << 24, limb_table });
     let up_clip = store.push(vec![]);
     ops.push(Op::Lookup { idx: up_idx, out: up_clip, table: clip });
 

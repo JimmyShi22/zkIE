@@ -47,6 +47,7 @@ fn main() {
     let sqrt_sp = store.push(load_i32("/data/zkIE/models/sqrt_softplus_table_i32.bin"));
     let silu = store.push(load_i32("/data/zkIE/models/silu_clipped_table_i32.bin"));
     let clip = store.push(load_i32("/data/zkIE/models/clip_m10_p10_table_i32.bin"));
+    let sigmoid = store.push(load_i32("/data/zkIE/models/sigmoid_table_i32.bin"));
     let gate_table = store.push(load_i32("/data/zkIE/models/engram_gate_table_i32.bin"));
     let hash_ids = load_i32_raw("/data/zkIE/models/deepseek-v4.1-flash/cache/engram/hash_ids_i32.bin");
     let hash_ids: Vec<u32> = hash_ids.into_iter().map(|v| v as u32).collect();
@@ -77,6 +78,7 @@ fn main() {
         clip,
         gate_table,
         &hash_ids,
+        sigmoid,
     );
 
     forward_ops(&mut store, &ops);

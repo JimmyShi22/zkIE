@@ -36,6 +36,7 @@ fn main() {
     let sqrt_sp = store.push(load_i32("/data/zkIE/models/sqrt_softplus_table_i32.bin"));
     let silu = store.push(load_i32("/data/zkIE/models/silu_clipped_table_i32.bin"));
     let clip = store.push(load_i32("/data/zkIE/models/clip_m10_p10_table_i32.bin"));
+    let sigmoid = store.push(load_i32("/data/zkIE/models/sigmoid_table_i32.bin"));
 
     // All-ones embedding input, expanded to the four HC residual copies.
     let x = store.push(vec![from_i64(1 << 16); m * DIM_PAD]);
@@ -59,6 +60,7 @@ fn main() {
         sqrt_sp,
         silu,
         clip,
+        sigmoid,
     );
 
     forward_ops(&mut store, &ops);
