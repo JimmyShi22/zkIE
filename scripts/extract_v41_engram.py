@@ -98,21 +98,25 @@ def main():
     layer_ids = tuple(cfg["engram_layer_ids"])
     max_ngram = cfg["engram_max_ngram_size"]
     n_heads = cfg["engram_n_heads"]
-    vocab_size = cfg["engram_compressed_vocab_size"]
+    compressed_vocab = cfg["engram_compressed_vocab_size"]
+    bucket_vocab = cfg["engram_vocab_size"]
     pad_id = cfg["engram_pad_token_id"]
 
     from tokenizers import Tokenizer
 
     tok = Tokenizer.from_file(args.tokenizer)
     token_map, cvocab = build_compressed_token_map(tok)
-    assert cvocab == vocab_size, (cvocab, vocab_size)
+    assert cvocab == compressed_vocab, (cvocab, compressed_vocab)
 
-    # Primes per (layer, ngram, head), and per-layer offsets.
+    # Primes per (layer, ngram, head), and per-layer offsets. The bucket
+    # modulus is `engram_vocab_size` (16M), matching the official
+    # `ds_v41_engram.py`; only the hash multipliers derive from the compressed
+    # tokenizer vocab (99092).
     primes, seen = [], set()
     for _ in layer_ids:
         per_ngram = []
         for _ in range(max_ngram - 1):
-            sizes, current = [], vocab_size - 1
+            sizes, current = [], bucket_vocab - 1
             for _ in range(n_heads):
                 current = find_next_prime(current, seen)
                 seen.add(current)
@@ -124,7 +128,7 @@ def main():
     offsets = [np.cumsum([0, *sizes[:-1]]).tolist() for sizes in flat]
 
     max_long = np.iinfo(np.int64).max
-    mult_bound = max(1, (max_long // vocab_size) // 2)
+    mult_bound = max(1, (max_long // compressed_vocab) // 2)
     multipliers = []
     for layer_id in layer_ids:
         gen = np.random.default_rng(10007 * layer_id)
