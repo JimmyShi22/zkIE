@@ -722,12 +722,9 @@ impl Store {
     pub fn materialize_expert_rows(&self, id: T, rows: &[u32]) -> Vec<Goldilocks> {
         match &self.v[id] {
             TensorData::ExpertStack { experts, k, n } => {
-                let mut out = vec![Goldilocks::ZERO; rows.len() * k * n];
-                for (i, &e) in rows.iter().enumerate() {
-                    let w = materialize_expert(&experts[e as usize]);
-                    out[i * k * n..(i + 1) * k * n].copy_from_slice(&w);
-                }
-                out
+                rows.par_iter()
+                    .flat_map_iter(|&e| materialize_expert(&experts[e as usize]).into_iter())
+                    .collect()
             }
             _ => panic!("materialize_expert_rows on non-expert-stack tensor"),
         }
@@ -2121,10 +2118,12 @@ pub fn forward_ops(store: &mut Store, ops: &[Op]) {
                     .collect();
                 let o: Vec<Goldilocks> = (0..m * n)
                     .map(|ij| {
-                        from_i64(round_div(
-                            to_i64(ev[ij]) * (1i64 << 16),
-                            to_i64(sum[ij / n]),
-                        ))
+                        let s = to_i64(sum[ij / n]);
+                        if s == 0 {
+                            Goldilocks::ZERO
+                        } else {
+                            from_i64(round_div(to_i64(ev[ij]) * (1i64 << 16), s))
+                        }
                     })
                     .collect();
                 store.v[e] = TensorData::Owned(ev);
@@ -2141,10 +2140,12 @@ pub fn forward_ops(store: &mut Store, ops: &[Op]) {
                     .collect();
                 let o: Vec<Goldilocks> = (0..m * n)
                     .map(|ij| {
-                        from_i64(round_div(
-                            to_i64(xv[ij]) * (1i64 << 16),
-                            to_i64(sum[ij / n]),
-                        ))
+                        let s = to_i64(sum[ij / n]);
+                        if s == 0 {
+                            Goldilocks::ZERO
+                        } else {
+                            from_i64(round_div(to_i64(xv[ij]) * (1i64 << 16), s))
+                        }
                     })
                     .collect();
                 store.v[out] = TensorData::Owned(o);

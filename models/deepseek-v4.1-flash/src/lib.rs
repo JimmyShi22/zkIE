@@ -1088,6 +1088,22 @@ mod tests {
     use zkie_ops::compose::{prove_shard, verify_shard};
 
     #[test]
+    fn expert_stack_parallel_matches_sequential() {
+        let file = open_shard(
+            "/data/zkIE/models/deepseek-v4.1-flash/raw/model-00003-of-00048.safetensors",
+        );
+        let mut store = Store::new();
+        let w = load_routed_expert_stack(&mut store, file, 0, "w1", MOE_INTER_DIM, DIM);
+        let rows = [0u32, 2, 1, 5, 3];
+        let par = store.materialize_expert_rows(w, &rows);
+        let mut seq = Vec::new();
+        for &e in &rows {
+            seq.extend(store.materialize_expert_one(w, e as usize));
+        }
+        assert_eq!(par, seq);
+    }
+
+    #[test]
     fn sparse_indexer_full_roundtrip() {
         let m = 2usize;
         let k = 2usize;
