@@ -4065,21 +4065,13 @@ fn prove_committed_shard_dag_impl(
 
     // Restore each weight group's Merkle prover data from its cache file (no
     // re-commit), then reduce each group's claims to one FRI proof + one sumcheck.
+    // Materialization is streamed per group: the whole 552B parameter set is
+    // never held in memory at once.
     let mut weight_locs: std::collections::BTreeMap<T, WeightClaimLoc> =
         std::collections::BTreeMap::new();
     let mut expert_weight_locs: std::collections::BTreeMap<(T, usize), WeightClaimLoc> =
         std::collections::BTreeMap::new();
-    let mut group_tensors: Vec<Vec<Vec<Goldilocks>>> = Vec::with_capacity(cached_weights.len());
     for (bi, cw) in cached_weights.iter().enumerate() {
-        let tensors: Vec<Vec<Goldilocks>> = cw
-            .table_ids
-            .iter()
-            .zip(cw.expert_indices.iter())
-            .map(|(&t, &e)| match e {
-                Some(ei) => store.materialize_expert_one(t, ei),
-                None => store.materialize(t).into_owned(),
-            })
-            .collect();
         for (i, (&t, &e)) in cw.table_ids.iter().zip(cw.expert_indices.iter()).enumerate() {
             let loc = WeightClaimLoc { batch: bi, table: i };
             match e {
@@ -4091,7 +4083,6 @@ fn prove_committed_shard_dag_impl(
                 }
             }
         }
-        group_tensors.push(tensors);
     }
 
     let num_groups = cached_weights.len();
@@ -4144,8 +4135,20 @@ fn prove_committed_shard_dag_impl(
         );
         let commitment: zkie_core::pcs::whir::Commitment =
             bincode::deserialize_from(&mut reader).expect("read cache commitment");
+        // Materialize exactly this group (already kept to one group's worth by
+        // commit_model_weights), restore its prover data, then drop it before
+        // moving to the next group.
+        let group_tensors: Vec<Vec<Goldilocks>> = cw
+            .table_ids
+            .iter()
+            .zip(cw.expert_indices.iter())
+            .map(|(&t, &e)| match e {
+                Some(ei) => store.materialize_expert_one(t, ei),
+                None => store.materialize(t).into_owned(),
+            })
+            .collect();
         let ref_slices: Vec<&[Goldilocks]> =
-            group_tensors[bi].iter().map(|v| v.as_slice()).collect();
+            group_tensors.iter().map(|v| v.as_slice()).collect();
         let prover_data = batch_whir
             .restore_batch_prover_data_from(&ref_slices, &mut reader)
             .expect("restore cache prover data");
@@ -4159,7 +4162,7 @@ fn prove_committed_shard_dag_impl(
         };
         let tensors: Vec<Vec<Goldilocks>> = claims
             .iter()
-            .map(|(ti, _, _)| group_tensors[bi][*ti].clone())
+            .map(|(ti, _, _)| group_tensors[*ti].clone())
             .collect();
         let proof = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
             ctx,
