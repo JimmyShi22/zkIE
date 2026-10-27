@@ -61,25 +61,11 @@ pub fn mm_par_fixed(
         .max()
         .unwrap_or(0) as i128;
     if max_a * max_b * (k as i128) >= (1i128 << 63) {
-        // The worst-case bound overflows i64, but the actual fixed-point dot
-        // products (Q16 x Q16 over k) stay far below 2^63 for every model
-        // tensor, so accumulate in i128 instead of paying for field mul.
-        let ai: Vec<i128> = a.iter().map(|&v| to_i64(v) as i128).collect();
-        let bi: Vec<i128> = b.iter().map(|&v| to_i64(v) as i128).collect();
-        let mut c = vec![0i128; m * n];
-        c.par_chunks_mut(n).enumerate().for_each(|(i, cij)| {
-            for j in 0..n {
-                cij[j] = 0;
-            }
-            for kk in 0..k {
-                let a_val = ai[i * k + kk];
-                let brow = &bi[kk * n..(kk + 1) * n];
-                for j in 0..n {
-                    cij[j] += a_val * brow[j];
-                }
-            }
-        });
-        return c.into_iter().map(|v| from_i64(v as i64)).collect();
+        eprintln!(
+            "[mm_par_fixed] overflow fallback to field (m={} k={} n={}, max_a={} max_b={})",
+            m, k, n, max_a, max_b
+        );
+        return mm_par(a, b, m, k, n, 64);
     }
 
     let ai: Vec<i64> = a.iter().map(|&v| to_i64(v)).collect();
