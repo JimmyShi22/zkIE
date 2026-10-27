@@ -176,11 +176,12 @@ fn build_broadcast_scale(
     scale: usize,
     m: usize,
     h: usize,
+    shift: u32,
 ) -> usize {
     let idx = (0..m * h).map(|ij| (ij / h) as u32).collect::<Vec<_>>();
     let scale_b = gather(store, ops, scale, idx);
     let out = store.push(vec![]);
-    ops.push(Op::ScaleVec { x, scale: scale_b, out, shift: 0 });
+    ops.push(Op::ScaleVec { x, scale: scale_b, out, shift });
     out
 }
 
@@ -525,8 +526,6 @@ pub fn build_hc_mixes(
     // inject ~100 Q16 of error per projection.
     let mix_raw = store.push(vec![]);
     ops.push(Op::MatMul { a: x4_pad, b: hc_fn_t, c: mix_raw, m, k: d_pad, n: mix_hc_pad });
-    let mix_q16 = store.push(vec![]);
-    ops.push(Op::Scale { x: mix_raw, out: mix_q16, factor: 1, shift: 16 });
     let rstd = store.push(vec![]);
     ops.push(Op::Rsqrt {
         x: x4_pad,
@@ -536,7 +535,10 @@ pub fn build_hc_mixes(
         d: d_pad,
         n_real: d_real,
     });
-    let mix_scaled = build_broadcast_scale(store, ops, mix_q16, rstd, m, mix_hc_pad);
+    // Keep the Q32 projection until the final scale, matching the float64
+    // reference `(x @ hc_fn^T) * rsqrt` (rounding the projection to Q16 here
+    // injected a systematic error that drifted the argmax over 40 layers).
+    let mix_scaled = build_broadcast_scale(store, ops, mix_raw, rstd, m, mix_hc_pad, 16);
     let mix = store.push(vec![]);
     ops.push(Op::Scale { x: mix_scaled, out: mix, factor: 1, shift: 16 });
     mix
@@ -760,7 +762,7 @@ pub fn build_routed_experts(
         mask[i] = Goldilocks::ONE;
     }
     let mask_t = store.push(mask);
-    let seg_z = build_broadcast_scale(store, ops, seg, mask_t, s_pad, DIM_PAD);
+    let seg_z = build_broadcast_scale(store, ops, seg, mask_t, s_pad, DIM_PAD, 0);
 
     let g = store.push(vec![]);
     ops.push(Op::GatherMatMul {

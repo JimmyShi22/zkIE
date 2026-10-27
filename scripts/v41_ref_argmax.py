@@ -18,12 +18,14 @@ def silu(x):
 
 def build_routed_experts(t, layer, x, m):
     gw = bf16_vec(t[f"layers.{layer}.ffn.gate.weight"]).reshape(N_EXPERTS, DIM)
+    gb = np.frombuffer(t[f"layers.{layer}.ffn.gate.bias"]["data"], dtype="<f4").astype(np.float64)
     z = x @ gw.T
     s = sqrt_softplus(z)
     topk = 6
     sel = np.zeros((m, N_EXPERTS), dtype=np.float64)
     for i in range(m):
-        idx = np.argpartition(-s[i], topk)[:topk]
+        biased = s[i] + gb
+        idx = np.argpartition(-biased, topk)[:topk]
         sel[i, idx] = 1.0
     s_sel = s * sel
     weights = s_sel / s_sel.sum(-1, keepdims=True) * ROUTE_SCALE
@@ -103,6 +105,9 @@ def main():
         pre_mix = ffn_pre
         print(f"layer {layer} done", flush=True)
 
+    fixed = np.round(x4 * 65536.0).astype(np.int64)
+    print("first8", fixed[0, 0, :8].tolist())
+    print("last8", fixed[-1, 0, :8].tolist())
     head_shard = read_safetensors(f"{args.raw}/model-00043-of-00048.safetensors")
     logits = build_final_head(head_shard, x4, pre_mix, args.m)
     am = np.argmax(logits, axis=-1)
