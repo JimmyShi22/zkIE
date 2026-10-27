@@ -1303,6 +1303,11 @@ pub struct OpShardProof {
     /// Raw `(tensor, point, eval)` claims emitted by this shard's ops, used by
     /// the shard-DAG composer for cross-shard binding.
     pub claims: Vec<(T, Vec<Goldilocks>, Goldilocks)>,
+    /// Per-expert weight claims emitted by `GatherMatMul`: `(weight_tensor,
+    /// expert_index, point, eval)`. Kept separate from `claims` because all
+    /// experts of an `ExpertStack` share one tensor id, so the tensor-only
+    /// `claims` keying cannot distinguish them.
+    pub expert_weight_claims: Vec<(T, usize, Vec<Goldilocks>, Goldilocks)>,
     pub witness_columns: Vec<WitnessColumn>,
     pub table_columns: Vec<TableColumn>,
 }
@@ -2378,6 +2383,7 @@ pub fn prove_shard_precomputed(
 
     // (tensor_id, point, eval) claims emitted by each op's proof.
     let mut claims: Vec<(T, Vec<Goldilocks>, Goldilocks)> = Vec::new();
+    let mut expert_weight_claims: Vec<(T, usize, Vec<Goldilocks>, Goldilocks)> = Vec::new();
     let mut op_proofs = Vec::with_capacity(ops.len());
     let mut lookup_by_table: std::collections::BTreeMap<T, Vec<(Vec<u32>, Vec<Goldilocks>)>> =
         std::collections::BTreeMap::new();
@@ -2554,6 +2560,18 @@ pub fn prove_shard_precomputed(
                 let mut cp = v.clone();
                 cp.extend_from_slice(&u);
                 claims.push((c, cp.clone(), mle::eval(store.get(c), &cp)));
+                // Bind every expert weight to the committed ExpertStack: the
+                // self-contained proof only carries `table[e] = MLE(W[e],
+                // (ch_d, v))` and checks `sum(counts * table)`; the committed
+                // path must additionally open each `table[e]` at `(v, ch_d)`
+                // against its per-expert weight commitment.
+                let k_bits = k.trailing_zeros() as usize;
+                let ch_d = &ch[..k_bits];
+                for e in 0..n_experts {
+                    let mut pt = v.clone();
+                    pt.extend_from_slice(ch_d);
+                    expert_weight_claims.push((w, e, pt, p.table[e]));
+                }
                 op_proofs.push(OpProof::GatherMatMul(p, u, v, ch));
             }
             Op::IdxBroadcast { .. } => {
@@ -3055,6 +3073,7 @@ pub fn prove_shard_precomputed(
         bound,
         binds,
         claims: raw_claims,
+        expert_weight_claims,
         witness_columns,
         table_columns,
     }
@@ -3973,6 +3992,14 @@ pub struct SelOpening {
     pub openings: Vec<zkie_core::pcs::whir::Proof>,
 }
 
+/// Coordinates of one weight tensor (or one expert of an `ExpertStack`) within
+/// the committed weight batches: `batch` is the size-group and `table` is the
+/// table index inside that batch.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy)]
+pub struct WeightClaimLoc {
+    pub batch: usize,
+    pub table: usize,
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct CommittedShardDagProof {
@@ -3982,7 +4009,8 @@ pub struct CommittedShardDagProof {
     pub cross_binds: Vec<CommittedCrossBindProof>,
     pub weight_batches: Vec<WeightBatchCommit>,
     pub weight_batch_openings: Vec<WeightBatchOpening>,
-    pub weight_locs: std::collections::BTreeMap<T, (usize, usize)>,
+    pub weight_locs: std::collections::BTreeMap<T, WeightClaimLoc>,
+    pub expert_weight_locs: std::collections::BTreeMap<(T, usize), WeightClaimLoc>,
     pub tokens: Vec<u32>,
     pub argmax_t: Vec<u32>,
     pub witness_batches: Vec<WitnessBatchCommit>,
@@ -4037,7 +4065,9 @@ fn prove_committed_shard_dag_impl(
 
     // Restore each weight group's Merkle prover data from its cache file (no
     // re-commit), then reduce each group's claims to one FRI proof + one sumcheck.
-    let mut weight_locs: std::collections::BTreeMap<T, (usize, usize)> =
+    let mut weight_locs: std::collections::BTreeMap<T, WeightClaimLoc> =
+        std::collections::BTreeMap::new();
+    let mut expert_weight_locs: std::collections::BTreeMap<(T, usize), WeightClaimLoc> =
         std::collections::BTreeMap::new();
     let mut group_tensors: Vec<Vec<Vec<Goldilocks>>> = Vec::with_capacity(cached_weights.len());
     for (bi, cw) in cached_weights.iter().enumerate() {
@@ -4050,8 +4080,16 @@ fn prove_committed_shard_dag_impl(
                 None => store.materialize(t).into_owned(),
             })
             .collect();
-        for (i, &t) in cw.table_ids.iter().enumerate() {
-            weight_locs.insert(t, (bi, i));
+        for (i, (&t, &e)) in cw.table_ids.iter().zip(cw.expert_indices.iter()).enumerate() {
+            let loc = WeightClaimLoc { batch: bi, table: i };
+            match e {
+                Some(ei) => {
+                    expert_weight_locs.insert((t, ei), loc);
+                }
+                None => {
+                    weight_locs.insert(t, loc);
+                }
+            }
         }
         group_tensors.push(tensors);
     }
@@ -4061,8 +4099,13 @@ fn prove_committed_shard_dag_impl(
         vec![Vec::new(); num_groups];
     for shard in &plain.shards {
         for (t, pt, ev) in &shard.claims {
-            if let Some(&(bi, ti)) = weight_locs.get(t) {
-                group_claims[bi].push((ti, pt.clone(), *ev));
+            if let Some(loc) = weight_locs.get(t) {
+                group_claims[loc.batch].push((loc.table, pt.clone(), *ev));
+            }
+        }
+        for (t, e, pt, ev) in &shard.expert_weight_claims {
+            if let Some(loc) = expert_weight_locs.get(&(*t, *e)) {
+                group_claims[loc.batch].push((loc.table, pt.clone(), *ev));
             }
         }
     }
@@ -4238,7 +4281,7 @@ fn prove_committed_shard_dag_impl(
         let mut t_arity = Vec::new();
         let mut t_cm = Vec::new();
         for tc in &shard.table_columns {
-            let total = tc.m.len().next_power_of_two();
+            let total = tc.m.len().next_power_of_two().max(32);
             let arity = total.trailing_zeros() as usize;
             let mut m_pad = vec![Goldilocks::from_u64(0); total];
             for (j, &v) in tc.m.iter().enumerate() {
@@ -4294,7 +4337,7 @@ fn prove_committed_shard_dag_impl(
     let mut t_challs: Vec<(Vec<Goldilocks>, Vec<Goldilocks>)> = Vec::new();
     for shard in &shards {
         for tc in &shard.table_columns {
-            let a = tc.m.len().next_power_of_two().trailing_zeros() as usize;
+            let a = tc.m.len().next_power_of_two().max(32).trailing_zeros() as usize;
             t_challs.push((ts.field_vec(a), ts.field_vec(a)));
         }
     }
@@ -4976,6 +5019,7 @@ fn prove_committed_shard_dag_impl(
         weight_batches,
         weight_batch_openings,
         weight_locs,
+        expert_weight_locs,
         tokens: store.idx[tokens_t].clone(),
         argmax_t: store.idx[argmax_t].clone(),
         witness_batches,
@@ -5107,6 +5151,38 @@ fn verify_committed_shard_dag_impl(
             opening_proof,
         ) {
             return false;
+        }
+    }
+    // Bind every shard weight claim to its committed opening. The shard proofs
+    // carry weight evals as oracle claims (`(w, pt, ev)`, or per-expert
+    // `(w, e, pt, ev)` for `GatherMatMul`); without this cross-check a prover
+    // could prove against a different weight than the one committed.
+    let opening_matches = |loc: WeightClaimLoc, pt: &[Goldilocks], ev: Goldilocks| {
+        if loc.batch >= proof.weight_batch_openings.len() {
+            return false;
+        }
+        let opening = &proof.weight_batch_openings[loc.batch];
+        opening
+            .table_idxs
+            .iter()
+            .zip(&opening.points)
+            .zip(&opening.claimed)
+            .any(|((&ti, p), &c)| ti == loc.table && p.as_slice() == pt && c == ev)
+    };
+    for shard in &proof.shards {
+        for (t, pt, ev) in &shard.claims {
+            if let Some(loc) = proof.weight_locs.get(t) {
+                if !opening_matches(*loc, pt, *ev) {
+                    return false;
+                }
+            }
+        }
+        for (t, e, pt, ev) in &shard.expert_weight_claims {
+            if let Some(loc) = proof.expert_weight_locs.get(&(*t, *e)) {
+                if !opening_matches(*loc, pt, *ev) {
+                    return false;
+                }
+            }
         }
     }
     for to in &proof.table_openings {
@@ -6360,6 +6436,54 @@ mod tests {
             }
         }
         assert!(!verify_committed_shard_dag(&store.owned_slices(), &ops, 2, &whir, &proof));
+    }
+
+    #[test]
+    fn committed_weight_binding_rejects_tamper() {
+        use zkie_core::common::field::PrimeCharacteristicRing;
+        use zkie_core::pcs::whir::Whir;
+
+        let mut rng = XorShift64::new(0x5151);
+        let (m, k, n) = (4usize, 8usize, 8usize);
+        let mut store = Store::new();
+        let a = store.push(
+            (0..m * k)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        let w = store.push(
+            (0..k * n)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        let c = store.push(vec![]);
+        let ops = vec![Op::MatMul { a, b: w, c, m, k, n }];
+
+        let whir = Whir::new_testing(6); // weight k*n = 64 = 2^6
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-test-cache-wbind");
+        let tokens_t = store.push_idx(vec![]);
+        let argmax_t = store.push_idx(vec![]);
+        let proof = prove_committed_shard_dag(
+            &mut store,
+            &ops,
+            1,
+            &whir,
+            &cached,
+            &mut rng,
+            tokens_t,
+            argmax_t,
+        );
+        assert!(verify_committed_shard_dag(&store.owned_slices(), &ops, 1, &whir, &proof));
+
+        // Tamper the shard's weight eval: the weight opening is bound to the
+        // committed weight, so the cross-check must reject the mismatch.
+        let mut bad = proof;
+        for shard in bad.shards.iter_mut() {
+            if let Some((_, _, ev)) = shard.claims.iter_mut().find(|(t, _, _)| *t == w) {
+                *ev = *ev + Goldilocks::ONE;
+            }
+        }
+        assert!(!verify_committed_shard_dag(&store.owned_slices(), &ops, 1, &whir, &bad));
     }
 
     #[test]

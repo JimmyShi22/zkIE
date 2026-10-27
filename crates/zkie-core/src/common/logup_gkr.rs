@@ -276,7 +276,11 @@ pub fn build_lookup_witness_num_den(
 }
 
 pub fn pad_table(table: &[Goldilocks]) -> Vec<Goldilocks> {
-    let total = table.len().next_power_of_two();
+    // WHIR's folding factor is 5, so any committed table must have arity >= 5.
+    // Small per-row broadcast tables (e.g. an `m`-length rsqrt or row-max
+    // vector) are only ever indexed below their real length, so zero-padding
+    // them to 2^5 is free and keeps the commitment foldable.
+    let total = table.len().next_power_of_two().max(32);
     let mut out = vec![Goldilocks::ZERO; total];
     out[..table.len()].copy_from_slice(table);
     out
@@ -289,7 +293,7 @@ pub fn build_lookup_table_num_den(
     beta: Goldilocks,
 ) -> (Vec<Goldilocks>, Vec<Goldilocks>) {
     let t = table.len();
-    let total = t.next_power_of_two();
+    let total = t.next_power_of_two().max(32);
     let mut num = vec![Goldilocks::from_u64(0); total];
     let mut den = vec![Goldilocks::from_u64(0); total];
     for j in 0..total {

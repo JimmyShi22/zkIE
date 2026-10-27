@@ -15,6 +15,9 @@ fn slice_concat_roundtrip() {
     ];
     let mut rng = XorShift64::new(1);
     let proof = prove_shard(&mut store, &ops, &[], &mut rng);
-    assert!(verify_shard(&[], &ops, &proof));
+    // `OpProof::Concat` is verified by recomputing the permuted concatenation
+    // from its part tensors, so the verifier needs those parts (and the output)
+    // in `tables`.
+    assert!(verify_shard(&store.owned_slices(), &ops, &proof));
     assert_eq!(store.get(c), store.get(x));
 }
