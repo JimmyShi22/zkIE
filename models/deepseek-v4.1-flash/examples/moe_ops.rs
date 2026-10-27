@@ -44,7 +44,7 @@ fn main() {
 
     let mut rng = XorShift64::new(0xCAFE);
     let proof = prove_shard(&mut store, &ops, &[], &mut rng);
-    assert!(verify_shard(&[], &ops, &proof));
+    assert!(verify_shard(&store.owned_slices(), &ops, &proof));
     println!(
         "ok moe ops={} first4={:?}",
         ops.len(),

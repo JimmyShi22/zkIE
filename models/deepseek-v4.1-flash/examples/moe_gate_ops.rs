@@ -33,7 +33,7 @@ fn main() {
 
     let mut rng = XorShift64::new(0xBEEF);
     let proof = prove_shard(&mut store, &ops, &[], &mut rng);
-    assert!(verify_shard(&[], &ops, &proof));
+    assert!(verify_shard(&store.owned_slices(), &ops, &proof));
 
     let n = N_ROUTED_EXPERTS_PAD;
     let selv = store.get(sel);
