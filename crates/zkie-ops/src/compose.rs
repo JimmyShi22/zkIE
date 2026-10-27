@@ -34,7 +34,7 @@ use crate::softmax_scaled::{
 use crate::topk::{argmax_forward, prove_argmax, prove_topk, topk_forward, verify_argmax, verify_topk, ArgmaxProof, TopKSelectProof};
 use rayon::prelude::*;
 use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
-use zkie_core::common::fixed_point::{from_i64, to_i32, to_i64};
+use zkie_core::common::fixed_point::{from_i128, from_i64, to_i128, to_i32, to_i64};
 use zkie_core::common::logup_gkr::{
     prove_lookup_fractional, prove_lookup_fractional_batch, prove_lookup_fractional_columns,
     verify_lookup_fractional, verify_lookup_fractional_batch, verify_lookup_fractional_chain,
@@ -1878,7 +1878,12 @@ pub fn forward_ops(store: &mut Store, ops: &[Op]) {
                 let o: Vec<Goldilocks> = store
                     .get(x)
                     .iter()
-                    .map(|&v| from_i64(round_div(to_i64(v) * factor, 1i64 << shift)))
+                    .map(|&v| {
+                        from_i128(round_div_i128(
+                            to_i128(v) * factor as i128,
+                            1i128 << shift,
+                        ))
+                    })
                     .collect();
                 store.v[out] = TensorData::Owned(o);
             }
@@ -1894,9 +1899,9 @@ pub fn forward_ops(store: &mut Store, ops: &[Op]) {
                     .iter()
                     .enumerate()
                     .map(|(i, &v)| {
-                        from_i64(round_div(
-                            to_i64(v) * to_i64(sv[i % sv.len()]),
-                            1i64 << shift,
+                        from_i128(round_div_i128(
+                            to_i128(v) * to_i128(sv[i % sv.len()]),
+                            1i128 << shift,
                         ))
                     })
                     .collect();

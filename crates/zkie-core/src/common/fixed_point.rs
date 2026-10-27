@@ -69,6 +69,27 @@ pub fn to_i64(x: Goldilocks) -> i64 {
     }
 }
 
+/// Embed a signed `i128` fixed-point value in the field by reducing it modulo
+/// `P`. This is the always-correct path for dot products whose intermediate
+/// accumulation exceeds `i64` (e.g. Q32 residual streams) but whose field value
+/// is still unambiguous. The caller is responsible for the fixed-point value
+/// staying inside `(-P/2, P/2)` for the sign convention to be meaningful.
+pub fn from_i128(x: i128) -> Goldilocks {
+    let r = x.rem_euclid(P as i128) as u64;
+    Goldilocks::new(r)
+}
+
+/// Recover the signed `i64` value from a field element that was produced by
+/// `from_i128` (or `from_i64`). Values must lie in `(-2^63, 2^63)`.
+pub fn to_i128(x: Goldilocks) -> i128 {
+    let v = x.as_canonical_u64();
+    if v <= i64::MAX as u64 {
+        v as i128
+    } else {
+        -((P - v) as i128)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
