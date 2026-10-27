@@ -60,6 +60,11 @@ python3 scripts/v41_make_prompt.py
 
 ## 待接
 
-- 90-bit WHIR（当前 bench 用 10-bit 测试 WHIR）。
+- 90-bit WHIR 已就位：`weight_commit_plan` 内部 `SECURITY=90`，边界承诺用
+  `with_params(arity, 90, 17)`；bench 里的 `new_testing(10)` 是未使用的遗留参数。
 - seq512 真实数据 + 参考 + 证明。
 - 把 argmax 基准统一成 Q16 计算，或评估 Q20 精度提升。
+- Engram 嵌入表的完整承诺：目前 engram 的 `embed.weight`（约 384M×256×2 ≈ 196B
+  参数）只物化被选中的行作为 witness，未把完整表提交进承诺，属于对 engram 表
+  的信任假设。提交完整表（反量化后约 1.5TB）需要按 chunk 流式提交或改为提交
+  原始 FP8 字节（约 196GB）再公开反量化，是后续的 soundness 补全项。
