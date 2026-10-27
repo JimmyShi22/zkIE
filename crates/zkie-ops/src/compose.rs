@@ -119,6 +119,16 @@ fn round_div(a: i64, b: i64) -> i64 {
     }
 }
 
+fn round_div_i128(a: i128, b: i128) -> i128 {
+    let q = a.div_euclid(b);
+    let r = a.rem_euclid(b);
+    if r * 2 >= b {
+        q + 1
+    } else {
+        q
+    }
+}
+
 fn sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
 }
@@ -941,6 +951,7 @@ pub enum Op {
         table: T,
         m: usize,
         n: usize,
+        prec: u32,
     },
     SoftmaxBias {
         e: T,
@@ -957,6 +968,7 @@ pub enum Op {
         out: T,
         m: usize,
         n: usize,
+        prec: u32,
     },
     SoftmaxIndex {
         x: T,
@@ -2108,6 +2120,7 @@ pub fn forward_ops(store: &mut Store, ops: &[Op]) {
                 table,
                 m,
                 n,
+                prec,
             } => {
                 let ev: Vec<Goldilocks> = store.idx[idx]
                     .iter()
@@ -2122,7 +2135,10 @@ pub fn forward_ops(store: &mut Store, ops: &[Op]) {
                         if s == 0 {
                             Goldilocks::ZERO
                         } else {
-                            from_i64(round_div(to_i64(ev[ij]) * (1i64 << 16), s))
+                            from_i64(round_div_i128(
+                                to_i64(ev[ij]) as i128 * (1i128 << prec),
+                                s as i128,
+                            ) as i64)
                         }
                     })
                     .collect();
@@ -2133,7 +2149,7 @@ pub fn forward_ops(store: &mut Store, ops: &[Op]) {
                 let (o, _sum) = softmax_bias_forward(store.get(e), store.get(bias), m, n);
                 store.v[out] = TensorData::Owned(o);
             }
-            Op::SumNorm { x, out, m, n } => {
+            Op::SumNorm { x, out, m, n, prec } => {
                 let xv = store.get(x);
                 let sum: Vec<Goldilocks> = (0..m)
                     .map(|i| (0..n).fold(Goldilocks::ZERO, |a, j| a + xv[i * n + j]))
@@ -2144,7 +2160,10 @@ pub fn forward_ops(store: &mut Store, ops: &[Op]) {
                         if s == 0 {
                             Goldilocks::ZERO
                         } else {
-                            from_i64(round_div(to_i64(xv[ij]) * (1i64 << 16), s))
+                            from_i64(round_div_i128(
+                                to_i64(xv[ij]) as i128 * (1i128 << prec),
+                                s as i128,
+                            ) as i64)
                         }
                     })
                     .collect();
@@ -2709,6 +2728,7 @@ pub fn prove_shard_precomputed(
                 table,
                 m,
                 n,
+                prec,
             } => {
                 let p = prove_softmax_rounded(
                     &store.idx[idx],
@@ -2717,6 +2737,7 @@ pub fn prove_shard_precomputed(
                     store.get(table),
                     m,
                     n,
+                    prec,
                     rng,
                 );
                 claims.push((
@@ -2745,7 +2766,7 @@ pub fn prove_shard_precomputed(
                 claims.push((out, p.r_scale.clone(), mle::eval(store.get(out), &p.r_scale)));
                 op_proofs.push(OpProof::SoftmaxBias(p));
             }
-            Op::SumNorm { x, out, m, n } => {
+            Op::SumNorm { x, out, m, n, prec } => {
                 let dummy_idx = vec![0u32; m * n];
                 let p = prove_softmax_rounded(
                     &dummy_idx,
@@ -2754,6 +2775,7 @@ pub fn prove_shard_precomputed(
                     &[],
                     m,
                     n,
+                    prec,
                     rng,
                 );
                 claims.push((x, p.r_scale.clone(), mle::eval(store.get(x), &p.r_scale)));
@@ -5835,6 +5857,7 @@ pub fn build_gpt2_layer(
             table: exp_table,
             m,
             n: m,
+            prec: 16,
         });
         ops.push(Op::MatMul {
             a: probs,
@@ -6223,6 +6246,7 @@ mod tests {
             table,
             m,
             n,
+            prec: 16,
         }];
         let proof = prove_shard(&mut store, &ops, &[out], &mut rng);
         assert!(verify_shard(&store.owned_slices(), &ops, &proof));
@@ -7374,6 +7398,7 @@ mod tests {
                 table: exp_table,
                 m,
                 n: m,
+                prec: 16,
             },
             Op::MatMul {
                 a: probs,
@@ -7534,6 +7559,7 @@ mod tests {
                 table: exp_table,
                 m,
                 n: m,
+                prec: 16,
             });
             ops.push(Op::MatMul {
                 a: probs,

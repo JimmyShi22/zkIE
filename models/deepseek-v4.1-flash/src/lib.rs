@@ -617,7 +617,7 @@ pub fn build_moe_gate(
     let s_sel = store.push(vec![]);
     ops.push(Op::ScaleVec { x: s, scale: sel, out: s_sel, shift: 0 });
     let weights_norm = store.push(vec![]);
-    ops.push(Op::SumNorm { x: s_sel, out: weights_norm, m, n });
+    ops.push(Op::SumNorm { x: s_sel, out: weights_norm, m, n, prec: 16 });
     // Official `Gate.forward`: `weights /= sum; weights *= route_scale`.
     let weights = store.push(vec![]);
     ops.push(Op::Scale { x: weights_norm, out: weights, factor: ROUTE_SCALE_Q16, shift: 16 });
@@ -1460,7 +1460,7 @@ pub fn build_mla_attention(
         let e = store.push(vec![]);
         let probs = store.push(vec![]);
         let idx = build_stable_softmax_index(store, ops, scores_aug, mask, m, n_pad, 1 << 21, 1 << 21, limb_table);
-        ops.push(Op::Softmax { idx, e, out: probs, table: exp_table, m, n: n_pad });
+        ops.push(Op::Softmax { idx, e, out: probs, table: exp_table, m, n: n_pad, prec: 16 });
         let attn_n = store.push(vec![]);
         let attn_r = store.push(vec![]);
         ops.push(Op::MatMul { a: probs, b: kvn_pad_aug, c: attn_n, m, k: n_pad, n: nope_pad });
@@ -1668,7 +1668,7 @@ pub fn build_mla_attention_compress(
         let e = store.push(vec![]);
         let probs = store.push(vec![]);
         let idx = build_stable_softmax_index(store, ops, scores_aug, mask, m, n_pad, 1 << 21, 1 << 21, limb_table);
-        ops.push(Op::Softmax { idx, e, out: probs, table: exp_table, m, n: n_pad });
+        ops.push(Op::Softmax { idx, e, out: probs, table: exp_table, m, n: n_pad, prec: 16 });
         let attn_n = store.push(vec![]);
         let attn_r = store.push(vec![]);
         ops.push(Op::MatMul { a: probs, b: kvn_aug, c: attn_n, m, k: n_pad, n: nope_pad });
@@ -1836,7 +1836,7 @@ pub fn build_compressor(
     );
     let e = store.push(vec![]);
     let probs = store.push(vec![]);
-    ops.push(Op::Softmax { idx: sidx, e, out: probs, table: exp_table, m: groups * hd, n: ratio });
+    ops.push(Op::Softmax { idx: sidx, e, out: probs, table: exp_table, m: groups * hd, n: ratio, prec: 16 });
 
     // Pooled sum over the in-group axis. `ratio` is a power of two here, so
     // each column can be gathered and combined with elementwise scale + add.
@@ -2027,6 +2027,7 @@ pub fn build_v41_layer(
     compress_cos: usize,
     compress_sin: usize,
     exp_table: usize,
+    exp_q32_table: usize,
     rsqrt_table: usize,
     limb_table: usize,
     sqrt_softplus_table: usize,
@@ -2068,7 +2069,7 @@ pub fn build_v41_layer(
         limb_table,
     );
     let (attn_pre, attn_post, attn_comb) =
-        build_hc_split(store, ops, attn_mix, attn_scale, attn_base, m, hc, iters, eps, sigmoid_table, exp_table, limb_table);
+        build_hc_split(store, ops, attn_mix, attn_scale, attn_base, m, hc, iters, eps, sigmoid_table, exp_table, exp_q32_table, limb_table);
     let attn_in = build_hc_pre(store, ops, x4, pre_mix, m, hc, d_stored);
     let attn_norm_w = {
         let v: Vec<i64> = file
@@ -2176,7 +2177,7 @@ pub fn build_v41_layer(
         limb_table,
     );
     let (ffn_pre, ffn_post, ffn_comb) =
-        build_hc_split(store, ops, ffn_mix, ffn_scale, ffn_base, m, hc, iters, eps, sigmoid_table, exp_table, limb_table);
+        build_hc_split(store, ops, ffn_mix, ffn_scale, ffn_base, m, hc, iters, eps, sigmoid_table, exp_table, exp_q32_table, limb_table);
     let ffn_in = build_hc_pre(store, ops, x4_attn, attn_pre, m, hc, d_stored);
     let ffn_norm_w = {
         let v: Vec<i64> = file
@@ -2251,6 +2252,7 @@ pub fn build_v41_forward(
     n_layers: usize,
     x: usize,
     exp_table: usize,
+    exp_q32_table: usize,
     rsqrt_table: usize,
     limb_table: usize,
     sqrt_softplus_table: usize,
@@ -2319,6 +2321,7 @@ pub fn build_v41_forward(
             ccos,
             csin,
             exp_table,
+            exp_q32_table,
             rsqrt_table,
             limb_table,
             sqrt_softplus_table,
@@ -2404,7 +2407,7 @@ pub fn push_embedding(store: &mut Store, path: &str, m: usize) -> usize {
 /// `SumNorm` op: `out[i,j] = round(x[i,j] * 2^16 / sum_k x[i,k])`.
 fn hc_row_norm(store: &mut Store, ops: &mut Vec<Op>, c: usize, m: usize, hc: usize) -> usize {
     let out = store.push(vec![]);
-    ops.push(Op::SumNorm { x: c, out, m: m * hc, n: hc });
+    ops.push(Op::SumNorm { x: c, out, m: m * hc, n: hc, prec: 32 });
     out
 }
 
@@ -2413,7 +2416,7 @@ fn hc_row_norm(store: &mut Store, ops: &mut Vec<Op>, c: usize, m: usize, hc: usi
 fn hc_col_norm(store: &mut Store, ops: &mut Vec<Op>, c: usize, m: usize, hc: usize) -> usize {
     let c_t = transpose_hc_jk(store, ops, c, m, hc);
     let out_t = store.push(vec![]);
-    ops.push(Op::SumNorm { x: c_t, out: out_t, m: m * hc, n: hc });
+    ops.push(Op::SumNorm { x: c_t, out: out_t, m: m * hc, n: hc, prec: 32 });
     transpose_hc_jk(store, ops, out_t, m, hc)
 }
 
@@ -2434,6 +2437,7 @@ pub fn build_hc_split(
     _eps: i64,
     sigmoid_table: usize,
     exp_table: usize,
+    exp_q32_table: usize,
     limb_table: usize,
 ) -> (usize, usize, usize) {
     let mix_hc = (2 + hc) * hc;
@@ -2500,7 +2504,7 @@ pub fn build_hc_split(
     );
     let e = store.push(vec![]);
     let c_softmax = store.push(vec![]);
-    ops.push(Op::Softmax { idx: softmax_idx, e, out: c_softmax, table: exp_table, m: m * hc, n: hc });
+    ops.push(Op::Softmax { idx: softmax_idx, e, out: c_softmax, table: exp_q32_table, m: m * hc, n: hc, prec: 32 });
     let mut c = c_softmax;
 
     // Sinkhorn: one column normalization, then iters-1 rounds of row/column
@@ -2510,8 +2514,11 @@ pub fn build_hc_split(
         c = hc_row_norm(store, ops, c, m, hc);
         c = hc_col_norm(store, ops, c, m, hc);
     }
+    // Round the Q32 sinkhorn matrix back to Q16 for the residual mixing.
+    let comb = store.push(vec![]);
+    ops.push(Op::Scale { x: c, out: comb, factor: 1, shift: 16 });
 
-    (pre, post, c)
+    (pre, post, comb)
 }
 
 /// Collapse the `hc` residual copies with the incoming `pre` coefficients.
@@ -2668,6 +2675,7 @@ pub fn build_block(
     rsqrt_table: usize,
     limb_table: usize,
     exp_table: usize,
+    exp_q32_table: usize,
     sqrt_softplus_table: usize,
     silu_table: usize,
     clip_table: usize,
@@ -2707,7 +2715,7 @@ pub fn build_block(
         limb_table,
     );
     let (attn_pre, attn_post, attn_comb) =
-        build_hc_split(store, ops, attn_mix, attn_scale, attn_base, m, hc, iters, eps, sigmoid_table, exp_table, limb_table);
+        build_hc_split(store, ops, attn_mix, attn_scale, attn_base, m, hc, iters, eps, sigmoid_table, exp_table, exp_q32_table, limb_table);
     let attn_in = build_hc_pre(store, ops, x4, pre_mix, m, hc, d_stored);
 
     let attn_norm_w = {
@@ -2775,7 +2783,7 @@ pub fn build_block(
         limb_table,
     );
     let (ffn_pre, ffn_post, ffn_comb) =
-        build_hc_split(store, ops, ffn_mix, ffn_scale, ffn_base, m, hc, iters, eps, sigmoid_table, exp_table, limb_table);
+        build_hc_split(store, ops, ffn_mix, ffn_scale, ffn_base, m, hc, iters, eps, sigmoid_table, exp_table, exp_q32_table, limb_table);
     let ffn_in = build_hc_pre(store, ops, x4_attn, attn_pre, m, hc, d_stored);
 
     let ffn_norm_w = {

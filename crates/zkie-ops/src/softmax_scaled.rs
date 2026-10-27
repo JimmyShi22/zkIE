@@ -37,6 +37,7 @@ pub struct SoftmaxRoundedProof {
     pub sum_ch: Vec<Goldilocks>,
     pub r_scale: Vec<Goldilocks>,
     pub claimed: Goldilocks,
+    pub prec: u32,
 }
 
 pub fn prove_softmax_rounded(
@@ -46,6 +47,7 @@ pub fn prove_softmax_rounded(
     table: &[Goldilocks],
     m: usize,
     n: usize,
+    prec: u32,
     rng: &mut impl ChallengeSource,
 ) -> SoftmaxRoundedProof {
     assert_eq!(indices.len(), m * n);
@@ -72,26 +74,22 @@ pub fn prove_softmax_rounded(
     );
 
     let sum_broadcast: Vec<Goldilocks> = (0..m * n).map(|idx| sum[idx / n]).collect();
+    let two = Goldilocks::from_u64(1u64 << prec);
     let rem: Vec<Goldilocks> = (0..m * n)
         .map(|ij| {
-            from_i64(
-                zkie_core::common::fixed_point::to_i64(e[ij]) * (1i64 << 16)
-                    - zkie_core::common::fixed_point::to_i64(out[ij])
-                        * zkie_core::common::fixed_point::to_i64(sum_broadcast[ij]),
-            )
+            e[ij] * two - out[ij] * sum_broadcast[ij]
         })
         .collect();
     let r_scale: Vec<Goldilocks> = (0..(m * n).trailing_zeros() as usize)
         .map(|_| rng.field())
         .collect();
-    let two16 = Goldilocks::from_u64(1u64 << 16);
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
-    // out * sum_broadcast - e * 2^16 - rem = 0
+    // out * sum_broadcast - e * 2^prec - rem = 0
     let rescale = prove_virtual(
         &[out, e, &sum_broadcast, &rem],
         &[
             (Goldilocks::ONE, vec![0usize, 2usize]),
-            (neg * two16, vec![1usize]),
+            (neg * two, vec![1usize]),
             (Goldilocks::ONE, vec![3usize]),
         ],
         Goldilocks::ZERO,
@@ -105,6 +103,7 @@ pub fn prove_softmax_rounded(
         sum_ch,
         r_scale,
         claimed,
+        prec,
     }
 }
 
@@ -118,13 +117,13 @@ pub fn verify_softmax_rounded(proof: &SoftmaxRoundedProof) -> bool {
     ) {
         return false;
     }
-    let two16 = Goldilocks::from_u64(1u64 << 16);
+    let two = Goldilocks::from_u64(1u64 << proof.prec);
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
     verify_virtual(
         &proof.rescale,
         &[
             (Goldilocks::ONE, vec![0usize, 2usize]),
-            (neg * two16, vec![1usize]),
+            (neg * two, vec![1usize]),
             (Goldilocks::ONE, vec![3usize]),
         ],
         Goldilocks::ZERO,

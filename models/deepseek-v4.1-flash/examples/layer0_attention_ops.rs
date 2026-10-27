@@ -131,6 +131,7 @@ fn main() {
             table: exp_table,
             m,
             n: m,
+            prec: 16,
         });
         ops.push(Op::SoftmaxBias {
             e,

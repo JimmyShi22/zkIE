@@ -22,6 +22,14 @@ fn load_i32(path: &str) -> Vec<Goldilocks> {
         .collect()
 }
 
+fn load_i64(path: &str) -> Vec<Goldilocks> {
+    std::fs::read(path)
+        .unwrap()
+        .chunks_exact(8)
+        .map(|c| from_i64(i64::from_le_bytes(c.try_into().unwrap())))
+        .collect()
+}
+
 fn peak_rss_kb() -> u64 {
     let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     for line in s.lines() {
@@ -48,6 +56,7 @@ fn main() {
             .collect::<Vec<_>>(),
     );
     let exp_table = store.push(load_i32("/data/zkIE/models/gpt2/weights/exp_table_i32.bin"));
+    let exp_q32 = store.push(load_i64("/data/zkIE/models/exp_table_q32_i64.bin"));
     let sqrt_sp = store.push(load_i32("/data/zkIE/models/sqrt_softplus_table_i32.bin"));
     let silu = store.push(load_i32("/data/zkIE/models/silu_clipped_table_i32.bin"));
     let clip = store.push(load_i32("/data/zkIE/models/clip_m10_p10_table_i32.bin"));
@@ -68,6 +77,7 @@ fn main() {
         rsqrt_table,
         limb_table,
         exp_table,
+        exp_q32,
         sqrt_sp,
         silu,
         clip,

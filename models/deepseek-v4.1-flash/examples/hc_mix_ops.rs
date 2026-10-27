@@ -11,6 +11,14 @@ fn load_i32(path: &str) -> Vec<Goldilocks> {
         .collect()
 }
 
+fn load_i64(path: &str) -> Vec<Goldilocks> {
+    std::fs::read(path)
+        .unwrap()
+        .chunks_exact(8)
+        .map(|c| from_i64(i64::from_le_bytes(c.try_into().unwrap())))
+        .collect()
+}
+
 fn main() {
     let path = std::env::args().nth(1).unwrap_or_else(|| {
         "/data/zkIE/models/deepseek-v4.1-flash/raw/model-00003-of-00048.safetensors".to_string()
@@ -70,6 +78,7 @@ fn main() {
         limb_table,
     );
     let exp_table = store.push(load_i32("/data/zkIE/models/gpt2/weights/exp_table_i32.bin"));
+    let exp_q32 = store.push(load_i64("/data/zkIE/models/exp_table_q32_i64.bin"));
     let sigmoid_table = store.push(load_i32("/data/zkIE/models/sigmoid_table_i32.bin"));
     let (pre, post, comb) = build_hc_split(
         &mut store,
@@ -83,6 +92,7 @@ fn main() {
         0,
         sigmoid_table,
         exp_table,
+        exp_q32,
         limb_table,
     );
 

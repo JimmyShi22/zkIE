@@ -13,6 +13,14 @@ fn load_i32(path: &str) -> Vec<Goldilocks> {
         .collect()
 }
 
+fn load_i64(path: &str) -> Vec<Goldilocks> {
+    std::fs::read(path)
+        .unwrap()
+        .chunks_exact(8)
+        .map(|c| from_i64(i64::from_le_bytes(c.try_into().unwrap())))
+        .collect()
+}
+
 fn load_i32_raw(path: &str) -> Vec<i32> {
     std::fs::read(path)
         .unwrap()
@@ -38,6 +46,7 @@ fn main() {
     let mut store = Store::new();
     let mut ops: Vec<Op> = Vec::new();
     let exp_table = store.push(load_i32("/data/zkIE/models/gpt2/weights/exp_table_i32.bin"));
+    let exp_q32 = store.push(load_i64("/data/zkIE/models/exp_table_q32_i64.bin"));
     let rsqrt_table = store.push(load_i32("/data/zkIE/models/gpt2/weights/rsqrt_table_i32.bin"));
     let limb_table = store.push(
         (0..(1usize << 16))
@@ -71,6 +80,7 @@ fn main() {
         n_layers,
         x,
         exp_table,
+        exp_q32,
         rsqrt_table,
         limb_table,
         sqrt_sp,
