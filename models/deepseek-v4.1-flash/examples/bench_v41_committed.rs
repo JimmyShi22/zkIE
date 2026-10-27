@@ -13,8 +13,7 @@ use zkie_models_deepseek_v41_flash::{
     build_final_logits, build_v41_forward, push_embedding, DIM_PAD,
 };
 use zkie_ops::compose::{
-    commit_model_weights, prove_committed_shard_dag_with_ranges,
-    verify_committed_shard_dag_with_ranges, Op, Store,
+    prove_committed_shard_dag_streaming, verify_committed_shard_dag_with_ranges, Op, Store,
 };
 
 fn load_i32(path: &str) -> Vec<Goldilocks> {
@@ -125,24 +124,18 @@ fn main() {
 
     let whir = Whir::new_testing(10);
     let mut rng = XorShift64::new(0xB10C);
-    let cache_dir = format!("/data/jimmyshi/zkie-cache/deepseek-v41-flash-l{n_layers}-m{m}");
 
     let t0 = std::time::Instant::now();
-    let cached = commit_model_weights(&store, &ops, &cache_dir);
-    let commit_t = t0.elapsed();
-
-    let t1 = std::time::Instant::now();
-    let proof = prove_committed_shard_dag_with_ranges(
+    let proof = prove_committed_shard_dag_streaming(
         &mut store,
         &ops,
         &ranges,
         &whir,
-        &cached,
         &mut rng,
         tokens_t,
         argmax_t,
     );
-    let prove_t = t1.elapsed();
+    let prove_t = t0.elapsed();
 
     let t2 = std::time::Instant::now();
     let bytes = bincode::serialize(&proof).unwrap();
@@ -157,7 +150,7 @@ fn main() {
 
     let am = &store.idx[argmax_t];
     println!(
-        "v41 committed: layers={n_layers} m={m} routed={routed} shards={} ops={} commit={commit_t:?} prove={prove_t:?} verify={verify_t:?} rss={}kB proof_bytes={} argmax={:?}",
+        "v41 committed: layers={n_layers} m={m} routed={routed} shards={} ops={} prove={prove_t:?} verify={verify_t:?} rss={}kB proof_bytes={} argmax={:?}",
         ranges.len(),
         ops.len(),
         peak_rss_kb(),

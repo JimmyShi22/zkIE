@@ -3763,21 +3763,26 @@ pub struct CachedWeightBatch {
     pub cache_path: std::path::PathBuf,
 }
 
-/// Phase 1 (offline, once): commit every weight group and stream the Merkle
-/// prover data to a cache file. Returns only commitment + rebuild params; the
-/// heavy WHIR commitment (RS encoding + FFT + Merkle) is paid exactly once here.
-pub fn commit_model_weights(
-    store: &Store,
-    ops: &[Op],
-    cache_dir: &str,
-) -> Vec<CachedWeightBatch> {
-    // Borrowed from feature/batch-pcs: 90-bit security + pow_bits=17 (enough for
-    // packed codewords up to 2^26), instead of the low-security testing params.
-    const SECURITY: usize = 90;
+/// Grouping metadata for one weight batch, without the commitment. Used to
+/// stream commit + open per group for the full 552B model, where the disk can
+/// hold only one group's Merkle prover data at a time.
+#[derive(Clone)]
+pub struct WeightGroupPlan {
+    pub arity: usize,
+    pub num_tables: usize,
+    pub num_vars: usize,
+    pub security: usize,
+    pub pow_bits: usize,
+    pub table_ids: Vec<T>,
+    pub expert_indices: Vec<Option<usize>>,
+}
 
+/// Enumerate the weight-commit units and group them by arity, without
+/// materializing or committing anything. Shared by the disk-cached and the
+/// streaming committed provers.
+pub fn weight_commit_plan(store: &Store, ops: &[Op]) -> Vec<WeightGroupPlan> {
+    const SECURITY: usize = 90;
     let weight_tensors = collect_weight_tensors(ops);
-    // Expand ExpertStacks into per-expert commit units so the 552B commitment
-    // streams one expert weight at a time instead of one 12.9B-element stack.
     let mut units: Vec<(T, Option<usize>)> = Vec::new();
     for &t in &weight_tensors {
         let n = store.n_experts(t);
@@ -3796,21 +3801,15 @@ pub fn commit_model_weights(
             Some(_) => store.len(t) / store.n_experts(t),
             None => store.len(t),
         };
-        // WHIR folding factor is 5, so a tensor shorter than 2^5 cannot be
-        // folded; skip such tiny weights (they are negligible and have no
-        // meaningful commitment).
         if len < 32 {
             continue;
         }
         by_size.entry(len).or_default().push((t, e));
     }
-    std::fs::create_dir_all(cache_dir).expect("create weight cache dir");
 
-    let mut batches = Vec::new();
+    let mut plans = Vec::new();
     for (len, group) in by_size {
         let arity = len.trailing_zeros() as usize;
-        // Horizontal merge: pack same-arity weights into groups that fit the
-        // WHIR PoW budget (num_vars = arity + log2(group_size) <= 26).
         let eff_group_size = if arity <= 26 {
             (1usize << (26 - arity)).max(1)
         } else {
@@ -3820,51 +3819,73 @@ pub fn commit_model_weights(
             let num_tables = ids.len();
             let total_slots = num_tables * (1usize << arity);
             let num_vars = total_slots.next_power_of_two().trailing_zeros() as usize;
-            // Per-group adaptive PoW budget: use the minimum pow_bits required at
-            // 90-bit security for this group's num_variables, so a large tensor
-            // (e.g. a 2^28 lm_head) gets a higher budget while small groups stay
-            // cheap. See Whir::required_pow_bits.
             let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, SECURITY);
-            // Materialize exactly this group, commit it, then drop the vectors
-            // before moving to the next group. This keeps peak memory near the
-            // largest single group instead of the whole 552B parameter set.
-            let materialized: Vec<Vec<Goldilocks>> = ids
-                .iter()
-                .map(|&(t, e)| match e {
-                    Some(ei) => store.materialize_expert_one(t, ei),
-                    None => store.materialize(t).into_owned(),
-                })
-                .collect();
-            let refs: Vec<&[Goldilocks]> =
-                materialized.iter().map(|v| v.as_slice()).collect();
-            let base_whir = zkie_core::pcs::whir::Whir::with_params(arity, SECURITY, pow_bits);
-            let (commitment, prover_data, _protocol, batch_whir) =
-                base_whir.commit_batch(&refs);
-            let num_vars = batch_whir.num_variables();
-            let table_ids: Vec<T> = ids.iter().map(|&(t, _)| t).collect();
-            let expert_indices: Vec<Option<usize>> = ids.iter().map(|&(_, e)| e).collect();
-            let cache_path = std::path::PathBuf::from(cache_dir).join(format!(
-                "weight-a{arity}-g{}.bin",
-                batches.len()
-            ));
-            let file = std::fs::File::create(&cache_path).expect("create weight cache");
-            let mut writer = std::io::BufWriter::new(file);
-            bincode::serialize_into(&mut writer, &commitment).expect("write cache commitment");
-            zkie_core::pcs::whir::Whir::serialize_batch_prover_data_into(prover_data, &mut writer)
-                .expect("write cache prover data");
-            std::io::Write::flush(&mut writer).expect("flush weight cache");
-            batches.push(CachedWeightBatch {
-                commitment,
+            plans.push(WeightGroupPlan {
                 arity,
                 num_tables,
                 num_vars,
                 security: SECURITY,
                 pow_bits,
-                table_ids,
-                expert_indices,
-                cache_path,
+                table_ids: ids.iter().map(|&(t, _)| t).collect(),
+                expert_indices: ids.iter().map(|&(_, e)| e).collect(),
             });
         }
+    }
+    plans
+}
+
+/// Phase 1 (offline, once): commit every weight group and stream the Merkle
+/// prover data to a cache file. Returns only commitment + rebuild params; the
+/// heavy WHIR commitment (RS encoding + FFT + Merkle) is paid exactly once here.
+pub fn commit_model_weights(
+    store: &Store,
+    ops: &[Op],
+    cache_dir: &str,
+) -> Vec<CachedWeightBatch> {
+    std::fs::create_dir_all(cache_dir).expect("create weight cache dir");
+
+    let mut batches = Vec::new();
+    for plan in weight_commit_plan(store, ops) {
+        // Materialize exactly this group, commit it, then drop the vectors.
+        let materialized: Vec<Vec<Goldilocks>> = plan
+            .table_ids
+            .iter()
+            .zip(plan.expert_indices.iter())
+            .map(|(&t, &e)| match e {
+                Some(ei) => store.materialize_expert_one(t, ei),
+                None => store.materialize(t).into_owned(),
+            })
+            .collect();
+        let refs: Vec<&[Goldilocks]> = materialized.iter().map(|v| v.as_slice()).collect();
+        let base_whir = zkie_core::pcs::whir::Whir::with_params(
+            plan.arity,
+            plan.security,
+            plan.pow_bits,
+        );
+        let (commitment, prover_data, _protocol, batch_whir) = base_whir.commit_batch(&refs);
+        let num_vars = batch_whir.num_variables();
+        let cache_path = std::path::PathBuf::from(cache_dir).join(format!(
+            "weight-a{}-g{}.bin",
+            plan.arity,
+            batches.len()
+        ));
+        let file = std::fs::File::create(&cache_path).expect("create weight cache");
+        let mut writer = std::io::BufWriter::new(file);
+        bincode::serialize_into(&mut writer, &commitment).expect("write cache commitment");
+        zkie_core::pcs::whir::Whir::serialize_batch_prover_data_into(prover_data, &mut writer)
+            .expect("write cache prover data");
+        std::io::Write::flush(&mut writer).expect("flush weight cache");
+        batches.push(CachedWeightBatch {
+            commitment,
+            arity: plan.arity,
+            num_tables: plan.num_tables,
+            num_vars,
+            security: plan.security,
+            pow_bits: plan.pow_bits,
+            table_ids: plan.table_ids,
+            expert_indices: plan.expert_indices,
+            cache_path,
+        });
     }
     batches
 }
@@ -4033,6 +4054,7 @@ fn prove_committed_shard_dag_impl(
     ranges: &[(usize, usize)],
     _whir: &zkie_core::pcs::whir::Whir,
     cached_weights: &[CachedWeightBatch],
+    streaming: bool,
     rng: &mut impl ChallengeSource,
     tokens_t: T,
     argmax_t: T,
@@ -4063,16 +4085,28 @@ fn prove_committed_shard_dag_impl(
         cross_binds.push(sp);
     }
 
-    // Restore each weight group's Merkle prover data from its cache file (no
-    // re-commit), then reduce each group's claims to one FRI proof + one sumcheck.
-    // Materialization is streamed per group: the whole 552B parameter set is
-    // never held in memory at once.
+    // Weight groups: either restore each group's Merkle prover data from its
+    // cache file, or (`streaming`) commit the group inline and drop it, so the
+    // full 552B parameter set never occupies disk or memory at once.
+    let streaming_plans = if streaming {
+        Some(weight_commit_plan(store, ops))
+    } else {
+        None
+    };
+    let num_groups = streaming_plans
+        .as_ref()
+        .map(|p| p.len())
+        .unwrap_or(cached_weights.len());
     let mut weight_locs: std::collections::BTreeMap<T, WeightClaimLoc> =
         std::collections::BTreeMap::new();
     let mut expert_weight_locs: std::collections::BTreeMap<(T, usize), WeightClaimLoc> =
         std::collections::BTreeMap::new();
-    for (bi, cw) in cached_weights.iter().enumerate() {
-        for (i, (&t, &e)) in cw.table_ids.iter().zip(cw.expert_indices.iter()).enumerate() {
+    for bi in 0..num_groups {
+        let (table_ids, expert_indices) = match &streaming_plans {
+            Some(p) => (&p[bi].table_ids, &p[bi].expert_indices),
+            None => (&cached_weights[bi].table_ids, &cached_weights[bi].expert_indices),
+        };
+        for (i, (&t, &e)) in table_ids.iter().zip(expert_indices.iter()).enumerate() {
             let loc = WeightClaimLoc { batch: bi, table: i };
             match e {
                 Some(ei) => {
@@ -4085,7 +4119,6 @@ fn prove_committed_shard_dag_impl(
         }
     }
 
-    let num_groups = cached_weights.len();
     let mut group_claims: Vec<Vec<(usize, Vec<Goldilocks>, Goldilocks)>> =
         vec![Vec::new(); num_groups];
     for shard in &plain.shards {
@@ -4103,19 +4136,64 @@ fn prove_committed_shard_dag_impl(
 
     let mut weight_batch_openings = Vec::with_capacity(num_groups);
     let mut weight_batches = Vec::with_capacity(num_groups);
-    for (bi, cw) in cached_weights.iter().enumerate() {
+    for bi in 0..num_groups {
+        let (arity, num_tables, num_vars, security, pow_bits) = match &streaming_plans {
+            Some(p) => {
+                let g = &p[bi];
+                (g.arity, g.num_tables, g.num_vars, g.security, g.pow_bits)
+            }
+            None => {
+                let c = &cached_weights[bi];
+                (c.arity, c.num_tables, c.num_vars, c.security, c.pow_bits)
+            }
+        };
         let claims = &group_claims[bi];
         let table_idxs: Vec<usize> = claims.iter().map(|(ti, _, _)| *ti).collect();
         let points: Vec<Vec<Goldilocks>> = claims.iter().map(|(_, pt, _)| pt.clone()).collect();
         let claimed: Vec<Goldilocks> = claims.iter().map(|(_, _, ev)| *ev).collect();
 
-        // Verifier-side batch commitment (no prover data); prover-side Whir is
-        // reconstructed below from the same params.
+        // Materialize exactly this group's tensors, then commit (streaming) or
+        // restore from cache, keeping peak memory at one group.
+        let (table_ids, expert_indices) = match &streaming_plans {
+            Some(p) => (&p[bi].table_ids, &p[bi].expert_indices),
+            None => (&cached_weights[bi].table_ids, &cached_weights[bi].expert_indices),
+        };
+        let group_tensors: Vec<Vec<Goldilocks>> = table_ids
+            .iter()
+            .zip(expert_indices.iter())
+            .map(|(&t, &e)| match e {
+                Some(ei) => store.materialize_expert_one(t, ei),
+                None => store.materialize(t).into_owned(),
+            })
+            .collect();
+        let ref_slices: Vec<&[Goldilocks]> = group_tensors.iter().map(|v| v.as_slice()).collect();
+
+        let (commitment, prover_data, batch_whir) = match &streaming_plans {
+            Some(_) => {
+                let base_whir = zkie_core::pcs::whir::Whir::with_params(arity, security, pow_bits);
+                let (c, pd, _protocol, bw) = base_whir.commit_batch(&ref_slices);
+                (c, pd, bw)
+            }
+            None => {
+                let batch_whir =
+                    zkie_core::pcs::whir::Whir::with_params(num_vars, security, pow_bits);
+                let mut reader = std::io::BufReader::new(
+                    std::fs::File::open(&cached_weights[bi].cache_path).expect("open weight cache"),
+                );
+                let commitment: zkie_core::pcs::whir::Commitment =
+                    bincode::deserialize_from(&mut reader).expect("read cache commitment");
+                let prover_data = batch_whir
+                    .restore_batch_prover_data_from(&ref_slices, &mut reader)
+                    .expect("restore cache prover data");
+                (commitment, prover_data, batch_whir)
+            }
+        };
+
         weight_batches.push(WeightBatchCommit {
-            commitment: cw.commitment.clone(),
-            arity: cw.arity,
-            num_tables: cw.num_tables,
-            whir: zkie_core::pcs::whir::Whir::with_params(cw.num_vars, cw.security, cw.pow_bits),
+            commitment: commitment.clone(),
+            arity,
+            num_tables,
+            whir: zkie_core::pcs::whir::Whir::with_params(num_vars, security, pow_bits),
         });
 
         if claims.is_empty() {
@@ -4128,37 +4206,13 @@ fn prove_committed_shard_dag_impl(
             continue;
         }
 
-        let batch_whir =
-            zkie_core::pcs::whir::Whir::with_params(cw.num_vars, cw.security, cw.pow_bits);
-        let mut reader = std::io::BufReader::new(
-            std::fs::File::open(&cw.cache_path).expect("open weight cache"),
-        );
-        let commitment: zkie_core::pcs::whir::Commitment =
-            bincode::deserialize_from(&mut reader).expect("read cache commitment");
-        // Materialize exactly this group (already kept to one group's worth by
-        // commit_model_weights), restore its prover data, then drop it before
-        // moving to the next group.
-        let group_tensors: Vec<Vec<Goldilocks>> = cw
-            .table_ids
-            .iter()
-            .zip(cw.expert_indices.iter())
-            .map(|(&t, &e)| match e {
-                Some(ei) => store.materialize_expert_one(t, ei),
-                None => store.materialize(t).into_owned(),
-            })
-            .collect();
-        let ref_slices: Vec<&[Goldilocks]> =
-            group_tensors.iter().map(|v| v.as_slice()).collect();
-        let prover_data = batch_whir
-            .restore_batch_prover_data_from(&ref_slices, &mut reader)
-            .expect("restore cache prover data");
-        let protocol = batch_whir.batch_opening_protocol(cw.num_tables, cw.arity);
+        let protocol = batch_whir.batch_opening_protocol(num_tables, arity);
         let ctx = zkie_core::pcs::committed::BatchCtx {
             commitment,
             prover_data,
             protocol,
             whir: batch_whir,
-            num_tables: cw.num_tables,
+            num_tables,
         };
         let tensors: Vec<Vec<Goldilocks>> = claims
             .iter()
@@ -5057,6 +5111,7 @@ pub fn prove_committed_shard_dag(
         &ranges,
         whir,
         cached_weights,
+        false,
         rng,
         tokens_t,
         argmax_t,
@@ -5079,6 +5134,33 @@ pub fn prove_committed_shard_dag_with_ranges(
         ranges,
         whir,
         cached_weights,
+        false,
+        rng,
+        tokens_t,
+        argmax_t,
+    )
+}
+
+/// Committed prove that commits every weight group inline and drops it
+/// immediately (no disk cache). For the full 552B parameter set the cached
+/// path would need tens of TB of disk; streaming keeps disk near zero and
+/// memory at one group's size.
+pub fn prove_committed_shard_dag_streaming(
+    store: &mut Store,
+    ops: &[Op],
+    ranges: &[(usize, usize)],
+    whir: &zkie_core::pcs::whir::Whir,
+    rng: &mut impl ChallengeSource,
+    tokens_t: T,
+    argmax_t: T,
+) -> CommittedShardDagProof {
+    prove_committed_shard_dag_impl(
+        store,
+        ops,
+        ranges,
+        whir,
+        &[],
+        true,
         rng,
         tokens_t,
         argmax_t,
