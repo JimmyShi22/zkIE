@@ -19,7 +19,6 @@
 use crate::common::field::{Goldilocks, PrimeCharacteristicRing};
 use crate::common::mle;
 use crate::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
-use rayon::prelude::*;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct BatchedMatmulProof {
@@ -341,20 +340,17 @@ pub fn gather_matmul_forward(
     assert_eq!(seg.len(), s * k);
     assert_eq!(expert_of.len(), s);
     assert_eq!(w_all.len(), n_experts * k * n);
-    // Parallel over positions, but keep field accumulation so the result stays
-    // bit-identical to the proof path (some FP4 scales are large enough that a
-    // naive i64 accumulation would wrap).
     let mut g = vec![Goldilocks::ZERO; s * n];
-    g.par_chunks_mut(n).enumerate().for_each(|(pos, gj)| {
+    for pos in 0..s {
         let base = expert_of[pos] as usize * k * n;
         for j in 0..n {
             let mut acc = Goldilocks::ZERO;
             for d in 0..k {
                 acc = acc + seg[pos * k + d] * w_all[base + d * n + j];
             }
-            gj[j] = acc;
+            g[pos * n + j] = acc;
         }
-    });
+    }
     g
 }
 

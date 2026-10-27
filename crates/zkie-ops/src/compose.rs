@@ -723,14 +723,10 @@ impl Store {
         match &self.v[id] {
             TensorData::ExpertStack { experts, k, n } => {
                 let mut out = vec![Goldilocks::ZERO; rows.len() * k * n];
-                // Dequantize the selected experts in parallel. `rows` carries
-                // unique expert ids (the caller dedups), so there is no write
-                // race; the backing shard is a read-only mmap.
-                out.par_chunks_mut(k * n)
-                    .zip(rows.par_iter())
-                    .for_each(|(chunk, &e)| {
-                        chunk.copy_from_slice(&materialize_expert(&experts[e as usize]));
-                    });
+                for (i, &e) in rows.iter().enumerate() {
+                    let w = materialize_expert(&experts[e as usize]);
+                    out[i * k * n..(i + 1) * k * n].copy_from_slice(&w);
+                }
                 out
             }
             _ => panic!("materialize_expert_rows on non-expert-stack tensor"),
