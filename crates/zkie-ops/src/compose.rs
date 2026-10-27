@@ -2567,20 +2567,38 @@ pub fn prove_shard_precomputed(
                 let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| rng.field()).collect();
                 let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
                 let ch: Vec<Goldilocks> = (0..(s * k).trailing_zeros() as usize).map(|_| rng.field()).collect();
-                let wv = store.materialize(w);
-                let p = bmm::prove_gather_matmul(
-                    store.get(a),
-                    &store.idx[expert_of],
-                    wv.as_ref(),
-                    store.get(c),
-                    s,
-                    k,
-                    n,
-                    n_experts,
-                    &u,
-                    &v,
-                    &ch,
-                );
+                let p = if store.n_experts(w) > 1 {
+                    // Full 552B MoE: stream one expert at a time so the proof
+                    // never materializes the whole expert stack.
+                    bmm::prove_gather_matmul_streaming(
+                        store.get(a),
+                        &store.idx[expert_of],
+                        |e| store.materialize_expert_one(w, e),
+                        store.get(c),
+                        s,
+                        k,
+                        n,
+                        n_experts,
+                        &u,
+                        &v,
+                        &ch,
+                    )
+                } else {
+                    let wv = store.materialize(w);
+                    bmm::prove_gather_matmul(
+                        store.get(a),
+                        &store.idx[expert_of],
+                        wv.as_ref(),
+                        store.get(c),
+                        s,
+                        k,
+                        n,
+                        n_experts,
+                        &u,
+                        &v,
+                        &ch,
+                    )
+                };
                 claims.push((a, ch.clone(), mle::eval(store.get(a), &ch)));
                 let mut cp = v.clone();
                 cp.extend_from_slice(&u);
