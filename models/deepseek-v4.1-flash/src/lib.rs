@@ -28,6 +28,11 @@ pub const SLIDING_WINDOW: usize = 128;
 pub const HC_MULT: usize = 4;
 pub const QUANT_BLOCK: usize = 32;
 pub const VOCAB: usize = 129280;
+/// `compress_rope_theta` from config.json: layers with `compress_ratio > 0`
+/// rotate their window KV, query, and compressed KV with this base instead of
+/// the default 10000.
+pub const COMPRESS_ROPE_THETA: f64 = 160000.0;
+pub const ROPE_THETA: f64 = 10000.0;
 /// MoE routed-expert scaling (`routed_scaling_factor = 1.5`) in Q16. The
 /// official `Gate.forward` multiplies the row-normalized top-k scores by this
 /// factor after normalization.
@@ -405,13 +410,13 @@ fn pad_sink_matrix(
 
 /// Position-dependent RoPE cos/sin tables for a `qk`-wide rotary tail, at fixed
 /// point 2^16. `cos[p*half+i] = cos(p * 10000^(-2i/qk))`.
-pub fn build_rope_tables(store: &mut Store, m: usize, qk: usize) -> (usize, usize) {
+pub fn build_rope_tables(store: &mut Store, m: usize, qk: usize, theta: f64) -> (usize, usize) {
     let half = qk / 2;
     let mut cos = Vec::with_capacity(m * half);
     let mut sin = Vec::with_capacity(m * half);
     for p in 0..m {
         for i in 0..half {
-            let theta = p as f64 * (10000f64).powf(-2.0 * i as f64 / qk as f64);
+            let theta = p as f64 * theta.powf(-2.0 * i as f64 / qk as f64);
             cos.push(from_i64((theta.cos() * 65536.0).round() as i64));
             sin.push(from_i64((theta.sin() * 65536.0).round() as i64));
         }
@@ -421,14 +426,14 @@ pub fn build_rope_tables(store: &mut Store, m: usize, qk: usize) -> (usize, usiz
 
 /// RoPE cos/sin tables for arbitrary positions (e.g. compressed KV latents sit
 /// at `g * ratio` instead of consecutive positions).
-pub fn build_rope_tables_at(store: &mut Store, positions: &[usize], qk: usize) -> (usize, usize) {
+pub fn build_rope_tables_at(store: &mut Store, positions: &[usize], qk: usize, theta: f64) -> (usize, usize) {
     let half = qk / 2;
     let n = positions.len();
     let mut cos = Vec::with_capacity(n * half);
     let mut sin = Vec::with_capacity(n * half);
     for &p in positions {
         for i in 0..half {
-            let theta = p as f64 * (10000f64).powf(-2.0 * i as f64 / qk as f64);
+            let theta = p as f64 * theta.powf(-2.0 * i as f64 / qk as f64);
             cos.push(from_i64((theta.cos() * 65536.0).round() as i64));
             sin.push(from_i64((theta.sin() * 65536.0).round() as i64));
         }
@@ -2300,10 +2305,11 @@ pub fn build_v41_forward(
         }
         let ratio = compress_ratio(layer);
         let file = open_shard(&layer_shard(dir, layer));
-        let (cos, sin) = build_rope_tables(store, m, HEAD_QK);
+        let rope_theta = if ratio > 0 { COMPRESS_ROPE_THETA } else { ROPE_THETA };
+        let (cos, sin) = build_rope_tables(store, m, HEAD_QK, rope_theta);
         let groups = if ratio > 0 { m / ratio } else { 0 };
         let cpos: Vec<usize> = (0..groups).map(|g| g * ratio).collect();
-        let (ccos, csin) = build_rope_tables_at(store, &cpos, HEAD_QK);
+        let (ccos, csin) = build_rope_tables_at(store, &cpos, HEAD_QK, rope_theta);
         let (x4o, pre_mixo, new_ckv) = build_v41_layer(
             store,
             ops,
@@ -2729,7 +2735,7 @@ pub fn build_block(
     let attn_in_norm =
         build_rms_norm(store, ops, attn_in, attn_norm_w, rsqrt_table, limb_table, m, DIM_PAD, DIM);
 
-    let (cos_t, sin_t) = build_rope_tables(store, m, HEAD_QK);
+    let (cos_t, sin_t) = build_rope_tables(store, m, HEAD_QK, ROPE_THETA);
     let (q, kv) = build_mla_qkv(
         store,
         ops,

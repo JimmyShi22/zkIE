@@ -98,13 +98,15 @@ def build_attention(t, layer, x, m, ratio, compress_kv):
     q = (qr @ wq_b.T).reshape(1, m, N_HEADS, HEAD_DIM)
     kv = rms_norm(x @ wkv.T, kv_norm)
     positions = np.arange(m, dtype=np.float64)
-    q[..., -QK:] = rope(q[..., -QK:], (positions[:, None] * np.power(10000.0, -2.0 * np.arange(QK // 2) / QK))[None, :, None, :])
-    kv[..., -QK:] = rope(kv[..., -QK:], (positions[:, None] * np.power(10000.0, -2.0 * np.arange(QK // 2) / QK))[None, :, :])
+    rope_theta = 160000.0 if ratio > 0 else 10000.0
+    inv = np.power(rope_theta, -2.0 * np.arange(QK // 2) / QK)
+    q[..., -QK:] = rope(q[..., -QK:], (positions[:, None] * inv)[None, :, None, :])
+    kv[..., -QK:] = rope(kv[..., -QK:], (positions[:, None] * inv)[None, :, :])
 
     if ratio > 0:
         latent = compress_kv.copy()
         cpos = np.arange(m // ratio, dtype=np.float64) * ratio
-        latent[..., -QK:] = rope(latent[..., -QK:], (cpos[:, None] * np.power(10000.0, -2.0 * np.arange(QK // 2) / QK))[None, :, :])
+        latent[..., -QK:] = rope(latent[..., -QK:], (cpos[:, None] * inv)[None, :, :])
         kv_all = np.concatenate([kv[None], latent[None]], axis=1)
         groups = m // ratio
         end = np.arange(m)[:, None]
@@ -121,7 +123,7 @@ def build_attention(t, layer, x, m, ratio, compress_kv):
         topk = win[None]
 
     o = sparse_attn(q, kv_all, sink, topk, HEAD_DIM ** -0.5)
-    o[..., -QK:] = rope(o[..., -QK:], (positions[:, None] * np.power(10000.0, -2.0 * np.arange(QK // 2) / QK))[None, :, None, :], inverse=True)
+    o[..., -QK:] = rope(o[..., -QK:], (positions[:, None] * inv)[None, :, None, :], inverse=True)
     o = o[0].reshape(m, O_GROUPS, -1)
     wa = wo_a.reshape(O_GROUPS, O_LORA, -1)
     o = np.einsum("sgd,grd->sgr", o, wa)

@@ -104,6 +104,8 @@ def main():
         x4 = hc_post(ffn_out, x4, ffn_post, ffn_comb)
         pre_mix = ffn_pre
         print(f"layer {layer} done", flush=True)
+        fixed = np.round(x4 * 65536.0).astype(np.int64)
+        print("L%d first8 %s" % (layer, fixed[0, 0, :8].tolist()), flush=True)
 
     fixed = np.round(x4 * 65536.0).astype(np.int64)
     print("first8", fixed[0, 0, :8].tolist())
