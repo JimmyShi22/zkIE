@@ -4162,9 +4162,14 @@ fn prove_committed_shard_dag_impl(
         }
     }
 
-    let mut weight_batch_openings = Vec::with_capacity(num_groups);
-    let mut weight_batches = Vec::with_capacity(num_groups);
-    for bi in 0..num_groups {
+    // Commit + open each weight group in parallel. Every group touches a
+    // disjoint set of tensors and only reads the store (`materialize` is
+    // `&self`), so the work is embarrassingly parallel; rayon's work-stealing
+    // pool bounds the in-flight materializations by the thread count, keeping
+    // peak memory at roughly `threads x one group` instead of the whole 552B.
+    let weight_results: Vec<(WeightBatchCommit, WeightBatchOpening)> = (0..num_groups)
+        .into_par_iter()
+        .map(|bi| {
         let (arity, num_tables, num_vars, security, pow_bits) = match &streaming_plans {
             Some(p) => {
                 let g = &p[bi];
@@ -4217,21 +4222,23 @@ fn prove_committed_shard_dag_impl(
             }
         };
 
-        weight_batches.push(WeightBatchCommit {
+        let weight_batch = WeightBatchCommit {
             commitment: commitment.clone(),
             arity,
             num_tables,
             whir: zkie_core::pcs::whir::Whir::with_params(num_vars, security, pow_bits),
-        });
+        };
 
         if claims.is_empty() {
-            weight_batch_openings.push(WeightBatchOpening {
+            return (
+                weight_batch,
+                WeightBatchOpening {
                 table_idxs,
                 points,
                 claimed,
                 proof: None,
-            });
-            continue;
+                },
+            );
         }
 
         let protocol = batch_whir.batch_opening_protocol(num_tables, arity);
@@ -4254,13 +4261,19 @@ fn prove_committed_shard_dag_impl(
             &claimed,
         )
         .expect("honest batch-open");
-        weight_batch_openings.push(WeightBatchOpening {
-            table_idxs,
-            points,
-            claimed,
-            proof: Some(proof),
-        });
-    }
+        (
+            weight_batch,
+            WeightBatchOpening {
+                table_idxs,
+                points,
+                claimed,
+                proof: Some(proof),
+            },
+        )
+        })
+        .collect();
+    let (weight_batches, weight_batch_openings): (Vec<_>, Vec<_>) =
+        weight_results.into_iter().unzip();
 
     // Vertical batch the witness columns across all shards: group the x/y/num
     // columns by arity, committing each (arity, column-type) group once. This
