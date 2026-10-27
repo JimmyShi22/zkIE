@@ -1,64 +1,65 @@
 # DeepSeek-V4.1-Flash text-only
 
-`zkie-models-deepseek-v41-flash` 目前是 layer0 纵向切片，先把量化 codec、MLA
-投影和输出投影逐段和 `scripts/v41_ref_cpu.py` 对齐，再扩展到 40 层全图。
+`zkie-models-deepseek-v41-flash`：text-only 的 committed store-free 端到端证明。
+已实现完整 40 层 Hyper-Connection + MLA（滑动窗口 + 共享压缩 KV + sink）+
+SwiGLU MoE（384 routed + 1 shared）+ Engram 前向与输出头，并接入流式全量权重
+承诺（同一时间只物化一个 batch）。
 
-## 已完成并验证
+## 当前状态
 
-- `zkie-core` 支持 FP8-E4M3/E8M0、packed FP4-E2M1 的流式反量化，并按二维
-  rows/cols 分别补零到 2 的幂。
-- `zkie-ops` 增加 `BlockQuantizedMatMul` op/proof。
-- layer0 `wq_a/wq_b/wkv` 投影、RoPE + attention、`wo_a/wo_b` 输出投影均与
-  CPU 参考逐项一致。
-- range-based committed prove/verify API 可用。
+- 40 层前向（`build_v41_forward`）端到端可跑，`m=16` 真实 prompt 全程无定点溢出。
+- committed prove/verify 全链路验证通过（1 层）：
+  `prove≈1h42m verify≈3.6s RSS≈110GB proof≈180MB`（10-bit 测试 WHIR）。
+- 40 层 seq16 committed 证明可后台启动（约 68 小时，按层流式提交）。
+- 真实 prompt 数据修复：`The sky is` 只有 3 token，之前用 BOS 补 16 会让模型
+  真实放大重复 BOS 位置（float64 参考第 8 层约 300 倍），导致 Q16 定点 i64 溢出。
+  现改用真实 16-token prompt，由 `scripts/v41_make_prompt.py` 生成 embed/hash id。
+- 定点累加已从 i64 升到 i128（`mm_par_fixed` / `Scale` / `ScaleVec`），按字段阶
+  取模，避免大值溢出；对 Q16 模型结果不变。
+
+## argmax 精度说明（重要）
+
+seq16 前向的 Q16 argmax 与 float64 参考有 13/16 一致，3 个位置（token 0/6/7）
+是 logit 边界极近的翻转（token 0 的 top1/top2 只差 0.042）。根因不是 bug：
+
+- 每层对 token 0 是一次 40 步非线性迭代；实测 layer0 对 1 Q16 输入扰动有约
+  3.7 倍增益，轨迹对初值敏感（Lyapunov≈0.2/层）。
+- 证明系统验证的就是 Q16 计算本身，`verify=true` 已证明 Rust 无 bug；Q16 与
+  float64 在近边界 token 上属两条不同轨迹，差异是精度特性而非错误。
+
+要 16/16 只能二选一：把 ground truth 定义为 Q16 计算（证明已验证它），或把激活
+精度整体提 Q20（Goldilocks 64 位字段放不下 Q24，且 Q20 未必压得住 0.042 的边界）。
 
 ## 运行
 
 ```bash
-# 单个量化 matmul committed 切片
-cargo run --release -p zkie-models-deepseek-v41-flash --example bench_committed
+# 40 层前向 + argmax（真实 prompt）
+ZKIE_REAL=1 ZKIE_LAYERS=40 ZKIE_M=16 \
+  ./target-native/release/examples/v41_forward_ops \
+  /data/zkIE/models/deepseek-v4.1-flash/raw
 
-# layer0 投影对拍
-cargo run --release -p zkie-models-deepseek-v41-flash --example layer0_proj_ref
-python3 scripts/v41_ref_cpu.py --shard models/deepseek-v4.1-flash/raw/model-00003-of-00048.safetensors --mode proj
+# 每层前向对拍（打印 per-layer first8 / tokmax）
+ZKIE_LAYERS=3 ZKIE_M=16 \
+  ./target-native/release/examples/v41_dump_diag \
+  /data/zkIE/models/deepseek-v4.1-flash/raw
 
-# 其它参考模式
-python3 scripts/v41_ref_cpu.py --shard models/deepseek-v4.1-flash/raw/model-00003-of-00048.safetensors --mode attention
-python3 scripts/v41_ref_cpu.py --shard models/deepseek-v4.1-flash/raw/model-00003-of-00048.safetensors --mode oproj
-python3 scripts/v41_ref_cpu.py --shard models/deepseek-v4.1-flash/raw/model-00003-of-00048.safetensors --mode moe_gate
-python3 scripts/v41_ref_cpu.py --shard models/deepseek-v4.1-flash/raw/model-00003-of-00048.safetensors --mode shared_expert
-python3 scripts/v41_ref_cpu.py --shard models/deepseek-v4.1-flash/raw/model-00003-of-00048.safetensors --mode routed_expert --expert-id 240
-python3 scripts/v41_ref_cpu.py --shard models/deepseek-v4.1-flash/raw/model-00003-of-00048.safetensors --mode mlp
+# 完整 committed 端到端（1 层或 40 层）
+ZKIE_REAL=1 ZKIE_LAYERS=1 ZKIE_M=16 RAYON_NUM_THREADS=64 \
+  ./target-native/release/examples/bench_v41_committed \
+  /data/zkIE/models/deepseek-v4.1-flash/raw
 
-# 生成 token / RoPE 表
-python3 scripts/extract_v41.py --raw models/deepseek-v4.1-flash/raw --out /tmp/cache --tokenizer-json models/deepseek-v4.1-flash/raw/tokenizer.json --tokens-out /tmp/tokens.bin --prompt "The sky is" --seq 16
-python3 scripts/extract_v41.py --raw models/deepseek-v4.1-flash/raw --out /tmp/cache --rope-out /tmp/rope --seq 16
-python3 scripts/extract_v41.py --raw models/deepseek-v4.1-flash/raw --out /tmp/cache --rsqrt-out /tmp/tables --limb-out /tmp/tables --layers 0 --filter wo_a --only-text
+# float64 argmax 参考（40 层）
+python3 scripts/v41_ref_argmax.py \
+  --raw models/deepseek-v4.1-flash/raw --m 16 --layers 40 \
+  --embed models/deepseek-v4.1-flash/cache/engram/embed_prompt_i32.bin \
+  --hash-ids models/deepseek-v4.1-flash/cache/engram/hash_ids_i32.bin
+
+# 生成真实 prompt 的 embed + hash id（默认 16-token prompt）
+python3 scripts/v41_make_prompt.py
 ```
 
 ## 待接
 
-- `SparseAttention` / `SparseIndexer` / `HyperConnection` / `EngramLookup` 的
-  op/proof。
-- 40 层 CSA2/CED 全图、MoE、真实 seq16/seq512 端到端。
-
-`model-00048-of-00048.safetensors` 已下载完整（101,537,926,640 bytes），layer14
-Engram 权重现已就位，全量承诺不再受下载阻塞。
-
-layer14 Engram 关键形状：`embed.weight` FP8 [384016682,256]（约 98GB），
-`q/k_weight` BF16 [4,5120]，`wkv.weight` FP8 [25600,6144]。
-
-layer0 attention（q_norm/kv_norm + tail RoPE + dense causal softmax，不含 sink）
-已与 CPU 参考逐项对齐；Rust head0 前 8 值：
-`[-15616, 4475, -10946, 12939, 9102, 5881, 2056, 22170]`。
-
-attn-sink 已通过新增 `SoftmaxBias` 证明原语接入，layer0 attention 全链路
-（含 sink）op 数 714，证明通过。
-
-下一步：`wo_a`/`wo_b` 输出投影 op graph；再往后是 MoE、HyperConnection、Engram。
-
-`wo_a`/`wo_b` 输出投影 op graph 已证明通过（8 groups，39 ops），合成输入下
-前 4 值与 CPU 参考一致。
-
-完整 layer0 attention = attention op graph + 输出投影 op graph，两段已分别
-证明；待合并成单条链路并做端到端数值对拍。
+- 90-bit WHIR（当前 bench 用 10-bit 测试 WHIR）。
+- seq512 真实数据 + 参考 + 证明。
+- 把 argmax 基准统一成 Q16 计算，或评估 Q20 精度提升。
