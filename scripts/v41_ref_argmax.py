@@ -62,10 +62,10 @@ def main():
     shards = {l: read_safetensors(f"{args.raw}/model-{l+3:05d}-of-00048.safetensors") for l in range(args.layers)}
     hash_ids = None
     if args.hash_ids:
-        hash_ids = np.fromfile(args.hash_ids, dtype=np.int32).reshape(args.m, -1)
+        hash_ids = np.fromfile(args.hash_ids, dtype=np.int32).reshape(-1, 48)[: args.m]
 
     if args.embed:
-        x = np.fromfile(args.embed, dtype=np.int32).astype(np.float64).reshape(args.m, DIM) / 65536.0
+        x = np.fromfile(args.embed, dtype=np.int32).astype(np.float64).reshape(-1, DIM)[: args.m] / 65536.0
     else:
         x = np.ones((args.m, DIM), dtype=np.float64)
     x4 = np.repeat(x[:, None, :], HC, axis=1)
