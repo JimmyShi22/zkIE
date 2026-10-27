@@ -526,6 +526,8 @@ pub fn build_hc_mixes(
     // inject ~100 Q16 of error per projection.
     let mix_raw = store.push(vec![]);
     ops.push(Op::MatMul { a: x4_pad, b: hc_fn_t, c: mix_raw, m, k: d_pad, n: mix_hc_pad });
+    let mix_q16 = store.push(vec![]);
+    ops.push(Op::Scale { x: mix_raw, out: mix_q16, factor: 1, shift: 16 });
     let rstd = store.push(vec![]);
     ops.push(Op::Rsqrt {
         x: x4_pad,
@@ -535,10 +537,7 @@ pub fn build_hc_mixes(
         d: d_pad,
         n_real: d_real,
     });
-    // Keep the Q32 projection until the final scale, matching the float64
-    // reference `(x @ hc_fn^T) * rsqrt` (rounding the projection to Q16 here
-    // injected a systematic error that drifted the argmax over 40 layers).
-    let mix_scaled = build_broadcast_scale(store, ops, mix_raw, rstd, m, mix_hc_pad, 16);
+    let mix_scaled = build_broadcast_scale(store, ops, mix_q16, rstd, m, mix_hc_pad, 0);
     let mix = store.push(vec![]);
     ops.push(Op::Scale { x: mix_scaled, out: mix, factor: 1, shift: 16 });
     mix
