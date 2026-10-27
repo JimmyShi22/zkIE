@@ -17,18 +17,11 @@ SwiGLU MoE（384 routed + 1 shared）+ Engram 前向与输出头，并接入流�
 - 定点累加已从 i64 升到 i128（`mm_par_fixed` / `Scale` / `ScaleVec`），按字段阶
   取模，避免大值溢出；对 Q16 模型结果不变。
 
-## argmax 精度说明（重要）
+## argmax 状态
 
-seq16 前向的 Q16 argmax 与 float64 参考有 13/16 一致，3 个位置（token 0/6/7）
-是 logit 边界极近的翻转（token 0 的 top1/top2 只差 0.042）。根因不是 bug：
-
-- 每层对 token 0 是一次 40 步非线性迭代；实测 layer0 对 1 Q16 输入扰动有约
-  3.7 倍增益，轨迹对初值敏感（Lyapunov≈0.2/层）。
-- 证明系统验证的就是 Q16 计算本身，`verify=true` 已证明 Rust 无 bug；Q16 与
-  float64 在近边界 token 上属两条不同轨迹，差异是精度特性而非错误。
-
-要 16/16 只能二选一：把 ground truth 定义为 Q16 计算（证明已验证它），或把激活
-精度整体提 Q20（Goldilocks 64 位字段放不下 Q24，且 Q20 未必压得住 0.042 的边界）。
+修复 Engram 哈希桶 bug（桶模数从 `engram_compressed_vocab_size=99092` 改成
+`engram_vocab_size=16000000`）后，seq16 的 Q16 argmax 与 float64 参考 **16/16
+完全一致**。此前 13/16 的偏差正是这个 Engram 哈希错误造成的，不是 Q16 精度问题。
 
 ## 运行
 
@@ -63,7 +56,6 @@ python3 scripts/v41_make_prompt.py
 - 90-bit WHIR 已就位：`weight_commit_plan` 内部 `SECURITY=90`，边界承诺用
   `with_params(arity, 90, 17)`；bench 里的 `new_testing(10)` 是未使用的遗留参数。
 - seq512 真实数据 + 参考 + 证明。
-- 把 argmax 基准统一成 Q16 计算，或评估 Q20 精度提升。
 - Engram 嵌入表的完整承诺：目前 engram 的 `embed.weight`（约 384M×256×2 ≈ 196B
   参数）只物化被选中的行作为 witness，未把完整表提交进承诺，属于对 engram 表
   的信任假设。提交完整表（反量化后约 1.5TB）需要按 chunk 流式提交或改为提交
