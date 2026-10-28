@@ -3989,7 +3989,7 @@ pub struct WeightBatchOpening {
     pub table_idxs: Vec<usize>,
     pub points: Vec<Vec<Goldilocks>>,
     pub claimed: Vec<Goldilocks>,
-    pub proof: Option<zkie_core::pcs::batch_open::BatchOpeningProof>,
+    pub proof: Option<Vec<u8>>,
 }
 
 /// A single lookup witness column pair opened at its chained-GKR leaf point:
@@ -4325,13 +4325,17 @@ fn prove_committed_shard_dag_impl(
             &claimed,
         )
         .expect("honest batch-open");
+        // Serialize the FRI opening immediately and drop the in-memory struct:
+        // the proof struct (STIR query openings) is far larger than its bincode
+        // form, and holding all 23k openings resident would OOM the 1TB box.
+        let proof_bytes = bincode::serialize(&proof).expect("serialize batch open");
         (
             weight_batch,
             WeightBatchOpening {
                 table_idxs,
                 points,
                 claimed,
-                proof: Some(proof),
+                proof: Some(proof_bytes),
             },
         )
         })
@@ -5324,6 +5328,11 @@ fn verify_committed_shard_dag_impl(
             Some(p) => p,
             None => continue, // committed but never opened (e.g. affine bias)
         };
+        let opening_proof: zkie_core::pcs::batch_open::BatchOpeningProof =
+            match bincode::deserialize(opening_proof) {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
         if opening.table_idxs.len() != opening.points.len()
             || opening.table_idxs.len() != opening.claimed.len()
         {
@@ -5338,7 +5347,7 @@ fn verify_committed_shard_dag_impl(
             &opening.table_idxs,
             &opening.points,
             &opening.claimed,
-            opening_proof,
+            &opening_proof,
         ) {
             return false;
         }
