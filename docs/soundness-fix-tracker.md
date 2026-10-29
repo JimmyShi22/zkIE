@@ -32,7 +32,12 @@
   - 回归（7 个 `s4_*`，修复前 3 红）：诚实不同点合并、**矛盾同点拒绝**（恶意 prover 自适应 f′ 构造，修复前接受）、**merged_eval 伪造拒绝**（修复前返回伪造值，现返回值必等于真实 opening 值）、gamma 篡改拒绝、merged_point 篡改拒绝、eq 值不再被读取（篡改 fe 返回值不变）、跨 tensor bind 互换拒绝。
 
 ### 阶段 C · 模型关系（依赖 B 框架）
-- [ ] **S5 · op 关系补齐（P0）** — Add/Transpose/Scale/ScaleVec 等逐位置关系，未实现归约的 op 明确拒绝。
+- [x] **S5 · op 关系补齐（P0）** — Add/Transpose/Scale/ScaleVec 等逐位置关系，未实现归约的 op 明确拒绝。
+  - 关系分两类：**线性关系在随机点 r 直接校验**（Add `a(r)+b(r)=c(r)`；Scale 除法截断 `x·factor = 2^shift·out + rho`、`rho = rem − 2^(shift−1)` 按远离零取整；CombineIdx `out = scale·a + b`；IdxBroadcast `out = b·base + jval(r)`；SoftmaxIndex 的 divmod `trunc = q·table_len + idx_f`）；**乘法关系必须 eq 加权为整列 virtual（乘积在项内）**——随机点上 MLE 的乘积 ≠ 乘积的 MLE：Relu `eq·out·(out−x)`、SoftmaxIndex 的 relu 段、GeluIndex 的 clamp `(idx−trunc)·(idx−(L−1))=0`、PadIdx `eq·(out − mask·base)`、BroadcastScale/ScaleVec/ScaleGate `eq·(x·scale − out) ± rem`。eq 加权模式：q 提前榨取（eq 点）、r 为 sumcheck 派生（claim 点），verify 检查 `fe[0]==eq_poly(q,r)` 与 `fc==virtual_eval(terms,fe)`。
+  - topk 的 gate/d1/d2 与 norms（layernorm/layer_norm_centered/rms_norm）的 out、rope 的两个 half 关系全部改为 eq 加权（gist 点名 topk 逐位置约束，同类洞一并修）。
+  - 范围检查接入**公共恒等表**：`ensure_public_tables` 在 prove 入口自动推 `[0,2^shift)`/`[0,2^22)`/`[0,table_len)` 恒等表，rem/idx/q 列经 LogUp lookup 绑定（committed 路径复用 S2 identity-table 机制）；SoftmaxIndex（relu+divmod：idx_f∈[0,L)、q∈[0,2^22)）、GeluIndex（relu+clamp：idx∈[0,L)、trunc−idx∈[0,2^22)）、StableSoftmaxIndex（公式 virtual 先行、行 virtual 后行，行点取公式派生点行位，sel∈{0,1}）同模板实现。**域契约**：`relu(x) < 2^22·table_len`（与真实模型一致——models/gpt2 先 `Op::Scale{shift:16}` 再喂 index op；build_gpt2_layer 测试 builder 同步修）。
+  - Transpose 改为轴交换 claim 转发（out claims → x claims @ swap(p)，m/k 非二次幂拒绝）；PadIdx 增加 `base_len` 字段；未实现归约的 op 变体在 committed verifier 明确拒绝（不默默通过）。
+  - 回归（15 个 `s5_*`）：add 逐位置伪造/元素对调拒绝、transpose 伪造 out claim 拒绝、scale 错误取整拒绝、scalevec/broadcastscale/scalegate 乘积伪造拒绝、relu 符号伪造拒绝、gelu/stable/softmax index 公式伪造拒绝、idx_broadcast/combine_idx/pad_idx 伪造拒绝、未实现变体拒绝。全量回归：ops 74 绿（15 s5 新增）、core 64、engine 3、models 全绿。
 - [ ] **S6 · 公开序列接入（P0）** — 独立验证 API 传入 prompt，tokens/Argmax 绑定 embedding lookup。
 - [ ] **S7 · MoE 专家绑定（P0）** — 路由 counts 归约到已认证路由，专家权重通过正确根 batch opening。
 
@@ -49,7 +54,7 @@
 | 反例 | 应拒绝项 | 对应 |
 |---|---|---|
 | 32×32 MatMul 空 sumcheck 无承诺 | 拒绝 | S2 ✅ `s2_matmul32_empty_commitments_rejected` |
-| Add `[1,2]+[3,4]=[5,5]` | 拒绝 | S5 |
+| Add `[1,2]+[3,4]=[5,5]` | 拒绝 | S5 ✅ `s5_add_positionwise_rejected` |
 | Lookup `table[0]=99` 改 final 分数 | 拒绝 | S3 ✅ `s3_root_steer_rejected` + 派生根 |
 | 替换 tokens / argmax 长度 | 拒绝 | S6 |
 | 同点 claim 1 和 2 | 拒绝 | S4 ✅ `s4_contradictory_same_point_rejected` |

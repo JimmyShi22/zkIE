@@ -64,13 +64,18 @@ pub fn prove_layernorm_chain(
     //    [x, rsqrt_b, w, b, out] with x*rsqrt*w + b - out = 0.
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
     let rsqrt_b: Vec<Goldilocks> = (0..m * d).map(|ij| rsqrt[ij / d]).collect();
+    // S5: EQ-WEIGHTED out relation (pointwise at the squeezed eq point;
+    // the claim point r_out stays the sumcheck's derived vector).
+    let q: Vec<Goldilocks> =
+        transcript.field_vec((m * d).trailing_zeros() as usize);
+    let eq = mle::eq_evals(&q);
     let terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
-        (Goldilocks::ONE, vec![3usize]),
-        (neg, vec![4usize]),
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize, 3usize]),
+        (Goldilocks::ONE, vec![0usize, 4usize]),
+        (neg, vec![0usize, 5usize]),
     ];
     let (out_proof, r_out) =
-        prove_virtual(&[x, &rsqrt_b, w, b, &out], &terms, Goldilocks::ZERO, transcript);
+        prove_virtual(&[&eq, x, &rsqrt_b, w, b, &out], &terms, Goldilocks::ZERO, transcript);
 
     (
         LayernormChainProof {
@@ -112,10 +117,12 @@ pub fn verify_layernorm_chain(
         return false;
     }
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    let q_s: Vec<Goldilocks> =
+        transcript.field_vec((m * d).trailing_zeros() as usize);
     let terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
-        (Goldilocks::ONE, vec![3usize]),
-        (neg, vec![4usize]),
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize, 3usize]),
+        (Goldilocks::ONE, vec![0usize, 4usize]),
+        (neg, vec![0usize, 5usize]),
     ];
     let (ok, r_out, fc) = verify_virtual(
         &proof.out,
@@ -124,7 +131,9 @@ pub fn verify_layernorm_chain(
         (m * d).trailing_zeros() as usize,
         transcript,
     );
-    ok && r_out == proof.r_out && fc == virtual_eval(&terms, &proof.out.final_evals)
+    ok && r_out == proof.r_out
+        && proof.out.final_evals[0] == mle::eq_poly(&q_s, &r_out)
+        && fc == virtual_eval(&terms, &proof.out.final_evals)
 }
 
 #[cfg(test)]

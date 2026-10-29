@@ -126,16 +126,21 @@ pub fn prove_rms_norm(
 
     let rstd_b: Vec<Goldilocks> = (0..m * d).map(|ij| rstd[ij / d]).collect();
     let raw: Vec<Goldilocks> = (0..m * d).map(|ij| x[ij] * rstd[ij / d] * w[ij]).collect();
+    // S5: EQ-WEIGHTED out relation (pointwise at the squeezed eq point;
+    // the claim point r_out stays the sumcheck's derived vector).
+    let q: Vec<Goldilocks> =
+        transcript.field_vec((m * d).trailing_zeros() as usize);
+    let eq = zkie_core::common::mle::eq_evals(&q);
     let out_terms = [
-        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
-        (neg, vec![3usize]),
-        (Goldilocks::ONE, vec![3usize]),
-        (neg * two32, vec![4usize]),
-        (neg, vec![5usize]),
-        (half32, vec![6usize]),
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize, 3usize]),
+        (neg, vec![0usize, 4usize]),
+        (Goldilocks::ONE, vec![0usize, 4usize]),
+        (neg * two32, vec![0usize, 5usize]),
+        (neg, vec![0usize, 6usize]),
+        (half32, vec![0usize, 7usize]),
     ];
     let (out_proof, r_out) = prove_virtual(
-        &[x, &rstd_b, w, &raw, &out, &rem_out, &ones_md],
+        &[&eq, x, &rstd_b, w, &raw, &out, &rem_out, &ones_md],
         &out_terms,
         Goldilocks::ZERO,
         transcript,
@@ -200,13 +205,14 @@ pub fn verify_rms_norm(
     }
 
     let arity_md = (m * d).trailing_zeros() as usize;
+    let q_s: Vec<Goldilocks> = transcript.field_vec(arity_md);
     let out_terms = [
-        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
-        (neg, vec![3usize]),
-        (Goldilocks::ONE, vec![3usize]),
-        (neg * two32, vec![4usize]),
-        (neg, vec![5usize]),
-        (half32, vec![6usize]),
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize, 3usize]),
+        (neg, vec![0usize, 4usize]),
+        (Goldilocks::ONE, vec![0usize, 4usize]),
+        (neg * two32, vec![0usize, 5usize]),
+        (neg, vec![0usize, 6usize]),
+        (half32, vec![0usize, 7usize]),
     ];
     let (ok, r, fc) = verify_virtual(
         &proof.out,
@@ -215,7 +221,11 @@ pub fn verify_rms_norm(
         arity_md,
         transcript,
     );
-    if !ok || r != proof.r_out || fc != virtual_eval(&out_terms, &proof.out.final_evals) {
+    if !ok
+        || r != proof.r_out
+        || proof.out.final_evals[0] != zkie_core::common::mle::eq_poly(&q_s, &r)
+        || fc != virtual_eval(&out_terms, &proof.out.final_evals)
+    {
         return false;
     }
 

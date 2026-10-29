@@ -95,10 +95,21 @@ pub fn prove_topk(
 ) -> TopKSelectProof {
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
 
-    // gate = x * sel  (degree-2). Each relation has its own per-round-derived
-    // challenge vector (S1); `r` keeps gate_rel's vector for the op claims.
-    let gate_terms = vec![(Goldilocks::ONE, vec![0usize, 1usize]), (neg, vec![2usize])];
-    let (gate_rel, r) = prove_virtual(&[x, sel, gate], &gate_terms, Goldilocks::ZERO, transcript);
+    // gate = x * sel, EQ-WEIGHTED (S5): the eq point q is squeezed
+    // upfront; the CLAIM point r is the sumcheck's derived vector.
+    let arity_mn = (m * n).trailing_zeros() as usize;
+    let q: Vec<Goldilocks> = transcript.field_vec(arity_mn);
+    let eq = zkie_core::common::mle::eq_evals(&q);
+    let gate_terms = vec![
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (neg, vec![0usize, 3usize]),
+    ];
+    let (gate_rel, r) = prove_virtual(
+        &[&eq, x, sel, gate],
+        &gate_terms,
+        Goldilocks::ZERO,
+        transcript,
+    );
 
     // threshold broadcast to [m, n]
     let thr_b: Vec<Goldilocks> = thr
@@ -107,22 +118,34 @@ pub fn prove_topk(
         .collect();
 
     // d1 = sel*(x - thr)  =>  sel*x - sel*thr - d1 = 0
+    let eq1 = zkie_core::common::mle::eq_evals(&q);
     let d1_terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize]),
-        (neg, vec![0usize, 2usize]),
-        (neg, vec![3usize]),
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (neg, vec![0usize, 1usize, 3usize]),
+        (neg, vec![0usize, 4usize]),
     ];
-    let (d1_rel, _) = prove_virtual(&[sel, x, &thr_b, d1], &d1_terms, Goldilocks::ZERO, transcript);
+    let (d1_rel, _) = prove_virtual(
+        &[&eq1, sel, x, &thr_b, d1],
+        &d1_terms,
+        Goldilocks::ZERO,
+        transcript,
+    );
 
     // d2 = (1-sel)*(thr - x) => thr - x - sel*thr + sel*x - d2 = 0
+    let eq2 = zkie_core::common::mle::eq_evals(&q);
     let d2_terms = vec![
-        (Goldilocks::ONE, vec![2usize]),
-        (neg, vec![1usize]),
+        (Goldilocks::ONE, vec![0usize, 3usize]),
         (neg, vec![0usize, 2usize]),
-        (Goldilocks::ONE, vec![0usize, 1usize]),
-        (neg, vec![3usize]),
+        (neg, vec![0usize, 1usize, 3usize]),
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (neg, vec![0usize, 4usize]),
     ];
-    let (d2_rel, _) = prove_virtual(&[sel, x, &thr_b, d2], &d2_terms, Goldilocks::ZERO, transcript);
+    let (d2_rel, _) = prove_virtual(
+        &[&eq2, sel, x, &thr_b, d2],
+        &d2_terms,
+        Goldilocks::ZERO,
+        transcript,
+    );
 
     // sum_e sel[t,e] = k for every row: prove row_sum(r_row) = k.
     // r_row is the eq point (squeezed upfront); the sumcheck challenges are
@@ -184,7 +207,13 @@ pub fn verify_topk(
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
     let arity_mn = (m * n).trailing_zeros() as usize;
 
-    let gate_terms = vec![(Goldilocks::ONE, vec![0usize, 1usize]), (neg, vec![2usize])];
+    // S5: eq-weighted — the eq point q is squeezed upfront; the stored eq
+    // eval must equal eq_poly(q, r) at the derived claim point r.
+    let q_s: Vec<Goldilocks> = transcript.field_vec(arity_mn);
+    let gate_terms = vec![
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (neg, vec![0usize, 3usize]),
+    ];
     let (ok, r, fc) = verify_virtual(
         &proof.gate_rel,
         &gate_terms,
@@ -192,41 +221,51 @@ pub fn verify_topk(
         arity_mn,
         transcript,
     );
-    if !ok || r != proof.r || fc != virtual_eval(&gate_terms, &proof.gate_rel.final_evals) {
+    if !ok
+        || r != proof.r
+        || proof.gate_rel.final_evals[0] != zkie_core::common::mle::eq_poly(&q_s, &r)
+        || fc != virtual_eval(&gate_terms, &proof.gate_rel.final_evals)
+    {
         return false;
     }
 
     let d1_terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize]),
-        (neg, vec![0usize, 2usize]),
-        (neg, vec![3usize]),
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (neg, vec![0usize, 1usize, 3usize]),
+        (neg, vec![0usize, 4usize]),
     ];
-    let (ok, _, fc) = verify_virtual(
+    let (ok, r_d1, fc) = verify_virtual(
         &proof.d1_rel,
         &d1_terms,
         Goldilocks::ZERO,
         arity_mn,
         transcript,
     );
-    if !ok || fc != virtual_eval(&d1_terms, &proof.d1_rel.final_evals) {
+    if !ok
+        || proof.d1_rel.final_evals[0] != zkie_core::common::mle::eq_poly(&q_s, &r_d1)
+        || fc != virtual_eval(&d1_terms, &proof.d1_rel.final_evals)
+    {
         return false;
     }
 
     let d2_terms = vec![
-        (Goldilocks::ONE, vec![2usize]),
-        (neg, vec![1usize]),
+        (Goldilocks::ONE, vec![0usize, 3usize]),
         (neg, vec![0usize, 2usize]),
-        (Goldilocks::ONE, vec![0usize, 1usize]),
-        (neg, vec![3usize]),
+        (neg, vec![0usize, 1usize, 3usize]),
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (neg, vec![0usize, 4usize]),
     ];
-    let (ok, _, fc) = verify_virtual(
+    let (ok, r_d2, fc) = verify_virtual(
         &proof.d2_rel,
         &d2_terms,
         Goldilocks::ZERO,
         arity_mn,
         transcript,
     );
-    if !ok || fc != virtual_eval(&d2_terms, &proof.d2_rel.final_evals) {
+    if !ok
+        || proof.d2_rel.final_evals[0] != zkie_core::common::mle::eq_poly(&q_s, &r_d2)
+        || fc != virtual_eval(&d2_terms, &proof.d2_rel.final_evals)
+    {
         return false;
     }
 

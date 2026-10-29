@@ -174,24 +174,34 @@ pub fn prove_rope(
     let two_shift = Goldilocks::from_u64(1u64 << shift);
     let half = Goldilocks::from_u64(1u64 << (shift - 1));
 
+    // S5: EQ-WEIGHTED half relations (pointwise at the squeezed eq
+    // points; the claim points stay the sumcheck-derived vectors). Each
+    // virtual's eq point is squeezed immediately before its own sumcheck
+    // so prove and verify interleave identically.
+    let q_f: Vec<Goldilocks> = transcript.field_vec(n.trailing_zeros() as usize);
+    let eq_f = zkie_core::common::mle::eq_evals(&q_f);
     let first_terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize]),
-        (neg, vec![2usize, 3usize]),
-        (neg * two_shift, vec![4usize]),
-        (neg, vec![5usize]),
-        (half, vec![6usize]),
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (neg, vec![0usize, 3usize, 4usize]),
+        (neg * two_shift, vec![0usize, 5usize]),
+        (neg, vec![0usize, 6usize]),
+        (half, vec![0usize, 7usize]),
     ];
-    let first_mles: Vec<&[Goldilocks]> = vec![&x_f, &cos_b, &x_s, &sin_b, &out_f, &rem_f, &ones];
+    let first_mles: Vec<&[Goldilocks]> =
+        vec![&eq_f, &x_f, &cos_b, &x_s, &sin_b, &out_f, &rem_f, &ones];
     let (first, r_f) = prove_virtual(&first_mles, &first_terms, Goldilocks::ZERO, transcript);
 
+    let q_s: Vec<Goldilocks> = transcript.field_vec(n.trailing_zeros() as usize);
+    let eq_s = zkie_core::common::mle::eq_evals(&q_s);
     let second_terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize]),
-        (Goldilocks::ONE, vec![2usize, 3usize]),
-        (neg * two_shift, vec![4usize]),
-        (neg, vec![5usize]),
-        (half, vec![6usize]),
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (Goldilocks::ONE, vec![0usize, 3usize, 4usize]),
+        (neg * two_shift, vec![0usize, 5usize]),
+        (neg, vec![0usize, 6usize]),
+        (half, vec![0usize, 7usize]),
     ];
-    let second_mles: Vec<&[Goldilocks]> = vec![&x_s, &cos_b, &x_f, &sin_b, &out_s, &rem_s, &ones];
+    let second_mles: Vec<&[Goldilocks]> =
+        vec![&eq_s, &x_s, &cos_b, &x_f, &sin_b, &out_s, &rem_s, &ones];
     let (second, r_s) = prove_virtual(&second_mles, &second_terms, Goldilocks::ZERO, transcript);
 
     // S2: no r_out squeeze — the out tensor is claimed at the two half points
@@ -222,12 +232,13 @@ pub fn verify_rope(proof: &RoPEProof, shift: u32, transcript: &mut Transcript) -
     // claims on `out` by the same_poly binding.
     let arity = proof.r_first.len();
 
+    let q_f_s: Vec<Goldilocks> = transcript.field_vec(arity);
     let first_terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize]),
-        (neg, vec![2usize, 3usize]),
-        (neg * two_shift, vec![4usize]),
-        (neg, vec![5usize]),
-        (half, vec![6usize]),
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (neg, vec![0usize, 3usize, 4usize]),
+        (neg * two_shift, vec![0usize, 5usize]),
+        (neg, vec![0usize, 6usize]),
+        (half, vec![0usize, 7usize]),
     ];
     let (ok, r_f, fc) = verify_virtual(
         &proof.first,
@@ -236,16 +247,21 @@ pub fn verify_rope(proof: &RoPEProof, shift: u32, transcript: &mut Transcript) -
         arity,
         transcript,
     );
-    if !ok || r_f != proof.r_first || fc != virtual_eval(&first_terms, &proof.first.final_evals) {
+    if !ok
+        || r_f != proof.r_first
+        || proof.first.final_evals[0] != zkie_core::common::mle::eq_poly(&q_f_s, &r_f)
+        || fc != virtual_eval(&first_terms, &proof.first.final_evals)
+    {
         return false;
     }
 
+    let q_s_s: Vec<Goldilocks> = transcript.field_vec(arity);
     let second_terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize]),
-        (Goldilocks::ONE, vec![2usize, 3usize]),
-        (neg * two_shift, vec![4usize]),
-        (neg, vec![5usize]),
-        (half, vec![6usize]),
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (Goldilocks::ONE, vec![0usize, 3usize, 4usize]),
+        (neg * two_shift, vec![0usize, 5usize]),
+        (neg, vec![0usize, 6usize]),
+        (half, vec![0usize, 7usize]),
     ];
     let (ok, r_s, fc) = verify_virtual(
         &proof.second,
@@ -254,7 +270,9 @@ pub fn verify_rope(proof: &RoPEProof, shift: u32, transcript: &mut Transcript) -
         arity,
         transcript,
     );
-    ok && r_s == proof.r_second && fc == virtual_eval(&second_terms, &proof.second.final_evals)
+    ok && r_s == proof.r_second
+        && proof.second.final_evals[0] == zkie_core::common::mle::eq_poly(&q_s_s, &r_s)
+        && fc == virtual_eval(&second_terms, &proof.second.final_evals)
 }
 
 #[cfg(test)]

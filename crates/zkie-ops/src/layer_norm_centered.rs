@@ -187,17 +187,22 @@ pub fn prove_layer_norm_centered(
         .collect();
     let two32 = Goldilocks::from_u64(1u64 << 32);
     let ones_md: Vec<Goldilocks> = vec![Goldilocks::ONE; m * d];
+    // S5: EQ-WEIGHTED out relation (pointwise at the squeezed eq point;
+    // the claim point r_out stays the sumcheck's derived vector).
+    let q: Vec<Goldilocks> =
+        transcript.field_vec((m * d).trailing_zeros() as usize);
+    let eq = zkie_core::common::mle::eq_evals(&q);
     let out_terms = [
-        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
-        (neg, vec![4usize]),
-        (Goldilocks::ONE, vec![4usize]),
-        (neg * two32, vec![5usize]),
-        (two32, vec![3usize]),
-        (neg, vec![6usize]),
-        (half32, vec![7usize]),
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize, 3usize]),
+        (neg, vec![0usize, 5usize]),
+        (Goldilocks::ONE, vec![0usize, 5usize]),
+        (neg * two32, vec![0usize, 6usize]),
+        (two32, vec![0usize, 4usize]),
+        (neg, vec![0usize, 7usize]),
+        (half32, vec![0usize, 8usize]),
     ];
     let (out_proof, r_out) = prove_virtual(
-        &[&centered, &rstd_b, w, b, &raw, &out, &rem_out, &ones_md],
+        &[&eq, &centered, &rstd_b, w, b, &raw, &out, &rem_out, &ones_md],
         &out_terms,
         Goldilocks::ZERO,
         transcript,
@@ -293,14 +298,17 @@ pub fn verify_layer_norm_centered(
         return false;
     }
 
+    // S5: EQ-WEIGHTED out relation — r_out squeezed upfront, stored eq
+    // checked against eq_poly(r_out, r_out).
+    let q_s: Vec<Goldilocks> = transcript.field_vec(arity_md);
     let out_terms = [
-        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
-        (neg, vec![4usize]),
-        (Goldilocks::ONE, vec![4usize]),
-        (neg * two32, vec![5usize]),
-        (two32, vec![3usize]),
-        (neg, vec![6usize]),
-        (half32, vec![7usize]),
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize, 3usize]),
+        (neg, vec![0usize, 5usize]),
+        (Goldilocks::ONE, vec![0usize, 5usize]),
+        (neg * two32, vec![0usize, 6usize]),
+        (two32, vec![0usize, 4usize]),
+        (neg, vec![0usize, 7usize]),
+        (half32, vec![0usize, 8usize]),
     ];
     let (ok, r_out, fc) = verify_virtual(
         &proof.out,
@@ -309,7 +317,9 @@ pub fn verify_layer_norm_centered(
         arity_md,
         transcript,
     );
-    ok && r_out == proof.r_out && fc == virtual_eval(&out_terms, &proof.out.final_evals)
+    ok && r_out == proof.r_out
+        && proof.out.final_evals[0] == zkie_core::common::mle::eq_poly(&q_s, &r_out)
+        && fc == virtual_eval(&out_terms, &proof.out.final_evals)
 }
 
 #[cfg(test)]

@@ -447,8 +447,8 @@ fn build_moe(
     // pad token_id / expert_of to s_pad (dummy entries -> 0)
     let token_id_pad = store.push_idx(vec![]);
     let expert_of_pad = store.push_idx(vec![]);
-    ops.push(Op::PadIdx { base: token_id, out: token_id_pad, len: s_pad });
-    ops.push(Op::PadIdx { base: expert_of, out: expert_of_pad, len: s_pad });
+    ops.push(Op::PadIdx { base: token_id, out: token_id_pad, len: s_pad, base_len: s });
+    ops.push(Op::PadIdx { base: expert_of, out: expert_of_pad, len: s_pad, base_len: s });
 
     // seg = gather x rows by token_id, then zero the dummy positions
     let idx_seg = store.push_idx(vec![]);

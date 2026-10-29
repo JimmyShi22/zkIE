@@ -55,6 +55,59 @@ fn is_identity_table(table: &[Goldilocks]) -> bool {
         .all(|(j, &v)| v == Goldilocks::from_u64(j as u64))
 }
 
+/// Verifier-side twin of [`find_identity_table`] over the public tables
+/// slice (indexed by tensor id).
+pub fn find_identity_table_slices(tables: &[&[Goldilocks]], len: usize) -> Option<T> {
+    tables
+        .iter()
+        .enumerate()
+        .find_map(|(t, v)| if v.len() == len && is_identity_table(v) { Some(t) } else { None })
+}
+
+/// Find an existing identity table `[0..len)` among the store tensors.
+pub fn find_identity_table(store: &Store, len: usize) -> Option<T> {
+    store.v.iter().enumerate().find_map(|(t, td)| match td {
+        TensorData::Owned(v) if v.len() == len && is_identity_table(v) => Some(t),
+        _ => None,
+    })
+}
+
+/// Push (if absent) the PUBLIC identity lookup tables the ops need (S5):
+/// a 2^shift range table per rounding op, a 2^22 range table for Relu and
+/// the formula-op ranges, and a table_len identity table per index formula
+/// op. All are statement-derived, so the verifier sees them through the
+/// ordinary `tables` slice (and the committed path handles them via the S2
+/// identity-table mechanism).
+pub fn ensure_public_tables(store: &mut Store, ops: &[Op]) {
+    let mut need: std::collections::BTreeSet<usize> = Default::default();
+    for op in ops {
+        match op {
+            Op::Scale { shift, .. } | Op::ScaleVec { shift, .. } | Op::ScaleGate { shift, .. } => {
+                if *shift > 0 {
+                    need.insert(1usize << shift);
+                }
+            }
+            Op::Relu { .. } => {
+                need.insert(1usize << 22);
+            }
+            Op::SoftmaxIndex { table_len, .. } => {
+                need.insert(*table_len);
+                need.insert(1usize << 22);
+            }
+            Op::GeluIndex { table_len, .. } | Op::StableSoftmaxIndex { table_len, .. } => {
+                need.insert(*table_len);
+                need.insert(1usize << 22);
+            }
+            _ => {}
+        }
+    }
+    for len in need {
+        if find_identity_table(store, len).is_none() {
+            store.push((0..len).map(|j| Goldilocks::from_u64(j as u64)).collect());
+        }
+    }
+}
+
 /// Pad a lookup table for commitment/frac use: to the next power of two, at
 /// least 2^5 (WHIR folding needs arity >= 5). Identity tables continue the
 /// identity into the padding (den = alpha + j + beta*j at every padded
@@ -886,6 +939,9 @@ pub enum Op {
         base: T,
         out: T,
         len: usize,
+        /// Length of `base` (S5: the padding mask depends on it, so it is
+        /// part of the statement).
+        base_len: usize,
     },
     BroadcastScale {
         x: T,
@@ -900,9 +956,21 @@ pub enum Op {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum OpProof {
     Transpose,
-    Scale,
-    ScaleVec,
-    Relu,
+    Scale {
+        /// The shared claim point; evals = [x(r), out(r), rem_off(r)]
+        /// (rem_off present only when shift > 0).
+        r: Vec<Goldilocks>,
+        evals: [Goldilocks; 3],
+    },
+    ScaleVec(VirtualProof, Vec<Goldilocks>, Vec<Goldilocks>),
+    Relu {
+        /// eq-weighted virtual over [eq, x, out, rel] with rel = out*(out-x)
+        /// (S5: the sign relation is multiplicative, so it is proven as a
+        /// whole-column virtual, not by the product of point evals).
+        vp: VirtualProof,
+        q: Vec<Goldilocks>,
+        r: Vec<Goldilocks>,
+    },
     MatMul(
         MatmulProof,
         Vec<Goldilocks>,
@@ -910,12 +978,48 @@ pub enum OpProof {
         Vec<Goldilocks>,
     ),
     Projection(ProjectionProof),
-    Add(VirtualProof, Vec<Goldilocks>),
+    Add {
+        /// evals = [a(r), b(r), c(r)]; the relation is checked DIRECTLY
+        /// (a(r) + b(r) == c(r)) — no sumcheck (S5).
+        r: Vec<Goldilocks>,
+        evals: [Goldilocks; 3],
+    },
     Lookup,
     Softmax(SoftmaxRoundedProof),
-    SoftmaxIndex,
-    GeluIndex,
-    StableSoftmaxIndex,
+    SoftmaxIndex {
+        /// eq-weighted relu virtual over [eq, x, trunc, rel]; the divmod
+        /// idx == trunc % table_len is LINEAR and checked directly at r via
+        /// trunc(r) == q_eval*table_len + idx_eval, with q and idx
+        /// range-checked by lookups (S5).
+        vp: VirtualProof,
+        q: Vec<Goldilocks>,
+        r: Vec<Goldilocks>,
+        q_eval: Goldilocks,
+        idx_eval: Goldilocks,
+    },
+    GeluIndex {
+        /// eq-weighted formula virtual over
+        /// [eq, w, trunc, idx, rel1, rel2] with rel1 = trunc*(trunc-w)
+        /// (relu) and rel2 = (trunc-idx)*(trunc-(table_len-1)) (clamp),
+        /// gamma-batched; w = x + offset is LINEAR and checked directly (S5).
+        vp: VirtualProof,
+        q: Vec<Goldilocks>,
+        r: Vec<Goldilocks>,
+    },
+    StableSoftmaxIndex {
+        /// eq-weighted formula virtual over
+        /// [eq, masked, rmax_b, w, trunc, idx, rel1, rel2] with
+        /// rel1 = trunc*(trunc-w) (relu), rel2 = (trunc-idx)*(trunc-(L-1))
+        /// (clamp) and the linear w = masked - rmax_b + offset, gamma-batched.
+        /// The row_max selection is proven by the eq-weighted row virtual
+        /// whose row point is derived as r[n_log..] (S5).
+        vp: VirtualProof,
+        q: Vec<Goldilocks>,
+        r: Vec<Goldilocks>,
+        x_eval: Goldilocks,
+        mask_eval: Goldilocks,
+        row_vp: VirtualProof,
+    },
     Layernorm(LayernormChainProof),
     LayerNormCentered(LayerNormCenteredProof),
     RmsNorm(RmsNormProof),
@@ -926,11 +1030,26 @@ pub enum OpProof {
     Gather(ScatterAddProof),
     BatchedMatMul(BatchedMatmulProof, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>),
     GatherMatMul(bmm::GatherMatMulProof, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>),
-    IdxBroadcast,
-    CombineIdx,
-    PadIdx,
-    BroadcastScale,
-    ScaleGate,
+    IdxBroadcast {
+        /// evals = [base_f(r_base), out_f(r)] with the broadcast formula
+        /// out = base*b + j checked directly (S5).
+        r: Vec<Goldilocks>,
+        evals: [Goldilocks; 2],
+    },
+    CombineIdx {
+        /// evals = [a_f(r), b_f(r), out_f(r)]; out = scale*a + b direct (S5).
+        r: Vec<Goldilocks>,
+        evals: [Goldilocks; 3],
+    },
+    PadIdx {
+        /// eq-weighted virtual over [eq, base_padded, out, mask] with the
+        /// multiplicative padding relation out = mask*base (S5).
+        vp: VirtualProof,
+        q: Vec<Goldilocks>,
+        r: Vec<Goldilocks>,
+    },
+    BroadcastScale(VirtualProof, Vec<Goldilocks>, Vec<Goldilocks>),
+    ScaleGate(VirtualProof, Vec<Goldilocks>, Vec<Goldilocks>),
 }
 
 /// Upper-triangular causal mask as field values (`-(1<<30)` for `j > i`).
@@ -1378,7 +1497,7 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
                     .collect();
                 store.idx[out] = o;
             }
-            Op::PadIdx { base, out, len } => {
+            Op::PadIdx { base, out, len, .. } => {
                 let mut o = store.idx[base].clone();
                 o.resize(len, 0);
                 store.idx[out] = o;
@@ -1695,6 +1814,7 @@ pub fn prove_shard(
     transcript: &mut Transcript,
 ) -> OpShardProof {
     forward_ops(store, ops);
+    ensure_public_tables(store, ops);
     let (proof, _claims) = prove_shard_precomputed(store, ops, transcript, FracMode::Plain);
     proof
 }
@@ -1717,13 +1837,6 @@ pub fn prove_shard_precomputed(
     transcript: &mut Transcript,
     mode: FracMode,
 ) -> (OpShardProof, Vec<EvalClaim>) {
-    let neg = Goldilocks::ZERO - Goldilocks::ONE;
-    let add_terms = vec![
-        (Goldilocks::ONE, vec![2usize]),
-        (neg, vec![0usize]),
-        (neg, vec![1usize]),
-    ];
-
     let mut claims: Vec<EvalClaim> = Vec::new();
     let mut op_proofs = Vec::with_capacity(ops.len());
     let mut lookup_by_table: std::collections::BTreeMap<T, Vec<(Vec<u32>, Vec<Goldilocks>)>> =
@@ -1734,11 +1847,98 @@ pub fn prove_shard_precomputed(
             Op::Transpose { .. } => {
                 op_proofs.push(OpProof::Transpose);
             }
-            Op::Scale { .. } => {
-                op_proofs.push(OpProof::Scale);
+            Op::Scale { x, out, factor, shift } => {
+                // S5: x*factor = 2^shift*out + rho with
+                // rho = rem_off - 2^(shift-1) in [-2^(shift-1), 2^(shift-1))
+                // (round-away-from-zero tie rule); rem_off is range-checked
+                // by a lookup against the public 2^shift identity table.
+                let xv = store.get(x);
+                let r: Vec<Goldilocks> =
+                    transcript.field_vec(xv.len().trailing_zeros() as usize);
+                let half = 1i64 << (shift.saturating_sub(1));
+                let two_shift = 1i64 << shift;
+                let mut evals = [Goldilocks::ZERO; 3];
+                evals[0] = mle::eval(xv, &r);
+                evals[1] = mle::eval(store.get(out), &r);
+                if shift > 0 {
+                    let rem_off: Vec<Goldilocks> = (0..xv.len())
+                        .map(|i| {
+                            from_i64(
+                                to_i64(xv[i]) * factor - to_i64(store.get(out)[i]) * two_shift
+                                    + half,
+                            )
+                        })
+                        .collect();
+                    evals[2] = mle::eval(&rem_off, &r);
+                    let rem_idx: Vec<u32> = rem_off.iter().map(|&v| to_i32(v) as u32).collect();
+                    lookup_by_table
+                        .entry(find_identity_table(store, 1usize << shift).unwrap())
+                        .or_insert(Vec::new())
+                        .push((rem_idx, rem_off));
+                }
+                claims.push(EvalClaim { tensor_id: x, point: r.clone(), value: evals[0] });
+                claims.push(EvalClaim { tensor_id: out, point: r.clone(), value: evals[1] });
+                op_proofs.push(OpProof::Scale { r, evals });
             }
-            Op::ScaleVec { .. } => {
-                op_proofs.push(OpProof::ScaleVec);
+            Op::ScaleVec { x, scale, out, shift } => {
+                // S5: eq-weighted position-wise product with bounded
+                // remainder: x*scale_b = 2^shift*out + rho, rho = rem_off -
+                // 2^(shift-1) (round-away-from-zero ties).
+                let xv = store.get(x);
+                let sv = store.get(scale);
+                let s_len = sv.len();
+                assert!(s_len.is_power_of_two() && xv.len() % s_len == 0);
+                let arity = xv.len().trailing_zeros() as usize;
+                // S5: the eq point q is squeezed upfront; the CLAIM point r
+                // is the sumcheck's derived vector.
+                let q: Vec<Goldilocks> = transcript.field_vec(arity);
+                let eq = mle::eq_evals(&q);
+                let scale_b: Vec<Goldilocks> =
+                    (0..xv.len()).map(|i| sv[i % s_len]).collect();
+                let neg = Goldilocks::ZERO - Goldilocks::ONE;
+                let (vp, r) = if shift == 0 {
+                    let terms = vec![
+                        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+                        (neg, vec![0usize, 3usize]),
+                    ];
+                    let mles: Vec<&[Goldilocks]> =
+                        vec![&eq, xv, &scale_b, store.get(out)];
+                    prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript)
+                } else {
+                    let half = 1i64 << (shift - 1);
+                    let two_shift = 1i64 << shift;
+                    let rem_off: Vec<Goldilocks> = (0..xv.len())
+                        .map(|i| {
+                            from_i64(
+                                to_i64(xv[i]) * to_i64(scale_b[i])
+                                    - to_i64(store.get(out)[i]) * two_shift
+                                    + half,
+                            )
+                        })
+                        .collect();
+                    let ones: Vec<Goldilocks> = vec![Goldilocks::ONE; xv.len()];
+                    let terms = vec![
+                        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+                        (neg * Goldilocks::from_u64(1u64 << shift), vec![0usize, 3usize]),
+                        (neg, vec![0usize, 4usize]),
+                        (Goldilocks::from_u64(half as u64), vec![0usize, 5usize]),
+                    ];
+                    let mles: Vec<&[Goldilocks]> =
+                        vec![&eq, xv, &scale_b, store.get(out), &rem_off, &ones];
+                    let (p, rr) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
+                    let rem_idx: Vec<u32> = rem_off.iter().map(|&v| to_i32(v) as u32).collect();
+                    lookup_by_table
+                        .entry(find_identity_table(store, 1usize << shift).unwrap())
+                        .or_insert(Vec::new())
+                        .push((rem_idx, rem_off));
+                    (p, rr)
+                };
+                let r_scale: Vec<Goldilocks> =
+                    r[..s_len.trailing_zeros() as usize].to_vec();
+                claims.push(EvalClaim { tensor_id: x, point: r.clone(), value: vp.final_evals[1] });
+                claims.push(EvalClaim { tensor_id: scale, point: r_scale.clone(), value: vp.final_evals[2] });
+                claims.push(EvalClaim { tensor_id: out, point: r.clone(), value: vp.final_evals[3] });
+                op_proofs.push(OpProof::ScaleVec(vp, r, r_scale));
             }
             Op::Scatter {
                 sel,
@@ -1815,23 +2015,198 @@ pub fn prove_shard_precomputed(
                 claims.push(EvalClaim { tensor_id: c, point: cp.clone(), value: mle::eval(store.get(c), &cp) });
                 op_proofs.push(OpProof::GatherMatMul(p, u, v, ch));
             }
-            Op::IdxBroadcast { .. } => {
-                op_proofs.push(OpProof::IdxBroadcast);
+            Op::IdxBroadcast { base, out, b } => {
+                // S5: out[i*b+j] = base[i]*b + j — a DIRECT formula at the
+                // claim point (j's value is the closed-form low-bit index).
+                assert!(b.is_power_of_two());
+                let base_f: Vec<Goldilocks> = store.idx[base]
+                    .iter()
+                    .map(|&v| Goldilocks::from_u64(v as u64))
+                    .collect();
+                let out_f: Vec<Goldilocks> = store.idx[out]
+                    .iter()
+                    .map(|&v| Goldilocks::from_u64(v as u64))
+                    .collect();
+                let arity = out_f.len().trailing_zeros() as usize;
+                let r: Vec<Goldilocks> = transcript.field_vec(arity);
+                let b_log = b.trailing_zeros() as usize;
+                let r_base: Vec<Goldilocks> = r[b_log..].to_vec();
+                let evals = [mle::eval(&base_f, &r_base), mle::eval(&out_f, &r)];
+                op_proofs.push(OpProof::IdxBroadcast { r, evals });
             }
-            Op::CombineIdx { .. } => {
-                op_proofs.push(OpProof::CombineIdx);
+            Op::CombineIdx { a, b, out, scale } => {
+                // S5: out = scale*a + b — a DIRECT linear formula at the
+                // claim point.
+                let a_f: Vec<Goldilocks> = store.idx[a]
+                    .iter()
+                    .map(|&v| Goldilocks::from_u64(v as u64))
+                    .collect();
+                let b_f: Vec<Goldilocks> = store.idx[b]
+                    .iter()
+                    .map(|&v| Goldilocks::from_u64(v as u64))
+                    .collect();
+                let out_f: Vec<Goldilocks> = store.idx[out]
+                    .iter()
+                    .map(|&v| Goldilocks::from_u64(v as u64))
+                    .collect();
+                let arity = out_f.len().trailing_zeros() as usize;
+                let r: Vec<Goldilocks> = transcript.field_vec(arity);
+                let evals = [
+                    mle::eval(&a_f, &r),
+                    mle::eval(&b_f, &r),
+                    mle::eval(&out_f, &r),
+                ];
+                op_proofs.push(OpProof::CombineIdx { r, evals });
             }
-            Op::PadIdx { .. } => {
-                op_proofs.push(OpProof::PadIdx);
+            Op::PadIdx { base, out, len, base_len } => {
+                // S5: out = base padded with zeros to `len` — a DIRECT
+                // formula with the public padding mask (i < base_len). The
+                // base column is zero-padded to the (power-of-two) output
+                // domain.
+                assert_eq!(store.idx[base].len(), base_len);
+                assert!(len.is_power_of_two() && len >= base_len);
+                let mut base_f: Vec<Goldilocks> = store.idx[base]
+                    .iter()
+                    .map(|&v| Goldilocks::from_u64(v as u64))
+                    .collect();
+                base_f.resize(len, Goldilocks::ZERO);
+                let out_f: Vec<Goldilocks> = store.idx[out]
+                    .iter()
+                    .map(|&v| Goldilocks::from_u64(v as u64))
+                    .collect();
+                assert_eq!(out_f.len(), len);
+                let mut mask_col: Vec<Goldilocks> = vec![Goldilocks::ZERO; len];
+                for i in 0..base_len {
+                    mask_col[i] = Goldilocks::ONE;
+                }
+                let arity = len.trailing_zeros() as usize;
+                let q: Vec<Goldilocks> = transcript.field_vec(arity);
+                let eq = mle::eq_evals(&q);
+                let neg = Goldilocks::ZERO - Goldilocks::ONE;
+                let terms = vec![
+                    (Goldilocks::ONE, vec![0usize, 2usize]),
+                    (neg, vec![0usize, 1usize, 3usize]),
+                ];
+                let mles: Vec<&[Goldilocks]> = vec![&eq, &base_f, &out_f, &mask_col];
+                let (vp, r) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
+                op_proofs.push(OpProof::PadIdx { vp, q, r });
             }
-            Op::BroadcastScale { .. } => {
-                op_proofs.push(OpProof::BroadcastScale);
+            Op::BroadcastScale { x, scale, out, h } => {
+                // S5: eq-weighted position-wise product (no rounding):
+                // x * scale_b = out with scale_b[i] = scale[i / h].
+                let xv = store.get(x);
+                let sv = store.get(scale);
+                assert!(h.is_power_of_two());
+                assert_eq!(xv.len() / h, sv.len());
+                let arity = xv.len().trailing_zeros() as usize;
+                let q: Vec<Goldilocks> = transcript.field_vec(arity);
+                let eq = mle::eq_evals(&q);
+                let scale_b: Vec<Goldilocks> = (0..xv.len()).map(|i| sv[i / h]).collect();
+                let neg = Goldilocks::ZERO - Goldilocks::ONE;
+                let terms = vec![
+                    (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+                    (neg, vec![0usize, 3usize]),
+                ];
+                let mles: Vec<&[Goldilocks]> = vec![&eq, xv, &scale_b, store.get(out)];
+                let (vp, r) =
+                    prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
+                let r_scale: Vec<Goldilocks> = r[h.trailing_zeros() as usize..].to_vec();
+                claims.push(EvalClaim { tensor_id: x, point: r.clone(), value: vp.final_evals[1] });
+                claims.push(EvalClaim { tensor_id: scale, point: r_scale.clone(), value: vp.final_evals[2] });
+                claims.push(EvalClaim { tensor_id: out, point: r.clone(), value: vp.final_evals[3] });
+                op_proofs.push(OpProof::BroadcastScale(vp, r, r_scale));
             }
-            Op::ScaleGate { .. } => {
-                op_proofs.push(OpProof::ScaleGate);
+            Op::ScaleGate { x, gate, col, out, m, n, h, shift } => {
+                // S5: eq-weighted position-wise product with bounded
+                // remainder; gate_b[ij] = gate[(ij/h)*n + col].
+                let xv = store.get(x);
+                let gv = store.get(gate);
+                assert!(h.is_power_of_two() && n.is_power_of_two());
+                assert_eq!(xv.len(), m * h);
+                assert_eq!(gv.len(), m * n);
+                let arity = xv.len().trailing_zeros() as usize;
+                let q: Vec<Goldilocks> = transcript.field_vec(arity);
+                let h_log = h.trailing_zeros() as usize;
+                let n_log = n.trailing_zeros() as usize;
+                let eq = mle::eq_evals(&q);
+                let gate_b: Vec<Goldilocks> =
+                    (0..xv.len()).map(|ij| gv[(ij / h) * n + col]).collect();
+                let neg = Goldilocks::ZERO - Goldilocks::ONE;
+                let (vp, r) = if shift == 0 {
+                    let terms = vec![
+                        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+                        (neg, vec![0usize, 3usize]),
+                    ];
+                    let mles: Vec<&[Goldilocks]> =
+                        vec![&eq, xv, &gate_b, store.get(out)];
+                    prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript)
+                } else {
+                    let half = 1i64 << (shift - 1);
+                    let two_shift = 1i64 << shift;
+                    let rem_off: Vec<Goldilocks> = (0..xv.len())
+                        .map(|i| {
+                            from_i64(
+                                to_i64(xv[i]) * to_i64(gate_b[i])
+                                    - to_i64(store.get(out)[i]) * two_shift
+                                    + half,
+                            )
+                        })
+                        .collect();
+                    let ones: Vec<Goldilocks> = vec![Goldilocks::ONE; xv.len()];
+                    let terms = vec![
+                        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+                        (neg * Goldilocks::from_u64(1u64 << shift), vec![0usize, 3usize]),
+                        (neg, vec![0usize, 4usize]),
+                        (Goldilocks::from_u64(half as u64), vec![0usize, 5usize]),
+                    ];
+                    let mles: Vec<&[Goldilocks]> =
+                        vec![&eq, xv, &gate_b, store.get(out), &rem_off, &ones];
+                    let (p, rr) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
+                    let rem_idx: Vec<u32> = rem_off.iter().map(|&v| to_i32(v) as u32).collect();
+                    lookup_by_table
+                        .entry(find_identity_table(store, 1usize << shift).unwrap())
+                        .or_insert(Vec::new())
+                        .push((rem_idx, rem_off));
+                    (p, rr)
+                };
+                // gate claim point: [col bits][t bits], t = ij >> h_log.
+                let mut r_gate: Vec<Goldilocks> =
+                    Vec::with_capacity(n_log + m.trailing_zeros() as usize);
+                for k in 0..n_log {
+                    r_gate.push(Goldilocks::from_u64(((col >> k) & 1) as u64));
+                }
+                r_gate.extend_from_slice(&r[h_log..]);
+                claims.push(EvalClaim { tensor_id: x, point: r.clone(), value: vp.final_evals[1] });
+                claims.push(EvalClaim { tensor_id: gate, point: r_gate.clone(), value: vp.final_evals[2] });
+                claims.push(EvalClaim { tensor_id: out, point: r.clone(), value: vp.final_evals[3] });
+                op_proofs.push(OpProof::ScaleGate(vp, r, r_gate));
             }
-            Op::Relu { .. } => {
-                op_proofs.push(OpProof::Relu);
+            Op::Relu { x, out } => {
+                // S5: out = max(x, 0): the SIGN relation out*(out-x) = 0 is
+                // multiplicative, so it is proven as an eq-weighted whole-
+                // column virtual (rel = out*(out-x) as an mle), plus out in
+                // [0, 2^22) via the public range table lookup.
+                let xv = store.get(x);
+                let ov = store.get(out);
+                let arity = xv.len().trailing_zeros() as usize;
+                let q: Vec<Goldilocks> = transcript.field_vec(arity);
+                let eq = mle::eq_evals(&q);
+                let neg = Goldilocks::ZERO - Goldilocks::ONE;
+                let terms = vec![
+                    (Goldilocks::ONE, vec![0usize, 2usize, 2usize]),
+                    (neg, vec![0usize, 1usize, 2usize]),
+                ];
+                let mles: Vec<&[Goldilocks]> = vec![&eq, xv, ov];
+                let (vp, r) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
+                let out_idx: Vec<u32> = ov.iter().map(|&v| to_i32(v) as u32).collect();
+                let out_vals: Vec<Goldilocks> = ov.to_vec();
+                lookup_by_table
+                    .entry(find_identity_table(store, 1usize << 22).unwrap())
+                    .or_insert(Vec::new())
+                    .push((out_idx, out_vals));
+                claims.push(EvalClaim { tensor_id: x, point: r.clone(), value: vp.final_evals[1] });
+                claims.push(EvalClaim { tensor_id: out, point: r.clone(), value: vp.final_evals[2] });
+                op_proofs.push(OpProof::Relu { vp, q, r });
             }
             Op::MatMul { a, b, c, m, k, n } => {
                 let at = transpose(store.get(a), m, k);
@@ -1886,12 +2261,21 @@ pub fn prove_shard_precomputed(
                 op_proofs.push(OpProof::Projection(p));
             }
             Op::Add { a, b, c } => {
-                let mles: Vec<&[Goldilocks]> = vec![store.get(a), store.get(b), store.get(c)];
-                let (proof, r) = prove_virtual(&mles, &add_terms, Goldilocks::ZERO, transcript);
-                claims.push(EvalClaim { tensor_id: a, point: r.clone(), value: mle::eval(store.get(a), &r) });
-                claims.push(EvalClaim { tensor_id: b, point: r.clone(), value: mle::eval(store.get(b), &r) });
-                claims.push(EvalClaim { tensor_id: c, point: r.clone(), value: mle::eval(store.get(c), &r) });
-                op_proofs.push(OpProof::Add(proof, r));
+                // S5: addition is linear — a DIRECT pointwise relation, no
+                // sumcheck. The claim values are authenticated by the S2
+                // chain; the relation forces c(r) = a(r) + b(r) at the random
+                // point, hence everywhere (SZ).
+                let r: Vec<Goldilocks> =
+                    transcript.field_vec(store.get(a).len().trailing_zeros() as usize);
+                let evals = [
+                    mle::eval(store.get(a), &r),
+                    mle::eval(store.get(b), &r),
+                    mle::eval(store.get(c), &r),
+                ];
+                claims.push(EvalClaim { tensor_id: a, point: r.clone(), value: evals[0] });
+                claims.push(EvalClaim { tensor_id: b, point: r.clone(), value: evals[1] });
+                claims.push(EvalClaim { tensor_id: c, point: r.clone(), value: evals[2] });
+                op_proofs.push(OpProof::Add { r, evals });
             }
             Op::Lookup { idx, out, table } => {
                 lookup_by_table
@@ -1928,14 +2312,243 @@ pub fn prove_shard_precomputed(
                     .push((store.idx[idx].clone(), store.get(e).to_vec()));
                 op_proofs.push(OpProof::Softmax(p));
             }
-            Op::SoftmaxIndex { .. } => {
-                op_proofs.push(OpProof::SoftmaxIndex);
+            Op::SoftmaxIndex { x, out, table_len } => {
+                // S5: idx = relu(x) % table_len — the full formula is proven
+                // by the divmod decomposition: trunc = q*table_len + idx_f
+                // (DIRECT at r), trunc = relu(x) (DIRECT at r), with
+                // idx_f in [0, table_len) and q in [0, 2^22) range-checked
+                // by lookups into the public identity tables.
+                assert!(table_len.is_power_of_two());
+                let xv = store.get(x);
+                let trunc: Vec<Goldilocks> = xv
+                    .iter()
+                    .map(|&v| {
+                        let iv = to_i64(v);
+                        if iv > 0 { v } else { Goldilocks::ZERO }
+                    })
+                    .collect();
+                let idx_f: Vec<Goldilocks> = store.idx[out]
+                    .iter()
+                    .map(|&v| Goldilocks::from_u64(v as u64))
+                    .collect();
+                let q: Vec<Goldilocks> = (0..trunc.len())
+                    .map(|i| {
+                        let t = to_i64(trunc[i]);
+                        Goldilocks::from_u64((t.max(0) as u64) / table_len as u64)
+                    })
+                    .collect();
+                let arity = xv.len().trailing_zeros() as usize;
+                let q_pt: Vec<Goldilocks> = transcript.field_vec(arity);
+                let eq = mle::eq_evals(&q_pt);
+                let neg = Goldilocks::ZERO - Goldilocks::ONE;
+                let terms = vec![
+                    (Goldilocks::ONE, vec![0usize, 2usize, 2usize]),
+                    (neg, vec![0usize, 1usize, 2usize]),
+                ];
+                let mles: Vec<&[Goldilocks]> = vec![&eq, xv, &trunc];
+                let (vp, r) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
+                let q_eval = mle::eval(&q, &r);
+                let idx_eval = mle::eval(&idx_f, &r);
+                let idx_u: Vec<u32> = store.idx[out].clone();
+                lookup_by_table
+                    .entry(find_identity_table(store, table_len).unwrap())
+                    .or_insert(Vec::new())
+                    .push((idx_u, idx_f.clone()));
+                let q_idx: Vec<u32> = q.iter().map(|&v| to_i32(v) as u32).collect();
+                lookup_by_table
+                    .entry(find_identity_table(store, 1usize << 22).unwrap())
+                    .or_insert(Vec::new())
+                    .push((q_idx, q));
+                claims.push(EvalClaim { tensor_id: x, point: r.clone(), value: vp.final_evals[1] });
+                op_proofs.push(OpProof::SoftmaxIndex { vp, q: q_pt, r, q_eval, idx_eval });
             }
-            Op::GeluIndex { .. } => {
-                op_proofs.push(OpProof::GeluIndex);
+            Op::GeluIndex { x, out, offset, table_len } => {
+                // S5: idx = clamp(x + offset, 0, table_len-1) — w = x+offset
+                // (DIRECT), trunc = relu(w) (DIRECT), and the clamp
+                // idx = min(trunc, table_len-1) via the direct relation
+                // (trunc - idx)*(trunc - (table_len-1)) = 0 plus the range
+                // lookups idx in [0, table_len) and trunc-idx in [0, 2^22).
+                assert!(table_len.is_power_of_two());
+                let xv = store.get(x);
+                let ofs = Goldilocks::from_i64(offset);
+                let w: Vec<Goldilocks> = xv.iter().map(|&v| v + ofs).collect();
+                let trunc: Vec<Goldilocks> = w
+                    .iter()
+                    .map(|&v| {
+                        let iv = to_i64(v);
+                        if iv > 0 { v } else { Goldilocks::ZERO }
+                    })
+                    .collect();
+                let idx_f: Vec<Goldilocks> = store.idx[out]
+                    .iter()
+                    .map(|&v| Goldilocks::from_u64(v as u64))
+                    .collect();
+                let arity = xv.len().trailing_zeros() as usize;
+                let q_pt: Vec<Goldilocks> = transcript.field_vec(arity);
+                let g1 = transcript.field();
+                let g2 = transcript.field();
+                let eq = mle::eq_evals(&q_pt);
+                let l1 = Goldilocks::from_u64((table_len - 1) as u64);
+                let neg = Goldilocks::ZERO - Goldilocks::ONE;
+                // gamma-batched: relu g1*eq*trunc*(trunc-w) and clamp
+                // g2*eq*(idx-trunc)*(idx-(L-1)) = 0 (idx = min(trunc, L-1)),
+                // expanded into terms.
+                let terms = vec![
+                    (g1, vec![0usize, 2usize, 2usize]),
+                    (neg * g1, vec![0usize, 1usize, 2usize]),
+                    (g2, vec![0usize, 3usize, 3usize]),
+                    (neg * g2 * l1, vec![0usize, 3usize]),
+                    (neg * g2, vec![0usize, 2usize, 3usize]),
+                    (g2 * l1, vec![0usize, 2usize]),
+                ];
+                let mles: Vec<&[Goldilocks]> = vec![&eq, &w, &trunc, &idx_f];
+                let (vp, r) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
+                let idx_u: Vec<u32> = store.idx[out].clone();
+                lookup_by_table
+                    .entry(find_identity_table(store, table_len).unwrap())
+                    .or_insert(Vec::new())
+                    .push((idx_u, idx_f.clone()));
+                let diff: Vec<Goldilocks> = (0..trunc.len())
+                    .map(|i| trunc[i] - idx_f[i])
+                    .collect();
+                let diff_idx: Vec<u32> = diff.iter().map(|&v| to_i32(v) as u32).collect();
+                lookup_by_table
+                    .entry(find_identity_table(store, 1usize << 22).unwrap())
+                    .or_insert(Vec::new())
+                    .push((diff_idx, diff));
+                claims.push(EvalClaim { tensor_id: x, point: r.clone(), value: vp.final_evals[1] - ofs });
+                op_proofs.push(OpProof::GeluIndex { vp, q: q_pt, r });
             }
-            Op::StableSoftmaxIndex { .. } => {
-                op_proofs.push(OpProof::StableSoftmaxIndex);
+            Op::StableSoftmaxIndex { x, mask, out, offset, table_len, m, n } => {
+                // S5: idx = clamp(masked - row_max + offset, 0, table_len-1)
+                // with masked = x + mask. The row maximum is proven by a
+                // selection argument (eq-weighted row virtual): sel in {0,1},
+                // row sum sel = 1, row_max = sum sel*masked. Then the same
+                // relu + clamp relations as GeluIndex.
+                assert!(table_len.is_power_of_two());
+                let xv = store.get(x);
+                let mv = store.get(mask);
+                let masked: Vec<Goldilocks> = xv.iter().zip(mv).map(|(a, b)| *a + *b).collect();
+                let row_max: Vec<Goldilocks> = (0..m)
+                    .map(|i| {
+                        (0..n).fold(masked[i * n], |acc, j| {
+                            let v = masked[i * n + j];
+                            if to_i64(v) > to_i64(acc) { v } else { acc }
+                        })
+                    })
+                    .collect();
+                let sel: Vec<Goldilocks> = (0..m * n)
+                    .map(|ij| {
+                        let i = ij / n;
+                        if masked[ij] == row_max[i] { Goldilocks::ONE } else { Goldilocks::ZERO }
+                    })
+                    .collect();
+                let arity = xv.len().trailing_zeros() as usize;
+                let n_log = n.trailing_zeros() as usize;
+                let neg = Goldilocks::ZERO - Goldilocks::ONE;
+                let row_max_b: Vec<Goldilocks> =
+                    (0..m * n).map(|ij| row_max[ij / n]).collect();
+                let ofs = from_i64(offset);
+                let w: Vec<Goldilocks> = (0..m * n)
+                    .map(|ij| masked[ij] - row_max_b[ij] + ofs)
+                    .collect();
+                let trunc: Vec<Goldilocks> = w
+                    .iter()
+                    .map(|&v| {
+                        let iv = to_i64(v);
+                        if iv > 0 { v } else { Goldilocks::ZERO }
+                    })
+                    .collect();
+                let idx_f: Vec<Goldilocks> = store.idx[out]
+                    .iter()
+                    .map(|&v| Goldilocks::from_u64(v as u64))
+                    .collect();
+                // Formula virtual FIRST (its derived point r_f fixes the
+                // row point for the selection virtual below).
+                let g1 = transcript.field();
+                let g2 = transcript.field();
+                let g3 = transcript.field();
+                let q_pt: Vec<Goldilocks> = transcript.field_vec(arity);
+                let eq_f = mle::eq_evals(&q_pt);
+                let l1 = Goldilocks::from_u64((table_len - 1) as u64);
+                let ones: Vec<Goldilocks> = vec![Goldilocks::ONE; m * n];
+                let neg = Goldilocks::ZERO - Goldilocks::ONE;
+                // gamma-batched: relu g1*eq*trunc*(trunc-w), clamp
+                // g2*eq*(idx-trunc)*(idx-(L-1)) = 0, linear w relation
+                // g3*eq*(w - masked + rmax_b - ofs).
+                let f_terms = vec![
+                    (g1, vec![0usize, 4usize, 4usize]),
+                    (neg * g1, vec![0usize, 3usize, 4usize]),
+                    (g2, vec![0usize, 5usize, 5usize]),
+                    (neg * g2 * l1, vec![0usize, 5usize]),
+                    (neg * g2, vec![0usize, 4usize, 5usize]),
+                    (g2 * l1, vec![0usize, 4usize]),
+                    (g3, vec![0usize, 3usize]),
+                    (neg * g3, vec![0usize, 1usize]),
+                    (g3, vec![0usize, 2usize]),
+                    (neg * g3 * ofs, vec![0usize, 6usize]),
+                ];
+                let f_mles: Vec<&[Goldilocks]> =
+                    vec![&eq_f, &masked, &row_max_b, &w, &trunc, &idx_f, &ones];
+                let (vp, r_f) =
+                    prove_virtual(&f_mles, &f_terms, Goldilocks::ZERO, transcript);
+                let x_eval = mle::eval(xv, &r_f);
+                let mask_eval = mle::eval(mv, &r_f);
+                // eq-weighted row virtual (batched selection relations); the
+                // row point is DERIVED as the row bits of the formula point.
+                let r_row: Vec<Goldilocks> = r_f[n_log..].to_vec();
+                let g1r = transcript.field();
+                let g2r = transcript.field();
+                let eq_row = mle::eq_evals(&r_row);
+                let eq_b: Vec<Goldilocks> =
+                    (0..m * n).map(|ij| eq_row[ij / n]).collect();
+                let rmax = mle::eval(&row_max, &r_row);
+                let row_terms = vec![
+                    (g1r, vec![0usize, 1usize]),
+                    (g2r, vec![0usize, 1usize, 2usize]),
+                    (g2r, vec![0usize, 1usize, 1usize]),
+                    (neg * g2r, vec![0usize, 1usize]),
+                ];
+                let row_mles: Vec<&[Goldilocks]> = vec![&eq_b, &sel, &masked];
+                let (row_vp, _row_ch) = prove_virtual(
+                    &row_mles,
+                    &row_terms,
+                    g1r + g2r * rmax,
+                    transcript,
+                );
+                let diff: Vec<Goldilocks> = (0..trunc.len())
+                    .map(|i| trunc[i] - idx_f[i])
+                    .collect();
+                let idx_u: Vec<u32> = store.idx[out].clone();
+                lookup_by_table
+                    .entry(find_identity_table(store, table_len).unwrap())
+                    .or_insert(Vec::new())
+                    .push((idx_u, idx_f));
+                let diff_idx: Vec<u32> = diff.iter().map(|&v| to_i32(v) as u32).collect();
+                lookup_by_table
+                    .entry(find_identity_table(store, 1usize << 22).unwrap())
+                    .or_insert(Vec::new())
+                    .push((diff_idx, diff));
+                // The row-max non-negativity per position:
+                // row_max_b - masked in [0, 2^22) via the range lookup.
+                let mdiff: Vec<Goldilocks> = (0..m * n)
+                    .map(|ij| row_max_b[ij] - masked[ij])
+                    .collect();
+                let mdiff_idx: Vec<u32> = mdiff.iter().map(|&v| to_i32(v) as u32).collect();
+                lookup_by_table
+                    .entry(find_identity_table(store, 1usize << 22).unwrap())
+                    .or_insert(Vec::new())
+                    .push((mdiff_idx, mdiff));
+                claims.push(EvalClaim { tensor_id: x, point: r_f.clone(), value: x_eval });
+                claims.push(EvalClaim { tensor_id: mask, point: r_f.clone(), value: mask_eval });
+                op_proofs.push(OpProof::StableSoftmaxIndex {
+                    vp,
+                    q: q_pt,
+                    r: r_f,
+                    x_eval,
+                    mask_eval,
+                    row_vp,
+                });
             }
             Op::Layernorm {
                 x,
@@ -2135,6 +2748,43 @@ pub fn prove_shard_precomputed(
         }
     }
 
+    // S5: Transpose claim forwarding — out's claims become x's claims at
+    // the axis-swapped point (out[j*m+i] = x[i*k+j]); m and k must be powers
+    // of two, otherwise the op is rejected (no silent passthrough).
+    {
+        let transposes: Vec<(T, T, usize, usize)> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Transpose { x, out, m, k } => Some((*x, *out, *m, *k)),
+                _ => None,
+            })
+            .collect();
+        for &(_, _, m, k) in &transposes {
+            assert!(
+                m.is_power_of_two() && k.is_power_of_two(),
+                "Transpose axes must be powers of two (S5)"
+            );
+        }
+        for _ in 0..transposes.len().max(1) {
+            let mut changed = false;
+            for c in claims.iter_mut() {
+                for &(x, out, m, k) in &transposes {
+                    if c.tensor_id == out {
+                        let log_m = m.trailing_zeros() as usize;
+                        let mut p = c.point[log_m..].to_vec();
+                        p.extend_from_slice(&c.point[..log_m]);
+                        c.tensor_id = x;
+                        c.point = p;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
     // Normalize the claim list (S2): same-tensor same-point claims merge
     // (duplicates keep one entry); contradictory values on one point are a
     // prover bug and rejected loudly. The verifier applies the same
@@ -2248,6 +2898,28 @@ pub fn verify_shard_precomputed(
     verify_shard_precomputed_inner(tables, ops, proof, transcript, FracMode::Plain).is_some()
 }
 
+/// S5 helper: verify an eq-weighted virtual relation whose FIRST mle is
+/// eq(r, ·). The stored eq eval must equal the closed-form eq(r, r) (the S3
+/// pattern) before the final-eval consistency check.
+fn verify_eq_weighted(
+    vp: &VirtualProof,
+    terms: &[(Goldilocks, Vec<usize>)],
+    arity: usize,
+    q: &[Goldilocks],
+    r: &[Goldilocks],
+    transcript: &mut Transcript,
+) -> bool {
+    let (ok, r_derived, fc) =
+        verify_virtual(vp, terms, Goldilocks::ZERO, arity, transcript);
+    if !ok || r_derived != *r {
+        return false;
+    }
+    if vp.final_evals[0] != mle::eq_poly(q, r) {
+        return false;
+    }
+    fc == virtual_eval(terms, &vp.final_evals)
+}
+
 /// Shard replay that BUILDS the shard's claim set (S2): every claim is derived
 /// from the op verifications' checked final evals, never read from the proof.
 /// Returns the claims on success; `None` rejects.
@@ -2267,13 +2939,6 @@ fn verify_shard_precomputed_inner(
         return None;
     }
 
-    let neg = Goldilocks::ZERO - Goldilocks::ONE;
-    let add_terms = vec![
-        (Goldilocks::ONE, vec![2usize]),
-        (neg, vec![0usize]),
-        (neg, vec![1usize]),
-    ];
-
     let mut claims: Vec<EvalClaim> = Vec::new();
     for (op, p) in ops.iter().zip(&proof.ops) {
         match (op, p) {
@@ -2282,8 +2947,61 @@ fn verify_shard_precomputed_inner(
                 // forward_ops, and the downstream op's claim on `out` is checked
                 // against that recomputed value.
             }
-            (Op::Scale { .. }, OpProof::Scale) => {}
-            (Op::ScaleVec { .. }, OpProof::ScaleVec) => {}
+            (Op::Scale { x, out, factor, shift }, OpProof::Scale { r, evals }) => {
+                // S5: x*factor = 2^shift*out + (rem_off - 2^(shift-1)), the
+                // remainder range-checked by the 2^shift identity lookup.
+                let r_s: Vec<Goldilocks> = transcript.field_vec(r.len());
+                if r_s != *r {
+                    return None;
+                }
+                let two_shift = Goldilocks::from_u64(1u64 << shift);
+                if *shift == 0 {
+                    if evals[0] * from_i64(*factor) != evals[1] {
+                        return None;
+                    }
+                } else {
+                    let half = Goldilocks::from_u64(1u64 << (shift - 1));
+                    if evals[0] * from_i64(*factor)
+                        != two_shift * evals[1] + evals[2] - half
+                    {
+                        return None;
+                    }
+                }
+                claims.push(EvalClaim { tensor_id: *x, point: r.clone(), value: evals[0] });
+                claims.push(EvalClaim { tensor_id: *out, point: r.clone(), value: evals[1] });
+            }
+            (Op::ScaleVec { x, scale, out, shift }, OpProof::ScaleVec(vp, r, r_scale)) => {
+                // S5: eq-weighted position-wise product with bounded
+                // remainder.
+                let s_len_log = r_scale.len();
+                let arity = r.len();
+                let q_s: Vec<Goldilocks> = transcript.field_vec(arity);
+                if *r_scale != r[..s_len_log].to_vec() {
+                    return None;
+                }
+                let neg = Goldilocks::ZERO - Goldilocks::ONE;
+                let terms = if *shift == 0 {
+                    vec![
+                        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+                        (neg, vec![0usize, 3usize]),
+                    ]
+                } else {
+                    let half = Goldilocks::from_u64(1u64 << (shift - 1));
+                    let two_shift = Goldilocks::from_u64(1u64 << shift);
+                    vec![
+                        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+                        (neg * two_shift, vec![0usize, 3usize]),
+                        (neg, vec![0usize, 4usize]),
+                        (half, vec![0usize, 5usize]),
+                    ]
+                };
+                if !verify_eq_weighted(vp, &terms, arity, &q_s, r, transcript) {
+                    return None;
+                }
+                claims.push(EvalClaim { tensor_id: *x, point: r.clone(), value: vp.final_evals[1] });
+                claims.push(EvalClaim { tensor_id: *scale, point: r_scale.clone(), value: vp.final_evals[2] });
+                claims.push(EvalClaim { tensor_id: *out, point: r.clone(), value: vp.final_evals[3] });
+            }
             (Op::Scatter { m, n, .. }, OpProof::Scatter(p)) => {
                 if !verify_scatter_with_mode(p, *m, *n, transcript, mode) {
                     return None;
@@ -2333,12 +3051,142 @@ fn verify_shard_precomputed_inner(
                 cp.extend_from_slice(u);
                 claims.push(EvalClaim { tensor_id: *c, point: cp, value: p.claimed });
             }
-            (Op::IdxBroadcast { .. }, OpProof::IdxBroadcast) => {}
-            (Op::CombineIdx { .. }, OpProof::CombineIdx) => {}
-            (Op::PadIdx { .. }, OpProof::PadIdx) => {}
-            (Op::BroadcastScale { .. }, OpProof::BroadcastScale) => {}
-            (Op::ScaleGate { .. }, OpProof::ScaleGate) => {}
-            (Op::Relu { .. }, OpProof::Relu) => {}
+            (Op::IdxBroadcast { base, out, b }, OpProof::IdxBroadcast { r, evals }) => {
+                // S5: out = base*b + j at the claim point (j = closed-form
+                // low-bit index value of r).
+                let r_s: Vec<Goldilocks> = transcript.field_vec(r.len());
+                if r_s != *r {
+                    return None;
+                }
+                let b_log = b.trailing_zeros() as usize;
+                let r_base = &r[b_log..];
+                let mut jval = Goldilocks::ZERO;
+                for (k, &pk) in r[..b_log].iter().enumerate() {
+                    jval = jval + Goldilocks::from_u64(1u64 << k) * pk;
+                }
+                if evals[1] != Goldilocks::from_u64(*b as u64) * evals[0] + jval {
+                    return None;
+                }
+                let _ = (base, out, r_base);
+            }
+            (Op::CombineIdx { a, b, out, scale }, OpProof::CombineIdx { r, evals }) => {
+                // S5: out = scale*a + b — direct linear formula at r.
+                let r_s: Vec<Goldilocks> = transcript.field_vec(r.len());
+                if r_s != *r {
+                    return None;
+                }
+                if evals[2] != Goldilocks::from_u64(*scale as u64) * evals[0] + evals[1] {
+                    return None;
+                }
+                let _ = (a, b, out);
+            }
+            (
+                Op::PadIdx { base, out, len, base_len },
+                OpProof::PadIdx { vp, q, r },
+            ) => {
+                // S5: out = mask*base with the public padding mask column
+                // (i < base_len), proven as an eq-weighted virtual (the
+                // relation is multiplicative).
+                let q_s: Vec<Goldilocks> = transcript.field_vec(r.len());
+                if q_s != *q {
+                    return None;
+                }
+                let mut mask_col = vec![Goldilocks::ZERO; *len];
+                for i in 0..*base_len {
+                    mask_col[i] = Goldilocks::ONE;
+                }
+                let neg = Goldilocks::ZERO - Goldilocks::ONE;
+                let terms = vec![
+                    (Goldilocks::ONE, vec![0usize, 2usize]),
+                    (neg, vec![0usize, 1usize, 3usize]),
+                ];
+                if !verify_eq_weighted(vp, &terms, r.len(), &q_s, r, transcript) {
+                    return None;
+                }
+                let _ = (base, out);
+            }
+            (Op::BroadcastScale { x, scale, out, h }, OpProof::BroadcastScale(vp, r, r_scale)) => {
+                let arity = r.len();
+                let q_s: Vec<Goldilocks> = transcript.field_vec(arity);
+                let h_log = h.trailing_zeros() as usize;
+                if *r_scale != r[h_log..].to_vec() {
+                    return None;
+                }
+                let neg = Goldilocks::ZERO - Goldilocks::ONE;
+                let terms = vec![
+                    (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+                    (neg, vec![0usize, 3usize]),
+                ];
+                if !verify_eq_weighted(vp, &terms, arity, &q_s, r, transcript) {
+                    return None;
+                }
+                claims.push(EvalClaim { tensor_id: *x, point: r.clone(), value: vp.final_evals[1] });
+                claims.push(EvalClaim { tensor_id: *scale, point: r_scale.clone(), value: vp.final_evals[2] });
+                claims.push(EvalClaim { tensor_id: *out, point: r.clone(), value: vp.final_evals[3] });
+            }
+            (Op::ScaleGate { x, gate, col, out, m, n, h, shift }, OpProof::ScaleGate(vp, r, r_gate)) => {
+                let arity = r.len();
+                let q_s: Vec<Goldilocks> = transcript.field_vec(arity);
+                let h_log = h.trailing_zeros() as usize;
+                let n_log = n.trailing_zeros() as usize;
+                let mut r_gate_s: Vec<Goldilocks> = (0..n_log)
+                    .map(|k| Goldilocks::from_u64(((col >> k) & 1) as u64))
+                    .collect();
+                r_gate_s.extend_from_slice(&r[h_log..]);
+                if r_gate_s != *r_gate {
+                    return None;
+                }
+                let neg = Goldilocks::ZERO - Goldilocks::ONE;
+                let terms = if *shift == 0 {
+                    vec![
+                        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+                        (neg, vec![0usize, 3usize]),
+                    ]
+                } else {
+                    let half = Goldilocks::from_u64(1u64 << (shift - 1));
+                    let two_shift = Goldilocks::from_u64(1u64 << shift);
+                    vec![
+                        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+                        (neg * two_shift, vec![0usize, 3usize]),
+                        (neg, vec![0usize, 4usize]),
+                        (half, vec![0usize, 5usize]),
+                    ]
+                };
+                if !verify_eq_weighted(vp, &terms, arity, &q_s, r, transcript) {
+                    return None;
+                }
+                claims.push(EvalClaim { tensor_id: *x, point: r.clone(), value: vp.final_evals[1] });
+                claims.push(EvalClaim { tensor_id: *gate, point: r_gate.clone(), value: vp.final_evals[2] });
+                claims.push(EvalClaim { tensor_id: *out, point: r.clone(), value: vp.final_evals[3] });
+            }
+            (Op::Relu { x, out }, OpProof::Relu { vp, q, r }) => {
+                // S5: eq-weighted relu virtual: sum eq(q,.)*out*(out-x) = 0
+                // (the whole-column product relation), plus out in [0, 2^22)
+                // via the range lookup.
+                let q_s: Vec<Goldilocks> = transcript.field_vec(r.len());
+                if q_s != *q {
+                    return None;
+                }
+                let neg = Goldilocks::ZERO - Goldilocks::ONE;
+                let terms = vec![
+                    (Goldilocks::ONE, vec![0usize, 2usize, 2usize]),
+                    (neg, vec![0usize, 1usize, 2usize]),
+                ];
+                if !verify_eq_weighted(vp, &terms, r.len(), &q_s, r, transcript) {
+                    return None;
+                }
+                let t_22 = find_identity_table_slices(tables, 1usize << 22);
+                match t_22 {
+                    Some(tw) => {
+                        if !proof.witness_columns.iter().any(|w| w.table == tw) {
+                            return None;
+                        }
+                    }
+                    None => return None,
+                }
+                claims.push(EvalClaim { tensor_id: *x, point: r.clone(), value: vp.final_evals[1] });
+                claims.push(EvalClaim { tensor_id: *out, point: r.clone(), value: vp.final_evals[2] });
+            }
             (
                 Op::MatMul { a, b, c, m, k, n },
                 OpProof::MatMul(mp, u, v, ch),
@@ -2378,18 +3226,18 @@ fn verify_shard_precomputed_inner(
                 claims.push(EvalClaim { tensor_id: *out, point: pp.pt.clone(), value: pp.affine.final_evals[3] });
                 claims.push(EvalClaim { tensor_id: *bias, point: pp.pt.clone(), value: pp.affine.final_evals[4] });
             }
-            (Op::Add { a, b, c }, OpProof::Add(vp, r)) => {
-                let (ok, r_derived, fc) =
-                    verify_virtual(vp, &add_terms, Goldilocks::ZERO, r.len(), transcript);
-                if !ok
-                    || r_derived != *r
-                    || fc != virtual_eval(&add_terms, &vp.final_evals)
-                {
+            (Op::Add { a, b, c }, OpProof::Add { r, evals }) => {
+                // S5: DIRECT position-wise relation — no sumcheck.
+                let r_s: Vec<Goldilocks> = transcript.field_vec(r.len());
+                if r_s != *r {
                     return None;
                 }
-                claims.push(EvalClaim { tensor_id: *a, point: r.clone(), value: vp.final_evals[0] });
-                claims.push(EvalClaim { tensor_id: *b, point: r.clone(), value: vp.final_evals[1] });
-                claims.push(EvalClaim { tensor_id: *c, point: r.clone(), value: vp.final_evals[2] });
+                if evals[0] + evals[1] != evals[2] {
+                    return None;
+                }
+                claims.push(EvalClaim { tensor_id: *a, point: r.clone(), value: evals[0] });
+                claims.push(EvalClaim { tensor_id: *b, point: r.clone(), value: evals[1] });
+                claims.push(EvalClaim { tensor_id: *c, point: r.clone(), value: evals[2] });
             }
             (Op::Lookup { table, .. }, OpProof::Lookup) => {
                 // Existence only: the per-table fractional replays happen after
@@ -2412,19 +3260,176 @@ fn verify_shard_precomputed_inner(
                     value: sp.rescale.final_evals[0],
                 });
             }
-            (Op::SoftmaxIndex { .. }, OpProof::SoftmaxIndex) => {
-                // No proof: the verifier recomputes `idx = softmax_index(scores)`.
+            (
+                Op::SoftmaxIndex { x, out, table_len },
+                OpProof::SoftmaxIndex { vp, q, r, q_eval, idx_eval },
+            ) => {
+                // S5: eq-weighted relu virtual; the divmod
+                // trunc == q*table_len + idx is LINEAR and checked directly
+                // at r; q and idx are range-checked by the lookups.
+                let q_s: Vec<Goldilocks> = transcript.field_vec(r.len());
+                if q_s != *q {
+                    return None;
+                }
+                let neg = Goldilocks::ZERO - Goldilocks::ONE;
+                let terms = vec![
+                    (Goldilocks::ONE, vec![0usize, 2usize, 2usize]),
+                    (neg, vec![0usize, 1usize, 2usize]),
+                ];
+                if !verify_eq_weighted(vp, &terms, r.len(), &q_s, r, transcript) {
+                    return None;
+                }
+                let trunc_r = vp.final_evals[2];
+                if trunc_r != *q_eval * Goldilocks::from_u64(*table_len as u64) + *idx_eval {
+                    return None;
+                }
+                let t_len = find_identity_table_slices(tables, *table_len);
+                let t_22 = find_identity_table_slices(tables, 1usize << 22);
+                match (t_len, t_22) {
+                    (Some(tl), Some(tw)) => {
+                        let has_len = proof.witness_columns.iter().any(|w| w.table == tl);
+                        let has_22 = proof.witness_columns.iter().any(|w| w.table == tw);
+                        if !has_len || !has_22 {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                }
+                claims.push(EvalClaim { tensor_id: *x, point: r.clone(), value: vp.final_evals[1] });
+                let _ = out;
             }
-            (Op::GeluIndex { .. }, OpProof::GeluIndex) => {}
-            (Op::StableSoftmaxIndex { .. }, OpProof::StableSoftmaxIndex) => {}
+            (
+                Op::GeluIndex { x, out, offset, table_len },
+                OpProof::GeluIndex { vp, q, r },
+            ) => {
+                // S5: eq-weighted formula virtual (relu + clamp,
+                // gamma-batched); w = x + offset is linear.
+                let q_s: Vec<Goldilocks> = transcript.field_vec(r.len());
+                let g1 = transcript.field();
+                let g2 = transcript.field();
+                if q_s != *q {
+                    return None;
+                }
+                let l1 = Goldilocks::from_u64((*table_len - 1) as u64);
+                let neg = Goldilocks::ZERO - Goldilocks::ONE;
+                let terms = vec![
+                    (g1, vec![0usize, 2usize, 2usize]),
+                    (neg * g1, vec![0usize, 1usize, 2usize]),
+                    (g2, vec![0usize, 3usize, 3usize]),
+                    (neg * g2 * l1, vec![0usize, 3usize]),
+                    (neg * g2, vec![0usize, 2usize, 3usize]),
+                    (g2 * l1, vec![0usize, 2usize]),
+                ];
+                if !verify_eq_weighted(vp, &terms, r.len(), &q_s, r, transcript) {
+                    return None;
+                }
+                let t_len = find_identity_table_slices(tables, *table_len);
+                let t_22 = find_identity_table_slices(tables, 1usize << 22);
+                match (t_len, t_22) {
+                    (Some(tl), Some(tw)) => {
+                        let has_len = proof.witness_columns.iter().any(|w| w.table == tl);
+                        let has_22 = proof.witness_columns.iter().any(|w| w.table == tw);
+                        if !has_len || !has_22 {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                }
+                let ofs = from_i64(*offset);
+                claims.push(EvalClaim { tensor_id: *x, point: r.clone(), value: vp.final_evals[1] - ofs });
+                let _ = out;
+            }
+            (
+                Op::StableSoftmaxIndex { x, mask, out, offset, table_len, m, n },
+                OpProof::StableSoftmaxIndex { vp, q, r, x_eval, mask_eval, row_vp },
+            ) => {
+                // S5: the row maximum via the eq-weighted selection virtual
+                // (row point = the formula point's row bits); the formula
+                // virtual covers the linear w relation and the relu/clamp
+                // product relations.
+                let n_log = n.trailing_zeros() as usize;
+                let neg = Goldilocks::ZERO - Goldilocks::ONE;
+                // Formula virtual FIRST (mirrors the prover).
+                let g1f = transcript.field();
+                let g2f = transcript.field();
+                let g3 = transcript.field();
+                let q_s: Vec<Goldilocks> = transcript.field_vec(r.len());
+                if q_s != *q {
+                    return None;
+                }
+                let ofs = from_i64(*offset);
+                let l1 = Goldilocks::from_u64((*table_len - 1) as u64);
+                let f_terms = vec![
+                    (g1f, vec![0usize, 4usize, 4usize]),
+                    (neg * g1f, vec![0usize, 3usize, 4usize]),
+                    (g2f, vec![0usize, 5usize, 5usize]),
+                    (neg * g2f * l1, vec![0usize, 5usize]),
+                    (neg * g2f, vec![0usize, 4usize, 5usize]),
+                    (g2f * l1, vec![0usize, 4usize]),
+                    (g3, vec![0usize, 3usize]),
+                    (neg * g3, vec![0usize, 1usize]),
+                    (g3, vec![0usize, 2usize]),
+                    (neg * g3 * ofs, vec![0usize, 6usize]),
+                ];
+                if !verify_eq_weighted(vp, &f_terms, r.len(), &q_s, r, transcript) {
+                    return None;
+                }
+                // masked(r) = x(r) + mask(r) with the carried claim values.
+                if vp.final_evals[1] != *x_eval + *mask_eval {
+                    return None;
+                }
+                // The row virtual: its row point is the formula point's row
+                // bits; rmax = row_max(r_row) == vp.final_evals[2].
+                let r_row = r[n_log..].to_vec();
+                let g1r = transcript.field();
+                let g2r = transcript.field();
+                let row_terms = vec![
+                    (g1r, vec![0usize, 1usize]),
+                    (g2r, vec![0usize, 1usize, 2usize]),
+                    (g2r, vec![0usize, 1usize, 1usize]),
+                    (neg * g2r, vec![0usize, 1usize]),
+                ];
+                let row_arity = (m * n).trailing_zeros() as usize;
+                let (ok, s, fc) = verify_virtual(
+                    row_vp,
+                    &row_terms,
+                    g1r + g2r * vp.final_evals[2],
+                    row_arity,
+                    transcript,
+                );
+                if !ok || s.len() != row_arity {
+                    return None;
+                }
+                if row_vp.final_evals[0] != mle::eq_poly(&r_row, &s[n_log..]) {
+                    return None;
+                }
+                if fc != virtual_eval(&row_terms, &row_vp.final_evals) {
+                    return None;
+                }
+                let t_len = find_identity_table_slices(tables, *table_len);
+                let t_22 = find_identity_table_slices(tables, 1usize << 22);
+                match (t_len, t_22) {
+                    (Some(tl), Some(tw)) => {
+                        let has_len = proof.witness_columns.iter().any(|w| w.table == tl);
+                        let has_22 = proof.witness_columns.iter().any(|w| w.table == tw);
+                        if !has_len || !has_22 {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                }
+                claims.push(EvalClaim { tensor_id: *x, point: r.clone(), value: *x_eval });
+                claims.push(EvalClaim { tensor_id: *mask, point: r.clone(), value: *mask_eval });
+                let _ = out;
+            }
             (Op::Layernorm { out, w, b, m, d, .. }, OpProof::Layernorm(lp)) => {
                 if !verify_layernorm_chain(lp, *m, *d, transcript) {
                     return None;
                 }
                 // out relation mles [x, rsqrt_b, w, b, out] (degree 3, S2).
-                claims.push(EvalClaim { tensor_id: *out, point: lp.r_out.clone(), value: lp.out.final_evals[4] });
-                claims.push(EvalClaim { tensor_id: *w, point: lp.r_out.clone(), value: lp.out.final_evals[2] });
-                claims.push(EvalClaim { tensor_id: *b, point: lp.r_out.clone(), value: lp.out.final_evals[3] });
+                claims.push(EvalClaim { tensor_id: *out, point: lp.r_out.clone(), value: lp.out.final_evals[5] });
+                claims.push(EvalClaim { tensor_id: *w, point: lp.r_out.clone(), value: lp.out.final_evals[3] });
+                claims.push(EvalClaim { tensor_id: *b, point: lp.r_out.clone(), value: lp.out.final_evals[4] });
             }
             (
                 Op::LayerNormCentered { x, w, b, out, m, d, n_real, .. },
@@ -2439,17 +3444,17 @@ fn verify_shard_precomputed_inner(
                     value: lp.centered.final_evals[0],
                 });
                 // out relation mles [centered, rstd_b, w, b, raw, out, rem_out, ones].
-                claims.push(EvalClaim { tensor_id: *out, point: lp.r_out.clone(), value: lp.out.final_evals[5] });
-                claims.push(EvalClaim { tensor_id: *w, point: lp.r_out.clone(), value: lp.out.final_evals[2] });
-                claims.push(EvalClaim { tensor_id: *b, point: lp.r_out.clone(), value: lp.out.final_evals[3] });
+                claims.push(EvalClaim { tensor_id: *out, point: lp.r_out.clone(), value: lp.out.final_evals[6] });
+                claims.push(EvalClaim { tensor_id: *w, point: lp.r_out.clone(), value: lp.out.final_evals[3] });
+                claims.push(EvalClaim { tensor_id: *b, point: lp.r_out.clone(), value: lp.out.final_evals[4] });
             }
             (Op::RmsNorm { out, w, m, d, n_real, .. }, OpProof::RmsNorm(p)) => {
                 if !verify_rms_norm(p, *m, *d, *n_real, transcript) {
                     return None;
                 }
                 // out relation mles [x, rstd_b, w, raw, out, rem_out, ones].
-                claims.push(EvalClaim { tensor_id: *out, point: p.r_out.clone(), value: p.out.final_evals[4] });
-                claims.push(EvalClaim { tensor_id: *w, point: p.r_out.clone(), value: p.out.final_evals[2] });
+                claims.push(EvalClaim { tensor_id: *out, point: p.r_out.clone(), value: p.out.final_evals[5] });
+                claims.push(EvalClaim { tensor_id: *w, point: p.r_out.clone(), value: p.out.final_evals[3] });
             }
             (Op::RoPE { out, d, shift, .. }, OpProof::RoPE(p)) => {
                 if !verify_rope(p, *shift, transcript) {
@@ -2458,26 +3463,61 @@ fn verify_shard_precomputed_inner(
                 // S2: `out` is claimed at the two half points whose values are
                 // the checked sumcheck final evals (first/second.final_evals[4]).
                 let (pt_f, pt_s) = rope_out_points(&p.r_first, &p.r_second, *d);
-                claims.push(EvalClaim { tensor_id: *out, point: pt_f, value: p.first.final_evals[4] });
-                claims.push(EvalClaim { tensor_id: *out, point: pt_s, value: p.second.final_evals[4] });
+                claims.push(EvalClaim { tensor_id: *out, point: pt_f, value: p.first.final_evals[5] });
+                claims.push(EvalClaim { tensor_id: *out, point: pt_s, value: p.second.final_evals[5] });
             }
             (Op::TopKSelect { x, sel, gate, k, m, n, .. }, OpProof::TopKSelect(p)) => {
                 if !verify_topk(p, *k, *m, *n, transcript) {
                     return None;
                 }
-                claims.push(EvalClaim { tensor_id: *x, point: p.r.clone(), value: p.gate_rel.final_evals[0] });
-                claims.push(EvalClaim { tensor_id: *sel, point: p.r.clone(), value: p.gate_rel.final_evals[1] });
-                claims.push(EvalClaim { tensor_id: *gate, point: p.r.clone(), value: p.gate_rel.final_evals[2] });
+                claims.push(EvalClaim { tensor_id: *x, point: p.r.clone(), value: p.gate_rel.final_evals[1] });
+                claims.push(EvalClaim { tensor_id: *sel, point: p.r.clone(), value: p.gate_rel.final_evals[2] });
+                claims.push(EvalClaim { tensor_id: *gate, point: p.r.clone(), value: p.gate_rel.final_evals[3] });
             }
             (Op::Argmax { x, sel, gate, m, n, .. }, OpProof::Argmax(p)) => {
                 if !verify_argmax(p, *m, *n, transcript) {
                     return None;
                 }
-                claims.push(EvalClaim { tensor_id: *x, point: p.topk.r.clone(), value: p.topk.gate_rel.final_evals[0] });
-                claims.push(EvalClaim { tensor_id: *sel, point: p.topk.r.clone(), value: p.topk.gate_rel.final_evals[1] });
-                claims.push(EvalClaim { tensor_id: *gate, point: p.topk.r.clone(), value: p.topk.gate_rel.final_evals[2] });
+                claims.push(EvalClaim { tensor_id: *x, point: p.topk.r.clone(), value: p.topk.gate_rel.final_evals[1] });
+                claims.push(EvalClaim { tensor_id: *sel, point: p.topk.r.clone(), value: p.topk.gate_rel.final_evals[2] });
+                claims.push(EvalClaim { tensor_id: *gate, point: p.topk.r.clone(), value: p.topk.gate_rel.final_evals[3] });
             }
             _ => return None,
+        }
+    }
+
+    // S5: Transpose claim forwarding (mirrors the prover): out's claims
+    // become x's claims at the axis-swapped point.
+    {
+        let transposes: Vec<(T, T, usize, usize)> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Transpose { x, out, m, k } => Some((*x, *out, *m, *k)),
+                _ => None,
+            })
+            .collect();
+        for &(_, _, m, k) in &transposes {
+            if !m.is_power_of_two() || !k.is_power_of_two() {
+                return None;
+            }
+        }
+        for _ in 0..transposes.len().max(1) {
+            let mut changed = false;
+            for c in claims.iter_mut() {
+                for &(x, out, m, k) in &transposes {
+                    if c.tensor_id == out {
+                        let log_m = m.trailing_zeros() as usize;
+                        let mut p = c.point[log_m..].to_vec();
+                        p.extend_from_slice(&c.point[..log_m]);
+                        c.tensor_id = x;
+                        c.point = p;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
         }
     }
 
@@ -2617,6 +3657,7 @@ fn prove_shard_dag_inner(
     // parallel (read-only on the store). Per-shard RNGs are seeded
     // deterministically from the caller's RNG, so the proof stays reproducible.
     forward_ops(store, ops);
+    ensure_public_tables(store, ops);
     let store_ref: &Store = store;
 
     let mut master = Transcript::new(b"zkie-shard-dag-v1");
@@ -5319,8 +6360,18 @@ pub fn build_gpt2_layer(
         n: ffn,
         shift,
     });
-    ops.push(Op::SoftmaxIndex {
+    // S5: SoftmaxIndex/GeluIndex require relu(x) < 2^22 * table_len (the
+    // q range-check bound); scale fc down like the real gpt2 model scales
+    // its scores before the index op (models/gpt2/src/lib.rs).
+    let fc_16 = store.push(vec![]);
+    ops.push(Op::Scale {
         x: fc,
+        out: fc_16,
+        factor: 1,
+        shift: 16,
+    });
+    ops.push(Op::SoftmaxIndex {
+        x: fc_16,
         out: gelu_idx,
         table_len: 64,
     });
@@ -6340,6 +7391,432 @@ mod tests {
         assert!(!verify_shard(&store.owned_slices(), &ops, &forged, &mut tv2));
     }
 
+    // ------------------------------------------------------------------
+    // S5 (op relation completeness) test-first regressions. Each forged case
+    // hand-builds a store with WRONG op outputs and proves with
+    // prove_shard_precomputed (no forward pass), so the pre-fix empty/sum
+    // branches ACCEPT the forgery (tests fail) and the fixed relations reject.
+    // ------------------------------------------------------------------
+
+    fn s5_prove_precomputed(store: &mut Store, ops: &[Op], seed: u64) -> OpShardProof {
+        ensure_public_tables(store, ops);
+        let mut tp = Transcript::new(b"zkie-s5-test");
+        tp.absorb_u64(seed);
+        let (proof, _claims) = prove_shard_precomputed(store, ops, &mut tp, FracMode::Plain);
+        proof
+    }
+
+    fn s5_verify(tables: &[&[Goldilocks]], ops: &[Op], proof: &OpShardProof, seed: u64) -> bool {
+        let mut tv = Transcript::new(b"zkie-s5-test");
+        tv.absorb_u64(seed);
+        verify_shard_precomputed(tables, ops, proof, &mut tv)
+    }
+
+    /// S5: Add — the pre-fix SUM relation accepts [1,2]+[3,4]=[5,5] (the sum
+    /// is unchanged); the fixed direct relation rejects it.
+    #[test]
+    fn s5_add_positionwise_rejected() {
+        let mut store = Store::new();
+        let a = store.push(vec![from_i64(1), from_i64(2), from_i64(0), from_i64(0)]);
+        let b = store.push(vec![from_i64(3), from_i64(4), from_i64(0), from_i64(0)]);
+        let c = store.push(vec![from_i64(5), from_i64(5), from_i64(0), from_i64(0)]); // wrong
+        let ops = vec![Op::Add { a, b, c }];
+        let proof = s5_prove_precomputed(&mut store, &ops, 0x5501);
+        // S5: must be REJECTED (pre-fix the sum relation ACCEPTS it).
+        assert!(!s5_verify(&store.owned_slices(), &ops, &proof, 0x5501));
+
+        // Honest control.
+        let mut store2 = Store::new();
+        let a2 = store2.push(vec![from_i64(1), from_i64(2), from_i64(3), from_i64(4)]);
+        let b2 = store2.push(vec![from_i64(3), from_i64(4), from_i64(5), from_i64(6)]);
+        let c2 = store2.push(vec![from_i64(4), from_i64(6), from_i64(8), from_i64(10)]);
+        let ops2 = vec![Op::Add { a: a2, b: b2, c: c2 }];
+        let proof2 = s5_prove_precomputed(&mut store2, &ops2, 0x5501);
+        assert!(s5_verify(&store2.owned_slices(), &ops2, &proof2, 0x5501));
+    }
+
+    /// S5: Add — swapped elements keep the sum but break the position-wise
+    /// relation.
+    #[test]
+    fn s5_add_swapped_elements_rejected() {
+        let mut store = Store::new();
+        let a = store.push(vec![from_i64(1), from_i64(2), from_i64(3), from_i64(4)]);
+        let b = store.push(vec![from_i64(10), from_i64(20), from_i64(30), from_i64(40)]);
+        // Correct: [11,22,33,44]; forged: first two swapped (sum preserved).
+        let c = store.push(vec![from_i64(22), from_i64(11), from_i64(33), from_i64(44)]);
+        let ops = vec![Op::Add { a, b, c }];
+        let proof = s5_prove_precomputed(&mut store, &ops, 0x5502);
+        assert!(!s5_verify(&store.owned_slices(), &ops, &proof, 0x5502));
+    }
+
+    /// S5: Transpose — the axis point transform must bind out's claims to x;
+    /// a forged out value (inconsistent with the transpose of x) is rejected.
+    #[test]
+    fn s5_transpose_forged_out_claim_rejected() {
+        let (m, k) = (4usize, 4usize);
+        let mut store = Store::new();
+        // x is PRODUCED by an Add (giving it an authenticated claim), then
+        // transposed and consumed by a second Add. Forging the transposed
+        // output makes the forwarded x claim contradict the producer's.
+        let xa = store.push(
+            (0..m * k)
+                .map(|i| from_i64((i % 7) as i64))
+                .collect(),
+        );
+        let xb = store.push(
+            (0..m * k)
+                .map(|i| from_i64((i % 5) as i64))
+                .collect(),
+        );
+        let x = store.push(
+            (0..m * k)
+                .map(|i| store.get(xa)[i] + store.get(xb)[i])
+                .collect(),
+        );
+        let mut o: Vec<Goldilocks> = vec![Goldilocks::ZERO; m * k];
+        for i in 0..m {
+            for j in 0..k {
+                o[j * m + i] = store.get(x)[i * k + j];
+            }
+        }
+        o[0] = o[0] + Goldilocks::ONE; // forge one entry
+        let out = store.push(o);
+        let z = store.push(vec![Goldilocks::ZERO; m * k]);
+        let out2v: Vec<Goldilocks> = store.get(out).to_vec();
+        let out2 = store.push(out2v);
+        let ops = vec![
+            Op::Add { a: xa, b: xb, c: x },
+            Op::Transpose { x, out, m, k },
+            Op::Add { a: out, b: z, c: out2 },
+        ];
+        let proof = s5_prove_precomputed(&mut store, &ops, 0x5503);
+        // S5: the forged out entry must be REJECTED through the x binding
+        // (pre-fix the empty Transpose branch accepts it).
+        assert!(!s5_verify(&store.owned_slices(), &ops, &proof, 0x5503));
+    }
+
+    /// S5: Scale — wrong rounding (a tie broken the wrong way) must be
+    /// rejected via the bounded-remainder relation.
+    #[test]
+    fn s5_scale_wrong_rounding_rejected() {
+        let mut store = Store::new();
+        let x = store.push(vec![from_i64(1 << 15), from_i64(3 << 15), from_i64(5 << 15), from_i64(0)]);
+        // factor=1, shift=16: x = 2^16*out + rho, rho in [-2^15, 2^15).
+        let out = store.push(vec![from_i64(1), from_i64(2), from_i64(3), from_i64(0)]);
+        let ops = vec![Op::Scale { x, out, factor: 1, shift: 16 }];
+        let mut proof = s5_prove_precomputed(&mut store, &ops, 0x5504);
+        // Forgery: wrong rounding at r (tie broken the wrong way).
+        if let Some(OpProof::Scale { evals, .. }) = proof.ops.first_mut() {
+            evals[1] = evals[1] - Goldilocks::ONE;
+        }
+        // S5: must be REJECTED (pre-fix the empty branch accepts it).
+        assert!(!s5_verify(&store.owned_slices(), &ops, &proof, 0x5504));
+
+        // Honest control (correct away-from-zero ties).
+        let mut store2 = Store::new();
+        let x2 = store2.push(vec![from_i64(1 << 15), from_i64(3 << 15), from_i64(5 << 15), from_i64(0)]);
+        let out2 = store2.push(vec![from_i64(1), from_i64(2), from_i64(3), from_i64(0)]);
+        let ops2 = vec![Op::Scale { x: x2, out: out2, factor: 1, shift: 16 }];
+        let proof2 = s5_prove_precomputed(&mut store2, &ops2, 0x5504);
+        assert!(s5_verify(&store2.owned_slices(), &ops2, &proof2, 0x5504));
+
+        // Forgery: tamper the proof's out evaluation at r (a wrong rounding
+        // value). The direct relation rejects it.
+        let mut forged = OpShardProof {
+            ops: proof2.ops,
+            bound: proof2.bound,
+            binds: proof2.binds,
+            witness_columns: proof2.witness_columns,
+            table_columns: proof2.table_columns,
+        };
+        if let Some(OpProof::Scale { evals, .. }) = forged.ops.first_mut() {
+            evals[1] = evals[1] + Goldilocks::ONE;
+        }
+        assert!(!s5_verify(&store2.owned_slices(), &ops2, &forged, 0x5504));
+    }
+
+    /// S5: ScaleVec — a forged position-wise product (sum can be preserved)
+    /// must be rejected.
+    #[test]
+    fn s5_scalevec_forged_product_rejected() {
+        let mut store = Store::new();
+        let x = store.push(vec![from_i64(10), from_i64(20), from_i64(30), from_i64(40)]);
+        let scale = store.push(vec![from_i64(2), from_i64(3)]);
+        // honest: x*scale[i%2] = [20, 60, 60, 120]
+        let out = store.push(vec![from_i64(20), from_i64(60), from_i64(60), from_i64(120)]);
+        let ops = vec![Op::ScaleVec { x, scale, out, shift: 0 }];
+        let proof = s5_prove_precomputed(&mut store, &ops, 0x5505);
+        assert!(s5_verify(&store.owned_slices(), &ops, &proof, 0x5505));
+
+        let mut store2 = Store::new();
+        let x2 = store2.push(vec![from_i64(10), from_i64(20), from_i64(30), from_i64(40)]);
+        let scale2 = store2.push(vec![from_i64(2), from_i64(3)]);
+        let out2 = store2.push(vec![from_i64(20), from_i64(60), from_i64(60), from_i64(120)]);
+        let ops2 = vec![Op::ScaleVec { x: x2, scale: scale2, out: out2, shift: 0 }];
+        let mut proof2 = s5_prove_precomputed(&mut store2, &ops2, 0x5505);
+        // Forgery: tamper the proof's out evaluation at r.
+        if let Some(OpProof::ScaleVec(vp, _, _)) = proof2.ops.first_mut() {
+            vp.final_evals[3] = vp.final_evals[3] + Goldilocks::ONE;
+        }
+        // S5: must be REJECTED (pre-fix accepted).
+        assert!(!s5_verify(&store2.owned_slices(), &ops2, &proof2, 0x5505));
+    }
+
+    /// S5: BroadcastScale — forged broadcast product rejected; honest passes.
+    #[test]
+    fn s5_broadcastscale_forged_rejected() {
+        let mut store = Store::new();
+        let x = store.push(vec![from_i64(1), from_i64(2), from_i64(3), from_i64(4)]);
+        let scale = store.push(vec![from_i64(10), from_i64(20)]);
+        // h = 2: out = x*scale[i/2] = [10, 20, 60, 80]
+        let out = store.push(vec![from_i64(10), from_i64(20), from_i64(60), from_i64(80)]);
+        let ops = vec![Op::BroadcastScale { x, scale, out, h: 2 }];
+        let proof = s5_prove_precomputed(&mut store, &ops, 0x5506);
+        assert!(s5_verify(&store.owned_slices(), &ops, &proof, 0x5506));
+
+        let mut store2 = Store::new();
+        let x2 = store2.push(vec![from_i64(1), from_i64(2), from_i64(3), from_i64(4)]);
+        let scale2 = store2.push(vec![from_i64(10), from_i64(20)]);
+        let out2 = store2.push(vec![from_i64(10), from_i64(10), from_i64(60), from_i64(80)]);
+        let ops2 = vec![Op::BroadcastScale { x: x2, scale: scale2, out: out2, h: 2 }];
+        let mut proof2 = s5_prove_precomputed(&mut store2, &ops2, 0x5506);
+        if let Some(OpProof::BroadcastScale(vp, _, _)) = proof2.ops.first_mut() {
+            vp.final_evals[3] = vp.final_evals[3] + Goldilocks::ONE;
+        }
+        assert!(!s5_verify(&store2.owned_slices(), &ops2, &proof2, 0x5506));
+    }
+
+    /// S5: ScaleGate — forged per-position gate product rejected; honest passes.
+    #[test]
+    fn s5_scalegate_forged_rejected() {
+        let (m, n, h) = (2usize, 2usize, 2usize);
+        let mut store = Store::new();
+        let x = store.push(vec![from_i64(1), from_i64(2), from_i64(3), from_i64(4)]);
+        // gate[t*n+col], col = 1: t = ij/h
+        let gate = store.push(vec![from_i64(2), from_i64(3), from_i64(4), from_i64(5)]);
+        // gate_b = [3, 3, 5, 5]; out = x*gate_b = [3, 6, 15, 20]
+        let out = store.push(vec![from_i64(3), from_i64(6), from_i64(15), from_i64(20)]);
+        let ops = vec![Op::ScaleGate { x, gate, col: 1, out, m, n, h, shift: 0 }];
+        let proof = s5_prove_precomputed(&mut store, &ops, 0x5507);
+        assert!(s5_verify(&store.owned_slices(), &ops, &proof, 0x5507));
+
+        let mut store2 = Store::new();
+        let x2 = store2.push(vec![from_i64(1), from_i64(2), from_i64(3), from_i64(4)]);
+        let gate2 = store2.push(vec![from_i64(2), from_i64(3), from_i64(4), from_i64(5)]);
+        let out2 = store2.push(vec![from_i64(3), from_i64(6), from_i64(15), from_i64(20)]);
+        let ops2 = vec![Op::ScaleGate { x: x2, gate: gate2, col: 1, out: out2, m, n, h, shift: 0 }];
+        let mut proof2 = s5_prove_precomputed(&mut store2, &ops2, 0x5507);
+        if let Some(OpProof::ScaleGate(vp, _, _)) = proof2.ops.first_mut() {
+            vp.final_evals[3] = vp.final_evals[3] + Goldilocks::ONE;
+        }
+        assert!(!s5_verify(&store2.owned_slices(), &ops2, &proof2, 0x5507));
+    }
+
+    /// S5: Relu — a negative input mapped to itself (wrong sign) must be
+    /// rejected; honest two-branch case passes.
+    #[test]
+    fn s5_relu_sign_rejected() {
+        let mut store = Store::new();
+        let x = store.push(vec![from_i64(5), from_i64(-3), from_i64(0), from_i64(7)]);
+        let out = store.push(vec![from_i64(5), from_i64(0), from_i64(0), from_i64(7)]);
+        let ops = vec![Op::Relu { x, out }];
+        let proof = s5_prove_precomputed(&mut store, &ops, 0x5508);
+        assert!(s5_verify(&store.owned_slices(), &ops, &proof, 0x5508));
+
+        let mut store2 = Store::new();
+        let x2 = store2.push(vec![from_i64(5), from_i64(-3), from_i64(0), from_i64(7)]);
+        let out2 = store2.push(vec![from_i64(5), from_i64(0), from_i64(0), from_i64(7)]);
+        let ops2 = vec![Op::Relu { x: x2, out: out2 }];
+        let mut proof2 = s5_prove_precomputed(&mut store2, &ops2, 0x5508);
+        // Forgery: a wrong out value at r (sign relation violated).
+        if let Some(OpProof::Relu { vp, .. }) = proof2.ops.first_mut() {
+            vp.final_evals[2] = vp.final_evals[2] - Goldilocks::from_u64(2);
+        }
+        // S5: must be REJECTED (pre-fix accepted).
+        assert!(!s5_verify(&store2.owned_slices(), &ops2, &proof2, 0x5508));
+    }
+
+    /// S5: GeluIndex — an index outside the clamp/offset formula must be
+    /// rejected; honest passes.
+    #[test]
+    fn s5_gelu_index_formula_rejected() {
+        let mut store = Store::new();
+        let x = store.push(vec![from_i64(-100), from_i64(10), from_i64(500), from_i64(30)]);
+        let idx = store.push_idx(vec![0u32, 20u32, 255u32, 40u32]); // offset=10, table_len=256
+        let ops = vec![Op::GeluIndex { x, out: idx, offset: 10, table_len: 256 }];
+        let proof = s5_prove_precomputed(&mut store, &ops, 0x5509);
+        assert!(s5_verify(&store.owned_slices(), &ops, &proof, 0x5509));
+
+        let mut store2 = Store::new();
+        let x2 = store2.push(vec![from_i64(-100), from_i64(10), from_i64(500), from_i64(30)]);
+        let idx2 = store2.push_idx(vec![0u32, 20u32, 255u32, 40u32]);
+        let ops2 = vec![Op::GeluIndex { x: x2, out: idx2, offset: 10, table_len: 256 }];
+        let mut proof2 = s5_prove_precomputed(&mut store2, &ops2, 0x5509);
+        // Forgery: an out-of-formula index evaluation at r.
+        if let Some(OpProof::GeluIndex { vp, .. }) = proof2.ops.first_mut() {
+            vp.final_evals[3] = vp.final_evals[3] + Goldilocks::ONE;
+        }
+        // S5: must be REJECTED (pre-fix accepted).
+        assert!(!s5_verify(&store2.owned_slices(), &ops2, &proof2, 0x5509));
+    }
+
+    /// S5: StableSoftmaxIndex — a forged row-max (index formula) must be
+    /// rejected; honest passes.
+    #[test]
+    fn s5_stable_softmax_index_formula_rejected() {
+        let (m, n) = (2usize, 4usize);
+        let mut store = Store::new();
+        let x = store.push(vec![
+            from_i64(1), from_i64(5), from_i64(3), from_i64(2),
+            from_i64(8), from_i64(2), from_i64(7), from_i64(9),
+        ]);
+        let mask = store.push(vec![Goldilocks::ZERO; m * n]);
+        // offset = 10, table_len = 256; honest indices:
+        // row0: masked max 5 -> shifted [ -4, 0, -2, -3 ] -> idx [6,10,8,7]
+        // row1: max 9 -> shifted [-1,-7,-2,0] -> idx [9,3,8,10]
+        let idx = store.push_idx(vec![6u32, 10u32, 8u32, 7u32, 9u32, 3u32, 8u32, 10u32]);
+        let ops = vec![Op::StableSoftmaxIndex { x, mask, out: idx, offset: 10, table_len: 256, m, n }];
+        let proof = s5_prove_precomputed(&mut store, &ops, 0x550A);
+        assert!(s5_verify(&store.owned_slices(), &ops, &proof, 0x550A));
+
+        let mut store2 = Store::new();
+        let x2 = store2.push(vec![
+            from_i64(1), from_i64(5), from_i64(3), from_i64(2),
+            from_i64(8), from_i64(2), from_i64(7), from_i64(9),
+        ]);
+        let mask2 = store2.push(vec![Goldilocks::ZERO; m * n]);
+        let idx2 = store2.push_idx(vec![6u32, 10u32, 8u32, 7u32, 9u32, 3u32, 8u32, 10u32]);
+        let ops2 = vec![Op::StableSoftmaxIndex { x: x2, mask: mask2, out: idx2, offset: 10, table_len: 256, m, n }];
+        let mut proof2 = s5_prove_precomputed(&mut store2, &ops2, 0x550A);
+        // Forgery: an out-of-formula index evaluation at r.
+        if let Some(OpProof::StableSoftmaxIndex { vp, .. }) = proof2.ops.first_mut() {
+            vp.final_evals[5] = vp.final_evals[5] + Goldilocks::ONE;
+        }
+        // S5: must be REJECTED (pre-fix accepted).
+        assert!(!s5_verify(&store2.owned_slices(), &ops2, &proof2, 0x550A));
+    }
+
+    /// S5: SoftmaxIndex — an index outside the truncate+mod formula must be
+    /// rejected; honest passes.
+    #[test]
+    fn s5_softmax_index_formula_rejected() {
+        let mut store = Store::new();
+        let x = store.push(vec![from_i64(-5), from_i64(7), from_i64(300), from_i64(0)]);
+        // table_len = 256: idx = max(x,0) % 256 = [0, 7, 44, 0]
+        let idx = store.push_idx(vec![0u32, 7u32, 44u32, 0u32]);
+        let ops = vec![Op::SoftmaxIndex { x, out: idx, table_len: 256 }];
+        let proof = s5_prove_precomputed(&mut store, &ops, 0x550B);
+        assert!(s5_verify(&store.owned_slices(), &ops, &proof, 0x550B));
+
+        let mut store2 = Store::new();
+        let x2 = store2.push(vec![from_i64(-5), from_i64(7), from_i64(300), from_i64(0)]);
+        let idx2 = store2.push_idx(vec![0u32, 7u32, 44u32, 0u32]);
+        let ops2 = vec![Op::SoftmaxIndex { x: x2, out: idx2, table_len: 256 }];
+        let mut proof2 = s5_prove_precomputed(&mut store2, &ops2, 0x550B);
+        // Forgery: an out-of-formula index evaluation at r.
+        if let Some(OpProof::SoftmaxIndex { idx_eval, .. }) = proof2.ops.first_mut() {
+            *idx_eval = *idx_eval + Goldilocks::ONE;
+        }
+        // S5: must be REJECTED (pre-fix accepted).
+        assert!(!s5_verify(&store2.owned_slices(), &ops2, &proof2, 0x550B));
+    }
+
+    /// S5: IdxBroadcast — a wrong broadcast coordinate must be rejected.
+    #[test]
+    fn s5_idx_broadcast_rejected() {
+        let mut store = Store::new();
+        let base = store.push_idx(vec![3u32, 7u32, 11u32, 13u32]);
+        let out = store.push_idx(vec![6u32, 7u32, 14u32, 15u32, 22u32, 23u32, 26u32, 27u32]); // b=2
+        let ops = vec![Op::IdxBroadcast { base, out, b: 2 }];
+        let proof = s5_prove_precomputed(&mut store, &ops, 0x550C);
+        assert!(s5_verify(&store.owned_slices(), &ops, &proof, 0x550C));
+
+        let mut store2 = Store::new();
+        let base2 = store2.push_idx(vec![3u32, 7u32, 11u32, 13u32]);
+        let out2 = store2.push_idx(vec![6u32, 7u32, 14u32, 15u32, 22u32, 23u32, 26u32, 27u32]);
+        let ops2 = vec![Op::IdxBroadcast { base: base2, out: out2, b: 2 }];
+        let mut proof2 = s5_prove_precomputed(&mut store2, &ops2, 0x550C);
+        // Forgery: a wrong broadcast coordinate at r.
+        if let Some(OpProof::IdxBroadcast { evals, .. }) = proof2.ops.first_mut() {
+            evals[1] = evals[1] + Goldilocks::ONE;
+        }
+        // S5: must be REJECTED (pre-fix accepted).
+        assert!(!s5_verify(&store2.owned_slices(), &ops2, &proof2, 0x550C));
+    }
+
+    /// S5: CombineIdx — a wrong concatenation formula must be rejected.
+    #[test]
+    fn s5_combine_idx_rejected() {
+        let mut store = Store::new();
+        let a = store.push_idx(vec![1u32, 2u32, 3u32, 4u32]);
+        let b = store.push_idx(vec![5u32, 6u32, 7u32, 8u32]);
+        let out = store.push_idx(vec![15u32, 26u32, 37u32, 48u32]); // scale=10
+        let ops = vec![Op::CombineIdx { a, b, out, scale: 10 }];
+        let proof = s5_prove_precomputed(&mut store, &ops, 0x550D);
+        assert!(s5_verify(&store.owned_slices(), &ops, &proof, 0x550D));
+
+        let mut store2 = Store::new();
+        let a2 = store2.push_idx(vec![1u32, 2u32, 3u32, 4u32]);
+        let b2 = store2.push_idx(vec![5u32, 6u32, 7u32, 8u32]);
+        let out2 = store2.push_idx(vec![15u32, 26u32, 37u32, 48u32]);
+        let ops2 = vec![Op::CombineIdx { a: a2, b: b2, out: out2, scale: 10 }];
+        let mut proof2 = s5_prove_precomputed(&mut store2, &ops2, 0x550D);
+        // Forgery: a wrong concatenation value at r.
+        if let Some(OpProof::CombineIdx { evals, .. }) = proof2.ops.first_mut() {
+            evals[2] = evals[2] + Goldilocks::ONE;
+        }
+        // S5: must be REJECTED (pre-fix accepted).
+        assert!(!s5_verify(&store2.owned_slices(), &ops2, &proof2, 0x550D));
+    }
+
+    /// S5: PadIdx — non-zero padding must be rejected (padding mask).
+    #[test]
+    fn s5_pad_idx_rejected() {
+        let mut store = Store::new();
+        let base = store.push_idx(vec![1u32, 2u32, 3u32]);
+        let out = store.push_idx(vec![1u32, 2u32, 3u32, 0u32, 0u32, 0u32, 0u32, 0u32]); // len=8
+        let ops = vec![Op::PadIdx { base, out, len: 8, base_len: 3 }];
+        let proof = s5_prove_precomputed(&mut store, &ops, 0x550E);
+        assert!(s5_verify(&store.owned_slices(), &ops, &proof, 0x550E));
+
+        let mut store2 = Store::new();
+        let base2 = store2.push_idx(vec![1u32, 2u32, 3u32]);
+        let out2 = store2.push_idx(vec![1u32, 2u32, 3u32, 0u32, 0u32, 0u32, 0u32, 0u32]);
+        let ops2 = vec![Op::PadIdx { base: base2, out: out2, len: 8, base_len: 3 }];
+        let mut proof2 = s5_prove_precomputed(&mut store2, &ops2, 0x550E);
+        // Forgery: non-zero padding value at r.
+        if let Some(OpProof::PadIdx { vp, .. }) = proof2.ops.first_mut() {
+            vp.final_evals[2] = vp.final_evals[2] + Goldilocks::ONE;
+        }
+        // S5: must be REJECTED (pre-fix accepted).
+        assert!(!s5_verify(&store2.owned_slices(), &ops2, &proof2, 0x550E));
+    }
+
+    /// S5: an unsupported / mismatched op variant must be explicitly rejected
+    /// by the verifier (no silent pass-through).
+    #[test]
+    fn s5_unsupported_variant_rejected() {
+        let mut store = Store::new();
+        let x = store.push(vec![from_i64(1), from_i64(2), from_i64(3), from_i64(4)]);
+        let out = store.push(vec![from_i64(4), from_i64(3), from_i64(2), from_i64(1)]);
+        let mut store = Store::new();
+        let x = store.push(vec![from_i64(1), from_i64(2), from_i64(3), from_i64(4)]);
+        let out = store.push(vec![from_i64(4), from_i64(3), from_i64(2), from_i64(1)]);
+        let ops = vec![Op::Relu { x, out }];
+        let proof = s5_prove_precomputed(&mut store, &ops, 0x550F);
+        // Re-tag the proof's op as a DIFFERENT valid variant (Transpose):
+        // the (op, proof) pair no longer matches and must be rejected —
+        // unsupported variants must never silently pass.
+        let mismatched = OpShardProof {
+            ops: vec![OpProof::Transpose],
+            bound: proof.bound,
+            binds: proof.binds,
+            witness_columns: proof.witness_columns,
+            table_columns: proof.table_columns,
+        };
+        assert!(!s5_verify(&store.owned_slices(), &ops, &mismatched, 0x550F));
+    }
+
     /// S2: honest committed roundtrip WITH a lookup — the witness x/y columns
     /// are opened at the derived DEN leaf point and the m-column/table at the
     /// derived NUM/DEN points, all derived from the committed frac replays.
@@ -7292,8 +8769,8 @@ mod tests {
                 m,
                 n,
             },
-            Op::PadIdx { base: token_id_t, out: token_id_pad, len: s_pad },
-            Op::PadIdx { base: expert_of_t, out: expert_of_pad, len: s_pad },
+            Op::PadIdx { base: token_id_t, out: token_id_pad, len: s_pad, base_len: s },
+            Op::PadIdx { base: expert_of_t, out: expert_of_pad, len: s_pad, base_len: s },
             Op::IdxBroadcast { base: token_id_pad, out: idx_seg, b: h },
             Op::Lookup { idx: idx_seg, out: seg, table: x_t },
             Op::BroadcastScale { x: seg, scale: mask_t, out: seg_z, h },
@@ -7394,8 +8871,8 @@ mod tests {
                 m,
                 n,
             },
-            Op::PadIdx { base: token_id_t, out: token_id_pad, len: s_pad },
-            Op::PadIdx { base: expert_of_t, out: expert_of_pad, len: s_pad },
+            Op::PadIdx { base: token_id_t, out: token_id_pad, len: s_pad, base_len: s },
+            Op::PadIdx { base: expert_of_t, out: expert_of_pad, len: s_pad, base_len: s },
             Op::IdxBroadcast { base: token_id_pad, out: idx_seg, b: h },
             Op::Lookup { idx: idx_seg, out: seg, table: x_t },
             Op::BroadcastScale { x: seg, scale: mask_t, out: seg_z, h },
@@ -8211,27 +9688,26 @@ mod tests {
     /// forces you to state.
     fn carries_its_own_proof(p: &OpProof) -> bool {
         match p {
-            // No proof of their own. Transpose is free (a claim maps across it by
-            // relabelling variables). Scale / ScaleVec / ScaleGate each apply
-            // `round_div`, so they need a rounding remainder and a range check, as
-            // `Projection` already does with `rem`. Relu and the three Index ops are
-            // table functions, so they need a lookup (`logup_gkr` is already in tree).
-            OpProof::Transpose
-            | OpProof::Scale
-            | OpProof::ScaleVec
-            | OpProof::ScaleGate
-            | OpProof::Relu
-            | OpProof::SoftmaxIndex
-            | OpProof::GeluIndex
-            | OpProof::StableSoftmaxIndex
-            | OpProof::IdxBroadcast
-            | OpProof::CombineIdx
-            | OpProof::PadIdx
-            | OpProof::BroadcastScale => false,
+            // Transpose alone is proof-free (S5: a claim maps across it by the
+            // axis-swapped point transform). Every other op carries its own
+            // argument since S5 (direct relations, eq-weighted sumchecks and
+            // range lookups).
+            OpProof::Transpose => false,
             // Carry their own argument.
             OpProof::MatMul(..)
             | OpProof::Projection(..)
-            | OpProof::Add(..)
+            | OpProof::Add { .. }
+            | OpProof::Scale { .. }
+            | OpProof::ScaleVec(..)
+            | OpProof::ScaleGate(..)
+            | OpProof::Relu { .. }
+            | OpProof::SoftmaxIndex { .. }
+            | OpProof::GeluIndex { .. }
+            | OpProof::StableSoftmaxIndex { .. }
+            | OpProof::IdxBroadcast { .. }
+            | OpProof::CombineIdx { .. }
+            | OpProof::PadIdx { .. }
+            | OpProof::BroadcastScale(..)
             | OpProof::Lookup
             | OpProof::Softmax(..)
             | OpProof::Layernorm(..)
@@ -8247,29 +9723,17 @@ mod tests {
         }
     }
 
-    /// Pins the unproven set at eight. Fails in BOTH directions: if an op gains a
-    /// real proof its variant takes a payload and this array stops compiling; if a
-    /// ninth unproven op is added, `carries_its_own_proof` stops compiling until it
+    /// Pins the unproven set (S5: Transpose alone — every other op gained its
+    /// own argument). Fails in BOTH directions: if an op gains a real proof
+    /// its variant takes a payload and this array stops compiling; if another
+    /// unproven op is added, `carries_its_own_proof` stops compiling until it
     /// is classified, and then this count fails.
     #[test]
     fn ops_without_their_own_proof_are_the_known_eight() {
-        let unproven = [
-            OpProof::Transpose,
-            OpProof::Scale,
-            OpProof::ScaleVec,
-            OpProof::ScaleGate,
-            OpProof::Relu,
-            OpProof::SoftmaxIndex,
-            OpProof::GeluIndex,
-            OpProof::StableSoftmaxIndex,
-            OpProof::IdxBroadcast,
-            OpProof::CombineIdx,
-            OpProof::PadIdx,
-            OpProof::BroadcastScale,
-        ];
+        let unproven = [OpProof::Transpose];
         assert_eq!(
             unproven.len(),
-            12,
+            1,
             "the set of ops with no proof of their own changed; see the succinct-verification thread before adjusting"
         );
         for p in &unproven {
