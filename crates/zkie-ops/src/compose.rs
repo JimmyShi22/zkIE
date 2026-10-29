@@ -3475,7 +3475,9 @@ fn verify_shard_precomputed_inner(
                 claims.push(EvalClaim { tensor_id: *gate, point: p.r.clone(), value: p.gate_rel.final_evals[3] });
             }
             (Op::Argmax { x, sel, gate, m, n, .. }, OpProof::Argmax(p)) => {
-                if !verify_argmax(p, *m, *n, transcript) {
+                // S6: committed mode defers the out-binding to the committed
+                // per-position selector openings; plain mode checks directly.
+                if !verify_argmax(p, *m, *n, transcript, mode != FracMode::Committed) {
                     return None;
                 }
                 claims.push(EvalClaim { tensor_id: *x, point: p.topk.r.clone(), value: p.topk.gate_rel.final_evals[1] });
@@ -4191,6 +4193,52 @@ pub struct SelOpening {
     pub arity: usize,
     pub points: Vec<Vec<Goldilocks>>,
     pub openings: Vec<zkie_core::pcs::whir::Proof>,
+    // S6: the SAME committed selector column is bound to the Argmax op's
+    // relation selector at its derived claim point r (topk.r): one opening
+    // proving sel(r) == the relation-bound eval, so the per-position openings
+    // cannot be manufactured from a different column.
+    pub r_point: Vec<Goldilocks>,
+    pub r_opening: zkie_core::pcs::whir::Proof,
+    pub r_claimed: Goldilocks,
+}
+
+/// S6: public-statement selector for committed verification. The caller's
+/// confirmed public data is authoritative; the verifier never takes the
+/// prompt/sequence from the proof or the Store.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub enum PublicStatement {
+    /// Language model: the caller confirms `prompt` + `response` (the public
+    /// token sequence of length m = prompt.len() + response.len()).
+    /// Teacher forcing: argmax[i] == tokens[i+1] for i = prompt_len-1..m-2
+    /// (empty prompt -> full chain from i=0; the caller may include a BOS
+    /// token in the prompt). The last row's argmax predicts a token NOT in
+    /// the sequence, so no shift condition is imposed there; `next_token`
+    /// optionally pins that prediction. The argmax tie rule is the same as
+    /// `argmax_forward`: the FIRST index achieving the row maximum. The
+    /// causal mask lives inside the model ops (committed as part of the
+    /// statement) and is not re-checked here.
+    LanguageModel {
+        prompt: Vec<u32>,
+        response: Vec<u32>,
+        next_token: Option<u32>,
+    },
+    /// Non-language models (e.g. TimesFM): no token-shift checks.
+    Generic,
+}
+
+/// S6: the public token sequence is bound into the computation via the
+/// embedding lookup's index witness column: one batch opening of that column
+/// at a fresh random point r with claimed value x_hat(r) recomputed by the
+/// verifier from the caller's public tokens (x_hat[i*D+d] = d*base + token_i,
+/// base = embedding table len / D). `batch`/`table` locate the column in
+/// `witness_batches`.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct TokenBinding {
+    pub batch: usize,
+    pub table: usize,
+    pub point: Vec<Goldilocks>,
+    pub claimed: Goldilocks,
+    pub opening: zkie_core::pcs::batch_open::BatchOpeningProof,
 }
 
 
@@ -4210,6 +4258,7 @@ pub struct CommittedShardDagProof {
     pub witness_locations: Vec<WitnessColumnLocation>,
     pub table_openings: Vec<TableOpening>,
     pub sel_openings: Vec<SelOpening>,
+    pub token_binding: Option<TokenBinding>,
     pub perm_batches: Vec<ColumnBatchCommit>,
     pub perm_batch_openings: Vec<ColumnBatchOpening>,
     pub perm_locations: Vec<PermLocation>,
@@ -4591,6 +4640,72 @@ pub fn prove_committed_shard_dag(
         });
     }
 
+    // S6: bind the public token sequence into the computation: one batch
+    // opening of the embedding lookup's index witness column at a fresh
+    // random point r, claimed = x_hat(r) (the MLE of the public expansion
+    // d*base + token_i). The verifier recomputes x_hat from the caller's
+    // tokens and re-derives r on the same transcript.
+    let token_binding: Option<TokenBinding> = (|| -> Option<TokenBinding> {
+        let tokens: Vec<u32> = store.idx[tokens_t].clone();
+        let first_lookup = ops.iter().find_map(|op| match op {
+            Op::Lookup { table, .. } => Some(*table),
+            _ => None,
+        });
+        match (embedding_lookup_column(ops, ops_per_shard, &|len| find_identity_table(store, len)), first_lookup) {
+            (Some((si, ci)), Some(table_t)) if !tokens.is_empty() => {
+                let m = tokens.len();
+                let x_col = shards[si].witness_columns[ci].x.clone();
+                if x_col.len() % m != 0 {
+                    None
+                } else {
+                    let d = x_col.len() / m;
+                    let table_len = store.get(table_t).len();
+                    if d == 0 || table_len % d != 0 {
+                        None
+                    } else {
+                        let base = table_len / d;
+                        // find the group + table index holding this column
+                        let gid = shard_wc_off[si] + ci;
+                        let mut loc: Option<(usize, usize)> = None;
+                        for (g_idx, g) in witness_groups.iter().enumerate() {
+                            for (ti, &(gsi, gci)) in g.cols.iter().enumerate() {
+                                if shard_wc_off[gsi] + gci == gid {
+                                    loc = Some((g_idx, ti));
+                                }
+                            }
+                        }
+                        let (g_idx, ti) = loc?;
+                        let g = &witness_groups[g_idx];
+                        let arity = x_col.len().trailing_zeros() as usize;
+                        let mut ts = Transcript::new(b"zkie-committed-public-v1");
+                        absorb_statement(&mut ts, ops, ops_per_shard);
+                        for wb in &witness_batches {
+                            ts.absorb(&bincode::serialize(&wb.commitment).unwrap());
+                        }
+                        let r: Vec<Goldilocks> = ts.field_vec(arity);
+                        let x_hat = embedding_x_hat(&tokens, base, d, &r);
+                        let opening = zkie_core::pcs::batch_open::prove_batch_open_committed(
+                            &g.x_ctx,
+                            &[ti],
+                            &[x_col],
+                            &[r.clone()],
+                            &[x_hat],
+                        )
+                        .expect("honest token binding");
+                        Some(TokenBinding {
+                            batch: 3 * g_idx,
+                            table: ti,
+                            point: r,
+                            claimed: x_hat,
+                            opening,
+                        })
+                    }
+                }
+            }
+            _ => None,
+        }
+    })();
+
     // Re-run the chained GKR per lookup, then batch-open each (arity, type) group.
     for (g_idx, g) in witness_groups.into_iter().enumerate() {
         let WitnessGroup {
@@ -4756,6 +4871,18 @@ pub fn prove_committed_shard_dag(
                 }
                 let commitment = c.commitment.clone();
                 let mut prover_data = Some(c.prover_data);
+                // S6: bind the committed selector column to the Argmax op's
+                // relation selector at its derived claim point r (topk.r):
+                // sel(r) == gate_rel.final_evals[2] must open to the same
+                // value, so the per-position openings below cannot be
+                // manufactured from a different column.
+                let mut r_pt = ap.topk.r.clone();
+                r_pt.resize(arity, Goldilocks::ZERO);
+                let (r_opening, r_ev) = bw.open(
+                    prover_data.as_ref().expect("Argmax prover data").clone(),
+                    &c.protocol,
+                    &r_pt,
+                );
                 let mut openings = Vec::with_capacity(*m);
                 for (i, point) in points.iter().enumerate() {
                     let data = if i + 1 == *m {
@@ -4774,6 +4901,9 @@ pub fn prove_committed_shard_dag(
                     arity,
                     points,
                     openings,
+                    r_point: r_pt,
+                    r_opening,
+                    r_claimed: r_ev,
                 });
             }
         }
@@ -5309,6 +5439,7 @@ pub fn prove_committed_shard_dag(
         witness_locations,
         table_openings,
         sel_openings,
+        token_binding,
         perm_batches,
         perm_batch_openings,
         perm_locations,
@@ -5325,6 +5456,7 @@ pub fn verify_committed_shard_dag(
     ops_per_shard: usize,
     _whir: &zkie_core::pcs::whir::Whir,
     proof: &CommittedShardDagProof,
+    statement: &PublicStatement,
 ) -> bool {
     let st = VerifierStatement::new(tables, ops, ops_per_shard);
     let ranges = shard_ranges(ops.len(), ops_per_shard);
@@ -6042,22 +6174,205 @@ pub fn verify_committed_shard_dag(
             }
         }
     }
-    // 9. Argmax selection openings (individual one-hot openings at the claimed
-    // output positions).
-    for so in &proof.sel_openings {
-        if so.points.is_empty() || so.openings.len() != so.points.len() {
+    // 9. Argmax selection openings + S6 public bindings. The Argmax op's
+    // relation selector is bound to the SAME committed column at its derived
+    // claim point r (topk.r): sel(r) must open to the relation-bound eval, so
+    // the per-position openings cannot be manufactured from a different
+    // column. For language-model statements the per-position points are
+    // DERIVED from the public argmax (row i, column argmax[i]); the proof
+    // cannot choose which positions to open, and the claimed sequence is
+    // forced through the selector.
+    let argmax_ops: Vec<(usize, usize)> = ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::Argmax { m, n, .. } => Some((*m, *n)),
+            _ => None,
+        })
+        .collect();
+    if proof.sel_openings.len() != argmax_ops.len() {
+        return false;
+    }
+
+    // S6 sequence checks (language-model statements only). The caller's
+    // confirmed prompt + response are authoritative; the proof's tokens /
+    // argmax must agree with them wherever the public data pins them.
+    let lm: Option<Vec<u32>> = match statement {
+        PublicStatement::Generic => None,
+        PublicStatement::LanguageModel {
+            prompt,
+            response,
+            next_token,
+        } => {
+            if argmax_ops.len() != 1 {
+                return false;
+            }
+            let (m, n) = argmax_ops[0];
+            let mut tokens = prompt.clone();
+            tokens.extend_from_slice(response);
+            if tokens.len() != m || proof.tokens != tokens || proof.argmax_t.len() != m {
+                return false;
+            }
+            for &t in &tokens {
+                if (t as usize) >= n {
+                    return false; // vocab range (padded vocab columns are masked)
+                }
+            }
+            for i in prompt.len().saturating_sub(1)..m.saturating_sub(1) {
+                if proof.argmax_t[i] != tokens[i + 1] {
+                    return false; // teacher forcing i = prompt_len-1 .. m-2
+                }
+            }
+            if let Some(nt) = next_token {
+                if proof.argmax_t[m - 1] != *nt {
+                    return false; // last row predicts a token outside the sequence
+                }
+            }
+            Some(tokens)
+        }
+    };
+
+    // S6 token binding (language-model statements only): the embedding
+    // lookup's index witness column is batch-opened at a fresh random point r
+    // with claimed x_hat(r), where x_hat is the MLE of the public expansion
+    // x_hat[i*D+d] = d*base + tokens[i]. The (batch, table) location must be
+    // the one derived from the statement, and r is re-derived on the same
+    // transcript as the prover.
+    if let Some(tokens) = &lm {
+        let loc = embedding_lookup_column(ops, ops_per_shard, &|len| {
+            find_identity_table_slices(tables, len)
+        });
+        let (si, ci) = match loc {
+            Some(l) => l,
+            None => return false,
+        };
+        let mut gid = 0usize;
+        for k in 0..si {
+            gid += proof.shards[k].witness_columns.len();
+        }
+        gid += ci;
+        if gid >= proof.witness_locations.len() {
             return false;
         }
-        let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(so.arity, 90);
-        let bw = zkie_core::pcs::whir::Whir::with_params(so.arity, 90, pow_bits);
-        let protocol = bw.opening_protocol(so.arity, 1);
-        for (opening, point) in so.openings.iter().zip(&so.points) {
-            if bw
-                .verify(&so.commitment, opening, &protocol, point)
-                .ok()
-                != Some(Goldilocks::ONE)
-            {
-                return false;
+        let wl = &proof.witness_locations[gid];
+        let tb = match &proof.token_binding {
+            Some(tb) => tb,
+            None => return false,
+        };
+        if tb.batch != wl.x_batch || tb.table != wl.x_table {
+            return false;
+        }
+        if tb.batch >= proof.witness_batches.len() {
+            return false;
+        }
+        let wb = &proof.witness_batches[tb.batch];
+        if tb.table >= wb.num_tables {
+            return false;
+        }
+        let mut ts = Transcript::new(b"zkie-committed-public-v1");
+        absorb_statement(&mut ts, ops, ops_per_shard);
+        for w in &proof.witness_batches {
+            ts.absorb(&bincode::serialize(&w.commitment).unwrap());
+        }
+        let r: Vec<Goldilocks> = ts.field_vec(wb.arity);
+        if tb.point != r {
+            return false;
+        }
+        let col_len = 1usize << wb.arity;
+        if col_len % tokens.len() != 0 {
+            return false;
+        }
+        let d = col_len / tokens.len();
+        if d == 0 {
+            return false;
+        }
+        let emb_table = match ops.iter().find_map(|op| match op {
+            Op::Lookup { table, .. } => Some(*table),
+            _ => None,
+        }) {
+            Some(t) => t,
+            None => return false,
+        };
+        if emb_table >= tables.len() || tables[emb_table].len() % d != 0 {
+            return false;
+        }
+        let base = tables[emb_table].len() / d;
+        if base != argmax_ops[0].1 {
+            return false; // the expansion base must equal the argmax column count
+        }
+        let x_hat = embedding_x_hat(tokens, base, d, &r);
+        if tb.claimed != x_hat {
+            return false; // proof-carried claimed value must match the recomputed one
+        }
+        let protocol = wb.whir.opening_protocol(wb.arity, wb.num_tables);
+        if !zkie_core::pcs::batch_open::verify_batch_open_committed(
+            &wb.whir,
+            &wb.commitment,
+            &protocol,
+            wb.num_tables,
+            &[tb.table],
+            &[r],
+            &[x_hat],
+            &tb.opening,
+        ) {
+            return false;
+        }
+    }
+
+    let mut kth = 0usize;
+    for (si, &(s, e)) in shard_ranges(ops.len(), ops_per_shard).iter().enumerate() {
+        for (li, op) in ops[s..e].iter().enumerate() {
+            if let Op::Argmax { m, n, .. } = op {
+                let so = &proof.sel_openings[kth];
+                kth += 1;
+                let ap = match &proof.shards[si].ops[li] {
+                    OpProof::Argmax(p) => p,
+                    _ => return false,
+                };
+                if so.points.is_empty() || so.openings.len() != so.points.len() || so.openings.len() != *m {
+                    return false;
+                }
+                let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(so.arity, 90);
+                let bw = zkie_core::pcs::whir::Whir::with_params(so.arity, 90, pow_bits);
+                let protocol = bw.opening_protocol(so.arity, 1);
+                // S6: same-column binding at the relation claim point r.
+                let mut r_pt = ap.topk.r.clone();
+                r_pt.resize(so.arity, Goldilocks::ZERO);
+                if so.r_point != r_pt
+                    || bw
+                        .verify(&so.commitment, &so.r_opening, &protocol, &r_pt)
+                        .ok()
+                        != Some(so.r_claimed)
+                    || so.r_claimed != ap.topk.gate_rel.final_evals[2]
+                {
+                    return false;
+                }
+                for i in 0..*m {
+                    let (point, opening) = match &lm {
+                        Some(_) => {
+                            // points derived from the public argmax
+                            let col = proof.argmax_t[i] as usize;
+                            if col >= *n {
+                                return false;
+                            }
+                            let idx = i * *n + col;
+                            let p: Vec<Goldilocks> = (0..so.arity)
+                                .map(|k| Goldilocks::from_u64(((idx >> k) & 1) as u64))
+                                .collect();
+                            if so.points[i] != p {
+                                return false;
+                            }
+                            (p, &so.openings[i])
+                        }
+                        None => (so.points[i].clone(), &so.openings[i]),
+                    };
+                    if bw
+                        .verify(&so.commitment, opening, &protocol, &point)
+                        .ok()
+                        != Some(Goldilocks::ONE)
+                    {
+                        return false;
+                    }
+                }
             }
         }
     }
@@ -6086,18 +6401,96 @@ pub fn verify_sequence_shift(tokens: &[u32], argmax_t: &[u32], prompt: &[u32]) -
     true
 }
 
+/// S6: the table ids a prove arm pushes as lookups, in push order. Must stay
+/// in sync with the `lookup_by_table` pushes in the prove arms; used to
+/// derive the witness-column position of the embedding lookup on both sides.
+/// `resolve_identity(len)` maps an identity-table length to its tensor id
+/// (prover: `find_identity_table(store, ..)`, verifier: `find_identity_table_slices`).
+fn op_lookup_pushes(op: &Op, resolve_identity: &dyn Fn(usize) -> Option<T>) -> Option<Vec<T>> {
+    match op {
+        Op::Lookup { table, .. } => Some(vec![*table]),
+        Op::Softmax { table, .. } => Some(vec![*table]),
+        Op::SoftmaxIndex { table_len, .. } => Some(vec![
+            resolve_identity(*table_len)?,
+            resolve_identity(1usize << 22)?,
+        ]),
+        Op::GeluIndex { table_len, .. } => Some(vec![
+            resolve_identity(*table_len)?,
+            resolve_identity(1usize << 22)?,
+        ]),
+        Op::StableSoftmaxIndex { table_len, .. } => Some(vec![
+            resolve_identity(*table_len)?,
+            resolve_identity(1usize << 22)?,
+            resolve_identity(1usize << 22)?,
+        ]),
+        Op::Relu { .. } => Some(vec![resolve_identity(1usize << 22)?]),
+        Op::Scale { shift, .. }
+        | Op::ScaleVec { shift, .. }
+        | Op::ScaleGate { shift, .. }
+            if *shift > 0 =>
+        {
+            Some(vec![resolve_identity(1usize << shift)?])
+        }
+        _ => Some(vec![]),
+    }
+}
+
+/// S6: replay the lookup-push order of the prove arms and return the
+/// (shard, in-shard column) witness position of the FIRST `Op::Lookup` (the
+/// embedding lookup for language models). `None` if there is no Lookup op.
+fn embedding_lookup_column(
+    ops: &[Op],
+    ops_per_shard: usize,
+    resolve_identity: &dyn Fn(usize) -> Option<T>,
+) -> Option<(usize, usize)> {
+    let ranges = shard_ranges(ops.len(), ops_per_shard);
+    for (si, &(s, e)) in ranges.iter().enumerate() {
+        let mut groups: std::collections::BTreeMap<T, usize> = std::collections::BTreeMap::new();
+        for op in &ops[s..e] {
+            if let Op::Lookup { table, .. } = op {
+                let col_in_group = groups.get(table).copied().unwrap_or(0);
+                let col_in_shard = groups.range(..table).map(|(_, n)| *n).sum::<usize>() + col_in_group;
+                return Some((si, col_in_shard));
+            }
+            for t in op_lookup_pushes(op, resolve_identity)? {
+                *groups.entry(t).or_insert(0) += 1;
+            }
+        }
+    }
+    None
+}
+
+/// S6: evaluate the MLE of the public index expansion of the embedding lookup
+/// at `r`: x_hat[i*D + d] = d*base + tokens[i] (base = embedding table len / D).
+fn embedding_x_hat(tokens: &[u32], base: usize, d: usize, r: &[Goldilocks]) -> Goldilocks {
+    let mut out = Goldilocks::ZERO;
+    for (i, &t) in tokens.iter().enumerate() {
+        for k in 0..d {
+            let idx = i * d + k;
+            let mut eq = Goldilocks::ONE;
+            for (bit, &rb) in r.iter().enumerate() {
+                let b = Goldilocks::from_u64(((idx >> bit) & 1) as u64);
+                eq = eq * (rb * b + (Goldilocks::ONE - rb) * (Goldilocks::ONE - b));
+            }
+            out = out + eq * Goldilocks::from_u64((k * base + t as usize) as u64);
+        }
+    }
+    out
+}
+
 pub fn verify_committed_shard_dag_bytes(
     proof_bytes: &[u8],
     tables: &[&[Goldilocks]],
     ops: &[Op],
     ops_per_shard: usize,
     whir: &zkie_core::pcs::whir::Whir,
+    statement: &PublicStatement,
 ) -> bool {
     let proof: CommittedShardDagProof = match bincode::deserialize(proof_bytes) {
         Ok(p) => p,
         Err(_) => return false,
     };
-    verify_committed_shard_dag(tables, ops, ops_per_shard, whir, &proof)
+    verify_committed_shard_dag(tables, ops, ops_per_shard, whir, &proof, statement)
 }
 
 /// Build a full pre-norm GPT-2 transformer layer as an op list:
@@ -6957,7 +7350,7 @@ mod tests {
         assert_eq!(proof.boundary_tensors.len(), 1);
         assert_eq!(proof.boundary_commitments.len(), 1);
         assert_eq!(proof.cross_binds.len(), 1);
-        assert!(verify_committed_shard_dag(&store.owned_slices(), &ops, 2, &whir, &proof));
+        assert!(verify_committed_shard_dag(&store.owned_slices(), &ops, 2, &whir, &proof, &PublicStatement::Generic));
 
         // Serialization roundtrip through the root-only bytes entry.
         let bytes = bincode::serialize(&proof).unwrap();
@@ -6966,7 +7359,8 @@ mod tests {
             &store.owned_slices(),
             &ops,
             2,
-            &whir
+            &whir,
+            &PublicStatement::Generic
         ));
 
         // Tamper a boundary opening value -> the committed cross-bind must
@@ -6975,7 +7369,7 @@ mod tests {
         if let Some((_, opened)) = proof.cross_binds[0].openings.first_mut() {
             *opened = *opened + Goldilocks::ONE;
         }
-        assert!(!verify_committed_shard_dag(&store.owned_slices(), &ops, 2, &whir, &proof));
+        assert!(!verify_committed_shard_dag(&store.owned_slices(), &ops, 2, &whir, &proof, &PublicStatement::Generic));
     }
 
 
@@ -7113,7 +7507,7 @@ mod tests {
         let mut proof =
             prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
         assert!(!proof.weight_batches.is_empty());
-        assert!(verify_committed_shard_dag(&store.owned_slices(), &ops, 1, &whir, &proof));
+        assert!(verify_committed_shard_dag(&store.owned_slices(), &ops, 1, &whir, &proof, &PublicStatement::Generic));
 
         // Forge: drop every weight batch + opening.
         proof.weight_batches.clear();
@@ -7126,7 +7520,8 @@ mod tests {
             &store.owned_slices(),
             &ops,
             1,
-            &whir
+            &whir,
+            &PublicStatement::Generic
         ));
     }
 
@@ -7211,6 +7606,7 @@ mod tests {
             1,
             &whir,
             &proof
+        ,            &PublicStatement::Generic
         ));
     }
 
@@ -7330,6 +7726,7 @@ mod tests {
             1,
             &whir,
             &proof
+        ,            &PublicStatement::Generic
         ));
     }
 
@@ -7817,6 +8214,420 @@ mod tests {
         assert!(!s5_verify(&store.owned_slices(), &ops, &mismatched, 0x550F));
     }
 
+    /// S6: minimal language-model statement: embedding lookup (m x D gather,
+    /// expansion k*base + token over a base*D table) -> identity matmul ->
+    /// argmax over `base` columns. wte[t][k] = 1000 if k == (t+1)%base, 10 if
+    /// k == t, else 0, so the honest argmax at row i is (tokens[i]+1)%base.
+    /// With `tied`, row t=2 gets two 1000s (k=3 and k=4) to exercise the
+    /// first-maximum tie rule of `argmax_forward`.
+    #[allow(clippy::type_complexity)]
+    fn s6_lm_setup(
+        seed: u64,
+        tokens: &[u32],
+        base: usize,
+        tied: bool,
+    ) -> (
+        Store,
+        Vec<Op>,
+        zkie_core::pcs::whir::Whir,
+        Vec<CachedWeightBatch>,
+        T,
+        T,
+    ) {
+        let m = tokens.len();
+        let d = base;
+        let mut store = Store::new();
+        let wte: Vec<Goldilocks> = (0..base * d)
+            .map(|i| {
+                let t = i % base;
+                let k = i / base;
+                if k == (t + 1) % base || (tied && t == 2 && k == 4) {
+                    from_i64(1000)
+                } else if k == t {
+                    from_i64(10)
+                } else {
+                    from_i64(0)
+                }
+            })
+            .collect();
+        let wte_t = store.push(wte);
+        let emb_idx: Vec<u32> = (0..m)
+            .flat_map(|i| (0..d).map(move |k| (k * base) as u32 + tokens[i]))
+            .collect();
+        let emb_idx_t = store.push_idx(emb_idx);
+        let emb = store.push(vec![]);
+        let w: Vec<Goldilocks> = (0..base * base)
+            .map(|i| {
+                let k = i / base;
+                let j = i % base;
+                if k == j {
+                    from_i64(1)
+                } else {
+                    from_i64(0)
+                }
+            })
+            .collect();
+        let w_t = store.push(w);
+        let logits = store.push(vec![]);
+        let sel = store.push(vec![]);
+        let thr = store.push(vec![]);
+        let gate = store.push(vec![]);
+        let d1 = store.push(vec![]);
+        let d2 = store.push(vec![]);
+        let out = store.push_idx(vec![]);
+        let ops = vec![
+            Op::Lookup {
+                idx: emb_idx_t,
+                out: emb,
+                table: wte_t,
+            },
+            Op::MatMul {
+                a: emb,
+                b: w_t,
+                c: logits,
+                m,
+                k: base,
+                n: base,
+            },
+            Op::Argmax {
+                x: logits,
+                sel,
+                thr,
+                gate,
+                d1,
+                d2,
+                out,
+                m,
+                n: base,
+            },
+        ];
+        let whir = zkie_core::pcs::whir::Whir::new_testing(5);
+        let cached =
+            commit_model_weights(&store, &ops, &format!("/tmp/zkie-s6-cache-{seed}"));
+        let tokens_t = store.push_idx(tokens.to_vec());
+        (store, ops, whir, cached, tokens_t, out)
+    }
+
+    /// S6: honest language-model roundtrip through the FORMAL bytes entry —
+    /// prompt prefix, teacher forcing i = prompt_len-1..m-2, and the
+    /// unpinned last-row next-token prediction all hold.
+    #[test]
+    fn s6_lm_honest_roundtrip() {
+        let base = 8usize;
+        let tokens: Vec<u32> = (0..8).collect();
+        let (mut store, ops, whir, cached, tokens_t, argmax_t) =
+            s6_lm_setup(0x61, &tokens, base, false);
+        let proof = prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        assert!(proof.token_binding.is_some());
+        let stmt = PublicStatement::LanguageModel {
+            prompt: tokens[..3].to_vec(),
+            response: tokens[3..].to_vec(),
+            next_token: Some(0),
+        };
+        assert!(verify_committed_shard_dag(
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir,
+            &proof,
+            &stmt
+        ));
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(verify_committed_shard_dag_bytes(
+            &bytes,
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir,
+            &stmt
+        ));
+    }
+
+    /// S6: a wrong prompt (one prefix token replaced) must be rejected by the
+    /// formal bytes entry.
+    #[test]
+    fn s6_wrong_prompt_rejected() {
+        let base = 8usize;
+        let tokens: Vec<u32> = (0..8).collect();
+        let (mut store, ops, whir, cached, tokens_t, argmax_t) =
+            s6_lm_setup(0x62, &tokens, base, false);
+        let proof = prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        let bytes = bincode::serialize(&proof).unwrap();
+        let stmt = PublicStatement::LanguageModel {
+            prompt: vec![0, 1, 5], // token 2 replaced by 5
+            response: tokens[3..].to_vec(),
+            next_token: Some(0),
+        };
+        assert!(!verify_committed_shard_dag_bytes(
+            &bytes,
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir,
+            &stmt
+        ));
+    }
+
+    /// S6: tampering with any response position must be rejected.
+    #[test]
+    fn s6_response_tampered_rejected() {
+        let base = 8usize;
+        let tokens: Vec<u32> = (0..8).collect();
+        let (mut store, ops, whir, cached, tokens_t, argmax_t) =
+            s6_lm_setup(0x63, &tokens, base, false);
+        let proof = prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        let bytes = bincode::serialize(&proof).unwrap();
+        // middle position: argmax[3] must equal tokens[4] = 4
+        let stmt = PublicStatement::LanguageModel {
+            prompt: tokens[..3].to_vec(),
+            response: vec![3, 4, 7, 6, 7],
+            next_token: Some(0),
+        };
+        assert!(!verify_committed_shard_dag_bytes(
+            &bytes,
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir,
+            &stmt
+        ));
+    }
+
+    /// S6: a length mismatch (response too short) must be rejected.
+    #[test]
+    fn s6_length_mismatch_rejected() {
+        let base = 8usize;
+        let tokens: Vec<u32> = (0..8).collect();
+        let (mut store, ops, whir, cached, tokens_t, argmax_t) =
+            s6_lm_setup(0x64, &tokens, base, false);
+        let proof = prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        let bytes = bincode::serialize(&proof).unwrap();
+        let stmt = PublicStatement::LanguageModel {
+            prompt: tokens[..3].to_vec(),
+            response: tokens[3..7].to_vec(), // one token short
+            next_token: Some(0),
+        };
+        assert!(!verify_committed_shard_dag_bytes(
+            &bytes,
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir,
+            &stmt
+        ));
+    }
+
+    /// S6: a public token outside the vocab range (>= base) must be rejected.
+    #[test]
+    fn s6_out_of_vocab_rejected() {
+        let base = 8usize;
+        let tokens: Vec<u32> = (0..8).collect();
+        let (mut store, ops, whir, cached, tokens_t, argmax_t) =
+            s6_lm_setup(0x65, &tokens, base, false);
+        let proof = prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        let bytes = bincode::serialize(&proof).unwrap();
+        let stmt = PublicStatement::LanguageModel {
+            prompt: tokens[..3].to_vec(),
+            response: vec![3, 4, 8, 6, 7], // 8 >= vocab base
+            next_token: Some(0),
+        };
+        assert!(!verify_committed_shard_dag_bytes(
+            &bytes,
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir,
+            &stmt
+        ));
+    }
+
+    /// S6: the per-position selector openings are derived from the public
+    /// argmax — pointing the claimed argmax at a column where the (bound)
+    /// selector is 0 must be rejected, even on a prompt row that the
+    /// sequence checks do not pin.
+    #[test]
+    fn s6_wrong_position_on_selector_rejected() {
+        let base = 8usize;
+        let tokens: Vec<u32> = (0..8).collect();
+        let (mut store, ops, whir, cached, tokens_t, argmax_t) =
+            s6_lm_setup(0x66, &tokens, base, false);
+        let mut proof = prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        // row 0 (inside the prompt): honest argmax[0] = 1, forge it to 5
+        // where sel[0*8+5] == 0.
+        proof.argmax_t[0] = 5;
+        let bytes = bincode::serialize(&proof).unwrap();
+        let stmt = PublicStatement::LanguageModel {
+            prompt: tokens[..3].to_vec(),
+            response: tokens[3..].to_vec(),
+            next_token: Some(0),
+        };
+        assert!(!verify_committed_shard_dag_bytes(
+            &bytes,
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir,
+            &stmt
+        ));
+    }
+
+    /// S6: the token binding is a batch opening of the embedding lookup's
+    /// index witness at a fresh random point — a forged claimed value, and
+    /// re-pointing the binding at a different witness column, must both be
+    /// rejected.
+    #[test]
+    fn s6_wrong_embedding_token_rejected() {
+        let base = 8usize;
+        let tokens: Vec<u32> = (0..8).collect();
+        let (mut store, ops, whir, cached, tokens_t, argmax_t) =
+            s6_lm_setup(0x67, &tokens, base, false);
+        let mut proof = prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        proof.token_binding.as_mut().unwrap().claimed += Goldilocks::ONE;
+        let stmt = PublicStatement::LanguageModel {
+            prompt: tokens[..3].to_vec(),
+            response: tokens[3..].to_vec(),
+            next_token: Some(0),
+        };
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(!verify_committed_shard_dag_bytes(
+            &bytes,
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir,
+            &stmt
+        ));
+        // re-point the binding at a different witness column: the derived
+        // (batch, table) of the embedding lookup must be used, never a
+        // proof-chosen one.
+        proof.token_binding.as_mut().unwrap().claimed -= Goldilocks::ONE;
+        proof.token_binding.as_mut().unwrap().table = 1;
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(!verify_committed_shard_dag_bytes(
+            &bytes,
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir,
+            &stmt
+        ));
+    }
+
+    /// S6: the selector openings and the relation selector must share ONE
+    /// committed column — swapping the commitment for another root (and
+    /// forging the r-binding eval) must be rejected.
+    #[test]
+    fn s6_selector_root_identity_rejected() {
+        let base = 8usize;
+        let tokens: Vec<u32> = (0..8).collect();
+        let (mut store, ops, whir, cached, tokens_t, argmax_t) =
+            s6_lm_setup(0x68, &tokens, base, false);
+        let mut proof = prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        // swap the selector commitment for the first weight batch's root: the
+        // r-binding opening can no longer verify against it.
+        proof.sel_openings[0].commitment = proof.weight_batches[0].commitment.clone();
+        let bytes = bincode::serialize(&proof).unwrap();
+        let stmt = PublicStatement::LanguageModel {
+            prompt: tokens[..3].to_vec(),
+            response: tokens[3..].to_vec(),
+            next_token: Some(0),
+        };
+        assert!(!verify_committed_shard_dag_bytes(
+            &bytes,
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir,
+            &stmt
+        ));
+    }
+
+    /// S6: explicit tie rule — the public sequence must claim the FIRST index
+    /// achieving the row maximum (the `argmax_forward` rule). Claiming the
+    /// tied second maximum is rejected; the honest first maximum passes.
+    #[test]
+    fn s6_tie_rule_rejected() {
+        let base = 8usize;
+        let tokens: Vec<u32> = (0..8).collect();
+        let (mut store, ops, whir, cached, tokens_t, argmax_t) =
+            s6_lm_setup(0x69, &tokens, base, true); // row t=2 ties k=3 and k=4
+        let proof = prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        // honest argmax[2] = 3 (first maximum); the caller claims 4.
+        let stmt_bad = PublicStatement::LanguageModel {
+            prompt: tokens[..3].to_vec(),
+            response: vec![4, 4, 5, 6, 7],
+            next_token: Some(0),
+        };
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(!verify_committed_shard_dag_bytes(
+            &bytes,
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir,
+            &stmt_bad
+        ));
+        let stmt_ok = PublicStatement::LanguageModel {
+            prompt: tokens[..3].to_vec(),
+            response: tokens[3..].to_vec(),
+            next_token: Some(0),
+        };
+        assert!(verify_committed_shard_dag_bytes(
+            &bytes,
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir,
+            &stmt_ok
+        ));
+    }
+
+    /// S6: empty prompt — full teacher forcing from i=0; the last row's
+    /// unpinned next-token prediction is accepted.
+    #[test]
+    fn s6_empty_prompt_roundtrip() {
+        let base = 8usize;
+        let tokens: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 0];
+        let (mut store, ops, whir, cached, tokens_t, argmax_t) =
+            s6_lm_setup(0x6A, &tokens, base, false);
+        let proof = prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        let bytes = bincode::serialize(&proof).unwrap();
+        let stmt = PublicStatement::LanguageModel {
+            prompt: vec![],
+            response: tokens.clone(),
+            next_token: None,
+        };
+        assert!(verify_committed_shard_dag_bytes(
+            &bytes,
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir,
+            &stmt
+        ));
+    }
+
+    /// S6: non-language statements (Generic) skip the sequence checks — the
+    /// proof-carried tokens are not consulted, matching TimesFM-style usage.
+    #[test]
+    fn s6_generic_skips_sequence() {
+        let base = 8usize;
+        let tokens: Vec<u32> = (0..8).collect();
+        let (mut store, ops, whir, cached, tokens_t, argmax_t) =
+            s6_lm_setup(0x6B, &tokens, base, false);
+        let mut proof = prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        proof.tokens = vec![9, 9, 9, 9, 9, 9, 9, 9]; // garbage tokens are not consulted
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(verify_committed_shard_dag_bytes(
+            &bytes,
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir,
+            &PublicStatement::Generic
+        ));
+    }
+
     /// S2: honest committed roundtrip WITH a lookup — the witness x/y columns
     /// are opened at the derived DEN leaf point and the m-column/table at the
     /// derived NUM/DEN points, all derived from the committed frac replays.
@@ -7881,6 +8692,7 @@ mod tests {
             1,
             &whir,
             &proof
+        ,            &PublicStatement::Generic
         ));
     }
 
@@ -7951,6 +8763,7 @@ mod tests {
             1,
             &whir,
             &proof
+        ,            &PublicStatement::Generic
         ));
     }
 
@@ -8086,6 +8899,7 @@ mod tests {
             1,
             &whir,
             &proof
+        ,            &PublicStatement::Generic
         ));
     }
 
@@ -8119,7 +8933,7 @@ mod tests {
         let proof =
             prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
         assert!(!proof.weight_batches.is_empty());
-        assert!(verify_committed_shard_dag(&store.owned_slices(), &ops, 1, &whir, &proof));
+        assert!(verify_committed_shard_dag(&store.owned_slices(), &ops, 1, &whir, &proof, &PublicStatement::Generic));
 
         // Forgery 1: empty commitments (drop every weight batch + opening).
         let mut forged =
@@ -8132,6 +8946,7 @@ mod tests {
             1,
             &whir,
             &forged
+        ,            &PublicStatement::Generic
         ));
 
         // Forgery 2: zero-round matmul sumcheck (round count comes from the
@@ -8151,6 +8966,7 @@ mod tests {
             1,
             &whir,
             &forged2
+        ,            &PublicStatement::Generic
         ));
     }
 
@@ -8226,7 +9042,7 @@ mod tests {
         let proof =
             prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
         assert!(proof.weight_batches.len() >= 2);
-        assert!(verify_committed_shard_dag(&store.owned_slices(), &ops, 1, &whir, &proof));
+        assert!(verify_committed_shard_dag(&store.owned_slices(), &ops, 1, &whir, &proof, &PublicStatement::Generic));
 
         // Forgery 1: change one opening's claimed value -> the point-set
         // comparison against the locally built claims rejects it.
@@ -8241,6 +9057,7 @@ mod tests {
             1,
             &whir,
             &forged
+        ,            &PublicStatement::Generic
         ));
 
         // Forgery 2: swap two batch roots (openings stay with their batches) ->
@@ -8255,6 +9072,7 @@ mod tests {
             1,
             &whir,
             &forged2
+        ,            &PublicStatement::Generic
         ));
     }
 
@@ -8340,6 +9158,7 @@ mod tests {
             1,
             &whir,
             &proof
+        ,            &PublicStatement::Generic
         ));
         let bytes = bincode::serialize(&proof).unwrap();
         assert!(verify_committed_shard_dag_bytes(
@@ -8347,7 +9166,8 @@ mod tests {
             &store.owned_slices(),
             &ops,
             1,
-            &whir
+            &whir,
+            &PublicStatement::Generic
         ));
 
         proof.sel_openings[0].points[0][0] =
@@ -8358,6 +9178,7 @@ mod tests {
             1,
             &whir,
             &proof
+        ,            &PublicStatement::Generic
         ));
     }
 

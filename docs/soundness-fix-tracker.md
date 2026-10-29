@@ -38,7 +38,12 @@
   - 范围检查接入**公共恒等表**：`ensure_public_tables` 在 prove 入口自动推 `[0,2^shift)`/`[0,2^22)`/`[0,table_len)` 恒等表，rem/idx/q 列经 LogUp lookup 绑定（committed 路径复用 S2 identity-table 机制）；SoftmaxIndex（relu+divmod：idx_f∈[0,L)、q∈[0,2^22)）、GeluIndex（relu+clamp：idx∈[0,L)、trunc−idx∈[0,2^22)）、StableSoftmaxIndex（公式 virtual 先行、行 virtual 后行，行点取公式派生点行位，sel∈{0,1}）同模板实现。**域契约**：`relu(x) < 2^22·table_len`（与真实模型一致——models/gpt2 先 `Op::Scale{shift:16}` 再喂 index op；build_gpt2_layer 测试 builder 同步修）。
   - Transpose 改为轴交换 claim 转发（out claims → x claims @ swap(p)，m/k 非二次幂拒绝）；PadIdx 增加 `base_len` 字段；未实现归约的 op 变体在 committed verifier 明确拒绝（不默默通过）。
   - 回归（15 个 `s5_*`）：add 逐位置伪造/元素对调拒绝、transpose 伪造 out claim 拒绝、scale 错误取整拒绝、scalevec/broadcastscale/scalegate 乘积伪造拒绝、relu 符号伪造拒绝、gelu/stable/softmax index 公式伪造拒绝、idx_broadcast/combine_idx/pad_idx 伪造拒绝、未实现变体拒绝。全量回归：ops 74 绿（15 s5 新增）、core 64、engine 3、models 全绿。
-- [ ] **S6 · 公开序列接入（P0）** — 独立验证 API 传入 prompt，tokens/Argmax 绑定 embedding lookup。
+- [x] **S6 · 公开序列接入（P0）** — 独立验证 API 传入 prompt，tokens/Argmax 绑定 embedding lookup。
+  - **公开 statement 类型**：`PublicStatement::LanguageModel { prompt, response, next_token }` / `Generic`（TimesFM 等非语言模型不强套 token 移位）。验证器从不从 proof/Store 自取 prompt——调用者确认的 prompt+response 是权威输入；`verify_committed_shard_dag`/`_bytes` 均带 statement 参数（bytes 入口被 s6 测试直接调用，不只测辅助函数）。
+  - **序列检查（LM）**：长度（tokens.len()==Argmax.m、argmax 同长）、词表范围（token < Argmax.n）、prompt 前缀（proof.tokens == prompt++response）、teacher forcing `i = prompt_len-1..m-2: argmax[i]==tokens[i+1]`（空 prompt → 全链从 i=0）；最后一行预测 next-token 不参与序列，`next_token` 可选 pin。并列规则 = `argmax_forward` 的首个最大索引（声称并列第二个 → 拒绝）；causal mask 在模型 ops 内（随 statement 提交），序列层不重复检查。
+  - **tokens 绑定**：`TokenBinding` = embedding lookup 的 idx witness 列在**新随机点 r** 的一个 batch opening，claimed = 验证器从公开 tokens 重算的 `x̂(r)`（`x̂[i·D+d] = d·base + tokens[i]`，base = 表长/D == Argmax.n，结构从 statement 推导）；(batch, table) 必须是 statement 推导的 witness 列位置（`embedding_lookup_column` 重放 lookup push 顺序，prove/verify 同一函数），r 在 `b"zkie-committed-public-v1"` 上重放派生。攻击：错误 prompt / 任意位置 response 篡改 / 长度不一致 / 错 embedding token 全部经 x̂ 或序列检查拒绝。
+  - **argmax/selector 绑定**：`SelOpening` 增加 r 点 binding（同一 committed sel 列在 Argmax 关系 claim 点 `topk.r` 的 opening == `gate_rel.fe[2]`），per-position 点由**公开 argmax 推导**（行 i、列 argmax[i]，proof 不能随意选 1 位置也不能换列——换根/换点都被 r-binding + 推导点拒绝）；committed 模式 `verify_argmax` 不再信任 proof 携带的 `sel_evals`（`check_out=false`，out 绑定全部交给 openings），plain 模式保持直查。
+  - 回归（11 个 `s6_*`）：诚实 LM roundtrip（bytes 入口）、错误 prompt、中间位置 response 篡改、长度不一致、词表越界、正确 selector 上的错误位置（prompt 行伪造 argmax）、claimed 伪造 + witness 列换指、selector 根互换、并列规则（第二最大拒绝/首个最大通过）、空 prompt 全链、Generic 跳过序列检查。全量回归：ops 85 绿（11 s6 新增）、core 64、engine 3、models 全绿。
 - [ ] **S7 · MoE 专家绑定（P0）** — 路由 counts 归约到已认证路由，专家权重通过正确根 batch opening。
 
 ### 阶段 D · 安全论证（依赖 C 闭合）
@@ -56,7 +61,7 @@
 | 32×32 MatMul 空 sumcheck 无承诺 | 拒绝 | S2 ✅ `s2_matmul32_empty_commitments_rejected` |
 | Add `[1,2]+[3,4]=[5,5]` | 拒绝 | S5 ✅ `s5_add_positionwise_rejected` |
 | Lookup `table[0]=99` 改 final 分数 | 拒绝 | S3 ✅ `s3_root_steer_rejected` + 派生根 |
-| 替换 tokens / argmax 长度 | 拒绝 | S6 |
+| 替换 tokens / argmax 长度 | 拒绝 | S6 ✅ `s6_response_tampered_rejected` + `s6_length_mismatch_rejected` + `s6_wrong_embedding_token_rejected` |
 | 同点 claim 1 和 2 | 拒绝 | S4 ✅ `s4_contradictory_same_point_rejected` |
 | 真实 WHIR opening + 伪造外层 sumcheck | 拒绝 | S1 |
 | 缺 op proof 序列化合法 | 返回 false 不 panic | S8 |

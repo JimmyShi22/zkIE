@@ -397,9 +397,17 @@ pub fn verify_argmax(
     m: usize,
     n: usize,
     transcript: &mut Transcript,
+    check_out: bool,
 ) -> bool {
     if !verify_topk(&proof.topk, 1, m, n, transcript) {
         return false;
+    }
+    // S6: in committed mode (`check_out = false`) the output-index binding is
+    // deferred to the committed per-position selector openings at the points
+    // derived from the public argmax; the proof-carried sel_evals/topk.sel are
+    // NOT trusted there. The plain path keeps the direct sel lookup.
+    if !check_out {
+        return true;
     }
     for i in 0..m {
         let j = proof.out[i] as usize;
@@ -444,13 +452,13 @@ mod argmax_tests {
         let proof = prove_argmax(&x, &sel, &thr, &gate, &d1, &d2, &out, m, n, 16, &mut tp);
         let mut tv = Transcript::new(b"zkie-argmax-test");
         tv.absorb_u64(0x9999);
-        assert!(verify_argmax(&proof, m, n, &mut tv));
+        assert!(verify_argmax(&proof, m, n, &mut tv, true));
         // corrupt out -> index binding must fail
         let mut bad = proof;
         bad.out[0] = (bad.out[0] + 1) % n as u32;
         let mut tv2 = Transcript::new(b"zkie-argmax-test");
         tv2.absorb_u64(0x9999);
-        assert!(!verify_argmax(&bad, m, n, &mut tv2));
+        assert!(!verify_argmax(&bad, m, n, &mut tv2, true));
     }
 }
 
