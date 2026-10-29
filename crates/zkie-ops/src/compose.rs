@@ -261,7 +261,8 @@ pub fn prove_projection_chain(
             (out_pt.clone(), mle::eval(&ys[i], &out_pt)),
             (in_pt.clone(), mle::eval(&ys[i], &in_pt)),
         ];
-        binds.push(prove_same_poly(&ys[i], &claims, transcript));
+        let (sp, _merged) = prove_same_poly(&ys[i], &claims, transcript);
+        binds.push(sp);
     }
 
     ProjectionChainProof {
@@ -355,7 +356,8 @@ pub fn prove_projection_sharded(
             (out_pt.clone(), mle::eval(&ys[b], &out_pt)),
             (in_pt.clone(), mle::eval(&ys[b], &in_pt)),
         ];
-        cross_binds.push(prove_same_poly(&ys[b], &claims, transcript));
+        let (sp, _merged) = prove_same_poly(&ys[b], &claims, transcript);
+        cross_binds.push(sp);
     }
 
     ProjectionShardedProof {
@@ -498,7 +500,8 @@ pub fn prove_residual_chain(
         // x_i is the residual input of add_i (claimed at r_i).
         let r_i = adds[i].1.clone();
         claims.push((r_i.clone(), mle::eval(&xs[i], &r_i)));
-        same_x.push(prove_same_poly(&xs[i], &claims, transcript));
+        let (sp, _merged) = prove_same_poly(&xs[i], &claims, transcript);
+        same_x.push(sp);
     }
 
     // Bind each p_i across projection out (pt_i) and residual in (r_i).
@@ -510,7 +513,8 @@ pub fn prove_residual_chain(
             (pt_i.clone(), mle::eval(&ps[i], &pt_i)),
             (r_i.clone(), mle::eval(&ps[i], &r_i)),
         ];
-        same_p.push(prove_same_poly(&ps[i], &claims, transcript));
+        let (sp, _merged) = prove_same_poly(&ps[i], &claims, transcript);
+        same_p.push(sp);
     }
 
     ResidualChainProof {
@@ -2170,7 +2174,11 @@ pub fn prove_shard_precomputed(
         if cs.len() < 2 {
             continue;
         }
-        let sp = prove_same_poly(store.materialize(t).as_ref(), &cs, transcript);
+        // S4: the shard-level bind is a consistency check whose merged
+        // claim is NOT consumed downstream — its input claims are each
+        // authenticated by the committed openings (S2 point-set) instead, so
+        // dropping the merged output here is sound.
+        let (sp, _merged) = prove_same_poly(store.materialize(t).as_ref(), &cs, transcript);
         bound.push(t);
         binds.push(sp);
     }
@@ -2652,7 +2660,10 @@ fn prove_shard_dag_inner(
     let mut cross_binds = Vec::new();
     for (t, claims) in by_tensor {
         if tensor_shards.get(&t).map(|s| s.len()).unwrap_or(0) > 1 {
-            let sp = prove_same_poly(store.materialize(t).as_ref(), &claims, &mut master);
+            // S4: same as the shard binds — the DAG cross-bind's merged
+            // claim is not consumed; the boundary claims are authenticated
+            // by the committed openings instead.
+            let (sp, _merged) = prove_same_poly(store.materialize(t).as_ref(), &claims, &mut master);
             cross_tensors.push(t);
             cross_binds.push(sp);
         }
@@ -2820,7 +2831,14 @@ pub fn committed_cross_bind(
         transcript.absorb_field(*ev);
     }
     Some(CommittedCrossBindProof {
-        same_poly: prove_same_poly(tensor, claims, transcript),
+        same_poly: {
+            // S4: the merged claim of the committed cross-bind is not
+            // consumed — every input claim is opened directly against the
+            // boundary commitment (the real authentication), so the
+            // same_poly here is an extra consistency check.
+            let (sp, _merged) = prove_same_poly(tensor, claims, transcript);
+            sp
+        },
         openings,
     })
 }
@@ -5783,7 +5801,7 @@ mod tests {
         let mut tp = Transcript::new(b"zkie-committed-binds-v1");
         tp.absorb_u64(0x1414);
         let proof = committed_cross_bind(&whir, &c, &f, &claims, &mut tp).expect("honest bind");
-        assert_eq!(proof.same_poly.coeffs.len(), 2);
+        assert_eq!(proof.same_poly.proof.final_evals.len(), 3); // mles [f, eq0, eq1]
 
         // A wrong claimed eval must fail the commitment check.
         let bad = vec![
@@ -6262,6 +6280,64 @@ mod tests {
             &whir,
             &proof
         ));
+    }
+
+    /// S4 guard: a bind must merge claims of ONE tensor. Swapping the binds
+    /// of two different multi-claim tensors must be rejected (the claim
+    /// lists no longer match the bind proofs).
+    #[test]
+    fn s4_cross_tensor_bind_rejected() {
+        let mut rng = XorShift64::new(0x54_01);
+        let (m, k, n, shift) = (4usize, 4usize, 4usize, 8u32);
+        let mut store = Store::new();
+        let x = store.push(
+            (0..m * k)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        let mut ws = Vec::new();
+        let mut bs = Vec::new();
+        for _ in 0..3 {
+            ws.push(store.push(
+                (0..k * n)
+                    .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                    .collect(),
+            ));
+            bs.push(store.push(
+                (0..m * n)
+                    .map(|_| from_i64((rng.next_u64() % 10) as i64 - 5))
+                    .collect(),
+            ));
+        }
+        let mid1 = store.push(vec![]);
+        let rem1 = store.push(vec![]);
+        let mid2 = store.push(vec![]);
+        let rem2 = store.push(vec![]);
+        let out = store.push(vec![]);
+        let rem3 = store.push(vec![]);
+        let ops = vec![
+            Op::Projection { x, w: ws[0], bias: bs[0], out: mid1, rem: rem1, m, k, n, shift },
+            Op::Projection { x: mid1, w: ws[1], bias: bs[1], out: mid2, rem: rem2, m, k, n, shift },
+            Op::Projection { x: mid2, w: ws[2], bias: bs[2], out, rem: rem3, m, k, n, shift },
+        ];
+
+        let mut tp = Transcript::new(b"zkie-s4-test");
+        let proof = prove_shard(&mut store, &ops, &[out], &mut tp);
+        assert_eq!(proof.bound.len(), 2, "mid1 and mid2 must both be bound");
+        let mut tv = Transcript::new(b"zkie-s4-test");
+        assert!(verify_shard(&store.owned_slices(), &ops, &proof, &mut tv));
+
+        // Swap the two binds: each is now checked against the OTHER tensor's
+        // claims, which must reject.
+        let mut forged = OpShardProof {
+            ops: proof.ops,
+            bound: proof.bound,
+            binds: proof.binds.into_iter().rev().collect(),
+            witness_columns: proof.witness_columns,
+            table_columns: proof.table_columns,
+        };
+        let mut tv2 = Transcript::new(b"zkie-s4-test");
+        assert!(!verify_shard(&store.owned_slices(), &ops, &forged, &mut tv2));
     }
 
     /// S2: honest committed roundtrip WITH a lookup — the witness x/y columns

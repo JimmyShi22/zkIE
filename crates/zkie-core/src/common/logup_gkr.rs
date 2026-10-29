@@ -149,11 +149,12 @@ pub fn prove_fractional(
         p0.push(Goldilocks::ZERO);
         let mut p1 = s.clone();
         p1.push(Goldilocks::ONE);
-        let num_merge =
+        let (num_merge, a_next) =
             prove_same_poly(num_k1, &[(p0.clone(), fe[2]), (p1.clone(), fe[3])], transcript);
-        let den_merge = prove_same_poly(den_k1, &[(p0, fe[4]), (p1, fe[5])], transcript);
-        a = num_merge.merged_eval;
-        b = den_merge.merged_eval;
+        let (den_merge, b_next) =
+            prove_same_poly(den_k1, &[(p0, fe[4]), (p1, fe[5])], transcript);
+        a = a_next;
+        b = b_next;
         q_num = num_merge.merged_point.clone();
         q_den = den_merge.merged_point.clone();
         layers.push(FractionalLayer {
@@ -248,16 +249,18 @@ pub fn verify_fractional(
         p1.push(Goldilocks::ONE);
         let num_claims = vec![(p0.clone(), fe[2]), (p1.clone(), fe[3])];
         let den_claims = vec![(p0, fe[4]), (p1, fe[5])];
-        if verify_same_poly(&layer.num_merge, &num_claims, transcript).is_none() {
-            return false;
-        }
-        if verify_same_poly(&layer.den_merge, &den_claims, transcript).is_none() {
-            return false;
-        }
-        a = layer.num_merge.merged_eval;
-        b = layer.den_merge.merged_eval;
-        q_num = layer.num_merge.merged_point.clone();
-        q_den = layer.den_merge.merged_point.clone();
+        let (q_next, a_next) = match verify_same_poly(&layer.num_merge, &num_claims, transcript) {
+            Some(m) => m,
+            None => return false,
+        };
+        let (qd_next, b_next) = match verify_same_poly(&layer.den_merge, &den_claims, transcript) {
+            Some(m) => m,
+            None => return false,
+        };
+        a = a_next;
+        b = b_next;
+        q_num = q_next;
+        q_den = qd_next;
     }
     let (final_num, final_den) = root.unwrap();
     // S3: a zero tree denominator is a protocol violation (the ratio would
@@ -334,16 +337,20 @@ fn replay_fractional_storefree(
         p1.push(Goldilocks::ONE);
         let num_claims = vec![(p0.clone(), fe[2]), (p1.clone(), fe[3])];
         let den_claims = vec![(p0, fe[4]), (p1, fe[5])];
-        if verify_same_poly(&layer.num_merge, &num_claims, transcript).is_none() {
-            return None;
-        }
-        if verify_same_poly(&layer.den_merge, &den_claims, transcript).is_none() {
-            return None;
-        }
-        a = layer.num_merge.merged_eval;
-        b = layer.den_merge.merged_eval;
-        q_num = layer.num_merge.merged_point.clone();
-        q_den = layer.den_merge.merged_point.clone();
+        // S4: the merged claim (point, value) is the verified output — the
+        // value comes from the argument itself, never a stored field.
+        let (q_next, a_next) = match verify_same_poly(&layer.num_merge, &num_claims, transcript) {
+            Some(m) => m,
+            None => return None,
+        };
+        let (qd_next, b_next) = match verify_same_poly(&layer.den_merge, &den_claims, transcript) {
+            Some(m) => m,
+            None => return None,
+        };
+        a = a_next;
+        b = b_next;
+        q_num = q_next;
+        q_den = qd_next;
     }
     let (final_num, final_den) = root.unwrap();
     Some(FractionalChainClaims {
@@ -406,9 +413,11 @@ pub fn fractional_leaf(
     match proof.layers.last() {
         Some(layer) => (
             layer.num_merge.merged_point.clone(),
-            layer.num_merge.merged_eval,
+            // S4: prover-side — the merged value is the honest sumcheck's
+            // final eval of the tensor column (f(r*)), not a stored field.
+            layer.num_merge.proof.final_evals[0],
             layer.den_merge.merged_point.clone(),
-            layer.den_merge.merged_eval,
+            layer.den_merge.proof.final_evals[0],
         ),
         // Unreachable for valid proofs (S3: the domain has >= 2 entries).
         None => (Vec::new(), Goldilocks::ZERO, Vec::new(), Goldilocks::ZERO),

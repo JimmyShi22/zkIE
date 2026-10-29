@@ -26,7 +26,10 @@
   - eq 列闭式重算：`eq_poly(q, s)` 重算 fe[0]/fe[1] 并与存储值比对（顶层空点 eq≡1），不再接受 proof 自报；零分母：派生 `final_den == 0` 显式拒绝（0/0 不再让交叉乘法恒成立），split 两侧各自先查。
   - 调用点接线：`verify_fractional_chain_core/chain/storefree`、`verify_lookup_split(w,t_w,t_t)`、`verify_permutation(t)`、`verify_lookup_fractional_chain(t)` 全部带列深度参数；compose committed 各 frac 段（lookup/perm/gather）用 batch arity 并补零分母拒绝；projection/topk/range_decomp/gather/scatter 用 statement/列长。
   - 回归（10 个 `s3_*`，修复前 7 红 3 绿）：诚实多层/单叶 roundtrip、零层拒绝、根直线伪造拒绝、eq 列伪造拒绝、零分母（单侧/双侧 0/0）拒绝、删底层 layer 拒绝、畸形结构（fe 截断）拒绝不 panic、顶层 child eval 篡改拒绝、空层+claimed 绑定拒绝。
-- [ ] **S4 · same_poly 绑定（P0）** — 从输入 claims 派生批量系数，终点由 verifier 闭式计算。
+- [x] **S4 · same_poly 绑定（P0）** — 从输入 claims 派生批量系数，终点由 verifier 闭式计算。
+  - 合并论证重写：`SamePolyProof { gamma, proof, merged_point }`（删 `coeffs` 与独立 `merged_eval` 字段）。批量系数 = 单个 transcript gamma 的幂 1, γ, γ², …（prove 与 verify 同侧派生，篡改 gamma 拒绝，γ∈{0,1} 退化拒绝）；verify 检查全部 claim 点维度一致、同点不同值快速拒绝，`W(r*) = Σ γ^i·eq_poly(r_i, r*)` 由 verifier 闭式计算（W=0 拒绝），**返回唯一输出 claim `(r*, final_claim·W(r*)⁻¹)`**——修复前 `verify_same_poly` 返回 prover 自由字段 `merged_eval`（篡改后被直接消费）、eq 值自报（S3 同类）。
+  - soundness 结构：rounds 先承诺 G′ → r* 后派生 → 下游绑定（叶 opening / 下一层恒等式）迫使 G′(r*)=f(r*)·W(r*) → 低度 SZ 得 G′≡f·W → 随机 γ 迫使全部输入 claims 为真。输出 claim 被 frac 链消费（下一层 incoming claim，最终由 S2 叶 opening 认证）；compose 的 shard/DAG bind 与 committed cross-bind 的合并输出不被消费——其输入 claims 已各自被 committed openings（S2 点集）直接认证，same_poly 为附加一致性检查（代码注释说明）。
+  - 回归（7 个 `s4_*`，修复前 3 红）：诚实不同点合并、**矛盾同点拒绝**（恶意 prover 自适应 f′ 构造，修复前接受）、**merged_eval 伪造拒绝**（修复前返回伪造值，现返回值必等于真实 opening 值）、gamma 篡改拒绝、merged_point 篡改拒绝、eq 值不再被读取（篡改 fe 返回值不变）、跨 tensor bind 互换拒绝。
 
 ### 阶段 C · 模型关系（依赖 B 框架）
 - [ ] **S5 · op 关系补齐（P0）** — Add/Transpose/Scale/ScaleVec 等逐位置关系，未实现归约的 op 明确拒绝。
@@ -49,7 +52,7 @@
 | Add `[1,2]+[3,4]=[5,5]` | 拒绝 | S5 |
 | Lookup `table[0]=99` 改 final 分数 | 拒绝 | S3 ✅ `s3_root_steer_rejected` + 派生根 |
 | 替换 tokens / argmax 长度 | 拒绝 | S6 |
-| 同点 claim 1 和 2 | 拒绝 | S4 |
+| 同点 claim 1 和 2 | 拒绝 | S4 ✅ `s4_contradictory_same_point_rejected` |
 | 真实 WHIR opening + 伪造外层 sumcheck | 拒绝 | S1 |
 | 缺 op proof 序列化合法 | 返回 false 不 panic | S8 |
 | GatherMatMul fake counts/table | 拒绝 | S7 |
