@@ -47,7 +47,9 @@ fn main() {
         })
         .collect();
     let t0 = Instant::now();
-    let proof = prove_projection(&x, &w, &bias, &out, &rem_off, m, k, n, shift, &mut rng);
+    let mut t = zkie_core::common::transcript::Transcript::new(b"zkie-bench-projection");
+    t.absorb_u64(0x1234);
+    let proof = prove_projection(&x, &w, &bias, &out, &rem_off, m, k, n, shift, &mut t);
     let dt = t0.elapsed();
     println!(
         "projection m={} k={} n={} shift={} time={:.2}s",

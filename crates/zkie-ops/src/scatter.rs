@@ -3,6 +3,7 @@
 
 use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
 use zkie_core::common::logup_gkr::{prove_permutation, verify_permutation, PermutationProof};
+use zkie_core::common::transcript::Transcript;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ScatterProof {
@@ -42,7 +43,7 @@ pub fn prove_scatter(
     expert_of: &[u32],
     m: usize,
     n: usize,
-    rng: &mut impl ChallengeSource,
+    transcript: &mut Transcript,
 ) -> ScatterProof {
     let a = source_encodings(sel, m, n);
     let b: Vec<Goldilocks> = token_id
@@ -50,12 +51,17 @@ pub fn prove_scatter(
         .zip(expert_of.iter())
         .map(|(&t, &e)| Goldilocks::from_u64((t as usize * n + e as usize) as u64))
         .collect();
-    let perm = prove_permutation(&a, &b, rng);
+    let perm = prove_permutation(&a, &b, transcript);
     ScatterProof { perm }
 }
 
-pub fn verify_scatter(proof: &ScatterProof, _m: usize, _n: usize) -> bool {
-    verify_permutation(&proof.perm)
+pub fn verify_scatter(
+    proof: &ScatterProof,
+    _m: usize,
+    _n: usize,
+    transcript: &mut Transcript,
+) -> bool {
+    verify_permutation(&proof.perm, transcript)
 }
 
 #[cfg(test)]
@@ -73,7 +79,11 @@ mod tests {
         }
         let (token_id, expert_of) = scatter_forward(&sel, m, n);
         assert_eq!(token_id.len(), m * k);
-        let proof = prove_scatter(&sel, &token_id, &expert_of, m, n, &mut rng);
-        assert!(verify_scatter(&proof, m, n));
+        let mut tp = Transcript::new(b"zkie-scatter-test");
+        tp.absorb_u64(0x4242);
+        let proof = prove_scatter(&sel, &token_id, &expert_of, m, n, &mut tp);
+        let mut tv = Transcript::new(b"zkie-scatter-test");
+        tv.absorb_u64(0x4242);
+        assert!(verify_scatter(&proof, m, n, &mut tv));
     }
 }

@@ -3,6 +3,7 @@ use zkie_core::common::field::{Goldilocks, XorShift64};
 use zkie_core::common::fixed_point::{from_i64, to_i32, to_i64};
 use zkie_core::common::logup_gkr::prove_lookup_fractional;
 use zkie_core::common::sumcheck::prove_virtual;
+use zkie_core::common::transcript::Transcript;
 
 fn main() {
     let seq = 512usize;
@@ -48,22 +49,19 @@ fn main() {
     let rem: Vec<Goldilocks> = (0..seq * seq)
         .map(|ij| e[ij] * from_i64(1i64 << shift) - probs[ij] * sum[ij / seq])
         .collect();
-    let alpha = rng.field();
-    let beta = rng.field();
+    let mut t = Transcript::new(b"zkie-bench-softmax");
+    t.absorb_u64(0x9ABC);
+    let alpha = t.field();
+    let beta = t.field();
     let t0 = Instant::now();
-    let _lookup = prove_lookup_fractional(&indices, &e, &exp_table, alpha, beta, &mut rng);
-    let r_i: Vec<Goldilocks> = (0..seq.trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
+    let _lookup = prove_lookup_fractional(&indices, &e, &exp_table, alpha, beta, &mut t);
+    let r_i: Vec<Goldilocks> = t.field_vec(seq.trailing_zeros() as usize);
     let eq_i = zkie_core::common::mle::eq_evals(&r_i);
     let eq_b: Vec<Goldilocks> = (0..seq * seq).map(|idx| eq_i[idx / seq]).collect();
     let sum_claim = zkie_core::common::mle::eval(&sum, &r_i);
     let sum_mles: Vec<&[Goldilocks]> = vec![&eq_b, &e];
     let sum_terms = vec![(from_i64(1), vec![0usize, 1usize])];
-    let sum_ch: Vec<Goldilocks> = (0..(seq * seq).trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
-    let _sum_p = prove_virtual(&sum_mles, &sum_terms, sum_claim, &sum_ch);
+    let (_sum_p, _) = prove_virtual(&sum_mles, &sum_terms, sum_claim, &mut t);
     let dt = t0.elapsed();
     println!(
         "softmax seq={} table=2^{} shift={} time={:.2}s (exp lookup + row-sum; rescale omitted)",

@@ -9,7 +9,9 @@
 按依赖 DAG 分阶段推进，每完成一个 S 更新状态并停下 review。
 
 ### 阶段 A · 入口（可并行）
-- [ ] **S1 · Sumcheck 挑战顺序（P0）** — batch_open / sumcheck / virtual / fractional GKR 改为逐轮 transcript 派生挑战，轮数来自 statement 维度。
+- [x] **S1 · Sumcheck 挑战顺序（P0）** — batch_open / sumcheck / virtual / fractional GKR 改为逐轮 transcript 派生挑战，轮数来自 statement 维度。回归：`s1_forged_outer_sumcheck_rejected`（真实 WHIR opening + 伪造外层 sumcheck 拒绝）、`s1_round_count_rejected`、`transcript_challenges_bind_round_messages`、`virtual_transcript_binds_rounds_and_replays`。
+  - 注：fractional GKR 内层（k ≥ 1）的挑战向量是第 0 层逐轮派生向量的嵌套截断（保持层间 chain-check 良定义）；内层自身的逐轮绑定留待 S9 安全论证时复核。
+  - 注：`verify_lookup_split` 等函数的 alpha/beta 前导由调用方在 transcript 上重放（每个路径的前导不同）。
 - [ ] **S8 · 防 panic 健壮性（P1）** — proof 结构校验，禁止对不可信数据 assert/unwrap，参数从受信 statement 选取。
 
 ### 阶段 B · 原语与框架（依赖 A）

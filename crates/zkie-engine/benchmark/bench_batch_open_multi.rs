@@ -29,7 +29,7 @@ fn main() {
     // batch_open: multi-point-to-one-point reduction (1 sumcheck + 1 FRI open).
     let t1 = Instant::now();
     let mut r2 = XorShift64::new(99);
-    let ok = batch_open(&tensors, &points, &claimed, &mut r2);
+    let ok = batch_open(&tensors, &points, &claimed);
     let batch = t1.elapsed();
 
     println!("separate:   {n} commit+open (different points) = {separate:?}");

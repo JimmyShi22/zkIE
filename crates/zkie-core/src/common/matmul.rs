@@ -6,6 +6,7 @@
 //! the low bits.
 
 use crate::common::field::{Goldilocks, PrimeCharacteristicRing};
+use crate::common::transcript::Transcript;
 use crate::{common::mle, common::sumcheck, common::sumcheck::SumcheckProof};
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -14,6 +15,9 @@ pub struct MatmulProof {
     pub sumcheck: SumcheckProof,
 }
 
+/// Fiat-Shamir prove (S1): `u`/`v` are statement-bound claim points squeezed by
+/// the caller; the contraction-index sumcheck challenges are derived per-round
+/// from the sumcheck's own round messages and returned.
 pub fn prove(
     at: &[Goldilocks],
     b: &[Goldilocks],
@@ -23,14 +27,13 @@ pub fn prove(
     n: usize,
     u: &[Goldilocks],
     v: &[Goldilocks],
-    challenges: &[Goldilocks],
-) -> MatmulProof {
+    transcript: &mut Transcript,
+) -> (MatmulProof, Vec<Goldilocks>) {
     assert_eq!(at.len(), k * m);
     assert_eq!(b.len(), k * n);
     assert_eq!(c.len(), m * n);
     assert_eq!(u.len(), m.trailing_zeros() as usize);
     assert_eq!(v.len(), n.trailing_zeros() as usize);
-    assert_eq!(challenges.len(), k.trailing_zeros() as usize);
 
     let a_restricted = mle::partial_eval(at, u);
     let b_restricted = mle::partial_eval(b, v);
@@ -41,18 +44,19 @@ pub fn prove(
     c_point.extend_from_slice(u);
     let claimed = mle::eval(c, &c_point);
 
-    let sumcheck = sumcheck::prove(&a_restricted, &b_restricted, claimed, challenges);
-    MatmulProof { claimed, sumcheck }
+    let (sumcheck, challenges) = sumcheck::prove(&a_restricted, &b_restricted, claimed, transcript);
+    (MatmulProof { claimed, sumcheck }, challenges)
 }
 
-pub fn verify(proof: &MatmulProof, challenges: &[Goldilocks]) -> bool {
-    sumcheck::verify(
-        &proof.sumcheck,
-        proof.claimed,
-        challenges,
-        proof.sumcheck.f_eval,
-        proof.sumcheck.h_eval,
-    )
+/// Fiat-Shamir verify (S1): replay the sumcheck rounds, deriving the
+/// contraction-index challenges per-round. `num_rounds` is the statement-derived
+/// `k.trailing_zeros()`.
+pub fn verify(
+    proof: &MatmulProof,
+    num_rounds: usize,
+    transcript: &mut Transcript,
+) -> (bool, Vec<Goldilocks>) {
+    sumcheck::verify(&proof.sumcheck, proof.claimed, num_rounds, transcript)
 }
 
 /// Nested matmul reduction: prove `E = (A @ B) @ D` with the intermediate
@@ -60,6 +64,10 @@ pub fn verify(proof: &MatmulProof, challenges: &[Goldilocks]) -> bool {
 /// single-contraction sumchecks: step1 proves `E = C @ D` over `n` and leaves a
 /// claim `C(u, ch_n)`; step2 proves `C = A @ B` over `k` at that same point and
 /// leaves claims on `A` and `B`. Cost is O(n) + O(k) rounds, not O(m*k*n*l).
+///
+/// S1: step1 runs first on the transcript and its derived challenge vector
+/// `ch_n` becomes step2's claim point on `B`; step2's challenges `ch_k` are
+/// derived from step2's own rounds. Returns `(proof, ch_n, ch_k)`.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct MatmulChainProof {
     pub claimed: Goldilocks,
@@ -79,9 +87,8 @@ pub fn prove_chain(
     l: usize,
     u: &[Goldilocks],
     l_pt: &[Goldilocks],
-    ch_n: &[Goldilocks],
-    ch_k: &[Goldilocks],
-) -> MatmulChainProof {
+    transcript: &mut Transcript,
+) -> (MatmulChainProof, Vec<Goldilocks>, Vec<Goldilocks>) {
     assert_eq!(at.len(), k * m);
     assert_eq!(b.len(), k * n);
     assert_eq!(c.len(), m * n);
@@ -93,30 +100,38 @@ pub fn prove_chain(
             ct[j * m + i] = c[i * n + j];
         }
     }
-    let step1 = prove(&ct, d, e, m, n, l, u, l_pt, ch_n);
-    let step2 = prove(at, b, c, m, k, n, u, ch_n, ch_k);
-    MatmulChainProof {
-        claimed: step1.claimed,
-        step1,
-        step2,
-    }
+    let (step1, ch_n) = prove(&ct, d, e, m, n, l, u, l_pt, transcript);
+    let (step2, ch_k) = prove(at, b, c, m, k, n, u, &ch_n, transcript);
+    (
+        MatmulChainProof {
+            claimed: step1.claimed,
+            step1,
+            step2,
+        },
+        ch_n,
+        ch_k,
+    )
 }
 
+/// Fiat-Shamir verify: replay step1 then step2 in the prover's transcript order.
 pub fn verify_chain(
     proof: &MatmulChainProof,
-    ch_n: &[Goldilocks],
-    ch_k: &[Goldilocks],
-) -> bool {
-    if !verify(&proof.step2, ch_k) {
-        return false;
+    n_rounds: usize,
+    k_rounds: usize,
+    transcript: &mut Transcript,
+) -> (bool, Vec<Goldilocks>, Vec<Goldilocks>) {
+    let (ok1, ch_n) = verify(&proof.step1, n_rounds, transcript);
+    if !ok1 {
+        return (false, ch_n, Vec::new());
     }
-    verify(&proof.step1, ch_n)
+    let (ok2, ch_k) = verify(&proof.step2, k_rounds, transcript);
+    (ok1 && ok2, ch_n, ch_k)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::field::XorShift64;
+    use crate::common::field::{XorShift64, ChallengeSource};
 
     fn mm(a: &[Goldilocks], b: &[Goldilocks], m: usize, k: usize, n: usize) -> Vec<Goldilocks> {
         let mut c = vec![Goldilocks::ZERO; m * n];
@@ -152,32 +167,58 @@ mod tests {
         let c = mm(&a, &b, m, k, n);
         let e = mm(&c, &d, m, n, l);
         let at = transpose(&a, m, k);
-        let u: Vec<Goldilocks> = (0..m.trailing_zeros() as usize)
-            .map(|_| rng.field())
-            .collect();
-        let l_pt: Vec<Goldilocks> = (0..l.trailing_zeros() as usize)
-            .map(|_| rng.field())
-            .collect();
-        let ch_n: Vec<Goldilocks> = (0..n.trailing_zeros() as usize)
-            .map(|_| rng.field())
-            .collect();
-        let ch_k: Vec<Goldilocks> = (0..k.trailing_zeros() as usize)
-            .map(|_| rng.field())
-            .collect();
-        let mut proof = prove_chain(&at, &b, &c, &d, &e, m, k, n, l, &u, &l_pt, &ch_n, &ch_k);
+
+        let mut tp = Transcript::new(b"zkie-matmul-test");
+        tp.absorb_u64(1);
+        let u: Vec<Goldilocks> = (0..m.trailing_zeros() as usize).map(|_| tp.field()).collect();
+        let l_pt: Vec<Goldilocks> = (0..l.trailing_zeros() as usize).map(|_| tp.field()).collect();
+        let (proof, ch_n, ch_k) = prove_chain(&at, &b, &c, &d, &e, m, k, n, l, &u, &l_pt, &mut tp);
+
+        let mut tv = Transcript::new(b"zkie-matmul-test");
+        tv.absorb_u64(1);
+        for _ in 0..m.trailing_zeros() {
+            tv.field();
+        }
+        for _ in 0..l.trailing_zeros() {
+            tv.field();
+        }
+        let (ok, ch_n_v, ch_k_v) = verify_chain(
+            &proof,
+            n.trailing_zeros() as usize,
+            k.trailing_zeros() as usize,
+            &mut tv,
+        );
+        assert!(ok);
+        assert_eq!(ch_n_v, ch_n);
+        assert_eq!(ch_k_v, ch_k);
 
         let mut p_ak = ch_k.clone();
         p_ak.extend_from_slice(&u);
-        let a_eval = crate::common::mle::eval(&a, &p_ak); // A[u][ch_k]
+        let _a_eval = crate::common::mle::eval(&a, &p_ak); // A[u][ch_k]
         let mut p_b = ch_n.clone();
         p_b.extend_from_slice(&ch_k);
-        let b_eval = crate::common::mle::eval(&b, &p_b); // B[ch_k][ch_n]
+        let _b_eval = crate::common::mle::eval(&b, &p_b); // B[ch_k][ch_n]
         let mut p_d = l_pt.clone();
         p_d.extend_from_slice(&ch_n);
-        let d_eval = crate::common::mle::eval(&d, &p_d); // D[ch_n][l_pt]
+        let _d_eval = crate::common::mle::eval(&d, &p_d); // D[ch_n][l_pt]
 
-        assert!(verify_chain(&proof, &ch_n, &ch_k));
-        proof.step2.claimed = proof.step2.claimed + Goldilocks::ONE;
-        assert!(!verify_chain(&proof, &ch_n, &ch_k));
+        // tamper the claimed value -> reject
+        let mut bad = proof;
+        bad.step2.claimed = bad.step2.claimed + Goldilocks::ONE;
+        let mut tv2 = Transcript::new(b"zkie-matmul-test");
+        tv2.absorb_u64(1);
+        for _ in 0..m.trailing_zeros() {
+            tv2.field();
+        }
+        for _ in 0..l.trailing_zeros() {
+            tv2.field();
+        }
+        let (ok2, _, _) = verify_chain(
+            &bad,
+            n.trailing_zeros() as usize,
+            k.trailing_zeros() as usize,
+            &mut tv2,
+        );
+        assert!(!ok2);
     }
 }

@@ -18,12 +18,13 @@ fn main() {
     let c = dense(&a, &b, m, k, n);
     let at = transpose(&a, m, k);
 
-    let u: Vec<Goldilocks> = (0..m.trailing_zeros()).map(|_| rng.field()).collect();
-    let v: Vec<Goldilocks> = (0..n.trailing_zeros()).map(|_| rng.field()).collect();
-    let challenges: Vec<Goldilocks> = (0..k.trailing_zeros()).map(|_| rng.field()).collect();
-
+    let mut t = zkie_core::common::transcript::Transcript::new(b"zkie-bench-matmul");
+    t.absorb_u64(0xfeed);
+    let u: Vec<Goldilocks> = t.field_vec(m.trailing_zeros() as usize);
+    let v: Vec<Goldilocks> = t.field_vec(n.trailing_zeros() as usize);
+    
     let t0 = std::time::Instant::now();
-    let proof = matmul::prove(&at, &b, &c, m, k, n, &u, &v, &challenges);
+    let (proof, challenges) = matmul::prove(&at, &b, &c, m, k, n, &u, &v, &mut t);
     let prove_secs = t0.elapsed().as_secs_f64();
 
     let mut f_point = u.clone();
@@ -32,7 +33,12 @@ fn main() {
     let mut h_point = v.clone();
     h_point.extend_from_slice(&challenges);
     let h_eval = mle::eval(&b, &h_point);
-    assert!(matmul::verify(&proof, &challenges));
+    let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-bench-matmul");
+    tv.absorb_u64(0xfeed);
+    for _ in 0..m.trailing_zeros() { let _ = tv.field(); }
+    for _ in 0..n.trailing_zeros() { let _ = tv.field(); }
+    let (ok, _) = matmul::verify(&proof, k.trailing_zeros() as usize, &mut tv);
+    assert!(ok);
 
     let gkr_field_ops = m * k + k * n + 6 * k;
     let halo2_rows = m * n * (k + 184);

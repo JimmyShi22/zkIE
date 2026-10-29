@@ -57,7 +57,7 @@ fn main() {
     let commit_t = t0.elapsed();
 
     let t1 = std::time::Instant::now();
-    let proof = prove_committed_shard_dag(&mut store, &ops, 176, &whir, &cached, &mut rng, tokens, t);
+    let proof = prove_committed_shard_dag(&mut store, &ops, 176, &whir, &cached, tokens, t);
     let prove_t = t1.elapsed();
 
     let t2 = std::time::Instant::now();

@@ -3,6 +3,7 @@ use zkie_core::common::field::{Goldilocks, XorShift64};
 use zkie_core::common::fixed_point::{from_i64, to_i64};
 use zkie_core::common::matmul::prove as matmul_prove;
 use zkie_core::common::sumcheck::prove_virtual;
+use zkie_core::common::transcript::Transcript;
 
 fn matmul(a: &[Goldilocks], b: &[Goldilocks], m: usize, k: usize, n: usize) -> Vec<Goldilocks> {
     let mut h = vec![from_i64(0); m * n];
@@ -26,10 +27,6 @@ fn transpose(a: &[Goldilocks], m: usize, k: usize) -> Vec<Goldilocks> {
         }
     }
     at
-}
-
-fn chs(rng: &mut XorShift64, n: usize) -> Vec<Goldilocks> {
-    (0..n).map(|_| rng.field()).collect()
 }
 
 fn main() {
@@ -73,20 +70,21 @@ fn main() {
     let attn = matmul(&probs, &v, m, m, d);
     let qt = transpose(&q, m, d);
     let pt = transpose(&probs, m, m);
-    let ch9 = chs(&mut rng, m.trailing_zeros() as usize);
-    let ch10 = chs(&mut rng, d.trailing_zeros() as usize);
+    let mut t = Transcript::new(b"zkie-bench-attention");
+    t.absorb_u64(0x5678);
     let t0 = Instant::now();
-    let _scores_p = matmul_prove(&qt, &kt, &scores, m, d, m, &ch9, &ch9, &ch10);
-    let _attn_p = matmul_prove(&pt, &v, &attn, m, m, d, &ch9, &ch10, &ch9);
-    let eq_i = zkie_core::common::mle::eq_evals(&ch9);
+    let ch9: Vec<Goldilocks> = t.field_vec(m.trailing_zeros() as usize);
+    let ch10: Vec<Goldilocks> = t.field_vec(d.trailing_zeros() as usize);
+    let (_scores_p, _) = matmul_prove(&qt, &kt, &scores, m, d, m, &ch9, &ch9, &mut t);
+    let ch9b: Vec<Goldilocks> = t.field_vec(m.trailing_zeros() as usize);
+    let ch10b: Vec<Goldilocks> = t.field_vec(d.trailing_zeros() as usize);
+    let (_attn_p, _) = matmul_prove(&pt, &v, &attn, m, m, d, &ch9b, &ch10b, &mut t);
+    let eq_i = zkie_core::common::mle::eq_evals(&ch9b);
     let eq_b: Vec<Goldilocks> = (0..m * m).map(|idx| eq_i[idx / m]).collect();
-    let sum_claim = zkie_core::common::mle::eval(&sum, &ch9);
+    let sum_claim = zkie_core::common::mle::eval(&sum, &ch9b);
     let sum_mles: Vec<&[Goldilocks]> = vec![&eq_b, &scores];
     let sum_terms = vec![(from_i64(1), vec![0usize, 1usize])];
-    let sum_ch: Vec<Goldilocks> = (0..(m * m).trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
-    let _sum_p = prove_virtual(&sum_mles, &sum_terms, sum_claim, &sum_ch);
+    let (_sum_p, _) = prove_virtual(&sum_mles, &sum_terms, sum_claim, &mut t);
     let dt = t0.elapsed();
     println!(
         "attention m={} d={} shift={} proving={:.2}s (2 matmul GKR + softmax row-sum)",

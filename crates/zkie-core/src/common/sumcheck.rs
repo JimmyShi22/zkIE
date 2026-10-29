@@ -1,10 +1,19 @@
-//! Sum-check protocol for a product of two multilinear polynomials.
+//! Sum-check protocols over products of multilinear polynomials.
 //!
-//! Proves `H = sum_{x in {0,1}^t} f(x) * h(x)`. Each round polynomial has
-//! degree at most two, so the prover sends three coefficients per round.
+//! All production entry points are Fiat-Shamir transcript-driven (S1): the
+//! claim is absorbed, each round message is absorbed, and the round challenge
+//! is squeezed from the transcript AFTER that round's message, never before.
+//! The verifier replays the same interleaving against the proof's round
+//! messages, and the round count always comes from statement-derived
+//! dimensions supplied by the caller (`num_rounds`), never from the proof.
+//!
+//! The `*_with_challenges` variants keep the old caller-supplied-challenge
+//! signatures. They are TEST/BENCHMARK ONLY — production paths must use the
+//! transcript versions.
 
 use crate::common::field::{Field, Goldilocks, PrimeCharacteristicRing};
 use crate::common::fixed_point::from_i64;
+use crate::common::transcript::Transcript;
 use rayon::prelude::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -30,52 +39,35 @@ pub struct SumcheckProof {
 
 const INV2: Goldilocks = Goldilocks::new(crate::common::field::P / 2 + 1); // (p + 1) / 2
 
-pub fn prove(
-    f: &[Goldilocks],
-    h: &[Goldilocks],
-    _claimed_sum: Goldilocks,
-    #[allow(unused_variables)] challenges: &[Goldilocks],
-) -> SumcheckProof {
-    let t = f.len().trailing_zeros() as usize;
-    assert_eq!(f.len(), 1 << t, "f length must be a power of two");
-    assert_eq!(h.len(), f.len());
-    assert_eq!(challenges.len(), t);
+/// Absorb a degree-2 round message (the three coefficients) into the transcript.
+fn absorb_round_poly(t: &mut Transcript, rp: &RoundPoly) {
+    t.absorb_field(rp.c0);
+    t.absorb_field(rp.c1);
+    t.absorb_field(rp.c2);
+}
 
-    let mut f_buf = f.to_vec();
-    let mut h_buf = h.to_vec();
-    let mut rounds = Vec::with_capacity(t);
-
-    for r in challenges.iter().copied() {
-        let half = f_buf.len() / 2;
-        let mut y0 = Goldilocks::ZERO;
-        let mut y1 = Goldilocks::ZERO;
-        let mut y2 = Goldilocks::ZERO;
-        for s in 0..half {
-            let f0 = f_buf[2 * s];
-            let f1 = f_buf[2 * s + 1];
-            let h0 = h_buf[2 * s];
-            let h1 = h_buf[2 * s + 1];
-            y0 = y0 + f0 * h0;
-            y1 = y1 + f1 * h1;
-            let f2 = Goldilocks::TWO * f1 - f0;
-            let h2 = Goldilocks::TWO * h1 - h0;
-            y2 = y2 + f2 * h2;
-        }
-
-        let c0 = y0;
-        let c1 = (Goldilocks::from_u64(4) * y1 - y2 - Goldilocks::from_u64(3) * y0) * INV2;
-        let c2 = (y2 - Goldilocks::TWO * y1 + y0) * INV2;
-        rounds.push(RoundPoly { c0, c1, c2 });
-
-        fold(&mut f_buf, r);
-        fold(&mut h_buf, r);
+/// Compute the degree-2 round polynomial of `sum_x f(x) * h(x)` from the
+/// current (folded) buffers.
+fn round_poly(f_buf: &[Goldilocks], h_buf: &[Goldilocks]) -> RoundPoly {
+    let half = f_buf.len() / 2;
+    let mut y0 = Goldilocks::ZERO;
+    let mut y1 = Goldilocks::ZERO;
+    let mut y2 = Goldilocks::ZERO;
+    for s in 0..half {
+        let f0 = f_buf[2 * s];
+        let f1 = f_buf[2 * s + 1];
+        let h0 = h_buf[2 * s];
+        let h1 = h_buf[2 * s + 1];
+        y0 = y0 + f0 * h0;
+        y1 = y1 + f1 * h1;
+        let f2 = Goldilocks::TWO * f1 - f0;
+        let h2 = Goldilocks::TWO * h1 - h0;
+        y2 = y2 + f2 * h2;
     }
-
-    SumcheckProof {
-        rounds,
-        f_eval: f_buf[0],
-        h_eval: h_buf[0],
-    }
+    let c0 = y0;
+    let c1 = (Goldilocks::from_u64(4) * y1 - y2 - Goldilocks::from_u64(3) * y0) * INV2;
+    let c2 = (y2 - Goldilocks::TWO * y1 + y0) * INV2;
+    RoundPoly { c0, c1, c2 }
 }
 
 fn fold(buf: &mut Vec<Goldilocks>, p: Goldilocks) {
@@ -88,10 +80,108 @@ fn fold(buf: &mut Vec<Goldilocks>, p: Goldilocks) {
     buf.truncate(half);
 }
 
+/// Fiat-Shamir prove of `sum_{x in {0,1}^t} f(x) * h(x) == claimed_sum`.
+/// Returns the proof and the assembled challenge point.
+pub fn prove(
+    f: &[Goldilocks],
+    h: &[Goldilocks],
+    claimed_sum: Goldilocks,
+    transcript: &mut Transcript,
+) -> (SumcheckProof, Vec<Goldilocks>) {
+    let t = f.len().trailing_zeros() as usize;
+    assert_eq!(f.len(), 1 << t, "f length must be a power of two");
+    assert_eq!(h.len(), f.len());
+
+    transcript.absorb_field(claimed_sum);
+    let mut f_buf = f.to_vec();
+    let mut h_buf = h.to_vec();
+    let mut rounds = Vec::with_capacity(t);
+    let mut challenges = Vec::with_capacity(t);
+    for _ in 0..t {
+        let rp = round_poly(&f_buf, &h_buf);
+        rounds.push(rp);
+        absorb_round_poly(transcript, &rp);
+        let r = transcript.field();
+        challenges.push(r);
+        fold(&mut f_buf, r);
+        fold(&mut h_buf, r);
+    }
+
+    (
+        SumcheckProof {
+            rounds,
+            f_eval: f_buf[0],
+            h_eval: h_buf[0],
+        },
+        challenges,
+    )
+}
+
+/// Fiat-Shamir verify: replay the round messages, deriving each challenge after
+/// absorbing its round. `num_rounds` is the statement-derived arity. The final
+/// eval pair is carried by the proof and authenticated by the caller's openings.
 pub fn verify(
     proof: &SumcheckProof,
     claimed_sum: Goldilocks,
-    #[allow(unused_variables)] challenges: &[Goldilocks],
+    num_rounds: usize,
+    transcript: &mut Transcript,
+) -> (bool, Vec<Goldilocks>) {
+    if proof.rounds.len() != num_rounds {
+        return (false, Vec::new());
+    }
+    transcript.absorb_field(claimed_sum);
+    let mut prev = claimed_sum;
+    let mut challenges = Vec::with_capacity(num_rounds);
+    for rp in &proof.rounds {
+        absorb_round_poly(transcript, rp);
+        let r = transcript.field();
+        challenges.push(r);
+        let p0 = rp.c0;
+        let p1 = rp.c0 + rp.c1 + rp.c2;
+        if p0 + p1 != prev {
+            return (false, challenges);
+        }
+        prev = rp.eval(r);
+    }
+    (prev == proof.f_eval * proof.h_eval, challenges)
+}
+
+/// TEST/BENCHMARK ONLY: prove with caller-supplied challenges (no transcript
+/// binding). Production paths must use the transcript version [`prove`].
+pub fn prove_with_challenges(
+    f: &[Goldilocks],
+    h: &[Goldilocks],
+    _claimed_sum: Goldilocks,
+    challenges: &[Goldilocks],
+) -> SumcheckProof {
+    let t = f.len().trailing_zeros() as usize;
+    assert_eq!(f.len(), 1 << t, "f length must be a power of two");
+    assert_eq!(h.len(), f.len());
+    assert_eq!(challenges.len(), t);
+
+    let mut f_buf = f.to_vec();
+    let mut h_buf = h.to_vec();
+    let mut rounds = Vec::with_capacity(t);
+
+    for r in challenges.iter().copied() {
+        let rp = round_poly(&f_buf, &h_buf);
+        rounds.push(rp);
+        fold(&mut f_buf, r);
+        fold(&mut h_buf, r);
+    }
+
+    SumcheckProof {
+        rounds,
+        f_eval: f_buf[0],
+        h_eval: h_buf[0],
+    }
+}
+
+/// TEST/BENCHMARK ONLY: verify with caller-supplied challenges.
+pub fn verify_with_challenges(
+    proof: &SumcheckProof,
+    claimed_sum: Goldilocks,
+    challenges: &[Goldilocks],
     f_eval: Goldilocks,
     h_eval: Goldilocks,
 ) -> bool {
@@ -158,13 +248,14 @@ fn interpolate_cubic(p0: Goldilocks, p1: Goldilocks, p2: Goldilocks, p3: Goldilo
     RoundPoly3 { c0, c1, c2, c3 }
 }
 
-/// Sum-check for `H = sum_{x in {0,1}^t} f(x) * g(x) * h(x)`.
-pub fn prove3(
+/// TEST/BENCHMARK ONLY: sum-check for `H = sum_{x in {0,1}^t} f(x) g(x) h(x)`
+/// with caller-supplied challenges. No production callers; kept for tests.
+pub fn prove3_with_challenges(
     f: &[Goldilocks],
     g: &[Goldilocks],
     h: &[Goldilocks],
     _claimed_sum: Goldilocks,
-    #[allow(unused_variables)] challenges: &[Goldilocks],
+    challenges: &[Goldilocks],
 ) -> SumcheckProof3 {
     let t = f.len().trailing_zeros() as usize;
     assert_eq!(f.len(), 1 << t, "f length must be a power of two");
@@ -208,10 +299,11 @@ pub fn prove3(
     }
 }
 
-pub fn verify3(
+/// TEST/BENCHMARK ONLY: verify with caller-supplied challenges.
+pub fn verify3_with_challenges(
     proof: &SumcheckProof3,
     claimed_sum: Goldilocks,
-    #[allow(unused_variables)] challenges: &[Goldilocks],
+    challenges: &[Goldilocks],
     f_eval: Goldilocks,
     g_eval: Goldilocks,
     h_eval: Goldilocks,
@@ -239,12 +331,101 @@ pub struct SumcheckProofBatch {
     pub b_eval: Goldilocks,
 }
 
-/// Prove `sum_x sum_i weights[i][x] * values[i][x] == claimed_sum`.
+/// Compute the degree-2 round polynomial of `sum_x sum_i w_i(x) * v_i(x)` from
+/// the current (folded) buffers.
+fn round_poly_batch(w_bufs: &[Vec<Goldilocks>], v_bufs: &[Vec<Goldilocks>]) -> RoundPoly {
+    let n = w_bufs.len();
+    let half = w_bufs[0].len() / 2;
+    let mut p0 = Goldilocks::ZERO;
+    let mut p1 = Goldilocks::ZERO;
+    let mut p2 = Goldilocks::ZERO;
+    for i in 0..n {
+        let w = &w_bufs[i];
+        let v = &v_bufs[i];
+        for s in 0..half {
+            let (w0, w1) = (w[2 * s], w[2 * s + 1]);
+            let (v0, v1) = (v[2 * s], v[2 * s + 1]);
+            p0 = p0 + w0 * v0;
+            p1 = p1 + w1 * v1;
+            let w2 = Goldilocks::TWO * w1 - w0;
+            let v2 = Goldilocks::TWO * v1 - v0;
+            p2 = p2 + w2 * v2;
+        }
+    }
+    let c0 = p0;
+    let c1 = (Goldilocks::from_u64(4) * p1 - p2 - Goldilocks::from_u64(3) * p0) * INV2;
+    let c2 = (p2 - Goldilocks::TWO * p1 + p0) * INV2;
+    RoundPoly { c0, c1, c2 }
+}
+
+/// Fiat-Shamir prove of `sum_x sum_i weights[i][x] * values[i][x] == claimed_sum`.
+/// Returns the proof and the assembled challenge point.
 pub fn prove_sum_of_products(
     weights: &[Vec<Goldilocks>],
     values: &[Vec<Goldilocks>],
     claimed_sum: Goldilocks,
-    #[allow(unused_variables)] challenges: &[Goldilocks],
+    transcript: &mut Transcript,
+) -> (SumcheckProofBatch, Vec<Goldilocks>) {
+    let n = weights.len();
+    assert!(n > 0, "empty batch");
+    assert_eq!(values.len(), n);
+    let t = weights[0].len().trailing_zeros() as usize;
+
+    transcript.absorb_field(claimed_sum);
+    let mut w_bufs = weights.to_vec();
+    let mut v_bufs = values.to_vec();
+    let mut rounds = Vec::with_capacity(t);
+    let mut challenges = Vec::with_capacity(t);
+    for _ in 0..t {
+        let rp = round_poly_batch(&w_bufs, &v_bufs);
+        rounds.push(rp);
+        absorb_round_poly(transcript, &rp);
+        let r = transcript.field();
+        challenges.push(r);
+        for i in 0..n {
+            fold(&mut w_bufs[i], r);
+            fold(&mut v_bufs[i], r);
+        }
+    }
+    let b_eval = (0..n).fold(Goldilocks::ZERO, |acc, i| acc + w_bufs[i][0] * v_bufs[i][0]);
+    (SumcheckProofBatch { rounds, b_eval }, challenges)
+}
+
+/// Fiat-Shamir verify of the sum-of-products sumcheck. `num_rounds` is the
+/// statement-derived arity. Checks the round chain against the proof's
+/// `b_eval`; binding `b_eval` to the opened evaluations is the caller's job.
+pub fn verify_sum_of_products(
+    proof: &SumcheckProofBatch,
+    claimed_sum: Goldilocks,
+    num_rounds: usize,
+    transcript: &mut Transcript,
+) -> (bool, Vec<Goldilocks>) {
+    if proof.rounds.len() != num_rounds {
+        return (false, Vec::new());
+    }
+    transcript.absorb_field(claimed_sum);
+    let mut prev = claimed_sum;
+    let mut challenges = Vec::with_capacity(num_rounds);
+    for rp in &proof.rounds {
+        absorb_round_poly(transcript, rp);
+        let r = transcript.field();
+        challenges.push(r);
+        let p0 = rp.c0;
+        let p1 = rp.c0 + rp.c1 + rp.c2;
+        if p0 + p1 != prev {
+            return (false, challenges);
+        }
+        prev = rp.eval(r);
+    }
+    (prev == proof.b_eval, challenges)
+}
+
+/// TEST/BENCHMARK ONLY: prove with caller-supplied challenges.
+pub fn prove_sum_of_products_with_challenges(
+    weights: &[Vec<Goldilocks>],
+    values: &[Vec<Goldilocks>],
+    _claimed_sum: Goldilocks,
+    challenges: &[Goldilocks],
 ) -> SumcheckProofBatch {
     let n = weights.len();
     assert!(n > 0, "empty batch");
@@ -255,27 +436,8 @@ pub fn prove_sum_of_products(
     let mut v_bufs = values.to_vec();
     let mut rounds = Vec::with_capacity(t);
     for &r in challenges {
-        let half = w_bufs[0].len() / 2;
-        let mut p0 = Goldilocks::ZERO;
-        let mut p1 = Goldilocks::ZERO;
-        let mut p2 = Goldilocks::ZERO;
-        for i in 0..n {
-            let w = &w_bufs[i];
-            let v = &v_bufs[i];
-            for s in 0..half {
-                let (w0, w1) = (w[2 * s], w[2 * s + 1]);
-                let (v0, v1) = (v[2 * s], v[2 * s + 1]);
-                p0 = p0 + w0 * v0;
-                p1 = p1 + w1 * v1;
-                let w2 = Goldilocks::TWO * w1 - w0;
-                let v2 = Goldilocks::TWO * v1 - v0;
-                p2 = p2 + w2 * v2;
-            }
-        }
-        let c0 = p0;
-        let c1 = (Goldilocks::from_u64(4) * p1 - p2 - Goldilocks::from_u64(3) * p0) * INV2;
-        let c2 = (p2 - Goldilocks::TWO * p1 + p0) * INV2;
-        rounds.push(RoundPoly { c0, c1, c2 });
+        let rp = round_poly_batch(&w_bufs, &v_bufs);
+        rounds.push(rp);
         for i in 0..n {
             fold(&mut w_bufs[i], r);
             fold(&mut v_bufs[i], r);
@@ -285,12 +447,11 @@ pub fn prove_sum_of_products(
     SumcheckProofBatch { rounds, b_eval }
 }
 
-/// Verify the sum-of-products sumcheck. `expected_b_eval` is the independent
-/// recomputation of `B(r)` from the opened `f_i(r)` values.
-pub fn verify_sum_of_products(
+/// TEST/BENCHMARK ONLY: verify with caller-supplied challenges.
+pub fn verify_sum_of_products_with_challenges(
     proof: &SumcheckProofBatch,
     claimed_sum: Goldilocks,
-    #[allow(unused_variables)] challenges: &[Goldilocks],
+    challenges: &[Goldilocks],
     expected_b_eval: Goldilocks,
 ) -> bool {
     if proof.rounds.len() != challenges.len() {
@@ -312,6 +473,7 @@ pub fn verify_sum_of_products(
 mod tests {
     use super::*;
     use crate::common::field::XorShift64;
+    use crate::common::mle;
 
     #[test]
     fn sumcheck_completeness_and_soundness() {
@@ -325,13 +487,13 @@ mod tests {
             .fold(Goldilocks::ZERO, |acc, (&a, &b)| acc + a * b);
         let challenges: Vec<Goldilocks> = (0..t).map(|_| rng.field()).collect();
 
-        let proof = prove(&f, &h, true_sum, &challenges);
-        let f_eval = crate::common::mle::eval(&f, &challenges);
-        let h_eval = crate::common::mle::eval(&h, &challenges);
-        assert!(verify(&proof, true_sum, &challenges, f_eval, h_eval));
+        let proof = prove_with_challenges(&f, &h, true_sum, &challenges);
+        let f_eval = mle::eval(&f, &challenges);
+        let h_eval = mle::eval(&h, &challenges);
+        assert!(verify_with_challenges(&proof, true_sum, &challenges, f_eval, h_eval));
 
         let wrong = true_sum + Goldilocks::ONE;
-        assert!(!verify(&proof, wrong, &challenges, f_eval, h_eval));
+        assert!(!verify_with_challenges(&proof, wrong, &challenges, f_eval, h_eval));
     }
 
     #[test]
@@ -348,11 +510,11 @@ mod tests {
             .fold(Goldilocks::ZERO, |acc, ((&a, &b), &c)| acc + a * b * c);
         let challenges: Vec<Goldilocks> = (0..t).map(|_| rng.field()).collect();
 
-        let proof = prove3(&f, &g, &h, true_sum, &challenges);
-        let f_eval = crate::common::mle::eval(&f, &challenges);
-        let g_eval = crate::common::mle::eval(&g, &challenges);
-        let h_eval = crate::common::mle::eval(&h, &challenges);
-        assert!(verify3(
+        let proof = prove3_with_challenges(&f, &g, &h, true_sum, &challenges);
+        let f_eval = mle::eval(&f, &challenges);
+        let g_eval = mle::eval(&g, &challenges);
+        let h_eval = mle::eval(&h, &challenges);
+        assert!(verify3_with_challenges(
             &proof,
             true_sum,
             &challenges,
@@ -362,7 +524,93 @@ mod tests {
         ));
 
         let wrong = true_sum + Goldilocks::ONE;
-        assert!(!verify3(&proof, wrong, &challenges, f_eval, g_eval, h_eval));
+        assert!(!verify3_with_challenges(
+            &proof,
+            wrong,
+            &challenges,
+            f_eval,
+            g_eval,
+            h_eval
+        ));
+    }
+
+    /// S1: the prover's assembled challenges replay exactly on the verifier
+    /// side, and tampering with any round message changes the subsequently
+    /// derived challenges.
+    #[test]
+    fn transcript_challenges_bind_round_messages() {
+        let mut rng = XorShift64::new(0x51);
+        let t = 8;
+        let f: Vec<Goldilocks> = (0..(1 << t)).map(|_| rng.field()).collect();
+        let h: Vec<Goldilocks> = (0..(1 << t)).map(|_| rng.field()).collect();
+        let true_sum: Goldilocks = f
+            .iter()
+            .zip(&h)
+            .fold(Goldilocks::ZERO, |acc, (&a, &b)| acc + a * b);
+
+        let mut tp = Transcript::new(b"zkie-sumcheck-test");
+        tp.absorb_u64(7); // statement
+        let (proof, challenges) = prove(&f, &h, true_sum, &mut tp);
+
+        // Honest replay: same challenges, accepted.
+        let mut tv = Transcript::new(b"zkie-sumcheck-test");
+        tv.absorb_u64(7);
+        let (ok, derived) = verify(&proof, true_sum, t, &mut tv);
+        assert!(ok);
+        assert_eq!(derived, challenges);
+
+        // Tamper round 0 -> the derived challenge vector must change.
+        let mut tampered = proof.clone();
+        tampered.rounds[0].c0 = tampered.rounds[0].c0 + Goldilocks::ONE;
+        let mut tv2 = Transcript::new(b"zkie-sumcheck-test");
+        tv2.absorb_u64(7);
+        let (_ok2, derived2) = verify(&tampered, true_sum, t, &mut tv2);
+        assert_ne!(derived2, derived);
+
+        // Tamper the last round -> only earlier-derived challenges may match;
+        // the full vector must differ.
+        let mut tampered_last = proof.clone();
+        let n = tampered_last.rounds.len();
+        tampered_last.rounds[n - 1].c0 = tampered_last.rounds[n - 1].c0 + Goldilocks::ONE;
+        let mut tv3 = Transcript::new(b"zkie-sumcheck-test");
+        tv3.absorb_u64(7);
+        let (_ok3, derived3) = verify(&tampered_last, true_sum, t, &mut tv3);
+        assert_ne!(derived3, derived);
+        assert_eq!(derived3[..n - 1], derived[..n - 1]);
+    }
+
+    /// S1/S8: the round count is enforced against the statement dimension.
+    #[test]
+    fn transcript_round_count_enforced() {
+        let mut rng = XorShift64::new(0x52);
+        let t = 6;
+        let f: Vec<Goldilocks> = (0..(1 << t)).map(|_| rng.field()).collect();
+        let h: Vec<Goldilocks> = (0..(1 << t)).map(|_| rng.field()).collect();
+        let true_sum: Goldilocks = f
+            .iter()
+            .zip(&h)
+            .fold(Goldilocks::ZERO, |acc, (&a, &b)| acc + a * b);
+
+        let mut tp = Transcript::new(b"zkie-sumcheck-test");
+        tp.absorb_u64(8);
+        let (proof, _) = prove(&f, &h, true_sum, &mut tp);
+
+        let mut empty = proof.clone();
+        empty.rounds.clear();
+        let mut short = proof.clone();
+        short.rounds.pop();
+        let mut long = proof.clone();
+        let last = *long.rounds.last().unwrap();
+        long.rounds.push(last);
+
+        // The statement dimension stays t: any other round count in the proof
+        // must be rejected by the length guard.
+        for p in [&empty, &short, &long] {
+            let mut tv = Transcript::new(b"zkie-sumcheck-test");
+            tv.absorb_u64(8);
+            let (ok, _) = verify(p, true_sum, t, &mut tv);
+            assert!(!ok);
+        }
     }
 }
 
@@ -370,12 +618,160 @@ mod tests {
 /// A sum of products of multilinear polynomials: g(x) = sum_i coeff_i * prod_{j in term_i} f_j(x).
 /// Proves sum_{x in {0,1}^t} g(x) = claimed with a single sumcheck whose round
 /// polynomial has degree max_i |term_i|.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct VirtualProof {
     pub rounds: Vec<Vec<Goldilocks>>,
     pub final_evals: Vec<Goldilocks>,
 }
+
+/// Absorb a virtual-sumcheck's round messages (max_deg+1 coefficients each) so
+/// later challenges bind them. Used by the fractional GKR for inner layers
+/// whose challenge vectors are the nested restrictions of the previous layer's
+/// transcript-derived vector.
+pub fn absorb_virtual_rounds(t: &mut Transcript, rounds: &[Vec<Goldilocks>]) {
+    for r in rounds {
+        for &p in r {
+            t.absorb_field(p);
+        }
+    }
+}
+
+/// Fiat-Shamir prove of the virtual polynomial sumcheck. Returns the proof and
+/// the assembled challenge point.
 pub fn prove_virtual(
+    mles: &[&[Goldilocks]],
+    terms: &[(Goldilocks, Vec<usize>)],
+    claimed: Goldilocks,
+    transcript: &mut Transcript,
+) -> (VirtualProof, Vec<Goldilocks>) {
+    let n = mles[0].len();
+    let t = n.trailing_zeros() as usize;
+    assert!(n.is_power_of_two());
+    for m in mles {
+        assert_eq!(m.len(), n);
+    }
+    let max_deg = terms.iter().map(|(_, idxs)| idxs.len()).max().unwrap_or(0);
+
+    transcript.absorb_field(claimed);
+    let mut bufs: Vec<Vec<Goldilocks>> = mles.iter().map(|m| m.to_vec()).collect();
+    let mut rounds = Vec::with_capacity(t);
+    let mut challenges = Vec::with_capacity(t);
+    for _ in 0..t {
+        let half = bufs[0].len() / 2;
+        let pvals: Vec<Goldilocks> = (0..half)
+            .into_par_iter()
+            .map(|s| {
+                let mut p = vec![Goldilocks::ZERO; max_deg + 1];
+                for (coeff, idxs) in terms {
+                    for k in 0..=max_deg {
+                        let mut prod = *coeff;
+                        for &j in idxs {
+                            let f0 = bufs[j][2 * s];
+                            let f1 = bufs[j][2 * s + 1];
+                            let fk = from_i64(k as i64) * f1 - from_i64(k as i64 - 1) * f0;
+                            prod = prod * fk;
+                        }
+                        p[k] = p[k] + prod;
+                    }
+                }
+                p
+            })
+            .reduce(
+                || vec![Goldilocks::ZERO; max_deg + 1],
+                |mut a, b| {
+                    for i in 0..=max_deg {
+                        a[i] = a[i] + b[i];
+                    }
+                    a
+                },
+            );
+        for &p in &pvals {
+            transcript.absorb_field(p);
+        }
+        rounds.push(pvals);
+        let r = transcript.field();
+        challenges.push(r);
+        bufs.par_iter_mut().for_each(|buf| {
+            for s in 0..half {
+                let f0 = buf[2 * s];
+                let f1 = buf[2 * s + 1];
+                buf[s] = (Goldilocks::ONE - r) * f0 + r * f1;
+            }
+            buf.truncate(half);
+        });
+    }
+    let final_evals = bufs.iter().map(|b| b[0]).collect();
+    (VirtualProof { rounds, final_evals }, challenges)
+}
+
+fn interpolate(vals: &[Goldilocks], x: Goldilocks, d: usize) -> Goldilocks {
+    let mut out = Goldilocks::ZERO;
+    for k in 0..=d {
+        let mut term = vals[k];
+        for j in 0..=d {
+            if j != k {
+                let num = x - from_i64(j as i64);
+                let den = from_i64(k as i64) - from_i64(j as i64);
+                term = term * num * den.inverse();
+            }
+        }
+        out = out + term;
+    }
+    out
+}
+
+/// Fiat-Shamir verify of the virtual sumcheck: replay the round messages,
+/// deriving each challenge after absorbing its round. Returns
+/// `(rounds_ok, challenges, final_claim)` where `final_claim` is the value the
+/// caller must match against the virtual polynomial evaluated at `challenges`
+/// (via [`virtual_eval`]) using either independently recomputed evaluations or
+/// the opening-bound evals carried by the proof.
+pub fn verify_virtual(
+    proof: &VirtualProof,
+    terms: &[(Goldilocks, Vec<usize>)],
+    claimed: Goldilocks,
+    num_rounds: usize,
+    transcript: &mut Transcript,
+) -> (bool, Vec<Goldilocks>, Goldilocks) {
+    let max_deg = terms.iter().map(|(_, idxs)| idxs.len()).max().unwrap_or(0);
+    if proof.rounds.len() != num_rounds {
+        return (false, Vec::new(), Goldilocks::ZERO);
+    }
+    transcript.absorb_field(claimed);
+    let mut current = claimed;
+    let mut challenges = Vec::with_capacity(num_rounds);
+    for pvals in &proof.rounds {
+        if pvals.len() != max_deg + 1 {
+            return (false, challenges, Goldilocks::ZERO);
+        }
+        for &p in pvals {
+            transcript.absorb_field(p);
+        }
+        let r = transcript.field();
+        challenges.push(r);
+        if pvals[0] + pvals[1] != current {
+            return (false, challenges, Goldilocks::ZERO);
+        }
+        current = interpolate(pvals, r, max_deg);
+    }
+    (true, challenges, current)
+}
+
+/// Evaluate a virtual polynomial `sum_i coeff_i * prod_{j in term_i} evals[j]`.
+pub fn virtual_eval(terms: &[(Goldilocks, Vec<usize>)], evals: &[Goldilocks]) -> Goldilocks {
+    let mut out = Goldilocks::ZERO;
+    for (coeff, idxs) in terms {
+        let mut prod = *coeff;
+        for &j in idxs {
+            prod = prod * evals[j];
+        }
+        out = out + prod;
+    }
+    out
+}
+
+/// TEST/BENCHMARK ONLY: prove with caller-supplied challenges.
+pub fn prove_virtual_with_challenges(
     mles: &[&[Goldilocks]],
     terms: &[(Goldilocks, Vec<usize>)],
     claimed: Goldilocks,
@@ -436,22 +832,9 @@ pub fn prove_virtual(
         final_evals,
     }
 }
-fn interpolate(vals: &[Goldilocks], x: Goldilocks, d: usize) -> Goldilocks {
-    let mut out = Goldilocks::ZERO;
-    for k in 0..=d {
-        let mut term = vals[k];
-        for j in 0..=d {
-            if j != k {
-                let num = x - from_i64(j as i64);
-                let den = from_i64(k as i64) - from_i64(j as i64);
-                term = term * num * den.inverse();
-            }
-        }
-        out = out + term;
-    }
-    out
-}
-pub fn verify_virtual(
+
+/// TEST/BENCHMARK ONLY: verify with caller-supplied challenges.
+pub fn verify_virtual_with_challenges(
     proof: &VirtualProof,
     terms: &[(Goldilocks, Vec<usize>)],
     claimed: Goldilocks,
@@ -472,21 +855,15 @@ pub fn verify_virtual(
         }
         current = interpolate(pvals, r, max_deg);
     }
-    let mut final_val = Goldilocks::ZERO;
-    for (coeff, idxs) in terms {
-        let mut prod = *coeff;
-        for &j in idxs {
-            prod = prod * final_evals[j];
-        }
-        final_val = final_val + prod;
-    }
-    current == final_val
+    current == virtual_eval(terms, final_evals)
 }
 
 #[cfg(test)]
 mod virtual_tests {
     use super::*;
     use crate::common::field::XorShift64;
+    use crate::common::mle;
+
     #[test]
     fn virtual_sumcheck_roundtrip() {
         let mut rng = XorShift64::new(0xBEEF);
@@ -509,12 +886,12 @@ mod virtual_tests {
             })
             .sum();
         let mles: Vec<&[Goldilocks]> = vec![&f, &g, &h];
-        let proof = prove_virtual(&mles, &terms, claimed, &challenges);
+        let proof = prove_virtual_with_challenges(&mles, &terms, claimed, &challenges);
         for (m, &ev) in mles.iter().zip(&proof.final_evals) {
-            let ev2 = crate::common::mle::eval(m, &challenges);
+            let ev2 = mle::eval(m, &challenges);
             assert_eq!(ev, ev2);
         }
-        assert!(verify_virtual(
+        assert!(verify_virtual_with_challenges(
             &proof,
             &terms,
             claimed,
@@ -523,8 +900,15 @@ mod virtual_tests {
         ));
         let mut bad = proof.final_evals.clone();
         bad[0] = bad[0] + Goldilocks::ONE;
-        assert!(!verify_virtual(&proof, &terms, claimed, &challenges, &bad));
+        assert!(!verify_virtual_with_challenges(
+            &proof,
+            &terms,
+            claimed,
+            &challenges,
+            &bad
+        ));
     }
+
     #[test]
     fn eq_weighted_sumcheck() {
         let mut rng = XorShift64::new(0xC0DE);
@@ -532,18 +916,79 @@ mod virtual_tests {
         let f: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
         let t = n.trailing_zeros() as usize;
         let r: Vec<Goldilocks> = (0..t).map(|_| rng.field()).collect();
-        let eq: Vec<Goldilocks> = crate::common::mle::eq_evals(&r);
-        let claimed = crate::common::mle::eval(&f, &r);
+        let eq: Vec<Goldilocks> = mle::eq_evals(&r);
+        let claimed = mle::eval(&f, &r);
         let mles: Vec<&[Goldilocks]> = vec![&eq, &f];
         let terms = vec![(Goldilocks::ONE, vec![0usize, 1])];
         let challenges: Vec<Goldilocks> = r.clone();
-        let proof = prove_virtual(&mles, &terms, claimed, &challenges);
-        assert!(verify_virtual(
+        let proof = prove_virtual_with_challenges(&mles, &terms, claimed, &challenges);
+        assert!(verify_virtual_with_challenges(
             &proof,
             &terms,
             claimed,
             &challenges,
             &proof.final_evals
         ));
+    }
+
+    /// S1: transcript replay matches the prover's challenges; tampering with any
+    /// round message changes the subsequently derived challenges; the final
+    /// claim matches the independently evaluated virtual polynomial.
+    #[test]
+    fn virtual_transcript_binds_rounds_and_replays() {
+        let mut rng = XorShift64::new(0x5152);
+        let n = 1usize << 6;
+        let t = n.trailing_zeros() as usize;
+        let f: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let g: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let h: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let terms: Vec<(Goldilocks, Vec<usize>)> = vec![
+            (Goldilocks::from_u64(3), vec![0, 1]),
+            (from_i64(-2), vec![1, 2]),
+            (Goldilocks::ONE, vec![0, 1, 2]),
+        ];
+        let claimed: Goldilocks = (0..n)
+            .map(|i| {
+                Goldilocks::from_u64(3) * f[i] * g[i]
+                    + from_i64(-2) * g[i] * h[i]
+                    + f[i] * g[i] * h[i]
+            })
+            .sum();
+        let mles: Vec<&[Goldilocks]> = vec![&f, &g, &h];
+
+        let mut tp = Transcript::new(b"zkie-virtual-test");
+        tp.absorb_u64(9);
+        let (proof, challenges) = prove_virtual(&mles, &terms, claimed, &mut tp);
+
+        // Honest replay: same challenges, final claim matches direct evaluation.
+        let mut tv = Transcript::new(b"zkie-virtual-test");
+        tv.absorb_u64(9);
+        let (ok, derived, final_claim) = verify_virtual(&proof, &terms, claimed, t, &mut tv);
+        assert!(ok);
+        assert_eq!(derived, challenges);
+        let fe: Vec<Goldilocks> = mles.iter().map(|m| mle::eval(m, &challenges)).collect();
+        assert_eq!(final_claim, virtual_eval(&terms, &fe));
+
+        // Tamper a round message -> derived challenges change.
+        let mut tampered = proof.clone();
+        tampered.rounds[0][0] = tampered.rounds[0][0] + Goldilocks::ONE;
+        let mut tv2 = Transcript::new(b"zkie-virtual-test");
+        tv2.absorb_u64(9);
+        let (_ok2, derived2, _fc2) = verify_virtual(&tampered, &terms, claimed, t, &mut tv2);
+        assert_ne!(derived2, derived);
+
+        // Wrong round count -> rejected (the statement dimension stays t).
+        let mut short = proof.clone();
+        short.rounds.pop();
+        let mut tv3 = Transcript::new(b"zkie-virtual-test");
+        tv3.absorb_u64(9);
+        let (ok3, _, _) = verify_virtual(&short, &terms, claimed, t, &mut tv3);
+        assert!(!ok3);
+        let mut long = proof.clone();
+        long.rounds.push(long.rounds.last().unwrap().clone());
+        let mut tv4 = Transcript::new(b"zkie-virtual-test");
+        tv4.absorb_u64(9);
+        let (ok4, _, _) = verify_virtual(&long, &terms, claimed, t, &mut tv4);
+        assert!(!ok4);
     }
 }

@@ -18,7 +18,8 @@ use zkie_core::common::logup_gkr::{
     prove_lookup_fractional, verify_lookup_fractional, FractionalProof,
 };
 use zkie_core::common::mle;
-use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
+use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, virtual_eval, VirtualProof};
+use zkie_core::common::transcript::Transcript;
 
 fn round_div(a: i64, b: i64) -> i64 {
     let q = a.div_euclid(b);
@@ -134,7 +135,7 @@ pub fn prove_rope(
     m: usize,
     d: usize,
     shift: u32,
-    rng: &mut impl ChallengeSource,
+    transcript: &mut Transcript,
 ) -> (RoPEProof, Vec<Goldilocks>, Vec<Goldilocks>) {
     let heads = heads_of(x.len(), m, d);
     let (_out, rem_f, rem_s) = rope_forward(x, cos, sin, m, d, shift);
@@ -151,9 +152,6 @@ pub fn prove_rope(
     let two_shift = Goldilocks::from_u64(1u64 << shift);
     let half = Goldilocks::from_u64(1u64 << (shift - 1));
 
-    let r_f: Vec<Goldilocks> = (0..n.trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
     let first_terms = vec![
         (Goldilocks::ONE, vec![0usize, 1usize]),
         (neg, vec![2usize, 3usize]),
@@ -162,11 +160,8 @@ pub fn prove_rope(
         (half, vec![6usize]),
     ];
     let first_mles: Vec<&[Goldilocks]> = vec![&x_f, &cos_b, &x_s, &sin_b, &out_f, &rem_f, &ones];
-    let first = prove_virtual(&first_mles, &first_terms, Goldilocks::ZERO, &r_f);
+    let (first, r_f) = prove_virtual(&first_mles, &first_terms, Goldilocks::ZERO, transcript);
 
-    let r_s: Vec<Goldilocks> = (0..n.trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
     let second_terms = vec![
         (Goldilocks::ONE, vec![0usize, 1usize]),
         (Goldilocks::ONE, vec![2usize, 3usize]),
@@ -175,11 +170,9 @@ pub fn prove_rope(
         (half, vec![6usize]),
     ];
     let second_mles: Vec<&[Goldilocks]> = vec![&x_s, &cos_b, &x_f, &sin_b, &out_s, &rem_s, &ones];
-    let second = prove_virtual(&second_mles, &second_terms, Goldilocks::ZERO, &r_s);
+    let (second, r_s) = prove_virtual(&second_mles, &second_terms, Goldilocks::ZERO, transcript);
 
-    let r_out: Vec<Goldilocks> = (0..out.len().trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
+    let r_out: Vec<Goldilocks> = transcript.field_vec(out.len().trailing_zeros() as usize);
 
     (
         RoPEProof {
@@ -195,10 +188,14 @@ pub fn prove_rope(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn verify_rope(proof: &RoPEProof, shift: u32) -> bool {
+pub fn verify_rope(proof: &RoPEProof, shift: u32, transcript: &mut Transcript) -> bool {
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
     let two_shift = Goldilocks::from_u64(1u64 << shift);
     let half = Goldilocks::from_u64(1u64 << (shift - 1));
+
+    // The half-tensor arity is r_out.len() - 1 (r_out spans the full x tensor).
+    // TODO(S2): take this from the statement's op shapes instead.
+    let arity = proof.r_out.len().saturating_sub(1);
 
     let first_terms = vec![
         (Goldilocks::ONE, vec![0usize, 1usize]),
@@ -207,13 +204,14 @@ pub fn verify_rope(proof: &RoPEProof, shift: u32) -> bool {
         (neg, vec![5usize]),
         (half, vec![6usize]),
     ];
-    if !verify_virtual(
+    let (ok, r_f, fc) = verify_virtual(
         &proof.first,
         &first_terms,
         Goldilocks::ZERO,
-        &proof.r_first,
-        &proof.first.final_evals,
-    ) {
+        arity,
+        transcript,
+    );
+    if !ok || r_f != proof.r_first || fc != virtual_eval(&first_terms, &proof.first.final_evals) {
         return false;
     }
 
@@ -224,17 +222,19 @@ pub fn verify_rope(proof: &RoPEProof, shift: u32) -> bool {
         (neg, vec![5usize]),
         (half, vec![6usize]),
     ];
-    if !verify_virtual(
+    let (ok, r_s, fc) = verify_virtual(
         &proof.second,
         &second_terms,
         Goldilocks::ZERO,
-        &proof.r_second,
-        &proof.second.final_evals,
-    ) {
+        arity,
+        transcript,
+    );
+    if !ok || r_s != proof.r_second || fc != virtual_eval(&second_terms, &proof.second.final_evals) {
         return false;
     }
 
-    true
+    let r_out: Vec<Goldilocks> = transcript.field_vec(proof.r_out.len());
+    r_out == proof.r_out
 }
 
 #[cfg(test)]
@@ -255,8 +255,12 @@ mod tests {
         let cos: Vec<Goldilocks> = (0..m * half).map(|_| from_i64(65536)).collect();
         let sin: Vec<Goldilocks> = (0..m * half).map(|_| from_i64(0)).collect();
         let (out, _rf, _rs) = rope_forward(&x, &cos, &sin, m, d, shift);
-        let (proof, _rem_f, _rem_s) = prove_rope(&x, &cos, &sin, &out, m, d, shift, &mut rng);
-        assert!(verify_rope(&proof, shift));
+        let mut tp = Transcript::new(b"zkie-rope-test");
+        tp.absorb_u64(0x0D0D);
+        let (proof, _rem_f, _rem_s) = prove_rope(&x, &cos, &sin, &out, m, d, shift, &mut tp);
+        let mut tv = Transcript::new(b"zkie-rope-test");
+        tv.absorb_u64(0x0D0D);
+        assert!(verify_rope(&proof, shift, &mut tv));
         assert_eq!(out.len(), m * heads * d);
     }
 }

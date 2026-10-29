@@ -18,7 +18,9 @@ fn main() {
         .map(|idx| e[idx] * sum[idx / n].inverse())
         .collect();
     let t0 = Instant::now();
-    let _proof = prove_softmax_scaled(&indices, &e, &out, &table, m, n, &mut rng);
+    let mut t = zkie_core::common::transcript::Transcript::new(b"zkie-bench-softmax-scaled");
+    t.absorb_u64(0xBEEF);
+    let _proof = prove_softmax_scaled(&indices, &e, &out, &table, m, n, &mut t);
     let dt = t0.elapsed();
     println!(
         "softmax-scaled m={} n={} table=2^18 time={:.2}s (exp lookup + row-sum + rescale, O(m*n))",

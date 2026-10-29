@@ -10,7 +10,8 @@ use zkie_core::common::logup_gkr::{
     FractionalProof,
 };
 use zkie_core::common::matmul::{prove as matmul_prove, verify as matmul_verify, MatmulProof};
-use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
+use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, virtual_eval, VirtualProof};
+use zkie_core::common::transcript::Transcript;
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ProjectionProof {
     pub matmul: MatmulProof,
@@ -51,25 +52,21 @@ pub fn prove_projection(
     k: usize,
     n: usize,
     shift: u32,
-    rng: &mut impl ChallengeSource,
+    transcript: &mut Transcript,
 ) -> ProjectionProof {
     let half = Goldilocks::from_u64(1u64 << (shift - 1));
     let two_shift = Goldilocks::from_u64(1u64 << shift);
     let h = matmul_full(x, w, m, k, n);
     let wt = transpose(x, m, k);
-    let u: Vec<Goldilocks> = (0..m.trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
-    let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
-    let ch: Vec<Goldilocks> = (0..k.trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
-    let matmul = matmul_prove(&wt, w, &h, m, k, n, &u, &v, &ch);
-    let mut pt = v.clone();
-    pt.extend_from_slice(&u);
-    let eq = zkie_core::common::mle::eq_evals(&pt);
+
+    // S1 ordering: the affine sumcheck runs FIRST. Its eq point is squeezed
+    // upfront (the eq table needs it), its challenge vector r_aff is derived
+    // per-round from its own messages, and r_aff becomes the matmul's claim
+    // point (u = high bits, v = low bits). That way the matmul's claimed
+    // eval of the virtual `h` sits exactly at the affine's final-check point.
+    let arity_mn = (m * n).trailing_zeros() as usize;
+    let q_aff: Vec<Goldilocks> = transcript.field_vec(arity_mn);
+    let eq = zkie_core::common::mle::eq_evals(&q_aff);
     let ones = vec![Goldilocks::from_u64(1); m * n];
     let neg = from_i64(-1);
     let terms = vec![
@@ -80,14 +77,22 @@ pub fn prove_projection(
         (neg * half, vec![0usize, 5usize]),
     ];
     let mles: Vec<&[Goldilocks]> = vec![&eq, &rem_off, &h, &out, &bias, &ones];
-    let affine = prove_virtual(&mles, &terms, Goldilocks::from_u64(0), &pt);
+    let (affine, r_aff) = prove_virtual(&mles, &terms, Goldilocks::from_u64(0), transcript);
+
+    let n_log = n.trailing_zeros() as usize;
+    let v: Vec<Goldilocks> = r_aff[..n_log].to_vec();
+    let u: Vec<Goldilocks> = r_aff[n_log..].to_vec();
+    let (matmul, ch) = matmul_prove(&wt, w, &h, m, k, n, &u, &v, transcript);
+    let mut pt = v.clone();
+    pt.extend_from_slice(&u);
+
     let table: Vec<Goldilocks> = (0..(1usize << shift))
         .map(|j| Goldilocks::from_u64(j as u64))
         .collect();
     let idx: Vec<u32> = rem_off.iter().map(|&vv| to_i32(vv) as u32).collect();
-    let alpha = rng.field();
-    let beta = rng.field();
-    let frac = prove_lookup_fractional(&idx, rem_off, &table, alpha, beta, rng);
+    let alpha = transcript.field();
+    let beta = transcript.field();
+    let frac = prove_lookup_fractional(&idx, rem_off, &table, alpha, beta, transcript);
     ProjectionProof {
         matmul,
         affine,
@@ -100,7 +105,15 @@ pub fn prove_projection(
         ch,
     }
 }
-pub fn verify_projection(proof: &ProjectionProof, shift: u32) -> bool {
+
+pub fn verify_projection(
+    proof: &ProjectionProof,
+    shift: u32,
+    m: usize,
+    k: usize,
+    n: usize,
+    transcript: &mut Transcript,
+) -> bool {
     let half = Goldilocks::from_u64(1u64 << (shift - 1));
     let two_shift = Goldilocks::from_u64(1u64 << shift);
     let neg = from_i64(-1);
@@ -111,21 +124,39 @@ pub fn verify_projection(proof: &ProjectionProof, shift: u32) -> bool {
         (neg * two_shift, vec![0usize, 4usize]),
         (neg * half, vec![0usize, 5usize]),
     ];
-    let mut fe = proof.affine.final_evals.clone();
-    fe[2] = proof.matmul.claimed;
-    if !verify_virtual(
+    let arity_mn = (m * n).trailing_zeros() as usize;
+    let _q_aff: Vec<Goldilocks> = transcript.field_vec(arity_mn); // advance state
+    let (ok, r_aff, fc) = verify_virtual(
         &proof.affine,
         &terms,
         Goldilocks::from_u64(0),
-        &proof.pt,
-        &fe,
-    ) {
+        arity_mn,
+        transcript,
+    );
+    if !ok || r_aff != proof.pt {
         return false;
     }
-    if !matmul_verify(&proof.matmul, &proof.ch) {
+    let n_log = n.trailing_zeros() as usize;
+    let v: Vec<Goldilocks> = r_aff[..n_log].to_vec();
+    let u: Vec<Goldilocks> = r_aff[n_log..].to_vec();
+    if u != proof.u || v != proof.v {
         return false;
     }
-    verify_lookup_fractional_chain(&proof.frac)
+    let (ok, ch) = matmul_verify(&proof.matmul, k.trailing_zeros() as usize, transcript);
+    if !ok || ch != proof.ch {
+        return false;
+    }
+    let mut fe = proof.affine.final_evals.clone();
+    // h is virtual: its eval at the affine's final-check point IS the
+    // matmul's claim (the matmul was proven at u/v = r_aff split).
+    fe[2] = proof.matmul.claimed;
+    if fc != virtual_eval(&terms, &fe) {
+        return false;
+    }
+    if transcript.field() != proof.alpha || transcript.field() != proof.beta {
+        return false;
+    }
+    verify_lookup_fractional_chain(&proof.frac, transcript)
 }
 #[cfg(test)]
 mod tests {
@@ -176,10 +207,16 @@ mod tests {
             assert!(to_i32(vv) >= 0 && to_i32(vv) < (1i32 << shift));
         }
         let _ = (half, two_shift);
-        let mut proof = prove_projection(&x, &w, &bias, &out, &rem_off, m, k, n, shift, &mut rng);
-        assert!(verify_projection(&proof, shift));
+        let mut tp = Transcript::new(b"zkie-projection-test");
+        tp.absorb_u64(0xABCD);
+        let mut proof = prove_projection(&x, &w, &bias, &out, &rem_off, m, k, n, shift, &mut tp);
+        let mut tv = Transcript::new(b"zkie-projection-test");
+        tv.absorb_u64(0xABCD);
+        assert!(verify_projection(&proof, shift, m, k, n, &mut tv));
         proof.frac.layers[0].proof.final_evals[3] += Goldilocks::from_u64(1);
-        assert!(!verify_projection(&proof, shift));
+        let mut tv2 = Transcript::new(b"zkie-projection-test");
+        tv2.absorb_u64(0xABCD);
+        assert!(!verify_projection(&proof, shift, m, k, n, &mut tv2));
     }
     #[test]
     fn committed_projection_roundtrip() {
@@ -232,16 +269,30 @@ mod tests {
                 at[kk * m + i] = x[i * k + kk];
             }
         }
-        let u: Vec<Goldilocks> = (0..m.trailing_zeros() as usize)
-            .map(|_| rng.field())
-            .collect();
-        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize)
-            .map(|_| rng.field())
-            .collect();
-        let ch: Vec<Goldilocks> = (0..k.trailing_zeros() as usize)
-            .map(|_| rng.field())
-            .collect();
-        let mm = mm_prove(&at, &w, &h, m, k, n, &u, &v, &ch);
+        let mut tp0 = Transcript::new(b"zkie-projection-committed-test");
+        tp0.absorb_u64(0xDD22);
+        let mut tp = tp0.clone();
+        // S1 order: the affine sumcheck runs first; its per-round-derived
+        // challenge vector r_aff becomes the matmul claim point.
+        let arity_mn = (m * n).trailing_zeros() as usize;
+        let q_aff: Vec<Goldilocks> = tp.field_vec(arity_mn);
+        let eq = zkie_core::common::mle::eq_evals(&q_aff);
+        let ones = vec![Goldilocks::from_u64(1); m * n];
+        let neg = from_i64(-1);
+        let terms = vec![
+            (Goldilocks::from_u64(1), vec![0usize, 1usize]),
+            (neg, vec![0usize, 2usize]),
+            (two_shift, vec![0usize, 3usize]),
+            (neg * two_shift, vec![0usize, 4usize]),
+            (neg * half, vec![0usize, 5usize]),
+        ];
+        let mles: Vec<&[Goldilocks]> = vec![&eq, &rem_off, &h, &out, &bias, &ones];
+        let (affine_proof, r_aff) =
+            zkie_core::common::sumcheck::prove_virtual(&mles, &terms, Goldilocks::from_u64(0), &mut tp);
+        let n_log = n.trailing_zeros() as usize;
+        let v: Vec<Goldilocks> = r_aff[..n_log].to_vec();
+        let u: Vec<Goldilocks> = r_aff[n_log..].to_vec();
+        let (mm, ch) = mm_prove(&at, &w, &h, m, k, n, &u, &v, &mut tp);
         let whir_km = Whir::new_testing((k * m).trailing_zeros() as usize);
         let whir_kn = Whir::new_testing((k * n).trailing_zeros() as usize);
         let whir_mn = Whir::new_testing((m * n).trailing_zeros() as usize);
@@ -270,66 +321,63 @@ mod tests {
             b_ev
         );
         assert_eq!(b_ev, zkie_core::common::mle::eval(&w, &bp));
-        assert!(mm_verify(&mm, &ch));
-        let mut pt = v.clone();
-        pt.extend_from_slice(&u);
-        let eq = zkie_core::common::mle::eq_evals(&pt);
-        let ones = vec![Goldilocks::from_u64(1); m * n];
-        let neg = from_i64(-1);
-        let terms = vec![
-            (Goldilocks::from_u64(1), vec![0usize, 1usize]),
-            (neg, vec![0usize, 2usize]),
-            (two_shift, vec![0usize, 3usize]),
-            (neg * two_shift, vec![0usize, 4usize]),
-            (neg * half, vec![0usize, 5usize]),
-        ];
-        let mles: Vec<&[Goldilocks]> = vec![&eq, &rem_off, &h, &out, &bias, &ones];
-        let affine_proof =
-            zkie_core::common::sumcheck::prove_virtual(&mles, &terms, Goldilocks::from_u64(0), &pt);
+        let mut tv = tp0.clone();
+        let _q: Vec<Goldilocks> = tv.field_vec(arity_mn);
+        // Replay the affine sumcheck: its per-round-derived challenge vector is
+        // the point where the committed mles must be opened for the final check
+        // and where the matmul claim on the virtual h sits.
+        let (ok, r_aff_v, fc) = zkie_core::common::sumcheck::verify_virtual(
+            &affine_proof,
+            &terms,
+            Goldilocks::from_u64(0),
+            arity_mn,
+            &mut tv,
+        );
+        assert!(ok);
+        assert_eq!(r_aff_v, r_aff);
+        let (ok, ch_v) = mm_verify(&mm, k.trailing_zeros() as usize, &mut tv);
+        assert!(ok);
+        assert_eq!(ch_v, ch);
+        assert_eq!(r_aff[..n_log].to_vec(), v);
+        assert_eq!(r_aff[n_log..].to_vec(), u);
         let rem_ev = {
-            let (o, e) = whir_mn.open(c_rem.prover_data.clone(), &c_rem.protocol, &pt);
+            let (o, e) = whir_mn.open(c_rem.prover_data.clone(), &c_rem.protocol, &r_aff);
             assert_eq!(
                 whir_mn
-                    .verify(&c_rem.commitment, &o, &c_rem.protocol, &pt)
+                    .verify(&c_rem.commitment, &o, &c_rem.protocol, &r_aff)
                     .unwrap(),
                 e
             );
             e
         };
         let out_ev = {
-            let (o, e) = whir_mn.open(c_out.prover_data.clone(), &c_out.protocol, &pt);
+            let (o, e) = whir_mn.open(c_out.prover_data.clone(), &c_out.protocol, &r_aff);
             assert_eq!(
                 whir_mn
-                    .verify(&c_out.commitment, &o, &c_out.protocol, &pt)
+                    .verify(&c_out.commitment, &o, &c_out.protocol, &r_aff)
                     .unwrap(),
                 e
             );
             e
         };
         let bias_ev = {
-            let (o, e) = whir_mn.open(c_bias.prover_data.clone(), &c_bias.protocol, &pt);
+            let (o, e) = whir_mn.open(c_bias.prover_data.clone(), &c_bias.protocol, &r_aff);
             assert_eq!(
                 whir_mn
-                    .verify(&c_bias.commitment, &o, &c_bias.protocol, &pt)
+                    .verify(&c_bias.commitment, &o, &c_bias.protocol, &r_aff)
                     .unwrap(),
                 e
             );
             e
         };
         let fe = vec![
-            zkie_core::common::mle::eval(&eq, &pt),
+            zkie_core::common::mle::eval(&eq, &r_aff),
             rem_ev,
             mm.claimed,
             out_ev,
             bias_ev,
-            zkie_core::common::mle::eval(&ones, &pt),
+            zkie_core::common::mle::eval(&ones, &r_aff),
         ];
-        assert!(zkie_core::common::sumcheck::verify_virtual(
-            &affine_proof,
-            &terms,
-            Goldilocks::from_u64(0),
-            &pt,
-            &fe
-        ));
+        assert_eq!(fc, zkie_core::common::sumcheck::virtual_eval(&terms, &fe));
     }
 }

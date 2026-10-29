@@ -82,14 +82,16 @@ fn main() {
         })
         .collect();
     let t0 = Instant::now();
+    let mut t = zkie_core::common::transcript::Transcript::new(b"zkie-bench-ffn");
+    t.absorb_u64(0x1234);
     let _fc_p = prove_projection(
-        &x, &fc_w, &fc_b, &fc, &fc_rem, m, hdim, ffn, shift, &mut rng,
+        &x, &fc_w, &fc_b, &fc, &fc_rem, m, hdim, ffn, shift, &mut t,
     );
-    let a_alpha = rng.field();
-    let a_beta = rng.field();
-    let _act_p = prove_lookup_fractional(&act_idx, &act, &gelu_table, a_alpha, a_beta, &mut rng);
+    let a_alpha = t.field();
+    let a_beta = t.field();
+    let _act_p = prove_lookup_fractional(&act_idx, &act, &gelu_table, a_alpha, a_beta, &mut t);
     let _proj_p = prove_projection(
-        &act, &proj_w, &proj_b, &proj, &proj_rem, m, ffn, hdim, shift, &mut rng,
+        &act, &proj_w, &proj_b, &proj, &proj_rem, m, ffn, hdim, shift, &mut t,
     );
     let dt = t0.elapsed();
     println!(

@@ -4,6 +4,7 @@ use zkie_core::common::fixed_point::{from_i64, to_i64};
 use zkie_core::common::logup_gkr::prove_lookup_fractional;
 use zkie_core::common::matmul;
 use zkie_core::common::sumcheck::prove_virtual;
+use zkie_core::common::transcript::Transcript;
 use zkie_ops::projection::prove_projection;
 use zkie_ops::softmax_scaled::prove_softmax_scaled;
 
@@ -128,34 +129,22 @@ fn main() {
     let (proj, proj_rem) = projection_fp(&act, &wproj, &bd, m, ffn, d, shift);
     let out: Vec<Goldilocks> = (0..m * d).map(|i| y[i] + proj[i]).collect();
 
+    let mut t = Transcript::new(b"zkie-bench-transformer");
+    t.absorb_u64(0x1234);
     let t0 = Instant::now();
-    let _ = prove_projection(&x, &wq, &bd, &q, &q_rem, m, d, d, shift, &mut rng);
-    let _ = prove_projection(&x, &wk, &bd, &k, &k_rem, m, d, d, shift, &mut rng);
-    let _ = prove_projection(&x, &wv, &bd, &v, &v_rem, m, d, d, shift, &mut rng);
+    let _ = prove_projection(&x, &wq, &bd, &q, &q_rem, m, d, d, shift, &mut t);
+    let _ = prove_projection(&x, &wk, &bd, &k, &k_rem, m, d, d, shift, &mut t);
+    let _ = prove_projection(&x, &wv, &bd, &v, &v_rem, m, d, d, shift, &mut t);
     let qt = transpose(&q, m, d);
-    let u: Vec<Goldilocks> = (0..m.trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
-    let vs: Vec<Goldilocks> = (0..m.trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
-    let ch: Vec<Goldilocks> = (0..d.trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
-    let _ = matmul::prove(&qt, &kt, &scores, m, d, m, &u, &vs, &ch);
-    let _ = prove_softmax_scaled(&indices, &e, &probs, &exp_table, m, m, &mut rng);
+    let u: Vec<Goldilocks> = t.field_vec(m.trailing_zeros() as usize);
+    let vs: Vec<Goldilocks> = t.field_vec(m.trailing_zeros() as usize);
+    let _ = matmul::prove(&qt, &kt, &scores, m, d, m, &u, &vs, &mut t);
+    let _ = prove_softmax_scaled(&indices, &e, &probs, &exp_table, m, m, &mut t);
     let pt = transpose(&probs, m, m);
-    let ch_v: Vec<Goldilocks> = (0..d.trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
-    let ch_m: Vec<Goldilocks> = (0..m.trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
-    let _ = matmul::prove(&pt, &v, &attn, m, m, d, &u, &ch_v, &ch_m);
-    let _ = prove_projection(&attn, &wo, &bd, &o, &o_rem, m, d, d, shift, &mut rng);
-    let r_add1: Vec<Goldilocks> = (0..(m * d).trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
+    let ch_v: Vec<Goldilocks> = t.field_vec(d.trailing_zeros() as usize);
+    let ch_m: Vec<Goldilocks> = t.field_vec(m.trailing_zeros() as usize);
+    let _ = matmul::prove(&pt, &v, &attn, m, m, d, &u, &ch_v, &mut t);
+    let _ = prove_projection(&attn, &wo, &bd, &o, &o_rem, m, d, d, shift, &mut t);
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
     let terms = vec![
         (Goldilocks::ONE, vec![2usize]),
@@ -163,24 +152,16 @@ fn main() {
         (neg, vec![1usize]),
     ];
     let mles: Vec<&[Goldilocks]> = vec![&x, &o, &y];
-    let _ = prove_virtual(&mles, &terms, Goldilocks::ZERO, &r_add1);
-    let _ = prove_projection(&y, &wfc, &bffn, &fc, &fc_rem, m, d, ffn, shift, &mut rng);
-    let _ = prove_lookup_fractional(
-        &gelu_idx,
-        &act,
-        &gelu_table,
-        rng.field(),
-        rng.field(),
-        &mut rng,
-    );
+    let _ = prove_virtual(&mles, &terms, Goldilocks::ZERO, &mut t);
+    let _ = prove_projection(&y, &wfc, &bffn, &fc, &fc_rem, m, d, ffn, shift, &mut t);
+    let alpha = t.field();
+    let beta = t.field();
+    let _ = prove_lookup_fractional(&gelu_idx, &act, &gelu_table, alpha, beta, &mut t);
     let _ = prove_projection(
-        &act, &wproj, &bd, &proj, &proj_rem, m, ffn, d, shift, &mut rng,
+        &act, &wproj, &bd, &proj, &proj_rem, m, ffn, d, shift, &mut t,
     );
-    let r_add2: Vec<Goldilocks> = (0..(m * d).trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
     let mles2: Vec<&[Goldilocks]> = vec![&y, &proj, &out];
-    let _ = prove_virtual(&mles2, &terms, Goldilocks::ZERO, &r_add2);
+    let _ = prove_virtual(&mles2, &terms, Goldilocks::ZERO, &mut t);
     let dt = t0.elapsed();
 
     println!(

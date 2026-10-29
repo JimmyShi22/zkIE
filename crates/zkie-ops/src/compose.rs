@@ -31,14 +31,14 @@ use zkie_core::common::logup_gkr::{
     prove_lookup_fractional, prove_lookup_fractional_batch, prove_lookup_fractional_columns,
     verify_lookup_fractional, verify_lookup_fractional_batch, verify_lookup_fractional_chain,
     build_lookup_table_num_den, build_perm_num_den, fractional_leaf, merge_multiplicity, pad_table,
-    prove_fractional_with_challenges, prove_lookup_table, prove_lookup_witness_batch_columns,
-    verify_lookup_split, FractionalProof,
+    prove_fractional, prove_lookup_table, prove_lookup_witness_batch_columns,
+    verify_fractional_chain_core, verify_lookup_split, FractionalProof,
 };
 use zkie_core::common::matmul::{prove as matmul_prove, verify as matmul_verify, MatmulProof};
 use zkie_core::common::batched_matmul::{self as bmm, BatchedMatmulProof};
 use zkie_core::common::mle;
 use zkie_core::common::same_poly::{prove_same_poly, verify_same_poly, SamePolyProof};
-use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
+use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, virtual_eval, VirtualProof};
 use zkie_core::common::transcript::Transcript;
 use zkie_core::common::weights_io::WeightMmap;
 
@@ -150,7 +150,7 @@ fn forward(
 pub fn prove_projection_chain(
     x: &[Goldilocks],
     steps: &[ProjectionStep],
-    rng: &mut impl ChallengeSource,
+    transcript: &mut Transcript,
 ) -> ProjectionChainProof {
     assert!(!steps.is_empty(), "chain needs at least one projection");
     let (ys, rems) = forward(x, steps);
@@ -159,7 +159,8 @@ pub fn prove_projection_chain(
     let mut prev = x;
     for (i, step) in steps.iter().enumerate() {
         let p = prove_projection(
-            prev, &step.w, &step.bias, &ys[i], &rems[i], step.m, step.k, step.n, step.shift, rng,
+            prev, &step.w, &step.bias, &ys[i], &rems[i], step.m, step.k, step.n, step.shift,
+            transcript,
         );
         step_proofs.push(p);
         prev = &ys[i];
@@ -176,7 +177,7 @@ pub fn prove_projection_chain(
             (out_pt.clone(), mle::eval(&ys[i], &out_pt)),
             (in_pt.clone(), mle::eval(&ys[i], &in_pt)),
         ];
-        binds.push(prove_same_poly(&ys[i], &claims, rng));
+        binds.push(prove_same_poly(&ys[i], &claims, transcript));
     }
 
     ProjectionChainProof {
@@ -191,6 +192,7 @@ pub fn verify_projection_chain(
     proof: &ProjectionChainProof,
     x: &[Goldilocks],
     steps: &[ProjectionStep],
+    transcript: &mut Transcript,
 ) -> bool {
     assert_eq!(proof.steps.len(), steps.len());
     assert_eq!(proof.binds.len(), steps.len().saturating_sub(1));
@@ -198,7 +200,7 @@ pub fn verify_projection_chain(
 
     let mut prev = x;
     for (i, step) in steps.iter().enumerate() {
-        if !verify_projection(&proof.steps[i], step.shift) {
+        if !verify_projection(&proof.steps[i], step.shift, step.m, step.k, step.n, transcript) {
             return false;
         }
         prev = &ys[i];
@@ -212,7 +214,7 @@ pub fn verify_projection_chain(
             (out_pt.clone(), mle::eval(&ys[i], &out_pt)),
             (in_pt.clone(), mle::eval(&ys[i], &in_pt)),
         ];
-        if verify_same_poly(&proof.binds[i - 1], &claims).is_none() {
+        if verify_same_poly(&proof.binds[i - 1], &claims, transcript).is_none() {
             return false;
         }
     }
@@ -235,7 +237,7 @@ pub fn prove_projection_sharded(
     x: &[Goldilocks],
     steps: &[ProjectionStep],
     ops_per_shard: usize,
-    rng: &mut impl ChallengeSource,
+    transcript: &mut Transcript,
 ) -> ProjectionShardedProof {
     assert!(!steps.is_empty(), "chain needs at least one projection");
     let ops_per_shard = ops_per_shard.max(1);
@@ -247,7 +249,9 @@ pub fn prove_projection_sharded(
     while start < steps.len() {
         let end = (start + ops_per_shard).min(steps.len());
         let input: &[Goldilocks] = if start == 0 { x } else { &ys[start - 1] };
-        shards.push(prove_projection_chain(input, &steps[start..end], rng));
+        let mut child = transcript.clone();
+        child.absorb_u64(shards.len() as u64);
+        shards.push(prove_projection_chain(input, &steps[start..end], &mut child));
         start = end;
         if start < steps.len() {
             boundary_steps.push(start - 1);
@@ -267,7 +271,7 @@ pub fn prove_projection_sharded(
             (out_pt.clone(), mle::eval(&ys[b], &out_pt)),
             (in_pt.clone(), mle::eval(&ys[b], &in_pt)),
         ];
-        cross_binds.push(prove_same_poly(&ys[b], &claims, rng));
+        cross_binds.push(prove_same_poly(&ys[b], &claims, transcript));
     }
 
     ProjectionShardedProof {
@@ -282,6 +286,7 @@ pub fn verify_projection_sharded(
     x: &[Goldilocks],
     steps: &[ProjectionStep],
     ops_per_shard: usize,
+    transcript: &mut Transcript,
 ) -> bool {
     let ops_per_shard = ops_per_shard.max(1);
     let (ys, _) = forward(x, steps);
@@ -291,7 +296,9 @@ pub fn verify_projection_sharded(
     while start < steps.len() {
         let end = (start + ops_per_shard).min(steps.len());
         let input: &[Goldilocks] = if start == 0 { x } else { &ys[start - 1] };
-        if !verify_projection_chain(&proof.shards[si], input, &steps[start..end]) {
+        let mut child = transcript.clone();
+        child.absorb_u64(si as u64);
+        if !verify_projection_chain(&proof.shards[si], input, &steps[start..end], &mut child) {
             return false;
         }
         si += 1;
@@ -313,7 +320,7 @@ pub fn verify_projection_sharded(
             (out_pt.clone(), mle::eval(&ys[b], &out_pt)),
             (in_pt.clone(), mle::eval(&ys[b], &in_pt)),
         ];
-        if verify_same_poly(&proof.cross_binds[ci], &claims).is_none() {
+        if verify_same_poly(&proof.cross_binds[ci], &claims, transcript).is_none() {
             return false;
         }
     }
@@ -364,7 +371,7 @@ fn residual_forward(
 pub fn prove_residual_chain(
     x: &[Goldilocks],
     steps: &[ProjectionStep],
-    rng: &mut impl ChallengeSource,
+    transcript: &mut Transcript,
 ) -> ResidualChainProof {
     assert!(!steps.is_empty(), "chain needs at least one block");
     let (xs, ps, rems) = residual_forward(x, steps);
@@ -373,7 +380,8 @@ pub fn prove_residual_chain(
     let mut proj = Vec::with_capacity(n);
     for (i, step) in steps.iter().enumerate() {
         proj.push(prove_projection(
-            &xs[i], &step.w, &step.bias, &ps[i], &rems[i], step.m, step.k, step.n, step.shift, rng,
+            &xs[i], &step.w, &step.bias, &ps[i], &rems[i], step.m, step.k, step.n, step.shift,
+            transcript,
         ));
     }
 
@@ -385,11 +393,8 @@ pub fn prove_residual_chain(
     ];
     let mut adds = Vec::with_capacity(n);
     for i in 0..n {
-        let r: Vec<Goldilocks> = (0..xs[i + 1].len().trailing_zeros() as usize)
-            .map(|_| rng.field())
-            .collect();
         let mles: Vec<&[Goldilocks]> = vec![&xs[i], &ps[i], &xs[i + 1]];
-        let proof = prove_virtual(&mles, &terms, Goldilocks::ZERO, &r);
+        let (proof, r) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
         adds.push((proof, r));
     }
 
@@ -409,7 +414,7 @@ pub fn prove_residual_chain(
         // x_i is the residual input of add_i (claimed at r_i).
         let r_i = adds[i].1.clone();
         claims.push((r_i.clone(), mle::eval(&xs[i], &r_i)));
-        same_x.push(prove_same_poly(&xs[i], &claims, rng));
+        same_x.push(prove_same_poly(&xs[i], &claims, transcript));
     }
 
     // Bind each p_i across projection out (pt_i) and residual in (r_i).
@@ -421,7 +426,7 @@ pub fn prove_residual_chain(
             (pt_i.clone(), mle::eval(&ps[i], &pt_i)),
             (r_i.clone(), mle::eval(&ps[i], &r_i)),
         ];
-        same_p.push(prove_same_poly(&ps[i], &claims, rng));
+        same_p.push(prove_same_poly(&ps[i], &claims, transcript));
     }
 
     ResidualChainProof {
@@ -436,6 +441,7 @@ pub fn verify_residual_chain(
     proof: &ResidualChainProof,
     x: &[Goldilocks],
     steps: &[ProjectionStep],
+    transcript: &mut Transcript,
 ) -> bool {
     assert_eq!(proof.proj.len(), steps.len());
     assert_eq!(proof.adds.len(), steps.len());
@@ -445,7 +451,7 @@ pub fn verify_residual_chain(
     let n = steps.len();
 
     for (i, step) in steps.iter().enumerate() {
-        if !verify_projection(&proof.proj[i], step.shift) {
+        if !verify_projection(&proof.proj[i], step.shift, step.m, step.k, step.n, transcript) {
             return false;
         }
     }
@@ -457,13 +463,22 @@ pub fn verify_residual_chain(
         (neg, vec![1usize]),
     ];
     for i in 0..n {
-        let r = &proof.adds[i].1;
+        let (ok, r, fc) = verify_virtual(
+            &proof.adds[i].0,
+            &terms,
+            Goldilocks::ZERO,
+            proof.adds[i].1.len(),
+            transcript,
+        );
+        if !ok || r != proof.adds[i].1 {
+            return false;
+        }
         let fe = vec![
-            mle::eval(&xs[i], r),
-            mle::eval(&ps[i], r),
-            mle::eval(&xs[i + 1], r),
+            mle::eval(&xs[i], &r),
+            mle::eval(&ps[i], &r),
+            mle::eval(&xs[i + 1], &r),
         ];
-        if !verify_virtual(&proof.adds[i].0, &terms, Goldilocks::ZERO, r, &fe) {
+        if fc != virtual_eval(&terms, &fe) {
             return false;
         }
     }
@@ -479,7 +494,7 @@ pub fn verify_residual_chain(
         claims.push((in_pt.clone(), mle::eval(&xs[i], &in_pt)));
         let r_i = proof.adds[i].1.clone();
         claims.push((r_i.clone(), mle::eval(&xs[i], &r_i)));
-        if verify_same_poly(&proof.same_x[i], &claims).is_none() {
+        if verify_same_poly(&proof.same_x[i], &claims, transcript).is_none() {
             return false;
         }
     }
@@ -491,7 +506,7 @@ pub fn verify_residual_chain(
             (pt_i.clone(), mle::eval(&ps[i], &pt_i)),
             (r_i.clone(), mle::eval(&ps[i], &r_i)),
         ];
-        if verify_same_poly(&proof.same_p[i], &claims).is_none() {
+        if verify_same_poly(&proof.same_p[i], &claims, transcript).is_none() {
             return false;
         }
     }
@@ -1590,20 +1605,22 @@ pub fn prove_shard(
     store: &mut Store,
     ops: &[Op],
     boundary: &[T],
-    rng: &mut impl ChallengeSource,
+    transcript: &mut Transcript,
 ) -> OpShardProof {
     forward_ops(store, ops);
-    prove_shard_precomputed(store, ops, boundary, rng)
+    prove_shard_precomputed(store, ops, boundary, transcript)
 }
 
 /// Prove a shard whose witness is already materialized in `store` (the forward
 /// pass has already run). Read-only on `store`, so shards can be proven in
-/// parallel by the shard-DAG composer.
+/// parallel by the shard-DAG composer. All challenges are Fiat-Shamir derived
+/// from the statement-absorbed transcript (S1): evaluation points are squeezed
+/// directly, sumcheck challenges per-round from the round messages.
 pub fn prove_shard_precomputed(
     store: &Store,
     ops: &[Op],
     boundary: &[T],
-    rng: &mut impl ChallengeSource,
+    transcript: &mut Transcript,
 ) -> OpShardProof {
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
     let add_terms = vec![
@@ -1642,7 +1659,7 @@ pub fn prove_shard_precomputed(
                     &store.idx[expert_of],
                     m,
                     n,
-                    rng,
+                    transcript,
                 );
                 op_proofs.push(OpProof::Scatter(p));
             }
@@ -1661,15 +1678,15 @@ pub fn prove_shard_precomputed(
                     store.get(out),
                     m,
                     h,
-                    rng,
+                    transcript,
                 );
                 op_proofs.push(OpProof::Gather(p));
             }
             Op::BatchedMatMul { a, w, c, s, k, n } => {
-                let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| rng.field()).collect();
-                let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
-                let ch: Vec<Goldilocks> = (0..(s * k).trailing_zeros() as usize).map(|_| rng.field()).collect();
-                let p = bmm::prove(store.get(a), store.get(w), store.get(c), s, k, n, &u, &v, &ch);
+                let u: Vec<Goldilocks> = transcript.field_vec(s.trailing_zeros() as usize);
+                let v: Vec<Goldilocks> = transcript.field_vec(n.trailing_zeros() as usize);
+                let (p, ch) =
+                    bmm::prove(store.get(a), store.get(w), store.get(c), s, k, n, &u, &v, transcript);
                 claims.push((a, ch.clone(), mle::eval(store.get(a), &ch)));
                 let mut wp = v.clone();
                 wp.extend_from_slice(&ch);
@@ -1680,11 +1697,10 @@ pub fn prove_shard_precomputed(
                 op_proofs.push(OpProof::BatchedMatMul(p, u, v, ch));
             }
             Op::GatherMatMul { a, expert_of, w, c, s, k, n, n_experts } => {
-                let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| rng.field()).collect();
-                let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
-                let ch: Vec<Goldilocks> = (0..(s * k).trailing_zeros() as usize).map(|_| rng.field()).collect();
+                let u: Vec<Goldilocks> = transcript.field_vec(s.trailing_zeros() as usize);
+                let v: Vec<Goldilocks> = transcript.field_vec(n.trailing_zeros() as usize);
                 let wv = store.materialize(w);
-                let p = bmm::prove_gather_matmul(
+                let (p, ch) = bmm::prove_gather_matmul(
                     store.get(a),
                     &store.idx[expert_of],
                     wv.as_ref(),
@@ -1695,7 +1711,7 @@ pub fn prove_shard_precomputed(
                     n_experts,
                     &u,
                     &v,
-                    &ch,
+                    transcript,
                 );
                 claims.push((a, ch.clone(), mle::eval(store.get(a), &ch)));
                 let mut cp = v.clone();
@@ -1724,16 +1740,10 @@ pub fn prove_shard_precomputed(
             Op::MatMul { a, b, c, m, k, n } => {
                 let at = transpose(store.get(a), m, k);
                 let bv = store.materialize(b);
-                let u: Vec<Goldilocks> = (0..m.trailing_zeros() as usize)
-                    .map(|_| rng.field())
-                    .collect();
-                let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize)
-                    .map(|_| rng.field())
-                    .collect();
-                let ch: Vec<Goldilocks> = (0..k.trailing_zeros() as usize)
-                    .map(|_| rng.field())
-                    .collect();
-                let p = matmul_prove(&at, bv.as_ref(), store.get(c), m, k, n, &u, &v, &ch);
+                let u: Vec<Goldilocks> = transcript.field_vec(m.trailing_zeros() as usize);
+                let v: Vec<Goldilocks> = transcript.field_vec(n.trailing_zeros() as usize);
+                let (p, ch) =
+                    matmul_prove(&at, bv.as_ref(), store.get(c), m, k, n, &u, &v, transcript);
                 let mut ap = ch.clone();
                 ap.extend_from_slice(&u);
                 claims.push((a, ap.clone(), mle::eval(store.get(a), &ap)));
@@ -1767,7 +1777,7 @@ pub fn prove_shard_precomputed(
                     k,
                     n,
                     shift,
-                    rng,
+                    transcript,
                 );
                 let mut in_pt = p.ch.clone();
                 in_pt.extend_from_slice(&p.u);
@@ -1780,11 +1790,8 @@ pub fn prove_shard_precomputed(
                 op_proofs.push(OpProof::Projection(p));
             }
             Op::Add { a, b, c } => {
-                let r: Vec<Goldilocks> = (0..store.get(c).len().trailing_zeros() as usize)
-                    .map(|_| rng.field())
-                    .collect();
                 let mles: Vec<&[Goldilocks]> = vec![store.get(a), store.get(b), store.get(c)];
-                let proof = prove_virtual(&mles, &add_terms, Goldilocks::ZERO, &r);
+                let (proof, r) = prove_virtual(&mles, &add_terms, Goldilocks::ZERO, transcript);
                 claims.push((a, r.clone(), mle::eval(store.get(a), &r)));
                 claims.push((b, r.clone(), mle::eval(store.get(b), &r)));
                 claims.push((c, r.clone(), mle::eval(store.get(c), &r)));
@@ -1812,7 +1819,7 @@ pub fn prove_shard_precomputed(
                     store.get(table),
                     m,
                     n,
-                    rng,
+                    transcript,
                 );
                 claims.push((
                     out,
@@ -1850,7 +1857,7 @@ pub fn prove_shard_precomputed(
                     store.get(rsqrt_table),
                     m,
                     d,
-                    rng,
+                    transcript,
                 );
                 lookup_by_table
                     .entry(rsqrt_table)
@@ -1879,7 +1886,7 @@ pub fn prove_shard_precomputed(
                     m,
                     d,
                     n_real,
-                    rng,
+                    transcript,
                 );
                 lookup_by_table
                     .entry(rsqrt_table)
@@ -1912,7 +1919,7 @@ pub fn prove_shard_precomputed(
                     m,
                     d,
                     n_real,
-                    rng,
+                    transcript,
                 );
                 lookup_by_table
                     .entry(rsqrt_table)
@@ -1950,7 +1957,7 @@ pub fn prove_shard_precomputed(
                     m,
                     d,
                     shift,
-                    rng,
+                    transcript,
                 );
                 let idx_f: Vec<u32> = rem_f.iter().map(|&v| to_i32(v) as u32).collect();
                 let idx_s: Vec<u32> = rem_s.iter().map(|&v| to_i32(v) as u32).collect();
@@ -1987,7 +1994,7 @@ pub fn prove_shard_precomputed(
                     n,
                     k,
                     22,
-                    rng,
+                    transcript,
                 );
                 claims.push((x, p.r.clone(), mle::eval(store.get(x), &p.r)));
                 claims.push((sel, p.r.clone(), mle::eval(store.get(sel), &p.r)));
@@ -2016,7 +2023,7 @@ pub fn prove_shard_precomputed(
                     m,
                     n,
                     16,
-                    rng,
+                    transcript,
                 );
                 claims.push((x, p.topk.r.clone(), mle::eval(store.get(x), &p.topk.r)));
                 claims.push((sel, p.topk.r.clone(), mle::eval(store.get(sel), &p.topk.r)));
@@ -2042,7 +2049,7 @@ pub fn prove_shard_precomputed(
         if boundary_set.contains(&t) || cs.len() < 2 {
             continue;
         }
-        let sp = prove_same_poly(store.get(t), &cs, rng);
+        let sp = prove_same_poly(store.get(t), &cs, transcript);
         bound.push(t);
         binds.push(sp);
     }
@@ -2050,14 +2057,15 @@ pub fn prove_shard_precomputed(
     let mut witness_columns = Vec::new();
     let mut table_columns = Vec::new();
     for (table, lookups) in &lookup_by_table {
-        let alpha = rng.field();
-        let beta = rng.field();
+        let alpha = transcript.field();
+        let beta = transcript.field();
         let xs: Vec<&[u32]> = lookups.iter().map(|(x, _)| x.as_slice()).collect();
         let ys: Vec<&[Goldilocks]> = lookups.iter().map(|(_, y)| y.as_slice()).collect();
-        let (proof, x, y, num, _den) = prove_lookup_witness_batch_columns(&xs, &ys, alpha, beta, rng);
+        let (proof, x, y, num, _den) =
+            prove_lookup_witness_batch_columns(&xs, &ys, alpha, beta, transcript);
         let (point, num_leaf, den_leaf) = fractional_leaf(&proof);
         let m = merge_multiplicity(&xs, store.get(*table).len());
-        let table_proof = prove_lookup_table(&m, store.get(*table), alpha, beta, rng);
+        let table_proof = prove_lookup_table(&m, store.get(*table), alpha, beta, transcript);
         let (point_t, num_leaf_t, den_leaf_t) = fractional_leaf(&table_proof);
         witness_columns.push(WitnessColumn {
             proof,
@@ -2094,13 +2102,26 @@ pub fn prove_shard_precomputed(
 }
 
 /// Verify a shard proof (recomputes the witness first).
-pub fn verify_shard(tables: &[&[Goldilocks]], ops: &[Op], proof: &OpShardProof) -> bool {
-    verify_shard_precomputed(tables, ops, proof)
+pub fn verify_shard(
+    tables: &[&[Goldilocks]],
+    ops: &[Op],
+    proof: &OpShardProof,
+    transcript: &mut Transcript,
+) -> bool {
+    verify_shard_precomputed(tables, ops, proof, transcript)
 }
 
 /// Verify a shard proof against an already-materialized witness store. Read-only
-/// on `store`, so shards can be verified in parallel.
-pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &OpShardProof) -> bool {
+/// on `store`, so shards can be verified in parallel. S1: the verifier replays
+/// the prover's transcript interleaving op by op — squeezing the same evaluation
+/// points (checked against the stored ones) and re-deriving every sumcheck
+/// challenge vector from the proof's round messages.
+pub fn verify_shard_precomputed(
+    tables: &[&[Goldilocks]],
+    ops: &[Op],
+    proof: &OpShardProof,
+    transcript: &mut Transcript,
+) -> bool {
     assert_eq!(proof.ops.len(), ops.len());
     assert_eq!(proof.bound.len(), proof.binds.len());
 
@@ -2122,22 +2143,34 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
             (Op::Scale { .. }, OpProof::Scale) => {}
             (Op::ScaleVec { .. }, OpProof::ScaleVec) => {}
             (Op::Scatter { m, n, .. }, OpProof::Scatter(p)) => {
-                if !verify_scatter(p, *m, *n) {
+                if !verify_scatter(p, *m, *n, transcript) {
                     return false;
                 }
             }
             (Op::Gather { m, h, .. }, OpProof::Gather(p)) => {
-                if !verify_scatter_add(p) {
+                if !verify_scatter_add(p, transcript) {
                     return false;
                 }
             }
-            (Op::BatchedMatMul { s, k, .. }, OpProof::BatchedMatMul(p, u, _, ch)) => {
-                if !bmm::verify(p, *s, *k, u, ch) {
+            (Op::BatchedMatMul { s, k, n, .. }, OpProof::BatchedMatMul(p, u, v, ch)) => {
+                let u_s: Vec<Goldilocks> = transcript.field_vec(s.trailing_zeros() as usize);
+                let v_s: Vec<Goldilocks> = transcript.field_vec(n.trailing_zeros() as usize);
+                if u_s != *u || v_s != *v {
+                    return false;
+                }
+                let (ok, ch_derived) = bmm::verify(p, *s, *k, u, transcript);
+                if !ok || ch_derived != *ch {
                     return false;
                 }
             }
-            (Op::GatherMatMul { s, k, .. }, OpProof::GatherMatMul(p, u, _, ch)) => {
-                if !bmm::verify_gather_matmul(p, *s, *k, u, ch) {
+            (Op::GatherMatMul { s, k, n, .. }, OpProof::GatherMatMul(p, u, v, ch)) => {
+                let u_s: Vec<Goldilocks> = transcript.field_vec(s.trailing_zeros() as usize);
+                let v_s: Vec<Goldilocks> = transcript.field_vec(n.trailing_zeros() as usize);
+                if u_s != *u || v_s != *v {
+                    return false;
+                }
+                let (ok, ch_derived) = bmm::verify_gather_matmul(p, *s, *k, u, transcript);
+                if !ok || ch_derived != *ch {
                     return false;
                 }
             }
@@ -2148,37 +2181,46 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
             (Op::ScaleGate { .. }, OpProof::ScaleGate) => {}
             (Op::Relu { .. }, OpProof::Relu) => {}
             (
-                Op::MatMul { .. },
-                OpProof::MatMul(mp, _, _, ch),
+                Op::MatMul { m, k, n, .. },
+                OpProof::MatMul(mp, u, v, ch),
             ) => {
-                if !matmul_verify(mp, ch) {
+                let u_s: Vec<Goldilocks> = transcript.field_vec(m.trailing_zeros() as usize);
+                let v_s: Vec<Goldilocks> = transcript.field_vec(n.trailing_zeros() as usize);
+                if u_s != *u || v_s != *v {
+                    return false;
+                }
+                let (ok, ch_derived) = matmul_verify(mp, k.trailing_zeros() as usize, transcript);
+                if !ok || ch_derived != *ch {
                     return false;
                 }
             }
-            (Op::Projection { shift, .. }, OpProof::Projection(pp)) => {
-                if !verify_projection(pp, *shift) {
+            (Op::Projection { shift, m, k, n, .. }, OpProof::Projection(pp)) => {
+                if !verify_projection(pp, *shift, *m, *k, *n, transcript) {
                     return false;
                 }
             }
             (Op::Add { .. }, OpProof::Add(vp, r)) => {
-                if !verify_virtual(vp, &add_terms, Goldilocks::ZERO, r, &vp.final_evals) {
+                let (ok, r_derived, fc) =
+                    verify_virtual(vp, &add_terms, Goldilocks::ZERO, r.len(), transcript);
+                if !ok
+                    || r_derived != *r
+                    || fc != virtual_eval(&add_terms, &vp.final_evals)
+                {
                     return false;
                 }
             }
             (Op::Lookup { table, .. }, OpProof::Lookup) => {
+                // Existence only: the per-table fractional replays happen after
+                // the op loop, in the prover's column order.
                 let w = proof.witness_columns.iter().find(|w| w.table == *table);
                 let t = proof.table_columns.iter().find(|t| t.table == *table);
                 match (w, t) {
-                    (Some(w), Some(t)) => {
-                        if !verify_lookup_split(&w.proof, &t.proof) {
-                            return false;
-                        }
-                    }
+                    (Some(_), Some(_)) => {}
                     _ => return false,
                 }
             }
-            (Op::Softmax { .. }, OpProof::Softmax(sp)) => {
-                if !verify_softmax_rounded(sp) {
+            (Op::Softmax { m, n, .. }, OpProof::Softmax(sp)) => {
+                if !verify_softmax_rounded(sp, *m, *n, transcript) {
                     return false;
                 }
             }
@@ -2187,36 +2229,36 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
             }
             (Op::GeluIndex { .. }, OpProof::GeluIndex) => {}
             (Op::StableSoftmaxIndex { .. }, OpProof::StableSoftmaxIndex) => {}
-            (Op::Layernorm { .. }, OpProof::Layernorm(lp)) => {
-                if !verify_layernorm_chain(lp) {
+            (Op::Layernorm { m, d, .. }, OpProof::Layernorm(lp)) => {
+                if !verify_layernorm_chain(lp, *m, *d, transcript) {
                     return false;
                 }
             }
             (
-                Op::LayerNormCentered { n_real, .. },
+                Op::LayerNormCentered { m, d, n_real, .. },
                 OpProof::LayerNormCentered(lp),
             ) => {
-                if !verify_layer_norm_centered(lp, *n_real) {
+                if !verify_layer_norm_centered(lp, *m, *d, *n_real, transcript) {
                     return false;
                 }
             }
-            (Op::RmsNorm { n_real, .. }, OpProof::RmsNorm(p)) => {
-                if !verify_rms_norm(p, *n_real) {
+            (Op::RmsNorm { m, d, n_real, .. }, OpProof::RmsNorm(p)) => {
+                if !verify_rms_norm(p, *m, *d, *n_real, transcript) {
                     return false;
                 }
             }
             (Op::RoPE { shift, .. }, OpProof::RoPE(p)) => {
-                if !verify_rope(p, *shift) {
+                if !verify_rope(p, *shift, transcript) {
                     return false;
                 }
             }
-            (Op::TopKSelect { k, .. }, OpProof::TopKSelect(p)) => {
-                if !verify_topk(p, *k) {
+            (Op::TopKSelect { k, m, n, .. }, OpProof::TopKSelect(p)) => {
+                if !verify_topk(p, *k, *m, *n, transcript) {
                     return false;
                 }
             }
             (Op::Argmax { m, n, .. }, OpProof::Argmax(p)) => {
-                if !verify_argmax(p, *m, *n) {
+                if !verify_argmax(p, *m, *n, transcript) {
                     return false;
                 }
             }
@@ -2243,10 +2285,25 @@ pub fn verify_shard_precomputed(tables: &[&[Goldilocks]], ops: &[Op], proof: &Op
         return false;
     }
     for (i, &t) in proof.bound.iter().enumerate() {
-        if verify_same_poly(&proof.binds[i], &bound_claims[i]).is_none() {
+        if verify_same_poly(&proof.binds[i], &bound_claims[i], transcript).is_none() {
             return false;
         }
     }
+
+    // Replay the per-table lookup fractional proofs in the prover's column
+    // order (per table: alpha, beta, witness frac, table frac).
+    if proof.witness_columns.len() != proof.table_columns.len() {
+        return false;
+    }
+    for (wc, tc) in proof.witness_columns.iter().zip(proof.table_columns.iter()) {
+        if transcript.field() != wc.alpha || transcript.field() != wc.beta {
+            return false;
+        }
+        if !verify_lookup_split(&wc.proof, &tc.proof, transcript) {
+            return false;
+        }
+    }
+
     true
 }
 
@@ -2373,10 +2430,20 @@ pub fn verify_shard_dag(
         return false;
     }
 
+    // Replay the same transcript structure as prove_shard_dag: statement
+    // absorbed, then a shard-indexed clone per shard; the master transcript
+    // stays at the post-statement state for the cross-shard bindings.
+    let mut master = Transcript::new(b"zkie-shard-dag-v1");
+    absorb_statement(&mut master, ops, ops_per_shard);
+
     let all_ok = ranges
         .par_iter()
         .enumerate()
-        .map(|(i, &(s, e))| verify_shard_precomputed(tables, &ops[s..e], &proof.shards[i]))
+        .map(|(i, &(s, e))| {
+            let mut child = master.clone();
+            child.absorb_u64(i as u64);
+            verify_shard_precomputed(tables, &ops[s..e], &proof.shards[i], &mut child)
+        })
         .all(|ok| ok);
     if !all_ok {
         return false;
@@ -2403,7 +2470,7 @@ pub fn verify_shard_dag(
         return false;
     }
     for (ci, &t) in proof.cross_tensors.iter().enumerate() {
-        if verify_same_poly(&proof.cross_binds[ci], &by_tensor[&t]).is_none() {
+        if verify_same_poly(&proof.cross_binds[ci], &by_tensor[&t], &mut master).is_none() {
             return false;
         }
     }
@@ -2449,7 +2516,7 @@ pub fn committed_cross_bind(
     committed: &zkie_core::pcs::committed::Committed,
     tensor: &[Goldilocks],
     claims: &[(Vec<Goldilocks>, Goldilocks)],
-    rng: &mut impl ChallengeSource,
+    transcript: &mut Transcript,
 ) -> Option<CommittedCrossBindProof> {
     let mut openings = Vec::with_capacity(claims.len());
     for (pt, expected) in claims {
@@ -2466,8 +2533,14 @@ pub fn committed_cross_bind(
         }
         openings.push((open, opened));
     }
+    // S1: the merged-point sumcheck binds the commitment root and the claims.
+    transcript.absorb(&bincode::serialize(&committed.commitment).ok()?);
+    for (pt, ev) in claims {
+        transcript.absorb_fields(pt);
+        transcript.absorb_field(*ev);
+    }
     Some(CommittedCrossBindProof {
-        same_poly: prove_same_poly(tensor, claims, rng),
+        same_poly: prove_same_poly(tensor, claims, transcript),
         openings,
     })
 }
@@ -2478,6 +2551,7 @@ pub fn verify_committed_cross_bind(
     committed: &BoundaryCommit,
     claims: &[(Vec<Goldilocks>, Goldilocks)],
     proof: &CommittedCrossBindProof,
+    transcript: &mut Transcript,
 ) -> bool {
     if proof.openings.len() != claims.len() {
         return false;
@@ -2496,7 +2570,12 @@ pub fn verify_committed_cross_bind(
             return false;
         }
     }
-    verify_same_poly(&proof.same_poly, claims).is_some()
+    transcript.absorb(&bincode::serialize(&committed.commitment).unwrap());
+    for (pt, ev) in claims {
+        transcript.absorb_fields(pt);
+        transcript.absorb_field(*ev);
+    }
+    verify_same_poly(&proof.same_poly, claims, transcript).is_some()
 }
 
 /// Collect the tensor ids of model weights: read but never written, and not a
@@ -2789,12 +2868,16 @@ pub fn prove_committed_shard_dag(
     ops_per_shard: usize,
     _whir: &zkie_core::pcs::whir::Whir,
     cached_weights: &[CachedWeightBatch],
-    rng: &mut impl ChallengeSource,
     tokens_t: T,
     argmax_t: T,
 ) -> CommittedShardDagProof {
     let plain = prove_shard_dag(store, ops, ops_per_shard);
     let boundary_tensors = plain.cross_tensors.clone();
+
+    // S1: the cross-bind merged-point sumchecks get their own statement-bound
+    // transcript; the verifier replays it in the same per-tensor order.
+    let mut bind_ts = Transcript::new(b"zkie-committed-binds-v1");
+    absorb_statement(&mut bind_ts, ops, ops_per_shard);
 
     let mut boundary_commitments = Vec::with_capacity(boundary_tensors.len());
     let mut cross_binds = Vec::with_capacity(boundary_tensors.len());
@@ -2810,7 +2893,7 @@ pub fn prove_committed_shard_dag(
                 }
             }
         }
-        let sp = committed_cross_bind(&bw, &committed, store.get(t), &claims, rng)
+        let sp = committed_cross_bind(&bw, &committed, store.get(t), &claims, &mut bind_ts)
             .expect("honest committed bind");
         boundary_commitments.push(BoundaryCommit {
             commitment: committed.commitment,
@@ -3057,25 +3140,45 @@ pub fn prove_committed_shard_dag(
         }
     }
 
-    let mut w_arities: Vec<usize> = Vec::new();
-    let mut w_alphas: Vec<Goldilocks> = Vec::new();
-    let mut w_betas: Vec<Goldilocks> = Vec::new();
-    for shard in &shards {
-        for wc in &shard.witness_columns {
-            w_arities.push(wc.num.len().trailing_zeros() as usize);
-            w_alphas.push(ts.field());
-            w_betas.push(ts.field());
+    // S1: derive alpha/beta and run every fractional proof on the transcript in
+    // shard-major order (all witness columns first, then all table columns),
+    // exactly the order the verifier replays. Each prove_fractional derives its
+    // layer challenges per-round internally.
+    for si in 0..shards.len() {
+        for ci in 0..shards[si].witness_columns.len() {
+            let alpha = ts.field();
+            let beta = ts.field();
+            let wc = &mut shards[si].witness_columns[ci];
+            let total = wc.x.len();
+            let mut den = vec![Goldilocks::from_u64(0); total];
+            for j in 0..total {
+                den[j] = alpha + wc.x[j] + beta * wc.y[j];
+            }
+            let new_proof = prove_fractional(wc.num.clone(), den, &mut ts);
+            let (point, num_leaf, den_leaf) = fractional_leaf(&new_proof);
+            wc.proof = new_proof;
+            wc.point = point;
+            wc.num_leaf = num_leaf;
+            wc.den_leaf = den_leaf;
+            wc.alpha = alpha;
+            wc.beta = beta;
         }
     }
-    let mut w_challs: Vec<(Vec<Goldilocks>, Vec<Goldilocks>)> = Vec::new();
-    for &a in &w_arities {
-        w_challs.push((ts.field_vec(a), ts.field_vec(a)));
-    }
-    let mut t_challs: Vec<(Vec<Goldilocks>, Vec<Goldilocks>)> = Vec::new();
-    for shard in &shards {
-        for tc in &shard.table_columns {
-            let a = tc.m.len().next_power_of_two().trailing_zeros() as usize;
-            t_challs.push((ts.field_vec(a), ts.field_vec(a)));
+    for si in 0..shards.len() {
+        for i in 0..shards[si].table_columns.len() {
+            let alpha = shards[si].witness_columns[i].alpha;
+            let beta = shards[si].witness_columns[i].beta;
+            let tc = &mut shards[si].table_columns[i];
+            let (num_t, den_t) =
+                build_lookup_table_num_den(&tc.m, store.get(tc.table), alpha, beta);
+            let new_proof = prove_fractional(num_t, den_t, &mut ts);
+            let (point, num_leaf, den_leaf) = fractional_leaf(&new_proof);
+            tc.proof = new_proof;
+            tc.point = point;
+            tc.num_leaf = num_leaf;
+            tc.den_leaf = den_leaf;
+            tc.alpha = alpha;
+            tc.beta = beta;
         }
     }
 
@@ -3125,28 +3228,14 @@ pub fn prove_committed_shard_dag(
         let mut nums_claimed: Vec<Goldilocks> = Vec::with_capacity(num_tables);
         for (ti, &(si, ci)) in cols.iter().enumerate() {
             let gid = shard_wc_off[si] + ci;
-            let (full_r, cs) = &w_challs[gid];
-            let alpha = w_alphas[gid];
-            let beta = w_betas[gid];
             let wc = &mut shards[si].witness_columns[ci];
+            let point = wc.point.clone();
+            let num_leaf = wc.num_leaf;
             let x = std::mem::take(&mut wc.x);
             let y = std::mem::take(&mut wc.y);
             let num = std::mem::take(&mut wc.num);
-            let total = x.len();
-            let mut den = vec![Goldilocks::from_u64(0); total];
-            for j in 0..total {
-                den[j] = alpha + x[j] + beta * y[j];
-            }
-            let new_proof = prove_fractional_with_challenges(num.clone(), den, full_r, cs);
-            let (point, num_leaf, den_leaf) = fractional_leaf(&new_proof);
             let eval_x = mle::eval(&x, &point);
             let eval_y = mle::eval(&y, &point);
-            wc.proof = new_proof;
-            wc.point = point.clone();
-            wc.num_leaf = num_leaf;
-            wc.den_leaf = den_leaf;
-            wc.alpha = alpha;
-            wc.beta = beta;
             points.push(point);
             xs_tensors.push(x);
             ys_tensors.push(y);
@@ -3192,16 +3281,12 @@ pub fn prove_committed_shard_dag(
         });
     }
 
-    // Re-run + open the per-lookup multiplicity columns `m`.
+    // Open the per-lookup multiplicity columns `m` at the fractional leaf
+    // points (the fractional proofs were already run on the transcript above).
     for (si, shard) in shards.iter_mut().enumerate() {
         for (i, tc) in shard.table_columns.iter_mut().enumerate() {
-            let gid = shard_wc_off[si] + i;
-            let (full_r, cs) = &t_challs[gid];
-            let alpha = w_alphas[gid];
-            let beta = w_betas[gid];
-            let (num_t, den_t) = build_lookup_table_num_den(&tc.m, store.get(tc.table), alpha, beta);
-            let new_proof = prove_fractional_with_challenges(num_t, den_t, full_r, cs);
-            let (point, num_leaf, den_leaf) = fractional_leaf(&new_proof);
+            let point = tc.point.clone();
+            let num_leaf = tc.num_leaf;
             let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(t_arities[si][i], 90);
             let bw = zkie_core::pcs::whir::Whir::with_params(t_arities[si][i], 90, pow_bits);
             let (open, ev) = bw.open(t_cms[si][i].prover_data.clone(), &t_cms[si][i].protocol, &point);
@@ -3223,10 +3308,6 @@ pub fn prove_committed_shard_dag(
                 );
                 (Some(table_committed.commitment.clone()), Some(open_table), ev_table)
             };
-            tc.proof = new_proof;
-            tc.point = point.clone();
-            tc.num_leaf = num_leaf;
-            tc.den_leaf = den_leaf;
             table_openings.push(TableOpening {
                 commitment: t_cms[si][i].commitment.clone(),
                 opening: open,
@@ -3237,9 +3318,9 @@ pub fn prove_committed_shard_dag(
                 table_opening,
                 table_eval,
                 is_identity: is_ident,
-                alpha,
-                beta,
-                den_leaf,
+                alpha: tc.alpha,
+                beta: tc.beta,
+                den_leaf: tc.den_leaf,
             });
             tc.m.clear();
         }
@@ -3384,11 +3465,22 @@ pub fn prove_committed_shard_dag(
         perm_ts.absorb(&bincode::serialize(&g.b_ctx.commitment).unwrap());
         perm_ts.absorb(&bincode::serialize(&g.num_ctx.commitment).unwrap());
     }
-    let mut perm_alphas: Vec<Goldilocks> = Vec::new();
-    let mut perm_challs: Vec<(Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>)> = Vec::new();
-    for &(_, _, arity) in &perm_ops {
-        perm_alphas.push(perm_ts.field());
-        perm_challs.push((perm_ts.field_vec(arity), perm_ts.field_vec(arity), perm_ts.field_vec(arity), perm_ts.field_vec(arity)));
+    // S1: per-op interleave — alpha, then the two fractional proofs, in
+    // perm_ops (shard-major) order; the verifier replays the same order. The
+    // fractional layer challenges are derived per-round inside prove_fractional.
+    for &(si, li, _) in &perm_ops {
+        let alpha = perm_ts.field();
+        let sp = match &mut shards[si].ops[li] {
+            OpProof::Scatter(p) => p,
+            _ => unreachable!(),
+        };
+        let (num_a, den_a) = build_perm_num_den(&sp.perm.a, alpha);
+        let (num_b, den_b) = build_perm_num_den(&sp.perm.b, alpha);
+        let new_a = prove_fractional(num_a, den_a, &mut perm_ts);
+        let new_b = prove_fractional(num_b, den_b, &mut perm_ts);
+        sp.perm.a_side = new_a;
+        sp.perm.b_side = new_b;
+        sp.perm.alpha = alpha;
     }
 
     for g in &perm_groups {
@@ -3428,23 +3520,14 @@ pub fn prove_committed_shard_dag(
         let mut num_tensors = Vec::with_capacity(n);
         for (ti, &(si, li)) in group_ops.iter().enumerate() {
             let gid = perm_gid[&(si, li)];
-            let (full_r_a, cs_a, full_r_b, cs_b) = &perm_challs[gid];
-            let alpha = perm_alphas[gid];
             let sp = match &mut shards[si].ops[li] {
                 OpProof::Scatter(p) => p,
                 _ => unreachable!(),
             };
+            let (point_a, num_leaf_a, den_leaf_a) = fractional_leaf(&sp.perm.a_side);
+            let (point_b, num_leaf_b, den_leaf_b) = fractional_leaf(&sp.perm.b_side);
             let a = std::mem::take(&mut sp.perm.a);
             let b = std::mem::take(&mut sp.perm.b);
-            let (num_a, den_a) = build_perm_num_den(&a, alpha);
-            let (num_b, den_b) = build_perm_num_den(&b, alpha);
-            let new_a = prove_fractional_with_challenges(num_a, den_a, full_r_a, cs_a);
-            let new_b = prove_fractional_with_challenges(num_b, den_b, full_r_b, cs_b);
-            let (point_a, num_leaf_a, den_leaf_a) = fractional_leaf(&new_a);
-            let (point_b, num_leaf_b, den_leaf_b) = fractional_leaf(&new_b);
-            sp.perm.a_side = new_a;
-            sp.perm.b_side = new_b;
-            sp.perm.alpha = alpha;
             let total = 1usize << arity;
             let mut a_pad = vec![Goldilocks::ZERO; total];
             let mut b_pad = vec![Goldilocks::ZERO; total];
@@ -3568,24 +3651,31 @@ pub fn prove_committed_shard_dag(
     }
 
     let gather_indep_count = gather_groups.len();
-    // FS: absorb the six independent roots, then derive alpha/gamma.
+    // FS: absorb the six independent roots, then derive alpha/gamma per op.
     let mut ts = Transcript::new(b"zkie-committed-gather-v1");
     absorb_statement(&mut ts, ops, ops_per_shard);
     for g in &gather_groups {
         ts.absorb(&bincode::serialize(&g.ctx.commitment).unwrap());
     }
-    let mut gather_alphas: Vec<Goldilocks> = Vec::new();
-    let mut gather_gammas: Vec<Vec<Goldilocks>> = Vec::new();
-    for &(_, _, _, _, _, h, _) in &gather_ops {
-        gather_alphas.push(ts.field());
-        gather_gammas.push((0..h).map(|_| ts.field()).collect());
+    for &(si, li, _, _, _, h, _) in &gather_ops {
+        let alpha = ts.field();
+        let gamma: Vec<Goldilocks> = (0..h).map(|_| ts.field()).collect();
+        let sp = match &mut shards[si].ops[li] {
+            OpProof::Gather(p) => p,
+            _ => unreachable!(),
+        };
+        sp.alpha = alpha;
+        sp.gamma = gamma;
     }
 
     // Phase B: rebuild den_source/den_target with the FS alpha, then commit them.
     let mut op_den_src: Vec<Vec<Goldilocks>> = vec![Vec::new(); gather_ops.len()];
     let mut op_den_tgt: Vec<Vec<Goldilocks>> = vec![Vec::new(); gather_ops.len()];
     for (gid, &(si, li, arity_src, arity_tgt, _, h, m)) in gather_ops.iter().enumerate() {
-        let alpha = gather_alphas[gid];
+        let alpha = match &shards[si].ops[li] {
+            OpProof::Gather(p) => p.alpha,
+            _ => unreachable!(),
+        };
         let sp = match &shards[si].ops[li] { OpProof::Gather(p) => p, _ => unreachable!() };
         let mut dsrc = vec![alpha; 1usize << arity_src];
         for pos in 0..sp.token_id.len() {
@@ -3628,13 +3718,9 @@ pub fn prove_committed_shard_dag(
         }
     }
 
-    // FS: absorb the two den roots, then derive fractional challenges.
+    // FS: absorb the two den roots, then run the fractional proofs per op (S1).
     for g in gather_groups.iter().skip(6) {
         ts.absorb(&bincode::serialize(&g.ctx.commitment).unwrap());
-    }
-    let mut gather_challs: Vec<(Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>)> = Vec::new();
-    for &(_, _, arity_src, arity_tgt, _, _, _) in &gather_ops {
-        gather_challs.push((ts.field_vec(arity_src), ts.field_vec(arity_src), ts.field_vec(arity_tgt), ts.field_vec(arity_tgt)));
     }
 
     // Record verifier-side batches (8 groups, in the same order).
@@ -3649,22 +3735,22 @@ pub fn prove_committed_shard_dag(
         });
     }
 
-    // Re-run the fractional sumchecks once per Gather op, using the rebuilt den.
+    // S1: run the fractional sumchecks per Gather op on the transcript, in
+    // gather_ops (shard-major) order, using the rebuilt den. The layer
+    // challenges are derived per-round inside prove_fractional.
     let mut op_point_src: Vec<Vec<Goldilocks>> = vec![Vec::new(); gather_ops.len()];
     let mut op_point_tgt: Vec<Vec<Goldilocks>> = vec![Vec::new(); gather_ops.len()];
     for (gid, &(si, li, arity_src, arity_tgt, _, _, _)) in gather_ops.iter().enumerate() {
-        let (full_r_src, cs_src, full_r_tgt, cs_tgt) = &gather_challs[gid];
-        let alpha = gather_alphas[gid];
-        let gamma = gather_gammas[gid].clone();
-        let sp = match &mut shards[si].ops[li] { OpProof::Gather(p) => p, _ => unreachable!() };
-        let new_src = prove_fractional_with_challenges(sp.num_source.clone(), op_den_src[gid].clone(), full_r_src, cs_src);
+        let sp = match &mut shards[si].ops[li] {
+            OpProof::Gather(p) => p,
+            _ => unreachable!(),
+        };
+        let new_src = prove_fractional(sp.num_source.clone(), op_den_src[gid].clone(), &mut ts);
         let (point_src, _, _) = fractional_leaf(&new_src);
-        let new_tgt = prove_fractional_with_challenges(sp.num_target.clone(), op_den_tgt[gid].clone(), full_r_tgt, cs_tgt);
+        let new_tgt = prove_fractional(sp.num_target.clone(), op_den_tgt[gid].clone(), &mut ts);
         let (point_tgt, _, _) = fractional_leaf(&new_tgt);
         sp.source_side = new_src;
         sp.target_side = new_tgt;
-        sp.alpha = alpha;
-        sp.gamma = gamma;
         op_point_src[gid] = point_src;
         op_point_tgt[gid] = point_tgt;
         let _ = arity_src;
@@ -3788,15 +3874,26 @@ pub fn verify_committed_shard_dag(
         return false;
     }
     let shards = &proof.shards;
+    // S1: replay the same transcript structure as prove_committed_shard_dag:
+    // the shard-DAG master for the per-shard replays, and the binds transcript
+    // for the committed cross-binds.
+    let mut master = Transcript::new(b"zkie-shard-dag-v1");
+    absorb_statement(&mut master, ops, ops_per_shard);
     let all_ok = ranges
         .par_iter()
         .enumerate()
-        .map(|(i, &(s, e))| verify_shard(tables, &ops[s..e], &shards[i]))
+        .map(|(i, &(s, e))| {
+            let mut child = master.clone();
+            child.absorb_u64(i as u64);
+            verify_shard_precomputed(tables, &ops[s..e], &shards[i], &mut child)
+        })
         .all(|ok| ok);
     if !all_ok {
         return false;
     }
 
+    let mut bind_ts = Transcript::new(b"zkie-committed-binds-v1");
+    absorb_statement(&mut bind_ts, ops, ops_per_shard);
     for (i, &t) in proof.boundary_tensors.iter().enumerate() {
         let mut claims = Vec::new();
         for shard in &proof.shards {
@@ -3810,6 +3907,7 @@ pub fn verify_committed_shard_dag(
             &proof.boundary_commitments[i],
             &claims,
             &proof.cross_binds[i],
+            &mut bind_ts,
         ) {
             return false;
         }
@@ -4033,9 +4131,10 @@ pub fn verify_committed_shard_dag(
         }
     }
 
-    // Fiat-Shamir: reconstruct the global transcript from the commitment roots,
-    // derive alpha/beta and the fractional challenges, and verify the prover
-    // used exactly those derived values.
+    // Fiat-Shamir (S1): replay the frac transcript — statement + roots, then per
+    // witness column alpha/beta, then every fractional proof in shard-major
+    // order (all witness columns first, then all table columns). The chain-core
+    // verify re-derives the layer challenges from the proof's round messages.
     {
         let mut ts = Transcript::new(b"zkie-committed-frac-v1");
         absorb_statement(&mut ts, ops, ops_per_shard);
@@ -4056,64 +4155,27 @@ pub fn verify_committed_shard_dag(
                 ti += 1;
             }
         }
-        let mut alphas: Vec<Goldilocks> = Vec::new();
-        let mut betas: Vec<Goldilocks> = Vec::new();
-        for shard in &proof.shards {
-            for _ in &shard.witness_columns {
-                alphas.push(ts.field());
-                betas.push(ts.field());
-            }
-        }
-        let mut gid = 0usize;
         for shard in &proof.shards {
             for wc in &shard.witness_columns {
-                if wc.alpha != alphas[gid] || wc.beta != betas[gid] {
+                if ts.field() != wc.alpha || ts.field() != wc.beta {
                     return false;
                 }
-                gid += 1;
-            }
-        }
-        gid = 0;
-        for shard in &proof.shards {
-            for _ in &shard.table_columns {
-                let to = &proof.table_openings[gid];
-                if to.alpha != alphas[gid] || to.beta != betas[gid] {
+                if !verify_fractional_chain_core(&wc.proof, &mut ts) {
                     return false;
-                }
-                gid += 1;
-            }
-        }
-        for shard in &proof.shards {
-            for wc in &shard.witness_columns {
-                let full_r = ts.field_vec(wc.proof.full_r.len());
-                let cs = ts.field_vec(wc.proof.full_r.len());
-                if wc.proof.full_r != full_r || wc.proof.layers.len() != cs.len() {
-                    return false;
-                }
-                for (layer, &c) in wc.proof.layers.iter().zip(cs.iter()) {
-                    if layer.c != c {
-                        return false;
-                    }
                 }
             }
         }
         for shard in &proof.shards {
             for tc in &shard.table_columns {
-                let full_r = ts.field_vec(tc.proof.full_r.len());
-                let cs = ts.field_vec(tc.proof.full_r.len());
-                if tc.proof.full_r != full_r || tc.proof.layers.len() != cs.len() {
+                if !verify_fractional_chain_core(&tc.proof, &mut ts) {
                     return false;
-                }
-                for (layer, &c) in tc.proof.layers.iter().zip(cs.iter()) {
-                    if layer.c != c {
-                        return false;
-                    }
                 }
             }
         }
     }
 
-    // Fiat-Shamir for permutations: verify alpha/full_r/c are transcript-derived.
+    // Fiat-Shamir for permutations (S1): per Scatter op — alpha, then the two
+    // fractional replays, in shard-major order.
     {
         let mut ts = Transcript::new(b"zkie-committed-perm-v1");
         absorb_statement(&mut ts, ops, ops_per_shard);
@@ -4123,40 +4185,26 @@ pub fn verify_committed_shard_dag(
         for shard in &proof.shards {
             for op in &shard.ops {
                 if let OpProof::Scatter(sp) = op {
-                    let arity = sp.perm.a_side.full_r.len();
                     let alpha = ts.field();
                     if alpha != sp.perm.alpha {
                         return false;
                     }
-                    let full_r_a = ts.field_vec(arity);
-                    let cs_a = ts.field_vec(arity);
-                    let full_r_b = ts.field_vec(arity);
-                    let cs_b = ts.field_vec(arity);
-                    if sp.perm.a_side.full_r != full_r_a || sp.perm.a_side.layers.len() != cs_a.len() {
+                    if !verify_fractional_chain_core(&sp.perm.a_side, &mut ts) {
                         return false;
                     }
-                    for (layer, &c) in sp.perm.a_side.layers.iter().zip(cs_a.iter()) {
-                        if layer.c != c {
-                            return false;
-                        }
-                    }
-                    if sp.perm.b_side.full_r != full_r_b || sp.perm.b_side.layers.len() != cs_b.len() {
+                    if !verify_fractional_chain_core(&sp.perm.b_side, &mut ts) {
                         return false;
-                    }
-                    for (layer, &c) in sp.perm.b_side.layers.iter().zip(cs_b.iter()) {
-                        if layer.c != c {
-                            return false;
-                        }
                     }
                 }
             }
         }
     }
 
-    // Fiat-Shamir for gather: verify alpha/gamma are transcript-derived. The
-    // den columns are committed after alpha (they depend on it), so the
-    // transcript absorbs the independent roots, derives alpha/gamma, then
-    // absorbs the den roots.
+    // Fiat-Shamir for gather (S1): per Gather op — alpha/gamma, then the den
+    // roots, then the two fractional replays, in shard-major order. The den
+    // columns are committed after alpha (they depend on it), so the transcript
+    // absorbs the independent roots, derives alpha/gamma, then absorbs the den
+    // roots before the fractional replays.
     {
         let mut ts = Transcript::new(b"zkie-committed-gather-v1");
         absorb_statement(&mut ts, ops, ops_per_shard);
@@ -4180,12 +4228,12 @@ pub fn verify_committed_shard_dag(
         for shard in &proof.shards {
             for op in &shard.ops {
                 if let OpProof::Gather(sp) = op {
-                    let arity_src = sp.source_side.full_r.len();
-                    let arity_tgt = sp.target_side.full_r.len();
-                    let _ = ts.field_vec(arity_src);
-                    let _ = ts.field_vec(arity_src);
-                    let _ = ts.field_vec(arity_tgt);
-                    let _ = ts.field_vec(arity_tgt);
+                    if !verify_fractional_chain_core(&sp.source_side, &mut ts) {
+                        return false;
+                    }
+                    if !verify_fractional_chain_core(&sp.target_side, &mut ts) {
+                        return false;
+                    }
                 }
             }
         }
@@ -4560,9 +4608,11 @@ mod tests {
             .map(|_| from_i64((rng.next_u64() % 50) as i64))
             .collect();
         let steps = vec![step(m, k, n, shift, &mut rng)];
-        let proof = prove_projection_chain(&x, &steps, &mut rng);
+        let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-chain-test");
+        let proof = prove_projection_chain(&x, &steps, &mut tp);
         assert!(proof.binds.is_empty(), "no internal binding for one op");
-        assert!(verify_projection_chain(&proof, &x, &steps));
+        let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-chain-test");
+        assert!(verify_projection_chain(&proof, &x, &steps, &mut tv));
     }
 
     #[test]
@@ -4578,9 +4628,11 @@ mod tests {
             step(m, d, d, shift, &mut rng),
             step(m, d, d, shift, &mut rng),
         ];
-        let proof = prove_projection_chain(&x, &steps, &mut rng);
+        let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-chain-test");
+        let proof = prove_projection_chain(&x, &steps, &mut tp);
         assert_eq!(proof.binds.len(), 3, "N-1 internal bindings");
-        assert!(verify_projection_chain(&proof, &x, &steps));
+        let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-chain-test");
+        assert!(verify_projection_chain(&proof, &x, &steps, &mut tv));
 
         // Tampering with an intermediate weight must break the whole chain: the
         // verifier recomputes the forward pass from `steps`, so a single altered
@@ -4600,10 +4652,12 @@ mod tests {
         let steps: Vec<ProjectionStep> = (0..8).map(|_| step(m, d, d, shift, &mut rng)).collect();
 
         let ops_per_shard = 2;
-        let proof = prove_projection_sharded(&x, &steps, ops_per_shard, &mut rng);
+        let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-chain-test");
+        let proof = prove_projection_sharded(&x, &steps, ops_per_shard, &mut tp);
         assert_eq!(proof.shards.len(), 4, "8 ops / 2 per shard = 4 shards");
         assert_eq!(proof.cross_binds.len(), 3, "3 cross-shard boundaries");
-        assert!(verify_projection_sharded(&proof, &x, &steps, ops_per_shard));
+        let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-chain-test");
+        assert!(verify_projection_sharded(&proof, &x, &steps, ops_per_shard, &mut tv));
 
         // A single altered weight in the middle breaks the affected shard.
         let mut bad_steps = steps.clone();
@@ -4612,10 +4666,12 @@ mod tests {
         let _ = &bad_steps;
 
         // Whole-model granularity = one shard, no cross-bindings.
-        let whole = prove_projection_sharded(&x, &steps, steps.len(), &mut rng);
+        let mut tp2 = zkie_core::common::transcript::Transcript::new(b"zkie-chain-test");
+        let whole = prove_projection_sharded(&x, &steps, steps.len(), &mut tp2);
         assert_eq!(whole.shards.len(), 1);
         assert!(whole.cross_binds.is_empty());
-        assert!(verify_projection_sharded(&whole, &x, &steps, steps.len()));
+        let mut tv2 = zkie_core::common::transcript::Transcript::new(b"zkie-chain-test");
+        assert!(verify_projection_sharded(&whole, &x, &steps, steps.len(), &mut tv2));
     }
 
     #[test]
@@ -4630,10 +4686,12 @@ mod tests {
             step(m, d, d, shift, &mut rng),
             step(m, d, d, shift, &mut rng),
         ];
-        let proof = prove_residual_chain(&x, &steps, &mut rng);
+        let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-chain-test");
+        let proof = prove_residual_chain(&x, &steps, &mut tp);
         assert_eq!(proof.same_x.len(), 3);
         assert_eq!(proof.same_p.len(), 3);
-        assert!(verify_residual_chain(&proof, &x, &steps));
+        let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-chain-test");
+        assert!(verify_residual_chain(&proof, &x, &steps, &mut tv));
 
         // Tampering with a residual output must break the chain.
         let mut bad_steps = steps.clone();
@@ -4738,9 +4796,11 @@ mod tests {
             .collect();
         store.idx[act_idx] = idx;
 
-        let proof = prove_shard(&mut store, &ops, &[out], &mut rng);
+        let mut tp = Transcript::new(b"zkie-shard-test");
+        let proof = prove_shard(&mut store, &ops, &[out], &mut tp);
         assert!(!proof.bound.is_empty(), "residual x must be bound");
-        assert!(verify_shard(&store.owned_slices(), &ops, &proof));
+        let mut tv = Transcript::new(b"zkie-shard-test");
+        assert!(verify_shard(&store.owned_slices(), &ops, &proof, &mut tv));
 
         // Tamper with an intermediate weight -> must fail.
         let mut bad = Store {
@@ -4777,8 +4837,10 @@ mod tests {
             m,
             n,
         }];
-        let proof = prove_shard(&mut store, &ops, &[out], &mut rng);
-        assert!(verify_shard(&store.owned_slices(), &ops, &proof));
+        let mut tp = Transcript::new(b"zkie-shard-test");
+        let proof = prove_shard(&mut store, &ops, &[out], &mut tp);
+        let mut tv = Transcript::new(b"zkie-shard-test");
+        assert!(verify_shard(&store.owned_slices(), &ops, &proof, &mut tv));
 
         let mut bad = Store {
             v: store.v.clone(),
@@ -4823,8 +4885,10 @@ mod tests {
             m,
             d,
         }];
-        let proof = prove_shard(&mut store, &ops, &[out], &mut rng);
-        assert!(verify_shard(&store.owned_slices(), &ops, &proof));
+        let mut tp = Transcript::new(b"zkie-shard-test");
+        let proof = prove_shard(&mut store, &ops, &[out], &mut tp);
+        let mut tv = Transcript::new(b"zkie-shard-test");
+        assert!(verify_shard(&store.owned_slices(), &ops, &proof, &mut tv));
 
         let mut bad = Store {
             v: store.v.clone(),
@@ -4951,7 +5015,9 @@ mod tests {
             (p1.clone(), mle::eval(&f, &p1)),
         ];
 
-        let proof = committed_cross_bind(&whir, &c, &f, &claims, &mut rng).expect("honest bind");
+        let mut tp = Transcript::new(b"zkie-committed-binds-v1");
+        tp.absorb_u64(0x1414);
+        let proof = committed_cross_bind(&whir, &c, &f, &claims, &mut tp).expect("honest bind");
         assert_eq!(proof.same_poly.coeffs.len(), 2);
 
         // A wrong claimed eval must fail the commitment check.
@@ -4959,7 +5025,9 @@ mod tests {
             (p0.clone(), mle::eval(&f, &p0) + Goldilocks::ONE),
             (p1.clone(), mle::eval(&f, &p1)),
         ];
-        assert!(committed_cross_bind(&whir, &c, &f, &bad, &mut rng).is_none());
+        let mut tp2 = Transcript::new(b"zkie-committed-binds-v1");
+        tp2.absorb_u64(0x1414);
+        assert!(committed_cross_bind(&whir, &c, &f, &bad, &mut tp2).is_none());
     }
 
     #[test]
@@ -5051,7 +5119,7 @@ mod tests {
         let tokens_t = store.push_idx(vec![]);
         let argmax_t = store.push_idx(vec![]);
         let mut proof =
-            prove_committed_shard_dag(&mut store, &ops, 2, &whir, &cached, &mut rng, tokens_t, argmax_t);
+            prove_committed_shard_dag(&mut store, &ops, 2, &whir, &cached, tokens_t, argmax_t);
         assert_eq!(proof.boundary_tensors.len(), 1);
         assert_eq!(proof.boundary_commitments.len(), 1);
         assert_eq!(proof.cross_binds.len(), 1);
@@ -5146,7 +5214,7 @@ mod tests {
             1,
             &whir,
             &[],
-            &mut rng,
+
             tokens_t,
             argmax_t,
         );
@@ -5212,8 +5280,10 @@ mod tests {
         );
         let c = store.push(vec![]);
         let ops = vec![Op::MatMul { a, b, c, m, k, n }];
-        let proof = prove_shard(&mut store, &ops, &[c], &mut rng);
-        assert!(verify_shard(&store.owned_slices(), &ops, &proof));
+        let mut tp = Transcript::new(b"zkie-shard-test");
+        let proof = prove_shard(&mut store, &ops, &[c], &mut tp);
+        let mut tv = Transcript::new(b"zkie-shard-test");
+        assert!(verify_shard(&store.owned_slices(), &ops, &proof, &mut tv));
 
         let mut bad = Store {
             v: store.v.clone(),
@@ -5243,8 +5313,10 @@ mod tests {
         );
         let c = store.push(vec![]);
         let ops = vec![Op::BatchedMatMul { a, w, c, s, k, n }];
-        let proof = prove_shard(&mut store, &ops, &[c], &mut rng);
-        assert!(verify_shard(&store.owned_slices(), &ops, &proof));
+        let mut tp = Transcript::new(b"zkie-shard-test");
+        let proof = prove_shard(&mut store, &ops, &[c], &mut tp);
+        let mut tv = Transcript::new(b"zkie-shard-test");
+        assert!(verify_shard(&store.owned_slices(), &ops, &proof, &mut tv));
 
         let expected = batched_matmul::forward(store.get(a), store.get(w), s, k, n);
         assert_eq!(store.get(c), expected.as_slice());
@@ -5342,8 +5414,10 @@ mod tests {
             },
         ];
 
-        let proof = prove_shard(&mut store, &ops, &[out_t], &mut rng);
-        assert!(verify_shard(&store.owned_slices(), &ops, &proof));
+        let mut tp = Transcript::new(b"zkie-shard-test");
+        let proof = prove_shard(&mut store, &ops, &[out_t], &mut tp);
+        let mut tv = Transcript::new(b"zkie-shard-test");
+        assert!(verify_shard(&store.owned_slices(), &ops, &proof, &mut tv));
 
         let mut reference = vec![Goldilocks::ZERO; m * p];
         for t in 0..m {
@@ -5483,8 +5557,10 @@ mod tests {
             },
         ];
 
-        let proof = prove_shard(&mut store, &ops, &[out_t], &mut rng);
-        assert!(verify_shard(&store.owned_slices(), &ops, &proof));
+        let mut tp = Transcript::new(b"zkie-shard-test");
+        let proof = prove_shard(&mut store, &ops, &[out_t], &mut tp);
+        let mut tv = Transcript::new(b"zkie-shard-test");
+        assert!(verify_shard(&store.owned_slices(), &ops, &proof, &mut tv));
 
         // dense reference: out[t][j] = sum_e sel[t][e] * gate[t][e] * (x[t] @ W_all[e])[j]
         let mut reference = vec![Goldilocks::ZERO; m * p];
@@ -5593,8 +5669,10 @@ mod tests {
             Op::Gather { weighted: g, token_id: token_id_pad, gate: gate_pos, out, m, h: p },
         ];
 
-        let proof = prove_shard(&mut store, &ops, &[out], &mut rng);
-        assert!(verify_shard(&store.owned_slices(), &ops, &proof));
+        let mut tp = Transcript::new(b"zkie-shard-test");
+        let proof = prove_shard(&mut store, &ops, &[out], &mut tp);
+        let mut tv = Transcript::new(b"zkie-shard-test");
+        assert!(verify_shard(&store.owned_slices(), &ops, &proof, &mut tv));
 
         // dense reference (only real (t,e) pairs contribute)
         let mut reference = vec![Goldilocks::ZERO; m * p];
@@ -5700,8 +5778,10 @@ mod tests {
             Op::Gather { weighted: g, token_id: token_id_pad, gate: gate_pos, out, m, h: p },
         ];
 
-        let proof = prove_shard(&mut store, &ops, &[out], &mut rng);
-        assert!(verify_shard(&store.owned_slices(), &ops, &proof));
+        let mut tp = Transcript::new(b"zkie-shard-test");
+        let proof = prove_shard(&mut store, &ops, &[out], &mut tp);
+        let mut tv = Transcript::new(b"zkie-shard-test");
+        assert!(verify_shard(&store.owned_slices(), &ops, &proof, &mut tv));
 
         let mut reference = vec![Goldilocks::ZERO; m * p];
         for t in 0..m {
@@ -5757,8 +5837,10 @@ mod tests {
                 n: m,
             },
         ];
-        let proof = prove_shard(&mut store, &ops, &[scores_t], &mut rng);
-        assert!(verify_shard(&store.owned_slices(), &ops, &proof));
+        let mut tp = Transcript::new(b"zkie-shard-test");
+        let proof = prove_shard(&mut store, &ops, &[scores_t], &mut tp);
+        let mut tv = Transcript::new(b"zkie-shard-test");
+        assert!(verify_shard(&store.owned_slices(), &ops, &proof, &mut tv));
 
         let mut bad = Store {
             v: store.v.clone(),
@@ -5890,8 +5972,10 @@ mod tests {
             },
         ];
 
-        let proof = prove_shard(&mut store, &ops, &[attn], &mut rng);
-        assert!(verify_shard(&store.owned_slices(), &ops, &proof));
+        let mut tp = Transcript::new(b"zkie-shard-test");
+        let proof = prove_shard(&mut store, &ops, &[attn], &mut tp);
+        let mut tv = Transcript::new(b"zkie-shard-test");
+        assert!(verify_shard(&store.owned_slices(), &ops, &proof, &mut tv));
 
         let mut bad = Store {
             v: store.v.clone(),
@@ -6073,8 +6157,10 @@ mod tests {
             acc = sum;
         }
 
-        let proof = prove_shard(&mut store, &ops, &[acc], &mut rng);
-        assert!(verify_shard(&store.owned_slices(), &ops, &proof));
+        let mut tp = Transcript::new(b"zkie-shard-test");
+        let proof = prove_shard(&mut store, &ops, &[acc], &mut tp);
+        let mut tv = Transcript::new(b"zkie-shard-test");
+        assert!(verify_shard(&store.owned_slices(), &ops, &proof, &mut tv));
 
         let mut bad = Store {
             v: store.v.clone(),
@@ -6196,8 +6282,10 @@ mod tests {
             },
         ];
 
-        let proof = prove_shard(&mut store, &ops, &[out], &mut rng);
-        assert!(verify_shard(&store.owned_slices(), &ops, &proof));
+        let mut tp = Transcript::new(b"zkie-shard-test");
+        let proof = prove_shard(&mut store, &ops, &[out], &mut tp);
+        let mut tv = Transcript::new(b"zkie-shard-test");
+        assert!(verify_shard(&store.owned_slices(), &ops, &proof, &mut tv));
 
         let mut bad = Store {
             v: store.v.clone(),
@@ -6248,8 +6336,10 @@ mod tests {
             rsqrt_table,
             &mut rng,
         );
-        let proof = prove_shard(&mut store, &ops, &[out], &mut rng);
-        assert!(verify_shard(&store.owned_slices(), &ops, &proof));
+        let mut tp = Transcript::new(b"zkie-shard-test");
+        let proof = prove_shard(&mut store, &ops, &[out], &mut tp);
+        let mut tv = Transcript::new(b"zkie-shard-test");
+        assert!(verify_shard(&store.owned_slices(), &ops, &proof, &mut tv));
 
         let mut bad = Store {
             v: store.v.clone(),

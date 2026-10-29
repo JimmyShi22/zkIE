@@ -10,7 +10,8 @@ use zkie_core::common::logup_gkr::{
     prove_lookup_fractional_batch, verify_lookup_fractional_batch, FractionalProof,
 };
 use zkie_core::common::mle;
-use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
+use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, virtual_eval, VirtualProof};
+use zkie_core::common::transcript::Transcript;
 
 fn round_div(a: i64, b: i64) -> i64 {
     let q = a.div_euclid(b);
@@ -97,7 +98,7 @@ pub fn prove_rms_norm(
     m: usize,
     d: usize,
     n_real: usize,
-    rng: &mut impl ChallengeSource,
+    transcript: &mut Transcript,
 ) -> (RmsNormProof, Vec<u32>, Vec<Goldilocks>, Vec<Goldilocks>, Vec<Goldilocks>) {
     let (ms, s_index, rstd, out, rem_out, rem_lo, rem_hi, sum_sq, rem_s) =
         rms_norm_forward(x, w, rsqrt_table, m, d, n_real);
@@ -110,52 +111,46 @@ pub fn prove_rms_norm(
     let ones_m: Vec<Goldilocks> = vec![Goldilocks::ONE; m];
     let ones_md: Vec<Goldilocks> = vec![Goldilocks::ONE; m * d];
 
-    let trunc_ch: Vec<Goldilocks> = (0..m.trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
-    let trunc_proof = prove_virtual(
+    let trunc_terms = [
+        (d_f, vec![0usize]),
+        (Goldilocks::ONE, vec![1usize]),
+        (neg, vec![2usize]),
+        (neg * half_d, vec![3usize]),
+    ];
+    let (trunc_proof, trunc_ch) = prove_virtual(
         &[&ms, &rem_s, &sum_sq, &ones_m],
-        &[
-            (d_f, vec![0usize]),
-            (Goldilocks::ONE, vec![1usize]),
-            (neg, vec![2usize]),
-            (neg * half_d, vec![3usize]),
-        ],
+        &trunc_terms,
         Goldilocks::ZERO,
-        &trunc_ch,
+        transcript,
     );
 
     let rstd_b: Vec<Goldilocks> = (0..m * d).map(|ij| rstd[ij / d]).collect();
     let raw: Vec<Goldilocks> = (0..m * d).map(|ij| x[ij] * rstd[ij / d] * w[ij]).collect();
-    let r_out: Vec<Goldilocks> = (0..(m * d).trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
-    let out_proof = prove_virtual(
+    let out_terms = [
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (neg, vec![3usize]),
+        (Goldilocks::ONE, vec![3usize]),
+        (neg * two32, vec![4usize]),
+        (neg, vec![5usize]),
+        (half32, vec![6usize]),
+    ];
+    let (out_proof, r_out) = prove_virtual(
         &[x, &rstd_b, w, &raw, &out, &rem_out, &ones_md],
-        &[
-            (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
-            (neg, vec![3usize]),
-            (Goldilocks::ONE, vec![3usize]),
-            (neg * two32, vec![4usize]),
-            (neg, vec![5usize]),
-            (half32, vec![6usize]),
-        ],
+        &out_terms,
         Goldilocks::ZERO,
-        &r_out,
+        transcript,
     );
 
-    let rem_split_ch: Vec<Goldilocks> = (0..(m * d).trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
-    let rem_split = prove_virtual(
+    let rem_split_terms = [
+        (Goldilocks::ONE, vec![0usize]),
+        (neg, vec![1usize]),
+        (neg * Goldilocks::from_u64(1u64 << 16), vec![2usize]),
+    ];
+    let (rem_split, rem_split_ch) = prove_virtual(
         &[&rem_out, &rem_lo, &rem_hi],
-        &[
-            (Goldilocks::ONE, vec![0usize]),
-            (neg, vec![1usize]),
-            (neg * Goldilocks::from_u64(1u64 << 16), vec![2usize]),
-        ],
+        &rem_split_terms,
         Goldilocks::ZERO,
-        &rem_split_ch,
+        transcript,
     );
     (
         RmsNormProof {
@@ -174,57 +169,69 @@ pub fn prove_rms_norm(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn verify_rms_norm(proof: &RmsNormProof, n_real: usize) -> bool {
+pub fn verify_rms_norm(
+    proof: &RmsNormProof,
+    m: usize,
+    d: usize,
+    n_real: usize,
+    transcript: &mut Transcript,
+) -> bool {
     let d_f = Goldilocks::from_u64(n_real as u64);
     let half_d = Goldilocks::from_u64((n_real / 2) as u64);
     let half32 = Goldilocks::from_u64(1u64 << 31);
     let two32 = Goldilocks::from_u64(1u64 << 32);
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
 
-    if !verify_virtual(
+    let trunc_terms = [
+        (d_f, vec![0usize]),
+        (Goldilocks::ONE, vec![1usize]),
+        (neg, vec![2usize]),
+        (neg * half_d, vec![3usize]),
+    ];
+    let (ok, r, fc) = verify_virtual(
         &proof.trunc,
-        &[
-            (d_f, vec![0usize]),
-            (Goldilocks::ONE, vec![1usize]),
-            (neg, vec![2usize]),
-            (neg * half_d, vec![3usize]),
-        ],
+        &trunc_terms,
         Goldilocks::ZERO,
-        &proof.trunc_ch,
-        &proof.trunc.final_evals,
-    ) {
+        m.trailing_zeros() as usize,
+        transcript,
+    );
+    if !ok || r != proof.trunc_ch || fc != virtual_eval(&trunc_terms, &proof.trunc.final_evals) {
         return false;
     }
-    if !verify_virtual(
+
+    let arity_md = (m * d).trailing_zeros() as usize;
+    let out_terms = [
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (neg, vec![3usize]),
+        (Goldilocks::ONE, vec![3usize]),
+        (neg * two32, vec![4usize]),
+        (neg, vec![5usize]),
+        (half32, vec![6usize]),
+    ];
+    let (ok, r, fc) = verify_virtual(
         &proof.out,
-        &[
-            (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
-            (neg, vec![3usize]),
-            (Goldilocks::ONE, vec![3usize]),
-            (neg * two32, vec![4usize]),
-            (neg, vec![5usize]),
-            (half32, vec![6usize]),
-        ],
+        &out_terms,
         Goldilocks::ZERO,
-        &proof.r_out,
-        &proof.out.final_evals,
-    ) {
+        arity_md,
+        transcript,
+    );
+    if !ok || r != proof.r_out || fc != virtual_eval(&out_terms, &proof.out.final_evals) {
         return false;
     }
-    if !verify_virtual(
+
+    let rem_split_terms = [
+        (Goldilocks::ONE, vec![0usize]),
+        (neg, vec![1usize]),
+        (neg * Goldilocks::from_u64(1u64 << 16), vec![2usize]),
+    ];
+    let (ok, r, fc) = verify_virtual(
         &proof.rem_split,
-        &[
-            (Goldilocks::ONE, vec![0usize]),
-            (neg, vec![1usize]),
-            (neg * Goldilocks::from_u64(1u64 << 16), vec![2usize]),
-        ],
+        &rem_split_terms,
         Goldilocks::ZERO,
-        &proof.rem_split_ch,
-        &proof.rem_split.final_evals,
-    ) {
-        return false;
-    }
-    true
+        arity_md,
+        transcript,
+    );
+    ok && r == proof.rem_split_ch && fc == virtual_eval(&rem_split_terms, &proof.rem_split.final_evals)
 }
 
 #[cfg(test)]
@@ -242,8 +249,13 @@ mod tests {
         let rsqrt_table: Vec<Goldilocks> = (0..64).map(|_| from_i64(65536)).collect();
         let (ms, _s_index, _rstd, out, _rem_out, _rem_lo, _rem_hi, _sum_sq, _rem_s) =
             rms_norm_forward(&x, &w, &rsqrt_table, m, d, n_real);
-        let (proof, _ridx, _rvals, _rem_lo, _rem_hi) = prove_rms_norm(&x, &w, &rsqrt_table, m, d, n_real, &mut rng);
-        assert!(verify_rms_norm(&proof, n_real));
+        let mut tp = zkie_core::common::transcript::Transcript::new(b"zkie-rmsnorm-test");
+        tp.absorb_u64(0x1234);
+        let (proof, _ridx, _rvals, _rem_lo, _rem_hi) =
+            prove_rms_norm(&x, &w, &rsqrt_table, m, d, n_real, &mut tp);
+        let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-rmsnorm-test");
+        tv.absorb_u64(0x1234);
+        assert!(verify_rms_norm(&proof, m, d, n_real, &mut tv));
         assert_eq!(ms.len(), m);
         assert_eq!(out.len(), m * d);
     }

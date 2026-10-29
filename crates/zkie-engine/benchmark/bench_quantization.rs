@@ -48,9 +48,13 @@ fn main() {
             .collect();
 
         let t0 = Instant::now();
-        let proof = prove_projection(&x, &w, &bias, &out, &rem, m, k, n, shift, &mut rng);
+        let mut t = zkie_core::common::transcript::Transcript::new(b"zkie-bench-quant");
+        t.absorb_u64(0xBEEF);
+        let proof = prove_projection(&x, &w, &bias, &out, &rem, m, k, n, shift, &mut t);
         let dt = t0.elapsed();
-        assert!(verify_projection(&proof, shift));
+        let mut tv = zkie_core::common::transcript::Transcript::new(b"zkie-bench-quant");
+        tv.absorb_u64(0xBEEF);
+        assert!(verify_projection(&proof, shift, m, k, n, &mut tv));
         println!(
             "shift={:>2} ({}-bit): {:>8.1?}  (range table = 2^{})",
             shift, shift, dt, shift

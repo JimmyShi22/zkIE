@@ -18,9 +18,10 @@
 
 use crate::common::field::{Goldilocks, PrimeCharacteristicRing};
 use crate::common::mle;
-use crate::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
+use crate::common::sumcheck::{prove_virtual, verify_virtual, virtual_eval, VirtualProof};
+use crate::common::transcript::Transcript;
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct BatchedMatmulProof {
     pub claimed: Goldilocks,
     pub sumcheck: VirtualProof,
@@ -45,9 +46,11 @@ fn terms() -> Vec<(Goldilocks, Vec<usize>)> {
 /// `(u, v)`.
 ///
 /// Layouts (row-major): `seg` = `S x K`, `w` = `S x K x N`, `g` = `S x N`.
-/// `u` fixes the `S` position variables, `v` fixes the `N` output variables, and
-/// `ch` carries `S + K` sumcheck challenges (the `(pos, d)` domain). `S`, `K`,
-/// `N` must be powers of two.
+/// `u` fixes the `S` position variables and `v` the `N` output variables
+/// (statement-bound, squeezed by the caller). S1: the `S + K` sumcheck
+/// challenges `ch` over the `(pos, d)` domain are derived per-round from the
+/// sumcheck's own round messages and returned. `S`, `K`, `N` must be powers of
+/// two.
 pub fn prove(
     seg: &[Goldilocks],
     w: &[Goldilocks],
@@ -57,14 +60,13 @@ pub fn prove(
     n: usize,
     u: &[Goldilocks],
     v: &[Goldilocks],
-    ch: &[Goldilocks],
-) -> BatchedMatmulProof {
+    transcript: &mut Transcript,
+) -> (BatchedMatmulProof, Vec<Goldilocks>) {
     assert_eq!(seg.len(), s * k);
     assert_eq!(w.len(), s * k * n);
     assert_eq!(g.len(), s * n);
     assert_eq!(u.len(), s.trailing_zeros() as usize);
     assert_eq!(v.len(), n.trailing_zeros() as usize);
-    assert_eq!(ch.len(), (s * k).trailing_zeros() as usize);
 
     let w_v = mle::partial_eval(w, v); // S x K, index pos*K + d
     let eq_u = mle::eq_evals(u); // S
@@ -75,37 +77,41 @@ pub fn prove(
     let claimed = mle::eval(g, &gp);
 
     let mles: [&[Goldilocks]; 3] = [seg, &w_v, &eq_b];
-    let sumcheck = prove_virtual(&mles, &terms(), claimed, ch);
-    BatchedMatmulProof { claimed, sumcheck }
+    let (sumcheck, ch) = prove_virtual(&mles, &terms(), claimed, transcript);
+    (BatchedMatmulProof { claimed, sumcheck }, ch)
 }
 
-/// Verify the sumcheck, recomputing the public `eq(pos, u)` selector. The
-/// `seg`/`w` endpoint evals carried by the proof are bound to their commitments
-/// by the caller (op layer), matching the ordinary-matmul convention.
+/// Verify the sumcheck with the S1 transcript replay, recomputing the public
+/// `eq(pos, u)` selector. Returns the derived `ch`. The `seg`/`w` endpoint
+/// evals carried by the proof are bound to their commitments by the caller
+/// (op layer), matching the ordinary-matmul convention.
 pub fn verify(
     proof: &BatchedMatmulProof,
     s: usize,
     k: usize,
     u: &[Goldilocks],
-    ch: &[Goldilocks],
-) -> bool {
+    transcript: &mut Transcript,
+) -> (bool, Vec<Goldilocks>) {
     assert_eq!(u.len(), s.trailing_zeros() as usize);
-    assert_eq!(ch.len(), (s * k).trailing_zeros() as usize);
     let eq_u = mle::eq_evals(u);
     let eq_b = broadcast_eq(&eq_u, k);
-    let eq_final = mle::eval(&eq_b, ch);
+    let (ok, ch, final_claim) = verify_virtual(
+        &proof.sumcheck,
+        &terms(),
+        proof.claimed,
+        (s * k).trailing_zeros() as usize,
+        transcript,
+    );
+    if !ok {
+        return (false, ch);
+    }
+    let eq_final = mle::eval(&eq_b, &ch);
     let final_evals = vec![
         proof.sumcheck.final_evals[0],
         proof.sumcheck.final_evals[1],
         eq_final,
     ];
-    verify_virtual(
-        &proof.sumcheck,
-        &terms(),
-        proof.claimed,
-        ch,
-        &final_evals,
-    )
+    (final_claim == virtual_eval(&terms(), &final_evals), ch)
 }
 
 /// Plain per-position matmul forward (also the test oracle).
@@ -191,14 +197,23 @@ mod tests {
         }
         assert_eq!(g, reference);
 
-        let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let ch: Vec<Goldilocks> = (0..(s * k).trailing_zeros() as usize)
-            .map(|_| rng.field())
-            .collect();
+        let mut tp = Transcript::new(b"zkie-bmm-test");
+        tp.absorb_u64(0xbeef);
+        let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| tp.field()).collect();
+        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| tp.field()).collect();
+        let (proof, ch) = prove(&seg, &w, &g, s, k, n, &u, &v, &mut tp);
 
-        let proof = prove(&seg, &w, &g, s, k, n, &u, &v, &ch);
-        assert!(verify(&proof, s, k, &u, &ch));
+        let mut tv = Transcript::new(b"zkie-bmm-test");
+        tv.absorb_u64(0xbeef);
+        for _ in 0..s.trailing_zeros() {
+            tv.field();
+        }
+        for _ in 0..n.trailing_zeros() {
+            tv.field();
+        }
+        let (ok, ch_v) = verify(&proof, s, k, &u, &mut tv);
+        assert!(ok);
+        assert_eq!(ch_v, ch);
 
         // endpoint evals match the committed tensors at the expected points
         let w_v = mle::partial_eval(&w, &v);
@@ -208,7 +223,16 @@ mod tests {
         // tamper the claimed output value -> reject
         let mut bad = proof;
         bad.claimed = bad.claimed + Goldilocks::ONE;
-        assert!(!verify(&bad, s, k, &u, &ch));
+        let mut tv2 = Transcript::new(b"zkie-bmm-test");
+        tv2.absorb_u64(0xbeef);
+        for _ in 0..s.trailing_zeros() {
+            tv2.field();
+        }
+        for _ in 0..n.trailing_zeros() {
+            tv2.field();
+        }
+        let (ok2, _) = verify(&bad, s, k, &u, &mut tv2);
+        assert!(!ok2);
     }
 }
 
@@ -356,6 +380,7 @@ pub fn gather_matmul_forward(
 
 /// Streaming prove: same eq-selector sumcheck as `prove`, but `w_v` is computed on
 /// the fly from the per-expert weights instead of a materialized `S x K x N` gather.
+/// Returns the proof and the derived `ch`.
 pub fn prove_streaming(
     seg: &[Goldilocks],
     expert_of: &[u32],
@@ -367,8 +392,8 @@ pub fn prove_streaming(
     n_experts: usize,
     u: &[Goldilocks],
     v: &[Goldilocks],
-    ch: &[Goldilocks],
-) -> BatchedMatmulProof {
+    transcript: &mut Transcript,
+) -> (BatchedMatmulProof, Vec<Goldilocks>) {
     assert_eq!(seg.len(), s * k);
     assert_eq!(expert_of.len(), s);
     assert_eq!(w_all.len(), n_experts * k * n);
@@ -383,12 +408,13 @@ pub fn prove_streaming(
     let claimed = mle::eval(g, &gp);
 
     let mles: [&[Goldilocks]; 3] = [seg, &w_v, &eq_b];
-    let sumcheck = prove_virtual(&mles, &terms(), claimed, ch);
-    BatchedMatmulProof { claimed, sumcheck }
+    let (sumcheck, ch) = prove_virtual(&mles, &terms(), claimed, transcript);
+    (BatchedMatmulProof { claimed, sumcheck }, ch)
 }
 
-/// Streaming verify: the ordinary eq-selector sumcheck, plus the weight claim bound
-/// by the linear combination `final_evals[1] == sum_e counts[e] * table[e]`.
+/// Streaming verify: the ordinary eq-selector sumcheck (S1 transcript replay),
+/// plus the weight claim bound by the linear combination
+/// `final_evals[1] == sum_e counts[e] * table[e]`.
 pub fn verify_streaming(
     proof: &BatchedMatmulProof,
     expert_of: &[u32],
@@ -399,19 +425,20 @@ pub fn verify_streaming(
     n_experts: usize,
     u: &[Goldilocks],
     v: &[Goldilocks],
-    ch: &[Goldilocks],
-) -> bool {
+    transcript: &mut Transcript,
+) -> (bool, Vec<Goldilocks>) {
     assert_eq!(expert_of.len(), s);
     assert_eq!(w_all.len(), n_experts * k * n);
-    if !verify(proof, s, k, u, ch) {
-        return false;
+    let (ok, ch) = verify(proof, s, k, u, transcript);
+    if !ok {
+        return (false, ch);
     }
     let k_bits = k.trailing_zeros() as usize;
     let ch_d = &ch[..k_bits];
     let ch_pos = &ch[k_bits..];
     let counts = expert_counts(expert_of, n_experts, ch_pos);
     let table = expert_table_evals(w_all, n_experts, k, n, ch_d, v);
-    proof.sumcheck.final_evals[1] == gather_open(&counts, &table)
+    (proof.sumcheck.final_evals[1] == gather_open(&counts, &table), ch)
 }
 
 #[cfg(test)]
@@ -438,17 +465,38 @@ mod streaming_matmul_tests {
         let g_mat = forward(&seg, &w_gathered, s, k, n);
         assert_eq!(g_stream, g_mat);
 
-        let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let ch: Vec<Goldilocks> = (0..(s * k).trailing_zeros() as usize).map(|_| rng.field()).collect();
+        let mut tp = Transcript::new(b"zkie-bmm-stream-test");
+        tp.absorb_u64(0x6161);
+        let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| tp.field()).collect();
+        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| tp.field()).collect();
+        let (proof, ch) =
+            prove_streaming(&seg, &expert_of, &w_all, &g_stream, s, k, n, n_experts, &u, &v, &mut tp);
 
-        let proof = prove_streaming(&seg, &expert_of, &w_all, &g_stream, s, k, n, n_experts, &u, &v, &ch);
-        assert!(verify_streaming(&proof, &expert_of, &w_all, s, k, n, n_experts, &u, &v, &ch));
+        let mut tv = Transcript::new(b"zkie-bmm-stream-test");
+        tv.absorb_u64(0x6161);
+        for _ in 0..s.trailing_zeros() {
+            tv.field();
+        }
+        for _ in 0..n.trailing_zeros() {
+            tv.field();
+        }
+        let (ok, ch_v) = verify_streaming(&proof, &expert_of, &w_all, s, k, n, n_experts, &u, &v, &mut tv);
+        assert!(ok);
+        assert_eq!(ch_v, ch);
 
         // tamper the weight claim -> reject
         let mut bad = proof;
         bad.sumcheck.final_evals[1] = bad.sumcheck.final_evals[1] + Goldilocks::ONE;
-        assert!(!verify_streaming(&bad, &expert_of, &w_all, s, k, n, n_experts, &u, &v, &ch));
+        let mut tv2 = Transcript::new(b"zkie-bmm-stream-test");
+        tv2.absorb_u64(0x6161);
+        for _ in 0..s.trailing_zeros() {
+            tv2.field();
+        }
+        for _ in 0..n.trailing_zeros() {
+            tv2.field();
+        }
+        let (ok2, _) = verify_streaming(&bad, &expert_of, &w_all, s, k, n, n_experts, &u, &v, &mut tv2);
+        assert!(!ok2);
     }
 }
 
@@ -477,20 +525,23 @@ pub fn prove_gather_matmul(
     n_experts: usize,
     u: &[Goldilocks],
     v: &[Goldilocks],
-    ch: &[Goldilocks],
-) -> GatherMatMulProof {
-    let matmul = prove_streaming(seg, expert_of, w_all, g, s, k, n, n_experts, u, v, ch);
+    transcript: &mut Transcript,
+) -> (GatherMatMulProof, Vec<Goldilocks>) {
+    let (matmul, ch) = prove_streaming(seg, expert_of, w_all, g, s, k, n, n_experts, u, v, transcript);
     let k_bits = k.trailing_zeros() as usize;
     let ch_d = &ch[..k_bits];
     let ch_pos = &ch[k_bits..];
     let counts = expert_counts(expert_of, n_experts, ch_pos);
     let table = expert_table_evals(w_all, n_experts, k, n, ch_d, v);
-    GatherMatMulProof {
-        claimed: matmul.claimed,
-        sumcheck: matmul.sumcheck,
-        counts,
-        table,
-    }
+    (
+        GatherMatMulProof {
+            claimed: matmul.claimed,
+            sumcheck: matmul.sumcheck,
+            counts,
+            table,
+        },
+        ch,
+    )
 }
 
 pub fn verify_gather_matmul(
@@ -498,20 +549,22 @@ pub fn verify_gather_matmul(
     s: usize,
     k: usize,
     u: &[Goldilocks],
-    ch: &[Goldilocks],
-) -> bool {
-    let eq_u = mle::eq_evals(u);
-    let eq_b = broadcast_eq(&eq_u, k);
-    let eq_final = mle::eval(&eq_b, ch);
-    let final_evals = vec![
-        proof.sumcheck.final_evals[0],
-        proof.sumcheck.final_evals[1],
-        eq_final,
-    ];
-    if !verify_virtual(&proof.sumcheck, &terms(), proof.claimed, ch, &final_evals) {
-        return false;
+    transcript: &mut Transcript,
+) -> (bool, Vec<Goldilocks>) {
+    let (ok, ch) = verify(
+        &BatchedMatmulProof {
+            claimed: proof.claimed,
+            sumcheck: proof.sumcheck.clone(),
+        },
+        s,
+        k,
+        u,
+        transcript,
+    );
+    if !ok {
+        return (false, ch);
     }
-    proof.sumcheck.final_evals[1] == gather_open(&proof.counts, &proof.table)
+    (proof.sumcheck.final_evals[1] == gather_open(&proof.counts, &proof.table), ch)
 }
 
 #[cfg(test)]
@@ -532,17 +585,38 @@ mod gather_matmul_proof_tests {
             .collect();
         let g = gather_matmul_forward(&seg, &expert_of, &w_all, s, k, n, n_experts);
 
-        let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| rng.field()).collect();
-        let ch: Vec<Goldilocks> = (0..(s * k).trailing_zeros() as usize).map(|_| rng.field()).collect();
+        let mut tp = Transcript::new(b"zkie-bmm-gather-test");
+        tp.absorb_u64(0x7171);
+        let u: Vec<Goldilocks> = (0..s.trailing_zeros() as usize).map(|_| tp.field()).collect();
+        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize).map(|_| tp.field()).collect();
+        let (proof, ch) =
+            prove_gather_matmul(&seg, &expert_of, &w_all, &g, s, k, n, n_experts, &u, &v, &mut tp);
 
-        let proof = prove_gather_matmul(&seg, &expert_of, &w_all, &g, s, k, n, n_experts, &u, &v, &ch);
-        assert!(verify_gather_matmul(&proof, s, k, &u, &ch));
+        let mut tv = Transcript::new(b"zkie-bmm-gather-test");
+        tv.absorb_u64(0x7171);
+        for _ in 0..s.trailing_zeros() {
+            tv.field();
+        }
+        for _ in 0..n.trailing_zeros() {
+            tv.field();
+        }
+        let (ok, ch_v) = verify_gather_matmul(&proof, s, k, &u, &mut tv);
+        assert!(ok);
+        assert_eq!(ch_v, ch);
 
         // tamper the weight claim (final_evals[1]) -> reject
         let mut bad = proof;
         bad.sumcheck.final_evals[1] = bad.sumcheck.final_evals[1] + Goldilocks::ONE;
-        assert!(!verify_gather_matmul(&bad, s, k, &u, &ch));
+        let mut tv2 = Transcript::new(b"zkie-bmm-gather-test");
+        tv2.absorb_u64(0x7171);
+        for _ in 0..s.trailing_zeros() {
+            tv2.field();
+        }
+        for _ in 0..n.trailing_zeros() {
+            tv2.field();
+        }
+        let (ok2, _) = verify_gather_matmul(&bad, s, k, &u, &mut tv2);
+        assert!(!ok2);
     }
 }
 
