@@ -2129,6 +2129,19 @@ pub fn verify_shard_precomputed(
     proof: &OpShardProof,
     transcript: &mut Transcript,
 ) -> bool {
+    verify_shard_precomputed_inner(tables, ops, proof, transcript, true)
+}
+
+/// Shard replay with the lookup-column fractional proofs skipped: the
+/// committed path re-proves those on its own transcript, so they are verified
+/// by the committed frac section instead.
+fn verify_shard_precomputed_inner(
+    tables: &[&[Goldilocks]],
+    ops: &[Op],
+    proof: &OpShardProof,
+    transcript: &mut Transcript,
+    include_lookups: bool,
+) -> bool {
     assert_eq!(proof.ops.len(), ops.len());
     assert_eq!(proof.bound.len(), proof.binds.len());
 
@@ -2298,16 +2311,20 @@ pub fn verify_shard_precomputed(
     }
 
     // Replay the per-table lookup fractional proofs in the prover's column
-    // order (per table: alpha, beta, witness frac, table frac).
-    if proof.witness_columns.len() != proof.table_columns.len() {
-        return false;
-    }
-    for (wc, tc) in proof.witness_columns.iter().zip(proof.table_columns.iter()) {
-        if transcript.field() != wc.alpha || transcript.field() != wc.beta {
+    // order (per table: alpha, beta, witness frac, table frac). Skipped on
+    // the committed path, whose frac section verifies the re-proven proofs
+    // on the committed transcript.
+    if include_lookups {
+        if proof.witness_columns.len() != proof.table_columns.len() {
             return false;
         }
-        if !verify_lookup_split(&wc.proof, &tc.proof, transcript) {
-            return false;
+        for (wc, tc) in proof.witness_columns.iter().zip(proof.table_columns.iter()) {
+            if transcript.field() != wc.alpha || transcript.field() != wc.beta {
+                return false;
+            }
+            if !verify_lookup_split(&wc.proof, &tc.proof, transcript) {
+                return false;
+            }
         }
     }
 
@@ -3923,7 +3940,8 @@ pub fn verify_committed_shard_dag(
         .map(|(i, &(s, e))| {
             let mut child = master.clone();
             child.absorb_u64(i as u64);
-            verify_shard_precomputed(tables, &ops[s..e], &shards[i], &mut child)
+            let ok = verify_shard_precomputed_inner(tables, &ops[s..e], &shards[i], &mut child, false);
+            ok
         })
         .all(|ok| ok);
     if !all_ok {
@@ -3950,7 +3968,6 @@ pub fn verify_committed_shard_dag(
             return false;
         }
     }
-
     // Verify each size group's vertical batch opening against the committed
     // weight roots (one FRI proof + one sumcheck per group, no tensor data).
     if proof.weight_batch_openings.len() != proof.weight_batches.len() {
@@ -3997,14 +4014,14 @@ pub fn verify_committed_shard_dag(
         } else {
             let (tc, to2) = (&to.table_commitment, &to.table_opening);
             if bw.verify(tc.as_ref().unwrap(), to2.as_ref().unwrap(), &protocol, &to.point).ok() != Some(to.table_eval) {
-                return false;
+            return false;
             }
             // The den-side opening authenticates the table at q_den.
             let (dc, do2) = (&to.table_commitment, &to.den_table_opening);
             if bw.verify(dc.as_ref().unwrap(), do2.as_ref().unwrap(), &protocol, &to.den_point).ok()
                 != Some(to.den_table_eval)
             {
-                return false;
+            return false;
             }
             to.table_eval
         };
@@ -5198,6 +5215,376 @@ mod tests {
             }
         }
         assert!(!verify_committed_shard_dag(&store.owned_slices(), &ops, 2, &whir, &proof));
+    }
+
+
+    /// S2 regression (gist "S2 / P0"): the verifier must rebuild the binding
+    /// set from its own reduction. Dropping one claim of a bound tensor AND
+    /// removing the tensor from `proof.bound` must NOT silently disable the
+    /// binding. (Pre-fix this forgery was accepted.)
+    #[test]
+    fn s2_dropped_claim_binding_rejected() {
+        let mut rng = XorShift64::new(0x52_01);
+        let (m, k, n, shift) = (4usize, 4usize, 4usize, 8u32);
+        let mut store = Store::new();
+        let x = store.push(
+            (0..m * k)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        let mut ws = Vec::new();
+        let mut bs = Vec::new();
+        for _ in 0..2 {
+            ws.push(store.push(
+                (0..k * n)
+                    .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                    .collect(),
+            ));
+            bs.push(store.push(
+                (0..m * n)
+                    .map(|_| from_i64((rng.next_u64() % 10) as i64 - 5))
+                    .collect(),
+            ));
+        }
+        let mid = store.push(vec![]);
+        let mid_rem = store.push(vec![]);
+        let out = store.push(vec![]);
+        let out_rem = store.push(vec![]);
+        let ops = vec![
+            Op::Projection {
+                x,
+                w: ws[0],
+                bias: bs[0],
+                out: mid,
+                rem: mid_rem,
+                m,
+                k,
+                n,
+                shift,
+            },
+            Op::Projection {
+                x: mid,
+                w: ws[1],
+                bias: bs[1],
+                out,
+                rem: out_rem,
+                m,
+                k,
+                n,
+                shift,
+            },
+        ];
+
+        let mut tp = Transcript::new(b"zkie-s2-test");
+        let proof = prove_shard(&mut store, &ops, &[out], &mut tp);
+        assert!(!proof.bound.is_empty(), "mid must be bound (2 claims)");
+        let mut tv = Transcript::new(b"zkie-s2-test");
+        assert!(verify_shard(&store.owned_slices(), &ops, &proof, &mut tv));
+
+        // Forge: drop ONE claim on the bound tensor and remove it from
+        // `bound`/`binds`, so the pre-fix verifier (which trusts both lists)
+        // silently skips the binding.
+        let bt = proof.bound[0];
+        let OpShardProof {
+            ops: proof_ops,
+            bound,
+            binds,
+            claims,
+            witness_columns,
+            table_columns,
+        } = proof;
+        let mut forged = OpShardProof {
+            ops: proof_ops,
+            bound: bound[1..].to_vec(),
+            binds: binds[1..].to_vec(),
+            claims: Vec::new(),
+            witness_columns,
+            table_columns,
+        };
+        let mut dropped = false;
+        for (t, pt, ev) in &claims {
+            if *t == bt && !dropped {
+                dropped = true;
+                continue;
+            }
+            forged.claims.push((*t, pt.clone(), *ev));
+        }
+        assert!(dropped, "claim to drop must exist");
+        let mut tv2 = Transcript::new(b"zkie-s2-test");
+        // S2: this must be REJECTED (pre-fix it is ACCEPTED).
+        assert!(!verify_shard(&store.owned_slices(), &ops, &forged, &mut tv2));
+    }
+
+    /// S2 regression: empty commitment lists must not skip non-empty
+    /// statements. Clearing every weight batch + opening on a committed proof
+    /// with weights must be rejected. (Pre-fix it was accepted.)
+    #[test]
+    fn s2_empty_weight_batches_rejected() {
+        use zkie_core::pcs::whir::Whir;
+        let mut rng = XorShift64::new(0x52_02);
+        let (m, k, n, shift) = (4usize, 8usize, 8usize, 8u32);
+        let mut store = Store::new();
+        let x = store.push(
+            (0..m * k)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        let w = store.push(
+            (0..k * n)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        let b = store.push(
+            (0..m * n)
+                .map(|_| from_i64((rng.next_u64() % 10) as i64 - 5))
+                .collect(),
+        );
+        let out = store.push(vec![]);
+        let rem = store.push(vec![]);
+        let ops = vec![Op::Projection {
+            x,
+            w,
+            bias: b,
+            out,
+            rem,
+            m,
+            k,
+            n,
+            shift,
+        }];
+
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s2-cache");
+        assert!(!cached.is_empty());
+        let tokens_t = store.push_idx(vec![]);
+        let argmax_t = store.push_idx(vec![]);
+        let mut proof =
+            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        assert!(!proof.weight_batches.is_empty());
+        assert!(verify_committed_shard_dag(&store.owned_slices(), &ops, 1, &whir, &proof));
+
+        // Forge: drop every weight batch + opening.
+        proof.weight_batches.clear();
+        proof.weight_batch_openings.clear();
+        let bytes = bincode::serialize(&proof).unwrap();
+        // S2: must be REJECTED (pre-fix it is ACCEPTED through the serialized
+        // entry with the empty lists).
+        assert!(!verify_committed_shard_dag_bytes(
+            &bytes,
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir
+        ));
+    }
+
+    /// S2 regression: the identity-table decision comes from the statement,
+    /// not from a proof flag. Forging `is_identity` on a non-identity table
+    /// (plus the consistent den-side values) must be rejected. (Pre-fix it
+    /// was accepted.)
+    #[test]
+    fn s2_identity_flag_forgery_rejected() {
+        use zkie_core::pcs::whir::Whir;
+        let mut rng = XorShift64::new(0x52_03);
+        let (m, k, n, shift) = (4usize, 4usize, 4usize, 8u32);
+        let mut store = Store::new();
+        let x = store.push(
+            (0..m * k)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        let w = store.push(
+            (0..k * n)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        let b = store.push(
+            (0..m * n)
+                .map(|_| from_i64((rng.next_u64() % 10) as i64 - 5))
+                .collect(),
+        );
+        let out = store.push(vec![]);
+        let rem = store.push(vec![]);
+        // Non-identity lookup table (>= 32 entries so the committed
+        // table commit has a valid WHIR folding schedule).
+        let table = store.push(
+            (0..32)
+                .map(|j| from_i64((j as i64 * j as i64) % 1000))
+                .collect(),
+        );
+        let idx = store.push_idx((0..16u32).collect::<Vec<u32>>());
+        let act = store.push(vec![]);
+        let ops = vec![
+            Op::Projection {
+                x,
+                w,
+                bias: b,
+                out,
+                rem,
+                m,
+                k,
+                n,
+                shift,
+            },
+            Op::Lookup {
+                idx,
+                out: act,
+                table,
+            },
+        ];
+
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s2-cache2");
+        let tokens_t = store.push_idx(vec![]);
+        let argmax_t = store.push_idx(vec![]);
+        let mut proof =
+            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        assert!(!proof.table_openings.is_empty());
+
+        // Forge: claim the table is an identity table (den = alpha + j +
+        // beta*j at the m-column point) and drop the table commitment.
+        for to in proof.table_openings.iter_mut() {
+            let mut den_idx = Goldilocks::ZERO;
+            for (kk, &pk) in to.point.iter().enumerate() {
+                den_idx = den_idx + Goldilocks::from_u64(1u64 << kk) * pk;
+            }
+            to.is_identity = true;
+            to.table_commitment = None;
+            to.table_opening = None;
+            to.den_point = to.point.clone();
+            to.den_table_opening = None;
+            to.den_table_eval = Goldilocks::ZERO;
+            to.den_leaf = to.alpha + den_idx + to.beta * den_idx;
+        }
+        // S2: must be REJECTED (pre-fix it is ACCEPTED).
+        assert!(!verify_committed_shard_dag(
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir,
+            &proof
+        ));
+    }
+
+    /// S2 regression: table-side openings must sit on the fractional proof's
+    /// derived leaf points. Moving the m-column opening to an arbitrary point
+    /// (with an honestly re-created opening there) must be rejected.
+    /// (Pre-fix it was accepted.)
+    #[test]
+    fn s2_table_leaf_point_swap_rejected() {
+        use zkie_core::pcs::committed::commit;
+        use zkie_core::pcs::whir::Whir;
+        let mut rng = XorShift64::new(0x52_04);
+        let (m, k, n, shift) = (4usize, 4usize, 4usize, 8u32);
+        let mut store = Store::new();
+        let x = store.push(
+            (0..m * k)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        let w = store.push(
+            (0..k * n)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        let b = store.push(
+            (0..m * n)
+                .map(|_| from_i64((rng.next_u64() % 10) as i64 - 5))
+                .collect(),
+        );
+        let out = store.push(vec![]);
+        let rem = store.push(vec![]);
+        let table = store.push(
+            (0..32)
+                .map(|j| from_i64((j as i64 * j as i64) % 1000))
+                .collect(),
+        );
+        let idx = store.push_idx((0..16u32).collect::<Vec<u32>>());
+        let act = store.push(vec![]);
+        let ops = vec![
+            Op::Projection {
+                x,
+                w,
+                bias: b,
+                out,
+                rem,
+                m,
+                k,
+                n,
+                shift,
+            },
+            Op::Lookup {
+                idx,
+                out: act,
+                table,
+            },
+        ];
+
+        // Plain-path control: the same ops must verify through the shard-DAG
+        // entry (the committed shard proofs are identical).
+        {
+            let mut store2 = Store {
+                v: store.v.clone(),
+                idx: store.idx.clone(),
+            };
+            let plain = prove_shard_dag(&mut store2, &ops, 1);
+            let ok_plain = verify_shard_dag(&store2.owned_slices(), &ops, 1, &plain);
+            assert!(ok_plain, "plain-path control must pass");
+        }
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s2-cache3");
+        let tokens_t = store.push_idx(vec![]);
+        let argmax_t = store.push_idx(vec![]);
+        let mut proof =
+            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        assert!(!proof.table_openings.is_empty());
+
+        // Re-commit the m column and the table, then re-open at an arbitrary
+        // point p' and move the opening there (the pre-fix verifier accepts
+        // any point the opening is consistent at).
+        let idx_vals = &store.idx[idx];
+        let m_col: Vec<u64> = idx_vals.iter().fold(vec![0u64; 32], |mut acc, &i| {
+            acc[i as usize] += 1;
+            acc
+        });
+        let total = 32usize.next_power_of_two();
+        let arity = total.trailing_zeros() as usize;
+        let mut m_pad = vec![Goldilocks::from_u64(0); total];
+        let mut table_pad = vec![Goldilocks::from_u64(0); total];
+        for j in 0..32 {
+            m_pad[j] = Goldilocks::from_u64(m_col[j]);
+            table_pad[j] = store.get(table)[j];
+        }
+        let bw = Whir::with_params(arity, 90, Whir::required_pow_bits(arity, 90));
+        let c_m = commit(&bw, &m_pad);
+        let c_t = commit(&bw, &table_pad);
+        let p_new: Vec<Goldilocks> = (0..arity).map(|_| rng.field()).collect();
+        let (open_new, ev_new) = bw.open(c_m.prover_data.clone(), &c_m.protocol, &p_new);
+        let (open_t_new, ev_t_new) = bw.open(c_t.prover_data.clone(), &c_t.protocol, &p_new);
+
+        for to in proof.table_openings.iter_mut() {
+            to.point = p_new.clone();
+            to.claimed = ev_new;
+            to.opening = open_new.clone();
+            to.table_eval = ev_t_new;
+            to.table_opening = Some(open_t_new.clone());
+            to.den_point = p_new.clone();
+            to.den_table_eval = ev_t_new;
+            to.den_table_opening = Some(open_t_new.clone());
+            let mut den_idx = Goldilocks::ZERO;
+            for (kk, &pk) in p_new.iter().enumerate() {
+                den_idx = den_idx + Goldilocks::from_u64(1u64 << kk) * pk;
+            }
+            to.den_leaf = to.alpha + den_idx + to.beta * ev_t_new;
+        }
+        // S2: must be REJECTED (pre-fix it is ACCEPTED).
+        assert!(!verify_committed_shard_dag(
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir,
+            &proof
+        ));
     }
 
     #[test]
