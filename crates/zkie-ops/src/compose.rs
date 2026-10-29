@@ -921,7 +921,11 @@ pub struct WitnessColumn {
     pub x: Vec<Goldilocks>,
     pub y: Vec<Goldilocks>,
     pub num: Vec<Goldilocks>,
+    /// Leaf claim point on the num column (q_num_0).
     pub point: Vec<Goldilocks>,
+    /// Leaf claim point on the den side (q_den_0); carried for the S2/S3
+    /// claim-authentication work, not opened on the committed path yet.
+    pub den_point: Vec<Goldilocks>,
     pub num_leaf: Goldilocks,
     pub den_leaf: Goldilocks,
     pub alpha: Goldilocks,
@@ -939,6 +943,7 @@ pub struct TableColumn {
     pub alpha: Goldilocks,
     pub beta: Goldilocks,
     pub point: Vec<Goldilocks>,
+    pub den_point: Vec<Goldilocks>,
     pub num_leaf: Goldilocks,
     pub den_leaf: Goldilocks,
 }
@@ -2063,16 +2068,17 @@ pub fn prove_shard_precomputed(
         let ys: Vec<&[Goldilocks]> = lookups.iter().map(|(_, y)| y.as_slice()).collect();
         let (proof, x, y, num, _den) =
             prove_lookup_witness_batch_columns(&xs, &ys, alpha, beta, transcript);
-        let (point, num_leaf, den_leaf) = fractional_leaf(&proof);
+        let (point, num_leaf, den_point, den_leaf) = fractional_leaf(&proof);
         let m = merge_multiplicity(&xs, store.get(*table).len());
         let table_proof = prove_lookup_table(&m, store.get(*table), alpha, beta, transcript);
-        let (point_t, num_leaf_t, den_leaf_t) = fractional_leaf(&table_proof);
+        let (point_t, num_leaf_t, den_point_t, den_leaf_t) = fractional_leaf(&table_proof);
         witness_columns.push(WitnessColumn {
             proof,
             x,
             y,
             num,
             point,
+            den_point,
             num_leaf,
             den_leaf,
             alpha,
@@ -2086,6 +2092,7 @@ pub fn prove_shard_precomputed(
             alpha,
             beta,
             point: point_t,
+            den_point: den_point_t,
             num_leaf: num_leaf_t,
             den_leaf: den_leaf_t,
         });
@@ -2737,6 +2744,11 @@ pub struct TableOpening {
     pub table_commitment: Option<zkie_core::pcs::whir::Commitment>,
     pub table_opening: Option<zkie_core::pcs::whir::Proof>,
     pub table_eval: Goldilocks,
+    /// The table opened at the den-side leaf claim point (q_den), so the
+    /// verifier can check the den relation at that point.
+    pub den_point: Vec<Goldilocks>,
+    pub den_table_opening: Option<zkie_core::pcs::whir::Proof>,
+    pub den_table_eval: Goldilocks,
     pub is_identity: bool,
     pub alpha: Goldilocks,
     pub beta: Goldilocks,
@@ -3155,9 +3167,10 @@ pub fn prove_committed_shard_dag(
                 den[j] = alpha + wc.x[j] + beta * wc.y[j];
             }
             let new_proof = prove_fractional(wc.num.clone(), den, &mut ts);
-            let (point, num_leaf, den_leaf) = fractional_leaf(&new_proof);
+            let (point, num_leaf, den_point, den_leaf) = fractional_leaf(&new_proof);
             wc.proof = new_proof;
             wc.point = point;
+            wc.den_point = den_point;
             wc.num_leaf = num_leaf;
             wc.den_leaf = den_leaf;
             wc.alpha = alpha;
@@ -3172,9 +3185,10 @@ pub fn prove_committed_shard_dag(
             let (num_t, den_t) =
                 build_lookup_table_num_den(&tc.m, store.get(tc.table), alpha, beta);
             let new_proof = prove_fractional(num_t, den_t, &mut ts);
-            let (point, num_leaf, den_leaf) = fractional_leaf(&new_proof);
+            let (point, num_leaf, den_point, den_leaf) = fractional_leaf(&new_proof);
             tc.proof = new_proof;
             tc.point = point;
+            tc.den_point = den_point;
             tc.num_leaf = num_leaf;
             tc.den_leaf = den_leaf;
             tc.alpha = alpha;
@@ -3286,14 +3300,15 @@ pub fn prove_committed_shard_dag(
     for (si, shard) in shards.iter_mut().enumerate() {
         for (i, tc) in shard.table_columns.iter_mut().enumerate() {
             let point = tc.point.clone();
+            let den_point = tc.den_point.clone();
             let num_leaf = tc.num_leaf;
             let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(t_arities[si][i], 90);
             let bw = zkie_core::pcs::whir::Whir::with_params(t_arities[si][i], 90, pow_bits);
             let (open, ev) = bw.open(t_cms[si][i].prover_data.clone(), &t_cms[si][i].protocol, &point);
             assert_eq!(ev, num_leaf);
             let is_ident = identity_tables.contains(&tc.table);
-            let (table_commitment, table_opening, table_eval) = if is_ident {
-                (None, None, Goldilocks::ZERO)
+            let (table_commitment, table_opening, table_eval, den_table_opening, den_table_eval) = if is_ident {
+                (None, None, Goldilocks::ZERO, None, Goldilocks::ZERO)
             } else {
                 let (table_arity, table_committed) = &global_table_commits[&tc.table];
                 let table_bw = zkie_core::pcs::whir::Whir::with_params(
@@ -3306,7 +3321,18 @@ pub fn prove_committed_shard_dag(
                     &table_committed.protocol,
                     &point,
                 );
-                (Some(table_committed.commitment.clone()), Some(open_table), ev_table)
+                let (open_den_table, ev_den_table) = table_bw.open(
+                    table_committed.prover_data.clone(),
+                    &table_committed.protocol,
+                    &den_point,
+                );
+                (
+                    Some(table_committed.commitment.clone()),
+                    Some(open_table),
+                    ev_table,
+                    Some(open_den_table),
+                    ev_den_table,
+                )
             };
             table_openings.push(TableOpening {
                 commitment: t_cms[si][i].commitment.clone(),
@@ -3317,6 +3343,9 @@ pub fn prove_committed_shard_dag(
                 table_commitment,
                 table_opening,
                 table_eval,
+                den_point,
+                den_table_opening,
+                den_table_eval,
                 is_identity: is_ident,
                 alpha: tc.alpha,
                 beta: tc.beta,
@@ -3524,8 +3553,8 @@ pub fn prove_committed_shard_dag(
                 OpProof::Scatter(p) => p,
                 _ => unreachable!(),
             };
-            let (point_a, num_leaf_a, den_leaf_a) = fractional_leaf(&sp.perm.a_side);
-            let (point_b, num_leaf_b, den_leaf_b) = fractional_leaf(&sp.perm.b_side);
+            let (point_a, num_leaf_a, den_point_a, den_leaf_a) = fractional_leaf(&sp.perm.a_side);
+            let (point_b, num_leaf_b, den_point_b, den_leaf_b) = fractional_leaf(&sp.perm.b_side);
             let a = std::mem::take(&mut sp.perm.a);
             let b = std::mem::take(&mut sp.perm.b);
             let total = 1usize << arity;
@@ -3537,25 +3566,34 @@ pub fn prove_committed_shard_dag(
                 b_pad[i] = b[i];
                 num_pad[i] = Goldilocks::ONE;
             }
+            // Each a/b column gets TWO claims: at the num leaf point (q_num)
+            // and at the den leaf point (q_den), so the verifier can check the
+            // pointwise relation den = alpha - value at q_den.
             points_a.push(point_a.clone());
-            points_b.push(point_b.clone());
+            points_a.push(den_point_a.clone());
             a_claimed.push(mle::eval(&a_pad, &point_a));
+            a_claimed.push(mle::eval(&a_pad, &den_point_a));
+            points_b.push(point_b.clone());
+            points_b.push(den_point_b.clone());
             b_claimed.push(mle::eval(&b_pad, &point_b));
+            b_claimed.push(mle::eval(&b_pad, &den_point_b));
             num_idxs.push(ti);
             num_idxs.push(ti);
             num_points.push(point_a.clone());
             num_points.push(point_b.clone());
             num_claimed.push(num_leaf_a);
             num_claimed.push(num_leaf_b);
+            a_tensors.push(a_pad.clone());
             a_tensors.push(a_pad);
+            b_tensors.push(b_pad.clone());
             b_tensors.push(b_pad);
             num_tensors.push(num_pad.clone());
             num_tensors.push(num_pad);
             perm_locations_slots[gid] = Some(PermLocation {
                 a_batch: 3 * g_idx,
-                a_table: ti,
+                a_table: 2 * ti,
                 b_batch: 3 * g_idx + 1,
-                b_table: ti,
+                b_table: 2 * ti,
                 num_batch: 3 * g_idx + 2,
                 num_table: ti,
             });
@@ -3746,9 +3784,9 @@ pub fn prove_committed_shard_dag(
             _ => unreachable!(),
         };
         let new_src = prove_fractional(sp.num_source.clone(), op_den_src[gid].clone(), &mut ts);
-        let (point_src, _, _) = fractional_leaf(&new_src);
+        let (point_src, _, _, _) = fractional_leaf(&new_src);
         let new_tgt = prove_fractional(sp.num_target.clone(), op_den_tgt[gid].clone(), &mut ts);
-        let (point_tgt, _, _) = fractional_leaf(&new_tgt);
+        let (point_tgt, _, _, _) = fractional_leaf(&new_tgt);
         sp.source_side = new_src;
         sp.target_side = new_tgt;
         op_point_src[gid] = point_src;
@@ -3961,9 +3999,25 @@ pub fn verify_committed_shard_dag(
             if bw.verify(tc.as_ref().unwrap(), to2.as_ref().unwrap(), &protocol, &to.point).ok() != Some(to.table_eval) {
                 return false;
             }
+            // The den-side opening authenticates the table at q_den.
+            let (dc, do2) = (&to.table_commitment, &to.den_table_opening);
+            if bw.verify(dc.as_ref().unwrap(), do2.as_ref().unwrap(), &protocol, &to.den_point).ok()
+                != Some(to.den_table_eval)
+            {
+                return false;
+            }
             to.table_eval
         };
-        let expected_den = to.alpha + eval_idx + to.beta * table_eval;
+        let mut den_idx = Goldilocks::ZERO;
+        for (k, &pk) in to.den_point.iter().enumerate() {
+            den_idx = den_idx + Goldilocks::from_u64(1u64 << k) * pk;
+        }
+        let den_table_eval = if to.is_identity {
+            den_idx
+        } else {
+            to.den_table_eval
+        };
+        let expected_den = to.alpha + den_idx + to.beta * den_table_eval;
         if expected_den != to.den_leaf {
             return false;
         }
@@ -4067,10 +4121,11 @@ pub fn verify_committed_shard_dag(
             for op in &shard.ops {
                 if let OpProof::Scatter(sp) = op {
                     let loc = &proof.perm_locations[gid];
-                    let (_, num_leaf_a, den_leaf_a) = fractional_leaf(&sp.perm.a_side);
-                    let (_, num_leaf_b, den_leaf_b) = fractional_leaf(&sp.perm.b_side);
-                    let eval_a = proof.perm_batch_openings[loc.a_batch].claimed[loc.a_table];
-                    let eval_b = proof.perm_batch_openings[loc.b_batch].claimed[loc.b_table];
+                    let (_, num_leaf_a, _, den_leaf_a) = fractional_leaf(&sp.perm.a_side);
+                    let (_, num_leaf_b, _, den_leaf_b) = fractional_leaf(&sp.perm.b_side);
+                    // entry loc.a_table is the q_num claim; +1 is the q_den claim
+                    let eval_a = proof.perm_batch_openings[loc.a_batch].claimed[loc.a_table + 1];
+                    let eval_b = proof.perm_batch_openings[loc.b_batch].claimed[loc.b_table + 1];
                     let nl_a = proof.perm_batch_openings[loc.num_batch].claimed[2 * loc.num_table];
                     let nl_b = proof.perm_batch_openings[loc.num_batch].claimed[2 * loc.num_table + 1];
                     if nl_a != num_leaf_a || nl_b != num_leaf_b {

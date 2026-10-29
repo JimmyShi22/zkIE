@@ -10,7 +10,7 @@ use crate::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift6
 use crate::common::sumcheck::{prove_virtual, verify_virtual, virtual_eval, VirtualProof};
 use crate::common::transcript::Transcript;
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SamePolyProof {
     pub coeffs: Vec<Goldilocks>,
     pub proof: VirtualProof,

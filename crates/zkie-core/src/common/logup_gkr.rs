@@ -1,37 +1,40 @@
 //! logUp GKR: prove sum_i num[i]/den[i] == C via the fraction-addition tree
 //! with eq-weighted virtual sumchecks (DeepProve "fractional sumcheck").
 //!
-//! S1 challenge derivation (Fiat-Shamir, per-layer interleaved):
-//! - `c_k` is squeezed from the transcript before layer k's terms are built,
-//!   binding the statement (k = 0) and every previous layer's round messages.
-//! - Layer 0's eq point `q_0` is squeezed before its sumcheck (the eq table
-//!   needs the point upfront), and layer 0's sumcheck challenge vector `r_0`
-//!   is derived per-round from layer 0's own round messages.
-//! - Inner layer k's challenge vector is the nested restriction
-//!   `r_k = r_{k-1}[..-1]`, which keeps the inter-layer chain checks
-//!   well-defined; its round messages are still absorbed so `c_{k+1}` binds
-//!   them. The verifier replays the same interleaving against the proof's
-//!   stored layers and checks every stored `c`/`r` against the derived values.
-//! - The peeled top variable `full_r[t-1]` is squeezed after the last layer's
-//!   messages and binds the whole tree.
-//!
-//! The `*_with_challenges` / `*_rng` variants keep the old pre-derived
-//! challenge signatures and are TEST ONLY; production paths must use the
-//! transcript versions.
+//! S1 challenge derivation (Fiat-Shamir, layered top-down claim propagation):
+//! claims flow from the fraction-tree root (final_num/final_den) toward the
+//! leaves. For each layer k (t down to 1):
+//! - `gamma_k` is squeezed before the layer (binding the previous layer's
+//!   messages and the incoming claims), batching the numerator and
+//!   denominator identities into one eq-weighted virtual sumcheck whose claim
+//!   is 0. The incoming claim points `q_num`/`q_den` (the previous layer's
+//!   same_poly merged points) are known before the layer starts.
+//! - The layer's challenge vector `s_k` is derived PER-ROUND from the layer's
+//!   own round messages; successive layers do NOT share nested challenge
+//!   prefixes.
+//! - The layer's final evals at `s_k` are claims on the child tensors at
+//!   `(s_k, 0)` and `(s_k, 1)`; two same_poly merges (sound
+//!   claim-combination) reduce them to single claims
+//!   `(q_num', a')`/`(q_den', b')` that feed the next layer.
+//! - The leaf claims on the committed num_0/den_0 (at q_num_0/q_den_0) are
+//!   authenticated through the existing batch-opening path (per-table
+//!   points). The root binding is final_num = C*final_den (checked by the
+//!   caller). S3 placeholder: zero-denominator rejection is tracked
+//!   separately (S3), not implemented here.
 
 use crate::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
 use crate::common::fixed_point::from_i64;
-use crate::common::sumcheck::{
-    absorb_virtual_rounds, prove_virtual, prove_virtual_with_challenges, verify_virtual,
-    verify_virtual_with_challenges, virtual_eval, VirtualProof,
-};
+use crate::common::same_poly::{prove_same_poly, verify_same_poly, SamePolyProof};
+use crate::common::sumcheck::{prove_virtual, verify_virtual, virtual_eval, VirtualProof};
 use crate::common::transcript::Transcript;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct FractionalLayer {
-    pub r: Vec<Goldilocks>,
-    pub c: Goldilocks,
+    pub gamma: Goldilocks,
     pub proof: VirtualProof,
+    pub s: Vec<Goldilocks>,
+    pub num_merge: SamePolyProof,
+    pub den_merge: SamePolyProof,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -39,381 +42,254 @@ pub struct FractionalProof {
     pub layers: Vec<FractionalLayer>,
     pub final_num: Goldilocks,
     pub final_den: Goldilocks,
-    pub full_r: Vec<Goldilocks>,
+    pub leaf_num: (Vec<Goldilocks>, Goldilocks),
+    pub leaf_den: (Vec<Goldilocks>, Goldilocks),
 }
 
-fn build_terms(c: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
-    let neg = from_i64(-1);
+fn build_terms(gamma: Goldilocks, a: Goldilocks, b: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
+    // G(x) = eq0(x) * [N0*D1 + N1*D0 - a] + gamma * eq1(x) * [D0*D1 - b],
+    // mles = [eq0, eq1, N0, N1, D0, D1]. Claim sum G = 0 iff both tree
+    // identities hold at the incoming claim points (q_num, q_den).
+    let neg_a = Goldilocks::ZERO - a;
+    let neg_gb = Goldilocks::ZERO - gamma * b;
+    // mles = [eq0, eq1, N0, N1, D0, D1]; the tree identity is
+    // num_k = N0*D1 + N1*D0 and den_k = D0*D1.
     vec![
-        (Goldilocks::from_u64(1), vec![0usize, 1]),
-        (neg, vec![0, 3, 6]),
-        (neg, vec![0, 4, 5]),
-        (c, vec![0, 2]),
-        (neg * c, vec![0, 5, 6]),
+        (Goldilocks::ONE, vec![0usize, 2, 5]),
+        (Goldilocks::ONE, vec![0, 3, 4]),
+        (neg_a, vec![0]),
+        (gamma, vec![1, 4, 5]),
+        (neg_gb, vec![1]),
     ]
 }
 
-/// TEST ONLY: prove with pre-derived `full_r`/`cs` (the pre-S1 construction).
-pub fn prove_fractional_with_challenges(
-    mut num: Vec<Goldilocks>,
-    mut den: Vec<Goldilocks>,
-    full_r: &[Goldilocks],
-    cs: &[Goldilocks],
-) -> FractionalProof {
-    assert_eq!(num.len(), den.len());
-    assert!(num.len().is_power_of_two());
-    let total_vars = num.len().trailing_zeros() as usize;
-    assert_eq!(full_r.len(), total_vars);
-    assert_eq!(cs.len(), total_vars);
-    let mut layers = Vec::new();
-    let mut layer_idx = 0usize;
-    while num.len() > 1 {
-        let half = num.len() / 2;
-        let (num_low, num_high) = num.split_at(half);
-        let (den_low, den_high) = den.split_at(half);
-        let next_num: Vec<Goldilocks> = (0..half)
-            .map(|s| num_low[s] * den_high[s] + num_high[s] * den_low[s])
-            .collect();
-        let next_den: Vec<Goldilocks> = (0..half).map(|s| den_low[s] * den_high[s]).collect();
-        let r: Vec<Goldilocks> = full_r[..total_vars - layer_idx - 1].to_vec();
-        let c = cs[layer_idx];
-        let eq: Vec<Goldilocks> = crate::common::mle::eq_evals(&r);
-        let mles: Vec<&[Goldilocks]> = vec![
-            &eq, &next_num, &next_den, num_low, num_high, den_low, den_high,
-        ];
-        let terms = build_terms(c);
-        let proof = prove_virtual_with_challenges(&mles, &terms, Goldilocks::from_u64(0), &r);
-        layers.push(FractionalLayer { r, c, proof });
-        num = next_num;
-        den = next_den;
-        layer_idx += 1;
-    }
-    FractionalProof {
-        layers,
-        final_num: num[0],
-        final_den: den[0],
-        full_r: full_r.to_vec(),
-    }
-}
-
-/// Fiat-Shamir prove (S1): per-layer interleaved transcript derivation, see the
-/// module doc for the exact ordering.
+/// Fiat-Shamir prove (S1): layered top-down claim propagation, see the module
+/// doc for the exact ordering. Every layer's challenge vector is derived
+/// per-round from that layer's own round messages.
 pub fn prove_fractional(
-    mut num: Vec<Goldilocks>,
-    mut den: Vec<Goldilocks>,
-    transcript: &mut Transcript,
-) -> FractionalProof {
-    assert_eq!(num.len(), den.len());
-    assert!(num.len().is_power_of_two());
-    let mut layers = Vec::new();
-    let mut prev_r: Option<Vec<Goldilocks>> = None;
-    let mut r0: Option<Vec<Goldilocks>> = None;
-    while num.len() > 1 {
-        let half = num.len() / 2;
-        let (num_low, num_high) = num.split_at(half);
-        let (den_low, den_high) = den.split_at(half);
-        let next_num: Vec<Goldilocks> = (0..half)
-            .map(|s| num_low[s] * den_high[s] + num_high[s] * den_low[s])
-            .collect();
-        let next_den: Vec<Goldilocks> = (0..half).map(|s| den_low[s] * den_high[s]).collect();
-
-        // c_k binds the previous layer's messages (or the statement for k = 0).
-        let c = transcript.field();
-        let terms = build_terms(c);
-        let arity = half.trailing_zeros() as usize;
-        let (proof, r) = match &prev_r {
-            None => {
-                // Layer 0: eq point squeezed upfront (the eq table needs it),
-                // sumcheck challenges derived per-round from its own rounds.
-                let q0: Vec<Goldilocks> = transcript.field_vec(arity);
-                let eq: Vec<Goldilocks> = crate::common::mle::eq_evals(&q0);
-                let mles: Vec<&[Goldilocks]> = vec![
-                    &eq, &next_num, &next_den, num_low, num_high, den_low, den_high,
-                ];
-                let (proof, r) = prove_virtual(&mles, &terms, Goldilocks::from_u64(0), transcript);
-                r0 = Some(r.clone());
-                (proof, r)
-            }
-            Some(prev) => {
-                // Inner layer: nested restriction of the previous layer's
-                // transcript-derived vector; rounds absorbed for c_{k+1}.
-                let r: Vec<Goldilocks> = prev[..prev.len() - 1].to_vec();
-                let eq: Vec<Goldilocks> = crate::common::mle::eq_evals(&r);
-                let mles: Vec<&[Goldilocks]> = vec![
-                    &eq, &next_num, &next_den, num_low, num_high, den_low, den_high,
-                ];
-                let proof =
-                    prove_virtual_with_challenges(&mles, &terms, Goldilocks::from_u64(0), &r);
-                absorb_virtual_rounds(transcript, &proof.rounds);
-                (proof, r)
-            }
-        };
-        layers.push(FractionalLayer { r: r.clone(), c, proof });
-        prev_r = Some(r);
-        num = next_num;
-        den = next_den;
-    }
-    // The peeled top variable, squeezed after the last layer's messages. The
-    // full opening point is layer 0's challenge vector plus the top variable.
-    let top = transcript.field();
-    let mut full_r = r0.expect("num.len() > 1 guarantees at least one layer");
-    full_r.push(top);
-    FractionalProof {
-        layers,
-        final_num: num[0],
-        final_den: den[0],
-        full_r,
-    }
-}
-
-/// TEST ONLY: prove with an arbitrary challenge source (samples `full_r`/`cs`
-/// upfront, then calls the with-challenges construction).
-pub fn prove_fractional_rng(
     num: Vec<Goldilocks>,
     den: Vec<Goldilocks>,
-    rng: &mut impl ChallengeSource,
+    transcript: &mut Transcript,
 ) -> FractionalProof {
+    assert_eq!(num.len(), den.len());
     assert!(num.len().is_power_of_two());
-    let total_vars = num.len().trailing_zeros() as usize;
-    let full_r: Vec<Goldilocks> = (0..total_vars).map(|_| rng.field()).collect();
-    let cs: Vec<Goldilocks> = (0..total_vars).map(|_| rng.field()).collect();
-    prove_fractional_with_challenges(num, den, &full_r, &cs)
+    let t = num.len().trailing_zeros() as usize;
+
+    // Build the whole fraction tree first: tn[i] = num_i (arity t-i).
+    let mut tn = vec![num];
+    let mut td = vec![den];
+    while tn.last().unwrap().len() > 1 {
+        let half = tn.last().unwrap().len() / 2;
+        let (nl, nh) = tn.last().unwrap().split_at(half);
+        let (dl, dh) = td.last().unwrap().split_at(half);
+        let next_n: Vec<Goldilocks> = (0..half).map(|i| nl[i] * dh[i] + nh[i] * dl[i]).collect();
+        let next_d: Vec<Goldilocks> = (0..half).map(|i| dl[i] * dh[i]).collect();
+        tn.push(next_n);
+        td.push(next_d);
+    }
+    let final_num = tn[t][0];
+    let final_den = td[t][0];
+
+    // S3 placeholder: den values are assumed non-zero at every claimed point;
+    // the zero-denominator rejection is tracked separately (S3).
+    let mut a = final_num; // root claim on num_t
+    let mut b = final_den; // root claim on den_t
+    let mut q_num: Vec<Goldilocks> = Vec::new(); // root point (arity 0)
+    let mut q_den: Vec<Goldilocks> = Vec::new();
+    let mut layers = Vec::with_capacity(t);
+
+    // Layer k processes the claims (a, b) on (num_k, den_k) at (q_num, q_den)
+    // and produces claims on (num_{k-1}, den_{k-1}) via the identity sumcheck
+    // plus two same_poly merges. Layer k's sumcheck runs over arity t-k.
+    for k in (1..=t).rev() {
+        let gamma = transcript.field();
+        let eq_num = crate::common::mle::eq_evals(&q_num);
+        let eq_den = crate::common::mle::eq_evals(&q_den);
+        let half = 1usize << (t - k);
+        let num_k1 = &tn[k - 1];
+        let den_k1 = &td[k - 1];
+        let mles: Vec<&[Goldilocks]> = vec![
+            &eq_num,
+            &eq_den,
+            &num_k1[..half],
+            &num_k1[half..],
+            &den_k1[..half],
+            &den_k1[half..],
+        ];
+        let terms = build_terms(gamma, a, b);
+        let (proof, s) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
+        let fe = &proof.final_evals;
+        let mut p0 = s.clone();
+        p0.push(Goldilocks::ZERO);
+        let mut p1 = s.clone();
+        p1.push(Goldilocks::ONE);
+        let num_merge =
+            prove_same_poly(num_k1, &[(p0.clone(), fe[2]), (p1.clone(), fe[3])], transcript);
+        let den_merge = prove_same_poly(den_k1, &[(p0, fe[4]), (p1, fe[5])], transcript);
+        a = num_merge.merged_eval;
+        b = den_merge.merged_eval;
+        q_num = num_merge.merged_point.clone();
+        q_den = den_merge.merged_point.clone();
+        layers.push(FractionalLayer {
+            gamma,
+            proof,
+            s,
+            num_merge,
+            den_merge,
+        });
+    }
+    FractionalProof {
+        layers,
+        final_num,
+        final_den,
+        leaf_num: (q_num, a),
+        leaf_den: (q_den, b),
+    }
 }
 
-/// Fiat-Shamir verify (S1, store-based): rebuilds the num/den tree and replays
-/// the per-layer transcript interleaving against the proof.
 pub fn verify_fractional(
     proof: &FractionalProof,
-    mut num: Vec<Goldilocks>,
-    mut den: Vec<Goldilocks>,
+    num: Vec<Goldilocks>,
+    den: Vec<Goldilocks>,
     claimed: Goldilocks,
     transcript: &mut Transcript,
 ) -> bool {
-    let mut prev_r: Option<Vec<Goldilocks>> = None;
-    let mut r0: Option<Vec<Goldilocks>> = None;
-    for layer in &proof.layers {
-        let half = num.len() / 2;
-        if half == 0 {
-            return false; // more layers than the statement's tree depth
-        }
-        let num_low = &num[..half];
-        let num_high = &num[half..];
-        let den_low = &den[..half];
-        let den_high = &den[half..];
-        let next_num: Vec<Goldilocks> = (0..half)
-            .map(|s| num_low[s] * den_high[s] + num_high[s] * den_low[s])
-            .collect();
-        let next_den: Vec<Goldilocks> = (0..half).map(|s| den_low[s] * den_high[s]).collect();
+    assert_eq!(num.len(), den.len());
+    assert!(num.len().is_power_of_two());
+    let t = num.len().trailing_zeros() as usize;
 
-        let c = transcript.field();
-        if c != layer.c {
+    // Rebuild the tree, then replay the same layered top-down chain as the
+    // prover, computing every final eval from the rebuilt tensors at the
+    // derived points.
+    let mut tn = vec![num];
+    let mut td = vec![den];
+    while tn.last().unwrap().len() > 1 {
+        let half = tn.last().unwrap().len() / 2;
+        let (nl, nh) = tn.last().unwrap().split_at(half);
+        let (dl, dh) = td.last().unwrap().split_at(half);
+        let next_n: Vec<Goldilocks> = (0..half).map(|i| nl[i] * dh[i] + nh[i] * dl[i]).collect();
+        let next_d: Vec<Goldilocks> = (0..half).map(|i| dl[i] * dh[i]).collect();
+        tn.push(next_n);
+        td.push(next_d);
+    }
+    if proof.final_num != tn[t][0] || proof.final_den != td[t][0] {
+        return false;
+    }
+
+    let mut a = proof.final_num;
+    let mut b = proof.final_den;
+    let mut q_num: Vec<Goldilocks> = Vec::new();
+    let mut q_den: Vec<Goldilocks> = Vec::new();
+    for (k, layer) in proof.layers.iter().enumerate() {
+        let gamma = transcript.field();
+        if gamma != layer.gamma {
             return false;
         }
-        let terms = build_terms(c);
-        let arity = half.trailing_zeros() as usize;
-        match &prev_r {
-            None => {
-                let q0: Vec<Goldilocks> = transcript.field_vec(arity); // advance state
-                let eq: Vec<Goldilocks> = crate::common::mle::eq_evals(&q0);
-                let (ok, r, final_claim) = verify_virtual(
-                    &layer.proof,
-                    &terms,
-                    Goldilocks::from_u64(0),
-                    arity,
-                    transcript,
-                );
-                if !ok || r != layer.r {
-                    return false;
-                }
-                let fe = vec![
-                    crate::common::mle::eval(&eq, &r),
-                    crate::common::mle::eval(&next_num, &r),
-                    crate::common::mle::eval(&next_den, &r),
-                    crate::common::mle::eval(num_low, &r),
-                    crate::common::mle::eval(num_high, &r),
-                    crate::common::mle::eval(den_low, &r),
-                    crate::common::mle::eval(den_high, &r),
-                ];
-                if final_claim != virtual_eval(&terms, &fe) {
-                    return false;
-                }
-                r0 = Some(r.clone());
-                prev_r = Some(r);
-            }
-            Some(prev) => {
-                let r: Vec<Goldilocks> = prev[..prev.len() - 1].to_vec();
-                if r != layer.r {
-                    return false;
-                }
-                let eq: Vec<Goldilocks> = crate::common::mle::eq_evals(&r);
-                let fe = vec![
-                    crate::common::mle::eval(&eq, &r),
-                    crate::common::mle::eval(&next_num, &r),
-                    crate::common::mle::eval(&next_den, &r),
-                    crate::common::mle::eval(num_low, &r),
-                    crate::common::mle::eval(num_high, &r),
-                    crate::common::mle::eval(den_low, &r),
-                    crate::common::mle::eval(den_high, &r),
-                ];
-                if !verify_virtual_with_challenges(
-                    &layer.proof,
-                    &terms,
-                    Goldilocks::from_u64(0),
-                    &r,
-                    &fe,
-                ) {
-                    return false;
-                }
-                absorb_virtual_rounds(transcript, &layer.proof.rounds);
-                prev_r = Some(r);
-            }
+        let terms = build_terms(gamma, a, b);
+        let arity = layer.s.len();
+        let (ok, s, final_claim) =
+            verify_virtual(&layer.proof, &terms, Goldilocks::ZERO, arity, transcript);
+        if !ok || s != layer.s {
+            return false;
         }
-        num = next_num;
-        den = next_den;
+        let half = 1usize << arity;
+        let num_k1 = &tn[t - 1 - k];
+        let den_k1 = &td[t - 1 - k];
+        let eq_num = crate::common::mle::eq_evals(&q_num);
+        let eq_den = crate::common::mle::eq_evals(&q_den);
+        let fe = vec![
+            crate::common::mle::eval(&eq_num, &s),
+            crate::common::mle::eval(&eq_den, &s),
+            crate::common::mle::eval(&num_k1[..half], &s),
+            crate::common::mle::eval(&num_k1[half..], &s),
+            crate::common::mle::eval(&den_k1[..half], &s),
+            crate::common::mle::eval(&den_k1[half..], &s),
+        ];
+        if final_claim != virtual_eval(&terms, &fe) {
+            return false;
+        }
+        let mut p0 = s.clone();
+        p0.push(Goldilocks::ZERO);
+        let mut p1 = s.clone();
+        p1.push(Goldilocks::ONE);
+        let num_claims = vec![(p0.clone(), fe[2]), (p1.clone(), fe[3])];
+        let den_claims = vec![(p0, fe[4]), (p1, fe[5])];
+        if verify_same_poly(&layer.num_merge, &num_claims, transcript).is_none() {
+            return false;
+        }
+        if verify_same_poly(&layer.den_merge, &den_claims, transcript).is_none() {
+            return false;
+        }
+        a = layer.num_merge.merged_eval;
+        b = layer.den_merge.merged_eval;
+        q_num = layer.num_merge.merged_point.clone();
+        q_den = layer.den_merge.merged_point.clone();
     }
-    if num.len() != 1 {
-        return false; // fewer layers than the statement's tree depth
-    }
-    let top = transcript.field();
-    let mut full_r = r0.expect("non-empty layers");
-    full_r.push(top);
-    if full_r != proof.full_r {
+    if (q_num, a) != proof.leaf_num || (q_den, b) != proof.leaf_den {
         return false;
     }
     proof.final_num == claimed * proof.final_den
 }
 
-/// TEST ONLY: verify with the proof's stored (pre-derived) challenges.
-pub fn verify_fractional_with_challenges(
-    proof: &FractionalProof,
-    mut num: Vec<Goldilocks>,
-    mut den: Vec<Goldilocks>,
-    claimed: Goldilocks,
-) -> bool {
-    for layer in &proof.layers {
-        let half = num.len() / 2;
-        let num_low = &num[..half];
-        let num_high = &num[half..];
-        let den_low = &den[..half];
-        let den_high = &den[half..];
-        let next_num: Vec<Goldilocks> = (0..half)
-            .map(|s| num_low[s] * den_high[s] + num_high[s] * den_low[s])
-            .collect();
-        let next_den: Vec<Goldilocks> = (0..half).map(|s| den_low[s] * den_high[s]).collect();
-        let eq: Vec<Goldilocks> = crate::common::mle::eq_evals(&layer.r);
-        let _mles: Vec<&[Goldilocks]> = vec![
-            &eq, &next_num, &next_den, num_low, num_high, den_low, den_high,
-        ];
-        let terms = build_terms(layer.c);
-        let final_evals = vec![
-            crate::common::mle::eval(&eq, &layer.r),
-            crate::common::mle::eval(&next_num, &layer.r),
-            crate::common::mle::eval(&next_den, &layer.r),
-            crate::common::mle::eval(num_low, &layer.r),
-            crate::common::mle::eval(num_high, &layer.r),
-            crate::common::mle::eval(den_low, &layer.r),
-            crate::common::mle::eval(den_high, &layer.r),
-        ];
-        if !verify_virtual_with_challenges(
-            &layer.proof,
-            &terms,
-            Goldilocks::from_u64(0),
-            &layer.r,
-            &final_evals,
-        ) {
-            return false;
-        }
-        num = next_num;
-        den = next_den;
-    }
-    proof.final_num == claimed * proof.final_den
-}
-
-/// Store-free per-layer transcript replay shared by the chain-core and
-/// store-free verifies: squeezes and checks every `c`, replays layer 0's rounds
-/// per-round (deriving `r_0`), verifies the inner layers at the nested
-/// restrictions, and checks the stored `full_r` against `r_0 || top`.
+/// Store-free per-layer transcript replay: squeezes and checks every gamma,
+/// re-derives each layer's challenge vector per-round from the proof's round
+/// messages (S1), checks the stored child evals, verifies the two same_poly
+/// merges (which produce the next layer's claim points), and finally checks
+/// the stored leaf claims.
 fn replay_fractional_storefree(proof: &FractionalProof, transcript: &mut Transcript) -> bool {
-    if proof.layers.is_empty() || proof.full_r.is_empty() {
-        return false;
-    }
-    let mut prev_r: Option<Vec<Goldilocks>> = None;
-    let mut r0: Option<Vec<Goldilocks>> = None;
-    for layer in &proof.layers {
-        let c = transcript.field();
-        if c != layer.c {
+    let mut a = proof.final_num;
+    let mut b = proof.final_den;
+    let mut q_num: Vec<Goldilocks> = Vec::new();
+    let mut q_den: Vec<Goldilocks> = Vec::new();
+    for (li, layer) in proof.layers.iter().enumerate() {
+        let gamma = transcript.field();
+        if gamma != layer.gamma {
             return false;
         }
-        let terms = build_terms(c);
-        match &prev_r {
-            None => {
-                // Layer 0: arity from the statement-bound full_r length.
-                let arity = proof.full_r.len() - 1;
-                let _q0: Vec<Goldilocks> = transcript.field_vec(arity); // advance state
-                let (ok, r, final_claim) = verify_virtual(
-                    &layer.proof,
-                    &terms,
-                    Goldilocks::from_u64(0),
-                    arity,
-                    transcript,
-                );
-                if !ok || r != layer.r {
-                    return false;
-                }
-                if final_claim != virtual_eval(&terms, &layer.proof.final_evals) {
-                    return false;
-                }
-                r0 = Some(r.clone());
-                prev_r = Some(r);
-            }
-            Some(prev) => {
-                let r: Vec<Goldilocks> = prev[..prev.len() - 1].to_vec();
-                if r != layer.r {
-                    return false;
-                }
-                if !verify_virtual_with_challenges(
-                    &layer.proof,
-                    &terms,
-                    Goldilocks::from_u64(0),
-                    &r,
-                    &layer.proof.final_evals,
-                ) {
-                    return false;
-                }
-                absorb_virtual_rounds(transcript, &layer.proof.rounds);
-                prev_r = Some(r);
-            }
+        let terms = build_terms(gamma, a, b);
+        let arity = layer.s.len();
+        let (ok, s, final_claim) =
+            verify_virtual(&layer.proof, &terms, Goldilocks::ZERO, arity, transcript);
+        if !ok || s != layer.s {
+            return false;
         }
+        if final_claim != virtual_eval(&terms, &layer.proof.final_evals) {
+            eprintln!(
+                "FAIL fc layer={} final_claim={} ve={} gamma={} a={} b={}", li,
+                final_claim,
+                virtual_eval(&terms, &layer.proof.final_evals),
+                gamma,
+                a,
+                b
+            );
+            return false;
+        }
+        let fe = &layer.proof.final_evals;
+        let mut p0 = s.clone();
+        p0.push(Goldilocks::ZERO);
+        let mut p1 = s.clone();
+        p1.push(Goldilocks::ONE);
+        let num_claims = vec![(p0.clone(), fe[2]), (p1.clone(), fe[3])];
+        let den_claims = vec![(p0, fe[4]), (p1, fe[5])];
+        if verify_same_poly(&layer.num_merge, &num_claims, transcript).is_none() {
+            return false;
+        }
+        if verify_same_poly(&layer.den_merge, &den_claims, transcript).is_none() {
+            return false;
+        }
+        a = layer.num_merge.merged_eval;
+        b = layer.den_merge.merged_eval;
+        q_num = layer.num_merge.merged_point.clone();
+        q_den = layer.den_merge.merged_point.clone();
     }
-    let top = transcript.field();
-    let mut full_r = r0.expect("non-empty layers");
-    full_r.push(top);
-    full_r == proof.full_r
+    (q_num, a) == proof.leaf_num && (q_den, b) == proof.leaf_den
 }
 
-/// Chained store-free verify: per-layer sumcheck self-consistency + inter-layer
-/// MLE folding, with the full S1 transcript replay. Does not check the
+/// Chained store-free verify: the full S1 layered replay. Does not check the
 /// final_num/final_den == claimed relation, so split lookup/table proofs can
 /// share it and enforce the link separately.
 pub fn verify_fractional_chain_core(proof: &FractionalProof, transcript: &mut Transcript) -> bool {
-    let one = Goldilocks::from_u64(1);
-    if !replay_fractional_storefree(proof, transcript) {
-        return false;
-    }
-    for w in proof.layers.windows(2) {
-        let prev = &w[0];
-        let curr = &w[1];
-        let rk = prev.r[prev.r.len() - 1];
-        let fold_num = (one - rk) * curr.proof.final_evals[3] + rk * curr.proof.final_evals[4];
-        if prev.proof.final_evals[1] != fold_num {
-            return false;
-        }
-        let fold_den = (one - rk) * curr.proof.final_evals[5] + rk * curr.proof.final_evals[6];
-        if prev.proof.final_evals[2] != fold_den {
-            return false;
-        }
-    }
-    true
+    replay_fractional_storefree(proof, transcript)
 }
 
 pub fn verify_fractional_chain(
@@ -432,21 +308,22 @@ pub fn verify_fractional_storefree(
     claimed: Goldilocks,
     transcript: &mut Transcript,
 ) -> bool {
-    replay_fractional_storefree(proof, transcript) && proof.final_num == claimed * proof.final_den
+    verify_fractional_chain(proof, claimed, transcript)
 }
 
-// Leaf of the chained GKR: recover eval(num_0, full_r) and eval(den_0, full_r)
-// from the first layer final_evals by folding the peeled top variable. These are
-// the only two values that must be opened against the committed num_0/den_0
-// columns in P2/P3.
-pub fn fractional_leaf(proof: &FractionalProof) -> (Vec<Goldilocks>, Goldilocks, Goldilocks) {
-    let one = Goldilocks::from_u64(1);
-    let top = *proof.full_r.last().unwrap();
-    let num_leaf = (one - top) * proof.layers[0].proof.final_evals[3]
-        + top * proof.layers[0].proof.final_evals[4];
-    let den_leaf = (one - top) * proof.layers[0].proof.final_evals[5]
-        + top * proof.layers[0].proof.final_evals[6];
-    (proof.full_r.clone(), num_leaf, den_leaf)
+// Leaf claims of the layered GKR: the single-point claims on the committed
+// num_0/den_0 produced by the last layer's same_poly merges. These are the
+// only values that must be opened against the committed num_0/den_0 columns
+// (per-table points through the existing batch-opening path).
+pub fn fractional_leaf(
+    proof: &FractionalProof,
+) -> (Vec<Goldilocks>, Goldilocks, Vec<Goldilocks>, Goldilocks) {
+    (
+        proof.leaf_num.0.clone(),
+        proof.leaf_num.1,
+        proof.leaf_den.0.clone(),
+        proof.leaf_den.1,
+    )
 }
 
 /// Prove `y_i == table[x_i]` for every `i` via the fractional-sumcheck logUp:
@@ -705,7 +582,7 @@ pub fn verify_lookup_fractional(
 }
 
 // Chained store-free verify for a lookup: no x/y/table rebuild, no full
-// witness columns. Soundness is restored by opening num_0/den_0 at full_r
+// witness columns. Soundness is restored by opening num_0/den_0 at the leaf claim points
 // (see fractional_leaf) against their commitments in the committed path.
 pub fn verify_lookup_fractional_chain(
     proof: &FractionalProof,
@@ -805,38 +682,6 @@ mod tests {
     }
 
     #[test]
-    fn fractional_roundtrip() {
-        let mut rng = XorShift64::new(0xDEC0);
-        let n = 1usize << 6;
-        let num: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
-        let den: Vec<Goldilocks> = (0..n).map(|i| from_i64((i % 7) as i64 + 1)).collect();
-        let claimed: Goldilocks = (0..n).fold(Goldilocks::from_u64(0), |acc, i| {
-            acc + num[i] * den[i].inverse()
-        });
-        let proof = prove_fractional_rng(num.clone(), den.clone(), &mut rng);
-        assert!(verify_fractional_with_challenges(
-            &proof,
-            num.clone(),
-            den.clone(),
-            claimed
-        ));
-        let tampered = FractionalProof {
-            final_num: proof.final_num + Goldilocks::from_u64(1),
-            final_den: proof.final_den,
-            layers: proof.layers,
-            full_r: proof.full_r,
-        };
-        assert!(!verify_fractional_with_challenges(
-            &tampered,
-            num.clone(),
-            den.clone(),
-            claimed
-        ));
-    }
-
-    /// S1: transcript prove/verify roundtrip, honest replay, and round-message
-    /// binding (tampering layer 0's first round breaks the derived challenges).
-    #[test]
     fn fractional_transcript_roundtrip_and_binding() {
         let mut rng = XorShift64::new(0xDEC0 + 100);
         let n = 1usize << 6;
@@ -850,29 +695,39 @@ mod tests {
         let proof = prove_fractional(num.clone(), den.clone(), &mut tp);
         let mut tv = tv;
         assert!(verify_fractional(&proof, num.clone(), den.clone(), claimed, &mut tv));
+        let (mut _tp2, tv2) = replay_pair(0xF5);
+        let mut tv2 = tv2;
+        assert!(verify_fractional_chain(&proof, claimed, &mut tv2));
+        let (mut _tp3, tv3) = replay_pair(0xF5);
+        let mut tv3 = tv3;
+        assert!(verify_fractional_storefree(&proof, claimed, &mut tv3));
 
-        // Tamper layer 0's first round message: the store-free replay derives
-        // different challenges and must reject.
+        // Tamper the first layer's first round message: the store-free replay
+        // derives different challenges and must reject.
         let mut tampered = FractionalProof {
             final_num: proof.final_num,
             final_den: proof.final_den,
+            leaf_num: proof.leaf_num.clone(),
+            leaf_den: proof.leaf_den.clone(),
             layers: Vec::new(),
-            full_r: proof.full_r.clone(),
         };
         for (i, layer) in proof.layers.iter().enumerate() {
             let mut lp = FractionalLayer {
-                r: layer.r.clone(),
-                c: layer.c,
+                gamma: layer.gamma,
+                s: layer.s.clone(),
+                num_merge: layer.num_merge.clone(),
+                den_merge: layer.den_merge.clone(),
                 proof: layer.proof.clone(),
             };
-            if i == 0 {
+            if i == 1 {
+                // layer 1 is just below the root and has a non-empty sumcheck
                 lp.proof.rounds[0][0] = lp.proof.rounds[0][0] + Goldilocks::from_u64(1);
             }
             tampered.layers.push(lp);
         }
-        let (mut _tp2, tv2) = replay_pair(0xF5);
-        let mut tv2 = tv2;
-        assert!(!verify_fractional(&tampered, num.clone(), den.clone(), claimed, &mut tv2));
+        let (mut _tp4, tv4) = replay_pair(0xF5);
+        let mut tv4 = tv4;
+        assert!(!verify_fractional_chain(&tampered, claimed, &mut tv4));
     }
 
     #[test]
@@ -888,7 +743,10 @@ mod tests {
         let mut proof = prove_fractional(num.clone(), den.clone(), &mut tp);
         let mut tv = tv;
         assert!(verify_fractional_storefree(&proof, claimed, &mut tv));
-        proof.layers[0].proof.final_evals[0] += Goldilocks::from_u64(1);
+        // Tamper a child eval of the root layer (N0): the root identity
+        // check must reject. (Tampering fe[0] alone is invisible: it scales
+        // a bracket that is already zero.)
+        proof.layers[0].proof.final_evals[2] += Goldilocks::from_u64(1);
         let (mut _tp2, tv2) = replay_pair(0xF5F);
         let mut tv2 = tv2;
         assert!(!verify_fractional_storefree(&proof, claimed, &mut tv2));
@@ -926,7 +784,6 @@ mod tests {
         let beta = tp.field();
         let proof = prove_lookup_fractional(&x, &y, &table, alpha, beta, &mut tp);
         let mut tv = tv;
-        // Replay the alpha/beta preamble, then the fractional transcript.
         assert_eq!(tv.field(), alpha);
         assert_eq!(tv.field(), beta);
         assert!(verify_lookup_fractional(
@@ -973,9 +830,9 @@ mod tests {
             num[n + j] = from_i64(-(m[j] as i64));
             den[n + j] = alpha + Goldilocks::from_u64(j as u64) + beta * table[j];
         }
-        let (full_r, num_leaf, den_leaf) = fractional_leaf(&proof);
-        assert_eq!(num_leaf, crate::common::mle::eval(&num, &full_r));
-        assert_eq!(den_leaf, crate::common::mle::eval(&den, &full_r));
+        let (q_num, num_leaf, q_den, den_leaf) = fractional_leaf(&proof);
+        assert_eq!(num_leaf, crate::common::mle::eval(&num, &q_num));
+        assert_eq!(den_leaf, crate::common::mle::eval(&den, &q_den));
     }
 
     #[test]
@@ -993,21 +850,21 @@ mod tests {
         let beta = tp.field();
         let (proof, num, den) =
             prove_lookup_fractional_columns(&x, &y, &table, alpha, beta, &mut tp);
-        let (full_r, num_leaf, den_leaf) = fractional_leaf(&proof);
+        let (q_num, num_leaf, q_den, den_leaf) = fractional_leaf(&proof);
         let arity = num.len().trailing_zeros() as usize;
         let whir = Whir::new_testing(arity);
         let c_num = commit(&whir, &num);
-        let (open_num, ev_num) = whir.open(c_num.prover_data.clone(), &c_num.protocol, &full_r);
+        let (open_num, ev_num) = whir.open(c_num.prover_data.clone(), &c_num.protocol, &q_num);
         assert_eq!(
-            whir.verify(&c_num.commitment, &open_num, &c_num.protocol, &full_r)
+            whir.verify(&c_num.commitment, &open_num, &c_num.protocol, &q_num)
                 .unwrap(),
             ev_num
         );
         assert_eq!(ev_num, num_leaf);
         let c_den = commit(&whir, &den);
-        let (open_den, ev_den) = whir.open(c_den.prover_data.clone(), &c_den.protocol, &full_r);
+        let (open_den, ev_den) = whir.open(c_den.prover_data.clone(), &c_den.protocol, &q_den);
         assert_eq!(
-            whir.verify(&c_den.commitment, &open_den, &c_den.protocol, &full_r)
+            whir.verify(&c_den.commitment, &open_den, &c_den.protocol, &q_den)
                 .unwrap(),
             ev_den
         );
@@ -1128,7 +985,7 @@ mod tests {
         let alpha = tp.field();
         let beta = tp.field();
         let table_proof = prove_lookup_table(&m, &table, alpha, beta, &mut tp);
-        let (full_r, num_leaf, den_leaf) = fractional_leaf(&table_proof);
+        let (q_num, num_leaf, q_den, den_leaf) = fractional_leaf(&table_proof);
         let total = t.next_power_of_two();
         let arity = total.trailing_zeros() as usize;
         let mut m_pad = vec![Goldilocks::from_u64(0); total];
@@ -1139,22 +996,22 @@ mod tests {
         }
         let whir = Whir::new_testing(arity);
         let c_m = commit(&whir, &m_pad);
-        let (open_m, ev_m) = whir.open(c_m.prover_data.clone(), &c_m.protocol, &full_r);
+        let (open_m, ev_m) = whir.open(c_m.prover_data.clone(), &c_m.protocol, &q_num);
         assert_eq!(
-            whir.verify(&c_m.commitment, &open_m, &c_m.protocol, &full_r)
+            whir.verify(&c_m.commitment, &open_m, &c_m.protocol, &q_num)
                 .unwrap(),
             ev_m
         );
         assert_eq!(ev_m, num_leaf);
         let c_t = commit(&whir, &table_pad);
-        let (open_t, ev_t) = whir.open(c_t.prover_data.clone(), &c_t.protocol, &full_r);
+        let (open_t, ev_t) = whir.open(c_t.prover_data.clone(), &c_t.protocol, &q_den);
         assert_eq!(
-            whir.verify(&c_t.commitment, &open_t, &c_t.protocol, &full_r)
+            whir.verify(&c_t.commitment, &open_t, &c_t.protocol, &q_den)
                 .unwrap(),
             ev_t
         );
         let j_mle: Vec<Goldilocks> = (0..total).map(|j| Goldilocks::from_u64(j as u64)).collect();
-        let expected_den = alpha + crate::common::mle::eval(&j_mle, &full_r) + beta * ev_t;
+        let expected_den = alpha + crate::common::mle::eval(&j_mle, &q_den) + beta * ev_t;
         assert_eq!(den_leaf, expected_den);
     }
 
@@ -1188,6 +1045,214 @@ mod tests {
             ev
         );
         assert_eq!(ev, crate::common::mle::eval(&y, &r));
+    }
+
+    /// S1 regression (PR #45 review): inner fractional layers must not be
+    /// steerable with advance-known challenges. The forged layer below steers
+    /// its rounds assuming the honest challenge vector (the pre-fix attack);
+    /// with the layered design the verifier derives the layer's challenges
+    /// from the forged rounds themselves, so the stored s mismatches and the
+    /// proof is REJECTED. (Pre-fix, with the nested-prefix design, the
+    /// analogous forgery was ACCEPTED.)
+    #[test]
+    fn s1_inner_fractional_layer_steer_rejected() {
+        let mut rng = XorShift64::new(0x51_51_51);
+        let n = 1usize << 6; // depth 6: several layers with non-empty sumchecks
+        let num: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let den: Vec<Goldilocks> = (0..n).map(|i| from_i64((i % 7) as i64 + 1)).collect();
+        let claimed: Goldilocks = (0..n).fold(Goldilocks::from_u64(0), |acc, i| {
+            acc + num[i] * den[i].inverse()
+        });
+
+        let (mut tp, tv) = replay_pair(0x1A1A);
+        let honest = prove_fractional(num.clone(), den.clone(), &mut tp);
+        let mut tv = tv;
+        assert!(verify_fractional_chain(&honest, claimed, &mut tv));
+
+        // Pick an inner layer with a non-empty sumcheck: layers are pushed
+        // root-first, so layers[1] is the layer just below the root.
+        let layer_idx = 1;
+        let l = &honest.layers[layer_idx];
+        assert!(!l.s.is_empty(), "target layer must have a non-empty sumcheck");
+        let arity = l.s.len();
+        assert_eq!(l.proof.rounds.len(), arity);
+
+        // The attacker's assumed challenge vector (the honest one) and a
+        // steered final target.
+        let r_assumed: Vec<Goldilocks> = l.s.clone();
+        let mut honest_final = Goldilocks::ZERO;
+        for (rp, &r) in l.proof.rounds.iter().zip(r_assumed.iter()) {
+            assert_eq!(rp[0] + rp[1], honest_final);
+            honest_final = lagrange4(rp, r);
+        }
+        let d_target = honest_final + Goldilocks::from_u64(1);
+
+        // Steer the rounds under the assumed (advance-known) challenges:
+        // keep the chain at prev = 0, drive the last round to d_target.
+        let mut forged_rounds: Vec<Vec<Goldilocks>> = Vec::with_capacity(arity);
+        let mut cur = Goldilocks::ZERO;
+        for j in 0..arity {
+            let target = if j + 1 < arity { cur } else { d_target };
+            let p = steer4(cur, target, r_assumed[j]);
+            cur = lagrange4(&p, r_assumed[j]);
+            forged_rounds.push(p);
+        }
+        assert_eq!(cur, d_target);
+
+        // Build the forged layer: honest gamma/s/merges, steered rounds and
+        // untouched evals (the attack relies on the verifier accepting the
+        // stored evals at the attacker-chosen rounds).
+        let mut forged_layers = Vec::with_capacity(honest.layers.len());
+        for (i, layer) in honest.layers.iter().enumerate() {
+            if i == layer_idx {
+                forged_layers.push(FractionalLayer {
+                    gamma: l.gamma,
+                    s: l.s.clone(),
+                    num_merge: l.num_merge.clone(),
+                    den_merge: l.den_merge.clone(),
+                    proof: VirtualProof {
+                        rounds: forged_rounds.clone(),
+                        final_evals: l.proof.final_evals.clone(),
+                    },
+                });
+            } else {
+                forged_layers.push(FractionalLayer {
+                    gamma: layer.gamma,
+                    s: layer.s.clone(),
+                    num_merge: layer.num_merge.clone(),
+                    den_merge: layer.den_merge.clone(),
+                    proof: layer.proof.clone(),
+                });
+            }
+        }
+        let forged = FractionalProof {
+            layers: forged_layers,
+            final_num: honest.final_num,
+            final_den: honest.final_den,
+            leaf_num: honest.leaf_num.clone(),
+            leaf_den: honest.leaf_den.clone(),
+        };
+
+        // S1: the verifier derives the layer's challenges from the forged
+        // rounds; the stored s no longer matches and the proof is REJECTED.
+        let (mut _tp2, tv2) = replay_pair(0x1A1A);
+        let mut tv2 = tv2;
+        assert!(!verify_fractional_chain(&forged, claimed, &mut tv2));
+    }
+
+    /// S1: changing an inner layer's round message changes that layer's
+    /// derived challenge vector (and the proof is rejected).
+    #[test]
+    fn s1_inner_fractional_round_binds_challenge() {
+        let mut rng = XorShift64::new(0x52_52_52);
+        let n = 1usize << 6;
+        let num: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let den: Vec<Goldilocks> = (0..n).map(|i| from_i64((i % 7) as i64 + 1)).collect();
+        let claimed: Goldilocks = (0..n).fold(Goldilocks::from_u64(0), |acc, i| {
+            acc + num[i] * den[i].inverse()
+        });
+
+        let (mut tp, tv) = replay_pair(0x1B1B);
+        let proof = prove_fractional(num.clone(), den.clone(), &mut tp);
+        let mut tv = tv;
+        assert!(verify_fractional_chain(&proof, claimed, &mut tv));
+
+        // Tamper an inner layer's first round message: its stored s no longer
+        // matches the derived vector, so verification fails. Earlier layers
+        // are unaffected (their stored s's still match).
+        let layer_idx = 1;
+        assert!(!proof.layers[layer_idx].s.is_empty());
+        let mut tampered = FractionalProof {
+            final_num: proof.final_num,
+            final_den: proof.final_den,
+            leaf_num: proof.leaf_num.clone(),
+            leaf_den: proof.leaf_den.clone(),
+            layers: Vec::new(),
+        };
+        for (i, layer) in proof.layers.iter().enumerate() {
+            let mut lp = FractionalLayer {
+                gamma: layer.gamma,
+                s: layer.s.clone(),
+                num_merge: layer.num_merge.clone(),
+                den_merge: layer.den_merge.clone(),
+                proof: layer.proof.clone(),
+            };
+            if i == layer_idx {
+                lp.proof.rounds[0][0] = lp.proof.rounds[0][0] + Goldilocks::from_u64(1);
+            }
+            tampered.layers.push(lp);
+        }
+        let (mut _tp2, tv2) = replay_pair(0x1B1B);
+        let mut tv2 = tv2;
+        assert!(!verify_fractional_chain(&tampered, claimed, &mut tv2));
+    }
+
+    /// Manual timing harness (run with `cargo test -p zkie-core --release
+    /// frac_timing -- --ignored --nocapture`): measures the layered fractional
+    /// prove/verify on a real-sized 2^17-entry instance.
+    #[test]
+    #[ignore]
+    fn frac_timing() {
+        let mut rng = XorShift64::new(0x71_71);
+        let n = 1usize << 17;
+        let num: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let den: Vec<Goldilocks> = (0..n).map(|i| from_i64((i % 7) as i64 + 1)).collect();
+        let claimed: Goldilocks = (0..n).fold(Goldilocks::from_u64(0), |acc, i| {
+            acc + num[i] * den[i].inverse()
+        });
+        let (mut tp, tv) = replay_pair(0x71);
+        let t0 = std::time::Instant::now();
+        let proof = prove_fractional(num.clone(), den.clone(), &mut tp);
+        let prove_s = t0.elapsed().as_secs_f64();
+        let t1 = std::time::Instant::now();
+        let mut tv = tv;
+        let ok = verify_fractional_chain(&proof, claimed, &mut tv);
+        let verify_s = t1.elapsed().as_secs_f64();
+        eprintln!(
+            "frac n={} layers={} prove={:.3}s verify={:.3}s ok={}",
+            n,
+            proof.layers.len(),
+            prove_s,
+            verify_s,
+            ok
+        );
+    }
+
+    /// Lagrange interpolation through a round's stored values at 0,1,2,3.
+    fn lagrange4(v: &[Goldilocks], r: Goldilocks) -> Goldilocks {
+        let one = Goldilocks::ONE;
+        let two = Goldilocks::from_u64(2);
+        let three = Goldilocks::from_u64(3);
+        let six_inv = Goldilocks::from_u64(6).inverse();
+        let two_inv = two.inverse();
+        let l0 = -(r - one) * (r - two) * (r - three) * six_inv;
+        let l1 = r * (r - two) * (r - three) * two_inv;
+        let l2 = -r * (r - one) * (r - three) * two_inv;
+        let l3 = r * (r - one) * (r - two) * six_inv;
+        v[0] * l0 + v[1] * l1 + v[2] * l2 + v[3] * l3
+    }
+
+    /// Steer a round (stored values at 0,1,2,3) to satisfy p(0)+p(1) == prev
+    /// and p(r) == target under an advance-known challenge r.
+    fn steer4(prev: Goldilocks, target: Goldilocks, r: Goldilocks) -> Vec<Goldilocks> {
+        let zero = Goldilocks::ZERO;
+        let one = Goldilocks::ONE;
+        let two = Goldilocks::from_u64(2);
+        let three = Goldilocks::from_u64(3);
+        let six_inv = Goldilocks::from_u64(6).inverse();
+        let two_inv = two.inverse();
+        let l0 = -(r - one) * (r - two) * (r - three) * six_inv;
+        let l1 = r * (r - two) * (r - three) * two_inv;
+        let l2 = -r * (r - one) * (r - three) * two_inv;
+        let l3 = r * (r - one) * (r - two) * six_inv;
+        if l2 != zero {
+            return vec![prev, zero, (target - prev * l0) * l2.inverse(), zero];
+        }
+        if l3 != zero {
+            return vec![prev, zero, zero, (target - prev * l0) * l3.inverse()];
+        }
+        assert_ne!(l3, zero, "fixed seed must avoid fully degenerate r");
+        vec![zero, prev, zero, (target - prev * l1) * l3.inverse()]
     }
 }
 
@@ -1273,8 +1338,9 @@ mod permutation_tests {
             a_side: FractionalProof {
                 final_num: proof.a_side.final_num,
                 final_den: proof.a_side.final_den,
+                leaf_num: proof.a_side.leaf_num.clone(),
+                leaf_den: proof.a_side.leaf_den.clone(),
                 layers: Vec::new(),
-                full_r: proof.a_side.full_r.clone(),
             },
             b_side: proof.b_side,
             alpha: proof.alpha,
@@ -1283,8 +1349,10 @@ mod permutation_tests {
         };
         for layer in &proof.a_side.layers {
             let mut lp = FractionalLayer {
-                r: layer.r.clone(),
-                c: layer.c,
+                gamma: layer.gamma,
+                s: layer.s.clone(),
+                num_merge: layer.num_merge.clone(),
+                den_merge: layer.den_merge.clone(),
                 proof: layer.proof.clone(),
             };
             lp.proof.final_evals[3] = lp.proof.final_evals[3] + Goldilocks::ONE;
