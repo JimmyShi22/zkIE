@@ -17,11 +17,17 @@ use crate::layer_norm_centered::{
     verify_layer_norm_centered, LayerNormCenteredProof,
 };
 use crate::layernorm_chain::{prove_layernorm_chain, verify_layernorm_chain, LayernormChainProof};
-use crate::gather::{gather_forward, prove_scatter_add, verify_scatter_add, ScatterAddProof};
+use crate::gather::{
+    gather_forward, prove_scatter_add, prove_scatter_add_with_mode, verify_scatter_add,
+    verify_scatter_add_with_mode, ScatterAddProof,
+};
 use crate::projection::{prove_projection, verify_projection, ProjectionProof};
-use crate::scatter::{prove_scatter, scatter_forward, verify_scatter, ScatterProof};
+use crate::scatter::{
+    prove_scatter, prove_scatter_with_mode, scatter_forward, verify_scatter,
+    verify_scatter_with_mode, ScatterProof,
+};
 use crate::rms_norm::{prove_rms_norm, rms_norm_forward, verify_rms_norm, RmsNormProof};
-use crate::rope::{prove_rope, rope_forward, verify_rope, RoPEProof};
+use crate::rope::{prove_rope, rope_forward, rope_out_points, verify_rope, RoPEProof};
 use crate::softmax_scaled::{prove_softmax_rounded, verify_softmax_rounded, SoftmaxRoundedProof};
 use crate::topk::{argmax_forward, prove_argmax, prove_topk, topk_forward, verify_argmax, verify_topk, ArgmaxProof, TopKSelectProof};
 use rayon::prelude::*;
@@ -47,6 +53,84 @@ fn is_identity_table(table: &[Goldilocks]) -> bool {
         .iter()
         .enumerate()
         .all(|(j, &v)| v == Goldilocks::from_u64(j as u64))
+}
+
+/// Pad a lookup table for commitment/frac use: to the next power of two, at
+/// least 2^5 (WHIR folding needs arity >= 5). Identity tables continue the
+/// identity into the padding (den = alpha + j + beta*j at every padded
+/// index, matching the verifier's identity evaluation); other tables pad
+/// with zeros (the den relation there is checked via openings, never by the
+/// index formula).
+fn pad_lookup_table(table: &[Goldilocks]) -> Vec<Goldilocks> {
+    let total = table.len().next_power_of_two().max(32);
+    let mut out = vec![Goldilocks::ZERO; total];
+    out[..table.len()].copy_from_slice(table);
+    if is_identity_table(table) {
+        for j in table.len()..total {
+            out[j] = Goldilocks::from_u64(j as u64);
+        }
+    }
+    out
+}
+
+/// One claim in the verifier's self-built authentication chain: tensor
+/// `tensor_id`'s MLE evaluated at `point` equals `value`. Every claim the
+/// verifier uses is derived from its own reduction (op sumcheck final evals,
+/// replayed fractional leaves) — never read from a prover-supplied list
+/// (S2).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EvalClaim {
+    pub tensor_id: T,
+    pub point: Vec<Goldilocks>,
+    pub value: Goldilocks,
+}
+
+/// Where the per-op fractional proofs (permutation / gather) run. On the
+/// plain shard path they live on the shard transcript; on the committed path
+/// they are re-proven on the committed transcripts (which bind the committed
+/// column roots), so the shard transcript must stay frac-free — the
+/// committed-mode shard proof runs them on a scratch transcript and the
+/// committed replay skips them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FracMode {
+    Plain,
+    Committed,
+}
+
+/// The public statement a verifier trusts: the op graph, the shard
+/// granularity, and the public lookup tables indexed by tensor id. All
+/// decisions that must not come from the proof (identity tables, expected
+/// weight tensors, statement-derived counts) derive from this (S2).
+#[derive(Clone)]
+pub struct VerifierStatement<'a> {
+    pub tables: &'a [&'a [Goldilocks]],
+    pub ops: &'a [Op],
+    pub ops_per_shard: usize,
+}
+
+impl<'a> VerifierStatement<'a> {
+    pub fn new(tables: &'a [&'a [Goldilocks]], ops: &'a [Op], ops_per_shard: usize) -> Self {
+        VerifierStatement {
+            tables,
+            ops,
+            ops_per_shard,
+        }
+    }
+
+    /// The identity-table decision comes from the statement tables, never
+    /// from a proof flag (S2).
+    pub fn is_identity_table(&self, t: T) -> bool {
+        match self.tables.get(t) {
+            Some(table) => is_identity_table(table),
+            None => false,
+        }
+    }
+
+    /// Weight tensors: read by an op but never written (statement-derived;
+    /// used to require batch openings for every claimed weight).
+    pub fn weight_tensors(&self) -> Vec<T> {
+        collect_weight_tensors(self.ops)
+    }
 }
 
 fn transpose(a: &[Goldilocks], m: usize, k: usize) -> Vec<Goldilocks> {
@@ -913,28 +997,24 @@ pub fn rsqrt_index(var: i64) -> u32 {
 /// A shard proof: per-op proofs plus the `same_poly` bindings on every
 /// multiply-consumed activation tensor.
 /// A lookup witness column pair (merged num_0/den_0) plus its chained-GKR
-/// leaf claim, collected by the plain prover and batch-committed/opened by
-/// the committed path.
+/// proof, collected by the plain prover and batch-committed/opened by the
+/// committed path. Leaf claims (points + evals) are NOT stored (S2): the
+/// verifier derives them from its own fractional replay, and the prover
+/// reads them back out of the freshly proven chain via [`fractional_leaf`].
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct WitnessColumn {
     pub proof: FractionalProof,
     pub x: Vec<Goldilocks>,
     pub y: Vec<Goldilocks>,
     pub num: Vec<Goldilocks>,
-    /// Leaf claim point on the num column (q_num_0).
-    pub point: Vec<Goldilocks>,
-    /// Leaf claim point on the den side (q_den_0); carried for the S2/S3
-    /// claim-authentication work, not opened on the committed path yet.
-    pub den_point: Vec<Goldilocks>,
-    pub num_leaf: Goldilocks,
-    pub den_leaf: Goldilocks,
     pub alpha: Goldilocks,
     pub beta: Goldilocks,
     pub table: T,
 }
 
-/// A lookup table side (table tensor + global multiplicity) opened at its leaf
-/// point, committed once per table globally in the committed path.
+/// A lookup table side (table tensor + global multiplicity) with its
+/// chained-GKR proof, committed once per table globally in the committed
+/// path. Leaf claims are derived from the replay, never stored (S2).
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct TableColumn {
     pub proof: FractionalProof,
@@ -942,21 +1022,19 @@ pub struct TableColumn {
     pub m: Vec<u64>,
     pub alpha: Goldilocks,
     pub beta: Goldilocks,
-    pub point: Vec<Goldilocks>,
-    pub den_point: Vec<Goldilocks>,
-    pub num_leaf: Goldilocks,
-    pub den_leaf: Goldilocks,
 }
 
+/// A shard proof: per-op proofs plus the `same_poly` bindings on every
+/// multiply-claimed tensor. It carries NO claim list (S2): the shard
+/// verifier rebuilds the claims from its own op verifications and derives
+/// the binding set from them; the shard-DAG and committed composers receive
+/// the claims from the prover side as a separate return value.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct OpShardProof {
     pub ops: Vec<OpProof>,
     /// `binds[j]` merges the claims of tensor `bound[j]`.
     pub bound: Vec<T>,
     pub binds: Vec<SamePolyProof>,
-    /// Raw `(tensor, point, eval)` claims emitted by this shard's ops, used by
-    /// the shard-DAG composer for cross-shard binding.
-    pub claims: Vec<(T, Vec<Goldilocks>, Goldilocks)>,
     pub witness_columns: Vec<WitnessColumn>,
     pub table_columns: Vec<TableColumn>,
 }
@@ -1609,11 +1687,12 @@ fn forward_ops(store: &mut Store, ops: &[Op]) {
 pub fn prove_shard(
     store: &mut Store,
     ops: &[Op],
-    boundary: &[T],
+    _boundary: &[T], // kept for API compatibility; binding no longer excludes boundary tensors (S2)
     transcript: &mut Transcript,
 ) -> OpShardProof {
     forward_ops(store, ops);
-    prove_shard_precomputed(store, ops, boundary, transcript)
+    let (proof, _claims) = prove_shard_precomputed(store, ops, transcript, FracMode::Plain);
+    proof
 }
 
 /// Prove a shard whose witness is already materialized in `store` (the forward
@@ -1621,12 +1700,19 @@ pub fn prove_shard(
 /// parallel by the shard-DAG composer. All challenges are Fiat-Shamir derived
 /// from the statement-absorbed transcript (S1): evaluation points are squeezed
 /// directly, sumcheck challenges per-round from the round messages.
+///
+/// Returns the proof plus the shard's raw claims (S2): the claims are NOT
+/// serialized into [`OpShardProof`] — the shard-DAG and committed composers
+/// use them prover-side, while every verifier rebuilds its own claims from
+/// the op verifications. In [`FracMode::Committed`] the permutation/gather
+/// fractional proofs run on scratch transcripts (they are re-proven on the
+/// committed transcripts later), so the shard transcript stays frac-free.
 pub fn prove_shard_precomputed(
     store: &Store,
     ops: &[Op],
-    boundary: &[T],
     transcript: &mut Transcript,
-) -> OpShardProof {
+    mode: FracMode,
+) -> (OpShardProof, Vec<EvalClaim>) {
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
     let add_terms = vec![
         (Goldilocks::ONE, vec![2usize]),
@@ -1634,8 +1720,7 @@ pub fn prove_shard_precomputed(
         (neg, vec![1usize]),
     ];
 
-    // (tensor_id, point, eval) claims emitted by each op's proof.
-    let mut claims: Vec<(T, Vec<Goldilocks>, Goldilocks)> = Vec::new();
+    let mut claims: Vec<EvalClaim> = Vec::new();
     let mut op_proofs = Vec::with_capacity(ops.len());
     let mut lookup_by_table: std::collections::BTreeMap<T, Vec<(Vec<u32>, Vec<Goldilocks>)>> =
         std::collections::BTreeMap::new();
@@ -1658,13 +1743,14 @@ pub fn prove_shard_precomputed(
                 m,
                 n,
             } => {
-                let p = prove_scatter(
+                let p = prove_scatter_with_mode(
                     store.get(sel),
                     &store.idx[token_id],
                     &store.idx[expert_of],
                     m,
                     n,
                     transcript,
+                    mode,
                 );
                 op_proofs.push(OpProof::Scatter(p));
             }
@@ -1676,7 +1762,7 @@ pub fn prove_shard_precomputed(
                 m,
                 h,
             } => {
-                let p = prove_scatter_add(
+                let p = prove_scatter_add_with_mode(
                     store.get(weighted),
                     &store.idx[token_id],
                     store.get(gate),
@@ -1684,6 +1770,7 @@ pub fn prove_shard_precomputed(
                     m,
                     h,
                     transcript,
+                    mode,
                 );
                 op_proofs.push(OpProof::Gather(p));
             }
@@ -1692,13 +1779,13 @@ pub fn prove_shard_precomputed(
                 let v: Vec<Goldilocks> = transcript.field_vec(n.trailing_zeros() as usize);
                 let (p, ch) =
                     bmm::prove(store.get(a), store.get(w), store.get(c), s, k, n, &u, &v, transcript);
-                claims.push((a, ch.clone(), mle::eval(store.get(a), &ch)));
+                claims.push(EvalClaim { tensor_id: a, point: ch.clone(), value: mle::eval(store.get(a), &ch) });
                 let mut wp = v.clone();
                 wp.extend_from_slice(&ch);
-                claims.push((w, wp.clone(), mle::eval(store.get(w), &wp)));
+                claims.push(EvalClaim { tensor_id: w, point: wp.clone(), value: mle::eval(store.get(w), &wp) });
                 let mut cp = v.clone();
                 cp.extend_from_slice(&u);
-                claims.push((c, cp.clone(), mle::eval(store.get(c), &cp)));
+                claims.push(EvalClaim { tensor_id: c, point: cp.clone(), value: mle::eval(store.get(c), &cp) });
                 op_proofs.push(OpProof::BatchedMatMul(p, u, v, ch));
             }
             Op::GatherMatMul { a, expert_of, w, c, s, k, n, n_experts } => {
@@ -1718,10 +1805,10 @@ pub fn prove_shard_precomputed(
                     &v,
                     transcript,
                 );
-                claims.push((a, ch.clone(), mle::eval(store.get(a), &ch)));
+                claims.push(EvalClaim { tensor_id: a, point: ch.clone(), value: mle::eval(store.get(a), &ch) });
                 let mut cp = v.clone();
                 cp.extend_from_slice(&u);
-                claims.push((c, cp.clone(), mle::eval(store.get(c), &cp)));
+                claims.push(EvalClaim { tensor_id: c, point: cp.clone(), value: mle::eval(store.get(c), &cp) });
                 op_proofs.push(OpProof::GatherMatMul(p, u, v, ch));
             }
             Op::IdxBroadcast { .. } => {
@@ -1751,13 +1838,13 @@ pub fn prove_shard_precomputed(
                     matmul_prove(&at, bv.as_ref(), store.get(c), m, k, n, &u, &v, transcript);
                 let mut ap = ch.clone();
                 ap.extend_from_slice(&u);
-                claims.push((a, ap.clone(), mle::eval(store.get(a), &ap)));
+                claims.push(EvalClaim { tensor_id: a, point: ap.clone(), value: mle::eval(store.get(a), &ap) });
                 let mut bp = v.clone();
                 bp.extend_from_slice(&ch);
-                claims.push((b, bp.clone(), mle::eval(bv.as_ref(), &bp)));
+                claims.push(EvalClaim { tensor_id: b, point: bp.clone(), value: mle::eval(bv.as_ref(), &bp) });
                 let mut cp = v.clone();
                 cp.extend_from_slice(&u);
-                claims.push((c, cp.clone(), mle::eval(store.get(c), &cp)));
+                claims.push(EvalClaim { tensor_id: c, point: cp.clone(), value: mle::eval(store.get(c), &cp) });
                 op_proofs.push(OpProof::MatMul(p, u, v, ch));
             }
             Op::Projection {
@@ -1786,20 +1873,20 @@ pub fn prove_shard_precomputed(
                 );
                 let mut in_pt = p.ch.clone();
                 in_pt.extend_from_slice(&p.u);
-                claims.push((x, in_pt.clone(), mle::eval(store.get(x), &in_pt)));
+                claims.push(EvalClaim { tensor_id: x, point: in_pt.clone(), value: mle::eval(store.get(x), &in_pt) });
                 let mut weight_pt = p.v.clone();
                 weight_pt.extend_from_slice(&p.ch);
-                claims.push((w, weight_pt.clone(), mle::eval(wv.as_ref(), &weight_pt)));
-                claims.push((out, p.pt.clone(), mle::eval(store.get(out), &p.pt)));
-                claims.push((bias, p.pt.clone(), p.affine.final_evals[4]));
+                claims.push(EvalClaim { tensor_id: w, point: weight_pt.clone(), value: mle::eval(wv.as_ref(), &weight_pt) });
+                claims.push(EvalClaim { tensor_id: out, point: p.pt.clone(), value: mle::eval(store.get(out), &p.pt) });
+                claims.push(EvalClaim { tensor_id: bias, point: p.pt.clone(), value: p.affine.final_evals[4] });
                 op_proofs.push(OpProof::Projection(p));
             }
             Op::Add { a, b, c } => {
                 let mles: Vec<&[Goldilocks]> = vec![store.get(a), store.get(b), store.get(c)];
                 let (proof, r) = prove_virtual(&mles, &add_terms, Goldilocks::ZERO, transcript);
-                claims.push((a, r.clone(), mle::eval(store.get(a), &r)));
-                claims.push((b, r.clone(), mle::eval(store.get(b), &r)));
-                claims.push((c, r.clone(), mle::eval(store.get(c), &r)));
+                claims.push(EvalClaim { tensor_id: a, point: r.clone(), value: mle::eval(store.get(a), &r) });
+                claims.push(EvalClaim { tensor_id: b, point: r.clone(), value: mle::eval(store.get(b), &r) });
+                claims.push(EvalClaim { tensor_id: c, point: r.clone(), value: mle::eval(store.get(c), &r) });
                 op_proofs.push(OpProof::Add(proof, r));
             }
             Op::Lookup { idx, out, table } => {
@@ -1826,11 +1913,11 @@ pub fn prove_shard_precomputed(
                     n,
                     transcript,
                 );
-                claims.push((
-                    out,
-                    p.r_scale.clone(),
-                    mle::eval(store.get(out), &p.r_scale),
-                ));
+                claims.push(EvalClaim {
+                    tensor_id: out,
+                    point: p.r_scale.clone(),
+                    value: mle::eval(store.get(out), &p.r_scale),
+                });
                 lookup_by_table
                     .entry(table)
                     .or_insert(Vec::new())
@@ -1868,9 +1955,9 @@ pub fn prove_shard_precomputed(
                     .entry(rsqrt_table)
                     .or_insert(Vec::new())
                     .push((ridx, rvals));
-                claims.push((out, p.r_out.clone(), mle::eval(store.get(out), &p.r_out)));
-                claims.push((w, p.r_out.clone(), mle::eval(store.get(w), &p.r_out)));
-                claims.push((b, p.r_out.clone(), mle::eval(store.get(b), &p.r_out)));
+                claims.push(EvalClaim { tensor_id: out, point: p.r_out.clone(), value: mle::eval(store.get(out), &p.r_out) });
+                claims.push(EvalClaim { tensor_id: w, point: p.r_out.clone(), value: mle::eval(store.get(w), &p.r_out) });
+                claims.push(EvalClaim { tensor_id: b, point: p.r_out.clone(), value: mle::eval(store.get(b), &p.r_out) });
                 op_proofs.push(OpProof::Layernorm(p));
             }
             Op::LayerNormCentered {
@@ -1897,14 +1984,14 @@ pub fn prove_shard_precomputed(
                     .entry(rsqrt_table)
                     .or_insert(Vec::new())
                     .push((ridx, rvals));
-                claims.push((
-                    x,
-                    p.centered_r.clone(),
-                    mle::eval(store.get(x), &p.centered_r),
-                ));
-                claims.push((out, p.r_out.clone(), mle::eval(store.get(out), &p.r_out)));
-                claims.push((w, p.r_out.clone(), mle::eval(store.get(w), &p.r_out)));
-                claims.push((b, p.r_out.clone(), mle::eval(store.get(b), &p.r_out)));
+                claims.push(EvalClaim {
+                    tensor_id: x,
+                    point: p.centered_r.clone(),
+                    value: mle::eval(store.get(x), &p.centered_r),
+                });
+                claims.push(EvalClaim { tensor_id: out, point: p.r_out.clone(), value: mle::eval(store.get(out), &p.r_out) });
+                claims.push(EvalClaim { tensor_id: w, point: p.r_out.clone(), value: mle::eval(store.get(w), &p.r_out) });
+                claims.push(EvalClaim { tensor_id: b, point: p.r_out.clone(), value: mle::eval(store.get(b), &p.r_out) });
                 op_proofs.push(OpProof::LayerNormCentered(p));
             }
             Op::RmsNorm {
@@ -1940,8 +2027,8 @@ pub fn prove_shard_precomputed(
                     .entry(limb_table)
                     .or_insert(Vec::new())
                     .push((idx_hi, rem_hi));
-                claims.push((out, p.r_out.clone(), mle::eval(store.get(out), &p.r_out)));
-                claims.push((w, p.r_out.clone(), mle::eval(store.get(w), &p.r_out)));
+                claims.push(EvalClaim { tensor_id: out, point: p.r_out.clone(), value: mle::eval(store.get(out), &p.r_out) });
+                claims.push(EvalClaim { tensor_id: w, point: p.r_out.clone(), value: mle::eval(store.get(w), &p.r_out) });
                 op_proofs.push(OpProof::RmsNorm(p));
             }
             Op::RoPE {
@@ -1974,7 +2061,13 @@ pub fn prove_shard_precomputed(
                     .entry(range_table)
                     .or_insert(Vec::new())
                     .push((idx_s, rem_s));
-                claims.push((out, p.r_out.clone(), mle::eval(store.get(out), &p.r_out)));
+                // S2: `out` is claimed at the two half points whose values are
+                // the checked sumcheck final evals (first.final_evals[4],
+                // second.final_evals[4]); the old unverifiable r_out claim is
+                // gone.
+                let (pt_f, pt_s) = rope_out_points(&p.r_first, &p.r_second, d);
+                claims.push(EvalClaim { tensor_id: out, point: pt_f.clone(), value: mle::eval(store.get(out), &pt_f) });
+                claims.push(EvalClaim { tensor_id: out, point: pt_s.clone(), value: mle::eval(store.get(out), &pt_s) });
                 op_proofs.push(OpProof::RoPE(p));
             }
             Op::TopKSelect {
@@ -2001,9 +2094,9 @@ pub fn prove_shard_precomputed(
                     22,
                     transcript,
                 );
-                claims.push((x, p.r.clone(), mle::eval(store.get(x), &p.r)));
-                claims.push((sel, p.r.clone(), mle::eval(store.get(sel), &p.r)));
-                claims.push((gate, p.r.clone(), mle::eval(store.get(gate), &p.r)));
+                claims.push(EvalClaim { tensor_id: x, point: p.r.clone(), value: mle::eval(store.get(x), &p.r) });
+                claims.push(EvalClaim { tensor_id: sel, point: p.r.clone(), value: mle::eval(store.get(sel), &p.r) });
+                claims.push(EvalClaim { tensor_id: gate, point: p.r.clone(), value: mle::eval(store.get(gate), &p.r) });
                 op_proofs.push(OpProof::TopKSelect(p));
             }
             Op::Argmax {
@@ -2030,31 +2123,54 @@ pub fn prove_shard_precomputed(
                     16,
                     transcript,
                 );
-                claims.push((x, p.topk.r.clone(), mle::eval(store.get(x), &p.topk.r)));
-                claims.push((sel, p.topk.r.clone(), mle::eval(store.get(sel), &p.topk.r)));
-                claims.push((gate, p.topk.r.clone(), mle::eval(store.get(gate), &p.topk.r)));
+                claims.push(EvalClaim { tensor_id: x, point: p.topk.r.clone(), value: mle::eval(store.get(x), &p.topk.r) });
+                claims.push(EvalClaim { tensor_id: sel, point: p.topk.r.clone(), value: mle::eval(store.get(sel), &p.topk.r) });
+                claims.push(EvalClaim { tensor_id: gate, point: p.topk.r.clone(), value: mle::eval(store.get(gate), &p.topk.r) });
                 op_proofs.push(OpProof::Argmax(p));
             }
         }
     }
 
-    // Group claims by tensor and bind those with >1 distinct point (and not a
-    // committed boundary tensor).
-    let raw_claims = claims.clone();
-    let boundary_set: std::collections::HashSet<T> = boundary.iter().copied().collect();
+    // Normalize the claim list (S2): same-tensor same-point claims merge
+    // (duplicates keep one entry); contradictory values on one point are a
+    // prover bug and rejected loudly. The verifier applies the same
+    // normalization with rejection.
+    let mut seen: std::collections::HashMap<(T, Vec<Goldilocks>), Goldilocks> =
+        std::collections::HashMap::new();
+    let mut normalized: Vec<EvalClaim> = Vec::with_capacity(claims.len());
+    for c in claims {
+        match seen.get(&(c.tensor_id, c.point.clone())) {
+            Some(&v) => {
+                assert_eq!(v, c.value, "contradictory claims on tensor {}", c.tensor_id);
+            }
+            None => {
+                seen.insert((c.tensor_id, c.point.clone()), c.value);
+                normalized.push(c);
+            }
+        }
+    }
+    let claims = normalized;
+
+    // Group claims by tensor and bind every tensor claimed at >1 point (S2:
+    // no boundary exclusion — the committed path opens boundary tensors
+    // directly and the bind is extra checking; the verifier rebuilds the
+    // same set from its own claims).
     let mut by_tensor: std::collections::BTreeMap<T, Vec<(Vec<Goldilocks>, Goldilocks)>> =
         std::collections::BTreeMap::new();
-    for (t, pt, ev) in claims {
-        by_tensor.entry(t).or_default().push((pt, ev));
+    for c in &claims {
+        by_tensor
+            .entry(c.tensor_id)
+            .or_default()
+            .push((c.point.clone(), c.value));
     }
 
     let mut bound = Vec::new();
     let mut binds = Vec::new();
     for (t, cs) in by_tensor {
-        if boundary_set.contains(&t) || cs.len() < 2 {
+        if cs.len() < 2 {
             continue;
         }
-        let sp = prove_same_poly(store.get(t), &cs, transcript);
+        let sp = prove_same_poly(store.materialize(t).as_ref(), &cs, transcript);
         bound.push(t);
         binds.push(sp);
     }
@@ -2068,19 +2184,13 @@ pub fn prove_shard_precomputed(
         let ys: Vec<&[Goldilocks]> = lookups.iter().map(|(_, y)| y.as_slice()).collect();
         let (proof, x, y, num, _den) =
             prove_lookup_witness_batch_columns(&xs, &ys, alpha, beta, transcript);
-        let (point, num_leaf, den_point, den_leaf) = fractional_leaf(&proof);
         let m = merge_multiplicity(&xs, store.get(*table).len());
         let table_proof = prove_lookup_table(&m, store.get(*table), alpha, beta, transcript);
-        let (point_t, num_leaf_t, den_point_t, den_leaf_t) = fractional_leaf(&table_proof);
         witness_columns.push(WitnessColumn {
             proof,
             x,
             y,
             num,
-            point,
-            den_point,
-            num_leaf,
-            den_leaf,
             alpha,
             beta,
             table: *table,
@@ -2091,21 +2201,19 @@ pub fn prove_shard_precomputed(
             m,
             alpha,
             beta,
-            point: point_t,
-            den_point: den_point_t,
-            num_leaf: num_leaf_t,
-            den_leaf: den_leaf_t,
         });
     }
 
-    OpShardProof {
-        ops: op_proofs,
-        bound,
-        binds,
-        claims: raw_claims,
-        witness_columns,
-        table_columns,
-    }
+    (
+        OpShardProof {
+            ops: op_proofs,
+            bound,
+            binds,
+            witness_columns,
+            table_columns,
+        },
+        claims,
+    )
 }
 
 /// Verify a shard proof (recomputes the witness first).
@@ -2118,32 +2226,38 @@ pub fn verify_shard(
     verify_shard_precomputed(tables, ops, proof, transcript)
 }
 
-/// Verify a shard proof against an already-materialized witness store. Read-only
-/// on `store`, so shards can be verified in parallel. S1: the verifier replays
-/// the prover's transcript interleaving op by op — squeezing the same evaluation
-/// points (checked against the stored ones) and re-deriving every sumcheck
-/// challenge vector from the proof's round messages.
+/// Verify a shard proof with the witness already recomputed by the caller.
+/// S1: the verifier replays the prover's transcript interleaving op by op —
+/// squeezing the same evaluation points (checked against the stored ones) and
+/// re-deriving every sumcheck challenge vector from the proof's round
+/// messages.
 pub fn verify_shard_precomputed(
     tables: &[&[Goldilocks]],
     ops: &[Op],
     proof: &OpShardProof,
     transcript: &mut Transcript,
 ) -> bool {
-    verify_shard_precomputed_inner(tables, ops, proof, transcript, true)
+    verify_shard_precomputed_inner(tables, ops, proof, transcript, FracMode::Plain).is_some()
 }
 
-/// Shard replay with the lookup-column fractional proofs skipped: the
-/// committed path re-proves those on its own transcript, so they are verified
-/// by the committed frac section instead.
+/// Shard replay that BUILDS the shard's claim set (S2): every claim is derived
+/// from the op verifications' checked final evals, never read from the proof.
+/// Returns the claims on success; `None` rejects.
+///
+/// In [`FracMode::Committed`] the lookup-column fractional section and the
+/// permutation/gather fracs are skipped: the committed path re-proves all of
+/// them on its own transcripts (binding the committed column roots) and
+/// verifies them in its dedicated sections.
 fn verify_shard_precomputed_inner(
     tables: &[&[Goldilocks]],
     ops: &[Op],
     proof: &OpShardProof,
     transcript: &mut Transcript,
-    include_lookups: bool,
-) -> bool {
-    assert_eq!(proof.ops.len(), ops.len());
-    assert_eq!(proof.bound.len(), proof.binds.len());
+    mode: FracMode,
+) -> Option<Vec<EvalClaim>> {
+    if proof.ops.len() != ops.len() || proof.bound.len() != proof.binds.len() {
+        return None;
+    }
 
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
     let add_terms = vec![
@@ -2152,7 +2266,7 @@ fn verify_shard_precomputed_inner(
         (neg, vec![1usize]),
     ];
 
-    let mut claims: Vec<(T, Vec<Goldilocks>, Goldilocks)> = Vec::new();
+    let mut claims: Vec<EvalClaim> = Vec::new();
     for (op, p) in ops.iter().zip(&proof.ops) {
         match (op, p) {
             (Op::Transpose { .. }, OpProof::Transpose) => {
@@ -2163,36 +2277,53 @@ fn verify_shard_precomputed_inner(
             (Op::Scale { .. }, OpProof::Scale) => {}
             (Op::ScaleVec { .. }, OpProof::ScaleVec) => {}
             (Op::Scatter { m, n, .. }, OpProof::Scatter(p)) => {
-                if !verify_scatter(p, *m, *n, transcript) {
-                    return false;
+                if !verify_scatter_with_mode(p, *m, *n, transcript, mode) {
+                    return None;
                 }
             }
-            (Op::Gather { m, h, .. }, OpProof::Gather(p)) => {
-                if !verify_scatter_add(p, transcript) {
-                    return false;
+            (Op::Gather { m: _, h: _, .. }, OpProof::Gather(p)) => {
+                if !verify_scatter_add_with_mode(p, transcript, mode) {
+                    return None;
                 }
             }
-            (Op::BatchedMatMul { s, k, n, .. }, OpProof::BatchedMatMul(p, u, v, ch)) => {
+            (
+                Op::BatchedMatMul { a, w, c, s, k, n },
+                OpProof::BatchedMatMul(p, u, v, ch),
+            ) => {
                 let u_s: Vec<Goldilocks> = transcript.field_vec(s.trailing_zeros() as usize);
                 let v_s: Vec<Goldilocks> = transcript.field_vec(n.trailing_zeros() as usize);
                 if u_s != *u || v_s != *v {
-                    return false;
+                    return None;
                 }
                 let (ok, ch_derived) = bmm::verify(p, *s, *k, u, transcript);
                 if !ok || ch_derived != *ch {
-                    return false;
+                    return None;
                 }
+                claims.push(EvalClaim { tensor_id: *a, point: ch.clone(), value: p.sumcheck.final_evals[0] });
+                let mut wp = v.clone();
+                wp.extend_from_slice(ch);
+                claims.push(EvalClaim { tensor_id: *w, point: wp, value: p.sumcheck.final_evals[1] });
+                let mut cp = v.clone();
+                cp.extend_from_slice(u);
+                claims.push(EvalClaim { tensor_id: *c, point: cp, value: p.claimed });
             }
-            (Op::GatherMatMul { s, k, n, .. }, OpProof::GatherMatMul(p, u, v, ch)) => {
+            (
+                Op::GatherMatMul { a, c, s, k, n, .. },
+                OpProof::GatherMatMul(p, u, v, ch),
+            ) => {
                 let u_s: Vec<Goldilocks> = transcript.field_vec(s.trailing_zeros() as usize);
                 let v_s: Vec<Goldilocks> = transcript.field_vec(n.trailing_zeros() as usize);
                 if u_s != *u || v_s != *v {
-                    return false;
+                    return None;
                 }
                 let (ok, ch_derived) = bmm::verify_gather_matmul(p, *s, *k, u, transcript);
                 if !ok || ch_derived != *ch {
-                    return false;
+                    return None;
                 }
+                claims.push(EvalClaim { tensor_id: *a, point: ch.clone(), value: p.sumcheck.final_evals[0] });
+                let mut cp = v.clone();
+                cp.extend_from_slice(u);
+                claims.push(EvalClaim { tensor_id: *c, point: cp, value: p.claimed });
             }
             (Op::IdxBroadcast { .. }, OpProof::IdxBroadcast) => {}
             (Op::CombineIdx { .. }, OpProof::CombineIdx) => {}
@@ -2201,112 +2332,190 @@ fn verify_shard_precomputed_inner(
             (Op::ScaleGate { .. }, OpProof::ScaleGate) => {}
             (Op::Relu { .. }, OpProof::Relu) => {}
             (
-                Op::MatMul { m, k, n, .. },
+                Op::MatMul { a, b, c, m, k, n },
                 OpProof::MatMul(mp, u, v, ch),
             ) => {
                 let u_s: Vec<Goldilocks> = transcript.field_vec(m.trailing_zeros() as usize);
                 let v_s: Vec<Goldilocks> = transcript.field_vec(n.trailing_zeros() as usize);
                 if u_s != *u || v_s != *v {
-                    return false;
+                    return None;
                 }
                 let (ok, ch_derived) = matmul_verify(mp, k.trailing_zeros() as usize, transcript);
                 if !ok || ch_derived != *ch {
-                    return false;
+                    return None;
                 }
+                let mut ap = ch.clone();
+                ap.extend_from_slice(u);
+                claims.push(EvalClaim { tensor_id: *a, point: ap, value: mp.sumcheck.f_eval });
+                let mut bp = v.clone();
+                bp.extend_from_slice(ch);
+                claims.push(EvalClaim { tensor_id: *b, point: bp, value: mp.sumcheck.h_eval });
+                let mut cp = v.clone();
+                cp.extend_from_slice(u);
+                claims.push(EvalClaim { tensor_id: *c, point: cp, value: mp.claimed });
             }
-            (Op::Projection { shift, m, k, n, .. }, OpProof::Projection(pp)) => {
+            (
+                Op::Projection { x, w, bias, out, shift, m, k, n, .. },
+                OpProof::Projection(pp),
+            ) => {
                 if !verify_projection(pp, *shift, *m, *k, *n, transcript) {
-                    return false;
+                    return None;
                 }
+                let mut in_pt = pp.ch.clone();
+                in_pt.extend_from_slice(&pp.u);
+                claims.push(EvalClaim { tensor_id: *x, point: in_pt, value: pp.matmul.sumcheck.f_eval });
+                let mut weight_pt = pp.v.clone();
+                weight_pt.extend_from_slice(&pp.ch);
+                claims.push(EvalClaim { tensor_id: *w, point: weight_pt, value: pp.matmul.sumcheck.h_eval });
+                claims.push(EvalClaim { tensor_id: *out, point: pp.pt.clone(), value: pp.affine.final_evals[3] });
+                claims.push(EvalClaim { tensor_id: *bias, point: pp.pt.clone(), value: pp.affine.final_evals[4] });
             }
-            (Op::Add { .. }, OpProof::Add(vp, r)) => {
+            (Op::Add { a, b, c }, OpProof::Add(vp, r)) => {
                 let (ok, r_derived, fc) =
                     verify_virtual(vp, &add_terms, Goldilocks::ZERO, r.len(), transcript);
                 if !ok
                     || r_derived != *r
                     || fc != virtual_eval(&add_terms, &vp.final_evals)
                 {
-                    return false;
+                    return None;
                 }
+                claims.push(EvalClaim { tensor_id: *a, point: r.clone(), value: vp.final_evals[0] });
+                claims.push(EvalClaim { tensor_id: *b, point: r.clone(), value: vp.final_evals[1] });
+                claims.push(EvalClaim { tensor_id: *c, point: r.clone(), value: vp.final_evals[2] });
             }
             (Op::Lookup { table, .. }, OpProof::Lookup) => {
                 // Existence only: the per-table fractional replays happen after
-                // the op loop, in the prover's column order.
+                // the op loop, in the prover's column order (or in the
+                // committed frac section on the committed path).
                 let w = proof.witness_columns.iter().find(|w| w.table == *table);
                 let t = proof.table_columns.iter().find(|t| t.table == *table);
                 match (w, t) {
                     (Some(_), Some(_)) => {}
-                    _ => return false,
+                    _ => return None,
                 }
             }
-            (Op::Softmax { m, n, .. }, OpProof::Softmax(sp)) => {
+            (Op::Softmax { out, m, n, .. }, OpProof::Softmax(sp)) => {
                 if !verify_softmax_rounded(sp, *m, *n, transcript) {
-                    return false;
+                    return None;
                 }
+                claims.push(EvalClaim {
+                    tensor_id: *out,
+                    point: sp.r_scale.clone(),
+                    value: sp.rescale.final_evals[0],
+                });
             }
             (Op::SoftmaxIndex { .. }, OpProof::SoftmaxIndex) => {
                 // No proof: the verifier recomputes `idx = softmax_index(scores)`.
             }
             (Op::GeluIndex { .. }, OpProof::GeluIndex) => {}
             (Op::StableSoftmaxIndex { .. }, OpProof::StableSoftmaxIndex) => {}
-            (Op::Layernorm { m, d, .. }, OpProof::Layernorm(lp)) => {
+            (Op::Layernorm { out, w, b, m, d, .. }, OpProof::Layernorm(lp)) => {
                 if !verify_layernorm_chain(lp, *m, *d, transcript) {
-                    return false;
+                    return None;
                 }
+                // out relation mles [x, rsqrt_b, w, b, out] (degree 3, S2).
+                claims.push(EvalClaim { tensor_id: *out, point: lp.r_out.clone(), value: lp.out.final_evals[4] });
+                claims.push(EvalClaim { tensor_id: *w, point: lp.r_out.clone(), value: lp.out.final_evals[2] });
+                claims.push(EvalClaim { tensor_id: *b, point: lp.r_out.clone(), value: lp.out.final_evals[3] });
             }
             (
-                Op::LayerNormCentered { m, d, n_real, .. },
+                Op::LayerNormCentered { x, w, b, out, m, d, n_real, .. },
                 OpProof::LayerNormCentered(lp),
             ) => {
                 if !verify_layer_norm_centered(lp, *m, *d, *n_real, transcript) {
-                    return false;
+                    return None;
                 }
+                claims.push(EvalClaim {
+                    tensor_id: *x,
+                    point: lp.centered_r.clone(),
+                    value: lp.centered.final_evals[0],
+                });
+                // out relation mles [centered, rstd_b, w, b, raw, out, rem_out, ones].
+                claims.push(EvalClaim { tensor_id: *out, point: lp.r_out.clone(), value: lp.out.final_evals[5] });
+                claims.push(EvalClaim { tensor_id: *w, point: lp.r_out.clone(), value: lp.out.final_evals[2] });
+                claims.push(EvalClaim { tensor_id: *b, point: lp.r_out.clone(), value: lp.out.final_evals[3] });
             }
-            (Op::RmsNorm { m, d, n_real, .. }, OpProof::RmsNorm(p)) => {
+            (Op::RmsNorm { out, w, m, d, n_real, .. }, OpProof::RmsNorm(p)) => {
                 if !verify_rms_norm(p, *m, *d, *n_real, transcript) {
-                    return false;
+                    return None;
                 }
+                // out relation mles [x, rstd_b, w, raw, out, rem_out, ones].
+                claims.push(EvalClaim { tensor_id: *out, point: p.r_out.clone(), value: p.out.final_evals[4] });
+                claims.push(EvalClaim { tensor_id: *w, point: p.r_out.clone(), value: p.out.final_evals[2] });
             }
-            (Op::RoPE { shift, .. }, OpProof::RoPE(p)) => {
+            (Op::RoPE { out, d, shift, .. }, OpProof::RoPE(p)) => {
                 if !verify_rope(p, *shift, transcript) {
-                    return false;
+                    return None;
                 }
+                // S2: `out` is claimed at the two half points whose values are
+                // the checked sumcheck final evals (first/second.final_evals[4]).
+                let (pt_f, pt_s) = rope_out_points(&p.r_first, &p.r_second, *d);
+                claims.push(EvalClaim { tensor_id: *out, point: pt_f, value: p.first.final_evals[4] });
+                claims.push(EvalClaim { tensor_id: *out, point: pt_s, value: p.second.final_evals[4] });
             }
-            (Op::TopKSelect { k, m, n, .. }, OpProof::TopKSelect(p)) => {
+            (Op::TopKSelect { x, sel, gate, k, m, n, .. }, OpProof::TopKSelect(p)) => {
                 if !verify_topk(p, *k, *m, *n, transcript) {
-                    return false;
+                    return None;
                 }
+                claims.push(EvalClaim { tensor_id: *x, point: p.r.clone(), value: p.gate_rel.final_evals[0] });
+                claims.push(EvalClaim { tensor_id: *sel, point: p.r.clone(), value: p.gate_rel.final_evals[1] });
+                claims.push(EvalClaim { tensor_id: *gate, point: p.r.clone(), value: p.gate_rel.final_evals[2] });
             }
-            (Op::Argmax { m, n, .. }, OpProof::Argmax(p)) => {
+            (Op::Argmax { x, sel, gate, m, n, .. }, OpProof::Argmax(p)) => {
                 if !verify_argmax(p, *m, *n, transcript) {
-                    return false;
+                    return None;
                 }
+                claims.push(EvalClaim { tensor_id: *x, point: p.topk.r.clone(), value: p.topk.gate_rel.final_evals[0] });
+                claims.push(EvalClaim { tensor_id: *sel, point: p.topk.r.clone(), value: p.topk.gate_rel.final_evals[1] });
+                claims.push(EvalClaim { tensor_id: *gate, point: p.topk.r.clone(), value: p.topk.gate_rel.final_evals[2] });
             }
-            _ => return false,
+            _ => return None,
         }
     }
 
-    // Rebuild the same grouping as prove_shard and verify each binding.
-    let mut by_tensor: std::collections::BTreeMap<T, Vec<(Vec<Goldilocks>, Goldilocks)>> =
-        std::collections::BTreeMap::new();
-    for (t, pt, ev) in &proof.claims {
-        by_tensor.entry(*t).or_default().push((pt.clone(), *ev));
-    }
-    // Recompute which tensors are bound (same rule: >1 claim). We rely on the
-    // proof's `bound` list to be the canonical order.
-    let mut bound_claims: Vec<Vec<(Vec<Goldilocks>, Goldilocks)>> = Vec::new();
-    for &t in &proof.bound {
-        match by_tensor.get(&t) {
-            Some(cs) if cs.len() >= 2 => bound_claims.push(cs.clone()),
-            _ => return false,
+    // Normalize + reject contradictions (S2): two claims on the same tensor
+    // at the same point with different values can never both be evaluations
+    // of one MLE — reject; equal duplicates merge.
+    let mut seen: std::collections::HashMap<(T, Vec<Goldilocks>), Goldilocks> =
+        std::collections::HashMap::new();
+    let mut normalized: Vec<EvalClaim> = Vec::with_capacity(claims.len());
+    for c in claims {
+        match seen.get(&(c.tensor_id, c.point.clone())) {
+            Some(&v) => {
+                if v != c.value {
+                    return None;
+                }
+            }
+            None => {
+                seen.insert((c.tensor_id, c.point.clone()), c.value);
+                normalized.push(c);
+            }
         }
     }
-    if bound_claims.len() != proof.binds.len() {
-        return false;
+    let claims = normalized;
+
+    // Rebuild the binding set from the LOCALLY BUILT claims (S2): every tensor
+    // with >1 claim must be bound, and the proof's `bound` list must equal
+    // that set in the prover's (sorted) order.
+    let mut by_tensor: std::collections::BTreeMap<T, Vec<(Vec<Goldilocks>, Goldilocks)>> =
+        std::collections::BTreeMap::new();
+    for c in &claims {
+        by_tensor
+            .entry(c.tensor_id)
+            .or_default()
+            .push((c.point.clone(), c.value));
     }
-    for (i, &t) in proof.bound.iter().enumerate() {
-        if verify_same_poly(&proof.binds[i], &bound_claims[i], transcript).is_none() {
-            return false;
+    let bound_groups: Vec<(&T, &Vec<(Vec<Goldilocks>, Goldilocks)>)> =
+        by_tensor.iter().filter(|(_, cs)| cs.len() >= 2).collect();
+    if bound_groups.len() != proof.bound.len() {
+        return None;
+    }
+    for (i, (t, cs)) in bound_groups.iter().enumerate() {
+        if **t != proof.bound[i] {
+            return None;
+        }
+        if verify_same_poly(&proof.binds[i], cs, transcript).is_none() {
+            return None;
         }
     }
 
@@ -2314,21 +2523,21 @@ fn verify_shard_precomputed_inner(
     // order (per table: alpha, beta, witness frac, table frac). Skipped on
     // the committed path, whose frac section verifies the re-proven proofs
     // on the committed transcript.
-    if include_lookups {
+    if mode == FracMode::Plain {
         if proof.witness_columns.len() != proof.table_columns.len() {
-            return false;
+            return None;
         }
         for (wc, tc) in proof.witness_columns.iter().zip(proof.table_columns.iter()) {
             if transcript.field() != wc.alpha || transcript.field() != wc.beta {
-                return false;
+                return None;
             }
             if !verify_lookup_split(&wc.proof, &tc.proof, transcript) {
-                return false;
+                return None;
             }
         }
     }
 
-    true
+    Some(claims)
 }
 
 /// A whole-model shard-DAG proof: every shard folded into one g, plus
@@ -2372,6 +2581,21 @@ pub fn prove_shard_dag(
     ops: &[Op],
     ops_per_shard: usize,
 ) -> ShardDagProof {
+    let (proof, _claims) = prove_shard_dag_inner(store, ops, ops_per_shard, FracMode::Plain);
+    proof
+}
+
+/// Prove the shard DAG and also return the per-shard claim sets (S2): the
+/// shard proofs carry no claims — the DAG/committed composers consume these
+/// prover-side, while every verifier rebuilds its own. In
+/// [`FracMode::Committed`] the per-op permutation/gather fracs stay off the
+/// shard transcripts (they are re-proven on the committed transcripts).
+fn prove_shard_dag_inner(
+    store: &mut Store,
+    ops: &[Op],
+    ops_per_shard: usize,
+    mode: FracMode,
+) -> (ShardDagProof, Vec<Vec<EvalClaim>>) {
     let ranges = shard_ranges(ops.len(), ops_per_shard);
 
     // Materialize every op output once, then prove each shard's sumchecks in
@@ -2383,31 +2607,37 @@ pub fn prove_shard_dag(
     let mut master = Transcript::new(b"zkie-shard-dag-v1");
     absorb_statement(&mut master, ops, ops_per_shard);
 
-    let shards: Vec<OpShardProof> = ranges
+    let shard_results: Vec<(OpShardProof, Vec<EvalClaim>)> = ranges
         .par_iter()
         .enumerate()
         .map(|(si, &(s, e))| {
             let mut child = master.clone();
             child.absorb_u64(si as u64);
-            prove_shard_precomputed(store_ref, &ops[s..e], &[], &mut child)
+            prove_shard_precomputed(store_ref, &ops[s..e], &mut child, mode)
         })
         .collect();
+    let (shards, shard_claims): (Vec<OpShardProof>, Vec<Vec<EvalClaim>>) =
+        shard_results.into_iter().unzip();
 
-    // Group raw claims by tensor across shards; bind tensors claimed by >1 shard.
+    // Group the prover-side claims by tensor across shards; bind tensors
+    // claimed by >1 shard.
     let mut by_tensor: std::collections::BTreeMap<T, Vec<(Vec<Goldilocks>, Goldilocks)>> =
         std::collections::BTreeMap::new();
-    for shard in shards.iter() {
-        for (t, pt, ev) in &shard.claims {
-            by_tensor.entry(*t).or_default().push((pt.clone(), *ev));
+    for claims in shard_claims.iter() {
+        for c in claims {
+            by_tensor
+                .entry(c.tensor_id)
+                .or_default()
+                .push((c.point.clone(), c.value));
         }
     }
     // Recompute per-tensor shard count with a set (a tensor may be claimed twice
     // by one shard, so a plain counter would overcount).
     let mut tensor_shards: std::collections::BTreeMap<T, std::collections::HashSet<usize>> =
         std::collections::BTreeMap::new();
-    for (si, shard) in shards.iter().enumerate() {
-        for (t, _, _) in &shard.claims {
-            tensor_shards.entry(*t).or_default().insert(si);
+    for (si, claims) in shard_claims.iter().enumerate() {
+        for c in claims {
+            tensor_shards.entry(c.tensor_id).or_default().insert(si);
         }
     }
 
@@ -2415,16 +2645,19 @@ pub fn prove_shard_dag(
     let mut cross_binds = Vec::new();
     for (t, claims) in by_tensor {
         if tensor_shards.get(&t).map(|s| s.len()).unwrap_or(0) > 1 {
-            let sp = prove_same_poly(store.get(t), &claims, &mut master);
+            let sp = prove_same_poly(store.materialize(t).as_ref(), &claims, &mut master);
             cross_tensors.push(t);
             cross_binds.push(sp);
         }
     }
-    ShardDagProof {
-        shards,
-        cross_tensors,
-        cross_binds,
-    }
+    (
+        ShardDagProof {
+            shards,
+            cross_tensors,
+            cross_binds,
+        },
+        shard_claims,
+    )
 }
 
 /// Standalone verifier entry: deserialize a serialized  from
@@ -2449,6 +2682,19 @@ pub fn verify_shard_dag(
     ops_per_shard: usize,
     proof: &ShardDagProof,
 ) -> bool {
+    verify_shard_dag_inner(tables, ops, ops_per_shard, proof, FracMode::Plain)
+}
+
+/// Shard-DAG verification that BUILDS every shard's claims locally (S2) and
+/// rebuilds the cross-shard binding set from them — `cross_tensors` and the
+/// cross-bind inputs never come from the proof.
+fn verify_shard_dag_inner(
+    tables: &[&[Goldilocks]],
+    ops: &[Op],
+    ops_per_shard: usize,
+    proof: &ShardDagProof,
+    mode: FracMode,
+) -> bool {
     let ranges = shard_ranges(ops.len(), ops_per_shard);
     if proof.shards.len() != ranges.len() || proof.cross_tensors.len() != proof.cross_binds.len() {
         return false;
@@ -2460,16 +2706,16 @@ pub fn verify_shard_dag(
     let mut master = Transcript::new(b"zkie-shard-dag-v1");
     absorb_statement(&mut master, ops, ops_per_shard);
 
-    let all_ok = ranges
+    let shard_claims: Vec<Option<Vec<EvalClaim>>> = ranges
         .par_iter()
         .enumerate()
         .map(|(i, &(s, e))| {
             let mut child = master.clone();
             child.absorb_u64(i as u64);
-            verify_shard_precomputed(tables, &ops[s..e], &proof.shards[i], &mut child)
+            verify_shard_precomputed_inner(tables, &ops[s..e], &proof.shards[i], &mut child, mode)
         })
-        .all(|ok| ok);
-    if !all_ok {
+        .collect();
+    if shard_claims.iter().any(|c| c.is_none()) {
         return false;
     }
 
@@ -2477,10 +2723,13 @@ pub fn verify_shard_dag(
         std::collections::BTreeMap::new();
     let mut tensor_shards: std::collections::BTreeMap<T, std::collections::HashSet<usize>> =
         std::collections::BTreeMap::new();
-    for (si, shard) in proof.shards.iter().enumerate() {
-        for (t, pt, ev) in &shard.claims {
-            by_tensor.entry(*t).or_default().push((pt.clone(), *ev));
-            tensor_shards.entry(*t).or_default().insert(si);
+    for (si, claims) in shard_claims.iter().enumerate() {
+        for c in claims.as_ref().unwrap() {
+            by_tensor
+                .entry(c.tensor_id)
+                .or_default()
+                .push((c.point.clone(), c.value));
+            tensor_shards.entry(c.tensor_id).or_default().insert(si);
         }
     }
 
@@ -2634,6 +2883,14 @@ fn collect_weight_tensors(ops: &[Op]) -> Vec<T> {
             Op::RmsNorm { w, .. } => {
                 weights.insert(*w);
             }
+            // BatchedMatMul's `w` is claimed at (v || ch) by the op proof, so
+            // it needs a batch opening on the committed path unless it is an
+            // op output (e.g. lookup-gathered rows in MoE).
+            Op::BatchedMatMul { w, .. } => {
+                if !written.contains(w) {
+                    weights.insert(*w);
+                }
+            }
             _ => {}
         }
     }
@@ -2677,13 +2934,15 @@ pub fn commit_model_weights(
         std::collections::BTreeMap::new();
     for &t in &weight_tensors {
         let v = store.materialize(t).into_owned();
-        // WHIR folding factor is 5, so a tensor shorter than 2^5 cannot be
-        // folded; skip such tiny weights (they are negligible and have no
-        // meaningful commitment).
-        if v.len() < 32 {
-            continue;
-        }
-        by_size.entry(v.len()).or_default().push((t, v));
+        // WHIR folding factor is 5, so every weight is committed at arity
+        // >= 5: tensors shorter than 2^5 are zero-padded (their claim
+        // points get zero-extended the same way, so the padded MLE matches
+        // the raw evaluation). Skipping them would leave used weights
+        // unauthenticated.
+        let padded_len = v.len().next_power_of_two().max(32);
+        let mut padded = v;
+        padded.resize(padded_len, Goldilocks::ZERO);
+        by_size.entry(padded_len).or_default().push((t, padded));
     }
     std::fs::create_dir_all(cache_dir).expect("create weight cache dir");
 
@@ -2749,8 +3008,12 @@ pub struct WeightBatchOpening {
     pub proof: Option<zkie_core::pcs::batch_open::BatchOpeningProof>,
 }
 
-/// A single lookup witness column pair opened at its chained-GKR leaf point:
-/// A multiplicity-column opening for one lookup table side (num_leaf = eval(m, r)).
+/// A multiplicity-column opening for one lookup table side, plus the table
+/// itself opened at the leaf claim points. `table` names the lookup table
+/// TENSOR (statement tensor id): whether it is an identity table is decided
+/// by the verifier from the statement tables, never by a proof flag (S2).
+/// `den_leaf` is likewise dropped — the verifier derives the den leaf from
+/// the table fractional replay.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct TableOpening {
     pub commitment: zkie_core::pcs::whir::Commitment,
@@ -2758,6 +3021,7 @@ pub struct TableOpening {
     pub arity: usize,
     pub point: Vec<Goldilocks>,
     pub claimed: Goldilocks,
+    pub table: T,
     pub table_commitment: Option<zkie_core::pcs::whir::Commitment>,
     pub table_opening: Option<zkie_core::pcs::whir::Proof>,
     pub table_eval: Goldilocks,
@@ -2766,10 +3030,8 @@ pub struct TableOpening {
     pub den_point: Vec<Goldilocks>,
     pub den_table_opening: Option<zkie_core::pcs::whir::Proof>,
     pub den_table_eval: Goldilocks,
-    pub is_identity: bool,
     pub alpha: Goldilocks,
     pub beta: Goldilocks,
-    pub den_leaf: Goldilocks,
 }
 
 /// Verifier-side witness batch commitment: one root for a group of same-arity
@@ -2900,7 +3162,10 @@ pub fn prove_committed_shard_dag(
     tokens_t: T,
     argmax_t: T,
 ) -> CommittedShardDagProof {
-    let plain = prove_shard_dag(store, ops, ops_per_shard);
+    // Committed mode: the per-op perm/gather fracs stay off the shard
+    // transcripts (re-proven on the committed transcripts below); the shard
+    // claims come back separately (S2).
+    let (plain, shard_claims) = prove_shard_dag_inner(store, ops, ops_per_shard, FracMode::Committed);
     let boundary_tensors = plain.cross_tensors.clone();
 
     // S1: the cross-bind merged-point sumchecks get their own statement-bound
@@ -2915,10 +3180,10 @@ pub fn prove_committed_shard_dag(
         let bw = zkie_core::pcs::whir::Whir::with_params(arity, 90, 17);
         let committed = zkie_core::pcs::committed::commit(&bw, store.get(t));
         let mut claims = Vec::new();
-        for shard in &plain.shards {
-            for (tt, pt, ev) in &shard.claims {
-                if *tt == t {
-                    claims.push((pt.clone(), *ev));
+        for shard_cs in &shard_claims {
+            for c in shard_cs {
+                if c.tensor_id == t {
+                    claims.push((c.point.clone(), c.value));
                 }
             }
         }
@@ -2940,7 +3205,12 @@ pub fn prove_committed_shard_dag(
         let tensors: Vec<Vec<Goldilocks>> = cw
             .table_ids
             .iter()
-            .map(|&t| store.materialize(t).into_owned())
+            .map(|&t| {
+                let mut v = store.materialize(t).into_owned();
+                let padded_len = 1usize << cw.arity;
+                v.resize(padded_len, Goldilocks::ZERO);
+                v
+            })
             .collect();
         for (i, &t) in cw.table_ids.iter().enumerate() {
             weight_locs.insert(t, (bi, i));
@@ -2951,10 +3221,10 @@ pub fn prove_committed_shard_dag(
     let num_groups = cached_weights.len();
     let mut group_claims: Vec<Vec<(usize, Vec<Goldilocks>, Goldilocks)>> =
         vec![Vec::new(); num_groups];
-    for shard in &plain.shards {
-        for (t, pt, ev) in &shard.claims {
-            if let Some(&(bi, ti)) = weight_locs.get(t) {
-                group_claims[bi].push((ti, pt.clone(), *ev));
+    for claims in &shard_claims {
+        for c in claims {
+            if let Some(&(bi, ti)) = weight_locs.get(&c.tensor_id) {
+                group_claims[bi].push((ti, c.point.clone(), c.value));
             }
         }
     }
@@ -2964,7 +3234,17 @@ pub fn prove_committed_shard_dag(
     for (bi, cw) in cached_weights.iter().enumerate() {
         let claims = &group_claims[bi];
         let table_idxs: Vec<usize> = claims.iter().map(|(ti, _, _)| *ti).collect();
-        let points: Vec<Vec<Goldilocks>> = claims.iter().map(|(_, pt, _)| pt.clone()).collect();
+        // Claim points are zero-extended to the batch arity (small weights
+        // are committed zero-padded; the padded MLE agrees with the raw
+        // evaluation at the extended point).
+        let points: Vec<Vec<Goldilocks>> = claims
+            .iter()
+            .map(|(_, pt, _)| {
+                let mut p = pt.clone();
+                p.resize(cw.arity, Goldilocks::ZERO);
+                p
+            })
+            .collect();
         let claimed: Vec<Goldilocks> = claims.iter().map(|(_, _, ev)| *ev).collect();
 
         // Verifier-side batch commitment (no prover data); prover-side Whir is
@@ -3066,7 +3346,7 @@ pub fn prove_committed_shard_dag(
                     identity_tables.insert(tc.table);
                     continue;
                 }
-                let table_pad = pad_table(raw_table);
+                let table_pad = pad_lookup_table(raw_table);
                 let arity = table_pad.len().trailing_zeros() as usize;
                 let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(arity, 90);
                 let bw = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow_bits);
@@ -3130,7 +3410,7 @@ pub fn prove_committed_shard_dag(
         let mut t_arity = Vec::new();
         let mut t_cm = Vec::new();
         for tc in &shard.table_columns {
-            let total = tc.m.len().next_power_of_two();
+            let total = tc.m.len().next_power_of_two().max(32);
             let arity = total.trailing_zeros() as usize;
             let mut m_pad = vec![Goldilocks::from_u64(0); total];
             for (j, &v) in tc.m.iter().enumerate() {
@@ -3173,6 +3453,9 @@ pub fn prove_committed_shard_dag(
     // shard-major order (all witness columns first, then all table columns),
     // exactly the order the verifier replays. Each prove_fractional derives its
     // layer challenges per-round internally.
+    // S2: no leaf fields are stored — the openings below read the leaves back
+    // out of the freshly proven chains via the prover-side helper, and the
+    // verifier derives them from its own replay.
     for si in 0..shards.len() {
         for ci in 0..shards[si].witness_columns.len() {
             let alpha = ts.field();
@@ -3184,12 +3467,7 @@ pub fn prove_committed_shard_dag(
                 den[j] = alpha + wc.x[j] + beta * wc.y[j];
             }
             let new_proof = prove_fractional(wc.num.clone(), den, &mut ts);
-            let (point, num_leaf, den_point, den_leaf) = fractional_leaf(&new_proof);
             wc.proof = new_proof;
-            wc.point = point;
-            wc.den_point = den_point;
-            wc.num_leaf = num_leaf;
-            wc.den_leaf = den_leaf;
             wc.alpha = alpha;
             wc.beta = beta;
         }
@@ -3199,15 +3477,23 @@ pub fn prove_committed_shard_dag(
             let alpha = shards[si].witness_columns[i].alpha;
             let beta = shards[si].witness_columns[i].beta;
             let tc = &mut shards[si].table_columns[i];
-            let (num_t, den_t) =
-                build_lookup_table_num_den(&tc.m, store.get(tc.table), alpha, beta);
+            // The table frac runs over the PADDED table (arity >= 5; identity
+            // tables continue the identity so the verifier's index-formula
+            // evaluation matches at every padded point).
+            let table_pad = pad_lookup_table(store.get(tc.table));
+            let total = table_pad.len();
+            let mut num_t = vec![Goldilocks::from_u64(0); total];
+            let mut den_t = vec![Goldilocks::from_u64(0); total];
+            for j in 0..total {
+                num_t[j] = if j < tc.m.len() {
+                    Goldilocks::from_u64(tc.m[j])
+                } else {
+                    Goldilocks::ZERO
+                };
+                den_t[j] = alpha + Goldilocks::from_u64(j as u64) + beta * table_pad[j];
+            }
             let new_proof = prove_fractional(num_t, den_t, &mut ts);
-            let (point, num_leaf, den_point, den_leaf) = fractional_leaf(&new_proof);
             tc.proof = new_proof;
-            tc.point = point;
-            tc.den_point = den_point;
-            tc.num_leaf = num_leaf;
-            tc.den_leaf = den_leaf;
             tc.alpha = alpha;
             tc.beta = beta;
         }
@@ -3250,7 +3536,11 @@ pub fn prove_committed_shard_dag(
         } = g;
         let num_tables = cols.len();
         let table_idxs: Vec<usize> = (0..num_tables).collect();
-        let mut points: Vec<Vec<Goldilocks>> = Vec::with_capacity(num_tables);
+        // S2: x/y are opened at the derived DEN leaf point (the den relation
+        // alpha + x + beta*y == den_leaf is checked there), num at the NUM
+        // leaf point (claimed == num_leaf).
+        let mut xy_points: Vec<Vec<Goldilocks>> = Vec::with_capacity(num_tables);
+        let mut num_points: Vec<Vec<Goldilocks>> = Vec::with_capacity(num_tables);
         let mut xs_tensors: Vec<Vec<Goldilocks>> = Vec::with_capacity(num_tables);
         let mut ys_tensors: Vec<Vec<Goldilocks>> = Vec::with_capacity(num_tables);
         let mut nums_tensors: Vec<Vec<Goldilocks>> = Vec::with_capacity(num_tables);
@@ -3260,14 +3550,14 @@ pub fn prove_committed_shard_dag(
         for (ti, &(si, ci)) in cols.iter().enumerate() {
             let gid = shard_wc_off[si] + ci;
             let wc = &mut shards[si].witness_columns[ci];
-            let point = wc.point.clone();
-            let num_leaf = wc.num_leaf;
+            let (num_point, num_leaf, den_point, _den_leaf) = fractional_leaf(&wc.proof);
             let x = std::mem::take(&mut wc.x);
             let y = std::mem::take(&mut wc.y);
             let num = std::mem::take(&mut wc.num);
-            let eval_x = mle::eval(&x, &point);
-            let eval_y = mle::eval(&y, &point);
-            points.push(point);
+            let eval_x = mle::eval(&x, &den_point);
+            let eval_y = mle::eval(&y, &den_point);
+            xy_points.push(den_point);
+            num_points.push(num_point);
             xs_tensors.push(x);
             ys_tensors.push(y);
             nums_tensors.push(num);
@@ -3284,29 +3574,29 @@ pub fn prove_committed_shard_dag(
             };
         }
         let x_proof = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
-            x_ctx, &table_idxs, &xs_tensors, &points, &xs_claimed,
+            x_ctx, &table_idxs, &xs_tensors, &xy_points, &xs_claimed,
         ).expect("honest witness x batch-open");
         let y_proof = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
-            y_ctx, &table_idxs, &ys_tensors, &points, &ys_claimed,
+            y_ctx, &table_idxs, &ys_tensors, &xy_points, &ys_claimed,
         ).expect("honest witness y batch-open");
         let num_proof = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(
-            num_ctx, &table_idxs, &nums_tensors, &points, &nums_claimed,
+            num_ctx, &table_idxs, &nums_tensors, &num_points, &nums_claimed,
         ).expect("honest witness num batch-open");
         witness_batch_openings.push(WitnessBatchOpening {
             table_idxs: table_idxs.clone(),
-            points: points.clone(),
+            points: xy_points.clone(),
             claimed: xs_claimed,
             proof: x_proof,
         });
         witness_batch_openings.push(WitnessBatchOpening {
             table_idxs: table_idxs.clone(),
-            points: points.clone(),
+            points: xy_points,
             claimed: ys_claimed,
             proof: y_proof,
         });
         witness_batch_openings.push(WitnessBatchOpening {
             table_idxs,
-            points,
+            points: num_points,
             claimed: nums_claimed,
             proof: num_proof,
         });
@@ -3314,11 +3604,12 @@ pub fn prove_committed_shard_dag(
 
     // Open the per-lookup multiplicity columns `m` at the fractional leaf
     // points (the fractional proofs were already run on the transcript above).
+    // S2: the leaf points come from the freshly proven chain (prover-side
+    // helper); `table` names the lookup table tensor so the verifier can
+    // decide identity from the statement.
     for (si, shard) in shards.iter_mut().enumerate() {
         for (i, tc) in shard.table_columns.iter_mut().enumerate() {
-            let point = tc.point.clone();
-            let den_point = tc.den_point.clone();
-            let num_leaf = tc.num_leaf;
+            let (point, num_leaf, den_point, _den_leaf) = fractional_leaf(&tc.proof);
             let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(t_arities[si][i], 90);
             let bw = zkie_core::pcs::whir::Whir::with_params(t_arities[si][i], 90, pow_bits);
             let (open, ev) = bw.open(t_cms[si][i].prover_data.clone(), &t_cms[si][i].protocol, &point);
@@ -3357,16 +3648,15 @@ pub fn prove_committed_shard_dag(
                 arity: t_arities[si][i],
                 point,
                 claimed: num_leaf,
+                table: tc.table,
                 table_commitment,
                 table_opening,
                 table_eval,
                 den_point,
                 den_table_opening,
                 den_table_eval,
-                is_identity: is_ident,
                 alpha: tc.alpha,
                 beta: tc.beta,
-                den_leaf: tc.den_leaf,
             });
             tc.m.clear();
         }
@@ -3436,7 +3726,9 @@ pub fn prove_committed_shard_dag(
             for (li, op) in ops[s..e].iter().enumerate() {
                 if let Op::Scatter { .. } = op {
                     let arity = match &shards[si].ops[li] {
-                        OpProof::Scatter(p) => p.perm.a.len().next_power_of_two().trailing_zeros() as usize,
+                        OpProof::Scatter(p) => {
+                            p.perm.a.len().next_power_of_two().max(32).trailing_zeros() as usize
+                        }
                         _ => unreachable!(),
                     };
                     perm_ops.push((si, li, arity));
@@ -3553,11 +3845,13 @@ pub fn prove_committed_shard_dag(
             num_ctx,
         } = g;
         let n = group_ops.len();
-        let table_idxs: Vec<usize> = (0..n).collect();
-        let mut points_a = Vec::with_capacity(n);
-        let mut points_b = Vec::with_capacity(n);
-        let mut a_claimed = Vec::with_capacity(n);
-        let mut b_claimed = Vec::with_capacity(n);
+        // Each a/b column carries TWO openings (num leaf point + den leaf
+        // point), so the index list repeats each table index twice.
+        let table_idxs: Vec<usize> = (0..n).flat_map(|ti| [ti, ti]).collect();
+        let mut points_a = Vec::with_capacity(2 * n);
+        let mut points_b = Vec::with_capacity(2 * n);
+        let mut a_claimed = Vec::with_capacity(2 * n);
+        let mut b_claimed = Vec::with_capacity(2 * n);
         let mut num_idxs = Vec::with_capacity(2 * n);
         let mut num_points = Vec::with_capacity(2 * n);
         let mut num_claimed = Vec::with_capacity(2 * n);
@@ -3643,9 +3937,11 @@ pub fn prove_committed_shard_dag(
             for (li, op) in ops[s..e].iter().enumerate() {
                 if let (Op::Gather { m, h, .. }, OpProof::Gather(sp)) = (op, &shards[si].ops[li]) {
                     let s_len = sp.token_id.len();
-                    let arity_src = (s_len * h).next_power_of_two().trailing_zeros() as usize;
-                    let arity_tgt = (m * h).next_power_of_two().trailing_zeros() as usize;
-                    let arity_gate = s_len.next_power_of_two().trailing_zeros() as usize;
+                    // The fractional domains are padded to arity >= 5 in
+                    // prove_scatter_add; the committed columns follow.
+                    let arity_src = sp.num_source.len().trailing_zeros() as usize;
+                    let arity_tgt = sp.num_target.len().trailing_zeros() as usize;
+                    let arity_gate = s_len.next_power_of_two().max(32).trailing_zeros() as usize;
                     gather_ops.push((si, li, arity_src, arity_tgt, arity_gate, *h, *m));
                 }
             }
@@ -3671,13 +3967,17 @@ pub fn prove_committed_shard_dag(
         o
     };
 
-    // Phase A: commit the six alpha-independent columns.
+    // Phase A: commit the four alpha/gamma-independent columns (weighted,
+    // out, gate, token_id). The num columns depend on the FS gamma and the
+    // den columns on the FS alpha, so they are committed in phase B below
+    // (rebuilding them with the committed-transcript alpha/gamma keeps the
+    // column content consistent with the fracs re-proven there).
     {
-        let indep = [0usize, 2, 3, 5, 6, 7];
+        let indep = [2usize, 5, 6, 7];
         let mut by_key: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>> = std::collections::BTreeMap::new();
         for &(si, li, arity_src, arity_tgt, arity_gate, _, _) in &gather_ops {
             for &ty in &indep {
-                let ar = match ty { 0 | 2 => arity_src, 3 | 5 => arity_tgt, _ => arity_gate };
+                let ar = match ty { 2 => arity_src, 5 => arity_tgt, _ => arity_gate };
                 by_key.entry((ar, ty)).or_default().push((si, li));
             }
         }
@@ -3686,9 +3986,7 @@ pub fn prove_committed_shard_dag(
             for &(si, li) in &ops_ {
                 let sp = match &shards[si].ops[li] { OpProof::Gather(p) => p, _ => unreachable!() };
                 let col = match ty {
-                    0 => pad(&sp.num_source, arity),
                     2 => pad(&sp.weighted, arity),
-                    3 => pad(&sp.num_target, arity),
                     5 => pad(&sp.out, arity),
                     6 => pad(&sp.gate, arity),
                     _ => { let g: Vec<Goldilocks> = sp.token_id.iter().map(|&t| Goldilocks::from_u64(t as u64)).collect(); pad(&g, arity) }
@@ -3706,7 +4004,7 @@ pub fn prove_committed_shard_dag(
     }
 
     let gather_indep_count = gather_groups.len();
-    // FS: absorb the six independent roots, then derive alpha/gamma per op.
+    // FS: absorb the independent roots, then derive alpha/gamma per op.
     let mut ts = Transcript::new(b"zkie-committed-gather-v1");
     absorb_statement(&mut ts, ops, ops_per_shard);
     for g in &gather_groups {
@@ -3723,36 +4021,52 @@ pub fn prove_committed_shard_dag(
         sp.gamma = gamma;
     }
 
-    // Phase B: rebuild den_source/den_target with the FS alpha, then commit them.
+    // Phase B: rebuild num_source/num_target with the FS gamma and
+    // den_source/den_target with the FS alpha, then commit them.
+    let mut op_num_src: Vec<Vec<Goldilocks>> = vec![Vec::new(); gather_ops.len()];
+    let mut op_num_tgt: Vec<Vec<Goldilocks>> = vec![Vec::new(); gather_ops.len()];
     let mut op_den_src: Vec<Vec<Goldilocks>> = vec![Vec::new(); gather_ops.len()];
     let mut op_den_tgt: Vec<Vec<Goldilocks>> = vec![Vec::new(); gather_ops.len()];
     for (gid, &(si, li, arity_src, arity_tgt, _, h, m)) in gather_ops.iter().enumerate() {
-        let alpha = match &shards[si].ops[li] {
-            OpProof::Gather(p) => p.alpha,
+        let (alpha, gamma) = match &shards[si].ops[li] {
+            OpProof::Gather(p) => (p.alpha, p.gamma.clone()),
             _ => unreachable!(),
         };
         let sp = match &shards[si].ops[li] { OpProof::Gather(p) => p, _ => unreachable!() };
+        let mut nsrc = vec![Goldilocks::ZERO; 1usize << arity_src];
         let mut dsrc = vec![alpha; 1usize << arity_src];
         for pos in 0..sp.token_id.len() {
             for d in 0..h {
-                dsrc[pos * h + d] = alpha - Goldilocks::from_u64(sp.token_id[pos] as u64);
+                let idx = pos * h + d;
+                nsrc[idx] = gamma[d] * sp.weighted[idx] * sp.gate[pos];
+                dsrc[idx] = alpha - Goldilocks::from_u64(sp.token_id[pos] as u64);
             }
         }
+        let mut ntgt = vec![Goldilocks::ZERO; 1usize << arity_tgt];
         let mut dtgt = vec![alpha; 1usize << arity_tgt];
         for t in 0..m {
             for d in 0..h {
+                ntgt[t * h + d] = gamma[d] * sp.out[t * h + d];
                 dtgt[t * h + d] = alpha - Goldilocks::from_u64(t as u64);
             }
         }
+        // Den continuation into the padding (num stays 0), matching the
+        // verifier's index-formula check at the den leaf point.
+        let h_log = h.trailing_zeros() as usize;
+        for idx in m * h..(1usize << arity_tgt) {
+            dtgt[idx] = alpha - Goldilocks::from_u64((idx >> h_log) as u64);
+        }
+        op_num_src[gid] = nsrc;
+        op_num_tgt[gid] = ntgt;
         op_den_src[gid] = dsrc;
         op_den_tgt[gid] = dtgt;
     }
     {
-        let den_tys = [1usize, 4];
+        let dep_tys = [0usize, 1, 3, 4];
         let mut by_key: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>> = std::collections::BTreeMap::new();
         for &(si, li, arity_src, arity_tgt, _, _, _) in &gather_ops {
-            for &ty in &den_tys {
-                let ar = if ty == 1 { arity_src } else { arity_tgt };
+            for &ty in &dep_tys {
+                let ar = if ty == 0 || ty == 1 { arity_src } else { arity_tgt };
                 by_key.entry((ar, ty)).or_default().push((si, li));
             }
         }
@@ -3760,7 +4074,12 @@ pub fn prove_committed_shard_dag(
             let mut cols = Vec::with_capacity(ops_.len());
             for &(si, li) in &ops_ {
                 let gid = gather_gid[&(si, li)];
-                let col = if ty == 1 { op_den_src[gid].clone() } else { op_den_tgt[gid].clone() };
+                let col = match ty {
+                    0 => op_num_src[gid].clone(),
+                    1 => op_den_src[gid].clone(),
+                    3 => op_num_tgt[gid].clone(),
+                    _ => op_den_tgt[gid].clone(),
+                };
                 cols.push(col);
             }
             let num_tables = ops_.len();
@@ -3773,8 +4092,8 @@ pub fn prove_committed_shard_dag(
         }
     }
 
-    // FS: absorb the two den roots, then run the fractional proofs per op (S1).
-    for g in gather_groups.iter().skip(6) {
+    // FS: absorb the dependent roots, then run the fractional proofs per op.
+    for g in gather_groups.iter().skip(gather_indep_count) {
         ts.absorb(&bincode::serialize(&g.ctx.commitment).unwrap());
     }
 
@@ -3794,20 +4113,30 @@ pub fn prove_committed_shard_dag(
     // gather_ops (shard-major) order, using the rebuilt den. The layer
     // challenges are derived per-round inside prove_fractional.
     let mut op_point_src: Vec<Vec<Goldilocks>> = vec![Vec::new(); gather_ops.len()];
+    let mut op_den_point_src: Vec<Vec<Goldilocks>> = vec![Vec::new(); gather_ops.len()];
     let mut op_point_tgt: Vec<Vec<Goldilocks>> = vec![Vec::new(); gather_ops.len()];
+    let mut op_den_point_tgt: Vec<Vec<Goldilocks>> = vec![Vec::new(); gather_ops.len()];
     for (gid, &(si, li, arity_src, arity_tgt, _, _, _)) in gather_ops.iter().enumerate() {
         let sp = match &mut shards[si].ops[li] {
             OpProof::Gather(p) => p,
             _ => unreachable!(),
         };
-        let new_src = prove_fractional(sp.num_source.clone(), op_den_src[gid].clone(), &mut ts);
-        let (point_src, _, _, _) = fractional_leaf(&new_src);
-        let new_tgt = prove_fractional(sp.num_target.clone(), op_den_tgt[gid].clone(), &mut ts);
-        let (point_tgt, _, _, _) = fractional_leaf(&new_tgt);
+        // The fracs run on the REBUILT (committed-gamma/alpha) columns, which
+        // the batch openings below commit and open.
+        let new_src = prove_fractional(op_num_src[gid].clone(), op_den_src[gid].clone(), &mut ts);
+        let (point_src, _, den_point_src, _) = fractional_leaf(&new_src);
+        let new_tgt = prove_fractional(op_num_tgt[gid].clone(), op_den_tgt[gid].clone(), &mut ts);
+        let (point_tgt, _, den_point_tgt, _) = fractional_leaf(&new_tgt);
+        sp.num_source = op_num_src[gid].clone();
+        sp.num_target = op_num_tgt[gid].clone();
+        sp.den_source = op_den_src[gid].clone();
+        sp.den_target = op_den_tgt[gid].clone();
         sp.source_side = new_src;
         sp.target_side = new_tgt;
         op_point_src[gid] = point_src;
+        op_den_point_src[gid] = den_point_src;
         op_point_tgt[gid] = point_tgt;
+        op_den_point_tgt[gid] = den_point_tgt;
         let _ = arity_src;
         let _ = arity_tgt;
     }
@@ -3832,18 +4161,28 @@ pub fn prove_committed_shard_dag(
         let mut claimed = Vec::with_capacity(n);
         for (ti, &(si, li)) in group_ops.iter().enumerate() {
             let gid = gather_gid[&(si, li)];
-            let (_, _, _, _, _, h, _) = gather_ops[gid];
+            let (_, _, _, _, arity_gate, h, _) = gather_ops[gid];
             let h_log = h.trailing_zeros() as usize;
             let sp = match &shards[si].ops[li] { OpProof::Gather(p) => p, _ => unreachable!() };
+            // The gate/token_id columns are committed over the PADDED gate
+            // domain (arity_gate), so their points are the restricted pos
+            // bits zero-padded to that arity. S2: num opened at the num leaf
+            // point, den (and the token_id it is checked against) at the den
+            // leaf point.
+            let gate_pt = |pos_bits: &[Goldilocks]| -> Vec<Goldilocks> {
+                let mut pt = pos_bits.to_vec();
+                pt.resize(arity_gate, Goldilocks::ZERO);
+                pt
+            };
             let (pt, cl) = match ty {
                 0 => (op_point_src[gid].clone(), mle::eval(&cols[ti], &op_point_src[gid])),
-                1 => (op_point_src[gid].clone(), mle::eval(&cols[ti], &op_point_src[gid])),
+                1 => (op_den_point_src[gid].clone(), mle::eval(&cols[ti], &op_den_point_src[gid])),
                 2 => (sp.r_prod_source.clone(), mle::eval(&cols[ti], &sp.r_prod_source)),
                 3 => (op_point_tgt[gid].clone(), mle::eval(&cols[ti], &op_point_tgt[gid])),
-                4 => (op_point_tgt[gid].clone(), mle::eval(&cols[ti], &op_point_tgt[gid])),
+                4 => (op_den_point_tgt[gid].clone(), mle::eval(&cols[ti], &op_den_point_tgt[gid])),
                 5 => (sp.r_prod_target.clone(), mle::eval(&cols[ti], &sp.r_prod_target)),
-                6 => (sp.r_prod_source[h_log..].to_vec(), mle::eval(&cols[ti], &sp.r_prod_source[h_log..].to_vec())),
-                _ => (op_point_src[gid][h_log..].to_vec(), mle::eval(&cols[ti], &op_point_src[gid][h_log..].to_vec())),
+                6 => (gate_pt(&sp.r_prod_source[h_log..]), mle::eval(&cols[ti], &gate_pt(&sp.r_prod_source[h_log..]))),
+                _ => (gate_pt(&op_den_point_src[gid][h_log..]), mle::eval(&cols[ti], &gate_pt(&op_den_point_src[gid][h_log..]))),
             };
             points.push(pt);
             claimed.push(cl);
@@ -3921,6 +4260,7 @@ pub fn verify_committed_shard_dag(
     _whir: &zkie_core::pcs::whir::Whir,
     proof: &CommittedShardDagProof,
 ) -> bool {
+    let st = VerifierStatement::new(tables, ops, ops_per_shard);
     let ranges = shard_ranges(ops.len(), ops_per_shard);
     if proof.shards.len() != ranges.len()
         || proof.boundary_tensors.len() != proof.boundary_commitments.len()
@@ -3929,130 +4269,230 @@ pub fn verify_committed_shard_dag(
         return false;
     }
     let shards = &proof.shards;
-    // S1: replay the same transcript structure as prove_committed_shard_dag:
-    // the shard-DAG master for the per-shard replays, and the binds transcript
-    // for the committed cross-binds.
+    // 1. Shard replays (committed mode) — every shard's claim set is BUILT
+    // locally from the op verifications (S2), never read from the proof.
     let mut master = Transcript::new(b"zkie-shard-dag-v1");
     absorb_statement(&mut master, ops, ops_per_shard);
-    let all_ok = ranges
+    let shard_claims: Vec<Option<Vec<EvalClaim>>> = ranges
         .par_iter()
         .enumerate()
         .map(|(i, &(s, e))| {
             let mut child = master.clone();
             child.absorb_u64(i as u64);
-            let ok = verify_shard_precomputed_inner(tables, &ops[s..e], &shards[i], &mut child, false);
-            ok
+            verify_shard_precomputed_inner(tables, &ops[s..e], &shards[i], &mut child, FracMode::Committed)
         })
-        .all(|ok| ok);
-    if !all_ok {
+        .collect();
+    if shard_claims.iter().any(|c| c.is_none()) {
         return false;
     }
-
+    // 2. Boundary (cross-shard) set rebuilt from the local claims; the
+    // committed cross-binds are verified against those local claims.
+    let mut by_tensor: std::collections::BTreeMap<T, Vec<(Vec<Goldilocks>, Goldilocks)>> =
+        std::collections::BTreeMap::new();
+    let mut tensor_shards: std::collections::BTreeMap<T, std::collections::HashSet<usize>> =
+        std::collections::BTreeMap::new();
+    for (si, claims) in shard_claims.iter().enumerate() {
+        for c in claims.as_ref().unwrap() {
+            by_tensor
+                .entry(c.tensor_id)
+                .or_default()
+                .push((c.point.clone(), c.value));
+            tensor_shards.entry(c.tensor_id).or_default().insert(si);
+        }
+    }
+    let mut expected_boundary: Vec<T> = Vec::new();
+    for (t, _) in &by_tensor {
+        if tensor_shards.get(t).map(|s| s.len()).unwrap_or(0) > 1 {
+            expected_boundary.push(*t);
+        }
+    }
+    if expected_boundary != proof.boundary_tensors {
+        return false;
+    }
     let mut bind_ts = Transcript::new(b"zkie-committed-binds-v1");
     absorb_statement(&mut bind_ts, ops, ops_per_shard);
     for (i, &t) in proof.boundary_tensors.iter().enumerate() {
-        let mut claims = Vec::new();
-        for shard in &proof.shards {
-            for (tt, pt, ev) in &shard.claims {
-                if *tt == t {
-                    claims.push((pt.clone(), *ev));
-                }
-            }
-        }
         if !verify_committed_cross_bind(
             &proof.boundary_commitments[i],
-            &claims,
+            &by_tensor[&t],
             &proof.cross_binds[i],
             &mut bind_ts,
         ) {
             return false;
         }
     }
-    // Verify each size group's vertical batch opening against the committed
-    // weight roots (one FRI proof + one sumcheck per group, no tensor data).
+    // 3. Weight batches (S2): every locally claimed weight tensor must be
+    // opened against its batch commitment — right tensor, right point, right
+    // value, right root. The expected opening entries are rebuilt from the
+    // local claims via the proof's `weight_locs` mapping, and an opening must
+    // carry EXACTLY those entries. Batches with no claimed tensors may be
+    // empty (unused weights); an empty list can never skip a non-empty one.
     if proof.weight_batch_openings.len() != proof.weight_batches.len() {
         return false;
     }
+    let weights: std::collections::HashSet<T> = st.weight_tensors().into_iter().collect();
+    let entry_key =
+        |e: &(usize, Vec<Goldilocks>, Goldilocks)| -> Vec<u8> { bincode::serialize(e).unwrap() };
+    let mut batch_entries: Vec<Vec<(usize, Vec<Goldilocks>, Goldilocks)>> =
+        vec![Vec::new(); proof.weight_batches.len()];
+    for claims in shard_claims.iter() {
+        for c in claims.as_ref().unwrap() {
+            if !weights.contains(&c.tensor_id) {
+                continue;
+            }
+            let (bi, ti) = match proof.weight_locs.get(&c.tensor_id) {
+                Some(&loc) => loc,
+                None => return false, // claimed weight with no batch opening
+            };
+            if bi >= proof.weight_batches.len() || ti >= proof.weight_batches[bi].num_tables {
+                return false;
+            }
+            if c.point.len() > proof.weight_batches[bi].arity {
+                return false;
+            }
+            let mut pt = c.point.clone();
+            pt.resize(proof.weight_batches[bi].arity, Goldilocks::ZERO);
+            batch_entries[bi].push((ti, pt, c.value));
+        }
+    }
     for (bi, opening) in proof.weight_batch_openings.iter().enumerate() {
-        let batch = &proof.weight_batches[bi];
-        let opening_proof = match &opening.proof {
-            Some(p) => p,
-            None => continue, // committed but never opened (e.g. affine bias)
-        };
+        let entries = &batch_entries[bi];
         if opening.table_idxs.len() != opening.points.len()
             || opening.table_idxs.len() != opening.claimed.len()
         {
             return false;
         }
-        let protocol = batch.whir.opening_protocol(batch.arity, batch.num_tables);
-        if !zkie_core::pcs::batch_open::verify_batch_open_committed(
-            &batch.whir,
-            &batch.commitment,
-            &protocol,
-            batch.num_tables,
-            &opening.table_idxs,
-            &opening.points,
-            &opening.claimed,
-            opening_proof,
-        ) {
-            return false;
+        match (&opening.proof, entries.is_empty()) {
+            (None, true) => {
+                // Unused weight group: no claims, no opening (allowed).
+                if !opening.table_idxs.is_empty() {
+                    return false;
+                }
+            }
+            (Some(_), false) => {
+                // Point-set comparison: the opening must carry exactly the
+                // claims of this batch (multiset).
+                let mut expected: Vec<Vec<u8>> = entries.iter().map(entry_key).collect();
+                expected.sort();
+                let mut got: Vec<Vec<u8>> = opening
+                    .table_idxs
+                    .iter()
+                    .zip(opening.points.iter())
+                    .zip(opening.claimed.iter())
+                    .map(|((ti, pt), ev)| bincode::serialize(&(ti, pt.clone(), ev)).unwrap())
+                    .collect();
+                got.sort();
+                if expected != got {
+                    return false;
+                }
+                let batch = &proof.weight_batches[bi];
+                let protocol = batch.whir.opening_protocol(batch.arity, batch.num_tables);
+                if !zkie_core::pcs::batch_open::verify_batch_open_committed(
+                    &batch.whir,
+                    &batch.commitment,
+                    &protocol,
+                    batch.num_tables,
+                    &opening.table_idxs,
+                    &opening.points,
+                    &opening.claimed,
+                    opening.proof.as_ref().unwrap(),
+                ) {
+                    return false;
+                }
+            }
+            _ => return false, // claims with no opening, or opening with no claims
         }
     }
-    for to in &proof.table_openings {
-        let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(to.arity, 90);
-        let bw = zkie_core::pcs::whir::Whir::with_params(to.arity, 90, pow_bits);
-        let protocol = bw.opening_protocol(to.arity, 1);
-        if bw.verify(&to.commitment, &to.opening, &protocol, &to.point).ok() != Some(to.claimed) {
-            return false;
+    // 4. Fractional replays FIRST — every leaf is derived from the checked
+    // chains (S2); the opening checks below compare against them.
+    let mut witness_leaves: Vec<(Vec<Goldilocks>, Goldilocks, Vec<Goldilocks>, Goldilocks)> =
+        Vec::new();
+    let mut table_leaves: Vec<(Vec<Goldilocks>, Goldilocks, Vec<Goldilocks>, Goldilocks)> =
+        Vec::new();
+    {
+        let mut ts = Transcript::new(b"zkie-committed-frac-v1");
+        absorb_statement(&mut ts, ops, ops_per_shard);
+        for batch in &proof.witness_batches {
+            ts.absorb(&bincode::serialize(&batch.commitment).unwrap());
         }
-        let mut eval_idx = Goldilocks::ZERO;
-        for (k, &pk) in to.point.iter().enumerate() {
-            eval_idx = eval_idx + Goldilocks::from_u64(1u64 << k) * pk;
-        }
-        let table_eval = if to.is_identity {
-            eval_idx
-        } else {
-            let (tc, to2) = (&to.table_commitment, &to.table_opening);
-            if bw.verify(tc.as_ref().unwrap(), to2.as_ref().unwrap(), &protocol, &to.point).ok() != Some(to.table_eval) {
-            return false;
+        let mut ti = 0usize;
+        for (si, shard) in shards.iter().enumerate() {
+            ts.absorb_u64(si as u64);
+            for tc in &shard.table_columns {
+                if ti >= proof.table_openings.len() {
+                    return false;
+                }
+                let to = &proof.table_openings[ti];
+                if tc.table != to.table {
+                    return false;
+                }
+                ts.absorb(&bincode::serialize(&to.commitment).unwrap());
+                if st.is_identity_table(to.table) {
+                    ts.absorb_u64(0);
+                } else {
+                    match &to.table_commitment {
+                        Some(c) => ts.absorb(&bincode::serialize(c).unwrap()),
+                        None => return false,
+                    }
+                }
+                ti += 1;
             }
-            // The den-side opening authenticates the table at q_den.
-            let (dc, do2) = (&to.table_commitment, &to.den_table_opening);
-            if bw.verify(dc.as_ref().unwrap(), do2.as_ref().unwrap(), &protocol, &to.den_point).ok()
-                != Some(to.den_table_eval)
-            {
-            return false;
-            }
-            to.table_eval
-        };
-        let mut den_idx = Goldilocks::ZERO;
-        for (k, &pk) in to.den_point.iter().enumerate() {
-            den_idx = den_idx + Goldilocks::from_u64(1u64 << k) * pk;
         }
-        let den_table_eval = if to.is_identity {
-            den_idx
-        } else {
-            to.den_table_eval
-        };
-        let expected_den = to.alpha + den_idx + to.beta * den_table_eval;
-        if expected_den != to.den_leaf {
+        if ti != proof.table_openings.len() {
             return false;
+        }
+        for shard in shards.iter() {
+            for wc in &shard.witness_columns {
+                if ts.field() != wc.alpha || ts.field() != wc.beta {
+                    return false;
+                }
+                match verify_fractional_chain_core(&wc.proof, &mut ts) {
+                    Some(leaf) => witness_leaves.push(leaf),
+                    None => return false,
+                }
+            }
+        }
+        for shard in shards.iter() {
+            for tc in &shard.table_columns {
+                match verify_fractional_chain_core(&tc.proof, &mut ts) {
+                    Some(leaf) => table_leaves.push(leaf),
+                    None => {
+                        return false;
+                    }
+                }
+                // Cross relation of the split lookup (the plain path checks it
+                // via verify_lookup_split; the committed path must too).
+            }
+        }
+        // The witness/table pairing is per shard by column index.
+        for shard in shards.iter() {
+            for i in 0..shard.witness_columns.len() {
+                let wc = &shard.witness_columns[i];
+                let tc = &shard.table_columns[i];
+                if wc.proof.final_num * tc.proof.final_den
+                    != tc.proof.final_num * wc.proof.final_den
+                {
+                    return false;
+                }
+            }
         }
     }
+    // 5. Witness columns: batch openings verified against their commitments
+    // and compared with the DERIVED leaves (x/y at q_den, num at q_num).
     if proof.witness_batches.len() != proof.witness_batch_openings.len() {
         return false;
     }
-    let total_witness_cols: usize = proof.shards.iter().map(|s| s.witness_columns.len()).sum();
+    let total_witness_cols: usize = shards.iter().map(|s| s.witness_columns.len()).sum();
     if proof.witness_locations.len() != total_witness_cols {
         return false;
     }
     for (bi, opening) in proof.witness_batch_openings.iter().enumerate() {
-        let batch = &proof.witness_batches[bi];
         if opening.table_idxs.len() != opening.points.len()
             || opening.table_idxs.len() != opening.claimed.len()
         {
             return false;
         }
+        let batch = &proof.witness_batches[bi];
         let protocol = batch.whir.opening_protocol(batch.arity, batch.num_tables);
         if !zkie_core::pcs::batch_open::verify_batch_open_committed(
             &batch.whir,
@@ -4069,22 +4509,425 @@ pub fn verify_committed_shard_dag(
     }
     {
         let mut gid = 0usize;
-        for shard in &proof.shards {
+        for shard in shards.iter() {
             for wc in &shard.witness_columns {
+                let (q_num, num_leaf, q_den, den_leaf) = &witness_leaves[gid];
                 let loc = &proof.witness_locations[gid];
-                let eval_x = proof.witness_batch_openings[loc.x_batch].claimed[loc.x_table];
-                let eval_y = proof.witness_batch_openings[loc.y_batch].claimed[loc.y_table];
-                let num_leaf = proof.witness_batch_openings[loc.num_batch].claimed[loc.num_table];
-                if num_leaf != wc.num_leaf {
+                let (x_open, y_open, num_open) = match (
+                    proof.witness_batch_openings.get(loc.x_batch),
+                    proof.witness_batch_openings.get(loc.y_batch),
+                    proof.witness_batch_openings.get(loc.num_batch),
+                ) {
+                    (Some(x), Some(y), Some(n)) => (x, y, n),
+                    _ => return false,
+                };
+                if loc.x_table >= x_open.points.len()
+                    || loc.y_table >= y_open.points.len()
+                    || loc.num_table >= num_open.points.len()
+                {
                     return false;
                 }
-                if wc.alpha + eval_x + wc.beta * eval_y != wc.den_leaf {
+                // x/y must sit on the derived DEN leaf point, num on the NUM
+                // leaf point with the derived num leaf value.
+                if x_open.points[loc.x_table] != *q_den || y_open.points[loc.y_table] != *q_den {
+                    return false;
+                }
+                if num_open.points[loc.num_table] != *q_num {
+                    return false;
+                }
+                if num_open.claimed[loc.num_table] != *num_leaf {
+                    return false;
+                }
+                let eval_x = x_open.claimed[loc.x_table];
+                let eval_y = y_open.claimed[loc.y_table];
+                if wc.alpha + eval_x + wc.beta * eval_y != *den_leaf {
                     return false;
                 }
                 gid += 1;
             }
         }
     }
+    // 6. Table side (S2, the four opening elements): the m-column opening must
+    // sit on the DERIVED num leaf point with the derived num leaf value; the
+    // table must be opened at the derived den leaf point with the den relation
+    // checked there; the identity decision comes from the statement tables.
+    {
+        let mut ti = 0usize;
+        for shard in shards.iter() {
+            for _tc in &shard.table_columns {
+                let (q_num_t, a_t, q_den_t, b_t) = &table_leaves[ti];
+                let to = &proof.table_openings[ti];
+                let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(to.arity, 90);
+                let bw = zkie_core::pcs::whir::Whir::with_params(to.arity, 90, pow_bits);
+                let protocol = bw.opening_protocol(to.arity, 1);
+                if to.point != *q_num_t || to.claimed != *a_t {
+                    return false;
+                }
+                if bw.verify(&to.commitment, &to.opening, &protocol, &to.point).ok()
+                    != Some(to.claimed)
+                {
+                    return false;
+                }
+                if to.den_point != *q_den_t {
+                    return false;
+                }
+                let is_ident = st.is_identity_table(to.table);
+                let den_table_eval = if is_ident {
+                    if to.table_commitment.is_some()
+                        || to.table_opening.is_some()
+                        || to.den_table_opening.is_some()
+                    {
+                        return false;
+                    }
+                    let mut den_idx = Goldilocks::ZERO;
+                    for (k, &pk) in q_den_t.iter().enumerate() {
+                        den_idx = den_idx + Goldilocks::from_u64(1u64 << k) * pk;
+                    }
+                    den_idx
+                } else {
+                    let (tc_, to2) = match (&to.table_commitment, &to.table_opening) {
+                        (Some(c), Some(o)) => (c, o),
+                        _ => return false,
+                    };
+                    if bw.verify(tc_, to2, &protocol, &to.point).ok() != Some(to.table_eval) {
+                        return false;
+                    }
+                    let (dc, do2) = match (&to.table_commitment, &to.den_table_opening) {
+                        (Some(c), Some(o)) => (c, o),
+                        _ => return false,
+                    };
+                    if bw.verify(dc, do2, &protocol, &to.den_point).ok()
+                        != Some(to.den_table_eval)
+                    {
+                        return false;
+                    }
+                    to.den_table_eval
+                };
+                let mut den_idx = Goldilocks::ZERO;
+                for (k, &pk) in q_den_t.iter().enumerate() {
+                    den_idx = den_idx + Goldilocks::from_u64(1u64 << k) * pk;
+                }
+                if to.alpha + den_idx + to.beta * den_table_eval != *b_t {
+                    return false;
+                }
+                ti += 1;
+            }
+        }
+    }
+    // 7. Permutations: frac replays first (collecting derived leaves), then
+    // the opening-vs-leaf comparisons.
+    if proof.perm_batches.len() != proof.perm_batch_openings.len() {
+        return false;
+    }
+    let mut perm_leaves: Vec<(
+        (Vec<Goldilocks>, Goldilocks, Vec<Goldilocks>, Goldilocks),
+        (Vec<Goldilocks>, Goldilocks, Vec<Goldilocks>, Goldilocks),
+    )> = Vec::new();
+    {
+        let mut ts = Transcript::new(b"zkie-committed-perm-v1");
+        absorb_statement(&mut ts, ops, ops_per_shard);
+        for batch in &proof.perm_batches {
+            ts.absorb(&bincode::serialize(&batch.commitment).unwrap());
+        }
+        for shard in shards.iter() {
+            for op in &shard.ops {
+                if let OpProof::Scatter(sp) = op {
+                    let alpha = ts.field();
+                    if alpha != sp.perm.alpha {
+                        return false;
+                    }
+                    let la = match verify_fractional_chain_core(&sp.perm.a_side, &mut ts) {
+                        Some(l) => l,
+                        None => return false,
+                    };
+                    let lb = match verify_fractional_chain_core(&sp.perm.b_side, &mut ts) {
+                        Some(l) => l,
+                        None => return false,
+                    };
+                    perm_leaves.push((la, lb));
+                }
+            }
+        }
+    }
+    {
+        let total: usize = shards
+            .iter()
+            .map(|s| s.ops.iter().filter(|o| matches!(o, OpProof::Scatter(_))).count())
+            .sum();
+        if proof.perm_locations.len() != total {
+            return false;
+        }
+    }
+    for (bi, opening) in proof.perm_batch_openings.iter().enumerate() {
+        if opening.table_idxs.len() != opening.points.len()
+            || opening.table_idxs.len() != opening.claimed.len()
+        {
+            return false;
+        }
+        let batch = &proof.perm_batches[bi];
+        let protocol = batch.whir.opening_protocol(batch.arity, batch.num_tables);
+        if !zkie_core::pcs::batch_open::verify_batch_open_committed(
+            &batch.whir,
+            &batch.commitment,
+            &protocol,
+            batch.num_tables,
+            &opening.table_idxs,
+            &opening.points,
+            &opening.claimed,
+            &opening.proof,
+        ) {
+            return false;
+        }
+    }
+    {
+        let mut gid = 0usize;
+        for shard in shards.iter() {
+            for op in &shard.ops {
+                if let OpProof::Scatter(sp) = op {
+                    let loc = &proof.perm_locations[gid];
+                    let (la, lb) = &perm_leaves[gid];
+                    let (q_na, a_a, q_da, b_a) = la;
+                    let (q_nb, a_b, q_db, b_b) = lb;
+                    let (a_open, b_open, num_open) = match (
+                        proof.perm_batch_openings.get(loc.a_batch),
+                        proof.perm_batch_openings.get(loc.b_batch),
+                        proof.perm_batch_openings.get(loc.num_batch),
+                    ) {
+                        (Some(a), Some(b), Some(n)) => (a, b, n),
+                        _ => return false,
+                    };
+                    if loc.a_table + 1 >= a_open.points.len()
+                        || loc.b_table + 1 >= b_open.points.len()
+                        || 2 * loc.num_table + 1 >= num_open.points.len()
+                    {
+                        return false;
+                    }
+                    // a/b columns: entry 2*ti at the num leaf point, 2*ti+1 at
+                    // the den leaf point. The num column (shared indicator):
+                    // q_num_a and q_num_b with the two derived num leaves.
+                    if a_open.points[loc.a_table] != *q_na
+                        || a_open.points[loc.a_table + 1] != *q_da
+                    {
+                        return false;
+                    }
+                    if b_open.points[loc.b_table] != *q_nb
+                        || b_open.points[loc.b_table + 1] != *q_db
+                    {
+                        return false;
+                    }
+                    if num_open.points[2 * loc.num_table] != *q_na
+                        || num_open.points[2 * loc.num_table + 1] != *q_nb
+                    {
+                        return false;
+                    }
+                    let nl_a = num_open.claimed[2 * loc.num_table];
+                    let nl_b = num_open.claimed[2 * loc.num_table + 1];
+                    if nl_a != *a_a || nl_b != *a_b {
+                        return false;
+                    }
+                    let eval_a = a_open.claimed[loc.a_table + 1];
+                    let eval_b = b_open.claimed[loc.b_table + 1];
+                    if *b_a != sp.perm.alpha - eval_a || *b_b != sp.perm.alpha - eval_b {
+                        return false;
+                    }
+                    gid += 1;
+                }
+            }
+        }
+    }
+    // 8. Gather: frac replays first (derived leaves), then the opening
+    // comparisons against the leaves and the product final evals.
+    if proof.gather_batches.len() != proof.gather_batch_openings.len() {
+        return false;
+    }
+    let mut gather_leaves: Vec<(
+        (Vec<Goldilocks>, Goldilocks, Vec<Goldilocks>, Goldilocks),
+        (Vec<Goldilocks>, Goldilocks, Vec<Goldilocks>, Goldilocks),
+    )> = Vec::new();
+    {
+        let mut ts = Transcript::new(b"zkie-committed-gather-v1");
+        absorb_statement(&mut ts, ops, ops_per_shard);
+        for batch in proof.gather_batches.iter().take(proof.gather_indep_batches) {
+            ts.absorb(&bincode::serialize(&batch.commitment).unwrap());
+        }
+        for shard in shards.iter() {
+            for op in &shard.ops {
+                if let OpProof::Gather(sp) = op {
+                    let alpha = ts.field();
+                    let gamma: Vec<Goldilocks> = (0..sp.gamma.len()).map(|_| ts.field()).collect();
+                    if alpha != sp.alpha || gamma != sp.gamma {
+                        return false;
+                    }
+                }
+            }
+        }
+        for batch in proof.gather_batches.iter().skip(proof.gather_indep_batches) {
+            ts.absorb(&bincode::serialize(&batch.commitment).unwrap());
+        }
+        for shard in shards.iter() {
+            for op in &shard.ops {
+                if let OpProof::Gather(sp) = op {
+                    let ls = match verify_fractional_chain_core(&sp.source_side, &mut ts) {
+                        Some(l) => l,
+                        None => return false,
+                    };
+                    let lt = match verify_fractional_chain_core(&sp.target_side, &mut ts) {
+                        Some(l) => l,
+                        None => return false,
+                    };
+                    // Cross relation of the split gather (as on the plain path).
+                    if sp.source_side.final_num * sp.target_side.final_den
+                        != sp.target_side.final_num * sp.source_side.final_den
+                    {
+                        return false;
+                    }
+                    gather_leaves.push((ls, lt));
+                }
+            }
+        }
+    }
+    {
+        let total: usize = shards
+            .iter()
+            .map(|s| s.ops.iter().filter(|o| matches!(o, OpProof::Gather(_))).count())
+            .sum();
+        if proof.gather_locations.len() != total {
+            return false;
+        }
+    }
+    for (bi, opening) in proof.gather_batch_openings.iter().enumerate() {
+        if opening.table_idxs.len() != opening.points.len()
+            || opening.table_idxs.len() != opening.claimed.len()
+        {
+            return false;
+        }
+        let batch = &proof.gather_batches[bi];
+        let protocol = batch.whir.opening_protocol(batch.arity, batch.num_tables);
+        if !zkie_core::pcs::batch_open::verify_batch_open_committed(
+            &batch.whir,
+            &batch.commitment,
+            &protocol,
+            batch.num_tables,
+            &opening.table_idxs,
+            &opening.points,
+            &opening.claimed,
+            &opening.proof,
+        ) {
+            return false;
+        }
+    }
+    {
+        let mut gid = 0usize;
+        for (si, &(s, e)) in ranges.iter().enumerate() {
+            for (li, (op_st, op_pr)) in ops[s..e].iter().zip(shards[si].ops.iter()).enumerate() {
+                if let (Op::Gather { h, .. }, OpProof::Gather(sp)) = (op_st, op_pr) {
+                    let loc = &proof.gather_locations[gid];
+                    let (ls, lt) = &gather_leaves[gid];
+                    let (q_ns, a_s, q_ds, b_s) = ls;
+                    let (q_nt, a_t, q_dt, b_t) = lt;
+                    let h_log = h.trailing_zeros() as usize;
+                    let get = |batch: usize, table: usize| -> Option<(&Vec<usize>, &Vec<Vec<Goldilocks>>, &Vec<Goldilocks>)> {
+                        let o = proof.gather_batch_openings.get(batch)?;
+                        if table >= o.points.len() {
+                            return None;
+                        }
+                        Some((&o.table_idxs, &o.points, &o.claimed))
+                    };
+                    // ty 0: num_source at q_num_src, claimed == num leaf.
+                    let (_, pts, clm) = match get(loc.num_source_batch, loc.num_source_table) {
+                        Some(t) => t,
+                        None => return false,
+                    };
+                    if pts[loc.num_source_table] != *q_ns || clm[loc.num_source_table] != *a_s {
+                        return false;
+                    }
+                    // ty 1: den_source at q_den_src, claimed == den leaf, and
+                    // b_s == alpha - token_id(q_den_src restricted).
+                    let (_, pts, clm) = match get(loc.den_source_batch, loc.den_source_table) {
+                        Some(t) => t,
+                        None => return false,
+                    };
+                    if pts[loc.den_source_table] != *q_ds || clm[loc.den_source_table] != *b_s {
+                        return false;
+                    }
+                    let (_, tk_pts, tk_clm) = match get(loc.token_id_batch, loc.token_id_table) {
+                        Some(t) => t,
+                        None => return false,
+                    };
+                    let gate_arity = proof.gather_batches[loc.token_id_batch].arity;
+                    let mut tk_pt = q_ds[h_log..].to_vec();
+                    tk_pt.resize(gate_arity, Goldilocks::ZERO);
+                    if tk_pts[loc.token_id_table] != tk_pt {
+                        return false;
+                    }
+                    if *b_s != sp.alpha - tk_clm[loc.token_id_table] {
+                        return false;
+                    }
+                    // ty 2: weighted at r_prod_source == prod_source.fe[3].
+                    let (_, pts, clm) = match get(loc.weighted_batch, loc.weighted_table) {
+                        Some(t) => t,
+                        None => return false,
+                    };
+                    if pts[loc.weighted_table] != sp.r_prod_source
+                        || clm[loc.weighted_table] != sp.prod_source.final_evals[3]
+                    {
+                        return false;
+                    }
+                    // ty 3: num_target at q_num_tgt, claimed == num leaf.
+                    let (_, pts, clm) = match get(loc.num_target_batch, loc.num_target_table) {
+                        Some(t) => t,
+                        None => return false,
+                    };
+                    if pts[loc.num_target_table] != *q_nt || clm[loc.num_target_table] != *a_t {
+                        return false;
+                    }
+                    // ty 4: den_target at q_den_tgt, claimed == den leaf, and
+                    // b_t == alpha - t where t is the index value of the point.
+                    let (_, pts, clm) = match get(loc.den_target_batch, loc.den_target_table) {
+                        Some(t) => t,
+                        None => return false,
+                    };
+                    if pts[loc.den_target_table] != *q_dt || clm[loc.den_target_table] != *b_t {
+                        return false;
+                    }
+                    let mut t_idx = Goldilocks::ZERO;
+                    for (k, &pk) in q_dt[h_log..].iter().enumerate() {
+                        t_idx = t_idx + Goldilocks::from_u64(1u64 << k) * pk;
+                    }
+                    if *b_t != sp.alpha - t_idx {
+                        return false;
+                    }
+                    // ty 5: out at r_prod_target == prod_target.fe[3].
+                    let (_, pts, clm) = match get(loc.out_batch, loc.out_table) {
+                        Some(t) => t,
+                        None => return false,
+                    };
+                    if pts[loc.out_table] != sp.r_prod_target
+                        || clm[loc.out_table] != sp.prod_target.final_evals[3]
+                    {
+                        return false;
+                    }
+                    // ty 6: gate at r_prod_source[h_log..] (zero-padded to the
+                    // gate arity) == prod_source.fe[4].
+                    let (_, pts, clm) = match get(loc.gate_batch, loc.gate_table) {
+                        Some(t) => t,
+                        None => return false,
+                    };
+                    let gate_arity = proof.gather_batches[loc.gate_batch].arity;
+                    let mut gate_pt = sp.r_prod_source[h_log..].to_vec();
+                    gate_pt.resize(gate_arity, Goldilocks::ZERO);
+                    if pts[loc.gate_table] != gate_pt
+                        || clm[loc.gate_table] != sp.prod_source.final_evals[4]
+                    {
+                        return false;
+                    }
+                    gid += 1;
+                }
+            }
+        }
+    }
+    // 9. Argmax selection openings (individual one-hot openings at the claimed
+    // output positions).
     for so in &proof.sel_openings {
         if so.points.is_empty() || so.openings.len() != so.points.len() {
             return false;
@@ -4102,214 +4945,7 @@ pub fn verify_committed_shard_dag(
             }
         }
     }
-    if proof.perm_batches.len() != proof.perm_batch_openings.len() {
-        return false;
-    }
-    {
-        let total: usize = proof.shards.iter().map(|s| s.ops.iter().filter(|o| matches!(o, OpProof::Scatter(_))).count()).sum();
-        if proof.perm_locations.len() != total {
-            return false;
-        }
-    }
-    for (bi, opening) in proof.perm_batch_openings.iter().enumerate() {
-        let batch = &proof.perm_batches[bi];
-        if opening.table_idxs.len() != opening.points.len()
-            || opening.table_idxs.len() != opening.claimed.len()
-        {
-            return false;
-        }
-        let protocol = batch.whir.opening_protocol(batch.arity, batch.num_tables);
-        if !zkie_core::pcs::batch_open::verify_batch_open_committed(
-            &batch.whir,
-            &batch.commitment,
-            &protocol,
-            batch.num_tables,
-            &opening.table_idxs,
-            &opening.points,
-            &opening.claimed,
-            &opening.proof,
-        ) {
-            return false;
-        }
-    }
-    {
-        let mut gid = 0usize;
-        for shard in &proof.shards {
-            for op in &shard.ops {
-                if let OpProof::Scatter(sp) = op {
-                    let loc = &proof.perm_locations[gid];
-                    let (_, num_leaf_a, _, den_leaf_a) = fractional_leaf(&sp.perm.a_side);
-                    let (_, num_leaf_b, _, den_leaf_b) = fractional_leaf(&sp.perm.b_side);
-                    // entry loc.a_table is the q_num claim; +1 is the q_den claim
-                    let eval_a = proof.perm_batch_openings[loc.a_batch].claimed[loc.a_table + 1];
-                    let eval_b = proof.perm_batch_openings[loc.b_batch].claimed[loc.b_table + 1];
-                    let nl_a = proof.perm_batch_openings[loc.num_batch].claimed[2 * loc.num_table];
-                    let nl_b = proof.perm_batch_openings[loc.num_batch].claimed[2 * loc.num_table + 1];
-                    if nl_a != num_leaf_a || nl_b != num_leaf_b {
-                        return false;
-                    }
-                    if den_leaf_a != sp.perm.alpha - eval_a || den_leaf_b != sp.perm.alpha - eval_b {
-                        return false;
-                    }
-                    gid += 1;
-                }
-            }
-        }
-    }
-    if proof.gather_batches.len() != proof.gather_batch_openings.len() {
-        return false;
-    }
-    {
-        let total: usize = proof.shards.iter().map(|s| s.ops.iter().filter(|o| matches!(o, OpProof::Gather(_))).count()).sum();
-        if proof.gather_locations.len() != total {
-            return false;
-        }
-    }
-    for (bi, opening) in proof.gather_batch_openings.iter().enumerate() {
-        let batch = &proof.gather_batches[bi];
-        if opening.table_idxs.len() != opening.points.len()
-            || opening.table_idxs.len() != opening.claimed.len()
-        {
-            return false;
-        }
-        let protocol = batch.whir.opening_protocol(batch.arity, batch.num_tables);
-        if !zkie_core::pcs::batch_open::verify_batch_open_committed(
-            &batch.whir,
-            &batch.commitment,
-            &protocol,
-            batch.num_tables,
-            &opening.table_idxs,
-            &opening.points,
-            &opening.claimed,
-            &opening.proof,
-        ) {
-            return false;
-        }
-    }
-    {
-        let mut gid = 0usize;
-        for shard in &proof.shards {
-            for op in &shard.ops {
-                if let OpProof::Gather(sp) = op {
-                    let loc = &proof.gather_locations[gid];
-                    let den_source = proof.gather_batch_openings[loc.den_source_batch].claimed[loc.den_source_table];
-                    let token_id = proof.gather_batch_openings[loc.token_id_batch].claimed[loc.token_id_table];
-                    if den_source != sp.alpha - token_id {
-                        return false;
-                    }
-                    gid += 1;
-                }
-            }
-        }
-    }
 
-    // Fiat-Shamir (S1): replay the frac transcript — statement + roots, then per
-    // witness column alpha/beta, then every fractional proof in shard-major
-    // order (all witness columns first, then all table columns). The chain-core
-    // verify re-derives the layer challenges from the proof's round messages.
-    {
-        let mut ts = Transcript::new(b"zkie-committed-frac-v1");
-        absorb_statement(&mut ts, ops, ops_per_shard);
-        for batch in &proof.witness_batches {
-            ts.absorb(&bincode::serialize(&batch.commitment).unwrap());
-        }
-        let mut ti = 0usize;
-        for (si, shard) in proof.shards.iter().enumerate() {
-            ts.absorb_u64(si as u64);
-            for _ in &shard.table_columns {
-                let to = &proof.table_openings[ti];
-                ts.absorb(&bincode::serialize(&to.commitment).unwrap());
-                if to.is_identity {
-                    ts.absorb_u64(0);
-                } else {
-                    ts.absorb(&bincode::serialize(to.table_commitment.as_ref().unwrap()).unwrap());
-                }
-                ti += 1;
-            }
-        }
-        for shard in &proof.shards {
-            for wc in &shard.witness_columns {
-                if ts.field() != wc.alpha || ts.field() != wc.beta {
-                    return false;
-                }
-                if !verify_fractional_chain_core(&wc.proof, &mut ts) {
-                    return false;
-                }
-            }
-        }
-        for shard in &proof.shards {
-            for tc in &shard.table_columns {
-                if !verify_fractional_chain_core(&tc.proof, &mut ts) {
-                    return false;
-                }
-            }
-        }
-    }
-
-    // Fiat-Shamir for permutations (S1): per Scatter op — alpha, then the two
-    // fractional replays, in shard-major order.
-    {
-        let mut ts = Transcript::new(b"zkie-committed-perm-v1");
-        absorb_statement(&mut ts, ops, ops_per_shard);
-        for batch in &proof.perm_batches {
-            ts.absorb(&bincode::serialize(&batch.commitment).unwrap());
-        }
-        for shard in &proof.shards {
-            for op in &shard.ops {
-                if let OpProof::Scatter(sp) = op {
-                    let alpha = ts.field();
-                    if alpha != sp.perm.alpha {
-                        return false;
-                    }
-                    if !verify_fractional_chain_core(&sp.perm.a_side, &mut ts) {
-                        return false;
-                    }
-                    if !verify_fractional_chain_core(&sp.perm.b_side, &mut ts) {
-                        return false;
-                    }
-                }
-            }
-        }
-    }
-
-    // Fiat-Shamir for gather (S1): per Gather op — alpha/gamma, then the den
-    // roots, then the two fractional replays, in shard-major order. The den
-    // columns are committed after alpha (they depend on it), so the transcript
-    // absorbs the independent roots, derives alpha/gamma, then absorbs the den
-    // roots before the fractional replays.
-    {
-        let mut ts = Transcript::new(b"zkie-committed-gather-v1");
-        absorb_statement(&mut ts, ops, ops_per_shard);
-        for batch in proof.gather_batches.iter().take(proof.gather_indep_batches) {
-            ts.absorb(&bincode::serialize(&batch.commitment).unwrap());
-        }
-        for shard in &proof.shards {
-            for op in &shard.ops {
-                if let OpProof::Gather(sp) = op {
-                    let alpha = ts.field();
-                    let gamma: Vec<Goldilocks> = (0..sp.gamma.len()).map(|_| ts.field()).collect();
-                    if alpha != sp.alpha || gamma != sp.gamma {
-                        return false;
-                    }
-                }
-            }
-        }
-        for batch in proof.gather_batches.iter().skip(proof.gather_indep_batches) {
-            ts.absorb(&bincode::serialize(&batch.commitment).unwrap());
-        }
-        for shard in &proof.shards {
-            for op in &shard.ops {
-                if let OpProof::Gather(sp) = op {
-                    if !verify_fractional_chain_core(&sp.source_side, &mut ts) {
-                        return false;
-                    }
-                    if !verify_fractional_chain_core(&sp.target_side, &mut ts) {
-                        return false;
-                    }
-                }
-            }
-        }
-    }
     true
 }
 
@@ -5207,12 +5843,11 @@ mod tests {
             &whir
         ));
 
-        // Tamper a boundary claim -> the committed cross-bind must reject.
-        let bt = proof.boundary_tensors[0];
-        for shard in proof.shards.iter_mut() {
-            if let Some((_, _, ev)) = shard.claims.iter_mut().find(|(t, _, _)| *t == bt) {
-                *ev = *ev + Goldilocks::ONE;
-            }
+        // Tamper a boundary opening value -> the committed cross-bind must
+        // reject (the verifier rebuilds the claim set itself, S2, so the
+        // proof carries no claim list to tamper).
+        if let Some((_, opened)) = proof.cross_binds[0].openings.first_mut() {
+            *opened = *opened + Goldilocks::ONE;
         }
         assert!(!verify_committed_shard_dag(&store.owned_slices(), &ops, 2, &whir, &proof));
     }
@@ -5281,35 +5916,26 @@ mod tests {
         let mut tv = Transcript::new(b"zkie-s2-test");
         assert!(verify_shard(&store.owned_slices(), &ops, &proof, &mut tv));
 
-        // Forge: drop ONE claim on the bound tensor and remove it from
-        // `bound`/`binds`, so the pre-fix verifier (which trusts both lists)
-        // silently skips the binding.
+        // Forge: remove a bound tensor from `bound`/`binds`. The proof carries
+        // no claim list (S2) — the verifier rebuilds its own claims, which
+        // still contain that tensor's two claims, so the binding-set
+        // comparison rejects. (Pre-fix this forgery was accepted.)
         let bt = proof.bound[0];
         let OpShardProof {
             ops: proof_ops,
             bound,
             binds,
-            claims,
             witness_columns,
             table_columns,
         } = proof;
-        let mut forged = OpShardProof {
+        assert!(bound.contains(&bt));
+        let forged = OpShardProof {
             ops: proof_ops,
-            bound: bound[1..].to_vec(),
+            bound: bound.into_iter().filter(|t| *t != bt).collect(),
             binds: binds[1..].to_vec(),
-            claims: Vec::new(),
             witness_columns,
             table_columns,
         };
-        let mut dropped = false;
-        for (t, pt, ev) in &claims {
-            if *t == bt && !dropped {
-                dropped = true;
-                continue;
-            }
-            forged.claims.push((*t, pt.clone(), *ev));
-        }
-        assert!(dropped, "claim to drop must exist");
         let mut tv2 = Transcript::new(b"zkie-s2-test");
         // S2: this must be REJECTED (pre-fix it is ACCEPTED).
         assert!(!verify_shard(&store.owned_slices(), &ops, &forged, &mut tv2));
@@ -5441,20 +6067,16 @@ mod tests {
             prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
         assert!(!proof.table_openings.is_empty());
 
-        // Forge: claim the table is an identity table (den = alpha + j +
-        // beta*j at the m-column point) and drop the table commitment.
+        // Forge: drop the table commitment/openings as if the table were an
+        // identity table. The identity decision comes from the STATEMENT
+        // tables (S2) — this non-identity table must still have a committed
+        // table with openings, so the forgery is rejected. (Pre-fix the
+        // prover-supplied is_identity flag made this forgery accepted.)
         for to in proof.table_openings.iter_mut() {
-            let mut den_idx = Goldilocks::ZERO;
-            for (kk, &pk) in to.point.iter().enumerate() {
-                den_idx = den_idx + Goldilocks::from_u64(1u64 << kk) * pk;
-            }
-            to.is_identity = true;
             to.table_commitment = None;
             to.table_opening = None;
-            to.den_point = to.point.clone();
             to.den_table_opening = None;
             to.den_table_eval = Goldilocks::ZERO;
-            to.den_leaf = to.alpha + den_idx + to.beta * den_idx;
         }
         // S2: must be REJECTED (pre-fix it is ACCEPTED).
         assert!(!verify_committed_shard_dag(
@@ -5571,11 +6193,9 @@ mod tests {
             to.den_point = p_new.clone();
             to.den_table_eval = ev_t_new;
             to.den_table_opening = Some(open_t_new.clone());
-            let mut den_idx = Goldilocks::ZERO;
-            for (kk, &pk) in p_new.iter().enumerate() {
-                den_idx = den_idx + Goldilocks::from_u64(1u64 << kk) * pk;
-            }
-            to.den_leaf = to.alpha + den_idx + to.beta * ev_t_new;
+            // (S2: there is no stored den_leaf to recompute — the verifier
+            // derives it from the fractional replay, so the moved point can
+            // never match the derived leaf point.)
         }
         // S2: must be REJECTED (pre-fix it is ACCEPTED).
         assert!(!verify_committed_shard_dag(
@@ -5584,6 +6204,447 @@ mod tests {
             1,
             &whir,
             &proof
+        ));
+    }
+
+    /// S2: honest committed roundtrip WITH a lookup — the witness x/y columns
+    /// are opened at the derived DEN leaf point and the m-column/table at the
+    /// derived NUM/DEN points, all derived from the committed frac replays.
+    #[test]
+    fn s2_committed_lookup_roundtrip() {
+        use zkie_core::pcs::whir::Whir;
+        let mut rng = XorShift64::new(0x52_05);
+        let (m, k, n, shift) = (4usize, 4usize, 4usize, 8u32);
+        let mut store = Store::new();
+        let x = store.push(
+            (0..m * k)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        let w = store.push(
+            (0..k * n)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        let b = store.push(
+            (0..m * n)
+                .map(|_| from_i64((rng.next_u64() % 10) as i64 - 5))
+                .collect(),
+        );
+        let out = store.push(vec![]);
+        let rem = store.push(vec![]);
+        let table = store.push(
+            (0..32)
+                .map(|j| from_i64((j as i64 * j as i64) % 1000))
+                .collect(),
+        );
+        let idx = store.push_idx((0..16u32).collect::<Vec<u32>>());
+        let act = store.push(vec![]);
+        let ops = vec![
+            Op::Projection {
+                x,
+                w,
+                bias: b,
+                out,
+                rem,
+                m,
+                k,
+                n,
+                shift,
+            },
+            Op::Lookup {
+                idx,
+                out: act,
+                table,
+            },
+        ];
+
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s2-cache5");
+        let tokens_t = store.push_idx(vec![]);
+        let argmax_t = store.push_idx(vec![]);
+        let proof =
+            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        assert!(verify_committed_shard_dag(
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir,
+            &proof
+        ));
+    }
+
+    /// S2: honest committed roundtrip with an IDENTITY lookup table — the
+    /// table side takes the statement-identity path (no table commitment;
+    /// den evaluated by the index formula over the identity continuation).
+    #[test]
+    fn s2_committed_identity_table_roundtrip() {
+        use zkie_core::pcs::whir::Whir;
+        let mut rng = XorShift64::new(0x52_09);
+        let (m, k, n, shift) = (4usize, 4usize, 4usize, 8u32);
+        let mut store = Store::new();
+        let x = store.push(
+            (0..m * k)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        let w = store.push(
+            (0..k * n)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        let b = store.push(
+            (0..m * n)
+                .map(|_| from_i64((rng.next_u64() % 10) as i64 - 5))
+                .collect(),
+        );
+        let out = store.push(vec![]);
+        let rem = store.push(vec![]);
+        // Identity table [0..32): out[i] = idx[i] by the table relation.
+        let table = store.push(
+            (0..32).map(|j| Goldilocks::from_u64(j as u64)).collect(),
+        );
+        let idx = store.push_idx((0..16u32).collect::<Vec<u32>>());
+        let act = store.push(vec![]);
+        let ops = vec![
+            Op::Projection {
+                x,
+                w,
+                bias: b,
+                out,
+                rem,
+                m,
+                k,
+                n,
+                shift,
+            },
+            Op::Lookup {
+                idx,
+                out: act,
+                table,
+            },
+        ];
+
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s2-cache9");
+        let tokens_t = store.push_idx(vec![]);
+        let argmax_t = store.push_idx(vec![]);
+        let proof =
+            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        assert!(proof
+            .table_openings
+            .iter()
+            .all(|to| to.table_commitment.is_none()));
+        assert!(verify_committed_shard_dag(
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir,
+            &proof
+        ));
+    }
+
+    /// S2: honest committed roundtrip with Scatter + Gather — the committed
+    /// perm/gather fractional sections (fracs re-proven on the committed
+    /// transcripts, shard transcript frac-free) must verify end to end.
+    #[test]
+    fn s2_committed_scatter_gather_roundtrip() {
+        use crate::scatter::scatter_forward;
+        use zkie_core::pcs::whir::Whir;
+
+        let mut rng = XorShift64::new(0x52_06);
+        let (m, n_experts, h, p) = (4usize, 4usize, 4usize, 2usize);
+        let k_top = 2usize;
+        let s = m * k_top;
+
+        let mut sel = vec![Goldilocks::ZERO; m * n_experts];
+        for t in 0..m {
+            sel[t * n_experts + (t % n_experts)] = Goldilocks::ONE;
+            sel[t * n_experts + ((t + 1) % n_experts)] = Goldilocks::ONE;
+        }
+        let (token_id, expert_of) = scatter_forward(&sel, m, n_experts);
+        assert_eq!(token_id.len(), s);
+
+        let gate_mn: Vec<Goldilocks> = (0..m * n_experts)
+            .map(|i| Goldilocks::from_u64((i as u64 % 3) + 1))
+            .collect();
+        let gate_pos: Vec<Goldilocks> = (0..s)
+            .map(|pos| gate_mn[token_id[pos] as usize * n_experts + expert_of[pos] as usize])
+            .collect();
+
+        let mut store = Store::new();
+        let x_t = store.push(
+            (0..m * h)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        let w_all_t = store.push(
+            (0..n_experts * h * p)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        let gate_t = store.push(gate_mn.clone());
+        let sel_t = store.push(sel.clone());
+        let token_id_t = store.push_idx(token_id.clone());
+        let expert_of_t = store.push_idx(expert_of.clone());
+
+        let mut idx_seg = Vec::with_capacity(s * h);
+        for pos in 0..s {
+            for d in 0..h {
+                idx_seg.push((token_id[pos] as usize * h + d) as u32);
+            }
+        }
+        let idx_seg_t = store.push_idx(idx_seg);
+        let seg_t = store.push(vec![]);
+
+        let mut idx_w = Vec::with_capacity(s * h * p);
+        for pos in 0..s {
+            for dj in 0..h * p {
+                idx_w.push((expert_of[pos] as usize * h * p + dj) as u32);
+            }
+        }
+        let idx_w_t = store.push_idx(idx_w);
+        let w_t = store.push(vec![]);
+
+        let idx_gate: Vec<u32> = (0..s)
+            .map(|pos| (token_id[pos] * n_experts as u32 + expert_of[pos]) as u32)
+            .collect();
+        let idx_gate_t = store.push_idx(idx_gate);
+        let gate_pos_t = store.push(vec![]);
+
+        let g_t = store.push(vec![]);
+        let out_t = store.push(vec![]);
+
+        let ops = vec![
+            Op::Scatter {
+                sel: sel_t,
+                token_id: token_id_t,
+                expert_of: expert_of_t,
+                m,
+                n: n_experts,
+            },
+            Op::Lookup {
+                idx: idx_seg_t,
+                out: seg_t,
+                table: x_t,
+            },
+            Op::Lookup {
+                idx: idx_w_t,
+                out: w_t,
+                table: w_all_t,
+            },
+            Op::CombineIdx {
+                a: token_id_t,
+                b: expert_of_t,
+                out: idx_gate_t,
+                scale: n_experts,
+            },
+            Op::Lookup {
+                idx: idx_gate_t,
+                out: gate_pos_t,
+                table: gate_t,
+            },
+            Op::BatchedMatMul {
+                a: seg_t,
+                w: w_t,
+                c: g_t,
+                s,
+                k: h,
+                n: p,
+            },
+            Op::Gather {
+                weighted: g_t,
+                token_id: token_id_t,
+                gate: gate_pos_t,
+                out: out_t,
+                m,
+                h: p,
+            },
+        ];
+
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s2-cache6");
+        let tokens_t = store.push_idx(vec![]);
+        let argmax_t = store.push_idx(vec![]);
+        let proof =
+            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        assert!(!proof.perm_batches.is_empty());
+        assert!(!proof.gather_batches.is_empty());
+        assert!(verify_committed_shard_dag(
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir,
+            &proof
+        ));
+    }
+
+    /// S2 counterexample from the gist: a 32x32 MatMul whose commitments and
+    /// sumcheck are both emptied must be rejected (empty lists can never skip
+    /// non-empty computation).
+    #[test]
+    fn s2_matmul32_empty_commitments_rejected() {
+        use zkie_core::pcs::whir::Whir;
+        let mut rng = XorShift64::new(0x52_07);
+        let (m, k, n) = (32usize, 32usize, 32usize);
+        let mut store = Store::new();
+        let x = store.push(
+            (0..m * k)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        let w = store.push(
+            (0..k * n)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        let out = store.push(vec![]);
+        let ops = vec![Op::MatMul { a: x, b: w, c: out, m, k, n }];
+
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s2-cache7");
+        assert!(!cached.is_empty());
+        let tokens_t = store.push_idx(vec![]);
+        let argmax_t = store.push_idx(vec![]);
+        let proof =
+            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        assert!(!proof.weight_batches.is_empty());
+        assert!(verify_committed_shard_dag(&store.owned_slices(), &ops, 1, &whir, &proof));
+
+        // Forgery 1: empty commitments (drop every weight batch + opening).
+        let mut forged =
+            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        forged.weight_batches.clear();
+        forged.weight_batch_openings.clear();
+        assert!(!verify_committed_shard_dag(
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir,
+            &forged
+        ));
+
+        // Forgery 2: zero-round matmul sumcheck (round count comes from the
+        // statement k=32, so an emptied sumcheck is rejected).
+        let mut forged2 =
+            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        for shard in forged2.shards.iter_mut() {
+            for op in shard.ops.iter_mut() {
+                if let OpProof::MatMul(mp, _, _, _) = op {
+                    mp.sumcheck.rounds.clear();
+                }
+            }
+        }
+        assert!(!verify_committed_shard_dag(
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir,
+            &forged2
+        ));
+    }
+
+    /// S2: weight openings are pinned to the locally built claims (tensor,
+    /// point, value, root). Changing an opening's claimed value, or swapping
+    /// two batch roots, must be rejected.
+    #[test]
+    fn s2_weight_opening_value_and_root_swap_rejected() {
+        use zkie_core::pcs::whir::Whir;
+        let mut rng = XorShift64::new(0x52_08);
+        let (m, k, shift) = (4usize, 8usize, 8u32);
+        let mut store = Store::new();
+        let x = store.push(
+            (0..m * k)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        // Two projections with different weight sizes -> two weight batches.
+        let w1 = store.push(
+            (0..k * 8)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        let b1 = store.push(
+            (0..m * 8)
+                .map(|_| from_i64((rng.next_u64() % 10) as i64 - 5))
+                .collect(),
+        );
+        let mid = store.push(vec![]);
+        let rem1 = store.push(vec![]);
+        let w2 = store.push(
+            (0..k * 16)
+                .map(|_| from_i64((rng.next_u64() % 50) as i64))
+                .collect(),
+        );
+        let b2 = store.push(
+            (0..m * 16)
+                .map(|_| from_i64((rng.next_u64() % 10) as i64 - 5))
+                .collect(),
+        );
+        let out = store.push(vec![]);
+        let rem2 = store.push(vec![]);
+        let ops = vec![
+            Op::Projection {
+                x,
+                w: w1,
+                bias: b1,
+                out: mid,
+                rem: rem1,
+                m,
+                k,
+                n: 8,
+                shift,
+            },
+            Op::Projection {
+                x: mid,
+                w: w2,
+                bias: b2,
+                out,
+                rem: rem2,
+                m,
+                k,
+                n: 16,
+                shift,
+            },
+        ];
+
+        let whir = Whir::new_testing(5);
+        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s2-cache8");
+        assert!(cached.len() >= 2);
+        let tokens_t = store.push_idx(vec![]);
+        let argmax_t = store.push_idx(vec![]);
+        let proof =
+            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        assert!(proof.weight_batches.len() >= 2);
+        assert!(verify_committed_shard_dag(&store.owned_slices(), &ops, 1, &whir, &proof));
+
+        // Forgery 1: change one opening's claimed value -> the point-set
+        // comparison against the locally built claims rejects it.
+        let mut forged =
+            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        if let Some(o) = forged.weight_batch_openings.iter_mut().find(|o| !o.claimed.is_empty()) {
+            o.claimed[0] = o.claimed[0] + Goldilocks::ONE;
+        }
+        assert!(!verify_committed_shard_dag(
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir,
+            &forged
+        ));
+
+        // Forgery 2: swap two batch roots (openings stay with their batches) ->
+        // the openings no longer verify against the swapped roots.
+        let mut forged2 =
+            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
+        let n = forged2.weight_batches.len();
+        forged2.weight_batches.swap(0, n - 1);
+        assert!(!verify_committed_shard_dag(
+            &store.owned_slices(),
+            &ops,
+            1,
+            &whir,
+            &forged2
         ));
     }
 

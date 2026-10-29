@@ -42,9 +42,14 @@ pub struct FractionalProof {
     pub layers: Vec<FractionalLayer>,
     pub final_num: Goldilocks,
     pub final_den: Goldilocks,
-    pub leaf_num: (Vec<Goldilocks>, Goldilocks),
-    pub leaf_den: (Vec<Goldilocks>, Goldilocks),
 }
+
+/// The four leaf claims (num point + eval, den point + eval) produced by the
+/// final layer's same_poly merges. The VERIFIER only ever uses leaves derived
+/// from its own replay (see [`verify_fractional_chain_core`]); the prover-side
+/// helper [`fractional_leaf`] reads the same values back out of a freshly
+/// proven chain.
+pub type FractionalLeaf = (Vec<Goldilocks>, Goldilocks, Vec<Goldilocks>, Goldilocks);
 
 fn build_terms(gamma: Goldilocks, a: Goldilocks, b: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
     // G(x) = eq0(x) * [N0*D1 + N1*D0 - a] + gamma * eq1(x) * [D0*D1 - b],
@@ -142,8 +147,6 @@ pub fn prove_fractional(
         layers,
         final_num,
         final_den,
-        leaf_num: (q_num, a),
-        leaf_den: (q_den, b),
     }
 }
 
@@ -225,44 +228,41 @@ pub fn verify_fractional(
         q_num = layer.num_merge.merged_point.clone();
         q_den = layer.den_merge.merged_point.clone();
     }
-    if (q_num, a) != proof.leaf_num || (q_den, b) != proof.leaf_den {
-        return false;
-    }
+    // Leaf single source (S2): the leaves are DERIVED here from the replayed
+    // chain, never read from a prover-supplied field.
     proof.final_num == claimed * proof.final_den
 }
 
 /// Store-free per-layer transcript replay: squeezes and checks every gamma,
 /// re-derives each layer's challenge vector per-round from the proof's round
-/// messages (S1), checks the stored child evals, verifies the two same_poly
-/// merges (which produce the next layer's claim points), and finally checks
-/// the stored leaf claims.
-fn replay_fractional_storefree(proof: &FractionalProof, transcript: &mut Transcript) -> bool {
+/// messages (S1), checks the stored child evals, and verifies the two
+/// same_poly merges (which produce the next layer's claim points).
+///
+/// Leaf single source (S2): on success this RETURNS the leaf claims
+/// `(q_num, a, q_den, b)` derived from the replayed chain. The proof carries
+/// no stored leaf fields, so every consumer must use these derived values.
+fn replay_fractional_storefree(
+    proof: &FractionalProof,
+    transcript: &mut Transcript,
+) -> Option<FractionalLeaf> {
     let mut a = proof.final_num;
     let mut b = proof.final_den;
     let mut q_num: Vec<Goldilocks> = Vec::new();
     let mut q_den: Vec<Goldilocks> = Vec::new();
-    for (li, layer) in proof.layers.iter().enumerate() {
+    for layer in proof.layers.iter() {
         let gamma = transcript.field();
         if gamma != layer.gamma {
-            return false;
+            return None;
         }
         let terms = build_terms(gamma, a, b);
         let arity = layer.s.len();
         let (ok, s, final_claim) =
             verify_virtual(&layer.proof, &terms, Goldilocks::ZERO, arity, transcript);
         if !ok || s != layer.s {
-            return false;
+            return None;
         }
         if final_claim != virtual_eval(&terms, &layer.proof.final_evals) {
-            eprintln!(
-                "FAIL fc layer={} final_claim={} ve={} gamma={} a={} b={}", li,
-                final_claim,
-                virtual_eval(&terms, &layer.proof.final_evals),
-                gamma,
-                a,
-                b
-            );
-            return false;
+            return None;
         }
         let fe = &layer.proof.final_evals;
         let mut p0 = s.clone();
@@ -272,23 +272,27 @@ fn replay_fractional_storefree(proof: &FractionalProof, transcript: &mut Transcr
         let num_claims = vec![(p0.clone(), fe[2]), (p1.clone(), fe[3])];
         let den_claims = vec![(p0, fe[4]), (p1, fe[5])];
         if verify_same_poly(&layer.num_merge, &num_claims, transcript).is_none() {
-            return false;
+            return None;
         }
         if verify_same_poly(&layer.den_merge, &den_claims, transcript).is_none() {
-            return false;
+            return None;
         }
         a = layer.num_merge.merged_eval;
         b = layer.den_merge.merged_eval;
         q_num = layer.num_merge.merged_point.clone();
         q_den = layer.den_merge.merged_point.clone();
     }
-    (q_num, a) == proof.leaf_num && (q_den, b) == proof.leaf_den
+    Some((q_num, a, q_den, b))
 }
 
 /// Chained store-free verify: the full S1 layered replay. Does not check the
 /// final_num/final_den == claimed relation, so split lookup/table proofs can
-/// share it and enforce the link separately.
-pub fn verify_fractional_chain_core(proof: &FractionalProof, transcript: &mut Transcript) -> bool {
+/// share it and enforce the link separately. Returns the DERIVED leaf claims
+/// `(q_num, a, q_den, b)` on success; `None` rejects.
+pub fn verify_fractional_chain_core(
+    proof: &FractionalProof,
+    transcript: &mut Transcript,
+) -> Option<FractionalLeaf> {
     replay_fractional_storefree(proof, transcript)
 }
 
@@ -297,7 +301,8 @@ pub fn verify_fractional_chain(
     claimed: Goldilocks,
     transcript: &mut Transcript,
 ) -> bool {
-    verify_fractional_chain_core(proof, transcript) && proof.final_num == claimed * proof.final_den
+    verify_fractional_chain_core(proof, transcript).is_some()
+        && proof.final_num == claimed * proof.final_den
 }
 
 // Store-free verify: use the final_evals already stored in each layer
@@ -311,19 +316,29 @@ pub fn verify_fractional_storefree(
     verify_fractional_chain(proof, claimed, transcript)
 }
 
-// Leaf claims of the layered GKR: the single-point claims on the committed
-// num_0/den_0 produced by the last layer's same_poly merges. These are the
-// only values that must be opened against the committed num_0/den_0 columns
-// (per-table points through the existing batch-opening path).
+/// PROVER-SIDE / post-replay helper only: read the leaf claims out of a
+/// freshly proven chain (the final layer's same_poly merge outputs). The
+/// verifier must never use this on an untrusted proof — it derives the leaves
+/// from its own replay via [`verify_fractional_chain_core`], which checks the
+/// merges first. A proof with no layers (arity-0 domain) has its roots as its
+/// leaves at the empty point.
 pub fn fractional_leaf(
     proof: &FractionalProof,
 ) -> (Vec<Goldilocks>, Goldilocks, Vec<Goldilocks>, Goldilocks) {
-    (
-        proof.leaf_num.0.clone(),
-        proof.leaf_num.1,
-        proof.leaf_den.0.clone(),
-        proof.leaf_den.1,
-    )
+    match proof.layers.last() {
+        Some(layer) => (
+            layer.num_merge.merged_point.clone(),
+            layer.num_merge.merged_eval,
+            layer.den_merge.merged_point.clone(),
+            layer.den_merge.merged_eval,
+        ),
+        None => (
+            Vec::new(),
+            proof.final_num,
+            Vec::new(),
+            proof.final_den,
+        ),
+    }
 }
 
 /// Prove `y_i == table[x_i]` for every `i` via the fractional-sumcheck logUp:
@@ -515,8 +530,8 @@ pub fn verify_lookup_split(
     table: &FractionalProof,
     transcript: &mut Transcript,
 ) -> bool {
-    verify_fractional_chain_core(witness, transcript)
-        && verify_fractional_chain_core(table, transcript)
+    verify_fractional_chain_core(witness, transcript).is_some()
+        && verify_fractional_chain_core(table, transcript).is_some()
         && witness.final_num * table.final_den == table.final_num * witness.final_den
 }
 
@@ -707,8 +722,6 @@ mod tests {
         let mut tampered = FractionalProof {
             final_num: proof.final_num,
             final_den: proof.final_den,
-            leaf_num: proof.leaf_num.clone(),
-            leaf_den: proof.leaf_den.clone(),
             layers: Vec::new(),
         };
         for (i, layer) in proof.layers.iter().enumerate() {
@@ -1129,8 +1142,6 @@ mod tests {
             layers: forged_layers,
             final_num: honest.final_num,
             final_den: honest.final_den,
-            leaf_num: honest.leaf_num.clone(),
-            leaf_den: honest.leaf_den.clone(),
         };
 
         // S1: the verifier derives the layer's challenges from the forged
@@ -1165,8 +1176,6 @@ mod tests {
         let mut tampered = FractionalProof {
             final_num: proof.final_num,
             final_den: proof.final_den,
-            leaf_num: proof.leaf_num.clone(),
-            leaf_den: proof.leaf_den.clone(),
             layers: Vec::new(),
         };
         for (i, layer) in proof.layers.iter().enumerate() {
@@ -1333,13 +1342,11 @@ mod permutation_tests {
         let mut tv = Transcript::new(b"zkie-perm-test");
         tv.absorb_u64(0xAB00);
         assert!(verify_permutation(&proof, &mut tv));
-        // Tamper a leaf eval: the chained verify must reject.
+        // Tamper a layer child eval: the chained verify must reject.
         let mut bad_proof = PermutationProof {
             a_side: FractionalProof {
                 final_num: proof.a_side.final_num,
                 final_den: proof.a_side.final_den,
-                leaf_num: proof.a_side.leaf_num.clone(),
-                leaf_den: proof.a_side.leaf_den.clone(),
                 layers: Vec::new(),
             },
             b_side: proof.b_side,

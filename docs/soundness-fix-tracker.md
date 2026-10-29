@@ -15,7 +15,11 @@
 - [ ] **S8 · 防 panic 健壮性（P1）** — proof 结构校验，禁止对不可信数据 assert/unwrap，参数从受信 statement 选取。
 
 ### 阶段 B · 原语与框架（依赖 A）
-- [ ] **S2 · Verifier 建立完整 claim 认证链（P0）** — 引入 VerifierStatement，每个 verify_reduce 返回 EvalClaim，verifier 自建所需 claims 集合。
+- [x] **S2 · Verifier 建立完整 claim 认证链（P0）** — 引入 VerifierStatement，每个 verify_reduce 返回 EvalClaim，verifier 自建所需 claims 集合。
+  - `EvalClaim{tensor_id,point,value}` 框架：`verify_shard_precomputed_inner` 从 op 校验的 final evals 自建 shard claims（proof.claims 字段已删除）；DAG/committed 层从本地 claims 重建 cross/boundary 集合并比对；committed 层用本地 claims 做 weight opening 点集多重集比对 + 四要素（张量/点/值/根）认证。bound 集合 = 本地 claims 中 ≥2 claim 的全体张量（不再排除 boundary）。
+  - 4 个关键点：① leaf 单一来源——FractionalProof 的 leaf_num/leaf_den 顶层字段删除，`verify_fractional_chain_core` 重放后返回派生叶 claims，witness x/y 在派生 q_den 点 opening（den 关系 α+x+βy==den_leaf 在该点核对），num 在 q_num；② is_identity manifest 化——TableOpening 增 `table` 字段，identity 判定来自 statement tables，proof 无此标志；③ opening 四要素——weight/boundary/table/witness/perm/gather openings 的 tensor、point、value、root 全部核对，weight 点集多重集精确匹配（未使用权重允许空 opening，空列表不可跳过非空计算）；④ 空列表拒绝——32×32 MatMul 清空承诺/零轮 sumcheck、清空 weight batches 均拒绝。
+  - committed 路径 op 缺口补齐：perm/gather fracs 改为 committed 专属 transcript 重证（shard transcript 保持 frac-free，`FracMode::Committed`）；gather 的 num/den 列用 committed FS alpha/gamma 重建并后置 commit（den 关系在 q_den 与索引公式核对，padding 连续延拓）；committed 路径补 lookup/perm/gather 的 split 交叉根关系；小权重（<2^5）零填充承诺（claim 点零延拓）；Layernorm out 关系 mles 加 w（degree-3，x·rsqrt·w+b−out）；RoPE out 在 r_f/r_s 两 half 点插位 claim（fe[4]），r_out 字段删除。`VerifierStatement{tables,ops,ops_per_shard}` 类型落地。
+  - 回归：`s2_dropped_claim_binding_rejected`（删 bound 列表项）、`s2_empty_weight_batches_rejected`（清空 weight batches）、`s2_identity_flag_forgery_rejected`（伪造 identity 表）、`s2_table_leaf_point_swap_rejected`（opening 换点）、`s2_committed_lookup_roundtrip`、`s2_committed_scatter_gather_roundtrip`（诚实 committed 全链路）、`s2_matmul32_empty_commitments_rejected`（32×32 反例）、`s2_weight_opening_value_and_root_swap_rejected`（改值/换根）。
 - [ ] **S3 · LogUp 顶端绑定（P0）** — final_num/final_den 绑定归约树顶层，拒绝零分母退化。
 - [ ] **S4 · same_poly 绑定（P0）** — 从输入 claims 派生批量系数，终点由 verifier 闭式计算。
 
@@ -36,7 +40,7 @@
 
 | 反例 | 应拒绝项 | 对应 |
 |---|---|---|
-| 32×32 MatMul 空 sumcheck 无承诺 | 拒绝 | S2 |
+| 32×32 MatMul 空 sumcheck 无承诺 | 拒绝 | S2 ✅ `s2_matmul32_empty_commitments_rejected` |
 | Add `[1,2]+[3,4]=[5,5]` | 拒绝 | S5 |
 | Lookup `table[0]=99` 改 final 分数 | 拒绝 | S3 |
 | 替换 tokens / argmax 长度 | 拒绝 | S6 |

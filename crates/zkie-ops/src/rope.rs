@@ -37,7 +37,29 @@ pub struct RoPEProof {
     pub second: VirtualProof,
     pub r_first: Vec<Goldilocks>,
     pub r_second: Vec<Goldilocks>,
-    pub r_out: Vec<Goldilocks>,
+}
+
+/// The two authenticated claim points on the full `out` tensor (S2): the
+/// half-selector bit (position `log2(d/2)`) is 0 resp. 1, every other bit
+/// comes from the first resp. second half-sumcheck's challenge vector. `out`
+/// at these points equals `first.final_evals[4]` resp. `second.final_evals[4]`
+/// — this replaces the old unverifiable `r_out` claim, whose point was
+/// squeezed but never tied to either sumcheck.
+pub fn rope_out_points(
+    r_f: &[Goldilocks],
+    r_s: &[Goldilocks],
+    d: usize,
+) -> (Vec<Goldilocks>, Vec<Goldilocks>) {
+    let half_log = (d / 2).trailing_zeros() as usize;
+    assert!(half_log <= r_f.len());
+    let insert = |r: &[Goldilocks], bit: Goldilocks| -> Vec<Goldilocks> {
+        let mut p = Vec::with_capacity(r.len() + 1);
+        p.extend_from_slice(&r[..half_log]);
+        p.push(bit);
+        p.extend_from_slice(&r[half_log..]);
+        p
+    };
+    (insert(r_f, Goldilocks::ZERO), insert(r_s, Goldilocks::ONE))
 }
 
 fn heads_of(x_len: usize, m: usize, d: usize) -> usize {
@@ -172,15 +194,15 @@ pub fn prove_rope(
     let second_mles: Vec<&[Goldilocks]> = vec![&x_s, &cos_b, &x_f, &sin_b, &out_s, &rem_s, &ones];
     let (second, r_s) = prove_virtual(&second_mles, &second_terms, Goldilocks::ZERO, transcript);
 
-    let r_out: Vec<Goldilocks> = transcript.field_vec(out.len().trailing_zeros() as usize);
-
+    // S2: no r_out squeeze — the out tensor is claimed at the two half points
+    // built by [`rope_out_points`], whose values are the checked sumcheck
+    // final evals (first.final_evals[4], second.final_evals[4]).
     (
         RoPEProof {
             first,
             second,
             r_first: r_f,
             r_second: r_s,
-            r_out,
         },
         rem_f,
         rem_s,
@@ -193,9 +215,12 @@ pub fn verify_rope(proof: &RoPEProof, shift: u32, transcript: &mut Transcript) -
     let two_shift = Goldilocks::from_u64(1u64 << shift);
     let half = Goldilocks::from_u64(1u64 << (shift - 1));
 
-    // The half-tensor arity is r_out.len() - 1 (r_out spans the full x tensor).
-    // TODO(S2): take this from the statement's op shapes instead.
-    let arity = proof.r_out.len().saturating_sub(1);
+    // The half-tensor arity is the length of the stored challenge vectors
+    // (checked against the proof's round count below). The claim points on
+    // `out` are built by the caller from the statement's `d` via
+    // [`rope_out_points`], and their length is pinned against the other
+    // claims on `out` by the same_poly binding.
+    let arity = proof.r_first.len();
 
     let first_terms = vec![
         (Goldilocks::ONE, vec![0usize, 1usize]),
@@ -229,12 +254,7 @@ pub fn verify_rope(proof: &RoPEProof, shift: u32, transcript: &mut Transcript) -
         arity,
         transcript,
     );
-    if !ok || r_s != proof.r_second || fc != virtual_eval(&second_terms, &proof.second.final_evals) {
-        return false;
-    }
-
-    let r_out: Vec<Goldilocks> = transcript.field_vec(proof.r_out.len());
-    r_out == proof.r_out
+    ok && r_s == proof.r_second && fc == virtual_eval(&second_terms, &proof.second.final_evals)
 }
 
 #[cfg(test)]

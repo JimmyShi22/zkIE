@@ -58,14 +58,19 @@ pub fn prove_layernorm_chain(
         transcript,
     );
 
-    // 3. out affine: out = x * scale + b  (i.e. x*scale + b - out = 0)
+    // 3. out = x * rsqrt * w + b  (degree-3; S2: binds the weight w into the
+    //    output relation instead of the prover-computed `scale` product).
+    //    rsqrt comes from the lookup table, so the mles are
+    //    [x, rsqrt_b, w, b, out] with x*rsqrt*w + b - out = 0.
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    let rsqrt_b: Vec<Goldilocks> = (0..m * d).map(|ij| rsqrt[ij / d]).collect();
     let terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize]),
-        (Goldilocks::ONE, vec![2usize]),
-        (neg, vec![3usize]),
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (Goldilocks::ONE, vec![3usize]),
+        (neg, vec![4usize]),
     ];
-    let (out_proof, r_out) = prove_virtual(&[x, &scale, b, &out], &terms, Goldilocks::ZERO, transcript);
+    let (out_proof, r_out) =
+        prove_virtual(&[x, &rsqrt_b, w, b, &out], &terms, Goldilocks::ZERO, transcript);
 
     (
         LayernormChainProof {
@@ -108,9 +113,9 @@ pub fn verify_layernorm_chain(
     }
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
     let terms = vec![
-        (Goldilocks::ONE, vec![0usize, 1usize]),
-        (Goldilocks::ONE, vec![2usize]),
-        (neg, vec![3usize]),
+        (Goldilocks::ONE, vec![0usize, 1usize, 2usize]),
+        (Goldilocks::ONE, vec![3usize]),
+        (neg, vec![4usize]),
     ];
     let (ok, r_out, fc) = verify_virtual(
         &proof.out,

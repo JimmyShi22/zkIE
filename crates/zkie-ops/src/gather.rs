@@ -57,14 +57,41 @@ pub fn prove_scatter_add(
     h: usize,
     transcript: &mut Transcript,
 ) -> ScatterAddProof {
+    prove_scatter_add_with_mode(weighted, token_id, gate, out, m, h, transcript, crate::compose::FracMode::Plain)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_scatter_add_with_mode(
+    weighted: &[Goldilocks],
+    token_id: &[u32],
+    gate: &[Goldilocks],
+    out: &[Goldilocks],
+    m: usize,
+    h: usize,
+    transcript: &mut Transcript,
+    mode: crate::compose::FracMode,
+) -> ScatterAddProof {
     let s = token_id.len();
     assert_eq!(weighted.len(), s * h);
     assert_eq!(gate.len(), s);
     assert_eq!(out.len(), m * h);
-    let alpha = transcript.field();
-    let gamma: Vec<Goldilocks> = transcript.field_vec(h);
-    let src_total = (s * h).next_power_of_two();
-    let tgt_total = (m * h).next_power_of_two();
+    // Committed mode: alpha/gamma and the two fractional proofs are derived
+    // on a scratch transcript — the committed gather section re-proves them
+    // on its own transcript (binding the committed column roots), and the
+    // shard transcript must stay frac-free for the committed replay. The
+    // product sumchecks below always run on the caller's transcript.
+    let mut scratch = Transcript::new(b"zkie-scratch-gather");
+    let frac_ts: &mut Transcript = match mode {
+        crate::compose::FracMode::Plain => transcript,
+        crate::compose::FracMode::Committed => &mut scratch,
+    };
+    let alpha = frac_ts.field();
+    let gamma: Vec<Goldilocks> = frac_ts.field_vec(h);
+    // WHIR folding needs arity >= 5: pad the fractional domains (num=0 /
+    // den=alpha padding contributes 0 to the logUp sum, so the roots
+    // relation is unaffected).
+    let src_total = (s * h).next_power_of_two().max(32);
+    let tgt_total = (m * h).next_power_of_two().max(32);
     let mut num_source = vec![Goldilocks::ZERO; src_total];
     let mut den_source = vec![alpha; src_total];
     let mut num_target = vec![Goldilocks::ZERO; tgt_total];
@@ -81,8 +108,15 @@ pub fn prove_scatter_add(
             den_target[t * h + d] = alpha - Goldilocks::from_u64(t as u64);
         }
     }
-    let source_side = prove_fractional(num_source.clone(), den_source.clone(), transcript);
-    let target_side = prove_fractional(num_target.clone(), den_target.clone(), transcript);
+    // Den continuation into the padding: the verifier checks
+    // den_target = alpha - (index at the point), so padded entries keep the
+    // same formula (index = idx >> h_log); num stays 0 there.
+    let h_log = h.trailing_zeros() as usize;
+    for idx in m * h..tgt_total {
+        den_target[idx] = alpha - Goldilocks::from_u64((idx >> h_log) as u64);
+    }
+    let source_side = prove_fractional(num_source.clone(), den_source.clone(), frac_ts);
+    let target_side = prove_fractional(num_target.clone(), den_target.clone(), frac_ts);
 
     // Product check (source): num_source[pos*h+d] == gamma[d]*weighted[pos*h+d]*gate[pos].
     // The eq point is squeezed upfront (the eq table needs it); the sumcheck
@@ -159,16 +193,30 @@ pub fn prove_scatter_add(
 }
 
 pub fn verify_scatter_add(proof: &ScatterAddProof, transcript: &mut Transcript) -> bool {
-    // Replay the alpha/gamma preamble, then the two fractional proofs.
-    if transcript.field() != proof.alpha {
-        return false;
-    }
-    let gamma: Vec<Goldilocks> = transcript.field_vec(proof.gamma.len());
-    if gamma != proof.gamma {
-        return false;
-    }
-    if !verify_lookup_split(&proof.source_side, &proof.target_side, transcript) {
-        return false;
+    verify_scatter_add_with_mode(proof, transcript, crate::compose::FracMode::Plain)
+}
+
+pub fn verify_scatter_add_with_mode(
+    proof: &ScatterAddProof,
+    transcript: &mut Transcript,
+    mode: crate::compose::FracMode,
+) -> bool {
+    // Plain: replay the alpha/gamma preamble, then the two fractional proofs.
+    // Committed: alpha/gamma and the fracs live on the committed gather
+    // transcript (never on this shard transcript), so nothing is replayed
+    // here; the committed gather section verifies them and compares the
+    // product final evals against the openings.
+    if mode == crate::compose::FracMode::Plain {
+        if transcript.field() != proof.alpha {
+            return false;
+        }
+        let gamma: Vec<Goldilocks> = transcript.field_vec(proof.gamma.len());
+        if gamma != proof.gamma {
+            return false;
+        }
+        if !verify_lookup_split(&proof.source_side, &proof.target_side, transcript) {
+            return false;
+        }
     }
     // Product checks: sumcheck self-consistency on the stored final_evals.
     // The final_evals are authenticated by the committed openings. The eq

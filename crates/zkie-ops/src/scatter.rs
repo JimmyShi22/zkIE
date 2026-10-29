@@ -45,13 +45,34 @@ pub fn prove_scatter(
     n: usize,
     transcript: &mut Transcript,
 ) -> ScatterProof {
+    prove_scatter_with_mode(sel, token_id, expert_of, m, n, transcript, crate::compose::FracMode::Plain)
+}
+
+pub fn prove_scatter_with_mode(
+    sel: &[Goldilocks],
+    token_id: &[u32],
+    expert_of: &[u32],
+    m: usize,
+    n: usize,
+    transcript: &mut Transcript,
+    mode: crate::compose::FracMode,
+) -> ScatterProof {
     let a = source_encodings(sel, m, n);
     let b: Vec<Goldilocks> = token_id
         .iter()
         .zip(expert_of.iter())
         .map(|(&t, &e)| Goldilocks::from_u64((t as usize * n + e as usize) as u64))
         .collect();
-    let perm = prove_permutation(&a, &b, transcript);
+    let perm = match mode {
+        // Committed: the committed perm section re-proves the fracs on its
+        // own transcript (binding the committed column roots); here they run
+        // on a scratch transcript so the shard transcript stays frac-free.
+        crate::compose::FracMode::Committed => {
+            let mut scratch = Transcript::new(b"zkie-scratch-perm");
+            prove_permutation(&a, &b, &mut scratch)
+        }
+        crate::compose::FracMode::Plain => prove_permutation(&a, &b, transcript),
+    };
     ScatterProof { perm }
 }
 
@@ -61,7 +82,23 @@ pub fn verify_scatter(
     _n: usize,
     transcript: &mut Transcript,
 ) -> bool {
-    verify_permutation(&proof.perm, transcript)
+    verify_scatter_with_mode(proof, _m, _n, transcript, crate::compose::FracMode::Plain)
+}
+
+pub fn verify_scatter_with_mode(
+    proof: &ScatterProof,
+    _m: usize,
+    _n: usize,
+    transcript: &mut Transcript,
+    mode: crate::compose::FracMode,
+) -> bool {
+    match mode {
+        crate::compose::FracMode::Plain => verify_permutation(&proof.perm, transcript),
+        // Committed: the fracs are verified by the committed perm section on
+        // the committed transcript; nothing is replayed on the shard
+        // transcript.
+        crate::compose::FracMode::Committed => true,
+    }
 }
 
 #[cfg(test)]
