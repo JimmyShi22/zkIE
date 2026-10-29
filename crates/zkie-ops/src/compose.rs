@@ -38,7 +38,7 @@ use zkie_core::common::logup_gkr::{
     verify_lookup_fractional, verify_lookup_fractional_batch, verify_lookup_fractional_chain,
     build_lookup_table_num_den, build_perm_num_den, fractional_leaf, merge_multiplicity, pad_table,
     prove_fractional, prove_lookup_table, prove_lookup_witness_batch_columns,
-    verify_fractional_chain_core, verify_lookup_split, FractionalProof,
+    verify_fractional_chain_core, verify_lookup_split, FractionalChainClaims, FractionalProof,
 };
 use zkie_core::common::matmul::{prove as matmul_prove, verify as matmul_verify, MatmulProof};
 use zkie_core::common::batched_matmul::{self as bmm, BatchedMatmulProof};
@@ -2531,7 +2531,14 @@ fn verify_shard_precomputed_inner(
             if transcript.field() != wc.alpha || transcript.field() != wc.beta {
                 return None;
             }
-            if !verify_lookup_split(&wc.proof, &tc.proof, transcript) {
+            // S3: the depths come from the columns — the plain proof carries
+            // the witness columns, the table depth from the statement table.
+            let t_w = wc.num.len().trailing_zeros() as usize;
+            let t_t = tables[tc.table]
+                .len()
+                .next_power_of_two()
+                .trailing_zeros() as usize;
+            if !verify_lookup_split(&wc.proof, &tc.proof, t_w, t_t, transcript) {
                 return None;
             }
         }
@@ -4405,10 +4412,8 @@ pub fn verify_committed_shard_dag(
     }
     // 4. Fractional replays FIRST — every leaf is derived from the checked
     // chains (S2); the opening checks below compare against them.
-    let mut witness_leaves: Vec<(Vec<Goldilocks>, Goldilocks, Vec<Goldilocks>, Goldilocks)> =
-        Vec::new();
-    let mut table_leaves: Vec<(Vec<Goldilocks>, Goldilocks, Vec<Goldilocks>, Goldilocks)> =
-        Vec::new();
+    let mut witness_leaves: Vec<FractionalChainClaims> = Vec::new();
+    let mut table_leaves: Vec<FractionalChainClaims> = Vec::new();
     {
         let mut ts = Transcript::new(b"zkie-committed-frac-v1");
         absorb_statement(&mut ts, ops, ops_per_shard);
@@ -4441,40 +4446,63 @@ pub fn verify_committed_shard_dag(
         if ti != proof.table_openings.len() {
             return false;
         }
+        // S3: each column's fractional depth comes from its committed
+        // column length (the witness batch arity / the m-column arity).
+        let mut shard_wc_off: Vec<usize> = Vec::with_capacity(shards.len() + 1);
+        shard_wc_off.push(0);
         for shard in shards.iter() {
-            for wc in &shard.witness_columns {
+            let next = shard_wc_off.last().unwrap() + shard.witness_columns.len();
+            shard_wc_off.push(next);
+        }
+        let total_witness_cols: usize = shards.iter().map(|s| s.witness_columns.len()).sum();
+        if proof.witness_locations.len() != total_witness_cols {
+            return false;
+        }
+        for (si, shard) in shards.iter().enumerate() {
+            for (ci, wc) in shard.witness_columns.iter().enumerate() {
                 if ts.field() != wc.alpha || ts.field() != wc.beta {
                     return false;
                 }
-                match verify_fractional_chain_core(&wc.proof, &mut ts) {
+                let loc = &proof.witness_locations[shard_wc_off[si] + ci];
+                if loc.x_batch >= proof.witness_batches.len() {
+                    return false;
+                }
+                let t_w = proof.witness_batches[loc.x_batch].arity;
+                match verify_fractional_chain_core(&wc.proof, t_w, &mut ts) {
                     Some(leaf) => witness_leaves.push(leaf),
                     None => return false,
                 }
             }
         }
+        let mut ti_frac = 0usize;
         for shard in shards.iter() {
             for tc in &shard.table_columns {
-                match verify_fractional_chain_core(&tc.proof, &mut ts) {
+                let t_t = proof.table_openings[ti_frac].arity;
+                match verify_fractional_chain_core(&tc.proof, t_t, &mut ts) {
                     Some(leaf) => table_leaves.push(leaf),
                     None => {
                         return false;
                     }
                 }
-                // Cross relation of the split lookup (the plain path checks it
-                // via verify_lookup_split; the committed path must too).
+                ti_frac += 1;
             }
         }
-        // The witness/table pairing is per shard by column index.
+        // The witness/table pairing is per shard by column index; the split
+        // cross relation uses the DERIVED roots, and zero denominators are
+        // rejected explicitly (S3: no vacuous 0/0).
+        let mut w_off = 0usize;
         for shard in shards.iter() {
             for i in 0..shard.witness_columns.len() {
-                let wc = &shard.witness_columns[i];
-                let tc = &shard.table_columns[i];
-                if wc.proof.final_num * tc.proof.final_den
-                    != tc.proof.final_num * wc.proof.final_den
-                {
+                let wc = &witness_leaves[w_off + i];
+                let tc = &table_leaves[w_off + i];
+                if wc.final_den == Goldilocks::ZERO || tc.final_den == Goldilocks::ZERO {
+                    return false;
+                }
+                if wc.final_num * tc.final_den != tc.final_num * wc.final_den {
                     return false;
                 }
             }
+            w_off += shard.witness_columns.len();
         }
     }
     // 5. Witness columns: batch openings verified against their commitments
@@ -4511,7 +4539,9 @@ pub fn verify_committed_shard_dag(
         let mut gid = 0usize;
         for shard in shards.iter() {
             for wc in &shard.witness_columns {
-                let (q_num, num_leaf, q_den, den_leaf) = &witness_leaves[gid];
+                let wl = &witness_leaves[gid];
+                let (q_num, num_leaf, q_den, den_leaf) =
+                    (&wl.q_num, &wl.num_leaf, &wl.q_den, &wl.den_leaf);
                 let loc = &proof.witness_locations[gid];
                 let (x_open, y_open, num_open) = match (
                     proof.witness_batch_openings.get(loc.x_batch),
@@ -4555,7 +4585,9 @@ pub fn verify_committed_shard_dag(
         let mut ti = 0usize;
         for shard in shards.iter() {
             for _tc in &shard.table_columns {
-                let (q_num_t, a_t, q_den_t, b_t) = &table_leaves[ti];
+                let tl = &table_leaves[ti];
+                let (q_num_t, a_t, q_den_t, b_t) =
+                    (&tl.q_num, &tl.num_leaf, &tl.q_den, &tl.den_leaf);
                 let to = &proof.table_openings[ti];
                 let pow_bits = zkie_core::pcs::whir::Whir::required_pow_bits(to.arity, 90);
                 let bw = zkie_core::pcs::whir::Whir::with_params(to.arity, 90, pow_bits);
@@ -4619,16 +4651,21 @@ pub fn verify_committed_shard_dag(
     if proof.perm_batches.len() != proof.perm_batch_openings.len() {
         return false;
     }
-    let mut perm_leaves: Vec<(
-        (Vec<Goldilocks>, Goldilocks, Vec<Goldilocks>, Goldilocks),
-        (Vec<Goldilocks>, Goldilocks, Vec<Goldilocks>, Goldilocks),
-    )> = Vec::new();
+    let mut perm_leaves: Vec<(FractionalChainClaims, FractionalChainClaims)> = Vec::new();
     {
         let mut ts = Transcript::new(b"zkie-committed-perm-v1");
         absorb_statement(&mut ts, ops, ops_per_shard);
         for batch in &proof.perm_batches {
             ts.absorb(&bincode::serialize(&batch.commitment).unwrap());
         }
+        let perm_op_count: usize = shards
+            .iter()
+            .map(|s| s.ops.iter().filter(|o| matches!(o, OpProof::Scatter(_))).count())
+            .sum();
+        if proof.perm_locations.len() != perm_op_count {
+            return false;
+        }
+        let mut pgid = 0usize;
         for shard in shards.iter() {
             for op in &shard.ops {
                 if let OpProof::Scatter(sp) = op {
@@ -4636,15 +4673,22 @@ pub fn verify_committed_shard_dag(
                     if alpha != sp.perm.alpha {
                         return false;
                     }
-                    let la = match verify_fractional_chain_core(&sp.perm.a_side, &mut ts) {
+                    // S3: the permutation depth comes from the committed
+                    // column length (the perm batch arity).
+                    let t = proof.perm_batches[proof.perm_locations[pgid].a_batch].arity;
+                    let la = match verify_fractional_chain_core(&sp.perm.a_side, t, &mut ts) {
                         Some(l) => l,
                         None => return false,
                     };
-                    let lb = match verify_fractional_chain_core(&sp.perm.b_side, &mut ts) {
+                    let lb = match verify_fractional_chain_core(&sp.perm.b_side, t, &mut ts) {
                         Some(l) => l,
                         None => return false,
                     };
+                    if la.final_den == Goldilocks::ZERO || lb.final_den == Goldilocks::ZERO {
+                        return false;
+                    }
                     perm_leaves.push((la, lb));
+                    pgid += 1;
                 }
             }
         }
@@ -4686,8 +4730,8 @@ pub fn verify_committed_shard_dag(
                 if let OpProof::Scatter(sp) = op {
                     let loc = &proof.perm_locations[gid];
                     let (la, lb) = &perm_leaves[gid];
-                    let (q_na, a_a, q_da, b_a) = la;
-                    let (q_nb, a_b, q_db, b_b) = lb;
+                    let (q_na, a_a, q_da, b_a) = (&la.q_num, &la.num_leaf, &la.q_den, &la.den_leaf);
+                    let (q_nb, a_b, q_db, b_b) = (&lb.q_num, &lb.num_leaf, &lb.q_den, &lb.den_leaf);
                     let (a_open, b_open, num_open) = match (
                         proof.perm_batch_openings.get(loc.a_batch),
                         proof.perm_batch_openings.get(loc.b_batch),
@@ -4740,10 +4784,7 @@ pub fn verify_committed_shard_dag(
     if proof.gather_batches.len() != proof.gather_batch_openings.len() {
         return false;
     }
-    let mut gather_leaves: Vec<(
-        (Vec<Goldilocks>, Goldilocks, Vec<Goldilocks>, Goldilocks),
-        (Vec<Goldilocks>, Goldilocks, Vec<Goldilocks>, Goldilocks),
-    )> = Vec::new();
+    let mut gather_leaves: Vec<(FractionalChainClaims, FractionalChainClaims)> = Vec::new();
     {
         let mut ts = Transcript::new(b"zkie-committed-gather-v1");
         absorb_statement(&mut ts, ops, ops_per_shard);
@@ -4764,24 +4805,40 @@ pub fn verify_committed_shard_dag(
         for batch in proof.gather_batches.iter().skip(proof.gather_indep_batches) {
             ts.absorb(&bincode::serialize(&batch.commitment).unwrap());
         }
+        let gather_op_count: usize = shards
+            .iter()
+            .map(|s| s.ops.iter().filter(|o| matches!(o, OpProof::Gather(_))).count())
+            .sum();
+        if proof.gather_locations.len() != gather_op_count {
+            return false;
+        }
+        let mut ggid = 0usize;
         for shard in shards.iter() {
             for op in &shard.ops {
                 if let OpProof::Gather(sp) = op {
-                    let ls = match verify_fractional_chain_core(&sp.source_side, &mut ts) {
+                    // S3: each side's depth comes from its committed column
+                    // length (the gather batch arities).
+                    let loc = &proof.gather_locations[ggid];
+                    let t_src = proof.gather_batches[loc.num_source_batch].arity;
+                    let t_tgt = proof.gather_batches[loc.num_target_batch].arity;
+                    let ls = match verify_fractional_chain_core(&sp.source_side, t_src, &mut ts) {
                         Some(l) => l,
                         None => return false,
                     };
-                    let lt = match verify_fractional_chain_core(&sp.target_side, &mut ts) {
+                    let lt = match verify_fractional_chain_core(&sp.target_side, t_tgt, &mut ts) {
                         Some(l) => l,
                         None => return false,
                     };
-                    // Cross relation of the split gather (as on the plain path).
-                    if sp.source_side.final_num * sp.target_side.final_den
-                        != sp.target_side.final_num * sp.source_side.final_den
-                    {
+                    // Cross relation of the split gather (as on the plain
+                    // path), with explicit zero-denominator rejection (S3).
+                    if ls.final_den == Goldilocks::ZERO || lt.final_den == Goldilocks::ZERO {
+                        return false;
+                    }
+                    if ls.final_num * lt.final_den != lt.final_num * ls.final_den {
                         return false;
                     }
                     gather_leaves.push((ls, lt));
+                    ggid += 1;
                 }
             }
         }
@@ -4823,8 +4880,8 @@ pub fn verify_committed_shard_dag(
                 if let (Op::Gather { h, .. }, OpProof::Gather(sp)) = (op_st, op_pr) {
                     let loc = &proof.gather_locations[gid];
                     let (ls, lt) = &gather_leaves[gid];
-                    let (q_ns, a_s, q_ds, b_s) = ls;
-                    let (q_nt, a_t, q_dt, b_t) = lt;
+                    let (q_ns, a_s, q_ds, b_s) = (&ls.q_num, &ls.num_leaf, &ls.q_den, &ls.den_leaf);
+                    let (q_nt, a_t, q_dt, b_t) = (&lt.q_num, &lt.num_leaf, &lt.q_den, &lt.den_leaf);
                     let h_log = h.trailing_zeros() as usize;
                     let get = |batch: usize, table: usize| -> Option<(&Vec<usize>, &Vec<Vec<Goldilocks>>, &Vec<Goldilocks>)> {
                         let o = proof.gather_batch_openings.get(batch)?;

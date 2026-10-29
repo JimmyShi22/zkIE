@@ -214,7 +214,17 @@ pub fn verify_scatter_add_with_mode(
         if gamma != proof.gamma {
             return false;
         }
-        if !verify_lookup_split(&proof.source_side, &proof.target_side, transcript) {
+        // S3: each side's depth comes from its (padded, proof-carried)
+        // column length.
+        let t_src = proof.num_source.len().trailing_zeros() as usize;
+        let t_tgt = proof.num_target.len().trailing_zeros() as usize;
+        if !verify_lookup_split(
+            &proof.source_side,
+            &proof.target_side,
+            t_src,
+            t_tgt,
+            transcript,
+        ) {
             return false;
         }
     }

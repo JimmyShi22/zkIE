@@ -156,7 +156,12 @@ pub fn verify_projection(
     if transcript.field() != proof.alpha || transcript.field() != proof.beta {
         return false;
     }
-    verify_lookup_fractional_chain(&proof.frac, transcript)
+    // S3: the fractional depth comes from the statement: m*n lookup entries
+    // plus the 2^shift range table.
+    let frac_t = (m * n + (1usize << shift))
+        .next_power_of_two()
+        .trailing_zeros() as usize;
+    verify_lookup_fractional_chain(&proof.frac, frac_t, transcript)
 }
 #[cfg(test)]
 mod tests {

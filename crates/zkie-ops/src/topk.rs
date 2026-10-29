@@ -249,18 +249,24 @@ pub fn verify_topk(
     if transcript.field() != proof.a_sel || transcript.field() != proof.b_sel {
         return false;
     }
-    if !verify_lookup_fractional_chain(&proof.sel_range, transcript) {
+    // S3: the fractional depth comes from the statement columns: m*n lookup
+    // entries plus the 2-entry {0,1} range table.
+    let sel_range_t = (m * n + 2).next_power_of_two().trailing_zeros() as usize;
+    if !verify_lookup_fractional_chain(&proof.sel_range, sel_range_t, transcript) {
         return false;
     }
 
     if transcript.field() != proof.a_d1 || transcript.field() != proof.b_d1 {
         return false;
     }
-    if !verify_lookup_fractional_chain(&proof.d1_range, transcript) {
+    let d1_range_t = (m * n + (1usize << proof.range_bits))
+        .next_power_of_two()
+        .trailing_zeros() as usize;
+    if !verify_lookup_fractional_chain(&proof.d1_range, d1_range_t, transcript) {
         return false;
     }
 
-    verify_range_decomp(&proof.d2_decomp, transcript)
+    verify_range_decomp(&proof.d2_decomp, m * n, transcript)
 }
 
 #[cfg(test)]
@@ -485,7 +491,11 @@ pub fn prove_range_decomp(
     }
 }
 
-pub fn verify_range_decomp(proof: &RangeDecompProof, transcript: &mut Transcript) -> bool {
+pub fn verify_range_decomp(
+    proof: &RangeDecompProof,
+    n_entries: usize,
+    transcript: &mut Transcript,
+) -> bool {
     let neg = Goldilocks::ZERO - Goldilocks::ONE;
     let s16 = Goldilocks::from_u64(1 << 16);
     let s32 = Goldilocks::from_u64(1 << 32);
@@ -503,13 +513,17 @@ pub fn verify_range_decomp(proof: &RangeDecompProof, transcript: &mut Transcript
     {
         return false;
     }
-    if !verify_lookup_fractional_chain(&proof.c0_range, transcript) {
+    // S3: each limb range frac runs over m*n entries plus the 2^16 table.
+    let range_t = (n_entries + (1usize << 16))
+        .next_power_of_two()
+        .trailing_zeros() as usize;
+    if !verify_lookup_fractional_chain(&proof.c0_range, range_t, transcript) {
         return false;
     }
-    if !verify_lookup_fractional_chain(&proof.c1_range, transcript) {
+    if !verify_lookup_fractional_chain(&proof.c1_range, range_t, transcript) {
         return false;
     }
-    if !verify_lookup_fractional_chain(&proof.c2_range, transcript) {
+    if !verify_lookup_fractional_chain(&proof.c2_range, range_t, transcript) {
         return false;
     }
     let (ok, r, fc) = verify_virtual(

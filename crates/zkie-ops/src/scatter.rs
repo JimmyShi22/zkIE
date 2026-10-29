@@ -93,7 +93,12 @@ pub fn verify_scatter_with_mode(
     mode: crate::compose::FracMode,
 ) -> bool {
     match mode {
-        crate::compose::FracMode::Plain => verify_permutation(&proof.perm, transcript),
+        crate::compose::FracMode::Plain => {
+            // S3: the permutation depth comes from the (padded, proof-carried)
+            // a column length (build_perm_num_den pads to at least 2^5).
+            let t = proof.perm.a.len().next_power_of_two().max(32).trailing_zeros() as usize;
+            verify_permutation(&proof.perm, t, transcript)
+        }
         // Committed: the fracs are verified by the committed perm section on
         // the committed transcript; nothing is replayed on the shard
         // transcript.

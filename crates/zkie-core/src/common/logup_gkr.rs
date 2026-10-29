@@ -37,11 +37,15 @@ pub struct FractionalLayer {
     pub den_merge: SamePolyProof,
 }
 
+/// The layered fractional proof: one γ-batched identity sumcheck per tree
+/// level, plus the two same_poly merges feeding the next level's claims.
+/// S3: NO root fields — the tree root (final_num, final_den) is DERIVED by
+/// the verifier from the top layer's child evals (N0*D1 + N1*D0, D0*D1),
+/// which the lower chain authenticates; a prover-supplied root is exactly the
+/// gap that let the LogUp final ratio be steered off the reduction.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct FractionalProof {
     pub layers: Vec<FractionalLayer>,
-    pub final_num: Goldilocks,
-    pub final_den: Goldilocks,
 }
 
 /// The four leaf claims (num point + eval, den point + eval) produced by the
@@ -50,6 +54,19 @@ pub struct FractionalProof {
 /// helper [`fractional_leaf`] reads the same values back out of a freshly
 /// proven chain.
 pub type FractionalLeaf = (Vec<Goldilocks>, Goldilocks, Vec<Goldilocks>, Goldilocks);
+
+/// Everything a fractional-chain replay derives (S2/S3): the leaf claims
+/// (which the openings authenticate) AND the tree roots (which the LogUp
+/// binding uses). Both are replay-derived — the proof stores neither.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FractionalChainClaims {
+    pub q_num: Vec<Goldilocks>,
+    pub num_leaf: Goldilocks,
+    pub q_den: Vec<Goldilocks>,
+    pub den_leaf: Goldilocks,
+    pub final_num: Goldilocks,
+    pub final_den: Goldilocks,
+}
 
 fn build_terms(gamma: Goldilocks, a: Goldilocks, b: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
     // G(x) = eq0(x) * [N0*D1 + N1*D0 - a] + gamma * eq1(x) * [D0*D1 - b],
@@ -78,6 +95,10 @@ pub fn prove_fractional(
 ) -> FractionalProof {
     assert_eq!(num.len(), den.len());
     assert!(num.len().is_power_of_two());
+    // S3: a single-entry domain (t = 0) has no layer to derive the root
+    // from; the protocol explicitly rejects it. All production columns are
+    // padded to at least 2^5.
+    assert!(num.len() >= 2, "fractional domain must have at least 2 entries");
     let t = num.len().trailing_zeros() as usize;
 
     // Build the whole fraction tree first: tn[i] = num_i (arity t-i).
@@ -143,11 +164,7 @@ pub fn prove_fractional(
             den_merge,
         });
     }
-    FractionalProof {
-        layers,
-        final_num,
-        final_den,
-    }
+    FractionalProof { layers }
 }
 
 pub fn verify_fractional(
@@ -175,24 +192,25 @@ pub fn verify_fractional(
         tn.push(next_n);
         td.push(next_d);
     }
-    if proof.final_num != tn[t][0] || proof.final_den != td[t][0] {
+
+    // S3: the chain must span the column-derived depth exactly (layer li has
+    // arity li); a zero-layer domain is explicitly invalid.
+    if t == 0 || proof.layers.len() != t {
         return false;
     }
 
-    let mut a = proof.final_num;
-    let mut b = proof.final_den;
+    let mut a = Goldilocks::ZERO;
+    let mut b = Goldilocks::ZERO;
     let mut q_num: Vec<Goldilocks> = Vec::new();
     let mut q_den: Vec<Goldilocks> = Vec::new();
+    let mut root: Option<(Goldilocks, Goldilocks)> = None;
     for (k, layer) in proof.layers.iter().enumerate() {
         let gamma = transcript.field();
         if gamma != layer.gamma {
             return false;
         }
-        let terms = build_terms(gamma, a, b);
-        let arity = layer.s.len();
-        let (ok, s, final_claim) =
-            verify_virtual(&layer.proof, &terms, Goldilocks::ZERO, arity, transcript);
-        if !ok || s != layer.s {
+        let arity = k;
+        if layer.s.len() != arity || layer.proof.final_evals.len() != 6 {
             return false;
         }
         let half = 1usize << arity;
@@ -201,13 +219,26 @@ pub fn verify_fractional(
         let eq_num = crate::common::mle::eq_evals(&q_num);
         let eq_den = crate::common::mle::eq_evals(&q_den);
         let fe = vec![
-            crate::common::mle::eval(&eq_num, &s),
-            crate::common::mle::eval(&eq_den, &s),
-            crate::common::mle::eval(&num_k1[..half], &s),
-            crate::common::mle::eval(&num_k1[half..], &s),
-            crate::common::mle::eval(&den_k1[..half], &s),
-            crate::common::mle::eval(&den_k1[half..], &s),
+            crate::common::mle::eval(&eq_num, &layer.s),
+            crate::common::mle::eval(&eq_den, &layer.s),
+            crate::common::mle::eval(&num_k1[..half], &layer.s),
+            crate::common::mle::eval(&num_k1[half..], &layer.s),
+            crate::common::mle::eval(&den_k1[..half], &layer.s),
+            crate::common::mle::eval(&den_k1[half..], &layer.s),
         ];
+        if k == 0 {
+            // S3: the tree roots are DERIVED from the (here fully rebuilt and
+            // tree-authenticated) top-layer child evals.
+            a = fe[2] * fe[5] + fe[3] * fe[4];
+            b = fe[4] * fe[5];
+            root = Some((a, b));
+        }
+        let terms = build_terms(gamma, a, b);
+        let (ok, s, final_claim) =
+            verify_virtual(&layer.proof, &terms, Goldilocks::ZERO, arity, transcript);
+        if !ok || s != layer.s {
+            return false;
+        }
         if final_claim != virtual_eval(&terms, &fe) {
             return false;
         }
@@ -228,43 +259,75 @@ pub fn verify_fractional(
         q_num = layer.num_merge.merged_point.clone();
         q_den = layer.den_merge.merged_point.clone();
     }
-    // Leaf single source (S2): the leaves are DERIVED here from the replayed
-    // chain, never read from a prover-supplied field.
-    proof.final_num == claimed * proof.final_den
+    let (final_num, final_den) = root.unwrap();
+    // S3: a zero tree denominator is a protocol violation (the ratio would
+    // be undefined and cross-multiplication would hold vacuously) — reject.
+    if final_den == Goldilocks::ZERO {
+        return false;
+    }
+    final_num == claimed * final_den
 }
 
-/// Store-free per-layer transcript replay: squeezes and checks every gamma,
-/// re-derives each layer's challenge vector per-round from the proof's round
-/// messages (S1), checks the stored child evals, and verifies the two
-/// same_poly merges (which produce the next layer's claim points).
+/// Store-free per-layer transcript replay (S3): squeezes and checks every
+/// gamma; derives each layer's challenge vector per-round from the proof's
+/// round messages (S1); REQUIRES the layer count, every point dimension and
+/// the final-eval column count to match the column-derived depth `t`; checks
+/// the stored child evals with the eq columns RECOMPUTED in closed form
+/// (never proof-supplied); verifies the two same_poly merges; and finally
+/// DERIVES the tree roots from the top layer's child evals.
 ///
-/// Leaf single source (S2): on success this RETURNS the leaf claims
-/// `(q_num, a, q_den, b)` derived from the replayed chain. The proof carries
-/// no stored leaf fields, so every consumer must use these derived values.
+/// Returns the derived leaf claims AND the derived roots on success; `None`
+/// rejects. The proof carries no root or leaf fields.
 fn replay_fractional_storefree(
     proof: &FractionalProof,
+    t: usize,
     transcript: &mut Transcript,
-) -> Option<FractionalLeaf> {
-    let mut a = proof.final_num;
-    let mut b = proof.final_den;
+) -> Option<FractionalChainClaims> {
+    // S3 explicit rules: a zero-layer domain is invalid; the chain must span
+    // the column depth exactly.
+    if t == 0 || proof.layers.len() != t {
+        return None;
+    }
+    let mut a = Goldilocks::ZERO;
+    let mut b = Goldilocks::ZERO;
     let mut q_num: Vec<Goldilocks> = Vec::new();
     let mut q_den: Vec<Goldilocks> = Vec::new();
-    for layer in proof.layers.iter() {
+    let mut root: Option<(Goldilocks, Goldilocks)> = None;
+    for (li, layer) in proof.layers.iter().enumerate() {
         let gamma = transcript.field();
         if gamma != layer.gamma {
             return None;
         }
+        // Layer li (top-down) covers arity li; the round count and the
+        // final-eval column count are fixed by the protocol.
+        let arity = li;
+        let fe = &layer.proof.final_evals;
+        if layer.s.len() != arity || layer.proof.rounds.len() != arity || fe.len() != 6 {
+            return None;
+        }
+        // The eq columns are closed-form recomputed from the derived claim
+        // points, never accepted from the proof (S3).
+        let eq0 = crate::common::mle::eq_poly(&q_num, &layer.s);
+        let eq1 = crate::common::mle::eq_poly(&q_den, &layer.s);
+        if fe[0] != eq0 || fe[1] != eq1 {
+            return None;
+        }
+        if li == 0 {
+            // S3: the tree roots come from the top layer's child evals
+            // (N0*D1 + N1*D0, D0*D1) — authenticated by the lower chain.
+            a = fe[2] * fe[5] + fe[3] * fe[4];
+            b = fe[4] * fe[5];
+            root = Some((a, b));
+        }
         let terms = build_terms(gamma, a, b);
-        let arity = layer.s.len();
         let (ok, s, final_claim) =
             verify_virtual(&layer.proof, &terms, Goldilocks::ZERO, arity, transcript);
         if !ok || s != layer.s {
             return None;
         }
-        if final_claim != virtual_eval(&terms, &layer.proof.final_evals) {
+        if final_claim != virtual_eval(&terms, &[eq0, eq1, fe[2], fe[3], fe[4], fe[5]]) {
             return None;
         }
-        let fe = &layer.proof.final_evals;
         let mut p0 = s.clone();
         p0.push(Goldilocks::ZERO);
         let mut p1 = s.clone();
@@ -282,27 +345,42 @@ fn replay_fractional_storefree(
         q_num = layer.num_merge.merged_point.clone();
         q_den = layer.den_merge.merged_point.clone();
     }
-    Some((q_num, a, q_den, b))
+    let (final_num, final_den) = root.unwrap();
+    Some(FractionalChainClaims {
+        q_num,
+        num_leaf: a,
+        q_den,
+        den_leaf: b,
+        final_num,
+        final_den,
+    })
 }
 
-/// Chained store-free verify: the full S1 layered replay. Does not check the
-/// final_num/final_den == claimed relation, so split lookup/table proofs can
-/// share it and enforce the link separately. Returns the DERIVED leaf claims
-/// `(q_num, a, q_den, b)` on success; `None` rejects.
+/// Chained store-free verify: the full S1 layered replay with the S3
+/// structural and root-derivation rules. `t` is the column depth (log2 of
+/// the padded column length), supplied by the caller from the column /
+/// statement — never from the proof. Does not check the
+/// final_num == claimed*final_den relation, so split lookup/table proofs can
+/// share it and enforce the link separately. Returns the derived leaf AND
+/// root claims on success; `None` rejects.
 pub fn verify_fractional_chain_core(
     proof: &FractionalProof,
+    t: usize,
     transcript: &mut Transcript,
-) -> Option<FractionalLeaf> {
-    replay_fractional_storefree(proof, transcript)
+) -> Option<FractionalChainClaims> {
+    replay_fractional_storefree(proof, t, transcript)
 }
 
 pub fn verify_fractional_chain(
     proof: &FractionalProof,
     claimed: Goldilocks,
+    t: usize,
     transcript: &mut Transcript,
 ) -> bool {
-    verify_fractional_chain_core(proof, transcript).is_some()
-        && proof.final_num == claimed * proof.final_den
+    match verify_fractional_chain_core(proof, t, transcript) {
+        Some(c) => c.final_den != Goldilocks::ZERO && c.final_num == claimed * c.final_den,
+        None => false,
+    }
 }
 
 // Store-free verify: use the final_evals already stored in each layer
@@ -311,17 +389,17 @@ pub fn verify_fractional_chain(
 pub fn verify_fractional_storefree(
     proof: &FractionalProof,
     claimed: Goldilocks,
+    t: usize,
     transcript: &mut Transcript,
 ) -> bool {
-    verify_fractional_chain(proof, claimed, transcript)
+    verify_fractional_chain(proof, claimed, t, transcript)
 }
 
 /// PROVER-SIDE / post-replay helper only: read the leaf claims out of a
 /// freshly proven chain (the final layer's same_poly merge outputs). The
 /// verifier must never use this on an untrusted proof — it derives the leaves
 /// from its own replay via [`verify_fractional_chain_core`], which checks the
-/// merges first. A proof with no layers (arity-0 domain) has its roots as its
-/// leaves at the empty point.
+/// merges first.
 pub fn fractional_leaf(
     proof: &FractionalProof,
 ) -> (Vec<Goldilocks>, Goldilocks, Vec<Goldilocks>, Goldilocks) {
@@ -332,22 +410,57 @@ pub fn fractional_leaf(
             layer.den_merge.merged_point.clone(),
             layer.den_merge.merged_eval,
         ),
-        None => (
-            Vec::new(),
-            proof.final_num,
-            Vec::new(),
-            proof.final_den,
-        ),
+        // Unreachable for valid proofs (S3: the domain has >= 2 entries).
+        None => (Vec::new(), Goldilocks::ZERO, Vec::new(), Goldilocks::ZERO),
     }
 }
 
-/// Prove `y_i == table[x_i]` for every `i` via the fractional-sumcheck logUp:
-/// `sum_i 1/(alpha+x_i+beta*y_i) = sum_j m_j/(alpha+j+beta*table[j])`, encoded as
-/// a combined fraction list whose sum is 0 and proven with `prove_fractional`.
-/// This replaces the standalone grand-product form (`prove_product`).
-// Build the merged LogUp columns num_0/den_0 from the lookup witness x/y and
-// the table. These are the only columns the chained GKR must commit and open
-// (equivalent to committing x/y + table/multiplicity).
+/// Verify the split lookup: each side is chained-GKR sound over its own
+/// column depth (`t_witness` / `t_table`, statement/column-derived), the two
+/// sides agree on the fractional sum (cross-multiplied LogUp identity), and
+/// neither tree denominator may be zero (S3: 0/0 must not hold vacuously).
+/// The witness side is replayed first, then the table side, matching the
+/// prover's order.
+
+pub fn prove_lookup_table(
+    m: &[u64],
+    table: &[Goldilocks],
+    alpha: Goldilocks,
+    beta: Goldilocks,
+    transcript: &mut Transcript,
+) -> FractionalProof {
+    let (num, den) = build_lookup_table_num_den(m, table, alpha, beta);
+    prove_fractional(num, den, transcript)
+}
+
+pub fn verify_lookup_split(
+    witness: &FractionalProof,
+    table: &FractionalProof,
+    t_witness: usize,
+    t_table: usize,
+    transcript: &mut Transcript,
+) -> bool {
+    let wc = match verify_fractional_chain_core(witness, t_witness, transcript) {
+        Some(c) => c,
+        None => return false,
+    };
+    if wc.final_den == Goldilocks::ZERO {
+        return false;
+    }
+    let tc = match verify_fractional_chain_core(table, t_table, transcript) {
+        Some(c) => c,
+        None => return false,
+    };
+    if tc.final_den == Goldilocks::ZERO {
+        return false;
+    }
+    wc.final_num * tc.final_den == tc.final_num * wc.final_den
+}
+
+/// Build the combined lookup num/den columns: witness entries 1/(alpha + x
+/// + beta*y) in the first `n` slots, table multiplicities
+/// -m/(alpha + j + beta*table[j]) in the following `t` slots, padded to the
+/// next power of two.
 pub fn build_lookup_num_den(
     x: &[u32],
     y: &[Goldilocks],
@@ -374,6 +487,7 @@ pub fn build_lookup_num_den(
     }
     (num, den)
 }
+
 
 // Split lookup into a witness side (x/y) and a table side (table/multiplicity),
 // matching DeepProve: the table side is committed once globally (small PoW),
@@ -511,30 +625,6 @@ pub fn prove_lookup_witness_batch_columns(
     (proof, x_flat, y_flat, num, den)
 }
 
-pub fn prove_lookup_table(
-    m: &[u64],
-    table: &[Goldilocks],
-    alpha: Goldilocks,
-    beta: Goldilocks,
-    transcript: &mut Transcript,
-) -> FractionalProof {
-    let (num, den) = build_lookup_table_num_den(m, table, alpha, beta);
-    prove_fractional(num, den, transcript)
-}
-
-// Verify the split lookup: each side is chained-GKR sound, and the two sides
-// agree on the fractional sum (cross-multiplied LogUp identity). The witness
-// side is replayed first, then the table side, matching the prover's order.
-pub fn verify_lookup_split(
-    witness: &FractionalProof,
-    table: &FractionalProof,
-    transcript: &mut Transcript,
-) -> bool {
-    verify_fractional_chain_core(witness, transcript).is_some()
-        && verify_fractional_chain_core(table, transcript).is_some()
-        && witness.final_num * table.final_den == table.final_num * witness.final_den
-}
-
 pub fn prove_lookup_fractional(
     x: &[u32],
     y: &[Goldilocks],
@@ -599,11 +689,14 @@ pub fn verify_lookup_fractional(
 // Chained store-free verify for a lookup: no x/y/table rebuild, no full
 // witness columns. Soundness is restored by opening num_0/den_0 at the leaf claim points
 // (see fractional_leaf) against their commitments in the committed path.
+// `t` is the column depth (S3), derived by the caller from the statement
+// column sizes.
 pub fn verify_lookup_fractional_chain(
     proof: &FractionalProof,
+    t: usize,
     transcript: &mut Transcript,
 ) -> bool {
-    verify_fractional_chain(proof, Goldilocks::from_u64(0), transcript)
+    verify_fractional_chain(proof, Goldilocks::from_u64(0), t, transcript)
 }
 
 /// Batch several lookups into the SAME `table` into one fractional-sumcheck
@@ -712,18 +805,14 @@ mod tests {
         assert!(verify_fractional(&proof, num.clone(), den.clone(), claimed, &mut tv));
         let (mut _tp2, tv2) = replay_pair(0xF5);
         let mut tv2 = tv2;
-        assert!(verify_fractional_chain(&proof, claimed, &mut tv2));
+        assert!(verify_fractional_chain(&proof, claimed, 6, &mut tv2));
         let (mut _tp3, tv3) = replay_pair(0xF5);
         let mut tv3 = tv3;
-        assert!(verify_fractional_storefree(&proof, claimed, &mut tv3));
+        assert!(verify_fractional_storefree(&proof, claimed, 6, &mut tv3));
 
         // Tamper the first layer's first round message: the store-free replay
         // derives different challenges and must reject.
-        let mut tampered = FractionalProof {
-            final_num: proof.final_num,
-            final_den: proof.final_den,
-            layers: Vec::new(),
-        };
+        let mut tampered = FractionalProof { layers: Vec::new() };
         for (i, layer) in proof.layers.iter().enumerate() {
             let mut lp = FractionalLayer {
                 gamma: layer.gamma,
@@ -740,7 +829,7 @@ mod tests {
         }
         let (mut _tp4, tv4) = replay_pair(0xF5);
         let mut tv4 = tv4;
-        assert!(!verify_fractional_chain(&tampered, claimed, &mut tv4));
+        assert!(!verify_fractional_chain(&tampered, claimed, 6, &mut tv4));
     }
 
     #[test]
@@ -755,14 +844,14 @@ mod tests {
         let (mut tp, tv) = replay_pair(0xF5F);
         let mut proof = prove_fractional(num.clone(), den.clone(), &mut tp);
         let mut tv = tv;
-        assert!(verify_fractional_storefree(&proof, claimed, &mut tv));
+        assert!(verify_fractional_storefree(&proof, claimed, 6, &mut tv));
         // Tamper a child eval of the root layer (N0): the root identity
         // check must reject. (Tampering fe[0] alone is invisible: it scales
         // a bracket that is already zero.)
         proof.layers[0].proof.final_evals[2] += Goldilocks::from_u64(1);
         let (mut _tp2, tv2) = replay_pair(0xF5F);
         let mut tv2 = tv2;
-        assert!(!verify_fractional_storefree(&proof, claimed, &mut tv2));
+        assert!(!verify_fractional_storefree(&proof, claimed, 6, &mut tv2));
     }
 
     #[test]
@@ -777,11 +866,11 @@ mod tests {
         let (mut tp, tv) = replay_pair(0xCA17);
         let mut proof = prove_fractional(num.clone(), den.clone(), &mut tp);
         let mut tv = tv;
-        assert!(verify_fractional_chain(&proof, claimed, &mut tv));
+        assert!(verify_fractional_chain(&proof, claimed, 6, &mut tv));
         proof.layers[0].proof.final_evals[3] += Goldilocks::from_u64(1);
         let (mut _tp2, tv2) = replay_pair(0xCA17);
         let mut tv2 = tv2;
-        assert!(!verify_fractional_chain(&proof, claimed, &mut tv2));
+        assert!(!verify_fractional_chain(&proof, claimed, 6, &mut tv2));
     }
 
     #[test]
@@ -899,13 +988,13 @@ mod tests {
         let mut tv = tv;
         assert_eq!(tv.field(), alpha);
         assert_eq!(tv.field(), beta);
-        assert!(verify_lookup_fractional_chain(&proof, &mut tv));
+        assert!(verify_lookup_fractional_chain(&proof, 7, &mut tv));
         proof.layers[0].proof.final_evals[3] += Goldilocks::from_u64(1);
         let (mut _tp2, tv2) = replay_pair(0x11A0);
         let mut tv2 = tv2;
         assert_eq!(tv2.field(), alpha);
         assert_eq!(tv2.field(), beta);
-        assert!(!verify_lookup_fractional_chain(&proof, &mut tv2));
+        assert!(!verify_lookup_fractional_chain(&proof, 7, &mut tv2));
     }
 
     #[test]
@@ -933,7 +1022,7 @@ mod tests {
         let mut tv2 = tv2;
         assert_eq!(tv2.field(), alpha2);
         assert_eq!(tv2.field(), beta2);
-        assert!(verify_lookup_split(&witness, &table_proof, &mut tv2));
+        assert!(verify_lookup_split(&witness, &table_proof, 6, 4, &mut tv2));
     }
 
     #[test]
@@ -969,7 +1058,7 @@ mod tests {
         let mut tv2 = tv2;
         assert_eq!(tv2.field(), alpha2);
         assert_eq!(tv2.field(), beta2);
-        assert!(verify_lookup_split(&witness, &table_proof, &mut tv2));
+        assert!(verify_lookup_split(&witness, &table_proof, 6, 6, &mut tv2));
     }
 
     #[test]
@@ -1080,7 +1169,7 @@ mod tests {
         let (mut tp, tv) = replay_pair(0x1A1A);
         let honest = prove_fractional(num.clone(), den.clone(), &mut tp);
         let mut tv = tv;
-        assert!(verify_fractional_chain(&honest, claimed, &mut tv));
+        assert!(verify_fractional_chain(&honest, claimed, 6, &mut tv));
 
         // Pick an inner layer with a non-empty sumcheck: layers are pushed
         // root-first, so layers[1] is the layer just below the root.
@@ -1140,15 +1229,13 @@ mod tests {
         }
         let forged = FractionalProof {
             layers: forged_layers,
-            final_num: honest.final_num,
-            final_den: honest.final_den,
         };
 
         // S1: the verifier derives the layer's challenges from the forged
         // rounds; the stored s no longer matches and the proof is REJECTED.
         let (mut _tp2, tv2) = replay_pair(0x1A1A);
         let mut tv2 = tv2;
-        assert!(!verify_fractional_chain(&forged, claimed, &mut tv2));
+        assert!(!verify_fractional_chain(&forged, claimed, 6, &mut tv2));
     }
 
     /// S1: changing an inner layer's round message changes that layer's
@@ -1166,18 +1253,14 @@ mod tests {
         let (mut tp, tv) = replay_pair(0x1B1B);
         let proof = prove_fractional(num.clone(), den.clone(), &mut tp);
         let mut tv = tv;
-        assert!(verify_fractional_chain(&proof, claimed, &mut tv));
+        assert!(verify_fractional_chain(&proof, claimed, 6, &mut tv));
 
         // Tamper an inner layer's first round message: its stored s no longer
         // matches the derived vector, so verification fails. Earlier layers
         // are unaffected (their stored s's still match).
         let layer_idx = 1;
         assert!(!proof.layers[layer_idx].s.is_empty());
-        let mut tampered = FractionalProof {
-            final_num: proof.final_num,
-            final_den: proof.final_den,
-            layers: Vec::new(),
-        };
+        let mut tampered = FractionalProof { layers: Vec::new() };
         for (i, layer) in proof.layers.iter().enumerate() {
             let mut lp = FractionalLayer {
                 gamma: layer.gamma,
@@ -1193,7 +1276,271 @@ mod tests {
         }
         let (mut _tp2, tv2) = replay_pair(0x1B1B);
         let mut tv2 = tv2;
-        assert!(!verify_fractional_chain(&tampered, claimed, &mut tv2));
+        assert!(!verify_fractional_chain(&tampered, claimed, 6, &mut tv2));
+    }
+
+    // ------------------------------------------------------------------
+    // S3 (LogUp top binding) test-first regressions. The forgery cases are
+    // expected to be ACCEPTED pre-fix (tests fail) and REJECTED post-fix.
+    // ------------------------------------------------------------------
+
+    /// Honest split pair helper: prove a witness/table fraction pair on one
+    /// transcript and return them, plus the WITNESS-side claimed ratio
+    /// (sum num_w/den_w), used by the S3 forgery tests.
+    fn honest_split_pair(
+        seed: u64,
+    ) -> (FractionalProof, FractionalProof, Transcript, Goldilocks) {
+        let mut rng = XorShift64::new(seed);
+        let n = 1usize << 6;
+        // Identical sides: the split cross relation (equal fraction ratios)
+        // holds honestly, like a real lookup pair whose multiplicities agree.
+        let num_w: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let den_w: Vec<Goldilocks> = (0..n).map(|i| from_i64((i % 7) as i64 + 1)).collect();
+        let num_t: Vec<Goldilocks> = num_w.clone();
+        let den_t: Vec<Goldilocks> = den_w.clone();
+        let claimed = (0..n).fold(Goldilocks::from_u64(0), |acc, i| {
+            acc + num_w[i] * den_w[i].inverse()
+        });
+        let mut start = Transcript::new(b"zkie-logup-test");
+        start.absorb_u64(seed);
+        let mut tp = start.clone();
+        let w = prove_fractional(num_w, den_w, &mut tp);
+        let t = prove_fractional(num_t, den_t, &mut tp);
+        // Return the PRE-prove transcript state: verifiers replay from the
+        // statement state, never from the post-prove transcript.
+        (w, t, start, claimed)
+    }
+
+    /// S3: honest multi-layer chain + store verification still pass.
+    #[test]
+    fn s3_honest_multi_layer_roundtrip() {
+        let (w, t, tp, claimed) = honest_split_pair(0x5301);
+        let mut tv = tp.clone();
+        assert!(verify_lookup_split(&w, &t, 6, 6, &mut tv));
+        let mut tv2 = tp.clone();
+        assert!(verify_fractional_chain(&w, claimed, 6, &mut tv2));
+        // Store version on the witness side (rebuilds the tree).
+        let mut rng = XorShift64::new(0x5301);
+        let n = 1usize << 6;
+        let num: Vec<Goldilocks> = (0..n).map(|_| rng.field()).collect();
+        let den: Vec<Goldilocks> = (0..n).map(|i| from_i64((i % 7) as i64 + 1)).collect();
+        let claimed_w: Goldilocks = (0..n).fold(Goldilocks::from_u64(0), |acc, i| {
+            acc + num[i] * den[i].inverse()
+        });
+        let (mut tp3, mut tv3) = replay_pair(0x5301);
+        let w2 = prove_fractional(num.clone(), den.clone(), &mut tp3);
+        assert!(verify_fractional(&w2, num, den, claimed_w, &mut tv3));
+    }
+
+    /// S3: honest single-leaf domain (t=1, two entries) still passes.
+    #[test]
+    fn s3_honest_single_leaf_roundtrip() {
+        let mut rng = XorShift64::new(0x5302);
+        let num: Vec<Goldilocks> = vec![rng.field(), rng.field()];
+        let den: Vec<Goldilocks> = vec![
+            from_i64(3),
+            from_i64(5),
+        ];
+        let claimed = num[0] * den[0].inverse() + num[1] * den[1].inverse();
+        let (mut tp, tv) = replay_pair(0x5302);
+        let proof = prove_fractional(num.clone(), den.clone(), &mut tp);
+        let mut tv = tv;
+        assert!(verify_fractional_chain(&proof, claimed, 1, &mut tv));
+        let (mut tp2, mut tv2) = replay_pair(0x5302);
+        let proof2 = prove_fractional(num.clone(), den.clone(), &mut tp2);
+        assert!(verify_fractional(&proof2, num, den, claimed, &mut tv2));
+    }
+
+    /// S3: a proof with zero layers must be rejected. (Pre-fix the empty
+    /// chain returned the stored root fields as the leaves and was ACCEPTED;
+    /// the split-level check only rejected it incidentally via the transcript
+    /// shift.) Post-fix the layer count must equal the column depth.
+    #[test]
+    fn s3_zero_layer_rejected() {
+        let (_w, _t, tp, claimed) = honest_split_pair(0x5303);
+        let empty = FractionalProof { layers: Vec::new() };
+        let mut tv = tp.clone();
+        assert!(!verify_fractional_chain(&empty, claimed, 6, &mut tv));
+    }
+
+    /// S3: steering the root pair along the top layer's constraint line
+    /// (a' = a + gamma*delta, b' = b - delta) leaves every layer identity
+    /// unchanged, so pre-fix the split check accepts it even though the LogUp
+    /// final ratio is rewritten. Post-fix the roots are DERIVED from the top
+    /// layer's child evals, so the pre-fix steering attack no longer exists;
+    /// its closest structural form — forging the top-layer child evals the
+    /// roots derive from — must be rejected.
+    #[test]
+    fn s3_root_steer_rejected() {
+        let (w, _t, tp, claimed) = honest_split_pair(0x5304);
+        let mut forged = FractionalProof { layers: Vec::new() };
+        for (i, layer) in w.layers.iter().enumerate() {
+            let mut lp = FractionalLayer {
+                gamma: layer.gamma,
+                s: layer.s.clone(),
+                num_merge: layer.num_merge.clone(),
+                den_merge: layer.den_merge.clone(),
+                proof: layer.proof.clone(),
+            };
+            if i == 0 {
+                lp.proof.final_evals[2] = lp.proof.final_evals[2] + Goldilocks::ONE;
+                lp.proof.final_evals[5] = lp.proof.final_evals[5] + Goldilocks::ONE;
+            }
+            forged.layers.push(lp);
+        }
+        let mut tv = tp.clone();
+        assert!(!verify_fractional_chain(&forged, claimed, 6, &mut tv));
+    }
+
+    /// S3: the eq columns must be recomputed in closed form, never taken from
+    /// the proof. At the TOP layer (arity 0) the eq points are empty, so the
+    /// true eq evals are BOTH ONE and the parenthesized tree identities are
+    /// zero — setting the stored eq evals (final_evals[0]/[1]) to ZERO leaves
+    /// every pre-fix check untouched and is ACCEPTED. Post-fix the verifier
+    /// computes eq0 == eq1 == 1 and rejects the forged columns.
+    #[test]
+    fn s3_eq_evals_recomputed_rejected() {
+        let (w, _t, tp, claimed) = honest_split_pair(0x5305);
+        let mut forged = FractionalProof { layers: Vec::new() };
+        for (i, layer) in w.layers.iter().enumerate() {
+            let mut lp = FractionalLayer {
+                gamma: layer.gamma,
+                s: layer.s.clone(),
+                num_merge: layer.num_merge.clone(),
+                den_merge: layer.den_merge.clone(),
+                proof: layer.proof.clone(),
+            };
+            if i == 0 {
+                // Top layer: both parenthesized parts are zero (the roots are
+                // the honest tree roots), so the eq values vanish from the
+                // pre-fix virtual-eval check — any stored eq passes.
+                lp.proof.final_evals[0] = Goldilocks::ZERO;
+                lp.proof.final_evals[1] = Goldilocks::ZERO;
+            }
+            forged.layers.push(lp);
+        }
+        let mut tv = tp.clone();
+        // S3: must be REJECTED (pre-fix it is ACCEPTED).
+        assert!(!verify_fractional_chain(&forged, claimed, 6, &mut tv));
+    }
+
+    /// S3: zero denominators must be handled by the protocol — 0/0 must not
+    /// make the cross-multiplied relation hold vacuously.
+    #[test]
+    fn s3_zero_denominator_rejected() {
+        let n = 1usize << 4;
+        let num: Vec<Goldilocks> = vec![Goldilocks::ONE; n];
+        let mut den: Vec<Goldilocks> = (0..n).map(|i| from_i64((i % 5) as i64 + 1)).collect();
+        den[3] = Goldilocks::ZERO; // one zero entry -> tree den root == 0
+        let mut start = Transcript::new(b"zkie-logup-test");
+        start.absorb_u64(0x5306);
+        let mut tp = start.clone();
+        let w = prove_fractional(num.clone(), den.clone(), &mut tp);
+        let t = prove_fractional(num.clone(), den.clone(), &mut tp);
+        // Pre-fix the split check was ACCEPTED: both chains pass and the
+        // cross relation 0 == 0 holds vacuously. S3: zero denominators must
+        // be rejected explicitly.
+        let mut tv = start.clone();
+        assert!(!verify_lookup_split(&w, &t, 4, 4, &mut tv));
+        // Chain level: an all-zero numerator hides the zero denominator
+        // pre-fix (final_num == 0 == 0*final_den). S3: rejected explicitly.
+        let num0: Vec<Goldilocks> = vec![Goldilocks::ZERO; n];
+        let mut tp2 = start.clone();
+        let w0 = prove_fractional(num0.clone(), den.clone(), &mut tp2);
+        let mut tv2 = start.clone();
+        assert!(!verify_fractional_chain(&w0, Goldilocks::ZERO, 4, &mut tv2));
+    }
+
+    /// S3: the layer count must equal the column-derived tree depth. Dropping
+    /// the BOTTOM layer leaves every remaining gamma in place, so pre-fix the
+    /// chain replays fine with leaves one level up and the split check
+    /// ACCEPTS it; post-fix layers.len() != t rejects it.
+    #[test]
+    fn s3_truncated_chain_rejected() {
+        let (w, _t, tp, claimed) = honest_split_pair(0x5307);
+        let truncated = FractionalProof {
+            layers: w.layers[..w.layers.len() - 1]
+                .iter()
+                .map(|layer| FractionalLayer {
+                    gamma: layer.gamma,
+                    s: layer.s.clone(),
+                    num_merge: layer.num_merge.clone(),
+                    den_merge: layer.den_merge.clone(),
+                    proof: layer.proof.clone(),
+                })
+                .collect(),
+        };
+        // Pre-fix this was ACCEPTED at the chain level (transcript-aligned,
+        // self-consistent leaves one level up; the split check only rejects
+        // it incidentally via the transcript shift). S3: layers.len() must
+        // equal the column depth.
+        let mut tv = tp.clone();
+        assert!(!verify_fractional_chain(&truncated, claimed, 6, &mut tv));
+    }
+
+    /// S3: malformed layer structure is rejected, never a panic. A truncated
+    /// final_evals (5 entries instead of 6) PANICS the pre-fix verifier; the
+    /// fixed verifier rejects it as malformed.
+    #[test]
+    fn s3_malformed_structure_rejected() {
+        let (w, _t, tp, claimed) = honest_split_pair(0x5308);
+        let mut forged = FractionalProof { layers: Vec::new() };
+        for (i, layer) in w.layers.iter().enumerate() {
+            let mut lp = FractionalLayer {
+                gamma: layer.gamma,
+                s: layer.s.clone(),
+                num_merge: layer.num_merge.clone(),
+                den_merge: layer.den_merge.clone(),
+                proof: layer.proof.clone(),
+            };
+            if i == 1 {
+                lp.proof.final_evals.truncate(5);
+            }
+            forged.layers.push(lp);
+        }
+        let mut tv = tp.clone();
+        // S3: must be rejected WITHOUT panicking (pre-fix panics on the
+        // out-of-bounds final-eval index).
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            verify_fractional_chain(&forged, claimed, 6, &mut tv)
+        }));
+        assert!(matches!(outcome, Ok(false)), "malformed fe must reject, not panic");
+    }
+
+    /// S3 guard: tampering a top-layer child eval breaks the top layer's
+    /// same_poly merge claims and is rejected (kept green pre- and post-fix).
+    #[test]
+    fn s3_top_layer_child_eval_tamper_rejected() {
+        let (w, _t, tp, claimed) = honest_split_pair(0x5309);
+        let mut forged = FractionalProof { layers: Vec::new() };
+        for (i, layer) in w.layers.iter().enumerate() {
+            let mut lp = FractionalLayer {
+                gamma: layer.gamma,
+                s: layer.s.clone(),
+                num_merge: layer.num_merge.clone(),
+                den_merge: layer.den_merge.clone(),
+                proof: layer.proof.clone(),
+            };
+            if i == 0 {
+                lp.proof.final_evals[2] = lp.proof.final_evals[2] + Goldilocks::ONE;
+            }
+            forged.layers.push(lp);
+        }
+        let mut tv = tp.clone();
+        assert!(!verify_fractional_chain(&forged, claimed, 6, &mut tv));
+    }
+
+    /// S3: the claimed root binding final_num == claimed*final_den must hold
+    /// for the DERIVED roots; an empty layer list plus matching root fields
+    /// passes pre-fix even though nothing was reduced. S3: the layer count
+    /// must equal the column depth, and the roots only exist as derived
+    /// values.
+    #[test]
+    fn s3_empty_layer_list_with_claimed_rejected() {
+        let (_w, _t, tp, claimed) = honest_split_pair(0x530A);
+        let empty = FractionalProof { layers: Vec::new() };
+        let mut tv = tp.clone();
+        assert!(!verify_fractional_chain(&empty, claimed, 6, &mut tv));
     }
 
     /// Manual timing harness (run with `cargo test -p zkie-core --release
@@ -1215,7 +1562,7 @@ mod tests {
         let prove_s = t0.elapsed().as_secs_f64();
         let t1 = std::time::Instant::now();
         let mut tv = tv;
-        let ok = verify_fractional_chain(&proof, claimed, &mut tv);
+        let ok = verify_fractional_chain(&proof, claimed, 17, &mut tv);
         let verify_s = t1.elapsed().as_secs_f64();
         eprintln!(
             "frac n={} layers={} prove={:.3}s verify={:.3}s ok={}",
@@ -1312,12 +1659,18 @@ pub fn prove_permutation(
     }
 }
 
-pub fn verify_permutation(proof: &PermutationProof, transcript: &mut Transcript) -> bool {
+/// `t` is the shared column depth of both sides (the permutation domain,
+/// padded to at least 2^5 — S3).
+pub fn verify_permutation(
+    proof: &PermutationProof,
+    t: usize,
+    transcript: &mut Transcript,
+) -> bool {
     let alpha = transcript.field();
     if alpha != proof.alpha {
         return false;
     }
-    verify_lookup_split(&proof.a_side, &proof.b_side, transcript)
+    verify_lookup_split(&proof.a_side, &proof.b_side, t, t, transcript)
 }
 
 #[cfg(test)]
@@ -1341,14 +1694,10 @@ mod permutation_tests {
         let proof = prove_permutation(&a, &b, &mut tp);
         let mut tv = Transcript::new(b"zkie-perm-test");
         tv.absorb_u64(0xAB00);
-        assert!(verify_permutation(&proof, &mut tv));
+        assert!(verify_permutation(&proof, 5, &mut tv));
         // Tamper a layer child eval: the chained verify must reject.
         let mut bad_proof = PermutationProof {
-            a_side: FractionalProof {
-                final_num: proof.a_side.final_num,
-                final_den: proof.a_side.final_den,
-                layers: Vec::new(),
-            },
+            a_side: FractionalProof { layers: Vec::new() },
             b_side: proof.b_side,
             alpha: proof.alpha,
             a: proof.a,
@@ -1367,6 +1716,6 @@ mod permutation_tests {
         }
         let mut tv2 = Transcript::new(b"zkie-perm-test");
         tv2.absorb_u64(0xAB00);
-        assert!(!verify_permutation(&bad_proof, &mut tv2));
+        assert!(!verify_permutation(&bad_proof, 5, &mut tv2));
     }
 }
