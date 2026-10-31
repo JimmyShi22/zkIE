@@ -145,6 +145,8 @@ pub fn prove_fractional(
         let terms = build_terms(gamma, a, b);
         let (proof, s) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
         let fe = &proof.final_evals;
+        transcript.absorb(b"zkie-logup-child-evals-v1");
+        transcript.absorb_fields(&fe[2..6]);
         let mut p0 = s.clone();
         p0.push(Goldilocks::ZERO);
         let mut p1 = s.clone();
@@ -243,6 +245,8 @@ pub fn verify_fractional(
         if final_claim != virtual_eval(&terms, &fe) {
             return false;
         }
+        transcript.absorb(b"zkie-logup-child-evals-v1");
+        transcript.absorb_fields(&fe[2..6]);
         let mut p0 = s.clone();
         p0.push(Goldilocks::ZERO);
         let mut p1 = s.clone();
@@ -331,6 +335,8 @@ fn replay_fractional_storefree(
         if final_claim != virtual_eval(&terms, &[eq0, eq1, fe[2], fe[3], fe[4], fe[5]]) {
             return None;
         }
+        transcript.absorb(b"zkie-logup-child-evals-v1");
+        transcript.absorb_fields(&fe[2..6]);
         let mut p0 = s.clone();
         p0.push(Goldilocks::ZERO);
         let mut p1 = s.clone();
@@ -788,6 +794,38 @@ pub fn verify_lookup_fractional_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numerator_merge_challenge_binds_denominator_children() {
+        let num = vec![Goldilocks::from_u64(2), Goldilocks::from_u64(3)];
+        let den = vec![Goldilocks::from_u64(5), Goldilocks::from_u64(7)];
+        let (mut tp, mut tv) = replay_pair(0x8d42);
+        let proof = prove_fractional(num.clone(), den, &mut tp);
+        let layer = &proof.layers[0];
+        let gamma = tv.field();
+        let fe = &layer.proof.final_evals;
+        let a = fe[2] * fe[5] + fe[3] * fe[4];
+        let b = fe[4] * fe[5];
+        let terms = build_terms(gamma, a, b);
+        let (ok, s, _) = verify_virtual(&layer.proof, &terms, Goldilocks::ZERO, 0, &mut tv);
+        assert!(ok);
+        let mut changed = tv.clone();
+        tv.absorb(b"zkie-logup-child-evals-v1");
+        tv.absorb_fields(&fe[2..6]);
+        let mut altered = fe[2..6].to_vec();
+        altered[2] += Goldilocks::ONE;
+        changed.absorb(b"zkie-logup-child-evals-v1");
+        changed.absorb_fields(&altered);
+        let mut p0 = s.clone();
+        p0.push(Goldilocks::ZERO);
+        let mut p1 = s;
+        p1.push(Goldilocks::ONE);
+        let claims = vec![(p0, fe[2]), (p1, fe[3])];
+        let (honest, _) = prove_same_poly(&num, &claims, &mut tv);
+        let (modified, _) = prove_same_poly(&num, &claims, &mut changed);
+        assert_eq!(honest.gamma, layer.num_merge.gamma);
+        assert_ne!(modified.gamma, layer.num_merge.gamma);
+    }
 
     /// A fresh transcript pair for roundtrip tests: prover and verifier start
     /// from the same statement-absorbed state.

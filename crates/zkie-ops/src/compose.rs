@@ -138,6 +138,1026 @@ pub struct EvalClaim {
     pub value: Goldilocks,
 }
 
+/// Field and index tensor IDs occupy distinct Store namespaces. Reverse claims
+/// use tagged keys, so equal numeric IDs in those namespaces never alias.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TensorKey { Field(T), Index(T) }
+
+impl TensorKey {
+    pub fn encoded(self) -> Option<T> {
+        // Wire keys use a fixed 64-bit high-bit tag. Do not reinterpret them
+        // on a platform with a different usize width.
+        if usize::BITS != 64 { return None; }
+        let tag = 1usize << (usize::BITS - 1);
+        match self {
+            TensorKey::Field(id) if id < tag => Some(id),
+            TensorKey::Index(id) if id < tag => Some(id | tag),
+            _ => None,
+        }
+    }
+}
+
+fn reverse_op_io(op: &Op) -> Option<(Vec<T>, Vec<T>)> {
+    let f = |id| TensorKey::Field(id).encoded();
+    let i = |id| TensorKey::Index(id).encoded();
+    match op {
+        Op::Add { a, b, c } => Some((vec![f(*a)?, f(*b)?], vec![f(*c)?])),
+        Op::MatMul { a, b, c, .. } => Some((vec![f(*a)?, f(*b)?], vec![f(*c)?])),
+        Op::Relu { x, out } => Some((vec![f(*x)?], vec![f(*out)?])),
+        Op::Transpose { x, out, .. } => Some((vec![f(*x)?], vec![f(*out)?])),
+        Op::Projection { x, w, bias, out, .. } => Some((vec![f(*x)?, f(*w)?, f(*bias)?], vec![f(*out)?])),
+        Op::Lookup { idx, out, .. } => Some((vec![i(*idx)?], vec![f(*out)?])),
+        Op::GeluIndex { x, out, .. } => Some((vec![f(*x)?], vec![i(*out)?])),
+        Op::Scale { x, out, .. } => Some((vec![f(*x)?], vec![f(*out)?])),
+        _ => None,
+    }
+}
+
+/// Reverse reduction proof. Its returned leaf claims still need independent
+/// authentication against caller-trusted inputs and model commitments.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ReverseDagProof { steps: Vec<ReverseStep> }
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReverseStep {
+    tensor_id: T,
+    merge: Option<SamePolyProof>,
+    reduction: ReverseReduction,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+enum ReverseReduction {
+    Add { a: Goldilocks, b: Goldilocks },
+    MatMul { proof: MatmulProof },
+    Relu { proof: ReverseReluProof },
+    Projection { proof: ReverseProjectionProof },
+    Lookup { proof: ReverseLookupProof },
+    GeluIndex { proof: ReverseGeluIndexProof },
+    Scale { proof: ReverseScaleProof },
+    Transpose,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReverseGeluIndexProof {
+    lower_at_output: Goldilocks,
+    upper: ReverseReluProof,
+    lower: ReverseReluProof,
+}
+
+fn reverse_tensor_values(store: &Store, id: T) -> Option<Cow<'_, [Goldilocks]>> {
+    if usize::BITS != 64 { return None; }
+    let tag = 1usize << (usize::BITS - 1);
+    if id & tag == 0 { Some(store.materialize(id)) }
+    else { Some(Cow::Owned(store.idx.get(id & !tag)?.iter().map(|&x| Goldilocks::from_u64(x as u64)).collect())) }
+}
+
+fn prove_reverse_gelu_index(input: &[Goldilocks], offset: i64, table_len: usize,
+    point: &[Goldilocks], value: Goldilocks, transcript: &mut Transcript)
+    -> Option<(ReverseGeluIndexProof, Vec<(Vec<Goldilocks>, Goldilocks)>)>
+{
+    if table_len == 0 || table_len > RELU_BOUND as usize || offset.unsigned_abs() > RELU_BOUND as u64 || !input.len().is_power_of_two() { return None; }
+    let limit = (table_len - 1) as i64;
+    let mut shifted = Vec::with_capacity(input.len());
+    let mut upper_input = Vec::with_capacity(input.len());
+    let mut indices = Vec::with_capacity(input.len());
+    for &x in input {
+        let w = to_i64(x).checked_add(offset)?;
+        if !(-RELU_BOUND..RELU_BOUND).contains(&w) { return None; }
+        let high = w.checked_sub(limit)?;
+        if !(-RELU_BOUND..RELU_BOUND).contains(&high) { return None; }
+        shifted.push(from_i64(w));
+        upper_input.push(from_i64(high));
+        indices.push(from_i64(w.max(0) - high.max(0)));
+    }
+    if point.len() != input.len().trailing_zeros() as usize || mle::eval(&indices, point) != value { return None; }
+    let lower_values: Vec<_> = shifted.iter().map(|&x| from_i64(to_i64(x).max(0))).collect();
+    let lower_at_output = mle::eval(&lower_values, point);
+    transcript.absorb_field(lower_at_output);
+    let (upper, upper_inputs) = prove_reverse_relu(&upper_input, point, lower_at_output - value, transcript)?;
+    let limit_f = from_i64(limit);
+    transcript.absorb_u64(upper_inputs.len() as u64);
+    for (p, v) in &upper_inputs { transcript.absorb_u64(p.len() as u64); transcript.absorb_fields(p); transcript.absorb_field(*v); }
+    let (lower, shifted_inputs) = prove_reverse_relu(&shifted, point, lower_at_output, transcript)?;
+    let offset_f = from_i64(offset);
+    let mut inputs: Vec<_> = upper_inputs.into_iter().map(|(p, v)| (p, v + limit_f - offset_f)).collect();
+    inputs.extend(shifted_inputs.into_iter().map(|(p, v)| (p, v - offset_f)));
+    Some((ReverseGeluIndexProof { lower_at_output, upper, lower }, inputs))
+}
+
+fn verify_reverse_gelu_index(offset: i64, table_len: usize, point: &[Goldilocks], value: Goldilocks,
+    proof: &ReverseGeluIndexProof, transcript: &mut Transcript)
+    -> Option<Vec<(Vec<Goldilocks>, Goldilocks)>>
+{
+    if table_len == 0 || table_len > RELU_BOUND as usize || offset.unsigned_abs() > RELU_BOUND as u64 { return None; }
+    let limit_f = from_i64((table_len - 1) as i64);
+    transcript.absorb_field(proof.lower_at_output);
+    let upper_inputs = verify_reverse_relu(&proof.upper, point, proof.lower_at_output - value, transcript)?;
+    transcript.absorb_u64(upper_inputs.len() as u64);
+    for (p, v) in &upper_inputs { transcript.absorb_u64(p.len() as u64); transcript.absorb_fields(p); transcript.absorb_field(*v); }
+    let shifted_inputs = verify_reverse_relu(&proof.lower, point, proof.lower_at_output, transcript)?;
+    let offset_f = from_i64(offset);
+    let mut inputs: Vec<_> = upper_inputs.into_iter().map(|(p, v)| (p, v + limit_f - offset_f)).collect();
+    inputs.extend(shifted_inputs.into_iter().map(|(p, v)| (p, v - offset_f)));
+    Some(inputs)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReverseScaleProof {
+    remainder_bits: Vec<Goldilocks>,
+    booleanity: Option<VirtualProof>,
+    opening: Option<zkie_core::pcs::batch_open::BatchOpeningProof>,
+    input_eval: Option<Goldilocks>,
+}
+
+fn prove_reverse_scale(store: &Store, op: &Op, point: &[Goldilocks], value: Goldilocks,
+    aux: Option<PreparedAux>, transcript: &mut Transcript) -> Option<(ReverseScaleProof, EvalClaim)>
+{
+    let (x, out, factor, shift) = match op {
+        Op::Scale { x, out, factor, shift } => (*x, *out, *factor, *shift),
+        _ => return None,
+    };
+    let xv = store.get(x);
+    if xv.len() != store.get(out).len() || !xv.len().is_power_of_two()
+        || point.len() != xv.len().trailing_zeros() as usize { return None; }
+    let x_eval = mle::eval(xv, point);
+    let factor_f = from_i64(factor);
+    if shift == 0 {
+        // round_div(a, 1) == a: the reverse relation is exact.
+        if factor_f * x_eval != value { return None; }
+        return Some((ReverseScaleProof { remainder_bits: Vec::new(), booleanity: None, opening: None,
+            input_eval: if factor == 0 { Some(x_eval) } else { None } },
+            EvalClaim { tensor_id: x, point: point.to_vec(), value: x_eval }));
+    }
+    let aux = aux?;
+    if aux.descriptor.columns != shift as usize || aux.descriptor.len != xv.len()
+        || aux.descriptor.arity < point.len() { return None; }
+    let two_shift = Goldilocks::from_u64(1u64 << shift);
+    let half = Goldilocks::from_u64(1u64 << (shift - 1));
+    let mut padded_point = point.to_vec(); padded_point.resize(aux.descriptor.arity, Goldilocks::ZERO);
+    let bit_evals: Vec<_> = aux.columns.iter().map(|c| mle::eval(c, &padded_point)).collect();
+    let remainder = bit_evals.iter().enumerate().fold(Goldilocks::ZERO, |acc, (j, &b)| acc + Goldilocks::from_u64(1u64 << j) * b);
+    if factor_f * x_eval != two_shift * value + remainder - half { return None; }
+    transcript.absorb_fields(&bit_evals);
+    let q = transcript.field_vec(aux.descriptor.arity);
+    let gamma = transcript.field();
+    let eq = mle::eq_evals(&q);
+    let mut mles: Vec<&[Goldilocks]> = vec![&eq];
+    mles.extend(aux.columns.iter().map(Vec::as_slice));
+    let terms = projection_boolean_terms(aux.descriptor.columns, gamma);
+    let (booleanity, bool_point) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
+    let mut idxs: Vec<usize> = (0..aux.descriptor.columns).collect();
+    idxs.extend(0..aux.descriptor.columns);
+    let mut points = vec![padded_point; aux.descriptor.columns];
+    points.extend((0..aux.descriptor.columns).map(|_| bool_point.clone()));
+    let mut values = bit_evals.clone(); values.extend_from_slice(&booleanity.final_evals[1..]);
+    let tensors: Vec<Vec<Goldilocks>> = idxs.iter().map(|&i| aux.columns[i].clone()).collect();
+    let ctx = zkie_core::pcs::committed::BatchCtx { commitment: aux.descriptor.commitment.clone(), prover_data: aux.prover_data, protocol: aux.protocol, whir: aux.whir, num_tables: aux.descriptor.columns };
+    let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(ctx, &idxs, &tensors, &points, &values).ok()?;
+    Some((ReverseScaleProof { remainder_bits: bit_evals, booleanity: Some(booleanity), opening: Some(opening),
+        input_eval: if factor == 0 { Some(x_eval) } else { None } },
+        EvalClaim { tensor_id: x, point: point.to_vec(), value: x_eval }))
+}
+
+fn verify_reverse_scale(op: &Op, point: &[Goldilocks], value: Goldilocks, aux: Option<&AuxDescriptor>,
+    proof: &ReverseScaleProof, transcript: &mut Transcript) -> Option<EvalClaim>
+{
+    let (x, factor, shift) = match op {
+        Op::Scale { x, factor, shift, .. } => (*x, *factor, *shift),
+        _ => return None,
+    };
+    if shift == 0 {
+        // round_div(a, 1) == a: out = x*factor, with no remainder witness.
+        if !proof.remainder_bits.is_empty() || proof.booleanity.is_some() || proof.opening.is_some() { return None; }
+        if factor == 0 {
+            // out is the constant zero function and the op does not constrain
+            // x, so the proof must carry x's evaluation for upstream/leaf
+            // authentication. It is never fabricated as zero.
+            let input_eval = proof.input_eval?;
+            if value != Goldilocks::ZERO { return None; }
+            return Some(EvalClaim { tensor_id: x, point: point.to_vec(), value: input_eval });
+        }
+        if proof.input_eval.is_some() { return None; }
+        let inv = from_i64(factor).try_inverse()?;
+        return Some(EvalClaim { tensor_id: x, point: point.to_vec(), value: value * inv });
+    }
+    if factor == 0 && value != Goldilocks::ZERO { return None; }
+    let descriptor = aux?;
+    let booleanity = proof.booleanity.as_ref()?;
+    let opening = proof.opening.as_ref()?;
+    if descriptor.columns != shift as usize || proof.remainder_bits.len() != descriptor.columns
+        || !descriptor.len.is_power_of_two()
+        || point.len() != descriptor.len.trailing_zeros() as usize
+        || booleanity.final_evals.len() != descriptor.columns + 1 { return None; }
+    if (factor == 0) != proof.input_eval.is_some() { return None; }
+    let two_shift = Goldilocks::from_u64(1u64 << shift);
+    let half = Goldilocks::from_u64(1u64 << (shift - 1));
+    let remainder = proof.remainder_bits.iter().enumerate().fold(Goldilocks::ZERO, |acc, (j, &b)| acc + Goldilocks::from_u64(1u64 << j) * b);
+    let rhs = two_shift * value + remainder - half;
+    let x_eval = if factor == 0 {
+        // out is constant zero; the range-checked remainder binds it, while x
+        // remains free and is authenticated through the carried evaluation.
+        if rhs != Goldilocks::ZERO { return None; }
+        proof.input_eval?
+    } else {
+        rhs * from_i64(factor).try_inverse()?
+    };
+    transcript.absorb_fields(&proof.remainder_bits);
+    let q = transcript.field_vec(descriptor.arity);
+    let gamma = transcript.field();
+    let terms = projection_boolean_terms(descriptor.columns, gamma);
+    let (ok, bool_point, final_value) = verify_virtual(booleanity, &terms, Goldilocks::ZERO, descriptor.arity, transcript);
+    if !ok { return None; }
+    let mut evals = booleanity.final_evals.clone(); evals[0] = mle::eq_poly(&q, &bool_point);
+    if final_value != virtual_eval(&terms, &evals) { return None; }
+    let padded = 1usize.checked_shl(descriptor.arity as u32)?;
+    let vars = descriptor.columns.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
+    let whir = zkie_core::pcs::whir::Whir::with_params(vars, 90, pow);
+    let protocol = whir.batch_opening_protocol(descriptor.columns, descriptor.arity);
+    let mut padded_point = point.to_vec(); padded_point.resize(descriptor.arity, Goldilocks::ZERO);
+    let mut idxs: Vec<usize> = (0..descriptor.columns).collect();
+    idxs.extend(0..descriptor.columns);
+    let mut points = vec![padded_point; descriptor.columns];
+    points.extend((0..descriptor.columns).map(|_| bool_point.clone()));
+    let mut values = proof.remainder_bits.clone(); values.extend_from_slice(&booleanity.final_evals[1..]);
+    if !zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &descriptor.commitment, &protocol, descriptor.columns, &idxs, &points, &values, opening) { return None; }
+    Some(EvalClaim { tensor_id: x, point: point.to_vec(), value: x_eval })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+enum AuxRole { ProjectionBits, ScaleRemainder, LookupPairs, LookupMultiplicity }
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct AuxDescriptor {
+    op_index: usize,
+    role: AuxRole,
+    len: usize,
+    arity: usize,
+    columns: usize,
+    commitment: zkie_core::pcs::whir::Commitment,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReverseLookupProof {
+    witness: FractionalProof,
+    table: FractionalProof,
+    output_index: Goldilocks,
+    witness_index: Goldilocks,
+    witness_value: Goldilocks,
+    multiplicity: Goldilocks,
+    table_value: Goldilocks,
+    padding: VirtualProof,
+    pairs_opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+    multiplicity_opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+    table_opening: Option<zkie_core::pcs::whir::Proof>,
+}
+
+struct PreparedAux {
+    descriptor: AuxDescriptor,
+    columns: Vec<Vec<Goldilocks>>,
+    prover_data: zkie_core::pcs::whir::ProverData,
+    protocol: zkie_core::pcs::whir::OpeningProtocol,
+    whir: zkie_core::pcs::whir::Whir,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReverseProjectionProof {
+    matmul: MatmulProof,
+    bias: Goldilocks,
+    remainder_bits: Vec<Goldilocks>,
+    booleanity: VirtualProof,
+    opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+}
+
+fn projection_aux_specs(ops: &[Op]) -> Option<Vec<(usize, usize, usize, usize)>> {
+    let mut specs = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        if let Op::Projection { m, n, shift, .. } = op {
+            if *shift == 0 || *shift > 31 { return None; }
+            let len = m.checked_mul(*n)?;
+            if !len.is_power_of_two() { return None; }
+            specs.push((i, len, len.trailing_zeros().max(5) as usize, *shift as usize));
+        }
+    }
+    Some(specs)
+}
+
+fn prepare_projection_aux(store: &Store, ops: &[Op]) -> Option<Vec<PreparedAux>> {
+    let mut prepared = Vec::new();
+    for (op_index, len, arity, count) in projection_aux_specs(ops)? {
+        let rem = match &ops[op_index] { Op::Projection { rem, .. } => *rem, _ => return None };
+        let values = store.get(rem);
+        if values.len() != len { return None; }
+        let padded = 1usize.checked_shl(arity as u32)?;
+        let mut columns = vec![vec![Goldilocks::ZERO; padded]; count];
+        for (i, &v) in values.iter().enumerate() {
+            let n = to_i64(v);
+            if n < 0 || (n as u64) >= (1u64 << count) { return None; }
+            for j in 0..count { columns[j][i] = Goldilocks::from_u64(((n as u64) >> j) & 1); }
+        }
+        let vars = count.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
+        let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+        let descriptor = AuxDescriptor { op_index, role: AuxRole::ProjectionBits, len, arity, columns: count, commitment };
+        prepared.push(PreparedAux { descriptor, columns, prover_data, protocol, whir });
+    }
+    Some(prepared)
+}
+
+fn scale_aux_specs(ops: &[Op], model: &TrustedModelManifest) -> Option<Vec<(usize, usize, usize, usize)>> {
+    let mut specs = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        if let Op::Scale { x, shift, .. } = op {
+            if *shift == 0 { continue; }
+            if *shift > 31 { return None; }
+            let key = TensorKey::Field(*x).encoded()?;
+            let len = *model.tensor_lengths.get(&key)?;
+            if !len.is_power_of_two() { return None; }
+            specs.push((i, len, len.trailing_zeros().max(5) as usize, *shift as usize));
+        }
+    }
+    Some(specs)
+}
+
+fn prepare_scale_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest) -> Option<Vec<PreparedAux>> {
+    let mut prepared = Vec::new();
+    for (op_index, len, arity, count) in scale_aux_specs(ops, model)? {
+        let (x, out, factor, shift) = match &ops[op_index] {
+            Op::Scale { x, out, factor, shift } => (*x, *out, *factor, *shift),
+            _ => return None,
+        };
+        let xv = store.get(x);
+        let ov = store.get(out);
+        if xv.len() != len || ov.len() != len { return None; }
+        let two_shift = 1i64.checked_shl(shift)?;
+        let half = two_shift / 2;
+        let padded = 1usize.checked_shl(arity as u32)?;
+        let mut columns = vec![vec![Goldilocks::ZERO; padded]; count];
+        for i in 0..len {
+            let rem = to_i64(xv[i]).checked_mul(factor)?
+                .checked_sub(to_i64(ov[i]).checked_mul(two_shift)?)?
+                .checked_add(half)?;
+            if rem < 0 || rem as u64 >= two_shift as u64 { return None; }
+            for j in 0..count { columns[j][i] = Goldilocks::from_u64(((rem as u64) >> j) & 1); }
+        }
+        let vars = count.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
+        let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+        let descriptor = AuxDescriptor { op_index, role: AuxRole::ScaleRemainder, len, arity, columns: count, commitment };
+        prepared.push(PreparedAux { descriptor, columns, prover_data, protocol, whir });
+    }
+    Some(prepared)
+}
+
+fn lookup_aux_specs(ops: &[Op], model: &TrustedModelManifest) -> Option<Vec<(usize, AuxRole, usize, usize, usize)>> {
+    let mut specs = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        if let Op::Lookup { idx, table, .. } = op {
+            let key = TensorKey::Index(*idx).encoded()?;
+            let len = *model.tensor_lengths.get(&key)?;
+            let table_len = *model.lookup_lengths.get(table)?;
+            if !len.is_power_of_two() || table_len == 0 { return None; }
+            let table_padded = table_len.checked_next_power_of_two()?.max(32);
+            specs.push((i, AuxRole::LookupPairs, len, len.trailing_zeros().max(5) as usize, 2));
+            specs.push((i, AuxRole::LookupMultiplicity, table_len, table_padded.trailing_zeros() as usize, 1));
+        }
+    }
+    Some(specs)
+}
+
+fn prepare_lookup_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest) -> Option<Vec<PreparedAux>> {
+    let mut prepared = Vec::new();
+    for (op_index, role, len, arity, count) in lookup_aux_specs(ops, model)? {
+        let (idx, out, table) = match &ops[op_index] { Op::Lookup { idx, out, table } => (*idx, *out, *table), _ => return None };
+        let xs = store.idx.get(idx)?;
+        let ys = store.get(out);
+        let table_len = *model.lookup_lengths.get(&table)?;
+        if xs.len() != ys.len() || xs.iter().any(|&x| x as usize >= table_len) { return None; }
+        let padded = 1usize.checked_shl(arity as u32)?;
+        let mut columns = vec![vec![Goldilocks::ZERO; padded]; count];
+        match role {
+            AuxRole::LookupPairs => {
+                if xs.len() != len { return None; }
+                for j in 0..len { columns[0][j] = Goldilocks::from_u64(xs[j] as u64); columns[1][j] = ys[j]; }
+            }
+            AuxRole::LookupMultiplicity => {
+                if table_len != len { return None; }
+                for &x in xs { columns[0][x as usize] += Goldilocks::ONE; }
+            }
+            _ => return None,
+        }
+        let vars = count.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
+        let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+        prepared.push(PreparedAux { descriptor: AuxDescriptor { op_index, role, len, arity, columns: count, commitment }, columns, prover_data, protocol, whir });
+    }
+    Some(prepared)
+}
+
+fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[AuxDescriptor]) -> bool {
+    let specs = match projection_aux_specs(ops) { Some(v) => v, None => return false };
+    let mut all: Vec<_> = specs.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ProjectionBits, len, arity, cols)).collect();
+    match scale_aux_specs(ops, model) {
+        Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ScaleRemainder, len, arity, cols))),
+        None => return false,
+    };
+    match lookup_aux_specs(ops, model) { Some(v) => all.extend(v), None => return false };
+    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::LookupPairs => 2, AuxRole::LookupMultiplicity => 3 }));
+    aux.len() == all.len() && aux.iter().zip(all).all(|(a, (i, role, len, arity, cols))|
+        a.op_index == i && a.role == role && a.len == len && a.arity == arity && a.columns == cols)
+}
+
+/// Bit commitments are auxiliary witnesses, not committed activation tensors.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReverseReluProof {
+    arity: usize,
+    bit_commitment: zkie_core::pcs::whir::Commitment,
+    output: VirtualProof,
+    range: VirtualProof,
+    bit_opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+}
+
+const RELU_BITS: usize = 23;
+const RELU_BOUND: i64 = 1 << 22;
+
+fn relu_range_terms(gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    let mut terms = Vec::new();
+    let mut power = Goldilocks::ONE;
+    for j in 0..RELU_BITS {
+        terms.push((power, vec![0, j + 2, j + 2]));
+        terms.push((neg * power, vec![0, j + 2]));
+        power *= gamma;
+    }
+    terms.push((power, vec![0, 1]));
+    terms.push((power * Goldilocks::from_u64(RELU_BOUND as u64), vec![0]));
+    for j in 0..RELU_BITS {
+        terms.push((neg * power * Goldilocks::from_u64(1u64 << j), vec![0, j + 2]));
+    }
+    terms
+}
+
+fn unpad_relu_claim(point: &[Goldilocks], value: Goldilocks, input_arity: usize)
+    -> Option<(Vec<Goldilocks>, Goldilocks)>
+{
+    if point.len() < input_arity { return None; }
+    let factor = point[input_arity..].iter().fold(Goldilocks::ONE, |a, &v| a * (Goldilocks::ONE - v));
+    if factor == Goldilocks::ZERO { return None; }
+    Some((point[..input_arity].to_vec(), value * factor.inverse()))
+}
+
+fn projection_boolean_terms(columns: usize, gamma: Goldilocks) -> Vec<(Goldilocks, Vec<usize>)> {
+    let mut power = Goldilocks::ONE;
+    let neg = Goldilocks::ZERO - Goldilocks::ONE;
+    let mut terms = Vec::new();
+    for j in 0..columns {
+        terms.push((power, vec![0, j + 1, j + 1]));
+        terms.push((neg * power, vec![0, j + 1]));
+        power *= gamma;
+    }
+    terms
+}
+
+fn open_aux(aux: PreparedAux, idxs: &[usize], points: &[Vec<Goldilocks>], values: &[Goldilocks])
+    -> Option<zkie_core::pcs::batch_open::BatchOpeningProof>
+{
+    let tensors: Vec<Vec<Goldilocks>> = idxs.iter().map(|&j| aux.columns[j].clone()).collect();
+    let ctx = zkie_core::pcs::committed::BatchCtx { commitment: aux.descriptor.commitment, prover_data: aux.prover_data, protocol: aux.protocol, whir: aux.whir, num_tables: aux.descriptor.columns };
+    zkie_core::pcs::batch_open::prove_batch_open_committed_owned(ctx, idxs, &tensors, points, values).ok()
+}
+
+fn verify_aux_open(aux: &AuxDescriptor, idxs: &[usize], points: &[Vec<Goldilocks>], values: &[Goldilocks], proof: &zkie_core::pcs::batch_open::BatchOpeningProof) -> bool {
+    let padded = match 1usize.checked_shl(aux.arity as u32) { Some(v) => v, None => return false };
+    let vars = match aux.columns.checked_mul(padded).and_then(usize::checked_next_power_of_two) { Some(v) => v.trailing_zeros() as usize, None => return false };
+    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
+    let whir = zkie_core::pcs::whir::Whir::with_params(vars, 90, pow);
+    let protocol = whir.batch_opening_protocol(aux.columns, aux.arity);
+    zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &aux.commitment, &protocol, aux.columns, idxs, points, values, proof)
+}
+
+fn lookup_index_eval(point: &[Goldilocks]) -> Goldilocks {
+    point.iter().enumerate().fold(Goldilocks::ZERO, |v, (j, &p)| v + Goldilocks::from_u64(1u64 << j) * p)
+}
+
+fn lookup_prefix_eval(len: usize, point: &[Goldilocks]) -> Goldilocks {
+    if point.len() >= usize::BITS as usize { return Goldilocks::ZERO; }
+    if len >= (1usize << point.len()) { return Goldilocks::ONE; }
+    let mut equal = Goldilocks::ONE;
+    let mut less = Goldilocks::ZERO;
+    for j in (0..point.len()).rev() {
+        if ((len >> j) & 1) != 0 {
+            less += equal * (Goldilocks::ONE - point[j]);
+            equal *= point[j];
+        } else {
+            equal *= Goldilocks::ONE - point[j];
+        }
+    }
+    less
+}
+
+fn prove_reverse_lookup(store: &Store, op: &Op, point: &[Goldilocks], value: Goldilocks,
+    pairs: PreparedAux, multiplicity: PreparedAux, model: &TrustedModelManifest, transcript: &mut Transcript)
+    -> Option<(ReverseLookupProof, EvalClaim)>
+{
+    let (idx, out, table_id) = match op { Op::Lookup { idx, out, table } => (*idx, *out, *table), _ => return None };
+    let xs = store.idx.get(idx)?;
+    let ys = store.get(out);
+    if point.len() != pairs.descriptor.len.trailing_zeros() as usize { return None; }
+    let mut output_point = point.to_vec(); output_point.resize(pairs.descriptor.arity, Goldilocks::ZERO);
+    let output_index = mle::eval(&pairs.columns[0], &output_point);
+    if mle::eval(&pairs.columns[1], &output_point) != value { return None; }
+    transcript.absorb_field(output_index);
+    let alpha = transcript.field();
+    let beta = transcript.field();
+    let (witness, _, _, _, _) = prove_lookup_witness_batch_columns(&[xs.as_slice()], &[ys], alpha, beta, transcript);
+    let table_values = pad_lookup_table(store.get(table_id));
+    let m: Vec<u64> = multiplicity.columns[0].iter().map(|&v| to_i64(v) as u64).collect();
+    let table = prove_lookup_table(&m, &table_values, alpha, beta, transcript);
+    let (w_num_point, w_num, w_den_point, w_den) = fractional_leaf(&witness);
+    let (t_num_point, t_num, t_den_point, t_den) = fractional_leaf(&table);
+    if w_num != lookup_prefix_eval(xs.len(), &w_num_point) { return None; }
+    let witness_index = mle::eval(&pairs.columns[0], &w_den_point);
+    let witness_value = mle::eval(&pairs.columns[1], &w_den_point);
+    let mult_eval = mle::eval(&multiplicity.columns[0], &t_num_point);
+    let table_eval = mle::eval(&table_values, &t_den_point);
+    if w_den != alpha + witness_index + beta * witness_value || t_num != mult_eval
+        || t_den != alpha + lookup_index_eval(&t_den_point) + beta * table_eval { return None; }
+    transcript.absorb_fields(&[witness_index, witness_value, mult_eval, table_eval]);
+    let q = transcript.field_vec(multiplicity.descriptor.arity);
+    let eq = mle::eq_evals(&q);
+    let mut padding_mask = vec![Goldilocks::ZERO; multiplicity.columns[0].len()];
+    for v in padding_mask.iter_mut().skip(multiplicity.descriptor.len) { *v = Goldilocks::ONE; }
+    let padding_terms = vec![(Goldilocks::ONE, vec![0, 1, 2])];
+    let (padding, padding_point) = prove_virtual(&[&eq, &multiplicity.columns[0], &padding_mask], &padding_terms, Goldilocks::ZERO, transcript);
+    let padding_value = padding.final_evals[1];
+    let pair_idxs = [0, 1, 0, 1];
+    let pair_points = vec![output_point.clone(), output_point.clone(), w_den_point.clone(), w_den_point];
+    let pair_values = [output_index, value, witness_index, witness_value];
+    let pairs_opening = open_aux(pairs, &pair_idxs, &pair_points, &pair_values)?;
+    let multiplicity_opening = open_aux(multiplicity, &[0, 0], &[t_num_point, padding_point], &[mult_eval, padding_value])?;
+    let table_opening = if model.identity_tables.contains_key(&table_id) {
+        if table_eval != lookup_index_eval(&t_den_point) { return None; }
+        None
+    } else {
+        let arity = table_values.len().trailing_zeros() as usize;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, 90);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let committed = zkie_core::pcs::committed::commit(&whir, &table_values);
+        if bincode::serialize(model.lookup_roots.get(&table_id)?).ok()? != bincode::serialize(&committed.commitment).ok()? { return None; }
+        let (opening, opened) = whir.open(committed.prover_data, &committed.protocol, &t_den_point);
+        if opened != table_eval { return None; }
+        Some(opening)
+    };
+    let claim = EvalClaim { tensor_id: TensorKey::Index(idx).encoded()?, point: point.to_vec(), value: output_index };
+    Some((ReverseLookupProof { witness, table, output_index, witness_index, witness_value, multiplicity: mult_eval, table_value: table_eval, padding, pairs_opening, multiplicity_opening, table_opening }, claim))
+}
+
+fn verify_reverse_lookup(op: &Op, point: &[Goldilocks], value: Goldilocks, pairs: &AuxDescriptor,
+    multiplicity: &AuxDescriptor, model: &TrustedModelManifest, proof: &ReverseLookupProof,
+    transcript: &mut Transcript) -> Option<EvalClaim>
+{
+    let (idx, table_id) = match op { Op::Lookup { idx, table, .. } => (*idx, *table), _ => return None };
+    if point.len() != pairs.len.trailing_zeros() as usize { return None; }
+    transcript.absorb_field(proof.output_index);
+    let alpha = transcript.field();
+    let beta = transcript.field();
+    let witness = verify_fractional_chain_core(&proof.witness, pairs.arity, transcript)?;
+    let table = verify_fractional_chain_core(&proof.table, multiplicity.arity, transcript)?;
+    if witness.final_den == Goldilocks::ZERO || table.final_den == Goldilocks::ZERO
+        || witness.final_num * table.final_den != table.final_num * witness.final_den
+        || witness.num_leaf != lookup_prefix_eval(pairs.len, &witness.q_num)
+        || witness.den_leaf != alpha + proof.witness_index + beta * proof.witness_value
+        || table.num_leaf != proof.multiplicity
+        || table.den_leaf != alpha + lookup_index_eval(&table.q_den) + beta * proof.table_value { return None; }
+    transcript.absorb_fields(&[proof.witness_index, proof.witness_value, proof.multiplicity, proof.table_value]);
+    if proof.padding.final_evals.len() != 3 { return None; }
+    let q = transcript.field_vec(multiplicity.arity);
+    let padding_terms = vec![(Goldilocks::ONE, vec![0, 1, 2])];
+    let (ok, padding_point, padding_final) = verify_virtual(&proof.padding, &padding_terms, Goldilocks::ZERO, multiplicity.arity, transcript);
+    if !ok || padding_final != mle::eq_poly(&q, &padding_point) * proof.padding.final_evals[1]
+        * (Goldilocks::ONE - lookup_prefix_eval(multiplicity.len, &padding_point)) { return None; }
+    let mut output_point = point.to_vec(); output_point.resize(pairs.arity, Goldilocks::ZERO);
+    let points = vec![output_point.clone(), output_point, witness.q_den.clone(), witness.q_den];
+    let values = [proof.output_index, value, proof.witness_index, proof.witness_value];
+    if !verify_aux_open(pairs, &[0, 1, 0, 1], &points, &values, &proof.pairs_opening)
+        || !verify_aux_open(multiplicity, &[0, 0], &[table.q_num, padding_point], &[proof.multiplicity, proof.padding.final_evals[1]], &proof.multiplicity_opening) { return None; }
+    if let Some(&len) = model.identity_tables.get(&table_id) {
+        if model.lookup_lengths.get(&table_id) != Some(&len) || proof.table_opening.is_some()
+            || proof.table_value != lookup_index_eval(&table.q_den) { return None; }
+    } else {
+        let root = model.lookup_roots.get(&table_id)?;
+        let opening = proof.table_opening.as_ref()?;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(multiplicity.arity, 90);
+        let whir = zkie_core::pcs::whir::Whir::with_params(multiplicity.arity, 90, pow);
+        let protocol = whir.opening_protocol(multiplicity.arity, 1);
+        if whir.verify(root, opening, &protocol, &table.q_den).ok() != Some(proof.table_value) { return None; }
+    }
+    Some(EvalClaim { tensor_id: TensorKey::Index(idx).encoded()?, point: point.to_vec(), value: proof.output_index })
+}
+
+fn prove_reverse_projection(store: &Store, op: &Op, point: &[Goldilocks], value: Goldilocks,
+    aux: PreparedAux, transcript: &mut Transcript) -> Option<(ReverseProjectionProof, Vec<EvalClaim>)>
+{
+    let (x, w, bias, m, k, n, shift) = match op {
+        Op::Projection { x, w, bias, m, k, n, shift, .. } => (*x, *w, *bias, *m, *k, *n, *shift),
+        _ => return None,
+    };
+    if !m.is_power_of_two() || !k.is_power_of_two() || !n.is_power_of_two() { return None; }
+    let nl = n.trailing_zeros() as usize;
+    if point.len() != nl + m.trailing_zeros() as usize { return None; }
+    let (v, u) = point.split_at(nl);
+    let mut padded_point = point.to_vec(); padded_point.resize(aux.descriptor.arity, Goldilocks::ZERO);
+    let bit_evals: Vec<_> = aux.columns.iter().map(|c| mle::eval(c, &padded_point)).collect();
+    let remainder = bit_evals.iter().enumerate().fold(Goldilocks::ZERO, |acc, (j, &b)| acc + Goldilocks::from_u64(1u64 << j) * b);
+    let bias_eval = mle::eval(store.get(bias), point);
+    transcript.absorb_field(bias_eval);
+    transcript.absorb_fields(&bit_evals);
+    let h = crate::par::mm_par_fixed(store.get(x), store.materialize(w).as_ref(), m, k, n);
+    let at = transpose(store.get(x), m, k);
+    let (matmul, ch) = matmul_prove(&at, store.materialize(w).as_ref(), &h, m, k, n, u, v, transcript);
+    let half = Goldilocks::from_u64(1u64 << (shift - 1));
+    let scale = Goldilocks::from_u64(1u64 << shift);
+    if matmul.claimed - remainder + half != scale * (value - bias_eval) { return None; }
+    transcript.absorb_field(matmul.sumcheck.f_eval);
+    transcript.absorb_field(matmul.sumcheck.h_eval);
+    let q = transcript.field_vec(aux.descriptor.arity);
+    let gamma = transcript.field();
+    let eq = mle::eq_evals(&q);
+    let mut mles: Vec<&[Goldilocks]> = vec![&eq];
+    mles.extend(aux.columns.iter().map(Vec::as_slice));
+    let terms = projection_boolean_terms(aux.descriptor.columns, gamma);
+    let (booleanity, bool_point) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
+    let mut idxs: Vec<usize> = (0..aux.descriptor.columns).collect();
+    idxs.extend(0..aux.descriptor.columns);
+    let mut points = vec![padded_point; aux.descriptor.columns];
+    points.extend((0..aux.descriptor.columns).map(|_| bool_point.clone()));
+    let mut values = bit_evals.clone(); values.extend_from_slice(&booleanity.final_evals[1..]);
+    let tensors: Vec<Vec<Goldilocks>> = idxs.iter().map(|&i| aux.columns[i].clone()).collect();
+    let ctx = zkie_core::pcs::committed::BatchCtx { commitment: aux.descriptor.commitment.clone(), prover_data: aux.prover_data, protocol: aux.protocol, whir: aux.whir, num_tables: aux.descriptor.columns };
+    let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(ctx, &idxs, &tensors, &points, &values).ok()?;
+    let mut xp = ch.clone(); xp.extend_from_slice(u);
+    let mut wp = v.to_vec(); wp.extend_from_slice(&ch);
+    let leaves = vec![EvalClaim { tensor_id: x, point: xp, value: matmul.sumcheck.f_eval }, EvalClaim { tensor_id: w, point: wp, value: matmul.sumcheck.h_eval }, EvalClaim { tensor_id: bias, point: point.to_vec(), value: bias_eval }];
+    Some((ReverseProjectionProof { matmul, bias: bias_eval, remainder_bits: bit_evals, booleanity, opening }, leaves))
+}
+
+fn verify_reverse_projection(op: &Op, point: &[Goldilocks], value: Goldilocks, aux: &AuxDescriptor,
+    proof: &ReverseProjectionProof, transcript: &mut Transcript) -> Option<Vec<EvalClaim>>
+{
+    let (x, w, bias, m, k, n, shift) = match op {
+        Op::Projection { x, w, bias, m, k, n, shift, .. } => (*x, *w, *bias, *m, *k, *n, *shift),
+        _ => return None,
+    };
+    if !m.is_power_of_two() || !k.is_power_of_two() || !n.is_power_of_two()
+        || proof.remainder_bits.len() != aux.columns || proof.booleanity.final_evals.len() != aux.columns + 1 { return None; }
+    let nl = n.trailing_zeros() as usize;
+    if point.len() != nl + m.trailing_zeros() as usize { return None; }
+    let (v, u) = point.split_at(nl);
+    let remainder = proof.remainder_bits.iter().enumerate().fold(Goldilocks::ZERO, |acc, (j, &b)| acc + Goldilocks::from_u64(1u64 << j) * b);
+    transcript.absorb_field(proof.bias);
+    transcript.absorb_fields(&proof.remainder_bits);
+    let (ok, ch) = matmul_verify(&proof.matmul, k.trailing_zeros() as usize, transcript);
+    if !ok || proof.matmul.claimed - remainder + Goldilocks::from_u64(1u64 << (shift - 1)) != Goldilocks::from_u64(1u64 << shift) * (value - proof.bias) { return None; }
+    transcript.absorb_field(proof.matmul.sumcheck.f_eval);
+    transcript.absorb_field(proof.matmul.sumcheck.h_eval);
+    let q = transcript.field_vec(aux.arity);
+    let gamma = transcript.field();
+    let terms = projection_boolean_terms(aux.columns, gamma);
+    let (ok, bool_point, final_value) = verify_virtual(&proof.booleanity, &terms, Goldilocks::ZERO, aux.arity, transcript);
+    if !ok { return None; }
+    let mut evals = proof.booleanity.final_evals.clone(); evals[0] = mle::eq_poly(&q, &bool_point);
+    if final_value != virtual_eval(&terms, &evals) { return None; }
+    let padded = 1usize.checked_shl(aux.arity as u32)?;
+    let vars = aux.columns.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
+    let whir = zkie_core::pcs::whir::Whir::with_params(vars, 90, pow);
+    let protocol = whir.batch_opening_protocol(aux.columns, aux.arity);
+    let mut padded_point = point.to_vec(); padded_point.resize(aux.arity, Goldilocks::ZERO);
+    let mut idxs: Vec<usize> = (0..aux.columns).collect(); idxs.extend(0..aux.columns);
+    let mut points = vec![padded_point; aux.columns]; points.extend((0..aux.columns).map(|_| bool_point.clone()));
+    let mut values = proof.remainder_bits.clone(); values.extend_from_slice(&proof.booleanity.final_evals[1..]);
+    if !zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &aux.commitment, &protocol, aux.columns, &idxs, &points, &values, &proof.opening) { return None; }
+    let mut xp = ch.clone(); xp.extend_from_slice(u);
+    let mut wp = v.to_vec(); wp.extend_from_slice(&ch);
+    Some(vec![EvalClaim { tensor_id: x, point: xp, value: proof.matmul.sumcheck.f_eval }, EvalClaim { tensor_id: w, point: wp, value: proof.matmul.sumcheck.h_eval }, EvalClaim { tensor_id: bias, point: point.to_vec(), value: proof.bias }])
+}
+
+fn prove_reverse_relu(input: &[Goldilocks], point: &[Goldilocks], value: Goldilocks, transcript: &mut Transcript)
+    -> Option<(ReverseReluProof, Vec<(Vec<Goldilocks>, Goldilocks)>)>
+{
+    if !input.len().is_power_of_two() || point.len() != input.len().trailing_zeros() as usize { return None; }
+    let input_arity = point.len();
+    let arity = input_arity.max(5);
+    let len = 1usize.checked_shl(arity as u32)?;
+    let mut x = input.to_vec(); x.resize(len, Goldilocks::ZERO);
+    let mut output_values = Vec::with_capacity(input.len());
+    let mut bits = vec![vec![Goldilocks::ZERO; len]; RELU_BITS];
+    for (i, &v) in x.iter().enumerate() {
+        let signed = to_i64(v);
+        if !(-RELU_BOUND..RELU_BOUND).contains(&signed) { return None; }
+        if i < input.len() { output_values.push(from_i64(signed.max(0))); }
+        let encoded = (signed + RELU_BOUND) as u64;
+        for j in 0..RELU_BITS { bits[j][i] = Goldilocks::from_u64((encoded >> j) & 1); }
+    }
+    if mle::eval(&output_values, point) != value { return None; }
+    let num_vars = (RELU_BITS * len).next_power_of_two().trailing_zeros() as usize;
+    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, 90);
+    let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+    let refs: Vec<&[Goldilocks]> = bits.iter().map(Vec::as_slice).collect();
+    let (commitment, prover_data, protocol, batch_whir) = whir.commit_batch(&refs);
+    transcript.absorb(b"zkie-relu-bits-v1");
+    transcript.absorb(&bincode::serialize(&commitment).ok()?);
+    let mut padded_point = point.to_vec(); padded_point.resize(arity, Goldilocks::ZERO);
+    let eq = mle::eq_evals(&padded_point);
+    let terms_out = vec![(Goldilocks::ONE, vec![0, 1, 2])];
+    let (output, out_point) = prove_virtual(&[&eq, &x, &bits[RELU_BITS - 1]], &terms_out, value, transcript);
+    transcript.absorb_fields(&output.final_evals);
+    let q = transcript.field_vec(arity);
+    let gamma = transcript.field();
+    let eq_range = mle::eq_evals(&q);
+    let mut mles: Vec<&[Goldilocks]> = vec![&eq_range, &x];
+    mles.extend(bits.iter().map(Vec::as_slice));
+    let terms_range = relu_range_terms(gamma);
+    let (range, range_point) = prove_virtual(&mles, &terms_range, Goldilocks::ZERO, transcript);
+    let mut idxs = vec![RELU_BITS - 1];
+    idxs.extend(0..RELU_BITS);
+    let mut points = vec![out_point.clone()];
+    points.extend((0..RELU_BITS).map(|_| range_point.clone()));
+    let mut values = vec![output.final_evals[2]];
+    values.extend_from_slice(&range.final_evals[2..]);
+    let tensors: Vec<Vec<Goldilocks>> = idxs.iter().map(|&j| bits[j].clone()).collect();
+    let ctx = zkie_core::pcs::committed::BatchCtx { commitment: commitment.clone(), prover_data, protocol, whir: batch_whir, num_tables: RELU_BITS };
+    let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(ctx, &idxs, &tensors, &points, &values).ok()?;
+    let claims = vec![unpad_relu_claim(&out_point, output.final_evals[1], input_arity)?, unpad_relu_claim(&range_point, range.final_evals[1], input_arity)?];
+    Some((ReverseReluProof { arity, bit_commitment: commitment, output, range, bit_opening: opening }, claims))
+}
+
+fn verify_reverse_relu(proof: &ReverseReluProof, point: &[Goldilocks], value: Goldilocks, transcript: &mut Transcript)
+    -> Option<Vec<(Vec<Goldilocks>, Goldilocks)>>
+{
+    let input_arity = point.len();
+    if proof.arity != input_arity.max(5) || proof.arity >= usize::BITS as usize
+        || proof.output.final_evals.len() != 3 || proof.range.final_evals.len() != RELU_BITS + 2 { return None; }
+    let len = 1usize.checked_shl(proof.arity as u32)?;
+    transcript.absorb(b"zkie-relu-bits-v1");
+    transcript.absorb(&bincode::serialize(&proof.bit_commitment).ok()?);
+    let mut padded_point = point.to_vec(); padded_point.resize(proof.arity, Goldilocks::ZERO);
+    let terms_out = vec![(Goldilocks::ONE, vec![0, 1, 2])];
+    let (ok, out_point, final_out) = verify_virtual(&proof.output, &terms_out, value, proof.arity, transcript);
+    if !ok || final_out != mle::eq_poly(&padded_point, &out_point) * proof.output.final_evals[1] * proof.output.final_evals[2] { return None; }
+    transcript.absorb_fields(&proof.output.final_evals);
+    let q = transcript.field_vec(proof.arity);
+    let gamma = transcript.field();
+    let terms_range = relu_range_terms(gamma);
+    let (ok, range_point, final_range) = verify_virtual(&proof.range, &terms_range, Goldilocks::ZERO, proof.arity, transcript);
+    if !ok { return None; }
+    let mut evals = proof.range.final_evals.clone();
+    evals[0] = mle::eq_poly(&q, &range_point);
+    if final_range != virtual_eval(&terms_range, &evals) { return None; }
+    let num_vars = RELU_BITS.checked_mul(len)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(num_vars, 90);
+    let whir = zkie_core::pcs::whir::Whir::with_params(num_vars, 90, pow);
+    let protocol = whir.batch_opening_protocol(RELU_BITS, proof.arity);
+    let mut idxs = vec![RELU_BITS - 1]; idxs.extend(0..RELU_BITS);
+    let mut points = vec![out_point.clone()]; points.extend((0..RELU_BITS).map(|_| range_point.clone()));
+    let mut values = vec![proof.output.final_evals[2]]; values.extend_from_slice(&proof.range.final_evals[2..]);
+    if !zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &proof.bit_commitment, &protocol, RELU_BITS, &idxs, &points, &values, &proof.bit_opening) { return None; }
+    Some(vec![unpad_relu_claim(&out_point, proof.output.final_evals[1], input_arity)?, unpad_relu_claim(&range_point, proof.range.final_evals[1], input_arity)?])
+}
+
+fn absorb_reverse_claim(transcript: &mut Transcript, id: T, point: &[Goldilocks], value: Goldilocks) {
+    transcript.absorb(b"zkie-reverse-claim-v1");
+    transcript.absorb_u64(id as u64);
+    transcript.absorb_u64(point.len() as u64);
+    transcript.absorb_fields(point);
+    transcript.absorb_field(value);
+}
+
+fn reverse_setup(ops: &[Op], seeds: &[EvalClaim], transcript: &mut Transcript)
+    -> Option<std::collections::BTreeMap<T, Vec<(Vec<Goldilocks>, Goldilocks)>>>
+{
+    let mut producers = std::collections::BTreeMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        let (_, outputs) = reverse_op_io(op)?;
+        if outputs.len() != 1 { return None; }
+        let out = outputs[0];
+        if producers.insert(out, i).is_some() { return None; }
+    }
+    for (i, op) in ops.iter().enumerate() {
+        if reverse_op_io(op)?.0.iter().any(|id| producers.get(id).is_some_and(|&j| j >= i)) { return None; }
+    }
+    transcript.absorb(b"zkie-reverse-dag-v1");
+    absorb_statement(transcript, ops, ops.len());
+    transcript.absorb_u64(seeds.len() as u64);
+    let mut claims = std::collections::BTreeMap::<T, Vec<(Vec<Goldilocks>, Goldilocks)>>::new();
+    for c in seeds {
+        transcript.absorb_u64(c.tensor_id as u64);
+        transcript.absorb_u64(c.point.len() as u64);
+        transcript.absorb_fields(&c.point);
+        transcript.absorb_field(c.value);
+        claims.entry(c.tensor_id).or_default().push((c.point.clone(), c.value));
+    }
+    Some(claims)
+}
+
+pub fn prove_reverse_dag(store: &Store, ops: &[Op], seeds: &[EvalClaim], transcript: &mut Transcript) -> Option<ReverseDagProof> {
+    prove_reverse_dag_inner(store, ops, seeds, transcript, &mut std::collections::BTreeMap::new(), None)
+}
+
+fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], transcript: &mut Transcript, aux: &mut std::collections::BTreeMap<(usize, AuxRole), PreparedAux>, model: Option<&TrustedModelManifest>) -> Option<ReverseDagProof> {
+    let mut claims = reverse_setup(ops, seeds, transcript)?;
+    let mut steps = Vec::new();
+    for (op_index, op) in ops.iter().enumerate().rev() {
+        let id = *reverse_op_io(op)?.1.first()?;
+        let cs = match claims.remove(&id) { Some(c) => c, None => continue };
+        transcript.absorb_u64(id as u64);
+        let (merge, point, value) = if cs.len() == 1 { (None, cs[0].0.clone(), cs[0].1) } else {
+            let (p, v) = prove_same_poly(reverse_tensor_values(store, id)?.as_ref(), &cs, transcript);
+            let point = p.merged_point.clone();
+            (Some(p), point, v)
+        };
+        absorb_reverse_claim(transcript, id, &point, value);
+        let reduction = match op {
+            Op::Transpose { x, m, k, .. } => {
+                if !m.is_power_of_two() || !k.is_power_of_two() { return None; }
+                let ml = m.trailing_zeros() as usize;
+                if point.len() != ml + k.trailing_zeros() as usize { return None; }
+                let mut input = point[ml..].to_vec(); input.extend_from_slice(&point[..ml]);
+                absorb_reverse_claim(transcript, *x, &input, value);
+                claims.entry(*x).or_default().push((input, value));
+                ReverseReduction::Transpose
+            }
+            Op::GeluIndex { x, offset, table_len, .. } => {
+                let (proof, incoming) = prove_reverse_gelu_index(store.get(*x), *offset, *table_len, &point, value, transcript)?;
+                for (p, v) in incoming {
+                    absorb_reverse_claim(transcript, *x, &p, v);
+                    claims.entry(*x).or_default().push((p, v));
+                }
+                ReverseReduction::GeluIndex { proof }
+            }
+            Op::Lookup { .. } => {
+                let (proof, c) = prove_reverse_lookup(store, op, &point, value,
+                    aux.remove(&(op_index, AuxRole::LookupPairs))?,
+                    aux.remove(&(op_index, AuxRole::LookupMultiplicity))?, model?, transcript)?;
+                absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                ReverseReduction::Lookup { proof }
+            }
+            Op::Projection { .. } => {
+                let (proof, incoming) = prove_reverse_projection(store, op, &point, value, aux.remove(&(op_index, AuxRole::ProjectionBits))?, transcript)?;
+                for c in incoming {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
+                ReverseReduction::Projection { proof }
+            }
+            Op::Scale { .. } => {
+                let prepared = match op {
+                    Op::Scale { shift: 0, .. } => None,
+                    _ => Some(aux.remove(&(op_index, AuxRole::ScaleRemainder))?),
+                };
+                let (proof, c) = prove_reverse_scale(store, op, &point, value, prepared, transcript)?;
+                absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                ReverseReduction::Scale { proof }
+            }
+            Op::Relu { x, .. } => {
+                let (proof, incoming) = prove_reverse_relu(store.get(*x), &point, value, transcript)?;
+                for (p, v) in incoming {
+                    absorb_reverse_claim(transcript, *x, &p, v);
+                    claims.entry(*x).or_default().push((p, v));
+                }
+                ReverseReduction::Relu { proof }
+            }
+            Op::Add { a, b, .. } => {
+                let av = mle::eval(store.get(*a), &point);
+                let bv = mle::eval(store.get(*b), &point);
+                if av + bv != value { return None; }
+                absorb_reverse_claim(transcript, *a, &point, av);
+                absorb_reverse_claim(transcript, *b, &point, bv);
+                claims.entry(*a).or_default().push((point.clone(), av));
+                claims.entry(*b).or_default().push((point, bv));
+                ReverseReduction::Add { a: av, b: bv }
+            }
+            Op::MatMul { a, b, m, k, n, .. } => {
+                if !m.is_power_of_two() || !k.is_power_of_two() || !n.is_power_of_two() { return None; }
+                let nl = n.trailing_zeros() as usize;
+                if point.len() != nl + m.trailing_zeros() as usize { return None; }
+                let (v, u) = point.split_at(nl);
+                let at = transpose(store.get(*a), *m, *k);
+                let bv = store.materialize(*b);
+                let (proof, ch) = matmul_prove(&at, bv.as_ref(), store.get(id), *m, *k, *n, u, v, transcript);
+                if proof.claimed != value { return None; }
+                let mut ap = ch.clone(); ap.extend_from_slice(u);
+                let mut bp = v.to_vec(); bp.extend_from_slice(&ch);
+                absorb_reverse_claim(transcript, *a, &ap, proof.sumcheck.f_eval);
+                absorb_reverse_claim(transcript, *b, &bp, proof.sumcheck.h_eval);
+                claims.entry(*a).or_default().push((ap, proof.sumcheck.f_eval));
+                claims.entry(*b).or_default().push((bp, proof.sumcheck.h_eval));
+                ReverseReduction::MatMul { proof }
+            }
+            _ => return None,
+        };
+        steps.push(ReverseStep { tensor_id: id, merge, reduction });
+    }
+    Some(ReverseDagProof { steps })
+}
+
+pub fn verify_reverse_dag(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagProof, transcript: &mut Transcript) -> Option<Vec<EvalClaim>> {
+    verify_reverse_dag_inner(ops, seeds, proof, transcript, &[], None)
+}
+
+fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagProof, transcript: &mut Transcript, aux: &[AuxDescriptor], model: Option<&TrustedModelManifest>) -> Option<Vec<EvalClaim>> {
+    let mut claims = reverse_setup(ops, seeds, transcript)?;
+    let mut steps = proof.steps.iter();
+    for (op_index, op) in ops.iter().enumerate().rev() {
+        let id = *reverse_op_io(op)?.1.first()?;
+        let cs = match claims.remove(&id) { Some(c) => c, None => continue };
+        let step = steps.next()?;
+        if step.tensor_id != id { return None; }
+        transcript.absorb_u64(id as u64);
+        let (point, value) = if cs.len() == 1 {
+            if step.merge.is_some() { return None; }
+            cs[0].clone()
+        } else { verify_same_poly(step.merge.as_ref()?, &cs, transcript)? };
+        absorb_reverse_claim(transcript, id, &point, value);
+        match (op, &step.reduction) {
+            (Op::Transpose { x, m, k, .. }, ReverseReduction::Transpose) => {
+                if !m.is_power_of_two() || !k.is_power_of_two() { return None; }
+                let ml = m.trailing_zeros() as usize;
+                if point.len() != ml + k.trailing_zeros() as usize { return None; }
+                let mut input = point[ml..].to_vec(); input.extend_from_slice(&point[..ml]);
+                absorb_reverse_claim(transcript, *x, &input, value);
+                claims.entry(*x).or_default().push((input, value));
+            }
+            (Op::GeluIndex { x, offset, table_len, .. }, ReverseReduction::GeluIndex { proof }) => {
+                for (p, v) in verify_reverse_gelu_index(*offset, *table_len, &point, value, proof, transcript)? {
+                    absorb_reverse_claim(transcript, *x, &p, v);
+                    claims.entry(*x).or_default().push((p, v));
+                }
+            }
+            (Op::Lookup { .. }, ReverseReduction::Lookup { proof }) => {
+                let pairs = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::LookupPairs)?;
+                let multiplicity = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::LookupMultiplicity)?;
+                let c = verify_reverse_lookup(op, &point, value, pairs, multiplicity, model?, proof, transcript)?;
+                absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+            }
+            (Op::Projection { .. }, ReverseReduction::Projection { proof }) => {
+                let descriptor = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::ProjectionBits)?;
+                for c in verify_reverse_projection(op, &point, value, descriptor, proof, transcript)? {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
+            }
+            (Op::Scale { .. }, ReverseReduction::Scale { proof }) => {
+                let descriptor = if matches!(op, Op::Scale { shift: 0, .. }) { None } else {
+                    Some(aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::ScaleRemainder)?)
+                };
+                let c = verify_reverse_scale(op, &point, value, descriptor, proof, transcript)?;
+                absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+            }
+            (Op::Relu { x, .. }, ReverseReduction::Relu { proof }) => {
+                for (p, v) in verify_reverse_relu(proof, &point, value, transcript)? {
+                    absorb_reverse_claim(transcript, *x, &p, v);
+                    claims.entry(*x).or_default().push((p, v));
+                }
+            }
+            (Op::Add { a, b, .. }, ReverseReduction::Add { a: av, b: bv }) => {
+                if *av + *bv != value { return None; }
+                absorb_reverse_claim(transcript, *a, &point, *av);
+                absorb_reverse_claim(transcript, *b, &point, *bv);
+                claims.entry(*a).or_default().push((point.clone(), *av));
+                claims.entry(*b).or_default().push((point, *bv));
+            }
+            (Op::MatMul { a, b, m, k, n, .. }, ReverseReduction::MatMul { proof }) => {
+                if !m.is_power_of_two() || !k.is_power_of_two() || !n.is_power_of_two() { return None; }
+                let nl = n.trailing_zeros() as usize;
+                if point.len() != nl + m.trailing_zeros() as usize || proof.claimed != value { return None; }
+                let (v, u) = point.split_at(nl);
+                let (ok, ch) = matmul_verify(proof, k.trailing_zeros() as usize, transcript);
+                if !ok { return None; }
+                let mut ap = ch.clone(); ap.extend_from_slice(u);
+                let mut bp = v.to_vec(); bp.extend_from_slice(&ch);
+                absorb_reverse_claim(transcript, *a, &ap, proof.sumcheck.f_eval);
+                absorb_reverse_claim(transcript, *b, &bp, proof.sumcheck.h_eval);
+                claims.entry(*a).or_default().push((ap, proof.sumcheck.f_eval));
+                claims.entry(*b).or_default().push((bp, proof.sumcheck.h_eval));
+            }
+            _ => return None,
+        }
+    }
+    if steps.next().is_some() { return None; }
+    Some(claims.into_iter().flat_map(|(tensor_id, cs)| cs.into_iter().map(move |(point, value)| EvalClaim { tensor_id, point, value })).collect())
+}
+
 /// Where the per-op fractional proofs (permutation / gather) run. On the
 /// plain shard path they live on the shard transcript; on the committed path
 /// they are re-proven on the committed transcripts (which bind the committed
@@ -736,7 +1756,7 @@ impl Store {
 
 /// One op primitive. `Projection` = matmul + affine + round + range check;
 /// `Add` = elementwise `c = a + b`; `Lookup` = `out[i] = table[idx[i]]`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Op {
     Transpose {
         x: T,
@@ -3621,16 +4641,11 @@ pub fn shard_ranges(op_count: usize, ops_per_shard: usize) -> Vec<(usize, usize)
 }
 
 fn absorb_statement(t: &mut Transcript, ops: &[Op], ops_per_shard: usize) {
+    t.absorb(b"zkie-full-op-graph-v1");
     t.absorb_u64(ops_per_shard as u64);
-    t.absorb_u64(ops.len() as u64);
-    for op in ops {
-        for id in op.reads() {
-            t.absorb_u64(id as u64);
-        }
-        for id in op.writes() {
-            t.absorb_u64(id as u64);
-        }
-    }
+    let encoded = bincode::serialize(ops).expect("serialize op graph");
+    t.absorb_u64(encoded.len() as u64);
+    t.absorb(&encoded);
 }
 
 pub fn prove_shard_dag(
@@ -3959,6 +4974,11 @@ fn collect_weight_tensors(ops: &[Op]) -> Vec<T> {
                     weights.insert(*w);
                 }
             }
+            Op::GatherMatMul { w, .. } => {
+                if !written.contains(w) {
+                    weights.insert(*w);
+                }
+            }
             _ => {}
         }
     }
@@ -3982,7 +5002,187 @@ pub struct CachedWeightBatch {
     pub security: usize,
     pub pow_bits: usize,
     pub table_ids: Vec<T>,
+    pub tensor_lengths: Vec<usize>,
     pub cache_path: std::path::PathBuf,
+}
+
+/// Caller-owned public model identity created from the trusted offline commit.
+/// It must be persisted and supplied independently of the incoming proof.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct TrustedModelManifest {
+    batches: Vec<TrustedWeightBatch>,
+    graph: Vec<u8>,
+    tensor_lengths: std::collections::BTreeMap<T, usize>,
+    lookup_roots: std::collections::BTreeMap<T, zkie_core::pcs::whir::Commitment>,
+    lookup_lengths: std::collections::BTreeMap<T, usize>,
+    identity_tables: std::collections::BTreeMap<T, usize>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct TrustedWeightBatch {
+    commitment: zkie_core::pcs::whir::Commitment,
+    arity: usize,
+    num_tables: usize,
+    num_vars: usize,
+    security: usize,
+    pow_bits: usize,
+    table_ids: Vec<T>,
+    tensor_lengths: Vec<usize>,
+}
+
+impl TrustedModelManifest {
+    pub fn from_offline_commitment(cached: &[CachedWeightBatch], tables: &[&[Goldilocks]], ops: &[Op]) -> Self {
+        let mut tensor_lengths = std::collections::BTreeMap::new();
+        for op in ops {
+            let ids = match reverse_op_io(op) {
+                Some((reads, writes)) => reads.into_iter().chain(writes).collect::<Vec<_>>(),
+                None => op.reads().into_iter().chain(op.writes()).collect(),
+            };
+            for id in ids {
+                if id & (1usize << (usize::BITS - 1)) != 0 { continue; }
+                if let Some(tensor) = tables.get(id) {
+                    if !tensor.is_empty() { tensor_lengths.insert(id, tensor.len()); }
+                }
+            }
+        }
+        for op in ops {
+            match op {
+                Op::MatMul { a, b, c, m, k, n } => {
+                    for (id, len) in [(*a, m.checked_mul(*k)), (*b, k.checked_mul(*n)), (*c, m.checked_mul(*n))] {
+                        let len = len.expect("tensor shape overflow");
+                        if let Some(old) = tensor_lengths.insert(id, len) { assert_eq!(old, len, "inconsistent tensor shape"); }
+                    }
+                }
+                Op::Transpose { x, out, m, k } => {
+                    let len = m.checked_mul(*k).expect("tensor shape overflow");
+                    for id in [*x, *out] {
+                        if let Some(old) = tensor_lengths.insert(id, len) { assert_eq!(old, len, "inconsistent transpose shape"); }
+                    }
+                }
+                Op::Projection { x, w, bias, out, rem, m, k, n, .. } => {
+                    for (id, len) in [(*x, m.checked_mul(*k)), (*w, k.checked_mul(*n)), (*bias, m.checked_mul(*n)), (*out, m.checked_mul(*n)), (*rem, m.checked_mul(*n))] {
+                        let len = len.expect("tensor shape overflow");
+                        if let Some(old) = tensor_lengths.insert(id, len) { assert_eq!(old, len, "inconsistent Projection shape"); }
+                    }
+                }
+                Op::Add { a, b, c } => {
+                    let len = *tensor_lengths.get(a).or_else(|| tensor_lengths.get(b)).expect("missing trusted Add input shape");
+                    for id in [*a, *b, *c] {
+                        if let Some(old) = tensor_lengths.insert(id, len) { assert_eq!(old, len, "inconsistent Add shape"); }
+                    }
+                }
+                Op::Relu { x, out } => {
+                    let len = *tensor_lengths.get(x).expect("missing trusted ReLU input shape");
+                    if let Some(old) = tensor_lengths.insert(*out, len) { assert_eq!(old, len, "inconsistent ReLU shape"); }
+                }
+                Op::Scale { x, out, .. } => {
+                    let len = *tensor_lengths.get(x).expect("missing trusted Scale input shape");
+                    if let Some(old) = tensor_lengths.insert(*out, len) { assert_eq!(old, len, "inconsistent Scale shape"); }
+                }
+                _ => {}
+            }
+        }
+        let mut table_ids = std::collections::BTreeSet::new();
+        for op in ops {
+            match op {
+                Op::Lookup { table, .. } | Op::Softmax { table, .. } => { table_ids.insert(*table); }
+                Op::Layernorm { rsqrt_table, .. } | Op::LayerNormCentered { rsqrt_table, .. } => { table_ids.insert(*rsqrt_table); }
+                Op::RmsNorm { rsqrt_table, limb_table, .. } => { table_ids.insert(*rsqrt_table); table_ids.insert(*limb_table); }
+                Op::RoPE { range_table, .. } => { table_ids.insert(*range_table); }
+                _ => {}
+            }
+            // Reverse ReLU/GeluIndex/Scale use committed bit witnesses rather
+            // than public identity tables; their ranges are proven by the
+            // precommitted booleanity constraints.
+            if !matches!(op, Op::Relu { .. } | Op::GeluIndex { .. } | Op::Scale { .. }) {
+                let resolve = |len| find_identity_table_slices(tables, len);
+                table_ids.extend(op_lookup_pushes(op, &resolve).expect("missing trusted identity table"));
+            }
+        }
+        let mut lookup_roots = std::collections::BTreeMap::new();
+        let mut lookup_lengths = std::collections::BTreeMap::new();
+        let mut identity_tables = std::collections::BTreeMap::new();
+        for id in table_ids {
+            let table = tables.get(id).expect("missing trusted lookup table");
+            assert!(!table.is_empty(), "empty trusted lookup table");
+            lookup_lengths.insert(id, table.len());
+            if is_identity_table(table) {
+                identity_tables.insert(id, table.len());
+            } else {
+                    let padded = pad_lookup_table(table);
+                    let arity = padded.len().trailing_zeros() as usize;
+                    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(arity, 90);
+                    let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+                    lookup_roots.insert(id, zkie_core::pcs::committed::commit(&whir, &padded).commitment);
+            }
+        }
+        Self { batches: cached.iter().map(|b| TrustedWeightBatch {
+            commitment: b.commitment.clone(), arity: b.arity,
+            num_tables: b.num_tables, num_vars: b.num_vars,
+            security: b.security, pow_bits: b.pow_bits,
+            table_ids: b.table_ids.clone(), tensor_lengths: b.tensor_lengths.clone(),
+        }).collect(), graph: bincode::serialize(ops).expect("serialize op graph"), tensor_lengths, lookup_roots, lookup_lengths, identity_tables }
+    }
+
+    /// Attach caller-trusted index-tensor lengths from the offline model schema.
+    /// They must never be inferred from a proof or dynamic witness.
+    pub fn with_index_shapes(mut self, shapes: &std::collections::BTreeMap<T, usize>) -> Self {
+        for (&id, &len) in shapes {
+            let key = TensorKey::Index(id).encoded().expect("index tensor ID too large");
+            assert!(len.is_power_of_two(), "invalid index shape");
+            self.tensor_lengths.insert(key, len);
+        }
+        let ops: Vec<Op> = bincode::deserialize(&self.graph).expect("trusted graph");
+        for op in &ops {
+            if let Op::Lookup { idx, out, .. } = op {
+                let key = TensorKey::Index(*idx).encoded().expect("index tensor ID too large");
+                let len = *self.tensor_lengths.get(&key).expect("missing trusted lookup index shape");
+                if let Some(old) = self.tensor_lengths.insert(*out, len) { assert_eq!(old, len, "inconsistent lookup shape"); }
+            }
+        }
+        self
+    }
+
+    fn matches_proof(&self, ops: &[Op], proof: &CommittedShardDagProof) -> bool {
+        if self.graph != bincode::serialize(ops).unwrap_or_default() || self.batches.len() != proof.weight_batches.len() { return false; }
+        let mut shapes = std::collections::BTreeMap::new();
+        let mut insert_shape = |id, shape: Option<usize>| -> bool {
+            match shape {
+                Some(n) if n > 0 => match shapes.insert(id, n) { Some(old) => old == n, None => true },
+                _ => false,
+            }
+        };
+        let weights: std::collections::BTreeSet<T> = collect_weight_tensors(ops).into_iter().collect();
+        for op in ops {
+            let ok = match op {
+                Op::MatMul { b, k, n, .. } if weights.contains(b) => insert_shape(*b, k.checked_mul(*n)),
+                Op::Projection { w, bias, m, k, n, .. } => insert_shape(*w, k.checked_mul(*n)) && insert_shape(*bias, m.checked_mul(*n)),
+                Op::Layernorm { w, b, m, d, .. } | Op::LayerNormCentered { w, b, m, d, .. } => insert_shape(*w, m.checked_mul(*d)) && insert_shape(*b, m.checked_mul(*d)),
+                Op::RmsNorm { w, m, d, .. } => insert_shape(*w, m.checked_mul(*d)),
+                Op::BatchedMatMul { w, s, k, n, .. } if weights.contains(w) => insert_shape(*w, s.checked_mul(*k).and_then(|v| v.checked_mul(*n))),
+                Op::GatherMatMul { w, n_experts, k, n, .. } if weights.contains(w) => insert_shape(*w, n_experts.checked_mul(*k).and_then(|v| v.checked_mul(*n))),
+                _ => true,
+            };
+            if !ok { return false; }
+        }
+        let mut locations = std::collections::BTreeMap::new();
+        for (bi, (trusted, supplied)) in self.batches.iter().zip(&proof.weight_batches).enumerate() {
+            if trusted.security < 90 || trusted.table_ids.len() != trusted.num_tables
+                || trusted.tensor_lengths.len() != trusted.num_tables
+                || trusted.arity != supplied.arity || trusted.num_tables != supplied.num_tables
+                || trusted.num_vars != supplied.whir.num_variables()
+                || trusted.security != supplied.whir.security_level()
+                || trusted.pow_bits != supplied.whir.pow_bits()
+                || bincode::serialize(&trusted.commitment).ok() != bincode::serialize(&supplied.commitment).ok()
+            { return false; }
+            for (ti, (&id, &len)) in trusted.table_ids.iter().zip(&trusted.tensor_lengths).enumerate() {
+                if shapes.get(&id) != Some(&len) || len == 0 || len.next_power_of_two().max(32).trailing_zeros() as usize != trusted.arity
+                    || locations.insert(id, (bi, ti)).is_some() { return false; }
+            }
+        }
+        locations.keys().copied().collect::<std::collections::BTreeSet<_>>() == weights
+            && locations == proof.weight_locs
+    }
 }
 
 /// Phase 1 (offline, once): commit every weight group and stream the Merkle
@@ -4057,6 +5257,7 @@ pub fn commit_model_weights(
                 security: SECURITY,
                 pow_bits,
                 table_ids,
+                tensor_lengths: ids.iter().map(|(t, _)| store.materialize(*t).len()).collect(),
                 cache_path,
             });
         }
@@ -4244,6 +5445,7 @@ pub struct TokenBinding {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct CommittedShardDagProof {
+    pub reverse: Option<ReverseDagProof>,
     pub shards: Vec<OpShardProof>,
     pub boundary_tensors: Vec<T>,
     pub boundary_commitments: Vec<BoundaryCommit>,
@@ -4276,6 +5478,19 @@ pub fn prove_committed_shard_dag(
     cached_weights: &[CachedWeightBatch],
     tokens_t: T,
     argmax_t: T,
+) -> CommittedShardDagProof {
+    prove_committed_shard_dag_inner(store, ops, ops_per_shard, _whir, cached_weights, tokens_t, argmax_t, &[])
+}
+
+fn prove_committed_shard_dag_inner(
+    store: &mut Store,
+    ops: &[Op],
+    ops_per_shard: usize,
+    _whir: &zkie_core::pcs::whir::Whir,
+    cached_weights: &[CachedWeightBatch],
+    tokens_t: T,
+    argmax_t: T,
+    extra_claims: &[EvalClaim],
 ) -> CommittedShardDagProof {
     // Committed mode: the per-op perm/gather fracs stay off the shard
     // transcripts (re-proven on the committed transcripts below); the shard
@@ -4341,6 +5556,11 @@ pub fn prove_committed_shard_dag(
             if let Some(&(bi, ti)) = weight_locs.get(&c.tensor_id) {
                 group_claims[bi].push((ti, c.point.clone(), c.value));
             }
+        }
+    }
+    for c in extra_claims {
+        if let Some(&(bi, ti)) = weight_locs.get(&c.tensor_id) {
+            group_claims[bi].push((ti, c.point.clone(), c.value));
         }
     }
 
@@ -5425,6 +6645,7 @@ pub fn prove_committed_shard_dag(
 
 
     CommittedShardDagProof {
+        reverse: None,
         shards,
         boundary_tensors,
         boundary_commitments,
@@ -5450,6 +6671,206 @@ pub fn prove_committed_shard_dag(
     }
 }
 
+/// Caller-authenticated public execution values, independent of the proof.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct TrustedExecution {
+    pub inputs: std::collections::BTreeMap<T, Vec<Goldilocks>>,
+    pub outputs: std::collections::BTreeMap<T, Vec<Goldilocks>>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct BoundExecutionProof {
+    aux: Vec<AuxDescriptor>,
+    reverse: ReverseDagProof,
+    weight_openings: Vec<WeightBatchOpening>,
+}
+
+fn trusted_weight_locations(model: &TrustedModelManifest, ops: &[Op]) -> Option<std::collections::BTreeMap<T, (usize, usize)>> {
+    if model.graph != bincode::serialize(ops).ok()? { return None; }
+    let expected: std::collections::BTreeSet<_> = collect_weight_tensors(ops).into_iter().collect();
+    let mut locations = std::collections::BTreeMap::new();
+    for (bi, batch) in model.batches.iter().enumerate() {
+        if batch.security < 90 || batch.table_ids.len() != batch.num_tables || batch.tensor_lengths.len() != batch.num_tables { return None; }
+        for (ti, (&id, &len)) in batch.table_ids.iter().zip(&batch.tensor_lengths).enumerate() {
+            if model.tensor_lengths.get(&id) != Some(&len) || len == 0 || len.checked_next_power_of_two()?.max(32).trailing_zeros() as usize != batch.arity
+                || locations.insert(id, (bi, ti)).is_some() { return None; }
+        }
+    }
+    if locations.keys().copied().collect::<std::collections::BTreeSet<_>>() != expected { return None; }
+    Some(locations)
+}
+
+fn group_reverse_weights(model: &TrustedModelManifest, ops: &[Op], leaves: &[EvalClaim])
+    -> Option<Vec<Vec<(usize, Vec<Goldilocks>, Goldilocks)>>>
+{
+    let locations = trusted_weight_locations(model, ops)?;
+    let mut groups = vec![Vec::new(); model.batches.len()];
+    for c in leaves {
+        if let Some(&(bi, ti)) = locations.get(&c.tensor_id) {
+            let batch = &model.batches[bi];
+            if c.point.len() > batch.arity { return None; }
+            let mut point = c.point.clone(); point.resize(batch.arity, Goldilocks::ZERO);
+            groups[bi].push((ti, point, c.value));
+        }
+    }
+    Some(groups)
+}
+
+fn execution_seeds(ops: &[Op], model: &TrustedModelManifest, execution: &TrustedExecution, aux: &[AuxDescriptor])
+    -> Option<(Transcript, Vec<EvalClaim>)>
+{
+    let mut writes = std::collections::BTreeSet::new();
+    let mut reads = std::collections::BTreeSet::new();
+    for op in ops {
+        let (op_reads, op_writes) = reverse_op_io(op)?;
+        writes.extend(op_writes);
+        reads.extend(op_reads);
+    }
+    let weights: std::collections::BTreeSet<_> = collect_weight_tensors(ops).into_iter().collect();
+    let expected_inputs: std::collections::BTreeSet<_> = reads.difference(&writes).copied().filter(|t| !weights.contains(t)).collect();
+    let expected_outputs: std::collections::BTreeSet<_> = writes.difference(&reads).copied().collect();
+    if expected_outputs.is_empty()
+        || execution.inputs.keys().copied().collect::<std::collections::BTreeSet<_>>() != expected_inputs
+        || execution.outputs.keys().copied().collect::<std::collections::BTreeSet<_>>() != expected_outputs { return None; }
+    for (&id, tensor) in execution.inputs.iter().chain(&execution.outputs) {
+        if model.tensor_lengths.get(&id) != Some(&tensor.len()) { return None; }
+    }
+    if !validate_aux_descriptors(ops, model, aux) { return None; }
+    let mut transcript = Transcript::new(b"zkie-bound-execution-v1");
+    transcript.absorb(&bincode::serialize(model).ok()?);
+    transcript.absorb(&bincode::serialize(execution).ok()?);
+    transcript.absorb(&bincode::serialize(aux).ok()?);
+    absorb_statement(&mut transcript, ops, ops.len());
+    let mut seeds = Vec::new();
+    for (&tensor_id, tensor) in &execution.outputs {
+        if !tensor.len().is_power_of_two() { return None; }
+        let point = transcript.field_vec(tensor.len().trailing_zeros() as usize);
+        let value = mle::eval(tensor, &point);
+        seeds.push(EvalClaim { tensor_id, point, value });
+    }
+    Some((transcript, seeds))
+}
+
+pub fn prove_committed_shard_dag_bound(
+    store: &mut Store, ops: &[Op], ops_per_shard: usize,
+    whir: &zkie_core::pcs::whir::Whir, cached: &[CachedWeightBatch],
+    _tokens_t: T, _argmax_t: T, model: &TrustedModelManifest, execution: &TrustedExecution,
+) -> Option<BoundExecutionProof> {
+    let _ = (ops_per_shard, whir);
+    trusted_weight_locations(model, ops)?;
+    if cached.len() != model.batches.len() { return None; }
+    for (cached, expected) in cached.iter().zip(&model.batches) {
+        if cached.arity != expected.arity || cached.num_tables != expected.num_tables
+            || cached.num_vars != expected.num_vars || cached.security != expected.security
+            || cached.pow_bits != expected.pow_bits || cached.table_ids != expected.table_ids
+            || cached.tensor_lengths != expected.tensor_lengths
+            || bincode::serialize(&cached.commitment).ok()? != bincode::serialize(&expected.commitment).ok()? { return None; }
+    }
+    for (&id, expected) in &execution.inputs {
+        if usize::BITS != 64 { return None; }
+        let tag = 1usize << (usize::BITS - 1);
+        if id & tag == 0 {
+            if store.get(id) != expected.as_slice() { return None; }
+        } else {
+            let idx = store.idx.get(id & !tag)?;
+            if idx.len() != expected.len() || idx.iter().zip(expected).any(|(&a, &b)| Goldilocks::from_u64(a as u64) != b) { return None; }
+        }
+    }
+    forward_ops(store, ops);
+    for (&id, expected) in &execution.outputs {
+        if store.get(id) != expected.as_slice() { return None; }
+    }
+    let mut prepared = prepare_projection_aux(store, ops)?;
+    prepared.extend(prepare_scale_aux(store, ops, model)?);
+    prepared.extend(prepare_lookup_aux(store, ops, model)?);
+    prepared.sort_by_key(|p| (p.descriptor.op_index, p.descriptor.role));
+    let aux: Vec<AuxDescriptor> = prepared.iter().map(|p| p.descriptor.clone()).collect();
+    let (mut transcript, seeds) = execution_seeds(ops, model, execution, &aux)?;
+    let mut prepared: std::collections::BTreeMap<(usize, AuxRole), PreparedAux> = prepared.into_iter().map(|p| ((p.descriptor.op_index, p.descriptor.role), p)).collect();
+    let reverse = prove_reverse_dag_inner(store, ops, &seeds, &mut transcript, &mut prepared, Some(model))?;
+    let (mut replay, replay_seeds) = execution_seeds(ops, model, execution, &aux)?;
+    let leaves = verify_reverse_dag_inner(ops, &replay_seeds, &reverse, &mut replay, &aux, Some(model))?;
+    let groups = group_reverse_weights(model, ops, &leaves)?;
+    let mut weight_openings = Vec::with_capacity(groups.len());
+    for (bi, entries) in groups.iter().enumerate() {
+        let table_idxs: Vec<usize> = entries.iter().map(|e| e.0).collect();
+        let points: Vec<Vec<Goldilocks>> = entries.iter().map(|e| e.1.clone()).collect();
+        let claimed: Vec<Goldilocks> = entries.iter().map(|e| e.2).collect();
+        if entries.is_empty() {
+            weight_openings.push(WeightBatchOpening { table_idxs, points, claimed, proof: None });
+            continue;
+        }
+        let cw = &cached[bi];
+        let tensors: Vec<Vec<Goldilocks>> = cw.table_ids.iter().map(|&id| {
+            let mut v = store.materialize(id).into_owned();
+            v.resize(1usize << cw.arity, Goldilocks::ZERO);
+            v
+        }).collect();
+        let refs: Vec<&[Goldilocks]> = tensors.iter().map(Vec::as_slice).collect();
+        let batch_whir = zkie_core::pcs::whir::Whir::with_params(cw.num_vars, cw.security, cw.pow_bits);
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&cw.cache_path).ok()?);
+        let commitment: zkie_core::pcs::whir::Commitment = bincode::deserialize_from(&mut reader).ok()?;
+        if bincode::serialize(&commitment).ok()? != bincode::serialize(&cw.commitment).ok()? { return None; }
+        let prover_data = batch_whir.restore_batch_prover_data_from(&refs, &mut reader).ok()?;
+        let protocol = batch_whir.batch_opening_protocol(cw.num_tables, cw.arity);
+        let ctx = zkie_core::pcs::committed::BatchCtx { commitment, prover_data, protocol, whir: batch_whir, num_tables: cw.num_tables };
+        let opened: Vec<Vec<Goldilocks>> = table_idxs.iter().map(|&i| tensors[i].clone()).collect();
+        let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(ctx, &table_idxs, &opened, &points, &claimed).ok()?;
+        weight_openings.push(WeightBatchOpening { table_idxs, points, claimed, proof: Some(opening) });
+    }
+    Some(BoundExecutionProof { aux, reverse, weight_openings })
+}
+
+pub fn verify_committed_shard_dag_bound(
+    ops: &[Op], ops_per_shard: usize,
+    whir: &zkie_core::pcs::whir::Whir, proof: &BoundExecutionProof,
+    statement: &PublicStatement, model: &TrustedModelManifest, execution: &TrustedExecution,
+) -> bool {
+    let _ = (ops_per_shard, whir);
+    if !matches!(statement, PublicStatement::Generic) || trusted_weight_locations(model, ops).is_none() { return false; }
+    let (mut transcript, seeds) = match execution_seeds(ops, model, execution, &proof.aux) { Some(v) => v, None => return false };
+    let leaves = match verify_reverse_dag_inner(ops, &seeds, &proof.reverse, &mut transcript, &proof.aux, Some(model)) {
+        Some(v) => v, None => return false,
+    };
+    let weights: std::collections::BTreeSet<_> = collect_weight_tensors(ops).into_iter().collect();
+    for c in &leaves {
+        if weights.contains(&c.tensor_id) { continue; }
+        let input = match execution.inputs.get(&c.tensor_id) { Some(v) => v, None => return false };
+        if !input.len().is_power_of_two() || c.point.len() != input.len().trailing_zeros() as usize
+            || mle::eval(input, &c.point) != c.value { return false; }
+    }
+    let groups = match group_reverse_weights(model, ops, &leaves) { Some(g) => g, None => return false };
+    if proof.weight_openings.len() != groups.len() { return false; }
+    for (bi, (opening, entries)) in proof.weight_openings.iter().zip(&groups).enumerate() {
+        let idxs: Vec<usize> = entries.iter().map(|e| e.0).collect();
+        let points: Vec<Vec<Goldilocks>> = entries.iter().map(|e| e.1.clone()).collect();
+        let values: Vec<Goldilocks> = entries.iter().map(|e| e.2).collect();
+        if opening.table_idxs != idxs || opening.points != points || opening.claimed != values { return false; }
+        match (&opening.proof, entries.is_empty()) {
+            (None, true) => {},
+            (Some(p), false) => {
+                let batch = &model.batches[bi];
+                let whir = zkie_core::pcs::whir::Whir::with_params(batch.num_vars, batch.security, batch.pow_bits);
+                let protocol = whir.batch_opening_protocol(batch.num_tables, batch.arity);
+                if !zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &batch.commitment, &protocol, batch.num_tables, &idxs, &points, &values, p) { return false; }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+pub fn verify_committed_shard_dag_bound_bytes(
+    bytes: &[u8], ops: &[Op], ops_per_shard: usize,
+    whir: &zkie_core::pcs::whir::Whir, statement: &PublicStatement,
+    model: &TrustedModelManifest, execution: &TrustedExecution,
+) -> bool {
+    match bincode::deserialize::<BoundExecutionProof>(bytes) {
+        Ok(proof) => verify_committed_shard_dag_bound(ops, ops_per_shard, whir, &proof, statement, model, execution),
+        Err(_) => false,
+    }
+}
+
 pub fn verify_committed_shard_dag(
     tables: &[&[Goldilocks]],
     ops: &[Op],
@@ -5457,7 +6878,27 @@ pub fn verify_committed_shard_dag(
     _whir: &zkie_core::pcs::whir::Whir,
     proof: &CommittedShardDagProof,
     statement: &PublicStatement,
+    trusted_model: &TrustedModelManifest,
 ) -> bool {
+    // A proof without a caller-owned execution statement cannot authenticate
+    // public inputs and outputs. Use verify_committed_shard_dag_bound.
+    let _ = (tables, ops, ops_per_shard, _whir, proof, statement, trusted_model);
+    false
+}
+
+fn verify_committed_shard_dag_inner(
+    tables: &[&[Goldilocks]],
+    ops: &[Op],
+    ops_per_shard: usize,
+    _whir: &zkie_core::pcs::whir::Whir,
+    proof: &CommittedShardDagProof,
+    statement: &PublicStatement,
+    trusted_model: &TrustedModelManifest,
+    extra_claims: &[EvalClaim],
+) -> bool {
+    if !trusted_model.matches_proof(ops, proof) {
+        return false;
+    }
     let st = VerifierStatement::new(tables, ops, ops_per_shard);
     let ranges = shard_ranges(ops.len(), ops_per_shard);
     if proof.shards.len() != ranges.len()
@@ -5552,6 +6993,18 @@ pub fn verify_committed_shard_dag(
             pt.resize(proof.weight_batches[bi].arity, Goldilocks::ZERO);
             batch_entries[bi].push((ti, pt, c.value));
         }
+    }
+    for c in extra_claims {
+        if !weights.contains(&c.tensor_id) { continue; }
+        let (bi, ti) = match proof.weight_locs.get(&c.tensor_id) {
+            Some(&loc) => loc,
+            None => return false,
+        };
+        if bi >= proof.weight_batches.len() || ti >= proof.weight_batches[bi].num_tables
+            || c.point.len() > proof.weight_batches[bi].arity { return false; }
+        let mut point = c.point.clone();
+        point.resize(proof.weight_batches[bi].arity, Goldilocks::ZERO);
+        batch_entries[bi].push((ti, point, c.value));
     }
     for (bi, opening) in proof.weight_batch_openings.iter().enumerate() {
         let entries = &batch_entries[bi];
@@ -5796,7 +7249,9 @@ pub fn verify_committed_shard_dag(
                 }
                 let is_ident = st.is_identity_table(to.table);
                 let den_table_eval = if is_ident {
-                    if to.table_commitment.is_some()
+                    if trusted_model.identity_tables.get(&to.table).copied() != tables.get(to.table).map(|t| t.len())
+                        || trusted_model.lookup_roots.contains_key(&to.table)
+                        || to.table_commitment.is_some()
                         || to.table_opening.is_some()
                         || to.den_table_opening.is_some()
                     {
@@ -5812,6 +7267,13 @@ pub fn verify_committed_shard_dag(
                         (Some(c), Some(o)) => (c, o),
                         _ => return false,
                     };
+                    let trusted_root = match trusted_model.lookup_roots.get(&to.table) {
+                        Some(root) => root,
+                        None => return false,
+                    };
+                    if bincode::serialize(trusted_root).ok() != bincode::serialize(tc_).ok() {
+                        return false;
+                    }
                     if bw.verify(tc_, to2, &protocol, &to.point).ok() != Some(to.table_eval) {
                         return false;
                     }
@@ -6485,12 +7947,13 @@ pub fn verify_committed_shard_dag_bytes(
     ops_per_shard: usize,
     whir: &zkie_core::pcs::whir::Whir,
     statement: &PublicStatement,
+    trusted_model: &TrustedModelManifest,
 ) -> bool {
     let proof: CommittedShardDagProof = match bincode::deserialize(proof_bytes) {
         Ok(p) => p,
         Err(_) => return false,
     };
-    verify_committed_shard_dag(tables, ops, ops_per_shard, whir, &proof, statement)
+    verify_committed_shard_dag(tables, ops, ops_per_shard, whir, &proof, statement, trusted_model)
 }
 
 /// Build a full pre-norm GPT-2 transformer layer as an op list:
@@ -7224,6 +8687,522 @@ mod tests {
     }
 
     #[test]
+    fn committed_scale_preserves_signed_rounding_and_public_input() {
+        let mut store = Store::new();
+        let x = store.push(vec![from_i64(-12), from_i64(-4), from_i64(4), from_i64(12)]);
+        let out = store.push(vec![]);
+        let ops = vec![Op::Scale { x, out, factor: 1, shift: 3 }];
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops);
+        let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, vec![from_i64(-1), from_i64(0), from_i64(1), from_i64(2)])].into() };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let mut bad = execution.clone();
+        bad.inputs.get_mut(&x).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad));
+    }
+
+    #[test]
+    fn committed_scale_shift_zero_is_exact_and_bound() {
+        let mut store = Store::new();
+        let x = store.push(vec![from_i64(-7), from_i64(-2), from_i64(3), from_i64(9)]);
+        let out = store.push(vec![]);
+        let ops = vec![Op::Scale { x, out, factor: 3, shift: 0 }];
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops);
+        let expected: Vec<_> = [-21, -6, 9, 27].into_iter().map(from_i64).collect();
+        let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, expected)].into() };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let mut bad_in = execution.clone();
+        bad_in.inputs.get_mut(&x).unwrap()[1] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad_in));
+        let mut bad_out = execution.clone();
+        bad_out.outputs.get_mut(&out).unwrap()[3] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad_out));
+    }
+
+    #[test]
+    fn committed_scale_rejects_forged_remainder_output_and_input() {
+        let mut store = Store::new();
+        let x = store.push(vec![from_i64(-13), from_i64(-12), from_i64(-4), from_i64(13)]);
+        let out = store.push(vec![]);
+        let ops = vec![Op::Scale { x, out, factor: 1, shift: 3 }];
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops);
+        let expected: Vec<_> = [-2, -1, 0, 2].into_iter().map(from_i64).collect();
+        let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, expected)].into() };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let bytes = bincode::serialize(&proof).unwrap();
+        let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        let mut hit = false;
+        for step in &mut forged.reverse.steps {
+            if let ReverseReduction::Scale { proof } = &mut step.reduction {
+                proof.remainder_bits[0] += Goldilocks::ONE;
+                hit = true;
+            }
+        }
+        assert!(hit);
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged, &PublicStatement::Generic, &model, &execution));
+        let mut bad_in = execution.clone();
+        bad_in.inputs.get_mut(&x).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad_in));
+        let mut bad_out = execution.clone();
+        bad_out.outputs.get_mut(&out).unwrap()[2] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad_out));
+    }
+
+    #[test]
+    fn committed_scale_zero_factor_propagates_input_claim() {
+        let mut store = Store::new();
+        let x = store.push(vec![from_i64(-5), from_i64(0), from_i64(7), from_i64(3)]);
+        let out = store.push(vec![]);
+        let ops = vec![Op::Scale { x, out, factor: 0, shift: 0 }];
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops);
+        let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, vec![Goldilocks::ZERO; 4])].into() };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let bytes = bincode::serialize(&proof).unwrap();
+        let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        for step in &mut forged.reverse.steps {
+            if let ReverseReduction::Scale { proof } = &mut step.reduction { proof.input_eval = Some(Goldilocks::ZERO); }
+        }
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged, &PublicStatement::Generic, &model, &execution));
+        let mut bad_out = execution.clone();
+        bad_out.outputs.get_mut(&out).unwrap()[1] = Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad_out));
+
+        let mut store3 = Store::new();
+        let x3 = store3.push(vec![from_i64(-5), from_i64(0), from_i64(7), from_i64(3)]);
+        let out3 = store3.push(vec![]);
+        let ops3 = vec![Op::Scale { x: x3, out: out3, factor: 0, shift: 3 }];
+        let model3 = TrustedModelManifest::from_offline_commitment(&[], &store3.owned_slices(), &ops3);
+        let execution3 = TrustedExecution { inputs: [(x3, store3.get(x3).to_vec())].into(), outputs: [(out3, vec![Goldilocks::ZERO; 4])].into() };
+        let proof3 = prove_committed_shard_dag_bound(&mut store3, &ops3, 1, &whir, &[], 0, 0, &model3, &execution3).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops3, 1, &whir, &proof3, &PublicStatement::Generic, &model3, &execution3));
+        let mut bad_out3 = execution3.clone();
+        bad_out3.outputs.get_mut(&out3).unwrap()[0] = Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops3, 1, &whir, &proof3, &PublicStatement::Generic, &model3, &bad_out3));
+    }
+
+    #[test]
+    fn reverse_scale_zero_factor_rejects_rebuilt_nonzero_value() {
+        fn scale_aux(op_index: usize, len: usize, columns: Vec<Vec<Goldilocks>>) -> PreparedAux {
+            let arity = 5usize;
+            let count = columns.len();
+            let vars = (count * 32).next_power_of_two().trailing_zeros() as usize;
+            let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
+            let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+            let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
+            let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+            PreparedAux { descriptor: AuxDescriptor { op_index, role: AuxRole::ScaleRemainder, len, arity, columns: count, commitment }, columns, prover_data, protocol, whir }
+        }
+        let mut store = Store::new();
+        let x = store.push(vec![from_i64(1), from_i64(2), from_i64(3), from_i64(4)]);
+        let out = store.push(vec![Goldilocks::ZERO; 4]);
+        let op = Op::Scale { x, out, factor: 0, shift: 1 };
+        let point = vec![Goldilocks::from_u64(2), Goldilocks::from_u64(5)];
+        // rem_off = 0 is a legal range witness; the field identity then admits
+        // value = (half - rem)/2^shift = 1/2, which is not the zero function.
+        let value = Goldilocks::ONE * Goldilocks::TWO.try_inverse().unwrap();
+        let zero_bits = vec![vec![Goldilocks::ZERO; 32]];
+        let prover_aux = scale_aux(0, 4, zero_bits.clone());
+        let verifier_aux = scale_aux(0, 4, zero_bits);
+        let mut tp = Transcript::new(b"scale-zero-rebuilt");
+        let (proof, claim) = prove_reverse_scale(&store, &op, &point, value, Some(prover_aux), &mut tp)
+            .expect("a rebuilt proof for a nonzero field value is constructible");
+        assert_eq!(claim.value, mle::eval(store.get(x), &point));
+        let mut tv = Transcript::new(b"scale-zero-rebuilt");
+        assert!(verify_reverse_scale(&op, &point, value, Some(&verifier_aux.descriptor), &proof, &mut tv).is_none());
+    }
+
+    #[test]
+    fn committed_scale_negative_factor_rounds_signed() {
+        let mut store = Store::new();
+        let x = store.push(vec![from_i64(-12), from_i64(-4), from_i64(4), from_i64(12)]);
+        let out = store.push(vec![]);
+        let ops = vec![Op::Scale { x, out, factor: -1, shift: 3 }];
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops);
+        let expected: Vec<_> = [2, 1, 0, -1].into_iter().map(from_i64).collect();
+        let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, expected)].into() };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let mut bad_in = execution.clone();
+        bad_in.inputs.get_mut(&x).unwrap()[2] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad_in));
+    }
+
+    #[test]
+    fn committed_transpose_matmul_binds_permuted_input() {
+        let mut store = Store::new();
+        let x = store.push((0..8).map(|i| from_i64(i as i64)).collect());
+        let transposed = store.push(vec![]);
+        let w = store.push(vec![from_i64(1), from_i64(0), from_i64(0), from_i64(1)]);
+        let out = store.push(vec![]);
+        let ops = vec![Op::Transpose { x, out: transposed, m: 2, k: 4 }, Op::MatMul { a: transposed, b: w, c: out, m: 4, k: 2, n: 2 }];
+        let path = std::env::temp_dir().join("zkie-transpose-chain");
+        let cache = commit_model_weights(&store, &ops, path.to_str().unwrap());
+        let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops);
+        let expected: Vec<_> = [0,4,1,5,2,6,3,7].into_iter().map(from_i64).collect();
+        let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, expected)].into() };
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 2, &whir, &cache, 0, 0, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 2, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let mut bad = execution.clone();
+        bad.inputs.get_mut(&x).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 2, &whir, &proof, &PublicStatement::Generic, &model, &bad));
+    }
+
+    #[test]
+    fn reverse_gelu_index_preserves_clamp_boundaries_and_negative_offset() {
+        let input: Vec<_> = [-5, -2, -1, 1, 2, 3, 4, 5].into_iter().map(from_i64).collect();
+        let point = vec![Goldilocks::from_u64(2), Goldilocks::from_u64(3), Goldilocks::from_u64(4)];
+        for (offset, expected) in [
+            (2, vec![0, 0, 1, 3, 3, 3, 3, 3]),
+            (-2, vec![0, 0, 0, 0, 0, 1, 2, 3]),
+        ] {
+            let expected: Vec<_> = expected.into_iter().map(from_i64).collect();
+            let value = mle::eval(&expected, &point);
+            let mut tp = Transcript::new(b"gelu-boundaries");
+            let (proof, _) = prove_reverse_gelu_index(&input, offset, 4, &point, value, &mut tp).unwrap();
+            let mut tv = Transcript::new(b"gelu-boundaries");
+            let leaves = verify_reverse_gelu_index(offset, 4, &point, value, &proof, &mut tv).unwrap();
+            assert!(leaves.iter().all(|(p, v)| mle::eval(&input, p) == *v));
+        }
+    }
+
+    #[test]
+    fn committed_projection_gelu_lookup_projection_residual_chain() {
+        let mut store = Store::new();
+        let x = store.push(vec![from_i64(-12), from_i64(-4), from_i64(4), from_i64(12)]);
+        let w = store.push(vec![from_i64(1), from_i64(0), from_i64(0), from_i64(1)]);
+        let bias = store.push(vec![Goldilocks::ZERO; 4]);
+        let p1 = store.push(vec![]);
+        let r1 = store.push(vec![]);
+        let table = store.push(vec![from_i64(1), from_i64(3), from_i64(5), from_i64(7)]);
+        let lookup = store.push(vec![]);
+        let p2 = store.push(vec![]);
+        let r2 = store.push(vec![]);
+        let out = store.push(vec![]);
+        let idx = store.push_idx(vec![]);
+        assert_eq!(idx, x);
+        let ops = vec![
+            Op::Projection { x, w, bias, out: p1, rem: r1, m: 2, k: 2, n: 2, shift: 3 },
+            Op::GeluIndex { x: p1, out: idx, offset: 2, table_len: 4 },
+            Op::Lookup { idx, out: lookup, table },
+            Op::Projection { x: lookup, w, bias, out: p2, rem: r2, m: 2, k: 2, n: 2, shift: 1 },
+            Op::Add { a: p2, b: x, c: out },
+        ];
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let path = std::env::temp_dir().join("zkie-bound-gelu-chain");
+        let cache = commit_model_weights(&store, &ops, path.to_str().unwrap());
+        let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops).with_index_shapes(&[(idx, 4usize)].into());
+        let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, vec![from_i64(-10), from_i64(-1), from_i64(8), from_i64(16)])].into() };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 5, &whir, &cache, 0, 0, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 5, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 5, &whir, &PublicStatement::Generic, &model, &execution));
+        let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        for step in &mut forged.reverse.steps {
+            if let ReverseReduction::Lookup { proof: p } = &mut step.reduction { p.output_index += Goldilocks::ONE; }
+        }
+        assert!(!verify_committed_shard_dag_bound(&ops, 5, &whir, &forged, &PublicStatement::Generic, &model, &execution));
+        let mut missing: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        missing.aux.pop();
+        assert!(!verify_committed_shard_dag_bound(&ops, 5, &whir, &missing, &PublicStatement::Generic, &model, &execution));
+        let mut bad = execution.clone();
+        bad.outputs.get_mut(&out).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 5, &whir, &proof, &PublicStatement::Generic, &model, &bad));
+    }
+
+    #[test]
+    fn lookup_rejects_forged_padded_identity_row() {
+        fn make_aux(op_index: usize, role: AuxRole, len: usize, columns: Vec<Vec<Goldilocks>>) -> PreparedAux {
+            let arity = 5usize;
+            let count = columns.len();
+            let vars = (count * 32).next_power_of_two().trailing_zeros() as usize;
+            let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
+            let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+            let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
+            let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+            PreparedAux { descriptor: AuxDescriptor { op_index, role, len, arity, columns: count, commitment }, columns, prover_data, protocol, whir }
+        }
+        let mut store = Store::new();
+        let table = store.push(vec![from_i64(0), from_i64(1), from_i64(2)]);
+        let idx = store.push_idx(vec![3]);
+        let out = store.push(vec![from_i64(3)]);
+        let ops = vec![Op::Lookup { idx, out, table }];
+        let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops)
+            .with_index_shapes(&[(idx, 1usize)].into());
+        let mut x = vec![Goldilocks::ZERO; 32]; x[0] = from_i64(3);
+        let mut y = vec![Goldilocks::ZERO; 32]; y[0] = from_i64(3);
+        let mut m = vec![Goldilocks::ZERO; 32]; m[3] = Goldilocks::ONE;
+        let pairs = make_aux(0, AuxRole::LookupPairs, 1, vec![x, y]);
+        let mult = make_aux(0, AuxRole::LookupMultiplicity, 3, vec![m]);
+        let pair_desc = pairs.descriptor.clone();
+        let mult_desc = mult.descriptor.clone();
+        let mut prover = Transcript::new(b"padded-identity-forgery");
+        let (proof, _) = prove_reverse_lookup(&store, &ops[0], &[], from_i64(3), pairs, mult, &model, &mut prover).unwrap();
+        let mut verifier = Transcript::new(b"padded-identity-forgery");
+        assert!(verify_reverse_lookup(&ops[0], &[], from_i64(3), &pair_desc, &mult_desc, &model, &proof, &mut verifier).is_none());
+    }
+
+    #[test]
+    fn committed_lookup_binds_typed_index_and_table() {
+        let mut store = Store::new();
+        let table = store.push(vec![from_i64(7), from_i64(3), from_i64(9), from_i64(5)]);
+        let idx = store.push_idx(vec![1, 0, 3, 2]);
+        assert_eq!(idx, table);
+        let out = store.push(vec![]);
+        let ops = vec![Op::Lookup { idx, out, table }];
+        let model = TrustedModelManifest::from_offline_commitment(&[], &store.owned_slices(), &ops)
+            .with_index_shapes(&[(idx, 4usize)].into());
+        let index_key = TensorKey::Index(idx).encoded().unwrap();
+        let execution = TrustedExecution { inputs: [(index_key, vec![from_i64(1), from_i64(0), from_i64(3), from_i64(2)])].into(), outputs: [(out, vec![from_i64(3), from_i64(7), from_i64(5), from_i64(9)])].into() };
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &[], 0, 0, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let mut wrong_namespace = execution.clone();
+        let values = wrong_namespace.inputs.remove(&index_key).unwrap();
+        wrong_namespace.inputs.insert(TensorKey::Field(idx).encoded().unwrap(), values);
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &wrong_namespace));
+    }
+
+    #[test]
+    fn reverse_field_and_index_same_number_do_not_alias() {
+        let field = TensorKey::Field(0).encoded().unwrap();
+        let index = TensorKey::Index(0).encoded().unwrap();
+        assert_ne!(field, index);
+        let seeds = vec![
+            EvalClaim { tensor_id: field, point: vec![], value: from_i64(3) },
+            EvalClaim { tensor_id: index, point: vec![], value: from_i64(9) },
+        ];
+        let groups = reverse_setup(&[], &seeds, &mut Transcript::new(b"typed-keys")).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_ne!(groups[&field][0].1, groups[&index][0].1);
+    }
+
+    #[test]
+    fn reverse_add_matmul_reduces_to_authenticated_leaves() {
+        let mut store = Store::new();
+        let a = store.push(vec![from_i64(1), from_i64(2), from_i64(3), from_i64(4)]);
+        let b = store.push(vec![from_i64(4), from_i64(3), from_i64(2), from_i64(1)]);
+        let w = store.push(vec![from_i64(1), from_i64(2), from_i64(0), from_i64(1)]);
+        let z = store.push(vec![]);
+        let out = store.push(vec![]);
+        let ops = vec![Op::Add { a, b, c: z }, Op::MatMul { a: z, b: w, c: out, m: 2, k: 2, n: 2 }];
+        forward_ops(&mut store, &ops);
+        let point = vec![Goldilocks::from_u64(3), Goldilocks::from_u64(5)];
+        let claim = EvalClaim { tensor_id: out, value: mle::eval(store.get(out), &point), point };
+        let mut prover = Transcript::new(b"reverse-add-matmul");
+        let proof = prove_reverse_dag(&store, &ops, &[claim.clone()], &mut prover).unwrap();
+        let mut verifier = Transcript::new(b"reverse-add-matmul");
+        let leaves = verify_reverse_dag(&ops, &[claim.clone()], &proof, &mut verifier).unwrap();
+        assert!(!leaves.is_empty());
+        assert!(leaves.iter().all(|leaf| [a, b, w].contains(&leaf.tensor_id)
+            && mle::eval(store.get(leaf.tensor_id), &leaf.point) == leaf.value));
+        // A forged producer split can preserve its sum but must not match
+        // the independently authenticated input tensors.
+        let mut forged = prove_reverse_dag(&store, &ops, &[claim.clone()], &mut Transcript::new(b"reverse-add-matmul")).unwrap();
+        for step in &mut forged.steps {
+            if let ReverseReduction::Add { a, b } = &mut step.reduction {
+                *a += Goldilocks::ONE;
+                *b -= Goldilocks::ONE;
+            }
+        }
+        let mut verifier = Transcript::new(b"reverse-add-matmul");
+        if let Some(bad_leaves) = verify_reverse_dag(&ops, &[claim.clone()], &forged, &mut verifier) {
+            assert!(bad_leaves.iter().any(|leaf| mle::eval(store.get(leaf.tensor_id), &leaf.point) != leaf.value));
+        }
+
+        let mut wrong = claim.clone();
+        wrong.value += Goldilocks::ONE;
+        let mut verifier = Transcript::new(b"reverse-add-matmul");
+        assert!(verify_reverse_dag(&ops, &[wrong], &proof, &mut verifier).is_none());
+    }
+
+    #[test]
+    fn trusted_manifest_rejects_consistent_replacement_model() {
+        use zkie_core::pcs::whir::Whir;
+        let mut store = Store::new();
+        let x = store.push(vec![from_i64(1), from_i64(2), from_i64(3), from_i64(4)]);
+        let w = store.push(vec![from_i64(2), from_i64(1), from_i64(1), from_i64(3)]);
+        let c = store.push(vec![]);
+        let ops = vec![Op::MatMul { a: x, b: w, c, m: 2, k: 2, n: 2 }];
+        let token = store.push_idx(vec![]);
+        let argmax = store.push_idx(vec![]);
+        let whir = Whir::with_params(5, 90, 17);
+        let cache_a_path = std::env::temp_dir().join("zkie-manifest-model-a");
+        let cache_a = commit_model_weights(&store, &ops, cache_a_path.to_str().unwrap());
+        let trusted_a = TrustedModelManifest::from_offline_commitment(&cache_a, &store.owned_slices(), &ops);
+        forward_ops(&mut store, &ops);
+        let execution_a = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(c, store.get(c).to_vec())].into() };
+        let proof_a = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache_a, token, argmax, &trusted_a, &execution_a).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof_a, &PublicStatement::Generic, &trusted_a, &execution_a));
+        let mut wrong_input = execution_a.clone();
+        wrong_input.inputs.get_mut(&x).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof_a, &PublicStatement::Generic, &trusted_a, &wrong_input));
+
+        store.get_mut(w)[0] += Goldilocks::ONE;
+        let cache_b_path = std::env::temp_dir().join("zkie-manifest-model-b");
+        let cache_b = commit_model_weights(&store, &ops, cache_b_path.to_str().unwrap());
+        let trusted_b = TrustedModelManifest::from_offline_commitment(&cache_b, &store.owned_slices(), &ops);
+        forward_ops(&mut store, &ops);
+        let execution_b = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(c, store.get(c).to_vec())].into() };
+        let proof_b = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache_b, token, argmax, &trusted_b, &execution_b).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof_b, &PublicStatement::Generic, &trusted_b, &execution_b));
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof_b, &PublicStatement::Generic, &trusted_a, &execution_b));
+    }
+
+    #[test]
+    fn committed_relu_checks_public_values_and_auxiliary_opening() {
+        for len in [4usize, 32] {
+            let mut store = Store::new();
+            let limit = 1i64 << 22;
+            let mut values = vec![from_i64(0); len];
+            values[..4].copy_from_slice(&[from_i64(5), from_i64(-5), from_i64(-limit), from_i64(limit - 1)]);
+            let x = store.push(values.clone());
+            let out = store.push(vec![]);
+            let ops = vec![Op::Relu { x, out }];
+            let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+            let cache = Vec::new();
+            let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops);
+            let output: Vec<_> = values.iter().map(|&v| from_i64(to_i64(v).max(0))).collect();
+            let execution = TrustedExecution { inputs: [(x, values.clone())].into(), outputs: [(out, output)].into() };
+            let mut proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache, 0, 0, &model, &execution).unwrap();
+            assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+            let mut bad_positive = execution.clone();
+            bad_positive.outputs.get_mut(&out).unwrap()[0] = Goldilocks::ZERO;
+            assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad_positive));
+            let mut bad_negative = execution.clone();
+            bad_negative.outputs.get_mut(&out).unwrap()[1] = from_i64(-5);
+            assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad_negative));
+            if let ReverseReduction::Relu { proof: relu } = &mut proof.reverse.steps[0].reduction {
+                relu.range.final_evals[2] += Goldilocks::ONE;
+            } else { panic!("missing relu proof"); }
+            assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+            store.get_mut(x)[0] = from_i64(limit);
+            let mut outside = execution.clone();
+            outside.inputs.get_mut(&x).unwrap()[0] = from_i64(limit);
+            outside.outputs.get_mut(&out).unwrap()[0] = from_i64(limit);
+            assert!(prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache, 0, 0, &model, &outside).is_none());
+        }
+    }
+
+    #[test]
+    fn committed_projection_preserves_negative_and_tie_rounding() {
+        let mut store = Store::new();
+        let x = store.push(vec![from_i64(-12), from_i64(-4), from_i64(4), from_i64(12)]);
+        let w = store.push(vec![from_i64(1), from_i64(0), from_i64(0), from_i64(1)]);
+        let bias = store.push(vec![Goldilocks::ZERO; 4]);
+        let out = store.push(vec![]);
+        let rem = store.push(vec![]);
+        let ops = vec![Op::Projection { x, w, bias, out, rem, m: 2, k: 2, n: 2, shift: 3 }];
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let path = std::env::temp_dir().join("zkie-bound-projection-rounding");
+        let cache = commit_model_weights(&store, &ops, path.to_str().unwrap());
+        let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops);
+        let expected = vec![from_i64(-1), from_i64(0), from_i64(1), from_i64(2)];
+        let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, expected)].into() };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache, 0, 0, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+    }
+
+    #[test]
+    fn committed_projection_uses_precommitted_bounded_remainder() {
+        let mut store = Store::new();
+        let x = store.push(vec![from_i64(1), from_i64(2), from_i64(3), from_i64(4)]);
+        let w = store.push(vec![from_i64(2), from_i64(1), from_i64(1), from_i64(3)]);
+        let bias = store.push(vec![from_i64(1), from_i64(0), from_i64(-1), from_i64(2)]);
+        let out = store.push(vec![]);
+        let rem = store.push(vec![]);
+        let ops = vec![Op::Projection { x, w, bias, out, rem, m: 2, k: 2, n: 2, shift: 3 }];
+        let token = store.push_idx(vec![]);
+        let argmax = store.push_idx(vec![]);
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let path = std::env::temp_dir().join("zkie-bound-projection");
+        let cache = commit_model_weights(&store, &ops, path.to_str().unwrap());
+        let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops);
+        forward_ops(&mut store, &ops);
+        let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, store.get(out).to_vec())].into() };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cache, token, argmax, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+        let mut missing: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        missing.aux.clear();
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &missing, &PublicStatement::Generic, &model, &execution));
+        let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        if let ReverseReduction::Projection { proof: p } = &mut forged.reverse.steps[0].reduction { p.remainder_bits[0] += Goldilocks::ONE; }
+        else { panic!("missing projection reduction"); }
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged, &PublicStatement::Generic, &model, &execution));
+        let mut bad = execution.clone();
+        bad.outputs.get_mut(&out).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad));
+    }
+
+    #[test]
+    fn committed_reverse_chain_rejects_wrong_internal_and_public_input() {
+        let mut store = Store::new();
+        let a = store.push(vec![from_i64(1), from_i64(2), from_i64(3), from_i64(4)]);
+        let b = store.push(vec![from_i64(4), from_i64(3), from_i64(2), from_i64(1)]);
+        let w = store.push(vec![from_i64(1), from_i64(2), from_i64(0), from_i64(1)]);
+        let z = store.push(vec![]);
+        let out = store.push(vec![]);
+        let ops = vec![Op::Add { a, b, c: z }, Op::MatMul { a: z, b: w, c: out, m: 2, k: 2, n: 2 }];
+        let token = store.push_idx(vec![]);
+        let argmax = store.push_idx(vec![]);
+        let whir = zkie_core::pcs::whir::Whir::with_params(5, 90, 17);
+        let path = std::env::temp_dir().join("zkie-bound-chain");
+        let cache = commit_model_weights(&store, &ops, path.to_str().unwrap());
+        let model = TrustedModelManifest::from_offline_commitment(&cache, &store.owned_slices(), &ops);
+        forward_ops(&mut store, &ops);
+        let execution = TrustedExecution {
+            inputs: [(a, store.get(a).to_vec()), (b, store.get(b).to_vec())].into(),
+            outputs: [(out, store.get(out).to_vec())].into(),
+        };
+        let mut proof = prove_committed_shard_dag_bound(&mut store, &ops, 2, &whir, &cache, token, argmax, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 2, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let mut wrong = execution.clone();
+        wrong.inputs.get_mut(&a).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound(&ops, 2, &whir, &proof, &PublicStatement::Generic, &model, &wrong));
+        for step in &mut proof.reverse.steps {
+            if let ReverseReduction::Add { a, b } = &mut step.reduction {
+                *a += Goldilocks::ONE;
+                *b -= Goldilocks::ONE;
+            }
+        }
+        assert!(!verify_committed_shard_dag_bound(&ops, 2, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+    }
+
+    #[test]
+    fn reverse_relu_enforces_signed_range_and_sign() {
+        let mut store = Store::new();
+        let bound = 1i64 << 22;
+        let x = store.push(vec![from_i64(5), from_i64(-5), from_i64(-bound), from_i64(bound - 1)]);
+        let out = store.push(vec![]);
+        let ops = vec![Op::Relu { x, out }];
+        forward_ops(&mut store, &ops);
+        let point = vec![Goldilocks::ZERO, Goldilocks::ZERO];
+        let claim = EvalClaim { tensor_id: out, point, value: from_i64(5) };
+        let proof = prove_reverse_dag(&store, &ops, &[claim.clone()], &mut Transcript::new(b"reverse-relu")).unwrap();
+        let leaves = verify_reverse_dag(&ops, &[claim.clone()], &proof, &mut Transcript::new(b"reverse-relu")).unwrap();
+        assert!(leaves.iter().all(|c| c.tensor_id == x && mle::eval(store.get(x), &c.point) == c.value));
+        let mut wrong_positive = claim.clone();
+        wrong_positive.value = Goldilocks::ZERO;
+        assert!(verify_reverse_dag(&ops, &[wrong_positive], &proof, &mut Transcript::new(b"reverse-relu")).is_none());
+        let wrong_negative = EvalClaim { tensor_id: out, point: vec![Goldilocks::ONE, Goldilocks::ZERO], value: from_i64(-5) };
+        assert!(prove_reverse_dag(&store, &ops, &[wrong_negative], &mut Transcript::new(b"reverse-relu")).is_none());
+        store.get_mut(x)[0] = from_i64(bound);
+        forward_ops(&mut store, &ops);
+        let out_of_range = EvalClaim { tensor_id: out, point: vec![Goldilocks::ZERO, Goldilocks::ZERO], value: from_i64(bound) };
+        assert!(prove_reverse_dag(&store, &ops, &[out_of_range], &mut Transcript::new(b"reverse-relu")).is_none());
+    }
+
+    #[test]
     fn committed_cross_bind_roundtrip() {
         use zkie_core::common::field::PrimeCharacteristicRing;
         use zkie_core::pcs::committed::commit;
@@ -7350,7 +9329,7 @@ mod tests {
         assert_eq!(proof.boundary_tensors.len(), 1);
         assert_eq!(proof.boundary_commitments.len(), 1);
         assert_eq!(proof.cross_binds.len(), 1);
-        assert!(verify_committed_shard_dag(&store.owned_slices(), &ops, 2, &whir, &proof, &PublicStatement::Generic));
+        assert!(verify_committed_shard_dag(&store.owned_slices(), &ops, 2, &whir, &proof, &PublicStatement::Generic, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)));
 
         // Serialization roundtrip through the root-only bytes entry.
         let bytes = bincode::serialize(&proof).unwrap();
@@ -7360,7 +9339,7 @@ mod tests {
             &ops,
             2,
             &whir,
-            &PublicStatement::Generic
+            &PublicStatement::Generic, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
         ));
 
         // Tamper a boundary opening value -> the committed cross-bind must
@@ -7369,7 +9348,7 @@ mod tests {
         if let Some((_, opened)) = proof.cross_binds[0].openings.first_mut() {
             *opened = *opened + Goldilocks::ONE;
         }
-        assert!(!verify_committed_shard_dag(&store.owned_slices(), &ops, 2, &whir, &proof, &PublicStatement::Generic));
+        assert!(!verify_committed_shard_dag(&store.owned_slices(), &ops, 2, &whir, &proof, &PublicStatement::Generic, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)));
     }
 
 
@@ -7470,59 +9449,32 @@ mod tests {
         let mut rng = XorShift64::new(0x52_02);
         let (m, k, n, shift) = (4usize, 8usize, 8usize, 8u32);
         let mut store = Store::new();
-        let x = store.push(
-            (0..m * k)
-                .map(|_| from_i64((rng.next_u64() % 50) as i64))
-                .collect(),
-        );
-        let w = store.push(
-            (0..k * n)
-                .map(|_| from_i64((rng.next_u64() % 50) as i64))
-                .collect(),
-        );
-        let b = store.push(
-            (0..m * n)
-                .map(|_| from_i64((rng.next_u64() % 10) as i64 - 5))
-                .collect(),
-        );
+        let x = store.push((0..m * k).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let w = store.push((0..k * n).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let b = store.push((0..m * n).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
         let out = store.push(vec![]);
         let rem = store.push(vec![]);
-        let ops = vec![Op::Projection {
-            x,
-            w,
-            bias: b,
-            out,
-            rem,
-            m,
-            k,
-            n,
-            shift,
-        }];
-
-        let whir = Whir::new_testing(5);
-        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s2-cache");
+        let ops = vec![Op::Projection { x, w, bias: b, out, rem, m, k, n, shift }];
+        let whir = Whir::with_params(5, 90, 17);
+        let cache_dir = std::env::temp_dir().join("zkie-s2-cache");
+        let cached = commit_model_weights(&store, &ops, cache_dir.to_str().unwrap());
         assert!(!cached.is_empty());
-        let tokens_t = store.push_idx(vec![]);
-        let argmax_t = store.push_idx(vec![]);
-        let mut proof =
-            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
-        assert!(!proof.weight_batches.is_empty());
-        assert!(verify_committed_shard_dag(&store.owned_slices(), &ops, 1, &whir, &proof, &PublicStatement::Generic));
-
-        // Forge: drop every weight batch + opening.
-        proof.weight_batches.clear();
-        proof.weight_batch_openings.clear();
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops);
+        let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, store.get(out).to_vec())].into() };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
+        assert!(!proof.weight_openings.is_empty());
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
         let bytes = bincode::serialize(&proof).unwrap();
-        // S2: must be REJECTED (pre-fix it is ACCEPTED through the serialized
-        // entry with the empty lists).
-        assert!(!verify_committed_shard_dag_bytes(
-            &bytes,
-            &store.owned_slices(),
-            &ops,
-            1,
-            &whir,
-            &PublicStatement::Generic
-        ));
+        assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+        // S2: dropping every weight opening must be rejected.
+        let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        forged.weight_openings.clear();
+        assert!(!verify_committed_shard_dag_bound_bytes(&bincode::serialize(&forged).unwrap(), &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+        // Bytes entry with a wrong public input must also reject.
+        let mut bad = execution.clone();
+        bad.inputs.get_mut(&x).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &bad));
     }
 
     /// S2 regression: the identity-table decision comes from the statement,
@@ -7535,79 +9487,49 @@ mod tests {
         let mut rng = XorShift64::new(0x52_03);
         let (m, k, n, shift) = (4usize, 4usize, 4usize, 8u32);
         let mut store = Store::new();
-        let x = store.push(
-            (0..m * k)
-                .map(|_| from_i64((rng.next_u64() % 50) as i64))
-                .collect(),
-        );
-        let w = store.push(
-            (0..k * n)
-                .map(|_| from_i64((rng.next_u64() % 50) as i64))
-                .collect(),
-        );
-        let b = store.push(
-            (0..m * n)
-                .map(|_| from_i64((rng.next_u64() % 10) as i64 - 5))
-                .collect(),
-        );
+        let x = store.push((0..m * k).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let w = store.push((0..k * n).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let b = store.push((0..m * n).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
         let out = store.push(vec![]);
         let rem = store.push(vec![]);
-        // Non-identity lookup table (>= 32 entries so the committed
-        // table commit has a valid WHIR folding schedule).
-        let table = store.push(
-            (0..32)
-                .map(|j| from_i64((j as i64 * j as i64) % 1000))
-                .collect(),
-        );
+        // Non-identity lookup table (>= 32 entries so the committed table has a
+        // valid WHIR folding schedule).
+        let table = store.push((0..32).map(|j| from_i64((j as i64 * j as i64) % 1000)).collect());
         let idx = store.push_idx((0..16u32).collect::<Vec<u32>>());
         let act = store.push(vec![]);
         let ops = vec![
-            Op::Projection {
-                x,
-                w,
-                bias: b,
-                out,
-                rem,
-                m,
-                k,
-                n,
-                shift,
-            },
-            Op::Lookup {
-                idx,
-                out: act,
-                table,
-            },
+            Op::Projection { x, w, bias: b, out, rem, m, k, n, shift },
+            Op::Lookup { idx, out: act, table },
         ];
-
-        let whir = Whir::new_testing(5);
-        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s2-cache2");
-        let tokens_t = store.push_idx(vec![]);
-        let argmax_t = store.push_idx(vec![]);
-        let mut proof =
-            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
-        assert!(!proof.table_openings.is_empty());
-
-        // Forge: drop the table commitment/openings as if the table were an
-        // identity table. The identity decision comes from the STATEMENT
-        // tables (S2) — this non-identity table must still have a committed
-        // table with openings, so the forgery is rejected. (Pre-fix the
-        // prover-supplied is_identity flag made this forgery accepted.)
-        for to in proof.table_openings.iter_mut() {
-            to.table_commitment = None;
-            to.table_opening = None;
-            to.den_table_opening = None;
-            to.den_table_eval = Goldilocks::ZERO;
+        let whir = Whir::with_params(5, 90, 17);
+        let cache_dir = std::env::temp_dir().join("zkie-s2-cache2");
+        let cached = commit_model_weights(&store, &ops, cache_dir.to_str().unwrap());
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(idx, 16usize)].into());
+        // The identity decision comes from the trusted statement tables.
+        assert!(!model.identity_tables.contains_key(&table));
+        let idx_values: Vec<Goldilocks> = store.idx.get(idx).unwrap().iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let idx_key = TensorKey::Index(idx).encoded().unwrap();
+        let execution = TrustedExecution {
+            inputs: [(x, store.get(x).to_vec()), (idx_key, idx_values)].into(),
+            outputs: [(out, store.get(out).to_vec()), (act, store.get(act).to_vec())].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        // Forge: drop the table commitment/opening as if the table were an
+        // identity table. The verifier's identity branch is statement-driven,
+        // so the missing table opening must be rejected.
+        let mut forged: BoundExecutionProof = bincode::deserialize(&bincode::serialize(&proof).unwrap()).unwrap();
+        let mut hit = false;
+        for step in &mut forged.reverse.steps {
+            if let ReverseReduction::Lookup { proof } = &mut step.reduction {
+                proof.table_opening = None;
+                hit = true;
+            }
         }
-        // S2: must be REJECTED (pre-fix it is ACCEPTED).
-        assert!(!verify_committed_shard_dag(
-            &store.owned_slices(),
-            &ops,
-            1,
-            &whir,
-            &proof
-        ,            &PublicStatement::Generic
-        ));
+        assert!(hit);
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged, &PublicStatement::Generic, &model, &execution));
     }
 
     /// S2 regression: table-side openings must sit on the fractional proof's
@@ -7621,113 +9543,53 @@ mod tests {
         let mut rng = XorShift64::new(0x52_04);
         let (m, k, n, shift) = (4usize, 4usize, 4usize, 8u32);
         let mut store = Store::new();
-        let x = store.push(
-            (0..m * k)
-                .map(|_| from_i64((rng.next_u64() % 50) as i64))
-                .collect(),
-        );
-        let w = store.push(
-            (0..k * n)
-                .map(|_| from_i64((rng.next_u64() % 50) as i64))
-                .collect(),
-        );
-        let b = store.push(
-            (0..m * n)
-                .map(|_| from_i64((rng.next_u64() % 10) as i64 - 5))
-                .collect(),
-        );
+        let x = store.push((0..m * k).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let w = store.push((0..k * n).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let b = store.push((0..m * n).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
         let out = store.push(vec![]);
         let rem = store.push(vec![]);
-        let table = store.push(
-            (0..32)
-                .map(|j| from_i64((j as i64 * j as i64) % 1000))
-                .collect(),
-        );
+        let table = store.push((0..32).map(|j| from_i64((j as i64 * j as i64) % 1000)).collect());
         let idx = store.push_idx((0..16u32).collect::<Vec<u32>>());
         let act = store.push(vec![]);
         let ops = vec![
-            Op::Projection {
-                x,
-                w,
-                bias: b,
-                out,
-                rem,
-                m,
-                k,
-                n,
-                shift,
-            },
-            Op::Lookup {
-                idx,
-                out: act,
-                table,
-            },
+            Op::Projection { x, w, bias: b, out, rem, m, k, n, shift },
+            Op::Lookup { idx, out: act, table },
         ];
-
-        // Plain-path control: the same ops must verify through the shard-DAG
-        // entry (the committed shard proofs are identical).
-        {
-            let mut store2 = Store {
-                v: store.v.clone(),
-                idx: store.idx.clone(),
-            };
-            let plain = prove_shard_dag(&mut store2, &ops, 1);
-            let ok_plain = verify_shard_dag(&store2.owned_slices(), &ops, 1, &plain);
-            assert!(ok_plain, "plain-path control must pass");
-        }
-        let whir = Whir::new_testing(5);
-        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s2-cache3");
-        let tokens_t = store.push_idx(vec![]);
-        let argmax_t = store.push_idx(vec![]);
-        let mut proof =
-            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
-        assert!(!proof.table_openings.is_empty());
-
-        // Re-commit the m column and the table, then re-open at an arbitrary
-        // point p' and move the opening there (the pre-fix verifier accepts
-        // any point the opening is consistent at).
-        let idx_vals = &store.idx[idx];
-        let m_col: Vec<u64> = idx_vals.iter().fold(vec![0u64; 32], |mut acc, &i| {
-            acc[i as usize] += 1;
-            acc
-        });
-        let total = 32usize.next_power_of_two();
-        let arity = total.trailing_zeros() as usize;
-        let mut m_pad = vec![Goldilocks::from_u64(0); total];
-        let mut table_pad = vec![Goldilocks::from_u64(0); total];
-        for j in 0..32 {
-            m_pad[j] = Goldilocks::from_u64(m_col[j]);
-            table_pad[j] = store.get(table)[j];
-        }
-        let bw = Whir::with_params(arity, 90, Whir::required_pow_bits(arity, 90));
-        let c_m = commit(&bw, &m_pad);
-        let c_t = commit(&bw, &table_pad);
+        let whir = Whir::with_params(5, 90, 17);
+        let cache_dir = std::env::temp_dir().join("zkie-s2-cache3");
+        let cached = commit_model_weights(&store, &ops, cache_dir.to_str().unwrap());
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(idx, 16usize)].into());
+        let idx_values: Vec<Goldilocks> = store.idx.get(idx).unwrap().iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let idx_key = TensorKey::Index(idx).encoded().unwrap();
+        let execution = TrustedExecution {
+            inputs: [(x, store.get(x).to_vec()), (idx_key, idx_values)].into(),
+            outputs: [(out, store.get(out).to_vec()), (act, store.get(act).to_vec())].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        // Re-commit the padded table, honestly open at an arbitrary point, and
+        // move the table opening there. The verifier derives the leaf point
+        // itself, so the moved (internally consistent) opening must reject.
+        let padded = pad_lookup_table(store.get(table));
+        let arity = padded.len().trailing_zeros() as usize;
+        let pow = Whir::required_pow_bits(arity, 90);
+        let table_whir = Whir::with_params(arity, 90, pow);
+        let commitment = commit(&table_whir, &padded);
         let p_new: Vec<Goldilocks> = (0..arity).map(|_| rng.field()).collect();
-        let (open_new, ev_new) = bw.open(c_m.prover_data.clone(), &c_m.protocol, &p_new);
-        let (open_t_new, ev_t_new) = bw.open(c_t.prover_data.clone(), &c_t.protocol, &p_new);
-
-        for to in proof.table_openings.iter_mut() {
-            to.point = p_new.clone();
-            to.claimed = ev_new;
-            to.opening = open_new.clone();
-            to.table_eval = ev_t_new;
-            to.table_opening = Some(open_t_new.clone());
-            to.den_point = p_new.clone();
-            to.den_table_eval = ev_t_new;
-            to.den_table_opening = Some(open_t_new.clone());
-            // (S2: there is no stored den_leaf to recompute — the verifier
-            // derives it from the fractional replay, so the moved point can
-            // never match the derived leaf point.)
+        let (open_new, ev_new) = table_whir.open(commitment.prover_data.clone(), &commitment.protocol, &p_new);
+        let mut forged: BoundExecutionProof = bincode::deserialize(&bincode::serialize(&proof).unwrap()).unwrap();
+        let mut hit = false;
+        for step in &mut forged.reverse.steps {
+            if let ReverseReduction::Lookup { proof } = &mut step.reduction {
+                proof.table_opening = Some(open_new.clone());
+                proof.table_value = ev_new;
+                hit = true;
+            }
         }
-        // S2: must be REJECTED (pre-fix it is ACCEPTED).
-        assert!(!verify_committed_shard_dag(
-            &store.owned_slices(),
-            &ops,
-            1,
-            &whir,
-            &proof
-        ,            &PublicStatement::Generic
-        ));
+        assert!(hit);
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged, &PublicStatement::Generic, &model, &execution));
     }
 
     /// S4 guard: a bind must merge claims of ONE tensor. Swapping the binds
@@ -8330,7 +10192,7 @@ mod tests {
             1,
             &whir,
             &proof,
-            &stmt
+            &stmt, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
         ));
         let bytes = bincode::serialize(&proof).unwrap();
         assert!(verify_committed_shard_dag_bytes(
@@ -8339,7 +10201,7 @@ mod tests {
             &ops,
             1,
             &whir,
-            &stmt
+            &stmt, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
         ));
     }
 
@@ -8364,7 +10226,7 @@ mod tests {
             &ops,
             1,
             &whir,
-            &stmt
+            &stmt, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
         ));
     }
 
@@ -8389,7 +10251,7 @@ mod tests {
             &ops,
             1,
             &whir,
-            &stmt
+            &stmt, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
         ));
     }
 
@@ -8413,7 +10275,7 @@ mod tests {
             &ops,
             1,
             &whir,
-            &stmt
+            &stmt, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
         ));
     }
 
@@ -8437,7 +10299,7 @@ mod tests {
             &ops,
             1,
             &whir,
-            &stmt
+            &stmt, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
         ));
     }
 
@@ -8467,7 +10329,7 @@ mod tests {
             &ops,
             1,
             &whir,
-            &stmt
+            &stmt, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
         ));
     }
 
@@ -8495,7 +10357,7 @@ mod tests {
             &ops,
             1,
             &whir,
-            &stmt
+            &stmt, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
         ));
         // re-point the binding at a different witness column: the derived
         // (batch, table) of the embedding lookup must be used, never a
@@ -8509,7 +10371,7 @@ mod tests {
             &ops,
             1,
             &whir,
-            &stmt
+            &stmt, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
         ));
     }
 
@@ -8538,7 +10400,7 @@ mod tests {
             &ops,
             1,
             &whir,
-            &stmt
+            &stmt, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
         ));
     }
 
@@ -8565,7 +10427,7 @@ mod tests {
             &ops,
             1,
             &whir,
-            &stmt_bad
+            &stmt_bad, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
         ));
         let stmt_ok = PublicStatement::LanguageModel {
             prompt: tokens[..3].to_vec(),
@@ -8578,7 +10440,7 @@ mod tests {
             &ops,
             1,
             &whir,
-            &stmt_ok
+            &stmt_ok, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
         ));
     }
 
@@ -8603,7 +10465,7 @@ mod tests {
             &ops,
             1,
             &whir,
-            &stmt
+            &stmt, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
         ));
     }
 
@@ -8624,7 +10486,7 @@ mod tests {
             &ops,
             1,
             &whir,
-            &PublicStatement::Generic
+            &PublicStatement::Generic, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
         ));
     }
 
@@ -8637,63 +10499,45 @@ mod tests {
         let mut rng = XorShift64::new(0x52_05);
         let (m, k, n, shift) = (4usize, 4usize, 4usize, 8u32);
         let mut store = Store::new();
-        let x = store.push(
-            (0..m * k)
-                .map(|_| from_i64((rng.next_u64() % 50) as i64))
-                .collect(),
-        );
-        let w = store.push(
-            (0..k * n)
-                .map(|_| from_i64((rng.next_u64() % 50) as i64))
-                .collect(),
-        );
-        let b = store.push(
-            (0..m * n)
-                .map(|_| from_i64((rng.next_u64() % 10) as i64 - 5))
-                .collect(),
-        );
+        let x = store.push((0..m * k).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let w = store.push((0..k * n).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let b = store.push((0..m * n).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
         let out = store.push(vec![]);
         let rem = store.push(vec![]);
-        let table = store.push(
-            (0..32)
-                .map(|j| from_i64((j as i64 * j as i64) % 1000))
-                .collect(),
-        );
+        let table = store.push((0..32).map(|j| from_i64((j as i64 * j as i64) % 1000)).collect());
         let idx = store.push_idx((0..16u32).collect::<Vec<u32>>());
         let act = store.push(vec![]);
         let ops = vec![
-            Op::Projection {
-                x,
-                w,
-                bias: b,
-                out,
-                rem,
-                m,
-                k,
-                n,
-                shift,
-            },
-            Op::Lookup {
-                idx,
-                out: act,
-                table,
-            },
+            Op::Projection { x, w, bias: b, out, rem, m, k, n, shift },
+            Op::Lookup { idx, out: act, table },
         ];
-
-        let whir = Whir::new_testing(5);
-        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s2-cache5");
-        let tokens_t = store.push_idx(vec![]);
-        let argmax_t = store.push_idx(vec![]);
-        let proof =
-            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
-        assert!(verify_committed_shard_dag(
-            &store.owned_slices(),
-            &ops,
-            1,
-            &whir,
-            &proof
-        ,            &PublicStatement::Generic
-        ));
+        let whir = Whir::with_params(5, 90, 17);
+        let cache_dir = std::env::temp_dir().join("zkie-s2-cache5");
+        let cached = commit_model_weights(&store, &ops, cache_dir.to_str().unwrap());
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(idx, 16usize)].into());
+        let idx_values: Vec<Goldilocks> = store.idx.get(idx).unwrap().iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let idx_key = TensorKey::Index(idx).encoded().unwrap();
+        let execution = TrustedExecution {
+            inputs: [(x, store.get(x).to_vec()), (idx_key, idx_values)].into(),
+            outputs: [(out, store.get(out).to_vec()), (act, store.get(act).to_vec())].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let mut table_committed = false;
+        for step in &proof.reverse.steps {
+            if let ReverseReduction::Lookup { proof } = &step.reduction {
+                assert!(proof.table_opening.is_some());
+                table_committed = true;
+            }
+        }
+        assert!(table_committed);
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+        let mut bad = execution.clone();
+        bad.inputs.get_mut(&idx_key).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &bad));
     }
 
     /// S2: honest committed roundtrip with an IDENTITY lookup table — the
@@ -8705,66 +10549,44 @@ mod tests {
         let mut rng = XorShift64::new(0x52_09);
         let (m, k, n, shift) = (4usize, 4usize, 4usize, 8u32);
         let mut store = Store::new();
-        let x = store.push(
-            (0..m * k)
-                .map(|_| from_i64((rng.next_u64() % 50) as i64))
-                .collect(),
-        );
-        let w = store.push(
-            (0..k * n)
-                .map(|_| from_i64((rng.next_u64() % 50) as i64))
-                .collect(),
-        );
-        let b = store.push(
-            (0..m * n)
-                .map(|_| from_i64((rng.next_u64() % 10) as i64 - 5))
-                .collect(),
-        );
+        let x = store.push((0..m * k).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let w = store.push((0..k * n).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let b = store.push((0..m * n).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
         let out = store.push(vec![]);
         let rem = store.push(vec![]);
-        // Identity table [0..32): out[i] = idx[i] by the table relation.
-        let table = store.push(
-            (0..32).map(|j| Goldilocks::from_u64(j as u64)).collect(),
-        );
+        // Identity table [0..32): act[i] = idx[i] by the table relation.
+        let table = store.push((0..32).map(|j| Goldilocks::from_u64(j as u64)).collect());
         let idx = store.push_idx((0..16u32).collect::<Vec<u32>>());
         let act = store.push(vec![]);
         let ops = vec![
-            Op::Projection {
-                x,
-                w,
-                bias: b,
-                out,
-                rem,
-                m,
-                k,
-                n,
-                shift,
-            },
-            Op::Lookup {
-                idx,
-                out: act,
-                table,
-            },
+            Op::Projection { x, w, bias: b, out, rem, m, k, n, shift },
+            Op::Lookup { idx, out: act, table },
         ];
-
-        let whir = Whir::new_testing(5);
-        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s2-cache9");
-        let tokens_t = store.push_idx(vec![]);
-        let argmax_t = store.push_idx(vec![]);
-        let proof =
-            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
-        assert!(proof
-            .table_openings
-            .iter()
-            .all(|to| to.table_commitment.is_none()));
-        assert!(verify_committed_shard_dag(
-            &store.owned_slices(),
-            &ops,
-            1,
-            &whir,
-            &proof
-        ,            &PublicStatement::Generic
-        ));
+        let whir = Whir::with_params(5, 90, 17);
+        let cache_dir = std::env::temp_dir().join("zkie-s2-cache9");
+        let cached = commit_model_weights(&store, &ops, cache_dir.to_str().unwrap());
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(idx, 16usize)].into());
+        assert!(model.identity_tables.contains_key(&table));
+        let idx_values: Vec<Goldilocks> = store.idx.get(idx).unwrap().iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let idx_key = TensorKey::Index(idx).encoded().unwrap();
+        let execution = TrustedExecution {
+            inputs: [(x, store.get(x).to_vec()), (idx_key, idx_values)].into(),
+            outputs: [(out, store.get(out).to_vec()), (act, store.get(act).to_vec())].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let mut table_identity = false;
+        for step in &proof.reverse.steps {
+            if let ReverseReduction::Lookup { proof } = &step.reduction {
+                assert!(proof.table_opening.is_none());
+                table_identity = true;
+            }
+        }
+        assert!(table_identity);
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
     }
 
     /// S2: honest committed roundtrip with Scatter + Gather — the committed
@@ -8899,7 +10721,7 @@ mod tests {
             1,
             &whir,
             &proof
-        ,            &PublicStatement::Generic
+        ,            &PublicStatement::Generic, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
         ));
     }
 
@@ -8912,62 +10734,41 @@ mod tests {
         let mut rng = XorShift64::new(0x52_07);
         let (m, k, n) = (32usize, 32usize, 32usize);
         let mut store = Store::new();
-        let x = store.push(
-            (0..m * k)
-                .map(|_| from_i64((rng.next_u64() % 50) as i64))
-                .collect(),
-        );
-        let w = store.push(
-            (0..k * n)
-                .map(|_| from_i64((rng.next_u64() % 50) as i64))
-                .collect(),
-        );
+        let x = store.push((0..m * k).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let w = store.push((0..k * n).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
         let out = store.push(vec![]);
         let ops = vec![Op::MatMul { a: x, b: w, c: out, m, k, n }];
-
-        let whir = Whir::new_testing(5);
-        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s2-cache7");
+        let whir = Whir::with_params(5, 90, 17);
+        let cache_dir = std::env::temp_dir().join("zkie-s2-cache7");
+        let cached = commit_model_weights(&store, &ops, cache_dir.to_str().unwrap());
         assert!(!cached.is_empty());
-        let tokens_t = store.push_idx(vec![]);
-        let argmax_t = store.push_idx(vec![]);
-        let proof =
-            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
-        assert!(!proof.weight_batches.is_empty());
-        assert!(verify_committed_shard_dag(&store.owned_slices(), &ops, 1, &whir, &proof, &PublicStatement::Generic));
-
-        // Forgery 1: empty commitments (drop every weight batch + opening).
-        let mut forged =
-            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
-        forged.weight_batches.clear();
-        forged.weight_batch_openings.clear();
-        assert!(!verify_committed_shard_dag(
-            &store.owned_slices(),
-            &ops,
-            1,
-            &whir,
-            &forged
-        ,            &PublicStatement::Generic
-        ));
-
-        // Forgery 2: zero-round matmul sumcheck (round count comes from the
-        // statement k=32, so an emptied sumcheck is rejected).
-        let mut forged2 =
-            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
-        for shard in forged2.shards.iter_mut() {
-            for op in shard.ops.iter_mut() {
-                if let OpProof::MatMul(mp, _, _, _) = op {
-                    mp.sumcheck.rounds.clear();
-                }
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops);
+        let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, store.get(out).to_vec())].into() };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
+        assert!(!proof.weight_openings.is_empty());
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+        // Forgery 1: empty commitments (drop every weight opening).
+        let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        forged.weight_openings.clear();
+        assert!(!verify_committed_shard_dag_bound_bytes(&bincode::serialize(&forged).unwrap(), &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+        // Forgery 2: zero-round matmul sumcheck (round count comes from k=32).
+        let mut forged2: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        let mut hit = false;
+        for step in &mut forged2.reverse.steps {
+            if let ReverseReduction::MatMul { proof } = &mut step.reduction {
+                proof.sumcheck.rounds.clear();
+                hit = true;
             }
         }
-        assert!(!verify_committed_shard_dag(
-            &store.owned_slices(),
-            &ops,
-            1,
-            &whir,
-            &forged2
-        ,            &PublicStatement::Generic
-        ));
+        assert!(hit);
+        assert!(!verify_committed_shard_dag_bound_bytes(&bincode::serialize(&forged2).unwrap(), &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+        // Bytes entry with a wrong public input must reject.
+        let mut bad = execution.clone();
+        bad.inputs.get_mut(&x).unwrap()[0] += Goldilocks::ONE;
+        assert!(!verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &bad));
     }
 
     /// S2: weight openings are pinned to the locally built claims (tensor,
@@ -8979,101 +10780,46 @@ mod tests {
         let mut rng = XorShift64::new(0x52_08);
         let (m, k, shift) = (4usize, 8usize, 8u32);
         let mut store = Store::new();
-        let x = store.push(
-            (0..m * k)
-                .map(|_| from_i64((rng.next_u64() % 50) as i64))
-                .collect(),
-        );
+        let x = store.push((0..m * k).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
         // Two projections with different weight sizes -> two weight batches.
-        let w1 = store.push(
-            (0..k * 8)
-                .map(|_| from_i64((rng.next_u64() % 50) as i64))
-                .collect(),
-        );
-        let b1 = store.push(
-            (0..m * 8)
-                .map(|_| from_i64((rng.next_u64() % 10) as i64 - 5))
-                .collect(),
-        );
+        let w1 = store.push((0..k * 8).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let b1 = store.push((0..m * 8).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
         let mid = store.push(vec![]);
         let rem1 = store.push(vec![]);
-        let w2 = store.push(
-            (0..k * 16)
-                .map(|_| from_i64((rng.next_u64() % 50) as i64))
-                .collect(),
-        );
-        let b2 = store.push(
-            (0..m * 16)
-                .map(|_| from_i64((rng.next_u64() % 10) as i64 - 5))
-                .collect(),
-        );
+        let w2 = store.push((0..k * 16).map(|_| from_i64((rng.next_u64() % 50) as i64)).collect());
+        let b2 = store.push((0..m * 16).map(|_| from_i64((rng.next_u64() % 10) as i64 - 5)).collect());
         let out = store.push(vec![]);
         let rem2 = store.push(vec![]);
         let ops = vec![
-            Op::Projection {
-                x,
-                w: w1,
-                bias: b1,
-                out: mid,
-                rem: rem1,
-                m,
-                k,
-                n: 8,
-                shift,
-            },
-            Op::Projection {
-                x: mid,
-                w: w2,
-                bias: b2,
-                out,
-                rem: rem2,
-                m,
-                k,
-                n: 16,
-                shift,
-            },
+            Op::Projection { x, w: w1, bias: b1, out: mid, rem: rem1, m, k, n: 8, shift },
+            Op::Projection { x: mid, w: w2, bias: b2, out, rem: rem2, m, k, n: 16, shift },
         ];
-
-        let whir = Whir::new_testing(5);
-        let cached = commit_model_weights(&store, &ops, "/tmp/zkie-s2-cache8");
+        let whir = Whir::with_params(5, 90, 17);
+        let cache_dir = std::env::temp_dir().join("zkie-s2-cache8");
+        let cached = commit_model_weights(&store, &ops, cache_dir.to_str().unwrap());
         assert!(cached.len() >= 2);
-        let tokens_t = store.push_idx(vec![]);
-        let argmax_t = store.push_idx(vec![]);
-        let proof =
-            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
-        assert!(proof.weight_batches.len() >= 2);
-        assert!(verify_committed_shard_dag(&store.owned_slices(), &ops, 1, &whir, &proof, &PublicStatement::Generic));
-
-        // Forgery 1: change one opening's claimed value -> the point-set
-        // comparison against the locally built claims rejects it.
-        let mut forged =
-            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
-        if let Some(o) = forged.weight_batch_openings.iter_mut().find(|o| !o.claimed.is_empty()) {
-            o.claimed[0] = o.claimed[0] + Goldilocks::ONE;
+        forward_ops(&mut store, &ops);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops);
+        let execution = TrustedExecution { inputs: [(x, store.get(x).to_vec())].into(), outputs: [(out, store.get(out).to_vec())].into() };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
+        assert!(proof.weight_openings.len() >= 2);
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let bytes = bincode::serialize(&proof).unwrap();
+        // Forgery 1: changing an opening's claimed value must reject.
+        let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        let mut hit = false;
+        if let Some(o) = forged.weight_openings.iter_mut().find(|o| !o.claimed.is_empty()) {
+            o.claimed[0] += Goldilocks::ONE;
+            hit = true;
         }
-        assert!(!verify_committed_shard_dag(
-            &store.owned_slices(),
-            &ops,
-            1,
-            &whir,
-            &forged
-        ,            &PublicStatement::Generic
-        ));
-
-        // Forgery 2: swap two batch roots (openings stay with their batches) ->
-        // the openings no longer verify against the swapped roots.
-        let mut forged2 =
-            prove_committed_shard_dag(&mut store, &ops, 1, &whir, &cached, tokens_t, argmax_t);
-        let n = forged2.weight_batches.len();
-        forged2.weight_batches.swap(0, n - 1);
-        assert!(!verify_committed_shard_dag(
-            &store.owned_slices(),
-            &ops,
-            1,
-            &whir,
-            &forged2
-        ,            &PublicStatement::Generic
-        ));
+        assert!(hit);
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged, &PublicStatement::Generic, &model, &execution));
+        // Forgery 2: swapping two weight-opening groups must reject (openings
+        // are pinned to the locally built per-batch claims/roots).
+        let mut forged2: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        let n = forged2.weight_openings.len();
+        forged2.weight_openings.swap(0, n - 1);
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged2, &PublicStatement::Generic, &model, &execution));
     }
 
     #[test]
@@ -9139,6 +10885,7 @@ mod tests {
         let whir = Whir::new_testing(5);
         let tokens_t = store.push_idx(vec![]);
         let argmax_t = store.push_idx(vec![]);
+        let cached = Vec::new();
         let mut proof = prove_committed_shard_dag(
             &mut store,
             &ops,
@@ -9158,7 +10905,7 @@ mod tests {
             1,
             &whir,
             &proof
-        ,            &PublicStatement::Generic
+        ,            &PublicStatement::Generic, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
         ));
         let bytes = bincode::serialize(&proof).unwrap();
         assert!(verify_committed_shard_dag_bytes(
@@ -9167,7 +10914,7 @@ mod tests {
             &ops,
             1,
             &whir,
-            &PublicStatement::Generic
+            &PublicStatement::Generic, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
         ));
 
         proof.sel_openings[0].points[0][0] =
@@ -9178,7 +10925,7 @@ mod tests {
             1,
             &whir,
             &proof
-        ,            &PublicStatement::Generic
+        ,            &PublicStatement::Generic, &TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
         ));
     }
 

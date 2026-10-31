@@ -20,6 +20,16 @@ pub struct SamePolyProof {
     pub merged_point: Vec<Goldilocks>,
 }
 
+fn absorb_claims(transcript: &mut Transcript, claims: &[(Vec<Goldilocks>, Goldilocks)]) {
+    transcript.absorb(b"zkie-same-poly-claims-v1");
+    transcript.absorb_u64(claims.len() as u64);
+    for (point, value) in claims {
+        transcript.absorb_u64(point.len() as u64);
+        transcript.absorb_fields(point);
+        transcript.absorb_field(*value);
+    }
+}
+
 /// Prove a set of claims (r_i, y_i) are all evaluations of the SAME MLE f
 /// (f(r_i) = y_i), and merge them into one claim at the sumcheck-derived
 /// point r*. S4: the batch coefficients are powers of ONE transcript gamma;
@@ -35,6 +45,7 @@ pub fn prove_same_poly(
     for (r_i, _) in claims {
         assert_eq!(r_i.len(), t);
     }
+    absorb_claims(transcript, claims);
     let gamma = transcript.field();
     let mut coeffs = Vec::with_capacity(claims.len());
     let mut acc = Goldilocks::ONE;
@@ -85,6 +96,7 @@ pub fn verify_same_poly(
         }
     }
     // The coefficients are gamma powers derived from the transcript.
+    absorb_claims(transcript, claims);
     let gamma = transcript.field();
     if gamma != proof.gamma {
         return None;
@@ -132,6 +144,24 @@ pub fn verify_same_poly(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adaptive_distinct_point_claims_cannot_cancel() {
+        let f = vec![Goldilocks::from_u64(3), Goldilocks::from_u64(7)];
+        let p0 = vec![Goldilocks::ZERO];
+        let p1 = vec![Goldilocks::ONE];
+        let mut peek = Transcript::new(b"adaptive-claims");
+        let gamma = peek.field();
+        let claims = vec![(p0, f[0] + Goldilocks::ONE),
+                          (p1, f[1] - gamma.inverse())];
+        let mut prover = Transcript::new(b"adaptive-claims");
+        let (proof, _) = prove_same_poly(&f, &claims, &mut prover);
+        let mut verifier = Transcript::new(b"adaptive-claims");
+        if let Some((point, value)) = verify_same_poly(&proof, &claims, &mut verifier) {
+            assert_ne!(value, crate::common::mle::eval(&f, &point),
+                       "forged claims passed with a genuine endpoint");
+        }
+    }
 
     #[test]
     fn same_poly_roundtrip() {
