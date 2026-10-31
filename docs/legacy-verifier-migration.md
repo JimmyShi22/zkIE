@@ -56,3 +56,48 @@ proof are exercised in `s2_empty_weight_batches_rejected` and
 - LayerNormCentered, Softmax, StableSoftmaxIndex reductions (real GPT-2 chain).
 - S8: base-field integer modular wraparound unresolved.
 - S9: 90-bit WHIR PCS setting is not a 90-bit whole-protocol claim.
+## Argmax reverse protocol (corrected, pending implementation)
+
+Claims arrive per output at their own challenge points: `thr, sel, gate, d1, d2`
+(field) and `out` (typed `TensorKey::Index`). They must NOT be treated as one
+shared point; each constraint below may emit its own `x` claim at its own point,
+and the existing `same_poly` merge (or leaf authentication) combines them.
+
+### Prefix/suffix orientation (corrected)
+
+For row `i` with one-hot `sel` at `out_i`:
+
+- `before_j = 1[j < out_i] = sum_{k>j} sel_k` (SUFFIX sum).
+- `after_j  = 1[j > out_i] = sum_{k<j} sel_k` (prefix sum).
+
+Prove the recurrence, not just boolean columns:
+
+- `before_{n-1} = 0`, and for `j < n-1`: `before_j = before_{j+1} + sel_{j+1}`.
+- Equivalently `after_0 = 0`, `after_{j+1} = after_j + sel_j`.
+- `sel` boolean, per-row `sum_j sel_j = 1`, `sel_j + before_j <= 1`.
+
+### Row constraints
+
+1. `gate = sel * x`.
+2. `d1 = sel * (x - thr)` and `d1 = 0` on the selected entry.
+3. `d2 = (1 - sel) * (thr - x)`, `d2 >= 0`.
+4. `thr = sum_j sel_j * x_j`.
+5. First-maximum (strict `>` forward rule): `d2_j - before_j + sel_j >= 0`.
+   For `j < out` this forces `thr - x_j >= 1`; for `j > out` it forces `>= 0`;
+   the selected entry is the unique minimum index attaining the maximum.
+6. Index binding: the `out` claim at its point equals `sum_j j * sel_j` in the
+   typed index encoding; a proof-carried integer `t` is never trusted.
+
+### Required regressions
+
+- Two tied maxima in one row, one at the row start and one at the row end;
+  verification must accept only the lowest index.
+- Tie at the row end must reject an equal-value earlier/later choice.
+- Different output claims at different random points must still merge through
+  `same_poly`, not be forced onto one point.
+
+### Reused primitives
+
+`prove_virtual`/`verify_virtual`, `mle::eq_evals`, `same_poly`, WHIR batch
+opening, `RangeDecompProof`/range checks from topk, `verify_sequence_shift`
+and `embedding_lookup_column` for the LM binding.

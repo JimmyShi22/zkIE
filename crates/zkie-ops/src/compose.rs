@@ -169,6 +169,10 @@ fn reverse_op_io(op: &Op) -> Option<(Vec<T>, Vec<T>)> {
         Op::Lookup { idx, out, .. } => Some((vec![i(*idx)?], vec![f(*out)?])),
         Op::GeluIndex { x, out, .. } => Some((vec![f(*x)?], vec![i(*out)?])),
         Op::Scale { x, out, .. } => Some((vec![f(*x)?], vec![f(*out)?])),
+        Op::Argmax { x, out, sel, thr, gate, d1, d2, .. } => Some((
+            vec![f(*x)?],
+            vec![i(*out)?, f(*sel)?, f(*thr)?, f(*gate)?, f(*d1)?, f(*d2)?],
+        )),
         _ => None,
     }
 }
@@ -179,9 +183,16 @@ fn reverse_op_io(op: &Op) -> Option<(Vec<T>, Vec<T>)> {
 pub struct ReverseDagProof { steps: Vec<ReverseStep> }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct ReverseStep {
+struct ReverseOutputClaim {
     tensor_id: T,
     merge: Option<SamePolyProof>,
+    point: Vec<Goldilocks>,
+    value: Goldilocks,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReverseStep {
+    outputs: Vec<ReverseOutputClaim>,
     reduction: ReverseReduction,
 }
 
@@ -194,6 +205,7 @@ enum ReverseReduction {
     Lookup { proof: ReverseLookupProof },
     GeluIndex { proof: ReverseGeluIndexProof },
     Scale { proof: ReverseScaleProof },
+    Argmax { proof: ReverseArgmaxProof },
     Transpose,
 }
 
@@ -384,8 +396,369 @@ fn verify_reverse_scale(op: &Op, point: &[Goldilocks], value: Goldilocks, aux: O
     Some(EvalClaim { tensor_id: x, point: point.to_vec(), value: x_eval })
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReverseArgmaxProof {
+    sel_bool: VirtualProof,
+    bit_bool: VirtualProof,
+    row_sum: VirtualProof,
+    before_sum: VirtualProof,
+    out_sum: VirtualProof,
+    thr_sum: VirtualProof,
+    aux_values: Vec<Goldilocks>,
+    opening: zkie_core::pcs::batch_open::BatchOpeningProof,
+    x_evals: [Goldilocks; 4],
+    thr_evals: [Goldilocks; 2],
+}
+
+fn argmax_pad_point(point: &[Goldilocks], arity: usize) -> Vec<Goldilocks> {
+    let mut out = point.to_vec();
+    out.resize(arity, Goldilocks::ZERO);
+    out
+}
+
+fn argmax_claim(outs: &[(T, Vec<Goldilocks>, Goldilocks)], id: T) -> Option<(Vec<Goldilocks>, Goldilocks)> {
+    outs.iter().find(|o| o.0 == id).map(|o| (o.1.clone(), o.2))
+}
+
+fn argmax_known_cols(m: usize, n: usize, arity: usize) -> (Vec<Goldilocks>, Vec<Goldilocks>) {
+    let mut rows = vec![Goldilocks::ZERO; 1usize << arity];
+    let mut ints = vec![Goldilocks::ZERO; 1usize << arity];
+    for i in 0..m {
+        for j in 0..n {
+            rows[i * n + j] = Goldilocks::ONE;
+            ints[i * n + j] = Goldilocks::from_u64(j as u64);
+        }
+    }
+    (rows, ints)
+}
+
+fn argmax_coeff_col(eq_rows: &[Goldilocks], coeff: &[Goldilocks], m: usize, n: usize, arity: usize) -> Vec<Goldilocks> {
+    let mut out = vec![Goldilocks::ZERO; 1usize << arity];
+    for i in 0..m {
+        for j in 0..n {
+            out[i * n + j] = eq_rows[i] * coeff[j];
+        }
+    }
+    out
+}
+
+fn prove_reverse_argmax(store: &Store, op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
+    aux: PreparedAux, transcript: &mut Transcript) -> Option<(ReverseArgmaxProof, Vec<EvalClaim>)>
+{
+    eprintln!("argmax-enter outs={}", outs.len());
+    let (x, sel, thr, gate, d1, d2, out, m, n) = match op {
+        Op::Argmax { x, sel, thr, gate, d1, d2, out, m, n } => (*x, *sel, *thr, *gate, *d1, *d2, *out, *m, *n),
+        _ => return None,
+    };
+    if !m.is_power_of_two() || !n.is_power_of_two() { return None; }
+    if m.checked_mul(n)? < 32 { return None; }
+    let lgn = n.trailing_zeros() as usize;
+    let lgm = m.trailing_zeros() as usize;
+    let arity = aux.descriptor.arity;
+    let len = 1usize.checked_shl(arity as u32)?;
+    let (qs, vs) = argmax_claim(outs, sel)?;
+    let (qt, vt) = argmax_claim(outs, thr)?;
+    let (qg, vg) = argmax_claim(outs, gate)?;
+    let (qd, vd) = argmax_claim(outs, d1)?;
+    let (q2, v2) = argmax_claim(outs, d2)?;
+    let out_key = TensorKey::Index(out).encoded()?;
+    let (qo, vo) = argmax_claim(outs, out_key)?;
+    eprintln!("argmax-claims qs={} qg={} qd={} q2={} qt={} qo={} arity={} lgm={}", qs.len(), qg.len(), qd.len(), q2.len(), qt.len(), qo.len(), arity, lgm);
+    if qs.len() != arity || qg.len() != arity || qd.len() != arity || q2.len() != arity
+        || qt.len() != lgm || qo.len() != lgm { eprintln!("argmax-len"); return None; }
+    let cols = &aux.columns;
+    let col_eval = |i: usize, p: &[Goldilocks]| mle::eval(&cols[i], &argmax_pad_point(p, arity));
+    let mut xp = store.get(x).to_vec(); xp.resize(len, Goldilocks::ZERO);
+    let thrv = store.get(thr).to_vec();
+    eprintln!("argmax-thr-len={} m={}", thrv.len(), m);
+    if thrv.len() != m { eprintln!("argmax-thr-bad"); return None; }
+    let row_of = |p: &[Goldilocks]| -> Vec<Goldilocks> { p[lgn..lgn + lgm].to_vec() };
+    let x_at = |p: &[Goldilocks]| mle::eval(&xp, &argmax_pad_point(p, arity));
+
+    // Pointwise bindings at the claim points.
+    if col_eval(0, &qs) != vs { eprintln!("argmax-fail sel vs={} aux={}", to_i64(vs), to_i64(col_eval(0, &qs))); return None; }
+    eprintln!("argmax-step selok");
+    let sel_g = col_eval(0, &qg);
+    let x_g = x_at(&qg);
+    if vg != sel_g * x_g { eprintln!("argmax-fail gate vg={} sel={} x={} prod={} direct_g={} direct_sel={} direct_x={}", to_i64(vg), to_i64(sel_g), to_i64(x_g), to_i64(sel_g * x_g), to_i64(mle::eval(store.get(gate), &argmax_pad_point(&qg, arity))), to_i64(mle::eval(store.get(sel), &argmax_pad_point(&qg, arity))), to_i64(mle::eval(store.get(x), &argmax_pad_point(&qg, arity)))); return None; }
+    eprintln!("argmax-step gateok");
+    let sel_d = col_eval(0, &qd);
+    let x_d = x_at(&qd);
+    let thr_d = mle::eval(&thrv, &row_of(&qd));
+    if vd != Goldilocks::ZERO || vd != sel_d * (x_d - thr_d) { eprintln!("argmax-fail d1 vd={} sel={} x={} thr={}", to_i64(vd), to_i64(sel_d), to_i64(x_d), to_i64(thr_d)); return None; }
+    eprintln!("argmax-step d1ok");
+    let sel_2 = col_eval(0, &q2);
+    let x_2 = x_at(&q2);
+    let thr_2 = mle::eval(&thrv, &row_of(&q2));
+    if v2 != (Goldilocks::ONE - sel_2) * (thr_2 - x_2) { eprintln!("argmax-fail d2"); return None; }
+    eprintln!("argmax-step d2ok");
+    let mut d2_at_q2 = Goldilocks::ZERO;
+    for b in 0..ARGMAX_D2_BITS { d2_at_q2 = d2_at_q2 + Goldilocks::from_u64(1u64 << b) * col_eval(ARGMAX_D2_COL + b, &q2); }
+    if d2_at_q2 != v2 { eprintln!("argmax-fail d2bits"); return None; }
+    eprintln!("argmax-step d2bitsok");
+
+    // Challenge points.
+    let q_bool = transcript.field_vec(arity);
+    let gamma_bool = transcript.field();
+    let q_bit = transcript.field_vec(arity);
+    let gamma_bit = transcript.field();
+    let q_tie = transcript.field_vec(arity);
+    let r_rows = transcript.field_vec(lgm);
+    let r_col = transcript.field_vec(lgn);
+    let r_before: Vec<Goldilocks> = r_col.iter().chain(r_rows.iter()).cloned().collect();
+    let before_r = col_eval(ARGMAX_BEFORE_COL, &r_before);
+    let eq_rows = mle::eq_evals(&r_rows);
+    let eq_col = mle::eq_evals(&r_col);
+    let mut suffix = vec![Goldilocks::ZERO; n];
+    let mut acc = Goldilocks::ZERO;
+    for k in 0..n { suffix[k] = acc; acc = acc + eq_col[k]; }
+    let before_coeff = argmax_coeff_col(&eq_rows, &suffix, m, n, arity);
+    let ones = vec![Goldilocks::ONE; n];
+    let eq_rows_col = argmax_coeff_col(&eq_rows, &ones, m, n, arity);
+    let qo_rows = mle::eq_evals(&qo);
+    let out_coeff = argmax_coeff_col(&qo_rows, &(0..n).map(|j| Goldilocks::from_u64(j as u64)).collect::<Vec<_>>(), m, n, arity);
+    let qt_rows = mle::eq_evals(&qt);
+
+    // Virtual proofs (aux evals at endpoints are opened in one batch below).
+    let eq_bool = mle::eq_evals(&q_bool);
+    let mut mles: Vec<&[Goldilocks]> = vec![&eq_bool, &cols[0], &cols[1]];
+    let g = gamma_bool;
+    let terms = vec![
+        (Goldilocks::ONE, vec![1usize]),
+        (-Goldilocks::ONE, vec![1usize, 1usize]),
+        (g, vec![2usize]),
+        (-g, vec![2usize, 2usize]),
+        (g * g, vec![1usize, 2usize]),
+    ];
+    let (sel_bool, z1) = prove_virtual(&mles, &terms, Goldilocks::ZERO, transcript);
+    let eq_bit = mle::eq_evals(&q_bit);
+    mles = vec![&eq_bit];
+    for i in 0..(ARGMAX_D2_BITS + ARGMAX_TIE_BITS) { mles.push(&cols[ARGMAX_D2_COL + i]); }
+    let mut bit_terms = Vec::new();
+    let mut gp = Goldilocks::ONE;
+    for i in 0..(ARGMAX_D2_BITS + ARGMAX_TIE_BITS) {
+        bit_terms.push((gp, vec![1 + i]));
+        bit_terms.push((-gp, vec![1 + i, 1 + i]));
+        gp = gp * gamma_bit;
+    }
+    let (bit_bool, z2) = prove_virtual(&mles, &bit_terms, Goldilocks::ZERO, transcript);
+    let mles_rs: Vec<&[Goldilocks]> = vec![&eq_rows_col, &cols[0]];
+    let (row_sum, z3) = prove_virtual(&mles_rs, &[(Goldilocks::ONE, vec![0usize, 1usize])], Goldilocks::ONE, transcript);
+    let mles_bs: Vec<&[Goldilocks]> = vec![&before_coeff, &cols[0]];
+    let (before_sum, z4) = prove_virtual(&mles_bs, &[(Goldilocks::ONE, vec![0usize, 1usize])], before_r, transcript);
+    let mles_os: Vec<&[Goldilocks]> = vec![&out_coeff, &cols[0]];
+    let (out_sum, z5) = prove_virtual(&mles_os, &[(Goldilocks::ONE, vec![0usize, 1usize])], vo, transcript);
+    let mles_ts: Vec<&[Goldilocks]> = vec![&eq_rows_col, &cols[0], &xp];
+    let (thr_sum, z6) = prove_virtual(&mles_ts, &[(Goldilocks::ONE, vec![0usize, 1usize, 2usize])], vt, transcript);
+    let zs = [&z1, &z2, &z3, &z4, &z5, &z6];
+
+    // One batch opening for fixed points and all endpoints.
+    let mut idxs: Vec<usize> = Vec::new();
+    let mut points: Vec<Vec<Goldilocks>> = Vec::new();
+    let mut values: Vec<Goldilocks> = Vec::new();
+    macro_rules! push { ($idx:expr, $point:expr, $val:expr) => {{ idxs.push($idx); points.push($point); values.push($val); }}; }
+    push!(0, argmax_pad_point(&qs, arity), vs);
+    push!(0, argmax_pad_point(&qg, arity), sel_g);
+    push!(0, argmax_pad_point(&qd, arity), sel_d);
+    push!(0, argmax_pad_point(&q2, arity), sel_2);
+    push!(ARGMAX_BEFORE_COL, argmax_pad_point(&r_before, arity), before_r);
+    for b in 0..ARGMAX_D2_BITS { push!(ARGMAX_D2_COL + b, argmax_pad_point(&q2, arity), col_eval(ARGMAX_D2_COL + b, &q2)); }
+    push!(ARGMAX_BEFORE_COL, argmax_pad_point(&q_tie, arity), col_eval(ARGMAX_BEFORE_COL, &q_tie));
+    push!(0, argmax_pad_point(&q_tie, arity), col_eval(0, &q_tie));
+    for b in 0..ARGMAX_D2_BITS { push!(ARGMAX_D2_COL + b, argmax_pad_point(&q_tie, arity), col_eval(ARGMAX_D2_COL + b, &q_tie)); }
+    for b in 0..ARGMAX_TIE_BITS { push!(ARGMAX_TIE_COL + b, argmax_pad_point(&q_tie, arity), col_eval(ARGMAX_TIE_COL + b, &q_tie)); }
+    let mut sel_idx_fixed = Vec::new();
+    for z in zs {
+        let zp = argmax_pad_point(z, arity);
+        sel_idx_fixed.push(values.len());
+        push!(0, zp.clone(), mle::eval(&cols[0], &zp));
+    }
+    // sel_bool also needs before.
+    let before_bool_idx = values.len();
+    push!(ARGMAX_BEFORE_COL, argmax_pad_point(&z1, arity), mle::eval(&cols[ARGMAX_BEFORE_COL], &argmax_pad_point(&z1, arity)));
+    let mut bit_idx = Vec::new();
+    for i in 0..(ARGMAX_D2_BITS + ARGMAX_TIE_BITS) {
+        bit_idx.push(values.len());
+        push!(ARGMAX_D2_COL + i, argmax_pad_point(&z2, arity), mle::eval(&cols[ARGMAX_D2_COL + i], &argmax_pad_point(&z2, arity)));
+    }
+    let tensors: Vec<Vec<Goldilocks>> = idxs.iter().map(|&i| cols[i].clone()).collect();
+    let ctx = zkie_core::pcs::committed::BatchCtx { commitment: aux.descriptor.commitment.clone(), prover_data: aux.prover_data, protocol: aux.protocol, whir: aux.whir, num_tables: aux.descriptor.columns };
+    let opening = zkie_core::pcs::batch_open::prove_batch_open_committed_owned(ctx, &idxs, &tensors, &points, &values).ok()?;
+
+    let x_evals = [x_g, x_d, x_2, mle::eval(&xp, &argmax_pad_point(&z6, arity))];
+    let claims = vec![
+        EvalClaim { tensor_id: x, point: qg.clone(), value: x_evals[0] },
+        EvalClaim { tensor_id: x, point: qd.clone(), value: x_evals[1] },
+        EvalClaim { tensor_id: x, point: q2.clone(), value: x_evals[2] },
+        EvalClaim { tensor_id: x, point: z6.clone(), value: x_evals[3] },
+        EvalClaim { tensor_id: thr, point: row_of(&qd), value: thr_d },
+        EvalClaim { tensor_id: thr, point: row_of(&q2), value: thr_2 },
+    ];
+    Some((ReverseArgmaxProof { sel_bool, bit_bool, row_sum, before_sum, out_sum, thr_sum,
+        aux_values: values, opening, x_evals, thr_evals: [thr_d, thr_2] }, claims))
+}
+
+fn verify_reverse_argmax(op: &Op, outs: &[(T, Vec<Goldilocks>, Goldilocks)],
+    descriptor: &AuxDescriptor, proof: &ReverseArgmaxProof, transcript: &mut Transcript) -> Option<Vec<EvalClaim>>
+{
+    let (x, sel, thr, gate, d1, d2, out, m, n) = match op {
+        Op::Argmax { x, sel, thr, gate, d1, d2, out, m, n } => (*x, *sel, *thr, *gate, *d1, *d2, *out, *m, *n),
+        _ => return None,
+    };
+    if !m.is_power_of_two() || !n.is_power_of_two() { return None; }
+    if m.checked_mul(n)? < 32 { return None; }
+    let lgn = n.trailing_zeros() as usize;
+    let lgm = m.trailing_zeros() as usize;
+    let arity = descriptor.arity;
+    let (qs, vs) = argmax_claim(outs, sel)?;
+    let (qt, vt) = argmax_claim(outs, thr)?;
+    let (qg, vg) = argmax_claim(outs, gate)?;
+    let (qd, vd) = argmax_claim(outs, d1)?;
+    let (q2, v2) = argmax_claim(outs, d2)?;
+    let out_key = TensorKey::Index(out).encoded()?;
+    let (qo, vo) = argmax_claim(outs, out_key)?;
+    if qs.len() != arity || qg.len() != arity || qd.len() != arity || q2.len() != arity
+        || qt.len() != lgm || qo.len() != lgm { return None; }
+    if descriptor.role != AuxRole::ArgmaxWitness || descriptor.len != m.checked_mul(n)? { return None; }
+    let row_of = |p: &[Goldilocks]| -> Vec<Goldilocks> { p[lgn..lgn + lgm].to_vec() };
+
+    let q_bool = transcript.field_vec(arity);
+    let gamma_bool = transcript.field();
+    let q_bit = transcript.field_vec(arity);
+    let gamma_bit = transcript.field();
+    let q_tie = transcript.field_vec(arity);
+    let r_rows = transcript.field_vec(lgm);
+    let r_col = transcript.field_vec(lgn);
+    let r_before: Vec<Goldilocks> = r_col.iter().chain(r_rows.iter()).cloned().collect();
+    let eq_rows = mle::eq_evals(&r_rows);
+    let eq_col = mle::eq_evals(&r_col);
+    let mut suffix = vec![Goldilocks::ZERO; n];
+    let mut acc = Goldilocks::ZERO;
+    for k in 0..n { suffix[k] = acc; acc = acc + eq_col[k]; }
+    let before_coeff = argmax_coeff_col(&eq_rows, &suffix, m, n, arity);
+    let ones = vec![Goldilocks::ONE; n];
+    let eq_rows_col = argmax_coeff_col(&eq_rows, &ones, m, n, arity);
+    let _ = &eq_rows_col;
+    let out_coeff = argmax_coeff_col(&mle::eq_evals(&qo), &(0..n).map(|j| Goldilocks::from_u64(j as u64)).collect::<Vec<_>>(), m, n, arity);
+    let qt_rows = mle::eq_evals(&qt);
+
+    // Replay virtual proofs to derive endpoints and check the round arithmetic.
+    let eq_bool = mle::eq_evals(&q_bool);
+    let g = gamma_bool;
+    let terms = vec![
+        (Goldilocks::ONE, vec![1usize]),
+        (-Goldilocks::ONE, vec![1usize, 1usize]),
+        (g, vec![2usize]),
+        (-g, vec![2usize, 2usize]),
+        (g * g, vec![1usize, 2usize]),
+    ];
+    let before_r = *proof.aux_values.get(4)?;
+    let (ok1, z1, f1) = verify_virtual(&proof.sel_bool, &terms, Goldilocks::ZERO, arity, transcript);
+    if !ok1 { return None; }
+    let eq_bit = mle::eq_evals(&q_bit);
+    let mut bit_terms = Vec::new();
+    let mut gp = Goldilocks::ONE;
+    for i in 0..(ARGMAX_D2_BITS + ARGMAX_TIE_BITS) {
+        bit_terms.push((gp, vec![1 + i]));
+        bit_terms.push((-gp, vec![1 + i, 1 + i]));
+        gp = gp * gamma_bit;
+    }
+    let (ok2, z2, f2) = verify_virtual(&proof.bit_bool, &bit_terms, Goldilocks::ZERO, arity, transcript);
+    if !ok2 { return None; }
+    let (ok3, z3, f3) = verify_virtual(&proof.row_sum, &[(Goldilocks::ONE, vec![0usize, 1usize])], Goldilocks::ONE, arity, transcript);
+    if !ok3 { return None; }
+    let (ok4, z4, f4) = verify_virtual(&proof.before_sum, &[(Goldilocks::ONE, vec![0usize, 1usize])], before_r, arity, transcript);
+    if !ok4 { return None; }
+    let (ok5, z5, f5) = verify_virtual(&proof.out_sum, &[(Goldilocks::ONE, vec![0usize, 1usize])], vo, arity, transcript);
+    if !ok5 { return None; }
+    let (ok6, z6, f6) = verify_virtual(&proof.thr_sum, &[(Goldilocks::ONE, vec![0usize, 1usize, 2usize])], vt, arity, transcript);
+    if !ok6 { return None; }
+    if proof.aux_values.len() != 4 + 1 + ARGMAX_D2_BITS + 1 + 1 + ARGMAX_D2_BITS + ARGMAX_TIE_BITS + 6 + 1 + (ARGMAX_D2_BITS + ARGMAX_TIE_BITS) { return None; }
+
+    // Rebuild the exact opening list.
+    let mut idxs: Vec<usize> = Vec::new();
+    let mut points: Vec<Vec<Goldilocks>> = Vec::new();
+    let mut keys: Vec<usize> = Vec::new();
+    macro_rules! push { ($idx:expr, $point:expr) => {{ idxs.push($idx); points.push($point); keys.push($idx); }}; }
+    push!(0, argmax_pad_point(&qs, arity));
+    push!(0, argmax_pad_point(&qg, arity));
+    push!(0, argmax_pad_point(&qd, arity));
+    push!(0, argmax_pad_point(&q2, arity));
+    push!(ARGMAX_BEFORE_COL, argmax_pad_point(&r_before, arity));
+    for b in 0..ARGMAX_D2_BITS { push!(ARGMAX_D2_COL + b, argmax_pad_point(&q2, arity)); }
+    push!(ARGMAX_BEFORE_COL, argmax_pad_point(&q_tie, arity));
+    push!(0, argmax_pad_point(&q_tie, arity));
+    for b in 0..ARGMAX_D2_BITS { push!(ARGMAX_D2_COL + b, argmax_pad_point(&q_tie, arity)); }
+    for b in 0..ARGMAX_TIE_BITS { push!(ARGMAX_TIE_COL + b, argmax_pad_point(&q_tie, arity)); }
+    let z6p = argmax_pad_point(&z6, arity);
+    let mut sel_idx = Vec::new();
+    for z in [&z1, &z2, &z3, &z4, &z5, &z6] {
+        sel_idx.push(idxs.len());
+        push!(0, argmax_pad_point(z, arity));
+    }
+    let before_bool_idx = idxs.len();
+    push!(ARGMAX_BEFORE_COL, argmax_pad_point(&z1, arity));
+    let mut bit_idx = Vec::new();
+    for i in 0..(ARGMAX_D2_BITS + ARGMAX_TIE_BITS) {
+        bit_idx.push(idxs.len());
+        push!(ARGMAX_D2_COL + i, argmax_pad_point(&z2, arity));
+    }
+    let padded = 1usize.checked_shl(arity as u32)?;
+    let vars = descriptor.columns.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+    let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
+    let whir = zkie_core::pcs::whir::Whir::with_params(vars, 90, pow);
+    let protocol = whir.batch_opening_protocol(descriptor.columns, arity);
+    if !zkie_core::pcs::batch_open::verify_batch_open_committed(&whir, &descriptor.commitment, &protocol, descriptor.columns, &idxs, &points, &proof.aux_values, &proof.opening) { return None; }
+    let av = &proof.aux_values;
+
+    // Pointwise bindings against the committed aux.
+    if av[0] != vs { return None; }
+    if vg != av[1] * proof.x_evals[0] { return None; }
+    if vd != Goldilocks::ZERO || vd != av[2] * (proof.x_evals[1] - proof.thr_evals[0]) { return None; }
+    if v2 != (Goldilocks::ONE - av[3]) * (proof.thr_evals[1] - proof.x_evals[2]) { return None; }
+    let mut d2_q2 = Goldilocks::ZERO;
+    let mut d2_tie = Goldilocks::ZERO;
+    let mut tie_gap = Goldilocks::ZERO;
+    for b in 0..ARGMAX_D2_BITS {
+        d2_q2 = d2_q2 + Goldilocks::from_u64(1u64 << b) * av[5 + b];
+        d2_tie = d2_tie + Goldilocks::from_u64(1u64 << b) * av[5 + ARGMAX_D2_BITS + 6 + b];
+    }
+    let before_tie = av[5 + ARGMAX_D2_BITS];
+    let sel_tie = av[5 + ARGMAX_D2_BITS + 1];
+    for b in 0..ARGMAX_TIE_BITS { tie_gap = tie_gap + Goldilocks::from_u64(1u64 << b) * av[5 + ARGMAX_D2_BITS + 2 + ARGMAX_D2_BITS + b]; }
+    if d2_q2 != v2 { return None; }
+    if tie_gap != d2_tie - before_tie + sel_tie { return None; }
+
+    // Final identities with closed-form known columns.
+    let sel_z = |i: usize| av[sel_idx[i]];
+    let ev_bool = [mle::eq_poly(&q_bool, &z1), sel_z(0), av[before_bool_idx]];
+    if f1 != virtual_eval(&terms, &ev_bool) { return None; }
+    let mut ev_bit = Vec::with_capacity(1 + bit_idx.len());
+    ev_bit.push(mle::eq_poly(&q_bit, &z2));
+    for &i in &bit_idx { ev_bit.push(av[i]); }
+    if f2 != virtual_eval(&bit_terms, &ev_bit) { return None; }
+    let zi = |z: &[Goldilocks]| z[lgn..lgn + lgm].to_vec();
+    if f3 != virtual_eval(&[(Goldilocks::ONE, vec![0usize, 1usize])], &[mle::eq_poly(&r_rows, &zi(&z3)), sel_z(2)]) { return None; }
+    let known_before = mle::eq_poly(&r_rows, &zi(&z4)) * suffix_kernel_eval(&r_col, &z4[..lgn]);
+    if f4 != virtual_eval(&[(Goldilocks::ONE, vec![0usize, 1usize])], &[known_before, sel_z(3)]) { return None; }
+    let known_out = mle::eq_poly(&qo, &zi(&z5)) * mle_integer(&z5[..lgn]);
+    if f5 != virtual_eval(&[(Goldilocks::ONE, vec![0usize, 1usize])], &[known_out, sel_z(4)]) { return None; }
+    let x_z = *proof.thr_sum.final_evals.get(2)?;
+    let known_thr = mle::eq_poly(&qt, &zi(&z6));
+    if f6 != virtual_eval(&[(Goldilocks::ONE, vec![0usize, 1usize, 2usize])], &[known_thr, sel_z(5), x_z]) { return None; }
+
+    Some(vec![
+        EvalClaim { tensor_id: x, point: qg.clone(), value: proof.x_evals[0] },
+        EvalClaim { tensor_id: x, point: qd.clone(), value: proof.x_evals[1] },
+        EvalClaim { tensor_id: x, point: q2.clone(), value: proof.x_evals[2] },
+        EvalClaim { tensor_id: x, point: z6p, value: x_z },
+        EvalClaim { tensor_id: thr, point: row_of(&qd), value: proof.thr_evals[0] },
+        EvalClaim { tensor_id: thr, point: row_of(&q2), value: proof.thr_evals[1] },
+    ])
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-enum AuxRole { ProjectionBits, ScaleRemainder, LookupPairs, LookupMultiplicity }
+enum AuxRole { ProjectionBits, ScaleRemainder, ArgmaxWitness, LookupPairs, LookupMultiplicity }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AuxDescriptor {
@@ -513,6 +886,108 @@ fn prepare_scale_aux(store: &Store, ops: &[Op], model: &TrustedModelManifest) ->
     Some(prepared)
 }
 
+const ARGMAX_D2_BITS: usize = 23;
+const ARGMAX_TIE_BITS: usize = 24;
+const ARGMAX_BEFORE_COL: usize = 1;
+const ARGMAX_D2_COL: usize = 2;
+const ARGMAX_TIE_COL: usize = ARGMAX_D2_COL + ARGMAX_D2_BITS;
+
+/// MLE of the integer column `j` at a point: `sum_k 2^k z[k]`.
+fn mle_integer(point: &[Goldilocks]) -> Goldilocks {
+    let mut out = Goldilocks::ZERO;
+    for (k, &z) in point.iter().enumerate() {
+        out = out + Goldilocks::from_u64(1u64 << k) * z;
+    }
+    out
+}
+
+/// Closed form of `H(r, z) = sum_{j,k} eq(r,j) eq(z,k) [k > j]`.
+/// The highest differing bit decides the comparison: at bit t the higher bits
+/// are equal and `z_t = 1`, `r_t = 0`. Bits are little-endian (bit 0 = LSB).
+fn known_sel_terms() -> Vec<(Goldilocks, Vec<usize>)> {
+    vec![(Goldilocks::ONE, vec![0usize, 1usize])]
+}
+
+fn prove_known_sel_sum(known: &[Goldilocks], sel: &[Goldilocks], target: Goldilocks,
+    transcript: &mut Transcript) -> (VirtualProof, Vec<Goldilocks>)
+{
+    prove_virtual(&[known, sel], &known_sel_terms(), target, transcript)
+}
+
+fn suffix_kernel_eval(r: &[Goldilocks], z: &[Goldilocks]) -> Goldilocks {
+    let mut out = Goldilocks::ZERO;
+    let mut higher_equal = Goldilocks::ONE;
+    for t in (0..r.len()).rev() {
+        let eq_t = r[t] * z[t] + (Goldilocks::ONE - r[t]) * (Goldilocks::ONE - z[t]);
+        out = out + higher_equal * z[t] * (Goldilocks::ONE - r[t]);
+        higher_equal = higher_equal * eq_t;
+    }
+    out
+}
+
+/// Per-row argmax witness: column 0 = one-hot `sel`, column 1 = `before`
+/// (suffix indicator `1[j < out_i]`), remaining columns = bit decomposition of
+/// the non-negative gaps `d2`. The index binding is not carried here; it is
+/// proved separately against the same `sel` column.
+fn argmax_aux_specs(ops: &[Op]) -> Option<Vec<(usize, usize, usize, usize)>> {
+    let mut specs = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        if let Op::Argmax { m, n, .. } = op {
+            let len = m.checked_mul(*n)?;
+            if !len.is_power_of_two() || !m.is_power_of_two() { return None; }
+            specs.push((i, len, len.trailing_zeros().max(5) as usize, 2 + ARGMAX_D2_BITS + ARGMAX_TIE_BITS));
+        }
+    }
+    Some(specs)
+}
+
+fn prepare_argmax_aux(store: &Store, ops: &[Op]) -> Option<Vec<PreparedAux>> {
+    let mut prepared = Vec::new();
+    for (op_index, len, arity, count) in argmax_aux_specs(ops)? {
+        let (sel, out, d2, m, n) = match &ops[op_index] {
+            Op::Argmax { sel, out, d2, m, n, .. } => (*sel, *out, *d2, *m, *n),
+            _ => return None,
+        };
+        let selv = store.get(sel);
+        let d2v = store.get(d2);
+        let outs = store.idx.get(out)?;
+        if selv.len() != len || d2v.len() != len || outs.len() != m || m.checked_mul(n)? != len { return None; }
+        let padded = 1usize.checked_shl(arity as u32)?;
+        let mut columns = vec![vec![Goldilocks::ZERO; padded]; count];
+        for i in 0..m {
+            let oi = outs[i] as usize;
+            if oi >= n { return None; }
+            for j in 0..n {
+                let at = i * n + j;
+                let sv = selv[at];
+                if sv != Goldilocks::ZERO && sv != Goldilocks::ONE { return None; }
+                columns[0][at] = sv;
+                // before = 1[j < out_i] is a SUFFIX indicator over one-hot sel.
+                columns[1][at] = if j < oi { Goldilocks::ONE } else { Goldilocks::ZERO };
+                let gap = to_i64(d2v[at]);
+                if gap < 0 || (gap as u64) >= (1u64 << ARGMAX_D2_BITS) { return None; }
+                for b in 0..ARGMAX_D2_BITS {
+                    columns[2 + b][at] = Goldilocks::from_u64(((gap as u64) >> b) & 1);
+                }
+                // tie_gap = d2 - before + sel must be a non-negative integer.
+                let tie = gap - if j < oi { 1i64 } else { 0i64 } + to_i64(sv);
+                if tie < 0 || (tie as u64) >= (1u64 << ARGMAX_TIE_BITS) { return None; }
+                for b in 0..ARGMAX_TIE_BITS {
+                    columns[2 + ARGMAX_D2_BITS + b][at] = Goldilocks::from_u64(((tie as u64) >> b) & 1);
+                }
+            }
+        }
+        let vars = count.checked_mul(padded)?.checked_next_power_of_two()?.trailing_zeros() as usize;
+        let pow = zkie_core::pcs::whir::Whir::required_pow_bits(vars, 90);
+        let whir = zkie_core::pcs::whir::Whir::with_params(arity, 90, pow);
+        let refs: Vec<&[Goldilocks]> = columns.iter().map(Vec::as_slice).collect();
+        let (commitment, prover_data, protocol, whir) = whir.commit_batch(&refs);
+        let descriptor = AuxDescriptor { op_index, role: AuxRole::ArgmaxWitness, len, arity, columns: count, commitment };
+        prepared.push(PreparedAux { descriptor, columns, prover_data, protocol, whir });
+    }
+    Some(prepared)
+}
+
 fn lookup_aux_specs(ops: &[Op], model: &TrustedModelManifest) -> Option<Vec<(usize, AuxRole, usize, usize, usize)>> {
     let mut specs = Vec::new();
     for (i, op) in ops.iter().enumerate() {
@@ -568,7 +1043,11 @@ fn validate_aux_descriptors(ops: &[Op], model: &TrustedModelManifest, aux: &[Aux
         None => return false,
     };
     match lookup_aux_specs(ops, model) { Some(v) => all.extend(v), None => return false };
-    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::LookupPairs => 2, AuxRole::LookupMultiplicity => 3 }));
+    match argmax_aux_specs(ops) {
+        Some(v) => all.extend(v.into_iter().map(|(i, len, arity, cols)| (i, AuxRole::ArgmaxWitness, len, arity, cols))),
+        None => return false,
+    };
+    all.sort_by_key(|(i, role, ..)| (*i, match role { AuxRole::ProjectionBits => 0, AuxRole::ScaleRemainder => 1, AuxRole::ArgmaxWitness => 2, AuxRole::LookupPairs => 3, AuxRole::LookupMultiplicity => 4 }));
     aux.len() == all.len() && aux.iter().zip(all).all(|(a, (i, role, len, arity, cols))|
         a.op_index == i && a.role == role && a.len == len && a.arity == arity && a.columns == cols)
 }
@@ -945,9 +1424,10 @@ fn reverse_setup(ops: &[Op], seeds: &[EvalClaim], transcript: &mut Transcript)
     let mut producers = std::collections::BTreeMap::new();
     for (i, op) in ops.iter().enumerate() {
         let (_, outputs) = reverse_op_io(op)?;
-        if outputs.len() != 1 { return None; }
-        let out = outputs[0];
-        if producers.insert(out, i).is_some() { return None; }
+        if outputs.is_empty() { return None; }
+        for out in outputs {
+            if producers.insert(out, i).is_some() { return None; }
+        }
     }
     for (i, op) in ops.iter().enumerate() {
         if reverse_op_io(op)?.0.iter().any(|id| producers.get(id).is_some_and(|&j| j >= i)) { return None; }
@@ -974,15 +1454,22 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
     let mut claims = reverse_setup(ops, seeds, transcript)?;
     let mut steps = Vec::new();
     for (op_index, op) in ops.iter().enumerate().rev() {
-        let id = *reverse_op_io(op)?.1.first()?;
-        let cs = match claims.remove(&id) { Some(c) => c, None => continue };
-        transcript.absorb_u64(id as u64);
-        let (merge, point, value) = if cs.len() == 1 { (None, cs[0].0.clone(), cs[0].1) } else {
-            let (p, v) = prove_same_poly(reverse_tensor_values(store, id)?.as_ref(), &cs, transcript);
-            let point = p.merged_point.clone();
-            (Some(p), point, v)
-        };
-        absorb_reverse_claim(transcript, id, &point, value);
+        let mut out_claims = Vec::new();
+        for id in reverse_op_io(op)?.1 {
+            let cs = match claims.remove(&id) { Some(c) => c, None => continue };
+            transcript.absorb_u64(id as u64);
+            let (merge, point, value) = if cs.len() == 1 { (None, cs[0].0.clone(), cs[0].1) } else {
+                let (p, v) = prove_same_poly(reverse_tensor_values(store, id)?.as_ref(), &cs, transcript);
+                let point = p.merged_point.clone();
+                (Some(p), point, v)
+            };
+            absorb_reverse_claim(transcript, id, &point, value);
+            out_claims.push(ReverseOutputClaim { tensor_id: id, merge, point, value });
+        }
+        if out_claims.is_empty() { continue; }
+        if !matches!(op, Op::Argmax { .. }) && out_claims.len() != 1 { return None; }
+        let point = out_claims[0].point.clone();
+        let value = out_claims[0].value;
         let reduction = match op {
             Op::Transpose { x, m, k, .. } => {
                 if !m.is_power_of_two() || !k.is_power_of_two() { return None; }
@@ -1027,6 +1514,22 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                 claims.entry(c.tensor_id).or_default().push((c.point, c.value));
                 ReverseReduction::Scale { proof }
             }
+            Op::Argmax { .. } => {
+                eprintln!("argmax-arm outs={}", out_claims.len());
+                let pairs: Vec<(T, Vec<Goldilocks>, Goldilocks)> = out_claims.iter().map(|o| (o.tensor_id, o.point.clone(), o.value)).collect();
+                let prepared_aux = match aux.remove(&(op_index, AuxRole::ArgmaxWitness)) {
+                    Some(a) => a,
+                    None => { eprintln!("argmax-no-aux"); return None; }
+                };
+                let reduced = prove_reverse_argmax(store, op, &pairs, prepared_aux, transcript);
+                if reduced.is_none() { eprintln!("argmax-reduction-none"); }
+                let (proof, incoming) = reduced?;
+                for c in incoming {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
+                ReverseReduction::Argmax { proof }
+            }
             Op::Relu { x, .. } => {
                 let (proof, incoming) = prove_reverse_relu(store.get(*x), &point, value, transcript)?;
                 for (p, v) in incoming {
@@ -1045,14 +1548,14 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
                 claims.entry(*b).or_default().push((point, bv));
                 ReverseReduction::Add { a: av, b: bv }
             }
-            Op::MatMul { a, b, m, k, n, .. } => {
+            Op::MatMul { a, b, c, m, k, n } => {
                 if !m.is_power_of_two() || !k.is_power_of_two() || !n.is_power_of_two() { return None; }
                 let nl = n.trailing_zeros() as usize;
                 if point.len() != nl + m.trailing_zeros() as usize { return None; }
                 let (v, u) = point.split_at(nl);
                 let at = transpose(store.get(*a), *m, *k);
                 let bv = store.materialize(*b);
-                let (proof, ch) = matmul_prove(&at, bv.as_ref(), store.get(id), *m, *k, *n, u, v, transcript);
+                let (proof, ch) = matmul_prove(&at, bv.as_ref(), store.get(*c), *m, *k, *n, u, v, transcript);
                 if proof.claimed != value { return None; }
                 let mut ap = ch.clone(); ap.extend_from_slice(u);
                 let mut bp = v.to_vec(); bp.extend_from_slice(&ch);
@@ -1064,7 +1567,7 @@ fn prove_reverse_dag_inner(store: &Store, ops: &[Op], seeds: &[EvalClaim], trans
             }
             _ => return None,
         };
-        steps.push(ReverseStep { tensor_id: id, merge, reduction });
+        steps.push(ReverseStep { outputs: out_claims, reduction });
     }
     Some(ReverseDagProof { steps })
 }
@@ -1077,16 +1580,30 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
     let mut claims = reverse_setup(ops, seeds, transcript)?;
     let mut steps = proof.steps.iter();
     for (op_index, op) in ops.iter().enumerate().rev() {
-        let id = *reverse_op_io(op)?.1.first()?;
-        let cs = match claims.remove(&id) { Some(c) => c, None => continue };
+        let mut local = Vec::new();
+        for id in reverse_op_io(op)?.1 {
+            if let Some(cs) = claims.remove(&id) { local.push((id, cs)); }
+        }
+        if local.is_empty() { continue; }
+        if !matches!(op, Op::Argmax { .. }) && local.len() != 1 { return None; }
         let step = steps.next()?;
-        if step.tensor_id != id { return None; }
-        transcript.absorb_u64(id as u64);
-        let (point, value) = if cs.len() == 1 {
-            if step.merge.is_some() { return None; }
-            cs[0].clone()
-        } else { verify_same_poly(step.merge.as_ref()?, &cs, transcript)? };
-        absorb_reverse_claim(transcript, id, &point, value);
+        if step.outputs.len() != local.len() { return None; }
+        let mut point = Vec::new();
+        let mut value = Goldilocks::ZERO;
+        let mut first = true;
+        let mut merged_out: Vec<(T, Vec<Goldilocks>, Goldilocks)> = Vec::new();
+        for (id, cs) in local {
+            let stored = step.outputs.iter().find(|o| o.tensor_id == id)?;
+            transcript.absorb_u64(id as u64);
+            let (p, v) = if cs.len() == 1 {
+                if stored.merge.is_some() { return None; }
+                cs[0].clone()
+            } else { verify_same_poly(stored.merge.as_ref()?, &cs, transcript)? };
+            if stored.point != p || stored.value != v { return None; }
+            absorb_reverse_claim(transcript, id, &p, v);
+            merged_out.push((id, p.clone(), v));
+            if first { point = p; value = v; first = false; }
+        }
         match (op, &step.reduction) {
             (Op::Transpose { x, m, k, .. }, ReverseReduction::Transpose) => {
                 if !m.is_power_of_two() || !k.is_power_of_two() { return None; }
@@ -1123,6 +1640,13 @@ fn verify_reverse_dag_inner(ops: &[Op], seeds: &[EvalClaim], proof: &ReverseDagP
                 let c = verify_reverse_scale(op, &point, value, descriptor, proof, transcript)?;
                 absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
                 claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+            }
+            (Op::Argmax { .. }, ReverseReduction::Argmax { proof }) => {
+                let descriptor = aux.iter().find(|a| a.op_index == op_index && a.role == AuxRole::ArgmaxWitness)?;
+                for c in verify_reverse_argmax(op, &merged_out, descriptor, proof, transcript)? {
+                    absorb_reverse_claim(transcript, c.tensor_id, &c.point, c.value);
+                    claims.entry(c.tensor_id).or_default().push((c.point, c.value));
+                }
             }
             (Op::Relu { x, .. }, ReverseReduction::Relu { proof }) => {
                 for (p, v) in verify_reverse_relu(proof, &point, value, transcript)? {
@@ -6757,6 +7281,7 @@ pub fn prove_committed_shard_dag_bound(
     _tokens_t: T, _argmax_t: T, model: &TrustedModelManifest, execution: &TrustedExecution,
 ) -> Option<BoundExecutionProof> {
     let _ = (ops_per_shard, whir);
+    eprintln!("bound-stage A");
     trusted_weight_locations(model, ops)?;
     if cached.len() != model.batches.len() { return None; }
     for (cached, expected) in cached.iter().zip(&model.batches) {
@@ -6776,21 +7301,43 @@ pub fn prove_committed_shard_dag_bound(
             if idx.len() != expected.len() || idx.iter().zip(expected).any(|(&a, &b)| Goldilocks::from_u64(a as u64) != b) { return None; }
         }
     }
+    eprintln!("bound-stage B");
     forward_ops(store, ops);
     for (&id, expected) in &execution.outputs {
-        if store.get(id) != expected.as_slice() { return None; }
+        if usize::BITS != 64 { return None; }
+        let tag = 1usize << (usize::BITS - 1);
+        if id & tag == 0 {
+            if store.get(id) != expected.as_slice() { return None; }
+        } else {
+            let idx = store.idx.get(id & !tag)?;
+            if idx.len() != expected.len() || idx.iter().zip(expected).any(|(&a, &b)| Goldilocks::from_u64(a as u64) != b) { return None; }
+        }
     }
+    eprintln!("bound-stage C");
     let mut prepared = prepare_projection_aux(store, ops)?;
+    eprintln!("bound-stage C1");
     prepared.extend(prepare_scale_aux(store, ops, model)?);
+    eprintln!("bound-stage C2");
+    prepared.extend(prepare_argmax_aux(store, ops)?);
+    eprintln!("bound-stage C3");
     prepared.extend(prepare_lookup_aux(store, ops, model)?);
+    eprintln!("bound-stage C4");
     prepared.sort_by_key(|p| (p.descriptor.op_index, p.descriptor.role));
     let aux: Vec<AuxDescriptor> = prepared.iter().map(|p| p.descriptor.clone()).collect();
+    eprintln!("bound-stage D");
     let (mut transcript, seeds) = execution_seeds(ops, model, execution, &aux)?;
+    eprintln!("bound-stage D1");
     let mut prepared: std::collections::BTreeMap<(usize, AuxRole), PreparedAux> = prepared.into_iter().map(|p| ((p.descriptor.op_index, p.descriptor.role), p)).collect();
+    eprintln!("bound-stage E");
     let reverse = prove_reverse_dag_inner(store, ops, &seeds, &mut transcript, &mut prepared, Some(model))?;
+    eprintln!("bound-stage E1");
     let (mut replay, replay_seeds) = execution_seeds(ops, model, execution, &aux)?;
+    eprintln!("bound-stage F");
     let leaves = verify_reverse_dag_inner(ops, &replay_seeds, &reverse, &mut replay, &aux, Some(model))?;
+    eprintln!("bound-stage F1");
+    eprintln!("bound-stage G");
     let groups = group_reverse_weights(model, ops, &leaves)?;
+    eprintln!("bound-stage G1");
     let mut weight_openings = Vec::with_capacity(groups.len());
     for (bi, entries) in groups.iter().enumerate() {
         let table_idxs: Vec<usize> = entries.iter().map(|e| e.0).collect();
@@ -8833,6 +9380,259 @@ mod tests {
         let mut bad_in = execution.clone();
         bad_in.inputs.get_mut(&x).unwrap()[2] += Goldilocks::ONE;
         assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad_in));
+    }
+
+    #[test]
+    fn argmax_aux_witness_orientation_and_gap_bits() {
+        let mut store = Store::new();
+        let x = store.push(vec![
+            from_i64(9), from_i64(1), from_i64(9), from_i64(3),
+            from_i64(2), from_i64(9), from_i64(1), from_i64(9),
+        ]);
+        let sel = store.push(vec![]);
+        let thr = store.push(vec![]);
+        let gate = store.push(vec![]);
+        let d1 = store.push(vec![]);
+        let d2 = store.push(vec![]);
+        let out = store.push_idx(vec![]);
+        let ops = vec![Op::Argmax { x, sel, thr, gate, d1, d2, out, m: 2, n: 4 }];
+        forward_ops(&mut store, &ops);
+        assert_eq!(store.idx[out], vec![0u32, 1u32]);
+        let aux = prepare_argmax_aux(&store, &ops).unwrap();
+        let descriptor = &aux[0].descriptor;
+        assert_eq!(descriptor.len, 8);
+        assert_eq!(descriptor.columns, 2 + ARGMAX_D2_BITS + ARGMAX_TIE_BITS);
+        let cols = &aux[0].columns;
+        assert_eq!(&cols[0][..8], &[
+            Goldilocks::ONE, Goldilocks::ZERO, Goldilocks::ZERO, Goldilocks::ZERO,
+            Goldilocks::ZERO, Goldilocks::ONE, Goldilocks::ZERO, Goldilocks::ZERO,
+        ]);
+        // before_j = 1[j < out_i] is a SUFFIX indicator: row0 out=0 -> none;
+        // row1 out=1 -> only j=0.
+        assert_eq!(&cols[1][..8], &[
+            Goldilocks::ZERO, Goldilocks::ZERO, Goldilocks::ZERO, Goldilocks::ZERO,
+            Goldilocks::ONE, Goldilocks::ZERO, Goldilocks::ZERO, Goldilocks::ZERO,
+        ]);
+        // d2 gaps: row0 [0,8,0,6], row1 [7,0,8,0].
+        assert_eq!(cols[2 + 3][1], Goldilocks::ONE);
+        assert_eq!(cols[2 + 0][4], Goldilocks::ONE);
+        assert_eq!(cols[2 + 1][4], Goldilocks::ONE);
+        assert_eq!(cols[2 + 2][4], Goldilocks::ONE);
+        // tie_gap = d2 - before + sel: row0 [1,8,0,6], row1 [6,1,8,0].
+        let tie = 2 + ARGMAX_D2_BITS;
+        assert_eq!(cols[tie][0], Goldilocks::ONE); // selected cell tie = 1
+        assert_eq!(cols[tie + 3][1], Goldilocks::ONE); // 8 = 1<<3
+        assert_eq!(cols[tie + 0][4], Goldilocks::ZERO); // 6 = 110b
+        assert_eq!(cols[tie + 1][4], Goldilocks::ONE);
+        assert_eq!(cols[tie + 2][4], Goldilocks::ONE);
+        assert_eq!(cols[tie][5], Goldilocks::ONE); // selected cell tie = 1
+    }
+
+    #[test]
+    fn argmax_suffix_kernel_matches_exhaustive_mle() {
+        for l in 1usize..=4 {
+            let n = 1usize << l;
+            for rmask in 0..n {
+                let r: Vec<Goldilocks> = (0..l).map(|b| if (rmask >> b) & 1 == 1 { Goldilocks::ONE } else { Goldilocks::ZERO }).collect();
+                let eq_r = mle::eq_evals(&r);
+                for zmask in 0..n {
+                    let z: Vec<Goldilocks> = (0..l).map(|b| if (zmask >> b) & 1 == 1 { Goldilocks::ONE } else { Goldilocks::ZERO }).collect();
+                    let eq_z = mle::eq_evals(&z);
+                    let mut direct = Goldilocks::ZERO;
+                    for j in 0..n {
+                        let mut inner = Goldilocks::ZERO;
+                        for k in (j + 1)..n { inner = inner + eq_z[k]; }
+                        direct = direct + eq_r[j] * inner;
+                    }
+                    assert_eq!(suffix_kernel_eval(&r, &z), direct, "l={} r={} z={}", l, rmask, zmask);
+                    // Coefficient column at the basis index k: C(k) = sum_{j<k} eq(r,j).
+                    let mut prefix = Goldilocks::ZERO;
+                    for k in 0..n {
+                        let mut expect = Goldilocks::ZERO;
+                        for j in 0..k { expect = expect + eq_r[j]; }
+                        assert_eq!(prefix, expect, "prefix mismatch at k={}", k);
+                        prefix = prefix + eq_r[k];
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn argmax_known_sel_sums_endpoint_closed_forms() {
+        let m = 2usize;
+        let n = 4usize;
+        let sel = [
+            Goldilocks::ONE, Goldilocks::ZERO, Goldilocks::ZERO, Goldilocks::ZERO,
+            Goldilocks::ZERO, Goldilocks::ONE, Goldilocks::ZERO, Goldilocks::ZERO,
+        ];
+        let before = [
+            Goldilocks::ZERO, Goldilocks::ZERO, Goldilocks::ZERO, Goldilocks::ZERO,
+            Goldilocks::ONE, Goldilocks::ZERO, Goldilocks::ZERO, Goldilocks::ZERO,
+        ];
+        let r_rows = vec![Goldilocks::from_u64(7)];
+        let r_col = vec![Goldilocks::from_u64(3), Goldilocks::from_u64(5)];
+        let eq_rows = mle::eq_evals(&r_rows);
+        let eq_col = mle::eq_evals(&r_col);
+        let terms = known_sel_terms();
+
+        // out binding: K(i,j) = eq(r_rows,i) * j.
+        let mut known_out = vec![Goldilocks::ZERO; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                known_out[i * n + j] = eq_rows[i] * Goldilocks::from_u64(j as u64);
+            }
+        }
+        let target_out = known_out.iter().zip(sel.iter()).fold(Goldilocks::ZERO, |a, (&k, &s)| a + k * s);
+        let out_vec: Vec<Goldilocks> = (0..m).map(|i| Goldilocks::from_u64(if i == 0 { 0 } else { 1 })).collect();
+        assert_eq!(target_out, mle::eval(&out_vec, &r_rows));
+        let mut tp = Transcript::new(b"argmax-out-binding");
+        let (proof, point) = prove_known_sel_sum(&known_out, &sel, target_out, &mut tp);
+        let mut tv = Transcript::new(b"argmax-out-binding");
+        let (ok, point_v, final_claim) = verify_virtual(&proof, &terms, target_out, 3, &mut tv);
+        assert!(ok && point == point_v);
+        let (z_j, z_i) = point.split_at(2);
+        let known_eval = mle::eq_poly(&r_rows, z_i) * mle_integer(z_j);
+        let sel_eval = mle::eval(&sel, &point);
+        assert_eq!(final_claim, virtual_eval(&terms, &[known_eval, sel_eval]));
+
+        // before suffix relation: before(r_i,r_j) = sum_{i,k} eq(r_rows,i) C(k) sel(i,k),
+        // with C(k) = sum_{j<k} eq(r_col,j).
+        let mut coeff = vec![Goldilocks::ZERO; n];
+        let mut acc = Goldilocks::ZERO;
+        for k in 0..n {
+            coeff[k] = acc;
+            acc = acc + eq_col[k];
+        }
+        let mut known_before = vec![Goldilocks::ZERO; m * n];
+        for i in 0..m {
+            for k in 0..n {
+                known_before[i * n + k] = eq_rows[i] * coeff[k];
+            }
+        }
+        let combined: Vec<Goldilocks> = r_col.iter().chain(r_rows.iter()).cloned().collect();
+        let target_before = mle::eval(&before, &combined);
+        let mut tp2 = Transcript::new(b"argmax-before-binding");
+        let (proof2, point2) = prove_known_sel_sum(&known_before, &sel, target_before, &mut tp2);
+        let mut tv2 = Transcript::new(b"argmax-before-binding");
+        let (ok2, point2_v, final2) = verify_virtual(&proof2, &terms, target_before, 3, &mut tv2);
+        assert!(ok2 && point2 == point2_v);
+        let (z_k, z_i2) = point2.split_at(2);
+        let known2 = mle::eq_poly(&r_rows, z_i2) * suffix_kernel_eval(&r_col, z_k);
+        let sel_eval2 = mle::eval(&sel, &point2);
+        assert_eq!(final2, virtual_eval(&terms, &[known2, sel_eval2]));
+    }
+
+    #[test]
+    fn argmax_suffix_kernel_nonboolean_points() {
+        // Fixed replayable non-Boolean points; a Boolean-basis-only check cannot
+        // rule out accidental higher-degree terms in the closed form.
+        let samples: Vec<Vec<u64>> = vec![
+            vec![],
+            vec![3],
+            vec![2, 7],
+            vec![5, 1, 9],
+            vec![11, 4, 3, 8],
+        ];
+        for l in 0..=4usize {
+            let n = 1usize << l;
+            let base: Vec<Goldilocks> = samples[l].iter().map(|&v| Goldilocks::from_u64(v)).collect();
+            let sevens: Vec<Goldilocks> = (0..l).map(|_| Goldilocks::from_u64(7)).collect();
+            let mut pairs: Vec<(Vec<Goldilocks>, Vec<Goldilocks>)> = Vec::new();
+            pairs.push((base.clone(), base.clone())); // r == z
+            pairs.push((base.clone(), sevens.clone()));
+            pairs.push((sevens.clone(), base.clone()));
+            if l > 0 {
+                // Highest-bit boundary: equal low bits, differing top bit.
+                let mut hi0: Vec<Goldilocks> = (0..l).map(|b| Goldilocks::from_u64(3 + b as u64)).collect();
+                let mut hi1 = hi0.clone();
+                hi0[l - 1] = Goldilocks::ZERO;
+                hi1[l - 1] = Goldilocks::ONE;
+                pairs.push((hi0.clone(), hi1.clone()));
+                pairs.push((hi1, hi0));
+            }
+            for (pi, (r, z)) in pairs.into_iter().enumerate() {
+                let eq_r = mle::eq_evals(&r);
+                let eq_z = mle::eq_evals(&z);
+                let mut direct = Goldilocks::ZERO;
+                for j in 0..n {
+                    for k in (j + 1)..n {
+                        direct = direct + eq_r[j] * eq_z[k];
+                    }
+                }
+                assert_eq!(suffix_kernel_eval(&r, &z), direct, "l={} pair={}", l, pi);
+                let mut prefix = Goldilocks::ZERO;
+                for k in 0..n {
+                    let mut expect = Goldilocks::ZERO;
+                    for j in 0..k { expect = expect + eq_r[j]; }
+                    assert_eq!(prefix, expect, "l={} pair={} k={}", l, pi, k);
+                    prefix = prefix + eq_r[k];
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn committed_argmax_chain_binds_all_outputs_and_tie_rule() {
+        use zkie_core::pcs::whir::Whir;
+        let mut store = Store::new();
+        let x = store.push(vec![
+            from_i64(9), from_i64(1), from_i64(2), from_i64(3), from_i64(4), from_i64(5), from_i64(6), from_i64(7),
+            from_i64(5), from_i64(9), from_i64(1), from_i64(9), from_i64(3), from_i64(0), from_i64(2), from_i64(7),
+            from_i64(1), from_i64(2), from_i64(3), from_i64(4), from_i64(5), from_i64(6), from_i64(9), from_i64(9),
+            from_i64(9), from_i64(1), from_i64(9), from_i64(2), from_i64(3), from_i64(4), from_i64(5), from_i64(6),
+        ]);
+        let sel = store.push(vec![]);
+        let thr = store.push(vec![]);
+        let gate = store.push(vec![]);
+        let d1 = store.push(vec![]);
+        let d2 = store.push(vec![]);
+        let out = store.push_idx(vec![]);
+        let ops = vec![Op::Argmax { x, sel, thr, gate, d1, d2, out, m: 4, n: 8 }];
+        let whir = Whir::with_params(5, 90, 17);
+        let cache_dir = std::env::temp_dir().join("zkie-argmax-cache");
+        let cached = commit_model_weights(&store, &ops, cache_dir.to_str().unwrap());
+        forward_ops(&mut store, &ops);
+        assert_eq!(store.idx[out], vec![0u32, 1, 6, 0]);
+        let model = TrustedModelManifest::from_offline_commitment(&cached, &store.owned_slices(), &ops)
+            .with_index_shapes(&[(out, 4usize)].into());
+        let out_vals: Vec<Goldilocks> = store.idx[out].iter().map(|&v| Goldilocks::from_u64(v as u64)).collect();
+        let out_key = TensorKey::Index(out).encoded().unwrap();
+        let execution = TrustedExecution {
+            inputs: [(x, store.get(x).to_vec())].into(),
+            outputs: [
+                (sel, store.get(sel).to_vec()),
+                (thr, store.get(thr).to_vec()),
+                (gate, store.get(gate).to_vec()),
+                (d1, store.get(d1).to_vec()),
+                (d2, store.get(d2).to_vec()),
+                (out_key, out_vals),
+            ].into(),
+        };
+        let proof = prove_committed_shard_dag_bound(&mut store, &ops, 1, &whir, &cached, 0, 0, &model, &execution).unwrap();
+        assert!(verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &execution));
+        let bytes = bincode::serialize(&proof).unwrap();
+        assert!(verify_committed_shard_dag_bound_bytes(&bytes, &ops, 1, &whir, &PublicStatement::Generic, &model, &execution));
+        for id in [sel, thr, gate, d1, d2, out_key] {
+            let mut bad = execution.clone();
+            bad.outputs.get_mut(&id).unwrap()[0] += Goldilocks::ONE;
+            assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &proof, &PublicStatement::Generic, &model, &bad), "output {} not bound", id);
+        }
+        let mut forged: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        let mut hit = false;
+        for step in &mut forged.reverse.steps {
+            if let ReverseReduction::Argmax { proof } = &mut step.reduction {
+                proof.aux_values[0] += Goldilocks::ONE;
+                hit = true;
+            }
+        }
+        assert!(hit);
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged, &PublicStatement::Generic, &model, &execution));
+        let mut forged2: BoundExecutionProof = bincode::deserialize(&bytes).unwrap();
+        for step in &mut forged2.reverse.steps {
+            if let ReverseReduction::Argmax { proof } = &mut step.reduction { proof.x_evals[0] += Goldilocks::ONE; }
+        }
+        assert!(!verify_committed_shard_dag_bound(&ops, 1, &whir, &forged2, &PublicStatement::Generic, &model, &execution));
     }
 
     #[test]
