@@ -27,12 +27,24 @@ pub struct RelationLengths {
     pub aux: Vec<usize>,
 }
 
+/// Reference to a row interval of a committed model asset. The interval is
+/// explicit so a step never relies on a positional or sentinel convention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ExternalAssetRef {
+    pub asset_id: u64,
+    pub row_start: u64,
+    pub row_count: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct OpRelationPublic {
     pub opcode: OpCode,
     pub config: Vec<i64>,
     pub registry: OracleRegistry,
-    pub input_oracles: Vec<OracleId>,
+    /// `None` means the input is supplied by a shared commitment interval;
+    /// `Some(oracle)` means a local oracle in this relation proof. There is no
+    /// magic oracle id for external inputs.
+    pub input_oracles: Vec<Option<OracleId>>,
     pub output_oracles: Vec<OracleId>,
 }
 
@@ -609,7 +621,7 @@ pub fn prove_op_relation_shared(
     let mut input_oracles = Vec::new();
     for (index, values) in inputs.iter().enumerate() {
         if external.contains(&index) {
-            input_oracles.push(OracleId(u64::MAX));
+            input_oracles.push(None);
             input_openings.push(Vec::new());
             continue;
         }
@@ -619,7 +631,7 @@ pub fn prove_op_relation_shared(
             values,
             *input_widths.get(index).unwrap_or(&1),
         )?;
-        input_oracles.push(openings[0].oracle);
+        input_oracles.push(Some(openings[0].oracle));
         input_openings.push(openings);
     }
     let output_widths = output_widths(opcode, config, record.outputs.len(), &record.outputs);
@@ -777,16 +789,22 @@ pub fn verify_op_relation_with_external(
         return Err(Error::ShapeMismatch);
     }
     for (index, openings) in proof.inputs.iter().enumerate() {
-        if let Some(values) = external_values.get(index).and_then(Option::as_ref) {
-            if !openings.is_empty() || values.len() != proof.lengths.inputs[index] {
-                return Err(Error::StatementMismatch);
+        let supplied = external_values.get(index).and_then(Option::as_ref);
+        match (public.input_oracles[index], supplied) {
+            (None, Some(values)) => {
+                if !openings.is_empty() || values.len() != proof.lengths.inputs[index] {
+                    return Err(Error::StatementMismatch);
+                }
             }
-            continue;
+            (None, None) => return Err(Error::StatementMismatch),
+            (Some(oracle), None) => {
+                if openings.first().map(|opening| opening.oracle) != Some(oracle) {
+                    return Err(Error::StatementMismatch);
+                }
+                verify_group(&public.registry, openings)?;
+            }
+            (Some(_), Some(_)) => return Err(Error::StatementMismatch),
         }
-        if openings.first().map(|opening| opening.oracle) != Some(public.input_oracles[index]) {
-            return Err(Error::StatementMismatch);
-        }
-        verify_group(&public.registry, openings)?;
     }
     for (index, openings) in proof.outputs.iter().enumerate() {
         if openings.first().map(|opening| opening.oracle) != Some(public.output_oracles[index]) {
@@ -811,14 +829,15 @@ pub fn verify_op_relation_with_external(
         .iter()
         .zip(&proof.lengths.inputs)
         .enumerate()
-        .map(|(index, (openings, len))| {
-            external_values
+        .map(|(index, (openings, len))| match public.input_oracles.get(index) {
+            Some(None) => external_values
                 .get(index)
                 .and_then(Option::as_ref)
                 .cloned()
-                .unwrap_or_else(|| decode(openings, *len))
+                .ok_or(Error::StatementMismatch),
+            _ => Ok(decode(openings, *len)),
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     let outputs: Vec<Vec<i64>> = proof
         .outputs
         .iter()

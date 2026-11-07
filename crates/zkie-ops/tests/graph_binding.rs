@@ -559,6 +559,7 @@ fn shared_trace_references_one_model_asset_opening() {
         commit_assets, open_asset, verify_shared_trace, ModelAssetSpec, ModelCommitmentPublic,
         SharedTrace, SharedTraceStep,
     };
+    use zkie_ops::proof::relations::ExternalAssetRef;
     use zkie_ops::proof::relations::{prove_op_relation_shared, RelationReceiptMessage};
     use zkie_ops::registry::PureForward;
 
@@ -615,7 +616,14 @@ fn shared_trace_references_one_model_asset_opening() {
             external_inputs: vec![1],
             proof,
         },
-        external: vec![None, Some(0)],
+        external: vec![
+            None,
+            Some(ExternalAssetRef {
+                asset_id: 3,
+                row_start: 0,
+                row_count: 2,
+            }),
+        ],
         sources: vec![None, None],
     };
     let trace = SharedTrace {
@@ -642,6 +650,22 @@ fn shared_trace_references_one_model_asset_opening() {
 
     let mut tampered = trace.clone();
     tampered.steps[0].message.proof.inputs[0][0].values[0] += 1;
+    assert!(verify_shared_trace(&public, &tampered, &[0]).is_err());
+
+    let mut tampered = trace.clone();
+    tampered.steps[0].external[1] = Some(ExternalAssetRef {
+        asset_id: 3,
+        row_start: 0,
+        row_count: 1,
+    });
+    assert!(verify_shared_trace(&public, &tampered, &[0]).is_err());
+
+    let mut tampered = trace.clone();
+    tampered.steps[0].external[1] = Some(ExternalAssetRef {
+        asset_id: 99,
+        row_start: 0,
+        row_count: 2,
+    });
     assert!(verify_shared_trace(&public, &tampered, &[0]).is_err());
 }
 

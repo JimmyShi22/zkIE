@@ -20,7 +20,8 @@ use zkie_ops::proof::model_commitment::{
     SharedTraceStep,
 };
 use zkie_ops::proof::relations::{
-    proof_output_values, prove_op_relation_shared, RelationConfig, RelationReceiptMessage,
+    proof_output_values, prove_op_relation_shared, ExternalAssetRef, RelationConfig,
+    RelationReceiptMessage,
 };
 use zkie_ops::registry::PureForward;
 use zkie_ops::softmax::SoftmaxOp;
@@ -92,12 +93,23 @@ pub fn asset_specs() -> Vec<ModelAssetSpec> {
 
 struct Assets<'a> {
     store: AssetStore<'a>,
+    refs: Vec<ExternalAssetRef>,
 }
 
 impl<'a> Assets<'a> {
     fn load(commitment: &'a ModelCommitment) -> Result<Self> {
+        let refs = commitment
+            .assets
+            .iter()
+            .map(|asset| ExternalAssetRef {
+                asset_id: asset.asset_id,
+                row_start: 0,
+                row_count: asset.rows,
+            })
+            .collect();
         Ok(Self {
             store: AssetStore::open(commitment)?,
+            refs,
         })
     }
 
@@ -145,6 +157,7 @@ struct Builder<'a> {
     progress: Option<&'a dyn ProgressSink>,
     planned_total: u64,
     completed: u64,
+    external_refs: &'a [ExternalAssetRef],
 }
 
 impl<'a> Builder<'a> {
@@ -159,6 +172,18 @@ impl<'a> Builder<'a> {
         for (value, pool) in inputs {
             values.push(value);
             external.push(pool);
+        }
+        let mut external_assets = Vec::with_capacity(external.len());
+        for slot in &external {
+            external_assets.push(match slot {
+                Some(index) => Some(
+                    *self
+                        .external_refs
+                        .get(*index)
+                        .ok_or(Error::InvalidIndex)?,
+                ),
+                None => None,
+            });
         }
         let external_indices: Vec<usize> = external
             .iter()
@@ -181,7 +206,7 @@ impl<'a> Builder<'a> {
                 external_inputs: external_indices,
                 proof,
             },
-            external,
+            external: external_assets,
             sources,
         });
         self.completed = self.completed.saturating_add(1);
@@ -272,6 +297,7 @@ pub fn execute_shared_with_progress(
         progress,
         planned_total,
         completed: 0,
+        external_refs: &assets.refs,
     };
     let weight = |name: &str| assets.value(name);
     let pool = |name: &str| assets.pool(name);

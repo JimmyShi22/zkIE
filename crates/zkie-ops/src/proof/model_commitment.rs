@@ -12,6 +12,8 @@ use std::sync::Arc;
 use zkie_core::compute::{MemoryGovernor, MemoryRequest};
 use zkie_core::error::{Error, Result};
 use rayon::prelude::*;
+
+use crate::proof::relations::ExternalAssetRef;
 use zkie_core::storage::TensorReader;
 use zkie_core::types::{Digest, DType, TensorSpec};
 use zkie_engine::compute::cpu::{merkle_build, merkle_verify, MerkleTree};
@@ -493,25 +495,34 @@ impl<'a> AssetStore<'a> {
     ) -> Result<Vec<AssetOpening>> {
         let mut used = BTreeSet::new();
         for step in steps.iter() {
-            for slot in step.external.iter().flatten() {
-                if *slot >= self.commitment.assets.len() {
+            for reference in step.external.iter().flatten() {
+                let asset = self
+                    .commitment
+                    .assets
+                    .iter()
+                    .find(|asset| asset.asset_id == reference.asset_id)
+                    .ok_or(Error::StatementMismatch)?;
+                if reference.row_count == 0
+                    || reference
+                        .row_start
+                        .checked_add(reference.row_count)
+                        .ok_or(Error::ResourceLimit)?
+                        > asset.rows
+                {
                     return Err(Error::InvalidIndex);
                 }
-                used.insert(*slot);
+                used.insert(reference.asset_id);
             }
         }
-        let mut remap = BTreeMap::new();
         let mut openings = Vec::with_capacity(used.len());
-        for index in used {
-            remap.insert(index, openings.len());
+        for asset_id in used {
+            let index = self
+                .commitment
+                .assets
+                .iter()
+                .position(|asset| asset.asset_id == asset_id)
+                .ok_or(Error::StatementMismatch)?;
             openings.push(self.open_asset(index)?);
-        }
-        for step in steps.iter_mut() {
-            for slot in step.external.iter_mut() {
-                if let Some(index) = slot {
-                    *index = *remap.get(index).ok_or(Error::InvalidIndex)?;
-                }
-            }
         }
         Ok(openings)
     }
@@ -640,13 +651,87 @@ impl ModelCommitmentPublic {
         })?;
         Ok(())
     }
+
+    /// Single verification entry for a shared-asset interval: checks the
+    /// opening against the public commitment and that the interval is in range.
+    /// Values are extracted separately so a verification pass does not retain
+    /// every external interval at once. P2 may replace this with a joint
+    /// opening verifier.
+    pub fn verify_opening_interval(
+        &self,
+        opening: &AssetOpening,
+        interval: &ExternalAssetRef,
+    ) -> Result<()> {
+        if opening.asset_id != interval.asset_id {
+            return Err(Error::StatementMismatch);
+        }
+        let asset = self
+            .assets
+            .iter()
+            .find(|asset| asset.asset_id == interval.asset_id)
+            .ok_or(Error::StatementMismatch)?;
+        let end = interval
+            .row_start
+            .checked_add(interval.row_count)
+            .ok_or(Error::ResourceLimit)?;
+        if interval.row_count == 0 || end > asset.rows {
+            return Err(Error::InvalidIndex);
+        }
+        self.verify_opening(opening)
+    }
+}
+
+/// Extract the values of an interval from an already verified opening.
+pub fn extract_interval_values(
+    opening: &AssetOpening,
+    interval: &ExternalAssetRef,
+) -> Result<Vec<i64>> {
+    if opening.asset_id != interval.asset_id {
+        return Err(Error::StatementMismatch);
+    }
+    let end = interval
+        .row_start
+        .checked_add(interval.row_count)
+        .ok_or(Error::ResourceLimit)?;
+    if interval.row_count == 0 {
+        return Err(Error::InvalidIndex);
+    }
+    let mut values = Vec::new();
+    let mut next = interval.row_start;
+    for row in &opening.rows {
+        if row.row < interval.row_start {
+            continue;
+        }
+        if row.row >= end {
+            break;
+        }
+        if row.row != next {
+            return Err(Error::InvalidIndex);
+        }
+        values.extend(row.values.iter().map(|value| *value as i64));
+        next = next.checked_add(1).ok_or(Error::ResourceLimit)?;
+    }
+    if next != end {
+        return Err(Error::IncompleteArtifact);
+    }
+    Ok(values)
+}
+
+/// Reserved interface for P2 joint openings. The signature exists so P2 can
+/// land without reshaping callers; the semantics are intentionally not frozen
+/// and the current implementation rejects the call.
+pub fn verify_joint_openings(
+    _public: &ModelCommitmentPublic,
+    _references: &[ExternalAssetRef],
+) -> Result<Vec<Vec<i64>>> {
+    Err(Error::UnsupportedPrimitive)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedTraceStep {
     pub message: crate::proof::relations::RelationReceiptMessage,
-    /// For each relation input index, the index into `SharedTrace::assets`.
-    pub external: Vec<Option<usize>>,
+    /// For each relation input index, an explicit shared-asset interval.
+    pub external: Vec<Option<ExternalAssetRef>>,
     /// For each relation input index, a previous (step, output) edge.
     pub sources: Vec<Option<(usize, usize)>>,
 }
@@ -703,19 +788,76 @@ fn verify_shared_trace_steps(
     if trace.output.is_empty() && trace.argmax.len() != expected_tokens.len() {
         return Err(Error::StatementMismatch);
     }
-    trace
-        .assets
+    let mut openings_by_id: BTreeMap<u64, &AssetOpening> = BTreeMap::new();
+    for opening in &trace.assets {
+        if openings_by_id.insert(opening.asset_id, opening).is_some() {
+            return Err(Error::StatementMismatch);
+        }
+    }
+    let mut referenced: BTreeSet<ExternalAssetRef> = BTreeSet::new();
+    for step in &trace.steps {
+        let input_count = step.message.proof.lengths.inputs.len();
+        if step.external.len() != input_count {
+            return Err(Error::ShapeMismatch);
+        }
+        let expected: Vec<usize> = step
+            .external
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| slot.map(|_| index))
+            .collect();
+        if step.message.external_inputs != expected {
+            return Err(Error::StatementMismatch);
+        }
+        for (index, slot) in step.external.iter().enumerate() {
+            match slot {
+                Some(reference) => {
+                    if !openings_by_id.contains_key(&reference.asset_id) {
+                        return Err(Error::StatementMismatch);
+                    }
+                    referenced.insert(*reference);
+                }
+                None => {
+                    if step
+                        .message
+                        .proof
+                        .inputs
+                        .get(index)
+                        .map(|openings| openings.is_empty())
+                        .unwrap_or(true)
+                    {
+                        return Err(Error::StatementMismatch);
+                    }
+                }
+            }
+        }
+    }
+    let referenced_ids: BTreeSet<u64> = referenced.iter().map(|reference| reference.asset_id).collect();
+    if referenced_ids.len() != openings_by_id.len()
+        || openings_by_id
+            .keys()
+            .any(|asset_id| !referenced_ids.contains(asset_id))
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let verified: std::sync::Mutex<BTreeSet<ExternalAssetRef>> =
+        std::sync::Mutex::new(BTreeSet::new());
+    referenced
         .par_iter()
-        .enumerate()
-        .try_for_each(|(asset_index, opening)| {
-            public.verify_opening(opening).map_err(|error| {
-                eprintln!(
-                    "asset opening {} id {} err {:?}",
-                    asset_index, opening.asset_id, error
-                );
-                error
-            })
+        .try_for_each(|reference| -> Result<()> {
+            let opening = openings_by_id
+                .get(&reference.asset_id)
+                .ok_or(Error::StatementMismatch)?;
+            public.verify_opening_interval(opening, reference)?;
+            verified
+                .lock()
+                .map_err(|_| Error::SynchronizationFailed)?
+                .insert(*reference);
+            Ok(())
         })?;
+    let verified = verified
+        .into_inner()
+        .map_err(|_| Error::SynchronizationFailed)?;
     let mut outputs: Vec<Vec<Vec<i64>>> = Vec::with_capacity(trace.steps.len());
     for (step_index, step) in trace.steps.iter().enumerate() {
         let mut registry = crate::proof::binding::OracleRegistry::new();
@@ -726,15 +868,19 @@ fn verify_shared_trace_steps(
         let output_count = step.message.proof.lengths.outputs.len();
         let input_oracles = (0..input_count)
             .map(|index| {
-                step.message
-                    .proof
-                    .inputs
-                    .get(index)
-                    .and_then(|openings| openings.first())
-                    .map(|opening| opening.oracle)
-                    .unwrap_or(crate::proof::binding::OracleId(u64::MAX))
+                if step.external[index].is_some() {
+                    Ok(None)
+                } else {
+                    step.message
+                        .proof
+                        .inputs
+                        .get(index)
+                        .and_then(|openings| openings.first())
+                        .map(|opening| Some(opening.oracle))
+                        .ok_or(Error::StatementMismatch)
+                }
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<Option<crate::proof::binding::OracleId>>>>()?;
         let output_oracles = (0..output_count)
             .map(|index| {
                 step.message
@@ -755,16 +901,15 @@ fn verify_shared_trace_steps(
             output_oracles,
         };
         let mut external_values: Vec<Option<Vec<i64>>> = vec![None; input_count];
-        for (input, pool) in step.external.iter().enumerate() {
-            if let Some(pool) = pool {
-                let opening = trace.assets.get(*pool).ok_or(Error::StatementMismatch)?;
-                let mut values = Vec::with_capacity(opening.rows.len() * opening.rows.first().map(|row| row.values.len()).unwrap_or(0));
-                for row in &opening.rows {
-                    values.extend(row.values.iter().map(|value| *value as i64));
-                }
-                if external_values[input].replace(values).is_some() {
+        for (input, reference) in step.external.iter().enumerate() {
+            if let Some(reference) = reference {
+                if !verified.contains(reference) {
                     return Err(Error::StatementMismatch);
                 }
+                let opening = openings_by_id
+                    .get(&reference.asset_id)
+                    .ok_or(Error::StatementMismatch)?;
+                external_values[input] = Some(extract_interval_values(opening, reference)?);
             }
         }
         crate::proof::relations::verify_op_relation_with_external(

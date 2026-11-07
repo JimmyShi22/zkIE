@@ -263,7 +263,7 @@ impl<F: ProtocolField, T: PureForward + RelationConfig> Operation<F> for T {
         let input_count = message.proof.lengths.inputs.len();
         let output_count = message.proof.lengths.outputs.len();
         let input_oracles = (0..input_count)
-            .map(|index| OracleId(index as u64))
+            .map(|index| Some(OracleId(index as u64)))
             .collect::<Vec<_>>();
         let output_oracles = (input_count..input_count + output_count)
             .map(|index| OracleId(index as u64))
