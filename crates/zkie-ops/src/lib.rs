@@ -53,4 +53,5 @@ pub mod profile_norm;
 pub mod profile_rms;
 pub mod profile_rope;
 pub mod profile_standardize;
+pub mod public_lut;
 pub mod index_gen;

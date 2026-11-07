@@ -26,6 +26,7 @@ use zkie_ops::proof::relations::{
     proof_output_values, prove_op_relation_shared, ExternalAssetRef, RelationConfig,
     RelationReceiptMessage,
 };
+use zkie_ops::public_lut::{self, PublicLutRef};
 use zkie_ops::registry::PureForward;
 use zkie_ops::softmax::SoftmaxOp;
 use zkie_ops::softmax_rows::SoftmaxRowsOp;
@@ -109,6 +110,7 @@ pub fn asset_specs() -> Vec<ModelAssetSpec> {
 }
 
 struct Assets<'a> {
+    commitment: &'a ModelCommitment,
     store: AssetStore<'a>,
     refs: Vec<ExternalAssetRef>,
 }
@@ -125,6 +127,7 @@ impl<'a> Assets<'a> {
             })
             .collect();
         Ok(Self {
+            commitment,
             store: AssetStore::open(commitment)?,
             refs,
         })
@@ -174,6 +177,7 @@ struct Builder<'a> {
     progress: Option<&'a dyn ProgressSink>,
     planned_total: u64,
     completed: u64,
+    commitment: &'a ModelCommitment,
     external_refs: &'a [ExternalAssetRef],
 }
 
@@ -191,23 +195,55 @@ impl<'a> Builder<'a> {
             external.push(pool);
         }
         let mut external_assets = Vec::with_capacity(external.len());
+        let mut public_luts = Vec::with_capacity(external.len());
         for slot in &external {
-            external_assets.push(match slot {
-                Some(index) => Some(
-                    *self
-                        .external_refs
+            match slot {
+                Some(index) => {
+                    let asset = self
+                        .commitment
+                        .assets
                         .get(*index)
-                        .ok_or(Error::InvalidIndex)?,
-                ),
-                None => None,
-            });
+                        .ok_or(Error::InvalidIndex)?;
+                    if let Some(kind) = public_lut::classify_path(&asset.path) {
+                        let reference = PublicLutRef {
+                            asset_id: asset.asset_id,
+                            kind,
+                            valid_len: asset.element_count,
+                            padded_len: public_lut::padded_len(asset.element_count),
+                        };
+                        external_assets.push(None);
+                        public_luts.push(Some(reference));
+                    } else {
+                        external_assets.push(Some(
+                            *self
+                                .external_refs
+                                .get(*index)
+                                .ok_or(Error::InvalidIndex)?,
+                        ));
+                        public_luts.push(None);
+                    }
+                }
+                None => {
+                    external_assets.push(None);
+                    public_luts.push(None);
+                }
+            }
         }
         let external_indices: Vec<usize> = external
             .iter()
             .enumerate()
             .filter_map(|(index, pool)| pool.map(|_| index))
             .collect();
-        let config = op.relation_config(&values)?;
+        let mut config = op.relation_config(&values)?;
+        for reference in public_luts.iter().flatten() {
+            let asset = self
+                .commitment
+                .assets
+                .iter()
+                .find(|asset| asset.asset_id == reference.asset_id)
+                .ok_or(Error::StatementMismatch)?;
+            config.extend(public_lut::identity_words(reference, &asset.root));
+        }
         let (public, proof) = prove_op_relation_shared(op, &values, &config, &external_indices)?;
         let mut roots = Vec::new();
         for id in public.registry.ids() {
@@ -224,6 +260,7 @@ impl<'a> Builder<'a> {
                 proof,
             },
             external: external_assets,
+            public_luts,
             sources,
         });
         self.completed = self.completed.saturating_add(1);
@@ -329,6 +366,7 @@ pub fn execute_shared_with_progress(
         progress,
         planned_total,
         completed: 0,
+        commitment: assets.commitment,
         external_refs: &assets.refs,
     };
     let weight = |name: &str| assets.value(name);

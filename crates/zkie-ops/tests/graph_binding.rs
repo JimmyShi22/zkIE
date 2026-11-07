@@ -624,6 +624,7 @@ fn shared_trace_references_one_model_asset_opening() {
                 row_count: 2,
             }),
         ],
+        public_luts: vec![None, None],
         sources: vec![None, None],
     };
     let trace = SharedTrace {

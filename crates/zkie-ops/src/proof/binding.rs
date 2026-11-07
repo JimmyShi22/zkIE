@@ -152,6 +152,16 @@ pub fn oracle_start(label: &Digest) -> Digest {
     hash_labeled(tag_word(STATEMENT, 6), 0, None, &label.0).unwrap_or(Digest::ZERO)
 }
 
+pub fn oracle_leaf_i64(index: u64, values: &[i64]) -> Digest {
+    let _profile = zkie_core::profile::Scope::kernel(zkie_core::profile::Kernel::Merkle);
+    let mut writer = CanonicalWriter::new();
+    for value in values {
+        writer.put_u64(*value as u64);
+    }
+    hash_labeled(tag_word(STATEMENT, 0), index, None, &writer.into_bytes())
+        .unwrap_or(Digest::ZERO)
+}
+
 pub fn oracle_leaf(index: u64, values: &[u64]) -> Digest {
     let _profile = zkie_core::profile::Scope::kernel(zkie_core::profile::Kernel::Merkle);
     let mut writer = CanonicalWriter::new();

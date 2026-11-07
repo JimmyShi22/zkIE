@@ -13,7 +13,9 @@ use zkie_core::compute::{MemoryGovernor, MemoryRequest};
 use zkie_core::error::{Error, Result};
 use rayon::prelude::*;
 
+use crate::proof::binding::oracle_leaf_i64;
 use crate::proof::relations::ExternalAssetRef;
+use crate::public_lut::{self, PublicLutRef};
 use zkie_core::storage::TensorReader;
 use zkie_core::types::{Digest, DType, TensorSpec};
 use zkie_engine::compute::cpu::{merkle_build, merkle_verify, MerkleTree};
@@ -495,6 +497,30 @@ impl<'a> AssetStore<'a> {
     ) -> Result<Vec<AssetOpening>> {
         let mut used = BTreeSet::new();
         for step in steps.iter() {
+            if step.external.len() != step.public_luts.len() {
+                return Err(Error::ShapeMismatch);
+            }
+            for (external, public_lut) in step.external.iter().zip(&step.public_luts) {
+                if external.is_some() && public_lut.is_some() {
+                    return Err(Error::StatementMismatch);
+                }
+                if let Some(reference) = public_lut {
+                    let asset = self
+                        .commitment
+                        .assets
+                        .iter()
+                        .find(|asset| asset.asset_id == reference.asset_id)
+                        .ok_or(Error::StatementMismatch)?;
+                    let kind = public_lut::classify_path(&asset.path)
+                        .ok_or(Error::StatementMismatch)?;
+                    if kind != reference.kind
+                        || reference.valid_len != asset.element_count
+                        || reference.padded_len != public_lut::padded_len(reference.valid_len)
+                    {
+                        return Err(Error::StatementMismatch);
+                    }
+                }
+            }
             for reference in step.external.iter().flatten() {
                 let asset = self
                     .commitment
@@ -732,6 +758,8 @@ pub struct SharedTraceStep {
     pub message: crate::proof::relations::RelationReceiptMessage,
     /// For each relation input index, an explicit shared-asset interval.
     pub external: Vec<Option<ExternalAssetRef>>,
+    /// For each relation input index, a public LUT reconstructed by verify.
+    pub public_luts: Vec<Option<PublicLutRef>>,
     /// For each relation input index, a previous (step, output) edge.
     pub sources: Vec<Option<(usize, usize)>>,
 }
@@ -795,41 +823,92 @@ fn verify_shared_trace_steps(
         }
     }
     let mut referenced: BTreeSet<ExternalAssetRef> = BTreeSet::new();
+    let mut public_lut_refs: BTreeMap<u64, PublicLutRef> = BTreeMap::new();
     for step in &trace.steps {
         let input_count = step.message.proof.lengths.inputs.len();
-        if step.external.len() != input_count {
+        if step.external.len() != input_count || step.public_luts.len() != input_count {
             return Err(Error::ShapeMismatch);
         }
-        let expected: Vec<usize> = step
-            .external
-            .iter()
-            .enumerate()
-            .filter_map(|(index, slot)| slot.map(|_| index))
-            .collect();
+        let mut expected: Vec<usize> = Vec::new();
+        for index in 0..input_count {
+            let external = step.external[index].is_some();
+            let public_lut = step.public_luts[index].is_some();
+            if external && public_lut {
+                return Err(Error::StatementMismatch);
+            }
+            if external || public_lut {
+                expected.push(index);
+            } else if step
+                .message
+                .proof
+                .inputs
+                .get(index)
+                .map(|openings| openings.is_empty())
+                .unwrap_or(true)
+            {
+                return Err(Error::StatementMismatch);
+            }
+        }
         if step.message.external_inputs != expected {
             return Err(Error::StatementMismatch);
         }
-        for (index, slot) in step.external.iter().enumerate() {
-            match slot {
-                Some(reference) => {
-                    if !openings_by_id.contains_key(&reference.asset_id) {
-                        return Err(Error::StatementMismatch);
-                    }
-                    referenced.insert(*reference);
+        for slot in &step.external {
+            if let Some(reference) = slot {
+                if !openings_by_id.contains_key(&reference.asset_id) {
+                    return Err(Error::StatementMismatch);
                 }
-                None => {
-                    if step
-                        .message
-                        .proof
-                        .inputs
-                        .get(index)
-                        .map(|openings| openings.is_empty())
-                        .unwrap_or(true)
-                    {
-                        return Err(Error::StatementMismatch);
-                    }
+                referenced.insert(*reference);
+            }
+        }
+        for reference in step.public_luts.iter().flatten() {
+            if openings_by_id.contains_key(&reference.asset_id) {
+                return Err(Error::StatementMismatch);
+            }
+            let meta = public
+                .assets
+                .iter()
+                .find(|asset| asset.asset_id == reference.asset_id)
+                .ok_or(Error::StatementMismatch)?;
+            let kind = public_lut::classify_path(&meta.path).ok_or(Error::StatementMismatch)?;
+            if kind != reference.kind
+                || reference.valid_len != meta.element_count
+                || reference.padded_len != public_lut::padded_len(reference.valid_len)
+                || meta.rows != 1
+                || meta.row_width as u64 != meta.element_count
+            {
+                return Err(Error::StatementMismatch);
+            }
+            if let Some(existing) = public_lut_refs.insert(reference.asset_id, *reference) {
+                if existing != *reference {
+                    return Err(Error::StatementMismatch);
                 }
             }
+        }
+        let mut expected_suffix = Vec::new();
+        for reference in step.public_luts.iter().flatten() {
+            let meta = public
+                .assets
+                .iter()
+                .find(|asset| asset.asset_id == reference.asset_id)
+                .ok_or(Error::StatementMismatch)?;
+            expected_suffix.extend(public_lut::identity_words(reference, &meta.root));
+        }
+        if !expected_suffix.is_empty()
+            && !step.message.config.ends_with(&expected_suffix)
+        {
+            return Err(Error::StatementMismatch);
+        }
+    }
+    for (asset_id, reference) in &public_lut_refs {
+        let meta = public
+            .assets
+            .iter()
+            .find(|asset| asset.asset_id == *asset_id)
+            .ok_or(Error::StatementMismatch)?;
+        let values = public_lut::values(reference)?;
+        let generated_root = oracle_leaf_i64(0, values.as_ref());
+        if generated_root != meta.root {
+            return Err(Error::StatementMismatch);
         }
     }
     let referenced_ids: BTreeSet<u64> = referenced.iter().map(|reference| reference.asset_id).collect();
@@ -868,7 +947,7 @@ fn verify_shared_trace_steps(
         let output_count = step.message.proof.lengths.outputs.len();
         let input_oracles = (0..input_count)
             .map(|index| {
-                if step.external[index].is_some() {
+                if step.external[index].is_some() || step.public_luts[index].is_some() {
                     Ok(None)
                 } else {
                     step.message
@@ -910,6 +989,12 @@ fn verify_shared_trace_steps(
                     .get(&reference.asset_id)
                     .ok_or(Error::StatementMismatch)?;
                 external_values[input] = Some(extract_interval_values(opening, reference)?);
+            }
+        }
+        for (input, reference) in step.public_luts.iter().enumerate() {
+            if let Some(reference) = reference {
+                let values = public_lut::values(reference)?;
+                external_values[input] = Some((*values).clone());
             }
         }
         crate::proof::relations::verify_op_relation_with_external(
