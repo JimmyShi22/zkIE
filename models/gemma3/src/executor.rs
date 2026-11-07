@@ -109,14 +109,13 @@ pub fn asset_specs() -> Vec<ModelAssetSpec> {
 
 struct Assets<'a> {
     store: AssetStore<'a>,
-    trace_assets: Vec<AssetOpening>,
 }
 
 impl<'a> Assets<'a> {
     fn load(commitment: &'a ModelCommitment) -> Result<Self> {
-        let store = AssetStore::open(commitment)?;
-        let trace_assets = store.open_all()?;
-        Ok(Self { store, trace_assets })
+        Ok(Self {
+            store: AssetStore::open(commitment)?,
+        })
     }
 
     fn value(&self, path: &str) -> Result<Vec<i64>> {
@@ -537,6 +536,8 @@ pub fn execute_shared_with_progress(
         argmax.push(out[0][0] as u32);
     }
     let Builder { steps, .. } = builder;
+    let mut steps = steps;
+    let trace_assets = assets.store.open_referenced(&mut steps)?;
     if let Some(progress) = progress {
         let actual = steps.len() as u64;
         let mut event = ProgressEvent::new("prove", "prove", ProgressKind::WorkAdvanced);
@@ -547,7 +548,7 @@ pub fn execute_shared_with_progress(
     }
     Ok(SharedTrace {
         tokens: tokens.iter().map(|value| *value as u32).collect(),
-        assets: assets.trace_assets,
+        assets: trace_assets,
         steps,
         argmax,
         output: Vec::new(),

@@ -5,7 +5,7 @@
 //! steps reference the same opening instead of re-committing the asset.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -482,6 +482,38 @@ impl<'a> AssetStore<'a> {
         self.with_reader(index, |reader| {
             open_asset_from_reader(self.commitment, reader, asset.asset_id, 0, asset.rows)
         })
+    }
+
+    /// Open only the assets referenced by a step's external slots. The trace
+    /// stores compact indices into the returned list; intervals are the full
+    /// asset row range for now (P2 may narrow them).
+    pub fn open_referenced(
+        &self,
+        steps: &mut [SharedTraceStep],
+    ) -> Result<Vec<AssetOpening>> {
+        let mut used = BTreeSet::new();
+        for step in steps.iter() {
+            for slot in step.external.iter().flatten() {
+                if *slot >= self.commitment.assets.len() {
+                    return Err(Error::InvalidIndex);
+                }
+                used.insert(*slot);
+            }
+        }
+        let mut remap = BTreeMap::new();
+        let mut openings = Vec::with_capacity(used.len());
+        for index in used {
+            remap.insert(index, openings.len());
+            openings.push(self.open_asset(index)?);
+        }
+        for step in steps.iter_mut() {
+            for slot in step.external.iter_mut() {
+                if let Some(index) = slot {
+                    *index = *remap.get(index).ok_or(Error::InvalidIndex)?;
+                }
+            }
+        }
+        Ok(openings)
     }
 
     /// Open every committed asset, preserving the trace's protocol work: each

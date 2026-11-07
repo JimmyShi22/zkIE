@@ -325,6 +325,15 @@ impl PipelineProvider for ProductionProvider {
         };
         let statement_bytes = bincode::serialize(&statement).map_err(|_| Error::InvalidEncoding)?;
         let trace = execute_shared(&config, &commitment, ctx.progress)?;
+        if std::env::var("ZKIE_MEASURE_PROOF_SECTIONS").ok().as_deref() == Some("1") {
+            let asset_bytes = bincode::serialized_size(&trace.assets)
+                .map_err(|_| Error::InvalidEncoding)?;
+            let step_bytes = bincode::serialized_size(&trace.steps)
+                .map_err(|_| Error::InvalidEncoding)?;
+            eprintln!(
+                "ZKIE_ASSET_BYTES={asset_bytes} ZKIE_STEP_BYTES={step_bytes}"
+            );
+        }
         let proof_bytes = bincode::serialize(&trace).map_err(|_| Error::InvalidEncoding)?;
         let public_inputs = if config.model == "timesfm" {
             bincode::serialize(&config.expected_output).map_err(|_| Error::InvalidEncoding)?
