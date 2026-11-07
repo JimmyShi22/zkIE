@@ -125,3 +125,29 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Fixed-point codec interface.
+
+pub trait FixedPointCodec<F: crate::common::field::ProtocolField>: Send + Sync {
+    fn encode_integer(
+        &self,
+        value: i128,
+        spec: &crate::types::FixedSpec,
+    ) -> crate::error::Result<F>;
+
+    fn decode_integer(
+        &self,
+        value: F,
+        spec: &crate::types::FixedSpec,
+    ) -> crate::error::Result<i128>;
+
+    fn requantize(
+        &self,
+        value: i128,
+        from_scale: i32,
+        to_scale: i32,
+        rule: crate::types::RoundRule,
+        output_bound: u128,
+    ) -> crate::error::Result<i128>;
+}

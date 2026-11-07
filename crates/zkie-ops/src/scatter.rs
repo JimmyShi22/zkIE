@@ -1,79 +1,41 @@
-//! Expert-major scatter: reorder tokens into dense per-expert segments and
-//! prove the reordering is a correct permutation (LogUp multiset equality).
+//! Scatter with duplicate-index rejection.
 
-use zkie_core::common::field::{Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
-use zkie_core::common::logup_gkr::{prove_permutation, verify_permutation, PermutationProof};
+use zkie_core::error::{Error, Result};
+use zkie_core::types::TensorSpec;
 
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct ScatterProof {
-    pub perm: PermutationProof,
+use crate::op::OpCode;
+use crate::registry::{KernelRecord, PureForward};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScatterOp {
+    pub size: usize,
 }
 
-/// `(token_id, expert_of)`: for each expert in order, the tokens routed to it.
-pub fn scatter_forward(sel: &[Goldilocks], m: usize, n: usize) -> (Vec<u32>, Vec<u32>) {
-    let mut token_id = Vec::new();
-    let mut expert_of = Vec::new();
-    for e in 0..n {
-        for t in 0..m {
-            if sel[t * n + e] == Goldilocks::ONE {
-                token_id.push(t as u32);
-                expert_of.push(e as u32);
-            }
-        }
+impl PureForward for ScatterOp {
+    fn opcode(&self) -> OpCode {
+        OpCode::Scatter
     }
-    (token_id, expert_of)
-}
 
-fn source_encodings(sel: &[Goldilocks], m: usize, n: usize) -> Vec<Goldilocks> {
-    let mut a = Vec::new();
-    for t in 0..m {
-        for e in 0..n {
-            if sel[t * n + e] == Goldilocks::ONE {
-                a.push(Goldilocks::from_u64((t * n + e) as u64));
-            }
+    fn infer_specs(&self, inputs: &[TensorSpec]) -> Result<Vec<TensorSpec>> {
+        if inputs.len() != 2 || crate::registry::io_count(&inputs[0])? != crate::registry::io_count(&inputs[1])? {
+            return Err(Error::ShapeMismatch);
         }
+        Ok(vec![crate::registry::spec_1d(self.size)])
     }
-    a
-}
 
-pub fn prove_scatter(
-    sel: &[Goldilocks],
-    token_id: &[u32],
-    expert_of: &[u32],
-    m: usize,
-    n: usize,
-    rng: &mut impl ChallengeSource,
-) -> ScatterProof {
-    let a = source_encodings(sel, m, n);
-    let b: Vec<Goldilocks> = token_id
-        .iter()
-        .zip(expert_of.iter())
-        .map(|(&t, &e)| Goldilocks::from_u64((t as usize * n + e as usize) as u64))
-        .collect();
-    let perm = prove_permutation(&a, &b, rng);
-    ScatterProof { perm }
-}
-
-pub fn verify_scatter(proof: &ScatterProof, _m: usize, _n: usize) -> bool {
-    verify_permutation(&proof.perm)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn scatter_roundtrip() {
-        let mut rng = XorShift64::new(0x4242);
-        let (m, n, k) = (4usize, 4usize, 2usize);
-        let mut sel = vec![Goldilocks::ZERO; m * n];
-        for t in 0..m {
-            sel[t * n + (t % n)] = Goldilocks::ONE;
-            sel[t * n + ((t + 1) % n)] = Goldilocks::ONE;
+    fn forward_values(&self, inputs: &[Vec<i64>]) -> Result<KernelRecord> {
+        if inputs.len() != 2 || inputs[0].len() != inputs[1].len() {
+            return Err(Error::ShapeMismatch);
         }
-        let (token_id, expert_of) = scatter_forward(&sel, m, n);
-        assert_eq!(token_id.len(), m * k);
-        let proof = prove_scatter(&sel, &token_id, &expert_of, m, n, &mut rng);
-        assert!(verify_scatter(&proof, m, n));
+        let mut output = vec![0i64; self.size];
+        let mut seen = vec![false; self.size];
+        for (index, value) in inputs[0].iter().zip(&inputs[1]) {
+            if *index < 0 || *index as usize >= self.size || seen[*index as usize] {
+                return Err(Error::InvalidIndex);
+            }
+            seen[*index as usize] = true;
+            output[*index as usize] = *value;
+        }
+        Ok(KernelRecord::with_output(output))
     }
 }

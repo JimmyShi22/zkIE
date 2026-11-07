@@ -3,6 +3,9 @@
 //! using the op primitives from `zkie-ops`. Weights/tables are read from
 //! `models/gemma3/weights/` (i32 fixed-point `.bin` files).
 
+pub mod config;
+pub mod executor;
+
 use std::fs;
 use std::sync::Arc;
 

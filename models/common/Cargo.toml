@@ -1,0 +1,11 @@
+[package]
+name = "zkie-models-common"
+version = "0.1.0"
+edition = "2021"
+description = "Shared model asset manifest and GT helpers"
+license = "Apache-2.0"
+
+[dependencies]
+zkie-core = { path = "../../crates/zkie-core" }
+zkie-ops = { path = "../../crates/zkie-ops" }
+sha2 = "0.10"

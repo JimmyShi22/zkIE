@@ -1,0 +1,1851 @@
+schema_version = 1
+case_group = "gemma3-270m"
+description = "Gemma3 270M 因果语言模型 case 组"
+
+[architecture]
+layers = 18
+heads = 4
+head_dim = 256
+hidden = 640
+hidden_padded = 1024
+ffn_intermediate = 2048
+vocab = 262144
+max_sequence = 512
+norm = "rmsnorm"
+activation = "gated_gelu"
+position = "local_global_rope"
+causal = true
+full_attention_layers = [5, 11, 17]
+
+[assets]
+root = "/data/zkie-assets"
+weight_encoding = "i32 little-endian"
+scale_encoding = "i64 little-endian"
+
+[[assets.file]]
+path = "models/gemma3/weights/L0_q_w_i32.bin"
+bytes = 4194304
+sha256 = "fdf864e4dad508d6552dc0a4992c9cf7ecc65328aca69dea1b6b8a58d0d0aaca"
+encoding = "i32-le"
+role = "L0.q_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L0_k_w_i32.bin"
+bytes = 1048576
+sha256 = "f8f61880b62a9ed477972eb7996537e0b45e561ae5c4ac36f48378b8c25b60ec"
+encoding = "i32-le"
+role = "L0.k_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L0_v_w_i32.bin"
+bytes = 1048576
+sha256 = "d41ae2008ed0a98e2c6951001e029d31678a1f29f60e4e193a8c59c66110f9c0"
+encoding = "i32-le"
+role = "L0.v_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L0_o_w_i32.bin"
+bytes = 4194304
+sha256 = "ffe5f3f632f54a5080a1bc0ea58a1b0ffac71be764e4ba0a1987478b94717e8a"
+encoding = "i32-le"
+role = "L0.o_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L0_gate_w_i32.bin"
+bytes = 8388608
+sha256 = "c76ba8722bc98a39d8f08c02fe37f8fc95cb72fbe5cfb6d4846c8e8224f85fbb"
+encoding = "i32-le"
+role = "L0.gate_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L0_up_w_i32.bin"
+bytes = 8388608
+sha256 = "6a93fc05e3cf945b18ea055368183ea6b8df0c655febf801db40d9da8d862dcf"
+encoding = "i32-le"
+role = "L0.up_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L0_down_w_i32.bin"
+bytes = 8388608
+sha256 = "866bb95ea7104b8ab9d3b40833943f1319d6df3ef0ff8af9568b19eb6683ebf1"
+encoding = "i32-le"
+role = "L0.down_w"
+shape = [2048, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L0_in_norm_i32.bin"
+bytes = 4096
+sha256 = "a0bd333cde7b9cc6882e6ee7da97b069fe9ff44a9ca6c714f4a5f83508cd046c"
+encoding = "i32-le"
+role = "L0.in_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L0_post_attn_norm_i32.bin"
+bytes = 4096
+sha256 = "eadc5462dd5cd1084b769762570640ded08a30e893f54ae024bf8d7ae00aed73"
+encoding = "i32-le"
+role = "L0.post_attn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L0_pre_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "fffda8d228eb472068a6dc7da66a0849baac22fa16043e6c50bfc66ad91a9951"
+encoding = "i32-le"
+role = "L0.pre_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L0_post_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "4ead2baf47e8f1e7a6ecc8ba2f42983393e1b829233b2f23e66ebb504b88f9f6"
+encoding = "i32-le"
+role = "L0.post_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L0_q_norm_i32.bin"
+bytes = 1024
+sha256 = "7a9f7173f630c7107d470e93bb51d0dc97e2a7e4b6574ba26dfe8242f892afd2"
+encoding = "i32-le"
+role = "L0.q_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L0_k_norm_i32.bin"
+bytes = 1024
+sha256 = "4f921fe2c7e7246465ec0afe5915a9fc7aa7f2648e5293eb01d20ae5d9512c29"
+encoding = "i32-le"
+role = "L0.k_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L1_q_w_i32.bin"
+bytes = 4194304
+sha256 = "74d128aa38ec353d08f026d8e5b549c949d35b126a942f28cc1b567bbd2ee372"
+encoding = "i32-le"
+role = "L1.q_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L1_k_w_i32.bin"
+bytes = 1048576
+sha256 = "c0fbbba7b13a2ea493f4b6f6cb4a3bfc3d5dc01932000be19ff8e5d519945fc6"
+encoding = "i32-le"
+role = "L1.k_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L1_v_w_i32.bin"
+bytes = 1048576
+sha256 = "590e084e55763cd6b2a36dec26270e46fc6b56d6fa69e7804aea7eacea5bf8d1"
+encoding = "i32-le"
+role = "L1.v_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L1_o_w_i32.bin"
+bytes = 4194304
+sha256 = "3168fe4dad454f7b1ef7e20620108c83bfaa5a0ba81950da15eadf98aaad766d"
+encoding = "i32-le"
+role = "L1.o_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L1_gate_w_i32.bin"
+bytes = 8388608
+sha256 = "5c7843ff627d260f4e6be0579985d32c09684a49544332ecf657c96c04cdf68f"
+encoding = "i32-le"
+role = "L1.gate_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L1_up_w_i32.bin"
+bytes = 8388608
+sha256 = "36d4f4efd119d4b07745948cf8581bd03a30adc6e77f371e4c61c3ea999a1c03"
+encoding = "i32-le"
+role = "L1.up_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L1_down_w_i32.bin"
+bytes = 8388608
+sha256 = "c43f97c668f39dc64b607f417bb55e144231ab593cc4243245339a77fbb25d75"
+encoding = "i32-le"
+role = "L1.down_w"
+shape = [2048, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L1_in_norm_i32.bin"
+bytes = 4096
+sha256 = "f69bc35cc2379c486c47a9b6bdb3f81f579a290d1d7455582d57a11688b49958"
+encoding = "i32-le"
+role = "L1.in_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L1_post_attn_norm_i32.bin"
+bytes = 4096
+sha256 = "3d2a39d3dc24d489c1db68de28ea7b6b2dc14739741506555677db86b65b790b"
+encoding = "i32-le"
+role = "L1.post_attn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L1_pre_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "cc98d757baa64bdd0c2f483a19c92460496e2521d1b1c3465b6a374737d1f99a"
+encoding = "i32-le"
+role = "L1.pre_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L1_post_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "2fd421842cc0cbfb24dc33841a169f645cadbe8ba7e48a3657d5bd09eb587e62"
+encoding = "i32-le"
+role = "L1.post_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L1_q_norm_i32.bin"
+bytes = 1024
+sha256 = "795e9f33bc71f7897827279d74fdf8f1f9dd6489fe095513b4f8e8882073a3e6"
+encoding = "i32-le"
+role = "L1.q_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L1_k_norm_i32.bin"
+bytes = 1024
+sha256 = "ae215a6da2a0913563ab6dd5190560d301efbc6da8610ab9c234f87ad80c67ac"
+encoding = "i32-le"
+role = "L1.k_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L2_q_w_i32.bin"
+bytes = 4194304
+sha256 = "b44b9e61237f9d99cb40b6a104ebfe0670297b7b8c86edbe162ead6e238f6248"
+encoding = "i32-le"
+role = "L2.q_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L2_k_w_i32.bin"
+bytes = 1048576
+sha256 = "c6e272feb2533adeae6b31007f98c6f7a6f7651d861536f4c042f719f633c68e"
+encoding = "i32-le"
+role = "L2.k_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L2_v_w_i32.bin"
+bytes = 1048576
+sha256 = "1c29f3e03163306e6c6544f3bb7b7977668769966b8c696a837135b275454107"
+encoding = "i32-le"
+role = "L2.v_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L2_o_w_i32.bin"
+bytes = 4194304
+sha256 = "7e676f825d75c2e0208e1bdfc3bb61983e02816e89871b012cdac855f2f2bbca"
+encoding = "i32-le"
+role = "L2.o_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L2_gate_w_i32.bin"
+bytes = 8388608
+sha256 = "7dfc1d34187f83cb42ea9d07d0f8916f4bfd17c0bb0b17b438377ec6816dc799"
+encoding = "i32-le"
+role = "L2.gate_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L2_up_w_i32.bin"
+bytes = 8388608
+sha256 = "495ca58f1b585525ccfc665be7dc10360b684b3d96bde622c2ee60d46c590eaf"
+encoding = "i32-le"
+role = "L2.up_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L2_down_w_i32.bin"
+bytes = 8388608
+sha256 = "4384daf3549654f3e38d9fcbc0bce48661f35bb0a3d76194a051bc68f18f4cb0"
+encoding = "i32-le"
+role = "L2.down_w"
+shape = [2048, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L2_in_norm_i32.bin"
+bytes = 4096
+sha256 = "24126e7ba9976efdfb0dfda87e391bc3a7ae7670c33aa7a425ddc9ba1ec3616a"
+encoding = "i32-le"
+role = "L2.in_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L2_post_attn_norm_i32.bin"
+bytes = 4096
+sha256 = "ef19821f147895c01ce8d93a8d61ae32cb670433572df4c7d2ebddcf9e6e9553"
+encoding = "i32-le"
+role = "L2.post_attn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L2_pre_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "fa9423b81826d21612b791e4d8de09a63284840e986b7c77a5797b090f29e9c0"
+encoding = "i32-le"
+role = "L2.pre_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L2_post_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "6c67fb35737a6504086ed8087ca5ffc98b42a86f16d7ef7b777d19bf08d25d88"
+encoding = "i32-le"
+role = "L2.post_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L2_q_norm_i32.bin"
+bytes = 1024
+sha256 = "de5910bb425792bc7fb019e0d049dc38eb84a2dd2de1df28c24496710df24b44"
+encoding = "i32-le"
+role = "L2.q_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L2_k_norm_i32.bin"
+bytes = 1024
+sha256 = "5deb131cce828cb5a911d9ebf9cd5cc27c7b04a044b77311d2474f42c8bfba28"
+encoding = "i32-le"
+role = "L2.k_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L3_q_w_i32.bin"
+bytes = 4194304
+sha256 = "14d1eebe5bbfc1de86d03347cb5ec5fc60b0849afb48cec2a6b21b51e8130235"
+encoding = "i32-le"
+role = "L3.q_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L3_k_w_i32.bin"
+bytes = 1048576
+sha256 = "be239dd16e21ec84af662d2f6e9c5d176a57f4b438b920912817a5f4565df142"
+encoding = "i32-le"
+role = "L3.k_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L3_v_w_i32.bin"
+bytes = 1048576
+sha256 = "66b55a36e471523bd7511cccee1b09dc0a1370bd598a532c9048071b87ec776f"
+encoding = "i32-le"
+role = "L3.v_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L3_o_w_i32.bin"
+bytes = 4194304
+sha256 = "ba8173458899ae2268f2cefa8f094f9279315b499edf227d27d2438cbf77ac2a"
+encoding = "i32-le"
+role = "L3.o_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L3_gate_w_i32.bin"
+bytes = 8388608
+sha256 = "d80bc61d342286b31c6181c3323ca7b2d18469244a742e71cd5f2cd16e66c132"
+encoding = "i32-le"
+role = "L3.gate_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L3_up_w_i32.bin"
+bytes = 8388608
+sha256 = "c44b6bf694a43b515bb8dd0daf892e99a1a1282af22150ea135d26a8c399884a"
+encoding = "i32-le"
+role = "L3.up_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L3_down_w_i32.bin"
+bytes = 8388608
+sha256 = "e5d155f52bfb4b72b4276f86b69c71d87a7b8fdfa038d290b8ff34e107deddc8"
+encoding = "i32-le"
+role = "L3.down_w"
+shape = [2048, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L3_in_norm_i32.bin"
+bytes = 4096
+sha256 = "d2e47b56136c6b34518bcbc05ac91641945f0d215f5f34de6f01d9e45041297e"
+encoding = "i32-le"
+role = "L3.in_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L3_post_attn_norm_i32.bin"
+bytes = 4096
+sha256 = "8927eb926d44a6752fdb9e7557850bba21d8ae8737649bd1fc814992ac4be543"
+encoding = "i32-le"
+role = "L3.post_attn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L3_pre_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "843909877eac5dbc5511fa4b207452b5829b8a1e02def5658bfec48ae7d70ac3"
+encoding = "i32-le"
+role = "L3.pre_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L3_post_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "652a2d481215904edcac3dcf6ddd1e4f54bcda9da241bb769507597269609db2"
+encoding = "i32-le"
+role = "L3.post_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L3_q_norm_i32.bin"
+bytes = 1024
+sha256 = "7bbf9f200511fc993b6d30cfad652cbbaddbb4971e58f4694f2dc556bfb69a73"
+encoding = "i32-le"
+role = "L3.q_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L3_k_norm_i32.bin"
+bytes = 1024
+sha256 = "a90ec9f69c6a8b44058eec1be03d3b3801c3596e459cfbf9d08926b5fd34488c"
+encoding = "i32-le"
+role = "L3.k_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L4_q_w_i32.bin"
+bytes = 4194304
+sha256 = "9775f3cbe4e9b50d1fb5392db97389de42aa92db70bfd5ada72b0db914ecec82"
+encoding = "i32-le"
+role = "L4.q_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L4_k_w_i32.bin"
+bytes = 1048576
+sha256 = "ad2f52a292d4ac9a98707b1f139b32914c7a19f7447ae4f9604877de6d1b834f"
+encoding = "i32-le"
+role = "L4.k_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L4_v_w_i32.bin"
+bytes = 1048576
+sha256 = "e540d1248704a0e07fcc56324b53ad10df4c7c5aba6d417896930a8fae3201bf"
+encoding = "i32-le"
+role = "L4.v_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L4_o_w_i32.bin"
+bytes = 4194304
+sha256 = "1cd2b72b8ba09d780dfc8fc3ca356092084069ddb290d36d5e951db2f381db69"
+encoding = "i32-le"
+role = "L4.o_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L4_gate_w_i32.bin"
+bytes = 8388608
+sha256 = "6fb6fab1a8675c7d56b048aa187a0c48577cff55faa9a65963058cb5bf580a53"
+encoding = "i32-le"
+role = "L4.gate_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L4_up_w_i32.bin"
+bytes = 8388608
+sha256 = "b5daba5f25ac6997f7ef7916c187d3a3299c41d9e8dd5c92fea41356e1a32852"
+encoding = "i32-le"
+role = "L4.up_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L4_down_w_i32.bin"
+bytes = 8388608
+sha256 = "a91ed384352a5e0163e03f2f72a1abf91f848e409148861b4371690fb3aad38a"
+encoding = "i32-le"
+role = "L4.down_w"
+shape = [2048, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L4_in_norm_i32.bin"
+bytes = 4096
+sha256 = "1335151cb3a939dd8bd259f8a0518a5a04a8e9646be278f3e5148ede5eb7a1fc"
+encoding = "i32-le"
+role = "L4.in_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L4_post_attn_norm_i32.bin"
+bytes = 4096
+sha256 = "4ac789283549535aa72ccd182f06c124ff92dfdc728fbb7624eadffe07f34d65"
+encoding = "i32-le"
+role = "L4.post_attn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L4_pre_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "fd7330bb0e9770e603cb3cd030c1c3f68f5ca762f43d668252aae32fcb5b1684"
+encoding = "i32-le"
+role = "L4.pre_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L4_post_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "ba50c3a83e4d96e16b1c100251eae6dc64a32dad36d67d968a3f7b570ee0afed"
+encoding = "i32-le"
+role = "L4.post_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L4_q_norm_i32.bin"
+bytes = 1024
+sha256 = "4a54bebb2f81f37dfa3b0feab1023fd500ef69a8330571ffe207a8c0272da65b"
+encoding = "i32-le"
+role = "L4.q_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L4_k_norm_i32.bin"
+bytes = 1024
+sha256 = "d866ee157e37812964e94762ef1a7aa7d562d5e5680dd47d94239dc955e22d2b"
+encoding = "i32-le"
+role = "L4.k_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L5_q_w_i32.bin"
+bytes = 4194304
+sha256 = "561369724957162e687cb487b69cfb92036d2bf29eb49eb317e981214840e633"
+encoding = "i32-le"
+role = "L5.q_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L5_k_w_i32.bin"
+bytes = 1048576
+sha256 = "e7114a44dda230f0e133c4a05a4ec77e3a65a9c35b3240c04bd7e555a563c095"
+encoding = "i32-le"
+role = "L5.k_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L5_v_w_i32.bin"
+bytes = 1048576
+sha256 = "fb7e7c00670219918bb4aa16375f7546ebdd37b6b4273c2c90f00b4134c8f90a"
+encoding = "i32-le"
+role = "L5.v_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L5_o_w_i32.bin"
+bytes = 4194304
+sha256 = "a45c379b3c4801e230a61cd9b21387c439e49e469f2d640374e0b1b442998a9b"
+encoding = "i32-le"
+role = "L5.o_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L5_gate_w_i32.bin"
+bytes = 8388608
+sha256 = "31d4ab3e00a7174ae8a168137af6b605fb44e2d314f3a82aff781308fb6c20ce"
+encoding = "i32-le"
+role = "L5.gate_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L5_up_w_i32.bin"
+bytes = 8388608
+sha256 = "1ff900cf7eec71100ed8e2af1b81b9325f871b102b5e0d7b1004e94b216b70fc"
+encoding = "i32-le"
+role = "L5.up_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L5_down_w_i32.bin"
+bytes = 8388608
+sha256 = "81fee3145bf361d6eb21b19efa102227a7f1dd70e6f1ea0553609b22d3b2647c"
+encoding = "i32-le"
+role = "L5.down_w"
+shape = [2048, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L5_in_norm_i32.bin"
+bytes = 4096
+sha256 = "c8321c3c0d5e571eb48e609b2bd14b5ce5c1368d19c80a9d60923ed8bff57345"
+encoding = "i32-le"
+role = "L5.in_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L5_post_attn_norm_i32.bin"
+bytes = 4096
+sha256 = "b307e9b7f9178bcefc227167e8210d5633a2fbc4d469f86ca60fbaeb013cdf78"
+encoding = "i32-le"
+role = "L5.post_attn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L5_pre_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "d12e13975cf7321dc9ee337f03e8acff4721cbe01391a06077b01f4745e6eb26"
+encoding = "i32-le"
+role = "L5.pre_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L5_post_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "e19920458692a688405210dfcbab6ef76706b177aa03f3835f6428ae524967d3"
+encoding = "i32-le"
+role = "L5.post_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L5_q_norm_i32.bin"
+bytes = 1024
+sha256 = "c2ace23d6d3a6af80f20c286ac4fd99670288f8ce454e4a43d09789d43432b05"
+encoding = "i32-le"
+role = "L5.q_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L5_k_norm_i32.bin"
+bytes = 1024
+sha256 = "63ee664b8c08b8b30c10543c6ddf46e3be3cba7f3cea820929ebc67f9bb9a889"
+encoding = "i32-le"
+role = "L5.k_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L6_q_w_i32.bin"
+bytes = 4194304
+sha256 = "13cf88ecc1aa6cdaf3e579d420165d320616ea07025a1ed61af0112e35ce50c2"
+encoding = "i32-le"
+role = "L6.q_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L6_k_w_i32.bin"
+bytes = 1048576
+sha256 = "3235c36eff74102fcf8ca9ddbb9007a3335aa9448f48aefd31bcec07c18d221e"
+encoding = "i32-le"
+role = "L6.k_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L6_v_w_i32.bin"
+bytes = 1048576
+sha256 = "894fd2eb7c39bb5b60ba239e899a30bdbfdebb799620ba9f9f7a174d49cb86da"
+encoding = "i32-le"
+role = "L6.v_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L6_o_w_i32.bin"
+bytes = 4194304
+sha256 = "aaaad18033c42ec1423090c5f36c632d464df0aaffd00dcfad5022732231c543"
+encoding = "i32-le"
+role = "L6.o_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L6_gate_w_i32.bin"
+bytes = 8388608
+sha256 = "ecf0290488d3b72c8b5ccadb4a8f35f9bb5e011137ce6a6ceb9bbf00ab46af21"
+encoding = "i32-le"
+role = "L6.gate_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L6_up_w_i32.bin"
+bytes = 8388608
+sha256 = "11a2fc394310b4d6e492af3752ddefc54a8d83fe41ee5e070a9082aa0c54df2e"
+encoding = "i32-le"
+role = "L6.up_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L6_down_w_i32.bin"
+bytes = 8388608
+sha256 = "d22cc2d6b136e2440c7cf2ca45a5cb3f5c214aa18f6e903ea558f3fc072e2863"
+encoding = "i32-le"
+role = "L6.down_w"
+shape = [2048, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L6_in_norm_i32.bin"
+bytes = 4096
+sha256 = "f247e6fa557ba4ee687a8118bef03cde4ecfe815e2d07b8a2864a01e71609d36"
+encoding = "i32-le"
+role = "L6.in_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L6_post_attn_norm_i32.bin"
+bytes = 4096
+sha256 = "6567984a22280d0af7cc1bea98bc44b17c160b34c9d70045db37c1cdadf42e19"
+encoding = "i32-le"
+role = "L6.post_attn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L6_pre_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "af0c1ca7d567343471ea2f140ed4d51a09fc9fd4384513b39123323c9c9a0306"
+encoding = "i32-le"
+role = "L6.pre_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L6_post_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "993826482c515711098b0030ff3e43183a3236948143af22381a05b1356c51b7"
+encoding = "i32-le"
+role = "L6.post_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L6_q_norm_i32.bin"
+bytes = 1024
+sha256 = "5cca13acdef6693ebe1d853fe324b166dcd4710cafe12c5f2acea20d12e801fb"
+encoding = "i32-le"
+role = "L6.q_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L6_k_norm_i32.bin"
+bytes = 1024
+sha256 = "2f4da7fcc6b6da46acca759d239ba2c7b862f791ea039d5978383b59c4df4be0"
+encoding = "i32-le"
+role = "L6.k_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L7_q_w_i32.bin"
+bytes = 4194304
+sha256 = "ccde839c5c762d17c748284482c04372ad87b60167bb2e671a9d10e6cd709185"
+encoding = "i32-le"
+role = "L7.q_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L7_k_w_i32.bin"
+bytes = 1048576
+sha256 = "b17d2aa38003f3505b2f0e1168e6f8cb4e53dc18d1c2ba7c7ab88839f52a458a"
+encoding = "i32-le"
+role = "L7.k_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L7_v_w_i32.bin"
+bytes = 1048576
+sha256 = "9a823e38a9aa7c9aac591b74012cbbdd8032050b5edee414bf8224064c6b8d75"
+encoding = "i32-le"
+role = "L7.v_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L7_o_w_i32.bin"
+bytes = 4194304
+sha256 = "af55438d5967c6db809f834bb587b0528c85cd26465b892109a3c1298c055655"
+encoding = "i32-le"
+role = "L7.o_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L7_gate_w_i32.bin"
+bytes = 8388608
+sha256 = "44430fc2a90cfb84fe93327a01aa72589daf678084e63f1ba165e6e5d28eed48"
+encoding = "i32-le"
+role = "L7.gate_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L7_up_w_i32.bin"
+bytes = 8388608
+sha256 = "de71a1706b00c9cb2a01311c4b698262626755aae93f154cdbee89ee6170778a"
+encoding = "i32-le"
+role = "L7.up_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L7_down_w_i32.bin"
+bytes = 8388608
+sha256 = "ea8da085b26b417055e42e724b8ed0350de9f22693cd007680dffd29fc547134"
+encoding = "i32-le"
+role = "L7.down_w"
+shape = [2048, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L7_in_norm_i32.bin"
+bytes = 4096
+sha256 = "90b14f7a6b641fca05004464fc4ec0444f3d2f858b1bef796c34e87682950be3"
+encoding = "i32-le"
+role = "L7.in_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L7_post_attn_norm_i32.bin"
+bytes = 4096
+sha256 = "4cfcac2f7b2075e1726ae79e9bfc0096b8031d8d974b64db7294e872a78fd103"
+encoding = "i32-le"
+role = "L7.post_attn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L7_pre_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "b8259ab00776980ed28fb36746ed7a599964d76a6a93dbcb80ebea3c3af0fd90"
+encoding = "i32-le"
+role = "L7.pre_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L7_post_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "01ff06f3860e98cbc7fbe601d8faec505c2bdd3d17b2d024f1d9176b0e532418"
+encoding = "i32-le"
+role = "L7.post_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L7_q_norm_i32.bin"
+bytes = 1024
+sha256 = "286172af5c23685a0c2927c0ea194182602e1060dd3249fcf495e36eedb4c3e0"
+encoding = "i32-le"
+role = "L7.q_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L7_k_norm_i32.bin"
+bytes = 1024
+sha256 = "f43d77c506515669544c21592efa6c83af21a72a00c3e755837f768efe854731"
+encoding = "i32-le"
+role = "L7.k_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L8_q_w_i32.bin"
+bytes = 4194304
+sha256 = "fbbb13c107284db6ab7893cc2a145b505bf4ecb2fd1abd6b09480296664a440d"
+encoding = "i32-le"
+role = "L8.q_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L8_k_w_i32.bin"
+bytes = 1048576
+sha256 = "6b75b6826e5a4f18b6366c1ca7981a1fe4b9abe80ee8911c3a23132faaf9f852"
+encoding = "i32-le"
+role = "L8.k_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L8_v_w_i32.bin"
+bytes = 1048576
+sha256 = "3a18bb376bbd559ee22fd1ad9d573fb934462298ab008b7d79657fa5769a8135"
+encoding = "i32-le"
+role = "L8.v_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L8_o_w_i32.bin"
+bytes = 4194304
+sha256 = "5d3f38b553716706f03f1c2ec914e50a2eb245f8f2dea3fd7260b38056e79b6b"
+encoding = "i32-le"
+role = "L8.o_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L8_gate_w_i32.bin"
+bytes = 8388608
+sha256 = "4334b99fbad866a62284856ba4abaa8e7de68aa606e9dd18a2ffcfd0575a84b4"
+encoding = "i32-le"
+role = "L8.gate_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L8_up_w_i32.bin"
+bytes = 8388608
+sha256 = "d167f2cce4102e2d569cdaca0d37124b3c073d117b73b37a784077655d95858b"
+encoding = "i32-le"
+role = "L8.up_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L8_down_w_i32.bin"
+bytes = 8388608
+sha256 = "86f6d2c66fd1f117c3fe9a55d8504ded8c5802935cbc72e055d34b73908bc28e"
+encoding = "i32-le"
+role = "L8.down_w"
+shape = [2048, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L8_in_norm_i32.bin"
+bytes = 4096
+sha256 = "90e204bd9f0430ef0b7c0f640981d62f601c0b70ff6f9b6a73ac138968589924"
+encoding = "i32-le"
+role = "L8.in_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L8_post_attn_norm_i32.bin"
+bytes = 4096
+sha256 = "7f99d6438dece31711f8a34e89957f03f07911e86efad1918b916952ce0f5158"
+encoding = "i32-le"
+role = "L8.post_attn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L8_pre_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "d633e70b4c77ead79a26c8b22575fee4bbec599036cc6a50ed98b47888140cce"
+encoding = "i32-le"
+role = "L8.pre_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L8_post_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "16683b681bc94addd9c98f8542ebe4e1b1a961b0719d17c177e8609f44b4bd28"
+encoding = "i32-le"
+role = "L8.post_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L8_q_norm_i32.bin"
+bytes = 1024
+sha256 = "a6299165b0e6fdf5313b604682c88ae90346dc91b86a3252fd48208053f2447f"
+encoding = "i32-le"
+role = "L8.q_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L8_k_norm_i32.bin"
+bytes = 1024
+sha256 = "bfdb7e0399ae3b41afc1b21515bfe850633c8977fa9d735e5cfa1dcb25787ed9"
+encoding = "i32-le"
+role = "L8.k_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L9_q_w_i32.bin"
+bytes = 4194304
+sha256 = "7bf6fc1e487e6be84ba3592dcb2045ef1b95300f829a8cd95bfc1f4bebda2742"
+encoding = "i32-le"
+role = "L9.q_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L9_k_w_i32.bin"
+bytes = 1048576
+sha256 = "b989b78bca244869e9787c79767ec94e9873b32ae81260ac1b3e20ee230efe40"
+encoding = "i32-le"
+role = "L9.k_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L9_v_w_i32.bin"
+bytes = 1048576
+sha256 = "2329e484de191a59d5b453b4c1502239fbb3609f4f2cea1bf060534ec4bdd843"
+encoding = "i32-le"
+role = "L9.v_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L9_o_w_i32.bin"
+bytes = 4194304
+sha256 = "2c6d79b641ed90e49639b7ac11558afa5250c9b505e59894f726884da9cdd85e"
+encoding = "i32-le"
+role = "L9.o_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L9_gate_w_i32.bin"
+bytes = 8388608
+sha256 = "f8e5ca732ca5daee338956bae067d3d931ad356c331081dffa70f4cac6b9efde"
+encoding = "i32-le"
+role = "L9.gate_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L9_up_w_i32.bin"
+bytes = 8388608
+sha256 = "790e7690e8cb32dcea1cc07b73de91cf277dbd7e6541653520f2b1935b97ae1f"
+encoding = "i32-le"
+role = "L9.up_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L9_down_w_i32.bin"
+bytes = 8388608
+sha256 = "97c863b2ae80dc62d16bbca23cdad1aba212b5173e2096236ed15497d4b6512e"
+encoding = "i32-le"
+role = "L9.down_w"
+shape = [2048, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L9_in_norm_i32.bin"
+bytes = 4096
+sha256 = "622899c7f16de9fdb7e7130a41b7064ed042b2e4857015a9269cf6bf2e1446d9"
+encoding = "i32-le"
+role = "L9.in_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L9_post_attn_norm_i32.bin"
+bytes = 4096
+sha256 = "28940611488d41676a304240c96a0e22473d8bd6f516bb64deba89fc80f8cff0"
+encoding = "i32-le"
+role = "L9.post_attn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L9_pre_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "f232b47ad83ecf704be67d9ece2724814151c661a438a583bb58026c8d6f318b"
+encoding = "i32-le"
+role = "L9.pre_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L9_post_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "ffa947d0774d5d9bb4758a62416c6900e7d137c4853e52f9693d20bf3526dbe3"
+encoding = "i32-le"
+role = "L9.post_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L9_q_norm_i32.bin"
+bytes = 1024
+sha256 = "1cc3f79485cd3a683b0f2eeab866eea45a3cd89ebabac76b1e843e556f0f98e7"
+encoding = "i32-le"
+role = "L9.q_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L9_k_norm_i32.bin"
+bytes = 1024
+sha256 = "f3621b6f223b0a04f2af6933c1017a30efb778ee235b4f34095b801ebe8b34e8"
+encoding = "i32-le"
+role = "L9.k_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L10_q_w_i32.bin"
+bytes = 4194304
+sha256 = "3aa8dfc15339d8caeecb8a932126f8f2a9c48432425a1d0bc3184a90526cd8dd"
+encoding = "i32-le"
+role = "L10.q_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L10_k_w_i32.bin"
+bytes = 1048576
+sha256 = "a26fa51fde28316432a2ee68e6e85f6f2874fe9163a0bbc41047f1c7ba708dfb"
+encoding = "i32-le"
+role = "L10.k_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L10_v_w_i32.bin"
+bytes = 1048576
+sha256 = "28939b6801d19004c25f0509c4bb1bca32b7e886efec8980202aca097f4087c5"
+encoding = "i32-le"
+role = "L10.v_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L10_o_w_i32.bin"
+bytes = 4194304
+sha256 = "94a5bcc7bfaeff4f86c56d219c37808416c920d30728ad059e70c9d07095f02c"
+encoding = "i32-le"
+role = "L10.o_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L10_gate_w_i32.bin"
+bytes = 8388608
+sha256 = "783359b07286a25cf8448effe6012d18be5d9f4c53bc5279fc28ba10995fedef"
+encoding = "i32-le"
+role = "L10.gate_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L10_up_w_i32.bin"
+bytes = 8388608
+sha256 = "553354f94d35854e843ea5c5ecfcdb588bf924215b096b1583a2660f3cbcc3ec"
+encoding = "i32-le"
+role = "L10.up_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L10_down_w_i32.bin"
+bytes = 8388608
+sha256 = "0fefe1cc83321efb5c2aaba19c005bcb6c230b4582d908194ac79cc0b22625d5"
+encoding = "i32-le"
+role = "L10.down_w"
+shape = [2048, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L10_in_norm_i32.bin"
+bytes = 4096
+sha256 = "daa149ad1140057a43f40ff0753578943c1dbd0a8ff8b897a5b07e5aeeb04887"
+encoding = "i32-le"
+role = "L10.in_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L10_post_attn_norm_i32.bin"
+bytes = 4096
+sha256 = "bf0c6cef67b0bf9e1d4c96ff5d3ba9690a2bf711eef1b429db4aadd471a77b14"
+encoding = "i32-le"
+role = "L10.post_attn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L10_pre_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "5ed13a935bab03ce571ec7865051460f37e48849d6bcee9470d738d1cd8d89ef"
+encoding = "i32-le"
+role = "L10.pre_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L10_post_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "1e27275079bc91cef446798657d558f3690d4ebfbb57b5ca1bc8c4a55807885b"
+encoding = "i32-le"
+role = "L10.post_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L10_q_norm_i32.bin"
+bytes = 1024
+sha256 = "057c2cf1e34c58ce714b8c7b4f298a04b0e6a651b2198580225df28fb2549880"
+encoding = "i32-le"
+role = "L10.q_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L10_k_norm_i32.bin"
+bytes = 1024
+sha256 = "551be89d205b00b00d0b77309ce42e628badde05a8a9afb22c71af317091a0c2"
+encoding = "i32-le"
+role = "L10.k_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L11_q_w_i32.bin"
+bytes = 4194304
+sha256 = "e83fb0292ce811b73709f37b0c2173ae95d9f62416badb61aab7bd0b58e5fd29"
+encoding = "i32-le"
+role = "L11.q_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L11_k_w_i32.bin"
+bytes = 1048576
+sha256 = "422e81fe5cba3c293f27b567ce011f9790269da2f239ca788a673d09083ae849"
+encoding = "i32-le"
+role = "L11.k_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L11_v_w_i32.bin"
+bytes = 1048576
+sha256 = "749fd69990003d426c9de0cef6de639a02e5d8f5163b4c5e8f9593030b1f3e40"
+encoding = "i32-le"
+role = "L11.v_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L11_o_w_i32.bin"
+bytes = 4194304
+sha256 = "416cc64e46ef9c9638b2c6d8efab01a1caee1be06cdd51bd65f949467aaaf6b3"
+encoding = "i32-le"
+role = "L11.o_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L11_gate_w_i32.bin"
+bytes = 8388608
+sha256 = "0d206e252fdbc66b7126fa51081b306a6b9c7266c8ebecbb50b8b0c8bf307278"
+encoding = "i32-le"
+role = "L11.gate_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L11_up_w_i32.bin"
+bytes = 8388608
+sha256 = "a154a8923902d03586a056ebf21cf26ca7a7bca819e417f23fdc05ee7b03d624"
+encoding = "i32-le"
+role = "L11.up_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L11_down_w_i32.bin"
+bytes = 8388608
+sha256 = "dc7dc743f56dd07e1c81da4db67e5af2248a3ee24d1f002e1dc14acee9bcc841"
+encoding = "i32-le"
+role = "L11.down_w"
+shape = [2048, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L11_in_norm_i32.bin"
+bytes = 4096
+sha256 = "0fb235a173120c91e83f69af02085038a574c1ecea9efe0fd162b5f29c5e7c9a"
+encoding = "i32-le"
+role = "L11.in_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L11_post_attn_norm_i32.bin"
+bytes = 4096
+sha256 = "2e651be658f4d3d8c17a70e69d04c28a15b37834847a09d962e4c291920ffeaf"
+encoding = "i32-le"
+role = "L11.post_attn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L11_pre_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "9c61d636e96d3298cae92958d776e4d312f4adc3d73ea6284f3da0a2609d6986"
+encoding = "i32-le"
+role = "L11.pre_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L11_post_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "7b888d33d0cf80dcf40d56b9519d645b6c05e03152db12ddfe0d1bb39bfc38e5"
+encoding = "i32-le"
+role = "L11.post_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L11_q_norm_i32.bin"
+bytes = 1024
+sha256 = "4d5704f026b561d975702f37c2d015a1ccca140840b6de051dc5d469ef3c0e00"
+encoding = "i32-le"
+role = "L11.q_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L11_k_norm_i32.bin"
+bytes = 1024
+sha256 = "ed4b58da5b43330328415cc399b1e36e80b2326bd2861f9eda1eadf2a765e58d"
+encoding = "i32-le"
+role = "L11.k_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L12_q_w_i32.bin"
+bytes = 4194304
+sha256 = "6f05adc77e41a2122134507b3ddfd3e67310aa7f3b462479fac085750b303ff1"
+encoding = "i32-le"
+role = "L12.q_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L12_k_w_i32.bin"
+bytes = 1048576
+sha256 = "acda0fd093243590e97329280dbf5e7d16479e8a0f5dd59eca7c583c8bb8565d"
+encoding = "i32-le"
+role = "L12.k_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L12_v_w_i32.bin"
+bytes = 1048576
+sha256 = "c0d66791ec06ad952273a0a201113f21db942f09d241e8a646536e5bb1bc05a6"
+encoding = "i32-le"
+role = "L12.v_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L12_o_w_i32.bin"
+bytes = 4194304
+sha256 = "e8b91dacf52940d7f4eaa0ce2deb9046b2db2474b9753625593b3fdb62498d85"
+encoding = "i32-le"
+role = "L12.o_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L12_gate_w_i32.bin"
+bytes = 8388608
+sha256 = "292f515ee26cd4aeded103bfec8f64662936cf25b00dd4412a50850dd6e9798b"
+encoding = "i32-le"
+role = "L12.gate_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L12_up_w_i32.bin"
+bytes = 8388608
+sha256 = "38046a61317a800ecffa10e90facddf074f074c3568667f553a8e11ac29f6b3f"
+encoding = "i32-le"
+role = "L12.up_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L12_down_w_i32.bin"
+bytes = 8388608
+sha256 = "8bb625bca00399780b046dd48909fe46bb3242b0b1a8ea3449c9e70fa8c4a7d8"
+encoding = "i32-le"
+role = "L12.down_w"
+shape = [2048, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L12_in_norm_i32.bin"
+bytes = 4096
+sha256 = "5b123aa49626a8ee5a2195d1e657f00e1711175e1b73ab16c8abda15f18fd98a"
+encoding = "i32-le"
+role = "L12.in_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L12_post_attn_norm_i32.bin"
+bytes = 4096
+sha256 = "812d462380430bb7c590fea9a07c7704f5ee124d812d7c13aa0b618cf6d916f8"
+encoding = "i32-le"
+role = "L12.post_attn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L12_pre_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "ee9715562927187cbb0327cb35a56eba24d9058536d67160135a07a1bda3ec25"
+encoding = "i32-le"
+role = "L12.pre_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L12_post_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "7ea718161f654bb473342331b24b20cfe79d8e8fa87a6bf317fdee8ddc936122"
+encoding = "i32-le"
+role = "L12.post_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L12_q_norm_i32.bin"
+bytes = 1024
+sha256 = "c030410822c32f70eb8101d5402912c541cca9057d60ff36c08cc3b92b70b9d9"
+encoding = "i32-le"
+role = "L12.q_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L12_k_norm_i32.bin"
+bytes = 1024
+sha256 = "47d88e623ce70cf516b205993d90cd358adf5492c61df64a62972b784bb1916f"
+encoding = "i32-le"
+role = "L12.k_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L13_q_w_i32.bin"
+bytes = 4194304
+sha256 = "244eac9b5011e468ab06a8b17b1c2551b02cc276aa348b626275cfab8171995b"
+encoding = "i32-le"
+role = "L13.q_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L13_k_w_i32.bin"
+bytes = 1048576
+sha256 = "9ed04866c74316b248ee1dc9ed87ba87cae8acf62d67731c4771987a65fb86b2"
+encoding = "i32-le"
+role = "L13.k_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L13_v_w_i32.bin"
+bytes = 1048576
+sha256 = "614edb7a1e9be0cae1c35c710cd36807a19fa11191ab77ab950da92c58b30c88"
+encoding = "i32-le"
+role = "L13.v_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L13_o_w_i32.bin"
+bytes = 4194304
+sha256 = "0c23a2217628118f1af5e66b866c6ebadceecda60145052ddc8781edc4d105ba"
+encoding = "i32-le"
+role = "L13.o_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L13_gate_w_i32.bin"
+bytes = 8388608
+sha256 = "58cfd066383f722e6ebc81a0fc83e3cbc6acd27d4a144b95a8f4ec1f9e9a4956"
+encoding = "i32-le"
+role = "L13.gate_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L13_up_w_i32.bin"
+bytes = 8388608
+sha256 = "ac6d123496c87c7dbbcd25edf421f8783a00efd0264939165d9e450cf8dee1f7"
+encoding = "i32-le"
+role = "L13.up_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L13_down_w_i32.bin"
+bytes = 8388608
+sha256 = "091aa9328ae4e5d2b4359aae168a504025a2b8ceb5f7e9c8bda911f0106c4a05"
+encoding = "i32-le"
+role = "L13.down_w"
+shape = [2048, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L13_in_norm_i32.bin"
+bytes = 4096
+sha256 = "33b37dc97d145942be615fd4f003788aa6b12280d68218fe9b8ff6946163ae98"
+encoding = "i32-le"
+role = "L13.in_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L13_post_attn_norm_i32.bin"
+bytes = 4096
+sha256 = "f0dcc41d2efc33c76dc88879538ffa5262afe43a79cccd7c320512bf12c3746c"
+encoding = "i32-le"
+role = "L13.post_attn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L13_pre_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "c24f02812d11ff0cc47ac6339cfc1b715dcd7b1f6ec5075a648215ab0c41d2df"
+encoding = "i32-le"
+role = "L13.pre_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L13_post_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "4645147f458a5336e24366fce399d9566a2057f8860d28e29daf090a81470dea"
+encoding = "i32-le"
+role = "L13.post_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L13_q_norm_i32.bin"
+bytes = 1024
+sha256 = "9e682934dd663541f48a41d4249f037fe51e23a8c8f1eb719b11497c756a1a26"
+encoding = "i32-le"
+role = "L13.q_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L13_k_norm_i32.bin"
+bytes = 1024
+sha256 = "ed0f1fa3b799f3be717e13497053715a8b513971762e555e1566809c3fc46f1e"
+encoding = "i32-le"
+role = "L13.k_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L14_q_w_i32.bin"
+bytes = 4194304
+sha256 = "882723288b4fb6d388046875d0307eae94da0ded3e46e100e4c45abad48da07d"
+encoding = "i32-le"
+role = "L14.q_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L14_k_w_i32.bin"
+bytes = 1048576
+sha256 = "6c445145ee39b964600a68c63ce748fcd924567515537e26a2bafeea26272cd1"
+encoding = "i32-le"
+role = "L14.k_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L14_v_w_i32.bin"
+bytes = 1048576
+sha256 = "edff1f22fd82649853f29cc14f350ef159faf3f541bfceed1850236916b9c47b"
+encoding = "i32-le"
+role = "L14.v_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L14_o_w_i32.bin"
+bytes = 4194304
+sha256 = "fea65aa93880029dc53501503f113e66d323e5d0d8ec24640b83c9c7234ca17c"
+encoding = "i32-le"
+role = "L14.o_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L14_gate_w_i32.bin"
+bytes = 8388608
+sha256 = "05c5976ea72af77c46e99a92d23700fe754d3964899e84e095df2b592d8c0d55"
+encoding = "i32-le"
+role = "L14.gate_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L14_up_w_i32.bin"
+bytes = 8388608
+sha256 = "06fbda52be8d7314c932dc6e598002173bc016e9c70ba4d36bb884f17ed08a48"
+encoding = "i32-le"
+role = "L14.up_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L14_down_w_i32.bin"
+bytes = 8388608
+sha256 = "7c4cc87e3cda368c35ebcfe8c9eb541ae0530b7fdf1b6fdce7a2f106c19af985"
+encoding = "i32-le"
+role = "L14.down_w"
+shape = [2048, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L14_in_norm_i32.bin"
+bytes = 4096
+sha256 = "010b933f90202c7a06554b77ade7cecab6c517a0644d06e0c87dddb1664f7c0a"
+encoding = "i32-le"
+role = "L14.in_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L14_post_attn_norm_i32.bin"
+bytes = 4096
+sha256 = "f1b5e85ba5d6b0cc87bd79ed970c158c6a35025b5173d8d9898efda7766ce03a"
+encoding = "i32-le"
+role = "L14.post_attn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L14_pre_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "e39ebd8dd49e3946c913641a3556b82f5f60d44e292e437f740d09c72dee23cf"
+encoding = "i32-le"
+role = "L14.pre_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L14_post_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "222be3809ab1a297d3cca3ab6272d17a6ff608a94b5a3886c3ff7a44f6a66740"
+encoding = "i32-le"
+role = "L14.post_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L14_q_norm_i32.bin"
+bytes = 1024
+sha256 = "2a23fb81d2570d256afe232bb87853d826785f4d66971d05e9b0d4397f805233"
+encoding = "i32-le"
+role = "L14.q_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L14_k_norm_i32.bin"
+bytes = 1024
+sha256 = "0655917aa41b7516d0e22f81fc0958440fcc285151d113c32f5974b80810d00a"
+encoding = "i32-le"
+role = "L14.k_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L15_q_w_i32.bin"
+bytes = 4194304
+sha256 = "4cc0ce2d87938f619f6e11f8b79634ecf5076983d6efbd54e3413985a025b8f2"
+encoding = "i32-le"
+role = "L15.q_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L15_k_w_i32.bin"
+bytes = 1048576
+sha256 = "34b17c3c2ccdd8991494b1fae80e157d0188c031b4a373df88780dca5113982f"
+encoding = "i32-le"
+role = "L15.k_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L15_v_w_i32.bin"
+bytes = 1048576
+sha256 = "89343661d5d3bf27e8c9fd06275ea4c430d4200e682f87fbffa762e9b6386ba1"
+encoding = "i32-le"
+role = "L15.v_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L15_o_w_i32.bin"
+bytes = 4194304
+sha256 = "169621ce9959d751e6ecdc9364fad931132f0d1ec61169471f2c5d5f4c577ade"
+encoding = "i32-le"
+role = "L15.o_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L15_gate_w_i32.bin"
+bytes = 8388608
+sha256 = "0414cfec334a9130206d097f75a0cbb0261bf2f497aef7943671d1560ad01674"
+encoding = "i32-le"
+role = "L15.gate_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L15_up_w_i32.bin"
+bytes = 8388608
+sha256 = "87076f45f772ab187b5634c391f6c0dbed436c7c15499248b62c5e5c14877807"
+encoding = "i32-le"
+role = "L15.up_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L15_down_w_i32.bin"
+bytes = 8388608
+sha256 = "21c501370525ab5b338f540fab20306ba50b6d4f3dcb0aa0c7e721854165b456"
+encoding = "i32-le"
+role = "L15.down_w"
+shape = [2048, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L15_in_norm_i32.bin"
+bytes = 4096
+sha256 = "02671094787b2e2bf19093cbceabdab931d54c55475bf14891a8e76d7e2d5731"
+encoding = "i32-le"
+role = "L15.in_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L15_post_attn_norm_i32.bin"
+bytes = 4096
+sha256 = "fbdd7a0be71cd8fd6b383e0b0bf3bb845fb9b0a60d381c92191ee65fa2b1d18b"
+encoding = "i32-le"
+role = "L15.post_attn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L15_pre_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "13d6b5e17904c8035942c44d11aa959bdfc31a343140419f1f0586eec5a6b104"
+encoding = "i32-le"
+role = "L15.pre_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L15_post_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "598f9712cc2689293a97e6c35452b221f114d04b9f58fbd9fdac553068958602"
+encoding = "i32-le"
+role = "L15.post_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L15_q_norm_i32.bin"
+bytes = 1024
+sha256 = "31fa03c97a28651160847b44987114ae0e297d8cc955affb4dfc5ebce7a29189"
+encoding = "i32-le"
+role = "L15.q_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L15_k_norm_i32.bin"
+bytes = 1024
+sha256 = "f400afbaa47b4701898ce9a2672c42855e54192c495a744339e3d7d4cce6d517"
+encoding = "i32-le"
+role = "L15.k_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L16_q_w_i32.bin"
+bytes = 4194304
+sha256 = "bc3cbd821ebfe2ae91e55868743bfea6ee4d24b3628fdfa3aeec04dd31c5bb95"
+encoding = "i32-le"
+role = "L16.q_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L16_k_w_i32.bin"
+bytes = 1048576
+sha256 = "41044686bf807dec274fff9142430491ae674cd63d81efdfaab4e34ba05f0a1c"
+encoding = "i32-le"
+role = "L16.k_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L16_v_w_i32.bin"
+bytes = 1048576
+sha256 = "d983a36394d40293e6397efef5421161024770378e7b2df196baf8a25b9abf01"
+encoding = "i32-le"
+role = "L16.v_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L16_o_w_i32.bin"
+bytes = 4194304
+sha256 = "1efb205ce577d547124c19e478a60b638f8db5f9ec449c9eae72443486732df3"
+encoding = "i32-le"
+role = "L16.o_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L16_gate_w_i32.bin"
+bytes = 8388608
+sha256 = "71b9762b49ae0c7f9f77c3bc63b92f236a411e676664ae934a5c222c0d599139"
+encoding = "i32-le"
+role = "L16.gate_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L16_up_w_i32.bin"
+bytes = 8388608
+sha256 = "026be5bce61950455ff4d37f2a04b69f918531d50a0244da09a17efc1f8320df"
+encoding = "i32-le"
+role = "L16.up_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L16_down_w_i32.bin"
+bytes = 8388608
+sha256 = "76faa8c383a075bfea36bfc4ccfe6e84faecb224cf13d8fbbae766e1d0973797"
+encoding = "i32-le"
+role = "L16.down_w"
+shape = [2048, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L16_in_norm_i32.bin"
+bytes = 4096
+sha256 = "58166488cecd7d43041496bea3dc815df3e9c9a22dff50e2525a93dac237fba3"
+encoding = "i32-le"
+role = "L16.in_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L16_post_attn_norm_i32.bin"
+bytes = 4096
+sha256 = "16be8879761b8b09a8af0afd431f7a254f8ca7050212270e356d9a6413d1640d"
+encoding = "i32-le"
+role = "L16.post_attn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L16_pre_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "1113a78a865dc198641b35d10950db7198a5dfceafb5a7c0ae4fc554e3c2acd6"
+encoding = "i32-le"
+role = "L16.pre_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L16_post_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "37752643545782de2caf1fa7fafdb20eddff6a1eee64b6acdde588eb63cc2564"
+encoding = "i32-le"
+role = "L16.post_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L16_q_norm_i32.bin"
+bytes = 1024
+sha256 = "31dc1b9f0d62481051c9edb4ea933c823a941731d53581282ea1735415bf57b8"
+encoding = "i32-le"
+role = "L16.q_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L16_k_norm_i32.bin"
+bytes = 1024
+sha256 = "b0ec5de0872defb3a26f9bc81ef4ca6c0fbd749ca88a99d9d3cfc0fcad0e2889"
+encoding = "i32-le"
+role = "L16.k_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L17_q_w_i32.bin"
+bytes = 4194304
+sha256 = "0ca41f76f031c21e730e74e15c16a0c67c93916baeeebd6a244076156fdbbc09"
+encoding = "i32-le"
+role = "L17.q_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L17_k_w_i32.bin"
+bytes = 1048576
+sha256 = "2fbdb6ff8cc7bf6e5088a584fd7634b6476ec7696cca812989849e9c0615e6e2"
+encoding = "i32-le"
+role = "L17.k_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L17_v_w_i32.bin"
+bytes = 1048576
+sha256 = "7b649b303a6e444c3bacc8968f8bfbdf6e53319e5117919121e17ed842c6db14"
+encoding = "i32-le"
+role = "L17.v_w"
+shape = [1024, 256]
+[[assets.file]]
+path = "models/gemma3/weights/L17_o_w_i32.bin"
+bytes = 4194304
+sha256 = "5a3fc61ef270d44eaee2a6a1fd20308c714adec91df37e549196fd948d21915e"
+encoding = "i32-le"
+role = "L17.o_w"
+shape = [1024, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L17_gate_w_i32.bin"
+bytes = 8388608
+sha256 = "086e9ed1ee204103e5d37d179debb6d1951bf223a5daf2473d1568ef50425202"
+encoding = "i32-le"
+role = "L17.gate_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L17_up_w_i32.bin"
+bytes = 8388608
+sha256 = "ce889d8880be7993d534288b284b6d50e6ca50ae28cbeeb70a7cb9008bf8a928"
+encoding = "i32-le"
+role = "L17.up_w"
+shape = [1024, 2048]
+[[assets.file]]
+path = "models/gemma3/weights/L17_down_w_i32.bin"
+bytes = 8388608
+sha256 = "ce5a775185d4e5fc931a4406a52d267fc7f87719d2493ce8c51f9705f767c26b"
+encoding = "i32-le"
+role = "L17.down_w"
+shape = [2048, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/L17_in_norm_i32.bin"
+bytes = 4096
+sha256 = "1d901d1a52d19266629f868955db7ddaeb0005ed0f62e6adcdda3aa6c744fbc5"
+encoding = "i32-le"
+role = "L17.in_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L17_post_attn_norm_i32.bin"
+bytes = 4096
+sha256 = "187fb60ef3f31cd5888c245dd818fd4646b06731f14c369d51467c2ebfba7949"
+encoding = "i32-le"
+role = "L17.post_attn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L17_pre_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "3855bced496904c8f82e6efbfb53364a092fbc195069138eea85234a3355e309"
+encoding = "i32-le"
+role = "L17.pre_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L17_post_ffn_norm_i32.bin"
+bytes = 4096
+sha256 = "ba5ec71e197fa0a0e0564b9a7dbca9bfac1106946b0a4bdb2222e3d08887d263"
+encoding = "i32-le"
+role = "L17.post_ffn_norm"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/L17_q_norm_i32.bin"
+bytes = 1024
+sha256 = "5787a6f517fffb102351033dc51a1296b456125ca5226406957167221aded857"
+encoding = "i32-le"
+role = "L17.q_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/L17_k_norm_i32.bin"
+bytes = 1024
+sha256 = "4de1fea7c424b413e2b94c7dda9607328484e1774e5cc16dcd615f7369ca0cea"
+encoding = "i32-le"
+role = "L17.k_norm"
+shape = [256]
+[[assets.file]]
+path = "models/gemma3/weights/embed_tokens_i32.bin"
+bytes = 1073741824
+sha256 = "5c9b2a94a53a3690bd794a4e45927ce7515901a0b309eb9982612776ba3d4e5b"
+encoding = "i32-le"
+role = "embed_tokens_i32"
+shape = [262144, 1024]
+[[assets.file]]
+path = "models/gemma3/weights/lm_head_i32.bin"
+bytes = 1073741824
+sha256 = "ed3b0efb5b04085ad797d200e3f95e8f1f6d7fd20c48da2710fd7514bcdb5ed3"
+encoding = "i32-le"
+role = "lm_head_i32"
+shape = [1024, 262144]
+[[assets.file]]
+path = "models/gemma3/weights/final_norm_i32.bin"
+bytes = 4096
+sha256 = "c69e8cf676b6c8b4e5c6170b4ae3d94fd3fe3b41cfdbb62de3a475ae8790ead1"
+encoding = "i32-le"
+role = "final_norm_i32"
+shape = [1024]
+[[assets.file]]
+path = "models/gemma3/weights/rope_cos_global_i32.bin"
+bytes = 262144
+sha256 = "f1274259717ea29f4377d1b3a9510f44104007708de3f3a8bb15f35afe772bd1"
+encoding = "i32-le"
+role = "rope_cos_global_i32"
+shape = [512, 128]
+[[assets.file]]
+path = "models/gemma3/weights/rope_cos_local_i32.bin"
+bytes = 262144
+sha256 = "59215ba7da66e69a9209ab0a39c068229aa974dd533752104e6075c4118b10c6"
+encoding = "i32-le"
+role = "rope_cos_local_i32"
+shape = [512, 128]
+[[assets.file]]
+path = "models/gemma3/weights/rope_sin_global_i32.bin"
+bytes = 262144
+sha256 = "47c3d75d9b4a0f66476a20252e73cc3a0de33a68c422b36561755ce7f5dd5730"
+encoding = "i32-le"
+role = "rope_sin_global_i32"
+shape = [512, 128]
+[[assets.file]]
+path = "models/gemma3/weights/rope_sin_local_i32.bin"
+bytes = 262144
+sha256 = "3096bad8797eed01cd733d508d726fff764630bce8fb3740b71746ad8e80f91d"
+encoding = "i32-le"
+role = "rope_sin_local_i32"
+shape = [512, 128]
+[[assets.file]]
+path = "models/gemma3/weights/x0_i32.bin"
+bytes = 65536
+sha256 = "1e8541767131c0bfd114a3dcaf82a6605a06d4cc9b12600f816416ae2d8865cb"
+encoding = "i32-le"
+role = "x0_i32"
+shape = [16, 1024]
+[[assets.file]]
+path = "models/gpt2/weights/exp_table_i32.bin"
+bytes = 8388608
+sha256 = "c6a3e6fae423e86bc2598392e4055c938381616c738414fa8bad859da4004f55"
+encoding = "i32-le"
+role = "shared.exp_table_i32"
+shape = [0]
+[[assets.file]]
+path = "models/gpt2/weights/rsqrt_table_i32.bin"
+bytes = 29360128
+sha256 = "7cba6a7c88053b99112c1271a2d593e1147a4b3b4a92fe1091c148e2e33573ed"
+encoding = "i32-le"
+role = "shared.rsqrt_table_i32"
+shape = [0]
+[[assets.file]]
+path = "models/gpt2/weights/gelu_table_i32.bin"
+bytes = 67108864
+sha256 = "42cd0f218e5635bb2c1e94076f8f5da3d92456ce30960b1463774dca2dad3e5d"
+encoding = "i32-le"
+role = "shared.gelu_table_i32"
+shape = [0]
+[[assets.file]]
+path = "models/gemma3/hf/tokenizer.json"
+bytes = 33384570
+sha256 = "7d4046bf0505a327dd5a0abbb427ecd4fc82f99c2ceaa170bc61ecde12809b0c"
+encoding = "utf8"
+role = "tokenizer.json"
+[[assets.file]]
+path = "models/gemma3/hf/tokenizer.model"
+bytes = 4689074
+sha256 = "1299c11d7cf632ef3b4e11937501358ada021bbdf7c47638d13c0ee982f2e79c"
+encoding = "utf8"
+role = "tokenizer.model"
+[[assets.file]]
+path = "models/gemma3/hf/tokenizer_config.json"
+bytes = 1155375
+sha256 = "94b03056ec5831e9021c3e3fe9db682778c4f2d081c4188f1fcb8b90541cf1cf"
+encoding = "utf8"
+role = "tokenizer_config.json"
+[[assets.file]]
+path = "models/gemma3/hf/config.json"
+bytes = 1352
+sha256 = "8983343e5bfbf8e336d222a522a1d781443491e9de2d081b8856f8fd26ab6046"
+encoding = "utf8"
+role = "config.json"
+[[assets.file]]
+path = "models/gemma3/hf/special_tokens_map.json"
+bytes = 662
+sha256 = "2f7b0adf4fb469770bb1490e3e35df87b1dc578246c5e7e6fc76ecf33213a397"
+encoding = "utf8"
+role = "special_tokens_map.json"
+[[assets.file]]
+path = "cases/gemma3/tokens_16_i32.bin"
+bytes = 64
+sha256 = "63e48e67516beef7a3b122044db4e0631a4295270c0177963af68dbb5ca02743"
+encoding = "i32-le"
+role = "tokens_16_i32.bin"
+[[assets.file]]
+path = "cases/gemma3/tokens_512_i32.bin"
+bytes = 2048
+sha256 = "54d7bd85c90660994fd47a8f140eb0dbacaac55a507f6beb52d1761d41c62054"
+encoding = "i32-le"
+role = "tokens_512_i32.bin"
+[[assets.file]]
+path = "cases/gemma3/input_text.txt"
+bytes = 4474
+sha256 = "365593be0c2c148c2ec83fc5f6c552639cacc9556ddb6f344884e07362ef3a26"
+encoding = "utf8"
+role = "input_text.txt"
+[[assets.file]]
+path = "cases/gemma3/case_meta.json"
+bytes = 2889
+sha256 = "a005958000f8f9d90eb7a4ebd3f06d85bb16ffcf1c9d9ac15abf945ac75dbc91"
+encoding = "utf8"
+role = "case_meta.json"
+
+[[case]]
+id = "gemma3-seq16"
+seq_tokens = 16
+input = { path = "cases/gemma3/tokens_16_i32.bin", bytes = 64, encoding = "i32-le" }
+    original_gt = { path = "cases/gemma3/gt_argmax_16_i32.bin", bytes = 64, sha256 = "79a4527ce240e392cd151b6ff1949136df18816933e29d65634bbb4026d88961" }
+integer_gt = { path = "cases/gemma3/gt_int_argmax_16_i32.bin", bytes = 64, sha256 = "8683f5e22e51d1405fe3efcc7487a9a4df2e694c5d9f0bed64e921810d77c562" }
+verification = { kind = "argmax", positions = "all", total = 16, tie_break = "smallest_index" }
+
+[[case]]
+id = "gemma3-seq512"
+seq_tokens = 512
+input = { path = "cases/gemma3/tokens_512_i32.bin", bytes = 2048, encoding = "i32-le" }
+    original_gt = { path = "cases/gemma3/gt_argmax_512_i32.bin", bytes = 2048, sha256 = "1cf07de256162d0fb1672fa29f171a6b5d9ebabdd1da66934fa89328dbbf15a5" }
+integer_gt = { path = "cases/gemma3/gt_int_argmax_512_i32.bin", bytes = 2048, sha256 = "6d1df6b50c20d02db715fd14b12b9134623739375c44a029dd15b6b30bd9344c" }
+verification = { kind = "argmax", positions = "all", total = 512, tie_break = "smallest_index" }
+
+[[assets.gt]]
+path = "cases/gemma3/gt_logits_16_f32.bin"
+bytes = 16777216
+sha256 = "16413c4883b0ffddeb29567bb224196faa7f3f9ec9f4f010b3f891a25bc3797d"
+encoding = "i32-le"
+
+[[assets.gt]]
+path = "cases/gemma3/gt_argmax_16_i32.bin"
+bytes = 64
+sha256 = "79a4527ce240e392cd151b6ff1949136df18816933e29d65634bbb4026d88961"
+encoding = "i32-le"
+
+[[assets.gt]]
+path = "cases/gemma3/gt_argmax_512_i32.bin"
+bytes = 2048
+sha256 = "1cf07de256162d0fb1672fa29f171a6b5d9ebabdd1da66934fa89328dbbf15a5"
+encoding = "i32-le"
+
+[[assets.gt]]
+path = "cases/gemma3/rsqrt_ext_i32.bin"
+bytes = 59397052
+sha256 = "59fc2554a5d0f13abb265ed2eb5b56d5e75d82616561c60545013be7aa6dcf50"
+encoding = "i32-le"
+
+[[assets.gt]]
+path = "cases/gemma3/gt_int_argmax_16_i32.bin"
+bytes = 64
+sha256 = "8683f5e22e51d1405fe3efcc7487a9a4df2e694c5d9f0bed64e921810d77c562"
+encoding = "i32-le"
+
+[[assets.gt]]
+path = "cases/gemma3/gt_int_argmax_512_i32.bin"
+bytes = 2048
+sha256 = "6d1df6b50c20d02db715fd14b12b9134623739375c44a029dd15b6b30bd9344c"
+encoding = "i32-le"
+
+[[assets.gt]]
+path = "cases/gemma3/rsqrt_ext_meta.json"
+bytes = 789
+sha256 = "c2361a122e4b887181b6441ce264a786520c0fb05dd48e2ed1132887a3066f85"
+encoding = "utf8"

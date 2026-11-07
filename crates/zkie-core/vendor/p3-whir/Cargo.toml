@@ -40,31 +40,9 @@ parallel = ["p3-maybe-rayon/parallel"]
 [lib]
 name = "p3_whir"
 path = "src/lib.rs"
+test = false
+doctest = false
 
-[[example]]
-name = "whir"
-path = "examples/whir.rs"
-required-features = []
-
-[[bench]]
-name = "fri_vs_whir"
-path = "benches/fri_vs_whir.rs"
-harness = false
-
-[[bench]]
-name = "sumcheck"
-path = "benches/sumcheck.rs"
-harness = false
-
-[[bench]]
-name = "whir_pcs"
-path = "benches/whir_pcs.rs"
-harness = false
-
-[[bench]]
-name = "zk_overhead"
-path = "benches/zk_overhead.rs"
-harness = false
 
 [dependencies.hashbrown]
 version = "0.17.1"

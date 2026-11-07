@@ -9,3 +9,6 @@ pub mod same_poly;
 pub mod sumcheck;
 pub mod transcript;
 pub mod weights_io;
+
+pub mod codec;
+pub mod random;

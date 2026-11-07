@@ -111,6 +111,7 @@ mod backend {
         type Evaluations = RowMajorMatrix<F>;
 
         fn dft_batch(&self, mat: RowMajorMatrix<F>) -> Self::Evaluations {
+            let _profile = crate::profile::Scope::kernel(crate::profile::Kernel::Dft);
             match self {
                 Self::Cpu(d) => d.dft_batch(mat),
                 #[cfg(feature = "cuda")]
@@ -436,6 +437,7 @@ impl Whir {
     }
 
     pub fn commit(&self, evals: &[Goldilocks]) -> (Commitment, ProverData, OpeningProtocol) {
+        let _profile = crate::profile::Scope::kernel(crate::profile::Kernel::Rs);
         let t0 = std::time::Instant::now();
         let num_vars = evals.len().trailing_zeros() as usize;
         assert_eq!(
@@ -614,6 +616,7 @@ impl Whir {
         protocol: &OpeningProtocol,
         point: &[Goldilocks],
     ) -> (Proof, Goldilocks) {
+        let _profile = crate::profile::Scope::kernel(crate::profile::Kernel::Rs);
         let t0 = std::time::Instant::now();
         let ef_point = to_ef_point(point);
         let proof = self.pcs.open_at(

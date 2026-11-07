@@ -17,13 +17,13 @@ use crate::layer_norm_centered::{
     verify_layer_norm_centered, LayerNormCenteredProof,
 };
 use crate::layernorm_chain::{prove_layernorm_chain, verify_layernorm_chain, LayernormChainProof};
-use crate::gather::{gather_forward, prove_scatter_add, verify_scatter_add, ScatterAddProof};
-use crate::projection::{prove_projection, verify_projection, ProjectionProof};
-use crate::scatter::{prove_scatter, scatter_forward, verify_scatter, ScatterProof};
-use crate::rms_norm::{prove_rms_norm, rms_norm_forward, verify_rms_norm, RmsNormProof};
+use crate::legacy_gather::{gather_forward, prove_scatter_add, verify_scatter_add, ScatterAddProof};
+use crate::legacy_projection::{prove_projection, verify_projection, ProjectionProof};
+use crate::legacy_scatter::{prove_scatter, scatter_forward, verify_scatter, ScatterProof};
+use crate::legacy_rms_norm::{prove_rms_norm, rms_norm_forward, verify_rms_norm, RmsNormProof};
 use crate::rope::{prove_rope, rope_forward, verify_rope, RoPEProof};
 use crate::softmax_scaled::{prove_softmax_rounded, verify_softmax_rounded, SoftmaxRoundedProof};
-use crate::topk::{argmax_forward, prove_argmax, prove_topk, topk_forward, verify_argmax, verify_topk, ArgmaxProof, TopKSelectProof};
+use crate::legacy_topk::{argmax_forward, prove_argmax, prove_topk, topk_forward, verify_argmax, verify_topk, ArgmaxProof, TopKSelectProof};
 use rayon::prelude::*;
 use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
 use zkie_core::common::fixed_point::{from_i64, to_i32, to_i64};
@@ -5254,7 +5254,7 @@ mod tests {
 
     #[test]
     fn op_shard_expert_major_moe_roundtrip() {
-        use crate::scatter::scatter_forward;
+        use crate::legacy_scatter::scatter_forward;
 
         let mut rng = XorShift64::new(0x3030);
         let (m, n_experts, h, p) = (4usize, 4usize, 4usize, 2usize);
@@ -5367,7 +5367,7 @@ mod tests {
 
     #[test]
     fn op_shard_gate_weighted_moe_roundtrip() {
-        use crate::scatter::scatter_forward;
+        use crate::legacy_scatter::scatter_forward;
 
         let mut rng = XorShift64::new(0x3131);
         let (m, n_experts, h, p) = (4usize, 4usize, 4usize, 2usize);
@@ -5510,7 +5510,7 @@ mod tests {
 
     #[test]
     fn op_shard_moe_with_padding_roundtrip() {
-        use crate::scatter::scatter_forward;
+        use crate::legacy_scatter::scatter_forward;
 
         let mut rng = XorShift64::new(0x3232);
         // n=8 experts, k=6 top-k, m=3 -> S=18 -> S_pad=32 (forces padding)
@@ -5620,7 +5620,7 @@ mod tests {
 
     #[test]
     fn op_shard_streaming_moe_roundtrip() {
-        use crate::scatter::scatter_forward;
+        use crate::legacy_scatter::scatter_forward;
 
         let mut rng = XorShift64::new(0x3333);
         let (m, n, h, p) = (3usize, 8usize, 4usize, 2usize);

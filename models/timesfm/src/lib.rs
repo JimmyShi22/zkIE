@@ -2,6 +2,9 @@
 //! (RMSNorm -> causal attention -> residual -> LayerNorm -> ReLU FFN -> residual)
 //! + horizon SiLU head + rescale. Assembles into `Vec<compose::Op>`.
 
+pub mod config;
+pub mod executor;
+
 use std::fs;
 use std::sync::Arc;
 

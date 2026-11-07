@@ -119,3 +119,24 @@ impl crate::common::field::ChallengeSource for Transcript {
         Transcript::next_u64(self)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Session-owned transcript interface.
+
+pub trait ProtocolTranscript<F: crate::common::field::ProtocolField>: Send {
+    fn protocol_id(&self) -> crate::types::Digest;
+
+    fn append_bytes(&mut self, label: &[u8], value: &[u8]) -> crate::error::Result<()>;
+
+    fn append_scalar(&mut self, label: &[u8], value: F) -> crate::error::Result<()>;
+
+    fn challenge_scalar(&mut self, label: &[u8]) -> crate::error::Result<F>;
+
+    fn challenge_bytes(
+        &mut self,
+        label: &[u8],
+        out: &mut [u8],
+    ) -> crate::error::Result<()>;
+
+    fn digest(&self) -> crate::types::Digest;
+}

@@ -74,3 +74,97 @@ impl ChallengeSource for XorShift64 {
         XorShift64::next_u64(self)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Protocol-facing field descriptor and bounded embedding interface.
+
+/// Description of a base field and its extension. Values not yet verified
+/// against the fixed specification are left as `None` rather than guessed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FieldDescriptor {
+    pub name: &'static str,
+    pub modulus: u64,
+    pub extension_degree: u32,
+    pub irreducible_polynomial: Option<&'static [u64]>,
+    pub basis: Option<&'static str>,
+    pub coefficient_order: Option<&'static str>,
+}
+
+pub static GOLDILOCKS: FieldDescriptor = FieldDescriptor {
+    name: "goldilocks",
+    modulus: P,
+    extension_degree: 1,
+    irreducible_polynomial: None,
+    basis: None,
+    coefficient_order: None,
+};
+
+pub static GOLDILOCKS_EXT3: FieldDescriptor = FieldDescriptor {
+    name: "goldilocks-ext3",
+    modulus: P,
+    extension_degree: 3,
+    irreducible_polynomial: None,
+    basis: None,
+    coefficient_order: None,
+};
+
+/// A field usable by the protocol layer. Arithmetic comes from the re-exported
+/// field trait; this trait adds the descriptor and the checked integer
+/// embedding boundary.
+pub trait ProtocolField:
+    Field + crate::common::codec::Canonical + Copy + Eq + Send + Sync + 'static
+{
+    fn descriptor() -> &'static FieldDescriptor;
+
+    /// Embed a signed integer only when it is inside `bound` and `bound` is
+    /// inside the safe symmetric range of the field.
+    fn embed_bounded_integer(value: i128, bound: u128) -> crate::error::Result<Self>;
+}
+
+impl ProtocolField for Goldilocks {
+    fn descriptor() -> &'static FieldDescriptor {
+        &GOLDILOCKS
+    }
+
+    fn embed_bounded_integer(value: i128, bound: u128) -> crate::error::Result<Self> {
+        let safe_bound = (P as u128) / 2;
+        if bound > safe_bound {
+            return Err(crate::error::Error::BoundViolation);
+        }
+        let magnitude = value.unsigned_abs();
+        if magnitude > bound {
+            return Err(crate::error::Error::BoundViolation);
+        }
+        Ok(if value >= 0 {
+            Goldilocks::from_u64(value as u64)
+        } else {
+            Goldilocks::from_u64(P - magnitude as u64)
+        })
+    }
+}
+
+impl crate::common::codec::Canonical for Goldilocks {
+    fn encode(&self, out: &mut Vec<u8>) -> crate::error::Result<()> {
+        out.extend_from_slice(&self.as_canonical_u64().to_le_bytes());
+        Ok(())
+    }
+
+    fn decode(
+        input: &mut &[u8],
+        limits: &crate::common::codec::DecodeLimits,
+    ) -> crate::error::Result<Self> {
+        limits.check_bytes(8)?;
+        if input.len() < 8 {
+            return Err(crate::error::Error::InvalidEncoding);
+        }
+        let bytes: [u8; 8] = input[..8]
+            .try_into()
+            .map_err(|_| crate::error::Error::InvalidEncoding)?;
+        *input = &input[8..];
+        let value = u64::from_le_bytes(bytes);
+        if value >= P {
+            return Err(crate::error::Error::InvalidEncoding);
+        }
+        Ok(Goldilocks::from_u64(value))
+    }
+}

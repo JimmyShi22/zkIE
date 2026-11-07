@@ -1,335 +1,55 @@
-//! Reusable projection-block prover: out = round((x @ W) / 2^shift) + bias, with
-//! the matmul output h = x@W never committed (chained via its GKR claim), the
-//! affine rounding as an arithmetic constraint, and the range check as a logUp
-//! lookup. This is the first reusable integration building block for the full
-//! GPT-2 layer circuit.
-use zkie_core::common::field::{Field, Goldilocks, PrimeCharacteristicRing, XorShift64, ChallengeSource};
-use zkie_core::common::fixed_point::{from_i64, to_i32};
-use zkie_core::common::logup_gkr::{
-    prove_lookup_fractional, verify_lookup_fractional, verify_lookup_fractional_chain,
-    FractionalProof,
-};
-use zkie_core::common::matmul::{prove as matmul_prove, verify as matmul_verify, MatmulProof};
-use zkie_core::common::sumcheck::{prove_virtual, verify_virtual, VirtualProof};
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct ProjectionProof {
-    pub matmul: MatmulProof,
-    pub affine: VirtualProof,
-    pub frac: FractionalProof,
-    pub alpha: Goldilocks,
-    pub beta: Goldilocks,
-    pub pt: Vec<Goldilocks>,
-    pub u: Vec<Goldilocks>,
-    pub v: Vec<Goldilocks>,
-    pub ch: Vec<Goldilocks>,
+//! Weight projection: matmul plus bias, one rounding at the end.
+
+use zkie_core::error::{Error, Result};
+use zkie_core::types::TensorSpec;
+
+use crate::op::OpCode;
+use crate::registry::{io_count, matmul_raw, requantize, to_i64_checked, KernelRecord, PureForward};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectionOp {
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+    pub shift: u32,
+    pub bias: Option<Vec<i64>>,
 }
-fn matmul_full(
-    x: &[Goldilocks],
-    w: &[Goldilocks],
-    m: usize,
-    k: usize,
-    n: usize,
-) -> Vec<Goldilocks> {
-    crate::par::mm_par_fixed(x, w, m, k, n)
-}
-fn transpose(x: &[Goldilocks], m: usize, k: usize) -> Vec<Goldilocks> {
-    let mut wt = vec![Goldilocks::from_u64(0); k * m];
-    for kk in 0..k {
-        for i in 0..m {
-            wt[kk * m + i] = x[i * k + kk];
+
+impl PureForward for ProjectionOp {
+    fn opcode(&self) -> OpCode {
+        OpCode::Projection
+    }
+
+    fn infer_specs(&self, inputs: &[TensorSpec]) -> Result<Vec<TensorSpec>> {
+        if inputs.len() != 2 {
+            return Err(Error::ShapeMismatch);
         }
-    }
-    wt
-}
-pub fn prove_projection(
-    x: &[Goldilocks],
-    w: &[Goldilocks],
-    bias: &[Goldilocks],
-    out: &[Goldilocks],
-    rem_off: &[Goldilocks],
-    m: usize,
-    k: usize,
-    n: usize,
-    shift: u32,
-    rng: &mut impl ChallengeSource,
-) -> ProjectionProof {
-    let half = Goldilocks::from_u64(1u64 << (shift - 1));
-    let two_shift = Goldilocks::from_u64(1u64 << shift);
-    let h = matmul_full(x, w, m, k, n);
-    let wt = transpose(x, m, k);
-    let u: Vec<Goldilocks> = (0..m.trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
-    let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
-    let ch: Vec<Goldilocks> = (0..k.trailing_zeros() as usize)
-        .map(|_| rng.field())
-        .collect();
-    let matmul = matmul_prove(&wt, w, &h, m, k, n, &u, &v, &ch);
-    let mut pt = v.clone();
-    pt.extend_from_slice(&u);
-    let eq = zkie_core::common::mle::eq_evals(&pt);
-    let ones = vec![Goldilocks::from_u64(1); m * n];
-    let neg = from_i64(-1);
-    let terms = vec![
-        (Goldilocks::from_u64(1), vec![0usize, 1usize]),
-        (neg, vec![0usize, 2usize]),
-        (two_shift, vec![0usize, 3usize]),
-        (neg * two_shift, vec![0usize, 4usize]),
-        (neg * half, vec![0usize, 5usize]),
-    ];
-    let mles: Vec<&[Goldilocks]> = vec![&eq, &rem_off, &h, &out, &bias, &ones];
-    let affine = prove_virtual(&mles, &terms, Goldilocks::from_u64(0), &pt);
-    let table: Vec<Goldilocks> = (0..(1usize << shift))
-        .map(|j| Goldilocks::from_u64(j as u64))
-        .collect();
-    let idx: Vec<u32> = rem_off.iter().map(|&vv| to_i32(vv) as u32).collect();
-    let alpha = rng.field();
-    let beta = rng.field();
-    let frac = prove_lookup_fractional(&idx, rem_off, &table, alpha, beta, rng);
-    ProjectionProof {
-        matmul,
-        affine,
-        frac,
-        alpha,
-        beta,
-        pt,
-        u,
-        v,
-        ch,
-    }
-}
-pub fn verify_projection(proof: &ProjectionProof, shift: u32) -> bool {
-    let half = Goldilocks::from_u64(1u64 << (shift - 1));
-    let two_shift = Goldilocks::from_u64(1u64 << shift);
-    let neg = from_i64(-1);
-    let terms = vec![
-        (Goldilocks::from_u64(1), vec![0usize, 1usize]),
-        (neg, vec![0usize, 2usize]),
-        (two_shift, vec![0usize, 3usize]),
-        (neg * two_shift, vec![0usize, 4usize]),
-        (neg * half, vec![0usize, 5usize]),
-    ];
-    let mut fe = proof.affine.final_evals.clone();
-    fe[2] = proof.matmul.claimed;
-    if !verify_virtual(
-        &proof.affine,
-        &terms,
-        Goldilocks::from_u64(0),
-        &proof.pt,
-        &fe,
-    ) {
-        return false;
-    }
-    if !matmul_verify(&proof.matmul, &proof.ch) {
-        return false;
-    }
-    verify_lookup_fractional_chain(&proof.frac)
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn projection_block_roundtrip() {
-        let mut rng = XorShift64::new(0xABCD);
-        let (m, k, n) = (2usize, 2usize, 2usize);
-        let shift = 4u32;
-        let half = Goldilocks::from_u64(1u64 << (shift - 1));
-        let two_shift = Goldilocks::from_u64(1u64 << shift);
-        let div_round = |a: i64, b: i64| -> i64 {
-            let q = a.div_euclid(b);
-            let rr = a.rem_euclid(b);
-            if rr * 2 >= b {
-                q + 1
-            } else {
-                q
-            }
-        };
-        let x: Vec<Goldilocks> = (0..m * k)
-            .map(|_| from_i64((rng.next_u64() % 100) as i64))
-            .collect();
-        let w: Vec<Goldilocks> = (0..k * n)
-            .map(|_| from_i64((rng.next_u64() % 100) as i64))
-            .collect();
-        let bias: Vec<Goldilocks> = (0..m * n)
-            .map(|_| from_i64((rng.next_u64() % 20) as i64 - 10))
-            .collect();
-        let h = matmul_full(&x, &w, m, k, n);
-        let out: Vec<Goldilocks> = (0..m * n)
-            .map(|ij| {
-                from_i64(
-                    div_round(zkie_core::common::fixed_point::to_i64(h[ij]), 1i64 << shift)
-                        + zkie_core::common::fixed_point::to_i64(bias[ij]),
-                )
-            })
-            .collect();
-        let rem_off: Vec<Goldilocks> = (0..m * n)
-            .map(|ij| {
-                let h_i = zkie_core::common::fixed_point::to_i64(h[ij]);
-                let o_i = zkie_core::common::fixed_point::to_i64(out[ij]);
-                let b_i = zkie_core::common::fixed_point::to_i64(bias[ij]);
-                from_i64(h_i - (o_i - b_i) * (1i64 << shift) + (1i64 << (shift - 1)))
-            })
-            .collect();
-        for &vv in &rem_off {
-            assert!(to_i32(vv) >= 0 && to_i32(vv) < (1i32 << shift));
+        if io_count(&inputs[0])? != self.m * self.k || io_count(&inputs[1])? != self.k * self.n {
+            return Err(Error::ShapeMismatch);
         }
-        let _ = (half, two_shift);
-        let mut proof = prove_projection(&x, &w, &bias, &out, &rem_off, m, k, n, shift, &mut rng);
-        assert!(verify_projection(&proof, shift));
-        proof.frac.layers[0].proof.final_evals[3] += Goldilocks::from_u64(1);
-        assert!(!verify_projection(&proof, shift));
-    }
-    #[test]
-    fn committed_projection_roundtrip() {
-        use zkie_core::common::matmul::{prove as mm_prove, verify as mm_verify};
-        use zkie_core::pcs::committed::commit;
-        use zkie_core::pcs::whir::Whir;
-        let mut rng = XorShift64::new(0xDD22);
-        let (m, k, n) = (8usize, 8usize, 8usize);
-        let shift = 4u32;
-        let half = Goldilocks::from_u64(1u64 << (shift - 1));
-        let two_shift = Goldilocks::from_u64(1u64 << shift);
-        let div_round = |a: i64, b: i64| -> i64 {
-            let q = a.div_euclid(b);
-            let rr = a.rem_euclid(b);
-            if rr * 2 >= b {
-                q + 1
-            } else {
-                q
-            }
-        };
-        let x: Vec<Goldilocks> = (0..m * k)
-            .map(|_| from_i64((rng.next_u64() % 100) as i64))
-            .collect();
-        let w: Vec<Goldilocks> = (0..k * n)
-            .map(|_| from_i64((rng.next_u64() % 100) as i64))
-            .collect();
-        let bias: Vec<Goldilocks> = (0..m * n)
-            .map(|_| from_i64((rng.next_u64() % 20) as i64 - 10))
-            .collect();
-        let h = matmul_full(&x, &w, m, k, n);
-        let out: Vec<Goldilocks> = (0..m * n)
-            .map(|ij| {
-                from_i64(
-                    div_round(zkie_core::common::fixed_point::to_i64(h[ij]), 1i64 << shift)
-                        + zkie_core::common::fixed_point::to_i64(bias[ij]),
-                )
-            })
-            .collect();
-        let rem_off: Vec<Goldilocks> = (0..m * n)
-            .map(|ij| {
-                let h_i = zkie_core::common::fixed_point::to_i64(h[ij]);
-                let o_i = zkie_core::common::fixed_point::to_i64(out[ij]);
-                let b_i = zkie_core::common::fixed_point::to_i64(bias[ij]);
-                from_i64(h_i - (o_i - b_i) * (1i64 << shift) + (1i64 << (shift - 1)))
-            })
-            .collect();
-        let mut at = vec![Goldilocks::from_u64(0); k * m];
-        for kk in 0..k {
-            for i in 0..m {
-                at[kk * m + i] = x[i * k + kk];
+        if let Some(bias) = &self.bias {
+            if bias.len() != self.m * self.n {
+                return Err(Error::ShapeMismatch);
             }
         }
-        let u: Vec<Goldilocks> = (0..m.trailing_zeros() as usize)
-            .map(|_| rng.field())
-            .collect();
-        let v: Vec<Goldilocks> = (0..n.trailing_zeros() as usize)
-            .map(|_| rng.field())
-            .collect();
-        let ch: Vec<Goldilocks> = (0..k.trailing_zeros() as usize)
-            .map(|_| rng.field())
-            .collect();
-        let mm = mm_prove(&at, &w, &h, m, k, n, &u, &v, &ch);
-        let whir_km = Whir::new_testing((k * m).trailing_zeros() as usize);
-        let whir_kn = Whir::new_testing((k * n).trailing_zeros() as usize);
-        let whir_mn = Whir::new_testing((m * n).trailing_zeros() as usize);
-        let c_at = commit(&whir_km, &x);
-        let c_w = commit(&whir_kn, &w);
-        let c_bias = commit(&whir_mn, &bias);
-        let c_out = commit(&whir_mn, &out);
-        let c_rem = commit(&whir_mn, &rem_off);
-        let mut ap = ch.clone();
-        ap.extend_from_slice(&u);
-        let (a_open, a_ev) = whir_km.open(c_at.prover_data.clone(), &c_at.protocol, &ap);
-        assert_eq!(
-            whir_km
-                .verify(&c_at.commitment, &a_open, &c_at.protocol, &ap)
-                .unwrap(),
-            a_ev
-        );
-        assert_eq!(a_ev, zkie_core::common::mle::eval(&x, &ap));
-        let mut bp = v.clone();
-        bp.extend_from_slice(&ch);
-        let (b_open, b_ev) = whir_kn.open(c_w.prover_data.clone(), &c_w.protocol, &bp);
-        assert_eq!(
-            whir_kn
-                .verify(&c_w.commitment, &b_open, &c_w.protocol, &bp)
-                .unwrap(),
-            b_ev
-        );
-        assert_eq!(b_ev, zkie_core::common::mle::eval(&w, &bp));
-        assert!(mm_verify(&mm, &ch));
-        let mut pt = v.clone();
-        pt.extend_from_slice(&u);
-        let eq = zkie_core::common::mle::eq_evals(&pt);
-        let ones = vec![Goldilocks::from_u64(1); m * n];
-        let neg = from_i64(-1);
-        let terms = vec![
-            (Goldilocks::from_u64(1), vec![0usize, 1usize]),
-            (neg, vec![0usize, 2usize]),
-            (two_shift, vec![0usize, 3usize]),
-            (neg * two_shift, vec![0usize, 4usize]),
-            (neg * half, vec![0usize, 5usize]),
-        ];
-        let mles: Vec<&[Goldilocks]> = vec![&eq, &rem_off, &h, &out, &bias, &ones];
-        let affine_proof =
-            zkie_core::common::sumcheck::prove_virtual(&mles, &terms, Goldilocks::from_u64(0), &pt);
-        let rem_ev = {
-            let (o, e) = whir_mn.open(c_rem.prover_data.clone(), &c_rem.protocol, &pt);
-            assert_eq!(
-                whir_mn
-                    .verify(&c_rem.commitment, &o, &c_rem.protocol, &pt)
-                    .unwrap(),
-                e
-            );
-            e
-        };
-        let out_ev = {
-            let (o, e) = whir_mn.open(c_out.prover_data.clone(), &c_out.protocol, &pt);
-            assert_eq!(
-                whir_mn
-                    .verify(&c_out.commitment, &o, &c_out.protocol, &pt)
-                    .unwrap(),
-                e
-            );
-            e
-        };
-        let bias_ev = {
-            let (o, e) = whir_mn.open(c_bias.prover_data.clone(), &c_bias.protocol, &pt);
-            assert_eq!(
-                whir_mn
-                    .verify(&c_bias.commitment, &o, &c_bias.protocol, &pt)
-                    .unwrap(),
-                e
-            );
-            e
-        };
-        let fe = vec![
-            zkie_core::common::mle::eval(&eq, &pt),
-            rem_ev,
-            mm.claimed,
-            out_ev,
-            bias_ev,
-            zkie_core::common::mle::eval(&ones, &pt),
-        ];
-        assert!(zkie_core::common::sumcheck::verify_virtual(
-            &affine_proof,
-            &terms,
-            Goldilocks::from_u64(0),
-            &pt,
-            &fe
-        ));
+        Ok(vec![crate::registry::spec_1d(self.m * self.n)])
+    }
+
+    fn forward_values(&self, inputs: &[Vec<i64>]) -> Result<KernelRecord> {
+        let mut raw = matmul_raw(&inputs[0], &inputs[1], self.m, self.n, self.k)?;
+        if let Some(bias) = &self.bias {
+            for (slot, value) in raw.iter_mut().zip(bias) {
+                *slot = slot.checked_add(*value as i128).ok_or(Error::BoundViolation)?;
+            }
+        }
+        let output = raw
+            .iter()
+            .map(|value| to_i64_checked(requantize(*value, self.shift)?))
+            .collect::<Result<_>>()?;
+        Ok(KernelRecord {
+            outputs: vec![output],
+            raw_accumulators: vec![raw],
+            ..KernelRecord::default()
+        })
     }
 }

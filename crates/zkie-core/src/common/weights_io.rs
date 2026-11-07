@@ -57,3 +57,40 @@ impl WeightMmap {
         self.read_goldilocks(0, self.len)
     }
 }
+
+impl WeightMmap {
+    pub fn byte_len(&self) -> usize {
+        self.mmap.len()
+    }
+
+    /// Copy a checked byte range. Only the requested bytes are touched.
+    pub fn read_bytes_range(
+        &self,
+        start_byte: usize,
+        len: usize,
+        dst: &mut [u8],
+    ) -> std::io::Result<()> {
+        let end = start_byte.checked_add(len).ok_or_else(invalid_range)?;
+        if end > self.mmap.len() || dst.len() != len {
+            return Err(invalid_range());
+        }
+        dst.copy_from_slice(&self.mmap[start_byte..end]);
+        Ok(())
+    }
+
+    /// Read an i32 range without converting the whole file.
+    pub fn read_i32_range(&self, start: usize, len: usize) -> std::io::Result<Vec<i32>> {
+        let byte_start = start.checked_mul(4).ok_or_else(invalid_range)?;
+        let byte_len = len.checked_mul(4).ok_or_else(invalid_range)?;
+        let mut bytes = vec![0u8; byte_len];
+        self.read_bytes_range(byte_start, byte_len, &mut bytes)?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect())
+    }
+}
+
+fn invalid_range() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, "range out of bounds")
+}

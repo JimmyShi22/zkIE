@@ -4,6 +4,9 @@
 //! primitives from `zkie-ops`. The weights/tables are read from
 //! `models/gpt2/weights/` (i32 fixed-point `.bin` files).
 
+pub mod config;
+pub mod executor;
+
 use std::fs;
 use std::sync::Arc;
 
