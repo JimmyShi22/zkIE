@@ -17,3 +17,6 @@
 
 # python working env
 .venv
+
+# large test artifacts stay on disk, textual traces are committed
+runs/**/*.bin
