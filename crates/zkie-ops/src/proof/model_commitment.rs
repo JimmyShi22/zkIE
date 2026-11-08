@@ -691,6 +691,11 @@ impl ModelCommitmentPublic {
         if opening.asset_id != interval.asset_id {
             return Err(Error::StatementMismatch);
         }
+        self.verify_interval_layout(interval)?;
+        self.verify_opening(opening)
+    }
+
+    fn verify_interval_layout(&self, interval: &ExternalAssetRef) -> Result<()> {
         let asset = self
             .assets
             .iter()
@@ -747,7 +752,7 @@ impl ModelCommitmentPublic {
                 }
             }
         }
-        self.verify_opening(opening)
+        Ok(())
     }
 }
 
@@ -767,7 +772,22 @@ pub fn extract_interval_values(
     if interval.row_count == 0 {
         return Err(Error::InvalidIndex);
     }
-    let mut rows = Vec::new();
+    let shape = interval_shape(interval, asset_row_width)?;
+    let width = usize::try_from(asset_row_width).map_err(|_| Error::ResourceLimit)?;
+    let available = interval
+        .row_count
+        .min(opening.rows.len() as u64);
+    let available = usize::try_from(available).map_err(|_| Error::ResourceLimit)?;
+    let capacity = match shape {
+        IntervalShape::Rows => available.checked_mul(width),
+        IntervalShape::Broadcast { repeat } => repeat.checked_mul(width),
+        IntervalShape::Columns { start, end } => available.checked_mul(end - start),
+        IntervalShape::BroadcastColumns { start, end, repeat } => {
+            repeat.checked_mul(end - start)
+        }
+    }
+    .ok_or(Error::ResourceLimit)?;
+    let mut values = Vec::with_capacity(capacity);
     let mut next = interval.row_start;
     for row in &opening.rows {
         if row.row < interval.row_start {
@@ -779,100 +799,131 @@ pub fn extract_interval_values(
         if row.row != next {
             return Err(Error::InvalidIndex);
         }
-        rows.push(
-            row.values
-                .iter()
-                .map(|value| *value as i64)
-                .collect::<Vec<_>>(),
-        );
         next = next.checked_add(1).ok_or(Error::ResourceLimit)?;
+        match shape {
+            IntervalShape::Rows => {
+                values.extend(row.values.iter().map(|value| *value as i64));
+            }
+            IntervalShape::Columns { start, end: window_end } => {
+                if row.values.len() != width {
+                    return Err(Error::ShapeMismatch);
+                }
+                values.extend(
+                    row.values[start..window_end]
+                        .iter()
+                        .map(|value| *value as i64),
+                );
+            }
+            IntervalShape::Broadcast { repeat } => {
+                let total = repeat
+                    .checked_mul(row.values.len())
+                    .ok_or(Error::ResourceLimit)?;
+                values.reserve(total);
+                for _ in 0..repeat {
+                    values.extend(row.values.iter().map(|value| *value as i64));
+                }
+            }
+            IntervalShape::BroadcastColumns {
+                start,
+                end: window_end,
+                repeat,
+            } => {
+                if row.values.len() != width {
+                    return Err(Error::ShapeMismatch);
+                }
+                let total = repeat
+                    .checked_mul(window_end - start)
+                    .ok_or(Error::ResourceLimit)?;
+                values.reserve(total);
+                for _ in 0..repeat {
+                    values.extend(
+                        row.values[start..window_end]
+                            .iter()
+                            .map(|value| *value as i64),
+                    );
+                }
+            }
+        }
     }
     if next != end {
         return Err(Error::IncompleteArtifact);
     }
+    Ok(values)
+}
+
+#[derive(Clone, Copy)]
+enum IntervalShape {
+    Rows,
+    Broadcast { repeat: usize },
+    Columns { start: usize, end: usize },
+    BroadcastColumns { start: usize, end: usize, repeat: usize },
+}
+
+fn interval_shape(interval: &ExternalAssetRef, asset_row_width: u64) -> Result<IntervalShape> {
     match interval.layout {
-        ExternalLayout::Rows => {
-            let mut values = Vec::new();
-            for row in rows {
-                values.extend(row);
-            }
-            Ok(values)
-        }
-        ExternalLayout::Broadcast { rows: repeat } => {
-            if rows.len() != 1 || repeat == 0 {
+        ExternalLayout::Rows => Ok(IntervalShape::Rows),
+        ExternalLayout::Broadcast { rows } => {
+            if interval.row_count != 1 || rows == 0 {
                 return Err(Error::InvalidIndex);
             }
-            let row = &rows[0];
-            let total = usize::try_from(repeat)
-                .ok()
-                .and_then(|repeat| repeat.checked_mul(row.len()))
-                .ok_or(Error::ResourceLimit)?;
-            let mut values = Vec::with_capacity(total);
-            for _ in 0..repeat {
-                values.extend_from_slice(row);
-            }
-            Ok(values)
+            Ok(IntervalShape::Broadcast {
+                repeat: usize::try_from(rows).map_err(|_| Error::ResourceLimit)?,
+            })
         }
         ExternalLayout::Columns {
             source_row_width,
             col_start,
             col_count,
         } => {
-            if source_row_width != asset_row_width {
-                return Err(Error::StatementMismatch);
-            }
-            let start = usize::try_from(col_start).map_err(|_| Error::InvalidIndex)?;
-            let count = usize::try_from(col_count).map_err(|_| Error::InvalidIndex)?;
-            let source_width =
-                usize::try_from(source_row_width).map_err(|_| Error::ResourceLimit)?;
-            let end = start.checked_add(count).ok_or(Error::ResourceLimit)?;
-            if end > source_width {
-                return Err(Error::InvalidIndex);
-            }
-            let mut values = Vec::new();
-            for row in rows {
-                if row.len() != source_width {
-                    return Err(Error::ShapeMismatch);
-                }
-                values.extend_from_slice(&row[start..end]);
-            }
-            Ok(values)
+            let (start, end) = column_window(
+                source_row_width,
+                col_start,
+                col_count,
+                asset_row_width,
+            )?;
+            Ok(IntervalShape::Columns { start, end })
         }
         ExternalLayout::BroadcastColumns {
             source_row_width,
             col_start,
             col_count,
-            rows: repeat,
+            rows,
         } => {
-            if rows.len() != 1 || repeat == 0 {
+            if interval.row_count != 1 || rows == 0 {
                 return Err(Error::InvalidIndex);
             }
-            if source_row_width != asset_row_width {
-                return Err(Error::StatementMismatch);
-            }
-            let start = usize::try_from(col_start).map_err(|_| Error::InvalidIndex)?;
-            let count = usize::try_from(col_count).map_err(|_| Error::InvalidIndex)?;
-            let source_width =
-                usize::try_from(source_row_width).map_err(|_| Error::ResourceLimit)?;
-            let end = start.checked_add(count).ok_or(Error::ResourceLimit)?;
-            if end > source_width {
-                return Err(Error::InvalidIndex);
-            }
-            let row = &rows[0];
-            if row.len() != source_width {
-                return Err(Error::ShapeMismatch);
-            }
-            let total = usize::try_from(repeat)
-                .ok()
-                .and_then(|repeat| repeat.checked_mul(count))
-                .ok_or(Error::ResourceLimit)?;
-            let mut values = Vec::with_capacity(total);
-            for _ in 0..repeat {
-                values.extend_from_slice(&row[start..end]);
-            }
-            Ok(values)
+            let (start, end) = column_window(
+                source_row_width,
+                col_start,
+                col_count,
+                asset_row_width,
+            )?;
+            Ok(IntervalShape::BroadcastColumns {
+                start,
+                end,
+                repeat: usize::try_from(rows).map_err(|_| Error::ResourceLimit)?,
+            })
         }
     }
+}
+
+fn column_window(
+    source_row_width: u64,
+    col_start: u64,
+    col_count: u64,
+    asset_row_width: u64,
+) -> Result<(usize, usize)> {
+    if source_row_width != asset_row_width || col_count == 0 {
+        return Err(Error::StatementMismatch);
+    }
+    let start = usize::try_from(col_start).map_err(|_| Error::InvalidIndex)?;
+    let count = usize::try_from(col_count).map_err(|_| Error::InvalidIndex)?;
+    let width = usize::try_from(source_row_width).map_err(|_| Error::ResourceLimit)?;
+    let end = start.checked_add(count).ok_or(Error::ResourceLimit)?;
+    if end > width {
+        return Err(Error::InvalidIndex);
+    }
+    Ok((start, end))
 }
 
 /// Reserved interface for P2 joint openings. The signature exists so P2 can
@@ -1064,6 +1115,9 @@ fn verify_shared_trace_steps(
     {
         return Err(Error::StatementMismatch);
     }
+    openings_by_id
+        .par_iter()
+        .try_for_each(|(_, opening)| public.verify_opening(opening))?;
     let verified: std::sync::Mutex<BTreeSet<ExternalAssetRef>> =
         std::sync::Mutex::new(BTreeSet::new());
     referenced
@@ -1072,7 +1126,10 @@ fn verify_shared_trace_steps(
             let opening = openings_by_id
                 .get(&reference.asset_id)
                 .ok_or(Error::StatementMismatch)?;
-            public.verify_opening_interval(opening, reference)?;
+            if opening.asset_id != reference.asset_id {
+                return Err(Error::StatementMismatch);
+            }
+            public.verify_interval_layout(reference)?;
             verified
                 .lock()
                 .map_err(|_| Error::SynchronizationFailed)?

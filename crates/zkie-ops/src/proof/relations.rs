@@ -5,6 +5,8 @@
 //! equations from the opened vectors and never invokes the operator's forward
 //! routine.
 
+use std::borrow::Cow;
+
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -873,7 +875,7 @@ pub fn verify_op_relation_with_external(
     for openings in &proof.aux {
         verify_group(&public.registry, openings)?;
     }
-    let inputs: Vec<Vec<i64>> = proof
+    let inputs: Vec<Cow<'_, [i64]>> = proof
         .inputs
         .iter()
         .zip(&proof.lengths.inputs)
@@ -882,9 +884,9 @@ pub fn verify_op_relation_with_external(
             Some(None) => external_values
                 .get(index)
                 .and_then(Option::as_ref)
-                .cloned()
+                .map(|values| Cow::Borrowed(values.as_slice()))
                 .ok_or(Error::StatementMismatch),
-            _ => Ok(decode(openings, *len)),
+            _ => Ok(Cow::Owned(decode(openings, *len))),
         })
         .collect::<Result<Vec<_>>>()?;
     let outputs: Vec<Vec<i64>> = proof
@@ -1297,7 +1299,7 @@ pub fn verify_op_relation_with_external(
             }
             let mut expected = vec![0i64; size];
             let mut seen = vec![false; size];
-            for (index, value) in inputs[0].iter().zip(&inputs[1]) {
+            for (index, value) in inputs[0].iter().zip(inputs[1].iter()) {
                 if *index < 0 || *index as usize >= size || seen[*index as usize] {
                     return Err(Error::InvalidIndex);
                 }
@@ -1538,7 +1540,11 @@ pub fn verify_op_relation_with_external(
         }
         OpCode::Patchify => {
             let patch = *config.first().ok_or(Error::InvalidConfig)? as usize;
-            if patch == 0 || inputs.len() != 1 || inputs[0].len() % patch != 0 || outputs[0] != inputs[0] {
+            if patch == 0
+                || inputs.len() != 1
+                || inputs[0].len() % patch != 0
+                || outputs[0].as_slice() != inputs[0].as_ref()
+            {
                 return Err(Error::InvalidProof);
             }
             let patches = inputs[0].len() / patch;
