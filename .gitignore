@@ -26,3 +26,6 @@ docs/benchmarks/**/*.bin
 expert-notes/
 .bridge/
 bridge/
+
+# Confidential development method (local only, never committed)
+.dev-method/

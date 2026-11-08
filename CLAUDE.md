@@ -6,6 +6,22 @@ Three-stage verifiable ML inference (commit / prove / verify as independent
 processes). Implementation details live in the code and docs/; this file does
 not describe the implementation and does not change when the design evolves.
 
+## Confidential method file
+
+Before starting any work item, read `.dev-method/DEV_METHOD.md` at the
+repository root. It is confidential, gitignored, never committed and never
+pushed; it stays on the local machine only. If the file is absent (for example
+in a clone that does not have it), ignore this instruction and follow this file
+alone.
+
+## Confirmation before starting
+
+No work item starts before the Tech Lead has confirmed its approach with the
+technical expert through the local channel kept outside the repository. Items
+without that confirmation stay parked. PM coordinates the sequence and records
+the outcome; technical content of the confirmation is not routed through other
+roles.
+
 ## Entry points
 
 These two entries are the only ones in the project. New entries must be
