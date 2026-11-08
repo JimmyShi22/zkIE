@@ -12,7 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use zkie_core::artifact::{digest_bytes, digest_from_hex, digest_to_hex};
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
-use zkie_ops::proof::model_commitment::ModelCommitment;
+use zkie_ops::proof::model_commitment::{
+    commit_assets_with_digests, AssetDigest, ModelCommitment,
+};
 
 use crate::report::{parse_flags, path_flag};
 
@@ -21,16 +23,23 @@ pub struct AnchorArgs {
     pub input: PathBuf,
     pub asset_root: PathBuf,
     pub out: Option<PathBuf>,
+    pub asset_hashes: Option<PathBuf>,
+    pub policy: Option<PathBuf>,
 }
 
 impl AnchorArgs {
     pub fn parse(args: &[String]) -> Result<Self> {
-        let flags = parse_flags(args, &["case", "input", "asset-root", "out"])?;
+        let flags = parse_flags(
+            args,
+            &["case", "input", "asset-root", "out", "asset-hashes", "policy"],
+        )?;
         Ok(Self {
             case: path_flag(&flags, "case")?,
             input: path_flag(&flags, "input")?,
             asset_root: path_flag(&flags, "asset-root")?,
             out: flags.get("out").map(PathBuf::from),
+            asset_hashes: flags.get("asset-hashes").map(PathBuf::from),
+            policy: flags.get("policy").map(PathBuf::from),
         })
     }
 }
@@ -136,7 +145,7 @@ struct Confirmation {
     model_id: Digest,
     parameters: Digest,
     spec_version: u32,
-    spec_count: usize,
+    digests: Vec<AssetDigest>,
 }
 
 fn confirmation(
@@ -145,55 +154,34 @@ fn confirmation(
     values: &[i32],
 ) -> Result<Confirmation> {
     let tokens: Vec<u32> = values.iter().map(|value| *value as u32).collect();
-    let (commitment, model_id, parameters, spec_version, spec_count) = match model {
-        "gpt2" => {
-            let commitment =
-                zkie_models_gpt2::executor::build_commitment(asset_root, &tokens)?;
-            let model_id = zkie_models_gpt2::plan::model_commitment(&tokens)?;
-            let parameters = zkie_models_gpt2::plan::parameters_digest()?;
-            let spec_count = zkie_models_gpt2::plan::asset_specs().len();
-            (
-                commitment,
-                model_id,
-                parameters,
-                zkie_models_gpt2::plan::MODEL_VERSION,
-                spec_count,
-            )
-        }
-        "gemma3" => {
-            let commitment =
-                zkie_models_gemma3::executor::build_commitment(asset_root, &tokens)?;
-            let model_id = zkie_models_gemma3::plan::model_commitment(&tokens)?;
-            let parameters = zkie_models_gemma3::plan::parameters_digest()?;
-            let spec_count = zkie_models_gemma3::plan::asset_specs().len();
-            (
-                commitment,
-                model_id,
-                parameters,
-                zkie_models_gemma3::plan::MODEL_VERSION,
-                spec_count,
-            )
-        }
-        "timesfm" => {
-            let input: Vec<i64> = values.iter().map(|value| *value as i64).collect();
-            let commitment =
-                zkie_models_timesfm::executor::build_commitment(asset_root, &input)?;
-            let model_id = zkie_models_timesfm::plan::model_commitment(&tokens)?;
-            let parameters = zkie_models_timesfm::plan::parameters_digest()?;
-            let spec_count = zkie_models_timesfm::plan::asset_specs().len();
-            (
-                commitment,
-                model_id,
-                parameters,
-                zkie_models_timesfm::plan::MODEL_VERSION,
-                spec_count,
-            )
-        }
+    let (model_id, parameters, specs, spec_version) = match model {
+        "gpt2" => (
+            zkie_models_gpt2::plan::model_commitment(&tokens)?,
+            zkie_models_gpt2::plan::parameters_digest()?,
+            zkie_models_gpt2::plan::asset_specs(),
+            zkie_models_gpt2::plan::MODEL_VERSION,
+        ),
+        "gemma3" => (
+            zkie_models_gemma3::plan::model_commitment(&tokens)?,
+            zkie_models_gemma3::plan::parameters_digest()?,
+            zkie_models_gemma3::plan::asset_specs(),
+            zkie_models_gemma3::plan::MODEL_VERSION,
+        ),
+        "timesfm" => (
+            zkie_models_timesfm::plan::model_commitment(&tokens)?,
+            zkie_models_timesfm::plan::parameters_digest()?,
+            zkie_models_timesfm::plan::asset_specs(),
+            zkie_models_timesfm::plan::MODEL_VERSION,
+        ),
         _ => return Err(Error::UnsupportedPrimitive),
     };
+    let spec_count = specs.len();
+    let (commitment, digests) =
+        commit_assets_with_digests(asset_root, model_id, parameters, &specs)?;
     if commitment.anchor.record.model_commitment != model_id
         || commitment.anchor.record.parameters_digest != parameters
         || commitment.assets.len() != spec_count
+        || digests.len() != spec_count
     {
         return Err(Error::StatementMismatch);
     }
@@ -202,8 +190,86 @@ fn confirmation(
         model_id,
         parameters,
         spec_version,
-        spec_count,
+        digests,
     })
+}
+
+fn compare_asset_hashes(previous: &serde_json::Value, current: &[AssetDigest]) -> Result<()> {
+    let list = previous.get("asset_sha256").unwrap_or(previous);
+    let list = list.as_array().ok_or(Error::InvalidConfig)?;
+    if list.len() != current.len() {
+        return Err(Error::StatementMismatch);
+    }
+    for (entry, digest) in list.iter().zip(current) {
+        let asset_id = entry
+            .get("asset_id")
+            .and_then(|value| value.as_u64())
+            .ok_or(Error::InvalidConfig)?;
+        let path = entry
+            .get("path")
+            .and_then(|value| value.as_str())
+            .ok_or(Error::InvalidConfig)?;
+        let bytes = entry
+            .get("bytes")
+            .and_then(|value| value.as_u64())
+            .ok_or(Error::InvalidConfig)?;
+        let sha256 = entry
+            .get("sha256")
+            .and_then(|value| value.as_str())
+            .ok_or(Error::InvalidConfig)?;
+        let element_count = entry
+            .get("element_count")
+            .and_then(|value| value.as_u64())
+            .ok_or(Error::InvalidConfig)?;
+        let row_width = entry
+            .get("row_width")
+            .and_then(|value| value.as_u64())
+            .ok_or(Error::InvalidConfig)?;
+        let encoding = entry
+            .get("encoding")
+            .and_then(|value| value.as_str())
+            .ok_or(Error::InvalidConfig)?;
+        if asset_id != digest.asset_id
+            || path != digest.path
+            || bytes != digest.bytes
+            || sha256 != digest_to_hex(&digest.sha256)
+            || element_count != digest.element_count
+            || row_width != digest.row_width as u64
+            || encoding != digest.encoding
+        {
+            return Err(Error::StatementMismatch);
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_policy(
+    path: &Path,
+    case: &SelectedCase,
+    confirmed: &Confirmation,
+    input_len: usize,
+    output_type: &str,
+    output_elements: usize,
+    gt_digest: Digest,
+) -> Result<()> {
+    let bytes = std::fs::read(path).map_err(|_| Error::Io)?;
+    let document = crate::policy::parse(&bytes)?;
+    let trusted = crate::policy::select(&document, &case.case_id, &case.model, input_len)?;
+    if trusted.model_version != confirmed.spec_version
+        || trusted.anchor_id != confirmed.commitment.anchor.record.anchor_id
+        || trusted.model_id != confirmed.model_id
+    {
+        return Err(Error::StatementMismatch);
+    }
+    if trusted.output.mode == crate::policy::OutputMode::Expected
+        && (trusted.output.kind.name() != output_type
+            || trusted.output.elements != Some(output_elements)
+            || trusted.output.sha256 != Some(gt_digest))
+    {
+        return Err(Error::StatementMismatch);
+    }
+    Ok(())
 }
 
 pub fn run(args: &[String]) -> Result<()> {
@@ -219,7 +285,8 @@ pub fn run(args: &[String]) -> Result<()> {
     if gt.len() as u64 != case.gt_bytes {
         return Err(Error::ShapeMismatch);
     }
-    if digest_bytes(&gt) != digest_from_hex(&case.gt_sha256)? {
+    let gt_digest = digest_from_hex(&case.gt_sha256)?;
+    if digest_bytes(&gt) != gt_digest {
         return Err(Error::StatementMismatch);
     }
     if gt.len() % 4 != 0 {
@@ -261,6 +328,38 @@ pub fn run(args: &[String]) -> Result<()> {
         "argmax"
     };
     let confirmed = confirmation(&case.model, &asset_root, &values)?;
+    if let Some(previous) = &parsed.asset_hashes {
+        let bytes = std::fs::read(previous).map_err(|_| Error::Io)?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| Error::InvalidEncoding)?;
+        compare_asset_hashes(&value, &confirmed.digests)?;
+    }
+    if let Some(policy) = &parsed.policy {
+        check_policy(
+            policy,
+            &case,
+            &confirmed,
+            values.len(),
+            output_type,
+            output_elements,
+            gt_digest,
+        )?;
+    }
+    let asset_hashes: Vec<serde_json::Value> = confirmed
+        .digests
+        .iter()
+        .map(|digest| {
+            serde_json::json!({
+                "asset_id": digest.asset_id,
+                "path": digest.path,
+                "bytes": digest.bytes,
+                "sha256": digest_to_hex(&digest.sha256),
+                "element_count": digest.element_count,
+                "row_width": digest.row_width,
+                "encoding": digest.encoding,
+            })
+        })
+        .collect();
     let registered_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
@@ -276,7 +375,7 @@ pub fn run(args: &[String]) -> Result<()> {
         "model_id": digest_to_hex(&confirmed.model_id),
         "anchor_id": digest_to_hex(&confirmed.commitment.anchor.record.anchor_id),
         "parameters_digest": digest_to_hex(&confirmed.parameters),
-        "assets_checked": confirmed.spec_count,
+        "assets_checked": confirmed.digests.len(),
         "input_elements": values.len(),
         "registered_at_unix": registered_at,
         "output_mode": "expected",
@@ -286,6 +385,8 @@ pub fn run(args: &[String]) -> Result<()> {
         "output_encoding": "i32-le",
         "output_elements": output_elements,
         "gt_bytes": case.gt_bytes,
+        "asset_sha256": asset_hashes,
+        "asset_baseline": "self-built change-detection baseline; not verified against externally published model material; model authorization policy pending",
     });
     if case.model == "timesfm" {
         output["raw_input_length"] = serde_json::json!(values.len());

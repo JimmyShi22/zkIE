@@ -187,10 +187,48 @@ pub fn validate_relative_path(relative_path: &str) -> Result<()> {
     Ok(())
 }
 
+pub struct Sha256Stream {
+    hasher: Sha256,
+}
+
+impl Sha256Stream {
+    pub fn new() -> Self {
+        let _profile = crate::profile::Scope::kernel(crate::profile::Kernel::Sha256);
+        Self {
+            hasher: Sha256::new(),
+        }
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.hasher.update(bytes);
+    }
+
+    pub fn finish(self) -> Digest {
+        Digest(self.hasher.finalize().into())
+    }
+}
+
+impl Default for Sha256Stream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn digest_bytes(bytes: &[u8]) -> Digest {
+    digest_bytes_chunks(std::iter::once(bytes))
+}
+
+/// SHA-256 over a byte stream supplied in chunks, in order.
+pub fn digest_bytes_chunks<I, B>(chunks: I) -> Digest
+where
+    I: IntoIterator<Item = B>,
+    B: AsRef<[u8]>,
+{
     let _profile = crate::profile::Scope::kernel(crate::profile::Kernel::Sha256);
     let mut hasher = Sha256::new();
-    hasher.update(bytes);
+    for chunk in chunks {
+        hasher.update(chunk.as_ref());
+    }
     Digest(hasher.finalize().into())
 }
 

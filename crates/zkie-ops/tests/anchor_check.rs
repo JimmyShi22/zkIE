@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use zkie_core::types::Digest;
 use zkie_ops::proof::model_commitment::{
-    commit_assets, verify_model_anchor, ModelAssetSpec, ModelCommitmentPublic,
+    commit_assets, verify_model_anchor, AssetStore, ModelAssetSpec, ModelCommitmentPublic,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -138,4 +138,58 @@ fn positive_anchor_and_negative_mutations() {
     let mut wrong_specs = specs.clone();
     wrong_specs[1] = wrong_specs[0].clone();
     assert!(verify(&public, &wrong_specs).is_err());
+}
+
+#[test]
+fn opening_structure_is_checked() {
+    let root = temp_dir();
+    write_i32(&root.join("c_i32.bin"), &[1, 2, 3, 4, 5, 6]);
+    let specs = vec![ModelAssetSpec {
+        asset_id: 0,
+        path: "c_i32.bin".into(),
+        element_count: 6,
+        row_width: 4,
+        encoding: "i32-le".into(),
+    }];
+    let commitment =
+        commit_assets(&root, Digest([3; 32]), Digest([4; 32]), &specs).unwrap();
+    let public = ModelCommitmentPublic::from_commitment(&commitment);
+    let openings = AssetStore::open(&commitment).unwrap().open_all().unwrap();
+    let opening = &openings[0];
+    public.verify_opening(opening).unwrap();
+
+    let mut padding = opening.clone();
+    padding.rows[1].values[2] = 1;
+    assert_eq!(
+        public.verify_opening(&padding).unwrap_err().code(),
+        "statement_mismatch"
+    );
+
+    let mut path = opening.clone();
+    path.rows[0].path.push(Digest([0; 32]));
+    assert_eq!(
+        public.verify_opening(&path).unwrap_err().code(),
+        "invalid_proof"
+    );
+
+    let mut duplicate = opening.clone();
+    duplicate.rows[1] = duplicate.rows[0].clone();
+    assert_eq!(
+        public.verify_opening(&duplicate).unwrap_err().code(),
+        "invalid_index"
+    );
+
+    let mut swapped = opening.clone();
+    swapped.rows.swap(0, 1);
+    assert_eq!(
+        public.verify_opening(&swapped).unwrap_err().code(),
+        "invalid_index"
+    );
+
+    let mut width = opening.clone();
+    width.rows[0].values.pop();
+    assert_eq!(
+        public.verify_opening(&width).unwrap_err().code(),
+        "shape_mismatch"
+    );
 }

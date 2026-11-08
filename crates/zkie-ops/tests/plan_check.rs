@@ -173,7 +173,7 @@ fn one_asset_fixture(tokens: &[u32], with_argmax: bool) -> Fixture {
     }
 }
 
-fn assert_rejected(fixture: &Fixture) {
+fn rejection_code(fixture: &Fixture) -> String {
     let bytes = bincode::serialize(&fixture.trace).unwrap();
     let trace: SharedTrace = bincode::deserialize(&bytes).unwrap();
     let result = if fixture.plan.final_output.is_some() {
@@ -193,7 +193,11 @@ fn assert_rejected(fixture: &Fixture) {
         )
         .map(|_| ())
     };
-    assert!(result.is_err(), "expected rejection");
+    result.err().expect("expected rejection").code().to_owned()
+}
+
+fn assert_rejected(fixture: &Fixture) {
+    let _ = rejection_code(fixture);
 }
 
 #[test]
@@ -631,5 +635,34 @@ fn negative_external_opening_must_cover_the_full_asset() {
     };
     negative.trace.assets[0].rows.pop();
     negative.trace.assets[0].row_count = 1;
-    assert_rejected(&negative);
+    assert_eq!(rejection_code(&negative), "statement_mismatch");
+
+    // Structural mutations keep the original rows and Merkle paths valid.
+    // Only the position/uniqueness/coverage checks can reject them.
+    let mut duplicate = Fixture {
+        public: fixture.public.clone(),
+        trace: fixture.trace.clone(),
+        tokens: fixture.tokens.clone(),
+        plan: fixture.plan.clone(),
+    };
+    duplicate.trace.assets[0].rows[1] = duplicate.trace.assets[0].rows[0].clone();
+    assert_eq!(rejection_code(&duplicate), "invalid_index");
+
+    let mut swapped = Fixture {
+        public: fixture.public.clone(),
+        trace: fixture.trace.clone(),
+        tokens: fixture.tokens.clone(),
+        plan: fixture.plan.clone(),
+    };
+    swapped.trace.assets[0].rows.swap(0, 1);
+    assert_eq!(rejection_code(&swapped), "invalid_index");
+
+    let mut width = Fixture {
+        public: fixture.public.clone(),
+        trace: fixture.trace.clone(),
+        tokens: fixture.tokens.clone(),
+        plan: fixture.plan.clone(),
+    };
+    width.trace.assets[0].rows[0].values.pop();
+    assert_eq!(rejection_code(&width), "shape_mismatch");
 }

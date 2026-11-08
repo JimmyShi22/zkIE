@@ -199,6 +199,8 @@ cargo run --release -p zkie -- anchor \
   --case <case.toml> \
   --input <input.bin> \
   --asset-root <asset-root> \
+  [--asset-hashes <previous-anchor.json>] \
+  [--policy <case.policy>] \
   [--out <anchor.json>]
 ```
 
@@ -206,10 +208,15 @@ It selects the case entry whose declared input path matches `--input`,
 validates the input shape, reads every asset through the trusted model
 specifications, rebuilds the complete commitment with the commit algorithm and
 prints `anchor_id`, `model_id`, `parameters_digest`, the specification
-version and audit counters. It never reads a proof bundle. The printed
-identities are what the operator fixes into `case.policy`; a policy is
-trusted only when the registration is performed and attested outside the
-prover's bundle.
+version and audit counters. It never reads a proof bundle. The output includes
+a per-asset file SHA-256 list taken from the same mapping that builds the
+commitment. The first registration establishes a self-built change-detection
+baseline, not an independent attestation of the model weights; pass a previous
+anchor output as `--asset-hashes` to compare item by item on later runs, and
+`--policy` to check the registered policy against the recomputed identities.
+The printed identities are what the operator fixes into `case.policy`; a
+policy is trusted only when the registration is performed and attested outside
+the prover's bundle.
 
 ### Verification policy
 

@@ -198,6 +198,17 @@ impl AssetReader {
         Ok(self.encoding.decode(&bytes))
     }
 
+    /// Raw bytes of `count` elements starting at `start`, in file order.
+    pub fn read_bytes(&self, start: u64, count: usize) -> Result<Vec<u8>> {
+        let byte_len = (count as u64)
+            .checked_mul(self.encoding.element_size())
+            .ok_or(Error::ResourceLimit)?;
+        let mut bytes =
+            vec![0u8; usize::try_from(byte_len).map_err(|_| Error::ResourceLimit)?];
+        self.reader.read_range(start, count, &mut bytes)?;
+        Ok(bytes)
+    }
+
     pub fn read_i64(&self, start: u64, count: usize) -> Result<Vec<i64>> {
         Ok(self
             .read(start, count)?
@@ -222,17 +233,54 @@ impl AssetReader {
     }
 }
 
+/// SHA-256 of one registered asset file, taken from the same mapping used to
+/// build the commitment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetDigest {
+    pub asset_id: u64,
+    pub path: String,
+    pub bytes: u64,
+    pub sha256: Digest,
+    pub element_count: u64,
+    pub row_width: usize,
+    pub encoding: String,
+}
+
 pub fn commit_assets(
     root: &Path,
     model_commitment: Digest,
     parameters_digest: Digest,
     specs: &[ModelAssetSpec],
 ) -> Result<ModelCommitment> {
+    commit_assets_inner(root, model_commitment, parameters_digest, specs, false)
+        .map(|(commitment, _)| commitment)
+}
+
+/// Builds the commitment and returns one SHA-256 per asset. Each digest covers
+/// the complete file bytes in order through the same mapping that supplies the
+/// Merkle leaves.
+pub fn commit_assets_with_digests(
+    root: &Path,
+    model_commitment: Digest,
+    parameters_digest: Digest,
+    specs: &[ModelAssetSpec],
+) -> Result<(ModelCommitment, Vec<AssetDigest>)> {
+    commit_assets_inner(root, model_commitment, parameters_digest, specs, true)
+}
+
+fn commit_assets_inner(
+    root: &Path,
+    model_commitment: Digest,
+    parameters_digest: Digest,
+    specs: &[ModelAssetSpec],
+    emit_digests: bool,
+) -> Result<(ModelCommitment, Vec<AssetDigest>)> {
     if specs.is_empty() {
         return Err(Error::InvalidConfig);
     }
     let mut assets = Vec::with_capacity(specs.len());
     let mut records = Vec::with_capacity(specs.len());
+    let mut asset_digests = Vec::with_capacity(specs.len());
     for (position, spec) in specs.iter().enumerate() {
         if spec.row_width == 0 || spec.element_count == 0 {
             return Err(Error::InvalidConfig);
@@ -257,6 +305,26 @@ pub fn commit_assets(
             return Err(Error::ShapeMismatch);
         }
         let reader = AssetReader::from_mmap(reader, encoding, spec.element_count);
+        if emit_digests {
+            let mut stream = zkie_core::artifact::Sha256Stream::new();
+            let chunk_elements = 1_048_576u64;
+            let mut offset = 0u64;
+            while offset < spec.element_count {
+                let count = (spec.element_count - offset).min(chunk_elements) as usize;
+                let bytes = reader.read_bytes(offset, count)?;
+                stream.update(&bytes);
+                offset += count as u64;
+            }
+            asset_digests.push(AssetDigest {
+                asset_id: spec.asset_id,
+                path: spec.path.clone(),
+                bytes: expected,
+                sha256: stream.finish(),
+                element_count: spec.element_count,
+                row_width: spec.row_width,
+                encoding: spec.encoding.clone(),
+            });
+        }
         let actual_rows = spec.element_count.div_ceil(spec.row_width as u64);
         let padded_rows = actual_rows.max(1).next_power_of_two();
         let mut digests = Vec::with_capacity(padded_rows as usize);
@@ -287,11 +355,14 @@ pub fn commit_assets(
         });
     }
     let anchor = make_anchor(model_commitment, parameters_digest, &records)?;
-    Ok(ModelCommitment {
-        anchor,
-        assets,
-        root: root.to_path_buf(),
-    })
+    Ok((
+        ModelCommitment {
+            anchor,
+            assets,
+            root: root.to_path_buf(),
+        },
+        asset_digests,
+    ))
 }
 
 pub fn open_asset(
@@ -585,25 +656,72 @@ impl ModelCommitmentPublic {
             .iter()
             .find(|asset| asset.asset_id == opening.asset_id)
             .ok_or(Error::StatementMismatch)?;
-        if opening.start != asset.start || opening.root != asset.root || opening.row_count == 0 {
+        if opening.start != asset.start
+            || opening.root != asset.root
+            || opening.row_count != asset.rows
+            || opening.rows.len() as u64 != asset.rows
+        {
             return Err(Error::StatementMismatch);
         }
+        if asset.row_width == 0
+            || asset.element_count == 0
+            || !asset.rows.is_power_of_two()
+        {
+            return Err(Error::InvalidConfig);
+        }
+        let row_width = asset.row_width as u64;
+        let actual_rows = asset.element_count.div_ceil(row_width);
+        let expected_rows = actual_rows.max(1).next_power_of_two();
+        if asset.rows != expected_rows {
+            return Err(Error::StatementMismatch);
+        }
+        let depth = asset.rows.trailing_zeros() as usize;
         verify_link(
             &self.anchor,
             &opening.link,
             &asset.leaf_record.table_identity,
             &asset.leaf_record.leaf_root,
         )?;
-        opening.rows.par_iter().try_for_each(|row| {
-            if row.row >= asset.rows {
-                return Err(Error::InvalidIndex);
-            }
-            let leaf = oracle_leaf(row.row, &row.values);
-            if !merkle_verify(&opening.start, &opening.root, row.row as usize, &leaf, &row.path)? {
-                return Err(Error::InvalidProof);
-            }
-            Ok(())
-        })?;
+        opening
+            .rows
+            .par_iter()
+            .enumerate()
+            .try_for_each(|(position, row)| {
+                if row.row != position as u64 {
+                    return Err(Error::InvalidIndex);
+                }
+                if row.values.len() != asset.row_width {
+                    return Err(Error::ShapeMismatch);
+                }
+                let data_start = row
+                    .row
+                    .checked_mul(row_width)
+                    .ok_or(Error::ResourceLimit)?;
+                if row.row >= actual_rows {
+                    if row.values.iter().any(|value| *value != 0) {
+                        return Err(Error::StatementMismatch);
+                    }
+                } else if data_start < asset.element_count {
+                    let valid = (asset.element_count - data_start).min(row_width) as usize;
+                    if row.values[valid..].iter().any(|value| *value != 0) {
+                        return Err(Error::StatementMismatch);
+                    }
+                }
+                if row.path.len() != depth {
+                    return Err(Error::InvalidProof);
+                }
+                let leaf = oracle_leaf(row.row, &row.values);
+                if !merkle_verify(
+                    &opening.start,
+                    &opening.root,
+                    row.row as usize,
+                    &leaf,
+                    &row.path,
+                )? {
+                    return Err(Error::InvalidProof);
+                }
+                Ok(())
+            })?;
         Ok(())
     }
 }
