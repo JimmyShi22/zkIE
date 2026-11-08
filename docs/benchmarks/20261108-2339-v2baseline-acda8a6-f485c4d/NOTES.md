@@ -15,7 +15,7 @@
 - GPT-2 seq16: all three stages returned `PASS`.
 - GPT-2 seq512: all three stages returned `PASS`.
 
-## 最小 case 三阶段验证 — GPT-2 seq16
+## Minimal-case three-stage validation — GPT-2 seq16
 
 | stage | wall ms | VmHWM KiB | proof bytes |
 | --- | ---: | ---: | ---: |
@@ -31,7 +31,7 @@
 - Archived `proof.bin` (gitignored):
   `docs/benchmarks/20261108-2339-v2baseline-acda8a6-f485c4d/mincase-seq16/proof/proof.bin`.
 
-## seq512 缩放实测 — GPT-2 seq512
+## seq512 scaling measurement — GPT-2 seq512
 
 | stage | wall ms | VmHWM KiB | proof bytes |
 | --- | ---: | ---: | ---: |
@@ -49,11 +49,11 @@
 
 ## Matrix
 
-_待填 — on hold pending scope/storage decision._
+_TBD — on hold pending scope/storage decision._
 
 ## Profile
 
-_待填 — on hold pending scope/storage decision._
+_TBD — on hold pending scope/storage decision._
 
 ## Storage context
 

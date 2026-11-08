@@ -183,7 +183,7 @@ cargo run --release -p zkie-check -- report --input <run-dir> --require-profile 
 - **No model re-execution.** Verification reads the public commitment, the
   statement, the proof and the public inputs only.
 - **Performance.** Current commit/prove/verify timings, peak memory and proof
-  sizes are **待测** (to be measured); no performance figures are recorded in
+  sizes are **TBD** (to be measured); no performance figures are recorded in
   this document.
 
 ## License

@@ -83,6 +83,9 @@ docs/               benchmarks.md; spec / roadmap are TODO placeholders;
    every result and note which change and scheme it belongs to.
 6. Docs in sync: deleting a feature deletes its documentation; docs/ matches the
    code.
+7. Docs in English: every documentation file (README, docs/, notes, tables) is
+   written in English; non-English text found in existing docs is translated
+   before it is committed.
 
 ## Workflow red lines
 

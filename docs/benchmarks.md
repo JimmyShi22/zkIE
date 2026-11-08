@@ -1,6 +1,6 @@
 # Benchmark method
 
-All performance figures for the current implementation are **待测**. The
+All performance figures for the current implementation are **TBD**. The
 numbers measured for earlier designs are not comparable with the current code
 and are intentionally not carried over: the proof format, the commitment
 layout and the executors have changed.
@@ -26,11 +26,11 @@ Correctness gates for every row:
 
 | Model | Input | commit | prove | verify | proof size | peak RSS |
 | --- | --- | --- | --- | --- | --- | --- |
-| GPT-2 124M | 16 tokens | 待测 | 待测 | 待测 | 待测 | 待测 |
-| GPT-2 124M | 512 tokens | 待测 | 待测 | 待测 | 待测 | 待测 |
-| Gemma 3 270M | 16 tokens | 待测 | 待测 | 待测 | 待测 | 待测 |
-| Gemma 3 270M | 512 tokens | 待测 | 待测 | 待测 | 待测 | 待测 |
-| TimesFM 1.0 200M | 16 patches | 待测 | 待测 | 待测 | 待测 | 待测 |
+| GPT-2 124M | 16 tokens | TBD | TBD | TBD | TBD | TBD |
+| GPT-2 124M | 512 tokens | TBD | TBD | TBD | TBD | TBD |
+| Gemma 3 270M | 16 tokens | TBD | TBD | TBD | TBD | TBD |
+| Gemma 3 270M | 512 tokens | TBD | TBD | TBD | TBD | TBD |
+| TimesFM 1.0 200M | 16 patches | TBD | TBD | TBD | TBD | TBD |
 
 ## Method
 
@@ -81,6 +81,6 @@ size is the byte length of `proof.bin`.
 - Do not mix numbers from different builds, thread counts or asset versions.
 - Do not report a number that was not produced by the current code on the
   stated case.
-- Mark an unavailable measurement as **待测**, not as zero or as an estimate.
+- Mark an unavailable measurement as **TBD**, not as zero or as an estimate.
 - Report commit, prove and verify separately; an end-to-end total hides which
   stage dominates.
