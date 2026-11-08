@@ -42,7 +42,7 @@ pub fn check(args: &[String]) -> Result<Summary, String> {
 
     let scope = fs::read_to_string(scope_path)
         .map_err(|error| format!("cannot read scope: {error}"))?;
-    if scope.trim().is_empty() || !scope.contains("本期必做矩阵") {
+    if scope.trim().is_empty() || !scope.contains("must-do matrix") {
         return Err("scope document is missing the case matrix section".into());
     }
 

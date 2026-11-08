@@ -1,6 +1,6 @@
 schema_version = 1
 case_group = "gemma3-270m"
-description = "Gemma3 270M 因果语言模型 case 组"
+description = "Gemma3 270M causal language model case group"
 
 [architecture]
 layers = 18

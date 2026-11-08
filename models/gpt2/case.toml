@@ -1,6 +1,6 @@
 schema_version = 1
 case_group = "gpt2-124m"
-description = "GPT-2 124M 因果语言模型 case 组"
+description = "GPT-2 124M causal language model case group"
 
 [architecture]
 layers = 12

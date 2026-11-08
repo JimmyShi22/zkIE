@@ -1,6 +1,6 @@
 schema_version = 1
 case_group = "timesfm-200m"
-description = "TimesFM 200M 时间序列回归 case 组"
+description = "TimesFM 200M time-series regression case group"
 
 [architecture]
 layers = 20
