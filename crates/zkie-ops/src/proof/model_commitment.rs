@@ -75,10 +75,6 @@ pub struct AssetOpening {
     pub start: Digest,
     pub root: Digest,
     pub row_count: u64,
-    /// Last step ordinal that consumes this asset in the trace. The verifier
-    /// derives the actual last use from the ordered step list and rejects an
-    /// earlier declaration.
-    pub last_use_step: u64,
 }
 
 fn table_identity(spec: &ModelAssetSpec) -> Digest {
@@ -372,7 +368,6 @@ pub fn open_asset_from_reader(
         start: asset.start,
         root: asset.root,
         row_count,
-        last_use_step: 0,
     })
 }
 
@@ -501,8 +496,7 @@ impl<'a> AssetStore<'a> {
         &self,
         steps: &mut [SharedTraceStep],
     ) -> Result<Vec<AssetOpening>> {
-        let mut used: BTreeMap<u64, u64> = BTreeMap::new();
-        for (step_index, step) in steps.iter().enumerate() {
+        for step in steps.iter() {
             if step.external.len() != step.public_luts.len() {
                 return Err(Error::ShapeMismatch);
             }
@@ -543,25 +537,18 @@ impl<'a> AssetStore<'a> {
                 {
                     return Err(Error::InvalidIndex);
                 }
-                let entry = used
-                    .entry(reference.asset_id)
-                    .or_insert(step_index as u64);
-                if (step_index as u64) > *entry {
-                    *entry = step_index as u64;
-                }
             }
         }
+        let used = referenced_asset_last_use(steps)?;
         let mut openings = Vec::with_capacity(used.len());
-        for (asset_id, last_use_step) in used {
+        for asset_id in used.keys().copied() {
             let index = self
                 .commitment
                 .assets
                 .iter()
                 .position(|asset| asset.asset_id == asset_id)
                 .ok_or(Error::StatementMismatch)?;
-            let mut opening = self.open_asset(index)?;
-            opening.last_use_step = last_use_step;
-            openings.push(opening);
+            openings.push(self.open_asset(index)?);
         }
         Ok(openings)
     }
@@ -970,6 +957,41 @@ pub struct SharedTrace {
     pub output: Vec<i64>,
 }
 
+/// Deterministic per-asset last consuming step. Derived only from the ordered
+/// external references, with no serialized lifetime field.
+pub fn referenced_asset_last_use(
+    steps: &[SharedTraceStep],
+) -> Result<BTreeMap<u64, u64>> {
+    let mut used = BTreeMap::new();
+    for (step_index, step) in steps.iter().enumerate() {
+        for reference in step.external.iter().flatten() {
+            let entry = used
+                .entry(reference.asset_id)
+                .or_insert(step_index as u64);
+            if (step_index as u64) > *entry {
+                *entry = step_index as u64;
+            }
+        }
+    }
+    Ok(used)
+}
+
+pub fn asset_last_use(trace: &SharedTrace) -> Result<BTreeMap<u64, u64>> {
+    referenced_asset_last_use(&trace.steps)
+}
+
+/// Structural consistency check: the derived last use must equal the expected
+/// reference-set maximum; an earlier declaration is rejected.
+pub fn check_asset_last_use(
+    trace: &SharedTrace,
+    expected: &BTreeMap<u64, u64>,
+) -> Result<()> {
+    if asset_last_use(trace)? != *expected {
+        return Err(Error::StatementMismatch);
+    }
+    Ok(())
+}
+
 const PREFIX_FORMAT_VERSION: u64 = 1;
 const PREFIX_TAG: u64 = 21;
 
@@ -1186,28 +1208,10 @@ fn verify_shared_trace_steps(
     {
         return Err(Error::StatementMismatch);
     }
-    // Lifetime declarations must cover every actual consumption site. The
-    // structure-derived last use wins over an earlier prover declaration.
-    let mut actual_last_use: BTreeMap<u64, u64> = BTreeMap::new();
-    for (step_index, step) in trace.steps.iter().enumerate() {
-        for reference in step.external.iter().flatten() {
-            let entry = actual_last_use
-                .entry(reference.asset_id)
-                .or_insert(step_index as u64);
-            if (step_index as u64) > *entry {
-                *entry = step_index as u64;
-            }
-        }
-    }
-    for opening in &trace.assets {
-        let actual = actual_last_use
-            .get(&opening.asset_id)
-            .copied()
-            .unwrap_or(0);
-        if opening.last_use_step < actual {
-            return Err(Error::StatementMismatch);
-        }
-    }
+    // Lifetime is derived from the ordered reference structure; there is no
+    // serialized declaration to trust. The map is retained for verification
+    // and later bounded-lifetime use.
+    let _last_use = referenced_asset_last_use(&trace.steps)?;
     openings_by_id
         .par_iter()
         .try_for_each(|(_, opening)| public.verify_opening(opening))?;

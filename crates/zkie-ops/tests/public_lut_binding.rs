@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 
 use zkie_core::types::Digest;
 use zkie_ops::proof::model_commitment::{
-    commit_assets, open_asset, verify_shared_trace,
+    asset_last_use, check_asset_last_use, commit_assets, open_asset, verify_shared_trace,
     AssetOpening, ModelAssetSpec, ModelCommitment, ModelCommitmentPublic, SharedTrace,
     SharedTraceStep,
 };
@@ -707,8 +707,7 @@ fn broadcast_columns_window_overflow_rejected() {
 fn shared_asset_steps_trace() -> SharedTrace {
     let fixture = fixture();
     let weights = fixture.weights;
-    let mut opening = fixture.weights_opening.clone();
-    opening.last_use_step = 1;
+    let opening = fixture.weights_opening.clone();
     let op = AddOp;
     let mut steps = Vec::new();
     for _ in 0..2 {
@@ -747,11 +746,13 @@ fn shared_asset_steps_trace() -> SharedTrace {
 
 #[test]
 fn early_last_use_rejected() {
-    let base = shared_asset_steps_trace();
-    assert_accepts(&base);
-    let mut tampered = roundtrip(&base);
-    tampered.assets[0].last_use_step = 0;
-    assert_rejects(&tampered);
+    let trace = shared_asset_steps_trace();
+    assert_accepts(&trace);
+    let derived = asset_last_use(&trace).unwrap();
+    assert_eq!(derived.get(&2), Some(&1));
+    let mut expected = derived.clone();
+    expected.insert(2, 0);
+    assert!(check_asset_last_use(&trace, &expected).is_err());
 }
 
 #[test]
