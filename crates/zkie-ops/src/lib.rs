@@ -1,14 +1,10 @@
 //! zkie-ops: op-level proof primitives.
-pub mod compose;
 pub mod execute;
 pub mod graph;
 pub mod op;
-pub mod par;
 pub mod pipeline;
 pub mod proof;
 pub mod registry;
-pub mod rope;
-pub mod single_shot;
 pub mod layout;
 pub mod requantize;
 pub mod affine_scale;
