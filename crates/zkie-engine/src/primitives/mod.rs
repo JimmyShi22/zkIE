@@ -4,7 +4,6 @@
 
 pub mod codec;
 pub mod field;
-pub mod random;
 pub mod transcript;
 
 use zkie_core::error::{Error, Result};

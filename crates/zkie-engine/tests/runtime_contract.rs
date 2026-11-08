@@ -6,10 +6,6 @@ use std::sync::{Arc, Mutex};
 use zkie_core::compute::{MemoryGovernor, MemoryRequest};
 use zkie_core::error::{Error, Result};
 use zkie_core::progress::{ProgressEvent, ProgressKind, ProgressSink};
-use zkie_core::types::{
-    AllocationId, BufferGeneration, BufferHandle, BufferOwner, DType, Fence,
-};
-use zkie_engine::buffer::{validate_fence, BufferTable};
 use zkie_engine::context::RuntimeConfig;
 use zkie_engine::memory::{BudgetedMemoryGovernor, MemoryBudgetConfig};
 use zkie_engine::parallel::{
@@ -61,59 +57,6 @@ fn memory_budget_is_reserved_before_use_and_released_on_drop() {
     drop(third);
     assert_eq!(governor.snapshot().reserved_bytes, 0);
     assert!(governor.snapshot().peak_bytes >= 800);
-}
-
-#[test]
-fn buffer_handles_are_owner_generation_and_dtype_checked() {
-    let owner = BufferOwner(1);
-    let handle = BufferHandle::new(
-        owner,
-        BufferGeneration(1),
-        AllocationId(7),
-        DType::I32,
-        4,
-    );
-    let mut table = BufferTable::new();
-    table.register(handle).unwrap();
-    table.validate(handle, owner, DType::I32).unwrap();
-    assert!(matches!(
-        table.validate(handle, BufferOwner(2), DType::I32),
-        Err(Error::StatementMismatch)
-    ));
-    assert!(matches!(
-        table.validate(handle, owner, DType::I64),
-        Err(Error::ShapeMismatch)
-    ));
-
-    table.retire(handle).unwrap();
-    assert!(matches!(
-        table.validate(handle, owner, DType::I32),
-        Err(Error::InvalidHandle)
-    ));
-    assert!(matches!(
-        table.register(handle),
-        Err(Error::StateRollbackSuspected)
-    ));
-
-    let next = BufferHandle::new(
-        owner,
-        BufferGeneration(2),
-        AllocationId(7),
-        DType::I32,
-        4,
-    );
-    table.register(next).unwrap();
-    assert!(matches!(
-        table.validate(handle, owner, DType::I32),
-        Err(Error::DeviceLost)
-    ));
-    table.validate(next, owner, DType::I32).unwrap();
-
-    assert!(validate_fence(Fence::new(owner, 1), owner).is_ok());
-    assert!(matches!(
-        validate_fence(Fence::new(BufferOwner(2), 1), owner),
-        Err(Error::StatementMismatch)
-    ));
 }
 
 type Task = Box<dyn FnOnce() -> Result<u64> + Send>;

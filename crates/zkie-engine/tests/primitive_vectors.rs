@@ -13,9 +13,7 @@ use zkie_engine::pcs::request::field::{
 };
 use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
 use zkie_engine::primitives::{add_with_carry, div_rem_checked, mul_add_carry, rq, sub_with_borrow, WideU256};
-use zkie_engine::primitives::random::OsRandomSource;
 use zkie_engine::primitives::transcript::{hash_labeled, hash_labeled_64, Blake2b};
-use zkie_core::common::random::RandomSource;
 
 fn vectors() -> Value {
     serde_json::from_str(include_str!("vectors/request/primitives.json")).unwrap()
@@ -295,29 +293,3 @@ fn canonical_codec_rejects_non_canonical_and_trailing_bytes() {
     let _: Fp = fp_from_u64(3);
 }
 
-#[test]
-fn os_randomness_is_fresh_and_domain_separated() {
-    let mut first = OsRandomSource::new().unwrap();
-    let mut second = OsRandomSource::new().unwrap();
-    let mut a = [0u8; 32];
-    let mut b = [0u8; 32];
-    first.fill(b"mask", 1, 0, &mut a).unwrap();
-    second.fill(b"mask", 1, 0, &mut b).unwrap();
-    assert_ne!(a, b);
-
-    let mut repeated = [0u8; 32];
-    first.fill(b"mask", 1, 0, &mut repeated).unwrap();
-    assert_eq!(a, repeated);
-
-    let mut other_object = [0u8; 32];
-    first.fill(b"mask", 2, 0, &mut other_object).unwrap();
-    assert_ne!(a, other_object);
-
-    let mut other_offset = [0u8; 32];
-    first.fill(b"mask", 1, 1, &mut other_offset).unwrap();
-    assert_ne!(a, other_offset);
-
-    let mut long = [0u8; 100];
-    first.fill(b"mask", 1, 0, &mut long).unwrap();
-    assert_eq!(&long[..32], &a);
-}

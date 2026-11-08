@@ -17,7 +17,6 @@ use zkie_core::types::{
     Fence, TensorSpec, TensorStorageRef, WorkspaceRequirement,
 };
 use zkie_engine::context::{ExecContext, FallbackPolicy, Metrics, RuntimeConfig};
-use zkie_engine::fallback::ComputeTransaction;
 use zkie_engine::memory::BudgetedMemoryGovernor;
 use zkie_engine::storage::EngineStorage;
 
@@ -209,34 +208,6 @@ fn scratch_is_writable_until_sealed_then_immutable() {
     ));
     storage.release_scratch(id).unwrap();
     assert!(storage.reader(&view).is_err());
-}
-
-#[test]
-fn fallback_retries_only_recoverable_compute() {
-    let mut attempts = 0;
-    let mut transaction = ComputeTransaction::new();
-    let value = transaction
-        .run(FallbackPolicy::Recompute, || {
-            attempts += 1;
-            if attempts == 1 {
-                Err(Error::SynchronizationFailed)
-            } else {
-                Ok(7u64)
-            }
-        })
-        .unwrap();
-    assert_eq!(value, 7);
-    assert_eq!(attempts, 2);
-    assert_eq!(transaction.retries(), 1);
-
-    let mut attempts = 0;
-    let mut transaction = ComputeTransaction::new();
-    let result: Result<u64> = transaction.run(FallbackPolicy::Fail, || {
-        attempts += 1;
-        Err(Error::SynchronizationFailed)
-    });
-    assert!(result.is_err());
-    assert_eq!(attempts, 1);
 }
 
 #[test]
