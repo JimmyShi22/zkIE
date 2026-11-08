@@ -601,12 +601,34 @@ impl<'a> AssetView<'a> {
     }
 }
 
-fn materialize(
+enum Materialized<'a> {
+    Slice(&'a [i64]),
+    Owned(Rc<Vec<i64>>),
+}
+
+impl Materialized<'_> {
+    fn as_slice(&self) -> &[i64] {
+        match self {
+            Self::Slice(values) => values,
+            Self::Owned(values) => values.as_slice(),
+        }
+    }
+}
+
+impl std::ops::Deref for Materialized<'_> {
+    type Target = [i64];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+fn materialize<'a>(
     source: &PlanSource,
-    verified_outputs: &[Vec<Vec<i64>>],
+    verified_outputs: &'a [Vec<Vec<i64>>],
     assets: &AssetView<'_>,
     tokens: &[u32],
-) -> Result<Rc<Vec<i64>>> {
+) -> Result<Materialized<'a>> {
     match source {
         PlanSource::Prev {
             step,
@@ -617,17 +639,25 @@ fn materialize(
                 .get(*step)
                 .and_then(|outputs| outputs.get(*output))
                 .ok_or(Error::InvalidIndex)?;
-            Ok(Rc::new(layout.apply(values)?))
+            if matches!(layout, PlanLayout::Flat) {
+                Ok(Materialized::Slice(values))
+            } else {
+                Ok(Materialized::Owned(Rc::new(layout.apply(values)?)))
+            }
         }
-        PlanSource::Asset { path, layout } => assets.source_values(path, layout),
-        PlanSource::Constant(constant) => Ok(Rc::new(constant.materialize(tokens)?)),
+        PlanSource::Asset { path, layout } => {
+            Ok(Materialized::Owned(assets.source_values(path, layout)?))
+        }
+        PlanSource::Constant(constant) => Ok(Materialized::Owned(Rc::new(
+            constant.materialize(tokens)?,
+        ))),
         PlanSource::Concat(parts) => {
             let mut out = Vec::new();
             for part in parts {
                 let part = materialize(part, verified_outputs, assets, tokens)?;
                 out.extend_from_slice(&part);
             }
-            Ok(Rc::new(out))
+            Ok(Materialized::Owned(Rc::new(out)))
         }
         PlanSource::HeadConcat { parts, rows } => {
             if *rows == 0 || parts.is_empty() {
@@ -648,11 +678,14 @@ fn materialize(
                     out.extend_from_slice(&part[row * head_dim..(row + 1) * head_dim]);
                 }
             }
-            Ok(Rc::new(out))
+            Ok(Materialized::Owned(Rc::new(out)))
         }
         PlanSource::Layout(inner, layout) => {
+            if matches!(layout, PlanLayout::Flat) {
+                return materialize(inner, verified_outputs, assets, tokens);
+            }
             let values = materialize(inner, verified_outputs, assets, tokens)?;
-            Ok(Rc::new(layout.apply(&values)?))
+            Ok(Materialized::Owned(Rc::new(layout.apply(&values)?)))
         }
     }
 }
