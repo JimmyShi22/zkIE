@@ -19,4 +19,4 @@
 .venv
 
 # large test artifacts stay on disk, textual traces are committed
-runs/**/*.bin
+docs/benchmarks/**/*.bin

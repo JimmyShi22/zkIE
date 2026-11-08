@@ -28,7 +28,8 @@ crates/zkie-ops/    operators and proofs: op/registry, pipeline, proof/*, live o
 models/{gpt2,gemma3,timesfm}/  config + executor + executor_smoke (weights always external)
 tools/              zkie-bench, zkie-check
 scripts/            data pipeline (extraction / simulation / GT), not the proof path
-docs/               spec / benchmarks / roadmap / overview (current implementation only)
+docs/               benchmarks.md; spec / roadmap are TODO placeholders;
+                     docs/benchmarks/ test trace archive (iteration tree)
 ```
 
 ## Build and test methods
@@ -49,7 +50,7 @@ docs/               spec / benchmarks / roadmap / overview (current implementati
   human summary (operator share ranking); same measurement basis as matrix; all
   three thread tiers must produce numbers, to locate serial bottlenecks.
 - Test trace archive (iteration tree, mandatory, committed): every test/bench run
-  creates a directory under `runs/` at the repository root:
+  creates a directory under `docs/benchmarks/`:
   `<YYYYMMDD-HHMM>-<scheme>-<current-short-commit>-<previous-short-commit>/`
   The directory must contain, committed to git:
   - `NOTES.md`: scheme name, which change and which scheme/baseline (previous
