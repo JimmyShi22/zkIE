@@ -1,0 +1,15 @@
+policy_version = 1
+model = "gemma3"
+model_version = 1
+
+[[case]]
+case_id = "gemma3-seq16"
+sequence_length = 16
+anchor_id = "567b30e6712444a9060b5a13d0f011faf50406e15babb6b51a5bd45844d645d3"
+model_id = "39b607c9f6156a8df155ca1a97e1fa70f0adf74730cc670ec67b5c8fd6410e34"
+
+[[case]]
+case_id = "gemma3-seq512"
+sequence_length = 512
+anchor_id = "fef99a167d1d31b80c4f8baf1ee746be18d279f7113c4e77e015bff1fa623216"
+model_id = "d5114631bccfb6e029cfeb1ad2c7b2a65d8a23827551f69424b07f87cbe332ec"

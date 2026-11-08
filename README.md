@@ -189,6 +189,28 @@ cargo run --release -p zkie-check -- report --input <run-dir> --require-profile 
   sizes are **TBD** (to be measured); no performance figures are recorded in
   this document.
 
+### Anchor registration
+
+`zkie anchor` registers a case input and the model asset set on the operator
+side:
+
+```bash
+cargo run --release -p zkie -- anchor \
+  --case <case.toml> \
+  --input <input.bin> \
+  --asset-root <asset-root> \
+  [--out <anchor.json>]
+```
+
+It selects the case entry whose declared input path matches `--input`,
+validates the input shape, reads every asset through the trusted model
+specifications, rebuilds the complete commitment with the commit algorithm and
+prints `anchor_id`, `model_id`, `parameters_digest`, the specification
+version and audit counters. It never reads a proof bundle. The printed
+identities are what the operator fixes into `case.policy`; a policy is
+trusted only when the registration is performed and attested outside the
+prover's bundle.
+
 ### Verification policy
 
 `verify`, `run` and `matrix` read the policy from a file fixed by the

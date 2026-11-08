@@ -1,0 +1,15 @@
+policy_version = 1
+model = "gpt2"
+model_version = 1
+
+[[case]]
+case_id = "gpt2-seq16"
+sequence_length = 16
+anchor_id = "dd08df8bcbba41adea6182709e00adb2f897fde4abc241d1ba09c552fd77ae36"
+model_id = "c2971c0179463bf12aecaefc3488417228008c1314e6905c49a55078242c1268"
+
+[[case]]
+case_id = "gpt2-seq512"
+sequence_length = 512
+anchor_id = "79091b77db16312ae9d9bc4fdb5d2de93fd87caba4be1158e5de303aa660477d"
+model_id = "6d35b05739f33e2d2c969f55fafd79c22a96d2264683a4d9a63ecb842438d271"
