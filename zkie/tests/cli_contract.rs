@@ -149,6 +149,9 @@ impl PipelineProvider for TestProvider {
         Ok(VerifyReceipt {
             accepted: true,
             outcome: RunOutcome::Passed,
+            output_binding: None,
+            authenticated_output: None,
+            authenticated_output_digest: None,
         })
     }
 }

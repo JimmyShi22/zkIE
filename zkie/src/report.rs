@@ -22,6 +22,9 @@ pub struct RunReport {
     pub progress_path: Option<PathBuf>,
     pub last_event_seq: Option<u64>,
     pub last_completed_stage: Option<String>,
+    pub output_binding: Option<String>,
+    pub authenticated_output_digest: Option<String>,
+    pub authenticated_output_elements: Option<u64>,
 }
 
 impl RunReport {
@@ -39,6 +42,9 @@ impl RunReport {
             progress_path: None,
             last_event_seq: None,
             last_completed_stage: None,
+            output_binding: None,
+            authenticated_output_digest: None,
+            authenticated_output_elements: None,
         }
     }
 
@@ -55,6 +61,9 @@ impl RunReport {
             "progress_path": self.progress_path.as_ref().map(|path| path.to_string_lossy().into_owned()),
             "last_event_seq": self.last_event_seq,
             "last_completed_stage": self.last_completed_stage,
+            "output_binding": self.output_binding,
+            "authenticated_output_digest": self.authenticated_output_digest,
+            "authenticated_output_elements": self.authenticated_output_elements,
         })
         .to_string()
     }

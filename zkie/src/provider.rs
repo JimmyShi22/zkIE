@@ -20,8 +20,8 @@ use zkie_models_gemma3::executor as gemma3;
 use zkie_models_gpt2::executor as gpt2;
 use zkie_models_timesfm::executor as timesfm;
 use zkie_ops::pipeline::{
-    CommitReceipt, CommitRequest, PipelineContext, PipelineProvider, ProofReceipt, ProveRequest,
-    VerifyReceipt, VerifyRequest,
+    CommitReceipt, CommitRequest, OutputBindingMode, PipelineContext, PipelineProvider,
+    ProofReceipt, ProveRequest, VerifyReceipt, VerifyRequest,
 };
 use zkie_ops::proof::model_commitment::{
     verify_model_anchor, verify_shared_trace, verify_shared_trace_output,
@@ -398,7 +398,7 @@ impl PipelineProvider for ProductionProvider {
             return Err(Error::StatementMismatch);
         }
 
-        let accepted = match trusted.model.as_str() {
+        let (bound, statement_matches) = match trusted.model.as_str() {
             "gpt2" => {
                 if trusted.model_version != zkie_models_gpt2::plan::MODEL_VERSION {
                     return Err(Error::InvalidConfig);
@@ -418,9 +418,19 @@ impl PipelineProvider for ProductionProvider {
                 )?;
                 let argmax =
                     verify_shared_trace(&public, &trace, &statement.tokens, &plan)?;
-                let expected: Vec<u32> =
-                    bincode::deserialize(&public_inputs).map_err(|_| Error::InvalidEncoding)?;
-                argmax == expected && expected == statement.expected_argmax
+                let computed: Vec<i64> = argmax.iter().map(|value| *value as i64).collect();
+                let bound = crate::output::bind(
+                    &trusted.output,
+                    &computed,
+                    Some(zkie_models_gpt2::plan::valid_vocab()),
+                    &public_inputs,
+                )?;
+                let statement_matches = statement
+                    .expected_argmax
+                    .iter()
+                    .map(|value| *value as i64)
+                    .eq(computed.iter().copied());
+                (bound, statement_matches)
             }
             "gemma3" => {
                 if trusted.model_version != zkie_models_gemma3::plan::MODEL_VERSION {
@@ -441,9 +451,19 @@ impl PipelineProvider for ProductionProvider {
                 )?;
                 let argmax =
                     verify_shared_trace(&public, &trace, &statement.tokens, &plan)?;
-                let expected: Vec<u32> =
-                    bincode::deserialize(&public_inputs).map_err(|_| Error::InvalidEncoding)?;
-                argmax == expected && expected == statement.expected_argmax
+                let computed: Vec<i64> = argmax.iter().map(|value| *value as i64).collect();
+                let bound = crate::output::bind(
+                    &trusted.output,
+                    &computed,
+                    Some(zkie_models_gemma3::plan::valid_vocab()),
+                    &public_inputs,
+                )?;
+                let statement_matches = statement
+                    .expected_argmax
+                    .iter()
+                    .map(|value| *value as i64)
+                    .eq(computed.iter().copied());
+                (bound, statement_matches)
             }
             "timesfm" => {
                 let patches = trusted
@@ -471,34 +491,48 @@ impl PipelineProvider for ProductionProvider {
                     &statement.tokens,
                     &plan,
                 )?;
-                let expected: Vec<i32> =
-                    bincode::deserialize(&public_inputs).map_err(|_| Error::InvalidEncoding)?;
-                let matched = output.len() == expected.len()
-                    && output
-                        .iter()
-                        .zip(&expected)
-                        .all(|(value, wanted)| *value as i32 == *wanted);
-                matched && expected == statement.expected_output
+                if output.len() != zkie_models_timesfm::plan::output_elements(patches)? {
+                    return Err(Error::ShapeMismatch);
+                }
+                let bound = crate::output::bind(
+                    &trusted.output,
+                    &output,
+                    None,
+                    &public_inputs,
+                )?;
+                let statement_matches = statement
+                    .expected_output
+                    .iter()
+                    .map(|value| *value as i64)
+                    .eq(output.iter().copied());
+                (bound, statement_matches)
             }
             _ => return Err(Error::UnsupportedPrimitive),
         };
 
-        if !accepted {
-            return Ok(VerifyReceipt {
-                accepted: false,
-                outcome: RunOutcome::Rejected,
-            });
+        let accepted = bound.accepted && statement_matches;
+        if accepted {
+            let step_units = trace.steps.len() as u64;
+            let mut progress_event =
+                ProgressEvent::new("verify", "verify", ProgressKind::WorkAdvanced);
+            progress_event.completed_units = step_units;
+            progress_event.total_units = Some(step_units);
+            progress_event.unit = Some("relation_steps".into());
+            let _ = ctx.progress.emit(progress_event);
         }
-        let step_units = trace.steps.len() as u64;
-        let mut progress_event =
-            ProgressEvent::new("verify", "verify", ProgressKind::WorkAdvanced);
-        progress_event.completed_units = step_units;
-        progress_event.total_units = Some(step_units);
-        progress_event.unit = Some("relation_steps".into());
-        let _ = ctx.progress.emit(progress_event);
         Ok(VerifyReceipt {
-            accepted: true,
-            outcome: RunOutcome::Passed,
+            accepted,
+            outcome: if accepted {
+                RunOutcome::Passed
+            } else {
+                RunOutcome::Rejected
+            },
+            output_binding: Some(match bound.mode {
+                crate::policy::OutputMode::Expected => OutputBindingMode::Expected,
+                crate::policy::OutputMode::None => OutputBindingMode::None,
+            }),
+            authenticated_output: Some(bound.values),
+            authenticated_output_digest: Some(bound.digest),
         })
     }
 }

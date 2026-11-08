@@ -2,6 +2,7 @@
 
 pub mod anchor;
 pub mod commit;
+pub mod output;
 pub mod provider;
 pub mod progress;
 pub mod policy;

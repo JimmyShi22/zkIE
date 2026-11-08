@@ -3,16 +3,17 @@
 //! The parser rejects private-directory and weight flags: verification only
 //! receives public material.
 
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use zkie_core::artifact::digest_from_hex;
+use zkie_core::artifact::{digest_from_hex, digest_to_hex};
 use zkie_core::error::Result;
 use zkie_core::progress::RunOutcome;
 use zkie_engine::context::{Metrics, RuntimeConfig};
 use zkie_ops::pipeline::{
-    self, PipelineProvider, PipelineServices, VerifyReceipt, VerifyRequest,
+    self, OutputBindingMode, PipelineProvider, PipelineServices, VerifyReceipt, VerifyRequest,
 };
 
 use crate::progress::{HeartbeatGuard, JsonlProgressSink};
@@ -93,6 +94,33 @@ pub fn run(args: &[String], provider: &dyn PipelineProvider) -> Result<VerifyRec
             report
         }
     };
+    if let Ok(receipt) = &result {
+        report.output_binding = receipt.output_binding.map(|mode| {
+            match mode {
+                OutputBindingMode::Expected => "expected",
+                OutputBindingMode::None => "none",
+            }
+            .to_owned()
+        });
+        report.authenticated_output_digest = receipt
+            .authenticated_output_digest
+            .as_ref()
+            .map(digest_to_hex);
+        report.authenticated_output_elements = receipt
+            .authenticated_output
+            .as_ref()
+            .map(|values| values.len() as u64);
+        if receipt.accepted {
+            if let Some(values) = &receipt.authenticated_output {
+                if let Ok(canonical) = crate::output::canonical_i32le(values) {
+                    let _ = fs::write(
+                        request.run_dir.join("authenticated-output-i32le.bin"),
+                        canonical,
+                    );
+                }
+            }
+        }
+    }
     let _ = progress.run_finished(
         "verify",
         report.outcome,

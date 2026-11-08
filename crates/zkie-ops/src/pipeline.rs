@@ -126,10 +126,18 @@ pub struct ProofReceipt {
     pub test_only: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputBindingMode {
+    Expected,
+    None,
+}
+
 pub struct VerifyReceipt {
     pub accepted: bool,
     pub outcome: RunOutcome,
+    pub output_binding: Option<OutputBindingMode>,
+    pub authenticated_output: Option<Vec<i64>>,
+    pub authenticated_output_digest: Option<Digest>,
 }
 
 pub struct PipelineContext<'a> {

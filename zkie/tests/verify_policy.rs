@@ -94,7 +94,7 @@ fn verify_code(root: &Path, public_dir: &Path, policy: &Path, model_id: &str) ->
 
 fn token_policy(sequence: usize, anchor: &Digest, model_id: &Digest) -> String {
     format!(
-        "policy_version = 1\nmodel = \"gpt2\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"gpt2-seq16\"\nsequence_length = {sequence}\nanchor_id = \"{}\"\nmodel_id = \"{}\"\n",
+        "policy_version = 1\nmodel = \"gpt2\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"gpt2-seq16\"\nsequence_length = {sequence}\nanchor_id = \"{}\"\nmodel_id = \"{}\"\noutput_mode = \"none\"\n",
         digest_to_hex(anchor),
         digest_to_hex(model_id)
     )
@@ -136,7 +136,7 @@ fn malformed_policy_exits_nonzero() {
 fn unknown_model_exits_nonzero() {
     let root = temp_dir();
     let policy = format!(
-        "policy_version = 1\nmodel = \"unknown\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"case\"\nsequence_length = 1\nanchor_id = \"{}\"\nmodel_id = \"{}\"\n",
+        "policy_version = 1\nmodel = \"unknown\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"case\"\nsequence_length = 1\nanchor_id = \"{}\"\nmodel_id = \"{}\"\noutput_mode = \"none\"\n",
         "22".repeat(32),
         "11".repeat(32)
     );
@@ -157,7 +157,7 @@ fn unknown_model_exits_nonzero() {
 fn ambiguous_case_exits_nonzero() {
     let root = temp_dir();
     let policy = format!(
-        "policy_version = 1\nmodel = \"gpt2\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"case\"\nsequence_length = 1\nanchor_id = \"{}\"\nmodel_id = \"{}\"\n\n[[case]]\ncase_id = \"case\"\nsequence_length = 1\nanchor_id = \"{}\"\nmodel_id = \"{}\"\n",
+        "policy_version = 1\nmodel = \"gpt2\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"case\"\nsequence_length = 1\nanchor_id = \"{}\"\nmodel_id = \"{}\"\noutput_mode = \"none\"\n\n[[case]]\ncase_id = \"case\"\nsequence_length = 1\nanchor_id = \"{}\"\nmodel_id = \"{}\"\noutput_mode = \"none\"\n",
         "22".repeat(32),
         "11".repeat(32),
         "22".repeat(32),

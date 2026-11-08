@@ -32,6 +32,41 @@ pub struct PolicyCase {
     pub patch_tokens: Option<usize>,
     pub anchor_id: String,
     pub model_id: String,
+    pub output_mode: String,
+    pub expected_output_sha256: Option<String>,
+    pub output_digest_algorithm: Option<String>,
+    pub output_type: Option<String>,
+    pub output_encoding: Option<String>,
+    pub output_elements: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputMode {
+    Expected,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputKind {
+    Argmax,
+    IntOutput,
+}
+
+impl OutputKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Argmax => "argmax",
+            Self::IntOutput => "int_output",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputExpectation {
+    pub mode: OutputMode,
+    pub kind: OutputKind,
+    pub sha256: Option<Digest>,
+    pub elements: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,6 +79,61 @@ pub struct TrustedRequest {
     pub patch_tokens: Option<usize>,
     pub anchor_id: Digest,
     pub model_id: Digest,
+    pub output: OutputExpectation,
+}
+
+fn select_output(
+    case: &PolicyCase,
+    kind: OutputKind,
+    sequence: Option<usize>,
+) -> Result<OutputExpectation> {
+    match case.output_mode.as_str() {
+        "none" => {
+            if case.expected_output_sha256.is_some()
+                || case.output_digest_algorithm.is_some()
+                || case.output_type.is_some()
+                || case.output_encoding.is_some()
+                || case.output_elements.is_some()
+            {
+                return Err(Error::InvalidConfig);
+            }
+            Ok(OutputExpectation {
+                mode: OutputMode::None,
+                kind,
+                sha256: None,
+                elements: None,
+            })
+        }
+        "expected" => {
+            let sha256 = digest_from_hex(
+                case.expected_output_sha256
+                    .as_deref()
+                    .ok_or(Error::InvalidConfig)?,
+            )?;
+            if case.output_digest_algorithm.as_deref() != Some("sha256")
+                || case.output_encoding.as_deref() != Some("i32-le")
+                || case.output_type.as_deref() != Some(kind.name())
+            {
+                return Err(Error::InvalidConfig);
+            }
+            let elements = case.output_elements.ok_or(Error::InvalidConfig)?;
+            if elements == 0 {
+                return Err(Error::InvalidConfig);
+            }
+            if let Some(sequence) = sequence {
+                if elements != sequence {
+                    return Err(Error::InvalidConfig);
+                }
+            }
+            Ok(OutputExpectation {
+                mode: OutputMode::Expected,
+                kind,
+                sha256: Some(sha256),
+                elements: Some(elements),
+            })
+        }
+        _ => Err(Error::InvalidConfig),
+    }
 }
 
 pub fn parse(bytes: &[u8]) -> Result<PolicyDocument> {
@@ -89,6 +179,7 @@ pub fn select(
             if sequence == 0 || sequence > TOKEN_MAX_SEQUENCE || sequence != input_len {
                 return Err(Error::StatementMismatch);
             }
+            let output = select_output(case, OutputKind::Argmax, Some(sequence))?;
             Ok(TrustedRequest {
                 model: document.model.clone(),
                 model_version: document.model_version,
@@ -98,6 +189,7 @@ pub fn select(
                 patch_tokens: None,
                 anchor_id: digest_from_hex(&case.anchor_id)?,
                 model_id: digest_from_hex(&case.model_id)?,
+                output,
             })
         }
         "timesfm" => {
@@ -112,6 +204,7 @@ pub fn select(
             {
                 return Err(Error::StatementMismatch);
             }
+            let output = select_output(case, OutputKind::IntOutput, None)?;
             Ok(TrustedRequest {
                 model: document.model.clone(),
                 model_version: document.model_version,
@@ -121,6 +214,7 @@ pub fn select(
                 patch_tokens: Some(patches),
                 anchor_id: digest_from_hex(&case.anchor_id)?,
                 model_id: digest_from_hex(&case.model_id)?,
+                output,
             })
         }
         _ => Err(Error::UnsupportedPrimitive),
@@ -133,10 +227,11 @@ mod tests {
 
     const A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const C: &str = "3333333333333333333333333333333333333333333333333333333333333333";
 
     fn token_policy() -> String {
         format!(
-            "policy_version = 1\nmodel = \"gpt2\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"gpt2-seq16\"\nsequence_length = 16\nanchor_id = \"{A}\"\nmodel_id = \"{B}\"\n\n[[case]]\ncase_id = \"gpt2-seq512\"\nsequence_length = 512\nanchor_id = \"{A}\"\nmodel_id = \"{B}\"\n"
+            "policy_version = 1\nmodel = \"gpt2\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"gpt2-seq16\"\nsequence_length = 16\nanchor_id = \"{A}\"\nmodel_id = \"{B}\"\noutput_mode = \"none\"\n\n[[case]]\ncase_id = \"gpt2-seq512\"\nsequence_length = 512\nanchor_id = \"{A}\"\nmodel_id = \"{B}\"\noutput_mode = \"none\"\n"
         )
     }
 
@@ -152,7 +247,7 @@ mod tests {
     #[test]
     fn parses_and_selects_timesfm_case() {
         let text = format!(
-            "policy_version = 1\nmodel = \"timesfm\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"timesfm-16patch\"\nraw_input_length = 512\npatch_tokens = 16\nanchor_id = \"{A}\"\nmodel_id = \"{B}\"\n"
+            "policy_version = 1\nmodel = \"timesfm\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"timesfm-16patch\"\nraw_input_length = 512\npatch_tokens = 16\nanchor_id = \"{A}\"\nmodel_id = \"{B}\"\noutput_mode = \"none\"\n"
         );
         let document = parse(text.as_bytes()).unwrap();
         let selected = select(&document, "timesfm-16patch", "timesfm", 512).unwrap();
@@ -181,7 +276,7 @@ mod tests {
             Err(Error::UnsupportedVersion)
         );
         let text = format!(
-            "policy_version = 1\nmodel = \"gpt2\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"gpt2-seq16\"\nsequence_length = 16\nanchor_id = \"aa\"\nmodel_id = \"{B}\"\n"
+            "policy_version = 1\nmodel = \"gpt2\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"gpt2-seq16\"\nsequence_length = 16\nanchor_id = \"aa\"\nmodel_id = \"{B}\"\noutput_mode = \"none\"\n"
         );
         assert!(parse(text.as_bytes()).is_ok());
         let document = parse(text.as_bytes()).unwrap();
@@ -193,5 +288,34 @@ mod tests {
         let duplicate = token_policy().replace("gpt2-seq512", "gpt2-seq16");
         let document = parse(duplicate.as_bytes()).unwrap();
         assert!(select(&document, "gpt2-seq16", "gpt2", 16).is_err());
+    }
+
+    #[test]
+    fn selects_expected_output_mode_and_rejects_partial_declarations() {
+        let text = format!(
+            "policy_version = 1\nmodel = \"gpt2\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"gpt2-seq16\"\nsequence_length = 16\nanchor_id = \"{A}\"\nmodel_id = \"{B}\"\noutput_mode = \"expected\"\nexpected_output_sha256 = \"{C}\"\noutput_digest_algorithm = \"sha256\"\noutput_type = \"argmax\"\noutput_encoding = \"i32-le\"\noutput_elements = 16\n"
+        );
+        let document = parse(text.as_bytes()).unwrap();
+        let selected = select(&document, "gpt2-seq16", "gpt2", 16).unwrap();
+        assert_eq!(selected.output.mode, OutputMode::Expected);
+        assert_eq!(selected.output.kind, OutputKind::Argmax);
+        assert_eq!(selected.output.elements, Some(16));
+        assert_eq!(selected.output.sha256.unwrap().0, [0x33; 32]);
+
+        for broken in [
+            text.replace("output_type = \"argmax\"", "output_type = \"int_output\""),
+            text.replace("output_encoding = \"i32-le\"", "output_encoding = \"i64-le\""),
+            text.replace("output_elements = 16", "output_elements = 15"),
+            text.replace("expected_output_sha256 = \"3333333333333333333333333333333333333333333333333333333333333333\"\n", ""),
+        ] {
+            let document = parse(broken.as_bytes()).unwrap();
+            assert!(select(&document, "gpt2-seq16", "gpt2", 16).is_err());
+        }
+
+        let none = token_policy();
+        let document = parse(none.as_bytes()).unwrap();
+        let selected = select(&document, "gpt2-seq16", "gpt2", 16).unwrap();
+        assert_eq!(selected.output.mode, OutputMode::None);
+        assert!(selected.output.sha256.is_none());
     }
 }

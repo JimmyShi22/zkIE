@@ -227,17 +227,28 @@ case_id = "gpt2-seq16"
 sequence_length = 16
 anchor_id = "<32-byte hex>"
 model_id = "<32-byte hex>"
+output_mode = "expected"
+expected_output_sha256 = "<32-byte hex>"
+output_digest_algorithm = "sha256"
+output_type = "argmax"
+output_encoding = "i32-le"
+output_elements = 16
 ```
 
 For the time-series model, replace `sequence_length` with
-`raw_input_length = 512` and `patch_tokens = 16`. `anchor_id` and
-`model_id` are the trusted anchor identity and input-bound model identity;
-both are checked against the commitment and against the input commitment
-recomputed from the statement tokens. `run` and `matrix` copy the policy into
-the run directory and record its path, SHA-256 and registration time in
-`policy-source.json`; they never fill expected values or identities from the
-pending bundle. `matrix` expects its policy next to the case file as
-`case.policy`.
+`raw_input_length = 512`, `patch_tokens = 16` and `output_type` with
+`int_output`. `anchor_id` and `model_id` are the trusted anchor identity and
+input-bound model identity; both are checked against the commitment and
+against the input commitment recomputed from the statement tokens.
+`expected_output_sha256` is the registered output file digest; verification
+compares the full canonical output bytes with it. To run a policy without an
+expected output, set `output_mode = "none"` and omit the output digest, type,
+encoding, algorithm and element fields; verification then returns the
+authenticated computed output without claiming a user expectation. `run` and
+`matrix` copy the policy into the run directory and record its path, SHA-256 and
+registration time in `policy-source.json`; they never fill expected values or
+identities from the pending bundle. `matrix` expects its policy next to the
+case file as `case.policy`.
 
 ## License
 
