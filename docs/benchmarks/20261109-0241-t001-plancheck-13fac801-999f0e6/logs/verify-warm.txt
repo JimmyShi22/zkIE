@@ -1,0 +1,26 @@
+WARM gpt2-seq16 run-1 EXIT 0 WALL_SEC 48
+{"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":12,"outcome":"PASS","progress_path":"/data/t001-measure/warm/gpt2-seq16/run-1/progress.jsonl","proof_bytes":null,"protocol_wall_ms":47560,"run_id":"verify","stage_wall_ms":47560,"vmhwm_kib":5934516}
+WARM gpt2-seq16 run-2 EXIT 0 WALL_SEC 44
+{"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":11,"outcome":"PASS","progress_path":"/data/t001-measure/warm/gpt2-seq16/run-2/progress.jsonl","proof_bytes":null,"protocol_wall_ms":43512,"run_id":"verify","stage_wall_ms":43512,"vmhwm_kib":5897848}
+WARM gpt2-seq16 run-3 EXIT 0 WALL_SEC 43
+{"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":11,"outcome":"PASS","progress_path":"/data/t001-measure/warm/gpt2-seq16/run-3/progress.jsonl","proof_bytes":null,"protocol_wall_ms":43199,"run_id":"verify","stage_wall_ms":43199,"vmhwm_kib":5917464}
+WARM timesfm-16patch run-1 EXIT 0 WALL_SEC 85
+{"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":20,"outcome":"PASS","progress_path":"/data/t001-measure/warm/timesfm-16patch/run-1/progress.jsonl","proof_bytes":null,"protocol_wall_ms":85110,"run_id":"verify","stage_wall_ms":85110,"vmhwm_kib":7387768}
+WARM timesfm-16patch run-2 EXIT 0 WALL_SEC 85
+{"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":19,"outcome":"PASS","progress_path":"/data/t001-measure/warm/timesfm-16patch/run-2/progress.jsonl","proof_bytes":null,"protocol_wall_ms":84723,"run_id":"verify","stage_wall_ms":84723,"vmhwm_kib":7407564}
+WARM timesfm-16patch run-3 EXIT 0 WALL_SEC 86
+{"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":20,"outcome":"PASS","progress_path":"/data/t001-measure/warm/timesfm-16patch/run-3/progress.jsonl","proof_bytes":null,"protocol_wall_ms":85157,"run_id":"verify","stage_wall_ms":85157,"vmhwm_kib":7386468}
+WARM gemma3-seq16 run-1 EXIT 0 WALL_SEC 88
+{"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":20,"outcome":"PASS","progress_path":"/data/t001-measure/warm/gemma3-seq16/run-1/progress.jsonl","proof_bytes":null,"protocol_wall_ms":88428,"run_id":"verify","stage_wall_ms":88428,"vmhwm_kib":15277072}
+WARM gemma3-seq16 run-2 EXIT 0 WALL_SEC 80
+{"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":18,"outcome":"PASS","progress_path":"/data/t001-measure/warm/gemma3-seq16/run-2/progress.jsonl","proof_bytes":null,"protocol_wall_ms":79597,"run_id":"verify","stage_wall_ms":79597,"vmhwm_kib":15275608}
+WARM gemma3-seq16 run-3 EXIT 0 WALL_SEC 80
+{"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":18,"outcome":"PASS","progress_path":"/data/t001-measure/warm/gemma3-seq16/run-3/progress.jsonl","proof_bytes":null,"protocol_wall_ms":79873,"run_id":"verify","stage_wall_ms":79873,"vmhwm_kib":15275928}
+WARM gpt2-seq512 run-1 EXIT 0 WALL_SEC 272
+{"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":57,"outcome":"PASS","progress_path":"/data/t001-measure/warm/gpt2-seq512/run-1/progress.jsonl","proof_bytes":null,"protocol_wall_ms":270976,"run_id":"verify","stage_wall_ms":270976,"vmhwm_kib":47018956}
+WARM gpt2-seq512 run-2 EXIT 0 WALL_SEC 239
+{"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":50,"outcome":"PASS","progress_path":"/data/t001-measure/warm/gpt2-seq512/run-2/progress.jsonl","proof_bytes":null,"protocol_wall_ms":238536,"run_id":"verify","stage_wall_ms":238536,"vmhwm_kib":47019532}
+WARM gpt2-seq512 run-3 EXIT 0 WALL_SEC 239
+{"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":50,"outcome":"PASS","progress_path":"/data/t001-measure/warm/gpt2-seq512/run-3/progress.jsonl","proof_bytes":null,"protocol_wall_ms":238182,"run_id":"verify","stage_wall_ms":238182,"vmhwm_kib":47016624}
+WARM gemma3-seq512 run-1 EXIT 0 WALL_SEC 881
+{"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":178,"outcome":"PASS","progress_path":"/data/t001-measure/warm/gemma3-seq512/run-1/progress.jsonl","proof_bytes":null,"protocol_wall_ms":878432,"run_id":"verify","stage_wall_ms":878432,"vmhwm_kib":120678156}

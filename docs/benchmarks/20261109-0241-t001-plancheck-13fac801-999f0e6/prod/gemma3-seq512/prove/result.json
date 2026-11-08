@@ -1,0 +1,1 @@
+{"command":"prove","error_code":null,"last_completed_stage":"prove","last_event_seq":111,"outcome":"PASS","progress_path":"docs/benchmarks/20261109-0241-t001-plancheck-68f795a2-999f0e6/prod/gemma3-seq512/prove/progress.jsonl","proof_bytes":101812159615,"protocol_wall_ms":422783,"run_id":"prove","stage_wall_ms":422783,"vmhwm_kib":207845808}

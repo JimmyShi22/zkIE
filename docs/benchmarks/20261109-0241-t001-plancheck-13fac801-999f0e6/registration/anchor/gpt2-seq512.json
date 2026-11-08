@@ -1,0 +1,15 @@
+{
+  "anchor_id": "79091b77db16312ae9d9bc4fdb5d2de93fd87caba4be1158e5de303aa660477d",
+  "assets_checked": 199,
+  "case_id": "gpt2-seq512",
+  "command": "anchor",
+  "input_elements": 512,
+  "model": "gpt2",
+  "model_id": "6d35b05739f33e2d2c969f55fafd79c22a96d2264683a4d9a63ecb842438d271",
+  "model_version": 1,
+  "parameters_digest": "f2b58e543a1794671afa6c2759c2452ea5182b503faf3e87c97cfdfe589ccd98",
+  "registered_at_unix": 1794166758,
+  "schema": 1,
+  "sequence_length": 512,
+  "spec_version": 1
+}

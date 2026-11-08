@@ -1,0 +1,1 @@
+{"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":11,"outcome":"PASS","progress_path":"/data/t001-measure/warm/gpt2-seq16/run-3/progress.jsonl","proof_bytes":null,"protocol_wall_ms":43199,"run_id":"verify","stage_wall_ms":43199,"vmhwm_kib":5917464}

@@ -1,0 +1,1 @@
+{"command":"prove","error_code":null,"last_completed_stage":"prove","last_event_seq":77,"outcome":"PASS","progress_path":"docs/benchmarks/20261109-0241-t001-plancheck-68f795a2-999f0e6/prove-gpt2-seq16-run/progress.jsonl","proof_bytes":4161786553,"protocol_wall_ms":22500,"run_id":"prove","stage_wall_ms":22500,"vmhwm_kib":8316060}

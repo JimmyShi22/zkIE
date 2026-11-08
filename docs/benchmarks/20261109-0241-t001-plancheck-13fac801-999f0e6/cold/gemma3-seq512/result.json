@@ -1,0 +1,1 @@
+{"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":177,"outcome":"PASS","progress_path":"/data/t001-measure/runs/gemma3-seq512/progress.jsonl","proof_bytes":null,"protocol_wall_ms":874699,"run_id":"verify","stage_wall_ms":874699,"vmhwm_kib":120658004}

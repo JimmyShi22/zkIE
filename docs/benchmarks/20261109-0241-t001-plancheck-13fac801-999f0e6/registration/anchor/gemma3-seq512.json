@@ -1,0 +1,15 @@
+{
+  "anchor_id": "fef99a167d1d31b80c4f8baf1ee746be18d279f7113c4e77e015bff1fa623216",
+  "assets_checked": 245,
+  "case_id": "gemma3-seq512",
+  "command": "anchor",
+  "input_elements": 512,
+  "model": "gemma3",
+  "model_id": "d5114631bccfb6e029cfeb1ad2c7b2a65d8a23827551f69424b07f87cbe332ec",
+  "model_version": 1,
+  "parameters_digest": "b3e33f41a4089131a6357e6ceb0ec6013409e45247f70a16a916a6ab7bae4ef5",
+  "registered_at_unix": 1794166777,
+  "schema": 1,
+  "sequence_length": 512,
+  "spec_version": 1
+}
