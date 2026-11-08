@@ -1,0 +1,1 @@
+{"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":49,"outcome":"PASS","progress_path":"/tmp/v2smoke512/verify/progress.jsonl","proof_bytes":null,"protocol_wall_ms":230146,"run_id":"verify","stage_wall_ms":230146,"vmhwm_kib":47018064}

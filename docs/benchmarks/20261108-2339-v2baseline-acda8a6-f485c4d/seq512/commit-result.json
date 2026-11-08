@@ -1,0 +1,1 @@
+{"command":"commit","error_code":null,"last_completed_stage":"commit","last_event_seq":3,"outcome":"PASS","progress_path":"/tmp/v2smoke512/commit-run/progress.jsonl","proof_bytes":null,"protocol_wall_ms":3348,"run_id":"commit","stage_wall_ms":3348,"vmhwm_kib":356032}
