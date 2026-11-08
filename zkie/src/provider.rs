@@ -24,7 +24,8 @@ use zkie_ops::pipeline::{
     VerifyReceipt, VerifyRequest,
 };
 use zkie_ops::proof::model_commitment::{
-    verify_shared_trace, verify_shared_trace_output, ModelCommitmentPublic, SharedTrace,
+    verify_model_anchor, verify_shared_trace, verify_shared_trace_output,
+    ModelCommitmentPublic, SharedTrace,
 };
 
 const PROTOCOL_ID: Digest = Digest([0xA1; 32]);
@@ -366,46 +367,127 @@ impl PipelineProvider for ProductionProvider {
         request: &VerifyRequest,
         ctx: &mut PipelineContext<'_>,
     ) -> Result<VerifyReceipt> {
+        let policy_bytes =
+            fs::read(&request.expected_policy).map_err(|_| Error::IncompleteArtifact)?;
+        let policy = crate::policy::parse(&policy_bytes)?;
         let commitment_bytes = fs::read(request.public_bundle_dir.join("model-commitment.bin"))
             .map_err(|_| Error::IncompleteArtifact)?;
         let public: ModelCommitmentPublic =
             bincode::deserialize(&commitment_bytes).map_err(|_| Error::InvalidEncoding)?;
-        if public.anchor.model_commitment != request.expected_model_id {
-            return Err(Error::StatementMismatch);
-        }
         let statement_bytes = fs::read(&request.statement).map_err(|_| Error::IncompleteArtifact)?;
         let statement: StatementData =
             bincode::deserialize(&statement_bytes).map_err(|_| Error::InvalidEncoding)?;
-        if statement.model_commitment != request.expected_model_id {
-            return Err(Error::StatementMismatch);
-        }
         let proof_file =
             fs::File::open(&request.proof).map_err(|_| Error::IncompleteArtifact)?;
         let trace: SharedTrace = bincode::deserialize_from(std::io::BufReader::new(proof_file))
             .map_err(|_| Error::InvalidEncoding)?;
-        let public_inputs = fs::read(&request.public_inputs).map_err(|_| Error::IncompleteArtifact)?;
-        if statement.model == "timesfm" {
-            let expected: Vec<i32> =
-                bincode::deserialize(&public_inputs).map_err(|_| Error::InvalidEncoding)?;
-            let output = verify_shared_trace_output(&public, &trace, &statement.tokens)?;
-            let matched = output.len() == expected.len()
-                && output.iter().zip(&expected).all(|(value, wanted)| *value as i32 == *wanted);
-            if !matched || expected != statement.expected_output {
-                return Ok(VerifyReceipt {
-                    accepted: false,
-                    outcome: RunOutcome::Rejected,
-                });
+        let public_inputs =
+            fs::read(&request.public_inputs).map_err(|_| Error::IncompleteArtifact)?;
+
+        let trusted = crate::policy::select(
+            &policy,
+            &statement.case_id,
+            &statement.model,
+            statement.tokens.len(),
+        )?;
+        let model_id = trusted.model_id;
+        if request.expected_model_id != model_id
+            || statement.model_commitment != model_id
+            || public.anchor.model_commitment != model_id
+        {
+            return Err(Error::StatementMismatch);
+        }
+
+        let accepted = match trusted.model.as_str() {
+            "gpt2" => {
+                if trusted.model_version != zkie_models_gpt2::plan::MODEL_VERSION {
+                    return Err(Error::InvalidConfig);
+                }
+                let plan = zkie_models_gpt2::plan::trace_plan(statement.tokens.len())?;
+                if zkie_models_gpt2::plan::model_commitment(&statement.tokens)? != model_id {
+                    return Err(Error::StatementMismatch);
+                }
+                let parameters = zkie_models_gpt2::plan::parameters_digest()?;
+                let specs = zkie_models_gpt2::plan::asset_specs();
+                verify_model_anchor(
+                    &public,
+                    trusted.anchor_id,
+                    model_id,
+                    parameters,
+                    &specs,
+                )?;
+                let argmax =
+                    verify_shared_trace(&public, &trace, &statement.tokens, &plan)?;
+                let expected: Vec<u32> =
+                    bincode::deserialize(&public_inputs).map_err(|_| Error::InvalidEncoding)?;
+                argmax == expected && expected == statement.expected_argmax
             }
-        } else {
-            let expected: Vec<u32> =
-                bincode::deserialize(&public_inputs).map_err(|_| Error::InvalidEncoding)?;
-            let argmax = verify_shared_trace(&public, &trace, &statement.tokens)?;
-            if argmax != expected || expected != statement.expected_argmax {
-                return Ok(VerifyReceipt {
-                    accepted: false,
-                    outcome: RunOutcome::Rejected,
-                });
+            "gemma3" => {
+                if trusted.model_version != zkie_models_gemma3::plan::MODEL_VERSION {
+                    return Err(Error::InvalidConfig);
+                }
+                let plan = zkie_models_gemma3::plan::trace_plan(statement.tokens.len())?;
+                if zkie_models_gemma3::plan::model_commitment(&statement.tokens)? != model_id {
+                    return Err(Error::StatementMismatch);
+                }
+                let parameters = zkie_models_gemma3::plan::parameters_digest()?;
+                let specs = zkie_models_gemma3::plan::asset_specs();
+                verify_model_anchor(
+                    &public,
+                    trusted.anchor_id,
+                    model_id,
+                    parameters,
+                    &specs,
+                )?;
+                let argmax =
+                    verify_shared_trace(&public, &trace, &statement.tokens, &plan)?;
+                let expected: Vec<u32> =
+                    bincode::deserialize(&public_inputs).map_err(|_| Error::InvalidEncoding)?;
+                argmax == expected && expected == statement.expected_argmax
             }
+            "timesfm" => {
+                let patches = trusted
+                    .patch_tokens
+                    .ok_or(Error::InvalidConfig)?;
+                if trusted.model_version != zkie_models_timesfm::plan::MODEL_VERSION {
+                    return Err(Error::InvalidConfig);
+                }
+                let plan = zkie_models_timesfm::plan::trace_plan(patches)?;
+                if zkie_models_timesfm::plan::model_commitment(&statement.tokens)? != model_id {
+                    return Err(Error::StatementMismatch);
+                }
+                let parameters = zkie_models_timesfm::plan::parameters_digest()?;
+                let specs = zkie_models_timesfm::plan::asset_specs();
+                verify_model_anchor(
+                    &public,
+                    trusted.anchor_id,
+                    model_id,
+                    parameters,
+                    &specs,
+                )?;
+                let output = verify_shared_trace_output(
+                    &public,
+                    &trace,
+                    &statement.tokens,
+                    &plan,
+                )?;
+                let expected: Vec<i32> =
+                    bincode::deserialize(&public_inputs).map_err(|_| Error::InvalidEncoding)?;
+                let matched = output.len() == expected.len()
+                    && output
+                        .iter()
+                        .zip(&expected)
+                        .all(|(value, wanted)| *value as i32 == *wanted);
+                matched && expected == statement.expected_output
+            }
+            _ => return Err(Error::UnsupportedPrimitive),
+        };
+
+        if !accepted {
+            return Ok(VerifyReceipt {
+                accepted: false,
+                outcome: RunOutcome::Rejected,
+            });
         }
         let step_units = trace.steps.len() as u64;
         let mut progress_event =

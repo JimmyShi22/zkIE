@@ -5,7 +5,7 @@
 //! steps reference the same opening instead of re-committing the asset.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -18,7 +18,7 @@ use zkie_engine::compute::cpu::{merkle_build, merkle_verify, MerkleTree};
 use zkie_engine::memory::BudgetedMemoryGovernor;
 use zkie_engine::storage::mmap::MmapTensorReader;
 use zkie_engine::pcs::request::link::{
-    make_anchor, prove_link, verify_link, Anchor, AnchorRecord, LeafRecord, LinkProof,
+    anchor_id, make_anchor, prove_link, verify_link, Anchor, AnchorRecord, LeafRecord, LinkProof,
 };
 use zkie_engine::primitives::transcript::{hash_labeled, tag_word, STATEMENT};
 
@@ -631,8 +631,9 @@ pub fn verify_shared_trace(
     public: &ModelCommitmentPublic,
     trace: &SharedTrace,
     expected_tokens: &[u32],
+    plan: &crate::proof::plan::TracePlan,
 ) -> Result<Vec<u32>> {
-    verify_shared_trace_steps(public, trace, expected_tokens)?;
+    verify_shared_trace_steps(public, trace, expected_tokens, plan)?;
     Ok(trace.argmax.clone())
 }
 
@@ -642,8 +643,9 @@ pub fn verify_shared_trace_output(
     public: &ModelCommitmentPublic,
     trace: &SharedTrace,
     expected_tokens: &[u32],
+    plan: &crate::proof::plan::TracePlan,
 ) -> Result<Vec<i64>> {
-    let outputs = verify_shared_trace_steps(public, trace, expected_tokens)?;
+    let outputs = verify_shared_trace_steps(public, trace, expected_tokens, plan)?;
     if trace.output.is_empty() {
         return Err(Error::StatementMismatch);
     }
@@ -662,6 +664,7 @@ fn verify_shared_trace_steps(
     public: &ModelCommitmentPublic,
     trace: &SharedTrace,
     expected_tokens: &[u32],
+    plan: &crate::proof::plan::TracePlan,
 ) -> Result<Vec<Vec<Vec<i64>>>> {
     if trace.tokens != expected_tokens {
         return Err(Error::StatementMismatch);
@@ -672,17 +675,9 @@ fn verify_shared_trace_steps(
     trace
         .assets
         .par_iter()
-        .enumerate()
-        .try_for_each(|(asset_index, opening)| {
-            public.verify_opening(opening).map_err(|error| {
-                eprintln!(
-                    "asset opening {} id {} err {:?}",
-                    asset_index, opening.asset_id, error
-                );
-                error
-            })
-        })?;
+        .try_for_each(|opening| public.verify_opening(opening))?;
     let mut outputs: Vec<Vec<Vec<i64>>> = Vec::with_capacity(trace.steps.len());
+    let assets = crate::proof::plan::AssetView::new(public, trace);
     for (step_index, step) in trace.steps.iter().enumerate() {
         let mut registry = crate::proof::binding::OracleRegistry::new();
         for (root, start, count) in &step.message.roots {
@@ -738,7 +733,7 @@ fn verify_shared_trace_steps(
             &step.message.proof,
             &step.message.config,
             &external_values,
-        ).map_err(|error| { eprintln!("shared step {} op {} err {:?} ex {:?} lens {:?}", step_index, step.message.opcode, error, step.external, step.message.proof.lengths.inputs); error })?;
+        )?;
         let inputs = crate::proof::relations::proof_input_values(&step.message.proof);
         for (index, source) in step.sources.iter().enumerate() {
             if let Some((step_index, output_index)) = source {
@@ -747,12 +742,106 @@ fn verify_shared_trace_steps(
                     .and_then(|values| values.get(*output_index))
                     .ok_or(Error::StatementMismatch)?;
                 if inputs.get(index) != Some(expected) {
-                    eprintln!("edge mismatch step {} op {} input {} source {:?} own_len {:?} exp_len {}", step_index, step.message.opcode, index, source, inputs.get(index).map(Vec::len), expected.len());
                     return Err(Error::StatementMismatch);
                 }
             }
         }
+        let plan_step = plan
+            .steps
+            .get(step_index)
+            .ok_or(Error::StatementMismatch)?;
+        crate::proof::plan::verify_step(
+            step,
+            plan_step,
+            &outputs,
+            &assets,
+            expected_tokens,
+        )?;
         outputs.push(crate::proof::relations::proof_output_values(&step.message.proof));
     }
+    crate::proof::plan::verify_outputs(trace, plan, &outputs, &assets)?;
     Ok(outputs)
+}
+
+/// Trusted table identity for a model asset specification.
+pub fn asset_table_identity(spec: &ModelAssetSpec) -> Digest {
+    table_identity(spec)
+}
+
+/// Padded row count implied by a trusted asset specification.
+pub fn expected_asset_rows(spec: &ModelAssetSpec) -> Result<u64> {
+    if spec.row_width == 0 || spec.element_count == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let actual = spec.element_count.div_ceil(spec.row_width as u64);
+    Ok(actual.max(1).next_power_of_two())
+}
+
+/// Verifies the public bundle against a trusted model specification set and a
+/// trusted anchor identity. The full asset set, table identities, leaf roots and
+/// registry root are rebuilt from the trusted specifications, then the anchor
+/// identity is recomputed.
+pub fn verify_model_anchor(
+    public: &ModelCommitmentPublic,
+    expected_anchor_id: Digest,
+    expected_model_commitment: Digest,
+    expected_parameters_digest: Digest,
+    specs: &[ModelAssetSpec],
+) -> Result<()> {
+    let anchor = &public.anchor;
+    if anchor.anchor_id != expected_anchor_id
+        || anchor.model_commitment != expected_model_commitment
+        || anchor.parameters_digest != expected_parameters_digest
+        || anchor.leaf_count != specs.len() as u64
+        || public.assets.len() != specs.len()
+    {
+        return Err(Error::StatementMismatch);
+    }
+    if anchor_id(anchor)? != expected_anchor_id {
+        return Err(Error::StatementMismatch);
+    }
+
+    let mut paths = BTreeSet::new();
+    let mut asset_ids = BTreeSet::new();
+    let mut leaf_ids = BTreeSet::new();
+    let mut records = Vec::with_capacity(specs.len());
+    for (position, spec) in specs.iter().enumerate() {
+        if !paths.insert(spec.path.clone()) || !asset_ids.insert(spec.asset_id) {
+            return Err(Error::StatementMismatch);
+        }
+        let meta = public
+            .assets
+            .iter()
+            .find(|asset| asset.path == spec.path)
+            .ok_or(Error::AssetMismatch)?;
+        let identity = asset_table_identity(spec);
+        let expected_root = oracle_start(&identity);
+        if meta.asset_id != spec.asset_id
+            || meta.element_count != spec.element_count
+            || meta.row_width != spec.row_width
+            || meta.rows != expected_asset_rows(spec)?
+            || meta.start != expected_root
+            || meta.root != meta.leaf_record.leaf_root
+            || meta.leaf_record.generation != 0
+            || meta.leaf_record.leaf_id != position as u64
+            || meta.leaf_record.table_identity != identity
+        {
+            return Err(Error::StatementMismatch);
+        }
+        if !leaf_ids.insert(meta.leaf_record.leaf_id) {
+            return Err(Error::StatementMismatch);
+        }
+        records.push(meta.leaf_record.clone());
+    }
+
+    let rebuilt = make_anchor(anchor.model_commitment, anchor.parameters_digest, &records)?;
+    if rebuilt.record.anchor_id != anchor.anchor_id
+        || rebuilt.record.registry_root != anchor.registry_root
+        || rebuilt.record.leaf_count != anchor.leaf_count
+        || rebuilt.record.model_commitment != anchor.model_commitment
+        || rebuilt.record.parameters_digest != anchor.parameters_digest
+    {
+        return Err(Error::StatementMismatch);
+    }
+    Ok(())
 }

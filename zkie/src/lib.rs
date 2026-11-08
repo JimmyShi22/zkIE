@@ -3,6 +3,7 @@
 pub mod commit;
 pub mod provider;
 pub mod progress;
+pub mod policy;
 pub mod profile;
 pub mod prove;
 pub mod report;
@@ -20,7 +21,14 @@ pub fn run_cli(args: Vec<String>) -> i32 {
     match command {
         "commit" => exit_code(commit::run(rest, &production_provider())),
         "prove" => exit_code(prove::run(rest, &production_provider())),
-        "verify" => exit_code(verify::run(rest, &production_provider())),
+        "verify" => match verify::run(rest, &production_provider()) {
+            Ok(receipt) if receipt.accepted => 0,
+            Ok(_) => 1,
+            Err(error) => {
+                eprintln!("{error}");
+                2
+            }
+        },
         "matrix" => match run::matrix(rest) {
             Ok(_) => 0,
             Err(error) => { eprintln!("{error}"); 2 }
