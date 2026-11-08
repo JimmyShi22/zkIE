@@ -1,5 +1,2177 @@
 {
   "anchor_id": "359e03b223eed95bd9078049954c172909e0ce5d6c7f7a2c96e67c539c1d35b2",
+  "asset_baseline": "self-built change-detection baseline; not verified against externally published model material; model authorization policy pending",
+  "asset_sha256": [
+    {
+      "asset_id": 0,
+      "bytes": 33554432,
+      "element_count": 8388608,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L0_qkv_w_i32.bin",
+      "row_width": 4096,
+      "sha256": "bc346d8dd1e145a547b664bfcbe9a16f6faf00b7c674428f1ef6d5c063d19ede"
+    },
+    {
+      "asset_id": 1,
+      "bytes": 15360,
+      "element_count": 3840,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L0_qkv_b_i32.bin",
+      "row_width": 3840,
+      "sha256": "2e98364927d47d9a5a2d40f3609a560731c453f87117b6b94c1ffb62807032ee"
+    },
+    {
+      "asset_id": 2,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L0_o_proj_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "d4d799977aae457753c2e6e5b94cdfa22f505899729d9c2db548cc97762327db"
+    },
+    {
+      "asset_id": 3,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L0_o_proj_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "26490062eb016ccd652432dd2530bc50d46fb4163af06a8bae1d5b76ec5ce727"
+    },
+    {
+      "asset_id": 4,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L0_gate_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "20eef7087bd9dd908c05e91e92ba213ffafb100dce287f13a8ead43cae1937a5"
+    },
+    {
+      "asset_id": 5,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L0_gate_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "41121fccb022e3a02a1c1a51affabf9ae7f672c5c1b10ac4f330844187a0da09"
+    },
+    {
+      "asset_id": 6,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L0_down_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "a7cf8bba2e757eb6fcf55ebf5086e99765279b14a84935c501d643943446d533"
+    },
+    {
+      "asset_id": 7,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L0_down_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "8971e726a35889a69da83b6e93ee72fc7247d57a3821647801cf937b97d93ed3"
+    },
+    {
+      "asset_id": 8,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L0_lnw_i32.bin",
+      "row_width": 2048,
+      "sha256": "102cc15ded6a4447c381dc8a317f8a0e9b94a57e518aca7af16cab82bc731d28"
+    },
+    {
+      "asset_id": 9,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L0_mlp_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "2ab7d9ba0264d02f30731c65a9f4240225557ad3aec1ac4da9206da42951c4fe"
+    },
+    {
+      "asset_id": 10,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L0_mlp_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "3f3ac667ee627cd00a8ae9a22be16dcd94c8ba7e63a4007d372ed7678b7c8bf6"
+    },
+    {
+      "asset_id": 11,
+      "bytes": 33554432,
+      "element_count": 8388608,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L1_qkv_w_i32.bin",
+      "row_width": 4096,
+      "sha256": "4206880e2c869fe6647c17d55b1a08be597f3486265fd2a6ee56c516d5ba3445"
+    },
+    {
+      "asset_id": 12,
+      "bytes": 15360,
+      "element_count": 3840,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L1_qkv_b_i32.bin",
+      "row_width": 3840,
+      "sha256": "9ffcf8be84b04bec25b552a23224d9bda98c1e62781eab704e0ac6674ecb069e"
+    },
+    {
+      "asset_id": 13,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L1_o_proj_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "78787cfbecc92453d2f94d407bd262d88fd493332f592d5993dbd31baa2972fe"
+    },
+    {
+      "asset_id": 14,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L1_o_proj_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "7d9d7cef6d8f043083025b774670d736e5a741727ebbeb0f4c42177eac41c577"
+    },
+    {
+      "asset_id": 15,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L1_gate_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "a0c2a85d8547e4eb5e13911822a0008beb300a200ffa180c8172f54d4a68c953"
+    },
+    {
+      "asset_id": 16,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L1_gate_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "8cd6d48b28844252bab0e41b020cd7bce859d50a203e1a21b8f1a127a9a2d147"
+    },
+    {
+      "asset_id": 17,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L1_down_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "2e9bcd2a3f15c4e9f74fb3302354d0834f97fe80defffdb4fec0c63fa8580626"
+    },
+    {
+      "asset_id": 18,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L1_down_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "e1489721660c91ee7204b55f17dd98bb6d3ec097d0f3dcef4c250968ba487799"
+    },
+    {
+      "asset_id": 19,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L1_lnw_i32.bin",
+      "row_width": 2048,
+      "sha256": "8717c29371359b2fac9d7a23d6aa818b17d9f2d6248261016eba7992eb6fc212"
+    },
+    {
+      "asset_id": 20,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L1_mlp_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "a6893e45c88d041c2964346891abb2ea719a83966df8fb897bcecadaaebadb75"
+    },
+    {
+      "asset_id": 21,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L1_mlp_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "bd20aff2e66d76150493c9e5879cb26044ac6d75a94c97502e6a7b9f33b1724a"
+    },
+    {
+      "asset_id": 22,
+      "bytes": 33554432,
+      "element_count": 8388608,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L2_qkv_w_i32.bin",
+      "row_width": 4096,
+      "sha256": "d155931eaa4b5a388f99fa34c18299f55429529e2958a36223becdff9d6d64b3"
+    },
+    {
+      "asset_id": 23,
+      "bytes": 15360,
+      "element_count": 3840,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L2_qkv_b_i32.bin",
+      "row_width": 3840,
+      "sha256": "d4cc8b0fe54837e836542cf14bc4c4afe927e27497a7357cdd926201b2f6e606"
+    },
+    {
+      "asset_id": 24,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L2_o_proj_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "4b07ad945475c0150b6b0c36bc4c31a211517ee68a4a515210626f4698f0469b"
+    },
+    {
+      "asset_id": 25,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L2_o_proj_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "c5589eaec733c1a2e66804ccbeb4204edccc01638c56299d70bb489772fe81e0"
+    },
+    {
+      "asset_id": 26,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L2_gate_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "16f8ec538b3ae7801b6cf6a6707aa707d4ec0218e54cd8b4c1099ea4258fe90c"
+    },
+    {
+      "asset_id": 27,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L2_gate_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "dce62622052e550f01e79295ac7f9862ee9251bc565ccfa6bfbbbf2ff86a96b1"
+    },
+    {
+      "asset_id": 28,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L2_down_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "489f0f85d1732820e30b27183e92693ca342dc3568edcd9c248cf44d7614a116"
+    },
+    {
+      "asset_id": 29,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L2_down_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "eaab2ce3ea61cc02bade46b7ceaaf82b0bbdb2670a991c6de890fb38fae25f0d"
+    },
+    {
+      "asset_id": 30,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L2_lnw_i32.bin",
+      "row_width": 2048,
+      "sha256": "11c9c1c48647cc4cd11cdbed89b041906bd61acb448d08c7ade687e11f04e360"
+    },
+    {
+      "asset_id": 31,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L2_mlp_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "32ef48f7909340a2ad2ad2bd5b37f4580a77ad64b8d16cc97d01a6c012a60e1f"
+    },
+    {
+      "asset_id": 32,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L2_mlp_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "30642e34110e9106043d1eaf684b2aabb3e967d2c099d07d18bdb1262877db28"
+    },
+    {
+      "asset_id": 33,
+      "bytes": 33554432,
+      "element_count": 8388608,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L3_qkv_w_i32.bin",
+      "row_width": 4096,
+      "sha256": "e77726e2e4dcfab0930aaaac5278f4e7b76aa59670522777e83f0f275b9b1ac1"
+    },
+    {
+      "asset_id": 34,
+      "bytes": 15360,
+      "element_count": 3840,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L3_qkv_b_i32.bin",
+      "row_width": 3840,
+      "sha256": "f9842da9ec2bb6f159fb7f51e7e23c0448de2f55066c2a143c42d840a3f402eb"
+    },
+    {
+      "asset_id": 35,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L3_o_proj_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "7eb62cf170a72ece7f62ff4a8295d2f4e43b27fa0272946d6804d56bc25a7fc0"
+    },
+    {
+      "asset_id": 36,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L3_o_proj_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "4199a03835e01eb048e7874e9fdffadbe1a63602862c31cc2b15d60bbd595626"
+    },
+    {
+      "asset_id": 37,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L3_gate_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "f692f3f9ceee1f57385af0ed2ff3f2f9229d5ed44346e813035fd23ca50e671b"
+    },
+    {
+      "asset_id": 38,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L3_gate_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "c32b569e0586104ef02feb3664b9786f2a8b6a31638a5750515ed7c0863ecd55"
+    },
+    {
+      "asset_id": 39,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L3_down_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "12397f1e1f55a84217154fea1d7e783a5f7c21b162da2a99241dad1865665047"
+    },
+    {
+      "asset_id": 40,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L3_down_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "a8fcdda2607395d76eed0aea39ff7a9572cc9d2a0e78b5e741802343f9ce4bae"
+    },
+    {
+      "asset_id": 41,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L3_lnw_i32.bin",
+      "row_width": 2048,
+      "sha256": "3da45aad057e01ce860e3857f49d0e9534310ba1b6a4f882767cc9c16c966830"
+    },
+    {
+      "asset_id": 42,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L3_mlp_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "99092a7e811fa1e6cba443bdc03f775c311e00aba682d2d09d4896436015aa96"
+    },
+    {
+      "asset_id": 43,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L3_mlp_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "934182696e057a68a63e37c095974c2757ae13c20247b8d04177746782d8cf77"
+    },
+    {
+      "asset_id": 44,
+      "bytes": 33554432,
+      "element_count": 8388608,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L4_qkv_w_i32.bin",
+      "row_width": 4096,
+      "sha256": "c6133f224335a71a9c1b87143bc792d0ee4507f835580357e33f3c33788d6b74"
+    },
+    {
+      "asset_id": 45,
+      "bytes": 15360,
+      "element_count": 3840,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L4_qkv_b_i32.bin",
+      "row_width": 3840,
+      "sha256": "33815061d63f8622ba6358138b6835d6d6665a095b3e6ff99f6d1cd3c8108521"
+    },
+    {
+      "asset_id": 46,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L4_o_proj_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "2ac34a60f6dbc46e0dba7c514a3de09e8b7923c56c8db93dd154f50f2172677a"
+    },
+    {
+      "asset_id": 47,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L4_o_proj_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "99e3bb694260479bd6fafec23de39a1658435537207a6d2edbc66bb3ba2013cc"
+    },
+    {
+      "asset_id": 48,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L4_gate_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "d4c309aeb5916c912d65f0f603587b9d2ccf97ae2874a754dc8db03250151cb3"
+    },
+    {
+      "asset_id": 49,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L4_gate_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "b81b072d9b50992d6df68c3a5c57449b5e18f4e26546307980a29a5fd03a4830"
+    },
+    {
+      "asset_id": 50,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L4_down_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "97e674fb0ac77757b4baa33f214cedc356e1d8fb6786c44a56625109a712d710"
+    },
+    {
+      "asset_id": 51,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L4_down_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "61cf491c1c016f7a90a6aaf15f0d99077f37ca71e740a2fcb8ffe35fd1f559e5"
+    },
+    {
+      "asset_id": 52,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L4_lnw_i32.bin",
+      "row_width": 2048,
+      "sha256": "17032a3a28ecba171e6375d3d0b5ac6e2462f30576796db17219a897f9e05edc"
+    },
+    {
+      "asset_id": 53,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L4_mlp_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "05a910fe5035cdb3bdc89e0c4a2878dedab057e30a68e4d77f6965d02e3164be"
+    },
+    {
+      "asset_id": 54,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L4_mlp_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "4edc0da65976d6cad4741c71bc44df71ea6694553b9d8088ed751a101094969c"
+    },
+    {
+      "asset_id": 55,
+      "bytes": 33554432,
+      "element_count": 8388608,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L5_qkv_w_i32.bin",
+      "row_width": 4096,
+      "sha256": "343462b3782f656c3c9725b8bfd0c80ab9f1d3b88fa9c02b4d28c14bc6330a9c"
+    },
+    {
+      "asset_id": 56,
+      "bytes": 15360,
+      "element_count": 3840,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L5_qkv_b_i32.bin",
+      "row_width": 3840,
+      "sha256": "80ac7b0c96b20282df566b0cc693c4d3ae2f856cc81837629ffe6222753345c7"
+    },
+    {
+      "asset_id": 57,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L5_o_proj_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "87009b2a9d04118a5f6092bfc0b372db267009c399aaadcf7638a78afd37346e"
+    },
+    {
+      "asset_id": 58,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L5_o_proj_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "7d1bece00c674d91fc7b114832f4402388a999562e269909a673aadccc6e79be"
+    },
+    {
+      "asset_id": 59,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L5_gate_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "9e46261cd1895a6d5776ec253eacfa1f2e69ea7eb57fdd2510ec5cb035210db4"
+    },
+    {
+      "asset_id": 60,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L5_gate_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "59d3b7d5e55901a6e383e8afb2a8e99ae28226bef0603bc19c6b330a438d83a5"
+    },
+    {
+      "asset_id": 61,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L5_down_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "732b3c1e6aab2d1dfe75c1ffd032b76a84e137370c654334902c6dc19e7cc011"
+    },
+    {
+      "asset_id": 62,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L5_down_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "fe6139c5875299b7497743887134a36778d984053ce680fd4b3bcdffff1fed8f"
+    },
+    {
+      "asset_id": 63,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L5_lnw_i32.bin",
+      "row_width": 2048,
+      "sha256": "093a56a303c9ab65dc559368c468e22140f86b5f4d2dd774c670b04d64000246"
+    },
+    {
+      "asset_id": 64,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L5_mlp_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "950e06fcf07cea8fd0a505d0d9173ffaf9612ace6c485bcf650d8a036092b74b"
+    },
+    {
+      "asset_id": 65,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L5_mlp_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "6830ad41a5f5f972561ecb0461284c52dd05b9b94ec036a17f6c23b28c2ca96d"
+    },
+    {
+      "asset_id": 66,
+      "bytes": 33554432,
+      "element_count": 8388608,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L6_qkv_w_i32.bin",
+      "row_width": 4096,
+      "sha256": "a6d08ac384386bacc103d91e4142cb3b663d819e423187e7f7274fb5832a7058"
+    },
+    {
+      "asset_id": 67,
+      "bytes": 15360,
+      "element_count": 3840,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L6_qkv_b_i32.bin",
+      "row_width": 3840,
+      "sha256": "1033314241fdc42631d04f84156ab0921112ad1411ddb5864494625239820d4b"
+    },
+    {
+      "asset_id": 68,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L6_o_proj_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "eedfec67ecd3d64504a76904563dcff02f6a5bccd4b271e4211174585dd5aca3"
+    },
+    {
+      "asset_id": 69,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L6_o_proj_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "0d9c856729bdf78b870014f11b9a37f18cb0b1d7ba5b1c8ea2c85b65b8419230"
+    },
+    {
+      "asset_id": 70,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L6_gate_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "3d09785836192d9eaf433f106e6e9016d2f33856799bc7f4d3250017306b5181"
+    },
+    {
+      "asset_id": 71,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L6_gate_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "036ad8e8f3e192c554e1be2b0ff94ff28f76b417e5e3e39ff5ad1096a1f8dadf"
+    },
+    {
+      "asset_id": 72,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L6_down_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "9abf04cca9403550b36a2e73c74e836b5303385a08190dc96d1dd992db632dc7"
+    },
+    {
+      "asset_id": 73,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L6_down_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "d3a05ab6b5dc98e8ed420ef170041e90c7e95749f0883adf8d5717e85fd0fe7e"
+    },
+    {
+      "asset_id": 74,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L6_lnw_i32.bin",
+      "row_width": 2048,
+      "sha256": "f17619c4fdcc3a2cf827ac956ca0c439863b835b9409f89e22197c34e8fcdbf2"
+    },
+    {
+      "asset_id": 75,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L6_mlp_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "5c37dca0fa598f754e06082c207722fc0781b993743b0f174ae7785978c3e278"
+    },
+    {
+      "asset_id": 76,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L6_mlp_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "1053b4efe33bf9d4188ac09938eecf1953c27de265fe1eb8630d392076000098"
+    },
+    {
+      "asset_id": 77,
+      "bytes": 33554432,
+      "element_count": 8388608,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L7_qkv_w_i32.bin",
+      "row_width": 4096,
+      "sha256": "4d6608de0c2c9a274fe15ebca4a863e22b1c7c4d2de3a97e4ac33e7405b3ed61"
+    },
+    {
+      "asset_id": 78,
+      "bytes": 15360,
+      "element_count": 3840,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L7_qkv_b_i32.bin",
+      "row_width": 3840,
+      "sha256": "4893414f7f984397239f8dffad503b526efa5e0975e8fc71ae2829cc3ea329f8"
+    },
+    {
+      "asset_id": 79,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L7_o_proj_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "0c65ea851be2600cad05838870da604ad8dddc34718a996c3208cc6a51d25f32"
+    },
+    {
+      "asset_id": 80,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L7_o_proj_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "d4262bdb52c9f185adc77243b21d36cb243475452e7938a1bb7c8e9ab58a513c"
+    },
+    {
+      "asset_id": 81,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L7_gate_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "9925051d53d797326c9a1d2da9553917f3ecfa24aeca7fa7af0457ef6a27cd33"
+    },
+    {
+      "asset_id": 82,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L7_gate_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "fedb19ee4f24261e4d9e8625e51ac8cd533cdeef7c42fdff33709b2a9a5064d9"
+    },
+    {
+      "asset_id": 83,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L7_down_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "8ac306c21a98b000110973adcb05d7e535878fed8989edbb2af28634bbde18df"
+    },
+    {
+      "asset_id": 84,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L7_down_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "1f232b9208821737d3cade5cd27f4a334019b1c3481a3f41f6ba0008ce3f77d2"
+    },
+    {
+      "asset_id": 85,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L7_lnw_i32.bin",
+      "row_width": 2048,
+      "sha256": "99a50aa2aff16a6f0cfc7facdcede394612ae6fa36021de47015597f0d284b25"
+    },
+    {
+      "asset_id": 86,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L7_mlp_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "308f521d5a434837a107921293e08764a61026512147ff44b8d9ec56c061902d"
+    },
+    {
+      "asset_id": 87,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L7_mlp_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "b0f0cfc08b8b663d965c33a8e475c4f5871c56a989687389321892d914c50110"
+    },
+    {
+      "asset_id": 88,
+      "bytes": 33554432,
+      "element_count": 8388608,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L8_qkv_w_i32.bin",
+      "row_width": 4096,
+      "sha256": "eb66ba6096a291d4bc8c46a20cb720d6094fc7a4140e0da8a2db224b04a9b58f"
+    },
+    {
+      "asset_id": 89,
+      "bytes": 15360,
+      "element_count": 3840,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L8_qkv_b_i32.bin",
+      "row_width": 3840,
+      "sha256": "f8a1d8fd1a09b2bf66d714acd18a7849cde6c1ed9599b56a679eca72bf021600"
+    },
+    {
+      "asset_id": 90,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L8_o_proj_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "7a1f584e9ed5487973be1dac2e64ec4622e5f0596df4c40222a930fdd5eea0ee"
+    },
+    {
+      "asset_id": 91,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L8_o_proj_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "8fb659aa752b985882547950c55d7f657b5e0e7d4d8867c96be44f6e69e6785f"
+    },
+    {
+      "asset_id": 92,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L8_gate_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "cd59135fd5e1e50c1d9a8e55ef7266a006f5c14080ee51819da346bbf071fc99"
+    },
+    {
+      "asset_id": 93,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L8_gate_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "20325812d875d3100958e82448985a8350adf9395a4be8c3d40f617975bc4312"
+    },
+    {
+      "asset_id": 94,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L8_down_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "31c63febc819d9fa8c608b407cfa6b20dface72c5ca8431f9d8c33fe85823cec"
+    },
+    {
+      "asset_id": 95,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L8_down_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "b51e93ef0d5180621debe00d3ab7cc5d76275247a529d7c269729b9b8e32e23c"
+    },
+    {
+      "asset_id": 96,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L8_lnw_i32.bin",
+      "row_width": 2048,
+      "sha256": "23c02a42e58a1e66ff15bf87787a2fe7f9f25a5f9b29f8e8c0783a959a1634fd"
+    },
+    {
+      "asset_id": 97,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L8_mlp_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "d12d855fa64bcbaad4a1cbf02314f9da990dd05e150ef74d4e03910f7513c22d"
+    },
+    {
+      "asset_id": 98,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L8_mlp_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "9e62e732ce662074d33500a0cc9512e78d1d6ef47502bc09ba7ab8119f57419c"
+    },
+    {
+      "asset_id": 99,
+      "bytes": 33554432,
+      "element_count": 8388608,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L9_qkv_w_i32.bin",
+      "row_width": 4096,
+      "sha256": "c34a4f4ddd3efe22f934497f4fa865aa8273fc61c23060b6c8f843f069e3e220"
+    },
+    {
+      "asset_id": 100,
+      "bytes": 15360,
+      "element_count": 3840,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L9_qkv_b_i32.bin",
+      "row_width": 3840,
+      "sha256": "23efe11a5f85f30acadfd800822755155fe43d2cfde125e38ecfadd039777c39"
+    },
+    {
+      "asset_id": 101,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L9_o_proj_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "599973219e2609e004c882f990ebfbafcfd78db4c53cf8ad961eea9fb4c9b141"
+    },
+    {
+      "asset_id": 102,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L9_o_proj_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "c6d8e8d41613e506546ec1b332beae62b1ba715fd50bef26e26b0b77cfb46e36"
+    },
+    {
+      "asset_id": 103,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L9_gate_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "f3f702812638f08cee118071c7e65c89c2fb793644f0d229bb57547c10610322"
+    },
+    {
+      "asset_id": 104,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L9_gate_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "4ee09a15f93b9a423ee61e26e565366615b60507bb1675badb6c3485c592ad3c"
+    },
+    {
+      "asset_id": 105,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L9_down_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "786c9ee088b23a37531ae90778b98e63ac53b3cfc29e3a99aacc84d448568f6e"
+    },
+    {
+      "asset_id": 106,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L9_down_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "c1e4e77164bc1caf543c613b98574023623933dfc072efa3ea84b66026ed9751"
+    },
+    {
+      "asset_id": 107,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L9_lnw_i32.bin",
+      "row_width": 2048,
+      "sha256": "b107eeec0da958369a86fa91797da67aec8bc51af3b5eb89f2c59dad61f9ea3a"
+    },
+    {
+      "asset_id": 108,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L9_mlp_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "b080debcd937b7b5aaf37b2423ca3a34c517849b32e2bdc68e14ded3395c13af"
+    },
+    {
+      "asset_id": 109,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L9_mlp_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "81ba257fc8c744f89d0916a913742df5423a02d7dccbb0a2e94b48717c85df29"
+    },
+    {
+      "asset_id": 110,
+      "bytes": 33554432,
+      "element_count": 8388608,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L10_qkv_w_i32.bin",
+      "row_width": 4096,
+      "sha256": "07532f17495b4af45d835bbd3908df40c08e651c98263cdafdf736de8ccec81d"
+    },
+    {
+      "asset_id": 111,
+      "bytes": 15360,
+      "element_count": 3840,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L10_qkv_b_i32.bin",
+      "row_width": 3840,
+      "sha256": "bddce25a43ef0541cd1f5399f89479275894e019b406ccacf579a765f9a7f1a2"
+    },
+    {
+      "asset_id": 112,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L10_o_proj_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "87a4d0d2cd09b7cdeb5b4625e8d8d0d84b826fb33f0a810f8391aa95c106cea6"
+    },
+    {
+      "asset_id": 113,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L10_o_proj_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "c84f440606cd10f2404563cdd487b9ab63b230904f0803ee04390650a6e2275d"
+    },
+    {
+      "asset_id": 114,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L10_gate_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "5430e4021b049924baf3f9028958e35d0597d1159c2093fa468573d1f8ae42df"
+    },
+    {
+      "asset_id": 115,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L10_gate_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "d1602ba26ff5bbe85f195022d6602ae7d34ebe94abde8ea8dd075d8845461698"
+    },
+    {
+      "asset_id": 116,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L10_down_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "d4cbc6844bda1b4e3e91021ca830b1525c03a6224cab5e42665fb0b1944d7617"
+    },
+    {
+      "asset_id": 117,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L10_down_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "1235b18e6a04ce200c31846f37d647f71a11a0dbb031eb887c5947464c7e953e"
+    },
+    {
+      "asset_id": 118,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L10_lnw_i32.bin",
+      "row_width": 2048,
+      "sha256": "45963057f744cc78624f7af01ff38e56b46b6ef6a18c99cadfb55c1114469be9"
+    },
+    {
+      "asset_id": 119,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L10_mlp_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "1a675b60fe2e05321766c2bee5705412d476e670b22a6d01d96201a5102ecfb6"
+    },
+    {
+      "asset_id": 120,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L10_mlp_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "c6d094c284edad08a3a15f82df12c1e926b831f1860f712952bbde33d07c0de9"
+    },
+    {
+      "asset_id": 121,
+      "bytes": 33554432,
+      "element_count": 8388608,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L11_qkv_w_i32.bin",
+      "row_width": 4096,
+      "sha256": "84f1b90764a019b862f452a5b11de5b9e52215a7d881a0c93a81392154cfc43e"
+    },
+    {
+      "asset_id": 122,
+      "bytes": 15360,
+      "element_count": 3840,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L11_qkv_b_i32.bin",
+      "row_width": 3840,
+      "sha256": "90e24fa2efe9eb034e0c480fb30e2034319ad219de72d6bab25b188042a585e9"
+    },
+    {
+      "asset_id": 123,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L11_o_proj_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "742692c46f325c1e5774bb594fc5e67c12fd5ebadeb34ea0bbe7533bc1f1430b"
+    },
+    {
+      "asset_id": 124,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L11_o_proj_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "dcb7bee7ae0967d116c6f9b9294e9bc506cc42740dd43c8e266218eeab01867b"
+    },
+    {
+      "asset_id": 125,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L11_gate_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "431cbdbfb027e598c0ea71db8dbd294910c99eb7fcbd13e5af1fb6b9eb623063"
+    },
+    {
+      "asset_id": 126,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L11_gate_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "b53340eeb3b7774427a4361131dc94761c75192ee722a9a614646094c4233e3b"
+    },
+    {
+      "asset_id": 127,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L11_down_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "2752f9b2ee852661b98d1d20784a9b5976531ecd55daa5819aaf4c7f30519623"
+    },
+    {
+      "asset_id": 128,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L11_down_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "ea10ff1e9a77767229ed45f3a63a6641edf6219b0429e5afb48426483ff4c5ff"
+    },
+    {
+      "asset_id": 129,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L11_lnw_i32.bin",
+      "row_width": 2048,
+      "sha256": "ca5a17d33a548d524c11e36e815517e51d8d5fcdaa4a48e23902dddc72f99d2c"
+    },
+    {
+      "asset_id": 130,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L11_mlp_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "69395c40db4368d51f2209c9dd42f50345e8483c57e4412875816bac76ae1405"
+    },
+    {
+      "asset_id": 131,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L11_mlp_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "ade20ea03612c7e05b800037fce5bcecb5b4f7989c8a7b2202636c7ddebba95f"
+    },
+    {
+      "asset_id": 132,
+      "bytes": 33554432,
+      "element_count": 8388608,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L12_qkv_w_i32.bin",
+      "row_width": 4096,
+      "sha256": "2fbb2a57d67848ab5d8a34fbc359c5d9cce8ba4e5d5d85838c2f272a6d46d2cd"
+    },
+    {
+      "asset_id": 133,
+      "bytes": 15360,
+      "element_count": 3840,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L12_qkv_b_i32.bin",
+      "row_width": 3840,
+      "sha256": "e3c199d0fa82ea01a7445be3667f06bcdb98c10ce7d5f60456d53554623e43b9"
+    },
+    {
+      "asset_id": 134,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L12_o_proj_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "4dc09877fbae9a8740df12afc3bf3d9dc005cafc400355f5ab6072be5b6c55d1"
+    },
+    {
+      "asset_id": 135,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L12_o_proj_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "fbcc61377a472278b913e95e72c6c54ec1507158bb9e897089c2926cf12c3dc8"
+    },
+    {
+      "asset_id": 136,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L12_gate_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "e5e22f0bf0484ea1d9b4fff8ea0596cf2ebd78d2578df937ecc5b1b740696d94"
+    },
+    {
+      "asset_id": 137,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L12_gate_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "6f700552949102a85d79965c08699172dc1e43193c4973629db7d1dcf8ce2996"
+    },
+    {
+      "asset_id": 138,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L12_down_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "1c11a96f1d6b469b72542eb92b8fe6aba0894a8dee871bcc2570ad19626354b0"
+    },
+    {
+      "asset_id": 139,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L12_down_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "3b29875712b06e69de0096344f1a911f5581a7a9bc479e62e5f98c656ddd8806"
+    },
+    {
+      "asset_id": 140,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L12_lnw_i32.bin",
+      "row_width": 2048,
+      "sha256": "af4eeb79bb513b0e27e86d5aa40e96d31a7dc10256869cf9dcfdfe9758609032"
+    },
+    {
+      "asset_id": 141,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L12_mlp_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "2b19bb0a596ecbf9409cc98eda8aeafc9339efc4ae1249ad962f543813c8cd4b"
+    },
+    {
+      "asset_id": 142,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L12_mlp_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "963e699faaf734eb057cd2a043f0aef69996084aeb604461b1ac690b9cc61a82"
+    },
+    {
+      "asset_id": 143,
+      "bytes": 33554432,
+      "element_count": 8388608,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L13_qkv_w_i32.bin",
+      "row_width": 4096,
+      "sha256": "205fe74ea44ddf4c1dfcb1a138d9bd2f94b87dbb550b3c41bd83937bf770532f"
+    },
+    {
+      "asset_id": 144,
+      "bytes": 15360,
+      "element_count": 3840,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L13_qkv_b_i32.bin",
+      "row_width": 3840,
+      "sha256": "becb41884ec99865d01fa08807f0c3927c6e9056b0e78f96b0d94278c615ac0b"
+    },
+    {
+      "asset_id": 145,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L13_o_proj_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "49be2af367389eeb3becd2424b806564533ed99c7824dcf739d7c2d5a333cf6f"
+    },
+    {
+      "asset_id": 146,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L13_o_proj_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "3d29d30320d287c77325cdc75358d4167b0035a6aa18aff45036a8ff13a4efdb"
+    },
+    {
+      "asset_id": 147,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L13_gate_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "80a08a40e8ec7862f2acc71e8e755977b2282e29a8ab5d61298767b50639b60b"
+    },
+    {
+      "asset_id": 148,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L13_gate_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "f77f64276bde6dca4d19c140cd911e52ca477f1e2a71d7e2d48acea813f5e256"
+    },
+    {
+      "asset_id": 149,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L13_down_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "e62c2a65f4d2071a3c044e81d0ef32b52eca7792994c38a9b38fb311b10ea0d7"
+    },
+    {
+      "asset_id": 150,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L13_down_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "940cacf8c0f2c84bcb502f2aaaa4f8c3c70680c7812604a728c0a0930e2d4fe4"
+    },
+    {
+      "asset_id": 151,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L13_lnw_i32.bin",
+      "row_width": 2048,
+      "sha256": "0dae133f67730c771d5c0a67a67fa38acede2bbd5e777b2fc7fc7c911c94c296"
+    },
+    {
+      "asset_id": 152,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L13_mlp_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "009fd2809f4959e80b790f5a42e5c8e6a07b3266151b1ad5cb18302d95ef2d4c"
+    },
+    {
+      "asset_id": 153,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L13_mlp_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "c0abbcff46be511e74ee81f4258d4a4054b9bd919e4a499214d581370c64e1d2"
+    },
+    {
+      "asset_id": 154,
+      "bytes": 33554432,
+      "element_count": 8388608,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L14_qkv_w_i32.bin",
+      "row_width": 4096,
+      "sha256": "de059e4455ce463168aa2c4d1b0066ce135c23125b8ad95778f380d73079dae1"
+    },
+    {
+      "asset_id": 155,
+      "bytes": 15360,
+      "element_count": 3840,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L14_qkv_b_i32.bin",
+      "row_width": 3840,
+      "sha256": "23c5002a7259e114a03565b28ed6af965835afe7e86f9f2b0b883faa773d10ef"
+    },
+    {
+      "asset_id": 156,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L14_o_proj_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "ec1896d3d9e79e7439218096dd134c9ac32d9feee2bb5b63c9fa221212c18290"
+    },
+    {
+      "asset_id": 157,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L14_o_proj_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "5bd9290215470d9d7ff43df7d82f8847d9c98012d9a4a7f00346186e1563a61b"
+    },
+    {
+      "asset_id": 158,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L14_gate_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "3571af0a70d08a8004785169a2ce6768d89bc355569f71a94a289a7a8264b5b4"
+    },
+    {
+      "asset_id": 159,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L14_gate_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "1a5a4cca9e85a8663df6b5c50340c7d1332f157de8c6c394990d8942cec1e9a7"
+    },
+    {
+      "asset_id": 160,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L14_down_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "02901da1066ac3aeb82c5df3cb3c4df6a4c958e29f8cd0b423ed88608cf46f99"
+    },
+    {
+      "asset_id": 161,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L14_down_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "962ed6c352b7e4e1a856d1d03be6948e3a43f95180f7d147b7b18aa947c66a77"
+    },
+    {
+      "asset_id": 162,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L14_lnw_i32.bin",
+      "row_width": 2048,
+      "sha256": "fdcb98c9b10e1e44c7739404d6d7e74f9a7ee72d78723cf19a2218cd8257e2d7"
+    },
+    {
+      "asset_id": 163,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L14_mlp_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "e6f3fcad8f8b8d841bae8366b50808c2df572b35be5cd7396d7dd584dc797e90"
+    },
+    {
+      "asset_id": 164,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L14_mlp_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "3dc5ef3483ceedd7141be3e77a2815c6433c7bf56672caed6530ba8a567cffc5"
+    },
+    {
+      "asset_id": 165,
+      "bytes": 33554432,
+      "element_count": 8388608,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L15_qkv_w_i32.bin",
+      "row_width": 4096,
+      "sha256": "547847e8fa14b32569a5d66ce67ec27959ca22de25751f5e9c7f1c99f321c609"
+    },
+    {
+      "asset_id": 166,
+      "bytes": 15360,
+      "element_count": 3840,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L15_qkv_b_i32.bin",
+      "row_width": 3840,
+      "sha256": "1b3c52ec54bb5c0cb450896c8bad474e5b2b25e9cf3aa2b9c8a6b1afa0f48124"
+    },
+    {
+      "asset_id": 167,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L15_o_proj_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "1e745a1f0c3e8afd3cb402c8210f85151e863a93428fd15ecbcde00e3f3dd8e5"
+    },
+    {
+      "asset_id": 168,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L15_o_proj_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "053639d5a2e2fe68adabdbceb46ccccb3d528179c150147b46175c2a70d394ce"
+    },
+    {
+      "asset_id": 169,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L15_gate_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "f22b6af52de99f01b249e5860829af59a72fc991de04a6eea537dd645df030b7"
+    },
+    {
+      "asset_id": 170,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L15_gate_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "cc40ee11a181768985cda40d1c730f0fab075b14f8386eae32d0f583700ab41a"
+    },
+    {
+      "asset_id": 171,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L15_down_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "56f5581f48616aae793b680951c55aaa553cc525e3742f886b7c7e80c8b9f340"
+    },
+    {
+      "asset_id": 172,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L15_down_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "0051542efda914865aad06367dfa91a32b683834c7baddef24d656d0611f430b"
+    },
+    {
+      "asset_id": 173,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L15_lnw_i32.bin",
+      "row_width": 2048,
+      "sha256": "f0b106513e24272a07892ee9e10a91c71bfc59d1c73a748f2375add9775d4e29"
+    },
+    {
+      "asset_id": 174,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L15_mlp_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "1dbad03f75b71aee76aa07de628f2dd6dcdea4b0fdc8ebde3a5549b98d7c96ae"
+    },
+    {
+      "asset_id": 175,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L15_mlp_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "fbf12b02f73a778a454d457da6944bd10c8f2c518c2f968854fca892544bc923"
+    },
+    {
+      "asset_id": 176,
+      "bytes": 33554432,
+      "element_count": 8388608,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L16_qkv_w_i32.bin",
+      "row_width": 4096,
+      "sha256": "67626f2e281e725e5c6d4a3478c459cf29b8e83ed5700a9cb8205e74ced72bc8"
+    },
+    {
+      "asset_id": 177,
+      "bytes": 15360,
+      "element_count": 3840,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L16_qkv_b_i32.bin",
+      "row_width": 3840,
+      "sha256": "c3b7a1c0007b09da3cecee4a807aa403619e8aa2cdf62d25980bc44fa7d992ba"
+    },
+    {
+      "asset_id": 178,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L16_o_proj_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "9f3f058e9ba39095eea478a0d2562014a618ca68115df6745de254569f51ecdc"
+    },
+    {
+      "asset_id": 179,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L16_o_proj_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "9a413070c930751b321565c9015ba230677ca0ae1fade48706964fe59294d2c4"
+    },
+    {
+      "asset_id": 180,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L16_gate_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "d1bfed62727a1e417e6903fd902ea0910a2424e7bd8d5be8afec9925ee6ef1f1"
+    },
+    {
+      "asset_id": 181,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L16_gate_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "c76d14b8dcebfbf6e128e7a8252e6fc9a73db6cdab7031a1428312a411ba755b"
+    },
+    {
+      "asset_id": 182,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L16_down_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "5a284b342a98d9b05d027cac252cd17c62710d9a7d799ba95002c9543785bd85"
+    },
+    {
+      "asset_id": 183,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L16_down_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "090a120bdc4e5376caf2b5da5209952eb51f1a31f5b0651e867e6f90509ff917"
+    },
+    {
+      "asset_id": 184,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L16_lnw_i32.bin",
+      "row_width": 2048,
+      "sha256": "feff69f4c30fad96643f0b5e4cd41f6fb1b119c6f1fee3979d5114b9b885cb1d"
+    },
+    {
+      "asset_id": 185,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L16_mlp_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "7c2582f24ec6f9191d0c1ab54041d2e1f0903fd18008a112fa8937af24e22cec"
+    },
+    {
+      "asset_id": 186,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L16_mlp_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "f7dd700b11ea0cc529208f2d6acb2ad2ceb941196c0dc78c3ab54cc2402502cf"
+    },
+    {
+      "asset_id": 187,
+      "bytes": 33554432,
+      "element_count": 8388608,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L17_qkv_w_i32.bin",
+      "row_width": 4096,
+      "sha256": "7ac40c458382285ae08ae0371a3d1bda450560f965982a1e87d7940514f26f25"
+    },
+    {
+      "asset_id": 188,
+      "bytes": 15360,
+      "element_count": 3840,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L17_qkv_b_i32.bin",
+      "row_width": 3840,
+      "sha256": "ac9daa252a0c792baa6a57f2cb026d2fed7609ed771b5290824bcd2a54c806ea"
+    },
+    {
+      "asset_id": 189,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L17_o_proj_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "e24589e70782268cf50ba8f7877817accecabd88183c04d4367fbea49d1ab132"
+    },
+    {
+      "asset_id": 190,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L17_o_proj_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "2525f7d9ed07207b206bf2db40404d075031f2abd0b8c732533a51ff235cc93d"
+    },
+    {
+      "asset_id": 191,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L17_gate_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "02357dd9dd027cb61e82fc567bf1ebf191bfcff2f1fed767698a66dd0f0ddd0b"
+    },
+    {
+      "asset_id": 192,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L17_gate_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "68de963d216ac246cc6a2040c1393e0c030c809482b82ae143e84337352919a6"
+    },
+    {
+      "asset_id": 193,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L17_down_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "b9b49f2888db698e626d9ff7de3e55a6194118e23d23f007438fe363a7c0a130"
+    },
+    {
+      "asset_id": 194,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L17_down_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "8cb72f4a190da5a897775355053fb5cd2fdf0b1ee363512978af9f2a7e2809f5"
+    },
+    {
+      "asset_id": 195,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L17_lnw_i32.bin",
+      "row_width": 2048,
+      "sha256": "528787d3c68ec2566e6790c242c518fd6529112dd87e81a24d690e08cefb9a81"
+    },
+    {
+      "asset_id": 196,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L17_mlp_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "2519e7849fe55ef8de9e235fcef5696c6e4224b238bb0e9103af541e4d0db0fe"
+    },
+    {
+      "asset_id": 197,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L17_mlp_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "fdf640dab06f47a59ac9c61e2a004d260eedd2441db45365ae681cf1a98e8894"
+    },
+    {
+      "asset_id": 198,
+      "bytes": 33554432,
+      "element_count": 8388608,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L18_qkv_w_i32.bin",
+      "row_width": 4096,
+      "sha256": "06e034c852bafcd0951c14f082c97db2242cdb4f15b2d8a530c8586ceaf8746f"
+    },
+    {
+      "asset_id": 199,
+      "bytes": 15360,
+      "element_count": 3840,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L18_qkv_b_i32.bin",
+      "row_width": 3840,
+      "sha256": "92fd79a590f093d8b04b5b2b88ac5c25561a294469ad9bc3969614d7024a6cd6"
+    },
+    {
+      "asset_id": 200,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L18_o_proj_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "8bdfbab723619b0db78f3ac3b1d563209e8db8e41659509f1c05fd621f50612b"
+    },
+    {
+      "asset_id": 201,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L18_o_proj_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "9eaa7d7eb46d1a26d4e4e12d54b86bcf0c556b8beae3417bb71e28e568ebae3d"
+    },
+    {
+      "asset_id": 202,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L18_gate_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "6969ec78d1bc48b4bb87be8d3f6d1ad507c53b4493e650b5158968c64b9d81e3"
+    },
+    {
+      "asset_id": 203,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L18_gate_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "b8b84f3a802655c10885242444aeae5fce88bdf6c68b60c025842d93498ca930"
+    },
+    {
+      "asset_id": 204,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L18_down_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "b5c3fab468182059abf1cb45e00cf9943ddfac966644f92dc851388915c01c82"
+    },
+    {
+      "asset_id": 205,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L18_down_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "ee2a0aa959244b72c771feeeaab16fe2730c4b35697b55bc67f26f2efd124e52"
+    },
+    {
+      "asset_id": 206,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L18_lnw_i32.bin",
+      "row_width": 2048,
+      "sha256": "9ed0723b61e0bf904fe2c98df888278c28f165ee31bc3590cc01f4476e14d9b1"
+    },
+    {
+      "asset_id": 207,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L18_mlp_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "46d805aae323b8b55e5f96ee84cb76639a7140ad483adb17becd3ca32580638e"
+    },
+    {
+      "asset_id": 208,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L18_mlp_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "b1f30073655ee32e738f2a4fe78a7ee1637cd636e7a698f9b24c029009606d16"
+    },
+    {
+      "asset_id": 209,
+      "bytes": 33554432,
+      "element_count": 8388608,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L19_qkv_w_i32.bin",
+      "row_width": 4096,
+      "sha256": "74108be689fb0a7d61f79aad833c6e833040c8d4095eba4223f27ba872a63e1c"
+    },
+    {
+      "asset_id": 210,
+      "bytes": 15360,
+      "element_count": 3840,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L19_qkv_b_i32.bin",
+      "row_width": 3840,
+      "sha256": "f8455298d3337e14b169be21b69dff8478265f65f307ce248b64b6724c6b1b94"
+    },
+    {
+      "asset_id": 211,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L19_o_proj_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "dc9fb3b79a07ef2d59c8701c00acf9ad31ce7736f5f441c257e29fffe787ef50"
+    },
+    {
+      "asset_id": 212,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L19_o_proj_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "6c61e89c9b59039e60dfed24a746235dbd18aba2b14fcb2913b5c793b5af1e70"
+    },
+    {
+      "asset_id": 213,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L19_gate_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "d177ff18b1599c0e45f724de387937ead085b537175b1bed2667094a64feb932"
+    },
+    {
+      "asset_id": 214,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L19_gate_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "5a2fcd4f7fa2501a5555588976a6aada8364f8d5ff3b96dba4701c54a4d38eed"
+    },
+    {
+      "asset_id": 215,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L19_down_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "751a179454216ac30e3fb918de2180c30cac97ead2469c9cf1f847db0947c623"
+    },
+    {
+      "asset_id": 216,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L19_down_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "1b0eb52d353d4d302002080b412b506ea1d1b5c68744d347a93feaac322d1bd7"
+    },
+    {
+      "asset_id": 217,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L19_lnw_i32.bin",
+      "row_width": 2048,
+      "sha256": "d240ba90c0fe05f477a7385540892bd2cbe11090e63c29d4b2cc8c433e99f7a6"
+    },
+    {
+      "asset_id": 218,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L19_mlp_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "cb590bd845852fae972430fe0eea3ed5954299a5ba20fa155f6318503be4d6f7"
+    },
+    {
+      "asset_id": 219,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/L19_mlp_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "c29fb2375bfd110a16041f8c19b2397d2e99f9cb3a4ef95f9bbfe61334cc401c"
+    },
+    {
+      "asset_id": 220,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/embedding_i32.bin",
+      "row_width": 2048,
+      "sha256": "27725e9f8196313e2a05a558e57dbdbbe3c200bac9b83fc3e2bfc78da81c242a"
+    },
+    {
+      "asset_id": 221,
+      "bytes": 131072,
+      "element_count": 32768,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/gather_i32.bin",
+      "row_width": 2048,
+      "sha256": "604e4277684c31d50802903f36979b216b1d8cc0ab5341e23e5875c0db86a2fb"
+    },
+    {
+      "asset_id": 222,
+      "bytes": 512,
+      "element_count": 128,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/q_scale_i32.bin",
+      "row_width": 128,
+      "sha256": "fd18c7ece2c90e07e570d9e78b2de78a14cd548da5f62378d97edb0e66b37dd7"
+    },
+    {
+      "asset_id": 223,
+      "bytes": 1024,
+      "element_count": 256,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/mask_q_i32.bin",
+      "row_width": 16,
+      "sha256": "e2d2eb66fadbf0602458568000c86cdae7d58ab5d8c102b65a45701b96453700"
+    },
+    {
+      "asset_id": 224,
+      "bytes": 16,
+      "element_count": 2,
+      "encoding": "i64-le",
+      "path": "models/timesfm/weights/scale_i64.bin",
+      "row_width": 2,
+      "sha256": "ec0c4e2cce899d6bbbadad2cecebd06c1efcc645c054fb4f3f2f43445dbb7e1d"
+    },
+    {
+      "asset_id": 225,
+      "bytes": 524288,
+      "element_count": 131072,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/pro_hid_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "c8f1ddea87aef87bdba03256f9c10d2e557ef65827a9dc04298ca95bd1d64435"
+    },
+    {
+      "asset_id": 226,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/pro_hid_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "0ad475d5ebb86461338c9bd57c8cb517d2b094f870632a52f230fa2fe7f4fcf1"
+    },
+    {
+      "asset_id": 227,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/pro_out_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "022852a913547cfcfd1aa40d21c3d6afb415b8030370966af5ff5954c524ac3c"
+    },
+    {
+      "asset_id": 228,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/pro_out_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "adda4fcbf683da2a913e277a75aa1dfda316d2427e3d338b9192c202a422e80c"
+    },
+    {
+      "asset_id": 229,
+      "bytes": 524288,
+      "element_count": 131072,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/pro_res_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "d19edb59c5ecdd3febf67a25099be6d6ca22b6339fbaf72e9e9478b9fe1f4c31"
+    },
+    {
+      "asset_id": 230,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/pro_res_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "6e9e80f529031803e40fc4f3889e70b2538657c3bacf8321df26be2808af3024"
+    },
+    {
+      "asset_id": 231,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/head_hid_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "ef7c126e5f9c4707532129a3705c7dd8bd51f6e77a6cb7f2b260a74844419099"
+    },
+    {
+      "asset_id": 232,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/head_hid_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "accfd42550e533bae9b4411c1452c63645e6a3221f1c729975e8c1847ea46d18"
+    },
+    {
+      "asset_id": 233,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/head_out_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "ff08b642d1123383be8c6d340105b019aae1898a1fadc7bed594d2cfc55bd9f4"
+    },
+    {
+      "asset_id": 234,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/head_out_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "25e2ea2e0ce7e663adb25c5158d239205f896e4e73266d7d67539cf7f00ce686"
+    },
+    {
+      "asset_id": 235,
+      "bytes": 16777216,
+      "element_count": 4194304,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/head_res_w_i32.bin",
+      "row_width": 2048,
+      "sha256": "864318f079e4e42832cab1498461944df047c6ebcbef9517ddec1b2d280add76"
+    },
+    {
+      "asset_id": 236,
+      "bytes": 8192,
+      "element_count": 2048,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/head_res_b_i32.bin",
+      "row_width": 2048,
+      "sha256": "8da5738db37765786395ebbd1d359d72e0eb177393f93e4d303df34bdbd02911"
+    },
+    {
+      "asset_id": 237,
+      "bytes": 4194304,
+      "element_count": 1048576,
+      "encoding": "i32-le",
+      "path": "models/timesfm/weights/silu_table_i32.bin",
+      "row_width": 1048576,
+      "sha256": "107fba3ab21394f02ff1869ca8aaeda98f70f092a96e61bcf646cb53af19d6c7"
+    },
+    {
+      "asset_id": 238,
+      "bytes": 8388608,
+      "element_count": 2097152,
+      "encoding": "i32-le",
+      "path": "models/gpt2/weights/exp_table_i32.bin",
+      "row_width": 2097152,
+      "sha256": "c6a3e6fae423e86bc2598392e4055c938381616c738414fa8bad859da4004f55"
+    },
+    {
+      "asset_id": 239,
+      "bytes": 29360128,
+      "element_count": 7340032,
+      "encoding": "i32-le",
+      "path": "models/gpt2/weights/rsqrt_table_i32.bin",
+      "row_width": 7340032,
+      "sha256": "7cba6a7c88053b99112c1271a2d593e1147a4b3b4a92fe1091c148e2e33573ed"
+    },
+    {
+      "asset_id": 240,
+      "bytes": 2048,
+      "element_count": 512,
+      "encoding": "i32-le",
+      "path": "cases/timesfm/input_ts_i32.bin",
+      "row_width": 512,
+      "sha256": "34628391da99ba306c2e0cf121f32370fc96aa3872dbd73edba87c70aae97a6e"
+    }
+  ],
   "assets_checked": 241,
   "case_id": "timesfm-16patch",
   "command": "anchor",
@@ -17,7 +2189,7 @@
   "parameters_digest": "266040361e23df88cdb7d9f272fd34804058b8b5203cfe8959a708d2855a0ed4",
   "patch_tokens": 16,
   "raw_input_length": 512,
-  "registered_at_unix": 1794169942,
+  "registered_at_unix": 1794176352,
   "schema": 1,
   "spec_version": 1
 }

@@ -46,7 +46,7 @@
 
 ## Gate
 
-- `cargo test --workspace`: **126 passed, 0 failed** (includes 5 output-binding, 6 policy, 2 anchor, 7 plan-check and 1 cache-key test).
+- `cargo test --workspace`: **127 passed, 0 failed** (includes 5 output-binding, 6 policy, 2 anchor, 7 plan-check, 1 opening-structure and 1 cache-key test).
 - Graph tamper tests in `crates/zkie-ops/tests/plan_check.rs` (6 tests) inject
   each mutation with a serialize round-trip, then require the full relation and
   plan verification path to reject: missing, extra, reordered and empty traces;
@@ -66,6 +66,67 @@
 - Policy parser unit tests (5 tests) cover parsing, selection, unknown fields,
   duplicate keys, bad shapes, versions and duplicate case ids.
 - Model plan step counts: gpt2 4462/2798, gemma3 2090/1506, timesfm 6683.
+
+## Opening row integrity (P0)
+
+`verify_opening`, the single entry for asset openings, now derives the expected
+shape from the trusted asset metadata and enforces, before any consumer reads
+the rows:
+
+- full coverage: `opening.row_count == meta.rows` and
+  `rows.len() == meta.rows`;
+- position order and uniqueness: `rows[i].row == i` for every position;
+- row width: every row has exactly `meta.row_width` values;
+- padding: rows at or beyond `ceil(element_count / row_width)` are all zero,
+  and the tail of the last data row beyond `element_count` is zero;
+- Merkle depth: `path.len() == log2(meta.rows)` for the trusted perfect tree;
+- the existing link and per-row Merkle path verification.
+
+All index and element-count arithmetic is checked. The plan checker, the flat
+external fast path, the relation verifier and the cache consume only openings
+that passed this check; the cache and fast path run after opening verification
+and never before it.
+
+### Structural negatives
+
+Each case below is serialized and verified through the full relation and plan
+path; duplicate and swap keep the original rows and Merkle paths valid, so only
+the position check can reject them. Error codes are asserted, so rejection is
+not an accidental failure from an unrelated condition.
+
+| injection | error code |
+| --- | --- |
+| duplicate row in another position | `invalid_index` |
+| swap of two valid rows | `invalid_index` |
+| same-count missing row | `invalid_index` |
+| row width change | `shape_mismatch` |
+| non-zero padding value | `statement_mismatch` |
+| Merkle path length change | `invalid_proof` |
+| partial opening coverage | `statement_mismatch` |
+| relation input replacement / wrong asset | `statement_mismatch` |
+
+Duplicate, swap and width cases run through `verify_shared_trace` with a
+serialize round-trip. The padding and path-length cases use the same
+`verify_opening` entry on a correctly built two-row fixture; the original root
+cannot contain a wrong-width leaf with a valid path, so that width case is a
+structural test rather than a claimed valid-path case.
+
+## Asset hash registration
+
+`zkie anchor` emits a per-asset file SHA-256 list. Each digest covers the
+complete asset file bytes in order and encoding through the same mapping that
+supplies the Merkle leaves, and the anchor is built from that same read. The
+list is published only after the commitment anchor, model identity, input
+digest, shape and, when `--policy` is given, the registered policy fields are
+checked. `--asset-hashes <previous-anchor.json>` compares the list item by item
+with a previous registration and refuses to publish on any mismatch. All 1,129
+list entries across the five case registrations match the actual files
+(recursive recomputation in the registration log).
+
+**Trust caveat.** The first list is a self-built change-detection baseline. It
+does not prove that the first read weights are the expected model and has not
+been checked against externally published model material. Who or what channel
+may authorize model assets is a product trust decision and remains open.
 
 ## Registration
 
@@ -257,59 +318,56 @@ plan check alone at 21.8 s of a 43 s verify: 3,462 asset materializations
 copied 6.06 billion values (about 48 GB), even though the same assets were
 already supplied as fully verified external openings.
 
-The rework removes that duplicate work:
+The rework removes that duplicate work and keeps the authentication
+obligations:
 
 - An asset source supplied through an external pool with a flat layout no
   longer materializes the expected values. The planned asset id, start, root,
   row count and row coverage are checked against the verified opening. Because
   the opening covers the full asset and is Merkle-verified against the trusted
-  anchor, value equality is implied. Edge and coverage obligations are
-  unchanged.
-- The remaining materialized asset values are cached per verification call.
-  The cache key binds the model version, anchor id, model commitment, asset id,
+  anchor, value equality is implied. Partial-row assets keep the materialized
+  comparison. Edge and coverage obligations are unchanged.
+- Flat previous-step outputs are compared by reference instead of being copied.
+  Slice and layout results still materialize.
+- Remaining materialized asset values are cached per verification call. The
+  cache key binds the model version, anchor id, model commitment, asset id,
   path, start, root, leaf root, element count, row count and layout. Only
-  sources that the trusted plan uses more than once are cached. The cache is
-  created after all openings have been verified and is never shared across
+  sources that the trusted plan uses more than once are cached, the cache is
+  created after all openings have been verified, and it is never shared across
   models, requests or layouts.
-- After the first change, the gpt2-seq16 plan check fell from 21.8 s to 1.25 s
-  and materializations to 1,119 calls / 0.71 billion values. The cache showed
-  no measurable additional gain on the five traces because the remaining
-  materializations are distinct; this is recorded as a no-gain optimization.
+- After the materialization change the gpt2-seq16 plan check fell from 21.8 s
+  to 1.25 s. The cache and the borrow change showed no measurable additional
+  gain on these traces; both are recorded as no-gain optimizations.
 
 ### Final five-case verification
 
 All five cases verified the production bundles with the registered policies
-and the final binary. The ledger table reports warm medians of three runs;
-baseline values are the warm medians recorded in the previous trace. The
-single first run of each case is listed above it as context only.
-
-| case | single run wall ms | delta vs baseline | single run VmHWM KiB |
-| --- | ---: | ---: | ---: |
-| gpt2-seq16 | 22,485 | -7.7% | 5,415,992 |
-| gpt2-seq512 | 263,507 | +14.4% | 47,020,108 |
-| gemma3-seq16 | 53,163 | +19.7% | 13,347,228 |
-| gemma3-seq512 | 821,571 | -1.7% | 120,673,912 |
-| timesfm-16patch | 52,780 | +24.6% | 7,321,944 |
+and the final binary. The table reports warm medians of three runs; baseline
+values are the warm medians recorded in the previous trace.
 
 | case | verify wall ms | baseline wall ms | delta | verify VmHWM KiB | baseline VmHWM KiB | delta |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| gpt2-seq16 | 22,334 | 24,360 | -8.3% | 5,397,344 | 5,385,024 | +0.2% |
-| gpt2-seq512 | 231,803 | 230,274 | +0.7% | 47,037,560 | 47,016,984 | +0.0% |
-| gemma3-seq16 | 43,912 | 44,401 | -1.1% | 13,346,360 | 13,357,036 | -0.1% |
-| gemma3-seq512 | 821,644 | 835,721 | -1.7% | 120,672,512 | 120,670,388 | +0.0% |
-| timesfm-16patch | 52,126 | 42,356 | +23.1% | 7,321,056 | 7,329,656 | -0.1% |
+| gpt2-seq16 | 22,443 | 24,360 | -7.9% | 5,397,976 | 5,385,024 | +0.2% |
+| gpt2-seq512 | 231,235 | 230,274 | +0.4% | 47,037,624 | 47,016,984 | +0.0% |
+| gemma3-seq16 | 43,979 | 44,401 | -1.0% | 13,360,840 | 13,357,036 | +0.0% |
+| gemma3-seq512 | 822,406 | 835,721 | -1.6% | 120,688,588 | 120,670,388 | +0.0% |
+| timesfm-16patch | 52,315 | 42,356 | +23.5% | 7,320,432 | 7,329,656 | -0.1% |
 
-The duplicate materialization removal brings verification back to the baseline
-range on every case; the expected-output binding adds only a strict decode,
-comparison and SHA-256 over the output bytes. The authenticated output digest
-for each case equals the registered case GT digest.
+The gpt2 and gemma3 cases are within 2% of the baseline. timesfm remains
++23.5% above baseline. Profiling after the materialization
+removal shows `full_values` at 0.08% of samples; the residual is the
+independent plan-comparison pass over every step input, which is the added
+authentication obligation rather than redundant materialization. Reducing it
+further would require fusing plan comparison with relation verification, which
+was not attempted; the residual is reported as a performance compromise.
 
 ## Open items and production limitations
 
 - Verification cost is back to baseline on gpt2 and gemma3 (within 2%) after
-  the materialization removal. timesfm remains 23.1% above baseline (+9.8 s on
-  42.4 s); this residual is reported as a performance compromise rather than
-  optimized further.
+  the materialization removal. timesfm remains 23.5% above baseline (+10.0 s
+  on 42.4 s); the residual is the independent plan-comparison pass over every
+  step input and is reported as a performance compromise rather than optimized
+  further.
 - The expected output is bound through the policy digest registered from the
   case GT file. The registration trust caveat above still applies: until the
   registration is independently attested, the policies are a non-trusted
@@ -340,9 +398,11 @@ for each case equals the registered case GT digest.
 - `binding/`: expected, none, wrong-digest, tampered, truncated, trailing,
   count-mismatch and illegal-value runs; `inputs/` and `policies/`.
 - `final/<case>/`: first run with the final code.
-- `final-warm/<case>/run-<i>/`: warm repeats used for the ledger.
+- `final-warm/<case>/run-<i>/`: warm repeats of the first rework binary.
+- `final2-warm/<case>/run-<i>/`: warm repeats of the final binary (P0
+  opening-integrity checks and borrow-based plan materialization).
 - `registration/`: anchors and policies regenerated with the output fields.
-- `logs/verify-warm.txt`, `logs/verify-prod.txt`, `logs/verify-final.txt` and
-  `logs/verify-final-warm.txt`.
+- `logs/verify-warm.txt`, `logs/verify-prod.txt`, `logs/verify-final.txt`,
+  `logs/verify-final-warm.txt` and `logs/verify-final2-warm.txt`.
 - The trace directory is 154G on disk; `/data` has 281G free after the runs.
 - No benchmark artifact was deleted.
