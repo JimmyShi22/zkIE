@@ -9,9 +9,9 @@ use std::sync::OnceLock;
 
 use zkie_core::types::Digest;
 use zkie_ops::proof::model_commitment::{
-    asset_last_use, check_asset_last_use, commit_assets, open_asset, verify_shared_trace,
-    AssetOpening, ModelAssetSpec, ModelCommitment, ModelCommitmentPublic, SharedTrace,
-    SharedTraceStep,
+    asset_last_use, check_asset_last_use, commit_assets, open_asset, trace_plan_from_trace,
+    verify_shared_trace, AssetOpening, ModelAssetSpec, ModelCommitment, ModelCommitmentPublic,
+    SharedTrace, SharedTraceStep,
 };
 use zkie_ops::proof::relations::{
     prove_op_relation_shared, ExternalAssetRef, ExternalLayout, RelationReceiptMessage,
@@ -367,17 +367,29 @@ fn roundtrip(trace: &SharedTrace) -> SharedTrace {
     bincode::deserialize(&bytes).unwrap()
 }
 
+fn public_with_plan(trace: &SharedTrace) -> ModelCommitmentPublic {
+    let mut public = fixture().public.clone();
+    public.trace_plan = Some(trace_plan_from_trace(trace));
+    public
+}
+
 fn assert_accepts(trace: &SharedTrace) {
     let bytes = bincode::serialize(trace).unwrap();
     let decoded: SharedTrace = bincode::deserialize(&bytes).unwrap();
-    verify_shared_trace(&fixture().public, &decoded, &[0], &TEST_PREFIX)
+    verify_shared_trace(&public_with_plan(trace), &decoded, &[0], &TEST_PREFIX)
         .expect("valid trace must pass");
 }
 
 fn assert_rejects(trace: &SharedTrace) {
     let bytes = bincode::serialize(trace).unwrap();
     let decoded: SharedTrace = bincode::deserialize(&bytes).unwrap();
-    assert!(verify_shared_trace(&fixture().public, &decoded, &[0], &TEST_PREFIX).is_err());
+    assert!(verify_shared_trace(&public_with_plan(trace), &decoded, &[0], &TEST_PREFIX).is_err());
+}
+
+fn assert_rejects_with_plan(trace: &SharedTrace, base: &SharedTrace) {
+    let bytes = bincode::serialize(trace).unwrap();
+    let decoded: SharedTrace = bincode::deserialize(&bytes).unwrap();
+    assert!(verify_shared_trace(&public_with_plan(base), &decoded, &[0], &TEST_PREFIX).is_err());
 }
 
 #[test]
@@ -768,4 +780,92 @@ fn post_challenge_obligation_rewrite_rejected() {
     let mut tampered = roundtrip(&base);
     tampered.steps[0].message.roots[0].1 = Digest([0x7F; 32]);
     assert_rejects(&tampered);
+}
+
+fn local_add_step(
+    left: Vec<i64>,
+    right: Vec<i64>,
+    sources: Vec<Option<(usize, usize)>>,
+) -> SharedTraceStep {
+    let op = AddOp;
+    let config = Vec::new();
+    let (relation_public, proof) =
+        prove_op_relation_shared(&op, &[left, right], &config, &[], &TEST_PREFIX).unwrap();
+    let mut roots = Vec::new();
+    for id in relation_public.registry.ids() {
+        let root = relation_public.registry.get(id).unwrap();
+        roots.push((root.root, root.start, root.count));
+    }
+    let mut step = step_with(
+        op.opcode() as u16,
+        config,
+        roots,
+        Vec::new(),
+        proof,
+        vec![None, None],
+        vec![None, None],
+    );
+    step.sources = sources;
+    step
+}
+
+fn producer_chain_trace() -> SharedTrace {
+    let first = local_add_step(vec![1, 1], vec![1, 1], vec![None, None]);
+    let second = local_add_step(vec![1, 1], vec![1, 1], vec![None, None]);
+    let consumer = local_add_step(vec![2, 2], vec![1, 1], vec![Some((0, 0)), None]);
+    SharedTrace {
+        tokens: vec![0],
+        assets: Vec::new(),
+        steps: vec![first, second, consumer],
+        argmax: vec![0],
+        output: Vec::new(),
+    }
+}
+
+#[test]
+fn layout_tamper_rejected() {
+    let base = columns_trace();
+    assert_accepts(&base);
+    let mut tampered = roundtrip(&base);
+    let reference = tampered.steps[0].external[1].as_mut().unwrap();
+    if let ExternalLayout::Columns { col_start, .. } = &mut reference.layout {
+        *col_start = 1;
+    }
+    assert_rejects_with_plan(&tampered, &base);
+}
+
+#[test]
+fn missing_external_rejected() {
+    let base = columns_trace();
+    assert_accepts(&base);
+    let mut tampered = roundtrip(&base);
+    tampered.steps[0].external[1] = None;
+    assert_rejects_with_plan(&tampered, &base);
+}
+
+#[test]
+fn missing_source_edge_rejected() {
+    let base = producer_chain_trace();
+    assert_accepts(&base);
+    let mut tampered = roundtrip(&base);
+    tampered.steps[2].sources[0] = None;
+    assert_rejects_with_plan(&tampered, &base);
+}
+
+#[test]
+fn extra_source_edge_rejected() {
+    let base = producer_chain_trace();
+    assert_accepts(&base);
+    let mut tampered = roundtrip(&base);
+    tampered.steps[2].sources[1] = Some((0, 0));
+    assert_rejects_with_plan(&tampered, &base);
+}
+
+#[test]
+fn wrong_source_edge_rejected() {
+    let base = producer_chain_trace();
+    assert_accepts(&base);
+    let mut tampered = roundtrip(&base);
+    tampered.steps[2].sources[0] = Some((1, 0));
+    assert_rejects_with_plan(&tampered, &base);
 }

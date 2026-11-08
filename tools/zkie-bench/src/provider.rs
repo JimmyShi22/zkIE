@@ -24,8 +24,8 @@ use zkie_ops::pipeline::{
     VerifyReceipt, VerifyRequest,
 };
 use zkie_ops::proof::model_commitment::{
-    trace_prefix, verify_shared_trace, verify_shared_trace_output, ModelCommitmentPublic,
-    SharedTrace,
+    trace_plan_from_trace, trace_prefix, verify_shared_trace, verify_shared_trace_output,
+    ModelCommitmentPublic, SharedTrace,
 };
 
 const PROTOCOL_ID: Digest = Digest([0xA1; 32]);
@@ -268,7 +268,14 @@ impl PipelineProvider for ProductionProvider {
         progress_event.total_units = Some(asset_units);
         progress_event.unit = Some("assets".into());
         let _ = ctx.progress.emit(progress_event);
-        let public = ModelCommitmentPublic::from_commitment(&commitment);
+        let mut public = ModelCommitmentPublic::from_commitment(&commitment);
+        let plan_trace = execute_shared(
+            &config,
+            &commitment,
+            &Digest::ZERO,
+            &zkie_ops::registry::NullProgress,
+        )?;
+        public.trace_plan = Some(trace_plan_from_trace(&plan_trace));
         let model = commitment.anchor.record.model_commitment;
         let commitment_bytes = bincode::serialize(&public).map_err(|_| Error::InvalidEncoding)?;
         let config_bytes = bincode::serialize(&config).map_err(|_| Error::InvalidEncoding)?;

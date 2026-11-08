@@ -3,7 +3,7 @@ use std::path::Path;
 use zkie_core::types::Digest;
 
 use zkie_models_gpt2::executor::{build_commitment, execute_shared};
-use zkie_ops::proof::model_commitment::{verify_shared_trace, ModelCommitmentPublic};
+use zkie_ops::proof::model_commitment::{trace_plan_from_trace, verify_shared_trace, ModelCommitmentPublic};
 
 fn main() {
     let seq: usize = std::env::var("ZKIE_SEQ")
@@ -28,7 +28,8 @@ fn main() {
     .unwrap();
     eprintln!("trace {:?} steps={} assets={}", t1.elapsed(), trace.steps.len(), trace.assets.len());
     let t2 = std::time::Instant::now();
-    let public = ModelCommitmentPublic::from_commitment(&commitment);
+    let mut public = ModelCommitmentPublic::from_commitment(&commitment);
+    public.trace_plan = Some(trace_plan_from_trace(&trace));
     let argmax =
         verify_shared_trace(&public, &trace, &tokens, &Digest::ZERO).unwrap();
     eprintln!("verify {:?}", t2.elapsed());

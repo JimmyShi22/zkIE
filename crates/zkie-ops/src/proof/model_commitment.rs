@@ -627,6 +627,10 @@ pub struct AssetMeta {
 pub struct ModelCommitmentPublic {
     pub anchor: AnchorRecord,
     pub assets: Vec<AssetMeta>,
+    /// Trusted port-layout plan generated from the model config at commit
+    /// time. The verifier compares every trace port against it.
+    #[serde(default)]
+    pub trace_plan: Option<TracePlan>,
 }
 
 impl ModelCommitmentPublic {
@@ -647,6 +651,7 @@ impl ModelCommitmentPublic {
                     leaf_record: asset.leaf_record.clone(),
                 })
                 .collect(),
+            trace_plan: None,
         }
     }
 
@@ -992,6 +997,118 @@ pub fn check_asset_last_use(
     Ok(())
 }
 
+/// Expected provenance of one relation input port.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlanInput {
+    Local,
+    Source { step: usize, port: usize },
+    External(ExternalAssetRef),
+    PublicLut(PublicLutRef),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TracePlanStep {
+    pub opcode: u16,
+    pub config: Vec<i64>,
+    pub inputs: Vec<PlanInput>,
+    pub input_lengths: Vec<usize>,
+    pub output_lengths: Vec<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TracePlan {
+    pub steps: Vec<TracePlanStep>,
+}
+
+/// Capture the trusted port-layout plan from a trace produced under the
+/// trusted model config (commit-time execution).
+pub fn trace_plan_from_trace(trace: &SharedTrace) -> TracePlan {
+    let steps = trace
+        .steps
+        .iter()
+        .map(|step| {
+            let input_count = step.external.len();
+            let inputs = (0..input_count)
+                .map(|index| {
+                    if let Some(reference) = step.external[index] {
+                        PlanInput::External(reference)
+                    } else if let Some(reference) = step.public_luts[index] {
+                        PlanInput::PublicLut(reference)
+                    } else if let Some((source, port)) = step.sources[index] {
+                        PlanInput::Source {
+                            step: source,
+                            port,
+                        }
+                    } else {
+                        PlanInput::Local
+                    }
+                })
+                .collect();
+            TracePlanStep {
+                opcode: step.message.opcode,
+                config: step.message.config.clone(),
+                inputs,
+                input_lengths: step.message.proof.lengths.inputs.clone(),
+                output_lengths: step.message.proof.lengths.outputs.clone(),
+            }
+        })
+        .collect();
+    TracePlan { steps }
+}
+
+fn verify_trace_plan(
+    public: &ModelCommitmentPublic,
+    trace: &SharedTrace,
+) -> Result<()> {
+    let plan = public
+        .trace_plan
+        .as_ref()
+        .ok_or(Error::StatementMismatch)?;
+    if plan.steps.len() != trace.steps.len() {
+        return Err(Error::StatementMismatch);
+    }
+    for (plan_step, step) in plan.steps.iter().zip(&trace.steps) {
+        if plan_step.opcode != step.message.opcode
+            || plan_step.config != step.message.config
+        {
+            return Err(Error::StatementMismatch);
+        }
+        let input_count = plan_step.inputs.len();
+        if step.external.len() != input_count
+            || step.public_luts.len() != input_count
+            || step.sources.len() != input_count
+            || step.message.proof.lengths.inputs.len() != input_count
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        for index in 0..input_count {
+            let actual = match (
+                step.external[index],
+                step.public_luts[index],
+                step.sources[index],
+            ) {
+                (Some(reference), None, None) => PlanInput::External(reference),
+                (None, Some(reference), None) => PlanInput::PublicLut(reference),
+                (None, None, Some((source, port))) => PlanInput::Source {
+                    step: source,
+                    port,
+                },
+                (None, None, None) => PlanInput::Local,
+                _ => return Err(Error::StatementMismatch),
+            };
+            if actual != plan_step.inputs[index]
+                || step.message.proof.lengths.inputs[index] != plan_step.input_lengths[index]
+            {
+                return Err(Error::StatementMismatch);
+            }
+        }
+        if step.message.proof.lengths.outputs != plan_step.output_lengths {
+            return Err(Error::StatementMismatch);
+        }
+    }
+    Ok(())
+}
+
 const PREFIX_FORMAT_VERSION: u64 = 1;
 const PREFIX_TAG: u64 = 21;
 
@@ -1092,6 +1209,9 @@ fn verify_shared_trace_steps(
     if trace.steps.is_empty() {
         return Err(Error::StatementMismatch);
     }
+    // Every port layout, slice and source is checked against the plan captured
+    // from the trusted model config at commit time.
+    verify_trace_plan(public, trace)?;
     // StepId is implicit from the canonical ordered list: graph_id is the
     // committed model id and the ordinal is the position. Forward or self
     // references would mean the list was reordered; they are rejected.

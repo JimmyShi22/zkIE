@@ -3,7 +3,7 @@ use std::path::Path;
 use zkie_core::types::Digest;
 
 use zkie_models_timesfm::executor::{build_commitment, execute_shared};
-use zkie_ops::proof::model_commitment::{verify_shared_trace_output, ModelCommitmentPublic};
+use zkie_ops::proof::model_commitment::{trace_plan_from_trace, verify_shared_trace_output, ModelCommitmentPublic};
 
 fn main() {
     let input: Vec<i32> = std::fs::read("/data/zkie-assets/cases/timesfm/input_ts_i32.bin")
@@ -20,7 +20,8 @@ fn main() {
     let trace = execute_shared(&commitment, &values).unwrap();
     eprintln!("trace {:?} steps={} assets={}", t1.elapsed(), trace.steps.len(), trace.assets.len());
     let t2 = std::time::Instant::now();
-    let public = ModelCommitmentPublic::from_commitment(&commitment);
+    let mut public = ModelCommitmentPublic::from_commitment(&commitment);
+    public.trace_plan = Some(trace_plan_from_trace(&trace));
     let output =
         verify_shared_trace_output(&public, &trace, &expected, &Digest::ZERO).unwrap();
     eprintln!("verify {:?}", t2.elapsed());
