@@ -61,8 +61,11 @@ docs/               benchmarks.md; spec / roadmap are TODO placeholders;
   Every run gets a new directory (multiple rounds of one scheme = multiple
   directories), forming a traceable scheme iteration tree; oversized binary
   artifacts (e.g. proof.bin, gigabytes) stay on disk in the same directory and
-  are gitignored, everything else is committed with the scheme. Numbers without
-  provenance must not enter any document.
+  are gitignored, everything else is committed with the scheme. When benching
+  for a new scheme starts, the gitignored binary artifacts left by the previous
+  scheme's rounds may be deleted to free space; textual traces are never
+  deleted, and the deletion is recorded in the new round's NOTES.md. Numbers
+  without provenance must not enter any document.
 
 ## Development rules (hard)
 
