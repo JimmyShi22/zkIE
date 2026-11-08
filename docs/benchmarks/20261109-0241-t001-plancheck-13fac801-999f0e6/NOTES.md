@@ -359,15 +359,18 @@ removal shows `full_values` at 0.08% of samples; the residual is the
 independent plan-comparison pass over every step input, which is the added
 authentication obligation rather than redundant materialization. Reducing it
 further would require fusing plan comparison with relation verification, which
-was not attempted; the residual is reported as a performance compromise.
+was not attempted. The boss has temporarily accepted the timesfm residual (the
+ruling references the earlier +23.1% / +9.8 s figure; the final measurement
+above is +23.5% / +10.0 s). No new optimization card is opened, no technical
+change is made for it, and optimization is deferred to later rounds.
 
 ## Open items and production limitations
 
 - Verification cost is back to baseline on gpt2 and gemma3 (within 2%) after
   the materialization removal. timesfm remains 23.5% above baseline (+10.0 s
   on 42.4 s); the residual is the independent plan-comparison pass over every
-  step input and is reported as a performance compromise rather than optimized
-  further.
+  step input; the boss has temporarily accepted it and optimization is deferred
+  to later rounds.
 - The expected output is bound through the policy digest registered from the
   case GT file. The registration trust caveat above still applies: until the
   registration is independently attested, the policies are a non-trusted
