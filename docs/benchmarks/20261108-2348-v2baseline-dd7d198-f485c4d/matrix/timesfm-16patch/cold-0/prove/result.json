@@ -1,0 +1,1 @@
+{"command":"prove","error_code":null,"last_completed_stage":"prove","last_event_seq":115,"outcome":"PASS","progress_path":"docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/timesfm-16patch/cold-0/prove/progress.jsonl","proof_bytes":6865533616,"protocol_wall_ms":35353,"run_id":"prove","stage_wall_ms":35353,"vmhwm_kib":13822564}

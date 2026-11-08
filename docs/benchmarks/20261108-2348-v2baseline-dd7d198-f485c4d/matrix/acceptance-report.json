@@ -1,0 +1,63 @@
+{
+  "cases": [
+    {
+      "case_id": "gpt2-seq16",
+      "note": "runs were recorded",
+      "passed_runs": 4,
+      "reasons": [],
+      "runs": 4,
+      "status": "PASS"
+    },
+    {
+      "case_id": "gpt2-seq512",
+      "note": "runs were recorded",
+      "passed_runs": 4,
+      "reasons": [],
+      "runs": 4,
+      "status": "PASS"
+    },
+    {
+      "case_id": "gemma3-seq16",
+      "note": "runs were recorded",
+      "passed_runs": 4,
+      "reasons": [],
+      "runs": 4,
+      "status": "PASS"
+    },
+    {
+      "case_id": "gemma3-seq512",
+      "note": "runs were recorded",
+      "passed_runs": 4,
+      "reasons": [],
+      "runs": 4,
+      "status": "PASS"
+    },
+    {
+      "case_id": "timesfm-16patch",
+      "note": "runs were recorded",
+      "passed_runs": 4,
+      "reasons": [],
+      "runs": 4,
+      "status": "PASS"
+    }
+  ],
+  "input": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix",
+  "kind": "acceptance-report",
+  "notes": [
+    "DEFERRED cases are excluded from the required denominator",
+    "a case is PASS only when every run and every stage is PASS",
+    "budget exhaustion and state conflicts are never reported as PASS"
+  ],
+  "profile": "cpu-original-cases",
+  "schema": 1,
+  "summary": {
+    "all_required_passed": true,
+    "blocked": 0,
+    "budget_exhausted": 0,
+    "deferred": 0,
+    "incomplete": 0,
+    "passed": 5,
+    "required": 5,
+    "state_conflict": 0
+  }
+}

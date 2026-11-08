@@ -1,0 +1,1 @@
+{"command":"commit","error_code":null,"last_completed_stage":"commit","last_event_seq":5,"outcome":"PASS","progress_path":"docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gemma3-seq16/cold-0/commit-run/progress.jsonl","proof_bytes":null,"protocol_wall_ms":10496,"run_id":"commit","stage_wall_ms":10496,"vmhwm_kib":1085224}

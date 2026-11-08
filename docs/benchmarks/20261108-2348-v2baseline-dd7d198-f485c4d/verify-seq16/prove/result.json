@@ -1,0 +1,1 @@
+{"command":"prove","error_code":null,"last_completed_stage":"prove","last_event_seq":76,"outcome":"PASS","progress_path":"/tmp/v2smoke/prove/progress.jsonl","proof_bytes":4161786553,"protocol_wall_ms":17630,"run_id":"prove","stage_wall_ms":17630,"vmhwm_kib":8315544}

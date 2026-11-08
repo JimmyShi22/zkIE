@@ -1,0 +1,1 @@
+{"command":"prove","error_code":null,"last_completed_stage":"prove","last_event_seq":77,"outcome":"PASS","progress_path":"docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gpt2-seq16/warm-2/prove/progress.jsonl","proof_bytes":4161786553,"protocol_wall_ms":21569,"run_id":"prove","stage_wall_ms":21569,"vmhwm_kib":8315908}

@@ -1,0 +1,1 @@
+{"command":"commit","error_code":null,"last_completed_stage":"commit","last_event_seq":3,"outcome":"PASS","progress_path":"docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gpt2-seq512/cold-0/commit-run/progress.jsonl","proof_bytes":null,"protocol_wall_ms":3327,"run_id":"commit","stage_wall_ms":3327,"vmhwm_kib":356088}

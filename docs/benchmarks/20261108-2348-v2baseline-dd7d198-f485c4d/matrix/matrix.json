@@ -1,0 +1,686 @@
+{
+  "cases": [
+    {
+      "case_id": "gpt2-seq16",
+      "input": "/data/zkie-assets/cases/gpt2/tokens_16_i32.bin",
+      "runs": [
+        {
+          "commit": {
+            "command": "commit",
+            "error_code": null,
+            "last_completed_stage": "commit",
+            "last_event_seq": 3,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gpt2-seq16/cold-0/commit-run/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 3344,
+            "run_id": "commit",
+            "stage_wall_ms": 3344,
+            "vmhwm_kib": 354568
+          },
+          "exit_code": 0,
+          "prove": {
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 77,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gpt2-seq16/cold-0/prove/progress.jsonl",
+            "proof_bytes": 4161786553,
+            "protocol_wall_ms": 21573,
+            "run_id": "prove",
+            "stage_wall_ms": 21573,
+            "vmhwm_kib": 8317048
+          },
+          "verify": {
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 7,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gpt2-seq16/cold-0/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 24237,
+            "run_id": "verify",
+            "stage_wall_ms": 24237,
+            "vmhwm_kib": 5402624
+          }
+        },
+        {
+          "exit_code": 0,
+          "prove": {
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 77,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gpt2-seq16/warm-0/prove/progress.jsonl",
+            "proof_bytes": 4161786553,
+            "protocol_wall_ms": 21576,
+            "run_id": "prove",
+            "stage_wall_ms": 21576,
+            "vmhwm_kib": 8315824
+          },
+          "verify": {
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 7,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gpt2-seq16/warm-0/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 24360,
+            "run_id": "verify",
+            "stage_wall_ms": 24360,
+            "vmhwm_kib": 5403700
+          }
+        },
+        {
+          "exit_code": 0,
+          "prove": {
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 77,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gpt2-seq16/warm-1/prove/progress.jsonl",
+            "proof_bytes": 4161786553,
+            "protocol_wall_ms": 21598,
+            "run_id": "prove",
+            "stage_wall_ms": 21598,
+            "vmhwm_kib": 8315132
+          },
+          "verify": {
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 7,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gpt2-seq16/warm-1/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 24406,
+            "run_id": "verify",
+            "stage_wall_ms": 24406,
+            "vmhwm_kib": 5385024
+          }
+        },
+        {
+          "exit_code": 0,
+          "prove": {
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 77,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gpt2-seq16/warm-2/prove/progress.jsonl",
+            "proof_bytes": 4161786553,
+            "protocol_wall_ms": 21569,
+            "run_id": "prove",
+            "stage_wall_ms": 21569,
+            "vmhwm_kib": 8315908
+          },
+          "verify": {
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 7,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gpt2-seq16/warm-2/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 24333,
+            "run_id": "verify",
+            "stage_wall_ms": 24333,
+            "vmhwm_kib": 5384980
+          }
+        }
+      ],
+      "seq_tokens": 16
+    },
+    {
+      "case_id": "gpt2-seq512",
+      "input": "/data/zkie-assets/cases/gpt2/tokens_512_i32.bin",
+      "runs": [
+        {
+          "commit": {
+            "command": "commit",
+            "error_code": null,
+            "last_completed_stage": "commit",
+            "last_event_seq": 3,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gpt2-seq512/cold-0/commit-run/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 3327,
+            "run_id": "commit",
+            "stage_wall_ms": 3327,
+            "vmhwm_kib": 356088
+          },
+          "exit_code": 0,
+          "prove": {
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 80,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gpt2-seq512/cold-0/prove/progress.jsonl",
+            "proof_bytes": 38992550944,
+            "protocol_wall_ms": 166301,
+            "run_id": "prove",
+            "stage_wall_ms": 166301,
+            "vmhwm_kib": 78569880
+          },
+          "verify": {
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 48,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gpt2-seq512/cold-0/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 229018,
+            "run_id": "verify",
+            "stage_wall_ms": 229018,
+            "vmhwm_kib": 47015632
+          }
+        },
+        {
+          "exit_code": 0,
+          "prove": {
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 80,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gpt2-seq512/warm-0/prove/progress.jsonl",
+            "proof_bytes": 38992550944,
+            "protocol_wall_ms": 165632,
+            "run_id": "prove",
+            "stage_wall_ms": 165632,
+            "vmhwm_kib": 78569140
+          },
+          "verify": {
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 49,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gpt2-seq512/warm-0/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 231352,
+            "run_id": "verify",
+            "stage_wall_ms": 231352,
+            "vmhwm_kib": 47015996
+          }
+        },
+        {
+          "exit_code": 0,
+          "prove": {
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 80,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gpt2-seq512/warm-1/prove/progress.jsonl",
+            "proof_bytes": 38992550944,
+            "protocol_wall_ms": 165973,
+            "run_id": "prove",
+            "stage_wall_ms": 165973,
+            "vmhwm_kib": 78569540
+          },
+          "verify": {
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 49,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gpt2-seq512/warm-1/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 230274,
+            "run_id": "verify",
+            "stage_wall_ms": 230274,
+            "vmhwm_kib": 47035524
+          }
+        },
+        {
+          "exit_code": 0,
+          "prove": {
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 80,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gpt2-seq512/warm-2/prove/progress.jsonl",
+            "proof_bytes": 38992550944,
+            "protocol_wall_ms": 165993,
+            "run_id": "prove",
+            "stage_wall_ms": 165993,
+            "vmhwm_kib": 78570232
+          },
+          "verify": {
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 48,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gpt2-seq512/warm-2/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 229186,
+            "run_id": "verify",
+            "stage_wall_ms": 229186,
+            "vmhwm_kib": 47016984
+          }
+        }
+      ],
+      "seq_tokens": 512
+    },
+    {
+      "case_id": "gemma3-seq16",
+      "input": "/data/zkie-assets/cases/gemma3/tokens_16_i32.bin",
+      "runs": [
+        {
+          "commit": {
+            "command": "commit",
+            "error_code": null,
+            "last_completed_stage": "commit",
+            "last_event_seq": 5,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gemma3-seq16/cold-0/commit-run/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 10496,
+            "run_id": "commit",
+            "stage_wall_ms": 10496,
+            "vmhwm_kib": 1085224
+          },
+          "exit_code": 0,
+          "prove": {
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 44,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gemma3-seq16/cold-0/prove/progress.jsonl",
+            "proof_bytes": 8766306050,
+            "protocol_wall_ms": 44879,
+            "run_id": "prove",
+            "stage_wall_ms": 44879,
+            "vmhwm_kib": 17523376
+          },
+          "verify": {
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 11,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gemma3-seq16/cold-0/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 44235,
+            "run_id": "verify",
+            "stage_wall_ms": 44235,
+            "vmhwm_kib": 13339752
+          }
+        },
+        {
+          "exit_code": 0,
+          "prove": {
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 45,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gemma3-seq16/warm-0/prove/progress.jsonl",
+            "proof_bytes": 8766306050,
+            "protocol_wall_ms": 45076,
+            "run_id": "prove",
+            "stage_wall_ms": 45076,
+            "vmhwm_kib": 17523472
+          },
+          "verify": {
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 11,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gemma3-seq16/warm-0/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 44437,
+            "run_id": "verify",
+            "stage_wall_ms": 44437,
+            "vmhwm_kib": 13342040
+          }
+        },
+        {
+          "exit_code": 0,
+          "prove": {
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 45,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gemma3-seq16/warm-1/prove/progress.jsonl",
+            "proof_bytes": 8766306050,
+            "protocol_wall_ms": 45070,
+            "run_id": "prove",
+            "stage_wall_ms": 45070,
+            "vmhwm_kib": 17523028
+          },
+          "verify": {
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 11,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gemma3-seq16/warm-1/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 44401,
+            "run_id": "verify",
+            "stage_wall_ms": 44401,
+            "vmhwm_kib": 13372580
+          }
+        },
+        {
+          "exit_code": 0,
+          "prove": {
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 45,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gemma3-seq16/warm-2/prove/progress.jsonl",
+            "proof_bytes": 8766306050,
+            "protocol_wall_ms": 45123,
+            "run_id": "prove",
+            "stage_wall_ms": 45123,
+            "vmhwm_kib": 17522908
+          },
+          "verify": {
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 11,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gemma3-seq16/warm-2/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 44258,
+            "run_id": "verify",
+            "stage_wall_ms": 44258,
+            "vmhwm_kib": 13357036
+          }
+        }
+      ],
+      "seq_tokens": 16
+    },
+    {
+      "case_id": "gemma3-seq512",
+      "input": "/data/zkie-assets/cases/gemma3/tokens_512_i32.bin",
+      "runs": [
+        {
+          "commit": {
+            "command": "commit",
+            "error_code": null,
+            "last_completed_stage": "commit",
+            "last_event_seq": 4,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gemma3-seq512/cold-0/commit-run/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 9313,
+            "run_id": "commit",
+            "stage_wall_ms": 9313,
+            "vmhwm_kib": 1085176
+          },
+          "exit_code": 0,
+          "prove": {
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 111,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gemma3-seq512/cold-0/prove/progress.jsonl",
+            "proof_bytes": 101812159615,
+            "protocol_wall_ms": 421707,
+            "run_id": "prove",
+            "stage_wall_ms": 421707,
+            "vmhwm_kib": 207846048
+          },
+          "verify": {
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 169,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gemma3-seq512/cold-0/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 832249,
+            "run_id": "verify",
+            "stage_wall_ms": 832249,
+            "vmhwm_kib": 120670568
+          }
+        },
+        {
+          "exit_code": 0,
+          "prove": {
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 110,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gemma3-seq512/warm-0/prove/progress.jsonl",
+            "proof_bytes": 101812159615,
+            "protocol_wall_ms": 417040,
+            "run_id": "prove",
+            "stage_wall_ms": 417040,
+            "vmhwm_kib": 207848544
+          },
+          "verify": {
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 170,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gemma3-seq512/warm-0/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 835721,
+            "run_id": "verify",
+            "stage_wall_ms": 835721,
+            "vmhwm_kib": 120686616
+          }
+        },
+        {
+          "exit_code": 0,
+          "prove": {
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 110,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gemma3-seq512/warm-1/prove/progress.jsonl",
+            "proof_bytes": 101812159615,
+            "protocol_wall_ms": 417507,
+            "run_id": "prove",
+            "stage_wall_ms": 417507,
+            "vmhwm_kib": 207848492
+          },
+          "verify": {
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 170,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gemma3-seq512/warm-1/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 835914,
+            "run_id": "verify",
+            "stage_wall_ms": 835914,
+            "vmhwm_kib": 120669888
+          }
+        },
+        {
+          "exit_code": 0,
+          "prove": {
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 110,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gemma3-seq512/warm-2/prove/progress.jsonl",
+            "proof_bytes": 101812159615,
+            "protocol_wall_ms": 416151,
+            "run_id": "prove",
+            "stage_wall_ms": 416151,
+            "vmhwm_kib": 207848448
+          },
+          "verify": {
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 170,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/gemma3-seq512/warm-2/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 835263,
+            "run_id": "verify",
+            "stage_wall_ms": 835263,
+            "vmhwm_kib": 120670388
+          }
+        }
+      ],
+      "seq_tokens": 512
+    },
+    {
+      "case_id": "timesfm-16patch",
+      "input": "/data/zkie-assets/cases/timesfm/input_ts_i32.bin",
+      "runs": [
+        {
+          "commit": {
+            "command": "commit",
+            "error_code": null,
+            "last_completed_stage": "commit",
+            "last_event_seq": 4,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/timesfm-16patch/cold-0/commit-run/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 5356,
+            "run_id": "commit",
+            "stage_wall_ms": 5356,
+            "vmhwm_kib": 174212
+          },
+          "exit_code": 0,
+          "prove": {
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 115,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/timesfm-16patch/cold-0/prove/progress.jsonl",
+            "proof_bytes": 6865533616,
+            "protocol_wall_ms": 35353,
+            "run_id": "prove",
+            "stage_wall_ms": 35353,
+            "vmhwm_kib": 13822564
+          },
+          "verify": {
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 11,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/timesfm-16patch/cold-0/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 42164,
+            "run_id": "verify",
+            "stage_wall_ms": 42164,
+            "vmhwm_kib": 7327904
+          }
+        },
+        {
+          "exit_code": 0,
+          "prove": {
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 115,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/timesfm-16patch/warm-0/prove/progress.jsonl",
+            "proof_bytes": 6865533616,
+            "protocol_wall_ms": 35231,
+            "run_id": "prove",
+            "stage_wall_ms": 35231,
+            "vmhwm_kib": 13821932
+          },
+          "verify": {
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 11,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/timesfm-16patch/warm-0/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 42329,
+            "run_id": "verify",
+            "stage_wall_ms": 42329,
+            "vmhwm_kib": 7329656
+          }
+        },
+        {
+          "exit_code": 0,
+          "prove": {
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 115,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/timesfm-16patch/warm-1/prove/progress.jsonl",
+            "proof_bytes": 6865533616,
+            "protocol_wall_ms": 35308,
+            "run_id": "prove",
+            "stage_wall_ms": 35308,
+            "vmhwm_kib": 13823152
+          },
+          "verify": {
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 11,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/timesfm-16patch/warm-1/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 42356,
+            "run_id": "verify",
+            "stage_wall_ms": 42356,
+            "vmhwm_kib": 7346316
+          }
+        },
+        {
+          "exit_code": 0,
+          "prove": {
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 115,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/timesfm-16patch/warm-2/prove/progress.jsonl",
+            "proof_bytes": 6865533616,
+            "protocol_wall_ms": 35378,
+            "run_id": "prove",
+            "stage_wall_ms": 35378,
+            "vmhwm_kib": 13821988
+          },
+          "verify": {
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 11,
+            "outcome": "PASS",
+            "progress_path": "docs/benchmarks/20261108-2348-v2baseline-dd7d198-f485c4d/matrix/timesfm-16patch/warm-2/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 42535,
+            "run_id": "verify",
+            "stage_wall_ms": 42535,
+            "vmhwm_kib": 7329140
+          }
+        }
+      ],
+      "seq_tokens": 16
+    }
+  ],
+  "kind": "matrix",
+  "schema": 1
+}
