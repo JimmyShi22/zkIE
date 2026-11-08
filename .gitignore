@@ -20,3 +20,9 @@
 
 # large test artifacts stay on disk, textual traces are committed
 docs/benchmarks/**/*.bin
+
+# Agent collaboration material lives outside this repository; never commit it
+.expert-notes/
+expert-notes/
+.bridge/
+bridge/
