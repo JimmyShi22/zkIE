@@ -351,26 +351,27 @@ values are the warm medians recorded in the previous trace.
 | gpt2-seq512 | 231,235 | 230,274 | +0.4% | 47,037,624 | 47,016,984 | +0.0% |
 | gemma3-seq16 | 43,979 | 44,401 | -1.0% | 13,360,840 | 13,357,036 | +0.0% |
 | gemma3-seq512 | 822,406 | 835,721 | -1.6% | 120,688,588 | 120,670,388 | +0.0% |
-| timesfm-16patch | 52,315 | 42,356 | +23.5% | 7,320,432 | 7,329,656 | -0.1% |
+| timesfm-16patch | 52,315 | 42,356 | +23.51% | 7,320,432 | 7,329,656 | -0.1% |
 
-The gpt2 and gemma3 cases are within 2% of the baseline. timesfm remains
-+23.5% above baseline. Profiling after the materialization
-removal shows `full_values` at 0.08% of samples; the residual is the
-independent plan-comparison pass over every step input, which is the added
-authentication obligation rather than redundant materialization. Reducing it
-further would require fusing plan comparison with relation verification, which
-was not attempted. The boss has temporarily accepted the timesfm residual (the
-ruling references the earlier +23.1% / +9.8 s figure; the final measurement
-above is +23.5% / +10.0 s). No new optimization card is opened, no technical
-change is made for it, and optimization is deferred to later rounds.
+The gpt2 and gemma3 cases are within 2% of the baseline. timesfm verify median
+is 52,315 ms vs 42,356 ms: +9,959 ms (+23.51%). Profiling after the
+materialization removal shows `full_values` at 0.08% of samples; the residual
+is the independent plan-comparison pass over every step input, which is the
+added authentication obligation rather than redundant materialization.
+Reducing it further would require fusing plan comparison with relation
+verification, which was not attempted. The boss has temporarily accepted the
+timesfm residual. The ruling references an earlier set of records
+(+23.1% / +9.8 s); that earlier figure is not the final measurement and is
+kept only as the earlier record. No new optimization card is opened, no
+technical change is made for it, and optimization is deferred to later rounds.
 
 ## Open items and production limitations
 
 - Verification cost is back to baseline on gpt2 and gemma3 (within 2%) after
-  the materialization removal. timesfm remains 23.5% above baseline (+10.0 s
-  on 42.4 s); the residual is the independent plan-comparison pass over every
-  step input; the boss has temporarily accepted it and optimization is deferred
-  to later rounds.
+  the materialization removal. timesfm verify median is 52,315 ms vs
+  42,356 ms: +9,959 ms (+23.51%). The residual is the independent plan
+  comparison pass over every step input; the boss has temporarily accepted it
+  and optimization is deferred to later rounds.
 - The expected output is bound through the policy digest registered from the
   case GT file. The registration trust caveat above still applies: until the
   registration is independently attested, the policies are a non-trusted
