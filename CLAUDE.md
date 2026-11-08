@@ -37,6 +37,11 @@ docs/               spec / benchmarks / roadmap / overview（只描述当前实�
   走完整验证路径断言拒绝），不允许只加不验。
 - 三阶段实测：`zkie-bench matrix`（冷 1 + 暖 3）；数字同机实测、warm 中位数
   入账、冷跑不写台账。
+- 打点（profile）方法：`zkie-bench profile-matrix --cases <case.toml>...
+  --threads 1 8 64 --runs 3 --out <dir>`——阶段级（commit/prove/verify 墙钟与
+  峰值内存）+ 算子级 + 内核级累计墙钟与调用次数；progress.jsonl 必须有真实
+  elapsed 与已/总量；输出机器可读记录（每档线程×每阶段×每算子）+ 人读汇总
+  （算子占比排序）；口径与 matrix 一致；三档线程都要出数，用于定位串行约束。
 - 测试与实测结果必须留存：每次测试/基准运行的产物（result.json、日志、对照表）
   落盘归档，并注明基于哪次修改、哪个方案/基线进行的——无出处的数字不得进入
   任何文档。
