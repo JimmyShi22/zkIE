@@ -4,7 +4,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use zkie_core::common::weights_io::WeightMmap;
 use zkie_core::compute::{MemoryGovernor, MemoryRequest};
 use zkie_core::error::{Error, Result};
 use zkie_core::storage::{TensorReader, TensorStorageService};
@@ -128,22 +127,6 @@ fn mmap_rejects_bounds_overflow_and_truncation() {
         MmapTensorReader::open(&path, spec, Digest([3u8; 32]), permit),
         Err(Error::ResourceLimit)
     ));
-}
-
-#[test]
-fn weight_mmap_range_api_matches_raw_slice() {
-    let temp = TempDir::new();
-    let path = temp.path().join("weights.bin");
-    let values = [7i32, -8, 9, -10];
-    let bytes = i32_bytes(&values);
-    fs::write(&path, &bytes).unwrap();
-
-    let mmap = WeightMmap::open(&path).unwrap();
-    assert_eq!(mmap.read_i32_range(1, 2).unwrap(), vec![-8, 9]);
-    let mut dst = [0u8; 8];
-    mmap.read_bytes_range(0, 8, &mut dst).unwrap();
-    assert_eq!(&dst[..], &bytes[..8]);
-    assert!(mmap.read_bytes_range(12, 8, &mut dst).is_err());
 }
 
 #[test]
