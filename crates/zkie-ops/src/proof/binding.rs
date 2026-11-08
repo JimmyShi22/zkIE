@@ -88,9 +88,73 @@ pub struct OracleRoot {
     pub count: u64,
 }
 
+/// Semantic role of an oracle. Same bytes with a different role must not
+/// share an identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OracleRole {
+    Weight = 1,
+    Activation = 2,
+    MultiplicityPlane = 3,
+    Mask = 4,
+    PublicLut = 5,
+}
+
+/// Canonical dtype tag entering the oracle identity hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OracleDType {
+    I32Le = 1,
+    I64Le = 2,
+    U32 = 3,
+    U64 = 4,
+}
+
+/// Stable data identity derived from the five-tuple
+/// `(role, dtype, rows, row_width, content_digest)` where content_digest is
+/// the commitment root plus its start. The hash is order-independent and does
+/// not depend on the position of the oracle inside a proof.
+pub trait OracleIdFromParts {
+    fn from_parts(
+        role: OracleRole,
+        dtype: OracleDType,
+        rows: u64,
+        row_width: u64,
+        root: &Digest,
+        start: &Digest,
+    ) -> OracleId;
+}
+
+impl OracleIdFromParts for OracleId {
+    fn from_parts(
+        role: OracleRole,
+        dtype: OracleDType,
+        rows: u64,
+        row_width: u64,
+        root: &Digest,
+        start: &Digest,
+    ) -> OracleId {
+        let mut bytes = Vec::with_capacity(2 + 8 + 8 + 32 + 32);
+        bytes.push(role as u8);
+        bytes.push(dtype as u8);
+        bytes.extend_from_slice(&rows.to_le_bytes());
+        bytes.extend_from_slice(&row_width.to_le_bytes());
+        bytes.extend_from_slice(&root.0);
+        bytes.extend_from_slice(&start.0);
+        let digest = hash_labeled(tag_word(STATEMENT, 16), 0, None, &bytes)
+            .unwrap_or(Digest::ZERO);
+        let mut id = [0u8; 8];
+        id.copy_from_slice(&digest.0[..8]);
+        OracleId(u64::from_le_bytes(id))
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OracleRegistry {
     roots: BTreeMap<OracleId, OracleRoot>,
+    // Deprecated position counter. New code must use OracleId::from_parts
+    // through the OracleIdFromParts trait; this counter remains only for the
+    // legacy sequential insertion path until it is removed.
     next: u64,
 }
 
@@ -99,6 +163,10 @@ impl OracleRegistry {
         Self::default()
     }
 
+    /// Legacy sequential insertion. Deprecated for identity purposes: new
+    /// callers should derive ids with `OracleId::from_parts` and register the
+    /// commitment metadata explicitly. Retained until the sequential path is
+    /// removed in a later step.
     pub fn insert(&mut self, root: Digest, start: Digest, count: u64) -> Result<OracleId> {
         if count == 0 || !count.is_power_of_two() {
             return Err(Error::InvalidConfig);
@@ -387,4 +455,105 @@ pub fn graph_binding_digest(edges: &[EdgeBinding]) -> Digest {
     }
     hash_labeled(tag_word(STATEMENT, 17), 0, None, &writer.into_bytes())
         .unwrap_or(Digest::ZERO)
+}
+
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    fn digest(byte: u8) -> Digest {
+        Digest([byte; 32])
+    }
+
+    #[test]
+    fn oracle_id_from_parts_is_deterministic_and_field_sensitive() {
+        let root = digest(1);
+        let start = digest(2);
+        let base = OracleId::from_parts(
+            OracleRole::Weight,
+            OracleDType::I32Le,
+            4,
+            2,
+            &root,
+            &start,
+        );
+        assert_eq!(
+            base,
+            OracleId::from_parts(
+                OracleRole::Weight,
+                OracleDType::I32Le,
+                4,
+                2,
+                &root,
+                &start
+            )
+        );
+        assert_ne!(
+            base,
+            OracleId::from_parts(
+                OracleRole::Activation,
+                OracleDType::I32Le,
+                4,
+                2,
+                &root,
+                &start
+            )
+        );
+        assert_ne!(
+            base,
+            OracleId::from_parts(
+                OracleRole::Weight,
+                OracleDType::I64Le,
+                4,
+                2,
+                &root,
+                &start
+            )
+        );
+        assert_ne!(
+            base,
+            OracleId::from_parts(
+                OracleRole::Weight,
+                OracleDType::I32Le,
+                8,
+                2,
+                &root,
+                &start
+            )
+        );
+        assert_ne!(
+            base,
+            OracleId::from_parts(
+                OracleRole::Weight,
+                OracleDType::I32Le,
+                4,
+                4,
+                &root,
+                &start
+            )
+        );
+        assert_ne!(
+            base,
+            OracleId::from_parts(
+                OracleRole::Weight,
+                OracleDType::I32Le,
+                4,
+                2,
+                &digest(3),
+                &start
+            )
+        );
+        assert_ne!(
+            base,
+            OracleId::from_parts(
+                OracleRole::Weight,
+                OracleDType::I32Le,
+                4,
+                2,
+                &root,
+                &digest(4)
+            )
+        );
+    }
 }
