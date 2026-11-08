@@ -8,14 +8,13 @@ not describe the implementation and does not change when the design evolves.
 
 ## Entry points
 
-These five entries are the only ones in the project. New entries must be
+These two entries are the only ones in the project. New entries must be
 registered here:
 
 | Entry | Location | Purpose |
 |---|---|---|
 | zkie-bench CLI | tools/zkie-bench/src/main.rs | three-stage commit/prove/verify + matrix/run |
 | zkie-check CLI | tools/zkie-check/src/main.rs | acceptance report |
-| executor_smoke x3 | models/{gpt2,gemma3,timesfm}/examples/executor_smoke.rs | single-process smoke (commit -> execute -> verify) |
 
 ## Directory layout
 
@@ -25,7 +24,7 @@ crates/zkie-core/   foundations: field/fixed_point/codec, artifact/progress/erro
 crates/zkie-engine/ execution environment: primitives, storage::mmap, compute::cpu,
                      context, metrics
 crates/zkie-ops/    operators and proofs: op/registry, pipeline, proof/*, live operator modules
-models/{gpt2,gemma3,timesfm}/  config + executor + executor_smoke (weights always external)
+models/{gpt2,gemma3,timesfm}/  config + executor (weights always external)
 tools/              zkie-bench, zkie-check
 scripts/            data pipeline (extraction / simulation / GT), not the proof path
 docs/               benchmarks.md; spec / roadmap are TODO placeholders;
