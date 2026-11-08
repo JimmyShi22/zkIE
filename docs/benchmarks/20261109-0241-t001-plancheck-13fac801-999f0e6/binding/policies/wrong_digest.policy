@@ -1,0 +1,15 @@
+policy_version = 1
+model = "gpt2"
+model_version = 1
+
+[[case]]
+case_id = "gpt2-seq16"
+sequence_length = 16
+anchor_id = "dd08df8bcbba41adea6182709e00adb2f897fde4abc241d1ba09c552fd77ae36"
+model_id = "c2971c0179463bf12aecaefc3488417228008c1314e6905c49a55078242c1268"
+output_mode = "expected"
+expected_output_sha256 = "135c4d1c47aee4fd1985fa862afefbedde9d59beaf112bd2cf0dcfff03339281"
+output_digest_algorithm = "sha256"
+output_type = "argmax"
+output_encoding = "i32-le"
+output_elements = 16

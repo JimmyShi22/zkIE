@@ -22,10 +22,19 @@
   registry root and anchor identity from the model asset specifications,
   recomputes the input commitment from the statement tokens, and compares the
   policy, statement, public anchor and CLI model identity.
-- The policy is strict TOML fixed outside the bundle. `run` and `matrix` copy
-  it into the run directory and record its path, SHA-256 and registration time
-  in `policy-source.json`; they no longer fill the model identity from the
-  pending commitment.
+- The policy is strict TOML fixed outside the bundle. It also fixes the
+  expected output: mode, digest, digest algorithm, type, encoding and element
+  count. Verification strictly decodes public-inputs, confirms it against the
+  authenticated computed output, re-encodes the values canonically as i32
+  little endian and compares SHA-256 with the registered GT digest. The
+  no-expectation mode returns the authenticated output without a user
+  expectation.
+- Plan checking no longer materializes flat external assets that the verified
+  openings already provide, and caches remaining materialized values by
+  authenticated asset identity, layout and model version.
+- `run` and `matrix` copy the policy into the run directory and record its
+  path, SHA-256 and registration time in `policy-source.json`; they no longer
+  fill the model identity from the pending commitment.
 - No statement field, proof field or CLI flag was added. `--policy` carries
   the policy.
 - `zkie anchor` is the operator-side registration command: it selects the case
@@ -37,7 +46,7 @@
 
 ## Gate
 
-- `cargo test --workspace`: **118 passed, 0 failed** (includes 2 anchor tests).
+- `cargo test --workspace`: **126 passed, 0 failed** (includes 5 output-binding, 6 policy, 2 anchor, 7 plan-check and 1 cache-key test).
 - Graph tamper tests in `crates/zkie-ops/tests/plan_check.rs` (6 tests) inject
   each mutation with a serialize round-trip, then require the full relation and
   plan verification path to reject: missing, extra, reordered and empty traces;
@@ -95,6 +104,63 @@ through a channel outside the prover's bundle), these policies are a
 non-trusted baseline, not a security acceptance. This note is the required
 label for that status.
 
+## Expected-output binding
+
+The policy fixes the expected output in addition to the anchor. For gpt2 and
+gemma3 the expected output is the per-position argmax file; for timesfm it is
+the complete integer output file. `expected_output_sha256` is taken from the
+case `integer_gt` registration value by `zkie anchor`, which verifies the GT
+file length and SHA-256 first; the GT files are never modified.
+
+The policy declares the mode and the canonical form explicitly:
+`output_mode` (`expected` or `none`), `expected_output_sha256`,
+`output_digest_algorithm` (`sha256`), `output_type` (`argmax` or `int_output`),
+`output_encoding` (`i32-le`) and `output_elements`. Partial declarations are
+rejected.
+
+Verification strictly decodes the public-inputs artifact (u64 fixed-width
+length prefix followed by fixed-width elements): truncation, trailing bytes,
+count mismatch, wrong shape and illegal values are rejected. The decoded
+values must equal the authenticated computed output. The verifier then
+re-encodes them canonically as little-endian i32, computes SHA-256 and compares
+it with the policy digest. Argmax values are range-checked against the model
+vocabulary; the time-series output is checked against the model output shape
+and i32 range. The computed output comes from the verified relation trace and
+the trusted inputs in both modes.
+
+`output_mode = "none"` skips the digest comparison but still performs the full
+relation verification and the statement/public-inputs consistency checks. It
+returns the authenticated output digest and values (the canonical bytes are
+written as `authenticated-output-i32le.bin` in the run directory); statement
+values are never treated as a user expectation. The mode is fixed by the
+trusted policy, so a proof cannot downgrade it.
+
+### Binding evidence
+
+All cases below ran through the production `zkie verify` path on the
+gpt2-seq16 production bundle. The registered expected-mode policy produced an
+authenticated output file byte-identical to the GT file
+(`135c4d1c47aee4fd1985fa862afefbedde9d59beaf112bd2cf0dcfff03339280`,
+16 elements).
+
+| mode / injection | exit | outcome | error code | authenticated digest |
+| --- | ---: | --- | --- | --- |
+| expected, correct | 0 | PASS | - | `135c4d1c...39280` |
+| none | 0 | PASS | - | `135c4d1c...39280` |
+| wrong policy digest | 1 | FAIL | - | `135c4d1c...39280` (computed) |
+| tampered value | 2 | FAIL | `statement_mismatch` | - |
+| truncated file | 2 | FAIL | `invalid_encoding` | - |
+| trailing byte | 2 | FAIL | `invalid_encoding` | - |
+| count mismatch | 2 | FAIL | `shape_mismatch` | - |
+| illegal argmax value | 2 | FAIL | `statement_mismatch` | - |
+
+The unit tests additionally cover a wrong element width, a non-canonical
+encoding, illegal computed argmax values, missing vocabulary context and
+negative time-series values. The public-inputs artifact is bincode while the GT
+registration is raw i32 little endian; the accepted expected-mode case is the
+positive "different encoding" check, because the canonical re-encoding
+reproduces the GT bytes exactly.
+
 ## Measurement basis
 
 - The five proof bundles produced by the baseline code are reused read-only from
@@ -114,6 +180,9 @@ label for that status.
   cover policy and bundle mismatch.
 
 ## Verification results
+
+These are the first-implementation numbers, kept as the iteration record.
+The final optimized numbers are in the performance rework section.
 
 Warm medians of three runs; baseline values are the warm medians recorded in
 the previous trace. gemma3-seq512 has one completed warm run; the two
@@ -141,6 +210,10 @@ The current code re-proved gpt2-seq16 from the baseline commit artifacts:
   number; the baseline warm median was 21,576 ms / 8,315,824 KiB).
 
 ## Production path
+
+These production prove numbers remain valid. The verify numbers here are
+from the first implementation and are superseded by the performance rework
+section.
 
 Five cases ran through `zkie run --commit-policy reuse` against the baseline
 cold commit directories, using the registered `case.policy` next to each case
@@ -177,14 +250,71 @@ small proofs and 4-5% on the largest proof, where deserialization and relation
 verification dominate. Peak memory rises only on the small cases, where the
 materialized asset slices are a larger share of the peak.
 
+## Performance rework
+
+Instrumentation of the first verified implementation on gpt2-seq16 showed the
+plan check alone at 21.8 s of a 43 s verify: 3,462 asset materializations
+copied 6.06 billion values (about 48 GB), even though the same assets were
+already supplied as fully verified external openings.
+
+The rework removes that duplicate work:
+
+- An asset source supplied through an external pool with a flat layout no
+  longer materializes the expected values. The planned asset id, start, root,
+  row count and row coverage are checked against the verified opening. Because
+  the opening covers the full asset and is Merkle-verified against the trusted
+  anchor, value equality is implied. Edge and coverage obligations are
+  unchanged.
+- The remaining materialized asset values are cached per verification call.
+  The cache key binds the model version, anchor id, model commitment, asset id,
+  path, start, root, leaf root, element count, row count and layout. Only
+  sources that the trusted plan uses more than once are cached. The cache is
+  created after all openings have been verified and is never shared across
+  models, requests or layouts.
+- After the first change, the gpt2-seq16 plan check fell from 21.8 s to 1.25 s
+  and materializations to 1,119 calls / 0.71 billion values. The cache showed
+  no measurable additional gain on the five traces because the remaining
+  materializations are distinct; this is recorded as a no-gain optimization.
+
+### Final five-case verification
+
+All five cases verified the production bundles with the registered policies
+and the final binary. The ledger table reports warm medians of three runs;
+baseline values are the warm medians recorded in the previous trace. The
+single first run of each case is listed above it as context only.
+
+| case | single run wall ms | delta vs baseline | single run VmHWM KiB |
+| --- | ---: | ---: | ---: |
+| gpt2-seq16 | 22,485 | -7.7% | 5,415,992 |
+| gpt2-seq512 | 263,507 | +14.4% | 47,020,108 |
+| gemma3-seq16 | 53,163 | +19.7% | 13,347,228 |
+| gemma3-seq512 | 821,571 | -1.7% | 120,673,912 |
+| timesfm-16patch | 52,780 | +24.6% | 7,321,944 |
+
+| case | verify wall ms | baseline wall ms | delta | verify VmHWM KiB | baseline VmHWM KiB | delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| gpt2-seq16 | 22,334 | 24,360 | -8.3% | 5,397,344 | 5,385,024 | +0.2% |
+| gpt2-seq512 | 231,803 | 230,274 | +0.7% | 47,037,560 | 47,016,984 | +0.0% |
+| gemma3-seq16 | 43,912 | 44,401 | -1.1% | 13,346,360 | 13,357,036 | -0.1% |
+| gemma3-seq512 | 821,644 | 835,721 | -1.7% | 120,672,512 | 120,670,388 | +0.0% |
+| timesfm-16patch | 52,126 | 42,356 | +23.1% | 7,321,056 | 7,329,656 | -0.1% |
+
+The duplicate materialization removal brings verification back to the baseline
+range on every case; the expected-output binding adds only a strict decode,
+comparison and SHA-256 over the output bytes. The authenticated output digest
+for each case equals the registered case GT digest.
+
 ## Open items and production limitations
 
-- Verification cost rises because the plan check materializes asset slices from
-  opened rows; the increase is small on proof-size-dominated cases and larger
-  on small proofs. No proof bytes, statement fields or CLI flags changed.
-- The verifier has no independent expected-output channel: final outputs are
-  derived from verified logits and compared with the bundle's public inputs and
-  statement. An operator-registered expected output is out of scope.
+- Verification cost is back to baseline on gpt2 and gemma3 (within 2%) after
+  the materialization removal. timesfm remains 23.1% above baseline (+9.8 s on
+  42.4 s); this residual is reported as a performance compromise rather than
+  optimized further.
+- The expected output is bound through the policy digest registered from the
+  case GT file. The registration trust caveat above still applies: until the
+  registration is independently attested, the policies are a non-trusted
+  baseline. In `output_mode = "none"` the verifier returns the authenticated
+  output digest and does not claim a user expectation.
 - `policy-source.json` is an audit record, not an authenticated one: it
   records the source file name, SHA-256 and file modification time.
 - Unused model assets require no row openings; their metadata, table identity
@@ -207,6 +337,12 @@ materialized asset slices are a larger share of the peak.
   gitignored.
 - `prove-gpt2-seq16/`: current-code proof reproduction; `proof.bin` stays on
   disk and is gitignored, and `prove-gpt2-seq16-run/` holds its text results.
-- `logs/verify-warm.txt` and `logs/verify-prod.txt`.
+- `binding/`: expected, none, wrong-digest, tampered, truncated, trailing,
+  count-mismatch and illegal-value runs; `inputs/` and `policies/`.
+- `final/<case>/`: first run with the final code.
+- `final-warm/<case>/run-<i>/`: warm repeats used for the ledger.
+- `registration/`: anchors and policies regenerated with the output fields.
+- `logs/verify-warm.txt`, `logs/verify-prod.txt`, `logs/verify-final.txt` and
+  `logs/verify-final-warm.txt`.
 - The trace directory is 154G on disk; `/data` has 281G free after the runs.
 - No benchmark artifact was deleted.
