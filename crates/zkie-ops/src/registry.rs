@@ -21,7 +21,7 @@ use zkie_core::types::{
 };
 use zkie_engine::primitives::rq;
 
-use crate::op::{ForwardRecord, OpCode, OpPhase, Operation, OpStatement, TensorRole};
+use crate::op::{ForwardRecord, OpCode, OpPhase, Operation, OpStatement};
 use zkie_core::claim::{PendingClaims, RelationId};
 use zkie_core::oracle::OracleId;
 use crate::proof::binding::{RelationReceipt, RelationProver, RelationVerifier, OracleRegistry};

@@ -68,24 +68,6 @@ fn clamp_config(clamp: Option<(i64, i64)>) -> Vec<i64> {
     }
 }
 
-impl RelationConfig for crate::layout::LayoutOp {
-    fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
-        Ok(vec![
-            if matches!(self.kind, crate::layout::LayoutKind::Reshape) { 0 } else { 1 },
-            self.from.first().copied().unwrap_or(0) as i64,
-            self.from.get(1).copied().unwrap_or(1) as i64,
-            self.to.first().copied().unwrap_or(0) as i64,
-            self.to.get(1).copied().unwrap_or(1) as i64,
-        ])
-    }
-}
-
-impl RelationConfig for crate::requantize::RequantizeOp {
-    fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
-        Ok(vec![self.shift as i64])
-    }
-}
-
 impl RelationConfig for crate::affine_scale::AffineScaleOp {
     fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
         let mut config = vec![self.multiplier as i64, self.addend as i64, self.shift as i64];
@@ -124,12 +106,6 @@ impl RelationConfig for crate::projection::ProjectionOp {
     }
 }
 
-impl RelationConfig for crate::regression_head::RegressionHeadOp {
-    fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
-        Ok(matrix_config(self.m, self.n, self.k, self.shift, self.bias.as_deref()))
-    }
-}
-
 impl RelationConfig for crate::add::AddOp {
     fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
         Ok(Vec::new())
@@ -154,87 +130,9 @@ impl RelationConfig for crate::softmax::SoftmaxOp {
     }
 }
 
-fn norm_config(rows: usize, cols: usize, valid: usize, shift: u32, clamp: Option<(i64, i64)>) -> Vec<i64> {
-    let mut config = vec![rows as i64, cols as i64, valid as i64, shift as i64];
-    config.extend(clamp_config(clamp));
-    config
-}
-
-impl RelationConfig for crate::layer_norm::LayerNormOp {
-    fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
-        Ok(norm_config(self.rows, self.cols, self.valid_cols, self.shift, self.clamp))
-    }
-}
-
-impl RelationConfig for crate::rms_norm::RmsNormOp {
-    fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
-        Ok(norm_config(self.rows, self.cols, self.valid_cols, self.shift, self.clamp))
-    }
-}
-
-impl RelationConfig for crate::rope_projection::RopeProjectionOp {
-    fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
-        Ok(vec![self.shift as i64])
-    }
-}
-
-impl RelationConfig for crate::topk::TopKOp {
-    fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
-        Ok(vec![self.k as i64])
-    }
-}
-
 impl RelationConfig for crate::argmax::ArgmaxOp {
     fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
         Ok(Vec::new())
-    }
-}
-
-impl RelationConfig for crate::route_gate::RouteGateOp {
-    fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
-        Ok(vec![self.top_k as i64, self.threshold])
-    }
-}
-
-impl RelationConfig for crate::scatter::ScatterOp {
-    fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
-        Ok(vec![self.size as i64])
-    }
-}
-
-impl RelationConfig for crate::gather::GatherOp {
-    fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
-        Ok(vec![self.cols as i64])
-    }
-}
-
-impl RelationConfig for crate::batched_matmul::BatchedMatMulOp {
-    fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
-        Ok(vec![
-            self.batch as i64,
-            self.m as i64,
-            self.n as i64,
-            self.k as i64,
-            self.shift as i64,
-        ])
-    }
-}
-
-impl RelationConfig for crate::gather_matmul::GatherMatMulOp {
-    fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
-        Ok(vec![self.cols as i64, self.n as i64, self.shift as i64])
-    }
-}
-
-impl RelationConfig for crate::index_compose::IndexComposeOp {
-    fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
-        Ok(Vec::new())
-    }
-}
-
-impl RelationConfig for crate::pad::PadOp {
-    fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
-        Ok(vec![self.valid_len as i64, self.value])
     }
 }
 
@@ -244,48 +142,9 @@ impl RelationConfig for crate::hadamard::HadamardOp {
     }
 }
 
-impl RelationConfig for crate::range::RangeOp {
-    fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
-        Ok(vec![self.low, self.high])
-    }
-}
-
-impl RelationConfig for crate::div_round::DivRoundOp {
-    fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
-        Ok(Vec::new())
-    }
-}
-
-impl RelationConfig for crate::int_sqrt::IntSqrtOp {
-    fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
-        Ok(Vec::new())
-    }
-}
-
 impl RelationConfig for crate::gated_ffn::GatedFfnOp {
     fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
         Ok(vec![self.shift as i64])
-    }
-}
-
-impl RelationConfig for crate::moe_down::MoeDownOp {
-    fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
-        let mut config = vec![self.width as i64, self.out_cols as i64, self.shift as i64];
-        config.extend(self.shared_weights.iter().copied());
-        config.extend(self.routed_weights.iter().copied());
-        Ok(config)
-    }
-}
-
-impl RelationConfig for crate::kv_cache::KvCacheOp {
-    fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
-        Ok(vec![self.capacity as i64, self.width as i64, self.position as i64])
-    }
-}
-
-impl RelationConfig for crate::patchify::PatchifyOp {
-    fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
-        Ok(vec![self.patch as i64])
     }
 }
 
@@ -351,12 +210,6 @@ impl RelationConfig for crate::index_gen::TableIndexOp {
 impl RelationConfig for crate::index_gen::EmbeddingIndexOp {
     fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
         Ok(vec![self.hidden as i64, self.vocab as i64])
-    }
-}
-
-impl RelationConfig for crate::causal_attention::CausalAttentionOp {
-    fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
-        Ok(vec![self.seq as i64, self.head_dim as i64, self.shift as i64])
     }
 }
 
@@ -1834,7 +1687,6 @@ pub fn verify_op_relation_with_external(
                 return Err(Error::InvalidProof);
             }
         }
-        _ => return Err(Error::UnsupportedPrimitive),
     }
     Ok(())
 }

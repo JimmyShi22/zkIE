@@ -17,7 +17,6 @@ use zkie_core::types::{Digest, DType, TensorSpec};
 use zkie_engine::compute::cpu::{merkle_build, merkle_verify, MerkleTree};
 use zkie_engine::memory::BudgetedMemoryGovernor;
 use zkie_engine::storage::mmap::MmapTensorReader;
-use zkie_engine::pcs::request::chain::KIND_ALGEBRAIC;
 use zkie_engine::pcs::request::link::{
     make_anchor, prove_link, verify_link, Anchor, AnchorRecord, LeafRecord, LinkProof,
 };
@@ -540,7 +539,6 @@ pub fn anchor_record(commitment: &ModelCommitment) -> AnchorRecord {
 // to a pool entry instead of re-committing the weight/LUT.
 
 use serde::{Deserialize, Serialize};
-use zkie_engine::pcs::request::link::LinkProof as PublicLinkProof;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssetMeta {
