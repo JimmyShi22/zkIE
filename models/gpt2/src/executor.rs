@@ -20,8 +20,8 @@ use zkie_ops::proof::model_commitment::{
     SharedTraceStep,
 };
 use zkie_ops::proof::relations::{
-    proof_output_values, prove_op_relation_shared, ExternalAssetRef, RelationConfig,
-    RelationReceiptMessage,
+    proof_output_values, prove_op_relation_shared, ExternalAssetRef, ExternalLayout,
+    ExternalSpec, RelationConfig, RelationReceiptMessage,
 };
 use zkie_ops::public_lut::{self, PublicLutRef};
 use zkie_ops::registry::PureForward;
@@ -95,25 +95,43 @@ pub fn asset_specs() -> Vec<ModelAssetSpec> {
 struct Assets<'a> {
     commitment: &'a ModelCommitment,
     store: AssetStore<'a>,
-    refs: Vec<ExternalAssetRef>,
 }
 
 impl<'a> Assets<'a> {
     fn load(commitment: &'a ModelCommitment) -> Result<Self> {
-        let refs = commitment
-            .assets
-            .iter()
-            .map(|asset| ExternalAssetRef {
-                asset_id: asset.asset_id,
-                row_start: 0,
-                row_count: asset.rows,
-            })
-            .collect();
         Ok(Self {
             commitment,
             store: AssetStore::open(commitment)?,
-            refs,
         })
+    }
+
+    fn spec(
+        &self,
+        pool: usize,
+        row_start: u64,
+        row_count: u64,
+        layout: ExternalLayout,
+    ) -> Result<ExternalSpec> {
+        let asset = self
+            .commitment
+            .assets
+            .get(pool)
+            .ok_or(Error::InvalidIndex)?;
+        Ok(ExternalSpec {
+            asset_id: asset.asset_id,
+            row_start,
+            row_count,
+            layout,
+        })
+    }
+
+    fn external_rows(&self, pool: usize) -> Result<ExternalSpec> {
+        let asset = self
+            .commitment
+            .assets
+            .get(pool)
+            .ok_or(Error::InvalidIndex)?;
+        self.spec(pool, 0, asset.rows, ExternalLayout::Rows)
     }
 
     fn value(&self, path: &str) -> Result<Vec<i64>> {
@@ -161,14 +179,13 @@ struct Builder<'a> {
     planned_total: u64,
     completed: u64,
     commitment: &'a ModelCommitment,
-    external_refs: &'a [ExternalAssetRef],
 }
 
 impl<'a> Builder<'a> {
     fn step<T: PureForward + RelationConfig>(
         &mut self,
         op: &T,
-        inputs: Vec<(Vec<i64>, Option<usize>)>,
+        inputs: Vec<(Vec<i64>, Option<ExternalSpec>)>,
         sources: Vec<Option<(usize, usize)>>,
     ) -> Result<(Vec<Vec<i64>>, usize)> {
         let mut values = Vec::with_capacity(inputs.len());
@@ -181,12 +198,13 @@ impl<'a> Builder<'a> {
         let mut public_luts = Vec::with_capacity(external.len());
         for slot in &external {
             match slot {
-                Some(index) => {
+                Some(spec) => {
                     let asset = self
                         .commitment
                         .assets
-                        .get(*index)
-                        .ok_or(Error::InvalidIndex)?;
+                        .iter()
+                        .find(|asset| asset.asset_id == spec.asset_id)
+                        .ok_or(Error::StatementMismatch)?;
                     if let Some(kind) = public_lut::classify_path(&asset.path) {
                         let reference = PublicLutRef {
                             asset_id: asset.asset_id,
@@ -197,12 +215,12 @@ impl<'a> Builder<'a> {
                         external_assets.push(None);
                         public_luts.push(Some(reference));
                     } else {
-                        external_assets.push(Some(
-                            *self
-                                .external_refs
-                                .get(*index)
-                                .ok_or(Error::InvalidIndex)?,
-                        ));
+                        external_assets.push(Some(ExternalAssetRef {
+                            asset_id: spec.asset_id,
+                            row_start: spec.row_start,
+                            row_count: spec.row_count,
+                            layout: spec.layout,
+                        }));
                         public_luts.push(None);
                     }
                 }
@@ -266,7 +284,9 @@ fn project(
     x: Vec<i64>,
     x_step: usize,
     weight: Vec<i64>,
+    weight_ext: Option<ExternalSpec>,
     bias: Vec<i64>,
+    bias_ext: Option<ExternalSpec>,
     m: usize,
     n: usize,
     k: usize,
@@ -275,12 +295,12 @@ fn project(
     let op = ProjectionOp { m, n, k, shift, bias: None };
     let (out, step) = builder.step(
         &op,
-        vec![(x, None), (weight, None)],
+        vec![(x, None), (weight, weight_ext)],
         vec![Some((x_step, 0)), None],
     )?;
     let (out, step) = builder.step(
         &AddOp,
-        vec![(out[0].clone(), None), (bias, None)],
+        vec![(out[0].clone(), None), (bias, bias_ext)],
         vec![Some((step, 0)), None],
     )?;
     Ok((out[0].clone(), step))
@@ -294,7 +314,7 @@ fn ln(
     weight: Vec<i64>,
     bias: Vec<i64>,
     rsqrt: Vec<i64>,
-    rsqrt_pool: Option<usize>,
+    rsqrt_pool: Option<ExternalSpec>,
     m: usize,
 ) -> Result<(Vec<i64>, usize)> {
     let op = ProfileLayerNormOp {
@@ -335,10 +355,9 @@ pub fn execute_shared_with_progress(
         planned_total,
         completed: 0,
         commitment: assets.commitment,
-        external_refs: &assets.refs,
     };
     let weight = |name: &str| assets.value(name);
-    let pool = |name: &str| assets.pool(name);
+    let pool = |name: &str| assets.external_rows(assets.pool(name)?);
 
     let (embed_idx, embed_idx_step) = builder.step(
         &EmbeddingIndexOp { hidden: HIDDEN, vocab: VOCAB },
@@ -356,9 +375,15 @@ pub fn execute_shared_with_progress(
     )?;
     let embedded = embedded[0].clone();
     let pos = assets.value_range("gpt2/weights/pos_emb_i32.bin", 0, m * HIDDEN)?;
+    let pos_ext = assets.spec(
+        assets.pool("gpt2/weights/pos_emb_i32.bin")?,
+        0,
+        m as u64,
+        ExternalLayout::Rows,
+    )?;
     let (x, mut x_step) = builder.step(
         &AddOp,
-        vec![(embedded, None), (pos, None)],
+        vec![(embedded, None), (pos, Some(pos_ext))],
         vec![Some((embed_step, 0)), None],
     )?;
     let mut current = x[0].clone();
@@ -399,19 +424,88 @@ pub fn execute_shared_with_progress(
             let qb = broadcast(&q_b[head * HEAD_DIM..(head + 1) * HEAD_DIM], m);
             let kb = broadcast(&k_b[head * HEAD_DIM..(head + 1) * HEAD_DIM], m);
             let vb = broadcast(&v_b[head * HEAD_DIM..(head + 1) * HEAD_DIM], m);
-            let (q, q_step) = project(&mut builder, h.clone(), h_step, qw, qb, m, HEAD_DIM, HIDDEN, 16)?;
+            let qw_ext = assets.spec(
+                assets.pool(&path("q_w"))?,
+                0,
+                HIDDEN as u64,
+                ExternalLayout::Columns {
+                    source_row_width: HIDDEN as u64,
+                    col_start: (head * HEAD_DIM) as u64,
+                    col_count: HEAD_DIM as u64,
+                },
+            )?;
+            let qb_ext = assets.spec(
+                assets.pool(&path("q_b"))?,
+                0,
+                1,
+                ExternalLayout::BroadcastColumns {
+                    source_row_width: HIDDEN as u64,
+                    col_start: (head * HEAD_DIM) as u64,
+                    col_count: HEAD_DIM as u64,
+                    rows: m as u64,
+                },
+            )?;
+            let (q, q_step) = project(
+                &mut builder, h.clone(), h_step, qw, Some(qw_ext), qb, Some(qb_ext), m, HEAD_DIM, HIDDEN, 16,
+            )?;
             let (q, q_step) = {
                 let op = AffineScaleOp { multiplier: 23170, addend: 0, shift: 16, clamp: None };
                 let (out, step) = builder.step(&op, vec![(q, None)], vec![Some((q_step, 0))])?;
                 (out[0].clone(), step)
             };
-            let (k, k_step) = project(&mut builder, h.clone(), h_step, kw, kb, m, HEAD_DIM, HIDDEN, 16)?;
+            let kw_ext = assets.spec(
+                assets.pool(&path("k_w"))?,
+                0,
+                HIDDEN as u64,
+                ExternalLayout::Columns {
+                    source_row_width: HIDDEN as u64,
+                    col_start: (head * HEAD_DIM) as u64,
+                    col_count: HEAD_DIM as u64,
+                },
+            )?;
+            let kb_ext = assets.spec(
+                assets.pool(&path("k_b"))?,
+                0,
+                1,
+                ExternalLayout::BroadcastColumns {
+                    source_row_width: HIDDEN as u64,
+                    col_start: (head * HEAD_DIM) as u64,
+                    col_count: HEAD_DIM as u64,
+                    rows: m as u64,
+                },
+            )?;
+            let (k, k_step) = project(
+                &mut builder, h.clone(), h_step, kw, Some(kw_ext), kb, Some(kb_ext), m, HEAD_DIM, HIDDEN, 16,
+            )?;
             let (k, k_step) = {
                 let op = AffineScaleOp { multiplier: 23170, addend: 0, shift: 16, clamp: None };
                 let (out, step) = builder.step(&op, vec![(k, None)], vec![Some((k_step, 0))])?;
                 (out[0].clone(), step)
             };
-            let (v, v_step) = project(&mut builder, h.clone(), h_step, vw, vb, m, HEAD_DIM, HIDDEN, 16)?;
+            let vw_ext = assets.spec(
+                assets.pool(&path("v_w"))?,
+                0,
+                HIDDEN as u64,
+                ExternalLayout::Columns {
+                    source_row_width: HIDDEN as u64,
+                    col_start: (head * HEAD_DIM) as u64,
+                    col_count: HEAD_DIM as u64,
+                },
+            )?;
+            let vb_ext = assets.spec(
+                assets.pool(&path("v_b"))?,
+                0,
+                1,
+                ExternalLayout::BroadcastColumns {
+                    source_row_width: HIDDEN as u64,
+                    col_start: (head * HEAD_DIM) as u64,
+                    col_count: HEAD_DIM as u64,
+                    rows: m as u64,
+                },
+            )?;
+            let (v, v_step) = project(
+                &mut builder, h.clone(), h_step, vw, Some(vw_ext), vb, Some(vb_ext), m, HEAD_DIM, HIDDEN, 16,
+            )?;
             let kt = transpose(&k, m, HEAD_DIM);
             let (scores, scores_step) = builder.step(
                 &MatMulOp { m, n: m, k: HEAD_DIM, shift: 16 },
@@ -452,8 +546,14 @@ pub fn execute_shared_with_progress(
                 vec![probs_step, Some((v_step, 0))],
             )?;
             let ow = assets.rows(&path("o_proj_w"), HIDDEN, head * HEAD_DIM, (head + 1) * HEAD_DIM)?;
+            let ow_ext = assets.spec(
+                assets.pool(&path("o_proj_w"))?,
+                (head * HEAD_DIM) as u64,
+                HEAD_DIM as u64,
+                ExternalLayout::Rows,
+            )?;
             let (head_out, head_step) = project(
-                &mut builder, attn[0].clone(), attn_step, ow, vec![0; m * HIDDEN], m, HIDDEN, HEAD_DIM, 16,
+                &mut builder, attn[0].clone(), attn_step, ow, Some(ow_ext), vec![0; m * HIDDEN], None, m, HIDDEN, HEAD_DIM, 16,
             )?;
             head_acc = Some(match head_acc {
                 None => (head_out, head_step),
@@ -480,7 +580,16 @@ pub fn execute_shared_with_progress(
         )?;
         let x2 = x2[0].clone();
         let (h2, h2_step) = ln(&mut builder, x2.clone(), x2_step, ln2_w, ln2_b, rsqrt.clone(), Some(pool("gpt2/weights/rsqrt_table_i32.bin")?), m)?;
-        let (fc, fc_step) = project(&mut builder, h2, h2_step, fc_w, broadcast(&fc_b, m), m, FFN, HIDDEN, 16)?;
+        let fc_ext = assets.external_rows(assets.pool(&path("fc_w"))?)?;
+        let fcb_ext = assets.spec(
+            assets.pool(&path("fc_b"))?,
+            0,
+            1,
+            ExternalLayout::Broadcast { rows: m as u64 },
+        )?;
+        let (fc, fc_step) = project(
+            &mut builder, h2, h2_step, fc_w, Some(fc_ext), broadcast(&fc_b, m), Some(fcb_ext), m, FFN, HIDDEN, 16,
+        )?;
         let (idx, idx_step) = builder.step(
             &TableIndexOp { offset: 1 << 23, table_len: 1 << 24 },
             vec![(fc.clone(), None)],
@@ -494,7 +603,16 @@ pub fn execute_shared_with_progress(
             )?;
             (out[0].clone(), step)
         };
-        let (proj, proj_step) = project(&mut builder, act.0, act.1, proj_w, broadcast(&proj_b, m), m, HIDDEN, FFN, 16)?;
+        let proj_ext = assets.external_rows(assets.pool(&path("proj_w"))?)?;
+        let projb_ext = assets.spec(
+            assets.pool(&path("proj_b"))?,
+            0,
+            1,
+            ExternalLayout::Broadcast { rows: m as u64 },
+        )?;
+        let (proj, proj_step) = project(
+            &mut builder, act.0, act.1, proj_w, Some(proj_ext), broadcast(&proj_b, m), Some(projb_ext), m, HIDDEN, FFN, 16,
+        )?;
         let (next, next_step) = builder.step(
             &AddOp,
             vec![(x2, None), (proj.clone(), None)],

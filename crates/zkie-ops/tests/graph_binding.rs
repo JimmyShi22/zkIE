@@ -618,11 +618,7 @@ fn shared_trace_references_one_model_asset_opening() {
         },
         external: vec![
             None,
-            Some(ExternalAssetRef {
-                asset_id: 3,
-                row_start: 0,
-                row_count: 2,
-            }),
+            Some(ExternalAssetRef::rows(3, 0, 2)),
         ],
         public_luts: vec![None, None],
         sources: vec![None, None],
@@ -654,19 +650,11 @@ fn shared_trace_references_one_model_asset_opening() {
     assert!(verify_shared_trace(&public, &tampered, &[0]).is_err());
 
     let mut tampered = trace.clone();
-    tampered.steps[0].external[1] = Some(ExternalAssetRef {
-        asset_id: 3,
-        row_start: 0,
-        row_count: 1,
-    });
+    tampered.steps[0].external[1] = Some(ExternalAssetRef::rows(3, 0, 1));
     assert!(verify_shared_trace(&public, &tampered, &[0]).is_err());
 
     let mut tampered = trace.clone();
-    tampered.steps[0].external[1] = Some(ExternalAssetRef {
-        asset_id: 99,
-        row_start: 0,
-        row_count: 2,
-    });
+    tampered.steps[0].external[1] = Some(ExternalAssetRef::rows(99, 0, 2));
     assert!(verify_shared_trace(&public, &tampered, &[0]).is_err());
 }
 

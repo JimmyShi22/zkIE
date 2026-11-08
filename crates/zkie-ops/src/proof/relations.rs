@@ -27,13 +27,62 @@ pub struct RelationLengths {
     pub aux: Vec<usize>,
 }
 
-/// Reference to a row interval of a committed model asset. The interval is
-/// explicit so a step never relies on a positional or sentinel convention.
+/// Layout applied when a shared asset interval is supplied to a step input.
+/// `Columns` covers row-major column slices; `Broadcast` repeats one row;
+/// `BroadcastColumns` selects a column window of one row and repeats it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ExternalLayout {
+    Rows,
+    Broadcast { rows: u64 },
+    Columns {
+        source_row_width: u64,
+        col_start: u64,
+        col_count: u64,
+    },
+    BroadcastColumns {
+        source_row_width: u64,
+        col_start: u64,
+        col_count: u64,
+        rows: u64,
+    },
+}
+
+impl Default for ExternalLayout {
+    fn default() -> Self {
+        Self::Rows
+    }
+}
+
+/// Reference to a row interval of a committed model asset plus an explicit
+/// layout. The interval is explicit so a step never relies on a positional or
+/// sentinel convention.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ExternalAssetRef {
     pub asset_id: u64,
     pub row_start: u64,
     pub row_count: u64,
+    #[serde(default)]
+    pub layout: ExternalLayout,
+}
+
+impl ExternalAssetRef {
+    pub const fn rows(asset_id: u64, row_start: u64, row_count: u64) -> Self {
+        Self {
+            asset_id,
+            row_start,
+            row_count,
+            layout: ExternalLayout::Rows,
+        }
+    }
+}
+
+/// Executor-side request to bind an input to a shared asset interval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExternalSpec {
+    pub asset_id: u64,
+    pub row_start: u64,
+    pub row_count: u64,
+    pub layout: ExternalLayout,
 }
 
 #[derive(Clone, Debug)]

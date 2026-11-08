@@ -24,8 +24,8 @@ use zkie_ops::proof::model_commitment::{
     SharedTraceStep,
 };
 use zkie_ops::proof::relations::{
-    proof_output_values, prove_op_relation_shared, ExternalAssetRef, RelationConfig,
-    RelationReceiptMessage,
+    proof_output_values, prove_op_relation_shared, ExternalAssetRef, ExternalLayout,
+    ExternalSpec, RelationConfig, RelationReceiptMessage,
 };
 use zkie_ops::public_lut::{self, PublicLutRef};
 use zkie_ops::registry::PureForward;
@@ -132,25 +132,55 @@ pub fn asset_specs() -> Vec<ModelAssetSpec> {
 struct Assets<'a> {
     commitment: &'a ModelCommitment,
     store: AssetStore<'a>,
-    refs: Vec<ExternalAssetRef>,
 }
 
 impl<'a> Assets<'a> {
     fn load(commitment: &'a ModelCommitment) -> Result<Self> {
-        let refs = commitment
-            .assets
-            .iter()
-            .map(|asset| ExternalAssetRef {
-                asset_id: asset.asset_id,
-                row_start: 0,
-                row_count: asset.rows,
-            })
-            .collect();
         Ok(Self {
             commitment,
             store: AssetStore::open(commitment)?,
-            refs,
         })
+    }
+
+    fn spec(
+        &self,
+        pool: usize,
+        row_start: u64,
+        row_count: u64,
+        layout: ExternalLayout,
+    ) -> Result<ExternalSpec> {
+        let asset = self
+            .commitment
+            .assets
+            .get(pool)
+            .ok_or(Error::InvalidIndex)?;
+        Ok(ExternalSpec {
+            asset_id: asset.asset_id,
+            row_start,
+            row_count,
+            layout,
+        })
+    }
+
+    fn broadcast_spec(&self, path: &str, rows: usize) -> Result<ExternalSpec> {
+        let pool = self.store.pool(path)?;
+        self.spec(
+            pool,
+            0,
+            1,
+            ExternalLayout::Broadcast {
+                rows: rows as u64,
+            },
+        )
+    }
+
+    fn external_rows(&self, pool: usize) -> Result<ExternalSpec> {
+        let asset = self
+            .commitment
+            .assets
+            .get(pool)
+            .ok_or(Error::InvalidIndex)?;
+        self.spec(pool, 0, asset.rows, ExternalLayout::Rows)
     }
 
     fn value(&self, path: &str) -> Result<Vec<i64>> {
@@ -203,14 +233,13 @@ struct Builder<'a> {
     planned_total: u64,
     completed: u64,
     commitment: &'a ModelCommitment,
-    external_refs: &'a [ExternalAssetRef],
 }
 
 impl<'a> Builder<'a> {
     fn step<T: PureForward + RelationConfig>(
         &mut self,
         op: &T,
-        inputs: Vec<(Vec<i64>, Option<usize>)>,
+        inputs: Vec<(Vec<i64>, Option<ExternalSpec>)>,
         sources: Vec<Option<(usize, usize)>>,
     ) -> Result<(Vec<Vec<i64>>, usize)> {
         let mut values = Vec::with_capacity(inputs.len());
@@ -223,12 +252,13 @@ impl<'a> Builder<'a> {
         let mut public_luts = Vec::with_capacity(external.len());
         for slot in &external {
             match slot {
-                Some(index) => {
+                Some(spec) => {
                     let asset = self
                         .commitment
                         .assets
-                        .get(*index)
-                        .ok_or(Error::InvalidIndex)?;
+                        .iter()
+                        .find(|asset| asset.asset_id == spec.asset_id)
+                        .ok_or(Error::StatementMismatch)?;
                     if let Some(kind) = public_lut::classify_path(&asset.path) {
                         let reference = PublicLutRef {
                             asset_id: asset.asset_id,
@@ -239,12 +269,12 @@ impl<'a> Builder<'a> {
                         external_assets.push(None);
                         public_luts.push(Some(reference));
                     } else {
-                        external_assets.push(Some(
-                            *self
-                                .external_refs
-                                .get(*index)
-                                .ok_or(Error::InvalidIndex)?,
-                        ));
+                        external_assets.push(Some(ExternalAssetRef {
+                            asset_id: spec.asset_id,
+                            row_start: spec.row_start,
+                            row_count: spec.row_count,
+                            layout: spec.layout,
+                        }));
                         public_luts.push(None);
                     }
                 }
@@ -308,7 +338,7 @@ fn project(
     x: Vec<i64>,
     x_step: usize,
     weight: Vec<i64>,
-    weight_pool: Option<usize>,
+    weight_pool: Option<ExternalSpec>,
     m: usize,
     n: usize,
     k: usize,
@@ -327,7 +357,7 @@ fn project_inline(
     builder: &mut Builder<'_>,
     x: Vec<i64>,
     weight: Vec<i64>,
-    weight_pool: Option<usize>,
+    weight_pool: Option<ExternalSpec>,
     m: usize,
     n: usize,
     k: usize,
@@ -343,11 +373,12 @@ fn add_bias(
     x: Vec<i64>,
     x_step: usize,
     bias: &[i64],
+    bias_ext: Option<ExternalSpec>,
     rows: usize,
 ) -> Result<(Vec<i64>, usize)> {
     let (out, step) = builder.step(
         &AddOp,
-        vec![(x, None), (broadcast(bias, rows), None)],
+        vec![(x, None), (broadcast(bias, rows), bias_ext)],
         vec![Some((x_step, 0)), None],
     )?;
     Ok((out[0].clone(), step))
@@ -358,8 +389,9 @@ fn rms(
     x: Vec<i64>,
     x_step: usize,
     weight: Vec<i64>,
+    weight_ext: Option<ExternalSpec>,
     base: Vec<i64>,
-    base_pool: usize,
+    base_pool: ExternalSpec,
     rows: usize,
     cols: usize,
     valid: usize,
@@ -373,7 +405,7 @@ fn rms(
     };
     let inputs = vec![
         (x, None),
-        (broadcast(&weight, rows), None),
+        (broadcast(&weight, rows), weight_ext),
         (base, Some(base_pool)),
     ];
     let (outputs, step) = builder.step(&op, inputs, vec![Some((x_step, 0)), None, None])?;
@@ -385,9 +417,11 @@ fn layer_norm(
     x: Vec<i64>,
     x_step: usize,
     weight: Vec<i64>,
+    weight_ext: Option<ExternalSpec>,
     bias: Vec<i64>,
+    bias_ext: Option<ExternalSpec>,
     base: Vec<i64>,
-    base_pool: usize,
+    base_pool: ExternalSpec,
     rows: usize,
     cols: usize,
     valid: usize,
@@ -401,8 +435,8 @@ fn layer_norm(
     };
     let inputs = vec![
         (x, None),
-        (broadcast(&weight, rows), None),
-        (broadcast(&bias, rows), None),
+        (broadcast(&weight, rows), weight_ext),
+        (broadcast(&bias, rows), bias_ext),
         (base, Some(base_pool)),
     ];
     let (outputs, step) = builder.step(&op, inputs, vec![Some((x_step, 0)), None, None, None])?;
@@ -414,7 +448,7 @@ fn silu(
     x: Vec<i64>,
     x_step: usize,
     silu_table: Vec<i64>,
-    silu_pool: usize,
+    silu_pool: ExternalSpec,
 ) -> Result<(Vec<i64>, usize)> {
     let (idx, idx_step) = builder.step(
         &TableIndexOp { offset: SILU_OFFSET, table_len: SILU_LEN },
@@ -449,10 +483,9 @@ pub fn execute_shared_with_progress(
         planned_total,
         completed: 0,
         commitment: assets.commitment,
-        external_refs: &assets.refs,
     };
     let weight = |name: &str| assets.value(name);
-    let pool = |name: &str| assets.pool(name);
+    let pool = |name: &str| assets.external_rows(assets.pool(name)?);
 
     let base_path = format!("{SHARED_DIR}/rsqrt_table_i32.bin");
     let exp_path = format!("{SHARED_DIR}/exp_table_i32.bin");
@@ -487,8 +520,10 @@ pub fn execute_shared_with_progress(
         &mut builder, current.clone(), x_step, weight(&pro_hid_path)?, Some(pool(&pro_hid_path)?),
         SEQ, H_PAD, 2 * PATCH, 16,
     )?;
+    let pro_hid_b_path = format!("{WEIGHT_DIR}/pro_hid_b_i32.bin");
     let (hid, hid_step) = add_bias(
-        &mut builder, hid, hid_step, &weight(&format!("{WEIGHT_DIR}/pro_hid_b_i32.bin"))?, SEQ,
+        &mut builder, hid, hid_step, &weight(&pro_hid_b_path)?,
+        Some(assets.broadcast_spec(&pro_hid_b_path, SEQ)?), SEQ,
     )?;
     let (activation, activation_step) = silu(&mut builder, hid, hid_step, silu_table.clone(), silu_pool)?;
     let pro_out_path = format!("{WEIGHT_DIR}/pro_out_w_i32.bin");
@@ -496,16 +531,20 @@ pub fn execute_shared_with_progress(
         &mut builder, activation, activation_step, weight(&pro_out_path)?, Some(pool(&pro_out_path)?),
         SEQ, H_PAD, H_PAD, 16,
     )?;
+    let pro_out_b_path = format!("{WEIGHT_DIR}/pro_out_b_i32.bin");
     let (out_proj, out_step) = add_bias(
-        &mut builder, out_proj, out_step, &weight(&format!("{WEIGHT_DIR}/pro_out_b_i32.bin"))?, SEQ,
+        &mut builder, out_proj, out_step, &weight(&pro_out_b_path)?,
+        Some(assets.broadcast_spec(&pro_out_b_path, SEQ)?), SEQ,
     )?;
     let pro_res_path = format!("{WEIGHT_DIR}/pro_res_w_i32.bin");
     let (res_proj, res_step) = project(
         &mut builder, current, x_step, weight(&pro_res_path)?, Some(pool(&pro_res_path)?),
         SEQ, H_PAD, 2 * PATCH, 16,
     )?;
+    let pro_res_b_path = format!("{WEIGHT_DIR}/pro_res_b_i32.bin");
     let (res_proj, res_step) = add_bias(
-        &mut builder, res_proj, res_step, &weight(&format!("{WEIGHT_DIR}/pro_res_b_i32.bin"))?, SEQ,
+        &mut builder, res_proj, res_step, &weight(&pro_res_b_path)?,
+        Some(assets.broadcast_spec(&pro_res_b_path, SEQ)?), SEQ,
     )?;
     let (sum, sum_step) = builder.step(
         &AddOp,
@@ -518,10 +557,12 @@ pub fn execute_shared_with_progress(
         vec![(sum[0].clone(), None), (weight(&gather_path)?, Some(pool(&gather_path)?))],
         vec![Some((sum_step, 0)), None],
     )?;
-    let embedding = weight(&format!("{WEIGHT_DIR}/embedding_i32.bin"))?;
+    let embedding_path = format!("{WEIGHT_DIR}/embedding_i32.bin");
+    let embedding = weight(&embedding_path)?;
+    let embedding_ext = assets.broadcast_spec(&embedding_path, SEQ)?;
     let (x0, x0_step) = builder.step(
         &AddOp,
-        vec![(sum[0].clone(), None), (broadcast(&embedding, SEQ), None)],
+        vec![(sum[0].clone(), None), (broadcast(&embedding, SEQ), Some(embedding_ext))],
         vec![Some((sum_step, 0)), None],
     )?;
     current = x0[0].clone();
@@ -535,8 +576,9 @@ pub fn execute_shared_with_progress(
     for layer in 0..LAYERS {
         let path = |suffix: &str| format!("{WEIGHT_DIR}/L{layer}_{suffix}_i32.bin");
         let (h, h_step) = rms(
-            &mut builder, current.clone(), x_step, weight(&path("lnw"))?, base.clone(), base_pool,
-            SEQ, H_PAD, HIDDEN,
+            &mut builder, current.clone(), x_step, weight(&path("lnw"))?,
+            Some(assets.broadcast_spec(&path("lnw"), SEQ)?),
+            base.clone(), base_pool, SEQ, H_PAD, HIDDEN,
         )?;
         let (qkv, qkv_step) = project(
             &mut builder, h, h_step, weight(&path("qkv_w"))?, Some(pool(&path("qkv_w"))?),
@@ -544,7 +586,7 @@ pub fn execute_shared_with_progress(
         )?;
         let mut padded_bias = weight(&path("qkv_b"))?;
         padded_bias.resize(QKV_COLS, 0);
-        let (qkv, _qkv_step) = add_bias(&mut builder, qkv, qkv_step, &padded_bias, SEQ)?;
+        let (qkv, _qkv_step) = add_bias(&mut builder, qkv, qkv_step, &padded_bias, None, SEQ)?;
 
         let mut attention = vec![0i64; SEQ * HIDDEN];
         for head in 0..HEADS {
@@ -604,7 +646,8 @@ pub fn execute_shared_with_progress(
             &mut builder, attention, ow, None, SEQ, H_PAD, HIDDEN, 16,
         )?;
         let (o, o_step) = add_bias(
-            &mut builder, o, o_step, &weight(&path("o_proj_b"))?, SEQ,
+            &mut builder, o, o_step, &weight(&path("o_proj_b"))?,
+            Some(assets.broadcast_spec(&path("o_proj_b"), SEQ)?), SEQ,
         )?;
         let (x2, x2_step) = builder.step(
             &AddOp,
@@ -613,7 +656,9 @@ pub fn execute_shared_with_progress(
         )?;
         let x2 = x2[0].clone();
         let (mlp, mlp_step) = layer_norm(
-            &mut builder, x2.clone(), x2_step, weight(&path("mlp_w"))?, weight(&path("mlp_b"))?,
+            &mut builder, x2.clone(), x2_step, weight(&path("mlp_w"))?,
+            Some(assets.broadcast_spec(&path("mlp_w"), SEQ)?),
+            weight(&path("mlp_b"))?, Some(assets.broadcast_spec(&path("mlp_b"), SEQ)?),
             base.clone(), base_pool, SEQ, H_PAD, HIDDEN,
         )?;
         let (gate, gate_step) = project(
@@ -621,7 +666,8 @@ pub fn execute_shared_with_progress(
             SEQ, H_PAD, H_PAD, 16,
         )?;
         let (gate, gate_step) = add_bias(
-            &mut builder, gate, gate_step, &weight(&path("gate_b"))?, SEQ,
+            &mut builder, gate, gate_step, &weight(&path("gate_b"))?,
+            Some(assets.broadcast_spec(&path("gate_b"), SEQ)?), SEQ,
         )?;
         let (gate, gate_step) = builder.step(
             &ReluOp,
@@ -633,7 +679,8 @@ pub fn execute_shared_with_progress(
             SEQ, H_PAD, H_PAD, 16,
         )?;
         let (down, down_step) = add_bias(
-            &mut builder, down, down_step, &weight(&path("down_b"))?, SEQ,
+            &mut builder, down, down_step, &weight(&path("down_b"))?,
+            Some(assets.broadcast_spec(&path("down_b"), SEQ)?), SEQ,
         )?;
         let (next, next_step) = builder.step(
             &AddOp,
@@ -649,8 +696,10 @@ pub fn execute_shared_with_progress(
         &mut builder, current.clone(), x_step, weight(&head_hid_path)?, Some(pool(&head_hid_path)?),
         SEQ, H_PAD, H_PAD, 16,
     )?;
+    let head_hid_b_path = format!("{WEIGHT_DIR}/head_hid_b_i32.bin");
     let (hh, hh_step) = add_bias(
-        &mut builder, hh, hh_step, &weight(&format!("{WEIGHT_DIR}/head_hid_b_i32.bin"))?, SEQ,
+        &mut builder, hh, hh_step, &weight(&head_hid_b_path)?,
+        Some(assets.broadcast_spec(&head_hid_b_path, SEQ)?), SEQ,
     )?;
     let (hs, hs_step) = silu(&mut builder, hh, hh_step, silu_table.clone(), silu_pool)?;
     let head_out_path = format!("{WEIGHT_DIR}/head_out_w_i32.bin");
@@ -658,16 +707,20 @@ pub fn execute_shared_with_progress(
         &mut builder, hs, hs_step, weight(&head_out_path)?, Some(pool(&head_out_path)?),
         SEQ, H_PAD, H_PAD, 16,
     )?;
+    let head_out_b_path = format!("{WEIGHT_DIR}/head_out_b_i32.bin");
     let (ho, ho_step) = add_bias(
-        &mut builder, ho, ho_step, &weight(&format!("{WEIGHT_DIR}/head_out_b_i32.bin"))?, SEQ,
+        &mut builder, ho, ho_step, &weight(&head_out_b_path)?,
+        Some(assets.broadcast_spec(&head_out_b_path, SEQ)?), SEQ,
     )?;
     let head_res_path = format!("{WEIGHT_DIR}/head_res_w_i32.bin");
     let (hr, hr_step) = project(
         &mut builder, current, x_step, weight(&head_res_path)?, Some(pool(&head_res_path)?),
         SEQ, H_PAD, H_PAD, 16,
     )?;
+    let head_res_b_path = format!("{WEIGHT_DIR}/head_res_b_i32.bin");
     let (hr, hr_step) = add_bias(
-        &mut builder, hr, hr_step, &weight(&format!("{WEIGHT_DIR}/head_res_b_i32.bin"))?, SEQ,
+        &mut builder, hr, hr_step, &weight(&head_res_b_path)?,
+        Some(assets.broadcast_spec(&head_res_b_path, SEQ)?), SEQ,
     )?;
     let (add, add_step) = builder.step(
         &AddOp,

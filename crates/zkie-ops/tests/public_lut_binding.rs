@@ -13,7 +13,7 @@ use zkie_ops::proof::model_commitment::{
     ModelCommitment, ModelCommitmentPublic, SharedTrace, SharedTraceStep,
 };
 use zkie_ops::proof::relations::{
-    prove_op_relation_shared, ExternalAssetRef, RelationReceiptMessage,
+    prove_op_relation_shared, ExternalAssetRef, ExternalLayout, RelationReceiptMessage,
 };
 use zkie_ops::registry::PureForward;
 use zkie_ops::public_lut::{self, PublicLutKind, PublicLutRef};
@@ -103,11 +103,7 @@ fn fixture() -> &'static Fixture {
         let rsqrt = reference_for(&public, 1, PublicLutKind::Rsqrt);
         let rsqrt_opening = opening(&commitment, 1);
         let weights_opening = opening(&commitment, 2);
-        let weights = ExternalAssetRef {
-            asset_id: 2,
-            row_start: 0,
-            row_count: 2,
-        };
+        let weights = ExternalAssetRef::rows(2, 0, 2);
         Fixture {
             public,
             exp,
@@ -286,6 +282,80 @@ fn asset_add_trace() -> SharedTrace {
     }
 }
 
+fn layout_trace(values: Vec<i64>, reference: ExternalAssetRef) -> SharedTrace {
+    let fixture = fixture();
+    let op = AddOp;
+    let config = Vec::new();
+    let left: Vec<i64> = (0..values.len()).map(|index| 5 + index as i64).collect();
+    let (relation_public, proof) =
+        prove_op_relation_shared(&op, &[left, values], &config, &[1]).unwrap();
+    let mut roots = Vec::new();
+    for id in relation_public.registry.ids() {
+        let root = relation_public.registry.get(id).unwrap();
+        roots.push((root.root, root.start, root.count));
+    }
+    SharedTrace {
+        tokens: vec![0],
+        assets: vec![fixture.weights_opening.clone()],
+        steps: vec![step_with(
+            op.opcode() as u16,
+            config,
+            roots,
+            vec![1],
+            proof,
+            vec![None, Some(reference)],
+            vec![None, None],
+        )],
+        argmax: vec![0],
+        output: Vec::new(),
+    }
+}
+
+fn broadcast_trace() -> SharedTrace {
+    layout_trace(
+        vec![1, 2, 1, 2],
+        ExternalAssetRef {
+            asset_id: 2,
+            row_start: 0,
+            row_count: 1,
+            layout: ExternalLayout::Broadcast { rows: 2 },
+        },
+    )
+}
+
+fn columns_trace() -> SharedTrace {
+    layout_trace(
+        vec![1, 3],
+        ExternalAssetRef {
+            asset_id: 2,
+            row_start: 0,
+            row_count: 2,
+            layout: ExternalLayout::Columns {
+                source_row_width: 2,
+                col_start: 0,
+                col_count: 1,
+            },
+        },
+    )
+}
+
+fn broadcast_columns_trace() -> SharedTrace {
+    layout_trace(
+        vec![1, 1],
+        ExternalAssetRef {
+            asset_id: 2,
+            row_start: 0,
+            row_count: 1,
+            layout: ExternalLayout::BroadcastColumns {
+                source_row_width: 2,
+                col_start: 0,
+                col_count: 1,
+                rows: 2,
+            },
+        },
+    )
+}
+
 fn roundtrip(trace: &SharedTrace) -> SharedTrace {
     let bytes = bincode::serialize(trace).unwrap();
     bincode::deserialize(&bytes).unwrap()
@@ -374,11 +444,11 @@ fn public_lut_and_external_collision_rejected() {
     let base = rsqrt_lookup_trace();
     assert_accepts(&base);
     let mut tampered = roundtrip(&base);
-    tampered.steps[0].external[0] = Some(ExternalAssetRef {
-        asset_id: fixture().rsqrt.asset_id,
-        row_start: 0,
-        row_count: fixture().rsqrt.valid_len,
-    });
+    tampered.steps[0].external[0] = Some(ExternalAssetRef::rows(
+        fixture().rsqrt.asset_id,
+        0,
+        fixture().rsqrt.valid_len,
+    ));
     assert_rejects(&tampered);
 }
 
@@ -456,5 +526,173 @@ fn step_list_missing_or_forward_reference_rejected() {
 
     let mut tampered = roundtrip(&base);
     tampered.steps[0].sources[0] = Some((0, 0));
+    assert_rejects(&tampered);
+}
+
+#[test]
+fn broadcast_layout_repeats_committed_row() {
+    let base = broadcast_trace();
+    assert_accepts(&base);
+    let mut tampered = roundtrip(&base);
+    let reference = tampered.steps[0].external[1].as_mut().unwrap();
+    if let ExternalLayout::Broadcast { rows } = &mut reference.layout {
+        *rows = 1;
+    }
+    assert_rejects(&tampered);
+}
+
+#[test]
+fn broadcast_requires_single_source_row_rejected() {
+    let base = broadcast_trace();
+    assert_accepts(&base);
+    let mut tampered = roundtrip(&base);
+    tampered.steps[0].external[1].as_mut().unwrap().row_count = 2;
+    assert_rejects(&tampered);
+}
+
+#[test]
+fn broadcast_zero_repeat_rejected() {
+    let base = broadcast_trace();
+    assert_accepts(&base);
+    let mut tampered = roundtrip(&base);
+    let reference = tampered.steps[0].external[1].as_mut().unwrap();
+    if let ExternalLayout::Broadcast { rows } = &mut reference.layout {
+        *rows = 0;
+    }
+    assert_rejects(&tampered);
+}
+
+#[test]
+fn columns_layout_selects_committed_window() {
+    let base = columns_trace();
+    assert_accepts(&base);
+    let mut tampered = roundtrip(&base);
+    let reference = tampered.steps[0].external[1].as_mut().unwrap();
+    if let ExternalLayout::Columns { col_start, .. } = &mut reference.layout {
+        *col_start = 1;
+    }
+    assert_rejects(&tampered);
+}
+
+#[test]
+fn columns_source_width_mismatch_rejected() {
+    let base = columns_trace();
+    assert_accepts(&base);
+    let mut tampered = roundtrip(&base);
+    let reference = tampered.steps[0].external[1].as_mut().unwrap();
+    if let ExternalLayout::Columns {
+        source_row_width, ..
+    } = &mut reference.layout
+    {
+        *source_row_width = 3;
+    }
+    assert_rejects(&tampered);
+}
+
+#[test]
+fn columns_window_overflow_rejected() {
+    let base = columns_trace();
+    assert_accepts(&base);
+    let mut tampered = roundtrip(&base);
+    let reference = tampered.steps[0].external[1].as_mut().unwrap();
+    if let ExternalLayout::Columns {
+        col_start,
+        col_count,
+        ..
+    } = &mut reference.layout
+    {
+        *col_start = 1;
+        *col_count = 2;
+    }
+    assert_rejects(&tampered);
+}
+
+#[test]
+fn columns_zero_width_rejected() {
+    let base = columns_trace();
+    assert_accepts(&base);
+    let mut tampered = roundtrip(&base);
+    let reference = tampered.steps[0].external[1].as_mut().unwrap();
+    if let ExternalLayout::Columns { col_count, .. } = &mut reference.layout {
+        *col_count = 0;
+    }
+    assert_rejects(&tampered);
+}
+
+#[test]
+fn broadcast_columns_layout_selects_window() {
+    let base = broadcast_columns_trace();
+    assert_accepts(&base);
+    let mut tampered = roundtrip(&base);
+    let reference = tampered.steps[0].external[1].as_mut().unwrap();
+    if let ExternalLayout::BroadcastColumns { col_start, .. } = &mut reference.layout {
+        *col_start = 1;
+    }
+    assert_rejects(&tampered);
+}
+
+#[test]
+fn broadcast_columns_requires_single_source_row_rejected() {
+    let base = broadcast_columns_trace();
+    assert_accepts(&base);
+    let mut tampered = roundtrip(&base);
+    tampered.steps[0].external[1].as_mut().unwrap().row_count = 2;
+    assert_rejects(&tampered);
+}
+
+#[test]
+fn broadcast_columns_zero_repeat_rejected() {
+    let base = broadcast_columns_trace();
+    assert_accepts(&base);
+    let mut tampered = roundtrip(&base);
+    let reference = tampered.steps[0].external[1].as_mut().unwrap();
+    if let ExternalLayout::BroadcastColumns { rows, .. } = &mut reference.layout {
+        *rows = 0;
+    }
+    assert_rejects(&tampered);
+}
+
+#[test]
+fn broadcast_columns_source_width_mismatch_rejected() {
+    let base = broadcast_columns_trace();
+    assert_accepts(&base);
+    let mut tampered = roundtrip(&base);
+    let reference = tampered.steps[0].external[1].as_mut().unwrap();
+    if let ExternalLayout::BroadcastColumns {
+        source_row_width, ..
+    } = &mut reference.layout
+    {
+        *source_row_width = 3;
+    }
+    assert_rejects(&tampered);
+}
+
+#[test]
+fn broadcast_columns_zero_width_rejected() {
+    let base = broadcast_columns_trace();
+    assert_accepts(&base);
+    let mut tampered = roundtrip(&base);
+    let reference = tampered.steps[0].external[1].as_mut().unwrap();
+    if let ExternalLayout::BroadcastColumns { col_count, .. } = &mut reference.layout {
+        *col_count = 0;
+    }
+    assert_rejects(&tampered);
+}
+
+#[test]
+fn broadcast_columns_window_overflow_rejected() {
+    let base = broadcast_columns_trace();
+    assert_accepts(&base);
+    let mut tampered = roundtrip(&base);
+    let reference = tampered.steps[0].external[1].as_mut().unwrap();
+    if let ExternalLayout::BroadcastColumns {
+        col_start,
+        col_count,
+        ..
+    } = &mut reference.layout
+    {
+        *col_start = 1;
+        *col_count = 2;
+    }
     assert_rejects(&tampered);
 }

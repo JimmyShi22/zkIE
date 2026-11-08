@@ -14,7 +14,7 @@ use zkie_core::error::{Error, Result};
 use rayon::prelude::*;
 
 use crate::proof::binding::oracle_leaf_i64;
-use crate::proof::relations::ExternalAssetRef;
+use crate::proof::relations::{ExternalAssetRef, ExternalLayout};
 use crate::public_lut::{self, PublicLutRef};
 use zkie_core::storage::TensorReader;
 use zkie_core::types::{Digest, DType, TensorSpec};
@@ -703,6 +703,50 @@ impl ModelCommitmentPublic {
         if interval.row_count == 0 || end > asset.rows {
             return Err(Error::InvalidIndex);
         }
+        match interval.layout {
+            ExternalLayout::Rows => {}
+            ExternalLayout::Broadcast { rows } => {
+                if interval.row_count != 1 || rows == 0 {
+                    return Err(Error::InvalidIndex);
+                }
+            }
+            ExternalLayout::Columns {
+                source_row_width,
+                col_start,
+                col_count,
+            } => {
+                if source_row_width != asset.row_width as u64 || col_count == 0 {
+                    return Err(Error::StatementMismatch);
+                }
+                if col_start
+                    .checked_add(col_count)
+                    .ok_or(Error::ResourceLimit)?
+                    > source_row_width
+                {
+                    return Err(Error::InvalidIndex);
+                }
+            }
+            ExternalLayout::BroadcastColumns {
+                source_row_width,
+                col_start,
+                col_count,
+                rows,
+            } => {
+                if interval.row_count != 1 || rows == 0 {
+                    return Err(Error::InvalidIndex);
+                }
+                if source_row_width != asset.row_width as u64 || col_count == 0 {
+                    return Err(Error::StatementMismatch);
+                }
+                if col_start
+                    .checked_add(col_count)
+                    .ok_or(Error::ResourceLimit)?
+                    > source_row_width
+                {
+                    return Err(Error::InvalidIndex);
+                }
+            }
+        }
         self.verify_opening(opening)
     }
 }
@@ -711,6 +755,7 @@ impl ModelCommitmentPublic {
 pub fn extract_interval_values(
     opening: &AssetOpening,
     interval: &ExternalAssetRef,
+    asset_row_width: u64,
 ) -> Result<Vec<i64>> {
     if opening.asset_id != interval.asset_id {
         return Err(Error::StatementMismatch);
@@ -722,7 +767,7 @@ pub fn extract_interval_values(
     if interval.row_count == 0 {
         return Err(Error::InvalidIndex);
     }
-    let mut values = Vec::new();
+    let mut rows = Vec::new();
     let mut next = interval.row_start;
     for row in &opening.rows {
         if row.row < interval.row_start {
@@ -734,13 +779,100 @@ pub fn extract_interval_values(
         if row.row != next {
             return Err(Error::InvalidIndex);
         }
-        values.extend(row.values.iter().map(|value| *value as i64));
+        rows.push(
+            row.values
+                .iter()
+                .map(|value| *value as i64)
+                .collect::<Vec<_>>(),
+        );
         next = next.checked_add(1).ok_or(Error::ResourceLimit)?;
     }
     if next != end {
         return Err(Error::IncompleteArtifact);
     }
-    Ok(values)
+    match interval.layout {
+        ExternalLayout::Rows => {
+            let mut values = Vec::new();
+            for row in rows {
+                values.extend(row);
+            }
+            Ok(values)
+        }
+        ExternalLayout::Broadcast { rows: repeat } => {
+            if rows.len() != 1 || repeat == 0 {
+                return Err(Error::InvalidIndex);
+            }
+            let row = &rows[0];
+            let total = usize::try_from(repeat)
+                .ok()
+                .and_then(|repeat| repeat.checked_mul(row.len()))
+                .ok_or(Error::ResourceLimit)?;
+            let mut values = Vec::with_capacity(total);
+            for _ in 0..repeat {
+                values.extend_from_slice(row);
+            }
+            Ok(values)
+        }
+        ExternalLayout::Columns {
+            source_row_width,
+            col_start,
+            col_count,
+        } => {
+            if source_row_width != asset_row_width {
+                return Err(Error::StatementMismatch);
+            }
+            let start = usize::try_from(col_start).map_err(|_| Error::InvalidIndex)?;
+            let count = usize::try_from(col_count).map_err(|_| Error::InvalidIndex)?;
+            let source_width =
+                usize::try_from(source_row_width).map_err(|_| Error::ResourceLimit)?;
+            let end = start.checked_add(count).ok_or(Error::ResourceLimit)?;
+            if end > source_width {
+                return Err(Error::InvalidIndex);
+            }
+            let mut values = Vec::new();
+            for row in rows {
+                if row.len() != source_width {
+                    return Err(Error::ShapeMismatch);
+                }
+                values.extend_from_slice(&row[start..end]);
+            }
+            Ok(values)
+        }
+        ExternalLayout::BroadcastColumns {
+            source_row_width,
+            col_start,
+            col_count,
+            rows: repeat,
+        } => {
+            if rows.len() != 1 || repeat == 0 {
+                return Err(Error::InvalidIndex);
+            }
+            if source_row_width != asset_row_width {
+                return Err(Error::StatementMismatch);
+            }
+            let start = usize::try_from(col_start).map_err(|_| Error::InvalidIndex)?;
+            let count = usize::try_from(col_count).map_err(|_| Error::InvalidIndex)?;
+            let source_width =
+                usize::try_from(source_row_width).map_err(|_| Error::ResourceLimit)?;
+            let end = start.checked_add(count).ok_or(Error::ResourceLimit)?;
+            if end > source_width {
+                return Err(Error::InvalidIndex);
+            }
+            let row = &rows[0];
+            if row.len() != source_width {
+                return Err(Error::ShapeMismatch);
+            }
+            let total = usize::try_from(repeat)
+                .ok()
+                .and_then(|repeat| repeat.checked_mul(count))
+                .ok_or(Error::ResourceLimit)?;
+            let mut values = Vec::with_capacity(total);
+            for _ in 0..repeat {
+                values.extend_from_slice(&row[start..end]);
+            }
+            Ok(values)
+        }
+    }
 }
 
 /// Reserved interface for P2 joint openings. The signature exists so P2 can
@@ -1001,7 +1133,16 @@ fn verify_shared_trace_steps(
                 let opening = openings_by_id
                     .get(&reference.asset_id)
                     .ok_or(Error::StatementMismatch)?;
-                external_values[input] = Some(extract_interval_values(opening, reference)?);
+                let meta = public
+                    .assets
+                    .iter()
+                    .find(|asset| asset.asset_id == reference.asset_id)
+                    .ok_or(Error::StatementMismatch)?;
+                external_values[input] = Some(extract_interval_values(
+                    opening,
+                    reference,
+                    meta.row_width as u64,
+                )?);
             }
         }
         for (input, reference) in step.public_luts.iter().enumerate() {

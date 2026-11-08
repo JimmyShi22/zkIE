@@ -23,8 +23,8 @@ use zkie_ops::proof::model_commitment::{
     SharedTraceStep,
 };
 use zkie_ops::proof::relations::{
-    proof_output_values, prove_op_relation_shared, ExternalAssetRef, RelationConfig,
-    RelationReceiptMessage,
+    proof_output_values, prove_op_relation_shared, ExternalAssetRef, ExternalLayout,
+    ExternalSpec, RelationConfig, RelationReceiptMessage,
 };
 use zkie_ops::public_lut::{self, PublicLutRef};
 use zkie_ops::registry::PureForward;
@@ -112,25 +112,55 @@ pub fn asset_specs() -> Vec<ModelAssetSpec> {
 struct Assets<'a> {
     commitment: &'a ModelCommitment,
     store: AssetStore<'a>,
-    refs: Vec<ExternalAssetRef>,
 }
 
 impl<'a> Assets<'a> {
     fn load(commitment: &'a ModelCommitment) -> Result<Self> {
-        let refs = commitment
-            .assets
-            .iter()
-            .map(|asset| ExternalAssetRef {
-                asset_id: asset.asset_id,
-                row_start: 0,
-                row_count: asset.rows,
-            })
-            .collect();
         Ok(Self {
             commitment,
             store: AssetStore::open(commitment)?,
-            refs,
         })
+    }
+
+    fn spec(
+        &self,
+        pool: usize,
+        row_start: u64,
+        row_count: u64,
+        layout: ExternalLayout,
+    ) -> Result<ExternalSpec> {
+        let asset = self
+            .commitment
+            .assets
+            .get(pool)
+            .ok_or(Error::InvalidIndex)?;
+        Ok(ExternalSpec {
+            asset_id: asset.asset_id,
+            row_start,
+            row_count,
+            layout,
+        })
+    }
+
+    fn broadcast_spec(&self, path: &str, rows: usize) -> Result<ExternalSpec> {
+        let pool = self.store.pool(path)?;
+        self.spec(
+            pool,
+            0,
+            1,
+            ExternalLayout::Broadcast {
+                rows: rows as u64,
+            },
+        )
+    }
+
+    fn external_rows(&self, pool: usize) -> Result<ExternalSpec> {
+        let asset = self
+            .commitment
+            .assets
+            .get(pool)
+            .ok_or(Error::InvalidIndex)?;
+        self.spec(pool, 0, asset.rows, ExternalLayout::Rows)
     }
 
     fn value(&self, path: &str) -> Result<Vec<i64>> {
@@ -178,14 +208,13 @@ struct Builder<'a> {
     planned_total: u64,
     completed: u64,
     commitment: &'a ModelCommitment,
-    external_refs: &'a [ExternalAssetRef],
 }
 
 impl<'a> Builder<'a> {
     fn step<T: PureForward + RelationConfig>(
         &mut self,
         op: &T,
-        inputs: Vec<(Vec<i64>, Option<usize>)>,
+        inputs: Vec<(Vec<i64>, Option<ExternalSpec>)>,
         sources: Vec<Option<(usize, usize)>>,
     ) -> Result<(Vec<Vec<i64>>, usize)> {
         let mut values = Vec::with_capacity(inputs.len());
@@ -198,12 +227,13 @@ impl<'a> Builder<'a> {
         let mut public_luts = Vec::with_capacity(external.len());
         for slot in &external {
             match slot {
-                Some(index) => {
+                Some(spec) => {
                     let asset = self
                         .commitment
                         .assets
-                        .get(*index)
-                        .ok_or(Error::InvalidIndex)?;
+                        .iter()
+                        .find(|asset| asset.asset_id == spec.asset_id)
+                        .ok_or(Error::StatementMismatch)?;
                     if let Some(kind) = public_lut::classify_path(&asset.path) {
                         let reference = PublicLutRef {
                             asset_id: asset.asset_id,
@@ -214,12 +244,12 @@ impl<'a> Builder<'a> {
                         external_assets.push(None);
                         public_luts.push(Some(reference));
                     } else {
-                        external_assets.push(Some(
-                            *self
-                                .external_refs
-                                .get(*index)
-                                .ok_or(Error::InvalidIndex)?,
-                        ));
+                        external_assets.push(Some(ExternalAssetRef {
+                            asset_id: spec.asset_id,
+                            row_start: spec.row_start,
+                            row_count: spec.row_count,
+                            layout: spec.layout,
+                        }));
                         public_luts.push(None);
                     }
                 }
@@ -283,7 +313,7 @@ fn project(
     x: Vec<i64>,
     x_step: usize,
     weight: Vec<i64>,
-    weight_pool: Option<usize>,
+    weight_pool: Option<ExternalSpec>,
     m: usize,
     n: usize,
     k: usize,
@@ -304,10 +334,11 @@ fn rms(
     x: Vec<i64>,
     x_step: usize,
     weight: Vec<i64>,
+    weight_ext: Option<ExternalSpec>,
     base: Vec<i64>,
-    base_pool: usize,
+    base_pool: ExternalSpec,
     extension: Vec<i64>,
-    extension_pool: usize,
+    extension_pool: ExternalSpec,
     rows: usize,
     cols: usize,
     valid: usize,
@@ -321,7 +352,7 @@ fn rms(
     };
     let inputs = vec![
         (x, None),
-        (broadcast(&weight, rows), None),
+        (broadcast(&weight, rows), weight_ext),
         (base, Some(base_pool)),
         (extension, Some(extension_pool)),
     ];
@@ -367,10 +398,9 @@ pub fn execute_shared_with_progress(
         planned_total,
         completed: 0,
         commitment: assets.commitment,
-        external_refs: &assets.refs,
     };
     let weight = |name: &str| assets.value(name);
-    let pool = |name: &str| assets.pool(name);
+    let pool = |name: &str| assets.external_rows(assets.pool(name)?);
 
     let base_path = format!("{SHARED_DIR}/rsqrt_table_i32.bin");
     let exp_path = format!("{SHARED_DIR}/exp_table_i32.bin");
@@ -436,6 +466,7 @@ pub fn execute_shared_with_progress(
 
         let (h, h_step) = rms(
             &mut builder, current.clone(), x_step, in_norm,
+            Some(assets.broadcast_spec(&path("in_norm"), m)?),
             base.clone(), base_pool, extension.clone(), extension_pool,
             m, PAD, REAL,
         )?;
@@ -447,6 +478,7 @@ pub fn execute_shared_with_progress(
         )?;
         let (k, k_step) = rms(
             &mut builder, k, k_step, k_norm,
+            Some(assets.broadcast_spec(&path("k_norm"), m)?),
             base.clone(), base_pool, extension.clone(), extension_pool,
             m, HEAD_DIM, HEAD_DIM,
         )?;
@@ -458,6 +490,7 @@ pub fn execute_shared_with_progress(
             let (q, q_step) = project(&mut builder, h.clone(), h_step, qw, None, m, HEAD_DIM, PAD, 16)?;
             let (q, q_step) = rms(
                 &mut builder, q, q_step, q_norm.clone(),
+                Some(assets.broadcast_spec(&path("q_norm"), m)?),
                 base.clone(), base_pool, extension.clone(), extension_pool,
                 m, HEAD_DIM, HEAD_DIM,
             )?;
@@ -526,6 +559,7 @@ pub fn execute_shared_with_progress(
         let (head_acc, head_step) = head_acc.ok_or(Error::IncompleteArtifact)?;
         let (attn_norm, attn_norm_step) = rms(
             &mut builder, head_acc, head_step, post_attn_norm,
+            Some(assets.broadcast_spec(&path("post_attn_norm"), m)?),
             base.clone(), base_pool, extension.clone(), extension_pool,
             m, PAD, REAL,
         )?;
@@ -537,6 +571,7 @@ pub fn execute_shared_with_progress(
         let x2 = x2[0].clone();
         let (h2, h2_step) = rms(
             &mut builder, x2.clone(), x2_step, pre_ffn_norm,
+            Some(assets.broadcast_spec(&path("pre_ffn_norm"), m)?),
             base.clone(), base_pool, extension.clone(), extension_pool,
             m, PAD, REAL,
         )?;
@@ -569,6 +604,7 @@ pub fn execute_shared_with_progress(
         )?;
         let (down_norm, down_norm_step) = rms(
             &mut builder, down, down_step, post_ffn_norm,
+            Some(assets.broadcast_spec(&path("post_ffn_norm"), m)?),
             base.clone(), base_pool, extension.clone(), extension_pool,
             m, PAD, REAL,
         )?;
@@ -583,6 +619,7 @@ pub fn execute_shared_with_progress(
 
     let (hf, hf_step) = rms(
         &mut builder, current, x_step, weight(&format!("{WEIGHT_DIR}/final_norm_i32.bin"))?,
+        Some(assets.broadcast_spec(&format!("{WEIGHT_DIR}/final_norm_i32.bin"), m)?),
         base, base_pool, extension, extension_pool,
         m, PAD, REAL,
     )?;
