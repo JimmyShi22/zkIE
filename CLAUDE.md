@@ -13,7 +13,7 @@ registered here:
 
 | Entry | Location | Purpose |
 |---|---|---|
-| zkie CLI | tools/zkie/src/main.rs | three-stage commit/prove/verify + matrix/run |
+| zkie CLI | zkie/src/main.rs | three-stage commit/prove/verify + matrix/run |
 | zkie-check CLI | tools/zkie-check/src/main.rs | acceptance report |
 
 ## Directory layout
@@ -25,7 +25,8 @@ crates/zkie-engine/ execution environment: primitives, storage::mmap, compute::c
                      context, metrics
 crates/zkie-ops/    operators and proofs: op/registry, pipeline, proof/*, live operator modules
 models/{gpt2,gemma3,timesfm}/  config + executor (weights always external)
-tools/              zkie, zkie-check
+zkie/               the main three-stage CLI (commit/prove/verify + matrix/run)
+tools/              zkie-check
 scripts/            data pipeline (extraction / simulation / GT), not the proof path
 docs/               benchmarks.md; spec / roadmap are TODO placeholders;
                      docs/benchmarks/ test trace archive (iteration tree)

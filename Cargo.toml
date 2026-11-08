@@ -1,4 +1,4 @@
 [workspace]
 resolver = "2"
-members = ["crates/zkie-core", "crates/zkie-ops", "crates/zkie-engine", "models/common", "models/gpt2", "models/timesfm", "models/gemma3", "tools/zkie", "tools/zkie-check"]
+members = ["crates/zkie-core", "crates/zkie-ops", "crates/zkie-engine", "models/common", "models/gpt2", "models/timesfm", "models/gemma3", "zkie", "tools/zkie-check"]
 
