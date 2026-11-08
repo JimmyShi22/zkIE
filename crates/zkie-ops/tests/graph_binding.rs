@@ -556,8 +556,8 @@ fn shared_trace_references_one_model_asset_opening() {
     use zkie_core::types::Digest;
     use zkie_ops::matmul::MatMulOp;
     use zkie_ops::proof::model_commitment::{
-        commit_assets, open_asset, verify_shared_trace, ModelAssetSpec, ModelCommitmentPublic,
-        SharedTrace, SharedTraceStep,
+        build_claim_set, commit_assets, open_asset, verify_shared_trace, ModelAssetSpec,
+        ModelCommitmentPublic, SharedTrace, SharedTraceStep,
     };
     use zkie_ops::proof::relations::ExternalAssetRef;
     use zkie_ops::proof::relations::{prove_op_relation_shared, RelationReceiptMessage};
@@ -623,13 +623,16 @@ fn shared_trace_references_one_model_asset_opening() {
         public_luts: vec![None, None],
         sources: vec![None, None],
     };
-    let trace = SharedTrace {
+    let mut trace = SharedTrace {
         tokens: vec![0],
         assets: vec![opening.clone()],
         steps: vec![step],
         argmax: vec![0],
         output: Vec::new(),
+        claims_root: Digest::ZERO,
     };
+    trace.claims_root =
+        build_claim_set(&trace, &public.anchor.model_commitment).unwrap().root;
     public.verify_opening(&opening).unwrap();
     verify_shared_trace(&public, &trace, &[0]).unwrap();
 

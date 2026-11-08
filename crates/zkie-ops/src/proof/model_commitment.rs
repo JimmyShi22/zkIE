@@ -13,7 +13,9 @@ use zkie_core::compute::{MemoryGovernor, MemoryRequest};
 use zkie_core::error::{Error, Result};
 use rayon::prelude::*;
 
-use crate::proof::binding::oracle_leaf_i64;
+use crate::proof::binding::{
+    oracle_leaf_i64, ClaimDirection, ClaimId, ClaimObligationRegistry, OracleId, StepId,
+};
 use crate::proof::relations::{ExternalAssetRef, ExternalLayout};
 use crate::public_lut::{self, PublicLutRef};
 use zkie_core::storage::TensorReader;
@@ -25,6 +27,7 @@ use zkie_engine::pcs::request::chain::KIND_ALGEBRAIC;
 use zkie_engine::pcs::request::link::{
     make_anchor, prove_link, verify_link, Anchor, AnchorRecord, LeafRecord, LinkProof,
 };
+use zkie_engine::primitives::codec::CanonicalWriter;
 use zkie_engine::primitives::transcript::{hash_labeled, tag_word, STATEMENT};
 
 use crate::proof::binding::{oracle_leaf, oracle_start};
@@ -74,6 +77,10 @@ pub struct AssetOpening {
     pub start: Digest,
     pub root: Digest,
     pub row_count: u64,
+    /// Last step ordinal that consumes this asset in the trace. The verifier
+    /// derives the actual last use from the ordered step list and rejects an
+    /// earlier declaration.
+    pub last_use_step: u64,
 }
 
 fn table_identity(spec: &ModelAssetSpec) -> Digest {
@@ -367,6 +374,7 @@ pub fn open_asset_from_reader(
         start: asset.start,
         root: asset.root,
         row_count,
+        last_use_step: 0,
     })
 }
 
@@ -495,8 +503,8 @@ impl<'a> AssetStore<'a> {
         &self,
         steps: &mut [SharedTraceStep],
     ) -> Result<Vec<AssetOpening>> {
-        let mut used = BTreeSet::new();
-        for step in steps.iter() {
+        let mut used: BTreeMap<u64, u64> = BTreeMap::new();
+        for (step_index, step) in steps.iter().enumerate() {
             if step.external.len() != step.public_luts.len() {
                 return Err(Error::ShapeMismatch);
             }
@@ -537,18 +545,25 @@ impl<'a> AssetStore<'a> {
                 {
                     return Err(Error::InvalidIndex);
                 }
-                used.insert(reference.asset_id);
+                let entry = used
+                    .entry(reference.asset_id)
+                    .or_insert(step_index as u64);
+                if (step_index as u64) > *entry {
+                    *entry = step_index as u64;
+                }
             }
         }
         let mut openings = Vec::with_capacity(used.len());
-        for asset_id in used {
+        for (asset_id, last_use_step) in used {
             let index = self
                 .commitment
                 .assets
                 .iter()
                 .position(|asset| asset.asset_id == asset_id)
                 .ok_or(Error::StatementMismatch)?;
-            openings.push(self.open_asset(index)?);
+            let mut opening = self.open_asset(index)?;
+            opening.last_use_step = last_use_step;
+            openings.push(opening);
         }
         Ok(openings)
     }
@@ -955,6 +970,368 @@ pub struct SharedTrace {
     pub argmax: Vec<u32>,
     #[serde(default)]
     pub output: Vec<i64>,
+    /// Commitment to the canonical ClaimId obligation set derived from the
+    /// ordered steps. The verifier recomputes the obligations from the
+    /// committed step data and rejects a mismatching commitment.
+    #[serde(default)]
+    pub claims_root: Digest,
+}
+
+const CLAIM_FORMAT_VERSION: u64 = 1;
+const CLAIM_OBLIGATION_TAG: u64 = 18;
+const CLAIMS_ROOT_TAG: u64 = 19;
+
+enum ClaimBinding<'a> {
+    Local {
+        oracle: OracleId,
+        root: &'a crate::proof::binding::OracleRoot,
+        len: usize,
+    },
+    External {
+        reference: ExternalAssetRef,
+        len: usize,
+    },
+    PublicLut {
+        reference: PublicLutRef,
+        len: usize,
+    },
+    Auxiliary {
+        role: u64,
+        oracle: OracleId,
+        root: &'a crate::proof::binding::OracleRoot,
+        len: usize,
+    },
+}
+
+struct ClaimSource {
+    producer_ordinal: u64,
+    producer_port: u16,
+    producer_obligation: Digest,
+}
+
+fn put_external_layout(writer: &mut CanonicalWriter, layout: &ExternalLayout) {
+    match layout {
+        ExternalLayout::Rows => writer.put_u64(0),
+        ExternalLayout::Broadcast { rows } => {
+            writer.put_u64(1);
+            writer.put_u64(*rows);
+        }
+        ExternalLayout::Columns {
+            source_row_width,
+            col_start,
+            col_count,
+        } => {
+            writer.put_u64(2);
+            writer.put_u64(*source_row_width);
+            writer.put_u64(*col_start);
+            writer.put_u64(*col_count);
+        }
+        ExternalLayout::BroadcastColumns {
+            source_row_width,
+            col_start,
+            col_count,
+            rows,
+        } => {
+            writer.put_u64(3);
+            writer.put_u64(*source_row_width);
+            writer.put_u64(*col_start);
+            writer.put_u64(*col_count);
+            writer.put_u64(*rows);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn claim_obligation(
+    graph_id: &Digest,
+    ordinal: u64,
+    opcode: u16,
+    config: &[i64],
+    direction: ClaimDirection,
+    port: u16,
+    binding: &ClaimBinding<'_>,
+    source: Option<ClaimSource>,
+) -> Result<Digest> {
+    let mut writer = CanonicalWriter::new();
+    writer.put_u64(CLAIM_FORMAT_VERSION);
+    writer.put_digest(graph_id);
+    writer.put_u64(ordinal);
+    writer.put_u64(opcode as u64);
+    writer.put_u64(config.len() as u64);
+    for value in config {
+        writer.put_u64(*value as u64);
+    }
+    writer.put_u64(direction as u64);
+    writer.put_u64(port as u64);
+    match binding {
+        ClaimBinding::Local { oracle, root, len } => {
+            writer.put_u64(0);
+            writer.put_u64(oracle.0);
+            writer.put_digest(&root.root);
+            writer.put_digest(&root.start);
+            writer.put_u64(root.count);
+            writer.put_u64(*len as u64);
+        }
+        ClaimBinding::External { reference, len } => {
+            writer.put_u64(1);
+            writer.put_u64(reference.asset_id);
+            writer.put_u64(reference.row_start);
+            writer.put_u64(reference.row_count);
+            put_external_layout(&mut writer, &reference.layout);
+            writer.put_u64(*len as u64);
+        }
+        ClaimBinding::PublicLut { reference, len } => {
+            writer.put_u64(2);
+            writer.put_u64(reference.asset_id);
+            writer.put_u64(reference.kind.tag() as u64);
+            writer.put_u64(reference.valid_len);
+            writer.put_u64(reference.padded_len);
+            writer.put_u64(*len as u64);
+        }
+        ClaimBinding::Auxiliary {
+            role,
+            oracle,
+            root,
+            len,
+        } => {
+            writer.put_u64(3);
+            writer.put_u64(*role);
+            writer.put_u64(oracle.0);
+            writer.put_digest(&root.root);
+            writer.put_digest(&root.start);
+            writer.put_u64(root.count);
+            writer.put_u64(*len as u64);
+        }
+    }
+    match source {
+        Some(source) => {
+            writer.put_u64(1);
+            writer.put_u64(source.producer_ordinal);
+            writer.put_u64(source.producer_port as u64);
+            writer.put_digest(&source.producer_obligation);
+        }
+        None => writer.put_u64(0),
+    }
+    hash_labeled(
+        tag_word(STATEMENT, CLAIM_OBLIGATION_TAG),
+        0,
+        None,
+        &writer.into_bytes(),
+    )
+}
+
+/// Complete canonical claim set derived from a trace. ClaimIds use the public
+/// model commitment as graph id and the ordered step position as ordinal.
+#[derive(Clone, Debug)]
+pub struct ClaimSet {
+    pub registry: ClaimObligationRegistry,
+    pub expected: Vec<ClaimId>,
+    pub root: Digest,
+}
+
+/// Recompute every (step, port, direction) obligation from the committed step
+/// data. The returned root is compared against the trace commitment; the
+/// registry enforces one content per ClaimId and legal reuse across ClaimIds.
+pub fn build_claim_set(trace: &SharedTrace, graph_id: &Digest) -> Result<ClaimSet> {
+    let mut registry = ClaimObligationRegistry::new();
+    let mut expected = Vec::new();
+    let mut output_obligations: BTreeMap<(usize, usize), Digest> = BTreeMap::new();
+    for (step_index, step) in trace.steps.iter().enumerate() {
+        let ordinal = step_index as u64;
+        let mut oracle_roots = crate::proof::binding::OracleRegistry::new();
+        for (root, start, count) in &step.message.roots {
+            oracle_roots.insert(*root, *start, *count)?;
+        }
+        let opcode = step.message.opcode;
+        let config = step.message.config.as_slice();
+        let step_id = StepId {
+            graph_id: *graph_id,
+            step_ordinal: ordinal,
+        };
+        for (port_index, openings) in step.message.proof.outputs.iter().enumerate() {
+            let opening = openings.first().ok_or(Error::StatementMismatch)?;
+            let root = oracle_roots
+                .get(opening.oracle)
+                .ok_or(Error::StatementMismatch)?;
+            let len = *step
+                .message
+                .proof
+                .lengths
+                .outputs
+                .get(port_index)
+                .ok_or(Error::StatementMismatch)?;
+            let port = u16::try_from(port_index).map_err(|_| Error::ResourceLimit)?;
+            let binding = ClaimBinding::Local {
+                oracle: opening.oracle,
+                root,
+                len,
+            };
+            let obligation = claim_obligation(
+                graph_id,
+                ordinal,
+                opcode,
+                config,
+                ClaimDirection::Output,
+                port,
+                &binding,
+                None,
+            )?;
+            let id = ClaimId {
+                step: step_id,
+                port,
+                direction: ClaimDirection::Output,
+            };
+            registry.register(id, obligation)?;
+            expected.push(id);
+            output_obligations.insert((step_index, port_index), obligation);
+        }
+        let input_count = step.message.proof.lengths.inputs.len();
+        if step.external.len() != input_count
+            || step.public_luts.len() != input_count
+            || step.sources.len() != input_count
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        for port_index in 0..input_count {
+            let port = u16::try_from(port_index).map_err(|_| Error::ResourceLimit)?;
+            let len = step.message.proof.lengths.inputs[port_index];
+            let binding = if let Some(reference) = step.external[port_index] {
+                ClaimBinding::External { reference, len }
+            } else if let Some(reference) = step.public_luts[port_index] {
+                ClaimBinding::PublicLut { reference, len }
+            } else {
+                let opening = step
+                    .message
+                    .proof
+                    .inputs
+                    .get(port_index)
+                    .and_then(|openings| openings.first())
+                    .ok_or(Error::StatementMismatch)?;
+                let root = oracle_roots
+                    .get(opening.oracle)
+                    .ok_or(Error::StatementMismatch)?;
+                ClaimBinding::Local {
+                    oracle: opening.oracle,
+                    root,
+                    len,
+                }
+            };
+            let source = match step.sources[port_index] {
+                Some((producer, producer_port)) => {
+                    let producer_obligation = output_obligations
+                        .get(&(producer, producer_port))
+                        .copied()
+                        .ok_or(Error::StatementMismatch)?;
+                    let producer_port =
+                        u16::try_from(producer_port).map_err(|_| Error::ResourceLimit)?;
+                    Some(ClaimSource {
+                        producer_ordinal: producer as u64,
+                        producer_port,
+                        producer_obligation,
+                    })
+                }
+                None => None,
+            };
+            let obligation = claim_obligation(
+                graph_id,
+                ordinal,
+                opcode,
+                config,
+                ClaimDirection::Input,
+                port,
+                &binding,
+                source,
+            )?;
+            let id = ClaimId {
+                step: step_id,
+                port,
+                direction: ClaimDirection::Input,
+            };
+            registry.register(id, obligation)?;
+            expected.push(id);
+        }
+        let mut auxiliary_port: u16 = 0;
+        for (role, groups, lengths) in [
+            (
+                0u64,
+                step.message.proof.raw.as_slice(),
+                step.message.proof.lengths.raw.as_slice(),
+            ),
+            (
+                1u64,
+                step.message.proof.quotients.as_slice(),
+                step.message.proof.lengths.quotients.as_slice(),
+            ),
+            (
+                2u64,
+                step.message.proof.helpers.as_slice(),
+                step.message.proof.lengths.helpers.as_slice(),
+            ),
+            (
+                3u64,
+                step.message.proof.aux.as_slice(),
+                step.message.proof.lengths.aux.as_slice(),
+            ),
+        ] {
+            for (group_index, openings) in groups.iter().enumerate() {
+                let opening = openings.first().ok_or(Error::StatementMismatch)?;
+                let root = oracle_roots
+                    .get(opening.oracle)
+                    .ok_or(Error::StatementMismatch)?;
+                let len = *lengths
+                    .get(group_index)
+                    .ok_or(Error::StatementMismatch)?;
+                let binding = ClaimBinding::Auxiliary {
+                    role,
+                    oracle: opening.oracle,
+                    root,
+                    len,
+                };
+                let obligation = claim_obligation(
+                    graph_id,
+                    ordinal,
+                    opcode,
+                    config,
+                    ClaimDirection::Auxiliary,
+                    auxiliary_port,
+                    &binding,
+                    None,
+                )?;
+                let id = ClaimId {
+                    step: step_id,
+                    port: auxiliary_port,
+                    direction: ClaimDirection::Auxiliary,
+                };
+                registry.register(id, obligation)?;
+                expected.push(id);
+                auxiliary_port = auxiliary_port
+                    .checked_add(1)
+                    .ok_or(Error::ResourceLimit)?;
+            }
+        }
+    }
+    let mut writer = CanonicalWriter::new();
+    writer.put_u64(CLAIM_FORMAT_VERSION);
+    writer.put_digest(graph_id);
+    writer.put_u64(registry.len() as u64);
+    for (id, obligation) in registry.iter() {
+        writer.put_u64(id.step.step_ordinal);
+        writer.put_u64(id.direction as u64);
+        writer.put_u64(id.port as u64);
+        writer.put_digest(obligation);
+    }
+    let root = hash_labeled(
+        tag_word(STATEMENT, CLAIMS_ROOT_TAG),
+        0,
+        None,
+        &writer.into_bytes(),
+    )?;
+    registry.verify_complete(&expected)?;
+    Ok(ClaimSet {
+        registry,
+        expected,
+        root,
+    })
 }
 
 pub fn verify_shared_trace(
@@ -1115,6 +1492,28 @@ fn verify_shared_trace_steps(
     {
         return Err(Error::StatementMismatch);
     }
+    // Lifetime declarations must cover every actual consumption site. The
+    // structure-derived last use wins over an earlier prover declaration.
+    let mut actual_last_use: BTreeMap<u64, u64> = BTreeMap::new();
+    for (step_index, step) in trace.steps.iter().enumerate() {
+        for reference in step.external.iter().flatten() {
+            let entry = actual_last_use
+                .entry(reference.asset_id)
+                .or_insert(step_index as u64);
+            if (step_index as u64) > *entry {
+                *entry = step_index as u64;
+            }
+        }
+    }
+    for opening in &trace.assets {
+        let actual = actual_last_use
+            .get(&opening.asset_id)
+            .copied()
+            .unwrap_or(0);
+        if opening.last_use_step < actual {
+            return Err(Error::StatementMismatch);
+        }
+    }
     openings_by_id
         .par_iter()
         .try_for_each(|(_, opening)| public.verify_opening(opening))?;
@@ -1228,6 +1627,13 @@ fn verify_shared_trace_steps(
             }
         }
         outputs.push(crate::proof::relations::proof_output_values(&step.message.proof));
+    }
+    // Claim obligations are recomputed from the verified step data and must
+    // match the commitment carried by the trace. Missing, duplicate, or
+    // conflicting ClaimIds are rejected by the registry.
+    let claims = build_claim_set(trace, &public.anchor.model_commitment)?;
+    if trace.claims_root == Digest::ZERO || trace.claims_root != claims.root {
+        return Err(Error::StatementMismatch);
     }
     Ok(outputs)
 }

@@ -138,6 +138,12 @@ impl ClaimObligationRegistry {
         self.obligations.get(id)
     }
 
+    /// Entries in canonical ClaimId order. Used to commit the complete
+    /// obligation set without depending on registration order.
+    pub fn iter(&self) -> impl Iterator<Item = (&ClaimId, &Digest)> {
+        self.obligations.iter()
+    }
+
     pub fn len(&self) -> usize {
         self.obligations.len()
     }

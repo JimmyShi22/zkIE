@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use zkie_core::error::{Error, Result};
+use zkie_core::types::Digest;
 use zkie_core::progress::{ProgressEvent, ProgressKind, ProgressSink};
 use zkie_ops::add::AddOp;
 use zkie_ops::affine_scale::AffineScaleOp;
@@ -16,8 +17,8 @@ use zkie_ops::matmul::MatMulOp;
 use zkie_ops::profile_norm::ProfileLayerNormOp;
 use zkie_ops::projection::ProjectionOp;
 use zkie_ops::proof::model_commitment::{
-    commit_assets, AssetOpening, AssetStore, ModelAssetSpec, ModelCommitment, SharedTrace,
-    SharedTraceStep,
+    build_claim_set, commit_assets, AssetOpening, AssetStore, ModelAssetSpec, ModelCommitment,
+    SharedTrace, SharedTraceStep,
 };
 use zkie_ops::proof::relations::{
     proof_output_values, prove_op_relation_shared, ExternalAssetRef, ExternalLayout,
@@ -665,13 +666,17 @@ pub fn execute_shared_with_progress(
         event.unit = Some("relation_steps".into());
         let _ = progress.emit(event);
     }
-    Ok(SharedTrace {
+    let mut trace = SharedTrace {
         tokens: tokens.iter().map(|value| *value as u32).collect(),
         assets: trace_assets,
         steps,
         argmax,
         output: Vec::new(),
-    })
+        claims_root: Digest::ZERO,
+    };
+    trace.claims_root =
+        build_claim_set(&trace, &assets.commitment.anchor.record.model_commitment)?.root;
+    Ok(trace)
 }
 
 pub fn build_commitment(asset_root: &Path, tokens: &[u32]) -> Result<ModelCommitment> {

@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 
 use zkie_core::types::Digest;
 use zkie_ops::proof::model_commitment::{
-    commit_assets, open_asset, verify_shared_trace, AssetOpening, ModelAssetSpec,
+    build_claim_set, commit_assets, open_asset, verify_shared_trace, AssetOpening, ModelAssetSpec,
     ModelCommitment, ModelCommitmentPublic, SharedTrace, SharedTraceStep,
 };
 use zkie_ops::proof::relations::{
@@ -198,7 +198,7 @@ fn softmax_trace() -> SharedTrace {
         let root = relation_public.registry.get(id).unwrap();
         roots.push((root.root, root.start, root.count));
     }
-    SharedTrace {
+    seal(SharedTrace {
         tokens: vec![0],
         assets: Vec::new(),
         steps: vec![step_with(
@@ -212,7 +212,8 @@ fn softmax_trace() -> SharedTrace {
         )],
         argmax: vec![0],
         output: Vec::new(),
-    }
+        claims_root: Digest::ZERO,
+    })
 }
 
 fn rsqrt_lookup_trace() -> SharedTrace {
@@ -232,7 +233,7 @@ fn rsqrt_lookup_trace() -> SharedTrace {
         let root = relation_public.registry.get(id).unwrap();
         roots.push((root.root, root.start, root.count));
     }
-    SharedTrace {
+    seal(SharedTrace {
         tokens: vec![0],
         assets: Vec::new(),
         steps: vec![step_with(
@@ -246,7 +247,8 @@ fn rsqrt_lookup_trace() -> SharedTrace {
         )],
         argmax: vec![0],
         output: Vec::new(),
-    }
+        claims_root: Digest::ZERO,
+    })
 }
 
 fn asset_add_trace() -> SharedTrace {
@@ -265,7 +267,7 @@ fn asset_add_trace() -> SharedTrace {
         let root = relation_public.registry.get(id).unwrap();
         roots.push((root.root, root.start, root.count));
     }
-    SharedTrace {
+    seal(SharedTrace {
         tokens: vec![0],
         assets: vec![fixture.weights_opening.clone()],
         steps: vec![step_with(
@@ -279,7 +281,8 @@ fn asset_add_trace() -> SharedTrace {
         )],
         argmax: vec![0],
         output: Vec::new(),
-    }
+        claims_root: Digest::ZERO,
+    })
 }
 
 fn layout_trace(values: Vec<i64>, reference: ExternalAssetRef) -> SharedTrace {
@@ -294,7 +297,7 @@ fn layout_trace(values: Vec<i64>, reference: ExternalAssetRef) -> SharedTrace {
         let root = relation_public.registry.get(id).unwrap();
         roots.push((root.root, root.start, root.count));
     }
-    SharedTrace {
+    seal(SharedTrace {
         tokens: vec![0],
         assets: vec![fixture.weights_opening.clone()],
         steps: vec![step_with(
@@ -308,7 +311,8 @@ fn layout_trace(values: Vec<i64>, reference: ExternalAssetRef) -> SharedTrace {
         )],
         argmax: vec![0],
         output: Vec::new(),
-    }
+        claims_root: Digest::ZERO,
+    })
 }
 
 fn broadcast_trace() -> SharedTrace {
@@ -354,6 +358,14 @@ fn broadcast_columns_trace() -> SharedTrace {
             },
         },
     )
+}
+
+fn seal(mut trace: SharedTrace) -> SharedTrace {
+    trace.claims_root =
+        build_claim_set(&trace, &fixture().public.anchor.model_commitment)
+            .unwrap()
+            .root;
+    trace
 }
 
 fn roundtrip(trace: &SharedTrace) -> SharedTrace {
@@ -695,4 +707,131 @@ fn broadcast_columns_window_overflow_rejected() {
         *col_count = 2;
     }
     assert_rejects(&tampered);
+}
+
+fn local_add_step(
+    left: Vec<i64>,
+    right: Vec<i64>,
+    sources: Vec<Option<(usize, usize)>>,
+) -> SharedTraceStep {
+    let op = AddOp;
+    let config = Vec::new();
+    let (relation_public, proof) =
+        prove_op_relation_shared(&op, &[left, right], &config, &[]).unwrap();
+    let mut roots = Vec::new();
+    for id in relation_public.registry.ids() {
+        let root = relation_public.registry.get(id).unwrap();
+        roots.push((root.root, root.start, root.count));
+    }
+    let mut step = step_with(
+        op.opcode() as u16,
+        config,
+        roots,
+        Vec::new(),
+        proof,
+        vec![None, None],
+        vec![None, None],
+    );
+    step.sources = sources;
+    step
+}
+
+fn producer_chain_trace() -> SharedTrace {
+    let first = local_add_step(vec![1, 1], vec![1, 1], vec![None, None]);
+    let second = local_add_step(vec![1, 1], vec![1, 1], vec![None, None]);
+    let consumer = local_add_step(vec![2, 2], vec![1, 1], vec![Some((0, 0)), None]);
+    seal(SharedTrace {
+        tokens: vec![0],
+        assets: Vec::new(),
+        steps: vec![first, second, consumer],
+        argmax: vec![0],
+        output: Vec::new(),
+        claims_root: Digest::ZERO,
+    })
+}
+
+fn local_pair_trace() -> SharedTrace {
+    let step = local_add_step(vec![1, 2], vec![3, 4], vec![None, None]);
+    seal(SharedTrace {
+        tokens: vec![0],
+        assets: Vec::new(),
+        steps: vec![step],
+        argmax: vec![0],
+        output: Vec::new(),
+        claims_root: Digest::ZERO,
+    })
+}
+
+fn shared_asset_steps_trace() -> SharedTrace {
+    let fixture = fixture();
+    let weights = fixture.weights;
+    let mut opening = fixture.weights_opening.clone();
+    opening.last_use_step = 1;
+    let op = AddOp;
+    let mut steps = Vec::new();
+    for _ in 0..2 {
+        let config = Vec::new();
+        let (relation_public, proof) = prove_op_relation_shared(
+            &op,
+            &[vec![5, 6, 7, 8], vec![1, 2, 3, 4]],
+            &config,
+            &[1],
+        )
+        .unwrap();
+        let mut roots = Vec::new();
+        for id in relation_public.registry.ids() {
+            let root = relation_public.registry.get(id).unwrap();
+            roots.push((root.root, root.start, root.count));
+        }
+        steps.push(step_with(
+            op.opcode() as u16,
+            config,
+            roots,
+            vec![1],
+            proof,
+            vec![None, Some(weights)],
+            vec![None, None],
+        ));
+    }
+    seal(SharedTrace {
+        tokens: vec![0],
+        assets: vec![opening],
+        steps,
+        argmax: vec![0],
+        output: Vec::new(),
+        claims_root: Digest::ZERO,
+    })
+}
+
+#[test]
+fn source_rebind_with_equal_values_rejected() {
+    let base = producer_chain_trace();
+    assert_accepts(&base);
+    let mut tampered = roundtrip(&base);
+    tampered.steps[2].sources[0] = Some((1, 0));
+    assert_rejects(&tampered);
+}
+
+#[test]
+fn claim_port_content_swap_rejected() {
+    let base = local_pair_trace();
+    assert_accepts(&base);
+    let mut tampered = roundtrip(&base);
+    tampered.steps[0].message.proof.inputs.swap(0, 1);
+    assert_rejects(&tampered);
+}
+
+#[test]
+fn early_last_use_rejected() {
+    let base = shared_asset_steps_trace();
+    assert_accepts(&base);
+    let mut tampered = roundtrip(&base);
+    tampered.assets[0].last_use_step = 0;
+    assert_rejects(&tampered);
+}
+
+#[test]
+fn different_claim_ids_share_one_slice_accepted() {
+    let trace = shared_asset_steps_trace();
+    assert_accepts(&trace);
 }
