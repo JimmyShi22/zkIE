@@ -26,10 +26,10 @@
 - `/tmp/v2smoke` total: 3.9G.
 - Commit artifact: ~100KB. `proof.bin`: 4.16GB. `statement.bin`: 214B.
   `public-inputs.bin`: 72B.
-- Large binaries remain in `/tmp/v2smoke` (volatile tmpfs) and are not
-  committed.
-- Archived `proof.bin` (gitignored):
+- `proof.bin` is archived on disk in this directory (gitignored, not committed):
   `docs/benchmarks/20261108-2339-v2baseline-acda8a6-f485c4d/mincase-seq16/proof/proof.bin`.
+- A copy also remains under `/tmp/v2smoke` (volatile tmpfs) and may disappear;
+  the on-disk copy above is the durable archive.
 
 ## seq512 scaling measurement — GPT-2 seq512
 
@@ -42,10 +42,10 @@
 - `/tmp/v2smoke512` total at completion: 37G.
 - Scaling vs seq16: proof 9.37x, prove wall 7.03x, prove VmHWM 9.45x,
   verify wall 9.38x, verify VmHWM 8.70x.
-- Large binaries remain in `/tmp/v2smoke512` (volatile tmpfs) and are not
-  committed.
-- Archived `proof.bin` (gitignored):
+- `proof.bin` is archived on disk in this directory (gitignored, not committed):
   `docs/benchmarks/20261108-2339-v2baseline-acda8a6-f485c4d/seq512/proof/proof.bin`.
+- A copy also remains under `/tmp/v2smoke512` (volatile tmpfs) and may
+  disappear; the on-disk copy above is the durable archive.
 
 ## Matrix
 
