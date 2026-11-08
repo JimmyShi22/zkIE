@@ -4,7 +4,12 @@
 //! reads a proof and never executes the model. The verifier uses it to bind
 //! every step, input port and final output to the expected data flow.
 
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
+
 use zkie_core::error::{Error, Result};
+use zkie_core::types::Digest;
 
 use crate::op::OpCode;
 use crate::proof::model_commitment::{
@@ -70,7 +75,7 @@ impl PlanSource {
 }
 
 /// Static tensor layouts. Layouts are applied in order.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PlanLayout {
     Flat,
     Range {
@@ -306,6 +311,7 @@ pub struct TracePlan {
     pub steps: Vec<PlanStep>,
     pub argmax_steps: Vec<usize>,
     pub final_output: Option<PlanFinalOutput>,
+    pub model_version: u32,
 }
 
 impl TracePlan {
@@ -314,6 +320,7 @@ impl TracePlan {
             steps: Vec::new(),
             argmax_steps: Vec::new(),
             final_output: None,
+            model_version: 0,
         }
     }
 }
@@ -376,14 +383,89 @@ pub fn config(values: Vec<i64>) -> Vec<PlanConfigValue> {
     values.into_iter().map(PlanConfigValue::Literal).collect()
 }
 
+/// Identity of an authenticated asset, bound to the model version and anchor.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct AssetCacheKey {
+    model_version: u32,
+    anchor_id: Digest,
+    model_commitment: Digest,
+    asset_id: u64,
+    path: String,
+    start: Digest,
+    root: Digest,
+    leaf_root: Digest,
+    element_count: u64,
+    rows: u64,
+}
+
+/// Assets whose materialized values are reused by the trusted plan.
+pub(crate) type AssetCacheKeys = BTreeSet<(String, PlanLayout)>;
+
+pub(crate) fn cache_keys(plan: &TracePlan) -> AssetCacheKeys {
+    let mut counts: BTreeMap<(String, PlanLayout), usize> = BTreeMap::new();
+    for step in &plan.steps {
+        for source in &step.inputs {
+            count_source(source, &mut counts);
+        }
+        for value in &step.config {
+            if let PlanConfigValue::AssetI64 { path, .. } = value {
+                *counts.entry((path.clone(), PlanLayout::Flat)).or_insert(0) += 1;
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(key, _)| key)
+        .collect()
+}
+
+fn count_source(source: &PlanSource, counts: &mut BTreeMap<(String, PlanLayout), usize>) {
+    match source {
+        PlanSource::Asset { path, layout } => {
+            *counts.entry((path.clone(), layout.clone())).or_insert(0) += 1;
+        }
+        PlanSource::Concat(parts) => {
+            for part in parts {
+                count_source(part, counts);
+            }
+        }
+        PlanSource::HeadConcat { parts, .. } => {
+            for part in parts {
+                count_source(part, counts);
+            }
+        }
+        PlanSource::Layout(inner, _) => count_source(inner, counts),
+        PlanSource::Prev { .. } | PlanSource::Constant(_) => {}
+    }
+}
+
 pub(crate) struct AssetView<'a> {
     public: &'a ModelCommitmentPublic,
     trace: &'a SharedTrace,
+    model_version: u32,
+    cache_keys: AssetCacheKeys,
+    full_cache: RefCell<BTreeMap<AssetCacheKey, Rc<Vec<i64>>>>,
+    slice_cache: RefCell<BTreeMap<(AssetCacheKey, PlanLayout), Rc<Vec<i64>>>>,
 }
 
 impl<'a> AssetView<'a> {
-    pub(crate) fn new(public: &'a ModelCommitmentPublic, trace: &'a SharedTrace) -> Self {
-        Self { public, trace }
+    /// The caller verifies every opening before constructing the view; cached
+    /// values are only derived from those verified openings and are keyed by
+    /// the model version, anchor identity and full asset identity.
+    pub(crate) fn new(
+        public: &'a ModelCommitmentPublic,
+        trace: &'a SharedTrace,
+        plan: &TracePlan,
+    ) -> Self {
+        Self {
+            public,
+            trace,
+            model_version: plan.model_version,
+            cache_keys: cache_keys(plan),
+            full_cache: RefCell::new(BTreeMap::new()),
+            slice_cache: RefCell::new(BTreeMap::new()),
+        }
     }
 
     fn meta(&self, path: &str) -> Result<&AssetMeta> {
@@ -403,7 +485,45 @@ impl<'a> AssetView<'a> {
             .ok_or(Error::StatementMismatch)
     }
 
-    fn full_values(&self, path: &str) -> Result<Vec<i64>> {
+    fn cache_key(&self, path: &str) -> Result<AssetCacheKey> {
+        let meta = self.meta(path)?;
+        Ok(AssetCacheKey {
+            model_version: self.model_version,
+            anchor_id: self.public.anchor.anchor_id,
+            model_commitment: self.public.anchor.model_commitment,
+            asset_id: meta.asset_id,
+            path: meta.path.clone(),
+            start: meta.start,
+            root: meta.root,
+            leaf_root: meta.leaf_record.leaf_root,
+            element_count: meta.element_count,
+            rows: meta.rows,
+        })
+    }
+
+    fn cacheable(&self, path: &str, layout: &PlanLayout) -> bool {
+        self.cache_keys
+            .contains(&(path.to_owned(), layout.clone()))
+    }
+
+    fn full_values(&self, path: &str) -> Result<Rc<Vec<i64>>> {
+        let key = self.cache_key(path)?;
+        let cacheable = self.cacheable(path, &PlanLayout::Flat);
+        if cacheable {
+            if let Some(values) = self.full_cache.borrow().get(&key) {
+                return Ok(Rc::clone(values));
+            }
+        }
+        let values = Rc::new(self.materialize_full(path)?);
+        if cacheable {
+            self.full_cache
+                .borrow_mut()
+                .insert(key, Rc::clone(&values));
+        }
+        Ok(values)
+    }
+
+    fn materialize_full(&self, path: &str) -> Result<Vec<i64>> {
         let meta = self.meta(path)?;
         let opening = self.opening(path)?;
         if opening.row_count != meta.rows || opening.rows.len() != meta.rows as usize {
@@ -428,9 +548,29 @@ impl<'a> AssetView<'a> {
         Ok(values)
     }
 
-    fn source_values(&self, path: &str, layout: &PlanLayout) -> Result<Vec<i64>> {
-        let values = self.full_values(path)?;
-        layout.apply(&values)
+    fn source_values(&self, path: &str, layout: &PlanLayout) -> Result<Rc<Vec<i64>>> {
+        if matches!(layout, PlanLayout::Flat) {
+            return self.full_values(path);
+        }
+        let key = self.cache_key(path)?;
+        let cacheable = self.cacheable(path, layout);
+        if cacheable {
+            if let Some(values) = self
+                .slice_cache
+                .borrow()
+                .get(&(key.clone(), layout.clone()))
+            {
+                return Ok(Rc::clone(values));
+            }
+        }
+        let full = self.full_values(path)?;
+        let values = Rc::new(layout.apply(&full)?);
+        if cacheable {
+            self.slice_cache
+                .borrow_mut()
+                .insert((key, layout.clone()), Rc::clone(&values));
+        }
+        Ok(values)
     }
 
     fn external_values(&self, pool: usize) -> Result<Vec<i64>> {
@@ -466,7 +606,7 @@ fn materialize(
     verified_outputs: &[Vec<Vec<i64>>],
     assets: &AssetView<'_>,
     tokens: &[u32],
-) -> Result<Vec<i64>> {
+) -> Result<Rc<Vec<i64>>> {
     match source {
         PlanSource::Prev {
             step,
@@ -477,16 +617,17 @@ fn materialize(
                 .get(*step)
                 .and_then(|outputs| outputs.get(*output))
                 .ok_or(Error::InvalidIndex)?;
-            layout.apply(values)
+            Ok(Rc::new(layout.apply(values)?))
         }
         PlanSource::Asset { path, layout } => assets.source_values(path, layout),
-        PlanSource::Constant(constant) => constant.materialize(tokens),
+        PlanSource::Constant(constant) => Ok(Rc::new(constant.materialize(tokens)?)),
         PlanSource::Concat(parts) => {
             let mut out = Vec::new();
             for part in parts {
-                out.extend(materialize(part, verified_outputs, assets, tokens)?);
+                let part = materialize(part, verified_outputs, assets, tokens)?;
+                out.extend_from_slice(&part);
             }
-            Ok(out)
+            Ok(Rc::new(out))
         }
         PlanSource::HeadConcat { parts, rows } => {
             if *rows == 0 || parts.is_empty() {
@@ -507,11 +648,11 @@ fn materialize(
                     out.extend_from_slice(&part[row * head_dim..(row + 1) * head_dim]);
                 }
             }
-            Ok(out)
+            Ok(Rc::new(out))
         }
         PlanSource::Layout(inner, layout) => {
             let values = materialize(inner, verified_outputs, assets, tokens)?;
-            layout.apply(&values)
+            Ok(Rc::new(layout.apply(&values)?))
         }
     }
 }
@@ -545,6 +686,16 @@ fn source_kind(source: &PlanSource) -> SourceKind {
     }
 }
 
+fn external_flat_path(source: &PlanSource) -> Option<&str> {
+    match source {
+        PlanSource::Asset {
+            path,
+            layout: PlanLayout::Flat,
+        } => Some(path.as_str()),
+        _ => None,
+    }
+}
+
 pub(crate) fn verify_step(
     step: &SharedTraceStep,
     plan_step: &PlanStep,
@@ -575,9 +726,39 @@ pub(crate) fn verify_step(
         return Err(Error::ShapeMismatch);
     }
     for (port, source) in plan_step.inputs.iter().enumerate() {
-        let expected = materialize(source, verified_outputs, assets, tokens)?;
         let external = step.external.get(port).copied().flatten();
         let edge = step.sources.get(port).copied().flatten();
+        if matches!(source_kind(source), SourceKind::Asset) && external.is_some() {
+            if edge.is_some() {
+                return Err(Error::StatementMismatch);
+            }
+            if let Some(path) = external_flat_path(source) {
+                let pool = external.ok_or(Error::StatementMismatch)?;
+                let meta = assets.meta(path)?;
+                // A flat external asset is supplied by the verified opening
+                // itself. Check the planned identity and full coverage; value
+                // equality follows from the anchor-bound, Merkle-verified
+                // opening, so no materialization is needed. Partial rows keep
+                // the materialized comparison path below.
+                if meta.row_width != 0 && meta.element_count % meta.row_width as u64 == 0 {
+                    let opening = assets
+                        .trace
+                        .assets
+                        .get(pool)
+                        .ok_or(Error::StatementMismatch)?;
+                    if opening.asset_id != meta.asset_id
+                        || opening.start != meta.start
+                        || opening.root != meta.root
+                        || opening.row_count != meta.rows
+                        || opening.rows.len() != meta.rows as usize
+                    {
+                        return Err(Error::IncompleteArtifact);
+                    }
+                    continue;
+                }
+            }
+        }
+        let expected = materialize(source, verified_outputs, assets, tokens)?;
         match source_kind(source) {
             SourceKind::Prev {
                 step,
@@ -594,7 +775,9 @@ pub(crate) fn verify_step(
                 } else if edge.is_some() {
                     return Err(Error::StatementMismatch);
                 }
-                if inputs.get(port) != Some(&expected) {
+                if inputs.get(port).map(|values| values.as_slice())
+                    != Some(expected.as_slice())
+                {
                     return Err(Error::StatementMismatch);
                 }
             }
@@ -620,12 +803,14 @@ pub(crate) fn verify_step(
                         if opening.asset_id != plan_asset {
                             return Err(Error::StatementMismatch);
                         }
-                        if assets.external_values(pool)? != expected {
+                        if assets.external_values(pool)?.as_slice() != expected.as_slice() {
                             return Err(Error::StatementMismatch);
                         }
                     }
                     None => {
-                        if inputs.get(port) != Some(&expected) {
+                        if inputs.get(port).map(|values| values.as_slice())
+                            != Some(expected.as_slice())
+                        {
                             return Err(Error::StatementMismatch);
                         }
                     }
@@ -635,7 +820,7 @@ pub(crate) fn verify_step(
                 if external.is_some() || edge.is_some() {
                     return Err(Error::StatementMismatch);
                 }
-                if inputs.get(port) != Some(&expected) {
+                if inputs.get(port).map(|values| values.as_slice()) != Some(expected.as_slice()) {
                     return Err(Error::StatementMismatch);
                 }
             }
@@ -705,4 +890,36 @@ pub(crate) fn verify_outputs(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_keys_select_only_reused_sources() {
+        let mut builder = PlanBuilder::new();
+        builder.step(
+            OpCode::TableLookup,
+            Vec::new(),
+            vec![
+                PlanSource::asset("reused.bin"),
+                PlanSource::asset("once.bin"),
+            ],
+            1,
+        );
+        builder.step(
+            OpCode::TableLookup,
+            Vec::new(),
+            vec![
+                PlanSource::asset("reused.bin"),
+                PlanSource::prev(0, 0),
+            ],
+            1,
+        );
+        let plan = builder.finish();
+        let keys = cache_keys(&plan);
+        assert!(keys.contains(&("reused.bin".to_owned(), PlanLayout::Flat)));
+        assert!(!keys.contains(&("once.bin".to_owned(), PlanLayout::Flat)));
+    }
 }

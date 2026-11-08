@@ -518,7 +518,9 @@ pub fn trace_plan(m: usize) -> Result<TracePlan> {
         1,
     );
     builder.final_output(output, 0);
-    Ok(builder.finish())
+    let mut plan = builder.finish();
+    plan.model_version = MODEL_VERSION;
+    Ok(plan)
 }
 
 fn transcript_digest(tag: u64, data: &[u8]) -> Result<Digest> {
@@ -534,6 +536,13 @@ fn transcript_digest(tag: u64, data: &[u8]) -> Result<Digest> {
 }
 
 pub const MODEL_VERSION: u32 = 1;
+
+pub fn output_elements(patches: usize) -> Result<usize> {
+    if patches != config::PATCH_TOKENS {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(SEQ * H_PAD)
+}
 
 pub fn parameters_digest() -> Result<Digest> {
     transcript_digest(14, b"timesfm-16patch")

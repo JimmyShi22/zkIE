@@ -677,7 +677,7 @@ fn verify_shared_trace_steps(
         .par_iter()
         .try_for_each(|opening| public.verify_opening(opening))?;
     let mut outputs: Vec<Vec<Vec<i64>>> = Vec::with_capacity(trace.steps.len());
-    let assets = crate::proof::plan::AssetView::new(public, trace);
+    let assets = crate::proof::plan::AssetView::new(public, trace, plan);
     for (step_index, step) in trace.steps.iter().enumerate() {
         let mut registry = crate::proof::binding::OracleRegistry::new();
         for (root, start, count) in &step.message.roots {

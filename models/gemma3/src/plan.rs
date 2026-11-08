@@ -411,7 +411,9 @@ pub fn trace_plan(m: usize) -> Result<TracePlan> {
         );
         builder.argmax_step(argmax);
     }
-    Ok(builder.finish())
+    let mut plan = builder.finish();
+    plan.model_version = MODEL_VERSION;
+    Ok(plan)
 }
 
 fn transcript_digest(tag: u64, data: &[u8]) -> Result<Digest> {
@@ -427,6 +429,10 @@ fn transcript_digest(tag: u64, data: &[u8]) -> Result<Digest> {
 }
 
 pub const MODEL_VERSION: u32 = 1;
+
+pub fn valid_vocab() -> usize {
+    config::VOCAB
+}
 
 pub fn parameters_digest() -> Result<Digest> {
     transcript_digest(14, b"gemma3-seq16")

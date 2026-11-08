@@ -545,3 +545,91 @@ fn negative_wrong_asset() {
     };
     assert_rejected(&fixture);
 }
+
+#[test]
+fn negative_external_opening_must_cover_the_full_asset() {
+    let root = temp_dir();
+    let table = vec![10i64, 20, 30, 40, 50, 60, 70, 80];
+    let table_i32: Vec<i32> = table.iter().map(|value| *value as i32).collect();
+    write_i32(&root.join("table_i32.bin"), &table_i32);
+    let specs = vec![ModelAssetSpec {
+        asset_id: 0,
+        path: "table_i32.bin".into(),
+        element_count: table.len() as u64,
+        row_width: 4,
+        encoding: "i32-le".into(),
+    }];
+    let commitment =
+        commit_assets(&root, Digest([9; 32]), Digest([10; 32]), &specs).unwrap();
+    let public = ModelCommitmentPublic::from_commitment(&commitment);
+    let opening = AssetStore::open(&commitment).unwrap().open_all().unwrap();
+    let tokens = vec![2u32];
+    let token_values: Vec<i64> = tokens.iter().map(|value| *value as i64).collect();
+    let (embed_step, embed_out) = make_step(
+        &EmbeddingIndexOp {
+            hidden: 1,
+            vocab: 4,
+        },
+        &[token_values],
+        &[1, 4],
+        &[],
+        vec![None],
+        vec![None],
+    );
+    let (lookup_step, lookup_out) = make_step(
+        &TableLookupOp,
+        &[table, embed_out[0].clone()],
+        &[],
+        &[0],
+        vec![Some(0), None],
+        vec![None, Some((0, 0))],
+    );
+    let trace = SharedTrace {
+        tokens,
+        assets: opening,
+        steps: vec![embed_step, lookup_step],
+        argmax: Vec::new(),
+        output: lookup_out[0].clone(),
+    };
+    let mut builder = PlanBuilder::new();
+    let embed = builder.step(
+        OpCode::EmbeddingIndex,
+        config(vec![1, 4]),
+        vec![PlanSource::Constant(PlanConstant::Tokens)],
+        1,
+    );
+    let lookup = builder.step(
+        OpCode::TableLookup,
+        config(Vec::new()),
+        vec![
+            PlanSource::asset("table_i32.bin"),
+            PlanSource::prev(embed, 0),
+        ],
+        1,
+    );
+    builder.final_output(lookup, 0);
+    let plan = builder.finish();
+    let fixture = Fixture {
+        public,
+        trace,
+        tokens: vec![2],
+        plan,
+    };
+    zkie_ops::proof::model_commitment::verify_shared_trace_output(
+        &fixture.public,
+        &fixture.trace,
+        &fixture.tokens,
+        &fixture.plan,
+    )
+    .unwrap();
+
+    let mut negative = Fixture {
+        public: fixture.public.clone(),
+        trace: fixture.trace.clone(),
+        tokens: fixture.tokens.clone(),
+        plan: fixture.plan.clone(),
+    };
+    negative.trace.assets[0].rows.pop();
+    negative.trace.assets[0].row_count = 1;
+    assert_rejected(&negative);
+}
