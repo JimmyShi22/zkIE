@@ -444,3 +444,17 @@ fn duplicate_asset_reference_rejected() {
     tampered.assets.push(fixture().weights_opening.clone());
     assert_rejects(&tampered);
 }
+
+#[test]
+fn step_list_missing_or_forward_reference_rejected() {
+    let base = softmax_trace();
+    assert_accepts(&base);
+
+    let mut tampered = roundtrip(&base);
+    tampered.steps.clear();
+    assert_rejects(&tampered);
+
+    let mut tampered = roundtrip(&base);
+    tampered.steps[0].sources[0] = Some((0, 0));
+    assert_rejects(&tampered);
+}

@@ -6,6 +6,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use zkie_core::claim::{ClaimKind, PendingClaims, RelationId};
 use zkie_core::common::field::ProtocolField;
 use zkie_core::compute::ExecutionPort;
@@ -86,6 +88,85 @@ pub struct OracleRoot {
     pub root: Digest,
     pub start: Digest,
     pub count: u64,
+}
+
+/// Execution-graph instance identity: `(graph_id, step_ordinal)`. The
+/// ordinal is the canonical position in the trusted ordered step list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct StepId {
+    pub graph_id: Digest,
+    pub step_ordinal: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum ClaimDirection {
+    Input = 0,
+    Output = 1,
+    Auxiliary = 2,
+}
+
+/// Identity of one step/port obligation. Multiple ClaimIds may reference the
+/// same oracle slice; only the pair (step, port, direction) is unique.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ClaimId {
+    pub step: StepId,
+    pub port: u16,
+    pub direction: ClaimDirection,
+}
+
+/// Claim obligations keyed by ClaimId. A second registration of the same
+/// ClaimId is rejected; a different ClaimId may carry the same obligation.
+#[derive(Clone, Debug, Default)]
+pub struct ClaimObligationRegistry {
+    obligations: BTreeMap<ClaimId, Digest>,
+}
+
+impl ClaimObligationRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&mut self, id: ClaimId, obligation: Digest) -> Result<()> {
+        if self.obligations.insert(id, obligation).is_some() {
+            return Err(Error::StatementMismatch);
+        }
+        Ok(())
+    }
+
+    pub fn get(&self, id: &ClaimId) -> Option<&Digest> {
+        self.obligations.get(id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.obligations.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.obligations.is_empty()
+    }
+
+    /// Requires the registered set to equal the expected set exactly: missing,
+    /// duplicated, or unexpected ClaimIds are rejected.
+    pub fn verify_complete(&self, expected: &[ClaimId]) -> Result<()> {
+        let mut expected_set = std::collections::BTreeSet::new();
+        for id in expected {
+            if !expected_set.insert(*id) {
+                return Err(Error::StatementMismatch);
+            }
+        }
+        if expected_set.len() != self.obligations.len() {
+            return Err(Error::StatementMismatch);
+        }
+        if self
+            .obligations
+            .keys()
+            .any(|id| !expected_set.contains(id))
+        {
+            return Err(Error::StatementMismatch);
+        }
+        Ok(())
+    }
 }
 
 /// Semantic role of an oracle. Same bytes with a different role must not
@@ -555,5 +636,58 @@ mod identity_tests {
                 &digest(4)
             )
         );
+    }
+}
+
+
+#[cfg(test)]
+mod claim_identity_tests {
+    use super::*;
+
+    fn step(ordinal: u64) -> StepId {
+        StepId {
+            graph_id: Digest([7u8; 32]),
+            step_ordinal: ordinal,
+        }
+    }
+
+    fn claim(ordinal: u64, port: u16, direction: ClaimDirection) -> ClaimId {
+        ClaimId {
+            step: step(ordinal),
+            port,
+            direction,
+        }
+    }
+
+    #[test]
+    fn claim_registry_rejects_duplicates_conflicts_and_missing() {
+        let a = claim(0, 0, ClaimDirection::Input);
+        let b = claim(0, 1, ClaimDirection::Input);
+        let c = claim(1, 0, ClaimDirection::Output);
+        let obligation = Digest([9u8; 32]);
+        let other = Digest([8u8; 32]);
+
+        let mut registry = ClaimObligationRegistry::new();
+        registry.register(a, obligation).unwrap();
+        assert!(registry.register(a, other).is_err());
+        registry.register(b, obligation).unwrap();
+        registry
+            .register(c, obligation)
+            .unwrap();
+        registry.verify_complete(&[a, b, c]).unwrap();
+        assert!(registry.verify_complete(&[a, b]).is_err());
+        assert!(registry.verify_complete(&[a, b, c, claim(2, 0, ClaimDirection::Input)]).is_err());
+        assert!(registry.verify_complete(&[a, b, c, c]).is_err());
+    }
+
+    #[test]
+    fn different_claim_ids_may_share_one_obligation() {
+        let a = claim(0, 0, ClaimDirection::Input);
+        let b = claim(1, 0, ClaimDirection::Input);
+        let obligation = Digest([5u8; 32]);
+        let mut registry = ClaimObligationRegistry::new();
+        registry.register(a, obligation).unwrap();
+        registry.register(b, obligation).unwrap();
+        registry.verify_complete(&[a, b]).unwrap();
     }
 }

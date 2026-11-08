@@ -813,6 +813,19 @@ fn verify_shared_trace_steps(
     if trace.tokens != expected_tokens {
         return Err(Error::StatementMismatch);
     }
+    if trace.steps.is_empty() {
+        return Err(Error::StatementMismatch);
+    }
+    // StepId is implicit from the canonical ordered list: graph_id is the
+    // committed model id and the ordinal is the position. Forward or self
+    // references would mean the list was reordered; they are rejected.
+    for (index, step) in trace.steps.iter().enumerate() {
+        for source in step.sources.iter().flatten() {
+            if source.0 >= index {
+                return Err(Error::StatementMismatch);
+            }
+        }
+    }
     if trace.output.is_empty() && trace.argmax.len() != expected_tokens.len() {
         return Err(Error::StatementMismatch);
     }
