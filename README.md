@@ -178,13 +178,44 @@ cargo run --release -p zkie-check -- report --input <run-dir> --require-profile 
 - **Hash-based commitments.** Commitment nodes and transcripts use
   domain-separated hashes; the field layer provides Goldilocks base-field and
   cubic-extension arithmetic for kernel primitives.
-- **Public statement.** The verifier trusts the case configuration and policy
-  it is given, and binds them to the commitment and proof through the statement.
+- **Operator policy.** The verifier takes a policy fixed outside the proof
+  bundle. For each case the policy records the input shape, the expected anchor
+  identity and the expected model identity; the verifier rebuilds the model
+  data-flow plan, asset table identities and anchor from trusted model
+  specifications, then checks the proof against them.
 - **No model re-execution.** Verification reads the public commitment, the
   statement, the proof and the public inputs only.
 - **Performance.** Current commit/prove/verify timings, peak memory and proof
   sizes are **TBD** (to be measured); no performance figures are recorded in
   this document.
+
+### Verification policy
+
+`verify`, `run` and `matrix` read the policy from a file fixed by the
+operator outside the proof bundle. The file is strict TOML; unknown fields and
+duplicate keys are rejected.
+
+```toml
+policy_version = 1
+model = "gpt2"
+model_version = 1
+
+[[case]]
+case_id = "gpt2-seq16"
+sequence_length = 16
+anchor_id = "<32-byte hex>"
+model_id = "<32-byte hex>"
+```
+
+For the time-series model, replace `sequence_length` with
+`raw_input_length = 512` and `patch_tokens = 16`. `anchor_id` and
+`model_id` are the trusted anchor identity and input-bound model identity;
+both are checked against the commitment and against the input commitment
+recomputed from the statement tokens. `run` and `matrix` copy the policy into
+the run directory and record its path, SHA-256 and registration time in
+`policy-source.json`; they never fill expected values or identities from the
+pending bundle. `matrix` expects its policy next to the case file as
+`case.policy`.
 
 ## License
 

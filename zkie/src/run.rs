@@ -126,32 +126,36 @@ impl RunArgs {
     }
 }
 
-fn manifest_model_hex(commit_dir: &Path) -> Result<String> {
-    let text = fs::read_to_string(commit_dir.join("manifest.json"))
-        .map_err(|_| Error::MissingCommitArtifact)?;
-    let value: serde_json::Value =
-        serde_json::from_str(&text).map_err(|_| Error::InvalidEncoding)?;
-    let bytes = value
-        .get("model_commitment_id")
-        .and_then(|value| value.as_array())
-        .ok_or(Error::InvalidEncoding)?;
-    let mut hex = String::with_capacity(64);
-    for byte in bytes {
-        let byte = byte.as_u64().ok_or(Error::InvalidEncoding)? as u8;
-        hex.push_str(&format!("{byte:02x}"));
-    }
-    Ok(hex)
-}
 
 pub fn run(args: &[String]) -> Result<Vec<i32>> {
-    let parsed = RunArgs::parse(args)?;
+    let mut parsed = RunArgs::parse(args)?;
+    fs::create_dir_all(&parsed.run_dir).map_err(|_| Error::Io)?;
+    let policy_bytes = fs::read(&parsed.verifier_policy).map_err(|_| Error::IncompleteArtifact)?;
+    let source_name = parsed
+        .verifier_policy
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "policy".into());
+    let registered_at = fs::metadata(&parsed.verifier_policy)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let policy_copy = parsed.run_dir.join("policy.toml");
+    fs::write(&policy_copy, &policy_bytes).map_err(|_| Error::Io)?;
+    parsed.verifier_policy = policy_copy;
+    let source = serde_json::json!({
+        "path": source_name,
+        "used_path": "policy.toml",
+        "sha256": digest_to_hex(&digest_bytes(&policy_bytes)),
+        "registered_at_unix": registered_at,
+    });
+    let source_bytes = serde_json::to_vec_pretty(&source).map_err(|_| Error::InvalidEncoding)?;
+    fs::write(parsed.run_dir.join("policy-source.json"), source_bytes).map_err(|_| Error::Io)?;
     let plan = parsed.plan()?;
     let executable = std::env::current_exe().map_err(|_| Error::Io)?;
     let mut codes = Vec::with_capacity(plan.len());
-    let commit_dir = match &parsed.policy {
-        CommitPolicy::Create => parsed.run_dir.join("commit"),
-        CommitPolicy::Reuse(dir) => dir.clone(),
-    };
     let mut index = 0usize;
     if matches!(parsed.policy, CommitPolicy::Create) {
         let status = Command::new(&executable)
@@ -162,16 +166,9 @@ pub fn run(args: &[String]) -> Result<Vec<i32>> {
         codes.push(status.code().unwrap_or(1));
         index = 1;
     }
-    let model_id = manifest_model_hex(&commit_dir).unwrap_or_else(|_| parsed.model_id.clone());
     for step in &plan[index..] {
-        let mut step = step.clone();
-        if let Some(position) = step.iter().position(|arg| arg == "--model-id") {
-            if let Some(value) = step.get_mut(position + 1) {
-                *value = model_id.clone();
-            }
-        }
         let status = Command::new(&executable)
-            .args(&step)
+            .args(step)
             .env("ZKIE_CASE_ID", std::env::var("ZKIE_CASE_ID").unwrap_or_default())
             .status()
             .map_err(|_| Error::Io)?;
@@ -260,12 +257,17 @@ fn run_one(
     let _ = fs::remove_dir_all(run_dir);
     fs::create_dir_all(run_dir).map_err(|_| Error::Io)?;
     let parameters = run_dir.join("parameters.toml");
-    let policy = run_dir.join("policy.toml");
     write_placeholder(&parameters, b"profile = \"case\"\n")?;
-    write_placeholder(&policy, b"policy = \"exact_match\"\n")?;
-    let model_id = digest_to_hex(&digest_bytes(
-        case.to_string_lossy().as_bytes(),
-    ));
+    let policy_source = case
+        .parent()
+        .map(|parent| parent.join("case.policy"))
+        .ok_or(Error::InvalidConfig)?;
+    let policy_bytes = fs::read(&policy_source).map_err(|_| Error::IncompleteArtifact)?;
+    let document = crate::policy::parse(&policy_bytes)?;
+    let input_len = (fs::metadata(input).map_err(|_| Error::Io)?.len() / 4) as usize;
+    let trusted =
+        crate::policy::select(&document, case_id, &document.model, input_len)?;
+    let model_id = digest_to_hex(&trusted.model_id);
     let mut args: Vec<String> = vec![
         "run".into(),
         "--commit-policy".into(),
@@ -287,7 +289,7 @@ fn run_one(
         "--model-id".into(),
         model_id,
         "--policy".into(),
-        policy.to_string_lossy().into_owned(),
+        policy_source.to_string_lossy().into_owned(),
         "--run-dir".into(),
         run_dir.to_string_lossy().into_owned(),
     ]);
