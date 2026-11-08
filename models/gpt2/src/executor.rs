@@ -17,7 +17,7 @@ use zkie_ops::matmul::MatMulOp;
 use zkie_ops::profile_norm::ProfileLayerNormOp;
 use zkie_ops::projection::ProjectionOp;
 use zkie_ops::proof::model_commitment::{
-    build_claim_set, commit_assets, AssetOpening, AssetStore, ModelAssetSpec, ModelCommitment,
+    commit_assets, AssetOpening, AssetStore, ModelAssetSpec, ModelCommitment,
     SharedTrace, SharedTraceStep,
 };
 use zkie_ops::proof::relations::{
@@ -666,17 +666,14 @@ pub fn execute_shared_with_progress(
         event.unit = Some("relation_steps".into());
         let _ = progress.emit(event);
     }
-    let mut trace = SharedTrace {
+    Ok(SharedTrace {
         tokens: tokens.iter().map(|value| *value as u32).collect(),
         assets: trace_assets,
         steps,
         argmax,
         output: Vec::new(),
-        claims_root: Digest::ZERO,
-    };
-    trace.claims_root =
-        build_claim_set(&trace, &assets.commitment.anchor.record.model_commitment)?.root;
-    Ok(trace)
+        binding_challenge: Digest::ZERO,
+    })
 }
 
 pub fn build_commitment(asset_root: &Path, tokens: &[u32]) -> Result<ModelCommitment> {

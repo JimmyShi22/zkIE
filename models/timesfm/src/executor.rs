@@ -21,7 +21,7 @@ use zkie_ops::profile_rms::ProfileRmsNormOp;
 use zkie_ops::profile_standardize::ProfileStandardizeOp;
 use zkie_ops::projection::ProjectionOp;
 use zkie_ops::proof::model_commitment::{
-    build_claim_set, commit_assets, AssetOpening, AssetStore, ModelAssetSpec, ModelCommitment,
+    commit_assets, AssetOpening, AssetStore, ModelAssetSpec, ModelCommitment,
     SharedTrace, SharedTraceStep,
 };
 use zkie_ops::proof::relations::{
@@ -751,17 +751,14 @@ pub fn execute_shared_with_progress(
         event.unit = Some("relation_steps".into());
         let _ = progress.emit(event);
     }
-    let mut trace = SharedTrace {
+    Ok(SharedTrace {
         tokens: input.iter().map(|value| *value as u32).collect(),
         assets: trace_assets,
         steps,
         argmax: Vec::new(),
         output,
-        claims_root: Digest::ZERO,
-    };
-    trace.claims_root =
-        build_claim_set(&trace, &assets.commitment.anchor.record.model_commitment)?.root;
-    Ok(trace)
+        binding_challenge: Digest::ZERO,
+    })
 }
 
 pub fn build_commitment(asset_root: &Path, input: &[i64]) -> Result<ModelCommitment> {

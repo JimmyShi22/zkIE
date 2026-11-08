@@ -556,8 +556,8 @@ fn shared_trace_references_one_model_asset_opening() {
     use zkie_core::types::Digest;
     use zkie_ops::matmul::MatMulOp;
     use zkie_ops::proof::model_commitment::{
-        build_claim_set, commit_assets, open_asset, verify_shared_trace, ModelAssetSpec,
-        ModelCommitmentPublic, SharedTrace, SharedTraceStep,
+        commit_assets, open_asset, trace_binding_digest, verify_shared_trace,
+        ModelAssetSpec, ModelCommitmentPublic, SharedTrace, SharedTraceStep,
     };
     use zkie_ops::proof::relations::ExternalAssetRef;
     use zkie_ops::proof::relations::{prove_op_relation_shared, RelationReceiptMessage};
@@ -629,36 +629,37 @@ fn shared_trace_references_one_model_asset_opening() {
         steps: vec![step],
         argmax: vec![0],
         output: Vec::new(),
-        claims_root: Digest::ZERO,
+        binding_challenge: Digest::ZERO,
     };
-    trace.claims_root =
-        build_claim_set(&trace, &public.anchor.model_commitment).unwrap().root;
+    let statement_digest = Digest([0x5B; 32]);
+    trace.binding_challenge =
+        trace_binding_digest(&public, &trace, &statement_digest).unwrap();
     public.verify_opening(&opening).unwrap();
-    verify_shared_trace(&public, &trace, &[0]).unwrap();
+    verify_shared_trace(&public, &trace, &[0], &statement_digest).unwrap();
 
     let mut tampered = trace.clone();
     tampered.assets[0].rows[0].values[0] = 99;
-    assert!(verify_shared_trace(&public, &tampered, &[0]).is_err());
+    assert!(verify_shared_trace(&public, &tampered, &[0], &statement_digest).is_err());
 
     let mut tampered = trace.clone();
     tampered.steps[0].message.config[0] = 3;
-    assert!(verify_shared_trace(&public, &tampered, &[0]).is_err());
+    assert!(verify_shared_trace(&public, &tampered, &[0], &statement_digest).is_err());
 
     let mut tampered = trace.clone();
     tampered.steps[0].message.proof.outputs[0][0].values[0] += 1;
-    assert!(verify_shared_trace(&public, &tampered, &[0]).is_err());
+    assert!(verify_shared_trace(&public, &tampered, &[0], &statement_digest).is_err());
 
     let mut tampered = trace.clone();
     tampered.steps[0].message.proof.inputs[0][0].values[0] += 1;
-    assert!(verify_shared_trace(&public, &tampered, &[0]).is_err());
+    assert!(verify_shared_trace(&public, &tampered, &[0], &statement_digest).is_err());
 
     let mut tampered = trace.clone();
     tampered.steps[0].external[1] = Some(ExternalAssetRef::rows(3, 0, 1));
-    assert!(verify_shared_trace(&public, &tampered, &[0]).is_err());
+    assert!(verify_shared_trace(&public, &tampered, &[0], &statement_digest).is_err());
 
     let mut tampered = trace.clone();
     tampered.steps[0].external[1] = Some(ExternalAssetRef::rows(99, 0, 2));
-    assert!(verify_shared_trace(&public, &tampered, &[0]).is_err());
+    assert!(verify_shared_trace(&public, &tampered, &[0], &statement_digest).is_err());
 }
 
 #[test]

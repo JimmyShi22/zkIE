@@ -24,7 +24,8 @@ use zkie_ops::pipeline::{
     VerifyReceipt, VerifyRequest,
 };
 use zkie_ops::proof::model_commitment::{
-    verify_shared_trace, verify_shared_trace_output, ModelCommitmentPublic, SharedTrace,
+    trace_binding_digest, verify_shared_trace, verify_shared_trace_output, ModelCommitmentPublic,
+    SharedTrace,
 };
 
 const PROTOCOL_ID: Digest = Digest([0xA1; 32]);
@@ -324,7 +325,11 @@ impl PipelineProvider for ProductionProvider {
             expected_output: config.expected_output.clone(),
         };
         let statement_bytes = bincode::serialize(&statement).map_err(|_| Error::InvalidEncoding)?;
-        let trace = execute_shared(&config, &commitment, ctx.progress)?;
+        let statement_digest = digest_bytes(&statement_bytes);
+        let public = ModelCommitmentPublic::from_commitment(&commitment);
+        let mut trace = execute_shared(&config, &commitment, ctx.progress)?;
+        trace.binding_challenge =
+            trace_binding_digest(&public, &trace, &statement_digest)?;
         if std::env::var("ZKIE_MEASURE_PROOF_SECTIONS").ok().as_deref() == Some("1") {
             let asset_bytes = bincode::serialized_size(&trace.assets)
                 .map_err(|_| Error::InvalidEncoding)?;
@@ -340,7 +345,6 @@ impl PipelineProvider for ProductionProvider {
         } else {
             bincode::serialize(&config.expected_argmax).map_err(|_| Error::InvalidEncoding)?
         };
-        let statement_digest = digest_bytes(&statement_bytes);
         let proof_digest = digest_bytes(&proof_bytes);
         let public_inputs_digest = digest_bytes(&public_inputs);
         let files: Vec<(&str, &[u8])> = vec![
@@ -385,6 +389,7 @@ impl PipelineProvider for ProductionProvider {
         let statement_bytes = fs::read(&request.statement).map_err(|_| Error::IncompleteArtifact)?;
         let statement: StatementData =
             bincode::deserialize(&statement_bytes).map_err(|_| Error::InvalidEncoding)?;
+        let statement_digest = digest_bytes(&statement_bytes);
         if statement.model_commitment != request.expected_model_id {
             return Err(Error::StatementMismatch);
         }
@@ -396,7 +401,7 @@ impl PipelineProvider for ProductionProvider {
         if statement.model == "timesfm" {
             let expected: Vec<i32> =
                 bincode::deserialize(&public_inputs).map_err(|_| Error::InvalidEncoding)?;
-            let output = verify_shared_trace_output(&public, &trace, &statement.tokens)?;
+            let output = verify_shared_trace_output(&public, &trace, &statement.tokens, &statement_digest)?;
             let matched = output.len() == expected.len()
                 && output.iter().zip(&expected).all(|(value, wanted)| *value as i32 == *wanted);
             if !matched || expected != statement.expected_output {
@@ -408,7 +413,7 @@ impl PipelineProvider for ProductionProvider {
         } else {
             let expected: Vec<u32> =
                 bincode::deserialize(&public_inputs).map_err(|_| Error::InvalidEncoding)?;
-            let argmax = verify_shared_trace(&public, &trace, &statement.tokens)?;
+            let argmax = verify_shared_trace(&public, &trace, &statement.tokens, &statement_digest)?;
             if argmax != expected || expected != statement.expected_argmax {
                 return Ok(VerifyReceipt {
                     accepted: false,

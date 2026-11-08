@@ -1,7 +1,9 @@
 use std::path::Path;
 
+use zkie_core::types::Digest;
+
 use zkie_models_gpt2::executor::{build_commitment, execute_shared};
-use zkie_ops::proof::model_commitment::{verify_shared_trace, ModelCommitmentPublic};
+use zkie_ops::proof::model_commitment::{trace_binding_digest, verify_shared_trace, ModelCommitmentPublic};
 
 fn main() {
     let seq: usize = std::env::var("ZKIE_SEQ")
@@ -19,7 +21,7 @@ fn main() {
     let commitment = build_commitment(Path::new("/data/zkie-assets/models"), &tokens).unwrap();
     eprintln!("commitment {:?} assets={}", t0.elapsed(), commitment.assets.len());
     let t1 = std::time::Instant::now();
-    let trace = execute_shared(
+    let mut trace = execute_shared(
         &commitment,
         &tokens.iter().map(|value| *value as i64).collect::<Vec<_>>(),
     )
@@ -27,7 +29,11 @@ fn main() {
     eprintln!("trace {:?} steps={} assets={}", t1.elapsed(), trace.steps.len(), trace.assets.len());
     let t2 = std::time::Instant::now();
     let public = ModelCommitmentPublic::from_commitment(&commitment);
-    let argmax = verify_shared_trace(&public, &trace, &tokens).unwrap();
+    let statement_digest = Digest([0x42; 32]);
+    trace.binding_challenge =
+        trace_binding_digest(&public, &trace, &statement_digest).unwrap();
+    let argmax =
+        verify_shared_trace(&public, &trace, &tokens, &statement_digest).unwrap();
     eprintln!("verify {:?}", t2.elapsed());
     let gt: Vec<i32> = std::fs::read(format!(
         "/data/zkie-assets/cases/gpt2/gt_int_argmax_{seq}_i32.bin"

@@ -1,7 +1,9 @@
 use std::path::Path;
 
+use zkie_core::types::Digest;
+
 use zkie_models_timesfm::executor::{build_commitment, execute_shared};
-use zkie_ops::proof::model_commitment::{verify_shared_trace_output, ModelCommitmentPublic};
+use zkie_ops::proof::model_commitment::{trace_binding_digest, verify_shared_trace_output, ModelCommitmentPublic};
 
 fn main() {
     let input: Vec<i32> = std::fs::read("/data/zkie-assets/cases/timesfm/input_ts_i32.bin")
@@ -15,11 +17,15 @@ fn main() {
     let commitment = build_commitment(Path::new("/data/zkie-assets"), &values).unwrap();
     eprintln!("commitment {:?} assets={}", t0.elapsed(), commitment.assets.len());
     let t1 = std::time::Instant::now();
-    let trace = execute_shared(&commitment, &values).unwrap();
+    let mut trace = execute_shared(&commitment, &values).unwrap();
     eprintln!("trace {:?} steps={} assets={}", t1.elapsed(), trace.steps.len(), trace.assets.len());
     let t2 = std::time::Instant::now();
     let public = ModelCommitmentPublic::from_commitment(&commitment);
-    let output = verify_shared_trace_output(&public, &trace, &expected).unwrap();
+    let statement_digest = Digest([0x42; 32]);
+    trace.binding_challenge =
+        trace_binding_digest(&public, &trace, &statement_digest).unwrap();
+    let output =
+        verify_shared_trace_output(&public, &trace, &expected, &statement_digest).unwrap();
     eprintln!("verify {:?}", t2.elapsed());
     let gt: Vec<i32> = std::fs::read("/data/zkie-assets/cases/timesfm/gt_int_output_i32.bin")
         .unwrap()
