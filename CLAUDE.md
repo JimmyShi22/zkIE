@@ -1,50 +1,62 @@
-# zkIE project instructions
+# 项目开发约定
 
 ## What this is
 
-zkIE proves fixed-point ML inference with a three-stage **commit → prove →
-verify** pipeline over a shared model commitment. Weight and public LUT assets
-are committed as Merkle-backed rows; each operator step emits a relation
-receipt; the verifier checks openings, relation equations and data-flow edges
-without re-running the model. Proofs are non-ZK: witness data is public.
+三段式可验证 ML 推理项目（commit / prove / verify 独立进程）。
+实现细节以代码与 docs/ 为准，本文不做实现描述——设计演进时本节不改。
 
-## Layout
+## 入口
 
-- `crates/zkie-core`: shared types, errors, artifact handling, field/codec and
-  fixed-point helpers, claims/oracles, memory and storage traits, profiling.
-- `crates/zkie-engine`: runtime context, deterministic CPU kernels, mmap and
-  scratch storage, Merkle/oracle commitments and link proofs, transcript and
-  field arithmetic.
-- `crates/zkie-ops`: live operators, registry, three-stage pipeline, relation
-  receipts and shared model commitment.
-- `models/common`: asset and ground-truth helpers shared by model crates.
-- `models/{gpt2,gemma3,timesfm}`: fixed-point configuration and shared-trace
-  executor for each supported model.
-- `tools/zkie-bench`: commit / prove / verify CLI and batch runners.
-- `tools/zkie-check`: asset, contract and run-report validation.
-- `scripts/`: ONNX extraction and fixed-point simulation helpers.
-- `docs/`: current specification, benchmark method and roadmap.
+全项目仅此五处，新增入口必须在此登记：
 
-## Build / test
+| 入口 | 位置 | 用途 |
+|---|---|---|
+| zkie-bench CLI | tools/zkie-bench/src/main.rs | 三阶段 commit/prove/verify + matrix/run |
+| zkie-check CLI | tools/zkie-check/src/main.rs | 验收报告 |
+| executor_smoke ×3 | models/{gpt2,gemma3,timesfm}/examples/executor_smoke.rs | 单进程冒烟（承诺→执行→验证） |
 
-```bash
-cargo build --workspace
-cargo test --workspace
+## 代码目录结构
+
+```
+crates/zkie-core/   基础件：field/fixed_point/codec、artifact/progress/error/types、
+                     compute、storage、oracle、claim
+crates/zkie-engine/ 执行环境：primitives、storage::mmap、compute::cpu、context、metrics
+crates/zkie-ops/    算子与证明：op/registry、pipeline、proof/*、活算子模块
+models/{gpt2,gemma3,timesfm}/  config + executor + executor_smoke（权重一律外置）
+tools/              zkie-bench、zkie-check
+scripts/            数据管线（提取/仿真/GT），非证明路径
+docs/               spec / benchmarks / roadmap / overview（只描述当前实现）
 ```
 
-## Live path
+## 构建与测试方法
 
-1. **commit** builds `ModelCommitmentPublic` from the model's weight and LUT
-   assets and publishes the public bundle.
-2. **prove** re-opens the committed assets, runs the model executor and writes a
-   `SharedTrace` of per-step relation receipts.
-3. **verify** checks asset openings, relation equations, producer/consumer edges
-   and the final output against the statement.
+- 构建：`cargo build --workspace` / `cargo check --workspace`；实测用 release
+  （`cargo build --release -p zkie-bench`）。
+- 测试：`cargo test --workspace` 全绿为准入门槛；单元测试写在模块内
+  `#[cfg(test)]`，集成测试放 `tests/`；负例必须真实注入（序列化往返篡改后
+  走完整验证路径断言拒绝），不允许只加不验。
+- 三阶段实测：`zkie-bench matrix`（冷 1 + 暖 3）；数字同机实测、warm 中位数
+  入账、冷跑不写台账。
+- 测试与实测结果必须留存：每次测试/基准运行的产物（result.json、日志、对照表）
+  落盘归档，并注明基于哪次修改、哪个方案/基线进行的——无出处的数字不得进入
+  任何文档。
 
-## Assets
+## 开发约定（硬规则）
 
-Model weights and lookup tables are external, gitignored assets under
-`models/*/weights/`; run the extraction scripts before proving. Committed asset
-files are read-only inputs: do not rewrite or regenerate them as part of code
-changes. Case files and ground truth live outside the repository; `zkie-bench`
-takes their paths from the case configuration.
+1. 单实现原则：一个概念只允许一套实现；禁止旧实现/重复路径/legacy 模块残留。
+2. 代码内不标注参照来源：代码、注释、文档、commit message 中一律不写任何
+   外部来源线索（名称、缩写、路径、file:line、编号类标记）——让实现自足、
+   让 AI 聚焦于代码本身；提交前自查。
+3. commit：英文 message；每小步一 commit；TL 复核后才 push。
+4. 资产红线：模型权重/GT/资产只读、外置，mmap/区间读取，禁止入库、禁止修改、
+   禁止整张物化。
+5. 测量纪律：优化必须有同机前后对照（proof 字节、墙钟、VmHWM）；字节不涨、
+   VmHWM 不升、墙钟 3% 噪声内；无收益如实记录「未观察到收益」；不许改口径
+   凑数字；所有结果留档并标明对应修改与方案。
+6. 文档同步：删除功能时同步删除其文档描述；docs/ 与代码一致。
+
+## 工作流红线
+
+- 新机制必须从某个出处产生（有据可循），除非是老板或专家已经明确批准的方案。
+- 不许自造等价机制过门禁。
+- 技术拿不准报老板，不自行改方案。
