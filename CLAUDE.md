@@ -6,21 +6,23 @@ Three-stage verifiable ML inference (commit / prove / verify as independent
 processes). Implementation details live in the code and docs/; this file does
 not describe the implementation and does not change when the design evolves.
 
-## Confidential method file
+## Confidential local rules directory
 
-Before starting any work item, read `.dev-method/DEV_METHOD.md` at the
-repository root. It is confidential, gitignored, never committed and never
-pushed; it stays on the local machine only. If the file is absent (for example
-in a clone that does not have it), ignore this instruction and follow this file
-alone.
+Before starting any work item, read **every file** under `.dev-method/` at the
+repository root and follow them: they carry the team collaboration protocol,
+the working method for the current effort, and the channel rules between roles.
+The directory is confidential, gitignored, never committed and never pushed; it
+exists on the local machine only. If the directory or a file in it is absent
+(for example in a clone that does not have it), ignore that part and follow this
+file alone. Never copy its contents out, never reference its path in any
+committed artifact, report, or external message.
 
 ## Confirmation before starting
 
 No work item starts before the Tech Lead has confirmed its approach with the
-technical expert through the local channel kept outside the repository. Items
-without that confirmation stay parked. PM coordinates the sequence and records
-the outcome; technical content of the confirmation is not routed through other
-roles.
+technical expert through the local channel. Items without that confirmation stay
+parked. PM coordinates the sequence and records the outcome; technical content of
+the confirmation is not routed through other roles.
 
 ## Entry points
 
