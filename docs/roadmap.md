@@ -1,95 +1,55 @@
 # Roadmap
 
-Model progression for the GKR/WHIR proving stack.
+Current state: the three-stage commit / prove / verify pipeline runs for
+GPT-2 124M, Gemma 3 270M and TimesFM 1.0 200M over a shared model commitment.
+Weights and public LUTs are committed as Merkle-backed assets; each operator
+step produces a relation receipt; the verifier checks openings, equations and
+data-flow edges without re-running the model. Proofs are non-ZK.
 
-## Step 1 - TimesFM 1.0 200M (done)
+## Next
 
-Full forward pass (prologue + 20 layers + output head) proves end-to-end
-through the unified op interface. See `docs/benchmarks.md`.
+### 1. Measure and publish current performance
 
-## Step 2 - GPT-2 124M (done)
+Run the benchmark method in `docs/benchmarks.md` for every supported model and
+input shape. Report commit, prove and verify separately, plus proof size and
+peak resident memory. All current numbers are **待测** until this is done.
+Do not reuse figures from removed designs.
 
-The smallest standard decoder-only Transformer. Open (MIT), single checkpoint,
-and a good first like-for-like target for the proving stack.
+### 2. Expand operator and model coverage
 
-Op deltas vs TimesFM:
+- Add new fixed-point operators only together with their algebraic relation and
+  rejection tests.
+- Add a new model as a configuration plus a shared-trace executor over the
+  existing operator set; do not add model-specific proof logic to the verifier.
+- Keep the public LUT path uniform: a new table is a committed asset, not a
+  verifier constant.
 
-- FFN activation is GELU instead of ReLU/SiLU. GELU is a table lookup, already
-  covered by `gelu.rs` plus the generic `lookup` op.
-- Causal self-attention uses a single fused QKV projection split into heads,
-  then concatenated back - a different head layout than TimesFM's per-head
-  Q/K/V split.
-- LayerNorm (already supported), no RevIN prologue.
-- Token + positional embeddings instead of TimesFM's RevIN cat.
+### 3. Reduce proof size and verification cost
 
-Main new risk is long-sequence attention (`QK^T` is O(seq^2) and dominates as
-the context grows). Proven at seq=16 and seq=512; the seq=512 causal mask must
-be deepened (see `docs/benchmarks.md`).
+- Measure the contribution of asset openings, relation vectors and Merkle paths
+  to `proof.bin`.
+- Deduplicate repeated asset intervals and row openings where the trace permits
+  it, without weakening the anchor or Merkle checks.
+- Keep verification free of any model re-execution or weight read.
 
-## Step 3 - Gemma 3 270M (in progress)
+### 4. Witness hiding
 
-Same decoder-only Transformer family, adds Rotary Position Embedding (RoPE)
-and RMSNorm. RMSNorm is already covered (TimesFM's `input_layernorm`); the new
-piece is RoPE.
+The current proof exposes weights, LUTs and activations. A future zero-knowledge
+variant must hide witness values while preserving the same public statement,
+commitment binding and relation checks. This is a protocol change, not a
+configuration switch; it needs its own specification and benchmark suite.
 
-Completion includes RoPE in fixed point (sin/cos lookup + rotary), because the
-same RoPE is reused by DeepSeek-V2-Lite's MLA (decoupled RoPE). This must not be
-deferred to the MLA step.
+### 5. Hardware acceleration
 
-Gemma 3 is the reuse target: the same op primitives and the same autotune flow.
+The engine currently uses deterministic CPU kernels. Any accelerated kernel
+must produce byte-identical results to the CPU reference and must be covered by
+the same correctness gates before it is enabled in the production path.
 
-## Step 4 - DeepSeek-V2-Lite (MoE + MLA, next)
+### 6. Operational hardening
 
-Target: **DeepSeek-V2-Lite** (15.7B total / 2.4B active, 27 layers, hidden 2048,
-MLA + DeepSeekMoE: 2 shared experts + 64 routed experts, top-6).
-
-New capabilities to prove:
-
-1. **MoE expert routing (top-k)** - a variant of the existing `GeluIndex` /
-   `Lookup` data-dependent-index pattern, plus a compare/select primitive
-   (range-check `s_j <= threshold` for the non-selected experts, O(num-experts)).
-   Not an architectural breakthrough.
-2. **Full commitment + lazy opening of expert weights** - one commitment tree
-   over all experts; the prover loads/opens only the routed experts after
-   routing. Memory scales with *active* parameters, not total. This is the only
-   lever that lets MoE scale.
-3. **op list built per-forward from the route** - the static chain becomes a
-   data-dependent chain. Since a proof is already for one concrete forward, this
-   only changes the build flow, not the proof abstraction. (The verifier currently
-   recomputes that forward to read interior evaluations; succinct verification,
-   with no re-run, is tracked in #15.)
-
-Expected order of magnitude (extrapolated from current calibration):
-prove ~10-14 min (seq=512), peak memory ~50-150 GB (fully-resident commitment
-~150 GB, lazy-open ~50 GB).
-
-## Step 5 - DeepSeek-V4.1-Flash (phased, reference point)
-
-Target: **DeepSeek-V4.1-Flash** (552B total / 8B active prefill, 16B decode,
-40-layer causal encoder-decoder, CSA2 sparse attention, multimodal, 1M context,
-MIT, 2026-09).
-
-Key judgement: it is **memory/commitment-bound, not compute-bound**. Relative
-to V2-Lite, active parameters rise only ~3.3x (8B / 2.4B), but the full
-commitment rises ~35x (552B / 15.7B).
-
-- Time: ~22-30 min prove at seq=512; ~3-4 h at 4K; 1M context is currently
-  infeasible.
-- Memory: full commitment ~2.2 TB (552B x 4B i32) + ~32 GB active experts.
-  This is the main wall: it needs 2 TB-class memory + streaming/lazy loading.
-
-Three phases - do not attempt full-scale at once:
-
-- **Phase A: MoE/FFN** - run the 552B expert layers on the lazy-commitment
-  machinery above, proving "large total params + small active params" is
-  workable. Most likely to land first.
-- **Phase B: CSA2 sparse attention** - Full / Reindex / Reuse modes + a
-  hierarchical sparse indexer; a new attention proof (the indexer itself must
-  be proven). Scale-independent, designed separately.
-- **Phase C: vision encoder + fp8** - a multimodal op family + 8-bit
-  fixed-point fidelity.
-
-One-line summary: **the DeepSeek path is: first land MoE via V2-Lite (routing +
-lazy expert commitment), then split V4.1-Flash into MoE / CSA2 / vision phases.
-Large total parameters are absorbed by lazy loading; the real hard parts are
-CSA2 and vision - two new op classes that are scale-independent.**
+- Validate the public bundle and policy against the case configuration before
+  accepting a run.
+- Keep artifact manifests and digests checked end to end.
+- Add negative tests for every rejection path described in `docs/spec.md`.
+- Keep `zkie-check` able to validate assets, contracts and run reports without
+  the prover.
