@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use zkie_bench::progress::{HeartbeatGuard, JsonlProgressSink};
-use zkie_bench::report::RunReport;
-use zkie_bench::{commit, prove, verify};
+use zkie::progress::{HeartbeatGuard, JsonlProgressSink};
+use zkie::report::RunReport;
+use zkie::{commit, prove, verify};
 use zkie_core::artifact::{
     digest_bytes, digest_to_hex, ArtifactFile, ArtifactKind, ArtifactManifest, PrivacyMode,
     COMPLETE_FILE,
@@ -388,7 +388,7 @@ fn progress_and_report_records_are_structured() {
     assert!(progress.contains("\"kind\":\"stage_started\""));
     assert!(progress.contains("\"kind\":\"stage_skipped\""));
     assert!(progress.contains("\"kind\":\"heartbeat\""));
-    assert!(zkie_bench::report::vm_hwm_kib().is_some());
+    assert!(zkie::report::vm_hwm_kib().is_some());
 
     let skipped = RunReport::new("verify", RunOutcome::Skipped);
     let skip_path = skipped.write(&temp.path().join("skip-run")).unwrap();
@@ -417,7 +417,7 @@ fn run_plan_requires_explicit_create_or_reuse() {
         write_file(path, b"x");
     }
 
-    let create = zkie_bench::run::RunArgs::parse(&[
+    let create = zkie::run::RunArgs::parse(&[
         "--commit-policy".into(),
         "create".into(),
         "--case".into(),
@@ -445,7 +445,7 @@ fn run_plan_requires_explicit_create_or_reuse() {
     let commit_dir = temp.path().join("commit");
     fs::create_dir_all(&commit_dir).unwrap();
     write_file(&commit_dir.join(COMPLETE_FILE), b"x");
-    let reuse = zkie_bench::run::RunArgs::parse(&[
+    let reuse = zkie::run::RunArgs::parse(&[
         "--commit-policy".into(),
         "reuse".into(),
         "--commit-dir".into(),

@@ -1,16 +1,16 @@
 [package]
-name = "zkie-bench"
+name = "zkie"
 version = "0.1.0"
 edition = "2021"
 description = "zkIE three-stage CLI and measurement harness"
 license = "Apache-2.0"
 
 [lib]
-name = "zkie_bench"
+name = "zkie"
 path = "src/lib.rs"
 
 [[bin]]
-name = "zkie-bench"
+name = "zkie"
 path = "src/main.rs"
 
 [dependencies]

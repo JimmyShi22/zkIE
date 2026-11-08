@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use zkie_bench::{prove, run, verify};
+use zkie::{prove, run, verify};
 use zkie_core::artifact::{digest_to_hex, COMPLETE_FILE};
 use zkie_core::error::Error;
 use zkie_core::types::Digest;

@@ -1,4 +1,4 @@
-//! zkie-bench library: three-stage command implementations and measurement.
+//! zkie library: three-stage command implementations and measurement.
 
 pub mod commit;
 pub mod provider;
@@ -65,6 +65,6 @@ fn exit_code<T>(result: zkie_core::error::Result<T>) -> i32 {
 
 pub fn print_usage() {
     println!(
-        "usage:\n  zkie-bench matrix --cases <case.toml>... --cold-runs 1 --warm-runs 3 --out <dir>\n  zkie-bench decode-matrix --cases <case.toml>... --prompt-len 16 --decode-lengths 16 512 --out <dir>\n  zkie-bench profile-matrix --cases <case.toml>... --threads 1 8 64 --runs 3 --out <dir>\n  zkie-bench commit --case <path> --assets-manifest <path> --parameters <path> --out <dir> --run-dir <dir>\n  zkie-bench prove --commit <dir> --input <path> --model-id <hex> --out <dir> --run-dir <dir>\n  zkie-bench verify --public <dir> --statement <path> --proof <path> --public-inputs <path> --model-id <hex> --policy <path> --run-dir <dir>\n  zkie-bench run --commit-policy create|reuse [--commit-dir <dir>] --case <path> --assets-manifest <path> --parameters <path> --input <path> --model-id <hex> --policy <path> --run-dir <dir>"
+        "usage:\n  zkie matrix --cases <case.toml>... --cold-runs 1 --warm-runs 3 --out <dir>\n  zkie decode-matrix --cases <case.toml>... --prompt-len 16 --decode-lengths 16 512 --out <dir>\n  zkie profile-matrix --cases <case.toml>... --threads 1 8 64 --runs 3 --out <dir>\n  zkie commit --case <path> --assets-manifest <path> --parameters <path> --out <dir> --run-dir <dir>\n  zkie prove --commit <dir> --input <path> --model-id <hex> --out <dir> --run-dir <dir>\n  zkie verify --public <dir> --statement <path> --proof <path> --public-inputs <path> --model-id <hex> --policy <path> --run-dir <dir>\n  zkie run --commit-policy create|reuse [--commit-dir <dir>] --case <path> --assets-manifest <path> --parameters <path> --input <path> --model-id <hex> --policy <path> --run-dir <dir>"
     );
 }

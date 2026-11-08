@@ -128,11 +128,11 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-Run the three stages with `zkie-bench`:
+Run the three stages with `zkie`:
 
 ```bash
 # commit: build and publish the shared model commitment
-cargo run --release -p zkie-bench -- commit \
+cargo run --release -p zkie -- commit \
   --case <case.toml> \
   --assets-manifest <assets-manifest> \
   --parameters <parameters.bin> \
@@ -140,7 +140,7 @@ cargo run --release -p zkie-bench -- commit \
   --run-dir <run-dir>
 
 # prove: execute the committed model and write the proof
-cargo run --release -p zkie-bench -- prove \
+cargo run --release -p zkie -- prove \
   --commit <commit-dir> \
   --input <input.bin> \
   --model-id <model-id-hex> \
@@ -148,7 +148,7 @@ cargo run --release -p zkie-bench -- prove \
   --run-dir <run-dir>
 
 # verify: check the public commitment, statement and proof
-cargo run --release -p zkie-bench -- verify \
+cargo run --release -p zkie -- verify \
   --public <commit-dir>/public \
   --statement <proof-dir>/statement.bin \
   --proof <proof-dir>/proof.bin \
@@ -158,8 +158,8 @@ cargo run --release -p zkie-bench -- verify \
   --run-dir <run-dir>
 ```
 
-`zkie-bench run` performs commit, prove and verify in one command; see
-`zkie-bench help` for its flags. `matrix`, `decode-matrix` and
+`zkie run` performs commit, prove and verify in one command; see
+`zkie help` for its flags. `matrix`, `decode-matrix` and
 `profile-matrix` repeat the same stages over case lists and record per-stage
 measurements.
 

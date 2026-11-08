@@ -13,7 +13,7 @@ registered here:
 
 | Entry | Location | Purpose |
 |---|---|---|
-| zkie-bench CLI | tools/zkie-bench/src/main.rs | three-stage commit/prove/verify + matrix/run |
+| zkie CLI | tools/zkie/src/main.rs | three-stage commit/prove/verify + matrix/run |
 | zkie-check CLI | tools/zkie-check/src/main.rs | acceptance report |
 
 ## Directory layout
@@ -25,7 +25,7 @@ crates/zkie-engine/ execution environment: primitives, storage::mmap, compute::c
                      context, metrics
 crates/zkie-ops/    operators and proofs: op/registry, pipeline, proof/*, live operator modules
 models/{gpt2,gemma3,timesfm}/  config + executor (weights always external)
-tools/              zkie-bench, zkie-check
+tools/              zkie, zkie-check
 scripts/            data pipeline (extraction / simulation / GT), not the proof path
 docs/               benchmarks.md; spec / roadmap are TODO placeholders;
                      docs/benchmarks/ test trace archive (iteration tree)
@@ -34,14 +34,14 @@ docs/               benchmarks.md; spec / roadmap are TODO placeholders;
 ## Build and test methods
 
 - Build: `cargo build --workspace` / `cargo check --workspace`; for real runs use
-  release (`cargo build --release -p zkie-bench`).
+  release (`cargo build --release -p zkie`).
 - Tests: `cargo test --workspace` all green is the acceptance gate; unit tests go
   in-module under `#[cfg(test)]`, integration tests under `tests/`; negatives must
   be truly injected (serialize round-trip tamper, then the full verification path
   must reject) - adding a negative without verifying it is not allowed.
-- Three-stage runs: `zkie-bench matrix` (1 cold + 3 warm); numbers are measured on
+- Three-stage runs: `zkie matrix` (1 cold + 3 warm); numbers are measured on
   the same machine, warm medians go into the ledger, cold-run numbers do not.
-- Profiling: `zkie-bench profile-matrix --cases <case.toml>... --threads 1 8 64
+- Profiling: `zkie profile-matrix --cases <case.toml>... --threads 1 8 64
   --runs 3 --out <dir>` - stage level (commit/prove/verify wall time and peak
   memory) plus operator-level and kernel-level cumulative wall time and call
   counts; progress.jsonl must carry real elapsed times and done/total units;

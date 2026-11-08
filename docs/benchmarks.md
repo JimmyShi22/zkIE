@@ -47,15 +47,15 @@ Correctness gates for every row:
 The separate stages can be driven directly:
 
 ```bash
-cargo run --release -p zkie-bench -- commit \
+cargo run --release -p zkie -- commit \
   --case <case.toml> --assets-manifest <manifest> --parameters <parameters> \
   --out <commit-dir> --run-dir <run-dir>
 
-cargo run --release -p zkie-bench -- prove \
+cargo run --release -p zkie -- prove \
   --commit <commit-dir> --input <input> --model-id <model-id> \
   --out <proof-dir> --run-dir <run-dir>
 
-cargo run --release -p zkie-bench -- verify \
+cargo run --release -p zkie -- verify \
   --public <commit-dir>/public --statement <proof-dir>/statement.bin \
   --proof <proof-dir>/proof.bin --public-inputs <proof-dir>/public-inputs.bin \
   --model-id <model-id> --policy <policy> --run-dir <run-dir>
@@ -65,11 +65,11 @@ Batch runners:
 
 ```bash
 # cold + warm stages over a case list
-cargo run --release -p zkie-bench -- matrix \
+cargo run --release -p zkie -- matrix \
   --cases <case.toml>... --cold-runs 1 --warm-runs 3 --out <dir>
 
 # per-thread-count samples
-cargo run --release -p zkie-bench -- profile-matrix \
+cargo run --release -p zkie -- profile-matrix \
   --cases <case.toml>... --threads 1 8 64 --runs 3 --out <dir>
 ```
 
