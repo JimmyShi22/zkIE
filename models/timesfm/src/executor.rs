@@ -11,7 +11,6 @@ use zkie_core::error::{Error, Result};
 use zkie_core::progress::{ProgressEvent, ProgressKind, ProgressSink};
 use zkie_ops::add::AddOp;
 use zkie_ops::affine_scale::AffineScaleOp;
-use zkie_ops::gated_ffn::GatedFfnOp;
 use zkie_ops::hadamard::HadamardOp;
 use zkie_ops::index_gen::TableIndexOp;
 use zkie_ops::matmul::MatMulOp;
