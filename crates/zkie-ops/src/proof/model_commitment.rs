@@ -15,7 +15,7 @@ use rayon::prelude::*;
 
 use crate::proof::binding::oracle_leaf_i64;
 use crate::proof::relations::{ExternalAssetRef, ExternalLayout};
-use crate::public_lut::{self, PublicLutRef};
+use crate::public_lut::{self, PublicLutKind, PublicLutRef};
 use zkie_core::storage::TensorReader;
 use zkie_core::types::{Digest, DType, TensorSpec};
 use zkie_engine::compute::cpu::{merkle_build, merkle_verify, MerkleTree};
@@ -968,152 +968,56 @@ pub struct SharedTrace {
     pub argmax: Vec<u32>,
     #[serde(default)]
     pub output: Vec<i64>,
-    /// Challenge derived from the canonical transcript prefix (statement, model
-    /// commitment, graph identity, oracle commitments, claim set). It must be
-    /// fixed before any accumulation challenge is derived and is replayed by
-    /// the verifier.
-    #[serde(default)]
-    pub binding_challenge: Digest,
 }
 
-const BINDING_FORMAT_VERSION: u64 = 1;
-const BINDING_TAG: u64 = 20;
-const CLAIM_OBLIGATION_TAG: u64 = 18;
-const CLAIMS_ROOT_TAG: u64 = 19;
+const PREFIX_FORMAT_VERSION: u64 = 1;
+const PREFIX_TAG: u64 = 21;
 
-/// Canonical transcript prefix for the shared trace. The order follows the
-/// frozen sequence: statement, model commitment, public LUT identities, graph
-/// and ordered step list, and oracle commitments.
-pub fn trace_binding_digest(
+/// Canonical prefix absorbed by every per-step relation label. The order is
+/// statement, model commitment, public LUT identities, graph identity, then
+/// the oracle commitments. No proof field is added: the prover and verifier
+/// derive the same prefix from public data and the label binds it.
+pub fn trace_prefix(
     public: &ModelCommitmentPublic,
-    trace: &SharedTrace,
     statement_digest: &Digest,
+    graph_identity: &Digest,
 ) -> Result<Digest> {
     let mut writer = CanonicalWriter::new();
-    writer.put_u64(BINDING_FORMAT_VERSION);
+    writer.put_u64(PREFIX_FORMAT_VERSION);
     writer.put_digest(statement_digest);
     writer.put_digest(&public.anchor.anchor_id);
     writer.put_digest(&public.anchor.model_commitment);
     writer.put_digest(&public.anchor.parameters_digest);
     writer.put_digest(&public.anchor.registry_root);
     writer.put_u64(public.anchor.leaf_count);
-    let mut public_luts: BTreeMap<u64, PublicLutRef> = BTreeMap::new();
-    for step in &trace.steps {
-        for reference in step.public_luts.iter().flatten() {
-            if let Some(existing) = public_luts.insert(reference.asset_id, *reference) {
-                if existing != *reference {
-                    return Err(Error::StatementMismatch);
-                }
-            }
-        }
+    let mut assets: Vec<&AssetMeta> = public.assets.iter().collect();
+    assets.sort_by_key(|asset| asset.asset_id);
+    let luts: Vec<(&AssetMeta, PublicLutKind)> = assets
+        .iter()
+        .filter_map(|asset| {
+            public_lut::classify_path(&asset.path).map(|kind| (*asset, kind))
+        })
+        .collect();
+    writer.put_u64(luts.len() as u64);
+    for (asset, kind) in luts {
+        writer.put_u64(asset.asset_id);
+        writer.put_u64(kind.tag() as u64);
+        writer.put_u64(asset.element_count);
+        writer.put_u64(public_lut::padded_len(asset.element_count));
+        writer.put_digest(&asset.root);
+        writer.put_digest(&asset.start);
     }
-    writer.put_u64(public_luts.len() as u64);
-    for (asset_id, reference) in &public_luts {
-        writer.put_u64(*asset_id);
-        writer.put_u64(reference.kind.tag() as u64);
-        writer.put_u64(reference.valid_len);
-        writer.put_u64(reference.padded_len);
-        let meta = public
-            .assets
-            .iter()
-            .find(|asset| asset.asset_id == *asset_id)
-            .ok_or(Error::StatementMismatch)?;
-        writer.put_digest(&meta.root);
-        writer.put_digest(&meta.start);
-    }
-    writer.put_u64(trace.steps.len() as u64);
-    for step in &trace.steps {
-        writer.put_u64(step.message.opcode as u64);
-        writer.put_u64(step.message.config.len() as u64);
-        for value in &step.message.config {
-            writer.put_u64(*value as u64);
-        }
-        writer.put_u64(step.message.external_inputs.len() as u64);
-        for index in &step.message.external_inputs {
-            writer.put_u64(*index as u64);
-        }
-        writer.put_u64(step.external.len() as u64);
-        for slot in &step.external {
-            match slot {
-                None => writer.put_u64(0),
-                Some(reference) => {
-                    writer.put_u64(1);
-                    writer.put_u64(reference.asset_id);
-                    writer.put_u64(reference.row_start);
-                    writer.put_u64(reference.row_count);
-                    match reference.layout {
-                        ExternalLayout::Rows => writer.put_u64(0),
-                        ExternalLayout::Broadcast { rows } => {
-                            writer.put_u64(1);
-                            writer.put_u64(rows);
-                        }
-                        ExternalLayout::Columns {
-                            source_row_width,
-                            col_start,
-                            col_count,
-                        } => {
-                            writer.put_u64(2);
-                            writer.put_u64(source_row_width);
-                            writer.put_u64(col_start);
-                            writer.put_u64(col_count);
-                        }
-                        ExternalLayout::BroadcastColumns {
-                            source_row_width,
-                            col_start,
-                            col_count,
-                            rows,
-                        } => {
-                            writer.put_u64(3);
-                            writer.put_u64(source_row_width);
-                            writer.put_u64(col_start);
-                            writer.put_u64(col_count);
-                            writer.put_u64(rows);
-                        }
-                    }
-                }
-            }
-        }
-        writer.put_u64(step.public_luts.len() as u64);
-        for slot in &step.public_luts {
-            match slot {
-                None => writer.put_u64(0),
-                Some(reference) => {
-                    writer.put_u64(1);
-                    writer.put_u64(reference.asset_id);
-                    writer.put_u64(reference.kind.tag() as u64);
-                    writer.put_u64(reference.valid_len);
-                    writer.put_u64(reference.padded_len);
-                }
-            }
-        }
-        writer.put_u64(step.sources.len() as u64);
-        for source in &step.sources {
-            match source {
-                None => writer.put_u64(0),
-                Some((producer, port)) => {
-                    writer.put_u64(1);
-                    writer.put_u64(*producer as u64);
-                    writer.put_u64(*port as u64);
-                }
-            }
-        }
-        writer.put_u64(step.message.roots.len() as u64);
-        for (root, start, count) in &step.message.roots {
-            writer.put_digest(root);
-            writer.put_digest(start);
-            writer.put_u64(*count);
-        }
-        writer.put_u64(step.message.proof.lengths.inputs.len() as u64);
-        for len in &step.message.proof.lengths.inputs {
-            writer.put_u64(*len as u64);
-        }
-        writer.put_u64(step.message.proof.lengths.outputs.len() as u64);
-        for len in &step.message.proof.lengths.outputs {
-            writer.put_u64(*len as u64);
-        }
+    writer.put_digest(graph_identity);
+    writer.put_u64(assets.len() as u64);
+    for asset in assets {
+        writer.put_u64(asset.asset_id);
+        writer.put_digest(&asset.root);
+        writer.put_digest(&asset.start);
+        writer.put_u64(asset.rows);
+        writer.put_u64(asset.row_width as u64);
     }
     hash_labeled(
-        tag_word(STATEMENT, BINDING_TAG),
+        tag_word(STATEMENT, PREFIX_TAG),
         0,
         None,
         &writer.into_bytes(),
@@ -1124,9 +1028,9 @@ pub fn verify_shared_trace(
     public: &ModelCommitmentPublic,
     trace: &SharedTrace,
     expected_tokens: &[u32],
-    statement_digest: &Digest,
+    prefix: &Digest,
 ) -> Result<Vec<u32>> {
-    verify_shared_trace_steps(public, trace, expected_tokens, statement_digest)?;
+    verify_shared_trace_steps(public, trace, expected_tokens, prefix)?;
     Ok(trace.argmax.clone())
 }
 
@@ -1136,10 +1040,10 @@ pub fn verify_shared_trace_output(
     public: &ModelCommitmentPublic,
     trace: &SharedTrace,
     expected_tokens: &[u32],
-    statement_digest: &Digest,
+    prefix: &Digest,
 ) -> Result<Vec<i64>> {
     let outputs =
-        verify_shared_trace_steps(public, trace, expected_tokens, statement_digest)?;
+        verify_shared_trace_steps(public, trace, expected_tokens, prefix)?;
     if trace.output.is_empty() {
         return Err(Error::StatementMismatch);
     }
@@ -1158,7 +1062,7 @@ fn verify_shared_trace_steps(
     public: &ModelCommitmentPublic,
     trace: &SharedTrace,
     expected_tokens: &[u32],
-    statement_digest: &Digest,
+    prefix: &Digest,
 ) -> Result<Vec<Vec<Vec<i64>>>> {
     if trace.tokens != expected_tokens {
         return Err(Error::StatementMismatch);
@@ -1177,13 +1081,6 @@ fn verify_shared_trace_steps(
         }
     }
     if trace.output.is_empty() && trace.argmax.len() != expected_tokens.len() {
-        return Err(Error::StatementMismatch);
-    }
-    // The canonical prefix, including the claim set, is fixed before any
-    // relation or accumulation challenge is consumed. A post-challenge rewrite
-    // of the graph or obligations changes this value and is rejected.
-    let binding = trace_binding_digest(public, trace, statement_digest)?;
-    if trace.binding_challenge == Digest::ZERO || trace.binding_challenge != binding {
         return Err(Error::StatementMismatch);
     }
     let mut openings_by_id: BTreeMap<u64, &AssetOpening> = BTreeMap::new();
@@ -1370,6 +1267,16 @@ fn verify_shared_trace_steps(
             })
             .collect::<Result<Vec<_>>>()?;
         let opcode = crate::op::opcode_from_u16(step.message.opcode)?;
+        let expected_start = oracle_start(&crate::proof::relations::relation_label(
+            prefix,
+            opcode,
+            &step.message.config,
+        ));
+        for (_, start, _) in &step.message.roots {
+            if *start != expected_start {
+                return Err(Error::StatementMismatch);
+            }
+        }
         let public_relation = crate::proof::relations::OpRelationPublic {
             opcode,
             config: step.message.config.clone(),

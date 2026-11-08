@@ -2,7 +2,9 @@
 
 use std::collections::BTreeMap;
 
-use zkie_core::types::{DType, LayoutSpec, PaddingSpec, TensorId, TensorSpec};
+use zkie_core::types::{DType, Digest, LayoutSpec, PaddingSpec, TensorId, TensorSpec};
+
+const TEST_PREFIX: Digest = Digest([0x5C; 32]);
 
 use zkie_engine::memory::BudgetedMemoryGovernor;
 use zkie_engine::pcs::request::field::Fp3;
@@ -427,7 +429,6 @@ fn profile_norm_and_index_generation_relations_close() {
 
 #[test]
 fn model_commitment_shares_asset_openings_across_intervals() {
-    use zkie_core::types::Digest;
     use zkie_ops::proof::model_commitment::{
         commit_assets, open_asset, verify_asset_opening, ModelAssetSpec,
     };
@@ -539,7 +540,7 @@ fn shared_external_inputs_avoid_local_weight_openings() {
     let a = vec![1i64, 2, 3, 4];
     let b = vec![5i64, 6, 7, 8];
     let (public, proof) =
-        prove_op_relation_shared(&op, &[a.clone(), b.clone()], &[2, 2, 2, 0, 0], &[1]).unwrap();
+        prove_op_relation_shared(&op, &[a.clone(), b.clone()], &[2, 2, 2, 0, 0], &[1], &TEST_PREFIX).unwrap();
     assert!(proof.inputs[1].is_empty());
     let external = vec![None, Some(b.clone())];
     verify_op_relation_with_external(&public, &proof, &public.config, &external).unwrap();
@@ -556,7 +557,7 @@ fn shared_trace_references_one_model_asset_opening() {
     use zkie_core::types::Digest;
     use zkie_ops::matmul::MatMulOp;
     use zkie_ops::proof::model_commitment::{
-        commit_assets, open_asset, trace_binding_digest, verify_shared_trace,
+        commit_assets, open_asset, verify_shared_trace,
         ModelAssetSpec, ModelCommitmentPublic, SharedTrace, SharedTraceStep,
     };
     use zkie_ops::proof::relations::ExternalAssetRef;
@@ -594,6 +595,7 @@ fn shared_trace_references_one_model_asset_opening() {
         &[a, vec![5, 6, 7, 8]],
         &[2, 2, 2, 0, 0],
         &[1],
+        &TEST_PREFIX,
     )
     .unwrap();
     zkie_ops::proof::relations::verify_op_relation_with_external(
@@ -629,37 +631,33 @@ fn shared_trace_references_one_model_asset_opening() {
         steps: vec![step],
         argmax: vec![0],
         output: Vec::new(),
-        binding_challenge: Digest::ZERO,
     };
-    let statement_digest = Digest([0x5B; 32]);
-    trace.binding_challenge =
-        trace_binding_digest(&public, &trace, &statement_digest).unwrap();
     public.verify_opening(&opening).unwrap();
-    verify_shared_trace(&public, &trace, &[0], &statement_digest).unwrap();
+    verify_shared_trace(&public, &trace, &[0], &TEST_PREFIX).unwrap();
 
     let mut tampered = trace.clone();
     tampered.assets[0].rows[0].values[0] = 99;
-    assert!(verify_shared_trace(&public, &tampered, &[0], &statement_digest).is_err());
+    assert!(verify_shared_trace(&public, &tampered, &[0], &TEST_PREFIX).is_err());
 
     let mut tampered = trace.clone();
     tampered.steps[0].message.config[0] = 3;
-    assert!(verify_shared_trace(&public, &tampered, &[0], &statement_digest).is_err());
+    assert!(verify_shared_trace(&public, &tampered, &[0], &TEST_PREFIX).is_err());
 
     let mut tampered = trace.clone();
     tampered.steps[0].message.proof.outputs[0][0].values[0] += 1;
-    assert!(verify_shared_trace(&public, &tampered, &[0], &statement_digest).is_err());
+    assert!(verify_shared_trace(&public, &tampered, &[0], &TEST_PREFIX).is_err());
 
     let mut tampered = trace.clone();
     tampered.steps[0].message.proof.inputs[0][0].values[0] += 1;
-    assert!(verify_shared_trace(&public, &tampered, &[0], &statement_digest).is_err());
+    assert!(verify_shared_trace(&public, &tampered, &[0], &TEST_PREFIX).is_err());
 
     let mut tampered = trace.clone();
     tampered.steps[0].external[1] = Some(ExternalAssetRef::rows(3, 0, 1));
-    assert!(verify_shared_trace(&public, &tampered, &[0], &statement_digest).is_err());
+    assert!(verify_shared_trace(&public, &tampered, &[0], &TEST_PREFIX).is_err());
 
     let mut tampered = trace.clone();
     tampered.steps[0].external[1] = Some(ExternalAssetRef::rows(99, 0, 2));
-    assert!(verify_shared_trace(&public, &tampered, &[0], &statement_digest).is_err());
+    assert!(verify_shared_trace(&public, &tampered, &[0], &TEST_PREFIX).is_err());
 }
 
 #[test]

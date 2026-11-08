@@ -24,7 +24,7 @@ use zkie_ops::pipeline::{
     VerifyReceipt, VerifyRequest,
 };
 use zkie_ops::proof::model_commitment::{
-    trace_binding_digest, verify_shared_trace, verify_shared_trace_output, ModelCommitmentPublic,
+    trace_prefix, verify_shared_trace, verify_shared_trace_output, ModelCommitmentPublic,
     SharedTrace,
 };
 
@@ -225,22 +225,26 @@ fn build_commitment(config: &ProviderConfig) -> Result<zkie_ops::proof::model_co
 fn execute_shared(
     config: &ProviderConfig,
     commitment: &zkie_ops::proof::model_commitment::ModelCommitment,
+    prefix: &Digest,
     progress: &dyn ProgressSink,
 ) -> Result<SharedTrace> {
     match config.model.as_str() {
-        "gpt2" => gpt2::execute_shared_with_progress(
+        "gpt2" => gpt2::execute_shared_with_prefix(
             commitment,
             &config.tokens.iter().map(|value| *value as i64).collect::<Vec<_>>(),
+            prefix,
             Some(progress),
         ),
-        "gemma3" => gemma3::execute_shared_with_progress(
+        "gemma3" => gemma3::execute_shared_with_prefix(
             commitment,
             &config.tokens.iter().map(|value| *value as i64).collect::<Vec<_>>(),
+            prefix,
             Some(progress),
         ),
-        "timesfm" => timesfm::execute_shared_with_progress(
+        "timesfm" => timesfm::execute_shared_with_prefix(
             commitment,
             &config.input.iter().map(|value| *value as i64).collect::<Vec<_>>(),
+            prefix,
             Some(progress),
         ),
         _ => Err(Error::UnsupportedPrimitive),
@@ -327,9 +331,11 @@ impl PipelineProvider for ProductionProvider {
         let statement_bytes = bincode::serialize(&statement).map_err(|_| Error::InvalidEncoding)?;
         let statement_digest = digest_bytes(&statement_bytes);
         let public = ModelCommitmentPublic::from_commitment(&commitment);
-        let mut trace = execute_shared(&config, &commitment, ctx.progress)?;
-        trace.binding_challenge =
-            trace_binding_digest(&public, &trace, &statement_digest)?;
+        let protocol_bytes = fs::read(request.commit_dir.join("public/protocol.bin"))
+            .map_err(|_| Error::MissingCommitArtifact)?;
+        let graph_identity = digest_bytes(&protocol_bytes);
+        let prefix = trace_prefix(&public, &statement_digest, &graph_identity)?;
+        let trace = execute_shared(&config, &commitment, &prefix, ctx.progress)?;
         if std::env::var("ZKIE_MEASURE_PROOF_SECTIONS").ok().as_deref() == Some("1") {
             let asset_bytes = bincode::serialized_size(&trace.assets)
                 .map_err(|_| Error::InvalidEncoding)?;
@@ -390,6 +396,10 @@ impl PipelineProvider for ProductionProvider {
         let statement: StatementData =
             bincode::deserialize(&statement_bytes).map_err(|_| Error::InvalidEncoding)?;
         let statement_digest = digest_bytes(&statement_bytes);
+        let protocol_bytes = fs::read(request.public_bundle_dir.join("protocol.bin"))
+            .map_err(|_| Error::IncompleteArtifact)?;
+        let graph_identity = digest_bytes(&protocol_bytes);
+        let prefix = trace_prefix(&public, &statement_digest, &graph_identity)?;
         if statement.model_commitment != request.expected_model_id {
             return Err(Error::StatementMismatch);
         }
@@ -401,7 +411,7 @@ impl PipelineProvider for ProductionProvider {
         if statement.model == "timesfm" {
             let expected: Vec<i32> =
                 bincode::deserialize(&public_inputs).map_err(|_| Error::InvalidEncoding)?;
-            let output = verify_shared_trace_output(&public, &trace, &statement.tokens, &statement_digest)?;
+            let output = verify_shared_trace_output(&public, &trace, &statement.tokens, &prefix)?;
             let matched = output.len() == expected.len()
                 && output.iter().zip(&expected).all(|(value, wanted)| *value as i32 == *wanted);
             if !matched || expected != statement.expected_output {
@@ -413,7 +423,7 @@ impl PipelineProvider for ProductionProvider {
         } else {
             let expected: Vec<u32> =
                 bincode::deserialize(&public_inputs).map_err(|_| Error::InvalidEncoding)?;
-            let argmax = verify_shared_trace(&public, &trace, &statement.tokens, &statement_digest)?;
+            let argmax = verify_shared_trace(&public, &trace, &statement.tokens, &prefix)?;
             if argmax != expected || expected != statement.expected_argmax {
                 return Ok(VerifyReceipt {
                     accepted: false,

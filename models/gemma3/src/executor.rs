@@ -209,6 +209,7 @@ struct Builder<'a> {
     planned_total: u64,
     completed: u64,
     commitment: &'a ModelCommitment,
+    prefix: Digest,
 }
 
 impl<'a> Builder<'a> {
@@ -275,7 +276,7 @@ impl<'a> Builder<'a> {
                 .ok_or(Error::StatementMismatch)?;
             config.extend(public_lut::identity_words(reference, &asset.root));
         }
-        let (public, proof) = prove_op_relation_shared(op, &values, &config, &external_indices)?;
+        let (public, proof) = prove_op_relation_shared(op, &values, &config, &external_indices, &self.prefix)?;
         let mut roots = Vec::new();
         for id in public.registry.ids() {
             let root = public.registry.get(id).ok_or(Error::ProverStateMissing)?;
@@ -387,6 +388,15 @@ pub fn execute_shared_with_progress(
     tokens: &[i64],
     progress: Option<&dyn ProgressSink>,
 ) -> Result<SharedTrace> {
+    execute_shared_with_prefix(commitment, tokens, &Digest::ZERO, progress)
+}
+
+pub fn execute_shared_with_prefix(
+    commitment: &ModelCommitment,
+    tokens: &[i64],
+    prefix: &Digest,
+    progress: Option<&dyn ProgressSink>,
+) -> Result<SharedTrace> {
     if tokens.is_empty() || tokens.len() > 512 {
         return Err(Error::InvalidConfig);
     }
@@ -399,6 +409,7 @@ pub fn execute_shared_with_progress(
         planned_total,
         completed: 0,
         commitment: assets.commitment,
+        prefix: *prefix,
     };
     let weight = |name: &str| assets.value(name);
     let pool = |name: &str| assets.external_rows(assets.pool(name)?);
@@ -654,7 +665,6 @@ pub fn execute_shared_with_progress(
         steps,
         argmax,
         output: Vec::new(),
-        binding_challenge: Digest::ZERO,
     })
 }
 

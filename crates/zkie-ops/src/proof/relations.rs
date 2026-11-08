@@ -474,8 +474,11 @@ fn commit_group_wide(
     Ok(openings)
 }
 
-fn relation_label(opcode: OpCode, config: &[i64]) -> Digest {
+/// Per-step relation label. The trace prefix is absorbed before the step's
+/// opcode/config, so the step commitments are bound to the fixed prefix.
+pub fn relation_label(prefix: &Digest, opcode: OpCode, config: &[i64]) -> Digest {
     let mut bytes = Vec::new();
+    bytes.extend_from_slice(&prefix.0);
     bytes.extend_from_slice(&(opcode as u16).to_le_bytes());
     for value in config {
         bytes.extend_from_slice(&value.to_le_bytes());
@@ -651,7 +654,7 @@ pub fn prove_op_relation(
     inputs: &[Vec<i64>],
     config: &[i64],
 ) -> Result<(OpRelationPublic, OpRelationProof)> {
-    prove_op_relation_shared(op, inputs, config, &[])
+    prove_op_relation_shared(op, inputs, config, &[], &Digest::ZERO)
 }
 
 /// Prove a relation where selected inputs are supplied by a shared model
@@ -661,11 +664,12 @@ pub fn prove_op_relation_shared(
     inputs: &[Vec<i64>],
     config: &[i64],
     external: &[usize],
+    prefix: &Digest,
 ) -> Result<(OpRelationPublic, OpRelationProof)> {
     let _profile = zkie_core::profile::Scope::operator(op.opcode() as u16);
     let record = op.forward_values(inputs)?;
     let opcode = op.opcode();
-    let label = relation_label(opcode, config);
+    let label = relation_label(prefix, opcode, config);
     let mut registry = OracleRegistry::new();
     let input_widths = input_widths(opcode, config, inputs);
     let mut input_openings = Vec::new();
