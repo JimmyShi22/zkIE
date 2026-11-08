@@ -1169,7 +1169,7 @@ pub fn verify_op_relation_with_external(
                 }
             }
         }
-        OpCode::IndexCompose => {
+        OpCode::IndexGather => {
             if inputs.len() != 2 || outputs[0].len() != inputs[0].len() {
                 return Err(Error::ShapeMismatch);
             }

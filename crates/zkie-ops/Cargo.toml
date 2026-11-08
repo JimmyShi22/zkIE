@@ -2,7 +2,7 @@
 name = "zkie-ops"
 version = "0.1.0"
 edition = "2021"
-description = "zkIE op-level proof primitives"
+description = "zkIE live operators, relation receipts, and shared model commitment"
 license = "Apache-2.0"
 
 [dependencies]

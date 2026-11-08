@@ -5,7 +5,7 @@
 //! and keeps a deterministic test PRNG. Goldilocks is the "sufficient" field for
 //! large-model inference: its 64-bit width holds int16 fixed-point accumulation
 //! (products are 32-bit, a length-K dot product adds `log2(K)` bits), and
-//! `p - 1 = 2^32 * (2^32 - 1)` gives a large 2-adic subgroup for FRI/WHIR.
+//! `p - 1 = 2^32 * (2^32 - 1)` gives a large 2-adic subgroup for field arithmetic and FFT-style transforms.
 
 pub use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
 pub use p3_goldilocks::Goldilocks;

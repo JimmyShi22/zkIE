@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dump the TimesFM 200M weights/biases/constants for the GKR prover.
+"""Dump the TimesFM 200M weights/biases/constants for the fixed-point prover.
 
 200M structure (same family as 8M, but non-degenerate attention at seq=16):
   hidden = 1280 (pad 2048), qkv fused = 3840 (pad 4096), 20 layers.

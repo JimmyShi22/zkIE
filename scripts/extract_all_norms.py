@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract the 7 LayerNorm inputs and mean/rstd scalars for the GKR prover.
+"""Extract the 7 LayerNorm inputs and mean/rstd scalars for the fixed-point prover.
 
 Walks the LayerNormalization nodes (one per decoder layer), extracts each norm's
 input (the residual), weight and bias, computes mean and rstd = 1/sqrt(var+eps),

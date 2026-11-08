@@ -2,7 +2,7 @@
 name = "zkie-models-gemma3"
 version = "0.1.0"
 edition = "2021"
-description = "zkIE Gemma 3 270M op-graph builder + prove/bench examples"
+description = "zkIE Gemma 3 270M fixed-point configuration and shared-trace executor"
 license = "Apache-2.0"
 
 [dependencies]

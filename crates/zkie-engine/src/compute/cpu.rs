@@ -550,7 +550,7 @@ pub fn isqrt_u128(value: u128) -> u128 {
     low
 }
 
-/// Decompose a non-negative value into limbs of `base_bits` bits each.
+/// Split a non-negative value into limbs of `base_bits` bits each.
 pub fn limb_decompose(value: i128, base_bits: u32) -> Result<Vec<u64>> {
     if value < 0 {
         return Err(Error::BoundViolation);

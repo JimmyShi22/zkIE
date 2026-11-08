@@ -207,7 +207,7 @@ pub trait ComputeBackend<F: ProtocolField>: Send {
     fn memory_usage(&self) -> MemoryUsage;
 }
 
-/// The execution boundary used by operators and PCS code.
+/// The execution boundary used by operators and engine kernels.
 pub trait ExecutionPort<F: ProtocolField> {
     fn storage(&self) -> &dyn TensorStorageService;
     fn memory(&self) -> &dyn MemoryGovernor;

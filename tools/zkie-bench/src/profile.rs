@@ -79,7 +79,7 @@ impl ProfileArgs {
                 "--keep-artifacts" => {
                     keep_artifacts = true;
                 }
-                "--compute" | "--pcs" | "--asset-root" => {
+                "--compute" | "--asset-root" => {
                     index += 1;
                     while index < args.len() && !args[index].starts_with("--") {
                         index += 1;

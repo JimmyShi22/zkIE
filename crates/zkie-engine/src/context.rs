@@ -2,7 +2,7 @@
 //!
 //! The context borrows the compute, storage, memory, progress and measurement
 //! services. It does not own a thread pool and does not hold protocol state;
-//! the request session owns the transcript and randomness.
+//! protocol state and randomness live in the proof pipeline.
 
 use std::collections::BTreeMap;
 

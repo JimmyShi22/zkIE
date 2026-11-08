@@ -2,7 +2,7 @@
 name = "zkie-engine"
 version = "0.1.0"
 edition = "2021"
-description = "zkIE execution facilities, providers and persistence"
+description = "zkIE execution context, CPU kernels, storage, commitments, and transcript primitives"
 license = "Apache-2.0"
 
 [dependencies]

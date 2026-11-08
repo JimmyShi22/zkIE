@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dump the TimesFM 200M prologue/epilogue/attention constants for the GKR prover.
+"""Dump the TimesFM 200M prologue/epilogue/attention constants for the fixed-point prover.
 
 `extract_200m.py` already dumps the 20 per-layer weights/biases/norms. This
 script dumps the remaining fixed tensors the full-stack proof needs:

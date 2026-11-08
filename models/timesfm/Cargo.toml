@@ -2,7 +2,7 @@
 name = "zkie-models-timesfm"
 version = "0.1.0"
 edition = "2021"
-description = "zkIE TimesFM 1.0 200M op-graph builder + prove/bench examples"
+description = "zkIE TimesFM 1.0 200M fixed-point configuration and shared-trace executor"
 license = "Apache-2.0"
 
 [dependencies]

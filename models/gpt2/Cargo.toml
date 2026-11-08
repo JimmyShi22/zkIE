@@ -2,7 +2,7 @@
 name = "zkie-models-gpt2"
 version = "0.1.0"
 edition = "2021"
-description = "zkIE GPT-2 124M op-graph builder + prove/bench examples"
+description = "zkIE GPT-2 124M fixed-point configuration and shared-trace executor"
 license = "Apache-2.0"
 
 [dependencies]

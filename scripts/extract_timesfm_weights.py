@@ -3,7 +3,7 @@
 
 Walks the ONNX graph, takes every 2D weight initializer, quantizes it at scale
 2^12 into int32, zero-pads each dimension up to a power of two, and writes one
-`.bin` per tensor under models/weights/ (name_{h}x{w}_i32.bin). The GKR matmul
+`.bin` per tensor under models/weights/ (name_{h}x{w}_i32.bin). The matmul relation
 requires power-of-two dims, so 264 -> 512 and 792 -> 1024.
 
 Usage: .venv-timesfm/bin/python scripts/extract_timesfm_weights.py

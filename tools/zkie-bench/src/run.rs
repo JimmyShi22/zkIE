@@ -344,7 +344,7 @@ fn collect(args: &[String], decode: bool) -> Result<serde_json::Value> {
                     .and_then(|value| value.parse().ok())
                     .ok_or(Error::InvalidConfig)?;
             }
-            "--prompt-len" | "--decode-lengths" | "--compute" | "--pcs" | "--asset-root" => {
+            "--prompt-len" | "--decode-lengths" | "--compute" | "--asset-root" => {
                 index += 1;
                 while index < args.len() && !args[index].starts_with("--") {
                     index += 1;

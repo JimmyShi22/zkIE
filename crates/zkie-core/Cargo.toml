@@ -2,7 +2,7 @@
 name = "zkie-core"
 version = "0.1.0"
 edition = "2021"
-description = "zkIE proving substrate: reductions + WHIR/FRI PCS (CPU + optional CUDA)"
+description = "zkIE shared types, artifacts, fixed-point helpers, and execution traits"
 license = "Apache-2.0"
 
 [dependencies]
@@ -17,7 +17,6 @@ rayon = "1.10"
 memmap2 = "0.9"
 p3-multilinear-util = "0.7.0"
 p3-poseidon2 = "0.7.0"
-p3-sumcheck = "0.7.0"
 p3-symmetric = "0.7.0"
 p3-util = "0.7.0"
 rand = "0.10.1"

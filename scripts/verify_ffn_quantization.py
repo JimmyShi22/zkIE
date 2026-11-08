@@ -4,7 +4,7 @@
 Extracts layer 0's FFN weights/input/output from the ONNX, quantizes everything
 at scale 2^12 into int32, recomputes FFN1 -> ReLU -> FFN2 in integer arithmetic
 with a rescale after each matmul, and reports the error against the real float
-output. This anchors the GKR fixed-point arithmetic: the proofs are sound and
+output. This anchors the fixed-point arithmetic: the relation checks are exact and
 the quantization is close to the float reference.
 
 Usage: .venv-timesfm/bin/python scripts/verify_ffn_quantization.py

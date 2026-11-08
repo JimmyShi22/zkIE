@@ -3,8 +3,8 @@
 
 At seq=1 the attention is degenerate: QK^T yields one score per head, softmax of
 a single value is 1, so PV = V. Crucially, QK^T is a *batched dot product*
-(element-wise multiply then per-head sum), not a GKR matmul, so it is covered by
-plain field arithmetic rather than a sum-check. A longer context would make the
+(element-wise multiply then per-head sum), handled as an operator relation over
+field arithmetic rather than a matrix relation. A longer context would make the
 attention non-degenerate (and head_dim=66 would need padding to a power of two).
 
 Usage: .venv-timesfm/bin/python scripts/verify_attention.py

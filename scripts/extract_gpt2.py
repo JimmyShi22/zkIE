@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dump GPT-2 124M weights/tables for the GKR prover (mirrors TimesFM extract).
+"""Dump GPT-2 124M weights/tables for the fixed-point prover (mirrors TimesFM extract).
 
 Writes models/gpt2/weights/*.i32.bin: per-layer weights/biases (padded to power
 of two), the precomputed embedding for a fixed input, the causal mask, and the

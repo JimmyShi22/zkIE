@@ -1,11 +1,6 @@
 # Minimal CI: compile the workspace and run the library tests.
 #
-# Scope is deliberately small. It is `--workspace --lib`, not `--workspace`,
-# because `gpt2`, `gemma3` and `timesfm` each ship examples named `prove` and
-# `bench` which all link to the same `target/debug/examples/prove` path. That
-# collision makes a bare `cargo test --workspace` abort before any test runs.
-# Renaming them is worth doing, but it changes documented commands, so it is
-# left as a separate decision rather than folded in here.
+# Scope is deliberately small: library tests only.
 name: tests
 
 on:
@@ -27,16 +22,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The workspace crates are edition 2021, but the vendored
-      # crates/zkie-core/vendor/p3-merkle-tree is edition 2024, which needs
-      # Rust >= 1.85. Reading the workspace manifests alone hides that, so it is
-      # checked explicitly rather than left to fail as a confusing parse error.
+      # Check that the pinned toolchain is available before building.
       - name: Check toolchain
         run: |
           rustc --version
           cargo --version
           rustc -vV | grep -q 'release: 1\.\(8[5-9]\|9[0-9]\|[0-9]\{3\}\)' || {
-            echo "::error::Rust >= 1.85 is required (vendored p3-merkle-tree is edition 2024)"
+            echo "::error::Rust >= 1.85 is required by the workspace"
             exit 1
           }
 
@@ -56,12 +48,8 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      # --release is REQUIRED, not an optimisation. In debug the WHIR/PCS tests in
-      # zkie-core are pathologically slow - unoptimised field arithmetic - and the
-      # suite consumes ~11 CPU-hours where release takes 35 s. On a 2-core runner
-      # that is ~5.5 hours against any sane timeout, so debug CI could never pass
-      # on any commit with any cache. Measured on a 32-thread box: 26 minutes and
-      # still unfinished, 16 of 21 tests done, five individually past 60 s.
+      # Use release mode so the CPU kernels and field arithmetic run at a
+      # representative speed.
       - name: Build
         run: cargo build --release --workspace --lib --locked
 

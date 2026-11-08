@@ -5,8 +5,8 @@ LayerNorm needs `rstd = 1/sqrt(var + eps)`; this is the single non-arithmetic
 scalar in the norm (everything else — mean, variance, the affine product — is
 plain field arithmetic the verifier recomputes from the committed input).  The
 table maps a fixed-point `s = var + eps` to the corresponding `rstd`, so the
-prover can bind `rstd` to the committed `x` through a LogUp lookup instead of
-supplying it as a trusted scalar.
+prover can bind `rstd` to the committed `x` through a committed table opening
+instead of supplying it as a trusted scalar.
 
 Quantization:
   * index scale 2^14, table size 2^19 -> covers s up to 32.0 (TimesFM's var

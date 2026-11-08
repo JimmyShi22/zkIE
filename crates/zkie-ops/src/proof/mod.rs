@@ -1,4 +1,4 @@
-//! Relation proof interfaces and request-session wiring.
+//! Relation proof interfaces and shared model commitment.
 pub mod binding;
 pub mod relations;
 pub mod model_commitment;

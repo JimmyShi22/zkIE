@@ -1,4 +1,4 @@
-//! zkie-core: proving substrate (common + pcs).
+//! zkie-core: shared types, commitments, and execution traits.
 pub mod artifact;
 pub mod claim;
 pub mod common;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract the 7 transformer layers' matmul activations for the GKR prover.
+"""Extract the 7 transformer layers' matmul activations for the fixed-point prover.
 
 Walks the ONNX MatMul nodes, groups them into the 7 decoder layers by the four
 2D weight shapes (qkv 264x792, o_proj 264x264, gate 264x1024, down 1024x264),

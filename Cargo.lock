@@ -365,27 +365,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "p3-sumcheck"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e79644f8b4a956b786e9b87f863ae2dae0427275cc7717de9e7ee97aa12c8713"
-dependencies = [
- "itertools",
- "p3-challenger",
- "p3-commit",
- "p3-field",
- "p3-matrix",
- "p3-maybe-rayon",
- "p3-multilinear-util",
- "p3-util",
- "p3-zk-codes",
- "rand",
- "serde",
- "thiserror",
- "tracing",
-]
-
-[[package]]
 name = "p3-symmetric"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -405,20 +384,6 @@ checksum = "e020b468e9188da32310d8c876225e5183df105a1970368df97f8a76b85dcc5b"
 dependencies = [
  "p3-maybe-rayon",
  "serde",
-]
-
-[[package]]
-name = "p3-zk-codes"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13ba052ae6fc2d110e96113749f6aff054fcdbc5c52b5bf89e03ded31f64aa39"
-dependencies = [
- "itertools",
- "p3-dft",
- "p3-field",
- "p3-matrix",
- "p3-util",
- "rand",
 ]
 
 [[package]]
@@ -586,26 +551,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "thiserror"
-version = "2.0.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
-dependencies = [
- "thiserror-impl",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "2.0.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.6",
-]
-
-[[package]]
 name = "tracing"
 version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -689,7 +634,6 @@ dependencies = [
  "p3-maybe-rayon",
  "p3-multilinear-util",
  "p3-poseidon2",
- "p3-sumcheck",
  "p3-symmetric",
  "p3-util",
  "rand",
