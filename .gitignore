@@ -14,3 +14,6 @@
 /zkie-evm-verifier-poc/contracts/cache
 /zkie-evm-verifier-poc/contracts/lib
 /zkie-evm-verifier-poc/logs
+
+# python working env
+.venv

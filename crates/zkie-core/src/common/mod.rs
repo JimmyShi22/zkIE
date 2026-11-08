@@ -1,11 +1,7 @@
-pub mod claim;
-pub mod batched_matmul;
 pub mod field;
 pub mod fixed_point;
 pub mod logup_gkr;
-pub mod matmul;
 pub mod mle;
-pub mod same_poly;
 pub mod sumcheck;
 pub mod transcript;
 pub mod weights_io;
