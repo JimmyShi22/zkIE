@@ -195,6 +195,9 @@ pub(crate) struct CaseEntry {
     pub(crate) id: String,
     pub(crate) input: String,
     pub(crate) seq_tokens: usize,
+    pub(crate) gt_path: Option<String>,
+    pub(crate) gt_bytes: Option<u64>,
+    pub(crate) gt_sha256: Option<String>,
 }
 
 pub(crate) fn parse_cases(path: &Path) -> Result<(std::path::PathBuf, Vec<CaseEntry>)> {
@@ -229,6 +232,26 @@ pub(crate) fn parse_cases(path: &Path) -> Result<(std::path::PathBuf, Vec<CaseEn
                 entry.seq_tokens = rest.trim().parse().unwrap_or(0);
             } else if let Some(rest) = trimmed.strip_prefix("patch_tokens = ") {
                 entry.seq_tokens = rest.trim().parse().unwrap_or(0);
+            } else if let Some(rest) = trimmed.strip_prefix("integer_gt = {") {
+                if let Some(position) = rest.find("path = \"") {
+                    let after = &rest[position + 8..];
+                    if let Some(end) = after.find('"') {
+                        entry.gt_path = Some(after[..end].to_owned());
+                    }
+                }
+                if let Some(position) = rest.find("bytes = ") {
+                    let after = &rest[position + 8..];
+                    let end = after
+                        .find(|character: char| !character.is_ascii_digit())
+                        .unwrap_or(after.len());
+                    entry.gt_bytes = after[..end].parse().ok();
+                }
+                if let Some(position) = rest.find("sha256 = \"") {
+                    let after = &rest[position + 10..];
+                    if let Some(end) = after.find('"') {
+                        entry.gt_sha256 = Some(after[..end].to_owned());
+                    }
+                }
             }
         }
     }
