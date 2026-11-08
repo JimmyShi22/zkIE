@@ -1,0 +1,708 @@
+//! Static model plans and plan checking for shared traces.
+//!
+//! A plan is constructed from model configuration and shapes only. It never
+//! reads a proof and never executes the model. The verifier uses it to bind
+//! every step, input port and final output to the expected data flow.
+
+use zkie_core::error::{Error, Result};
+
+use crate::op::OpCode;
+use crate::proof::model_commitment::{
+    AssetMeta, AssetOpening, ModelCommitmentPublic, SharedTrace, SharedTraceStep,
+};
+use crate::proof::relations::{proof_input_values, proof_output_values};
+
+/// One expected input source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlanSource {
+    /// A previous step output, optionally sliced or transformed.
+    Prev {
+        step: usize,
+        output: usize,
+        layout: PlanLayout,
+    },
+    /// A model asset, optionally sliced or transformed.
+    Asset { path: String, layout: PlanLayout },
+    /// A trusted constant derived from public configuration.
+    Constant(PlanConstant),
+    /// Values concatenated from several sources.
+    Concat(Vec<PlanSource>),
+    /// Per-row concatenation of equally shaped head outputs.
+    HeadConcat { parts: Vec<PlanSource>, rows: usize },
+    /// Apply a layout to another source.
+    Layout(Box<PlanSource>, PlanLayout),
+}
+
+impl PlanSource {
+    pub fn prev(step: usize, output: usize) -> Self {
+        Self::Prev {
+            step,
+            output,
+            layout: PlanLayout::Flat,
+        }
+    }
+
+    pub fn prev_slice(step: usize, output: usize, layout: PlanLayout) -> Self {
+        Self::Prev {
+            step,
+            output,
+            layout,
+        }
+    }
+
+    pub fn asset(path: impl Into<String>) -> Self {
+        Self::Asset {
+            path: path.into(),
+            layout: PlanLayout::Flat,
+        }
+    }
+
+    pub fn asset_slice(path: impl Into<String>, layout: PlanLayout) -> Self {
+        Self::Asset {
+            path: path.into(),
+            layout,
+        }
+    }
+
+    pub fn with_layout(self, layout: PlanLayout) -> Self {
+        Self::Layout(Box::new(self), layout)
+    }
+}
+
+/// Static tensor layouts. Layouts are applied in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlanLayout {
+    Flat,
+    Range {
+        start: u64,
+        count: usize,
+    },
+    Rows {
+        row_width: usize,
+        start: usize,
+        count: usize,
+    },
+    Columns {
+        row_width: usize,
+        start: usize,
+        count: usize,
+    },
+    Transpose {
+        rows: usize,
+        cols: usize,
+    },
+    Broadcast {
+        rows: usize,
+    },
+    Chain(Vec<PlanLayout>),
+}
+
+impl PlanLayout {
+    pub fn apply(&self, values: &[i64]) -> Result<Vec<i64>> {
+        match self {
+            Self::Flat => Ok(values.to_vec()),
+            Self::Range { start, count } => {
+                let start = usize::try_from(*start).map_err(|_| Error::InvalidIndex)?;
+                let end = start.checked_add(*count).ok_or(Error::InvalidIndex)?;
+                if end > values.len() {
+                    return Err(Error::InvalidIndex);
+                }
+                Ok(values[start..end].to_vec())
+            }
+            Self::Rows {
+                row_width,
+                start,
+                count,
+            } => {
+                if *row_width == 0 {
+                    return Err(Error::ShapeMismatch);
+                }
+                let rows = values.len() / row_width;
+                let end = start.checked_add(*count).ok_or(Error::InvalidIndex)?;
+                if end > rows {
+                    return Err(Error::InvalidIndex);
+                }
+                let begin = start
+                    .checked_mul(*row_width)
+                    .ok_or(Error::InvalidIndex)?;
+                let finish = end
+                    .checked_mul(*row_width)
+                    .ok_or(Error::InvalidIndex)?;
+                Ok(values[begin..finish].to_vec())
+            }
+            Self::Columns {
+                row_width,
+                start,
+                count,
+            } => {
+                if *row_width == 0 {
+                    return Err(Error::ShapeMismatch);
+                }
+                let end = start.checked_add(*count).ok_or(Error::InvalidIndex)?;
+                if end > *row_width {
+                    return Err(Error::InvalidIndex);
+                }
+                let rows = values.len() / row_width;
+                let mut out = Vec::with_capacity(rows.saturating_mul(*count));
+                for row in 0..rows {
+                    let base = row * row_width + start;
+                    out.extend_from_slice(&values[base..base + count]);
+                }
+                Ok(out)
+            }
+            Self::Transpose { rows, cols } => {
+                if rows.checked_mul(*cols).ok_or(Error::ShapeMismatch)? != values.len() {
+                    return Err(Error::ShapeMismatch);
+                }
+                let mut out = vec![0i64; values.len()];
+                for row in 0..*rows {
+                    for column in 0..*cols {
+                        out[column * rows + row] = values[row * cols + column];
+                    }
+                }
+                Ok(out)
+            }
+            Self::Broadcast { rows } => {
+                let mut out = Vec::with_capacity(values.len().saturating_mul(*rows));
+                for _ in 0..*rows {
+                    out.extend_from_slice(values);
+                }
+                Ok(out)
+            }
+            Self::Chain(layouts) => {
+                let mut current = values.to_vec();
+                for layout in layouts {
+                    current = layout.apply(&current)?;
+                }
+                Ok(current)
+            }
+        }
+    }
+
+    pub fn rows(row_width: usize, start: usize, count: usize) -> Self {
+        Self::Rows {
+            row_width,
+            start,
+            count,
+        }
+    }
+
+    pub fn columns(row_width: usize, start: usize, count: usize) -> Self {
+        Self::Columns {
+            row_width,
+            start,
+            count,
+        }
+    }
+
+    pub fn range(start: u64, count: usize) -> Self {
+        Self::Range { start, count }
+    }
+
+    pub fn transpose(rows: usize, cols: usize) -> Self {
+        Self::Transpose { rows, cols }
+    }
+
+    pub fn broadcast(rows: usize) -> Self {
+        Self::Broadcast { rows }
+    }
+
+    pub fn chain(layouts: Vec<PlanLayout>) -> Self {
+        Self::Chain(layouts)
+    }
+}
+
+/// Trusted constants derived from public configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlanConstant {
+    Tokens,
+    CausalMask {
+        rows: usize,
+        cols: usize,
+        masked: i64,
+    },
+    VocabMask {
+        rows: usize,
+        vocab: usize,
+        valid: usize,
+        masked: i64,
+    },
+    Zeros {
+        count: usize,
+    },
+    ScalarBroadcast {
+        value: i64,
+        count: usize,
+    },
+    Literal(Vec<i64>),
+}
+
+impl PlanConstant {
+    fn materialize(&self, tokens: &[u32]) -> Result<Vec<i64>> {
+        match self {
+            Self::Tokens => Ok(tokens.iter().map(|value| *value as i64).collect()),
+            Self::CausalMask { rows, cols, masked } => {
+                if rows != cols {
+                    return Err(Error::ShapeMismatch);
+                }
+                let mut values = vec![0i64; rows.checked_mul(*cols).ok_or(Error::ShapeMismatch)?];
+                for row in 0..*rows {
+                    for column in row + 1..*cols {
+                        values[row * cols + column] = *masked;
+                    }
+                }
+                Ok(values)
+            }
+            Self::VocabMask {
+                rows,
+                vocab,
+                valid,
+                masked,
+            } => {
+                if *valid > *vocab {
+                    return Err(Error::ShapeMismatch);
+                }
+                let mut values = vec![0i64; rows.checked_mul(*vocab).ok_or(Error::ShapeMismatch)?];
+                for row in 0..*rows {
+                    for column in *valid..*vocab {
+                        values[row * vocab + column] = *masked;
+                    }
+                }
+                Ok(values)
+            }
+            Self::Zeros { count } => Ok(vec![0i64; *count]),
+            Self::ScalarBroadcast { value, count } => Ok(vec![*value; *count]),
+            Self::Literal(values) => Ok(values.clone()),
+        }
+    }
+}
+
+/// One plan configuration value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlanConfigValue {
+    Literal(i64),
+    AssetI64 { path: String, index: usize },
+}
+
+/// One static step template.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanStep {
+    pub opcode: OpCode,
+    pub config: Vec<PlanConfigValue>,
+    pub inputs: Vec<PlanSource>,
+    pub outputs: usize,
+}
+
+/// Final output closure for an output-producing model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanFinalOutput {
+    pub step: usize,
+    pub output: usize,
+}
+
+/// A complete static trace plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TracePlan {
+    pub steps: Vec<PlanStep>,
+    pub argmax_steps: Vec<usize>,
+    pub final_output: Option<PlanFinalOutput>,
+}
+
+impl TracePlan {
+    pub fn new() -> Self {
+        Self {
+            steps: Vec::new(),
+            argmax_steps: Vec::new(),
+            final_output: None,
+        }
+    }
+}
+
+impl Default for TracePlan {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Builder used by model plan modules.
+pub struct PlanBuilder {
+    plan: TracePlan,
+}
+
+impl PlanBuilder {
+    pub fn new() -> Self {
+        Self {
+            plan: TracePlan::new(),
+        }
+    }
+
+    pub fn step(
+        &mut self,
+        opcode: OpCode,
+        config: Vec<PlanConfigValue>,
+        inputs: Vec<PlanSource>,
+        outputs: usize,
+    ) -> usize {
+        let index = self.plan.steps.len();
+        self.plan.steps.push(PlanStep {
+            opcode,
+            config,
+            inputs,
+            outputs,
+        });
+        index
+    }
+
+    pub fn argmax_step(&mut self, step: usize) {
+        self.plan.argmax_steps.push(step);
+    }
+
+    pub fn final_output(&mut self, step: usize, output: usize) {
+        self.plan.final_output = Some(PlanFinalOutput { step, output });
+    }
+
+    pub fn finish(self) -> TracePlan {
+        self.plan
+    }
+}
+
+impl Default for PlanBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn config(values: Vec<i64>) -> Vec<PlanConfigValue> {
+    values.into_iter().map(PlanConfigValue::Literal).collect()
+}
+
+pub(crate) struct AssetView<'a> {
+    public: &'a ModelCommitmentPublic,
+    trace: &'a SharedTrace,
+}
+
+impl<'a> AssetView<'a> {
+    pub(crate) fn new(public: &'a ModelCommitmentPublic, trace: &'a SharedTrace) -> Self {
+        Self { public, trace }
+    }
+
+    fn meta(&self, path: &str) -> Result<&AssetMeta> {
+        self.public
+            .assets
+            .iter()
+            .find(|asset| asset.path == path)
+            .ok_or(Error::AssetMismatch)
+    }
+
+    fn opening(&self, path: &str) -> Result<&AssetOpening> {
+        let meta = self.meta(path)?;
+        self.trace
+            .assets
+            .iter()
+            .find(|opening| opening.asset_id == meta.asset_id)
+            .ok_or(Error::StatementMismatch)
+    }
+
+    fn full_values(&self, path: &str) -> Result<Vec<i64>> {
+        let meta = self.meta(path)?;
+        let opening = self.opening(path)?;
+        if opening.row_count != meta.rows || opening.rows.len() != meta.rows as usize {
+            return Err(Error::IncompleteArtifact);
+        }
+        let count = usize::try_from(meta.element_count).map_err(|_| Error::ResourceLimit)?;
+        let mut values = Vec::with_capacity(count);
+        for row in &opening.rows {
+            for value in &row.values {
+                if values.len() == count {
+                    break;
+                }
+                values.push(*value as i64);
+            }
+            if values.len() == count {
+                break;
+            }
+        }
+        if values.len() != count {
+            return Err(Error::IncompleteArtifact);
+        }
+        Ok(values)
+    }
+
+    fn source_values(&self, path: &str, layout: &PlanLayout) -> Result<Vec<i64>> {
+        let values = self.full_values(path)?;
+        layout.apply(&values)
+    }
+
+    fn external_values(&self, pool: usize) -> Result<Vec<i64>> {
+        let opening = self.trace.assets.get(pool).ok_or(Error::StatementMismatch)?;
+        let mut values = Vec::new();
+        for row in &opening.rows {
+            values.extend(row.values.iter().map(|value| *value as i64));
+        }
+        Ok(values)
+    }
+
+    fn asset_id(&self, path: &str) -> Result<u64> {
+        Ok(self.meta(path)?.asset_id)
+    }
+
+    fn config_values(&self, values: &[PlanConfigValue]) -> Result<Vec<i64>> {
+        let mut out = Vec::with_capacity(values.len());
+        for value in values {
+            match value {
+                PlanConfigValue::Literal(value) => out.push(*value),
+                PlanConfigValue::AssetI64 { path, index } => {
+                    let asset = self.full_values(path)?;
+                    out.push(*asset.get(*index).ok_or(Error::InvalidIndex)?);
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn materialize(
+    source: &PlanSource,
+    verified_outputs: &[Vec<Vec<i64>>],
+    assets: &AssetView<'_>,
+    tokens: &[u32],
+) -> Result<Vec<i64>> {
+    match source {
+        PlanSource::Prev {
+            step,
+            output,
+            layout,
+        } => {
+            let values = verified_outputs
+                .get(*step)
+                .and_then(|outputs| outputs.get(*output))
+                .ok_or(Error::InvalidIndex)?;
+            layout.apply(values)
+        }
+        PlanSource::Asset { path, layout } => assets.source_values(path, layout),
+        PlanSource::Constant(constant) => constant.materialize(tokens),
+        PlanSource::Concat(parts) => {
+            let mut out = Vec::new();
+            for part in parts {
+                out.extend(materialize(part, verified_outputs, assets, tokens)?);
+            }
+            Ok(out)
+        }
+        PlanSource::HeadConcat { parts, rows } => {
+            if *rows == 0 || parts.is_empty() {
+                return Err(Error::ShapeMismatch);
+            }
+            let mut values = Vec::with_capacity(parts.len());
+            for part in parts {
+                let part = materialize(part, verified_outputs, assets, tokens)?;
+                if part.len() % rows != 0 {
+                    return Err(Error::ShapeMismatch);
+                }
+                values.push(part);
+            }
+            let head_dim = values[0].len() / rows;
+            let mut out = Vec::with_capacity(values.len() * values[0].len());
+            for row in 0..*rows {
+                for part in &values {
+                    out.extend_from_slice(&part[row * head_dim..(row + 1) * head_dim]);
+                }
+            }
+            Ok(out)
+        }
+        PlanSource::Layout(inner, layout) => {
+            let values = materialize(inner, verified_outputs, assets, tokens)?;
+            layout.apply(&values)
+        }
+    }
+}
+
+enum SourceKind {
+    Prev {
+        step: usize,
+        output: usize,
+        flat: bool,
+    },
+    Asset,
+    Other,
+}
+
+fn source_kind(source: &PlanSource) -> SourceKind {
+    match source {
+        PlanSource::Prev {
+            step,
+            output,
+            layout,
+        } => SourceKind::Prev {
+            step: *step,
+            output: *output,
+            flat: matches!(layout, PlanLayout::Flat),
+        },
+        PlanSource::Asset { .. } => SourceKind::Asset,
+        PlanSource::Constant(_) => SourceKind::Other,
+        PlanSource::Concat(_) => SourceKind::Other,
+        PlanSource::HeadConcat { .. } => SourceKind::Other,
+        PlanSource::Layout(inner, _) => source_kind(inner),
+    }
+}
+
+pub(crate) fn verify_step(
+    step: &SharedTraceStep,
+    plan_step: &PlanStep,
+    verified_outputs: &[Vec<Vec<i64>>],
+    assets: &AssetView<'_>,
+    tokens: &[u32],
+) -> Result<()> {
+    if plan_step.opcode as u16 != step.message.opcode {
+        return Err(Error::StatementMismatch);
+    }
+    if assets.config_values(&plan_step.config)? != step.message.config {
+        return Err(Error::StatementMismatch);
+    }
+    let input_count = step.message.proof.lengths.inputs.len();
+    if input_count != plan_step.inputs.len()
+        || step.message.proof.inputs.len() != input_count
+        || step.external.len() != input_count
+        || step.sources.len() != input_count
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let output_count = step.message.proof.lengths.outputs.len();
+    if output_count != plan_step.outputs || step.message.proof.outputs.len() != output_count {
+        return Err(Error::ShapeMismatch);
+    }
+    let inputs = proof_input_values(&step.message.proof);
+    if inputs.len() != input_count {
+        return Err(Error::ShapeMismatch);
+    }
+    for (port, source) in plan_step.inputs.iter().enumerate() {
+        let expected = materialize(source, verified_outputs, assets, tokens)?;
+        let external = step.external.get(port).copied().flatten();
+        let edge = step.sources.get(port).copied().flatten();
+        match source_kind(source) {
+            SourceKind::Prev {
+                step,
+                output,
+                flat,
+            } => {
+                if external.is_some() {
+                    return Err(Error::StatementMismatch);
+                }
+                if flat {
+                    if edge != Some((step, output)) {
+                        return Err(Error::StatementMismatch);
+                    }
+                } else if edge.is_some() {
+                    return Err(Error::StatementMismatch);
+                }
+                if inputs.get(port) != Some(&expected) {
+                    return Err(Error::StatementMismatch);
+                }
+            }
+            SourceKind::Asset => {
+                if edge.is_some() {
+                    return Err(Error::StatementMismatch);
+                }
+                match external {
+                    Some(pool) => {
+                        let plan_asset = assets.asset_id(match source {
+                            PlanSource::Asset { path, .. } => path,
+                            PlanSource::Layout(inner, _) => match inner.as_ref() {
+                                PlanSource::Asset { path, .. } => path,
+                                _ => return Err(Error::StatementMismatch),
+                            },
+                            _ => return Err(Error::StatementMismatch),
+                        })?;
+                        let opening = assets
+                            .trace
+                            .assets
+                            .get(pool)
+                            .ok_or(Error::StatementMismatch)?;
+                        if opening.asset_id != plan_asset {
+                            return Err(Error::StatementMismatch);
+                        }
+                        if assets.external_values(pool)? != expected {
+                            return Err(Error::StatementMismatch);
+                        }
+                    }
+                    None => {
+                        if inputs.get(port) != Some(&expected) {
+                            return Err(Error::StatementMismatch);
+                        }
+                    }
+                }
+            }
+            SourceKind::Other => {
+                if external.is_some() || edge.is_some() {
+                    return Err(Error::StatementMismatch);
+                }
+                if inputs.get(port) != Some(&expected) {
+                    return Err(Error::StatementMismatch);
+                }
+            }
+        }
+    }
+    let outputs = proof_output_values(&step.message.proof);
+    if outputs.len() != output_count {
+        return Err(Error::ShapeMismatch);
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_outputs(
+    trace: &SharedTrace,
+    plan: &TracePlan,
+    verified_outputs: &[Vec<Vec<i64>>],
+    assets: &AssetView<'_>,
+) -> Result<()> {
+    let mut argmax = Vec::with_capacity(plan.argmax_steps.len());
+    for step in &plan.argmax_steps {
+        let plan_step = plan.steps.get(*step).ok_or(Error::StatementMismatch)?;
+        if plan_step.opcode != OpCode::Argmax || plan_step.inputs.is_empty() {
+            return Err(Error::StatementMismatch);
+        }
+        let input = materialize(
+            &plan_step.inputs[0],
+            verified_outputs,
+            assets,
+            &trace.tokens,
+        )?;
+        if input.is_empty() {
+            return Err(Error::InvalidConfig);
+        }
+        let mut best = 0usize;
+        for index in 1..input.len() {
+            if input[index] > input[best] {
+                best = index;
+            }
+        }
+        let output = verified_outputs
+            .get(*step)
+            .and_then(|outputs| outputs.first())
+            .and_then(|values| values.first())
+            .ok_or(Error::StatementMismatch)?;
+        if *output != best as i64 {
+            return Err(Error::InvalidProof);
+        }
+        argmax.push(*output as u32);
+    }
+    if trace.argmax != argmax {
+        return Err(Error::StatementMismatch);
+    }
+    match &plan.final_output {
+        Some(final_output) => {
+            let output = verified_outputs
+                .get(final_output.step)
+                .and_then(|outputs| outputs.get(final_output.output))
+                .ok_or(Error::StatementMismatch)?;
+            if trace.output != *output {
+                return Err(Error::StatementMismatch);
+            }
+        }
+        None => {
+            if !trace.output.is_empty() {
+                return Err(Error::StatementMismatch);
+            }
+        }
+    }
+    Ok(())
+}
