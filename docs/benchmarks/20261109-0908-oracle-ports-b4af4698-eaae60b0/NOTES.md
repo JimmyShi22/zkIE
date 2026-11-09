@@ -71,3 +71,9 @@ deleted: 160,598,040,964 bytes (149.57 GiB). The commit directories are
 retained. The trace directory now holds 1.8 MiB and 103 files; no `*.bin` file
 of at least 1 MiB remains. `/data` used space moved from 1,058,984,255,488 to
 898,386,153,472 bytes as reported by df.
+
+## Open items
+
+- The gpt2-seq16 verify delta in the previous trace is pending a boss decision.
+- timesfm verify is at +0.06% in the previous trace; no optimization card is
+  open.
