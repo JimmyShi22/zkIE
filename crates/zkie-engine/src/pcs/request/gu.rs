@@ -1,19 +1,22 @@
-//! G_u's SEND notice and its out-of-domain/record relation skeleton
+//! G_u's SEND notice and its out-of-domain/record/column relation skeleton
 //! (foundation only, not wired into production).
 //!
-//! G_u is a runtime oracle message: its root is the prover's commitment to the
-//! folded row, sent in SEND before any seed is drawn. The verifier binds that
-//! root to the frozen plan's tree and part, records it as a sampled oracle and
-//! then keeps two separate relations: one claim per out-of-domain sample,
-//! answered after the seed, and one claim per record answer, folded at the
-//! table's row point. The two are distinct messages/rounds and are never
-//! merged into one claim set. The coefficient rows and their verification are
-//! open; this file gives the binding and target skeleton.
+//! G_u is a runtime oracle message with its own trusted [`GuOracleShape`]:
+//! its own code, main and mask rows and its own sample answer count. The
+//! indexed table's shape is a different object and supplies only the record
+//! relation. The verifier binds the received root to the frozen tree, part and
+//! complete G_u shape, records it as a sampled oracle, and keeps three
+//! separate relations: one claim per out-of-domain sample (the seed is drawn
+//! after the root and the answer follows), one claim per record answer of the
+//! indexed table, and one claim per drawn column. The coefficient rows and
+//! their verification are open; this module gives the binding, the capacity
+//! check and the target skeleton.
 
 use serde::{Deserialize, Serialize};
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
 
+use crate::pcs::request::code::{build_code_plan, CodeParams};
 use crate::pcs::request::field::{Fp3, E_DEGREE};
 use crate::pcs::request::runtime_tree::RuntimeTreePlan;
 use crate::pcs::request::table::{
@@ -21,10 +24,58 @@ use crate::pcs::request::table::{
 };
 use crate::primitives::codec::CanonicalWriter;
 
+fn ceil_log2(value: u64) -> u32 {
+    if value <= 1 {
+        0
+    } else {
+        64 - (value - 1).leading_zeros()
+    }
+}
+
+/// The trusted shape of the G_u oracle message itself. Its code, rows, mask
+/// rows and sample answers are not the indexed table's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuOracleShape {
+    pub code: CodeParams,
+    pub main_rows: u64,
+    /// The main rows are over the cubic extension: 3.
+    pub main_deg: u32,
+    pub mask_rows: u64,
+    pub mask_code: Option<CodeParams>,
+    pub answers: u32,
+}
+
+impl GuOracleShape {
+    pub fn fault(&self) -> Option<&'static str> {
+        if build_code_plan(self.code.log_n, self.code.ell, self.code.r).is_err() {
+            return Some("the G_u oracle code is not a code");
+        }
+        if self.main_rows < 1 || self.main_deg != E_DEGREE as u32 {
+            return Some("the G_u oracle has no main rows over the extension field");
+        }
+        if self.answers < 1 {
+            return Some("the G_u oracle has no sample answer");
+        }
+        match (self.mask_rows, self.mask_code) {
+            (0, None) => {}
+            (0, Some(_)) => return Some("the G_u oracle names a mask code without mask rows"),
+            (_, None) => return Some("the G_u oracle has mask rows without a mask code"),
+            (_, Some(code)) => {
+                if build_code_plan(code.log_n, code.ell, code.r).is_err() {
+                    return Some("the G_u mask code is not a code");
+                }
+                if code.ell < self.answers as u64 {
+                    return Some("the G_u mask row has no room for the sample pads");
+                }
+            }
+        }
+        None
+    }
+}
+
 /// The trusted plan's shape of the G_u oracle message: the runtime tree, the
-/// part that carries the folded row, and the indexed table's shape whose
-/// record supplies the record relation. The tree number, leaf class, depth,
-/// widths, salt and starts are plan values; the root is received, never
+/// part that carries the folded row, G_u's own oracle shape and the indexed
+/// table's shape that supplies the record. The root is received, never
 /// planned.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuShape {
@@ -32,39 +83,99 @@ pub struct GuShape {
     pub group: u64,
     pub tree: RuntimeTreePlan,
     pub part: u32,
+    pub rows_high: bool,
+    pub u: GuOracleShape,
     pub index: IndexShape,
 }
 
 impl GuShape {
-    pub fn main_rows(&self) -> Result<u64> {
-        let part = self
-            .tree
-            .parts
-            .get(self.part as usize)
-            .ok_or(Error::InvalidIndex)?;
-        if part.main_symbols == 0 || part.main_symbols % E_DEGREE as u64 != 0 {
-            return Err(Error::InvalidConfig);
-        }
-        Ok(part.main_symbols / E_DEGREE as u64)
+    /// The G_u table's entry count: the folded message, its tail at the next
+    /// multiple of the tail's power of two, and the mask-code tail.
+    pub fn entries(&self) -> Result<u64> {
+        let step = 1u64
+            .checked_shl(ceil_log2(self.index.code.r))
+            .ok_or(Error::ResourceLimit)?;
+        let tail_first = self
+            .index
+            .code
+            .ell
+            .checked_add(step - 1)
+            .ok_or(Error::ResourceLimit)?
+            / step
+            * step;
+        tail_first
+            .checked_add(self.index.code.r)
+            .ok_or(Error::ResourceLimit)
     }
 
-    /// The number of sample-cube coordinates that a G_u seed must carry: the
-    /// row bits plus the base code's entry bits.
+    /// The leading entries that lie in real rows and before every main-table
+    /// pad of G_u's own sample.
+    pub fn vector_room(&self) -> Result<u64> {
+        let row_bits = ceil_log2(self.u.main_rows);
+        let place_bits = self.u.code.log_ell();
+        if !self.rows_high && self.u.main_rows != (1u64 << row_bits) {
+            return Ok(0);
+        }
+        let bits = row_bits.checked_add(place_bits).ok_or(Error::ResourceLimit)?;
+        if bits > 60 {
+            return Ok(0);
+        }
+        let mut room = self
+            .u
+            .main_rows
+            .checked_shl(place_bits)
+            .ok_or(Error::ResourceLimit)?;
+        if self.u.answers > 0 && self.u.mask_rows == 0 {
+            if self.u.code.ell < self.u.answers as u64 {
+                return Ok(0);
+            }
+            for answer in 0..self.u.answers {
+                let place = self.u.code.ell - self.u.answers as u64 + answer as u64;
+                let index = (self.u.main_rows - 1)
+                    .checked_add(place.checked_shl(row_bits).ok_or(Error::ResourceLimit)?)
+                    .ok_or(Error::ResourceLimit)?;
+                let entry_at = if self.rows_high {
+                    (index >> row_bits)
+                        | ((index & ((1u64 << row_bits) - 1)) << place_bits)
+                } else {
+                    index
+                };
+                room = room.min(entry_at);
+            }
+        }
+        Ok(room)
+    }
+
+    /// The number of sample-cube coordinates that a G_u seed must carry.
     pub fn sample_bits(&self) -> Result<u32> {
-        let rows = self.main_rows()?;
-        let row_bits = if rows <= 1 {
-            0
+        let main_bits = ceil_log2(self.u.main_rows)
+            .checked_add(self.u.code.log_ell())
+            .ok_or(Error::ResourceLimit)?;
+        let mask_bits = if let Some(code) = self.u.mask_code {
+            ceil_log2(self.u.mask_rows)
+                .checked_add(code.log_ell())
+                .ok_or(Error::ResourceLimit)?
         } else {
-            64 - (rows - 1).leading_zeros()
+            0
         };
-        row_bits
-            .checked_add(self.index.code.log_ell())
-            .ok_or(Error::ResourceLimit)
+        if self.u.main_rows > 0 && self.u.mask_rows > 0 {
+            main_bits
+                .max(mask_bits)
+                .checked_add(1)
+                .ok_or(Error::ResourceLimit)
+        } else {
+            main_bits
+                .checked_add(mask_bits)
+                .ok_or(Error::ResourceLimit)
+        }
     }
 
     pub fn fault(&self) -> Option<&'static str> {
         if index_fault(&self.index).is_some() || tree_shape_fault(&self.index).is_some() {
-            return Some("the G_u index shape is not a table");
+            return Some("the record's index shape is not a table");
+        }
+        if self.u.fault().is_some() {
+            return Some("the G_u oracle shape is not an oracle shape");
         }
         if self.tree.fault().is_some() {
             return Some("the G_u tree is not a runtime tree");
@@ -73,20 +184,39 @@ impl GuShape {
             Some(part) => part,
             None => return Some("the G_u part is not in its tree"),
         };
-        if part.main_symbols == 0 {
-            return Some("the G_u part has no main symbols");
+        let main_symbols = self
+            .u
+            .main_rows
+            .checked_mul(self.u.main_deg as u64)
+            .ok_or(Error::ResourceLimit)
+            .ok()?;
+        let mask_symbols = self
+            .u
+            .mask_rows
+            .checked_mul(E_DEGREE as u64)
+            .ok_or(Error::ResourceLimit)
+            .ok()?;
+        if part.main_symbols != main_symbols || part.mask_symbols != mask_symbols {
+            return Some("the G_u part's widths are not its oracle shape's");
         }
-        if part.main_symbols % E_DEGREE as u64 != 0 {
-            return Some("the G_u part is not over the extension field");
+        if self.tree.log_n != self.u.code.log_n {
+            return Some("the G_u tree depth is not the oracle code's depth");
         }
-        if part.mask_symbols != 0 {
-            return Some("the G_u part has mask symbols in this skeleton");
+        if let Some(code) = self.u.mask_code {
+            if self.tree.log_n_zk != code.log_n {
+                return Some("the G_u tree mask depth is not the mask code's depth");
+            }
         }
-        if self.tree.log_n != self.index.code.log_n {
-            return Some("the G_u tree depth is not the table code's depth");
-        }
-        if self.index.answers < 1 {
-            return Some("the G_u table has no record answer");
+        let entries = match self.entries() {
+            Ok(entries) => entries,
+            Err(_) => return Some("the G_u entry count overflows"),
+        };
+        let room = match self.vector_room() {
+            Ok(room) => room,
+            Err(_) => return Some("the G_u vector room overflows"),
+        };
+        if entries > room {
+            return Some("the folded row does not fit beside the pad of its oracle message");
         }
         None
     }
@@ -99,6 +229,20 @@ impl GuShape {
         writer.put_u64(tree.len() as u64);
         writer.put_bytes(&tree);
         writer.put_u64(self.part as u64);
+        writer.put_u64(if self.rows_high { 1 } else { 0 });
+        writer.put_u64(self.u.code.log_n as u64);
+        writer.put_u64(self.u.code.ell);
+        writer.put_u64(self.u.code.r);
+        writer.put_u64(self.u.main_rows);
+        writer.put_u64(self.u.main_deg as u64);
+        writer.put_u64(self.u.mask_rows);
+        writer.put_u64(if self.u.mask_code.is_some() { 1 } else { 0 });
+        if let Some(code) = self.u.mask_code {
+            writer.put_u64(code.log_n as u64);
+            writer.put_u64(code.ell);
+            writer.put_u64(code.r);
+        }
+        writer.put_u64(self.u.answers as u64);
         writer.put_u64(self.index.code.log_n as u64);
         writer.put_u64(self.index.code.ell);
         writer.put_u64(self.index.code.r);
@@ -147,22 +291,19 @@ impl GuNotice {
     }
 }
 
-/// The oracle recorded by SEND: the received root, bound to the frozen shape.
+/// The oracle recorded by SEND: the received root and the complete trusted
+/// shape it was bound to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GuOracle {
     pub oracle: u64,
-    pub group: u64,
-    pub tree_number: u64,
-    pub part: u32,
     pub root: Digest,
-    pub answers: u32,
-    pub main_rows: u64,
     pub sampled: bool,
+    pub shape: GuShape,
 }
 
 /// The verifier's G_u SEND registry. A root is recorded only when its notice
-/// equals the frozen plan's shape; the root is then that oracle's root for the
-/// sample and record relations.
+/// equals the frozen plan's shape; the recorded shape is the authority for
+/// every later claim, not the caller's shape argument.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GuRegistry {
     entries: Vec<GuOracle>,
@@ -177,18 +318,18 @@ impl GuRegistry {
         if planned.fault().is_some() || notice.fault().is_some() || !notice.matches(planned) {
             return Err(Error::StatementMismatch);
         }
-        if self.entries.iter().any(|entry| entry.oracle == planned.oracle) {
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.oracle == planned.oracle)
+        {
             return Err(Error::StatementMismatch);
         }
         let oracle = GuOracle {
             oracle: planned.oracle,
-            group: planned.group,
-            tree_number: planned.tree.tree_number,
-            part: planned.part,
             root: notice.root,
-            answers: planned.index.answers,
-            main_rows: planned.main_rows()?,
             sampled: true,
+            shape: planned.clone(),
         };
         self.entries.push(oracle.clone());
         Ok(oracle)
@@ -208,9 +349,9 @@ impl GuRegistry {
 }
 
 /// One out-of-domain sample claim on G_u: the prover's answer after the seed
-/// was drawn. The claim's coefficient row (eq over the sample cube, with the
-/// pad at beta) is open; this skeleton binds the oracle, the answer number,
-/// the seed and the target.
+/// was drawn. The claim's coefficient row is open; this skeleton binds the
+/// registered oracle, the answer number, the seed and the target. The answer
+/// count is G_u's own, not the record's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GuSampleClaim {
     pub oracle: u64,
@@ -228,11 +369,11 @@ impl GuSampleClaim {
         seed: SampleSeed,
         target: Fp3,
     ) -> Result<Self> {
-        if shape.fault().is_some() {
-            return Err(Error::InvalidConfig);
-        }
         let oracle = registry.get(shape.oracle).ok_or(Error::StatementMismatch)?;
-        if !oracle.sampled || answer >= shape.index.answers {
+        if oracle.shape != *shape || !oracle.sampled {
+            return Err(Error::StatementMismatch);
+        }
+        if answer >= shape.u.answers {
             return Err(Error::StatementMismatch);
         }
         if seed.beta == Fp3::ZERO {
@@ -242,8 +383,8 @@ impl GuSampleClaim {
             return Err(Error::ShapeMismatch);
         }
         Ok(Self {
-            oracle: shape.oracle,
-            group: shape.group,
+            oracle: oracle.oracle,
+            group: oracle.shape.group,
             answer,
             seed,
             target,
@@ -265,9 +406,9 @@ impl GuSampleClaim {
     }
 }
 
-/// One record claim on G_u: at the table's row point, answer i folds the
-/// record to a public target. The claim's coefficient row is open; the target
-/// and its oracle binding are the skeleton.
+/// One record claim on G_u: at the indexed table's row point, answer i folds
+/// the record to a public target. The record's answer count is the index's,
+/// not G_u's sample count. The coefficient row is open.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GuRecordClaim {
     pub oracle: u64,
@@ -284,11 +425,11 @@ impl GuRecordClaim {
         eq_gamma: &[Fp3],
         answer: u32,
     ) -> Result<Self> {
-        if shape.fault().is_some() {
-            return Err(Error::InvalidConfig);
-        }
         let oracle = registry.get(shape.oracle).ok_or(Error::StatementMismatch)?;
-        if !oracle.sampled || answer >= shape.index.answers {
+        if oracle.shape != *shape || !oracle.sampled {
+            return Err(Error::StatementMismatch);
+        }
+        if answer >= shape.index.answers {
             return Err(Error::StatementMismatch);
         }
         let rows = usize::try_from(shape.index.rows()).map_err(|_| Error::ResourceLimit)?;
@@ -304,8 +445,8 @@ impl GuRecordClaim {
             target = target.add(&weight.mul(&record.y[row * answers + answer as usize]));
         }
         Ok(Self {
-            oracle: shape.oracle,
-            group: shape.group,
+            oracle: oracle.oracle,
+            group: oracle.shape.group,
             answer,
             target,
         })
@@ -322,9 +463,7 @@ impl GuRecordClaim {
 }
 
 /// One column-query claim on G_u: the folded row's codeword at the drawn
-/// position has the prover's value. The claim's coefficient row is open; the
-/// oracle, position and value are the skeleton. It is a third message/round,
-/// separate from both the sample and record claims.
+/// position has the prover's value. The coefficient row is open.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GuColumnClaim {
     pub oracle: u64,
@@ -335,16 +474,16 @@ pub struct GuColumnClaim {
 
 impl GuColumnClaim {
     pub fn new(shape: &GuShape, registry: &GuRegistry, position: u64, value: Fp3) -> Result<Self> {
-        if shape.fault().is_some() {
-            return Err(Error::InvalidConfig);
-        }
         let oracle = registry.get(shape.oracle).ok_or(Error::StatementMismatch)?;
-        if !oracle.sampled || position >= shape.index.code.n() {
+        if oracle.shape != *shape || !oracle.sampled {
+            return Err(Error::StatementMismatch);
+        }
+        if position >= shape.index.code.n() {
             return Err(Error::StatementMismatch);
         }
         Ok(Self {
-            oracle: shape.oracle,
-            group: shape.group,
+            oracle: oracle.oracle,
+            group: oracle.shape.group,
             position,
             value,
         })
@@ -364,8 +503,8 @@ const SAMPLE_CLAIMS_LABEL: u64 = 1;
 const RECORD_CLAIMS_LABEL: u64 = 2;
 const COLUMN_CLAIMS_LABEL: u64 = 3;
 
-/// The bytes of the sample-claim round. Separate from the record bytes: the
-/// two relations are bound in their own messages and are never merged.
+/// The bytes of the sample-claim round. Separate from the record and column
+/// bytes: the relations are bound in their own messages and are never merged.
 pub fn encode_sample_claims(claims: &[GuSampleClaim]) -> Vec<u8> {
     let mut writer = CanonicalWriter::new();
     writer.put_u64(SAMPLE_CLAIMS_LABEL);
@@ -408,18 +547,15 @@ pub fn encode_column_claims(claims: &[GuColumnClaim]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pcs::request::code::build_code_plan;
     use crate::pcs::request::params::LEAF_SALT_MIN_BYTES;
-    use crate::pcs::request::runtime_tree::{
-        lay_runtime_trees, RuntimeOracleShape,
-    };
+    use crate::pcs::request::runtime_tree::{lay_runtime_trees, RuntimeOracleShape};
     use crate::pcs::request::table::TableDistances;
 
-    fn index_shape() -> IndexShape {
+    fn index_shape(log_n: u32, ell: u64, answers: u32) -> IndexShape {
         IndexShape {
-            code: build_code_plan(3, 4, 1).unwrap(),
+            code: build_code_plan(log_n, ell, 1).unwrap(),
             v: 2,
-            answers: 1,
+            answers,
             salt_bytes: LEAF_SALT_MIN_BYTES,
             distances: TableDistances {
                 radius: 0,
@@ -430,15 +566,15 @@ mod tests {
         }
     }
 
-    fn tree() -> RuntimeTreePlan {
+    fn tree(main_rows: u64, mask_rows: u64) -> RuntimeTreePlan {
         let layout = lay_runtime_trees(
             &[RuntimeOracleShape {
                 leaf_class: 2,
                 base_log_n: 3,
-                main_rows: 1,
+                main_rows,
                 main_deg: 3,
-                mask_rows: 0,
-                mask_log_n: 0,
+                mask_rows,
+                mask_log_n: if mask_rows > 0 { 2 } else { 0 },
             }],
             5,
             LEAF_SALT_MIN_BYTES,
@@ -453,9 +589,18 @@ mod tests {
         GuShape {
             oracle: 9,
             group: 1,
-            tree: tree(),
+            tree: tree(4, 0),
             part: 0,
-            index: index_shape(),
+            rows_high: false,
+            u: GuOracleShape {
+                code: build_code_plan(3, 4, 1).unwrap(),
+                main_rows: 4,
+                main_deg: 3,
+                mask_rows: 0,
+                mask_code: None,
+                answers: 1,
+            },
+            index: index_shape(3, 4, 1),
         }
     }
 
@@ -476,34 +621,120 @@ mod tests {
     }
 
     #[test]
-    fn gu_send_binds_the_root_to_the_planned_tree() {
+    fn gu_send_binds_the_root_to_the_complete_shape() {
         let shape = shape();
         assert!(shape.fault().is_none());
-        assert_eq!(shape.main_rows().unwrap(), 1);
-        assert_eq!(shape.sample_bits().unwrap(), 2);
+        assert_eq!(shape.sample_bits().unwrap(), 4);
         let mut registry = GuRegistry::new();
         let oracle = registry.receive(&shape, &notice()).unwrap();
-        assert_eq!(oracle.oracle, 9);
-        assert_eq!(oracle.group, 1);
-        assert_eq!(oracle.tree_number, 5);
-        assert_eq!(oracle.part, 0);
-        assert_eq!(oracle.root, Digest([4; 32]));
-        assert_eq!(oracle.answers, 1);
+        assert_eq!(oracle.shape, shape);
         assert!(oracle.sampled);
-        // Duplicate registration and a mismatched notice are rejected.
         assert!(registry.receive(&shape, &notice()).is_err());
         let mut wrong = notice();
-        wrong.oracle = 10;
-        assert!(GuRegistry::new().receive(&shape, &wrong).is_err());
-        let mut wrong = notice();
-        wrong.tree_number = 6;
+        wrong.root = Digest::ZERO;
         assert!(GuRegistry::new().receive(&shape, &wrong).is_err());
         let mut wrong = notice();
         wrong.part = 1;
         assert!(GuRegistry::new().receive(&shape, &wrong).is_err());
-        let mut wrong = notice();
-        wrong.root = Digest::ZERO;
-        assert!(GuRegistry::new().receive(&shape, &wrong).is_err());
+    }
+
+    #[test]
+    fn gu_shape_faults_follow_the_oracle_and_capacity() {
+        let base = shape();
+        let mut bad = base.clone();
+        bad.u.main_deg = 1;
+        assert!(bad.fault().is_some());
+        let mut bad = base.clone();
+        bad.u.answers = 0;
+        assert!(bad.fault().is_some());
+        let mut bad = base.clone();
+        bad.tree.parts[0].main_symbols = 3;
+        assert!(bad.fault().is_some());
+        // A folded row that is longer than the room before G_u's own pads.
+        let mut bad = base.clone();
+        bad.u.main_rows = 1;
+        bad.tree = tree(1, 0);
+        bad.index = index_shape(3, 4, 1);
+        assert!(bad.fault().is_some());
+        // The index's depth need not equal G_u's; the capacity, not log_n, decides.
+        let mut good = base.clone();
+        good.index = index_shape(4, 8, 1);
+        assert!(good.fault().is_none());
+        // rows_high admits a non-power-of-two row count.
+        let mut good = base;
+        good.rows_high = true;
+        good.u.main_rows = 3;
+        good.tree = tree(3, 0);
+        assert!(good.fault().is_none());
+    }
+
+    #[test]
+    fn gu_claims_use_the_registered_shape_not_a_lookalike() {
+        let (shape, registry) = registered();
+        let mut other = shape.clone();
+        other.group = 2;
+        let seed = SampleSeed {
+            z: vec![Fp3::ONE; shape.sample_bits().unwrap() as usize],
+            beta: Fp3::ONE,
+        };
+        assert!(GuSampleClaim::new(&other, &registry, 0, seed.clone(), Fp3::ONE).is_err());
+        let record = IndexRecord {
+            y: vec![Fp3::ONE; 4],
+        };
+        let eq_gamma = vec![Fp3::ONE; 4];
+        assert!(GuRecordClaim::new(&other, &registry, &record, &eq_gamma, 0).is_err());
+        assert!(GuColumnClaim::new(&other, &registry, 1, Fp3::ONE).is_err());
+        assert!(GuSampleClaim::new(&shape, &registry, 0, seed, Fp3::ONE).is_ok());
+        assert!(GuRecordClaim::new(&shape, &registry, &record, &eq_gamma, 0).is_ok());
+        assert!(GuColumnClaim::new(&shape, &registry, 1, Fp3::ONE).is_ok());
+    }
+
+    #[test]
+    fn gu_index_and_oracle_answers_stay_separate() {
+        let mut shape = shape();
+        shape.u.answers = 2;
+        shape.index.answers = 1;
+        let mut registry = GuRegistry::new();
+        registry.receive(&shape, &notice()).unwrap();
+        let seed = SampleSeed {
+            z: vec![Fp3::ONE; shape.sample_bits().unwrap() as usize],
+            beta: Fp3::ONE,
+        };
+        // G_u has two sample answers.
+        assert!(GuSampleClaim::new(&shape, &registry, 1, seed, Fp3::ONE).is_ok());
+        // The index record has one answer.
+        let record = IndexRecord {
+            y: vec![Fp3::ONE; 4],
+        };
+        let eq_gamma = vec![Fp3::ONE; 4];
+        assert!(GuRecordClaim::new(&shape, &registry, &record, &eq_gamma, 1).is_err());
+    }
+
+    #[test]
+    fn gu_record_and_column_targets_and_separate_bytes() {
+        let (shape, registry) = registered();
+        let seed = SampleSeed {
+            z: vec![Fp3::ONE; shape.sample_bits().unwrap() as usize],
+            beta: Fp3::ONE,
+        };
+        let sample = GuSampleClaim::new(&shape, &registry, 0, seed, Fp3::from_u64(7)).unwrap();
+        let record = IndexRecord {
+            y: (1..=4).map(Fp3::from_u64).collect(),
+        };
+        let eq_gamma: Vec<Fp3> = (1..=4).map(Fp3::from_u64).collect();
+        let record = GuRecordClaim::new(&shape, &registry, &record, &eq_gamma, 0).unwrap();
+        assert_eq!(record.target, Fp3::from_u64(30));
+        let column = GuColumnClaim::new(&shape, &registry, 1, Fp3::from_u64(9)).unwrap();
+        assert!(GuColumnClaim::new(&shape, &registry, 8, Fp3::ZERO).is_err());
+        let sample_bytes = encode_sample_claims(&[sample.clone()]);
+        let record_bytes = encode_record_claims(&[record.clone()]);
+        let column_bytes = encode_column_claims(&[column.clone()]);
+        assert_ne!(sample_bytes, record_bytes);
+        assert_ne!(sample_bytes, column_bytes);
+        assert_ne!(record_bytes, column_bytes);
+        assert_eq!(sample_bytes, encode_sample_claims(&[sample]));
+        assert_eq!(record_bytes, encode_record_claims(&[record]));
+        assert_eq!(column_bytes, encode_column_claims(&[column]));
     }
 
     #[test]
@@ -521,102 +752,5 @@ mod tests {
         let mut other = notice();
         other.part = 1;
         assert_ne!(base, other.encode());
-    }
-
-    #[test]
-    fn gu_shape_faults_are_rejected() {
-        let base = shape();
-        let mut bad = base.clone();
-        bad.part = 1;
-        assert!(bad.fault().is_some());
-        let mut bad = base.clone();
-        bad.tree.parts[0].main_symbols = 4;
-        assert!(bad.fault().is_some());
-        let mut bad = base.clone();
-        bad.tree.parts[0].mask_symbols = 3;
-        assert!(bad.fault().is_some());
-        let mut bad = base;
-        bad.index.answers = 0;
-        assert!(bad.fault().is_some());
-        assert!(GuRegistry::new().receive(&bad, &notice()).is_err());
-    }
-
-    #[test]
-    fn gu_sample_claim_binds_its_round_and_rejects_bad_seeds() {
-        let (shape, registry) = registered();
-        let seed = SampleSeed {
-            z: vec![Fp3::ONE; shape.sample_bits().unwrap() as usize],
-            beta: Fp3::ONE,
-        };
-        let claim = GuSampleClaim::new(&shape, &registry, 0, seed, Fp3::from_u64(7)).unwrap();
-        assert_eq!(claim.oracle, 9);
-        assert_eq!(claim.answer, 0);
-        assert_eq!(claim.target, Fp3::from_u64(7));
-        let mut short = SampleSeed {
-            z: vec![Fp3::ONE; 1],
-            beta: Fp3::ONE,
-        };
-        assert!(GuSampleClaim::new(&shape, &registry, 0, short.clone(), Fp3::ZERO).is_err());
-        short.z = vec![Fp3::ONE; 2];
-        short.beta = Fp3::ZERO;
-        assert!(GuSampleClaim::new(&shape, &registry, 0, short, Fp3::ZERO).is_err());
-        let good = SampleSeed {
-            z: vec![Fp3::ONE; 2],
-            beta: Fp3::ONE,
-        };
-        assert!(GuSampleClaim::new(&shape, &registry, 1, good, Fp3::ZERO).is_err());
-        assert!(GuSampleClaim::new(&shape, &GuRegistry::new(), 0, {
-            SampleSeed {
-                z: vec![Fp3::ONE; 2],
-                beta: Fp3::ONE,
-            }
-        }, Fp3::ZERO)
-        .is_err());
-    }
-
-    #[test]
-    fn gu_record_claim_folds_each_answer_separately() {
-        let (shape, registry) = registered();
-        let record = IndexRecord {
-            y: (1..=4).map(Fp3::from_u64).collect(),
-        };
-        let eq_gamma: Vec<Fp3> = (1..=4).map(Fp3::from_u64).collect();
-        let claim = GuRecordClaim::new(&shape, &registry, &record, &eq_gamma, 0).unwrap();
-        assert_eq!(claim.target, Fp3::from_u64(30));
-        assert_eq!(claim.oracle, 9);
-        assert_eq!(claim.group, 1);
-        // Wrong record length, wrong point length and an answer out of range.
-        let short = IndexRecord {
-            y: vec![Fp3::ONE; 3],
-        };
-        assert!(GuRecordClaim::new(&shape, &registry, &short, &eq_gamma, 0).is_err());
-        assert!(GuRecordClaim::new(&shape, &registry, &record, &eq_gamma[..3], 0).is_err());
-        assert!(GuRecordClaim::new(&shape, &registry, &record, &eq_gamma, 1).is_err());
-    }
-
-    #[test]
-    fn gu_sample_and_record_bytes_stay_separate() {
-        let (shape, registry) = registered();
-        let seed = SampleSeed {
-            z: vec![Fp3::ONE; 2],
-            beta: Fp3::ONE,
-        };
-        let sample = GuSampleClaim::new(&shape, &registry, 0, seed, Fp3::from_u64(7)).unwrap();
-        let record = IndexRecord {
-            y: (1..=4).map(Fp3::from_u64).collect(),
-        };
-        let eq_gamma: Vec<Fp3> = (1..=4).map(Fp3::from_u64).collect();
-        let record = GuRecordClaim::new(&shape, &registry, &record, &eq_gamma, 0).unwrap();
-        let column = GuColumnClaim::new(&shape, &registry, 1, Fp3::from_u64(9)).unwrap();
-        assert!(GuColumnClaim::new(&shape, &registry, 8, Fp3::ZERO).is_err());
-        let sample_bytes = encode_sample_claims(&[sample.clone()]);
-        let record_bytes = encode_record_claims(&[record.clone()]);
-        let column_bytes = encode_column_claims(&[column.clone()]);
-        assert_ne!(sample_bytes, record_bytes);
-        assert_ne!(sample_bytes, column_bytes);
-        assert_ne!(record_bytes, column_bytes);
-        assert_eq!(sample_bytes, encode_sample_claims(&[sample]));
-        assert_eq!(record_bytes, encode_record_claims(&[record]));
-        assert_eq!(column_bytes, encode_column_claims(&[column]));
     }
 }
