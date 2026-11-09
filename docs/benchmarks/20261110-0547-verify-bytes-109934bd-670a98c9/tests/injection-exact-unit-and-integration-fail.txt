@@ -1,0 +1,93 @@
+warning: unused variable: `k_step`
+   --> models/gpt2/src/executor.rs:346:21
+    |
+346 |             let (k, k_step) = {
+    |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_step`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `m`
+   --> models/gemma3/src/executor.rs:277:5
+    |
+277 |     m: usize,
+    |     ^ help: if this is intentional, prefix it with an underscore: `_m`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_rot_step`
+   --> models/gemma3/src/executor.rs:390:21
+    |
+390 |         let (k_rot, k_rot_step) = rope(&mut builder, k, k_step, cos_prefix.clone(), sin_prefix.clone(), m)?;
+    |                     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_rot_step`
+
+warning: `zkie-models-gpt2` (lib) generated 1 warning (run `cargo fix --lib -p zkie-models-gpt2` to apply 1 suggestion)
+warning: `zkie-models-gemma3` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gemma3` to apply 2 suggestions)
+   Compiling zkie v0.1.0 (/data/zkIE/zkie)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.30s
+     Running unittests src/lib.rs (target/debug/deps/zkie-5a18c1172baeb4fd)
+
+running 1 test
+test provider::tests::exact_bincode_rejects_trailing_and_truncation ... FAILED
+
+failures:
+
+---- provider::tests::exact_bincode_rejects_trailing_and_truncation stdout ----
+
+thread 'provider::tests::exact_bincode_rejects_trailing_and_truncation' (1506441) panicked at zkie/src/provider.rs:612:18:
+called `Result::unwrap_err()` on an `Ok` value: StatementData { case_id: "case", model: "gpt2", model_commitment: Digest([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]), tokens: [], expected_argmax: [], expected_output: [] }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    provider::tests::exact_bincode_rejects_trailing_and_truncation
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p zkie --lib`
+---INTEGRATION
+warning: unused variable: `k_step`
+   --> models/gpt2/src/executor.rs:346:21
+    |
+346 |             let (k, k_step) = {
+    |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_step`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `m`
+   --> models/gemma3/src/executor.rs:277:5
+    |
+277 |     m: usize,
+    |     ^ help: if this is intentional, prefix it with an underscore: `_m`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_rot_step`
+   --> models/gemma3/src/executor.rs:390:21
+    |
+390 |         let (k_rot, k_rot_step) = rope(&mut builder, k, k_step, cos_prefix.clone(), sin_prefix.clone(), m)?;
+    |                     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_rot_step`
+
+warning: `zkie-models-gpt2` (lib) generated 1 warning (run `cargo fix --lib -p zkie-models-gpt2` to apply 1 suggestion)
+warning: `zkie-models-gemma3` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gemma3` to apply 2 suggestions)
+   Compiling zkie v0.1.0 (/data/zkIE/zkie)
+    Finished `release` profile [optimized] target(s) in 1.59s
+     Running tests/verify_bytes.rs (target/release/deps/verify_bytes-ec2d38089de2c0dc)
+
+running 1 test
+test production_verify_rejects_trailing_and_truncated_artifacts ... FAILED
+
+failures:
+
+---- production_verify_rejects_trailing_and_truncated_artifacts stdout ----
+
+thread 'production_verify_rejects_trailing_and_truncated_artifacts' (1506549) panicked at zkie/tests/verify_bytes.rs:120:28:
+expected rejection invalid_proof, got accepted=true outcome=Passed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    production_verify_rejects_trailing_and_truncated_artifacts
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 42.30s
+
+error: test failed, to rerun pass `-p zkie --test verify_bytes`

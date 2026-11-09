@@ -1,0 +1,39 @@
+TRACE docs/benchmarks/20261110-0547-verify-bytes-109934bd-670a98c9
+HEAD 109934bded134e3c282a0bebce0a5424da9a94da
+BINARY 58491fc2d11b08fb3bc232b4d5effeeaf84526675f35db188bb915a461303823  target/release/zkie
+FULL3 gpt2-seq16 EXIT 0 WALL_SEC 50
+-- commit-run
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"commit","error_code":null,"last_completed_stage":"commit","last_event_seq":3,"outcome":"PASS","output_binding":null,"progress_path":"docs/benchmarks/20261110-0547-verify-bytes-109934bd-670a98c9/prod/gpt2-seq16/commit-run/progress.jsonl","proof_bytes":null,"protocol_wall_ms":3449,"run_id":"commit","stage_wall_ms":3449,"vmhwm_kib":354836}
+-- prove
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"prove","error_code":null,"last_completed_stage":"prove","last_event_seq":77,"outcome":"PASS","output_binding":null,"progress_path":"docs/benchmarks/20261110-0547-verify-bytes-109934bd-670a98c9/prod/gpt2-seq16/prove/progress.jsonl","proof_bytes":4161786553,"protocol_wall_ms":21835,"run_id":"prove","stage_wall_ms":21835,"vmhwm_kib":8316292}
+-- verify
+{"authenticated_output_digest":"135c4d1c47aee4fd1985fa862afefbedde9d59beaf112bd2cf0dcfff03339280","authenticated_output_elements":16,"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":8,"outcome":"PASS","output_binding":"expected","progress_path":"docs/benchmarks/20261110-0547-verify-bytes-109934bd-670a98c9/prod/gpt2-seq16/verify/progress.jsonl","proof_bytes":null,"protocol_wall_ms":25145,"run_id":"verify","stage_wall_ms":25145,"vmhwm_kib":5391180}
+FULL3 gpt2-seq512 EXIT 0 WALL_SEC 407
+-- commit-run
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"commit","error_code":null,"last_completed_stage":"commit","last_event_seq":3,"outcome":"PASS","output_binding":null,"progress_path":"docs/benchmarks/20261110-0547-verify-bytes-109934bd-670a98c9/prod/gpt2-seq512/commit-run/progress.jsonl","proof_bytes":null,"protocol_wall_ms":3436,"run_id":"commit","stage_wall_ms":3436,"vmhwm_kib":356404}
+-- prove
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"prove","error_code":null,"last_completed_stage":"prove","last_event_seq":80,"outcome":"PASS","output_binding":null,"progress_path":"docs/benchmarks/20261110-0547-verify-bytes-109934bd-670a98c9/prod/gpt2-seq512/prove/progress.jsonl","proof_bytes":38992550944,"protocol_wall_ms":167596,"run_id":"prove","stage_wall_ms":167596,"vmhwm_kib":78571136}
+-- verify
+{"authenticated_output_digest":"eac0949d6463927eb9a961d61d618fb703e4b02169e89db10dbada94a5f0dfdd","authenticated_output_elements":512,"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":49,"outcome":"PASS","output_binding":"expected","progress_path":"docs/benchmarks/20261110-0547-verify-bytes-109934bd-670a98c9/prod/gpt2-seq512/verify/progress.jsonl","proof_bytes":null,"protocol_wall_ms":234055,"run_id":"verify","stage_wall_ms":234055,"vmhwm_kib":47036836}
+FULL3 gemma3-seq16 EXIT 0 WALL_SEC 101
+-- commit-run
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"commit","error_code":null,"last_completed_stage":"commit","last_event_seq":4,"outcome":"PASS","output_binding":null,"progress_path":"docs/benchmarks/20261110-0547-verify-bytes-109934bd-670a98c9/prod/gemma3-seq16/commit-run/progress.jsonl","proof_bytes":null,"protocol_wall_ms":9828,"run_id":"commit","stage_wall_ms":9828,"vmhwm_kib":1084876}
+-- prove
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"prove","error_code":null,"last_completed_stage":"prove","last_event_seq":45,"outcome":"PASS","output_binding":null,"progress_path":"docs/benchmarks/20261110-0547-verify-bytes-109934bd-670a98c9/prod/gemma3-seq16/prove/progress.jsonl","proof_bytes":8766306050,"protocol_wall_ms":45430,"run_id":"prove","stage_wall_ms":45430,"vmhwm_kib":17523544}
+-- verify
+{"authenticated_output_digest":"8683f5e22e51d1405fe3efcc7487a9a4df2e694c5d9f0bed64e921810d77c562","authenticated_output_elements":16,"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":12,"outcome":"PASS","output_binding":"expected","progress_path":"docs/benchmarks/20261110-0547-verify-bytes-109934bd-670a98c9/prod/gemma3-seq16/verify/progress.jsonl","proof_bytes":null,"protocol_wall_ms":45336,"run_id":"verify","stage_wall_ms":45336,"vmhwm_kib":13351300}
+FULL3 gemma3-seq512 EXIT 0 WALL_SEC 1256
+-- commit-run
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"commit","error_code":null,"last_completed_stage":"commit","last_event_seq":4,"outcome":"PASS","output_binding":null,"progress_path":"docs/benchmarks/20261110-0547-verify-bytes-109934bd-670a98c9/prod/gemma3-seq512/commit-run/progress.jsonl","proof_bytes":null,"protocol_wall_ms":9713,"run_id":"commit","stage_wall_ms":9713,"vmhwm_kib":1085068}
+-- prove
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"prove","error_code":null,"last_completed_stage":"prove","last_event_seq":110,"outcome":"PASS","output_binding":null,"progress_path":"docs/benchmarks/20261110-0547-verify-bytes-109934bd-670a98c9/prod/gemma3-seq512/prove/progress.jsonl","proof_bytes":101812159615,"protocol_wall_ms":419204,"run_id":"prove","stage_wall_ms":419204,"vmhwm_kib":207848880}
+-- verify
+{"authenticated_output_digest":"6d1df6b50c20d02db715fd14b12b9134623739375c44a029dd15b6b30bd9344c","authenticated_output_elements":512,"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":167,"outcome":"PASS","output_binding":"expected","progress_path":"docs/benchmarks/20261110-0547-verify-bytes-109934bd-670a98c9/prod/gemma3-seq512/verify/progress.jsonl","proof_bytes":null,"protocol_wall_ms":821930,"run_id":"verify","stage_wall_ms":821930,"vmhwm_kib":120673912}
+FULL3 timesfm-16patch EXIT 0 WALL_SEC 84
+-- commit-run
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"commit","error_code":null,"last_completed_stage":"commit","last_event_seq":4,"outcome":"PASS","output_binding":null,"progress_path":"docs/benchmarks/20261110-0547-verify-bytes-109934bd-670a98c9/prod/timesfm-16patch/commit-run/progress.jsonl","proof_bytes":null,"protocol_wall_ms":5548,"run_id":"commit","stage_wall_ms":5548,"vmhwm_kib":176308}
+-- prove
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"prove","error_code":null,"last_completed_stage":"prove","last_event_seq":115,"outcome":"PASS","output_binding":null,"progress_path":"docs/benchmarks/20261110-0547-verify-bytes-109934bd-670a98c9/prod/timesfm-16patch/prove/progress.jsonl","proof_bytes":6865533616,"protocol_wall_ms":35506,"run_id":"prove","stage_wall_ms":35506,"vmhwm_kib":13822988}
+-- verify
+{"authenticated_output_digest":"cc72805b7a845cb2b8505d6092dbb79477d083394a03c99cdac7f5665de56ba3","authenticated_output_elements":32768,"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":11,"outcome":"PASS","output_binding":"expected","progress_path":"docs/benchmarks/20261110-0547-verify-bytes-109934bd-670a98c9/prod/timesfm-16patch/verify/progress.jsonl","proof_bytes":null,"protocol_wall_ms":42979,"run_id":"verify","stage_wall_ms":42979,"vmhwm_kib":7322900}
+FULL3_DONE

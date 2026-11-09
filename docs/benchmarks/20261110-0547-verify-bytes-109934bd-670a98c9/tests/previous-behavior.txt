@@ -1,0 +1,21 @@
+Previous-commit behavior check for the byte-consumption table.
+
+Previous commit: 670a98c92ee01ee54588fcbcc53f992554208b35
+Binary: /tmp/zkie-old-target/release/zkie
+Binary sha256: 33af421c39cabb8cb9c5b7a39769fb859ab19c8aaa7714488a7e6a1d8dbf454c
+Artifacts: legal gpt2-seq16 set from
+docs/benchmarks/20261110-0547-verify-bytes-109934bd-670a98c9.
+
+Every row ran the full production verify entry on the previous binary. Small
+files were restored from the legal fixture after each mutation; proof.bin was
+truncated back to its original length.
+
+legal                        exit 0  outcome PASS  error none
+statement-trailing           exit 0  outcome PASS  error none
+commitment-trailing          exit 0  outcome PASS  error none
+proof-trailing               exit 0  outcome PASS  error none
+statement-truncated          exit 2  outcome FAIL  error invalid_encoding
+commitment-truncated         exit 2  outcome FAIL  error invalid_encoding
+proof-truncated              exit 2  outcome FAIL  error invalid_encoding
+legal-restored               exit 0  outcome PASS  error none
+legal-restored-2             exit 0  outcome PASS  error none
