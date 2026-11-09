@@ -8,6 +8,13 @@
 //! therefore appear as several rows for the same entry; they are all kept and
 //! weighted by their own powers. Physical-opening deduplication belongs to the
 //! caller's SEND/opening layer and is not represented or claimed here.
+//!
+//! This module is not connected to the FOLDEQ session. Sample rows are fixture
+//! inputs shaped like SEND's registered rows; they are not authenticated by a
+//! real SEND receipt, and this layer has no sample-pad registration or pad-read
+//! restriction. The mask state is only a placeholder, and BAT output does not
+//! unlock the isolated FOLD next stage. These are production integration gates,
+//! not hidden assumptions.
 
 use std::collections::BTreeSet;
 
@@ -293,7 +300,8 @@ impl BatRunInput {
 
 /// One combined group claim. `main` and `mask` are full group-table coefficient
 /// vectors; `kept` has one full member-table vector per kept oracle that the
-/// combined claim reads, ordered by oracle number.
+/// combined claim reads, ordered by oracle number. This is candidate data: it
+/// does not imply FOLD/IOPP verification or unlock the FOLD next stage.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BatGroupRow {
     pub group: u64,
@@ -321,7 +329,14 @@ impl BatStatement {
         Self::default()
     }
 
+    /// Register an oracle in the trusted sending order. Its id is the current
+    /// registration count; an external id that is out of order or skips ahead
+    /// is rejected. The shape's tables are checked, but the fixture itself is
+    /// not authenticated as a real SEND message.
     pub fn add_oracle(&mut self, shape: BatOracleShape) -> Result<u64> {
+        if shape.oracle != self.oracles.len() as u64 {
+            return Err(Error::StatementMismatch);
+        }
         if shape.fault().is_some()
             || self
                 .oracles
@@ -382,18 +397,30 @@ impl BatStatement {
     }
 
     /// Register the complete ordered sample answer rows of one oracle. A
-    /// sampled oracle is registered once; the row count is its answer count and
-    /// every row is a SAMPLE claim.
+    /// sampled oracle is registered once; the row count is its answer count,
+    /// every row is a SAMPLE claim, and every coefficient reference must name
+    /// this oracle and fit its main/mask table. These are fixture rows standing
+    /// in for SEND's registered sample rows, not a producer self-certification.
     pub fn sample(&mut self, oracle: u64, rows: Vec<BatRow>) -> Result<()> {
-        let expected = {
+        let shape = {
             let entry = self.oracle(oracle)?;
             if entry.sampled || entry.shape.answers == 0 {
                 return Err(Error::InvalidSessionState);
             }
-            entry.shape.answers as usize
+            entry.shape
         };
-        if rows.len() != expected || rows.iter().any(|row| row.kind != BatRowKind::Sample) {
+        if rows.len() != shape.answers as usize
+            || rows.iter().any(|row| row.kind != BatRowKind::Sample)
+        {
             return Err(Error::ShapeMismatch);
+        }
+        for row in &rows {
+            check_row_entries(row, |referenced| {
+                if referenced != oracle {
+                    return Err(Error::StatementMismatch);
+                }
+                Ok(shape)
+            })?;
         }
         let entry = self.oracle_mut(oracle)?;
         entry.sample_rows = rows;
@@ -467,45 +494,12 @@ impl BatStatement {
 
     fn check_row(&self, group: u64, row: &BatRow) -> Result<()> {
         let entry = self.group(group)?;
-        let shape = |oracle: u64| -> Result<BatOracleShape> {
+        check_row_entries(row, |oracle| {
             if !entry.members.contains(&oracle) {
                 return Err(Error::StatementMismatch);
             }
             Ok(self.oracle(oracle)?.shape)
-        };
-        for term in &row.terms {
-            let shape = shape(term.oracle)?;
-            if !shape.has(term.part) || term.values.len() != shape.table_len(term.part)? {
-                return Err(Error::ShapeMismatch);
-            }
-        }
-        for unit in &row.units {
-            let shape = shape(unit.oracle)?;
-            if !shape.has(unit.part) || unit.index >= shape.table_len(unit.part)? as u64 {
-                return Err(Error::InvalidIndex);
-            }
-        }
-        for run in &row.runs {
-            let shape = shape(run.oracle)?;
-            if !shape.has(run.part) || run.step == 0 || run.values.is_empty() {
-                return Err(Error::ShapeMismatch);
-            }
-            let len = shape.table_len(run.part)? as u64;
-            if run.first >= len
-                || (run.values.len() as u64 - 1) > (len - 1 - run.first) / run.step
-            {
-                return Err(Error::InvalidIndex);
-            }
-        }
-        for form in &row.forms {
-            let shape = shape(form.oracle)?;
-            if !shape.has(BatPart::Main)
-                || form.values.len() != shape.table_len(BatPart::Main)?
-            {
-                return Err(Error::ShapeMismatch);
-            }
-        }
-        Ok(())
+        })
     }
 
     pub fn layout(&self, group: u64) -> Result<BatGroupLayout> {
@@ -621,11 +615,15 @@ impl BatStatement {
         Ok(next)
     }
 
-    /// Convert the candidate layout to the isolated FOLD fixture layout. The
-    /// conversion is exact for the represented rows and kept marks; the result
-    /// still needs the FOLD shape check. It is not a production layout source.
+    /// Shape-less candidate mapping to the isolated FOLD fixture. It fails
+    /// closed unless the FOLD candidate checker accepts the layout, so the
+    /// public handoff entry does not silently return a layout outside the
+    /// supported fixture subset. The result still needs the full checked
+    /// handoff for the shape code widths; it is not a general GroupLayout
+    /// handoff or a production layout source.
     pub fn to_fold_layout(&self, group: u64) -> Result<FoldGroupLayout> {
         let layout = self.layout(group)?;
+        let entry = self.group(group)?;
         let members = layout
             .members
             .iter()
@@ -639,18 +637,33 @@ impl BatStatement {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(FoldGroupLayout {
+        let out = FoldGroupLayout {
             group,
             k: layout.k,
             h: layout.h,
             members,
-        })
+        };
+        let fixture_shape = FoldShape {
+            code: entry.code,
+            mask_code: entry.mask_code,
+            k: out.k,
+            h: out.h,
+            mask_leaf_class: 0,
+        };
+        if out.fault(&fixture_shape).is_some() {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(out)
     }
 
-    /// Convert and validate the handoff to the isolated FOLD fixture. The
-    /// supplied shape must name this group's codes and row variables, and the
-    /// FOLD candidate checker must accept the result. This is still an
-    /// unauthenticated fixture boundary, not a production authority.
+    /// Convert and validate the handoff to the isolated FOLD fixture. This is
+    /// a restricted fixture handoff only: it accepts exactly the layouts that
+    /// the isolated FOLD candidate checker accepts. A legal BAT layout whose
+    /// descending blocks that checker rejects is outside this S2 subset and
+    /// fails closed here; it is not a general GroupLayout handoff. The only BAT
+    /// layout derivation is `BatStatement::layout`; production must rebuild the
+    /// same members/first offsets/k/h/kept from an authenticated statement, and
+    /// must not introduce a second layout authority.
     pub fn to_fold_layout_checked(
         &self,
         group: u64,
@@ -737,6 +750,43 @@ impl BatStatement {
             target: row.target,
         })
     }
+}
+
+fn check_row_entries<F>(row: &BatRow, lookup: F) -> Result<()>
+where
+    F: Fn(u64) -> Result<BatOracleShape>,
+{
+    for term in &row.terms {
+        let shape = lookup(term.oracle)?;
+        if !shape.has(term.part) || term.values.len() != shape.table_len(term.part)? {
+            return Err(Error::ShapeMismatch);
+        }
+    }
+    for unit in &row.units {
+        let shape = lookup(unit.oracle)?;
+        if !shape.has(unit.part) || unit.index >= shape.table_len(unit.part)? as u64 {
+            return Err(Error::InvalidIndex);
+        }
+    }
+    for run in &row.runs {
+        let shape = lookup(run.oracle)?;
+        if !shape.has(run.part) || run.step == 0 || run.values.is_empty() {
+            return Err(Error::ShapeMismatch);
+        }
+        let len = shape.table_len(run.part)? as u64;
+        if run.first >= len
+            || (run.values.len() as u64 - 1) > (len - 1 - run.first) / run.step
+        {
+            return Err(Error::InvalidIndex);
+        }
+    }
+    for form in &row.forms {
+        let shape = lookup(form.oracle)?;
+        if !shape.has(BatPart::Main) || form.values.len() != shape.table_len(BatPart::Main)? {
+            return Err(Error::ShapeMismatch);
+        }
+    }
+    Ok(())
 }
 
 /// The isolated chain session. BAT's prover sends no message: the round is an
@@ -1109,25 +1159,25 @@ mod tests {
 
     fn group_fixture() -> (BatStatement, u64) {
         let mut st = BatStatement::new();
-        add_shape(&mut st, shape(1, 2, 1, 1));
-        add_shape(&mut st, shape(2, 4, 2, 1));
-        add_shape(&mut st, shape(3, 3, 1, 1));
+        add_shape(&mut st, shape(0, 2, 1, 1));
+        add_shape(&mut st, shape(1, 4, 2, 1));
+        add_shape(&mut st, shape(2, 3, 1, 1));
         let group = st.new_group(code(), mask_code()).unwrap();
+        st.join(group, 0, false).unwrap();
         st.join(group, 1, false).unwrap();
-        st.join(group, 2, false).unwrap();
-        st.join(group, 3, true).unwrap();
+        st.join(group, 2, true).unwrap();
         (st, group)
     }
 
     fn fold_fixture() -> (BatStatement, u64) {
         let mut st = BatStatement::new();
-        add_shape(&mut st, shape(1, 4, 2, 1));
-        add_shape(&mut st, shape(2, 2, 1, 1));
-        add_shape(&mut st, shape(3, 3, 1, 1));
+        add_shape(&mut st, shape(0, 4, 2, 1));
+        add_shape(&mut st, shape(1, 2, 1, 1));
+        add_shape(&mut st, shape(2, 3, 1, 1));
         let group = st.new_group(code(), mask_code()).unwrap();
+        st.join(group, 0, false).unwrap();
         st.join(group, 1, false).unwrap();
-        st.join(group, 2, false).unwrap();
-        st.join(group, 3, true).unwrap();
+        st.join(group, 2, true).unwrap();
         (st, group)
     }
 
@@ -1140,13 +1190,13 @@ mod tests {
         assert_eq!(layout.log_ell, 3);
         assert_eq!(layout.log_ell_zk, 3);
         let members = layout.members;
-        assert_eq!(members[0].oracle, 1);
+        assert_eq!(members[0].oracle, 0);
         assert_eq!(members[0].main_first, Some(4));
         assert_eq!(members[0].mask_first, Some(2));
-        assert_eq!(members[1].oracle, 2);
+        assert_eq!(members[1].oracle, 1);
         assert_eq!(members[1].main_first, Some(0));
         assert_eq!(members[1].mask_first, Some(0));
-        assert_eq!(members[2].oracle, 3);
+        assert_eq!(members[2].oracle, 2);
         assert!(members[2].kept);
         assert_eq!(members[2].main_first, None);
         assert_eq!(members[2].mask_first, Some(3));
@@ -1155,9 +1205,9 @@ mod tests {
     #[test]
     fn begin_run_uses_class_order_and_closes_the_group() {
         let mut st = BatStatement::new();
-        add_shape(&mut st, shape(7, 2, 1, 2));
+        add_shape(&mut st, shape(0, 2, 1, 2));
         let group = st.new_group(code(), mask_code()).unwrap();
-        st.join(group, 7, false).unwrap();
+        st.join(group, 0, false).unwrap();
         let mut plain_first = BatRow::new(BatRowKind::Plain);
         plain_first.target = Fp3::from_u64(1);
         let mut generator_first = BatRow::new(BatRowKind::Generator);
@@ -1171,7 +1221,7 @@ mod tests {
         st.add_row(group, plain_second).unwrap();
         st.add_row(group, generator_second).unwrap();
         assert!(st.add_row(group, sample_row(9)).is_err());
-        let mask_before = st.take_mask_slot(7).unwrap();
+        let mask_before = st.take_mask_slot(0).unwrap();
         assert_eq!(mask_before, 0);
         let input = st.begin_run(group).unwrap();
         assert_eq!(input.rows.len(), 6);
@@ -1201,16 +1251,16 @@ mod tests {
             vec![
                 Fp3::from_u64(1),
                 Fp3::from_u64(3),
-                Fp3::from_u64(171),
-                Fp3::from_u64(172),
+                Fp3::from_u64(101),
+                Fp3::from_u64(102),
                 Fp3::from_u64(2),
                 Fp3::from_u64(4),
             ]
         );
         assert!(st.add_row(group, BatRow::new(BatRowKind::Plain)).is_err());
-        assert!(st.join(group, 7, false).is_err());
+        assert!(st.join(group, 0, false).is_err());
         assert!(st.begin_run(group).is_err());
-        assert!(st.take_mask_slot(7).is_err());
+        assert!(st.take_mask_slot(0).is_err());
     }
 
     #[test]
@@ -1218,76 +1268,42 @@ mod tests {
         let (mut st, group) = group_fixture();
         let mut first = BatRow::new(BatRowKind::Plain);
         first.target = Fp3::from_u64(5);
-        first.add_term(1, BatPart::Main, one_at(16, 5, 3));
-        first.add_unit(2, BatPart::Mask, 3, Fp3::from_u64(2));
-        first.add_run(3, BatPart::Main, 1, 2, vec![Fp3::from_u64(7), Fp3::from_u64(9)]);
-        first.add_form(1, one_at(16, 0, 1));
+        first.add_term(0, BatPart::Main, one_at(16, 5, 3));
+        first.add_unit(1, BatPart::Mask, 3, Fp3::from_u64(2));
+        first.add_run(2, BatPart::Main, 1, 2, vec![Fp3::from_u64(7), Fp3::from_u64(9)]);
+        first.add_form(0, one_at(16, 0, 1));
         let mut second = BatRow::new(BatRowKind::Plain);
         second.target = Fp3::from_u64(6);
-        second.add_term(2, BatPart::Main, one_at(32, 0, 5));
-        second.add_term(3, BatPart::Main, one_at(32, 9, 11));
+        second.add_term(1, BatPart::Main, one_at(32, 0, 5));
+        second.add_term(2, BatPart::Main, one_at(32, 9, 11));
         st.add_row(group, first).unwrap();
         st.add_row(group, second).unwrap();
         let input = st.begin_run(group).unwrap();
         let x = Fp3::from_u64(7);
         let row = combine(&st, &input.layout, &input.rows, x).unwrap();
         let layout = input.layout;
-        let main = |oracle: u64, index: u64| -> usize {
-            let member = layout
-                .members
-                .iter()
-                .find(|member| member.oracle == oracle)
-                .unwrap();
-            group_index(
-                index,
-                st.oracle(oracle).unwrap().shape.row_bits(BatPart::Main),
-                member.main_first.unwrap(),
-                layout.k,
-            )
-            .unwrap() as usize
-        };
-        let mask = |oracle: u64, index: u64| -> usize {
-            let member = layout
-                .members
-                .iter()
-                .find(|member| member.oracle == oracle)
-                .unwrap();
-            group_index(
-                index,
-                st.oracle(oracle).unwrap().shape.row_bits(BatPart::Mask),
-                member.mask_first.unwrap(),
-                layout.h,
-            )
-            .unwrap() as usize
-        };
-        assert_eq!(row.main[main(1, 5)], Fp3::from_u64(3));
-        assert_eq!(row.main[main(1, 0)], Fp3::from_u64(1));
-        assert_eq!(row.main[main(2, 0)], x.mul(&Fp3::from_u64(5)));
-        assert_eq!(row.mask[mask(2, 3)], Fp3::from_u64(2));
-        assert_eq!(
-            row.main.iter().filter(|value| **value != Fp3::ZERO).count(),
-            3
-        );
-        assert_eq!(
-            row.mask.iter().filter(|value| **value != Fp3::ZERO).count(),
-            1
-        );
+        let mut expected_main = vec![Fp3::ZERO; 64];
+        expected_main[21] = Fp3::from_u64(3);
+        expected_main[4] = Fp3::from_u64(1);
+        expected_main[0] = x.mul(&Fp3::from_u64(5));
+        let mut expected_mask = vec![Fp3::ZERO; 32];
+        expected_mask[5] = Fp3::from_u64(2);
+        assert_eq!(row.main, expected_main);
+        assert_eq!(row.mask, expected_mask);
         assert_eq!(
             row.target,
             Fp3::from_u64(5)
                 .add(&x.mul(&Fp3::from_u64(6)))
-                .add(&x.mul(&x).mul(&Fp3::from_u64(111)))
-                .add(&x.mul(&x).mul(&x).mul(&Fp3::from_u64(121)))
-                .add(&x.mul(&x).mul(&x).mul(&x).mul(&Fp3::from_u64(131)))
+                .add(&x.mul(&x).mul(&Fp3::from_u64(101)))
+                .add(&x.mul(&x).mul(&x).mul(&Fp3::from_u64(111)))
+                .add(&x.mul(&x).mul(&x).mul(&x).mul(&Fp3::from_u64(121)))
         );
-        let kept = row.kept.iter().find(|form| form.oracle == 3).unwrap();
-        assert_eq!(kept.coefficients[1], Fp3::from_u64(7));
-        assert_eq!(kept.coefficients[3], Fp3::from_u64(9));
-        assert_eq!(kept.coefficients[9], x.mul(&Fp3::from_u64(11)));
-        assert_eq!(
-            kept.coefficients.iter().filter(|value| **value != Fp3::ZERO).count(),
-            3
-        );
+        let kept = row.kept.iter().find(|form| form.oracle == 2).unwrap();
+        let mut expected_kept = vec![Fp3::ZERO; 32];
+        expected_kept[1] = Fp3::from_u64(7);
+        expected_kept[3] = Fp3::from_u64(9);
+        expected_kept[9] = x.mul(&Fp3::from_u64(11));
+        assert_eq!(kept.coefficients, expected_kept);
         let reversed = combine(
             &st,
             &layout,
@@ -1300,9 +1316,9 @@ mod tests {
 
     fn session_fixture_with_chain(planned_rows: u64, chain: Chain) -> (BatSession, u64) {
         let mut st = BatStatement::new();
-        add_shape(&mut st, shape(7, 2, 1, 2));
+        add_shape(&mut st, shape(0, 2, 1, 2));
         let group = st.new_group(code(), mask_code()).unwrap();
-        st.join(group, 7, false).unwrap();
+        st.join(group, 0, false).unwrap();
         let mut plain = BatRow::new(BatRowKind::Plain);
         plain.target = Fp3::from_u64(3);
         let mut generator_first = BatRow::new(BatRowKind::Generator);
@@ -1329,8 +1345,8 @@ mod tests {
         assert!(replay.step(&prefix, 0).unwrap());
         assert_eq!(x, replay.draw_e().unwrap());
         let expected = Fp3::from_u64(3)
-            .add(&x.mul(&Fp3::from_u64(171)))
-            .add(&x.mul(&x).mul(&Fp3::from_u64(172)))
+            .add(&x.mul(&Fp3::from_u64(101)))
+            .add(&x.mul(&x).mul(&Fp3::from_u64(102)))
             .add(&x.mul(&x).mul(&x).mul(&Fp3::from_u64(5)))
             .add(&x.mul(&x).mul(&x).mul(&x).mul(&Fp3::from_u64(7)));
         assert_eq!(row.target, expected);
@@ -1369,19 +1385,19 @@ mod tests {
         assert!(session
             .add_row(group, BatRow::new(BatRowKind::Plain))
             .is_err());
-        assert!(session.join(group, 7, false).is_err());
+        assert!(session.join(group, 0, false).is_err());
         assert!(session
             .statement_mut()
-            .sample(7, vec![sample_row(1), sample_row(2)])
+            .sample(0, vec![sample_row(1), sample_row(2)])
             .is_err());
-        assert!(session.statement_mut().take_mask_slot(7).is_err());
+        assert!(session.statement_mut().take_mask_slot(0).is_err());
         assert!(session.statement_mut().add_row(99, BatRow::new(BatRowKind::Plain)).is_err());
     }
 
     #[test]
     fn sample_and_membership_checks_fail_closed() {
         let mut st = BatStatement::new();
-        let id = st.add_oracle(shape(1, 2, 1, 2)).unwrap();
+        let id = st.add_oracle(shape(0, 2, 1, 2)).unwrap();
         let group = st.new_group(code(), mask_code()).unwrap();
         assert!(st.join(group, id, false).is_err());
         assert!(st.sample(id, vec![sample_row(1)]).is_err());
@@ -1392,26 +1408,111 @@ mod tests {
     }
 
     #[test]
+    fn oracle_ids_follow_registration_order() {
+        let mut st = BatStatement::new();
+        assert!(st.add_oracle(shape(9, 2, 1, 1)).is_err());
+        assert!(st.add_oracle(shape(1, 2, 1, 1)).is_err());
+        assert!(st.add_oracle(shape(0, 2, 1, 1)).is_ok());
+        assert!(st.add_oracle(shape(2, 2, 1, 1)).is_err());
+        assert!(st.add_oracle(shape(1, 2, 1, 1)).is_ok());
+    }
+
+    #[test]
+    fn sample_rows_must_reference_their_own_oracle() {
+        let mut st = BatStatement::new();
+        st.add_oracle(shape(0, 2, 1, 2)).unwrap();
+        st.add_oracle(shape(1, 2, 0, 1)).unwrap();
+        let valid = || {
+            let mut row = BatRow::new(BatRowKind::Sample);
+            row.target = Fp3::from_u64(7);
+            row.add_term(0, BatPart::Main, vec![Fp3::ZERO; 16]);
+            row.add_unit(0, BatPart::Mask, 0, Fp3::ONE);
+            row.add_run(0, BatPart::Main, 1, 2, vec![Fp3::ONE, Fp3::ZERO]);
+            row.add_form(0, vec![Fp3::ZERO; 16]);
+            row
+        };
+        let mut other_oracle = valid();
+        other_oracle.add_unit(1, BatPart::Main, 0, Fp3::ONE);
+        assert!(st.sample(0, vec![valid(), other_oracle]).is_err());
+
+        let mut bad_index = valid();
+        bad_index.units.clear();
+        bad_index.add_unit(0, BatPart::Main, 16, Fp3::ONE);
+        assert!(st.sample(0, vec![valid(), bad_index]).is_err());
+
+        let mut no_part = valid();
+        no_part.units.clear();
+        no_part.add_unit(1, BatPart::Mask, 0, Fp3::ONE);
+        assert!(st.sample(0, vec![valid(), no_part]).is_err());
+
+        let mut absent_part = BatRow::new(BatRowKind::Sample);
+        absent_part.add_unit(1, BatPart::Mask, 0, Fp3::ONE);
+        assert!(st.sample(1, vec![absent_part]).is_err());
+
+        let mut wrong_kind = valid();
+        wrong_kind.kind = BatRowKind::Plain;
+        assert!(st.sample(0, vec![valid(), wrong_kind]).is_err());
+
+        assert!(st.sample(0, vec![valid(), valid()]).is_ok());
+    }
+
+    #[test]
+    fn two_oracles_keep_send_order_and_sample_powers() {
+        let mut st = BatStatement::new();
+        st.add_oracle(shape(0, 2, 1, 1)).unwrap();
+        st.add_oracle(shape(1, 2, 1, 1)).unwrap();
+        st.sample(0, vec![sample_row(101)]).unwrap();
+        st.sample(1, vec![sample_row(111)]).unwrap();
+        let group = st.new_group(code(), mask_code()).unwrap();
+        st.join(group, 1, false).unwrap();
+        st.join(group, 0, false).unwrap();
+        let mut first = BatRow::new(BatRowKind::Plain);
+        first.target = Fp3::from_u64(5);
+        first.add_term(0, BatPart::Main, one_at(16, 5, 3));
+        let mut second = BatRow::new(BatRowKind::Plain);
+        second.target = Fp3::from_u64(6);
+        second.add_term(1, BatPart::Main, one_at(16, 5, 4));
+        st.add_row(group, first).unwrap();
+        st.add_row(group, second).unwrap();
+        let input = st.begin_run(group).unwrap();
+        assert_eq!(input.layout.members[0].oracle, 0);
+        assert_eq!(input.layout.members[1].oracle, 1);
+        assert_eq!(input.layout.members[0].main_first, Some(0));
+        assert_eq!(input.layout.members[1].main_first, Some(2));
+        let x = Fp3::from_u64(9);
+        let row = combine(&st, &input.layout, &input.rows, x).unwrap();
+        assert_eq!(row.main[9], Fp3::from_u64(3));
+        assert_eq!(row.main[11], x.mul(&Fp3::from_u64(4)));
+        assert_eq!(
+            row.target,
+            Fp3::from_u64(5)
+                .add(&x.mul(&Fp3::from_u64(6)))
+                .add(&x.mul(&x).mul(&Fp3::from_u64(101)))
+                .add(&x.mul(&x).mul(&x).mul(&Fp3::from_u64(111)))
+        );
+    }
+
+    #[test]
     fn entry_dimensions_and_kept_mask_only_are_checked() {
         let (mut st, group) = group_fixture();
         let mut bad_term = BatRow::new(BatRowKind::Plain);
-        bad_term.add_term(1, BatPart::Main, vec![Fp3::ZERO; 15]);
+        bad_term.add_term(0, BatPart::Main, vec![Fp3::ZERO; 15]);
         assert!(st.add_row(group, bad_term).is_err());
         let mut bad_unit = BatRow::new(BatRowKind::Plain);
-        bad_unit.add_unit(1, BatPart::Mask, 99, Fp3::ONE);
+        bad_unit.add_unit(0, BatPart::Mask, 99, Fp3::ONE);
         assert!(st.add_row(group, bad_unit).is_err());
         let mut bad_run = BatRow::new(BatRowKind::Plain);
-        bad_run.add_run(1, BatPart::Main, 15, 1, vec![Fp3::ONE, Fp3::ZERO]);
+        bad_run.add_run(0, BatPart::Main, 15, 1, vec![Fp3::ONE, Fp3::ZERO]);
         assert!(st.add_row(group, bad_run).is_err());
         let mut bad_form = BatRow::new(BatRowKind::Plain);
-        bad_form.add_form(1, vec![Fp3::ZERO; 8]);
+        bad_form.add_form(0, vec![Fp3::ZERO; 8]);
         assert!(st.add_row(group, bad_form).is_err());
 
         let mut mask_only = BatStatement::new();
-        add_shape(&mut mask_only, shape(4, 0, 1, 1));
+        add_shape(&mut mask_only, shape(0, 0, 1, 1));
         let other = mask_only.new_group(code(), mask_code()).unwrap();
-        assert!(mask_only.join(other, 4, true).is_err());
-        assert!(mask_only.join(other, 4, false).is_ok());
+        assert!(mask_only.join(other, 0, true).is_err());
+        assert!(mask_only.join(other, 0, false).is_ok());
     }
 
     #[test]
@@ -1437,15 +1538,15 @@ mod tests {
         let (st, group) = group_fixture();
         let layout = st.layout(group).unwrap();
         let mut first = BatRow::new(BatRowKind::Plain);
-        first.add_unit(1, BatPart::Main, 0, Fp3::from_u64(2));
+        first.add_unit(0, BatPart::Main, 0, Fp3::from_u64(2));
         let mut second = BatRow::new(BatRowKind::Plain);
-        second.add_unit(1, BatPart::Main, 0, Fp3::from_u64(3));
+        second.add_unit(0, BatPart::Main, 0, Fp3::from_u64(3));
         let x = Fp3::from_u64(5);
         let out = combine(&st, &layout, &[first, second], x).unwrap();
         let at = layout
             .members
             .iter()
-            .find(|member| member.oracle == 1)
+            .find(|member| member.oracle == 0)
             .unwrap()
             .main_first
             .unwrap() as usize;
@@ -1489,12 +1590,36 @@ mod tests {
     }
 
     #[test]
+    fn legal_descending_layout_is_outside_the_fixture_handoff_subset() {
+        let mut st = BatStatement::new();
+        add_shape(&mut st, shape(0, 1, 1, 1));
+        add_shape(&mut st, shape(1, 4, 1, 1));
+        add_shape(&mut st, shape(2, 1, 1, 1));
+        let group = st.new_group(code(), mask_code()).unwrap();
+        st.join(group, 0, false).unwrap();
+        st.join(group, 1, false).unwrap();
+        st.join(group, 2, false).unwrap();
+        let layout = st.layout(group).unwrap();
+        assert_eq!(layout.k, 3);
+        assert_eq!(layout.h, 2);
+        assert!(st.to_fold_layout(group).is_err());
+        let shape = crate::pcs::request::fold::FoldShape {
+            code: code(),
+            mask_code: mask_code(),
+            k: layout.k,
+            h: layout.h,
+            mask_leaf_class: 3,
+        };
+        assert!(st.to_fold_layout_checked(group, &shape).is_err());
+    }
+
+    #[test]
     fn candidate_output_converts_to_the_isolated_fold_input() {
         let (mut st, group) = fold_fixture();
         let mut row = BatRow::new(BatRowKind::Plain);
         row.target = Fp3::from_u64(9);
-        row.add_term(3, BatPart::Main, one_at(32, 9, 4));
-        row.add_unit(3, BatPart::Mask, 0, Fp3::from_u64(6));
+        row.add_term(2, BatPart::Main, one_at(32, 9, 4));
+        row.add_unit(2, BatPart::Mask, 0, Fp3::from_u64(6));
         st.add_row(group, row).unwrap();
         let input = st.begin_run(group).unwrap();
         let combined = combine(&st, &input.layout, &input.rows, Fp3::from_u64(3)).unwrap();
@@ -1514,7 +1639,7 @@ mod tests {
         fold_row.check(&fold_shape, &fold_layout).unwrap();
 
         let mut broken = combined.clone();
-        let form = broken.kept.iter_mut().find(|form| form.oracle == 3).unwrap();
+        let form = broken.kept.iter_mut().find(|form| form.oracle == 2).unwrap();
         form.coefficients[3] = Fp3::ONE;
         assert!(st.to_fold_input_row(&broken, &input.layout).is_err());
     }
