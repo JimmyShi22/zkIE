@@ -3,7 +3,9 @@ use zkie_core::types::Digest;
 use zkie_ops::affine_scale::AffineScaleOp;
 use zkie_ops::matmul::MatMulOp;
 use zkie_ops::op::OpCode;
-use zkie_ops::proof::binding::{commit_rows_with_openings, OracleRegistry};
+use zkie_ops::proof::binding::{
+    commit_rows_with_openings, OracleId, OracleOpening, OracleRegistry,
+};
 use zkie_ops::proof::relations::{
     proof_input_values, prove_op_relation_shared, verify_op_relation_with_external,
     OpRelationProof, OpRelationPublic, RelationConfig, RelationLengths,
@@ -253,4 +255,206 @@ fn softmax_raw_length_must_match_the_input() {
     tampered.raw[0] = openings;
     tampered.lengths.raw[0] -= 1;
     assert_eq!(verify_code(&public, &tampered, &config), "shape_mismatch");
+}
+
+fn width_group(
+    registry: &mut OracleRegistry,
+    label: u8,
+    values: &[i64],
+    width: usize,
+) -> (OracleId, Vec<OracleOpening>) {
+    assert!(width > 0 && values.len() % width == 0);
+    let mut rows: Vec<Vec<u64>> = values
+        .chunks_exact(width)
+        .map(|chunk| chunk.iter().map(|value| *value as u64).collect())
+        .collect();
+    assert!(!rows.is_empty());
+    rows.resize(rows.len().max(1).next_power_of_two(), vec![0; width]);
+    commit_rows_with_openings(registry, &Digest([label; 32]), &rows).unwrap()
+}
+
+fn wide_group(
+    registry: &mut OracleRegistry,
+    label: u8,
+    values: &[i64],
+) -> (OracleId, Vec<OracleOpening>) {
+    let mut words = Vec::with_capacity(values.len() * 2);
+    for value in values {
+        let wide = *value as i128;
+        words.push(wide as u64);
+        words.push((wide >> 64) as u64);
+    }
+    commit_rows_with_openings(registry, &Digest([label; 32]), &[words]).unwrap()
+}
+
+fn manual_relation(
+    opcode: OpCode,
+    config: Vec<i64>,
+    inputs: Vec<(Vec<i64>, usize)>,
+    outputs: Vec<(Vec<i64>, usize)>,
+    raw: Option<Vec<i64>>,
+    aux: Vec<Vec<i64>>,
+) -> (OpRelationPublic, OpRelationProof) {
+    let mut registry = OracleRegistry::new();
+    let mut label = 40u8;
+    let mut input_oracles = Vec::new();
+    let mut input_openings = Vec::new();
+    let mut input_lengths = Vec::new();
+    for (values, width) in inputs {
+        let (oracle, openings) = width_group(&mut registry, label, &values, width);
+        label += 1;
+        input_oracles.push(oracle);
+        input_openings.push(openings);
+        input_lengths.push(values.len());
+    }
+    let mut output_oracles = Vec::new();
+    let mut output_openings = Vec::new();
+    let mut output_lengths = Vec::new();
+    for (values, width) in outputs {
+        let (oracle, openings) = width_group(&mut registry, label, &values, width);
+        label += 1;
+        output_oracles.push(oracle);
+        output_openings.push(openings);
+        output_lengths.push(values.len());
+    }
+    let mut raw_lengths = Vec::new();
+    let mut raw_openings = Vec::new();
+    if let Some(values) = raw {
+        let (_, openings) = wide_group(&mut registry, label, &values);
+        label += 1;
+        raw_lengths.push(values.len());
+        raw_openings.push(openings);
+    }
+    let mut aux_lengths = Vec::new();
+    let mut aux_openings = Vec::new();
+    for values in aux {
+        let (_, openings) = width_group(&mut registry, label, &values, 1);
+        label += 1;
+        aux_lengths.push(values.len());
+        aux_openings.push(openings);
+    }
+    let proof = OpRelationProof {
+        lengths: RelationLengths {
+            inputs: input_lengths,
+            outputs: output_lengths,
+            raw: raw_lengths,
+            quotients: Vec::new(),
+            helpers: Vec::new(),
+            aux: aux_lengths,
+        },
+        inputs: input_openings,
+        outputs: output_openings,
+        raw: raw_openings,
+        quotients: Vec::new(),
+        helpers: Vec::new(),
+        aux: aux_openings,
+    };
+    let public = OpRelationPublic {
+        opcode,
+        config: config.clone(),
+        registry,
+        input_oracles,
+        output_oracles,
+    };
+    (public, proof)
+}
+
+#[test]
+fn profile_rms_norm_square_overflow_is_rejected() {
+    let min = i64::MIN;
+    let (public, proof) = manual_relation(
+        OpCode::ProfileRmsNorm,
+        vec![1, 2, 2, 0],
+        vec![
+            (vec![min, min], 1),
+            (vec![1, 1], 2),
+            (vec![1], 1),
+        ],
+        vec![(vec![0, 0], 2)],
+        Some(vec![0, 0]),
+        vec![vec![0], vec![0]],
+    );
+    assert_eq!(verify_code(&public, &proof, &[1, 2, 2, 0]), "bound_violation");
+}
+
+#[test]
+fn profile_layer_norm_variance_overflow_is_rejected() {
+    let (public, proof) = manual_relation(
+        OpCode::ProfileLayerNorm,
+        vec![1, 2, 2, 0],
+        vec![
+            (vec![i64::MIN, i64::MAX], 1),
+            (vec![1, 1], 2),
+            (vec![0, 0], 2),
+            (vec![1], 1),
+        ],
+        vec![(vec![0, 0], 2)],
+        Some(vec![0, 0]),
+        vec![vec![0], vec![0], vec![0]],
+    );
+    assert_eq!(verify_code(&public, &proof, &[1, 2, 2, 0]), "bound_violation");
+}
+
+#[test]
+fn rope_projection_short_raw_is_rejected() {
+    let (public, proof) = manual_relation(
+        OpCode::RopeProjection,
+        vec![0],
+        vec![
+            (vec![1, 2, 3, 4], 1),
+            (vec![1, 1], 1),
+            (vec![0, 0], 1),
+        ],
+        vec![(vec![1, 2, 3, 4], 1)],
+        Some(vec![1, 2]),
+        Vec::new(),
+    );
+    assert_eq!(verify_code(&public, &proof, &[0]), "shape_mismatch");
+}
+
+#[test]
+fn unchecked_accumulation_branches_fail_closed() {
+    let min = i64::MIN;
+
+    let (public, proof) = manual_relation(
+        OpCode::BatchedMatMul,
+        vec![1, 1, 1, 2, 0],
+        vec![(vec![min, min], 2), (vec![min, min], 1)],
+        vec![(vec![0], 1)],
+        Some(vec![0]),
+        Vec::new(),
+    );
+    assert_eq!(
+        verify_code(&public, &proof, &[1, 1, 1, 2, 0]),
+        "bound_violation"
+    );
+
+    let (public, proof) = manual_relation(
+        OpCode::GatherMatMul,
+        vec![2, 1, 0],
+        vec![
+            (vec![min, min], 1),
+            (vec![0], 1),
+            (vec![min, min], 1),
+        ],
+        vec![(vec![0], 1)],
+        Some(vec![0]),
+        Vec::new(),
+    );
+    assert_eq!(verify_code(&public, &proof, &[2, 1, 0]), "bound_violation");
+
+    let (public, proof) = manual_relation(
+        OpCode::CausalAttention,
+        vec![1, 2, 0],
+        vec![
+            (vec![min, min], 1),
+            (vec![min, min], 1),
+            (vec![0, 0], 1),
+            (vec![1], 1),
+        ],
+        vec![(vec![0, 0], 1)],
+        Some(vec![0, 0]),
+        vec![vec![0], vec![0], vec![0]],
+    );
+    assert_eq!(verify_code(&public, &proof, &[1, 2, 0]), "bound_violation");
 }

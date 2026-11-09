@@ -1108,13 +1108,16 @@ pub fn verify_op_relation_with_external(
                 let mut mean = 0i128;
                 if layer_norm {
                     for index in 0..valid {
-                        mean += inputs[0][start + index] as i128;
+                        mean = mean
+                            .checked_add(inputs[0][start + index] as i128)
+                            .ok_or(Error::BoundViolation)?;
                     }
                     mean = mean.div_euclid(valid as i128);
                 } else {
                     for index in 0..valid {
                         let value = inputs[0][start + index] as i128;
-                        mean += value * value;
+                        let square = value.checked_mul(value).ok_or(Error::BoundViolation)?;
+                        mean = mean.checked_add(square).ok_or(Error::BoundViolation)?;
                     }
                     mean = mean.div_euclid(valid as i128);
                 }
@@ -1125,7 +1128,8 @@ pub fn verify_op_relation_with_external(
                 if layer_norm {
                     for index in 0..valid {
                         let centered = inputs[0][start + index] as i128 - mean;
-                        variance += centered * centered;
+                        let square = centered.checked_mul(centered).ok_or(Error::BoundViolation)?;
+                        variance = variance.checked_add(square).ok_or(Error::BoundViolation)?;
                     }
                     variance = variance.div_euclid(valid as i128).max(1);
                     if aux[1][row] as i128 != variance {
@@ -1168,7 +1172,7 @@ pub fn verify_op_relation_with_external(
                 return Err(Error::ShapeMismatch);
             }
             let pairs = inputs[0].len() / 2;
-            if inputs[1].len() != pairs || inputs[2].len() != pairs || outputs[0].len() != inputs[0].len() || raw.is_empty() {
+            if inputs[1].len() != pairs || inputs[2].len() != pairs || outputs[0].len() != inputs[0].len() || raw.is_empty() || raw[0].len() != inputs[0].len() {
                 return Err(Error::ShapeMismatch);
             }
             for pair in 0..pairs {
@@ -1329,8 +1333,12 @@ pub fn verify_op_relation_with_external(
                     for column in 0..n {
                         let mut expected = 0i128;
                         for inner in 0..k {
-                            expected += inputs[0][batch_index * m * k + row * k + inner] as i128
-                                * inputs[1][batch_index * k * n + inner * n + column] as i128;
+                            let term = (inputs[0][batch_index * m * k + row * k + inner] as i128)
+                                .checked_mul(
+                                    inputs[1][batch_index * k * n + inner * n + column] as i128,
+                                )
+                                .ok_or(Error::BoundViolation)?;
+                            expected = expected.checked_add(term).ok_or(Error::BoundViolation)?;
                         }
                         let slot = batch_index * m * n + row * n + column;
                         if raw[0][slot] != expected || rq(expected, shift)? != outputs[0][slot] as i128 {
@@ -1366,8 +1374,10 @@ pub fn verify_op_relation_with_external(
                 for column in 0..n {
                     let mut expected = 0i128;
                     for inner in 0..cols {
-                        expected += inputs[0][*index as usize * cols + inner] as i128
-                            * inputs[2][inner * n + column] as i128;
+                        let term = (inputs[0][*index as usize * cols + inner] as i128)
+                            .checked_mul(inputs[2][inner * n + column] as i128)
+                            .ok_or(Error::BoundViolation)?;
+                        expected = expected.checked_add(term).ok_or(Error::BoundViolation)?;
                     }
                     let position = slot * n + column;
                     if raw[0][position] != expected || rq(expected, shift)? != outputs[0][position] as i128 {
@@ -1504,10 +1514,22 @@ pub fn verify_op_relation_with_external(
                 let mut shared_raw = 0i128;
                 let mut routed_raw = 0i128;
                 for index in 0..width {
-                    shared_raw += inputs[0][index] as i128 * shared[index * out_cols + column] as i128;
-                    routed_raw += inputs[1][index] as i128 * routed[index * out_cols + column] as i128;
+                    let shared_term = (inputs[0][index] as i128)
+                        .checked_mul(shared[index * out_cols + column] as i128)
+                        .ok_or(Error::BoundViolation)?;
+                    shared_raw = shared_raw
+                        .checked_add(shared_term)
+                        .ok_or(Error::BoundViolation)?;
+                    let routed_term = (inputs[1][index] as i128)
+                        .checked_mul(routed[index * out_cols + column] as i128)
+                        .ok_or(Error::BoundViolation)?;
+                    routed_raw = routed_raw
+                        .checked_add(routed_term)
+                        .ok_or(Error::BoundViolation)?;
                 }
-                let total = shared_raw + routed_raw;
+                let total = shared_raw
+                    .checked_add(routed_raw)
+                    .ok_or(Error::BoundViolation)?;
                 if raw[0][column] != shared_raw
                     || raw[1][column] != routed_raw
                     || raw[2][column] != total
@@ -1575,12 +1597,18 @@ pub fn verify_op_relation_with_external(
             }
             for row in 0..rows {
                 let start = row * cols;
-                let sum: i128 = (0..valid).map(|index| inputs[0][start + index] as i128).sum();
+                let mut sum = 0i128;
+                for index in 0..valid {
+                    sum = sum
+                        .checked_add(inputs[0][start + index] as i128)
+                        .ok_or(Error::BoundViolation)?;
+                }
                 let mean = round_div_half_up(sum, valid as i128)?;
                 let mut squares = 0i128;
                 for index in 0..valid {
                     let centered = inputs[0][start + index] as i128 - mean;
-                    squares += centered * centered;
+                    let square = centered.checked_mul(centered).ok_or(Error::BoundViolation)?;
+                    squares = squares.checked_add(square).ok_or(Error::BoundViolation)?;
                 }
                 let variance = round_div_half_up(squares, valid as i128)?;
                 let variance_i64 = i64::try_from(variance).map_err(|_| Error::BoundViolation)?;
@@ -1678,7 +1706,8 @@ pub fn verify_op_relation_with_external(
                 let mut square = 0i128;
                 for index in 0..valid {
                     let value = inputs[0][start + index] as i128;
-                    square += value * value;
+                    let term = value.checked_mul(value).ok_or(Error::BoundViolation)?;
+                    square = square.checked_add(term).ok_or(Error::BoundViolation)?;
                 }
                 let mean_square = round_div_half_up(square, valid as i128)?;
                 let mean_square_i64 = i64::try_from(mean_square).map_err(|_| Error::BoundViolation)?;
@@ -1790,13 +1819,16 @@ pub fn verify_op_relation_with_external(
             let source = source_row * cols;
             let mut sum = 0i128;
             for index in 0..valid {
-                sum += inputs[0][source + index] as i128;
+                sum = sum
+                    .checked_add(inputs[0][source + index] as i128)
+                    .ok_or(Error::BoundViolation)?;
             }
             let mean = round_div_half_up(sum, valid as i128)?;
             let mut squares = 0i128;
             for index in 0..valid {
                 let centered = inputs[0][source + index] as i128 - mean;
-                squares += centered * centered;
+                let square = centered.checked_mul(centered).ok_or(Error::BoundViolation)?;
+                squares = squares.checked_add(square).ok_or(Error::BoundViolation)?;
             }
             let variance = round_div_half_up(squares, valid as i128)?;
             let variance_i64 = i64::try_from(variance).map_err(|_| Error::BoundViolation)?;
@@ -1880,8 +1912,10 @@ pub fn verify_op_relation_with_external(
                 for column in 0..=row {
                     let mut score = 0i128;
                     for index in 0..head_dim {
-                        score += inputs[0][row * head_dim + index] as i128
-                            * inputs[1][column * head_dim + index] as i128;
+                        let term = (inputs[0][row * head_dim + index] as i128)
+                            .checked_mul(inputs[1][column * head_dim + index] as i128)
+                            .ok_or(Error::BoundViolation)?;
+                        score = score.checked_add(term).ok_or(Error::BoundViolation)?;
                     }
                     scores.push(score);
                 }
@@ -1898,7 +1932,9 @@ pub fn verify_op_relation_with_external(
                     if entry < 0 {
                         return Err(Error::InvalidProof);
                     }
-                    denominator += entry as i128;
+                    denominator = denominator
+                        .checked_add(entry as i128)
+                        .ok_or(Error::BoundViolation)?;
                     u.push(entry);
                 }
                 if denominator == 0 || aux[2][row] as i128 != denominator {
@@ -1913,7 +1949,10 @@ pub fn verify_op_relation_with_external(
                 for index in 0..head_dim {
                     let mut numerator = 0i128;
                     for (column, entry) in u.iter().enumerate() {
-                        numerator += *entry as i128 * inputs[2][column * head_dim + index] as i128;
+                        let term = (*entry as i128)
+                            .checked_mul(inputs[2][column * head_dim + index] as i128)
+                            .ok_or(Error::BoundViolation)?;
+                        numerator = numerator.checked_add(term).ok_or(Error::BoundViolation)?;
                     }
                     let scaled = numerator.checked_mul(scale).ok_or(Error::BoundViolation)?;
                     let slot = row * head_dim + index;
