@@ -142,9 +142,112 @@ fn round_apply(w: &[Fp3], k: u32, variable: u32) -> Result<Fp3> {
         .add(&round_coefficient(w, k, variable, 2)?))
 }
 
-/// The prover's sumcheck rounds of the hiding polynomial U, with the FOLD
-/// mask/kept terms of one round. The main-row and mask-row polynomials of a
-/// round are supplied by the caller; their oracle-table construction is open.
+/// A small main-row table for the round arithmetic: coefficient and message
+/// rows in column-major order, folded once per variable. It is a test-sized
+/// stand-in for the actual oracle rows, which a production prover reads
+/// through its engine; its entries must come from that table, not from a free
+/// choice of polynomial.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoldMainTable {
+    pub coefficients: Vec<Fp3>,
+    pub messages: Vec<Fp3>,
+}
+
+impl FoldMainTable {
+    pub fn new(coefficients: Vec<Fp3>, messages: Vec<Fp3>) -> Result<Self> {
+        if coefficients.is_empty() || coefficients.len() != messages.len() {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(Self {
+            coefficients,
+            messages,
+        })
+    }
+
+    fn fold_low_once(&mut self, gamma: Fp3) -> Result<()> {
+        if self.coefficients.len() % 2 != 0 {
+            return Err(Error::InvalidConfig);
+        }
+        let rows = self.coefficients.len() / 2;
+        for index in 0..rows {
+            self.coefficients[index] = fold_pair(
+                self.coefficients[2 * index],
+                self.coefficients[2 * index + 1],
+                gamma,
+            );
+            self.messages[index] =
+                fold_pair(self.messages[2 * index], self.messages[2 * index + 1], gamma);
+        }
+        self.coefficients.truncate(rows);
+        self.messages.truncate(rows);
+        Ok(())
+    }
+
+    fn pair_products(&self) -> Result<[Fp3; 3]> {
+        pair_products(&self.coefficients, &self.messages)
+    }
+}
+
+fn fold_pair(low: Fp3, high: Fp3, gamma: Fp3) -> Fp3 {
+    low.add(&gamma.mul(&high.sub(&low)))
+}
+
+fn fold_low_once(values: &mut Vec<Fp3>, gamma: Fp3) -> Result<()> {
+    if values.len() % 2 != 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let rows = values.len() / 2;
+    for index in 0..rows {
+        values[index] = fold_pair(values[2 * index], values[2 * index + 1], gamma);
+    }
+    values.truncate(rows);
+    Ok(())
+}
+
+fn pair_products(a: &[Fp3], m: &[Fp3]) -> Result<[Fp3; 3]> {
+    if a.len() != m.len() || a.len() % 2 != 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let mut q = [Fp3::ZERO; 3];
+    for index in 0..a.len() / 2 {
+        let a0 = a[2 * index];
+        let a1 = a[2 * index + 1].sub(&a0);
+        let m0 = m[2 * index];
+        let m1 = m[2 * index + 1].sub(&m0);
+        q[0] = q[0].add(&a0.mul(&m0));
+        q[1] = q[1].add(&a0.mul(&m1).add(&a1.mul(&m0)));
+        q[2] = q[2].add(&a1.mul(&m1));
+    }
+    Ok(q)
+}
+
+fn inner(a: &[Fp3], b: &[Fp3]) -> Result<Fp3> {
+    if a.len() != b.len() {
+        return Err(Error::InvalidConfig);
+    }
+    let mut sum = Fp3::ZERO;
+    for (left, right) in a.iter().zip(b) {
+        sum = sum.add(&left.mul(right));
+    }
+    Ok(sum)
+}
+
+/// What is left of the mask rows when the rounds end: the old mask's
+/// coefficients (scaled), the folded old mask message and the folded fresh
+/// mask message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoldRoundEnd {
+    pub d: Vec<Fp3>,
+    pub mu: Vec<Fp3>,
+    pub fresh: Vec<Fp3>,
+}
+
+/// The prover's sumcheck rounds of the hiding polynomial U with FOLD's mask
+/// and kept terms. The mask term is rebuilt here from the old mask rows
+/// (`d`, `mu`), the fresh mask made from the coefficients, and `later`; the
+/// main term is the pair product of the actual main coefficient and message
+/// rows. This is the mathematical round shell: the oracle tables, group
+/// layout, statement and production channel are not wired.
 #[derive(Clone, Debug)]
 pub struct FoldRoundProver {
     k: u32,
@@ -157,13 +260,37 @@ pub struct FoldRoundProver {
     eps: Option<Fp3>,
     kept: Fp3,
     later: Fp3,
+    d: Vec<Fp3>,
+    mu: Vec<Fp3>,
+    fresh: Vec<Fp3>,
+    main: FoldMainTable,
+    folded_inner: Option<Fp3>,
 }
 
 impl FoldRoundProver {
-    pub fn new(k: u32, h: u32, coefficients: Vec<Fp3>, kept: Fp3) -> Result<Self> {
+    pub fn new(
+        k: u32,
+        h: u32,
+        coefficients: Vec<Fp3>,
+        d: Vec<Fp3>,
+        mu: Vec<Fp3>,
+        len_zk: usize,
+        main: FoldMainTable,
+        kept: Fp3,
+    ) -> Result<Self> {
         if k < 1 || h > k || coefficients.len() != 2 * k as usize + 1 {
             return Err(Error::InvalidConfig);
         }
+        let mask_entries = (1usize << h)
+            .checked_mul(len_zk)
+            .ok_or(Error::ResourceLimit)?;
+        if d.len() != mask_entries || mu.len() != mask_entries {
+            return Err(Error::InvalidConfig);
+        }
+        if main.coefficients.len() % (1usize << k) != 0 {
+            return Err(Error::InvalidConfig);
+        }
+        let fresh = fold_mask_table(k, h, len_zk, &coefficients)?;
         let two = Fp3::from_u64(2);
         let mut after = vec![Fp3::ZERO; k as usize];
         for variable in (0..(k as usize - 1)).rev() {
@@ -171,6 +298,11 @@ impl FoldRoundProver {
             after[variable] = own.add(&two.mul(&after[variable + 1]));
         }
         let sum = round_apply(&coefficients, k, 0)?.add(&two.mul(&after[0]));
+        let folded_inner = if h == 0 {
+            Some(inner(&d, &mu)?)
+        } else {
+            None
+        };
         Ok(Self {
             k,
             h,
@@ -182,6 +314,11 @@ impl FoldRoundProver {
             eps: None,
             kept,
             later: Fp3::ONE,
+            d,
+            mu,
+            fresh,
+            main,
+            folded_inner,
         })
     }
 
@@ -197,8 +334,6 @@ impl FoldRoundProver {
         Ok(())
     }
 
-    /// U's round polynomial for the current variable: three coefficients,
-    /// lowest degree first.
     fn u_round(&self) -> Result<[Fp3; 3]> {
         if self.next >= self.k {
             return Err(Error::InvalidSessionState);
@@ -214,10 +349,19 @@ impl FoldRoundProver {
         Ok(q)
     }
 
-    /// The round polynomial including the caller's main and mask parts and
-    /// the kept-row term. `eps` must have been started and one round remains.
-    pub fn round(&self, main: [Fp3; 3], mask: [Fp3; 3]) -> Result<[Fp3; 3]> {
+    /// The round polynomial: U's round plus eps times the main and mask
+    /// terms, with the kept-row term. `eps` must have been started.
+    pub fn round(&self) -> Result<[Fp3; 3]> {
         let eps = self.eps.ok_or(Error::InvalidSessionState)?;
+        let main = self.main.pair_products()?;
+        let mask = if self.next < self.h {
+            pair_products(&self.d, &self.mu)?
+        } else {
+            let folded_inner = self
+                .folded_inner
+                .ok_or(Error::InvalidSessionState)?;
+            [Fp3::ZERO, folded_inner.mul(&self.later), Fp3::ZERO]
+        };
         let mut q = self.u_round()?;
         for (coefficient, (main, mask)) in q.iter_mut().zip(main.iter().zip(&mask)) {
             *coefficient = coefficient.add(&eps.mul(&main.add(mask)));
@@ -241,8 +385,16 @@ impl FoldRoundProver {
                     .mul(&gamma.mul(&gamma)),
             );
         self.before = self.before.mul(&gamma).add(&value);
-        if variable >= self.h {
+        self.main.fold_low_once(gamma)?;
+        if variable < self.h {
+            fold_low_once(&mut self.d, gamma)?;
+            fold_low_once(&mut self.mu, gamma)?;
+            fold_low_once(&mut self.fresh, gamma)?;
+        } else {
             self.later = self.later.mul(&gamma);
+        }
+        if self.next + 1 == self.h {
+            self.folded_inner = Some(inner(&self.d, &self.mu)?);
         }
         self.kept = self.kept.mul(&Fp3::ONE.sub(&gamma));
         self.next += 1;
@@ -255,6 +407,20 @@ impl FoldRoundProver {
             return Err(Error::InvalidSessionState);
         }
         Ok(self.before)
+    }
+
+    /// The folded mask rows and the fresh mask at the end of the rounds.
+    pub fn end(&self) -> Result<FoldRoundEnd> {
+        if self.next != self.k {
+            return Err(Error::InvalidSessionState);
+        }
+        let eps = self.eps.ok_or(Error::InvalidSessionState)?;
+        let scale = eps.mul(&self.later);
+        Ok(FoldRoundEnd {
+            d: self.d.iter().map(|value| value.mul(&scale)).collect(),
+            mu: self.mu.clone(),
+            fresh: self.fresh.clone(),
+        })
     }
 
     pub fn next(&self) -> u32 {
@@ -290,11 +456,10 @@ impl FoldRoundVerifier {
     }
 }
 
-/// The prover's per-round self-check: the live coefficients must agree with
-/// the values regenerated from their draw numbers. Both sides advance with
-/// the same challenges, so a coefficient that was lost or overwritten is
-/// caught at the next round before its polynomial is sent.
-#[derive(Clone, Debug)]
+/// The prover's per-round self-check. The drawn side is not a caller's copy:
+/// every coefficient and every encoding-tail value is regenerated from its
+/// draw number through the numbered source, and the live side must agree with
+/// it before a round polynomial is returned.
 pub struct FoldRoundSession {
     live: FoldRoundProver,
     drawn: FoldRoundProver,
@@ -302,18 +467,63 @@ pub struct FoldRoundSession {
 
 impl FoldRoundSession {
     pub fn new(
-        k: u32,
-        h: u32,
-        coefficients: Vec<Fp3>,
-        drawn: Vec<Fp3>,
+        shape: &FoldShape,
+        mask: &FoldMask,
+        coins: &impl MaskCoins,
+        d: Vec<Fp3>,
+        mu: Vec<Fp3>,
+        main: FoldMainTable,
         kept: Fp3,
     ) -> Result<Self> {
-        if coefficients.len() != drawn.len() {
+        if mask.coefficients().len() != 2 * shape.k as usize + 1
+            || mask.draws().len() != mask.coefficients().len()
+        {
             return Err(Error::InvalidConfig);
         }
+        let mut drawn = Vec::with_capacity(mask.coefficients().len());
+        for (coefficient, number) in mask.coefficients().iter().zip(mask.draws()) {
+            if *number == NO_DRAW || coins.redraw(*number)? != *coefficient {
+                return Err(Error::InvalidProof);
+            }
+            drawn.push(coins.redraw(*number)?);
+        }
+        let tail = mask.tail().ok_or(Error::InvalidConfig)?;
+        let tail_rows = 1usize
+            .checked_shl(shape.h)
+            .ok_or(Error::InvalidConfig)?;
+        if tail.rows != tail_rows || tail.len != shape.mask_code.r as usize {
+            return Err(Error::ShapeMismatch);
+        }
+        if tail.values.len() != tail.rows * tail.len || tail.draws.len() != tail.values.len() {
+            return Err(Error::ShapeMismatch);
+        }
+        for (value, number) in tail.values.iter().zip(&tail.draws) {
+            if *number == NO_DRAW || coins.redraw(*number)? != *value {
+                return Err(Error::InvalidProof);
+            }
+        }
+        let len_zk = shape.mask_code.ell as usize;
         Ok(Self {
-            live: FoldRoundProver::new(k, h, coefficients, kept)?,
-            drawn: FoldRoundProver::new(k, h, drawn, kept)?,
+            live: FoldRoundProver::new(
+                shape.k,
+                shape.h,
+                mask.coefficients().to_vec(),
+                d.clone(),
+                mu.clone(),
+                len_zk,
+                main.clone(),
+                kept,
+            )?,
+            drawn: FoldRoundProver::new(
+                shape.k,
+                shape.h,
+                drawn,
+                d,
+                mu,
+                len_zk,
+                main,
+                kept,
+            )?,
         })
     }
 
@@ -322,9 +532,9 @@ impl FoldRoundSession {
         self.drawn.start(eps)
     }
 
-    pub fn round(&mut self, main: [Fp3; 3], mask: [Fp3; 3]) -> Result<[Fp3; 3]> {
-        let live = self.live.round(main, mask)?;
-        let drawn = self.drawn.round(main, mask)?;
+    pub fn round(&mut self) -> Result<[Fp3; 3]> {
+        let live = self.live.round()?;
+        let drawn = self.drawn.round()?;
         if live != drawn {
             return Err(Error::InvalidProof);
         }
@@ -2299,14 +2509,57 @@ mod tests {
         assert!(fold_mask_shape_fault(&bad).is_some());
     }
 
+    fn round_shape(k: u32, h: u32) -> FoldShape {
+        FoldShape {
+            code: build_code_plan(4, 8, 1).unwrap(),
+            mask_code: build_code_plan(3, 4, 1).unwrap(),
+            k,
+            h,
+            mask_leaf_class: 3,
+        }
+    }
+
+    fn small_mask(shape: &FoldShape) -> (FoldMask, TestMaskCoins) {
+        let mut coins = TestMaskCoins::new(Digest([11; 32]));
+        let mut mask = fold_mask_make(shape, &mut coins).unwrap();
+        fold_mask_make_tail(shape, &mut mask, &mut coins).unwrap();
+        (mask, coins)
+    }
+
+    fn zero_round_inputs(
+        shape: &FoldShape,
+    ) -> (Vec<Fp3>, Vec<Fp3>, FoldMainTable) {
+        let mask_entries = (1usize << shape.h) * shape.mask_code.ell as usize;
+        let main_entries = 1usize << shape.k;
+        (
+            vec![Fp3::ZERO; mask_entries],
+            vec![Fp3::ZERO; mask_entries],
+            FoldMainTable::new(vec![Fp3::ZERO; main_entries], vec![Fp3::ZERO; main_entries])
+                .unwrap(),
+        )
+    }
+
     #[test]
     fn fold_round_polynomials_reproduce_the_hiding_sum() {
         for k in 1..=3u32 {
+            let h = k;
+            let shape = round_shape(k, h);
+            let len_zk = shape.mask_code.ell as usize;
             let coefficients: Vec<Fp3> = (0..2 * k + 1)
                 .map(|index| Fp3::from_u64(10 + index as u64))
                 .collect();
-            let mut prover =
-                FoldRoundProver::new(k, k, coefficients.clone(), Fp3::ZERO).unwrap();
+            let (d, mu, main) = zero_round_inputs(&shape);
+            let mut prover = FoldRoundProver::new(
+                k,
+                h,
+                coefficients.clone(),
+                d,
+                mu,
+                len_zk,
+                main,
+                Fp3::ZERO,
+            )
+            .unwrap();
             assert_eq!(prover.sum(), fold_mask_sum(k, &coefficients).unwrap());
             let eps = Fp3::from_u64(7);
             prover.start(eps).unwrap();
@@ -2314,14 +2567,13 @@ mod tests {
             let mut transcript = FoldRoundTranscript::new(k, 7, b"fold-rounds").unwrap();
             transcript.draw_epsilon(b"start").unwrap();
             for _ in 0..k {
-                let q = prover
-                    .round([Fp3::ZERO; 3], [Fp3::ZERO; 3])
-                    .unwrap();
+                let q = prover.round().unwrap();
                 let gamma = transcript.draw_round(&q[0], &q[2]).unwrap();
                 verifier.round(q[0], q[2], gamma);
                 prover.bind(gamma).unwrap();
             }
             assert_eq!(verifier.claim(), prover.finish().unwrap());
+            assert!(prover.end().is_ok());
         }
     }
 
@@ -2350,59 +2602,139 @@ mod tests {
     }
 
     #[test]
-    fn fold_round_as_drawn_checks_after_each_round() {
-        let k = 3u32;
-        let coefficients: Vec<Fp3> = (0..2 * k + 1)
-            .map(|index| Fp3::from_u64(20 + index as u64))
-            .collect();
+    fn fold_round_main_table_is_folded_by_the_prover() {
+        let shape = round_shape(2, 2);
+        let len_zk = shape.mask_code.ell as usize;
+        let coefficients: Vec<Fp3> = (0..5).map(|index| Fp3::from_u64(30 + index)).collect();
+        let mask_entries = (1usize << shape.h) * len_zk;
+        let mut main = FoldMainTable::new(
+            (0..4).map(|index| Fp3::from_u64(40 + index)).collect(),
+            (0..4).map(|index| Fp3::from_u64(50 + index)).collect(),
+        )
+        .unwrap();
+        let mut prover = FoldRoundProver::new(
+            shape.k,
+            shape.h,
+            coefficients.clone(),
+            vec![Fp3::ZERO; mask_entries],
+            vec![Fp3::ZERO; mask_entries],
+            len_zk,
+            main.clone(),
+            Fp3::ZERO,
+        )
+        .unwrap();
+        let eps = Fp3::from_u64(7);
+        prover.start(eps).unwrap();
+        let target = inner(&main.coefficients, &main.messages).unwrap();
+        let mut verifier = FoldRoundVerifier::new(prover.sum(), eps, target);
+        let mut gammas = Vec::new();
+        for round in 0..shape.k {
+            let q = prover.round().unwrap();
+            let gamma = Fp3::from_u64(200 + round as u64);
+            verifier.round(q[0], q[2], gamma);
+            prover.bind(gamma).unwrap();
+            gammas.push(gamma);
+        }
+        for gamma in gammas {
+            fold_low_once(&mut main.coefficients, gamma).unwrap();
+            fold_low_once(&mut main.messages, gamma).unwrap();
+        }
+        let folded = inner(&main.coefficients, &main.messages).unwrap();
+        assert_eq!(
+            verifier.claim(),
+            prover.finish().unwrap().add(&eps.mul(&folded))
+        );
+    }
+
+    #[test]
+    fn fold_round_as_drawn_regenerates_coefficients_and_tail() {
+        let shape = round_shape(3, 3);
+        let (mask, coins) = small_mask(&shape);
+        let (d, mu, main) = zero_round_inputs(&shape);
         let eps = Fp3::from_u64(5);
         let draw = |round: u32| Fp3::from_u64(100 + round as u64);
         let mut session = FoldRoundSession::new(
-            k,
-            k,
-            coefficients.clone(),
-            coefficients.clone(),
+            &shape,
+            &mask,
+            &coins,
+            d.clone(),
+            mu.clone(),
+            main.clone(),
             Fp3::ZERO,
         )
         .unwrap();
         session.start(eps).unwrap();
-        for round in 0..k {
-            session
-                .round([Fp3::ZERO; 3], [Fp3::ZERO; 3])
-                .unwrap();
+        for round in 0..3 {
+            session.round().unwrap();
             session.bind(draw(round)).unwrap();
         }
         assert!(session.finish().is_ok());
 
-        // A coefficient lost or overwritten after round 0 is caught when its
-        // variable's round is computed, before that polynomial is sent.
+        // A coefficient lost after round 0 is caught when its variable's
+        // round is computed.
         let mut session = FoldRoundSession::new(
-            k,
-            k,
-            coefficients.clone(),
-            coefficients.clone(),
+            &shape,
+            &mask,
+            &coins,
+            d.clone(),
+            mu.clone(),
+            main.clone(),
             Fp3::ZERO,
         )
         .unwrap();
         session.start(eps).unwrap();
-        session
-            .round([Fp3::ZERO; 3], [Fp3::ZERO; 3])
-            .unwrap();
+        session.round().unwrap();
         session.bind(draw(0)).unwrap();
-        session.live.coefficients[hp_place(k, 1, 2).unwrap()] = Fp3::from_u64(777);
-        assert!(session
-            .round([Fp3::ZERO; 3], [Fp3::ZERO; 3])
-            .is_err());
-
-        // A coefficient that the first round already reads fails at once.
+        session.live.coefficients[hp_place(3, 1, 2).unwrap()] = Fp3::from_u64(777);
+        assert!(session.round().is_err());
         let mut session =
-            FoldRoundSession::new(k, k, coefficients.clone(), coefficients.clone(), Fp3::ZERO)
+            FoldRoundSession::new(&shape, &mask, &coins, d.clone(), mu.clone(), main.clone(), Fp3::ZERO)
                 .unwrap();
         session.start(eps).unwrap();
-        session.live.coefficients[hp_place(k, 0, 1).unwrap()] = Fp3::from_u64(888);
-        assert!(session
-            .round([Fp3::ZERO; 3], [Fp3::ZERO; 3])
-            .is_err());
-        assert!(FoldRoundSession::new(1, 1, vec![Fp3::ZERO; 2], vec![], Fp3::ZERO).is_err());
+        session.live.coefficients[hp_place(3, 0, 1).unwrap()] = Fp3::from_u64(888);
+        assert!(session.round().is_err());
+
+        // A wrong source, an overwritten coefficient and a tampered tail are
+        // each rejected before any round.
+        let other = TestMaskCoins::new(Digest([12; 32]));
+        assert!(FoldRoundSession::new(
+            &shape,
+            &mask,
+            &other,
+            d.clone(),
+            mu.clone(),
+            main.clone(),
+            Fp3::ZERO,
+        )
+        .is_err());
+        let mut same_source = TestMaskCoins::new(Digest([11; 32]));
+        let mut wrong_copy = fold_mask_make(&shape, &mut same_source).unwrap();
+        fold_mask_make_tail(&shape, &mut wrong_copy, &mut same_source).unwrap();
+        wrong_copy.coefficients[0] = wrong_copy.coefficients[0].add(&Fp3::ONE);
+        assert!(FoldRoundSession::new(
+            &shape,
+            &wrong_copy,
+            &same_source,
+            d.clone(),
+            mu.clone(),
+            main.clone(),
+            Fp3::ZERO,
+        )
+        .is_err());
+        let mut same_source = TestMaskCoins::new(Digest([11; 32]));
+        let mut tampered = fold_mask_make(&shape, &mut same_source).unwrap();
+        fold_mask_make_tail(&shape, &mut tampered, &mut same_source).unwrap();
+        tampered.tail.as_mut().unwrap().values[0] =
+            tampered.tail().unwrap().values[0].add(&Fp3::ONE);
+        assert!(FoldRoundSession::new(
+            &shape,
+            &tampered,
+            &same_source,
+            d,
+            mu,
+            main,
+            Fp3::ZERO,
+        )
+        .is_err());
     }
 }
