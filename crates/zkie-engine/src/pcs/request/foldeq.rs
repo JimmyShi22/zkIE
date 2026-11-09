@@ -2963,6 +2963,23 @@ mod tests {
     }
 
     #[test]
+    fn fold_session_fixes_input_before_epsilon() {
+        let (mut session, _table, start, _mask, _source) = fold_open_prestart();
+        let (row, _, _, _) = fold_fixture(session.plan(), 1);
+        session.fold_bind_row(row.clone()).unwrap();
+        assert!(session.fold_bind_row(row.clone()).is_err());
+        session.start_fold(&start.message).unwrap();
+        let mut changed_coefficients = row.clone();
+        changed_coefficients.coefficients[0] =
+            changed_coefficients.coefficients[0].add(&Fp3::ONE);
+        assert!(session.fold_bind_row(changed_coefficients).is_err());
+        let mut changed_target = row.clone();
+        changed_target.target = changed_target.target.add(&Fp3::ONE);
+        assert!(session.fold_bind_row(changed_target).is_err());
+        session.fold_rounds_start().unwrap();
+    }
+
+    #[test]
     fn fold_session_wrong_group_layout_or_shape_is_rejected() {
         let (mut session, _table, _start, _mask, _source) = fold_open_prestart();
         let (row, _, _, _) = fold_fixture(session.plan(), 1);
