@@ -1,0 +1,48 @@
+warning: unused variable: `k_step`
+   --> models/gpt2/src/executor.rs:346:21
+    |
+346 |             let (k, k_step) = {
+    |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_step`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `m`
+   --> models/gemma3/src/executor.rs:277:5
+    |
+277 |     m: usize,
+    |     ^ help: if this is intentional, prefix it with an underscore: `_m`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_rot_step`
+   --> models/gemma3/src/executor.rs:390:21
+    |
+390 |         let (k_rot, k_rot_step) = rope(&mut builder, k, k_step, cos_prefix.clone(), sin_prefix.clone(), m)?;
+    |                     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_rot_step`
+
+warning: `zkie-models-gpt2` (lib) generated 1 warning (run `cargo fix --lib -p zkie-models-gpt2` to apply 1 suggestion)
+warning: `zkie-models-gemma3` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gemma3` to apply 2 suggestions)
+   Compiling zkie v0.1.0 (/data/zkIE/zkie)
+    Finished `release` profile [optimized] target(s) in 0.30s
+     Running tests/verify_bytes.rs (target/release/deps/verify_bytes-ec2d38089de2c0dc)
+
+running 1 test
+test saved_len_restores_a_nonzero_tail_byte ... FAILED
+
+failures:
+
+---- saved_len_restores_a_nonzero_tail_byte stdout ----
+
+thread 'saved_len_restores_a_nonzero_tail_byte' (1516833) panicked at zkie/tests/verify_bytes.rs:232:5:
+assertion `left == right` failed: nonzero tail byte was not restored
+  left: "d156028490cbfa64e75a20588e6d03361f4275e46e72e2e9768f33652f6ad53b"
+ right: "c33c6e9c3e87cd5de1f3c97d62b6fbe403eaa234feb02f2a838cd1c4b3e76f23"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    saved_len_restores_a_nonzero_tail_byte
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p zkie --test verify_bytes`

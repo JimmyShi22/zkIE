@@ -11,16 +11,22 @@
 //! - `policy.toml`, `model-id.txt`
 //!
 //! Each test works on a private copy and restores every mutation before the
-//! next assertion, so the source fixture is never modified.
+//! next assertion, so the source fixture is never modified. The proof truncation
+//! saves the removed tail byte and writes it back at the same offset; a SHA-256
+//! comparison before and after the proof mutation checks that the restored file
+//! is byte-identical, including when the last byte is nonzero.
 
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{BufReader, Read, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use zkie_core::artifact::{digest_bytes_chunks, digest_to_hex};
 use zkie_core::error::Error;
 use zkie_core::progress::RunOutcome;
+use zkie_core::types::Digest;
 use zkie_ops::pipeline::VerifyReceipt;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -168,8 +174,76 @@ fn with_saved_bytes<F: FnOnce(&Path)>(path: &Path, action: F) {
 
 fn with_saved_len<F: FnOnce(&Path, u64)>(path: &Path, action: F) {
     let original = fs::metadata(path).unwrap().len();
+    let mut last = [0u8; 1];
+    if original > 0 {
+        let read = fs::File::open(path)
+            .unwrap()
+            .read_at(&mut last, original - 1)
+            .unwrap();
+        assert_eq!(read, 1);
+    }
     action(path, original);
     set_len(path, original);
+    if original > 0 {
+        let written = fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .write_at(&last, original - 1)
+            .unwrap();
+        assert_eq!(written, 1);
+    }
+}
+
+struct FileChunks {
+    reader: BufReader<fs::File>,
+}
+
+impl Iterator for FileChunks {
+    type Item = Vec<u8>;
+
+    fn next(&mut self) -> Option<Vec<u8>> {
+        let mut chunk = vec![0u8; 1 << 20];
+        let mut filled = 0;
+        while filled < chunk.len() {
+            match self.reader.read(&mut chunk[filled..]).unwrap() {
+                0 => break,
+                read => filled += read,
+            }
+        }
+        if filled == 0 {
+            None
+        } else {
+            chunk.truncate(filled);
+            Some(chunk)
+        }
+    }
+}
+
+fn file_digest(path: &Path) -> Digest {
+    digest_bytes_chunks(FileChunks {
+        reader: BufReader::new(fs::File::open(path).unwrap()),
+    })
+}
+
+#[test]
+fn saved_len_restores_a_nonzero_tail_byte() {
+    let root = temp_dir("restore");
+    let path = root.join("tail.bin");
+    let original = vec![0x11u8, 0x22, 0x33, 0xab];
+    fs::write(&path, &original).unwrap();
+    let before = file_digest(&path);
+    with_saved_len(&path, |path, original_len| {
+        set_len(path, original_len - 1);
+    });
+    let after = file_digest(&path);
+    assert_eq!(
+        digest_to_hex(&before),
+        digest_to_hex(&after),
+        "nonzero tail byte was not restored"
+    );
+    assert_eq!(fs::read(&path).unwrap(), original);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -201,12 +275,19 @@ fn production_verify_rejects_trailing_and_truncated_artifacts() {
     });
 
     let proof = fixture.path("proof.bin");
+    let proof_before = file_digest(&proof);
     with_saved_len(&proof, |path, original| {
         append_one(path);
         fixture.assert_rejected("invalid_proof");
         set_len(path, original - 1);
         fixture.assert_rejected("invalid_encoding");
     });
+    let proof_after = file_digest(&proof);
+    assert_eq!(
+        digest_to_hex(&proof_before),
+        digest_to_hex(&proof_after),
+        "proof content changed across mutation and restore"
+    );
     fixture.assert_accepted();
 
     let backup = fixture.path("proof.bin.legal");

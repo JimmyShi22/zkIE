@@ -3,6 +3,25 @@
 Trace of the exact-byte-consumption hardening of the production verify entry,
 with a full three-stage rerun on all five validation cases.
 
+## Round 2 corrections
+
+Expert review returned three items; this section supersedes the matching text
+below.
+
+- F1: the proof truncation now saves the removed tail byte and writes it back at
+  the same offset, and the proof mutation block records a SHA-256 before and
+  after and asserts equality. A separate non-ignored test covers a nonzero tail
+  byte. Both multi-GiB integration tests were rerun and the workspace is green.
+- F2: the baseline prove values for `gemma3-seq16`, `gemma3-seq512` and
+  `timesfm-16patch` were corrected to the `b4af4698` result files (45,222,
+  419,974, 35,380). The earlier 45,076 / 417,040 / 35,308 came from a different
+  baseline and are removed. Every baseline cell now names the `b4af4698` round
+  and the per-case `result.json` files; both sides are single measurements.
+- F3: "proof bytes identical" is corrected to "proof byte counts identical".
+  The previous proof files were deleted, so no proof content-digest comparison
+  is claimed. Authenticated output digest equality is retained because those
+  digests are recorded in the previous result files.
+
 ## Change
 
 Code commit `109934bd` ("Require exact byte consumption in production
@@ -40,22 +59,27 @@ The full five-case set is the required validation set for this change.
 All five cases ran commit, prove and verify once on the HEAD binary
 (`sha256 58491fc2d11b08fb3bc232b4d5effeeaf84526675f35db188bb915a461303823`).
 Every stage returned `PASS`; every verify ran with output binding `expected`.
-The baseline is the single-run table in the previous three-stage trace
-(`b4af4698`).
+The baseline for every row is the single run stored in
+`docs/benchmarks/20261109-0908-oracle-ports-b4af4698-eaae60b0/prod/<case>/prove/result.json`
+and the matching `verify/result.json` under the same case (commit `b4af4698`).
+No warm median and no other round is used. Both this run and the baseline are
+single measurements; this trace makes no claim about three warm-run variance.
 
-| case | commit ms | prove ms | baseline prove ms | verify ms | baseline verify ms | proof bytes | baseline proof bytes | prove VmHWM KiB | verify VmHWM KiB | baseline verify VmHWM KiB |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| gpt2-seq16 | 3,449 | 21,835 | 21,710 | 25,145 | 25,202 | 4,161,786,553 | 4,161,786,553 | 8,316,292 | 5,391,180 | 5,405,436 |
-| gpt2-seq512 | 3,436 | 167,596 | 166,840 | 234,055 | 232,603 | 38,992,550,944 | 38,992,550,944 | 78,571,136 | 47,036,836 | 47,018,280 |
-| gemma3-seq16 | 9,828 | 45,430 | 45,076 | 45,336 | 45,736 | 8,766,306,050 | 8,766,306,050 | 17,523,544 | 13,351,300 | 13,350,856 |
-| gemma3-seq512 | 9,713 | 419,204 | 417,040 | 821,930 | 831,845 | 101,812,159,615 | 101,812,159,615 | 207,848,880 | 120,673,912 | 120,691,540 |
-| timesfm-16patch | 5,548 | 35,506 | 35,308 | 42,979 | 43,423 | 6,865,533,616 | 6,865,533,616 | 13,822,988 | 7,322,900 | 7,322,308 |
+| case | commit ms | prove ms | baseline prove ms | verify ms | baseline verify ms | proof bytes | baseline proof bytes | prove VmHWM KiB | baseline prove VmHWM KiB | verify VmHWM KiB | baseline verify VmHWM KiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| gpt2-seq16 | 3,449 | 21,835 | 21,710 | 25,145 | 25,202 | 4,161,786,553 | 4,161,786,553 | 8,316,292 | 8,317,232 | 5,391,180 | 5,405,436 |
+| gpt2-seq512 | 3,436 | 167,596 | 166,840 | 234,055 | 232,603 | 38,992,550,944 | 38,992,550,944 | 78,571,136 | 78,570,220 | 47,036,836 | 47,018,280 |
+| gemma3-seq16 | 9,828 | 45,430 | 45,222 | 45,336 | 45,736 | 8,766,306,050 | 8,766,306,050 | 17,523,544 | 17,523,512 | 13,351,300 | 13,350,856 |
+| gemma3-seq512 | 9,713 | 419,204 | 419,974 | 821,930 | 831,845 | 101,812,159,615 | 101,812,159,615 | 207,848,880 | 207,849,064 | 120,673,912 | 120,691,540 |
+| timesfm-16patch | 5,548 | 35,506 | 35,380 | 42,979 | 43,423 | 6,865,533,616 | 6,865,533,616 | 13,822,988 | 13,824,016 | 7,322,900 | 7,322,308 |
 
-Proof bytes are identical to the baseline for every case. Verify wall time
-moves between -1.192% and +0.624%; prove wall time between +0.453% and +0.785%.
-Verify VmHWM moves between -0.264% and +0.039%. No byte growth and no memory
-rise beyond measurement noise were observed. Total three-stage wall time was
-1,891 s across the five cases (`full3.txt`).
+Proof byte counts are identical to the baseline for every case; the previous
+proof files were deleted, so no proof content-digest comparison is claimed.
+Verify wall time moves between -1.192% and +0.624%; prove wall time between
+-0.183% and +0.576%. Prove VmHWM moves between -0.011% and +0.001%; verify
+VmHWM between -0.264% and +0.040%. No byte growth and no memory rise beyond
+measurement noise were observed. Total three-stage wall time was 1,891 s across
+the five cases (`full3.txt`).
 
 Authenticated output digests (all equal to the baseline):
 
@@ -78,7 +102,12 @@ subdirectory holding `public/model-commitment.bin`, `statement.bin`,
 copies the files to a private directory, mutates the copy, runs the full
 production verify entry, and restores the file before the next mutation; the
 source fixture is never modified. The legal artifact is accepted at the start
-and at the end of each test.
+and at the end of each test. For the proof file the truncation saves the removed
+tail byte and writes it back at the same offset; the mutation block records a
+SHA-256 before and after and asserts equality. A separate non-ignored test,
+`saved_len_restores_a_nonzero_tail_byte`, truncates a four-byte file ending in
+`0xab` and checks the restored digest and content, so the nonzero-tail case does
+not depend on the proof fixture's last byte.
 
 Commands (release test build, one test thread):
 
@@ -89,8 +118,10 @@ ZKIE_VERIFY_FIXTURE=<fixture> cargo test --release -p zkie --test verify_bytes \
   -- --ignored --test-threads=1 production_verify_rejects_malformed_public_inputs
 ```
 
-Both passed: `tests/verify-bytes-artifacts.txt`,
-`tests/verify-bytes-public-inputs.txt`.
+Both passed in round 2: `tests/r2-verify-bytes-artifacts.txt`,
+`tests/r2-verify-bytes-public-inputs.txt`, and the final combined run
+`tests/r2-verify-bytes-both.txt`. Round 1 logs remain in the directory; the
+round 2 logs supersede them.
 
 Observed categories through the production verify entry:
 
@@ -129,21 +160,24 @@ three-stage table above.
 
 ## Injections
 
-Both new gates were removed in turn, the named tests were run, and the gate was
-restored; the restore run passed again.
+The two byte gates and the proof tail write-back were removed in turn, the
+named tests were run, and each change was restored; every restore run passed
+again.
 
 | injected omission | failing tests | log |
 | --- | --- | --- |
 | proof end-of-input check removed | `provider::tests::proof_bincode_requires_eof` failed with an `Ok` value; `production_verify_rejects_trailing_and_truncated_artifacts` failed with `expected rejection invalid_proof, got accepted=true` | `tests/injection-eof-unit-fail.txt`, `tests/injection-eof-integration-fail.txt` |
 | cursor-position check removed from exact deserialization | `provider::tests::exact_bincode_rejects_trailing_and_truncation` failed; the integration test accepted the trailing statement | `tests/injection-exact-unit-and-integration-fail.txt` |
+| proof tail write-back removed | `saved_len_restores_a_nonzero_tail_byte` failed with a SHA-256 mismatch | `tests/injection-restore-tail-fail.txt` |
 
 Restore logs: `tests/injection-eof-restore.txt`,
-`tests/injection-exact-restore.txt`.
+`tests/injection-exact-restore.txt`, `tests/injection-restore-tail-restore.txt`.
 
 ## Workspace gate
 
-`cargo test --workspace` on `109934bd`: 356 passed, 0 failed, 2 ignored (the two
-multi-GiB artifact tests above). Log: `logs/cargo-test.txt`.
+`cargo test --workspace` on the round 2 code state: 357 passed, 0 failed, 2
+ignored (the two multi-GiB artifact tests above). Log:
+`logs/cargo-test-r2.txt`. The round 1 log `logs/cargo-test.txt` is retained.
 
 ## Artifacts
 
@@ -151,8 +185,11 @@ multi-GiB artifact tests above). Log: `logs/cargo-test.txt`.
   and every stage result.
 - `prod/<case>/`: commit, proof and verify run directories with `result.json`
   and `progress.jsonl`; commit and proof manifests; policy and parameters.
-- `tests/`: both integration test logs and the injection logs.
-- `logs/cargo-test.txt`: full workspace test log.
+- `tests/`: both integration test logs and the injection logs. Round 1 logs are
+  retained; the round 2 `r2-*` logs and `injection-restore-tail-*` logs are the
+  current evidence.
+- `logs/cargo-test.txt`: round 1 workspace test log.
+- `logs/cargo-test-r2.txt`: round 2 workspace test log.
 - The five `proof.bin` files (150 GiB total) remain on disk under
   `prod/<case>/proof/` and are gitignored. No binary artifact was deleted in
   this round and no previous binary cleanup is claimed here.
@@ -166,6 +203,9 @@ multi-GiB artifact tests above). Log: `logs/cargo-test.txt`.
   executed logs are committed here.
 - A proof path that is a directory is rejected during deserialization with
   `invalid_encoding`; the post-deserialization I/O branch is unit-tested only.
+- The multi-GiB proof fixture's last byte is zero; the nonzero-tail restore path
+  is covered by the synthetic `saved_len_restores_a_nonzero_tail_byte` test, not
+  by the proof fixture's byte value.
 - Public-input verify-entry negatives use the Argmax case; IntOutput width
   semantics are unit-tested and the Int32 path is validated end to end by the
   timesfm case.
