@@ -660,25 +660,11 @@ fn materialize<'a>(
             Ok(Materialized::Owned(Rc::new(out)))
         }
         PlanSource::HeadConcat { parts, rows } => {
-            if *rows == 0 || parts.is_empty() {
-                return Err(Error::ShapeMismatch);
-            }
             let mut values = Vec::with_capacity(parts.len());
             for part in parts {
-                let part = materialize(part, verified_outputs, assets, tokens)?;
-                if part.len() % rows != 0 {
-                    return Err(Error::ShapeMismatch);
-                }
-                values.push(part);
+                values.push(materialize(part, verified_outputs, assets, tokens)?);
             }
-            let head_dim = values[0].len() / rows;
-            let mut out = Vec::with_capacity(values.len() * values[0].len());
-            for row in 0..*rows {
-                for part in &values {
-                    out.extend_from_slice(&part[row * head_dim..(row + 1) * head_dim]);
-                }
-            }
-            Ok(Materialized::Owned(Rc::new(out)))
+            Ok(Materialized::Owned(Rc::new(head_concat(&values, *rows)?)))
         }
         PlanSource::Layout(inner, layout) => {
             if matches!(layout, PlanLayout::Flat) {
@@ -688,6 +674,26 @@ fn materialize<'a>(
             Ok(Materialized::Owned(Rc::new(layout.apply(&values)?)))
         }
     }
+}
+
+/// Per-row concatenation of equally shaped parts. Any length disagreement is
+/// rejected before slicing, so a short part cannot index out of bounds.
+fn head_concat(parts: &[Materialized<'_>], rows: usize) -> Result<Vec<i64>> {
+    if rows == 0 || parts.is_empty() {
+        return Err(Error::ShapeMismatch);
+    }
+    let len = parts[0].len();
+    if len % rows != 0 || parts.iter().any(|part| part.len() != len) {
+        return Err(Error::ShapeMismatch);
+    }
+    let head_dim = len / rows;
+    let mut out = Vec::with_capacity(parts.len() * len);
+    for row in 0..rows {
+        for part in parts {
+            out.extend_from_slice(&part[row * head_dim..(row + 1) * head_dim]);
+        }
+    }
+    Ok(out)
 }
 
 enum SourceKind {
@@ -729,12 +735,13 @@ fn external_flat_path(source: &PlanSource) -> Option<&str> {
     }
 }
 
-pub(crate) fn verify_step(
+/// Check the step structure against the trusted plan. This runs before any
+/// relation verification consumes proof ports, so port counts, config and
+/// external/source maps are trusted-plan constrained first.
+pub(crate) fn verify_step_structure(
     step: &SharedTraceStep,
     plan_step: &PlanStep,
-    verified_outputs: &[Vec<Vec<i64>>],
     assets: &AssetView<'_>,
-    tokens: &[u32],
 ) -> Result<()> {
     if plan_step.opcode as u16 != step.message.opcode {
         return Err(Error::StatementMismatch);
@@ -754,6 +761,19 @@ pub(crate) fn verify_step(
     if output_count != plan_step.outputs || step.message.proof.outputs.len() != output_count {
         return Err(Error::ShapeMismatch);
     }
+    Ok(())
+}
+
+pub(crate) fn verify_step(
+    step: &SharedTraceStep,
+    plan_step: &PlanStep,
+    verified_outputs: &[Vec<Vec<i64>>],
+    assets: &AssetView<'_>,
+    tokens: &[u32],
+) -> Result<()> {
+    verify_step_structure(step, plan_step, assets)?;
+    let input_count = step.message.proof.lengths.inputs.len();
+    let output_count = step.message.proof.lengths.outputs.len();
     let inputs = proof_input_values(&step.message.proof)?;
     if inputs.len() != input_count {
         return Err(Error::ShapeMismatch);
@@ -954,5 +974,24 @@ mod tests {
         let keys = cache_keys(&plan);
         assert!(keys.contains(&("reused.bin".to_owned(), PlanLayout::Flat)));
         assert!(!keys.contains(&("once.bin".to_owned(), PlanLayout::Flat)));
+    }
+
+    #[test]
+    fn head_concat_rejects_mismatched_part_lengths() {
+        let first = vec![1i64, 2, 3, 4];
+        let short = vec![5i64, 6];
+        let parts = [Materialized::Slice(&first), Materialized::Slice(&short)];
+        assert!(matches!(head_concat(&parts, 2), Err(Error::ShapeMismatch)));
+
+        let long = vec![5i64, 6, 7, 8, 9, 10];
+        let parts = [Materialized::Slice(&first), Materialized::Slice(&long)];
+        assert!(matches!(head_concat(&parts, 2), Err(Error::ShapeMismatch)));
+
+        let second = vec![5i64, 6, 7, 8];
+        let parts = [Materialized::Slice(&first), Materialized::Slice(&second)];
+        assert_eq!(
+            head_concat(&parts, 2).unwrap(),
+            vec![1, 2, 5, 6, 3, 4, 7, 8]
+        );
     }
 }

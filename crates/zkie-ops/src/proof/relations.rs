@@ -582,8 +582,12 @@ fn verify_group(
         return Err(Error::ShapeMismatch);
     }
     let data_rows = (len / width) as u64;
-    if data_rows > count {
-        return Err(Error::ShapeMismatch);
+    let expected = data_rows
+        .max(1)
+        .checked_next_power_of_two()
+        .ok_or(Error::ResourceLimit)?;
+    if count != expected {
+        return Err(Error::StatementMismatch);
     }
     let depth = count.trailing_zeros() as usize;
     for (position, opening) in openings.iter().enumerate() {
@@ -696,6 +700,14 @@ pub fn verify_op_relation_with_config(
     verify_op_relation_with_external(public, proof, expected_config, &[])
 }
 
+/// Number of output tensors every relation of this opcode produces.
+fn output_tensor_count(opcode: OpCode) -> usize {
+    match opcode {
+        OpCode::KvCache => 2,
+        _ => 1,
+    }
+}
+
 /// Verify a relation where selected inputs must be supplied from an already
 /// authenticated shared model opening.
 pub fn verify_op_relation_with_external(
@@ -713,6 +725,9 @@ pub fn verify_op_relation_with_external(
         || public.input_oracles.len() != proof.lengths.inputs.len()
         || public.output_oracles.len() != proof.lengths.outputs.len()
     {
+        return Err(Error::ShapeMismatch);
+    }
+    if proof.inputs.is_empty() || proof.outputs.len() != output_tensor_count(public.opcode) {
         return Err(Error::ShapeMismatch);
     }
     let input_widths = input_widths(public.opcode, &public.config, &proof.lengths.inputs);
@@ -905,7 +920,7 @@ pub fn verify_op_relation_with_external(
                 || inputs[0].len() != m * k
                 || inputs[1].len() != k * n
                 || outputs[0].len() != m * n
-                || raw[0].len() != m * n
+                || raw.is_empty() || raw[0].len() != m * n
             {
                 return Err(Error::ShapeMismatch);
             }
@@ -951,7 +966,7 @@ pub fn verify_op_relation_with_external(
         }
         OpCode::Softmax => {
             let shift = *config.first().ok_or(Error::InvalidConfig)? as u32;
-            if inputs.len() != 2 || inputs[0].is_empty() || outputs[0].len() != inputs[0].len() {
+            if inputs.len() != 2 || inputs[0].is_empty() || raw.is_empty() || outputs[0].len() != inputs[0].len() {
                 return Err(Error::ShapeMismatch);
             }
             let length = inputs[0].len();
@@ -993,7 +1008,7 @@ pub fn verify_op_relation_with_external(
                 || inputs[0].len() != count
                 || inputs[1].is_empty()
                 || outputs[0].len() != count
-                || raw[0].len() != count
+                || raw.is_empty() || raw[0].len() != count
                 || aux.len() != 2
                 || aux[0].len() != rows
                 || aux[1].len() != rows
@@ -1051,7 +1066,7 @@ pub fn verify_op_relation_with_external(
                 || inputs[0].len() != rows * cols
                 || inputs[1].len() != rows * cols
                 || outputs[0].len() != rows * cols
-                || raw[0].len() != rows * cols
+                || raw.is_empty() || raw[0].len() != rows * cols
             {
                 return Err(Error::ShapeMismatch);
             }
@@ -1131,7 +1146,7 @@ pub fn verify_op_relation_with_external(
                 return Err(Error::ShapeMismatch);
             }
             let pairs = inputs[0].len() / 2;
-            if inputs[1].len() != pairs || inputs[2].len() != pairs || outputs[0].len() != inputs[0].len() {
+            if inputs[1].len() != pairs || inputs[2].len() != pairs || outputs[0].len() != inputs[0].len() || raw.is_empty() {
                 return Err(Error::ShapeMismatch);
             }
             for pair in 0..pairs {
@@ -1253,7 +1268,7 @@ pub fn verify_op_relation_with_external(
                 || inputs[0].len() != batch * m * k
                 || inputs[1].len() != batch * k * n
                 || outputs[0].len() != batch * m * n
-                || raw[0].len() != batch * m * n
+                || raw.is_empty() || raw[0].len() != batch * m * n
             {
                 return Err(Error::ShapeMismatch);
             }
@@ -1281,7 +1296,7 @@ pub fn verify_op_relation_with_external(
                 return Err(Error::ShapeMismatch);
             }
             let rows = inputs[0].len() / cols;
-            if outputs[0].len() != inputs[1].len() * n || raw[0].len() != inputs[1].len() * n {
+            if outputs[0].len() != inputs[1].len() * n || raw.is_empty() || raw[0].len() != inputs[1].len() * n {
                 return Err(Error::ShapeMismatch);
             }
             for (slot, index) in inputs[1].iter().enumerate() {
@@ -1326,7 +1341,7 @@ pub fn verify_op_relation_with_external(
         }
         OpCode::Hadamard | OpCode::GatedFfn => {
             let shift = *config.first().ok_or(Error::InvalidConfig)? as u32;
-            if inputs.len() != 2 || inputs[0].len() != inputs[1].len() || outputs[0].len() != inputs[0].len() || raw[0].len() != inputs[0].len() {
+            if inputs.len() != 2 || inputs[0].len() != inputs[1].len() || outputs[0].len() != inputs[0].len() || raw.is_empty() || raw[0].len() != inputs[0].len() {
                 return Err(Error::ShapeMismatch);
             }
             for index in 0..inputs[0].len() {
@@ -1357,7 +1372,16 @@ pub fn verify_op_relation_with_external(
             }
         }
         OpCode::DivRound => {
-            if inputs.len() != 2 || inputs[0].len() != inputs[1].len() || outputs[0].len() != 2 * inputs[0].len() || quotients.len() != 1 {
+            let doubled = inputs[0]
+                .len()
+                .checked_mul(2)
+                .ok_or(Error::ShapeMismatch)?;
+            if inputs.len() != 2
+                || inputs[0].len() != inputs[1].len()
+                || outputs[0].len() != doubled
+                || quotients.len() != 1
+                || quotients[0].len() != inputs[0].len()
+            {
                 return Err(Error::ShapeMismatch);
             }
             for index in 0..inputs[0].len() {
@@ -1402,7 +1426,7 @@ pub fn verify_op_relation_with_external(
                 || inputs[1].len() != width
                 || outputs[0].len() != out_cols
                 || raw.len() != 3
-                || raw[0].len() != out_cols
+                || raw.is_empty() || raw[0].len() != out_cols
                 || raw[1].len() != out_cols
                 || raw[2].len() != out_cols
             {
@@ -1474,7 +1498,7 @@ pub fn verify_op_relation_with_external(
                 || inputs[2].len() != rows * cols
                 || inputs[3].is_empty()
                 || outputs[0].len() != rows * cols
-                || raw[0].len() != rows * cols
+                || raw.is_empty() || raw[0].len() != rows * cols
                 || aux.len() != 3
                 || aux[0].len() != rows
                 || aux[1].len() != rows
@@ -1569,7 +1593,7 @@ pub fn verify_op_relation_with_external(
                 || inputs[1].len() != rows * cols
                 || inputs[2].is_empty()
                 || outputs[0].len() != rows * cols
-                || raw[0].len() != rows * cols
+                || raw.is_empty() || raw[0].len() != rows * cols
                 || aux.len() != 2
                 || aux[0].len() != rows
                 || aux[1].len() != rows
@@ -1637,7 +1661,7 @@ pub fn verify_op_relation_with_external(
                 || inputs[1].len() != inputs[0].len() / 2
                 || inputs[2].len() != inputs[0].len() / 2
                 || outputs[0].len() != inputs[0].len()
-                || raw[0].len() != inputs[0].len()
+                || raw.is_empty() || raw[0].len() != inputs[0].len()
             {
                 return Err(Error::ShapeMismatch);
             }
@@ -1678,7 +1702,7 @@ pub fn verify_op_relation_with_external(
                 || inputs[0].len() != rows * cols
                 || inputs[1].is_empty()
                 || outputs[0].len() != rows * output_cols
-                || raw[0].len() != rows * output_cols
+                || raw.is_empty() || raw[0].len() != rows * output_cols
                 || aux.len() != 3
                 || aux[0].len() != 1
                 || aux[1].len() != 1
@@ -1757,7 +1781,7 @@ pub fn verify_op_relation_with_external(
             let seq = *config.first().ok_or(Error::InvalidConfig)? as usize;
             let head_dim = *config.get(1).ok_or(Error::InvalidConfig)? as usize;
             let shift = *config.get(2).ok_or(Error::InvalidConfig)? as u32;
-            if seq == 0 || head_dim == 0 || inputs.len() != 4 || outputs[0].len() != seq * head_dim || raw[0].len() != seq * head_dim {
+            if seq == 0 || head_dim == 0 || inputs.len() != 4 || outputs[0].len() != seq * head_dim || raw.is_empty() || raw[0].len() != seq * head_dim {
                 return Err(Error::ShapeMismatch);
             }
             if inputs[0].len() != seq * head_dim || inputs[1].len() != seq * head_dim || inputs[2].len() != seq * head_dim {

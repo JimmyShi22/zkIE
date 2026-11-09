@@ -271,6 +271,25 @@ fn negative_sources_and_argmax() {
 }
 
 #[test]
+fn negative_external_and_missing_ports() {
+    let fixture = one_asset_fixture(&[2], true);
+    let mut negative = Fixture {
+        public: fixture.public.clone(),
+        trace: fixture.trace.clone(),
+        tokens: fixture.tokens.clone(),
+        plan: fixture.plan.clone(),
+    };
+
+    negative.trace.steps[1].external.push(None);
+    assert_eq!(rejection_code(&negative), "shape_mismatch");
+
+    negative.trace = fixture.trace.clone();
+    negative.trace.steps[1].message.proof.outputs.clear();
+    negative.trace.steps[1].message.proof.lengths.outputs.clear();
+    assert_eq!(rejection_code(&negative), "shape_mismatch");
+}
+
+#[test]
 fn negative_cross_step_edge_with_equal_values() {
     let root = temp_dir();
     write_i32(&root.join("table_i32.bin"), &[0, 1, 2, 3]);

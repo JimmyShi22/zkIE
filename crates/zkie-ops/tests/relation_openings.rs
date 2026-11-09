@@ -2,6 +2,7 @@ use zkie_core::error::Error;
 use zkie_core::types::Digest;
 use zkie_ops::affine_scale::AffineScaleOp;
 use zkie_ops::matmul::MatMulOp;
+use zkie_ops::proof::binding::commit_rows_with_openings;
 use zkie_ops::proof::relations::{
     proof_input_values, prove_op_relation_shared, verify_op_relation_with_external,
     OpRelationProof, OpRelationPublic, RelationConfig,
@@ -132,4 +133,56 @@ fn bounds_do_not_panic() {
     proof.lengths.inputs[0] = usize::MAX;
     let result = verify_op_relation_with_external(&public, &proof, &config, &[]);
     assert!(matches!(result, Err(Error::ShapeMismatch)));
+}
+
+#[test]
+fn empty_and_missing_ports_are_rejected() {
+    let (public, proof, config) = matmul_fixture();
+
+    let mut empty_outputs = proof.clone();
+    empty_outputs.outputs.clear();
+    empty_outputs.lengths.outputs.clear();
+    let mut public_empty_outputs = public.clone();
+    public_empty_outputs.output_oracles.clear();
+    assert_eq!(
+        verify_code(&public_empty_outputs, &empty_outputs, &config),
+        "shape_mismatch"
+    );
+
+    let mut empty_inputs = proof.clone();
+    empty_inputs.inputs.clear();
+    empty_inputs.lengths.inputs.clear();
+    let mut public_empty_inputs = public.clone();
+    public_empty_inputs.input_oracles.clear();
+    assert_eq!(
+        verify_code(&public_empty_inputs, &empty_inputs, &config),
+        "shape_mismatch"
+    );
+
+    let mut empty_raw = proof.clone();
+    empty_raw.raw.clear();
+    empty_raw.lengths.raw.clear();
+    assert_eq!(verify_code(&public, &empty_raw, &config), "shape_mismatch");
+}
+
+#[test]
+fn extra_zero_leaves_are_rejected() {
+    let (mut public, proof, config) = matmul_fixture();
+    let mut rows: Vec<Vec<u64>> = proof.inputs[0]
+        .iter()
+        .map(|opening| opening.values.clone())
+        .collect();
+    let width = rows[0].len();
+    while rows.len() < 8 {
+        rows.push(vec![0; width]);
+    }
+    let (oracle, openings) =
+        commit_rows_with_openings(&mut public.registry, &Digest([9; 32]), &rows).unwrap();
+    let mut tampered = proof.clone();
+    tampered.inputs[0] = openings;
+    public.input_oracles[0] = oracle;
+    assert_eq!(
+        verify_code(&public, &tampered, &config),
+        "statement_mismatch"
+    );
 }

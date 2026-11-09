@@ -797,6 +797,11 @@ fn verify_shared_trace_steps(
     let mut outputs: Vec<Vec<Vec<i64>>> = Vec::with_capacity(trace.steps.len());
     let assets = crate::proof::plan::AssetView::new(public, trace, plan);
     for (step_index, step) in trace.steps.iter().enumerate() {
+        let plan_step = plan
+            .steps
+            .get(step_index)
+            .ok_or(Error::StatementMismatch)?;
+        crate::proof::plan::verify_step_structure(step, plan_step, &assets)?;
         let mut registry = crate::proof::binding::OracleRegistry::new();
         for (root, start, count) in &step.message.roots {
             registry.insert(*root, *start, *count)?;
@@ -841,7 +846,10 @@ fn verify_shared_trace_steps(
                 for row in &opening.rows {
                     values.extend(row.values.iter().map(|value| *value as i64));
                 }
-                if external_values[input].replace(values).is_some() {
+                let slot = external_values
+                    .get_mut(input)
+                    .ok_or(Error::ShapeMismatch)?;
+                if slot.replace(values).is_some() {
                     return Err(Error::StatementMismatch);
                 }
             }
@@ -864,10 +872,6 @@ fn verify_shared_trace_steps(
                 }
             }
         }
-        let plan_step = plan
-            .steps
-            .get(step_index)
-            .ok_or(Error::StatementMismatch)?;
         crate::proof::plan::verify_step(
             step,
             plan_step,
