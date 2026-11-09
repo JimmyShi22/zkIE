@@ -11,6 +11,11 @@
 //! are verifier chain challenges, not caller values; and columns must be
 //! opened against the table's trusted commitment. Here these are explicit
 //! fixtures; no function or type name claims that the source is authenticated.
+//! A changed fixture input either changes a value/target, breaks the algebraic
+//! relation with a fixed witness, or (only when a real authenticated source is
+//! connected) would be rejected by that source. The last category is not
+//! implemented in this isolated layer and marks the integration gate; no test
+//! here claims it.
 
 use zkie_core::common::field::PrimeCharacteristicRing;
 use zkie_core::error::{Error, Result};
@@ -2158,20 +2163,25 @@ mod tests {
             Fp3::from_u64(7),
         ];
         let row = record_row(&shape, &registry, &record, &name, &seeds, &eq_gamma, 0).unwrap();
-        // A different table name changes the recomputed seeds; the supplied
-        // fixture seeds no longer match.
+        // Value/relationship change: a different table name changes the
+        // recomputed seeds, so the supplied fixture seeds no longer match.
+        // This is a structural recomputation, not an authenticated-source
+        // rejection.
         let other_name = index_name(&Digest([6; 32]), &shape.index, &Digest([7; 32]));
         assert!(record_row(
             &shape, &registry, &record, &other_name, &seeds, &eq_gamma, 0
         )
         .is_err());
-        // A different row-point weight changes the target.
+        // Value/relationship change: a different row-point weight changes the
+        // target. With a fixed witness the old row no longer matches it.
         let mut other_gamma = eq_gamma.clone();
         other_gamma[0] = other_gamma[0].add(&Fp3::ONE);
         let other_row =
             record_row(&shape, &registry, &record, &name, &seeds, &other_gamma, 0).unwrap();
         assert_ne!(other_row.target, row.target);
-        // A different provided column changes the column target.
+        // Value/relationship change: a different provided column changes the
+        // column target; it does not prove that a real opening would accept or
+        // reject either column.
         let column = column_values(&shape);
         let column_row_value = column_row(&shape, &registry, 1, &column, &eq_gamma).unwrap();
         let mut other_column = column.clone();
@@ -2179,7 +2189,9 @@ mod tests {
         let other_column_row =
             column_row(&shape, &registry, 1, &other_column, &eq_gamma).unwrap();
         assert_ne!(other_column_row.target, column_row_value.target);
-        // A changed draw sequence does not match the provided unique columns.
+        // Structure change: a changed draw sequence does not match the
+        // provided unique columns. The real chain/opening rejection is not
+        // connected and is an integration gate.
         let fixture = vec![(1u64, column.clone()), (3u64, column.clone())];
         assert!(column_plan_rows(
             &shape,
@@ -2191,5 +2203,280 @@ mod tests {
             &eq_gamma
         )
         .is_err());
+    }
+
+    #[test]
+    fn one_actual_gu_table_satisfies_record_column_and_sample() {
+        let shape = shape();
+        let registry = registry(&shape);
+        let rows: Vec<Vec<Fp>> = vec![
+            vec![Fp::from_u64(3), Fp::from_u64(5), Fp::from_u64(7), Fp::from_u64(11)],
+            vec![Fp::from_u64(13), Fp::from_u64(17), Fp::from_u64(19), Fp::from_u64(23)],
+            vec![Fp::from_u64(29), Fp::from_u64(31), Fp::from_u64(37), Fp::from_u64(41)],
+            vec![Fp::from_u64(43), Fp::from_u64(47), Fp::from_u64(53), Fp::from_u64(59)],
+        ];
+        let tails: Vec<Vec<Fp>> = vec![
+            vec![Fp::from_u64(2), Fp::from_u64(3)],
+            vec![Fp::from_u64(5), Fp::from_u64(7)],
+            vec![Fp::from_u64(11), Fp::from_u64(13)],
+            vec![Fp::from_u64(17), Fp::from_u64(19)],
+        ];
+        let eq_gamma = vec![
+            Fp3::from_u64(2),
+            Fp3::from_u64(3),
+            Fp3::from_u64(5),
+            Fp3::from_u64(7),
+        ];
+        let mut folded_message = vec![Fp3::ZERO; shape.index.code.ell as usize];
+        for (row, weight) in eq_gamma.iter().enumerate() {
+            for (entry, value) in rows[row].iter().enumerate() {
+                folded_message[entry] = folded_message[entry]
+                    .add(&weight.mul(&Fp3::from_base(*value)));
+            }
+        }
+        let mut folded_tail = vec![Fp3::ZERO; shape.index.code.r as usize];
+        for (row, weight) in eq_gamma.iter().enumerate() {
+            for (entry, value) in tails[row].iter().enumerate() {
+                folded_tail[entry] =
+                    folded_tail[entry].add(&weight.mul(&Fp3::from_base(*value)));
+            }
+        }
+        let mut witness = gu_table(&shape, &folded_message, &folded_tail).unwrap();
+        // The G_u sample pad is a separate slot; fill it with a fixture value.
+        let send_pad_virtual = (shape.u.main_rows - 1)
+            + ((shape.u.code.ell - shape.u.answers as u64) << ceil_log2(shape.u.main_rows));
+        let row_bits = ceil_log2(shape.u.main_rows);
+        let send_pad = ((send_pad_virtual & ((1u64 << row_bits) - 1)) * shape.u.code.ell
+            + (send_pad_virtual >> row_bits)) as usize;
+        assert_eq!(witness.main[send_pad], Fp3::ZERO);
+        let send_value = Fp3::from_u64(999);
+        witness.main[send_pad] = send_value;
+
+        let name = index_name(&Digest([4; 32]), &shape.index, &Digest([7; 32]));
+        let record_seed = record_seeds(&shape.index, &name, 1).unwrap();
+        let bits = shape.index.cube_bits();
+        let plain = shape.index.code.ell - shape.index.pads() as u64;
+        let mut record = IndexRecord { y: Vec::new() };
+        for row in &rows {
+            let mut value = Fp3::ZERO;
+            for entry in 0..plain {
+                value = value.add(
+                    &eq_manual(entry, &record_seed[0].z, bits)
+                        .mul(&Fp3::from_base(row[entry as usize])),
+                );
+            }
+            for coefficient in 0..E_DEGREE {
+                let place = shape.index.pad_place(0, coefficient) as usize;
+                value = value.add(
+                    &record_seed[0]
+                        .beta
+                        .mul(&theta(coefficient))
+                        .mul(&Fp3::from_base(row[place])),
+                );
+            }
+            record.y.push(value);
+        }
+        let record_row_value =
+            record_row(&shape, &registry, &record, &name, &record_seed, &eq_gamma, 0).unwrap();
+        assert_eq!(record_row_value.evaluate(&witness).unwrap(), record_row_value.target);
+
+        let x = 2u64;
+        let column: Vec<Fp3> = rows
+            .iter()
+            .zip(&tails)
+            .map(|(row, tail)| {
+                Fp3::from_base(
+                    crate::pcs::request::code::encode_row_fp(&shape.index.code, row, tail)
+                        .unwrap()[x as usize],
+                )
+            })
+            .collect();
+        let column_row_value = column_row(&shape, &registry, x, &column, &eq_gamma).unwrap();
+        let mut column_target = Fp3::ZERO;
+        for (weight, value) in eq_gamma.iter().zip(&column) {
+            column_target = column_target.add(&weight.mul(value));
+        }
+        assert_eq!(column_row_value.target, column_target);
+        assert_eq!(
+            column_row_value.evaluate(&witness).unwrap(),
+            column_target
+        );
+
+        let sample_seed = SampleSeed {
+            z: (0..4).map(|index| Fp3::from_u64(70 + index)).collect(),
+            beta: Fp3::from_u64(80),
+        };
+        let sample_seeds = vec![sample_seed];
+        let cube = sample_cube(&shape).unwrap();
+        let mut expected_sample = vec![Fp3::ZERO; witness.main.len()];
+        for virtual_index in 0..(1u64 << cube.main_bits) {
+            let row = virtual_index & ((1u64 << cube.main_row_bits) - 1);
+            let place = virtual_index >> cube.main_row_bits;
+            if row < shape.u.main_rows && place < shape.u.code.ell {
+                expected_sample[(row * shape.u.code.ell + place) as usize] =
+                    eq_manual(virtual_index, &sample_seeds[0].z, cube.main_bits);
+            }
+        }
+        let pad_virtual = send_pad_virtual;
+        expected_sample[send_pad] =
+            expected_sample[send_pad]
+                .sub(&eq_manual(pad_virtual, &sample_seeds[0].z, cube.main_bits))
+                .add(&sample_seeds[0].beta.mul(&theta(0)));
+        let mut sample_target = Fp3::ZERO;
+        for (coefficient, entry) in expected_sample.iter().zip(&witness.main) {
+            sample_target = sample_target.add(&coefficient.mul(entry));
+        }
+        let sample_row_value =
+            sample_row(&shape, &registry, &sample_seeds, 0, sample_target).unwrap();
+        assert_eq!(sample_row_value.main, expected_sample);
+        assert_eq!(
+            sample_row_value.evaluate(&witness).unwrap(),
+            sample_target
+        );
+
+        // A G_u SEND pad changes only the sample relation.
+        let mut changed = witness.clone();
+        changed.main[send_pad] = changed.main[send_pad].add(&Fp3::ONE);
+        assert_eq!(
+            record_row_value.evaluate(&changed).unwrap(),
+            record_row_value.target
+        );
+        assert_eq!(
+            column_row_value.evaluate(&changed).unwrap(),
+            column_target
+        );
+        assert_ne!(
+            sample_row_value.evaluate(&changed).unwrap(),
+            sample_target
+        );
+        // A tail entry changes the column and sample relations, not the record.
+        let tail_virtual = shape.index.code.ell; // tail_first == ell in this fixture
+        let tail_row = tail_virtual & ((1u64 << ceil_log2(shape.u.main_rows)) - 1);
+        let tail_place = tail_virtual >> ceil_log2(shape.u.main_rows);
+        let tail_offset = (tail_row * shape.u.code.ell + tail_place) as usize;
+        assert_ne!(column_row_value.main[tail_offset], Fp3::ZERO);
+        let mut changed = witness.clone();
+        changed.main[tail_offset] = changed.main[tail_offset].add(&Fp3::ONE);
+        assert_eq!(
+            record_row_value.evaluate(&changed).unwrap(),
+            record_row_value.target
+        );
+        assert_ne!(
+            column_row_value.evaluate(&changed).unwrap(),
+            column_target
+        );
+        assert_ne!(
+            sample_row_value.evaluate(&changed).unwrap(),
+            sample_target
+        );
+        // An index pad changes the record relation at least.
+        let pad_place = shape.index.pad_place(0, 0);
+        let pad_row = pad_place & ((1u64 << ceil_log2(shape.u.main_rows)) - 1);
+        let pad_column = pad_place >> ceil_log2(shape.u.main_rows);
+        let pad_offset = (pad_row * shape.u.code.ell + pad_column) as usize;
+        assert_ne!(record_row_value.main[pad_offset], Fp3::ZERO);
+        let mut changed = witness.clone();
+        changed.main[pad_offset] = changed.main[pad_offset].add(&Fp3::ONE);
+        assert_ne!(
+            record_row_value.evaluate(&changed).unwrap(),
+            record_row_value.target
+        );
+        // An ordinary entry changes all three.
+        let ordinary = witness.main[0];
+        let mut changed = witness.clone();
+        changed.main[0] = changed.main[0].add(&Fp3::ONE);
+        assert_ne!(ordinary, changed.main[0]);
+        assert_ne!(
+            record_row_value.evaluate(&changed).unwrap(),
+            record_row_value.target
+        );
+        assert_ne!(
+            column_row_value.evaluate(&changed).unwrap(),
+            column_target
+        );
+        assert_ne!(
+            sample_row_value.evaluate(&changed).unwrap(),
+            sample_target
+        );
+    }
+
+    #[test]
+    fn gu_table_keeps_the_gap_when_tail_first_exceeds_ell() {
+        let index = IndexShape {
+            code: build_code_plan(4, 5, 3).unwrap(),
+            v: 2,
+            answers: 1,
+            salt_bytes: LEAF_SALT_MIN_BYTES,
+            distances: TableDistances {
+                radius: 0,
+                later_radius: 0,
+                m_once: 0,
+                m_later: 0,
+            },
+        };
+        let shape = GuShape {
+            oracle: 9,
+            group: 1,
+            tree: RuntimeTreePlan {
+                tree_number: 5,
+                leaf_class: 2,
+                log_n: 4,
+                log_n_zk: 0,
+                parts: vec![RuntimeTreePart {
+                    main_symbols: 6,
+                    mask_symbols: 0,
+                }],
+                salt_bytes: LEAF_SALT_MIN_BYTES,
+                run: Digest([9; 32]),
+                configuration: Digest([7; 32]),
+            },
+            part: 0,
+            rows_high: false,
+            u: GuOracleShape {
+                code: build_code_plan(4, 12, 0).unwrap(),
+                main_rows: 2,
+                main_deg: 3,
+                mask_rows: 0,
+                mask_code: None,
+                answers: 1,
+            },
+            index,
+        };
+        assert!(shape.fault().is_none());
+        assert!(gu_layout_fault(&shape).is_none());
+        let message: Vec<Fp3> = (0..5).map(|index| Fp3::from_u64(10 + index)).collect();
+        let tail: Vec<Fp3> = (0..3).map(|index| Fp3::from_u64(30 + index)).collect();
+        let table = gu_table(&shape, &message, &tail).unwrap();
+        // Independent gap/tail positions: step = 2^ceil_log2(3) = 4,
+        // first = ceil(5/4)*4 = 8, so vector positions 5,6,7 are the gap.
+        let step = 4u64;
+        let first = 8u64;
+        let row_bits = 1u32;
+        let offset = |value: u64| {
+            let row = value & ((1u64 << row_bits) - 1);
+            let place = value >> row_bits;
+            (row * shape.u.code.ell + place) as usize
+        };
+        for entry in 5..first {
+            assert_eq!(table.main[offset(entry)], Fp3::ZERO);
+        }
+        for (entry, value) in tail.iter().enumerate() {
+            assert_eq!(table.main[offset(first + entry as u64)], *value);
+        }
+        for (entry, value) in message.iter().enumerate() {
+            assert_eq!(table.main[offset(entry as u64)], *value);
+        }
+        assert_eq!(step, first - 4);
+        // A shape whose G_u pad would overlap the folded row is rejected at a
+        // prerequisite; it is not claimed legal.
+        let mut bad = shape.clone();
+        bad.u.main_rows = 1;
+        bad.u.code = build_code_plan(2, 4, 0).unwrap();
+        bad.tree.log_n = 2;
+        bad.tree.parts = vec![RuntimeTreePart {
+            main_symbols: 3,
+            mask_symbols: 0,
+        }];
+        assert!(bad.fault().is_some() || gu_layout_fault(&bad).is_some());
     }
 }
