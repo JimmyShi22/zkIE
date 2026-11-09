@@ -590,6 +590,80 @@ impl VerifiedGroups {
     }
 }
 
+impl MaskOracle {
+    /// The verifier's view of a fresh-mask notice. The notice carries no
+    /// members; `claimed_group` is the proof's lookup key into the verifier's
+    /// registry.
+    pub fn from_notice(id: u64, claimed_group: u64, notice: &MaskNotice) -> Self {
+        Self {
+            id,
+            claimed_group,
+            main_rows: 0,
+            mask_rows: notice.mask_rows,
+            mask_code: notice.mask_code,
+            answers: notice.answers,
+            sampled: false,
+        }
+    }
+}
+
+/// The sum of the hiding polynomial U over `{0,1}^k`: the first value FOLD
+/// sends after the fresh mask. U(X) = sum_l w_l(X_l) * prod_{j>l} X_j with
+/// `w_l(X) = sum_t w[l,t] X^t` and no constant term for l < k; plain `{0,1}`
+/// sums give w_l(0)+w_l(1) for every variable and a factor two for every
+/// variable after l.
+pub fn fold_mask_sum(k: u32, w: &[Fp3]) -> Result<Fp3> {
+    if k < 1 || w.len() != 2 * k as usize + 1 {
+        return Err(Error::InvalidConfig);
+    }
+    let two = Fp3::from_u64(2);
+    let mut sum = Fp3::ZERO;
+    for l in 0..k {
+        let last = l + 1 == k;
+        let mut weight = Fp3::ZERO;
+        if last {
+            // The last variable keeps its constant term, and both 0 and 1
+            // evaluate it.
+            weight = weight.add(&w[hp_place(k, l, 0)?].mul(&two));
+        }
+        for degree in 1..=2 {
+            weight = weight.add(&w[hp_place(k, l, degree)?]);
+        }
+        // Every variable before l contributes phi(1) = 2.
+        let scale = two.pow_u64(l as u64);
+        sum = sum.add(&weight.mul(&scale));
+    }
+    Ok(sum)
+}
+
+/// The opening of one FOLD: the mask was checked against the verifier's
+/// registry and the drawn values, the draft is the sent mask message and the
+/// sum is the first value after it. The round polynomials and the table test
+/// are the next part of the FOLD session and are not in this foundation.
+#[derive(Clone, Debug)]
+pub struct FoldStart {
+    pub draft: MaskDraft,
+    pub sum: Fp3,
+}
+
+pub fn fold_start(
+    shape: &FoldShape,
+    mask: &FoldMask,
+    coins: &impl MaskCoins,
+    oracle: &MaskOracle,
+    groups: &VerifiedGroups,
+) -> Result<FoldStart> {
+    validate_fold_mask_shape(shape)?;
+    if mask.id() != Some(oracle.id) {
+        return Err(Error::InvalidProof);
+    }
+    fold_mask_check(shape, oracle, groups)?;
+    fold_mask_as_drawn(shape, mask, coins)?;
+    let draft = fold_mask_draft(shape, mask)?;
+    let sum = fold_mask_sum(shape.k, mask.coefficients())?;
+    Ok(FoldStart { draft, sum })
+}
+
 /// What the verifier knows of an oracle named as a fresh mask. `claimed_group`
 /// is only a lookup key into the verifier's registry; the members come from
 /// the registry entry, never from this notice.
@@ -794,6 +868,79 @@ mod tests {
         let mut tall_mask = fold_mask_make(&taller, &mut source).unwrap();
         fold_mask_make_tail(&taller, &mut tall_mask, &mut source).unwrap();
         assert!(fold_mask_as_drawn(&shape, &tall_mask, &source).is_err());
+    }
+
+    #[test]
+    fn mask_sum_matches_the_definition() {
+        for k in 1..=3u32 {
+            let w = values(k);
+            let sum = fold_mask_sum(k, &w).unwrap();
+            let mut brute = Fp3::ZERO;
+            for bits in 0..(1u64 << k) {
+                let mut total = Fp3::ZERO;
+                for l in 0..k {
+                    let last = l + 1 == k;
+                    let x = if (bits >> l) & 1 == 1 {
+                        Fp3::ONE
+                    } else {
+                        Fp3::ZERO
+                    };
+                    let mut weight = Fp3::ZERO;
+                    for degree in if last { 0 } else { 1 }..=2 {
+                        let power = x.pow_u64(degree as u64);
+                        weight = weight.add(&w[hp_place(k, l, degree).unwrap()].mul(&power));
+                    }
+                    let mut tail = Fp3::ONE;
+                    for j in (l + 1)..k {
+                        let xj = if (bits >> j) & 1 == 1 {
+                            Fp3::ONE
+                        } else {
+                            Fp3::ZERO
+                        };
+                        tail = tail.mul(&xj);
+                    }
+                    total = total.add(&weight.mul(&tail));
+                }
+                brute = brute.add(&total);
+            }
+            assert_eq!(sum, brute);
+        }
+    }
+
+    #[test]
+    fn fold_start_checks_the_mask_and_returns_the_sum() {
+        let shape = shape();
+        let mut source = coins();
+        let mut mask = fold_mask_make(&shape, &mut source).unwrap();
+        fold_mask_make_tail(&shape, &mut mask, &mut source).unwrap();
+        let groups = VerifiedGroups {
+            groups: vec![VerifiedGroup {
+                group: 1,
+                members: vec![1, 2],
+                fresh: Some(9),
+            }],
+        };
+        let notice = fold_mask_notice(&shape).unwrap();
+        let oracle = MaskOracle::from_notice(9, 1, &notice);
+        // The mask must have been sent under the id the verifier checks.
+        assert!(fold_start(&shape, &mask, &source, &oracle, &groups).is_err());
+        mask.sent_as(9).unwrap();
+        let start = fold_start(&shape, &mask, &source, &oracle, &groups).unwrap();
+        assert_eq!(start.sum, fold_mask_sum(shape.k, mask.coefficients()).unwrap());
+        assert_eq!(start.draft.table.rows, 2);
+        assert_eq!(start.draft.tail.draws, mask.tail().unwrap().draws);
+        // A different claimed group or a tampered coefficient fails.
+        let mut bad = oracle;
+        bad.claimed_group = 7;
+        assert!(fold_start(&shape, &mask, &source, &bad, &groups).is_err());
+        let mut tampered = FoldMask {
+            coefficients: mask.coefficients().to_vec(),
+            draws: mask.draws().to_vec(),
+            tail: mask.tail().cloned(),
+            id: Some(9),
+        };
+        tampered.coefficients[0] = tampered.coefficients[0].add(&Fp3::ONE);
+        assert!(fold_start(&shape, &tampered, &source, &oracle, &groups).is_err());
     }
 
     #[test]
