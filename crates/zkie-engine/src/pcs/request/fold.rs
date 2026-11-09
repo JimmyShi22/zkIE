@@ -62,6 +62,61 @@ impl FoldShape {
     }
 }
 
+/// One member of the fixed FOLD group layout. `main_rows` is the member's
+/// real main-row count and decides the length of a kept coefficient form;
+/// `kept` is the trusted layout mark that permits that member to appear as a
+/// kept form. The mask-row count is kept for identity only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoldMemberLayout {
+    pub oracle: u64,
+    pub main_rows: u64,
+    pub mask_rows: u64,
+    pub kept: bool,
+}
+
+/// The fixed FOLD group layout: the group and row variables plus one entry per
+/// member, ordered by oracle number. It is a trusted fixture in this isolated
+/// layer; the proof cannot supply or change it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoldGroupLayout {
+    pub group: u64,
+    pub k: u32,
+    pub h: u32,
+    pub members: Vec<FoldMemberLayout>,
+}
+
+impl FoldGroupLayout {
+    pub fn fault(&self, shape: &FoldShape) -> Option<&'static str> {
+        if self.k != shape.k || self.h != shape.h {
+            return Some("the FOLD layout does not match the fold shape");
+        }
+        if self.members.is_empty() {
+            return Some("the FOLD layout has no members");
+        }
+        for (index, member) in self.members.iter().enumerate() {
+            if member.main_rows == 0 {
+                return Some("a FOLD member has no main rows");
+            }
+            if index > 0 && self.members[index - 1].oracle >= member.oracle {
+                return Some("the FOLD layout members are not strictly ordered");
+            }
+        }
+        None
+    }
+
+    pub fn member(&self, oracle: u64) -> Option<&FoldMemberLayout> {
+        self.members.iter().find(|member| member.oracle == oracle)
+    }
+
+    pub fn kept_rows(&self) -> u64 {
+        self.members
+            .iter()
+            .filter(|member| member.kept)
+            .map(|member| member.main_rows)
+            .sum()
+    }
+}
+
 /// One kept main row of the fixed group: the member identity and the
 /// coefficient vector on that row. Kept rows are not folded; their coefficients
 /// are scaled by `eps * (1 - g_1) .. (1 - g_k)` in the output. In this isolated
@@ -73,12 +128,16 @@ pub struct FoldKeptForm {
 }
 
 impl FoldKeptForm {
-    pub fn check(&self, shape: &FoldShape, members: &[u64]) -> Result<()> {
-        if self.coefficients.is_empty()
-            || usize::try_from(shape.code.ell).map_err(|_| Error::ResourceLimit)?
-                != self.coefficients.len()
-            || members.binary_search(&self.oracle).is_err()
-        {
+    pub fn check(&self, shape: &FoldShape, layout: &FoldGroupLayout) -> Result<()> {
+        let member = layout.member(self.oracle).ok_or(Error::ShapeMismatch)?;
+        if !member.kept {
+            return Err(Error::StatementMismatch);
+        }
+        let expected = member
+            .main_rows
+            .checked_mul(shape.code.ell)
+            .ok_or(Error::ResourceLimit)?;
+        if usize::try_from(expected).map_err(|_| Error::ResourceLimit)? != self.coefficients.len() {
             return Err(Error::ShapeMismatch);
         }
         Ok(())
@@ -106,13 +165,28 @@ impl FoldInputRow {
     /// The fixture must have the shape's layout and table lengths. The member
     /// list is strictly increasing and non-empty; the session separately checks
     /// it against the trusted group view.
-    pub fn check(&self, shape: &FoldShape) -> Result<()> {
+    pub fn check(&self, shape: &FoldShape, layout: &FoldGroupLayout) -> Result<()> {
         validate_fold_mask_shape(shape)?;
-        if self.k != shape.k || self.h != shape.h || self.members.is_empty() {
+        if layout.fault(shape).is_some() {
+            return Err(Error::InvalidConfig);
+        }
+        if self.group != layout.group
+            || self.k != layout.k
+            || self.h != layout.h
+            || self.members.is_empty()
+        {
             return Err(Error::ShapeMismatch);
         }
         if self.members.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(Error::InvalidConfig);
+        }
+        if self
+            .members
+            .iter()
+            .copied()
+            .ne(layout.members.iter().map(|member| member.oracle))
+        {
+            return Err(Error::StatementMismatch);
         }
         let rows = 1usize.checked_shl(shape.k).ok_or(Error::ResourceLimit)?;
         let mask_rows = 1usize.checked_shl(shape.h).ok_or(Error::ResourceLimit)?;
@@ -129,7 +203,7 @@ impl FoldInputRow {
         }
         let mut kept_oracles = Vec::with_capacity(self.kept.len());
         for kept in &self.kept {
-            kept.check(shape, &self.members)?;
+            kept.check(shape, layout)?;
             if kept_oracles.contains(&kept.oracle) {
                 return Err(Error::InvalidConfig);
             }
@@ -163,6 +237,8 @@ pub struct FoldOutput {
     pub fresh_coefficients: Vec<Fp3>,
     pub kept: Vec<FoldKeptForm>,
     pub kept_factor: Fp3,
+    pub layout: FoldGroupLayout,
+    pub kept_rows: u64,
     pub target: Fp3,
 }
 
@@ -613,6 +689,7 @@ fn fold_mask_form_values(
 /// chosen here.
 pub fn fold_output(
     shape: &FoldShape,
+    layout: &FoldGroupLayout,
     row: &FoldInputRow,
     fresh: u64,
     fresh_root: Digest,
@@ -622,7 +699,7 @@ pub fn fold_output(
     gamma: &[Fp3],
     claim: Fp3,
 ) -> Result<FoldOutput> {
-    row.check(shape)?;
+    row.check(shape, layout)?;
     if gamma.len() != shape.k as usize {
         return Err(Error::ShapeMismatch);
     }
@@ -671,6 +748,8 @@ pub fn fold_output(
         fresh_coefficients,
         kept,
         kept_factor,
+        layout: layout.clone(),
+        kept_rows: layout.kept_rows(),
         target: claim,
     })
 }
@@ -793,13 +872,14 @@ pub struct FoldProverSession {
 impl FoldProverSession {
     pub fn new(
         shape: &FoldShape,
+        layout: &FoldGroupLayout,
         mask: &FoldMask,
         row: &FoldInputRow,
         main_messages: Vec<Fp3>,
         mask_messages: Vec<Fp3>,
         kept_messages: Vec<Vec<Fp3>>,
     ) -> Result<Self> {
-        row.check(shape)?;
+        row.check(shape, layout)?;
         if kept_messages.len() != row.kept.len() {
             return Err(Error::ShapeMismatch);
         }

@@ -46,7 +46,8 @@ use crate::pcs::request::relation::{
 use crate::pcs::request::runtime_tree::RuntimeTreeOpening;
 use crate::pcs::request::fold::{
     fold_mask_shape_fault, fold_output, fold_start_verify, fold_start_verify_with_groups,
-    FoldInputRow, FoldOutput, FoldRoundVerifier, FoldShape, FoldStartMessage, RuntimeOracles,
+    FoldGroupLayout, FoldInputRow, FoldOutput, FoldRoundVerifier, FoldShape, FoldStartMessage,
+    RuntimeOracles,
     VerifiedStatement,
 };
 use crate::pcs::request::read::{
@@ -231,6 +232,9 @@ pub struct FoldeqPlan {
     /// The trusted G_u shape when this plan carries the isolated G_u relation
     /// session. It is a plan/statement value, not a proof report.
     pub gu: Option<GuShape>,
+    /// The trusted fixed group layout for the isolated FOLD input row. It is a
+    /// fixture supplied by the plan, not a proof field.
+    pub fold_layout: Option<FoldGroupLayout>,
 }
 
 impl FoldeqPlan {
@@ -298,6 +302,14 @@ impl FoldeqPlan {
             }
             if crate::pcs::request::relation::gu_layout_fault(gu).is_some() {
                 return Some("the G_u layout is not executable");
+            }
+            if let Some(layout) = &self.fold_layout {
+                if layout.group != self.group_id {
+                    return Some("the FOLD layout group is not the plan group");
+                }
+                if layout.fault(&self.fold).is_some() {
+                    return Some("the FOLD layout does not match the fold shape");
+                }
             }
         }
         match self.gamma_path {
@@ -1097,8 +1109,13 @@ impl FoldeqSession {
     }
 
     fn check_fold_row(&self, row: &FoldInputRow, claimed_group: Option<u64>) -> Result<()> {
-        row.check(&self.plan.fold)?;
-        if row.group != self.plan.group_id {
+        let layout = self
+            .plan
+            .fold_layout
+            .as_ref()
+            .ok_or(Error::InvalidSessionState)?;
+        row.check(&self.plan.fold, layout)?;
+        if row.group != self.plan.group_id || layout.group != self.plan.group_id {
             return Err(Error::StatementMismatch);
         }
         if let Some(claimed) = claimed_group {
@@ -1127,7 +1144,13 @@ impl FoldeqSession {
                 .members
                 .clone(),
         };
-        if row.members != expected_members {
+        if row.members != expected_members
+            || layout
+                .members
+                .iter()
+                .map(|member| member.oracle)
+                .ne(expected_members.iter().copied())
+        {
             return Err(Error::StatementMismatch);
         }
         Ok(())
@@ -1209,8 +1232,14 @@ impl FoldeqSession {
             .as_ref()
             .ok_or(Error::InvalidSessionState)?
             .claim();
+        let layout = self
+            .plan
+            .fold_layout
+            .as_ref()
+            .ok_or(Error::InvalidSessionState)?;
         let output = fold_output(
             &self.plan.fold,
+            layout,
             &row,
             start.id,
             start.root,
@@ -1327,7 +1356,7 @@ mod tests {
     use crate::pcs::request::field::{Fp, Fp3, MODULUS};
     use crate::pcs::request::fold::{
         fold_mask_make, fold_mask_make_tail, fold_mask_notice, fold_start_prove,
-        FoldInputRow, FoldKeptForm, FoldMask, FoldOutput,
+        FoldInputRow, FoldKeptForm, FoldMask, FoldMemberLayout, FoldOutput,
         FoldProverSession, FoldRoundEnd, FoldShape,
         MaskOracle, OracleMetadata, RuntimeOracles, VerifiedGroup, VerifiedGroups,
         VerifiedStatement,
@@ -1442,6 +1471,41 @@ mod tests {
         }
     }
 
+    fn fold_layout_for(plan: &FoldeqPlan, oracle: u64) -> FoldGroupLayout {
+        let mut oracles = plan
+            .statement
+            .groups()
+            .get(plan.group_id)
+            .unwrap()
+            .members
+            .clone();
+        oracles.push(oracle);
+        oracles.sort_unstable();
+        oracles.dedup();
+        let gu_rows = plan.gu.as_ref().map(|gu| gu.u.main_rows).unwrap_or(1);
+        let members = oracles
+            .into_iter()
+            .map(|id| FoldMemberLayout {
+                oracle: id,
+                main_rows: if id == oracle {
+                    gu_rows
+                } else if id == 2 {
+                    2
+                } else {
+                    1
+                },
+                mask_rows: 0,
+                kept: id == 1 || id == 2,
+            })
+            .collect();
+        FoldGroupLayout {
+            group: plan.group_id,
+            k: plan.fold.k,
+            h: plan.fold.h,
+            members,
+        }
+    }
+
     fn gu_plan_with(
         group_code: Option<CodeParams>,
         members: Vec<u64>,
@@ -1451,6 +1515,7 @@ mod tests {
         let mut gu = gu_shape();
         gu.oracle = oracle;
         plan.gu = Some(gu);
+        plan.fold_layout = Some(fold_layout_for(&plan, oracle));
         (plan, table)
     }
 
@@ -1479,7 +1544,9 @@ mod tests {
         ]);
         let mut gu = gu_shape();
         gu.group = gu_group;
+        let oracle = gu.oracle;
         plan.gu = Some(gu);
+        plan.fold_layout = Some(fold_layout_for(&plan, oracle));
         (plan, table)
     }
 
@@ -1487,6 +1554,7 @@ mod tests {
         let (mut plan, table) =
             plan_fixture_with_group_fresh(Some(build_code_plan(3, 6, 1).unwrap()), vec![1, 2], Some(10));
         plan.gu = Some(gu_shape());
+        plan.fold_layout = Some(fold_layout_for(&plan, 10));
         (plan, table)
     }
 
@@ -1563,6 +1631,7 @@ mod tests {
             mask_query_count: 2,
             gamma_path: GammaPath::Lin { shape: LinShapeBinding { matrix_rows: 1, k_lo: 0, k_col: 2 } },
             gu: None,
+            fold_layout: None,
         };
         (plan, table)
     }
@@ -1670,9 +1739,10 @@ mod tests {
         (session, table, start, mask, source)
     }
 
-    fn fold_fixture(
+    fn fold_fixture_with_kept(
         plan: &FoldeqPlan,
         salt: u64,
+        kept_salt: u64,
     ) -> (FoldInputRow, Vec<Fp3>, Vec<Fp3>, Vec<Vec<Fp3>>) {
         let shape = plan.fold;
         let rows = 1usize << shape.k;
@@ -1691,14 +1761,15 @@ mod tests {
         let mask_messages: Vec<Fp3> = (0..mask_rows * mask_len)
             .map(|index| Fp3::from_u64(salt * 1000 + index as u64 + 901))
             .collect();
+        let kept_rows = 2usize;
         let kept_form = FoldKeptForm {
             oracle: 2,
-            coefficients: (0..ell)
-                .map(|index| Fp3::from_u64(salt * 1000 + 1201 + index as u64))
+            coefficients: (0..kept_rows * ell)
+                .map(|index| Fp3::from_u64(kept_salt * 1000 + 1201 + index as u64))
                 .collect(),
         };
-        let kept_message: Vec<Fp3> = (0..ell)
-            .map(|index| Fp3::from_u64(salt * 1000 + 1401 + index as u64))
+        let kept_message: Vec<Fp3> = (0..kept_rows * ell)
+            .map(|index| Fp3::from_u64(kept_salt * 1000 + 1401 + index as u64))
             .collect();
         let kept_value = fold_dot(&kept_form.coefficients, &kept_message);
         let target = fold_dot(&coefficients, &main_messages)
@@ -1716,6 +1787,17 @@ mod tests {
             target,
         };
         (row, main_messages, mask_messages, vec![kept_message])
+    }
+
+    fn fold_fixture(
+        plan: &FoldeqPlan,
+        salt: u64,
+    ) -> (FoldInputRow, Vec<Fp3>, Vec<Fp3>, Vec<Vec<Fp3>>) {
+        fold_fixture_with_kept(plan, salt, salt)
+    }
+
+    fn run_fold_instance(salt: u64) -> FoldRun {
+        run_fold_instance_kept(salt, salt)
     }
 
     fn fold_dot(left: &[Fp3], right: &[Fp3]) -> Fp3 {
@@ -1739,9 +1821,10 @@ mod tests {
         start: crate::pcs::request::fold::FoldStartMessage,
     }
 
-    fn run_fold_instance(salt: u64) -> FoldRun {
+    fn run_fold_instance_kept(salt: u64, kept_salt: u64) -> FoldRun {
         let (mut session, _table, start, mask, source) = fold_open_prestart();
-        let (row, main_messages, mask_messages, kept_messages) = fold_fixture(session.plan(), salt);
+        let (row, main_messages, mask_messages, kept_messages) =
+            fold_fixture_with_kept(session.plan(), salt, kept_salt);
         let mask_coefficients = mask.coefficients().to_vec();
         let initial_main = main_messages.clone();
         let initial_mu = mask_messages.clone();
@@ -1751,6 +1834,7 @@ mod tests {
         let eps = session.epsilon().unwrap();
         let mut prover = FoldProverSession::new(
             &session.plan().fold,
+            session.plan().fold_layout.as_ref().unwrap(),
             &mask,
             &row,
             main_messages,
@@ -2864,6 +2948,47 @@ mod tests {
         sum
     }
 
+    fn fold_kept_value(run: &FoldRun) -> Fp3 {
+        run.row
+            .kept
+            .iter()
+            .zip(&run.kept_messages)
+            .fold(Fp3::ZERO, |sum, (form, message)| {
+                sum.add(&fold_dot(&form.coefficients, message))
+            })
+    }
+
+    fn assert_fold_run_direct(run: &FoldRun) {
+        for round in 0..run.row.k as usize {
+            for degree in 0..3u64 {
+                let at = Fp3::from_u64(degree);
+                assert_eq!(
+                    fold_poly_at(&run.qs[round], at),
+                    fold_q_direct(run, round, at)
+                );
+            }
+        }
+        let kept_value = fold_kept_value(run);
+        let end_value = fold_dot(&run.output.coefficients, &run.main_end)
+            .add(&fold_dot(&run.output.mask_coefficients, &run.end.mu))
+            .add(&fold_dot(&run.output.fresh_coefficients, &run.end.fresh))
+            .add(&run.output.kept_factor.mul(&kept_value));
+        assert_eq!(end_value, run.output.target);
+        assert_eq!(run.output.kept.len(), run.row.kept.len());
+        for (out, source) in run.output.kept.iter().zip(&run.row.kept) {
+            assert_eq!(out.oracle, source.oracle);
+            assert_eq!(
+                out.coefficients,
+                source
+                    .coefficients
+                    .iter()
+                    .map(|value| value.mul(&run.output.kept_factor))
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(run.output.kept_rows, run.output.layout.kept_rows());
+    }
+
     #[test]
     fn fold_session_rounds_produce_the_final_constraint() {
         let run = run_fold_instance(1);
@@ -2939,6 +3064,61 @@ mod tests {
         let second = run_fold_instance(2);
         assert_ne!(first.messages, second.messages);
         assert_ne!(first.output.target, second.output.target);
+    }
+
+    #[test]
+    fn fold_session_kept_layout_is_enforced() {
+        let (mut session, _table, _start, _mask, _source) = fold_open_prestart();
+        let (row, _, _, _) = fold_fixture(session.plan(), 1);
+        let ell = session.plan().fold.code.ell as usize;
+        let form = |oracle: u64, rows: usize| FoldKeptForm {
+            oracle,
+            coefficients: (0..rows * ell)
+                .map(|index| Fp3::from_u64(2001 + index as u64))
+                .collect(),
+        };
+        let mut ordinary = row.clone();
+        ordinary.kept = vec![form(10, 2)];
+        assert!(session.fold_bind_row(ordinary).is_err());
+        let mut wrong_rows = row.clone();
+        wrong_rows.kept = vec![form(2, 1)];
+        assert!(session.fold_bind_row(wrong_rows).is_err());
+        let mut mixed = row.clone();
+        mixed.kept = vec![form(2, 2), form(10, 2)];
+        assert!(session.fold_bind_row(mixed).is_err());
+        let mut duplicate = row.clone();
+        duplicate.kept = vec![form(2, 2), form(2, 2)];
+        assert!(session.fold_bind_row(duplicate).is_err());
+        session.fold_bind_row(row.clone()).unwrap();
+
+        let (mut single, _table, start, _mask, _source) = fold_open_prestart();
+        let (mut single_row, _, _, _) = fold_fixture(single.plan(), 1);
+        single_row.kept = vec![form(1, 1)];
+        single.fold_bind_row(single_row).unwrap();
+        single.start_fold(&start.message).unwrap();
+        single.fold_rounds_start().unwrap();
+    }
+
+    #[test]
+    fn fold_session_kept_evidence_is_direct_and_nonzero() {
+        let baseline = run_fold_instance_kept(1, 1);
+        let changed = run_fold_instance_kept(1, 2);
+        assert_eq!(baseline.main_messages, changed.main_messages);
+        assert_eq!(baseline.mask_messages, changed.mask_messages);
+        assert_eq!(baseline.mask_coefficients, changed.mask_coefficients);
+        assert_ne!(baseline.kept_messages, changed.kept_messages);
+        let first_kept = fold_kept_value(&baseline);
+        let second_kept = fold_kept_value(&changed);
+        assert_ne!(first_kept, Fp3::ZERO);
+        assert_ne!(second_kept, Fp3::ZERO);
+        assert_ne!(first_kept, second_kept);
+        assert_ne!(baseline.eps, Fp3::ZERO);
+        assert_ne!(baseline.output.kept_factor, Fp3::ZERO);
+        assert_ne!(changed.output.kept_factor, Fp3::ZERO);
+        assert_ne!(baseline.qs, changed.qs);
+        assert_ne!(baseline.output.target, changed.output.target);
+        assert_fold_run_direct(&baseline);
+        assert_fold_run_direct(&changed);
     }
 
     #[test]
@@ -3028,6 +3208,7 @@ mod tests {
             fold_fixture(session.plan(), 1);
         let mut prover = FoldProverSession::new(
             &session.plan().fold,
+            session.plan().fold_layout.as_ref().unwrap(),
             &mask,
             &row,
             main_messages,
