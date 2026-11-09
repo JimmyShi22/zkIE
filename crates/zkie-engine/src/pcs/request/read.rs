@@ -75,6 +75,20 @@ impl ReadBudget {
         Ok(())
     }
 
+    /// Return a local read-budget charge that never led to an opening because
+    /// the shared hiding token rejected the same request first. This is not a
+    /// refund of the provider's long-term hiding reservation; that reservation
+    /// is never returned. A charge made after the token accepted the request is
+    /// not refunded here.
+    fn refund_unstarted(&mut self, reads: usize) -> Result<()> {
+        let reads = u64::try_from(reads).map_err(|_| Error::ResourceLimit)?;
+        self.used = self
+            .used
+            .checked_sub(reads)
+            .ok_or(Error::InvalidSessionState)?;
+        Ok(())
+    }
+
     pub fn max_reads(&self) -> u64 {
         self.max_reads
     }
@@ -250,9 +264,11 @@ impl HidingCharge {
         self.total
     }
 
-    /// Consume the new physical positions and return how many were new. A
-    /// repeat of a consumed position adds nothing; the union above the
-    /// reserved total fails.
+    /// Consume the new physical positions and return how many were new to the
+    /// shared token. A repeat of a consumed position adds nothing; the union
+    /// above the reserved total fails. The returned count is token-global and
+    /// is not a reader's read budget: a second reader must still budget the
+    /// positions it opens even when this token reports zero fresh entries.
     pub fn consume(&self, positions: &[u64]) -> Result<usize> {
         let mut state = self
             .state
@@ -515,6 +531,14 @@ impl ProverReads {
         }
     }
 
+    /// Open the requested positions under one proof's hiding token. The read
+    /// budget is per reader and is charged for every position this reader will
+    /// open and has not already cached, before the shared token is touched. A
+    /// budget failure leaves the token untouched. If the shared token rejects
+    /// the request, the unstarted local charge is returned; the provider's
+    /// long-term hiding reservation is never returned. Once the token accepts,
+    /// neither it nor the local read charge is refunded, even if an opening
+    /// later fails; a retry pays again for positions not already cached.
     pub fn open(
         &mut self,
         charge: &HidingCharge,
@@ -524,8 +548,29 @@ impl ProverReads {
         if charge.table() != table.reader.root {
             return Err(Error::StatementMismatch);
         }
-        let new_units = charge.consume(positions)?;
-        self.budget.charge(new_units)?;
+        // The reader's budget is its own. It charges the positions this reader
+        // will actually open, before the shared hiding token is touched; a
+        // token-global zero-fresh result does not exempt a second reader. The
+        // budget charge is local and may be returned only when the shared token
+        // rejects the request before any opening; the provider's long-term
+        // hiding reservation is never returned.
+        let mut fresh_positions = Vec::new();
+        fresh_positions
+            .try_reserve_exact(positions.len())
+            .map_err(|_| Error::ResourceLimit)?;
+        let mut seen = HashSet::new();
+        for position in positions {
+            let key = (table.reader.root, *position);
+            if self.openings.contains_key(&key) || !seen.insert(*position) {
+                continue;
+            }
+            fresh_positions.push(*position);
+        }
+        self.budget.charge(fresh_positions.len())?;
+        if let Err(error) = charge.consume(positions) {
+            self.budget.refund_unstarted(fresh_positions.len())?;
+            return Err(error);
+        }
         let mut openings = Vec::new();
         openings
             .try_reserve_exact(positions.len())
@@ -673,16 +718,120 @@ mod tests {
         let repeated = reads.open(&charge, &table, &positions).unwrap();
         assert_eq!(first, repeated);
         assert_eq!(reads.budget().used(), 2);
-        // A token copy and a second reader share the consumed set.
+        // A token copy and a second reader share the consumed set, but the
+        // second reader still pays its own read budget for the opening it
+        // makes, even when the token reports no fresh position.
         let copied = charge.clone();
         let mut second = ProverReads::new(8);
         assert!(second.open(&copied, &table, &[6]).is_err());
         assert!(second.open(&copied, &table, &[1]).is_ok());
-        assert_eq!(second.budget().used(), 0);
+        assert_eq!(second.budget().used(), 1);
         let other = Digest([8; 32]);
         let mut other_state = HidingState::new(other, 1, 8);
         let other_charge = other_state.begin_charge(other, 1, 8).unwrap();
         assert!(reads.open(&other_charge, &table, &positions).is_err());
+    }
+
+    #[test]
+    fn prover_budget_failure_does_not_consume_the_hiding_token() {
+        let table = committed();
+        let root = table.reader.root;
+        let mut state = HidingState::new(root, 1, 2);
+        let charge = state.begin_charge(root, 1, 2).unwrap();
+        let mut reads = ProverReads::new(1);
+        assert!(reads.open(&charge, &table, &[1, 4]).is_err());
+        assert_eq!(reads.budget().used(), 0);
+        assert_eq!(reads.budget().remaining(), 1);
+        // The retry still fails the reader's budget rather than seeing a
+        // zero-fresh token and slipping through.
+        assert!(reads.open(&charge, &table, &[1, 4]).is_err());
+        assert_eq!(reads.budget().used(), 0);
+        // No hiding position was consumed by the failed budget attempt, so
+        // another request can still use the reserved two positions.
+        assert_eq!(charge.consume(&[5, 6]).unwrap(), 2);
+    }
+
+    #[test]
+    fn token_clone_does_not_exempt_a_second_reader_budget() {
+        let table = committed();
+        let root = table.reader.root;
+        let mut state = HidingState::new(root, 1, 1);
+        let charge = state.begin_charge(root, 1, 1).unwrap();
+        let mut first = ProverReads::new(1);
+        first.open(&charge, &table, &[0]).unwrap();
+        // The token now sees position 0 as fresh=0; a reader with no budget
+        // must still fail, and one with a budget pays for its own opening.
+        let mut no_budget = ProverReads::new(0);
+        assert!(no_budget.open(&charge, &table, &[0]).is_err());
+        assert_eq!(no_budget.budget().used(), 0);
+        let mut second = ProverReads::new(1);
+        second.open(&charge, &table, &[0]).unwrap();
+        assert_eq!(second.budget().used(), 1);
+        let copied = charge.clone();
+        let mut third = ProverReads::new(0);
+        assert!(third.open(&copied, &table, &[0]).is_err());
+        let mut fourth = ProverReads::new(1);
+        fourth.open(&copied, &table, &[0]).unwrap();
+        assert_eq!(fourth.budget().used(), 1);
+    }
+
+    #[test]
+    fn concurrent_readers_charge_independent_budgets() {
+        let table = Arc::new(committed());
+        let root = table.reader.root;
+        let mut state = HidingState::new(root, 1, 1);
+        let charge = state.begin_charge(root, 1, 1).unwrap();
+        let (left, right) = std::thread::scope(|scope| {
+            let left_table = Arc::clone(&table);
+            let left_charge = charge.clone();
+            let left = scope.spawn(move || {
+                let mut reads = ProverReads::new(1);
+                let ok = reads.open(&left_charge, &left_table, &[0]).is_ok();
+                (ok, reads.budget().used())
+            });
+            let right_table = Arc::clone(&table);
+            let right_charge = charge.clone();
+            let right = scope.spawn(move || {
+                let mut reads = ProverReads::new(1);
+                let ok = reads.open(&right_charge, &right_table, &[0]).is_ok();
+                (ok, reads.budget().used())
+            });
+            (left.join().unwrap(), right.join().unwrap())
+        });
+        // Both readers open the same already-consumed position: the shared
+        // token says fresh=0 for one of them, but both readers pay their own
+        // one-read budget.
+        assert!(left.0 && right.0);
+        assert_eq!(left.1 + right.1, 2);
+    }
+
+    #[test]
+    fn concurrent_readers_refund_only_unstarted_budget() {
+        let table = Arc::new(committed());
+        let root = table.reader.root;
+        let mut state = HidingState::new(root, 1, 1);
+        let charge = state.begin_charge(root, 1, 1).unwrap();
+        let (left, right) = std::thread::scope(|scope| {
+            let left_table = Arc::clone(&table);
+            let left_charge = charge.clone();
+            let left = scope.spawn(move || {
+                let mut reads = ProverReads::new(1);
+                let ok = reads.open(&left_charge, &left_table, &[0]).is_ok();
+                (ok, reads.budget().used())
+            });
+            let right_table = Arc::clone(&table);
+            let right_charge = charge.clone();
+            let right = scope.spawn(move || {
+                let mut reads = ProverReads::new(1);
+                let ok = reads.open(&right_charge, &right_table, &[1]).is_ok();
+                (ok, reads.budget().used())
+            });
+            (left.join().unwrap(), right.join().unwrap())
+        });
+        // One token position: exactly one reader opens and pays; the other
+        // token rejection returns its unstarted local budget.
+        assert_eq!(left.0 as u8 + right.0 as u8, 1);
+        assert_eq!(left.1 + right.1, 1);
     }
 
     #[test]

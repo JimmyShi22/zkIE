@@ -1655,6 +1655,16 @@ pub struct RuntimeOracles {
     entries: Vec<RuntimeOracle>,
 }
 
+/// The result of a supplied mask opening. `NoOpening` is a legal explicit
+/// no-op for an empty position list: it is not a successful authentication,
+/// marks no opening and consumes no list. `Verified` means the supplied
+/// non-empty opening passed the root check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MaskAuthentication {
+    NoOpening,
+    Verified,
+}
+
 impl RuntimeOracles {
     /// Registration phase of SEND: check the mask notice against the frozen
     /// statement's oracle metadata and the trusted runtime tree, and record
@@ -1707,8 +1717,9 @@ impl RuntimeOracles {
     /// caller must supply the complete deduplicated set of the verifier's
     /// draws: this function checks the list it is given and does not prove the
     /// list's source or completeness, so a short or empty list is not evidence
-    /// that the transcript drew fewer. A zero count performs no opening and
-    /// marks nothing. This checks the opening only: it is not a complete
+    /// that the transcript drew fewer. An empty list is an explicit no-opening
+    /// result, not a successful mask authentication: it marks nothing and
+    /// consumes no list. This checks the opening only: it is not a complete
     /// authentication, a proximity test, a table test or a relation closure.
     ///
     /// This is a low-level entry. The count and positions are caller-supplied
@@ -1722,7 +1733,7 @@ impl RuntimeOracles {
         expected_count: usize,
         positions: &[u64],
         openings: &RuntimeTreeOpening,
-    ) -> Result<()> {
+    ) -> Result<MaskAuthentication> {
         if positions.len() > expected_count || positions.len() != openings.columns.len() {
             return Err(Error::StatementMismatch);
         }
@@ -1738,11 +1749,11 @@ impl RuntimeOracles {
             return Err(Error::StatementMismatch);
         }
         if positions.is_empty() {
-            return Ok(());
+            return Ok(MaskAuthentication::NoOpening);
         }
         verify_mask_opening(tree_plan, &entry.root, positions, openings)?;
         entry.opening_verified = true;
-        Ok(())
+        Ok(MaskAuthentication::Verified)
     }
 
     pub fn get(&self, id: u64) -> Option<&RuntimeOracle> {
@@ -2020,6 +2031,25 @@ impl VerifiedStatement {
             .spend(id)
     }
 
+    /// Spend one fresh-mask oracle. The statement and the runtime registry
+    /// must both show an unsampled mask-only message before the single-use
+    /// ledger is touched. A sampled message, a message with main rows or a
+    /// message with answers cannot be spent as a mask.
+    pub fn spend_as_mask(&self, runtime: &RuntimeOracles, id: u64) -> Result<()> {
+        let metadata = self.oracle(id).ok_or(Error::StatementMismatch)?;
+        let entry = runtime.get(id).ok_or(Error::StatementMismatch)?;
+        if entry.sampled
+            || entry.answers != 0
+            || entry.main_rows != 0
+            || entry.mask_rows != metadata.mask_rows
+            || entry.mask_code != metadata.mask_code
+            || metadata.mask_rows == 0
+        {
+            return Err(Error::StatementMismatch);
+        }
+        self.spend(id)
+    }
+
     pub fn is_spent(&self, id: u64) -> bool {
         self.spent
             .lock()
@@ -2158,28 +2188,28 @@ pub fn fold_start_verify_with_groups(
         return Err(Error::StatementMismatch);
     }
     let metadata = statement.oracle(message.id).ok_or(Error::StatementMismatch)?;
-    let runtime = runtime.get(message.id).ok_or(Error::StatementMismatch)?;
+    let runtime_entry = runtime.get(message.id).ok_or(Error::StatementMismatch)?;
     if metadata.group != message.claimed_group
         || metadata.tree_number != message.tree_number
         || metadata.leaf_class != message.notice.leaf_class
         || metadata.mask_rows != message.notice.mask_rows
         || metadata.mask_code != message.notice.mask_code
-        || runtime.root != message.root
-        || runtime.main_rows != 0
-        || runtime.mask_rows != message.notice.mask_rows
-        || runtime.mask_code != message.notice.mask_code
-        || runtime.answers != message.notice.answers
-        || runtime.leaf_class != message.notice.leaf_class
-        || runtime.sampled
+        || runtime_entry.root != message.root
+        || runtime_entry.main_rows != 0
+        || runtime_entry.mask_rows != message.notice.mask_rows
+        || runtime_entry.mask_code != message.notice.mask_code
+        || runtime_entry.answers != message.notice.answers
+        || runtime_entry.leaf_class != message.notice.leaf_class
+        || runtime_entry.sampled
     {
         return Err(Error::StatementMismatch);
     }
-    let oracle = MaskOracle::from_metadata(metadata, runtime.sampled);
+    let oracle = MaskOracle::from_metadata(metadata, runtime_entry.sampled);
     fold_mask_check(shape, &oracle, groups)?;
     if message.root == Digest::ZERO {
         return Err(Error::InvalidProof);
     }
-    statement.spend(message.id)?;
+    statement.spend_as_mask(runtime, message.id)?;
     Ok(())
 }
 

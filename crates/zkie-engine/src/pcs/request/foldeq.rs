@@ -48,7 +48,7 @@ use crate::pcs::request::runtime_tree::RuntimeTreeOpening;
 use crate::pcs::request::fold::{
     fold_mask_shape_fault, fold_output, fold_start_verify, fold_start_verify_with_groups,
     FoldGroupLayout, FoldInputRow, FoldOutput, FoldRoundVerifier, FoldShape, FoldStartMessage,
-    RuntimeOracles,
+    MaskAuthentication, RuntimeOracles,
     VerifiedStatement,
 };
 use crate::pcs::request::read::{
@@ -1320,12 +1320,13 @@ impl FoldeqSession {
     /// low-level check accepts at most that many positions and does not prove
     /// the list's source or completeness. The list comes from this session's
     /// own chain in the harness, which is not connected to production and does
-    /// not claim a complete reference round, proximity, table test or hiding
-    /// closure. With a zero plan count there is nothing to open and the stage
-    /// still advances; whether the block permits zero queries is a
-    /// reference-block condition, and entering this stage does not mean the
-    /// mask was authenticated.
-    pub fn read_mask(&mut self, openings: &RuntimeTreeOpening) -> Result<()> {
+    /// not claim a complete round, proximity, table test or hiding
+    /// closure. With a zero plan count there is nothing to open: this returns
+    /// `NoOpening`, does not mark the mask tree as opened, and leaves the stage
+    /// at `MaskQueried`; it is an explicit no-op, not a successful mask
+    /// authentication. Whether the block permits zero queries is a
+    /// block condition.
+    pub fn read_mask(&mut self, openings: &RuntimeTreeOpening) -> Result<MaskAuthentication> {
         if self.stage != Stage::MaskQueried {
             return Err(Error::InvalidSessionState);
         }
@@ -1340,7 +1341,7 @@ impl FoldeqSession {
             .oracles
             .lock()
             .map_err(|_| Error::InvalidSessionState)?;
-        oracles.authenticate_mask(
+        let outcome = oracles.authenticate_mask(
             tree,
             message.id,
             self.plan.mask_query_count,
@@ -1348,8 +1349,13 @@ impl FoldeqSession {
             openings,
         )?;
         drop(oracles);
-        self.stage = Stage::MaskOpened;
-        Ok(())
+        match outcome {
+            MaskAuthentication::NoOpening => Ok(MaskAuthentication::NoOpening),
+            MaskAuthentication::Verified => {
+                self.stage = Stage::MaskOpened;
+                Ok(MaskAuthentication::Verified)
+            }
+        }
     }
 }
 
@@ -2185,9 +2191,11 @@ mod tests {
                 start.message.root,
             )
             .unwrap();
-        // An empty opening list is allowed (nothing is opened or marked); a
-        // list longer than the plan's draw count is rejected.
-        empty_registry
+        // An empty opening list is an explicit no-opening result, not a
+        // successful mask authentication; it marks nothing, so a later
+        // non-empty opening can still be verified. A list longer than the
+        // plan's draw count is rejected.
+        let no_op = empty_registry
             .authenticate_mask(
                 tree,
                 9,
@@ -2196,6 +2204,10 @@ mod tests {
                 &RuntimeTreeOpening::default(),
             )
             .unwrap();
+        assert_eq!(
+            no_op,
+            crate::pcs::request::fold::MaskAuthentication::NoOpening
+        );
         let long = start.tree.open(&[0u64, 1, 2]).unwrap();
         assert!(empty_registry
             .authenticate_mask(
@@ -2204,6 +2216,28 @@ mod tests {
                 plan.mask_query_count,
                 &[0u64, 1, 2],
                 &long,
+            )
+            .is_err());
+        let verified = empty_registry
+            .authenticate_mask(
+                tree,
+                9,
+                plan.mask_query_count,
+                &positions,
+                &mask_openings,
+            )
+            .unwrap();
+        assert_eq!(
+            verified,
+            crate::pcs::request::fold::MaskAuthentication::Verified
+        );
+        assert!(empty_registry
+            .authenticate_mask(
+                tree,
+                9,
+                plan.mask_query_count,
+                &positions,
+                &mask_openings,
             )
             .is_err());
         session.read_mask(&mask_openings).unwrap();

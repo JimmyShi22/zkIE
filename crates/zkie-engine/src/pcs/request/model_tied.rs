@@ -12,6 +12,19 @@ use zkie_core::types::Digest;
 
 use crate::pcs::request::field::Fp3;
 
+/// Candidate allocation bound for the model adapter. The dimension and
+/// vocabulary are plan values, never proof values; this cap keeps a malformed
+/// or untrusted plan from forcing a huge index vector before a model proof can
+/// start. It is an adapter limit, not a protocol constant.
+pub const MAX_GPT2_EMBEDDING_DIMENSION: u64 = 1 << 20;
+
+fn check_gpt2_dimensions(hidden: u64, vocab: u64) -> Result<()> {
+    if hidden == 0 || vocab == 0 || hidden > MAX_GPT2_EMBEDDING_DIMENSION || vocab > MAX_GPT2_EMBEDDING_DIMENSION {
+        return Err(Error::ResourceLimit);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AssetShape {
     pub rows: u64,
@@ -109,6 +122,7 @@ impl Gpt2Tied {
         if self.hidden == 0 || self.vocab == 0 || self.token >= self.vocab {
             return Err(Error::InvalidIndex);
         }
+        check_gpt2_dimensions(self.hidden, self.vocab)?;
         if self.configuration == Digest::ZERO {
             return Err(Error::InvalidConfig);
         }
@@ -147,7 +161,12 @@ pub fn gpt2_embedding_indices(hidden: u64, vocab: u64, token: u64) -> Result<Vec
     if hidden == 0 || vocab == 0 || token >= vocab {
         return Err(Error::InvalidIndex);
     }
-    let mut indices = Vec::with_capacity(usize::try_from(hidden).map_err(|_| Error::ResourceLimit)?);
+    check_gpt2_dimensions(hidden, vocab)?;
+    let hidden_len = usize::try_from(hidden).map_err(|_| Error::ResourceLimit)?;
+    let mut indices = Vec::new();
+    indices
+        .try_reserve_exact(hidden_len)
+        .map_err(|_| Error::ResourceLimit)?;
     for dimension in 0..hidden {
         indices.push(
             dimension
@@ -163,7 +182,9 @@ pub fn gpt2_embedding_indices(hidden: u64, vocab: u64, token: u64) -> Result<Vec
 /// indices. This is arithmetic evidence only, not an opening or LIN proof.
 pub fn gpt2_lookup(values: &[Fp3], hidden: u64, vocab: u64, token: u64) -> Result<Vec<Fp3>> {
     let indices = gpt2_embedding_indices(hidden, vocab, token)?;
-    let mut out = Vec::with_capacity(indices.len());
+    let mut out = Vec::new();
+    out.try_reserve_exact(indices.len())
+        .map_err(|_| Error::ResourceLimit)?;
     for index in indices {
         out.push(
             *values
@@ -191,6 +212,7 @@ pub fn gpt2_head_token(
     {
         return Err(Error::ShapeMismatch);
     }
+    check_gpt2_dimensions(hidden, vocab)?;
     let mut sum = Fp3::ZERO;
     for (dimension, activation) in activation.iter().enumerate() {
         let index = (dimension as u64)
@@ -388,6 +410,12 @@ mod tests {
         let mut short_embedding = gpt2();
         short_embedding.embedding.indices.pop();
         assert!(short_embedding.check().is_err());
+
+        let mut too_large = gpt2();
+        too_large.hidden = MAX_GPT2_EMBEDDING_DIMENSION + 1;
+        assert!(too_large.check().is_err());
+        assert!(gpt2_embedding_indices(MAX_GPT2_EMBEDDING_DIMENSION + 1, 5, 2).is_err());
+        assert!(gpt2_embedding_indices(3, MAX_GPT2_EMBEDDING_DIMENSION + 1, 2).is_err());
     }
 
     #[test]

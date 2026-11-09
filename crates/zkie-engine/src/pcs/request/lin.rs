@@ -217,6 +217,19 @@ pub struct LinClaim {
 }
 
 impl LinClaim {
+    /// Fixture-level shape agreement: `psi` covers `k_col` and `weights`
+    /// covers the effective `matrix_rows`. This is not a real chain/claim
+    /// binding and does not prove the relation or the source of either field.
+    pub fn check(&self, shape: &LinShape) -> Result<()> {
+        shape.check()?;
+        if self.psi.len() != shape.k_col as usize
+            || self.weights.len() != shape.matrix_rows as usize
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        Ok(())
+    }
+
     pub fn digest(&self) -> Result<Digest> {
         let mut writer = CanonicalWriter::new();
         writer.put_u64(self.weights.len() as u64);
@@ -244,6 +257,7 @@ impl LinClaim {
 
 /// The (Eval) check: W(psi) + sum(coeff * mask value) = target.
 pub fn lin_eval_holds(table: &LinTable, claim: &LinClaim) -> Result<bool> {
+    claim.check(&table.shape)?;
     let w = table.w(&claim.weights)?;
     let mut value = eval(&w, &claim.psi)?;
     for mask in &claim.masks {
@@ -276,6 +290,7 @@ pub fn lin_dot_holds_with(
     omega: &[Fp3],
 ) -> Result<bool> {
     table.shape.check()?;
+    claim.check(&table.shape)?;
     let expected = power_of_two_len(table.shape.k_row() as usize)?;
     if claim.weights.len() != table.shape.matrix_rows as usize
         || shared_point.len() != table.shape.k_col as usize
@@ -431,6 +446,7 @@ pub struct LinFirstFixture {
 impl LinFirstFixture {
     pub fn new(claim: LinClaim, public: LinPublicParameters) -> Result<Self> {
         public.check()?;
+        claim.check(&public.shape)?;
         let claim_digest = claim.digest()?;
         let first_query = first_prefix(&claim_digest, &public)?;
         let seal = fixture_seal(&claim_digest, &first_query);
@@ -535,6 +551,7 @@ pub fn check_lin_skeleton(
     second.public.check()?;
     for entry in first {
         entry.public.check()?;
+        entry.claim.check(&entry.public.shape)?;
         let claim_digest = entry.claim.digest()?;
         if entry.seal == Digest::ZERO
             || entry.first_query.is_empty()
@@ -834,6 +851,10 @@ mod tests {
         short_weights.weights.pop();
         assert!(lin_eval_holds(&table, &short_weights).is_err());
         assert!(lin_dot_holds_with(&table, &short_weights, &shared_point, &shared_omega).is_err());
+        let mut short_psi = claim.clone();
+        short_psi.psi.pop();
+        assert!(short_psi.check(&table.shape).is_err());
+        assert!(lin_eval_holds(&table, &short_psi).is_err());
         assert!(eval(&w, &psi[..2]).is_err());
     }
 
@@ -910,8 +931,8 @@ mod tests {
     #[test]
     fn skeleton_requires_every_first_seal_and_matching_public_parameters() {
         let claim = |target: u64| LinClaim {
-            weights: vec![Fp3::from_u64(1)],
-            psi: vec![Fp3::from_u64(2)],
+            weights: vec![Fp3::from_u64(1), Fp3::from_u64(2), Fp3::from_u64(3)],
+            psi: vec![Fp3::from_u64(4), Fp3::from_u64(5), Fp3::from_u64(6)],
             masks: Vec::new(),
             target: Fp3::from_u64(target),
         };
@@ -963,6 +984,33 @@ mod tests {
             &second
         )
         .is_err());
+        let mut wrong_claim_shape = first_a.clone();
+        wrong_claim_shape.claim.psi.pop();
+        assert!(check_lin_skeleton(
+            &[wrong_claim_shape, first_b.clone()],
+            &shared,
+            &second
+        )
+        .is_err());
+        let mut bad_claim = LinClaim {
+            weights: vec![Fp3::from_u64(1)],
+            psi: vec![Fp3::from_u64(2)],
+            masks: Vec::new(),
+            target: Fp3::from_u64(3),
+        };
+        assert!(LinFirstFixture::new(bad_claim.clone(), public()).is_err());
+        bad_claim.psi = vec![Fp3::from_u64(1), Fp3::from_u64(2), Fp3::from_u64(3)];
+        assert!(LinFirstFixture::new(bad_claim, public()).is_err());
+        assert!(LinFirstFixture::new(
+            LinClaim {
+                weights: vec![Fp3::from_u64(1), Fp3::from_u64(2), Fp3::from_u64(3)],
+                psi: vec![Fp3::from_u64(1), Fp3::from_u64(2)],
+                masks: Vec::new(),
+                target: Fp3::from_u64(3),
+            },
+            public()
+        )
+        .is_err());
         let mut wrong_second_public = second.clone();
         wrong_second_public.public.shape = LinShape::new(5, 2, 2, 20).unwrap();
         assert!(check_lin_skeleton(
@@ -998,8 +1046,8 @@ mod tests {
     #[test]
     fn skeleton_is_a_fixture_not_a_chain_claim() {
         let claim = LinClaim {
-            weights: vec![Fp3::from_u64(1)],
-            psi: vec![Fp3::from_u64(2)],
+            weights: vec![Fp3::from_u64(1), Fp3::from_u64(2), Fp3::from_u64(3)],
+            psi: vec![Fp3::from_u64(4), Fp3::from_u64(5), Fp3::from_u64(6)],
             masks: Vec::new(),
             target: Fp3::from_u64(3),
         };
