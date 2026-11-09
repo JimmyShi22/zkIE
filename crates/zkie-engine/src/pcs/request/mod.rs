@@ -1,3 +1,4 @@
+pub mod bat;
 pub mod chain;
 pub mod code;
 pub mod field;
