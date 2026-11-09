@@ -17,6 +17,7 @@
 //! proof.
 
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use zkie_core::error::{Error, Result};
@@ -25,6 +26,8 @@ use zkie_core::types::Digest;
 use crate::pcs::request::code::{build_code_plan, CodeParams};
 use crate::pcs::request::field::{E_DEGREE, Fp3};
 use crate::pcs::request::runtime_tree::{MaskTree, MaskTreePlan};
+use crate::primitives::codec::CanonicalWriter;
+use crate::primitives::transcript::{hash_labeled, tag_word, STATEMENT};
 
 /// The draw number that no source produces.
 pub const NO_DRAW: u32 = u32::MAX;
@@ -647,6 +650,7 @@ pub fn fold_mask_sum(k: u32, w: &[Fp3]) -> Result<Fp3> {
 pub struct FoldStartMessage {
     pub id: u64,
     pub claimed_group: u64,
+    pub tree_number: u64,
     pub notice: MaskNotice,
     pub root: Digest,
     pub sum: Fp3,
@@ -678,6 +682,87 @@ impl MaskSpend {
 
     pub fn is_spent(&self, id: u64) -> bool {
         self.spent.contains(&id)
+    }
+}
+
+/// The verifier's statement for one run: the group registry, the runtime mask
+/// tree layouts and the shared single-use mask ledger, bound by an internal
+/// statement digest. The verifier constructs it from its own verified plan and
+/// commitment; the type cannot prove that origin, and building it from proof
+/// bytes would be a caller error. The digest is an internal binding, not a
+/// public artifact identity.
+#[derive(Clone, Debug)]
+pub struct VerifiedStatement {
+    pub id: Digest,
+    pub groups: VerifiedGroups,
+    pub mask_trees: Vec<MaskTreePlan>,
+    spent: Arc<Mutex<MaskSpend>>,
+}
+
+impl VerifiedStatement {
+    pub fn new(groups: VerifiedGroups, mask_trees: Vec<MaskTreePlan>) -> Result<Self> {
+        for tree in &mask_trees {
+            if tree.fault().is_some() {
+                return Err(Error::InvalidConfig);
+            }
+        }
+        let mut writer = CanonicalWriter::new();
+        writer.put_u64(groups.groups.len() as u64);
+        for group in &groups.groups {
+            writer.put_u64(group.group);
+            writer.put_u64(group.members.len() as u64);
+            for member in &group.members {
+                writer.put_u64(*member);
+            }
+            writer.put_u64(if group.fresh.is_some() { 1 } else { 0 });
+            writer.put_u64(group.fresh.unwrap_or(0));
+        }
+        writer.put_u64(mask_trees.len() as u64);
+        for tree in &mask_trees {
+            writer.put_u64(tree.tree_number);
+            writer.put_u64(tree.leaf_class as u64);
+            writer.put_u64(tree.log_n as u64);
+            writer.put_u64(tree.mask_rows);
+            writer.put_u64(tree.salt_bytes as u64);
+            writer.put_digest(&tree.run);
+            writer.put_digest(&tree.configuration);
+        }
+        let id = hash_labeled(
+            tag_word(STATEMENT, 0),
+            0,
+            None,
+            &writer.into_bytes(),
+        )?;
+        Ok(Self {
+            id,
+            groups,
+            mask_trees,
+            spent: Arc::new(Mutex::new(MaskSpend::default())),
+        })
+    }
+
+    pub fn groups(&self) -> &VerifiedGroups {
+        &self.groups
+    }
+
+    pub fn mask_tree(&self, tree_number: u64) -> Option<&MaskTreePlan> {
+        self.mask_trees
+            .iter()
+            .find(|tree| tree.tree_number == tree_number)
+    }
+
+    pub fn spend(&self, id: u64) -> Result<()> {
+        self.spent
+            .lock()
+            .map_err(|_| Error::InvalidSessionState)?
+            .spend(id)
+    }
+
+    pub fn is_spent(&self, id: u64) -> bool {
+        self.spent
+            .lock()
+            .map(|spent| spent.is_spent(id))
+            .unwrap_or(true)
     }
 }
 
@@ -748,9 +833,11 @@ pub fn fold_start_prove(
     let tails = mask_tail_rows(shape, mask)?;
     let tree = MaskTree::commit(tree_plan, shape, &rows, &tails, salts)?;
     let sum = fold_mask_sum(shape.k, mask.coefficients())?;
+    let tree_number = tree_plan.tree_number;
     let message = FoldStartMessage {
         id: oracle.id,
         claimed_group: oracle.claimed_group,
+        tree_number,
         notice: draft.notice,
         root: tree.root,
         sum,
@@ -768,11 +855,12 @@ pub fn fold_start_prove(
 pub fn fold_start_verify(
     shape: &FoldShape,
     message: &FoldStartMessage,
-    groups: &VerifiedGroups,
-    tree_plan: &MaskTreePlan,
-    spend: &mut MaskSpend,
+    statement: &VerifiedStatement,
 ) -> Result<()> {
     validate_fold_mask_shape(shape)?;
+    let tree_plan = statement
+        .mask_tree(message.tree_number)
+        .ok_or(Error::StatementMismatch)?;
     if tree_plan.fault().is_some() {
         return Err(Error::InvalidConfig);
     }
@@ -788,11 +876,11 @@ pub fn fold_start_verify(
         return Err(Error::StatementMismatch);
     }
     let oracle = MaskOracle::from_notice(message.id, message.claimed_group, &message.notice);
-    fold_mask_check(shape, &oracle, groups)?;
+    fold_mask_check(shape, &oracle, statement.groups())?;
     if message.root == Digest::ZERO {
         return Err(Error::InvalidProof);
     }
-    spend.spend(message.id)?;
+    statement.spend(message.id)?;
     Ok(())
 }
 
@@ -1094,9 +1182,12 @@ mod tests {
         assert_eq!(start.draft.table.rows, 2);
         assert_eq!(start.draft.tail.draws, mask.tail().unwrap().draws);
         // The verifier accepts the public message with no prover secret.
-        let mut spend = MaskSpend::default();
-        fold_start_verify(&shape, &start.message, &groups, &plan, &mut spend).unwrap();
-        assert!(fold_start_verify(&shape, &start.message, &groups, &plan, &mut spend).is_err());
+        let statement = VerifiedStatement::new(groups.clone(), vec![plan]).unwrap();
+        fold_start_verify(&shape, &start.message, &statement).unwrap();
+        assert!(fold_start_verify(&shape, &start.message, &statement).is_err());
+        let mut bad = start.message.clone();
+        bad.tree_number = 6;
+        assert!(fold_start_verify(&shape, &bad, &statement).is_err());
         // The committed root opens the mask tree at the drawn positions.
         let positions = [1u64, 4];
         let openings = start.tree.open(&positions).unwrap();
@@ -1110,20 +1201,10 @@ mod tests {
         // layout is rejected before the spend.
         let mut bad = start.message.clone();
         bad.claimed_group = 7;
-        assert!(fold_start_verify(&shape, &bad, &groups, &plan, &mut MaskSpend::default()).is_err());
+        assert!(fold_start_verify(&shape, &bad, &statement).is_err());
         let mut bad = start.message.clone();
         bad.notice.mask_rows = 4;
-        assert!(fold_start_verify(&shape, &bad, &groups, &plan, &mut MaskSpend::default()).is_err());
-        let mut bad_plan = plan;
-        bad_plan.mask_rows = 4;
-        assert!(fold_start_verify(
-            &shape,
-            &start.message,
-            &groups,
-            &bad_plan,
-            &mut MaskSpend::default()
-        )
-        .is_err());
+        assert!(fold_start_verify(&shape, &bad, &statement).is_err());
         // A tampered prover coefficient fails the self-check.
         let mut tampered_mask = FoldMask {
             coefficients: mask.coefficients().to_vec(),

@@ -7,8 +7,10 @@
 //! an exhausted budget fails closed. This module is not wired into
 //! production; the plan/priced_table that fixes the budget is still open.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
 
@@ -77,19 +79,142 @@ impl ReadBudget {
     }
 }
 
-/// The verifier's column reads: one budget and one value store per statement.
-#[derive(Clone, Debug, Default)]
+/// A reservation made against a read ledger. A token is committed once or
+/// cancelled once; a forged or replayed token fails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadReservation {
+    serial: u64,
+    reads: u64,
+}
+
+/// The verifier's cross-batch read ledger. It lives with the statement, not
+/// with one session, so starting a new session cannot reset the budget. Reads
+/// are reserved atomically before verification and committed after success;
+/// a failed read cancels its reservation, while a crash leaves it outstanding
+/// and `recover` counts it as used (fail closed). The unit is one column read.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadLedger {
+    max_reads: u64,
+    used: u64,
+    reserved: u64,
+    next_serial: u64,
+    outstanding: BTreeMap<u64, u64>,
+}
+
+impl ReadLedger {
+    pub fn new(max_reads: u64) -> Self {
+        Self {
+            max_reads,
+            used: 0,
+            reserved: 0,
+            next_serial: 0,
+            outstanding: BTreeMap::new(),
+        }
+    }
+
+    pub fn max_reads(&self) -> u64 {
+        self.max_reads
+    }
+
+    pub fn used(&self) -> u64 {
+        self.used
+    }
+
+    pub fn reserved(&self) -> u64 {
+        self.reserved
+    }
+
+    pub fn outstanding(&self) -> usize {
+        self.outstanding.len()
+    }
+
+    /// Reserve `reads` atomically. Exhaustion fails before any verification.
+    pub fn reserve(&mut self, reads: usize) -> Result<ReadReservation> {
+        let reads = u64::try_from(reads).map_err(|_| Error::ResourceLimit)?;
+        let used = self
+            .used
+            .checked_add(self.reserved)
+            .and_then(|total| total.checked_add(reads))
+            .ok_or(Error::ResourceLimit)?;
+        if used > self.max_reads {
+            return Err(Error::ResourceLimit);
+        }
+        let serial = self.next_serial;
+        self.next_serial = self.next_serial.checked_add(1).ok_or(Error::ResourceLimit)?;
+        self.outstanding.insert(serial, reads);
+        self.reserved = self
+            .reserved
+            .checked_add(reads)
+            .ok_or(Error::ResourceLimit)?;
+        Ok(ReadReservation { serial, reads })
+    }
+
+    /// Commit a successful read. A missing or mismatched token fails.
+    pub fn commit(&mut self, reservation: ReadReservation) -> Result<()> {
+        let reads = self
+            .outstanding
+            .remove(&reservation.serial)
+            .ok_or(Error::StatementMismatch)?;
+        if reads != reservation.reads {
+            return Err(Error::StatementMismatch);
+        }
+        self.reserved = self
+            .reserved
+            .checked_sub(reads)
+            .ok_or(Error::StatementMismatch)?;
+        self.used = self
+            .used
+            .checked_add(reads)
+            .ok_or(Error::ResourceLimit)?;
+        Ok(())
+    }
+
+    /// Cancel a read that failed before its result was accepted.
+    pub fn cancel(&mut self, reservation: ReadReservation) -> Result<()> {
+        let reads = self
+            .outstanding
+            .remove(&reservation.serial)
+            .ok_or(Error::StatementMismatch)?;
+        if reads != reservation.reads {
+            return Err(Error::StatementMismatch);
+        }
+        self.reserved = self
+            .reserved
+            .checked_sub(reads)
+            .ok_or(Error::StatementMismatch)?;
+        Ok(())
+    }
+
+    /// Recovery: an outstanding reservation may have been read before a crash,
+    /// so it is counted as used and cleared. This can only spend budget, never
+    /// return it.
+    pub fn recover(&mut self) {
+        self.used = self.used.saturating_add(self.reserved);
+        self.reserved = 0;
+        self.outstanding.clear();
+    }
+}
+
+/// The verifier's column reads: a shared ledger and one value store per
+/// session. The ledger is the authority for the budget; the value store keeps
+/// repeated reads consistent.
+#[derive(Clone, Debug)]
 pub struct VerifierReads {
-    budget: ReadBudget,
+    ledger: Arc<Mutex<ReadLedger>>,
     values: HashMap<(Digest, u64), Vec<Fp>>,
 }
 
 impl VerifierReads {
-    pub fn new(max_reads: u64) -> Self {
+    /// The ledger must come from the statement; a session cannot reset it.
+    pub fn new(ledger: Arc<Mutex<ReadLedger>>) -> Self {
         Self {
-            budget: ReadBudget::new(max_reads),
+            ledger,
             values: HashMap::new(),
         }
+    }
+
+    pub fn ledger(&self) -> Arc<Mutex<ReadLedger>> {
+        Arc::clone(&self.ledger)
     }
 
     /// Verify the openings for `positions`, charge one read per position and
@@ -105,7 +230,35 @@ impl VerifierReads {
         if positions.len() != openings.len() {
             return Err(Error::ShapeMismatch);
         }
-        self.budget.charge(positions.len())?;
+        let reservation = self
+            .ledger
+            .lock()
+            .map_err(|_| Error::InvalidSessionState)?
+            .reserve(positions.len())?;
+        let result = self.verify_and_remember(reader, positions, openings);
+        match result {
+            Ok(columns) => {
+                self.ledger
+                    .lock()
+                    .map_err(|_| Error::InvalidSessionState)?
+                    .commit(reservation)?;
+                Ok(columns)
+            }
+            Err(error) => {
+                if let Ok(mut ledger) = self.ledger.lock() {
+                    let _ = ledger.cancel(reservation);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn verify_and_remember(
+        &mut self,
+        reader: &IndexReader,
+        positions: &[u64],
+        openings: &[ColumnOpening],
+    ) -> Result<Vec<Vec<Fp>>> {
         let mut columns = Vec::new();
         columns
             .try_reserve_exact(positions.len())
@@ -142,9 +295,6 @@ impl VerifierReads {
         self.values.get(&(root, position)).map(Vec::as_slice)
     }
 
-    pub fn budget(&self) -> ReadBudget {
-        self.budget
-    }
 }
 
 /// The prover's column reads: a budget and an opening cache. A repeated
@@ -199,6 +349,7 @@ mod tests {
     use crate::pcs::request::code::build_code_plan;
     use crate::pcs::request::params::LEAF_SALT_MIN_BYTES;
     use crate::pcs::request::table::{commit_table, IndexShape, TableDistances};
+    use std::sync::{Arc, Mutex};
     use zkie_core::common::field::PrimeCharacteristicRing;
 
     fn shape() -> IndexShape {
@@ -246,6 +397,14 @@ mod tests {
         chain
     }
 
+    fn ledger(max_reads: u64) -> Arc<Mutex<ReadLedger>> {
+        Arc::new(Mutex::new(ReadLedger::new(max_reads)))
+    }
+
+    fn used(reads: &VerifierReads) -> u64 {
+        reads.ledger().lock().unwrap().used()
+    }
+
     #[test]
     fn positions_are_drawn_in_range_and_deterministically() {
         let shape = shape();
@@ -268,20 +427,19 @@ mod tests {
         let table = committed();
         let positions = [1u64, 4];
         let openings = table.open_columns(&positions).unwrap();
-        let mut reads = VerifierReads::new(2);
+        let mut reads = VerifierReads::new(ledger(2));
         let columns = reads.read(&table.reader, &positions, &openings).unwrap();
         assert_eq!(columns.len(), 2);
-        assert_eq!(reads.budget().used(), 2);
-        assert_eq!(reads.budget().remaining(), 0);
+        assert_eq!(used(&reads), 2);
         assert_eq!(reads.values(table.reader.root, 1), Some(columns[0].as_slice()));
         // A repeated read returns the remembered values and still charges.
         let again = reads.read(&table.reader, &positions[..1], &openings[..1]).unwrap_err();
         assert!(matches!(again, Error::ResourceLimit));
-        let mut reads = VerifierReads::new(4);
+        let mut reads = VerifierReads::new(ledger(4));
         let first = reads.read(&table.reader, &positions, &openings).unwrap();
         let second = reads.read(&table.reader, &positions, &openings).unwrap();
         assert_eq!(first, second);
-        assert_eq!(reads.budget().used(), 4);
+        assert_eq!(used(&reads), 4);
         // The value store rejects a conflicting column for the same address.
         let different = vec![Fp::from_u64(999); shape().rows() as usize];
         assert!(reads
@@ -309,11 +467,77 @@ mod tests {
     }
 
     #[test]
+    fn ledger_reservations_are_atomic_and_shared() {
+        let shared = ledger(2);
+        let mut first = VerifierReads::new(Arc::clone(&shared));
+        let table = committed();
+        let positions = [1u64];
+        let openings = table.open_columns(&positions).unwrap();
+        first.read(&table.reader, &positions, &openings).unwrap();
+        assert_eq!(used(&first), 1);
+        // The ledger is shared: a new session sees the used read and spends
+        // the remaining budget rather than starting over.
+        let mut second = VerifierReads::new(Arc::clone(&shared));
+        second.read(&table.reader, &positions, &openings).unwrap();
+        assert_eq!(shared.lock().unwrap().used(), 2);
+        let mut third = VerifierReads::new(Arc::clone(&shared));
+        assert!(third.read(&table.reader, &positions, &openings).is_err());
+        // Reservations are atomic and never overspend.
+        let mut ledger = ReadLedger::new(2);
+        let reservation = ledger.reserve(1).unwrap();
+        assert!(ledger.reserve(2).is_err());
+        ledger.commit(reservation).unwrap();
+        assert!(ledger.reserve(2).is_err());
+        ledger.reserve(1).unwrap();
+    }
+
+    #[test]
+    fn recovery_counts_outstanding_reservations_as_used() {
+        let mut ledger = ReadLedger::new(3);
+        let _reservation = ledger.reserve(2).unwrap();
+        ledger.recover();
+        assert_eq!(ledger.used(), 2);
+        assert_eq!(ledger.reserved(), 0);
+        assert_eq!(ledger.outstanding(), 0);
+    }
+
+    #[test]
+    fn failed_read_cancels_its_reservation() {
+        let table = committed();
+        let positions = [1u64, 4];
+        let openings = table.open_columns(&positions).unwrap();
+        let shared = ledger(2);
+        let mut reads = VerifierReads::new(Arc::clone(&shared));
+        let mut tampered = openings.clone();
+        tampered[0].symbols[0] = tampered[0].symbols[0] + Fp::ONE;
+        assert!(reads.read(&table.reader, &positions, &tampered).is_err());
+        assert_eq!(shared.lock().unwrap().used(), 0);
+        assert_eq!(shared.lock().unwrap().reserved(), 0);
+        // The budget is still available after the failed read.
+        reads.read(&table.reader, &positions, &openings).unwrap();
+        assert_eq!(shared.lock().unwrap().used(), 2);
+    }
+
+    #[test]
+    fn recovery_keeps_the_budget_spent() {
+        let mut ledger = ReadLedger::new(3);
+        let _reservation = ledger.reserve(2).unwrap();
+        assert_eq!(ledger.reserved(), 2);
+        ledger.recover();
+        assert_eq!(ledger.used(), 2);
+        assert_eq!(ledger.reserved(), 0);
+        assert_eq!(ledger.outstanding(), 0);
+        let reservation = ledger.reserve(1).unwrap();
+        ledger.cancel(reservation).unwrap();
+        assert_eq!(ledger.used(), 2);
+    }
+
+    #[test]
     fn read_errors_do_not_panic() {
         let table = committed();
         let positions = [1u64, 4];
         let openings = table.open_columns(&positions).unwrap();
-        let mut reads = VerifierReads::new(4);
+        let mut reads = VerifierReads::new(ledger(4));
         assert!(reads.read(&table.reader, &positions, &openings[..1]).is_err());
         let mut wrong = openings.clone();
         wrong[0].position = 2;

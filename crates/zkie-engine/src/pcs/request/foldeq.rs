@@ -8,6 +8,8 @@
 //! start message. The G_u table/OOD relations, the FOLD round polynomials and
 //! the table test are not in this skeleton and no closure is claimed.
 
+use std::sync::{Arc, Mutex};
+
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
 
@@ -16,11 +18,9 @@ use crate::pcs::request::chain::{
 };
 use crate::pcs::request::field::{Fp, Fp3};
 use crate::pcs::request::fold::{
-    fold_mask_shape_fault, fold_start_verify, FoldShape, FoldStartMessage, MaskSpend,
-    VerifiedGroups,
+    fold_mask_shape_fault, fold_start_verify, FoldShape, FoldStartMessage, VerifiedStatement,
 };
-use crate::pcs::request::read::{draw_positions, VerifierReads};
-use crate::pcs::request::runtime_tree::MaskTreePlan;
+use crate::pcs::request::read::{draw_positions, ReadLedger, VerifierReads};
 use crate::pcs::request::table::{
     record_seeds, ColumnOpening, IndexName, IndexReader, SampleSeed,
 };
@@ -71,12 +71,12 @@ impl FoldeqBinder {
 pub struct FoldeqPlan {
     pub reader: IndexReader,
     pub fold: FoldShape,
-    pub mask_tree: MaskTreePlan,
-    pub groups: VerifiedGroups,
+    pub statement: Arc<VerifiedStatement>,
+    pub mask_tree_number: u64,
     pub group_id: u64,
     pub leaf_class: u32,
     pub seed_budget: usize,
-    pub read_budget: u64,
+    pub ledger: Arc<Mutex<ReadLedger>>,
     pub column_draws: usize,
 }
 
@@ -88,20 +88,24 @@ impl FoldeqPlan {
         if let Some(fault) = fold_mask_shape_fault(&self.fold) {
             return Some(fault);
         }
-        if let Some(fault) = self.mask_tree.fault() {
+        let tree = match self.statement.mask_tree(self.mask_tree_number) {
+            Some(tree) => tree,
+            None => return Some("the plan names a runtime tree the statement does not hold"),
+        };
+        if let Some(fault) = tree.fault() {
             return Some(fault);
         }
         let rows = match self.fold.mask_rows() {
             Ok(rows) => rows,
             Err(_) => return Some("the fold shape has no mask rows"),
         };
-        if self.mask_tree.mask_rows != rows
-            || self.mask_tree.log_n != self.fold.mask_code.log_n
-            || self.mask_tree.leaf_class != self.fold.mask_leaf_class
+        if tree.mask_rows != rows
+            || tree.log_n != self.fold.mask_code.log_n
+            || tree.leaf_class != self.fold.mask_leaf_class
         {
             return Some("the runtime mask tree does not match the fold shape");
         }
-        let group = match self.groups.get(self.group_id) {
+        let group = match self.statement.groups().get(self.group_id) {
             Some(group) => group,
             None => return Some("the plan names a group the verifier does not hold"),
         };
@@ -115,7 +119,11 @@ impl FoldeqPlan {
             Ok(draws) => draws,
             Err(_) => return Some("the column draw count does not fit"),
         };
-        if draws > self.read_budget {
+        let max_reads = match self.ledger.lock() {
+            Ok(ledger) => ledger.max_reads(),
+            Err(_) => return Some("the read ledger is poisoned"),
+        };
+        if draws > max_reads {
             return Some("the column draws exceed the read budget");
         }
         let answers = self.reader.shape.answers as usize;
@@ -175,7 +183,6 @@ pub struct FoldeqSession {
     gu_root: Option<Digest>,
     start: Option<FoldStartMessage>,
     epsilon: Option<Fp3>,
-    spend: MaskSpend,
     queries: Vec<u64>,
 }
 
@@ -194,7 +201,7 @@ impl FoldeqSession {
         {
             return Err(Error::StatementMismatch);
         }
-        let reads = VerifierReads::new(plan.read_budget);
+        let reads = VerifierReads::new(Arc::clone(&plan.ledger));
         Ok(Self {
             plan,
             chain,
@@ -204,7 +211,6 @@ impl FoldeqSession {
             gu_root: None,
             start: None,
             epsilon: None,
-            spend: MaskSpend::default(),
             queries: Vec::new(),
         })
     }
@@ -327,13 +333,12 @@ impl FoldeqSession {
         if self.stage != Stage::Read {
             return Err(Error::InvalidSessionState);
         }
-        fold_start_verify(
-            &self.plan.fold,
-            message,
-            &self.plan.groups,
-            &self.plan.mask_tree,
-            &mut self.spend,
-        )?;
+        if message.tree_number != self.plan.mask_tree_number
+            || message.claimed_group != self.plan.group_id
+        {
+            return Err(Error::StatementMismatch);
+        }
+        fold_start_verify(&self.plan.fold, message, &self.plan.statement)?;
         let mut out = self.chain.message();
         out.push_u64(message.id);
         out.push_u64(message.claimed_group);
@@ -366,12 +371,12 @@ mod tests {
     use crate::pcs::request::field::{Fp, MODULUS};
     use crate::pcs::request::fold::{
         fold_mask_make, fold_mask_make_tail, fold_mask_notice, fold_start_prove, MaskOracle,
-        VerifiedGroup,
+        VerifiedGroup, VerifiedGroups, VerifiedStatement,
     };
     use crate::pcs::request::params::{LEAF_SALT_MIN_BYTES, REQUEST_CHAIN_LABEL};
     use crate::pcs::request::read::ProverReads;
     use crate::pcs::request::runtime_tree::MaskTreePlan;
-    use crate::pcs::request::table::{commit_table, IndexShape, TableDistances};
+        use crate::pcs::request::table::{commit_table, IndexShape, TableDistances};
     use crate::primitives::transcript::{hash_labeled, tag_word, TEST_COINS};
     use zkie_core::common::field::PrimeCharacteristicRing;
 
@@ -444,21 +449,29 @@ mod tests {
 
     fn plan_fixture() -> (FoldeqPlan, crate::pcs::request::table::CommittedTable) {
         let table = committed();
+        let tree = mask_tree();
+        let statement = Arc::new(
+            VerifiedStatement::new(
+                VerifiedGroups {
+                    groups: vec![VerifiedGroup {
+                        group: 1,
+                        members: vec![1, 2],
+                        fresh: Some(9),
+                    }],
+                },
+                vec![tree],
+            )
+            .unwrap(),
+        );
         let plan = FoldeqPlan {
             reader: table.reader.clone(),
             fold: fold_shape(),
-            mask_tree: mask_tree(),
-            groups: VerifiedGroups {
-                groups: vec![VerifiedGroup {
-                    group: 1,
-                    members: vec![1, 2],
-                    fresh: Some(9),
-                }],
-            },
+            statement,
+            mask_tree_number: tree.tree_number,
             group_id: 1,
             leaf_class: 3,
             seed_budget: table.reader.shape.answers as usize,
-            read_budget: 2,
+            ledger: Arc::new(Mutex::new(ReadLedger::new(2))),
             column_draws: 2,
         };
         (plan, table)
@@ -478,14 +491,15 @@ mod tests {
         mask.sent_as(9).unwrap();
         let notice = fold_mask_notice(&plan.fold).unwrap();
         let oracle = MaskOracle::from_notice(9, 1, &notice);
+        let tree = *plan.statement.mask_tree(plan.mask_tree_number).unwrap();
         fold_start_prove(
             &plan.fold,
             &mask,
             &source,
             &oracle,
-            &plan.groups,
-            plan.mask_tree,
-            &mask_salts(&plan.mask_tree),
+            plan.statement.groups(),
+            tree,
+            &mask_salts(&tree),
         )
         .unwrap()
     }
@@ -536,7 +550,7 @@ mod tests {
         assert_eq!(session.gu_root(), Some(&Digest([4; 32])));
         session.draw_queries().unwrap();
         assert_eq!(session.queries().len(), plan.column_draws);
-        let mut prover = ProverReads::new(plan.read_budget);
+        let mut prover = ProverReads::new(plan.ledger.lock().unwrap().max_reads());
         let openings = prover.open(&table, session.queries()).unwrap();
         let columns = session.read_queries(&openings).unwrap();
         assert_eq!(columns.len(), plan.column_draws);
@@ -563,13 +577,13 @@ mod tests {
         assert!(FoldeqSession::open(plan, binder, chain).is_err());
 
         let (mut plan, _table) = plan_fixture();
-        plan.mask_tree.mask_rows = 4;
+        plan.mask_tree_number = 6;
         let binder = FoldeqBinder::new(REQUEST_CHAIN_LABEL, Digest::ZERO, &plan).unwrap();
         let chain = binder.chain().unwrap();
         assert!(FoldeqSession::open(plan, binder, chain).is_err());
 
         let (mut plan, _table) = plan_fixture();
-        plan.read_budget = 1;
+        plan.ledger = Arc::new(Mutex::new(ReadLedger::new(1)));
         plan.column_draws = 2;
         let binder = FoldeqBinder::new(REQUEST_CHAIN_LABEL, Digest::ZERO, &plan).unwrap();
         let chain = binder.chain().unwrap();
