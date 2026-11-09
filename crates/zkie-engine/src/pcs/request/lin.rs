@@ -3,7 +3,7 @@
 //! This module models only a candidate linear matrix claim and the three local
 //! relation values used by the isolated session skeleton. It is not a complete
 //! LIN proof, a model decoder, or a production relation. Challenge order, tree
-//! bookkeeping, mask messages, BATT, the folding equations, the proximity tests,
+//! bookkeeping, mask messages, BAT, the folding equations, the proximity tests,
 //! hiding, and real seals are not connected here and remain fail-closed. The
 //! trusted source of shape, claims and table identity remains a caller/plan
 //! gate; a proof must not supply them. The small arithmetic tests are
