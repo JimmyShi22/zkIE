@@ -701,6 +701,11 @@ impl RuntimeOracles {
     /// nothing; an opening count mismatch or a caller list is rejected. This
     /// checks the opening only: it is not a complete authentication, a
     /// proximity test, a table test or a relation closure.
+    ///
+    /// This is a low-level entry. The count and positions are caller-supplied
+    /// and are not self-authenticating: only a trusted session whose transcript
+    /// binds the frozen plan may call it, and the tree's complete identity is
+    /// checked by that plan, not by this function.
     pub fn authenticate_mask(
         &mut self,
         tree_plan: &MaskTreePlan,

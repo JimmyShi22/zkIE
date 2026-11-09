@@ -265,7 +265,14 @@ impl FoldeqPlan {
                 if shape.k_col != expected {
                     return Some("the LIN challenge path does not end at the table width");
                 }
-                let width = match shape.matrix_rows.checked_shl(shape.k_lo) {
+                // A shift that loses high bits is not a fit: checked_shl only
+                // rejects an out-of-range shift amount, so use a checked
+                // multiply by the explicit power of two instead.
+                let factor = match 1u64.checked_shl(shape.k_lo) {
+                    Some(factor) => factor,
+                    None => return Some("the matrix width overflows"),
+                };
+                let width = match shape.matrix_rows.checked_mul(factor) {
                     Some(width) => width,
                     None => return Some("the matrix width overflows"),
                 };
@@ -638,7 +645,10 @@ impl FoldeqSession {
     /// Check the mask opening at the positions the verifier's transcript drew.
     /// The plan's count is a different source from the drawn list. This checks
     /// the opening only; not a complete authentication, proximity, table test
-    /// or relation closure.
+    /// or relation closure. With a zero plan count there is nothing to open and
+    /// the stage still advances; whether the block permits zero queries is a
+    /// reference-block condition, and entering this stage does not mean the
+    /// mask was authenticated.
     pub fn read_mask(&mut self, openings: &[MaskColumnOpening]) -> Result<()> {
         if self.stage != Stage::MaskQueried {
             return Err(Error::InvalidSessionState);
@@ -1100,6 +1110,27 @@ use crate::pcs::request::fold::{
 
         let mut bad = plan.clone();
         bad.gamma_path = GammaPath::Lin { shape: LinShapeBinding { matrix_rows: 1, k_lo: 0, k_col: 1 } };
+        assert!(FoldeqSession::open(bad, binder.clone(), chain.clone()).is_err());
+
+        // A matrix whose width loses high bits must be refused, not wrapped to
+        // a small value; the checked multiply rejects the overflow.
+        let mut bad = plan.clone();
+        bad.gamma_path = GammaPath::Lin {
+            shape: LinShapeBinding { matrix_rows: 1u64 << 63, k_lo: 1, k_col: 3 },
+        };
+        assert_eq!(bad.fault(), Some("the matrix width overflows"));
+        assert!(FoldeqSession::open(bad, binder.clone(), chain.clone()).is_err());
+
+        // A matrix that does not overflow but exceeds the plain columns is
+        // refused by the upper-bound check.
+        let mut bad = plan.clone();
+        bad.gamma_path = GammaPath::Lin {
+            shape: LinShapeBinding { matrix_rows: 2, k_lo: 0, k_col: 2 },
+        };
+        assert_eq!(
+            bad.fault(),
+            Some("the matrix does not fit the table's plain columns")
+        );
         assert!(FoldeqSession::open(bad, binder.clone(), chain.clone()).is_err());
 
         let mut bad = plan;
