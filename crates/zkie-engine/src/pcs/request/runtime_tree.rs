@@ -560,16 +560,14 @@ impl RuntimeTreeLay {
             if plan.leaf_class != oracle.leaf_class {
                 return Some("a runtime layout tree has another leaf class than its oracle");
             }
-            let main_symbols = oracle
-                .main_rows
-                .checked_mul(oracle.main_deg as u64)
-                .ok_or(Error::ResourceLimit)
-                .ok()?;
-            let mask_symbols = oracle
-                .mask_rows
-                .checked_mul(E_DEGREE as u64)
-                .ok_or(Error::ResourceLimit)
-                .ok()?;
+            let main_symbols = match oracle.main_rows.checked_mul(oracle.main_deg as u64) {
+                Some(value) => value,
+                None => return Some("a runtime layout oracle's main width overflows"),
+            };
+            let mask_symbols = match oracle.mask_rows.checked_mul(E_DEGREE as u64) {
+                Some(value) => value,
+                None => return Some("a runtime layout oracle's mask width overflows"),
+            };
             if plan.parts[part].main_symbols != main_symbols
                 || plan.parts[part].mask_symbols != mask_symbols
             {
@@ -595,13 +593,41 @@ impl RuntimeTreeLay {
         None
     }
 
-    /// A layout received from elsewhere must equal the verifier's own trusted
-    /// oracle shapes before it is used; the verifier rebuilds or checks it.
+    /// Local structural consistency only: the layout must agree with the
+    /// oracle shape list it carries. This is not a reconstruction gate, and an
+    /// external layout must not be trusted on this check alone.
     pub fn check_against(&self, oracles: &[RuntimeOracleShape]) -> Option<&'static str> {
         if self.oracles != oracles {
             return Some("the runtime layout was not built from these trusted oracle shapes");
         }
         self.fault()
+    }
+
+    /// The integration gate: build the layout independently from the
+    /// verifier's trusted ordered oracle shapes and the trusted tree context
+    /// (the first tree number, salt length, run and configuration) and compare
+    /// the complete external layout with it. The external layout's own tree
+    /// numbers, starts and oracle list are not trusted inputs; a reordered,
+    /// split or re-contexted layout differs from the rebuilt one and is
+    /// rejected. The mask short-column mapping and the co-tree commit/open/read
+    /// paths remain unimplemented.
+    pub fn check_rebuilt(
+        &self,
+        oracles: &[RuntimeOracleShape],
+        first_tree_number: u64,
+        salt_bytes: usize,
+        run: Digest,
+        configuration: Digest,
+    ) -> Option<&'static str> {
+        let trusted =
+            match lay_runtime_trees(oracles, first_tree_number, salt_bytes, run, configuration) {
+                Ok(layout) => layout,
+                Err(_) => return Some("the trusted oracle shapes do not lay out"),
+            };
+        if *self != trusted {
+            return Some("the runtime layout differs from the independently built layout");
+        }
+        None
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -1052,6 +1078,73 @@ mod tests {
         assert!(bad.fault().is_some());
         assert!(lay.check_against(&oracles).is_none());
         assert!(lay.check_against(&[oracles[0]]).is_some());
+    }
+
+    #[test]
+    fn runtime_layout_overflowing_widths_are_rejected() {
+        let base = oracle(1, 4, 4, 3, 0, 0);
+        let mut lay = layout(&[base], 0);
+        assert!(lay.check_against(&[base]).is_none());
+        let mut huge = lay.oracles.clone();
+        huge[0].main_rows = u64::MAX / 3 + 1;
+        lay.oracles = huge.clone();
+        assert_eq!(
+            lay.check_against(&huge),
+            Some("a runtime layout oracle's main width overflows")
+        );
+        let base = oracle(1, 4, 4, 1, 2, 3);
+        let mut lay = layout(&[base], 0);
+        let mut huge = lay.oracles.clone();
+        huge[0].mask_rows = u64::MAX / 3 + 1;
+        lay.oracles = huge.clone();
+        assert_eq!(
+            lay.check_against(&huge),
+            Some("a runtime layout oracle's mask width overflows")
+        );
+        // The legal shape remains usable.
+        let legal = layout(&[base], 0);
+        assert!(legal.check_against(&[base]).is_none());
+    }
+
+    #[test]
+    fn runtime_layout_rebuild_gate_rejects_reorder_split_and_context() {
+        let a = oracle(1, 4, 4, 1, 0, 0);
+        let b = oracle(1, 4, 8, 1, 0, 0);
+        let oracles = [a, b];
+        let external = layout(&oracles, 0);
+        let salt = LEAF_SALT_MIN_BYTES;
+        let run = Digest([9; 32]);
+        let configuration = Digest([7; 32]);
+        assert!(external
+            .check_rebuilt(&oracles, 0, salt, run, configuration)
+            .is_none());
+        // Reordered oracle shapes.
+        assert!(external
+            .check_rebuilt(&[b, a], 0, salt, run, configuration)
+            .is_some());
+        // A split layout that is locally valid but differs from the rebuilt one.
+        let one_a = layout(&[a], 0);
+        let one_b = layout(&[b], 1);
+        let split = RuntimeTreeLay {
+            tree: vec![0, 1],
+            part: vec![0, 0],
+            oracles: vec![a, b],
+            plans: vec![one_a.plans[0].clone(), one_b.plans[0].clone()],
+        };
+        assert!(split.fault().is_none());
+        assert!(split
+            .check_rebuilt(&oracles, 0, salt, run, configuration)
+            .is_some());
+        // Another tree context: first number, run or configuration.
+        assert!(external
+            .check_rebuilt(&oracles, 1, salt, run, configuration)
+            .is_some());
+        assert!(external
+            .check_rebuilt(&oracles, 0, salt, Digest([8; 32]), configuration)
+            .is_some());
+        assert!(external
+            .check_rebuilt(&oracles, 0, salt, run, Digest([6; 32]))
+            .is_some());
     }
 
     #[test]

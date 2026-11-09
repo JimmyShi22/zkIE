@@ -184,18 +184,14 @@ impl GuShape {
             Some(part) => part,
             None => return Some("the G_u part is not in its tree"),
         };
-        let main_symbols = self
-            .u
-            .main_rows
-            .checked_mul(self.u.main_deg as u64)
-            .ok_or(Error::ResourceLimit)
-            .ok()?;
-        let mask_symbols = self
-            .u
-            .mask_rows
-            .checked_mul(E_DEGREE as u64)
-            .ok_or(Error::ResourceLimit)
-            .ok()?;
+        let main_symbols = match self.u.main_rows.checked_mul(self.u.main_deg as u64) {
+            Some(value) => value,
+            None => return Some("the G_u main width overflows"),
+        };
+        let mask_symbols = match self.u.mask_rows.checked_mul(E_DEGREE as u64) {
+            Some(value) => value,
+            None => return Some("the G_u mask width overflows"),
+        };
         if part.main_symbols != main_symbols || part.mask_symbols != mask_symbols {
             return Some("the G_u part's widths are not its oracle shape's");
         }
@@ -735,6 +731,22 @@ mod tests {
         assert_eq!(sample_bytes, encode_sample_claims(&[sample]));
         assert_eq!(record_bytes, encode_record_claims(&[record]));
         assert_eq!(column_bytes, encode_column_claims(&[column]));
+    }
+
+    #[test]
+    fn gu_overflowing_widths_are_rejected_by_the_registry() {
+        let base = shape();
+        let mut bad = base.clone();
+        bad.u.main_rows = u64::MAX / 3 + 1;
+        assert_eq!(bad.fault(), Some("the G_u main width overflows"));
+        assert!(GuRegistry::new().receive(&bad, &notice()).is_err());
+        let mut bad = base.clone();
+        bad.u.mask_rows = u64::MAX / 3 + 1;
+        bad.u.mask_code = Some(build_code_plan(3, 4, 1).unwrap());
+        assert_eq!(bad.fault(), Some("the G_u mask width overflows"));
+        assert!(GuRegistry::new().receive(&bad, &notice()).is_err());
+        // The legal shape remains usable.
+        assert!(GuRegistry::new().receive(&base, &notice()).is_ok());
     }
 
     #[test]
