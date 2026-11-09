@@ -27,7 +27,7 @@ use crate::pcs::request::chain::{Chain, KIND_ALGEBRAIC, KIND_EPSILON};
 use crate::pcs::request::code::{build_code_plan, CodeParams};
 use crate::pcs::request::field::{E_DEGREE, Fp3};
 use crate::pcs::request::runtime_tree::{
-    verify_mask_columns, MaskColumnOpening, MaskTree, MaskTreePlan,
+    verify_mask_opening, MaskTree, MaskTreePlan, RuntimeTreeOpening,
 };
 use crate::primitives::codec::CanonicalWriter;
 use crate::primitives::transcript::{hash_labeled, tag_word, STATEMENT};
@@ -1212,9 +1212,9 @@ impl RuntimeOracles {
         id: u64,
         expected_count: usize,
         positions: &[u64],
-        openings: &[MaskColumnOpening],
+        openings: &RuntimeTreeOpening,
     ) -> Result<()> {
-        if positions.len() > expected_count || positions.len() != openings.len() {
+        if positions.len() > expected_count || positions.len() != openings.columns.len() {
             return Err(Error::StatementMismatch);
         }
         if positions.windows(2).any(|pair| pair[0] >= pair[1]) {
@@ -1231,7 +1231,7 @@ impl RuntimeOracles {
         if positions.is_empty() {
             return Ok(());
         }
-        verify_mask_columns(tree_plan, &entry.root, positions, openings)?;
+        verify_mask_opening(tree_plan, &entry.root, positions, openings)?;
         entry.opening_verified = true;
         Ok(())
     }
@@ -1694,7 +1694,7 @@ mod tests {
     use super::*;
     use crate::pcs::request::field::{Fp, MODULUS};
     use crate::pcs::request::params::LEAF_SALT_MIN_BYTES;
-    use crate::pcs::request::runtime_tree::verify_mask_columns;
+    use crate::pcs::request::runtime_tree::verify_mask_opening;
     use zkie_core::common::field::PrimeCharacteristicRing;
     use crate::primitives::transcript::{hash_labeled, tag_word, TEST_COINS};
     use zkie_core::types::Digest;
@@ -2016,11 +2016,11 @@ mod tests {
         // The committed root opens the mask tree at the drawn positions.
         let positions = [1u64, 4];
         let openings = start.tree.open(&positions).unwrap();
-        verify_mask_columns(&plan, &start.message.root, &positions, &openings).unwrap();
+        verify_mask_opening(&plan, &start.message.root, &positions, &openings).unwrap();
         let mut tampered = openings.clone();
-        tampered[0].symbols[0] = tampered[0].symbols[0] + Fp::ONE;
+        tampered.columns[0].symbols[0] = tampered.columns[0].symbols[0] + Fp::ONE;
         assert!(
-            verify_mask_columns(&plan, &start.message.root, &positions, &tampered).is_err()
+            verify_mask_opening(&plan, &start.message.root, &positions, &tampered).is_err()
         );
         // A different claimed group, a changed notice or a different tree
         // layout is rejected before the spend.

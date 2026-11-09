@@ -17,7 +17,7 @@ use crate::pcs::request::chain::{
     Chain, KIND_ALGEBRAIC, KIND_EPSILON, KIND_POSITIONS, KIND_SEAL,
 };
 use crate::pcs::request::field::{Fp, Fp3};
-use crate::pcs::request::runtime_tree::MaskColumnOpening;
+use crate::pcs::request::runtime_tree::RuntimeTreeOpening;
 use crate::pcs::request::fold::{
     fold_mask_shape_fault, fold_start_verify, FoldShape, FoldStartMessage, RuntimeOracles,
     VerifiedStatement,
@@ -656,7 +656,7 @@ impl FoldeqSession {
     /// still advances; whether the block permits zero queries is a
     /// reference-block condition, and entering this stage does not mean the
     /// mask was authenticated.
-    pub fn read_mask(&mut self, openings: &[MaskColumnOpening]) -> Result<()> {
+    pub fn read_mask(&mut self, openings: &RuntimeTreeOpening) -> Result<()> {
         if self.stage != Stage::MaskQueried {
             return Err(Error::InvalidSessionState);
         }
@@ -696,7 +696,7 @@ use crate::pcs::request::fold::{
     };
     use crate::pcs::request::params::{LEAF_SALT_MIN_BYTES, REQUEST_CHAIN_LABEL};
     use crate::pcs::request::read::{HidingState, ProverReads};
-    use crate::pcs::request::runtime_tree::{verify_mask_columns, MaskTreePlan};
+    use crate::pcs::request::runtime_tree::{verify_mask_opening, MaskTreePlan};
     use crate::pcs::request::table::{
         commit_table, IndexReader, IndexRecord, IndexShape, TableDistances,
     };
@@ -1038,20 +1038,27 @@ use crate::pcs::request::fold::{
         // An empty opening list is allowed (nothing is opened or marked); a
         // list longer than the plan's draw count is rejected.
         empty_registry
-            .authenticate_mask(tree, 9, plan.mask_query_count, &[], &[])
+            .authenticate_mask(
+                tree,
+                9,
+                plan.mask_query_count,
+                &[],
+                &RuntimeTreeOpening::default(),
+            )
             .unwrap();
+        let long = start.tree.open(&[0u64, 1, 2]).unwrap();
         assert!(empty_registry
             .authenticate_mask(
                 tree,
                 9,
                 plan.mask_query_count,
                 &[0u64, 1, 2],
-                &mask_openings[..0],
+                &long,
             )
             .is_err());
         session.read_mask(&mask_openings).unwrap();
         assert!(session.read_mask(&mask_openings).is_err());
-        assert!(verify_mask_columns(
+        assert!(verify_mask_opening(
             tree,
             &Digest([5; 32]),
             &positions,
@@ -1059,8 +1066,8 @@ use crate::pcs::request::fold::{
         )
         .is_err());
         let mut forged = mask_openings;
-        forged[0].symbols[0] = forged[0].symbols[0] + Fp::ONE;
-        assert!(verify_mask_columns(
+        forged.columns[0].symbols[0] = forged.columns[0].symbols[0] + Fp::ONE;
+        assert!(verify_mask_opening(
             tree,
             &start.message.root,
             &positions,

@@ -19,7 +19,8 @@ use crate::pcs::request::code::encode_row_fp3;
 use crate::pcs::request::field::{Fp, Fp3, E_DEGREE};
 use crate::pcs::request::fold::FoldShape;
 use crate::pcs::request::params::{LEAF_SALT_MAX_BYTES, LEAF_SALT_MIN_BYTES};
-use crate::primitives::codec::CanonicalWriter;
+use crate::primitives::codec::{CanonicalReader, CanonicalWriter};
+use zkie_core::common::codec::DecodeLimits;
 use crate::primitives::transcript::{hash_labeled, tag_word, LEAF_MAIN, TREE_NODE};
 
 /// The verifier's layout of one runtime tree that carries mask rows.
@@ -81,61 +82,38 @@ impl MaskTreePlan {
     }
 }
 
-/// One opening of a runtime mask column.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MaskColumnOpening {
-    pub position: u64,
-    pub salt: Vec<u8>,
-    pub symbols: Vec<Fp>,
-    pub path: Vec<Digest>,
-}
-
-fn mask_leaf(
-    plan: &MaskTreePlan,
-    position: u64,
-    salt: &[u8],
-    symbols: &[Fp],
-) -> Result<Digest> {
-    let width = plan.width()?;
-    if symbols.len() as u64 != width {
-        return Err(Error::ShapeMismatch);
+impl MaskTreePlan {
+    /// The same tree as a single mask-only part of a general runtime tree:
+    /// the mask-only tree is the one-part special case, not another encoding.
+    pub fn runtime_plan(&self) -> Result<RuntimeTreePlan> {
+        let mask_symbols = self
+            .mask_rows
+            .checked_mul(E_DEGREE as u64)
+            .ok_or(Error::ResourceLimit)?;
+        Ok(RuntimeTreePlan {
+            tree_number: self.tree_number,
+            leaf_class: self.leaf_class,
+            log_n: self.log_n,
+            log_n_zk: self.log_n,
+            parts: vec![RuntimeTreePart {
+                main_symbols: 0,
+                mask_symbols,
+            }],
+            salt_bytes: self.salt_bytes,
+            run: self.run,
+            configuration: self.configuration,
+        })
     }
-    let index = (1u64 << plan.log_n)
-        .checked_add(position)
-        .ok_or(Error::ResourceLimit)?;
-    let mut writer = CanonicalWriter::new();
-    writer.put_u64(width);
-    writer.put_u64(salt.len() as u64);
-    for symbol in symbols {
-        writer.put_fp(*symbol);
-    }
-    writer.put_bytes(salt);
-    hash_labeled(
-        tag_word(LEAF_MAIN, plan.tree_number),
-        index,
-        Some(&plan.run),
-        &writer.into_bytes(),
-    )
 }
 
-fn mask_node(plan: &MaskTreePlan, left: &Digest, right: &Digest) -> Result<Digest> {
-    merkle_node(
-        tag_word(TREE_NODE, plan.tree_number),
-        0,
-        &plan.configuration,
-        left,
-        right,
-    )
-}
-
-/// A committed runtime mask tree with the private rows needed to open columns.
+/// A committed runtime mask tree: the one-part mask-only special case of the
+/// general runtime tree. It keeps its plan and root; commit and open use the
+/// same leaf encoding and whole-tree opening as every other runtime tree.
 #[derive(Clone, Debug)]
 pub struct MaskTree {
     pub plan: MaskTreePlan,
     pub root: Digest,
-    levels: Vec<Vec<Digest>>,
-    salts: Vec<Vec<u8>>,
-    codewords: Vec<Vec<Fp3>>,
+    inner: RuntimeTree,
 }
 
 impl MaskTree {
@@ -175,112 +153,43 @@ impl MaskTree {
                 return Err(Error::ShapeMismatch);
             }
         }
-        for salt in salts {
-            if salt.len() != plan.salt_bytes {
-                return Err(Error::ShapeMismatch);
-            }
-        }
         let mut codewords = Vec::with_capacity(rows.len());
         for (row, tail) in rows.iter().zip(tails) {
             codewords.push(encode_row_fp3(&shape.mask_code, row, tail)?);
         }
-        let width = plan.width()?;
-        let mut leaves = Vec::with_capacity(columns);
-        for position in 0..columns {
-            let mut symbols = Vec::with_capacity(width as usize);
-            for codeword in &codewords {
-                for coefficient in codeword[position].c {
-                    symbols.push(coefficient);
-                }
-            }
-            leaves.push(mask_leaf(
-                &plan,
-                position as u64,
-                &salts[position],
-                &symbols,
-            )?);
-        }
-        let mut levels = vec![leaves];
-        while levels.last().expect("one level").len() > 1 {
-            let previous = levels.last().expect("one level");
-            let mut next = Vec::with_capacity(previous.len() / 2);
-            for pair in previous.chunks_exact(2) {
-                next.push(mask_node(&plan, &pair[0], &pair[1])?);
-            }
-            levels.push(next);
-        }
-        let root = levels.last().expect("one level")[0];
+        let inner = RuntimeTree::commit(
+            plan.runtime_plan()?,
+            &[RuntimePartRows {
+                main: Vec::new(),
+                mask: codewords,
+                main_deg: 1,
+            }],
+            salts,
+        )?;
         Ok(Self {
             plan,
-            root,
-            levels,
-            salts: salts.to_vec(),
-            codewords,
+            root: *inner.root(),
+            inner,
         })
     }
 
-    /// Open the columns at `positions` (sorted, without repeats).
-    pub fn open(&self, positions: &[u64]) -> Result<Vec<MaskColumnOpening>> {
-        let columns = self.plan.columns();
-        let width = self.plan.width()? as usize;
-        let mut openings = Vec::with_capacity(positions.len());
-        let mut previous = None;
-        for position in positions {
-            if *position >= columns {
-                return Err(Error::InvalidIndex);
-            }
-            if let Some(previous) = previous {
-                if *position <= previous {
-                    return Err(Error::InvalidIndex);
-                }
-            }
-            previous = Some(*position);
-            let mut symbols = Vec::with_capacity(width);
-            for codeword in &self.codewords {
-                for coefficient in codeword[*position as usize].c {
-                    symbols.push(coefficient);
-                }
-            }
-            openings.push(MaskColumnOpening {
-                position: *position,
-                salt: self.salts[*position as usize].clone(),
-                symbols,
-                path: self.path(*position as usize)?,
-            });
-        }
-        Ok(openings)
-    }
-
-    fn path(&self, index: usize) -> Result<Vec<Digest>> {
-        if index >= self.plan.columns() as usize {
-            return Err(Error::InvalidIndex);
-        }
-        let mut path = Vec::with_capacity(self.levels.len().saturating_sub(1));
-        let mut position = index;
-        for level in &self.levels[..self.levels.len() - 1] {
-            path.push(level[position ^ 1]);
-            position >>= 1;
-        }
-        Ok(path)
+    /// Open the complete leaves at `positions` (strictly increasing, unique).
+    pub fn open(&self, positions: &[u64]) -> Result<RuntimeTreeOpening> {
+        self.inner.open(positions)
     }
 }
 
-/// Verify runtime mask openings against the plan and root. The positions must
-/// be the verifier's drawn list, sorted and without repeats; the caller checks
-/// that list against its plan.
-pub fn verify_mask_columns(
+/// Check a whole-tree opening of a mask-only tree. The mask-only tree is the
+/// one-part special case: the same full leaves and shared-sibling walk as the
+/// general runtime tree.
+pub fn verify_mask_opening(
     plan: &MaskTreePlan,
     root: &Digest,
     positions: &[u64],
-    openings: &[MaskColumnOpening],
+    opening: &RuntimeTreeOpening,
 ) -> Result<Vec<Fp>> {
-    if plan.fault().is_some() {
-        return Err(Error::InvalidConfig);
-    }
-    if positions.len() != openings.len() {
-        return Err(Error::ShapeMismatch);
-    }
-    let columns = plan.columns();
+    let runtime = plan.runtime_plan()?;
+    verify_runtime_opening(&runtime, root, positions, opening)?;
     let width = plan.width()? as usize;
     let mut symbols = Vec::with_capacity(
         positions
@@ -288,39 +197,8 @@ pub fn verify_mask_columns(
             .checked_mul(width)
             .ok_or(Error::ResourceLimit)?,
     );
-    let mut previous = None;
-    for (position, opening) in positions.iter().zip(openings) {
-        if *position >= columns {
-            return Err(Error::InvalidIndex);
-        }
-        if let Some(previous) = previous {
-            if *position <= previous {
-                return Err(Error::InvalidIndex);
-            }
-        }
-        previous = Some(*position);
-        if opening.position != *position
-            || opening.salt.len() != plan.salt_bytes
-            || opening.symbols.len() != width
-            || opening.path.len() != plan.log_n as usize
-        {
-            return Err(Error::ShapeMismatch);
-        }
-        let leaf = mask_leaf(plan, *position, &opening.salt, &opening.symbols)?;
-        let mut current = leaf;
-        let mut at = *position as usize;
-        for sibling in &opening.path {
-            current = if at & 1 == 0 {
-                mask_node(plan, &current, sibling)?
-            } else {
-                mask_node(plan, sibling, &current)?
-            };
-            at >>= 1;
-        }
-        if current != *root {
-            return Err(Error::InvalidProof);
-        }
-        symbols.extend_from_slice(&opening.symbols);
+    for column in &opening.columns {
+        symbols.extend_from_slice(&column.symbols);
     }
     Ok(symbols)
 }
@@ -330,13 +208,10 @@ pub fn verify_mask_columns(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeOracleShape {
     pub leaf_class: u32,
-    /// The base code's depth; used only when the message has main rows.
     pub base_log_n: u32,
     pub main_rows: u64,
-    /// The main rows are over the base field (1) or its cubic extension (3).
     pub main_deg: u32,
     pub mask_rows: u64,
-    /// The mask code's depth; used only when the message has mask rows.
     pub mask_log_n: u32,
 }
 
@@ -359,8 +234,6 @@ pub struct RuntimeTreePlan {
     pub tree_number: u64,
     pub leaf_class: u32,
     pub log_n: u32,
-    /// The mask rows' depth, at most the main depth; a mask-only tree has
-    /// `log_n == log_n_zk`.
     pub log_n_zk: u32,
     pub parts: Vec<RuntimeTreePart>,
     pub salt_bytes: usize,
@@ -403,7 +276,6 @@ impl RuntimeTreePlan {
         self.parts.iter().any(|part| part.mask_symbols > 0)
     }
 
-    /// The offset of a part's main symbols from the start of the main section.
     pub fn main_offset(&self, part: usize) -> Result<u64> {
         if part >= self.parts.len() {
             return Err(Error::InvalidIndex);
@@ -417,8 +289,6 @@ impl RuntimeTreePlan {
         Ok(offset)
     }
 
-    /// The offset of a part's mask symbols from the start of the mask section
-    /// (the mask section starts after every main symbol).
     pub fn mask_offset(&self, part: usize) -> Result<u64> {
         if part >= self.parts.len() {
             return Err(Error::InvalidIndex);
@@ -471,7 +341,6 @@ impl RuntimeTreePlan {
         1u64 << self.log_n
     }
 
-    /// Canonical bytes for binding this tree into a plan or first query.
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = CanonicalWriter::new();
         writer.put_u64(self.tree_number);
@@ -490,10 +359,7 @@ impl RuntimeTreePlan {
     }
 }
 
-/// The verifier's layout of a prover message's runtime oracles: each oracle's
-/// tree and part, and the trees in creation order. Trees with main rows are
-/// numbered first; mask-only trees follow. The proof never supplies these
-/// numbers.
+/// The verifier's layout of a prover message's runtime oracles.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeTreeLay {
     pub tree: Vec<u32>,
@@ -503,10 +369,6 @@ pub struct RuntimeTreeLay {
 }
 
 impl RuntimeTreeLay {
-    /// The layout is complete and consistent with the trusted oracle shapes
-    /// it was built from: every (tree, part) appears exactly once, every part
-    /// is used, tree numbers are unique, main trees come before mask-only
-    /// trees, and each part's class, depth and widths equal its oracle's.
     pub fn fault(&self) -> Option<&'static str> {
         if self.tree.len() != self.part.len() || self.tree.len() != self.oracles.len() {
             return Some("the runtime layout has one tree and part for each oracle only");
@@ -584,18 +446,10 @@ impl RuntimeTreeLay {
             if used[tree].iter().any(|used| !used) || plan.parts.len() != used[tree].len() {
                 return Some("a runtime layout leaves a part unused");
             }
-            if !plan.has_main() && self.oracles.iter().enumerate().any(|(index, oracle)| {
-                self.tree[index] as usize == tree && oracle.main_rows > 0
-            }) {
-                return Some("a runtime mask-only tree holds a main oracle");
-            }
         }
         None
     }
 
-    /// Local structural consistency only: the layout must agree with the
-    /// oracle shape list it carries. This is not a reconstruction gate, and an
-    /// external layout must not be trusted on this check alone.
     pub fn check_against(&self, oracles: &[RuntimeOracleShape]) -> Option<&'static str> {
         if self.oracles != oracles {
             return Some("the runtime layout was not built from these trusted oracle shapes");
@@ -603,14 +457,6 @@ impl RuntimeTreeLay {
         self.fault()
     }
 
-    /// The integration gate: build the layout independently from the
-    /// verifier's trusted ordered oracle shapes and the trusted tree context
-    /// (the first tree number, salt length, run and configuration) and compare
-    /// the complete external layout with it. The external layout's own tree
-    /// numbers, starts and oracle list are not trusted inputs; a reordered,
-    /// split or re-contexted layout differs from the rebuilt one and is
-    /// rejected. The mask short-column mapping and the co-tree commit/open/read
-    /// paths remain unimplemented.
     pub fn check_rebuilt(
         &self,
         oracles: &[RuntimeOracleShape],
@@ -674,12 +520,6 @@ fn oracle_fault(oracle: &RuntimeOracleShape) -> Option<&'static str> {
     None
 }
 
-/// Lay out one prover message's runtime oracles exactly by class and depth:
-/// main-row oracles of one leaf class and one base depth share a tree; a
-/// mask-only oracle joins the first tree of its class, or forms a mask-only
-/// tree of its own; parts follow the sending order. All mask rows in one tree
-/// must have one depth, and mask rows cannot be deeper than the main rows.
-/// Runtime-only: the caller must not pass a stored table's shape.
 pub fn lay_runtime_trees(
     oracles: &[RuntimeOracleShape],
     first_tree_number: u64,
@@ -708,8 +548,6 @@ pub fn lay_runtime_trees(
         run,
         configuration,
     };
-    // Main-row oracles first: one tree per (leaf class, base depth), in the
-    // order the first such oracle is sent.
     for (index, oracle) in oracles.iter().enumerate() {
         if oracle.main_rows == 0 {
             continue;
@@ -732,8 +570,6 @@ pub fn lay_runtime_trees(
         }
         tree[index] = at as u32;
     }
-    // Mask-only oracles join the first tree of their class, or make a
-    // mask-only tree (depth set after the parts are known).
     for (index, oracle) in oracles.iter().enumerate() {
         if oracle.main_rows != 0 {
             continue;
@@ -753,7 +589,6 @@ pub fn lay_runtime_trees(
         }
         tree[index] = at as u32;
     }
-    // Parts in sending order, one entry per oracle in its tree.
     for (index, oracle) in oracles.iter().enumerate() {
         let at = tree[index] as usize;
         let plan = &mut plans[at];
@@ -797,11 +632,464 @@ pub fn lay_runtime_trees(
     Ok(lay)
 }
 
+/// One part's rows for committing a runtime tree. `main` rows are codewords
+/// over the long columns (`2^log_n` symbols, each an extension-field element);
+/// `mask` rows are codewords over the short columns (`2^log_n_zk` symbols).
+/// A mask row is read at `x mod 2^log_n_zk` in the leaf of the long position x.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimePartRows {
+    pub main: Vec<Vec<Fp3>>,
+    pub mask: Vec<Vec<Fp3>>,
+    pub main_deg: u32,
+}
+
+/// One opened long-column leaf: its position, its own salt and the complete
+/// column (every part's main symbols, then every part's mask symbols, in part
+/// order).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeLeafColumn {
+    pub position: u64,
+    pub salt: Vec<u8>,
+    pub symbols: Vec<Fp>,
+}
+
+/// The opening of a whole runtime co-tree at a list of long positions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeTreeOpening {
+    pub positions: Vec<u64>,
+    pub columns: Vec<RuntimeLeafColumn>,
+    pub given: Vec<Digest>,
+}
+
+/// The position at which a short codeword is read for the leaf of long
+/// position `x`: `x mod 2^log_n_zk`.
+pub fn short_position(log_n: u32, log_short: u32, x: u64) -> Result<u64> {
+    if log_short > log_n || log_n >= 64 || log_short >= 64 {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(x & ((1u64 << log_short) - 1))
+}
+
+/// Shrink a query list drawn over a longer column domain to a tree's depth:
+/// each position is read at `x mod 2^tree_log_n`, the result sorted and
+/// deduplicated. The original query positions are not lost: the caller keeps
+/// them and maps each to its short position when extracting from the leaf.
+pub fn reduce_positions(
+    positions: &[u64],
+    source_log_n: u32,
+    tree_log_n: u32,
+) -> Result<Vec<u64>> {
+    if tree_log_n > source_log_n || source_log_n >= 64 || tree_log_n >= 64 {
+        return Err(Error::InvalidConfig);
+    }
+    if positions.iter().any(|position| position >> source_log_n != 0) {
+        return Err(Error::InvalidIndex);
+    }
+    let mask = (1u64 << tree_log_n) - 1;
+    let mut reduced: Vec<u64> = positions.iter().map(|position| position & mask).collect();
+    reduced.sort_unstable();
+    reduced.dedup();
+    Ok(reduced)
+}
+
+fn runtime_leaf(
+    plan: &RuntimeTreePlan,
+    position: u64,
+    salt: &[u8],
+    symbols: &[Fp],
+) -> Result<Digest> {
+    let width = plan.width()?;
+    if symbols.len() as u64 != width {
+        return Err(Error::ShapeMismatch);
+    }
+    let index = (1u64 << plan.log_n)
+        .checked_add(position)
+        .ok_or(Error::ResourceLimit)?;
+    let mut writer = CanonicalWriter::new();
+    writer.put_u64(width);
+    writer.put_u64(salt.len() as u64);
+    for symbol in symbols {
+        writer.put_fp(*symbol);
+    }
+    writer.put_bytes(salt);
+    hash_labeled(
+        tag_word(LEAF_MAIN, plan.tree_number),
+        index,
+        Some(&plan.run),
+        &writer.into_bytes(),
+    )
+}
+
+fn runtime_node(plan: &RuntimeTreePlan, left: &Digest, right: &Digest) -> Result<Digest> {
+    merkle_node(
+        tag_word(TREE_NODE, plan.tree_number),
+        0,
+        &plan.configuration,
+        left,
+        right,
+    )
+}
+
+fn walk_given(
+    plan: &RuntimeTreePlan,
+    list: &[u64],
+    leaves: &[Digest],
+    levels: &[Vec<Digest>],
+) -> Result<Vec<Digest>> {
+    if list.len() != leaves.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut given = Vec::new();
+    let mut now: Vec<(u64, Digest)> = list.iter().copied().zip(leaves.iter().copied()).collect();
+    for step in 0..plan.log_n {
+        let level = &levels[step as usize];
+        let mut next = Vec::with_capacity((now.len() + 1) / 2);
+        let mut index = 0usize;
+        while index < now.len() {
+            let place = now[index].0;
+            if place & 1 == 0 && index + 1 < now.len() && now[index + 1].0 == place + 1 {
+                next.push((place >> 1, runtime_node(plan, &now[index].1, &now[index + 1].1)?));
+                index += 2;
+            } else {
+                let sibling = level[(place ^ 1) as usize];
+                given.push(sibling);
+                let parent = if place & 1 == 0 {
+                    runtime_node(plan, &now[index].1, &sibling)?
+                } else {
+                    runtime_node(plan, &sibling, &now[index].1)?
+                };
+                next.push((place >> 1, parent));
+                index += 1;
+            }
+        }
+        now = next;
+    }
+    if now.len() != 1 {
+        return Err(Error::InvalidProof);
+    }
+    Ok(given)
+}
+
+fn opening_given_count(plan: &RuntimeTreePlan, list: &[u64]) -> Result<usize> {
+    let mut now: Vec<u64> = list.to_vec();
+    let mut given = 0usize;
+    for _ in 0..plan.log_n {
+        let mut next = Vec::with_capacity((now.len() + 1) / 2);
+        let mut index = 0usize;
+        while index < now.len() {
+            let place = now[index];
+            if place & 1 == 0 && index + 1 < now.len() && now[index + 1] == place + 1 {
+                next.push(place >> 1);
+                index += 2;
+            } else {
+                given += 1;
+                next.push(place >> 1);
+                index += 1;
+            }
+        }
+        now = next;
+    }
+    Ok(given)
+}
+
+fn check_leaf_walk(
+    plan: &RuntimeTreePlan,
+    root: &Digest,
+    list: &[u64],
+    leaves: &[Digest],
+    given: &[Digest],
+) -> Result<()> {
+    let mut used = 0usize;
+    let mut now: Vec<(u64, Digest)> = list.iter().copied().zip(leaves.iter().copied()).collect();
+    for _ in 0..plan.log_n {
+        let mut next = Vec::with_capacity((now.len() + 1) / 2);
+        let mut index = 0usize;
+        while index < now.len() {
+            let place = now[index].0;
+            if place & 1 == 0 && index + 1 < now.len() && now[index + 1].0 == place + 1 {
+                next.push((place >> 1, runtime_node(plan, &now[index].1, &now[index + 1].1)?));
+                index += 2;
+            } else {
+                let sibling = *given.get(used).ok_or(Error::ShapeMismatch)?;
+                used += 1;
+                let parent = if place & 1 == 0 {
+                    runtime_node(plan, &now[index].1, &sibling)?
+                } else {
+                    runtime_node(plan, &sibling, &now[index].1)?
+                };
+                next.push((place >> 1, parent));
+                index += 1;
+            }
+        }
+        now = next;
+    }
+    if used != given.len() || now.len() != 1 || now[0].1 != *root {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
+/// A committed runtime co-tree with the private columns and salts needed to
+/// open complete leaves. This is an in-memory test foundation; it materializes
+/// every column and is not the production committer.
+#[derive(Clone, Debug)]
+pub struct RuntimeTree {
+    plan: RuntimeTreePlan,
+    root: Digest,
+    levels: Vec<Vec<Digest>>,
+    columns: Vec<Vec<Fp>>,
+    salts: Vec<Vec<u8>>,
+}
+
+impl RuntimeTree {
+    pub fn commit(
+        plan: RuntimeTreePlan,
+        parts: &[RuntimePartRows],
+        salts: &[Vec<u8>],
+    ) -> Result<Self> {
+        if plan.fault().is_some() {
+            return Err(Error::InvalidConfig);
+        }
+        if parts.len() != plan.parts.len() || salts.len() as u64 != plan.columns() {
+            return Err(Error::ShapeMismatch);
+        }
+        let columns = plan.columns();
+        let short_columns = 1u64 << plan.log_n_zk;
+        for (part, rows) in plan.parts.iter().zip(parts) {
+            if rows.main_deg != 1 && rows.main_deg != E_DEGREE as u32 {
+                return Err(Error::InvalidConfig);
+            }
+            if part.main_symbols == 0 {
+                if !rows.main.is_empty() {
+                    return Err(Error::ShapeMismatch);
+                }
+            } else {
+                if part.main_symbols % rows.main_deg as u64 != 0
+                    || rows.main.len() as u64 != part.main_symbols / rows.main_deg as u64
+                    || rows.main.iter().any(|row| row.len() as u64 != columns)
+                {
+                    return Err(Error::ShapeMismatch);
+                }
+            }
+            if part.mask_symbols == 0 {
+                if !rows.mask.is_empty() {
+                    return Err(Error::ShapeMismatch);
+                }
+            } else {
+                if part.mask_symbols % E_DEGREE as u64 != 0
+                    || rows.mask.len() as u64 != part.mask_symbols / E_DEGREE as u64
+                    || rows
+                        .mask
+                        .iter()
+                        .any(|row| row.len() as u64 != short_columns)
+                {
+                    return Err(Error::ShapeMismatch);
+                }
+            }
+        }
+        for salt in salts {
+            if salt.len() != plan.salt_bytes {
+                return Err(Error::ShapeMismatch);
+            }
+        }
+        let width = plan.width()? as usize;
+        let mut columns_data = Vec::with_capacity(columns as usize);
+        let mut leaves = Vec::with_capacity(columns as usize);
+        for position in 0..columns {
+            let short = short_position(plan.log_n, plan.log_n_zk, position)? as usize;
+            let mut symbols = Vec::with_capacity(width);
+            for rows in parts {
+                for row in &rows.main {
+                    for coefficient in 0..rows.main_deg as usize {
+                        symbols.push(row[position as usize].c[coefficient]);
+                    }
+                }
+            }
+            for rows in parts {
+                for row in &rows.mask {
+                    for coefficient in 0..E_DEGREE {
+                        symbols.push(row[short].c[coefficient]);
+                    }
+                }
+            }
+            leaves.push(runtime_leaf(&plan, position, &salts[position as usize], &symbols)?);
+            columns_data.push(symbols);
+        }
+        let mut levels = vec![leaves];
+        while levels.last().expect("one level").len() > 1 {
+            let previous = levels.last().expect("one level");
+            let mut next = Vec::with_capacity(previous.len() / 2);
+            for pair in previous.chunks_exact(2) {
+                next.push(runtime_node(&plan, &pair[0], &pair[1])?);
+            }
+            levels.push(next);
+        }
+        let root = levels.last().expect("one level")[0];
+        Ok(Self {
+            plan,
+            root,
+            levels,
+            columns: columns_data,
+            salts: salts.to_vec(),
+        })
+    }
+
+    pub fn plan(&self) -> &RuntimeTreePlan {
+        &self.plan
+    }
+
+    pub fn root(&self) -> &Digest {
+        &self.root
+    }
+
+    pub fn open(&self, positions: &[u64]) -> Result<RuntimeTreeOpening> {
+        if positions.is_empty() {
+            return Err(Error::InvalidIndex);
+        }
+        let columns = self.plan.columns();
+        let mut previous = None;
+        let mut leaves = Vec::with_capacity(positions.len());
+        let mut opened = Vec::with_capacity(positions.len());
+        for position in positions {
+            if *position >= columns {
+                return Err(Error::InvalidIndex);
+            }
+            if let Some(previous) = previous {
+                if *position <= previous {
+                    return Err(Error::InvalidIndex);
+                }
+            }
+            previous = Some(*position);
+            let symbols = self.columns[*position as usize].clone();
+            leaves.push(runtime_leaf(
+                &self.plan,
+                *position,
+                &self.salts[*position as usize],
+                &symbols,
+            )?);
+            opened.push(RuntimeLeafColumn {
+                position: *position,
+                salt: self.salts[*position as usize].clone(),
+                symbols,
+            });
+        }
+        let given = walk_given(&self.plan, positions, &leaves, &self.levels)?;
+        Ok(RuntimeTreeOpening {
+            positions: positions.to_vec(),
+            columns: opened,
+            given,
+        })
+    }
+}
+
+pub fn verify_runtime_opening(
+    plan: &RuntimeTreePlan,
+    root: &Digest,
+    list: &[u64],
+    opening: &RuntimeTreeOpening,
+) -> Result<()> {
+    if plan.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    if opening.positions != list || opening.columns.len() != list.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    if list.is_empty() || list.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(Error::InvalidIndex);
+    }
+    let width = plan.width()? as usize;
+    let columns = plan.columns();
+    let mut leaves = Vec::with_capacity(list.len());
+    for (position, column) in list.iter().zip(&opening.columns) {
+        if *position >= columns
+            || column.position != *position
+            || column.salt.len() != plan.salt_bytes
+            || column.symbols.len() != width
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        leaves.push(runtime_leaf(plan, *position, &column.salt, &column.symbols)?);
+    }
+    check_leaf_walk(plan, root, list, &leaves, &opening.given)
+}
+
+pub fn encode_runtime_opening(plan: &RuntimeTreePlan, opening: &RuntimeTreeOpening) -> Result<Vec<u8>> {
+    if plan.fault().is_some() || opening.positions.len() != opening.columns.len() {
+        return Err(Error::InvalidConfig);
+    }
+    let width = plan.width()? as usize;
+    let mut writer = CanonicalWriter::new();
+    for column in &opening.columns {
+        if column.symbols.len() != width || column.salt.len() != plan.salt_bytes {
+            return Err(Error::ShapeMismatch);
+        }
+        for symbol in &column.symbols {
+            writer.put_fp(*symbol);
+        }
+        writer.put_bytes(&column.salt);
+    }
+    for digest in &opening.given {
+        writer.put_digest(digest);
+    }
+    Ok(writer.into_bytes())
+}
+
+pub fn decode_runtime_opening(
+    plan: &RuntimeTreePlan,
+    list: &[u64],
+    bytes: &[u8],
+) -> Result<RuntimeTreeOpening> {
+    if plan.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    if list.is_empty()
+        || list.windows(2).any(|pair| pair[0] >= pair[1])
+        || list.iter().any(|x| *x >= plan.columns())
+    {
+        return Err(Error::InvalidIndex);
+    }
+    let width = plan.width()? as usize;
+    let given_count = opening_given_count(plan, list)?;
+    let mut reader = CanonicalReader::new(
+        bytes,
+        DecodeLimits {
+            max_bytes: bytes.len(),
+            max_elements: given_count.saturating_add(list.len()),
+        },
+    );
+    let mut columns = Vec::with_capacity(list.len());
+    for position in list {
+        let mut symbols = Vec::with_capacity(width);
+        for _ in 0..width {
+            symbols.push(reader.get_fp()?);
+        }
+        let salt = reader.get_bytes()?.to_vec();
+        if salt.len() != plan.salt_bytes {
+            return Err(Error::ShapeMismatch);
+        }
+        columns.push(RuntimeLeafColumn {
+            position: *position,
+            salt,
+            symbols,
+        });
+    }
+    let mut given = Vec::with_capacity(given_count);
+    for _ in 0..given_count {
+        given.push(reader.get_digest()?);
+    }
+    reader.finish()?;
+    Ok(RuntimeTreeOpening {
+        positions: list.to_vec(),
+        columns,
+        given,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pcs::request::code::build_code_plan;
-    use crate::pcs::request::field::Fp;
+    use crate::pcs::request::code::{build_code_plan, encode_row_fp3};
+    use crate::pcs::request::field::{Fp, MODULUS};
     use crate::pcs::request::fold::fold_mask_columns;
     use zkie_core::common::field::PrimeCharacteristicRing;
 
@@ -873,7 +1161,7 @@ mod tests {
         assert_ne!(tree.root, Digest::ZERO);
         let positions = [1u64, 4, 6];
         let openings = tree.open(&positions).unwrap();
-        let symbols = verify_mask_columns(&tree.plan, &tree.root, &positions, &openings).unwrap();
+        let symbols = verify_mask_opening(&tree.plan, &tree.root, &positions, &openings).unwrap();
         assert_eq!(symbols.len(), positions.len() * tree.plan.width().unwrap() as usize);
         let _ = shape;
     }
@@ -884,17 +1172,17 @@ mod tests {
         let positions = [1u64, 4];
         let openings = tree.open(&positions).unwrap();
         let mut tampered = openings.clone();
-        tampered[0].symbols[0] = tampered[0].symbols[0] + Fp::ONE;
-        assert!(verify_mask_columns(&tree.plan, &tree.root, &positions, &tampered).is_err());
+        tampered.columns[0].symbols[0] = tampered.columns[0].symbols[0] + Fp::ONE;
+        assert!(verify_mask_opening(&tree.plan, &tree.root, &positions, &tampered).is_err());
         let mut tampered = openings.clone();
-        tampered[0].salt[0] ^= 1;
-        assert!(verify_mask_columns(&tree.plan, &tree.root, &positions, &tampered).is_err());
+        tampered.columns[0].salt[0] ^= 1;
+        assert!(verify_mask_opening(&tree.plan, &tree.root, &positions, &tampered).is_err());
         let mut tampered = openings.clone();
-        tampered[0].path[0] = Digest([3; 32]);
-        assert!(verify_mask_columns(&tree.plan, &tree.root, &positions, &tampered).is_err());
+        tampered.given[0] = Digest([3; 32]);
+        assert!(verify_mask_opening(&tree.plan, &tree.root, &positions, &tampered).is_err());
         let mut tampered = openings;
-        tampered[0].position = 2;
-        assert!(verify_mask_columns(&tree.plan, &tree.root, &positions, &tampered).is_err());
+        tampered.columns[0].position = 2;
+        assert!(verify_mask_opening(&tree.plan, &tree.root, &positions, &tampered).is_err());
     }
 
     #[test]
@@ -904,13 +1192,68 @@ mod tests {
         let openings = tree.open(&positions).unwrap();
         let mut other = tree.plan;
         other.tree_number += 1;
-        assert!(verify_mask_columns(&other, &tree.root, &positions, &openings).is_err());
+        assert!(verify_mask_opening(&other, &tree.root, &positions, &openings).is_err());
         let mut other = tree.plan;
         other.run = Digest([8; 32]);
-        assert!(verify_mask_columns(&other, &tree.root, &positions, &openings).is_err());
+        assert!(verify_mask_opening(&other, &tree.root, &positions, &openings).is_err());
         let mut other = tree.plan;
         other.configuration = Digest([6; 32]);
-        assert!(verify_mask_columns(&other, &tree.root, &positions, &openings).is_err());
+        assert!(verify_mask_opening(&other, &tree.root, &positions, &openings).is_err());
+    }
+
+    fn co_plan() -> RuntimeTreePlan {
+        RuntimeTreePlan {
+            tree_number: 7,
+            leaf_class: 3,
+            log_n: 2,
+            log_n_zk: 1,
+            parts: vec![part(6, 3), part(0, 6)],
+            salt_bytes: LEAF_SALT_MIN_BYTES,
+            run: Digest([9; 32]),
+            configuration: Digest([7; 32]),
+        }
+    }
+
+    fn co_parts() -> Vec<RuntimePartRows> {
+        let main = (0..2)
+            .map(|row| {
+                (0..4)
+                    .map(|column| Fp3::from_u64(100 + row * 10 + column + 1))
+                    .collect()
+            })
+            .collect();
+        let mask0 = (0..1)
+            .map(|row| {
+                (0..2)
+                    .map(|column| Fp3::from_u64(200 + row * 10 + column + 1))
+                    .collect()
+            })
+            .collect();
+        let mask1 = (0..2)
+            .map(|row| {
+                (0..2)
+                    .map(|column| Fp3::from_u64(300 + row * 10 + column + 1))
+                    .collect()
+            })
+            .collect();
+        vec![
+            RuntimePartRows {
+                main,
+                mask: mask0,
+                main_deg: 3,
+            },
+            RuntimePartRows {
+                main: Vec::new(),
+                mask: mask1,
+                main_deg: 1,
+            },
+        ]
+    }
+
+    fn co_salts() -> Vec<Vec<u8>> {
+        (0..4)
+            .map(|position| vec![(position as u8) + 1; LEAF_SALT_MIN_BYTES])
+            .collect()
     }
 
     fn oracle(
@@ -1189,6 +1532,150 @@ mod tests {
         assert!(mask_only.fault().is_some());
         assert!(base.main_offset(1).is_err());
         assert!(base.mask_offset(1).is_err());
+    }
+
+    #[test]
+    fn runtime_co_tree_round_trip_and_opening_units() {
+        let plan = co_plan();
+        let tree = RuntimeTree::commit(plan.clone(), &co_parts(), &co_salts()).unwrap();
+        let positions = [0u64, 1, 2, 3];
+        let opening = tree.open(&positions).unwrap();
+        verify_runtime_opening(&plan, tree.root(), &positions, &opening).unwrap();
+        assert_eq!(opening.columns.len(), 4);
+        assert_eq!(opening.columns[0].symbols.len(), 15);
+        // Mask sections: x=0 and x=2 share short position 0; x=1 and x=3 share 1.
+        assert_eq!(&opening.columns[0].symbols[6..9], &opening.columns[2].symbols[6..9]);
+        assert_eq!(&opening.columns[1].symbols[6..9], &opening.columns[3].symbols[6..9]);
+        assert_ne!(&opening.columns[0].symbols[..6], &opening.columns[2].symbols[..6]);
+        assert_ne!(opening.columns[0].salt, opening.columns[2].salt);
+        assert_ne!(
+            runtime_leaf(&plan, 0, &opening.columns[0].salt, &opening.columns[0].symbols).unwrap(),
+            runtime_leaf(&plan, 2, &opening.columns[2].salt, &opening.columns[2].symbols).unwrap()
+        );
+        let mut bad = opening.clone();
+        bad.columns[0].symbols[0] = bad.columns[0].symbols[0] + Fp::ONE;
+        assert!(verify_runtime_opening(&plan, tree.root(), &positions, &bad).is_err());
+        // A symbol in another part's mask section is bound too.
+        let mut bad = opening.clone();
+        bad.columns[0].symbols[10] = bad.columns[0].symbols[10] + Fp::ONE;
+        assert!(verify_runtime_opening(&plan, tree.root(), &positions, &bad).is_err());
+        // A leaf with a missing part symbol is not the full leaf.
+        let mut bad = opening.clone();
+        bad.columns[0].symbols.pop();
+        assert!(verify_runtime_opening(&plan, tree.root(), &positions, &bad).is_err());
+        let mut bad = opening.clone();
+        bad.columns[0].salt[0] ^= 1;
+        assert!(verify_runtime_opening(&plan, tree.root(), &positions, &bad).is_err());
+        // A sparse list needs siblings; its given data is exact.
+        let sparse_positions = [0u64, 2];
+        let sparse = tree.open(&sparse_positions).unwrap();
+        verify_runtime_opening(&plan, tree.root(), &sparse_positions, &sparse).unwrap();
+        let mut bad = sparse.clone();
+        bad.given.pop();
+        assert!(verify_runtime_opening(&plan, tree.root(), &sparse_positions, &bad).is_err());
+        let mut bad = sparse.clone();
+        bad.given.push(Digest([3; 32]));
+        assert!(verify_runtime_opening(&plan, tree.root(), &sparse_positions, &bad).is_err());
+        let mut bad = opening.clone();
+        bad.positions = vec![0, 1, 3, 2];
+        assert!(verify_runtime_opening(&plan, tree.root(), &positions, &bad).is_err());
+        assert!(verify_runtime_opening(&plan, &Digest([4; 32]), &positions, &opening).is_err());
+        let mut other = plan.clone();
+        other.run = Digest([8; 32]);
+        assert!(verify_runtime_opening(&other, tree.root(), &positions, &opening).is_err());
+        let mut other = plan.clone();
+        other.configuration = Digest([6; 32]);
+        assert!(verify_runtime_opening(&other, tree.root(), &positions, &opening).is_err());
+        assert!(tree.open(&[1, 0]).is_err());
+        assert!(tree.open(&[0, 0]).is_err());
+        assert!(tree.open(&[0, 4]).is_err());
+        assert!(tree.open(&[]).is_err());
+
+        let bytes = encode_runtime_opening(&plan, &opening).unwrap();
+        let decoded = decode_runtime_opening(&plan, &positions, &bytes).unwrap();
+        assert_eq!(decoded, opening);
+        let mut noncanonical = bytes.clone();
+        noncanonical[..8].copy_from_slice(&MODULUS.to_le_bytes());
+        assert!(decode_runtime_opening(&plan, &positions, &noncanonical).is_err());
+        assert!(decode_runtime_opening(&plan, &positions, &bytes[..bytes.len() - 1]).is_err());
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(decode_runtime_opening(&plan, &positions, &trailing).is_err());
+    }
+
+    #[test]
+    fn mask_only_tree_is_the_one_part_special_case() {
+        let shape = shape();
+        let plan = plan();
+        let rows = rows(&shape);
+        let tails = tails(&shape);
+        let salts = salts(&shape, &plan);
+        let mask_tree = MaskTree::commit(plan, &shape, &rows, &tails, &salts).unwrap();
+        let codewords: Vec<Vec<Fp3>> = rows
+            .iter()
+            .zip(&tails)
+            .map(|(row, tail)| encode_row_fp3(&shape.mask_code, row, tail).unwrap())
+            .collect();
+        let generic = RuntimeTree::commit(
+            plan.runtime_plan().unwrap(),
+            &[RuntimePartRows {
+                main: Vec::new(),
+                mask: codewords,
+                main_deg: 1,
+            }],
+            &salts,
+        )
+        .unwrap();
+        assert_eq!(mask_tree.root, *generic.root());
+        assert_eq!(
+            short_position(plan.log_n, plan.log_n, 5).unwrap(),
+            5 & ((1u64 << plan.log_n) - 1)
+        );
+    }
+
+    #[test]
+    fn reduced_query_positions_keep_their_long_identity() {
+        let plan = co_plan();
+        let tree = RuntimeTree::commit(plan.clone(), &co_parts(), &co_salts()).unwrap();
+        let queries = [1u64, 9, 3, 11];
+        let reduced = reduce_positions(&queries, 4, 2).unwrap();
+        assert_eq!(reduced, vec![1, 3]);
+        let opening = tree.open(&reduced).unwrap();
+        verify_runtime_opening(&plan, tree.root(), &reduced, &opening).unwrap();
+        for query in queries {
+            let tree_position = short_position(4, plan.log_n, query).unwrap();
+            let mask_position = short_position(plan.log_n, plan.log_n_zk, tree_position).unwrap();
+            assert_eq!(mask_position, short_position(4, plan.log_n_zk, query).unwrap());
+            assert!(reduced.contains(&tree_position));
+        }
+        assert_eq!(short_position(4, 2, 1).unwrap(), 1);
+        assert_eq!(short_position(4, 2, 9).unwrap(), 1);
+        assert_eq!(short_position(2, 1, 0).unwrap(), 0);
+        assert_eq!(short_position(2, 1, 2).unwrap(), 0);
+    }
+
+    #[test]
+    fn illegal_co_tree_shapes_fail_closed() {
+        let mut bad = co_plan();
+        bad.log_n = 64;
+        assert!(bad.fault().is_some());
+        assert!(RuntimeTree::commit(bad, &co_parts(), &co_salts()).is_err());
+        let mut bad = co_plan();
+        bad.parts[0].mask_symbols = u64::MAX;
+        assert!(bad.fault().is_some());
+        assert!(RuntimeTree::commit(bad, &co_parts(), &co_salts()).is_err());
+        let mut bad = co_plan();
+        bad.parts[0].main_symbols = 0;
+        bad.parts[0].mask_symbols = 0;
+        assert!(bad.fault().is_some());
+        let mut parts = co_parts();
+        parts[0].main.pop();
+        assert!(RuntimeTree::commit(co_plan(), &parts, &co_salts()).is_err());
+        let mut salts = co_salts();
+        salts[0].pop();
+        assert!(RuntimeTree::commit(co_plan(), &co_parts(), &salts).is_err());
+        let bytes = vec![0u8; 8];
+        assert!(decode_runtime_opening(&co_plan(), &[0], &bytes).is_err());
     }
 
     #[test]
