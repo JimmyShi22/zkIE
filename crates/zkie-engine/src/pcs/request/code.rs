@@ -41,6 +41,15 @@ impl CodeParams {
         bits
     }
 
+    /// The number of factors in the message's multilinear extension.
+    pub fn log_ell(&self) -> u32 {
+        let mut bits = 0u32;
+        while (1u64 << bits) < self.ell {
+            bits += 1;
+        }
+        bits
+    }
+
     pub fn message_at(&self) -> u64 {
         self.r
     }
