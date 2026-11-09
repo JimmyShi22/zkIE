@@ -64,8 +64,9 @@ impl FoldShape {
 
 /// One member of the fixed FOLD group layout. `main_rows` is the member's
 /// real main-row count and decides the length of a kept coefficient form;
-/// `kept` is the trusted layout mark that permits that member to appear as a
-/// kept form. The mask-row count is kept for identity only.
+/// `kept` is the layout mark that permits that member to appear as a kept
+/// form. `mask_rows` is used by the isolated mask-block space check, not only
+/// as identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FoldMemberLayout {
     pub oracle: u64,
@@ -75,8 +76,10 @@ pub struct FoldMemberLayout {
 }
 
 /// The fixed FOLD group layout: the group and row variables plus one entry per
-/// member, ordered by oracle number. It is a trusted fixture in this isolated
-/// layer; the proof cannot supply or change it.
+/// member, ordered by oracle number. It is a plan-provided trusted input in
+/// this isolated test layer; its production source is not authenticated, and a
+/// proof cannot supply or change it. The checks below are only candidate
+/// self-consistency checks, not a reference layout derivation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FoldGroupLayout {
     pub group: u64,
@@ -86,14 +89,17 @@ pub struct FoldGroupLayout {
 }
 
 impl FoldGroupLayout {
-    /// The strict isolated subset: every member has at least one main or mask
-    /// row; a kept member has main rows; non-kept main and mask blocks are
-    /// aligned by the next power-of-two boundary and must fit the group's
-    /// `2^k`/`2^h` spaces; kept main rows are outside the folded block but
-    /// their checked sum is bounded. This is not a reference layout algorithm:
-    /// production must derive and compare the layout from authenticated
-    /// statement/oracle shapes and join kept marks, not from this fixture or a
-    /// proof row.
+    /// An isolated candidate self-consistency check, not a reference layout
+    /// algorithm. It only checks, in the layout's oracle order, that every
+    /// member has at least one main or mask row; a kept member has main rows;
+    /// non-kept main and mask blocks are locally aligned by the next
+    /// power-of-two boundary and fit the supplied `2^k`/`2^h` spaces; and the
+    /// kept-row sum is bounded. It does not prove the reference block order,
+    /// offsets, minimal k/h or the real oracle kept/main_rows/mask_rows values.
+    /// Production must rebuild and compare the complete layout from
+    /// authenticated statement/oracle shapes and join kept marks, not from this
+    /// plan-provided test fixture or a proof row. No new production layout
+    /// protocol is defined here.
     pub fn fault(&self, shape: &FoldShape) -> Option<&'static str> {
         if self.k != shape.k || self.h != shape.h || self.k >= 64 || self.h >= 64 {
             return Some("the FOLD layout does not match the fold shape");
@@ -203,10 +209,13 @@ fn aligned_start(first: u64, block: u64) -> Option<u64> {
 /// length `main_rows * ell`. The virtual multilinear space has
 /// `2^ceil_log2(main_rows)` rows at column-major index `row + 2^row_bits * place`;
 /// virtual padding rows (row >= main_rows) are fixed zero and are not stored.
-/// The same compact order is used by the prover dot product, the output scaling
-/// and later checks. The layout and form source are untrusted fixtures here;
-/// production must derive both from authenticated statement/oracle shapes and
-/// join kept marks, not from a proof row.
+/// The same compact order is used by the prover dot product and the output
+/// scaling. The layout and form source are plan-provided test inputs, not
+/// production-authenticated values; a proof's self-report is never trusted.
+/// There is no virtual-table-to-next-consumer entry yet, so the virtual
+/// expansion is evidence-only and the later consumer remains unconnected.
+/// Production must derive both sources from authenticated statement/oracle
+/// shapes and join kept marks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FoldKeptForm {
     pub oracle: u64,

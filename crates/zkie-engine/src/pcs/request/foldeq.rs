@@ -12,7 +12,8 @@
 //! come either from the reads verified against the trusted reader root or from
 //! an explicit, unauthenticated fixture; both stay pending, and only the
 //! verified source can satisfy the FOLD gate. The statement and
-//! runtime layout origins are trusted fixtures in this isolated layer, the
+//! runtime layout origins are plan-provided test inputs in this isolated
+//! layer (not production-authenticated sources), the
 //! proof-byte answer decoder is not connected, and no production
 //! statement-authentication, relation or FOLD closure is claimed. With a G_u
 //! shape `fold_bind_row` fixes one explicitly unauthenticated input-row fixture
@@ -3229,6 +3230,87 @@ mod tests {
         let mut plan_overflow = plan.clone();
         plan_overflow.fold_layout = Some(kept_overflow);
         assert!(plan_overflow.fault().is_some());
+    }
+
+    #[test]
+    fn fold_session_kept_rows_three_virtual_mapping_is_independent() {
+        let run = run_fold_instance_kept_rows(1, 1, Some(3));
+        let ell = run.output.code.ell as usize;
+        assert!(ell > 1);
+        let rows = 3usize;
+        let row_bits = 2usize;
+        let virtual_rows = 1usize << row_bits;
+        let coefficients = &run.row.kept[0].coefficients;
+        let messages = &run.kept_messages[0];
+        assert_eq!(coefficients.len(), rows * ell);
+        assert_eq!(messages.len(), rows * ell);
+
+        let mut virtual_coefficients = vec![Fp3::ZERO; virtual_rows * ell];
+        let mut virtual_messages = vec![Fp3::ZERO; virtual_rows * ell];
+        for row in 0..rows {
+            for place in 0..ell {
+                let compact = row * ell + place;
+                let virtual_index = row + virtual_rows * place;
+                virtual_coefficients[virtual_index] = coefficients[compact];
+                virtual_messages[virtual_index] = messages[compact];
+            }
+        }
+        for place in 0..ell {
+            assert_eq!(virtual_coefficients[rows + virtual_rows * place], Fp3::ZERO);
+            assert_eq!(virtual_messages[rows + virtual_rows * place], Fp3::ZERO);
+        }
+        let manual_dot = |left: &[Fp3], right: &[Fp3]| {
+            left.iter()
+                .zip(right)
+                .fold(Fp3::ZERO, |sum, (a, b)| sum.add(&a.mul(b)))
+        };
+        let compact_dot = manual_dot(coefficients, messages);
+        let virtual_dot = manual_dot(&virtual_coefficients, &virtual_messages);
+        assert_ne!(compact_dot, Fp3::ZERO);
+        assert_eq!(compact_dot, virtual_dot);
+        assert_eq!(virtual_coefficients[2 + virtual_rows * (ell - 1)], coefficients[2 * ell + ell - 1]);
+
+        let factor = run.output.kept_factor;
+        assert_eq!(
+            run.output.kept[0].coefficients,
+            coefficients
+                .iter()
+                .map(|value| value.mul(&factor))
+                .collect::<Vec<_>>()
+        );
+        let mut virtual_output = vec![Fp3::ZERO; virtual_rows * ell];
+        for row in 0..rows {
+            for place in 0..ell {
+                virtual_output[row + virtual_rows * place] =
+                    run.output.kept[0].coefficients[row * ell + place];
+            }
+        }
+        for place in 0..ell {
+            assert_eq!(virtual_output[rows + virtual_rows * place], Fp3::ZERO);
+        }
+        assert_eq!(manual_dot(&virtual_output, &virtual_messages), factor.mul(&compact_dot));
+
+        let mut swapped = vec![Fp3::ZERO; virtual_rows * ell];
+        for row in 0..rows {
+            for place in 0..ell {
+                swapped[place + virtual_rows * row] = coefficients[row * ell + place];
+            }
+        }
+        assert_ne!(swapped, virtual_coefficients);
+        assert_ne!(manual_dot(&swapped, &virtual_messages), virtual_dot);
+
+        let (mut session, _table, _start, _mask, _source) = fold_open_prestart();
+        let layout = session.plan.fold_layout.as_mut().unwrap();
+        for member in &mut layout.members {
+            if member.oracle == 2 {
+                member.main_rows = 3;
+            }
+        }
+        assert!(session.plan.fault().is_none());
+        let (mut padded, _, _, _) = fold_fixture(session.plan(), 1);
+        padded.kept[0].coefficients.extend(vec![Fp3::ZERO; ell]);
+        assert!(session.fold_bind_row(padded).is_err());
+        assert_fold_run_direct(&run);
     }
 
     #[test]
