@@ -62,6 +62,29 @@ impl FoldShape {
     }
 }
 
+/// One kept main row of the fixed group: the member identity and the
+/// coefficient vector on that row. Kept rows are not folded; their coefficients
+/// are scaled by `eps * (1 - g_1) .. (1 - g_k)` in the output. In this isolated
+/// step the form is a fixture and its length is not interpreted as a layout.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoldKeptForm {
+    pub oracle: u64,
+    pub coefficients: Vec<Fp3>,
+}
+
+impl FoldKeptForm {
+    pub fn check(&self, shape: &FoldShape, members: &[u64]) -> Result<()> {
+        if self.coefficients.is_empty()
+            || usize::try_from(shape.code.ell).map_err(|_| Error::ResourceLimit)?
+                != self.coefficients.len()
+            || members.binary_search(&self.oracle).is_err()
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        Ok(())
+    }
+}
+
 /// An isolated FOLD input claim on one fixed group. The group/layout and the
 /// coefficient vectors are an unauthenticated fixture in this step: the BAT/
 /// relation layer that would produce them from sampled rows is not connected.
@@ -75,6 +98,7 @@ pub struct FoldInputRow {
     pub members: Vec<u64>,
     pub coefficients: Vec<Fp3>,
     pub mask_coefficients: Vec<Fp3>,
+    pub kept: Vec<FoldKeptForm>,
     pub target: Fp3,
 }
 
@@ -103,6 +127,14 @@ impl FoldInputRow {
         if self.coefficients.len() != main_len || self.mask_coefficients.len() != mask_len {
             return Err(Error::ShapeMismatch);
         }
+        let mut kept_oracles = Vec::with_capacity(self.kept.len());
+        for kept in &self.kept {
+            kept.check(shape, &self.members)?;
+            if kept_oracles.contains(&kept.oracle) {
+                return Err(Error::InvalidConfig);
+            }
+            kept_oracles.push(kept.oracle);
+        }
         Ok(())
     }
 }
@@ -129,6 +161,8 @@ pub struct FoldOutput {
     pub coefficients: Vec<Fp3>,
     pub mask_coefficients: Vec<Fp3>,
     pub fresh_coefficients: Vec<Fp3>,
+    pub kept: Vec<FoldKeptForm>,
+    pub kept_factor: Fp3,
     pub target: Fp3,
 }
 
@@ -604,6 +638,21 @@ pub fn fold_output(
         usize::try_from(shape.mask_code.ell).map_err(|_| Error::ResourceLimit)?,
         gamma,
     )?;
+    let mut kept_factor = eps;
+    for challenge in gamma {
+        kept_factor = kept_factor.mul(&Fp3::ONE.sub(challenge));
+    }
+    let mut kept = Vec::with_capacity(row.kept.len());
+    for form in &row.kept {
+        kept.push(FoldKeptForm {
+            oracle: form.oracle,
+            coefficients: form
+                .coefficients
+                .iter()
+                .map(|value| value.mul(&kept_factor))
+                .collect(),
+        });
+    }
     Ok(FoldOutput {
         code: shape.code,
         mask_code: shape.mask_code,
@@ -620,6 +669,8 @@ pub fn fold_output(
         coefficients,
         mask_coefficients,
         fresh_coefficients,
+        kept,
+        kept_factor,
         target: claim,
     })
 }
@@ -746,9 +797,19 @@ impl FoldProverSession {
         row: &FoldInputRow,
         main_messages: Vec<Fp3>,
         mask_messages: Vec<Fp3>,
-        kept: Fp3,
+        kept_messages: Vec<Vec<Fp3>>,
     ) -> Result<Self> {
         row.check(shape)?;
+        if kept_messages.len() != row.kept.len() {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut kept = Fp3::ZERO;
+        for (form, messages) in row.kept.iter().zip(&kept_messages) {
+            if messages.len() != form.coefficients.len() {
+                return Err(Error::ShapeMismatch);
+            }
+            kept = kept.add(&inner(&form.coefficients, messages)?);
+        }
         let expected = 2 * shape.k as usize + 1;
         if mask.coefficients().len() != expected || mask.draws().len() != expected {
             return Err(Error::InvalidConfig);
