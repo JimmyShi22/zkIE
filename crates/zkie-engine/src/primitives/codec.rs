@@ -42,6 +42,12 @@ impl CanonicalWriter {
         self.bytes.extend_from_slice(value);
     }
 
+    /// Raw bytes with no length prefix, for formats that fix the length
+    /// elsewhere (an opening leaf salt, for example).
+    pub fn put_raw_bytes(&mut self, value: &[u8]) {
+        self.bytes.extend_from_slice(value);
+    }
+
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
@@ -113,6 +119,17 @@ impl<'a> CanonicalReader<'a> {
     pub fn get_bytes(&mut self) -> Result<&'a [u8]> {
         let length = self.get_u64()?;
         let length = usize::try_from(length).map_err(|_| Error::InvalidEncoding)?;
+        self.limits.check_bytes(length)?;
+        if length > self.input.len() {
+            return Err(Error::InvalidEncoding);
+        }
+        let value = &self.input[..length];
+        self.input = &self.input[length..];
+        Ok(value)
+    }
+
+    /// Raw bytes of a length fixed by the caller, no prefix.
+    pub fn get_raw_bytes(&mut self, length: usize) -> Result<&'a [u8]> {
         self.limits.check_bytes(length)?;
         if length > self.input.len() {
             return Err(Error::InvalidEncoding);

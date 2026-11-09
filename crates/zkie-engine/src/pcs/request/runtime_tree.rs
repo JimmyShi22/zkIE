@@ -15,6 +15,15 @@
 //! column and salt, is not the production committer, and the verifier cannot
 //! see whether the private salts are random. The root is a tree root, not a
 //! value that a session has authenticated; the session/group wiring is open.
+//!
+//! The leaf hash input is the repository's frozen convention: a `u64` column
+//! width, a `u64` salt length, every symbol in canonical little-endian form,
+//! then `CanonicalWriter::put_bytes(salt)`, which writes the salt length
+//! **again** followed by the salt bytes. The tag is the runtime leaf domain
+//! with the tree number, the index is `2^log_n + x`, and the hash starts from
+//! `run`. The stored `column_leaf` convention has the same shape. The
+//! reference leaf hash has no length fields; this repository makes no
+//! interoperability claim and the global format is not changed.
 
 use serde::{Deserialize, Serialize};
 use zkie_core::common::field::PrimeCharacteristicRing;
@@ -1049,7 +1058,9 @@ pub fn encode_runtime_opening(plan: &RuntimeTreePlan, opening: &RuntimeTreeOpeni
         for symbol in &column.symbols {
             writer.put_fp(*symbol);
         }
-        writer.put_bytes(&column.salt);
+        // The salt is a fixed-length field of the opening, not a
+        // length-prefixed string.
+        writer.put_raw_bytes(&column.salt);
     }
     for digest in &opening.given {
         writer.put_digest(digest);
@@ -1086,10 +1097,7 @@ pub fn decode_runtime_opening(
         for _ in 0..width {
             symbols.push(reader.get_fp()?);
         }
-        let salt = reader.get_bytes()?.to_vec();
-        if salt.len() != plan.salt_bytes {
-            return Err(Error::ShapeMismatch);
-        }
+        let salt = reader.get_raw_bytes(plan.salt_bytes)?.to_vec();
         columns.push(RuntimeLeafColumn {
             position: *position,
             salt,
@@ -1615,6 +1623,10 @@ mod tests {
         assert!(tree.open(&[]).is_err());
 
         let bytes = encode_runtime_opening(&plan, &opening).unwrap();
+        assert_eq!(
+            bytes.len(),
+            positions.len() * (15 * 8 + plan.salt_bytes) + opening.given.len() * 32
+        );
         let decoded = decode_runtime_opening(&plan, &positions, &bytes).unwrap();
         assert_eq!(decoded, opening);
         let mut noncanonical = bytes.clone();
@@ -1692,6 +1704,97 @@ mod tests {
         assert!(short_position(1, 2, 0).is_err());
         assert!(short_position(64, 1, 0).is_err());
         assert!(short_position(1, 64, 0).is_err());
+    }
+
+    #[test]
+    fn opening_bytes_are_an_independent_fixed_format() {
+        let plan = RuntimeTreePlan {
+            tree_number: 5,
+            leaf_class: 2,
+            log_n: 1,
+            log_n_zk: 1,
+            parts: vec![part(0, 3)],
+            salt_bytes: LEAF_SALT_MIN_BYTES,
+            run: Digest([9; 32]),
+            configuration: Digest([7; 32]),
+        };
+        let row = vec![
+            Fp3::new(Fp::from_u64(1), Fp::from_u64(2), Fp::from_u64(3)),
+            Fp3::new(Fp::from_u64(4), Fp::from_u64(5), Fp::from_u64(6)),
+        ];
+        let salts = vec![
+            vec![0xA0; LEAF_SALT_MIN_BYTES],
+            vec![0xB0; LEAF_SALT_MIN_BYTES],
+        ];
+        let tree = RuntimeTree::commit(
+            plan.clone(),
+            &[RuntimePartRows {
+                main: Vec::new(),
+                mask: vec![row],
+                main_deg: 1,
+            }],
+            &salts,
+        )
+        .unwrap();
+        let opening = tree.open(&[0]).unwrap();
+        let mut expected = Vec::new();
+        for value in [1u64, 2, 3] {
+            expected.extend_from_slice(&value.to_le_bytes());
+        }
+        expected.extend_from_slice(&salts[0]);
+        for digest in &opening.given {
+            expected.extend_from_slice(&digest.0);
+        }
+        assert_eq!(
+            expected.len(),
+            3 * 8 + plan.salt_bytes + opening.given.len() * 32
+        );
+        assert_eq!(encode_runtime_opening(&plan, &opening).unwrap(), expected);
+        assert_eq!(
+            decode_runtime_opening(&plan, &[0], &expected).unwrap(),
+            opening
+        );
+        assert!(decode_runtime_opening(&plan, &[0], &expected[..expected.len() - 1]).is_err());
+        let mut trailing = expected;
+        trailing.push(0);
+        assert!(decode_runtime_opening(&plan, &[0], &trailing).is_err());
+    }
+
+    #[test]
+    fn runtime_leaf_hash_input_is_the_frozen_format() {
+        use crate::primitives::transcript::{hash_labeled, tag_word, LEAF_MAIN};
+        let plan = RuntimeTreePlan {
+            tree_number: 5,
+            leaf_class: 2,
+            log_n: 1,
+            log_n_zk: 1,
+            parts: vec![part(0, 3)],
+            salt_bytes: LEAF_SALT_MIN_BYTES,
+            run: Digest([9; 32]),
+            configuration: Digest([7; 32]),
+        };
+        let salt = vec![0xAB; LEAF_SALT_MIN_BYTES];
+        let symbols = vec![
+            Fp::from_u64(11),
+            Fp::from_u64(12),
+            Fp::from_u64(13),
+        ];
+        let mut input = Vec::new();
+        input.extend_from_slice(&3u64.to_le_bytes());
+        input.extend_from_slice(&(salt.len() as u64).to_le_bytes());
+        for value in [11u64, 12, 13] {
+            input.extend_from_slice(&value.to_le_bytes());
+        }
+        input.extend_from_slice(&(salt.len() as u64).to_le_bytes());
+        input.extend_from_slice(&salt);
+        let expected = hash_labeled(
+            tag_word(LEAF_MAIN, plan.tree_number),
+            (1u64 << plan.log_n) + 1,
+            Some(&plan.run),
+            &input,
+        )
+        .unwrap();
+        assert_eq!(runtime_leaf(&plan, 1, &salt, &symbols).unwrap(), expected);
     }
 
     #[test]
