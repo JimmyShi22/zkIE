@@ -1,0 +1,16 @@
+   Compiling zkie-ops v0.1.0 (/data/zkIE/crates/zkie-ops)
+    Finished `release` profile [optimized] target(s) in 0.38s
+mutated Some((0, 0))
+invalid_index
+TAMPER duplicate EXIT 2
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"verify","error_code":"invalid_index","last_completed_stage":"verify","last_event_seq":2,"outcome":"FAIL","output_binding":null,"progress_path":"/data/t001-measure/oracle-tamper/run-duplicate/progress.jsonl","proof_bytes":null,"protocol_wall_ms":4840,"run_id":"verify","stage_wall_ms":4840,"vmhwm_kib":4352368}
+mutated Some((0, 0))
+invalid_index
+TAMPER swap EXIT 2
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"verify","error_code":"invalid_index","last_completed_stage":"verify","last_event_seq":2,"outcome":"FAIL","output_binding":null,"progress_path":"/data/t001-measure/oracle-tamper/run-swap/progress.jsonl","proof_bytes":null,"protocol_wall_ms":4586,"run_id":"verify","stage_wall_ms":4586,"vmhwm_kib":4428000}
+mutated Some((4, 0))
+TAMPER output-duplicate EXIT 2
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"verify","error_code":"invalid_index","last_completed_stage":"verify","last_event_seq":2,"outcome":"FAIL","output_binding":null,"progress_path":"/data/t001-measure/oracle-tamper/run-output-duplicate/progress.jsonl","proof_bytes":null,"protocol_wall_ms":4853,"run_id":"verify","stage_wall_ms":4853,"vmhwm_kib":5274852}
+mutated Some((4, 0))
+TAMPER output-swap EXIT 2
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"verify","error_code":"invalid_index","last_completed_stage":"verify","last_event_seq":3,"outcome":"FAIL","output_binding":null,"progress_path":"/data/t001-measure/oracle-tamper/run-output-swap/progress.jsonl","proof_bytes":null,"protocol_wall_ms":5100,"run_id":"verify","stage_wall_ms":5100,"vmhwm_kib":5270720}

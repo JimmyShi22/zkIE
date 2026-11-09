@@ -221,8 +221,10 @@ the prover's bundle.
 ### Verification policy
 
 `verify`, `run` and `matrix` read the policy from a file fixed by the
-operator outside the proof bundle. The file is strict TOML; unknown fields and
-duplicate keys are rejected.
+operator outside the proof bundle. `--policy` is mandatory and carries trusted
+content; there is no lenient default path, and old invocations migrate to the
+new contract. The file is strict TOML; unknown fields and duplicate keys are
+rejected.
 
 ```toml
 policy_version = 1

@@ -46,7 +46,7 @@
 
 ## Gate
 
-- `cargo test --workspace`: **127 passed, 0 failed** (includes 5 output-binding, 6 policy, 2 anchor, 7 plan-check, 1 opening-structure and 1 cache-key test).
+- `cargo test --workspace`: **133 passed, 0 failed** (includes 5 output-binding, 6 policy, 2 anchor, 7 plan-check, 5 relation-opening, 1 opening-structure, 1 signed-input and 1 cache-key test).
 - Graph tamper tests in `crates/zkie-ops/tests/plan_check.rs` (6 tests) inject
   each mutation with a serialize round-trip, then require the full relation and
   plan verification path to reject: missing, extra, reordered and empty traces;
@@ -125,8 +125,86 @@ list entries across the five case registrations match the actual files
 
 **Trust caveat.** The first list is a self-built change-detection baseline. It
 does not prove that the first read weights are the expected model and has not
-been checked against externally published model material. Who or what channel
-may authorize model assets is a product trust decision and remains open.
+been checked against externally published model material. Asset source
+authorization is deferred to the on-chain commitment phase; it is not addressed
+in this round.
+
+## Operator oracle coordinate authentication
+
+Relation proofs commit each logical group as an oracle tree. `verify_group`
+previously checked only that every opening shared the group oracle and passed a
+per-opening Merkle check; `decode`/`decode_wide` then concatenated the openings
+in list order and truncated. A prover could reorder, duplicate or omit valid
+rows with valid paths and change the vector consumed by relation verification.
+
+The fix binds every group to its commitment construction before decoding:
+
+- purpose: input, output, raw, quotient, helper and auxiliary groups are
+  distinguished by the verifier from the relation structure, not from the
+  opening list; raw groups use the single-row wide form, the others use the
+  row-wise width form;
+- coordinates: `opening.index == list position`, rows cover exactly
+  `0..count-1`, and the group oracle root count equals the opening count;
+- tree shape: count is a power of two and every path length is
+  `log2(count)`;
+- width: normal groups use the opcode/config/declared-length width rule
+  (`commit_group_width`) and every row has exactly that width; wide groups
+  have exactly one row of `2*len` words and an empty path;
+- padding: rows at or beyond `ceil(len/width)` are zero, matching the zero
+  rows added by `commit_group_width`; wide groups have no padding;
+- decode: after these checks, decode walks openings in authenticated
+  coordinate order, rejects short coverage and no longer concatenates in list
+  order with blind truncation. `proof_input_values` and
+  `proof_output_values` return `Result` and use the same checked decode;
+- all index and multiplication arithmetic is checked; the empty opening list
+  is reserved for external slots, whose values come from the authenticated
+  external mapping.
+
+Audit: the only `OracleOpening` consumers are `verify_group`, `decode`,
+`decode_wide`, `proof_input_values` and `proof_output_values`. The model
+executors call `proof_output_values` while proving. The verifier calls
+`proof_input_values` in `registry.rs` before relation verification in the same
+call that then fully verifies the relation, and after verification in the plan
+and shared-trace layers. No other reachable acceptance path consumes openings
+without the checks above.
+
+### Negative coverage
+
+All cases use real rows and original Merkle paths where the mutation permits;
+the relation verifier is reached through the production entry
+`verify_op_relation_with_external`, with asserted error codes.
+
+| injection | error code |
+| --- | --- |
+| duplicate row in another position | `invalid_index` |
+| swap of two valid rows | `invalid_index` |
+| same-count missing row | `invalid_index` |
+| row width change | `shape_mismatch` |
+| non-zero padding row | `statement_mismatch` |
+| path depth change | `invalid_proof` |
+| coverage loss | `statement_mismatch` |
+| length change | `shape_mismatch` |
+| wide-row width change | `shape_mismatch` |
+| wide-group index change | `invalid_index` |
+| wide-group path change | `invalid_proof` |
+| wide-group duplicate | `shape_mismatch` |
+
+Width, padding and tree-shape cases that cannot be reached by mutating a valid
+commitment without breaking its root are exercised on independently
+constructed fixtures. The bounds test uses a `usize::MAX` length and returns a
+shape error without panicking.
+
+On the production gpt2-seq16 proof bundle the real proof artifact was
+re-serialized after duplicating and after swapping two openings of an internal
+input group (step 0) and an internal output group (step 4), keeping the
+original rows and Merkle paths; `zkie verify` rejected every run with
+`invalid_index` (exit 2, no panic). Raw output: `logs/oracle-cli-tamper.txt`.
+
+### Signed time-series input
+
+`models/timesfm/src/plan.rs` asserts that `model_commitment` over u32 tokens
+reproduces the commitment over the same values encoded as signed i64
+little-endian, covering the u32 -> i32 -> i64 conversion used by the model.
 
 ## Registration
 
@@ -239,6 +317,8 @@ reproduces the GT bytes exactly.
   bundle. The production-path runs below use the registered
   `models/<model>/case.policy` files instead; the fail-closed tests above
   cover policy and bundle mismatch.
+- `--policy` is mandatory and carries trusted content; there is no lenient
+  default path, and old invocations migrate to the new contract.
 
 ## Verification results
 
@@ -347,31 +427,45 @@ values are the warm medians recorded in the previous trace.
 
 | case | verify wall ms | baseline wall ms | delta | verify VmHWM KiB | baseline VmHWM KiB | delta |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| gpt2-seq16 | 22,443 | 24,360 | -7.9% | 5,397,976 | 5,385,024 | +0.2% |
-| gpt2-seq512 | 231,235 | 230,274 | +0.4% | 47,037,624 | 47,016,984 | +0.0% |
-| gemma3-seq16 | 43,979 | 44,401 | -1.0% | 13,360,840 | 13,357,036 | +0.0% |
-| gemma3-seq512 | 822,406 | 835,721 | -1.6% | 120,688,588 | 120,670,388 | +0.0% |
-| timesfm-16patch | 52,315 | 42,356 | +23.51% | 7,320,432 | 7,329,656 | -0.1% |
+| gpt2-seq16 | 25,520 | 24,360 | +4.8% | 5,387,788 | 5,385,024 | +0.1% |
+| gpt2-seq512 | 233,515 | 230,274 | +1.4% | 47,019,360 | 47,016,984 | +0.0% |
+| gemma3-seq16 | 45,093 | 44,401 | +1.6% | 13,353,424 | 13,357,036 | -0.0% |
+| gemma3-seq512 | 821,263 | 835,721 | -1.7% | 120,693,040 | 120,670,388 | +0.0% |
+| timesfm-16patch | 42,380 | 42,356 | +0.1% | 7,323,620 | 7,329,656 | -0.1% |
 
-The gpt2 and gemma3 cases are within 2% of the baseline. timesfm verify median
-is 52,315 ms vs 42,356 ms: +9,959 ms (+23.51%). Profiling after the
-materialization removal shows `full_values` at 0.08% of samples; the residual
-is the independent plan-comparison pass over every step input, which is the
-added authentication obligation rather than redundant materialization.
-Reducing it further would require fusing plan comparison with relation
-verification, which was not attempted. The boss has temporarily accepted the
-timesfm residual. The ruling references an earlier set of records
-(+23.1% / +9.8 s); that earlier figure is not the final measurement and is
-kept only as the earlier record. No new optimization card is opened, no
-technical change is made for it, and optimization is deferred to later rounds.
+The largest gpt2/gemma3 delta is 4.8% (gpt2-seq16,
+25,520 ms vs 24,360 ms,
++1,160 ms); gpt2-seq512,
+gemma3-seq16 and gemma3-seq512 are within 1.6%. timesfm verify median is
+42,380 ms vs 42,356 ms: +24 ms
+(+0.06%), at parity with the baseline. Profiling after the
+materialization removal shows `full_values` at 0.08% of samples; the remaining
+overhead is the independent plan-comparison pass and the oracle coordinate
+checks over every step, which are authentication obligations rather than
+redundant materialization. Reducing it further would require fusing plan
+comparison with relation verification, which was not attempted.
+
+The gpt2-seq16 delta exceeds the 3% noise band. The same case measured -7.9%
+in the previous group with the rework but before the oracle coordinate checks,
+so the group-to-group spread on the smallest case is larger than the band; the
+final group is the ledger for the final code. The boss temporarily accepted
+the earlier group's timesfm residual (+23.1% / +9.8 s) and deferred timesfm
+optimization to later rounds; the final group does not reproduce a timesfm
+residual, no optimization was made, and no new card is opened. The earlier
+figure remains in the record as the earlier record.
 
 ## Open items and production limitations
 
-- Verification cost is back to baseline on gpt2 and gemma3 (within 2%) after
-  the materialization removal. timesfm verify median is 52,315 ms vs
-  42,356 ms: +9,959 ms (+23.51%). The residual is the independent plan
-  comparison pass over every step input; the boss has temporarily accepted it
-  and optimization is deferred to later rounds.
+- Final verify medians: gpt2-seq16 25,520 ms
+  (+4.8%), gpt2-seq512 233,515 ms
+  (+1.4%), gemma3-seq16 45,093 ms
+  (+1.6%), gemma3-seq512
+  821,263 ms (-1.7%),
+  timesfm-16patch 42,380 ms (+0.06%). gpt2-seq16 exceeds the
+  3% band and is recorded as-is; the oracle coordinate checks are
+  authentication obligations. The boss accepted the earlier timesfm residual
+  (+23.1% / +9.8 s) and deferred timesfm optimization to later rounds; the
+  final group shows no measurable timesfm residual and no new card is opened.
 - The expected output is bound through the policy digest registered from the
   case GT file. The registration trust caveat above still applies: until the
   registration is independently attested, the policies are a non-trusted
@@ -403,10 +497,16 @@ technical change is made for it, and optimization is deferred to later rounds.
   count-mismatch and illegal-value runs; `inputs/` and `policies/`.
 - `final/<case>/`: first run with the final code.
 - `final-warm/<case>/run-<i>/`: warm repeats of the first rework binary.
-- `final2-warm/<case>/run-<i>/`: warm repeats of the final binary (P0
-  opening-integrity checks and borrow-based plan materialization).
+- `final2-warm/<case>/run-<i>/`: warm repeats of the previous final binary.
+- `final3-warm/<case>/run-<i>/`: warm repeats of the final binary including
+  the oracle coordinate checks.
 - `registration/`: anchors and policies regenerated with the output fields.
 - `logs/verify-warm.txt`, `logs/verify-prod.txt`, `logs/verify-final.txt`,
-  `logs/verify-final-warm.txt` and `logs/verify-final2-warm.txt`.
-- The trace directory is 154G on disk; `/data` has 281G free after the runs.
-- No benchmark artifact was deleted.
+  `logs/verify-final-warm.txt`, `logs/verify-final2-warm.txt`,
+  `logs/verify-final3-warm.txt` and `logs/oracle-cli-tamper.txt`.
+- Large proof binaries are deleted after verification and ledger entry; the
+  keep list is minimal: textual artifacts, each case's cold-0 commit directory,
+  policies, GT files, registrations and assets.
+- The trace directory held 154G on disk before the cleanup; `/data` had 281G
+  free after the runs. The cleanup inventory and freed bytes are recorded in
+  the cleanup entry below.
