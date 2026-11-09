@@ -255,7 +255,11 @@ impl FoldeqPlan {
         }
         match self.gamma_path {
             GammaPath::Lin { shape } => {
-                if shape.matrix_rows < 1 || shape.k_lo > 30 || shape.k_col > 60 {
+                if shape.matrix_rows < 1
+                    || shape.matrix_rows > (1u64 << 30)
+                    || shape.k_lo > 30
+                    || shape.k_col > 60
+                {
                     return Some("the LIN shape binding has invalid numbers");
                 }
                 let expected = match shape.k_lo.checked_add(self.reader.shape.v) {
@@ -1112,13 +1116,14 @@ use crate::pcs::request::fold::{
         bad.gamma_path = GammaPath::Lin { shape: LinShapeBinding { matrix_rows: 1, k_lo: 0, k_col: 1 } };
         assert!(FoldeqSession::open(bad, binder.clone(), chain.clone()).is_err());
 
-        // A matrix whose width loses high bits must be refused, not wrapped to
-        // a small value; the checked multiply rejects the overflow.
+        // A high-bit matrix is rejected by the reference row-index bound
+        // before any shift; the checked multiply stays as a defensive guard,
+        // since within the row and shift bounds the product cannot overflow.
         let mut bad = plan.clone();
         bad.gamma_path = GammaPath::Lin {
             shape: LinShapeBinding { matrix_rows: 1u64 << 63, k_lo: 1, k_col: 3 },
         };
-        assert_eq!(bad.fault(), Some("the matrix width overflows"));
+        assert_eq!(bad.fault(), Some("the LIN shape binding has invalid numbers"));
         assert!(FoldeqSession::open(bad, binder.clone(), chain.clone()).is_err());
 
         // A matrix that does not overflow but exceeds the plain columns is
@@ -1131,6 +1136,15 @@ use crate::pcs::request::fold::{
             bad.fault(),
             Some("the matrix does not fit the table's plain columns")
         );
+        assert!(FoldeqSession::open(bad, binder.clone(), chain.clone()).is_err());
+
+        // The reference shape bound also limits the row index to 30 bits, so a
+        // matrix with more than 2^30 rows is invalid regardless of the fit.
+        let mut bad = plan.clone();
+        bad.gamma_path = GammaPath::Lin {
+            shape: LinShapeBinding { matrix_rows: (1u64 << 30) + 1, k_lo: 0, k_col: 2 },
+        };
+        assert_eq!(bad.fault(), Some("the LIN shape binding has invalid numbers"));
         assert!(FoldeqSession::open(bad, binder.clone(), chain.clone()).is_err());
 
         let mut bad = plan;
