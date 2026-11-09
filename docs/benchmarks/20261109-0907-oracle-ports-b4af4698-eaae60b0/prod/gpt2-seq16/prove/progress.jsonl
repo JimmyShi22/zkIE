@@ -1,0 +1,2 @@
+{"completed_units":0,"elapsed_ms":0,"error_code":"missing_commit_artifact","event_seq":0,"kind":"stage_failed","last_completed_stage":null,"outcome":null,"parent_instance":null,"run_id":"pipeline","schema_version":1,"stage_id":"prove","stage_instance":0,"total_units":null,"unit":null}
+{"completed_units":0,"elapsed_ms":0,"error_code":"missing_commit_artifact","event_seq":1,"kind":"run_finished","last_completed_stage":"prove","outcome":"BLOCKED","parent_instance":null,"run_id":"prove","schema_version":1,"stage_id":"prove","stage_instance":0,"total_units":null,"unit":null}

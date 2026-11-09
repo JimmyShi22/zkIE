@@ -448,11 +448,13 @@ comparison with relation verification, which was not attempted.
 The gpt2-seq16 delta exceeds the 3% noise band. The same case measured -7.9%
 in the previous group with the rework but before the oracle coordinate checks,
 so the group-to-group spread on the smallest case is larger than the band; the
-final group is the ledger for the final code. The boss temporarily accepted
-the earlier group's timesfm residual (+23.1% / +9.8 s) and deferred timesfm
-optimization to later rounds; the final group does not reproduce a timesfm
-residual, no optimization was made, and no new card is opened. The earlier
-figure remains in the record as the earlier record.
+final group is the ledger for the final code. This item is outside the
+timesfm acceptance and is recorded as pending a boss decision. The boss
+temporarily accepted the earlier group's timesfm residual (+23.1% / +9.8 s)
+and deferred timesfm optimization; the current timesfm result is +0.06%
+(42,380 ms vs 42,356 ms), the final group does not reproduce a residual, no
+optimization was made, and no new card is opened. The earlier +23.51% figure
+remains in the record only as the earlier record.
 
 ## Open items and production limitations
 
@@ -462,8 +464,8 @@ figure remains in the record as the earlier record.
   (+1.6%), gemma3-seq512
   821,263 ms (-1.7%),
   timesfm-16patch 42,380 ms (+0.06%). gpt2-seq16 exceeds the
-  3% band and is recorded as-is; the oracle coordinate checks are
-  authentication obligations. The boss accepted the earlier timesfm residual
+  3% band, is recorded as-is and is pending a boss decision; the oracle
+  coordinate checks are authentication obligations. The boss accepted the earlier timesfm residual
   (+23.1% / +9.8 s) and deferred timesfm optimization to later rounds; the
   final group shows no measurable timesfm residual and no new card is opened.
 - The expected output is bound through the policy digest registered from the
