@@ -7,6 +7,7 @@ pub mod error;
 pub mod oracle;
 pub mod profile;
 pub mod progress;
+pub mod proof_header;
 pub mod storage;
 pub mod types;
 
