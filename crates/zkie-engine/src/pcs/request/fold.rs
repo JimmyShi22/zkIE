@@ -6,22 +6,21 @@
 //! the tail are drawn from a numbered source, and the prover's self-check
 //! compares every value with the source's regeneration.
 //!
-//! The deterministic source in this file is a test and replay device: its
-//! values are public and reproducible, it provides no hiding, and it must not
-//! produce a proof. A production prover must draw the coefficients and the
-//! tail from an independent, secret and fresh source (a CSPRNG or a key
-//! derivation) with a per-mask lifecycle: one mask for one fold, never reused,
-//! and its values never derived from public data. That source and lifecycle
-//! are not implemented here, and no production provider wires this module.
+//! The normal build provides only the `MaskCoins` interface. A production
+//! implementation must draw the coefficients and the tail from an independent,
+//! secret and fresh source (a CSPRNG or a key derivation) with a per-mask
+//! lifecycle: one mask for one fold, never reused, and its values never
+//! derived from public data. That implementation, its lifecycle and its ledger
+//! are not present here, and no production provider wires this module. The
+//! deterministic numbered source lives in the test module behind `cfg(test)`;
+//! it is public and reproducible, provides no hiding, and must not produce a
+//! proof.
 
 use serde::{Deserialize, Serialize};
-use zkie_core::common::field::PrimeCharacteristicRing;
 use zkie_core::error::{Error, Result};
-use zkie_core::types::Digest;
 
 use crate::pcs::request::code::{build_code_plan, CodeParams};
-use crate::pcs::request::field::{E_DEGREE, Fp, Fp3};
-use crate::primitives::transcript::{hash_labeled, tag_word, TEST_COINS};
+use crate::pcs::request::field::{E_DEGREE, Fp3};
 
 /// The draw number that no source produces.
 pub const NO_DRAW: u32 = u32::MAX;
@@ -38,11 +37,14 @@ pub struct FoldShape {
 }
 
 impl FoldShape {
-    /// The number of mask rows. The shape must be validated first
-    /// (`fold_mask_shape_fault` bounds `h`); public entries validate it before
-    /// this shift.
-    pub fn mask_rows(&self) -> u64 {
-        1u64 << self.h
+    /// The number of mask rows, with the shift checked. Public entries call
+    /// this before using the shape; a shape whose `h` does not fit a shift is
+    /// rejected instead of panicking.
+    pub fn mask_rows(&self) -> Result<u64> {
+        if self.h >= 64 {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(1u64 << self.h)
     }
 
     pub fn mask_columns(&self) -> usize {
@@ -133,6 +135,8 @@ pub struct MaskTail {
 }
 
 impl MaskTail {
+    /// A tail with `rows * len` values and their draw numbers. `len` may be
+    /// zero (a mask code with no random tail); `rows` may not.
     pub fn new(
         rows: usize,
         len: usize,
@@ -140,7 +144,7 @@ impl MaskTail {
         draws: Vec<u32>,
     ) -> Result<Self> {
         let entries = rows.checked_mul(len).ok_or(Error::ResourceLimit)?;
-        if rows == 0 || len == 0 || values.len() != entries || draws.len() != entries {
+        if rows == 0 || values.len() != entries || draws.len() != entries {
             return Err(Error::ShapeMismatch);
         }
         Ok(Self {
@@ -151,57 +155,42 @@ impl MaskTail {
         })
     }
 
+    /// The structural check. All accessors are checked as well, so a malformed
+    /// tail cannot panic even if it was built without `new`.
+    pub fn fault(&self) -> Option<&'static str> {
+        if self.rows == 0 {
+            return Some("a mask tail has no rows");
+        }
+        match self.rows.checked_mul(self.len) {
+            Some(entries) if entries == self.values.len() && entries == self.draws.len() => None,
+            Some(_) => Some("a mask tail's values do not match its shape"),
+            None => Some("a mask tail's shape overflows"),
+        }
+    }
+
     pub fn at(&self, row: usize, column: usize) -> Result<Fp3> {
         if row >= self.rows || column >= self.len {
             return Err(Error::InvalidIndex);
         }
-        Ok(self.values[row * self.len + column])
+        let index = row
+            .checked_mul(self.len)
+            .and_then(|index| index.checked_add(column))
+            .ok_or(Error::ResourceLimit)?;
+        self.values.get(index).copied().ok_or(Error::ShapeMismatch)
     }
 }
 
-/// A deterministic numbered coin source for tests and replay only. It is
-/// public and reproducible, provides no hiding, and must never produce a
-/// proof; see the module documentation for the production requirement.
-#[derive(Clone, Debug)]
-pub struct TestMaskCoins {
-    seed: Digest,
-    draw: u32,
-}
+/// The numbered source of a fresh mask's coefficients and encoding tail.
+///
+/// A production implementation must draw fresh secret values from an
+/// independent CSPRNG or key derivation, with one mask per fold and no reuse;
+/// that implementation and its lifecycle are not present in this foundation.
+pub trait MaskCoins {
+    /// Draw one extension-field value and return it with its draw number.
+    fn draw(&mut self) -> Result<(Fp3, u32)>;
 
-impl TestMaskCoins {
-    pub fn new(seed: Digest) -> Self {
-        Self { seed, draw: 0 }
-    }
-
-    pub fn draw_number(&self) -> u32 {
-        self.draw
-    }
-
-    fn value_at(&self, number: u32) -> Result<Fp3> {
-        let digest = hash_labeled(
-            tag_word(TEST_COINS, 0),
-            number as u64,
-            Some(&self.seed),
-            &[],
-        )?;
-        let mut coefficients = [Fp::ZERO; E_DEGREE];
-        for (index, coefficient) in coefficients.iter_mut().enumerate() {
-            let bytes = &digest.0[index * 8..(index + 1) * 8];
-            let word = u64::from_le_bytes(bytes.try_into().map_err(|_| Error::InvalidEncoding)?);
-            *coefficient = Fp::from_u64(word % crate::pcs::request::field::MODULUS);
-        }
-        Ok(Fp3::new(coefficients[0], coefficients[1], coefficients[2]))
-    }
-
-    pub fn draw(&mut self) -> Result<(Fp3, u32)> {
-        let number = self.draw;
-        self.draw = self.draw.checked_add(1).ok_or(Error::ResourceLimit)?;
-        Ok((self.value_at(number)?, number))
-    }
-
-    pub fn redraw(&self, number: u32) -> Result<Fp3> {
-        self.value_at(number)
-    }
+    /// Regenerate the value drawn under `number`.
+    fn redraw(&self, number: u32) -> Result<Fp3>;
 }
 
 /// The fresh mask of one fold: coefficients, the draws' numbers, the random
@@ -250,7 +239,7 @@ impl FoldMask {
 /// `fold_mask_make_tail`, as it is when the mask rows are sent.
 pub fn fold_mask_make(
     shape: &FoldShape,
-    coins: &mut TestMaskCoins,
+    coins: &mut impl MaskCoins,
 ) -> Result<FoldMask> {
     validate_fold_mask_shape(shape)?;
     let mut coefficients = Vec::with_capacity(2 * shape.k as usize + 1);
@@ -275,13 +264,13 @@ pub fn fold_mask_make(
 pub fn fold_mask_make_tail(
     shape: &FoldShape,
     mask: &mut FoldMask,
-    coins: &mut TestMaskCoins,
+    coins: &mut impl MaskCoins,
 ) -> Result<()> {
     validate_fold_mask_shape(shape)?;
     if mask.tail.is_some() {
         return Err(Error::InvalidProof);
     }
-    let rows = usize::try_from(shape.mask_rows()).map_err(|_| Error::ResourceLimit)?;
+    let rows = usize::try_from(shape.mask_rows()?).map_err(|_| Error::ResourceLimit)?;
     let len = usize::try_from(shape.mask_code.r).map_err(|_| Error::ResourceLimit)?;
     let entries = rows.checked_mul(len).ok_or(Error::ResourceLimit)?;
     let mut values = Vec::with_capacity(entries);
@@ -306,7 +295,7 @@ pub fn fold_mask_make_tail(
 pub fn fold_mask_as_drawn(
     shape: &FoldShape,
     mask: &FoldMask,
-    coins: &TestMaskCoins,
+    coins: &impl MaskCoins,
 ) -> Result<()> {
     validate_fold_mask_shape(shape)?;
     let coefficients = 2 * shape.k as usize + 1;
@@ -319,14 +308,10 @@ pub fn fold_mask_as_drawn(
             differ = true;
         }
     }
-    let tail_rows = usize::try_from(shape.mask_rows()).map_err(|_| Error::ResourceLimit)?;
+    let tail_rows = usize::try_from(shape.mask_rows()?).map_err(|_| Error::ResourceLimit)?;
     let tail_len = usize::try_from(shape.mask_code.r).map_err(|_| Error::ResourceLimit)?;
     let tail = mask.tail.as_ref().ok_or(Error::InvalidProof)?;
-    if tail.rows != tail_rows
-        || tail.len != tail_len
-        || tail.values.len() != tail.draws.len()
-        || tail.rows.checked_mul(tail.len) != Some(tail.values.len())
-    {
+    if tail.fault().is_some() || tail.rows != tail_rows || tail.len != tail_len {
         return Err(Error::InvalidProof);
     }
     for (value, number) in tail.values.iter().zip(&tail.draws) {
@@ -352,7 +337,7 @@ pub struct MaskNotice {
 pub fn fold_mask_notice(shape: &FoldShape) -> Result<MaskNotice> {
     validate_fold_mask_shape(shape)?;
     Ok(MaskNotice {
-        mask_rows: shape.mask_rows(),
+        mask_rows: shape.mask_rows()?,
         mask_code: shape.mask_code,
         answers: 0,
         leaf_class: shape.mask_leaf_class,
@@ -369,19 +354,38 @@ pub struct MaskTable {
 }
 
 impl MaskTable {
+    /// A table with `rows * len` values. `len` may be zero (an empty mask
+    /// tail); `rows` may not.
     pub fn new(rows: usize, len: usize, values: Vec<Fp3>) -> Result<Self> {
         let entries = rows.checked_mul(len).ok_or(Error::ResourceLimit)?;
-        if rows == 0 || len == 0 || values.len() != entries {
+        if rows == 0 || values.len() != entries {
             return Err(Error::ShapeMismatch);
         }
         Ok(Self { rows, len, values })
+    }
+
+    /// The structural check. All accessors are checked as well, so a malformed
+    /// table cannot panic even if it was built without `new`.
+    pub fn fault(&self) -> Option<&'static str> {
+        if self.rows == 0 {
+            return Some("a mask table has no rows");
+        }
+        match self.rows.checked_mul(self.len) {
+            Some(entries) if entries == self.values.len() => None,
+            Some(_) => Some("a mask table's values do not match its shape"),
+            None => Some("a mask table's shape overflows"),
+        }
     }
 
     pub fn at(&self, row: usize, column: usize) -> Result<Fp3> {
         if row >= self.rows || column >= self.len {
             return Err(Error::InvalidIndex);
         }
-        Ok(self.values[row + self.rows * column])
+        let index = column
+            .checked_mul(self.rows)
+            .and_then(|index| index.checked_add(row))
+            .ok_or(Error::ResourceLimit)?;
+        self.values.get(index).copied().ok_or(Error::ShapeMismatch)
     }
 }
 
@@ -490,7 +494,7 @@ pub struct MaskPlacement {
 /// supplies overlapping or misaligned blocks must be fixed, not silently
 /// truncated, so this function rejects both cases.
 pub fn fold_gather_mask(h: u32, len: usize, members: &[MaskPlacement]) -> Result<MaskTable> {
-    if h >= 40 || len == 0 {
+    if h >= 40 {
         return Err(Error::InvalidConfig);
     }
     let rows = 1usize << h;
@@ -499,7 +503,11 @@ pub fn fold_gather_mask(h: u32, len: usize, members: &[MaskPlacement]) -> Result
     let mut occupied = vec![false; rows];
     for member in members {
         let member_rows = member.table.rows;
-        if member.table.len != len || member_rows == 0 || !member_rows.is_power_of_two() {
+        if member.table.len != len
+            || member.table.fault().is_some()
+            || member_rows == 0
+            || !member_rows.is_power_of_two()
+        {
             return Err(Error::ShapeMismatch);
         }
         let first = usize::try_from(member.first).map_err(|_| Error::InvalidIndex)?;
@@ -542,7 +550,8 @@ pub fn fold_mask_draft(shape: &FoldShape, mask: &FoldMask) -> Result<MaskDraft> 
     let notice = fold_mask_notice(shape)?;
     let len = usize::try_from(shape.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
     let values = fold_mask_table(shape.k, shape.h, len, mask.coefficients())?;
-    let table = MaskTable::new(1usize << shape.h, len, values)?;
+    let rows = usize::try_from(shape.mask_rows()?).map_err(|_| Error::ResourceLimit)?;
+    let table = MaskTable::new(rows, len, values)?;
     let tail = mask.tail().ok_or(Error::InvalidProof)?.clone();
     Ok(MaskDraft {
         notice,
@@ -551,11 +560,20 @@ pub fn fold_mask_draft(shape: &FoldShape, mask: &FoldMask) -> Result<MaskDraft> 
     })
 }
 
-/// What the verifier knows of an oracle named as a fresh mask.
+/// The verifier's group layout: a group number and the member oracle ids.
 ///
-/// `members` is the verifier's own group layout, never a list taken from the
-/// proof: the static slice makes the trusted origin explicit at the type
-/// level. A group with no members is not a group and is rejected.
+/// The caller must pass the layout that the verifier has already validated.
+/// This struct and its static slice do not prove that origin: a list built for
+/// the same lifetime passes the same content checks. Binding the layout to the
+/// statement and authenticating it is a FOLDEQ prerequisite and is not
+/// implemented in this foundation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupMembers {
+    pub group: u64,
+    pub members: &'static [u64],
+}
+
+/// What the verifier knows of an oracle named as a fresh mask.
 #[derive(Clone, Copy, Debug)]
 pub struct MaskOracle {
     pub id: u64,
@@ -564,18 +582,24 @@ pub struct MaskOracle {
     pub mask_code: CodeParams,
     pub answers: u32,
     pub sampled: bool,
-    pub members: &'static [u64],
+    pub group: GroupMembers,
 }
 
 /// Check that the named oracle has just the shape of a fresh mask, no sample,
 /// and is not a member of the group.
+///
+/// This is a content check on the supplied group list; it is not group
+/// authentication. A forged same-lifetime list that omits the fresh id passes
+/// it, so the caller must supply the layout the verifier validated, and FOLDEQ
+/// must bind and authenticate that layout before this check means anything
+/// about the group.
 pub fn fold_mask_check(shape: &FoldShape, fresh: &MaskOracle) -> Result<()> {
     validate_fold_mask_shape(shape)?;
-    if fresh.members.is_empty() {
+    if fresh.group.members.is_empty() {
         return Err(Error::StatementMismatch);
     }
     if fresh.main_rows != 0
-        || fresh.mask_rows != shape.mask_rows()
+        || fresh.mask_rows != shape.mask_rows()?
         || fresh.mask_code != shape.mask_code
     {
         return Err(Error::StatementMismatch);
@@ -583,7 +607,7 @@ pub fn fold_mask_check(shape: &FoldShape, fresh: &MaskOracle) -> Result<()> {
     if fresh.sampled || fresh.answers != 0 {
         return Err(Error::StatementMismatch);
     }
-    if fresh.members.contains(&fresh.id) {
+    if fresh.group.members.contains(&fresh.id) {
         return Err(Error::StatementMismatch);
     }
     Ok(())
@@ -592,6 +616,53 @@ pub fn fold_mask_check(shape: &FoldShape, fresh: &MaskOracle) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pcs::request::field::{Fp, MODULUS};
+    use zkie_core::common::field::PrimeCharacteristicRing;
+    use crate::primitives::transcript::{hash_labeled, tag_word, TEST_COINS};
+    use zkie_core::types::Digest;
+
+    /// A deterministic numbered source for tests only. It is compiled out of
+    /// the normal build and provides no hiding.
+    #[derive(Clone, Debug)]
+    struct TestMaskCoins {
+        seed: Digest,
+        draw: u32,
+    }
+
+    impl TestMaskCoins {
+        fn new(seed: Digest) -> Self {
+            Self { seed, draw: 0 }
+        }
+
+        fn value_at(&self, number: u32) -> Result<Fp3> {
+            let digest = hash_labeled(
+                tag_word(TEST_COINS, 0),
+                number as u64,
+                Some(&self.seed),
+                &[],
+            )?;
+            let mut coefficients = [Fp::ZERO; E_DEGREE];
+            for (index, coefficient) in coefficients.iter_mut().enumerate() {
+                let bytes = &digest.0[index * 8..(index + 1) * 8];
+                let word =
+                    u64::from_le_bytes(bytes.try_into().map_err(|_| Error::InvalidEncoding)?);
+                *coefficient = Fp::from_u64(word % MODULUS);
+            }
+            Ok(Fp3::new(coefficients[0], coefficients[1], coefficients[2]))
+        }
+    }
+
+    impl MaskCoins for TestMaskCoins {
+        fn draw(&mut self) -> Result<(Fp3, u32)> {
+            let number = self.draw;
+            self.draw = self.draw.checked_add(1).ok_or(Error::ResourceLimit)?;
+            Ok((self.value_at(number)?, number))
+        }
+
+        fn redraw(&self, number: u32) -> Result<Fp3> {
+            self.value_at(number)
+        }
+    }
 
     fn shape() -> FoldShape {
         FoldShape {
@@ -853,9 +924,13 @@ mod tests {
         )
         .unwrap();
         assert!(fold_gather_mask(2, 1, &[MaskPlacement { first: 0, table: three }]).is_err());
-        // The shift itself is bounded, and a zero-width layout is rejected.
+        // The shift itself is bounded; a zero-width layout is a legal empty
+        // tail and keeps the group's rows.
         assert!(fold_gather_mask(40, 2, &[]).is_err());
-        assert!(fold_gather_mask(1, 0, &[]).is_err());
+        let empty = fold_gather_mask(1, 0, &[]).unwrap();
+        assert_eq!(empty.rows, 2);
+        assert_eq!(empty.len, 0);
+        assert!(empty.values.is_empty());
     }
 
     #[test]
@@ -886,7 +961,10 @@ mod tests {
             mask_code: shape.mask_code,
             answers: 0,
             sampled: false,
-            members: &[1, 2],
+            group: GroupMembers {
+                group: 1,
+                members: &[1, 2],
+            },
         };
         fold_mask_check(&shape, &good).unwrap();
         let mut bad = good;
@@ -905,11 +983,36 @@ mod tests {
         bad.answers = 1;
         assert!(fold_mask_check(&shape, &bad).is_err());
         let mut bad = good;
-        bad.members = &[9, 1];
+        bad.group = GroupMembers {
+            group: 1,
+            members: &[9, 1],
+        };
         assert!(fold_mask_check(&shape, &bad).is_err());
+        // A forged list with the same lifetime that names the mask is still a
+        // content-level rejection.
+        let forged: &'static [u64] = Box::leak(vec![9, 4].into_boxed_slice());
+        let mut bad = good;
+        bad.group = GroupMembers {
+            group: 1,
+            members: forged,
+        };
+        assert!(fold_mask_check(&shape, &bad).is_err());
+        // A forged list that omits the mask passes the content check. This is
+        // the recorded limitation: the function does not authenticate the
+        // group, and FOLDEQ must bind the verifier's layout before wiring.
+        let forged_clean: &'static [u64] = Box::leak(vec![1, 2].into_boxed_slice());
+        let mut forged_oracle = good;
+        forged_oracle.group = GroupMembers {
+            group: 1,
+            members: forged_clean,
+        };
+        assert!(fold_mask_check(&shape, &forged_oracle).is_ok());
         // A group with no members is not a group.
         let mut bad = good;
-        bad.members = &[];
+        bad.group = GroupMembers {
+            group: 1,
+            members: &[],
+        };
         assert!(fold_mask_check(&shape, &bad).is_err());
     }
 
@@ -927,6 +1030,97 @@ mod tests {
         too_high.h = 64;
         assert!(fold_mask_shape_fault(&too_high).is_some());
         assert!(fold_mask_notice(&too_high).is_err());
+    }
+
+    #[test]
+    fn zero_length_tail_is_supported() {
+        let mut shape = shape();
+        shape.mask_code = build_code_plan(3, 4, 0).unwrap();
+        let mut source = coins();
+        let mut mask = fold_mask_make(&shape, &mut source).unwrap();
+        fold_mask_make_tail(&shape, &mut mask, &mut source).unwrap();
+        let tail = mask.tail().unwrap();
+        assert_eq!(tail.rows, 2);
+        assert_eq!(tail.len, 0);
+        assert!(tail.values.is_empty());
+        assert!(tail.draws.is_empty());
+        assert!(tail.at(0, 0).is_err());
+        fold_mask_as_drawn(&shape, &mask, &source).unwrap();
+        let draft = fold_mask_draft(&shape, &mask).unwrap();
+        assert_eq!(draft.tail.len, 0);
+        let empty = MaskTable::new(1, 0, Vec::new()).unwrap();
+        let group = fold_gather_mask(1, 0, &[MaskPlacement { first: 0, table: empty }]).unwrap();
+        assert_eq!(group.rows, 2);
+        assert_eq!(group.len, 0);
+        assert!(group.values.is_empty());
+    }
+
+    #[test]
+    fn malformed_structures_are_rejected_without_panicking() {
+        let short_table = MaskTable {
+            rows: 2,
+            len: 2,
+            values: vec![Fp3::from_u64(1)],
+        };
+        assert!(short_table.fault().is_some());
+        assert!(short_table.at(1, 0).is_err());
+        assert!(fold_gather_mask(
+            1,
+            2,
+            &[MaskPlacement {
+                first: 0,
+                table: short_table.clone(),
+            }]
+        )
+        .is_err());
+        assert!(MaskTable::new(0, 2, Vec::new()).is_err());
+        let empty = MaskTable::new(2, 0, Vec::new()).unwrap();
+        assert!(empty.fault().is_none());
+        assert!(empty.at(0, 0).is_err());
+
+        let short_tail = MaskTail {
+            rows: 2,
+            len: 1,
+            values: vec![Fp3::from_u64(1)],
+            draws: vec![0],
+        };
+        assert!(short_tail.fault().is_some());
+        assert!(short_tail.at(1, 0).is_err());
+        assert!(MaskTail::new(0, 0, Vec::new(), Vec::new()).is_err());
+
+        let shape = shape();
+        let mut source = coins();
+        let mut mask = fold_mask_make(&shape, &mut source).unwrap();
+        fold_mask_make_tail(&shape, &mut mask, &mut source).unwrap();
+        let broken = FoldMask {
+            coefficients: mask.coefficients().to_vec(),
+            draws: mask.draws().to_vec(),
+            tail: Some(short_tail),
+            id: None,
+        };
+        assert!(fold_mask_as_drawn(&shape, &broken, &source).is_err());
+    }
+
+    #[test]
+    fn mask_rows_rejects_unvalidated_shifts() {
+        let base = shape();
+        let mut h64 = base;
+        h64.h = 64;
+        h64.k = 64;
+        assert!(h64.mask_rows().is_err());
+        assert!(fold_mask_shape_fault(&h64).is_some());
+        assert!(fold_mask_notice(&h64).is_err());
+        let mut source = coins();
+        let mut mask = fold_mask_make(&base, &mut source).unwrap();
+        assert!(fold_mask_make_tail(&h64, &mut mask, &mut source).is_err());
+        assert!(fold_mask_as_drawn(&h64, &mask, &source).is_err());
+        // h=63 still shifts, but the shape bound rejects it before use.
+        let mut h63 = base;
+        h63.h = 63;
+        h63.k = 63;
+        assert!(h63.mask_rows().is_ok());
+        assert!(fold_mask_shape_fault(&h63).is_some());
+        assert!(fold_mask_notice(&h63).is_err());
     }
 
     #[test]
