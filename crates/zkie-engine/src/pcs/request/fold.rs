@@ -552,51 +552,83 @@ pub fn fold_mask_draft(shape: &FoldShape, mask: &FoldMask) -> Result<MaskDraft> 
     let values = fold_mask_table(shape.k, shape.h, len, mask.coefficients())?;
     let rows = usize::try_from(shape.mask_rows()?).map_err(|_| Error::ResourceLimit)?;
     let table = MaskTable::new(rows, len, values)?;
-    let tail = mask.tail().ok_or(Error::InvalidProof)?.clone();
+    let tail = mask.tail().ok_or(Error::InvalidProof)?;
+    let tail_rows = usize::try_from(shape.mask_rows()?).map_err(|_| Error::ResourceLimit)?;
+    let tail_len = usize::try_from(shape.mask_code.r).map_err(|_| Error::ResourceLimit)?;
+    if tail.fault().is_some() || tail.rows != tail_rows || tail.len != tail_len {
+        return Err(Error::InvalidProof);
+    }
     Ok(MaskDraft {
         notice,
         table,
-        tail,
+        tail: tail.clone(),
     })
 }
 
-/// The verifier's group layout: a group number and the member oracle ids.
-///
-/// The caller must pass the layout that the verifier has already validated.
-/// This struct and its static slice do not prove that origin: a list built for
-/// the same lifetime passes the same content checks. Binding the layout to the
-/// statement and authenticating it is a FOLDEQ prerequisite and is not
-/// implemented in this foundation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GroupMembers {
+/// The verifier's own group entry, taken from its independently verified
+/// statement/plan registry. This is the only source of members for the
+/// fresh-mask check; a proof supplies a group number, never the members.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedGroup {
     pub group: u64,
-    pub members: &'static [u64],
+    pub members: Vec<u64>,
+    /// The fresh mask id the plan fixes for this group, if any.
+    pub fresh: Option<u64>,
 }
 
-/// What the verifier knows of an oracle named as a fresh mask.
+/// The verifier's group registry. It must be built from the verified
+/// statement/plan, not from proof bytes; this foundation trusts the caller to
+/// have done so, and the FOLDEQ statement binding is the gate that closes it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VerifiedGroups {
+    pub groups: Vec<VerifiedGroup>,
+}
+
+impl VerifiedGroups {
+    pub fn get(&self, group: u64) -> Option<&VerifiedGroup> {
+        self.groups.iter().find(|entry| entry.group == group)
+    }
+}
+
+/// What the verifier knows of an oracle named as a fresh mask. `claimed_group`
+/// is only a lookup key into the verifier's registry; the members come from
+/// the registry entry, never from this notice.
 #[derive(Clone, Copy, Debug)]
 pub struct MaskOracle {
     pub id: u64,
+    pub claimed_group: u64,
     pub main_rows: u64,
     pub mask_rows: u64,
     pub mask_code: CodeParams,
     pub answers: u32,
     pub sampled: bool,
-    pub group: GroupMembers,
 }
 
 /// Check that the named oracle has just the shape of a fresh mask, no sample,
-/// and is not a member of the group.
+/// and is not a member of the group the verifier's registry holds.
 ///
-/// This is a content check on the supplied group list; it is not group
-/// authentication. A forged same-lifetime list that omits the fresh id passes
-/// it, so the caller must supply the layout the verifier validated, and FOLDEQ
-/// must bind and authenticate that layout before this check means anything
-/// about the group.
-pub fn fold_mask_check(shape: &FoldShape, fresh: &MaskOracle) -> Result<()> {
+/// This is a content check against the registry entry. It does not
+/// authenticate the registry; the statement/plan must be verified before the
+/// registry is used, and FOLDEQ must bind the group, the fresh oracle and the
+/// layout to the statement. A proof that omits its fresh id from a group it
+/// invents cannot influence the check: the notice carries no members, and the
+/// members are looked up by the registry's group number.
+pub fn fold_mask_check(
+    shape: &FoldShape,
+    fresh: &MaskOracle,
+    groups: &VerifiedGroups,
+) -> Result<()> {
     validate_fold_mask_shape(shape)?;
-    if fresh.group.members.is_empty() {
+    let group = groups
+        .get(fresh.claimed_group)
+        .ok_or(Error::StatementMismatch)?;
+    if group.members.is_empty() {
         return Err(Error::StatementMismatch);
+    }
+    if let Some(expected) = group.fresh {
+        if fresh.id != expected {
+            return Err(Error::StatementMismatch);
+        }
     }
     if fresh.main_rows != 0
         || fresh.mask_rows != shape.mask_rows()?
@@ -607,7 +639,7 @@ pub fn fold_mask_check(shape: &FoldShape, fresh: &MaskOracle) -> Result<()> {
     if fresh.sampled || fresh.answers != 0 {
         return Err(Error::StatementMismatch);
     }
-    if fresh.group.members.contains(&fresh.id) {
+    if group.members.contains(&fresh.id) {
         return Err(Error::StatementMismatch);
     }
     Ok(())
@@ -954,66 +986,102 @@ mod tests {
                 .unwrap()
         );
 
+        // A mask made for another legal shape cannot be drafted here: the
+        // tail's rows/r and the coefficient count are checked against the
+        // current shape before the draft is built.
+        let mut other_shape = shape;
+        other_shape.mask_code = build_code_plan(3, 5, 2).unwrap();
+        let mut other_mask = fold_mask_make(&other_shape, &mut source).unwrap();
+        fold_mask_make_tail(&other_shape, &mut other_mask, &mut source).unwrap();
+        assert!(fold_mask_draft(&shape, &other_mask).is_err());
+        let mut narrow_shape = shape;
+        narrow_shape.k = 1;
+        let mut narrow_mask = fold_mask_make(&narrow_shape, &mut source).unwrap();
+        fold_mask_make_tail(&narrow_shape, &mut narrow_mask, &mut source).unwrap();
+        assert!(fold_mask_draft(&shape, &narrow_mask).is_err());
+
+        let groups = VerifiedGroups {
+            groups: vec![VerifiedGroup {
+                group: 1,
+                members: vec![1, 2],
+                fresh: None,
+            }],
+        };
         let good = MaskOracle {
             id: 9,
+            claimed_group: 1,
             main_rows: 0,
             mask_rows: 2,
             mask_code: shape.mask_code,
             answers: 0,
             sampled: false,
-            group: GroupMembers {
-                group: 1,
-                members: &[1, 2],
-            },
         };
-        fold_mask_check(&shape, &good).unwrap();
+        fold_mask_check(&shape, &good, &groups).unwrap();
         let mut bad = good;
         bad.main_rows = 1;
-        assert!(fold_mask_check(&shape, &bad).is_err());
+        assert!(fold_mask_check(&shape, &bad, &groups).is_err());
         let mut bad = good;
         bad.mask_rows = 4;
-        assert!(fold_mask_check(&shape, &bad).is_err());
+        assert!(fold_mask_check(&shape, &bad, &groups).is_err());
         let mut bad = good;
         bad.mask_code = shape.code;
-        assert!(fold_mask_check(&shape, &bad).is_err());
+        assert!(fold_mask_check(&shape, &bad, &groups).is_err());
         let mut bad = good;
         bad.sampled = true;
-        assert!(fold_mask_check(&shape, &bad).is_err());
+        assert!(fold_mask_check(&shape, &bad, &groups).is_err());
         let mut bad = good;
         bad.answers = 1;
-        assert!(fold_mask_check(&shape, &bad).is_err());
+        assert!(fold_mask_check(&shape, &bad, &groups).is_err());
+        // The claimed group is only a lookup key: a group the verifier's
+        // registry does not hold is rejected.
         let mut bad = good;
-        bad.group = GroupMembers {
-            group: 1,
-            members: &[9, 1],
+        bad.claimed_group = 7;
+        assert!(fold_mask_check(&shape, &bad, &groups).is_err());
+        // The members come from the registry, not from the notice. A fresh id
+        // listed as a member of the registry's group is rejected even though
+        // the notice itself carries no member list.
+        let member_groups = VerifiedGroups {
+            groups: vec![VerifiedGroup {
+                group: 1,
+                members: vec![9, 1],
+                fresh: None,
+            }],
         };
-        assert!(fold_mask_check(&shape, &bad).is_err());
-        // A forged list with the same lifetime that names the mask is still a
-        // content-level rejection.
-        let forged: &'static [u64] = Box::leak(vec![9, 4].into_boxed_slice());
-        let mut bad = good;
-        bad.group = GroupMembers {
-            group: 1,
-            members: forged,
+        assert!(fold_mask_check(&shape, &good, &member_groups).is_err());
+        // A fresh id the plan fixes must match.
+        let fixed = VerifiedGroups {
+            groups: vec![VerifiedGroup {
+                group: 1,
+                members: vec![1, 2],
+                fresh: Some(9),
+            }],
         };
-        assert!(fold_mask_check(&shape, &bad).is_err());
-        // A forged list that omits the mask passes the content check. This is
-        // the recorded limitation: the function does not authenticate the
-        // group, and FOLDEQ must bind the verifier's layout before wiring.
-        let forged_clean: &'static [u64] = Box::leak(vec![1, 2].into_boxed_slice());
-        let mut forged_oracle = good;
-        forged_oracle.group = GroupMembers {
-            group: 1,
-            members: forged_clean,
+        fold_mask_check(&shape, &good, &fixed).unwrap();
+        let mut other = good;
+        other.id = 8;
+        assert!(fold_mask_check(&shape, &other, &fixed).is_err());
+        // A forged registry that omits the fresh id passes this content check.
+        // The recorded limitation is the registry itself: the statement/plan
+        // must be independently verified before the registry is used, and
+        // FOLDEQ must bind the group, fresh oracle and layout to that
+        // statement. The notice cannot forge the members.
+        let forged_clean = VerifiedGroups {
+            groups: vec![VerifiedGroup {
+                group: 1,
+                members: vec![1, 2],
+                fresh: None,
+            }],
         };
-        assert!(fold_mask_check(&shape, &forged_oracle).is_ok());
+        assert!(fold_mask_check(&shape, &good, &forged_clean).is_ok());
         // A group with no members is not a group.
-        let mut bad = good;
-        bad.group = GroupMembers {
-            group: 1,
-            members: &[],
+        let empty = VerifiedGroups {
+            groups: vec![VerifiedGroup {
+                group: 1,
+                members: Vec::new(),
+                fresh: None,
+            }],
         };
-        assert!(fold_mask_check(&shape, &bad).is_err());
+        assert!(fold_mask_check(&shape, &good, &empty).is_err());
     }
 
     #[test]
