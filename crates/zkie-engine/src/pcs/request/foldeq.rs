@@ -1164,6 +1164,14 @@ use crate::pcs::request::fold::{
         gu_plan_with(Some(build_code_plan(3, 6, 1).unwrap()), vec![1, 2], 10)
     }
 
+    fn gu_plan_with_answers(
+        answers: u32,
+    ) -> (FoldeqPlan, crate::pcs::request::table::CommittedTable) {
+        let (mut plan, table) = gu_plan_fixture();
+        plan.gu.as_mut().unwrap().u.answers = answers;
+        (plan, table)
+    }
+
     fn open_gu_plan_from(plan: FoldeqPlan) -> FoldeqSession {
         let binder = FoldeqBinder::new(REQUEST_CHAIN_LABEL, plan.reader.configuration, &plan).unwrap();
         let chain = binder.chain().unwrap();
@@ -2049,5 +2057,29 @@ use crate::pcs::request::fold::{
         session.receive_gu_answer(Fp3::ONE).unwrap();
         session.plan.gu.as_mut().unwrap().group = 2;
         assert!(session.join_gu_record().is_err());
+    }
+
+    #[test]
+    fn gu_session_closes_every_ordered_answer() {
+        let (plan, _table) = gu_plan_with_answers(2);
+        let mut session = open_gu_plan_from(plan);
+        session.send_gu(&Digest([4; 32])).unwrap();
+        session.shared_seeds().unwrap();
+        assert_eq!(session.gu_shared_seeds().len(), 2);
+        session.receive_gu_answer(Fp3::ONE).unwrap();
+        assert!(session.draw_queries().is_err());
+        assert!(session.join_gu_record().is_err());
+        session.receive_gu_answer(Fp3::from_u64(2)).unwrap();
+        assert!(session.receive_gu_answer(Fp3::ONE).is_err());
+        session.join_gu_record().unwrap();
+        session.draw_queries().unwrap();
+        assert_eq!(
+            session
+                .pending_gu_rows()
+                .iter()
+                .filter(|row| row.kind == GuRelationKind::Sample)
+                .count(),
+            2
+        );
     }
 }
