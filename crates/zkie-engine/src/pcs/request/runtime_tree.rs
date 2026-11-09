@@ -379,7 +379,7 @@ mod tests {
             .collect()
     }
 
-    fn salts(shape: &FoldShape, plan: &MaskTreePlan) -> Vec<Vec<u8>> {
+    fn salts(_shape: &FoldShape, plan: &MaskTreePlan) -> Vec<Vec<u8>> {
         (0..plan.columns() as usize)
             .map(|position| vec![(position as u8).wrapping_add(1); plan.salt_bytes])
             .collect()
