@@ -1,0 +1,25 @@
+   Compiling zkie-engine v0.1.0 (/data/zkIE/crates/zkie-engine)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.66s
+     Running unittests src/lib.rs (target/debug/deps/zkie_engine-8aa968ebbad7c68c)
+
+running 1 test
+test pcs::request::binding::tests::statement_request_and_table_identities_change_the_first_query ... FAILED
+
+failures:
+
+---- pcs::request::binding::tests::statement_request_and_table_identities_change_the_first_query stdout ----
+
+thread 'pcs::request::binding::tests::statement_request_and_table_identities_change_the_first_query' (1544355) panicked at crates/zkie-engine/src/pcs/request/binding.rs:376:9:
+assertion `left != right` failed
+  left: Digest([81, 22, 68, 102, 59, 77, 16, 153, 103, 32, 116, 112, 73, 129, 46, 220, 236, 165, 3, 102, 58, 89, 49, 225, 107, 250, 161, 185, 145, 87, 46, 102])
+ right: Digest([81, 22, 68, 102, 59, 77, 16, 153, 103, 32, 116, 112, 73, 129, 46, 220, 236, 165, 3, 102, 58, 89, 49, 225, 107, 250, 161, 185, 145, 87, 46, 102])
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    pcs::request::binding::tests::statement_request_and_table_identities_change_the_first_query
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 223 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p zkie-engine --lib`
+INJECT statement-table EXIT 101

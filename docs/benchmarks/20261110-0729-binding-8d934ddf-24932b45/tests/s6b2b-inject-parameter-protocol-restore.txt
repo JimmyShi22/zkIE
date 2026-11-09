@@ -1,0 +1,10 @@
+   Compiling zkie-engine v0.1.0 (/data/zkIE/crates/zkie-engine)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.66s
+     Running unittests src/lib.rs (target/debug/deps/zkie_engine-8aa968ebbad7c68c)
+
+running 1 test
+test pcs::request::binding::tests::parameter_protocol_identity_changes_the_digest ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 223 filtered out; finished in 0.00s
+
+RESTORE parameter-protocol EXIT 0

@@ -1,0 +1,23 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/zkie_engine-8aa968ebbad7c68c)
+
+running 16 tests
+test pcs::request::binding::tests::canonical_writer_separates_word_and_byte_string_types ... ok
+test pcs::request::binding::tests::contradictory_statement_is_rejected ... ok
+test pcs::request::binding::tests::assembly_is_deterministic_and_reuses_chain_start ... ok
+test pcs::request::binding::tests::case_id_length_and_field_framing_are_bound ... ok
+test pcs::request::binding::tests::domain_separation_isolates_the_domain_label ... ok
+test pcs::request::binding::tests::missing_statement_values_are_rejected ... ok
+test pcs::request::binding::tests::missing_parameters_are_rejected ... ok
+test pcs::request::binding::tests::parameter_domain_parameters_change_the_digest ... ok
+test pcs::request::binding::tests::parameter_plan_identifier_changes_the_digest ... ok
+test pcs::request::binding::tests::parameter_protocol_identity_changes_the_digest ... ok
+test pcs::request::binding::tests::plan_identifier_binds_order_length_and_presence ... ok
+test pcs::request::binding::tests::parameter_version_changes_the_digest ... ok
+test pcs::request::binding::tests::statement_case_changes_the_first_query ... ok
+test pcs::request::binding::tests::statement_field_order_is_bound ... ok
+test pcs::request::binding::tests::record_presence_bytes_and_length_are_bound ... ok
+test pcs::request::binding::tests::statement_request_and_table_identities_change_the_first_query ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 208 filtered out; finished in 0.00s
+

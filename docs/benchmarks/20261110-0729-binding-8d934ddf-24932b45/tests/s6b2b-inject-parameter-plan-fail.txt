@@ -1,0 +1,25 @@
+   Compiling zkie-engine v0.1.0 (/data/zkIE/crates/zkie-engine)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.66s
+     Running unittests src/lib.rs (target/debug/deps/zkie_engine-8aa968ebbad7c68c)
+
+running 1 test
+test pcs::request::binding::tests::parameter_plan_identifier_changes_the_digest ... FAILED
+
+failures:
+
+---- pcs::request::binding::tests::parameter_plan_identifier_changes_the_digest stdout ----
+
+thread 'pcs::request::binding::tests::parameter_plan_identifier_changes_the_digest' (1542720) panicked at crates/zkie-engine/src/pcs/request/binding.rs:351:9:
+assertion `left != right` failed
+  left: Digest([52, 247, 229, 64, 45, 170, 211, 206, 9, 50, 50, 141, 3, 20, 131, 39, 246, 97, 102, 178, 128, 188, 159, 137, 20, 33, 114, 79, 5, 159, 23, 26])
+ right: Digest([52, 247, 229, 64, 45, 170, 211, 206, 9, 50, 50, 141, 3, 20, 131, 39, 246, 97, 102, 178, 128, 188, 159, 137, 20, 33, 114, 79, 5, 159, 23, 26])
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    pcs::request::binding::tests::parameter_plan_identifier_changes_the_digest
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 223 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p zkie-engine --lib`
+INJECT parameter-plan EXIT 101

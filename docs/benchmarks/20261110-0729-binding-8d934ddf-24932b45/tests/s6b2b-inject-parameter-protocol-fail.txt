@@ -1,0 +1,25 @@
+   Compiling zkie-engine v0.1.0 (/data/zkIE/crates/zkie-engine)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.66s
+     Running unittests src/lib.rs (target/debug/deps/zkie_engine-8aa968ebbad7c68c)
+
+running 1 test
+test pcs::request::binding::tests::parameter_protocol_identity_changes_the_digest ... FAILED
+
+failures:
+
+---- pcs::request::binding::tests::parameter_protocol_identity_changes_the_digest stdout ----
+
+thread 'pcs::request::binding::tests::parameter_protocol_identity_changes_the_digest' (1541630) panicked at crates/zkie-engine/src/pcs/request/binding.rs:327:9:
+assertion `left != right` failed
+  left: Digest([61, 61, 250, 102, 11, 63, 0, 48, 30, 35, 38, 34, 230, 214, 151, 5, 145, 109, 100, 189, 152, 232, 245, 128, 19, 92, 104, 114, 36, 91, 156, 85])
+ right: Digest([61, 61, 250, 102, 11, 63, 0, 48, 30, 35, 38, 34, 230, 214, 151, 5, 145, 109, 100, 189, 152, 232, 245, 128, 19, 92, 104, 114, 36, 91, 156, 85])
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    pcs::request::binding::tests::parameter_protocol_identity_changes_the_digest
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 223 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p zkie-engine --lib`
+INJECT parameter-protocol EXIT 101

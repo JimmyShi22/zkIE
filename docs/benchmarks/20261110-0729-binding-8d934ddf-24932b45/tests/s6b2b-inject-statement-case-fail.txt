@@ -1,0 +1,25 @@
+   Compiling zkie-engine v0.1.0 (/data/zkIE/crates/zkie-engine)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.65s
+     Running unittests src/lib.rs (target/debug/deps/zkie_engine-8aa968ebbad7c68c)
+
+running 1 test
+test pcs::request::binding::tests::statement_case_changes_the_first_query ... FAILED
+
+failures:
+
+---- pcs::request::binding::tests::statement_case_changes_the_first_query stdout ----
+
+thread 'pcs::request::binding::tests::statement_case_changes_the_first_query' (1543265) panicked at crates/zkie-engine/src/pcs/request/binding.rs:359:9:
+assertion `left != right` failed
+  left: Digest([110, 218, 148, 190, 125, 21, 160, 127, 19, 238, 133, 216, 140, 170, 15, 95, 182, 235, 84, 29, 192, 92, 108, 200, 203, 254, 32, 151, 191, 14, 33, 56])
+ right: Digest([110, 218, 148, 190, 125, 21, 160, 127, 19, 238, 133, 216, 140, 170, 15, 95, 182, 235, 84, 29, 192, 92, 108, 200, 203, 254, 32, 151, 191, 14, 33, 56])
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    pcs::request::binding::tests::statement_case_changes_the_first_query
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 223 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p zkie-engine --lib`
+INJECT statement-case EXIT 101
