@@ -16,11 +16,15 @@
 //! it is public and reproducible, provides no hiding, and must not produce a
 //! proof.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use zkie_core::error::{Error, Result};
+use zkie_core::types::Digest;
 
 use crate::pcs::request::code::{build_code_plan, CodeParams};
 use crate::pcs::request::field::{E_DEGREE, Fp3};
+use crate::pcs::request::runtime_tree::{MaskTree, MaskTreePlan};
 
 /// The draw number that no source produces.
 pub const NO_DRAW: u32 = u32::MAX;
@@ -636,23 +640,103 @@ pub fn fold_mask_sum(k: u32, w: &[Fp3]) -> Result<Fp3> {
     Ok(sum)
 }
 
-/// The opening of one FOLD: the mask was checked against the verifier's
-/// registry and the drawn values, the draft is the sent mask message and the
-/// sum is the first value after it. The round polynomials and the table test
-/// are the next part of the FOLD session and are not in this foundation.
-#[derive(Clone, Debug)]
-pub struct FoldStart {
-    pub draft: MaskDraft,
+/// The public FOLD start message: the fresh mask's oracle id and claimed
+/// group, its notice, its runtime-tree root and the hiding sum. A verifier
+/// checks it without any coefficient, tail or coin from the prover.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoldStartMessage {
+    pub id: u64,
+    pub claimed_group: u64,
+    pub notice: MaskNotice,
+    pub root: Digest,
     pub sum: Fp3,
 }
 
-pub fn fold_start(
+/// The prover's FOLD start: the public message, the private draft and the
+/// committed runtime mask tree.
+#[derive(Clone, Debug)]
+pub struct FoldStartProver {
+    pub message: FoldStartMessage,
+    pub draft: MaskDraft,
+    pub tree: MaskTree,
+}
+
+/// The single-use mask ledger. The verifier's statement owns it; a second
+/// start that names the same oracle id fails.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MaskSpend {
+    spent: HashSet<u64>,
+}
+
+impl MaskSpend {
+    pub fn spend(&mut self, id: u64) -> Result<()> {
+        if !self.spent.insert(id) {
+            return Err(Error::StatementMismatch);
+        }
+        Ok(())
+    }
+
+    pub fn is_spent(&self, id: u64) -> bool {
+        self.spent.contains(&id)
+    }
+}
+
+fn mask_rows(shape: &FoldShape, mask: &FoldMask) -> Result<Vec<Vec<Fp3>>> {
+    let len = usize::try_from(shape.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
+    let rows = usize::try_from(shape.mask_rows()?).map_err(|_| Error::ResourceLimit)?;
+    let values = fold_mask_table(shape.k, shape.h, len, mask.coefficients())?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(rows).map_err(|_| Error::ResourceLimit)?;
+    for row in 0..rows {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(len)
+            .map_err(|_| Error::ResourceLimit)?;
+        for column in 0..len {
+            entries.push(values[row + rows * column]);
+        }
+        out.push(entries);
+    }
+    Ok(out)
+}
+
+fn mask_tail_rows(shape: &FoldShape, mask: &FoldMask) -> Result<Vec<Vec<Fp3>>> {
+    let tail = mask.tail().ok_or(Error::InvalidProof)?;
+    if tail.fault().is_some()
+        || tail.rows != usize::try_from(shape.mask_rows()?).map_err(|_| Error::ResourceLimit)?
+        || tail.len != usize::try_from(shape.mask_code.r).map_err(|_| Error::ResourceLimit)?
+    {
+        return Err(Error::InvalidProof);
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(tail.rows)
+        .map_err(|_| Error::ResourceLimit)?;
+    for row in 0..tail.rows {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(tail.len)
+            .map_err(|_| Error::ResourceLimit)?;
+        for column in 0..tail.len {
+            entries.push(tail.at(row, column)?);
+        }
+        out.push(entries);
+    }
+    Ok(out)
+}
+
+/// Prover side: check the mask against the verifier's registry and the drawn
+/// values, commit the runtime mask tree under the plan, and return the public
+/// message plus the private draft. The salts are fresh prover values; the
+/// production source is not implemented.
+pub fn fold_start_prove(
     shape: &FoldShape,
     mask: &FoldMask,
     coins: &impl MaskCoins,
     oracle: &MaskOracle,
     groups: &VerifiedGroups,
-) -> Result<FoldStart> {
+    tree_plan: MaskTreePlan,
+    salts: &[Vec<u8>],
+) -> Result<FoldStartProver> {
     validate_fold_mask_shape(shape)?;
     if mask.id() != Some(oracle.id) {
         return Err(Error::InvalidProof);
@@ -660,8 +744,56 @@ pub fn fold_start(
     fold_mask_check(shape, oracle, groups)?;
     fold_mask_as_drawn(shape, mask, coins)?;
     let draft = fold_mask_draft(shape, mask)?;
+    let rows = mask_rows(shape, mask)?;
+    let tails = mask_tail_rows(shape, mask)?;
+    let tree = MaskTree::commit(tree_plan, shape, &rows, &tails, salts)?;
     let sum = fold_mask_sum(shape.k, mask.coefficients())?;
-    Ok(FoldStart { draft, sum })
+    let message = FoldStartMessage {
+        id: oracle.id,
+        claimed_group: oracle.claimed_group,
+        notice: draft.notice,
+        root: tree.root,
+        sum,
+    };
+    Ok(FoldStartProver {
+        message,
+        draft,
+        tree,
+    })
+}
+
+/// Verifier side: check the public start message against the plan's runtime
+/// tree layout, the mask shape, the verifier's group registry and the
+/// single-use ledger. No coefficient, tail, coin or salt is accepted.
+pub fn fold_start_verify(
+    shape: &FoldShape,
+    message: &FoldStartMessage,
+    groups: &VerifiedGroups,
+    tree_plan: &MaskTreePlan,
+    spend: &mut MaskSpend,
+) -> Result<()> {
+    validate_fold_mask_shape(shape)?;
+    if tree_plan.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let rows = tree_plan.mask_rows;
+    let log_n = tree_plan.log_n;
+    if rows != shape.mask_rows()?
+        || log_n != shape.mask_code.log_n
+        || tree_plan.leaf_class != message.notice.leaf_class
+        || message.notice.mask_rows != rows
+        || message.notice.mask_code != shape.mask_code
+        || message.notice.answers != 0
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let oracle = MaskOracle::from_notice(message.id, message.claimed_group, &message.notice);
+    fold_mask_check(shape, &oracle, groups)?;
+    if message.root == Digest::ZERO {
+        return Err(Error::InvalidProof);
+    }
+    spend.spend(message.id)?;
+    Ok(())
 }
 
 /// What the verifier knows of an oracle named as a fresh mask. `claimed_group`
@@ -723,6 +855,8 @@ pub fn fold_mask_check(
 mod tests {
     use super::*;
     use crate::pcs::request::field::{Fp, MODULUS};
+    use crate::pcs::request::params::LEAF_SALT_MIN_BYTES;
+    use crate::pcs::request::runtime_tree::verify_mask_columns;
     use zkie_core::common::field::PrimeCharacteristicRing;
     use crate::primitives::transcript::{hash_labeled, tag_word, TEST_COINS};
     use zkie_core::types::Digest;
@@ -907,8 +1041,26 @@ mod tests {
         }
     }
 
+    fn tree_plan(shape: &FoldShape) -> MaskTreePlan {
+        MaskTreePlan {
+            tree_number: 5,
+            leaf_class: shape.mask_leaf_class,
+            log_n: shape.mask_code.log_n,
+            mask_rows: shape.mask_rows().unwrap(),
+            salt_bytes: LEAF_SALT_MIN_BYTES,
+            run: Digest([2; 32]),
+            configuration: Digest([7; 32]),
+        }
+    }
+
+    fn tree_salts(plan: &MaskTreePlan) -> Vec<Vec<u8>> {
+        (0..plan.columns() as usize)
+            .map(|position| vec![(position as u8).wrapping_add(1); plan.salt_bytes])
+            .collect()
+    }
+
     #[test]
-    fn fold_start_checks_the_mask_and_returns_the_sum() {
+    fn fold_start_separates_prover_and_verifier() {
         let shape = shape();
         let mut source = coins();
         let mut mask = fold_mask_make(&shape, &mut source).unwrap();
@@ -920,27 +1072,76 @@ mod tests {
                 fresh: Some(9),
             }],
         };
+        let plan = tree_plan(&shape);
+        let salts = tree_salts(&plan);
         let notice = fold_mask_notice(&shape).unwrap();
         let oracle = MaskOracle::from_notice(9, 1, &notice);
         // The mask must have been sent under the id the verifier checks.
-        assert!(fold_start(&shape, &mask, &source, &oracle, &groups).is_err());
+        assert!(fold_start_prove(
+            &shape, &mask, &source, &oracle, &groups, plan, &salts
+        )
+        .is_err());
         mask.sent_as(9).unwrap();
-        let start = fold_start(&shape, &mask, &source, &oracle, &groups).unwrap();
-        assert_eq!(start.sum, fold_mask_sum(shape.k, mask.coefficients()).unwrap());
+        let start = fold_start_prove(
+            &shape, &mask, &source, &oracle, &groups, plan, &salts,
+        )
+        .unwrap();
+        assert_ne!(start.message.root, Digest::ZERO);
+        assert_eq!(
+            start.message.sum,
+            fold_mask_sum(shape.k, mask.coefficients()).unwrap()
+        );
         assert_eq!(start.draft.table.rows, 2);
         assert_eq!(start.draft.tail.draws, mask.tail().unwrap().draws);
-        // A different claimed group or a tampered coefficient fails.
-        let mut bad = oracle;
+        // The verifier accepts the public message with no prover secret.
+        let mut spend = MaskSpend::default();
+        fold_start_verify(&shape, &start.message, &groups, &plan, &mut spend).unwrap();
+        assert!(fold_start_verify(&shape, &start.message, &groups, &plan, &mut spend).is_err());
+        // The committed root opens the mask tree at the drawn positions.
+        let positions = [1u64, 4];
+        let openings = start.tree.open(&positions).unwrap();
+        verify_mask_columns(&plan, &start.message.root, &positions, &openings).unwrap();
+        let mut tampered = openings.clone();
+        tampered[0].symbols[0] = tampered[0].symbols[0] + Fp::ONE;
+        assert!(
+            verify_mask_columns(&plan, &start.message.root, &positions, &tampered).is_err()
+        );
+        // A different claimed group, a changed notice or a different tree
+        // layout is rejected before the spend.
+        let mut bad = start.message.clone();
         bad.claimed_group = 7;
-        assert!(fold_start(&shape, &mask, &source, &bad, &groups).is_err());
-        let mut tampered = FoldMask {
+        assert!(fold_start_verify(&shape, &bad, &groups, &plan, &mut MaskSpend::default()).is_err());
+        let mut bad = start.message.clone();
+        bad.notice.mask_rows = 4;
+        assert!(fold_start_verify(&shape, &bad, &groups, &plan, &mut MaskSpend::default()).is_err());
+        let mut bad_plan = plan;
+        bad_plan.mask_rows = 4;
+        assert!(fold_start_verify(
+            &shape,
+            &start.message,
+            &groups,
+            &bad_plan,
+            &mut MaskSpend::default()
+        )
+        .is_err());
+        // A tampered prover coefficient fails the self-check.
+        let mut tampered_mask = FoldMask {
             coefficients: mask.coefficients().to_vec(),
             draws: mask.draws().to_vec(),
             tail: mask.tail().cloned(),
             id: Some(9),
         };
-        tampered.coefficients[0] = tampered.coefficients[0].add(&Fp3::ONE);
-        assert!(fold_start(&shape, &tampered, &source, &oracle, &groups).is_err());
+        tampered_mask.coefficients[0] = tampered_mask.coefficients[0].add(&Fp3::ONE);
+        assert!(fold_start_prove(
+            &shape,
+            &tampered_mask,
+            &source,
+            &oracle,
+            &groups,
+            plan,
+            &salts
+        )
+        .is_err());
     }
 
     #[test]
