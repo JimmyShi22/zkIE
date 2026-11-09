@@ -671,8 +671,11 @@ pub struct RuntimeTreeOpening {
 /// The position at which a short codeword is read for the leaf of long
 /// position `x`: `x mod 2^log_n_zk`.
 pub fn short_position(log_n: u32, log_short: u32, x: u64) -> Result<u64> {
-    if log_short > log_n || log_n >= 64 || log_short >= 64 {
+    if log_n < 1 || log_short > log_n || log_n >= 64 || log_short >= 64 {
         return Err(Error::InvalidConfig);
+    }
+    if x >> log_n != 0 {
+        return Err(Error::InvalidIndex);
     }
     Ok(x & ((1u64 << log_short) - 1))
 }
@@ -1672,6 +1675,23 @@ mod tests {
         assert_eq!(short_position(4, 2, 9).unwrap(), 1);
         assert_eq!(short_position(2, 1, 0).unwrap(), 0);
         assert_eq!(short_position(2, 1, 2).unwrap(), 0);
+    }
+
+    #[test]
+    fn short_position_checks_the_source_domain() {
+        assert_eq!(short_position(2, 1, 3).unwrap(), 1);
+        assert!(short_position(2, 1, 4).is_err());
+        assert!(short_position(2, 1, u64::MAX).is_err());
+        assert_eq!(short_position(60, 1, (1u64 << 60) - 1).unwrap(), 1);
+        assert!(short_position(60, 1, 1u64 << 60).is_err());
+        assert_eq!(short_position(60, 60, 12_345).unwrap(), 12_345);
+        assert!(short_position(60, 60, 1u64 << 60).is_err());
+        assert_eq!(short_position(2, 0, 3).unwrap(), 0);
+        assert!(short_position(2, 0, 4).is_err());
+        assert!(short_position(0, 0, 0).is_err());
+        assert!(short_position(1, 2, 0).is_err());
+        assert!(short_position(64, 1, 0).is_err());
+        assert!(short_position(1, 64, 0).is_err());
     }
 
     #[test]
