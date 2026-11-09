@@ -243,7 +243,7 @@ pub fn record_row(
     let mut main = empty_main(shape)?;
     let mut mask = empty_mask(shape)?;
     for entry in 0..shape.index.code.ell {
-        add_entry(shape, &mut main, entry, eq_index(entry, &seed.z, bits)?, false)?;
+        add_entry(shape, &mut main, entry, eq_index(entry, &seed.z, bits)?, true)?;
     }
     for pad_answer in 0..shape.index.answers {
         for coefficient in 0..E_DEGREE {
@@ -354,6 +354,12 @@ pub fn column_row(
     if position >= shape.index.code.n() || column.len() != rows || eq_gamma.len() != rows {
         return Err(Error::ShapeMismatch);
     }
+    if column
+        .iter()
+        .any(|value| value.c[1] != Fp::ZERO || value.c[2] != Fp::ZERO)
+    {
+        return Err(Error::ShapeMismatch);
+    }
     let message = generator_message(&shape.index.code, position)?;
     let tail = generator_tail(&shape.index.code, position)?;
     let first = tail_first(&shape.index.code)?;
@@ -365,7 +371,7 @@ pub fn column_row(
             &mut main,
             entry as u64,
             Fp3::from_base(*coefficient),
-            false,
+            true,
         )?;
     }
     for (entry, coefficient) in tail.iter().enumerate() {
@@ -374,7 +380,7 @@ pub fn column_row(
             &mut main,
             first + entry as u64,
             Fp3::from_base(*coefficient),
-            false,
+            true,
         )?;
     }
     mask.iter_mut().for_each(|coefficient| *coefficient = Fp3::ZERO);
@@ -413,7 +419,9 @@ pub fn unique_positions(trusted: &[u64]) -> Vec<u64> {
 }
 
 /// Build one row per logical draw in the trusted order. `authenticated` is
-/// the one column per unique position, as a sorted strictly increasing list;
+/// the one column per unique position, as a sorted strictly increasing list
+/// (the name records the caller's claim only; the real column authentication is
+/// not connected);
 /// every logical draw, repeats included, reuses the column of its position.
 /// A repeated position with two different columns is rejected before any
 /// target comparison, so a zero equation weight cannot hide the difference.
@@ -427,9 +435,12 @@ pub fn column_rows_from_draws(
     if trusted_draws.is_empty() || authenticated.is_empty() {
         return Err(Error::StatementMismatch);
     }
-    if authenticated
-        .windows(2)
-        .any(|pair| pair[0].0 >= pair[1].0)
+    let expected_positions = unique_positions(trusted_draws);
+    if authenticated.len() != expected_positions.len()
+        || authenticated
+            .iter()
+            .map(|(position, _)| *position)
+            .ne(expected_positions.iter().copied())
     {
         return Err(Error::StatementMismatch);
     }
@@ -924,6 +935,12 @@ mod tests {
         let mut changed = witness.clone();
         changed.main[tail_offset] = changed.main[tail_offset].add(&Fp3::ONE);
         assert_ne!(row.evaluate(&changed).unwrap(), manual);
+        let mut high = column.clone();
+        high[0].c[1] = Fp::ONE;
+        assert!(column_row(&shape, &registry, position, &high, &eq_gamma).is_err());
+        let mut high = column.clone();
+        high[0].c[2] = Fp::ONE;
+        assert!(column_row(&shape, &registry, position, &high, &eq_gamma).is_err());
         assert!(column_row(&shape, &registry, code.n(), &column, &eq_gamma).is_err());
         assert!(column_row(&shape, &registry, position, &column[..3], &eq_gamma).is_err());
         assert!(column_row(&shape, &registry, position, &column, &eq_gamma[..3]).is_err());
@@ -980,6 +997,41 @@ mod tests {
             &registry,
             &trusted,
             &missing,
+            &eq_gamma
+        )
+        .is_err());
+        let extra = vec![
+            (1u64, column.clone()),
+            (2u64, column.clone()),
+            (3u64, column.clone()),
+        ];
+        assert!(column_rows_from_draws(
+            &shape,
+            &registry,
+            &trusted,
+            &extra,
+            &eq_gamma
+        )
+        .is_err());
+        let unsorted = vec![(3u64, column.clone()), (1u64, column.clone())];
+        assert!(column_rows_from_draws(
+            &shape,
+            &registry,
+            &trusted,
+            &unsorted,
+            &eq_gamma
+        )
+        .is_err());
+        let repeated_same = vec![
+            (1u64, column.clone()),
+            (1u64, column.clone()),
+            (3u64, column.clone()),
+        ];
+        assert!(column_rows_from_draws(
+            &shape,
+            &registry,
+            &trusted,
+            &repeated_same,
             &eq_gamma
         )
         .is_err());
@@ -1498,6 +1550,15 @@ mod tests {
             let registry = registry(&shape);
             let cube = sample_cube(&shape).unwrap();
             let bits = cube.bits;
+            let manual_offset = |rows: u64, row_bits: u32, len: u64, value: u64| {
+                let row = value & ((1u64 << row_bits) - 1);
+                let place = value >> row_bits;
+                if row >= rows || place >= len {
+                    None
+                } else {
+                    Some((row * len + place) as usize)
+                }
+            };
             let seeds: Vec<SampleSeed> = (0..2)
                 .map(|answer| SampleSeed {
                     z: (0..bits)
@@ -1522,14 +1583,12 @@ mod tests {
             };
             let mut expected_main = vec![Fp3::ZERO; witness.main.len()];
             for virtual_index in 0..(1u64 << cube.main_bits) {
-                if let Some(offset) = physical_offset(
+                if let Some(offset) = manual_offset(
                     shape.u.main_rows,
                     cube.main_row_bits,
                     shape.u.code.ell,
                     virtual_index,
-                )
-                .unwrap()
-                {
+                ) {
                     expected_main[offset] = main_front.mul(&eq_manual(
                         virtual_index,
                         &seeds[answer as usize].z,
@@ -1541,14 +1600,12 @@ mod tests {
             if mask_rows > 0 {
                 let code = shape.u.mask_code.unwrap();
                 for virtual_index in 0..(1u64 << cube.mask_bits) {
-                    if let Some(offset) = physical_offset(
+                    if let Some(offset) = manual_offset(
                         shape.u.mask_rows,
                         cube.mask_row_bits,
                         code.ell,
                         virtual_index,
-                    )
-                    .unwrap()
-                    {
+                    ) {
                         expected_mask[offset] = mask_front.mul(&eq_manual(
                             virtual_index,
                             &seeds[answer as usize].z,
@@ -1562,13 +1619,12 @@ mod tests {
                 let place = len - shape.u.answers as u64 + pad_answer as u64;
                 let main_virtual = (shape.u.main_rows - 1) + (place << cube.main_row_bits);
                 if mask_rows == 0 {
-                    let offset = physical_offset(
+                    let offset = manual_offset(
                         shape.u.main_rows,
                         cube.main_row_bits,
                         len,
                         main_virtual,
                     )
-                    .unwrap()
                     .unwrap();
                     expected_main[offset] = if pad_answer == answer {
                         seeds[answer as usize].beta.mul(&theta(0))
@@ -1579,13 +1635,12 @@ mod tests {
                     let code = shape.u.mask_code.unwrap();
                     let mask_virtual =
                         (shape.u.mask_rows - 1) + (place << cube.mask_row_bits);
-                    let offset = physical_offset(
+                    let offset = manual_offset(
                         shape.u.mask_rows,
                         cube.mask_row_bits,
                         code.ell,
                         mask_virtual,
                     )
-                    .unwrap()
                     .unwrap();
                     expected_mask[offset] = if pad_answer == answer {
                         seeds[answer as usize].beta.mul(&theta(0))
@@ -1605,6 +1660,166 @@ mod tests {
             assert_eq!(row.main, expected_main);
             assert_eq!(row.mask, expected_mask);
             assert_eq!(row.evaluate(&witness).unwrap(), target);
+            let non_pad = (0..expected_main.len())
+                .find(|index| expected_main[*index] != Fp3::ZERO)
+                .unwrap();
+            let mut changed = witness.clone();
+            changed.main[non_pad] = changed.main[non_pad].add(&Fp3::ONE);
+            assert_ne!(row.evaluate(&changed).unwrap(), target);
+            let place = len - shape.u.answers as u64 + answer as u64;
+            if mask_rows == 0 {
+                let pad_virtual = (shape.u.main_rows - 1) + (place << cube.main_row_bits);
+                let pad_offset = manual_offset(
+                    shape.u.main_rows,
+                    cube.main_row_bits,
+                    len,
+                    pad_virtual,
+                )
+                .unwrap();
+                let mut changed = witness.clone();
+                changed.main[pad_offset] = changed.main[pad_offset].add(&Fp3::ONE);
+                assert_ne!(row.evaluate(&changed).unwrap(), target);
+            } else {
+                let code = shape.u.mask_code.unwrap();
+                let pad_virtual = (shape.u.mask_rows - 1) + (place << cube.mask_row_bits);
+                let pad_offset = manual_offset(
+                    shape.u.mask_rows,
+                    cube.mask_row_bits,
+                    code.ell,
+                    pad_virtual,
+                )
+                .unwrap();
+                let mut changed = witness.clone();
+                changed.mask[pad_offset] = changed.mask[pad_offset].add(&Fp3::ONE);
+                assert_ne!(row.evaluate(&changed).unwrap(), target);
+            }
         }
+    }
+
+    fn tail_layout_shape(index_r: u64, mask_rows: u64) -> GuShape {
+        let index = IndexShape {
+            code: build_code_plan(4, 8, index_r).unwrap(),
+            v: 2,
+            answers: 1,
+            salt_bytes: LEAF_SALT_MIN_BYTES,
+            distances: TableDistances {
+                radius: 0,
+                later_radius: 0,
+                m_once: 0,
+                m_later: 0,
+            },
+        };
+        let mask_code = if mask_rows > 0 {
+            Some(build_code_plan(4, 10, 1).unwrap())
+        } else {
+            None
+        };
+        GuShape {
+            oracle: 9,
+            group: 1,
+            tree: RuntimeTreePlan {
+                tree_number: 5,
+                leaf_class: 2,
+                log_n: 4,
+                log_n_zk: if mask_rows > 0 { 4 } else { 0 },
+                parts: vec![RuntimeTreePart {
+                    main_symbols: 9,
+                    mask_symbols: mask_rows * 3,
+                }],
+                salt_bytes: LEAF_SALT_MIN_BYTES,
+                run: Digest([9; 32]),
+                configuration: Digest([7; 32]),
+            },
+            part: 0,
+            rows_high: true,
+            u: GuOracleShape {
+                code: build_code_plan(4, 10, 1).unwrap(),
+                main_rows: 3,
+                main_deg: 3,
+                mask_rows,
+                mask_code,
+                answers: 1,
+            },
+            index,
+        }
+    }
+
+    #[test]
+    fn column_row_rejects_a_real_tail_without_a_physical_slot() {
+        let shape = tail_layout_shape(4, 1);
+        assert!(shape.fault().is_none());
+        let registry = registry(&shape);
+        let column = vec![
+            Fp3::from_u64(1),
+            Fp3::from_u64(2),
+            Fp3::from_u64(3),
+            Fp3::from_u64(4),
+        ];
+        let eq_gamma = vec![Fp3::ONE; 4];
+        // index ell 8, r 4: the tail entries 8..12 are real; entries 10 and 11
+        // map to place 10/11, beyond the G_u row length 10, and must fail
+        // closed rather than be silently dropped.
+        assert!(column_row(&shape, &registry, 0, &column, &eq_gamma).is_err());
+    }
+
+    #[test]
+    fn column_row_places_a_non_power_width_tail_that_fits() {
+        let shape = tail_layout_shape(2, 0);
+        assert!(shape.fault().is_none());
+        let registry = registry(&shape);
+        let column = vec![
+            Fp3::from_u64(1),
+            Fp3::from_u64(2),
+            Fp3::from_u64(3),
+            Fp3::from_u64(4),
+        ];
+        let eq_gamma = vec![Fp3::from_u64(2), Fp3::from_u64(3), Fp3::from_u64(5), Fp3::from_u64(7)];
+        let row = column_row(&shape, &registry, 0, &column, &eq_gamma).unwrap();
+        let manual_offset = |rows: u64, row_bits: u32, len: u64, value: u64| {
+            let row = value & ((1u64 << row_bits) - 1);
+            let place = value >> row_bits;
+            if row >= rows || place >= len {
+                None
+            } else {
+                Some((row * len + place) as usize)
+            }
+        };
+        let code = &shape.index.code;
+        let mut expected = vec![Fp3::ZERO; (shape.u.main_rows * shape.u.code.ell) as usize];
+        for entry in 0..code.ell {
+            let mut message = vec![Fp::ZERO; code.ell as usize];
+            message[entry as usize] = Fp::ONE;
+            let tail = vec![Fp::ZERO; code.r as usize];
+            let v = (entry >> shape.u.code.log_ell())
+                | ((entry & ((1u64 << shape.u.code.log_ell()) - 1)) << 2);
+            expected[manual_offset(
+                shape.u.main_rows,
+                2,
+                shape.u.code.ell,
+                v,
+            )
+            .unwrap()] = Fp3::from_base(encode_symbol(code, &message, &tail, 0));
+        }
+        let first = tail_first(code).unwrap();
+        for entry in 0..code.r {
+            let message = vec![Fp::ZERO; code.ell as usize];
+            let mut tail = vec![Fp::ZERO; code.r as usize];
+            tail[entry as usize] = Fp::ONE;
+            let v = ((first + entry) >> shape.u.code.log_ell())
+                | (((first + entry) & ((1u64 << shape.u.code.log_ell()) - 1)) << 2);
+            expected[manual_offset(
+                shape.u.main_rows,
+                2,
+                shape.u.code.ell,
+                v,
+            )
+            .unwrap()] = Fp3::from_base(encode_symbol(code, &message, &tail, 0));
+        }
+        assert_eq!(row.main, expected);
+        let mut target = Fp3::ZERO;
+        for (weight, value) in eq_gamma.iter().zip(&column) {
+            target = target.add(&weight.mul(value));
+        }
+        assert_eq!(row.target, target);
     }
 }
