@@ -382,6 +382,202 @@ pub fn column_rows_from_draws(
     Ok(rows)
 }
 
+/// The sample cube of one G_u oracle shape: the main and mask table bit
+/// counts and the coordinates of a shared seed that the form reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SampleCube {
+    pub has_main: bool,
+    pub has_mask: bool,
+    pub main_row_bits: u32,
+    pub main_bits: u32,
+    pub mask_row_bits: u32,
+    pub mask_bits: u32,
+    pub bits: u32,
+}
+
+pub fn sample_cube(shape: &GuShape) -> Result<SampleCube> {
+    let u = &shape.u;
+    let main_bits = ceil_log2(u.main_rows)
+        .checked_add(u.code.log_ell())
+        .ok_or(Error::ResourceLimit)?;
+    let mask_bits = match u.mask_code {
+        Some(code) => ceil_log2(u.mask_rows)
+            .checked_add(code.log_ell())
+            .ok_or(Error::ResourceLimit)?,
+        None => 0,
+    };
+    let both = u.main_rows > 0 && u.mask_code.is_some();
+    Ok(SampleCube {
+        has_main: u.main_rows > 0,
+        has_mask: u.mask_code.is_some(),
+        main_row_bits: ceil_log2(u.main_rows),
+        main_bits,
+        mask_row_bits: ceil_log2(u.mask_rows),
+        mask_bits,
+        bits: if both {
+            main_bits
+                .max(mask_bits)
+                .checked_add(1)
+                .ok_or(Error::ResourceLimit)?
+        } else {
+            main_bits
+                .checked_add(mask_bits)
+                .ok_or(Error::ResourceLimit)?
+        },
+    })
+}
+
+fn sample_front(seed: &SampleSeed, cube: &SampleCube, table_bits: u32, mask: bool) -> Result<Fp3> {
+    if !(cube.has_main && cube.has_mask) {
+        return Ok(Fp3::ONE);
+    }
+    if seed.z.len() < cube.bits as usize {
+        return Err(Error::ShapeMismatch);
+    }
+    let top = seed.z[cube.bits as usize - 1];
+    let mut factor = if mask {
+        top
+    } else {
+        Fp3::ONE.sub(&top)
+    };
+    for coordinate in seed.z.iter().take(cube.bits as usize - 1).skip(table_bits as usize) {
+        factor = factor.mul(&Fp3::ONE.sub(coordinate));
+    }
+    Ok(factor)
+}
+
+fn sample_pad(
+    coefficients: &mut [Fp3],
+    seed: &SampleSeed,
+    answers: u32,
+    target: u32,
+    rows: u64,
+    row_bits: u32,
+    len: u64,
+    bits: u32,
+    front: Fp3,
+) -> Result<()> {
+    let each = 1u64;
+    if len < each * answers as u64 {
+        return Err(Error::ShapeMismatch);
+    }
+    for pad_answer in 0..answers {
+        let place = len - each * (answers as u64) + each * pad_answer as u64;
+        let index = (rows - 1)
+            .checked_add(place.checked_shl(row_bits).ok_or(Error::ResourceLimit)?)
+            .ok_or(Error::ResourceLimit)?;
+        let under = front.mul(&eq_index(index, &seed.z, bits)?);
+        let mut value = Fp3::ZERO.sub(&under);
+        if pad_answer == target {
+            value = value.add(&seed.beta.mul(&theta(0)));
+        }
+        let slot = usize::try_from(index).map_err(|_| Error::ResourceLimit)?;
+        if slot >= coefficients.len() {
+            return Err(Error::ShapeMismatch);
+        }
+        coefficients[slot] = coefficients[slot].add(&value);
+    }
+    Ok(())
+}
+
+/// Build the SEND sample relation row for one oracle and one answer from the
+/// shared seed set. The seed set is shared by answer number across the
+/// sampled oracles of one SEND message; this function uses `seeds[answer]` and
+/// the oracle's own cube prefix. The target is the answer value received from
+/// SEND; the real root/seed/answer transcript is not connected.
+pub fn sample_row(
+    shape: &GuShape,
+    registry: &GuRegistry,
+    seeds: &[SampleSeed],
+    answer: u32,
+    target: Fp3,
+) -> Result<GuRelationRow> {
+    check_binding(shape, registry)?;
+    if answer >= shape.u.answers || seeds.len() < shape.u.answers as usize {
+        return Err(Error::ShapeMismatch);
+    }
+    let cube = sample_cube(shape)?;
+    let seed = &seeds[answer as usize];
+    if seed.z.len() < cube.bits as usize || seed.beta == Fp3::ZERO {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut main = empty_main(shape)?;
+    let mut mask = empty_mask(shape)?;
+    if cube.has_main {
+        let front = sample_front(seed, &cube, cube.main_bits, false)?;
+        for index in 0..main.len() {
+            main[index] = front.mul(&eq_index(index as u64, &seed.z, cube.main_bits)?);
+        }
+        if !cube.has_mask {
+            sample_pad(
+                &mut main,
+                seed,
+                shape.u.answers,
+                answer,
+                shape.u.main_rows,
+                cube.main_row_bits,
+                shape.u.code.ell,
+                cube.main_bits,
+                front,
+            )?;
+        }
+    }
+    if cube.has_mask {
+        let code = shape.u.mask_code.ok_or(Error::ShapeMismatch)?;
+        let front = sample_front(seed, &cube, cube.mask_bits, true)?;
+        for index in 0..mask.len() {
+            mask[index] = front.mul(&eq_index(index as u64, &seed.z, cube.mask_bits)?);
+        }
+        sample_pad(
+            &mut mask,
+            seed,
+            shape.u.answers,
+            answer,
+            shape.u.mask_rows,
+            cube.mask_row_bits,
+            code.ell,
+            cube.mask_bits,
+            front,
+        )?;
+    }
+    Ok(GuRelationRow {
+        oracle: shape.oracle,
+        group: shape.group,
+        kind: GuRelationKind::Sample,
+        main,
+        mask,
+        target,
+    })
+}
+
+/// One shared seed set for the sampled oracles of one SEND message: the
+/// number of seeds is the largest answer count, each seed has the largest
+/// cube's coordinates, and each oracle reads the prefix its own cube needs.
+pub fn validate_shared_sample_seeds(shapes: &[&GuShape], seeds: &[SampleSeed]) -> Result<u32> {
+    if shapes.is_empty() {
+        return Err(Error::InvalidConfig);
+    }
+    let mut bits = 0u32;
+    let mut answers = 0u32;
+    for shape in shapes {
+        if shape.fault().is_some() {
+            return Err(Error::InvalidConfig);
+        }
+        let cube = sample_cube(shape)?;
+        bits = bits.max(cube.bits);
+        answers = answers.max(shape.u.answers);
+    }
+    if seeds.len() != answers as usize {
+        return Err(Error::ShapeMismatch);
+    }
+    for seed in seeds {
+        if seed.z.len() < bits as usize || seed.beta == Fp3::ZERO {
+            return Err(Error::ShapeMismatch);
+        }
+    }
+    Ok(bits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,5 +857,227 @@ mod tests {
         assert_eq!(unique_positions(&trusted), vec![1, 3]);
         assert!(validate_draw_sequence(&trusted, &[1, 1, 3]).is_ok());
         assert!(validate_draw_sequence(&trusted, &[1, 3, 3]).is_err());
+    }
+
+    fn sample_shape(main_rows: u64, mask_rows: u64, answers: u32) -> GuShape {
+        let main_code = build_code_plan(2, 4, 0).unwrap();
+        let mask_code = if mask_rows > 0 {
+            Some(build_code_plan(2, 4, 0).unwrap())
+        } else {
+            None
+        };
+        GuShape {
+            oracle: 9,
+            group: 1,
+            tree: RuntimeTreePlan {
+                tree_number: 5,
+                leaf_class: 2,
+                log_n: 2,
+                log_n_zk: if mask_rows > 0 { 2 } else { 0 },
+                parts: vec![RuntimeTreePart {
+                    main_symbols: main_rows * 3,
+                    mask_symbols: mask_rows * 3,
+                }],
+                salt_bytes: LEAF_SALT_MIN_BYTES,
+                run: Digest([9; 32]),
+                configuration: Digest([7; 32]),
+            },
+            part: 0,
+            rows_high: false,
+            u: GuOracleShape {
+                code: main_code,
+                main_rows,
+                main_deg: 3,
+                mask_rows,
+                mask_code,
+                answers,
+            },
+            index: index_shape(),
+        }
+    }
+
+    fn sample_shape_wide() -> GuShape {
+        GuShape {
+            oracle: 9,
+            group: 1,
+            tree: RuntimeTreePlan {
+                tree_number: 5,
+                leaf_class: 2,
+                log_n: 3,
+                log_n_zk: 0,
+                parts: vec![RuntimeTreePart {
+                    main_symbols: 6,
+                    mask_symbols: 0,
+                }],
+                salt_bytes: LEAF_SALT_MIN_BYTES,
+                run: Digest([9; 32]),
+                configuration: Digest([7; 32]),
+            },
+            part: 0,
+            rows_high: false,
+            u: GuOracleShape {
+                code: build_code_plan(3, 8, 0).unwrap(),
+                main_rows: 2,
+                main_deg: 3,
+                mask_rows: 0,
+                mask_code: None,
+                answers: 2,
+            },
+            index: index_shape(),
+        }
+    }
+
+    fn sample_witness(shape: &GuShape) -> GuWitness {
+        let main_len = (shape.u.main_rows * shape.u.code.ell) as usize;
+        let mask_len = shape
+            .u
+            .mask_code
+            .map(|code| (shape.u.mask_rows * code.ell) as usize)
+            .unwrap_or(0);
+        GuWitness {
+            main: (0..main_len)
+                .map(|index| Fp3::from_u64(400 + index as u64))
+                .collect(),
+            mask: (0..mask_len)
+                .map(|index| Fp3::from_u64(500 + index as u64))
+                .collect(),
+        }
+    }
+
+    fn shared_seed(bits: u32, answer: u64) -> SampleSeed {
+        SampleSeed {
+            z: (0..bits)
+                .map(|coordinate| Fp3::from_u64(10 + answer * 10 + coordinate as u64))
+                .collect(),
+            beta: Fp3::from_u64(90 + answer),
+        }
+    }
+
+    #[test]
+    fn sample_rows_share_one_seed_set_by_answer() {
+        let first = sample_shape(2, 0, 1);
+        let second = sample_shape_wide();
+        let first_registry = registry(&first);
+        let second_registry = registry(&second);
+        let seeds = vec![shared_seed(4, 0), shared_seed(4, 1)];
+        let bits =
+            validate_shared_sample_seeds(&[&first, &second], &seeds).unwrap();
+        assert_eq!(bits, 4);
+        assert!(validate_shared_sample_seeds(&[&first, &second], &seeds[..1]).is_err());
+        let mut short = seeds.clone();
+        short[0].z.pop();
+        assert!(validate_shared_sample_seeds(&[&first, &second], &short).is_err());
+
+        let first_witness = sample_witness(&first);
+        let mut expected = vec![Fp3::ZERO; first_witness.main.len()];
+        let cube = sample_cube(&first).unwrap();
+        for index in 0..expected.len() {
+            expected[index] = Fp3::ONE
+                .mul(&eq_manual(index as u64, &seeds[0].z, cube.main_bits));
+        }
+        let rows = first.u.main_rows;
+        for pad_answer in 0..first.u.answers {
+            let place = first.u.code.ell - first.u.answers as u64 + pad_answer as u64;
+            let index = (rows - 1) + (place << cube.main_row_bits);
+            expected[index as usize] = if pad_answer == 0 {
+                seeds[0].beta.mul(&theta(0))
+            } else {
+                Fp3::ZERO
+            };
+        }
+        let mut target = Fp3::ZERO;
+        for (coefficient, entry) in expected.iter().zip(&first_witness.main) {
+            target = target.add(&coefficient.mul(entry));
+        }
+        let first_row =
+            sample_row(&first, &first_registry, &seeds, 0, target).unwrap();
+        assert_eq!(first_row.main, expected);
+        assert_eq!(first_row.evaluate(&first_witness).unwrap(), target);
+
+        // The second oracle uses the same seed of answer 0 (prefix of its own
+        // cube) and the second seed of answer 1.
+        let second_witness = sample_witness(&second);
+        for answer in 0..second.u.answers {
+            let cube = sample_cube(&second).unwrap();
+            let mut expected = vec![Fp3::ZERO; second_witness.main.len()];
+            for index in 0..expected.len() {
+                expected[index] = eq_manual(
+                    index as u64,
+                    &seeds[answer as usize].z,
+                    cube.main_bits,
+                );
+            }
+            let rows = second.u.main_rows;
+            for pad_answer in 0..second.u.answers {
+                let place = second.u.code.ell - second.u.answers as u64 + pad_answer as u64;
+                let index = (rows - 1) + (place << cube.main_row_bits);
+                expected[index as usize] = if pad_answer == answer {
+                    seeds[answer as usize].beta.mul(&theta(0))
+                } else {
+                    Fp3::ZERO
+                };
+            }
+            let mut target = Fp3::ZERO;
+            for (coefficient, entry) in expected.iter().zip(&second_witness.main) {
+                target = target.add(&coefficient.mul(entry));
+            }
+            let row =
+                sample_row(&second, &second_registry, &seeds, answer, target).unwrap();
+            assert_eq!(row.main, expected);
+            assert_eq!(row.evaluate(&second_witness).unwrap(), target);
+        }
+        // A fixed witness does not satisfy a target changed by a perturbed seed.
+        let changed = sample_row(
+            &first,
+            &first_registry,
+            &[shared_seed(4, 7), seeds[1].clone()],
+            0,
+            target,
+        )
+        .unwrap();
+        assert_ne!(changed.evaluate(&first_witness).unwrap(), target);
+    }
+
+    #[test]
+    fn sample_row_uses_both_main_and_mask_fronts() {
+        let shape = sample_shape(2, 1, 1);
+        let registry = registry(&shape);
+        let seeds = vec![shared_seed(4, 0)];
+        let seed = &seeds[0];
+        let cube = sample_cube(&shape).unwrap();
+        assert!(cube.has_main && cube.has_mask);
+        assert_eq!(cube.bits, 4);
+        let witness = sample_witness(&shape);
+        let top = seed.z[3];
+        let main_front = Fp3::ONE.sub(&top);
+        let mask_front = top.mul(&Fp3::ONE.sub(&seed.z[2]));
+        let mut expected_main = vec![Fp3::ZERO; witness.main.len()];
+        for index in 0..expected_main.len() {
+            expected_main[index] =
+                main_front.mul(&eq_manual(index as u64, &seed.z, cube.main_bits));
+        }
+        let mask_code = shape.u.mask_code.unwrap();
+        let mut expected_mask = vec![Fp3::ZERO; witness.mask.len()];
+        for index in 0..expected_mask.len() {
+            expected_mask[index] =
+                mask_front.mul(&eq_manual(index as u64, &seed.z, cube.mask_bits));
+        }
+        let place = mask_code.ell - shape.u.answers as u64;
+        let pad = (shape.u.mask_rows - 1) + (place << cube.mask_row_bits);
+        expected_mask[pad as usize] = seed.beta.mul(&theta(0));
+        let mut target = Fp3::ZERO;
+        for (coefficient, entry) in expected_main.iter().zip(&witness.main) {
+            target = target.add(&coefficient.mul(entry));
+        }
+        for (coefficient, entry) in expected_mask.iter().zip(&witness.mask) {
+            target = target.add(&coefficient.mul(entry));
+        }
+        let row = sample_row(&shape, &registry, &seeds, 0, target).unwrap();
+        assert_eq!(row.main, expected_main);
+        assert_eq!(row.mask, expected_mask);
+        assert_eq!(row.evaluate(&witness).unwrap(), target);
+        let mut changed = witness.clone();
+        changed.mask[pad as usize] = changed.mask[pad as usize].add(&Fp3::ONE);
+        assert_ne!(row.evaluate(&changed).unwrap(), target);
     }
 }
