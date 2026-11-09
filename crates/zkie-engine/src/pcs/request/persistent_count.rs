@@ -13,32 +13,52 @@
 //! which live tables are in the set. This module does not select a new leaf,
 //! shorten a batch, retry a failed sync, or silently downgrade hiding. The lock
 //! is the platform file lock; if that lock cannot be taken the call fails with
-//! an I/O error, and there is no thread-mutex fallback.
+//! an I/O error, and there is no thread-mutex fallback. The caller's paths must
+//! all be under one trusted directory/lock authority: two root paths that point
+//! at one count file under different lock files are not made mutually
+//! exclusive here, and arbitrary-directory safety is not claimed.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::os::unix::io::IntoRawFd;
 
 use zkie_core::error::{Error, Result};
 
 /// The fixed plan for one batch of count files. `columns` is the logical
 /// number of columns the plan reserves for every batch; `max_columns` is the
-/// table-life limit.
+/// table-life limit. The fields are private so a forged plan cannot be built
+/// by struct literal; every receiving entry rechecks the values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CountPlan {
-    pub columns: u64,
-    pub max_columns: u64,
+    columns: u64,
+    max_columns: u64,
 }
 
 impl CountPlan {
     pub fn new(columns: u64, max_columns: u64) -> Result<Self> {
-        if columns == 0 || max_columns < columns {
-            return Err(Error::InvalidConfig);
-        }
-        Ok(Self {
+        let plan = Self {
             columns,
             max_columns,
-        })
+        };
+        plan.check()?;
+        Ok(plan)
+    }
+
+    pub fn columns(&self) -> u64 {
+        self.columns
+    }
+
+    pub fn max_columns(&self) -> u64 {
+        self.max_columns
+    }
+
+    fn check(&self) -> Result<()> {
+        if self.columns == 0 || self.max_columns == 0 || self.max_columns < self.columns {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(())
     }
 }
 
@@ -65,10 +85,15 @@ pub struct CountSet {
     sync_failure: bool,
     #[cfg(test)]
     unlock_failure: bool,
+    #[cfg(test)]
+    append_failure: bool,
+    #[cfg(test)]
+    close_failure: bool,
 }
 
 impl CountSet {
     pub fn new(root: impl Into<PathBuf>, counts: Vec<PathBuf>, plan: CountPlan) -> Result<Self> {
+        plan.check()?;
         let root = root.into();
         if counts.is_empty() || !root.is_dir() {
             return Err(Error::InvalidConfig);
@@ -97,6 +122,10 @@ impl CountSet {
             sync_failure: false,
             #[cfg(test)]
             unlock_failure: false,
+            #[cfg(test)]
+            append_failure: false,
+            #[cfg(test)]
+            close_failure: false,
         })
     }
 
@@ -124,8 +153,13 @@ impl CountSet {
     }
 
     fn verify_startup_locked(&self) -> Result<()> {
+        self.plan.check()?;
+        if self.append_failure_for_test() {
+            return Err(Error::Io);
+        }
         for path in &self.counts {
             let count = read_count(path)?;
+            check_appendable(path)?;
             let next = count
                 .checked_add(self.plan.columns)
                 .ok_or(Error::ResourceLimit)?;
@@ -156,6 +190,7 @@ impl CountSet {
     }
 
     fn begin_batch_locked(&self, leaf: usize) -> Result<CountReceipt> {
+        self.plan.check()?;
         self.verify_startup_locked()?;
         #[cfg(test)]
         if let Some(milliseconds) = std::env::var("ZKIE_COUNT_CHILD_HOLD_MS")
@@ -188,6 +223,10 @@ impl CountSet {
             return Err(Error::Io);
         }
         file.sync_all().map_err(|_| Error::Io)?;
+        close_count_file(file)?;
+        if self.close_failure_for_test() {
+            return Err(Error::Io);
+        }
         Ok(CountReceipt {
             leaf,
             added: self.plan.columns,
@@ -216,6 +255,16 @@ impl CountSet {
     #[cfg(test)]
     pub fn force_unlock_failure(&mut self) {
         self.unlock_failure = true;
+    }
+
+    #[cfg(test)]
+    pub fn force_append_failure(&mut self) {
+        self.append_failure = true;
+    }
+
+    #[cfg(test)]
+    pub fn force_close_failure(&mut self) {
+        self.close_failure = true;
     }
 
     #[cfg(test)]
@@ -248,6 +297,26 @@ impl CountSet {
         false
     }
 
+    #[cfg(test)]
+    fn append_failure_for_test(&self) -> bool {
+        self.append_failure
+    }
+
+    #[cfg(not(test))]
+    fn append_failure_for_test(&self) -> bool {
+        false
+    }
+
+    #[cfg(test)]
+    fn close_failure_for_test(&self) -> bool {
+        self.close_failure
+    }
+
+    #[cfg(not(test))]
+    fn close_failure_for_test(&self) -> bool {
+        false
+    }
+
     /// The lock file's path is exposed only for tests and diagnostics.
     pub fn lock_path(&self) -> &Path {
         &self.lock_path
@@ -266,6 +335,19 @@ fn read_count(path: &Path) -> Result<u64> {
     Ok(metadata.len())
 }
 
+fn check_appendable(path: &Path) -> Result<()> {
+    let file = OpenOptions::new()
+        .write(true)
+        .append(true)
+        .open(path)
+        .map_err(|_| Error::Io)?;
+    let metadata = file.metadata().map_err(|_| Error::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(())
+}
+
 fn write_zeros(file: &mut File, count: u64) -> Result<u64> {
     let count = usize::try_from(count).map_err(|_| Error::ResourceLimit)?;
     let mut zeros = Vec::new();
@@ -278,6 +360,21 @@ fn write_zeros(file: &mut File, count: u64) -> Result<u64> {
         Err(error) if error.kind() == io::ErrorKind::Interrupted => Err(Error::Io),
         Err(_) => Err(Error::Io),
     }
+}
+
+#[cfg(unix)]
+fn close_count_file(file: File) -> Result<()> {
+    let descriptor = file.into_raw_fd();
+    if unsafe { libc::close(descriptor) } != 0 {
+        return Err(Error::Io);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn close_count_file(file: File) -> Result<()> {
+    drop(file);
+    Err(Error::UnsupportedPrimitive)
 }
 
 #[cfg(test)]
@@ -406,6 +503,92 @@ mod tests {
         let root = temp_root("missing");
         let missing = root.join("leaf0/count.bin");
         assert!(CountSet::new(&root, vec![missing], CountPlan::new(1, 1).unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn forged_plans_are_rejected_at_every_entry() {
+        let root = temp_root("forged-plan");
+        let count = add_leaf(&root, "leaf0");
+        let zero = CountPlan {
+            columns: 0,
+            max_columns: 0,
+        };
+        assert!(zero.check().is_err());
+        assert!(CountSet::new(&root, vec![count.clone()], zero).is_err());
+        let reversed = CountPlan {
+            columns: 2,
+            max_columns: 1,
+        };
+        assert!(reversed.check().is_err());
+        assert!(CountSet::new(&root, vec![count.clone()], reversed).is_err());
+
+        let mut set = CountSet::new(
+            &root,
+            vec![count.clone()],
+            CountPlan::new(1, 1).unwrap(),
+        )
+        .unwrap();
+        set.plan.columns = 0;
+        assert!(set.begin_batch(0).is_err());
+        assert_eq!(read_count(&count).unwrap(), 0);
+
+        let mut set = CountSet::new(
+            &root,
+            vec![count.clone()],
+            CountPlan::new(1, 1).unwrap(),
+        )
+        .unwrap();
+        set.plan.max_columns = 0;
+        assert!(set.begin_batch(0).is_err());
+        assert_eq!(read_count(&count).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn append_open_failure_is_rejected_at_startup() {
+        let root = temp_root("append-open");
+        let count = add_leaf(&root, "leaf0");
+        let mut set = CountSet::new(
+            &root,
+            vec![count.clone()],
+            CountPlan::new(1, 1).unwrap(),
+        )
+        .unwrap();
+        set.force_append_failure();
+        assert!(set.verify_startup().is_err());
+        assert!(set.begin_batch(0).is_err());
+        assert_eq!(read_count(&count).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn close_failure_is_not_reported_as_success() {
+        let root = temp_root("close-failure");
+        let count = add_leaf(&root, "leaf0");
+        let mut set = CountSet::new(
+            &root,
+            vec![count.clone()],
+            CountPlan::new(1, 1).unwrap(),
+        )
+        .unwrap();
+        set.force_close_failure();
+        assert!(set.begin_batch(0).is_err());
+        assert_eq!(read_count(&count).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn count_files_are_appendable_at_startup() {
+        let root = temp_root("appendable");
+        let count = add_leaf(&root, "leaf0");
+        let set = CountSet::new(
+            &root,
+            vec![count],
+            CountPlan::new(1, 1).unwrap(),
+        )
+        .unwrap();
+        set.verify_startup().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -729,6 +729,7 @@ dependencies = [
 name = "zkie-engine"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "memmap2",
  "num-bigint",
  "p3-field",

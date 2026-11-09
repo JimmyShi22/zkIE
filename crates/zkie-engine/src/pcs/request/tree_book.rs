@@ -130,6 +130,7 @@ struct TreeState {
     log_n: u32,
     parts: Vec<u64>,
     one_list: bool,
+    adopted: bool,
     counts: Arc<Mutex<TreeCounts>>,
 }
 
@@ -140,6 +141,7 @@ pub struct TreeBook {
     trees: Vec<TreeState>,
     oracles: BTreeMap<u64, OracleSpec>,
     place: BTreeMap<u64, (usize, usize)>,
+    context_lists: BTreeMap<u64, u64>,
     held: BTreeSet<u64>,
 }
 
@@ -180,14 +182,17 @@ impl TreeBook {
                     log_n: tree.log_n,
                     parts: tree.parts,
                     one_list,
+                    adopted: false,
                     counts: Arc::new(Mutex::new(TreeCounts::default())),
                 }
             })
             .collect::<Vec<_>>();
+        let context_lists = place.keys().map(|id| (*id, 0)).collect();
         Ok(Self {
             trees: states,
             oracles: specs,
             place,
+            context_lists,
             held: BTreeSet::new(),
         })
     }
@@ -216,6 +221,15 @@ impl TreeBook {
 
     pub fn is_held(&self, id: u64) -> bool {
         self.held.contains(&id)
+    }
+
+    /// This context's own list count for one oracle part. Adoption shares the
+    /// tree's global counts but does not copy this per-context count.
+    pub fn context_lists(&self, id: u64) -> Result<u64> {
+        self.context_lists
+            .get(&id)
+            .copied()
+            .ok_or(Error::InvalidIndex)
     }
 
     fn tree_of(&self, id: u64) -> Result<usize> {
@@ -290,7 +304,7 @@ impl TreeBook {
     /// added by the actual own-list size (a short list for a shorter tree), and
     /// every part's main/mask hiding limit is checked before the opening is
     /// returned. An error leaves the raised counts in place (fail closed).
-    pub fn open_oracles(&self, ids: &[u64], at: &PositionList) -> Result<Opened> {
+    pub fn open_oracles(&mut self, ids: &[u64], at: &PositionList) -> Result<Opened> {
         if ids.is_empty() {
             return Ok(Opened::default());
         }
@@ -317,6 +331,11 @@ impl TreeBook {
                 if spec.mask_rows > 0 && positions > spec.mask_hiding {
                     return Err(Error::ResourceLimit);
                 }
+                let count = self
+                    .context_lists
+                    .get_mut(part)
+                    .ok_or(Error::InvalidConfig)?;
+                *count = count.checked_add(1).ok_or(Error::ResourceLimit)?;
             }
             opened.push(OpenedTree {
                 tree,
@@ -353,12 +372,12 @@ impl TreeBook {
     pub fn release_oracles(&self, ids: &[u64]) -> Result<Vec<usize>> {
         let mut released = Vec::new();
         for tree in self.trees_of(ids)? {
-            let counts = self.counts(tree)?;
             let mut done = true;
             for part in &self.trees[tree].parts {
                 let spec = self.oracles.get(part).ok_or(Error::InvalidConfig)?;
                 let groups = spec.groups.len().max(1) as u64;
-                done = done && !self.held.contains(part) && counts.lists >= groups;
+                let lists = self.context_lists.get(part).copied().unwrap_or(0);
+                done = done && !self.held.contains(part) && lists >= groups;
             }
             if done {
                 released.push(tree);
@@ -367,17 +386,28 @@ impl TreeBook {
         Ok(released)
     }
 
-    /// Continue another chain's tree: sizes must agree, one-list trees cannot
-    /// be adopted, and both books share the same list/position counters.
+    /// Continue another chain's tree: the candidate compares the public
+    /// log-length and complete ordered parts, rejects a used or already-adopted
+    /// target and one-list trees, and shares the global list/position counters.
+    /// This context's own list counts are not copied. Root/sent trust binding is
+    /// not connected here.
     pub fn adopt(&mut self, target: usize, source: &TreeBook, source_tree: usize) -> Result<()> {
+        let target_counts = self.counts(target)?;
+        let source_counts = source.counts(source_tree)?;
         let target_state = self.trees.get(target).ok_or(Error::InvalidIndex)?;
         let source_state = source.trees.get(source_tree).ok_or(Error::InvalidIndex)?;
-        if target_state.parts.len() != source_state.parts.len()
+        if target_state.adopted
+            || target_counts.lists != 0
+            || target_counts.positions != 0
+            || target_state.log_n != source_state.log_n
+            || target_state.parts != source_state.parts
             || target_state.one_list
             || source_state.one_list
+            || source_counts.lists == 0 && source_counts.positions != 0
         {
             return Err(Error::StatementMismatch);
         }
+        self.trees[target].adopted = true;
         self.trees[target].counts = Arc::clone(&source.trees[source_tree].counts);
         Ok(())
     }
@@ -426,7 +456,7 @@ mod tests {
 
     #[test]
     fn empty_ids_are_a_noop_but_empty_draws_are_not() {
-        let book = book();
+        let mut book = book();
         let at = PositionList::from_draws(vec![0], 3).unwrap();
         let opened = book.open_oracles(&[], &at).unwrap();
         assert!(opened.trees.is_empty());
@@ -438,14 +468,14 @@ mod tests {
 
     #[test]
     fn positions_count_cross_list_repeats_and_short_lists() {
-        let book = book();
+        let mut book = book();
         let first = PositionList::from_draws(vec![0, 4], 3).unwrap();
         let second = PositionList::from_draws(vec![4, 0], 3).unwrap();
         book.open_oracles(&[1, 2], &first).unwrap();
         assert_eq!(book.counts(0).unwrap(), TreeCounts { lists: 1, positions: 2 });
         book.open_oracles(&[1, 2], &second).unwrap();
         assert_eq!(book.counts(0).unwrap(), TreeCounts { lists: 2, positions: 4 });
-        let short_book = TreeBook::new(
+        let mut short_book = TreeBook::new(
             vec![TreeSpec {
                 log_n: 2,
                 parts: vec![1, 2],
@@ -461,10 +491,10 @@ mod tests {
 
     #[test]
     fn whole_trees_and_group_agreement_are_required() {
-        let book = book();
+        let mut book = book();
         let at = PositionList::from_draws(vec![0], 3).unwrap();
         assert!(book.open_oracles(&[1], &at).is_err());
-        let mixed = TreeBook::new(
+        let mut mixed = TreeBook::new(
             vec![TreeSpec {
                 log_n: 3,
                 parts: vec![1, 2],
@@ -480,7 +510,7 @@ mod tests {
     fn one_list_trees_reject_second_lists_and_adoption() {
         let mut one = oracle(1, vec![7]);
         one.answers = 0;
-        let book = TreeBook::new(
+        let mut book = TreeBook::new(
             vec![TreeSpec {
                 log_n: 3,
                 parts: vec![1],
@@ -509,7 +539,7 @@ mod tests {
             mask_hiding: 2,
             ..oracle(1, vec![7])
         };
-        let book = TreeBook::new(
+        let mut book = TreeBook::new(
             vec![TreeSpec {
                 log_n: 3,
                 parts: vec![1],
@@ -536,15 +566,77 @@ mod tests {
 
     #[test]
     fn adoption_shares_counts_and_release_waits_for_held_and_lists() {
-        let source = book();
+        let mut source = book();
         let mut target = book();
         let at = PositionList::from_draws(vec![0, 1], 3).unwrap();
         source.open_oracles(&[1, 2], &at).unwrap();
         target.adopt(0, &source, 0).unwrap();
         assert_eq!(target.counts(0).unwrap(), TreeCounts { lists: 1, positions: 2 });
+        // Adoption shares global counts but not this context's own list use.
+        assert!(target.release_oracles(&[1, 2]).unwrap().is_empty());
+        target.open_oracles(&[1, 2], &at).unwrap();
+        assert_eq!(target.context_lists(1).unwrap(), 1);
         target.set_held(1, true).unwrap();
         assert!(target.release_oracles(&[1, 2]).unwrap().is_empty());
         target.set_held(1, false).unwrap();
         assert_eq!(target.release_oracles(&[1, 2]).unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn release_waits_for_each_parts_group_count() {
+        let mut book = TreeBook::new(
+            vec![TreeSpec {
+                log_n: 3,
+                parts: vec![1, 2],
+            }],
+            vec![oracle(1, vec![7, 8]), oracle(2, vec![7, 8])],
+        )
+        .unwrap();
+        let at = PositionList::from_draws(vec![0], 3).unwrap();
+        book.open_oracles(&[1, 2], &at).unwrap();
+        assert!(book.release_oracles(&[1, 2]).unwrap().is_empty());
+        book.open_oracles(&[1, 2], &at).unwrap();
+        assert_eq!(book.release_oracles(&[1, 2]).unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn adoption_rejects_used_target_repeat_and_incompatible_shape() {
+        let mut source = book();
+        let at = PositionList::from_draws(vec![0], 3).unwrap();
+        source.open_oracles(&[1, 2], &at).unwrap();
+
+        let mut used_target = book();
+        used_target.open_oracles(&[1, 2], &at).unwrap();
+        assert!(used_target.adopt(0, &source, 0).is_err());
+
+        let mut target = book();
+        target.adopt(0, &source, 0).unwrap();
+        assert!(target.adopt(0, &source, 0).is_err());
+
+        let wrong_log = TreeBook::new(
+            vec![TreeSpec {
+                log_n: 2,
+                parts: vec![1, 2],
+            }],
+            vec![oracle(1, vec![7]), oracle(2, vec![7])],
+        )
+        .unwrap();
+        let mut target = book();
+        assert!(target.adopt(0, &wrong_log, 0).is_err());
+
+        let wrong_parts = TreeBook::new(
+            vec![TreeSpec {
+                log_n: 3,
+                parts: vec![2, 1],
+            }],
+            vec![oracle(1, vec![7]), oracle(2, vec![7])],
+        )
+        .unwrap();
+        let mut target = book();
+        assert!(target.adopt(0, &wrong_parts, 0).is_err());
+
+        let mut target = book();
+        target.adopt(0, &source, 0).unwrap();
+        assert_eq!(target.counts(0).unwrap(), TreeCounts { lists: 1, positions: 1 });
     }
 }

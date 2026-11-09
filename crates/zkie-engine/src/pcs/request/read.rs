@@ -516,7 +516,9 @@ impl VerifierReads {
 }
 
 /// The prover's column reads: a budget and an opening cache. A repeated
-/// position returns the opening first produced for it.
+/// position returns the opening first produced for it. Cloning copies the
+/// budget and cache: a clone is a separate logical reader, not a share of one
+/// global read budget, and this type does not claim a cross-instance budget.
 #[derive(Clone, Debug, Default)]
 pub struct ProverReads {
     budget: ReadBudget,
