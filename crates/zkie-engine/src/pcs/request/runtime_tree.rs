@@ -1,16 +1,23 @@
-//! Runtime mask trees: the tree that carries a fresh mask's rows (foundation
-//! only).
+//! Runtime co-trees: the trees that carry a prover message's oracle parts
+//! (foundation only).
 //!
 //! A runtime tree is laid out by the verifier's plan: tree number, leaf class,
-//! depth, mask-row count, salt length and the run/configuration starts are
-//! plan values, never proof values. Its leaves use the runtime leaf domain and
-//! the run's value as the hash start; internal nodes use the tree node domain,
-//! the same tree number and the configuration digest. Stored table leaves stay
-//! under their own domain and configuration. The byte layout is the
-//! repository's internal candidate: domain separation is kept, but no
-//! interoperability with another representation is claimed.
+//! long and short depths, part widths, salt length and the run/configuration
+//! starts are plan values, never proof values. A long-column leaf holds every
+//! part's main symbols in part order, then every part's mask symbols at their
+//! short positions in part order, then the leaf's own salt. Leaves use the
+//! runtime leaf domain and the run's value as the hash start; internal nodes
+//! use the tree node domain, the same tree number and the configuration
+//! digest. Stored table leaves stay under their own domain and configuration
+//! and are never laid out here. A mask-only tree is the one-part special case;
+//! commit, leaf hashing and the whole-tree opening are shared with every other
+//! part count. The tree is an in-memory test foundation: it materializes every
+//! column and salt, is not the production committer, and the verifier cannot
+//! see whether the private salts are random. The root is a tree root, not a
+//! value that a session has authenticated; the session/group wiring is open.
 
 use serde::{Deserialize, Serialize};
+use zkie_core::common::field::PrimeCharacteristicRing;
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
 
@@ -870,6 +877,19 @@ impl RuntimeTree {
                 {
                     return Err(Error::ShapeMismatch);
                 }
+                // A base-field row carries one coordinate per element. Two
+                // different extension-field inputs must not collapse to the
+                // same commitment, so a non-zero high coordinate is rejected
+                // rather than dropped.
+                if rows.main_deg == 1
+                    && rows
+                        .main
+                        .iter()
+                        .flatten()
+                        .any(|element| element.c[1] != Fp::ZERO || element.c[2] != Fp::ZERO)
+                {
+                    return Err(Error::ShapeMismatch);
+                }
             }
             if part.mask_symbols == 0 {
                 if !rows.mask.is_empty() {
@@ -1652,6 +1672,70 @@ mod tests {
         assert_eq!(short_position(4, 2, 9).unwrap(), 1);
         assert_eq!(short_position(2, 1, 0).unwrap(), 0);
         assert_eq!(short_position(2, 1, 2).unwrap(), 0);
+    }
+
+    #[test]
+    fn base_rows_reject_nonzero_high_components() {
+        let plan = RuntimeTreePlan {
+            tree_number: 11,
+            leaf_class: 1,
+            log_n: 1,
+            log_n_zk: 0,
+            parts: vec![part(1, 0)],
+            salt_bytes: LEAF_SALT_MIN_BYTES,
+            run: Digest([9; 32]),
+            configuration: Digest([7; 32]),
+        };
+        let salts = vec![vec![1; LEAF_SALT_MIN_BYTES]; 2];
+        let base = |value: u64| vec![vec![Fp3::from_base(Fp::from_u64(value)); 2]];
+        let tree = RuntimeTree::commit(
+            plan.clone(),
+            &[RuntimePartRows {
+                main: base(7),
+                mask: Vec::new(),
+                main_deg: 1,
+            }],
+            &salts,
+        )
+        .unwrap();
+        let opening = tree.open(&[0]).unwrap();
+        verify_runtime_opening(&plan, tree.root(), &[0], &opening).unwrap();
+        assert_eq!(opening.columns[0].symbols, vec![Fp::from_u64(7)]);
+        for high in 1..=2usize {
+            let mut element = Fp3::from_base(Fp::ONE);
+            element.c[high] = Fp::ONE;
+            assert!(RuntimeTree::commit(
+                plan.clone(),
+                &[RuntimePartRows {
+                    main: vec![vec![element; 2]],
+                    mask: Vec::new(),
+                    main_deg: 1,
+                }],
+                &salts,
+            )
+            .is_err());
+        }
+        let extended_plan = RuntimeTreePlan {
+            parts: vec![part(3, 0)],
+            ..plan
+        };
+        let extended = Fp3::new(Fp::from_u64(2), Fp::from_u64(3), Fp::from_u64(4));
+        let tree = RuntimeTree::commit(
+            extended_plan.clone(),
+            &[RuntimePartRows {
+                main: vec![vec![extended; 2]],
+                mask: Vec::new(),
+                main_deg: 3,
+            }],
+            &salts,
+        )
+        .unwrap();
+        let opening = tree.open(&[0]).unwrap();
+        assert_eq!(
+            opening.columns[0].symbols,
+            vec![Fp::from_u64(2), Fp::from_u64(3), Fp::from_u64(4)]
+        );
+        verify_runtime_opening(&extended_plan, tree.root(), &[0], &opening).unwrap();
     }
 
     #[test]
