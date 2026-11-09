@@ -730,6 +730,11 @@ mod tests {
             manual = manual.add(&coefficient.mul(entry));
         }
         assert_eq!(evaluated, manual);
+        // A single pad entry change with the other inputs fixed no longer
+        // satisfies the target.
+        let mut changed_witness = witness.clone();
+        changed_witness.main[1] = changed_witness.main[1].add(&Fp3::ONE);
+        assert_ne!(row.evaluate(&changed_witness).unwrap(), manual);
 
         // A supplied seed list that differs from the recomputation is rejected.
         let mut wrong = seeds.clone();
@@ -805,6 +810,12 @@ mod tests {
             manual = manual.add(&coefficient.mul(entry));
         }
         assert_eq!(row.evaluate(&witness).unwrap(), manual);
+        // A single tail entry change with the other inputs fixed no longer
+        // satisfies the target.
+        assert_ne!(row.main[first as usize], Fp3::ZERO);
+        let mut changed = witness.clone();
+        changed.main[first as usize] = changed.main[first as usize].add(&Fp3::ONE);
+        assert_ne!(row.evaluate(&changed).unwrap(), manual);
         assert!(column_row(&shape, &registry, code.n(), &column, &eq_gamma).is_err());
         assert!(column_row(&shape, &registry, position, &column[..3], &eq_gamma).is_err());
         assert!(column_row(&shape, &registry, position, &column, &eq_gamma[..3]).is_err());
@@ -1079,5 +1090,48 @@ mod tests {
         let mut changed = witness.clone();
         changed.mask[pad as usize] = changed.mask[pad as usize].add(&Fp3::ONE);
         assert_ne!(row.evaluate(&changed).unwrap(), target);
+    }
+
+    #[test]
+    fn record_row_uses_the_transposed_layout_when_rows_are_high() {
+        let mut shape = shape();
+        shape.rows_high = true;
+        let registry = registry(&shape);
+        let name = index_name(&Digest([4; 32]), &shape.index, &Digest([7; 32]));
+        let seeds = record_seeds(&shape.index, &name, 1).unwrap();
+        let record = IndexRecord {
+            y: vec![
+                Fp3::from_u64(11),
+                Fp3::from_u64(13),
+                Fp3::from_u64(17),
+                Fp3::from_u64(19),
+            ],
+        };
+        let eq_gamma = vec![
+            Fp3::from_u64(2),
+            Fp3::from_u64(3),
+            Fp3::from_u64(5),
+            Fp3::from_u64(7),
+        ];
+        let row = record_row(&shape, &registry, &record, &name, &seeds, &eq_gamma, 0).unwrap();
+        let mut expected = vec![Fp3::ZERO; (shape.u.main_rows * shape.u.code.ell) as usize];
+        let bits = shape.index.cube_bits();
+        let place_bits = shape.u.code.log_ell();
+        let row_bits = 1u32;
+        let index_of = |entry: u64| (entry >> place_bits) | ((entry & ((1u64 << place_bits) - 1)) << row_bits);
+        for entry in 0..shape.index.code.ell {
+            expected[index_of(entry) as usize] = eq_manual(entry, &seeds[0].z, bits);
+        }
+        for coefficient in 0..E_DEGREE {
+            let place = shape.index.pad_place(0, coefficient);
+            expected[index_of(place) as usize] = seeds[0].beta.mul(&theta(coefficient));
+        }
+        assert_eq!(row.main, expected);
+        let witness = witness(&shape);
+        let mut manual = Fp3::ZERO;
+        for (coefficient, entry) in expected.iter().zip(&witness.main) {
+            manual = manual.add(&coefficient.mul(entry));
+        }
+        assert_eq!(row.evaluate(&witness).unwrap(), manual);
     }
 }
