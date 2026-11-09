@@ -62,6 +62,85 @@ impl FoldShape {
     }
 }
 
+/// An isolated FOLD input claim on one fixed group. The group/layout and the
+/// coefficient vectors are an unauthenticated fixture in this step: the BAT/
+/// relation layer that would produce them from sampled rows is not connected.
+/// The row binds the group number, the layout's row variables and member ids,
+/// the main and mask coefficients of the running claim, and its target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoldInputRow {
+    pub group: u64,
+    pub k: u32,
+    pub h: u32,
+    pub members: Vec<u64>,
+    pub coefficients: Vec<Fp3>,
+    pub mask_coefficients: Vec<Fp3>,
+    pub target: Fp3,
+}
+
+impl FoldInputRow {
+    /// The fixture must have the shape's layout and table lengths. The member
+    /// list is strictly increasing and non-empty; the session separately checks
+    /// it against the trusted group view.
+    pub fn check(&self, shape: &FoldShape) -> Result<()> {
+        validate_fold_mask_shape(shape)?;
+        if self.k != shape.k || self.h != shape.h || self.members.is_empty() {
+            return Err(Error::ShapeMismatch);
+        }
+        if self.members.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(Error::InvalidConfig);
+        }
+        let rows = 1usize.checked_shl(shape.k).ok_or(Error::ResourceLimit)?;
+        let mask_rows = 1usize.checked_shl(shape.h).ok_or(Error::ResourceLimit)?;
+        let main_len = rows
+            .checked_mul(usize::try_from(shape.code.ell).map_err(|_| Error::ResourceLimit)?)
+            .ok_or(Error::ResourceLimit)?;
+        let mask_len = mask_rows
+            .checked_mul(
+                usize::try_from(shape.mask_code.ell).map_err(|_| Error::ResourceLimit)?,
+            )
+            .ok_or(Error::ResourceLimit)?;
+        if self.coefficients.len() != main_len || self.mask_coefficients.len() != mask_len {
+            return Err(Error::ShapeMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// The final constraint after the FOLD rounds: the folded main coefficients,
+/// the old mask's coefficients, the fresh mask's coefficients, and the new
+/// target, together with the group/layout, challenges, fresh-mask id/root and
+/// tree identity needed by the next stage. The next IOPP/CS stage is not
+/// connected, so [`FoldOutput::next_stage`] always fails closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoldOutput {
+    pub code: CodeParams,
+    pub mask_code: CodeParams,
+    pub group: u64,
+    pub k: u32,
+    pub h: u32,
+    pub members: Vec<u64>,
+    pub gamma: Vec<Fp3>,
+    pub eps: Fp3,
+    pub sum: Fp3,
+    pub fresh: u64,
+    pub fresh_root: Digest,
+    pub tree_number: u64,
+    pub coefficients: Vec<Fp3>,
+    pub mask_coefficients: Vec<Fp3>,
+    pub fresh_coefficients: Vec<Fp3>,
+    pub target: Fp3,
+}
+
+impl FoldOutput {
+    /// The next protocol stage (IOPP/CS) is not implemented in this isolated
+    /// layer. Returning an error here makes a caller fail closed instead of
+    /// treating the FOLD output as an accepted proof.
+    pub fn next_stage(&self) -> Result<()> {
+        Err(Error::InvalidSessionState)
+    }
+}
+
 /// The number of entries per mask row that the hiding coefficients fill.
 pub fn fold_mask_columns(k: u32, h: u32) -> usize {
     (2 * k as usize) + 1 - h.min(k) as usize
@@ -426,6 +505,12 @@ impl FoldRoundProver {
     pub fn next(&self) -> u32 {
         self.next
     }
+
+    /// The main message row after the challenges bound so far. This is the
+    /// prover's witness at the end of the rounds; it is not a verifier output.
+    pub fn main_messages(&self) -> &[Fp3] {
+        &self.main.messages
+    }
 }
 
 /// The verifier's running claim for the same rounds. The linear coefficient
@@ -454,6 +539,89 @@ impl FoldRoundVerifier {
     pub fn claim(&self) -> Fp3 {
         self.claim
     }
+}
+
+fn fold_low_values(values: &[Fp3], gamma: &[Fp3], variables: u32) -> Result<Vec<Fp3>> {
+    if gamma.len() < variables as usize || variables >= 64 {
+        return Err(Error::InvalidConfig);
+    }
+    let mut out = values.to_vec();
+    for challenge in gamma.iter().take(variables as usize) {
+        fold_low_once(&mut out, *challenge)?;
+    }
+    Ok(out)
+}
+
+fn fold_mask_form_values(
+    k: u32,
+    h: u32,
+    d: &[Fp3],
+    eps: Fp3,
+    gamma: &[Fp3],
+) -> Result<Vec<Fp3>> {
+    if gamma.len() != k as usize || h > k {
+        return Err(Error::InvalidConfig);
+    }
+    let mut out = fold_low_values(d, gamma, h)?;
+    let mut scale = eps;
+    for challenge in gamma.iter().skip(h as usize) {
+        scale = scale.mul(challenge);
+    }
+    for value in &mut out {
+        *value = value.mul(&scale);
+    }
+    Ok(out)
+}
+
+/// Compute the final FOLD constraint from the verifier's fixed group row and
+/// the challenges. The caller supplies the already-checked start identity and
+/// the running claim after the last round; no new challenge or target is
+/// chosen here.
+pub fn fold_output(
+    shape: &FoldShape,
+    row: &FoldInputRow,
+    fresh: u64,
+    fresh_root: Digest,
+    tree_number: u64,
+    eps: Fp3,
+    sum: Fp3,
+    gamma: &[Fp3],
+    claim: Fp3,
+) -> Result<FoldOutput> {
+    row.check(shape)?;
+    if gamma.len() != shape.k as usize {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut coefficients = fold_low_values(&row.coefficients, gamma, shape.k)?;
+    for value in &mut coefficients {
+        *value = value.mul(&eps);
+    }
+    let mask_coefficients =
+        fold_mask_form_values(shape.k, shape.h, &row.mask_coefficients, eps, gamma)?;
+    let fresh_coefficients = fold_mask_weights(
+        shape.k,
+        shape.h,
+        usize::try_from(shape.mask_code.ell).map_err(|_| Error::ResourceLimit)?,
+        gamma,
+    )?;
+    Ok(FoldOutput {
+        code: shape.code,
+        mask_code: shape.mask_code,
+        group: row.group,
+        k: row.k,
+        h: row.h,
+        members: row.members.clone(),
+        gamma: gamma.to_vec(),
+        eps,
+        sum,
+        fresh,
+        fresh_root,
+        tree_number,
+        coefficients,
+        mask_coefficients,
+        fresh_coefficients,
+        target: claim,
+    })
 }
 
 /// The prover's per-round self-check. The drawn side is not a caller's copy:
@@ -553,6 +721,96 @@ impl FoldRoundSession {
             return Err(Error::InvalidProof);
         }
         Ok(live)
+    }
+}
+
+/// The prover's isolated FOLD rounds over the actual main row, the old mask
+/// rows and the fresh mask. The fresh mask must already have passed the start
+/// path's first as-drawn check; `start` performs the second check before the
+/// first round, when the coefficients and the encoding tail are last read, and
+/// the round polynomial then uses the live mask data. The q values are not
+/// supplied by a verifier.
+pub struct FoldProverSession {
+    shape: FoldShape,
+    coefficients: Vec<Fp3>,
+    draws: Vec<u32>,
+    tail: MaskTail,
+    rounds: FoldRoundProver,
+    started: bool,
+}
+
+impl FoldProverSession {
+    pub fn new(
+        shape: &FoldShape,
+        mask: &FoldMask,
+        row: &FoldInputRow,
+        main_messages: Vec<Fp3>,
+        mask_messages: Vec<Fp3>,
+        kept: Fp3,
+    ) -> Result<Self> {
+        row.check(shape)?;
+        let expected = 2 * shape.k as usize + 1;
+        if mask.coefficients().len() != expected || mask.draws().len() != expected {
+            return Err(Error::InvalidConfig);
+        }
+        let tail = mask.tail().cloned().ok_or(Error::InvalidProof)?;
+        let main = FoldMainTable::new(row.coefficients.clone(), main_messages)?;
+        let len_zk = usize::try_from(shape.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
+        let rounds = FoldRoundProver::new(
+            shape.k,
+            shape.h,
+            mask.coefficients().to_vec(),
+            row.mask_coefficients.clone(),
+            mask_messages,
+            len_zk,
+            main,
+            kept,
+        )?;
+        Ok(Self {
+            shape: *shape,
+            coefficients: mask.coefficients().to_vec(),
+            draws: mask.draws().to_vec(),
+            tail,
+            rounds,
+            started: false,
+        })
+    }
+
+    pub fn sum(&self) -> Fp3 {
+        self.rounds.sum()
+    }
+
+    /// The second as-drawn check, immediately before the first round.
+    pub fn start(&mut self, eps: Fp3, coins: &impl MaskCoins) -> Result<()> {
+        if self.started {
+            return Err(Error::InvalidSessionState);
+        }
+        fold_mask_as_drawn_parts(
+            &self.shape,
+            &self.coefficients,
+            &self.draws,
+            &self.tail,
+            coins,
+        )?;
+        self.rounds.start(eps)?;
+        self.started = true;
+        Ok(())
+    }
+
+    pub fn round(&self) -> Result<[Fp3; 3]> {
+        self.rounds.round()
+    }
+
+    pub fn bind(&mut self, gamma: Fp3) -> Result<()> {
+        self.rounds.bind(gamma)
+    }
+
+    pub fn end(&self) -> Result<FoldRoundEnd> {
+        self.rounds.end()
+    }
+
+    pub fn main_messages(&self) -> &[Fp3] {
+        self.rounds.main_messages()
     }
 }
 
@@ -813,20 +1071,30 @@ pub fn fold_mask_as_drawn(
     mask: &FoldMask,
     coins: &impl MaskCoins,
 ) -> Result<()> {
+    let tail = mask.tail.as_ref().ok_or(Error::InvalidProof)?;
+    fold_mask_as_drawn_parts(shape, &mask.coefficients, &mask.draws, tail, coins)
+}
+
+fn fold_mask_as_drawn_parts(
+    shape: &FoldShape,
+    coefficients: &[Fp3],
+    draws: &[u32],
+    tail: &MaskTail,
+    coins: &impl MaskCoins,
+) -> Result<()> {
     validate_fold_mask_shape(shape)?;
-    let coefficients = 2 * shape.k as usize + 1;
-    if mask.coefficients.len() != coefficients || mask.draws.len() != coefficients {
+    let coefficient_count = 2 * shape.k as usize + 1;
+    if coefficients.len() != coefficient_count || draws.len() != coefficient_count {
         return Err(Error::InvalidProof);
     }
     let mut differ = false;
-    for (coefficient, number) in mask.coefficients.iter().zip(&mask.draws) {
+    for (coefficient, number) in coefficients.iter().zip(draws) {
         if *number == NO_DRAW || coins.redraw(*number)? != *coefficient {
             differ = true;
         }
     }
     let tail_rows = usize::try_from(shape.mask_rows()?).map_err(|_| Error::ResourceLimit)?;
     let tail_len = usize::try_from(shape.mask_code.r).map_err(|_| Error::ResourceLimit)?;
-    let tail = mask.tail.as_ref().ok_or(Error::InvalidProof)?;
     if tail.fault().is_some() || tail.rows != tail_rows || tail.len != tail_len {
         return Err(Error::InvalidProof);
     }
