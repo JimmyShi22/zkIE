@@ -744,6 +744,32 @@ mod tests {
     }
 
     #[test]
+    fn over_limit_retry_stays_rejected_through_charged_opens() {
+        let table = committed();
+        let mut state = HidingState::new(table.reader.root, 1, 1);
+        let charge = state.begin_charge(table.reader.root, 1, 1).unwrap();
+        let third_charge = charge.clone();
+        let mut first = ProverReads::new(2);
+        let mut second = ProverReads::new(2);
+        let mut third = ProverReads::new(2);
+        first.open(&charge, &table, &[0]).unwrap();
+        // A second reader cannot spend a new column and keeps failing on the
+        // same over-limit position through the real charged-open path.
+        assert!(second.open(&charge, &table, &[1]).is_err());
+        assert!(second.open(&charge, &table, &[1]).is_err());
+        assert!(second.open(&charge, &table, &[0, 1]).is_err());
+        assert_eq!(second.open(&charge, &table, &[0]).unwrap().len(), 1);
+        // A cloned token and a third reader share the same rejected state.
+        assert!(third.open(&third_charge, &table, &[1]).is_err());
+        assert_eq!(third.open(&third_charge, &table, &[0]).unwrap().len(), 1);
+        // The table's charged open rejects the same position on retry and
+        // still serves the already consumed one.
+        assert!(table.open_columns_charged(&charge, &[1]).is_err());
+        assert!(table.open_columns_charged(&charge, &[1]).is_err());
+        assert!(table.open_columns_charged(&charge, &[0]).is_ok());
+    }
+
+    #[test]
     fn hiding_state_charges_before_send_and_never_refunds() {
         let table = Digest([7; 32]);
         let mut state = HidingState::new(table, 1, 3);

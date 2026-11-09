@@ -695,12 +695,15 @@ impl RuntimeOracles {
 
     /// Later verifier phase: check the mask opening at positions produced by
     /// the verifier's trusted transcript. `expected_count` is the plan's query
-    /// count, a different source from the positions; the positions must be
-    /// sorted unique, have exactly that count, and the openings must verify
-    /// against the registered root. A zero count performs no opening and marks
-    /// nothing; an opening count mismatch or a caller list is rejected. This
-    /// checks the opening only: it is not a complete authentication, a
-    /// proximity test, a table test or a relation closure.
+    /// count, a different source from the positions; the function accepts at
+    /// most that many sorted unique positions (a longer or unsorted list is
+    /// rejected) and verifies the openings against the registered root. The
+    /// caller must supply the complete deduplicated set of the verifier's
+    /// draws: this function checks the list it is given and does not prove the
+    /// list's source or completeness, so a short or empty list is not evidence
+    /// that the transcript drew fewer. A zero count performs no opening and
+    /// marks nothing. This checks the opening only: it is not a complete
+    /// authentication, a proximity test, a table test or a relation closure.
     ///
     /// This is a low-level entry. The count and positions are caller-supplied
     /// and are not self-authenticating: only a trusted session whose transcript

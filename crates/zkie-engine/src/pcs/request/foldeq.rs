@@ -647,10 +647,13 @@ impl FoldeqSession {
     }
 
     /// Check the mask opening at the positions the verifier's transcript drew.
-    /// The plan's count is a different source from the drawn list. This checks
-    /// the opening only; not a complete authentication, proximity, table test
-    /// or relation closure. With a zero plan count there is nothing to open and
-    /// the stage still advances; whether the block permits zero queries is a
+    /// The plan's count is a different source from the drawn list; the
+    /// low-level check accepts at most that many positions and does not prove
+    /// the list's source or completeness. The list comes from this session's
+    /// own chain in the harness, which is not connected to production and does
+    /// not claim a complete reference round, proximity, table test or hiding
+    /// closure. With a zero plan count there is nothing to open and the stage
+    /// still advances; whether the block permits zero queries is a
     /// reference-block condition, and entering this stage does not mean the
     /// mask was authenticated.
     pub fn read_mask(&mut self, openings: &[MaskColumnOpening]) -> Result<()> {
@@ -685,7 +688,7 @@ impl FoldeqSession {
 mod tests {
     use super::*;
     use crate::pcs::request::code::build_code_plan;
-    use crate::pcs::request::field::{Fp, MODULUS};
+    use crate::pcs::request::field::{Fp, Fp3, MODULUS};
 use crate::pcs::request::fold::{
         fold_mask_make, fold_mask_make_tail, fold_mask_notice, fold_start_prove, MaskOracle,
         OracleMetadata, RuntimeOracles, VerifiedGroup, VerifiedGroups,
@@ -694,7 +697,9 @@ use crate::pcs::request::fold::{
     use crate::pcs::request::params::{LEAF_SALT_MIN_BYTES, REQUEST_CHAIN_LABEL};
     use crate::pcs::request::read::{HidingState, ProverReads};
     use crate::pcs::request::runtime_tree::{verify_mask_columns, MaskTreePlan};
-        use crate::pcs::request::table::{commit_table, IndexShape, TableDistances};
+    use crate::pcs::request::table::{
+        commit_table, IndexReader, IndexRecord, IndexShape, TableDistances,
+    };
     use crate::primitives::transcript::{hash_labeled, tag_word, TEST_COINS};
     use zkie_core::common::field::PrimeCharacteristicRing;
 
@@ -1150,6 +1155,39 @@ use crate::pcs::request::fold::{
         let mut bad = plan;
         bad.group_id = 7;
         assert!(FoldeqSession::open(bad, binder, chain).is_err());
+    }
+
+    #[test]
+    fn lin_row_bound_accepts_the_limit_without_materializing() {
+        let (mut plan, _table) = plan_fixture();
+        // A shape whose plain width admits the largest row count; only the
+        // numbers are built, no row or matrix is allocated.
+        plan.reader = IndexReader {
+            shape: IndexShape {
+                code: build_code_plan(32, (1u64 << 30) + 3, 1).unwrap(),
+                v: 0,
+                answers: 1,
+                salt_bytes: LEAF_SALT_MIN_BYTES,
+                distances: TableDistances {
+                    radius: 0,
+                    later_radius: 0,
+                    m_once: 0,
+                    m_later: 0,
+                },
+            },
+            configuration: Digest([9; 32]),
+            root: Digest([7; 32]),
+            record: IndexRecord { y: vec![Fp3::ZERO] },
+        };
+        plan.gamma_path = GammaPath::Lin {
+            shape: LinShapeBinding { matrix_rows: 1u64 << 30, k_lo: 0, k_col: 0 },
+        };
+        // The plain width is exactly 2^30, so this row count is legal.
+        assert_eq!(plan.fault(), None);
+        plan.gamma_path = GammaPath::Lin {
+            shape: LinShapeBinding { matrix_rows: (1u64 << 30) + 1, k_lo: 0, k_col: 0 },
+        };
+        assert_eq!(plan.fault(), Some("the LIN shape binding has invalid numbers"));
     }
 
     // A local numbered source for the joint harness tests; it is not a
