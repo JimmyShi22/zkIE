@@ -295,17 +295,22 @@ pub fn fold_mask_make_tail(
     Ok(())
 }
 
-/// The prover's self-check: every coefficient and every value of the mask
-/// rows' encoding tail equals the value that the source regenerates from its
-/// recorded draw number. All values are compared, with no early end. A mask
-/// whose tail was never drawn is rejected: the check must not silently
-/// compare nothing. A `NO_DRAW` number is treated as a difference here, so a
-/// lost number fails closed.
+/// The prover's self-check for a mask of `shape`: every coefficient and every
+/// value of the mask rows' encoding tail equals the value that the source
+/// regenerates from its recorded draw number. The mask must have the shape's
+/// `2k + 1` coefficients and a tail of the shape's `2^h` rows and mask-code
+/// `r` entries. All values are compared, with no early end. A mask whose tail
+/// was never drawn is rejected: the check must not silently compare nothing.
+/// A `NO_DRAW` number is treated as a difference here, so a lost number fails
+/// closed.
 pub fn fold_mask_as_drawn(
+    shape: &FoldShape,
     mask: &FoldMask,
     coins: &TestMaskCoins,
 ) -> Result<()> {
-    if mask.coefficients.len() != mask.draws.len() {
+    validate_fold_mask_shape(shape)?;
+    let coefficients = 2 * shape.k as usize + 1;
+    if mask.coefficients.len() != coefficients || mask.draws.len() != coefficients {
         return Err(Error::InvalidProof);
     }
     let mut differ = false;
@@ -314,8 +319,12 @@ pub fn fold_mask_as_drawn(
             differ = true;
         }
     }
+    let tail_rows = usize::try_from(shape.mask_rows()).map_err(|_| Error::ResourceLimit)?;
+    let tail_len = usize::try_from(shape.mask_code.r).map_err(|_| Error::ResourceLimit)?;
     let tail = mask.tail.as_ref().ok_or(Error::InvalidProof)?;
-    if tail.values.len() != tail.draws.len()
+    if tail.rows != tail_rows
+        || tail.len != tail_len
+        || tail.values.len() != tail.draws.len()
         || tail.rows.checked_mul(tail.len) != Some(tail.values.len())
     {
         return Err(Error::InvalidProof);
@@ -614,7 +623,7 @@ mod tests {
         assert!(!mask.sent());
         // Without the encoding tail the check must not compare only one part.
         assert!(mask.tail().is_none());
-        assert!(fold_mask_as_drawn(&mask, &source).is_err());
+        assert!(fold_mask_as_drawn(&shape, &mask, &source).is_err());
 
         fold_mask_make_tail(&shape, &mut mask, &mut source).unwrap();
         let tail = mask.tail().unwrap();
@@ -622,7 +631,7 @@ mod tests {
         assert_eq!(tail.len, shape.mask_code.r as usize);
         assert_eq!(tail.draws, vec![5, 6]);
         assert!(fold_mask_make_tail(&shape, &mut mask, &mut source).is_err());
-        fold_mask_as_drawn(&mask, &source).unwrap();
+        fold_mask_as_drawn(&shape, &mask, &source).unwrap();
 
         let mut tampered = FoldMask {
             coefficients: mask.coefficients().to_vec(),
@@ -631,7 +640,7 @@ mod tests {
             id: None,
         };
         tampered.coefficients[0] = tampered.coefficients[0].add(&Fp3::ONE);
-        assert!(fold_mask_as_drawn(&tampered, &source).is_err());
+        assert!(fold_mask_as_drawn(&shape, &tampered, &source).is_err());
 
         let mut number = FoldMask {
             coefficients: mask.coefficients().to_vec(),
@@ -640,9 +649,9 @@ mod tests {
             id: None,
         };
         number.draws[1] = 4;
-        assert!(fold_mask_as_drawn(&number, &source).is_err());
+        assert!(fold_mask_as_drawn(&shape, &number, &source).is_err());
         number.draws[1] = NO_DRAW;
-        assert!(fold_mask_as_drawn(&number, &source).is_err());
+        assert!(fold_mask_as_drawn(&shape, &number, &source).is_err());
 
         let mut tail_value = FoldMask {
             coefficients: mask.coefficients().to_vec(),
@@ -652,7 +661,7 @@ mod tests {
         };
         tail_value.tail.as_mut().unwrap().values[0] =
             tail_value.tail.as_ref().unwrap().values[0].add(&Fp3::ONE);
-        assert!(fold_mask_as_drawn(&tail_value, &source).is_err());
+        assert!(fold_mask_as_drawn(&shape, &tail_value, &source).is_err());
 
         let mut tail_number = FoldMask {
             coefficients: mask.coefficients().to_vec(),
@@ -661,7 +670,7 @@ mod tests {
             id: None,
         };
         tail_number.tail.as_mut().unwrap().draws[1] = NO_DRAW;
-        assert!(fold_mask_as_drawn(&tail_number, &source).is_err());
+        assert!(fold_mask_as_drawn(&shape, &tail_number, &source).is_err());
 
         let no_tail = FoldMask {
             coefficients: mask.coefficients().to_vec(),
@@ -669,7 +678,19 @@ mod tests {
             tail: None,
             id: None,
         };
-        assert!(fold_mask_as_drawn(&no_tail, &source).is_err());
+        assert!(fold_mask_as_drawn(&shape, &no_tail, &source).is_err());
+
+        // A mask made for another shape fails the same check.
+        let mut other_shape = shape;
+        other_shape.k = 1;
+        let mut other_mask = fold_mask_make(&other_shape, &mut source).unwrap();
+        fold_mask_make_tail(&other_shape, &mut other_mask, &mut source).unwrap();
+        assert!(fold_mask_as_drawn(&shape, &other_mask, &source).is_err());
+        let mut taller = shape;
+        taller.mask_code = build_code_plan(3, 5, 2).unwrap();
+        let mut tall_mask = fold_mask_make(&taller, &mut source).unwrap();
+        fold_mask_make_tail(&taller, &mut tall_mask, &mut source).unwrap();
+        assert!(fold_mask_as_drawn(&shape, &tall_mask, &source).is_err());
     }
 
     #[test]
