@@ -650,6 +650,7 @@ impl BatStatement {
             h: out.h,
             mask_leaf_class: 0,
         };
+        validate_fold_mask_shape(&fixture_shape)?;
         if out.fault(&fixture_shape).is_some() {
             return Err(Error::InvalidConfig);
         }
@@ -1461,8 +1462,12 @@ mod tests {
         let mut st = BatStatement::new();
         st.add_oracle(shape(0, 2, 1, 1)).unwrap();
         st.add_oracle(shape(1, 2, 1, 1)).unwrap();
-        st.sample(0, vec![sample_row(101)]).unwrap();
-        st.sample(1, vec![sample_row(111)]).unwrap();
+        let mut sample_first = sample_row(101);
+        sample_first.add_unit(0, BatPart::Main, 0, Fp3::from_u64(7));
+        let mut sample_second = sample_row(111);
+        sample_second.add_unit(1, BatPart::Main, 0, Fp3::from_u64(8));
+        st.sample(0, vec![sample_first]).unwrap();
+        st.sample(1, vec![sample_second]).unwrap();
         let group = st.new_group(code(), mask_code()).unwrap();
         st.join(group, 1, false).unwrap();
         st.join(group, 0, false).unwrap();
@@ -1481,8 +1486,13 @@ mod tests {
         assert_eq!(input.layout.members[1].main_first, Some(2));
         let x = Fp3::from_u64(9);
         let row = combine(&st, &input.layout, &input.rows, x).unwrap();
-        assert_eq!(row.main[9], Fp3::from_u64(3));
-        assert_eq!(row.main[11], x.mul(&Fp3::from_u64(4)));
+        let mut expected_main = vec![Fp3::ZERO; 32];
+        expected_main[9] = Fp3::from_u64(3);
+        expected_main[11] = x.mul(&Fp3::from_u64(4));
+        expected_main[0] = x.mul(&x).mul(&Fp3::from_u64(7));
+        expected_main[2] = x.mul(&x).mul(&x).mul(&Fp3::from_u64(8));
+        assert_eq!(row.main, expected_main);
+        assert!(row.mask.iter().all(|value| *value == Fp3::ZERO));
         assert_eq!(
             row.target,
             Fp3::from_u64(5)
