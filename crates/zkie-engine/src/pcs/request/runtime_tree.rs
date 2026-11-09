@@ -16,14 +16,15 @@
 //! see whether the private salts are random. The root is a tree root, not a
 //! value that a session has authenticated; the session/group wiring is open.
 //!
-//! The leaf hash input is the repository's frozen convention: a `u64` column
-//! width, a `u64` salt length, every symbol in canonical little-endian form,
-//! then `CanonicalWriter::put_bytes(salt)`, which writes the salt length
+//! The leaf hash input is the current isolated candidate format: a `u64`
+//! column width, a `u64` salt length, every symbol in canonical little-endian
+//! form, then `CanonicalWriter::put_bytes(salt)`, which writes the salt length
 //! **again** followed by the salt bytes. The tag is the runtime leaf domain
 //! with the tree number, the index is `2^log_n + x`, and the hash starts from
-//! `run`. The stored `column_leaf` convention has the same shape. The
-//! reference leaf hash has no length fields; this repository makes no
-//! interoperability claim and the global format is not changed.
+//! `run`. The stored `column_leaf` encoding has a similar shape; that alone
+//! does not establish that this runtime form is frozen. The reference leaf
+//! hash has no length fields; this repository makes no interoperability claim
+//! and the global format is not changed.
 
 use serde::{Deserialize, Serialize};
 use zkie_core::common::field::PrimeCharacteristicRing;
@@ -1761,7 +1762,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_leaf_hash_input_is_the_frozen_format() {
+    fn runtime_leaf_hash_input_is_the_current_candidate_format() {
         use crate::primitives::transcript::{hash_labeled, tag_word, LEAF_MAIN};
         let plan = RuntimeTreePlan {
             tree_number: 5,
