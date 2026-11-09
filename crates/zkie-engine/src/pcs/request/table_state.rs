@@ -13,7 +13,7 @@
 use zkie_core::error::{Error, Result};
 
 use crate::pcs::request::code::CodeParams;
-use crate::pcs::request::table::{IndexReader, IndexShape, TableDistances};
+use crate::pcs::request::table::{validate_index_shape, IndexReader, IndexShape, TableDistances};
 
 /// The complete candidate setting whose equality is required when a read says
 /// that the table already passed its one-time test. The fields mirror the
@@ -150,7 +150,10 @@ impl TableRead {
     }
 }
 
-/// Compare a candidate read with the plan's priced table and the run setting.
+/// Compare a candidate read with an independent trusted run shape, the plan's
+/// priced table and the run setting. The run shape's code/v/answers/salt are
+/// checked against the reader separately; distances are checked separately and
+/// salt is deliberately not part of `PricedTable`.
 ///
 /// ONE_TIME requires an untested standing. LATER requires a tested fixture and
 /// full setting equality. LINK leaves the two-sided standing choice to the
@@ -158,13 +161,25 @@ impl TableRead {
 /// setting equality, while an UnderTest side has no tested evidence.
 pub fn check_table_read(
     read: &TableRead,
+    run_shape: &IndexShape,
     priced: &PricedTable,
     setting: &TableSetting,
 ) -> Result<()> {
     if read.reader.fault().is_some() {
         return Err(Error::InvalidConfig);
     }
-    if priced_table(&read.reader.shape, priced.test) != *priced {
+    validate_index_shape(run_shape)?;
+    if read.reader.shape.code != run_shape.code
+        || read.reader.shape.v != run_shape.v
+        || read.reader.shape.answers != run_shape.answers
+        || read.reader.shape.salt_bytes != run_shape.salt_bytes
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    if read.reader.shape.distances != run_shape.distances {
+        return Err(Error::StatementMismatch);
+    }
+    if priced_table(run_shape, priced.test) != *priced {
         return Err(Error::StatementMismatch);
     }
     match priced.test {
@@ -255,6 +270,10 @@ mod tests {
         priced_table(&reader().shape, test)
     }
 
+    fn run_shape() -> IndexShape {
+        reader().shape
+    }
+
     #[test]
     fn priced_table_binds_all_shape_fields_and_test() {
         let base = priced_for(TableTest::OneTime);
@@ -286,15 +305,15 @@ mod tests {
             set.clone(),
         ));
 
-        assert!(check_table_read(&untested, &priced_for(TableTest::OneTime), &set).is_ok());
-        assert!(check_table_read(&tested, &priced_for(TableTest::OneTime), &set).is_err());
-        assert!(check_table_read(&untested, &priced_for(TableTest::Later), &set).is_err());
-        assert!(check_table_read(&tested, &priced_for(TableTest::Later), &set).is_ok());
-        assert!(check_table_read(&untested, &priced_for(TableTest::Link), &set).is_ok());
-        assert!(check_table_read(&tested, &priced_for(TableTest::Link), &set).is_ok());
+        assert!(check_table_read(&untested, &run_shape(), &priced_for(TableTest::OneTime), &set).is_ok());
+        assert!(check_table_read(&tested, &run_shape(), &priced_for(TableTest::OneTime), &set).is_err());
+        assert!(check_table_read(&untested, &run_shape(), &priced_for(TableTest::Later), &set).is_err());
+        assert!(check_table_read(&tested, &run_shape(), &priced_for(TableTest::Later), &set).is_ok());
+        assert!(check_table_read(&untested, &run_shape(), &priced_for(TableTest::Link), &set).is_ok());
+        assert!(check_table_read(&tested, &run_shape(), &priced_for(TableTest::Link), &set).is_ok());
         let mut other = set.clone();
         other.target += 1;
-        assert!(check_table_read(&tested, &priced_for(TableTest::Link), &other).is_err());
+        assert!(check_table_read(&tested, &run_shape(), &priced_for(TableTest::Link), &other).is_err());
     }
 
     #[test]
@@ -306,13 +325,13 @@ mod tests {
         ));
         let mut changed = set.clone();
         changed.target += 1;
-        assert!(check_table_read(&tested, &priced_for(TableTest::Later), &changed).is_err());
+        assert!(check_table_read(&tested, &run_shape(), &priced_for(TableTest::Later), &changed).is_err());
         changed = set.clone();
         changed.samples += 1;
-        assert!(check_table_read(&tested, &priced_for(TableTest::Later), &changed).is_err());
+        assert!(check_table_read(&tested, &run_shape(), &priced_for(TableTest::Later), &changed).is_err());
         changed = set.clone();
         changed.work[2][1] += 1;
-        assert!(check_table_read(&tested, &priced_for(TableTest::Later), &changed).is_err());
+        assert!(check_table_read(&tested, &run_shape(), &priced_for(TableTest::Later), &changed).is_err());
         assert!(set.same_setting(&setting()));
         assert!(!set.same_setting(&changed));
     }
@@ -323,9 +342,20 @@ mod tests {
         let read = TableRead::from_untested(reader());
         let mut priced = priced_for(TableTest::OneTime);
         priced.distances.later_radius += 1;
-        assert!(check_table_read(&read, &priced, &set).is_err());
+        assert!(check_table_read(&read, &run_shape(), &priced, &set).is_err());
         let mut bad_reader = reader();
         bad_reader.shape.code.ell += 1;
-        assert!(check_table_read(&TableRead::from_untested(bad_reader), &priced_for(TableTest::OneTime), &set).is_err());
+        assert!(check_table_read(&TableRead::from_untested(bad_reader), &run_shape(), &priced_for(TableTest::OneTime), &set).is_err());
     }
+    #[test]
+    fn valid_salt_change_in_reader_is_rejected_by_the_run_shape() {
+        let set = setting();
+        let mut reader = reader();
+        reader.shape.salt_bytes = 48;
+        let run = run_shape();
+        assert_eq!(run.salt_bytes, 40);
+        let priced = priced_table(&run, TableTest::OneTime);
+        assert!(check_table_read(&TableRead::from_untested(reader), &run, &priced, &set).is_err());
+    }
+
 }
