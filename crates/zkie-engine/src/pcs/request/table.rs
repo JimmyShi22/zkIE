@@ -19,6 +19,7 @@ use crate::pcs::request::chain::{Chain, KIND_SEED};
 use crate::pcs::request::code::{encode_row_fp, CodeParams};
 use crate::pcs::request::field::{E_DEGREE, Fp, Fp3, FP3_BYTES};
 use crate::pcs::request::params::{LEAF_SALT_MAX_BYTES, LEAF_SALT_MIN_BYTES};
+use crate::pcs::request::read::HidingCharge;
 use crate::primitives::codec::{CanonicalReader, CanonicalWriter};
 use crate::primitives::transcript::{hash_labeled, tag_word, LEAF_STORED_MAIN};
 
@@ -460,8 +461,9 @@ pub struct CommittedTable {
 
 impl CommittedTable {
     /// Open the columns at `positions` (drawn by the chain; the caller keeps
-    /// them sorted and without repeats).
-    pub fn open_columns(&self, positions: &[u64]) -> Result<Vec<ColumnOpening>> {
+    /// them sorted and without repeats). This is the crate-internal primitive;
+    /// a provider outside the charged read path must use the charged wrapper.
+    pub(crate) fn open_columns(&self, positions: &[u64]) -> Result<Vec<ColumnOpening>> {
         if self.reader.fault().is_some() {
             return Err(Error::InvalidConfig);
         }
@@ -491,6 +493,20 @@ impl CommittedTable {
             });
         }
         Ok(openings)
+    }
+
+    /// Open only with a hiding charge for this table. The charge is produced by
+    /// `HidingState::begin_charge`; a charge for another table fails. The open
+    /// count must not exceed the charged columns.
+    pub fn open_columns_charged(
+        &self,
+        charge: &HidingCharge,
+        positions: &[u64],
+    ) -> Result<Vec<ColumnOpening>> {
+        if charge.table() != self.reader.root || positions.len() > charge.columns() {
+            return Err(Error::StatementMismatch);
+        }
+        self.open_columns(positions)
     }
 }
 

@@ -204,6 +204,30 @@ impl ReadLedger {
 /// encoded random tail and opening budgets are not implemented, and an
 /// independent verifier without trusted global state does not claim to verify
 /// the cumulative hidden budget. This is separate from the read ledger.
+/// The token a provider receives after a hiding pre-charge. Its fields are
+/// private and only `HidingState::begin_charge` produces it; provider reads and
+/// charged opens require it. It records the table and the charged column count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HidingCharge {
+    table: Digest,
+    lifecycle: u64,
+    columns: usize,
+}
+
+impl HidingCharge {
+    pub fn table(&self) -> Digest {
+        self.table
+    }
+
+    pub fn lifecycle(&self) -> u64 {
+        self.lifecycle
+    }
+
+    pub fn columns(&self) -> usize {
+        self.columns
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HidingState {
     table: Digest,
@@ -238,7 +262,7 @@ impl HidingState {
         self.used
     }
 
-    pub fn begin(&mut self, table: Digest, lifecycle: u64, columns: usize) -> Result<()> {
+    fn begin(&mut self, table: Digest, lifecycle: u64, columns: usize) -> Result<()> {
         if table != self.table || lifecycle != self.lifecycle {
             return Err(Error::StatementMismatch);
         }
@@ -249,6 +273,23 @@ impl HidingState {
         }
         self.used = used;
         Ok(())
+    }
+
+    /// Charge the table-life hiding capacity and return the token that the
+    /// charged read/open path requires. The charge is an in-memory update, not
+    /// a durable pre-charge; the durable provider ledger is still open.
+    pub fn begin_charge(
+        &mut self,
+        table: Digest,
+        lifecycle: u64,
+        columns: usize,
+    ) -> Result<HidingCharge> {
+        self.begin(table, lifecycle, columns)?;
+        Ok(HidingCharge {
+            table,
+            lifecycle,
+            columns,
+        })
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -419,9 +460,13 @@ impl ProverReads {
 
     pub fn open(
         &mut self,
+        charge: &HidingCharge,
         table: &CommittedTable,
         positions: &[u64],
     ) -> Result<Vec<ColumnOpening>> {
+        if charge.table() != table.reader.root || positions.len() > charge.columns() {
+            return Err(Error::StatementMismatch);
+        }
         self.budget.charge(positions.len())?;
         let mut openings = Vec::new();
         openings
@@ -433,7 +478,7 @@ impl ProverReads {
                 openings.push(known.clone());
                 continue;
             }
-            let mut fresh = table.open_columns(std::slice::from_ref(position))?;
+            let mut fresh = table.open_columns_charged(charge, std::slice::from_ref(position))?;
             let opening = fresh.pop().ok_or(Error::InvalidProof)?;
             self.openings.insert(key, opening.clone());
             openings.push(opening);
@@ -559,15 +604,22 @@ mod tests {
     fn prover_reads_cache_and_bound_the_budget() {
         let table = committed();
         let positions = [1u64, 4];
+        let root = table.reader.root;
+        let mut state = HidingState::new(root, 1, 8);
+        let charge = state.begin_charge(root, 1, 8).unwrap();
         let mut reads = ProverReads::new(4);
-        let first = reads.open(&table, &positions).unwrap();
-        let repeated = reads.open(&table, &positions).unwrap();
+        let first = reads.open(&charge, &table, &positions).unwrap();
+        let repeated = reads.open(&charge, &table, &positions).unwrap();
         assert_eq!(first, repeated);
         assert_eq!(reads.budget().used(), 4);
-        assert!(reads.open(&table, &[6]).is_err());
+        assert!(reads.open(&charge, &table, &[6]).is_err());
         let mut reads = ProverReads::new(3);
-        assert!(reads.open(&table, &positions).is_ok());
-        assert!(reads.open(&table, &[6, 7]).is_err());
+        assert!(reads.open(&charge, &table, &positions).is_ok());
+        assert!(reads.open(&charge, &table, &[6, 7]).is_err());
+        let other = Digest([8; 32]);
+        let mut other_state = HidingState::new(other, 1, 8);
+        let other_charge = other_state.begin_charge(other, 1, 8).unwrap();
+        assert!(reads.open(&other_charge, &table, &positions).is_err());
     }
 
     #[test]
@@ -626,22 +678,22 @@ mod tests {
     fn hiding_state_charges_before_send_and_never_refunds() {
         let table = Digest([7; 32]);
         let mut state = HidingState::new(table, 1, 3);
-        state.begin(table, 1, 2).unwrap();
+        state.begin_charge(table, 1, 2).unwrap();
         assert_eq!(state.used(), 2);
-        assert!(state.begin(table, 1, 2).is_err());
-        state.begin(table, 1, 1).unwrap();
+        assert!(state.begin_charge(table, 1, 2).is_err());
+        state.begin_charge(table, 1, 1).unwrap();
         assert_eq!(state.used(), 3);
-        state.begin(table, 1, 0).unwrap();
-        assert!(state.begin(table, 1, 1).is_err());
-        assert!(state.begin(Digest([8; 32]), 1, 1).is_err());
-        assert!(state.begin(table, 2, 1).is_err());
+        state.begin_charge(table, 1, 0).unwrap();
+        assert!(state.begin_charge(table, 1, 1).is_err());
+        assert!(state.begin_charge(Digest([8; 32]), 1, 1).is_err());
+        assert!(state.begin_charge(table, 2, 1).is_err());
     }
 
     #[test]
     fn hiding_state_saves_and_loads_atomically() {
         let table = Digest([7; 32]);
         let mut state = HidingState::new(table, 3, 4);
-        state.begin(table, 3, 2).unwrap();
+        state.begin_charge(table, 3, 2).unwrap();
         let path = std::env::temp_dir().join(format!(
             "zkie-hiding-state-{}-{}.bin",
             std::process::id(),
@@ -650,8 +702,8 @@ mod tests {
         state.save(&path).unwrap();
         let mut loaded = HidingState::load(&path).unwrap();
         assert_eq!(loaded, state);
-        loaded.begin(table, 3, 2).unwrap();
-        assert!(loaded.begin(table, 3, 2).is_err());
+        loaded.begin_charge(table, 3, 2).unwrap();
+        assert!(loaded.begin_charge(table, 3, 2).is_err());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -663,7 +715,7 @@ mod tests {
         for _ in 0..2 {
             let shared = Arc::clone(&shared);
             handles.push(std::thread::spawn(move || {
-                shared.lock().unwrap().begin(table, 1, 2).is_ok()
+                shared.lock().unwrap().begin_charge(table, 1, 2).is_ok()
             }));
         }
         let successes = handles

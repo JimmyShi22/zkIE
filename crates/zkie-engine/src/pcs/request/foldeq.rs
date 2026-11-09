@@ -17,12 +17,12 @@ use crate::pcs::request::chain::{
     Chain, KIND_ALGEBRAIC, KIND_EPSILON, KIND_POSITIONS, KIND_SEAL,
 };
 use crate::pcs::request::field::{Fp, Fp3};
-use crate::pcs::request::runtime_tree::{verify_mask_columns, MaskColumnOpening};
+use crate::pcs::request::runtime_tree::MaskColumnOpening;
 use crate::pcs::request::fold::{
     fold_mask_shape_fault, fold_start_verify, FoldShape, FoldStartMessage, RuntimeOracles,
     VerifiedStatement,
 };
-use crate::pcs::request::read::{draw_positions, HidingState, ReadLedger, VerifierReads};
+use crate::pcs::request::read::{draw_positions, HidingCharge, HidingState, ReadLedger, VerifierReads};
 use crate::pcs::request::table::{
     record_seeds, ColumnOpening, IndexName, IndexReader, SampleSeed,
 };
@@ -115,16 +115,20 @@ impl ProverFoldeq {
         })
     }
 
-    /// Durable pre-charge before G_u and any column exposure. A second call
-    /// fails; an over-budget charge fails before any send.
-    pub fn begin(&mut self) -> Result<()> {
+    /// Charge the provider hiding state before G_u and any column exposure.
+    /// This is an in-memory update, not a durable pre-charge; the durable
+    /// provider ledger (IndexHolder-like) is still open. A second call fails;
+    /// an over-budget charge fails before any send. The returned token is
+    /// required by the charged column-open path.
+    pub fn begin(&mut self) -> Result<HidingCharge> {
         if self.charged {
             return Err(Error::InvalidSessionState);
         }
-        self.hiding
-            .begin(self.table, self.lifecycle, self.columns)?;
+        let charge = self
+            .hiding
+            .begin_charge(self.table, self.lifecycle, self.columns)?;
         self.charged = true;
-        Ok(())
+        Ok(charge)
     }
 
     /// Return the G_u message only after the hiding pre-charge.
@@ -160,8 +164,14 @@ fn lin_gamma(psi: &[Fp3], k_lo: u32, columns: u32) -> Result<Vec<Fp3>> {
 /// caller, and the first query binds these numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GammaPath {
-    Lin { k_lo: u32, k_col: u32 },
-    Direct { columns: u32 },
+    Lin {
+        k_lo: u32,
+        k_col: u32,
+        lin_shape: Digest,
+    },
+    Direct {
+        columns: u32,
+    },
 }
 
 /// The verifier's FOLDEQ plan. The reader is the committed table, the fold and
@@ -252,7 +262,10 @@ impl FoldeqPlan {
             return Some("the seed budget is below the answer count");
         }
         match self.gamma_path {
-            GammaPath::Lin { k_lo, k_col } => {
+            GammaPath::Lin { k_lo, k_col, lin_shape } => {
+                if lin_shape == Digest::ZERO {
+                    return Some("the LIN challenge path has no caller shape binding");
+                }
                 if k_lo > 30 || k_col > 60 {
                     return Some("the LIN challenge path has too many coordinates");
                 }
@@ -331,10 +344,15 @@ impl FoldeqPlan {
             writer.put_u64(*position);
         }
         match self.gamma_path {
-            GammaPath::Lin { k_lo, k_col } => {
+            GammaPath::Lin {
+                k_lo,
+                k_col,
+                lin_shape,
+            } => {
                 writer.put_u64(1);
                 writer.put_u64(k_lo as u64);
                 writer.put_u64(k_col as u64);
+                writer.put_digest(&lin_shape);
             }
             GammaPath::Direct { columns } => {
                 writer.put_u64(2);
@@ -465,7 +483,7 @@ impl FoldeqSession {
             return Err(Error::InvalidSessionState);
         }
         let gamma = match self.plan.gamma_path {
-            GammaPath::Lin { k_lo, k_col } => {
+            GammaPath::Lin { k_lo, k_col, .. } => {
                 let psi = self.draw_challenge(k_col as usize)?;
                 lin_gamma(&psi, k_lo, self.plan.reader.shape.v)?
             }
@@ -606,7 +624,19 @@ impl FoldeqSession {
             .statement
             .mask_tree(self.plan.mask_tree_number)
             .ok_or(Error::StatementMismatch)?;
-        verify_mask_columns(tree, &message.root, &self.plan.mask_positions, openings)?;
+        let mut oracles = self
+            .plan
+            .oracles
+            .lock()
+            .map_err(|_| Error::InvalidSessionState)?;
+        oracles.authenticate_mask(
+            tree,
+            message.id,
+            &self.plan.mask_positions,
+            &self.plan.mask_positions,
+            openings,
+        )?;
+        drop(oracles);
         self.stage = Stage::MaskOpened;
         Ok(())
     }
@@ -617,7 +647,7 @@ mod tests {
     use super::*;
     use crate::pcs::request::code::build_code_plan;
     use crate::pcs::request::field::{Fp, MODULUS};
-    use crate::pcs::request::runtime_tree::{verify_mask_columns, MaskColumnOpening};
+    use crate::pcs::request::runtime_tree::MaskColumnOpening;
 use crate::pcs::request::fold::{
         fold_mask_make, fold_mask_make_tail, fold_mask_notice, fold_start_prove, MaskOracle,
         OracleMetadata, RuntimeOracle, RuntimeOracles, VerifiedGroup, VerifiedGroups,
@@ -625,7 +655,7 @@ use crate::pcs::request::fold::{
     };
     use crate::pcs::request::params::{LEAF_SALT_MIN_BYTES, REQUEST_CHAIN_LABEL};
     use crate::pcs::request::read::{HidingState, ProverReads};
-    use crate::pcs::request::runtime_tree::MaskTreePlan;
+    use crate::pcs::request::runtime_tree::{verify_mask_columns, MaskTreePlan};
         use crate::pcs::request::table::{commit_table, IndexShape, TableDistances};
     use crate::primitives::transcript::{hash_labeled, tag_word, TEST_COINS};
     use zkie_core::common::field::PrimeCharacteristicRing;
@@ -733,7 +763,7 @@ use crate::pcs::request::fold::{
             ledger: Arc::new(Mutex::new(ReadLedger::new(2))),
             column_draws: 2,
             mask_positions: vec![1, 4],
-            gamma_path: GammaPath::Lin { k_lo: 1, k_col: 3 },
+            gamma_path: GammaPath::Lin { k_lo: 1, k_col: 3, lin_shape: Digest([3; 32]) },
         };
         (plan, table)
     }
@@ -845,7 +875,7 @@ use crate::pcs::request::fold::{
         // The same statement with a replaced LIN offset is a different plan
         // binding and cannot be bound to the first query.
         let mut offset = plan;
-        offset.gamma_path = GammaPath::Lin { k_lo: 0, k_col: 2 };
+        offset.gamma_path = GammaPath::Lin { k_lo: 0, k_col: 2, lin_shape: Digest([3; 32]) };
         assert_ne!(first, draw(offset.clone()));
         let binder = FoldeqBinder::new(
             REQUEST_CHAIN_LABEL,
@@ -891,7 +921,7 @@ use crate::pcs::request::fold::{
         let mut gu_prover =
             ProverFoldeq::new(prover_hiding, &table.reader, 1, plan.column_draws).unwrap();
         assert!(gu_prover.send_gu(&Digest([4; 32])).is_err());
-        gu_prover.begin().unwrap();
+        let charge = gu_prover.begin().unwrap();
         let gu = gu_prover.send_gu(&Digest([4; 32])).unwrap();
         session.send_gu(&gu.root).unwrap();
         assert_eq!(session.gu_root(), Some(&gu.root));
@@ -899,7 +929,7 @@ use crate::pcs::request::fold::{
         session.draw_queries().unwrap();
         assert_eq!(session.queries().len(), plan.column_draws);
         let mut prover = ProverReads::new(plan.ledger.lock().unwrap().max_reads());
-        let openings = prover.open(&table, session.queries()).unwrap();
+        let openings = prover.open(&charge, &table, session.queries()).unwrap();
         let columns = session.read_queries(&openings).unwrap();
         assert_eq!(columns.len(), plan.column_draws);
         // A second read charges past the plan's budget.
@@ -919,22 +949,50 @@ use crate::pcs::request::fold::{
                     9,
                     &start.message.notice,
                     start.message.root,
-                    &plan.mask_positions,
-                    &mask_openings,
                 )
                 .unwrap();
-            // A forged root cannot be registered through the SEND path even
-            // when the same forged root is put in a start message.
+            // Registration of a forged root is only a claim; the later
+            // opening phase must reject it.
             let mut forged_registry = RuntimeOracles::default();
-            assert!(forged_registry
+            forged_registry
                 .receive_mask(
                     &plan.statement,
                     tree,
                     9,
                     &start.message.notice,
                     Digest([5; 32]),
+                )
+                .unwrap();
+            assert!(forged_registry
+                .authenticate_mask(
+                    tree,
+                    9,
+                    &plan.mask_positions,
                     &plan.mask_positions,
                     &mask_openings,
+                )
+                .is_err());
+            // Empty or caller-chosen positions are not the verifier's list.
+            let mut empty_registry = RuntimeOracles::default();
+            empty_registry
+                .receive_mask(
+                    &plan.statement,
+                    tree,
+                    9,
+                    &start.message.notice,
+                    start.message.root,
+                )
+                .unwrap();
+            assert!(empty_registry
+                .authenticate_mask(tree, 9, &plan.mask_positions, &[], &[])
+                .is_err());
+            assert!(empty_registry
+                .authenticate_mask(
+                    tree,
+                    9,
+                    &plan.mask_positions,
+                    &[1u64],
+                    &mask_openings[..1],
                 )
                 .is_err());
         }
@@ -977,7 +1035,7 @@ use crate::pcs::request::fold::{
         let state = HidingState::new(table.reader.root, 1, 8);
         let mut prover = ProverFoldeq::new(state, &table.reader, 1, plan.column_draws).unwrap();
         assert!(prover.send_gu(&Digest([4; 32])).is_err());
-        prover.begin().unwrap();
+        let _charge = prover.begin().unwrap();
         assert!(prover.begin().is_err());
         assert_eq!(prover.used(), plan.column_draws as u64);
     }
@@ -1015,7 +1073,7 @@ use crate::pcs::request::fold::{
         assert!(FoldeqSession::open(bad, binder.clone(), chain.clone()).is_err());
 
         let mut bad = plan.clone();
-        bad.gamma_path = GammaPath::Lin { k_lo: 0, k_col: 1 };
+        bad.gamma_path = GammaPath::Lin { k_lo: 0, k_col: 1, lin_shape: Digest([3; 32]) };
         assert!(FoldeqSession::open(bad, binder.clone(), chain.clone()).is_err());
 
         let mut bad = plan;

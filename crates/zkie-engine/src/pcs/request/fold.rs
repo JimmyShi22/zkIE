@@ -630,6 +630,7 @@ pub struct RuntimeOracle {
     pub id: u64,
     pub root: Digest,
     pub sampled: bool,
+    pub authenticated: bool,
     pub main_rows: u64,
     pub mask_rows: u64,
     pub mask_code: CodeParams,
@@ -637,21 +638,26 @@ pub struct RuntimeOracle {
     pub leaf_class: u32,
 }
 
-/// The verifier's SEND registry. Entries are private; the only public way to
-/// add one is `receive_mask`, which checks the static metadata and tree layout
-/// and authenticates the root by verifying the mask openings at the plan's
-/// allowed positions. A caller cannot inject an arbitrary root.
+/// The verifier's SEND registry. Entries are private. `receive_mask` is the
+/// registration phase: it binds a claimed root to the static metadata and tree
+/// but does not authenticate it. `authenticate_mask` is the later phase that
+/// verifies the root's openings at the verifier's allowed positions. A forged
+/// root can be registered and must fail the opening phase; a directly built
+/// registry is a test-only/trusted input.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeOracles {
     entries: Vec<RuntimeOracle>,
 }
 
 impl RuntimeOracles {
-    /// Receive the mask SEND: check the notice against the frozen statement's
-    /// oracle metadata and runtime tree, verify the root's openings at the
-    /// allowed positions, and record the complete sent metadata once. This is
-    /// the verifier's SEND authentication; a forged root without valid
-    /// openings is rejected here.
+    /// Registration phase of SEND: check the mask notice against the frozen
+    /// statement's oracle metadata and the trusted runtime tree, and record
+    /// the claimed root with the complete sent metadata. This binds the root
+    /// to the plan; it does NOT authenticate the root, does not take
+    /// positions, and does not verify openings. The later verifier phase draws
+    /// or fixes positions and authenticates the opening/relations; until then
+    /// the root is only a claim. A forged root can be registered here and must
+    /// fail the later opening phase.
     pub fn receive_mask(
         &mut self,
         statement: &VerifiedStatement,
@@ -659,8 +665,6 @@ impl RuntimeOracles {
         id: u64,
         notice: &MaskNotice,
         root: Digest,
-        positions: &[u64],
-        openings: &[MaskColumnOpening],
     ) -> Result<()> {
         if self.get(id).is_some() || root == Digest::ZERO {
             return Err(Error::StatementMismatch);
@@ -675,17 +679,47 @@ impl RuntimeOracles {
         {
             return Err(Error::StatementMismatch);
         }
-        verify_mask_columns(tree_plan, &root, positions, openings)?;
         self.entries.push(RuntimeOracle {
             id,
             root,
             sampled: false,
+            authenticated: false,
             main_rows: 0,
             mask_rows: notice.mask_rows,
             mask_code: notice.mask_code,
             answers: notice.answers,
             leaf_class: notice.leaf_class,
         });
+        Ok(())
+    }
+
+    /// Later verifier phase: authenticate the registered mask root by opening
+    /// the runtime tree at the verifier's allowed positions. `expected`
+    /// positions are the plan's list; a caller list that differs, or an empty
+    /// list, is rejected. A second authentication fails. This verifies the
+    /// opening and marks the root; it is not a proximity, table test or
+    /// relation closure.
+    pub fn authenticate_mask(
+        &mut self,
+        tree_plan: &MaskTreePlan,
+        id: u64,
+        expected: &[u64],
+        positions: &[u64],
+        openings: &[MaskColumnOpening],
+    ) -> Result<()> {
+        if expected.is_empty() || positions != expected {
+            return Err(Error::StatementMismatch);
+        }
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|oracle| oracle.id == id)
+            .ok_or(Error::StatementMismatch)?;
+        if entry.authenticated || entry.mask_code.log_n != tree_plan.log_n {
+            return Err(Error::StatementMismatch);
+        }
+        verify_mask_columns(tree_plan, &entry.root, positions, openings)?;
+        entry.authenticated = true;
         Ok(())
     }
 
@@ -1410,6 +1444,7 @@ mod tests {
                 id: 9,
                 root: start.message.root,
                 sampled: false,
+                authenticated: false,
                 main_rows: 0,
                 mask_rows: start.message.notice.mask_rows,
                 mask_code: start.message.notice.mask_code,
@@ -1429,6 +1464,7 @@ mod tests {
                 id: 9,
                 root: start.message.root,
                 sampled: true,
+                authenticated: false,
                 main_rows: 0,
                 mask_rows: start.message.notice.mask_rows,
                 mask_code: start.message.notice.mask_code,
@@ -1449,6 +1485,7 @@ mod tests {
                 id: 9,
                 root: Digest([4; 32]),
                 sampled: false,
+                authenticated: false,
                 main_rows: 0,
                 mask_rows: start.message.notice.mask_rows,
                 mask_code: start.message.notice.mask_code,
