@@ -1090,6 +1090,11 @@ pub struct VerifiedGroup {
     pub members: Vec<u64>,
     /// The fresh mask id the plan fixes for this group, if any.
     pub fresh: Option<u64>,
+    /// The group's base code, when the trusted plan fixes one. A G_u oracle
+    /// can join only a group whose base code and mask code are its own.
+    pub code: Option<CodeParams>,
+    /// The group's mask code; `None` means the group names no mask code.
+    pub mask_code: Option<CodeParams>,
 }
 
 /// The verifier's group registry. It must be built from the verified
@@ -1380,6 +1385,16 @@ impl VerifiedStatement {
                     return Err(Error::InvalidConfig);
                 }
             }
+            if let Some(code) = group.code {
+                if build_code_plan(code.log_n, code.ell, code.r).is_err() {
+                    return Err(Error::InvalidConfig);
+                }
+            }
+            if let Some(code) = group.mask_code {
+                if build_code_plan(code.log_n, code.ell, code.r).is_err() {
+                    return Err(Error::InvalidConfig);
+                }
+            }
         }
         for (index, tree) in mask_trees.iter().enumerate() {
             if tree.fault().is_some()
@@ -1423,6 +1438,18 @@ impl VerifiedStatement {
             }
             writer.put_u64(if group.fresh.is_some() { 1 } else { 0 });
             writer.put_u64(group.fresh.unwrap_or(0));
+            writer.put_u64(if group.code.is_some() { 1 } else { 0 });
+            if let Some(code) = group.code {
+                writer.put_u64(code.log_n as u64);
+                writer.put_u64(code.ell);
+                writer.put_u64(code.r);
+            }
+            writer.put_u64(if group.mask_code.is_some() { 1 } else { 0 });
+            if let Some(code) = group.mask_code {
+                writer.put_u64(code.log_n as u64);
+                writer.put_u64(code.ell);
+                writer.put_u64(code.r);
+            }
         }
         writer.put_u64(mask_trees.len() as u64);
         for tree in &mask_trees {
@@ -1913,6 +1940,8 @@ mod tests {
                 group: 1,
                 members: vec![1, 2],
                 fresh: Some(9),
+                code: None,
+                mask_code: None,
             }],
         };
         let plan = tree_plan(&shape);
@@ -2260,6 +2289,8 @@ mod tests {
                 group: 1,
                 members: vec![1, 2],
                 fresh: None,
+                code: None,
+                mask_code: None,
             }],
         };
         let good = MaskOracle {
@@ -2300,6 +2331,8 @@ mod tests {
                 group: 1,
                 members: vec![9, 1],
                 fresh: None,
+                code: None,
+                mask_code: None,
             }],
         };
         assert!(fold_mask_check(&shape, &good, &member_groups).is_err());
@@ -2309,6 +2342,8 @@ mod tests {
                 group: 1,
                 members: vec![1, 2],
                 fresh: Some(9),
+                code: None,
+                mask_code: None,
             }],
         };
         fold_mask_check(&shape, &good, &fixed).unwrap();
@@ -2325,6 +2360,8 @@ mod tests {
                 group: 1,
                 members: vec![1, 2],
                 fresh: None,
+                code: None,
+                mask_code: None,
             }],
         };
         assert!(fold_mask_check(&shape, &good, &forged_clean).is_ok());
@@ -2334,6 +2371,8 @@ mod tests {
                 group: 1,
                 members: Vec::new(),
                 fresh: None,
+                code: None,
+                mask_code: None,
             }],
         };
         assert!(fold_mask_check(&shape, &good, &empty).is_err());
@@ -2456,6 +2495,8 @@ mod tests {
                 group: 1,
                 members: vec![1, 2],
                 fresh: Some(9),
+                code: None,
+                mask_code: None,
             }],
         };
         let metadata = OracleMetadata {

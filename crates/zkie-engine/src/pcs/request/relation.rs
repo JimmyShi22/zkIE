@@ -2555,6 +2555,8 @@ mod tests {
                         group: 1,
                         members: vec![10],
                         fresh: Some(9),
+                        code: None,
+                        mask_code: None,
                     }],
                 },
                 vec![tree],

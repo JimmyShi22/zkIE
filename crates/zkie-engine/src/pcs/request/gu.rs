@@ -18,6 +18,8 @@ use zkie_core::types::Digest;
 
 use crate::pcs::request::code::{build_code_plan, CodeParams};
 use crate::pcs::request::field::{Fp3, E_DEGREE};
+use crate::pcs::request::fold::VerifiedGroup;
+use crate::pcs::request::relation::GuRelationRow;
 use crate::pcs::request::runtime_tree::RuntimeTreePlan;
 use crate::pcs::request::table::{
     index_fault, tree_shape_fault, IndexRecord, IndexShape, SampleSeed,
@@ -344,6 +346,116 @@ impl GuRegistry {
     }
 }
 
+/// The isolated group membership of a sampled G_u oracle. The trusted group
+/// supplies the base and mask codes; the trusted G_u shape supplies the
+/// oracle, group, tree, part and layout; the registry supplies the received
+/// root. The membership records the dynamic join and rejects a second join,
+/// a static member with the same oracle number, another group/code/layout or
+/// a pending row that names another oracle or group. The statement and layout
+/// sources are trusted fixtures in this isolated layer; this is not a
+/// production statement-authentication claim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuMembership {
+    pub group: u64,
+    pub code: CodeParams,
+    pub mask_code: Option<CodeParams>,
+    pub tree_number: u64,
+    pub part: u32,
+    pub members: Vec<u64>,
+    joined: Option<u64>,
+}
+
+impl GuMembership {
+    /// Open the membership for a trusted group and a registered G_u shape.
+    /// The shape must be the complete registered shape; this only checks the
+    /// static group/code/layout relation, not the statement's origin.
+    pub fn new(group: &VerifiedGroup, shape: &GuShape, registry: &GuRegistry) -> Result<Self> {
+        if shape.fault().is_some() {
+            return Err(Error::InvalidConfig);
+        }
+        let oracle = registry.get(shape.oracle).ok_or(Error::StatementMismatch)?;
+        if oracle.shape != *shape || !oracle.sampled {
+            return Err(Error::StatementMismatch);
+        }
+        if shape.group != group.group {
+            return Err(Error::StatementMismatch);
+        }
+        let code = group.code.ok_or(Error::StatementMismatch)?;
+        if code != shape.u.code || group.mask_code != shape.u.mask_code {
+            return Err(Error::StatementMismatch);
+        }
+        let mut members = group.members.clone();
+        members.sort_unstable();
+        if members.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(Self {
+            group: shape.group,
+            code,
+            mask_code: shape.u.mask_code,
+            tree_number: shape.tree.tree_number,
+            part: shape.part,
+            members,
+            joined: None,
+        })
+    }
+
+    /// Dynamically join the registered G_u oracle. Only one dynamic join is
+    /// allowed; an oracle number that is already a static member is a
+    /// duplicate. The complete shape, group, code, tree and part must agree.
+    pub fn join(&mut self, shape: &GuShape, registry: &GuRegistry) -> Result<()> {
+        if self.joined.is_some() {
+            return Err(Error::InvalidSessionState);
+        }
+        let oracle = registry.get(shape.oracle).ok_or(Error::StatementMismatch)?;
+        if oracle.shape != *shape || !oracle.sampled {
+            return Err(Error::StatementMismatch);
+        }
+        if shape.group != self.group
+            || shape.u.code != self.code
+            || shape.u.mask_code != self.mask_code
+            || shape.tree.tree_number != self.tree_number
+            || shape.part != self.part
+        {
+            return Err(Error::StatementMismatch);
+        }
+        let at = match self.members.binary_search(&shape.oracle) {
+            Ok(_) => return Err(Error::StatementMismatch),
+            Err(index) => index,
+        };
+        self.members.insert(at, shape.oracle);
+        self.joined = Some(shape.oracle);
+        Ok(())
+    }
+
+    /// The joined oracle and its complete shape must still be the registry's
+    /// authority for every later claim.
+    pub fn require(&self, shape: &GuShape, registry: &GuRegistry) -> Result<()> {
+        let oracle = registry.get(shape.oracle).ok_or(Error::StatementMismatch)?;
+        if oracle.shape != *shape || !oracle.sampled || self.joined != Some(shape.oracle) {
+            return Err(Error::StatementMismatch);
+        }
+        if shape.group != self.group
+            || shape.u.code != self.code
+            || shape.u.mask_code != self.mask_code
+            || shape.tree.tree_number != self.tree_number
+            || shape.part != self.part
+            || self.members.binary_search(&shape.oracle).is_err()
+        {
+            return Err(Error::StatementMismatch);
+        }
+        Ok(())
+    }
+
+    /// A pending G_u relation row must belong to the joined oracle and group.
+    pub fn check_row(&self, row: &GuRelationRow) -> Result<()> {
+        if self.joined != Some(row.oracle) || row.group != self.group {
+            return Err(Error::StatementMismatch);
+        }
+        Ok(())
+    }
+}
+
 /// One out-of-domain sample claim on G_u: the prover's answer after the seed
 /// was drawn. The claim's coefficient row is open; this skeleton binds the
 /// registered oracle, the answer number, the seed and the target. The answer
@@ -544,6 +656,7 @@ pub fn encode_column_claims(claims: &[GuColumnClaim]) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::pcs::request::params::LEAF_SALT_MIN_BYTES;
+    use crate::pcs::request::relation::GuRelationKind;
     use crate::pcs::request::runtime_tree::{lay_runtime_trees, RuntimeOracleShape};
     use crate::pcs::request::table::TableDistances;
 
@@ -614,6 +727,57 @@ mod tests {
         let mut registry = GuRegistry::new();
         registry.receive(&shape, &notice()).unwrap();
         (shape, registry)
+    }
+
+    fn trusted_group(shape: &GuShape) -> VerifiedGroup {
+        VerifiedGroup {
+            group: shape.group,
+            members: vec![1, 2],
+            fresh: None,
+            code: Some(shape.u.code),
+            mask_code: shape.u.mask_code,
+        }
+    }
+
+    #[test]
+    fn gu_membership_joins_once_and_checks_the_trusted_group() {
+        let (shape, registry) = registered();
+        let group = trusted_group(&shape);
+        let mut membership = GuMembership::new(&group, &shape, &registry).unwrap();
+        let row = GuRelationRow {
+            oracle: shape.oracle,
+            group: shape.group,
+            kind: GuRelationKind::Record,
+            main: Vec::new(),
+            mask: Vec::new(),
+            target: Fp3::ZERO,
+        };
+        assert!(GuMembership::check_row(&membership, &row).is_err());
+        membership.join(&shape, &registry).unwrap();
+        assert!(GuMembership::check_row(&membership, &row).is_ok());
+        assert!(membership.join(&shape, &registry).is_err());
+        assert!(membership.require(&shape, &registry).is_ok());
+
+        let mut other_group = shape.clone();
+        other_group.group = 2;
+        assert!(membership.require(&other_group, &registry).is_err());
+
+        let mut wrong_code = group.clone();
+        wrong_code.code = Some(build_code_plan(3, 8, 0).unwrap());
+        assert!(GuMembership::new(&wrong_code, &shape, &registry).is_err());
+
+        let mut duplicate = group.clone();
+        duplicate.members = vec![shape.oracle];
+        let mut duplicate_membership = GuMembership::new(&duplicate, &shape, &registry).unwrap();
+        assert!(duplicate_membership.join(&shape, &registry).is_err());
+
+        let mut rebound = shape.clone();
+        rebound.oracle = 10;
+        assert!(GuMembership::new(&group, &rebound, &registry).is_err());
+
+        let mut another_tree = shape.clone();
+        another_tree.tree.tree_number += 1;
+        assert!(GuMembership::new(&group, &another_tree, &registry).is_err());
     }
 
     #[test]

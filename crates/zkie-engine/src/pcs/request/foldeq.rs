@@ -2,11 +2,18 @@
 //!
 //! The verifier's plan holds the committed table, the fold shape, the runtime
 //! mask-tree layout, the group registry and the budgets/counts; every number
-//! comes from the verified statement/plan, not from a proof. The session fixes
-//! the order: the complete first query, the record seeds, the gamma challenge,
-//! the G_u SEND root, the column query round, the column reads and the FOLD
-//! start message. The G_u table/OOD relations, the FOLD round polynomials and
-//! the table test are not in this skeleton and no closure is claimed.
+//! comes from the verified statement/plan, not from a proof. With a G_u shape
+//! the session orders the complete first query, the record seeds, the gamma
+//! challenge, the received G_u root, the shared seed set drawn from that
+//! session chain, the answer round (closed before any later challenge), the
+//! group join and record rows, the column draws, the column rows and the FOLD
+//! start; without one it keeps the existing path. The group join uses the
+//! trusted statement group's codes and the registered G_u shape. Column rows
+//! come either from the reads verified against the trusted reader root or from
+//! an explicit, unauthenticated fixture; both stay pending. The statement and
+//! runtime layout origins are trusted fixtures in this isolated layer, the
+//! proof-byte answer decoder is not connected, and no production
+//! statement-authentication, relation or FOLD closure is claimed.
 
 use std::sync::{Arc, Mutex};
 
@@ -14,13 +21,12 @@ use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
 
 use crate::pcs::request::chain::{
-    Chain, KIND_ALGEBRAIC, KIND_EPSILON, KIND_POSITIONS, KIND_SEAL,
+    Chain, KIND_ALGEBRAIC, KIND_EPSILON, KIND_EMPTY, KIND_POSITIONS, KIND_SEAL, KIND_SEED,
 };
 use crate::pcs::request::field::{Fp, Fp3};
-use crate::pcs::request::gu::{GuNotice, GuRegistry, GuShape};
+use crate::pcs::request::gu::{GuMembership, GuNotice, GuRegistry, GuShape};
 use crate::pcs::request::relation::{
-    column_plan_rows, foldeq_weights, record_row, sample_row, validate_shared_sample_seeds,
-    GuRelationRow,
+    column_plan_rows, foldeq_weights, record_row, sample_row, GuRelationRow,
 };
 use crate::pcs::request::runtime_tree::RuntimeTreeOpening;
 use crate::pcs::request::fold::{
@@ -441,7 +447,10 @@ pub struct FoldeqSession {
     mask_queries: Vec<u64>,
     gu_registry: GuRegistry,
     gu_seeds: Vec<SampleSeed>,
+    gu_answers: Vec<Fp3>,
     gu_answered: usize,
+    gu_membership: Option<GuMembership>,
+    gu_read_columns: Option<Vec<Vec<Fp>>>,
     gu_columns_joined: bool,
     gu_rows: Vec<GuRelationRow>,
 }
@@ -475,7 +484,10 @@ impl FoldeqSession {
             mask_queries: Vec::new(),
             gu_registry: GuRegistry::new(),
             gu_seeds: Vec::new(),
+            gu_answers: Vec::new(),
             gu_answered: 0,
+            gu_membership: None,
+            gu_read_columns: None,
             gu_columns_joined: false,
             gu_rows: Vec::new(),
         })
@@ -497,8 +509,20 @@ impl FoldeqSession {
         self.gamma.as_deref()
     }
 
+    /// The seed set drawn from the received G_u root's SEND round. It is
+    /// session state, not a proof field.
+    pub fn gu_shared_seeds(&self) -> &[SampleSeed] {
+        &self.gu_seeds
+    }
+
     pub fn gu_root(&self) -> Option<&Digest> {
         self.gu_root.as_ref()
+    }
+
+    /// The current chain value. This is session state for inspection, not a
+    /// proof field and not a public transcript artifact.
+    pub fn transcript_value(&self) -> &Digest {
+        self.chain.value()
     }
 
     pub fn epsilon(&self) -> Option<Fp3> {
@@ -579,7 +603,15 @@ impl FoldeqSession {
             let word = u64::from_le_bytes(chunk.try_into().map_err(|_| Error::InvalidEncoding)?);
             message.push_u64(word);
         }
-        let prefix = message.prefix(KIND_SEAL, 0)?;
+        // With a G_u shape the root opens the seed round: the verifier's
+        // message is the seed set, drawn by `shared_seeds`. Without one the
+        // root keeps the existing seal round.
+        let kind = if self.plan.gu.is_some() {
+            KIND_SEED
+        } else {
+            KIND_SEAL
+        };
+        let prefix = message.prefix(kind, 0)?;
         if !self.chain.step(&prefix, 0)? {
             return Err(Error::InvalidProof);
         }
@@ -599,24 +631,48 @@ impl FoldeqSession {
         Ok(())
     }
 
-    /// The verifier's shared seed set for the plan's G_u (single-oracle
-    /// interface; fixture input here). It is required after the received root
-    /// and before any answer when the plan carries a G_u shape.
-    pub fn shared_seeds(&mut self, seeds: &[SampleSeed]) -> Result<()> {
+    /// Draw the verifier's shared seed set from the session chain after the
+    /// received G_u root. The seed carries the maximum sample-cube dimension
+    /// and G_u's answer count; the caller cannot supply or replace it. This is
+    /// the single-G_u interface; a multi-oracle SEND message is not
+    /// implemented.
+    pub fn shared_seeds(&mut self) -> Result<()> {
         if self.stage != Stage::Gu {
             return Err(Error::InvalidSessionState);
         }
         let gu = self.plan.gu.as_ref().ok_or(Error::InvalidSessionState)?;
-        validate_shared_sample_seeds(&[gu], seeds)?;
-        self.gu_seeds = seeds.to_vec();
+        let bits = gu.sample_bits()? as usize;
+        let answers = gu.u.answers as usize;
+        let mut seeds = Vec::new();
+        seeds
+            .try_reserve_exact(answers)
+            .map_err(|_| Error::ResourceLimit)?;
+        for _ in 0..answers {
+            let mut z = Vec::new();
+            z.try_reserve_exact(bits)
+                .map_err(|_| Error::ResourceLimit)?;
+            for _ in 0..bits {
+                z.push(self.chain.draw_e()?);
+            }
+            let beta = self.chain.draw_e_nonzero()?;
+            seeds.push(SampleSeed { z, beta });
+        }
+        self.gu_seeds = seeds;
+        self.gu_answers.clear();
         self.gu_answered = 0;
         self.stage = Stage::GuAnswers;
         Ok(())
     }
 
-    /// Receive the next sample answer in the fixed single-G_u answer order and
-    /// keep its pending sample row. A value swap is not necessarily visible at
-    /// this interface; the fixed seed and later relation check decide it.
+    /// Receive the next sample answer in the fixed single-G_u answer order.
+    /// The answer is encoded into the answer round with its canonical field
+    /// words; after the last answer the round is closed and its state feeds
+    /// the later column draws. A value swap is not necessarily visible at this
+    /// typed interface; the fixed seed and later relation check decide it.
+    ///
+    /// The interface takes typed field values. A proof-byte decoder with
+    /// truncation/non-canonical checks is not connected here, so that byte
+    /// boundary remains an integration gate and is not claimed as tested.
     pub fn receive_gu_answer(&mut self, target: Fp3) -> Result<()> {
         if self.stage != Stage::GuAnswers {
             return Err(Error::InvalidSessionState);
@@ -633,20 +689,43 @@ impl FoldeqSession {
             target,
         )?;
         self.gu_rows.push(row);
+        self.gu_answers.push(target);
         self.gu_answered += 1;
         if self.gu_answered == gu.u.answers as usize {
+            let mut message = self.chain.message();
+            for answer in &self.gu_answers {
+                message.push_fp3(answer);
+            }
+            let prefix = message.prefix(KIND_EMPTY, 0)?;
+            if !self.chain.step(&prefix, 0)? {
+                return Err(Error::InvalidProof);
+            }
             self.stage = Stage::GuRecord;
         }
         Ok(())
     }
 
-    /// Join the record rows after every sample answer, using the same gamma as
-    /// the row-point weights and the bound index name's record seeds.
+    /// Join the trusted group and the record rows after every sample answer,
+    /// using the same gamma as the row-point weights and the bound index
+    /// name's record seeds. The group join checks the trusted group/code and
+    /// the registered G_u shape, and every pending row must belong to the
+    /// joined oracle and group.
     pub fn join_gu_record(&mut self) -> Result<()> {
         if self.stage != Stage::GuRecord {
             return Err(Error::InvalidSessionState);
         }
         let gu = self.plan.gu.as_ref().ok_or(Error::InvalidSessionState)?.clone();
+        let group = self
+            .plan
+            .statement
+            .groups()
+            .get(gu.group)
+            .ok_or(Error::StatementMismatch)?;
+        let mut membership = GuMembership::new(group, &gu, &self.gu_registry)?;
+        membership.join(&gu, &self.gu_registry)?;
+        for row in &self.gu_rows {
+            membership.check_row(row)?;
+        }
         let gamma = self.gamma.clone().ok_or(Error::InvalidSessionState)?;
         let eq_gamma = foldeq_weights(&gamma, self.plan.reader.shape.v)?;
         let name = index_name(
@@ -659,8 +738,11 @@ impl FoldeqSession {
         if seeds.len() < answers {
             return Err(Error::ShapeMismatch);
         }
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(answers)
+            .map_err(|_| Error::ResourceLimit)?;
         for answer in 0..answers {
-            self.gu_rows.push(record_row(
+            let row = record_row(
                 &gu,
                 &self.gu_registry,
                 &self.plan.reader.record,
@@ -668,24 +750,33 @@ impl FoldeqSession {
                 &seeds[..answers],
                 &eq_gamma,
                 answer as u32,
-            )?);
+            )?;
+            membership.check_row(&row)?;
+            rows.push(row);
         }
+        self.gu_rows.extend(rows);
+        self.gu_membership = Some(membership);
         self.stage = Stage::GuJoined;
         Ok(())
     }
 
-    /// Add the column rows after the draws. The fixture columns are not
-    /// authenticated by a reader opening in this isolated path; the rows stay
-    /// pending. The stage is unchanged so the existing FOLD/mask flow keeps
-    /// its Read stage.
+    /// Add column rows from an explicit fixture column map before any read.
+    /// The fixture is not authenticated by a reader opening and the rows stay
+    /// pending; this path is only for the isolated fixture flow. A caller with
+    /// verified reads must use `join_gu_read_columns` after `read_queries`.
     pub fn join_gu_columns(&mut self, fixture_columns: &[(u64, Vec<Fp3>)]) -> Result<()> {
-        if self.stage != Stage::Queried && self.stage != Stage::Read {
+        if self.stage != Stage::Queried {
             return Err(Error::InvalidSessionState);
         }
         if self.gu_columns_joined {
             return Err(Error::InvalidSessionState);
         }
         let gu = self.plan.gu.as_ref().ok_or(Error::InvalidSessionState)?.clone();
+        let membership = self
+            .gu_membership
+            .as_ref()
+            .ok_or(Error::InvalidSessionState)?;
+        membership.require(&gu, &self.gu_registry)?;
         let gamma = self.gamma.clone().ok_or(Error::InvalidSessionState)?;
         let eq_gamma = foldeq_weights(&gamma, self.plan.reader.shape.v)?;
         let rows = column_plan_rows(
@@ -697,6 +788,80 @@ impl FoldeqSession {
             fixture_columns,
             &eq_gamma,
         )?;
+        for row in &rows {
+            membership.check_row(row)?;
+        }
+        self.gu_rows.extend(rows);
+        self.gu_columns_joined = true;
+        Ok(())
+    }
+
+    /// Add column rows from the columns that `read_queries` verified against
+    /// the trusted reader root for this session's draws. The draw order,
+    /// repeats included, is reused; a unique physical position is opened once
+    /// and its verified column serves every repeat. No caller column map is
+    /// accepted here, so a substituted read cannot become an authenticated
+    /// claim.
+    pub fn join_gu_read_columns(&mut self) -> Result<()> {
+        if self.stage != Stage::Read {
+            return Err(Error::InvalidSessionState);
+        }
+        if self.gu_columns_joined {
+            return Err(Error::InvalidSessionState);
+        }
+        let gu = self.plan.gu.as_ref().ok_or(Error::InvalidSessionState)?.clone();
+        let membership = self
+            .gu_membership
+            .as_ref()
+            .ok_or(Error::InvalidSessionState)?;
+        membership.require(&gu, &self.gu_registry)?;
+        let read_columns = self
+            .gu_read_columns
+            .as_ref()
+            .ok_or(Error::InvalidSessionState)?;
+        if read_columns.len() != self.queries.len() {
+            return Err(Error::ShapeMismatch);
+        }
+        let rows_count = usize::try_from(self.plan.reader.shape.rows())
+            .map_err(|_| Error::ResourceLimit)?;
+        let mut columns = Vec::new();
+        for position in unique_sorted(&self.queries) {
+            let mut column: Option<&Vec<Fp>> = None;
+            for (query, read) in self.queries.iter().zip(read_columns) {
+                if *query == position {
+                    if read.len() != rows_count {
+                        return Err(Error::ShapeMismatch);
+                    }
+                    match column {
+                        Some(previous) if previous != read => {
+                            return Err(Error::StatementMismatch);
+                        }
+                        Some(_) => {}
+                        None => column = Some(read),
+                    }
+                }
+            }
+            let column = column.ok_or(Error::StatementMismatch)?;
+            let values = column
+                .iter()
+                .map(|value| Fp3::from_base(*value))
+                .collect();
+            columns.push((position, values));
+        }
+        let gamma = self.gamma.clone().ok_or(Error::InvalidSessionState)?;
+        let eq_gamma = foldeq_weights(&gamma, self.plan.reader.shape.v)?;
+        let rows = column_plan_rows(
+            &gu,
+            &self.gu_registry,
+            self.plan.column_draws,
+            self.plan.reader.shape.code.log_n,
+            &self.queries,
+            &columns,
+            &eq_gamma,
+        )?;
+        for row in &rows {
+            membership.check_row(row)?;
+        }
         self.gu_rows.extend(rows);
         self.gu_columns_joined = true;
         Ok(())
@@ -736,9 +901,13 @@ impl FoldeqSession {
             reads,
             queries,
             stage,
+            gu_read_columns,
             ..
         } = self;
         let columns = reads.read(&plan.reader, queries, openings)?;
+        if plan.gu.is_some() {
+            *gu_read_columns = Some(columns.clone());
+        }
         *stage = Stage::Read;
         Ok(columns)
     }
@@ -749,6 +918,14 @@ impl FoldeqSession {
     pub fn start_fold(&mut self, message: &FoldStartMessage) -> Result<()> {
         if self.stage != Stage::Read {
             return Err(Error::InvalidSessionState);
+        }
+        if self.plan.gu.is_some() {
+            if self.gu_membership.is_none() {
+                return Err(Error::InvalidSessionState);
+            }
+            if !self.gu_columns_joined {
+                return Err(Error::InvalidSessionState);
+            }
         }
         if message.tree_number != self.plan.mask_tree_number
             || message.claimed_group != self.plan.group_id
@@ -854,7 +1031,7 @@ impl FoldeqSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pcs::request::code::build_code_plan;
+    use crate::pcs::request::code::{build_code_plan, CodeParams};
     use crate::pcs::request::field::{Fp, Fp3, MODULUS};
 use crate::pcs::request::fold::{
         fold_mask_make, fold_mask_make_tail, fold_mask_notice, fold_start_prove, MaskOracle,
@@ -862,9 +1039,9 @@ use crate::pcs::request::fold::{
         VerifiedStatement,
     };
     use crate::pcs::request::params::{LEAF_SALT_MIN_BYTES, REQUEST_CHAIN_LABEL};
-    use crate::pcs::request::gu::{GuOracleShape, GuShape};
+    use crate::pcs::request::gu::{GuNotice, GuOracleShape, GuRegistry, GuShape};
     use crate::pcs::request::read::{unique_sorted, HidingState, ProverReads};
-    use crate::pcs::request::relation::GuRelationKind;
+    use crate::pcs::request::relation::{gu_table, GuRelationKind};
     use crate::pcs::request::runtime_tree::{RuntimeTreePart, RuntimeTreePlan};
     use crate::pcs::request::runtime_tree::{verify_mask_opening, MaskTreePlan};
     use crate::pcs::request::table::{
@@ -971,14 +1148,23 @@ use crate::pcs::request::fold::{
         }
     }
 
-    fn gu_plan_fixture() -> (FoldeqPlan, crate::pcs::request::table::CommittedTable) {
-        let (mut plan, table) = plan_fixture();
-        plan.gu = Some(gu_shape());
+    fn gu_plan_with(
+        group_code: Option<CodeParams>,
+        members: Vec<u64>,
+        oracle: u64,
+    ) -> (FoldeqPlan, crate::pcs::request::table::CommittedTable) {
+        let (mut plan, table) = plan_fixture_with_group(group_code, members);
+        let mut gu = gu_shape();
+        gu.oracle = oracle;
+        plan.gu = Some(gu);
         (plan, table)
     }
 
-    fn open_gu_session() -> (FoldeqSession, crate::pcs::request::table::CommittedTable) {
-        let (plan, table) = gu_plan_fixture();
+    fn gu_plan_fixture() -> (FoldeqPlan, crate::pcs::request::table::CommittedTable) {
+        gu_plan_with(Some(build_code_plan(3, 6, 1).unwrap()), vec![1, 2], 10)
+    }
+
+    fn open_gu_plan_from(plan: FoldeqPlan) -> FoldeqSession {
         let binder = FoldeqBinder::new(REQUEST_CHAIN_LABEL, plan.reader.configuration, &plan).unwrap();
         let chain = binder.chain().unwrap();
         let mut session = FoldeqSession::open(plan, binder, chain).unwrap();
@@ -987,18 +1173,32 @@ use crate::pcs::request::fold::{
             .unwrap();
         session.seeds().unwrap();
         session.draw_gamma().unwrap();
+        session
+    }
+
+    fn open_gu_plan() -> (FoldeqSession, crate::pcs::request::table::CommittedTable) {
+        let (plan, table) = gu_plan_fixture();
+        (open_gu_plan_from(plan), table)
+    }
+
+    fn open_gu_session() -> (FoldeqSession, crate::pcs::request::table::CommittedTable) {
+        let (mut session, table) = open_gu_plan();
         session.send_gu(&Digest([4; 32])).unwrap();
         (session, table)
     }
 
-    fn gu_seed() -> SampleSeed {
-        SampleSeed {
-            z: (0..4).map(|index| Fp3::from_u64(70 + index)).collect(),
-            beta: Fp3::from_u64(80),
-        }
+    fn open_gu_with_root(
+        root: Digest,
+    ) -> (FoldeqSession, crate::pcs::request::table::CommittedTable) {
+        let (mut session, table) = open_gu_plan();
+        session.send_gu(&root).unwrap();
+        (session, table)
     }
 
-    fn plan_fixture() -> (FoldeqPlan, crate::pcs::request::table::CommittedTable) {
+    fn plan_fixture_with_group(
+        group_code: Option<CodeParams>,
+        members: Vec<u64>,
+    ) -> (FoldeqPlan, crate::pcs::request::table::CommittedTable) {
         let table = committed();
         let tree = mask_tree();
         let statement = Arc::new(
@@ -1006,8 +1206,10 @@ use crate::pcs::request::fold::{
                 VerifiedGroups {
                     groups: vec![VerifiedGroup {
                         group: 1,
-                        members: vec![1, 2],
+                        members,
                         fresh: Some(9),
+                        code: group_code,
+                        mask_code: None,
                     }],
                 },
                 vec![tree],
@@ -1038,6 +1240,10 @@ use crate::pcs::request::fold::{
             gu: None,
         };
         (plan, table)
+    }
+
+    fn plan_fixture() -> (FoldeqPlan, crate::pcs::request::table::CommittedTable) {
+        plan_fixture_with_group(Some(build_code_plan(3, 6, 1).unwrap()), vec![1, 2])
     }
 
     fn open_session() -> (FoldeqSession, crate::pcs::request::table::CommittedTable) {
@@ -1473,7 +1679,13 @@ use crate::pcs::request::fold::{
         // The old skip path from the received root directly to draws is rejected.
         assert!(session.draw_queries().is_err());
         assert!(session.receive_gu_answer(Fp3::ONE).is_err());
-        session.shared_seeds(&[gu_seed()]).unwrap();
+        session.shared_seeds().unwrap();
+        assert_eq!(session.gu_shared_seeds().len(), 1);
+        assert_eq!(
+            session.gu_shared_seeds()[0].z.len(),
+            gu_shape().sample_bits().unwrap() as usize
+        );
+        assert!(session.shared_seeds().is_err());
         assert!(session.draw_queries().is_err());
         assert!(session.join_gu_record().is_err());
         session.receive_gu_answer(Fp3::from_u64(7)).unwrap();
@@ -1482,6 +1694,7 @@ use crate::pcs::request::fold::{
         session.join_gu_record().unwrap();
         assert!(session.join_gu_record().is_err());
         assert!(session.join_gu_columns(&[]).is_err());
+        assert_eq!(session.pending_gu_rows().len(), 2);
         session.draw_queries().unwrap();
         let queries = session.queries().to_vec();
         let unique = unique_sorted(&queries);
@@ -1496,7 +1709,14 @@ use crate::pcs::request::fold::{
                 )
             })
             .collect();
-        assert!(session.join_gu_columns(&fixture[..1]).is_err());
+        let mut wrong = fixture.clone();
+        if wrong.len() > 1 {
+            wrong.pop();
+        } else {
+            let other = if wrong[0].0 == 0 { 1 } else { 0 };
+            wrong.push((other, vec![Fp3::ZERO; session.plan().reader.shape.rows() as usize]));
+        }
+        assert!(session.join_gu_columns(&wrong).is_err());
         session.join_gu_columns(&fixture).unwrap();
         assert!(session.join_gu_columns(&fixture).is_err());
         assert!(session.draw_queries().is_err());
@@ -1514,22 +1734,320 @@ use crate::pcs::request::fold::{
         let binder = FoldeqBinder::new(REQUEST_CHAIN_LABEL, plan.reader.configuration, &plan).unwrap();
         let chain = binder.chain().unwrap();
         let mut session = FoldeqSession::open(plan, binder, chain).unwrap();
-        assert!(session.shared_seeds(&[gu_seed()]).is_err());
+        assert!(session.shared_seeds().is_err());
         session
             .bind_first_query(&session.plan().first_query())
             .unwrap();
-        assert!(session.shared_seeds(&[gu_seed()]).is_err());
+        assert!(session.shared_seeds().is_err());
         session.seeds().unwrap();
         session.draw_gamma().unwrap();
         assert!(session.draw_queries().is_err());
         session.send_gu(&Digest([4; 32])).unwrap();
-        session.shared_seeds(&[gu_seed()]).unwrap();
-        assert!(session.shared_seeds(&[gu_seed()]).is_err());
+        session.shared_seeds().unwrap();
+        assert!(session.shared_seeds().is_err());
         assert!(session.join_gu_record().is_err());
         session.receive_gu_answer(Fp3::ONE).unwrap();
         assert!(session.draw_queries().is_err());
+        assert!(session.join_gu_columns(&[]).is_err());
         session.join_gu_record().unwrap();
         assert!(session.join_gu_columns(&[]).is_err());
         assert!(session.read_queries(&[]).is_err());
+    }
+
+    #[test]
+    fn gu_shared_seeds_are_drawn_from_the_received_root() {
+        let (mut first, _) = open_gu_with_root(Digest([4; 32]));
+        let (mut second, _) = open_gu_with_root(Digest([4; 32]));
+        first.shared_seeds().unwrap();
+        second.shared_seeds().unwrap();
+        assert_eq!(first.transcript_value(), second.transcript_value());
+        assert_eq!(first.gu_shared_seeds(), second.gu_shared_seeds());
+
+        let (mut changed, _) = open_gu_with_root(Digest([5; 32]));
+        assert_ne!(first.transcript_value(), changed.transcript_value());
+        changed.shared_seeds().unwrap();
+        assert_ne!(first.gu_shared_seeds(), changed.gu_shared_seeds());
+    }
+
+    #[test]
+    fn gu_answer_round_feeds_the_following_draws() {
+        let (mut first, _) = open_gu_with_root(Digest([4; 32]));
+        first.shared_seeds().unwrap();
+        first.receive_gu_answer(Fp3::ONE).unwrap();
+        first.join_gu_record().unwrap();
+        let first_value = *first.transcript_value();
+        first.draw_queries().unwrap();
+
+        let (mut second, _) = open_gu_with_root(Digest([4; 32]));
+        second.shared_seeds().unwrap();
+        second.receive_gu_answer(Fp3::from_u64(2)).unwrap();
+        second.join_gu_record().unwrap();
+        let second_value = *second.transcript_value();
+        second.draw_queries().unwrap();
+
+        assert_ne!(first_value, second_value);
+        assert_ne!(first.queries(), second.queries());
+    }
+
+    #[test]
+    fn gu_session_joins_the_trusted_group_once() {
+        let (mut session, _) = open_gu_session();
+        session.shared_seeds().unwrap();
+        session.receive_gu_answer(Fp3::ONE).unwrap();
+        session.join_gu_record().unwrap();
+        assert!(session
+            .pending_gu_rows()
+            .iter()
+            .all(|row| row.oracle == 10 && row.group == 1));
+
+        let (wrong_code, _) = gu_plan_with(
+            Some(build_code_plan(3, 8, 0).unwrap()),
+            vec![1, 2],
+            10,
+        );
+        let mut wrong = open_gu_plan_from(wrong_code);
+        wrong.send_gu(&Digest([4; 32])).unwrap();
+        wrong.shared_seeds().unwrap();
+        wrong.receive_gu_answer(Fp3::ONE).unwrap();
+        assert!(wrong.join_gu_record().is_err());
+
+        let (duplicate, _) = gu_plan_with(
+            Some(build_code_plan(3, 6, 1).unwrap()),
+            vec![10],
+            10,
+        );
+        let mut duplicate = open_gu_plan_from(duplicate);
+        duplicate.send_gu(&Digest([4; 32])).unwrap();
+        duplicate.shared_seeds().unwrap();
+        duplicate.receive_gu_answer(Fp3::ONE).unwrap();
+        assert!(duplicate.join_gu_record().is_err());
+    }
+
+    #[test]
+    fn gu_session_requires_joined_columns_before_fold_and_uses_verified_reads() {
+        let (mut session, table) = open_gu_session();
+        session.shared_seeds().unwrap();
+        session.receive_gu_answer(Fp3::ONE).unwrap();
+        session.join_gu_record().unwrap();
+        session.draw_queries().unwrap();
+        let queries = session.queries().to_vec();
+        let unique = unique_sorted(&queries);
+        let openings = table.open_columns(&unique).unwrap();
+        let mut by_position = std::collections::HashMap::new();
+        for opening in &openings {
+            by_position.insert(opening.position, opening.clone());
+        }
+        let ordered: Vec<ColumnOpening> = queries
+            .iter()
+            .map(|position| by_position[position].clone())
+            .collect();
+        let mut tampered = ordered.clone();
+        tampered[0].symbols[0] = tampered[0].symbols[0] + Fp::ONE;
+        assert!(session.read_queries(&tampered).is_err());
+        let columns = session.read_queries(&ordered).unwrap();
+        assert_eq!(columns.len(), queries.len());
+        let fixture: Vec<(u64, Vec<Fp3>)> = unique
+            .iter()
+            .map(|position| {
+                (
+                    *position,
+                    (0..session.plan().reader.shape.rows())
+                        .map(|row| Fp3::from_u64(700 + row + *position))
+                        .collect(),
+                )
+            })
+            .collect();
+        assert!(session.join_gu_columns(&fixture).is_err());
+        let start = mask_start(session.plan());
+        let tree = *session
+            .plan()
+            .statement
+            .mask_tree(session.plan().mask_tree_number)
+            .unwrap();
+        let statement = Arc::clone(&session.plan().statement);
+        session
+            .plan()
+            .oracles
+            .lock()
+            .unwrap()
+            .receive_mask(
+                &statement,
+                &tree,
+                start.message.id,
+                &start.message.notice,
+                start.message.root,
+            )
+            .unwrap();
+        assert!(session.start_fold(&start.message).is_err());
+        session.join_gu_read_columns().unwrap();
+        assert!(session.join_gu_read_columns().is_err());
+        session.start_fold(&start.message).unwrap();
+        assert_eq!(session.pending_gu_rows().len(), 2 + queries.len());
+    }
+
+    #[test]
+    fn gu_session_rows_check_one_independent_witness() {
+        let (mut session, table) = open_gu_session();
+        session.shared_seeds().unwrap();
+        let gu = session.plan().gu.clone().unwrap();
+        let shape = session.plan().reader.shape;
+        let eq_gamma = foldeq_weights(session.gamma().unwrap(), shape.v).unwrap();
+        let rows = shape.rows() as usize;
+        let messages: Vec<Vec<Fp>> = (0..rows)
+            .map(|row| {
+                (0..shape.code.ell)
+                    .map(|index| Fp::from_u64((row * 10 + index as usize + 1) as u64))
+                    .collect()
+            })
+            .collect();
+        let tails: Vec<Vec<Fp>> = (0..rows)
+            .map(|row| {
+                (0..shape.code.r)
+                    .map(|index| Fp::from_u64((row + index as usize + 1) as u64))
+                    .collect()
+            })
+            .collect();
+        let mut folded_message = vec![Fp3::ZERO; shape.code.ell as usize];
+        for (row, weight) in eq_gamma.iter().enumerate() {
+            for (entry, value) in messages[row].iter().enumerate() {
+                folded_message[entry] =
+                    folded_message[entry].add(&weight.mul(&Fp3::from_base(*value)));
+            }
+        }
+        let mut folded_tail = vec![Fp3::ZERO; shape.code.r as usize];
+        for (row, weight) in eq_gamma.iter().enumerate() {
+            for (entry, value) in tails[row].iter().enumerate() {
+                folded_tail[entry] =
+                    folded_tail[entry].add(&weight.mul(&Fp3::from_base(*value)));
+            }
+        }
+        let mut witness = gu_table(&gu, &folded_message, &folded_tail).unwrap();
+        let row_bits = 1u64;
+        let pad_virtual = (gu.u.main_rows - 1)
+            + ((gu.u.code.ell - gu.u.answers as u64) << row_bits);
+        let pad = ((pad_virtual & ((1u64 << row_bits) - 1)) * gu.u.code.ell
+            + (pad_virtual >> row_bits)) as usize;
+        witness.main[pad] = Fp3::from_u64(999);
+
+        let notice = GuNotice {
+            root: *session.gu_root().unwrap(),
+            oracle: gu.oracle,
+            tree_number: gu.tree.tree_number,
+            part: gu.part,
+        };
+        let mut probe_registry = GuRegistry::new();
+        probe_registry.receive(&gu, &notice).unwrap();
+        let seeds = session.gu_shared_seeds().to_vec();
+        let sample_probe =
+            sample_row(&gu, &probe_registry, &seeds, 0, Fp3::ZERO).unwrap();
+        let sample_target = sample_probe.evaluate(&witness).unwrap();
+        session.receive_gu_answer(sample_target).unwrap();
+        session.join_gu_record().unwrap();
+        let rows = session.pending_gu_rows();
+        let sample = rows.iter().find(|row| row.kind == GuRelationKind::Sample).unwrap();
+        let record = rows.iter().find(|row| row.kind == GuRelationKind::Record).unwrap();
+        assert_eq!(sample.evaluate(&witness).unwrap(), sample.target);
+        assert_eq!(record.evaluate(&witness).unwrap(), record.target);
+
+        session.draw_queries().unwrap();
+        let queries = session.queries().to_vec();
+        let unique = unique_sorted(&queries);
+        let openings = table.open_columns(&unique).unwrap();
+        let mut by_position = std::collections::HashMap::new();
+        for opening in &openings {
+            by_position.insert(opening.position, opening.clone());
+        }
+        let ordered: Vec<ColumnOpening> = queries
+            .iter()
+            .map(|position| by_position[position].clone())
+            .collect();
+        session.read_queries(&ordered).unwrap();
+        session.join_gu_read_columns().unwrap();
+        let rows = session.pending_gu_rows();
+        let columns: Vec<_> = rows
+            .iter()
+            .filter(|row| row.kind == GuRelationKind::Column)
+            .collect();
+        assert_eq!(columns.len(), queries.len());
+        for column in columns {
+            assert_eq!(column.evaluate(&witness).unwrap(), column.target);
+        }
+    }
+
+    #[test]
+    fn gu_session_reuses_one_verified_column_for_repeated_draws() {
+        let mut found = None;
+        for answer in 0..64u64 {
+            let (mut plan, table) = gu_plan_fixture();
+            plan.column_draws = 8;
+            plan.ledger = Arc::new(Mutex::new(ReadLedger::new(8)));
+            let mut session = open_gu_plan_from(plan);
+            session.send_gu(&Digest([4; 32])).unwrap();
+            session.shared_seeds().unwrap();
+            session
+                .receive_gu_answer(Fp3::from_u64(answer))
+                .unwrap();
+            session.join_gu_record().unwrap();
+            session.draw_queries().unwrap();
+            if unique_sorted(session.queries()).len() < session.queries().len() {
+                found = Some((session, table));
+                break;
+            }
+        }
+        let (mut session, table) = found.expect("a repeated draw in the searched range");
+        let queries = session.queries().to_vec();
+        let unique = unique_sorted(&queries);
+        let openings = table.open_columns(&unique).unwrap();
+        let mut by_position = std::collections::HashMap::new();
+        for opening in &openings {
+            by_position.insert(opening.position, opening.clone());
+        }
+        let ordered: Vec<ColumnOpening> = queries
+            .iter()
+            .map(|position| by_position[position].clone())
+            .collect();
+        session.read_queries(&ordered).unwrap();
+        session.join_gu_read_columns().unwrap();
+        let rows = session.pending_gu_rows();
+        let columns: Vec<_> = rows
+            .iter()
+            .filter(|row| row.kind == GuRelationKind::Column)
+            .collect();
+        assert_eq!(columns.len(), queries.len());
+        let mut targets = std::collections::HashMap::new();
+        let mut repeats = 0usize;
+        for (position, row) in queries.iter().zip(columns) {
+            match targets.get(position) {
+                Some(target) => {
+                    assert_eq!(*target, row.target);
+                    repeats += 1;
+                }
+                None => {
+                    targets.insert(*position, row.target);
+                }
+            }
+        }
+        assert!(repeats > 0);
+    }
+
+    #[test]
+    fn gu_session_rejects_a_rebound_oracle_tree_or_group() {
+        let (mut session, _) = open_gu_session();
+        session.shared_seeds().unwrap();
+        session.receive_gu_answer(Fp3::ONE).unwrap();
+        session.plan.gu.as_mut().unwrap().oracle = 11;
+        assert!(session.join_gu_record().is_err());
+
+        let (mut session, _) = open_gu_session();
+        session.shared_seeds().unwrap();
+        session.receive_gu_answer(Fp3::ONE).unwrap();
+        session.plan.gu.as_mut().unwrap().tree.tree_number += 1;
+        assert!(session.join_gu_record().is_err());
+
+        let (mut session, _) = open_gu_session();
+        session.shared_seeds().unwrap();
+        session.receive_gu_answer(Fp3::ONE).unwrap();
+        session.plan.gu.as_mut().unwrap().group = 2;
+        assert!(session.join_gu_record().is_err());
     }
 }
