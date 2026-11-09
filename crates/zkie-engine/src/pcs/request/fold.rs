@@ -1,10 +1,18 @@
 //! FOLD hiding masks (foundation only).
 //!
 //! A fresh mask is an oracle message of `2^h` mask rows whose messages are
-//! built from the coefficients of the hiding polynomial U. The coefficients
-//! come from private randomness; the prover records each draw's number and can
-//! compare the coefficients with the values that the source regenerates. No
-//! production provider wires this module yet.
+//! built from the coefficients of the hiding polynomial U. Each mask also has
+//! a random tail with which its rows are encoded; both the coefficients and
+//! the tail are drawn from a numbered source, and the prover's self-check
+//! compares every value with the source's regeneration.
+//!
+//! The deterministic source in this file is a test and replay device: its
+//! values are public and reproducible, it provides no hiding, and it must not
+//! produce a proof. A production prover must draw the coefficients and the
+//! tail from an independent, secret and fresh source (a CSPRNG or a key
+//! derivation) with a per-mask lifecycle: one mask for one fold, never reused,
+//! and its values never derived from public data. That source and lifecycle
+//! are not implemented here, and no production provider wires this module.
 
 use serde::{Deserialize, Serialize};
 use zkie_core::common::field::PrimeCharacteristicRing;
@@ -30,6 +38,9 @@ pub struct FoldShape {
 }
 
 impl FoldShape {
+    /// The number of mask rows. The shape must be validated first
+    /// (`fold_mask_shape_fault` bounds `h`); public entries validate it before
+    /// this shift.
     pub fn mask_rows(&self) -> u64 {
         1u64 << self.h
     }
@@ -109,15 +120,55 @@ pub fn fold_mask_from_coins(k: u32, coins: Vec<Fp3>) -> Result<Vec<Fp3>> {
     Ok(coins)
 }
 
-/// A deterministic coin source for tests and replay. It is an engineering
-/// internal source, not a production randomness source.
+/// The random tail of the mask rows' encodings: `rows * len` values in
+/// row-major order, `(row, column) -> row * len + column`, with the draw
+/// number of each value. The tail is part of the sent mask message, not a
+/// secret kept apart from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaskTail {
+    pub rows: usize,
+    pub len: usize,
+    pub values: Vec<Fp3>,
+    pub draws: Vec<u32>,
+}
+
+impl MaskTail {
+    pub fn new(
+        rows: usize,
+        len: usize,
+        values: Vec<Fp3>,
+        draws: Vec<u32>,
+    ) -> Result<Self> {
+        let entries = rows.checked_mul(len).ok_or(Error::ResourceLimit)?;
+        if rows == 0 || len == 0 || values.len() != entries || draws.len() != entries {
+            return Err(Error::ShapeMismatch);
+        }
+        Ok(Self {
+            rows,
+            len,
+            values,
+            draws,
+        })
+    }
+
+    pub fn at(&self, row: usize, column: usize) -> Result<Fp3> {
+        if row >= self.rows || column >= self.len {
+            return Err(Error::InvalidIndex);
+        }
+        Ok(self.values[row * self.len + column])
+    }
+}
+
+/// A deterministic numbered coin source for tests and replay only. It is
+/// public and reproducible, provides no hiding, and must never produce a
+/// proof; see the module documentation for the production requirement.
 #[derive(Clone, Debug)]
-pub struct DeterministicMaskCoins {
+pub struct TestMaskCoins {
     seed: Digest,
     draw: u32,
 }
 
-impl DeterministicMaskCoins {
+impl TestMaskCoins {
     pub fn new(seed: Digest) -> Self {
         Self { seed, draw: 0 }
     }
@@ -153,12 +204,14 @@ impl DeterministicMaskCoins {
     }
 }
 
-/// The fresh mask of one fold: coefficients, the draws' numbers and, after it
-/// is sent, its oracle id.
+/// The fresh mask of one fold: coefficients, the draws' numbers, the random
+/// tail of the rows' encodings after it is drawn, and, after it is sent, its
+/// oracle id.
 #[derive(Debug, PartialEq, Eq)]
 pub struct FoldMask {
     coefficients: Vec<Fp3>,
     draws: Vec<u32>,
+    tail: Option<MaskTail>,
     id: Option<u64>,
 }
 
@@ -186,13 +239,18 @@ impl FoldMask {
     pub fn draws(&self) -> &[u32] {
         &self.draws
     }
+
+    pub fn tail(&self) -> Option<&MaskTail> {
+        self.tail.as_ref()
+    }
 }
 
 /// Draw the `2k + 1` coefficients from a numbered source and record each
-/// draw's number.
+/// draw's number. The encoding tail is drawn separately by
+/// `fold_mask_make_tail`, as it is when the mask rows are sent.
 pub fn fold_mask_make(
     shape: &FoldShape,
-    coins: &mut DeterministicMaskCoins,
+    coins: &mut TestMaskCoins,
 ) -> Result<FoldMask> {
     validate_fold_mask_shape(shape)?;
     let mut coefficients = Vec::with_capacity(2 * shape.k as usize + 1);
@@ -205,15 +263,47 @@ pub fn fold_mask_make(
     Ok(FoldMask {
         coefficients: fold_mask_from_coins(shape.k, coefficients)?,
         draws,
+        tail: None,
         id: None,
     })
 }
 
-/// The prover's self-check: every coefficient equals the value that the source
-/// regenerates from its recorded draw number. All coefficients are compared.
+/// Draw the random tail of the mask rows' encodings: `2^h` rows of the mask
+/// code's `r` entries each, row-major, one numbered draw per value. The send
+/// path calls this when the mask draft is encoded; the numbers stay with the
+/// mask for `fold_mask_as_drawn`. A mask draws its tail once.
+pub fn fold_mask_make_tail(
+    shape: &FoldShape,
+    mask: &mut FoldMask,
+    coins: &mut TestMaskCoins,
+) -> Result<()> {
+    validate_fold_mask_shape(shape)?;
+    if mask.tail.is_some() {
+        return Err(Error::InvalidProof);
+    }
+    let rows = usize::try_from(shape.mask_rows()).map_err(|_| Error::ResourceLimit)?;
+    let len = usize::try_from(shape.mask_code.r).map_err(|_| Error::ResourceLimit)?;
+    let entries = rows.checked_mul(len).ok_or(Error::ResourceLimit)?;
+    let mut values = Vec::with_capacity(entries);
+    let mut draws = Vec::with_capacity(entries);
+    for _ in 0..entries {
+        let (value, number) = coins.draw()?;
+        values.push(value);
+        draws.push(number);
+    }
+    mask.tail = Some(MaskTail::new(rows, len, values, draws)?);
+    Ok(())
+}
+
+/// The prover's self-check: every coefficient and every value of the mask
+/// rows' encoding tail equals the value that the source regenerates from its
+/// recorded draw number. All values are compared, with no early end. A mask
+/// whose tail was never drawn is rejected: the check must not silently
+/// compare nothing. A `NO_DRAW` number is treated as a difference here, so a
+/// lost number fails closed.
 pub fn fold_mask_as_drawn(
     mask: &FoldMask,
-    coins: &DeterministicMaskCoins,
+    coins: &TestMaskCoins,
 ) -> Result<()> {
     if mask.coefficients.len() != mask.draws.len() {
         return Err(Error::InvalidProof);
@@ -221,6 +311,17 @@ pub fn fold_mask_as_drawn(
     let mut differ = false;
     for (coefficient, number) in mask.coefficients.iter().zip(&mask.draws) {
         if *number == NO_DRAW || coins.redraw(*number)? != *coefficient {
+            differ = true;
+        }
+    }
+    let tail = mask.tail.as_ref().ok_or(Error::InvalidProof)?;
+    if tail.values.len() != tail.draws.len()
+        || tail.rows.checked_mul(tail.len) != Some(tail.values.len())
+    {
+        return Err(Error::InvalidProof);
+    }
+    for (value, number) in tail.values.iter().zip(&tail.draws) {
+        if *number == NO_DRAW || coins.redraw(*number)? != *value {
             differ = true;
         }
     }
@@ -239,13 +340,14 @@ pub struct MaskNotice {
     pub leaf_class: u32,
 }
 
-pub fn fold_mask_notice(shape: &FoldShape) -> MaskNotice {
-    MaskNotice {
+pub fn fold_mask_notice(shape: &FoldShape) -> Result<MaskNotice> {
+    validate_fold_mask_shape(shape)?;
+    Ok(MaskNotice {
         mask_rows: shape.mask_rows(),
         mask_code: shape.mask_code,
         answers: 0,
         leaf_class: shape.mask_leaf_class,
-    }
+    })
 }
 
 /// A table of `rows` rows and `len` columns, column-major: entry (row,
@@ -283,7 +385,12 @@ fn coefficient(w: &[Fp3], k: u32, variable: u32, degree: u32) -> Result<Fp3> {
 /// The fresh mask rows: the hiding coefficients laid out in `2^h` rows of
 /// `len` entries, in the reference's column order.
 pub fn fold_mask_table(k: u32, h: u32, len: usize, w: &[Fp3]) -> Result<Vec<Fp3>> {
-    if k < 1 || h > k || len < fold_mask_columns(k, h) || w.len() != 2 * k as usize + 1 {
+    if k < 1
+        || h >= 40
+        || h > k
+        || len < fold_mask_columns(k, h)
+        || w.len() != 2 * k as usize + 1
+    {
         return Err(Error::InvalidConfig);
     }
     let rows = 1usize << h;
@@ -323,7 +430,12 @@ pub fn fold_mask_table(k: u32, h: u32, len: usize, w: &[Fp3]) -> Result<Vec<Fp3>
 
 /// The public weights u(g): U(g) = <u(g), mask table folded at g_1..g_h>.
 pub fn fold_mask_weights(k: u32, h: u32, len: usize, g: &[Fp3]) -> Result<Vec<Fp3>> {
-    if k < 1 || h > k || g.len() != k as usize || len < fold_mask_columns(k, h) {
+    if k < 1
+        || h >= 40
+        || h > k
+        || g.len() != k as usize
+        || len < fold_mask_columns(k, h)
+    {
         return Err(Error::InvalidConfig);
     }
     let mut after = vec![Fp3::ONE; k as usize + 1];
@@ -362,48 +474,79 @@ pub struct MaskPlacement {
 }
 
 /// Gather the members' mask rows into one group table of `2^h` rows.
+///
+/// The layout is a precondition: each member's rows are a power of two, its
+/// first row is aligned to that number of rows, its rows lie inside the
+/// group's `2^h` rows, and no two members' rows overlap. A layout builder that
+/// supplies overlapping or misaligned blocks must be fixed, not silently
+/// truncated, so this function rejects both cases.
 pub fn fold_gather_mask(h: u32, len: usize, members: &[MaskPlacement]) -> Result<MaskTable> {
+    if h >= 40 || len == 0 {
+        return Err(Error::InvalidConfig);
+    }
     let rows = 1usize << h;
     let entries = rows.checked_mul(len).ok_or(Error::ResourceLimit)?;
     let mut values = vec![Fp3::ZERO; entries];
+    let mut occupied = vec![false; rows];
     for member in members {
-        if member.table.len != len {
+        let member_rows = member.table.rows;
+        if member.table.len != len || member_rows == 0 || !member_rows.is_power_of_two() {
             return Err(Error::ShapeMismatch);
         }
         let first = usize::try_from(member.first).map_err(|_| Error::InvalidIndex)?;
-        if first
-            .checked_add(member.table.rows)
-            .map(|end| end > rows)
-            .unwrap_or(true)
-        {
+        if first % member_rows != 0 {
             return Err(Error::InvalidIndex);
         }
-        for b in 0..member.table.rows {
+        let end = first.checked_add(member_rows).ok_or(Error::InvalidIndex)?;
+        if end > rows {
+            return Err(Error::InvalidIndex);
+        }
+        for row in &mut occupied[first..end] {
+            if *row {
+                return Err(Error::InvalidIndex);
+            }
+            *row = true;
+        }
+        for b in 0..member_rows {
             for c in 0..len {
-                values[(first + b) + (c << h)] = member.table.at(b, c)?;
+                let row = first.checked_add(b).ok_or(Error::ResourceLimit)?;
+                let offset = c.checked_mul(rows).ok_or(Error::ResourceLimit)?;
+                let at = row.checked_add(offset).ok_or(Error::ResourceLimit)?;
+                values[at] = member.table.at(b, c)?;
             }
         }
     }
     MaskTable::new(rows, len, values)
 }
 
-/// The mask draft: the notice and the rows built from the coefficients.
+/// The mask draft: the notice, the rows built from the coefficients, and the
+/// random tail of the rows' encodings.
 #[derive(Clone, Debug)]
 pub struct MaskDraft {
     pub notice: MaskNotice,
     pub table: MaskTable,
+    pub tail: MaskTail,
 }
 
 pub fn fold_mask_draft(shape: &FoldShape, mask: &FoldMask) -> Result<MaskDraft> {
     validate_fold_mask_shape(shape)?;
-    let notice = fold_mask_notice(shape);
-    let len = shape.mask_code.ell as usize;
+    let notice = fold_mask_notice(shape)?;
+    let len = usize::try_from(shape.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
     let values = fold_mask_table(shape.k, shape.h, len, mask.coefficients())?;
     let table = MaskTable::new(1usize << shape.h, len, values)?;
-    Ok(MaskDraft { notice, table })
+    let tail = mask.tail().ok_or(Error::InvalidProof)?.clone();
+    Ok(MaskDraft {
+        notice,
+        table,
+        tail,
+    })
 }
 
 /// What the verifier knows of an oracle named as a fresh mask.
+///
+/// `members` is the verifier's own group layout, never a list taken from the
+/// proof: the static slice makes the trusted origin explicit at the type
+/// level. A group with no members is not a group and is rejected.
 #[derive(Clone, Copy, Debug)]
 pub struct MaskOracle {
     pub id: u64,
@@ -419,8 +562,11 @@ pub struct MaskOracle {
 /// and is not a member of the group.
 pub fn fold_mask_check(shape: &FoldShape, fresh: &MaskOracle) -> Result<()> {
     validate_fold_mask_shape(shape)?;
+    if fresh.members.is_empty() {
+        return Err(Error::StatementMismatch);
+    }
     if fresh.main_rows != 0
-        || fresh.mask_rows != (1u64 << shape.h)
+        || fresh.mask_rows != shape.mask_rows()
         || fresh.mask_code != shape.mask_code
     {
         return Err(Error::StatementMismatch);
@@ -448,8 +594,8 @@ mod tests {
         }
     }
 
-    fn coins() -> DeterministicMaskCoins {
-        DeterministicMaskCoins::new(Digest([9; 32]))
+    fn coins() -> TestMaskCoins {
+        TestMaskCoins::new(Digest([9; 32]))
     }
 
     fn values(k: u32) -> Vec<Fp3> {
@@ -462,15 +608,26 @@ mod tests {
     fn mask_is_drawn_and_checked() {
         let shape = shape();
         let mut source = coins();
-        let mask = fold_mask_make(&shape, &mut source).unwrap();
+        let mut mask = fold_mask_make(&shape, &mut source).unwrap();
         assert_eq!(mask.coefficients().len(), 5);
         assert_eq!(mask.draws(), &[0, 1, 2, 3, 4]);
         assert!(!mask.sent());
+        // Without the encoding tail the check must not compare only one part.
+        assert!(mask.tail().is_none());
+        assert!(fold_mask_as_drawn(&mask, &source).is_err());
+
+        fold_mask_make_tail(&shape, &mut mask, &mut source).unwrap();
+        let tail = mask.tail().unwrap();
+        assert_eq!(tail.rows, 2);
+        assert_eq!(tail.len, shape.mask_code.r as usize);
+        assert_eq!(tail.draws, vec![5, 6]);
+        assert!(fold_mask_make_tail(&shape, &mut mask, &mut source).is_err());
         fold_mask_as_drawn(&mask, &source).unwrap();
 
         let mut tampered = FoldMask {
             coefficients: mask.coefficients().to_vec(),
             draws: mask.draws().to_vec(),
+            tail: mask.tail().cloned(),
             id: None,
         };
         tampered.coefficients[0] = tampered.coefficients[0].add(&Fp3::ONE);
@@ -479,12 +636,40 @@ mod tests {
         let mut number = FoldMask {
             coefficients: mask.coefficients().to_vec(),
             draws: mask.draws().to_vec(),
+            tail: mask.tail().cloned(),
             id: None,
         };
         number.draws[1] = 4;
         assert!(fold_mask_as_drawn(&number, &source).is_err());
         number.draws[1] = NO_DRAW;
         assert!(fold_mask_as_drawn(&number, &source).is_err());
+
+        let mut tail_value = FoldMask {
+            coefficients: mask.coefficients().to_vec(),
+            draws: mask.draws().to_vec(),
+            tail: mask.tail().cloned(),
+            id: None,
+        };
+        tail_value.tail.as_mut().unwrap().values[0] =
+            tail_value.tail.as_ref().unwrap().values[0].add(&Fp3::ONE);
+        assert!(fold_mask_as_drawn(&tail_value, &source).is_err());
+
+        let mut tail_number = FoldMask {
+            coefficients: mask.coefficients().to_vec(),
+            draws: mask.draws().to_vec(),
+            tail: mask.tail().cloned(),
+            id: None,
+        };
+        tail_number.tail.as_mut().unwrap().draws[1] = NO_DRAW;
+        assert!(fold_mask_as_drawn(&tail_number, &source).is_err());
+
+        let no_tail = FoldMask {
+            coefficients: mask.coefficients().to_vec(),
+            draws: mask.draws().to_vec(),
+            tail: None,
+            id: None,
+        };
+        assert!(fold_mask_as_drawn(&no_tail, &source).is_err());
     }
 
     #[test]
@@ -609,19 +794,64 @@ mod tests {
             &[MaskPlacement { first: 1, table: group.clone() }]
         )
         .is_err());
+        // No two members may write the same row.
+        let one = MaskTable::new(1, 2, vec![Fp3::from_u64(5), Fp3::from_u64(6)]).unwrap();
+        assert!(fold_gather_mask(
+            1,
+            2,
+            &[
+                MaskPlacement { first: 0, table: one.clone() },
+                MaskPlacement { first: 0, table: one.clone() },
+            ]
+        )
+        .is_err());
+        // A member's first row is aligned to its own row count.
+        let two = MaskTable::new(
+            2,
+            1,
+            vec![Fp3::from_u64(7), Fp3::from_u64(8)],
+        )
+        .unwrap();
+        assert!(fold_gather_mask(
+            2,
+            1,
+            &[MaskPlacement { first: 1, table: two.clone() }]
+        )
+        .is_err());
+        assert!(fold_gather_mask(
+            2,
+            1,
+            &[MaskPlacement { first: 4, table: two.clone() }]
+        )
+        .is_err());
+        // A member's row count is a power of two.
+        let three = MaskTable::new(
+            3,
+            1,
+            vec![Fp3::from_u64(9), Fp3::from_u64(10), Fp3::from_u64(11)],
+        )
+        .unwrap();
+        assert!(fold_gather_mask(2, 1, &[MaskPlacement { first: 0, table: three }]).is_err());
+        // The shift itself is bounded, and a zero-width layout is rejected.
+        assert!(fold_gather_mask(40, 2, &[]).is_err());
+        assert!(fold_gather_mask(1, 0, &[]).is_err());
     }
 
     #[test]
     fn notice_draft_and_check() {
         let shape = shape();
         let mut source = coins();
-        let mask = fold_mask_make(&shape, &mut source).unwrap();
+        let mut mask = fold_mask_make(&shape, &mut source).unwrap();
+        assert!(fold_mask_draft(&shape, &mask).is_err());
+        fold_mask_make_tail(&shape, &mut mask, &mut source).unwrap();
         let draft = fold_mask_draft(&shape, &mask).unwrap();
         assert_eq!(draft.notice.mask_rows, 2);
         assert_eq!(draft.notice.mask_code, shape.mask_code);
         assert_eq!(draft.notice.answers, 0);
         assert_eq!(draft.table.rows, 2);
         assert_eq!(draft.table.len, shape.mask_code.ell as usize);
+        assert_eq!(draft.tail.rows, 2);
+        assert_eq!(draft.tail.len, shape.mask_code.r as usize);
         assert_eq!(
             draft.table.values,
             fold_mask_table(shape.k, shape.h, shape.mask_code.ell as usize, mask.coefficients())
@@ -656,6 +886,26 @@ mod tests {
         let mut bad = good;
         bad.members = &[9, 1];
         assert!(fold_mask_check(&shape, &bad).is_err());
+        // A group with no members is not a group.
+        let mut bad = good;
+        bad.members = &[];
+        assert!(fold_mask_check(&shape, &bad).is_err());
+    }
+
+    #[test]
+    fn public_table_functions_bound_their_shifts() {
+        let wide = values(64);
+        assert!(fold_mask_table(64, 64, 65, &wide).is_err());
+        let weights: Vec<Fp3> = (0..64).map(|index| Fp3::from_u64(index + 1)).collect();
+        assert!(fold_mask_weights(64, 64, 65, &weights).is_err());
+        assert!(fold_mask_table(0, 0, 1, &[]).is_err());
+        assert!(fold_mask_weights(0, 0, 1, &[]).is_err());
+        let base = shape();
+        let mut too_high = base;
+        too_high.k = 64;
+        too_high.h = 64;
+        assert!(fold_mask_shape_fault(&too_high).is_some());
+        assert!(fold_mask_notice(&too_high).is_err());
     }
 
     #[test]
