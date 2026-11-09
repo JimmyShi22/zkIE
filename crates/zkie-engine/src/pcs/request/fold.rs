@@ -86,20 +86,74 @@ pub struct FoldGroupLayout {
 }
 
 impl FoldGroupLayout {
+    /// The strict isolated subset: every member has at least one main or mask
+    /// row; a kept member has main rows; non-kept main and mask blocks are
+    /// aligned by the next power-of-two boundary and must fit the group's
+    /// `2^k`/`2^h` spaces; kept main rows are outside the folded block but
+    /// their checked sum is bounded. This is not a reference layout algorithm:
+    /// production must derive and compare the layout from authenticated
+    /// statement/oracle shapes and join kept marks, not from this fixture or a
+    /// proof row.
     pub fn fault(&self, shape: &FoldShape) -> Option<&'static str> {
-        if self.k != shape.k || self.h != shape.h {
+        if self.k != shape.k || self.h != shape.h || self.k >= 64 || self.h >= 64 {
             return Some("the FOLD layout does not match the fold shape");
         }
         if self.members.is_empty() {
             return Some("the FOLD layout has no members");
         }
+        let main_space = 1u64 << self.k;
+        let mask_space = 1u64 << self.h;
+        let mut main_first = 0u64;
+        let mut mask_first = 0u64;
         for (index, member) in self.members.iter().enumerate() {
-            if member.main_rows == 0 {
-                return Some("a FOLD member has no main rows");
-            }
             if index > 0 && self.members[index - 1].oracle >= member.oracle {
                 return Some("the FOLD layout members are not strictly ordered");
             }
+            if member.main_rows == 0 && member.mask_rows == 0 {
+                return Some("a FOLD member is an empty oracle");
+            }
+            if member.kept && member.main_rows == 0 {
+                return Some("a kept FOLD member has no main rows");
+            }
+            if !member.kept && member.main_rows > 0 {
+                let block = match checked_block(member.main_rows) {
+                    Some(block) => block,
+                    None => return Some("the FOLD main block size overflows"),
+                };
+                let start = match aligned_start(main_first, block) {
+                    Some(start) => start,
+                    None => return Some("the FOLD main block start overflows"),
+                };
+                let end = match start.checked_add(member.main_rows) {
+                    Some(end) => end,
+                    None => return Some("the FOLD main block end overflows"),
+                };
+                if end > main_space {
+                    return Some("the FOLD main rows do not fit the group space");
+                }
+                main_first = end;
+            }
+            if member.mask_rows > 0 {
+                let block = match checked_block(member.mask_rows) {
+                    Some(block) => block,
+                    None => return Some("the FOLD mask block size overflows"),
+                };
+                let start = match aligned_start(mask_first, block) {
+                    Some(start) => start,
+                    None => return Some("the FOLD mask block start overflows"),
+                };
+                let end = match start.checked_add(member.mask_rows) {
+                    Some(end) => end,
+                    None => return Some("the FOLD mask block end overflows"),
+                };
+                if end > mask_space {
+                    return Some("the FOLD mask rows do not fit the group space");
+                }
+                mask_first = end;
+            }
+        }
+        if self.kept_rows_checked().is_err() {
+            return Some("the FOLD kept-row count overflows");
         }
         None
     }
@@ -108,19 +162,51 @@ impl FoldGroupLayout {
         self.members.iter().find(|member| member.oracle == oracle)
     }
 
-    pub fn kept_rows(&self) -> u64 {
-        self.members
-            .iter()
-            .filter(|member| member.kept)
-            .map(|member| member.main_rows)
-            .sum()
+    /// The sum of kept main rows, checked at the only place that synthesizes
+    /// the output count. No unchecked sum is exposed.
+    pub fn kept_rows_checked(&self) -> Result<u64> {
+        let mut sum = 0u64;
+        for member in &self.members {
+            if member.kept {
+                sum = sum
+                    .checked_add(member.main_rows)
+                    .ok_or(Error::ResourceLimit)?;
+            }
+        }
+        Ok(sum)
     }
 }
 
-/// One kept main row of the fixed group: the member identity and the
+fn checked_block(rows: u64) -> Option<u64> {
+    if rows == 0 {
+        return None;
+    }
+    let bits = 64 - (rows - 1).leading_zeros();
+    1u64.checked_shl(bits)
+}
+
+fn aligned_start(first: u64, block: u64) -> Option<u64> {
+    if first == 0 {
+        return Some(0);
+    }
+    let rest = first % block;
+    if rest == 0 {
+        return Some(first);
+    }
+    first.checked_add(block - rest)
+}
+
+/// One kept main row of the fixed group: the member identity and the compact
 /// coefficient vector on that row. Kept rows are not folded; their coefficients
-/// are scaled by `eps * (1 - g_1) .. (1 - g_k)` in the output. In this isolated
-/// step the form is a fixture and its length is not interpreted as a layout.
+/// are scaled by `eps * (1 - g_1) .. (1 - g_k)` in the output. The isolated
+/// representation stores only real rows, row-major as `row * ell + place`, with
+/// length `main_rows * ell`. The virtual multilinear space has
+/// `2^ceil_log2(main_rows)` rows at column-major index `row + 2^row_bits * place`;
+/// virtual padding rows (row >= main_rows) are fixed zero and are not stored.
+/// The same compact order is used by the prover dot product, the output scaling
+/// and later checks. The layout and form source are untrusted fixtures here;
+/// production must derive both from authenticated statement/oracle shapes and
+/// join kept marks, not from a proof row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FoldKeptForm {
     pub oracle: u64,
@@ -749,7 +835,7 @@ pub fn fold_output(
         kept,
         kept_factor,
         layout: layout.clone(),
-        kept_rows: layout.kept_rows(),
+        kept_rows: layout.kept_rows_checked()?,
         target: claim,
     })
 }

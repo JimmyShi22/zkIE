@@ -1761,7 +1761,13 @@ mod tests {
         let mask_messages: Vec<Fp3> = (0..mask_rows * mask_len)
             .map(|index| Fp3::from_u64(salt * 1000 + index as u64 + 901))
             .collect();
-        let kept_rows = 2usize;
+        let kept_rows = plan
+            .fold_layout
+            .as_ref()
+            .unwrap()
+            .member(2)
+            .unwrap()
+            .main_rows as usize;
         let kept_form = FoldKeptForm {
             oracle: 2,
             coefficients: (0..kept_rows * ell)
@@ -1822,7 +1828,24 @@ mod tests {
     }
 
     fn run_fold_instance_kept(salt: u64, kept_salt: u64) -> FoldRun {
+        run_fold_instance_kept_rows(salt, kept_salt, None)
+    }
+
+    fn run_fold_instance_kept_rows(
+        salt: u64,
+        kept_salt: u64,
+        kept_rows: Option<u64>,
+    ) -> FoldRun {
         let (mut session, _table, start, mask, source) = fold_open_prestart();
+        if let Some(rows) = kept_rows {
+            let layout = session.plan.fold_layout.as_mut().unwrap();
+            for member in &mut layout.members {
+                if member.oracle == 2 {
+                    member.main_rows = rows;
+                }
+            }
+            assert!(session.plan.fault().is_none());
+        }
         let (row, main_messages, mask_messages, kept_messages) =
             fold_fixture_with_kept(session.plan(), salt, kept_salt);
         let mask_coefficients = mask.coefficients().to_vec();
@@ -2986,7 +3009,10 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
-        assert_eq!(run.output.kept_rows, run.output.layout.kept_rows());
+        assert_eq!(
+            run.output.kept_rows,
+            run.output.layout.kept_rows_checked().unwrap()
+        );
     }
 
     #[test]
@@ -3119,6 +3145,112 @@ mod tests {
         assert_ne!(baseline.output.target, changed.output.target);
         assert_fold_run_direct(&baseline);
         assert_fold_run_direct(&changed);
+    }
+
+    #[test]
+    fn fold_layout_mask_only_and_row_overflow_are_checked() {
+        let (plan, _table) = gu_plan_fixture();
+        let layout = plan.fold_layout.clone().unwrap();
+        assert!(layout.fault(&plan.fold).is_none());
+
+        let mut mask_only = layout.clone();
+        mask_only.members.push(FoldMemberLayout {
+            oracle: 11,
+            main_rows: 0,
+            mask_rows: 1,
+            kept: false,
+        });
+        assert!(mask_only.fault(&plan.fold).is_none());
+        let (mut mask_row, _, _, _) = fold_fixture(&plan, 1);
+        mask_row.members = mask_only
+            .members
+            .iter()
+            .map(|member| member.oracle)
+            .collect();
+        assert!(mask_row.check(&plan.fold, &mask_only).is_ok());
+        let mut kept_mask = mask_only.clone();
+        kept_mask.members.last_mut().unwrap().kept = true;
+        assert!(kept_mask.fault(&plan.fold).is_some());
+
+        let (mut session, _table, _start, _mask, _source) = fold_open_prestart();
+        session.plan.fold_layout = Some(mask_only.clone());
+        let (mut outside_member, _, _, _) = fold_fixture(session.plan(), 1);
+        outside_member.members = mask_only
+            .members
+            .iter()
+            .map(|member| member.oracle)
+            .collect();
+        assert!(session.fold_bind_row(outside_member).is_err());
+        let mut empty = mask_only.clone();
+        empty.members.last_mut().unwrap().mask_rows = 0;
+        assert!(empty.fault(&plan.fold).is_some());
+
+        let mut main_overflow = layout.clone();
+        main_overflow.members[0].kept = false;
+        main_overflow.members.push(FoldMemberLayout {
+            oracle: 11,
+            main_rows: 1,
+            mask_rows: 0,
+            kept: false,
+        });
+        assert!(main_overflow.fault(&plan.fold).is_some());
+
+        let mut mask_overflow = layout.clone();
+        for (offset, oracle) in [11u64, 12, 13].into_iter().enumerate() {
+            mask_overflow.members.push(FoldMemberLayout {
+                oracle,
+                main_rows: 0,
+                mask_rows: 1,
+                kept: false,
+            });
+            if offset < 2 {
+                assert!(mask_overflow.fault(&plan.fold).is_none());
+            } else {
+                assert!(mask_overflow.fault(&plan.fold).is_some());
+            }
+        }
+
+        let mut kept_overflow = layout.clone();
+        kept_overflow.members = vec![
+            FoldMemberLayout {
+                oracle: 1,
+                main_rows: u64::MAX,
+                mask_rows: 0,
+                kept: true,
+            },
+            FoldMemberLayout {
+                oracle: 2,
+                main_rows: 2,
+                mask_rows: 0,
+                kept: true,
+            },
+        ];
+        assert!(kept_overflow.fault(&plan.fold).is_some());
+        let mut plan_overflow = plan.clone();
+        plan_overflow.fold_layout = Some(kept_overflow);
+        assert!(plan_overflow.fault().is_some());
+    }
+
+    #[test]
+    fn fold_session_kept_rows_three_use_compact_mapping() {
+        let run = run_fold_instance_kept_rows(1, 1, Some(3));
+        assert_eq!(run.output.layout.member(2).unwrap().main_rows, 3);
+        assert_eq!(run.row.kept[0].coefficients.len(), 3 * 4);
+        assert_eq!(run.output.kept[0].coefficients.len(), 3 * 4);
+        assert!(run.output.kept_rows >= 3);
+        assert_fold_run_direct(&run);
+
+        let (mut session, _table, _start, _mask, _source) = fold_open_prestart();
+        let layout = session.plan.fold_layout.as_mut().unwrap();
+        for member in &mut layout.members {
+            if member.oracle == 2 {
+                member.main_rows = 3;
+            }
+        }
+        assert!(session.plan.fault().is_none());
+        let (mut row, _, _, _) = fold_fixture(session.plan(), 1);
+        row.kept[0].coefficients.push(Fp3::ONE);
+        assert!(session.fold_bind_row(row).is_err());
     }
 
     #[test]
