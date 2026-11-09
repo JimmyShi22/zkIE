@@ -16,7 +16,10 @@
 //! an I/O error, and there is no thread-mutex fallback. The caller's paths must
 //! all be under one trusted directory/lock authority: two root paths that point
 //! at one count file under different lock files are not made mutually
-//! exclusive here, and arbitrary-directory safety is not claimed.
+//! exclusive here, and arbitrary-directory safety is not claimed. The test-only
+//! append/close hooks demonstrate upper-layer error propagation and the absence
+//! of a receipt; they are not injected operating-system syscall failures. The
+//! removed-count-file test exercises an actual missing-target append open.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -154,12 +157,9 @@ impl CountSet {
 
     fn verify_startup_locked(&self) -> Result<()> {
         self.plan.check()?;
-        if self.append_failure_for_test() {
-            return Err(Error::Io);
-        }
         for path in &self.counts {
+            check_appendable(path, self.append_failure_for_test())?;
             let count = read_count(path)?;
-            check_appendable(path)?;
             let next = count
                 .checked_add(self.plan.columns)
                 .ok_or(Error::ResourceLimit)?;
@@ -335,12 +335,15 @@ fn read_count(path: &Path) -> Result<u64> {
     Ok(metadata.len())
 }
 
-fn check_appendable(path: &Path) -> Result<()> {
+fn check_appendable(path: &Path, injected_failure: bool) -> Result<()> {
     let file = OpenOptions::new()
         .write(true)
         .append(true)
         .open(path)
         .map_err(|_| Error::Io)?;
+    if injected_failure {
+        return Err(Error::Io);
+    }
     let metadata = file.metadata().map_err(|_| Error::Io)?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
         return Err(Error::InvalidConfig);
@@ -546,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn append_open_failure_is_rejected_at_startup() {
+    fn append_open_call_error_is_rejected_at_startup() {
         let root = temp_root("append-open");
         let count = add_leaf(&root, "leaf0");
         let mut set = CountSet::new(
@@ -555,6 +558,9 @@ mod tests {
             CountPlan::new(1, 1).unwrap(),
         )
         .unwrap();
+        // The hook fails inside the append-open helper after the actual open.
+        // It proves upper-layer propagation and no append/receipt; it is not a
+        // claim that the operating system's open(2) failed.
         set.force_append_failure();
         assert!(set.verify_startup().is_err());
         assert!(set.begin_batch(0).is_err());
@@ -563,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn close_failure_is_not_reported_as_success() {
+    fn close_call_error_propagation_does_not_emit_receipt() {
         let root = temp_root("close-failure");
         let count = add_leaf(&root, "leaf0");
         let mut set = CountSet::new(
@@ -572,9 +578,29 @@ mod tests {
             CountPlan::new(1, 1).unwrap(),
         )
         .unwrap();
+        // The hook reports an error after the real close succeeded. This proves
+        // the caller does not emit a receipt on the reported close failure; it
+        // is not an actual close(2) failure injection.
         set.force_close_failure();
         assert!(set.begin_batch(0).is_err());
         assert_eq!(read_count(&count).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn startup_rejects_a_removed_count_file_at_append_open() {
+        let root = temp_root("removed-before-open");
+        let count = add_leaf(&root, "leaf0");
+        let set = CountSet::new(
+            &root,
+            vec![count.clone()],
+            CountPlan::new(1, 1).unwrap(),
+        )
+        .unwrap();
+        // Removing the file after construction makes the real append-open fail
+        // with a missing target; no injected flag is used here.
+        std::fs::remove_file(&count).unwrap();
+        assert!(set.verify_startup().is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 

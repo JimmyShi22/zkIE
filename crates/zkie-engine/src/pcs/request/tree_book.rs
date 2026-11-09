@@ -407,6 +407,21 @@ impl TreeBook {
         {
             return Err(Error::StatementMismatch);
         }
+        for part in &target_state.parts {
+            let target_spec = self.oracles.get(part).ok_or(Error::InvalidConfig)?;
+            let source_spec = source.oracles.get(part).ok_or(Error::InvalidConfig)?;
+            // Groups are context-specific and are compared only where a
+            // context uses them. Every field that shapes the tree or its
+            // hiding budget must agree before the counters are shared.
+            if target_spec.answers != source_spec.answers
+                || target_spec.main_rows != source_spec.main_rows
+                || target_spec.mask_rows != source_spec.mask_rows
+                || target_spec.main_hiding != source_spec.main_hiding
+                || target_spec.mask_hiding != source_spec.mask_hiding
+            {
+                return Err(Error::StatementMismatch);
+            }
+        }
         self.trees[target].adopted = true;
         self.trees[target].counts = Arc::clone(&source.trees[source_tree].counts);
         Ok(())
@@ -436,6 +451,31 @@ mod tests {
                 parts: vec![1, 2],
             }],
             vec![oracle(1, vec![7]), oracle(2, vec![7])],
+        )
+        .unwrap()
+    }
+
+    fn safety_book(
+        main_hiding: u64,
+        main_rows: u64,
+        mask_rows: u64,
+        answers: u32,
+        groups: Vec<u32>,
+    ) -> TreeBook {
+        let mut first = oracle(1, groups.clone());
+        first.main_hiding = main_hiding;
+        first.mask_hiding = main_hiding;
+        first.main_rows = main_rows;
+        first.mask_rows = mask_rows;
+        first.answers = answers;
+        let mut second = first.clone();
+        second.id = 2;
+        TreeBook::new(
+            vec![TreeSpec {
+                log_n: 3,
+                parts: vec![1, 2],
+            }],
+            vec![first, second],
         )
         .unwrap()
     }
@@ -597,6 +637,46 @@ mod tests {
         assert!(book.release_oracles(&[1, 2]).unwrap().is_empty());
         book.open_oracles(&[1, 2], &at).unwrap();
         assert_eq!(book.release_oracles(&[1, 2]).unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn adoption_checks_source_safety_fields_but_not_context_groups() {
+        let mut source = safety_book(4, 1, 1, 1, vec![7]);
+        let at = PositionList::from_draws(vec![0], 3).unwrap();
+        source.open_oracles(&[1, 2], &at).unwrap();
+
+        let loose = safety_book(100, 1, 1, 1, vec![7]);
+        let mut target = loose;
+        assert!(target.adopt(0, &source, 0).is_err());
+
+        let no_mask = safety_book(4, 1, 0, 1, vec![7]);
+        let mut target = no_mask;
+        assert!(target.adopt(0, &source, 0).is_err());
+
+        let no_main = safety_book(4, 0, 1, 1, vec![7]);
+        let mut target = no_main;
+        assert!(target.adopt(0, &source, 0).is_err());
+
+        let different_answers = safety_book(4, 1, 1, 2, vec![7]);
+        let mut target = different_answers;
+        assert!(target.adopt(0, &source, 0).is_err());
+
+        // The group is context-specific: same safety fields, another group is
+        // not rejected by adopt.
+        let mut cross_context = safety_book(4, 1, 1, 1, vec![8]);
+        cross_context.adopt(0, &source, 0).unwrap();
+        assert_eq!(cross_context.counts(0).unwrap(), TreeCounts { lists: 1, positions: 1 });
+        // Global positions are shared: the source already spent one. A target
+        // list of two reaches three, a single reaches four, and another list
+        // of two would go past the source's tight limit.
+        let two = PositionList::from_draws(vec![0, 1], 3).unwrap();
+        cross_context.open_oracles(&[1, 2], &two).unwrap();
+        assert_eq!(cross_context.counts(0).unwrap(), TreeCounts { lists: 2, positions: 3 });
+        let one = PositionList::from_draws(vec![2], 3).unwrap();
+        cross_context.open_oracles(&[1, 2], &one).unwrap();
+        assert_eq!(cross_context.counts(0).unwrap(), TreeCounts { lists: 3, positions: 4 });
+        assert!(cross_context.open_oracles(&[1, 2], &two).is_err());
+        assert_eq!(cross_context.context_lists(1).unwrap(), 2);
     }
 
     #[test]
