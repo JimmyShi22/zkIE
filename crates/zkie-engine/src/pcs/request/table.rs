@@ -313,7 +313,20 @@ fn record_value(shape: &IndexShape, seed: &SampleSeed, answer: u32, message: &[F
 /// The seeds of a table's record, from its name. The label and the empty seed
 /// round follow the chain layout; the seed values are drawn from the
 /// repository's chain rules.
-pub fn record_seeds(shape: &IndexShape, name: &[u8]) -> Result<Vec<SampleSeed>> {
+///
+/// The shape is validated first. `max_seeds` is the caller's trusted budget on
+/// the number of seeds (the plan or priced table supplies it); a shape that
+/// asks for more is rejected before the vector is reserved.
+pub fn record_seeds(
+    shape: &IndexShape,
+    name: &[u8],
+    max_seeds: usize,
+) -> Result<Vec<SampleSeed>> {
+    validate_index_shape(shape)?;
+    let answers = usize::try_from(shape.answers).map_err(|_| Error::ResourceLimit)?;
+    if answers > max_seeds {
+        return Err(Error::ResourceLimit);
+    }
     let mut chain = Chain::begin(
         RECORD_SEED_LABEL,
         &Digest::ZERO,
@@ -325,8 +338,11 @@ pub fn record_seeds(shape: &IndexShape, name: &[u8]) -> Result<Vec<SampleSeed>> 
     if !chain.step(&prefix, 0)? {
         return Err(Error::InvalidProof);
     }
-    let mut seeds = Vec::with_capacity(shape.answers as usize);
-    for _ in 0..shape.answers {
+    let mut seeds = Vec::new();
+    seeds
+        .try_reserve_exact(answers)
+        .map_err(|_| Error::ResourceLimit)?;
+    for _ in 0..answers {
         let mut z = Vec::with_capacity(shape.cube_bits() as usize);
         for _ in 0..shape.cube_bits() {
             z.push(chain.draw_e()?);
@@ -544,7 +560,8 @@ pub fn commit_table(
     let tree = merkle_build(&configuration, &leaves)?;
     let root = tree.root;
     let name = index_name(&root, &shape, &configuration);
-    let seeds = record_seeds(&shape, &name)?;
+    let seed_budget = usize::try_from(shape.answers).map_err(|_| Error::ResourceLimit)?;
+    let seeds = record_seeds(&shape, &name, seed_budget)?;
     let mut record = IndexRecord {
         y: Vec::with_capacity(record_entries),
     };
@@ -821,10 +838,10 @@ mod tests {
     fn record_seeds_are_deterministic_and_bound() {
         let shape = shape();
         let name = b"table-name";
-        let first = record_seeds(&shape, name).unwrap();
-        let second = record_seeds(&shape, name).unwrap();
+        let first = record_seeds(&shape, name, shape.answers as usize).unwrap();
+        let second = record_seeds(&shape, name, shape.answers as usize).unwrap();
         assert_eq!(first, second);
-        let other = record_seeds(&shape, b"other-name").unwrap();
+        let other = record_seeds(&shape, b"other-name", shape.answers as usize).unwrap();
         assert_ne!(first, other);
         assert!(!first[0].beta.is_zero());
 
@@ -833,14 +850,26 @@ mod tests {
         let mut two_answers = shape;
         two_answers.answers = 2;
         two_answers.code = crate::pcs::request::code::build_code_plan(5, 16, 1).unwrap();
-        let ordered = record_seeds(&two_answers, b"table-name").unwrap();
+        let ordered =
+            record_seeds(&two_answers, b"table-name", two_answers.answers as usize).unwrap();
         assert_eq!(ordered.len(), 2);
         assert_ne!(ordered[0], ordered[1]);
         let mut three_answers = two_answers;
         three_answers.answers = 3;
-        let extended = record_seeds(&three_answers, b"table-name").unwrap();
+        let extended =
+            record_seeds(&three_answers, b"table-name", three_answers.answers as usize).unwrap();
         assert_eq!(extended.len(), 3);
         assert_eq!(extended[..2], ordered[..]);
+
+        // The entry validates the shape and checks the caller's seed budget.
+        assert!(record_seeds(&shape, name, 0).is_err());
+        assert!(record_seeds(&two_answers, b"table-name", 1).is_err());
+        let mut bad = shape;
+        bad.v = 64;
+        assert!(record_seeds(&bad, name, 8).is_err());
+        let mut bad_code = shape;
+        bad_code.code.log_n = 64;
+        assert!(record_seeds(&bad_code, name, 8).is_err());
     }
 
     #[test]
@@ -1104,7 +1133,7 @@ mod tests {
     fn record_seeds_match_an_independent_derivation() {
         let shape = shape();
         let name = b"independent-name";
-        let seeds = record_seeds(&shape, name).unwrap();
+        let seeds = record_seeds(&shape, name, shape.answers as usize).unwrap();
         let manual = manual_seeds(&shape, name);
         assert_eq!(seeds.len(), manual.len());
         for (left, right) in seeds.iter().zip(&manual) {
