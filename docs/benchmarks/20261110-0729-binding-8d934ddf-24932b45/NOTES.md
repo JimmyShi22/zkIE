@@ -62,14 +62,14 @@ passed.
 
 | removed absorption | failing test | log |
 | --- | --- | --- |
-| parameter version word | `parameter_version_changes_the_digest` | `tests/injection-parameter-version-fail.txt` |
-| parameter protocol identity | `parameter_protocol_identity_changes_the_digest` | `tests/injection-parameter-protocol-fail.txt` |
-| parameter domain parameters | `parameter_domain_parameters_change_the_digest` | `tests/injection-parameter-domain-fail.txt` |
-| parameter plan identifier | `parameter_plan_identifier_changes_the_digest` | `tests/injection-parameter-plan-fail.txt` |
-| statement case id | `statement_case_changes_the_first_query` | `tests/injection-statement-case-fail.txt` |
-| statement request identity | `statement_request_and_table_identities_change_the_first_query` | `tests/injection-statement-request-fail.txt` |
-| statement table identity | `statement_request_and_table_identities_change_the_first_query` | `tests/injection-statement-table-fail.txt` |
-| record bytes and length | `record_presence_bytes_and_length_are_bound` | `tests/injection-record-bytes-fail.txt` |
+| parameter version word | `parameter_version_changes_the_digest` | `tests/inject-parameter-version-fail.txt` |
+| parameter protocol identity | `parameter_protocol_identity_changes_the_digest` | `tests/inject-parameter-protocol-fail.txt` |
+| parameter domain parameters | `parameter_domain_parameters_change_the_digest` | `tests/inject-parameter-domain-fail.txt` |
+| parameter plan identifier | `parameter_plan_identifier_changes_the_digest` | `tests/inject-parameter-plan-fail.txt` |
+| statement case id | `statement_case_changes_the_first_query` | `tests/inject-statement-case-fail.txt` |
+| statement request identity | `statement_request_and_table_identities_change_the_first_query` | `tests/inject-statement-request-fail.txt` |
+| statement table identity | `statement_request_and_table_identities_change_the_first_query` | `tests/inject-statement-table-fail.txt` |
+| record bytes and length | `record_presence_bytes_and_length_are_bound` | `tests/inject-record-bytes-fail.txt` |
 
 Restore logs use the same names with `-restore.txt`.
 
@@ -97,6 +97,6 @@ multi-GiB byte-consumption tests from the earlier trace, unchanged). Logs:
 ## Artifacts
 
 - `tests/binding-unit.txt`: the sixteen binding tests.
-- `tests/injection-*.txt`: eight fail logs and eight restore logs.
+- `tests/inject-*.txt`: eight fail logs and eight restore logs.
 - `logs/cargo-test.txt`: full workspace log.
 - No binary artifacts were produced or deleted.
