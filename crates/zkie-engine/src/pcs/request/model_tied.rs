@@ -87,11 +87,13 @@ pub fn verify_candidate_opening(_use: &AssetUse) -> Result<()> {
     Err(Error::UnsupportedPrimitive)
 }
 
-/// A candidate GPT-2 tied use. The embedding lookup and the head matrix must
-/// refer to one verified root and one trusted `[hidden, vocab]` layout, while
-/// each side keeps its own opened indices. The head's index list must contain
-/// the token-column entries that the embedding lookup reads; identity alone is
-/// not enough.
+/// A candidate GPT-2 tied use. The embedding lookup and the head matrix refer
+/// to one verified root and one trusted `[hidden, vocab]` layout, while each
+/// side keeps its own opened indices. The embedding indices are checked against
+/// the lookup mapping; no intersection or containment with the head's opening
+/// query is required, because LIN random queries and lookup queries may differ.
+/// Each side still needs its own proof; identity alone is not a value or graph
+/// edge proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Gpt2Tied {
     pub hidden: u64,
@@ -133,9 +135,6 @@ impl Gpt2Tied {
                 .and_then(|value| value.checked_add(self.token))
                 .ok_or(Error::ResourceLimit)?;
             if *index != expected {
-                return Err(Error::StatementMismatch);
-            }
-            if !self.head.indices.contains(index) {
                 return Err(Error::StatementMismatch);
             }
         }
@@ -206,20 +205,21 @@ pub fn gpt2_head_token(
     Ok(sum)
 }
 
-/// A production plan-binding gate for the GPT-2 embedding/head label mismatch:
-/// the graph names an external embedding table while the executor reads the
-/// head asset. Only verified roots identify the same asset; names and paths do
-/// not.
+/// A candidate self-consistency check for the GPT-2 embedding/head label
+/// mismatch: the graph names an external embedding table while the executor
+/// reads the head asset. Equal caller-supplied roots are only a local
+/// consistency condition; the trusted plan, root source and graph edge are not
+/// connected here. Names and paths are never anchors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Gpt2PlanBinding {
+pub struct Gpt2PlanCandidate {
     pub graph_root: Digest,
     pub executor_root: Digest,
     pub shape: AssetShape,
     pub configuration: Digest,
 }
 
-impl Gpt2PlanBinding {
-    pub fn check(&self) -> Result<()> {
+impl Gpt2PlanCandidate {
+    pub fn check_candidate(&self) -> Result<()> {
         if self.graph_root == Digest::ZERO
             || self.executor_root == Digest::ZERO
             || self.configuration == Digest::ZERO
@@ -318,6 +318,9 @@ mod tests {
     fn gpt2_tied_binds_same_root_shape_and_own_indices() {
         let candidate = gpt2();
         candidate.check().unwrap();
+        let mut disjoint_head = gpt2();
+        disjoint_head.head.indices = vec![0, 1, 3];
+        disjoint_head.check().unwrap();
         let values = values(15);
         let lookup = gpt2_lookup(&values, 3, 5, 2).unwrap();
         assert_eq!(lookup, vec![values[2], values[7], values[12]]);
@@ -358,9 +361,13 @@ mod tests {
         token_major.embedding.indices = vec![6, 7, 8];
         assert!(token_major.check().is_err());
 
-        let mut missing_head_column = gpt2();
-        missing_head_column.head.indices.retain(|index| *index != 7);
-        assert!(missing_head_column.check().is_err());
+        let mut head_out_of_range = gpt2();
+        head_out_of_range.head.indices.push(99);
+        assert!(head_out_of_range.check().is_err());
+
+        let mut empty_head = gpt2();
+        empty_head.head.indices.clear();
+        assert!(empty_head.check().is_err());
 
         let mut out_of_range = gpt2();
         out_of_range.embedding.indices[0] = 99;
@@ -384,8 +391,8 @@ mod tests {
     }
 
     #[test]
-    fn plan_binding_uses_roots_not_labels_or_paths() {
-        let binding = Gpt2PlanBinding {
+    fn plan_candidate_self_consistency_uses_roots_only() {
+        let binding = Gpt2PlanCandidate {
             graph_root: Digest([4; 32]),
             executor_root: Digest([4; 32]),
             shape: AssetShape {
@@ -394,16 +401,16 @@ mod tests {
             },
             configuration: Digest([9; 32]),
         };
-        binding.check().unwrap();
+        binding.check_candidate().unwrap();
         let mut other_root = binding;
         other_root.executor_root = Digest([5; 32]);
-        assert!(other_root.check().is_err());
+        assert!(other_root.check_candidate().is_err());
         let mut zero = binding;
         zero.graph_root = Digest::ZERO;
-        assert!(zero.check().is_err());
+        assert!(zero.check_candidate().is_err());
         let mut empty = binding;
         empty.shape.rows = 0;
-        assert!(empty.check().is_err());
+        assert!(empty.check_candidate().is_err());
     }
 
     #[test]

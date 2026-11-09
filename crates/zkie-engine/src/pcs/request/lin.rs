@@ -47,37 +47,62 @@ impl LinShape {
         }
         let table_log = table_rows.trailing_zeros();
         let k_col = k_lo.checked_add(table_log).ok_or(Error::InvalidConfig)?;
-        if k_col > 60 {
-            return Err(Error::InvalidConfig);
-        }
-        let required = matrix_rows
-            .checked_shl(k_lo)
-            .ok_or(Error::ResourceLimit)?;
-        if required > table_columns {
-            return Err(Error::ShapeMismatch);
-        }
-        Ok(Self {
+        let shape = Self {
             matrix_rows,
             k_lo,
             k_col,
             table_rows,
             table_columns,
-        })
+        };
+        shape.check()?;
+        Ok(shape)
+    }
+
+    /// Revalidate every invariant at a public entry point. The fields stay
+    /// inspectable for tests, but a forged or mutated shape must fail closed.
+    pub fn check(&self) -> Result<()> {
+        if self.matrix_rows == 0
+            || self.matrix_rows > (1u64 << 30)
+            || self.k_lo > 30
+            || self.table_rows == 0
+            || !self.table_rows.is_power_of_two()
+            || self.table_columns == 0
+        {
+            return Err(Error::InvalidConfig);
+        }
+        let table_log = self.table_rows.trailing_zeros();
+        let expected_k_col = self
+            .k_lo
+            .checked_add(table_log)
+            .ok_or(Error::InvalidConfig)?;
+        if expected_k_col > 60 || self.k_col != expected_k_col {
+            return Err(Error::InvalidConfig);
+        }
+        let required = self
+            .matrix_rows
+            .checked_shl(self.k_lo)
+            .ok_or(Error::ResourceLimit)?;
+        if required > self.table_columns {
+            return Err(Error::ShapeMismatch);
+        }
+        Ok(())
     }
 
     pub fn k_row(&self) -> u32 {
-        let mut bits = 0u32;
-        while (1u64 << bits) < self.matrix_rows {
-            bits += 1;
+        if self.matrix_rows <= 1 {
+            0
+        } else {
+            u64::BITS - (self.matrix_rows - 1).leading_zeros()
         }
-        bits
     }
 
     pub fn matrix_columns(&self) -> Result<u64> {
+        self.check()?;
         1u64.checked_shl(self.k_col).ok_or(Error::ResourceLimit)
     }
 
     pub fn table_columns_used(&self) -> Result<u64> {
+        self.check()?;
         self.matrix_rows
             .checked_shl(self.k_lo)
             .ok_or(Error::ResourceLimit)
@@ -93,6 +118,7 @@ pub struct LinTable {
 
 impl LinTable {
     pub fn new(shape: LinShape, rows: Vec<Vec<Fp3>>) -> Result<Self> {
+        shape.check()?;
         let expected_rows = usize::try_from(shape.table_rows).map_err(|_| Error::ResourceLimit)?;
         let expected_cols =
             usize::try_from(shape.table_columns).map_err(|_| Error::ResourceLimit)?;
@@ -104,6 +130,7 @@ impl LinTable {
 
     /// M[y, col] for an effective matrix row and a matrix column.
     pub fn at(&self, row: u64, column: u64) -> Result<Fp3> {
+        self.shape.check()?;
         if row >= self.shape.matrix_rows || column >= self.shape.matrix_columns()? {
             return Err(Error::InvalidIndex);
         }
@@ -125,6 +152,7 @@ impl LinTable {
 
     /// W = gᵀ M. `weights` has one entry for each effective M row.
     pub fn w(&self, weights: &[Fp3]) -> Result<Vec<Fp3>> {
+        self.shape.check()?;
         if usize::try_from(self.shape.matrix_rows).ok() != Some(weights.len()) {
             return Err(Error::ShapeMismatch);
         }
@@ -145,6 +173,7 @@ impl LinTable {
     /// The result is dense over the row bits `k_row`; entries at or above
     /// `matrix_rows` are zero padding and are not part of the relation.
     pub fn omega(&self, psi: &[Fp3]) -> Result<Vec<Fp3>> {
+        self.shape.check()?;
         if psi.len() != self.shape.k_col as usize {
             return Err(Error::ShapeMismatch);
         }
@@ -223,28 +252,34 @@ pub fn lin_eval_holds(table: &LinTable, claim: &LinClaim) -> Result<bool> {
     Ok(value == claim.target)
 }
 
-/// The (Dot) check: <weights, Omega> = W(psi*), where `omega` is built at the
-/// same point as the W evaluation. This convenience recomputes Omega from the
-/// table; it cannot by itself reject a substituted Omega. A verifier that gets
-/// Omega from a committed message must use the explicit form below.
-pub fn lin_dot_holds(table: &LinTable, claim: &LinClaim) -> Result<bool> {
-    let omega = table.omega(&claim.psi)?;
-    lin_dot_holds_with(table, claim, &omega)
+/// The (Dot) check: <weights, Omega> = W(psi*). `shared_point` is the shared
+/// challenge point, distinct from the request's `claim.psi` used by Eval.
+/// This convenience recomputes Omega at that point; it cannot by itself reject
+/// a substituted Omega. A verifier that gets Omega from a committed message
+/// must use the explicit form below.
+pub fn lin_dot_holds(
+    table: &LinTable,
+    claim: &LinClaim,
+    shared_point: &[Fp3],
+) -> Result<bool> {
+    let omega = table.omega(shared_point)?;
+    lin_dot_holds_with(table, claim, shared_point, &omega)
 }
 
-/// The (Dot) check with an explicitly supplied shared Omega. The caller's
-/// source of Omega is a committed message, not this function; the explicit
-/// form is what lets a tampered Omega be rejected.
+/// The (Dot) check with an explicitly supplied shared Omega and shared point.
+/// The caller's source of Omega is a committed message, not this function; the
+/// explicit form is what lets a tampered Omega or a wrong point be rejected.
 pub fn lin_dot_holds_with(
     table: &LinTable,
     claim: &LinClaim,
+    shared_point: &[Fp3],
     omega: &[Fp3],
 ) -> Result<bool> {
+    table.shape.check()?;
+    let expected = power_of_two_len(table.shape.k_row() as usize)?;
     if claim.weights.len() != table.shape.matrix_rows as usize
-        || omega.len()
-            != 1usize
-                .checked_shl(table.shape.k_row())
-                .ok_or(Error::ResourceLimit)?
+        || shared_point.len() != table.shape.k_col as usize
+        || omega.len() != expected
     {
         return Err(Error::ShapeMismatch);
     }
@@ -257,7 +292,7 @@ pub fn lin_dot_holds_with(
     {
         left = left.add(&weight.mul(value));
     }
-    Ok(left == eval(&w, &claim.psi)?)
+    Ok(left == eval(&w, shared_point)?)
 }
 
 /// The (Fold) check: Omega at zeta equals the folded-row inner product.
@@ -271,16 +306,15 @@ pub fn lin_fold_holds(
     zeta: &[Fp3],
     folded: &[Fp3],
 ) -> Result<bool> {
+    shape.check()?;
+    let folded_bits = shape
+        .k_lo
+        .checked_add(shape.k_row())
+        .ok_or(Error::ResourceLimit)? as usize;
     if psi_lo.len() != shape.k_lo as usize
         || zeta.len() != shape.k_row() as usize
-        || omega.len()
-            != 1usize
-                .checked_shl(shape.k_row())
-                .ok_or(Error::ResourceLimit)?
-        || folded.len()
-            != 1usize
-                .checked_shl(shape.k_lo + shape.k_row())
-                .ok_or(Error::ResourceLimit)?
+        || omega.len() != power_of_two_len(shape.k_row() as usize)?
+        || folded.len() != power_of_two_len(folded_bits)?
     {
         return Err(Error::ShapeMismatch);
     }
@@ -299,7 +333,7 @@ pub fn lin_fold_holds(
 
 /// Multilinear evaluation of a power-of-two length vector.
 pub fn eval(values: &[Fp3], point: &[Fp3]) -> Result<Fp3> {
-    if values.len() != 1usize.checked_shl(point.len() as u32).unwrap_or(0) {
+    if values.len() != power_of_two_len(point.len())? {
         return Err(Error::ShapeMismatch);
     }
     let mut sum = Fp3::ZERO;
@@ -309,10 +343,15 @@ pub fn eval(values: &[Fp3], point: &[Fp3]) -> Result<Fp3> {
     Ok(sum)
 }
 
+fn power_of_two_len(bits: usize) -> Result<usize> {
+    let shift = u32::try_from(bits).map_err(|_| Error::ResourceLimit)?;
+    1usize.checked_shl(shift).ok_or(Error::ResourceLimit)
+}
+
 /// Multilinear evaluation with rows at or above `effective_rows` treated as
 /// padding (the small analogue of a truncated matrix row space).
 pub fn eval_truncated(values: &[Fp3], point: &[Fp3], effective_rows: u64) -> Result<Fp3> {
-    if values.len() != 1usize.checked_shl(point.len() as u32).unwrap_or(0)
+    if values.len() != power_of_two_len(point.len())?
         || effective_rows as usize > values.len()
     {
         return Err(Error::ShapeMismatch);
@@ -340,73 +379,102 @@ fn eq_eval(point: &[Fp3], index: u64, bits: u32) -> Result<Fp3> {
     Ok(value)
 }
 
+/// The public parameters a fixture chain carries: the matrix/table shape, the
+/// code setup, and the table identity, record and configuration. The fixture
+/// compares these values across chains; it does not prove that a real statement
+/// or table supplies them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinPublicParameters {
+    pub shape: LinShape,
+    pub codes: Digest,
+    pub table_identity: Digest,
+    pub table_record: Digest,
+    pub configuration: Digest,
+}
+
+impl LinPublicParameters {
+    pub fn check(&self) -> Result<()> {
+        self.shape.check()?;
+        if self.codes == Digest::ZERO
+            || self.table_identity == Digest::ZERO
+            || self.table_record == Digest::ZERO
+            || self.configuration == Digest::ZERO
+        {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<Digest> {
+        self.check()?;
+        let mut writer = CanonicalWriter::new();
+        put_public(&mut writer, self);
+        Ok(hash_labeled(
+            tag_word(STATEMENT, 0),
+            0,
+            None,
+            &writer.into_bytes(),
+        )?)
+    }
+}
+
 /// Fixture-only first-chain seal. The digest covers the fixed claim and the
-/// chain prefix bytes; it is not a real seal round.
+/// structured public parameters; it is not a real seal round.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinFirstFixture {
     pub claim: LinClaim,
+    pub public: LinPublicParameters,
     pub first_query: Vec<u8>,
     pub seal: Digest,
 }
 
 impl LinFirstFixture {
-    pub fn new(claim: LinClaim, first_query: Vec<u8>) -> Result<Self> {
-        if first_query.is_empty() {
-            return Err(Error::InvalidSessionState);
-        }
-        let seal = fixture_seal(&claim.digest()?, &first_query);
+    pub fn new(claim: LinClaim, public: LinPublicParameters) -> Result<Self> {
+        public.check()?;
+        let claim_digest = claim.digest()?;
+        let first_query = first_prefix(&claim_digest, &public)?;
+        let seal = fixture_seal(&claim_digest, &first_query);
         if seal == Digest::ZERO {
             return Err(Error::InvalidSessionState);
         }
         Ok(Self {
             claim,
+            public,
             first_query,
             seal,
         })
     }
 }
 
-/// Fixture-only shared-chain snapshot carrying the binding root and table
-/// identity. No real seal, tree, or challenge round is claimed.
+/// Fixture-only shared-chain snapshot carrying the binding root and the same
+/// structured public parameters. No real seal, tree, or challenge round is
+/// claimed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinSharedFixture {
     pub binding_root: Digest,
-    pub table_identity: Digest,
-    pub table_record: Digest,
-    pub configuration: Digest,
+    pub public: LinPublicParameters,
     pub first_query: Vec<u8>,
     pub seal: Digest,
 }
 
 impl LinSharedFixture {
-    pub fn new(
-        first_seals: &[Digest],
-        table_identity: Digest,
-        table_record: Digest,
-        configuration: Digest,
-    ) -> Result<Self> {
-        if first_seals.is_empty()
-            || first_seals.iter().any(|seal| *seal == Digest::ZERO)
-            || table_identity == Digest::ZERO
-            || table_record == Digest::ZERO
-            || configuration == Digest::ZERO
-        {
+    pub fn new(first_seals: &[Digest], public: LinPublicParameters) -> Result<Self> {
+        public.check()?;
+        if first_seals.is_empty() || first_seals.iter().any(|seal| *seal == Digest::ZERO) {
             return Err(Error::InvalidSessionState);
         }
         let binding_root = binding_root(first_seals);
         if binding_root == Digest::ZERO {
             return Err(Error::InvalidSessionState);
         }
-        let first_query = shared_prefix(&binding_root, &table_identity, &table_record, &configuration);
+        let first_query = shared_prefix(&binding_root, &public)?;
         let seal = fixture_seal(&binding_root, &first_query);
         if seal == Digest::ZERO {
             return Err(Error::InvalidSessionState);
         }
         Ok(Self {
             binding_root,
-            table_identity,
-            table_record,
-            configuration,
+            public,
             first_query,
             seal,
         })
@@ -419,6 +487,7 @@ impl LinSharedFixture {
 pub struct LinSecondFixture {
     pub own_seal: Digest,
     pub shared_seal: Digest,
+    pub public: LinPublicParameters,
     pub follows: Vec<Digest>,
     pub first_query: Vec<u8>,
     pub seal: Digest,
@@ -440,6 +509,7 @@ impl LinSecondFixture {
         Ok(Self {
             own_seal: own.seal,
             shared_seal: shared.seal,
+            public: shared.public,
             follows: vec![own.seal, shared.seal],
             first_query,
             seal,
@@ -448,44 +518,42 @@ impl LinSecondFixture {
 }
 
 /// Check a fixture skeleton: every first seal is the fixture seal of its fixed
-/// claim and prefix; the binding root is the digest of all first seals; the
-/// shared prefix carries the binding root and table identity/record/config;
-/// the second prefix follows its own first and the shared seal. This is a
-/// structural fixture check, not a chain protocol.
+/// claim and structured public prefix; all first and shared and second public
+/// parameters agree; the binding root is the digest of all first seals; the
+/// shared prefix carries the binding root and public parameters; the second
+/// prefix follows its own first and the shared seal. This is a structural
+/// fixture check, not a chain protocol or a real public-parameter proof.
 pub fn check_lin_skeleton(
     first: &[LinFirstFixture],
     shared: &LinSharedFixture,
     second: &LinSecondFixture,
 ) -> Result<()> {
-    if first.is_empty()
-        || shared.table_identity == Digest::ZERO
-        || shared.table_record == Digest::ZERO
-        || shared.configuration == Digest::ZERO
-    {
+    if first.is_empty() {
         return Err(Error::StatementMismatch);
     }
+    shared.public.check()?;
+    second.public.check()?;
     for entry in first {
+        entry.public.check()?;
+        let claim_digest = entry.claim.digest()?;
         if entry.seal == Digest::ZERO
             || entry.first_query.is_empty()
-            || entry.seal != fixture_seal(&entry.claim.digest()?, &entry.first_query)
+            || entry.public != shared.public
+            || entry.first_query != first_prefix(&claim_digest, &entry.public)?
+            || entry.seal != fixture_seal(&claim_digest, &entry.first_query)
         {
             return Err(Error::StatementMismatch);
         }
     }
     let expected_root = binding_root(&first.iter().map(|entry| entry.seal).collect::<Vec<_>>());
     if shared.binding_root != expected_root
-        || shared.first_query
-            != shared_prefix(
-                &shared.binding_root,
-                &shared.table_identity,
-                &shared.table_record,
-                &shared.configuration,
-            )
+        || shared.first_query != shared_prefix(&shared.binding_root, &shared.public)?
         || shared.seal != fixture_seal(&shared.binding_root, &shared.first_query)
     {
         return Err(Error::StatementMismatch);
     }
-    if second.own_seal == Digest::ZERO
+    if second.public != shared.public
+        || second.own_seal == Digest::ZERO
         || second.shared_seal == Digest::ZERO
         || second.follows != vec![second.own_seal, second.shared_seal]
         || !first.iter().any(|entry| entry.seal == second.own_seal)
@@ -505,26 +573,42 @@ pub fn check_lin_skeleton(
     Ok(())
 }
 
+fn put_public(writer: &mut CanonicalWriter, public: &LinPublicParameters) {
+    writer.put_u64(public.shape.matrix_rows);
+    writer.put_u64(public.shape.k_lo as u64);
+    writer.put_u64(public.shape.k_col as u64);
+    writer.put_u64(public.shape.table_rows);
+    writer.put_u64(public.shape.table_columns);
+    writer.put_digest(&public.codes);
+    writer.put_digest(&public.table_identity);
+    writer.put_digest(&public.table_record);
+    writer.put_digest(&public.configuration);
+}
+
+fn first_prefix(claim: &Digest, public: &LinPublicParameters) -> Result<Vec<u8>> {
+    public.check()?;
+    let mut writer = CanonicalWriter::new();
+    writer.put_digest(claim);
+    put_public(&mut writer, public);
+    Ok(writer.into_bytes())
+}
+
+fn shared_prefix(binding_root: &Digest, public: &LinPublicParameters) -> Result<Vec<u8>> {
+    public.check()?;
+    let mut writer = CanonicalWriter::new();
+    writer.put_digest(binding_root);
+    put_public(&mut writer, public);
+    Ok(writer.into_bytes())
+}
+
+/// Fixture-only linear hash over first seals. It is not a real binding tree
+/// root and does not prove a sealed-chain or public-parameter relation.
 fn binding_root(seals: &[Digest]) -> Digest {
     let mut writer = CanonicalWriter::new();
     for seal in seals {
         writer.put_digest(seal);
     }
     fixture_digest(&writer.into_bytes())
-}
-
-fn shared_prefix(
-    binding_root: &Digest,
-    table_identity: &Digest,
-    table_record: &Digest,
-    configuration: &Digest,
-) -> Vec<u8> {
-    let mut writer = CanonicalWriter::new();
-    writer.put_digest(binding_root);
-    writer.put_digest(table_identity);
-    writer.put_digest(table_record);
-    writer.put_digest(configuration);
-    writer.into_bytes()
 }
 
 fn fixture_seal(start: &Digest, bytes: &[u8]) -> Digest {
@@ -557,6 +641,16 @@ mod tests {
         LinTable::new(shape(), rows).unwrap()
     }
 
+    fn public() -> LinPublicParameters {
+        LinPublicParameters {
+            shape: shape(),
+            codes: Digest([1; 32]),
+            table_identity: Digest([2; 32]),
+            table_record: Digest([3; 32]),
+            configuration: Digest([4; 32]),
+        }
+    }
+
     #[test]
     fn shape_mapping_and_non_power_rows_are_exact() {
         let shape = shape();
@@ -584,6 +678,69 @@ mod tests {
     }
 
     #[test]
+    fn forged_shapes_fail_closed_at_public_entries() {
+        let mut forged = table();
+        forged.shape.k_lo = 31;
+        assert!(forged.at(0, 0).is_err());
+        assert!(forged.w(&[Fp3::ZERO; 3]).is_err());
+        assert!(forged.omega(&[Fp3::ZERO; 3]).is_err());
+        assert!(forged.shape.matrix_columns().is_err());
+        assert!(forged.shape.table_columns_used().is_err());
+        forged.shape.k_lo = 64;
+        assert!(forged.at(0, 0).is_err());
+        let mut bad_kcol = table();
+        bad_kcol.shape.k_col = 64;
+        assert!(bad_kcol.at(0, 0).is_err());
+        assert!(bad_kcol.omega(&[Fp3::ZERO; 3]).is_err());
+
+        let mut mismatch = table();
+        mismatch.shape.k_col = 4;
+        assert!(mismatch.at(0, 0).is_err());
+        assert!(mismatch.shape.check().is_err());
+
+        let mut non_power = table();
+        non_power.shape.table_rows = 3;
+        assert!(non_power.at(0, 0).is_err());
+
+        let mut huge = shape();
+        huge.matrix_rows = u64::MAX;
+        assert!(huge.check().is_err());
+        assert!(huge.k_row() > 0);
+        assert!(huge.matrix_columns().is_err());
+
+        let rows = table().rows;
+        assert!(LinTable::new(
+            LinShape {
+                matrix_rows: 3,
+                k_lo: 2,
+                k_col: 4,
+                table_rows: 2,
+                table_columns: 12,
+            },
+            rows
+        )
+        .is_err());
+
+        let mut short_row = table();
+        short_row.rows[1].pop();
+        assert!(short_row.at(2, 7).is_err());
+    }
+
+    #[test]
+    fn evaluation_rejects_dimension_overflow_and_accepts_zero_variables() {
+        let scalar = vec![Fp3::from_u64(7)];
+        assert_eq!(eval(&scalar, &[]).unwrap(), scalar[0]);
+        assert_eq!(eval_truncated(&scalar, &[], 1).unwrap(), scalar[0]);
+        assert!(eval(&[], &[]).is_err());
+        let long = vec![Fp3::ZERO; usize::BITS as usize + 1];
+        assert!(eval(&[], &long).is_err());
+        assert!(eval_truncated(&[], &long, 0).is_err());
+        let machine_width = vec![Fp3::ZERO; usize::BITS as usize];
+        assert!(eval(&[], &machine_width).is_err());
+        assert!(eval_truncated(&[], &machine_width, 0).is_err());
+    }
+
+    #[test]
     fn w_omega_and_dot_are_independently_checked() {
         let table = table();
         let weights = vec![Fp3::from_u64(2), Fp3::from_u64(3), Fp3::from_u64(5)];
@@ -602,9 +759,9 @@ mod tests {
                 Fp3::from_u64(1092),
             ]
         );
-        let omega = table.omega(&psi).unwrap();
+        let request_omega = table.omega(&psi).unwrap();
         assert_eq!(
-            omega,
+            request_omega,
             vec![
                 Fp3::from_u64(1330),
                 Fp3::from_u64(1334),
@@ -618,8 +775,29 @@ mod tests {
                 let eq = eq_eval(&psi, column, 3).unwrap();
                 expected = expected.add(&table.at(row as u64, column).unwrap().mul(&eq));
             }
-            assert_eq!(omega[row], expected);
+            assert_eq!(request_omega[row], expected);
         }
+        let shared_point = vec![Fp3::from_u64(17), Fp3::from_u64(19), Fp3::from_u64(23)];
+        assert_ne!(shared_point, psi);
+        let shared_omega = table.omega(&shared_point).unwrap();
+        assert_eq!(
+            shared_omega,
+            vec![
+                Fp3::from_u64(2356),
+                Fp3::from_u64(2360),
+                Fp3::from_u64(2364),
+                Fp3::ZERO,
+            ]
+        );
+        assert_eq!(eval(&w, &psi).unwrap(), Fp3::from_u64(13352));
+        assert_eq!(eval(&w, &shared_point).unwrap(), Fp3::from_u64(23612));
+        assert_eq!(
+            weights[0]
+                .mul(&shared_omega[0])
+                .add(&weights[1].mul(&shared_omega[1]))
+                .add(&weights[2].mul(&shared_omega[2])),
+            Fp3::from_u64(23612)
+        );
         let mask = LinMask {
             value: Fp3::from_u64(17),
             coefficient: Fp3::from_u64(3),
@@ -631,14 +809,14 @@ mod tests {
             masks: vec![mask],
             target,
         };
-        assert!(lin_dot_holds(&table, &claim).unwrap());
         assert!(lin_eval_holds(&table, &claim).unwrap());
-        let omega = table.omega(&claim.psi).unwrap();
-        assert!(lin_dot_holds_with(&table, &claim, &omega).unwrap());
-        let mut bad_omega = omega.clone();
+        assert!(lin_dot_holds(&table, &claim, &shared_point).unwrap());
+        assert!(lin_dot_holds_with(&table, &claim, &shared_point, &shared_omega).unwrap());
+        assert!(!lin_dot_holds_with(&table, &claim, &claim.psi, &shared_omega).unwrap());
+        let mut bad_omega = shared_omega.clone();
         bad_omega[0] = bad_omega[0].add(&Fp3::from_u64(1));
-        assert!(!lin_dot_holds_with(&table, &claim, &bad_omega).unwrap());
-        assert!(lin_dot_holds_with(&table, &claim, &omega[..3]).is_err());
+        assert!(!lin_dot_holds_with(&table, &claim, &shared_point, &bad_omega).unwrap());
+        assert!(lin_dot_holds_with(&table, &claim, &shared_point, &shared_omega[..3]).is_err());
         claim.target = target.add(&Fp3::from_u64(1));
         assert!(!lin_eval_holds(&table, &claim).unwrap());
         claim.target = target;
@@ -647,6 +825,7 @@ mod tests {
         claim.masks[0].coefficient = Fp3::from_u64(3);
         claim.psi[0] = Fp3::from_u64(19);
         assert!(!lin_eval_holds(&table, &claim).unwrap());
+        assert!(lin_dot_holds_with(&table, &claim, &shared_point, &shared_omega).unwrap());
         claim.psi[0] = Fp3::from_u64(7);
         let mut wrong_weights = claim.clone();
         wrong_weights.weights[0] = Fp3::from_u64(9);
@@ -654,7 +833,7 @@ mod tests {
         let mut short_weights = claim.clone();
         short_weights.weights.pop();
         assert!(lin_eval_holds(&table, &short_weights).is_err());
-        assert!(lin_dot_holds_with(&table, &short_weights, &omega).is_err());
+        assert!(lin_dot_holds_with(&table, &short_weights, &shared_point, &shared_omega).is_err());
         assert!(eval(&w, &psi[..2]).is_err());
     }
 
@@ -729,48 +908,91 @@ mod tests {
     }
 
     #[test]
-    fn skeleton_requires_every_first_seal_and_shared_table_fields() {
+    fn skeleton_requires_every_first_seal_and_matching_public_parameters() {
         let claim = |target: u64| LinClaim {
             weights: vec![Fp3::from_u64(1)],
             psi: vec![Fp3::from_u64(2)],
             masks: Vec::new(),
             target: Fp3::from_u64(target),
         };
-        let first_a = LinFirstFixture::new(claim(3), b"first-a".to_vec()).unwrap();
-        let first_b = LinFirstFixture::new(claim(4), b"first-b".to_vec()).unwrap();
-        let shared = LinSharedFixture::new(
-            &[first_a.seal, first_b.seal],
-            Digest([2; 32]),
-            Digest([3; 32]),
-            Digest([4; 32]),
-        )
-        .unwrap();
+        let first_a = LinFirstFixture::new(claim(3), public()).unwrap();
+        let first_b = LinFirstFixture::new(claim(4), public()).unwrap();
+        let shared = LinSharedFixture::new(&[first_a.seal, first_b.seal], public()).unwrap();
         let second = LinSecondFixture::new(&first_b, &shared).unwrap();
         check_lin_skeleton(&[first_a.clone(), first_b.clone()], &shared, &second).unwrap();
         assert!(check_lin_skeleton(&[first_b.clone()], &shared, &second).is_err());
+
         let mut wrong_identity = shared.clone();
-        wrong_identity.table_identity = Digest([8; 32]);
-        assert!(check_lin_skeleton(&[first_a.clone(), first_b.clone()], &wrong_identity, &second).is_err());
+        wrong_identity.public.table_identity = Digest([8; 32]);
+        assert!(check_lin_skeleton(
+            &[first_a.clone(), first_b.clone()],
+            &wrong_identity,
+            &second
+        )
+        .is_err());
+        let mut wrong_codes = shared.clone();
+        wrong_codes.public.codes = Digest([8; 32]);
+        assert!(check_lin_skeleton(
+            &[first_a.clone(), first_b.clone()],
+            &wrong_codes,
+            &second
+        )
+        .is_err());
         let mut wrong_record = shared.clone();
-        wrong_record.table_record = Digest([8; 32]);
-        assert!(check_lin_skeleton(&[first_a.clone(), first_b.clone()], &wrong_record, &second).is_err());
-        let mut wrong_configuration = shared;
-        wrong_configuration.configuration = Digest([8; 32]);
+        wrong_record.public.table_record = Digest([8; 32]);
+        assert!(check_lin_skeleton(
+            &[first_a.clone(), first_b.clone()],
+            &wrong_record,
+            &second
+        )
+        .is_err());
+        let mut wrong_configuration = shared.clone();
+        wrong_configuration.public.configuration = Digest([8; 32]);
         assert!(check_lin_skeleton(
             &[first_a.clone(), first_b.clone()],
             &wrong_configuration,
             &second
         )
         .is_err());
-        assert!(LinSharedFixture::new(&[], Digest([2; 32]), Digest([3; 32]), Digest([4; 32])).is_err());
-        assert!(LinSharedFixture::new(
-            &[Digest::ZERO],
-            Digest([2; 32]),
-            Digest([3; 32]),
-            Digest([4; 32])
+
+        let mut wrong_first_public = first_a.clone();
+        wrong_first_public.public.configuration = Digest([8; 32]);
+        assert!(check_lin_skeleton(
+            &[wrong_first_public, first_b.clone()],
+            &shared,
+            &second
         )
         .is_err());
-        assert!(LinFirstFixture::new(claim(5), Vec::new()).is_err());
+        let mut wrong_second_public = second.clone();
+        wrong_second_public.public.shape = LinShape::new(5, 2, 2, 20).unwrap();
+        assert!(check_lin_skeleton(
+            &[first_a.clone(), first_b.clone()],
+            &shared,
+            &wrong_second_public
+        )
+        .is_err());
+
+        let mut empty_query = first_a.clone();
+        empty_query.first_query.clear();
+        assert!(check_lin_skeleton(&[empty_query], &shared, &second).is_err());
+        let mut tampered_shared_query = shared.clone();
+        tampered_shared_query.first_query.push(0);
+        assert!(check_lin_skeleton(
+            &[first_a.clone(), first_b.clone()],
+            &tampered_shared_query,
+            &second
+        )
+        .is_err());
+
+        assert!(LinSharedFixture::new(&[], public()).is_err());
+        assert!(LinSharedFixture::new(&[Digest::ZERO], public()).is_err());
+        let mut zero_identity = public();
+        zero_identity.table_identity = Digest::ZERO;
+        assert!(LinSharedFixture::new(&[first_a.seal], zero_identity).is_err());
+        assert!(LinFirstFixture::new(claim(5), zero_identity).is_err());
+        let mut zero_codes = public();
+        zero_codes.codes = Digest::ZERO;
+        assert!(LinFirstFixture::new(claim(6), zero_codes).is_err());
     }
 
     #[test]
@@ -781,14 +1003,8 @@ mod tests {
             masks: Vec::new(),
             target: Fp3::from_u64(3),
         };
-        let first = LinFirstFixture::new(claim, b"first".to_vec()).unwrap();
-        let shared = LinSharedFixture::new(
-            &[first.seal],
-            Digest([2; 32]),
-            Digest([3; 32]),
-            Digest([4; 32]),
-        )
-        .unwrap();
+        let first = LinFirstFixture::new(claim, public()).unwrap();
+        let shared = LinSharedFixture::new(&[first.seal], public()).unwrap();
         let second = LinSecondFixture::new(&first, &shared).unwrap();
         check_lin_skeleton(&[first.clone()], &shared, &second).unwrap();
         assert!(check_lin_skeleton(&[], &shared, &second).is_err());
