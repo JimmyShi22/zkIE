@@ -1208,6 +1208,12 @@ impl FoldeqSession {
         if self.stage != Stage::FoldStarted {
             return Err(Error::InvalidSessionState);
         }
+        // With a G_u shape the S1 path continues through the fixed FOLD rounds
+        // and their final constraint; the legacy mask-query path is not an
+        // alternative and remains unavailable.
+        if self.plan.gu.is_some() {
+            return Err(Error::InvalidSessionState);
+        }
         let tree = self
             .plan
             .statement
@@ -2811,6 +2817,7 @@ mod tests {
     #[test]
     fn fold_session_round_order_and_missing_rounds_fail_closed() {
         let (mut session, _table, _start, _mask, _source) = fold_open_ready();
+        assert!(session.draw_mask_queries().is_err());
         let (row, _, _, _) = fold_fixture(session.plan(), 1);
         assert!(session.fold_finish().is_err());
         assert!(session.receive_fold_round(Fp3::ONE, Fp3::ONE).is_err());
