@@ -616,8 +616,10 @@ impl BatStatement {
     }
 
     /// Shape-less candidate mapping to the isolated FOLD fixture. It fails
-    /// closed unless the FOLD candidate checker accepts the layout, so the
-    /// public handoff entry does not silently return a layout outside the
+    /// closed unless the FOLD candidate checker accepts the layout and its
+    /// member-order implied main/mask offsets are exactly BAT's actual
+    /// main_first/mask_first; a space check alone is not enough. The public
+    /// handoff entry therefore does not silently return a layout outside the
     /// supported fixture subset. The result still needs the full checked
     /// handoff for the shape code widths; it is not a general GroupLayout
     /// handoff or a production layout source.
@@ -654,6 +656,7 @@ impl BatStatement {
         if out.fault(&fixture_shape).is_some() {
             return Err(Error::InvalidConfig);
         }
+        check_fold_fixture_offsets(&layout, &out)?;
         Ok(out)
     }
 
@@ -785,6 +788,69 @@ where
         let shape = lookup(form.oracle)?;
         if !shape.has(BatPart::Main) || form.values.len() != shape.table_len(BatPart::Main)? {
             return Err(Error::ShapeMismatch);
+        }
+    }
+    Ok(())
+}
+
+/// The first-row offsets that the isolated FOLD fixture's local member-order
+/// alignment would imply for one table. This is a candidate checker's
+/// coordinate convention, not a second production layout.
+fn fold_fixture_firsts(
+    layout: &FoldGroupLayout,
+    part: BatPart,
+) -> Result<Vec<Option<u64>>> {
+    let mut cursor = 0u64;
+    let mut firsts = Vec::with_capacity(layout.members.len());
+    for member in &layout.members {
+        let rows = match part {
+            BatPart::Main => member.main_rows,
+            BatPart::Mask => member.mask_rows,
+        };
+        if (part == BatPart::Main && member.kept) || rows == 0 {
+            firsts.push(None);
+            continue;
+        }
+        let block = 1u64
+            .checked_shl(ceil_log2(rows))
+            .ok_or(Error::ResourceLimit)?;
+        let start = if cursor == 0 {
+            0
+        } else {
+            let rest = cursor % block;
+            if rest == 0 {
+                cursor
+            } else {
+                cursor.checked_add(block - rest).ok_or(Error::ResourceLimit)?
+            }
+        };
+        firsts.push(Some(start));
+        cursor = start.checked_add(rows).ok_or(Error::ResourceLimit)?;
+    }
+    Ok(firsts)
+}
+
+/// Require the BAT layout's actual first offsets to equal the FOLD fixture
+/// checker's member-order offsets for both main and mask tables. A space check
+/// alone does not establish coordinate equality.
+fn check_fold_fixture_offsets(
+    bat: &BatGroupLayout,
+    fold: &FoldGroupLayout,
+) -> Result<()> {
+    if bat.members.len() != fold.members.len()
+        || bat
+            .members
+            .iter()
+            .zip(&fold.members)
+            .any(|(left, right)| left.oracle != right.oracle)
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let main = fold_fixture_firsts(fold, BatPart::Main)?;
+    let mask = fold_fixture_firsts(fold, BatPart::Mask)?;
+    for (index, member) in bat.members.iter().enumerate() {
+        if main[index] != member.main_first || mask[index] != member.mask_first {
+            return Err(Error::InvalidConfig);
         }
     }
     Ok(())
@@ -1621,6 +1687,32 @@ mod tests {
             mask_leaf_class: 3,
         };
         assert!(st.to_fold_layout_checked(group, &shape).is_err());
+    }
+
+    #[test]
+    fn fold_fixture_offsets_must_match_bat_offsets() {
+        fn handoff(main_rows: &[u64], mask_rows: &[u64]) -> (BatGroupLayout, Result<()>) {
+            let mut st = BatStatement::new();
+            for (index, (main, mask)) in main_rows.iter().zip(mask_rows).enumerate() {
+                add_shape(&mut st, shape(index as u64, *main, *mask, 1));
+            }
+            let group = st.new_group(code(), mask_code()).unwrap();
+            for index in 0..main_rows.len() {
+                st.join(group, index as u64, false).unwrap();
+            }
+            let layout = st.layout(group).unwrap();
+            (layout, st.to_fold_layout(group).map(|_| ()))
+        }
+        let (layout, result) = handoff(&[1, 2], &[1, 2]);
+        assert_eq!(layout.members[0].main_first, Some(2));
+        assert_eq!(layout.members[1].main_first, Some(0));
+        assert_eq!(layout.members[0].mask_first, Some(2));
+        assert_eq!(layout.members[1].mask_first, Some(0));
+        assert!(result.is_err());
+        assert!(handoff(&[1, 2], &[2, 1]).1.is_err());
+        assert!(handoff(&[2, 1], &[1, 2]).1.is_err());
+        assert!(handoff(&[2, 2], &[2, 2]).1.is_ok());
+        assert!(handoff(&[2, 1], &[2, 1]).1.is_ok());
     }
 
     #[test]
