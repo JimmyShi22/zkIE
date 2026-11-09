@@ -10,6 +10,7 @@
 use zkie_core::common::field::PrimeCharacteristicRing;
 use zkie_core::error::{Error, Result};
 
+use crate::pcs::request::code::factors;
 use crate::pcs::request::field::{Fp, Fp3, E_DEGREE};
 use crate::pcs::request::gu::{GuRegistry, GuShape};
 use crate::pcs::request::table::{
@@ -229,6 +230,158 @@ pub fn record_row(
     })
 }
 
+fn product_index(f: &[Fp], count: u32, index: u64) -> Fp {
+    let mut value = Fp::ONE;
+    for (t, factor) in f.iter().take(count as usize).enumerate() {
+        if (index >> t) & 1 == 1 {
+            value = value * *factor;
+        }
+    }
+    value
+}
+
+fn code_log_ell(code: &crate::pcs::request::code::CodeParams) -> u32 {
+    ceil_log2(code.ell)
+}
+
+fn code_log_r(code: &crate::pcs::request::code::CodeParams) -> u32 {
+    ceil_log2(code.r)
+}
+
+fn tail_first(code: &crate::pcs::request::code::CodeParams) -> Result<u64> {
+    let step = 1u64
+        .checked_shl(code_log_r(code))
+        .ok_or(Error::ResourceLimit)?;
+    Ok(code
+        .ell
+        .checked_add(step - 1)
+        .ok_or(Error::ResourceLimit)?
+        / step
+        * step)
+}
+
+fn generator_message(
+    code: &crate::pcs::request::code::CodeParams,
+    position: u64,
+) -> Result<Vec<Fp>> {
+    let log_dim = ceil_log2(
+        code.ell
+            .checked_add(code.r)
+            .ok_or(Error::ResourceLimit)?,
+    );
+    let factors = factors(code.log_n, position, log_dim)?;
+    let scale = product_index(&factors, log_dim, code.r);
+    let mut message = Vec::with_capacity(code.ell as usize);
+    for entry in 0..code.ell {
+        message.push(product_index(&factors, code_log_ell(code), entry) * scale);
+    }
+    Ok(message)
+}
+
+fn generator_tail(
+    code: &crate::pcs::request::code::CodeParams,
+    position: u64,
+) -> Result<Vec<Fp>> {
+    let log_dim = ceil_log2(
+        code.ell
+            .checked_add(code.r)
+            .ok_or(Error::ResourceLimit)?,
+    );
+    let factors = factors(code.log_n, position, log_dim)?;
+    let scale = product_index(&factors, log_dim, 0);
+    let mut tail = Vec::with_capacity(code.r as usize);
+    for entry in 0..code.r {
+        tail.push(product_index(&factors, code_log_r(code), entry) * scale);
+    }
+    Ok(tail)
+}
+
+/// Build one column-query relation row: the generator coefficients of the
+/// indexed code at the drawn position, placed on the G_u main table, with the
+/// target equal to the authenticated index column folded at `eq_gamma`.
+pub fn column_row(
+    shape: &GuShape,
+    registry: &GuRegistry,
+    position: u64,
+    column: &[Fp3],
+    eq_gamma: &[Fp3],
+) -> Result<GuRelationRow> {
+    check_binding(shape, registry)?;
+    let rows = usize::try_from(shape.index.rows()).map_err(|_| Error::ResourceLimit)?;
+    if position >= shape.index.code.n() || column.len() != rows || eq_gamma.len() != rows {
+        return Err(Error::ShapeMismatch);
+    }
+    let message = generator_message(&shape.index.code, position)?;
+    let tail = generator_tail(&shape.index.code, position)?;
+    let first = tail_first(&shape.index.code)?;
+    let mut main = empty_main(shape)?;
+    let mut mask = empty_mask(shape)?;
+    for (entry, coefficient) in message.iter().enumerate() {
+        let index = vector_index(shape, entry as u64)?;
+        main[index] = main[index].add(&Fp3::from_base(*coefficient));
+    }
+    for (entry, coefficient) in tail.iter().enumerate() {
+        let index = vector_index(shape, first + entry as u64)?;
+        main[index] = main[index].add(&Fp3::from_base(*coefficient));
+    }
+    mask.iter_mut().for_each(|coefficient| *coefficient = Fp3::ZERO);
+    let mut target = Fp3::ZERO;
+    for (weight, value) in eq_gamma.iter().zip(column) {
+        target = target.add(&weight.mul(value));
+    }
+    Ok(GuRelationRow {
+        oracle: shape.oracle,
+        group: shape.group,
+        kind: GuRelationKind::Column,
+        main,
+        mask,
+        target,
+    })
+}
+
+/// The trusted draw sequence and the claimed positions must agree item by
+/// item: a permutation of the same multiset, a missing item or a reordering is
+/// not the drawn relation.
+pub fn validate_draw_sequence(trusted: &[u64], claimed: &[u64]) -> Result<()> {
+    if trusted.is_empty() || trusted != claimed {
+        return Err(Error::StatementMismatch);
+    }
+    Ok(())
+}
+
+/// The unique sorted positions of a draw list, for the one physical opening
+/// that may be reused by every draw at the same position. This does not
+/// decide the logical draw sequence.
+pub fn unique_positions(trusted: &[u64]) -> Vec<u64> {
+    let mut positions = trusted.to_vec();
+    positions.sort_unstable();
+    positions.dedup();
+    positions
+}
+
+/// Build one row per logical draw in the trusted order. Each claim carries its
+/// own position and authenticated column; the positions must equal the trusted
+/// draw list exactly (multiplicity and order included). Physical openings may
+/// be deduplicated separately with `unique_positions`.
+pub fn column_rows_from_draws(
+    shape: &GuShape,
+    registry: &GuRegistry,
+    trusted_draws: &[u64],
+    claimed: &[(u64, Vec<Fp3>)],
+    eq_gamma: &[Fp3],
+) -> Result<Vec<GuRelationRow>> {
+    if trusted_draws.is_empty() || trusted_draws.len() != claimed.len() {
+        return Err(Error::StatementMismatch);
+    }
+    let positions: Vec<u64> = claimed.iter().map(|(position, _)| *position).collect();
+    validate_draw_sequence(trusted_draws, &positions)?;
+    let mut rows = Vec::with_capacity(claimed.len());
+    for (position, column) in claimed {
+        rows.push(column_row(shape, registry, *position, column, eq_gamma)?);
+    }
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,5 +550,116 @@ mod tests {
         let mut other = shape.clone();
         other.group = 2;
         assert!(record_row(&other, &registry, &record, &name, &seeds, &eq_gamma, 0).is_err());
+    }
+
+    fn column_values(shape: &GuShape) -> Vec<Fp3> {
+        (0..shape.index.rows())
+            .map(|row| Fp3::from_u64(300 + row))
+            .collect()
+    }
+
+    fn encode_symbol(
+        code: &crate::pcs::request::code::CodeParams,
+        message: &[Fp],
+        tail: &[Fp],
+        position: u64,
+    ) -> Fp {
+        crate::pcs::request::code::encode_row_fp(code, message, tail).unwrap()[position as usize]
+    }
+
+    #[test]
+    fn column_row_matches_an_independent_generator_evaluation() {
+        let shape = shape();
+        let registry = registry(&shape);
+        let position = 2u64;
+        let column = column_values(&shape);
+        let eq_gamma = vec![
+            Fp3::from_u64(2),
+            Fp3::from_u64(3),
+            Fp3::from_u64(5),
+            Fp3::from_u64(7),
+        ];
+        let row = column_row(&shape, &registry, position, &column, &eq_gamma).unwrap();
+        let code = &shape.index.code;
+        let mut expected = vec![Fp3::ZERO; shape.u.main_rows as usize * shape.u.code.ell as usize];
+        for entry in 0..code.ell {
+            let mut message = vec![Fp::ZERO; code.ell as usize];
+            message[entry as usize] = Fp::ONE;
+            let tail = vec![Fp::ZERO; code.r as usize];
+            expected[entry as usize] =
+                Fp3::from_base(encode_symbol(code, &message, &tail, position));
+        }
+        let first = tail_first(code).unwrap();
+        for entry in 0..code.r {
+            let message = vec![Fp::ZERO; code.ell as usize];
+            let mut tail = vec![Fp::ZERO; code.r as usize];
+            tail[entry as usize] = Fp::ONE;
+            expected[(first + entry) as usize] =
+                Fp3::from_base(encode_symbol(code, &message, &tail, position));
+        }
+        assert_eq!(row.main, expected);
+        let mut target = Fp3::ZERO;
+        for (weight, value) in eq_gamma.iter().zip(&column) {
+            target = target.add(&weight.mul(value));
+        }
+        assert_eq!(row.target, target);
+        let witness = witness(&shape);
+        let mut manual = Fp3::ZERO;
+        for (coefficient, entry) in expected.iter().zip(&witness.main) {
+            manual = manual.add(&coefficient.mul(entry));
+        }
+        assert_eq!(row.evaluate(&witness).unwrap(), manual);
+        assert!(column_row(&shape, &registry, code.n(), &column, &eq_gamma).is_err());
+        assert!(column_row(&shape, &registry, position, &column[..3], &eq_gamma).is_err());
+        assert!(column_row(&shape, &registry, position, &column, &eq_gamma[..3]).is_err());
+        let mut other = shape.clone();
+        other.group = 2;
+        assert!(column_row(&other, &registry, position, &column, &eq_gamma).is_err());
+    }
+
+    #[test]
+    fn column_draw_sequence_keeps_order_and_multiplicity() {
+        let shape = shape();
+        let registry = registry(&shape);
+        let eq_gamma = vec![Fp3::ONE; 4];
+        let column = column_values(&shape);
+        let trusted = [1u64, 1, 3];
+        let claimed = vec![
+            (1u64, column.clone()),
+            (1u64, column.clone()),
+            (3u64, column.clone()),
+        ];
+        let rows =
+            column_rows_from_draws(&shape, &registry, &trusted, &claimed, &eq_gamma).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], rows[1]);
+        let mut duplicate_permuted = claimed.clone();
+        duplicate_permuted[1].0 = 3;
+        duplicate_permuted[2].0 = 1;
+        assert!(column_rows_from_draws(
+            &shape,
+            &registry,
+            &trusted,
+            &duplicate_permuted,
+            &eq_gamma
+        )
+        .is_err());
+        assert!(column_rows_from_draws(
+            &shape,
+            &registry,
+            &trusted,
+            &claimed[..2],
+            &eq_gamma
+        )
+        .is_err());
+        let reordered = vec![
+            (3u64, column.clone()),
+            (1u64, column.clone()),
+            (1u64, column.clone()),
+        ];
+        assert!(column_rows_from_draws(&shape, &registry, &trusted, &reordered, &eq_gamma).is_err());
+        assert_eq!(unique_positions(&trusted), vec![1, 3]);
+        assert!(validate_draw_sequence(&trusted, &[1, 1, 3]).is_ok());
+        assert!(validate_draw_sequence(&trusted, &[1, 3, 3]).is_err());
     }
 }
