@@ -236,4 +236,19 @@ mod tests {
         tampered[last] ^= 1;
         assert!(bind(&expected, &[-5, 7, 0], None, &tampered).is_err());
     }
+
+    #[test]
+    fn argmax_and_int_output_keep_their_widths() {
+        let mut bytes = Vec::with_capacity(12);
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&0x8000_0000u32.to_le_bytes());
+        assert_eq!(
+            decode_public_inputs(&bytes, OutputKind::Argmax, 1).unwrap(),
+            vec![2_147_483_648i64]
+        );
+        assert_eq!(
+            decode_public_inputs(&bytes, OutputKind::IntOutput, 1).unwrap(),
+            vec![-2_147_483_648i64]
+        );
+    }
 }

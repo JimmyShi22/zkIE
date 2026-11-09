@@ -5,8 +5,10 @@
 //! proof. Verify reads only the public commitment/proof/inputs.
 
 use std::fs;
+use std::io::{BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use zkie_core::artifact::{
@@ -67,6 +69,31 @@ fn read_i32(path: &Path) -> Result<Vec<i32>> {
         .chunks_exact(4)
         .map(|chunk| i32::from_le_bytes(chunk.try_into().unwrap_or([0; 4])))
         .collect())
+}
+
+fn deserialize_exact<T: DeserializeOwned>(bytes: &[u8], trailing_error: Error) -> Result<T> {
+    let mut cursor = Cursor::new(bytes);
+    let value = bincode::deserialize_from(&mut cursor).map_err(|_| Error::InvalidEncoding)?;
+    if cursor.position() != bytes.len() as u64 {
+        return Err(trailing_error);
+    }
+    Ok(value)
+}
+
+fn read_proof_exact(path: &Path) -> Result<SharedTrace> {
+    let file = fs::File::open(path).map_err(|_| Error::IncompleteArtifact)?;
+    let mut reader = BufReader::new(file);
+    read_proof_from(&mut reader)
+}
+
+fn read_proof_from<R: Read>(reader: &mut R) -> Result<SharedTrace> {
+    let trace = bincode::deserialize_from(&mut *reader).map_err(|_| Error::InvalidEncoding)?;
+    let mut trailing = [0u8; 1];
+    match reader.read(&mut trailing) {
+        Ok(0) => Ok(trace),
+        Ok(_) => Err(Error::InvalidProof),
+        Err(_) => Err(Error::Io),
+    }
 }
 
 fn parse_case(case: &Path) -> Result<ProviderConfig> {
@@ -373,14 +400,11 @@ impl PipelineProvider for ProductionProvider {
         let commitment_bytes = fs::read(request.public_bundle_dir.join("model-commitment.bin"))
             .map_err(|_| Error::IncompleteArtifact)?;
         let public: ModelCommitmentPublic =
-            bincode::deserialize(&commitment_bytes).map_err(|_| Error::InvalidEncoding)?;
+            deserialize_exact(&commitment_bytes, Error::ArtifactIntegrityMismatch)?;
         let statement_bytes = fs::read(&request.statement).map_err(|_| Error::IncompleteArtifact)?;
         let statement: StatementData =
-            bincode::deserialize(&statement_bytes).map_err(|_| Error::InvalidEncoding)?;
-        let proof_file =
-            fs::File::open(&request.proof).map_err(|_| Error::IncompleteArtifact)?;
-        let trace: SharedTrace = bincode::deserialize_from(std::io::BufReader::new(proof_file))
-            .map_err(|_| Error::InvalidEncoding)?;
+            deserialize_exact(&statement_bytes, Error::InvalidProof)?;
+        let trace = read_proof_exact(&request.proof)?;
         let public_inputs =
             fs::read(&request.public_inputs).map_err(|_| Error::IncompleteArtifact)?;
 
@@ -539,4 +563,121 @@ impl PipelineProvider for ProductionProvider {
 
 pub fn production_provider() -> ProductionProvider {
     ProductionProvider
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{self, Cursor};
+
+    fn trace() -> SharedTrace {
+        SharedTrace {
+            tokens: Vec::new(),
+            assets: Vec::new(),
+            steps: Vec::new(),
+            argmax: Vec::new(),
+            output: Vec::new(),
+        }
+    }
+
+    fn statement() -> StatementData {
+        StatementData {
+            case_id: "case".into(),
+            model: "gpt2".into(),
+            model_commitment: Digest([1; 32]),
+            tokens: Vec::new(),
+            expected_argmax: Vec::new(),
+            expected_output: Vec::new(),
+        }
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "zkie-provider-bytes-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn exact_bincode_rejects_trailing_and_truncation() {
+        let bytes = bincode::serialize(&statement()).unwrap();
+        let value: StatementData =
+            deserialize_exact(&bytes, Error::InvalidProof).unwrap();
+        assert_eq!(value.case_id, "case");
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(
+            deserialize_exact::<StatementData>(&trailing, Error::InvalidProof)
+                .unwrap_err()
+                .code(),
+            "invalid_proof"
+        );
+        assert_eq!(
+            deserialize_exact::<StatementData>(&bytes[..bytes.len() - 1], Error::InvalidProof)
+                .unwrap_err()
+                .code(),
+            "invalid_encoding"
+        );
+    }
+
+    #[test]
+    fn proof_bincode_requires_eof() {
+        let root = temp_path("proof");
+        let path = root.join("proof.bin");
+        let bytes = bincode::serialize(&trace()).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        read_proof_exact(&path).unwrap();
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        fs::write(&path, &trailing).unwrap();
+        assert_eq!(
+            read_proof_exact(&path).unwrap_err().code(),
+            "invalid_proof"
+        );
+        fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+        assert_eq!(
+            read_proof_exact(&path).unwrap_err().code(),
+            "invalid_encoding"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    struct ErrorAfter {
+        bytes: Cursor<Vec<u8>>,
+    }
+
+    impl Read for ErrorAfter {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            let position = self.bytes.position() as usize;
+            if position < self.bytes.get_ref().len() {
+                self.bytes.read(out)
+            } else {
+                Err(io::Error::other("injected read error"))
+            }
+        }
+    }
+
+    #[test]
+    fn proof_eof_read_error_is_not_success() {
+        let bytes = bincode::serialize(&trace()).unwrap();
+        let mut reader = ErrorAfter {
+            bytes: Cursor::new(bytes),
+        };
+        assert_eq!(
+            read_proof_from(&mut reader).unwrap_err().code(),
+            "io"
+        );
+    }
+
+    #[test]
+    fn proof_directory_is_not_success() {
+        let root = temp_path("proof-dir");
+        let path = root.join("proof.bin");
+        fs::create_dir_all(&path).unwrap();
+        assert!(read_proof_exact(&path).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
 }
