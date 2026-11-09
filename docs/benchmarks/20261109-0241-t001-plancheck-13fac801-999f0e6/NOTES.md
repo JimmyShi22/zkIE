@@ -489,10 +489,11 @@ figure remains in the record as the earlier record.
 - `registration/policies/<model>/case.policy`: archived copies of the
   registered policies.
 - `prod/<case>/`: prove and verify results, the copied policy and its
-  `policy-source.json` record. `proof/proof.bin` stays on disk in place and is
-  gitignored.
-- `prove-gpt2-seq16/`: current-code proof reproduction; `proof.bin` stays on
-  disk and is gitignored, and `prove-gpt2-seq16-run/` holds its text results.
+  `policy-source.json` record. `proof/proof.bin` is gitignored and was deleted
+  in the cleanup.
+- `prove-gpt2-seq16/`: current-code proof reproduction; `proof.bin` is
+  gitignored and was deleted in the cleanup, and `prove-gpt2-seq16-run/` holds
+  its text results.
 - `binding/`: expected, none, wrong-digest, tampered, truncated, trailing,
   count-mismatch and illegal-value runs; `inputs/` and `policies/`.
 - `final/<case>/`: first run with the final code.
@@ -507,6 +508,18 @@ figure remains in the record as the earlier record.
 - Large proof binaries are deleted after verification and ledger entry; the
   keep list is minimal: textual artifacts, each case's cold-0 commit directory,
   policies, GT files, registrations and assets.
-- The trace directory held 154G on disk before the cleanup; `/data` had 281G
-  free after the runs. The cleanup inventory and freed bytes are recorded in
-  the cleanup entry below.
+
+### Cleanup
+
+The final measurements and all textual records were committed first. Then 30
+`proof.bin` files totaling 832.10 GiB were deleted from the three trace
+directories, together with the temporary smoke copies `/tmp/v2smoke` and
+`/tmp/v2smoke512` (40.19 GiB). The files were selected as every regular
+`*.bin` file of at least 1 MiB outside the `cold-*` commit directories; the
+count and byte total were taken before deletion. `/data/zkie-assets` (769G)
+was not touched. After the cleanup the three trace directories hold 152 KiB,
+4.2 MiB and 5.1 MiB, and 600 files remain, including the 30 files under the
+`cold-*` commit directories. `/data` free space moved from 264.7 GiB
+(284,194,062,336 bytes) to 1.07 TiB (1,177,655,009,280 bytes) as reported by
+df. Every number in this trace comes from the committed text records; no proof
+binary is needed to read them.
