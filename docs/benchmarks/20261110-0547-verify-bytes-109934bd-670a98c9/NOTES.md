@@ -77,9 +77,9 @@ Proof byte counts are identical to the baseline for every case; the previous
 proof files were deleted, so no proof content-digest comparison is claimed.
 Verify wall time moves between -1.192% and +0.624%; prove wall time between
 -0.183% and +0.576%. Prove VmHWM moves between -0.011% and +0.001%; verify
-VmHWM between -0.264% and +0.040%. No byte growth and no memory rise beyond
-measurement noise were observed. Total three-stage wall time was 1,891 s across
-the five cases (`full3.txt`).
+VmHWM between -0.264% and +0.040%. Both this run and the baseline are single
+measurements; single samples are not sufficient to establish measurement noise.
+Total three-stage wall time was 1,891 s across the five cases (`full3.txt`).
 
 Authenticated output digests (all equal to the baseline):
 
