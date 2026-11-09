@@ -2,11 +2,13 @@ use zkie_core::error::Error;
 use zkie_core::types::Digest;
 use zkie_ops::affine_scale::AffineScaleOp;
 use zkie_ops::matmul::MatMulOp;
-use zkie_ops::proof::binding::commit_rows_with_openings;
+use zkie_ops::op::OpCode;
+use zkie_ops::proof::binding::{commit_rows_with_openings, OracleRegistry};
 use zkie_ops::proof::relations::{
     proof_input_values, prove_op_relation_shared, verify_op_relation_with_external,
-    OpRelationProof, OpRelationPublic, RelationConfig,
+    OpRelationProof, OpRelationPublic, RelationConfig, RelationLengths,
 };
+use zkie_ops::softmax::SoftmaxOp;
 
 fn matmul_fixture() -> (OpRelationPublic, OpRelationProof, Vec<i64>) {
     let op = MatMulOp {
@@ -185,4 +187,70 @@ fn extra_zero_leaves_are_rejected() {
         verify_code(&public, &tampered, &config),
         "statement_mismatch"
     );
+}
+
+fn layout_fixture(cells: usize) -> (OpRelationPublic, OpRelationProof, Vec<i64>) {
+    let config = vec![0, 2, 2, 4, 1];
+    let values: Vec<i64> = (1..=cells as i64).collect();
+    let mut rows: Vec<Vec<u64>> = values.iter().map(|value| vec![*value as u64]).collect();
+    rows.resize(rows.len().max(1).next_power_of_two(), vec![0]);
+    let mut registry = OracleRegistry::new();
+    let (input_oracle, inputs) =
+        commit_rows_with_openings(&mut registry, &Digest([11; 32]), &rows).unwrap();
+    let (output_oracle, outputs) =
+        commit_rows_with_openings(&mut registry, &Digest([12; 32]), &rows).unwrap();
+    let proof = OpRelationProof {
+        lengths: RelationLengths {
+            inputs: vec![cells],
+            outputs: vec![cells],
+            raw: Vec::new(),
+            quotients: Vec::new(),
+            helpers: Vec::new(),
+            aux: Vec::new(),
+        },
+        inputs: vec![inputs],
+        outputs: vec![outputs],
+        raw: Vec::new(),
+        quotients: Vec::new(),
+        helpers: Vec::new(),
+        aux: Vec::new(),
+    };
+    let public = OpRelationPublic {
+        opcode: OpCode::Layout,
+        config: config.clone(),
+        registry,
+        input_oracles: vec![input_oracle],
+        output_oracles: vec![output_oracle],
+    };
+    (public, proof, config)
+}
+
+#[test]
+fn layout_lengths_must_match_the_grid() {
+    let (public, proof, config) = layout_fixture(4);
+    verify_op_relation_with_external(&public, &proof, &config, &[]).unwrap();
+
+    let (short_public, short_proof, short_config) = layout_fixture(3);
+    assert_eq!(
+        verify_code(&short_public, &short_proof, &short_config),
+        "shape_mismatch"
+    );
+}
+
+#[test]
+fn softmax_raw_length_must_match_the_input() {
+    let op = SoftmaxOp { shift: 4 };
+    let inputs = vec![vec![1i64, 2, 3, 4], vec![1i64, 2, 3, 4]];
+    let config = op.relation_config(&inputs).unwrap();
+    let (mut public, proof) = prove_op_relation_shared(&op, &inputs, &config, &[]).unwrap();
+    verify_op_relation_with_external(&public, &proof, &config, &[]).unwrap();
+
+    let words = proof.raw[0][0].values.clone();
+    let shortened = words[..words.len() - 2].to_vec();
+    let (oracle, openings) =
+        commit_rows_with_openings(&mut public.registry, &Digest([13; 32]), &[shortened]).unwrap();
+    let mut tampered = proof.clone();
+    tampered.raw[0] = openings;
+    tampered.lengths.raw[0] -= 1;
+    assert_eq!(verify_code(&public, &tampered, &config), "shape_mismatch");
 }

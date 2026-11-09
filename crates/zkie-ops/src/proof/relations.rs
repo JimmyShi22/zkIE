@@ -857,7 +857,17 @@ pub fn verify_op_relation_with_external(
             let from_y = *config.get(2).ok_or(Error::InvalidConfig)? as usize;
             let to_x = *config.get(3).ok_or(Error::InvalidConfig)? as usize;
             let to_y = *config.get(4).ok_or(Error::InvalidConfig)? as usize;
-            if from_x * from_y != to_x * to_y || inputs.len() != 1 || outputs[0].len() != inputs[0].len() {
+            let cells = from_x
+                .checked_mul(from_y)
+                .ok_or(Error::ShapeMismatch)?;
+            let targets = to_x
+                .checked_mul(to_y)
+                .ok_or(Error::ShapeMismatch)?;
+            if cells != targets
+                || inputs.len() != 1
+                || inputs[0].len() != cells
+                || outputs[0].len() != targets
+            {
                 return Err(Error::ShapeMismatch);
             }
             for row in 0..from_x {
@@ -915,18 +925,22 @@ pub fn verify_op_relation_with_external(
             let k = *config.get(2).ok_or(Error::InvalidConfig)? as usize;
             let shift = *config.get(3).ok_or(Error::InvalidConfig)? as u32;
             let bias_len = *config.get(4).ok_or(Error::InvalidConfig)? as usize;
-            if config.len() != 5 + bias_len
+            let bias_header = 5usize.checked_add(bias_len).ok_or(Error::ResourceLimit)?;
+            let left = m.checked_mul(k).ok_or(Error::ResourceLimit)?;
+            let right = k.checked_mul(n).ok_or(Error::ResourceLimit)?;
+            let output_len = m.checked_mul(n).ok_or(Error::ResourceLimit)?;
+            if config.len() != bias_header
                 || inputs.len() != 2
-                || inputs[0].len() != m * k
-                || inputs[1].len() != k * n
-                || outputs[0].len() != m * n
-                || raw.is_empty() || raw[0].len() != m * n
+                || inputs[0].len() != left
+                || inputs[1].len() != right
+                || outputs[0].len() != output_len
+                || raw.is_empty() || raw[0].len() != output_len
             {
                 return Err(Error::ShapeMismatch);
             }
-            let bias = &config[5..5 + bias_len];
+            let bias = &config[5..bias_header];
             let computed = crate::registry::matmul_raw(&inputs[0], &inputs[1], m, n, k)?;
-            (0..m * n).into_par_iter().try_for_each(|slot| -> Result<()> {
+            (0..output_len).into_par_iter().try_for_each(|slot| -> Result<()> {
                 let expected = computed[slot]
                     .checked_add(if bias.is_empty() {
                         0i128
@@ -970,6 +984,9 @@ pub fn verify_op_relation_with_external(
                 return Err(Error::ShapeMismatch);
             }
             let length = inputs[0].len();
+            if raw[0].len() != length {
+                return Err(Error::ShapeMismatch);
+            }
             let max = *inputs[0].iter().max().ok_or(Error::InvalidProof)?;
             if aux.len() != 3 || aux[0] != vec![max] || aux[1].len() != length || aux[2].len() != 1 {
                 return Err(Error::InvalidProof);
@@ -981,14 +998,17 @@ pub fn verify_op_relation_with_external(
                 if entry < 0 || aux[1][index] != entry {
                     return Err(Error::InvalidProof);
                 }
-                denominator += entry as i128;
+                denominator = denominator
+                    .checked_add(entry as i128)
+                    .ok_or(Error::BoundViolation)?;
             }
             if denominator == 0 || aux[2][0] as i128 != denominator {
                 return Err(Error::InvalidProof);
             }
+            let scale = 1i128.checked_shl(shift).ok_or(Error::BoundViolation)?;
             for index in 0..length {
                 let numerator = (aux[1][index] as i128)
-                    .checked_mul(1i128 << shift)
+                    .checked_mul(scale)
                     .ok_or(Error::BoundViolation)?;
                 if raw[0][index] != numerator
                     || outputs[0][index] as i128 != crate::registry::round_div_half_up(numerator, denominator)?
@@ -1062,11 +1082,12 @@ pub fn verify_op_relation_with_external(
             let cols = *config.get(1).ok_or(Error::InvalidConfig)? as usize;
             let valid = *config.get(2).ok_or(Error::InvalidConfig)? as usize;
             let shift = *config.get(3).ok_or(Error::InvalidConfig)? as u32;
+            let cells = rows.checked_mul(cols).ok_or(Error::ResourceLimit)?;
             if valid == 0 || valid > cols || inputs.len() != 2
-                || inputs[0].len() != rows * cols
-                || inputs[1].len() != rows * cols
-                || outputs[0].len() != rows * cols
-                || raw.is_empty() || raw[0].len() != rows * cols
+                || inputs[0].len() != cells
+                || inputs[1].len() != cells
+                || outputs[0].len() != cells
+                || raw.is_empty() || raw[0].len() != cells
             {
                 return Err(Error::ShapeMismatch);
             }
@@ -1078,8 +1099,9 @@ pub fn verify_op_relation_with_external(
             } else if aux.len() != 2 || aux[0].len() != rows || aux[1].len() != rows {
                 return Err(Error::InvalidProof);
             }
+            let doubled_shift = shift.checked_mul(2).ok_or(Error::BoundViolation)?;
             let scale_squared = 1u128
-                .checked_shl(2 * shift)
+                .checked_shl(doubled_shift)
                 .ok_or(Error::BoundViolation)?;
             for row in 0..rows {
                 let start = row * cols;
@@ -1167,7 +1189,11 @@ pub fn verify_op_relation_with_external(
         }
         OpCode::TopK => {
             let k = *config.first().ok_or(Error::InvalidConfig)? as usize;
-            if inputs.len() != 1 || k == 0 || k > inputs[0].len() || outputs[0].len() != 2 * k {
+            if inputs.len() != 1 || k == 0 || k > inputs[0].len() {
+                return Err(Error::ShapeMismatch);
+            }
+            let output_len = k.checked_mul(2).ok_or(Error::ResourceLimit)?;
+            if outputs[0].len() != output_len {
                 return Err(Error::ShapeMismatch);
             }
             let mut order: Vec<usize> = (0..inputs[0].len()).collect();
@@ -1201,7 +1227,14 @@ pub fn verify_op_relation_with_external(
         OpCode::RouteGate => {
             let top_k = *config.first().ok_or(Error::InvalidConfig)? as usize;
             let threshold = *config.get(1).ok_or(Error::InvalidConfig)?;
-            if inputs.len() != 1 || top_k == 0 || top_k > inputs[0].len() || outputs[0].len() != 1 + 2 * top_k {
+            if inputs.len() != 1 || top_k == 0 || top_k > inputs[0].len() {
+                return Err(Error::ShapeMismatch);
+            }
+            let output_len = top_k
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(1))
+                .ok_or(Error::ResourceLimit)?;
+            if outputs[0].len() != output_len {
                 return Err(Error::ShapeMismatch);
             }
             let mut order: Vec<usize> = (0..inputs[0].len()).collect();
@@ -1242,7 +1275,14 @@ pub fn verify_op_relation_with_external(
         }
         OpCode::Gather => {
             let cols = *config.first().ok_or(Error::InvalidConfig)? as usize;
-            if inputs.len() != 2 || cols == 0 || inputs[0].len() % cols != 0 || outputs[0].len() != inputs[1].len() * cols {
+            if inputs.len() != 2 || cols == 0 || inputs[0].len() % cols != 0 {
+                return Err(Error::ShapeMismatch);
+            }
+            let output_len = inputs[1]
+                .len()
+                .checked_mul(cols)
+                .ok_or(Error::ResourceLimit)?;
+            if outputs[0].len() != output_len {
                 return Err(Error::ShapeMismatch);
             }
             let rows = inputs[0].len() / cols;
@@ -1264,11 +1304,23 @@ pub fn verify_op_relation_with_external(
             let n = *config.get(2).ok_or(Error::InvalidConfig)? as usize;
             let k = *config.get(3).ok_or(Error::InvalidConfig)? as usize;
             let shift = *config.get(4).ok_or(Error::InvalidConfig)? as u32;
+            let left = batch
+                .checked_mul(m)
+                .and_then(|value| value.checked_mul(k))
+                .ok_or(Error::ResourceLimit)?;
+            let right = batch
+                .checked_mul(k)
+                .and_then(|value| value.checked_mul(n))
+                .ok_or(Error::ResourceLimit)?;
+            let output_len = batch
+                .checked_mul(m)
+                .and_then(|value| value.checked_mul(n))
+                .ok_or(Error::ResourceLimit)?;
             if inputs.len() != 2
-                || inputs[0].len() != batch * m * k
-                || inputs[1].len() != batch * k * n
-                || outputs[0].len() != batch * m * n
-                || raw.is_empty() || raw[0].len() != batch * m * n
+                || inputs[0].len() != left
+                || inputs[1].len() != right
+                || outputs[0].len() != output_len
+                || raw.is_empty() || raw[0].len() != output_len
             {
                 return Err(Error::ShapeMismatch);
             }
@@ -1292,11 +1344,19 @@ pub fn verify_op_relation_with_external(
             let cols = *config.first().ok_or(Error::InvalidConfig)? as usize;
             let n = *config.get(1).ok_or(Error::InvalidConfig)? as usize;
             let shift = *config.get(2).ok_or(Error::InvalidConfig)? as u32;
-            if inputs.len() != 3 || cols == 0 || inputs[0].len() % cols != 0 || inputs[2].len() != cols * n {
+            if inputs.len() != 3 || cols == 0 || inputs[0].len() % cols != 0 {
+                return Err(Error::ShapeMismatch);
+            }
+            let table_len = cols.checked_mul(n).ok_or(Error::ResourceLimit)?;
+            if inputs[2].len() != table_len {
                 return Err(Error::ShapeMismatch);
             }
             let rows = inputs[0].len() / cols;
-            if outputs[0].len() != inputs[1].len() * n || raw.is_empty() || raw[0].len() != inputs[1].len() * n {
+            let output_len = inputs[1]
+                .len()
+                .checked_mul(n)
+                .ok_or(Error::ResourceLimit)?;
+            if outputs[0].len() != output_len || raw.is_empty() || raw[0].len() != output_len {
                 return Err(Error::ShapeMismatch);
             }
             for (slot, index) in inputs[1].iter().enumerate() {
@@ -1419,7 +1479,13 @@ pub fn verify_op_relation_with_external(
             let width = *config.first().ok_or(Error::InvalidConfig)? as usize;
             let out_cols = *config.get(1).ok_or(Error::InvalidConfig)? as usize;
             let shift = *config.get(2).ok_or(Error::InvalidConfig)? as u32;
-            let expected_len = 3 + 2 * width * out_cols;
+            let table = width
+                .checked_mul(out_cols)
+                .ok_or(Error::ResourceLimit)?;
+            let expected_len = table
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(3))
+                .ok_or(Error::ResourceLimit)?;
             if width == 0 || out_cols == 0 || config.len() != expected_len
                 || inputs.len() != 2
                 || inputs[0].len() != width
@@ -1432,8 +1498,8 @@ pub fn verify_op_relation_with_external(
             {
                 return Err(Error::ShapeMismatch);
             }
-            let shared = &config[3..3 + width * out_cols];
-            let routed = &config[3 + width * out_cols..];
+            let shared = &config[3..3 + table];
+            let routed = &config[3 + table..];
             for column in 0..out_cols {
                 let mut shared_raw = 0i128;
                 let mut routed_raw = 0i128;
@@ -1458,7 +1524,7 @@ pub fn verify_op_relation_with_external(
             if position >= capacity || width == 0 || inputs.len() != 4 || outputs.len() != 2 {
                 return Err(Error::ShapeMismatch);
             }
-            let total = capacity * width;
+            let total = capacity.checked_mul(width).ok_or(Error::ResourceLimit)?;
             if inputs[0].len() != total
                 || inputs[1].len() != total
                 || inputs[2].len() != width
@@ -1492,13 +1558,14 @@ pub fn verify_op_relation_with_external(
             let cols = *config.get(1).ok_or(Error::InvalidConfig)? as usize;
             let valid = *config.get(2).ok_or(Error::InvalidConfig)? as usize;
             let output_shift = *config.get(3).ok_or(Error::InvalidConfig)? as u32;
+            let cells = rows.checked_mul(cols).ok_or(Error::ResourceLimit)?;
             if valid == 0 || valid > cols || inputs.len() != 4
-                || inputs[0].len() != rows * cols
-                || inputs[1].len() != rows * cols
-                || inputs[2].len() != rows * cols
+                || inputs[0].len() != cells
+                || inputs[1].len() != cells
+                || inputs[2].len() != cells
                 || inputs[3].is_empty()
-                || outputs[0].len() != rows * cols
-                || raw.is_empty() || raw[0].len() != rows * cols
+                || outputs[0].len() != cells
+                || raw.is_empty() || raw[0].len() != cells
                 || aux.len() != 3
                 || aux[0].len() != rows
                 || aux[1].len() != rows
@@ -1563,9 +1630,14 @@ pub fn verify_op_relation_with_external(
         OpCode::EmbeddingIndex => {
             let hidden = *config.first().ok_or(Error::InvalidConfig)? as usize;
             let vocab = *config.get(1).ok_or(Error::InvalidConfig)? as usize;
-            if hidden == 0 || vocab == 0 || inputs.len() != 1
-                || outputs[0].len() != inputs[0].len() * hidden
-            {
+            if hidden == 0 || vocab == 0 || inputs.len() != 1 {
+                return Err(Error::ShapeMismatch);
+            }
+            let output_len = inputs[0]
+                .len()
+                .checked_mul(hidden)
+                .ok_or(Error::ResourceLimit)?;
+            if outputs[0].len() != output_len {
                 return Err(Error::ShapeMismatch);
             }
             for (row, token) in inputs[0].iter().enumerate() {
@@ -1586,14 +1658,15 @@ pub fn verify_op_relation_with_external(
             let cols = *config.get(1).ok_or(Error::InvalidConfig)? as usize;
             let valid = *config.get(2).ok_or(Error::InvalidConfig)? as usize;
             let output_shift = *config.get(3).ok_or(Error::InvalidConfig)? as u32;
+            let cells = rows.checked_mul(cols).ok_or(Error::ResourceLimit)?;
             if (inputs.len() != 3 && inputs.len() != 4)
                 || valid == 0
                 || valid > cols
-                || inputs[0].len() != rows * cols
-                || inputs[1].len() != rows * cols
+                || inputs[0].len() != cells
+                || inputs[1].len() != cells
                 || inputs[2].is_empty()
-                || outputs[0].len() != rows * cols
-                || raw.is_empty() || raw[0].len() != rows * cols
+                || outputs[0].len() != cells
+                || raw.is_empty() || raw[0].len() != cells
                 || aux.len() != 2
                 || aux[0].len() != rows
                 || aux[1].len() != rows
@@ -1692,6 +1765,10 @@ pub fn verify_op_relation_with_external(
             let valid = *config.get(3).ok_or(Error::InvalidConfig)? as usize;
             let source_row = *config.get(4).ok_or(Error::InvalidConfig)? as usize;
             let output_shift = *config.get(5).ok_or(Error::InvalidConfig)? as u32;
+            let cells = rows.checked_mul(cols).ok_or(Error::ResourceLimit)?;
+            let out_cells = rows
+                .checked_mul(output_cols)
+                .ok_or(Error::ResourceLimit)?;
             if (inputs.len() != 2 && inputs.len() != 3)
                 || rows == 0
                 || cols == 0
@@ -1699,10 +1776,10 @@ pub fn verify_op_relation_with_external(
                 || valid > cols
                 || output_cols < cols
                 || source_row >= rows
-                || inputs[0].len() != rows * cols
+                || inputs[0].len() != cells
                 || inputs[1].is_empty()
-                || outputs[0].len() != rows * output_cols
-                || raw.is_empty() || raw[0].len() != rows * output_cols
+                || outputs[0].len() != out_cells
+                || raw.is_empty() || raw[0].len() != out_cells
                 || aux.len() != 3
                 || aux[0].len() != 1
                 || aux[1].len() != 1
@@ -1761,9 +1838,14 @@ pub fn verify_op_relation_with_external(
         OpCode::RowEmbeddingIndex => {
             let hidden = *config.first().ok_or(Error::InvalidConfig)? as usize;
             let vocab = *config.get(1).ok_or(Error::InvalidConfig)? as usize;
-            if hidden == 0 || vocab == 0 || inputs.len() != 1
-                || outputs[0].len() != inputs[0].len() * hidden
-            {
+            if hidden == 0 || vocab == 0 || inputs.len() != 1 {
+                return Err(Error::ShapeMismatch);
+            }
+            let output_len = inputs[0]
+                .len()
+                .checked_mul(hidden)
+                .ok_or(Error::ResourceLimit)?;
+            if outputs[0].len() != output_len {
                 return Err(Error::ShapeMismatch);
             }
             for (row, token) in inputs[0].iter().enumerate() {
@@ -1781,10 +1863,11 @@ pub fn verify_op_relation_with_external(
             let seq = *config.first().ok_or(Error::InvalidConfig)? as usize;
             let head_dim = *config.get(1).ok_or(Error::InvalidConfig)? as usize;
             let shift = *config.get(2).ok_or(Error::InvalidConfig)? as u32;
-            if seq == 0 || head_dim == 0 || inputs.len() != 4 || outputs[0].len() != seq * head_dim || raw.is_empty() || raw[0].len() != seq * head_dim {
+            let cells = seq.checked_mul(head_dim).ok_or(Error::ResourceLimit)?;
+            if seq == 0 || head_dim == 0 || inputs.len() != 4 || outputs[0].len() != cells || raw.is_empty() || raw[0].len() != cells {
                 return Err(Error::ShapeMismatch);
             }
-            if inputs[0].len() != seq * head_dim || inputs[1].len() != seq * head_dim || inputs[2].len() != seq * head_dim {
+            if inputs[0].len() != cells || inputs[1].len() != cells || inputs[2].len() != cells {
                 return Err(Error::ShapeMismatch);
             }
             if aux.len() != 3 || aux[0].len() != seq || aux[2].len() != seq {

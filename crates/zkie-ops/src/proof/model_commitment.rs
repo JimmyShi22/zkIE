@@ -787,6 +787,9 @@ fn verify_shared_trace_steps(
     if trace.tokens != expected_tokens {
         return Err(Error::StatementMismatch);
     }
+    if trace.steps.len() != plan.steps.len() {
+        return Err(Error::StatementMismatch);
+    }
     if trace.output.is_empty() && trace.argmax.len() != expected_tokens.len() {
         return Err(Error::StatementMismatch);
     }
