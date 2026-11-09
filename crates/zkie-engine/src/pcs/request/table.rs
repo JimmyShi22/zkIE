@@ -45,8 +45,19 @@ pub struct IndexShape {
 }
 
 impl IndexShape {
+    /// The number of rows. The shape must have been validated first; a `v`
+    /// that does not fit a `u64` shift is rejected by `rows_checked`.
     pub fn rows(&self) -> u64 {
         1u64 << self.v
+    }
+
+    /// The number of rows with the shift checked. Public entries call this
+    /// before any accessor that shifts by `v`.
+    pub fn rows_checked(&self) -> Result<u64> {
+        if self.v >= 64 {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(1u64 << self.v)
     }
 
     pub fn pads(&self) -> usize {
@@ -92,10 +103,14 @@ pub fn index_fault(shape: &IndexShape) -> Option<&'static str> {
     None
 }
 
-/// The tree-shape checks that index_fault() does not cover: the salt is a
-/// multiple of eight bytes, and a column (one symbol per row) is narrower than
-/// 2^24. The salt-length range remains index_fault()'s check.
+/// The tree-shape checks that index_fault() does not cover: the row count
+/// fits a shift, the salt is a multiple of eight bytes, and a column (one
+/// symbol per row) is narrower than 2^24. The salt-length range remains
+/// index_fault()'s check.
 pub fn tree_shape_fault(shape: &IndexShape) -> Option<&'static str> {
+    if shape.v >= 64 {
+        return Some("the table's row count does not fit a shift");
+    }
     if shape.salt_bytes % 8 != 0 {
         return Some("a leaf salt is not a multiple of eight bytes");
     }
@@ -148,31 +163,48 @@ impl IndexRecord {
         Ok(Self { y })
     }
 
-    /// Decode a record for a shape: the length must equal rows * answers,
-    /// with checked arithmetic.
+    /// Decode a record for a shape: the shape is validated first, then the
+    /// length must equal rows * answers, with checked arithmetic.
     pub fn decode_for(shape: &IndexShape, bytes: &[u8]) -> Result<Self> {
+        validate_index_shape(shape)?;
         let expected = shape
-            .rows()
+            .rows_checked()?
             .checked_mul(shape.answers as u64)
             .ok_or(Error::ResourceLimit)?;
         let expected = usize::try_from(expected).map_err(|_| Error::ResourceLimit)?;
         let record = Self::decode(bytes, expected)?;
-        if record_fault(shape, &record).is_some() {
+        if record_length_fault(shape, &record).is_some() {
             return Err(Error::ShapeMismatch);
         }
         Ok(record)
     }
 }
 
-pub fn record_fault(shape: &IndexShape, record: &IndexRecord) -> Option<&'static str> {
-    let expected = shape
-        .rows()
-        .checked_mul(shape.answers as u64);
+/// The record-length check against a shape that is already validated. The
+/// public entry validates the shape before calling this.
+fn record_length_fault(shape: &IndexShape, record: &IndexRecord) -> Option<&'static str> {
+    let rows = match shape.rows_checked() {
+        Ok(rows) => rows,
+        Err(_) => return Some("the table's row count does not fit"),
+    };
+    let expected = rows.checked_mul(shape.answers as u64);
     match expected {
         Some(expected) if record.y.len() as u64 == expected => None,
         Some(_) => Some("the record has not one answer for each row and seed"),
         None => Some("the record length overflows the verified shape"),
     }
+}
+
+/// What is wrong with the shape or the record. The shape is validated first;
+/// a `v` that does not fit a shift is a fault and is never shifted.
+pub fn record_fault(shape: &IndexShape, record: &IndexRecord) -> Option<&'static str> {
+    if index_fault(shape).is_some() {
+        return Some("the shape is not a table shape");
+    }
+    if tree_shape_fault(shape).is_some() {
+        return Some("the shape is not a tree shape");
+    }
+    record_length_fault(shape, record)
 }
 
 /// A table's statement item: its commitment bytes and record answers.
@@ -327,10 +359,13 @@ impl IndexReader {
         if let Some(fault) = index_fault(&self.shape) {
             return Some(fault);
         }
+        if let Some(fault) = tree_shape_fault(&self.shape) {
+            return Some(fault);
+        }
         if self.configuration == Digest::ZERO {
             return Some("the key names no configuration");
         }
-        record_fault(&self.shape, &self.record)
+        record_length_fault(&self.shape, &self.record)
     }
 }
 
@@ -344,6 +379,35 @@ pub struct ColumnOpening {
     pub path: Vec<Digest>,
 }
 
+/// The leaf of one stored column.
+///
+/// The leaf index is `2^log_n + position` (so a leaf index is at least
+/// `2^log_n` and a bare position cannot name a leaf); the tree is a perfect
+/// binary tree with exactly `2^log_n` leaves and no padding.
+///
+/// The leaf data, in order: the column width and the salt length as two
+/// `u64` little-endian words, one canonical base-field symbol per row as
+/// eight-byte little-endian words below the modulus, then the salt as a
+/// length-prefixed byte string (a `u64` length followed by the bytes). The
+/// salt length therefore appears twice; a parser admits the leaf only when
+/// both equal the trusted shape's salt length, the symbol count equals the
+/// trusted shape's row count, and no bytes follow the salt.
+///
+/// The tag is `tag_word(LEAF_STORED_MAIN, 0)`: the stored-leaf domain with
+/// tree number 0. The configuration digest is the hash start, and it must be
+/// nonzero. The hash is the protocol's labelled 32-byte BLAKE2b: a sixteen
+/// byte label (tag and index, both little-endian), and, because the stored
+/// leaf domain takes a start, the start's first sixteen bytes as BLAKE2b's
+/// salt and its next sixteen as personalization.
+///
+/// Domain separation: a stored leaf uses domain 174 and index
+/// `2^log_n + position`; a tree node uses domain 166 and index 0 with the two
+/// child digests as data; binding leaves, binding nodes and chain rounds use
+/// their own domains and index spaces. Two different objects therefore never
+/// share a domain, an index and a data layout, so a digest of one object
+/// cannot be read as another without a hash collision. This is an integrity
+/// argument: the salt and the configuration digest are public binding values,
+/// not secret keys; collision resistance is the assumption.
 fn column_leaf(
     configuration: &Digest,
     log_n: u32,
@@ -351,9 +415,6 @@ fn column_leaf(
     salt: &[u8],
     symbols: &[Fp],
 ) -> Result<Digest> {
-    // Leaf index: tree_index(log_n, position) = 2^log_n + position. The leaf
-    // carries the column, then its salt; the column width and the salt length
-    // are bound in the leaf data (the reference puts them in the leaf tag).
     let mut writer = CanonicalWriter::new();
     writer.put_u64(symbols.len() as u64);
     writer.put_u64(salt.len() as u64);
@@ -385,6 +446,9 @@ impl CommittedTable {
     /// Open the columns at `positions` (drawn by the chain; the caller keeps
     /// them sorted and without repeats).
     pub fn open_columns(&self, positions: &[u64]) -> Result<Vec<ColumnOpening>> {
+        if self.reader.fault().is_some() {
+            return Err(Error::InvalidConfig);
+        }
         let n = self.reader.shape.code.n();
         let rows = self.reader.shape.rows() as usize;
         let mut openings = Vec::with_capacity(positions.len());
@@ -417,6 +481,12 @@ impl CommittedTable {
 /// Commit a table from the rows' messages (each `ell` entries: plain entries,
 /// then the answers' pads) and random tails (each `r` entries). `salts` holds
 /// one salt per column, `salt_bytes` long.
+///
+/// This is the test foundation: it materializes every row, codeword, salt and
+/// the whole column tree in memory. It is not the production commit path and
+/// must not be used to materialize an asset; a production committer reads the
+/// asset through ranges, keeps the asset red line, and only this module's
+/// leaf, record-seed and opening rules are shared with it.
 pub fn commit_table(
     shape: IndexShape,
     configuration: Digest,
@@ -518,10 +588,6 @@ pub fn verify_columns(
     }
     if openings.len() != positions.len() {
         return Err(Error::ShapeMismatch);
-    }
-    if let Some(fault) = tree_shape_fault(&reader.shape) {
-        let _ = fault;
-        return Err(Error::InvalidConfig);
     }
     let rows = reader.shape.rows() as usize;
     let n = reader.shape.code.n();
@@ -1140,5 +1206,54 @@ mod tests {
         let second = name.encode();
         assert_eq!(first, second);
         assert!(first.len() > table.reader.record.encode().len());
+    }
+
+    #[test]
+    fn oversized_shapes_are_rejected_without_a_shift_panic() {
+        let base = shape();
+        for v in [64u32, 65, u32::MAX] {
+            let mut bad = base;
+            bad.v = v;
+            assert!(tree_shape_fault(&bad).is_some());
+            assert!(record_fault(&bad, &IndexRecord { y: Vec::new() }).is_some());
+            assert!(IndexRecord::decode_for(&bad, &[]).is_err());
+            assert!(validate_index_shape(&bad).is_err());
+            let reader = IndexReader {
+                shape: bad,
+                configuration: Digest([7; 32]),
+                root: Digest([1; 32]),
+                record: IndexRecord { y: Vec::new() },
+            };
+            assert!(reader.fault().is_some());
+            assert!(verify_columns(&reader, &[], &[]).is_err());
+        }
+        // A code number that cannot describe a code is rejected before the
+        // code's length is shifted.
+        let mut bad_code = base;
+        bad_code.code.log_n = 64;
+        assert!(record_fault(&bad_code, &IndexRecord { y: Vec::new() }).is_some());
+        assert!(IndexRecord::decode_for(&bad_code, &[]).is_err());
+        assert!(tree_shape_fault(&bad_code).is_none());
+    }
+
+    #[test]
+    fn opening_paths_are_bound_to_position_and_configuration() {
+        let table = committed();
+        let positions = [1u64, 4];
+        let openings = table.open_columns(&positions).unwrap();
+        // Swap the two paths: neither leaf matches the other's path.
+        let mut swapped = openings.clone();
+        let first_path = swapped[0].path.clone();
+        swapped[0].path = swapped[1].path.clone();
+        swapped[1].path = first_path;
+        assert!(verify_columns(&table.reader, &positions, &swapped).is_err());
+        // A different configuration changes the hash start of every leaf.
+        let mut other = table.reader.clone();
+        other.configuration = Digest([8; 32]);
+        assert!(verify_columns(&other, &positions, &openings).is_err());
+        // A different root rejects every path.
+        let mut other = table.reader.clone();
+        other.root = Digest([1; 32]);
+        assert!(verify_columns(&other, &positions, &openings).is_err());
     }
 }
