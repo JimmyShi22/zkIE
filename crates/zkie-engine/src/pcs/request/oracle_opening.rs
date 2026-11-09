@@ -21,6 +21,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
@@ -32,6 +34,8 @@ use crate::pcs::request::runtime_tree::{
 };
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+#[cfg(test)]
+static COMMIT_DELAY: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReceivedRoot {
@@ -169,6 +173,20 @@ impl OpeningSession {
             positions: unique,
             marker: self.current.marker,
         })
+    }
+
+    #[cfg(test)]
+    pub fn record_list_for_test(&mut self, domain: u32, positions: Vec<u64>) -> OpeningList {
+        let mut unique = positions.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique, positions);
+        self.current.lists.insert((domain, positions.clone()));
+        OpeningList {
+            domain,
+            positions,
+            marker: self.current.marker,
+        }
     }
 
     /// Record a root with the identity of the chain that received it. This is
@@ -349,13 +367,22 @@ impl OpeningSession {
         if opening.positions != source.list {
             return Err(Error::InvalidIndex);
         }
-        let prior = self
+        // The read, conflict check, merge and commit of one root's node
+        // record are one critical section. Keeping the lock across the walk
+        // prevents two sibling chains from overwriting each other's accepted
+        // vertices; a failed walk leaves the committed map unchanged.
+        let mut nodes = self
             .nodes
             .lock()
-            .map_err(|_| Error::InvalidSessionState)?
+            .map_err(|_| Error::InvalidSessionState)?;
+        let prior = nodes
             .get(&source.root)
             .cloned()
             .unwrap_or_default();
+        #[cfg(test)]
+        if COMMIT_DELAY.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
         let staged = verify_runtime_opening_shared(
             &plan.tree,
             &source.root,
@@ -363,10 +390,7 @@ impl OpeningSession {
             opening,
             &prior,
         )?;
-        self.nodes
-            .lock()
-            .map_err(|_| Error::InvalidSessionState)?
-            .insert(source.root, staged);
+        nodes.insert(source.root, staged);
         Ok(())
     }
 }
@@ -634,8 +658,7 @@ mod tests {
     fn sibling_chains_share_nodes_and_clone_is_not_available() {
         let (tree, plan) = tree();
         let mut first = make_session();
-        let (root, source, opening, list) = valid(&mut first, &plan, &tree);
-        first.verify_non_stored(&plan, &source, &opening).unwrap();
+        let (root, _source, _opening_first, _list_first) = valid(&mut first, &plan, &tree);
         let sealed = first.seal();
         let mut left = OpeningSession::follow(
             &sealed,
@@ -649,22 +672,38 @@ mod tests {
             Digest([7; 32]),
         )
         .unwrap();
-        let source_left = left.authorize(&list, &root).unwrap();
-        left.verify_non_stored(&plan, &source_left, &opening).unwrap();
-        assert!(!nodes_snapshot(&right).is_empty());
-        let source_right = right.authorize(&list, &root).unwrap();
-        right.verify_non_stored(&plan, &source_right, &opening).unwrap();
-        let mut conflict = nodes_snapshot(&right)
-            .get(tree.root())
-            .cloned()
-            .unwrap_or_default();
-        conflict.insert_for_test(*tree.root(), 0, list.positions[0], Digest([99; 32]));
-        left.nodes.lock().unwrap().insert(*tree.root(), conflict);
-        let before_failure = nodes_snapshot(&right);
-        assert!(right.verify_non_stored(&plan, &source_right, &opening).is_err());
-        assert_eq!(nodes_snapshot(&right), before_failure);
-    }
+        let list_left = left.record_list_for_test(2, vec![0]);
+        let list_right = right.record_list_for_test(2, vec![2]);
+        let source_left = left.authorize(&list_left, &root).unwrap();
+        let source_right = right.authorize(&list_right, &root).unwrap();
+        let opening_left = tree.open(&list_left.positions).unwrap();
+        let opening_right = tree.open(&list_right.positions).unwrap();
 
+        let after_first = OpeningNodeStore::default();
+        let after_left = verify_runtime_opening_shared(
+            &plan.tree,
+            tree.root(),
+            &list_left.positions,
+            &opening_left,
+            &after_first,
+        )
+        .unwrap();
+
+        left.verify_non_stored(&plan, &source_left, &opening_left).unwrap();
+        assert_eq!(nodes_snapshot(&right).get(tree.root()), Some(&after_left));
+        right.verify_non_stored(&plan, &source_right, &opening_right).unwrap();
+        let union = verify_runtime_opening_shared(
+            &plan.tree,
+            tree.root(),
+            &list_right.positions,
+            &opening_right,
+            &after_left,
+        )
+        .unwrap();
+        assert!(after_left.len() < union.len());
+        assert_eq!(nodes_snapshot(&left).get(tree.root()), Some(&union));
+        assert_eq!(nodes_snapshot(&right).get(tree.root()), Some(&union));
+    }
     #[test]
     fn multi_level_ancestors_and_mixed_roots_are_accepted() {
         let (tree, plan) = tree();
@@ -735,4 +774,84 @@ mod tests {
             .unwrap();
         assert!(session.authorize(&list, &other_root).is_err());
     }
+    #[test]
+    fn concurrent_siblings_merge_valid_openings_atomically() {
+        use std::sync::Barrier;
+        let (tree, plan) = tree();
+        let mut first = make_session();
+        first.advance_empty_round().unwrap();
+        let _first_list = first.draw_positions(1, 2).unwrap();
+        let root = first
+            .receive_root(*tree.root(), plan.tree.run, plan.tree.configuration)
+            .unwrap();
+        let sealed = first.seal();
+        let mut left = OpeningSession::follow(
+            &sealed,
+            Chain::resume(sealed.label(), sealed.value()),
+            Digest([7; 32]),
+        )
+        .unwrap();
+        let mut right = OpeningSession::follow(
+            &sealed,
+            Chain::resume(sealed.label(), sealed.value()),
+            Digest([7; 32]),
+        )
+        .unwrap();
+        let left_list = left.record_list_for_test(2, vec![0]);
+        let right_list = right.record_list_for_test(2, vec![2]);
+        let left_source = left.authorize(&left_list, &root).unwrap();
+        let right_source = right.authorize(&right_list, &root).unwrap();
+        let left_opening = tree.open(&left_list.positions).unwrap();
+        let right_opening = tree.open(&right_list.positions).unwrap();
+
+        let barrier = Barrier::new(2);
+        let plan_ref = &plan;
+        let left_check = left_opening.clone();
+        let right_check = right_opening.clone();
+        let left_ref = &mut left;
+        let right_ref = &mut right;
+        COMMIT_DELAY.store(true, Ordering::Relaxed);
+        let (left_ok, right_ok) = std::thread::scope(|scope| {
+            let left_barrier = &barrier;
+            let left_handle = scope.spawn(move || {
+                left_barrier.wait();
+                left_ref
+                    .verify_non_stored(plan_ref, &left_source, &left_check)
+                    .is_ok()
+            });
+            let right_barrier = &barrier;
+            let right_handle = scope.spawn(move || {
+                right_barrier.wait();
+                right_ref
+                    .verify_non_stored(plan_ref, &right_source, &right_check)
+                    .is_ok()
+            });
+            (
+                left_handle.join().unwrap(),
+                right_handle.join().unwrap(),
+            )
+        });
+        COMMIT_DELAY.store(false, Ordering::Relaxed);
+        assert!(left_ok && right_ok);
+        let left_store = verify_runtime_opening_shared(
+            &plan.tree,
+            tree.root(),
+            &left_list.positions,
+            &left_opening,
+            &OpeningNodeStore::default(),
+        )
+        .unwrap();
+        let union = verify_runtime_opening_shared(
+            &plan.tree,
+            tree.root(),
+            &right_list.positions,
+            &right_opening,
+            &left_store,
+        )
+        .unwrap();
+        let snapshot = nodes_snapshot(&left);
+        assert!(left_store.len() < union.len());
+        assert_eq!(snapshot.get(tree.root()), Some(&union));
+    }
+
 }
