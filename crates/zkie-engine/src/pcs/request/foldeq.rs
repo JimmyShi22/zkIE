@@ -17,6 +17,7 @@ use crate::pcs::request::chain::{
     Chain, KIND_ALGEBRAIC, KIND_EPSILON, KIND_POSITIONS, KIND_SEAL,
 };
 use crate::pcs::request::field::{Fp, Fp3};
+use crate::pcs::request::gu::GuShape;
 use crate::pcs::request::runtime_tree::RuntimeTreeOpening;
 use crate::pcs::request::fold::{
     fold_mask_shape_fault, fold_start_verify, FoldShape, FoldStartMessage, RuntimeOracles,
@@ -201,6 +202,9 @@ pub struct FoldeqPlan {
     pub column_draws: usize,
     pub mask_query_count: usize,
     pub gamma_path: GammaPath,
+    /// The trusted G_u shape when this plan carries the isolated G_u relation
+    /// session. It is a plan/statement value, not a proof report.
+    pub gu: Option<GuShape>,
 }
 
 impl FoldeqPlan {
@@ -252,6 +256,20 @@ impl FoldeqPlan {
         let answers = self.reader.shape.answers as usize;
         if self.seed_budget < answers {
             return Some("the seed budget is below the answer count");
+        }
+        if let Some(gu) = &self.gu {
+            if gu.fault().is_some() {
+                return Some("the G_u shape is not valid");
+            }
+            if gu.index != self.reader.shape {
+                return Some("the G_u index shape is not the plan's reader shape");
+            }
+            if self.statement.groups().get(gu.group).is_none() {
+                return Some("the G_u group is not in the statement");
+            }
+            if crate::pcs::request::relation::gu_layout_fault(gu).is_some() {
+                return Some("the G_u layout is not executable");
+            }
         }
         match self.gamma_path {
             GammaPath::Lin { shape } => {
@@ -358,6 +376,15 @@ impl FoldeqPlan {
                 writer.put_u64(2);
                 writer.put_u64(columns as u64);
             }
+        }
+        match &self.gu {
+            Some(gu) => {
+                writer.put_u64(1);
+                let bytes = gu.encode();
+                writer.put_u64(bytes.len() as u64);
+                writer.put_bytes(&bytes);
+            }
+            None => writer.put_u64(0),
         }
         writer.into_bytes()
     }
@@ -807,6 +834,7 @@ use crate::pcs::request::fold::{
             column_draws: 2,
             mask_query_count: 2,
             gamma_path: GammaPath::Lin { shape: LinShapeBinding { matrix_rows: 1, k_lo: 0, k_col: 2 } },
+            gu: None,
         };
         (plan, table)
     }
