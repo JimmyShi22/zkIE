@@ -1,0 +1,24 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/zkie_core-49cb0f9c93bd77bd)
+
+running 11 tests
+test proof_header::tests::fixture_parser_consumes_header_and_body ... ok
+test proof_header::tests::fixture_parser_rejects_a_truncated_body ... ok
+test proof_header::tests::every_short_header_is_invalid_encoding ... ok
+test proof_header::tests::fixture_parser_rejects_a_trailing_byte ... ok
+test proof_header::tests::header_does_not_check_trailing_bytes ... ok
+test proof_header::tests::io_error_after_the_tag_is_io ... ok
+test proof_header::tests::io_error_before_the_header_is_io ... ok
+test proof_header::tests::io_error_in_the_middle_of_a_word_is_io ... ok
+test proof_header::tests::legal_header_is_accepted_and_consumes_eight_bytes ... ok
+test proof_header::tests::unknown_version_is_unsupported ... ok
+test proof_header::tests::wrong_tag_is_rejected_before_version ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/contracts.rs (target/debug/deps/contracts-157a2132b61f12c0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+

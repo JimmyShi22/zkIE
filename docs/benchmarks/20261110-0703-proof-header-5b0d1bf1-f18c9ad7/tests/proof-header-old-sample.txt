@@ -1,0 +1,40 @@
+   Compiling zkie-core v0.1.0 (/data/zkIE/crates/zkie-core)
+   Compiling zkie-engine v0.1.0 (/data/zkIE/crates/zkie-engine)
+   Compiling zkie-ops v0.1.0 (/data/zkIE/crates/zkie-ops)
+   Compiling zkie-models-common v0.1.0 (/data/zkIE/models/common)
+   Compiling zkie-models-gemma3 v0.1.0 (/data/zkIE/models/gemma3)
+   Compiling zkie-models-timesfm v0.1.0 (/data/zkIE/models/timesfm)
+   Compiling zkie-models-gpt2 v0.1.0 (/data/zkIE/models/gpt2)
+warning: unused variable: `k_step`
+   --> models/gpt2/src/executor.rs:346:21
+    |
+346 |             let (k, k_step) = {
+    |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_step`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `m`
+   --> models/gemma3/src/executor.rs:277:5
+    |
+277 |     m: usize,
+    |     ^ help: if this is intentional, prefix it with an underscore: `_m`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_rot_step`
+   --> models/gemma3/src/executor.rs:390:21
+    |
+390 |         let (k_rot, k_rot_step) = rope(&mut builder, k, k_step, cos_prefix.clone(), sin_prefix.clone(), m)?;
+    |                     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_rot_step`
+
+   Compiling zkie v0.1.0 (/data/zkIE/zkie)
+warning: `zkie-models-gpt2` (lib) generated 1 warning (run `cargo fix --lib -p zkie-models-gpt2` to apply 1 suggestion)
+warning: `zkie-models-gemma3` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gemma3` to apply 2 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.08s
+     Running tests/proof_header.rs (target/debug/deps/proof_header-5baafdeec38e2458)
+
+running 1 test
+test a_headerless_old_sample_is_rejected ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

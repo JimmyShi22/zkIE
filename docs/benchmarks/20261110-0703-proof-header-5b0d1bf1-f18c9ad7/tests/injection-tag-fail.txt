@@ -1,0 +1,22 @@
+   Compiling zkie-core v0.1.0 (/data/zkIE/crates/zkie-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
+     Running unittests src/lib.rs (target/debug/deps/zkie_core-49cb0f9c93bd77bd)
+
+running 1 test
+test proof_header::tests::wrong_tag_is_rejected_before_version ... FAILED
+
+failures:
+
+---- proof_header::tests::wrong_tag_is_rejected_before_version stdout ----
+
+thread 'proof_header::tests::wrong_tag_is_rejected_before_version' (1525853) panicked at crates/zkie-core/src/proof_header.rs:86:46:
+called `Result::unwrap_err()` on an `Ok` value: ProofHeader { tag: [91, 75, 80, 82], version_word: 825248602 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    proof_header::tests::wrong_tag_is_rejected_before_version
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 16 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p zkie-core --lib`
