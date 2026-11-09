@@ -275,7 +275,7 @@ impl<F: ProtocolField, T: PureForward + RelationConfig> Operation<F> for T {
             input_oracles,
             output_oracles,
         };
-        let inputs = proof_input_values(&message.proof);
+        let inputs = proof_input_values(&message.proof)?;
         let expected = self.relation_config(&inputs)?;
         verify_op_relation_with_config(&public, &message.proof, &expected)?;
         session.register_claims(PendingClaims::new())?;

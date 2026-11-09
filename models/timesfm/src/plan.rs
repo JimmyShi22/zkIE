@@ -568,4 +568,16 @@ mod tests {
     fn plan_step_count_matches_executor() {
         assert_eq!(trace_plan(16).unwrap().steps.len(), 6683);
     }
+
+    #[test]
+    fn signed_input_commitment_matches_i64_encoding() {
+        let values = [-5i32, 7, -1];
+        let tokens: Vec<u32> = values.iter().map(|value| *value as u32).collect();
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|value| (*value as i64).to_le_bytes())
+            .collect();
+        let expected = transcript_digest(15, &bytes).unwrap();
+        assert_eq!(model_commitment(&tokens).unwrap(), expected);
+    }
 }

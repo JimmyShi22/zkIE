@@ -190,7 +190,7 @@ impl<'a> Builder<'a> {
             let root = public.registry.get(id).ok_or(Error::ProverStateMissing)?;
             roots.push((root.root, root.start, root.count));
         }
-        let outputs = proof_output_values(&proof);
+        let outputs = proof_output_values(&proof)?;
         self.steps.push(SharedTraceStep {
             message: RelationReceiptMessage {
                 opcode: op.opcode() as u16,

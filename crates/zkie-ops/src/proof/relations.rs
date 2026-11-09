@@ -282,8 +282,8 @@ fn relation_label(opcode: OpCode, config: &[i64]) -> Digest {
     .unwrap_or(Digest::ZERO)
 }
 
-fn input_widths(opcode: OpCode, config: &[i64], inputs: &[Vec<i64>]) -> Vec<usize> {
-    let count = inputs.len();
+fn input_widths(opcode: OpCode, config: &[i64], lengths: &[usize]) -> Vec<usize> {
+    let count = lengths.len();
     let mut widths = vec![1usize; count];
     match opcode {
         OpCode::MatMul | OpCode::Projection | OpCode::RegressionHead => {
@@ -318,16 +318,16 @@ fn input_widths(opcode: OpCode, config: &[i64], inputs: &[Vec<i64>]) -> Vec<usiz
             }
         }
         OpCode::TableLookup => {
-            if !inputs.is_empty() && !inputs[0].is_empty() {
-                widths[0] = inputs[0].len();
+            if !lengths.is_empty() && lengths[0] > 0 {
+                widths[0] = lengths[0];
             }
-            if inputs.len() > 1 && !inputs[1].is_empty() {
-                widths[1] = inputs[1].len();
+            if lengths.len() > 1 && lengths[1] > 0 {
+                widths[1] = lengths[1];
             }
         }
         OpCode::Softmax => {
-            if inputs.len() > 1 && !inputs[1].is_empty() {
-                widths[1] = inputs[1].len();
+            if lengths.len() > 1 && lengths[1] > 0 {
+                widths[1] = lengths[1];
             }
         }
         OpCode::SoftmaxRows => {
@@ -336,59 +336,59 @@ fn input_widths(opcode: OpCode, config: &[i64], inputs: &[Vec<i64>]) -> Vec<usiz
                     widths[0] = *cols as usize;
                 }
             }
-            if inputs.len() > 1 && !inputs[1].is_empty() {
-                widths[1] = inputs[1].len();
+            if lengths.len() > 1 && lengths[1] > 0 {
+                widths[1] = lengths[1];
             }
         }
         OpCode::CausalAttention => {
-            if inputs.len() > 3 && !inputs[3].is_empty() {
-                widths[3] = inputs[3].len();
+            if lengths.len() > 3 && lengths[3] > 0 {
+                widths[3] = lengths[3];
             }
         }
         OpCode::ProfileLayerNorm => {
-            if inputs.len() > 3 && !inputs[3].is_empty() {
-                widths[3] = inputs[3].len();
+            if lengths.len() > 3 && lengths[3] > 0 {
+                widths[3] = lengths[3];
             }
-            if inputs.len() > 2 {
-                widths[1] = inputs[1].len();
-                widths[2] = inputs[2].len();
+            if lengths.len() > 2 {
+                widths[1] = lengths[1];
+                widths[2] = lengths[2];
             }
         }
         OpCode::ProfileRmsNorm => {
-            if inputs.len() > 2 {
-                widths[1] = inputs[1].len();
-                widths[2] = inputs[2].len();
+            if lengths.len() > 2 {
+                widths[1] = lengths[1];
+                widths[2] = lengths[2];
             }
-            if inputs.len() > 3 {
-                widths[3] = inputs[3].len();
+            if lengths.len() > 3 {
+                widths[3] = lengths[3];
             }
         }
         OpCode::ProfileRope => {
-            for (index, values) in inputs.iter().enumerate() {
-                widths[index] = values.len();
+            for (index, length) in lengths.iter().enumerate() {
+                widths[index] = *length;
             }
         }
         OpCode::RowEmbeddingIndex => {
-            if !inputs.is_empty() {
-                widths[0] = inputs[0].len();
+            if let Some(length) = lengths.first() {
+                widths[0] = *length;
             }
         }
         OpCode::ProfileStandardize => {
-            if inputs.len() > 1 {
-                widths[1] = inputs[1].len();
+            if lengths.len() > 1 {
+                widths[1] = lengths[1];
             }
-            if inputs.len() > 2 {
-                widths[2] = inputs[2].len();
+            if lengths.len() > 2 {
+                widths[2] = lengths[2];
             }
         }
         OpCode::Add => {
-            for (index, values) in inputs.iter().enumerate() {
-                widths[index] = values.len();
+            for (index, length) in lengths.iter().enumerate() {
+                widths[index] = *length;
             }
         }
         OpCode::Argmax | OpCode::TableIndex => {
-            if !inputs.is_empty() {
-                widths[0] = inputs[0].len();
+            if let Some(length) = lengths.first() {
+                widths[0] = *length;
             }
         }
         _ => {}
@@ -396,8 +396,8 @@ fn input_widths(opcode: OpCode, config: &[i64], inputs: &[Vec<i64>]) -> Vec<usiz
     widths
 }
 
-fn output_widths(opcode: OpCode, config: &[i64], count: usize, outputs: &[Vec<i64>]) -> Vec<usize> {
-    let mut widths = vec![1usize; count];
+fn output_widths(opcode: OpCode, config: &[i64], lengths: &[usize]) -> Vec<usize> {
+    let mut widths = vec![1usize; lengths.len()];
     match opcode {
         OpCode::SoftmaxRows => {
             if let Some(cols) = config.get(1) {
@@ -408,14 +408,13 @@ fn output_widths(opcode: OpCode, config: &[i64], count: usize, outputs: &[Vec<i6
             return widths;
         }
         OpCode::Add | OpCode::ProfileLayerNorm | OpCode::ProfileRmsNorm | OpCode::ProfileRope | OpCode::ProfileStandardize | OpCode::TableIndex | OpCode::Argmax | OpCode::EmbeddingIndex | OpCode::RowEmbeddingIndex | OpCode::TableLookup => {
-            for (index, values) in outputs.iter().enumerate() {
-                widths[index] = values.len();
+            for (index, length) in lengths.iter().enumerate() {
+                widths[index] = *length;
             }
             return widths;
         }
         _ => {}
     }
-    let _ = outputs;
     match opcode {
         OpCode::MatMul | OpCode::Projection | OpCode::RegressionHead | OpCode::BatchedMatMul => {
             if let Some(n) = config.get(1) {
@@ -457,7 +456,8 @@ pub fn prove_op_relation_shared(
     let opcode = op.opcode();
     let label = relation_label(opcode, config);
     let mut registry = OracleRegistry::new();
-    let input_widths = input_widths(opcode, config, inputs);
+    let input_lengths: Vec<usize> = inputs.iter().map(Vec::len).collect();
+    let input_widths = input_widths(opcode, config, &input_lengths);
     let mut input_openings = Vec::new();
     let mut input_oracles = Vec::new();
     for (index, values) in inputs.iter().enumerate() {
@@ -475,7 +475,8 @@ pub fn prove_op_relation_shared(
         input_oracles.push(openings[0].oracle);
         input_openings.push(openings);
     }
-    let output_widths = output_widths(opcode, config, record.outputs.len(), &record.outputs);
+    let output_lengths: Vec<usize> = record.outputs.iter().map(Vec::len).collect();
+    let output_widths = output_widths(opcode, config, &output_lengths);
     let mut output_openings = Vec::new();
     let mut output_oracles = Vec::new();
     for (index, values) in record.outputs.iter().enumerate() {
@@ -532,33 +533,115 @@ pub fn prove_op_relation_shared(
     ))
 }
 
-fn verify_group(registry: &OracleRegistry, openings: &[OracleOpening]) -> Result<()> {
-    let oracle = openings.first().map(|opening| opening.oracle).ok_or(Error::ShapeMismatch)?;
+fn verify_group(
+    registry: &OracleRegistry,
+    openings: &[OracleOpening],
+    len: usize,
+    width: usize,
+    wide: bool,
+) -> Result<()> {
+    if wide {
+        let words = len.checked_mul(2).ok_or(Error::ResourceLimit)?;
+        if openings.len() != 1 {
+            return Err(Error::ShapeMismatch);
+        }
+        let opening = &openings[0];
+        let root = registry
+            .get(opening.oracle)
+            .ok_or(Error::ProverStateMissing)?;
+        if root.count != 1 {
+            return Err(Error::StatementMismatch);
+        }
+        if opening.index != 0 {
+            return Err(Error::InvalidIndex);
+        }
+        if opening.values.len() != words {
+            return Err(Error::ShapeMismatch);
+        }
+        if !opening.path.is_empty() {
+            return Err(Error::InvalidProof);
+        }
+        return verify_opening(registry, opening, 1);
+    }
+    if width == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    if openings.is_empty() {
+        return Err(Error::ShapeMismatch);
+    }
+    let oracle = openings[0].oracle;
     let root = registry.get(oracle).ok_or(Error::ProverStateMissing)?;
-    for opening in openings {
+    let count = openings.len() as u64;
+    if root.count != count {
+        return Err(Error::StatementMismatch);
+    }
+    if !count.is_power_of_two() {
+        return Err(Error::InvalidConfig);
+    }
+    if len % width != 0 {
+        return Err(Error::ShapeMismatch);
+    }
+    let data_rows = (len / width) as u64;
+    if data_rows > count {
+        return Err(Error::ShapeMismatch);
+    }
+    let depth = count.trailing_zeros() as usize;
+    for (position, opening) in openings.iter().enumerate() {
         if opening.oracle != oracle {
             return Err(Error::StatementMismatch);
         }
-        verify_opening(registry, opening, root.count)?;
+        if opening.index != position as u64 {
+            return Err(Error::InvalidIndex);
+        }
+        if opening.values.len() != width {
+            return Err(Error::ShapeMismatch);
+        }
+        if opening.path.len() != depth {
+            return Err(Error::InvalidProof);
+        }
+        if position as u64 >= data_rows
+            && opening.values.iter().any(|value| *value != 0)
+        {
+            return Err(Error::StatementMismatch);
+        }
+        verify_opening(registry, opening, count)?;
     }
     Ok(())
 }
 
-fn decode(openings: &[OracleOpening], len: usize) -> Vec<i64> {
+fn decode(openings: &[OracleOpening], len: usize) -> Result<Vec<i64>> {
+    if openings.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut values = Vec::with_capacity(len);
-    for opening in openings {
+    for (position, opening) in openings.iter().enumerate() {
+        if opening.index != position as u64 {
+            return Err(Error::InvalidIndex);
+        }
         values.extend(opening.values.iter().map(|value| *value as i64));
         if values.len() >= len {
             break;
         }
     }
+    if values.len() < len {
+        return Err(Error::ShapeMismatch);
+    }
     values.truncate(len);
-    values
+    Ok(values)
 }
 
-fn decode_wide(openings: &[OracleOpening], len: usize) -> Vec<i128> {
+fn decode_wide(openings: &[OracleOpening], len: usize) -> Result<Vec<i128>> {
+    if openings.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut values = Vec::with_capacity(len);
-    for opening in openings {
+    for (position, opening) in openings.iter().enumerate() {
+        if opening.index != position as u64 {
+            return Err(Error::InvalidIndex);
+        }
+        if opening.values.len() % 2 != 0 {
+            return Err(Error::ShapeMismatch);
+        }
         for pair in opening.values.chunks_exact(2) {
             values.push(((pair[1] as i128) << 64) | pair[0] as i128);
         }
@@ -566,8 +649,11 @@ fn decode_wide(openings: &[OracleOpening], len: usize) -> Vec<i128> {
             break;
         }
     }
+    if values.len() < len {
+        return Err(Error::ShapeMismatch);
+    }
     values.truncate(len);
-    values
+    Ok(values)
 }
 
 fn rq(value: i128, shift: u32) -> Result<i128> {
@@ -629,6 +715,8 @@ pub fn verify_op_relation_with_external(
     {
         return Err(Error::ShapeMismatch);
     }
+    let input_widths = input_widths(public.opcode, &public.config, &proof.lengths.inputs);
+    let output_widths = output_widths(public.opcode, &public.config, &proof.lengths.outputs);
     for (index, openings) in proof.inputs.iter().enumerate() {
         if let Some(values) = external_values.get(index).and_then(Option::as_ref) {
             if !openings.is_empty() || values.len() != proof.lengths.inputs[index] {
@@ -639,69 +727,113 @@ pub fn verify_op_relation_with_external(
         if openings.first().map(|opening| opening.oracle) != Some(public.input_oracles[index]) {
             return Err(Error::StatementMismatch);
         }
-        verify_group(&public.registry, openings)?;
+        verify_group(
+            &public.registry,
+            openings,
+            proof.lengths.inputs[index],
+            *input_widths.get(index).unwrap_or(&1),
+            false,
+        )?;
     }
     for (index, openings) in proof.outputs.iter().enumerate() {
         if openings.first().map(|opening| opening.oracle) != Some(public.output_oracles[index]) {
             return Err(Error::StatementMismatch);
         }
-        verify_group(&public.registry, openings)?;
+        verify_group(
+            &public.registry,
+            openings,
+            proof.lengths.outputs[index],
+            *output_widths.get(index).unwrap_or(&1),
+            false,
+        )?;
     }
-    for openings in &proof.raw {
-        verify_group(&public.registry, openings)?;
+    for (index, openings) in proof.raw.iter().enumerate() {
+        verify_group(
+            &public.registry,
+            openings,
+            *proof.lengths.raw.get(index).ok_or(Error::ShapeMismatch)?,
+            0,
+            true,
+        )?;
     }
-    for openings in &proof.quotients {
-        verify_group(&public.registry, openings)?;
+    for (index, openings) in proof.quotients.iter().enumerate() {
+        verify_group(
+            &public.registry,
+            openings,
+            *proof
+                .lengths
+                .quotients
+                .get(index)
+                .ok_or(Error::ShapeMismatch)?,
+            1,
+            false,
+        )?;
     }
-    for openings in &proof.helpers {
-        verify_group(&public.registry, openings)?;
+    for (index, openings) in proof.helpers.iter().enumerate() {
+        verify_group(
+            &public.registry,
+            openings,
+            *proof
+                .lengths
+                .helpers
+                .get(index)
+                .ok_or(Error::ShapeMismatch)?,
+            1,
+            false,
+        )?;
     }
-    for openings in &proof.aux {
-        verify_group(&public.registry, openings)?;
+    for (index, openings) in proof.aux.iter().enumerate() {
+        verify_group(
+            &public.registry,
+            openings,
+            *proof.lengths.aux.get(index).ok_or(Error::ShapeMismatch)?,
+            1,
+            false,
+        )?;
     }
     let inputs: Vec<Vec<i64>> = proof
         .inputs
         .iter()
         .zip(&proof.lengths.inputs)
         .enumerate()
-        .map(|(index, (openings, len))| {
-            external_values
-                .get(index)
-                .and_then(Option::as_ref)
-                .cloned()
-                .unwrap_or_else(|| decode(openings, *len))
+        .map(|(index, (openings, len))| -> Result<Vec<i64>> {
+            if let Some(values) = external_values.get(index).and_then(Option::as_ref) {
+                Ok(values.clone())
+            } else {
+                decode(openings, *len)
+            }
         })
-        .collect();
+        .collect::<Result<_>>()?;
     let outputs: Vec<Vec<i64>> = proof
         .outputs
         .iter()
         .zip(&proof.lengths.outputs)
         .map(|(openings, len)| decode(openings, *len))
-        .collect();
+        .collect::<Result<_>>()?;
     let raw: Vec<Vec<i128>> = proof
         .raw
         .iter()
         .zip(&proof.lengths.raw)
         .map(|(openings, len)| decode_wide(openings, *len))
-        .collect();
+        .collect::<Result<_>>()?;
     let quotients: Vec<Vec<i64>> = proof
         .quotients
         .iter()
         .zip(&proof.lengths.quotients)
         .map(|(openings, len)| decode(openings, *len))
-        .collect();
+        .collect::<Result<_>>()?;
     let helpers: Vec<Vec<i64>> = proof
         .helpers
         .iter()
         .zip(&proof.lengths.helpers)
         .map(|(openings, len)| decode(openings, *len))
-        .collect();
+        .collect::<Result<_>>()?;
     let aux: Vec<Vec<i64>> = proof
         .aux
         .iter()
         .zip(&proof.lengths.aux)
         .map(|(openings, len)| decode(openings, *len))
-        .collect();
+        .collect::<Result<_>>()?;
     let config = &public.config;
     match public.opcode {
         OpCode::Layout => {
@@ -1692,9 +1824,11 @@ pub fn verify_op_relation_with_external(
 }
 
 
-/// Input values recovered from an authenticated relation proof. Used by the
-/// verifier to compare the proof configuration with the operator configuration.
-pub fn proof_input_values(proof: &OpRelationProof) -> Vec<Vec<i64>> {
+/// Input values recovered from a relation proof. The decode enforces
+/// coordinate order and full length, so reordered or duplicated openings are
+/// rejected even before the oracle roots are checked. Production callers use
+/// this only on proofs that are verified in the same path.
+pub fn proof_input_values(proof: &OpRelationProof) -> Result<Vec<Vec<i64>>> {
     proof
         .inputs
         .iter()
@@ -1703,7 +1837,7 @@ pub fn proof_input_values(proof: &OpRelationProof) -> Vec<Vec<i64>> {
         .collect()
 }
 
-pub fn proof_output_values(proof: &OpRelationProof) -> Vec<Vec<i64>> {
+pub fn proof_output_values(proof: &OpRelationProof) -> Result<Vec<Vec<i64>>> {
     proof
         .outputs
         .iter()

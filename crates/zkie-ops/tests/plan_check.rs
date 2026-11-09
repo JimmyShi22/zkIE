@@ -51,7 +51,7 @@ fn make_step(
         let root = public.registry.get(id).unwrap();
         roots.push((root.root, root.start, root.count));
     }
-    let outputs = proof_output_values(&proof);
+    let outputs = proof_output_values(&proof).unwrap();
     (
         SharedTraceStep {
             message: RelationReceiptMessage {

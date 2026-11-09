@@ -232,6 +232,13 @@ pub fn verify_opening(
     if opening.index >= root.count {
         return Err(Error::InvalidIndex);
     }
+    if root.count == 0 || !root.count.is_power_of_two() {
+        return Err(Error::InvalidConfig);
+    }
+    let depth = root.count.trailing_zeros() as usize;
+    if opening.path.len() != depth {
+        return Err(Error::InvalidProof);
+    }
     let leaf = oracle_leaf(opening.index, &opening.values);
     if merkle_verify(&root.start, &root.root, opening.index as usize, &leaf, &opening.path)? {
         Ok(())

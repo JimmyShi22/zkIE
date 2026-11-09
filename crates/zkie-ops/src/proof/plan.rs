@@ -754,7 +754,7 @@ pub(crate) fn verify_step(
     if output_count != plan_step.outputs || step.message.proof.outputs.len() != output_count {
         return Err(Error::ShapeMismatch);
     }
-    let inputs = proof_input_values(&step.message.proof);
+    let inputs = proof_input_values(&step.message.proof)?;
     if inputs.len() != input_count {
         return Err(Error::ShapeMismatch);
     }
@@ -859,7 +859,7 @@ pub(crate) fn verify_step(
             }
         }
     }
-    let outputs = proof_output_values(&step.message.proof);
+    let outputs = proof_output_values(&step.message.proof)?;
     if outputs.len() != output_count {
         return Err(Error::ShapeMismatch);
     }

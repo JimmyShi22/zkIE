@@ -852,7 +852,7 @@ fn verify_shared_trace_steps(
             &step.message.config,
             &external_values,
         )?;
-        let inputs = crate::proof::relations::proof_input_values(&step.message.proof);
+        let inputs = crate::proof::relations::proof_input_values(&step.message.proof)?;
         for (index, source) in step.sources.iter().enumerate() {
             if let Some((step_index, output_index)) = source {
                 let expected = outputs
@@ -875,7 +875,7 @@ fn verify_shared_trace_steps(
             &assets,
             expected_tokens,
         )?;
-        outputs.push(crate::proof::relations::proof_output_values(&step.message.proof));
+        outputs.push(crate::proof::relations::proof_output_values(&step.message.proof)?);
     }
     crate::proof::plan::verify_outputs(trace, plan, &outputs, &assets)?;
     Ok(outputs)
