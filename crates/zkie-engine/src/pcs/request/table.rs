@@ -17,16 +17,13 @@ use zkie_core::types::Digest;
 use crate::compute::cpu::{merkle_build, merkle_verify, MerkleTree};
 use crate::pcs::request::chain::{Chain, KIND_SEED};
 use crate::pcs::request::code::{encode_row_fp, CodeParams};
-use crate::pcs::request::field::{Fp, Fp3};
+use crate::pcs::request::field::{E_DEGREE, Fp, Fp3, FP3_BYTES};
 use crate::pcs::request::params::{LEAF_SALT_MAX_BYTES, LEAF_SALT_MIN_BYTES};
 use crate::primitives::codec::{CanonicalReader, CanonicalWriter};
 use crate::primitives::transcript::{hash_labeled, tag_word, LEAF_STORED_MAIN};
 
 /// The label of the chain that derives a table's record seeds.
 pub const RECORD_SEED_LABEL: u64 = 1 << 32;
-/// Degree of the extension field: a pad is one element of the base field per
-/// coefficient.
-pub const E_DEGREE: usize = 3;
 
 /// The sampling distances a plan fixes for a table. They are not part of the
 /// table's name or of any first query; the trusted plan supplies them.
@@ -95,8 +92,21 @@ pub fn index_fault(shape: &IndexShape) -> Option<&'static str> {
     None
 }
 
+/// The tree-shape checks that index_fault() does not cover: the salt is a
+/// multiple of eight bytes, and a column (one symbol per row) is narrower than
+/// 2^24. The salt-length range remains index_fault()'s check.
+pub fn tree_shape_fault(shape: &IndexShape) -> Option<&'static str> {
+    if shape.salt_bytes % 8 != 0 {
+        return Some("a leaf salt is not a multiple of eight bytes");
+    }
+    if shape.rows() >> 24 != 0 {
+        return Some("a column is wider than the tree tag admits");
+    }
+    None
+}
+
 pub fn validate_index_shape(shape: &IndexShape) -> Result<()> {
-    if index_fault(shape).is_some() {
+    if index_fault(shape).is_some() || tree_shape_fault(shape).is_some() {
         return Err(Error::InvalidConfig);
     }
     Ok(())
@@ -119,21 +129,50 @@ impl IndexRecord {
         writer.into_bytes()
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
+    /// Decode at most `max_elements` answers; the caller passes a bound
+    /// derived from the verified shape.
+    pub fn decode(bytes: &[u8], max_elements: usize) -> Result<Self> {
+        if bytes.len() % FP3_BYTES != 0 {
+            return Err(Error::InvalidEncoding);
+        }
+        let count = bytes.len() / FP3_BYTES;
+        if count > max_elements {
+            return Err(Error::ResourceLimit);
+        }
         let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
-        let mut y = Vec::new();
+        let mut y = Vec::with_capacity(count);
         while !reader.remaining().is_empty() {
             y.push(reader.get_fp3()?);
         }
+        reader.finish()?;
         Ok(Self { y })
+    }
+
+    /// Decode a record for a shape: the length must equal rows * answers,
+    /// with checked arithmetic.
+    pub fn decode_for(shape: &IndexShape, bytes: &[u8]) -> Result<Self> {
+        let expected = shape
+            .rows()
+            .checked_mul(shape.answers as u64)
+            .ok_or(Error::ResourceLimit)?;
+        let expected = usize::try_from(expected).map_err(|_| Error::ResourceLimit)?;
+        let record = Self::decode(bytes, expected)?;
+        if record_fault(shape, &record).is_some() {
+            return Err(Error::ShapeMismatch);
+        }
+        Ok(record)
     }
 }
 
 pub fn record_fault(shape: &IndexShape, record: &IndexRecord) -> Option<&'static str> {
-    if record.y.len() as u64 != shape.rows() * shape.answers as u64 {
-        return Some("the record has not one answer for each row and seed");
+    let expected = shape
+        .rows()
+        .checked_mul(shape.answers as u64);
+    match expected {
+        Some(expected) if record.y.len() as u64 == expected => None,
+        Some(_) => Some("the record has not one answer for each row and seed"),
+        None => Some("the record length overflows the verified shape"),
     }
-    None
 }
 
 /// A table's statement item: its commitment bytes and record answers.
@@ -141,6 +180,19 @@ pub fn record_fault(shape: &IndexShape, record: &IndexRecord) -> Option<&'static
 pub struct IndexName {
     pub commitment: Vec<u8>,
     pub record: IndexRecord,
+}
+
+impl IndexName {
+    /// The bytes a first query binds: the commitment (length-prefixed) and
+    /// the complete record, before any challenge that reads it.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut writer = CanonicalWriter::new();
+        writer.put_bytes(&self.commitment);
+        for value in &self.record.y {
+            writer.put_fp3(value);
+        }
+        writer.into_bytes()
+    }
 }
 
 /// One out-of-domain sample: a point with one extension coordinate per message
@@ -294,18 +346,27 @@ pub struct ColumnOpening {
 
 fn column_leaf(
     configuration: &Digest,
+    log_n: u32,
     position: u64,
     salt: &[u8],
     symbols: &[Fp],
 ) -> Result<Digest> {
+    // Leaf index: tree_index(log_n, position) = 2^log_n + position. The leaf
+    // carries the column, then its salt; the column width and the salt length
+    // are bound in the leaf data (the reference puts them in the leaf tag).
     let mut writer = CanonicalWriter::new();
-    writer.put_bytes(salt);
+    writer.put_u64(symbols.len() as u64);
+    writer.put_u64(salt.len() as u64);
     for value in symbols {
         writer.put_fp(*value);
     }
+    writer.put_bytes(salt);
+    let index = (1u64 << log_n)
+        .checked_add(position)
+        .ok_or(Error::ResourceLimit)?;
     hash_labeled(
         tag_word(LEAF_STORED_MAIN, 0),
-        position,
+        index,
         Some(configuration),
         &writer.into_bytes(),
     )
@@ -372,6 +433,9 @@ pub fn commit_table(
     if messages.len() != rows || tails.len() != rows || salts.len() != n {
         return Err(Error::ShapeMismatch);
     }
+    let record_entries = rows
+        .checked_mul(shape.answers as usize)
+        .ok_or(Error::ResourceLimit)?;
     for message in messages {
         if message.len() as u64 != shape.code.ell {
             return Err(Error::ShapeMismatch);
@@ -401,6 +465,7 @@ pub fn commit_table(
         }
         leaves.push(column_leaf(
             &configuration,
+            shape.code.log_n,
             position as u64,
             &salts[position],
             &symbols,
@@ -411,7 +476,7 @@ pub fn commit_table(
     let name = index_name(&root, &shape, &configuration);
     let seeds = record_seeds(&shape, &name)?;
     let mut record = IndexRecord {
-        y: Vec::with_capacity(rows * shape.answers as usize),
+        y: Vec::with_capacity(record_entries),
     };
     for message in messages {
         for answer in 0..shape.answers {
@@ -454,9 +519,17 @@ pub fn verify_columns(
     if openings.len() != positions.len() {
         return Err(Error::ShapeMismatch);
     }
+    if let Some(fault) = tree_shape_fault(&reader.shape) {
+        let _ = fault;
+        return Err(Error::InvalidConfig);
+    }
     let rows = reader.shape.rows() as usize;
     let n = reader.shape.code.n();
-    let mut columns = Vec::with_capacity(positions.len() * rows);
+    let capacity = positions
+        .len()
+        .checked_mul(rows)
+        .ok_or(Error::ResourceLimit)?;
+    let mut columns = Vec::with_capacity(capacity);
     let mut previous = None;
     for (position, opening) in positions.iter().zip(openings) {
         if *position >= n {
@@ -477,8 +550,12 @@ pub fn verify_columns(
         if opening.symbols.len() != rows {
             return Err(Error::ShapeMismatch);
         }
+        if opening.path.len() != reader.shape.code.log_n as usize {
+            return Err(Error::InvalidProof);
+        }
         let leaf = column_leaf(
             &reader.configuration,
+            reader.shape.code.log_n,
             opening.position,
             &opening.salt,
             &opening.symbols,
@@ -679,13 +756,46 @@ mod tests {
         let other = record_seeds(&shape, b"other-name").unwrap();
         assert_ne!(first, other);
         assert!(!first[0].beta.is_zero());
+
+        // One sequential draw per answer: with the same code, the first seeds
+        // do not change when more answers are added.
+        let mut two_answers = shape;
+        two_answers.answers = 2;
+        two_answers.code = crate::pcs::request::code::build_code_plan(5, 16, 1).unwrap();
+        let ordered = record_seeds(&two_answers, b"table-name").unwrap();
+        assert_eq!(ordered.len(), 2);
+        assert_ne!(ordered[0], ordered[1]);
+        let mut three_answers = two_answers;
+        three_answers.answers = 3;
+        let extended = record_seeds(&three_answers, b"table-name").unwrap();
+        assert_eq!(extended.len(), 3);
+        assert_eq!(extended[..2], ordered[..]);
+    }
+
+    #[test]
+    fn index_name_binds_the_complete_record() {
+        let table = committed();
+        let mut name = IndexName {
+            commitment: table.reader.commitment(),
+            record: table.reader.record.clone(),
+        };
+        let original = name.encode();
+        name.record.y[0] = name.record.y[0].add(&Fp3::ONE);
+        assert_ne!(original, name.encode());
+        let mut other = IndexName {
+            commitment: vec![1, 2, 3],
+            record: table.reader.record.clone(),
+        };
+        let with_other_commitment = other.encode();
+        other.commitment = table.reader.commitment();
+        assert_ne!(with_other_commitment, other.encode());
     }
 
     #[test]
     fn record_round_trip_and_length_check() {
         let table = committed();
         let bytes = table.reader.record.encode();
-        let decoded = IndexRecord::decode(&bytes).unwrap();
+        let decoded = IndexRecord::decode(&bytes, table.reader.record.y.len()).unwrap();
         assert_eq!(decoded, table.reader.record);
         let mut short = table.reader.record.clone();
         short.y.pop();
@@ -744,5 +854,82 @@ mod tests {
         let mut short_salt = salts.clone();
         short_salt[0].pop();
         assert!(commit_table(shape, Digest([7; 32]), &messages, &tails, &short_salt).is_err());
+    }
+
+    #[test]
+    fn leaf_root_and_depth_are_checked() {
+        let table = committed();
+        let rows = table.reader.shape.rows() as usize;
+        let shape = table.reader.shape;
+        // A malicious reader whose root is one column's leaf and whose opening
+        // has an empty path must be rejected: the declared tree is larger.
+        let position = 0u64;
+        let mut symbols = Vec::with_capacity(rows);
+        for codeword in &table.codewords {
+            symbols.push(codeword[position as usize]);
+        }
+        let leaf = column_leaf(
+            &table.reader.configuration,
+            shape.code.log_n,
+            position,
+            &table.salts[position as usize],
+            &symbols,
+        )
+        .unwrap();
+        let malicious = IndexReader {
+            shape,
+            configuration: table.reader.configuration,
+            root: leaf,
+            record: table.reader.record.clone(),
+        };
+        let opening = ColumnOpening {
+            position,
+            salt: table.salts[position as usize].clone(),
+            symbols,
+            path: Vec::new(),
+        };
+        assert!(verify_columns(&malicious, &[position], &[opening]).is_err());
+    }
+
+    #[test]
+    fn decode_is_bounded_and_checked() {
+        let table = committed();
+        let bytes = table.reader.record.encode();
+        let count = table.reader.record.y.len();
+        assert!(IndexRecord::decode(&bytes, count - 1).is_err());
+        assert!(IndexRecord::decode(&bytes, count).is_ok());
+        let mut trailing = bytes.clone();
+        trailing.push(1);
+        assert!(IndexRecord::decode(&trailing, count + 1).is_err());
+        assert!(IndexRecord::decode_for(&table.reader.shape, &bytes).is_ok());
+        let mut short = bytes;
+        short.truncate(short.len() - crate::pcs::request::field::FP3_BYTES);
+        assert!(IndexRecord::decode_for(&table.reader.shape, &short).is_err());
+    }
+
+    #[test]
+    fn tree_shape_checks_are_separate() {
+        let base = shape();
+        let mut bad = base;
+        bad.salt_bytes = LEAF_SALT_MIN_BYTES + 1;
+        assert!(index_fault(&bad).is_none());
+        assert!(tree_shape_fault(&bad).is_some());
+        assert!(validate_index_shape(&bad).is_err());
+        let mut wide = base;
+        wide.v = 24;
+        assert!(tree_shape_fault(&wide).is_some());
+    }
+
+    #[test]
+    fn index_name_record_encoding_is_stable() {
+        let table = committed();
+        let name = IndexName {
+            commitment: table.reader.commitment(),
+            record: table.reader.record.clone(),
+        };
+        let first = name.encode();
+        let second = name.encode();
+        assert_eq!(first, second);
+        assert!(first.len() > table.reader.record.encode().len());
     }
 }

@@ -15,6 +15,8 @@ pub const MODULUS: u64 = 0xFFFF_FFFF_0000_0001;
 pub const EXTENSION_NONRESIDUE: u64 = 2;
 pub const FP_BYTES: usize = 8;
 pub const FP3_BYTES: usize = 24;
+/// Degree of the extension field.
+pub const E_DEGREE: usize = 3;
 
 pub fn fp_from_u64(value: u64) -> Fp {
     Fp::from_u64(value)
