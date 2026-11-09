@@ -209,6 +209,7 @@ pub struct FoldMask {
     draws: Vec<u32>,
     tail: Option<MaskTail>,
     id: Option<u64>,
+    used: bool,
 }
 
 impl FoldMask {
@@ -239,6 +240,14 @@ impl FoldMask {
     pub fn tail(&self) -> Option<&MaskTail> {
         self.tail.as_ref()
     }
+
+    pub fn used(&self) -> bool {
+        self.used
+    }
+
+    fn mark_used(&mut self) {
+        self.used = true;
+    }
 }
 
 /// Draw the `2k + 1` coefficients from a numbered source and record each
@@ -261,6 +270,7 @@ pub fn fold_mask_make(
         draws,
         tail: None,
         id: None,
+        used: false,
     })
 }
 
@@ -597,11 +607,38 @@ impl VerifiedGroups {
     }
 }
 
+/// The verifier's registered metadata for an oracle id. `sampled` is the
+/// verifier's fact, never the proof's notice: a notice cannot claim that the
+/// oracle has no out-of-domain sample.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OracleMetadata {
+    pub id: u64,
+    pub group: u64,
+    pub tree_number: u64,
+    pub leaf_class: u32,
+    pub mask_rows: u64,
+    pub mask_code: CodeParams,
+    pub sampled: bool,
+}
+
 impl MaskOracle {
-    /// The verifier's view of a fresh-mask notice. The notice carries no
-    /// members; `claimed_group` is the proof's lookup key into the verifier's
-    /// registry.
-    pub fn from_notice(id: u64, claimed_group: u64, notice: &MaskNotice) -> Self {
+    /// The verifier's view from its registered metadata. The notice cannot set
+    /// or clear the sampled fact.
+    pub fn from_metadata(metadata: &OracleMetadata) -> Self {
+        Self {
+            id: metadata.id,
+            claimed_group: metadata.group,
+            main_rows: 0,
+            mask_rows: metadata.mask_rows,
+            mask_code: metadata.mask_code,
+            answers: 0,
+            sampled: metadata.sampled,
+        }
+    }
+
+    /// The prover's own view of its fresh mask. It is a prover claim and must
+    /// never be used by a verifier; the verifier uses the registered metadata.
+    pub fn prover_view(id: u64, claimed_group: u64, notice: &MaskNotice) -> Self {
         Self {
             id,
             claimed_group,
@@ -696,11 +733,16 @@ pub struct VerifiedStatement {
     pub id: Digest,
     pub groups: VerifiedGroups,
     pub mask_trees: Vec<MaskTreePlan>,
+    pub oracles: Vec<OracleMetadata>,
     spent: Arc<Mutex<MaskSpend>>,
 }
 
 impl VerifiedStatement {
-    pub fn new(groups: VerifiedGroups, mask_trees: Vec<MaskTreePlan>) -> Result<Self> {
+    pub fn new(
+        groups: VerifiedGroups,
+        mask_trees: Vec<MaskTreePlan>,
+        oracles: Vec<OracleMetadata>,
+    ) -> Result<Self> {
         for tree in &mask_trees {
             if tree.fault().is_some() {
                 return Err(Error::InvalidConfig);
@@ -727,6 +769,18 @@ impl VerifiedStatement {
             writer.put_digest(&tree.run);
             writer.put_digest(&tree.configuration);
         }
+        writer.put_u64(oracles.len() as u64);
+        for oracle in &oracles {
+            writer.put_u64(oracle.id);
+            writer.put_u64(oracle.group);
+            writer.put_u64(oracle.tree_number);
+            writer.put_u64(oracle.leaf_class as u64);
+            writer.put_u64(oracle.mask_rows);
+            writer.put_u64(oracle.mask_code.log_n as u64);
+            writer.put_u64(oracle.mask_code.ell);
+            writer.put_u64(oracle.mask_code.r);
+            writer.put_u64(if oracle.sampled { 1 } else { 0 });
+        }
         let id = hash_labeled(
             tag_word(STATEMENT, 0),
             0,
@@ -737,6 +791,7 @@ impl VerifiedStatement {
             id,
             groups,
             mask_trees,
+            oracles,
             spent: Arc::new(Mutex::new(MaskSpend::default())),
         })
     }
@@ -749,6 +804,10 @@ impl VerifiedStatement {
         self.mask_trees
             .iter()
             .find(|tree| tree.tree_number == tree_number)
+    }
+
+    pub fn oracle(&self, id: u64) -> Option<&OracleMetadata> {
+        self.oracles.iter().find(|oracle| oracle.id == id)
     }
 
     pub fn spend(&self, id: u64) -> Result<()> {
@@ -815,7 +874,7 @@ fn mask_tail_rows(shape: &FoldShape, mask: &FoldMask) -> Result<Vec<Vec<Fp3>>> {
 /// production source is not implemented.
 pub fn fold_start_prove(
     shape: &FoldShape,
-    mask: &FoldMask,
+    mask: &mut FoldMask,
     coins: &impl MaskCoins,
     oracle: &MaskOracle,
     groups: &VerifiedGroups,
@@ -823,7 +882,7 @@ pub fn fold_start_prove(
     salts: &[Vec<u8>],
 ) -> Result<FoldStartProver> {
     validate_fold_mask_shape(shape)?;
-    if mask.id() != Some(oracle.id) {
+    if mask.id() != Some(oracle.id) || mask.used() {
         return Err(Error::InvalidProof);
     }
     fold_mask_check(shape, oracle, groups)?;
@@ -833,6 +892,7 @@ pub fn fold_start_prove(
     let tails = mask_tail_rows(shape, mask)?;
     let tree = MaskTree::commit(tree_plan, shape, &rows, &tails, salts)?;
     let sum = fold_mask_sum(shape.k, mask.coefficients())?;
+    mask.mark_used();
     let tree_number = tree_plan.tree_number;
     let message = FoldStartMessage {
         id: oracle.id,
@@ -875,7 +935,16 @@ pub fn fold_start_verify(
     {
         return Err(Error::StatementMismatch);
     }
-    let oracle = MaskOracle::from_notice(message.id, message.claimed_group, &message.notice);
+    let metadata = statement.oracle(message.id).ok_or(Error::StatementMismatch)?;
+    if metadata.group != message.claimed_group
+        || metadata.tree_number != message.tree_number
+        || metadata.leaf_class != message.notice.leaf_class
+        || metadata.mask_rows != message.notice.mask_rows
+        || metadata.mask_code != message.notice.mask_code
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let oracle = MaskOracle::from_metadata(metadata);
     fold_mask_check(shape, &oracle, statement.groups())?;
     if message.root == Digest::ZERO {
         return Err(Error::InvalidProof);
@@ -1037,6 +1106,7 @@ mod tests {
             draws: mask.draws().to_vec(),
             tail: mask.tail().cloned(),
             id: None,
+            used: false,
         };
         tampered.coefficients[0] = tampered.coefficients[0].add(&Fp3::ONE);
         assert!(fold_mask_as_drawn(&shape, &tampered, &source).is_err());
@@ -1046,6 +1116,7 @@ mod tests {
             draws: mask.draws().to_vec(),
             tail: mask.tail().cloned(),
             id: None,
+            used: false,
         };
         number.draws[1] = 4;
         assert!(fold_mask_as_drawn(&shape, &number, &source).is_err());
@@ -1057,6 +1128,7 @@ mod tests {
             draws: mask.draws().to_vec(),
             tail: mask.tail().cloned(),
             id: None,
+            used: false,
         };
         tail_value.tail.as_mut().unwrap().values[0] =
             tail_value.tail.as_ref().unwrap().values[0].add(&Fp3::ONE);
@@ -1067,6 +1139,7 @@ mod tests {
             draws: mask.draws().to_vec(),
             tail: mask.tail().cloned(),
             id: None,
+            used: false,
         };
         tail_number.tail.as_mut().unwrap().draws[1] = NO_DRAW;
         assert!(fold_mask_as_drawn(&shape, &tail_number, &source).is_err());
@@ -1076,6 +1149,7 @@ mod tests {
             draws: mask.draws().to_vec(),
             tail: None,
             id: None,
+            used: false,
         };
         assert!(fold_mask_as_drawn(&shape, &no_tail, &source).is_err());
 
@@ -1163,17 +1237,22 @@ mod tests {
         let plan = tree_plan(&shape);
         let salts = tree_salts(&plan);
         let notice = fold_mask_notice(&shape).unwrap();
-        let oracle = MaskOracle::from_notice(9, 1, &notice);
+        let oracle = MaskOracle::prover_view(9, 1, &notice);
         // The mask must have been sent under the id the verifier checks.
         assert!(fold_start_prove(
-            &shape, &mask, &source, &oracle, &groups, plan, &salts
+            &shape, &mut mask, &source, &oracle, &groups, plan, &salts
         )
         .is_err());
         mask.sent_as(9).unwrap();
         let start = fold_start_prove(
-            &shape, &mask, &source, &oracle, &groups, plan, &salts,
+            &shape, &mut mask, &source, &oracle, &groups, plan, &salts,
         )
         .unwrap();
+        assert!(mask.used());
+        assert!(fold_start_prove(
+            &shape, &mut mask, &source, &oracle, &groups, plan, &salts
+        )
+        .is_err());
         assert_ne!(start.message.root, Digest::ZERO);
         assert_eq!(
             start.message.sum,
@@ -1182,12 +1261,29 @@ mod tests {
         assert_eq!(start.draft.table.rows, 2);
         assert_eq!(start.draft.tail.draws, mask.tail().unwrap().draws);
         // The verifier accepts the public message with no prover secret.
-        let statement = VerifiedStatement::new(groups.clone(), vec![plan]).unwrap();
+        let metadata = OracleMetadata {
+            id: 9,
+            group: 1,
+            tree_number: plan.tree_number,
+            leaf_class: plan.leaf_class,
+            mask_rows: plan.mask_rows,
+            mask_code: shape.mask_code,
+            sampled: false,
+        };
+        let statement =
+            VerifiedStatement::new(groups.clone(), vec![plan], vec![metadata.clone()]).unwrap();
         fold_start_verify(&shape, &start.message, &statement).unwrap();
         assert!(fold_start_verify(&shape, &start.message, &statement).is_err());
         let mut bad = start.message.clone();
         bad.tree_number = 6;
         assert!(fold_start_verify(&shape, &bad, &statement).is_err());
+        // The verifier's metadata, not the notice, decides whether the oracle
+        // was sampled.
+        let mut sampled = metadata;
+        sampled.sampled = true;
+        let sampled_statement =
+            VerifiedStatement::new(groups.clone(), vec![plan], vec![sampled]).unwrap();
+        assert!(fold_start_verify(&shape, &start.message, &sampled_statement).is_err());
         // The committed root opens the mask tree at the drawn positions.
         let positions = [1u64, 4];
         let openings = start.tree.open(&positions).unwrap();
@@ -1211,11 +1307,12 @@ mod tests {
             draws: mask.draws().to_vec(),
             tail: mask.tail().cloned(),
             id: Some(9),
+            used: false,
         };
         tampered_mask.coefficients[0] = tampered_mask.coefficients[0].add(&Fp3::ONE);
         assert!(fold_start_prove(
             &shape,
-            &tampered_mask,
+            &mut tampered_mask,
             &source,
             &oracle,
             &groups,
@@ -1594,6 +1691,7 @@ mod tests {
             draws: mask.draws().to_vec(),
             tail: Some(short_tail),
             id: None,
+            used: false,
         };
         assert!(fold_mask_as_drawn(&shape, &broken, &source).is_err());
     }

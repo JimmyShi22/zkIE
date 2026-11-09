@@ -17,13 +17,15 @@ use crate::pcs::request::chain::{
     Chain, KIND_ALGEBRAIC, KIND_EPSILON, KIND_POSITIONS, KIND_SEAL,
 };
 use crate::pcs::request::field::{Fp, Fp3};
+use crate::pcs::request::runtime_tree::{verify_mask_columns, MaskColumnOpening};
 use crate::pcs::request::fold::{
     fold_mask_shape_fault, fold_start_verify, FoldShape, FoldStartMessage, VerifiedStatement,
 };
-use crate::pcs::request::read::{draw_positions, ReadLedger, VerifierReads};
+use crate::pcs::request::read::{draw_positions, HidingLedger, ReadLedger, VerifierReads};
 use crate::pcs::request::table::{
     record_seeds, ColumnOpening, IndexName, IndexReader, SampleSeed,
 };
+use crate::primitives::codec::CanonicalWriter;
 use crate::primitives::transcript::chain_start;
 
 /// The binder that both sides build from the complete first query. A session
@@ -39,6 +41,12 @@ pub struct FoldeqBinder {
 
 impl FoldeqBinder {
     pub fn new(label: u64, parameters: Digest, plan: &FoldeqPlan) -> Result<Self> {
+        if plan.fault().is_some() {
+            return Err(Error::InvalidConfig);
+        }
+        if parameters != plan.reader.configuration {
+            return Err(Error::StatementMismatch);
+        }
         let first_query = plan.first_query();
         let start = chain_start(label, &parameters, &first_query, &[], None)?;
         Ok(Self {
@@ -62,6 +70,20 @@ impl FoldeqBinder {
     }
 }
 
+/// A LIN-style gamma: the suffix of a caller-drawn psi, starting at `k_lo`.
+/// The FOLDEQ session does not assume this caller; a direct gamma is also
+/// accepted. The caller owns the psi draw and its round.
+pub fn lin_gamma(psi: &[Fp3], k_lo: u32, columns: u32) -> Result<Vec<Fp3>> {
+    let start = k_lo as usize;
+    let end = start
+        .checked_add(columns as usize)
+        .ok_or(Error::ResourceLimit)?;
+    if end > psi.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    Ok(psi[start..end].to_vec())
+}
+
 /// The verifier's FOLDEQ plan. The reader is the committed table, the fold and
 /// runtime mask-tree layouts and the group registry come from the statement,
 /// and the seed/read budgets and column draw count come from the plan. None of
@@ -77,7 +99,9 @@ pub struct FoldeqPlan {
     pub leaf_class: u32,
     pub seed_budget: usize,
     pub ledger: Arc<Mutex<ReadLedger>>,
+    pub hiding: Arc<Mutex<HidingLedger>>,
     pub column_draws: usize,
+    pub mask_positions: Vec<u64>,
 }
 
 impl FoldeqPlan {
@@ -126,6 +150,29 @@ impl FoldeqPlan {
         if draws > max_reads {
             return Some("the column draws exceed the read budget");
         }
+        let max_columns = match self.hiding.lock() {
+            Ok(ledger) => ledger.max_columns(),
+            Err(_) => return Some("the hiding ledger is poisoned"),
+        };
+        if draws > max_columns {
+            return Some("the column draws exceed the table's hiding budget");
+        }
+        if self.mask_positions.is_empty() {
+            return Some("no mask position is fixed");
+        }
+        let columns = tree.columns();
+        let mut previous = None;
+        for position in &self.mask_positions {
+            if *position >= columns {
+                return Some("a mask position is outside the runtime tree");
+            }
+            if let Some(previous) = previous {
+                if *position <= previous {
+                    return Some("the mask positions are not sorted unique");
+                }
+            }
+            previous = Some(*position);
+        }
         let answers = self.reader.shape.answers as usize;
         if self.seed_budget < answers {
             return Some("the seed budget is below the answer count");
@@ -137,11 +184,66 @@ impl FoldeqPlan {
     /// record), before any challenge that reads it. Distances are not part of
     /// the first query; they stay plan values.
     pub fn first_query(&self) -> Vec<u8> {
-        IndexName {
-            commitment: self.reader.commitment(),
-            record: self.reader.record.clone(),
+        let mut writer = CanonicalWriter::new();
+        // The complete table name: commitment and record.
+        writer.put_bytes(
+            &IndexName {
+                commitment: self.reader.commitment(),
+                record: self.reader.record.clone(),
+            }
+            .encode(),
+        );
+        // The trusted table and fold shapes. Distances are the first-query
+        // exception and stay plan values; the configuration is the binder's
+        // parameters digest, not this statement.
+        for value in [
+            self.reader.shape.code.log_n as u64,
+            self.reader.shape.code.ell,
+            self.reader.shape.code.r,
+            self.reader.shape.v as u64,
+            self.reader.shape.answers as u64,
+            self.reader.shape.salt_bytes as u64,
+            self.fold.code.log_n as u64,
+            self.fold.code.ell,
+            self.fold.code.r,
+            self.fold.mask_code.log_n as u64,
+            self.fold.mask_code.ell,
+            self.fold.mask_code.r,
+            self.fold.k as u64,
+            self.fold.h as u64,
+            self.fold.mask_leaf_class as u64,
+        ] {
+            writer.put_u64(value);
         }
-        .encode()
+        // The verified statement (groups, runtime trees and their starts), the
+        // expected tree/group/leaf numbers and the complete query plan.
+        writer.put_digest(&self.statement.id);
+        for value in [
+            self.mask_tree_number,
+            self.group_id,
+            self.leaf_class as u64,
+            self.seed_budget as u64,
+            self.column_draws as u64,
+        ] {
+            writer.put_u64(value);
+        }
+        let max_reads = self
+            .ledger
+            .lock()
+            .map(|ledger| ledger.max_reads())
+            .unwrap_or(0);
+        writer.put_u64(max_reads);
+        let max_columns = self
+            .hiding
+            .lock()
+            .map(|ledger| ledger.max_columns())
+            .unwrap_or(0);
+        writer.put_u64(max_columns);
+        writer.put_u64(self.mask_positions.len() as u64);
+        for position in &self.mask_positions {
+            writer.put_u64(*position);
+        }
+        writer.into_bytes()
     }
 
     pub fn check_first_query(&self, sent: &[u8]) -> Result<()> {
@@ -169,6 +271,7 @@ enum Stage {
     Queried,
     Read,
     FoldStarted,
+    MaskOpened,
 }
 
 /// The verifier's FOLDEQ session. It owns the chain, the plan, the mask spend
@@ -179,7 +282,7 @@ pub struct FoldeqSession {
     chain: Chain,
     reads: VerifierReads,
     stage: Stage,
-    gamma: Option<Fp3>,
+    gamma: Option<Vec<Fp3>>,
     gu_root: Option<Digest>,
     start: Option<FoldStartMessage>,
     epsilon: Option<Fp3>,
@@ -201,6 +304,10 @@ impl FoldeqSession {
         {
             return Err(Error::StatementMismatch);
         }
+        plan.hiding
+            .lock()
+            .map_err(|_| Error::InvalidSessionState)?
+            .begin(plan.column_draws)?;
         let reads = VerifierReads::new(Arc::clone(&plan.ledger));
         Ok(Self {
             plan,
@@ -223,8 +330,8 @@ impl FoldeqSession {
         &self.queries
     }
 
-    pub fn gamma(&self) -> Option<Fp3> {
-        self.gamma
+    pub fn gamma(&self) -> Option<&[Fp3]> {
+        self.gamma.as_deref()
     }
 
     pub fn gu_root(&self) -> Option<&Digest> {
@@ -255,17 +362,27 @@ impl FoldeqSession {
         self.plan.seeds()
     }
 
-    /// Draw gamma after the record is bound (the first query carries the
-    /// record) and before any G_u or column message.
-    pub fn draw_gamma(&mut self) -> Result<()> {
+    /// Bind the caller's gamma after the record is bound (the first query
+    /// carries the record) and before any G_u or column message. The caller
+    /// owns the challenge round: a LIN caller passes the psi suffix through
+    /// `lin_gamma`, another caller may pass a directly drawn gamma. The session
+    /// binds the value and does not assume one interface.
+    pub fn bind_gamma(&mut self, gamma: &[Fp3]) -> Result<()> {
         if self.stage != Stage::Seeds {
             return Err(Error::InvalidSessionState);
         }
-        let prefix = self.chain.message().prefix(KIND_ALGEBRAIC, 0)?;
+        if gamma.len() != self.plan.reader.shape.v as usize {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut message = self.chain.message();
+        for value in gamma {
+            message.push_fp3(value);
+        }
+        let prefix = message.prefix(KIND_ALGEBRAIC, 0)?;
         if !self.chain.step(&prefix, 0)? {
             return Err(Error::InvalidProof);
         }
-        self.gamma = Some(self.chain.draw_e()?);
+        self.gamma = Some(gamma.to_vec());
         self.stage = Stage::Gamma;
         Ok(())
     }
@@ -362,6 +479,24 @@ impl FoldeqSession {
         self.stage = Stage::FoldStarted;
         Ok(())
     }
+
+    /// Verify the mask root against the plan's runtime tree and the plan's
+    /// allowed position list. This is the root authentication the start
+    /// message cannot provide by itself.
+    pub fn read_mask(&mut self, openings: &[MaskColumnOpening]) -> Result<()> {
+        if self.stage != Stage::FoldStarted {
+            return Err(Error::InvalidSessionState);
+        }
+        let message = self.start.as_ref().ok_or(Error::InvalidSessionState)?;
+        let tree = self
+            .plan
+            .statement
+            .mask_tree(self.plan.mask_tree_number)
+            .ok_or(Error::StatementMismatch)?;
+        verify_mask_columns(tree, &message.root, &self.plan.mask_positions, openings)?;
+        self.stage = Stage::MaskOpened;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -369,9 +504,10 @@ mod tests {
     use super::*;
     use crate::pcs::request::code::build_code_plan;
     use crate::pcs::request::field::{Fp, MODULUS};
-    use crate::pcs::request::fold::{
+    use crate::pcs::request::runtime_tree::{verify_mask_columns, MaskColumnOpening};
+use crate::pcs::request::fold::{
         fold_mask_make, fold_mask_make_tail, fold_mask_notice, fold_start_prove, MaskOracle,
-        VerifiedGroup, VerifiedGroups, VerifiedStatement,
+        OracleMetadata, VerifiedGroup, VerifiedGroups, VerifiedStatement,
     };
     use crate::pcs::request::params::{LEAF_SALT_MIN_BYTES, REQUEST_CHAIN_LABEL};
     use crate::pcs::request::read::ProverReads;
@@ -460,6 +596,15 @@ mod tests {
                     }],
                 },
                 vec![tree],
+                vec![OracleMetadata {
+                    id: 9,
+                    group: 1,
+                    tree_number: tree.tree_number,
+                    leaf_class: tree.leaf_class,
+                    mask_rows: tree.mask_rows,
+                    mask_code: build_code_plan(3, 4, 1).unwrap(),
+                    sampled: false,
+                }],
             )
             .unwrap(),
         );
@@ -472,14 +617,16 @@ mod tests {
             leaf_class: 3,
             seed_budget: table.reader.shape.answers as usize,
             ledger: Arc::new(Mutex::new(ReadLedger::new(2))),
+            hiding: Arc::new(Mutex::new(HidingLedger::new(4))),
             column_draws: 2,
+            mask_positions: vec![1, 4],
         };
         (plan, table)
     }
 
     fn open_session() -> (FoldeqSession, crate::pcs::request::table::CommittedTable) {
         let (plan, table) = plan_fixture();
-        let binder = FoldeqBinder::new(REQUEST_CHAIN_LABEL, Digest::ZERO, &plan).unwrap();
+        let binder = FoldeqBinder::new(REQUEST_CHAIN_LABEL, plan.reader.configuration, &plan).unwrap();
         let chain = binder.chain().unwrap();
         (FoldeqSession::open(plan, binder, chain).unwrap(), table)
     }
@@ -490,11 +637,11 @@ mod tests {
         fold_mask_make_tail(&plan.fold, &mut mask, &mut source).unwrap();
         mask.sent_as(9).unwrap();
         let notice = fold_mask_notice(&plan.fold).unwrap();
-        let oracle = MaskOracle::from_notice(9, 1, &notice);
+        let oracle = MaskOracle::prover_view(9, 1, &notice);
         let tree = *plan.statement.mask_tree(plan.mask_tree_number).unwrap();
         fold_start_prove(
             &plan.fold,
-            &mask,
+            &mut mask,
             &source,
             &oracle,
             plan.statement.groups(),
@@ -507,7 +654,7 @@ mod tests {
     #[test]
     fn wrong_prefix_chain_is_rejected() {
         let (plan, _table) = plan_fixture();
-        let binder = FoldeqBinder::new(REQUEST_CHAIN_LABEL, Digest::ZERO, &plan).unwrap();
+        let binder = FoldeqBinder::new(REQUEST_CHAIN_LABEL, plan.reader.configuration, &plan).unwrap();
         let wrong = Chain::begin(
             REQUEST_CHAIN_LABEL,
             &Digest::ZERO,
@@ -520,10 +667,47 @@ mod tests {
     }
 
     #[test]
+    fn first_query_binds_the_plan_and_configuration() {
+        let (plan, _table) = plan_fixture();
+        assert!(FoldeqBinder::new(REQUEST_CHAIN_LABEL, Digest::ZERO, &plan).is_err());
+        let mut other = plan.clone();
+        other.column_draws = 1;
+        assert_ne!(plan.first_query(), other.first_query());
+        // The same root and record under another plan is not this first query.
+        let binder = FoldeqBinder::new(
+            REQUEST_CHAIN_LABEL,
+            plan.reader.configuration,
+            &plan,
+        )
+        .unwrap();
+        let chain = binder.chain().unwrap();
+        let mut session = FoldeqSession::open(plan.clone(), binder, chain).unwrap();
+        assert!(session.bind_first_query(&other.first_query()).is_err());
+        let own = plan.first_query();
+        session.bind_first_query(&own).unwrap();
+    }
+
+    #[test]
+    fn lin_gamma_is_the_psi_suffix() {
+        let psi = vec![
+            Fp3::from_u64(1),
+            Fp3::from_u64(2),
+            Fp3::from_u64(3),
+            Fp3::from_u64(4),
+        ];
+        assert_eq!(
+            lin_gamma(&psi, 2, 2).unwrap(),
+            vec![Fp3::from_u64(3), Fp3::from_u64(4)]
+        );
+        assert!(lin_gamma(&psi, 3, 2).is_err());
+        assert!(lin_gamma(&psi, 0, 5).is_err());
+    }
+
+    #[test]
     fn first_query_and_stage_order() {
         let (mut session, _table) = open_session();
         assert!(session.seeds().is_err());
-        assert!(session.draw_gamma().is_err());
+        assert!(session.bind_gamma(&[]).is_err());
         let mut sent = session.plan().first_query();
         sent[0] ^= 1;
         assert!(session.bind_first_query(&sent).is_err());
@@ -544,8 +728,9 @@ mod tests {
         let good = plan.first_query();
         session.bind_first_query(&good).unwrap();
         let _seeds = session.seeds().unwrap();
-        session.draw_gamma().unwrap();
-        assert!(session.gamma().is_some());
+        let gamma = vec![Fp3::from_u64(3); plan.reader.shape.v as usize];
+        session.bind_gamma(&gamma).unwrap();
+        assert_eq!(session.gamma(), Some(gamma.as_slice()));
         session.send_gu(&Digest([4; 32])).unwrap();
         assert_eq!(session.gu_root(), Some(&Digest([4; 32])));
         session.draw_queries().unwrap();
@@ -560,40 +745,88 @@ mod tests {
         session.start_fold(&start.message).unwrap();
         assert!(session.epsilon().is_some());
         assert_eq!(session.start(), Some(&start.message));
+        let mask_openings = start.tree.open(&plan.mask_positions).unwrap();
+        session.read_mask(&mask_openings).unwrap();
+        assert!(session.read_mask(&mask_openings).is_err());
+        let tree = plan.statement.mask_tree(plan.mask_tree_number).unwrap();
+        assert!(verify_mask_columns(
+            tree,
+            &Digest([5; 32]),
+            &plan.mask_positions,
+            &mask_openings
+        )
+        .is_err());
+        let mut forged = mask_openings;
+        forged[0].symbols[0] = forged[0].symbols[0] + Fp::ONE;
+        assert!(verify_mask_columns(
+            tree,
+            &start.message.root,
+            &plan.mask_positions,
+            &forged
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn hiding_budget_is_shared_across_sessions_and_not_refunded() {
+        let (plan, _table) = plan_fixture();
+        let binder = FoldeqBinder::new(
+            REQUEST_CHAIN_LABEL,
+            plan.reader.configuration,
+            &plan,
+        )
+        .unwrap();
+        let chain = binder.chain().unwrap();
+        let first = FoldeqSession::open(plan.clone(), binder.clone(), chain.clone()).unwrap();
+        let second = FoldeqSession::open(plan.clone(), binder.clone(), chain.clone()).unwrap();
+        // Dropping an abandoned proof does not refund its columns.
+        drop(first);
+        drop(second);
+        assert_eq!(plan.hiding.lock().unwrap().used(), 4);
+        let third = FoldeqSession::open(plan, binder, chain);
+        assert!(third.is_err());
     }
 
     #[test]
     fn plan_faults_are_rejected() {
-        let (mut plan, _table) = plan_fixture();
-        plan.seed_budget = 0;
-        let binder = FoldeqBinder::new(REQUEST_CHAIN_LABEL, Digest::ZERO, &plan).unwrap();
+        let (plan, _table) = plan_fixture();
+        let binder = FoldeqBinder::new(
+            REQUEST_CHAIN_LABEL,
+            plan.reader.configuration,
+            &plan,
+        )
+        .unwrap();
         let chain = binder.chain().unwrap();
-        assert!(FoldeqSession::open(plan, binder, chain).is_err());
 
-        let (mut plan, _table) = plan_fixture();
-        plan.column_draws = 0;
-        let binder = FoldeqBinder::new(REQUEST_CHAIN_LABEL, Digest::ZERO, &plan).unwrap();
-        let chain = binder.chain().unwrap();
-        assert!(FoldeqSession::open(plan, binder, chain).is_err());
+        let mut bad = plan.clone();
+        bad.seed_budget = 0;
+        assert!(FoldeqSession::open(bad, binder.clone(), chain.clone()).is_err());
 
-        let (mut plan, _table) = plan_fixture();
-        plan.mask_tree_number = 6;
-        let binder = FoldeqBinder::new(REQUEST_CHAIN_LABEL, Digest::ZERO, &plan).unwrap();
-        let chain = binder.chain().unwrap();
-        assert!(FoldeqSession::open(plan, binder, chain).is_err());
+        let mut bad = plan.clone();
+        bad.column_draws = 0;
+        assert!(FoldeqSession::open(bad, binder.clone(), chain.clone()).is_err());
 
-        let (mut plan, _table) = plan_fixture();
-        plan.ledger = Arc::new(Mutex::new(ReadLedger::new(1)));
-        plan.column_draws = 2;
-        let binder = FoldeqBinder::new(REQUEST_CHAIN_LABEL, Digest::ZERO, &plan).unwrap();
-        let chain = binder.chain().unwrap();
-        assert!(FoldeqSession::open(plan, binder, chain).is_err());
+        let mut bad = plan.clone();
+        bad.mask_tree_number = 6;
+        assert!(FoldeqSession::open(bad, binder.clone(), chain.clone()).is_err());
 
-        let (mut plan, _table) = plan_fixture();
-        plan.group_id = 7;
-        let binder = FoldeqBinder::new(REQUEST_CHAIN_LABEL, Digest::ZERO, &plan).unwrap();
-        let chain = binder.chain().unwrap();
-        assert!(FoldeqSession::open(plan, binder, chain).is_err());
+        let mut bad = plan.clone();
+        bad.ledger = Arc::new(Mutex::new(ReadLedger::new(1)));
+        bad.column_draws = 2;
+        assert!(FoldeqSession::open(bad, binder.clone(), chain.clone()).is_err());
+
+        let mut bad = plan.clone();
+        bad.hiding = Arc::new(Mutex::new(HidingLedger::new(1)));
+        bad.column_draws = 2;
+        assert!(FoldeqSession::open(bad, binder.clone(), chain.clone()).is_err());
+
+        let mut bad = plan.clone();
+        bad.mask_positions.clear();
+        assert!(FoldeqSession::open(bad, binder.clone(), chain.clone()).is_err());
+
+        let mut bad = plan;
+        bad.group_id = 7;
+        assert!(FoldeqSession::open(bad, binder, chain).is_err());
     }
 
     // A local numbered source for the joint harness tests; it is not a

@@ -195,6 +195,44 @@ impl ReadLedger {
     }
 }
 
+/// The table-life hiding budget: how many columns the table's random tails
+/// can hide over the table's whole life. The unit is one column. `begin`
+/// charges before any fold or draw and never refunds: an abandoned proof has
+/// spent its columns all the same. The ledger lives with the statement, so a
+/// rebuilt session cannot reset it; disk persistence is not implemented.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HidingLedger {
+    max_columns: u64,
+    used: u64,
+}
+
+impl HidingLedger {
+    pub fn new(max_columns: u64) -> Self {
+        Self {
+            max_columns,
+            used: 0,
+        }
+    }
+
+    pub fn max_columns(&self) -> u64 {
+        self.max_columns
+    }
+
+    pub fn used(&self) -> u64 {
+        self.used
+    }
+
+    pub fn begin(&mut self, columns: usize) -> Result<()> {
+        let columns = u64::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+        let used = self.used.checked_add(columns).ok_or(Error::ResourceLimit)?;
+        if used > self.max_columns {
+            return Err(Error::ResourceLimit);
+        }
+        self.used = used;
+        Ok(())
+    }
+}
+
 /// The verifier's column reads: a shared ledger and one value store per
 /// session. The ledger is the authority for the budget; the value store keeps
 /// repeated reads consistent.
@@ -516,6 +554,18 @@ mod tests {
         // The budget is still available after the failed read.
         reads.read(&table.reader, &positions, &openings).unwrap();
         assert_eq!(shared.lock().unwrap().used(), 2);
+    }
+
+    #[test]
+    fn hiding_ledger_charges_before_fold_and_never_refunds() {
+        let mut ledger = HidingLedger::new(3);
+        ledger.begin(2).unwrap();
+        assert_eq!(ledger.used(), 2);
+        assert!(ledger.begin(2).is_err());
+        ledger.begin(1).unwrap();
+        assert_eq!(ledger.used(), 3);
+        ledger.begin(0).unwrap();
+        assert!(ledger.begin(1).is_err());
     }
 
     #[test]
