@@ -661,13 +661,15 @@ impl BatStatement {
     }
 
     /// Convert and validate the handoff to the isolated FOLD fixture. This is
-    /// a restricted fixture handoff only: it accepts exactly the layouts that
-    /// the isolated FOLD candidate checker accepts. A legal BAT layout whose
-    /// descending blocks that checker rejects is outside this S2 subset and
-    /// fails closed here; it is not a general GroupLayout handoff. The only BAT
-    /// layout derivation is `BatStatement::layout`; production must rebuild the
-    /// same members/first offsets/k/h/kept from an authenticated statement, and
-    /// must not introduce a second layout authority.
+    /// a restricted fixture handoff only: it accepts a layout only when the
+    /// isolated FOLD candidate checker passes and that checker's member-order
+    /// implied main/mask first offsets equal BAT's actual main_first/mask_first.
+    /// A legal BAT layout whose descending blocks that checker rejects is
+    /// outside this S2 subset and fails closed here; it is not a general
+    /// GroupLayout handoff. The only BAT layout derivation is
+    /// `BatStatement::layout`; production must rebuild the same
+    /// members/first offsets/k/h/kept from an authenticated statement, and must
+    /// not introduce a second layout authority.
     pub fn to_fold_layout_checked(
         &self,
         group: u64,
