@@ -904,11 +904,15 @@ impl FoldeqSession {
     }
 
     /// Verify one opening per unique physical position and map the verified
-    /// columns back to the logical draw sequence. The caller supplies one
-    /// opening per logical draw; repeats must carry the same opening. The read
-    /// ledger therefore charges the actual unique openings, while the plan's
-    /// column count remains the logical sampling count. Hiding accounting is a
-    /// separate provider-side ledger and is not reduced by this deduplication.
+    /// columns back to the logical draw sequence. The caller still supplies one
+    /// opening per logical draw; repeats must carry the same opening. Only the
+    /// verification and the read ledger deduplicate to unique physical
+    /// positions. This does not claim that an online proof carries one opening
+    /// per position or that proof size is reduced; the real opening list
+    /// encoding and provision remain a production integration gate. The read
+    /// ledger charges the actual unique openings, while the plan's column count
+    /// remains the logical sampling count. Hiding accounting is a separate
+    /// provider-side ledger and is not reduced by this deduplication.
     pub fn read_queries(&mut self, openings: &[ColumnOpening]) -> Result<Vec<Vec<Fp>>> {
         if self.stage != Stage::Queried && self.stage != Stage::Read {
             return Err(Error::InvalidSessionState);

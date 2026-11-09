@@ -1,11 +1,16 @@
 //! Column reads: drawn positions, a read budget, a verifier value store and
 //! a prover opening cache (foundation only).
 //!
-//! The verifier draws positions from its own chain and charges every draw to
-//! the plan's read budget; the prover gets the same positions from the same
-//! transcript. A position read twice must return the same column values, and
-//! an exhausted budget fails closed. This module is not wired into
-//! production; the plan/priced_table that fixes the budget is still open.
+//! The verifier draws positions from its own chain; the prover gets the same
+//! positions from the same transcript. The read budget counts supplied column
+//! reads, not logical draws: a low-level entry charges the list it receives,
+//! while `FoldeqSession::read_queries` verifies unique physical positions and
+//! charges that deduplicated list. The plan's logical draw count is a separate
+//! quantity. The provider's hiding budget is a separate ledger; verification
+//! deduplication does not reduce it, and no cumulative hiding-budget closure is
+//! claimed. A position read twice must return the same column values, and an
+//! exhausted budget fails closed. This module is not wired into production;
+//! the plan/priced_table that fixes the budget is still open.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -35,8 +40,10 @@ pub fn draw_positions(chain: &mut Chain, count: usize, log_n: u32) -> Result<Vec
 }
 
 /// The drawn positions in increasing order without repeats. The number of
-/// draws is not the number of distinct positions; callers that charge a
-/// budget must use the draw count.
+/// draws is not the number of distinct positions. A low-level read entry
+/// charges the list it receives; a caller that treats a physical opening as
+/// the budget unit must deduplicate first. The plan's logical draw count stays
+/// a separate quantity.
 pub fn unique_sorted(positions: &[u64]) -> Vec<u64> {
     let mut sorted = positions.to_vec();
     sorted.sort_unstable();
@@ -44,7 +51,9 @@ pub fn unique_sorted(positions: &[u64]) -> Vec<u64> {
     sorted
 }
 
-/// A read budget in draws. Charging past the maximum fails closed.
+/// A read budget in supplied column reads. One charge is one entry of the
+/// list an entry verifies; it is not necessarily one logical draw. Charging
+/// past the maximum fails closed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReadBudget {
     max_reads: u64,
@@ -91,7 +100,10 @@ pub struct ReadReservation {
 /// with one session, so starting a new session cannot reset the budget. Reads
 /// are reserved atomically before verification and committed after success;
 /// a failed read cancels its reservation, while a crash leaves it outstanding
-/// and `recover` counts it as used (fail closed). The unit is one column read.
+/// and `recover` counts it as used (fail closed). The unit is one supplied
+/// column read (one list entry); a caller that budgets physical openings must
+/// deduplicate before reserving. The plan's logical draw count and the
+/// provider's hiding ledger are separate quantities.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadLedger {
     max_reads: u64,
@@ -406,10 +418,11 @@ impl VerifierReads {
         Arc::clone(&self.ledger)
     }
 
-    /// Verify the openings for `positions`, charge one read per position and
-    /// remember each column. The positions come from the verifier's chain or
-    /// its plan, never from the proof; a repeated position must carry the same
-    /// column values.
+    /// Verify the openings for `positions`, charge one read per supplied
+    /// list entry and remember each column. This entry does not deduplicate:
+    /// callers that budget physical openings must pass a unique list. The
+    /// positions come from the verifier's chain or its plan, never from the
+    /// proof; a repeated position must carry the same column values.
     pub fn read(
         &mut self,
         reader: &IndexReader,

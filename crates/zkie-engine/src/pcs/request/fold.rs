@@ -1623,7 +1623,11 @@ pub fn fold_start_verify(
 /// The same FOLD start check with an explicit trusted group view. The overlay
 /// must come from the statement plus the session's registered dynamic members;
 /// it is not a proof-supplied list. This keeps a dynamically joined oracle in
-/// the same group that the FOLD fresh-mask check consumes.
+/// the same group that the FOLD fresh-mask check consumes. This is a low-level
+/// entry: it checks the message, registered oracle and fresh-mask rules against
+/// the supplied view, but it does not authenticate the view's origin. The
+/// session currently guarantees only its local overlay's source; production
+/// callers must constrain the call and use an independently trusted statement.
 pub fn fold_start_verify_with_groups(
     shape: &FoldShape,
     message: &FoldStartMessage,
