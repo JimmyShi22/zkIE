@@ -577,7 +577,12 @@ pub fn verify_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pcs::request::chain::KIND_SEED;
     use crate::pcs::request::code::{build_code_plan, symbol_at_fp};
+    use crate::primitives::transcript::{
+        hash_labeled, hash_labeled_64, tag_word, CHAIN_QUERY, CHAIN_START,
+    };
+    use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
 
     fn shape() -> IndexShape {
         IndexShape {
@@ -905,6 +910,210 @@ mod tests {
         let mut short = bytes;
         short.truncate(short.len() - crate::pcs::request::field::FP3_BYTES);
         assert!(IndexRecord::decode_for(&table.reader.shape, &short).is_err());
+    }
+
+    fn push_length_prefixed(data: &mut Vec<u8>, value: &[u8]) {
+        data.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        data.extend_from_slice(value);
+    }
+
+    /// The seeds derived by an independent local reconstruction of the
+    /// documented chain bytes and draws (no Chain method is called).
+    struct ManualSeeds {
+        rho: Digest,
+        round: u64,
+        call_index: u64,
+        words: [u64; 8],
+        next: usize,
+        have: usize,
+    }
+
+    impl ManualSeeds {
+        fn new(name: &[u8]) -> Self {
+            let mut data = Vec::new();
+            data.extend_from_slice(&Digest::ZERO.0);
+            push_length_prefixed(&mut data, name);
+            push_length_prefixed(&mut data, &[]);
+            data.extend_from_slice(&0u64.to_le_bytes());
+            let rho = hash_labeled(
+                tag_word(CHAIN_START, RECORD_SEED_LABEL),
+                RECORD_SEED_LABEL,
+                None,
+                &data,
+            )
+            .unwrap();
+            let mut manual = Self {
+                rho: Digest::ZERO,
+                round: 0,
+                call_index: 1,
+                words: [0u64; 8],
+                next: 0,
+                have: 0,
+            };
+            let first = manual.call(0, &rho);
+            // Every call of this round hashes the round's rho_prev, the chain
+            // start value; the call's response is not that prefix.
+            manual.rho = rho;
+            for index in 0..4 {
+                manual.words[index] = u64::from_le_bytes(
+                    first[32 + index * 8..40 + index * 8].try_into().unwrap(),
+                );
+            }
+            manual.have = 4;
+            // Later calls in the same round keep the prefix's round number.
+            manual
+        }
+
+        fn call(&self, j: u64, rho: &Digest) -> [u8; 64] {
+            let closing = (KIND_SEED as u64) | (j << 16);
+            let mut message = Vec::new();
+            message.extend_from_slice(&closing.to_le_bytes());
+            message.extend_from_slice(&0u64.to_le_bytes());
+            hash_labeled_64(
+                tag_word(CHAIN_QUERY, RECORD_SEED_LABEL),
+                self.round,
+                rho,
+                &message,
+            )
+            .unwrap()
+        }
+
+        fn next_word(&mut self) -> u64 {
+            if self.next == self.have {
+                let response = self.call(self.call_index, &self.rho);
+                self.call_index += 1;
+                for index in 0..8 {
+                    self.words[index] = u64::from_le_bytes(
+                        response[index * 8..(index + 1) * 8].try_into().unwrap(),
+                    );
+                }
+                self.next = 0;
+                self.have = 8;
+            }
+            let word = self.words[self.next];
+            self.next += 1;
+            word
+        }
+
+        fn draw_f(&mut self) -> Fp {
+            for _ in 0..6 {
+                let word = self.next_word();
+                if word < crate::pcs::request::field::MODULUS {
+                    return Fp::from_u64(word);
+                }
+            }
+            Fp::ZERO
+        }
+
+        fn draw_e(&mut self) -> Fp3 {
+            Fp3::new(self.draw_f(), self.draw_f(), self.draw_f())
+        }
+
+        fn seeds(&mut self, shape: &IndexShape) -> Vec<(Vec<Fp3>, Fp3)> {
+            let mut seeds = Vec::new();
+            for _ in 0..shape.answers {
+                let mut z = Vec::new();
+                for _ in 0..shape.cube_bits() {
+                    z.push(self.draw_e());
+                }
+                let mut beta = Fp3::ONE;
+                for attempt in 0..2 {
+                    let value = self.draw_e();
+                    if !value.is_zero() || attempt == 1 {
+                        beta = if value.is_zero() { Fp3::ONE } else { value };
+                        break;
+                    }
+                }
+                seeds.push((z, beta));
+            }
+            seeds
+        }
+    }
+
+    fn manual_seeds(shape: &IndexShape, name: &[u8]) -> Vec<(Vec<Fp3>, Fp3)> {
+        ManualSeeds::new(name).seeds(shape)
+    }
+
+    #[test]
+    fn record_seeds_match_an_independent_derivation() {
+        let shape = shape();
+        let name = b"independent-name";
+        let seeds = record_seeds(&shape, name).unwrap();
+        let manual = manual_seeds(&shape, name);
+        assert_eq!(seeds.len(), manual.len());
+        for (left, right) in seeds.iter().zip(&manual) {
+            assert_eq!(&left.z, &right.0);
+            assert_eq!(left.beta, right.1);
+        }
+    }
+
+    #[test]
+    fn reference_format_variants_are_rejected() {
+        let table = committed();
+        let shape = table.reader.shape;
+        let position = 0u64;
+        let rows = shape.rows() as usize;
+        let mut symbols = Vec::with_capacity(rows);
+        for codeword in &table.codewords {
+            symbols.push(codeword[position as usize]);
+        }
+        let salt = &table.salts[position as usize];
+        let mut data = Vec::new();
+        data.extend_from_slice(&(symbols.len() as u64).to_le_bytes());
+        data.extend_from_slice(&(salt.len() as u64).to_le_bytes());
+        for value in &symbols {
+            data.extend_from_slice(&value.as_canonical_u64().to_le_bytes());
+        }
+        data.extend_from_slice(&(salt.len() as u64).to_le_bytes());
+        data.extend_from_slice(salt);
+        let index = (1u64 << shape.code.log_n) + position;
+        let current = hash_labeled(
+            tag_word(crate::primitives::transcript::LEAF_STORED_MAIN, 0),
+            index,
+            Some(&table.reader.configuration),
+            &data,
+        )
+        .unwrap();
+        // The leaf as if the index were the bare position.
+        let bare = hash_labeled(
+            tag_word(crate::primitives::transcript::LEAF_STORED_MAIN, 0),
+            position,
+            Some(&table.reader.configuration),
+            &data,
+        )
+        .unwrap();
+        assert_ne!(current, bare);
+        // A salt-first data order.
+        let mut salt_first = Vec::new();
+        salt_first.extend_from_slice(&(symbols.len() as u64).to_le_bytes());
+        salt_first.extend_from_slice(&(salt.len() as u64).to_le_bytes());
+        salt_first.extend_from_slice(&(salt.len() as u64).to_le_bytes());
+        salt_first.extend_from_slice(salt);
+        for value in &symbols {
+            salt_first.extend_from_slice(&value.as_canonical_u64().to_le_bytes());
+        }
+        let other = hash_labeled(
+            tag_word(crate::primitives::transcript::LEAF_STORED_MAIN, 0),
+            index,
+            Some(&table.reader.configuration),
+            &salt_first,
+        )
+        .unwrap();
+        assert_ne!(current, other);
+        // A reader with the bare-index leaf as root rejects a full-depth path.
+        let malicious = IndexReader {
+            shape,
+            configuration: table.reader.configuration,
+            root: bare,
+            record: table.reader.record.clone(),
+        };
+        let opening = ColumnOpening {
+            position,
+            salt: salt.clone(),
+            symbols,
+            path: table.tree.open(position as usize).unwrap(),
+        };
+        assert!(verify_columns(&malicious, &[position], &[opening]).is_err());
     }
 
     #[test]
