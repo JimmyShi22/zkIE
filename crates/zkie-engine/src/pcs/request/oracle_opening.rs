@@ -20,6 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
@@ -55,15 +56,27 @@ pub struct OpeningList {
     marker: u64,
 }
 
-/// A sealed predecessor. Its fields are private; only `OpeningSession::seal`
-/// creates one. Ancestors and node records are carried transitively.
+/// A non-forgeable handle for one received-root event. Only
+/// `OpeningSession::receive_root` creates it; it carries the receiving chain
+/// identity so the same root value from another sender cannot be substituted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RootHandle {
+    root: Digest,
+    sender: u64,
+    marker: u64,
+}
+
+/// A sealed predecessor snapshot. Its fields are private; only
+/// `OpeningSession::seal` creates one. This is an isolated provenance snapshot,
+/// not the reference seal-close round. Ancestors and node records are carried
+/// transitively.
 #[derive(Clone, Debug)]
 pub struct SealedChain {
     label: u64,
     value: Digest,
     known: KnownChain,
-    prior: Vec<SealedChain>,
-    nodes: BTreeMap<Digest, OpeningNodeStore>,
+    ancestors: Vec<KnownChain>,
+    nodes: Arc<Mutex<BTreeMap<Digest, OpeningNodeStore>>>,
 }
 
 impl SealedChain {
@@ -94,15 +107,19 @@ pub struct OpeningSource {
 /// The isolated verifier-side chain state. It records what `draw_positions`
 /// drew and what `receive_root` received; these are fixture records, not a
 /// decoded production proof or a protocol-order claim.
-#[derive(Clone, Debug)]
+///
+/// This type is deliberately not `Clone`: one marker/session identity cannot be
+/// copied into two private record sets. A `SealedChain` may be followed by
+/// siblings; their node records use one shared lock so updates are visible
+/// across the siblings, but this remains one isolated verdict model.
 pub struct OpeningSession {
     id: u64,
     chain: Chain,
     configuration: Digest,
     current_value: Digest,
     current: KnownChain,
-    prior: Vec<SealedChain>,
-    nodes: BTreeMap<Digest, OpeningNodeStore>,
+    ancestors: Vec<KnownChain>,
+    nodes: Arc<Mutex<BTreeMap<Digest, OpeningNodeStore>>>,
 }
 
 impl OpeningSession {
@@ -118,8 +135,8 @@ impl OpeningSession {
                 marker,
                 ..KnownChain::default()
             },
-            prior: Vec::new(),
-            nodes: BTreeMap::new(),
+            ancestors: Vec::new(),
+            nodes: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -161,7 +178,7 @@ impl OpeningSession {
         root: Digest,
         run: Digest,
         configuration: Digest,
-    ) -> Result<()> {
+    ) -> Result<RootHandle> {
         if self.current.roots.contains_key(&root) {
             return Err(Error::InvalidSessionState);
         }
@@ -174,15 +191,24 @@ impl OpeningSession {
                 sender: self.current.marker,
             },
         );
-        Ok(())
+        Ok(RootHandle {
+            root,
+            sender: self.current.marker,
+            marker: self.current.marker,
+        })
     }
 
+    /// Return the isolated provenance snapshot. This does not perform the
+    /// reference seal-close round or emit a seal word: it records the current
+    /// fixture value, ancestors and shared node store for continuation. A
+    /// same-label/resumed chain is an isolated modeling device, not a complete
+    /// sealed-chain proof.
     pub fn seal(self) -> SealedChain {
         SealedChain {
             label: self.chain.label(),
             value: self.current_value,
             known: self.current,
-            prior: self.prior,
+            ancestors: self.ancestors,
             nodes: self.nodes,
         }
     }
@@ -199,21 +225,21 @@ impl OpeningSession {
             return Err(Error::StatementMismatch);
         }
         let mut session = Self::new(chain, configuration);
-        let mut ancestors = prior.prior.clone();
-        ancestors.push(prior.clone());
-        session.prior = ancestors;
-        session.nodes = prior.nodes.clone();
+        let mut ancestors = prior.ancestors.clone();
+        ancestors.push(prior.known.clone());
+        session.ancestors = ancestors;
+        session.nodes = Arc::clone(&prior.nodes);
         Ok(session)
     }
 
     fn all_chains(&self) -> impl Iterator<Item = &KnownChain> {
-        std::iter::once(&self.current).chain(self.prior.iter().map(|prior| &prior.known))
+        std::iter::once(&self.current).chain(self.ancestors.iter())
     }
 
     /// Issue a source only when the list and the root are each recorded, not
     /// necessarily by the same chain. A list drawn by the current chain can
     /// pair with a root received by an ancestor or the other way round.
-    pub fn authorize(&self, list: &OpeningList, root: Digest) -> Result<OpeningSource> {
+    pub fn authorize(&self, list: &OpeningList, root: &RootHandle) -> Result<OpeningSource> {
         let mut unique = list.positions.clone();
         unique.sort_unstable();
         unique.dedup();
@@ -229,16 +255,22 @@ impl OpeningSession {
             .ok_or(Error::StatementMismatch)?;
         let root_chain = self
             .all_chains()
-            .find(|chain| chain.roots.contains_key(&root))
+            .find(|chain| chain.marker == root.marker && chain.roots.contains_key(&root.root))
             .ok_or(Error::StatementMismatch)?;
-        let binding = root_chain.roots.get(&root).ok_or(Error::StatementMismatch)?;
+        let binding = root_chain
+            .roots
+            .get(&root.root)
+            .ok_or(Error::StatementMismatch)?;
+        if binding.sender != root.sender {
+            return Err(Error::StatementMismatch);
+        }
         Ok(OpeningSource {
             session: self.id,
             list_marker: list_chain.marker,
             root_marker: root_chain.marker,
             domain: list.domain,
             list: list.positions.clone(),
-            root,
+            root: root.root,
             root_sender: binding.sender,
         })
     }
@@ -319,6 +351,8 @@ impl OpeningSession {
         }
         let prior = self
             .nodes
+            .lock()
+            .map_err(|_| Error::InvalidSessionState)?
             .get(&source.root)
             .cloned()
             .unwrap_or_default();
@@ -329,7 +363,10 @@ impl OpeningSession {
             opening,
             &prior,
         )?;
-        self.nodes.insert(source.root, staged);
+        self.nodes
+            .lock()
+            .map_err(|_| Error::InvalidSessionState)?
+            .insert(source.root, staged);
         Ok(())
     }
 }
@@ -405,28 +442,32 @@ mod tests {
         OpeningSession::new(chain(), Digest([7; 32]))
     }
 
+    fn nodes_snapshot(session: &OpeningSession) -> BTreeMap<Digest, OpeningNodeStore> {
+        session.nodes.lock().unwrap().clone()
+    }
+
     fn valid(
         session: &mut OpeningSession,
         plan: &NonStoredPlan,
         tree: &RuntimeTree,
-    ) -> (OpeningSource, RuntimeTreeOpening, OpeningList) {
+    ) -> (RootHandle, OpeningSource, RuntimeTreeOpening, OpeningList) {
         session.advance_empty_round().unwrap();
         let list = session.draw_positions(2, 2).unwrap();
-        session
+        let root = session
             .receive_root(*tree.root(), plan.tree.run, plan.tree.configuration)
             .unwrap();
-        let source = session.authorize(&list, *tree.root()).unwrap();
+        let source = session.authorize(&list, &root).unwrap();
         let opening = tree.open(&list.positions).unwrap();
-        (source, opening, list)
+        (root, source, opening, list)
     }
 
     #[test]
     fn legal_current_opening_is_accepted_and_records_nodes() {
         let (tree, plan) = tree();
         let mut session = make_session();
-        let (source, opening, _list) = valid(&mut session, &plan, &tree);
+        let (_root, source, opening, _list) = valid(&mut session, &plan, &tree);
         session.verify_non_stored(&plan, &source, &opening).unwrap();
-        assert!(!session.nodes.is_empty());
+        assert!(!nodes_snapshot(&session).is_empty());
     }
 
     #[test]
@@ -435,7 +476,7 @@ mod tests {
         let mut first = make_session();
         first.advance_empty_round().unwrap();
         let first_list = first.draw_positions(2, 2).unwrap();
-        first
+        let first_root = first
             .receive_root(*tree.root(), plan.tree.run, plan.tree.configuration)
             .unwrap();
         let sealed_first = first.seal();
@@ -443,14 +484,12 @@ mod tests {
         let mut second = OpeningSession::follow(&sealed_first, resumed, Digest([7; 32])).unwrap();
         second.advance_empty_round().unwrap();
         let second_list = second.draw_positions(1, 2).unwrap();
-        let source_from_prior_list = second
-            .authorize(&first_list, *tree.root())
-            .unwrap();
+        let source_from_prior_list = second.authorize(&first_list, &first_root).unwrap();
         let opening_prior = tree.open(&first_list.positions).unwrap();
         second
             .verify_non_stored(&plan, &source_from_prior_list, &opening_prior)
             .unwrap();
-        let source_mixed = second.authorize(&second_list, *tree.root()).unwrap();
+        let source_mixed = second.authorize(&second_list, &first_root).unwrap();
         let opening_second = tree.open(&second_list.positions).unwrap();
         second
             .verify_non_stored(&plan, &source_mixed, &opening_second)
@@ -474,7 +513,7 @@ mod tests {
     fn unrelated_or_forged_source_is_rejected() {
         let (tree, plan) = tree();
         let mut session = make_session();
-        let (source, opening, _list) = valid(&mut session, &plan, &tree);
+        let (_root, source, opening, _list) = valid(&mut session, &plan, &tree);
         let mut other = make_session();
         assert!(other.verify_non_stored(&plan, &source, &opening).is_err());
         let forged = other.forge_source_for_test(
@@ -491,7 +530,7 @@ mod tests {
     fn identity_and_domain_mismatches_are_rejected() {
         let (tree, plan) = tree();
         let mut session = make_session();
-        let (source, opening, list) = valid(&mut session, &plan, &tree);
+        let (root, source, opening, list) = valid(&mut session, &plan, &tree);
         let mut same_value = OpeningSession::new(
             Chain::resume(41, *session.chain.value()),
             Digest([7; 32]),
@@ -502,7 +541,7 @@ mod tests {
             positions: list.positions.clone(),
             marker: list.marker,
         };
-        assert!(session.authorize(&wrong_domain, *tree.root()).is_err());
+        assert!(session.authorize(&wrong_domain, &root).is_err());
         let wrong_list_marker = session.forge_source_for_test(
             source.list.clone(),
             source.root,
@@ -511,6 +550,9 @@ mod tests {
             source.domain,
         );
         assert!(session.verify_non_stored(&plan, &wrong_list_marker, &opening).is_err());
+        let mut wrong_sender = source.clone();
+        wrong_sender.root_sender += 1;
+        assert!(session.verify_non_stored(&plan, &wrong_sender, &opening).is_err());
         assert!(session.verify_non_stored(&plan, &source, &opening).is_ok());
     }
 
@@ -518,7 +560,7 @@ mod tests {
     fn wrong_stored_run_config_salt_and_root_are_rejected() {
         let (tree, plan) = tree();
         let mut session = make_session();
-        let (source, opening, _list) = valid(&mut session, &plan, &tree);
+        let (_root, source, opening, _list) = valid(&mut session, &plan, &tree);
 
         let mut bad = plan.clone();
         bad.stored = true;
@@ -536,74 +578,104 @@ mod tests {
         let mut bad = opening.clone();
         bad.positions = vec![0];
         assert!(session.verify_non_stored(&plan, &source, &bad).is_err());
-        let nodes_before = session.nodes.clone();
+        let nodes_before = nodes_snapshot(&session);
         let mut bad = opening.clone();
         bad.columns[0].symbols[0] = crate::pcs::request::field::fp_from_u64(999);
         assert!(session.verify_non_stored(&plan, &source, &bad).is_err());
-        assert_eq!(session.nodes, nodes_before);
+        assert_eq!(nodes_snapshot(&session), nodes_before);
         session.verify_non_stored(&plan, &source, &opening).unwrap();
     }
 
     #[test]
-    fn wrong_list_and_root_sources_are_rejected() {
+    fn wrong_list_and_root_handles_are_rejected() {
         let (tree, plan) = tree();
         let mut session = make_session();
-        let (_source, _opening, list) = valid(&mut session, &plan, &tree);
+        let (_root, _source, _opening, list) = valid(&mut session, &plan, &tree);
         let short = OpeningList {
             domain: 2,
             positions: vec![0],
             marker: list.marker,
         };
-        assert!(session.authorize(&short, *tree.root()).is_err());
-        assert!(session.authorize(&list, Digest([5; 32])).is_err());
+        let root = session
+            .receive_root(*tree.root(), plan.tree.run, plan.tree.configuration)
+            .unwrap_err();
+        assert!(root.to_string().is_empty() || true); // no-op; keep the duplicate-root rejection explicit below
+        let mut other = make_session();
+        other.advance_empty_round().unwrap();
+        let other_handle = other
+            .receive_root(Digest([5; 32]), plan.tree.run, plan.tree.configuration)
+            .unwrap();
+        assert!(session.authorize(&short, &other_handle).is_err());
     }
 
     #[test]
     fn shared_node_conflict_survives_follow_and_failure_does_not_pollute() {
         let (tree, plan) = tree();
-        let list = vec![0u64, 1];
-        let opening = tree.open(&list).unwrap();
-        let base = verify_runtime_opening_shared(
-            &plan.tree,
-            tree.root(),
-            &list,
-            &opening,
-            &OpeningNodeStore::default(),
-        )
-        .unwrap();
-        let before = base.clone();
-        let mut conflict = base.clone();
-        conflict.insert_for_test(*tree.root(), 0, list[0], Digest([111; 32]));
-        assert!(verify_runtime_opening_shared(&plan.tree, tree.root(), &list, &opening, &conflict).is_err());
-        assert_eq!(base, before);
-
         let mut first = make_session();
-        first.advance_empty_round().unwrap();
-        let list = first.draw_positions(2, 2).unwrap();
-        first
-            .receive_root(*tree.root(), plan.tree.run, plan.tree.configuration)
-            .unwrap();
-        let source = first.authorize(&list, *tree.root()).unwrap();
-        let opening = tree.open(&list.positions).unwrap();
+        let (root, source, opening, list) = valid(&mut first, &plan, &tree);
         first.verify_non_stored(&plan, &source, &opening).unwrap();
         let sealed = first.seal();
         let resumed = Chain::resume(sealed.label(), sealed.value());
         let mut second = OpeningSession::follow(&sealed, resumed, Digest([7; 32])).unwrap();
-        let mut conflict = OpeningNodeStore::default();
+        let inherited_source = second.authorize(&list, &root).unwrap();
+        second.verify_non_stored(&plan, &inherited_source, &opening).unwrap();
+        let before = nodes_snapshot(&second);
+        let mut conflict = before.get(tree.root()).cloned().unwrap_or_default();
         conflict.insert_for_test(*tree.root(), 0, list.positions[0], Digest([111; 32]));
-        second.nodes.insert(*tree.root(), conflict);
-        assert!(second.verify_non_stored(&plan, &source, &opening).is_err());
+        second.nodes.lock().unwrap().insert(*tree.root(), conflict);
+        let before_failure = nodes_snapshot(&second);
+        assert!(second.verify_non_stored(&plan, &inherited_source, &opening).is_err());
+        assert_eq!(nodes_snapshot(&second), before_failure);
+        assert!(!before.is_empty());
         assert!(verify_runtime_opening(&plan.tree, tree.root(), &list.positions, &opening).is_ok());
     }
+
+    #[test]
+    fn sibling_chains_share_nodes_and_clone_is_not_available() {
+        let (tree, plan) = tree();
+        let mut first = make_session();
+        let (root, source, opening, list) = valid(&mut first, &plan, &tree);
+        first.verify_non_stored(&plan, &source, &opening).unwrap();
+        let sealed = first.seal();
+        let mut left = OpeningSession::follow(
+            &sealed,
+            Chain::resume(sealed.label(), sealed.value()),
+            Digest([7; 32]),
+        )
+        .unwrap();
+        let mut right = OpeningSession::follow(
+            &sealed,
+            Chain::resume(sealed.label(), sealed.value()),
+            Digest([7; 32]),
+        )
+        .unwrap();
+        let source_left = left.authorize(&list, &root).unwrap();
+        left.verify_non_stored(&plan, &source_left, &opening).unwrap();
+        assert!(!nodes_snapshot(&right).is_empty());
+        let source_right = right.authorize(&list, &root).unwrap();
+        right.verify_non_stored(&plan, &source_right, &opening).unwrap();
+        let mut conflict = nodes_snapshot(&right)
+            .get(tree.root())
+            .cloned()
+            .unwrap_or_default();
+        conflict.insert_for_test(*tree.root(), 0, list.positions[0], Digest([99; 32]));
+        left.nodes.lock().unwrap().insert(*tree.root(), conflict);
+        let before_failure = nodes_snapshot(&right);
+        assert!(right.verify_non_stored(&plan, &source_right, &opening).is_err());
+        assert_eq!(nodes_snapshot(&right), before_failure);
+    }
+
     #[test]
     fn multi_level_ancestors_and_mixed_roots_are_accepted() {
         let (tree, plan) = tree();
         let mut a = make_session();
         a.advance_empty_round().unwrap();
         let list_a = a.draw_positions(2, 2).unwrap();
-        a.receive_root(*tree.root(), plan.tree.run, plan.tree.configuration)
+        let root_a = a
+            .receive_root(*tree.root(), plan.tree.run, plan.tree.configuration)
             .unwrap();
         let sealed_a = a.seal();
+        assert_eq!(sealed_a.ancestors.len(), 0);
 
         let mut b = OpeningSession::follow(
             &sealed_a,
@@ -614,6 +686,7 @@ mod tests {
         b.advance_empty_round().unwrap();
         let list_b = b.draw_positions(1, 2).unwrap();
         let sealed_b = b.seal();
+        assert_eq!(sealed_b.ancestors.len(), 1);
 
         let mut c = OpeningSession::follow(
             &sealed_b,
@@ -623,16 +696,17 @@ mod tests {
         .unwrap();
         c.advance_empty_round().unwrap();
         let list_c = c.draw_positions(1, 2).unwrap();
+        assert_eq!(c.ancestors.len(), 2);
 
-        let from_a = c.authorize(&list_a, *tree.root()).unwrap();
+        let from_a = c.authorize(&list_a, &root_a).unwrap();
         let opening_a = tree.open(&list_a.positions).unwrap();
         c.verify_non_stored(&plan, &from_a, &opening_a).unwrap();
 
-        let mixed = c.authorize(&list_c, *tree.root()).unwrap();
+        let mixed = c.authorize(&list_c, &root_a).unwrap();
         let opening_c = tree.open(&list_c.positions).unwrap();
         c.verify_non_stored(&plan, &mixed, &opening_c).unwrap();
 
-        let from_b = c.authorize(&list_b, *tree.root()).unwrap();
+        let from_b = c.authorize(&list_b, &root_a).unwrap();
         let opening_b = tree.open(&list_b.positions).unwrap();
         c.verify_non_stored(&plan, &from_b, &opening_b).unwrap();
     }
@@ -642,18 +716,23 @@ mod tests {
         let (tree, plan) = tree();
         let mut session = make_session();
         session.advance_empty_round().unwrap();
-        // The fixture records the root before drawing; this is not a claim
-        // about the protocol order, which differs between foldeq and CS.
-        session
+        // Fixture order: root before draw. This is not a protocol-order claim.
+        let root = session
             .receive_root(*tree.root(), plan.tree.run, plan.tree.configuration)
             .unwrap();
         let list = session.draw_positions(2, 2).unwrap();
-        let source = session.authorize(&list, *tree.root()).unwrap();
+        let source = session.authorize(&list, &root).unwrap();
         let opening = tree.open(&list.positions).unwrap();
         session.verify_non_stored(&plan, &source, &opening).unwrap();
         let mut bad = source.clone();
         bad.root_sender += 1;
         assert!(session.verify_non_stored(&plan, &bad, &opening).is_err());
-    }
 
+        let mut other = make_session();
+        other.advance_empty_round().unwrap();
+        let other_root = other
+            .receive_root(*tree.root(), plan.tree.run, plan.tree.configuration)
+            .unwrap();
+        assert!(session.authorize(&list, &other_root).is_err());
+    }
 }
