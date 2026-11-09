@@ -29,24 +29,30 @@ Final-version warm verification on reused commits plus the row-length audit.
 
 ## Audit and reachability
 
-A source-level scan of the three model plan and executor modules shows that the
-five registered cases can reach these verifier branches: Add, AffineScale,
-Argmax, CausalAttention, EmbeddingIndex, GatedFfn, Hadamard, LayerNorm, MatMul,
-Patchify, ProfileLayerNorm, ProfileRmsNorm, ProfileRope, ProfileStandardize,
-Projection, RegressionHead, Relu, RmsNorm, RopeProjection, RowEmbeddingIndex,
-Softmax, SoftmaxRows, TableIndex, TableLookup.
+A scan of the three model plan modules shows the opcodes that the five
+registered cases actually build steps for:
 
-The remaining branches (Layout, Requantize, TopK, RouteGate, Scatter, Gather,
+- gpt2: Add, AffineScale, Argmax, EmbeddingIndex, MatMul, ProfileLayerNorm,
+  Projection, Softmax, SoftmaxRows, TableIndex, TableLookup.
+- gemma3: Add, AffineScale, Argmax, GatedFfn, MatMul, ProfileRmsNorm,
+  ProfileRope, Projection, RowEmbeddingIndex, Softmax, SoftmaxRows, TableIndex,
+  TableLookup.
+- timesfm: Add, AffineScale, Hadamard, MatMul, ProfileLayerNorm,
+  ProfileRmsNorm, ProfileStandardize, Projection, Relu, Softmax, TableIndex,
+  TableLookup.
+
+Names that appear only in configuration or executor modules do not make a
+branch reachable: Layout, Requantize, TopK, RouteGate, Scatter, Gather,
 BatchedMatMul, GatherMatMul, IndexGather, Pad, Range, DivRound, IntSqrt,
-MoeDown, KvCache) are not reachable from the five registered plans; their
-checks are exercised through the generic relation entry and fixture-level
-tests. A gap in a generic-entry branch would not by itself demonstrate an
-attack on the five registered cases, and this trace does not claim such an
-attack. The Layout negative added here is therefore a generic-entry guard; the
-Softmax negative targets a branch reachable by all three models. The
-empty-port, oversized-external and missing-output negatives run through the
-shared-trace entry. All reachable branches are exercised end to end by the
-five prove and verify runs below.
+MoeDown, KvCache, CausalAttention, LayerNorm, RmsNorm and RopeProjection are
+not built by any of the five plans and are exercised only through the generic
+relation entry and fixture-level tests. A gap in a generic-entry branch would
+not by itself demonstrate an attack on the five registered cases, and this
+trace does not claim such an attack. The Layout negative is a generic-entry
+guard; the Softmax negative targets a branch reachable by all three models.
+The empty-port, oversized-external and missing-output negatives run through
+the shared-trace entry. Every reachable branch is exercised end to end by the
+prove and verify runs below.
 
 ## Case selection
 
@@ -58,12 +64,14 @@ skipped, and a sequence-512 not-run reason does not apply. Routine checks return
 to the three seq16 cases unless a later change hits sequence-512 logic or shared
 structure.
 
-## Final-version warm verification
+## Same-proof repeat verification
 
-Each case reused the commit artifacts from the previous trace, ran one prove,
-and verified the same proof three times with the registered policy. The table
-reports the three verify runs, their median, the baseline warm median and the
-proof size. Baseline prove values are the baseline warm medians.
+Each case reused the existing commit artifacts from the previous trace, ran a
+single prove, and verified that one proof three times with the registered
+policy. This is not a cold three-stage rerun: no new commit was produced and
+the prove is a single run. The table reports the three verify runs, their
+median, the baseline warm median and the proof size. Baseline prove values are
+the baseline warm medians.
 
 | case | prove ms | baseline prove ms | verify runs ms | verify median ms | baseline verify ms | delta | proof bytes |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -74,7 +82,12 @@ proof size. Baseline prove values are the baseline warm medians.
 | timesfm-16patch | 35,211 | 35,308 | 42,320 / 42,939 / 42,884 | 42,884 | 42,356 | +1.2% | 6,865,533,616 |
 
 All outcomes PASS; every verify binds the expected output; proof bytes are
-identical to the baseline for every case. Cases outside the 3% band: gpt2-seq16 +5.1%, gemma3-seq16 +3.5%. They are recorded as-is and are pending a boss decision. timesfm is +1.25% on the final version. Proofs were
+identical to the baseline for every case. Comparison basis: the baseline
+values are the warm medians recorded in the baseline trace on the same machine;
+the baseline proof files and the earlier final-code proofs have been deleted,
+so the baseline verify could not be re-measured in this session, and the
+deltas are against the recorded baseline numbers rather than a fresh
+side-by-side run. Cases outside the 3% band: gpt2-seq16 +5.1%, gemma3-seq16 +3.5%. They are recorded as-is and are pending a boss decision. timesfm is +1.25% on the final version. Proofs were
 deleted immediately after the three verifies per case (160,598,040,964
 bytes across the five `proof.bin` files; the `proof_bytes` metric in the table
 also counts the statement, public inputs and manifest). Commit directories
