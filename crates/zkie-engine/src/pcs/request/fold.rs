@@ -630,7 +630,7 @@ pub struct RuntimeOracle {
     pub id: u64,
     pub root: Digest,
     pub sampled: bool,
-    pub authenticated: bool,
+    pub opening_verified: bool,
     pub main_rows: u64,
     pub mask_rows: u64,
     pub mask_code: CodeParams,
@@ -683,7 +683,7 @@ impl RuntimeOracles {
             id,
             root,
             sampled: false,
-            authenticated: false,
+            opening_verified: false,
             main_rows: 0,
             mask_rows: notice.mask_rows,
             mask_code: notice.mask_code,
@@ -693,33 +693,41 @@ impl RuntimeOracles {
         Ok(())
     }
 
-    /// Later verifier phase: authenticate the registered mask root by opening
-    /// the runtime tree at the verifier's allowed positions. `expected`
-    /// positions are the plan's list; a caller list that differs, or an empty
-    /// list, is rejected. A second authentication fails. This verifies the
-    /// opening and marks the root; it is not a proximity, table test or
-    /// relation closure.
+    /// Later verifier phase: check the mask opening at positions produced by
+    /// the verifier's trusted transcript. `expected_count` is the plan's query
+    /// count, a different source from the positions; the positions must be
+    /// sorted unique, have exactly that count, and the openings must verify
+    /// against the registered root. A zero count performs no opening and marks
+    /// nothing; an opening count mismatch or a caller list is rejected. This
+    /// checks the opening only: it is not a complete authentication, a
+    /// proximity test, a table test or a relation closure.
     pub fn authenticate_mask(
         &mut self,
         tree_plan: &MaskTreePlan,
         id: u64,
-        expected: &[u64],
+        expected_count: usize,
         positions: &[u64],
         openings: &[MaskColumnOpening],
     ) -> Result<()> {
-        if expected.is_empty() || positions != expected {
+        if positions.len() > expected_count || positions.len() != openings.len() {
             return Err(Error::StatementMismatch);
+        }
+        if positions.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(Error::InvalidIndex);
         }
         let entry = self
             .entries
             .iter_mut()
             .find(|oracle| oracle.id == id)
             .ok_or(Error::StatementMismatch)?;
-        if entry.authenticated || entry.mask_code.log_n != tree_plan.log_n {
+        if entry.opening_verified || entry.mask_code.log_n != tree_plan.log_n {
             return Err(Error::StatementMismatch);
         }
+        if positions.is_empty() {
+            return Ok(());
+        }
         verify_mask_columns(tree_plan, &entry.root, positions, openings)?;
-        entry.authenticated = true;
+        entry.opening_verified = true;
         Ok(())
     }
 
@@ -1444,7 +1452,7 @@ mod tests {
                 id: 9,
                 root: start.message.root,
                 sampled: false,
-                authenticated: false,
+                opening_verified: false,
                 main_rows: 0,
                 mask_rows: start.message.notice.mask_rows,
                 mask_code: start.message.notice.mask_code,
@@ -1464,7 +1472,7 @@ mod tests {
                 id: 9,
                 root: start.message.root,
                 sampled: true,
-                authenticated: false,
+                opening_verified: false,
                 main_rows: 0,
                 mask_rows: start.message.notice.mask_rows,
                 mask_code: start.message.notice.mask_code,
@@ -1485,7 +1493,7 @@ mod tests {
                 id: 9,
                 root: Digest([4; 32]),
                 sampled: false,
-                authenticated: false,
+                opening_verified: false,
                 main_rows: 0,
                 mask_rows: start.message.notice.mask_rows,
                 mask_code: start.message.notice.mask_code,

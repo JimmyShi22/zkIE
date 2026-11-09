@@ -7,7 +7,7 @@
 //! an exhausted budget fails closed. This module is not wired into
 //! production; the plan/priced_table that fixes the budget is still open.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -204,14 +204,25 @@ impl ReadLedger {
 /// encoded random tail and opening budgets are not implemented, and an
 /// independent verifier without trusted global state does not claim to verify
 /// the cumulative hidden budget. This is separate from the read ledger.
-/// The token a provider receives after a hiding pre-charge. Its fields are
-/// private and only `HidingState::begin_charge` produces it; provider reads and
-/// charged opens require it. It records the table and the charged column count.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The token a provider receives after a hiding pre-charge for one proof.
+/// Its fields are private and only `HidingState::begin_charge` produces it.
+/// Copies share one consumed-position set, so copying the token or using it
+/// from several readers does not create new budget: the union of physical
+/// positions never exceeds the proof's reserved total, while a repeat of an
+/// already opened position is free. The charge is in-memory; the durable
+/// provider ledger is open.
+#[derive(Clone, Debug)]
 pub struct HidingCharge {
     table: Digest,
     lifecycle: u64,
-    columns: usize,
+    total: usize,
+    state: Arc<Mutex<ChargeState>>,
+}
+
+#[derive(Debug, Default)]
+struct ChargeState {
+    unique: HashSet<u64>,
+    units: usize,
 }
 
 impl HidingCharge {
@@ -224,7 +235,28 @@ impl HidingCharge {
     }
 
     pub fn columns(&self) -> usize {
-        self.columns
+        self.total
+    }
+
+    /// Consume the new physical positions and return how many were new. A
+    /// repeat of a consumed position adds nothing; the union above the
+    /// reserved total fails.
+    pub fn consume(&self, positions: &[u64]) -> Result<usize> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::InvalidSessionState)?;
+        let mut new_units = 0usize;
+        for position in positions {
+            if state.unique.insert(*position) {
+                state.units = state.units.checked_add(1).ok_or(Error::ResourceLimit)?;
+                if state.units > self.total {
+                    return Err(Error::ResourceLimit);
+                }
+                new_units += 1;
+            }
+        }
+        Ok(new_units)
     }
 }
 
@@ -288,7 +320,8 @@ impl HidingState {
         Ok(HidingCharge {
             table,
             lifecycle,
-            columns,
+            total: columns,
+            state: Arc::new(Mutex::new(ChargeState::default())),
         })
     }
 
@@ -464,10 +497,11 @@ impl ProverReads {
         table: &CommittedTable,
         positions: &[u64],
     ) -> Result<Vec<ColumnOpening>> {
-        if charge.table() != table.reader.root || positions.len() > charge.columns() {
+        if charge.table() != table.reader.root {
             return Err(Error::StatementMismatch);
         }
-        self.budget.charge(positions.len())?;
+        let new_units = charge.consume(positions)?;
+        self.budget.charge(new_units)?;
         let mut openings = Vec::new();
         openings
             .try_reserve_exact(positions.len())
@@ -606,16 +640,21 @@ mod tests {
         let positions = [1u64, 4];
         let root = table.reader.root;
         let mut state = HidingState::new(root, 1, 8);
-        let charge = state.begin_charge(root, 1, 8).unwrap();
-        let mut reads = ProverReads::new(4);
+        // The proof reserves two columns: the union of physical opens must not
+        // exceed them, while repeats are free.
+        let charge = state.begin_charge(root, 1, 2).unwrap();
+        let mut reads = ProverReads::new(8);
         let first = reads.open(&charge, &table, &positions).unwrap();
+        assert_eq!(reads.budget().used(), 2);
         let repeated = reads.open(&charge, &table, &positions).unwrap();
         assert_eq!(first, repeated);
-        assert_eq!(reads.budget().used(), 4);
-        assert!(reads.open(&charge, &table, &[6]).is_err());
-        let mut reads = ProverReads::new(3);
-        assert!(reads.open(&charge, &table, &positions).is_ok());
-        assert!(reads.open(&charge, &table, &[6, 7]).is_err());
+        assert_eq!(reads.budget().used(), 2);
+        // A token copy and a second reader share the consumed set.
+        let copied = charge.clone();
+        let mut second = ProverReads::new(8);
+        assert!(second.open(&copied, &table, &[6]).is_err());
+        assert!(second.open(&copied, &table, &[1]).is_ok());
+        assert_eq!(second.budget().used(), 0);
         let other = Digest([8; 32]);
         let mut other_state = HidingState::new(other, 1, 8);
         let other_charge = other_state.begin_charge(other, 1, 8).unwrap();

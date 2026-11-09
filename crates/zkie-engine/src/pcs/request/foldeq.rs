@@ -22,7 +22,9 @@ use crate::pcs::request::fold::{
     fold_mask_shape_fault, fold_start_verify, FoldShape, FoldStartMessage, RuntimeOracles,
     VerifiedStatement,
 };
-use crate::pcs::request::read::{draw_positions, HidingCharge, HidingState, ReadLedger, VerifierReads};
+use crate::pcs::request::read::{
+    draw_positions, unique_sorted, HidingCharge, HidingState, ReadLedger, VerifierReads,
+};
 use crate::pcs::request::table::{
     record_seeds, ColumnOpening, IndexName, IndexReader, SampleSeed,
 };
@@ -164,14 +166,20 @@ fn lin_gamma(psi: &[Fp3], k_lo: u32, columns: u32) -> Result<Vec<Fp3>> {
 /// caller, and the first query binds these numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GammaPath {
-    Lin {
-        k_lo: u32,
-        k_col: u32,
-        lin_shape: Digest,
-    },
-    Direct {
-        columns: u32,
-    },
+    Lin { shape: LinShapeBinding },
+    Direct { columns: u32 },
+}
+
+/// The verifier's binding of the caller's LinShape for the gamma path: the
+/// matrix rows and the low/column counts. The verifier constructs it from its
+/// own trusted LinShape and the first query binds these fields. Carrying the
+/// fields (not a caller-supplied digest) keeps the values checkable; the
+/// trusted source itself remains a verifier/plan prerequisite.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinShapeBinding {
+    pub matrix_rows: u64,
+    pub k_lo: u32,
+    pub k_col: u32,
 }
 
 /// The verifier's FOLDEQ plan. The reader is the committed table, the fold and
@@ -191,7 +199,7 @@ pub struct FoldeqPlan {
     pub seed_budget: usize,
     pub ledger: Arc<Mutex<ReadLedger>>,
     pub column_draws: usize,
-    pub mask_positions: Vec<u64>,
+    pub mask_query_count: usize,
     pub gamma_path: GammaPath,
 }
 
@@ -241,40 +249,28 @@ impl FoldeqPlan {
         if draws > max_reads {
             return Some("the column draws exceed the read budget");
         }
-        if self.mask_positions.is_empty() {
-            return Some("no mask position is fixed");
-        }
-        let columns = tree.columns();
-        let mut previous = None;
-        for position in &self.mask_positions {
-            if *position >= columns {
-                return Some("a mask position is outside the runtime tree");
-            }
-            if let Some(previous) = previous {
-                if *position <= previous {
-                    return Some("the mask positions are not sorted unique");
-                }
-            }
-            previous = Some(*position);
-        }
         let answers = self.reader.shape.answers as usize;
         if self.seed_budget < answers {
             return Some("the seed budget is below the answer count");
         }
         match self.gamma_path {
-            GammaPath::Lin { k_lo, k_col, lin_shape } => {
-                if lin_shape == Digest::ZERO {
-                    return Some("the LIN challenge path has no caller shape binding");
+            GammaPath::Lin { shape } => {
+                if shape.matrix_rows < 1 || shape.k_lo > 30 || shape.k_col > 60 {
+                    return Some("the LIN shape binding has invalid numbers");
                 }
-                if k_lo > 30 || k_col > 60 {
-                    return Some("the LIN challenge path has too many coordinates");
-                }
-                let expected = match k_lo.checked_add(self.reader.shape.v) {
+                let expected = match shape.k_lo.checked_add(self.reader.shape.v) {
                     Some(expected) => expected,
                     None => return Some("the LIN challenge path overflows"),
                 };
-                if k_col != expected {
+                if shape.k_col != expected {
                     return Some("the LIN challenge path does not end at the table width");
+                }
+                let width = match shape.matrix_rows.checked_shl(shape.k_lo) {
+                    Some(width) => width,
+                    None => return Some("the matrix width overflows"),
+                };
+                if width > self.reader.shape.plain() {
+                    return Some("the matrix does not fit the table's plain columns");
                 }
             }
             GammaPath::Direct { columns } => {
@@ -339,20 +335,13 @@ impl FoldeqPlan {
             .map(|ledger| ledger.max_reads())
             .unwrap_or(0);
         writer.put_u64(max_reads);
-        writer.put_u64(self.mask_positions.len() as u64);
-        for position in &self.mask_positions {
-            writer.put_u64(*position);
-        }
+        writer.put_u64(self.mask_query_count as u64);
         match self.gamma_path {
-            GammaPath::Lin {
-                k_lo,
-                k_col,
-                lin_shape,
-            } => {
+            GammaPath::Lin { shape } => {
                 writer.put_u64(1);
-                writer.put_u64(k_lo as u64);
-                writer.put_u64(k_col as u64);
-                writer.put_digest(&lin_shape);
+                writer.put_u64(shape.matrix_rows);
+                writer.put_u64(shape.k_lo as u64);
+                writer.put_u64(shape.k_col as u64);
             }
             GammaPath::Direct { columns } => {
                 writer.put_u64(2);
@@ -387,6 +376,7 @@ enum Stage {
     Queried,
     Read,
     FoldStarted,
+    MaskQueried,
     MaskOpened,
 }
 
@@ -403,6 +393,7 @@ pub struct FoldeqSession {
     start: Option<FoldStartMessage>,
     epsilon: Option<Fp3>,
     queries: Vec<u64>,
+    mask_queries: Vec<u64>,
 }
 
 impl FoldeqSession {
@@ -431,6 +422,7 @@ impl FoldeqSession {
             start: None,
             epsilon: None,
             queries: Vec::new(),
+            mask_queries: Vec::new(),
         })
     }
 
@@ -440,6 +432,10 @@ impl FoldeqSession {
 
     pub fn queries(&self) -> &[u64] {
         &self.queries
+    }
+
+    pub fn mask_queries(&self) -> &[u64] {
+        &self.mask_queries
     }
 
     pub fn gamma(&self) -> Option<&[Fp3]> {
@@ -483,9 +479,9 @@ impl FoldeqSession {
             return Err(Error::InvalidSessionState);
         }
         let gamma = match self.plan.gamma_path {
-            GammaPath::Lin { k_lo, k_col, .. } => {
-                let psi = self.draw_challenge(k_col as usize)?;
-                lin_gamma(&psi, k_lo, self.plan.reader.shape.v)?
+            GammaPath::Lin { shape } => {
+                let psi = self.draw_challenge(shape.k_col as usize)?;
+                lin_gamma(&psi, shape.k_lo, self.plan.reader.shape.v)?
             }
             GammaPath::Direct { columns } => self.draw_challenge(columns as usize)?,
         };
@@ -611,11 +607,40 @@ impl FoldeqSession {
         Ok(())
     }
 
-    /// Verify the mask root against the plan's runtime tree and the plan's
-    /// allowed position list. This is the root authentication the start
-    /// message cannot provide by itself.
-    pub fn read_mask(&mut self, openings: &[MaskColumnOpening]) -> Result<()> {
+    /// Draw the mask opening positions from the verifier's own transcript.
+    /// The plan supplies only the query count; the positions are not the
+    /// plan's list and are not supplied by the caller or the proof.
+    pub fn draw_mask_queries(&mut self) -> Result<()> {
         if self.stage != Stage::FoldStarted {
+            return Err(Error::InvalidSessionState);
+        }
+        let tree = self
+            .plan
+            .statement
+            .mask_tree(self.plan.mask_tree_number)
+            .ok_or(Error::StatementMismatch)?;
+        let prefix = self.chain.message().prefix(KIND_POSITIONS, 0)?;
+        if !self.chain.step(&prefix, 0)? {
+            return Err(Error::InvalidProof);
+        }
+        let mut positions = Vec::new();
+        positions
+            .try_reserve_exact(self.plan.mask_query_count)
+            .map_err(|_| Error::ResourceLimit)?;
+        for _ in 0..self.plan.mask_query_count {
+            positions.push(self.chain.draw_position(tree.log_n)?);
+        }
+        self.mask_queries = unique_sorted(&positions);
+        self.stage = Stage::MaskQueried;
+        Ok(())
+    }
+
+    /// Check the mask opening at the positions the verifier's transcript drew.
+    /// The plan's count is a different source from the drawn list. This checks
+    /// the opening only; not a complete authentication, proximity, table test
+    /// or relation closure.
+    pub fn read_mask(&mut self, openings: &[MaskColumnOpening]) -> Result<()> {
+        if self.stage != Stage::MaskQueried {
             return Err(Error::InvalidSessionState);
         }
         let message = self.start.as_ref().ok_or(Error::InvalidSessionState)?;
@@ -632,8 +657,8 @@ impl FoldeqSession {
         oracles.authenticate_mask(
             tree,
             message.id,
-            &self.plan.mask_positions,
-            &self.plan.mask_positions,
+            self.plan.mask_query_count,
+            &self.mask_queries,
             openings,
         )?;
         drop(oracles);
@@ -647,10 +672,9 @@ mod tests {
     use super::*;
     use crate::pcs::request::code::build_code_plan;
     use crate::pcs::request::field::{Fp, MODULUS};
-    use crate::pcs::request::runtime_tree::MaskColumnOpening;
 use crate::pcs::request::fold::{
         fold_mask_make, fold_mask_make_tail, fold_mask_notice, fold_start_prove, MaskOracle,
-        OracleMetadata, RuntimeOracle, RuntimeOracles, VerifiedGroup, VerifiedGroups,
+        OracleMetadata, RuntimeOracles, VerifiedGroup, VerifiedGroups,
         VerifiedStatement,
     };
     use crate::pcs::request::params::{LEAF_SALT_MIN_BYTES, REQUEST_CHAIN_LABEL};
@@ -762,8 +786,8 @@ use crate::pcs::request::fold::{
             seed_budget: table.reader.shape.answers as usize,
             ledger: Arc::new(Mutex::new(ReadLedger::new(2))),
             column_draws: 2,
-            mask_positions: vec![1, 4],
-            gamma_path: GammaPath::Lin { k_lo: 1, k_col: 3, lin_shape: Digest([3; 32]) },
+            mask_query_count: 2,
+            gamma_path: GammaPath::Lin { shape: LinShapeBinding { matrix_rows: 1, k_lo: 0, k_col: 2 } },
         };
         (plan, table)
     }
@@ -864,6 +888,7 @@ use crate::pcs::request::fold::{
             session.gamma().unwrap().to_vec()
         };
         let (plan, _table) = plan_fixture();
+        let first_query = plan.first_query();
         let first = draw(plan.clone());
         let (same, _table) = plan_fixture();
         assert_eq!(first, draw(same));
@@ -872,22 +897,24 @@ use crate::pcs::request::fold::{
             columns: other.reader.shape.v,
         };
         assert_ne!(first, draw(other.clone()));
-        // The same statement with a replaced LIN offset is a different plan
-        // binding and cannot be bound to the first query.
+        // A replaced LIN offset does not fit this table's plain columns and is
+        // rejected by the plan fault before any draw; its first query is a
+        // different binding.
         let mut offset = plan;
-        offset.gamma_path = GammaPath::Lin { k_lo: 0, k_col: 2, lin_shape: Digest([3; 32]) };
-        assert_ne!(first, draw(offset.clone()));
+        offset.gamma_path = GammaPath::Lin {
+            shape: LinShapeBinding {
+                matrix_rows: 1,
+                k_lo: 1,
+                k_col: 3,
+            },
+        };
+        assert_ne!(first_query, offset.first_query());
         let binder = FoldeqBinder::new(
             REQUEST_CHAIN_LABEL,
             offset.reader.configuration,
             &offset,
-        )
-        .unwrap();
-        let chain = binder.chain().unwrap();
-        let mut session = FoldeqSession::open(offset, binder, chain).unwrap();
-        let first = session.plan().first_query();
-        session.bind_first_query(&first).unwrap();
-        assert!(session.draw_gamma().is_ok());
+        );
+        assert!(binder.is_err());
     }
 
     #[test]
@@ -935,77 +962,80 @@ use crate::pcs::request::fold::{
         // A second read charges past the plan's budget.
         assert!(session.read_queries(&openings).is_err());
         let start = mask_start(&plan);
-        let mask_openings = start.tree.open(&plan.mask_positions).unwrap();
-        {
-            let tree = plan.statement.mask_tree(plan.mask_tree_number).unwrap();
-            session
-                .plan()
-                .oracles
-                .lock()
-                .unwrap()
-                .receive_mask(
-                    &plan.statement,
-                    tree,
-                    9,
-                    &start.message.notice,
-                    start.message.root,
-                )
-                .unwrap();
-            // Registration of a forged root is only a claim; the later
-            // opening phase must reject it.
-            let mut forged_registry = RuntimeOracles::default();
-            forged_registry
-                .receive_mask(
-                    &plan.statement,
-                    tree,
-                    9,
-                    &start.message.notice,
-                    Digest([5; 32]),
-                )
-                .unwrap();
-            assert!(forged_registry
-                .authenticate_mask(
-                    tree,
-                    9,
-                    &plan.mask_positions,
-                    &plan.mask_positions,
-                    &mask_openings,
-                )
-                .is_err());
-            // Empty or caller-chosen positions are not the verifier's list.
-            let mut empty_registry = RuntimeOracles::default();
-            empty_registry
-                .receive_mask(
-                    &plan.statement,
-                    tree,
-                    9,
-                    &start.message.notice,
-                    start.message.root,
-                )
-                .unwrap();
-            assert!(empty_registry
-                .authenticate_mask(tree, 9, &plan.mask_positions, &[], &[])
-                .is_err());
-            assert!(empty_registry
-                .authenticate_mask(
-                    tree,
-                    9,
-                    &plan.mask_positions,
-                    &[1u64],
-                    &mask_openings[..1],
-                )
-                .is_err());
-        }
+        let tree = plan.statement.mask_tree(plan.mask_tree_number).unwrap();
+        session
+            .plan()
+            .oracles
+            .lock()
+            .unwrap()
+            .receive_mask(
+                &plan.statement,
+                tree,
+                9,
+                &start.message.notice,
+                start.message.root,
+            )
+            .unwrap();
+        // Registration of a forged root is only a claim; the later opening
+        // phase must reject it.
+        let mut forged_registry = RuntimeOracles::default();
+        forged_registry
+            .receive_mask(
+                &plan.statement,
+                tree,
+                9,
+                &start.message.notice,
+                Digest([5; 32]),
+            )
+            .unwrap();
         session.start_fold(&start.message).unwrap();
         assert!(session.epsilon().is_some());
         assert_eq!(session.start(), Some(&start.message));
+        // The opening positions come from the verifier's own transcript; the
+        // plan supplies only the count.
+        session.draw_mask_queries().unwrap();
+        let positions = session.mask_queries().to_vec();
+        assert!(positions.len() <= plan.mask_query_count);
+        let mask_openings = start.tree.open(&positions).unwrap();
+        assert!(forged_registry
+            .authenticate_mask(
+                tree,
+                9,
+                plan.mask_query_count,
+                &positions,
+                &mask_openings,
+            )
+            .is_err());
+        let mut empty_registry = RuntimeOracles::default();
+        empty_registry
+            .receive_mask(
+                &plan.statement,
+                tree,
+                9,
+                &start.message.notice,
+                start.message.root,
+            )
+            .unwrap();
+        // An empty opening list is allowed (nothing is opened or marked); a
+        // list longer than the plan's draw count is rejected.
+        empty_registry
+            .authenticate_mask(tree, 9, plan.mask_query_count, &[], &[])
+            .unwrap();
+        assert!(empty_registry
+            .authenticate_mask(
+                tree,
+                9,
+                plan.mask_query_count,
+                &[0u64, 1, 2],
+                &mask_openings[..0],
+            )
+            .is_err());
         session.read_mask(&mask_openings).unwrap();
         assert!(session.read_mask(&mask_openings).is_err());
-        let tree = plan.statement.mask_tree(plan.mask_tree_number).unwrap();
         assert!(verify_mask_columns(
             tree,
             &Digest([5; 32]),
-            &plan.mask_positions,
+            &positions,
             &mask_openings
         )
         .is_err());
@@ -1014,7 +1044,7 @@ use crate::pcs::request::fold::{
         assert!(verify_mask_columns(
             tree,
             &start.message.root,
-            &plan.mask_positions,
+            &positions,
             &forged
         )
         .is_err());
@@ -1069,11 +1099,7 @@ use crate::pcs::request::fold::{
         assert!(FoldeqSession::open(bad, binder.clone(), chain.clone()).is_err());
 
         let mut bad = plan.clone();
-        bad.mask_positions.clear();
-        assert!(FoldeqSession::open(bad, binder.clone(), chain.clone()).is_err());
-
-        let mut bad = plan.clone();
-        bad.gamma_path = GammaPath::Lin { k_lo: 0, k_col: 1, lin_shape: Digest([3; 32]) };
+        bad.gamma_path = GammaPath::Lin { shape: LinShapeBinding { matrix_rows: 1, k_lo: 0, k_col: 1 } };
         assert!(FoldeqSession::open(bad, binder.clone(), chain.clone()).is_err());
 
         let mut bad = plan;

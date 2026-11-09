@@ -503,9 +503,10 @@ impl CommittedTable {
         charge: &HidingCharge,
         positions: &[u64],
     ) -> Result<Vec<ColumnOpening>> {
-        if charge.table() != self.reader.root || positions.len() > charge.columns() {
+        if charge.table() != self.reader.root {
             return Err(Error::StatementMismatch);
         }
+        charge.consume(positions)?;
         self.open_columns(positions)
     }
 }
