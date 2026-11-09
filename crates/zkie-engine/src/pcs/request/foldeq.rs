@@ -851,11 +851,14 @@ impl FoldeqSession {
     }
 
     /// Add column rows from the columns that `read_queries` verified against
-    /// the trusted reader root for this session's draws. The draw order,
-    /// repeats included, is reused. `read_queries` verifies one opening per
-    /// unique physical position and maps it back to the logical draw sequence;
-    /// no caller column map is accepted here, so a substituted read cannot
-    /// become an authenticated claim.
+    /// the trusted reader root for this session's draws. The unique loop below
+    /// builds only the physical position→column map; the complete `queries`
+    /// sequence is then passed to `column_plan_rows`, which emits one logical
+    /// relation row per draw, repeats included. Equal openings for a repeated
+    /// draw are checked in `read_queries` before its unique position is sent to
+    /// `VerifierReads`; that store's `(root, position)` record is for values
+    /// read again across separate reads, not a second handling of this same
+    /// repeat. Provider hiding accounting is separate and is not reduced here.
     pub fn join_gu_read_columns(&mut self) -> Result<()> {
         if self.stage != Stage::Read {
             return Err(Error::InvalidSessionState);

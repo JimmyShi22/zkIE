@@ -27,6 +27,7 @@
 //! and the global format is not changed.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use zkie_core::common::field::PrimeCharacteristicRing;
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
@@ -812,42 +813,6 @@ fn opening_given_count(plan: &RuntimeTreePlan, list: &[u64]) -> Result<usize> {
     Ok(given)
 }
 
-fn check_leaf_walk(
-    plan: &RuntimeTreePlan,
-    root: &Digest,
-    list: &[u64],
-    leaves: &[Digest],
-    given: &[Digest],
-) -> Result<()> {
-    let mut used = 0usize;
-    let mut now: Vec<(u64, Digest)> = list.iter().copied().zip(leaves.iter().copied()).collect();
-    for _ in 0..plan.log_n {
-        let mut next = Vec::with_capacity((now.len() + 1) / 2);
-        let mut index = 0usize;
-        while index < now.len() {
-            let place = now[index].0;
-            if place & 1 == 0 && index + 1 < now.len() && now[index + 1].0 == place + 1 {
-                next.push((place >> 1, runtime_node(plan, &now[index].1, &now[index + 1].1)?));
-                index += 2;
-            } else {
-                let sibling = *given.get(used).ok_or(Error::ShapeMismatch)?;
-                used += 1;
-                let parent = if place & 1 == 0 {
-                    runtime_node(plan, &now[index].1, &sibling)?
-                } else {
-                    runtime_node(plan, &sibling, &now[index].1)?
-                };
-                next.push((place >> 1, parent));
-                index += 1;
-            }
-        }
-        now = next;
-    }
-    if used != given.len() || now.len() != 1 || now[0].1 != *root {
-        return Err(Error::InvalidProof);
-    }
-    Ok(())
-}
 
 /// A committed runtime co-tree with the private columns and salts needed to
 /// open complete leaves. This is an in-memory test foundation; it materializes
@@ -1015,12 +980,57 @@ impl RuntimeTree {
     }
 }
 
-pub fn verify_runtime_opening(
+/// Nodes already seen under one tree root. The key is
+/// `(root, depth, index)`; a different value at the same vertex is a conflict.
+/// This is an isolated candidate store, not a reference vertex record and not
+/// a production session object.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OpeningNodeStore {
+    nodes: BTreeMap<(Digest, u32, u64), Digest>,
+}
+
+impl OpeningNodeStore {
+    pub fn get(&self, root: &Digest, depth: u32, index: u64) -> Option<&Digest> {
+        self.nodes.get(&(*root, depth, index))
+    }
+
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn insert_for_test(&mut self, root: Digest, depth: u32, index: u64, digest: Digest) {
+        self.nodes.insert((root, depth, index), digest);
+    }
+
+    fn record(&mut self, root: &Digest, depth: u32, index: u64, digest: Digest) -> Result<()> {
+        match self.nodes.get(&(*root, depth, index)) {
+            Some(known) if *known == digest => Ok(()),
+            Some(_) => Err(Error::InvalidProof),
+            None => {
+                self.nodes.insert((*root, depth, index), digest);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Check one opening and return a node store extended with every leaf, given
+/// sibling and computed parent visited by the walk. The input store is not
+/// changed on failure; callers commit the returned store only after success.
+/// The root is part of every key, so values from another root or tree do not
+/// collide.
+pub fn verify_runtime_opening_shared(
     plan: &RuntimeTreePlan,
     root: &Digest,
     list: &[u64],
     opening: &RuntimeTreeOpening,
-) -> Result<()> {
+    store: &OpeningNodeStore,
+) -> Result<OpeningNodeStore> {
     if plan.fault().is_some() {
         return Err(Error::InvalidConfig);
     }
@@ -1032,7 +1042,8 @@ pub fn verify_runtime_opening(
     }
     let width = plan.width()? as usize;
     let columns = plan.columns();
-    let mut leaves = Vec::with_capacity(list.len());
+    let mut staged = store.clone();
+    let mut now = Vec::with_capacity(list.len());
     for (position, column) in list.iter().zip(&opening.columns) {
         if *position >= columns
             || column.position != *position
@@ -1041,9 +1052,59 @@ pub fn verify_runtime_opening(
         {
             return Err(Error::ShapeMismatch);
         }
-        leaves.push(runtime_leaf(plan, *position, &column.salt, &column.symbols)?);
+        let leaf = runtime_leaf(plan, *position, &column.salt, &column.symbols)?;
+        staged.record(root, 0, *position, leaf)?;
+        now.push((*position, leaf));
     }
-    check_leaf_walk(plan, root, list, &leaves, &opening.given)
+    let mut used = 0usize;
+    for depth in 0..plan.log_n {
+        let mut next = Vec::with_capacity((now.len() + 1) / 2);
+        let mut index = 0usize;
+        while index < now.len() {
+            let place = now[index].0;
+            if place & 1 == 0 && index + 1 < now.len() && now[index + 1].0 == place + 1 {
+                let parent = runtime_node(plan, &now[index].1, &now[index + 1].1)?;
+                staged.record(root, depth + 1, place >> 1, parent)?;
+                next.push((place >> 1, parent));
+                index += 2;
+            } else {
+                let sibling = *opening.given.get(used).ok_or(Error::ShapeMismatch)?;
+                used += 1;
+                staged.record(root, depth, place ^ 1, sibling)?;
+                let parent = if place & 1 == 0 {
+                    runtime_node(plan, &now[index].1, &sibling)?
+                } else {
+                    runtime_node(plan, &sibling, &now[index].1)?
+                };
+                staged.record(root, depth + 1, place >> 1, parent)?;
+                next.push((place >> 1, parent));
+                index += 1;
+            }
+        }
+        now = next;
+    }
+    if used != opening.given.len() || now.len() != 1 || now[0].1 != *root {
+        return Err(Error::InvalidProof);
+    }
+    staged.record(root, plan.log_n, 0, *root)?;
+    Ok(staged)
+}
+
+/// Check a runtime opening without retaining its vertex values.
+pub fn verify_runtime_opening(
+    plan: &RuntimeTreePlan,
+    root: &Digest,
+    list: &[u64],
+    opening: &RuntimeTreeOpening,
+) -> Result<()> {
+    verify_runtime_opening_shared(
+        plan,
+        root,
+        list,
+        opening,
+        &OpeningNodeStore::default(),
+    )
+    .map(|_| ())
 }
 
 pub fn encode_runtime_opening(plan: &RuntimeTreePlan, opening: &RuntimeTreeOpening) -> Result<Vec<u8>> {
