@@ -246,17 +246,28 @@ impl HidingCharge {
             .state
             .lock()
             .map_err(|_| Error::InvalidSessionState)?;
-        let mut new_units = 0usize;
+        // Build the candidate set and check the total before committing
+        // anything. A failed request leaves the consumed set unchanged, so a
+        // retry cannot slip a new position in through an earlier partial
+        // insertion.
+        let mut fresh = HashSet::new();
         for position in positions {
-            if state.unique.insert(*position) {
-                state.units = state.units.checked_add(1).ok_or(Error::ResourceLimit)?;
-                if state.units > self.total {
-                    return Err(Error::ResourceLimit);
-                }
-                new_units += 1;
+            if !state.unique.contains(position) {
+                fresh.insert(*position);
             }
         }
-        Ok(new_units)
+        let candidate = state
+            .units
+            .checked_add(fresh.len())
+            .ok_or(Error::ResourceLimit)?;
+        if candidate > self.total {
+            return Err(Error::ResourceLimit);
+        }
+        for position in &fresh {
+            state.unique.insert(*position);
+        }
+        state.units = candidate;
+        Ok(fresh.len())
     }
 }
 
@@ -711,6 +722,25 @@ mod tests {
         // The budget is still available after the failed read.
         reads.read(&table.reader, &positions, &openings).unwrap();
         assert_eq!(shared.lock().unwrap().used(), 2);
+    }
+
+    #[test]
+    fn hiding_charge_failure_is_atomic() {
+        let table = Digest([7; 32]);
+        let mut state = HidingState::new(table, 1, 1);
+        let charge = state.begin_charge(table, 1, 1).unwrap();
+        assert_eq!(charge.consume(&[0]).unwrap(), 1);
+        // The failed request consumes nothing; retrying it still fails.
+        assert!(charge.consume(&[1]).is_err());
+        assert!(charge.consume(&[1]).is_err());
+        assert!(charge.consume(&[0, 1]).is_err());
+        // An already consumed position remains free after the failures.
+        assert_eq!(charge.consume(&[0]).unwrap(), 0);
+        // A clone shares the same consumed set.
+        let copied = charge.clone();
+        assert_eq!(copied.consume(&[0]).unwrap(), 0);
+        assert!(copied.consume(&[1]).is_err());
+        assert_eq!(charge.columns(), 1);
     }
 
     #[test]
