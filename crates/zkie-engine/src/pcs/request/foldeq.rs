@@ -22,7 +22,7 @@ use crate::pcs::request::fold::{
     fold_mask_shape_fault, fold_start_verify, FoldShape, FoldStartMessage, RuntimeOracles,
     VerifiedStatement,
 };
-use crate::pcs::request::read::{draw_positions, ReadLedger, VerifierReads};
+use crate::pcs::request::read::{draw_positions, HidingState, ReadLedger, VerifierReads};
 use crate::pcs::request::table::{
     record_seeds, ColumnOpening, IndexName, IndexReader, SampleSeed,
 };
@@ -71,6 +71,75 @@ impl FoldeqBinder {
     }
 }
 
+/// The provider's G_u message: the root the provider sends after its durable
+/// hiding pre-charge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuMessage {
+    pub root: Digest,
+}
+
+/// The provider's side of the G_u/column phase. `begin` must charge the
+/// provider hiding state before `send_gu` returns a message; an uncharged
+/// provider cannot send. The charge is in-memory here; durable cross-process
+/// storage and rollback protection remain open.
+pub struct ProverFoldeq {
+    hiding: HidingState,
+    table: Digest,
+    lifecycle: u64,
+    columns: usize,
+    charged: bool,
+}
+
+impl ProverFoldeq {
+    /// Bind the provider state to the actual table root, the lifecycle and the
+    /// plan's column count. The maximum is still a caller-provided value; its
+    /// derivation from the encoded tail/opening budgets is open.
+    pub fn new(
+        hiding: HidingState,
+        reader: &IndexReader,
+        lifecycle: u64,
+        columns: usize,
+    ) -> Result<Self> {
+        if hiding.table() != reader.root
+            || hiding.lifecycle() != lifecycle
+            || columns == 0
+        {
+            return Err(Error::StatementMismatch);
+        }
+        Ok(Self {
+            hiding,
+            table: reader.root,
+            lifecycle,
+            columns,
+            charged: false,
+        })
+    }
+
+    /// Durable pre-charge before G_u and any column exposure. A second call
+    /// fails; an over-budget charge fails before any send.
+    pub fn begin(&mut self) -> Result<()> {
+        if self.charged {
+            return Err(Error::InvalidSessionState);
+        }
+        self.hiding
+            .begin(self.table, self.lifecycle, self.columns)?;
+        self.charged = true;
+        Ok(())
+    }
+
+    /// Return the G_u message only after the hiding pre-charge.
+    pub fn send_gu(&self, root: &Digest) -> Result<GuMessage> {
+        if !self.charged || *root == Digest::ZERO {
+            return Err(Error::InvalidSessionState);
+        }
+        Ok(GuMessage { root: *root })
+    }
+
+    pub fn used(&self) -> u64 {
+        self.hiding.used()
+    }
+}
+
 /// A LIN-style gamma: the suffix of a caller-drawn psi, starting at `k_lo`.
 /// The FOLDEQ session does not assume this caller; a direct gamma is also
 /// accepted. The caller owns the psi draw and its round.
@@ -83,6 +152,16 @@ fn lin_gamma(psi: &[Fp3], k_lo: u32, columns: u32) -> Result<Vec<Fp3>> {
         return Err(Error::ShapeMismatch);
     }
     Ok(psi[start..end].to_vec())
+}
+
+/// The trusted challenge path of one FOLDEQ plan. A LIN caller fixes the
+/// LinShape's k_lo/k_col; a caller with another reference path fixes the
+/// direct length. The plan chooses the path, never the proof or an untrusted
+/// caller, and the first query binds these numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GammaPath {
+    Lin { k_lo: u32, k_col: u32 },
+    Direct { columns: u32 },
 }
 
 /// The verifier's FOLDEQ plan. The reader is the committed table, the fold and
@@ -103,6 +182,7 @@ pub struct FoldeqPlan {
     pub ledger: Arc<Mutex<ReadLedger>>,
     pub column_draws: usize,
     pub mask_positions: Vec<u64>,
+    pub gamma_path: GammaPath,
 }
 
 impl FoldeqPlan {
@@ -171,6 +251,25 @@ impl FoldeqPlan {
         if self.seed_budget < answers {
             return Some("the seed budget is below the answer count");
         }
+        match self.gamma_path {
+            GammaPath::Lin { k_lo, k_col } => {
+                if k_lo > 30 || k_col > 60 {
+                    return Some("the LIN challenge path has too many coordinates");
+                }
+                let expected = match k_lo.checked_add(self.reader.shape.v) {
+                    Some(expected) => expected,
+                    None => return Some("the LIN challenge path overflows"),
+                };
+                if k_col != expected {
+                    return Some("the LIN challenge path does not end at the table width");
+                }
+            }
+            GammaPath::Direct { columns } => {
+                if columns != self.reader.shape.v {
+                    return Some("the direct challenge length is not the table width");
+                }
+            }
+        }
         None
     }
 
@@ -230,6 +329,17 @@ impl FoldeqPlan {
         writer.put_u64(self.mask_positions.len() as u64);
         for position in &self.mask_positions {
             writer.put_u64(*position);
+        }
+        match self.gamma_path {
+            GammaPath::Lin { k_lo, k_col } => {
+                writer.put_u64(1);
+                writer.put_u64(k_lo as u64);
+                writer.put_u64(k_col as u64);
+            }
+            GammaPath::Direct { columns } => {
+                writer.put_u64(2);
+                writer.put_u64(columns as u64);
+            }
         }
         writer.into_bytes()
     }
@@ -346,31 +456,21 @@ impl FoldeqSession {
         self.plan.seeds()
     }
 
-    /// Draw the LIN path's psi and bind gamma as its suffix. The session owns
-    /// the draw: a caller cannot choose or replace the challenge or forge the
-    /// psi source. `k_lo` is the LIN caller's low-variable count.
-    pub fn draw_lin_gamma(&mut self, k_lo: u32) -> Result<()> {
+    /// Draw the challenge along the plan's fixed path. The path and its
+    /// numbers are trusted-plan values bound by the first query; the caller
+    /// cannot choose LIN versus direct or replace the offset, and the session
+    /// owns the draw so no caller value or forged psi source is accepted.
+    pub fn draw_gamma(&mut self) -> Result<()> {
         if self.stage != Stage::Seeds {
             return Err(Error::InvalidSessionState);
         }
-        let columns = self.plan.reader.shape.v;
-        let total = (k_lo as usize)
-            .checked_add(columns as usize)
-            .ok_or(Error::ResourceLimit)?;
-        let psi = self.draw_challenge(total)?;
-        let gamma = lin_gamma(&psi, k_lo, columns)?;
-        self.set_gamma(gamma)
-    }
-
-    /// Draw a directly used gamma for a caller whose reference path does not
-    /// use the LIN psi suffix. The session still owns the draw; no caller
-    /// value is accepted.
-    pub fn draw_direct_gamma(&mut self) -> Result<()> {
-        if self.stage != Stage::Seeds {
-            return Err(Error::InvalidSessionState);
-        }
-        let columns = self.plan.reader.shape.v as usize;
-        let gamma = self.draw_challenge(columns)?;
+        let gamma = match self.plan.gamma_path {
+            GammaPath::Lin { k_lo, k_col } => {
+                let psi = self.draw_challenge(k_col as usize)?;
+                lin_gamma(&psi, k_lo, self.plan.reader.shape.v)?
+            }
+            GammaPath::Direct { columns } => self.draw_challenge(columns as usize)?,
+        };
         self.set_gamma(gamma)
     }
 
@@ -633,6 +733,7 @@ use crate::pcs::request::fold::{
             ledger: Arc::new(Mutex::new(ReadLedger::new(2))),
             column_draws: 2,
             mask_positions: vec![1, 4],
+            gamma_path: GammaPath::Lin { k_lo: 1, k_col: 3 },
         };
         (plan, table)
     }
@@ -652,8 +753,6 @@ use crate::pcs::request::fold::{
         let notice = fold_mask_notice(&plan.fold).unwrap();
         let oracle = MaskOracle::prover_view(9, 1, &notice);
         let tree = *plan.statement.mask_tree(plan.mask_tree_number).unwrap();
-        let table = Digest([7; 32]);
-        let mut hiding = HidingState::new(table, 1, 8);
         fold_start_prove(
             &plan.fold,
             &mut mask,
@@ -662,10 +761,6 @@ use crate::pcs::request::fold::{
             plan.statement.groups(),
             tree,
             &mask_salts(&tree),
-            &mut hiding,
-            table,
-            1,
-            plan.column_draws,
         )
         .unwrap()
     }
@@ -735,23 +830,41 @@ use crate::pcs::request::fold::{
             let mut session = FoldeqSession::open(plan.clone(), binder, chain).unwrap();
             let first = plan.first_query();
             session.bind_first_query(&first).unwrap();
-            session.draw_direct_gamma().unwrap();
+            session.draw_gamma().unwrap();
             session.gamma().unwrap().to_vec()
         };
         let (plan, _table) = plan_fixture();
         let first = draw(plan.clone());
         let (same, _table) = plan_fixture();
         assert_eq!(first, draw(same));
-        let mut other = plan;
-        other.column_draws = 1;
-        assert_ne!(first, draw(other));
+        let mut other = plan.clone();
+        other.gamma_path = GammaPath::Direct {
+            columns: other.reader.shape.v,
+        };
+        assert_ne!(first, draw(other.clone()));
+        // The same statement with a replaced LIN offset is a different plan
+        // binding and cannot be bound to the first query.
+        let mut offset = plan;
+        offset.gamma_path = GammaPath::Lin { k_lo: 0, k_col: 2 };
+        assert_ne!(first, draw(offset.clone()));
+        let binder = FoldeqBinder::new(
+            REQUEST_CHAIN_LABEL,
+            offset.reader.configuration,
+            &offset,
+        )
+        .unwrap();
+        let chain = binder.chain().unwrap();
+        let mut session = FoldeqSession::open(offset, binder, chain).unwrap();
+        let first = session.plan().first_query();
+        session.bind_first_query(&first).unwrap();
+        assert!(session.draw_gamma().is_ok());
     }
 
     #[test]
     fn first_query_and_stage_order() {
         let (mut session, _table) = open_session();
         assert!(session.seeds().is_err());
-        assert!(session.draw_direct_gamma().is_err());
+        assert!(session.draw_gamma().is_err());
         let mut sent = session.plan().first_query();
         sent[0] ^= 1;
         assert!(session.bind_first_query(&sent).is_err());
@@ -772,10 +885,17 @@ use crate::pcs::request::fold::{
         let good = plan.first_query();
         session.bind_first_query(&good).unwrap();
         let _seeds = session.seeds().unwrap();
-        session.draw_direct_gamma().unwrap();
+        session.draw_gamma().unwrap();
         assert_eq!(session.gamma().unwrap().len(), plan.reader.shape.v as usize);
-        session.send_gu(&Digest([4; 32])).unwrap();
-        assert_eq!(session.gu_root(), Some(&Digest([4; 32])));
+        let prover_hiding = HidingState::new(table.reader.root, 1, 8);
+        let mut gu_prover =
+            ProverFoldeq::new(prover_hiding, &table.reader, 1, plan.column_draws).unwrap();
+        assert!(gu_prover.send_gu(&Digest([4; 32])).is_err());
+        gu_prover.begin().unwrap();
+        let gu = gu_prover.send_gu(&Digest([4; 32])).unwrap();
+        session.send_gu(&gu.root).unwrap();
+        assert_eq!(session.gu_root(), Some(&gu.root));
+        assert_eq!(gu_prover.used(), plan.column_draws as u64);
         session.draw_queries().unwrap();
         assert_eq!(session.queries().len(), plan.column_draws);
         let mut prover = ProverReads::new(plan.ledger.lock().unwrap().max_reads());
@@ -785,21 +905,42 @@ use crate::pcs::request::fold::{
         // A second read charges past the plan's budget.
         assert!(session.read_queries(&openings).is_err());
         let start = mask_start(&plan);
-        session
-            .plan()
-            .oracles
-            .lock()
-            .unwrap()
-            .insert(RuntimeOracle {
-                id: 9,
-                root: start.message.root,
-                sampled: false,
-            })
-            .unwrap();
+        let mask_openings = start.tree.open(&plan.mask_positions).unwrap();
+        {
+            let tree = plan.statement.mask_tree(plan.mask_tree_number).unwrap();
+            session
+                .plan()
+                .oracles
+                .lock()
+                .unwrap()
+                .receive_mask(
+                    &plan.statement,
+                    tree,
+                    9,
+                    &start.message.notice,
+                    start.message.root,
+                    &plan.mask_positions,
+                    &mask_openings,
+                )
+                .unwrap();
+            // A forged root cannot be registered through the SEND path even
+            // when the same forged root is put in a start message.
+            let mut forged_registry = RuntimeOracles::default();
+            assert!(forged_registry
+                .receive_mask(
+                    &plan.statement,
+                    tree,
+                    9,
+                    &start.message.notice,
+                    Digest([5; 32]),
+                    &plan.mask_positions,
+                    &mask_openings,
+                )
+                .is_err());
+        }
         session.start_fold(&start.message).unwrap();
         assert!(session.epsilon().is_some());
         assert_eq!(session.start(), Some(&start.message));
-        let mask_openings = start.tree.open(&plan.mask_positions).unwrap();
         session.read_mask(&mask_openings).unwrap();
         assert!(session.read_mask(&mask_openings).is_err());
         let tree = plan.statement.mask_tree(plan.mask_tree_number).unwrap();
@@ -819,6 +960,26 @@ use crate::pcs::request::fold::{
             &forged
         )
         .is_err());
+    }
+
+    #[test]
+    fn provider_hiding_is_bound_and_charged_before_send() {
+        let (plan, table) = plan_fixture();
+        let wrong_table = HidingState::new(Digest([9; 32]), 1, 8);
+        assert!(ProverFoldeq::new(wrong_table, &table.reader, 1, plan.column_draws).is_err());
+        let wrong_lifecycle = HidingState::new(table.reader.root, 2, 8);
+        assert!(ProverFoldeq::new(wrong_lifecycle, &table.reader, 1, plan.column_draws).is_err());
+        let too_small = HidingState::new(table.reader.root, 1, 1);
+        let mut small =
+            ProverFoldeq::new(too_small, &table.reader, 1, plan.column_draws).unwrap();
+        assert!(small.begin().is_err());
+        assert!(small.send_gu(&Digest([4; 32])).is_err());
+        let state = HidingState::new(table.reader.root, 1, 8);
+        let mut prover = ProverFoldeq::new(state, &table.reader, 1, plan.column_draws).unwrap();
+        assert!(prover.send_gu(&Digest([4; 32])).is_err());
+        prover.begin().unwrap();
+        assert!(prover.begin().is_err());
+        assert_eq!(prover.used(), plan.column_draws as u64);
     }
 
     #[test]
@@ -851,6 +1012,10 @@ use crate::pcs::request::fold::{
 
         let mut bad = plan.clone();
         bad.mask_positions.clear();
+        assert!(FoldeqSession::open(bad, binder.clone(), chain.clone()).is_err());
+
+        let mut bad = plan.clone();
+        bad.gamma_path = GammaPath::Lin { k_lo: 0, k_col: 1 };
         assert!(FoldeqSession::open(bad, binder.clone(), chain.clone()).is_err());
 
         let mut bad = plan;

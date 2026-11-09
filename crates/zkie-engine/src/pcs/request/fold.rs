@@ -25,8 +25,9 @@ use zkie_core::types::Digest;
 
 use crate::pcs::request::code::{build_code_plan, CodeParams};
 use crate::pcs::request::field::{E_DEGREE, Fp3};
-use crate::pcs::request::read::HidingState;
-use crate::pcs::request::runtime_tree::{MaskTree, MaskTreePlan};
+use crate::pcs::request::runtime_tree::{
+    verify_mask_columns, MaskColumnOpening, MaskTree, MaskTreePlan,
+};
 use crate::primitives::codec::CanonicalWriter;
 use crate::primitives::transcript::{hash_labeled, tag_word, STATEMENT};
 
@@ -629,21 +630,62 @@ pub struct RuntimeOracle {
     pub id: u64,
     pub root: Digest,
     pub sampled: bool,
+    pub main_rows: u64,
+    pub mask_rows: u64,
+    pub mask_code: CodeParams,
+    pub answers: u32,
+    pub leaf_class: u32,
 }
 
+/// The verifier's SEND registry. Entries are private; the only public way to
+/// add one is `receive_mask`, which checks the static metadata and tree layout
+/// and authenticates the root by verifying the mask openings at the plan's
+/// allowed positions. A caller cannot inject an arbitrary root.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeOracles {
-    pub entries: Vec<RuntimeOracle>,
+    entries: Vec<RuntimeOracle>,
 }
 
 impl RuntimeOracles {
-    /// Record the root and sampled fact the verifier accepted from a SEND
-    /// message. A second entry for the same id, or a zero root, fails.
-    pub fn insert(&mut self, oracle: RuntimeOracle) -> Result<()> {
-        if oracle.root == Digest::ZERO || self.get(oracle.id).is_some() {
+    /// Receive the mask SEND: check the notice against the frozen statement's
+    /// oracle metadata and runtime tree, verify the root's openings at the
+    /// allowed positions, and record the complete sent metadata once. This is
+    /// the verifier's SEND authentication; a forged root without valid
+    /// openings is rejected here.
+    pub fn receive_mask(
+        &mut self,
+        statement: &VerifiedStatement,
+        tree_plan: &MaskTreePlan,
+        id: u64,
+        notice: &MaskNotice,
+        root: Digest,
+        positions: &[u64],
+        openings: &[MaskColumnOpening],
+    ) -> Result<()> {
+        if self.get(id).is_some() || root == Digest::ZERO {
             return Err(Error::StatementMismatch);
         }
-        self.entries.push(oracle);
+        let metadata = statement.oracle(id).ok_or(Error::StatementMismatch)?;
+        if statement.mask_tree(metadata.tree_number) != Some(tree_plan)
+            || metadata.tree_number != tree_plan.tree_number
+            || notice.mask_rows != metadata.mask_rows
+            || notice.mask_code != metadata.mask_code
+            || notice.leaf_class != metadata.leaf_class
+            || notice.answers != 0
+        {
+            return Err(Error::StatementMismatch);
+        }
+        verify_mask_columns(tree_plan, &root, positions, openings)?;
+        self.entries.push(RuntimeOracle {
+            id,
+            root,
+            sampled: false,
+            main_rows: 0,
+            mask_rows: notice.mask_rows,
+            mask_code: notice.mask_code,
+            answers: notice.answers,
+            leaf_class: notice.leaf_class,
+        });
         Ok(())
     }
 
@@ -963,10 +1005,6 @@ pub fn fold_start_prove(
     groups: &VerifiedGroups,
     tree_plan: MaskTreePlan,
     salts: &[Vec<u8>],
-    hiding: &mut HidingState,
-    table: Digest,
-    lifecycle: u64,
-    columns: usize,
 ) -> Result<FoldStartProver> {
     validate_fold_mask_shape(shape)?;
     if mask.id() != Some(oracle.id) || mask.used() {
@@ -979,9 +1017,6 @@ pub fn fold_start_prove(
     let tails = mask_tail_rows(shape, mask)?;
     let tree = MaskTree::commit(tree_plan, shape, &rows, &tails, salts)?;
     let sum = fold_mask_sum(shape.k, mask.coefficients())?;
-    // The provider charges the table's hiding capacity before the mask
-    // message is sent; an abandoned proof keeps its columns.
-    hiding.begin(table, lifecycle, columns)?;
     mask.mark_used();
     let tree_number = tree_plan.tree_number;
     let message = FoldStartMessage {
@@ -1034,6 +1069,12 @@ pub fn fold_start_verify(
         || metadata.mask_rows != message.notice.mask_rows
         || metadata.mask_code != message.notice.mask_code
         || runtime.root != message.root
+        || runtime.main_rows != 0
+        || runtime.mask_rows != message.notice.mask_rows
+        || runtime.mask_code != message.notice.mask_code
+        || runtime.answers != message.notice.answers
+        || runtime.leaf_class != message.notice.leaf_class
+        || runtime.sampled
     {
         return Err(Error::StatementMismatch);
     }
@@ -1331,25 +1372,19 @@ mod tests {
         let salts = tree_salts(&plan);
         let notice = fold_mask_notice(&shape).unwrap();
         let oracle = MaskOracle::prover_view(9, 1, &notice);
-        let table = Digest([7; 32]);
-        let mut hiding = HidingState::new(table, 1, 8);
         // The mask must have been sent under the id the verifier checks.
         assert!(fold_start_prove(
             &shape, &mut mask, &source, &oracle, &groups, plan, &salts,
-            &mut hiding, table, 1, 4
         )
         .is_err());
         mask.sent_as(9).unwrap();
         let start = fold_start_prove(
             &shape, &mut mask, &source, &oracle, &groups, plan, &salts,
-            &mut hiding, table, 1, 4,
         )
         .unwrap();
         assert!(mask.used());
-        assert_eq!(hiding.used(), 4);
         assert!(fold_start_prove(
             &shape, &mut mask, &source, &oracle, &groups, plan, &salts,
-            &mut hiding, table, 1, 4
         )
         .is_err());
         assert_ne!(start.message.root, Digest::ZERO);
@@ -1375,6 +1410,11 @@ mod tests {
                 id: 9,
                 root: start.message.root,
                 sampled: false,
+                main_rows: 0,
+                mask_rows: start.message.notice.mask_rows,
+                mask_code: start.message.notice.mask_code,
+                answers: 0,
+                leaf_class: start.message.notice.leaf_class,
             }],
         };
         fold_start_verify(&shape, &start.message, &statement, &runtime).unwrap();
@@ -1389,6 +1429,11 @@ mod tests {
                 id: 9,
                 root: start.message.root,
                 sampled: true,
+                main_rows: 0,
+                mask_rows: start.message.notice.mask_rows,
+                mask_code: start.message.notice.mask_code,
+                answers: 0,
+                leaf_class: start.message.notice.leaf_class,
             }],
         };
         assert!(fold_start_verify(
@@ -1404,6 +1449,11 @@ mod tests {
                 id: 9,
                 root: Digest([4; 32]),
                 sampled: false,
+                main_rows: 0,
+                mask_rows: start.message.notice.mask_rows,
+                mask_code: start.message.notice.mask_code,
+                answers: 0,
+                leaf_class: start.message.notice.leaf_class,
             }],
         };
         assert!(fold_start_verify(
@@ -1447,10 +1497,6 @@ mod tests {
             &groups,
             plan,
             &salts,
-            &mut hiding,
-            table,
-            1,
-            4
         )
         .is_err());
     }
