@@ -1134,4 +1134,137 @@ mod tests {
         }
         assert_eq!(row.evaluate(&witness).unwrap(), manual);
     }
+
+    #[test]
+    fn record_and_column_rows_handle_three_rows_with_rows_high() {
+        let mut shape = shape();
+        shape.rows_high = true;
+        shape.u.code = build_code_plan(4, 10, 1).unwrap();
+        shape.u.main_rows = 3;
+        shape.tree = RuntimeTreePlan {
+            tree_number: 5,
+            leaf_class: 2,
+            log_n: 4,
+            log_n_zk: 0,
+            parts: vec![RuntimeTreePart {
+                main_symbols: 9,
+                mask_symbols: 0,
+            }],
+            salt_bytes: LEAF_SALT_MIN_BYTES,
+            run: Digest([9; 32]),
+            configuration: Digest([7; 32]),
+        };
+        let registry = registry(&shape);
+        let name = index_name(&Digest([4; 32]), &shape.index, &Digest([7; 32]));
+        let seeds = record_seeds(&shape.index, &name, 1).unwrap();
+        let record = IndexRecord {
+            y: vec![
+                Fp3::from_u64(11),
+                Fp3::from_u64(13),
+                Fp3::from_u64(17),
+                Fp3::from_u64(19),
+            ],
+        };
+        let eq_gamma = vec![
+            Fp3::from_u64(2),
+            Fp3::from_u64(3),
+            Fp3::from_u64(5),
+            Fp3::from_u64(7),
+        ];
+        let row = record_row(&shape, &registry, &record, &name, &seeds, &eq_gamma, 0).unwrap();
+        let place_bits = shape.u.code.log_ell();
+        let row_bits = 2u32;
+        let index_of = |entry: u64| (entry >> place_bits) | ((entry & ((1u64 << place_bits) - 1)) << row_bits);
+        let mut expected = vec![Fp3::ZERO; (shape.u.main_rows * shape.u.code.ell) as usize];
+        expected[index_of(0) as usize] = eq_manual(0, &seeds[0].z, shape.index.cube_bits());
+        for coefficient in 0..E_DEGREE {
+            let place = shape.index.pad_place(0, coefficient);
+            expected[index_of(place) as usize] = seeds[0].beta.mul(&theta(coefficient));
+        }
+        assert_eq!(row.main, expected);
+        let witness = witness(&shape);
+        let mut manual = Fp3::ZERO;
+        for (coefficient, entry) in expected.iter().zip(&witness.main) {
+            manual = manual.add(&coefficient.mul(entry));
+        }
+        assert_eq!(row.evaluate(&witness).unwrap(), manual);
+        assert!(vector_index(&shape, 8).is_err());
+
+        // A column row under the same transposed layout.
+        let column = column_values(&shape);
+        let column_row_value =
+            column_row(&shape, &registry, 2, &column, &eq_gamma).unwrap();
+        let code = &shape.index.code;
+        let mut expected = vec![Fp3::ZERO; witness.main.len()];
+        for entry in 0..code.ell {
+            let mut message = vec![Fp::ZERO; code.ell as usize];
+            message[entry as usize] = Fp::ONE;
+            let tail = vec![Fp::ZERO; code.r as usize];
+            expected[index_of(entry) as usize] =
+                Fp3::from_base(encode_symbol(code, &message, &tail, 2));
+        }
+        let first = tail_first(code).unwrap();
+        for entry in 0..code.r {
+            let message = vec![Fp::ZERO; code.ell as usize];
+            let mut tail = vec![Fp::ZERO; code.r as usize];
+            tail[entry as usize] = Fp::ONE;
+            expected[index_of(first + entry) as usize] =
+                Fp3::from_base(encode_symbol(code, &message, &tail, 2));
+        }
+        assert_eq!(column_row_value.main, expected);
+        let mut column_target = Fp3::ZERO;
+        for (weight, value) in eq_gamma.iter().zip(&column) {
+            column_target = column_target.add(&weight.mul(value));
+        }
+        assert_eq!(column_row_value.target, column_target);
+        let mut manual = Fp3::ZERO;
+        for (coefficient, entry) in expected.iter().zip(&witness.main) {
+            manual = manual.add(&coefficient.mul(entry));
+        }
+        assert_eq!(column_row_value.evaluate(&witness).unwrap(), manual);
+    }
+
+    #[test]
+    fn record_row_handles_two_answers_and_target_answer_one() {
+        let mut shape = shape();
+        shape.index.code = build_code_plan(4, 8, 2).unwrap();
+        shape.index.answers = 2;
+        let registry = registry(&shape);
+        let name = index_name(&Digest([4; 32]), &shape.index, &Digest([7; 32]));
+        let seeds = record_seeds(&shape.index, &name, 2).unwrap();
+        let record = IndexRecord {
+            y: (0..8).map(|index| Fp3::from_u64(20 + index)).collect(),
+        };
+        let eq_gamma = vec![
+            Fp3::from_u64(2),
+            Fp3::from_u64(3),
+            Fp3::from_u64(5),
+            Fp3::from_u64(7),
+        ];
+        let row = record_row(&shape, &registry, &record, &name, &seeds, &eq_gamma, 1).unwrap();
+        let bits = shape.index.cube_bits();
+        let mut expected = vec![Fp3::ZERO; (shape.u.main_rows * shape.u.code.ell) as usize];
+        for entry in 0..shape.index.code.ell {
+            expected[entry as usize] = eq_manual(entry, &seeds[1].z, bits);
+        }
+        for coefficient in 0..E_DEGREE {
+            let answer_zero = shape.index.pad_place(0, coefficient);
+            let answer_one = shape.index.pad_place(1, coefficient);
+            expected[answer_zero as usize] = Fp3::ZERO;
+            expected[answer_one as usize] = seeds[1].beta.mul(&theta(coefficient));
+        }
+        assert_eq!(row.main, expected);
+        let witness = witness(&shape);
+        let mut manual = Fp3::ZERO;
+        for (coefficient, entry) in expected.iter().zip(&witness.main) {
+            manual = manual.add(&coefficient.mul(entry));
+        }
+        assert_eq!(row.evaluate(&witness).unwrap(), manual);
+        let mut target = Fp3::ZERO;
+        for (row_index, weight) in eq_gamma.iter().enumerate() {
+            target = target.add(&weight.mul(&record.y[row_index * 2 + 1]));
+        }
+        assert_eq!(row.target, target);
+        assert!(record_row(&shape, &registry, &record, &name, &seeds, &eq_gamma, 2).is_err());
+    }
 }
