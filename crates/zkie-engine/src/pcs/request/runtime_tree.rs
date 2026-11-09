@@ -498,30 +498,110 @@ impl RuntimeTreePlan {
 pub struct RuntimeTreeLay {
     pub tree: Vec<u32>,
     pub part: Vec<u32>,
+    pub oracles: Vec<RuntimeOracleShape>,
     pub plans: Vec<RuntimeTreePlan>,
 }
 
 impl RuntimeTreeLay {
+    /// The layout is complete and consistent with the trusted oracle shapes
+    /// it was built from: every (tree, part) appears exactly once, every part
+    /// is used, tree numbers are unique, main trees come before mask-only
+    /// trees, and each part's class, depth and widths equal its oracle's.
     pub fn fault(&self) -> Option<&'static str> {
-        if self.tree.len() != self.part.len() {
-            return Some("the runtime layout has an entry for each oracle only");
+        if self.tree.len() != self.part.len() || self.tree.len() != self.oracles.len() {
+            return Some("the runtime layout has one tree and part for each oracle only");
         }
-        for (tree, part) in self.tree.iter().zip(&self.part) {
-            let plan = match self.plans.get(*tree as usize) {
-                Some(plan) => plan,
-                None => return Some("the runtime layout names a tree it does not hold"),
-            };
-            if *part as usize >= plan.parts.len() {
-                return Some("the runtime layout names a part the tree does not hold");
-            }
+        if self.plans.is_empty() != self.oracles.is_empty() {
+            return Some("a runtime layout without oracles has no trees");
+        }
+        for (index, plan) in self.plans.iter().enumerate() {
             if plan.fault().is_some() {
                 return Some("a runtime layout tree is not a tree");
             }
+            if self.plans[..index]
+                .iter()
+                .any(|other| other.tree_number == plan.tree_number)
+            {
+                return Some("the runtime layout repeats a tree number");
+            }
         }
-        if self.plans.is_empty() != self.tree.is_empty() {
-            return Some("a runtime layout without oracles has no trees");
+        let mut mask_only_seen = false;
+        for plan in &self.plans {
+            if plan.has_main() {
+                if mask_only_seen {
+                    return Some("a main tree follows a mask-only tree");
+                }
+            } else {
+                mask_only_seen = true;
+            }
+        }
+        let mut used: Vec<Vec<bool>> = self
+            .plans
+            .iter()
+            .map(|plan| vec![false; plan.parts.len()])
+            .collect();
+        for (index, oracle) in self.oracles.iter().enumerate() {
+            if oracle_fault(oracle).is_some() {
+                return Some("a runtime layout oracle is not an oracle shape");
+            }
+            let tree = self.tree[index] as usize;
+            let part = self.part[index] as usize;
+            let plan = match self.plans.get(tree) {
+                Some(plan) => plan,
+                None => return Some("the runtime layout names a tree it does not hold"),
+            };
+            if part >= plan.parts.len() {
+                return Some("the runtime layout names a part the tree does not hold");
+            }
+            if used[tree][part] {
+                return Some("the runtime layout names a part twice");
+            }
+            used[tree][part] = true;
+            if plan.leaf_class != oracle.leaf_class {
+                return Some("a runtime layout tree has another leaf class than its oracle");
+            }
+            let main_symbols = oracle
+                .main_rows
+                .checked_mul(oracle.main_deg as u64)
+                .ok_or(Error::ResourceLimit)
+                .ok()?;
+            let mask_symbols = oracle
+                .mask_rows
+                .checked_mul(E_DEGREE as u64)
+                .ok_or(Error::ResourceLimit)
+                .ok()?;
+            if plan.parts[part].main_symbols != main_symbols
+                || plan.parts[part].mask_symbols != mask_symbols
+            {
+                return Some("a runtime layout part has other widths than its oracle");
+            }
+            if oracle.main_rows > 0 && plan.log_n != oracle.base_log_n {
+                return Some("a runtime layout main tree has another depth than its oracle");
+            }
+            if oracle.mask_rows > 0 && plan.log_n_zk != oracle.mask_log_n {
+                return Some("a runtime layout mask tree has another depth than its oracle");
+            }
+        }
+        for (tree, plan) in self.plans.iter().enumerate() {
+            if used[tree].iter().any(|used| !used) || plan.parts.len() != used[tree].len() {
+                return Some("a runtime layout leaves a part unused");
+            }
+            if !plan.has_main() && self.oracles.iter().enumerate().any(|(index, oracle)| {
+                self.tree[index] as usize == tree && oracle.main_rows > 0
+            }) {
+                return Some("a runtime mask-only tree holds a main oracle");
+            }
         }
         None
+    }
+
+    /// A layout received from elsewhere must equal the verifier's own trusted
+    /// oracle shapes before it is used; the verifier rebuilds or checks it.
+    pub fn check_against(&self, oracles: &[RuntimeOracleShape]) -> Option<&'static str> {
+        if self.oracles != oracles {
+            return Some("the runtime layout was not built from these trusted oracle shapes");
+        }
+        self.fault()
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -531,6 +611,15 @@ impl RuntimeTreeLay {
             writer.put_u64(*tree as u64);
             writer.put_u64(*part as u64);
         }
+        writer.put_u64(self.oracles.len() as u64);
+        for oracle in &self.oracles {
+            writer.put_u64(oracle.leaf_class as u64);
+            writer.put_u64(oracle.base_log_n as u64);
+            writer.put_u64(oracle.main_rows);
+            writer.put_u64(oracle.main_deg as u64);
+            writer.put_u64(oracle.mask_rows);
+            writer.put_u64(oracle.mask_log_n as u64);
+        }
         writer.put_u64(self.plans.len() as u64);
         for plan in &self.plans {
             let bytes = plan.encode();
@@ -539,6 +628,24 @@ impl RuntimeTreeLay {
         }
         writer.into_bytes()
     }
+}
+
+fn oracle_fault(oracle: &RuntimeOracleShape) -> Option<&'static str> {
+    if oracle.main_rows == 0 && oracle.mask_rows == 0 {
+        return Some("a runtime oracle has no row");
+    }
+    if oracle.main_rows > 0 {
+        if oracle.main_deg != 1 && oracle.main_deg != E_DEGREE as u32 {
+            return Some("a runtime oracle's main rows are over the wrong field");
+        }
+        if oracle.base_log_n < 1 || oracle.base_log_n > 60 {
+            return Some("a runtime oracle's base depth is not a tree");
+        }
+    }
+    if oracle.mask_rows > 0 && (oracle.mask_log_n < 1 || oracle.mask_log_n > 60) {
+        return Some("a runtime oracle's mask depth is not a tree");
+    }
+    None
 }
 
 /// Lay out one prover message's runtime oracles exactly by class and depth:
@@ -555,18 +662,7 @@ pub fn lay_runtime_trees(
     configuration: Digest,
 ) -> Result<RuntimeTreeLay> {
     for oracle in oracles {
-        if oracle.main_rows == 0 && oracle.mask_rows == 0 {
-            return Err(Error::InvalidConfig);
-        }
-        if oracle.main_rows > 0 {
-            if oracle.main_deg != 1 && oracle.main_deg != E_DEGREE as u32 {
-                return Err(Error::InvalidConfig);
-            }
-            if oracle.base_log_n < 1 || oracle.base_log_n > 60 {
-                return Err(Error::InvalidConfig);
-            }
-        }
-        if oracle.mask_rows > 0 && (oracle.mask_log_n < 1 || oracle.mask_log_n > 60) {
+        if oracle_fault(oracle).is_some() {
             return Err(Error::InvalidConfig);
         }
     }
@@ -663,7 +759,12 @@ pub fn lay_runtime_trees(
             return Err(Error::InvalidConfig);
         }
     }
-    let lay = RuntimeTreeLay { tree, part, plans };
+    let lay = RuntimeTreeLay {
+        tree,
+        part,
+        oracles: oracles.to_vec(),
+        plans,
+    };
     if lay.fault().is_some() {
         return Err(Error::InvalidConfig);
     }
@@ -922,6 +1023,35 @@ mod tests {
             Digest([7; 32])
         )
         .is_err());
+    }
+
+    #[test]
+    fn runtime_layout_tampers_are_rejected() {
+        let oracles = [
+            oracle(1, 4, 4, 1, 2, 3),
+            oracle(1, 0, 0, 1, 4, 3),
+            oracle(2, 4, 4, 1, 0, 0),
+        ];
+        let lay = layout(&oracles, 0);
+        assert!(lay.fault().is_none());
+        let mut bad = lay.clone();
+        bad.tree[1] = 0;
+        bad.part[1] = 0;
+        assert!(bad.fault().is_some());
+        let mut bad = lay.clone();
+        bad.plans[1].tree_number = bad.plans[0].tree_number;
+        assert!(bad.fault().is_some());
+        let mut bad = lay.clone();
+        bad.oracles[0].leaf_class = 9;
+        assert!(bad.fault().is_some());
+        let mut bad = lay.clone();
+        bad.oracles[0].main_rows = 5;
+        assert!(bad.fault().is_some());
+        let mut bad = lay.clone();
+        bad.oracles[1].mask_log_n = 4;
+        assert!(bad.fault().is_some());
+        assert!(lay.check_against(&oracles).is_none());
+        assert!(lay.check_against(&[oracles[0]]).is_some());
     }
 
     #[test]
