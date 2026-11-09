@@ -325,6 +325,351 @@ pub fn verify_mask_columns(
     Ok(symbols)
 }
 
+/// One oracle message's planned shape for a runtime tree layout. The plan
+/// supplies the numbers; nothing here comes from the proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeOracleShape {
+    pub leaf_class: u32,
+    /// The base code's depth; used only when the message has main rows.
+    pub base_log_n: u32,
+    pub main_rows: u64,
+    /// The main rows are over the base field (1) or its cubic extension (3).
+    pub main_deg: u32,
+    pub mask_rows: u64,
+    /// The mask code's depth; used only when the message has mask rows.
+    pub mask_log_n: u32,
+}
+
+/// One part's column widths in a runtime tree: its main rows and mask rows in
+/// base-field symbols. Parts are appended in sending order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeTreePart {
+    pub main_symbols: u64,
+    pub mask_symbols: u64,
+}
+
+/// A trusted plan's layout of one runtime tree. A leaf's column holds every
+/// part's main symbols in part order, then every part's mask symbols in part
+/// order, then one salt. The tree is runtime-only: leaves start from `run`
+/// under the runtime leaf domain and inner nodes from `configuration`; a
+/// stored table keeps its own domain and configuration and is never laid out
+/// here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeTreePlan {
+    pub tree_number: u64,
+    pub leaf_class: u32,
+    pub log_n: u32,
+    /// The mask rows' depth, at most the main depth; a mask-only tree has
+    /// `log_n == log_n_zk`.
+    pub log_n_zk: u32,
+    pub parts: Vec<RuntimeTreePart>,
+    pub salt_bytes: usize,
+    pub run: Digest,
+    pub configuration: Digest,
+}
+
+impl RuntimeTreePlan {
+    pub fn main_width(&self) -> Result<u64> {
+        let mut width = 0u64;
+        for part in &self.parts {
+            width = width
+                .checked_add(part.main_symbols)
+                .ok_or(Error::ResourceLimit)?;
+        }
+        Ok(width)
+    }
+
+    pub fn mask_width(&self) -> Result<u64> {
+        let mut width = 0u64;
+        for part in &self.parts {
+            width = width
+                .checked_add(part.mask_symbols)
+                .ok_or(Error::ResourceLimit)?;
+        }
+        Ok(width)
+    }
+
+    pub fn width(&self) -> Result<u64> {
+        self.main_width()?
+            .checked_add(self.mask_width()?)
+            .ok_or(Error::ResourceLimit)
+    }
+
+    pub fn has_main(&self) -> bool {
+        self.parts.iter().any(|part| part.main_symbols > 0)
+    }
+
+    pub fn has_mask(&self) -> bool {
+        self.parts.iter().any(|part| part.mask_symbols > 0)
+    }
+
+    /// The offset of a part's main symbols from the start of the main section.
+    pub fn main_offset(&self, part: usize) -> Result<u64> {
+        if part >= self.parts.len() {
+            return Err(Error::InvalidIndex);
+        }
+        let mut offset = 0u64;
+        for entry in &self.parts[..part] {
+            offset = offset
+                .checked_add(entry.main_symbols)
+                .ok_or(Error::ResourceLimit)?;
+        }
+        Ok(offset)
+    }
+
+    /// The offset of a part's mask symbols from the start of the mask section
+    /// (the mask section starts after every main symbol).
+    pub fn mask_offset(&self, part: usize) -> Result<u64> {
+        if part >= self.parts.len() {
+            return Err(Error::InvalidIndex);
+        }
+        let mut offset = 0u64;
+        for entry in &self.parts[..part] {
+            offset = offset
+                .checked_add(entry.mask_symbols)
+                .ok_or(Error::ResourceLimit)?;
+        }
+        Ok(offset)
+    }
+
+    pub fn fault(&self) -> Option<&'static str> {
+        if self.tree_number >= (1u64 << 16) {
+            return Some("the runtime tree number does not fit the tag");
+        }
+        if self.log_n < 1 || self.log_n > 60 {
+            return Some("the runtime tree depth is not a tree");
+        }
+        if self.parts.is_empty() || (!self.has_main() && !self.has_mask()) {
+            return Some("the runtime tree has no part or no symbol");
+        }
+        if self.has_mask() && (self.log_n_zk < 1 || self.log_n_zk > self.log_n) {
+            return Some("the runtime tree mask rows do not fit under its main rows");
+        }
+        if !self.has_main() && self.log_n != self.log_n_zk {
+            return Some("a mask-only runtime tree has two depths");
+        }
+        let width = match self.width() {
+            Ok(width) => width,
+            Err(_) => return Some("the runtime tree width overflows"),
+        };
+        if width >> 24 != 0 {
+            return Some("the runtime tree column is too wide");
+        }
+        if self.salt_bytes < LEAF_SALT_MIN_BYTES || self.salt_bytes > LEAF_SALT_MAX_BYTES {
+            return Some("the runtime tree salt length is not admitted");
+        }
+        if self.salt_bytes % 8 != 0 {
+            return Some("the runtime tree salt length is not a multiple of eight");
+        }
+        if self.run == Digest::ZERO || self.configuration == Digest::ZERO {
+            return Some("the runtime tree has no run or configuration start");
+        }
+        None
+    }
+
+    pub fn columns(&self) -> u64 {
+        1u64 << self.log_n
+    }
+
+    /// Canonical bytes for binding this tree into a plan or first query.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut writer = CanonicalWriter::new();
+        writer.put_u64(self.tree_number);
+        writer.put_u64(self.leaf_class as u64);
+        writer.put_u64(self.log_n as u64);
+        writer.put_u64(self.log_n_zk as u64);
+        writer.put_u64(self.parts.len() as u64);
+        for part in &self.parts {
+            writer.put_u64(part.main_symbols);
+            writer.put_u64(part.mask_symbols);
+        }
+        writer.put_u64(self.salt_bytes as u64);
+        writer.put_bytes(&self.run.0);
+        writer.put_bytes(&self.configuration.0);
+        writer.into_bytes()
+    }
+}
+
+/// The verifier's layout of a prover message's runtime oracles: each oracle's
+/// tree and part, and the trees in creation order. Trees with main rows are
+/// numbered first; mask-only trees follow. The proof never supplies these
+/// numbers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeTreeLay {
+    pub tree: Vec<u32>,
+    pub part: Vec<u32>,
+    pub plans: Vec<RuntimeTreePlan>,
+}
+
+impl RuntimeTreeLay {
+    pub fn fault(&self) -> Option<&'static str> {
+        if self.tree.len() != self.part.len() {
+            return Some("the runtime layout has an entry for each oracle only");
+        }
+        for (tree, part) in self.tree.iter().zip(&self.part) {
+            let plan = match self.plans.get(*tree as usize) {
+                Some(plan) => plan,
+                None => return Some("the runtime layout names a tree it does not hold"),
+            };
+            if *part as usize >= plan.parts.len() {
+                return Some("the runtime layout names a part the tree does not hold");
+            }
+            if plan.fault().is_some() {
+                return Some("a runtime layout tree is not a tree");
+            }
+        }
+        if self.plans.is_empty() != self.tree.is_empty() {
+            return Some("a runtime layout without oracles has no trees");
+        }
+        None
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut writer = CanonicalWriter::new();
+        writer.put_u64(self.tree.len() as u64);
+        for (tree, part) in self.tree.iter().zip(&self.part) {
+            writer.put_u64(*tree as u64);
+            writer.put_u64(*part as u64);
+        }
+        writer.put_u64(self.plans.len() as u64);
+        for plan in &self.plans {
+            let bytes = plan.encode();
+            writer.put_u64(bytes.len() as u64);
+            writer.put_bytes(&bytes);
+        }
+        writer.into_bytes()
+    }
+}
+
+/// Lay out one prover message's runtime oracles exactly by class and depth:
+/// main-row oracles of one leaf class and one base depth share a tree; a
+/// mask-only oracle joins the first tree of its class, or forms a mask-only
+/// tree of its own; parts follow the sending order. All mask rows in one tree
+/// must have one depth, and mask rows cannot be deeper than the main rows.
+/// Runtime-only: the caller must not pass a stored table's shape.
+pub fn lay_runtime_trees(
+    oracles: &[RuntimeOracleShape],
+    first_tree_number: u64,
+    salt_bytes: usize,
+    run: Digest,
+    configuration: Digest,
+) -> Result<RuntimeTreeLay> {
+    for oracle in oracles {
+        if oracle.main_rows == 0 && oracle.mask_rows == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        if oracle.main_rows > 0 {
+            if oracle.main_deg != 1 && oracle.main_deg != E_DEGREE as u32 {
+                return Err(Error::InvalidConfig);
+            }
+            if oracle.base_log_n < 1 || oracle.base_log_n > 60 {
+                return Err(Error::InvalidConfig);
+            }
+        }
+        if oracle.mask_rows > 0 && (oracle.mask_log_n < 1 || oracle.mask_log_n > 60) {
+            return Err(Error::InvalidConfig);
+        }
+    }
+    if first_tree_number >= (1u64 << 16) {
+        return Err(Error::InvalidConfig);
+    }
+    let mut tree = vec![0u32; oracles.len()];
+    let mut part = vec![0u32; oracles.len()];
+    let mut plans: Vec<RuntimeTreePlan> = Vec::new();
+    let new_plan = |number: u64, leaf_class: u32, log_n: u32| RuntimeTreePlan {
+        tree_number: number,
+        leaf_class,
+        log_n,
+        log_n_zk: 0,
+        parts: Vec::new(),
+        salt_bytes,
+        run,
+        configuration,
+    };
+    // Main-row oracles first: one tree per (leaf class, base depth), in the
+    // order the first such oracle is sent.
+    for (index, oracle) in oracles.iter().enumerate() {
+        if oracle.main_rows == 0 {
+            continue;
+        }
+        let mut at = 0usize;
+        while at < plans.len()
+            && !(plans[at].leaf_class == oracle.leaf_class
+                && plans[at].log_n == oracle.base_log_n)
+        {
+            at += 1;
+        }
+        if at == plans.len() {
+            let number = first_tree_number
+                .checked_add(plans.len() as u64)
+                .ok_or(Error::ResourceLimit)?;
+            if number >= (1u64 << 16) {
+                return Err(Error::ResourceLimit);
+            }
+            plans.push(new_plan(number, oracle.leaf_class, oracle.base_log_n));
+        }
+        tree[index] = at as u32;
+    }
+    // Mask-only oracles join the first tree of their class, or make a
+    // mask-only tree (depth set after the parts are known).
+    for (index, oracle) in oracles.iter().enumerate() {
+        if oracle.main_rows != 0 {
+            continue;
+        }
+        let mut at = 0usize;
+        while at < plans.len() && plans[at].leaf_class != oracle.leaf_class {
+            at += 1;
+        }
+        if at == plans.len() {
+            let number = first_tree_number
+                .checked_add(plans.len() as u64)
+                .ok_or(Error::ResourceLimit)?;
+            if number >= (1u64 << 16) {
+                return Err(Error::ResourceLimit);
+            }
+            plans.push(new_plan(number, oracle.leaf_class, 0));
+        }
+        tree[index] = at as u32;
+    }
+    // Parts in sending order, one entry per oracle in its tree.
+    for (index, oracle) in oracles.iter().enumerate() {
+        let at = tree[index] as usize;
+        let plan = &mut plans[at];
+        if oracle.mask_rows > 0 {
+            if plan.has_mask() && plan.log_n_zk != oracle.mask_log_n {
+                return Err(Error::InvalidConfig);
+            }
+            plan.log_n_zk = oracle.mask_log_n;
+        }
+        part[index] = u32::try_from(plan.parts.len()).map_err(|_| Error::ResourceLimit)?;
+        let main_symbols = oracle
+            .main_rows
+            .checked_mul(oracle.main_deg as u64)
+            .ok_or(Error::ResourceLimit)?;
+        let mask_symbols = oracle
+            .mask_rows
+            .checked_mul(E_DEGREE as u64)
+            .ok_or(Error::ResourceLimit)?;
+        plan.parts.push(RuntimeTreePart {
+            main_symbols,
+            mask_symbols,
+        });
+    }
+    for plan in &mut plans {
+        if !plan.has_main() {
+            plan.log_n = plan.log_n_zk;
+        }
+        if plan.fault().is_some() {
+            return Err(Error::InvalidConfig);
+        }
+    }
+    let lay = RuntimeTreeLay { tree, part, plans };
+    if lay.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(lay)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,6 +784,188 @@ mod tests {
         let mut other = tree.plan;
         other.configuration = Digest([6; 32]);
         assert!(verify_mask_columns(&other, &tree.root, &positions, &openings).is_err());
+    }
+
+    fn oracle(
+        leaf_class: u32,
+        base_log_n: u32,
+        main_rows: u64,
+        main_deg: u32,
+        mask_rows: u64,
+        mask_log_n: u32,
+    ) -> RuntimeOracleShape {
+        RuntimeOracleShape {
+            leaf_class,
+            base_log_n,
+            main_rows,
+            main_deg,
+            mask_rows,
+            mask_log_n,
+        }
+    }
+
+    fn part(main_symbols: u64, mask_symbols: u64) -> RuntimeTreePart {
+        RuntimeTreePart {
+            main_symbols,
+            mask_symbols,
+        }
+    }
+
+    fn layout(oracles: &[RuntimeOracleShape], first: u64) -> RuntimeTreeLay {
+        lay_runtime_trees(
+            oracles,
+            first,
+            LEAF_SALT_MIN_BYTES,
+            Digest([9; 32]),
+            Digest([7; 32]),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn runtime_layout_groups_same_class_and_depth() {
+        let oracles = [
+            oracle(1, 4, 4, 1, 2, 3),
+            oracle(1, 4, 8, 3, 0, 0),
+            oracle(1, 0, 0, 1, 4, 3),
+            oracle(2, 0, 0, 1, 8, 5),
+        ];
+        let lay = layout(&oracles, 5);
+        assert_eq!(lay.tree, vec![0, 0, 0, 1]);
+        assert_eq!(lay.part, vec![0, 1, 2, 0]);
+        assert_eq!(lay.plans.len(), 2);
+        assert_eq!(lay.plans[0].tree_number, 5);
+        assert_eq!(lay.plans[0].log_n, 4);
+        assert_eq!(lay.plans[0].log_n_zk, 3);
+        assert_eq!(
+            lay.plans[0].parts,
+            vec![part(4, 6), part(24, 0), part(0, 12)]
+        );
+        assert_eq!(lay.plans[0].main_width().unwrap(), 28);
+        assert_eq!(lay.plans[0].mask_width().unwrap(), 18);
+        assert_eq!(lay.plans[0].width().unwrap(), 46);
+        assert_eq!(lay.plans[0].main_offset(1).unwrap(), 4);
+        assert_eq!(lay.plans[0].mask_offset(2).unwrap(), 6);
+        assert_eq!(lay.plans[1].tree_number, 6);
+        assert_eq!(lay.plans[1].log_n, 5);
+        assert_eq!(lay.plans[1].log_n_zk, 5);
+        assert_eq!(lay.plans[1].parts, vec![part(0, 24)]);
+        assert!(lay.fault().is_none());
+    }
+
+    #[test]
+    fn runtime_layout_separates_depth_and_class() {
+        let oracles = [
+            oracle(1, 4, 4, 1, 0, 0),
+            oracle(1, 5, 4, 1, 0, 0),
+            oracle(2, 4, 4, 1, 0, 0),
+        ];
+        let lay = layout(&oracles, 0);
+        assert_eq!(lay.tree, vec![0, 1, 2]);
+        assert_eq!(lay.part, vec![0, 0, 0]);
+        assert_eq!(lay.plans.len(), 3);
+        assert_eq!(lay.plans[0].log_n, 4);
+        assert_eq!(lay.plans[1].log_n, 5);
+        assert_eq!(lay.plans[2].log_n, 4);
+    }
+
+    #[test]
+    fn runtime_layout_faults_are_rejected() {
+        assert!(lay_runtime_trees(
+            &[oracle(1, 4, 0, 1, 0, 0)],
+            0,
+            LEAF_SALT_MIN_BYTES,
+            Digest([9; 32]),
+            Digest([7; 32])
+        )
+        .is_err());
+        assert!(lay_runtime_trees(
+            &[oracle(1, 4, 4, 2, 0, 0)],
+            0,
+            LEAF_SALT_MIN_BYTES,
+            Digest([9; 32]),
+            Digest([7; 32])
+        )
+        .is_err());
+        assert!(lay_runtime_trees(
+            &[oracle(1, 0, 4, 1, 0, 0)],
+            0,
+            LEAF_SALT_MIN_BYTES,
+            Digest([9; 32]),
+            Digest([7; 32])
+        )
+        .is_err());
+        // Mask rows of two lengths cannot share a tree.
+        assert!(lay_runtime_trees(
+            &[oracle(1, 4, 4, 1, 2, 3), oracle(1, 4, 4, 1, 2, 4)],
+            0,
+            LEAF_SALT_MIN_BYTES,
+            Digest([9; 32]),
+            Digest([7; 32])
+        )
+        .is_err());
+        // Mask rows cannot be deeper than the main rows.
+        assert!(lay_runtime_trees(
+            &[oracle(1, 3, 4, 1, 2, 4)],
+            0,
+            LEAF_SALT_MIN_BYTES,
+            Digest([9; 32]),
+            Digest([7; 32])
+        )
+        .is_err());
+        // The next tree number must fit the tag.
+        assert!(lay_runtime_trees(
+            &[oracle(1, 4, 4, 1, 0, 0), oracle(2, 4, 4, 1, 0, 0)],
+            (1u64 << 16) - 1,
+            LEAF_SALT_MIN_BYTES,
+            Digest([9; 32]),
+            Digest([7; 32])
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn runtime_layout_encoding_binds_classes_depths_and_parts() {
+        let oracles = [oracle(1, 4, 4, 1, 2, 3), oracle(2, 0, 0, 1, 4, 3)];
+        let first = layout(&oracles, 0);
+        let again = layout(&oracles, 0);
+        assert_eq!(first.encode(), again.encode());
+        let mut changed = oracles;
+        changed[0].leaf_class = 3;
+        assert_ne!(first.encode(), layout(&changed, 0).encode());
+        let mut changed = oracles;
+        changed[0].main_rows = 5;
+        assert_ne!(first.encode(), layout(&changed, 0).encode());
+        let mut changed = oracles;
+        changed[1].mask_log_n = 4;
+        assert_ne!(first.encode(), layout(&changed, 0).encode());
+    }
+
+    #[test]
+    fn runtime_tree_plan_shape_faults_are_rejected() {
+        let lay = layout(&[oracle(1, 4, 4, 1, 2, 3)], 0);
+        let base = &lay.plans[0];
+        assert!(base.fault().is_none());
+        let mut bad = base.clone();
+        bad.log_n_zk = 5;
+        assert!(bad.fault().is_some());
+        let mut bad = base.clone();
+        bad.parts[0].main_symbols = 1u64 << 24;
+        assert!(bad.fault().is_some());
+        let mut bad = base.clone();
+        bad.salt_bytes = LEAF_SALT_MIN_BYTES - 1;
+        assert!(bad.fault().is_some());
+        let mut bad = base.clone();
+        bad.run = Digest::ZERO;
+        assert!(bad.fault().is_some());
+        let mut mask_only = layout(&[oracle(1, 0, 0, 1, 2, 3)], 0)
+            .plans[0]
+            .clone();
+        assert!(mask_only.fault().is_none());
+        mask_only.log_n = 4;
+        assert!(mask_only.fault().is_some());
+        assert!(base.main_offset(1).is_err());
+        assert!(base.mask_offset(1).is_err());
     }
 
     #[test]
