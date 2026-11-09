@@ -351,14 +351,16 @@ impl GuRegistry {
 /// oracle, group, tree, part and layout; the registry supplies the received
 /// root. The membership records the dynamic join and rejects a second join,
 /// a static member with the same oracle number, another group/code/layout or
-/// a pending row that names another oracle or group. The statement and layout
-/// sources are trusted fixtures in this isolated layer; this is not a
-/// production statement-authentication claim.
+/// a pending row that names another oracle or group, and a G_u oracle number
+/// equal to the group's fresh mask id. The statement and layout sources are
+/// trusted fixtures in this isolated layer; this is not a production
+/// statement-authentication claim.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GuMembership {
     pub group: u64,
     pub code: CodeParams,
     pub mask_code: Option<CodeParams>,
+    pub fresh: Option<u64>,
     pub tree_number: u64,
     pub part: u32,
     pub members: Vec<u64>,
@@ -384,6 +386,9 @@ impl GuMembership {
         if code != shape.u.code || group.mask_code != shape.u.mask_code {
             return Err(Error::StatementMismatch);
         }
+        if group.fresh == Some(shape.oracle) {
+            return Err(Error::StatementMismatch);
+        }
         let mut members = group.members.clone();
         members.sort_unstable();
         if members.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -393,6 +398,7 @@ impl GuMembership {
             group: shape.group,
             code,
             mask_code: shape.u.mask_code,
+            fresh: group.fresh,
             tree_number: shape.tree.tree_number,
             part: shape.part,
             members,
@@ -414,6 +420,7 @@ impl GuMembership {
         if shape.group != self.group
             || shape.u.code != self.code
             || shape.u.mask_code != self.mask_code
+            || self.fresh == Some(shape.oracle)
             || shape.tree.tree_number != self.tree_number
             || shape.part != self.part
         {
@@ -438,6 +445,7 @@ impl GuMembership {
         if shape.group != self.group
             || shape.u.code != self.code
             || shape.u.mask_code != self.mask_code
+            || self.fresh == Some(shape.oracle)
             || shape.tree.tree_number != self.tree_number
             || shape.part != self.part
             || self.members.binary_search(&shape.oracle).is_err()
@@ -770,6 +778,10 @@ mod tests {
         duplicate.members = vec![shape.oracle];
         let mut duplicate_membership = GuMembership::new(&duplicate, &shape, &registry).unwrap();
         assert!(duplicate_membership.join(&shape, &registry).is_err());
+
+        let mut fresh_collision = group.clone();
+        fresh_collision.fresh = Some(shape.oracle);
+        assert!(GuMembership::new(&fresh_collision, &shape, &registry).is_err());
 
         let mut rebound = shape.clone();
         rebound.oracle = 10;

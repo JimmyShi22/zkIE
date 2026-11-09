@@ -1617,6 +1617,20 @@ pub fn fold_start_verify(
     statement: &VerifiedStatement,
     runtime: &RuntimeOracles,
 ) -> Result<()> {
+    fold_start_verify_with_groups(shape, message, statement, runtime, statement.groups())
+}
+
+/// The same FOLD start check with an explicit trusted group view. The overlay
+/// must come from the statement plus the session's registered dynamic members;
+/// it is not a proof-supplied list. This keeps a dynamically joined oracle in
+/// the same group that the FOLD fresh-mask check consumes.
+pub fn fold_start_verify_with_groups(
+    shape: &FoldShape,
+    message: &FoldStartMessage,
+    statement: &VerifiedStatement,
+    runtime: &RuntimeOracles,
+    groups: &VerifiedGroups,
+) -> Result<()> {
     validate_fold_mask_shape(shape)?;
     let tree_plan = statement
         .mask_tree(message.tree_number)
@@ -1653,7 +1667,7 @@ pub fn fold_start_verify(
         return Err(Error::StatementMismatch);
     }
     let oracle = MaskOracle::from_metadata(metadata, runtime.sampled);
-    fold_mask_check(shape, &oracle, statement.groups())?;
+    fold_mask_check(shape, &oracle, groups)?;
     if message.root == Digest::ZERO {
         return Err(Error::InvalidProof);
     }
