@@ -66,4 +66,8 @@ time was 1907 s across the five cases; the per-case wall times are in
 
 ### Cleanup
 
-Pending.
+After this ledger entry was committed, the five `proof.bin` files were
+deleted: 160,598,040,964 bytes (149.57 GiB). The commit directories are
+retained. The trace directory now holds 1.8 MiB and 103 files; no `*.bin` file
+of at least 1 MiB remains. `/data` used space moved from 1,058,984,255,488 to
+898,386,153,472 bytes as reported by df.
