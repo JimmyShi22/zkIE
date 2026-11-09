@@ -18,22 +18,32 @@
 
 use std::collections::BTreeSet;
 
+use zkie_core::artifact::digest_bytes;
 use zkie_core::error::{Error, Result};
+use zkie_core::proof_header::PROOF_VERSION_WORD;
 use zkie_core::types::Digest;
+use zkie_engine::pcs::request::binding::{
+    assemble, BindingCandidate, BindingParameters, BindingStatement,
+};
 use zkie_engine::pcs::request::chain::{Chain, KIND_ALGEBRAIC};
 use zkie_engine::pcs::request::field::Fp;
-use zkie_engine::pcs::request::params::REQUEST_CHAIN_LABEL;
+use zkie_engine::pcs::request::params::{RequestParams, REQUEST_CHAIN_LABEL};
 use zkie_engine::primitives::codec::CanonicalWriter;
 
 use crate::op::OpCode;
 use crate::proof::binding::{verify_opening, OracleId, OracleRegistry};
 use crate::proof::model_commitment::{
-    AssetMeta, AssetOpening, ModelCommitmentPublic, SharedTrace, SharedTraceStep,
+    verify_model_anchor, AssetMeta, AssetOpening, ModelAssetSpec, ModelCommitmentPublic, SharedTrace,
+    SharedTraceStep,
 };
 use crate::proof::plan::{PlanConfigValue, PlanLayout, PlanSource, TracePlan};
 use crate::proof::relations::{verify_op_relation_with_external, OpRelationPublic};
 
 const SESSION_SCHEMA_VERSION: u64 = 1;
+
+/// Candidate protocol identity for this baseline. It is not a final external
+/// protocol identity.
+const SESSION_PROTOCOL_IDENTITY: Digest = Digest([0x5a; 32]);
 
 const GROUP_INPUTS: u64 = 1;
 const GROUP_OUTPUTS: u64 = 2;
@@ -41,6 +51,17 @@ const GROUP_RAW: u64 = 3;
 const GROUP_QUOTIENTS: u64 = 4;
 const GROUP_HELPERS: u64 = 5;
 const GROUP_AUX: u64 = 6;
+
+/// Trusted model metadata from the same static plan source used by production.
+/// Successful anchor verification establishes internal consistency with this
+/// metadata; it does not decide external weight authorization, which remains
+/// deferred.
+pub struct TrustedModel<'a> {
+    pub anchor_id: Digest,
+    pub model_id: Digest,
+    pub parameters_digest: Digest,
+    pub asset_specs: &'a [ModelAssetSpec],
+}
 
 /// One MatMul step selected by the trusted plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,11 +184,7 @@ fn push_digest(words: &mut Vec<u64>, digest: &Digest) {
     words.extend_from_slice(&digest_words(digest));
 }
 
-fn encode_source(
-    writer: &mut CanonicalWriter,
-    public: &ModelCommitmentPublic,
-    source: &PlanSource,
-) -> Result<()> {
+fn encode_plan_source(writer: &mut CanonicalWriter, source: &PlanSource) -> Result<()> {
     match source {
         PlanSource::Prev {
             step,
@@ -183,38 +200,23 @@ fn encode_source(
             path,
             layout: PlanLayout::Flat,
         } => {
-            let meta = public
-                .assets
-                .iter()
-                .find(|asset| asset.path.as_str() == path.as_str())
-                .ok_or(Error::AssetMismatch)?;
             writer.put_u64(2);
             writer.put_bytes(path.as_bytes());
-            writer.put_u64(meta.asset_id);
-            writer.put_u64(meta.element_count);
-            writer.put_u64(meta.row_width as u64);
-            writer.put_u64(meta.rows);
-            writer.put_digest(&meta.start);
-            writer.put_digest(&meta.root);
             Ok(())
         }
         _ => Err(Error::UnsupportedPrimitive),
     }
 }
 
-fn statement_bytes(
-    public: &ModelCommitmentPublic,
+/// Candidate plan summary for the selected step. The item order is
+/// candidate-internal and replaceable.
+fn selected_plan_digest(
     plan: &TracePlan,
     selection: &SelectedMatmulStep,
-) -> Result<Vec<u8>> {
+) -> Result<Digest> {
     let mut writer = CanonicalWriter::new();
     writer.put_u64(SESSION_SCHEMA_VERSION);
     writer.put_u64(plan.model_version as u64);
-    writer.put_digest(&public.anchor.anchor_id);
-    writer.put_digest(&public.anchor.model_commitment);
-    writer.put_digest(&public.anchor.parameters_digest);
-    writer.put_digest(&public.anchor.registry_root);
-    writer.put_u64(public.anchor.leaf_count);
     writer.put_u64(selection.step_index as u64);
     writer.put_u64(OpCode::MatMul as u64);
     for value in &selection.config {
@@ -222,10 +224,36 @@ fn statement_bytes(
     }
     writer.put_u64(selection.inputs.len() as u64);
     for source in &selection.inputs {
-        encode_source(&mut writer, public, source)?;
+        encode_plan_source(&mut writer, source)?;
     }
     writer.put_u64(1);
-    Ok(writer.into_bytes())
+    Ok(digest_bytes(&writer.into_bytes()))
+}
+
+/// Reuses the existing binding candidate to assemble the parameters,
+/// statement and record for this session. The encoding is candidate-internal
+/// and replaceable.
+fn assemble_binding(
+    public: &ModelCommitmentPublic,
+    plan: &TracePlan,
+    selection: &SelectedMatmulStep,
+) -> Result<BindingCandidate> {
+    let plan_digest = selected_plan_digest(plan, selection)?;
+    let request_parameters = RequestParams::default_with_code(4, 4, 0)?;
+    let parameters = BindingParameters::with_plan_parts(
+        PROOF_VERSION_WORD,
+        SESSION_PROTOCOL_IDENTITY,
+        &request_parameters,
+        &[plan_digest],
+    )?;
+    let statement = BindingStatement::new(
+        PROOF_VERSION_WORD,
+        SESSION_PROTOCOL_IDENTITY,
+        plan_digest.0.to_vec(),
+        plan_digest,
+        public.anchor.anchor_id,
+    )?;
+    assemble(&parameters, &statement, None)
 }
 
 fn check_plan_step(step: &SharedTraceStep, selection: &SelectedMatmulStep) -> Result<()> {
@@ -740,7 +768,19 @@ pub fn verify_selected_step(
     trace: &SharedTrace,
     plan: &TracePlan,
     selection: &SelectedMatmulStep,
+    trusted_model: &TrustedModel<'_>,
 ) -> Result<SessionOutcome> {
+    // The caller supplies trusted model metadata from the same static plan
+    // source used by production. This establishes internal consistency with
+    // that metadata before any asset or opening is used; it is not the deferred
+    // external weight authorization decision.
+    verify_model_anchor(
+        public,
+        trusted_model.anchor_id,
+        trusted_model.model_id,
+        trusted_model.parameters_digest,
+        trusted_model.asset_specs,
+    )?;
     let trusted = SelectedMatmulStep::select(plan, selection.step_index)?;
     if trusted != *selection {
         return Err(Error::StatementMismatch);
@@ -757,14 +797,17 @@ pub fn verify_selected_step(
     let external_values = build_external_values(step, &mut assets)?;
     check_relation_shape(selection, step, &external_values)?;
 
-    let parameters = public.anchor.model_commitment;
-    let statement = statement_bytes(public, plan, selection)?;
-    let record = Vec::new();
+    let candidate = assemble_binding(public, plan, selection)?;
     // The same immutable step and asset opening references feed absorption,
     // Merkle authentication and the full recomputation below. No value is
     // re-read or replaced after absorption.
     let words = absorb_step_words(selection, step, &assets)?;
-    let transcript = derive_transcript(&parameters, &statement, &record, &words)?;
+    let transcript = derive_transcript(
+        &candidate.parameters_digest,
+        &candidate.statement_bytes,
+        &candidate.record_bytes,
+        &words,
+    )?;
 
     for asset in &assets {
         verify_asset_authentication(public, asset)?;
@@ -780,9 +823,9 @@ pub fn verify_selected_step(
 
     Ok(SessionOutcome {
         step_index: selection.step_index,
-        parameters,
-        statement_bytes: statement,
-        record_bytes: record,
+        parameters: candidate.parameters_digest,
+        statement_bytes: candidate.statement_bytes,
+        record_bytes: candidate.record_bytes,
         rho: transcript.rho,
         challenge: transcript.challenge,
         assets: assets
@@ -865,6 +908,10 @@ mod tests {
         plan: TracePlan,
         selection: SelectedMatmulStep,
         rhs: Vec<i64>,
+        specs: Vec<ModelAssetSpec>,
+        anchor_id: Digest,
+        model_id: Digest,
+        parameters_digest: Digest,
     }
 
     impl Drop for Fixture {
@@ -917,6 +964,7 @@ mod tests {
         let commitment =
             commit_assets(&root, Digest([1; 32]), Digest([2; 32]), &specs).unwrap();
         let public = ModelCommitmentPublic::from_commitment(&commitment);
+        let anchor_id = public.anchor.anchor_id;
         let assets = AssetStore::open(&commitment).unwrap().open_all().unwrap();
 
         let plan = TracePlan {
@@ -959,15 +1007,26 @@ mod tests {
             plan,
             selection,
             rhs,
+            specs,
+            anchor_id,
+            model_id: Digest([1; 32]),
+            parameters_digest: Digest([2; 32]),
         }
     }
 
     fn verify(fixture: &Fixture) -> Result<SessionOutcome> {
+        let trusted = TrustedModel {
+            anchor_id: fixture.anchor_id,
+            model_id: fixture.model_id,
+            parameters_digest: fixture.parameters_digest,
+            asset_specs: &fixture.specs,
+        };
         verify_selected_step(
             &fixture.public,
             &fixture.trace,
             &fixture.plan,
             &fixture.selection,
+            &trusted,
         )
     }
 
@@ -1015,16 +1074,62 @@ mod tests {
     }
 
     #[test]
+    fn forged_asset_meta_root_is_rejected_before_use() {
+        let mut fixture = self::fixture();
+        fixture.public.assets[0].root.0[0] ^= 1;
+        assert_rejected(&fixture);
+    }
+
+    #[test]
+    fn forged_trusted_anchor_identity_is_rejected() {
+        let mut fixture = self::fixture();
+        fixture.anchor_id.0[0] ^= 1;
+        assert_rejected(&fixture);
+    }
+
+    #[test]
     fn prover_and_verifier_derive_the_same_challenge() {
         let fixture = self::fixture();
         let step = &fixture.trace.steps[1];
         let assets = collect_assets(&fixture.public, &fixture.trace, &fixture.selection, step).unwrap();
         let words = absorb_step_words(&fixture.selection, step, &assets).unwrap();
-        let statement = statement_bytes(&fixture.public, &fixture.plan, &fixture.selection).unwrap();
-        let parameters = fixture.public.anchor.model_commitment;
-        let prover = derive_transcript(&parameters, &statement, &[], &words).unwrap();
-        let verifier = derive_transcript(&parameters, &statement, &[], &words).unwrap();
+        let candidate =
+            assemble_binding(&fixture.public, &fixture.plan, &fixture.selection).unwrap();
+        let prover = derive_transcript(
+            &candidate.parameters_digest,
+            &candidate.statement_bytes,
+            &candidate.record_bytes,
+            &words,
+        )
+        .unwrap();
+        let verifier = derive_transcript(
+            &candidate.parameters_digest,
+            &candidate.statement_bytes,
+            &candidate.record_bytes,
+            &words,
+        )
+        .unwrap();
         assert_eq!(prover, verifier);
+    }
+
+    #[test]
+    fn binding_assembly_outputs_are_used() {
+        let fixture = self::fixture();
+        let candidate =
+            assemble_binding(&fixture.public, &fixture.plan, &fixture.selection).unwrap();
+        let outcome = verify(&fixture).unwrap();
+        assert_eq!(outcome.parameters, candidate.parameters_digest);
+        assert_eq!(outcome.statement_bytes, candidate.statement_bytes);
+        assert_eq!(outcome.record_bytes, candidate.record_bytes);
+        let expected = Chain::begin(
+            REQUEST_CHAIN_LABEL,
+            &candidate.parameters_digest,
+            &candidate.statement_bytes,
+            &candidate.record_bytes,
+            None,
+        )
+        .unwrap();
+        assert_eq!(*expected.value(), candidate.first_query);
     }
 
     #[test]
@@ -1041,10 +1146,22 @@ mod tests {
         let changed = absorb_step_words(&fixture.selection, &changed_step, &changed_assets).unwrap();
         assert_ne!(original, changed);
 
-        let statement = statement_bytes(&fixture.public, &fixture.plan, &fixture.selection).unwrap();
-        let parameters = fixture.public.anchor.model_commitment;
-        let prover_changed = derive_transcript(&parameters, &statement, &[], &changed).unwrap();
-        let verifier_changed = derive_transcript(&parameters, &statement, &[], &changed).unwrap();
+        let candidate =
+            assemble_binding(&fixture.public, &fixture.plan, &fixture.selection).unwrap();
+        let prover_changed = derive_transcript(
+            &candidate.parameters_digest,
+            &candidate.statement_bytes,
+            &candidate.record_bytes,
+            &changed,
+        )
+        .unwrap();
+        let verifier_changed = derive_transcript(
+            &candidate.parameters_digest,
+            &candidate.statement_bytes,
+            &candidate.record_bytes,
+            &changed,
+        )
+        .unwrap();
         assert_eq!(prover_changed, verifier_changed);
     }
 
@@ -1121,6 +1238,8 @@ mod tests {
         let commitment =
             commit_assets(&root, Digest([1; 32]), Digest([2; 32]), &specs).unwrap();
         fixture.public = ModelCommitmentPublic::from_commitment(&commitment);
+        fixture.anchor_id = fixture.public.anchor.anchor_id;
+        fixture.specs = specs;
         fixture.trace.assets = AssetStore::open(&commitment).unwrap().open_all().unwrap();
         let error = verify(&fixture).unwrap_err();
         assert_eq!(error.code(), "invalid_proof");
