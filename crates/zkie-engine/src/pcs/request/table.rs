@@ -311,8 +311,8 @@ fn record_value(shape: &IndexShape, seed: &SampleSeed, answer: u32, message: &[F
 }
 
 /// The seeds of a table's record, from its name. The label and the empty seed
-/// round match the reference chain; the seed values are drawn from the
-/// repository's chain layout.
+/// round follow the chain layout; the seed values are drawn from the
+/// repository's chain rules.
 pub fn record_seeds(shape: &IndexShape, name: &[u8]) -> Result<Vec<SampleSeed>> {
     let mut chain = Chain::begin(
         RECORD_SEED_LABEL,
@@ -1114,7 +1114,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_format_variants_are_rejected() {
+    fn noncanonical_leaf_variants_are_rejected() {
         let table = committed();
         let shape = table.reader.shape;
         let position = 0u64;

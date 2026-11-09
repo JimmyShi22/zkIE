@@ -376,14 +376,14 @@ impl MaskTable {
     }
 }
 
-/// One coefficient of the hiding polynomial, indexed from 1 as in the
-/// reference formula.
+/// One coefficient of the hiding polynomial, indexed from 1 as in the layout
+/// formula.
 fn coefficient(w: &[Fp3], k: u32, variable: u32, degree: u32) -> Result<Fp3> {
     Ok(w[hp_place(k, variable - 1, degree)?])
 }
 
 /// The fresh mask rows: the hiding coefficients laid out in `2^h` rows of
-/// `len` entries, in the reference's column order.
+/// `len` entries, in the layout's column order.
 pub fn fold_mask_table(k: u32, h: u32, len: usize, w: &[Fp3]) -> Result<Vec<Fp3>> {
     if k < 1
         || h >= 40
