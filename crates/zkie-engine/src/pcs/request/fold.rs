@@ -25,6 +25,7 @@ use zkie_core::types::Digest;
 
 use crate::pcs::request::code::{build_code_plan, CodeParams};
 use crate::pcs::request::field::{E_DEGREE, Fp3};
+use crate::pcs::request::read::HidingState;
 use crate::pcs::request::runtime_tree::{MaskTree, MaskTreePlan};
 use crate::primitives::codec::CanonicalWriter;
 use crate::primitives::transcript::{hash_labeled, tag_word, STATEMENT};
@@ -618,13 +619,43 @@ pub struct OracleMetadata {
     pub leaf_class: u32,
     pub mask_rows: u64,
     pub mask_code: CodeParams,
+}
+
+/// The verifier's record of one oracle after its SEND message: the actual
+/// root and the sampled fact. It is kept apart from the frozen plan statement
+/// so the first query can be bound before the root exists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeOracle {
+    pub id: u64,
+    pub root: Digest,
     pub sampled: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeOracles {
+    pub entries: Vec<RuntimeOracle>,
+}
+
+impl RuntimeOracles {
+    /// Record the root and sampled fact the verifier accepted from a SEND
+    /// message. A second entry for the same id, or a zero root, fails.
+    pub fn insert(&mut self, oracle: RuntimeOracle) -> Result<()> {
+        if oracle.root == Digest::ZERO || self.get(oracle.id).is_some() {
+            return Err(Error::StatementMismatch);
+        }
+        self.entries.push(oracle);
+        Ok(())
+    }
+
+    pub fn get(&self, id: u64) -> Option<&RuntimeOracle> {
+        self.entries.iter().find(|oracle| oracle.id == id)
+    }
 }
 
 impl MaskOracle {
     /// The verifier's view from its registered metadata. The notice cannot set
     /// or clear the sampled fact.
-    pub fn from_metadata(metadata: &OracleMetadata) -> Self {
+    pub fn from_metadata(metadata: &OracleMetadata, sampled: bool) -> Self {
         Self {
             id: metadata.id,
             claimed_group: metadata.group,
@@ -632,7 +663,7 @@ impl MaskOracle {
             mask_rows: metadata.mask_rows,
             mask_code: metadata.mask_code,
             answers: 0,
-            sampled: metadata.sampled,
+            sampled,
         }
     }
 
@@ -730,21 +761,66 @@ impl MaskSpend {
 /// public artifact identity.
 #[derive(Clone, Debug)]
 pub struct VerifiedStatement {
-    pub id: Digest,
-    pub groups: VerifiedGroups,
-    pub mask_trees: Vec<MaskTreePlan>,
-    pub oracles: Vec<OracleMetadata>,
+    id: Digest,
+    groups: VerifiedGroups,
+    mask_trees: Vec<MaskTreePlan>,
+    oracles: Vec<OracleMetadata>,
     spent: Arc<Mutex<MaskSpend>>,
 }
 
 impl VerifiedStatement {
+    /// Build the frozen plan statement. The constructor checks the complete
+    /// static relations: unique group/tree/oracle numbers, a plan-fixed fresh
+    /// mask outside its group's members, and each oracle's group/tree/leaf/
+    /// mask-row/mask-code agreement with the registered tree. After this
+    /// returns, the fields are private and cannot be changed. The actual
+    /// oracle roots and sampled facts are recorded separately by SEND in
+    /// `RuntimeOracles`; the type name does not prove the statement's origin,
+    /// and the verifier must construct it from its own plan.
     pub fn new(
         groups: VerifiedGroups,
         mask_trees: Vec<MaskTreePlan>,
         oracles: Vec<OracleMetadata>,
     ) -> Result<Self> {
-        for tree in &mask_trees {
-            if tree.fault().is_some() {
+        for (index, group) in groups.groups.iter().enumerate() {
+            if groups.groups[..index].iter().any(|other| other.group == group.group) {
+                return Err(Error::InvalidConfig);
+            }
+            if let Some(fresh) = group.fresh {
+                if group.members.contains(&fresh) {
+                    return Err(Error::InvalidConfig);
+                }
+            }
+        }
+        for (index, tree) in mask_trees.iter().enumerate() {
+            if tree.fault().is_some()
+                || mask_trees[..index]
+                    .iter()
+                    .any(|other| other.tree_number == tree.tree_number)
+            {
+                return Err(Error::InvalidConfig);
+            }
+        }
+        for (index, oracle) in oracles.iter().enumerate() {
+            if oracles[..index].iter().any(|other| other.id == oracle.id) {
+                return Err(Error::InvalidConfig);
+            }
+            let group = groups
+                .get(oracle.group)
+                .ok_or(Error::InvalidConfig)?;
+            if group.members.is_empty() {
+                return Err(Error::InvalidConfig);
+            }
+            let tree = mask_trees
+                .iter()
+                .find(|tree| tree.tree_number == oracle.tree_number)
+                .ok_or(Error::InvalidConfig)?;
+            if oracle.mask_code.log_n != tree.log_n
+                || oracle.leaf_class != tree.leaf_class
+                || oracle.mask_rows != tree.mask_rows
+                || build_code_plan(oracle.mask_code.log_n, oracle.mask_code.ell, oracle.mask_code.r)
+                    .is_err()
+            {
                 return Err(Error::InvalidConfig);
             }
         }
@@ -779,7 +855,6 @@ impl VerifiedStatement {
             writer.put_u64(oracle.mask_code.log_n as u64);
             writer.put_u64(oracle.mask_code.ell);
             writer.put_u64(oracle.mask_code.r);
-            writer.put_u64(if oracle.sampled { 1 } else { 0 });
         }
         let id = hash_labeled(
             tag_word(STATEMENT, 0),
@@ -796,8 +871,16 @@ impl VerifiedStatement {
         })
     }
 
+    pub fn id(&self) -> &Digest {
+        &self.id
+    }
+
     pub fn groups(&self) -> &VerifiedGroups {
         &self.groups
+    }
+
+    pub fn mask_trees(&self) -> &[MaskTreePlan] {
+        &self.mask_trees
     }
 
     pub fn mask_tree(&self, tree_number: u64) -> Option<&MaskTreePlan> {
@@ -880,6 +963,10 @@ pub fn fold_start_prove(
     groups: &VerifiedGroups,
     tree_plan: MaskTreePlan,
     salts: &[Vec<u8>],
+    hiding: &mut HidingState,
+    table: Digest,
+    lifecycle: u64,
+    columns: usize,
 ) -> Result<FoldStartProver> {
     validate_fold_mask_shape(shape)?;
     if mask.id() != Some(oracle.id) || mask.used() {
@@ -892,6 +979,9 @@ pub fn fold_start_prove(
     let tails = mask_tail_rows(shape, mask)?;
     let tree = MaskTree::commit(tree_plan, shape, &rows, &tails, salts)?;
     let sum = fold_mask_sum(shape.k, mask.coefficients())?;
+    // The provider charges the table's hiding capacity before the mask
+    // message is sent; an abandoned proof keeps its columns.
+    hiding.begin(table, lifecycle, columns)?;
     mask.mark_used();
     let tree_number = tree_plan.tree_number;
     let message = FoldStartMessage {
@@ -916,6 +1006,7 @@ pub fn fold_start_verify(
     shape: &FoldShape,
     message: &FoldStartMessage,
     statement: &VerifiedStatement,
+    runtime: &RuntimeOracles,
 ) -> Result<()> {
     validate_fold_mask_shape(shape)?;
     let tree_plan = statement
@@ -936,15 +1027,17 @@ pub fn fold_start_verify(
         return Err(Error::StatementMismatch);
     }
     let metadata = statement.oracle(message.id).ok_or(Error::StatementMismatch)?;
+    let runtime = runtime.get(message.id).ok_or(Error::StatementMismatch)?;
     if metadata.group != message.claimed_group
         || metadata.tree_number != message.tree_number
         || metadata.leaf_class != message.notice.leaf_class
         || metadata.mask_rows != message.notice.mask_rows
         || metadata.mask_code != message.notice.mask_code
+        || runtime.root != message.root
     {
         return Err(Error::StatementMismatch);
     }
-    let oracle = MaskOracle::from_metadata(metadata);
+    let oracle = MaskOracle::from_metadata(metadata, runtime.sampled);
     fold_mask_check(shape, &oracle, statement.groups())?;
     if message.root == Digest::ZERO {
         return Err(Error::InvalidProof);
@@ -1238,19 +1331,25 @@ mod tests {
         let salts = tree_salts(&plan);
         let notice = fold_mask_notice(&shape).unwrap();
         let oracle = MaskOracle::prover_view(9, 1, &notice);
+        let table = Digest([7; 32]);
+        let mut hiding = HidingState::new(table, 1, 8);
         // The mask must have been sent under the id the verifier checks.
         assert!(fold_start_prove(
-            &shape, &mut mask, &source, &oracle, &groups, plan, &salts
+            &shape, &mut mask, &source, &oracle, &groups, plan, &salts,
+            &mut hiding, table, 1, 4
         )
         .is_err());
         mask.sent_as(9).unwrap();
         let start = fold_start_prove(
             &shape, &mut mask, &source, &oracle, &groups, plan, &salts,
+            &mut hiding, table, 1, 4,
         )
         .unwrap();
         assert!(mask.used());
+        assert_eq!(hiding.used(), 4);
         assert!(fold_start_prove(
-            &shape, &mut mask, &source, &oracle, &groups, plan, &salts
+            &shape, &mut mask, &source, &oracle, &groups, plan, &salts,
+            &mut hiding, table, 1, 4
         )
         .is_err());
         assert_ne!(start.message.root, Digest::ZERO);
@@ -1268,22 +1367,52 @@ mod tests {
             leaf_class: plan.leaf_class,
             mask_rows: plan.mask_rows,
             mask_code: shape.mask_code,
-            sampled: false,
         };
         let statement =
             VerifiedStatement::new(groups.clone(), vec![plan], vec![metadata.clone()]).unwrap();
-        fold_start_verify(&shape, &start.message, &statement).unwrap();
-        assert!(fold_start_verify(&shape, &start.message, &statement).is_err());
+        let runtime = RuntimeOracles {
+            entries: vec![RuntimeOracle {
+                id: 9,
+                root: start.message.root,
+                sampled: false,
+            }],
+        };
+        fold_start_verify(&shape, &start.message, &statement, &runtime).unwrap();
+        assert!(fold_start_verify(&shape, &start.message, &statement, &runtime).is_err());
         let mut bad = start.message.clone();
         bad.tree_number = 6;
-        assert!(fold_start_verify(&shape, &bad, &statement).is_err());
-        // The verifier's metadata, not the notice, decides whether the oracle
-        // was sampled.
-        let mut sampled = metadata;
-        sampled.sampled = true;
-        let sampled_statement =
-            VerifiedStatement::new(groups.clone(), vec![plan], vec![sampled]).unwrap();
-        assert!(fold_start_verify(&shape, &start.message, &sampled_statement).is_err());
+        assert!(fold_start_verify(&shape, &bad, &statement, &runtime).is_err());
+        // The verifier's SEND registry, not the notice, decides whether the
+        // oracle was sampled.
+        let sampled_runtime = RuntimeOracles {
+            entries: vec![RuntimeOracle {
+                id: 9,
+                root: start.message.root,
+                sampled: true,
+            }],
+        };
+        assert!(fold_start_verify(
+            &shape,
+            &start.message,
+            &statement,
+            &sampled_runtime
+        )
+        .is_err());
+        // A legal non-zero but wrong root is rejected by the SEND registry.
+        let wrong_runtime = RuntimeOracles {
+            entries: vec![RuntimeOracle {
+                id: 9,
+                root: Digest([4; 32]),
+                sampled: false,
+            }],
+        };
+        assert!(fold_start_verify(
+            &shape,
+            &start.message,
+            &statement,
+            &wrong_runtime
+        )
+        .is_err());
         // The committed root opens the mask tree at the drawn positions.
         let positions = [1u64, 4];
         let openings = start.tree.open(&positions).unwrap();
@@ -1297,10 +1426,10 @@ mod tests {
         // layout is rejected before the spend.
         let mut bad = start.message.clone();
         bad.claimed_group = 7;
-        assert!(fold_start_verify(&shape, &bad, &statement).is_err());
+        assert!(fold_start_verify(&shape, &bad, &statement, &runtime).is_err());
         let mut bad = start.message.clone();
         bad.notice.mask_rows = 4;
-        assert!(fold_start_verify(&shape, &bad, &statement).is_err());
+        assert!(fold_start_verify(&shape, &bad, &statement, &runtime).is_err());
         // A tampered prover coefficient fails the self-check.
         let mut tampered_mask = FoldMask {
             coefficients: mask.coefficients().to_vec(),
@@ -1317,7 +1446,11 @@ mod tests {
             &oracle,
             &groups,
             plan,
-            &salts
+            &salts,
+            &mut hiding,
+            table,
+            1,
+            4
         )
         .is_err());
     }
@@ -1716,6 +1849,45 @@ mod tests {
         assert!(h63.mask_rows().is_ok());
         assert!(fold_mask_shape_fault(&h63).is_some());
         assert!(fold_mask_notice(&h63).is_err());
+    }
+
+    #[test]
+    fn statement_validation_rejects_bad_relations() {
+        let shape = shape();
+        let plan = tree_plan(&shape);
+        let groups = VerifiedGroups {
+            groups: vec![VerifiedGroup {
+                group: 1,
+                members: vec![1, 2],
+                fresh: Some(9),
+            }],
+        };
+        let metadata = OracleMetadata {
+            id: 9,
+            group: 1,
+            tree_number: plan.tree_number,
+            leaf_class: plan.leaf_class,
+            mask_rows: plan.mask_rows,
+            mask_code: shape.mask_code,
+        };
+        VerifiedStatement::new(groups.clone(), vec![plan], vec![metadata.clone()]).unwrap();
+        let mut duplicate_group = groups.clone();
+        duplicate_group.groups.push(groups.groups[0].clone());
+        assert!(VerifiedStatement::new(duplicate_group, vec![plan], vec![metadata.clone()]).is_err());
+        assert!(VerifiedStatement::new(groups.clone(), vec![plan, plan], vec![metadata.clone()]).is_err());
+        assert!(VerifiedStatement::new(groups.clone(), vec![plan], vec![metadata.clone(), metadata.clone()]).is_err());
+        let mut bad = metadata.clone();
+        bad.group = 7;
+        assert!(VerifiedStatement::new(groups.clone(), vec![plan], vec![bad]).is_err());
+        let mut bad = metadata.clone();
+        bad.tree_number = 6;
+        assert!(VerifiedStatement::new(groups.clone(), vec![plan], vec![bad]).is_err());
+        let mut bad = metadata.clone();
+        bad.leaf_class = 4;
+        assert!(VerifiedStatement::new(groups.clone(), vec![plan], vec![bad]).is_err());
+        let mut fresh_member = groups;
+        fresh_member.groups[0].fresh = Some(1);
+        assert!(VerifiedStatement::new(fresh_member, vec![plan], vec![metadata]).is_err());
     }
 
     #[test]

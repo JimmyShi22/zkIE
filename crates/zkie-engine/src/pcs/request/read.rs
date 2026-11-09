@@ -195,23 +195,39 @@ impl ReadLedger {
     }
 }
 
-/// The table-life hiding budget: how many columns the table's random tails
-/// can hide over the table's whole life. The unit is one column. `begin`
-/// charges before any fold or draw and never refunds: an abandoned proof has
-/// spent its columns all the same. The ledger lives with the statement, so a
-/// rebuilt session cannot reset it; disk persistence is not implemented.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HidingLedger {
+/// The provider's table-life hiding state. The unit is one column. It is keyed
+/// by the table and a lifecycle number, so the same state cannot be applied to
+/// another leaf/table or a new lifecycle. `begin` charges before any fold or
+/// send and never refunds: an abandoned proof has spent its columns all the
+/// same. The provider keeps the state authoritative and may save it atomically;
+/// cross-process locking, rollback protection and deriving the maximum from the
+/// encoded random tail and opening budgets are not implemented, and an
+/// independent verifier without trusted global state does not claim to verify
+/// the cumulative hidden budget. This is separate from the read ledger.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HidingState {
+    table: Digest,
+    lifecycle: u64,
     max_columns: u64,
     used: u64,
 }
 
-impl HidingLedger {
-    pub fn new(max_columns: u64) -> Self {
+impl HidingState {
+    pub fn new(table: Digest, lifecycle: u64, max_columns: u64) -> Self {
         Self {
+            table,
+            lifecycle,
             max_columns,
             used: 0,
         }
+    }
+
+    pub fn table(&self) -> Digest {
+        self.table
+    }
+
+    pub fn lifecycle(&self) -> u64 {
+        self.lifecycle
     }
 
     pub fn max_columns(&self) -> u64 {
@@ -222,7 +238,10 @@ impl HidingLedger {
         self.used
     }
 
-    pub fn begin(&mut self, columns: usize) -> Result<()> {
+    pub fn begin(&mut self, table: Digest, lifecycle: u64, columns: usize) -> Result<()> {
+        if table != self.table || lifecycle != self.lifecycle {
+            return Err(Error::StatementMismatch);
+        }
         let columns = u64::try_from(columns).map_err(|_| Error::ResourceLimit)?;
         let used = self.used.checked_add(columns).ok_or(Error::ResourceLimit)?;
         if used > self.max_columns {
@@ -230,6 +249,53 @@ impl HidingLedger {
         }
         self.used = used;
         Ok(())
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut writer = crate::primitives::codec::CanonicalWriter::new();
+        writer.put_digest(&self.table);
+        writer.put_u64(self.lifecycle);
+        writer.put_u64(self.max_columns);
+        writer.put_u64(self.used);
+        writer.into_bytes()
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut reader =
+            crate::primitives::codec::CanonicalReader::new(bytes, zkie_core::common::codec::DecodeLimits::unlimited());
+        let table = reader.get_digest()?;
+        let lifecycle = reader.get_u64()?;
+        let max_columns = reader.get_u64()?;
+        let used = reader.get_u64()?;
+        reader.finish()?;
+        if used > max_columns {
+            return Err(Error::InvalidEncoding);
+        }
+        Ok(Self {
+            table,
+            lifecycle,
+            max_columns,
+            used,
+        })
+    }
+
+    /// Write the state to `path` through a temporary file and an atomic rename.
+    /// This gives a durable single-writer update; it does not lock across
+    /// processes, prevent a rollback to an older valid file, or anchor the
+    /// state outside the provider.
+    pub fn save(&self, path: &std::path::Path) -> Result<()> {
+        use std::io::Write;
+        let temporary = path.with_extension("tmp");
+        let mut file = std::fs::File::create(&temporary).map_err(|_| Error::Io)?;
+        file.write_all(&self.encode()).map_err(|_| Error::Io)?;
+        file.sync_all().map_err(|_| Error::Io)?;
+        std::fs::rename(&temporary, path).map_err(|_| Error::Io)?;
+        Ok(())
+    }
+
+    pub fn load(path: &std::path::Path) -> Result<Self> {
+        let bytes = std::fs::read(path).map_err(|_| Error::Io)?;
+        Self::decode(&bytes)
     }
 }
 
@@ -557,15 +623,56 @@ mod tests {
     }
 
     #[test]
-    fn hiding_ledger_charges_before_fold_and_never_refunds() {
-        let mut ledger = HidingLedger::new(3);
-        ledger.begin(2).unwrap();
-        assert_eq!(ledger.used(), 2);
-        assert!(ledger.begin(2).is_err());
-        ledger.begin(1).unwrap();
-        assert_eq!(ledger.used(), 3);
-        ledger.begin(0).unwrap();
-        assert!(ledger.begin(1).is_err());
+    fn hiding_state_charges_before_send_and_never_refunds() {
+        let table = Digest([7; 32]);
+        let mut state = HidingState::new(table, 1, 3);
+        state.begin(table, 1, 2).unwrap();
+        assert_eq!(state.used(), 2);
+        assert!(state.begin(table, 1, 2).is_err());
+        state.begin(table, 1, 1).unwrap();
+        assert_eq!(state.used(), 3);
+        state.begin(table, 1, 0).unwrap();
+        assert!(state.begin(table, 1, 1).is_err());
+        assert!(state.begin(Digest([8; 32]), 1, 1).is_err());
+        assert!(state.begin(table, 2, 1).is_err());
+    }
+
+    #[test]
+    fn hiding_state_saves_and_loads_atomically() {
+        let table = Digest([7; 32]);
+        let mut state = HidingState::new(table, 3, 4);
+        state.begin(table, 3, 2).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "zkie-hiding-state-{}-{}.bin",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        state.save(&path).unwrap();
+        let mut loaded = HidingState::load(&path).unwrap();
+        assert_eq!(loaded, state);
+        loaded.begin(table, 3, 2).unwrap();
+        assert!(loaded.begin(table, 3, 2).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn hiding_state_is_atomic_under_concurrency() {
+        let table = Digest([7; 32]);
+        let shared = Arc::new(Mutex::new(HidingState::new(table, 1, 3)));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let shared = Arc::clone(&shared);
+            handles.push(std::thread::spawn(move || {
+                shared.lock().unwrap().begin(table, 1, 2).is_ok()
+            }));
+        }
+        let successes = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(successes, 1);
+        assert_eq!(shared.lock().unwrap().used(), 2);
     }
 
     #[test]

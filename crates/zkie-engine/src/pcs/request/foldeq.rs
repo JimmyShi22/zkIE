@@ -19,9 +19,10 @@ use crate::pcs::request::chain::{
 use crate::pcs::request::field::{Fp, Fp3};
 use crate::pcs::request::runtime_tree::{verify_mask_columns, MaskColumnOpening};
 use crate::pcs::request::fold::{
-    fold_mask_shape_fault, fold_start_verify, FoldShape, FoldStartMessage, VerifiedStatement,
+    fold_mask_shape_fault, fold_start_verify, FoldShape, FoldStartMessage, RuntimeOracles,
+    VerifiedStatement,
 };
-use crate::pcs::request::read::{draw_positions, HidingLedger, ReadLedger, VerifierReads};
+use crate::pcs::request::read::{draw_positions, ReadLedger, VerifierReads};
 use crate::pcs::request::table::{
     record_seeds, ColumnOpening, IndexName, IndexReader, SampleSeed,
 };
@@ -73,7 +74,7 @@ impl FoldeqBinder {
 /// A LIN-style gamma: the suffix of a caller-drawn psi, starting at `k_lo`.
 /// The FOLDEQ session does not assume this caller; a direct gamma is also
 /// accepted. The caller owns the psi draw and its round.
-pub fn lin_gamma(psi: &[Fp3], k_lo: u32, columns: u32) -> Result<Vec<Fp3>> {
+fn lin_gamma(psi: &[Fp3], k_lo: u32, columns: u32) -> Result<Vec<Fp3>> {
     let start = k_lo as usize;
     let end = start
         .checked_add(columns as usize)
@@ -94,12 +95,12 @@ pub struct FoldeqPlan {
     pub reader: IndexReader,
     pub fold: FoldShape,
     pub statement: Arc<VerifiedStatement>,
+    pub oracles: Arc<Mutex<RuntimeOracles>>,
     pub mask_tree_number: u64,
     pub group_id: u64,
     pub leaf_class: u32,
     pub seed_budget: usize,
     pub ledger: Arc<Mutex<ReadLedger>>,
-    pub hiding: Arc<Mutex<HidingLedger>>,
     pub column_draws: usize,
     pub mask_positions: Vec<u64>,
 }
@@ -149,13 +150,6 @@ impl FoldeqPlan {
         };
         if draws > max_reads {
             return Some("the column draws exceed the read budget");
-        }
-        let max_columns = match self.hiding.lock() {
-            Ok(ledger) => ledger.max_columns(),
-            Err(_) => return Some("the hiding ledger is poisoned"),
-        };
-        if draws > max_columns {
-            return Some("the column draws exceed the table's hiding budget");
         }
         if self.mask_positions.is_empty() {
             return Some("no mask position is fixed");
@@ -217,7 +211,7 @@ impl FoldeqPlan {
         }
         // The verified statement (groups, runtime trees and their starts), the
         // expected tree/group/leaf numbers and the complete query plan.
-        writer.put_digest(&self.statement.id);
+        writer.put_digest(self.statement.id());
         for value in [
             self.mask_tree_number,
             self.group_id,
@@ -233,12 +227,6 @@ impl FoldeqPlan {
             .map(|ledger| ledger.max_reads())
             .unwrap_or(0);
         writer.put_u64(max_reads);
-        let max_columns = self
-            .hiding
-            .lock()
-            .map(|ledger| ledger.max_columns())
-            .unwrap_or(0);
-        writer.put_u64(max_columns);
         writer.put_u64(self.mask_positions.len() as u64);
         for position in &self.mask_positions {
             writer.put_u64(*position);
@@ -304,10 +292,6 @@ impl FoldeqSession {
         {
             return Err(Error::StatementMismatch);
         }
-        plan.hiding
-            .lock()
-            .map_err(|_| Error::InvalidSessionState)?
-            .begin(plan.column_draws)?;
         let reads = VerifierReads::new(Arc::clone(&plan.ledger));
         Ok(Self {
             plan,
@@ -362,27 +346,51 @@ impl FoldeqSession {
         self.plan.seeds()
     }
 
-    /// Bind the caller's gamma after the record is bound (the first query
-    /// carries the record) and before any G_u or column message. The caller
-    /// owns the challenge round: a LIN caller passes the psi suffix through
-    /// `lin_gamma`, another caller may pass a directly drawn gamma. The session
-    /// binds the value and does not assume one interface.
-    pub fn bind_gamma(&mut self, gamma: &[Fp3]) -> Result<()> {
+    /// Draw the LIN path's psi and bind gamma as its suffix. The session owns
+    /// the draw: a caller cannot choose or replace the challenge or forge the
+    /// psi source. `k_lo` is the LIN caller's low-variable count.
+    pub fn draw_lin_gamma(&mut self, k_lo: u32) -> Result<()> {
         if self.stage != Stage::Seeds {
             return Err(Error::InvalidSessionState);
         }
-        if gamma.len() != self.plan.reader.shape.v as usize {
-            return Err(Error::ShapeMismatch);
+        let columns = self.plan.reader.shape.v;
+        let total = (k_lo as usize)
+            .checked_add(columns as usize)
+            .ok_or(Error::ResourceLimit)?;
+        let psi = self.draw_challenge(total)?;
+        let gamma = lin_gamma(&psi, k_lo, columns)?;
+        self.set_gamma(gamma)
+    }
+
+    /// Draw a directly used gamma for a caller whose reference path does not
+    /// use the LIN psi suffix. The session still owns the draw; no caller
+    /// value is accepted.
+    pub fn draw_direct_gamma(&mut self) -> Result<()> {
+        if self.stage != Stage::Seeds {
+            return Err(Error::InvalidSessionState);
         }
-        let mut message = self.chain.message();
-        for value in gamma {
-            message.push_fp3(value);
-        }
-        let prefix = message.prefix(KIND_ALGEBRAIC, 0)?;
+        let columns = self.plan.reader.shape.v as usize;
+        let gamma = self.draw_challenge(columns)?;
+        self.set_gamma(gamma)
+    }
+
+    fn draw_challenge(&mut self, count: usize) -> Result<Vec<Fp3>> {
+        let prefix = self.chain.message().prefix(KIND_ALGEBRAIC, 0)?;
         if !self.chain.step(&prefix, 0)? {
             return Err(Error::InvalidProof);
         }
-        self.gamma = Some(gamma.to_vec());
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(count)
+            .map_err(|_| Error::ResourceLimit)?;
+        for _ in 0..count {
+            values.push(self.chain.draw_e()?);
+        }
+        Ok(values)
+    }
+
+    fn set_gamma(&mut self, gamma: Vec<Fp3>) -> Result<()> {
+        self.gamma = Some(gamma);
         self.stage = Stage::Gamma;
         Ok(())
     }
@@ -455,7 +463,12 @@ impl FoldeqSession {
         {
             return Err(Error::StatementMismatch);
         }
-        fold_start_verify(&self.plan.fold, message, &self.plan.statement)?;
+        let oracles = self
+            .plan
+            .oracles
+            .lock()
+            .map_err(|_| Error::InvalidSessionState)?;
+        fold_start_verify(&self.plan.fold, message, &self.plan.statement, &oracles)?;
         let mut out = self.chain.message();
         out.push_u64(message.id);
         out.push_u64(message.claimed_group);
@@ -507,10 +520,11 @@ mod tests {
     use crate::pcs::request::runtime_tree::{verify_mask_columns, MaskColumnOpening};
 use crate::pcs::request::fold::{
         fold_mask_make, fold_mask_make_tail, fold_mask_notice, fold_start_prove, MaskOracle,
-        OracleMetadata, VerifiedGroup, VerifiedGroups, VerifiedStatement,
+        OracleMetadata, RuntimeOracle, RuntimeOracles, VerifiedGroup, VerifiedGroups,
+        VerifiedStatement,
     };
     use crate::pcs::request::params::{LEAF_SALT_MIN_BYTES, REQUEST_CHAIN_LABEL};
-    use crate::pcs::request::read::ProverReads;
+    use crate::pcs::request::read::{HidingState, ProverReads};
     use crate::pcs::request::runtime_tree::MaskTreePlan;
         use crate::pcs::request::table::{commit_table, IndexShape, TableDistances};
     use crate::primitives::transcript::{hash_labeled, tag_word, TEST_COINS};
@@ -603,7 +617,6 @@ use crate::pcs::request::fold::{
                     leaf_class: tree.leaf_class,
                     mask_rows: tree.mask_rows,
                     mask_code: build_code_plan(3, 4, 1).unwrap(),
-                    sampled: false,
                 }],
             )
             .unwrap(),
@@ -612,12 +625,12 @@ use crate::pcs::request::fold::{
             reader: table.reader.clone(),
             fold: fold_shape(),
             statement,
+            oracles: Arc::new(Mutex::new(RuntimeOracles::default())),
             mask_tree_number: tree.tree_number,
             group_id: 1,
             leaf_class: 3,
             seed_budget: table.reader.shape.answers as usize,
             ledger: Arc::new(Mutex::new(ReadLedger::new(2))),
-            hiding: Arc::new(Mutex::new(HidingLedger::new(4))),
             column_draws: 2,
             mask_positions: vec![1, 4],
         };
@@ -639,6 +652,8 @@ use crate::pcs::request::fold::{
         let notice = fold_mask_notice(&plan.fold).unwrap();
         let oracle = MaskOracle::prover_view(9, 1, &notice);
         let tree = *plan.statement.mask_tree(plan.mask_tree_number).unwrap();
+        let table = Digest([7; 32]);
+        let mut hiding = HidingState::new(table, 1, 8);
         fold_start_prove(
             &plan.fold,
             &mut mask,
@@ -647,6 +662,10 @@ use crate::pcs::request::fold::{
             plan.statement.groups(),
             tree,
             &mask_salts(&tree),
+            &mut hiding,
+            table,
+            1,
+            plan.column_draws,
         )
         .unwrap()
     }
@@ -704,10 +723,35 @@ use crate::pcs::request::fold::{
     }
 
     #[test]
+    fn gamma_is_drawn_from_the_fixed_prefix() {
+        let draw = |plan: FoldeqPlan| {
+            let binder = FoldeqBinder::new(
+                REQUEST_CHAIN_LABEL,
+                plan.reader.configuration,
+                &plan,
+            )
+            .unwrap();
+            let chain = binder.chain().unwrap();
+            let mut session = FoldeqSession::open(plan.clone(), binder, chain).unwrap();
+            let first = plan.first_query();
+            session.bind_first_query(&first).unwrap();
+            session.draw_direct_gamma().unwrap();
+            session.gamma().unwrap().to_vec()
+        };
+        let (plan, _table) = plan_fixture();
+        let first = draw(plan.clone());
+        let (same, _table) = plan_fixture();
+        assert_eq!(first, draw(same));
+        let mut other = plan;
+        other.column_draws = 1;
+        assert_ne!(first, draw(other));
+    }
+
+    #[test]
     fn first_query_and_stage_order() {
         let (mut session, _table) = open_session();
         assert!(session.seeds().is_err());
-        assert!(session.bind_gamma(&[]).is_err());
+        assert!(session.draw_direct_gamma().is_err());
         let mut sent = session.plan().first_query();
         sent[0] ^= 1;
         assert!(session.bind_first_query(&sent).is_err());
@@ -728,9 +772,8 @@ use crate::pcs::request::fold::{
         let good = plan.first_query();
         session.bind_first_query(&good).unwrap();
         let _seeds = session.seeds().unwrap();
-        let gamma = vec![Fp3::from_u64(3); plan.reader.shape.v as usize];
-        session.bind_gamma(&gamma).unwrap();
-        assert_eq!(session.gamma(), Some(gamma.as_slice()));
+        session.draw_direct_gamma().unwrap();
+        assert_eq!(session.gamma().unwrap().len(), plan.reader.shape.v as usize);
         session.send_gu(&Digest([4; 32])).unwrap();
         assert_eq!(session.gu_root(), Some(&Digest([4; 32])));
         session.draw_queries().unwrap();
@@ -742,6 +785,17 @@ use crate::pcs::request::fold::{
         // A second read charges past the plan's budget.
         assert!(session.read_queries(&openings).is_err());
         let start = mask_start(&plan);
+        session
+            .plan()
+            .oracles
+            .lock()
+            .unwrap()
+            .insert(RuntimeOracle {
+                id: 9,
+                root: start.message.root,
+                sampled: false,
+            })
+            .unwrap();
         session.start_fold(&start.message).unwrap();
         assert!(session.epsilon().is_some());
         assert_eq!(session.start(), Some(&start.message));
@@ -765,26 +819,6 @@ use crate::pcs::request::fold::{
             &forged
         )
         .is_err());
-    }
-
-    #[test]
-    fn hiding_budget_is_shared_across_sessions_and_not_refunded() {
-        let (plan, _table) = plan_fixture();
-        let binder = FoldeqBinder::new(
-            REQUEST_CHAIN_LABEL,
-            plan.reader.configuration,
-            &plan,
-        )
-        .unwrap();
-        let chain = binder.chain().unwrap();
-        let first = FoldeqSession::open(plan.clone(), binder.clone(), chain.clone()).unwrap();
-        let second = FoldeqSession::open(plan.clone(), binder.clone(), chain.clone()).unwrap();
-        // Dropping an abandoned proof does not refund its columns.
-        drop(first);
-        drop(second);
-        assert_eq!(plan.hiding.lock().unwrap().used(), 4);
-        let third = FoldeqSession::open(plan, binder, chain);
-        assert!(third.is_err());
     }
 
     #[test]
@@ -812,11 +846,6 @@ use crate::pcs::request::fold::{
 
         let mut bad = plan.clone();
         bad.ledger = Arc::new(Mutex::new(ReadLedger::new(1)));
-        bad.column_draws = 2;
-        assert!(FoldeqSession::open(bad, binder.clone(), chain.clone()).is_err());
-
-        let mut bad = plan.clone();
-        bad.hiding = Arc::new(Mutex::new(HidingLedger::new(1)));
         bad.column_draws = 2;
         assert!(FoldeqSession::open(bad, binder.clone(), chain.clone()).is_err());
 
