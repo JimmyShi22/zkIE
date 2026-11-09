@@ -4,8 +4,13 @@
 //! three G_u relations on small in-memory tables. They are local relation
 //! construction and mathematical checks, not a verifier: the real verifier
 //! does not hold the private G_u tables, and the chain, group, opening and
-//! soundness paths are not connected. Fixtures used by the tests supply the
-//! seeds and witnesses; their source is not authenticated.
+//! soundness paths are not connected. In the full protocol the index
+//! commitment/name/record, public parameters and plan come from the trusted
+//! statement/configuration and are chain-bound; a G_u root is a prover claim
+//! received by the verifier in its round, not trusted content; gamma and draws
+//! are verifier chain challenges, not caller values; and columns must be
+//! opened against the table's trusted commitment. Here these are explicit
+//! fixtures; no function or type name claims that the source is authenticated.
 
 use zkie_core::common::field::PrimeCharacteristicRing;
 use zkie_core::error::{Error, Result};
@@ -208,6 +213,124 @@ fn empty_mask(shape: &GuShape) -> Result<Vec<Fp3>> {
         .map_err(|_| Error::ResourceLimit)
 }
 
+/// The shared layout check: every real folded-message entry and every real
+/// tail entry must map through the trusted vector layout to a real compact
+/// main slot. A shape whose `fault()` is empty can still fail here when a real
+/// entry would fall in a virtual padded row or a place past the code length.
+pub fn gu_layout_fault(shape: &GuShape) -> Option<&'static str> {
+    if shape.fault().is_some() {
+        return Some("the G_u shape is not valid");
+    }
+    let first = match tail_first(&shape.index.code) {
+        Ok(first) => first,
+        Err(_) => return Some("the folded row's tail position overflows"),
+    };
+    let end = match first.checked_add(shape.index.code.r) {
+        Some(end) => end,
+        None => return Some("the folded row's tail end overflows"),
+    };
+    for entry in 0..shape.index.code.ell {
+        match vector_index(shape, entry).and_then(|value| physical_index(shape, value)) {
+            Ok(Some(_)) => {}
+            _ => return Some("a folded message entry has no real main slot"),
+        }
+    }
+    for entry in first..end {
+        match vector_index(shape, entry).and_then(|value| physical_index(shape, value)) {
+            Ok(Some(_)) => {}
+            _ => return Some("a folded tail entry has no real main slot"),
+        }
+    }
+    None
+}
+
+fn gu_sample_pad_offsets(shape: &GuShape) -> Result<(Vec<usize>, Vec<usize>)> {
+    let mut main = Vec::new();
+    let mut mask = Vec::new();
+    if shape.u.mask_code.is_none() && shape.u.answers > 0 {
+        let row_bits = ceil_log2(shape.u.main_rows);
+        for answer in 0..shape.u.answers {
+            let place = shape.u.code.ell - shape.u.answers as u64 + answer as u64;
+            let virtual_index = (shape.u.main_rows - 1)
+                .checked_add(place.checked_shl(row_bits).ok_or(Error::ResourceLimit)?)
+                .ok_or(Error::ResourceLimit)?;
+            let offset = physical_offset(
+                shape.u.main_rows,
+                row_bits,
+                shape.u.code.ell,
+                virtual_index,
+            )?
+            .ok_or(Error::ShapeMismatch)?;
+            main.push(offset);
+        }
+    }
+    if let Some(code) = shape.u.mask_code {
+        let row_bits = ceil_log2(shape.u.mask_rows);
+        for answer in 0..shape.u.answers {
+            let place = code.ell - shape.u.answers as u64 + answer as u64;
+            let virtual_index = (shape.u.mask_rows - 1)
+                .checked_add(place.checked_shl(row_bits).ok_or(Error::ResourceLimit)?)
+                .ok_or(Error::ResourceLimit)?;
+            let offset =
+                physical_offset(shape.u.mask_rows, row_bits, code.ell, virtual_index)?
+                    .ok_or(Error::ShapeMismatch)?;
+            mask.push(offset);
+        }
+    }
+    Ok((main, mask))
+}
+
+/// Build the actual small G_u table from the folded message and its aligned
+/// tail: each real folded entry is placed through the shared layout check, the
+/// rest stays zero, the index pads inside the message are retained, and the
+/// G_u sample pads are a different set of slots (main without mask, mask with
+/// mask). Before SEND writes them, those reserved slots must remain zero; a
+/// folded entry that would land there is rejected. This is a static fixture
+/// construction, not a random or hidden commitment.
+pub fn gu_table(shape: &GuShape, message: &[Fp3], tail: &[Fp3]) -> Result<GuWitness> {
+    if gu_layout_fault(shape).is_some()
+        || message.len() != shape.index.code.ell as usize
+        || tail.len() != shape.index.code.r as usize
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let (main_pads, mask_pads) = gu_sample_pad_offsets(shape)?;
+    let mut main = empty_main(shape)?;
+    let mask = empty_mask(shape)?;
+    let first = tail_first(&shape.index.code)?;
+    for (entry, value) in message.iter().enumerate() {
+        let offset = vector_index(shape, entry as u64)
+            .and_then(|virtual_index| physical_index(shape, virtual_index))?
+            .ok_or(Error::ShapeMismatch)?;
+        if main_pads.contains(&offset) {
+            return Err(Error::ShapeMismatch);
+        }
+        main[offset] = *value;
+    }
+    for (entry, value) in tail.iter().enumerate() {
+        let offset = vector_index(shape, first + entry as u64)
+            .and_then(|virtual_index| physical_index(shape, virtual_index))?
+            .ok_or(Error::ShapeMismatch)?;
+        if main_pads.contains(&offset) {
+            return Err(Error::ShapeMismatch);
+        }
+        main[offset] = *value;
+    }
+    for offset in main_pads {
+        if main[offset] != Fp3::ZERO {
+            return Err(Error::ShapeMismatch);
+        }
+    }
+    // The mask table is zero here; the G_u sample pads in it are written by
+    // SEND later, not by this static construction.
+    for offset in mask_pads {
+        if mask[offset] != Fp3::ZERO {
+            return Err(Error::ShapeMismatch);
+        }
+    }
+    Ok(GuWitness { main, mask })
+}
+
 /// Build the record relation row for one answer. `name` is the table's index
 /// name bytes; the record seeds are recomputed from it and the index shape,
 /// and a supplied seed list that differs from the recomputation is rejected.
@@ -223,6 +346,9 @@ pub fn record_row(
     answer: u32,
 ) -> Result<GuRelationRow> {
     check_binding(shape, registry)?;
+    if gu_layout_fault(shape).is_some() {
+        return Err(Error::InvalidConfig);
+    }
     let answers = shape.index.answers as usize;
     let rows = usize::try_from(shape.index.rows()).map_err(|_| Error::ResourceLimit)?;
     if answer as usize >= answers
@@ -341,7 +467,8 @@ fn generator_tail(
 
 /// Build one column-query relation row: the generator coefficients of the
 /// indexed code at the drawn position, placed on the G_u main table, with the
-/// target equal to the authenticated index column folded at `eq_gamma`.
+/// target equal to the provided index column (a fixture; the opening is not
+/// connected) folded at `eq_gamma`.
 pub fn column_row(
     shape: &GuShape,
     registry: &GuRegistry,
@@ -350,6 +477,9 @@ pub fn column_row(
     eq_gamma: &[Fp3],
 ) -> Result<GuRelationRow> {
     check_binding(shape, registry)?;
+    if gu_layout_fault(shape).is_some() {
+        return Err(Error::InvalidConfig);
+    }
     let rows = usize::try_from(shape.index.rows()).map_err(|_| Error::ResourceLimit)?;
     if position >= shape.index.code.n() || column.len() != rows || eq_gamma.len() != rows {
         return Err(Error::ShapeMismatch);
@@ -418,10 +548,10 @@ pub fn unique_positions(trusted: &[u64]) -> Vec<u64> {
     positions
 }
 
-/// Build one row per logical draw in the trusted order. `authenticated` is
-/// the one column per unique position, as a sorted strictly increasing list
-/// (the name records the caller's claim only; the real column authentication is
-/// not connected);
+/// Build one row per logical draw in the trusted order. `fixture_columns` is
+/// the one provided column per unique position, as a sorted strictly
+/// increasing list; it is a fixture input and the real column opening and
+/// authentication are not connected;
 /// every logical draw, repeats included, reuses the column of its position.
 /// A repeated position with two different columns is rejected before any
 /// target comparison, so a zero equation weight cannot hide the difference.
@@ -429,35 +559,65 @@ pub fn column_rows_from_draws(
     shape: &GuShape,
     registry: &GuRegistry,
     trusted_draws: &[u64],
-    authenticated: &[(u64, Vec<Fp3>)],
+    fixture_columns: &[(u64, Vec<Fp3>)],
     eq_gamma: &[Fp3],
 ) -> Result<Vec<GuRelationRow>> {
-    if trusted_draws.is_empty() || authenticated.is_empty() {
+    if trusted_draws.is_empty() || fixture_columns.is_empty() {
         return Err(Error::StatementMismatch);
     }
     let expected_positions = unique_positions(trusted_draws);
-    if authenticated.len() != expected_positions.len()
-        || authenticated
+    if fixture_columns.len() != expected_positions.len()
+        || fixture_columns
             .iter()
             .map(|(position, _)| *position)
             .ne(expected_positions.iter().copied())
     {
         return Err(Error::StatementMismatch);
     }
-    for (position, _) in authenticated {
+    for (position, _) in fixture_columns {
         if *position >= shape.index.code.n() {
             return Err(Error::ShapeMismatch);
         }
     }
     let mut rows = Vec::with_capacity(trusted_draws.len());
     for position in trusted_draws {
-        let (_, column) = authenticated
+        let (_, column) = fixture_columns
             .iter()
             .find(|(at, _)| at == position)
             .ok_or(Error::StatementMismatch)?;
         rows.push(column_row(shape, registry, *position, column, eq_gamma)?);
     }
     Ok(rows)
+}
+
+/// The isolated plan-driven column entry: the trusted plan supplies the
+/// column count and the index code domain depth, and the caller supplies a
+/// fixture draw sequence and one provided column per unique position. The
+/// sequence length must equal the planned count, every draw must be in the
+/// index code's domain, and the unique column positions must equal the draw
+/// deduplication. Logical rows follow the draw order (repeats included);
+/// physical openings are the unique positions; neither is a hiding-budget
+/// count. The chain source of the plan, draws and columns is not connected.
+pub fn column_plan_rows(
+    shape: &GuShape,
+    registry: &GuRegistry,
+    planned_columns: usize,
+    index_log_n: u32,
+    draws: &[u64],
+    fixture_columns: &[(u64, Vec<Fp3>)],
+    eq_gamma: &[Fp3],
+) -> Result<Vec<GuRelationRow>> {
+    if planned_columns == 0 || draws.len() != planned_columns {
+        return Err(Error::ShapeMismatch);
+    }
+    if index_log_n != shape.index.code.log_n || index_log_n >= 64 {
+        return Err(Error::StatementMismatch);
+    }
+    let domain = 1u64 << index_log_n;
+    if draws.iter().any(|position| *position >= domain) {
+        return Err(Error::InvalidIndex);
+    }
+    column_rows_from_draws(shape, registry, draws, fixture_columns, eq_gamma)
 }
 
 /// The sample cube of one G_u oracle shape: the main and mask table bit
@@ -956,12 +1116,12 @@ mod tests {
         let eq_gamma = vec![Fp3::ONE; 4];
         let column = column_values(&shape);
         let trusted = [1u64, 1, 3];
-        let authenticated = vec![(1u64, column.clone()), (3u64, column.clone())];
+        let fixture_columns = vec![(1u64, column.clone()), (3u64, column.clone())];
         let rows = column_rows_from_draws(
             &shape,
             &registry,
             &trusted,
-            &authenticated,
+            &fixture_columns,
             &eq_gamma,
         )
         .unwrap();
@@ -972,7 +1132,7 @@ mod tests {
         assert!(validate_draw_sequence(&trusted, &[1, 3, 3]).is_err());
         assert!(validate_draw_sequence(&trusted, &[1, 1]).is_err());
         assert!(validate_draw_sequence(&trusted, &[3, 1, 1]).is_err());
-        // The same position cannot carry two different authenticated columns,
+        // The same position cannot carry two different fixture columns,
         // even when a zero equation weight would make the folded targets equal.
         let mut other_column = column.clone();
         other_column[0] = other_column[0].add(&Fp3::ONE);
@@ -1821,5 +1981,215 @@ mod tests {
             target = target.add(&weight.mul(value));
         }
         assert_eq!(row.target, target);
+    }
+
+    fn manual_slot(rows: u64, row_bits: u32, len: u64, value: u64) -> Option<usize> {
+        let row = value & ((1u64 << row_bits) - 1);
+        let place = value >> row_bits;
+        if row >= rows || place >= len {
+            None
+        } else {
+            Some((row * len + place) as usize)
+        }
+    }
+
+    #[test]
+    fn gu_table_keeps_index_pads_and_reserves_send_pads() {
+        // rows_high, main_rows 3, non-power ell 10, no mask.
+        let wide = tail_layout_shape(2, 0);
+        assert!(wide.fault().is_none());
+        assert!(gu_layout_fault(&wide).is_none());
+        let message: Vec<Fp3> = (0..8).map(|index| Fp3::from_u64(100 + index)).collect();
+        let tail = vec![Fp3::from_u64(200), Fp3::from_u64(201)];
+        let table = gu_table(&wide, &message, &tail).unwrap();
+        let mut expected = vec![Fp3::ZERO; (wide.u.main_rows * wide.u.code.ell) as usize];
+        let row_bits = 2u32;
+        let place_bits = wide.u.code.log_ell();
+        for (entry, value) in message.iter().enumerate() {
+            let value = *value;
+            let v = ((entry as u64) >> place_bits)
+                | (((entry as u64) & ((1u64 << place_bits) - 1)) << row_bits);
+            expected[manual_slot(wide.u.main_rows, row_bits, wide.u.code.ell, v).unwrap()] =
+                value;
+        }
+        let first = tail_first(&wide.index.code).unwrap();
+        for (entry, value) in tail.iter().enumerate() {
+            let v = ((first + entry as u64) >> place_bits)
+                | (((first + entry as u64) & ((1u64 << place_bits) - 1)) << row_bits);
+            expected[manual_slot(wide.u.main_rows, row_bits, wide.u.code.ell, v).unwrap()] =
+                *value;
+        }
+        // The index pads inside the message are retained.
+        for pad in 5..8 {
+            let v = ((pad as u64) >> place_bits)
+                | (((pad as u64) & ((1u64 << place_bits) - 1)) << row_bits);
+            expected[manual_slot(wide.u.main_rows, row_bits, wide.u.code.ell, v).unwrap()] =
+                message[pad];
+        }
+        let send_pad = (wide.u.main_rows - 1)
+            + ((wide.u.code.ell - wide.u.answers as u64) << row_bits);
+        let send_pad_offset =
+            manual_slot(wide.u.main_rows, row_bits, wide.u.code.ell, send_pad).unwrap();
+        expected[send_pad_offset] = Fp3::ZERO;
+        assert_eq!(table.main, expected);
+        assert!(table.mask.is_empty());
+
+        // With a mask, the G_u sample pad is in the mask table and the main
+        // folded data (including the index pads) stays.
+        let masked = tail_layout_shape(2, 1);
+        assert!(masked.fault().is_none());
+        let masked_table = gu_table(&masked, &message, &tail).unwrap();
+        let mut masked_expected = expected.clone();
+        masked_expected[send_pad_offset] = Fp3::ZERO;
+        assert_eq!(masked_table.main, masked_expected);
+        let mask_pad = (masked.u.mask_rows - 1)
+            + ((masked.u.mask_code.unwrap().ell - masked.u.answers as u64)
+                << ceil_log2(masked.u.mask_rows));
+        let mask_pad_offset = manual_slot(
+            masked.u.mask_rows,
+            ceil_log2(masked.u.mask_rows),
+            masked.u.mask_code.unwrap().ell,
+            mask_pad,
+        )
+        .unwrap();
+        assert_eq!(masked_table.mask[mask_pad_offset], Fp3::ZERO);
+        assert!(masked_table.mask.iter().all(|value| *value == Fp3::ZERO));
+
+        // The rows_low layout: main_rows 2, ell 6, index ell 4, tail 2.
+        let low = shape();
+        let message = vec![
+            Fp3::from_u64(10),
+            Fp3::from_u64(11),
+            Fp3::from_u64(12),
+            Fp3::from_u64(13),
+        ];
+        let tail = vec![Fp3::from_u64(20), Fp3::from_u64(21)];
+        let table = gu_table(&low, &message, &tail).unwrap();
+        let mut expected = vec![Fp3::ZERO; 12];
+        for entry in 0..4u64 {
+            let row = entry & 1;
+            let place = entry >> 1;
+            expected[(row * low.u.code.ell + place) as usize] = message[entry as usize];
+        }
+        let first = tail_first(&low.index.code).unwrap();
+        for entry in 0..2u64 {
+            let v = first + entry;
+            let row = v & 1;
+            let place = v >> 1;
+            expected[(row * low.u.code.ell + place) as usize] = tail[entry as usize];
+        }
+        assert_eq!(table.main, expected);
+
+        // A shape that passes fault() but has a real tail without a slot is
+        // rejected by the same layout check and by the table builder.
+        let bad = tail_layout_shape(4, 1);
+        assert!(bad.fault().is_none());
+        assert!(gu_layout_fault(&bad).is_some());
+        assert!(gu_table(&bad, &[Fp3::ONE; 8], &[Fp3::ONE; 4]).is_err());
+    }
+
+    #[test]
+    fn column_plan_rows_checks_the_plan_and_fixture_list() {
+        let shape = shape();
+        let registry = registry(&shape);
+        let column = column_values(&shape);
+        let eq_gamma = vec![Fp3::ONE; 4];
+        let fixture = vec![(1u64, column.clone()), (3u64, column.clone())];
+        let draws = [1u64, 1, 3];
+        let log_n = shape.index.code.log_n;
+        let rows = column_plan_rows(
+            &shape, &registry, 3, log_n, &draws, &fixture, &eq_gamma,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], rows[1]);
+        assert_eq!(unique_positions(&draws), vec![1, 3]);
+        assert!(column_plan_rows(
+            &shape, &registry, 2, log_n, &draws, &fixture, &eq_gamma
+        )
+        .is_err());
+        assert!(column_plan_rows(
+            &shape, &registry, 4, log_n, &draws, &fixture, &eq_gamma
+        )
+        .is_err());
+        assert!(column_plan_rows(
+            &shape, &registry, 3, log_n + 1, &draws, &fixture, &eq_gamma
+        )
+        .is_err());
+        assert!(column_plan_rows(
+            &shape,
+            &registry,
+            3,
+            log_n,
+            &[1, 1, (1u64 << log_n)],
+            &fixture,
+            &eq_gamma
+        )
+        .is_err());
+        let extra = vec![
+            (1u64, column.clone()),
+            (2u64, column.clone()),
+            (3u64, column.clone()),
+        ];
+        assert!(column_plan_rows(
+            &shape, &registry, 3, log_n, &draws, &extra, &eq_gamma
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn fixture_source_replacements_fail_at_the_matching_boundary() {
+        let shape = shape();
+        let registry = registry(&shape);
+        let name = index_name(&Digest([4; 32]), &shape.index, &Digest([7; 32]));
+        let seeds = record_seeds(&shape.index, &name, 1).unwrap();
+        let record = IndexRecord {
+            y: vec![
+                Fp3::from_u64(11),
+                Fp3::from_u64(13),
+                Fp3::from_u64(17),
+                Fp3::from_u64(19),
+            ],
+        };
+        let eq_gamma = vec![
+            Fp3::from_u64(2),
+            Fp3::from_u64(3),
+            Fp3::from_u64(5),
+            Fp3::from_u64(7),
+        ];
+        let row = record_row(&shape, &registry, &record, &name, &seeds, &eq_gamma, 0).unwrap();
+        // A different table name changes the recomputed seeds; the supplied
+        // fixture seeds no longer match.
+        let other_name = index_name(&Digest([6; 32]), &shape.index, &Digest([7; 32]));
+        assert!(record_row(
+            &shape, &registry, &record, &other_name, &seeds, &eq_gamma, 0
+        )
+        .is_err());
+        // A different row-point weight changes the target.
+        let mut other_gamma = eq_gamma.clone();
+        other_gamma[0] = other_gamma[0].add(&Fp3::ONE);
+        let other_row =
+            record_row(&shape, &registry, &record, &name, &seeds, &other_gamma, 0).unwrap();
+        assert_ne!(other_row.target, row.target);
+        // A different provided column changes the column target.
+        let column = column_values(&shape);
+        let column_row_value = column_row(&shape, &registry, 1, &column, &eq_gamma).unwrap();
+        let mut other_column = column.clone();
+        other_column[0] = other_column[0].add(&Fp3::ONE);
+        let other_column_row =
+            column_row(&shape, &registry, 1, &other_column, &eq_gamma).unwrap();
+        assert_ne!(other_column_row.target, column_row_value.target);
+        // A changed draw sequence does not match the provided unique columns.
+        let fixture = vec![(1u64, column.clone()), (3u64, column.clone())];
+        assert!(column_plan_rows(
+            &shape,
+            &registry,
+            2,
+            shape.index.code.log_n,
+            &[1, 2],
+            &fixture,
+            &eq_gamma
+        )
+        .is_err());
     }
 }
