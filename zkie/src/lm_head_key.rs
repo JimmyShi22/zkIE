@@ -1393,76 +1393,84 @@ pub fn run_limited_shared_to_columns(
         fold_output = Some(output);
         pending_rows = session.pending_gu_rows().len();
         transcript = *session.transcript_value();
-        if let (Some(inputs), Some(stage)) = (switch, fold_stage.as_ref()) {
-            let chain = session.take_chain_for_base()?;
-            let first = run_switch(
-                chain,
-                stage,
-                inputs.target,
-                inputs.plan.clone(),
-                inputs.main_tails.clone(),
-                inputs.mask_tails.clone(),
-                inputs.pad,
-                &inputs.salts,
-                SwitchMembers::Initial {
-                    gu: &provider,
-                    omega: &omega_provider,
-                    old_mask,
-                    fresh: &setup.mask,
-                },
-            )?;
-            cs_claims = Some(first.claims.clone());
-            cs_message = Some(first.message.clone());
-            transcript = *first.chain.value();
-            if let Some(spec) = inputs.stage_fold {
-                let row = FoldInputRow {
-                    group: spec.group,
-                    k: spec.shape.k,
-                    h: spec.shape.h,
-                    members: vec![spec.member],
-                    coefficients: first.claims.combined.main.clone(),
-                    mask_coefficients: first.claims.combined.mask.clone(),
-                    kept: Vec::new(),
-                    target: first.claims.combined.target,
+        if let (Some(inputs), Some(stage0)) = (switch, fold_stage.as_ref()) {
+            let mut chain = session.take_chain_for_base()?;
+            let mut stage = stage0.clone();
+            let mut step = Some(inputs);
+            let mut previous: Option<CsMultiProver> = None;
+            let mut folds: Vec<StageFoldOutcome> = Vec::new();
+            let mut stages: Vec<LimitedFoldStage> = Vec::new();
+            let mut first = true;
+            while let Some(inputs) = step {
+                let members = if first {
+                    SwitchMembers::Initial {
+                        gu: &provider,
+                        omega: &omega_provider,
+                        old_mask,
+                        fresh: &setup.mask,
+                    }
+                } else {
+                    let member = previous.as_ref().ok_or(Error::InvalidSessionState)?;
+                    let fresh = &folds
+                        .last()
+                        .ok_or(Error::InvalidSessionState)?
+                        .fresh;
+                    SwitchMembers::Stage { member, fresh }
                 };
-                let outcome = run_stage_fold(
-                    first.chain.clone(),
-                    &spec,
-                    row,
-                    first.message.main.clone(),
-                    first.message.mask.clone(),
+                let run = run_switch(
+                    chain,
+                    &stage,
+                    inputs.target,
+                    inputs.plan.clone(),
+                    inputs.main_tails.clone(),
+                    inputs.mask_tails.clone(),
+                    inputs.pad,
+                    &inputs.salts,
+                    members,
                 )?;
-                transcript = *outcome.chain.value();
-                let rows = build_stage_fold_stage(
-                    &spec,
-                    &outcome,
-                    first.prover.root(),
-                    first.prover.plan().clone(),
-                    first.prover.main_tails(),
-                    first.prover.mask_tails(),
-                )?;
-                if let Some(next) = inputs.next {
-                    let second = run_switch(
-                        outcome.chain.clone(),
-                        &rows,
-                        next.target,
-                        next.plan.clone(),
-                        next.main_tails.clone(),
-                        next.mask_tails.clone(),
-                        next.pad,
-                        &next.salts,
-                        SwitchMembers::Stage {
-                            member: &first.prover,
-                            fresh: &outcome.fresh,
-                        },
+                chain = run.chain;
+                cs_claims = Some(run.claims.clone());
+                cs_message = Some(run.message.clone());
+                transcript = *chain.value();
+                previous = Some(run.prover);
+                if let Some(spec) = inputs.stage_fold {
+                    let row = FoldInputRow {
+                        group: spec.group,
+                        k: spec.shape.k,
+                        h: spec.shape.h,
+                        members: vec![spec.member],
+                        coefficients: run.claims.combined.main.clone(),
+                        mask_coefficients: run.claims.combined.mask.clone(),
+                        kept: Vec::new(),
+                        target: run.claims.combined.target,
+                    };
+                    let outcome = run_stage_fold(
+                        chain.clone(),
+                        &spec,
+                        row,
+                        run.message.main.clone(),
+                        run.message.mask.clone(),
                     )?;
-                    transcript = *second.chain.value();
-                    cs_claims = Some(second.claims);
-                    cs_message = Some(second.message);
+                    chain = outcome.chain.clone();
+                    transcript = *chain.value();
+                    let member = previous.as_ref().ok_or(Error::InvalidSessionState)?;
+                    let rows = build_stage_fold_stage(
+                        &spec,
+                        &outcome,
+                        member.root(),
+                        member.plan().clone(),
+                        member.main_tails(),
+                        member.mask_tails(),
+                    )?;
+                    stage = rows.clone();
+                    folds.push(outcome);
+                    stages.push(rows);
                 }
-                stage_fold = Some(outcome);
-                stage_rows = Some(rows);
+                step = inputs.next.map(|next| *next);
+                first = false;
             }
+            stage_fold = folds.pop();
+            stage_rows = stages.pop();
         }
         }
     } else if omega_randomness.is_some() {
@@ -1936,6 +1944,7 @@ fn group_main_messages(
 
 /// The FOLD-to-CS handoff of one shared run: the verified handoff, the
 /// original member commitments and the prover's two-mask single rows.
+#[derive(Clone)]
 pub struct LimitedFoldStage {
     pub handoff: FoldHandoff,
     pub basis: FoldBasis,
@@ -3640,6 +3649,19 @@ mod tests {
         let salts2: Vec<Vec<u8>> = (0..plan2.columns())
             .map(|position| vec![(position as u8) ^ 0x7b; 40])
             .collect();
+        let final_code = build_code_plan(6, 8, 1)?;
+        let final_mask = build_code_plan(6, 32, 1)?;
+        let final_target = SwitchTarget::from_stage(final_code, final_mask, 0, 0, 1)?;
+        let final_plan = switch_tree_plan_multi(
+            3,
+            &final_target,
+            40,
+            Digest([0x71; 32]),
+            Digest([0x72; 32]),
+        )?;
+        let final_salts: Vec<Vec<u8>> = (0..final_plan.columns())
+            .map(|position| vec![(position as u8) ^ 0x7c; 40])
+            .collect();
         run_limited_shared_to_columns(
             setup,
             &key,
@@ -3703,8 +3725,54 @@ mod tests {
                         .collect(),
                     pad: Fp3::from_u64(0x9b),
                     salts: salts2,
-                    stage_fold: None,
-                    next: None,
+                    stage_fold: Some(StageFoldSpec {
+                        shape: FoldShape {
+                            code: next_code,
+                            mask_code: next_mask,
+                            k: 2,
+                            h: 2,
+                            mask_leaf_class: 0,
+                        },
+                        layout: FoldGroupLayout {
+                            group: 1,
+                            k: 2,
+                            h: 2,
+                            members: vec![FoldMemberLayout {
+                                oracle: 1,
+                                main_rows: 4,
+                                mask_rows: 4,
+                                kept: false,
+                            }],
+                        },
+                        mask_tree: MaskTreePlan {
+                            tree_number: 2,
+                            leaf_class: 0,
+                            log_n: next_mask.log_n,
+                            mask_rows: 4,
+                            salt_bytes: 40,
+                            run: Digest([0x63; 32]),
+                            configuration: key.reader.configuration,
+                        },
+                        group: 1,
+                        member: 1,
+                        fresh: 3,
+                        randomness: LmHeadMaskRandomness {
+                            seed: Digest([0x65; 32]),
+                            salts: (0..32)
+                                .map(|position| vec![(position as u8) ^ 0x6b; 40])
+                                .collect(),
+                        },
+                    }),
+                    next: Some(Box::new(LimitedSwitchInputs {
+                        target: final_target,
+                        plan: final_plan,
+                        main_tails: vec![vec![Fp3::from_u64(0x240)]],
+                        mask_tails: vec![vec![Fp3::from_u64(0x340)]],
+                        pad: Fp3::from_u64(0x9c),
+                        salts: final_salts,
+                        stage_fold: None,
+                        next: None,
+                    })),
                 })),
             }),
         )
@@ -3726,7 +3794,7 @@ mod tests {
         let claims = run.cs_claims.as_ref().expect("cs claims");
         let message = run.cs_message.as_ref().expect("cs message");
         assert_eq!(claims.claims.len(), 8);
-        assert_eq!(claims.combined.main.len(), 16);
+        assert_eq!(claims.combined.main.len(), 8);
         assert_eq!(claims.combined.mask.len(), 32);
         let mut value = Fp3::ZERO;
         for (coefficient, symbol) in claims.combined.main.iter().zip(&message.main) {
