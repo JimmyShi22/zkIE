@@ -42,11 +42,12 @@ use crate::pcs::request::chain::{
     Chain, KIND_ALGEBRAIC, KIND_EPSILON, KIND_EMPTY, KIND_POSITIONS, KIND_SEAL, KIND_SEED,
 };
 use crate::pcs::request::field::{Fp, Fp3};
-use crate::pcs::request::gu::{GuMembership, GuNotice, GuRegistry, GuShape};
+use crate::pcs::request::gu::{GuMembership, GuNotice, GuOracleShape, GuRegistry, GuShape};
 use crate::pcs::request::relation::{
-    column_plan_rows, foldeq_weights, record_row, sample_row, GuRelationRow,
+    column_plan_rows, foldeq_weights, oracle_sample_row, record_row, sample_cube_of,
+    sample_row, GuRelationRow,
 };
-use crate::pcs::request::runtime_tree::RuntimeTreeOpening;
+use crate::pcs::request::runtime_tree::{RuntimeTreeOpening, RuntimeTreePlan};
 use crate::pcs::request::fold::{
     fold_mask_shape_fault, fold_output, fold_start_verify, fold_start_verify_with_groups,
     FoldGroupLayout, FoldInputRow, FoldOutput, FoldRoundVerifier, FoldShape, FoldStartMessage,
@@ -572,6 +573,79 @@ impl FoldeqEdgeBinding {
     }
 }
 
+/// The trusted plan of the shared chain's Omega oracle message. Omega is a
+/// static member of the FOLD group; its vector is read by the FOLD row and
+/// its message carries one sample answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OmegaShapePlan {
+    pub oracle: u64,
+    pub group: u64,
+    pub tree: RuntimeTreePlan,
+    pub u: GuOracleShape,
+    pub rows_high: bool,
+    pub matrix_rows: u64,
+    pub k_lo: u32,
+}
+
+impl OmegaShapePlan {
+    pub fn fault(&self) -> Option<&'static str> {
+        if self.u.fault().is_some() {
+            return Some("the Omega oracle shape is not an oracle shape");
+        }
+        if self.u.mask_rows != 0 || self.u.answers != 1 {
+            return Some("the Omega oracle is not a maskless single-answer message");
+        }
+        if self.tree.fault().is_some() {
+            return Some("the Omega tree is not a runtime tree");
+        }
+        if self.tree.parts.len() != 1 {
+            return Some("the Omega tree is not one part");
+        }
+        let part = &self.tree.parts[0];
+        let main_symbols = match self.u.main_rows.checked_mul(self.u.main_deg as u64) {
+            Some(value) => value,
+            None => return Some("the Omega main width overflows"),
+        };
+        if part.main_symbols != main_symbols || part.mask_symbols != 0 {
+            return Some("the Omega part's widths are not its oracle shape's");
+        }
+        if self.tree.log_n != self.u.code.log_n {
+            return Some("the Omega tree depth is not the oracle code's depth");
+        }
+        if self.matrix_rows < 1
+            || !self.matrix_rows.is_power_of_two()
+            || self.matrix_rows > (1u64 << 30)
+            || self.k_lo >= 32
+        {
+            return Some("the Omega vector shape is not executable");
+        }
+        if self.matrix_rows + self.u.answers as u64 > self.u.code.ell {
+            return Some("the Omega vector does not fit its message beside the pad");
+        }
+        None
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut writer = CanonicalWriter::new();
+        writer.put_u64(self.oracle);
+        writer.put_u64(self.group);
+        let tree = self.tree.encode();
+        writer.put_u64(tree.len() as u64);
+        writer.put_bytes(&tree);
+        writer.put_u64(if self.rows_high { 1 } else { 0 });
+        writer.put_u64(self.u.code.log_n as u64);
+        writer.put_u64(self.u.code.ell);
+        writer.put_u64(self.u.code.r);
+        writer.put_u64(self.u.main_rows);
+        writer.put_u64(self.u.main_deg as u64);
+        writer.put_u64(self.u.mask_rows);
+        writer.put_u64(self.u.answers as u64);
+        writer.put_u64(self.matrix_rows);
+        writer.put_u64(self.k_lo as u64);
+        writer.into_bytes()
+    }
+}
+
 /// The verifier's FOLDEQ plan. The reader is the committed table, the fold and
 /// runtime mask-tree layouts and the group registry come from the statement,
 /// and the seed/read budgets and column draw count come from the plan. None of
@@ -604,6 +678,8 @@ pub struct FoldeqPlan {
     /// The trusted fixed group layout for the isolated FOLD input row. It is a
     /// fixture supplied by the plan, not a proof field.
     pub fold_layout: Option<FoldGroupLayout>,
+    /// The shared chain's Omega oracle plan, when the chain carries it.
+    pub omega: Option<OmegaShapePlan>,
 }
 
 impl FoldeqPlan {
@@ -697,6 +773,27 @@ impl FoldeqPlan {
                 if layout.fault(&self.fold).is_some() {
                     return Some("the FOLD layout does not match the fold shape");
                 }
+            }
+        }
+        if let Some(omega) = &self.omega {
+            if omega.fault().is_some() {
+                return Some("the Omega shape is not valid");
+            }
+            if self.gu.is_none() {
+                return Some("the Omega message has no G_u message");
+            }
+            if omega.group != self.group_id {
+                return Some("the Omega group is not the FOLD group");
+            }
+            if omega.oracle == self.gu.as_ref().expect("checked").oracle {
+                return Some("the Omega oracle is the G_u oracle");
+            }
+            let group = match self.statement.groups().get(self.group_id) {
+                Some(group) => group,
+                None => return Some("the plan names a group the verifier does not hold"),
+            };
+            if !group.members.contains(&omega.oracle) || group.fresh == Some(omega.oracle) {
+                return Some("the Omega oracle is not a static member of the FOLD group");
             }
         }
         match self.gamma_path {
@@ -822,6 +919,15 @@ impl FoldeqPlan {
             }
             None => writer.put_u64(0),
         }
+        match &self.omega {
+            Some(omega) => {
+                writer.put_u64(1);
+                let bytes = omega.encode();
+                writer.put_u64(bytes.len() as u64);
+                writer.put_bytes(&bytes);
+            }
+            None => writer.put_u64(0),
+        }
         writer.into_bytes()
     }
 
@@ -864,6 +970,10 @@ enum Stage {
     FoldStarted,
     FoldRounds,
     FoldFinished,
+    Omega,
+    OmegaAnswers,
+    OmegaJoined,
+    ZetaDrawn,
     MaskQueried,
     MaskOpened,
 }
@@ -891,6 +1001,13 @@ pub struct FoldeqSession {
     gu_read_columns: Option<Vec<Vec<Fp>>>,
     gu_columns_source: Option<GuColumnSource>,
     gu_rows: Vec<GuRelationRow>,
+    omega_root: Option<Digest>,
+    omega_seeds: Vec<SampleSeed>,
+    omega_answers: Vec<Fp3>,
+    omega_answered: usize,
+    omega_rows: Vec<GuRelationRow>,
+    omega_joined: bool,
+    zeta: Option<Vec<Fp3>>,
     fold_row: Option<FoldInputRow>,
     fold_claim: Option<FoldRoundVerifier>,
     fold_gamma: Vec<Fp3>,
@@ -934,6 +1051,13 @@ impl FoldeqSession {
             gu_read_columns: None,
             gu_columns_source: None,
             gu_rows: Vec::new(),
+            omega_root: None,
+            omega_seeds: Vec::new(),
+            omega_answers: Vec::new(),
+            omega_answered: 0,
+            omega_rows: Vec::new(),
+            omega_joined: false,
+            zeta: None,
             fold_row: None,
             fold_claim: None,
             fold_gamma: Vec::new(),
@@ -988,6 +1112,13 @@ impl FoldeqSession {
             gu_read_columns: None,
             gu_columns_source: None,
             gu_rows: Vec::new(),
+            omega_root: None,
+            omega_seeds: Vec::new(),
+            omega_answers: Vec::new(),
+            omega_answered: 0,
+            omega_rows: Vec::new(),
+            omega_joined: false,
+            zeta: None,
             fold_row: None,
             fold_claim: None,
             fold_gamma: Vec::new(),
@@ -1404,6 +1535,184 @@ impl FoldeqSession {
         Ok(())
     }
 
+    /// SEND of Omega: bind the received root on the shared chain after the
+    /// table columns were verified. Omega is a static member of the FOLD
+    /// group; its sample answer round follows.
+    pub fn send_omega(&mut self, root: &Digest) -> Result<()> {
+        if self.stage != Stage::Read {
+            return Err(Error::InvalidSessionState);
+        }
+        if self.gu_columns_source != Some(GuColumnSource::Verified)
+            || self.gu_membership.is_none()
+        {
+            return Err(Error::InvalidSessionState);
+        }
+        let omega = self
+            .plan
+            .omega
+            .as_ref()
+            .ok_or(Error::InvalidSessionState)?
+            .clone();
+        if *root == Digest::ZERO {
+            return Err(Error::InvalidProof);
+        }
+        let mut message = self.chain.message();
+        for chunk in root.0.chunks(8) {
+            let word = u64::from_le_bytes(chunk.try_into().map_err(|_| Error::InvalidEncoding)?);
+            message.push_u64(word);
+        }
+        let prefix = message.prefix(KIND_SEED, 0)?;
+        if !self.chain.step(&prefix, 0)? {
+            return Err(Error::InvalidProof);
+        }
+        self.omega_root = Some(*root);
+        self.omega_seeds.clear();
+        self.omega_answers.clear();
+        self.omega_answered = 0;
+        self.omega_rows.clear();
+        self.omega_joined = false;
+        let _ = omega;
+        self.stage = Stage::Omega;
+        Ok(())
+    }
+
+    /// Draw Omega's own sample seeds after its root. The seed width is the
+    /// oracle's cube width; the caller cannot supply or replace it.
+    pub fn omega_seeds(&mut self) -> Result<Vec<SampleSeed>> {
+        if self.stage != Stage::Omega {
+            return Err(Error::InvalidSessionState);
+        }
+        let omega = self
+            .plan
+            .omega
+            .as_ref()
+            .ok_or(Error::InvalidSessionState)?
+            .clone();
+        let bits = sample_cube_of(&omega.u)?.bits as usize;
+        let answers = omega.u.answers as usize;
+        let mut seeds = Vec::with_capacity(answers);
+        for _ in 0..answers {
+            let mut z = Vec::with_capacity(bits);
+            for _ in 0..bits {
+                z.push(self.chain.draw_e()?);
+            }
+            let beta = self.chain.draw_e_nonzero()?;
+            seeds.push(SampleSeed { z, beta });
+        }
+        self.omega_seeds = seeds.clone();
+        self.omega_answers.clear();
+        self.omega_answered = 0;
+        self.stage = Stage::OmegaAnswers;
+        Ok(seeds)
+    }
+
+    /// Receive the next Omega sample answer in the fixed order. The row uses
+    /// the ordinary-oracle sample relation; the answer round closes after the
+    /// last answer.
+    pub fn receive_omega_answer(&mut self, target: Fp3) -> Result<()> {
+        if self.stage != Stage::OmegaAnswers {
+            return Err(Error::InvalidSessionState);
+        }
+        let omega = self
+            .plan
+            .omega
+            .as_ref()
+            .ok_or(Error::InvalidSessionState)?
+            .clone();
+        if self.omega_answered >= omega.u.answers as usize {
+            return Err(Error::InvalidSessionState);
+        }
+        let row = oracle_sample_row(
+            omega.oracle,
+            omega.group,
+            &omega.u,
+            &self.omega_seeds,
+            self.omega_answered as u32,
+            target,
+        )?;
+        self.omega_rows.push(row);
+        self.omega_answers.push(target);
+        self.omega_answered += 1;
+        if self.omega_answered == omega.u.answers as usize {
+            let mut message = self.chain.message();
+            for answer in &self.omega_answers {
+                message.push_fp3(answer);
+            }
+            let prefix = message.prefix(KIND_EMPTY, 0)?;
+            if !self.chain.step(&prefix, 0)? {
+                return Err(Error::InvalidProof);
+            }
+            self.stage = Stage::OmegaJoined;
+        }
+        Ok(())
+    }
+
+    /// Join Omega's sample rows into the FOLD group. The root and the static
+    /// group membership are already fixed; every row must name Omega and the
+    /// FOLD group.
+    pub fn join_omega(&mut self) -> Result<()> {
+        if self.stage != Stage::OmegaJoined || self.omega_joined {
+            return Err(Error::InvalidSessionState);
+        }
+        let omega = self
+            .plan
+            .omega
+            .as_ref()
+            .ok_or(Error::InvalidSessionState)?
+            .clone();
+        let membership = self
+            .gu_membership
+            .as_ref()
+            .ok_or(Error::InvalidSessionState)?;
+        if omega.group != self.plan.group_id
+            || membership.group != omega.group
+            || !membership.members.contains(&omega.oracle)
+            || self.omega_root.is_none()
+            || self.omega_rows.len() != omega.u.answers as usize
+            || self
+                .omega_rows
+                .iter()
+                .any(|row| row.oracle != omega.oracle || row.group != omega.group)
+        {
+            return Err(Error::StatementMismatch);
+        }
+        self.omega_joined = true;
+        Ok(())
+    }
+
+    /// Draw the row point zeta after Omega was joined. Its width is the
+    /// matrix row bits; the caller cannot supply it.
+    pub fn draw_zeta(&mut self) -> Result<Vec<Fp3>> {
+        if !self.omega_joined || self.zeta.is_some() {
+            return Err(Error::InvalidSessionState);
+        }
+        let omega = self
+            .plan
+            .omega
+            .as_ref()
+            .ok_or(Error::InvalidSessionState)?
+            .clone();
+        if omega.fault().is_some() {
+            return Err(Error::InvalidConfig);
+        }
+        let k_row = omega.matrix_rows.trailing_zeros();
+        let prefix = self.chain.message().prefix(KIND_ALGEBRAIC, 0)?;
+        if !self.chain.step(&prefix, 0)? {
+            return Err(Error::InvalidProof);
+        }
+        let mut zeta = Vec::with_capacity(k_row as usize);
+        for _ in 0..k_row {
+            zeta.push(self.chain.draw_e()?);
+        }
+        self.zeta = Some(zeta.clone());
+        self.stage = Stage::ZetaDrawn;
+        Ok(zeta)
+    }
+
+    pub fn zeta(&self) -> Option<&[Fp3]> {
+        self.zeta.as_deref()
+    }
+
     pub fn pending_gu_rows(&self) -> &[GuRelationRow] {
         &self.gu_rows
     }
@@ -1498,7 +1807,7 @@ impl FoldeqSession {
     /// view consumed by the FOLD check, and requires the FOLD target group to
     /// be the joined group and the column rows to come from verified reads.
     pub fn start_fold(&mut self, message: &FoldStartMessage) -> Result<()> {
-        if self.stage != Stage::Read {
+        if self.stage != Stage::Read && self.stage != Stage::ZetaDrawn {
             return Err(Error::InvalidSessionState);
         }
         if self.plan.gu.is_some() {
@@ -1581,7 +1890,7 @@ impl FoldeqSession {
     /// can replace it. The group/layout/membership checks use the trusted plan
     /// and the session's fixed membership, never a proof-supplied row.
     pub fn fold_bind_row(&mut self, row: FoldInputRow) -> Result<()> {
-        if self.stage != Stage::Read {
+        if self.stage != Stage::Read && self.stage != Stage::ZetaDrawn {
             return Err(Error::InvalidSessionState);
         }
         if self.fold_row.is_some() {
@@ -2175,6 +2484,7 @@ mod tests {
             mask_query_count: 2,
             gamma_path: GammaPath::Lin { shape: LinShapeBinding { matrix_rows: 1, k_lo: 0, k_col: 2 } },
             gu: None,
+            omega: None,
             fold_layout: None,
         };
         (plan, table)

@@ -2658,6 +2658,7 @@ mod tests {
                 columns: gu.index.v,
             },
             gu: Some(gu),
+            omega: None,
             fold_layout: None,
         }
     }

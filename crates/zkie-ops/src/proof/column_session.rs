@@ -726,6 +726,7 @@ pub(crate) fn build_demo_setup(
             columns: table.shape.v,
         },
         gu: Some(gu_shape),
+        omega: None,
         fold_layout: Some(fold_layout),
     };
     if plan.fault().is_some() {

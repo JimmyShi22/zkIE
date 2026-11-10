@@ -24,7 +24,7 @@ use zkie_engine::pcs::request::fold::{
 };
 use zkie_engine::pcs::request::foldeq::{
     reader_table_identity, FoldeqBinder, FoldeqBinding, FoldeqEdgeBinding, FoldeqPlan,
-    FoldeqSession, GammaPath, LinShapeBinding,
+    FoldeqSession, GammaPath, LinShapeBinding, OmegaShapePlan,
 };
 use zkie_engine::pcs::request::gu::{GuNotice, GuOracleShape, GuRegistry, GuShape};
 use zkie_engine::pcs::request::params::{RequestParams, SHARED_CHAIN_LABEL};
@@ -408,6 +408,7 @@ pub const LM_HEAD_OMEGA_ORACLE: u64 = 2;
 pub const LM_HEAD_FRESH_MASK: u64 = 3;
 pub const LM_HEAD_MASK_TREE: u64 = 0;
 pub const LM_HEAD_GU_TREE: u64 = 2;
+pub const LM_HEAD_OMEGA_TREE: u64 = 3;
 
 /// The table columns drawn by the one-time shared test.
 pub const LM_HEAD_COLUMN_DRAWS: usize = 603;
@@ -524,7 +525,6 @@ pub fn build_limited_shared_session(
     }
 
     let gu_oracle = compiled.once_foldeq.u.clone();
-    let omega = compiled.once_foldeq.omega.clone();
     let gu_tree = RuntimeTreePlan {
         tree_number: LM_HEAD_GU_TREE,
         leaf_class: compiled.once_foldeq.fold_leaf_class,
@@ -558,6 +558,38 @@ pub fn build_limited_shared_session(
         index: reader.shape,
     };
 
+    let omega_oracle = compiled.once_foldeq.omega.clone();
+    let omega = OmegaShapePlan {
+        oracle: LM_HEAD_OMEGA_ORACLE,
+        group: LM_HEAD_FOLD_GROUP,
+        tree: RuntimeTreePlan {
+            tree_number: LM_HEAD_OMEGA_TREE,
+            leaf_class: compiled.once_foldeq.omega_leaf_class,
+            log_n: omega_oracle.code.log_n,
+            log_n_zk: omega_oracle.code.log_n,
+            parts: vec![RuntimeTreePart {
+                main_symbols: omega_oracle
+                    .main_rows
+                    .checked_mul(omega_oracle.main_deg as u64)
+                    .ok_or(Error::ResourceLimit)?,
+                mask_symbols: 0,
+            }],
+            salt_bytes: request_plan.salt_bytes,
+            run,
+            configuration,
+        },
+        u: GuOracleShape {
+            code: omega_oracle.code,
+            main_rows: omega_oracle.main_rows,
+            main_deg: omega_oracle.main_deg,
+            mask_rows: omega_oracle.mask_rows,
+            mask_code: omega_oracle.mask_code,
+            answers: omega_oracle.answers,
+        },
+        rows_high: true,
+        matrix_rows: 1u64 << request_plan.lin.matrix_rows_log,
+        k_lo: request_plan.lin.k_lo,
+    };
     let mask_tree = MaskTreePlan {
         tree_number: LM_HEAD_MASK_TREE,
         leaf_class: fold.mask_leaf_class,
@@ -609,8 +641,8 @@ pub fn build_limited_shared_session(
             },
             FoldMemberLayout {
                 oracle: LM_HEAD_OMEGA_ORACLE,
-                main_rows: omega.main_rows,
-                mask_rows: omega.mask_rows,
+                main_rows: omega_oracle.main_rows,
+                mask_rows: omega_oracle.mask_rows,
                 kept: false,
             },
         ],
@@ -652,6 +684,7 @@ pub fn build_limited_shared_session(
         },
         gu: Some(gu),
         fold_layout: Some(layout),
+        omega: Some(omega),
     };
     if plan.fault().is_some() {
         return Err(Error::InvalidConfig);
@@ -1057,6 +1090,8 @@ pub struct LimitedSharedColumns {
     pub answers: Vec<Fp3>,
     pub queries: Vec<u64>,
     pub root: Digest,
+    pub omega_root: Option<Digest>,
+    pub zeta: Vec<Fp3>,
     pub transcript: Digest,
 }
 
@@ -1070,6 +1105,7 @@ pub fn run_limited_shared_to_columns(
     key: &LmHeadKey,
     table_tails: &[Vec<Fp>],
     randomness: &LmHeadGuRandomness,
+    omega_randomness: Option<&LmHeadOmegaRandomness>,
 ) -> Result<(FoldeqSession, LimitedSharedColumns)> {
     let mut session = FoldeqSession::open(setup.plan, setup.binder, setup.chain)?;
     session.bind_first_query(&setup.first_query)?;
@@ -1113,6 +1149,39 @@ pub fn run_limited_shared_to_columns(
     }
     session.read_queries(&openings)?;
     session.join_gu_read_columns()?;
+    let mut omega_root = None;
+    let mut zeta = Vec::new();
+    if let Some(omega) = session.plan().omega.as_ref().cloned() {
+        let omega_randomness = omega_randomness.ok_or(Error::InvalidConfig)?;
+        let psi_lo: &[Fp3] = match session.psi() {
+            Some(psi) => psi
+                .get(..omega.k_lo as usize)
+                .ok_or(Error::ShapeMismatch)?,
+            None if omega.k_lo == 0 => &[],
+            None => return Err(Error::StatementMismatch),
+        };
+        let omega_provider = commit_lm_head_omega(
+            &provider,
+            omega.oracle,
+            omega.group,
+            &omega.u,
+            &omega.tree,
+            omega.matrix_rows,
+            omega.k_lo,
+            psi_lo,
+            omega_randomness,
+        )?;
+        session.send_omega(&omega_provider.root())?;
+        let seeds = session.omega_seeds()?;
+        for answer in omega_provider.answers(&seeds)? {
+            session.receive_omega_answer(answer)?;
+        }
+        session.join_omega()?;
+        zeta = session.draw_zeta()?;
+        omega_root = Some(omega_provider.root());
+    } else if omega_randomness.is_some() {
+        return Err(Error::InvalidConfig);
+    }
     let transcript = *session.transcript_value();
     Ok((
         session,
@@ -1122,6 +1191,8 @@ pub fn run_limited_shared_to_columns(
             answers,
             queries,
             root: provider.root(),
+            omega_root,
+            zeta,
             transcript,
         },
     ))
@@ -1723,6 +1794,14 @@ mod tests {
                 },
             }
         );
+        let omega = plan.omega.as_ref().expect("Omega plan");
+        assert_eq!(omega.oracle, LM_HEAD_OMEGA_ORACLE);
+        assert_eq!(omega.group, LM_HEAD_FOLD_GROUP);
+        assert_eq!(omega.tree.run, expected_run);
+        assert_eq!(omega.tree.configuration, plan.reader.configuration);
+        assert_eq!(omega.tree.leaf_class, 1);
+        assert_eq!(omega.matrix_rows, 1u64 << request_plan.lin.matrix_rows_log);
+        assert_eq!(omega.k_lo, request_plan.lin.k_lo);
         assert_eq!(plan.column_draws, LM_HEAD_COLUMN_DRAWS);
         assert_eq!(
             plan.ledger.lock().expect("ledger").max_reads(),
@@ -2134,6 +2213,35 @@ mod tests {
             table_identity,
         )?;
         let binding = FoldeqBinding::new(&parameters, binding_statement, &key.reader)?;
+        let omega_code = build_code_plan(4, 8, 1)?;
+        let omega = OmegaShapePlan {
+            oracle: 2,
+            group: 1,
+            tree: RuntimeTreePlan {
+                tree_number: 3,
+                leaf_class: 1,
+                log_n: omega_code.log_n,
+                log_n_zk: omega_code.log_n,
+                parts: vec![RuntimeTreePart {
+                    main_symbols: 3,
+                    mask_symbols: 0,
+                }],
+                salt_bytes: 40,
+                run: Digest([0x36; 32]),
+                configuration: key.reader.configuration,
+            },
+            u: GuOracleShape {
+                code: omega_code,
+                main_rows: 1,
+                main_deg: 3,
+                mask_rows: 0,
+                mask_code: None,
+                answers: 1,
+            },
+            rows_high: true,
+            matrix_rows: 1u64 << key.shape.v,
+            k_lo: 0,
+        };
         let plan = FoldeqPlan {
             reader: key.reader.clone(),
             binding,
@@ -2153,6 +2261,7 @@ mod tests {
             },
             gu: Some(gu),
             fold_layout: Some(layout),
+            omega: Some(omega),
         };
         if plan.fault().is_some() {
             return Err(Error::InvalidConfig);
@@ -2171,7 +2280,14 @@ mod tests {
             chain,
             first_query,
         };
-        run_limited_shared_to_columns(setup, &key, &tails, &randomness)
+        let omega_randomness = LmHeadOmegaRandomness {
+            code_tails: vec![vec![Fp3::from_u64(9)]],
+            salts: (0..16)
+                .map(|position| vec![(position as u8) ^ 0x33; 40])
+                .collect(),
+            pad: Fp3::from_u64(0x888),
+        };
+        run_limited_shared_to_columns(setup, &key, &tails, &randomness, Some(&omega_randomness))
     }
 
     #[test]
@@ -2184,6 +2300,9 @@ mod tests {
         assert_eq!(run.answers.len(), 1);
         assert_eq!(run.queries.len(), 2);
         assert_eq!(session.pending_gu_rows().len(), 4);
+        assert!(run.omega_root.is_some());
+        assert_eq!(run.zeta.len(), 2);
+        assert!(session.zeta().is_some());
     }
 
 

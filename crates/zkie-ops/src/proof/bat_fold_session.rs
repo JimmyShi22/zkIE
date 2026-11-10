@@ -953,6 +953,7 @@ impl BatFoldFixture {
                 columns: self.reader.shape.v,
             },
             gu: None,
+            omega: None,
             fold_layout: Some(layout.clone()),
         })
     }
