@@ -1,0 +1,68 @@
+warning: unused variable: `k_step`
+   --> models/gpt2/src/executor.rs:346:21
+    |
+346 |             let (k, k_step) = {
+    |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_step`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `m`
+   --> models/gemma3/src/executor.rs:277:5
+    |
+277 |     m: usize,
+    |     ^ help: if this is intentional, prefix it with an underscore: `_m`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_rot_step`
+   --> models/gemma3/src/executor.rs:390:21
+    |
+390 |         let (k_rot, k_rot_step) = rope(&mut builder, k, k_step, cos_prefix.clone(), sin_prefix.clone(), m)?;
+    |                     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_rot_step`
+
+warning: `zkie-models-gpt2` (lib) generated 1 warning (run `cargo fix --lib -p zkie-models-gpt2` to apply 1 suggestion)
+warning: `zkie-models-gemma3` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gemma3` to apply 2 suggestions)
+   Compiling zkie v0.1.0 (/data/zkIE/zkie)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.23s
+     Running tests/column_session.rs (target/debug/deps/column_session-378f751b2e36e822)
+
+running 1 test
+test selected_gpt2_column_verification_components has been running for over 60 seconds
+full_recompute_control_ms=16538
+column_session_ms=362
+asset_root=Digest([154, 139, 228, 237, 187, 195, 144, 253, 104, 68, 113, 3, 153, 68, 23, 136, 80, 108, 47, 31, 58, 31, 201, 201, 201, 94, 25, 224, 103, 151, 24, 50])
+table_root=Digest([131, 166, 44, 57, 149, 179, 56, 35, 210, 155, 84, 101, 247, 162, 113, 214, 155, 44, 201, 164, 247, 61, 76, 64, 62, 233, 233, 108, 1, 246, 35, 179])
+gu_root=Digest([71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71])
+queries=[4, 7, 7, 4]
+opened_positions=[4, 7]
+gamma=[Fp3 { c: [3429814736110695461, 5483785243576898673, 7463767304899148856] }, Fp3 { c: [17153637724026608083, 6326751155259042370, 1001853388358087125] }]
+eq_gamma=[Fp3 { c: [11580842302013180311, 7063440887145216597, 8159058296944236429] }, Fp3 { c: [8159008112789380249, 5056552027010325354, 9285832384112260767] }, Fp3 { c: [3436087031290708550, 5899517938692469051, 2823918467571199036] }, Fp3 { c: [13717550692735899533, 427233216566573319, 16624678990201472410] }]
+column_cells=16
+gu_rows=6
+test selected_gpt2_column_verification_components ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 72.86s
+
+	Command being timed: "env ZKIE_SESSION_FIXTURE=<fixture> cargo test -p zkie --test column_session -- --ignored --nocapture"
+	User time (seconds): 221.38
+	System time (seconds): 3.29
+	Percent of CPU this job got: 306%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:13.20
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 6377344
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 767
+	Minor (reclaiming a frame) page faults: 1198792
+	Voluntary context switches: 26557
+	Involuntary context switches: 2037
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 121456
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
