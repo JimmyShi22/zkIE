@@ -17,6 +17,7 @@
 //! switch (the production target shift is zero); a wrong target is rejected by
 //! the linear check, not corrected.
 
+use zkie_core::common::codec::DecodeLimits;
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
 use zkie_engine::pcs::request::base_stage::{self, BaseRows};
@@ -26,8 +27,10 @@ use zkie_engine::pcs::request::field::{Fp3, E_DEGREE};
 use zkie_engine::pcs::request::fold::{ByteMaskCoins, MaskCoins};
 use zkie_engine::pcs::request::proximity::SingleRows;
 use zkie_engine::pcs::request::read::{draw_positions, unique_sorted};
+use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
 use zkie_engine::pcs::request::runtime_tree::{
-    verify_runtime_opening, RuntimePartRows, RuntimeTree, RuntimeTreeOpening, RuntimeTreePlan,
+    decode_runtime_opening, encode_runtime_opening, verify_runtime_opening, RuntimePartRows,
+    RuntimeTree, RuntimeTreeOpening, RuntimeTreePlan,
 };
 
 const STAGE_STAR: u64 = 24;
@@ -241,6 +244,92 @@ impl LastBaseProver {
     pub fn plan(&self) -> &RuntimeTreePlan {
         &self.plan
     }
+}
+
+fn put_vec(writer: &mut CanonicalWriter, values: &[Fp3]) {
+    writer.put_u64(values.len() as u64);
+    for value in values {
+        writer.put_fp3(value);
+    }
+}
+
+fn get_vec(reader: &mut CanonicalReader<'_>, expected: u64) -> Result<Vec<Fp3>> {
+    if reader.get_u64()? != expected {
+        return Err(Error::ShapeMismatch);
+    }
+    let expected = usize::try_from(expected).map_err(|_| Error::ResourceLimit)?;
+    let mut values = Vec::with_capacity(expected);
+    for _ in 0..expected {
+        values.push(reader.get_fp3()?);
+    }
+    Ok(values)
+}
+
+/// The prover's byte artifact for one last-stage BASE: target*, the masked
+/// rows and tails, and the two authenticated openings in message order.
+pub fn encode_last_base_proof(
+    messages: &LastBaseMessages,
+    prepared: &BaseRows,
+    star_opening: &RuntimeTreeOpening,
+    final_opening: &RuntimeTreeOpening,
+    star_plan: &RuntimeTreePlan,
+    final_plan: &RuntimeTreePlan,
+) -> Result<Vec<u8>> {
+    if star_opening.positions != final_opening.positions {
+        return Err(Error::InvalidIndex);
+    }
+    let star_bytes = encode_runtime_opening(star_plan, star_opening)?;
+    let final_bytes = encode_runtime_opening(final_plan, final_opening)?;
+    let mut writer = CanonicalWriter::new();
+    writer.put_digest(&messages.star_root);
+    writer.put_fp3(&messages.target_star);
+    put_vec(&mut writer, &prepared.main_prime);
+    put_vec(&mut writer, &prepared.main_tail_prime);
+    put_vec(&mut writer, &prepared.mask_prime);
+    put_vec(&mut writer, &prepared.mask_tail_prime);
+    writer.put_bytes(&star_bytes);
+    writer.put_bytes(&final_bytes);
+    Ok(writer.into_bytes())
+}
+
+/// Verifies one last-stage BASE from its byte artifact: the verifier draws
+/// lambda and the positions from the transcript, decodes exactly the prover's
+/// messages, and requires the artifact to end after the openings.
+pub fn verify_last_base_proof(
+    mut session: LastBaseSession,
+    positions_count: usize,
+    bytes: &[u8],
+) -> Result<Digest> {
+    let limits = DecodeLimits {
+        max_bytes: bytes.len(),
+        max_elements: bytes.len(),
+    };
+    let mut reader = CanonicalReader::new(bytes, limits);
+    let star_root = reader.get_digest()?;
+    let target_star = reader.get_fp3()?;
+    session.receive_star(star_root, target_star)?;
+    let lambda = session.draw_lambda()?;
+    let main_prime = get_vec(&mut reader, session.rows.code.ell)?;
+    let main_tail_prime = get_vec(&mut reader, session.rows.code.r)?;
+    let mask_prime = get_vec(&mut reader, session.rows.mask_code.ell)?;
+    let mask_tail_prime = get_vec(&mut reader, session.rows.mask_code.r)?;
+    session.receive_rows(BaseRows {
+        target_star,
+        lambda,
+        main_prime,
+        main_tail_prime,
+        mask_prime,
+        mask_tail_prime,
+    })?;
+    let positions = session.draw_base_positions(positions_count)?;
+    let star_bytes = reader.get_bytes()?;
+    let star_opening = decode_runtime_opening(&session.star_plan, &positions, star_bytes)?;
+    let final_bytes = reader.get_bytes()?;
+    let final_opening = decode_runtime_opening(&session.final_plan, &positions, final_bytes)?;
+    session.verify_openings(&star_opening, &final_opening)?;
+    let sealed = session.finish()?;
+    reader.finish()?;
+    Ok(sealed)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -676,6 +765,103 @@ mod tests {
         let sealed = run(&rows, &oracle, &randomness(), false, false, false, false, false, false, false)
             .expect("honest base");
         assert_ne!(sealed, Digest::ZERO);
+    }
+
+    fn typed_and_encoded(
+        rows: &SingleRows,
+        oracle: &FinalOracle,
+    ) -> (Digest, Vec<u8>, LastBaseProver) {
+        let (prover, root) = prover_session(rows, oracle, &randomness());
+        let messages = prover.messages().expect("messages");
+        let chain = Chain::begin(99, &Digest::ZERO, b"last base test", &[], None).unwrap();
+        let mut session = LastBaseSession::new(
+            chain,
+            rows.clone(),
+            oracle.plan.clone(),
+            root,
+            prover.plan().clone(),
+        )
+        .unwrap();
+        session
+            .receive_star(messages.star_root, messages.target_star)
+            .unwrap();
+        let lambda = session.draw_lambda().unwrap();
+        let prepared = prover.base_rows(lambda).unwrap();
+        session.receive_rows(prepared.clone()).unwrap();
+        let positions = session.draw_base_positions(2).unwrap();
+        let star_opening = prover.open_star(&positions).unwrap();
+        let final_opening = oracle.tree.open(&positions).unwrap();
+        session
+            .verify_openings(&star_opening, &final_opening)
+            .unwrap();
+        let sealed = session.finish().unwrap();
+        let bytes = encode_last_base_proof(
+            &messages,
+            &prepared,
+            &star_opening,
+            &final_opening,
+            prover.plan(),
+            &oracle.plan,
+        )
+        .unwrap();
+        (sealed, bytes, prover)
+    }
+
+    fn fresh_session(
+        rows: &SingleRows,
+        oracle: &FinalOracle,
+        prover: &LastBaseProver,
+    ) -> LastBaseSession {
+        let chain = Chain::begin(99, &Digest::ZERO, b"last base test", &[], None).unwrap();
+        LastBaseSession::new(
+            chain,
+            rows.clone(),
+            oracle.plan.clone(),
+            *oracle.tree.root(),
+            prover.plan().clone(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_last_base_proof_decodes_to_the_same_seal_and_rejects_leftovers() {
+        let rows = rows();
+        let oracle = final_oracle(&rows);
+        let (typed, bytes, prover) = typed_and_encoded(&rows, &oracle);
+        let session = fresh_session(&rows, &oracle, &prover);
+        let decoded = verify_last_base_proof(session, 2, &bytes).expect("decoded proof");
+        assert_eq!(decoded, typed);
+
+        let mut extra = bytes.clone();
+        extra.push(0);
+        let session = fresh_session(&rows, &oracle, &prover);
+        assert!(matches!(
+            verify_last_base_proof(session, 2, &extra),
+            Err(Error::InvalidEncoding)
+        ));
+
+        let short = &bytes[..bytes.len() - 1];
+        let session = fresh_session(&rows, &oracle, &prover);
+        assert!(matches!(
+            verify_last_base_proof(session, 2, short),
+            Err(Error::InvalidEncoding)
+        ));
+    }
+
+    #[test]
+    fn the_last_base_proof_rejects_a_tampered_masked_row() {
+        let rows = rows();
+        let oracle = final_oracle(&rows);
+        let (_typed, mut bytes, prover) = typed_and_encoded(&rows, &oracle);
+        // The masked main row starts after the digest and target* and its
+        // length word: 32 + 24 + 8 bytes.
+        let at = 32 + 24 + 8;
+        bytes[at] ^= 1;
+        let session = fresh_session(&rows, &oracle, &prover);
+        assert!(matches!(
+            verify_last_base_proof(session, 2, &bytes),
+            Err(Error::InvalidProof)
+        ));
     }
 
     #[test]

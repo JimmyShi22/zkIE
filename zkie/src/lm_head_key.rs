@@ -55,7 +55,10 @@ use zkie_engine::primitives::transcript::run_value;
 use zkie_engine::pcs::request::proximity::SingleRows;
 use zkie_ops::proof::base_final_session::{fold_identity, FoldBasis, FoldMember};
 use zkie_ops::proof::column_session::fp_from_signed_word;
-use zkie_ops::proof::base_last_session::{LastBaseProver, LastBaseRandomness, LastBaseSession};
+use zkie_ops::proof::base_last_session::{
+    encode_last_base_proof, verify_last_base_proof, LastBaseProver, LastBaseRandomness,
+    LastBaseSession,
+};
 use zkie_ops::proof::cs_multi_session::{CsMultiProver, CsMultiSession, OldMaskSource};
 use zkie_ops::proof::fold_handoff::{FoldHandoff, FoldHandoffAnchor};
 use zkie_ops::proof::session_baseline::SESSION_PROTOCOL_IDENTITY;
@@ -1208,6 +1211,7 @@ pub struct LimitedSharedColumns {
     pub stage_fold: Option<StageFoldOutcome>,
     pub stage_rows: Option<LimitedFoldStage>,
     pub sealed: Option<Digest>,
+    pub base_proof: Option<Vec<u8>>,
     pub pending_rows: usize,
     pub transcript: Digest,
 }
@@ -1280,6 +1284,7 @@ pub fn run_limited_shared_to_columns(
     let mut stage_fold = None;
     let mut stage_rows = None;
     let mut sealed = None;
+    let mut base_proof = None;
     let mut pending_rows = 0usize;
     let mut transcript = *session.transcript_value();
     if let Some(omega) = session.plan().omega.as_ref().cloned() {
@@ -1551,7 +1556,7 @@ pub fn run_limited_shared_to_columns(
                 let messages = prover.messages()?;
                 let mut session = LastBaseSession::new(
                     chain.clone(),
-                    rows,
+                    rows.clone(),
                     last.plan().clone(),
                     root,
                     base_binding.plan.clone(),
@@ -1559,13 +1564,35 @@ pub fn run_limited_shared_to_columns(
                 session.receive_star(messages.star_root, messages.target_star)?;
                 let lambda = session.draw_lambda()?;
                 let prepared = prover.base_rows(lambda)?;
-                session.receive_rows(prepared)?;
+                session.receive_rows(prepared.clone())?;
                 let positions = session.draw_base_positions(base_binding.positions)?;
                 let star_opening = prover.open_star(&positions)?;
                 let final_opening = last.open(&positions)?;
                 session.verify_openings(&star_opening, &final_opening)?;
-                sealed = Some(session.finish()?);
-                transcript = *session.chain_value();
+                let typed_seal = session.finish()?;
+                let proof = encode_last_base_proof(
+                    &messages,
+                    &prepared,
+                    &star_opening,
+                    &final_opening,
+                    prover.plan(),
+                    last.plan(),
+                )?;
+                let verifier = LastBaseSession::new(
+                    chain.clone(),
+                    rows,
+                    last.plan().clone(),
+                    root,
+                    base_binding.plan.clone(),
+                )?;
+                let decoded_seal =
+                    verify_last_base_proof(verifier, base_binding.positions, &proof)?;
+                if decoded_seal != typed_seal {
+                    return Err(Error::InvalidProof);
+                }
+                sealed = Some(decoded_seal);
+                base_proof = Some(proof);
+                transcript = decoded_seal;
             }
         }
         }
@@ -1588,6 +1615,7 @@ pub fn run_limited_shared_to_columns(
         stage_fold,
         stage_rows,
         sealed,
+        base_proof,
         pending_rows,
         transcript,
     })
@@ -4039,6 +4067,8 @@ mod tests {
         assert_eq!(stage_rows.rows.masks.len(), 2);
         let sealed = run.sealed.expect("sealed transcript");
         assert_ne!(sealed, Digest::ZERO);
+        let proof = run.base_proof.as_ref().expect("base proof bytes");
+        assert!(!proof.is_empty());
 
     }
 
