@@ -5,12 +5,12 @@ use std::path::Path;
 use std::time::Instant;
 
 use zkie_core::types::Digest;
-use zkie_engine::pcs::request::fold::FoldOutput;
+use zkie_engine::pcs::request::field::Fp3;
+use zkie_engine::pcs::request::relation::{foldeq_weights, GuRelationKind, GuRelationRow};
 use zkie_engine::pcs::request::table::verify_columns;
 use zkie_ops::proof::column_session::{
-    authenticate_columns, build_authenticated_encoding_table, check_fold_component,
-    check_full_table, check_merge_targets, demo_eq_gamma, register_gu,
-    register_gu_with_columns, verify_column_session,
+    build_authenticated_encoding_table_with_configuration, check_full_columns, check_merge_targets,
+    open_columns_for_queries, verify_column_session,
 };
 use zkie_ops::proof::model_commitment::{ModelCommitmentPublic, SharedTrace};
 use zkie_ops::proof::session_baseline::{
@@ -63,8 +63,10 @@ fn selected_gpt2_column_verification_components() {
     println!("asset_root={:?}", outcome.asset_root);
     println!("table_root={:?}", outcome.table_root);
     println!("gu_root={:?}", outcome.gu_root);
-    println!("logical_draws={:?}", outcome.logical_draws);
+    println!("queries={:?}", outcome.queries);
     println!("opened_positions={:?}", outcome.opened_positions);
+    println!("gamma={:?}", outcome.gamma);
+    println!("eq_gamma={:?}", outcome.eq_gamma);
     println!("column_cells={}", outcome.column_cells);
     println!("gu_rows={}", outcome.gu_rows);
     assert!(outcome.column_authentication);
@@ -73,68 +75,97 @@ fn selected_gpt2_column_verification_components() {
     assert!(outcome.full_table_comparison);
     assert!(outcome.fold_component);
     assert!(outcome.fold_next_stage_closed);
-    assert_eq!(outcome.logical_draws.len(), 4);
-    assert_eq!(outcome.gu_rows, 4);
+    assert_eq!(outcome.queries.len(), 4);
+    assert_eq!(outcome.gamma.len(), 2);
+    assert_eq!(outcome.eq_gamma, foldeq_weights(&outcome.gamma, 2).unwrap());
+    assert_eq!(outcome.column_cells, outcome.queries.len() * 4);
+    assert!(outcome.gu_rows >= 4);
     assert_ne!(outcome.asset_root, outcome.table_root);
     assert_ne!(outcome.asset_root, outcome.gu_root);
     assert_ne!(outcome.table_root, outcome.gu_root);
 
-    let table = build_authenticated_encoding_table(
+    let table = build_authenticated_encoding_table_with_configuration(
         &public,
         &trusted,
         asset_path,
         &trace.assets[192],
+        binding.first_query,
     )
     .unwrap();
-    let authentication = authenticate_columns(&table, &outcome.logical_draws).unwrap();
-    let eq_gamma = demo_eq_gamma(authentication.rows).unwrap();
-    let good = register_gu(&table, &authentication, &eq_gamma).unwrap();
-    assert!(good
-        .rows
+    assert_eq!(table.reader.root, outcome.table_root);
+    let openings = open_columns_for_queries(&table, &outcome.queries).unwrap();
+    let positions = zkie_engine::pcs::request::read::unique_sorted(&outcome.queries);
+    let unique: Vec<_> = positions
         .iter()
-        .all(|row| good.membership.check_row(row).is_ok()));
-    assert!(check_merge_targets(&table, &authentication, &good, &eq_gamma).unwrap());
-    assert!(check_full_table(&table, &authentication).unwrap().matches);
-
-    let mut wrong_columns = authentication.columns_by_position();
-    wrong_columns[0].1[0] = wrong_columns[0].1[0].add(&zkie_engine::pcs::request::field::Fp3::ONE);
-    let wrong = register_gu_with_columns(&table, &authentication, &eq_gamma, &wrong_columns)
-        .expect("membership registration does not evaluate the target");
-    assert!(wrong
-        .rows
+        .map(|position| {
+            openings
+                .iter()
+                .find(|opening| opening.position == *position)
+                .unwrap()
+                .clone()
+        })
+        .collect();
+    let flat = verify_columns(&table.reader, &positions, &unique).unwrap();
+    let rows = 4usize;
+    let by_position: Vec<(u64, Vec<_>)> = positions
         .iter()
-        .all(|row| wrong.membership.check_row(row).is_ok()));
-    assert!(!check_merge_targets(&table, &authentication, &wrong, &eq_gamma).unwrap());
+        .enumerate()
+        .map(|(index, position)| {
+            (*position, flat[index * rows..(index + 1) * rows].to_vec())
+        })
+        .collect();
+    let mut logical_flat = Vec::new();
+    for query in &outcome.queries {
+        let column = by_position
+            .iter()
+            .find(|(position, _)| position == query)
+            .map(|(_, column)| column)
+            .unwrap();
+        logical_flat.extend_from_slice(column);
+    }
+    assert!(check_full_columns(&table, &outcome.queries, &logical_flat)
+        .unwrap()
+        .matches);
+    let mut wrong_columns = logical_flat.clone();
+    wrong_columns[0] = Fp3::from_u64(999).c[0];
+    assert!(!check_full_columns(&table, &outcome.queries, &wrong_columns)
+        .unwrap()
+        .matches);
 
-    let mut wrong_opened = authentication.clone();
-    wrong_opened.columns[0] = zkie_engine::pcs::request::field::Fp3::from_u64(999).c[0];
-    assert!(!check_full_table(&table, &wrong_opened).unwrap().matches);
-
-    let mut path_tamper = authentication.clone();
-    path_tamper.openings[0].path.push(Digest([9; 32]));
-    assert!(verify_columns(
-        &table.reader,
-        &path_tamper.positions,
-        &path_tamper.openings
+    let fake_rows: Vec<GuRelationRow> = outcome
+        .queries
+        .iter()
+        .map(|_| GuRelationRow {
+            oracle: 0,
+            group: 0,
+            kind: GuRelationKind::Column,
+            main: Vec::new(),
+            mask: Vec::new(),
+            target: Fp3::ZERO,
+        })
+        .collect();
+    assert!(!check_merge_targets(
+        &table,
+        &outcome.queries,
+        &fake_rows,
+        &outcome.eq_gamma
     )
-    .is_err());
+    .unwrap());
+
+    let mut path_tamper = unique.clone();
+    path_tamper[0].path.push(Digest([9; 32]));
+    assert!(verify_columns(&table.reader, &positions, &path_tamper).is_err());
 
     let mut root_tamper = trace.assets[192].clone();
     root_tamper.root.0[0] ^= 1;
-    assert!(build_authenticated_encoding_table(&public, &trusted, asset_path, &root_tamper).is_err());
-
-    let fold = check_fold_component(
-        table.shape,
-        zkie_engine::pcs::request::field::Fp3::from_u64(7),
-        zkie_engine::pcs::request::field::Fp3::from_u64(11),
-        zkie_engine::pcs::request::field::Fp3::from_u64(13),
+    assert!(build_authenticated_encoding_table_with_configuration(
+        &public,
+        &trusted,
+        asset_path,
+        &root_tamper,
+        binding.first_query
     )
-    .unwrap();
-    fold.input.check(&fold.shape, &fold.layout).unwrap();
-    assert!(fold.next_stage_closed);
-    let closed: Result<(), zkie_core::error::Error> = fold.output.next_stage();
-    assert!(closed.is_err());
-    let _: &FoldOutput = &fold.output;
+    .is_err());
 
     assert!(verify_column_session(
         &public,

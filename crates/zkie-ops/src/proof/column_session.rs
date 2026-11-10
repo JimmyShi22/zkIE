@@ -2,41 +2,48 @@
 //!
 //! This module builds a small encoding table deterministically from a slice of
 //! an authenticated asset opening, commits it with the existing table
-//! primitives, and exercises four component layers:
+//! primitives, and runs the candidate FOLDEQ session in its fixed order:
 //!
-//! 1. authenticated column openings against the table's fixed column root;
-//! 2. G_u SEND registration and the membership row check;
-//! 3. a deterministic full reconstruction comparison of the opened columns
-//!    against the encoded rows;
-//! 4. the public FOLD input check and output computation, ending at the
-//!    deliberately fail-closed next-stage boundary.
+//! 1. bind the table first query, derive the session gamma, and fix/send the
+//!    G_u message before any column draw;
+//! 2. draw the plan's column queries and authenticate the opened columns
+//!    against the table's fixed column root;
+//! 3. join the G_u record and verified column rows, using equation weights
+//!    derived from the session gamma;
+//! 4. run the deterministic full reconstruction comparison and the public
+//!    FOLD component, ending at the deliberately fail-closed next-stage
+//!    boundary.
 //!
 //! It is not a proof verifier, and its result must not be used to accept a
-//! proof. The G_u root is a self-reported notice; the G_u relation rows are
-//! constructed from already verified columns, but the membership check only
-//! checks the oracle and group, not the target. The FOLD input row is a
-//! self-reported fixture and is not derived from the asset table. The FOLD
-//! output's next stage is not connected, so the FOLD layer is component-level
-//! only and no statement is made that the full FOLD gate passed.
+//! proof. The G_u root is a public message value sent into the session; the
+//! membership check still checks only the oracle and group, not the target.
+//! The column target control separately compares the registered target with
+//! the full re-encoded table. The FOLD input row is a self-reported fixture
+//! and is not derived from the asset table. The FOLD output's next stage is
+//! not connected, so the FOLD layer is component-level only and no statement
+//! is made that the full FOLD gate passed.
 //!
 //! Three roots are kept separate and recorded: the authenticated asset's meta
-//! root, the encoding table's column-tree root, and the G_u notice root. No
+//! root, the encoding table's column-tree root, and the sent G_u root. No
 //! equality between them is claimed.
 //!
 //! The encoding table is a test foundation, not a production commit path. It
-//! materializes a four-row, eight-column table in memory; the asset itself is
-//! read only through the verified opening and is never materialized. The
-//! message layout, zero padding, zero tails, deterministic salts and the
-//! slice mapping are demonstration choices and are replaceable. The table
-//! configuration, the G_u notice root, the runtime-tree starts and the FOLD
-//! fresh root are demo placeholders; the G_u notice root in particular is
-//! self-reported and not derived from the asset or the table root.
+//! verifies the complete asset opening row by row and the complete opening is
+//! resident; only the first four rows and the first plain column participate
+//! in the table. This is an expensive isolation control, not evidence that the
+//! production mmap/ranged commit or memory path is closed. The message layout,
+//! zero padding, zero tails, deterministic salts and the slice mapping are
+//! demonstration choices and are replaceable. The existing binding candidate's
+//! first-query digest is used as the table/chain configuration; its protocol
+//! identity and request parameters are demo placeholders. The G_u
+//! runtime-tree starts and the FOLD fresh root are also demo placeholders.
 //!
 //! The asset-to-FOLD witness derivation interface remains unclosed: there is
 //! no public construction path from an authenticated asset table to the FOLD
-//! input coefficients, mask, target or challenges. The FOLD row here is an
-//! explicitly labelled self-reported fixture. Adding such a derivation would
-//! be a new interface and is not part of this demonstration.
+//! input coefficients, mask, target or rounds. The FOLD row here is an
+//! explicitly labelled self-reported fixture; the FOLD round messages are
+//! fixed component values, not a prover session. Adding such a derivation
+//! would be a new interface and is not part of this demonstration.
 //!
 //! The base field has `p < 2^64` and `Fp3` is a cubic extension, so
 //! `|Fp3| = p^3 < 2^192`. This demonstration gives no soundness bound: the
@@ -45,35 +52,28 @@
 //! proof. Hiding and single-shot semantics are not connected. The production
 //! verify entry is unchanged.
 
-use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
+use std::sync::{Arc, Mutex};
+
+use zkie_core::common::field::PrimeCharacteristicRing;
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
 use zkie_engine::pcs::request::binding::BindingCandidate;
-use zkie_engine::pcs::request::chain::{
-    Chain, ChainMessage, KIND_ALGEBRAIC,
-};
+use zkie_engine::pcs::request::chain::Chain;
 use zkie_engine::pcs::request::code::{build_code_plan, encode_row_fp, CodeParams};
 use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE};
 use zkie_engine::pcs::request::fold::{
-    fold_mask_shape_fault, fold_output, FoldGroupLayout, FoldInputRow, FoldMemberLayout,
-    FoldOutput, FoldShape,
+    fold_mask_notice, fold_mask_shape_fault, FoldGroupLayout, FoldInputRow, FoldMemberLayout,
+    FoldOutput, FoldShape, FoldStartMessage, OracleMetadata, RuntimeOracles,
+    VerifiedGroup, VerifiedGroups, VerifiedStatement,
 };
-use zkie_engine::pcs::request::gu::{
-    GuMembership, GuNotice, GuOracleShape, GuRegistry, GuShape,
-};
-use zkie_engine::pcs::request::params::{
-    LEAF_SALT_MIN_BYTES, REQUEST_CHAIN_LABEL,
-};
-use zkie_engine::pcs::request::read::{
-    draw_positions, unique_sorted, HidingState,
-};
-use zkie_engine::pcs::request::relation::{
-    column_plan_rows, GuRelationRow,
-};
-use zkie_engine::pcs::request::runtime_tree::{RuntimeTreePart, RuntimeTreePlan};
+use zkie_engine::pcs::request::foldeq::{FoldeqBinder, FoldeqPlan, FoldeqSession, GammaPath};
+use zkie_engine::pcs::request::gu::{GuOracleShape, GuShape};
+use zkie_engine::pcs::request::params::{LEAF_SALT_MIN_BYTES, REQUEST_CHAIN_LABEL};
+use zkie_engine::pcs::request::read::{unique_sorted, HidingState, ReadLedger};
+use zkie_engine::pcs::request::relation::{foldeq_weights, GuRelationKind, GuRelationRow};
+use zkie_engine::pcs::request::runtime_tree::{MaskTreePlan, RuntimeTreePart, RuntimeTreePlan};
 use zkie_engine::pcs::request::table::{
-    commit_table, verify_columns, ColumnOpening, CommittedTable, IndexReader, IndexShape,
-    TableDistances,
+    commit_table, ColumnOpening, CommittedTable, IndexReader, IndexShape, TableDistances,
 };
 
 use crate::proof::model_commitment::{
@@ -81,14 +81,9 @@ use crate::proof::model_commitment::{
 };
 use crate::proof::session_baseline::TrustedModel;
 
-const SESSION_SCHEMA_VERSION: u64 = 1;
-const STAGE_TABLE: u64 = 1;
-const STAGE_GU: u64 = 2;
-const STAGE_FOLD: u64 = 3;
-
 const TABLE_CONFIGURATION: Digest = Digest([0x5a; 32]);
 const GU_NOTICE_ROOT: Digest = Digest([0x47; 32]);
-const FOLD_FRESH_ROOT: Digest = Digest([0x46; 32]);
+const FRESH_MASK_ROOT: Digest = Digest([0x46; 32]);
 
 const TABLE_LOG_N: u32 = 3;
 const TABLE_ELL: u64 = 4;
@@ -99,13 +94,21 @@ const TABLE_SALT_BYTES: usize = LEAF_SALT_MIN_BYTES;
 const DRAW_COUNT: usize = 4;
 
 const GU_ORACLE: u64 = 11;
+const GU_STATIC_MEMBER: u64 = 12;
 const GU_GROUP: u64 = 5;
 const GU_TREE_NUMBER: u64 = 7;
 const GU_MAIN_ROWS: u64 = 4;
+const GU_ANSWERS: u32 = 1;
+const FRESH_MASK_ID: u64 = 99;
+const FOLD_K: u32 = 2;
+const FOLD_H: u32 = 0;
+const MASK_ELL: u64 = 6;
+const MASK_R: u64 = 1;
+
 const GU_TREE_RUN: Digest = Digest([0x31; 32]);
 const GU_TREE_CONFIGURATION: Digest = Digest([0x32; 32]);
-
-const FOLD_MAIN_ROWS: u64 = 2;
+const MASK_TREE_RUN: Digest = Digest([0x33; 32]);
+const MASK_TREE_CONFIGURATION: Digest = Digest([0x34; 32]);
 
 /// A self-contained table built from the authenticated asset slice, together
 /// with the messages and tails used to build it.
@@ -118,26 +121,6 @@ pub struct AssetEncodingTable {
     pub tails: Vec<Vec<Fp>>,
 }
 
-/// The result of authenticated column opening.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ColumnAuthentication {
-    pub logical_draws: Vec<u64>,
-    pub positions: Vec<u64>,
-    pub rows: usize,
-    pub openings: Vec<ColumnOpening>,
-    pub columns: Vec<Fp>,
-}
-
-/// The result of the G_u registration component.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GuRegistration {
-    pub shape: GuShape,
-    pub notice: GuNotice,
-    pub registry: GuRegistry,
-    pub membership: GuMembership,
-    pub rows: Vec<GuRelationRow>,
-}
-
 /// The result of the deterministic full-table comparison.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableComparison {
@@ -145,15 +128,20 @@ pub struct TableComparison {
     pub matches: bool,
 }
 
-/// The public FOLD component result. `next_stage_closed` records the current
-/// fail-closed boundary; it is not a successful connection to the next stage.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FoldComponent {
-    pub shape: FoldShape,
-    pub layout: FoldGroupLayout,
-    pub input: FoldInputRow,
-    pub output: FoldOutput,
-    pub next_stage_closed: bool,
+/// One session run. This is a component harness result, not an accepted proof.
+struct SessionRun {
+    gu_root: Digest,
+    gamma: Vec<Fp3>,
+    eq_gamma: Vec<Fp3>,
+    queries: Vec<u64>,
+    opened_positions: Vec<u64>,
+    transcript_after_queries: Digest,
+    columns: Vec<Fp>,
+    rows: Vec<GuRelationRow>,
+    comparison: TableComparison,
+    merge_targets: bool,
+    fold_output: FoldOutput,
+    next_stage_closed: bool,
 }
 
 /// The four component layers and the three separately recorded roots.
@@ -163,8 +151,11 @@ pub struct ColumnSessionOutcome {
     pub table_root: Digest,
     pub gu_root: Digest,
     pub shape: IndexShape,
-    pub logical_draws: Vec<u64>,
+    pub queries: Vec<u64>,
     pub opened_positions: Vec<u64>,
+    pub gamma: Vec<Fp3>,
+    pub eq_gamma: Vec<Fp3>,
+    pub transcript_after_queries: Digest,
     pub column_cells: usize,
     pub gu_rows: usize,
     pub column_authentication: bool,
@@ -188,41 +179,9 @@ pub fn fp_from_signed_word(value: u64) -> Fp {
     }
 }
 
-fn fp3_words(value: &Fp3) -> [u64; 3] {
-    [
-        value.c[0].as_canonical_u64(),
-        value.c[1].as_canonical_u64(),
-        value.c[2].as_canonical_u64(),
-    ]
-}
-
-fn push_digest(message: &mut ChainMessage, digest: &Digest) {
-    for word in digest_words(digest) {
-        message.push_u64(word);
-    }
-}
-
-fn digest_words(digest: &Digest) -> [u64; 4] {
-    let mut words = [0u64; 4];
-    for (index, chunk) in digest.0.chunks_exact(8).enumerate() {
-        words[index] = u64::from_le_bytes([
-            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-        ]);
-    }
-    words
-}
-
-fn push_fp3(message: &mut ChainMessage, value: &Fp3) {
-    for word in fp3_words(value) {
-        message.push_u64(word);
-    }
-}
-
-fn push_bytes(message: &mut ChainMessage, bytes: &[u8]) {
-    message.push_u64(bytes.len() as u64);
-    for byte in bytes {
-        message.push_u64(*byte as u64);
-    }
+fn index_shape_fault(shape: &IndexShape) -> Option<&'static str> {
+    zkie_engine::pcs::request::table::index_fault(shape)
+        .or_else(|| zkie_engine::pcs::request::table::tree_shape_fault(shape))
 }
 
 /// The demonstration table shape. It has four rows and eight columns, one
@@ -247,12 +206,6 @@ pub fn demo_index_shape() -> Result<IndexShape> {
     Ok(shape)
 }
 
-fn index_shape_fault(shape: &IndexShape) -> Option<&'static str> {
-    zkie_engine::pcs::request::table::index_fault(shape).or_else(|| {
-        zkie_engine::pcs::request::table::tree_shape_fault(shape)
-    })
-}
-
 /// Builds the encoding table from the first `plain` values of the first
 /// `2^v` rows of an authenticated asset opening. The mapping is deterministic:
 ///
@@ -264,13 +217,36 @@ fn index_shape_fault(shape: &IndexShape) -> Option<&'static str> {
 ///   `salt_bytes` times;
 /// - the code is Reed-Solomon with the shape's `log_n`, `ell` and `r`.
 ///
-/// The trusted anchor and the opening are verified first. The asset file is
-/// never materialized; only the slice values in the opening are used.
+/// The trusted anchor and the complete opening are verified first. The full
+/// opening is resident and every row is checked; only the first four rows and
+/// the first plain column are used by the table. The asset file itself is not
+/// opened or materialized by this path.
 pub fn build_authenticated_encoding_table(
     public: &ModelCommitmentPublic,
     trusted: &TrustedModel<'_>,
     asset_path: &str,
     opening: &AssetOpening,
+) -> Result<AssetEncodingTable> {
+    build_authenticated_encoding_table_with_configuration(
+        public,
+        trusted,
+        asset_path,
+        opening,
+        TABLE_CONFIGURATION,
+    )
+}
+
+/// The same table construction with the caller's table configuration. The
+/// candidate binding's first-query digest is the configuration used by the
+/// session entry; this keeps the existing binding candidate in the transcript
+/// while the fixed demo configuration remains available for the isolated
+/// component probes.
+pub fn build_authenticated_encoding_table_with_configuration(
+    public: &ModelCommitmentPublic,
+    trusted: &TrustedModel<'_>,
+    asset_path: &str,
+    opening: &AssetOpening,
+    configuration: Digest,
 ) -> Result<AssetEncodingTable> {
     verify_model_anchor(
         public,
@@ -314,10 +290,7 @@ pub fn build_authenticated_encoding_table(
     for (row, message) in messages.iter_mut().enumerate() {
         let source = opening.rows.get(row).ok_or(Error::IncompleteArtifact)?;
         for (column, entry) in message.iter_mut().take(plain).enumerate() {
-            let value = *source
-                .values
-                .get(column)
-                .ok_or(Error::ShapeMismatch)?;
+            let value = *source.values.get(column).ok_or(Error::ShapeMismatch)?;
             *entry = fp_from_signed_word(value);
         }
     }
@@ -325,7 +298,7 @@ pub fn build_authenticated_encoding_table(
         .map(|position| vec![(position as u8) ^ 0xA5; shape.salt_bytes])
         .collect();
 
-    let table = commit_table(shape, TABLE_CONFIGURATION, &messages, &tails, &salts)?;
+    let table = commit_table(shape, configuration, &messages, &tails, &salts)?;
     let reader = table.reader.clone();
     Ok(AssetEncodingTable {
         table,
@@ -337,72 +310,50 @@ pub fn build_authenticated_encoding_table(
     })
 }
 
-/// Opens the unique drawn columns with the existing hiding charge and verifies
-/// every opening against the table's fixed column root. The logical draw list
-/// is kept in its drawn order; the physical opening list is sorted and
-/// deduplicated.
-pub fn authenticate_columns(
+/// Opens one charged physical column per unique query position and returns one
+/// opening per logical query in the query order. Repeated queries reuse the
+/// same opening. The caller must keep the table's immutable root for the
+/// session; this function is not a verifier by itself.
+pub fn open_columns_for_queries(
     table: &AssetEncodingTable,
-    logical_draws: &[u64],
-) -> Result<ColumnAuthentication> {
-    if logical_draws.is_empty() {
+    queries: &[u64],
+) -> Result<Vec<ColumnOpening>> {
+    if queries.is_empty() {
         return Err(Error::InvalidConfig);
     }
-    let positions = unique_sorted(logical_draws);
-    let rows = usize::try_from(table.shape.rows_checked()?).map_err(|_| Error::ResourceLimit)?;
+    let positions = unique_sorted(queries);
     let mut state = HidingState::new(table.reader.root, 1, positions.len() as u64);
     let charge = state.begin_charge(table.reader.root, 1, positions.len())?;
-    let openings = table.table.open_columns_charged(&charge, &positions)?;
-    let columns = verify_columns(&table.reader, &positions, &openings)?;
-    Ok(ColumnAuthentication {
-        logical_draws: logical_draws.to_vec(),
-        positions,
-        rows,
-        openings,
-        columns,
-    })
-}
-
-impl ColumnAuthentication {
-    /// The verified columns in the same `(position, column)` shape expected by
-    /// the G_u column row builder.
-    pub fn columns_by_position(&self) -> Vec<(u64, Vec<Fp3>)> {
-        self.positions
+    let unique = table.table.open_columns_charged(&charge, &positions)?;
+    let mut openings = Vec::with_capacity(queries.len());
+    for query in queries {
+        let opening = unique
             .iter()
-            .enumerate()
-            .map(|(index, position)| {
-                let start = index * self.rows;
-                let end = start + self.rows;
-                let column = self.columns[start..end]
-                    .iter()
-                    .map(|value| Fp3::from_base(*value))
-                    .collect();
-                (*position, column)
-            })
-            .collect()
+            .find(|opening| opening.position == *query)
+            .ok_or(Error::InvalidIndex)?
+            .clone();
+        openings.push(opening);
     }
+    Ok(openings)
 }
 
 /// Re-encodes every row and compares every opened cell with the expected
 /// codeword symbol. This is a deterministic full-value comparison on the small
 /// in-memory table; it is not a proximity test.
-pub fn check_full_table(
+pub fn check_full_columns(
     table: &AssetEncodingTable,
-    authentication: &ColumnAuthentication,
+    queries: &[u64],
+    columns: &[Fp],
 ) -> Result<TableComparison> {
     let rows = usize::try_from(table.shape.rows_checked()?).map_err(|_| Error::ResourceLimit)?;
-    let expected = authentication
-        .positions
-        .len()
-        .checked_mul(rows)
-        .ok_or(Error::ResourceLimit)?;
-    if authentication.columns.len() != expected || authentication.rows != rows {
+    let expected = queries.len().checked_mul(rows).ok_or(Error::ResourceLimit)?;
+    if columns.len() != expected {
         return Err(Error::ShapeMismatch);
     }
     let mut matches = true;
     let mut cells = 0usize;
-    for (index, position) in authentication.positions.iter().enumerate() {
-        if *position >= table.shape.code.n() {
+    for (index, query) in queries.iter().enumerate() {
+        if *query >= table.shape.code.n() {
             return Err(Error::InvalidIndex);
         }
         for row in 0..rows {
@@ -411,10 +362,8 @@ pub fn check_full_table(
                 table.messages.get(row).ok_or(Error::ShapeMismatch)?,
                 table.tails.get(row).ok_or(Error::ShapeMismatch)?,
             )?;
-            let expected = *codeword
-                .get(*position as usize)
-                .ok_or(Error::InvalidIndex)?;
-            let actual = authentication.columns[index * rows + row];
+            let expected = *codeword.get(*query as usize).ok_or(Error::InvalidIndex)?;
+            let actual = columns[index * rows + row];
             if expected != actual {
                 matches = false;
             }
@@ -424,131 +373,31 @@ pub fn check_full_table(
     Ok(TableComparison { cells, matches })
 }
 
-/// The trusted shape for the demonstration G_u oracle. The G_u code, main
-/// rows, tree, part and indexed-table shape are fixed test values; only the
-/// notice root is received.
-pub fn demo_gu_shape(index: IndexShape) -> Result<GuShape> {
-    let main_symbols = GU_MAIN_ROWS
-        .checked_mul(E_DEGREE as u64)
-        .ok_or(Error::ResourceLimit)?;
-    let tree = RuntimeTreePlan {
-        tree_number: GU_TREE_NUMBER,
-        leaf_class: 0,
-        log_n: TABLE_LOG_N,
-        log_n_zk: TABLE_LOG_N,
-        parts: vec![RuntimeTreePart {
-            main_symbols,
-            mask_symbols: 0,
-        }],
-        salt_bytes: TABLE_SALT_BYTES,
-        run: GU_TREE_RUN,
-        configuration: GU_TREE_CONFIGURATION,
-    };
-    let u = GuOracleShape {
-        code: build_code_plan(TABLE_LOG_N, TABLE_ELL, TABLE_R)?,
-        main_rows: GU_MAIN_ROWS,
-        main_deg: E_DEGREE as u32,
-        mask_rows: 0,
-        mask_code: None,
-        answers: 1,
-    };
-    let shape = GuShape {
-        oracle: GU_ORACLE,
-        group: GU_GROUP,
-        tree,
-        part: 0,
-        rows_high: false,
-        u,
-        index,
-    };
-    if shape.fault().is_some() {
-        return Err(Error::InvalidConfig);
-    }
-    Ok(shape)
-}
-
-fn demo_gu_notice(shape: &GuShape) -> GuNotice {
-    GuNotice {
-        root: GU_NOTICE_ROOT,
-        oracle: shape.oracle,
-        tree_number: shape.tree.tree_number,
-        part: shape.part,
-    }
-}
-
-/// Registers the self-reported G_u notice and joins the isolated group. The
-/// rows are built from the provided fixture columns, which must be one
-/// strictly increasing entry per unique drawn position. The membership check
-/// checks the oracle and group only; it does not evaluate the target.
-pub fn register_gu_with_columns(
-    table: &AssetEncodingTable,
-    authentication: &ColumnAuthentication,
-    eq_gamma: &[Fp3],
-    fixture_columns: &[(u64, Vec<Fp3>)],
-) -> Result<GuRegistration> {
-    if eq_gamma.len() != authentication.rows {
-        return Err(Error::ShapeMismatch);
-    }
-    let shape = demo_gu_shape(table.shape)?;
-    let notice = demo_gu_notice(&shape);
-    let mut registry = GuRegistry::new();
-    registry.receive(&shape, &notice)?;
-    let group = zkie_engine::pcs::request::fold::VerifiedGroup {
-        group: shape.group,
-        members: Vec::new(),
-        fresh: None,
-        code: Some(shape.u.code),
-        mask_code: shape.u.mask_code,
-    };
-    let mut membership = GuMembership::new(&group, &shape, &registry)?;
-    membership.join(&shape, &registry)?;
-    let rows = column_plan_rows(
-        &shape,
-        &registry,
-        authentication.logical_draws.len(),
-        table.shape.code.log_n,
-        &authentication.logical_draws,
-        fixture_columns,
-        eq_gamma,
-    )?;
-    for row in &rows {
-        membership.check_row(row)?;
-    }
-    Ok(GuRegistration {
-        shape,
-        notice,
-        registry,
-        membership,
-        rows,
-    })
-}
-
-/// Registers G_u using the verified columns themselves.
-pub fn register_gu(
-    table: &AssetEncodingTable,
-    authentication: &ColumnAuthentication,
-    eq_gamma: &[Fp3],
-) -> Result<GuRegistration> {
-    let columns = authentication.columns_by_position();
-    register_gu_with_columns(table, authentication, eq_gamma, &columns)
-}
-
 /// Recomputes each G_u column target from the full re-encoded table and the
-/// fixed equation weights, then compares it with the target in the registered
-/// row. The membership check is separate and does not evaluate targets.
+/// session's equation weights, then compares it with the target in the
+/// registered column row. The membership check is separate and does not
+/// evaluate targets.
 pub fn check_merge_targets(
     table: &AssetEncodingTable,
-    authentication: &ColumnAuthentication,
-    registration: &GuRegistration,
+    queries: &[u64],
+    rows: &[GuRelationRow],
     eq_gamma: &[Fp3],
 ) -> Result<bool> {
-    let rows = usize::try_from(table.shape.rows_checked()?).map_err(|_| Error::ResourceLimit)?;
-    if eq_gamma.len() != rows || registration.rows.len() != authentication.logical_draws.len() {
+    let row_count =
+        usize::try_from(table.shape.rows_checked()?).map_err(|_| Error::ResourceLimit)?;
+    if eq_gamma.len() != row_count {
+        return Err(Error::ShapeMismatch);
+    }
+    let column_rows: Vec<&GuRelationRow> = rows
+        .iter()
+        .filter(|row| row.kind == GuRelationKind::Column)
+        .collect();
+    if column_rows.len() != queries.len() {
         return Err(Error::ShapeMismatch);
     }
     let mut matches = true;
-    for (row, draw) in registration.rows.iter().zip(&authentication.logical_draws) {
-        if *draw >= table.shape.code.n() {
+    for (row, query) in column_rows.iter().zip(queries) {
+        if *query >= table.shape.code.n() {
             return Err(Error::InvalidIndex);
         }
         let mut expected = Fp3::ZERO;
@@ -560,7 +409,7 @@ pub fn check_merge_targets(
             )?;
             let value = Fp3::from_base(
                 *codeword
-                    .get(*draw as usize)
+                    .get(*query as usize)
                     .ok_or(Error::InvalidIndex)?,
             );
             expected = expected.add(&weight.mul(&value));
@@ -572,26 +421,16 @@ pub fn check_merge_targets(
     Ok(matches)
 }
 
-/// Fixed test-only equation weights for the four table rows.
-pub fn demo_eq_gamma(rows: usize) -> Result<Vec<Fp3>> {
-    if rows == 0 {
-        return Err(Error::InvalidConfig);
-    }
-    Ok((0..rows)
-        .map(|index| Fp3::from_u64(index as u64 + 1))
-        .collect())
-}
-
 /// The demonstration FOLD shape. The main code is the table's code; the mask
-/// code is a valid three-entry code at the same depth. The shape is a public
+/// code is a valid six-entry code at the same depth. The shape is a public
 /// component input, not a production group layout.
 pub fn demo_fold_shape(index: IndexShape) -> Result<FoldShape> {
-    let mask_code: CodeParams = build_code_plan(index.code.log_n, 3, 1)?;
+    let mask_code: CodeParams = build_code_plan(index.code.log_n, MASK_ELL, MASK_R)?;
     let shape = FoldShape {
         code: index.code,
         mask_code,
-        k: 1,
-        h: 0,
+        k: FOLD_K,
+        h: FOLD_H,
         mask_leaf_class: 0,
     };
     if fold_mask_shape_fault(&shape).is_some() {
@@ -605,12 +444,20 @@ fn demo_fold_layout(shape: &FoldShape) -> Result<FoldGroupLayout> {
         group: GU_GROUP,
         k: shape.k,
         h: shape.h,
-        members: vec![FoldMemberLayout {
-            oracle: GU_ORACLE,
-            main_rows: FOLD_MAIN_ROWS,
-            mask_rows: 0,
-            kept: false,
-        }],
+        members: vec![
+            FoldMemberLayout {
+                oracle: GU_ORACLE,
+                main_rows: 1,
+                mask_rows: 0,
+                kept: false,
+            },
+            FoldMemberLayout {
+                oracle: GU_STATIC_MEMBER,
+                main_rows: 1,
+                mask_rows: 0,
+                kept: false,
+            },
+        ],
     };
     if layout.fault(shape).is_some() {
         return Err(Error::InvalidConfig);
@@ -626,15 +473,13 @@ fn demo_fold_input(shape: &FoldShape) -> Result<FoldInputRow> {
     let mask_len = 1usize
         .checked_shl(shape.h)
         .ok_or(Error::ResourceLimit)?
-        .checked_mul(
-            usize::try_from(shape.mask_code.ell).map_err(|_| Error::ResourceLimit)?,
-        )
+        .checked_mul(usize::try_from(shape.mask_code.ell).map_err(|_| Error::ResourceLimit)?)
         .ok_or(Error::ResourceLimit)?;
     Ok(FoldInputRow {
         group: GU_GROUP,
         k: shape.k,
         h: shape.h,
-        members: vec![GU_ORACLE],
+        members: vec![GU_ORACLE, GU_STATIC_MEMBER],
         coefficients: (0..main_len)
             .map(|index| Fp3::from_u64(index as u64 + 1))
             .collect(),
@@ -646,149 +491,226 @@ fn demo_fold_input(shape: &FoldShape) -> Result<FoldInputRow> {
     })
 }
 
-/// Builds the public FOLD shape, layout and self-reported input row. The input
-/// row is not derived from the asset table.
-pub fn demo_fold_material(index: IndexShape) -> Result<(FoldShape, FoldGroupLayout, FoldInputRow)> {
-    let shape = demo_fold_shape(index)?;
-    let layout = demo_fold_layout(&shape)?;
-    let input = demo_fold_input(&shape)?;
-    input.check(&shape, &layout)?;
-    Ok((shape, layout, input))
+/// The trusted G_u shape for the demonstration. Its mask code is the FOLD mask
+/// code so the dynamic G_u oracle and the FOLD group use the same trusted
+/// code; the notice root is supplied later by the session's SEND message.
+pub fn demo_gu_shape(index: IndexShape, mask_code: CodeParams) -> Result<GuShape> {
+    let main_symbols = GU_MAIN_ROWS
+        .checked_mul(E_DEGREE as u64)
+        .ok_or(Error::ResourceLimit)?;
+    let mask_symbols = (1u64)
+        .checked_mul(E_DEGREE as u64)
+        .ok_or(Error::ResourceLimit)?;
+    let tree = RuntimeTreePlan {
+        tree_number: GU_TREE_NUMBER,
+        leaf_class: 0,
+        log_n: TABLE_LOG_N,
+        log_n_zk: TABLE_LOG_N,
+        parts: vec![RuntimeTreePart {
+            main_symbols,
+            mask_symbols,
+        }],
+        salt_bytes: TABLE_SALT_BYTES,
+        run: GU_TREE_RUN,
+        configuration: GU_TREE_CONFIGURATION,
+    };
+    let u = GuOracleShape {
+        code: build_code_plan(TABLE_LOG_N, TABLE_ELL, TABLE_R)?,
+        main_rows: GU_MAIN_ROWS,
+        main_deg: E_DEGREE as u32,
+        mask_rows: 1,
+        mask_code: Some(mask_code),
+        answers: GU_ANSWERS,
+    };
+    let shape = GuShape {
+        oracle: GU_ORACLE,
+        group: GU_GROUP,
+        tree,
+        part: 0,
+        rows_high: false,
+        u,
+        index,
+    };
+    if shape.fault().is_some()
+        || zkie_engine::pcs::request::relation::gu_layout_fault(&shape).is_some()
+    {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(shape)
 }
 
-/// Computes the public FOLD output for the fixed, self-reported fixture row
-/// and the supplied challenges. The output's next stage is deliberately
-/// fail-closed.
-pub fn check_fold_component_with_input(
-    shape: FoldShape,
-    layout: FoldGroupLayout,
-    input: FoldInputRow,
-    eps: Fp3,
-    gamma: Fp3,
-    sum: Fp3,
-) -> Result<FoldComponent> {
-    let output = fold_output(
-        &shape,
-        &layout,
-        &input,
-        1,
-        FOLD_FRESH_ROOT,
-        GU_TREE_NUMBER,
-        eps,
-        sum,
-        &[gamma],
-        input.target,
+fn demo_mask_tree() -> Result<MaskTreePlan> {
+    let tree = MaskTreePlan {
+        tree_number: GU_TREE_NUMBER,
+        leaf_class: 0,
+        log_n: TABLE_LOG_N,
+        mask_rows: 1,
+        salt_bytes: TABLE_SALT_BYTES,
+        run: MASK_TREE_RUN,
+        configuration: MASK_TREE_CONFIGURATION,
+    };
+    if tree.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(tree)
+}
+
+struct DemoSetup {
+    plan: FoldeqPlan,
+    binder: FoldeqBinder,
+    chain: Chain,
+    first_query: Vec<u8>,
+    fold_shape: FoldShape,
+    fold_row: FoldInputRow,
+    fold_start: FoldStartMessage,
+}
+
+fn build_demo_setup(table: &AssetEncodingTable) -> Result<DemoSetup> {
+    let fold_shape = demo_fold_shape(table.shape)?;
+    let gu_shape = demo_gu_shape(table.shape, fold_shape.mask_code)?;
+    let fold_layout = demo_fold_layout(&fold_shape)?;
+    let mask_tree = demo_mask_tree()?;
+    let mask_notice = fold_mask_notice(&fold_shape)?;
+
+    let group = VerifiedGroup {
+        group: GU_GROUP,
+        members: vec![GU_STATIC_MEMBER],
+        fresh: Some(FRESH_MASK_ID),
+        code: Some(gu_shape.u.code),
+        mask_code: Some(fold_shape.mask_code),
+    };
+    let statement = Arc::new(VerifiedStatement::new(
+        VerifiedGroups {
+            groups: vec![group],
+        },
+        vec![mask_tree],
+        vec![OracleMetadata {
+            id: FRESH_MASK_ID,
+            group: GU_GROUP,
+            tree_number: GU_TREE_NUMBER,
+            leaf_class: 0,
+            mask_rows: 1,
+            mask_code: fold_shape.mask_code,
+        }],
+    )?);
+    let mut oracles = RuntimeOracles::default();
+    oracles.receive_mask(
+        &statement,
+        &mask_tree,
+        FRESH_MASK_ID,
+        &mask_notice,
+        FRESH_MASK_ROOT,
     )?;
-    let next_stage_closed = output.next_stage().is_err();
-    Ok(FoldComponent {
-        shape,
-        layout,
-        input,
-        output,
+    let ledger = Arc::new(Mutex::new(ReadLedger::new(DRAW_COUNT as u64)));
+    let plan = FoldeqPlan {
+        reader: table.reader.clone(),
+        fold: fold_shape,
+        statement,
+        oracles: Arc::new(Mutex::new(oracles)),
+        mask_tree_number: GU_TREE_NUMBER,
+        group_id: GU_GROUP,
+        leaf_class: 0,
+        seed_budget: table.shape.answers as usize,
+        ledger,
+        column_draws: DRAW_COUNT,
+        mask_query_count: 0,
+        gamma_path: GammaPath::Direct {
+            columns: table.shape.v,
+        },
+        gu: Some(gu_shape),
+        fold_layout: Some(fold_layout),
+    };
+    if plan.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let binder = FoldeqBinder::new(REQUEST_CHAIN_LABEL, table.reader.configuration, &plan)?;
+    let first_query = binder.first_query().to_vec();
+    let chain = binder.chain()?;
+    let fold_row = demo_fold_input(&fold_shape)?;
+    let fold_start = FoldStartMessage {
+        id: FRESH_MASK_ID,
+        claimed_group: GU_GROUP,
+        tree_number: GU_TREE_NUMBER,
+        notice: mask_notice,
+        root: FRESH_MASK_ROOT,
+        sum: Fp3::from_u64(0x2e),
+    };
+    Ok(DemoSetup {
+        plan,
+        binder,
+        chain,
+        first_query,
+        fold_shape,
+        fold_row,
+        fold_start,
+    })
+}
+
+/// Runs the candidate FOLDEQ session with the fixed G_u root. The root is an
+/// immutable reference: the same value is sent in the G_u message and carried
+/// into the run result, so the fixed root and the used root are the same value.
+/// The session derives gamma before G_u, sends G_u before drawing columns, and
+/// only then reads and verifies the columns.
+fn run_session(table: &AssetEncodingTable, gu_root: &Digest) -> Result<SessionRun> {
+    let setup = build_demo_setup(table)?;
+    let mut session =
+        FoldeqSession::open(setup.plan, setup.binder, setup.chain)?;
+    session.bind_first_query(&setup.first_query)?;
+    session.draw_gamma()?;
+    let gamma = session
+        .gamma()
+        .ok_or(Error::InvalidSessionState)?
+        .to_vec();
+
+    // The G_u message is fixed and absorbed here, after gamma and before the
+    // column query draw. The same immutable reference is the message root and
+    // the recorded root below.
+    session.send_gu(gu_root)?;
+    session.shared_seeds()?;
+    for answer in 0..GU_ANSWERS {
+        session.receive_gu_answer(Fp3::from_u64(0x31 + answer as u64))?;
+    }
+    session.join_gu_record()?;
+    session.draw_queries()?;
+    let queries = session.queries().to_vec();
+    let transcript_after_queries = *session.transcript_value();
+    let openings = open_columns_for_queries(table, &queries)?;
+    let read_columns = session.read_queries(&openings)?;
+    let columns: Vec<Fp> = read_columns.into_iter().flatten().collect();
+    session.join_gu_read_columns()?;
+    let rows = session.pending_gu_rows().to_vec();
+    let eq_gamma = foldeq_weights(&gamma, table.shape.v)?;
+    let merge_targets = check_merge_targets(table, &queries, &rows, &eq_gamma)?;
+    let comparison = check_full_columns(table, &queries, &columns)?;
+
+    session.fold_bind_row(setup.fold_row)?;
+    session.start_fold(&setup.fold_start)?;
+    session.fold_rounds_start()?;
+    for _ in 0..setup.fold_shape.k {
+        session.receive_fold_round(Fp3::ZERO, Fp3::ZERO)?;
+    }
+    let fold_output = session.fold_finish()?;
+    let next_stage_closed = session.fold_next_stage().is_err();
+    let opened_positions = unique_sorted(&queries);
+
+    Ok(SessionRun {
+        gu_root: *gu_root,
+        gamma,
+        eq_gamma,
+        queries,
+        opened_positions,
+        transcript_after_queries,
+        columns,
+        rows,
+        comparison,
+        merge_targets,
+        fold_output,
         next_stage_closed,
     })
 }
 
-/// Builds the self-reported input row and computes the FOLD output for the
-/// supplied challenges. Callers that need transcript ordering first call
-/// `demo_fold_material`, absorb the row, and then draw the challenges.
-pub fn check_fold_component(
-    index: IndexShape,
-    eps: Fp3,
-    gamma: Fp3,
-    sum: Fp3,
-) -> Result<FoldComponent> {
-    let (shape, layout, input) = demo_fold_material(index)?;
-    check_fold_component_with_input(shape, layout, input, eps, gamma, sum)
-}
-
-fn begin_chain(binding: &BindingCandidate) -> Result<Chain> {
-    Chain::begin(
-        REQUEST_CHAIN_LABEL,
-        &binding.parameters_digest,
-        &binding.statement_bytes,
-        &binding.record_bytes,
-        None,
-    )
-}
-
-fn absorb_table(chain: &mut Chain, table: &AssetEncodingTable) -> Result<()> {
-    let mut message = chain.message();
-    message.push_u64(SESSION_SCHEMA_VERSION);
-    message.push_u64(STAGE_TABLE);
-    push_digest(&mut message, &table.asset_root);
-    push_digest(&mut message, &table.reader.root);
-    push_digest(&mut message, &table.reader.configuration);
-    for value in [
-        table.shape.code.log_n as u64,
-        table.shape.code.ell,
-        table.shape.code.r,
-        table.shape.v as u64,
-        table.shape.answers as u64,
-        table.shape.salt_bytes as u64,
-    ] {
-        message.push_u64(value);
-    }
-    message.push_u64(table.reader.record.y.len() as u64);
-    for value in &table.reader.record.y {
-        push_fp3(&mut message, value);
-    }
-    let prefix = message.prefix(KIND_ALGEBRAIC, 0)?;
-    if !chain.step(&prefix, 0)? {
-        return Err(Error::InvalidProof);
-    }
-    Ok(())
-}
-
-fn absorb_gu(chain: &mut Chain, registration: &GuRegistration) -> Result<()> {
-    let mut message = chain.message();
-    message.push_u64(SESSION_SCHEMA_VERSION);
-    message.push_u64(STAGE_GU);
-    push_digest(&mut message, &registration.notice.root);
-    message.push_u64(registration.shape.oracle);
-    message.push_u64(registration.shape.group);
-    message.push_u64(registration.shape.tree.tree_number);
-    message.push_u64(registration.shape.part as u64);
-    push_bytes(&mut message, &registration.shape.encode());
-    let prefix = message.prefix(KIND_ALGEBRAIC, 0)?;
-    if !chain.step(&prefix, 0)? {
-        return Err(Error::InvalidProof);
-    }
-    Ok(())
-}
-
-fn absorb_fold(chain: &mut Chain, input: &FoldInputRow) -> Result<()> {
-    let mut message = chain.message();
-    message.push_u64(SESSION_SCHEMA_VERSION);
-    message.push_u64(STAGE_FOLD);
-    message.push_u64(input.group);
-    message.push_u64(input.k as u64);
-    message.push_u64(input.h as u64);
-    message.push_u64(input.members.len() as u64);
-    for member in &input.members {
-        message.push_u64(*member);
-    }
-    message.push_u64(input.coefficients.len() as u64);
-    for value in &input.coefficients {
-        push_fp3(&mut message, value);
-    }
-    message.push_u64(input.mask_coefficients.len() as u64);
-    for value in &input.mask_coefficients {
-        push_fp3(&mut message, value);
-    }
-    push_fp3(&mut message, &input.target);
-    let prefix = message.prefix(KIND_ALGEBRAIC, 0)?;
-    if !chain.step(&prefix, 0)? {
-        return Err(Error::InvalidProof);
-    }
-    Ok(())
-}
-
-/// Runs the four component layers in transcript order: the table roots and
-/// record are fixed before the column draws; the verified columns are then
-/// used for the G_u registration and merge-target control; the full table
-/// comparison follows; the self-reported FOLD row is fixed before the FOLD
-/// challenges. A failed real component returns an error. The FOLD next stage
+/// Runs the four component layers in the session's fixed order and records the
+/// three roots. A failed real component returns an error. The FOLD next stage
 /// is expected to remain fail-closed.
 pub fn verify_column_session(
     public: &ModelCommitmentPublic,
@@ -797,59 +719,45 @@ pub fn verify_column_session(
     asset_path: &str,
     opening: &AssetOpening,
 ) -> Result<ColumnSessionOutcome> {
-    let table = build_authenticated_encoding_table(public, trusted, asset_path, opening)?;
-    let mut chain = begin_chain(binding)?;
-    absorb_table(&mut chain, &table)?;
-    let logical_draws = draw_positions(&mut chain, DRAW_COUNT, table.shape.code.log_n)?;
-    if logical_draws.is_empty() {
-        return Err(Error::InvalidConfig);
-    }
-    let authentication = authenticate_columns(&table, &logical_draws)?;
-    let eq_gamma = demo_eq_gamma(authentication.rows)?;
-    let registration = register_gu(&table, &authentication, &eq_gamma)?;
-    absorb_gu(&mut chain, &registration)?;
-    let gu_registration = registration
-        .rows
-        .iter()
-        .all(|row| registration.membership.check_row(row).is_ok());
-    let merge_targets = check_merge_targets(&table, &authentication, &registration, &eq_gamma)?;
-    let comparison = check_full_table(&table, &authentication)?;
-
-    let (fold_shape, fold_layout, fold_input) = demo_fold_material(table.shape)?;
-    absorb_fold(&mut chain, &fold_input)?;
-    let eps = chain.draw_e_nonzero()?;
-    let gamma = chain.draw_e()?;
-    let fold = check_fold_component_with_input(
-        fold_shape,
-        fold_layout,
-        fold_input,
-        eps,
-        gamma,
-        registration
-            .rows
-            .first()
-            .map(|row| row.target)
-            .unwrap_or(Fp3::ZERO),
+    // The existing binding candidate supplies the chain/table configuration.
+    // Its protocol identity and request parameters are demo placeholders, not
+    // real protocol values.
+    let table = build_authenticated_encoding_table_with_configuration(
+        public,
+        trusted,
+        asset_path,
+        opening,
+        binding.first_query,
     )?;
-
-    if !gu_registration || !merge_targets || !comparison.matches || !fold.next_stage_closed {
+    let gu_root = GU_NOTICE_ROOT;
+    let run = run_session(&table, &gu_root)?;
+    if run.gu_root != gu_root
+        || !run.merge_targets
+        || !run.comparison.matches
+        || !run.next_stage_closed
+        || run.fold_output.next_stage().is_ok()
+    {
         return Err(Error::InvalidProof);
     }
+    let column_cells = run.columns.len();
     Ok(ColumnSessionOutcome {
         asset_root: table.asset_root,
         table_root: table.reader.root,
-        gu_root: registration.notice.root,
+        gu_root: run.gu_root,
         shape: table.shape,
-        logical_draws,
-        opened_positions: authentication.positions.clone(),
-        column_cells: authentication.columns.len(),
-        gu_rows: registration.rows.len(),
+        queries: run.queries,
+        opened_positions: run.opened_positions,
+        gamma: run.gamma,
+        eq_gamma: run.eq_gamma,
+        transcript_after_queries: run.transcript_after_queries,
+        column_cells,
+        gu_rows: run.rows.len(),
         column_authentication: true,
-        gu_registration,
-        merge_targets,
-        full_table_comparison: comparison.matches,
+        gu_registration: true,
+        merge_targets: run.merge_targets,
+        full_table_comparison: run.comparison.matches,
         fold_component: true,
-        fold_next_stage_closed: fold.next_stage_closed,
+        fold_next_stage_closed: run.next_stage_closed,
     })
 }
 
@@ -862,11 +770,11 @@ mod tests {
 
     use zkie_core::proof_header::PROOF_VERSION_WORD;
     use zkie_engine::pcs::request::binding::{assemble, BindingParameters, BindingStatement};
+    use zkie_engine::pcs::request::gu::{GuMembership, GuNotice, GuRegistry};
     use zkie_engine::pcs::request::params::RequestParams;
+    use zkie_engine::pcs::request::table::verify_columns;
 
-    use crate::proof::model_commitment::{
-        commit_assets, AssetStore, ModelAssetSpec,
-    };
+    use crate::proof::model_commitment::{commit_assets, AssetStore, ModelAssetSpec};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -975,11 +883,12 @@ mod tests {
 
     fn table(fixture: &Fixture) -> AssetEncodingTable {
         let trusted = trusted(fixture);
-        build_authenticated_encoding_table(
+        build_authenticated_encoding_table_with_configuration(
             &fixture.public,
             &trusted,
             "table_i32.bin",
             &fixture.opening,
+            fixture.binding.first_query,
         )
         .unwrap()
     }
@@ -995,6 +904,28 @@ mod tests {
         )
     }
 
+    fn session_to_queried(
+        table: &AssetEncodingTable,
+        gu_root: &Digest,
+    ) -> Result<(FoldeqSession, Vec<Fp3>)> {
+        let setup = build_demo_setup(table)?;
+        let mut session = FoldeqSession::open(setup.plan, setup.binder, setup.chain)?;
+        session.bind_first_query(&setup.first_query)?;
+        session.draw_gamma()?;
+        let gamma = session
+            .gamma()
+            .ok_or(Error::InvalidSessionState)?
+            .to_vec();
+        session.send_gu(gu_root)?;
+        session.shared_seeds()?;
+        for answer in 0..GU_ANSWERS {
+            session.receive_gu_answer(Fp3::from_u64(0x31 + answer as u64))?;
+        }
+        session.join_gu_record()?;
+        session.draw_queries()?;
+        Ok((session, gamma))
+    }
+
     #[test]
     fn session_passes_all_four_component_layers_and_records_three_roots() {
         let fixture = fixture();
@@ -1005,10 +936,11 @@ mod tests {
         assert!(outcome.full_table_comparison);
         assert!(outcome.fold_component);
         assert!(outcome.fold_next_stage_closed);
-        assert_eq!(outcome.logical_draws.len(), DRAW_COUNT);
-        assert!(outcome.opened_positions.len() <= outcome.logical_draws.len());
-        assert_eq!(outcome.column_cells, outcome.opened_positions.len() * 4);
-        assert_eq!(outcome.gu_rows, outcome.logical_draws.len());
+        assert_eq!(outcome.queries.len(), DRAW_COUNT);
+        assert_eq!(outcome.gamma.len(), TABLE_V as usize);
+        assert_eq!(outcome.eq_gamma, foldeq_weights(&outcome.gamma, TABLE_V).unwrap());
+        assert_eq!(outcome.column_cells, outcome.queries.len() * 4);
+        assert!(outcome.gu_rows >= DRAW_COUNT);
         assert_ne!(outcome.asset_root, outcome.table_root);
         assert_ne!(outcome.asset_root, outcome.gu_root);
         assert_ne!(outcome.table_root, outcome.gu_root);
@@ -1020,6 +952,22 @@ mod tests {
         let first = verify(&fixture).unwrap();
         let second = verify(&fixture).unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn changed_gu_message_changes_the_query_transcript_and_order() {
+        let fixture = fixture();
+        let table = table(&fixture);
+        let base = run_session(&table, &GU_NOTICE_ROOT).unwrap();
+        let changed_root = Digest([0x48; 32]);
+        let changed = run_session(&table, &changed_root).unwrap();
+        assert_eq!(base.gu_root, GU_NOTICE_ROOT);
+        assert_eq!(changed.gu_root, changed_root);
+        assert_ne!(
+            base.transcript_after_queries,
+            changed.transcript_after_queries
+        );
+        assert_ne!(base.queries, changed.queries);
     }
 
     #[test]
@@ -1041,86 +989,133 @@ mod tests {
     fn column_path_tamper_is_rejected_by_authentication() {
         let fixture = fixture();
         let table = table(&fixture);
-        let draws = vec![0, 1, 2, 3];
-        let mut authentication = authenticate_columns(&table, &draws).unwrap();
-        authentication.openings[0].path.push(Digest([9; 32]));
-        assert!(verify_columns(
-            &table.reader,
-            &authentication.positions,
-            &authentication.openings
-        )
-        .is_err());
-        assert!(authenticate_columns(&table, &draws).is_ok());
+        let run = run_session(&table, &GU_NOTICE_ROOT).unwrap();
+        let openings = open_columns_for_queries(&table, &run.queries).unwrap();
+        let positions = unique_sorted(&run.queries);
+        let mut unique: Vec<ColumnOpening> = positions
+            .iter()
+            .map(|position| {
+                openings
+                    .iter()
+                    .find(|opening| opening.position == *position)
+                    .unwrap()
+                    .clone()
+            })
+            .collect();
+        unique[0].path.push(Digest([9; 32]));
+        assert!(verify_columns(&table.reader, &positions, &unique).is_err());
+        assert!(run_session(&table, &GU_NOTICE_ROOT).is_ok());
     }
 
     #[test]
     fn path_valid_but_wrong_merge_is_seen_by_the_target_control() {
         let fixture = fixture();
         let table = table(&fixture);
-        let draws = vec![0, 1, 2, 3];
-        let authentication = authenticate_columns(&table, &draws).unwrap();
-        let eq_gamma = demo_eq_gamma(authentication.rows).unwrap();
-        let mut columns = authentication.columns_by_position();
-        let first = &mut columns[0].1;
-        first.swap(0, 1);
-        let wrong = register_gu_with_columns(&table, &authentication, &eq_gamma, &columns)
-            .expect("membership registration does not evaluate the target");
-        assert!(wrong
-            .rows
+        let (mut session, gamma) = session_to_queried(&table, &GU_NOTICE_ROOT).unwrap();
+        let queries = session.queries().to_vec();
+        let openings = open_columns_for_queries(&table, &queries).unwrap();
+        let positions = unique_sorted(&queries);
+        let unique: Vec<ColumnOpening> = positions
             .iter()
-            .all(|row| wrong.membership.check_row(row).is_ok()));
-        assert!(!check_merge_targets(&table, &authentication, &wrong, &eq_gamma).unwrap());
-        let good = register_gu(&table, &authentication, &eq_gamma).unwrap();
-        assert!(check_merge_targets(&table, &authentication, &good, &eq_gamma).unwrap());
+            .map(|position| {
+                openings
+                    .iter()
+                    .find(|opening| opening.position == *position)
+                    .unwrap()
+                    .clone()
+            })
+            .collect();
+        let flat = verify_columns(&table.reader, &positions, &unique).unwrap();
+        let rows = usize::try_from(table.shape.rows_checked().unwrap()).unwrap();
+        let mut fixture_columns: Vec<(u64, Vec<Fp3>)> = positions
+            .iter()
+            .enumerate()
+            .map(|(index, position)| {
+                let column = flat[index * rows..(index + 1) * rows]
+                    .iter()
+                    .map(|value| Fp3::from_base(*value))
+                    .collect();
+                (*position, column)
+            })
+            .collect();
+        fixture_columns[0].1[0] = fixture_columns[0].1[0].add(&Fp3::ONE);
+        session
+            .join_gu_columns(&fixture_columns)
+            .expect("membership registration does not evaluate the target");
+        let eq_gamma = foldeq_weights(&gamma, TABLE_V).unwrap();
+        assert!(!check_merge_targets(
+            &table,
+            &queries,
+            session.pending_gu_rows(),
+            &eq_gamma
+        )
+        .unwrap());
     }
 
     #[test]
     fn gu_registration_rejects_a_wrong_oracle_or_group() {
         let fixture = fixture();
         let table = table(&fixture);
-        let authentication = authenticate_columns(&table, &[0, 1, 2, 3]).unwrap();
-        let eq_gamma = demo_eq_gamma(authentication.rows).unwrap();
-        let registration = register_gu(&table, &authentication, &eq_gamma).unwrap();
-        assert!(registration
-            .rows
-            .iter()
-            .all(|row| registration.membership.check_row(row).is_ok()));
-        let mut wrong_oracle = registration.rows[0].clone();
-        wrong_oracle.oracle += 1;
-        assert!(registration.membership.check_row(&wrong_oracle).is_err());
-        let mut wrong_group = registration.rows[0].clone();
-        wrong_group.group += 1;
-        assert!(registration.membership.check_row(&wrong_group).is_err());
+        let fold = demo_fold_shape(table.shape).unwrap();
+        let shape = demo_gu_shape(table.shape, fold.mask_code).unwrap();
+        let notice = GuNotice {
+            root: GU_NOTICE_ROOT,
+            oracle: shape.oracle,
+            tree_number: shape.tree.tree_number,
+            part: shape.part,
+        };
+        let mut registry = GuRegistry::new();
+        registry.receive(&shape, &notice).unwrap();
+        let group = VerifiedGroup {
+            group: shape.group,
+            members: vec![GU_STATIC_MEMBER],
+            fresh: Some(FRESH_MASK_ID),
+            code: Some(shape.u.code),
+            mask_code: shape.u.mask_code,
+        };
+        let mut membership = GuMembership::new(&group, &shape, &registry).unwrap();
+        membership.join(&shape, &registry).unwrap();
+        let mut row = GuRelationRow {
+            oracle: shape.oracle,
+            group: shape.group,
+            kind: GuRelationKind::Column,
+            main: Vec::new(),
+            mask: Vec::new(),
+            target: Fp3::ZERO,
+        };
+        assert!(membership.check_row(&row).is_ok());
+        row.oracle += 1;
+        assert!(membership.check_row(&row).is_err());
+        row.oracle = shape.oracle;
+        row.group += 1;
+        assert!(membership.check_row(&row).is_err());
     }
 
     #[test]
     fn full_table_comparison_detects_a_wrong_opened_cell() {
         let fixture = fixture();
         let table = table(&fixture);
-        let mut authentication = authenticate_columns(&table, &[0, 1, 2, 3]).unwrap();
-        assert!(check_full_table(&table, &authentication).unwrap().matches);
-        authentication.columns[0] = Fp3::from_u64(999).c[0];
-        assert!(!check_full_table(&table, &authentication).unwrap().matches);
+        let run = run_session(&table, &GU_NOTICE_ROOT).unwrap();
+        assert!(run.comparison.matches);
+        let mut columns = run.columns.clone();
+        columns[0] = Fp3::from_u64(999).c[0];
+        assert!(!check_full_columns(&table, &run.queries, &columns)
+            .unwrap()
+            .matches);
     }
 
     #[test]
     fn fold_component_checks_the_public_row_and_stops_at_the_closed_boundary() {
         let fixture = fixture();
         let table = table(&fixture);
+        let run = run_session(&table, &GU_NOTICE_ROOT).unwrap();
+        assert!(run.next_stage_closed);
+        assert!(run.fold_output.next_stage().is_err());
         let shape = demo_fold_shape(table.shape).unwrap();
-        assert!(fold_mask_shape_fault(&shape).is_none());
-        let fold = check_fold_component(
-            table.shape,
-            Fp3::from_u64(7),
-            Fp3::from_u64(11),
-            Fp3::from_u64(13),
-        )
-        .unwrap();
-        fold.input.check(&fold.shape, &fold.layout).unwrap();
-        assert!(fold.next_stage_closed);
-        assert!(fold.output.next_stage().is_err());
-        let mut bad = fold.input.clone();
-        bad.coefficients.pop();
-        assert!(bad.check(&fold.shape, &fold.layout).is_err());
+        let layout = demo_fold_layout(&shape).unwrap();
+        let mut row = demo_fold_input(&shape).unwrap();
+        row.check(&shape, &layout).unwrap();
+        row.coefficients.pop();
+        assert!(row.check(&shape, &layout).is_err());
     }
 }
