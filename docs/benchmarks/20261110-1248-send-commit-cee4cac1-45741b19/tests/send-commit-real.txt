@@ -1,0 +1,61 @@
+warning: unused variable: `k_step`
+   --> models/gpt2/src/executor.rs:346:21
+    |
+346 |             let (k, k_step) = {
+    |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_step`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `m`
+   --> models/gemma3/src/executor.rs:277:5
+    |
+277 |     m: usize,
+    |     ^ help: if this is intentional, prefix it with an underscore: `_m`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_rot_step`
+   --> models/gemma3/src/executor.rs:390:21
+    |
+390 |         let (k_rot, k_rot_step) = rope(&mut builder, k, k_step, cos_prefix.clone(), sin_prefix.clone(), m)?;
+    |                     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_rot_step`
+
+warning: `zkie-models-gpt2` (lib) generated 1 warning (run `cargo fix --lib -p zkie-models-gpt2` to apply 1 suggestion)
+warning: `zkie-models-gemma3` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gemma3` to apply 2 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running tests/send_session.rs (target/debug/deps/send_session-9bdb951814c9a37c)
+
+running 1 test
+send_session_ms=362
+committed_root=Digest([64, 28, 5, 255, 46, 202, 91, 113, 200, 81, 206, 104, 138, 17, 63, 248, 244, 12, 199, 129, 84, 21, 167, 67, 219, 240, 39, 177, 144, 107, 38, 206])
+seeds=[SampleSeed { z: [Fp3 { c: [8796757766991476470, 5022403881898958271, 8867506467703464737] }, Fp3 { c: [155456539304978395, 15028846736799889385, 6552890087806437519] }, Fp3 { c: [3854529647600522410, 15649771530505671034, 14288281461619198839] }, Fp3 { c: [18338902819810824990, 8458957921370389741, 13968777106295438529] }, Fp3 { c: [13784805083209160754, 3778810832752865133, 14986808804693039540] }], beta: Fp3 { c: [385743667744600796, 11193500646458991137, 7670745903094995928] } }]
+provider_answers=[Fp3 { c: [7959715948118013368, 4600147627639561860, 11928710650687970310] }]
+sample_target=Fp3 { c: [7959715948118013368, 4600147627639561860, 11928710650687970310] }
+bat_order=[Plain, Plain, Plain, Plain, Plain, Sample] bat_targets=[Fp3 { c: [8659293421314855608, 14648278258228076007, 7292299110535156279] }, Fp3 { c: [569981987347928320, 9852386913000955542, 12456505567751217311] }, Fp3 { c: [4509510566857893636, 2386509191493433221, 8980351734769094652] }, Fp3 { c: [11025981287138072325, 12899395459511436619, 15109958304493937051] }, Fp3 { c: [8027388988200911912, 3150132556434965468, 17982868374586241372] }, Fp3 { c: [7959715948118013368, 4600147627639561860, 11928710650687970310] }]
+test selected_gpt2_fixture_send_data_flow ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 56.46s
+
+	Command being timed: "env ZKIE_SESSION_FIXTURE=<fixture> cargo test -p zkie --test send_session -- --ignored --nocapture"
+	User time (seconds): 143.13
+	System time (seconds): 2.29
+	Percent of CPU this job got: 256%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:56.60
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 4239988
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 1036726
+	Voluntary context switches: 14739
+	Involuntary context switches: 1567
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 0
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
