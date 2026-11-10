@@ -4,6 +4,7 @@ pub mod binding;
 pub mod column_session;
 pub mod edge_session;
 pub mod fold_handoff;
+pub mod group_commitment_session;
 pub mod group_row_session;
 pub mod gu_combine_session;
 pub mod send_session;

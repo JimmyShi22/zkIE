@@ -1,58 +1,78 @@
-//! Isolated algebraic/chain interface demonstration from a BAT group row to the
-//! FOLD stage, without a group commitment.
+//! Isolated fixture group commitment and BAT-to-FOLD component handoff.
 //!
-//! This is not a same-commitment positive case. The group message tables are
-//! plaintext fixture data with no oracle root: nothing binds the BAT
-//! declarations, the prover's FOLD messages or the sample-class rows to a group
-//! commitment, and the same-tag inner products in this module establish only
-//! fixture arithmetic consistency. A witness replacement or mismatch after a
-//! fixed group root cannot be tested here because no group root exists; that
-//! establishment remains unclosed.
+//! This is not a production verification and not a complete soundness result.
+//! Each member oracle of the fixture group has its own runtime tree, code,
+//! message rows, encoding tail, salts and root. The ordered root message is
+//! absorbed into the session chain before the BAT challenge, the member
+//! openings are checked against those roots before the challenge, and only
+//! then is the same chain moved to BAT. Every member keeps its own oracle
+//! identity and opening positions. The ordered list of roots is not called one
+//! group root, and the chain transcript value after the root message is a
+//! transcript value, not a group commitment root.
 //!
-//! The local interface progress demonstrated here: the BAT group's base and
-//! mask codes are the FOLD shape's codes, the member mask width is already a
-//! power of two, and the BAT layout is the FOLD fixture layout. No field is
-//! copied from a width adapter and no code or tail parameter is transformed.
-//! The BAT combined row is converted by the existing BAT-to-FOLD input-row
-//! conversion and enters FOLD with the same main coefficients, mask
-//! coefficients and target.
+//! The roots and plans are fixture values checked against the fixture's own
+//! independently re-encoded expectation and the member openings. They are not
+//! SEND receipts, not G_u or asset roots, and not a production trust anchor.
+//! The opening check is the cryptographic check in this component; it covers
+//! the drawn positions, not every row. A caller that replaces both the witness
+//! and the fixture expectation has no independent trusted binding here; that
+//! remains unclosed.
 //!
-//! The BAT sample-class rows are fixture rows required by the member
-//! registration; their targets are plaintext inner products against the same
-//! group tables, not authenticated send receipts.
+//! Group source table:
 //!
-//! The fresh-mask witness is built from a deterministic numbered test source.
-//! Its coefficients, encoding tail and mask rows produce the committed mask
-//! tree root and the hiding sum carried by the FOLD start message; the fixture
-//! independently re-commits the stored rows and tails and checks the same root.
-//! The verifier's runtime registry receives that root before any challenge.
-//! The fresh-mask root commits only the fresh mask; it is not a group oracle
-//! root. The values are public and reproducible, provide no hiding, and are
-//! only a test fixture. The root is registered, not authenticated by openings.
+//! | item | source and layout |
+//! | --- | --- |
+//! | member messages | deterministic fixture values per tag/oracle, `main_rows` rows of the main code's `ell` entries and `mask_rows` rows of the mask code's `ell` entries |
+//! | member tails | deterministic fixture values, one tail of the code's `r` entries per row; encoded with the row and not part of the FOLD relation view |
+//! | member tree | one part, `main_symbols = main_rows * 3` and `mask_symbols = mask_rows * 3`, `log_n` from the main code, `log_n_zk` from the mask code, `2^log_n` columns; each leaf holds every main symbol, then every mask symbol, then a 40-byte salt |
+//! | pad | none; the BAT sample-class rows are fixture claims, not SEND receipts, and no reserved sample-pad slot is read |
+//! | roots | one root per member, committed by the runtime tree; the ordered list of roots is the declaration, not a concatenated group root |
 //!
-//! Order and ownership: the group is frozen, the BAT session draws `x` and is
-//! consumed by `into_chain`, the returned chain is moved into the FOLD-only
-//! session entry, the fixed row is bound, the start message fixes the fresh
-//! root and sum before the epsilon challenge, each round message is absorbed
-//! before its gamma, and the final output stays pending. The handoff records
-//! the chain round count and value on both sides; it does not compare pointers.
-//! A chain that was not advanced by a prior stage is rejected.
+//! The BAT group's base and mask codes are the FOLD shape's codes; the member
+//! mask width is a power of two; the BAT layout is the FOLD fixture layout. No
+//! field is copied from a width adapter. The BAT claims' targets are computed
+//! by BAT's own combination against the group tables reconstructed from the
+//! committed member messages. The sample-class rows are plaintext fixture inner
+//! products, not send receipts, and no declaration is labelled as derived from
+//! protocol-bound messages.
 //!
-//! The verifier advances only on the bound row and the checked start/round
-//! messages. FOLD does not decide truth: a wrong BAT target still completes the
-//! rounds and remains pending, and only a later relation or proximity check
-//! could reject it. Wrong shape, code, oracle, root and order violations fail
-//! closed. The wrong-target case is not evidence that FOLD judges an arbitrary
-//! declaration.
+//! FOLD row source table:
 //!
-//! Unclosed: establishing a group oracle root and a witness bound to it, real
-//! SEND/G_u and send receipts, authenticated assets, fresh-mask openings,
-//! folded tails, a proximity/relation connection, hiding, single-shot semantics
-//! and production wiring. The group-root witness-replacement negative is not
-//! applicable in this step. The plan's reader and binding are a valid but
-//! inert scaffold required by the existing plan type; the FOLD-only entry
-//! never reads them and they are not a witness or an asset binding.
-//! `verify_request` is unchanged.
+//! | item | source |
+//! | --- | --- |
+//! | main coefficients | BAT combined main coefficients |
+//! | old-mask coefficients | BAT combined mask coefficients |
+//! | kept forms | none in this fixture |
+//! | main messages | group table reconstructed from the committed member main messages at the BAT layout offsets |
+//! | old-mask messages | group table reconstructed from the committed member mask messages at the BAT layout offsets |
+//! | fresh mask | deterministic fresh-mask witness committed under its own mask tree; the fresh-mask root and sum are fixed at the FOLD start after BAT |
+//! | tails | committed member tails; not part of the FOLD relation view |
+//!
+//! The FOLD verifier consumes the fixed row and the prover messages; it does
+//! not re-open the member roots, which the group session checks before `x`.
+//!
+//! Order and ownership: the ordered group roots are bound (seal round), the
+//! verifier draws the member opening positions (positions round), the member
+//! openings are checked, the chain is moved to BAT, BAT freezes the group and
+//! draws `x`, the advanced chain moves to the FOLD-only entry, the fixed row is
+//! bound, the start message fixes the fresh root and sum before epsilon, each
+//! round message is absorbed before its gamma, and the final output stays
+//! pending. Round counts and values are recorded across every move.
+//!
+//! FOLD does not decide truth: a wrong BAT target still completes the rounds
+//! and remains pending. Wrong shape, code, group, oracle, layout, root, opening
+//! and order violations fail closed. The wrong-target case is not evidence that
+//! FOLD judges an arbitrary declaration.
+//!
+//! The single G_u witness from the SEND fixture is not applied to this group:
+//! each member has its own shape-checked fixture commitment. Unsupported plans
+//! and shapes are rejected. Unclosed: real SEND/G_u and send receipts,
+//! authenticated assets, fresh-mask openings and proximity, folded tails, a
+//! relation/proximity connection, hiding, single-shot semantics, and a trust
+//! anchor independent of the fixture expectation. The plan's reader and
+//! binding are a valid but inert scaffold required by the existing plan type;
+//! the FOLD-only entry never reads them and they are not a witness or an asset
+//! binding. `verify_request` is unchanged.
 
 use std::sync::{Arc, Mutex};
 
@@ -79,11 +99,15 @@ use zkie_engine::pcs::request::foldeq::{
 };
 use zkie_engine::pcs::request::params::{RequestParams, LEAF_SALT_MIN_BYTES};
 use zkie_engine::pcs::request::read::ReadLedger;
-use zkie_engine::pcs::request::runtime_tree::{MaskTree, MaskTreePlan};
+use zkie_engine::pcs::request::runtime_tree::{MaskTree, MaskTreePlan, RuntimeTreeOpening};
 use zkie_engine::pcs::request::table::{
     commit_table, IndexReader, IndexShape, TableDistances,
 };
 use zkie_engine::primitives::transcript::{hash_labeled, tag_word, TEST_COINS};
+
+use crate::proof::group_commitment_session::{
+    CommittedGroupMember, GroupCommitmentSession, GroupMemberPlan, GroupRootMessage,
+};
 
 const FIXTURE_GROUP: u64 = 0;
 const FIXTURE_FRESH: u64 = 3;
@@ -95,6 +119,9 @@ const FIXTURE_MASK_ROWS: u64 = 2;
 const FIXTURE_K: u32 = 3;
 const FIXTURE_H: u32 = 3;
 const FIXTURE_PLANNED_ROWS: u64 = 6;
+const FIXTURE_OPENINGS_PER_ORACLE: usize = 2;
+const FIXTURE_MEMBER_TREE_BASE: u64 = 10;
+const FIXTURE_MEMBER_LEAF: u32 = 4;
 
 /// A deterministic numbered source for the fixture's fresh mask. It is public,
 /// reproducible and provides no hiding; it must not be used outside a test or
@@ -177,18 +204,6 @@ fn table_len(rows: u64, ell: u64) -> Result<usize> {
     1usize.checked_shl(bits).ok_or(Error::ResourceLimit)
 }
 
-fn message_table(len: usize, base: u64, tag: u64, oracle: u64) -> Vec<Fp3> {
-    (0..len)
-        .map(|index| {
-            Fp3::from_u64(
-                base.wrapping_add(tag.wrapping_mul(0x100))
-                    .wrapping_add(oracle.wrapping_mul(0x40))
-                    .wrapping_add(index as u64),
-            )
-        })
-        .collect()
-}
-
 fn coefficient_table(len: usize, seed: u64, tag: u64) -> Vec<Fp3> {
     (0..len)
         .map(|index| {
@@ -211,27 +226,31 @@ fn dot(left: &[Fp3], right: &[Fp3]) -> Result<Fp3> {
     Ok(sum)
 }
 
-/// Builds the group message table from the per-member fixture messages. The
-/// index mapping is the layout's own: member entries are column-major within
-/// the member table and placed at the member's first group row, exactly where
-/// BAT carries the coefficients.
+/// Builds the group message table from the committed member messages. The
+/// index mapping is the layout's own: member message entries are row-major and
+/// placed at the member's first group row, exactly where BAT carries the
+/// coefficients.
 fn build_group_table(
     layout: &FoldGroupLayout,
     bat_layout: &BatGroupLayout,
     part: BatPart,
-    ell: u64,
-    tag: u64,
-    base: u64,
+    members: &[CommittedGroupMember],
 ) -> Result<Vec<Fp3>> {
     let group_bits = bat_layout.group_row_bits(part);
     let group_len = bat_layout.group_len(part)?;
     let mut values = vec![Fp3::ZERO; group_len];
-    if layout.members.len() != bat_layout.members.len() {
+    if layout.members.len() != bat_layout.members.len() || layout.members.len() != members.len() {
         return Err(Error::StatementMismatch);
     }
-    for (fold_member, bat_member) in layout.members.iter().zip(&bat_layout.members) {
+    for (index, (fold_member, bat_member)) in
+        layout.members.iter().zip(&bat_layout.members).enumerate()
+    {
         if fold_member.oracle != bat_member.oracle || fold_member.kept {
             return Err(Error::UnsupportedPrimitive);
+        }
+        let member = members.get(index).ok_or(Error::StatementMismatch)?;
+        if member.plan().oracle != fold_member.oracle {
+            return Err(Error::StatementMismatch);
         }
         let rows = match part {
             BatPart::Main => fold_member.main_rows,
@@ -240,23 +259,32 @@ fn build_group_table(
         if rows == 0 {
             continue;
         }
+        let ell = match part {
+            BatPart::Main => member.plan().main_code.ell,
+            BatPart::Mask => member.plan().mask_code.ell,
+        };
+        let messages = match part {
+            BatPart::Main => member.main_messages(),
+            BatPart::Mask => member.mask_messages(),
+        };
+        if messages.len() as u64 != rows || messages.iter().any(|message| message.len() as u64 != ell)
+        {
+            return Err(Error::ShapeMismatch);
+        }
         let first = match part {
             BatPart::Main => bat_member.main_first,
             BatPart::Mask => bat_member.mask_first,
         }
         .ok_or(Error::StatementMismatch)?;
-        let bits = row_bits(rows);
-        let row_mask = (1u64 << bits) - 1;
-        let table = message_table(table_len(rows, ell)?, base, tag, fold_member.oracle);
-        for (index, value) in table.iter().enumerate() {
-            let row = index as u64 & row_mask;
-            let place = (index as u64) >> bits;
-            let at = first
-                .checked_add(row)
-                .and_then(|value| value.checked_add(place.checked_shl(group_bits)?))
-                .ok_or(Error::ResourceLimit)?;
-            let slot = values.get_mut(at as usize).ok_or(Error::InvalidIndex)?;
-            *slot = *value;
+        for (row, message) in messages.iter().enumerate() {
+            for (place, value) in message.iter().enumerate() {
+                let at = first
+                    .checked_add(row as u64)
+                    .and_then(|value| value.checked_add((place as u64).checked_shl(group_bits)?))
+                    .ok_or(Error::ResourceLimit)?;
+                let slot = values.get_mut(at as usize).ok_or(Error::InvalidIndex)?;
+                *slot = *value;
+            }
         }
     }
     Ok(values)
@@ -302,14 +330,16 @@ fn probe_bat_statement(
     Ok((layout, probe))
 }
 
-/// One deterministic fixture group shared natively by BAT and FOLD. The group
-/// has no commitment; only the fresh mask is committed.
+/// One deterministic fixture group shared natively by BAT and FOLD. Each member
+/// oracle has its own committed runtime tree and root; the ordered roots are
+/// bound into the session before the BAT challenge.
 pub struct BatFoldFixture {
     tag: u64,
     target_shift: Fp3,
     shape: FoldShape,
     layout: FoldGroupLayout,
     bat_statement: BatStatement,
+    members: Vec<CommittedGroupMember>,
     group_main: Vec<Fp3>,
     group_mask: Vec<Fp3>,
     tree_plan: MaskTreePlan,
@@ -358,24 +388,31 @@ impl BatFoldFixture {
         {
             return Err(Error::UnsupportedPrimitive);
         }
+        let mut members = Vec::with_capacity(shapes.len());
+        for entry in &shapes {
+            let member = CommittedGroupMember::new(
+                tag,
+                entry.oracle,
+                FIXTURE_MEMBER_TREE_BASE + entry.oracle,
+                FIXTURE_MEMBER_LEAF,
+                shape.code,
+                shape.mask_code,
+                FIXTURE_MAIN_ROWS,
+                FIXTURE_MASK_ROWS,
+            )?;
+            if member.plan().main_code != shape.code
+                || member.plan().mask_code != shape.mask_code
+                || member.plan().main_rows != FIXTURE_MAIN_ROWS
+                || member.plan().mask_rows != FIXTURE_MASK_ROWS
+            {
+                return Err(Error::StatementMismatch);
+            }
+            members.push(member);
+        }
         let main_len = table_len(FIXTURE_MAIN_ROWS, shape.code.ell)?;
         let mask_len = table_len(FIXTURE_MASK_ROWS, shape.mask_code.ell)?;
-        let group_main = build_group_table(
-            &layout,
-            &bat_layout,
-            BatPart::Main,
-            shape.code.ell,
-            tag,
-            0x1000,
-        )?;
-        let group_mask = build_group_table(
-            &layout,
-            &bat_layout,
-            BatPart::Mask,
-            shape.mask_code.ell,
-            tag,
-            0x2000,
-        )?;
+        let group_main = build_group_table(&layout, &bat_layout, BatPart::Main, &members)?;
+        let group_mask = build_group_table(&layout, &bat_layout, BatPart::Mask, &members)?;
 
         // Fixture sample-class rows satisfy BAT's sampled-member registration.
         // Their targets are the true inner products of their unit coefficients
@@ -550,6 +587,7 @@ impl BatFoldFixture {
             shape,
             layout,
             bat_statement,
+            members,
             group_main,
             group_mask,
             tree_plan,
@@ -594,6 +632,37 @@ impl BatFoldFixture {
 
     pub fn planned_rows(&self) -> u64 {
         FIXTURE_PLANNED_ROWS
+    }
+
+    pub fn member_plans(&self) -> Vec<GroupMemberPlan> {
+        self.members
+            .iter()
+            .map(|member| member.plan().clone())
+            .collect()
+    }
+
+    pub fn group_root_message(&self) -> GroupRootMessage {
+        GroupRootMessage::from_plans(&self.member_plans())
+    }
+
+    pub fn open_members(&self, positions: &[Vec<u64>]) -> Result<Vec<RuntimeTreeOpening>> {
+        if positions.len() != self.members.len() {
+            return Err(Error::ShapeMismatch);
+        }
+        self.members
+            .iter()
+            .zip(positions)
+            .map(|(member, list)| member.open(list))
+            .collect()
+    }
+
+    /// Re-encodes every member message and tail and re-commits its tree. The
+    /// caller compares the results with the member plans' roots.
+    pub fn recompute_member_roots(&self) -> Result<Vec<Digest>> {
+        self.members
+            .iter()
+            .map(CommittedGroupMember::recompute_root)
+            .collect()
     }
 
     /// Re-commits the stored mask rows and tails independently of the start
@@ -736,14 +805,19 @@ fn fixture_plan_scaffold() -> Result<(IndexReader, FoldeqBinding)> {
     Ok((reader, binding))
 }
 
-/// The result of one fixture BAT-to-FOLD run. The group and declaration flags
-/// record that this demonstration has no group commitment; the FOLD output is a
-/// pending candidate, not an acceptance.
+/// The result of one fixture BAT-to-FOLD run. The group roots are fixture
+/// commitments checked against fixture expectations and openings; the sample
+/// rows remain plaintext fixture claims. The FOLD output is a pending
+/// candidate, not an acceptance.
 pub struct BatFoldOutcome {
     pub tag: u64,
     pub shape: FoldShape,
     pub layout: FoldGroupLayout,
     pub bat_layout: BatGroupLayout,
+    pub group_roots: Vec<Digest>,
+    pub group_positions: Vec<Vec<u64>>,
+    pub group_rounds: u64,
+    pub group_value: Digest,
     pub bat_order: Vec<BatRowKind>,
     pub bat_planned_rows: u64,
     pub bat_input_targets: Vec<Fp3>,
@@ -762,8 +836,13 @@ pub struct BatFoldOutcome {
     pub fold_decides_truth: bool,
     pub native_shared_codes: bool,
     pub adapter_used: bool,
-    pub group_root_committed: bool,
-    pub witness_bound_to_group_commitment: bool,
+    pub group_roots_bound: bool,
+    pub single_group_root_claimed: bool,
+    pub openings_verified: bool,
+    pub member_roots_from_fixture: bool,
+    pub real_send_receipts: bool,
+    pub group_roots_authenticated: bool,
+    pub fold_messages_from_committed_members: bool,
     pub sample_rows_are_send_receipts: bool,
     pub declarations_from_bound_messages: bool,
     pub real_assets_bound: bool,
@@ -785,9 +864,11 @@ pub struct BatFoldOutcome {
     pub witness_root: Digest,
 }
 
-/// Runs the isolated fixture: BAT freezes the shared group, draws `x`, hands
-/// its advanced chain to the FOLD-only entry, the fixed combined row enters
-/// FOLD unchanged, and the rounds finish with a pending output.
+/// Runs the isolated fixture: the per-member group roots are bound into the
+/// chain and the member openings are checked, BAT freezes the shared group and
+/// draws `x`, the advanced chain moves to the FOLD-only entry, the fixed
+/// combined row enters FOLD unchanged, and the rounds finish with a pending
+/// output.
 pub fn run_bat_fold(fixture: &BatFoldFixture, chain: Chain) -> Result<BatFoldOutcome> {
     if fixture.recompute_root()? != fixture.start.root {
         return Err(Error::StatementMismatch);
@@ -795,10 +876,33 @@ pub fn run_bat_fold(fixture: &BatFoldFixture, chain: Chain) -> Result<BatFoldOut
     if fold_mask_sum(fixture.shape.k, fixture.mask.coefficients())? != fixture.start.sum {
         return Err(Error::StatementMismatch);
     }
+    let member_plans = fixture.member_plans();
+    let member_roots = fixture.recompute_member_roots()?;
+    if member_roots.len() != member_plans.len()
+        || member_roots
+            .iter()
+            .zip(&member_plans)
+            .any(|(root, plan)| *root != plan.root)
+    {
+        return Err(Error::StatementMismatch);
+    }
+
+    let mut group = GroupCommitmentSession::new(chain, member_plans)?;
+    group.bind_roots(&fixture.group_root_message())?;
+    let group_positions = group.draw_positions(FIXTURE_OPENINGS_PER_ORACLE)?;
+    let group_openings = fixture.open_members(&group_positions)?;
+    group.verify_openings(&group_openings)?;
+    let group_roots = group.roots().to_vec();
+    let group_rounds = group.chain_rounds();
+    let group_value = *group.chain_value();
+    let group_chain = group.into_chain()?;
+    if group_chain.rounds() != group_rounds || *group_chain.value() != group_value {
+        return Err(Error::StatementMismatch);
+    }
 
     let mut bat = BatSession::new(
         fixture.bat_statement.clone(),
-        chain,
+        group_chain,
         fixture.planned_rows(),
     )?;
     let input = bat.begin_run(fixture.group())?;
@@ -881,6 +985,10 @@ pub fn run_bat_fold(fixture: &BatFoldFixture, chain: Chain) -> Result<BatFoldOut
         shape: fixture.shape,
         layout: fixture.layout.clone(),
         bat_layout,
+        group_roots,
+        group_positions,
+        group_rounds,
+        group_value,
         bat_order,
         bat_planned_rows: fixture.planned_rows(),
         bat_input_targets,
@@ -899,8 +1007,13 @@ pub fn run_bat_fold(fixture: &BatFoldFixture, chain: Chain) -> Result<BatFoldOut
         fold_decides_truth: false,
         native_shared_codes: true,
         adapter_used: false,
-        group_root_committed: false,
-        witness_bound_to_group_commitment: false,
+        group_roots_bound: true,
+        single_group_root_claimed: false,
+        openings_verified: true,
+        member_roots_from_fixture: true,
+        real_send_receipts: false,
+        group_roots_authenticated: false,
+        fold_messages_from_committed_members: true,
         sample_rows_are_send_receipts: false,
         declarations_from_bound_messages: false,
         real_assets_bound: false,
@@ -933,9 +1046,16 @@ mod tests {
     }
 
     fn bat_stage(fixture: &BatFoldFixture, seed: &[u8]) -> Result<(Chain, FoldInputRow)> {
+        let mut group =
+            GroupCommitmentSession::new(chain(seed), fixture.member_plans())?;
+        group.bind_roots(&fixture.group_root_message())?;
+        let positions = group.draw_positions(FIXTURE_OPENINGS_PER_ORACLE)?;
+        let openings = fixture.open_members(&positions)?;
+        group.verify_openings(&openings)?;
+        let handoff = group.into_chain()?;
         let mut bat = BatSession::new(
             fixture.bat_statement.clone(),
-            chain(seed),
+            handoff,
             fixture.planned_rows(),
         )?;
         let input = bat.begin_run(fixture.group())?;
@@ -979,6 +1099,51 @@ mod tests {
             fold_mask_sum(fixture.shape.k, fixture.mask.coefficients()).unwrap(),
             fixture.start.sum
         );
+        let plans = fixture.member_plans();
+        assert_eq!(plans.len(), 3);
+        assert_eq!(
+            fixture.recompute_member_roots().unwrap(),
+            plans.iter().map(|plan| plan.root).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            fixture.group_root_message().entries.len(),
+            plans.len()
+        );
+        assert_eq!(
+            build_group_table(&fixture.layout, &bat_layout, BatPart::Main, &fixture.members)
+                .unwrap(),
+            fixture.group_main
+        );
+        assert_eq!(
+            build_group_table(&fixture.layout, &bat_layout, BatPart::Mask, &fixture.members)
+                .unwrap(),
+            fixture.group_mask
+        );
+        // The first member's first message row sits at its BAT first offset;
+        // later places move by the group row space.
+        let first = &bat_layout.members[0];
+        assert_eq!(first.oracle, 0);
+        assert_eq!(first.main_first, Some(0));
+        assert_eq!(
+            fixture.group_main[0],
+            fixture.members[0].main_messages()[0][0]
+        );
+        assert_eq!(
+            fixture.group_main[1],
+            fixture.members[0].main_messages()[1][0]
+        );
+        assert_eq!(
+            fixture.group_main[1 << bat_layout.k],
+            fixture.members[0].main_messages()[0][1]
+        );
+        assert_eq!(
+            fixture.group_main.len(),
+            1 << (bat_layout.k + bat_layout.log_ell)
+        );
+        assert_eq!(
+            fixture.group_mask.len(),
+            1 << (bat_layout.h + bat_layout.log_ell_zk)
+        );
     }
 
     #[test]
@@ -1008,16 +1173,27 @@ mod tests {
         assert!(!run.fold_decides_truth);
         assert!(!run.adapter_used);
         assert!(run.native_shared_codes);
-        assert!(!run.group_root_committed);
-        assert!(!run.witness_bound_to_group_commitment);
+        assert!(run.group_roots_bound);
+        assert!(!run.single_group_root_claimed);
+        assert!(run.openings_verified);
+        assert!(run.member_roots_from_fixture);
+        assert!(!run.real_send_receipts);
+        assert!(!run.group_roots_authenticated);
+        assert!(run.fold_messages_from_committed_members);
         assert!(!run.sample_rows_are_send_receipts);
         assert!(!run.declarations_from_bound_messages);
         assert!(!run.real_assets_bound);
         assert!(!run.mask_root_authenticated);
         assert!(!run.production_wired);
-        assert_eq!(run.gamma.len(), fixture.shape.k as usize);
+        assert_eq!(run.group_roots.len(), 3);
+        assert_eq!(run.group_positions.len(), 3);
+        assert_eq!(run.group_roots, fixture.recompute_member_roots().unwrap());
+        assert_eq!(run.group_rounds, 2);
+        assert_eq!(run.bat_chain_rounds, run.group_rounds + 1);
         assert_eq!(run.fold_entry_rounds, run.bat_chain_rounds);
         assert_eq!(run.fold_entry_value, run.bat_chain_value);
+        assert_ne!(run.group_value, run.bat_chain_value);
+        assert_eq!(run.gamma.len(), fixture.shape.k as usize);
         assert_eq!(run.start_chain_rounds, run.fold_entry_rounds + 1);
         assert_eq!(
             run.final_rounds,
@@ -1037,6 +1213,7 @@ mod tests {
         assert_eq!(first.witness_root, second.witness_root);
         assert_eq!(first.start.root, second.start.root);
         assert_eq!(first.start.sum, second.start.sum);
+        assert_eq!(first.group_roots, second.group_roots);
         assert_ne!(first.x, second.x);
         assert_ne!(first.epsilon, second.epsilon);
         assert_ne!(first.combined.main, second.combined.main);
@@ -1226,21 +1403,31 @@ mod tests {
     }
 
     #[test]
-    fn the_demonstration_has_no_group_commitment() {
+    fn group_commitment_is_per_oracle_and_fixture_only() {
         let fixture = BatFoldFixture::new(30).unwrap();
-        let run = run_bat_fold(&fixture, chain(b"no group commitment")).unwrap();
-        assert!(!run.group_root_committed);
-        assert!(!run.witness_bound_to_group_commitment);
+        let run = run_bat_fold(&fixture, chain(b"fixture group commitment")).unwrap();
+        assert!(run.group_roots_bound);
+        assert!(!run.single_group_root_claimed);
+        assert!(run.openings_verified);
+        assert!(run.member_roots_from_fixture);
+        assert!(!run.real_send_receipts);
+        assert!(!run.group_roots_authenticated);
+        assert!(run.fold_messages_from_committed_members);
         assert!(!run.sample_rows_are_send_receipts);
         assert!(!run.declarations_from_bound_messages);
-        // The only committed root in this fixture is the fresh mask's, and it
-        // commits only the fresh mask rows and tail.
+        assert_eq!(run.group_roots.len(), 3);
+        assert_eq!(run.group_positions.len(), 3);
+        assert!(run
+            .group_roots
+            .windows(2)
+            .all(|pair| pair[0] != pair[1]));
+        assert_eq!(run.group_roots, fixture.recompute_member_roots().unwrap());
+        assert_eq!(run.group_rounds, 2);
+        assert_eq!(run.bat_chain_rounds, run.group_rounds + 1);
         assert_eq!(fixture.recompute_root().unwrap(), run.start.root);
         assert_eq!(run.witness_root, run.start.root);
         assert!(run.pending);
         assert!(!run.fold_decides_truth);
-        // The arithmetic consistency check uses the plaintext group tables; it
-        // is not a commitment check.
         assert!(run.combined_matches_witness);
         assert!(run.fold_matches_witness);
     }

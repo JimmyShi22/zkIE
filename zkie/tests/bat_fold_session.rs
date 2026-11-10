@@ -1,6 +1,7 @@
-//! Isolated fixture BAT-to-FOLD algebraic/chain interface demonstration. This
-//! is not a same-commitment positive case: the group tables have no oracle
-//! root and only the fresh mask is committed.
+//! Isolated fixture BAT-to-FOLD algebraic/chain interface demonstration. Each
+//! group member has its own fixture runtime-tree root; the ordered roots are
+//! bound before the BAT challenge and the member openings are checked. The
+//! roots are fixture expectations, not SEND receipts or asset roots.
 
 use zkie_core::types::Digest;
 use zkie_engine::pcs::request::chain::Chain;
@@ -24,10 +25,20 @@ fn the_fixture_bat_row_enters_fold_natively() {
     assert!(!run.fold_decides_truth);
     assert!(!run.adapter_used);
     assert!(run.native_shared_codes);
-    assert!(!run.group_root_committed);
-    assert!(!run.witness_bound_to_group_commitment);
+    assert!(run.group_roots_bound);
+    assert!(!run.single_group_root_claimed);
+    assert!(run.openings_verified);
+    assert!(run.member_roots_from_fixture);
+    assert!(!run.real_send_receipts);
+    assert!(!run.group_roots_authenticated);
+    assert!(run.fold_messages_from_committed_members);
     assert!(!run.sample_rows_are_send_receipts);
     assert!(!run.declarations_from_bound_messages);
+    assert_eq!(run.group_roots.len(), 3);
+    assert_eq!(run.group_positions.len(), 3);
+    assert_eq!(run.group_roots, fixture.recompute_member_roots().unwrap());
+    assert_eq!(run.group_rounds, 2);
+    assert_eq!(run.bat_chain_rounds, run.group_rounds + 1);
     assert!(run.combined_matches_witness);
     assert!(run.fold_matches_witness);
     assert_eq!(run.fold_row.coefficients, run.combined.main);
@@ -41,8 +52,15 @@ fn the_fixture_bat_row_enters_fold_natively() {
     );
     assert!(run.output.next_stage().is_err());
     println!(
-        "root={:?} sum={:?} x={:?} eps={:?} target={:?} auxiliary={:?}",
-        run.start.root, run.start.sum, run.x, run.epsilon, run.output.target, run.auxiliary_value
+        "roots={:?} positions={:?} root={:?} sum={:?} x={:?} eps={:?} target={:?} auxiliary={:?}",
+        run.group_roots,
+        run.group_positions,
+        run.start.root,
+        run.start.sum,
+        run.x,
+        run.epsilon,
+        run.output.target,
+        run.auxiliary_value
     );
 }
 
