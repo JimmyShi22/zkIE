@@ -60,7 +60,7 @@ pub fn lm_head_plan() -> Result<RequestPlan> {
     let codes = codes()?;
     Ok(RequestPlan {
         table: TablePlan {
-            code: code(17, 1 << 16, 8192)?,
+            code: code(17, 65539, 8192)?,
             v: 10,
             delta_once_num: 1,
             delta_once_den: 8,
@@ -130,7 +130,12 @@ mod tests {
     fn the_fixed_plan_is_admissible() {
         let plan = lm_head_plan().expect("plan");
         plan.validate().expect("plan validates");
-        assert_eq!(plan.table.code.ell, 1 << plan.lin.k_col);
+        let pads = zkie_engine::pcs::request::field::E_DEGREE as u64 * plan.samples;
+        assert_eq!(
+            plan.table.code.ell - pads,
+            1 << plan.lin.k_col,
+            "the matrix fills the message beside the pads"
+        );
         assert_eq!(plan.table.v, plan.lin.matrix_rows_log);
         assert_eq!(plan.lin.matrix_rows_log + plan.lin.k_lo, plan.lin.k_col);
         assert_eq!(plan.groups.guo.cube_bits(&plan.codes).expect("cube"), 17);
@@ -185,6 +190,13 @@ mod tests {
     fn a_mask_code_with_a_larger_rate_is_rejected() {
         let mut plan = lm_head_plan().expect("plan");
         plan.codes.mask_c = code(14, 4096, 300).expect("code");
+        assert!(plan.validate().is_err());
+    }
+
+    #[test]
+    fn a_table_without_room_for_the_matrix_beside_its_pads_is_rejected() {
+        let mut plan = lm_head_plan().expect("plan");
+        plan.table.code.ell = 65538;
         assert!(plan.validate().is_err());
     }
 }

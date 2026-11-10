@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use zkie_core::error::{Error, Result};
 
 use crate::pcs::request::code::{build_code_plan, CodeParams, MOST_LOG_N};
+use crate::pcs::request::field::E_DEGREE;
 
 /// The largest number of work bits a scope may state.
 pub const MAX_WORK_BITS: u8 = 32;
@@ -253,12 +254,32 @@ impl RequestPlan {
         {
             return Err(Error::InvalidConfig);
         }
+        self.table
+            .code
+            .ell
+            .checked_add(self.table.code.r)
+            .ok_or(Error::InvalidConfig)?;
         build_code_plan(
             self.table.code.log_n,
             self.table.code.ell,
             self.table.code.r,
         )?;
-        if self.table.code.ell != 1u64 << self.lin.k_col {
+        let pads = (E_DEGREE as u64)
+            .checked_mul(self.samples)
+            .ok_or(Error::InvalidConfig)?;
+        let plain = self
+            .table
+            .code
+            .ell
+            .checked_sub(pads)
+            .ok_or(Error::InvalidConfig)?;
+        let matrix_rows = 1u64
+            .checked_shl(self.lin.matrix_rows_log)
+            .ok_or(Error::InvalidConfig)?;
+        let matrix_entries = matrix_rows
+            .checked_shl(self.lin.k_lo)
+            .ok_or(Error::InvalidConfig)?;
+        if matrix_entries > plain {
             return Err(Error::InvalidConfig);
         }
         for code in [
@@ -417,7 +438,7 @@ mod tests {
     }
 
     fn base_plan() -> RequestPlan {
-        let table = code(17, 1 << 16, 8192);
+        let table = code(17, 65539, 8192);
         let u = code(11, 512, 300);
         let om = code(17, 4096, 3640);
         let mask_u = code(10, 64, 300);
@@ -566,5 +587,21 @@ mod tests {
         let mut plan = base_plan();
         plan.groups.om.rows_log = 9;
         assert!(plan.validate().is_err());
+    }
+
+    #[test]
+    fn a_table_without_room_for_the_matrix_beside_its_pads_is_rejected() {
+        let mut plan = base_plan();
+        plan.table.code.ell = 65538;
+        assert!(plan.validate().is_err());
+        plan.table.code.ell = 65536;
+        assert!(plan.validate().is_err());
+    }
+
+    #[test]
+    fn the_smallest_table_message_that_fits_beside_the_pads_passes() {
+        let mut plan = base_plan();
+        plan.table.code.ell = 65539;
+        plan.validate().expect("the matrix fits beside the pads");
     }
 }
