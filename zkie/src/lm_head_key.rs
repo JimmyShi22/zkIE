@@ -171,6 +171,57 @@ impl LimitedKeyStatement {
         zkie_core::artifact::digest_bytes(&self.encode())
     }
 
+    /// Decodes the canonical statement bytes. Bounded and strict: unknown
+    /// fields, truncation and trailing bytes are rejected.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        use zkie_engine::primitives::codec::CanonicalReader;
+        use zkie_core::common::codec::DecodeLimits;
+        let limits = DecodeLimits {
+            max_bytes: 1 << 20,
+            max_elements: 1 << 12,
+        };
+        let mut reader = CanonicalReader::new(bytes, limits);
+        let version = reader.get_u64()?;
+        let model_commitment = reader.get_digest()?;
+        let table_root = reader.get_digest()?;
+        let table_configuration = reader.get_digest()?;
+        let log_n = u32::try_from(reader.get_u64()?).map_err(|_| Error::InvalidEncoding)?;
+        let ell = reader.get_u64()?;
+        let r = reader.get_u64()?;
+        let v = u32::try_from(reader.get_u64()?).map_err(|_| Error::InvalidEncoding)?;
+        let answers = u32::try_from(reader.get_u64()?).map_err(|_| Error::InvalidEncoding)?;
+        let salt_bytes = u32::try_from(reader.get_u64()?).map_err(|_| Error::InvalidEncoding)?;
+        let code = zkie_engine::pcs::request::code::build_code_plan(log_n, ell, r)?;
+        let table_shape = zkie_engine::pcs::request::table::IndexShape {
+            code,
+            v,
+            answers,
+            salt_bytes: salt_bytes as usize,
+            distances: zkie_engine::pcs::request::table::TableDistances {
+                radius: reader.get_u64()?,
+                later_radius: reader.get_u64()?,
+                m_once: reader.get_u64()?,
+                m_later: reader.get_u64()?,
+            },
+        };
+        let statement = Self {
+            version,
+            model_commitment,
+            table_root,
+            table_configuration,
+            table_shape,
+            matrix_rows: reader.get_u64()?,
+            k_lo: u32::try_from(reader.get_u64()?).map_err(|_| Error::InvalidEncoding)?,
+            k_col: u32::try_from(reader.get_u64()?).map_err(|_| Error::InvalidEncoding)?,
+            valid_min: reader.get_u64()? as i64,
+            valid_max: reader.get_u64()? as i64,
+            no_wf: reader.get_u64()? != 0,
+            trusted_i32_mapping: reader.get_u64()? != 0,
+        };
+        reader.finish()?;
+        Ok(statement)
+    }
+
     /// Checks the limited statement's own version, semantics and range.
     pub fn validate(&self) -> Result<()> {
         if self.version != LIMITED_KEY_VERSION
@@ -1104,6 +1155,576 @@ pub fn commit_lm_head_omega(
 /// The values one shared-only run records before the FOLD stage: the gamma,
 /// the seed set, the provider's ordered answers, the drawn table columns and
 /// the transcript value after the two joins.
+/// The public messages of one switch stage. Prover witness (the new rows,
+/// their tails and the private encoding) stays out of this record; openings
+/// are verifier inputs.
+#[derive(Clone, Debug)]
+pub struct LimitedSwitchRecord {
+    pub identity: Digest,
+    pub declared_root: Digest,
+    pub sample_answer: Fp3,
+    pub member_openings: Vec<RuntimeTreeOpening>,
+    pub fresh_opening: RuntimeTreeOpening,
+    pub old_mask_root: Option<Digest>,
+    pub old_mask_opening: Option<RuntimeTreeOpening>,
+    pub stage_fold: Option<LimitedStageFoldRecord>,
+}
+
+/// The public messages of one FOLD stage: the fresh mask start message and
+/// the round polynomials.
+#[derive(Clone, Debug)]
+pub struct LimitedStageFoldRecord {
+    pub start: FoldStartMessage,
+    pub rounds: Vec<(Fp3, Fp3)>,
+}
+
+/// The public prover messages of one chain. The statement and the trusted
+/// plan are supplied by the verifier; this record holds only what the prover
+/// sent and the final BASE artifact.
+#[derive(Clone, Debug, Default)]
+pub struct LimitedChainRecord {
+    pub gu_root: Option<Digest>,
+    pub gu_answers: Vec<Fp3>,
+    pub omega_root: Option<Digest>,
+    pub omega_answers: Vec<Fp3>,
+    pub column_openings: Vec<ColumnOpening>,
+    pub fold_start: Option<FoldStartMessage>,
+    pub fold_rounds: Vec<(Fp3, Fp3)>,
+    pub switches: Vec<LimitedSwitchRecord>,
+    pub base_proof: Option<Vec<u8>>,
+    pub sealed: Option<Digest>,
+}
+
+/// One versioned whole-chain artifact. It carries the statement and every
+/// public prover message; no folded message, switched row, tail or mask
+/// coefficient is included.
+pub const LIMITED_CHAIN_ARTIFACT_VERSION: u64 = 1;
+
+#[derive(Clone, Debug)]
+pub struct LimitedStageFoldArtifact {
+    pub start: FoldStartMessage,
+    pub rounds: Vec<(Fp3, Fp3)>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LimitedSwitchArtifact {
+    pub identity: Digest,
+    pub declared_root: Digest,
+    pub sample_answer: Fp3,
+    pub member_openings: Vec<RuntimeTreeOpening>,
+    pub fresh_opening: RuntimeTreeOpening,
+    pub old_mask_root: Option<Digest>,
+    pub old_mask_opening: Option<RuntimeTreeOpening>,
+    pub stage_fold: Option<LimitedStageFoldArtifact>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LimitedChainArtifact {
+    pub version: u64,
+    pub protocol_identity: Digest,
+    pub statement: LimitedKeyStatement,
+    pub gu_root: Digest,
+    pub gu_answers: Vec<Fp3>,
+    pub omega_root: Option<Digest>,
+    pub omega_answers: Vec<Fp3>,
+    pub column_openings: Vec<ColumnOpening>,
+    pub fold_start: FoldStartMessage,
+    pub fold_rounds: Vec<(Fp3, Fp3)>,
+    pub switches: Vec<LimitedSwitchArtifact>,
+    pub base_proof: Vec<u8>,
+    pub sealed: Digest,
+}
+
+fn artifact_limits() -> zkie_core::common::codec::DecodeLimits {
+    zkie_core::common::codec::DecodeLimits {
+        max_bytes: 1 << 34,
+        max_elements: 1 << 28,
+    }
+}
+
+fn put_digest_vec(
+    writer: &mut zkie_engine::primitives::codec::CanonicalWriter,
+    values: &[Digest],
+) {
+    writer.put_u64(values.len() as u64);
+    for value in values {
+        writer.put_digest(value);
+    }
+}
+
+fn put_fp_vec(
+    writer: &mut zkie_engine::primitives::codec::CanonicalWriter,
+    values: &[Fp],
+) {
+    writer.put_u64(values.len() as u64);
+    for value in values {
+        writer.put_fp(*value);
+    }
+}
+
+fn put_fp3_vec(
+    writer: &mut zkie_engine::primitives::codec::CanonicalWriter,
+    values: &[Fp3],
+) {
+    writer.put_u64(values.len() as u64);
+    for value in values {
+        writer.put_fp3(value);
+    }
+}
+
+fn put_column_opening(
+    writer: &mut zkie_engine::primitives::codec::CanonicalWriter,
+    opening: &ColumnOpening,
+) {
+    writer.put_u64(opening.position);
+    writer.put_bytes(&opening.salt);
+    put_fp_vec(writer, &opening.symbols);
+    put_digest_vec(writer, &opening.path);
+}
+
+fn put_runtime_opening(
+    writer: &mut zkie_engine::primitives::codec::CanonicalWriter,
+    opening: &RuntimeTreeOpening,
+) {
+    writer.put_u64(opening.positions.len() as u64);
+    for position in &opening.positions {
+        writer.put_u64(*position);
+    }
+    writer.put_u64(opening.columns.len() as u64);
+    for column in &opening.columns {
+        writer.put_u64(column.position);
+        writer.put_bytes(&column.salt);
+        put_fp_vec(writer, &column.symbols);
+    }
+    put_digest_vec(writer, &opening.given);
+}
+
+fn put_mask_notice(
+    writer: &mut zkie_engine::primitives::codec::CanonicalWriter,
+    notice: &zkie_engine::pcs::request::fold::MaskNotice,
+) {
+    writer.put_u64(notice.mask_rows);
+    writer.put_u64(notice.mask_code.log_n as u64);
+    writer.put_u64(notice.mask_code.ell);
+    writer.put_u64(notice.mask_code.r);
+    writer.put_u64(notice.answers as u64);
+    writer.put_u64(notice.leaf_class as u64);
+}
+
+fn put_fold_start(
+    writer: &mut zkie_engine::primitives::codec::CanonicalWriter,
+    start: &FoldStartMessage,
+) {
+    writer.put_u64(start.id);
+    writer.put_u64(start.claimed_group);
+    writer.put_u64(start.tree_number);
+    put_mask_notice(writer, &start.notice);
+    writer.put_digest(&start.root);
+    writer.put_fp3(&start.sum);
+}
+
+fn put_stage_fold(
+    writer: &mut zkie_engine::primitives::codec::CanonicalWriter,
+    stage: &LimitedStageFoldArtifact,
+) {
+    put_fold_start(writer, &stage.start);
+    writer.put_u64(stage.rounds.len() as u64);
+    for (first, second) in &stage.rounds {
+        writer.put_fp3(first);
+        writer.put_fp3(second);
+    }
+}
+
+fn put_switch(
+    writer: &mut zkie_engine::primitives::codec::CanonicalWriter,
+    switch: &LimitedSwitchArtifact,
+) {
+    writer.put_digest(&switch.identity);
+    writer.put_digest(&switch.declared_root);
+    writer.put_fp3(&switch.sample_answer);
+    writer.put_u64(switch.member_openings.len() as u64);
+    for opening in &switch.member_openings {
+        put_runtime_opening(writer, opening);
+    }
+    put_runtime_opening(writer, &switch.fresh_opening);
+    match switch.old_mask_root {
+        Some(root) => {
+            writer.put_u64(1);
+            writer.put_digest(&root);
+        }
+        None => writer.put_u64(0),
+    }
+    match &switch.old_mask_opening {
+        Some(opening) => {
+            writer.put_u64(1);
+            put_runtime_opening(writer, opening);
+        }
+        None => writer.put_u64(0),
+    }
+    match &switch.stage_fold {
+        Some(stage) => {
+            writer.put_u64(1);
+            put_stage_fold(writer, stage);
+        }
+        None => writer.put_u64(0),
+    }
+}
+
+fn read_count(
+    reader: &mut zkie_engine::primitives::codec::CanonicalReader<'_>,
+    limits: zkie_core::common::codec::DecodeLimits,
+) -> Result<usize> {
+    let count = usize::try_from(reader.get_u64()?).map_err(|_| Error::InvalidEncoding)?;
+    limits.check_elements(count)?;
+    Ok(count)
+}
+
+fn read_digest_vec(
+    reader: &mut zkie_engine::primitives::codec::CanonicalReader<'_>,
+    limits: zkie_core::common::codec::DecodeLimits,
+) -> Result<Vec<Digest>> {
+    let count = read_count(reader, limits)?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| Error::ResourceLimit)?;
+    for _ in 0..count {
+        values.push(reader.get_digest()?);
+    }
+    Ok(values)
+}
+
+fn read_fp_vec(
+    reader: &mut zkie_engine::primitives::codec::CanonicalReader<'_>,
+    limits: zkie_core::common::codec::DecodeLimits,
+) -> Result<Vec<Fp>> {
+    let count = read_count(reader, limits)?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| Error::ResourceLimit)?;
+    for _ in 0..count {
+        values.push(reader.get_fp()?);
+    }
+    Ok(values)
+}
+
+fn read_fp3_vec(
+    reader: &mut zkie_engine::primitives::codec::CanonicalReader<'_>,
+    limits: zkie_core::common::codec::DecodeLimits,
+) -> Result<Vec<Fp3>> {
+    let count = read_count(reader, limits)?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| Error::ResourceLimit)?;
+    for _ in 0..count {
+        values.push(reader.get_fp3()?);
+    }
+    Ok(values)
+}
+
+fn read_column_opening(
+    reader: &mut zkie_engine::primitives::codec::CanonicalReader<'_>,
+    limits: zkie_core::common::codec::DecodeLimits,
+) -> Result<ColumnOpening> {
+    let position = reader.get_u64()?;
+    let salt = reader.get_bytes()?.to_vec();
+    let symbols = read_fp_vec(reader, limits)?;
+    let path = read_digest_vec(reader, limits)?;
+    Ok(ColumnOpening {
+        position,
+        salt,
+        symbols,
+        path,
+    })
+}
+
+fn read_runtime_opening(
+    reader: &mut zkie_engine::primitives::codec::CanonicalReader<'_>,
+    limits: zkie_core::common::codec::DecodeLimits,
+) -> Result<RuntimeTreeOpening> {
+    let positions_count = read_count(reader, limits)?;
+    let mut positions = Vec::new();
+    positions
+        .try_reserve_exact(positions_count)
+        .map_err(|_| Error::ResourceLimit)?;
+    for _ in 0..positions_count {
+        positions.push(reader.get_u64()?);
+    }
+    let columns_count = read_count(reader, limits)?;
+    let mut columns = Vec::new();
+    columns
+        .try_reserve_exact(columns_count)
+        .map_err(|_| Error::ResourceLimit)?;
+    for _ in 0..columns_count {
+        let position = reader.get_u64()?;
+        let salt = reader.get_bytes()?.to_vec();
+        let symbols = read_fp_vec(reader, limits)?;
+        columns.push(zkie_engine::pcs::request::runtime_tree::RuntimeLeafColumn {
+            position,
+            salt,
+            symbols,
+        });
+    }
+    let given = read_digest_vec(reader, limits)?;
+    Ok(RuntimeTreeOpening {
+        positions,
+        columns,
+        given,
+    })
+}
+
+fn read_mask_notice(
+    reader: &mut zkie_engine::primitives::codec::CanonicalReader<'_>,
+) -> Result<zkie_engine::pcs::request::fold::MaskNotice> {
+    let mask_rows = reader.get_u64()?;
+    let log_n = u32::try_from(reader.get_u64()?).map_err(|_| Error::InvalidEncoding)?;
+    let ell = reader.get_u64()?;
+    let r = reader.get_u64()?;
+    let code = zkie_engine::pcs::request::code::build_code_plan(log_n, ell, r)?;
+    let answers = u32::try_from(reader.get_u64()?).map_err(|_| Error::InvalidEncoding)?;
+    let leaf_class =
+        u32::try_from(reader.get_u64()?).map_err(|_| Error::InvalidEncoding)?;
+    Ok(zkie_engine::pcs::request::fold::MaskNotice {
+        mask_rows,
+        mask_code: code,
+        answers,
+        leaf_class,
+    })
+}
+
+fn read_fold_start(
+    reader: &mut zkie_engine::primitives::codec::CanonicalReader<'_>,
+) -> Result<FoldStartMessage> {
+    Ok(FoldStartMessage {
+        id: reader.get_u64()?,
+        claimed_group: reader.get_u64()?,
+        tree_number: reader.get_u64()?,
+        notice: read_mask_notice(reader)?,
+        root: reader.get_digest()?,
+        sum: reader.get_fp3()?,
+    })
+}
+
+fn read_stage_fold(
+    reader: &mut zkie_engine::primitives::codec::CanonicalReader<'_>,
+    limits: zkie_core::common::codec::DecodeLimits,
+) -> Result<LimitedStageFoldArtifact> {
+    let start = read_fold_start(reader)?;
+    let count = read_count(reader, limits)?;
+    let mut rounds = Vec::new();
+    rounds
+        .try_reserve_exact(count)
+        .map_err(|_| Error::ResourceLimit)?;
+    for _ in 0..count {
+        rounds.push((reader.get_fp3()?, reader.get_fp3()?));
+    }
+    Ok(LimitedStageFoldArtifact { start, rounds })
+}
+
+fn read_switch(
+    reader: &mut zkie_engine::primitives::codec::CanonicalReader<'_>,
+    limits: zkie_core::common::codec::DecodeLimits,
+) -> Result<LimitedSwitchArtifact> {
+    let identity = reader.get_digest()?;
+    let declared_root = reader.get_digest()?;
+    let sample_answer = reader.get_fp3()?;
+    let member_count = read_count(reader, limits)?;
+    let mut member_openings = Vec::new();
+    member_openings
+        .try_reserve_exact(member_count)
+        .map_err(|_| Error::ResourceLimit)?;
+    for _ in 0..member_count {
+        member_openings.push(read_runtime_opening(reader, limits)?);
+    }
+    let fresh_opening = read_runtime_opening(reader, limits)?;
+    let old_mask_root = match reader.get_u64()? {
+        0 => None,
+        1 => Some(reader.get_digest()?),
+        _ => return Err(Error::InvalidEncoding),
+    };
+    let old_mask_opening = match reader.get_u64()? {
+        0 => None,
+        1 => Some(read_runtime_opening(reader, limits)?),
+        _ => return Err(Error::InvalidEncoding),
+    };
+    let stage_fold = match reader.get_u64()? {
+        0 => None,
+        1 => Some(read_stage_fold(reader, limits)?),
+        _ => return Err(Error::InvalidEncoding),
+    };
+    Ok(LimitedSwitchArtifact {
+        identity,
+        declared_root,
+        sample_answer,
+        member_openings,
+        fresh_opening,
+        old_mask_root,
+        old_mask_opening,
+        stage_fold,
+    })
+}
+
+impl LimitedChainArtifact {
+    pub fn from_record(
+        statement: &LimitedKeyStatement,
+        record: &LimitedChainRecord,
+    ) -> Result<Self> {
+        statement.validate()?;
+        let fold_start = record
+            .fold_start
+            .clone()
+            .ok_or(Error::IncompleteArtifact)?;
+        let base_proof = record
+            .base_proof
+            .clone()
+            .ok_or(Error::IncompleteArtifact)?;
+        let sealed = record.sealed.ok_or(Error::IncompleteArtifact)?;
+        let omega_root = record.omega_root;
+        if omega_root.is_some() != !record.omega_answers.is_empty() {
+            return Err(Error::IncompleteArtifact);
+        }
+        let mut switches = Vec::with_capacity(record.switches.len());
+        for switch in &record.switches {
+            switches.push(LimitedSwitchArtifact {
+                identity: switch.identity,
+                declared_root: switch.declared_root,
+                sample_answer: switch.sample_answer,
+                member_openings: switch.member_openings.clone(),
+                fresh_opening: switch.fresh_opening.clone(),
+                old_mask_root: switch.old_mask_root,
+                old_mask_opening: switch.old_mask_opening.clone(),
+                stage_fold: switch.stage_fold.as_ref().map(|stage| LimitedStageFoldArtifact {
+                    start: stage.start.clone(),
+                    rounds: stage.rounds.clone(),
+                }),
+            });
+        }
+        Ok(Self {
+            version: LIMITED_CHAIN_ARTIFACT_VERSION,
+            protocol_identity: SESSION_PROTOCOL_IDENTITY,
+            statement: statement.clone(),
+            gu_root: record.gu_root.ok_or(Error::IncompleteArtifact)?,
+            gu_answers: record.gu_answers.clone(),
+            omega_root,
+            omega_answers: record.omega_answers.clone(),
+            column_openings: record.column_openings.clone(),
+            fold_start,
+            fold_rounds: record.fold_rounds.clone(),
+            switches,
+            base_proof,
+            sealed,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut writer = zkie_engine::primitives::codec::CanonicalWriter::new();
+        writer.put_u64(self.version);
+        writer.put_digest(&self.protocol_identity);
+        let statement = self.statement.encode();
+        writer.put_bytes(&statement);
+        writer.put_digest(&self.gu_root);
+        put_fp3_vec(&mut writer, &self.gu_answers);
+        match self.omega_root {
+            Some(root) => {
+                writer.put_u64(1);
+                writer.put_digest(&root);
+            }
+            None => writer.put_u64(0),
+        }
+        put_fp3_vec(&mut writer, &self.omega_answers);
+        writer.put_u64(self.column_openings.len() as u64);
+        for opening in &self.column_openings {
+            put_column_opening(&mut writer, opening);
+        }
+        put_fold_start(&mut writer, &self.fold_start);
+        writer.put_u64(self.fold_rounds.len() as u64);
+        for (first, second) in &self.fold_rounds {
+            writer.put_fp3(first);
+            writer.put_fp3(second);
+        }
+        writer.put_u64(self.switches.len() as u64);
+        for switch in &self.switches {
+            put_switch(&mut writer, switch);
+        }
+        writer.put_bytes(&self.base_proof);
+        writer.put_digest(&self.sealed);
+        writer.into_bytes()
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        use zkie_engine::primitives::codec::CanonicalReader;
+        let limits = artifact_limits();
+        let mut reader = CanonicalReader::new(bytes, limits);
+        let version = reader.get_u64()?;
+        if version != LIMITED_CHAIN_ARTIFACT_VERSION {
+            return Err(Error::InvalidConfig);
+        }
+        let protocol_identity = reader.get_digest()?;
+        if protocol_identity != SESSION_PROTOCOL_IDENTITY {
+            return Err(Error::InvalidConfig);
+        }
+        let statement_bytes = reader.get_bytes()?;
+        let statement = LimitedKeyStatement::decode(statement_bytes)?;
+        statement.validate()?;
+        let gu_root = reader.get_digest()?;
+        let gu_answers = read_fp3_vec(&mut reader, limits)?;
+        let omega_root = match reader.get_u64()? {
+            0 => None,
+            1 => Some(reader.get_digest()?),
+            _ => return Err(Error::InvalidEncoding),
+        };
+        let omega_answers = read_fp3_vec(&mut reader, limits)?;
+        if omega_root.is_some() != !omega_answers.is_empty() {
+            return Err(Error::IncompleteArtifact);
+        }
+        let opening_count = read_count(&mut reader, limits)?;
+        let mut column_openings = Vec::new();
+        column_openings
+            .try_reserve_exact(opening_count)
+            .map_err(|_| Error::ResourceLimit)?;
+        for _ in 0..opening_count {
+            column_openings.push(read_column_opening(&mut reader, limits)?);
+        }
+        let fold_start = read_fold_start(&mut reader)?;
+        let round_count = read_count(&mut reader, limits)?;
+        let mut fold_rounds = Vec::new();
+        fold_rounds
+            .try_reserve_exact(round_count)
+            .map_err(|_| Error::ResourceLimit)?;
+        for _ in 0..round_count {
+            fold_rounds.push((reader.get_fp3()?, reader.get_fp3()?));
+        }
+        let switch_count = read_count(&mut reader, limits)?;
+        let mut switches = Vec::new();
+        switches
+            .try_reserve_exact(switch_count)
+            .map_err(|_| Error::ResourceLimit)?;
+        for _ in 0..switch_count {
+            switches.push(read_switch(&mut reader, limits)?);
+        }
+        let base_proof = reader.get_bytes()?.to_vec();
+        let sealed = reader.get_digest()?;
+        reader.finish()?;
+        Ok(Self {
+            version,
+            protocol_identity,
+            statement,
+            gu_root,
+            gu_answers,
+            omega_root,
+            omega_answers,
+            column_openings,
+            fold_start,
+            fold_rounds,
+            switches,
+            base_proof,
+            sealed,
+        })
+    }
+}
+
 pub struct LimitedSharedColumns {
     pub gamma: Vec<Fp3>,
     pub seeds: Vec<SampleSeed>,
@@ -1123,6 +1744,7 @@ pub struct LimitedSharedColumns {
     pub base_proof: Option<Vec<u8>>,
     pub pending_rows: usize,
     pub transcript: Digest,
+    pub record: LimitedChainRecord,
 }
 
 /// Runs the shared-only chain through the record and column joins. The
@@ -1446,6 +2068,7 @@ pub fn run_limited_shared_to_columns(
     let base_binding = setup.base.clone();
     let expected_switches = setup.switches.clone();
     let mut session = FoldeqSession::open(setup.plan, setup.binder, setup.chain)?;
+    let mut record = LimitedChainRecord::default();
     session.bind_first_query(&setup.first_query)?;
     session.draw_gamma()?;
     let gamma = session
@@ -1460,11 +2083,13 @@ pub fn run_limited_shared_to_columns(
         .clone();
     table.begin(LM_HEAD_COLUMN_DRAWS as usize)?;
     let provider = table.fold(&gamma, &gu_shape)?;
+    record.gu_root = Some(provider.root());
     mem("fold");
     session.send_gu(&provider.root())?;
     session.shared_seeds()?;
     let seeds = session.gu_shared_seeds().to_vec();
     let answers = provider.answers(&seeds)?;
+    record.gu_answers = answers.clone();
     for answer in &answers {
         session.receive_gu_answer(*answer)?;
     }
@@ -1486,6 +2111,7 @@ pub fn run_limited_shared_to_columns(
         );
     }
     session.read_queries(&openings)?;
+    record.column_openings = openings;
     table.forget()?;
     table.release()?;
     mem("released");
@@ -1531,6 +2157,8 @@ pub fn run_limited_shared_to_columns(
             session.receive_omega_answer(answer)?;
         }
         session.join_omega()?;
+        record.omega_root = Some(omega_provider.root());
+        record.omega_answers = session.omega_rows().iter().map(|row| row.target).collect();
         mem("omega");
         zeta = session.draw_zeta()?;
         omega_root = Some(omega_provider.root());
@@ -1668,6 +2296,7 @@ pub fn run_limited_shared_to_columns(
         let prover_row = fold_row.clone();
         session.fold_bind_row(fold_row)?;
         session.start_fold(setup.mask.message())?;
+        record.fold_start = Some(setup.mask.message().clone());
         let eps = session.epsilon().ok_or(Error::InvalidSessionState)?;
         let coins = ByteMaskCoins::new(setup.mask.coins_seed())?;
         let fold_layout = session
@@ -1690,6 +2319,7 @@ pub fn run_limited_shared_to_columns(
         session.fold_rounds_start()?;
         for _ in 0..fold_shape.k {
             let round = prover.round()?;
+            record.fold_rounds.push((round[0], round[2]));
             session.receive_fold_round(round[0], round[2])?;
             let gamma = *session
                 .fold_gamma()
@@ -1769,6 +2399,7 @@ pub fn run_limited_shared_to_columns(
                 cs_claims = Some(run.claims.clone());
                 cs_message = Some(run.message.clone());
                 transcript = *chain.value();
+                record.switches.push(run.record.clone());
                 previous = Some(run.prover);
                 mem("switch");
                 if let Some(spec) = inputs.stage_fold {
@@ -1789,6 +2420,9 @@ pub fn run_limited_shared_to_columns(
                         run.message.main.clone(),
                         run.message.mask.clone(),
                     )?;
+                    if let Some(last) = record.switches.last_mut() {
+                        last.stage_fold = Some(outcome.record.clone());
+                    }
                     chain = outcome.chain.clone();
                     transcript = *chain.value();
                     let member = previous.as_ref().ok_or(Error::InvalidSessionState)?;
@@ -1869,6 +2503,8 @@ pub fn run_limited_shared_to_columns(
     } else if omega_randomness.is_some() {
         return Err(Error::InvalidConfig);
     }
+    record.base_proof = base_proof.clone();
+    record.sealed = sealed;
     Ok(LimitedSharedColumns {
         gamma,
         seeds,
@@ -1888,6 +2524,7 @@ pub fn run_limited_shared_to_columns(
         base_proof,
         pending_rows,
         transcript,
+        record,
     })
 }
 
@@ -2524,6 +3161,7 @@ pub struct StageFoldOutcome {
     pub end_fresh: Vec<Fp3>,
     pub folded_main: Vec<Fp3>,
     pub fresh: LmHeadMaskProvider,
+    pub record: LimitedStageFoldRecord,
 }
 
 /// Runs one non-initial FOLD stage over a switched oracle message and a fresh
@@ -2573,6 +3211,7 @@ pub fn run_stage_fold(
         spec.mask_tree,
         &spec.randomness,
     )?;
+    let start_message = fresh.message().clone();
     let mut oracles = RuntimeOracles::default();
     oracles.receive_mask(
         &statement,
@@ -2617,8 +3256,10 @@ pub fn run_stage_fold(
     prover.start(eps, &coins)?;
     let mut claim = FoldRoundVerifier::new(fresh.message().sum, eps, row.target);
     let mut gammas = Vec::with_capacity(spec.shape.k as usize);
+    let mut rounds = Vec::with_capacity(spec.shape.k as usize);
     for _ in 0..spec.shape.k {
         let round = prover.round()?;
+        rounds.push((round[0], round[2]));
         let mut message = chain.message();
         message.push_fp3(&round[0]);
         message.push_fp3(&round[2]);
@@ -2651,6 +3292,10 @@ pub fn run_stage_fold(
         end_fresh: end.fresh,
         folded_main: prover.main_messages().to_vec(),
         fresh,
+        record: LimitedStageFoldRecord {
+            start: start_message,
+            rounds,
+        },
     })
 }
 
@@ -3042,6 +3687,7 @@ struct SwitchRun {
     message: SwitchedRows,
     prover: CsMultiProver,
     declared_root: Digest,
+    record: LimitedSwitchRecord,
 }
 
 /// Where one switch stage's member openings and old mask come from. The first
@@ -3106,9 +3752,11 @@ fn run_switch(
         plan,
         source,
     )?;
-    cs.receive_declarations(fold_identity(&stage.handoff), prover.root())?;
+    let identity = fold_identity(&stage.handoff);
+    cs.receive_declarations(identity, prover.root())?;
     let seed = cs.draw_sample_seed()?;
-    cs.receive_answer(prover.sample_answer(&seed)?)?;
+    let sample_answer = prover.sample_answer(&seed)?;
+    cs.receive_answer(sample_answer)?;
     let (positions, _theta) = cs.draw_positions_theta(2)?;
     let unique = unique_sorted(&positions);
     let mask_positions: Vec<u64> = positions
@@ -3116,7 +3764,7 @@ fn run_switch(
         .map(|position| *position % stage.handoff.mask_code.n())
         .collect();
     let mask_unique = unique_sorted(&mask_positions);
-    let (member_openings, old_mask_opening) = match &members {
+    let (member_openings, old_mask_root, old_mask_opening) = match &members {
         SwitchMembers::Initial {
             gu,
             omega,
@@ -3124,9 +3772,10 @@ fn run_switch(
             ..
         } => (
             vec![gu.open(&unique)?, omega.open(&unique)?],
+            Some(old_mask.root()),
             Some(old_mask.open(&mask_unique)?),
         ),
-        SwitchMembers::Stage { member, .. } => (vec![member.open(&unique)?], None),
+        SwitchMembers::Stage { member, .. } => (vec![member.open(&unique)?], None, None),
     };
     let fresh_opening = fresh.open(&mask_unique)?;
     let claims = cs
@@ -3141,6 +3790,16 @@ fn run_switch(
         message,
         prover,
         declared_root,
+        record: LimitedSwitchRecord {
+            identity,
+            declared_root,
+            sample_answer,
+            member_openings,
+            fresh_opening,
+            old_mask_root,
+            old_mask_opening,
+            stage_fold: None,
+        },
     })
 }
 
@@ -3499,6 +4158,94 @@ mod tests {
             no_wf: true,
             trusted_i32_mapping: true,
         }
+    }
+
+    fn sample_artifact() -> LimitedChainArtifact {
+        use zkie_engine::pcs::request::code::build_code_plan;
+        use zkie_engine::pcs::request::fold::MaskNotice;
+        let code = build_code_plan(3, 4, 1).expect("code");
+        LimitedChainArtifact {
+            version: LIMITED_CHAIN_ARTIFACT_VERSION,
+            protocol_identity: SESSION_PROTOCOL_IDENTITY,
+            statement: test_statement(),
+            gu_root: Digest([0x44; 32]),
+            gu_answers: vec![Fp3::from_u64(5)],
+            omega_root: Some(Digest([0x45; 32])),
+            omega_answers: vec![Fp3::from_u64(6)],
+            column_openings: vec![ColumnOpening {
+                position: 1,
+                salt: vec![0x5a; 4],
+                symbols: vec![Fp::from_u64(7)],
+                path: vec![Digest([0x55; 32])],
+            }],
+            fold_start: FoldStartMessage {
+                id: 1,
+                claimed_group: 1,
+                tree_number: 0x600,
+                notice: MaskNotice {
+                    mask_rows: 2,
+                    mask_code: code,
+                    answers: 0,
+                    leaf_class: 0,
+                },
+                root: Digest([0x46; 32]),
+                sum: Fp3::from_u64(8),
+            },
+            fold_rounds: vec![(Fp3::ONE, Fp3::from_u64(9))],
+            switches: vec![LimitedSwitchArtifact {
+                identity: Digest([0x47; 32]),
+                declared_root: Digest([0x48; 32]),
+                sample_answer: Fp3::from_u64(10),
+                member_openings: Vec::new(),
+                fresh_opening: RuntimeTreeOpening::default(),
+                old_mask_root: Some(Digest([0x49; 32])),
+                old_mask_opening: Some(RuntimeTreeOpening::default()),
+                stage_fold: None,
+            }],
+            base_proof: vec![1, 2, 3, 4],
+            sealed: Digest([0x4a; 32]),
+        }
+    }
+
+    #[test]
+    fn the_chain_artifact_round_trips_and_rejects_damage() {
+        let artifact = sample_artifact();
+        let bytes = artifact.encode();
+        let decoded = LimitedChainArtifact::decode(&bytes).expect("decode");
+        assert_eq!(decoded.encode(), bytes);
+        assert_eq!(decoded.statement, artifact.statement);
+        assert_eq!(decoded.gu_root, artifact.gu_root);
+        assert_eq!(decoded.column_openings[0].position, 1);
+        assert_eq!(decoded.switches.len(), 1);
+        assert_eq!(decoded.base_proof, vec![1, 2, 3, 4]);
+
+        let mut version = bytes.clone();
+        version[0] ^= 1;
+        assert!(LimitedChainArtifact::decode(&version).is_err());
+
+        let mut identity = bytes.clone();
+        identity[8] ^= 1;
+        assert!(LimitedChainArtifact::decode(&identity).is_err());
+
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(LimitedChainArtifact::decode(&trailing).is_err());
+
+        let mut truncated = bytes.clone();
+        truncated.truncate(truncated.len() - 4);
+        assert!(LimitedChainArtifact::decode(&truncated).is_err());
+
+        // The statement starts after the version, identity and its length.
+        let mut statement = bytes.clone();
+        statement[48] ^= 1;
+        assert!(LimitedChainArtifact::decode(&statement).is_err());
+    }
+
+    #[test]
+    fn an_incomplete_record_has_no_artifact() {
+        let statement = test_statement();
+        let record = LimitedChainRecord::default();
+        assert!(LimitedChainArtifact::from_record(&statement, &record).is_err());
     }
 
     #[test]
@@ -4508,6 +5255,23 @@ mod tests {
         assert_eq!(run.answers.len(), 1);
         assert_eq!(run.queries.len(), 2);
         assert_eq!(run.pending_rows, 4);
+        assert_eq!(run.record.gu_root, Some(run.root));
+        assert_eq!(run.record.gu_answers, run.answers);
+        assert_eq!(run.record.omega_root, run.omega_root);
+        assert_eq!(run.record.column_openings.len(), run.queries.len());
+        assert!(run.record.fold_start.is_some());
+        assert_eq!(
+            run.record.fold_rounds.len(),
+            run.fold_output.as_ref().expect("fold output").gamma.len()
+        );
+        assert!(!run.record.switches.is_empty());
+        assert!(run.record.switches.iter().all(|switch| {
+            switch.identity != Digest::ZERO
+                && switch.declared_root != Digest::ZERO
+                && !switch.member_openings.is_empty()
+        }));
+        assert_eq!(run.record.base_proof, run.base_proof);
+        assert_eq!(run.record.sealed, run.sealed);
         assert!(run.omega_root.is_some());
         assert_eq!(run.zeta.len(), 0);
         assert!(run.fold_output.is_some());
