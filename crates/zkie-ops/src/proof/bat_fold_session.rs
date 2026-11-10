@@ -140,7 +140,8 @@ use zkie_engine::pcs::request::table::{
 use zkie_engine::primitives::transcript::{hash_labeled, tag_word, TEST_COINS};
 
 use crate::proof::base_final_session::{
-    fold_identity, BaseFinalOutcome, BaseFinalSession, BaseProver,
+    fold_identity, BaseFinalCheck, BaseFinalOutcome, BaseFinalRejection, BaseFinalSession,
+    BaseProver,
 };
 use crate::proof::fold_handoff::{FoldHandoff, FoldHandoffAnchor};
 use crate::proof::group_commitment_session::{
@@ -1302,13 +1303,30 @@ pub struct BatFoldBaseOutcome {
     pub fold_exit_value: Digest,
 }
 
+/// The explicit result of the BASE verification entry: a missing precondition
+/// is a stage error, and a completed local check either passes (still pending)
+/// or returns a typed rejection. The rejection is consumed by the entry and is
+/// never returned as a passing outcome.
+#[derive(Debug)]
+pub enum BaseFinalRunError {
+    Stage(Error),
+    Rejected(BaseFinalRejection),
+}
+
+impl From<Error> for BaseFinalRunError {
+    fn from(error: Error) -> Self {
+        Self::Stage(error)
+    }
+}
+
 /// Runs the same fixture chain and then wires the FOLD output into the local
-/// BASE final-state check. The BASE result is pending; it is not a complete
-/// BASE or a valid FOLD-to-BASE handoff.
+/// BASE final-state check. A failed local check returns a typed rejection; a
+/// passed local result remains pending. It is not a complete BASE or a valid
+/// FOLD-to-BASE handoff.
 pub fn run_bat_fold_with_base(
     fixture: &BatFoldFixture,
     chain: Chain,
-) -> Result<BatFoldBaseOutcome> {
+) -> std::result::Result<BatFoldBaseOutcome, BaseFinalRunError> {
     run_bat_fold_with_base_and_target_shift(fixture, chain, Fp3::ZERO)
 }
 
@@ -1319,27 +1337,51 @@ pub fn run_bat_fold_with_base_and_target_shift(
     fixture: &BatFoldFixture,
     chain: Chain,
     target_shift: Fp3,
-) -> Result<BatFoldBaseOutcome> {
+) -> std::result::Result<BatFoldBaseOutcome, BaseFinalRunError> {
     let core = run_bat_fold_core(fixture, chain, |_, _, true_answers| {
         Ok(true_answers.to_vec())
     })?;
+    run_base_from_core(core, target_shift)
+}
+
+/// Runs the same wiring with a caller-supplied SEND answer provider. This is
+/// the wrong-upstream-declaration path: a well-formed wrong answer is carried
+/// through BAT and FOLD on the same chain and then rejected by the local BASE
+/// check.
+pub fn run_bat_fold_with_base_and_provider<F>(
+    fixture: &BatFoldFixture,
+    chain: Chain,
+    provider: F,
+) -> std::result::Result<BatFoldBaseOutcome, BaseFinalRunError>
+where
+    F: FnOnce(&[(u32, u64)], &[SampleSeed], &[Fp3]) -> Result<Vec<Fp3>>,
+{
+    let core = run_bat_fold_core(fixture, chain, provider)?;
+    run_base_from_core(core, Fp3::ZERO)
+}
+
+fn run_base_from_core(
+    core: BatFoldCore,
+    target_shift: Fp3,
+) -> std::result::Result<BatFoldBaseOutcome, BaseFinalRunError> {
+    let fixture_tag = core.outcome.tag;
+    let code = core.outcome.shape.code;
+    let mask_code = core.outcome.shape.mask_code;
     let fold_exit_rounds = core.fold.chain().rounds();
     let fold_exit_value = *core.fold.transcript_value();
     let base_chain = core.fold.take_chain_for_base()?;
     if base_chain.rounds() != fold_exit_rounds || *base_chain.value() != fold_exit_value {
-        return Err(Error::StatementMismatch);
+        return Err(BaseFinalRunError::Stage(Error::StatementMismatch));
     }
-    let code = fixture.shape.code;
-    let mask_code = fixture.shape.mask_code;
-    let star = fixture_base_star(fixture.tag, code, mask_code);
+    let star = fixture_base_star(fixture_tag, code, mask_code);
     let old_main_tail: Vec<Fp3> = (0..code.r)
-        .map(|index| Fp3::from_u64(0x9200 + fixture.tag * 0x10 + index))
+        .map(|index| Fp3::from_u64(0x9200 + fixture_tag * 0x10 + index))
         .collect();
     let old_mask_tail: Vec<Fp3> = (0..mask_code.r)
-        .map(|index| Fp3::from_u64(0x9300 + fixture.tag * 0x10 + index))
+        .map(|index| Fp3::from_u64(0x9300 + fixture_tag * 0x10 + index))
         .collect();
     let fresh_tail: Vec<Fp3> = (0..mask_code.r)
-        .map(|index| Fp3::from_u64(0x9700 + fixture.tag * 0x10 + index))
+        .map(|index| Fp3::from_u64(0x9700 + fixture_tag * 0x10 + index))
         .collect();
     let fresh_claim = core.handoff.fresh_claim.clone();
     let rows = core.handoff.single_rows(
@@ -1368,7 +1410,12 @@ pub fn run_bat_fold_with_base_and_target_shift(
     let positions = session.draw_base_positions(FIXTURE_BASE_POSITIONS)?;
     let openings = prover.openings(&positions)?;
     session.verify_openings(&openings)?;
-    let base = session.finish()?;
+    let base = match session.finish()? {
+        BaseFinalCheck::Passed(base) => base,
+        BaseFinalCheck::Rejected(rejection) => {
+            return Err(BaseFinalRunError::Rejected(rejection));
+        }
+    };
     Ok(BatFoldBaseOutcome {
         fold: core.outcome,
         base,
@@ -1943,17 +1990,39 @@ mod tests {
     #[test]
     fn a_fixed_base_target_shift_is_rejected_at_the_target_layer() {
         let fixture = BatFoldFixture::new(34).unwrap();
-        let run = run_bat_fold_with_base_and_target_shift(
+        let rejection = match run_bat_fold_with_base_and_target_shift(
             &fixture,
             chain(b"base target shift"),
             Fp3::ONE,
-        )
-        .unwrap();
-        assert!(!run.base.base_linear);
-        assert_eq!(run.base.rejection, Some(BaseRejection::TargetLinear));
-        assert!(run.base.pending);
-        assert!(!run.base.complete_base);
-        assert_eq!(run.base.base_positions.len(), FIXTURE_BASE_POSITIONS);
+        ) {
+            Err(BaseFinalRunError::Rejected(rejection)) => rejection,
+            Err(BaseFinalRunError::Stage(error)) => panic!("stage error: {error:?}"),
+            Ok(_) => panic!("the fixed target shift was not rejected"),
+        };
+        assert_eq!(rejection.layer, BaseRejection::TargetLinear);
+        assert!(!rejection.base_linear);
+        assert_eq!(rejection.base_positions.len(), FIXTURE_BASE_POSITIONS);
+    }
+
+    #[test]
+    fn a_wrong_upstream_answer_is_rejected_at_base() {
+        let fixture = BatFoldFixture::new(35).unwrap();
+        let rejection = match run_bat_fold_with_base_and_provider(
+            &fixture,
+            chain(b"base wrong upstream"),
+            |_order, _seeds, true_answers| {
+                let mut answers = true_answers.to_vec();
+                answers[0] = answers[0].add(&Fp3::ONE);
+                Ok(answers)
+            },
+        ) {
+            Err(BaseFinalRunError::Rejected(rejection)) => rejection,
+            Err(BaseFinalRunError::Stage(error)) => panic!("stage error: {error:?}"),
+            Ok(_) => panic!("the wrong upstream answer was not rejected"),
+        };
+        assert_eq!(rejection.layer, BaseRejection::TargetLinear);
+        assert!(!rejection.base_linear);
+        assert_eq!(rejection.base_positions.len(), FIXTURE_BASE_POSITIONS);
     }
 
     #[test]

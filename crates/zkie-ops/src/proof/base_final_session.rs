@@ -16,24 +16,27 @@
 //! the extended linear check and the encoded-symbol checks against those
 //! openings are recorded. Missing any precondition fails closed.
 //!
-//! The FOLD fresh row is a fixture commitment: the FOLD fresh root commits the
-//! fresh mask table, not this folded message row. The fresh row is combined
-//! with a zero star row, so its combined message is lambda times the fresh
-//! message. The linear check extends the two-row BASE algebra by the fresh row;
-//! it does not rewrite the FOLD target. This is not a complete BASE, IOPP or
-//! proof acceptance, and it remains a projection of the FOLD output rather than
-//! a valid FOLD-to-BASE handoff.
+//! Root source and binding status: the BASE builds a new fixture fresh-row
+//! root, rebuilds the old main/mask roots from the same prover copies and uses
+//! a same-prover expectation with a second independent commit. These roots are
+//! approved only for this local fixture experiment. They are not a production
+//! mechanism, and root binding is not completed: the fresh-row root is not
+//! authenticated by the FOLD fresh root. The result stays pending on that
+//! boundary and must not be read as a complete root binding or reference
+//! equivalence.
+//!
+//! The reference path is FOLD -> CS -> final SingleRows -> BASE. The extra
+//! commitment and the zero-star third row implemented here are not the
+//! reference protocol and are not an equivalence proof. Later wiring must use a
+//! reference-verifiable commitment source and the reference folding/conversion
+//! relation, not this fixture extension.
 //!
 //! A single equality at one fixed lambda does not show that every wrong
 //! declaration is rejected and does not give an IOPP security bound; wrong
 //! declarations can cancel through aggregation. The fixed inconsistent sample
 //! in the tests is crafted to fail at the target layer; it is not a general
-//! rejection guarantee.
-//!
-//! The commitment roots are fixture expectations independently committed from
-//! the same rows. They are not real SEND, asset or FOLD roots; replacing both a
-//! witness and the fixture expectation is outside the detection of this
-//! component.
+//! rejection guarantee. The verification entry consumes a failed check and
+//! returns a typed rejection; a passed local check remains pending.
 
 use zkie_core::artifact::digest_bytes;
 use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
@@ -150,6 +153,33 @@ pub struct BaseFinalOutcome {
     pub commit_value: Digest,
     pub rows_rounds: u64,
     pub rows_value: Digest,
+}
+
+/// The typed rejection of a well-formed but inconsistent local check. It
+/// carries the fixed challenge/conditions and the rejection layer. It is a
+/// local fixture rejection, not a general wrong-declaration guarantee.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BaseFinalRejection {
+    pub layer: BaseRejection,
+    pub fold_identity: Digest,
+    pub old_main_root: Digest,
+    pub old_mask_root: Digest,
+    pub star_root: Digest,
+    pub star_mask_root: Digest,
+    pub fresh_root: Digest,
+    pub lambda: Fp3,
+    pub target_star: Fp3,
+    pub base_positions: Vec<u64>,
+    pub base_linear: bool,
+    pub symbol_checks: bool,
+}
+
+/// The explicit result of the local check: a passed local result (still
+/// pending) or a typed rejection consumed by the verification entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BaseFinalCheck {
+    Passed(BaseFinalOutcome),
+    Rejected(BaseFinalRejection),
 }
 
 fn inner(left: &[Fp3], right: &[Fp3]) -> Result<Fp3> {
@@ -764,7 +794,7 @@ impl BaseFinalSession {
         Ok(())
     }
 
-    pub fn finish(self) -> Result<BaseFinalOutcome> {
+    pub fn finish(self) -> Result<BaseFinalCheck> {
         if self.stage != Stage::Openings {
             return Err(Error::InvalidSessionState);
         }
@@ -833,20 +863,42 @@ impl BaseFinalSession {
         } else {
             None
         };
-        Ok(BaseFinalOutcome {
-            fold_identity: self.expectation.fold_identity,
-            old_main_root: self.expectation.old_main.root,
-            old_mask_root: self.expectation.old_mask.root,
-            star_root: self.expectation.star.root,
-            star_mask_root: self.expectation.star_mask.root,
-            fresh_root: self.expectation.fresh.root,
+        let fold_identity = self.expectation.fold_identity;
+        let old_main_root = self.expectation.old_main.root;
+        let old_mask_root = self.expectation.old_mask.root;
+        let star_root = self.expectation.star.root;
+        let star_mask_root = self.expectation.star_mask.root;
+        let fresh_root = self.expectation.fresh.root;
+        if let Some(layer) = rejection {
+            return Ok(BaseFinalCheck::Rejected(BaseFinalRejection {
+                layer,
+                fold_identity,
+                old_main_root,
+                old_mask_root,
+                star_root,
+                star_mask_root,
+                fresh_root,
+                lambda,
+                target_star,
+                base_positions: self.positions,
+                base_linear,
+                symbol_checks,
+            }));
+        }
+        Ok(BaseFinalCheck::Passed(BaseFinalOutcome {
+            fold_identity,
+            old_main_root,
+            old_mask_root,
+            star_root,
+            star_mask_root,
+            fresh_root,
             lambda,
             target_star,
             base_positions: self.positions,
             base_linear,
             symbol_checks,
             openings_verified: true,
-            rejection,
+            rejection: None,
             pending: true,
             complete_base: false,
             fresh_row_committed: true,
@@ -860,7 +912,7 @@ impl BaseFinalSession {
             commit_value: self.commit_value,
             rows_rounds: self.rows_rounds,
             rows_value: self.rows_value,
-        })
+        }))
     }
 
     pub fn chain_value(&self) -> &Digest {
@@ -1032,7 +1084,7 @@ mod tests {
         (prover, session, messages)
     }
 
-    fn finish(prover: &BaseProver, mut session: BaseFinalSession) -> BaseFinalOutcome {
+    fn finish(prover: &BaseProver, mut session: BaseFinalSession) -> BaseFinalCheck {
         let messages = prover.messages().unwrap();
         session.receive_commitments(messages).unwrap();
         let lambda = session.draw_lambda().unwrap();
@@ -1047,7 +1099,12 @@ mod tests {
     #[test]
     fn the_local_base_wiring_passes_but_stays_pending() {
         let (prover, session, _messages) = setup(b"base final", Fp3::ZERO);
-        let outcome = finish(&prover, session);
+        let outcome = match finish(&prover, session) {
+            BaseFinalCheck::Passed(outcome) => outcome,
+            BaseFinalCheck::Rejected(rejection) => {
+                panic!("the local check rejected a consistent fixture: {:?}", rejection)
+            }
+        };
         assert!(outcome.base_linear);
         assert!(outcome.symbol_checks);
         assert!(outcome.openings_verified);
@@ -1068,12 +1125,14 @@ mod tests {
     #[test]
     fn a_fixed_target_shift_is_rejected_at_the_target_layer() {
         let (prover, session, _messages) = setup(b"base target", Fp3::ONE);
-        let outcome = finish(&prover, session);
-        assert!(!outcome.base_linear);
-        assert_eq!(outcome.rejection, Some(BaseRejection::TargetLinear));
-        assert!(outcome.pending);
-        assert!(!outcome.complete_base);
-        assert!(!outcome.base_positions.is_empty());
+        let rejection = match finish(&prover, session) {
+            BaseFinalCheck::Rejected(rejection) => rejection,
+            BaseFinalCheck::Passed(_) => panic!("the fixed target shift was not rejected"),
+        };
+        assert_eq!(rejection.layer, BaseRejection::TargetLinear);
+        assert!(!rejection.base_linear);
+        assert!(!rejection.base_positions.is_empty());
+        assert!(!rejection.lambda.is_zero());
     }
 
     #[test]
@@ -1088,13 +1147,15 @@ mod tests {
         let positions = session.draw_base_positions(2).unwrap();
         let openings = prover.openings(&positions).unwrap();
         session.verify_openings(&openings).unwrap();
-        let outcome = session.finish().unwrap();
+        let rejection = match session.finish().unwrap() {
+            BaseFinalCheck::Rejected(rejection) => rejection,
+            BaseFinalCheck::Passed(_) => panic!("the changed tail was not rejected"),
+        };
         // The linear check does not use the tails, so it still holds; the
         // encoded-symbol check is the layer that rejects the changed tail.
-        assert!(outcome.base_linear);
-        assert!(!outcome.symbol_checks);
-        assert_eq!(outcome.rejection, Some(BaseRejection::Symbol));
-        assert!(outcome.pending);
+        assert!(rejection.base_linear);
+        assert!(!rejection.symbol_checks);
+        assert_eq!(rejection.layer, BaseRejection::Symbol);
     }
 
     #[test]
@@ -1164,6 +1225,9 @@ mod tests {
         assert!(session.draw_base_positions(1).is_err());
         let openings = prover.openings(&positions).unwrap();
         session.verify_openings(&openings).unwrap();
-        assert!(session.finish().is_ok());
+        assert!(matches!(
+            session.finish(),
+            Ok(BaseFinalCheck::Passed(_))
+        ));
     }
 }

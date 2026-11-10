@@ -9,7 +9,8 @@ use zkie_engine::pcs::request::field::Fp3;
 use zkie_engine::pcs::request::params::REQUEST_CHAIN_LABEL;
 use zkie_ops::proof::base_final_session::BaseRejection;
 use zkie_ops::proof::bat_fold_session::{
-    run_bat_fold, run_bat_fold_with_base, run_bat_fold_with_base_and_target_shift, BatFoldFixture,
+    run_bat_fold, run_bat_fold_with_base, run_bat_fold_with_base_and_provider,
+    run_bat_fold_with_base_and_target_shift, BaseFinalRunError, BatFoldFixture,
 };
 
 fn chain(seed: &[u8]) -> Chain {
@@ -117,20 +118,46 @@ fn the_fixture_base_final_wiring_passes_but_stays_pending() {
 #[test]
 fn a_fixed_base_target_shift_is_rejected_at_the_target_layer() {
     let fixture = BatFoldFixture::new(10).unwrap();
-    let run = run_bat_fold_with_base_and_target_shift(
+    let rejection = match run_bat_fold_with_base_and_target_shift(
         &fixture,
         chain(b"fixture base target"),
         Fp3::ONE,
-    )
-    .unwrap();
-    assert!(!run.base.base_linear);
-    assert_eq!(run.base.rejection, Some(BaseRejection::TargetLinear));
-    assert!(run.base.pending);
-    assert!(!run.base.complete_base);
-    assert_eq!(run.base.base_positions.len(), 2);
+    ) {
+        Err(BaseFinalRunError::Rejected(rejection)) => rejection,
+        Err(BaseFinalRunError::Stage(error)) => panic!("stage error: {error:?}"),
+        Ok(_) => panic!("the fixed target shift was not rejected"),
+    };
+    assert_eq!(rejection.layer, BaseRejection::TargetLinear);
+    assert!(!rejection.base_linear);
+    assert_eq!(rejection.base_positions.len(), 2);
     println!(
         "rejected base lambda={:?} target_star={:?} positions={:?} layer=TargetLinear",
-        run.base.lambda, run.base.target_star, run.base.base_positions
+        rejection.lambda, rejection.target_star, rejection.base_positions
+    );
+}
+
+#[test]
+fn a_wrong_upstream_answer_is_rejected_at_base() {
+    let fixture = BatFoldFixture::new(11).unwrap();
+    let rejection = match run_bat_fold_with_base_and_provider(
+        &fixture,
+        chain(b"fixture base wrong upstream"),
+        |_order, _seeds, true_answers| {
+            let mut answers = true_answers.to_vec();
+            answers[0] = answers[0].add(&Fp3::ONE);
+            Ok(answers)
+        },
+    ) {
+        Err(BaseFinalRunError::Rejected(rejection)) => rejection,
+        Err(BaseFinalRunError::Stage(error)) => panic!("stage error: {error:?}"),
+        Ok(_) => panic!("the wrong upstream answer was not rejected"),
+    };
+    assert_eq!(rejection.layer, BaseRejection::TargetLinear);
+    assert!(!rejection.base_linear);
+    assert_eq!(rejection.base_positions.len(), 2);
+    println!(
+        "rejected upstream answer lambda={:?} target_star={:?} positions={:?} layer=TargetLinear path=wrong SEND answer -> BAT target -> FOLD output -> BASE",
+        rejection.lambda, rejection.target_star, rejection.base_positions
     );
 }
 
