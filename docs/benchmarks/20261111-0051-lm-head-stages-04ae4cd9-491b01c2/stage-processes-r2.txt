@@ -1,0 +1,125 @@
+warning: unused variable: `target`
+   --> crates/zkie-engine/src/pcs/request/relation.rs:858:5
+    |
+858 |     target: Fp3,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `columns_usize`
+   --> crates/zkie-engine/src/pcs/request/table.rs:952:13
+    |
+952 |         let columns_usize = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_columns_usize`
+
+warning: `zkie-engine` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-engine` to apply 2 suggestions)
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/base_last_session.rs:578:13
+    |
+578 |         let mut message = self.chain.message();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `plan` is never read
+   --> crates/zkie-ops/src/proof/cs_multi_session.rs:194:5
+    |
+188 | pub struct CsMultiSession {
+    |            -------------- field in this struct
+...
+194 |     plan: RuntimeTreePlan,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-ops` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-ops` to apply 1 suggestion)
+warning: unused import: `zkie_engine::pcs::request::field::E_DEGREE`
+  --> models/gpt2/src/lm_head_plan.rs:11:5
+   |
+11 | use zkie_engine::pcs::request::field::E_DEGREE;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_step`
+   --> models/gpt2/src/executor.rs:346:21
+    |
+346 |             let (k, k_step) = {
+    |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_step`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `m`
+   --> models/gemma3/src/executor.rs:277:5
+    |
+277 |     m: usize,
+    |     ^ help: if this is intentional, prefix it with an underscore: `_m`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_rot_step`
+   --> models/gemma3/src/executor.rs:390:21
+    |
+390 |         let (k_rot, k_rot_step) = rope(&mut builder, k, k_step, cos_prefix.clone(), sin_prefix.clone(), m)?;
+    |                     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_rot_step`
+
+warning: `zkie-models-gpt2` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gpt2` to apply 2 suggestions)
+warning: `zkie-models-gemma3` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gemma3` to apply 2 suggestions)
+   Compiling zkie v0.1.0 (/data/zkIE/zkie)
+warning: unused variable: `mask_oracle`
+    --> zkie/src/lm_head_key.rs:2921:9
+     |
+2921 |     let mask_oracle = MaskOracle {
+     |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mask_oracle`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> zkie/src/lm_head_key.rs:3781:9
+     |
+3781 |     let mut mask_tail = vec![Fp3::ZERO; mask_tail_len];
+     |         ----^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `mask_tail`
+    --> zkie/src/lm_head_key.rs:3781:9
+     |
+3781 |     let mut mask_tail = vec![Fp3::ZERO; mask_tail_len];
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mask_tail`
+
+warning: variable does not need to be mutable
+   --> zkie/src/lm_head_stage.rs:273:9
+    |
+273 |     let mut options = if private {
+    |         ----^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: field `tree` is never read
+    --> zkie/src/lm_head_key.rs:1144:5
+     |
+1140 | pub struct LmHeadOmegaProvider {
+     |            ------------------- field in this struct
+...
+1144 |     tree: RuntimeTreePlan,
+     |     ^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie` (lib test) generated 5 warnings (run `cargo fix --lib -p zkie --tests` to apply 4 suggestions)
+    Finished `release` profile [optimized] target(s) in 3.44s
+     Running unittests src/lib.rs (target/release/deps/zkie-c7b8d42a057b8bea)
+
+running 1 test
+stage commit: {"extra":{"public_digest":"Digest([105, 40, 18, 153, 112, 225, 214, 243, 119, 118, 206, 66, 96, 75, 39, 105, 18, 223, 248, 65, 216, 131, 197, 3, 31, 251, 238, 127, 41, 142, 251, 30])","store_len":1073774656,"store_read":2147483648,"store_written":1073741824,"switch_count":3},"hwm_kb":461300,"io_read":0,"io_write":0,"ok":true,"temp_bytes":1073774656,"wall_s":32.222830451}
+stage prove: {"extra":{"artifact_bytes":5385552,"chain_wall_s":8.370103263,"sealed":"Digest([149, 0, 151, 135, 26, 202, 73, 205, 34, 16, 99, 239, 52, 85, 196, 184, 6, 117, 211, 124, 142, 77, 76, 1, 66, 85, 28, 31, 170, 69, 21, 88])","setup_wall_s":0.103164489},"hwm_kb":630648,"io_read":0,"io_write":0,"ok":true,"temp_bytes":5385552,"wall_s":8.658250619}
+stage verify: {"extra":{"artifact_bytes":5385552,"sealed":"Digest([149, 0, 151, 135, 26, 202, 73, 205, 34, 16, 99, 239, 52, 85, 196, 184, 6, 117, 211, 124, 142, 77, 76, 1, 66, 85, 28, 31, 170, 69, 21, 88])","verdict":"accept"},"hwm_kb":69756,"io_read":0,"io_write":0,"ok":true,"temp_bytes":0,"wall_s":4.291913093}
+test lm_head_key::stage_tests::lm_head_stage_processes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 54 filtered out; finished in 45.99s
+
