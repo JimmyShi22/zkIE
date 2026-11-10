@@ -18,14 +18,15 @@ use zkie_engine::pcs::request::bat::{
     combine, group_index, BatOracleShape, BatPart, BatRow, BatRowKind, BatStatement,
 };
 use zkie_engine::pcs::request::binding::{BindingParameters, BindingStatement};
-use zkie_engine::pcs::request::chain::Chain;
+use zkie_engine::pcs::request::chain::{Chain, KIND_ALGEBRAIC, KIND_EPSILON};
 use zkie_engine::pcs::request::cs_stage::{switch_tree_plan_multi, SwitchTarget, SwitchedClaims, SwitchedRows};
 use zkie_engine::pcs::request::code::encode_row_fp3;
 use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE};
 use zkie_engine::pcs::request::fold::{
     fold_member_firsts, FoldPart,
     fold_mask_make, fold_mask_make_tail, fold_mask_notice, fold_mask_shape_fault,
-    fold_start_prove, ByteMaskCoins, FoldGroupLayout, FoldInputRow, FoldMask, FoldMemberLayout,
+    fold_output, fold_start_prove, fold_start_verify, FoldRoundVerifier, ByteMaskCoins,
+    FoldGroupLayout, FoldInputRow, FoldMask, FoldMemberLayout,
     FoldOutput, FoldProverSession, FoldShape, FoldStartMessage, FoldStartProver, MaskOracle,
     OracleMetadata, RuntimeOracles,
     VerifiedGroup, VerifiedGroups, VerifiedStatement,
@@ -1159,6 +1160,7 @@ pub struct LimitedSharedColumns {
     pub fold_stage: Option<LimitedFoldStage>,
     pub cs_claims: Option<SwitchedClaims>,
     pub cs_message: Option<SwitchedRows>,
+    pub stage_fold: Option<StageFoldOutcome>,
     pub pending_rows: usize,
     pub transcript: Digest,
 }
@@ -1226,6 +1228,7 @@ pub fn run_limited_shared_to_columns(
     let mut fold_stage = None;
     let mut cs_claims = None;
     let mut cs_message = None;
+    let mut stage_fold = None;
     let mut pending_rows = 0usize;
     let mut transcript = *session.transcript_value();
     if let Some(omega) = session.plan().omega.as_ref().cloned() {
@@ -1351,7 +1354,7 @@ pub fn run_limited_shared_to_columns(
             .ok_or(Error::InvalidConfig)?;
         let main_messages = group_main_messages(&provider, &omega_provider, &input.layout)?;
         let old_mu = old_mask.mu()?;
-        let mut prover = FoldProverSession::new(
+    let mut prover = FoldProverSession::new(
             &fold_shape,
             &fold_layout,
             setup.mask.mask(),
@@ -1360,7 +1363,7 @@ pub fn run_limited_shared_to_columns(
             old_mu.clone(),
             Vec::new(),
         )?;
-        prover.start(eps, &coins)?;
+    prover.start(eps, &coins)?;
         session.fold_rounds_start()?;
         for _ in 0..fold_shape.k {
             let round = prover.round()?;
@@ -1432,6 +1435,30 @@ pub fn run_limited_shared_to_columns(
             );
             cs_message = Some(prover.message().clone());
             transcript = *cs.chain_value();
+            if let Some(spec) = inputs.stage_fold {
+                let claims = cs_claims.as_ref().expect("just stored");
+                let message = cs_message.as_ref().expect("just stored");
+                let row = FoldInputRow {
+                    group: spec.group,
+                    k: spec.shape.k,
+                    h: spec.shape.h,
+                    members: vec![spec.member],
+                    coefficients: claims.combined.main.clone(),
+                    mask_coefficients: claims.combined.mask.clone(),
+                    kept: Vec::new(),
+                    target: claims.combined.target,
+                };
+                let chain = cs.into_chain();
+                let outcome = run_stage_fold(
+                    chain,
+                    &spec,
+                    row,
+                    message.main.clone(),
+                    message.mask.clone(),
+                )?;
+                transcript = *outcome.chain.value();
+                stage_fold = Some(outcome);
+            }
         }
         }
     } else if omega_randomness.is_some() {
@@ -1450,6 +1477,7 @@ pub fn run_limited_shared_to_columns(
         fold_stage,
         cs_claims,
         cs_message,
+        stage_fold,
         pending_rows,
         transcript,
     })
@@ -1919,6 +1947,7 @@ pub struct LimitedSwitchInputs {
     pub mask_tails: Vec<Vec<Fp3>>,
     pub pad: Fp3,
     pub salts: Vec<Vec<u8>>,
+    pub stage_fold: Option<StageFoldSpec>,
 }
 
 /// Builds the FOLD-to-CS handoff from the verified FOLD output and the real
@@ -2060,6 +2089,155 @@ pub fn build_limited_fold_stage(
         handoff,
         basis,
         rows,
+    })
+}
+
+/// The plan inputs of one stage FOLD: its shape and group layout, the fresh
+/// mask tree, the group/member/fresh numbers and the private mask randomness.
+pub struct StageFoldSpec {
+    pub shape: FoldShape,
+    pub layout: FoldGroupLayout,
+    pub mask_tree: MaskTreePlan,
+    pub group: u64,
+    pub member: u64,
+    pub fresh: u64,
+    pub randomness: LmHeadMaskRandomness,
+}
+
+/// The result of one stage FOLD: the verified output, the advanced chain and
+/// the folded messages the next switch consumes.
+pub struct StageFoldOutcome {
+    pub output: FoldOutput,
+    pub chain: Chain,
+    pub end_mu: Vec<Fp3>,
+    pub end_fresh: Vec<Fp3>,
+    pub folded_main: Vec<Fp3>,
+}
+
+/// Runs one non-initial FOLD stage over a switched oracle message and a fresh
+/// mask: the same prover/verifier round arithmetic as the shared chain, with
+/// the stage's own shape and mask tree.
+pub fn run_stage_fold(
+    mut chain: Chain,
+    spec: &StageFoldSpec,
+    row: FoldInputRow,
+    main_messages: Vec<Fp3>,
+    mask_messages: Vec<Fp3>,
+) -> Result<StageFoldOutcome> {
+    let metadata = OracleMetadata {
+        id: spec.fresh,
+        group: spec.group,
+        tree_number: spec.mask_tree.tree_number,
+        leaf_class: spec.mask_tree.leaf_class,
+        mask_rows: spec.mask_tree.mask_rows,
+        mask_code: spec.shape.mask_code,
+    };
+    let statement = Arc::new(VerifiedStatement::new(
+        VerifiedGroups {
+            groups: vec![VerifiedGroup {
+                group: spec.group,
+                members: vec![spec.member],
+                fresh: Some(spec.fresh),
+                code: None,
+                mask_code: None,
+            }],
+        },
+        vec![spec.mask_tree],
+        vec![metadata],
+    )?);
+    let mask_oracle = MaskOracle {
+        id: spec.fresh,
+        claimed_group: spec.group,
+        main_rows: 0,
+        mask_rows: spec.mask_tree.mask_rows,
+        mask_code: spec.shape.mask_code,
+        answers: 0,
+        sampled: false,
+    };
+    let fresh = make_lm_head_mask(
+        &spec.shape,
+        &mask_oracle,
+        statement.groups(),
+        spec.mask_tree,
+        &spec.randomness,
+    )?;
+    let mut oracles = RuntimeOracles::default();
+    oracles.receive_mask(
+        &statement,
+        &spec.mask_tree,
+        spec.fresh,
+        &fold_mask_notice(&spec.shape)?,
+        fresh.root(),
+    )?;
+    fold_start_verify(&spec.shape, fresh.message(), &statement, &oracles)?;
+    let mut message = chain.message();
+    message.push_u64(fresh.message().id);
+    message.push_u64(fresh.message().claimed_group);
+    message.push_u64(fresh.message().notice.mask_rows);
+    message.push_u64(fresh.message().notice.mask_code.log_n as u64);
+    message.push_u64(fresh.message().notice.mask_code.ell);
+    message.push_u64(fresh.message().notice.mask_code.r);
+    message.push_u64(fresh.message().notice.answers as u64);
+    message.push_u64(fresh.message().notice.leaf_class as u64);
+    for chunk in fresh.message().root.0.chunks(8) {
+        let word = u64::from_le_bytes(chunk.try_into().map_err(|_| Error::InvalidEncoding)?);
+        message.push_u64(word);
+    }
+    message.push_fp3(&fresh.message().sum);
+    let prefix = message.prefix(KIND_EPSILON, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    let eps = chain.draw_e()?;
+    let coins = ByteMaskCoins::new(spec.randomness.seed)?;
+    let mut prover = FoldProverSession::new(
+        &spec.shape,
+        &spec.layout,
+        fresh.mask(),
+        &row,
+        main_messages,
+        mask_messages,
+        Vec::new(),
+    )?;
+    if prover.sum() != fresh.message().sum {
+        return Err(Error::StatementMismatch);
+    }
+    prover.start(eps, &coins)?;
+    let mut claim = FoldRoundVerifier::new(fresh.message().sum, eps, row.target);
+    let mut gammas = Vec::with_capacity(spec.shape.k as usize);
+    for _ in 0..spec.shape.k {
+        let round = prover.round()?;
+        let mut message = chain.message();
+        message.push_fp3(&round[0]);
+        message.push_fp3(&round[2]);
+        let prefix = message.prefix(KIND_ALGEBRAIC, 0)?;
+        if !chain.step(&prefix, 0)? {
+            return Err(Error::InvalidProof);
+        }
+        let gamma = chain.draw_e()?;
+        claim.round(round[0], round[2], gamma);
+        gammas.push(gamma);
+        prover.bind(gamma)?;
+    }
+    let end = prover.end()?;
+    let output = fold_output(
+        &spec.shape,
+        &spec.layout,
+        &row,
+        spec.fresh,
+        fresh.root(),
+        spec.mask_tree.tree_number,
+        eps,
+        fresh.message().sum,
+        &gammas,
+        claim.claim(),
+    )?;
+    Ok(StageFoldOutcome {
+        output,
+        chain,
+        end_mu: end.mu,
+        end_fresh: end.fresh,
+        folded_main: prover.main_messages().to_vec(),
     })
 }
 
@@ -3207,12 +3385,12 @@ mod tests {
             },
         )?;
         let next_code = build_code_plan(5, 2, 1)?;
-        let next_mask = build_code_plan(5, 4, 1)?;
-        let target = SwitchTarget::from_stage(next_code, next_mask, 2, 3, 1)?;
+        let next_mask = build_code_plan(5, 8, 1)?;
+        let target = SwitchTarget::from_stage(next_code, next_mask, 2, 2, 1)?;
         let main_tails: Vec<Vec<Fp3>> = (0..4)
             .map(|row| vec![Fp3::from_u64(0x200 + row as u64)])
             .collect();
-        let mask_tails: Vec<Vec<Fp3>> = (0..8)
+        let mask_tails: Vec<Vec<Fp3>> = (0..4)
             .map(|row| vec![Fp3::from_u64(0x300 + row as u64)])
             .collect();
         let plan = switch_tree_plan_multi(
@@ -3239,6 +3417,44 @@ mod tests {
                 mask_tails,
                 pad: Fp3::from_u64(0x9a),
                 salts,
+                stage_fold: Some(StageFoldSpec {
+                    shape: FoldShape {
+                        code: next_code,
+                        mask_code: next_mask,
+                        k: 2,
+                        h: 2,
+                        mask_leaf_class: 0,
+                    },
+                    layout: FoldGroupLayout {
+                        group: 1,
+                        k: 2,
+                        h: 2,
+                        members: vec![FoldMemberLayout {
+                            oracle: 1,
+                            main_rows: 4,
+                            mask_rows: 4,
+                            kept: false,
+                        }],
+                    },
+                    mask_tree: MaskTreePlan {
+                        tree_number: 1,
+                        leaf_class: 0,
+                        log_n: next_mask.log_n,
+                        mask_rows: 4,
+                        salt_bytes: 40,
+                        run: Digest([0x51; 32]),
+                        configuration: key.reader.configuration,
+                    },
+                    group: 1,
+                    member: 1,
+                    fresh: 3,
+                    randomness: LmHeadMaskRandomness {
+                        seed: Digest([0x53; 32]),
+                        salts: (0..32)
+                            .map(|position| vec![(position as u8) ^ 0x5b; 40])
+                            .collect(),
+                    },
+                }),
             }),
         )
     }
@@ -3278,6 +3494,28 @@ mod tests {
         assert_eq!(stage.rows.masks.len(), 2);
         assert_eq!(stage.rows.main_tail.len(), 1);
         assert_eq!(stage.rows.mask_tails.len(), 2);
+        let stage_fold = run.stage_fold.as_ref().expect("stage fold");
+        assert_eq!(stage_fold.output.k, 2);
+        assert_eq!(stage_fold.output.h, 2);
+        assert_eq!(stage_fold.output.members, vec![1]);
+        assert_eq!(stage_fold.output.fresh, 3);
+        let mut value = Fp3::ZERO;
+        for (coefficient, symbol) in
+            stage_fold.output.coefficients.iter().zip(&stage_fold.folded_main)
+        {
+            value = value.add(&coefficient.mul(symbol));
+        }
+        for (coefficient, symbol) in
+            stage_fold.output.mask_coefficients.iter().zip(&stage_fold.end_mu)
+        {
+            value = value.add(&coefficient.mul(symbol));
+        }
+        for (coefficient, symbol) in
+            stage_fold.output.fresh_coefficients.iter().zip(&stage_fold.end_fresh)
+        {
+            value = value.add(&coefficient.mul(symbol));
+        }
+        assert_eq!(value, stage_fold.output.target);
 
     }
 

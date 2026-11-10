@@ -218,6 +218,10 @@ impl CsMultiSession {
         self.chain.value()
     }
 
+    pub fn into_chain(self) -> Chain {
+        self.chain
+    }
+
     pub fn receive_declarations(&mut self, identity: Digest, root: Digest) -> Result<()> {
         if self.stage != Stage::Fresh || identity != self.identity || root == Digest::ZERO {
             return Err(Error::StatementMismatch);
