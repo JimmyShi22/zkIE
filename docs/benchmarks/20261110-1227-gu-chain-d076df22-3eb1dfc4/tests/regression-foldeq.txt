@@ -1,0 +1,46 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/zkie_engine-8aa968ebbad7c68c)
+
+running 39 tests
+test pcs::request::foldeq::tests::first_query_binds_the_plan_and_configuration ... ok
+test pcs::request::foldeq::tests::bat_chain_handoff_requires_the_read_stage ... ok
+test pcs::request::foldeq::tests::first_query_and_stage_order ... ok
+test pcs::request::foldeq::tests::fold_session_fixes_input_before_epsilon ... ok
+test pcs::request::foldeq::tests::fold_prover_second_as_drawn_check_rejects_another_source ... ok
+test pcs::request::foldeq::tests::lin_gamma_is_the_psi_suffix ... ok
+test pcs::request::foldeq::tests::gu_fresh_id_collision_is_rejected ... ok
+test pcs::request::foldeq::tests::five_binding_inputs_change_the_actual_session_prefix_or_first_challenge ... ok
+test pcs::request::foldeq::tests::fold_session_round_order_and_missing_rounds_fail_closed ... ok
+test pcs::request::foldeq::tests::fold_layout_mask_only_and_row_overflow_are_checked ... ok
+test pcs::request::foldeq::tests::fold_session_wrong_group_layout_or_shape_is_rejected ... ok
+test pcs::request::foldeq::tests::fold_session_wrong_root_is_rejected_before_rounds ... ok
+test pcs::request::foldeq::tests::gu_session_rejects_missing_and_out_of_order_stages ... ok
+test pcs::request::foldeq::tests::gamma_is_drawn_from_the_fixed_prefix ... ok
+test pcs::request::foldeq::tests::gamma_gu_queries_reads_and_fold_start ... ok
+test pcs::request::foldeq::tests::gu_wrong_fold_group_is_rejected ... ok
+test pcs::request::foldeq::tests::gu_fixture_columns_do_not_pass_fold ... ok
+test pcs::request::foldeq::tests::gu_session_requires_seed_answers_record_then_queries ... ok
+test pcs::request::foldeq::tests::fold_session_rounds_produce_the_final_constraint ... ok
+test pcs::request::foldeq::tests::gu_fold_consumes_the_joined_membership ... ok
+test pcs::request::foldeq::tests::provider_hiding_is_bound_and_charged_before_send ... ok
+test pcs::request::foldeq::tests::lin_row_bound_accepts_the_limit_without_materializing ... ok
+test pcs::request::foldeq::tests::binding_identity_and_canonical_fields_are_checked ... ok
+test pcs::request::foldeq::tests::gu_answer_round_feeds_the_following_draws ... ok
+test pcs::request::foldeq::tests::gu_session_rows_check_one_independent_witness ... ok
+test pcs::request::foldeq::tests::gu_session_reuses_one_verified_column_for_repeated_draws ... ok
+test pcs::request::foldeq::tests::gu_session_requires_joined_columns_before_fold_and_uses_verified_reads ... ok
+test pcs::request::foldeq::tests::wrong_prefix_chain_is_rejected ... ok
+test pcs::request::foldeq::tests::fold_session_kept_layout_is_enforced ... ok
+test pcs::request::foldeq::tests::plan_faults_are_rejected ... ok
+test pcs::request::foldeq::tests::fold_session_fixed_input_change_changes_rounds ... ok
+test pcs::request::foldeq::tests::gu_session_rejects_a_rebound_oracle_tree_or_group ... ok
+test pcs::request::foldeq::tests::fold_session_kept_rows_three_use_compact_mapping ... ok
+test pcs::request::foldeq::tests::plan_and_binding_substitution_is_rejected_at_open_and_bind ... ok
+test pcs::request::foldeq::tests::fold_session_kept_rows_three_virtual_mapping_is_independent ... ok
+test pcs::request::foldeq::tests::gu_session_joins_the_trusted_group_once ... ok
+test pcs::request::foldeq::tests::fold_session_kept_evidence_is_direct_and_nonzero ... ok
+test pcs::request::foldeq::tests::gu_shared_seeds_are_drawn_from_the_received_root ... ok
+test pcs::request::foldeq::tests::gu_session_closes_every_ordered_answer ... ok
+
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 194 filtered out; finished in 0.00s
+
