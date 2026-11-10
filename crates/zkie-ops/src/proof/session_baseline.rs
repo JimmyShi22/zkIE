@@ -233,7 +233,7 @@ fn selected_plan_digest(
 /// Reuses the existing binding candidate to assemble the parameters,
 /// statement and record for this session. The encoding is candidate-internal
 /// and replaceable.
-fn assemble_binding(
+pub fn assemble_binding(
     public: &ModelCommitmentPublic,
     plan: &TracePlan,
     selection: &SelectedMatmulStep,
