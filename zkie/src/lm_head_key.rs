@@ -55,6 +55,7 @@ use zkie_engine::primitives::transcript::run_value;
 use zkie_engine::pcs::request::proximity::SingleRows;
 use zkie_ops::proof::base_final_session::{fold_identity, FoldBasis, FoldMember};
 use zkie_ops::proof::column_session::fp_from_signed_word;
+use zkie_ops::proof::base_last_session::{LastBaseProver, LastBaseRandomness, LastBaseSession};
 use zkie_ops::proof::cs_multi_session::{CsMultiProver, CsMultiSession, OldMaskSource};
 use zkie_ops::proof::fold_handoff::{FoldHandoff, FoldHandoffAnchor};
 use zkie_ops::proof::session_baseline::SESSION_PROTOCOL_IDENTITY;
@@ -1162,6 +1163,7 @@ pub struct LimitedSharedColumns {
     pub cs_message: Option<SwitchedRows>,
     pub stage_fold: Option<StageFoldOutcome>,
     pub stage_rows: Option<LimitedFoldStage>,
+    pub sealed: Option<Digest>,
     pub pending_rows: usize,
     pub transcript: Digest,
 }
@@ -1231,6 +1233,7 @@ pub fn run_limited_shared_to_columns(
     let mut cs_message = None;
     let mut stage_fold = None;
     let mut stage_rows = None;
+    let mut sealed = None;
     let mut pending_rows = 0usize;
     let mut transcript = *session.transcript_value();
     if let Some(omega) = session.plan().omega.as_ref().cloned() {
@@ -1401,6 +1404,9 @@ pub fn run_limited_shared_to_columns(
             let mut folds: Vec<StageFoldOutcome> = Vec::new();
             let mut stages: Vec<LimitedFoldStage> = Vec::new();
             let mut first = true;
+            let mut last_target: Option<SwitchTarget> = None;
+            let mut last_root: Option<Digest> = None;
+            let mut base_step: Option<BaseStep> = None;
             while let Some(inputs) = step {
                 let members = if first {
                     SwitchMembers::Initial {
@@ -1429,6 +1435,9 @@ pub fn run_limited_shared_to_columns(
                     members,
                 )?;
                 chain = run.chain;
+                last_target = Some(inputs.target);
+                last_root = Some(run.declared_root);
+                base_step = inputs.base.clone();
                 cs_claims = Some(run.claims.clone());
                 cs_message = Some(run.message.clone());
                 transcript = *chain.value();
@@ -1471,6 +1480,38 @@ pub fn run_limited_shared_to_columns(
             }
             stage_fold = folds.pop();
             stage_rows = stages.pop();
+            if let Some(base) = base_step {
+                let target = last_target.ok_or(Error::InvalidSessionState)?;
+                let root = last_root.ok_or(Error::InvalidSessionState)?;
+                let claims = cs_claims.as_ref().ok_or(Error::InvalidSessionState)?;
+                let message = cs_message.as_ref().ok_or(Error::InvalidSessionState)?;
+                let last = previous.as_ref().ok_or(Error::InvalidSessionState)?;
+                let rows = last_stage_single_rows(target, claims, message)?;
+                let prover = LastBaseProver::new(
+                    rows.clone(),
+                    base.plan.clone(),
+                    &base.salts,
+                    &base.randomness,
+                )?;
+                let messages = prover.messages()?;
+                let mut session = LastBaseSession::new(
+                    chain.clone(),
+                    rows,
+                    last.plan().clone(),
+                    root,
+                    base.plan.clone(),
+                )?;
+                session.receive_star(messages.star_root, messages.target_star)?;
+                let lambda = session.draw_lambda()?;
+                let prepared = prover.base_rows(lambda)?;
+                session.receive_rows(prepared)?;
+                let positions = session.draw_base_positions(base.positions)?;
+                let star_opening = prover.open_star(&positions)?;
+                let final_opening = last.open(&positions)?;
+                session.verify_openings(&star_opening, &final_opening)?;
+                sealed = Some(session.finish()?);
+                transcript = *session.chain_value();
+            }
         }
         }
     } else if omega_randomness.is_some() {
@@ -1491,6 +1532,7 @@ pub fn run_limited_shared_to_columns(
         cs_message,
         stage_fold,
         stage_rows,
+        sealed,
         pending_rows,
         transcript,
     })
@@ -1963,6 +2005,7 @@ pub struct LimitedSwitchInputs {
     pub salts: Vec<Vec<u8>>,
     pub stage_fold: Option<StageFoldSpec>,
     pub next: Option<Box<LimitedSwitchInputs>>,
+    pub base: Option<BaseStep>,
 }
 
 /// Builds the FOLD-to-CS handoff from the verified FOLD output and the real
@@ -2369,6 +2412,16 @@ pub fn build_stage_fold_stage(
     })
 }
 
+/// The last-stage BASE inputs: the independent masking oracle's tree plan,
+/// its private randomness and salts, and the number of drawn positions.
+#[derive(Clone)]
+pub struct BaseStep {
+    pub plan: RuntimeTreePlan,
+    pub salts: Vec<Vec<u8>>,
+    pub randomness: LastBaseRandomness,
+    pub positions: usize,
+}
+
 /// One switch stage's public result: the advanced chain, the registered
 /// claims, the switched message and the prover that committed it.
 struct SwitchRun {
@@ -2376,6 +2429,7 @@ struct SwitchRun {
     claims: SwitchedClaims,
     message: SwitchedRows,
     prover: CsMultiProver,
+    declared_root: Digest,
 }
 
 /// Where one switch stage's member openings and old mask come from. The first
@@ -2467,13 +2521,52 @@ fn run_switch(
         .authenticate_and_register(&member_openings, &fresh_opening, old_mask_opening.as_ref())?
         .clone();
     let message = prover.message().clone();
+    let declared_root = cs.declared_root().ok_or(Error::InvalidSessionState)?;
     let chain = cs.into_chain();
     Ok(SwitchRun {
         chain,
         claims,
         message,
         prover,
+        declared_root,
     })
+}
+
+/// Turns the final switched GroupRow into the last stage's SingleRows. The
+/// final target has one real main row and one mask row (k = h = 0). The
+/// reference layout carries a virtual second main row that was never sent and
+/// is fixed to zero, so the direct one-row form has the same coefficients,
+/// target and openings without a new commitment; a target with folded rows is
+/// rejected instead of approximated.
+fn last_stage_single_rows(
+    target: SwitchTarget,
+    claims: &SwitchedClaims,
+    message: &SwitchedRows,
+) -> Result<SingleRows> {
+    if target.main_rows != 1 || target.mask_rows != 1 {
+        return Err(Error::UnsupportedPrimitive);
+    }
+    if message.main_tails.len() != 1 || message.mask_tails.len() != 1 {
+        return Err(Error::ShapeMismatch);
+    }
+    let rows = SingleRows {
+        code: target.code,
+        mask_code: target.mask_code,
+        main: message.main.clone(),
+        main_tail: message.main_tails[0].clone(),
+        masks: vec![message.mask.clone()],
+        mask_tails: vec![message.mask_tails[0].clone()],
+        claim: claims.combined.main.clone(),
+        mask_claims: vec![claims.combined.mask.clone()],
+        target: claims.combined.target,
+    };
+    rows.check()?;
+    if rows.claim.len() != usize::try_from(rows.code.ell).map_err(|_| Error::ResourceLimit)?
+        || rows.masks.len() != 1
+    {
+        return Err(Error::StatementMismatch);
+    }
+    Ok(rows)
 }
 
 /// The checks that the shared-only chain must report before a limited tested
@@ -3676,6 +3769,7 @@ mod tests {
                 mask_tails,
                 pad: Fp3::from_u64(0x9a),
                 salts,
+                base: None,
                 stage_fold: Some(StageFoldSpec {
                     shape: FoldShape {
                         code: next_code,
@@ -3725,6 +3819,7 @@ mod tests {
                         .collect(),
                     pad: Fp3::from_u64(0x9b),
                     salts: salts2,
+                    base: None,
                     stage_fold: Some(StageFoldSpec {
                         shape: FoldShape {
                             code: next_code,
@@ -3772,6 +3867,28 @@ mod tests {
                         salts: final_salts,
                         stage_fold: None,
                         next: None,
+                        base: Some(BaseStep {
+                            plan: RuntimeTreePlan {
+                                tree_number: 0x401,
+                                leaf_class: 0,
+                                log_n: final_code.log_n,
+                                log_n_zk: final_mask.log_n,
+                                parts: vec![RuntimeTreePart {
+                                    main_symbols: 3,
+                                    mask_symbols: 3,
+                                }],
+                                salt_bytes: 40,
+                                run: Digest([0x83; 32]),
+                                configuration: key.reader.configuration,
+                            },
+                            salts: (0..64)
+                                .map(|position| vec![(position as u8) ^ 0x7d; 40])
+                                .collect(),
+                            randomness: LastBaseRandomness {
+                                seed: Digest([0x81; 32]),
+                            },
+                            positions: 2,
+                        }),
                     })),
                 })),
             }),
@@ -3842,9 +3959,85 @@ mod tests {
         assert_eq!(stage_rows.rows.code.ell, 4);
         assert_eq!(Some(stage_rows.rows.mask_code), run.stage_fold.as_ref().map(|s| s.output.mask_code));
         assert_eq!(stage_rows.rows.masks.len(), 2);
+        let sealed = run.sealed.expect("sealed transcript");
+        assert_ne!(sealed, Digest::ZERO);
 
     }
 
+
+    #[test]
+    fn the_last_stage_carries_the_group_row_unchanged() {
+        use zkie_engine::pcs::request::code::build_code_plan;
+        use zkie_engine::pcs::request::cs_stage::SwitchClaim;
+        let code = build_code_plan(6, 8, 1).expect("code");
+        let mask_code = build_code_plan(6, 32, 1).expect("mask code");
+        let target = SwitchTarget::from_stage(code, mask_code, 0, 0, 1).expect("target");
+        let claims = SwitchedClaims {
+            positions: vec![1, 2],
+            old_symbols: vec![Fp3::from_u64(3), Fp3::from_u64(4)],
+            claims: Vec::new(),
+            theta: Fp3::from_u64(5),
+            combined: SwitchClaim {
+                main: vec![Fp3::from_u64(6); code.ell as usize],
+                mask: vec![Fp3::from_u64(7); mask_code.ell as usize],
+                target: Fp3::from_u64(8),
+            },
+            main_len: code.ell,
+            main_tail_len: code.r,
+            mask_len: mask_code.ell,
+            mask_tail_len: mask_code.r,
+        };
+        let message = SwitchedRows {
+            main: vec![Fp3::from_u64(9); code.ell as usize],
+            main_tails: vec![vec![Fp3::from_u64(10); code.r as usize]],
+            mask: vec![Fp3::from_u64(11); mask_code.ell as usize],
+            mask_tails: vec![vec![Fp3::from_u64(12); mask_code.r as usize]],
+        };
+        let rows = last_stage_single_rows(target, &claims, &message).expect("last rows");
+        assert_eq!(rows.main, message.main);
+        assert_eq!(rows.main_tail, message.main_tails[0]);
+        assert_eq!(rows.masks, vec![message.mask.clone()]);
+        assert_eq!(rows.mask_tails, vec![message.mask_tails[0].clone()]);
+        assert_eq!(rows.claim, claims.combined.main);
+        assert_eq!(rows.mask_claims, vec![claims.combined.mask.clone()]);
+        assert_eq!(rows.target, claims.combined.target);
+        assert_eq!(rows.main.len(), code.ell as usize);
+        assert_eq!(rows.masks.len(), 1);
+    }
+
+    #[test]
+    fn the_last_stage_rejects_a_folded_final_target() {
+        use zkie_engine::pcs::request::code::build_code_plan;
+        use zkie_engine::pcs::request::cs_stage::SwitchClaim;
+        let code = build_code_plan(4, 4, 1).expect("code");
+        let mask_code = build_code_plan(4, 8, 1).expect("mask code");
+        let target = SwitchTarget::from_stage(code, mask_code, 1, 0, 1).expect("target");
+        let claims = SwitchedClaims {
+            positions: Vec::new(),
+            old_symbols: Vec::new(),
+            claims: Vec::new(),
+            theta: Fp3::ZERO,
+            combined: SwitchClaim {
+                main: vec![Fp3::ZERO; target.code.ell as usize],
+                mask: vec![Fp3::ZERO; target.mask_code.ell as usize],
+                target: Fp3::ZERO,
+            },
+            main_len: target.code.ell,
+            main_tail_len: target.code.r,
+            mask_len: target.mask_code.ell,
+            mask_tail_len: target.mask_code.r,
+        };
+        let message = SwitchedRows {
+            main: vec![Fp3::ZERO; target.main_rows as usize * target.code.ell as usize],
+            main_tails: vec![vec![Fp3::ZERO; target.code.r as usize]; target.main_rows as usize],
+            mask: vec![Fp3::ZERO; target.mask_rows as usize * target.mask_code.ell as usize],
+            mask_tails: vec![vec![Fp3::ZERO; target.mask_code.r as usize]; target.mask_rows as usize],
+        };
+        assert!(matches!(
+            last_stage_single_rows(target, &claims, &message),
+            Err(Error::UnsupportedPrimitive)
+        ));
+    }
 
     #[test]
     fn omega_blocks_sum_the_folded_matrix_rows() {
