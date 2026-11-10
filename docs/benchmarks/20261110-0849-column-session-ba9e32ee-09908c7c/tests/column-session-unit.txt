@@ -1,0 +1,15 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/zkie_ops-a527cf57462e281a)
+
+running 8 tests
+test proof::column_session::tests::asset_root_tamper_is_rejected_before_the_table_is_used ... ok
+test proof::column_session::tests::fold_component_checks_the_public_row_and_stops_at_the_closed_boundary ... ok
+test proof::column_session::tests::gu_registration_rejects_a_wrong_oracle_or_group ... ok
+test proof::column_session::tests::column_path_tamper_is_rejected_by_authentication ... ok
+test proof::column_session::tests::full_table_comparison_detects_a_wrong_opened_cell ... ok
+test proof::column_session::tests::session_passes_all_four_component_layers_and_records_three_roots ... ok
+test proof::column_session::tests::path_valid_but_wrong_merge_is_seen_by_the_target_control ... ok
+test proof::column_session::tests::fixed_fixture_is_reproducible ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 25 filtered out; finished in 0.00s
+
