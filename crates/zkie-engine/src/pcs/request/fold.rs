@@ -1228,6 +1228,57 @@ pub trait MaskCoins {
     fn redraw(&self, number: u32) -> Result<Fp3>;
 }
 
+/// A numbered mask-coin source over caller-provided random bytes. Each draw
+/// is a labeled hash of the bytes and its number; the source is random-access,
+/// so the prover can regenerate a recorded draw. Production supplies CSPRNG
+/// bytes; tests may supply fixed bytes.
+pub struct ByteMaskCoins {
+    seed: Digest,
+    draw: u32,
+}
+
+impl ByteMaskCoins {
+    pub fn new(seed: Digest) -> Result<Self> {
+        if seed == Digest::ZERO {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(Self { seed, draw: 0 })
+    }
+
+    fn value_at(&self, number: u32) -> Result<Fp3> {
+        use zkie_core::common::field::PrimeCharacteristicRing;
+
+        use crate::pcs::request::field::{Fp, E_DEGREE, MODULUS};
+        use crate::primitives::transcript::{hash_labeled, tag_word, COIN_INPUTS};
+
+        let digest = hash_labeled(
+            tag_word(COIN_INPUTS, 0),
+            number as u64,
+            None,
+            &self.seed.0,
+        )?;
+        let mut coefficients = [Fp::ZERO; E_DEGREE];
+        for (index, coefficient) in coefficients.iter_mut().enumerate() {
+            let bytes = &digest.0[index * 8..(index + 1) * 8];
+            let word = u64::from_le_bytes(bytes.try_into().map_err(|_| Error::InvalidEncoding)?);
+            *coefficient = Fp::from_u64(word % MODULUS);
+        }
+        Ok(Fp3::new(coefficients[0], coefficients[1], coefficients[2]))
+    }
+}
+
+impl MaskCoins for ByteMaskCoins {
+    fn draw(&mut self) -> Result<(Fp3, u32)> {
+        let number = self.draw;
+        self.draw = self.draw.checked_add(1).ok_or(Error::ResourceLimit)?;
+        Ok((self.value_at(number)?, number))
+    }
+
+    fn redraw(&self, number: u32) -> Result<Fp3> {
+        self.value_at(number)
+    }
+}
+
 /// The fresh mask of one fold: coefficients, the draws' numbers, the random
 /// tail of the rows' encodings after it is drawn, and, after it is sent, its
 /// oracle id.
@@ -3365,4 +3416,18 @@ mod tests {
         )
         .is_err());
     }
+
+    #[test]
+    fn the_byte_mask_coins_are_reproducible_and_seeded() {
+        let mut first = ByteMaskCoins::new(Digest([0x11; 32])).unwrap();
+        let (a, zero) = first.draw().unwrap();
+        let (b, one) = first.draw().unwrap();
+        assert_eq!((zero, one), (0, 1));
+        assert_eq!(a, first.redraw(0).unwrap());
+        assert_eq!(b, first.redraw(1).unwrap());
+        let other = ByteMaskCoins::new(Digest([0x12; 32])).unwrap();
+        assert_ne!(a, other.redraw(0).unwrap());
+        assert!(ByteMaskCoins::new(Digest::ZERO).is_err());
+    }
+
 }
