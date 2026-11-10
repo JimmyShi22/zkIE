@@ -187,6 +187,187 @@ pub fn build_lm_head_key(
     })
 }
 
+
+/// The version of the limited key statement and plan. This is an adaptation
+/// with no range proof: it binds the trusted publication assumption that every
+/// valid matrix entry is the canonical i32 weight under the fixed mapping.
+/// It is not a reference key file and promises no range proof.
+pub const LIMITED_KEY_VERSION: u64 = 1;
+
+/// The public statement of the limited key. The version, the model identity,
+/// the table root/record/configuration, the table shape, the matrix mapping's
+/// dimensions and the admitted element range are all bound here. The two flags
+/// say what the statement assumes rather than proves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LimitedKeyStatement {
+    pub version: u64,
+    pub model_commitment: Digest,
+    pub table_root: Digest,
+    pub table_configuration: Digest,
+    pub table_shape: IndexShape,
+    pub matrix_rows: u64,
+    pub k_lo: u32,
+    pub k_col: u32,
+    pub valid_min: i64,
+    pub valid_max: i64,
+    pub no_wf: bool,
+    pub trusted_i32_mapping: bool,
+}
+
+impl LimitedKeyStatement {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut writer = zkie_engine::primitives::codec::CanonicalWriter::new();
+        writer.put_u64(self.version);
+        writer.put_digest(&self.model_commitment);
+        writer.put_digest(&self.table_root);
+        writer.put_digest(&self.table_configuration);
+        writer.put_u64(self.table_shape.code.log_n as u64);
+        writer.put_u64(self.table_shape.code.ell);
+        writer.put_u64(self.table_shape.code.r);
+        writer.put_u64(self.table_shape.v as u64);
+        writer.put_u64(self.table_shape.answers as u64);
+        writer.put_u64(self.table_shape.salt_bytes as u64);
+        writer.put_u64(self.table_shape.distances.radius);
+        writer.put_u64(self.table_shape.distances.later_radius);
+        writer.put_u64(self.table_shape.distances.m_once);
+        writer.put_u64(self.table_shape.distances.m_later);
+        writer.put_u64(self.matrix_rows);
+        writer.put_u64(self.k_lo as u64);
+        writer.put_u64(self.k_col as u64);
+        writer.put_u64(self.valid_min as u64);
+        writer.put_u64(self.valid_max as u64);
+        writer.put_u64(self.no_wf as u64);
+        writer.put_u64(self.trusted_i32_mapping as u64);
+        writer.into_bytes()
+    }
+
+    pub fn digest(&self) -> Digest {
+        zkie_core::artifact::digest_bytes(&self.encode())
+    }
+
+    /// Checks the limited statement's own version, semantics and range.
+    pub fn validate(&self) -> Result<()> {
+        if self.version != LIMITED_KEY_VERSION
+            || !self.no_wf
+            || !self.trusted_i32_mapping
+            || self.model_commitment == Digest::ZERO
+            || self.table_root == Digest::ZERO
+            || self.table_configuration == Digest::ZERO
+            || self.valid_min > self.valid_max
+            || self.valid_min < i32::MIN as i64
+            || self.valid_max > i32::MAX as i64
+        {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(())
+    }
+}
+
+/// The retained stages of the limited key, in the reference order. There is no
+/// range-proof stage: the statement's flags say that the range property is a
+/// trusted publication assumption, not a checked one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LimitedKeyStage {
+    IndexMasks,
+    LinFirst,
+    Seal,
+    Place,
+    LinShared,
+    LinSecond,
+}
+
+/// The limited key's plan: the retained stages and the compiled one-time and
+/// batch groups.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LimitedKeyPlan {
+    pub version: u64,
+    pub stages: Vec<LimitedKeyStage>,
+    pub once: zkie_engine::pcs::request::plan::CompiledLines,
+    pub proof: zkie_engine::pcs::request::plan::CompiledLines,
+}
+
+impl LimitedKeyPlan {
+    pub fn validate(&self) -> Result<()> {
+        let expected = [
+            LimitedKeyStage::IndexMasks,
+            LimitedKeyStage::LinFirst,
+            LimitedKeyStage::Seal,
+            LimitedKeyStage::Place,
+            LimitedKeyStage::LinShared,
+            LimitedKeyStage::LinSecond,
+        ];
+        if self.version != LIMITED_KEY_VERSION || self.stages != expected.to_vec() {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(())
+    }
+}
+
+/// Builds the limited key statement from the trusted context, the plan and the
+/// committed table. The admitted range is the canonical i32 range of the
+/// mapping; the statement does not prove it.
+pub fn build_limited_key_statement(
+    context: &LmHeadContext,
+    plan: &RequestPlan,
+    key: &LmHeadKey,
+) -> Result<LimitedKeyStatement> {
+    plan.validate()?;
+    let shape = plan.table_shape()?;
+    if key.shape != shape || key.reader.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let factor = 1u64
+        .checked_shl(plan.lin.k_lo)
+        .ok_or(Error::InvalidConfig)?;
+    let rows = 1u64 << plan.table.v;
+    let columns = 1u64 << plan.lin.k_col;
+    if factor.checked_mul(rows).ok_or(Error::InvalidConfig)? != columns
+        || rows != 1u64 << plan.lin.matrix_rows_log
+    {
+        return Err(Error::InvalidConfig);
+    }
+    let statement = LimitedKeyStatement {
+        version: LIMITED_KEY_VERSION,
+        model_commitment: context.model_id,
+        table_root: key.reader.root,
+        table_configuration: key.reader.configuration,
+        table_shape: shape,
+        matrix_rows: rows,
+        k_lo: plan.lin.k_lo,
+        k_col: plan.lin.k_col,
+        valid_min: i32::MIN as i64,
+        valid_max: i32::MAX as i64,
+        no_wf: true,
+        trusted_i32_mapping: true,
+    };
+    statement.validate()?;
+    Ok(statement)
+}
+
+/// Builds the limited key plan. Every retained stage is present, and the
+/// compiled groups are checked against the plan's lines.
+pub fn limited_key_plan(
+    plan: &RequestPlan,
+    compiled: &zkie_engine::pcs::request::plan::CompiledPlan,
+) -> Result<LimitedKeyPlan> {
+    plan.validate_compiled(compiled)?;
+    let key_plan = LimitedKeyPlan {
+        version: LIMITED_KEY_VERSION,
+        stages: vec![
+            LimitedKeyStage::IndexMasks,
+            LimitedKeyStage::LinFirst,
+            LimitedKeyStage::Seal,
+            LimitedKeyStage::Place,
+            LimitedKeyStage::LinShared,
+            LimitedKeyStage::LinSecond,
+        ],
+        once: compiled.once.clone(),
+        proof: compiled.proof.clone(),
+    };
+    key_plan.validate()?;
+    Ok(key_plan)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +491,67 @@ mod tests {
             salts: Vec::new(),
             pads: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_limited_statement_binds_its_semantics_and_range() {
+        let Some((context, plan)) = context() else {
+            return;
+        };
+        let randomness = empty_randomness();
+        let error = build_lm_head_key(
+            &context,
+            &plan,
+            Digest([0x42; 32]),
+            &randomness,
+            u64::MAX,
+        );
+        assert!(error.is_err());
+        let statement = LimitedKeyStatement {
+            version: LIMITED_KEY_VERSION,
+            model_commitment: context.model_id,
+            table_root: Digest([0x11; 32]),
+            table_configuration: Digest([0x22; 32]),
+            table_shape: plan.table_shape().expect("shape"),
+            matrix_rows: 1 << plan.table.v,
+            k_lo: plan.lin.k_lo,
+            k_col: plan.lin.k_col,
+            valid_min: i32::MIN as i64,
+            valid_max: i32::MAX as i64,
+            no_wf: true,
+            trusted_i32_mapping: true,
+        };
+        statement.validate().expect("statement");
+        let digest = statement.digest();
+        let mut other = statement.clone();
+        other.table_root = Digest([0x33; 32]);
+        assert_ne!(digest, other.digest());
+        other.version = LIMITED_KEY_VERSION + 1;
+        assert!(other.validate().is_err());
+        let mut other = statement.clone();
+        other.valid_max = i32::MAX as i64 + 1;
+        assert!(other.validate().is_err());
+        let mut other = statement.clone();
+        other.model_commitment = Digest::ZERO;
+        assert!(other.validate().is_err());
+        let mut other = statement.clone();
+        other.no_wf = false;
+        assert!(other.validate().is_err());
+    }
+
+    #[test]
+    fn the_limited_key_plan_keeps_every_stage_in_order() {
+        let Some((_context, plan)) = context() else {
+            return;
+        };
+        let compiled = zkie_models_gpt2::lm_head_plan::lm_head_compiled().expect("compiled");
+        let key_plan = limited_key_plan(&plan, &compiled).expect("key plan");
+        key_plan.validate().expect("plan");
+        let mut missing = key_plan.clone();
+        missing.stages.pop();
+        assert!(missing.validate().is_err());
+        let mut reordered = key_plan.clone();
+        reordered.stages.swap(1, 2);
+        assert!(reordered.validate().is_err());
     }
 }
