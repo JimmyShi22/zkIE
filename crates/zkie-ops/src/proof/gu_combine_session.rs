@@ -72,7 +72,7 @@ use zkie_engine::pcs::request::table::{IndexShape, SampleSeed};
 
 use crate::proof::column_session::{
     bind_table, build_authenticated_encoding_table_with_configuration, open_gu_flow_with_answers,
-    ColumnBindingInput, GU_NOTICE_ROOT,
+    AssetEncodingTable, ColumnBindingInput, GU_NOTICE_ROOT,
 };
 use crate::proof::model_commitment::{AssetOpening, ModelCommitmentPublic};
 use crate::proof::session_baseline::TrustedModel;
@@ -362,9 +362,30 @@ where
         opening,
         configuration,
     )?;
-    let binding = bind_table(&table, input)?;
-    let flow = open_gu_flow_with_answers(
+    verify_gu_combine_session_with_table_and_provider(
+        input,
         &table,
+        gu_root,
+        answer_provider,
+    )
+}
+
+/// Runs the same demonstration over a table that the caller already built from
+/// the complete authenticated opening. This is used by the SEND fixture, which
+/// must build and fix the oracle commitment before the session seed.
+pub fn verify_gu_combine_session_with_table_and_provider<F>(
+    input: &ColumnBindingInput,
+    table: &AssetEncodingTable,
+    gu_root: Digest,
+    answer_provider: F,
+) -> Result<GuCombineOutcome>
+where
+    F: FnOnce(&GuShape, &[SampleSeed]) -> Result<Vec<Fp3>>,
+{
+    let configuration = input.parameters.digest()?;
+    let binding = bind_table(table, input)?;
+    let flow = open_gu_flow_with_answers(
+        table,
         binding,
         input.edge.clone(),
         gu_root,

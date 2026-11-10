@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::io::BufReader;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use zkie_core::error::Error;
@@ -13,8 +14,8 @@ use zkie_ops::proof::model_commitment::{
     verify_model_anchor, ModelCommitmentPublic, SharedTrace,
 };
 use zkie_ops::proof::send_session::{
-    verify_send_session, verify_send_session_with_provider, FixtureSendProvider,
-    FIXTURE_GU_ROOT,
+    verify_send_session, verify_send_session_with_committed, CommittedGuWitness,
+    FixtureSendProvider,
 };
 use zkie_ops::proof::session_baseline::{
     selected_plan_identifier, SelectedMatmulStep, TrustedModel,
@@ -76,6 +77,7 @@ fn selected_gpt2_fixture_send_data_flow() {
     )
     .unwrap();
     println!("send_session_ms={}", started.elapsed().as_millis());
+    println!("committed_root={:?}", outcome.committed.root);
     println!("seeds={:?}", outcome.seeds);
     println!("provider_answers={:?}", outcome.provider_answers);
     println!("sample_target={:?}", sample_target(&outcome));
@@ -99,26 +101,35 @@ fn selected_gpt2_fixture_send_data_flow() {
         outcome.provider_answers[0]
     );
     assert!(outcome.combine.chain_handoff);
+    assert_eq!(outcome.committed.root, outcome.gu_root);
+    assert_eq!(
+        outcome.committed.recompute_root().unwrap(),
+        outcome.committed.root
+    );
 
     // Auxiliary test oracle: recompute the provider's sample-form answers from
-    // the plaintext fixture witness and the recorded seed. The verifier path
-    // does not call this comparison.
-    let provider = FixtureSendProvider::new(&outcome.gu_shape, outcome.gu_root).unwrap();
+    // the same committed witness object. The verifier path does not call this
+    // comparison.
+    let provider = FixtureSendProvider::from_committed(outcome.committed.clone()).unwrap();
+    assert!(std::sync::Arc::ptr_eq(
+        provider.committed(),
+        &outcome.committed
+    ));
     let oracle_answers = provider.answers(&outcome.seeds).unwrap();
     assert_eq!(oracle_answers, outcome.provider_answers);
 
     // A syntactically valid wrong answer is registered as a pending sample
     // claim, not rejected or self-certified.
-    let wrong = verify_send_session_with_provider(
+    let committed = Arc::clone(&outcome.committed);
+    let wrong = verify_send_session_with_committed(
         &public,
         &trusted,
         &input,
         "gpt2/weights/lm_head_w_i32.bin",
         opening,
-        FIXTURE_GU_ROOT,
-        |shape, seeds| {
-            let mut answers =
-                FixtureSendProvider::new(shape, FIXTURE_GU_ROOT)?.answers(seeds)?;
+        Arc::clone(&outcome.committed),
+        move |committed, _, seeds| {
+            let mut answers = FixtureSendProvider::from_committed(committed)?.answers(seeds)?;
             answers[0] = answers[0].add(&Fp3::ONE);
             Ok(answers)
         },
@@ -129,14 +140,30 @@ fn selected_gpt2_fixture_send_data_flow() {
     assert_eq!(wrong.combine.bat_input.targets[wrong.combine.bat_input.count - 1], sample_target(&wrong));
 
     // Truncated answer list fails closed before the verifier registers a claim.
-    let truncated = verify_send_session_with_provider(
+    let truncated = verify_send_session_with_committed(
         &public,
         &trusted,
         &input,
         "gpt2/weights/lm_head_w_i32.bin",
         opening,
-        FIXTURE_GU_ROOT,
-        |_, _| Ok(Vec::new()),
+        Arc::clone(&outcome.committed),
+        |_, _, _| Ok(Vec::new()),
     );
     assert!(matches!(truncated, Err(Error::ShapeMismatch)));
+
+    let other = Arc::new(CommittedGuWitness::new_with_tag(&outcome.gu_shape, 7).unwrap());
+    assert_ne!(other.root, outcome.committed.root);
+    assert!(matches!(
+        FixtureSendProvider::from_committed_with_root(other, Some(outcome.committed.root)),
+        Err(Error::StatementMismatch)
+    ));
+
+    let mut unsupported = outcome.gu_shape.clone();
+    let part = unsupported.tree.parts[0];
+    unsupported.tree.parts.push(part);
+    assert!(matches!(
+        CommittedGuWitness::new(&unsupported),
+        Err(Error::UnsupportedPrimitive) | Err(Error::InvalidConfig)
+    ));
+    let _ = committed;
 }
