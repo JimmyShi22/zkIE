@@ -297,6 +297,78 @@ fn product_form_fp3(plan: &CodeParams, message: &[Fp3], tail: &[Fp3]) -> Result<
     Ok(word)
 }
 
+/// The linear form of the code's message and tail entries at one position,
+/// in the encoder's coefficient order: the tail first, then the message. It is
+/// the transpose of the product-form network, so one position costs one pass
+/// over the tree rather than one encoding per entry.
+pub fn coefficients_at_fp3(plan: &CodeParams, position: u64) -> Result<Vec<Fp3>> {
+    let n = plan.n() as usize;
+    if position >= plan.n() {
+        return Err(Error::InvalidIndex);
+    }
+    let log_dim = plan.log_dim() as usize;
+    let block = 1usize << log_dim;
+    let dim = usize::try_from(plan.dim()).map_err(|_| Error::ResourceLimit)?;
+    let table = transform_table(plan.log_n)?;
+    let mut row = vec![Fp3::ZERO; n];
+    row[position as usize] = Fp3::ONE;
+    // The forward network applies its layers from log_dim-1 down to 0; the
+    // transpose applies them in the opposite order.
+    for layer in 0..log_dim {
+        let st = 1usize << layer;
+        let offset = n >> (layer + 1);
+        for h in 0..offset {
+            let twiddle = Fp3::from_base(table[offset + h]);
+            for j in 0..st {
+                let even = 2 * st * h + j;
+                let odd = even + st;
+                let a = row[even];
+                let b = row[odd];
+                row[even] = a.add(&b);
+                row[odd] = twiddle.mul(&a.sub(&b));
+            }
+        }
+    }
+    // The encoder fills the rest of the word by copying the coefficient block;
+    // the form on the original entries sums those copies.
+    let mut out = vec![Fp3::ZERO; dim];
+    let mut at = 0usize;
+    while at < n {
+        for index in 0..dim {
+            out[index] = out[index].add(&row[at + index]);
+        }
+        at += block;
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod coefficients_tests {
+    use super::*;
+    use zkie_core::common::field::PrimeCharacteristicRing;
+
+    #[test]
+    fn the_position_form_reproduces_the_encoder_symbol() {
+        let plan = build_code_plan(3, 4, 1).unwrap();
+        let message = [
+            Fp3::from_u64(1),
+            Fp3::from_u64(2),
+            Fp3::from_u64(3),
+            Fp3::from_u64(4),
+        ];
+        let tail = [Fp3::from_u64(5)];
+        let word = encode_row_fp3(&plan, &message, &tail).unwrap();
+        for position in 0..plan.n() {
+            let form = coefficients_at_fp3(&plan, position).unwrap();
+            let mut value = Fp3::ZERO;
+            for (coefficient, entry) in form.iter().zip(tail.iter().chain(message.iter())) {
+                value = value.add(&coefficient.mul(entry));
+            }
+            assert_eq!(value, word[position as usize]);
+        }
+    }
+}
+
 /// Encode one row with the protocol's product-form transform. The output is
 /// the codeword in position order and equals direct evaluation at the points.
 pub fn encode_row_fp(plan: &CodeParams, message: &[Fp], tail: &[Fp]) -> Result<Vec<Fp>> {

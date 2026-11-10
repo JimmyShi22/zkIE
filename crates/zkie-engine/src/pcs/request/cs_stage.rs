@@ -132,27 +132,16 @@ pub fn switched_message(
 }
 
 fn coeff_on_message(code: &CodeParams, position: u64, length: usize) -> Result<Vec<Fp3>> {
-    let mut out = vec![Fp3::ZERO; length];
-    let zeros = vec![Fp3::ZERO; code.r as usize];
-    for index in 0..length {
-        let mut message = vec![Fp3::ZERO; length];
-        message[index] = Fp3::ONE;
-        let encoded = encode_row_fp3(code, &message, &zeros)?;
-        out[index] = *encoded.get(position as usize).ok_or(Error::InvalidIndex)?;
+    if length != code.ell as usize {
+        return Err(Error::ShapeMismatch);
     }
-    Ok(out)
+    let form = crate::pcs::request::code::coefficients_at_fp3(code, position)?;
+    Ok(form[code.r as usize..].to_vec())
 }
 
 fn coeff_on_tail(code: &CodeParams, position: u64) -> Result<Vec<Fp3>> {
-    let message = vec![Fp3::ZERO; code.ell as usize];
-    let mut out = vec![Fp3::ZERO; code.r as usize];
-    for index in 0..code.r as usize {
-        let mut tail = vec![Fp3::ZERO; code.r as usize];
-        tail[index] = Fp3::ONE;
-        let encoded = encode_row_fp3(code, &message, &tail)?;
-        out[index] = *encoded.get(position as usize).ok_or(Error::InvalidIndex)?;
-    }
-    Ok(out)
+    let form = crate::pcs::request::code::coefficients_at_fp3(code, position)?;
+    Ok(form[..code.r as usize].to_vec())
 }
 
 fn add_scaled(target: &mut [Fp3], source: &[Fp3], scale: Fp3) -> Result<()> {
@@ -528,6 +517,146 @@ pub fn switched_message_multi(
         mask_tail,
     })
 }
+
+/// One authenticated old-row opening for the multi-row switch: the main
+/// symbol and one mask symbol per mask row of the single rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthenticatedRows {
+    pub position: u64,
+    pub main: Fp3,
+    pub masks: [Fp3; 2],
+}
+
+fn place_rest(
+    out: &mut [Fp3],
+    places: &[u64],
+    first: usize,
+    coefficients: &[Fp3],
+) -> Result<()> {
+    for (offset, value) in coefficients.iter().enumerate() {
+        let at = places
+            .get(first + offset)
+            .ok_or(Error::ShapeMismatch)?;
+        *out.get_mut(*at as usize).ok_or(Error::ShapeMismatch)? = *value;
+    }
+    Ok(())
+}
+
+/// Registers the multi-row switch claims: the original claim, then for every
+/// authenticated old position one main-row claim and one claim per mask row.
+/// The old messages and tails are lifted through the target's cut and rest
+/// layout; the claims are combined by powers of theta and remain pending.
+pub fn register_switch_multi(
+    rows: &SingleRows,
+    target: &SwitchTarget,
+    authenticated: &[AuthenticatedRows],
+    theta: Fp3,
+) -> Result<SwitchedClaims> {
+    target.check(rows)?;
+    let main_len = usize::try_from(
+        target
+            .main_rows
+            .checked_mul(target.code.ell)
+            .ok_or(Error::ResourceLimit)?,
+    )
+    .map_err(|_| Error::ResourceLimit)?;
+    let mask_len = usize::try_from(
+        target
+            .mask_rows
+            .checked_mul(target.mask_code.ell)
+            .ok_or(Error::ResourceLimit)?,
+    )
+    .map_err(|_| Error::ResourceLimit)?;
+    let places = target.rest_places()?;
+    let mask_ell = rows.mask_code.ell as usize;
+    let mask_r = rows.mask_code.r as usize;
+    let main_r = rows.code.r as usize;
+    let base_mask = [0usize, mask_ell];
+    let base_main_tail = 2 * mask_ell;
+    let base_mask_tail = [
+        base_main_tail + main_r,
+        base_main_tail + main_r + mask_r,
+    ];
+
+    let mut claims = Vec::new();
+    let mut original_main = vec![Fp3::ZERO; main_len];
+    for (j, value) in rows.claim.iter().enumerate() {
+        let at = SwitchTarget::cut_index(&target.main, target.main.bits, j as u64)?;
+        original_main[at as usize] = *value;
+    }
+    let mut original_mask = vec![Fp3::ZERO; mask_len];
+    for (r, claim) in rows.mask_claims.iter().enumerate().take(2) {
+        place_rest(&mut original_mask, &places, base_mask[r], claim)?;
+    }
+    claims.push(SwitchClaim {
+        main: original_main,
+        mask: original_mask,
+        target: rows.target,
+    });
+
+    for auth in authenticated {
+        if auth.position >= rows.code.n() {
+            return Err(Error::InvalidIndex);
+        }
+        let mut main_claim = vec![Fp3::ZERO; main_len];
+        let main_message = coeff_on_message(&rows.code, auth.position, rows.code.ell as usize)?;
+        for (j, value) in main_message.iter().enumerate() {
+            let at = SwitchTarget::cut_index(&target.main, target.main.bits, j as u64)?;
+            main_claim[at as usize] = main_claim[at as usize].add(value);
+        }
+        let mut mask_claim = vec![Fp3::ZERO; mask_len];
+        let main_tail = coeff_on_tail(&rows.code, auth.position)?;
+        place_rest(&mut mask_claim, &places, base_main_tail, &main_tail)?;
+        claims.push(SwitchClaim {
+            main: main_claim,
+            mask: mask_claim,
+            target: auth.main,
+        });
+
+        let mask_position = rows.mask_position(auth.position);
+        let mask_message =
+            coeff_on_message(&rows.mask_code, mask_position, rows.mask_code.ell as usize)?;
+        let mask_tail = coeff_on_tail(&rows.mask_code, mask_position)?;
+        for r in 0..2 {
+            let mut claim_main = vec![Fp3::ZERO; main_len];
+            let mut claim_mask = vec![Fp3::ZERO; mask_len];
+            place_rest(&mut claim_mask, &places, base_mask[r], &mask_message)?;
+            place_rest(&mut claim_mask, &places, base_mask_tail[r], &mask_tail)?;
+            let _ = &mut claim_main;
+            claims.push(SwitchClaim {
+                main: claim_main,
+                mask: claim_mask,
+                target: auth.masks[r],
+            });
+        }
+    }
+
+    let mut combined_main = vec![Fp3::ZERO; main_len];
+    let mut combined_mask = vec![Fp3::ZERO; mask_len];
+    let mut combined_target = Fp3::ZERO;
+    let mut power = Fp3::ONE;
+    for claim in &claims {
+        add_scaled(&mut combined_main, &claim.main, power)?;
+        add_scaled(&mut combined_mask, &claim.mask, power)?;
+        combined_target = combined_target.add(&power.mul(&claim.target));
+        power = power.mul(&theta);
+    }
+    Ok(SwitchedClaims {
+        positions: authenticated.iter().map(|auth| auth.position).collect(),
+        old_symbols: authenticated.iter().map(|auth| auth.main).collect(),
+        claims,
+        theta,
+        combined: SwitchClaim {
+            main: combined_main,
+            mask: combined_mask,
+            target: combined_target,
+        },
+        main_len: target.main_rows * target.code.ell,
+        main_tail_len: 0,
+        mask_len: target.mask_rows * target.mask_code.ell,
+        mask_tail_len: 0,
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,6 +758,70 @@ mod tests {
         assert_eq!(message.mask[places[222] as usize], rows.mask_tails[0][0]);
         // The pad entry is not in the rest and carries the private pad value.
         assert_eq!(message.mask[511], Fp3::from_u64(9));
+    }
+
+
+    #[test]
+    fn the_multi_row_switch_claims_hold_on_the_honest_message() {
+        use crate::pcs::request::code::{build_code_plan, encode_row_fp3};
+        let old_code = build_code_plan(17, 4096, 94).unwrap();
+        let old_mask = build_code_plan(14, 64, 47).unwrap();
+        let rows = SingleRows {
+            code: old_code,
+            mask_code: old_mask,
+            main: (0..4096).map(|index| Fp3::from_u64(index + 1)).collect(),
+            main_tail: (0..94).map(|index| Fp3::from_u64(0x1000 + index)).collect(),
+            masks: vec![
+                (0..64).map(|index| Fp3::from_u64(0x2000 + index)).collect(),
+                (0..64).map(|index| Fp3::from_u64(0x3000 + index)).collect(),
+            ],
+            mask_tails: vec![
+                (0..47).map(|index| Fp3::from_u64(0x4000 + index)).collect(),
+                (0..47).map(|index| Fp3::from_u64(0x5000 + index)).collect(),
+            ],
+            claim: vec![Fp3::ZERO; 4096],
+            mask_claims: vec![vec![Fp3::ZERO; 64], vec![Fp3::ZERO; 64]],
+            target: Fp3::ZERO,
+        };
+        let we = encode_row_fp3(&rows.code, &rows.main, &rows.main_tail).unwrap();
+        let wm = [
+            encode_row_fp3(&rows.mask_code, &rows.masks[0], &rows.mask_tails[0]).unwrap(),
+            encode_row_fp3(&rows.mask_code, &rows.masks[1], &rows.mask_tails[1]).unwrap(),
+        ];
+        let positions = [3u64, 100u64];
+        let auth: Vec<AuthenticatedRows> = positions
+            .iter()
+            .map(|position| {
+                let mask_position = rows.mask_position(*position) as usize;
+                AuthenticatedRows {
+                    position: *position,
+                    main: we[*position as usize],
+                    masks: [wm[0][mask_position], wm[1][mask_position]],
+                }
+            })
+            .collect();
+        let next_code = build_code_plan(12, 256, 64).unwrap();
+        let next_mask = build_code_plan(12, 64, 64).unwrap();
+        let target = SwitchTarget::from_stage(next_code, next_mask, 4, 3, 1).unwrap();
+        let message = switched_message_multi(
+            &rows,
+            &target,
+            vec![Fp3::from_u64(7); 64],
+            vec![Fp3::from_u64(8); 64],
+            Fp3::from_u64(9),
+        )
+        .unwrap();
+        let theta = Fp3::from_u64(11);
+        let switched = register_switch_multi(&rows, &target, &auth, theta).unwrap();
+        assert_eq!(switched.claims.len(), 1 + 2 * 3);
+        let mut value = Fp3::ZERO;
+        for (coefficient, symbol) in switched.combined.main.iter().zip(&message.main) {
+            value = value.add(&coefficient.mul(symbol));
+        }
+        for (coefficient, symbol) in switched.combined.mask.iter().zip(&message.mask) {
+            value = value.add(&coefficient.mul(symbol));
+        }
+        assert_eq!(value, switched.combined.target);
     }
 
 }
