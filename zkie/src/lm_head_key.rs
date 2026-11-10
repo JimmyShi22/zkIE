@@ -19,8 +19,10 @@ use zkie_engine::pcs::request::chain::Chain;
 use zkie_engine::pcs::request::code::encode_row_fp3;
 use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE};
 use zkie_engine::pcs::request::fold::{
-    fold_mask_notice, fold_mask_shape_fault, FoldGroupLayout, FoldInputRow, FoldMemberLayout, FoldShape,
-    OracleMetadata, RuntimeOracles, VerifiedGroup, VerifiedGroups, VerifiedStatement,
+    fold_mask_make, fold_mask_make_tail, fold_mask_notice, fold_mask_shape_fault,
+    fold_start_prove, ByteMaskCoins, FoldGroupLayout, FoldInputRow, FoldMemberLayout, FoldShape,
+    FoldStartMessage, FoldStartProver, MaskOracle, OracleMetadata, RuntimeOracles, VerifiedGroup, VerifiedGroups,
+    VerifiedStatement,
 };
 use zkie_engine::pcs::request::foldeq::{
     reader_table_identity, FoldeqBinder, FoldeqBinding, FoldeqEdgeBinding, FoldeqPlan,
@@ -1299,6 +1301,76 @@ pub fn build_fold_row(
     };
     row.check(fold, layout)?;
     Ok(row)
+}
+
+/// The private values of the fresh FOLD mask: the coin seed and one salt per
+/// committed mask-tree column.
+pub struct LmHeadMaskRandomness {
+    pub seed: Digest,
+    pub salts: Vec<Vec<u8>>,
+}
+
+/// The provider's fresh mask: the start message with its committed runtime
+/// tree, and the mask message coefficients the FOLD row consumes.
+pub struct LmHeadMaskProvider {
+    start: FoldStartProver,
+    mask_coefficients: Vec<Fp3>,
+}
+
+impl LmHeadMaskProvider {
+    pub fn root(&self) -> Digest {
+        self.start.message.root
+    }
+
+    pub fn message(&self) -> &FoldStartMessage {
+        &self.start.message
+    }
+
+    pub fn coefficients(&self) -> &[Fp3] {
+        &self.mask_coefficients
+    }
+}
+
+/// Builds the fresh mask from the existing mask maker: draws the coefficients
+/// and the encoding tail from private bytes, checks the mask against the
+/// verifier's group registry, commits the runtime mask tree under the plan,
+/// and returns the start message and the mask message coefficients. The root
+/// must equal the fresh mask root registered when the plan was built.
+pub fn make_lm_head_mask(
+    fold: &FoldShape,
+    oracle: &MaskOracle,
+    groups: &VerifiedGroups,
+    tree_plan: MaskTreePlan,
+    randomness: &LmHeadMaskRandomness,
+) -> Result<LmHeadMaskProvider> {
+    if tree_plan.fault().is_some()
+        || randomness.salts.len() != usize::try_from(tree_plan.columns())
+            .map_err(|_| Error::ResourceLimit)?
+        || randomness
+            .salts
+            .iter()
+            .any(|salt| salt.len() != tree_plan.salt_bytes)
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut coins = ByteMaskCoins::new(randomness.seed)?;
+    let mut mask = fold_mask_make(fold, &mut coins)?;
+    fold_mask_make_tail(fold, &mut mask, &mut coins)?;
+    mask.sent_as(oracle.id)?;
+    let start = fold_start_prove(
+        fold,
+        &mut mask,
+        &coins,
+        oracle,
+        groups,
+        tree_plan,
+        &randomness.salts,
+    )?;
+    let mask_coefficients = start.draft.table.values.clone();
+    Ok(LmHeadMaskProvider {
+        start,
+        mask_coefficients,
+    })
 }
 
 /// The checks that the shared-only chain must report before a limited tested
@@ -2585,6 +2657,77 @@ mod tests {
         assert_eq!(row.coefficients[0], Fp3::ONE);
         assert_eq!(row.coefficients[4 * 4], Fp3::ONE);
         assert_eq!(row.target, Fp3::ZERO);
+    }
+
+
+    #[test]
+    fn the_fresh_mask_commits_and_is_reproducible_from_private_bytes() {
+        use zkie_engine::pcs::request::code::build_code_plan;
+        let mask_code = build_code_plan(3, 7, 1).expect("mask code");
+        let fold = FoldShape {
+            code: build_code_plan(3, 4, 1).expect("main code"),
+            mask_code,
+            k: 3,
+            h: 0,
+            mask_leaf_class: 0,
+        };
+        let groups = VerifiedGroups {
+            groups: vec![VerifiedGroup {
+                group: 1,
+                members: vec![1, 2],
+                fresh: Some(3),
+                code: None,
+                mask_code: None,
+            }],
+        };
+        let oracle = MaskOracle {
+            id: 3,
+            claimed_group: 1,
+            main_rows: 0,
+            mask_rows: 1,
+            mask_code,
+            answers: 0,
+            sampled: false,
+        };
+        let tree = MaskTreePlan {
+            tree_number: 0,
+            leaf_class: 0,
+            log_n: mask_code.log_n,
+            mask_rows: 1,
+            salt_bytes: 40,
+            run: Digest([0x37; 32]),
+            configuration: Digest([0x38; 32]),
+        };
+        let salts: Vec<Vec<u8>> = (0..8)
+            .map(|position| vec![(position as u8) ^ 0x44; 40])
+            .collect();
+        let first = make_lm_head_mask(
+            &fold,
+            &oracle,
+            &groups,
+            tree,
+            &LmHeadMaskRandomness {
+                seed: Digest([0x39; 32]),
+                salts: salts.clone(),
+            },
+        )
+        .expect("mask");
+        assert_ne!(first.root(), Digest::ZERO);
+        assert_eq!(first.coefficients().len(), 7);
+        assert_eq!(first.message().id, 3);
+        let second = make_lm_head_mask(
+            &fold,
+            &oracle,
+            &groups,
+            tree,
+            &LmHeadMaskRandomness {
+                seed: Digest([0x39; 32]),
+                salts,
+            },
+        )
+        .expect("second mask");
+        assert_eq!(first.root(), second.root());
+        assert_eq!(first.coefficients(), second.coefficients());
     }
 
 }
