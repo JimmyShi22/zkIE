@@ -1,12 +1,15 @@
 //! Candidate FOLD output handoff into the local CS/BASE algebraic component.
 //!
-//! This module maps a FOLD session's final output into the claim data used by
-//! the local CS/BASE component. The handoff runs on the verifier side: the
-//! verifier supplies the trusted anchor (shape, group, layout and start
-//! identity) and checks the output against it before any claim is built. The
-//! output itself is a candidate from the FOLD session whose input rows are
-//! still a self-reported fixture; this module does not claim a real FOLD
-//! witness, a complete FOLD result or a complete IOPP/CS/BASE chain.
+//! This module is a **field projection fixture**: it maps a FOLD session's
+//! final output into the claim data used by the local CS/BASE component. It is
+//! not a valid FOLD-to-CS/BASE handoff when the fresh term is uncovered. The
+//! projected component result describes only the algebraic behaviour of the
+//! projected claim data; it is not equivalent to the FOLD output claim.
+//!
+//! The anchor is supplied by the caller. Neither the type nor the checks make
+//! it independently trusted: independent trust depends on the caller and the
+//! production wiring, which remain unclosed. The checks below are internal
+//! consistency checks under the caller-trust assumption.
 //!
 //! Field mapping into [`SingleRows`]:
 //!
@@ -23,7 +26,11 @@
 //!
 //! The implemented subset accepts only no-kept outputs (`kept` empty and
 //! `kept_rows` zero). A kept output is rejected as unsupported rather than
-//! silently dropped.
+//! silently dropped. The fresh coefficients are length/recompute/root checked,
+//! but those checks do not prove that the fresh contribution to the target is
+//! zero. A handoff statement is produced only when a caller-supplied fresh
+//! witness makes that contribution exactly zero; otherwise only a projection
+//! statement exists, and no valid handoff result is returned.
 
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
@@ -35,9 +42,12 @@ use zkie_engine::pcs::request::fold::{
 };
 use zkie_engine::pcs::request::proximity::{ProximityStatement, SingleRows};
 
-/// The verifier's trusted anchor for one FOLD output. It comes from the
-/// verifier's independent FOLD plan and the start message the session accepted,
-/// not from the output under test.
+/// The caller-supplied anchor for one FOLD output. It is expected to come from
+/// the caller's FOLD plan and the start message the caller accepted, not from
+/// the output under test. The type and the checks below do not make it
+/// independently trusted: independent trust depends on the caller and the
+/// production wiring, which remain unclosed. The checks are internal
+/// consistency checks under that caller-trust assumption.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FoldHandoffAnchor {
     pub shape: FoldShape,
@@ -64,10 +74,17 @@ pub struct FoldHandoff {
     pub main_claim: Vec<Fp3>,
     pub mask_claim: Vec<Fp3>,
     pub target: Fp3,
-    /// Fresh-mask coefficients. They do not enter `SingleRows`; the local
-    /// component does not check their contribution, and no fresh witness is
-    /// connected here.
+    /// Fresh-mask coefficients. They do not enter `SingleRows`. The length,
+    /// recomputation and root identity checks do not prove that the fresh
+    /// contribution to the target is zero; `fresh_covered` records whether a
+    /// caller-supplied fresh witness made that contribution exactly zero.
     pub fresh_claim: Vec<Fp3>,
+    /// The fresh contribution computed from a caller-supplied witness, if any.
+    pub fresh_contribution: Option<Fp3>,
+    /// True only when a fresh witness was supplied and the contribution is
+    /// exactly zero. This is the only case in which `handoff_statement`
+    /// returns a statement.
+    pub fresh_covered: bool,
     pub group: u64,
     pub k: u32,
     pub h: u32,
@@ -95,7 +112,11 @@ impl FoldHandoff {
     /// Checks the candidate output against the verifier's trusted anchor and
     /// maps the claim fields. Identity, shape, kept and gamma/kept-factor
     /// mismatches are rejected before any claim is handed to the component.
-    pub fn from_output(output: &FoldOutput, anchor: &FoldHandoffAnchor) -> Result<Self> {
+    pub fn from_output(
+        output: &FoldOutput,
+        anchor: &FoldHandoffAnchor,
+        fresh_witness: Option<&[Fp3]>,
+    ) -> Result<Self> {
         build_code_plan(
             anchor.shape.code.log_n,
             anchor.shape.code.ell,
@@ -161,6 +182,20 @@ impl FoldHandoff {
         if output.fresh_coefficients != expected_fresh {
             return Err(Error::StatementMismatch);
         }
+        let fresh_contribution = match fresh_witness {
+            Some(witness) => {
+                if witness.len() as u64 != anchor.shape.mask_code.ell {
+                    return Err(Error::ShapeMismatch);
+                }
+                let mut value = Fp3::ZERO;
+                for (coefficient, weight) in output.fresh_coefficients.iter().zip(witness) {
+                    value = value.add(&coefficient.mul(weight));
+                }
+                Some(value)
+            }
+            None => None,
+        };
+        let fresh_covered = matches!(fresh_contribution, Some(value) if value == Fp3::ZERO);
         Ok(Self {
             code: output.code,
             mask_code: output.mask_code,
@@ -168,6 +203,8 @@ impl FoldHandoff {
             mask_claim: output.mask_coefficients.clone(),
             target: output.target,
             fresh_claim: output.fresh_coefficients.clone(),
+            fresh_contribution,
+            fresh_covered,
             group: output.group,
             k: output.k,
             h: output.h,
@@ -184,9 +221,10 @@ impl FoldHandoff {
         })
     }
 
-    /// The verifier-side statement built from the mapped claim data. This is
-    /// the product the local CS/BASE component consumes.
-    pub fn statement(&self) -> Result<ProximityStatement> {
+    /// The projection statement built from the mapped claim data. This is the
+    /// product the local CS/BASE component may consume for algebraic testing;
+    /// it is not a valid handoff when `fresh_covered` is false.
+    pub fn projection_statement(&self) -> Result<ProximityStatement> {
         let statement = ProximityStatement {
             code: self.code,
             mask_code: self.mask_code,
@@ -202,10 +240,21 @@ impl FoldHandoff {
         Ok(statement)
     }
 
+    /// The handoff statement. It exists only when the caller supplied a fresh
+    /// witness whose contribution to the target is exactly zero. Otherwise the
+    /// fresh term is uncovered, and no valid FOLD-to-CS/BASE handoff result is
+    /// returned.
+    pub fn handoff_statement(&self) -> Result<ProximityStatement> {
+        if !self.fresh_covered {
+            return Err(Error::UnsupportedPrimitive);
+        }
+        self.projection_statement()
+    }
+
     /// Builds the prover-side row fixture with the mapped claim/target. The
     /// plaintext rows are supplied by the caller and are not part of the FOLD
-    /// output; they remain a fixture. The claim and target are the mapped
-    /// values, not a re-report from these rows.
+    /// output; they remain a projection fixture. The claim and target are the
+    /// mapped values, not a re-report from these rows.
     pub fn single_rows(
         &self,
         main: Vec<Fp3>,
@@ -316,18 +365,55 @@ mod tests {
         }
     }
 
+    fn dot(left: &[Fp3], right: &[Fp3]) -> Fp3 {
+        left.iter()
+            .zip(right)
+            .fold(Fp3::ZERO, |sum, (a, b)| sum.add(&a.mul(b)))
+    }
+
+    fn fresh_witness_nonzero(output: &FoldOutput) -> Vec<Fp3> {
+        let mut witness = vec![Fp3::ZERO; output.fresh_coefficients.len()];
+        for (index, coefficient) in output.fresh_coefficients.iter().enumerate() {
+            if *coefficient != Fp3::ZERO {
+                witness[index] = Fp3::ONE;
+                return witness;
+            }
+        }
+        panic!("the fixture has no nonzero fresh coefficient");
+    }
+
+    fn fresh_witness_zero(output: &FoldOutput) -> Vec<Fp3> {
+        let mut witness = vec![Fp3::ZERO; output.fresh_coefficients.len()];
+        if let Some(index) = output
+            .fresh_coefficients
+            .iter()
+            .position(|coefficient| *coefficient == Fp3::ZERO)
+        {
+            witness[index] = Fp3::ONE;
+            return witness;
+        }
+        let first = output.fresh_coefficients[0];
+        let second = output.fresh_coefficients[1];
+        let inverse = first.inverse().unwrap();
+        witness[0] = Fp3::ZERO.sub(&second.mul(&inverse));
+        witness[1] = Fp3::ONE;
+        witness
+    }
+
     #[test]
     fn mapping_enters_claim_and_target_and_keeps_identity_separate() {
         let output = output();
-        let handoff = FoldHandoff::from_output(&output, &anchor()).unwrap();
+        let handoff = FoldHandoff::from_output(&output, &anchor(), None).unwrap();
         assert_eq!(handoff.main_claim, output.coefficients);
         assert_eq!(handoff.mask_claim, output.mask_coefficients);
         assert_eq!(handoff.target, output.target);
         assert_eq!(handoff.fresh_claim, output.fresh_coefficients);
+        assert!(!handoff.fresh_covered);
+        assert!(handoff.handoff_statement().is_err());
         assert_eq!(handoff.group, output.group);
         assert_eq!(handoff.members, output.members);
         assert_eq!(handoff.layout, output.layout);
-        let statement = handoff.statement().unwrap();
+        let statement = handoff.projection_statement().unwrap();
         assert_eq!(statement.claim, output.coefficients);
         assert_eq!(statement.mask_claims, vec![output.mask_coefficients.clone()]);
         assert_eq!(statement.target, output.target);
@@ -355,31 +441,31 @@ mod tests {
         let mut bad = output();
         bad.group += 1;
         assert_eq!(
-            FoldHandoff::from_output(&bad, &anchor()).unwrap_err(),
+            FoldHandoff::from_output(&bad, &anchor(), None).unwrap_err(),
             Error::StatementMismatch
         );
         let mut bad = output();
         bad.fresh_root = Digest([0x32; 32]);
         assert_eq!(
-            FoldHandoff::from_output(&bad, &anchor()).unwrap_err(),
+            FoldHandoff::from_output(&bad, &anchor(), None).unwrap_err(),
             Error::StatementMismatch
         );
         let mut bad = output();
         bad.tree_number += 1;
         assert_eq!(
-            FoldHandoff::from_output(&bad, &anchor()).unwrap_err(),
+            FoldHandoff::from_output(&bad, &anchor(), None).unwrap_err(),
             Error::StatementMismatch
         );
         let mut bad = output();
         bad.members = vec![12];
         assert_eq!(
-            FoldHandoff::from_output(&bad, &anchor()).unwrap_err(),
+            FoldHandoff::from_output(&bad, &anchor(), None).unwrap_err(),
             Error::StatementMismatch
         );
         let mut bad = output();
         bad.layout.members[0].main_rows = 2;
         assert_eq!(
-            FoldHandoff::from_output(&bad, &anchor()).unwrap_err(),
+            FoldHandoff::from_output(&bad, &anchor(), None).unwrap_err(),
             Error::StatementMismatch
         );
         let mut kept_anchor = anchor();
@@ -392,39 +478,75 @@ mod tests {
         }];
         bad.kept_rows = 1;
         assert_eq!(
-            FoldHandoff::from_output(&bad, &kept_anchor).unwrap_err(),
+            FoldHandoff::from_output(&bad, &kept_anchor, None).unwrap_err(),
             Error::UnsupportedPrimitive
         );
         let mut bad = output();
         bad.kept_factor = bad.kept_factor.add(&Fp3::ONE);
         assert_eq!(
-            FoldHandoff::from_output(&bad, &anchor()).unwrap_err(),
+            FoldHandoff::from_output(&bad, &anchor(), None).unwrap_err(),
             Error::StatementMismatch
         );
         let mut bad = output();
         bad.gamma[0] = bad.gamma[0].add(&Fp3::ONE);
         assert_eq!(
-            FoldHandoff::from_output(&bad, &anchor()).unwrap_err(),
+            FoldHandoff::from_output(&bad, &anchor(), None).unwrap_err(),
             Error::StatementMismatch
         );
         let mut bad = output();
         bad.eps = bad.eps.add(&Fp3::ONE);
         assert_eq!(
-            FoldHandoff::from_output(&bad, &anchor()).unwrap_err(),
+            FoldHandoff::from_output(&bad, &anchor(), None).unwrap_err(),
             Error::StatementMismatch
         );
         let mut bad = output();
         bad.sum = bad.sum.add(&Fp3::ONE);
         assert_eq!(
-            FoldHandoff::from_output(&bad, &anchor()).unwrap_err(),
+            FoldHandoff::from_output(&bad, &anchor(), None).unwrap_err(),
             Error::StatementMismatch
         );
         let mut bad = output();
         bad.fresh_coefficients[0] = bad.fresh_coefficients[0].add(&Fp3::ONE);
         assert_eq!(
-            FoldHandoff::from_output(&bad, &anchor()).unwrap_err(),
+            FoldHandoff::from_output(&bad, &anchor(), None).unwrap_err(),
             Error::StatementMismatch
         );
+    }
+
+    #[test]
+    fn fresh_contribution_must_be_covered_for_a_handoff() {
+        let output = output();
+        let nonzero = fresh_witness_nonzero(&output);
+        let projection = FoldHandoff::from_output(&output, &anchor(), Some(&nonzero)).unwrap();
+        assert_ne!(projection.fresh_contribution.unwrap(), Fp3::ZERO);
+        assert!(!projection.fresh_covered);
+        assert!(projection.handoff_statement().is_err());
+        let statement = projection.projection_statement().unwrap();
+        assert_eq!(statement.target, output.target);
+
+        // The projected equation can be satisfied by a chosen fixture witness.
+        // This does not make it equivalent to the FOLD output claim: the FOLD
+        // target also contains the fresh term, which is deleted here. The
+        // negative below is about that non-equivalence, not about a failed
+        // projection equation.
+        let mut main = vec![Fp3::ZERO; statement.claim.len()];
+        for (index, coefficient) in statement.claim.iter().enumerate() {
+            if *coefficient != Fp3::ZERO {
+                main[index] = statement.target.mul(&coefficient.inverse().unwrap());
+                break;
+            }
+        }
+        let mask = vec![Fp3::ZERO; statement.mask_claims[0].len()];
+        assert_eq!(
+            dot(&statement.claim, &main).add(&dot(&statement.mask_claims[0], &mask)),
+            statement.target
+        );
+
+        let zero = fresh_witness_zero(&output);
+        let covered = FoldHandoff::from_output(&output, &anchor(), Some(&zero)).unwrap();
+        assert_eq!(covered.fresh_contribution, Some(Fp3::ZERO));
+        assert!(covered.fresh_covered);
+        assert!(covered.handoff_statement().is_ok());
     }
 
     #[test]
@@ -432,28 +554,28 @@ mod tests {
         let mut bad = output();
         bad.coefficients.pop();
         assert_eq!(
-            FoldHandoff::from_output(&bad, &anchor()).unwrap_err(),
+            FoldHandoff::from_output(&bad, &anchor(), None).unwrap_err(),
             Error::ShapeMismatch
         );
         let mut bad = output();
         bad.mask_coefficients.pop();
         assert_eq!(
-            FoldHandoff::from_output(&bad, &anchor()).unwrap_err(),
+            FoldHandoff::from_output(&bad, &anchor(), None).unwrap_err(),
             Error::ShapeMismatch
         );
         let mut bad = output();
         bad.gamma.pop();
         assert_eq!(
-            FoldHandoff::from_output(&bad, &anchor()).unwrap_err(),
+            FoldHandoff::from_output(&bad, &anchor(), None).unwrap_err(),
             Error::StatementMismatch
         );
         let mut bad = output();
         bad.fresh_coefficients.pop();
         assert_eq!(
-            FoldHandoff::from_output(&bad, &anchor()).unwrap_err(),
+            FoldHandoff::from_output(&bad, &anchor(), None).unwrap_err(),
             Error::ShapeMismatch
         );
-        let handoff = FoldHandoff::from_output(&output(), &anchor()).unwrap();
+        let handoff = FoldHandoff::from_output(&output(), &anchor(), None).unwrap();
         assert!(handoff
             .single_rows(vec![Fp3::ZERO; 3], vec![Fp3::ZERO], vec![Fp3::ZERO; 6], vec![Fp3::ZERO])
             .is_err());

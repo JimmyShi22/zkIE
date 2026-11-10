@@ -78,7 +78,9 @@ pub struct ProximityOutcome {
 impl ProximityOutcome {
     /// Returns the local algebraic component marker only when every recorded
     /// check passed. This does not accept a proof, does not prove the pending
-    /// CS claims and does not claim a complete BASE/IOPP result. `FoldOutput`
+    /// CS claims, does not claim a complete BASE/IOPP result and does not
+    /// establish a FOLD-to-CS/BASE handoff. A caller that uses projected FOLD
+    /// data must not present this marker as a valid handoff. `FoldOutput`
     /// remains independently fail-closed.
     pub fn component_complete(&self) -> Result<ProximityComponent> {
         if self.verified
@@ -786,9 +788,15 @@ impl<'a> ProximityVerifier<'a> {
     }
 }
 
-/// Runs the local CS/BASE algebraic component. The caller supplies the
-/// independent plan, the verifier-side statement, the public commitments, a
-/// prover channel and an independent test-side sample oracle.
+/// Runs the local CS/BASE algebraic component. The caller supplies the plan,
+/// the statement, the public commitments, a prover channel and a test-side
+/// sample oracle.
+///
+/// The statement is caller-supplied. A statement built from a field projection
+/// fixture (for example a FOLD output whose fresh term is uncovered) exercises
+/// only the local algebraic behaviour of the projected data. `ComponentComplete`
+/// does not establish a FOLD-to-CS/BASE handoff, does not prove the pending CS
+/// claims and does not accept a proof.
 pub fn verify_proximity_session(
     plan: &ProximityPlan,
     statement: &ProximityStatement,

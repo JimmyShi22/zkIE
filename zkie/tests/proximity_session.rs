@@ -281,7 +281,10 @@ fn selected_gpt2_cs_base_component() {
 
 #[test]
 #[ignore = "requires ZKIE_SESSION_FIXTURE with the multi-GiB gpt2-seq16 artifact"]
-fn selected_gpt2_fold_output_handoff_component() {
+fn selected_gpt2_fold_projection_component() {
+    // Field projection fixture: the FOLD output has an uncovered fresh term, so
+    // no valid FOLD-to-CS/BASE handoff is produced. The component result below
+    // describes the algebraic behaviour of the projected data only.
     let fixture = env::var("ZKIE_SESSION_FIXTURE").expect("set ZKIE_SESSION_FIXTURE");
     let root = Path::new(&fixture).join("gpt2-seq16");
     let public: ModelCommitmentPublic =
@@ -322,7 +325,7 @@ fn selected_gpt2_fold_output_handoff_component() {
         public_opening,
     )
     .unwrap();
-    let handoff = FoldHandoff::from_output(&column.fold_output, &column.fold_anchor).unwrap();
+    let handoff = FoldHandoff::from_output(&column.fold_output, &column.fold_anchor, None).unwrap();
     assert_eq!(handoff.main_claim, column.fold_output.coefficients);
     assert_eq!(handoff.mask_claim, column.fold_output.mask_coefficients);
     assert_eq!(handoff.fresh_claim, column.fold_output.fresh_coefficients);
@@ -331,8 +334,29 @@ fn selected_gpt2_fold_output_handoff_component() {
     assert_eq!(handoff.members, column.fold_output.members);
     assert_eq!(handoff.kept_rows, 0);
     assert!(column.fold_output.kept.is_empty());
+    assert!(!handoff.fresh_covered);
+    assert!(handoff.fresh_contribution.is_none());
+    assert!(handoff.handoff_statement().is_err());
 
-    let statement = handoff.statement().unwrap();
+    let mut fresh_witness = vec![Fp3::ZERO; handoff.mask_code.ell as usize];
+    for (index, coefficient) in handoff.fresh_claim.iter().enumerate() {
+        if *coefficient != Fp3::ZERO {
+            fresh_witness[index] = Fp3::ONE;
+            break;
+        }
+    }
+    let with_fresh = FoldHandoff::from_output(
+        &column.fold_output,
+        &column.fold_anchor,
+        Some(&fresh_witness),
+    )
+    .unwrap();
+    assert_ne!(with_fresh.fresh_contribution.unwrap(), Fp3::ZERO);
+    assert!(!with_fresh.fresh_covered);
+    assert!(with_fresh.handoff_statement().is_err());
+    assert!(with_fresh.projection_statement().is_ok());
+
+    let statement = handoff.projection_statement().unwrap();
     let plan = handoff_plan(&handoff);
     let switch_code = plan.stages[0].code;
     let switch_mask = plan.stages[0].mask_code;
@@ -373,8 +397,8 @@ fn selected_gpt2_fold_output_handoff_component() {
 
     let mut bad_output = column.fold_output.clone();
     bad_output.target = bad_output.target.add(&Fp3::ONE);
-    let bad_handoff = FoldHandoff::from_output(&bad_output, &column.fold_anchor).unwrap();
-    let bad_statement = bad_handoff.statement().unwrap();
+    let bad_handoff = FoldHandoff::from_output(&bad_output, &column.fold_anchor, None).unwrap();
+    let bad_statement = bad_handoff.projection_statement().unwrap();
     assert!(matches!(
         verify_proximity_session(&plan, &bad_statement, messages, &prover, &oracle),
         Err(Error::InvalidProof)
@@ -382,8 +406,8 @@ fn selected_gpt2_fold_output_handoff_component() {
 
     let mut bad_output = column.fold_output.clone();
     bad_output.coefficients[0] = bad_output.coefficients[0].add(&Fp3::ONE);
-    let bad_handoff = FoldHandoff::from_output(&bad_output, &column.fold_anchor).unwrap();
-    let bad_statement = bad_handoff.statement().unwrap();
+    let bad_handoff = FoldHandoff::from_output(&bad_output, &column.fold_anchor, None).unwrap();
+    let bad_statement = bad_handoff.projection_statement().unwrap();
     assert!(matches!(
         verify_proximity_session(&plan, &bad_statement, messages, &prover, &oracle),
         Err(Error::InvalidProof)
@@ -391,8 +415,8 @@ fn selected_gpt2_fold_output_handoff_component() {
 
     let mut bad_output = column.fold_output.clone();
     bad_output.mask_coefficients[0] = bad_output.mask_coefficients[0].add(&Fp3::ONE);
-    let bad_handoff = FoldHandoff::from_output(&bad_output, &column.fold_anchor).unwrap();
-    let bad_statement = bad_handoff.statement().unwrap();
+    let bad_handoff = FoldHandoff::from_output(&bad_output, &column.fold_anchor, None).unwrap();
+    let bad_statement = bad_handoff.projection_statement().unwrap();
     assert!(matches!(
         verify_proximity_session(&plan, &bad_statement, messages, &prover, &oracle),
         Err(Error::InvalidProof)
@@ -401,31 +425,31 @@ fn selected_gpt2_fold_output_handoff_component() {
     let mut bad_output = column.fold_output.clone();
     bad_output.group += 1;
     assert!(matches!(
-        FoldHandoff::from_output(&bad_output, &column.fold_anchor),
+        FoldHandoff::from_output(&bad_output, &column.fold_anchor, None),
         Err(Error::StatementMismatch)
     ));
     let mut bad_output = column.fold_output.clone();
     bad_output.fresh_root = zkie_core::types::Digest::ZERO;
     assert!(matches!(
-        FoldHandoff::from_output(&bad_output, &column.fold_anchor),
+        FoldHandoff::from_output(&bad_output, &column.fold_anchor, None),
         Err(Error::StatementMismatch)
     ));
     let mut bad_output = column.fold_output.clone();
     bad_output.fresh_coefficients[0] = bad_output.fresh_coefficients[0].add(&Fp3::ONE);
     assert!(matches!(
-        FoldHandoff::from_output(&bad_output, &column.fold_anchor),
+        FoldHandoff::from_output(&bad_output, &column.fold_anchor, None),
         Err(Error::StatementMismatch)
     ));
     let mut bad_output = column.fold_output.clone();
     bad_output.coefficients.pop();
     assert!(matches!(
-        FoldHandoff::from_output(&bad_output, &column.fold_anchor),
+        FoldHandoff::from_output(&bad_output, &column.fold_anchor, None),
         Err(Error::ShapeMismatch)
     ));
     let mut bad_output = column.fold_output.clone();
     bad_output.kept_rows = 1;
     assert!(matches!(
-        FoldHandoff::from_output(&bad_output, &column.fold_anchor),
+        FoldHandoff::from_output(&bad_output, &column.fold_anchor, None),
         Err(Error::StatementMismatch)
     ));
 }
