@@ -1,0 +1,40 @@
+warning: unused variable: `k_step`
+   --> models/gpt2/src/executor.rs:346:21
+    |
+346 |             let (k, k_step) = {
+    |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_step`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `m`
+   --> models/gemma3/src/executor.rs:277:5
+    |
+277 |     m: usize,
+    |     ^ help: if this is intentional, prefix it with an underscore: `_m`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_rot_step`
+   --> models/gemma3/src/executor.rs:390:21
+    |
+390 |         let (k_rot, k_rot_step) = rope(&mut builder, k, k_step, cos_prefix.clone(), sin_prefix.clone(), m)?;
+    |                     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_rot_step`
+
+warning: `zkie-models-gpt2` (lib) generated 1 warning (run `cargo fix --lib -p zkie-models-gpt2` to apply 1 suggestion)
+warning: `zkie-models-gemma3` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gemma3` to apply 2 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running tests/bat_fold_session.rs (target/debug/deps/bat_fold_session-99d54a96fc667dbe)
+
+running 5 tests
+test a_wrong_bat_declaration_stays_pending_after_fold ... ok
+roots=[Digest([79, 86, 88, 30, 90, 248, 152, 195, 179, 59, 199, 86, 17, 238, 48, 110, 21, 54, 198, 229, 226, 211, 154, 225, 121, 120, 183, 111, 3, 2, 228, 243]), Digest([106, 89, 196, 86, 91, 78, 212, 164, 50, 31, 57, 52, 101, 202, 228, 233, 167, 99, 79, 194, 230, 38, 93, 89, 201, 220, 22, 242, 222, 168, 16, 33]), Digest([70, 195, 50, 2, 128, 249, 28, 208, 193, 0, 184, 56, 197, 242, 89, 13, 15, 239, 37, 57, 225, 154, 231, 171, 150, 40, 128, 202, 229, 151, 211, 86])] positions=[[8, 14], [5, 7], [10, 14]] seeds=[SampleSeed { z: [Fp3 { c: [3058123640867202770, 6922237040851343470, 11262755735499430621] }, Fp3 { c: [6244281098706282, 6709770016328099072, 4666713253212063240] }, Fp3 { c: [3900746431084538818, 847907802356180823, 11734127282022607417] }, Fp3 { c: [352171989358979531, 18160254935055845196, 4950711324320735784] }, Fp3 { c: [5355620760922603938, 18338060556365949877, 15183812203619476103] }], beta: Fp3 { c: [12830000447955503375, 14424011152369936069, 17272453353077252362] } }] answers=[Fp3 { c: [4852050361658459373, 14671040519985345750, 807652831946418578] }, Fp3 { c: [1211680574892807528, 10787265860895837660, 5208501738870321495] }, Fp3 { c: [16018054857541740004, 6903491201806329570, 9609350645794224412] }] root=Digest([116, 103, 250, 222, 105, 130, 169, 46, 220, 89, 0, 192, 143, 15, 45, 212, 50, 91, 176, 198, 93, 255, 87, 123, 62, 231, 163, 132, 66, 125, 229, 78]) sum=Fp3 { c: [6920283429447377251, 17809523116397550467, 2483515671979276613] } x=Fp3 { c: [14280002280861239336, 18046767938536086875, 6823183131953967170] } eps=Fp3 { c: [717177151104958925, 2739090653223031486, 11765671224129447086] } target=Fp3 { c: [17372188479993875748, 18320622313472264981, 15353606433726305722] } auxiliary=Fp3 { c: [17372188479993875748, 18320622313472264981, 15353606433726305722] }
+test the_fixture_bat_row_enters_fold_natively ... ok
+rejected base lambda=Fp3 { c: [4181077404533880468, 16786332104266696149, 3456930394359919983] } target_star=Fp3 { c: [17652280374797064835, 8161331915830456396, 7358458655439356460] } positions=[7, 3] layer=TargetLinear
+base fold_identity=Digest([47, 12, 214, 2, 78, 111, 210, 105, 211, 200, 12, 19, 94, 41, 8, 246, 79, 146, 153, 213, 252, 142, 111, 40, 167, 198, 199, 249, 211, 11, 63, 190]) star_roots=[Digest([183, 22, 26, 185, 75, 42, 107, 196, 130, 118, 180, 134, 1, 1, 158, 109, 0, 32, 71, 118, 226, 206, 56, 69, 151, 109, 1, 95, 219, 64, 33, 88]),Digest([133, 118, 133, 28, 152, 128, 46, 137, 152, 118, 121, 154, 218, 103, 227, 106, 145, 157, 177, 97, 217, 30, 49, 192, 139, 101, 84, 164, 138, 162, 138, 96])] member_roots=[Digest([73, 148, 48, 191, 123, 93, 197, 220, 12, 168, 69, 73, 129, 124, 225, 247, 66, 255, 136, 160, 36, 145, 124, 222, 164, 213, 193, 57, 222, 203, 27, 155]), Digest([171, 154, 17, 99, 160, 149, 236, 180, 177, 71, 102, 52, 212, 153, 39, 15, 105, 119, 223, 217, 170, 153, 96, 198, 128, 201, 140, 123, 114, 32, 49, 135]), Digest([207, 216, 149, 185, 154, 149, 148, 241, 52, 47, 201, 215, 43, 65, 29, 41, 214, 116, 165, 75, 70, 74, 208, 8, 5, 26, 218, 6, 201, 12, 196, 78])] fresh_root=Digest([43, 148, 193, 1, 142, 231, 251, 35, 181, 168, 227, 41, 197, 149, 86, 63, 16, 248, 84, 253, 171, 4, 52, 80, 152, 180, 255, 187, 37, 87, 205, 2]) lambda=Fp3 { c: [430870282149263012, 11647216507932674768, 15081478647295954624] } target_star=Fp3 { c: [16868277434214652845, 13470965661350279654, 12186704821915069562] } positions=[9, 3]
+rejected upstream answer lambda=Fp3 { c: [14110942288656323744, 17286076374538583336, 12881489594459434530] } target_star=Fp3 { c: [7005279915648414391, 11225751876979421554, 348300791375232952] } positions=[12, 8] layer=TargetLinear path=wrong SEND answer -> BAT target -> FOLD output -> BASE
+test a_fixed_base_target_shift_is_rejected_at_the_target_layer ... ok
+test the_fixture_base_final_wiring_passes_but_stays_pending ... ok
+test a_wrong_upstream_answer_is_rejected_at_base ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
