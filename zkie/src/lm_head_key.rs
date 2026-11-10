@@ -1307,14 +1307,13 @@ pub fn build_lm_head_holder(
     plan: &RequestPlan,
     configuration: Digest,
     key_randomness: &LmHeadKeyRandomness,
-    gu_randomness: LmHeadGuRandomness,
     store: &mut dyn EncodedRowStore,
     panel_columns: u64,
     max_bytes: u64,
     cap_bytes: u64,
     window_bytes: u64,
     total_bytes: u64,
-) -> Result<HolderSharedSource<LmHeadAssetSource>> {
+) -> Result<StreamingHolder<LmHeadAssetSource>> {
     let shape = plan.table_shape()?;
     let mut source = LmHeadAssetSource::open(
         context,
@@ -1334,8 +1333,7 @@ pub fn build_lm_head_holder(
         panel_columns,
         max_bytes,
     )?;
-    let holder = StreamingHolder::new(table, source, LM_HEAD_COLUMN_DRAWS as u64)?;
-    Ok(HolderSharedSource::new(holder, gu_randomness))
+    StreamingHolder::new(table, source, LM_HEAD_COLUMN_DRAWS as u64)
 }
 
 /// One committed table as the ops layer sees it: the caller starts a proof
@@ -4509,6 +4507,293 @@ mod tests {
         assert_eq!(rows.target, claims.combined.target);
         assert_eq!(rows.main.len(), code.ell as usize);
         assert_eq!(rows.masks.len(), 1);
+    }
+
+    fn random_bytes(count: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; count];
+        getrandom::fill(&mut bytes).expect("entropy");
+        bytes
+    }
+
+    fn random_digest() -> Digest {
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes).expect("entropy");
+        Digest(bytes)
+    }
+
+    fn random_fp() -> Fp {
+        loop {
+            let mut bytes = [0u8; 8];
+            getrandom::fill(&mut bytes).expect("entropy");
+            let word = u64::from_le_bytes(bytes);
+            if word < zkie_engine::pcs::request::field::MODULUS {
+                return Fp::from_u64(word);
+            }
+        }
+    }
+
+    fn random_fp3() -> Fp3 {
+        Fp3::new(random_fp(), random_fp(), random_fp())
+    }
+
+    fn vm_hwm_kb() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmHWM:") {
+                if let Some(value) = rest.split_whitespace().next() {
+                    return value.parse().unwrap_or(0);
+                }
+            }
+        }
+        0
+    }
+
+    fn random_fps(count: usize) -> Vec<Fp> {
+        let mut bytes = vec![0u8; count * 8];
+        getrandom::fill(&mut bytes).expect("entropy");
+        let mut out = Vec::with_capacity(count);
+        for chunk in bytes.chunks_exact(8) {
+            let word = u64::from_le_bytes(chunk.try_into().expect("word"));
+            out.push(if word < zkie_engine::pcs::request::field::MODULUS {
+                Fp::from_u64(word)
+            } else {
+                random_fp()
+            });
+        }
+        out
+    }
+
+    #[test]
+    #[ignore]
+    fn real_gpt2_lm_head_chain() {
+        use std::path::Path;
+        use std::time::Instant;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repository root");
+        let case = root.join("models/gpt2/case.toml");
+        let policy_path = root.join("models/gpt2/case.policy");
+        let public = root.join(
+            "docs/benchmarks/20261110-0547-verify-bytes-109934bd-670a98c9/prod/gpt2-seq16/commit/public",
+        );
+        let statement_path = root.join(
+            "docs/benchmarks/20261110-0547-verify-bytes-109934bd-670a98c9/prod/gpt2-seq16/proof/statement.bin",
+        );
+        let statement_bytes = std::fs::read(&statement_path).expect("statement");
+        let statement_data: crate::provider::StatementData =
+            bincode::deserialize(&statement_bytes).expect("statement data");
+        let context = crate::s7_context::load_gpt2_lm_head_context(
+            &case,
+            &policy_path,
+            &public,
+            &statement_path,
+            statement_data.model_commitment,
+        )
+        .expect("context");
+        let request_plan = zkie_models_gpt2::lm_head_plan::lm_head_plan().expect("plan");
+        let compiled = zkie_models_gpt2::lm_head_plan::lm_head_compiled().expect("compiled");
+        request_plan.validate().expect("plan validate");
+        request_plan
+            .validate_compiled(&compiled)
+            .expect("compiled validate");
+        let parameters = limited_key_binding_parameters(&request_plan, context.plan_identifier)
+            .expect("parameters");
+        let configuration = parameters.digest().expect("configuration");
+        let shape = request_plan.table_shape().expect("shape");
+        let rows = shape.rows() as usize;
+        let n = shape.code.n() as usize;
+        let tail_len = shape.code.r as usize;
+        let answers = shape.answers as usize;
+        let pads_len = E_DEGREE * answers;
+        let flat_tails = random_fps(rows.saturating_mul(tail_len));
+        let tails = (0..rows)
+            .map(|row| flat_tails[row * tail_len..(row + 1) * tail_len].to_vec())
+            .collect();
+        let salts = (0..n)
+            .map(|_| random_bytes(shape.salt_bytes))
+            .collect();
+        let flat_pads = random_fps(rows.saturating_mul(pads_len));
+        let pads = (0..rows)
+            .map(|row| flat_pads[row * pads_len..(row + 1) * pads_len].to_vec())
+            .collect();
+        let key_randomness = LmHeadKeyRandomness {
+            tails,
+            salts,
+            pads,
+        };
+        let private_dir = std::env::temp_dir().join("zkie-real-lm-head");
+        std::fs::create_dir_all(&private_dir).expect("private dir");
+        let session_seed = random_digest();
+        let max_temp = 4u64 << 30;
+        let mut store = zkie_engine::storage::encoded_store::FileRowStore::new(
+            &private_dir,
+            session_seed,
+            shape.rows(),
+            shape.code.n(),
+            configuration,
+            max_temp,
+        )
+        .expect("store");
+        let cap_bytes = 1_700_000_000u64;
+        let max_commit_bytes = 2u64 << 30;
+        let commit_start = Instant::now();
+        let holder = build_lm_head_holder(
+            &context,
+            &request_plan,
+            configuration,
+            &key_randomness,
+            &mut store,
+            4096,
+            max_commit_bytes,
+            cap_bytes,
+            1 << 20,
+            1 << 30,
+        )
+        .expect("holder");
+        let commit_wall = commit_start.elapsed();
+        let commit_hwm = vm_hwm_kb();
+        let store_written = store.bytes_written();
+        let store_read = store.bytes_read();
+        let store_len = store.file_len().expect("file len");
+        store.cleanup().expect("cleanup after commit");
+        let masked = LimitedKeyStatement {
+            version: LIMITED_KEY_VERSION,
+            model_commitment: context.model_id,
+            table_root: holder.reader().root,
+            table_configuration: holder.reader().configuration,
+            table_shape: shape,
+            matrix_rows: 1 << request_plan.table.v,
+            k_lo: request_plan.lin.k_lo,
+            k_col: request_plan.lin.k_col,
+            valid_min: i32::MIN as i64,
+            valid_max: i32::MAX as i64,
+            no_wf: true,
+            trusted_i32_mapping: true,
+        };
+        masked.validate().expect("statement");
+        let fold_mask_columns = 1u64 << compiled.once.folded.mask.log_n;
+        let mask_randomness = LmHeadMaskRandomness {
+            seed: random_digest(),
+            salts: (0..fold_mask_columns)
+                .map(|_| random_bytes(request_plan.salt_bytes))
+                .collect(),
+        };
+        let random_digest_bytes = random_digest();
+        let session = build_limited_shared_session_for_context(
+            &context,
+            &request_plan,
+            &compiled,
+            &masked,
+            holder.reader(),
+            random_digest_bytes,
+            &mask_randomness,
+        )
+        .expect("session");
+        let gu_shape = session
+            .plan
+            .gu
+            .as_ref()
+            .expect("gu shape")
+            .clone();
+        let main_rows = gu_shape.u.main_rows as usize;
+        let gu_tail_len = gu_shape.u.code.r as usize;
+        let gu_randomness = LmHeadGuRandomness {
+            code_tails: (0..main_rows)
+                .map(|_| (0..gu_tail_len).map(|_| random_fp3()).collect())
+                .collect(),
+            salts: (0..gu_shape.tree.columns())
+                .map(|_| random_bytes(gu_shape.tree.salt_bytes))
+                .collect(),
+            pads: (0..gu_sample_pad_offsets(&gu_shape)
+                .expect("gu pads")
+                .0
+                .len())
+                .map(|_| random_fp3())
+                .collect(),
+        };
+        let omega_shape = session
+            .plan
+            .omega
+            .as_ref()
+            .expect("omega")
+            .clone();
+        let omega_randomness = LmHeadOmegaRandomness {
+            code_tails: vec![
+                (0..omega_shape.u.code.r as usize)
+                    .map(|_| random_fp3())
+                    .collect(),
+            ],
+            salts: (0..omega_shape.tree.columns())
+                .map(|_| random_bytes(omega_shape.tree.salt_bytes))
+                .collect(),
+            pad: random_fp3(),
+        };
+        let fold = session.plan.fold;
+        let old_mask_tree = MaskTreePlan {
+            tree_number: 0x600,
+            leaf_class: compiled.once_foldeq.shared_split_leaf_class,
+            log_n: fold.mask_code.log_n,
+            mask_rows: fold.mask_rows().expect("mask rows"),
+            salt_bytes: request_plan.salt_bytes,
+            run: session.base.plan.run,
+            configuration,
+        };
+        if let Some(fault) = old_mask_tree.fault() {
+            panic!("old mask tree: {fault}");
+        }
+        let old_rows_count = old_mask_tree.mask_rows as usize;
+        let old_mask_randomness = LmHeadOldMaskRandomness {
+            rows: (0..old_rows_count)
+                .map(|_| (0..fold.mask_code.ell as usize).map(|_| random_fp3()).collect())
+                .collect(),
+            tails: (0..old_rows_count)
+                .map(|_| (0..fold.mask_code.r as usize).map(|_| random_fp3()).collect())
+                .collect(),
+            salts: (0..old_mask_tree.columns())
+                .map(|_| random_bytes(old_mask_tree.salt_bytes))
+                .collect(),
+        };
+        let old_mask = commit_lm_head_old_mask(&fold, old_mask_tree, &old_mask_randomness)
+            .expect("old mask");
+        let master = random_digest();
+        let switches = plan_stage_chain(
+            &compiled,
+            request_plan.samples as u32,
+            configuration,
+            session.base.plan.run,
+            master,
+            &session.base,
+        )
+        .expect("stage chain");
+        let mut source = HolderSharedSource::new(holder, gu_randomness);
+        let prove_start = Instant::now();
+        let result = run_limited_shared_to_columns(
+            session,
+            &mut source,
+            Some(&omega_randomness),
+            Some(&old_mask),
+            switches,
+        )
+        .expect("real chain");
+        let prove_wall = prove_start.elapsed();
+        let prove_hwm = vm_hwm_kb();
+        let sealed = result.sealed.expect("sealed");
+        let proof = result.base_proof.expect("base proof");
+        eprintln!(
+            "real lm head: commit {:?} prove {:?} hwm_commit_kb {} hwm_prove_kb {} store_written {} store_read {} store_len {} base_proof {} sealed {:?}",
+            commit_wall,
+            prove_wall,
+            commit_hwm,
+            prove_hwm,
+            store_written,
+            store_read,
+            store_len,
+            proof.len(),
+            sealed
+        );
+        assert_ne!(sealed, Digest::ZERO);
+        assert!(!proof.is_empty());
+        store.cleanup().expect("cleanup");
     }
 
     #[test]

@@ -682,6 +682,7 @@ name = "zkie"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "getrandom",
  "serde",
  "serde_json",
  "toml",

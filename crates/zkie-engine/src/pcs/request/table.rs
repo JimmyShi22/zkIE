@@ -502,9 +502,17 @@ impl StreamingTable {
         let tail_len = usize::try_from(shape.code.r).map_err(|_| Error::ResourceLimit)?;
         let mut message = vec![Fp::ZERO; ell];
         let mut tail = vec![Fp::ZERO; tail_len];
+        let mut symbols = vec![Fp::ZERO; positions.len() * rows];
+        for row in 0..rows {
+            source.row(row as u64, &mut message, &mut tail)?;
+            let codeword = encode_row_fp(&shape.code, &message, &tail)?;
+            for (index, position) in positions.iter().enumerate() {
+                symbols[index * rows + row] = codeword[*position as usize];
+            }
+        }
         let mut openings = Vec::with_capacity(positions.len());
         let mut previous = None;
-        for position in positions {
+        for (index, position) in positions.iter().enumerate() {
             if *position >= n {
                 return Err(Error::InvalidIndex);
             }
@@ -514,16 +522,10 @@ impl StreamingTable {
                 }
             }
             previous = Some(*position);
-            let mut symbols = Vec::with_capacity(rows);
-            for row in 0..rows {
-                source.row(row as u64, &mut message, &mut tail)?;
-                let codeword = encode_row_fp(&shape.code, &message, &tail)?;
-                symbols.push(codeword[*position as usize]);
-            }
             openings.push(ColumnOpening {
                 position: *position,
                 salt: self.salts[*position as usize].clone(),
-                symbols,
+                symbols: symbols[index * rows..(index + 1) * rows].to_vec(),
                 path: self.tree.open(*position as usize)?,
             });
         }
