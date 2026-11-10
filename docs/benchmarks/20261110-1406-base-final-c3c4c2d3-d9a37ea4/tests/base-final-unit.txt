@@ -1,0 +1,71 @@
+warning: unused variable: `prover`
+    --> crates/zkie-ops/src/proof/base_final_session.rs:1113:14
+     |
+1113 |         let (prover, mut session, messages) = setup(b"base identity", Fp3::ZERO);
+     |              ^^^^^^ help: if this is intentional, prefix it with an underscore: `_prover`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-ops` (lib test) generated 1 warning (run `cargo fix --lib -p zkie-ops --tests` to apply 1 suggestion)
+warning: unused variable: `oracle`
+   --> crates/zkie-ops/tests/relation_openings.rs:252:10
+    |
+252 |     let (oracle, openings) =
+    |          ^^^^^^ help: if this is intentional, prefix it with an underscore: `_oracle`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-ops` (test "relation_openings") generated 1 warning (run `cargo fix --test "relation_openings" -p zkie-ops` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/zkie_ops-a527cf57462e281a)
+
+running 5 tests
+test proof::base_final_session::tests::missing_preconditions_fail_closed ... ok
+test proof::base_final_session::tests::a_fixed_target_shift_is_rejected_at_the_target_layer ... ok
+test proof::base_final_session::tests::a_changed_encoding_tail_fails_the_symbol_layer ... ok
+test proof::base_final_session::tests::the_local_base_wiring_passes_but_stays_pending ... ok
+test proof::base_final_session::tests::changed_openings_and_swapped_bindings_are_rejected ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 86 filtered out; finished in 0.00s
+
+     Running tests/anchor_check.rs (target/debug/deps/anchor_check-f866da9ffaf2947d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/plan_check.rs (target/debug/deps/plan_check-73121b6baf6dc017)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/relation_openings.rs (target/debug/deps/relation_openings-16cec0e7ab489a11)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s
+
+	Command being timed: "cargo test -p zkie-ops base_final_session"
+	User time (seconds): 0.02
+	System time (seconds): 0.01
+	Percent of CPU this job got: 110%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.04
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 29476
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 7
+	Minor (reclaiming a frame) page faults: 5233
+	Voluntary context switches: 141
+	Involuntary context switches: 2
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 8
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
