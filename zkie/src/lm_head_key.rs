@@ -11,9 +11,10 @@
 use std::sync::{Arc, Mutex};
 
 use zkie_core::common::field::PrimeCharacteristicRing;
+use zkie_core::compute::{MemoryGovernor, MemoryRequest};
 use zkie_core::error::{Error, Result};
 use zkie_core::proof_header::PROOF_VERSION_WORD;
-use zkie_core::types::Digest;
+use zkie_core::types::{Digest, DType, TensorSpec};
 use zkie_engine::pcs::request::bat::{
     combine, group_index, BatOracleShape, BatPart, BatRow, BatRowKind, BatStatement,
 };
@@ -47,10 +48,12 @@ use zkie_engine::pcs::request::runtime_tree::{
     MaskTree, MaskTreePlan, RuntimePartRows, RuntimeTree, RuntimeTreeOpening, RuntimeTreePart,
     RuntimeTreePlan,
 };
+use zkie_engine::storage::mmap::BoundedAssetReader;
 use zkie_engine::pcs::request::table::{
     commit_table, verify_columns, ColumnOpening, CommittedTable, IndexReader, IndexShape,
     SampleSeed, StreamingHolder, TableRowSource,
 };
+use zkie_engine::memory::BudgetedMemoryGovernor;
 use zkie_engine::primitives::transcript::run_value;
 use zkie_engine::pcs::request::proximity::SingleRows;
 use zkie_ops::proof::base_final_session::{fold_identity, FoldBasis, FoldMember};
@@ -1252,6 +1255,213 @@ pub struct LimitedSharedColumns {
 /// answers the seeds, and opens the verifier's drawn table columns. The FOLD
 /// group still needs its second member (Omega), so no FOLD round is entered
 /// here.
+/// The read-only weight asset as a bounded table row source. For one table
+/// row it reads, for every matrix row, the factor entries that row owns at
+/// that table row's column segment; the complete weight matrix is never read
+/// into one buffer. The asset stays mapped read-only and every copy is charged
+/// to the reader's window budget.
+pub struct LmHeadAssetSource {
+    reader: BoundedAssetReader,
+    shape: IndexShape,
+    matrix_rows: u64,
+    factor: u64,
+    row_width: u64,
+    plain: u64,
+    pads: Vec<Vec<Fp>>,
+    tails: Vec<Vec<Fp>>,
+    buffer: Vec<u8>,
+}
+
+impl LmHeadAssetSource {
+    #[allow(clippy::too_many_arguments)]
+    pub fn open(
+        context: &LmHeadContext,
+        plan: &RequestPlan,
+        configuration: Digest,
+        randomness: &LmHeadKeyRandomness,
+        cap_bytes: u64,
+        window_bytes: u64,
+        total_bytes: u64,
+    ) -> Result<Self> {
+        plan.validate()?;
+        if configuration == Digest::ZERO || cap_bytes == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        let shape = plan.table_shape()?;
+        let factor = 1u64
+            .checked_shl(plan.lin.k_lo)
+            .ok_or(Error::InvalidConfig)?;
+        let matrix_rows = 1u64
+            .checked_shl(plan.lin.matrix_rows_log)
+            .ok_or(Error::InvalidConfig)?;
+        let columns = 1u64
+            .checked_shl(plan.lin.k_col)
+            .ok_or(Error::InvalidConfig)?;
+        if context.asset.rows != shape.rows()
+            || context.asset.row_width < columns
+            || context.asset.element_count != context.asset.rows.saturating_mul(context.asset.row_width)
+            || matrix_rows != shape.rows()
+            || factor
+                .checked_mul(matrix_rows)
+                .ok_or(Error::InvalidConfig)?
+                != columns
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        let ell = usize::try_from(shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+        let tail = usize::try_from(shape.code.r).map_err(|_| Error::ResourceLimit)?;
+        let plain = shape.plain();
+        if randomness.pads.len() != shape.rows() as usize
+            || randomness.tails.len() != shape.rows() as usize
+            || randomness
+                .pads
+                .iter()
+                .any(|row| row.len() != E_DEGREE * shape.answers as usize)
+            || randomness
+                .tails
+                .iter()
+                .any(|row| row.len() != tail)
+            || randomness.salts.len() != shape.code.n() as usize
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        let bytes = context
+            .asset
+            .element_count
+            .checked_mul(4)
+            .ok_or(Error::ResourceLimit)?;
+        if bytes > cap_bytes {
+            return Err(Error::ResourceLimit);
+        }
+        let governor = BudgetedMemoryGovernor::new(cap_bytes);
+        let permit = governor.acquire(&MemoryRequest {
+            mapped_window_bytes: bytes,
+            ..MemoryRequest::default()
+        })?;
+        let reader = BoundedAssetReader::open(
+            context.asset_root.join(&context.asset.path),
+            TensorSpec::new(DType::I32, vec![context.asset.element_count]),
+            context.asset.start,
+            permit,
+            window_bytes,
+            total_bytes,
+        )?;
+        let buffer = vec![0u8; usize::try_from(factor).map_err(|_| Error::ResourceLimit)? * 4];
+        let _ = ell;
+        Ok(Self {
+            reader,
+            shape,
+            matrix_rows,
+            factor,
+            row_width: context.asset.row_width,
+            plain,
+            pads: randomness.pads.clone(),
+            tails: randomness.tails.clone(),
+            buffer,
+        })
+    }
+
+    pub fn reader(&self) -> &BoundedAssetReader {
+        &self.reader
+    }
+
+    pub fn shape(&self) -> IndexShape {
+        self.shape
+    }
+}
+
+impl TableRowSource for LmHeadAssetSource {
+    fn rows(&self) -> u64 {
+        self.shape.rows()
+    }
+
+    fn row(&mut self, row: u64, message: &mut [Fp], tail: &mut [Fp]) -> Result<()> {
+        let rows = self.shape.rows();
+        if row >= rows
+            || message.len() as u64 != self.shape.code.ell
+            || tail.len() as u64 != self.shape.code.r
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        let factor = usize::try_from(self.factor).map_err(|_| Error::ResourceLimit)?;
+        let table_row = row;
+        for matrix_row in 0..self.matrix_rows {
+            let start = matrix_row
+                .checked_mul(self.row_width)
+                .and_then(|value| {
+                    table_row
+                        .checked_mul(self.factor)
+                        .and_then(|offset| value.checked_add(offset))
+                })
+                .ok_or(Error::ResourceLimit)?;
+            self.reader
+                .read_range(start, factor, &mut self.buffer)?;
+            for low in 0..factor {
+                let value = i32::from_le_bytes(
+                    self.buffer[low * 4..low * 4 + 4]
+                        .try_into()
+                        .map_err(|_| Error::InvalidEncoding)?,
+                ) as i64;
+                let place = usize::try_from(
+                    matrix_row
+                        .checked_mul(self.factor)
+                        .and_then(|base| base.checked_add(low as u64))
+                        .ok_or(Error::ResourceLimit)?,
+                )
+                .map_err(|_| Error::ResourceLimit)?;
+                *message.get_mut(place).ok_or(Error::ShapeMismatch)? =
+                    fp_from_signed_word(value as u64);
+            }
+        }
+        let pads = self.pads.get(row as usize).ok_or(Error::ShapeMismatch)?;
+        for (offset, pad) in pads.iter().enumerate() {
+            let at = usize::try_from(self.plain).map_err(|_| Error::ResourceLimit)? + offset;
+            *message.get_mut(at).ok_or(Error::ShapeMismatch)? = *pad;
+        }
+        let tail_row = self.tails.get(row as usize).ok_or(Error::ShapeMismatch)?;
+        tail.copy_from_slice(tail_row);
+        Ok(())
+    }
+}
+
+/// Commits the real weight asset through the bounded holder and returns the
+/// ops-facing source. The table's root, record and openings come from the same
+/// identity, configuration and private tails as the key path.
+#[allow(clippy::too_many_arguments)]
+pub fn build_lm_head_holder(
+    context: &LmHeadContext,
+    plan: &RequestPlan,
+    configuration: Digest,
+    key_randomness: &LmHeadKeyRandomness,
+    gu_randomness: LmHeadGuRandomness,
+    panel_columns: u64,
+    max_bytes: u64,
+    cap_bytes: u64,
+    window_bytes: u64,
+    total_bytes: u64,
+) -> Result<HolderSharedSource<LmHeadAssetSource>> {
+    let shape = plan.table_shape()?;
+    let mut source = LmHeadAssetSource::open(
+        context,
+        plan,
+        configuration,
+        key_randomness,
+        cap_bytes,
+        window_bytes,
+        total_bytes,
+    )?;
+    let table = zkie_engine::pcs::request::table::commit_table_streaming(
+        &mut source,
+        shape,
+        configuration,
+        &key_randomness.salts,
+        panel_columns,
+        max_bytes,
+    )?;
+    let holder = StreamingHolder::new(table, source, LM_HEAD_COLUMN_DRAWS as u64)?;
+    Ok(HolderSharedSource::new(holder, gu_randomness))
+}
+
 /// One committed table as the ops layer sees it: the caller starts a proof
 /// with a column reservation, folds and opens through the holder, and never
 /// receives the complete weight matrix. The production implementation wraps
