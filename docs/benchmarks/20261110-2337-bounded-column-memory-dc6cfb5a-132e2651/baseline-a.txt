@@ -1,0 +1,237 @@
+warning: unused variable: `target`
+   --> crates/zkie-engine/src/pcs/request/relation.rs:816:5
+    |
+816 |     target: Fp3,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `columns_usize`
+   --> crates/zkie-engine/src/pcs/request/table.rs:891:13
+    |
+891 |         let columns_usize = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_columns_usize`
+
+warning: `zkie-engine` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-engine` to apply 2 suggestions)
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/base_last_session.rs:576:13
+    |
+576 |         let mut message = self.chain.message();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `plan` is never read
+   --> crates/zkie-ops/src/proof/cs_multi_session.rs:194:5
+    |
+188 | pub struct CsMultiSession {
+    |            -------------- field in this struct
+...
+194 |     plan: RuntimeTreePlan,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-ops` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-ops` to apply 1 suggestion)
+warning: unused variable: `m`
+   --> models/gemma3/src/executor.rs:277:5
+    |
+277 |     m: usize,
+    |     ^ help: if this is intentional, prefix it with an underscore: `_m`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_rot_step`
+   --> models/gemma3/src/executor.rs:390:21
+    |
+390 |         let (k_rot, k_rot_step) = rope(&mut builder, k, k_step, cos_prefix.clone(), sin_prefix.clone(), m)?;
+    |                     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_rot_step`
+
+warning: unused import: `zkie_engine::pcs::request::field::E_DEGREE`
+  --> models/gpt2/src/lm_head_plan.rs:11:5
+   |
+11 | use zkie_engine::pcs::request::field::E_DEGREE;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_step`
+   --> models/gpt2/src/executor.rs:346:21
+    |
+346 |             let (k, k_step) = {
+    |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_step`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-models-gemma3` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gemma3` to apply 2 suggestions)
+warning: `zkie-models-gpt2` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gpt2` to apply 2 suggestions)
+warning: unused imports: `VecTableSource` and `commit_table_streaming`
+  --> zkie/src/lm_head_key.rs:53:5
+   |
+53 |     commit_table_streaming, verify_columns, ColumnOpening, IndexReader, IndexShape, SampleSeed,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+54 |     EncodedRowStore, StreamingHolder, TableRowSource, VecTableSource,
+   |                                                       ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `zkie_core::common::field::PrimeCharacteristicRing`
+  --> zkie/src/lm_head_key.rs:13:5
+   |
+13 | use zkie_core::common::field::PrimeCharacteristicRing;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+    --> zkie/src/lm_head_key.rs:2377:9
+     |
+2377 |     let mut mask_tail = vec![Fp3::ZERO; mask_tail_len];
+     |         ----^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `mask_tail`
+    --> zkie/src/lm_head_key.rs:2377:9
+     |
+2377 |     let mut mask_tail = vec![Fp3::ZERO; mask_tail_len];
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mask_tail`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `tree` is never read
+   --> zkie/src/lm_head_key.rs:925:5
+    |
+921 | pub struct LmHeadOmegaProvider {
+    |            ------------------- field in this struct
+...
+925 |     tree: RuntimeTreePlan,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie` (lib) generated 5 warnings (run `cargo fix --lib -p zkie` to apply 3 suggestions)
+warning: `zkie` (lib test) generated 3 warnings (3 duplicates)
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running unittests src/lib.rs (/tmp/zkie-a-target/release/deps/zkie-c7b8d42a057b8bea)
+
+running 1 test
+MEM fold hwm_kb 677876 rss_kb 614188 anon_kb 348416 file_kb 263832 shmem_kb 1940
+MEM record hwm_kb 677876 rss_kb 618220 anon_kb 352448 file_kb 263832 shmem_kb 1940
+MEM queries hwm_kb 677876 rss_kb 618220 anon_kb 352448 file_kb 263832 shmem_kb 1940
+MEM columns hwm_kb 1874164 rss_kb 1874164 anon_kb 1608392 file_kb 263832 shmem_kb 1940
+MEM omega hwm_kb 1883400 rss_kb 1883400 anon_kb 1617628 file_kb 263832 shmem_kb 1940
+MEM fold-stage hwm_kb 5603824 rss_kb 5603824 anon_kb 5338052 file_kb 263832 shmem_kb 1940
+MEM switch hwm_kb 5603828 rss_kb 5603828 anon_kb 5338056 file_kb 263832 shmem_kb 1940
+MEM switch hwm_kb 5603828 rss_kb 5603828 anon_kb 5338056 file_kb 263832 shmem_kb 1940
+MEM switch hwm_kb 5603828 rss_kb 5603828 anon_kb 5338056 file_kb 263832 shmem_kb 1940
+MEM base hwm_kb 5603828 rss_kb 5603828 anon_kb 5338056 file_kb 263832 shmem_kb 1940
+real lm head: commit 29.416286749s prove 10.449607638s hwm_commit_kb 525968 hwm_prove_kb 5603208 store_written 1073741824 store_read 2147483648 store_len 1073774656 base_proof 62968 sealed Digest([34, 187, 14, 254, 80, 88, 96, 179, 165, 144, 92, 3, 69, 68, 141, 137, 240, 74, 98, 149, 231, 228, 191, 59, 26, 116, 217, 3, 223, 182, 177, 38])
+test lm_head_key::tests::real_gpt2_lm_head_chain ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 45 filtered out; finished in 40.46s
+
+     Running unittests src/main.rs (/tmp/zkie-a-target/release/deps/zkie-302697a3160ba722)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/bat_fold_session.rs (/tmp/zkie-a-target/release/deps/bat_fold_session-72ea5d4538598813)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/cli_contract.rs (/tmp/zkie-a-target/release/deps/cli_contract-977e58c54ad3de62)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/column_session.rs (/tmp/zkie-a-target/release/deps/column_session-479049313eae5fdf)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/edge_session.rs (/tmp/zkie-a-target/release/deps/edge_session-18b9db9ea5af794e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/group_row_session.rs (/tmp/zkie-a-target/release/deps/group_row_session-20ec0ffad4c7b11a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/gu_combine_session.rs (/tmp/zkie-a-target/release/deps/gu_combine_session-b4c2a2c6648ec500)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/lin_session.rs (/tmp/zkie-a-target/release/deps/lin_session-57244f2b8a6ff03d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/proof_header.rs (/tmp/zkie-a-target/release/deps/proof_header-e3e496d5e6d4df66)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/proximity_session.rs (/tmp/zkie-a-target/release/deps/proximity_session-9ccd9adf03d95aff)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/run_policy.rs (/tmp/zkie-a-target/release/deps/run_policy-7121e05e89e7efc4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/s7_context.rs (/tmp/zkie-a-target/release/deps/s7_context-6c8691b2782698b9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/send_session.rs (/tmp/zkie-a-target/release/deps/send_session-dcc262168c840cc8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/session_baseline.rs (/tmp/zkie-a-target/release/deps/session_baseline-9fbe953a5d320d14)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/stage_cli.rs (/tmp/zkie-a-target/release/deps/stage_cli-7356520b753f49ba)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/verify_bytes.rs (/tmp/zkie-a-target/release/deps/verify_bytes-6d8b4d6d98af2fc7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/verify_policy.rs (/tmp/zkie-a-target/release/deps/verify_policy-4712e2a9135c4298)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
