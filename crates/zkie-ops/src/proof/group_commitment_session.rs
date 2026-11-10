@@ -502,6 +502,16 @@ impl CommittedGroupMember {
         &self.mask_messages
     }
 
+    /// The committed main encoding tails, one row per main message row.
+    pub fn main_tails(&self) -> &[Vec<Fp3>] {
+        &self.main_tails
+    }
+
+    /// The committed mask encoding tails, one row per mask message row.
+    pub fn mask_tails(&self) -> &[Vec<Fp3>] {
+        &self.mask_tails
+    }
+
     pub fn pad_slots(&self) -> &[(bool, usize, usize, Fp3)] {
         &self.pads
     }

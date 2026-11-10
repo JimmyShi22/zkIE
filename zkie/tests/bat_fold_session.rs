@@ -87,27 +87,35 @@ fn the_fixture_base_final_wiring_passes_but_stays_pending() {
     let fixture = BatFoldFixture::new(9).unwrap();
     let run = run_bat_fold_with_base(&fixture, chain(b"fixture base final")).unwrap();
     assert!(run.base.base_linear);
-    assert!(run.base.symbol_checks);
+    assert!(run.base.fold_main);
+    assert!(run.base.fold_mask);
+    assert!(run.base.fold_fresh);
     assert!(run.base.openings_verified);
+    assert!(run.base.member_openings_verified);
+    assert!(run.base.fresh_opening_verified);
     assert!(run.base.rejection.is_none());
     assert!(run.base.pending);
     assert!(!run.base.complete_base);
-    assert!(run.base.fresh_row_committed);
-    assert!(run.base.fresh_term_checked);
-    assert!(!run.base.fresh_term_authenticated_by_fold_root);
+    assert!(run.base.sampled_fold_relation_only);
+    assert!(!run.base.complete_fold_binding);
+    assert!(run.base.fresh_term_checked_against_fold_root);
+    assert!(run.base.conditional_local_experiment);
+    assert!(!run.base.cs_connected);
+    assert!(!run.base.reference_iopp_path);
     assert!(run.base.chain_handoff);
     assert_eq!(run.base.entry_rounds, run.fold_exit_rounds);
     assert_eq!(run.base.entry_value, run.fold_exit_value);
     assert!(run.base.commit_rounds > run.base.entry_rounds);
     assert!(run.base.rows_rounds > run.base.commit_rounds);
+    assert_eq!(run.base.check_rounds, run.base.rows_rounds);
+    assert_eq!(run.base.check_value, run.base.rows_value);
     assert_eq!(run.base.base_positions.len(), 2);
     println!(
-        "base fold_identity={:?} roots=[{:?},{:?},{:?},{:?},{:?}] lambda={:?} target_star={:?} positions={:?}",
+        "base fold_identity={:?} star_roots=[{:?},{:?}] member_roots={:?} fresh_root={:?} lambda={:?} target_star={:?} positions={:?}",
         run.base.fold_identity,
-        run.base.old_main_root,
-        run.base.old_mask_root,
         run.base.star_root,
         run.base.star_mask_root,
+        run.base.member_roots,
         run.base.fresh_root,
         run.base.lambda,
         run.base.target_star,

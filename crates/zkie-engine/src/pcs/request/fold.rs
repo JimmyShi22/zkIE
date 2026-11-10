@@ -191,6 +191,41 @@ fn checked_block(rows: u64) -> Option<u64> {
     1u64.checked_shl(bits)
 }
 
+/// Which row block of a fold layout a member's rows occupy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FoldPart {
+    Main,
+    Mask,
+}
+
+/// The first group row of every member's main or mask block, in layout order.
+/// The derivation is the layout's own aligned-block order, not a
+/// proof-supplied offset. `None` means the member has no block in that part
+/// (a kept main member is not placed in the main block). The result is an
+/// internal placement view; it does not authenticate the layout's source.
+pub fn fold_member_firsts(
+    layout: &FoldGroupLayout,
+    part: FoldPart,
+) -> Result<Vec<Option<u64>>> {
+    let mut cursor = 0u64;
+    let mut firsts = Vec::with_capacity(layout.members.len());
+    for member in &layout.members {
+        let rows = match part {
+            FoldPart::Main => member.main_rows,
+            FoldPart::Mask => member.mask_rows,
+        };
+        if (part == FoldPart::Main && member.kept) || rows == 0 {
+            firsts.push(None);
+            continue;
+        }
+        let block = checked_block(rows).ok_or(Error::ResourceLimit)?;
+        let start = aligned_start(cursor, block).ok_or(Error::ResourceLimit)?;
+        firsts.push(Some(start));
+        cursor = start.checked_add(rows).ok_or(Error::ResourceLimit)?;
+    }
+    Ok(firsts)
+}
+
 fn aligned_start(first: u64, block: u64) -> Option<u64> {
     if first == 0 {
         return Some(0);

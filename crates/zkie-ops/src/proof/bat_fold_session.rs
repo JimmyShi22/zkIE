@@ -84,14 +84,24 @@
 //! The BASE continuation runs on the same chain after `fold_finish`: the claim,
 //! target and FOLD identity are taken from the same FOLD output; the old main
 //! and old mask rows are the FOLD prover's end rows; the fresh row is the FOLD
-//! prover's folded fresh message, separately committed by the BASE fixture.
-//! The star rows are the BASE prover's own fixture rows. Five row commitments
-//! and target* are fixed before lambda; M'/R' and the fresh combined row are
-//! fixed before the position draw; the openings are authenticated; the
-//! extended linear check and the encoded-symbol checks are recorded. The BASE
-//! result stays pending: it is not a complete BASE, IOPP bound or valid
-//! FOLD-to-BASE handoff, and one equality at one lambda is not a general
-//! wrong-declaration rejection.
+//! prover's folded fresh message. The star rows are the BASE prover's own
+//! fixture rows; their two commitments and target* are fixed before lambda, and
+//! M'/R' and the fresh rows are fixed before the position draw. No extra
+//! commitment is created for the old or fresh rows. At the drawn positions the
+//! verifier opens every original member commitment and the FOLD fresh mask
+//! tree, folds the opened columns with the transcript's fold challenges, and
+//! compares them with the received rows: the combined main and mask rows equal
+//! the star openings plus lambda times the folded original columns, and the
+//! fresh row equals the folded fresh columns. The extended linear check and
+//! these folded-column checks are recorded. This is a conditional local
+//! experiment, not the reference standard IOPP path: the code-switch stage is
+//! not connected, so the reference path FOLD -> CS -> final SingleRows -> BASE
+//! is not completed and skipping CS is not claimed to be equivalent to it. The
+//! result stays pending: it is not a complete BASE, IOPP bound, complete
+//! proximity result, production pass or valid FOLD-to-BASE handoff. The
+//! folded-column relation is checked only at the drawn positions, so the fold
+//! binding is sampled, not complete, and one equality at one lambda is not a
+//! general wrong-declaration rejection.
 //!
 //! The single G_u witness from the SEND fixture is not applied to this group:
 //! each member has its own shape-checked fixture commitment and a per-member
@@ -100,11 +110,13 @@
 //! receipts, authenticated assets, fresh-mask openings and proximity, folded
 //! tails, a relation/proximity connection, random hiding, single-shot semantics,
 //! production and performance acceptance, a complete BASE/IOPP result, a
-//! deterministic wrong-declaration guarantee, and a trust anchor independent of
-//! the fixture expectation. The plan's reader and binding are a valid but inert
-//! scaffold required by the existing plan type; the FOLD-only entry never reads
-//! them and they are not a witness or an asset binding. `verify_request` is
-//! unchanged.
+//! complete (not sampled) fold binding, the CS stage, a reference-path
+//! equivalence claim, a deterministic wrong-declaration guarantee, and a trust
+//! anchor independent of the fixture expectation. A zero-fold degenerate input
+//! is not used to prove general conclusions. The plan's reader and binding are a
+//! valid but inert scaffold required by the existing plan type; the FOLD-only
+//! entry never reads them and they are not a witness or an asset binding.
+//! `verify_request` is unchanged.
 
 use std::sync::{Arc, Mutex};
 
@@ -121,17 +133,17 @@ use zkie_engine::pcs::request::chain::Chain;
 use zkie_engine::pcs::request::code::{build_code_plan, CodeParams};
 use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE, MODULUS};
 use zkie_engine::pcs::request::fold::{
-    fold_mask_make, fold_mask_make_tail, fold_mask_notice, fold_mask_sum, fold_start_prove,
-    validate_fold_mask_shape, FoldGroupLayout, FoldInputRow, FoldMask, FoldOutput,
-    FoldProverSession, FoldShape, FoldStartMessage, MaskCoins, MaskOracle, OracleMetadata,
-    RuntimeOracles, VerifiedGroup, VerifiedGroups, VerifiedStatement,
+    fold_member_firsts, fold_mask_make, fold_mask_make_tail, fold_mask_notice, fold_mask_sum,
+    fold_start_prove, validate_fold_mask_shape, FoldGroupLayout, FoldInputRow, FoldMask,
+    FoldOutput, FoldPart, FoldProverSession, FoldShape, FoldStartMessage, MaskCoins, MaskOracle,
+    OracleMetadata, RuntimeOracles, VerifiedGroup, VerifiedGroups, VerifiedStatement,
 };
 use zkie_engine::pcs::request::foldeq::{
     reader_table_identity, FoldeqBinding, FoldeqEdgeBinding, FoldeqPlan, FoldeqSession, GammaPath,
 };
 use zkie_engine::pcs::request::gu::{GuNotice, GuRegistry};
 use zkie_engine::pcs::request::params::{RequestParams, LEAF_SALT_MIN_BYTES};
-use zkie_engine::pcs::request::read::ReadLedger;
+use zkie_engine::pcs::request::read::{unique_sorted, ReadLedger};
 use zkie_engine::pcs::request::relation::{sample_row, GuRelationKind, GuRelationRow};
 use zkie_engine::pcs::request::runtime_tree::{MaskTree, MaskTreePlan, RuntimeTreeOpening};
 use zkie_engine::pcs::request::table::{
@@ -140,8 +152,8 @@ use zkie_engine::pcs::request::table::{
 use zkie_engine::primitives::transcript::{hash_labeled, tag_word, TEST_COINS};
 
 use crate::proof::base_final_session::{
-    fold_identity, BaseFinalCheck, BaseFinalOutcome, BaseFinalRejection, BaseFinalSession,
-    BaseProver,
+    fold_coefficients, fold_identity, BaseFinalCheck, BaseFinalOutcome, BaseFinalRejection,
+    BaseFinalSession, BaseOpenings, BaseProver, FoldBasis, FoldMember,
 };
 use crate::proof::fold_handoff::{FoldHandoff, FoldHandoffAnchor};
 use crate::proof::group_commitment_session::{
@@ -701,6 +713,30 @@ impl BatFoldFixture {
             .collect()
     }
 
+    /// The fresh mask tree's public plan.
+    pub fn fresh_plan(&self) -> MaskTreePlan {
+        self.tree_plan
+    }
+
+    /// Re-commits the stored fresh mask rows and tails and opens the given
+    /// positions. The root is checked against the started mask root by the
+    /// caller.
+    pub fn open_fresh(&self, positions: &[u64]) -> Result<RuntimeTreeOpening> {
+        MaskTree::commit(
+            self.tree_plan,
+            &self.shape,
+            &self.witness_rows,
+            &self.witness_tails,
+            &self.salts,
+        )?
+        .open(positions)
+    }
+
+    /// The committed fresh mask encoding tails, one row per fresh mask row.
+    pub fn fresh_tails(&self) -> &[Vec<Fp3>] {
+        &self.witness_tails
+    }
+
     /// Re-encodes every member message and tail and re-commits its tree. The
     /// caller compares the results with the member plans' roots.
     pub fn recompute_member_roots(&self) -> Result<Vec<Digest>> {
@@ -1041,6 +1077,8 @@ struct BatFoldCore {
     old_main: Vec<Fp3>,
     old_mask: Vec<Fp3>,
     old_fresh: Vec<Fp3>,
+    member_plans: Vec<GroupMemberPlan>,
+    group_roots: Vec<Digest>,
 }
 
 /// Runs the isolated fixture with the prover's plaintext sample answers as the
@@ -1092,7 +1130,7 @@ where
         return Err(Error::StatementMismatch);
     }
 
-    let mut group = GroupCommitmentSession::new(chain, member_plans)?;
+    let mut group = GroupCommitmentSession::new(chain, member_plans.clone())?;
     group.bind_roots(&fixture.group_root_message())?;
     group.draw_shared_seeds()?;
     let seeds = group.seeds().to_vec();
@@ -1224,7 +1262,7 @@ where
         shape: fixture.shape,
         layout: fixture.layout.clone(),
         bat_layout,
-        group_roots,
+        group_roots: group_roots.clone(),
         group_positions,
         group_rounds,
         group_value,
@@ -1292,6 +1330,8 @@ where
         old_main,
         old_mask,
         old_fresh,
+        member_plans,
+        group_roots,
     })
 }
 
@@ -1341,7 +1381,7 @@ pub fn run_bat_fold_with_base_and_target_shift(
     let core = run_bat_fold_core(fixture, chain, |_, _, true_answers| {
         Ok(true_answers.to_vec())
     })?;
-    run_base_from_core(core, target_shift)
+    run_base_from_core(fixture, core, target_shift)
 }
 
 /// Runs the same wiring with a caller-supplied SEND answer provider. This is
@@ -1357,45 +1397,40 @@ where
     F: FnOnce(&[(u32, u64)], &[SampleSeed], &[Fp3]) -> Result<Vec<Fp3>>,
 {
     let core = run_bat_fold_core(fixture, chain, provider)?;
-    run_base_from_core(core, Fp3::ZERO)
+    run_base_from_core(fixture, core, Fp3::ZERO)
 }
 
 fn run_base_from_core(
+    fixture: &BatFoldFixture,
     core: BatFoldCore,
     target_shift: Fp3,
 ) -> std::result::Result<BatFoldBaseOutcome, BaseFinalRunError> {
-    let fixture_tag = core.outcome.tag;
-    let code = core.outcome.shape.code;
-    let mask_code = core.outcome.shape.mask_code;
-    let fold_exit_rounds = core.fold.chain().rounds();
-    let fold_exit_value = *core.fold.transcript_value();
-    let base_chain = core.fold.take_chain_for_base()?;
+    let BatFoldCore {
+        outcome,
+        fold,
+        handoff,
+        old_main,
+        old_mask,
+        old_fresh,
+        member_plans,
+        group_roots,
+    } = core;
+    let code = outcome.shape.code;
+    let mask_code = outcome.shape.mask_code;
+    let fold_exit_rounds = fold.chain().rounds();
+    let fold_exit_value = *fold.transcript_value();
+    let base_chain = fold.take_chain_for_base()?;
     if base_chain.rounds() != fold_exit_rounds || *base_chain.value() != fold_exit_value {
         return Err(BaseFinalRunError::Stage(Error::StatementMismatch));
     }
-    let star = fixture_base_star(fixture_tag, code, mask_code);
-    let old_main_tail: Vec<Fp3> = (0..code.r)
-        .map(|index| Fp3::from_u64(0x9200 + fixture_tag * 0x10 + index))
-        .collect();
-    let old_mask_tail: Vec<Fp3> = (0..mask_code.r)
-        .map(|index| Fp3::from_u64(0x9300 + fixture_tag * 0x10 + index))
-        .collect();
-    let fresh_tail: Vec<Fp3> = (0..mask_code.r)
-        .map(|index| Fp3::from_u64(0x9700 + fixture_tag * 0x10 + index))
-        .collect();
-    let fresh_claim = core.handoff.fresh_claim.clone();
-    let rows = core.handoff.single_rows(
-        core.old_main,
-        old_main_tail,
-        core.old_mask,
-        old_mask_tail,
-    )?;
-    let identity = fold_identity(&core.handoff);
+    let star = fixture_base_star(outcome.tag, code, mask_code);
+    let (old_main_tail, old_mask_tail, fresh_tail) = folded_tails(fixture, &handoff)?;
+    let rows = handoff.single_rows(old_main, old_main_tail, old_mask, old_mask_tail)?;
+    let identity = fold_identity(&handoff);
     let prover = BaseProver::new(
         rows,
         identity,
-        fresh_claim,
-        core.old_fresh,
+        old_fresh,
         fresh_tail,
         star.0,
         star.1,
@@ -1403,12 +1438,26 @@ fn run_base_from_core(
         star.3,
         target_shift,
     )?;
-    let mut session = BaseFinalSession::new(base_chain, core.handoff, prover.expectation())?;
+    let basis = base_basis(fixture, &handoff, &member_plans, &group_roots)?;
+    let mut session = BaseFinalSession::new(base_chain, handoff, basis)?;
     session.receive_commitments(prover.messages()?)?;
     let lambda = session.draw_lambda()?;
     session.receive_base_rows(prover.base_rows(lambda)?)?;
     let positions = session.draw_base_positions(FIXTURE_BASE_POSITIONS)?;
-    let openings = prover.openings(&positions)?;
+    let unique = unique_sorted(&positions);
+    let member_openings = fixture.open_members(&vec![unique.clone(); member_plans.len()])?;
+    let mask_positions: Vec<u64> = positions
+        .iter()
+        .map(|position| *position % mask_code.n())
+        .collect();
+    let fresh_opening = fixture.open_fresh(&unique_sorted(&mask_positions))?;
+    let star_openings = prover.openings(&positions)?;
+    let openings = BaseOpenings {
+        star: star_openings.star,
+        star_mask: star_openings.star_mask,
+        members: member_openings,
+        fresh: fresh_opening,
+    };
     session.verify_openings(&openings)?;
     let base = match session.finish()? {
         BaseFinalCheck::Passed(base) => base,
@@ -1417,11 +1466,114 @@ fn run_base_from_core(
         }
     };
     Ok(BatFoldBaseOutcome {
-        fold: core.outcome,
+        fold: outcome,
         base,
         fold_exit_rounds,
         fold_exit_value,
     })
+}
+
+fn base_basis(
+    fixture: &BatFoldFixture,
+    handoff: &FoldHandoff,
+    member_plans: &[GroupMemberPlan],
+    roots: &[Digest],
+) -> Result<FoldBasis> {
+    if member_plans.len() != roots.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    let members = member_plans
+        .iter()
+        .zip(roots)
+        .map(|(plan, root)| FoldMember {
+            oracle: plan.oracle,
+            main_code: plan.main_code,
+            mask_code: plan.mask_code,
+            root: *root,
+            tree: plan.tree.clone(),
+        })
+        .collect();
+    Ok(FoldBasis {
+        layout: handoff.layout.clone(),
+        fresh_root: handoff.fresh_root,
+        fresh_tree: fixture.fresh_plan(),
+        members,
+    })
+}
+
+/// The encoding-tail rows of the folded output, derived by folding the
+/// committed member tails with the transcript's fold challenges. The result is
+/// the tail that the encoded folded row must have for the folded-column
+/// relation to hold.
+fn folded_tails(
+    fixture: &BatFoldFixture,
+    handoff: &FoldHandoff,
+) -> Result<(Vec<Fp3>, Vec<Fp3>, Vec<Fp3>)> {
+    let layout = &handoff.layout;
+    let main_coeff = fold_coefficients(handoff.k, &handoff.gamma)?;
+    let mask_gamma = &handoff.gamma[..handoff.h as usize];
+    let mask_coeff = fold_coefficients(handoff.h, mask_gamma)?;
+    let main_firsts = fold_member_firsts(layout, FoldPart::Main)?;
+    let mask_firsts = fold_member_firsts(layout, FoldPart::Mask)?;
+    let main_len = usize::try_from(handoff.code.r).map_err(|_| Error::ResourceLimit)?;
+    let mask_len = usize::try_from(handoff.mask_code.r).map_err(|_| Error::ResourceLimit)?;
+    let mut main_tail = vec![Fp3::ZERO; main_len];
+    let mut mask_tail = vec![Fp3::ZERO; mask_len];
+    if fixture.members.len() != layout.members.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    for (index, (member, layout_member)) in fixture.members.iter().zip(&layout.members).enumerate() {
+        let main_first = main_firsts[index].ok_or(Error::StatementMismatch)?;
+        for row in 0..usize::try_from(layout_member.main_rows).map_err(|_| Error::ResourceLimit)? {
+            let tail = member.main_tails().get(row).ok_or(Error::ShapeMismatch)?;
+            if tail.len() != main_len {
+                return Err(Error::ShapeMismatch);
+            }
+            let group = main_first
+                .checked_add(row as u64)
+                .ok_or(Error::ResourceLimit)?;
+            let coefficient = *main_coeff
+                .get(group as usize)
+                .ok_or(Error::InvalidIndex)?;
+            for (value, tail) in main_tail.iter_mut().zip(tail) {
+                *value = value.add(&coefficient.mul(tail));
+            }
+        }
+        let mask_first = mask_firsts[index].ok_or(Error::StatementMismatch)?;
+        for row in 0..usize::try_from(layout_member.mask_rows).map_err(|_| Error::ResourceLimit)? {
+            let tail = member.mask_tails().get(row).ok_or(Error::ShapeMismatch)?;
+            if tail.len() != mask_len {
+                return Err(Error::ShapeMismatch);
+            }
+            let group = mask_first
+                .checked_add(row as u64)
+                .ok_or(Error::ResourceLimit)?;
+            let coefficient = *mask_coeff
+                .get(group as usize)
+                .ok_or(Error::InvalidIndex)?;
+            for (value, tail) in mask_tail.iter_mut().zip(tail) {
+                *value = value.add(&coefficient.mul(tail));
+            }
+        }
+    }
+    let fresh_rows = 1usize
+        .checked_shl(handoff.h)
+        .ok_or(Error::ResourceLimit)?;
+    let fresh_tails = fixture.fresh_tails();
+    if fresh_tails.len() != fresh_rows {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut fresh_tail = vec![Fp3::ZERO; mask_len];
+    for (row, tail) in fresh_tails.iter().enumerate() {
+        if tail.len() != mask_len {
+            return Err(Error::ShapeMismatch);
+        }
+        let coefficient = *mask_coeff.get(row).ok_or(Error::InvalidIndex)?;
+        for (value, tail) in fresh_tail.iter_mut().zip(tail) {
+            *value = value.add(&coefficient.mul(tail));
+        }
+    }
+    Ok((main_tail, mask_tail, fresh_tail))
 }
 
 fn fixture_base_star(
@@ -1943,21 +2095,32 @@ mod tests {
         let fixture = BatFoldFixture::new(33).unwrap();
         let run = run_bat_fold_with_base(&fixture, chain(b"base final")).unwrap();
         assert!(run.base.base_linear);
-        assert!(run.base.symbol_checks);
+        assert!(run.base.fold_main);
+        assert!(run.base.fold_mask);
+        assert!(run.base.fold_fresh);
         assert!(run.base.openings_verified);
+        assert!(run.base.member_openings_verified);
+        assert!(run.base.fresh_opening_verified);
         assert!(run.base.rejection.is_none());
         assert!(run.base.pending);
         assert!(!run.base.complete_base);
-        assert!(run.base.fresh_row_committed);
-        assert!(run.base.fresh_term_checked);
-        assert!(!run.base.fresh_term_authenticated_by_fold_root);
+        assert!(run.base.sampled_fold_relation_only);
+        assert!(!run.base.complete_fold_binding);
+        assert!(run.base.fresh_term_checked_against_fold_root);
         assert!(run.base.projection_only);
+        assert!(run.base.conditional_local_experiment);
+        assert!(!run.base.cs_connected);
+        assert!(!run.base.reference_iopp_path);
         assert!(run.base.chain_handoff);
         assert_eq!(run.base.entry_rounds, run.fold_exit_rounds);
         assert_eq!(run.base.entry_value, run.fold_exit_value);
         assert!(run.base.commit_rounds > run.base.entry_rounds);
         assert!(run.base.rows_rounds > run.base.commit_rounds);
+        assert_eq!(run.base.check_rounds, run.base.rows_rounds);
+        assert_eq!(run.base.check_value, run.base.rows_value);
         assert_eq!(run.base.base_positions.len(), FIXTURE_BASE_POSITIONS);
+        assert_eq!(run.base.member_roots.len(), 3);
+        assert_eq!(run.base.fresh_root, run.fold.start.root);
         assert_eq!(run.base.fold_identity, fold_identity_of(&run.fold));
         assert_eq!(run.fold.output.next_stage() , Err(Error::InvalidSessionState));
     }
@@ -1985,6 +2148,246 @@ mod tests {
         };
         let handoff = FoldHandoff::from_output(&outcome.output, &anchor).unwrap();
         crate::proof::base_final_session::fold_identity(&handoff)
+    }
+
+    enum BaseTamper {
+        FoldGamma,
+        MainTail,
+        MaskTail,
+        FreshTail,
+        MemberOpening,
+        FreshOpening,
+        MemberRoot,
+        FreshRoot,
+        Layout,
+        Identity,
+        StarRoot,
+    }
+
+    fn dot(left: &[Fp3], right: &[Fp3]) -> Result<Fp3> {
+        if left.len() != right.len() {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut sum = Fp3::ZERO;
+        for (a, b) in left.iter().zip(right) {
+            sum = sum.add(&a.mul(b));
+        }
+        Ok(sum)
+    }
+
+    /// Runs the same BASE flow as the fixture entry with one fixed tamper.
+    /// Each tamper names the layer that must reject it; this is a local
+    /// negative sample, not a general wrong-declaration guarantee.
+    fn run_base_tampered(
+        fixture: &BatFoldFixture,
+        seed: &[u8],
+        tamper: BaseTamper,
+    ) -> std::result::Result<BatFoldBaseOutcome, BaseFinalRunError> {
+        let core = run_bat_fold_core(fixture, chain(seed), |_, _, answers| {
+            Ok(answers.to_vec())
+        })?;
+        let BatFoldCore {
+            outcome,
+            fold,
+            handoff,
+            old_main,
+            old_mask,
+            old_fresh,
+            member_plans,
+            group_roots,
+        } = core;
+        let code = outcome.shape.code;
+        let mask_code = outcome.shape.mask_code;
+        let fold_exit_rounds = fold.chain().rounds();
+        let fold_exit_value = *fold.transcript_value();
+        let base_chain = fold.take_chain_for_base()?;
+        if base_chain.rounds() != fold_exit_rounds || *base_chain.value() != fold_exit_value {
+            return Err(BaseFinalRunError::Stage(Error::StatementMismatch));
+        }
+        let star = fixture_base_star(outcome.tag, code, mask_code);
+        let (old_main_tail, old_mask_tail, fresh_tail) = folded_tails(fixture, &handoff)?;
+        let true_fresh_claim = handoff.fresh_claim.clone();
+        let mut handoff = handoff;
+        if matches!(tamper, BaseTamper::FoldGamma) {
+            handoff.gamma[0] = handoff.gamma[0].add(&Fp3::ONE);
+            handoff.fresh_claim = zkie_engine::pcs::request::fold::fold_mask_weights(
+                handoff.k,
+                handoff.h,
+                usize::try_from(mask_code.ell)
+                    .map_err(|_| BaseFinalRunError::Stage(Error::ResourceLimit))?,
+                &handoff.gamma,
+            )
+            .map_err(BaseFinalRunError::Stage)?;
+            let delta = dot(&handoff.fresh_claim, &old_fresh)?
+                .sub(&dot(&true_fresh_claim, &old_fresh)?);
+            handoff.target = handoff.target.add(&delta);
+        }
+        let rows = handoff.single_rows(old_main, old_main_tail, old_mask, old_mask_tail)?;
+        let identity = fold_identity(&handoff);
+        let prover = BaseProver::new(
+            rows,
+            identity,
+            old_fresh,
+            fresh_tail,
+            star.0,
+            star.1,
+            star.2,
+            star.3,
+            Fp3::ZERO,
+        )?;
+        let mut basis = base_basis(fixture, &handoff, &member_plans, &group_roots)?;
+        match tamper {
+            BaseTamper::MemberRoot => basis.members[0].root = Digest([0xEE; 32]),
+            BaseTamper::FreshRoot => basis.fresh_root = Digest([0xEE; 32]),
+            BaseTamper::Layout => basis.layout.k += 1,
+            _ => {}
+        }
+        let mut session = BaseFinalSession::new(base_chain, handoff, basis)?;
+        let mut messages = prover.messages()?;
+        match tamper {
+            BaseTamper::Identity => messages.fold_identity.0[0] ^= 1,
+            BaseTamper::StarRoot => messages.star.root.0[0] ^= 1,
+            _ => {}
+        }
+        session.receive_commitments(messages)?;
+        let lambda = session.draw_lambda()?;
+        let mut prepared = prover.base_rows(lambda)?;
+        match tamper {
+            BaseTamper::MainTail => {
+                prepared.base.main_tail_prime[0] =
+                    prepared.base.main_tail_prime[0].add(&Fp3::ONE)
+            }
+            BaseTamper::MaskTail => {
+                prepared.base.mask_tail_prime[0] =
+                    prepared.base.mask_tail_prime[0].add(&Fp3::ONE)
+            }
+            BaseTamper::FreshTail => {
+                prepared.fresh_tail[0] = prepared.fresh_tail[0].add(&Fp3::ONE)
+            }
+            _ => {}
+        }
+        session.receive_base_rows(prepared)?;
+        let positions = session.draw_base_positions(FIXTURE_BASE_POSITIONS)?;
+        let unique = unique_sorted(&positions);
+        let mut member_openings =
+            fixture.open_members(&vec![unique.clone(); member_plans.len()])?;
+        let mask_positions: Vec<u64> = positions
+            .iter()
+            .map(|position| *position % mask_code.n())
+            .collect();
+        let mut fresh_opening = fixture.open_fresh(&unique_sorted(&mask_positions))?;
+        match tamper {
+            BaseTamper::MemberOpening => {
+                member_openings[0].columns[0].symbols[0] =
+                    member_openings[0].columns[0].symbols[0] + Fp::from_u64(1)
+            }
+            BaseTamper::FreshOpening => {
+                fresh_opening.columns[0].symbols[0] =
+                    fresh_opening.columns[0].symbols[0] + Fp::from_u64(1)
+            }
+            _ => {}
+        }
+        let star_openings = prover.openings(&positions)?;
+        let openings = BaseOpenings {
+            star: star_openings.star,
+            star_mask: star_openings.star_mask,
+            members: member_openings,
+            fresh: fresh_opening,
+        };
+        session.verify_openings(&openings)?;
+        let base = match session.finish()? {
+            BaseFinalCheck::Passed(base) => base,
+            BaseFinalCheck::Rejected(rejection) => {
+                return Err(BaseFinalRunError::Rejected(rejection));
+            }
+        };
+        Ok(BatFoldBaseOutcome {
+            fold: outcome,
+            base,
+            fold_exit_rounds,
+            fold_exit_value,
+        })
+    }
+
+    fn rejection_layer(
+        result: std::result::Result<BatFoldBaseOutcome, BaseFinalRunError>,
+    ) -> BaseRejection {
+        match result {
+            Err(BaseFinalRunError::Rejected(rejection)) => rejection.layer,
+            Err(BaseFinalRunError::Stage(error)) => {
+                panic!("expected a typed rejection, got a stage error: {error:?}")
+            }
+            Ok(_) => panic!("expected a typed rejection, got a passing outcome"),
+        }
+    }
+
+    #[test]
+    fn replaced_folded_rows_are_rejected_at_the_named_layer() {
+        let fixture = BatFoldFixture::new(40).unwrap();
+        assert_eq!(
+            rejection_layer(run_base_tampered(
+                &fixture,
+                b"tamper main tail",
+                BaseTamper::MainTail
+            )),
+            BaseRejection::FoldMain
+        );
+        assert_eq!(
+            rejection_layer(run_base_tampered(
+                &fixture,
+                b"tamper mask tail",
+                BaseTamper::MaskTail
+            )),
+            BaseRejection::FoldMask
+        );
+        assert_eq!(
+            rejection_layer(run_base_tampered(
+                &fixture,
+                b"tamper fresh tail",
+                BaseTamper::FreshTail
+            )),
+            BaseRejection::FoldFresh
+        );
+        assert_eq!(
+            rejection_layer(run_base_tampered(
+                &fixture,
+                b"tamper fold challenge",
+                BaseTamper::FoldGamma
+            )),
+            BaseRejection::FoldMain
+        );
+    }
+
+    #[test]
+    fn replaced_identity_layout_and_commitments_fail_closed() {
+        let fixture = BatFoldFixture::new(41).unwrap();
+        for tamper in [
+            BaseTamper::Identity,
+            BaseTamper::StarRoot,
+            BaseTamper::MemberRoot,
+            BaseTamper::FreshRoot,
+            BaseTamper::Layout,
+            BaseTamper::MemberOpening,
+            BaseTamper::FreshOpening,
+        ] {
+            let label = match tamper {
+                BaseTamper::Identity => "identity",
+                BaseTamper::StarRoot => "star root",
+                BaseTamper::MemberRoot => "member root",
+                BaseTamper::FreshRoot => "fresh root",
+                BaseTamper::Layout => "layout",
+                BaseTamper::MemberOpening => "member opening",
+                BaseTamper::FreshOpening => "fresh opening",
+                _ => "unexpected",
+            };
+            assert!(
+                matches!(
+                    run_base_tampered(&fixture, label.as_bytes(), tamper),
+                    Err(BaseFinalRunError::Stage(_))
+                ),
+                "the replaced {label} was not rejected"
+            );
+        }
     }
 
     #[test]

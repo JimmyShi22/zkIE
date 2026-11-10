@@ -25,8 +25,8 @@ use crate::pcs::request::chain::{Chain, KIND_ALGEBRAIC};
 use crate::pcs::request::code::{build_code_plan, CodeParams};
 use crate::pcs::request::field::Fp3;
 use crate::pcs::request::fold::{
-    mask_fits, validate_fold_mask_shape, FoldGroupLayout, FoldInputRow, FoldKeptForm,
-    FoldMemberLayout, FoldShape,
+    fold_member_firsts, mask_fits, validate_fold_mask_shape, FoldGroupLayout, FoldInputRow,
+    FoldKeptForm, FoldMemberLayout, FoldPart, FoldShape,
 };
 
 /// The two tables of an oracle message.
@@ -802,34 +802,11 @@ fn fold_fixture_firsts(
     layout: &FoldGroupLayout,
     part: BatPart,
 ) -> Result<Vec<Option<u64>>> {
-    let mut cursor = 0u64;
-    let mut firsts = Vec::with_capacity(layout.members.len());
-    for member in &layout.members {
-        let rows = match part {
-            BatPart::Main => member.main_rows,
-            BatPart::Mask => member.mask_rows,
-        };
-        if (part == BatPart::Main && member.kept) || rows == 0 {
-            firsts.push(None);
-            continue;
-        }
-        let block = 1u64
-            .checked_shl(ceil_log2(rows))
-            .ok_or(Error::ResourceLimit)?;
-        let start = if cursor == 0 {
-            0
-        } else {
-            let rest = cursor % block;
-            if rest == 0 {
-                cursor
-            } else {
-                cursor.checked_add(block - rest).ok_or(Error::ResourceLimit)?
-            }
-        };
-        firsts.push(Some(start));
-        cursor = start.checked_add(rows).ok_or(Error::ResourceLimit)?;
-    }
-    Ok(firsts)
+    let part = match part {
+        BatPart::Main => FoldPart::Main,
+        BatPart::Mask => FoldPart::Mask,
+    };
+    fold_member_firsts(layout, part)
 }
 
 /// Require the BAT layout's actual first offsets to equal the FOLD fixture
