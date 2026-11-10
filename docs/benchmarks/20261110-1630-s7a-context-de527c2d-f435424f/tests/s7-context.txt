@@ -1,0 +1,35 @@
+warning: unused variable: `k_step`
+   --> models/gpt2/src/executor.rs:346:21
+    |
+346 |             let (k, k_step) = {
+    |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_step`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `m`
+   --> models/gemma3/src/executor.rs:277:5
+    |
+277 |     m: usize,
+    |     ^ help: if this is intentional, prefix it with an underscore: `_m`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_rot_step`
+   --> models/gemma3/src/executor.rs:390:21
+    |
+390 |         let (k_rot, k_rot_step) = rope(&mut builder, k, k_step, cos_prefix.clone(), sin_prefix.clone(), m)?;
+    |                     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_rot_step`
+
+warning: `zkie-models-gpt2` (lib) generated 1 warning (run `cargo fix --lib -p zkie-models-gpt2` to apply 1 suggestion)
+warning: `zkie-models-gemma3` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gemma3` to apply 2 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running tests/s7_context.rs (target/debug/deps/s7_context-fa727bb4f8ef167f)
+
+running 3 tests
+test the_compiled_plan_has_one_lm_head_matmul_step ... ok
+S7A asset_id=192 table_identity=Digest([225, 197, 67, 2, 100, 229, 135, 178, 48, 84, 232, 63, 179, 97, 85, 231, 98, 188, 129, 128, 119, 202, 94, 120, 137, 221, 106, 23, 207, 198, 244, 186]) start=Digest([91, 79, 88, 144, 124, 165, 153, 95, 183, 38, 174, 79, 143, 247, 216, 122, 125, 60, 168, 34, 237, 95, 72, 14, 197, 255, 64, 72, 47, 155, 112, 185]) root=Digest([154, 139, 228, 237, 187, 195, 144, 253, 104, 68, 113, 3, 153, 68, 23, 136, 80, 108, 47, 31, 58, 31, 201, 201, 201, 94, 25, 224, 103, 151, 24, 50]) leaf_root=Digest([154, 139, 228, 237, 187, 195, 144, 253, 104, 68, 113, 3, 153, 68, 23, 136, 80, 108, 47, 31, 58, 31, 201, 201, 201, 94, 25, 224, 103, 151, 24, 50]) rows=1024 row_width=65536 elements=67108864 matmul_step=4444 activation_step=4443 weight_port=1 config=[16, 65536, 1024, 0, 0] anchor_id=Digest([221, 8, 223, 139, 203, 186, 65, 173, 234, 97, 130, 112, 158, 0, 173, 178, 248, 151, 253, 228, 171, 194, 65, 209, 186, 9, 197, 82, 253, 119, 174, 54]) model_id=Digest([194, 151, 28, 1, 121, 70, 59, 241, 42, 236, 174, 252, 52, 136, 65, 114, 40, 0, 140, 19, 20, 230, 144, 92, 73, 165, 80, 120, 36, 44, 18, 104])
+test the_real_context_is_loaded_with_the_lm_head_identity ... ok
+test wrong_identities_and_shapes_are_rejected ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
