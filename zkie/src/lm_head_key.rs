@@ -25,7 +25,7 @@ use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE};
 use zkie_engine::pcs::request::fold::{
     fold_member_firsts, FoldPart,
     fold_mask_make, fold_mask_make_tail, fold_mask_notice, fold_mask_shape_fault,
-    fold_output, fold_start_prove, fold_start_verify, FoldRoundVerifier, ByteMaskCoins,
+    fold_output, fold_start_prove, fold_start_verify, FoldRoundVerifier, ByteMaskCoins, MaskCoins,
     FoldGroupLayout, FoldInputRow, FoldMask, FoldMemberLayout,
     FoldOutput, FoldProverSession, FoldShape, FoldStartMessage, FoldStartProver, MaskOracle,
     OracleMetadata, RuntimeOracles,
@@ -2495,6 +2495,259 @@ pub fn build_stage_fold_stage(
     })
 }
 
+/// The label that separates the stage private-input expansion from every
+/// transcript challenge domain.
+const PRIVATE_INPUTS_LABEL: u64 = 0x5052_4956;
+
+fn index_digest(words: &[u64]) -> Digest {
+    let mut bytes = [0u8; 32];
+    for (slot, word) in bytes.chunks_exact_mut(8).zip(words) {
+        slot.copy_from_slice(&word.to_le_bytes());
+    }
+    Digest(bytes)
+}
+
+fn derive_salt(
+    master: &Digest,
+    stage: u64,
+    column: u64,
+    salt_bytes: usize,
+) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(salt_bytes);
+    let mut block = 0u64;
+    while bytes.len() < salt_bytes {
+        let digest = run_value(
+            PRIVATE_INPUTS_LABEL,
+            master,
+            &index_digest(&[stage, column, block, 1]),
+        )?;
+        bytes.extend_from_slice(&digest.0);
+        block = block.checked_add(1).ok_or(Error::ResourceLimit)?;
+    }
+    bytes.truncate(salt_bytes);
+    Ok(bytes)
+}
+
+fn derive_seed(master: &Digest, stage: u64, domain: u64) -> Result<Digest> {
+    run_value(
+        PRIVATE_INPUTS_LABEL,
+        master,
+        &index_digest(&[stage, domain, 0, 2]),
+    )
+}
+
+/// The private switch-stage inputs generated from one master seed: the new
+/// main and mask encoding tails, the private pad and one salt per new column.
+pub struct StagePrivateInputs {
+    pub main_tails: Vec<Vec<Fp3>>,
+    pub mask_tails: Vec<Vec<Fp3>>,
+    pub pad: Fp3,
+    pub salts: Vec<Vec<u8>>,
+}
+
+pub fn expand_stage_private(
+    target: &SwitchTarget,
+    columns: u64,
+    salt_bytes: usize,
+    master: &Digest,
+    stage: u64,
+) -> Result<StagePrivateInputs> {
+    if master == &Digest::ZERO || salt_bytes == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let mut coins = ByteMaskCoins::new(derive_seed(master, stage, 0)?)?;
+    let main_r = usize::try_from(target.code.r).map_err(|_| Error::ResourceLimit)?;
+    let mask_r = usize::try_from(target.mask_code.r).map_err(|_| Error::ResourceLimit)?;
+    let main_rows = usize::try_from(target.main_rows).map_err(|_| Error::ResourceLimit)?;
+    let mask_rows = usize::try_from(target.mask_rows).map_err(|_| Error::ResourceLimit)?;
+    let mut main_tails = Vec::with_capacity(main_rows);
+    for _ in 0..main_rows {
+        let mut tail = Vec::with_capacity(main_r);
+        for _ in 0..main_r {
+            tail.push(coins.draw()?.0);
+        }
+        main_tails.push(tail);
+    }
+    let mut mask_tails = Vec::with_capacity(mask_rows);
+    for _ in 0..mask_rows {
+        let mut tail = Vec::with_capacity(mask_r);
+        for _ in 0..mask_r {
+            tail.push(coins.draw()?.0);
+        }
+        mask_tails.push(tail);
+    }
+    let pad = coins.draw()?.0;
+    let columns = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    let mut salts = Vec::with_capacity(columns);
+    for column in 0..columns {
+        salts.push(derive_salt(
+            master,
+            stage,
+            column as u64,
+            salt_bytes,
+        )?);
+    }
+    Ok(StagePrivateInputs {
+        main_tails,
+        mask_tails,
+        pad,
+        salts,
+    })
+}
+
+fn expand_fold_mask(
+    target: &SwitchTarget,
+    salt_bytes: usize,
+    master: &Digest,
+    stage: u64,
+) -> Result<LmHeadMaskRandomness> {
+    let plan = MaskTreePlan {
+        tree_number: 0x500 + stage,
+        leaf_class: 0,
+        log_n: target.mask_code.log_n,
+        mask_rows: target.mask_rows,
+        salt_bytes,
+        run: derive_seed(master, stage, 10)?,
+        configuration: derive_seed(master, stage, 11)?,
+    };
+    if plan.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let columns = usize::try_from(plan.columns()).map_err(|_| Error::ResourceLimit)?;
+    let mut salts = Vec::with_capacity(columns);
+    for column in 0..columns {
+        salts.push(derive_salt(master, stage + 0x1000, column as u64, salt_bytes)?);
+    }
+    Ok(LmHeadMaskRandomness {
+        seed: derive_seed(master, stage, 12)?,
+        salts,
+    })
+}
+
+/// Builds the switch chain of the compiled once group from one private master
+/// seed. Each step's target comes from the compiled stages, its tree plan from
+/// the plan's salt length and the session run/configuration, its private tails
+/// and salts from the seed, and the following FOLD shape from the same target.
+/// The last step carries the plan-bound BASE masking salts.
+pub fn plan_stage_chain(
+    compiled: &CompiledPlan,
+    answers: u32,
+    configuration: Digest,
+    run: Digest,
+    master: Digest,
+    base: &BaseStarBinding,
+) -> Result<Option<LimitedSwitchInputs>> {
+    let stages = &compiled.once.folded.stages;
+    if stages.is_empty() || master == Digest::ZERO {
+        return Err(Error::InvalidConfig);
+    }
+    let salt_bytes = compiled.once_foldeq.base_salt_bytes;
+    let mut steps: Vec<LimitedSwitchInputs> = Vec::with_capacity(stages.len());
+    for (index, stage) in stages.iter().enumerate() {
+        let stage_index = index as u64;
+        let target = SwitchTarget::from_stage(stage.main, stage.mask, stage.k, stage.h, answers)?;
+        let tree = switch_tree_plan_multi(
+            stage_index + 1,
+            &target,
+            salt_bytes,
+            run,
+            configuration,
+        )?;
+        let private = expand_stage_private(
+            &target,
+            tree.columns(),
+            salt_bytes,
+            &master,
+            stage_index,
+        )?;
+        let stage_fold = if index + 1 < stages.len() {
+            let shape = FoldShape {
+                code: target.code,
+                mask_code: target.mask_code,
+                k: target.main.bits,
+                h: target.rest.bits,
+                mask_leaf_class: compiled.once_foldeq.shared_split_leaf_class,
+            };
+            if fold_mask_shape_fault(&shape).is_some() {
+                return Err(Error::InvalidConfig);
+            }
+            let layout = FoldGroupLayout {
+                group: 1,
+                k: shape.k,
+                h: shape.h,
+                members: vec![FoldMemberLayout {
+                    oracle: 1,
+                    main_rows: target.main_rows,
+                    mask_rows: target.mask_rows,
+                    kept: false,
+                }],
+            };
+            if layout.fault(&shape).is_some() {
+                return Err(Error::InvalidConfig);
+            }
+            let mask_tree = MaskTreePlan {
+                tree_number: 0x500 + stage_index,
+                leaf_class: compiled.once_foldeq.shared_split_leaf_class,
+                log_n: target.mask_code.log_n,
+                mask_rows: target.mask_rows,
+                salt_bytes,
+                run: derive_seed(&master, stage_index, 10)?,
+                configuration,
+            };
+            if mask_tree.fault().is_some() {
+                return Err(Error::InvalidConfig);
+            }
+            Some(StageFoldSpec {
+                shape,
+                layout,
+                mask_tree,
+                group: 1,
+                member: 1,
+                fresh: 3,
+                randomness: expand_fold_mask(&target, salt_bytes, &master, stage_index)?,
+            })
+        } else {
+            None
+        };
+        let base_step = if index + 1 == stages.len() {
+            let columns =
+                usize::try_from(base.plan.columns()).map_err(|_| Error::ResourceLimit)?;
+            let mut salts = Vec::with_capacity(columns);
+            for column in 0..columns {
+                salts.push(derive_salt(
+                    &master,
+                    stage_index + 0x2000,
+                    column as u64,
+                    base.plan.salt_bytes,
+                )?);
+            }
+            Some(BaseStep {
+                salts,
+                randomness: LastBaseRandomness::Private,
+            })
+        } else {
+            None
+        };
+        steps.push(LimitedSwitchInputs {
+            target,
+            plan: tree,
+            main_tails: private.main_tails,
+            mask_tails: private.mask_tails,
+            pad: private.pad,
+            salts: private.salts,
+            stage_fold,
+            next: None,
+            base: base_step,
+        });
+    }
+    let mut tail = steps.pop().ok_or(Error::InvalidConfig)?;
+    while let Some(mut step) = steps.pop() {
+        step.next = Some(Box::new(tail));
+        tail = step;
+    }
+    Ok(Some(tail))
+}
+
 /// The last-stage BASE private inputs: salts and randomness. The masking
 /// oracle's tree plan and position count come from the bound compiled plan.
 #[derive(Clone)]
@@ -4111,6 +4364,104 @@ mod tests {
         assert_eq!(rows.target, claims.combined.target);
         assert_eq!(rows.main.len(), code.ell as usize);
         assert_eq!(rows.masks.len(), 1);
+    }
+
+    #[test]
+    fn the_planned_stage_chain_follows_the_compiled_stages() {
+        let request = zkie_models_gpt2::lm_head_plan::lm_head_plan().expect("request plan");
+        let compiled =
+            zkie_models_gpt2::lm_head_plan::lm_head_compiled().expect("compiled plan");
+        let answers = u32::try_from(request.samples).expect("answers");
+        let configuration = Digest([0x11; 32]);
+        let run = Digest([0x22; 32]);
+        let master = Digest([0x33; 32]);
+        let last = compiled
+            .once
+            .folded
+            .stages
+            .last()
+            .expect("final stage");
+        let base = BaseStarBinding {
+            plan: RuntimeTreePlan {
+                tree_number: compiled.once_foldeq.base_tree_number,
+                leaf_class: compiled.once_foldeq.base_leaf_class,
+                log_n: last.main.log_n,
+                log_n_zk: last.mask.log_n,
+                parts: vec![RuntimeTreePart {
+                    main_symbols: 3,
+                    mask_symbols: 3,
+                }],
+                salt_bytes: compiled.once_foldeq.base_salt_bytes,
+                run,
+                configuration,
+            },
+            positions: usize::try_from(last.positions).expect("positions"),
+        };
+        let chain = plan_stage_chain(&compiled, answers, configuration, run, master, &base)
+            .expect("stage chain")
+            .expect("some chain");
+        let stages = &compiled.once.folded.stages;
+        let mut step = Some(&chain);
+        let mut index = 0usize;
+        while let Some(current) = step {
+            let stage = &stages[index];
+            let target = SwitchTarget::from_stage(
+                stage.main,
+                stage.mask,
+                stage.k,
+                stage.h,
+                answers,
+            )
+            .expect("target");
+            assert_eq!(current.target, target);
+            assert_eq!(current.main_tails.len(), target.main_rows as usize);
+            assert_eq!(current.mask_tails.len(), target.mask_rows as usize);
+            assert_eq!(current.salts.len(), current.plan.columns() as usize);
+            assert!(current
+                .main_tails
+                .iter()
+                .all(|tail| tail.len() == target.code.r as usize));
+            assert!(current
+                .mask_tails
+                .iter()
+                .all(|tail| tail.len() == target.mask_code.r as usize));
+            if index + 1 < stages.len() {
+                let fold = current.stage_fold.as_ref().expect("fold");
+                assert_eq!(fold.shape.code, target.code);
+                assert_eq!(fold.shape.mask_code, target.mask_code);
+                assert_eq!(fold.shape.k, target.main.bits);
+                assert_eq!(fold.shape.h, target.rest.bits);
+                assert_eq!(fold.layout.members[0].main_rows, target.main_rows);
+                assert_eq!(fold.layout.members[0].mask_rows, target.mask_rows);
+                assert_eq!(fold.randomness.salts.len(), fold.mask_tree.columns() as usize);
+            } else {
+                assert!(current.stage_fold.is_none());
+                let base_step = current.base.as_ref().expect("base step");
+                assert_eq!(base_step.salts.len(), base.plan.columns() as usize);
+            }
+            index += 1;
+            step = current.next.as_deref();
+        }
+        assert_eq!(index, stages.len());
+
+        let other = plan_stage_chain(&compiled, answers, configuration, run, master, &base)
+            .expect("stage chain")
+            .expect("some chain");
+        assert_eq!(other.target, chain.target);
+        assert_eq!(other.main_tails, chain.main_tails);
+        assert_eq!(other.salts, chain.salts);
+        let changed = plan_stage_chain(
+            &compiled,
+            answers,
+            configuration,
+            run,
+            Digest([0x34; 32]),
+            &base,
+        )
+        .expect("stage chain")
+        .expect("some chain");
+        assert_ne!(changed.main_tails, chain.main_tails);
+        assert_ne!(changed.salts, chain.salts);
     }
 
     #[test]
