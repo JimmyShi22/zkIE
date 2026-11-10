@@ -931,6 +931,21 @@ impl FoldeqSession {
         &self.chain
     }
 
+    /// Transfers chain ownership to the BAT stage after the G_u/record/column
+    /// declarations are joined. The session is consumed, so the old handle
+    /// cannot advance the chain independently. A missing join or an earlier
+    /// stage is rejected. The returned chain is the same state the session
+    /// ended with; this is an ownership transfer, not a copied digest.
+    pub fn take_chain_for_bat(self) -> Result<crate::pcs::request::chain::Chain> {
+        if self.stage != Stage::Read
+            || self.gu_membership.is_none()
+            || self.gu_columns_source.is_none()
+        {
+            return Err(Error::InvalidSessionState);
+        }
+        Ok(self.chain)
+    }
+
     pub fn transcript_value(&self) -> &Digest {
         self.chain.value()
     }
@@ -2391,6 +2406,15 @@ mod tests {
                 message.root,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn bat_chain_handoff_requires_the_read_stage() {
+        let (session, _table) = open_gu_session();
+        assert!(matches!(
+            session.take_chain_for_bat(),
+            Err(Error::InvalidSessionState)
+        ));
     }
 
     #[test]

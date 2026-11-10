@@ -905,6 +905,16 @@ impl BatSession {
         self.last_x
     }
 
+    /// Transfers the advanced chain back to the next stage. The session is
+    /// consumed, so it cannot be reused; calling before a completed run is
+    /// rejected. This is an ownership transfer, not a copied digest.
+    pub fn into_chain(self) -> Result<Chain> {
+        if self.last_x.is_none() || self.pending.is_some() {
+            return Err(Error::InvalidSessionState);
+        }
+        Ok(self.chain)
+    }
+
     pub fn begin_run(&mut self, group: u64) -> Result<BatRunInput> {
         if self.pending.is_some() {
             return Err(Error::InvalidSessionState);

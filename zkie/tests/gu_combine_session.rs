@@ -5,7 +5,10 @@ use std::path::Path;
 use std::time::Instant;
 
 use zkie_engine::pcs::request::bat::BatRowKind;
-use zkie_ops::proof::column_session::ColumnBindingInput;
+use zkie_engine::pcs::request::foldeq::reader_table_identity;
+use zkie_ops::proof::column_session::{
+    build_authenticated_encoding_table_with_configuration, ColumnBindingInput,
+};
 use zkie_ops::proof::gu_combine_session::verify_gu_combine_session;
 use zkie_ops::proof::model_commitment::{
     verify_model_anchor, ModelCommitmentPublic, SharedTrace,
@@ -80,7 +83,6 @@ fn selected_gpt2_gu_declaration_combination() {
     println!("declaration_names={:?}", outcome.declaration_names);
 
     assert!(outcome.same_session);
-    assert!(outcome.snapshot_fork);
     assert!(outcome.column_root_only);
     assert!(outcome.self_reported_gu_root);
     assert!(outcome.fake_send_answer);
@@ -88,6 +90,9 @@ fn selected_gpt2_gu_declaration_combination() {
     assert!(!outcome.three_c_connected);
     assert!(!outcome.reference_exact);
     assert!(!outcome.permanent_format);
+    assert!(outcome.chain_handoff);
+    assert!(outcome.adapter_only);
+    assert!(!outcome.downstream_fold_connected);
     assert_ne!(outcome.gu_root, zkie_core::types::Digest::ZERO);
     assert_eq!(outcome.sample_count, 1);
     assert_eq!(outcome.record_count, 1);
@@ -107,6 +112,26 @@ fn selected_gpt2_gu_declaration_combination() {
     assert_eq!(outcome.bat_oracle, 0);
     assert_eq!(outcome.bat_layout.group, 0);
     assert_eq!(outcome.bat_planned_rows as usize, outcome.declarations.len());
+    assert_eq!(outcome.bat_input.count, outcome.declarations.len());
+    assert_eq!(outcome.bat_input.oracle, 0);
+    assert_eq!(outcome.bat_input.group, 0);
+    assert_eq!(outcome.bat_input.order, outcome.bat_order);
+    assert_eq!(outcome.bat_input.main_len, 16);
+    assert_eq!(outcome.bat_input.mask_len, 8);
+    let mut expected_targets: Vec<_> = outcome
+        .declarations
+        .iter()
+        .filter(|row| row.kind != zkie_engine::pcs::request::relation::GuRelationKind::Sample)
+        .map(|row| row.target)
+        .collect();
+    expected_targets.extend(
+        outcome
+            .declarations
+            .iter()
+            .filter(|row| row.kind == zkie_engine::pcs::request::relation::GuRelationKind::Sample)
+            .map(|row| row.target),
+    );
+    assert_eq!(outcome.bat_input.targets, expected_targets);
     assert_eq!(outcome.combined.group, 0);
     assert_eq!(outcome.combined.main.len(), 16);
     assert_eq!(outcome.combined.mask.len(), 8);
@@ -131,4 +156,22 @@ fn selected_gpt2_gu_declaration_combination() {
     assert_eq!(second.transcript_after_columns, outcome.transcript_after_columns);
     assert_eq!(second.x, outcome.x);
     assert_eq!(second.combined, outcome.combined);
+    assert_eq!(
+        second.returned_chain.value(),
+        outcome.returned_chain.value()
+    );
+
+    let table = build_authenticated_encoding_table_with_configuration(
+        &public,
+        &trusted,
+        "gpt2/weights/lm_head_w_i32.bin",
+        opening,
+        input.parameters.digest().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(outcome.reader_root, table.reader.root);
+    assert_eq!(
+        outcome.table_identity,
+        reader_table_identity(&table.reader).unwrap()
+    );
 }

@@ -13,12 +13,13 @@
 //! ids are mapped to BAT's sequential registration ids; the original ids are
 //! retained in the outcome. This is an adapter, not a second BAT.
 //!
-//! The chain snapshot is a **same-prefix forked isolated snapshot**: cloning the
-//! session chain and running BAT on the clone does not advance the original
-//! FOLDEQ session, and this result is not a later FOLD-ready state of that
-//! session. Future linkage requires one continuous session, with declarations
-//! fixed in the confirmed order before the challenge is drawn; copying the
-//! state must not create two independent protocol paths.
+//! Chain ownership is transferred through the stages: `take_chain_for_bat`
+//! consumes the FOLDEQ session after the declarations are joined, and
+//! `BatSession::into_chain` consumes the BAT session and returns the advanced
+//! chain. The old handles cannot advance independently. This is one continuous
+//! state handoff, not a copied digest and not a forked snapshot. A missing
+//! stage, an earlier stage, or a BAT transfer before a completed run is
+//! rejected; consuming the handles makes reuse a type error.
 //!
 //! The BAT round is a candidate demonstration. BAT's close-algebraic step and
 //! the session prefix are used, but this is not an exact reproduction of a
@@ -41,6 +42,19 @@
 //! fresh-mask declaration. The G_u root is self-reported; the G_u row is a
 //! pending declaration. BAT combines claims and does not judge truth. Without a
 //! later proximity/relation check this is not a check pass.
+//!
+//! Declaration fixing follows the confirmed session order: the verifier takes
+//! the declarations from the same session's bound table root/record, G_u
+//! message, challenges and authenticated columns; the BAT group is frozen and
+//! cannot be replaced; only then is `x` drawn. No arbitrary external
+//! declaration is hashed to claim a trusted source, and no extra declaration
+//! absorption round is added: the declarations depend on the already-fixed
+//! inputs and are frozen by `BatRunInput`.
+//!
+//! The six-to-eight mask adapter is only for this local algebraic
+//! demonstration. Its combined row must not flow into a path that claims a real
+//! FOLD or proximity result; the adapter-only and downstream flags record that
+//! isolation.
 
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
@@ -68,6 +82,9 @@ use crate::proof::session_baseline::TrustedModel;
 pub struct BatAdapterShape {
     pub oracle: u64,
     pub group: u64,
+    /// The original G_u oracle/group ids used by the session declarations.
+    pub source_oracle: u64,
+    pub source_group: u64,
     pub main_rows: u64,
     pub mask_rows: u64,
     pub main_code: CodeParams,
@@ -103,6 +120,8 @@ impl BatAdapterShape {
         Ok(Self {
             oracle: 0,
             group: 0,
+            source_oracle: gu.oracle,
+            source_group: gu.group,
             main_rows: gu.u.main_rows,
             mask_rows: gu.u.mask_rows,
             main_code: gu.u.code,
@@ -135,6 +154,9 @@ impl BatAdapterShape {
 }
 
 fn adapt_row(row: &GuRelationRow, shape: &BatAdapterShape) -> Result<BatRow> {
+    if row.oracle != shape.source_oracle || row.group != shape.source_group {
+        return Err(Error::StatementMismatch);
+    }
     if row.main.len() as u64 != shape.main_rows.saturating_mul(shape.main_code.ell)
         || row.mask.len() as u64 != shape.mask_rows.saturating_mul(shape.mask_orig_ell)
     {
@@ -159,12 +181,26 @@ fn adapt_row(row: &GuRelationRow, shape: &BatAdapterShape) -> Result<BatRow> {
     Ok(out)
 }
 
-/// The BAT run result and its retained declaration order.
+/// The frozen BAT input summary checked by the caller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatFrozenSummary {
+    pub oracle: u64,
+    pub group: u64,
+    pub order: Vec<BatRowKind>,
+    pub targets: Vec<Fp3>,
+    pub main_len: usize,
+    pub mask_len: usize,
+    pub count: usize,
+}
+
+/// The BAT run result, its retained declaration order and the advanced chain.
 pub struct BatCombineRun {
     pub layout: BatGroupLayout,
     pub combined: BatGroupRow,
     pub x: Fp3,
     pub order: Vec<BatRowKind>,
+    pub input: BatFrozenSummary,
+    pub returned_chain: Chain,
 }
 
 /// Adapts the G_u declarations to BAT, freezes the group, closes the BAT
@@ -203,13 +239,27 @@ pub fn run_bat_combine(
     let layout = statement.layout(group)?;
     let input = bat.begin_run(group)?;
     let order = input.rows.iter().map(|row| row.kind).collect::<Vec<_>>();
+    let targets = input.rows.iter().map(|row| row.target).collect::<Vec<_>>();
+    let count = input.rows.len();
+    let summary = BatFrozenSummary {
+        oracle: shape.oracle,
+        group: layout.group,
+        order: order.clone(),
+        targets,
+        main_len: shape.main_table_len()?,
+        mask_len: shape.mask_table_len()?,
+        count,
+    };
     let combined = bat.finish_run(input)?;
     let x = bat.last_x().ok_or(Error::InvalidSessionState)?;
+    let returned_chain = bat.into_chain()?;
     Ok(BatCombineRun {
         layout,
         combined,
         x,
         order,
+        input: summary,
+        returned_chain,
     })
 }
 
@@ -243,11 +293,13 @@ pub struct GuCombineOutcome {
     pub bat_layout: BatGroupLayout,
     pub bat_planned_rows: u64,
     pub bat_order: Vec<BatRowKind>,
+    pub bat_input: BatFrozenSummary,
     pub combined: BatGroupRow,
     pub x: Fp3,
+    pub returned_chain: Chain,
+    pub chain_handoff: bool,
     pub transcript_after_columns: Digest,
     pub same_session: bool,
-    pub snapshot_fork: bool,
     pub column_root_only: bool,
     pub self_reported_gu_root: bool,
     pub fake_send_answer: bool,
@@ -255,6 +307,8 @@ pub struct GuCombineOutcome {
     pub three_c_connected: bool,
     pub reference_exact: bool,
     pub permanent_format: bool,
+    pub adapter_only: bool,
+    pub downstream_fold_connected: bool,
 }
 
 /// Runs the candidate G_u declaration registration and BAT combination over
@@ -276,20 +330,30 @@ pub fn verify_gu_combine_session(
     )?;
     let binding = bind_table(&table, input)?;
     let flow = open_gu_flow(&table, binding, input.edge.clone())?;
-    let plan = flow.session.plan();
-    let gu = plan.gu.as_ref().ok_or(Error::StatementMismatch)?;
-    if plan.reader.root != table.reader.root
-        || plan.reader.configuration != configuration
-        || flow.table_identity != reader_table_identity(&plan.reader)?
-        || flow.transcript_after_columns != *flow.session.transcript_value()
+    let crate::proof::column_session::GuFlow {
+        session,
+        gu_root,
+        queries,
+        table_identity,
+        transcript_after_columns,
+    } = flow;
+    let plan = session.plan();
+    let gu = plan.gu.as_ref().ok_or(Error::StatementMismatch)?.clone();
+    let reader_root = plan.reader.root;
+    let reader_configuration = plan.reader.configuration;
+    let reader_shape = plan.reader.shape;
+    if reader_root != table.reader.root
+        || reader_configuration != configuration
+        || table_identity != reader_table_identity(&plan.reader)?
+        || transcript_after_columns != *session.transcript_value()
     {
         return Err(Error::StatementMismatch);
     }
-    let rows = flow.session.pending_gu_rows().to_vec();
+    let rows = session.pending_gu_rows().to_vec();
     if rows.is_empty() {
         return Err(Error::InvalidConfig);
     }
-    let shape = BatAdapterShape::from_gu(gu)?;
+    let shape = BatAdapterShape::from_gu(&gu)?;
     let main_len = usize::try_from(
         shape
             .main_rows
@@ -313,7 +377,8 @@ pub fn verify_gu_combine_session(
             return Err(Error::StatementMismatch);
         }
     }
-    let run = run_bat_combine(&rows, &shape, flow.session.chain().clone())?;
+    let chain = session.take_chain_for_bat()?;
+    let run = run_bat_combine(&rows, &shape, chain)?;
     let bat_planned_rows =
         u64::try_from(rows.len()).map_err(|_| Error::ResourceLimit)?;
     let sample_count = rows
@@ -329,15 +394,15 @@ pub fn verify_gu_combine_session(
         .filter(|row| row.kind == GuRelationKind::Column)
         .count();
     Ok(GuCombineOutcome {
-        reader_root: plan.reader.root,
-        configuration: plan.reader.configuration,
-        shape: plan.reader.shape,
-        table_identity: flow.table_identity,
-        gu_root: flow.gu_root,
+        reader_root,
+        configuration: reader_configuration,
+        shape: reader_shape,
+        table_identity,
+        gu_root,
         gu_oracle: gu.oracle,
         gu_group: gu.group,
         gu_tree_number: gu.tree.tree_number,
-        queries: flow.queries,
+        queries,
         declaration_names: rows.iter().map(|row| kind_name(row.kind)).collect(),
         declarations: rows,
         sample_count,
@@ -353,11 +418,13 @@ pub fn verify_gu_combine_session(
         bat_layout: run.layout,
         bat_planned_rows,
         bat_order: run.order,
+        bat_input: run.input,
         combined: run.combined,
         x: run.x,
-        transcript_after_columns: flow.transcript_after_columns,
+        returned_chain: run.returned_chain,
+        chain_handoff: true,
+        transcript_after_columns,
         same_session: true,
-        snapshot_fork: true,
         column_root_only: true,
         self_reported_gu_root: true,
         fake_send_answer: true,
@@ -365,6 +432,8 @@ pub fn verify_gu_combine_session(
         three_c_connected: false,
         reference_exact: false,
         permanent_format: false,
+        adapter_only: true,
+        downstream_fold_connected: false,
     })
 }
 
@@ -377,6 +446,8 @@ mod tests {
         BatAdapterShape {
             oracle: 0,
             group: 0,
+            source_oracle: 11,
+            source_group: 5,
             main_rows: 2,
             mask_rows: 1,
             main_code: build_code_plan(3, 4, 1).unwrap(),
@@ -420,6 +491,12 @@ mod tests {
             run.order,
             vec![BatRowKind::Plain, BatRowKind::Plain, BatRowKind::Sample]
         );
+        assert_eq!(run.input.count, 3);
+        assert_eq!(run.input.order, run.order);
+        assert_eq!(run.input.oracle, 0);
+        assert_eq!(run.input.group, 0);
+        assert_eq!(run.input.main_len, 8);
+        assert_eq!(run.input.mask_len, 4);
         assert_eq!(run.combined.main.len(), 8);
         assert_eq!(run.combined.mask.len(), 4);
         assert_eq!(run.combined.group, 0);
@@ -452,10 +529,87 @@ mod tests {
     fn shape_mismatch_is_rejected_at_the_adapter() {
         let mut bad = row(GuRelationKind::Record, 8);
         bad.main.pop();
-        assert!(run_bat_combine(&[bad], &shape(), chain()).is_err());
+        assert!(matches!(
+            run_bat_combine(&[bad], &shape(), chain()),
+            Err(Error::ShapeMismatch)
+        ));
         let mut bad = row(GuRelationKind::Record, 8);
         bad.mask.pop();
-        assert!(run_bat_combine(&[bad], &shape(), chain()).is_err());
+        assert!(matches!(
+            run_bat_combine(&[bad], &shape(), chain()),
+            Err(Error::ShapeMismatch)
+        ));
+        let mut bad = row(GuRelationKind::Record, 8);
+        bad.group = 6;
+        assert!(matches!(
+            run_bat_combine(&[bad], &shape(), chain()),
+            Err(Error::StatementMismatch)
+        ));
+        let mut bad = row(GuRelationKind::Record, 8);
+        bad.oracle = 12;
+        assert!(matches!(
+            run_bat_combine(&[bad], &shape(), chain()),
+            Err(Error::StatementMismatch)
+        ));
+    }
+
+    #[test]
+    fn a_closed_group_rejects_replacement() {
+        let shape = shape();
+        let rows = vec![
+            row(GuRelationKind::Sample, 7),
+            row(GuRelationKind::Record, 8),
+        ];
+        let mut bat = BatSession::new(BatStatement::new(), chain(), 2).unwrap();
+        {
+            let statement = bat.statement_mut();
+            statement.add_oracle(shape.oracle_shape()).unwrap();
+            let group = statement
+                .new_group(shape.main_code, shape.mask_code)
+                .unwrap();
+            let sample = adapt_row(&rows[0], &shape).unwrap();
+            let plain = adapt_row(&rows[1], &shape).unwrap();
+            statement.sample(shape.oracle, vec![sample]).unwrap();
+            statement.join(group, shape.oracle, false).unwrap();
+            statement.add_row(group, plain).unwrap();
+            bat.begin_run(group).unwrap();
+        }
+        assert!(matches!(
+            bat.add_row(0, BatRow::new(BatRowKind::Plain)),
+            Err(Error::InvalidSessionState)
+        ));
+    }
+
+    #[test]
+    fn bat_chain_transfer_requires_a_completed_run() {
+        let bat = BatSession::new(BatStatement::new(), chain(), 0).unwrap();
+        assert!(matches!(bat.into_chain(), Err(Error::InvalidSessionState)));
+    }
+
+    #[test]
+    fn challenge_prefix_change_propagates_to_x_on_a_fixed_sample() {
+        let rows = vec![row(GuRelationKind::Sample, 7)];
+        let first_chain = Chain::begin(
+            REQUEST_CHAIN_LABEL,
+            &Digest::ZERO,
+            b"bat-prefix-a",
+            &[],
+            None,
+        )
+        .unwrap();
+        let second_chain = Chain::begin(
+            REQUEST_CHAIN_LABEL,
+            &Digest::ZERO,
+            b"bat-prefix-b",
+            &[],
+            None,
+        )
+        .unwrap();
+        let first = run_bat_combine(&rows, &shape(), first_chain).unwrap();
+        let second = run_bat_combine(&rows, &shape(), second_chain).unwrap();
+        // Fixed-sample propagation check only; this is not a general claim
+        // about hash collisions or domain mapping.
+        assert_ne!(first.x, second.x);
     }
 
     #[test]
