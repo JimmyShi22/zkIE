@@ -32,13 +32,25 @@ fn the_fixture_bat_row_enters_fold_natively() {
     assert!(!run.real_send_receipts);
     assert!(!run.group_roots_authenticated);
     assert!(run.fold_messages_from_committed_members);
-    assert!(!run.sample_rows_are_send_receipts);
-    assert!(!run.declarations_from_bound_messages);
+    assert!(run.sample_claims_registered);
+    assert!(run.sample_claims_pending);
+    assert!(run.sample_claims_from_received_answers);
+    assert!(run.sample_answers_provider_constructed);
+    assert!(!run.verifier_standard_answer_comparison);
+    assert!(!run.send_judges_truth);
+    assert!(run.sample_pads_committed);
+    assert!(!run.sample_pad_hiding);
     assert_eq!(run.group_roots.len(), 3);
     assert_eq!(run.group_positions.len(), 3);
     assert_eq!(run.group_roots, fixture.recompute_member_roots().unwrap());
-    assert_eq!(run.group_rounds, 2);
+    assert_eq!(run.group_rounds, 3);
     assert_eq!(run.bat_chain_rounds, run.group_rounds + 1);
+    assert_eq!(run.sample_claims_in_bat, 3);
+    assert_eq!(run.sample_rows.len(), 3);
+    assert_eq!(run.seeds.len(), 1);
+    assert_eq!(run.answer_order.len(), 3);
+    assert_eq!(run.provider_answers, run.received_answers);
+    assert_eq!(&run.bat_input_targets[2..5], run.received_answers.as_slice());
     assert!(run.combined_matches_witness);
     assert!(run.fold_matches_witness);
     assert_eq!(run.fold_row.coefficients, run.combined.main);
@@ -52,9 +64,11 @@ fn the_fixture_bat_row_enters_fold_natively() {
     );
     assert!(run.output.next_stage().is_err());
     println!(
-        "roots={:?} positions={:?} root={:?} sum={:?} x={:?} eps={:?} target={:?} auxiliary={:?}",
+        "roots={:?} positions={:?} seeds={:?} answers={:?} root={:?} sum={:?} x={:?} eps={:?} target={:?} auxiliary={:?}",
         run.group_roots,
         run.group_positions,
+        run.seeds,
+        run.received_answers,
         run.start.root,
         run.start.sum,
         run.x,
