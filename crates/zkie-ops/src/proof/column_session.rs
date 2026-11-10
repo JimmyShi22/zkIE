@@ -475,7 +475,7 @@ pub fn check_full_columns(
 pub fn check_merge_targets(
     table: &AssetEncodingTable,
     queries: &[u64],
-    rows: &[GuRelationRow],
+    targets: &[Fp3],
     eq_gamma: &[Fp3],
 ) -> Result<bool> {
     let row_count =
@@ -483,15 +483,11 @@ pub fn check_merge_targets(
     if eq_gamma.len() != row_count {
         return Err(Error::ShapeMismatch);
     }
-    let column_rows: Vec<&GuRelationRow> = rows
-        .iter()
-        .filter(|row| row.kind == GuRelationKind::Column)
-        .collect();
-    if column_rows.len() != queries.len() {
+    if targets.len() != queries.len() {
         return Err(Error::ShapeMismatch);
     }
     let mut matches = true;
-    for (row, query) in column_rows.iter().zip(queries) {
+    for (target, query) in targets.iter().zip(queries) {
         if *query >= table.shape.code.n() {
             return Err(Error::InvalidIndex);
         }
@@ -509,7 +505,7 @@ pub fn check_merge_targets(
             );
             expected = expected.add(&weight.mul(&value));
         }
-        if row.target != expected {
+        if *target != expected {
             matches = false;
         }
     }
@@ -824,9 +820,12 @@ fn run_session(
     let read_columns = session.read_queries(&openings)?;
     let columns: Vec<Fp> = read_columns.into_iter().flatten().collect();
     session.join_gu_read_columns()?;
-    let rows = session.pending_gu_rows().to_vec();
+    let mut rows = session.pending_gu_rows().to_vec();
+    for draw in 0..session.pending_column_count() {
+        rows.push(session.column_relation_row(draw)?);
+    }
     let eq_gamma = foldeq_weights(&gamma, table.shape.v)?;
-    let merge_targets = check_merge_targets(table, &queries, &rows, &eq_gamma)?;
+    let merge_targets = check_merge_targets(table, &queries, session.column_targets(), &eq_gamma)?;
     let comparison = check_full_columns(table, &queries, &columns)?;
 
     session.fold_bind_row(setup.fold_row)?;
@@ -1268,7 +1267,7 @@ mod tests {
         assert!(!check_merge_targets(
             &table,
             &queries,
-            session.pending_gu_rows(),
+            session.column_targets(),
             &eq_gamma
         )
         .unwrap());

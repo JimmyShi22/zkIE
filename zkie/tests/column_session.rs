@@ -148,22 +148,11 @@ fn selected_gpt2_column_verification_components() {
         .unwrap()
         .matches);
 
-    let fake_rows: Vec<GuRelationRow> = outcome
-        .queries
-        .iter()
-        .map(|_| GuRelationRow {
-            oracle: 0,
-            group: 0,
-            kind: GuRelationKind::Column,
-            main: Vec::new(),
-            mask: Vec::new(),
-            target: Fp3::ZERO,
-        })
-        .collect();
+    let fake_targets = vec![Fp3::ZERO; outcome.queries.len()];
     assert!(!check_merge_targets(
         &table,
         &outcome.queries,
-        &fake_rows,
+        &fake_targets,
         &outcome.eq_gamma
     )
     .unwrap());

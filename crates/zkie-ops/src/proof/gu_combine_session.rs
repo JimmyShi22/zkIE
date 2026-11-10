@@ -410,7 +410,10 @@ where
     {
         return Err(Error::StatementMismatch);
     }
-    let rows = session.pending_gu_rows().to_vec();
+    let mut rows = session.pending_gu_rows().to_vec();
+    for draw in 0..session.pending_column_count() {
+        rows.push(session.column_relation_row(draw)?);
+    }
     if rows.is_empty() {
         return Err(Error::InvalidConfig);
     }
