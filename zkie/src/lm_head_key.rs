@@ -376,6 +376,7 @@ pub struct LimitedSharedSession {
     pub mask: LmHeadMaskProvider,
     pub base: BaseStarBinding,
     pub switches: Vec<SwitchTarget>,
+    pub switch_positions: Vec<u64>,
 }
 
 /// Builds the binding parameters of the limited key. The plan identifier is
@@ -416,6 +417,7 @@ struct LimitedPlanParts {
     omega: OmegaShapePlan,
     base: BaseStarBinding,
     switches: Vec<SwitchTarget>,
+    switch_positions: Vec<u64>,
     reader: IndexReader,
     statement_digest: Digest,
     leaf_class: u32,
@@ -431,6 +433,9 @@ pub struct LimitedVerifySetup {
     pub first_query: Vec<u8>,
     pub base: BaseStarBinding,
     pub switches: Vec<SwitchTarget>,
+    /// The old group's real position count at each switch, from the trusted
+    /// compiled plan. The verifier rejects a public switch plan that differs.
+    pub switch_positions: Vec<u64>,
     pub fresh_plan: MaskTreePlan,
 }
 
@@ -481,7 +486,13 @@ fn build_limited_plan_parts(
     }
     let answers = u32::try_from(request_plan.samples).map_err(|_| Error::InvalidConfig)?;
     let mut switches = Vec::with_capacity(compiled.once.folded.stages.len());
-    for stage in &compiled.once.folded.stages {
+    let mut switch_positions = Vec::with_capacity(compiled.once.folded.stages.len());
+    for (index, stage) in compiled.once.folded.stages.iter().enumerate() {
+        switch_positions.push(if index == 0 {
+            compiled.once.folded.positions
+        } else {
+            compiled.once.folded.stages[index - 1].positions
+        });
         switches.push(SwitchTarget::from_stage(
             stage.main,
             stage.mask,
@@ -655,6 +666,7 @@ fn build_limited_plan_parts(
         omega,
         base,
         switches,
+        switch_positions,
         reader: reader.clone(),
         statement_digest: statement.digest(),
         leaf_class: compiled.once_foldeq.fold_leaf_class,
@@ -745,6 +757,7 @@ fn finish_limited_setup(
         first_query,
         base: parts.base,
         switches: parts.switches,
+        switch_positions: parts.switch_positions,
         fresh_plan: parts.mask_tree,
     })
 }
@@ -760,6 +773,7 @@ impl LimitedSharedSession {
             first_query: self.first_query.clone(),
             base: self.base.clone(),
             switches: self.switches.clone(),
+            switch_positions: self.switch_positions.clone(),
             fresh_plan: self.mask.tree().plan.clone(),
         }
     }
@@ -874,6 +888,7 @@ pub fn build_limited_shared_session(
         mask,
         base: setup.base,
         switches: setup.switches,
+        switch_positions: setup.switch_positions,
     })
 }
 
@@ -2263,6 +2278,7 @@ pub fn run_limited_shared_to_columns(
 ) -> Result<LimitedSharedColumns> {
     let base_binding = setup.base.clone();
     let expected_switches = setup.switches.clone();
+    let expected_positions = setup.switch_positions.clone();
     let mut session = FoldeqSession::open(setup.plan, setup.binder, setup.chain)?;
     let mut record = LimitedChainRecord::default();
     session.bind_first_query(&setup.first_query)?;
@@ -2427,12 +2443,17 @@ pub fn run_limited_shared_to_columns(
         transcript = *session.transcript_value();
         if let Some(inputs) = switch.as_ref() {
             let mut provided = Vec::new();
+            let mut provided_positions = Vec::new();
             let mut cursor = Some(inputs);
             while let Some(step) = cursor {
                 provided.push(step.target);
+                provided_positions.push(step.positions);
                 cursor = step.next.as_deref();
             }
             check_stage_sequence(&expected_switches, &provided)?;
+            if provided_positions != expected_positions {
+                return Err(Error::StatementMismatch);
+            }
         }
         if let (Some(inputs), Some(stage0)) = (switch, fold_stage.as_ref()) {
             let mut chain = session.take_chain_for_base()?;
@@ -2465,6 +2486,7 @@ pub fn run_limited_shared_to_columns(
                     chain,
                     &stage,
                     inputs.target,
+                    inputs.positions,
                     inputs.plan.clone(),
                     inputs.main_tails.clone(),
                     inputs.mask_tails.clone(),
@@ -2624,6 +2646,7 @@ pub struct LimitedStageFoldPlan {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LimitedSwitchPlan {
     pub target: SwitchTarget,
+    pub positions: u64,
     pub plan: RuntimeTreePlan,
     pub stage_fold: Option<LimitedStageFoldPlan>,
 }
@@ -2634,6 +2657,7 @@ impl LimitedSwitchPlan {
         while let Some(input) = inputs {
             plans.push(Self {
                 target: input.target.clone(),
+                positions: input.positions,
                 plan: input.plan.clone(),
                 stage_fold: input.stage_fold.as_ref().map(|spec| LimitedStageFoldPlan {
                     shape: spec.shape,
@@ -2662,7 +2686,9 @@ pub fn verify_limited_chain(
     old_mask_root: Option<Digest>,
     artifact: &LimitedChainArtifact,
 ) -> Result<Digest> {
-    if artifact.switches.len() != switches.len() {
+    if artifact.switches.len() != switches.len()
+        || setup.switch_positions.len() != switches.len()
+    {
         return Err(Error::IncompleteArtifact);
     }
     let (session, fold_output) = verify_limited_fold(setup, trusted, artifact)?;
@@ -2679,6 +2705,9 @@ pub fn verify_limited_chain(
             .get(index)
             .ok_or(Error::IncompleteArtifact)?;
         let target = plan.target.clone();
+        if plan.positions != setup.switch_positions[index] {
+            return Err(Error::InvalidProof);
+        }
         let source = if index == 0 {
             OldMaskSource::Tree {
                 plan: old_mask_plan.clone().ok_or(Error::IncompleteArtifact)?,
@@ -2717,7 +2746,11 @@ pub fn verify_limited_chain(
         cs.receive_declarations(record.identity, record.declared_root)?;
         cs.draw_sample_seed()?;
         cs.receive_answer(record.sample_answer)?;
-        cs.draw_positions_theta(2)?;
+        let count = usize::try_from(plan.positions).map_err(|_| Error::ResourceLimit)?;
+        if count == 0 {
+            return Err(Error::IncompleteArtifact);
+        }
+        cs.draw_positions_theta(count)?;
         let claims = cs
             .authenticate_and_register(
                 &record.member_openings,
@@ -3693,6 +3726,9 @@ pub struct LimitedFoldStage {
 /// sample pad.
 pub struct LimitedSwitchInputs {
     pub target: SwitchTarget,
+    /// The number of positions drawn from the old group's compiled plan at
+    /// this switch. It is the previous stage's real count, never a fixture.
+    pub positions: u64,
     pub plan: RuntimeTreePlan,
     pub main_tails: Vec<Vec<Fp3>>,
     pub mask_tails: Vec<Vec<Fp3>>,
@@ -4265,6 +4301,14 @@ pub fn plan_stage_chain(
     let mut steps: Vec<LimitedSwitchInputs> = Vec::with_capacity(stages.len());
     for (index, stage) in stages.iter().enumerate() {
         let stage_index = index as u64;
+        let positions = if index == 0 {
+            compiled.once.folded.positions
+        } else {
+            stages[index - 1].positions
+        };
+        if positions == 0 {
+            return Err(Error::InvalidConfig);
+        }
         let target = SwitchTarget::from_stage(stage.main, stage.mask, stage.k, stage.h, answers)?;
         let tree = switch_tree_plan_multi(
             stage_index + 1,
@@ -4350,6 +4394,7 @@ pub fn plan_stage_chain(
         };
         steps.push(LimitedSwitchInputs {
             target,
+            positions,
             plan: tree,
             main_tails: private.main_tails,
             mask_tails: private.mask_tails,
@@ -4420,6 +4465,7 @@ fn run_switch(
     chain: Chain,
     stage: &LimitedFoldStage,
     target: SwitchTarget,
+    positions: u64,
     plan: RuntimeTreePlan,
     main_tails: Vec<Vec<Fp3>>,
     mask_tails: Vec<Vec<Fp3>>,
@@ -4462,7 +4508,8 @@ fn run_switch(
     let seed = cs.draw_sample_seed()?;
     let sample_answer = prover.sample_answer(&seed)?;
     cs.receive_answer(sample_answer)?;
-    let (positions, _theta) = cs.draw_positions_theta(2)?;
+    let count = usize::try_from(positions).map_err(|_| Error::ResourceLimit)?;
+    let (positions, _theta) = cs.draw_positions_theta(count)?;
     let unique = unique_sorted(&positions);
     let mask_positions: Vec<u64> = positions
         .iter()
@@ -5827,6 +5874,7 @@ mod tests {
             mask: fresh_mask,
             base,
             switches: vec![target, target2, final_target],
+            switch_positions: vec![2, 2, 2],
         };
         let source_salts: Vec<Vec<u8>> = (0..16)
             .map(|position| vec![(position as u8) ^ 0x5a; 40])
@@ -5859,6 +5907,7 @@ mod tests {
             Some(&old_mask),
             Some(LimitedSwitchInputs {
                 target,
+                positions: 2,
                 plan: switch_plan,
                 main_tails,
                 mask_tails,
@@ -5905,6 +5954,7 @@ mod tests {
                 }),
                 next: Some(Box::new(LimitedSwitchInputs {
                     target: target2,
+                    positions: 2,
                     plan: plan2,
                     main_tails: (0..4)
                         .map(|row| vec![Fp3::from_u64(0x220 + row as u64)])
@@ -5955,6 +6005,7 @@ mod tests {
                     }),
                     next: Some(Box::new(LimitedSwitchInputs {
                         target: final_target,
+                        positions: 2,
                         plan: final_plan,
                         main_tails: vec![vec![Fp3::from_u64(0x240)]],
                         mask_tails: vec![vec![Fp3::from_u64(0x340)]],
@@ -7518,6 +7569,25 @@ mod stage_tests {
         let bytes = artifact.encode();
         write_public_file(&dir.join("proof"), "artifact.bin", &bytes)?;
         let sealed = result.sealed.ok_or(Error::IncompleteArtifact)?;
+        // Logical draws are the trusted plan's per-switch counts; physical
+        // openings are the unique positions actually carried by the artifact.
+        let draws: Vec<serde_json::Value> = handoff
+            .switches
+            .iter()
+            .zip(result.record.switches.iter())
+            .map(|(plan, record)| {
+                json!({
+                    "positions": plan.positions,
+                    "unique_main": record
+                        .member_openings
+                        .iter()
+                        .map(|opening| opening.positions.len())
+                        .max()
+                        .unwrap_or(0),
+                    "unique_mask": record.fresh_opening.positions.len(),
+                })
+            })
+            .collect();
         let wall = start.elapsed().as_secs_f64();
         Ok(stage_json(
             wall,
@@ -7529,6 +7599,7 @@ mod stage_tests {
                 "chain_wall_s": chain_wall,
                 "artifact_bytes": bytes.len(),
                 "sealed": format!("{sealed:?}"),
+                "draws": draws,
             }),
         ))
     }

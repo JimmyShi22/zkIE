@@ -92,6 +92,7 @@ impl LmHeadPublicHandoff {
         for switch in &self.switches {
             if switch.target.main_rows == 0
                 || switch.target.mask_rows == 0
+                || switch.positions == 0
                 || switch.plan.fault().is_some()
             {
                 return Err(Error::InvalidConfig);
@@ -540,6 +541,7 @@ mod tests {
             },
             switches: vec![LimitedSwitchPlan {
                 target,
+                positions: 2,
                 plan: tree(),
                 stage_fold: None,
             }],
