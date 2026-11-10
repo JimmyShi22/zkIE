@@ -974,6 +974,7 @@ enum Stage {
     OmegaAnswers,
     OmegaJoined,
     ZetaDrawn,
+    BatDrawn,
     MaskQueried,
     MaskOpened,
 }
@@ -1008,6 +1009,7 @@ pub struct FoldeqSession {
     omega_rows: Vec<GuRelationRow>,
     omega_joined: bool,
     zeta: Option<Vec<Fp3>>,
+    bat_x: Option<Fp3>,
     fold_row: Option<FoldInputRow>,
     fold_claim: Option<FoldRoundVerifier>,
     fold_gamma: Vec<Fp3>,
@@ -1058,6 +1060,7 @@ impl FoldeqSession {
             omega_rows: Vec::new(),
             omega_joined: false,
             zeta: None,
+            bat_x: None,
             fold_row: None,
             fold_claim: None,
             fold_gamma: Vec::new(),
@@ -1119,6 +1122,7 @@ impl FoldeqSession {
             omega_rows: Vec::new(),
             omega_joined: false,
             zeta: None,
+            bat_x: None,
             fold_row: None,
             fold_claim: None,
             fold_gamma: Vec::new(),
@@ -1713,8 +1717,33 @@ impl FoldeqSession {
         self.zeta.as_deref()
     }
 
+    /// Draw the BAT group challenge after the row point. The challenge is
+    /// absorbed on the shared chain and the same value is used to combine the
+    /// group's frozen rows.
+    pub fn draw_bat_challenge(&mut self) -> Result<Fp3> {
+        if self.stage != Stage::ZetaDrawn {
+            return Err(Error::InvalidSessionState);
+        }
+        let prefix = self.chain.message().prefix(KIND_ALGEBRAIC, 0)?;
+        if !self.chain.step(&prefix, 0)? {
+            return Err(Error::InvalidProof);
+        }
+        let x = self.chain.draw_e()?;
+        self.bat_x = Some(x);
+        self.stage = Stage::BatDrawn;
+        Ok(x)
+    }
+
+    pub fn bat_challenge(&self) -> Option<Fp3> {
+        self.bat_x
+    }
+
     pub fn pending_gu_rows(&self) -> &[GuRelationRow] {
         &self.gu_rows
+    }
+
+    pub fn omega_rows(&self) -> &[GuRelationRow] {
+        &self.omega_rows
     }
 
     pub fn draw_queries(&mut self) -> Result<()> {
@@ -1807,7 +1836,10 @@ impl FoldeqSession {
     /// view consumed by the FOLD check, and requires the FOLD target group to
     /// be the joined group and the column rows to come from verified reads.
     pub fn start_fold(&mut self, message: &FoldStartMessage) -> Result<()> {
-        if self.stage != Stage::Read && self.stage != Stage::ZetaDrawn {
+        if self.stage != Stage::Read
+            && self.stage != Stage::ZetaDrawn
+            && self.stage != Stage::BatDrawn
+        {
             return Err(Error::InvalidSessionState);
         }
         if self.plan.gu.is_some() {
@@ -1890,7 +1922,10 @@ impl FoldeqSession {
     /// can replace it. The group/layout/membership checks use the trusted plan
     /// and the session's fixed membership, never a proof-supplied row.
     pub fn fold_bind_row(&mut self, row: FoldInputRow) -> Result<()> {
-        if self.stage != Stage::Read && self.stage != Stage::ZetaDrawn {
+        if self.stage != Stage::Read
+            && self.stage != Stage::ZetaDrawn
+            && self.stage != Stage::BatDrawn
+        {
             return Err(Error::InvalidSessionState);
         }
         if self.fold_row.is_some() {

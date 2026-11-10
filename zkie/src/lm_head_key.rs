@@ -14,15 +14,19 @@ use zkie_core::common::field::PrimeCharacteristicRing;
 use zkie_core::error::{Error, Result};
 use zkie_core::proof_header::PROOF_VERSION_WORD;
 use zkie_core::types::Digest;
+use zkie_engine::pcs::request::bat::{
+    combine, group_index, BatOracleShape, BatPart, BatRow, BatRowKind, BatStatement,
+};
 use zkie_engine::pcs::request::binding::{BindingParameters, BindingStatement};
 use zkie_engine::pcs::request::chain::Chain;
 use zkie_engine::pcs::request::code::encode_row_fp3;
 use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE};
 use zkie_engine::pcs::request::fold::{
     fold_mask_make, fold_mask_make_tail, fold_mask_notice, fold_mask_shape_fault,
-    fold_start_prove, ByteMaskCoins, FoldGroupLayout, FoldInputRow, FoldMemberLayout, FoldShape,
-    FoldStartMessage, FoldStartProver, MaskOracle, OracleMetadata, RuntimeOracles, VerifiedGroup, VerifiedGroups,
-    VerifiedStatement,
+    fold_start_prove, ByteMaskCoins, FoldGroupLayout, FoldInputRow, FoldMask, FoldMemberLayout,
+    FoldOutput, FoldProverSession, FoldShape, FoldStartMessage, FoldStartProver, MaskOracle,
+    OracleMetadata, RuntimeOracles,
+    VerifiedGroup, VerifiedGroups, VerifiedStatement,
 };
 use zkie_engine::pcs::request::foldeq::{
     reader_table_identity, FoldeqBinder, FoldeqBinding, FoldeqEdgeBinding, FoldeqPlan,
@@ -34,7 +38,7 @@ use zkie_engine::pcs::request::plan::{CompiledPlan, RequestPlan};
 use zkie_engine::pcs::request::read::{unique_sorted, HidingState, ReadLedger};
 use zkie_engine::pcs::request::relation::{
     foldeq_weights, gu_sample_pad_offsets, gu_table, gu_vector_offset, oracle_sample_row,
-    sample_row, GuWitness,
+    sample_row, GuRelationRow, GuWitness,
 };
 use zkie_engine::pcs::request::runtime_tree::{
     MaskTree, MaskTreePlan, RuntimePartRows, RuntimeTree, RuntimeTreePart, RuntimeTreePlan,
@@ -425,6 +429,7 @@ pub struct LimitedSharedSession {
     pub binder: FoldeqBinder,
     pub chain: Chain,
     pub first_query: Vec<u8>,
+    pub mask: LmHeadMaskProvider,
 }
 
 /// Builds the binding parameters of the limited key. The plan identifier is
@@ -462,14 +467,11 @@ pub fn build_limited_shared_session(
     plan_identifier: Digest,
     case_id: &[u8],
     random_bytes: Digest,
-    fresh_mask_root: Digest,
+    mask_randomness: &LmHeadMaskRandomness,
 ) -> Result<LimitedSharedSession> {
     request_plan.validate()?;
     request_plan.validate_compiled(compiled)?;
-    if fresh_mask_root == Digest::ZERO
-        || random_bytes == Digest::ZERO
-        || case_id.is_empty()
-    {
+    if random_bytes == Digest::ZERO || case_id.is_empty() {
         return Err(Error::InvalidConfig);
     }
     let parameters = limited_key_binding_parameters(request_plan, plan_identifier)?;
@@ -623,13 +625,29 @@ pub fn build_limited_shared_session(
             mask_code: fold.mask_code,
         }],
     )?);
+    let mask_oracle = MaskOracle {
+        id: LM_HEAD_FRESH_MASK,
+        claimed_group: LM_HEAD_FOLD_GROUP,
+        main_rows: 0,
+        mask_rows: mask_tree.mask_rows,
+        mask_code: fold.mask_code,
+        answers: 0,
+        sampled: false,
+    };
+    let mask = make_lm_head_mask(
+        &fold,
+        &mask_oracle,
+        verified.groups(),
+        mask_tree,
+        mask_randomness,
+    )?;
     let mut oracles = RuntimeOracles::default();
     oracles.receive_mask(
         &verified,
         &mask_tree,
         LM_HEAD_FRESH_MASK,
         &fold_mask_notice(&fold)?,
-        fresh_mask_root,
+        mask.root(),
     )?;
     let layout = FoldGroupLayout {
         group: LM_HEAD_FOLD_GROUP,
@@ -705,6 +723,7 @@ pub fn build_limited_shared_session(
         binder,
         chain,
         first_query,
+        mask,
     })
 }
 
@@ -718,7 +737,7 @@ pub fn build_limited_shared_session_for_context(
     statement: &LimitedKeyStatement,
     reader: &IndexReader,
     random_bytes: Digest,
-    fresh_mask_root: Digest,
+    mask_randomness: &LmHeadMaskRandomness,
 ) -> Result<LimitedSharedSession> {
     build_limited_shared_session(
         request_plan,
@@ -728,7 +747,7 @@ pub fn build_limited_shared_session_for_context(
         context.plan_identifier,
         context.policy.case_id.as_bytes(),
         random_bytes,
-        fresh_mask_root,
+        mask_randomness,
     )
 }
 
@@ -1095,6 +1114,7 @@ pub struct LimitedSharedColumns {
     pub root: Digest,
     pub omega_root: Option<Digest>,
     pub zeta: Vec<Fp3>,
+    pub fold_output: Option<FoldOutput>,
     pub transcript: Digest,
 }
 
@@ -1109,6 +1129,7 @@ pub fn run_limited_shared_to_columns(
     table_tails: &[Vec<Fp>],
     randomness: &LmHeadGuRandomness,
     omega_randomness: Option<&LmHeadOmegaRandomness>,
+    old_mask: Option<&LmHeadOldMaskProvider>,
 ) -> Result<(FoldeqSession, LimitedSharedColumns)> {
     let mut session = FoldeqSession::open(setup.plan, setup.binder, setup.chain)?;
     session.bind_first_query(&setup.first_query)?;
@@ -1154,13 +1175,15 @@ pub fn run_limited_shared_to_columns(
     session.join_gu_read_columns()?;
     let mut omega_root = None;
     let mut zeta = Vec::new();
+    let mut fold_output = None;
     if let Some(omega) = session.plan().omega.as_ref().cloned() {
         let omega_randomness = omega_randomness.ok_or(Error::InvalidConfig)?;
-        let psi_lo: &[Fp3] = match session.psi() {
+        let psi_lo: Vec<Fp3> = match session.psi() {
             Some(psi) => psi
                 .get(..omega.k_lo as usize)
-                .ok_or(Error::ShapeMismatch)?,
-            None if omega.k_lo == 0 => &[],
+                .ok_or(Error::ShapeMismatch)?
+                .to_vec(),
+            None if omega.k_lo == 0 => Vec::new(),
             None => return Err(Error::StatementMismatch),
         };
         let omega_provider = commit_lm_head_omega(
@@ -1171,7 +1194,7 @@ pub fn run_limited_shared_to_columns(
             &omega.tree,
             omega.matrix_rows,
             omega.k_lo,
-            psi_lo,
+            &psi_lo,
             omega_randomness,
         )?;
         session.send_omega(&omega_provider.root())?;
@@ -1182,6 +1205,122 @@ pub fn run_limited_shared_to_columns(
         session.join_omega()?;
         zeta = session.draw_zeta()?;
         omega_root = Some(omega_provider.root());
+        if let Some(old_mask) = old_mask {
+        let fold_shape = session.plan().fold;
+        let mut bat = BatStatement::new();
+        bat.add_oracle(BatOracleShape {
+            oracle: 0,
+            main_rows: provider.shape().u.main_rows,
+            mask_rows: provider.shape().u.mask_rows,
+            main_code: Some(provider.shape().u.code),
+            mask_code: provider.shape().u.mask_code,
+            answers: provider.shape().u.answers,
+        })?;
+        bat.add_oracle(BatOracleShape {
+            oracle: 1,
+            main_rows: omega_provider.shape().main_rows,
+            mask_rows: 0,
+            main_code: Some(omega_provider.shape().code),
+            mask_code: None,
+            answers: omega_provider.shape().answers,
+        })?;
+        let sample_g = session
+            .pending_gu_rows()
+            .iter()
+            .find(|row| row.kind == zkie_engine::pcs::request::relation::GuRelationKind::Sample)
+            .ok_or(Error::InvalidSessionState)?;
+        let sample_o = session
+            .omega_rows()
+            .first()
+            .ok_or(Error::InvalidSessionState)?;
+        bat.sample(
+            0,
+            vec![bat_row_from_relation(
+                sample_g,
+                0,
+                provider.shape().u.main_rows,
+                provider.shape().u.code.ell,
+                BatRowKind::Sample,
+            )?],
+        )?;
+        bat.sample(
+            1,
+            vec![bat_row_from_relation(
+                sample_o,
+                1,
+                omega_provider.shape().main_rows,
+                omega_provider.shape().code.ell,
+                BatRowKind::Sample,
+            )?],
+        )?;
+        let group = bat.new_group(fold_shape.code, fold_shape.mask_code)?;
+        bat.join(group, 0, false)?;
+        bat.join(group, 1, false)?;
+        for row in session.pending_gu_rows().iter().filter(|row| {
+            row.kind != zkie_engine::pcs::request::relation::GuRelationKind::Sample
+        }) {
+            bat.add_row(
+                group,
+                bat_row_from_relation(
+                    row,
+                    0,
+                    provider.shape().u.main_rows,
+                    provider.shape().u.code.ell,
+                    BatRowKind::Plain,
+                )?,
+            )?;
+        }
+        bat.add_row(
+            group,
+            bat_lin_fold_row(
+                &provider,
+                &omega_provider,
+                &psi_lo,
+                &zeta,
+                omega.matrix_rows,
+                omega.k_lo,
+            )?,
+        )?;
+        let input = bat.begin_run(group)?;
+        let x = session.draw_bat_challenge()?;
+        let combined = combine(&bat, &input.layout, &input.rows, x)?;
+        let mut fold_row = bat.to_fold_input_row(&combined, &input.layout)?;
+        fold_row.group = session.plan().group_id;
+        fold_row.members = vec![provider.shape().oracle, omega_provider.oracle()];
+        let prover_row = fold_row.clone();
+        session.fold_bind_row(fold_row)?;
+        session.start_fold(setup.mask.message())?;
+        let eps = session.epsilon().ok_or(Error::InvalidSessionState)?;
+        let coins = ByteMaskCoins::new(setup.mask.coins_seed())?;
+        let fold_layout = session
+            .plan()
+            .fold_layout
+            .clone()
+            .ok_or(Error::InvalidConfig)?;
+        let main_messages = group_main_messages(&provider, &omega_provider, &input.layout)?;
+        let old_mu = old_mask.mu()?;
+        let mut prover = FoldProverSession::new(
+            &fold_shape,
+            &fold_layout,
+            setup.mask.mask(),
+            &prover_row,
+            main_messages,
+            old_mu,
+            Vec::new(),
+        )?;
+        prover.start(eps, &coins)?;
+        session.fold_rounds_start()?;
+        for _ in 0..fold_shape.k {
+            let round = prover.round()?;
+            session.receive_fold_round(round[0], round[2])?;
+            let gamma = *session
+                .fold_gamma()
+                .last()
+                .ok_or(Error::InvalidSessionState)?;
+            prover.bind(gamma)?;
+        }
+        fold_output = Some(session.fold_finish()?);
+        }
     } else if omega_randomness.is_some() {
         return Err(Error::InvalidConfig);
     }
@@ -1196,6 +1335,7 @@ pub fn run_limited_shared_to_columns(
             root: provider.root(),
             omega_root,
             zeta,
+            fold_output,
             transcript,
         },
     ))
@@ -1314,6 +1454,8 @@ pub struct LmHeadMaskRandomness {
 /// tree, and the mask message coefficients the FOLD row consumes.
 pub struct LmHeadMaskProvider {
     start: FoldStartProver,
+    mask: FoldMask,
+    coins_seed: Digest,
     mask_coefficients: Vec<Fp3>,
 }
 
@@ -1328,6 +1470,14 @@ impl LmHeadMaskProvider {
 
     pub fn coefficients(&self) -> &[Fp3] {
         &self.mask_coefficients
+    }
+
+    pub fn mask(&self) -> &FoldMask {
+        &self.mask
+    }
+
+    pub fn coins_seed(&self) -> Digest {
+        self.coins_seed
     }
 }
 
@@ -1353,7 +1503,8 @@ pub fn make_lm_head_mask(
     {
         return Err(Error::ShapeMismatch);
     }
-    let mut coins = ByteMaskCoins::new(randomness.seed)?;
+    let seed = randomness.seed;
+    let mut coins = ByteMaskCoins::new(seed)?;
     let mut mask = fold_mask_make(fold, &mut coins)?;
     fold_mask_make_tail(fold, &mut mask, &mut coins)?;
     mask.sent_as(oracle.id)?;
@@ -1369,6 +1520,8 @@ pub fn make_lm_head_mask(
     let mask_coefficients = start.draft.table.values.clone();
     Ok(LmHeadMaskProvider {
         start,
+        mask,
+        coins_seed: seed,
         mask_coefficients,
     })
 }
@@ -1426,6 +1579,181 @@ pub fn commit_lm_head_old_mask(
         root: committed.root,
         rows: randomness.rows.clone(),
     })
+}
+
+fn bit_count(value: u64) -> u32 {
+    if value <= 1 {
+        0
+    } else {
+        64 - (value - 1).leading_zeros()
+    }
+}
+
+/// Expands one oracle relation row (compact row-major rows x ell) into the
+/// BAT term order, where an oracle table index is `row + (place << row_bits)`
+/// and the virtual padded rows are zero.
+fn bat_term_values(
+    main: &[Fp3],
+    main_rows: u64,
+    ell: u64,
+) -> Result<Vec<Fp3>> {
+    let row_bits = bit_count(main_rows);
+    let ell = usize::try_from(ell).map_err(|_| Error::ResourceLimit)?;
+    let rows = usize::try_from(main_rows).map_err(|_| Error::ResourceLimit)?;
+    let virtual_rows = 1usize
+        .checked_shl(row_bits)
+        .ok_or(Error::ResourceLimit)?;
+    let mut values = vec![
+        Fp3::ZERO;
+        virtual_rows.checked_mul(ell).ok_or(Error::ResourceLimit)?
+    ];
+    for row in 0..rows {
+        for place in 0..ell {
+            let value = *main
+                .get(row.checked_mul(ell).and_then(|base| base.checked_add(place)).ok_or(Error::ResourceLimit)?)
+                .ok_or(Error::ShapeMismatch)?;
+            values[row + (place << row_bits)] = value;
+        }
+    }
+    Ok(values)
+}
+
+fn bat_row_from_relation(
+    row: &GuRelationRow,
+    oracle: u64,
+    main_rows: u64,
+    ell: u64,
+    kind: BatRowKind,
+) -> Result<BatRow> {
+    let values = bat_term_values(&row.main, main_rows, ell)?;
+    let mut out = BatRow::new(kind);
+    out.terms.push(zkie_engine::pcs::request::bat::BatTerm {
+        oracle,
+        part: BatPart::Main,
+        values,
+    });
+    out.target = row.target;
+    Ok(out)
+}
+
+/// The LIN fold row as BAT terms: Omega at eq(zeta, row) on its leading
+/// slots, and the folded row at eq(psi_lo, place) * eq(zeta, row) through the
+/// trusted G_u layout.
+fn bat_lin_fold_row(
+    gu: &LmHeadGuProvider,
+    omega: &LmHeadOmegaProvider,
+    psi_lo: &[Fp3],
+    zeta: &[Fp3],
+    matrix_rows: u64,
+    k_lo: u32,
+) -> Result<BatRow> {
+    let shape = gu.shape();
+    let k_row = bit_count(matrix_rows);
+    if !matrix_rows.is_power_of_two() || zeta.len() != k_row as usize {
+        return Err(Error::ShapeMismatch);
+    }
+    let eq_psi = foldeq_weights(psi_lo, k_lo)?;
+    let eq_zeta = foldeq_weights(zeta, k_row)?;
+    let gu_rows = usize::try_from(shape.u.main_rows).map_err(|_| Error::ResourceLimit)?;
+    let ell = usize::try_from(shape.u.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let row_bits = bit_count(shape.u.main_rows);
+    let mut gu_values = vec![
+        Fp3::ZERO;
+        (1usize
+            .checked_shl(row_bits)
+            .ok_or(Error::ResourceLimit)?)
+        .checked_mul(ell)
+        .ok_or(Error::ResourceLimit)?
+    ];
+    let entries = matrix_rows
+        .checked_shl(k_lo)
+        .ok_or(Error::ResourceLimit)?;
+    let low_count = 1u64.checked_shl(k_lo).ok_or(Error::ResourceLimit)?;
+    for entry in 0..entries {
+        let row = entry / low_count;
+        let place = entry % low_count;
+        let offset = gu_vector_offset(shape, entry)?.ok_or(Error::ShapeMismatch)?;
+        if offset >= gu_rows * ell {
+            return Err(Error::ShapeMismatch);
+        }
+        let real_row = offset / ell;
+        let real_place = offset % ell;
+        let weight = eq_psi[place as usize].mul(&eq_zeta[row as usize]);
+        let at = real_row + (real_place << row_bits);
+        gu_values[at] = gu_values[at].add(&weight);
+    }
+    let omega_ell = usize::try_from(omega.shape().code.ell).map_err(|_| Error::ResourceLimit)?;
+    let mut omega_values = vec![Fp3::ZERO; omega_ell];
+    for (row, weight) in eq_zeta.iter().enumerate().take(matrix_rows as usize) {
+        if row >= omega_values.len() {
+            return Err(Error::ShapeMismatch);
+        }
+        omega_values[row] = omega_values[row].add(weight);
+    }
+    let mut out = BatRow::new(BatRowKind::Plain);
+    out.terms.push(zkie_engine::pcs::request::bat::BatTerm {
+        oracle: 0,
+        part: BatPart::Main,
+        values: gu_values,
+    });
+    out.terms.push(zkie_engine::pcs::request::bat::BatTerm {
+        oracle: 1,
+        part: BatPart::Main,
+        values: omega_values,
+    });
+    Ok(out)
+}
+
+/// The group's main message table in the same virtual order as the combined
+/// row: each oracle's message entries are placed at the BAT layout offset.
+fn group_main_messages(
+    gu: &LmHeadGuProvider,
+    omega: &LmHeadOmegaProvider,
+    layout: &zkie_engine::pcs::request::bat::BatGroupLayout,
+) -> Result<Vec<Fp3>> {
+    let mut out = vec![
+        Fp3::ZERO;
+        layout.group_len(BatPart::Main)?
+    ];
+    for member in &layout.members {
+        let (main_rows, ell, compact): (u64, usize, Vec<Fp3>) = if member.oracle == 0 {
+            (
+                gu.shape().u.main_rows,
+                usize::try_from(gu.shape().u.code.ell).map_err(|_| Error::ResourceLimit)?,
+                gu.relation().main.clone(),
+            )
+        } else if member.oracle == 1 {
+            (
+                omega.shape().main_rows,
+                usize::try_from(omega.shape().code.ell).map_err(|_| Error::ResourceLimit)?,
+                omega.message().to_vec(),
+            )
+        } else {
+            return Err(Error::StatementMismatch);
+        };
+        let row_bits = bit_count(main_rows);
+        let first = member.main_first.ok_or(Error::ShapeMismatch)?;
+        let rows = usize::try_from(main_rows).map_err(|_| Error::ResourceLimit)?;
+        for row in 0..rows {
+            for place in 0..ell {
+                let index = row
+                    .checked_add(place << row_bits)
+                    .ok_or(Error::ResourceLimit)?;
+                let at = usize::try_from(group_index(
+                    index as u64,
+                    row_bits,
+                    first,
+                    layout.k,
+                )?)
+                .map_err(|_| Error::ResourceLimit)?;
+                let value = *compact
+                    .get(row.checked_mul(ell).and_then(|base| base.checked_add(place)).ok_or(Error::ResourceLimit)?)
+                    .ok_or(Error::ShapeMismatch)?;
+                *out.get_mut(at).ok_or(Error::ShapeMismatch)? = value;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The checks that the shared-only chain must report before a limited tested
@@ -1946,6 +2274,26 @@ mod tests {
         (request_plan, compiled, statement, reader, plan_identifier)
     }
 
+    fn real_mask_randomness() -> &'static LmHeadMaskRandomness {
+        static MASK: std::sync::OnceLock<LmHeadMaskRandomness> = std::sync::OnceLock::new();
+        MASK.get_or_init(|| LmHeadMaskRandomness {
+            seed: Digest([0x95; 32]),
+            salts: (0..1usize << 14)
+                .map(|position| vec![(position as u8) ^ 0x77; 40])
+                .collect(),
+        })
+    }
+
+    fn zero_seed_mask_randomness() -> &'static LmHeadMaskRandomness {
+        static MASK: std::sync::OnceLock<LmHeadMaskRandomness> = std::sync::OnceLock::new();
+        MASK.get_or_init(|| LmHeadMaskRandomness {
+            seed: Digest::ZERO,
+            salts: (0..1usize << 14)
+                .map(|position| vec![(position as u8) ^ 0x77; 40])
+                .collect(),
+        })
+    }
+
     fn build_shared(
         request_plan: &RequestPlan,
         compiled: &CompiledPlan,
@@ -1953,7 +2301,7 @@ mod tests {
         reader: &IndexReader,
         plan_identifier: Digest,
         salt: Digest,
-        mask_root: Digest,
+        mask_randomness: &LmHeadMaskRandomness,
     ) -> Result<LimitedSharedSession> {
         build_limited_shared_session(
             request_plan,
@@ -1963,7 +2311,7 @@ mod tests {
             plan_identifier,
             b"gpt2-seq16",
             salt,
-            mask_root,
+            mask_randomness,
         )
     }
 
@@ -1972,7 +2320,7 @@ mod tests {
         let (request_plan, compiled, statement, reader, plan_identifier) =
             shared_plan_fixture();
         let salt = Digest([0x94; 32]);
-        let mask_root = Digest([0x95; 32]);
+        let mask_randomness = real_mask_randomness();
         let session = build_shared(
             &request_plan,
             &compiled,
@@ -1980,7 +2328,7 @@ mod tests {
             &reader,
             plan_identifier,
             salt,
-            mask_root,
+            mask_randomness,
         )
         .expect("shared session");
         let plan = &session.plan;
@@ -2055,7 +2403,7 @@ mod tests {
             &reader,
             plan_identifier,
             Digest([0x94; 32]),
-            Digest([0x95; 32]),
+            real_mask_randomness(),
         )
         .is_err());
     }
@@ -2073,7 +2421,7 @@ mod tests {
             &reader,
             plan_identifier,
             Digest([0x94; 32]),
-            Digest([0x95; 32]),
+            real_mask_randomness(),
         )
         .is_err());
         let mut other = statement.clone();
@@ -2085,7 +2433,7 @@ mod tests {
             &reader,
             plan_identifier,
             Digest([0x94; 32]),
-            Digest([0x95; 32]),
+            real_mask_randomness(),
         )
         .is_err());
     }
@@ -2102,7 +2450,7 @@ mod tests {
             &reader,
             plan_identifier,
             Digest([0x94; 32]),
-            Digest([0x95; 32]),
+            real_mask_randomness(),
         )
         .is_err());
     }
@@ -2118,7 +2466,7 @@ mod tests {
             &reader,
             plan_identifier,
             Digest::ZERO,
-            Digest([0x95; 32]),
+            real_mask_randomness(),
         )
         .is_err());
         assert!(build_shared(
@@ -2128,7 +2476,7 @@ mod tests {
             &reader,
             plan_identifier,
             Digest([0x94; 32]),
-            Digest::ZERO,
+            zero_seed_mask_randomness(),
         )
         .is_err());
     }
@@ -2144,7 +2492,7 @@ mod tests {
             &reader,
             plan_identifier,
             Digest([0x94; 32]),
-            Digest([0x95; 32]),
+            real_mask_randomness(),
         )
         .expect("first");
         let second = build_shared(
@@ -2154,7 +2502,7 @@ mod tests {
             &reader,
             plan_identifier,
             Digest([0x96; 32]),
-            Digest([0x95; 32]),
+            real_mask_randomness(),
         )
         .expect("second");
         assert_ne!(first.binder.run(), second.binder.run());
@@ -2175,7 +2523,7 @@ mod tests {
             &reader,
             plan_identifier,
             Digest([0x94; 32]),
-            Digest([0x95; 32]),
+            real_mask_randomness(),
         )
         .expect("first");
         let other_identifier = Digest([0x98; 32]);
@@ -2192,7 +2540,7 @@ mod tests {
             &other_reader,
             other_identifier,
             Digest([0x94; 32]),
-            Digest([0x95; 32]),
+            real_mask_randomness(),
         )
         .expect("second");
         assert_ne!(first.first_query, second.first_query);
@@ -2209,7 +2557,7 @@ mod tests {
         use zkie_engine::pcs::request::code::build_code_plan;
         use zkie_engine::pcs::request::table::TableDistances;
         let shape = IndexShape {
-            code: build_code_plan(3, 4, 1).expect("code"),
+            code: build_code_plan(4, 4, 1).expect("code"),
             v: 2,
             answers: 1,
             salt_bytes: 40,
@@ -2230,10 +2578,10 @@ mod tests {
         let tails: Vec<Vec<Fp>> = (0..4)
             .map(|row| vec![Fp::from_u64(row as u64 + 7)])
             .collect();
-        let salts: Vec<Vec<u8>> = (0..8)
+        let salts: Vec<Vec<u8>> = (0..16)
             .map(|position| vec![(position as u8) ^ 0x5a; 40])
             .collect();
-        let request_parameters = RequestParams::default_with_code(3, 4, 1).expect("params");
+        let request_parameters = RequestParams::default_with_code(4, 4, 1).expect("params");
         let parameters = BindingParameters::with_plan_parts(
             PROOF_VERSION_WORD,
             SESSION_PROTOCOL_IDENTITY,
@@ -2286,7 +2634,7 @@ mod tests {
             code_tails: (0..4)
                 .map(|row| vec![Fp3::from_u64(0x100 + row)])
                 .collect(),
-            salts: (0..8)
+            salts: (0..16)
                 .map(|position| vec![(position as u8) ^ 0xa5; 40])
                 .collect(),
             pads: vec![Fp3::from_u64(0x777)],
@@ -2370,7 +2718,7 @@ mod tests {
     fn small_shared_run() -> Result<(FoldeqSession, LimitedSharedColumns)> {
         use zkie_engine::pcs::request::code::build_code_plan;
         let (key, gu, randomness, tails, parameters) = small_gu_fixture();
-        let mask_code = build_code_plan(3, 7, 1)?;
+        let mask_code = build_code_plan(4, 8, 1)?;
         let fold = FoldShape {
             code: key.shape.code,
             mask_code,
@@ -2407,13 +2755,34 @@ mod tests {
                 mask_code,
             }],
         )?);
+        let mask_oracle = MaskOracle {
+            id: 3,
+            claimed_group: 1,
+            main_rows: 0,
+            mask_rows: 1,
+            mask_code,
+            answers: 0,
+            sampled: false,
+        };
+        let fresh_mask = make_lm_head_mask(
+            &fold,
+            &mask_oracle,
+            statement.groups(),
+            mask_tree,
+            &LmHeadMaskRandomness {
+                seed: Digest([0x77; 32]),
+                salts: (0..16)
+                    .map(|position| vec![(position as u8) ^ 0x66; 40])
+                    .collect(),
+            },
+        )?;
         let mut oracles = RuntimeOracles::default();
         oracles.receive_mask(
             &statement,
             &mask_tree,
             3,
             &fold_mask_notice(&fold)?,
-            Digest([0x77; 32]),
+            fresh_mask.root(),
         )?;
         let layout = FoldGroupLayout {
             group: 1,
@@ -2443,7 +2812,7 @@ mod tests {
             table_identity,
         )?;
         let binding = FoldeqBinding::new(&parameters, binding_statement, &key.reader)?;
-        let omega_code = build_code_plan(4, 8, 1)?;
+        let omega_code = key.shape.code;
         let omega = OmegaShapePlan {
             oracle: 2,
             group: 1,
@@ -2469,7 +2838,7 @@ mod tests {
                 answers: 1,
             },
             rows_high: true,
-            matrix_rows: 1u64 << key.shape.v,
+            matrix_rows: 1,
             k_lo: 0,
         };
         let plan = FoldeqPlan {
@@ -2509,6 +2878,7 @@ mod tests {
             binder,
             chain,
             first_query,
+            mask: fresh_mask,
         };
         let omega_randomness = LmHeadOmegaRandomness {
             code_tails: vec![vec![Fp3::from_u64(9)]],
@@ -2517,7 +2887,25 @@ mod tests {
                 .collect(),
             pad: Fp3::from_u64(0x888),
         };
-        run_limited_shared_to_columns(setup, &key, &tails, &randomness, Some(&omega_randomness))
+        let old_mask = commit_lm_head_old_mask(
+            &fold,
+            mask_tree,
+            &LmHeadOldMaskRandomness {
+                rows: vec![vec![Fp3::from_u64(0x91); mask_code.ell as usize]],
+                tails: vec![vec![Fp3::from_u64(0x92)]],
+                salts: (0..16)
+                    .map(|position| vec![(position as u8) ^ 0x67; 40])
+                    .collect(),
+            },
+        )?;
+        run_limited_shared_to_columns(
+            setup,
+            &key,
+            &tails,
+            &randomness,
+            Some(&omega_randomness),
+            Some(&old_mask),
+        )
     }
 
     #[test]
@@ -2531,7 +2919,8 @@ mod tests {
         assert_eq!(run.queries.len(), 2);
         assert_eq!(session.pending_gu_rows().len(), 4);
         assert!(run.omega_root.is_some());
-        assert_eq!(run.zeta.len(), 2);
+        assert_eq!(run.zeta.len(), 0);
+        assert!(run.fold_output.is_some());
         assert!(session.zeta().is_some());
     }
 
@@ -2649,7 +3038,7 @@ mod tests {
         };
         let omega_randomness = LmHeadOmegaRandomness {
             code_tails: vec![vec![Fp3::from_u64(9)]],
-            salts: (0..8)
+            salts: (0..16)
                 .map(|position| vec![(position as u8) ^ 0x33; 40])
                 .collect(),
             pad: Fp3::from_u64(0x888),

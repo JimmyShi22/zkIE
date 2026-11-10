@@ -935,7 +935,7 @@ impl BatSession {
     }
 }
 
-fn group_index(index: u64, row_bits: u32, first: u64, group_bits: u32) -> Result<u64> {
+pub fn group_index(index: u64, row_bits: u32, first: u64, group_bits: u32) -> Result<u64> {
     if row_bits >= 64 || group_bits >= 64 {
         return Err(Error::InvalidConfig);
     }
