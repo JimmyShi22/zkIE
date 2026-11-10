@@ -92,11 +92,25 @@ fn verify_code(root: &Path, public_dir: &Path, policy: &Path, model_id: &str) ->
     ])
 }
 
+fn identity_block(case_id: &str, anchor: &Digest, model_id: &Digest) -> String {
+    format!(
+        "\n[case.limited_table_identity]\nversion = 1\nmodel = \"gpt2\"\nmodel_version = 1\ncase_id = \"{case_id}\"\nanchor_id = \"{}\"\nmodel_id = \"{}\"\nasset_id = 7\nasset_table_identity = \"{a}\"\ntable_root = \"{r}\"\ntable_record_digest = \"{d}\"\ntable_configuration = \"{c}\"\ncode_log_n = 3\ncode_ell = 5\ncode_r = 3\ntable_v = 1\nanswers = 1\nsalt_bytes = 40\ndistance_radius = 1\ndistance_later_radius = 1\ndistance_m_once = 0\ndistance_m_later = 0\nmatrix_rows_log = 1\nk_lo = 1\nk_col = 2\nprotocol_identity = \"{p}\"\n",
+        digest_to_hex(anchor),
+        digest_to_hex(model_id),
+        a = "33".repeat(32),
+        r = "44".repeat(32),
+        d = "55".repeat(32),
+        c = "66".repeat(32),
+        p = "77".repeat(32),
+    )
+}
+
 fn token_policy(sequence: usize, anchor: &Digest, model_id: &Digest) -> String {
     format!(
-        "policy_version = 1\nmodel = \"gpt2\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"gpt2-seq16\"\nsequence_length = {sequence}\nanchor_id = \"{}\"\nmodel_id = \"{}\"\noutput_mode = \"none\"\n",
+        "policy_version = 1\nmodel = \"gpt2\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"gpt2-seq16\"\nsequence_length = {sequence}\nanchor_id = \"{}\"\nmodel_id = \"{}\"\noutput_mode = \"none\"\n{}",
         digest_to_hex(anchor),
-        digest_to_hex(model_id)
+        digest_to_hex(model_id),
+        identity_block("gpt2-seq16", anchor, model_id)
     )
 }
 
@@ -156,12 +170,15 @@ fn unknown_model_exits_nonzero() {
 #[test]
 fn ambiguous_case_exits_nonzero() {
     let root = temp_dir();
+    let anchor = Digest([0x22; 32]);
+    let model_id = Digest([0x11; 32]);
+    let identity = identity_block("case", &anchor, &model_id);
     let policy = format!(
-        "policy_version = 1\nmodel = \"gpt2\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"case\"\nsequence_length = 1\nanchor_id = \"{}\"\nmodel_id = \"{}\"\noutput_mode = \"none\"\n\n[[case]]\ncase_id = \"case\"\nsequence_length = 1\nanchor_id = \"{}\"\nmodel_id = \"{}\"\noutput_mode = \"none\"\n",
+        "policy_version = 1\nmodel = \"gpt2\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"case\"\nsequence_length = 1\nanchor_id = \"{}\"\nmodel_id = \"{}\"\noutput_mode = \"none\"\n{identity}\n\n[[case]]\ncase_id = \"case\"\nsequence_length = 1\nanchor_id = \"{}\"\nmodel_id = \"{}\"\noutput_mode = \"none\"\n{identity}\n",
         "22".repeat(32),
         "11".repeat(32),
         "22".repeat(32),
-        "11".repeat(32)
+        "11".repeat(32),
     );
     let (public_dir, policy) = setup(
         &root,

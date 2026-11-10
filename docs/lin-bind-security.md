@@ -96,6 +96,37 @@ root is not yet authenticated by an asset opening in this local chain; until
 that closure is added, the table is only tied to the statement's identity and
 the chain's commitments, and the caller-word items above remain open items.
 
+## Trusted-policy table identity warranty
+
+The limited table identity in the trusted policy binds the old model, anchor
+and weight asset to the new committed encoded table through one canonical,
+domain-separated, versioned digest. It covers the model id and version, the
+case id, the anchor id, the asset id and asset table identity, the committed
+table root, the full record digest, the table configuration, the code
+parameters, the table shape and distances, the matrix mapping and the protocol
+identity. The verifier rebuilds the committed side from the public reader, the
+statement and the fixed protocol identity and checks it against the policy
+value; the proof's own statement, roots and metadata are not a substitute. A
+new table root or record therefore rejects until the operator updates the
+policy. A prover-generated policy is not an independent anchor in production:
+policy distribution, freshness and anti-rollback are deployment trust
+assumptions.
+
+This pin is an operator warranty, not a cryptographic permutation proof. The
+trusted operator or publisher warrants that the two commitments -- the old
+model/asset commitment and the new encoded table commitment -- correspond to
+the same canonical weight matrix through the fixed mapping (table row and low
+column to matrix row and column). The chain proves the encoded table's
+relations; it does not prove that the encoding is a permutation of the
+authenticated weights. That equality is the published-release trust assumption
+recorded in the acceptance checklist.
+
+Independently of this pin, hiding remains unclosed. The shared trace's
+AssetOpening carries the opened weight rows as plaintext values to the
+verifier, so a verifier that reads the trace proof sees private weights in the
+clear. This combination must not be described as hidden acceptance; it is a
+controlled diagnostic only.
+
 ## Open items
 
 - The implementation's own round-by-round accounting is not mechanized; the

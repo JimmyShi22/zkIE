@@ -10,6 +10,13 @@
 //! the requested row is copied. The file path itself is not a trusted source:
 //! the identity comes from the compiled asset specification, the public anchor
 //! record and the policy anchor id, all checked here.
+//!
+//! The policy also carries the limited output-head table identity. Its old
+//! model, anchor and asset fields are checked against the same public bundle
+//! here. Its committed table root, record, configuration, shape and mapping
+//! are checked later against the committed reader, after commit, by
+//! `committed_limited_table_identity`; the proof's self-reported metadata is
+//! never substituted for the policy value.
 
 use std::fs;
 use std::io::Cursor;
@@ -21,6 +28,7 @@ use zkie_core::error::{Error, Result};
 use zkie_core::storage::TensorReader;
 use zkie_core::types::{DType, Digest, TensorSpec};
 use zkie_engine::memory::BudgetedMemoryGovernor;
+use zkie_engine::pcs::request::table::IndexReader;
 use zkie_engine::storage::mmap::MmapTensorReader;
 use zkie_ops::op::OpCode;
 use zkie_ops::proof::binding::oracle_start;
@@ -29,9 +37,12 @@ use zkie_ops::proof::model_commitment::{
     ModelCommitmentPublic,
 };
 use zkie_ops::proof::plan::{PlanConfigValue, PlanSource, TracePlan};
-use zkie_ops::proof::session_baseline::{selected_plan_identifier, SelectedMatmulStep};
+use zkie_ops::proof::session_baseline::{
+    selected_plan_identifier, SelectedMatmulStep, SESSION_PROTOCOL_IDENTITY,
+};
 
-use crate::policy::{self, TrustedRequest};
+use crate::lm_head_key::LimitedKeyStatement;
+use crate::policy::{self, LimitedTableIdentity, TrustedRequest};
 use crate::provider::StatementData;
 
 const LM_HEAD_SUFFIX: &str = "gpt2/weights/lm_head_w_i32.bin";
@@ -73,6 +84,8 @@ pub struct LmHeadContext {
     pub model_id: Digest,
     pub asset_root: PathBuf,
     pub asset: LmHeadAsset,
+    /// The trusted policy identity of the limited output-head table.
+    pub limited_table_identity: LimitedTableIdentity,
     pub matmul: LmHeadStep,
     pub plan_identifier: Digest,
     pub plan_steps: usize,
@@ -224,21 +237,43 @@ pub fn load_gpt2_lm_head_context(
         .iter()
         .find(|asset| asset.path == spec.path)
         .ok_or(Error::AssetMismatch)?;
-    let identity = asset_table_identity(spec);
+    let asset_identity = asset_table_identity(spec);
     if meta.asset_id != spec.asset_id
         || meta.element_count != spec.element_count
         || meta.row_width != spec.row_width
         || meta.rows != expected_asset_rows(spec)?
-        || meta.start != oracle_start(&identity)
+        || meta.start != oracle_start(&asset_identity)
         || meta.root != meta.leaf_record.leaf_root
-        || meta.leaf_record.table_identity != identity
+        || meta.leaf_record.table_identity != asset_identity
+    {
+        return Err(Error::StatementMismatch);
+    }
+    if trusted.model_version != zkie_models_gpt2::plan::MODEL_VERSION {
+        return Err(Error::InvalidConfig);
+    }
+    let limited_table_identity = trusted.trusted_limited_table_identity()?.clone();
+    let table_plan = zkie_models_gpt2::lm_head_plan::lm_head_plan()?;
+    table_plan.validate()?;
+    let planned_shape = table_plan.table_shape()?;
+    if limited_table_identity.model != trusted.model
+        || limited_table_identity.model_version != trusted.model_version
+        || limited_table_identity.case_id != trusted.case_id
+        || limited_table_identity.anchor_id != trusted.anchor_id
+        || limited_table_identity.model_id != model_id
+        || limited_table_identity.asset_id != meta.asset_id
+        || limited_table_identity.asset_table_identity != asset_identity
+        || limited_table_identity.protocol_identity != SESSION_PROTOCOL_IDENTITY
+        || limited_table_identity.shape()? != planned_shape
+        || limited_table_identity.matrix_rows_log != table_plan.lin.matrix_rows_log
+        || limited_table_identity.k_lo != table_plan.lin.k_lo
+        || limited_table_identity.k_col != table_plan.lin.k_col
     {
         return Err(Error::StatementMismatch);
     }
     let asset = LmHeadAsset {
         asset_id: meta.asset_id,
         path: meta.path.clone(),
-        table_identity: identity,
+        table_identity: asset_identity,
         element_count: meta.element_count,
         row_width: meta.row_width as u64,
         rows: meta.rows,
@@ -253,13 +288,81 @@ pub fn load_gpt2_lm_head_context(
         model_id,
         asset_root,
         asset,
+        limited_table_identity,
         matmul,
         plan_identifier,
         plan_steps: plan.steps.len(),
     })
 }
 
+/// Rebuilds the trusted table identity from the committed public reader and
+/// statement. The old-side fields come from the trusted policy identity; the
+/// table root, record digest, configuration, shape and mapping come from the
+/// committed reader and the statement. The proof's self-reported values are
+/// not used.
+pub fn committed_limited_table_identity(
+    context: &LmHeadContext,
+    reader: &IndexReader,
+    statement: &LimitedKeyStatement,
+) -> Result<LimitedTableIdentity> {
+    statement.validate()?;
+    if reader.fault().is_some()
+        || statement.model_commitment != context.model_id
+        || statement.table_root != reader.root
+        || statement.table_configuration != reader.configuration
+        || statement.table_shape != reader.shape
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let rows = 1u64
+        .checked_shl(reader.shape.v)
+        .ok_or(Error::InvalidConfig)?;
+    if !statement.matrix_rows.is_power_of_two()
+        || statement.matrix_rows != rows
+        || statement.k_lo >= statement.k_col
+        || statement.k_col > 63
+    {
+        return Err(Error::InvalidConfig);
+    }
+    let factor = 1u64
+        .checked_shl(statement.k_lo)
+        .ok_or(Error::InvalidConfig)?;
+    if factor
+        .checked_mul(statement.matrix_rows)
+        .ok_or(Error::ResourceLimit)?
+        != 1u64 << statement.k_col
+    {
+        return Err(Error::InvalidConfig);
+    }
+    context.limited_table_identity.rebuild_committed(
+        reader.root,
+        zkie_core::artifact::digest_bytes(&reader.record.encode()),
+        reader.configuration,
+        reader.shape,
+        reader.shape.v,
+        statement.k_lo,
+        statement.k_col,
+        SESSION_PROTOCOL_IDENTITY,
+    )
+}
+
 impl LmHeadContext {
+    /// Checks the committed reader and statement against the trusted policy
+    /// table identity. This is the verifier's pin: a new table root, record,
+    /// configuration, shape or mapping fails unless the operator policy was
+    /// updated to name it.
+    pub fn verify_committed_limited_table_identity(
+        &self,
+        reader: &IndexReader,
+        statement: &LimitedKeyStatement,
+    ) -> Result<()> {
+        let actual = committed_limited_table_identity(self, reader, statement)?;
+        if actual.digest()? != self.limited_table_identity.digest()? {
+            return Err(Error::StatementMismatch);
+        }
+        Ok(())
+    }
+
     /// Reads one weight row read-only through the mmap path. Only the requested
     /// row is copied; the row index is checked against the real element count.
     pub fn read_lm_head_row(&self, row: u64) -> Result<Vec<i64>> {

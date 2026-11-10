@@ -119,6 +119,20 @@ impl LmHeadPublicHandoff {
     pub fn digest(&self) -> Result<Digest> {
         Ok(digest_bytes(&self.encode()?))
     }
+
+    /// Checks the handoff's committed public reader and statement against the
+    /// trusted policy table identity. The context's old-side fields were
+    /// already checked against the public anchor and asset when it was loaded.
+    /// The verifier uses this instead of trusting the handoff's own statement
+    /// or roots.
+    pub fn verify_trusted_identity(
+        &self,
+        context: &crate::s7_context::LmHeadContext,
+    ) -> Result<LimitedKeyStatement> {
+        let statement = self.validate()?;
+        context.verify_committed_limited_table_identity(&self.reader, &statement)?;
+        Ok(statement)
+    }
 }
 
 /// The persisted commitment state of the committed table: its public reader

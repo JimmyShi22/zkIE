@@ -71,6 +71,7 @@ use zkie_ops::proof::cs_multi_session::{CsMultiProver, CsMultiSession, OldMaskSo
 use zkie_ops::proof::fold_handoff::{FoldHandoff, FoldHandoffAnchor};
 use zkie_ops::proof::session_baseline::SESSION_PROTOCOL_IDENTITY;
 
+use crate::policy::LimitedTableIdentity;
 use crate::s7_context::LmHeadContext;
 
 /// One LIN request declaration of the output-head relation. It names the
@@ -3081,18 +3082,54 @@ fn check_switch_public_plans(
     Ok(())
 }
 
+/// Checks the trusted policy identity against the committed reader and the
+/// statement the verifier is about to use. The committed values come from the
+/// reader and the fixed protocol identity; the proof's self-reported metadata
+/// cannot replace the policy value.
+fn check_trusted_table_identity(
+    trusted_identity: &LimitedTableIdentity,
+    reader: &IndexReader,
+    trusted: &LimitedKeyStatement,
+) -> Result<()> {
+    trusted.validate()?;
+    let rows = 1u64
+        .checked_shl(reader.shape.v)
+        .ok_or(Error::InvalidConfig)?;
+    if trusted_identity.model_id != trusted.model_commitment
+        || trusted.table_root != reader.root
+        || trusted.table_configuration != reader.configuration
+        || trusted.table_shape != reader.shape
+        || !trusted.matrix_rows.is_power_of_two()
+        || trusted.matrix_rows != rows
+    {
+        return Err(Error::StatementMismatch);
+    }
+    trusted_identity.check_committed(
+        reader.root,
+        zkie_core::artifact::digest_bytes(&reader.record.encode()),
+        reader.configuration,
+        reader.shape,
+        reader.shape.v,
+        trusted.k_lo,
+        trusted.k_col,
+        SESSION_PROTOCOL_IDENTITY,
+    )
+}
+
 /// Replays the whole chain from the public setup, the public switch plans and
 /// the artifact messages. The replay builds only zero coefficient vectors of
 /// the required shapes; every claim used for a check is recomputed from the
 /// verifier session or the artifact. Returns the final seal.
 pub fn verify_limited_chain(
     setup: &LimitedVerifySetup,
+    trusted_identity: &LimitedTableIdentity,
     trusted: &LimitedKeyStatement,
     switches: &[LimitedSwitchPlan],
     old_mask_plan: Option<MaskTreePlan>,
     old_mask_root: Option<Digest>,
     artifact: &LimitedChainArtifact,
 ) -> Result<Digest> {
+    check_trusted_table_identity(trusted_identity, &setup.plan.reader, trusted)?;
     if artifact.switches.len() != switches.len()
         || setup.switch_positions.len() != switches.len()
         || setup.switch_public_plans.len() != switches.len()
@@ -6787,6 +6824,69 @@ mod tests {
             trusted_i32_mapping: true,
         };
         masked.validate().expect("statement");
+        // The trusted publisher is a separate operator step: after commit, the
+        // identity is computed from the committed public reader and record and
+        // an updated policy copy is written. Prove and verify consume that
+        // copy; the table root is never accepted without it.
+        let committed_identity = crate::s7_context::committed_limited_table_identity(
+            &context,
+            holder.reader(),
+            &masked,
+        )
+        .expect("committed identity");
+        let base_policy = std::fs::read(root.join("models/gpt2/case.policy")).expect("policy");
+        let document = crate::policy::parse(&base_policy).expect("policy document");
+        let document = crate::policy::bind_limited_table_identity(
+            &document,
+            &context.policy.case_id,
+            committed_identity,
+        )
+        .expect("bound policy");
+        let operator_dir = std::env::temp_dir().join("zkie-real-lm-head-policy");
+        std::fs::create_dir_all(&operator_dir).expect("operator dir");
+        let operator_policy = operator_dir.join("case.policy");
+        crate::policy::write_document(&operator_policy, &document).expect("write policy");
+        let operator_context = crate::s7_context::load_gpt2_lm_head_context(
+            &case,
+            &operator_policy,
+            &public,
+            &statement_path,
+            statement_data.model_commitment,
+        )
+        .expect("operator context");
+        let trusted_identity = operator_context.limited_table_identity.clone();
+        // A policy whose old side does not match the public anchor and asset is
+        // rejected when the trusted context is loaded.
+        let case_position = document
+            .case
+            .iter()
+            .position(|entry| entry.case_id == context.policy.case_id)
+            .expect("selected case");
+        let mut asset_swap = document.clone();
+        asset_swap.case[case_position]
+            .limited_table_identity
+            .as_mut()
+            .expect("identity")
+            .asset_id += 1;
+        let mut version_swap = document.clone();
+        version_swap.model_version = zkie_models_gpt2::plan::MODEL_VERSION + 1;
+        for entry in &mut version_swap.case {
+            if let Some(identity) = &mut entry.limited_table_identity {
+                identity.model_version = zkie_models_gpt2::plan::MODEL_VERSION + 1;
+            }
+        }
+        for (name, tampered) in [("asset", asset_swap), ("version", version_swap)] {
+            let path = operator_dir.join(format!("tampered-{name}.policy"));
+            crate::policy::write_document(&path, &tampered).expect("tampered policy");
+            assert!(crate::s7_context::load_gpt2_lm_head_context(
+                &case,
+                &path,
+                &public,
+                &statement_path,
+                statement_data.model_commitment,
+            )
+            .is_err());
+        }
         let fold_mask_columns = 1u64 << compiled.once.folded.mask.log_n;
         let mask_randomness = LmHeadMaskRandomness {
             seed: random_digest(),
@@ -6957,6 +7057,7 @@ mod tests {
         assert!(verify_setup.column_work_bits > 0 && verify_setup.switch_work_bits > 0);
         let verified_seal = verify_limited_chain(
             &verify_setup,
+            &trusted_identity,
             &masked,
             &verify_plans,
             Some(old_mask_plan),
@@ -6971,6 +7072,7 @@ mod tests {
         let verify = |artifact: &LimitedChainArtifact| {
             verify_limited_chain(
                 &verify_setup,
+                &trusted_identity,
                 &masked,
                 &verify_plans,
                 Some(old_mask_plan.clone()),
@@ -6982,6 +7084,7 @@ mod tests {
         wrong_target[0].target = verify_setup.switches[1].clone();
         assert!(verify_limited_chain(
             &verify_setup,
+            &trusted_identity,
             &masked,
             &wrong_target,
             Some(old_mask_plan.clone()),
@@ -6994,6 +7097,7 @@ mod tests {
             edit(&mut plans[0]);
             assert!(verify_limited_chain(
                 &verify_setup,
+                &trusted_identity,
                 &masked,
                 &plans,
                 Some(old_mask_plan.clone()),
@@ -7024,6 +7128,44 @@ mod tests {
         let mut wrong_statement = decoded.clone();
         wrong_statement.statement.table_root = Digest([0x77; 32]);
         assert!(verify(&wrong_statement).is_err());
+        // The policy identity pins the committed table. Replacing its root,
+        // record digest, configuration, shape, mapping, protocol identity or
+        // model id without an operator policy update rejects.
+        let verify_with = |artifact: &LimitedChainArtifact, identity: &LimitedTableIdentity| {
+            verify_limited_chain(
+                &verify_setup,
+                identity,
+                &masked,
+                &verify_plans,
+                Some(old_mask_plan.clone()),
+                Some(old_mask_root),
+                artifact,
+            )
+        };
+        let mut wrong_root = trusted_identity.clone();
+        wrong_root.table_root = Digest([0x71; 32]);
+        assert!(verify_with(&decoded, &wrong_root).is_err());
+        let mut wrong_record = trusted_identity.clone();
+        wrong_record.table_record_digest = Digest([0x72; 32]);
+        assert!(verify_with(&decoded, &wrong_record).is_err());
+        let mut wrong_configuration = trusted_identity.clone();
+        wrong_configuration.table_configuration = Digest([0x73; 32]);
+        assert!(verify_with(&decoded, &wrong_configuration).is_err());
+        let mut wrong_shape = trusted_identity.clone();
+        wrong_shape.code_log_n += 1;
+        assert!(verify_with(&decoded, &wrong_shape).is_err());
+        let mut wrong_mapping = trusted_identity.clone();
+        wrong_mapping.k_lo += 1;
+        assert!(verify_with(&decoded, &wrong_mapping).is_err());
+        let mut wrong_protocol = trusted_identity.clone();
+        wrong_protocol.protocol_identity = Digest([0x74; 32]);
+        assert!(verify_with(&decoded, &wrong_protocol).is_err());
+        let mut wrong_model_id = trusted_identity.clone();
+        wrong_model_id.model_id = Digest([0x75; 32]);
+        assert!(verify_with(&decoded, &wrong_model_id).is_err());
+        // The random table this test commits is not the table the pre-commit
+        // policy identity pins; without the operator update it rejects.
+        assert!(verify_with(&decoded, &context.limited_table_identity).is_err());
         let mut wrong_gu_root = decoded.clone();
         wrong_gu_root.gu_root = Digest([0x78; 32]);
         assert!(verify(&wrong_gu_root).is_err());
@@ -7810,12 +7952,27 @@ mod stage_tests {
         configuration: Digest,
     }
 
-    fn load_inputs() -> Result<Inputs> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
-            .expect("repository root");
+            .expect("repository root")
+            .to_path_buf()
+    }
+
+    /// The pre-commit policy. Its limited table identity pins the operator's
+    /// provisioning commit, not the table this run is about to commit.
+    fn base_policy_path() -> PathBuf {
+        repo_root().join("models/gpt2/case.policy")
+    }
+
+    /// The trusted policy copy the operator writes after commit.
+    fn operator_policy_path(dir: &Path) -> PathBuf {
+        dir.join("policy").join("case.policy")
+    }
+
+    fn load_inputs(policy_path: &Path) -> Result<Inputs> {
+        let root = repo_root();
         let case = root.join("models/gpt2/case.toml");
-        let policy_path = root.join("models/gpt2/case.policy");
         let public = root.join(
             "docs/benchmarks/20261110-0547-verify-bytes-109934bd-670a98c9/prod/gpt2-seq16/commit/public",
         );
@@ -7958,7 +8115,7 @@ mod stage_tests {
 
     fn stage_commit(dir: &Path) -> Result<serde_json::Value> {
         let start = Instant::now();
-        let inputs = load_inputs()?;
+        let inputs = load_inputs(&base_policy_path())?;
         let shape = inputs.request_plan.table_shape()?;
         let key = random_key(shape);
         let private_dir = dir.join("private");
@@ -8000,6 +8157,20 @@ mod stage_tests {
         store.cleanup()?;
         let statement = masked_statement(&inputs, &reader);
         statement.validate()?;
+        // The operator step: compute the trusted identity from the committed
+        // public reader and record, then write the policy copy that prove and
+        // verify consume. The table was not known before this commit.
+        let committed_identity =
+            crate::s7_context::committed_limited_table_identity(&inputs.context, &reader, &statement)?;
+        let base_policy = std::fs::read(base_policy_path()).map_err(|_| Error::Io)?;
+        let document = crate::policy::parse(&base_policy)?;
+        let document = crate::policy::bind_limited_table_identity(
+            &document,
+            &inputs.context.policy.case_id,
+            committed_identity,
+        )?;
+        let operator_policy = operator_policy_path(dir);
+        crate::policy::write_document(&operator_policy, &document)?;
         let session_bytes = random_digest();
         let public_plan = build_limited_public_plan(
             &inputs.request_plan,
@@ -8082,6 +8253,7 @@ mod stage_tests {
                 "public_digest": format!("{digest:?}"),
                 "switch_count": handoff.switches.len(),
                 "private_state_bytes": private_bytes,
+                "policy": operator_policy.to_string_lossy().into_owned(),
             }),
         ))
     }
@@ -8094,17 +8266,19 @@ mod stage_tests {
         let start = Instant::now();
         let handoff = load_handoff(dir)?;
         let digest = handoff.digest()?;
-        let statement = handoff.validate()?;
-        let private_dir = dir.join("private");
-        let private = read_private(&private_dir.join("prove-state.bin"), digest)?;
-        let _claim = claim_budget(&private_dir, digest, LM_HEAD_COLUMN_DRAWS as u64)?;
-        let inputs = load_inputs()?;
+        let inputs = load_inputs(&operator_policy_path(dir))?;
+        // Prove consumes the operator policy as a trusted input: the handoff's
+        // reader and statement must be the table the policy pins.
+        let statement = handoff.verify_trusted_identity(&inputs.context)?;
         if handoff.plan_identifier != inputs.context.plan_identifier
             || handoff.case_id != inputs.context.policy.case_id.as_bytes()
             || statement.model_commitment != inputs.context.model_id
         {
             return Err(Error::StatementMismatch);
         }
+        let private_dir = dir.join("private");
+        let private = read_private(&private_dir.join("prove-state.bin"), digest)?;
+        let _claim = claim_budget(&private_dir, digest, LM_HEAD_COLUMN_DRAWS as u64)?;
         let public_plan = build_limited_public_plan(
             &inputs.request_plan,
             &inputs.compiled,
@@ -8231,10 +8405,12 @@ mod stage_tests {
     fn stage_verify(dir: &Path) -> Result<serde_json::Value> {
         let start = Instant::now();
         let handoff = load_handoff(dir)?;
-        let statement = handoff.validate()?;
         let bytes = read_public_file(&dir.join("proof").join("artifact.bin"))?;
         let artifact = LimitedChainArtifact::decode(&bytes)?;
-        let inputs = load_inputs()?;
+        let inputs = load_inputs(&operator_policy_path(dir))?;
+        // Verify consumes the operator policy as a trusted input. The proof's
+        // own statement and roots cannot stand in for the policy identity.
+        let statement = handoff.verify_trusted_identity(&inputs.context)?;
         if handoff.plan_identifier != inputs.context.plan_identifier
             || handoff.case_id != inputs.context.policy.case_id.as_bytes()
             || statement.model_commitment != inputs.context.model_id
@@ -8254,6 +8430,7 @@ mod stage_tests {
         let old_public = handoff.old_mask.as_ref().ok_or(Error::IncompleteArtifact)?;
         let sealed = verify_limited_chain(
             &setup,
+            &inputs.context.limited_table_identity,
             &statement,
             &handoff.switches,
             Some(old_public.plan),
@@ -8352,6 +8529,16 @@ mod stage_tests {
             assert!(value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false));
             positive.push((stage, value));
         }
+
+        // A new random table without an operator policy update is rejected: the
+        // pre-commit policy still pins the provisioning table, not this commit.
+        let operator_policy = operator_policy_path(&dir);
+        let updated_policy = std::fs::read(&operator_policy).expect("operator policy");
+        let stale_policy = std::fs::read(base_policy_path()).expect("base policy");
+        std::fs::write(&operator_policy, &stale_policy).expect("stale policy");
+        let output = run_stage(&executable, &dir, "verify");
+        assert!(!output.status.success());
+        std::fs::write(&operator_policy, &updated_policy).expect("restore policy");
 
         // A second prove must not reuse the spent budget.
         let output = run_stage(&executable, &dir, "prove");
