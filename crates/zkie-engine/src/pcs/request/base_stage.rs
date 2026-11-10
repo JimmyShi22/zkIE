@@ -1,17 +1,18 @@
 //! Isolated BASE algebra.
 //!
-//! This module computes the masking row target, the M'/R' plaintext rows, the
-//! final linear check and the symbol check. Commitments, SEND and opening
-//! verification belong to the isolated session; this module never treats a
-//! public target or a fixture row as authenticated.
+//! The prover sends target* and the plaintext M'/R' rows. The verifier checks
+//! the linear relation and the sampled symbol relations against authenticated
+//! openings. Commitments, SEND and opening verification belong to the isolated
+//! session; this module never treats a public target or a fixture row as
+//! authenticated.
 
 use zkie_core::error::{Error, Result};
 
 use crate::pcs::request::field::Fp3;
 use crate::pcs::request::proximity::SingleRows;
 
-/// The public BASE values and plaintext rows. M' and R' are deliberately not
-/// committed.
+/// The prover's BASE message and plaintext rows. M' and R' are deliberately
+/// not committed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BaseRows {
     pub target_star: Fp3,
@@ -44,8 +45,9 @@ fn combine(star: &[Fp3], lambda: Fp3, row: &[Fp3]) -> Result<Vec<Fp3>> {
         .collect())
 }
 
-/// Builds target* and M'/R'. The caller must commit the star row and absorb
-/// target*/root before drawing lambda; this function only performs algebra.
+/// Prover-side: builds target* and M'/R' from the final plaintext rows. The
+/// prover must commit the star row and send target*/its commitment before the
+/// verifier draws lambda; this function only performs algebra.
 pub fn prepare(
     rows: &SingleRows,
     star_main: &[Fp3],
@@ -77,15 +79,20 @@ pub fn prepare(
     })
 }
 
-/// The final linear check.
-pub fn linear_holds(rows: &SingleRows, prepared: &BaseRows) -> Result<bool> {
-    let main = inner(&rows.claim, &prepared.main_prime)?;
-    let mask = inner(&rows.mask_claims[0], &prepared.mask_prime)?;
-    Ok(main
-        .add(&mask)
-        == prepared
-            .target_star
-            .add(&prepared.lambda.mul(&rows.target)))
+/// Verifier-side: the final linear check, using the verifier's own combined
+/// claim and target, not the prover's claim values.
+pub fn linear_holds(
+    claim: &[Fp3],
+    mask_claim: &[Fp3],
+    target: Fp3,
+    prepared: &BaseRows,
+) -> Result<bool> {
+    if claim.len() != prepared.main_prime.len() || mask_claim.len() != prepared.mask_prime.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    let main = inner(claim, &prepared.main_prime)?;
+    let mask = inner(mask_claim, &prepared.mask_prime)?;
+    Ok(main.add(&mask) == prepared.target_star.add(&prepared.lambda.mul(&target)))
 }
 
 /// The symbol check at one position. `encoded_prime` is the symbol of
@@ -138,7 +145,7 @@ mod tests {
             lambda,
         )
         .unwrap();
-        assert!(linear_holds(&rows, &prepared).unwrap());
+        assert!(linear_holds(&rows.claim, &rows.mask_claims[0], rows.target, &prepared).unwrap());
         let encoded = encode_row_fp3(&rows.code, &prepared.main_prime, &prepared.main_tail_prime)
             .unwrap();
         let old = encode_row_fp3(&rows.code, &rows.main, &rows.main_tail).unwrap();
@@ -146,7 +153,10 @@ mod tests {
         assert!(symbol_holds(encoded[0], star[0], lambda, old[0]));
         let mut bad_target = prepared.clone();
         bad_target.target_star = bad_target.target_star.add(&Fp3::ONE);
-        assert!(!linear_holds(&rows, &bad_target).unwrap());
+        assert!(!linear_holds(&rows.claim, &rows.mask_claims[0], rows.target, &bad_target).unwrap());
         assert!(!symbol_holds(encoded[0].add(&Fp3::ONE), star[0], lambda, old[0]));
+        let mut wrong_claim = rows.claim.clone();
+        wrong_claim[0] = wrong_claim[0].add(&Fp3::ONE);
+        assert!(!linear_holds(&wrong_claim, &rows.mask_claims[0], rows.target, &prepared).unwrap());
     }
 }

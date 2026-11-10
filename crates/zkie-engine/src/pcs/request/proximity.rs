@@ -1,9 +1,9 @@
 //! Isolated two-stage proximity plan and single-row handoff.
 //!
 //! This is candidate development code. It defines only the verifier-side plan
-//! constraints and the row handoff used by the isolated CS/BASE demonstration.
-//! It does not implement a complete proximity test, a production statement or
-//! a proof-byte format.
+//! constraints, the verifier-side statement view and the prover-side row
+//! handoff used by the isolated CS/BASE demonstration. It does not implement a
+//! complete proximity test, a production statement or a proof-byte format.
 
 use zkie_core::error::{Error, Result};
 
@@ -34,6 +34,7 @@ pub struct ProximityStage {
     pub h: u32,
     pub answers: u32,
     pub samples: u32,
+    pub folds: bool,
     pub choice: ChoiceReference,
 }
 
@@ -87,6 +88,18 @@ impl ProximityPlan {
         {
             return Some("a stage choice is not from the verifier plan");
         }
+        if switch.folds && switch.k < 1 {
+            return Some("a folding stage has no row variable");
+        }
+        if !switch.folds && switch.k != 0 {
+            return Some("a non-folding stage names rows");
+        }
+        if switch.folds {
+            return Some("the isolated subset does not implement row folding");
+        }
+        if base.folds {
+            return Some("the final stage cannot fold rows");
+        }
         if switch.k >= 64
             || switch.h > switch.k
             || base.k != 0
@@ -102,6 +115,9 @@ impl ProximityPlan {
         {
             return Some("a mask row has no room for its sample answer");
         }
+        if switch.h as u64 > switch.mask_code.ell {
+            return Some("a stage has more mask rows than mask capacity");
+        }
         let switch_main_needed = self.input_code.ell.saturating_add(self.input_code.r);
         let switch_mask_needed = self
             .input_mask_code
@@ -112,6 +128,13 @@ impl ProximityPlan {
         }
         if switch.code.ell < 1 || base.code.ell < 1 {
             return Some("a stage has no message entry");
+        }
+        if base.code.ell != switch.code.ell
+            || base.code.r != switch.code.r
+            || base.mask_code.ell != switch.mask_code.ell
+            || base.mask_code.r != switch.mask_code.r
+        {
+            return Some("the base message shape does not match the switched message");
         }
         None
     }
@@ -124,8 +147,64 @@ impl ProximityPlan {
     }
 }
 
-/// The last-stage handoff: one main row and zero or more old mask rows, with
-/// one linear claim. Kept rows are deliberately absent; this is a BASE
+/// The verifier-side statement view: codes, claim data and row lengths only.
+/// The old plaintext rows are prover material and never enter this view; the
+/// verifier authenticates old symbols by opening the committed rows at the
+/// drawn positions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProximityStatement {
+    pub code: CodeParams,
+    pub mask_code: CodeParams,
+    pub main_len: u64,
+    pub main_tail_len: u64,
+    pub mask_len: u64,
+    pub mask_tail_len: u64,
+    pub claim: Vec<Fp3>,
+    pub mask_claims: Vec<Vec<Fp3>>,
+    pub target: Fp3,
+}
+
+impl ProximityStatement {
+    pub fn from_rows(rows: &SingleRows) -> Result<Self> {
+        rows.check()?;
+        Ok(Self {
+            code: rows.code,
+            mask_code: rows.mask_code,
+            main_len: rows.main.len() as u64,
+            main_tail_len: rows.main_tail.len() as u64,
+            mask_len: rows.masks[0].len() as u64,
+            mask_tail_len: rows.mask_tails[0].len() as u64,
+            claim: rows.claim.clone(),
+            mask_claims: rows.mask_claims.clone(),
+            target: rows.target,
+        })
+    }
+
+    pub fn check(&self) -> Result<()> {
+        build_code_plan(self.code.log_n, self.code.ell, self.code.r)?;
+        build_code_plan(self.mask_code.log_n, self.mask_code.ell, self.mask_code.r)?;
+        if self.main_len != self.code.ell
+            || self.main_tail_len != self.code.r
+            || self.mask_len != self.mask_code.ell
+            || self.mask_tail_len != self.mask_code.r
+            || self.claim.len() as u64 != self.code.ell
+            || self.mask_claims.len() != 1
+            || self.mask_claims[0].len() as u64 != self.mask_code.ell
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        Ok(())
+    }
+
+    /// A position on a mask row: the main position modulo the mask code's
+    /// column count.
+    pub fn mask_position(&self, position: u64) -> u64 {
+        position % self.mask_code.n()
+    }
+}
+
+/// The prover-side last-stage handoff: one main row and one mask row with one
+/// combined claim. Kept rows are deliberately absent; this is a BASE
 /// precondition, not a general group representation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SingleRows {
@@ -199,6 +278,7 @@ mod tests {
                     h: 0,
                     answers: 1,
                     samples: 2,
+                    folds: false,
                     choice: ChoiceReference::VerifierPlan,
                 },
                 ProximityStage {
@@ -209,6 +289,7 @@ mod tests {
                     h: 0,
                     answers: 1,
                     samples: 4,
+                    folds: false,
                     choice: ChoiceReference::VerifierPlan,
                 },
             ],
@@ -227,6 +308,19 @@ mod tests {
         assert!(bad.check().is_err());
         let mut bad = plan.clone();
         bad.stages[0].mask_code = code(4, 4, 1);
+        assert!(bad.check().is_err());
+        let mut bad = plan.clone();
+        bad.stages[0].folds = true;
+        assert!(bad.check().is_err());
+        let mut bad = plan.clone();
+        bad.stages[0].folds = true;
+        bad.stages[0].k = 1;
+        assert_eq!(
+            bad.fault(),
+            Some("the isolated subset does not implement row folding")
+        );
+        let mut bad = plan.clone();
+        bad.stages[0].h = 7;
         assert!(bad.check().is_err());
         let mut bad = plan.clone();
         bad.stages[0].role = StageRole::Base;
@@ -256,6 +350,9 @@ mod tests {
         assert!(rows.check().is_ok());
         assert!(rows.base_ready().is_ok());
         assert_eq!(rows.mask_position(9), 1);
+        let statement = ProximityStatement::from_rows(&rows).unwrap();
+        assert!(statement.check().is_ok());
+        assert_eq!(statement.mask_position(9), 1);
         let mut bad = rows;
         bad.main.pop();
         assert!(bad.check().is_err());

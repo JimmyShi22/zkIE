@@ -7,13 +7,13 @@ use std::time::Instant;
 use zkie_engine::pcs::request::code::build_code_plan;
 use zkie_engine::pcs::request::field::Fp3;
 use zkie_engine::pcs::request::proximity::{
-    ProximityPlan, ProximityStage, SingleRows, StageRole,
+    ProximityPlan, ProximityStage, ProximityStatement, SingleRows, StageRole,
 };
 use zkie_ops::proof::lin_session::fp3_from_signed_word;
 use zkie_ops::proof::model_commitment::{
     verify_model_anchor, ModelCommitmentPublic, SharedTrace,
 };
-use zkie_ops::proof::proximity_session::verify_proximity_session;
+use zkie_ops::proof::proximity_session::{verify_proximity_session, ProximityProver};
 use zkie_ops::proof::session_baseline::TrustedModel;
 
 fn dot(a: &[Fp3], b: &[Fp3]) -> Fp3 {
@@ -96,6 +96,7 @@ fn selected_gpt2_cs_base_component() {
                 h: 0,
                 answers: 1,
                 samples: 3,
+                folds: false,
                 choice: zkie_engine::pcs::request::proximity::ChoiceReference::VerifierPlan,
             },
             ProximityStage {
@@ -106,21 +107,30 @@ fn selected_gpt2_cs_base_component() {
                 h: 0,
                 answers: 1,
                 samples: 4,
+                folds: false,
                 choice: zkie_engine::pcs::request::proximity::ChoiceReference::VerifierPlan,
             },
         ],
     };
 
-    let started = Instant::now();
-    let outcome = verify_proximity_session(
+    let statement = ProximityStatement::from_rows(&rows).unwrap();
+    let bad_rows = rows.clone();
+    let star_main_original = star_main.clone();
+    let star_tail_original = star_tail.clone();
+    let star_mask_original = star_mask.clone();
+    let star_mask_tail_original = star_mask_tail.clone();
+    let prover = ProximityProver::new(
         &plan,
-        &rows,
-        &star_main,
-        &star_tail,
-        &star_mask,
-        &star_mask_tail,
+        rows,
+        star_main,
+        star_tail,
+        star_mask,
+        star_mask_tail,
     )
     .unwrap();
+    let messages = prover.messages().unwrap();
+    let started = Instant::now();
+    let outcome = verify_proximity_session(&plan, &statement, messages, &prover).unwrap();
     println!("proximity_session_ms={}", started.elapsed().as_millis());
     println!("old_main_root={:?}", outcome.old_main_root);
     println!("old_mask_root={:?}", outcome.old_mask_root);
@@ -132,55 +142,35 @@ fn selected_gpt2_cs_base_component() {
     println!("theta={:?}", outcome.theta);
     println!("lambda={:?}", outcome.lambda);
     assert!(outcome.stage_handoff);
+    assert!(outcome.sample_verified);
     assert!(outcome.base_linear);
     assert!(outcome.symbol_checks);
     assert!(outcome.next_stage);
     assert_eq!(outcome.next_stage().unwrap(), zkie_ops::proof::proximity_session::ProximityNext::BaseComplete);
-    assert_eq!(outcome.registration_count, 4);
+    assert_eq!(outcome.registration_count, 7);
 
-    let mut bad_rows = rows.clone();
+    let mut bad_rows = bad_rows;
     bad_rows.target = bad_rows.target.add(&Fp3::ONE);
-    assert!(verify_proximity_session(
+    let bad_statement = ProximityStatement::from_rows(&bad_rows).unwrap();
+    let bad_prover = ProximityProver::new(
         &plan,
-        &bad_rows,
-        &star_main,
-        &star_tail,
-        &star_mask,
-        &star_mask_tail
+        bad_rows,
+        star_main_original,
+        star_tail_original,
+        star_mask_original,
+        star_mask_tail_original,
     )
-    .is_err());
+    .unwrap();
+    let bad_messages = bad_prover.messages().unwrap();
+    assert!(verify_proximity_session(&plan, &bad_statement, bad_messages, &bad_prover).is_err());
 
     let mut bad_plan = plan.clone();
     bad_plan.stages.truncate(1);
-    assert!(verify_proximity_session(
-        &bad_plan,
-        &rows,
-        &star_main,
-        &star_tail,
-        &star_mask,
-        &star_mask_tail
-    )
-    .is_err());
+    assert!(verify_proximity_session(&bad_plan, &statement, messages, &prover).is_err());
 
     let mut bad_plan = plan.clone();
     bad_plan.input_code = new_code;
-    assert!(verify_proximity_session(
-        &bad_plan,
-        &rows,
-        &star_main,
-        &star_tail,
-        &star_mask,
-        &star_mask_tail
-    )
-    .is_err());
+    assert!(verify_proximity_session(&bad_plan, &statement, messages, &prover).is_err());
 
-    assert!(verify_proximity_session(
-        &plan,
-        &rows,
-        &star_main,
-        &star_tail,
-        &star_mask,
-        &star_mask_tail
-    )
-    .is_ok());
+    assert!(verify_proximity_session(&plan, &statement, messages, &prover).is_ok());
 }

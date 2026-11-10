@@ -1,16 +1,16 @@
-//! Isolated code-switch claim registration.
+//! Isolated code-switch stage.
 //!
-//! This module implements the algebraic core of the isolated CS stage: the
-//! old single rows are placed in new-code messages/tails, the old symbols are
-//! read, and the original and generator-position claims are registered. It
-//! does not prove that the new message is a correct re-encoding; that is the
-//! later proximity test's task. No kept-row path is exercised in this subset.
+//! The prover side builds the switched message. The verifier side registers
+//! the original claim and one generator-position claim per authenticated old
+//! opening, then combines them by powers of theta. Registration is not a proof
+//! that the switched message is a correct re-encoding; that is the later
+//! proximity test's task. No kept-row path is exercised in this subset.
 
 use zkie_core::error::{Error, Result};
 
 use crate::pcs::request::code::{encode_row_fp3, CodeParams};
 use crate::pcs::request::field::Fp3;
-use crate::pcs::request::proximity::SingleRows;
+use crate::pcs::request::proximity::{ProximityStatement, SingleRows};
 
 /// One registered linear claim on the new-code main/mask messages.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,19 +20,109 @@ pub struct SwitchClaim {
     pub target: Fp3,
 }
 
-/// The switched messages and registered claims. This is not a proof that the
-/// new encoding is correct.
+/// One authenticated old-row opening at a drawn position. The symbol values
+/// come from `verify_opening`; the coordinate is the drawn position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthenticatedSymbols {
+    pub position: u64,
+    pub main: Fp3,
+    pub mask: Fp3,
+}
+
+/// The prover's switched message. It is prover material; the verifier never
+/// receives these values, only the commitment to their encoding.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SwitchedRows {
+pub struct SwitchedMessage {
     pub main: Vec<Fp3>,
     pub main_tail: Vec<Fp3>,
     pub mask: Vec<Fp3>,
     pub mask_tail: Vec<Fp3>,
+}
+
+/// The verifier-side registration output. There is no plaintext message here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SwitchedClaims {
     pub positions: Vec<u64>,
     pub old_symbols: Vec<Fp3>,
     pub claims: Vec<SwitchClaim>,
     pub theta: Fp3,
     pub combined: SwitchClaim,
+    pub main_len: u64,
+    pub main_tail_len: u64,
+    pub mask_len: u64,
+    pub mask_tail_len: u64,
+}
+
+impl SwitchedClaims {
+    pub fn check(&self, code: CodeParams, mask_code: CodeParams) -> Result<()> {
+        if self.main_len != code.ell
+            || self.main_tail_len != code.r
+            || self.mask_len != mask_code.ell
+            || self.mask_tail_len != mask_code.r
+            || self.combined.main.len() as u64 != self.main_len
+            || self.combined.mask.len() as u64 != self.mask_len
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        if self.positions.len() != self.old_symbols.len() {
+            return Err(Error::ShapeMismatch);
+        }
+        Ok(())
+    }
+
+    /// The isolated no-kept-row handoff is ready when the register shapes fit
+    /// the final codes. The second mask row and kept rows are unsupported.
+    pub fn base_ready(&self, code: CodeParams, mask_code: CodeParams) -> Result<()> {
+        self.check(code, mask_code)
+    }
+}
+
+fn switched_lengths(
+    rows: &SingleRows,
+    new_code: CodeParams,
+    new_mask_code: CodeParams,
+) -> Result<(usize, usize, usize, usize)> {
+    if rows.masks.len() != 1 {
+        return Err(Error::UnsupportedPrimitive);
+    }
+    if new_code.ell < rows.code.ell + rows.code.r
+        || new_mask_code.ell < rows.mask_code.ell + rows.mask_code.r
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    Ok((
+        new_code.ell as usize,
+        new_code.r as usize,
+        new_mask_code.ell as usize,
+        new_mask_code.r as usize,
+    ))
+}
+
+/// Builds the switched message for the prover. The old messages and their
+/// random tails occupy the front of the new message; the remaining entries are
+/// zero in this subset.
+pub fn switched_message(
+    rows: &SingleRows,
+    new_code: CodeParams,
+    new_mask_code: CodeParams,
+) -> Result<SwitchedMessage> {
+    rows.base_ready()?;
+    let (main_len, main_tail_len, mask_len, mask_tail_len) =
+        switched_lengths(rows, new_code, new_mask_code)?;
+    let mut main = vec![Fp3::ZERO; main_len];
+    let mut mask = vec![Fp3::ZERO; mask_len];
+    main[..rows.main.len()].copy_from_slice(&rows.main);
+    main[rows.main.len()..rows.main.len() + rows.main_tail.len()]
+        .copy_from_slice(&rows.main_tail);
+    mask[..rows.masks[0].len()].copy_from_slice(&rows.masks[0]);
+    mask[rows.masks[0].len()..rows.masks[0].len() + rows.mask_tails[0].len()]
+        .copy_from_slice(&rows.mask_tails[0]);
+    Ok(SwitchedMessage {
+        main,
+        main_tail: vec![Fp3::ZERO; main_tail_len],
+        mask,
+        mask_tail: vec![Fp3::ZERO; mask_tail_len],
+    })
 }
 
 fn coeff_on_message(code: &CodeParams, position: u64, length: usize) -> Result<Vec<Fp3>> {
@@ -69,111 +159,79 @@ fn add_scaled(target: &mut [Fp3], source: &[Fp3], scale: Fp3) -> Result<()> {
     Ok(())
 }
 
-/// Registers the original claim and one generator-position claim per old
-/// position, then combines them with the supplied theta. The returned claims
-/// are pending: registration is not verification, and a false claim is for
-/// the later proximity test to catch.
+/// Registers the original claim and one generator-position claim per
+/// authenticated old position, then combines them with the supplied theta.
+/// The returned claims are pending: registration is not verification, and a
+/// false claim is for the later proximity test to catch.
 pub fn register_switch(
-    rows: &SingleRows,
+    statement: &ProximityStatement,
     new_code: CodeParams,
     new_mask_code: CodeParams,
-    positions: &[u64],
+    authenticated: &[AuthenticatedSymbols],
     theta: Fp3,
-) -> Result<SwitchedRows> {
-    rows.base_ready()?;
-    if rows.masks.len() != 1 {
-        return Err(Error::UnsupportedPrimitive);
-    }
-    if new_code.ell < rows.code.ell + rows.code.r
-        || new_mask_code.ell < rows.mask_code.ell + rows.mask_code.r
+) -> Result<SwitchedClaims> {
+    statement.check()?;
+    if new_code.ell < statement.main_len + statement.main_tail_len
+        || new_mask_code.ell < statement.mask_len + statement.mask_tail_len
     {
         return Err(Error::ShapeMismatch);
     }
-    let old_main = encode_row_fp3(&rows.code, &rows.main, &rows.main_tail)?;
-    let old_mask = encode_row_fp3(
-        &rows.mask_code,
-        &rows.masks[0],
-        &rows.mask_tails[0],
-    )?;
-    let mut main = vec![Fp3::ZERO; new_code.ell as usize];
-    let main_tail = vec![Fp3::ZERO; new_code.r as usize];
-    let mut mask = vec![Fp3::ZERO; new_mask_code.ell as usize];
-    let mask_tail = vec![Fp3::ZERO; new_mask_code.r as usize];
-    for (to, from) in main.iter_mut().zip(&rows.main) {
-        *to = *from;
-    }
-    for (to, from) in main.iter_mut().skip(rows.code.ell as usize).zip(&rows.main_tail) {
-        *to = *from;
-    }
-    for (to, from) in mask.iter_mut().zip(&rows.masks[0]) {
-        *to = *from;
-    }
-    for (to, from) in mask.iter_mut().skip(rows.mask_code.ell as usize).zip(&rows.mask_tails[0]) {
-        *to = *from;
-    }
+    let main_len = new_code.ell as usize;
+    let mask_len = new_mask_code.ell as usize;
 
     let mut claims = Vec::new();
-    let mut original_main = vec![Fp3::ZERO; new_code.ell as usize];
-    let mut original_mask = vec![Fp3::ZERO; new_mask_code.ell as usize];
-    for (to, from) in original_main.iter_mut().zip(&rows.claim) {
-        *to = *from;
-    }
-    for (to, from) in original_mask.iter_mut().zip(&rows.mask_claims[0]) {
-        *to = *from;
-    }
+    let mut original_main = vec![Fp3::ZERO; main_len];
+    let mut original_mask = vec![Fp3::ZERO; mask_len];
+    original_main[..statement.claim.len()].copy_from_slice(&statement.claim);
+    original_mask[..statement.mask_claims[0].len()].copy_from_slice(&statement.mask_claims[0]);
     claims.push(SwitchClaim {
         main: original_main,
         mask: original_mask,
-        target: rows.target,
+        target: statement.target,
     });
 
-    let mut old_symbols = Vec::with_capacity(positions.len());
-    for position in positions {
-        let main_position = usize::try_from(*position).map_err(|_| Error::ResourceLimit)?;
-        let symbol = *old_main.get(main_position).ok_or(Error::InvalidIndex)?;
-        old_symbols.push(symbol);
-        let mask_position = usize::try_from(rows.mask_position(*position))
-            .map_err(|_| Error::ResourceLimit)?;
-        let mask_symbol = *old_mask.get(mask_position).ok_or(Error::InvalidIndex)?;
-        let mut main_coeff = vec![Fp3::ZERO; new_code.ell as usize];
-        let mut mask_coeff = vec![Fp3::ZERO; new_mask_code.ell as usize];
-        let main_coeffs = coeff_on_message(&rows.code, *position, rows.code.ell as usize)?;
-        let main_tail_coeffs = coeff_on_tail(&rows.code, *position)?;
-        for (to, from) in main_coeff.iter_mut().zip(&main_coeffs) {
-            *to = *from;
+    let mut old_symbols = Vec::with_capacity(authenticated.len());
+    for auth in authenticated {
+        if auth.position >= statement.code.n() {
+            return Err(Error::InvalidIndex);
         }
-        for (to, from) in main_coeff
-            .iter_mut()
-            .skip(rows.code.ell as usize)
-            .zip(&main_tail_coeffs)
-        {
-            *to = *from;
-        }
+        old_symbols.push(auth.main);
+        let main_coeffs = coeff_on_message(&statement.code, auth.position, statement.code.ell as usize)?;
+        let main_tail_coeffs = coeff_on_tail(&statement.code, auth.position)?;
+        let mut main_coeff = vec![Fp3::ZERO; main_len];
+        main_coeff[..statement.code.ell as usize].copy_from_slice(&main_coeffs);
+        main_coeff[statement.code.ell as usize..statement.code.ell as usize + statement.code.r as usize]
+            .copy_from_slice(&main_tail_coeffs);
+
+        let mask_position = statement.mask_position(auth.position);
         let mask_coeffs = coeff_on_message(
-            &rows.mask_code,
-            rows.mask_position(*position),
-            rows.mask_code.ell as usize,
+            &statement.mask_code,
+            mask_position,
+            statement.mask_code.ell as usize,
         )?;
-        let mask_tail_coeffs = coeff_on_tail(&rows.mask_code, rows.mask_position(*position))?;
-        for (to, from) in mask_coeff.iter_mut().zip(&mask_coeffs) {
-            *to = *from;
-        }
-        for (to, from) in mask_coeff
-            .iter_mut()
-            .skip(rows.mask_code.ell as usize)
-            .zip(&mask_tail_coeffs)
-        {
-            *to = *from;
-        }
+        let mask_tail_coeffs = coeff_on_tail(&statement.mask_code, mask_position)?;
+        let mut mask_coeff = vec![Fp3::ZERO; mask_len];
+        mask_coeff[..statement.mask_code.ell as usize].copy_from_slice(&mask_coeffs);
+        mask_coeff[statement.mask_code.ell as usize
+            ..statement.mask_code.ell as usize + statement.mask_code.r as usize]
+            .copy_from_slice(&mask_tail_coeffs);
+
+        // Keep the main and mask equations separate: summing them into one
+        // target can cancel a wrong relation.
         claims.push(SwitchClaim {
             main: main_coeff,
+            mask: vec![Fp3::ZERO; mask_len],
+            target: auth.main,
+        });
+        claims.push(SwitchClaim {
+            main: vec![Fp3::ZERO; main_len],
             mask: mask_coeff,
-            target: symbol.add(&mask_symbol),
+            target: auth.mask,
         });
     }
 
-    let mut combined_main = vec![Fp3::ZERO; new_code.ell as usize];
-    let mut combined_mask = vec![Fp3::ZERO; new_mask_code.ell as usize];
+    let mut combined_main = vec![Fp3::ZERO; main_len];
+    let mut combined_mask = vec![Fp3::ZERO; mask_len];
     let mut combined_target = Fp3::ZERO;
     let mut power = Fp3::ONE;
     for claim in &claims {
@@ -182,12 +240,8 @@ pub fn register_switch(
         combined_target = combined_target.add(&power.mul(&claim.target));
         power = power.mul(&theta);
     }
-    Ok(SwitchedRows {
-        main,
-        main_tail,
-        mask,
-        mask_tail,
-        positions: positions.to_vec(),
+    Ok(SwitchedClaims {
+        positions: authenticated.iter().map(|auth| auth.position).collect(),
         old_symbols,
         claims,
         theta,
@@ -196,36 +250,18 @@ pub fn register_switch(
             mask: combined_mask,
             target: combined_target,
         },
+        main_len: new_code.ell,
+        main_tail_len: new_code.r,
+        mask_len: new_mask_code.ell,
+        mask_tail_len: new_mask_code.r,
     })
-}
-
-/// The last-stage handoff. Only the no-kept-row subset is represented; the
-/// handoff is explicit and checked by `SingleRows::base_ready`.
-pub fn switched_to_single_rows(
-    switched: &SwitchedRows,
-    code: CodeParams,
-    mask_code: CodeParams,
-) -> Result<SingleRows> {
-    let rows = SingleRows {
-        code,
-        mask_code,
-        main: switched.main.clone(),
-        main_tail: switched.main_tail.clone(),
-        masks: vec![switched.mask.clone()],
-        mask_tails: vec![switched.mask_tail.clone()],
-        claim: switched.combined.main.clone(),
-        mask_claims: vec![switched.combined.mask.clone()],
-        target: switched.combined.target,
-    };
-    rows.base_ready()?;
-    Ok(rows)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pcs::request::code::build_code_plan;
-    use crate::pcs::request::proximity::SingleRows;
+    use crate::pcs::request::proximity::{ProximityStatement, SingleRows};
 
     fn rows() -> SingleRows {
         let code = build_code_plan(3, 4, 1).unwrap();
@@ -245,21 +281,31 @@ mod tests {
     #[test]
     fn registration_is_deterministic_and_pending() {
         let rows = rows();
+        let statement = ProximityStatement::from_rows(&rows).unwrap();
+        let message = switched_message(&rows, build_code_plan(3, 6, 1).unwrap(), build_code_plan(3, 6, 1).unwrap()).unwrap();
+        assert_eq!(message.main.len(), 6);
+        assert_eq!(message.main_tail.len(), 1);
         let new_code = build_code_plan(3, 6, 1).unwrap();
-        let first = register_switch(&rows, new_code, new_code, &[1, 2], Fp3::from_u64(7)).unwrap();
-        let second = register_switch(&rows, new_code, new_code, &[1, 2], Fp3::from_u64(7)).unwrap();
+        let auth = [
+            AuthenticatedSymbols { position: 1, main: Fp3::from_u64(111), mask: Fp3::from_u64(222) },
+            AuthenticatedSymbols { position: 2, main: Fp3::from_u64(333), mask: Fp3::from_u64(444) },
+        ];
+        let first = register_switch(&statement, new_code, new_code, &auth, Fp3::from_u64(7)).unwrap();
+        let second = register_switch(&statement, new_code, new_code, &auth, Fp3::from_u64(7)).unwrap();
         assert_eq!(first, second);
-        assert_eq!(first.claims.len(), 3);
+        assert_eq!(first.claims.len(), 5);
         assert_eq!(first.old_symbols.len(), 2);
-        let final_rows = switched_to_single_rows(&first, new_code, new_code).unwrap();
-        assert!(final_rows.base_ready().is_ok());
+        assert!(first.base_ready(new_code, new_code).is_ok());
     }
 
     #[test]
     fn wrong_code_capacity_or_shape_is_rejected() {
         let rows = rows();
+        let statement = ProximityStatement::from_rows(&rows).unwrap();
         let small = build_code_plan(2, 2, 1).unwrap();
-        assert!(register_switch(&rows, small, rows.mask_code, &[1], Fp3::ONE).is_err());
+        let auth = [AuthenticatedSymbols { position: 1, main: Fp3::ONE, mask: Fp3::ONE }];
+        assert!(register_switch(&statement, small, statement.mask_code, &auth, Fp3::ONE).is_err());
+        assert!(switched_message(&rows, small, rows.mask_code).is_err());
         let mut bad = rows;
         bad.main.pop();
         assert!(bad.base_ready().is_err());
