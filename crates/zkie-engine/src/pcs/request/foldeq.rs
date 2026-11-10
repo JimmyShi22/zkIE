@@ -2217,7 +2217,7 @@ mod tests {
     use crate::pcs::request::runtime_tree::{RuntimeTreePart, RuntimeTreePlan};
     use crate::pcs::request::runtime_tree::{verify_mask_opening, MaskTreePlan};
     use crate::pcs::request::table::{
-        commit_table, IndexReader, IndexRecord, IndexShape, TableDistances,
+        test_commit_table, IndexReader, IndexRecord, IndexShape, TableDistances,
     };
     use crate::primitives::transcript::{hash_labeled, tag_word, TEST_COINS};
     use zkie_core::common::field::PrimeCharacteristicRing;
@@ -2273,7 +2273,7 @@ mod tests {
         }
     }
 
-    fn committed() -> crate::pcs::request::table::CommittedTable {
+    fn committed() -> crate::pcs::request::table::TestTable {
         let shape = shape();
         let rows = shape.rows() as usize;
         let messages: Vec<Vec<Fp>> = (0..rows)
@@ -2294,7 +2294,7 @@ mod tests {
             .map(|position| vec![(position as u8).wrapping_add(1); shape.salt_bytes])
             .collect();
         let configuration = binding_parameters(&shape).digest().unwrap();
-        commit_table(shape, configuration, &messages, &tails, &salts).unwrap()
+        test_commit_table(shape, configuration, &messages, &tails, &salts).unwrap()
     }
 
     fn fold_shape() -> FoldShape {
@@ -2396,7 +2396,7 @@ mod tests {
         group_code: Option<CodeParams>,
         members: Vec<u64>,
         oracle: u64,
-    ) -> (FoldeqPlan, crate::pcs::request::table::CommittedTable) {
+    ) -> (FoldeqPlan, crate::pcs::request::table::TestTable) {
         let (mut plan, table) = plan_fixture_with_group(group_code, members);
         let mut gu = gu_shape();
         gu.oracle = oracle;
@@ -2405,12 +2405,12 @@ mod tests {
         (plan, table)
     }
 
-    fn gu_plan_fixture() -> (FoldeqPlan, crate::pcs::request::table::CommittedTable) {
+    fn gu_plan_fixture() -> (FoldeqPlan, crate::pcs::request::table::TestTable) {
         gu_plan_with(Some(build_code_plan(3, 6, 1).unwrap()), vec![1, 2], 10)
     }
     fn gu_plan_two_groups(
         gu_group: u64,
-    ) -> (FoldeqPlan, crate::pcs::request::table::CommittedTable) {
+    ) -> (FoldeqPlan, crate::pcs::request::table::TestTable) {
         let code = Some(build_code_plan(3, 6, 1).unwrap());
         let (mut plan, table) = plan_fixture_with_groups(vec![
             VerifiedGroup {
@@ -2436,7 +2436,7 @@ mod tests {
         (plan, table)
     }
 
-    fn gu_plan_fresh_collision() -> (FoldeqPlan, crate::pcs::request::table::CommittedTable) {
+    fn gu_plan_fresh_collision() -> (FoldeqPlan, crate::pcs::request::table::TestTable) {
         let (mut plan, table) =
             plan_fixture_with_group_fresh(Some(build_code_plan(3, 6, 1).unwrap()), vec![1, 2], Some(10));
         plan.gu = Some(gu_shape());
@@ -2446,7 +2446,7 @@ mod tests {
 
     fn gu_plan_with_answers(
         answers: u32,
-    ) -> (FoldeqPlan, crate::pcs::request::table::CommittedTable) {
+    ) -> (FoldeqPlan, crate::pcs::request::table::TestTable) {
         let (mut plan, table) = gu_plan_fixture();
         plan.gu.as_mut().unwrap().u.answers = answers;
         (plan, table)
@@ -2464,12 +2464,12 @@ mod tests {
         session
     }
 
-    fn open_gu_plan() -> (FoldeqSession, crate::pcs::request::table::CommittedTable) {
+    fn open_gu_plan() -> (FoldeqSession, crate::pcs::request::table::TestTable) {
         let (plan, table) = gu_plan_fixture();
         (open_gu_plan_from(plan), table)
     }
 
-    fn open_gu_session() -> (FoldeqSession, crate::pcs::request::table::CommittedTable) {
+    fn open_gu_session() -> (FoldeqSession, crate::pcs::request::table::TestTable) {
         let (mut session, table) = open_gu_plan();
         session.send_gu(&Digest([4; 32])).unwrap();
         (session, table)
@@ -2477,7 +2477,7 @@ mod tests {
 
     fn open_gu_with_root(
         root: Digest,
-    ) -> (FoldeqSession, crate::pcs::request::table::CommittedTable) {
+    ) -> (FoldeqSession, crate::pcs::request::table::TestTable) {
         let (mut session, table) = open_gu_plan();
         session.send_gu(&root).unwrap();
         (session, table)
@@ -2485,7 +2485,7 @@ mod tests {
 
     fn plan_fixture_with_groups(
         groups: Vec<VerifiedGroup>,
-    ) -> (FoldeqPlan, crate::pcs::request::table::CommittedTable) {
+    ) -> (FoldeqPlan, crate::pcs::request::table::TestTable) {
         let table = committed();
         let tree = mask_tree();
         let statement = Arc::new(
@@ -2529,7 +2529,7 @@ mod tests {
         group_code: Option<CodeParams>,
         members: Vec<u64>,
         fresh: Option<u64>,
-    ) -> (FoldeqPlan, crate::pcs::request::table::CommittedTable) {
+    ) -> (FoldeqPlan, crate::pcs::request::table::TestTable) {
         plan_fixture_with_groups(vec![VerifiedGroup {
             group: 1,
             members,
@@ -2542,15 +2542,15 @@ mod tests {
     fn plan_fixture_with_group(
         group_code: Option<CodeParams>,
         members: Vec<u64>,
-    ) -> (FoldeqPlan, crate::pcs::request::table::CommittedTable) {
+    ) -> (FoldeqPlan, crate::pcs::request::table::TestTable) {
         plan_fixture_with_group_fresh(group_code, members, Some(9))
     }
 
-    fn plan_fixture() -> (FoldeqPlan, crate::pcs::request::table::CommittedTable) {
+    fn plan_fixture() -> (FoldeqPlan, crate::pcs::request::table::TestTable) {
         plan_fixture_with_group(Some(build_code_plan(3, 6, 1).unwrap()), vec![1, 2])
     }
 
-    fn open_session() -> (FoldeqSession, crate::pcs::request::table::CommittedTable) {
+    fn open_session() -> (FoldeqSession, crate::pcs::request::table::TestTable) {
         let (plan, table) = plan_fixture();
         let binder = FoldeqBinder::new(REQUEST_CHAIN_LABEL, plan.reader.configuration, &plan).unwrap();
         let chain = binder.chain().unwrap();
@@ -2586,7 +2586,7 @@ mod tests {
 
     fn fold_open_prestart() -> (
         FoldeqSession,
-        crate::pcs::request::table::CommittedTable,
+        crate::pcs::request::table::TestTable,
         crate::pcs::request::fold::FoldStartProver,
         FoldMask,
         TestCoins,
@@ -2616,7 +2616,7 @@ mod tests {
 
     fn fold_open_ready() -> (
         FoldeqSession,
-        crate::pcs::request::table::CommittedTable,
+        crate::pcs::request::table::TestTable,
         crate::pcs::request::fold::FoldStartProver,
         FoldMask,
         TestCoins,

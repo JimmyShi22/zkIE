@@ -1047,7 +1047,7 @@ mod tests {
     use crate::pcs::request::gu::{GuNotice, GuOracleShape, GuShape};
     use crate::pcs::request::read::ReadLedger;
     use crate::pcs::request::runtime_tree::MaskTreePlan;
-    use crate::pcs::request::table::commit_table;
+    use crate::pcs::request::table::test_commit_table;
     use std::sync::{Arc, Mutex};
     use crate::pcs::request::params::{RequestParams, LEAF_SALT_MIN_BYTES};
     use crate::pcs::request::runtime_tree::{RuntimeTreePart, RuntimeTreePlan};
@@ -2728,7 +2728,7 @@ mod tests {
             .map(|position| vec![(position as u8).wrapping_add(1); index.salt_bytes])
             .collect();
         let configuration = binding_parameters(&index).digest().unwrap();
-        let table = commit_table(index, configuration, &messages, &tails, &salts).unwrap();
+        let table = test_commit_table(index, configuration, &messages, &tails, &salts).unwrap();
         let fold = FoldShape {
             code: build_code_plan(3, 4, 1).unwrap(),
             mask_code: build_code_plan(3, 4, 1).unwrap(),

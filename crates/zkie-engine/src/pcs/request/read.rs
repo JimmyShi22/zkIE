@@ -22,8 +22,10 @@ use zkie_core::types::Digest;
 use crate::pcs::request::chain::Chain;
 use crate::pcs::request::field::Fp;
 use crate::pcs::request::table::{
-    verify_columns, ColumnOpening, CommittedTable, IndexReader,
+    verify_columns, ColumnOpening, IndexReader,
 };
+#[cfg(test)]
+use crate::pcs::request::table::TestTable;
 
 /// Draw `count` positions below `2^log_n` from the chain. The order is the
 /// draw order; a caller that wants one opening list sorts and deduplicates
@@ -55,11 +57,13 @@ pub fn unique_sorted(positions: &[u64]) -> Vec<u64> {
 /// list an entry verifies; it is not necessarily one logical draw. Charging
 /// past the maximum fails closed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg(test)]
 pub struct ReadBudget {
     max_reads: u64,
     used: u64,
 }
 
+#[cfg(test)]
 impl ReadBudget {
     pub fn new(max_reads: u64) -> Self {
         Self { max_reads, used: 0 }
@@ -520,11 +524,13 @@ impl VerifierReads {
 /// budget and cache: a clone is a separate logical reader, not a share of one
 /// global read budget, and this type does not claim a cross-instance budget.
 #[derive(Clone, Debug, Default)]
+#[cfg(test)]
 pub struct ProverReads {
     budget: ReadBudget,
     openings: HashMap<(Digest, u64), ColumnOpening>,
 }
 
+#[cfg(test)]
 impl ProverReads {
     pub fn new(max_reads: u64) -> Self {
         Self {
@@ -544,7 +550,7 @@ impl ProverReads {
     pub fn open(
         &mut self,
         charge: &HidingCharge,
-        table: &CommittedTable,
+        table: &TestTable,
         positions: &[u64],
     ) -> Result<Vec<ColumnOpening>> {
         if charge.table() != table.reader.root {
@@ -602,7 +608,7 @@ mod tests {
     use crate::pcs::request::chain::KIND_POSITIONS;
     use crate::pcs::request::code::build_code_plan;
     use crate::pcs::request::params::LEAF_SALT_MIN_BYTES;
-    use crate::pcs::request::table::{commit_table, IndexShape, TableDistances};
+    use crate::pcs::request::table::{test_commit_table, IndexShape, TableDistances};
     use std::sync::{Arc, Mutex};
     use zkie_core::common::field::PrimeCharacteristicRing;
 
@@ -621,7 +627,7 @@ mod tests {
         }
     }
 
-    fn committed() -> CommittedTable {
+    fn committed() -> TestTable {
         let shape = shape();
         let rows = shape.rows() as usize;
         let messages: Vec<Vec<Fp>> = (0..rows)
@@ -641,7 +647,7 @@ mod tests {
         let salts: Vec<Vec<u8>> = (0..shape.code.n() as usize)
             .map(|position| vec![(position as u8).wrapping_add(1); shape.salt_bytes])
             .collect();
-        commit_table(shape, Digest([7; 32]), &messages, &tails, &salts).unwrap()
+        test_commit_table(shape, Digest([7; 32]), &messages, &tails, &salts).unwrap()
     }
 
     fn chain() -> Chain {

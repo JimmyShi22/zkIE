@@ -39,7 +39,7 @@ use zkie_engine::pcs::request::foldeq::{
 use zkie_engine::pcs::request::gu::{GuNotice, GuOracleShape, GuRegistry, GuShape};
 use zkie_engine::pcs::request::params::{RequestParams, SHARED_CHAIN_LABEL};
 use zkie_engine::pcs::request::plan::{CompiledPlan, RequestPlan};
-use zkie_engine::pcs::request::read::{unique_sorted, HidingState, ReadLedger};
+use zkie_engine::pcs::request::read::{unique_sorted, ReadLedger};
 use zkie_engine::pcs::request::relation::{
     foldeq_weights, gu_sample_pad_offsets, gu_table, gu_vector_offset, oracle_sample_row,
     sample_row, GuRelationRow, GuWitness,
@@ -50,8 +50,8 @@ use zkie_engine::pcs::request::runtime_tree::{
 };
 use zkie_engine::storage::mmap::BoundedAssetReader;
 use zkie_engine::pcs::request::table::{
-    commit_table, verify_columns, ColumnOpening, CommittedTable, IndexReader, IndexShape,
-    SampleSeed, StreamingHolder, TableRowSource,
+    commit_table_streaming, verify_columns, ColumnOpening, IndexReader, IndexShape, SampleSeed,
+    StreamingHolder, TableRowSource, VecTableSource,
 };
 use zkie_engine::memory::BudgetedMemoryGovernor;
 use zkie_engine::primitives::transcript::run_value;
@@ -80,7 +80,6 @@ pub struct LmHeadKeyRandomness {
 pub struct LmHeadKey {
     pub shape: IndexShape,
     pub reader: IndexReader,
-    pub table: CommittedTable,
     pub name: Vec<u8>,
     /// The committed message rows, kept for the one-time fold of this table.
     pub messages: Vec<Vec<Fp>>,
@@ -113,131 +112,6 @@ pub fn lm_head_entry(
         .ok_or(Error::ShapeMismatch)?;
     Ok(fp_from_signed_word(value as u64))
 }
-
-/// Builds the key material of the output-head table.
-///
-/// `max_bytes` bounds the derived buffers before any of them is allocated: the
-/// messages, the codewords, the tails and the column tree.
-pub fn build_lm_head_key(
-    context: &LmHeadContext,
-    plan: &RequestPlan,
-    configuration: Digest,
-    randomness: &LmHeadKeyRandomness,
-    max_bytes: u64,
-) -> Result<LmHeadKey> {
-    plan.validate()?;
-    if configuration == Digest::ZERO {
-        return Err(Error::InvalidConfig);
-    }
-    let shape = plan.table_shape()?;
-    let rows = usize::try_from(shape.rows_checked()?).map_err(|_| Error::ResourceLimit)?;
-    let factor = 1usize
-        .checked_shl(plan.lin.k_lo)
-        .ok_or(Error::ResourceLimit)?;
-    let columns = 1usize
-        .checked_shl(plan.lin.k_col)
-        .ok_or(Error::ResourceLimit)?;
-    if context.asset.rows != shape.rows()
-        || context.asset.row_width < columns as u64
-        || context.asset.element_count
-            != context.asset.rows.saturating_mul(context.asset.row_width)
-    {
-        return Err(Error::ShapeMismatch);
-    }
-    if factor.checked_mul(rows).ok_or(Error::ResourceLimit)? != columns {
-        return Err(Error::InvalidConfig);
-    }
-    let ell = usize::try_from(shape.code.ell).map_err(|_| Error::ResourceLimit)?;
-    let tail = usize::try_from(shape.code.r).map_err(|_| Error::ResourceLimit)?;
-    let code_len = usize::try_from(shape.code.n()).map_err(|_| Error::ResourceLimit)?;
-    let plain = usize::try_from(shape.plain()).map_err(|_| Error::ResourceLimit)?;
-    if plain.checked_add(E_DEGREE * shape.answers as usize).ok_or(Error::ResourceLimit)? != ell {
-        return Err(Error::InvalidConfig);
-    }
-    let messages_bytes = (rows as u64)
-        .checked_mul(ell as u64)
-        .and_then(|value| value.checked_mul(8))
-        .ok_or(Error::ResourceLimit)?;
-    let codewords_bytes = (rows as u64)
-        .checked_mul(code_len as u64)
-        .and_then(|value| value.checked_mul(8))
-        .ok_or(Error::ResourceLimit)?;
-    let tails_bytes = (rows as u64)
-        .checked_mul(tail as u64)
-        .and_then(|value| value.checked_mul(8))
-        .ok_or(Error::ResourceLimit)?;
-    let tree_bytes = (code_len as u64)
-        .checked_mul((rows as u64).saturating_mul(8).saturating_add(shape.salt_bytes as u64))
-        .ok_or(Error::ResourceLimit)?;
-    let needed = messages_bytes
-        .checked_add(codewords_bytes)
-        .and_then(|value| value.checked_add(tails_bytes))
-        .and_then(|value| value.checked_add(tree_bytes))
-        .ok_or(Error::ResourceLimit)?;
-    if needed > max_bytes {
-        return Err(Error::ResourceLimit);
-    }
-    if randomness.pads.len() != rows
-        || randomness.pads.iter().any(|row| row.len() != E_DEGREE * shape.answers as usize)
-        || randomness.tails.len() != rows
-        || randomness.tails.iter().any(|row| row.len() != tail)
-        || randomness.salts.len() != code_len
-        || randomness
-            .salts
-            .iter()
-            .any(|salt| salt.len() != shape.salt_bytes)
-    {
-        return Err(Error::ShapeMismatch);
-    }
-
-    let mut messages = vec![vec![Fp::ZERO; ell]; rows];
-    for row in 0..rows {
-        for (offset, pad) in randomness.pads[row].iter().enumerate() {
-            messages[row][plain + offset] = *pad;
-        }
-    }
-    for matrix_row in 0..rows {
-        let source = context.read_lm_head_row(matrix_row as u64)?;
-        if source.len() < columns {
-            return Err(Error::ShapeMismatch);
-        }
-        for table_row in 0..rows {
-            let base = table_row
-                .checked_mul(factor)
-                .ok_or(Error::ResourceLimit)?;
-            let destination = &mut messages[table_row];
-            for low in 0..factor {
-                let column = base.checked_add(low).ok_or(Error::ResourceLimit)?;
-                let place = low
-                    .checked_add(
-                        matrix_row
-                            .checked_mul(factor)
-                            .ok_or(Error::ResourceLimit)?,
-                    )
-                    .ok_or(Error::ResourceLimit)?;
-                destination[place] =
-                    fp_from_signed_word(source[column] as u64);
-            }
-        }
-    }
-    let table = commit_table(
-        shape,
-        configuration,
-        &messages,
-        &randomness.tails,
-        &randomness.salts,
-    )?;
-    let reader = table.reader.clone();
-    let name = table.name.clone();
-    Ok(LmHeadKey {
-        shape,
-        reader,
-        table,
-        name,
-        messages,
-    })
-}
-
 
 /// The version of the limited key statement and plan. This is an adaptation
 /// with no range proof: it binds the trusted publication assumption that every
@@ -3355,17 +3229,6 @@ pub fn verify_shared_columns(
     verify_columns(reader, positions, openings)
 }
 
-/// The prover's charged opening of the drawn columns.
-pub fn open_shared_columns(
-    table: &CommittedTable,
-    positions: &[u64],
-    max_columns: u64,
-) -> Result<Vec<ColumnOpening>> {
-    let mut state = HidingState::new(table.reader.root, 1, max_columns);
-    let charge = state.begin_charge(table.reader.root, 1, positions.len())?;
-    table.open_columns_charged(&charge, positions)
-}
-
 /// Reports only the column check. The remaining shared checks stay false, so
 /// the limited tested gate stays closed until they are produced.
 pub fn shared_column_check(
@@ -3463,62 +3326,10 @@ mod tests {
     }
 
     #[test]
-    fn a_wrong_asset_row_count_is_rejected() {
-        let Some((mut context, plan)) = context() else {
-            return;
-        };
-        context.asset.rows += 1;
-        let randomness = empty_randomness();
-        let error = build_lm_head_key(&context, &plan, Digest([0x42; 32]), &randomness, u64::MAX);
-        assert!(error.is_err());
-    }
-
-    #[test]
-    fn randomness_of_the_wrong_size_is_rejected() {
-        let Some((context, plan)) = context() else {
-            return;
-        };
-        let randomness = LmHeadKeyRandomness {
-            tails: Vec::new(),
-            salts: Vec::new(),
-            pads: Vec::new(),
-        };
-        let error = build_lm_head_key(&context, &plan, Digest([0x42; 32]), &randomness, u64::MAX);
-        assert!(error.is_err());
-    }
-
-    #[test]
-    fn the_buffer_bound_is_checked_before_the_build() {
-        let Some((context, plan)) = context() else {
-            return;
-        };
-        let randomness = empty_randomness();
-        let error = build_lm_head_key(&context, &plan, Digest([0x42; 32]), &randomness, 1);
-        assert!(matches!(error, Err(Error::ResourceLimit)));
-    }
-
-    fn empty_randomness() -> LmHeadKeyRandomness {
-        LmHeadKeyRandomness {
-            tails: Vec::new(),
-            salts: Vec::new(),
-            pads: Vec::new(),
-        }
-    }
-
-    #[test]
     fn the_limited_statement_binds_its_semantics_and_range() {
         let Some((context, plan)) = context() else {
             return;
         };
-        let randomness = empty_randomness();
-        let error = build_lm_head_key(
-            &context,
-            &plan,
-            Digest([0x42; 32]),
-            &randomness,
-            u64::MAX,
-        );
-        assert!(error.is_err());
         let statement = LimitedKeyStatement {
             version: LIMITED_KEY_VERSION,
             model_commitment: context.model_id,
@@ -3670,8 +3481,16 @@ mod tests {
             .collect();
         let tails: Vec<Vec<Fp>> = (0..4).map(|_| vec![Fp::ZERO; 2]).collect();
         let salts: Vec<Vec<u8>> = (0..32).map(|position| vec![position as u8; 40]).collect();
-        let table = commit_table(shape, Digest([0x55; 32]), &messages, &tails, &salts)
-            .expect("table");
+        let mut source = VecTableSource::new(messages, tails).expect("source");
+        let table = commit_table_streaming(
+            &mut source,
+            shape,
+            Digest([0x55; 32]),
+            &salts,
+            64,
+            u64::MAX,
+        )
+        .expect("table");
         let mut chain = Chain::begin(
             0x1234,
             &table.reader.configuration,
@@ -3684,7 +3503,7 @@ mod tests {
         assert!(chain.step(&prefix, 0).expect("step"));
         let positions = draw_shared_columns(&mut chain, shape.code.log_n, 4).expect("positions");
         assert!(!positions.is_empty());
-        let openings = open_shared_columns(&table, &positions, 100).expect("openings");
+        let openings = table.open_columns(&mut source, &positions).expect("openings");
         let columns = verify_shared_columns(&table.reader, &positions, &openings)
             .expect("columns");
         assert_eq!(columns.len(), positions.len() * 4);
@@ -4055,14 +3874,21 @@ mod tests {
         )
         .expect("binding parameters");
         let configuration = parameters.digest().expect("configuration");
-        let table = commit_table(shape, configuration, &messages, &tails, &salts)
-            .expect("table");
+        let mut source = VecTableSource::new(messages.clone(), tails.clone()).expect("source");
+        let table = commit_table_streaming(
+            &mut source,
+            shape,
+            configuration,
+            &salts,
+            64,
+            u64::MAX,
+        )
+        .expect("table");
         let reader = table.reader.clone();
         let name = table.name.clone();
         let key = LmHeadKey {
             shape,
             reader,
-            table,
             name,
             messages,
         };

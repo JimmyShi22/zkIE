@@ -451,166 +451,6 @@ fn column_leaf(
     )
 }
 
-/// A committed table, with the private rows and salts needed to open columns.
-pub struct CommittedTable {
-    pub reader: IndexReader,
-    pub name: Vec<u8>,
-    tree: MerkleTree,
-    salts: Vec<Vec<u8>>,
-    codewords: Vec<Vec<Fp>>,
-}
-
-impl CommittedTable {
-    /// Open the columns at `positions` (drawn by the chain; the caller keeps
-    /// them sorted and without repeats). This is the crate-internal primitive;
-    /// a provider outside the charged read path must use the charged wrapper.
-    pub(crate) fn open_columns(&self, positions: &[u64]) -> Result<Vec<ColumnOpening>> {
-        if self.reader.fault().is_some() {
-            return Err(Error::InvalidConfig);
-        }
-        let n = self.reader.shape.code.n();
-        let rows = self.reader.shape.rows() as usize;
-        let mut openings = Vec::with_capacity(positions.len());
-        let mut previous = None;
-        for position in positions {
-            if *position >= n {
-                return Err(Error::InvalidIndex);
-            }
-            if let Some(previous) = previous {
-                if *position <= previous {
-                    return Err(Error::InvalidIndex);
-                }
-            }
-            previous = Some(*position);
-            let mut symbols = Vec::with_capacity(rows);
-            for codeword in &self.codewords {
-                symbols.push(codeword[*position as usize]);
-            }
-            openings.push(ColumnOpening {
-                position: *position,
-                salt: self.salts[*position as usize].clone(),
-                symbols,
-                path: self.tree.open(*position as usize)?,
-            });
-        }
-        Ok(openings)
-    }
-
-    /// Open only with a hiding charge for this table. The charge is produced by
-    /// `HidingState::begin_charge`; a charge for another table fails. The open
-    /// count must not exceed the charged columns.
-    pub fn open_columns_charged(
-        &self,
-        charge: &HidingCharge,
-        positions: &[u64],
-    ) -> Result<Vec<ColumnOpening>> {
-        if charge.table() != self.reader.root {
-            return Err(Error::StatementMismatch);
-        }
-        charge.consume(positions)?;
-        self.open_columns(positions)
-    }
-}
-
-/// Commit a table from the rows' messages (each `ell` entries: plain entries,
-/// then the answers' pads) and random tails (each `r` entries). `salts` holds
-/// one salt per column, `salt_bytes` long.
-///
-/// This is the test foundation: it materializes every row, codeword, salt and
-/// the whole column tree in memory. It is not the production commit path and
-/// must not be used to materialize an asset; a production committer reads the
-/// asset through ranges, keeps the asset red line, and only this module's
-/// leaf, record-seed and opening rules are shared with it.
-pub fn commit_table(
-    shape: IndexShape,
-    configuration: Digest,
-    messages: &[Vec<Fp>],
-    tails: &[Vec<Fp>],
-    salts: &[Vec<u8>],
-) -> Result<CommittedTable> {
-    validate_index_shape(&shape)?;
-    if configuration == Digest::ZERO {
-        return Err(Error::InvalidConfig);
-    }
-    let rows = shape.rows() as usize;
-    let n = shape.code.n() as usize;
-    if messages.len() != rows || tails.len() != rows || salts.len() != n {
-        return Err(Error::ShapeMismatch);
-    }
-    let record_entries = rows
-        .checked_mul(shape.answers as usize)
-        .ok_or(Error::ResourceLimit)?;
-    for message in messages {
-        if message.len() as u64 != shape.code.ell {
-            return Err(Error::ShapeMismatch);
-        }
-    }
-    for tail in tails {
-        if tail.len() as u64 != shape.code.r {
-            return Err(Error::ShapeMismatch);
-        }
-    }
-    for salt in salts {
-        if salt.len() != shape.salt_bytes {
-            return Err(Error::ShapeMismatch);
-        }
-    }
-
-    let mut codewords = Vec::with_capacity(rows);
-    for (message, tail) in messages.iter().zip(tails) {
-        codewords.push(encode_row_fp(&shape.code, message, tail)?);
-    }
-
-    let mut leaves = Vec::with_capacity(n);
-    for position in 0..n {
-        let mut symbols = Vec::with_capacity(rows);
-        for codeword in &codewords {
-            symbols.push(codeword[position]);
-        }
-        leaves.push(column_leaf(
-            &configuration,
-            shape.code.log_n,
-            position as u64,
-            &salts[position],
-            &symbols,
-        )?);
-    }
-    let tree = merkle_build(&configuration, &leaves)?;
-    let root = tree.root;
-    let name = index_name(&root, &shape, &configuration);
-    let seed_budget = usize::try_from(shape.answers).map_err(|_| Error::ResourceLimit)?;
-    let seeds = record_seeds(&shape, &name, seed_budget)?;
-    let mut record = IndexRecord {
-        y: Vec::with_capacity(record_entries),
-    };
-    for message in messages {
-        for answer in 0..shape.answers {
-            record.y.push(record_value(
-                &shape,
-                &seeds[answer as usize],
-                answer,
-                message,
-            )?);
-        }
-    }
-    let reader = IndexReader {
-        shape,
-        configuration,
-        root,
-        record,
-    };
-    if reader.fault().is_some() {
-        return Err(Error::InvalidConfig);
-    }
-    Ok(CommittedTable {
-        reader,
-        name,
-        tree,
-        salts: salts.to_vec(),
-        codewords,
-    })
-}
-
 /// A bounded source of a table's row messages and random tails. The models
 /// layer maps the read-only asset into these rows and the committer reads one
 /// row at a time; no caller hands over the whole table.
@@ -1014,14 +854,20 @@ impl<S: TableRowSource> StreamingHolder<S> {
 pub struct TestTable {
     pub reader: IndexReader,
     pub name: Vec<u8>,
+    pub codewords: Vec<Vec<Fp>>,
+    pub salts: Vec<Vec<u8>>,
+    pub tree: MerkleTree,
     table: StreamingTable,
-    source: std::cell::RefCell<VecTableSource>,
+    source: std::sync::Mutex<VecTableSource>,
 }
 
 #[cfg(test)]
 impl TestTable {
     pub fn open_columns(&self, positions: &[u64]) -> Result<Vec<ColumnOpening>> {
-        let mut source = self.source.borrow_mut();
+        let mut source = self
+            .source
+            .lock()
+            .map_err(|_| Error::InvalidSessionState)?;
         self.table.open_columns(&mut *source, positions)
     }
 
@@ -1047,6 +893,11 @@ pub fn test_commit_table(
     tails: &[Vec<Fp>],
     salts: &[Vec<u8>],
 ) -> Result<TestTable> {
+    let codewords = messages
+        .iter()
+        .zip(tails)
+        .map(|(message, tail)| encode_row_fp(&shape.code, message, tail))
+        .collect::<Result<Vec<_>>>()?;
     let mut source = VecTableSource::new(messages.to_vec(), tails.to_vec())?;
     let table = commit_table_streaming(&mut source, shape, configuration, salts, 64, u64::MAX)?;
     let reader = table.reader.clone();
@@ -1054,8 +905,11 @@ pub fn test_commit_table(
     Ok(TestTable {
         reader,
         name,
+        codewords,
+        salts: salts.to_vec(),
+        tree: table.tree.clone(),
         table,
-        source: std::cell::RefCell::new(source),
+        source: std::sync::Mutex::new(source),
     })
 }
 
@@ -1176,10 +1030,10 @@ mod tests {
             .collect()
     }
 
-    fn committed() -> CommittedTable {
+    fn committed() -> TestTable {
         let shape = shape();
         let configuration = Digest([7; 32]);
-        commit_table(
+        test_commit_table(
             shape,
             configuration,
             &messages(&shape),
@@ -1259,7 +1113,7 @@ mod tests {
         let messages = messages(&shape);
         let tails = tails(&shape);
         let salts = salts(&shape);
-        let first = commit_table(
+        let first = test_commit_table(
             shape,
             Digest([7; 32]),
             &messages,
@@ -1267,7 +1121,7 @@ mod tests {
             &salts,
         )
         .unwrap();
-        let second = commit_table(
+        let second = test_commit_table(
             shape,
             Digest([8; 32]),
             &messages,
@@ -1288,7 +1142,7 @@ mod tests {
             index_name(&first.reader.root, &changed, &first.reader.configuration),
             first.name
         );
-        let renamed = commit_table(
+        let renamed = test_commit_table(
             changed,
             Digest([7; 32]),
             &messages,
@@ -1397,8 +1251,8 @@ mod tests {
         let messages = messages(&shape);
         let tails = tails(&shape);
         let salts = salts(&shape);
-        assert!(commit_table(shape, Digest::ZERO, &messages, &tails, &salts).is_err());
-        assert!(commit_table(
+        assert!(test_commit_table(shape, Digest::ZERO, &messages, &tails, &salts).is_err());
+        assert!(test_commit_table(
             shape,
             Digest([7; 32]),
             &messages[..3],
@@ -1406,7 +1260,7 @@ mod tests {
             &salts
         )
         .is_err());
-        assert!(commit_table(
+        assert!(test_commit_table(
             shape,
             Digest([7; 32]),
             &messages,
@@ -1416,10 +1270,10 @@ mod tests {
         .is_err());
         let mut short_message = messages.clone();
         short_message[0].pop();
-        assert!(commit_table(shape, Digest([7; 32]), &short_message, &tails, &salts).is_err());
+        assert!(test_commit_table(shape, Digest([7; 32]), &short_message, &tails, &salts).is_err());
         let mut short_salt = salts.clone();
         short_salt[0].pop();
-        assert!(commit_table(shape, Digest([7; 32]), &messages, &tails, &short_salt).is_err());
+        assert!(test_commit_table(shape, Digest([7; 32]), &messages, &tails, &short_salt).is_err());
     }
 
     #[test]
@@ -1828,7 +1682,7 @@ mod streaming_tests {
     #[test]
     fn streaming_matches_the_in_memory_committer() {
         let (shape, configuration, messages, tails, salts) = fixture();
-        let table = commit_table(
+        let table = test_commit_table(
             shape,
             configuration,
             &messages,
@@ -1869,7 +1723,7 @@ mod streaming_tests {
     fn the_holder_folds_opens_and_places_the_folded_row() {
         let (shape, configuration, messages, tails, salts) = fixture();
         let expected_table =
-            commit_table(shape, configuration, &messages, &tails, &salts).expect("in-memory");
+            test_commit_table(shape, configuration, &messages, &tails, &salts).expect("in-memory");
         let mut source = VecSource {
             messages: messages.clone(),
             tails: tails.clone(),
