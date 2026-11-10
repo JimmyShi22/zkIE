@@ -406,6 +406,10 @@ pub fn pow2_at_least(value: u64) -> Result<u64> {
     Ok(1u64 << bits)
 }
 
+fn is_power_of_two(value: u64) -> bool {
+    value != 0 && (value & (value - 1)) == 0
+}
+
 /// Derives the main and mask codes of every later stage from the group's
 /// codes, the fold's k and h, the number of positions and the sample count.
 /// The formulas are the protocol's: the folded main message is the previous
@@ -423,6 +427,15 @@ pub fn derive_stages(
     }
     let main0 = codes.get(first.main);
     let mask0 = codes.get(first.mask);
+    if first.k > 32
+        || first.h > first.k
+        || mask0.log_n > main0.log_n
+        || mask0.ell < 2u64 * first.k as u64 + 1 - first.h as u64
+        || !is_power_of_two(main0.ell)
+        || !is_power_of_two(mask0.ell)
+    {
+        return Err(Error::InvalidConfig);
+    }
     let mut main_ell = main0.ell;
     let mut prev_main_r = main0.r;
     let mut prev_mask_ell = mask0.ell;
@@ -483,6 +496,19 @@ pub fn derive_stages(
             1
         };
         let mask_ell = pow2_at_least(scaled)?.max(pow2_at_least(own_fold)?);
+        if !is_power_of_two(main_ell)
+            || !is_power_of_two(mask_ell)
+            || stage.mask_log_n > stage.log_n
+            || mask_ell
+                .checked_shl(stage.h)
+                .ok_or(Error::InvalidConfig)?
+                < carried
+                    .checked_add(samples)
+                    .ok_or(Error::InvalidConfig)?
+            || samples > mask_ell
+        {
+            return Err(Error::InvalidConfig);
+        }
         let main = CodeParams {
             log_n: stage.log_n,
             ell: main_ell,
@@ -793,5 +819,19 @@ mod tests {
         let mut plan = base_plan();
         plan.table.code.ell = 65539;
         plan.validate().expect("the matrix fits beside the pads");
+    }
+
+    #[test]
+    fn a_group_mask_code_without_room_for_the_fold_is_rejected() {
+        let mut plan = base_plan();
+        plan.codes.mask_u = code(10, 8, 300);
+        assert!(plan.validate().is_err());
+    }
+
+    #[test]
+    fn a_stage_mask_code_longer_than_its_main_code_is_rejected() {
+        let mut plan = base_plan();
+        plan.stages.guo[0] = stage(4, 2, 12, 13, 141);
+        assert!(plan.validate().is_err());
     }
 }
