@@ -1,0 +1,373 @@
+warning: unused import: `FallbackPolicy`
+  --> crates/zkie-engine/tests/memory_budget.rs:19:41
+   |
+19 | use zkie_engine::context::{ExecContext, FallbackPolicy, Metrics, RuntimeConfig};
+   |                                         ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-engine` (test "memory_budget") generated 1 warning (run `cargo fix --test "memory_budget" -p zkie-engine` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/zkie_engine-8aa968ebbad7c68c)
+
+running 234 tests
+test pcs::request::base_stage::tests::base_linear_and_symbol_checks ... ok
+test pcs::request::bat::tests::begin_run_uses_class_order_and_closes_the_group ... ok
+test pcs::request::bat::tests::direct_combine_is_the_separate_code_switch_path ... ok
+test pcs::request::bat::tests::candidate_output_converts_to_the_isolated_fold_input ... ok
+test pcs::request::bat::tests::entry_dimensions_and_kept_mask_only_are_checked ... ok
+test pcs::request::bat::tests::duplicate_units_are_kept_with_their_own_x_powers ... ok
+test pcs::request::bat::tests::combine_uses_x_powers_per_claim_and_kept_forms ... ok
+test pcs::request::bat::tests::layout_is_descending_blocks_and_kept_main_is_excluded ... ok
+test pcs::request::bat::tests::fold_fixture_offsets_must_match_bat_offsets ... ok
+test pcs::request::bat::tests::legal_descending_layout_is_outside_the_fixture_handoff_subset ... ok
+test pcs::request::bat::tests::oracle_ids_follow_registration_order ... ok
+test pcs::request::bat::tests::sample_and_membership_checks_fail_closed ... ok
+test pcs::request::bat::tests::sample_rows_must_reference_their_own_oracle ... ok
+test pcs::request::bat::tests::session_freezes_rows_joins_and_mask_entries ... ok
+test pcs::request::bat::tests::session_draws_x_from_its_chain_and_keeps_repeated_generator_rows ... ok
+test pcs::request::bat::tests::session_rejects_wrong_plan_count_and_modified_frozen_input ... ok
+test pcs::request::bat::tests::two_oracles_keep_send_order_and_sample_powers ... ok
+test pcs::request::bat::tests::wrong_group_and_layout_are_rejected ... ok
+test pcs::request::binding::tests::canonical_writer_separates_word_and_byte_string_types ... ok
+test pcs::request::bat::tests::session_uses_the_current_chain_position_and_prior_prefix ... ok
+test pcs::request::binding::tests::assembly_is_deterministic_and_reuses_chain_start ... ok
+test pcs::request::binding::tests::contradictory_statement_is_rejected ... ok
+test pcs::request::binding::tests::domain_separation_isolates_the_domain_label ... ok
+test pcs::request::binding::tests::case_id_length_and_field_framing_are_bound ... ok
+test pcs::request::binding::tests::missing_statement_values_are_rejected ... ok
+test pcs::request::binding::tests::missing_parameters_are_rejected ... ok
+test pcs::request::binding::tests::parameter_domain_parameters_change_the_digest ... ok
+test pcs::request::binding::tests::parameter_plan_identifier_changes_the_digest ... ok
+test pcs::request::binding::tests::parameter_protocol_identity_changes_the_digest ... ok
+test pcs::request::binding::tests::parameter_version_changes_the_digest ... ok
+test pcs::request::binding::tests::plan_identifier_binds_order_length_and_presence ... ok
+test pcs::request::binding::tests::statement_case_changes_the_first_query ... ok
+test pcs::request::binding::tests::statement_field_order_is_bound ... ok
+test pcs::request::binding::tests::record_presence_bytes_and_length_are_bound ... ok
+test pcs::request::cs_stage::tests::wrong_code_capacity_or_shape_is_rejected ... ok
+test pcs::request::binding::tests::statement_request_and_table_identities_change_the_first_query ... ok
+test pcs::request::fold::tests::fold_round_challenges_reproduce_and_enforce_order ... ok
+test pcs::request::fold::tests::fold_round_main_table_is_folded_by_the_prover ... ok
+test pcs::request::cs_stage::tests::registration_is_deterministic_and_pending ... ok
+test pcs::request::fold::tests::gather_mask_rows ... ok
+test pcs::request::fold::tests::mask_cannot_be_sent_twice ... ok
+test pcs::request::fold::tests::malformed_structures_are_rejected_without_panicking ... ok
+test pcs::request::fold::tests::fold_round_polynomials_reproduce_the_hiding_sum ... ok
+test pcs::request::fold::tests::mask_rows_rejects_unvalidated_shifts ... ok
+test pcs::request::fold::tests::mask_table_and_weights_give_the_hiding_polynomial ... ok
+test pcs::request::fold::tests::mask_table_matches_the_formula ... ok
+test pcs::request::fold::tests::mask_sum_matches_the_definition ... ok
+test pcs::request::fold::tests::public_table_functions_bound_their_shifts ... ok
+test pcs::request::fold::tests::shape_faults_are_rejected ... ok
+test pcs::request::fold::tests::notice_draft_and_check ... ok
+test pcs::request::fold::tests::statement_validation_rejects_bad_relations ... ok
+test pcs::request::fold::tests::fold_start_separates_prover_and_verifier ... ok
+test pcs::request::fold::tests::mask_is_drawn_and_checked ... ok
+test pcs::request::fold::tests::zero_length_tail_is_supported ... ok
+test pcs::request::fold::tests::fold_round_as_drawn_regenerates_coefficients_and_tail ... ok
+test pcs::request::foldeq::tests::first_query_binds_the_plan_and_configuration ... ok
+test pcs::request::foldeq::tests::bat_chain_handoff_requires_the_read_stage ... ok
+test pcs::request::foldeq::tests::first_query_and_stage_order ... ok
+test pcs::request::foldeq::tests::lin_gamma_is_the_psi_suffix ... ok
+test pcs::request::gu::tests::gu_notice_bytes_bind_root_and_shape ... ok
+test pcs::request::foldeq::tests::gu_fresh_id_collision_is_rejected ... ok
+test pcs::request::gu::tests::gu_overflowing_widths_are_rejected_by_the_registry ... ok
+test pcs::request::foldeq::tests::fold_session_fixes_input_before_epsilon ... ok
+test pcs::request::gu::tests::gu_shape_faults_follow_the_oracle_and_capacity ... ok
+test pcs::request::gu::tests::gu_send_binds_the_root_to_the_complete_shape ... ok
+test pcs::request::foldeq::tests::fold_prover_second_as_drawn_check_rejects_another_source ... ok
+test pcs::request::lin::tests::evaluation_rejects_dimension_overflow_and_accepts_zero_variables ... ok
+test pcs::request::foldeq::tests::five_binding_inputs_change_the_actual_session_prefix_or_first_challenge ... ok
+test pcs::request::lin::tests::forged_shapes_fail_closed_at_public_entries ... ok
+test pcs::request::lin::tests::shape_mapping_and_non_power_rows_are_exact ... ok
+test pcs::request::foldeq::tests::fold_layout_mask_only_and_row_overflow_are_checked ... ok
+test pcs::request::foldeq::tests::wrong_prefix_chain_is_rejected ... ok
+test pcs::request::lin::tests::fold_check_is_hand_checked ... ok
+test pcs::request::foldeq::tests::fold_session_round_order_and_missing_rounds_fail_closed ... ok
+test pcs::request::foldeq::tests::fold_session_wrong_root_is_rejected_before_rounds ... ok
+test pcs::request::foldeq::tests::fold_session_wrong_group_layout_or_shape_is_rejected ... ok
+test pcs::request::foldeq::tests::gu_session_requires_seed_answers_record_then_queries ... ok
+test pcs::request::foldeq::tests::gamma_is_drawn_from_the_fixed_prefix ... ok
+test pcs::request::model_tied::tests::plan_candidate_self_consistency_uses_roots_only ... ok
+test pcs::request::foldeq::tests::gu_fixture_columns_do_not_pass_fold ... ok
+test pcs::request::model_tied::tests::timesfm_maps_a_vector_and_has_no_tied_head ... ok
+test pcs::request::foldeq::tests::gu_fold_consumes_the_joined_membership ... ok
+test pcs::request::foldeq::tests::gamma_gu_queries_reads_and_fold_start ... ok
+test pcs::request::foldeq::tests::plan_faults_are_rejected ... ok
+test pcs::request::lin::tests::claim_encoding_is_stable_and_public ... ok
+test pcs::request::foldeq::tests::gu_session_rows_check_one_independent_witness ... ok
+test pcs::request::oracle_opening::tests::identity_and_domain_mismatches_are_rejected ... ok
+test pcs::request::oracle_opening::tests::legal_current_opening_is_accepted_and_records_nodes ... ok
+test pcs::request::foldeq::tests::fold_session_rounds_produce_the_final_constraint ... ok
+test pcs::request::foldeq::tests::gu_wrong_fold_group_is_rejected ... ok
+test pcs::request::foldeq::tests::gu_session_requires_joined_columns_before_fold_and_uses_verified_reads ... ok
+test pcs::request::gu::tests::gu_claims_use_the_registered_shape_not_a_lookalike ... ok
+test pcs::request::gu::tests::gu_membership_joins_once_and_checks_the_trusted_group ... ok
+test pcs::request::gu::tests::gu_record_and_column_targets_and_separate_bytes ... ok
+test pcs::request::gu::tests::gu_index_and_oracle_answers_stay_separate ... ok
+test pcs::request::foldeq::tests::fold_session_kept_layout_is_enforced ... ok
+test pcs::request::foldeq::tests::gu_answer_round_feeds_the_following_draws ... ok
+test pcs::request::foldeq::tests::gu_session_rejects_missing_and_out_of_order_stages ... ok
+test pcs::request::foldeq::tests::gu_session_reuses_one_verified_column_for_repeated_draws ... ok
+test pcs::request::foldeq::tests::fold_session_fixed_input_change_changes_rounds ... ok
+test pcs::request::foldeq::tests::binding_identity_and_canonical_fields_are_checked ... ok
+test pcs::request::foldeq::tests::provider_hiding_is_bound_and_charged_before_send ... ok
+test pcs::request::foldeq::tests::lin_row_bound_accepts_the_limit_without_materializing ... ok
+test pcs::request::oracle_opening::tests::sealed_value_must_be_the_advanced_chain_value ... ok
+test pcs::request::model_tied::tests::gpt2_identity_alone_and_wrong_mappings_are_rejected ... ok
+test pcs::request::model_tied::tests::gpt2_tied_binds_same_root_shape_and_own_indices ... ok
+test pcs::request::foldeq::tests::fold_session_kept_rows_three_use_compact_mapping ... ok
+test pcs::request::foldeq::tests::gu_session_joins_the_trusted_group_once ... ok
+test pcs::request::foldeq::tests::plan_and_binding_substitution_is_rejected_at_open_and_bind ... ok
+test pcs::request::foldeq::tests::send_root_cannot_be_replaced_after_seeds_are_drawn ... ok
+test pcs::request::foldeq::tests::fold_session_kept_rows_three_virtual_mapping_is_independent ... ok
+test pcs::request::lin::tests::skeleton_requires_every_first_seal_and_matching_public_parameters ... ok
+test pcs::request::lin::tests::w_omega_and_dot_are_independently_checked ... ok
+test pcs::request::persistent_count::tests::a_full_sampled_leaf_is_not_switched_to_a_roomy_leaf ... ok
+test pcs::request::persistent_count::tests::child_process_helper ... ok
+test pcs::request::oracle_opening::tests::unrelated_or_forged_source_is_rejected ... ok
+test pcs::request::model_tied::tests::gemma3_tied_stays_unsupported ... ok
+test pcs::request::oracle_opening::tests::wrong_list_and_root_handles_are_rejected ... ok
+test pcs::request::foldeq::tests::gu_session_closes_every_ordered_answer ... ok
+test pcs::request::persistent_count::tests::all_live_leaves_are_checked_before_append ... ok
+test pcs::request::persistent_count::tests::append_open_call_error_is_rejected_at_startup ... ok
+test pcs::request::persistent_count::tests::append_is_durable_and_restart_preserves_the_count ... ok
+test pcs::request::persistent_count::tests::close_call_error_propagation_does_not_emit_receipt ... ok
+test pcs::request::foldeq::tests::fold_session_kept_evidence_is_direct_and_nonzero ... ok
+test pcs::request::persistent_count::tests::count_files_are_appendable_at_startup ... ok
+test pcs::request::persistent_count::tests::missing_count_file_is_not_treated_as_zero ... ok
+test pcs::request::persistent_count::tests::forged_plans_are_rejected_at_every_entry ... ok
+test pcs::request::foldeq::tests::gu_session_rejects_a_rebound_oracle_tree_or_group ... ok
+test pcs::request::proximity::tests::plan_checks_adjacent_codes_and_last_stage_shape ... ok
+test pcs::request::proximity::tests::single_rows_check_shapes_and_base_precondition ... ok
+test pcs::request::persistent_count::tests::short_write_and_sync_failure_stay_fail_closed ... ok
+test pcs::request::persistent_count::tests::startup_rejects_a_full_live_set ... ok
+test pcs::request::persistent_count::tests::startup_rejects_a_removed_count_file_at_append_open ... ok
+test pcs::request::read::tests::hiding_charge_failure_is_atomic ... ok
+test pcs::request::read::tests::hiding_state_charges_before_send_and_never_refunds ... ok
+test pcs::request::read::tests::hiding_state_saves_and_loads_atomically ... ok
+test pcs::request::lin::tests::skeleton_is_a_fixture_not_a_chain_claim ... ok
+test pcs::request::read::tests::positions_are_drawn_in_range_and_deterministically ... ok
+test pcs::request::read::tests::ledger_reservations_are_atomic_and_shared ... ok
+test pcs::request::persistent_count::tests::unlock_failure_is_not_reported_as_success ... ok
+test pcs::request::read::tests::hiding_state_is_atomic_under_concurrency ... ok
+test pcs::request::read::tests::concurrent_readers_refund_only_unstarted_budget ... ok
+test pcs::request::read::tests::recovery_counts_outstanding_reservations_as_used ... ok
+test pcs::request::read::tests::recovery_keeps_the_budget_spent ... ok
+test pcs::request::read::tests::prover_budget_failure_does_not_consume_the_hiding_token ... ok
+test pcs::request::read::tests::over_limit_retry_stays_rejected_through_charged_opens ... ok
+test pcs::request::read::tests::failed_read_cancels_its_reservation ... ok
+test pcs::request::read::tests::prover_reads_cache_and_bound_the_budget ... ok
+test pcs::request::read::tests::concurrent_readers_charge_independent_budgets ... ok
+test pcs::request::relation::tests::column_draw_sequence_keeps_order_and_multiplicity ... ok
+test pcs::request::read::tests::read_errors_do_not_panic ... ok
+test pcs::request::relation::tests::column_plan_rows_checks_the_plan_and_fixture_list ... ok
+test pcs::request::relation::tests::column_row_matches_an_independent_generator_evaluation ... ok
+test pcs::request::foldeq::tests::gu_shared_seeds_are_drawn_from_the_received_root ... ok
+test pcs::request::relation::tests::column_row_rejects_a_real_tail_without_a_physical_slot ... ok
+test pcs::request::read::tests::token_clone_does_not_exempt_a_second_reader_budget ... ok
+test pcs::request::relation::tests::column_row_places_a_non_power_width_tail_that_fits ... ok
+test pcs::request::relation::tests::gu_table_keeps_index_pads_and_reserves_send_pads ... ok
+test pcs::request::relation::tests::gu_table_keeps_the_gap_when_tail_first_exceeds_ell ... ok
+test pcs::request::relation::tests::fixture_source_replacements_fail_at_the_matching_boundary ... ok
+test pcs::request::read::tests::verifier_reads_charge_and_repeat_consistently ... ok
+test pcs::request::relation::tests::sample_row_uses_both_main_and_mask_fronts ... ok
+test pcs::request::relation::tests::record_row_handles_two_answers_and_target_answer_one ... ok
+test pcs::request::relation::tests::record_row_uses_the_transposed_layout_when_rows_are_high ... ok
+test pcs::request::relation::tests::record_and_column_rows_handle_three_rows_with_rows_high ... ok
+test pcs::request::relation::tests::one_actual_gu_table_satisfies_record_column_and_sample ... ok
+test pcs::request::relation::tests::record_row_matches_an_independent_small_evaluation ... ok
+test pcs::request::runtime_tree::tests::illegal_co_tree_shapes_fail_closed ... ok
+test pcs::request::runtime_tree::tests::mask_tree_plan_faults_are_rejected ... ok
+test pcs::request::relation::tests::sample_rows_share_one_seed_set_by_answer ... ok
+test pcs::request::runtime_tree::tests::base_rows_reject_nonzero_high_components ... ok
+test pcs::request::runtime_tree::tests::opening_bytes_are_an_independent_fixed_format ... ok
+test pcs::request::runtime_tree::tests::runtime_layout_faults_are_rejected ... ok
+test pcs::request::runtime_tree::tests::runtime_layout_encoding_binds_classes_depths_and_parts ... ok
+test pcs::request::runtime_tree::tests::runtime_layout_groups_same_class_and_depth ... ok
+test pcs::request::runtime_tree::tests::mask_only_tree_is_the_one_part_special_case ... ok
+test pcs::request::runtime_tree::tests::runtime_layout_overflowing_widths_are_rejected ... ok
+test pcs::request::relation::tests::plan_first_query_binds_the_trusted_gu_shape ... ok
+test pcs::request::runtime_tree::tests::runtime_layout_rebuild_gate_rejects_reorder_split_and_context ... ok
+test pcs::request::runtime_tree::tests::runtime_layout_separates_depth_and_class ... ok
+test pcs::request::runtime_tree::tests::reduced_query_positions_keep_their_long_identity ... ok
+test pcs::request::runtime_tree::tests::runtime_layout_tampers_are_rejected ... ok
+test pcs::request::relation::tests::sample_rows_handle_three_rows_and_mask_rows ... ok
+test pcs::request::runtime_tree::tests::runtime_leaf_hash_input_is_the_current_candidate_format ... ok
+test pcs::request::runtime_tree::tests::runtime_tree_plan_shape_faults_are_rejected ... ok
+test pcs::request::runtime_tree::tests::short_position_checks_the_source_domain ... ok
+test pcs::request::send::tests::invalid_notices_are_rejected_without_panicking ... ok
+test pcs::request::send::tests::notices_bind_the_planned_root_and_shape ... ok
+test pcs::request::send::tests::registry_requires_the_plan_notice ... ok
+test pcs::request::table::tests::commit_rejects_wrong_inputs ... ok
+test pcs::request::runtime_tree::tests::runtime_mask_tree_round_trip ... ok
+test pcs::request::runtime_tree::tests::runtime_plan_values_are_bound ... ok
+test pcs::request::runtime_tree::tests::tampered_mask_openings_are_rejected ... ok
+test pcs::request::table::tests::oversized_shapes_are_rejected_without_a_shift_panic ... ok
+test pcs::request::table::tests::decode_is_bounded_and_checked ... ok
+test pcs::request::table::tests::index_name_binds_the_complete_record ... ok
+test pcs::request::table::tests::index_name_record_encoding_is_stable ... ok
+test pcs::request::table::tests::shape_faults_are_rejected ... ok
+test pcs::request::table::tests::leaf_root_and_depth_are_checked ... ok
+test pcs::request::table::tests::noncanonical_leaf_variants_are_rejected ... ok
+test pcs::request::table::tests::record_seeds_match_an_independent_derivation ... ok
+test pcs::request::table::tests::order_and_length_are_checked ... ok
+test pcs::request::table::tests::opening_paths_are_bound_to_position_and_configuration ... ok
+test pcs::request::table::tests::tree_shape_checks_are_separate ... ok
+test pcs::request::table::tests::record_seeds_are_deterministic_and_bound ... ok
+test pcs::request::table_state::tests::priced_or_shape_mismatch_is_rejected ... ok
+test pcs::request::table::tests::record_round_trip_and_length_check ... ok
+test pcs::request::table_state::tests::priced_table_binds_all_shape_fields_and_test ... ok
+test pcs::request::runtime_tree::tests::runtime_co_tree_round_trip_and_opening_units ... ok
+test pcs::request::table_state::tests::standing_matches_one_time_later_and_link ... ok
+test pcs::request::table::tests::positive_commit_and_open ... ok
+test pcs::request::table::tests::configuration_and_distances_binding ... ok
+test pcs::request::table_state::tests::tested_state_requires_full_setting_equality ... ok
+test pcs::request::table_state::tests::valid_salt_change_in_reader_is_rejected_by_the_run_shape ... ok
+test pcs::request::table::tests::tampered_columns_are_rejected ... ok
+test pcs::request::tree_book::tests::adoption_shares_counts_and_release_waits_for_held_and_lists ... ok
+test pcs::request::tree_book::tests::hiding_limits_reject_before_output_and_leave_counts_high ... ok
+test pcs::request::tree_book::tests::empty_ids_are_a_noop_but_empty_draws_are_not ... ok
+test pcs::request::tree_book::tests::adoption_rejects_used_target_repeat_and_incompatible_shape ... ok
+test pcs::request::tree_book::tests::one_list_trees_reject_second_lists_and_adoption ... ok
+test pcs::request::tree_book::tests::adoption_checks_source_safety_fields_but_not_context_groups ... ok
+test pcs::request::tree_book::tests::position_lists_are_nonempty_and_short_lists_deduplicate ... ok
+test pcs::request::tree_book::tests::release_waits_for_each_parts_group_count ... ok
+test pcs::request::tree_book::tests::verifier_reads_count_lists_but_not_prover_positions ... ok
+test pcs::request::tree_book::tests::positions_count_cross_list_repeats_and_short_lists ... ok
+test pcs::request::tree_book::tests::whole_trees_and_group_agreement_are_required ... ok
+test pcs::request::oracle_opening::tests::legal_sealed_predecessor_and_mixed_sources_are_accepted ... ok
+test pcs::request::oracle_opening::tests::root_sender_identity_and_fixture_order_are_explicit ... ok
+test pcs::request::persistent_count::tests::two_processes_serialize_on_one_lock ... ok
+test pcs::request::oracle_opening::tests::wrong_stored_run_config_salt_and_root_are_rejected ... ok
+test pcs::request::oracle_opening::tests::sibling_chains_share_nodes_and_clone_is_not_available ... ok
+test pcs::request::oracle_opening::tests::concurrent_siblings_merge_valid_openings_atomically ... ok
+test pcs::request::oracle_opening::tests::shared_node_conflict_survives_follow_and_failure_does_not_pollute ... ok
+test pcs::request::oracle_opening::tests::multi_level_ancestors_and_mixed_roots_are_accepted ... ok
+
+test result: ok. 234 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+     Running tests/artifact_atomicity.rs (target/debug/deps/artifact_atomicity-0439e414d48132e1)
+
+running 4 tests
+test failed_publish_leaves_no_final_or_temp_directory ... ok
+test half_written_artifact_is_rejected ... ok
+test version_and_complete_digest_mismatch_are_rejected ... ok
+test publish_is_atomic_complete_and_not_overwritten ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cpu_kernels.rs (target/debug/deps/cpu_kernels-caaec65386b4d900)
+
+running 14 tests
+test batched_matmul_equals_per_batch_calls ... ok
+test dft_matches_the_naive_transform ... ok
+test field_matmul_matches_the_scalar_oracle ... ok
+test fixed_matmul_is_exact_and_checked ... ok
+test gather_uses_only_the_complete_table_and_rejects_bad_indices ... ok
+test integer_relations_are_exact ... ok
+test layout_is_index_safe_and_deterministic ... ok
+test lookup_counts_and_field_accumulation_are_separate ... ok
+test merkle_hash_matches_independent_layout_vectors ... ok
+test mle_fold_matches_the_direct_expansion ... ok
+test reductions_are_exact_and_deterministic ... ok
+test kernels_are_reentrant_from_several_threads ... ok
+test merkle_tree_is_perfect_and_rejects_non_power_of_two ... ok
+test worker_count_and_tile_order_do_not_change_results ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/kernel_storage.rs (target/debug/deps/kernel_storage-d3bbf9bf19e1203c)
+
+running 4 tests
+test workspace_requests_are_enforced_and_released ... ok
+test tile_bounds_do_not_change_results_across_sources ... ok
+test resident_mmap_and_scratch_sources_agree_with_tiled_reads ... ok
+test field_sources_reject_non_canonical_words_and_mismatched_dtypes ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/memory_budget.rs (target/debug/deps/memory_budget-adb58aab6e4f5870)
+
+running 4 tests
+test insufficient_budget_fails_before_reservation ... ok
+test snapshot_tracks_categories_and_releases_on_drop ... ok
+test scratch_is_writable_until_sealed_then_immutable ... ok
+test exec_context_implements_execution_port ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/mmap_ranges.rs (target/debug/deps/mmap_ranges-bebe673285f7738e)
+
+running 3 tests
+test engine_storage_serves_mapped_view ... ok
+test mmap_range_matches_independent_slice ... ok
+test mmap_rejects_bounds_overflow_and_truncation ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/parallel_exactness.rs (target/debug/deps/parallel_exactness-98adc31a2511286a)
+
+running 4 tests
+test duplicate_keys_are_rejected ... ok
+test overlap_is_off_by_default_and_allowlisted ... ok
+test overlap_must_match_serial_witness_or_fall_back ... ok
+test worker_count_does_not_change_normalized_results ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/primitive_vectors.rs (target/debug/deps/primitive_vectors-6e5a9540816d44cd)
+
+running 8 tests
+test canonical_codec_rejects_non_canonical_and_trailing_bytes ... ok
+test exact_division_rejects_zero_and_matches_euclid ... ok
+test base_field_vectors ... ok
+test blake2b_matches_independent_vectors ... ok
+test extension_field_vectors_and_canonical_encoding ... ok
+test rounding_vectors_use_mathematical_floor ... ok
+test labelled_hashes_match_vectors ... ok
+test wide_integer_vectors_and_carry_helpers ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/progress_contract.rs (target/debug/deps/progress_contract-6e35f60ef80ee0c4)
+
+running 4 tests
+test bounded_queue_drops_work_but_never_lifecycle ... ok
+test missing_terminal_event_is_incomplete ... ok
+test buffered_sink_assigns_gapless_sequences_across_threads ... ok
+test heartbeat_interval_and_process_metrics_are_available ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/request_primitives.rs (target/debug/deps/request_primitives-d42a11c8ef2affce)
+
+running 7 tests
+test extension_code_is_coordinate_wise ... ok
+test code_plan_and_encoding_match_vectors ... ok
+test chain_start_matches_vectors ... ok
+test parameter_digest_matches_vector_and_binds_shape ... ok
+test proof_of_work_search_and_verification ... ok
+test round_calls_match_vectors_and_bind_position ... ok
+test verifier_draws_match_vectors ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/runtime_contract.rs (target/debug/deps/runtime_contract-b685eb3923d4435e)
+
+running 5 tests
+test duplicate_task_keys_are_rejected ... ok
+test logical_task_order_is_independent_of_worker_count ... ok
+test memory_budget_is_reserved_before_use_and_released_on_drop ... ok
+test progress_sequence_is_strictly_increasing ... ok
+test runtime_config_is_validated_before_execution ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests zkie_engine
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
