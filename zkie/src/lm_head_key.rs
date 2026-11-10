@@ -8586,6 +8586,21 @@ mod stage_tests {
         assert!(!output.status.success());
         std::fs::write(&public_path, &public_bytes).expect("restore public identity");
 
+        // A prover-reported new table root cannot replace the policy-pinned
+        // identity: the verifier rebuilds the committed identity and rejects
+        // a root that the operator policy does not name.
+        let mut handoff = read_public(&public_path).expect("handoff");
+        let mut replaced_statement =
+            LimitedKeyStatement::decode(&handoff.statement).expect("statement");
+        replaced_statement.table_root = Digest([0xef; 32]);
+        handoff.statement = replaced_statement.encode();
+        handoff.reader.root = replaced_statement.table_root;
+        std::fs::write(&public_path, &handoff.encode().expect("encode handoff"))
+            .expect("replace root");
+        let output = run_stage(&executable, &dir, "verify");
+        assert!(!output.status.success());
+        std::fs::write(&public_path, &public_bytes).expect("restore root");
+
         // Replaced private bytes are rejected before any proof work.
         let private_bytes = std::fs::read(&private).expect("private");
         let mut changed_private = private_bytes.clone();
