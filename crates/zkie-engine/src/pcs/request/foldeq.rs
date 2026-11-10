@@ -71,10 +71,23 @@ pub struct FoldeqBinder {
     parameters: Digest,
     first_query: Vec<u8>,
     start: Digest,
+    random_bytes: Option<Digest>,
 }
 
 impl FoldeqBinder {
     pub fn new(label: u64, parameters: Digest, plan: &FoldeqPlan) -> Result<Self> {
+        Self::new_with_random_bytes(label, parameters, plan, None)
+    }
+
+    /// Builds the binder with the chain's random bytes. The salted chain's
+    /// start and its run's value follow the same bytes; the trees that the
+    /// chain sends use that run as their start.
+    pub fn new_with_random_bytes(
+        label: u64,
+        parameters: Digest,
+        plan: &FoldeqPlan,
+        random_bytes: Option<Digest>,
+    ) -> Result<Self> {
         if plan.fault().is_some() {
             return Err(Error::InvalidConfig);
         }
@@ -82,13 +95,38 @@ impl FoldeqBinder {
             return Err(Error::StatementMismatch);
         }
         let first_query = plan.first_query();
-        let start = chain_start(label, &parameters, &first_query, &[], None)?;
+        let start = chain_start(
+            label,
+            &parameters,
+            &first_query,
+            &[],
+            random_bytes.as_ref(),
+        )?;
         Ok(Self {
             label,
             parameters,
             first_query,
             start,
+            random_bytes,
         })
+    }
+
+    /// The chain's run's value when its first query carries random bytes.
+    pub fn run(&self) -> Option<Digest> {
+        self.random_bytes
+            .as_ref()
+            .and_then(|bytes| {
+                crate::primitives::transcript::run_value(
+                    self.label,
+                    &self.parameters,
+                    bytes,
+                )
+                .ok()
+            })
+    }
+
+    pub fn random_bytes(&self) -> Option<&Digest> {
+        self.random_bytes.as_ref()
     }
 
     pub fn first_query(&self) -> &[u8] {
@@ -100,7 +138,13 @@ impl FoldeqBinder {
     }
 
     pub fn chain(&self) -> Result<Chain> {
-        Chain::begin(self.label, &self.parameters, &self.first_query, &[], None)
+        Chain::begin(
+            self.label,
+            &self.parameters,
+            &self.first_query,
+            &[],
+            self.random_bytes.as_ref(),
+        )
     }
 }
 
@@ -4158,4 +4202,39 @@ mod tests {
         assert!(prover.start(eps, &wrong).is_err());
         assert_eq!(start.message.sum, prover.sum());
     }
+
+    #[test]
+    fn the_binder_binds_the_chain_random_bytes_and_its_run() {
+        let (plan, _table) = plan_fixture();
+        let parameters = plan.reader.configuration;
+        let salt = Digest([0x77; 32]);
+        let salted = FoldeqBinder::new_with_random_bytes(
+            0x1234,
+            parameters,
+            &plan,
+            Some(salt),
+        )
+        .expect("salted binder");
+        let other = FoldeqBinder::new_with_random_bytes(
+            0x1234,
+            parameters,
+            &plan,
+            Some(Digest([0x78; 32])),
+        )
+        .expect("other salt");
+        let unsalted = FoldeqBinder::new(0x1234, parameters, &plan).expect("unsalted");
+        assert_ne!(salted.start(), other.start());
+        assert_ne!(salted.start(), unsalted.start());
+        assert_eq!(
+            salted.run(),
+            Some(
+                crate::primitives::transcript::run_value(0x1234, &parameters, &salt)
+                    .expect("run")
+            )
+        );
+        assert_eq!(salted.random_bytes(), Some(&salt));
+        assert_eq!(salted.chain().expect("chain").value(), salted.start());
+        assert!(unsalted.run().is_none());
+    }
+
 }
