@@ -710,7 +710,7 @@ impl TableRowSource for VecTableSource {
 /// tree and salts stay with the table.
 pub struct StreamingHolder<S: TableRowSource> {
     table: StreamingTable,
-    source: S,
+    source: Option<S>,
     peak_bytes: u64,
     hiding: HidingState,
     charge: Option<HidingCharge>,
@@ -727,7 +727,7 @@ impl<S: TableRowSource> StreamingHolder<S> {
         let hiding = HidingState::new(table.reader.root, 1, max_columns);
         Ok(Self {
             table,
-            source,
+            source: Some(source),
             peak_bytes: peak,
             hiding,
             charge: None,
@@ -782,7 +782,10 @@ impl<S: TableRowSource> StreamingHolder<S> {
         let mut folded = vec![Fp3::ZERO; ell];
         let mut folded_tail = vec![Fp3::ZERO; tail_len];
         for row in 0..rows {
-            self.source.row(row as u64, &mut message, &mut tail)?;
+            self.source
+                .as_mut()
+                .ok_or(Error::InvalidSessionState)?
+                .row(row as u64, &mut message, &mut tail)?;
             let weight = eq_gamma[row];
             for (place, value) in message.iter().enumerate() {
                 folded[place] = folded[place].add(&weight.mul(&Fp3::from_base(*value)));
@@ -835,14 +838,29 @@ impl<S: TableRowSource> StreamingHolder<S> {
     /// Recomputes the drawn columns from the source and checks them against
     /// the stored tree.
     pub fn open(&mut self, positions: &[u64]) -> Result<Vec<ColumnOpening>> {
-        let charge = self.charge.as_ref().ok_or(Error::InvalidSessionState)?;
-        charge.consume(positions)?;
-        self.table.open_columns(&mut self.source, positions)
+        {
+            let charge = self.charge.as_ref().ok_or(Error::InvalidSessionState)?;
+            charge.consume(positions)?;
+        }
+        let source = self
+            .source
+            .as_mut()
+            .ok_or(Error::InvalidSessionState)?;
+        self.table.open_columns(source, positions)
     }
 
     /// Releases fold state. This holder keeps no folded row between calls; a
     /// caller that caches the returned rows drops them itself.
     pub fn forget(&mut self) -> Result<()> {
+        self.charge = None;
+        Ok(())
+    }
+
+    /// Releases the row source after its last fold or opening. The table's
+    /// reader, name, tree and salts stay; the source can no longer fold or
+    /// open. A caller uses this once every drawn column was opened.
+    pub fn release_source(&mut self) -> Result<()> {
+        self.source = None;
         self.charge = None;
         Ok(())
     }
