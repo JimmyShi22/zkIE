@@ -7,7 +7,10 @@ use zkie_core::types::Digest;
 use zkie_engine::pcs::request::chain::Chain;
 use zkie_engine::pcs::request::field::Fp3;
 use zkie_engine::pcs::request::params::REQUEST_CHAIN_LABEL;
-use zkie_ops::proof::bat_fold_session::{run_bat_fold, BatFoldFixture};
+use zkie_ops::proof::base_final_session::BaseRejection;
+use zkie_ops::proof::bat_fold_session::{
+    run_bat_fold, run_bat_fold_with_base, run_bat_fold_with_base_and_target_shift, BatFoldFixture,
+};
 
 fn chain(seed: &[u8]) -> Chain {
     Chain::begin(REQUEST_CHAIN_LABEL, &Digest::ZERO, seed, &[], None).unwrap()
@@ -75,6 +78,59 @@ fn the_fixture_bat_row_enters_fold_natively() {
         run.epsilon,
         run.output.target,
         run.auxiliary_value
+    );
+}
+
+#[test]
+fn the_fixture_base_final_wiring_passes_but_stays_pending() {
+    let fixture = BatFoldFixture::new(9).unwrap();
+    let run = run_bat_fold_with_base(&fixture, chain(b"fixture base final")).unwrap();
+    assert!(run.base.base_linear);
+    assert!(run.base.symbol_checks);
+    assert!(run.base.openings_verified);
+    assert!(run.base.rejection.is_none());
+    assert!(run.base.pending);
+    assert!(!run.base.complete_base);
+    assert!(run.base.fresh_row_committed);
+    assert!(run.base.fresh_term_checked);
+    assert!(!run.base.fresh_term_authenticated_by_fold_root);
+    assert!(run.base.chain_handoff);
+    assert_eq!(run.base.entry_rounds, run.fold_exit_rounds);
+    assert_eq!(run.base.entry_value, run.fold_exit_value);
+    assert!(run.base.commit_rounds > run.base.entry_rounds);
+    assert!(run.base.rows_rounds > run.base.commit_rounds);
+    assert_eq!(run.base.base_positions.len(), 2);
+    println!(
+        "base fold_identity={:?} roots=[{:?},{:?},{:?},{:?},{:?}] lambda={:?} target_star={:?} positions={:?}",
+        run.base.fold_identity,
+        run.base.old_main_root,
+        run.base.old_mask_root,
+        run.base.star_root,
+        run.base.star_mask_root,
+        run.base.fresh_root,
+        run.base.lambda,
+        run.base.target_star,
+        run.base.base_positions
+    );
+}
+
+#[test]
+fn a_fixed_base_target_shift_is_rejected_at_the_target_layer() {
+    let fixture = BatFoldFixture::new(10).unwrap();
+    let run = run_bat_fold_with_base_and_target_shift(
+        &fixture,
+        chain(b"fixture base target"),
+        Fp3::ONE,
+    )
+    .unwrap();
+    assert!(!run.base.base_linear);
+    assert_eq!(run.base.rejection, Some(BaseRejection::TargetLinear));
+    assert!(run.base.pending);
+    assert!(!run.base.complete_base);
+    assert_eq!(run.base.base_positions.len(), 2);
+    println!(
+        "rejected base lambda={:?} target_star={:?} positions={:?} layer=TargetLinear",
+        run.base.lambda, run.base.target_star, run.base.base_positions
     );
 }
 

@@ -81,14 +81,27 @@
 //! violations fail closed. The wrong-target case is not evidence that FOLD
 //! judges an arbitrary declaration.
 //!
+//! The BASE continuation runs on the same chain after `fold_finish`: the claim,
+//! target and FOLD identity are taken from the same FOLD output; the old main
+//! and old mask rows are the FOLD prover's end rows; the fresh row is the FOLD
+//! prover's folded fresh message, separately committed by the BASE fixture.
+//! The star rows are the BASE prover's own fixture rows. Five row commitments
+//! and target* are fixed before lambda; M'/R' and the fresh combined row are
+//! fixed before the position draw; the openings are authenticated; the
+//! extended linear check and the encoded-symbol checks are recorded. The BASE
+//! result stays pending: it is not a complete BASE, IOPP bound or valid
+//! FOLD-to-BASE handoff, and one equality at one lambda is not a general
+//! wrong-declaration rejection.
+//!
 //! The single G_u witness from the SEND fixture is not applied to this group:
 //! each member has its own shape-checked fixture commitment and a per-member
 //! G_u-shaped view for the shared sample form. Unsupported plans, shapes, answer
 //! counts and seed lengths are rejected. Unclosed: real SEND/G_u and send
 //! receipts, authenticated assets, fresh-mask openings and proximity, folded
 //! tails, a relation/proximity connection, random hiding, single-shot semantics,
-//! production and performance acceptance, and a trust anchor independent of the
-//! fixture expectation. The plan's reader and binding are a valid but inert
+//! production and performance acceptance, a complete BASE/IOPP result, a
+//! deterministic wrong-declaration guarantee, and a trust anchor independent of
+//! the fixture expectation. The plan's reader and binding are a valid but inert
 //! scaffold required by the existing plan type; the FOLD-only entry never reads
 //! them and they are not a witness or an asset binding. `verify_request` is
 //! unchanged.
@@ -126,6 +139,10 @@ use zkie_engine::pcs::request::table::{
 };
 use zkie_engine::primitives::transcript::{hash_labeled, tag_word, TEST_COINS};
 
+use crate::proof::base_final_session::{
+    fold_identity, BaseFinalOutcome, BaseFinalSession, BaseProver,
+};
+use crate::proof::fold_handoff::{FoldHandoff, FoldHandoffAnchor};
 use crate::proof::group_commitment_session::{
     member_gu_shapes, shared_answer_order, CommittedGroupMember, GroupCommitmentSession,
     GroupMemberPlan, GroupRootMessage, MemberFixture,
@@ -144,6 +161,7 @@ const FIXTURE_PLANNED_ROWS: u64 = 6;
 const FIXTURE_OPENINGS_PER_ORACLE: usize = 2;
 const FIXTURE_MEMBER_TREE_BASE: u64 = 10;
 const FIXTURE_MEMBER_LEAF: u32 = 4;
+const FIXTURE_BASE_POSITIONS: usize = 2;
 
 /// A deterministic numbered source for the fixture's fresh mask. It is public,
 /// reproducible and provides no hiding; it must not be used outside a test or
@@ -1013,6 +1031,17 @@ pub struct BatFoldOutcome {
     pub witness_root: Digest,
 }
 
+/// The fixture run result together with the FOLD continuation needed by the
+/// BASE stage.
+struct BatFoldCore {
+    outcome: BatFoldOutcome,
+    fold: FoldeqSession,
+    handoff: FoldHandoff,
+    old_main: Vec<Fp3>,
+    old_mask: Vec<Fp3>,
+    old_fresh: Vec<Fp3>,
+}
+
 /// Runs the isolated fixture with the prover's plaintext sample answers as the
 /// received answers.
 pub fn run_bat_fold(fixture: &BatFoldFixture, chain: Chain) -> Result<BatFoldOutcome> {
@@ -1031,6 +1060,17 @@ pub fn run_bat_fold_with_provider<F>(
     chain: Chain,
     provider: F,
 ) -> Result<BatFoldOutcome>
+where
+    F: FnOnce(&[(u32, u64)], &[SampleSeed], &[Fp3]) -> Result<Vec<Fp3>>,
+{
+    run_bat_fold_core(fixture, chain, provider).map(|core| core.outcome)
+}
+
+fn run_bat_fold_core<F>(
+    fixture: &BatFoldFixture,
+    chain: Chain,
+    provider: F,
+) -> Result<BatFoldCore>
 where
     F: FnOnce(&[(u32, u64)], &[SampleSeed], &[Fp3]) -> Result<Vec<Fp3>>,
 {
@@ -1157,7 +1197,28 @@ where
 
     let final_rounds = fold.chain().rounds();
     let final_value = *fold.transcript_value();
-    Ok(BatFoldOutcome {
+    let anchor = FoldHandoffAnchor {
+        shape: fixture.shape,
+        group: FIXTURE_GROUP,
+        members: fixture
+            .layout
+            .members
+            .iter()
+            .map(|member| member.oracle)
+            .collect(),
+        fresh: fixture.start.id,
+        fresh_root: fixture.start.root,
+        tree_number: fixture.start.tree_number,
+        layout: fixture.layout.clone(),
+        fold_gamma: output.gamma.clone(),
+        fold_epsilon: output.eps,
+        fold_sum: output.sum,
+    };
+    let handoff = FoldHandoff::from_output(&output, &anchor)?;
+    let old_main = prover.main_messages().to_vec();
+    let old_mask = end.mu.clone();
+    let old_fresh = end.fresh.clone();
+    let outcome = BatFoldOutcome {
         tag: fixture.tag,
         shape: fixture.shape,
         layout: fixture.layout.clone(),
@@ -1222,12 +1283,124 @@ where
         final_rounds,
         final_value,
         witness_root: fixture.witness_root,
+    };
+    Ok(BatFoldCore {
+        outcome,
+        fold,
+        handoff,
+        old_main,
+        old_mask,
+        old_fresh,
     })
+}
+
+/// The fixture run plus the local BASE final-state wiring result.
+pub struct BatFoldBaseOutcome {
+    pub fold: BatFoldOutcome,
+    pub base: BaseFinalOutcome,
+    pub fold_exit_rounds: u64,
+    pub fold_exit_value: Digest,
+}
+
+/// Runs the same fixture chain and then wires the FOLD output into the local
+/// BASE final-state check. The BASE result is pending; it is not a complete
+/// BASE or a valid FOLD-to-BASE handoff.
+pub fn run_bat_fold_with_base(
+    fixture: &BatFoldFixture,
+    chain: Chain,
+) -> Result<BatFoldBaseOutcome> {
+    run_bat_fold_with_base_and_target_shift(fixture, chain, Fp3::ZERO)
+}
+
+/// Runs the same wiring with a fixture target* shift for the fixed
+/// inconsistent sample. A nonzero shift must fail the target/linear layer; it
+/// is not a general wrong-declaration claim.
+pub fn run_bat_fold_with_base_and_target_shift(
+    fixture: &BatFoldFixture,
+    chain: Chain,
+    target_shift: Fp3,
+) -> Result<BatFoldBaseOutcome> {
+    let core = run_bat_fold_core(fixture, chain, |_, _, true_answers| {
+        Ok(true_answers.to_vec())
+    })?;
+    let fold_exit_rounds = core.fold.chain().rounds();
+    let fold_exit_value = *core.fold.transcript_value();
+    let base_chain = core.fold.take_chain_for_base()?;
+    if base_chain.rounds() != fold_exit_rounds || *base_chain.value() != fold_exit_value {
+        return Err(Error::StatementMismatch);
+    }
+    let code = fixture.shape.code;
+    let mask_code = fixture.shape.mask_code;
+    let star = fixture_base_star(fixture.tag, code, mask_code);
+    let old_main_tail: Vec<Fp3> = (0..code.r)
+        .map(|index| Fp3::from_u64(0x9200 + fixture.tag * 0x10 + index))
+        .collect();
+    let old_mask_tail: Vec<Fp3> = (0..mask_code.r)
+        .map(|index| Fp3::from_u64(0x9300 + fixture.tag * 0x10 + index))
+        .collect();
+    let fresh_tail: Vec<Fp3> = (0..mask_code.r)
+        .map(|index| Fp3::from_u64(0x9700 + fixture.tag * 0x10 + index))
+        .collect();
+    let fresh_claim = core.handoff.fresh_claim.clone();
+    let rows = core.handoff.single_rows(
+        core.old_main,
+        old_main_tail,
+        core.old_mask,
+        old_mask_tail,
+    )?;
+    let identity = fold_identity(&core.handoff);
+    let prover = BaseProver::new(
+        rows,
+        identity,
+        fresh_claim,
+        core.old_fresh,
+        fresh_tail,
+        star.0,
+        star.1,
+        star.2,
+        star.3,
+        target_shift,
+    )?;
+    let mut session = BaseFinalSession::new(base_chain, core.handoff, prover.expectation())?;
+    session.receive_commitments(prover.messages()?)?;
+    let lambda = session.draw_lambda()?;
+    session.receive_base_rows(prover.base_rows(lambda)?)?;
+    let positions = session.draw_base_positions(FIXTURE_BASE_POSITIONS)?;
+    let openings = prover.openings(&positions)?;
+    session.verify_openings(&openings)?;
+    let base = session.finish()?;
+    Ok(BatFoldBaseOutcome {
+        fold: core.outcome,
+        base,
+        fold_exit_rounds,
+        fold_exit_value,
+    })
+}
+
+fn fixture_base_star(
+    tag: u64,
+    code: CodeParams,
+    mask_code: CodeParams,
+) -> (Vec<Fp3>, Vec<Fp3>, Vec<Fp3>, Vec<Fp3>) {
+    let main: Vec<Fp3> = (0..code.ell)
+        .map(|index| Fp3::from_u64(0x9100 + tag * 0x10 + index))
+        .collect();
+    let main_tail: Vec<Fp3> = (0..code.r)
+        .map(|index| Fp3::from_u64(0x9400 + tag * 0x10 + index))
+        .collect();
+    let mask: Vec<Fp3> = (0..mask_code.ell)
+        .map(|index| Fp3::from_u64(0x9500 + tag * 0x10 + index))
+        .collect();
+    let mask_tail: Vec<Fp3> = (0..mask_code.r)
+        .map(|index| Fp3::from_u64(0x9600 + tag * 0x10 + index))
+        .collect();
+    (main, main_tail, mask, mask_tail)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proof::base_final_session::BaseRejection;
     use zkie_engine::pcs::request::params::REQUEST_CHAIN_LABEL;
 
     fn chain(seed: &[u8]) -> Chain {
@@ -1716,6 +1889,71 @@ mod tests {
             ),
             Err(Error::ShapeMismatch)
         ));
+    }
+
+    #[test]
+    fn the_base_final_wiring_passes_but_stays_pending() {
+        let fixture = BatFoldFixture::new(33).unwrap();
+        let run = run_bat_fold_with_base(&fixture, chain(b"base final")).unwrap();
+        assert!(run.base.base_linear);
+        assert!(run.base.symbol_checks);
+        assert!(run.base.openings_verified);
+        assert!(run.base.rejection.is_none());
+        assert!(run.base.pending);
+        assert!(!run.base.complete_base);
+        assert!(run.base.fresh_row_committed);
+        assert!(run.base.fresh_term_checked);
+        assert!(!run.base.fresh_term_authenticated_by_fold_root);
+        assert!(run.base.projection_only);
+        assert!(run.base.chain_handoff);
+        assert_eq!(run.base.entry_rounds, run.fold_exit_rounds);
+        assert_eq!(run.base.entry_value, run.fold_exit_value);
+        assert!(run.base.commit_rounds > run.base.entry_rounds);
+        assert!(run.base.rows_rounds > run.base.commit_rounds);
+        assert_eq!(run.base.base_positions.len(), FIXTURE_BASE_POSITIONS);
+        assert_eq!(run.base.fold_identity, fold_identity_of(&run.fold));
+        assert_eq!(run.fold.output.next_stage() , Err(Error::InvalidSessionState));
+    }
+
+    fn fold_identity_of(outcome: &BatFoldOutcome) -> Digest {
+        // Rebuild the same handoff identity from the outcome's FOLD output and
+        // fixture identity fields. This is an independent check of the
+        // identity absorbed by the BASE stage, not a second protocol source.
+        let anchor = FoldHandoffAnchor {
+            shape: outcome.shape,
+            group: FIXTURE_GROUP,
+            members: outcome
+                .layout
+                .members
+                .iter()
+                .map(|member| member.oracle)
+                .collect(),
+            fresh: outcome.start.id,
+            fresh_root: outcome.start.root,
+            tree_number: outcome.start.tree_number,
+            layout: outcome.layout.clone(),
+            fold_gamma: outcome.output.gamma.clone(),
+            fold_epsilon: outcome.output.eps,
+            fold_sum: outcome.output.sum,
+        };
+        let handoff = FoldHandoff::from_output(&outcome.output, &anchor).unwrap();
+        crate::proof::base_final_session::fold_identity(&handoff)
+    }
+
+    #[test]
+    fn a_fixed_base_target_shift_is_rejected_at_the_target_layer() {
+        let fixture = BatFoldFixture::new(34).unwrap();
+        let run = run_bat_fold_with_base_and_target_shift(
+            &fixture,
+            chain(b"base target shift"),
+            Fp3::ONE,
+        )
+        .unwrap();
+        assert!(!run.base.base_linear);
+        assert_eq!(run.base.rejection, Some(BaseRejection::TargetLinear));
+        assert!(run.base.pending);
+        assert!(!run.base.complete_base);
+        assert_eq!(run.base.base_positions.len(), FIXTURE_BASE_POSITIONS);
     }
 
     #[test]

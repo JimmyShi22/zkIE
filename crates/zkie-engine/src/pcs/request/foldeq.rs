@@ -1688,6 +1688,18 @@ impl FoldeqSession {
         self.fold_result.as_ref()
     }
 
+    /// Transfers chain ownership to the isolated fixture BASE stage after the
+    /// FOLD rounds finished. This entry is for one fixture continuation only:
+    /// it requires a stored FOLD output and consumes the session, so the FOLD
+    /// handle cannot advance independently. It is not a production acceptance
+    /// path; `fold_next_stage` remains fail-closed.
+    pub fn take_chain_for_base(self) -> Result<Chain> {
+        if self.stage != Stage::FoldFinished || self.fold_result.is_none() {
+            return Err(Error::InvalidSessionState);
+        }
+        Ok(self.chain)
+    }
+
     /// The next stage after FOLD is not connected. This method records the
     /// boundary explicitly and always fails closed rather than accepting the
     /// output as a complete proof.
