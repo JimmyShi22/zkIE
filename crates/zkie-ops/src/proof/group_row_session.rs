@@ -68,7 +68,9 @@ use zkie_engine::pcs::request::fold::{
     FoldStartMessage, MaskCoins,
 };
 use zkie_engine::pcs::request::runtime_tree::{MaskTree, MaskTreePlan};
-use zkie_engine::pcs::request::table::{commit_table, IndexShape};
+use zkie_engine::pcs::request::table::{
+    commit_table_streaming, IndexShape, VecTableSource,
+};
 use zkie_engine::primitives::codec::CanonicalWriter;
 
 use crate::proof::column_session::{
@@ -466,12 +468,14 @@ fn compare_source(
         .collect();
     compare_main_rows(&expected_main, &expected_tails, source)?;
     let salts = table_salts(shape)?;
-    let expected_table = commit_table(
+    let mut expected_source = VecTableSource::new(expected_messages, expected_tail_rows)?;
+    let expected_table = commit_table_streaming(
+        &mut expected_source,
         shape,
         plan.configuration,
-        &expected_messages,
-        &expected_tail_rows,
         &salts,
+        64,
+        u64::MAX,
     )?;
     if expected_table.reader.root != source.table_root {
         return Err(Error::StatementMismatch);
@@ -732,10 +736,20 @@ mod tests {
         let shape = demo_shape();
         let tails = vec![vec![Fp::ZERO; 1]; messages.len()];
         let salts = table_salts(shape).unwrap();
-        let table = commit_table(shape, Digest([0x61; 32]), &messages, &tails, &salts).unwrap();
+        let mut source = VecTableSource::new(messages.clone(), tails.clone()).unwrap();
+        let table = commit_table_streaming(
+            &mut source,
+            shape,
+            Digest([0x61; 32]),
+            &salts,
+            64,
+            u64::MAX,
+        )
+        .unwrap();
         crate::proof::column_session::AssetEncodingTable {
             reader: table.reader.clone(),
             table,
+            source: std::cell::RefCell::new(source),
             asset_root: Digest([0x62; 32]),
             shape,
             messages,
@@ -825,7 +839,16 @@ mod tests {
         messages[0][0] = Fp::from_u64(999);
         let salts = table_salts(shape).unwrap();
         let tails = source.table_tails.clone();
-        let changed = commit_table(shape, plan.configuration, &messages, &tails, &salts).unwrap();
+        let mut changed_source = VecTableSource::new(messages.clone(), tails.clone()).unwrap();
+        let changed = commit_table_streaming(
+            &mut changed_source,
+            shape,
+            plan.configuration,
+            &salts,
+            64,
+            u64::MAX,
+        )
+        .unwrap();
         assert_ne!(changed.reader.root, source.table_root);
         let expected: Vec<Fp3> = source
             .table_messages

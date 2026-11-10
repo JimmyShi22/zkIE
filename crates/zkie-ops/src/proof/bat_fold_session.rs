@@ -160,7 +160,7 @@ use zkie_engine::pcs::request::read::{unique_sorted, ReadLedger};
 use zkie_engine::pcs::request::relation::{sample_row, GuRelationKind, GuRelationRow};
 use zkie_engine::pcs::request::runtime_tree::{MaskTree, MaskTreePlan, RuntimeTreeOpening};
 use zkie_engine::pcs::request::table::{
-    commit_table, IndexReader, IndexShape, SampleSeed, TableDistances,
+    commit_table_streaming, IndexReader, IndexShape, SampleSeed, TableDistances, VecTableSource,
 };
 use zkie_engine::primitives::transcript::{hash_labeled, tag_word, TEST_COINS};
 
@@ -999,7 +999,9 @@ fn fixture_plan_scaffold() -> Result<(IndexReader, FoldeqBinding)> {
     let salts: Vec<Vec<u8>> = (0..columns)
         .map(|position| vec![(position as u8).wrapping_add(1); shape.salt_bytes])
         .collect();
-    let table = commit_table(shape, configuration, &messages, &tails, &salts)?;
+    let mut source = VecTableSource::new(messages, tails)?;
+    let table =
+        commit_table_streaming(&mut source, shape, configuration, &salts, 64, u64::MAX)?;
     let reader = table.reader;
     let statement = BindingStatement::new(
         parameters.version_word,

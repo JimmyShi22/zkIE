@@ -86,8 +86,11 @@ use zkie_engine::pcs::request::params::{RequestParams, LEAF_SALT_MIN_BYTES, REQU
 use zkie_engine::pcs::request::read::{unique_sorted, HidingState, ReadLedger};
 use zkie_engine::pcs::request::relation::{foldeq_weights, GuRelationKind, GuRelationRow};
 use zkie_engine::pcs::request::runtime_tree::{MaskTreePlan, RuntimeTreePart, RuntimeTreePlan};
+use std::cell::RefCell;
+
 use zkie_engine::pcs::request::table::{
-    commit_table, ColumnOpening, CommittedTable, IndexReader, IndexShape, SampleSeed,
+    commit_table_streaming, ColumnOpening, IndexReader, IndexShape, SampleSeed, StreamingTable,
+    VecTableSource,
     TableDistances,
 };
 
@@ -134,7 +137,8 @@ const MASK_TREE_CONFIGURATION: Digest = Digest([0x34; 32]);
 /// A self-contained table built from the authenticated asset slice, together
 /// with the messages and tails used to build it.
 pub struct AssetEncodingTable {
-    pub table: CommittedTable,
+    pub table: StreamingTable,
+    pub source: RefCell<VecTableSource>,
     pub reader: IndexReader,
     pub asset_root: Digest,
     pub shape: IndexShape,
@@ -385,10 +389,13 @@ pub fn build_authenticated_encoding_table_with_configuration(
         .map(|position| vec![(position as u8) ^ 0xA5; shape.salt_bytes])
         .collect();
 
-    let table = commit_table(shape, configuration, &messages, &tails, &salts)?;
+    let mut source = VecTableSource::new(messages.clone(), tails.clone())?;
+    let table =
+        commit_table_streaming(&mut source, shape, configuration, &salts, 64, u64::MAX)?;
     let reader = table.reader.clone();
     Ok(AssetEncodingTable {
         table,
+        source: RefCell::new(source),
         reader,
         asset_root: meta.root,
         shape,
@@ -410,8 +417,9 @@ pub fn open_columns_for_queries(
     }
     let positions = unique_sorted(queries);
     let mut state = HidingState::new(table.reader.root, 1, positions.len() as u64);
-    let charge = state.begin_charge(table.reader.root, 1, positions.len())?;
-    let unique = table.table.open_columns_charged(&charge, &positions)?;
+    let _charge = state.begin_charge(table.reader.root, 1, positions.len())?;
+    let mut source = table.source.borrow_mut();
+    let unique = table.table.open_columns(&mut *source, &positions)?;
     let mut openings = Vec::with_capacity(queries.len());
     for query in queries {
         let opening = unique
