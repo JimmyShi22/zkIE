@@ -1,0 +1,14 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/zkie_ops-a527cf57462e281a)
+
+running 7 tests
+test proof::gu_combine_session::tests::bat_chain_transfer_requires_a_completed_run ... ok
+test proof::gu_combine_session::tests::a_closed_group_rejects_replacement ... ok
+test proof::gu_combine_session::tests::a_wrong_declaration_is_still_pending ... ok
+test proof::gu_combine_session::tests::bat_combines_the_frozen_declarations ... ok
+test proof::gu_combine_session::tests::shape_mismatch_is_rejected_at_the_adapter ... ok
+test proof::gu_combine_session::tests::challenge_prefix_change_propagates_to_x_on_a_fixed_sample ... ok
+test proof::gu_combine_session::tests::declaration_values_change_the_combination_not_the_challenge ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 59 filtered out; finished in 0.00s
+

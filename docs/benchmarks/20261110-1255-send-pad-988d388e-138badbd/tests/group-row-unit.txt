@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/zkie_ops-a527cf57462e281a)
+
+running 6 tests
+test proof::group_row_session::tests::order_violation_is_rejected_at_the_transcript_layer ... ok
+test proof::group_row_session::tests::verifier_plan_shape_and_configuration_are_checked ... ok
+test proof::group_row_session::tests::source_components_and_fixed_randomness_are_separate ... ok
+test proof::group_row_session::tests::component_order_and_fold_output_are_consistent ... ok
+test proof::group_row_session::tests::independent_reconstruction_rejects_a_valid_recommitment_mismatch ... ok
+test proof::group_row_session::tests::input_parts_change_their_own_layer_and_tails_are_not_folded ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 60 filtered out; finished in 0.00s
+
