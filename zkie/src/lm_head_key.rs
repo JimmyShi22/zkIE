@@ -41,7 +41,8 @@ use zkie_engine::pcs::request::relation::{
     sample_row, GuRelationRow, GuWitness,
 };
 use zkie_engine::pcs::request::runtime_tree::{
-    MaskTree, MaskTreePlan, RuntimePartRows, RuntimeTree, RuntimeTreePart, RuntimeTreePlan,
+    MaskTree, MaskTreePlan, RuntimePartRows, RuntimeTree, RuntimeTreeOpening, RuntimeTreePart,
+    RuntimeTreePlan,
 };
 use zkie_engine::pcs::request::table::{
     commit_table, verify_columns, ColumnOpening, CommittedTable, IndexReader, IndexShape,
@@ -767,6 +768,7 @@ pub struct LmHeadGuProvider {
     folded: Vec<Fp3>,
     root: Digest,
     registry: GuRegistry,
+    tree: RuntimeTree,
 }
 
 impl LmHeadGuProvider {
@@ -786,6 +788,10 @@ impl LmHeadGuProvider {
     /// block sum of this vector under the low column point.
     pub fn folded(&self) -> &[Fp3] {
         &self.folded
+    }
+
+    pub fn open(&self, positions: &[u64]) -> Result<RuntimeTreeOpening> {
+        self.tree.open(positions)
     }
 
     /// The complete ordered sample answers for the verifier's seeds. The
@@ -925,6 +931,7 @@ pub fn fold_lm_head_gu(
         folded,
         root,
         registry,
+        tree,
     })
 }
 
@@ -943,6 +950,7 @@ pub struct LmHeadOmegaProvider {
     group: u64,
     u: GuOracleShape,
     tree: RuntimeTreePlan,
+    committed: RuntimeTree,
     message: Vec<Fp3>,
     root: Digest,
 }
@@ -966,6 +974,10 @@ impl LmHeadOmegaProvider {
 
     pub fn message(&self) -> &[Fp3] {
         &self.message
+    }
+
+    pub fn open(&self, positions: &[u64]) -> Result<RuntimeTreeOpening> {
+        self.committed.open(positions)
     }
 
     /// The complete ordered sample answers for the verifier's seeds. It uses
@@ -1093,13 +1105,15 @@ pub fn commit_lm_head_omega(
         }],
         &randomness.salts,
     )?;
+    let root = *committed.root();
     Ok(LmHeadOmegaProvider {
         oracle,
         group,
         u: *u,
         tree: tree.clone(),
+        committed,
         message,
-        root: *committed.root(),
+        root,
     })
 }
 
@@ -1479,6 +1493,14 @@ impl LmHeadMaskProvider {
     pub fn coins_seed(&self) -> Digest {
         self.coins_seed
     }
+
+    pub fn tree(&self) -> &MaskTree {
+        &self.start.tree
+    }
+
+    pub fn open(&self, positions: &[u64]) -> Result<RuntimeTreeOpening> {
+        self.start.tree.open(positions)
+    }
 }
 
 /// Builds the fresh mask from the existing mask maker: draws the coefficients
@@ -1539,6 +1561,7 @@ pub struct LmHeadOldMaskRandomness {
 pub struct LmHeadOldMaskProvider {
     root: Digest,
     rows: Vec<Vec<Fp3>>,
+    tree: MaskTree,
 }
 
 impl LmHeadOldMaskProvider {
@@ -1554,6 +1577,10 @@ impl LmHeadOldMaskProvider {
             values.extend_from_slice(row);
         }
         Ok(values)
+    }
+
+    pub fn open(&self, positions: &[u64]) -> Result<RuntimeTreeOpening> {
+        self.tree.open(positions)
     }
 }
 
@@ -1578,6 +1605,7 @@ pub fn commit_lm_head_old_mask(
     Ok(LmHeadOldMaskProvider {
         root: committed.root,
         rows: randomness.rows.clone(),
+        tree: committed,
     })
 }
 
@@ -2649,6 +2677,7 @@ mod tests {
         let provider =
             fold_lm_head_gu(&key, &tails, &shape, &gamma, &randomness).expect("fold");
         assert_ne!(provider.root(), Digest::ZERO);
+        assert!(provider.open(&[0]).is_ok());
         let seeds = vec![SampleSeed {
             z: vec![Fp3::from_u64(5); 4],
             beta: Fp3::from_u64(7),
@@ -2992,6 +3021,7 @@ mod tests {
         )
         .expect("omega commit");
         assert_ne!(omega.root(), Digest::ZERO);
+        assert!(omega.open(&[0]).is_ok());
         let seeds = vec![SampleSeed {
             z: vec![Fp3::from_u64(3); 3],
             beta: Fp3::from_u64(7),
@@ -3157,6 +3187,7 @@ mod tests {
         )
         .expect("mask");
         assert_ne!(first.root(), Digest::ZERO);
+        assert!(first.open(&[0]).is_ok());
         assert_eq!(first.coefficients().len(), 7);
         assert_eq!(first.message().id, 3);
         let second = make_lm_head_mask(
@@ -3211,6 +3242,7 @@ mod tests {
         )
         .expect("old mask");
         assert_ne!(provider.root(), Digest::ZERO);
+        assert!(provider.open(&[0]).is_ok());
         assert_eq!(provider.mu().expect("mu"), rows.concat());
     }
 
