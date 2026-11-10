@@ -37,7 +37,7 @@ use zkie_engine::pcs::request::relation::{
     sample_row, GuWitness,
 };
 use zkie_engine::pcs::request::runtime_tree::{
-    MaskTreePlan, RuntimePartRows, RuntimeTree, RuntimeTreePart, RuntimeTreePlan,
+    MaskTree, MaskTreePlan, RuntimePartRows, RuntimeTree, RuntimeTreePart, RuntimeTreePlan,
 };
 use zkie_engine::pcs::request::table::{
     commit_table, verify_columns, ColumnOpening, CommittedTable, IndexReader, IndexShape,
@@ -1370,6 +1370,61 @@ pub fn make_lm_head_mask(
     Ok(LmHeadMaskProvider {
         start,
         mask_coefficients,
+    })
+}
+
+/// The private values of the group's old mask message: its message rows, the
+/// encoding tails and one salt per mask-tree column. This message is sent with
+/// G_u; it is not the FOLD fresh mask.
+pub struct LmHeadOldMaskRandomness {
+    pub rows: Vec<Vec<Fp3>>,
+    pub tails: Vec<Vec<Fp3>>,
+    pub salts: Vec<Vec<u8>>,
+}
+
+/// The committed old mask message of the shared group.
+pub struct LmHeadOldMaskProvider {
+    root: Digest,
+    rows: Vec<Vec<Fp3>>,
+}
+
+impl LmHeadOldMaskProvider {
+    pub fn root(&self) -> Digest {
+        self.root
+    }
+
+    /// The mask message rows in the group layout, row-major. They are the
+    /// `mu` half of the original group declaration.
+    pub fn mu(&self) -> Result<Vec<Fp3>> {
+        let mut values = Vec::new();
+        for row in &self.rows {
+            values.extend_from_slice(row);
+        }
+        Ok(values)
+    }
+}
+
+/// Commits the group's old mask message under the plan's mask tree. The root
+/// is the oracle root sent with G_u; the FOLD fresh mask is a separate
+/// message with its own root.
+pub fn commit_lm_head_old_mask(
+    fold: &FoldShape,
+    tree: MaskTreePlan,
+    randomness: &LmHeadOldMaskRandomness,
+) -> Result<LmHeadOldMaskProvider> {
+    if tree.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let committed = MaskTree::commit(
+        tree,
+        fold,
+        &randomness.rows,
+        &randomness.tails,
+        &randomness.salts,
+    )?;
+    Ok(LmHeadOldMaskProvider {
+        root: committed.root,
+        rows: randomness.rows.clone(),
     })
 }
 
@@ -2728,6 +2783,46 @@ mod tests {
         .expect("second mask");
         assert_eq!(first.root(), second.root());
         assert_eq!(first.coefficients(), second.coefficients());
+    }
+
+
+    #[test]
+    fn the_old_mask_commits_its_message_rows_separately_from_the_fresh_mask() {
+        use zkie_engine::pcs::request::code::build_code_plan;
+        let mask_code = build_code_plan(3, 7, 1).expect("mask code");
+        let fold = FoldShape {
+            code: build_code_plan(3, 4, 1).expect("main code"),
+            mask_code,
+            k: 3,
+            h: 0,
+            mask_leaf_class: 0,
+        };
+        let tree = MaskTreePlan {
+            tree_number: 0,
+            leaf_class: 0,
+            log_n: mask_code.log_n,
+            mask_rows: 1,
+            salt_bytes: 40,
+            run: Digest([0x51; 32]),
+            configuration: Digest([0x52; 32]),
+        };
+        let rows = vec![vec![Fp3::from_u64(0x60); 7]];
+        let tails = vec![vec![Fp3::from_u64(0x61)]];
+        let salts: Vec<Vec<u8>> = (0..8)
+            .map(|position| vec![(position as u8) ^ 0x55; 40])
+            .collect();
+        let provider = commit_lm_head_old_mask(
+            &fold,
+            tree,
+            &LmHeadOldMaskRandomness {
+                rows: rows.clone(),
+                tails,
+                salts,
+            },
+        )
+        .expect("old mask");
+        assert_ne!(provider.root(), Digest::ZERO);
+        assert_eq!(provider.mu().expect("mu"), rows.concat());
     }
 
 }
