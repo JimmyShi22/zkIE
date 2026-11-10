@@ -1,39 +1,49 @@
-//! Isolated fixture code-switch continuation from the FOLD output into BASE.
+//! Isolated fixture code-switch continuation from the FOLD output into BASE,
+//! with fixture SEND sample registration and fresh-column correspondence.
 //!
 //! The session starts on the same chain and from the same FOLD declaration,
 //! layout, original member identities and transcript challenges that produced
 //! the FOLD output; it does not create a second plan or rebuild unrelated rows.
-//! The old rows are authenticated at the code-switch positions by opening the
+//! The old rows are authenticated at the switch positions by opening the
 //! original member commitments and the FOLD fresh mask tree and folding the
 //! opened columns exactly as the BASE fold relation does. That relation remains
-//! sampled at the drawn positions (`sampled_fold_relation_only`); the original
-//! commitments are not described as completely bound.
+//! sampled at the drawn positions; the original commitments are not described
+//! as completely bound.
 //!
-//! The prover sends the two new code-switch oracles (the switched main and mask
-//! rows) as commitments before the SEND seed. The verifier derives the new
-//! group declaration from its own authenticated old symbols and the transcript
-//! theta: `register_switch` registers the original claim and one coefficient
-//! claim per authenticated position and combines them into a group row. The
-//! registration is pending; the code-switch stage does not prove the new group
-//! declaration true on the spot, and no proximity test runs here. The final
-//! single-row view is derived from that combined group row and the switch
-//! layout, never from the old FOLD objects relabelled as the switch output.
-//! BASE then opens the new code-switch commitments at its own positions; the
-//! old FOLD row commitments are not substituted for them.
+//! The prover commits one new oracle carrying the switched main row and the
+//! switched mask row in one runtime tree; its root and shape are fixed before
+//! the seed. The switched mask row carries the old mask row, its tail, the
+//! FOLD fresh mask row and the FOLD fresh tail, followed by the sample pad. A
+//! fixture SEND phase draws a real sample seed (the cube's z values and a
+//! nonzero beta), receives one answer, and registers the sample claim on the
+//! same oracle shape and commitment. Unsupported answer counts and shapes fail
+//! closed. This is not a production SEND receipt and not the reference
+//! standard SEND-to-code-switch wiring; the sample claim is pending.
 //!
-//! Ordering: the two new roots are fixed, then the SEND seed is drawn, then the
-//! answer is received, then one challenge round draws the old positions and
-//! theta, then the old openings are authenticated and the new group is
-//! registered and combined. BASE commitments/target* come before lambda, its
-//! rows before its position draw, and its openings after. No new message is
-//! inserted into an already frozen challenge window. The old-row fold relation
-//! is checked only at the drawn positions; it is sampled, not complete.
+//! In the same challenge round that draws the old positions and theta, the
+//! verifier registers pending claims and combines them by powers of theta into
+//! one group row: the original claim and one coefficient claim per
+//! authenticated old position; one correspondence claim per drawn fresh
+//! column, mapping the authenticated FOLD fresh column to the switched mask
+//! row's fresh block and tail; and the SEND sample claim. The fresh
+//! correspondence is derived from the verified fresh openings, never from the
+//! prover's plaintext fresh row. The registration does not prove any claim true
+//! on the spot and no proximity test runs here.
 //!
-//! This is a conditional local experiment. It is not the reference proof, not
-//! a complete proximity test, not a zero-knowledge result, not a production
-//! pass and not an equivalence proof. The fixture is public, the fresh rows are
-//! plaintext and the star row is fixed; there is no hiding. Unsupported switch
-//! shapes and code lengths fail closed.
+//! BASE opens the new switch commitment at its own positions, derives the old
+//! symbols from those openings, and checks the linear and symbol relations on
+//! the combined claims. The old FOLD row commitments are not substituted for
+//! the switch output. The result stays pending; the switch claims, the fresh
+//! correspondence and the sample claim are pending.
+//!
+//! Ordering: the new root is fixed, then the seed, then the answer, then one
+//! challenge round draws the old positions and theta, then the old openings are
+//! authenticated and the claims registered and combined. BASE commitments and
+//! target* come before lambda, its rows before its position draw, and its
+//! openings after. No new message is inserted into an already frozen challenge
+//! window. This is a conditional local experiment, not a proof, not complete
+//! proximity, not zero knowledge and not a production pass; the fixture is
+//! public, the fresh rows are plaintext and the star row is fixed.
 
 use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
 use zkie_core::error::{Error, Result};
@@ -41,12 +51,23 @@ use zkie_core::types::Digest;
 use zkie_engine::pcs::request::base_stage::{self, BaseRows};
 use zkie_engine::pcs::request::chain::{Chain, KIND_ALGEBRAIC};
 use zkie_engine::pcs::request::code::{build_code_plan, encode_row_fp3, CodeParams};
-use zkie_engine::pcs::request::cs_stage::{self, AuthenticatedSymbols, SwitchedClaims, SwitchedMessage};
-use zkie_engine::pcs::request::field::{Fp, Fp3};
+use zkie_engine::pcs::request::cs_stage::{
+    self, AuthenticatedSymbols, SwitchClaim, SwitchedClaims,
+};
+use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE};
 use zkie_engine::pcs::request::fold::{validate_fold_mask_shape, FoldShape};
+use zkie_engine::pcs::request::gu::{GuNotice, GuOracleShape, GuRegistry, GuShape};
+use zkie_engine::pcs::request::params::LEAF_SALT_MIN_BYTES;
 use zkie_engine::pcs::request::proximity::{ProximityStatement, SingleRows};
 use zkie_engine::pcs::request::read::{draw_positions, unique_sorted};
-use zkie_engine::pcs::request::runtime_tree::RuntimeTreeOpening;
+use zkie_engine::pcs::request::relation::{
+    gu_layout_fault, sample_cube, sample_row, validate_shared_sample_seeds, GuWitness,
+};
+use zkie_engine::pcs::request::runtime_tree::{
+    verify_runtime_opening, RuntimePartRows, RuntimeTree, RuntimeTreeOpening, RuntimeTreePart,
+    RuntimeTreePlan,
+};
+use zkie_engine::pcs::request::table::{IndexShape, SampleSeed, TableDistances};
 
 use crate::proof::base_final_session::{
     fold_fresh_columns, fold_identity, fold_original_columns, BaseOpening, FoldBasis,
@@ -56,7 +77,6 @@ use crate::proof::binding::{
 };
 use crate::proof::fold_handoff::FoldHandoff;
 
-/// One new code-switch oracle commitment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CsCommitment {
     pub root: Digest,
@@ -64,17 +84,12 @@ pub struct CsCommitment {
     pub count: u64,
 }
 
-/// The code-switch declaration fixed before the SEND seed: the FOLD identity
-/// and the two new oracle commitments. There is no target field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CsDeclarations {
     pub fold_identity: Digest,
-    pub switched_main: CsCommitment,
-    pub switched_mask: CsCommitment,
+    pub switched: CsCommitment,
 }
 
-/// The BASE commitment message for the code-switch output: the two star row
-/// commitments and target*.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CsBaseMessages {
     pub star: CsCommitment,
@@ -82,23 +97,26 @@ pub struct CsBaseMessages {
     pub target_star: Fp3,
 }
 
-/// The BASE openings: star rows and the new code-switch rows, in drawn order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CsBaseOpenings {
     pub star: Vec<BaseOpening>,
     pub star_mask: Vec<BaseOpening>,
-    pub switched_main: Vec<BaseOpening>,
-    pub switched_mask: Vec<BaseOpening>,
+    pub switched: RuntimeTreeOpening,
 }
 
-/// The local code-switch continuation result. It stays pending.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CsOutcome {
     pub fold_identity: Digest,
-    pub switched_main_root: Digest,
-    pub switched_mask_root: Digest,
+    pub switched_root: Digest,
     pub star_root: Digest,
     pub star_mask_root: Digest,
+    pub sample_answer: Fp3,
+    pub sample_beta_nonzero: bool,
+    pub sample_claim_registered: bool,
+    pub sample_claim_pending: bool,
+    pub send_standard_wiring: bool,
+    pub fresh_correspondence_registered: bool,
+    pub fresh_correspondence_sampled: bool,
     pub theta: Fp3,
     pub lambda: Fp3,
     pub target_star: Fp3,
@@ -109,7 +127,6 @@ pub struct CsOutcome {
     pub new_group_registered: bool,
     pub cs_claims_pending: bool,
     pub cs_proves_new_group: bool,
-    pub fold_relation_sampled_at_cs_positions: bool,
     pub sampled_fold_relation_only: bool,
     pub complete_fold_binding: bool,
     pub base_linear: bool,
@@ -196,6 +213,13 @@ fn fp3_from_words(values: &[u64]) -> Result<Fp3> {
     ))
 }
 
+fn fp3_from_symbols(symbols: &[Fp], offset: usize) -> Result<Fp3> {
+    let values = symbols
+        .get(offset..offset.checked_add(3).ok_or(Error::ResourceLimit)?)
+        .ok_or(Error::ShapeMismatch)?;
+    Ok(Fp3::new(values[0], values[1], values[2]))
+}
+
 fn push_digest(words: &mut Vec<u64>, digest: &Digest) {
     for chunk in digest.0.chunks_exact(8) {
         words.push(u64::from_le_bytes(chunk.try_into().unwrap()));
@@ -234,15 +258,130 @@ fn commit_row(code: CodeParams, message: &[Fp3], tail: &[Fp3]) -> Result<ProverC
     })
 }
 
-/// Places the FOLD fresh coefficients in the combined mask claim at the
-/// position where the switched mask message carries the FOLD fresh row. The
-/// original claim's target already includes the fresh term, so the target is
-/// not changed; the basis changes so the inner product covers that term.
+fn fixture_index_shape() -> Result<IndexShape> {
+    Ok(IndexShape {
+        code: build_code_plan(3, 4, 1)?,
+        v: 2,
+        answers: 1,
+        salt_bytes: LEAF_SALT_MIN_BYTES,
+        distances: TableDistances {
+            radius: 0,
+            later_radius: 0,
+            m_once: 0,
+            m_later: 0,
+        },
+    })
+}
+
+pub(crate) fn switch_tree_plan(
+    tag: u64,
+    main_code: CodeParams,
+    mask_code: CodeParams,
+) -> Result<RuntimeTreePlan> {
+    let plan = RuntimeTreePlan {
+        tree_number: 0x200u64.wrapping_add(tag & 0x3ff),
+        leaf_class: 6,
+        log_n: main_code.log_n,
+        log_n_zk: mask_code.log_n,
+        parts: vec![RuntimeTreePart {
+            main_symbols: E_DEGREE as u64,
+            mask_symbols: E_DEGREE as u64,
+        }],
+        salt_bytes: LEAF_SALT_MIN_BYTES,
+        run: Digest([0xc1; 32]),
+        configuration: Digest([0xc2; 32]),
+    };
+    if plan.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(plan)
+}
+
+fn switch_shape(
+    plan: &RuntimeTreePlan,
+    main_code: CodeParams,
+    mask_code: CodeParams,
+) -> Result<GuShape> {
+    let shape = GuShape {
+        oracle: 0,
+        group: 0,
+        tree: plan.clone(),
+        part: 0,
+        rows_high: false,
+        u: GuOracleShape {
+            code: main_code,
+            main_rows: 1,
+            main_deg: E_DEGREE as u32,
+            mask_rows: 1,
+            mask_code: Some(mask_code),
+            answers: 1,
+        },
+        index: fixture_index_shape()?,
+    };
+    if shape.fault().is_some() || gu_layout_fault(&shape).is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(shape)
+}
+
+fn symbol_coefficients(
+    code: CodeParams,
+    position: u64,
+    len: usize,
+) -> Result<(Vec<Fp3>, Vec<Fp3>)> {
+    let zeros = vec![Fp3::ZERO; code.r as usize];
+    let mut message = vec![Fp3::ZERO; len];
+    let mut message_out = vec![Fp3::ZERO; len];
+    for index in 0..len {
+        message[index] = Fp3::ONE;
+        let encoded = encode_row_fp3(&code, &message, &zeros)?;
+        message_out[index] = *encoded.get(position as usize).ok_or(Error::InvalidIndex)?;
+        message[index] = Fp3::ZERO;
+    }
+    let empty = vec![Fp3::ZERO; len];
+    let mut tail = vec![Fp3::ZERO; code.r as usize];
+    let mut tail_out = vec![Fp3::ZERO; code.r as usize];
+    for index in 0..code.r as usize {
+        tail[index] = Fp3::ONE;
+        let encoded = encode_row_fp3(&code, &empty, &tail)?;
+        tail_out[index] = *encoded.get(position as usize).ok_or(Error::InvalidIndex)?;
+        tail[index] = Fp3::ZERO;
+    }
+    Ok((message_out, tail_out))
+}
+
+fn add_scaled(target: &mut [Fp3], source: &[Fp3], scale: Fp3) -> Result<()> {
+    if target.len() != source.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    for (target, source) in target.iter_mut().zip(source) {
+        *target = target.add(&scale.mul(source));
+    }
+    Ok(())
+}
+
+fn append_claim(claims: &mut SwitchedClaims, claim: SwitchClaim, theta: Fp3) -> Result<()> {
+    if claim.main.len() != claims.combined.main.len()
+        || claim.mask.len() != claims.combined.mask.len()
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut power = Fp3::ONE;
+    for _ in 0..claims.claims.len() {
+        power = power.mul(&theta);
+    }
+    add_scaled(&mut claims.combined.main, &claim.main, power)?;
+    add_scaled(&mut claims.combined.mask, &claim.mask, power)?;
+    claims.combined.target = claims.combined.target.add(&power.mul(&claim.target));
+    claims.claims.push(claim);
+    Ok(())
+}
+
 fn extend_combined_with_fresh(
     claims: &mut SwitchedClaims,
     handoff: &FoldHandoff,
     switch_mask_code: CodeParams,
-) -> Result<()> {
+) -> Result<usize> {
     let offset = usize::try_from(
         handoff
             .mask_code
@@ -258,7 +397,7 @@ fn extend_combined_with_fresh(
         return Err(Error::UnsupportedPrimitive);
     }
     claims.combined.mask[offset..end].copy_from_slice(&handoff.fresh_claim);
-    Ok(())
+    Ok(offset)
 }
 
 fn switch_statement(handoff: &FoldHandoff) -> Result<ProximityStatement> {
@@ -277,16 +416,22 @@ fn switch_statement(handoff: &FoldHandoff) -> Result<ProximityStatement> {
     Ok(statement)
 }
 
-/// The prover side of the isolated code-switch continuation.
 pub struct CsProver {
+    shape: GuShape,
+    plan: RuntimeTreePlan,
     statement: ProximityStatement,
     handoff: FoldHandoff,
     switch_code: CodeParams,
     switch_mask_code: CodeParams,
-    switched: SwitchedMessage,
     old_rows: SingleRows,
-    switched_main: ProverCommitment,
-    switched_mask: ProverCommitment,
+    main_message: Vec<Fp3>,
+    mask_message: Vec<Fp3>,
+    main_tail: Vec<Fp3>,
+    mask_tail: Vec<Fp3>,
+    fresh_row: Vec<Fp3>,
+    fresh_tail: Vec<Fp3>,
+    tree: RuntimeTree,
+    gu: GuRegistry,
     star_main: Vec<Fp3>,
     star_tail: Vec<Fp3>,
     star_mask: Vec<Fp3>,
@@ -296,25 +441,55 @@ pub struct CsProver {
 }
 
 impl CsProver {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         rows: &SingleRows,
         handoff: &FoldHandoff,
         switch_code: CodeParams,
         switch_mask_code: CodeParams,
         fresh_row: Vec<Fp3>,
+        fresh_tail: Vec<Fp3>,
+        tag: u64,
+        star_main: Vec<Fp3>,
+        star_tail: Vec<Fp3>,
+        star_mask: Vec<Fp3>,
+        star_mask_tail: Vec<Fp3>,
+    ) -> Result<Self> {
+        Self::new_with_fresh_tamper(
+            rows,
+            handoff,
+            switch_code,
+            switch_mask_code,
+            fresh_row,
+            fresh_tail,
+            tag,
+            Fp3::ZERO,
+            star_main,
+            star_tail,
+            star_mask,
+            star_mask_tail,
+        )
+    }
+
+    /// The committed fresh block may carry a fixed shift while the
+    /// correspondence targets still use the true fresh row. This is the
+    /// "replace the new group fresh row" negative hook.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_fresh_tamper(
+        rows: &SingleRows,
+        handoff: &FoldHandoff,
+        switch_code: CodeParams,
+        switch_mask_code: CodeParams,
+        fresh_row: Vec<Fp3>,
+        fresh_tail: Vec<Fp3>,
+        tag: u64,
+        committed_fresh_shift: Fp3,
         star_main: Vec<Fp3>,
         star_tail: Vec<Fp3>,
         star_mask: Vec<Fp3>,
         star_mask_tail: Vec<Fp3>,
     ) -> Result<Self> {
         rows.base_ready()?;
-        if star_main.len() as u64 != switch_code.ell
-            || star_tail.len() as u64 != switch_code.r
-            || star_mask.len() as u64 != switch_mask_code.ell
-            || star_mask_tail.len() as u64 != switch_mask_code.r
-        {
-            return Err(Error::ShapeMismatch);
-        }
         let statement = switch_statement(handoff)?;
         let mut switched = cs_stage::switched_message(rows, switch_code, switch_mask_code)?;
         let fresh_offset = usize::try_from(
@@ -326,27 +501,81 @@ impl CsProver {
         )
         .map_err(|_| Error::ResourceLimit)?;
         let fresh_end = fresh_offset
-            .checked_add(fresh_row.len())
+            .checked_add(fresh_row.len() + fresh_tail.len())
             .ok_or(Error::ResourceLimit)?;
         if fresh_row.len() as u64 != handoff.mask_code.ell
-            || fresh_end > switched.mask.len()
+            || fresh_tail.len() as u64 != handoff.mask_code.r
+            || fresh_end >= switched.mask.len()
         {
             return Err(Error::UnsupportedPrimitive);
         }
-        switched.mask[fresh_offset..fresh_end].copy_from_slice(&fresh_row);
-        let switched_main = commit_row(switch_code, &switched.main, &switched.main_tail)?;
-        let switched_mask = commit_row(switch_mask_code, &switched.mask, &switched.mask_tail)?;
+        for (index, value) in fresh_row.iter().enumerate() {
+            switched.mask[fresh_offset + index] = value.add(&committed_fresh_shift);
+        }
+        for (index, value) in fresh_tail.iter().enumerate() {
+            switched.mask[fresh_offset + fresh_row.len() + index] = *value;
+        }
+        // One public deterministic pad per answer, reserved before the seed.
+        let last = switched
+            .mask
+            .len()
+            .checked_sub(1)
+            .ok_or(Error::ResourceLimit)?;
+        switched.mask[last] = Fp3::from_u64(0xd000u64.wrapping_add(tag.wrapping_mul(0x10)));
+        let plan = switch_tree_plan(tag, switch_code, switch_mask_code)?;
+        let shape = switch_shape(&plan, switch_code, switch_mask_code)?;
+        let main_codeword = encode_row_fp3(&switch_code, &switched.main, &switched.main_tail)?;
+        let mask_codeword = encode_row_fp3(&switch_mask_code, &switched.mask, &switched.mask_tail)?;
+        let salts: Vec<Vec<u8>> = (0..plan.columns())
+            .map(|position| {
+                let byte = ((position as u8).wrapping_mul(0x1b)) ^ (tag as u8) ^ 0x5d;
+                vec![byte; plan.salt_bytes]
+            })
+            .collect();
+        let tree = RuntimeTree::commit(
+            plan.clone(),
+            &[RuntimePartRows {
+                main: vec![main_codeword],
+                mask: vec![mask_codeword],
+                main_deg: E_DEGREE as u32,
+            }],
+            &salts,
+        )?;
+        let mut gu = GuRegistry::new();
+        gu.receive(
+            &shape,
+            &GuNotice {
+                root: *tree.root(),
+                oracle: shape.oracle,
+                tree_number: plan.tree_number,
+                part: 0,
+            },
+        )?;
+        if star_main.len() as u64 != switch_code.ell
+            || star_tail.len() as u64 != switch_code.r
+            || star_mask.len() as u64 != switch_mask_code.ell
+            || star_mask_tail.len() as u64 != switch_mask_code.r
+        {
+            return Err(Error::ShapeMismatch);
+        }
         let star = commit_row(switch_code, &star_main, &star_tail)?;
         let star_mask_row = commit_row(switch_mask_code, &star_mask, &star_mask_tail)?;
         Ok(Self {
+            shape,
+            plan,
             statement,
             handoff: handoff.clone(),
             switch_code,
             switch_mask_code,
-            switched,
             old_rows: rows.clone(),
-            switched_main,
-            switched_mask,
+            main_message: switched.main,
+            mask_message: switched.mask,
+            main_tail: switched.main_tail,
+            mask_tail: switched.mask_tail,
+            fresh_row,
+            fresh_tail,
+            tree,
+            gu,
             star_main,
             star_tail,
             star_mask,
@@ -356,75 +585,43 @@ impl CsProver {
         })
     }
 
+    pub fn plan(&self) -> RuntimeTreePlan {
+        self.plan.clone()
+    }
+
     pub fn declarations(&self, fold_identity: Digest) -> Result<CsDeclarations> {
         Ok(CsDeclarations {
             fold_identity,
-            switched_main: self.switched_main.public()?,
-            switched_mask: self.switched_mask.public()?,
+            switched: CsCommitment {
+                root: *self.tree.root(),
+                start: self.plan.run,
+                count: self.plan.columns(),
+            },
         })
     }
 
-    pub fn answer(&self, seed: Fp3) -> Result<Fp3> {
-        zkie_engine::pcs::request::code::evaluate_ood_fp3(
-            &self.switch_code,
-            &self.switched.main,
-            &self.switched.main_tail,
-            seed,
-        )
+    pub fn sample_answer(&self, seeds: &[SampleSeed]) -> Result<Fp3> {
+        let witness = GuWitness {
+            main: self.main_message.clone(),
+            mask: self.mask_message.clone(),
+        };
+        sample_row(&self.shape, &self.gu, seeds, 0, Fp3::ZERO)?.evaluate(&witness)
     }
 
     fn rows(&self, claims: &SwitchedClaims) -> Result<SingleRows> {
         let rows = SingleRows {
             code: self.switch_code,
             mask_code: self.switch_mask_code,
-            main: self.switched.main.clone(),
-            main_tail: self.switched.main_tail.clone(),
-            masks: vec![self.switched.mask.clone()],
-            mask_tails: vec![self.switched.mask_tail.clone()],
+            main: self.main_message.clone(),
+            main_tail: self.main_tail.clone(),
+            masks: vec![self.mask_message.clone()],
+            mask_tails: vec![self.mask_tail.clone()],
             claim: claims.combined.main.clone(),
             mask_claims: vec![claims.combined.mask.clone()],
             target: claims.combined.target,
         };
         rows.base_ready()?;
         Ok(rows)
-    }
-
-    /// The prover-side registration from the plaintext old rows. The harness
-    /// compares it with the verifier's registration; it is not a verifier
-    /// source.
-    pub fn claims(&self, positions: &[u64], theta: Fp3) -> Result<SwitchedClaims> {
-        let main = encode_row_fp3(
-            &self.old_rows.code,
-            &self.old_rows.main,
-            &self.old_rows.main_tail,
-        )?;
-        let mask = encode_row_fp3(
-            &self.old_rows.mask_code,
-            &self.old_rows.masks[0],
-            &self.old_rows.mask_tails[0],
-        )?;
-        let mut authenticated = Vec::with_capacity(positions.len());
-        for position in positions {
-            let mask_position = *position % self.old_rows.mask_code.n();
-            authenticated.push(AuthenticatedSymbols {
-                position: *position,
-                main: *main
-                    .get(*position as usize)
-                    .ok_or(Error::InvalidIndex)?,
-                mask: *mask
-                    .get(mask_position as usize)
-                    .ok_or(Error::InvalidIndex)?,
-            });
-        }
-        let mut claims = cs_stage::register_switch(
-            &self.statement,
-            self.switch_code,
-            self.switch_mask_code,
-            &authenticated,
-            theta,
-        )?;
-        extend_combined_with_fresh(&mut claims, &self.handoff, self.switch_mask_code)?;
-        Ok(claims)
     }
 
     pub fn base_messages(&self, claims: &SwitchedClaims) -> Result<CsBaseMessages> {
@@ -456,22 +653,17 @@ impl CsProver {
         )
     }
 
-    pub fn switched_openings(&self, positions: &[u64]) -> Result<(Vec<BaseOpening>, Vec<BaseOpening>)> {
-        let mask_n = self.switched_mask.registry
-            .get(self.switched_mask.oracle)
-            .ok_or(Error::ProverStateMissing)?
-            .count;
-        let mut main = Vec::with_capacity(positions.len());
-        let mut mask = Vec::with_capacity(positions.len());
-        for position in positions {
-            main.push(self.switched_main.open(*position)?);
-            mask.push(self.switched_mask.open(*position % mask_n)?);
-        }
-        Ok((main, mask))
+    pub fn openings(&self, positions: &[u64]) -> Result<RuntimeTreeOpening> {
+        self.tree.open(positions)
     }
 
-    pub fn star_openings(&self, positions: &[u64]) -> Result<(Vec<BaseOpening>, Vec<BaseOpening>)> {
-        let mask_n = self.star_mask_row.registry
+    pub fn star_openings(
+        &self,
+        positions: &[u64],
+    ) -> Result<(Vec<BaseOpening>, Vec<BaseOpening>)> {
+        let mask_n = self
+            .star_mask_row
+            .registry
             .get(self.star_mask_row.oracle)
             .ok_or(Error::ProverStateMissing)?
             .count;
@@ -483,30 +675,112 @@ impl CsProver {
         }
         Ok((star, star_mask))
     }
+
+    /// The prover-side registration over the plaintext old rows. The harness
+    /// compares it with the verifier's registration; it is not a verifier
+    /// source. The fresh correspondence targets use the true fresh row and
+    /// tail; only the committed block may carry the tamper hook.
+    pub fn claims(
+        &self,
+        positions: &[u64],
+        theta: Fp3,
+        seeds: &[SampleSeed],
+    ) -> Result<SwitchedClaims> {
+        let main_rows = encode_row_fp3(
+            &self.old_rows.code,
+            &self.old_rows.main,
+            &self.old_rows.main_tail,
+        )?;
+        let mask_rows = encode_row_fp3(
+            &self.old_rows.mask_code,
+            &self.old_rows.masks[0],
+            &self.old_rows.mask_tails[0],
+        )?;
+        let mut authenticated = Vec::with_capacity(positions.len());
+        for position in positions {
+            let mask_position = *position % self.old_rows.mask_code.n();
+            authenticated.push(AuthenticatedSymbols {
+                position: *position,
+                main: *main_rows
+                    .get(*position as usize)
+                    .ok_or(Error::InvalidIndex)?,
+                mask: *mask_rows
+                    .get(mask_position as usize)
+                    .ok_or(Error::InvalidIndex)?,
+            });
+        }
+        let mut claims = cs_stage::register_switch(
+            &self.statement,
+            self.switch_code,
+            self.switch_mask_code,
+            &authenticated,
+            theta,
+        )?;
+        let fresh_offset =
+            extend_combined_with_fresh(&mut claims, &self.handoff, self.switch_mask_code)?;
+        let fresh_column = encode_row_fp3(
+            &self.statement.mask_code,
+            &self.fresh_row,
+            &self.fresh_tail,
+        )?;
+        for position in positions {
+            let mask_position = *position % self.statement.mask_code.n();
+            let (message, tail) = symbol_coefficients(
+                self.statement.mask_code,
+                mask_position,
+                self.handoff.mask_code.ell as usize,
+            )?;
+            let mut mask = vec![
+                Fp3::ZERO;
+                usize::try_from(self.switch_mask_code.ell).map_err(|_| Error::ResourceLimit)?
+            ];
+            mask[fresh_offset..fresh_offset + message.len()].copy_from_slice(&message);
+            mask[fresh_offset + message.len()..fresh_offset + message.len() + tail.len()]
+                .copy_from_slice(&tail);
+            let target = *fresh_column
+                .get(mask_position as usize)
+                .ok_or(Error::InvalidIndex)?;
+            let zero_main = vec![Fp3::ZERO; claims.combined.main.len()];
+            append_claim(
+                &mut claims,
+                SwitchClaim {
+                    main: zero_main,
+                    mask,
+                    target,
+                },
+                theta,
+            )?;
+        }
+        let answer = self.sample_answer(seeds)?;
+        let sample = sample_row(&self.shape, &self.gu, seeds, 0, answer)?;
+        append_claim(
+            &mut claims,
+            SwitchClaim {
+                main: sample.main,
+                mask: sample.mask,
+                target: sample.target,
+            },
+            theta,
+        )?;
+        Ok(claims)
+    }
 }
 
-/// The verifier session for the isolated FOLD-to-code-switch-to-BASE
-/// continuation. It owns the chain moved from the FOLD session and never reads
-/// prover rows except through declarations, received rows and openings.
 pub struct CsSession {
     chain: Chain,
     handoff: FoldHandoff,
     basis: FoldBasis,
+    plan: RuntimeTreePlan,
+    shape: GuShape,
     switch_code: CodeParams,
     switch_mask_code: CodeParams,
-    registry: OracleRegistry,
-    main_id: Option<OracleId>,
-    mask_id: Option<OracleId>,
-    star_id: Option<OracleId>,
-    star_mask_id: Option<OracleId>,
+    root: Option<Digest>,
     stage: Stage,
-    seed: Option<Fp3>,
+    seed: Option<SampleSeed>,
     answer: Option<Fp3>,
     positions: Vec<u64>,
     theta: Fp3,
     claims: Option<SwitchedClaims>,
-    fold_main: Vec<Fp3>,
-    fold_mask: Vec<Fp3>,
     fold_fresh: Vec<Fp3>,
     star_target: Option<Fp3>,
     lambda: Option<Fp3>,
@@ -514,6 +788,9 @@ pub struct CsSession {
     base_positions: Vec<u64>,
     base_linear: bool,
     symbol_checks: bool,
+    star_id: Option<OracleId>,
+    star_mask_id: Option<OracleId>,
+    registry: OracleRegistry,
     declaration_rounds: u64,
     answer_rounds: u64,
     positions_rounds: u64,
@@ -526,6 +803,7 @@ impl CsSession {
         chain: Chain,
         handoff: FoldHandoff,
         basis: FoldBasis,
+        plan: RuntimeTreePlan,
         switch_code: CodeParams,
         switch_mask_code: CodeParams,
     ) -> Result<Self> {
@@ -535,51 +813,55 @@ impl CsSession {
             switch_mask_code.ell,
             switch_mask_code.r,
         )?;
-        let shape = FoldShape {
+        let fold_shape = FoldShape {
             code: handoff.code,
             mask_code: handoff.mask_code,
             k: handoff.k,
             h: handoff.h,
             mask_leaf_class: basis.fresh_tree.leaf_class,
         };
-        validate_fold_mask_shape(&shape)?;
+        validate_fold_mask_shape(&fold_shape)?;
         if handoff.gamma.len() != handoff.k as usize
             || handoff.main_claim.len() as u64 != handoff.code.ell
             || handoff.mask_claim.len() as u64 != handoff.mask_code.ell
             || handoff.fresh_claim.len() as u64 != handoff.mask_code.ell
             || handoff.kept_rows != 0
             || basis.layout != handoff.layout
-            || basis.layout.fault(&shape).is_some()
             || basis.layout.members.iter().any(|member| member.kept)
             || basis.members.len() != basis.layout.members.len()
         {
             return Err(Error::InvalidConfig);
         }
+        let fresh_offset = handoff
+            .mask_code
+            .ell
+            .checked_add(handoff.mask_code.r)
+            .ok_or(Error::ResourceLimit)?;
+        let fresh_end = fresh_offset
+            .checked_add(handoff.mask_code.ell + handoff.mask_code.r)
+            .ok_or(Error::ResourceLimit)?;
         if switch_code.ell < handoff.code.ell + handoff.code.r
-            || switch_mask_code.ell < handoff.mask_code.ell + handoff.mask_code.r
+            || switch_mask_code.ell < fresh_end
         {
             return Err(Error::UnsupportedPrimitive);
         }
+        let shape = switch_shape(&plan, switch_code, switch_mask_code)?;
         let declaration_rounds = chain.rounds();
         Ok(Self {
             chain,
             handoff,
             basis,
+            plan,
+            shape,
             switch_code,
             switch_mask_code,
-            registry: OracleRegistry::new(),
-            main_id: None,
-            mask_id: None,
-            star_id: None,
-            star_mask_id: None,
+            root: None,
             stage: Stage::Fresh,
             seed: None,
             answer: None,
             positions: Vec::new(),
             theta: Fp3::ZERO,
             claims: None,
-            fold_main: Vec::new(),
-            fold_mask: Vec::new(),
             fold_fresh: Vec::new(),
             star_target: None,
             lambda: None,
@@ -587,6 +869,9 @@ impl CsSession {
             base_positions: Vec::new(),
             base_linear: false,
             symbol_checks: false,
+            star_id: None,
+            star_mask_id: None,
+            registry: OracleRegistry::new(),
             declaration_rounds,
             answer_rounds: declaration_rounds,
             positions_rounds: declaration_rounds,
@@ -600,39 +885,37 @@ impl CsSession {
         {
             return Err(Error::StatementMismatch);
         }
-        if declarations.switched_main.count != self.switch_code.n()
-            || declarations.switched_mask.count != self.switch_mask_code.n()
-            || declarations.switched_main.root == Digest::ZERO
-            || declarations.switched_mask.root == Digest::ZERO
+        if declarations.switched.count != self.plan.columns()
+            || declarations.switched.root == Digest::ZERO
         {
             return Err(Error::StatementMismatch);
         }
-        self.main_id = Some(self.registry.insert(
-            declarations.switched_main.root,
-            declarations.switched_main.start,
-            declarations.switched_main.count,
-        )?);
-        self.mask_id = Some(self.registry.insert(
-            declarations.switched_mask.root,
-            declarations.switched_mask.start,
-            declarations.switched_mask.count,
-        )?);
+        self.root = Some(declarations.switched.root);
         let mut words = Vec::new();
         push_digest(&mut words, &declarations.fold_identity);
-        push_commitment(&mut words, &declarations.switched_main);
-        push_commitment(&mut words, &declarations.switched_mask);
+        push_commitment(&mut words, &declarations.switched);
         absorb(&mut self.chain, 6, &words)?;
         self.declaration_rounds = self.chain.rounds();
         self.stage = Stage::Declared;
         Ok(())
     }
 
-    pub fn draw_seed(&mut self) -> Result<Fp3> {
+    pub fn draw_sample_seed(&mut self) -> Result<SampleSeed> {
         if self.stage != Stage::Declared {
             return Err(Error::InvalidSessionState);
         }
-        let seed = self.chain.draw_e()?;
-        self.seed = Some(seed);
+        let cube = sample_cube(&self.shape)?;
+        let mut z = Vec::with_capacity(cube.bits as usize);
+        for _ in 0..cube.bits {
+            z.push(self.chain.draw_e()?);
+        }
+        let beta = self.chain.draw_e_nonzero()?;
+        if beta.is_zero() || z.len() != cube.bits as usize {
+            return Err(Error::InvalidConfig);
+        }
+        let seed = SampleSeed { z, beta };
+        validate_shared_sample_seeds(&[&self.shape], std::slice::from_ref(&seed))?;
+        self.seed = Some(seed.clone());
         self.stage = Stage::SeedDrawn;
         Ok(seed)
     }
@@ -665,10 +948,6 @@ impl CsSession {
         Ok((positions, theta))
     }
 
-    /// Authenticates the old (FOLD output) columns at the drawn positions from
-    /// the original member and fresh commitments, then registers the pending
-    /// switch claims and combines them with theta. The fold relation remains
-    /// sampled at these positions.
     pub fn authenticate_and_register(
         &mut self,
         member_openings: &[RuntimeTreeOpening],
@@ -677,6 +956,9 @@ impl CsSession {
         if self.stage != Stage::PositionsTheta {
             return Err(Error::InvalidSessionState);
         }
+        let seed = self.seed.clone().ok_or(Error::InvalidSessionState)?;
+        let answer = self.answer.ok_or(Error::InvalidSessionState)?;
+        let root = self.root.ok_or(Error::InvalidSessionState)?;
         let unique = unique_sorted(&self.positions);
         let (fold_main, fold_mask) =
             fold_original_columns(&self.handoff, &self.basis, member_openings, &unique)?;
@@ -709,10 +991,57 @@ impl CsSession {
             &authenticated,
             self.theta,
         )?;
-        extend_combined_with_fresh(&mut claims, &self.handoff, self.switch_mask_code)?;
+        let fresh_offset =
+            extend_combined_with_fresh(&mut claims, &self.handoff, self.switch_mask_code)?;
+        for position in &self.positions {
+            let mask_position = *position % self.handoff.mask_code.n();
+            let (message, tail) = symbol_coefficients(
+                self.handoff.mask_code,
+                mask_position,
+                self.handoff.mask_code.ell as usize,
+            )?;
+            let mut mask = vec![
+                Fp3::ZERO;
+                usize::try_from(self.switch_mask_code.ell).map_err(|_| Error::ResourceLimit)?
+            ];
+            mask[fresh_offset..fresh_offset + message.len()].copy_from_slice(&message);
+            mask[fresh_offset + message.len()..fresh_offset + message.len() + tail.len()]
+                .copy_from_slice(&tail);
+            let at = mask_unique
+                .binary_search(&mask_position)
+                .map_err(|_| Error::InvalidIndex)?;
+            let zero_main = vec![Fp3::ZERO; claims.combined.main.len()];
+            append_claim(
+                &mut claims,
+                SwitchClaim {
+                    main: zero_main,
+                    mask,
+                    target: fold_fresh[at],
+                },
+                self.theta,
+            )?;
+        }
+        let mut gu = GuRegistry::new();
+        gu.receive(
+            &self.shape,
+            &GuNotice {
+                root,
+                oracle: self.shape.oracle,
+                tree_number: self.plan.tree_number,
+                part: 0,
+            },
+        )?;
+        let sample = sample_row(&self.shape, &gu, std::slice::from_ref(&seed), 0, answer)?;
+        append_claim(
+            &mut claims,
+            SwitchClaim {
+                main: sample.main,
+                mask: sample.mask,
+                target: sample.target,
+            },
+            self.theta,
+        )?;
         claims.base_ready(self.switch_code, self.switch_mask_code)?;
-        self.fold_main = fold_main;
-        self.fold_mask = fold_mask;
         self.fold_fresh = fold_fresh;
         self.claims = Some(claims);
         self.stage = Stage::OldOpened;
@@ -734,17 +1063,11 @@ impl CsSession {
         {
             return Err(Error::StatementMismatch);
         }
-        if self.registry.get(self.main_id.ok_or(Error::InvalidSessionState)?).is_none()
-            || self.registry.get(self.mask_id.ok_or(Error::InvalidSessionState)?).is_none()
-        {
-            return Err(Error::StatementMismatch);
-        }
         let mut words = Vec::new();
         push_commitment(&mut words, &messages.star);
         push_commitment(&mut words, &messages.star_mask);
         words.extend(fp3_words(&messages.target_star));
         absorb(&mut self.chain, 9, &words)?;
-        // Insert the star roots after binding them in the transcript.
         self.star_id = Some(self.registry.insert(
             messages.star.root,
             messages.star.start,
@@ -849,17 +1172,16 @@ impl CsSession {
         let claims = self.claims.as_ref().ok_or(Error::InvalidSessionState)?;
         let rows = self.base_rows.as_ref().ok_or(Error::InvalidSessionState)?;
         let lambda = self.lambda.ok_or(Error::InvalidSessionState)?;
-        let main_id = self.main_id.ok_or(Error::InvalidSessionState)?;
-        let mask_id = self.mask_id.ok_or(Error::InvalidSessionState)?;
         let star_id = self.star_id.ok_or(Error::InvalidSessionState)?;
         let star_mask_id = self.star_mask_id.ok_or(Error::InvalidSessionState)?;
+        let root = self.root.ok_or(Error::InvalidSessionState)?;
         if openings.star.len() != self.base_positions.len()
             || openings.star_mask.len() != self.base_positions.len()
-            || openings.switched_main.len() != self.base_positions.len()
-            || openings.switched_mask.len() != self.base_positions.len()
         {
             return Err(Error::ShapeMismatch);
         }
+        let unique = unique_sorted(&self.base_positions);
+        verify_runtime_opening(&self.plan, &root, &unique, &openings.switched)?;
         let mask_n = self.switch_mask_code.n();
         let mut star = Vec::with_capacity(self.base_positions.len());
         let mut star_mask = Vec::with_capacity(self.base_positions.len());
@@ -879,18 +1201,16 @@ impl CsSession {
                 self.switch_mask_code.n(),
                 &openings.star_mask[index],
             )?);
-            switched_main.push(self.open_committed(
-                main_id,
-                *position,
-                self.switch_code.n(),
-                &openings.switched_main[index],
-            )?);
-            switched_mask.push(self.open_committed(
-                mask_id,
-                mask_position,
-                self.switch_mask_code.n(),
-                &openings.switched_mask[index],
-            )?);
+            let at = unique
+                .binary_search(position)
+                .map_err(|_| Error::InvalidIndex)?;
+            let column = openings
+                .switched
+                .columns
+                .get(at)
+                .ok_or(Error::ShapeMismatch)?;
+            switched_main.push(fp3_from_symbols(&column.symbols, 0)?);
+            switched_mask.push(fp3_from_symbols(&column.symbols, E_DEGREE)?);
         }
         self.base_linear = base_stage::linear_holds(
             &claims.combined.main,
@@ -938,18 +1258,10 @@ impl CsSession {
         if !self.base_linear || !self.symbol_checks {
             return Err(Error::InvalidProof);
         }
+        let seed = self.seed.as_ref().ok_or(Error::InvalidSessionState)?;
         Ok(CsOutcome {
             fold_identity: fold_identity(&self.handoff),
-            switched_main_root: self
-                .registry
-                .get(self.main_id.ok_or(Error::InvalidSessionState)?)
-                .ok_or(Error::ProverStateMissing)?
-                .root,
-            switched_mask_root: self
-                .registry
-                .get(self.mask_id.ok_or(Error::InvalidSessionState)?)
-                .ok_or(Error::ProverStateMissing)?
-                .root,
+            switched_root: self.root.ok_or(Error::InvalidSessionState)?,
             star_root: self
                 .registry
                 .get(self.star_id.ok_or(Error::InvalidSessionState)?)
@@ -960,6 +1272,13 @@ impl CsSession {
                 .get(self.star_mask_id.ok_or(Error::InvalidSessionState)?)
                 .ok_or(Error::ProverStateMissing)?
                 .root,
+            sample_answer: self.answer.ok_or(Error::InvalidSessionState)?,
+            sample_beta_nonzero: !seed.beta.is_zero(),
+            sample_claim_registered: true,
+            sample_claim_pending: true,
+            send_standard_wiring: false,
+            fresh_correspondence_registered: true,
+            fresh_correspondence_sampled: true,
             theta: self.theta,
             lambda: self.lambda.ok_or(Error::InvalidSessionState)?,
             target_star: self.star_target.ok_or(Error::InvalidSessionState)?,
@@ -970,7 +1289,6 @@ impl CsSession {
             new_group_registered: true,
             cs_claims_pending: true,
             cs_proves_new_group: false,
-            fold_relation_sampled_at_cs_positions: true,
             sampled_fold_relation_only: true,
             complete_fold_binding: false,
             base_linear: self.base_linear,

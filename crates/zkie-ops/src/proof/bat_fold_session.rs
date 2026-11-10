@@ -168,9 +168,7 @@ use crate::proof::base_final_session::{
     fold_coefficients, fold_identity, BaseFinalCheck, BaseFinalOutcome, BaseFinalRejection,
     BaseFinalSession, BaseOpenings, BaseProver, FoldBasis, FoldMember,
 };
-use crate::proof::cs_final_session::{
-    CsBaseOpenings, CsOutcome, CsProver, CsSession,
-};
+use crate::proof::cs_final_session::{CsBaseOpenings, CsOutcome, CsProver, CsSession};
 use crate::proof::fold_handoff::{FoldHandoff, FoldHandoffAnchor};
 use crate::proof::group_commitment_session::{
     member_gu_shapes, shared_answer_order, CommittedGroupMember, GroupCommitmentSession,
@@ -1642,7 +1640,6 @@ pub fn run_bat_fold_cs(
         member_plans,
         group_roots,
     } = core;
-    let _ = old_fresh;
     let code = outcome.shape.code;
     let mask_code = outcome.shape.mask_code;
     let fold_exit_rounds = fold.chain().rounds();
@@ -1651,7 +1648,7 @@ pub fn run_bat_fold_cs(
     if base_chain.rounds() != fold_exit_rounds || *base_chain.value() != fold_exit_value {
         return Err(Error::StatementMismatch);
     }
-    let (main_tail, mask_tail, _fresh_tail) = folded_tails(fixture, &handoff)?;
+    let (main_tail, mask_tail, fresh_tail) = folded_tails(fixture, &handoff)?;
     let rows = handoff.single_rows(old_main, main_tail, old_mask, mask_tail)?;
     let switch_code = build_code_plan(code.log_n + 1, FIXTURE_SWITCH_ELL, 1)?;
     let switch_mask_code = build_code_plan(mask_code.log_n + 1, FIXTURE_SWITCH_ELL, 1)?;
@@ -1662,18 +1659,22 @@ pub fn run_bat_fold_cs(
         switch_code,
         switch_mask_code,
         old_fresh,
+        fresh_tail,
+        outcome.tag,
         star.0,
         star.1,
         star.2,
         star.3,
     )?;
+    let plan = prover.plan();
     let identity = fold_identity(&handoff);
     let declarations = prover.declarations(identity)?;
     let basis = base_basis(fixture, &handoff, &member_plans, &group_roots)?;
-    let mut session = CsSession::new(base_chain, handoff, basis, switch_code, switch_mask_code)?;
+    let mut session =
+        CsSession::new(base_chain, handoff, basis, plan, switch_code, switch_mask_code)?;
     session.receive_declarations(declarations)?;
-    let seed = session.draw_seed()?;
-    let answer = prover.answer(seed)?;
+    let seed = session.draw_sample_seed()?;
+    let answer = prover.sample_answer(std::slice::from_ref(&seed))?;
     session.receive_answer(answer)?;
     let (positions, theta) = session.draw_positions_theta(FIXTURE_CS_POSITIONS)?;
     let unique = unique_sorted(&positions);
@@ -1686,7 +1687,7 @@ pub fn run_bat_fold_cs(
     let session_claims = session
         .authenticate_and_register(&member_openings, &fresh_opening)?
         .clone();
-    let prover_claims = prover.claims(&positions, theta)?;
+    let prover_claims = prover.claims(&positions, theta, std::slice::from_ref(&seed))?;
     if session_claims != prover_claims {
         return Err(Error::StatementMismatch);
     }
@@ -1697,12 +1698,11 @@ pub fn run_bat_fold_cs(
     session.receive_base_rows(base_rows)?;
     let base_positions = session.draw_base_positions(FIXTURE_BASE_POSITIONS)?;
     let (star_openings, star_mask_openings) = prover.star_openings(&base_positions)?;
-    let (switched_main, switched_mask) = prover.switched_openings(&base_positions)?;
+    let switched = prover.openings(&unique_sorted(&base_positions))?;
     session.verify_base_openings(&CsBaseOpenings {
         star: star_openings,
         star_mask: star_mask_openings,
-        switched_main,
-        switched_mask,
+        switched,
     })?;
     Ok(BatFoldCsOutcome {
         fold: outcome,
@@ -1734,6 +1734,7 @@ fn fixture_base_star(
 mod tests {
     use super::*;
     use crate::proof::base_final_session::BaseRejection;
+    use crate::proof::cs_final_session::switch_tree_plan;
     use zkie_engine::pcs::request::params::REQUEST_CHAIN_LABEL;
 
     fn chain(seed: &[u8]) -> Chain {
@@ -2583,7 +2584,12 @@ mod tests {
         assert!(run.cs.new_group_registered);
         assert!(run.cs.cs_claims_pending);
         assert!(!run.cs.cs_proves_new_group);
-        assert!(run.cs.fold_relation_sampled_at_cs_positions);
+        assert!(run.cs.sample_claim_registered);
+        assert!(run.cs.sample_claim_pending);
+        assert!(run.cs.sample_beta_nonzero);
+        assert!(!run.cs.send_standard_wiring);
+        assert!(run.cs.fresh_correspondence_registered);
+        assert!(run.cs.fresh_correspondence_sampled);
         assert!(run.cs.sampled_fold_relation_only);
         assert!(!run.cs.complete_fold_binding);
         assert!(run.cs.base_linear);
@@ -2599,18 +2605,21 @@ mod tests {
         assert_eq!(run.cs.base_commit_rounds, run.cs.positions_rounds + 1);
         assert_eq!(run.cs.base_rows_rounds, run.cs.base_commit_rounds + 2);
         assert_eq!(run.cs.final_rounds, run.cs.base_rows_rounds);
-        assert_eq!(run.cs.registered_claims, 1 + 2 * run.cs.cs_positions.len());
+        assert_eq!(
+            run.cs.registered_claims,
+            2 + 3 * run.cs.cs_positions.len()
+        );
         println!(
-            "cs roots=[{:?},{:?}] fold_identity={:?} theta={:?} lambda={:?} target_star={:?} cs_positions={:?} base_positions={:?} claims={}",
-            run.cs.switched_main_root,
-            run.cs.switched_mask_root,
+            "cs root={:?} fold_identity={:?} theta={:?} lambda={:?} target_star={:?} cs_positions={:?} base_positions={:?} claims={} sample_answer={:?}",
+            run.cs.switched_root,
             run.cs.fold_identity,
             run.cs.theta,
             run.cs.lambda,
             run.cs.target_star,
             run.cs.cs_positions,
             run.cs.base_positions,
-            run.cs.registered_claims
+            run.cs.registered_claims,
+            run.cs.sample_answer
         );
     }
 
@@ -2619,16 +2628,24 @@ mod tests {
         MemberOpening,
         SwitchedOpening,
         Theta,
+        WrongAnswer,
+        TamperedFresh,
     }
 
+    /// Runs the same flow with one fixed tamper. The returned flag says whether
+    /// the registration stage completed; the error may come from registration
+    /// or from the later BASE check.
     fn run_cs_tampered(
         fixture: &BatFoldFixture,
         seed: &[u8],
         tamper: CsTamper,
-    ) -> Result<CsOutcome> {
-        let core = run_bat_fold_core(fixture, chain(seed), |_, _, answers| {
+    ) -> (bool, Result<CsOutcome>) {
+        let core = match run_bat_fold_core(fixture, chain(seed), |_, _, answers| {
             Ok(answers.to_vec())
-        })?;
+        }) {
+            Ok(core) => core,
+            Err(error) => return (false, Err(error)),
+        };
         let BatFoldCore {
             outcome,
             fold,
@@ -2639,42 +2656,117 @@ mod tests {
             member_plans,
             group_roots,
         } = core;
-        let _ = old_fresh;
         let code = outcome.shape.code;
         let mask_code = outcome.shape.mask_code;
-        let base_chain = fold.take_chain_for_base()?;
-        let (main_tail, mask_tail, _fresh_tail) = folded_tails(fixture, &handoff)?;
-        let rows = handoff.single_rows(old_main, main_tail, old_mask, mask_tail)?;
-        let switch_code = build_code_plan(code.log_n + 1, FIXTURE_SWITCH_ELL, 1)?;
-        let switch_mask_code = build_code_plan(mask_code.log_n + 1, FIXTURE_SWITCH_ELL, 1)?;
+        let base_chain = match fold.take_chain_for_base() {
+            Ok(chain) => chain,
+            Err(error) => return (false, Err(error)),
+        };
+        let (main_tail, mask_tail, fresh_tail) = match folded_tails(fixture, &handoff) {
+            Ok(tails) => tails,
+            Err(error) => return (false, Err(error)),
+        };
+        let rows = match handoff.single_rows(old_main, main_tail, old_mask, mask_tail) {
+            Ok(rows) => rows,
+            Err(error) => return (false, Err(error)),
+        };
+        let switch_code = match build_code_plan(code.log_n + 1, FIXTURE_SWITCH_ELL, 1) {
+            Ok(code) => code,
+            Err(error) => return (false, Err(error)),
+        };
+        let switch_mask_code = match build_code_plan(mask_code.log_n + 1, FIXTURE_SWITCH_ELL, 1) {
+            Ok(code) => code,
+            Err(error) => return (false, Err(error)),
+        };
         let star = fixture_cs_star(outcome.tag, switch_code, switch_mask_code);
-        let prover = CsProver::new(
-            &rows,
-            &handoff,
+        let prover = if matches!(tamper, CsTamper::TamperedFresh) {
+            CsProver::new_with_fresh_tamper(
+                &rows,
+                &handoff,
+                switch_code,
+                switch_mask_code,
+                old_fresh,
+                fresh_tail,
+                outcome.tag,
+                Fp3::ONE,
+                star.0,
+                star.1,
+                star.2,
+                star.3,
+            )
+        } else {
+            CsProver::new(
+                &rows,
+                &handoff,
+                switch_code,
+                switch_mask_code,
+                old_fresh,
+                fresh_tail,
+                outcome.tag,
+                star.0,
+                star.1,
+                star.2,
+                star.3,
+            )
+        };
+        let prover = match prover {
+            Ok(prover) => prover,
+            Err(error) => return (false, Err(error)),
+        };
+        let plan = prover.plan();
+        let identity = fold_identity(&handoff);
+        let mut declarations = match prover.declarations(identity) {
+            Ok(declarations) => declarations,
+            Err(error) => return (false, Err(error)),
+        };
+        if matches!(tamper, CsTamper::DeclarationRoot) {
+            declarations.switched.root.0[0] ^= 1;
+        }
+        let basis = match base_basis(fixture, &handoff, &member_plans, &group_roots) {
+            Ok(basis) => basis,
+            Err(error) => return (false, Err(error)),
+        };
+        let mut session = match CsSession::new(
+            base_chain,
+            handoff,
+            basis,
+            plan,
             switch_code,
             switch_mask_code,
-            old_fresh,
-            star.0,
-            star.1,
-            star.2,
-            star.3,
-        )?;
-        let identity = fold_identity(&handoff);
-        let mut declarations = prover.declarations(identity)?;
-        if matches!(tamper, CsTamper::DeclarationRoot) {
-            declarations.switched_main.root.0[0] ^= 1;
+        ) {
+            Ok(session) => session,
+            Err(error) => return (false, Err(error)),
+        };
+        if let Err(error) = session.receive_declarations(declarations) {
+            return (false, Err(error));
         }
-        let basis = base_basis(fixture, &handoff, &member_plans, &group_roots)?;
-        let mut session =
-            CsSession::new(base_chain, handoff, basis, switch_code, switch_mask_code)?;
-        session.receive_declarations(declarations)?;
-        let seed = session.draw_seed()?;
-        let answer = prover.answer(seed)?;
-        session.receive_answer(answer)?;
-        let (positions, theta) = session.draw_positions_theta(FIXTURE_CS_POSITIONS)?;
+        let seed = match session.draw_sample_seed() {
+            Ok(seed) => seed,
+            Err(error) => return (false, Err(error)),
+        };
+        let true_answer = match prover.sample_answer(std::slice::from_ref(&seed)) {
+            Ok(answer) => answer,
+            Err(error) => return (false, Err(error)),
+        };
+        let received_answer = if matches!(tamper, CsTamper::WrongAnswer) {
+            true_answer.add(&Fp3::ONE)
+        } else {
+            true_answer
+        };
+        if let Err(error) = session.receive_answer(received_answer) {
+            return (false, Err(error));
+        }
+        let (positions, theta) = match session.draw_positions_theta(FIXTURE_CS_POSITIONS) {
+            Ok(values) => values,
+            Err(error) => return (false, Err(error)),
+        };
         let unique = unique_sorted(&positions);
-        let mut member_openings =
-            fixture.open_members(&vec![unique.clone(); member_plans.len()])?;
+        let mut member_openings = match fixture.open_members(
+            &vec![unique.clone(); member_plans.len()],
+        ) {
+            Ok(openings) => openings,
+            Err(error) => return (false, Err(error)),
+        };
         if matches!(tamper, CsTamper::MemberOpening) {
             member_openings[0].columns[0].symbols[0] =
                 member_openings[0].columns[0].symbols[0] + Fp::from_u64(1);
@@ -2683,39 +2775,76 @@ mod tests {
             .iter()
             .map(|position| *position % mask_code.n())
             .collect();
-        let fresh_opening = fixture.open_fresh(&unique_sorted(&mask_positions))?;
-        let claims = session
-            .authenticate_and_register(&member_openings, &fresh_opening)?
-            .clone();
+        let fresh_opening = match fixture.open_fresh(&unique_sorted(&mask_positions)) {
+            Ok(opening) => opening,
+            Err(error) => return (false, Err(error)),
+        };
+        let claims = match session.authenticate_and_register(&member_openings, &fresh_opening) {
+            Ok(claims) => claims.clone(),
+            Err(error) => return (false, Err(error)),
+        };
         let prover_theta = if matches!(tamper, CsTamper::Theta) {
             theta.add(&Fp3::ONE)
         } else {
             theta
         };
-        let prover_claims = prover.claims(&positions, prover_theta)?;
-        let messages = prover.base_messages(&prover_claims)?;
-        session.receive_base_commitments(messages)?;
-        let lambda = session.draw_lambda()?;
-        let base_rows = prover.base_rows(&prover_claims, lambda)?;
-        session.receive_base_rows(base_rows)?;
-        let base_positions = session.draw_base_positions(FIXTURE_BASE_POSITIONS)?;
-        let (star_openings, star_mask_openings) = prover.star_openings(&base_positions)?;
-        let (mut switched_main, switched_mask) = prover.switched_openings(&base_positions)?;
-        if matches!(tamper, CsTamper::SwitchedOpening) {
-            switched_main[0].values[0] ^= 1;
+        let prover_claims = match prover.claims(&positions, prover_theta, std::slice::from_ref(&seed)) {
+            Ok(claims) => claims,
+            Err(error) => return (true, Err(error)),
+        };
+        if !matches!(tamper, CsTamper::Theta | CsTamper::WrongAnswer)
+            && claims != prover_claims
+        {
+            return (true, Err(Error::StatementMismatch));
         }
-        session.verify_base_openings(&CsBaseOpenings {
+        let _ = &claims;
+        let auth_claims = prover_claims;
+        let messages = match prover.base_messages(&auth_claims) {
+            Ok(messages) => messages,
+            Err(error) => return (true, Err(error)),
+        };
+        if let Err(error) = session.receive_base_commitments(messages) {
+            return (true, Err(error));
+        }
+        let lambda = match session.draw_lambda() {
+            Ok(lambda) => lambda,
+            Err(error) => return (true, Err(error)),
+        };
+        let base_rows = match prover.base_rows(&auth_claims, lambda) {
+            Ok(rows) => rows,
+            Err(error) => return (true, Err(error)),
+        };
+        if let Err(error) = session.receive_base_rows(base_rows) {
+            return (true, Err(error));
+        }
+        let base_positions = match session.draw_base_positions(FIXTURE_BASE_POSITIONS) {
+            Ok(positions) => positions,
+            Err(error) => return (true, Err(error)),
+        };
+        let (star_openings, star_mask_openings) = match prover.star_openings(&base_positions) {
+            Ok(openings) => openings,
+            Err(error) => return (true, Err(error)),
+        };
+        let mut switched = match prover.openings(&unique_sorted(&base_positions)) {
+            Ok(opening) => opening,
+            Err(error) => return (true, Err(error)),
+        };
+        if matches!(tamper, CsTamper::SwitchedOpening) {
+            switched.columns[0].symbols[0] =
+                switched.columns[0].symbols[0] + Fp::from_u64(1);
+        }
+        if let Err(error) = session.verify_base_openings(&CsBaseOpenings {
             star: star_openings,
             star_mask: star_mask_openings,
-            switched_main,
-            switched_mask,
-        })?;
-        let _ = claims;
-        session.finish()
+            switched,
+        }) {
+            return (true, Err(error));
+        }
+        (true, session.finish())
     }
 
     #[test]
-    fn replaced_cs_declarations_openings_and_theta_fail_closed() {
+    fn replaced_cs_inputs_fail_closed() {
         let fixture = BatFoldFixture::new(51).unwrap();
         for (seed, tamper) in [
             (b"cs declaration".as_slice(), CsTamper::DeclarationRoot),
@@ -2723,9 +2852,26 @@ mod tests {
             (b"cs switched opening".as_slice(), CsTamper::SwitchedOpening),
             (b"cs theta".as_slice(), CsTamper::Theta),
         ] {
+            let (_, result) = run_cs_tampered(&fixture, seed, tamper);
+            assert!(result.is_err(), "the replaced CS input was not rejected");
+        }
+    }
+
+    #[test]
+    fn altered_send_answer_and_fresh_block_are_rejected_after_registration() {
+        let fixture = BatFoldFixture::new(54).unwrap();
+        for (seed, tamper) in [
+            (b"cs wrong answer".as_slice(), CsTamper::WrongAnswer),
+            (b"cs fresh block".as_slice(), CsTamper::TamperedFresh),
+        ] {
+            let (registered, result) = run_cs_tampered(&fixture, seed, tamper);
             assert!(
-                run_cs_tampered(&fixture, seed, tamper).is_err(),
-                "the replaced CS input was not rejected"
+                registered,
+                "the registration stage should complete before the later check"
+            );
+            assert!(
+                result.is_err(),
+                "the altered relation was not rejected at the later stage"
             );
         }
     }
@@ -2750,27 +2896,32 @@ mod tests {
         let _ = (&outcome, old_main, old_mask, old_fresh);
         let code = fixture.shape.code;
         let mask_code = fixture.shape.mask_code;
-        let unsupported = build_code_plan(code.log_n, code.ell, 1).unwrap();
+        let switch_code = build_code_plan(code.log_n + 1, FIXTURE_SWITCH_ELL, 1).unwrap();
+        let switch_mask_code = build_code_plan(mask_code.log_n + 1, FIXTURE_SWITCH_ELL, 1).unwrap();
+        let plan = switch_tree_plan(outcome.tag, switch_code, switch_mask_code).unwrap();
         let basis = base_basis(&fixture, &handoff, &member_plans, &group_roots).unwrap();
         let mut order_session = CsSession::new(
             fold_chain(&fixture, b"cs stage order"),
             handoff.clone(),
             basis.clone(),
-            build_code_plan(code.log_n + 1, FIXTURE_SWITCH_ELL, 1).unwrap(),
-            build_code_plan(mask_code.log_n + 1, FIXTURE_SWITCH_ELL, 1).unwrap(),
+            plan.clone(),
+            switch_code,
+            switch_mask_code,
         )
         .unwrap();
-        assert!(order_session.draw_seed().is_err());
+        assert!(order_session.draw_sample_seed().is_err());
         assert!(order_session.receive_answer(Fp3::ONE).is_err());
         assert!(order_session.draw_positions_theta(1).is_err());
+        let unsupported = build_code_plan(code.log_n, code.ell, 1).unwrap();
         let chain = fold.take_chain_for_base().unwrap();
         assert!(matches!(
             CsSession::new(
                 chain,
                 handoff.clone(),
                 basis.clone(),
+                plan.clone(),
                 unsupported,
-                mask_code
+                switch_mask_code
             ),
             Err(Error::UnsupportedPrimitive)
         ));
@@ -2781,8 +2932,9 @@ mod tests {
                 fold_chain(&fixture, b"cs kept"),
                 handoff,
                 kept,
-                build_code_plan(code.log_n + 1, FIXTURE_SWITCH_ELL, 1).unwrap(),
-                build_code_plan(mask_code.log_n + 1, FIXTURE_SWITCH_ELL, 1).unwrap()
+                plan,
+                switch_code,
+                switch_mask_code
             ),
             Err(Error::InvalidConfig)
         ));
@@ -2795,4 +2947,5 @@ mod tests {
             .take_chain_for_base()
             .unwrap()
     }
+
 }
