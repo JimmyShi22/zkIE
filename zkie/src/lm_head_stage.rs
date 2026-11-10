@@ -424,6 +424,120 @@ pub fn claim_budget(dir: &Path, session: Digest, columns: u64) -> Result<LmHeadB
     Ok(LmHeadBudgetClaim { state: claimed })
 }
 
+/// One file that a verifier needs. The role is a stable name, the path is
+/// relative to the manifest directory, and the digest covers the whole file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestFile {
+    pub role: String,
+    pub path: String,
+    pub bytes: u64,
+    pub digest: Digest,
+}
+
+/// The versioned list of every byte a verifier needs for this chain. A
+/// manifest binds referenced files by whole-file digest and rejects a missing
+/// file, a size or digest mismatch, a path outside its directory and a
+/// trailing byte in the manifest itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationManifest {
+    pub version: u64,
+    pub files: Vec<ManifestFile>,
+}
+
+pub const VERIFICATION_MANIFEST_VERSION: u64 = 1;
+pub const VERIFICATION_MANIFEST_FILE: &str = "verification-manifest.bin";
+
+fn checked_relative(path: &str) -> Result<PathBuf> {
+    if path.is_empty() {
+        return Err(Error::InvalidConfig);
+    }
+    let value = Path::new(path);
+    if value.is_absolute()
+        || value
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(value.to_path_buf())
+}
+
+impl VerificationManifest {
+    pub fn new(mut files: Vec<ManifestFile>) -> Result<Self> {
+        if files.is_empty() {
+            return Err(Error::IncompleteArtifact);
+        }
+        files.sort_by(|a, b| a.role.cmp(&b.role));
+        let value = Self {
+            version: VERIFICATION_MANIFEST_VERSION,
+            files,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.version != VERIFICATION_MANIFEST_VERSION || self.files.is_empty() {
+            return Err(Error::InvalidConfig);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for file in &self.files {
+            if file.role.is_empty() || file.digest == Digest::ZERO {
+                return Err(Error::InvalidConfig);
+            }
+            checked_relative(&file.path)?;
+            if !seen.insert(file.role.as_str()) {
+                return Err(Error::InvalidConfig);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        encode_bytes(self)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let value: Self = decode_bytes(bytes)?;
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn digest(&self) -> Result<Digest> {
+        Ok(zkie_core::artifact::digest_bytes(&self.encode()?))
+    }
+
+    /// Checks every referenced file against its declared size and digest.
+    pub fn verify(&self, dir: &Path) -> Result<()> {
+        self.validate()?;
+        for file in &self.files {
+            let path = dir.join(checked_relative(&file.path)?);
+            let bytes = read_bytes(&path)?;
+            if bytes.len() as u64 != file.bytes
+                || zkie_core::artifact::digest_bytes(&bytes) != file.digest
+            {
+                return Err(Error::ArtifactIntegrityMismatch);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Writes the manifest and returns its digest. The file is created fresh.
+pub fn write_manifest(dir: &Path, manifest: &VerificationManifest) -> Result<Digest> {
+    manifest.validate()?;
+    write_bytes(
+        &dir.join(VERIFICATION_MANIFEST_FILE),
+        &manifest.encode()?,
+        false,
+    )?;
+    manifest.digest()
+}
+
+pub fn read_manifest(dir: &Path) -> Result<VerificationManifest> {
+    VerificationManifest::decode(&read_bytes(&dir.join(VERIFICATION_MANIFEST_FILE))?)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -749,5 +863,57 @@ mod tests {
         assert_eq!(state.used_columns, 0);
         assert!(!state.mask_consumed);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn manifest_file(role: &str, path: &str, bytes: &[u8]) -> ManifestFile {
+        ManifestFile {
+            role: role.to_string(),
+            path: path.to_string(),
+            bytes: bytes.len() as u64,
+            digest: zkie_core::artifact::digest_bytes(bytes),
+        }
+    }
+
+    #[test]
+    fn the_manifest_binds_whole_files_and_rejects_damage() {
+        let dir = dir();
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("artifact.bin"), b"artifact").expect("artifact");
+        std::fs::write(dir.join("trace.bin"), b"trace").expect("trace");
+        let manifest = VerificationManifest::new(vec![
+            manifest_file("artifact", "artifact.bin", b"artifact"),
+            manifest_file("trace", "trace.bin", b"trace"),
+        ])
+        .expect("manifest");
+        manifest.verify(&dir).expect("verify");
+        let digest = write_manifest(&dir, &manifest).expect("write");
+        assert_eq!(read_manifest(&dir).expect("read").digest().expect("digest"), digest);
+
+        std::fs::write(dir.join("artifact.bin"), b"artifacT").expect("tamper");
+        assert!(manifest.verify(&dir).is_err());
+
+        std::fs::remove_file(dir.join("trace.bin")).expect("remove");
+        assert!(manifest.verify(&dir).is_err());
+
+        let outside = VerificationManifest::new(vec![manifest_file(
+            "outside",
+            "../outside.bin",
+            b"x",
+        )]);
+        assert!(outside.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_manifest_rejects_trailing_bytes_and_duplicate_roles() {
+        let value = VerificationManifest::new(vec![manifest_file("a", "a.bin", b"a")]).expect("m");
+        let mut trailing = value.encode().expect("encode");
+        trailing.push(0);
+        assert!(VerificationManifest::decode(&trailing).is_err());
+        let duplicate = VerificationManifest::new(vec![
+            manifest_file("a", "a.bin", b"a"),
+            manifest_file("a", "b.bin", b"b"),
+        ]);
+        assert!(duplicate.is_err());
     }
 }
