@@ -354,6 +354,120 @@ pub(crate) fn fold_coefficients(variables: u32, gamma: &[Fp3]) -> Result<Vec<Fp3
     Ok(out)
 }
 
+pub(crate) fn fold_original_columns(
+    handoff: &FoldHandoff,
+    basis: &FoldBasis,
+        openings: &[RuntimeTreeOpening],
+        unique: &[u64],
+    ) -> Result<(Vec<Fp3>, Vec<Fp3>)> {
+        let main_coeff = fold_coefficients(handoff.k, &handoff.gamma)?;
+        let mask_coeff = fold_coefficients(handoff.h, &handoff.gamma[..handoff.h as usize])?;
+        let main_firsts = fold_member_firsts(&basis.layout, FoldPart::Main)?;
+        let mask_firsts = fold_member_firsts(&basis.layout, FoldPart::Mask)?;
+        let mut fold_main = vec![Fp3::ZERO; unique.len()];
+        let mut fold_mask = vec![Fp3::ZERO; unique.len()];
+        if openings.len() != basis.members.len() {
+            return Err(Error::ShapeMismatch);
+        }
+        for (index, (member, opening)) in basis.members.iter().zip(openings).enumerate() {
+            let layout_member = &basis.layout.members[index];
+            if opening.positions != unique {
+                return Err(Error::InvalidIndex);
+            }
+            verify_runtime_opening(&member.tree, &member.root, unique, opening)?;
+            let part = &member.tree.parts[0];
+            let main_symbols =
+                usize::try_from(part.main_symbols).map_err(|_| Error::ResourceLimit)?;
+            let expected_main = usize::try_from(
+                layout_member
+                    .main_rows
+                    .checked_mul(3)
+                    .ok_or(Error::ResourceLimit)?,
+            )
+            .map_err(|_| Error::ResourceLimit)?;
+            let expected_mask = usize::try_from(
+                layout_member
+                    .mask_rows
+                    .checked_mul(3)
+                    .ok_or(Error::ResourceLimit)?,
+            )
+            .map_err(|_| Error::ResourceLimit)?;
+            if main_symbols != expected_main {
+                return Err(Error::ShapeMismatch);
+            }
+            let main_first = main_firsts[index];
+            let mask_first = mask_firsts[index];
+            for (column_index, column) in opening.columns.iter().enumerate() {
+                if column.symbols.len() != main_symbols + expected_mask {
+                    return Err(Error::ShapeMismatch);
+                }
+                for row in 0..usize::try_from(layout_member.main_rows)
+                    .map_err(|_| Error::ResourceLimit)?
+                {
+                    let value = fp3_from_symbols(&column.symbols, row * 3)?;
+                    let group = main_first
+                        .ok_or(Error::StatementMismatch)?
+                        .checked_add(row as u64)
+                        .ok_or(Error::ResourceLimit)?;
+                    let coefficient = *main_coeff
+                        .get(group as usize)
+                        .ok_or(Error::InvalidIndex)?;
+                    fold_main[column_index] =
+                        fold_main[column_index].add(&coefficient.mul(&value));
+                }
+                for row in 0..usize::try_from(layout_member.mask_rows)
+                    .map_err(|_| Error::ResourceLimit)?
+                {
+                    let value = fp3_from_symbols(&column.symbols, main_symbols + row * 3)?;
+                    let group = mask_first
+                        .ok_or(Error::StatementMismatch)?
+                        .checked_add(row as u64)
+                        .ok_or(Error::ResourceLimit)?;
+                    let coefficient = *mask_coeff
+                        .get(group as usize)
+                        .ok_or(Error::InvalidIndex)?;
+                    fold_mask[column_index] =
+                        fold_mask[column_index].add(&coefficient.mul(&value));
+                }
+            }
+        }
+        Ok((fold_main, fold_mask))
+    }
+
+
+pub(crate) fn fold_fresh_columns(
+    handoff: &FoldHandoff,
+    basis: &FoldBasis,
+        opening: &RuntimeTreeOpening,
+        unique: &[u64],
+    ) -> Result<Vec<Fp3>> {
+        if opening.positions != unique {
+            return Err(Error::InvalidIndex);
+        }
+        verify_mask_opening(
+            &basis.fresh_tree,
+            &basis.fresh_root,
+            unique,
+            opening,
+        )?;
+        let mask_coeff = fold_coefficients(handoff.h, &handoff.gamma[..handoff.h as usize])?;
+        let width = usize::try_from(basis.fresh_tree.width()?).map_err(|_| Error::ResourceLimit)?;
+        let rows = usize::try_from(basis.fresh_tree.mask_rows).map_err(|_| Error::ResourceLimit)?;
+        let mut fold = vec![Fp3::ZERO; unique.len()];
+        for (column_index, column) in opening.columns.iter().enumerate() {
+            if column.symbols.len() != width || width != rows * 3 {
+                return Err(Error::ShapeMismatch);
+            }
+            for row in 0..rows {
+                let value = fp3_from_symbols(&column.symbols, row * 3)?;
+                let coefficient = *mask_coeff.get(row).ok_or(Error::InvalidIndex)?;
+                fold[column_index] = fold[column_index].add(&coefficient.mul(&value));
+            }
+        }
+        Ok(fold)
+    }
+
+
 struct ProverCommitment {
     registry: OracleRegistry,
     openings: Vec<OracleOpening>,
@@ -806,78 +920,7 @@ impl BaseFinalSession {
         openings: &[RuntimeTreeOpening],
         unique: &[u64],
     ) -> Result<(Vec<Fp3>, Vec<Fp3>)> {
-        let main_coeff = fold_coefficients(self.handoff.k, &self.handoff.gamma)?;
-        let mask_coeff = fold_coefficients(self.handoff.h, &self.handoff.gamma[..self.handoff.h as usize])?;
-        let main_firsts = fold_member_firsts(&self.basis.layout, FoldPart::Main)?;
-        let mask_firsts = fold_member_firsts(&self.basis.layout, FoldPart::Mask)?;
-        let mut fold_main = vec![Fp3::ZERO; unique.len()];
-        let mut fold_mask = vec![Fp3::ZERO; unique.len()];
-        if openings.len() != self.basis.members.len() {
-            return Err(Error::ShapeMismatch);
-        }
-        for (index, (member, opening)) in self.basis.members.iter().zip(openings).enumerate() {
-            let layout_member = &self.basis.layout.members[index];
-            if opening.positions != unique {
-                return Err(Error::InvalidIndex);
-            }
-            verify_runtime_opening(&member.tree, &member.root, unique, opening)?;
-            let part = &member.tree.parts[0];
-            let main_symbols =
-                usize::try_from(part.main_symbols).map_err(|_| Error::ResourceLimit)?;
-            let expected_main = usize::try_from(
-                layout_member
-                    .main_rows
-                    .checked_mul(3)
-                    .ok_or(Error::ResourceLimit)?,
-            )
-            .map_err(|_| Error::ResourceLimit)?;
-            let expected_mask = usize::try_from(
-                layout_member
-                    .mask_rows
-                    .checked_mul(3)
-                    .ok_or(Error::ResourceLimit)?,
-            )
-            .map_err(|_| Error::ResourceLimit)?;
-            if main_symbols != expected_main {
-                return Err(Error::ShapeMismatch);
-            }
-            let main_first = main_firsts[index];
-            let mask_first = mask_firsts[index];
-            for (column_index, column) in opening.columns.iter().enumerate() {
-                if column.symbols.len() != main_symbols + expected_mask {
-                    return Err(Error::ShapeMismatch);
-                }
-                for row in 0..usize::try_from(layout_member.main_rows)
-                    .map_err(|_| Error::ResourceLimit)?
-                {
-                    let value = fp3_from_symbols(&column.symbols, row * 3)?;
-                    let group = main_first
-                        .ok_or(Error::StatementMismatch)?
-                        .checked_add(row as u64)
-                        .ok_or(Error::ResourceLimit)?;
-                    let coefficient = *main_coeff
-                        .get(group as usize)
-                        .ok_or(Error::InvalidIndex)?;
-                    fold_main[column_index] =
-                        fold_main[column_index].add(&coefficient.mul(&value));
-                }
-                for row in 0..usize::try_from(layout_member.mask_rows)
-                    .map_err(|_| Error::ResourceLimit)?
-                {
-                    let value = fp3_from_symbols(&column.symbols, main_symbols + row * 3)?;
-                    let group = mask_first
-                        .ok_or(Error::StatementMismatch)?
-                        .checked_add(row as u64)
-                        .ok_or(Error::ResourceLimit)?;
-                    let coefficient = *mask_coeff
-                        .get(group as usize)
-                        .ok_or(Error::InvalidIndex)?;
-                    fold_mask[column_index] =
-                        fold_mask[column_index].add(&coefficient.mul(&value));
-                }
-            }
-        }
-        Ok((fold_main, fold_mask))
+        fold_original_columns(&self.handoff, &self.basis, openings, unique)
     }
 
     fn fold_fresh_columns(
@@ -885,30 +928,7 @@ impl BaseFinalSession {
         opening: &RuntimeTreeOpening,
         unique: &[u64],
     ) -> Result<Vec<Fp3>> {
-        if opening.positions != unique {
-            return Err(Error::InvalidIndex);
-        }
-        verify_mask_opening(
-            &self.basis.fresh_tree,
-            &self.basis.fresh_root,
-            unique,
-            opening,
-        )?;
-        let mask_coeff = fold_coefficients(self.handoff.h, &self.handoff.gamma[..self.handoff.h as usize])?;
-        let width = usize::try_from(self.basis.fresh_tree.width()?).map_err(|_| Error::ResourceLimit)?;
-        let rows = usize::try_from(self.basis.fresh_tree.mask_rows).map_err(|_| Error::ResourceLimit)?;
-        let mut fold = vec![Fp3::ZERO; unique.len()];
-        for (column_index, column) in opening.columns.iter().enumerate() {
-            if column.symbols.len() != width || width != rows * 3 {
-                return Err(Error::ShapeMismatch);
-            }
-            for row in 0..rows {
-                let value = fp3_from_symbols(&column.symbols, row * 3)?;
-                let coefficient = *mask_coeff.get(row).ok_or(Error::InvalidIndex)?;
-                fold[column_index] = fold[column_index].add(&coefficient.mul(&value));
-            }
-        }
-        Ok(fold)
+        fold_fresh_columns(&self.handoff, &self.basis, opening, unique)
     }
 
     pub fn verify_openings(&mut self, openings: &BaseOpenings) -> Result<()> {

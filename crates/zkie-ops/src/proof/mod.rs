@@ -3,6 +3,7 @@ pub mod base_final_session;
 pub mod bat_fold_session;
 pub mod binding;
 pub mod column_session;
+pub mod cs_final_session;
 pub mod edge_session;
 pub mod fold_handoff;
 pub mod group_commitment_session;
