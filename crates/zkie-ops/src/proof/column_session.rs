@@ -87,7 +87,8 @@ use zkie_engine::pcs::request::read::{unique_sorted, HidingState, ReadLedger};
 use zkie_engine::pcs::request::relation::{foldeq_weights, GuRelationKind, GuRelationRow};
 use zkie_engine::pcs::request::runtime_tree::{MaskTreePlan, RuntimeTreePart, RuntimeTreePlan};
 use zkie_engine::pcs::request::table::{
-    commit_table, ColumnOpening, CommittedTable, IndexReader, IndexShape, TableDistances,
+    commit_table, ColumnOpening, CommittedTable, IndexReader, IndexShape, SampleSeed,
+    TableDistances,
 };
 
 use crate::proof::model_commitment::{
@@ -102,7 +103,7 @@ const PLAN_IDENTIFIER: Digest = Digest([0x54; 32]);
 const DEMO_REQUEST_ID: Digest = Digest([0x52; 32]);
 #[cfg(test)]
 const DEMO_CASE_ID: &[u8] = b"demo-column-case";
-const GU_NOTICE_ROOT: Digest = Digest([0x47; 32]);
+pub(crate) const GU_NOTICE_ROOT: Digest = Digest([0x47; 32]);
 const FRESH_MASK_ROOT: Digest = Digest([0x46; 32]);
 
 const TABLE_LOG_N: u32 = 3;
@@ -877,19 +878,40 @@ pub(crate) struct GuFlow {
 /// demonstration values used by the column session; they are not real SEND
 /// values. Column openings are authenticated only against the table column
 /// root.
-pub(crate) fn open_gu_flow(
+/// Runs the fixed pre-FOLD flow with caller-supplied SEND answers. The caller
+/// receives the actual session G_u shape and the independent seed set after the
+/// fixed root, and returns the complete ordered answer list. The verifier only
+/// registers those answers as pending sample claims; it does not compare them
+/// with a standard answer.
+pub(crate) fn open_gu_flow_with_answers<F>(
     table: &AssetEncodingTable,
     binding: FoldeqBinding,
     edge: FoldeqEdgeBinding,
-) -> Result<GuFlow> {
+    gu_root: Digest,
+    answer_provider: F,
+) -> Result<GuFlow>
+where
+    F: FnOnce(&GuShape, &[SampleSeed]) -> Result<Vec<Fp3>>,
+{
     let setup = build_demo_setup(table, binding, edge)?;
     let mut session = FoldeqSession::open(setup.plan, setup.binder, setup.chain)?;
     session.bind_first_query(&setup.first_query)?;
     session.draw_gamma()?;
-    session.send_gu(&GU_NOTICE_ROOT)?;
+    session.send_gu(&gu_root)?;
     session.shared_seeds()?;
-    for answer in 0..GU_ANSWERS {
-        session.receive_gu_answer(Fp3::from_u64(0x31 + answer as u64))?;
+    let gu = session
+        .plan()
+        .gu
+        .as_ref()
+        .ok_or(Error::InvalidSessionState)?
+        .clone();
+    let seeds = session.gu_shared_seeds().to_vec();
+    let answers = answer_provider(&gu, &seeds)?;
+    if answers.len() != gu.u.answers as usize {
+        return Err(Error::ShapeMismatch);
+    }
+    for answer in answers {
+        session.receive_gu_answer(answer)?;
     }
     session.join_gu_record()?;
     session.draw_queries()?;
@@ -901,7 +923,7 @@ pub(crate) fn open_gu_flow(
     let table_identity = reader_table_identity(&table.reader)?;
     Ok(GuFlow {
         session,
-        gu_root: GU_NOTICE_ROOT,
+        gu_root,
         queries,
         table_identity,
         transcript_after_columns,

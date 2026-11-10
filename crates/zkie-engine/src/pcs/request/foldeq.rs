@@ -2409,6 +2409,16 @@ mod tests {
     }
 
     #[test]
+    fn send_root_cannot_be_replaced_after_seeds_are_drawn() {
+        let (mut session, _table) = open_gu_session();
+        session.shared_seeds().unwrap();
+        assert!(matches!(
+            session.send_gu(&Digest([5; 32])),
+            Err(Error::InvalidSessionState)
+        ));
+    }
+
+    #[test]
     fn bat_chain_handoff_requires_the_read_stage() {
         let (session, _table) = open_gu_session();
         assert!(matches!(

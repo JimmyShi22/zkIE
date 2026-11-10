@@ -66,12 +66,13 @@ use zkie_engine::pcs::request::chain::Chain;
 use zkie_engine::pcs::request::code::{build_code_plan, CodeParams};
 use zkie_engine::pcs::request::field::Fp3;
 use zkie_engine::pcs::request::foldeq::reader_table_identity;
+use zkie_engine::pcs::request::gu::GuShape;
 use zkie_engine::pcs::request::relation::{GuRelationKind, GuRelationRow};
-use zkie_engine::pcs::request::table::IndexShape;
+use zkie_engine::pcs::request::table::{IndexShape, SampleSeed};
 
 use crate::proof::column_session::{
-    bind_table, build_authenticated_encoding_table_with_configuration, open_gu_flow,
-    ColumnBindingInput,
+    bind_table, build_authenticated_encoding_table_with_configuration, open_gu_flow_with_answers,
+    ColumnBindingInput, GU_NOTICE_ROOT,
 };
 use crate::proof::model_commitment::{AssetOpening, ModelCommitmentPublic};
 use crate::proof::session_baseline::TrustedModel;
@@ -309,6 +310,8 @@ pub struct GuCombineOutcome {
     pub permanent_format: bool,
     pub adapter_only: bool,
     pub downstream_fold_connected: bool,
+    pub sample_answers_provider_constructed: bool,
+    pub verifier_standard_answer_comparison: bool,
 }
 
 /// Runs the candidate G_u declaration registration and BAT combination over
@@ -320,6 +323,37 @@ pub fn verify_gu_combine_session(
     asset_path: &str,
     opening: &AssetOpening,
 ) -> Result<GuCombineOutcome> {
+    verify_gu_combine_session_with_provider(
+        public,
+        trusted,
+        input,
+        asset_path,
+        opening,
+        GU_NOTICE_ROOT,
+        |gu, _seeds| {
+            Ok((0..gu.u.answers)
+                .map(|answer| Fp3::from_u64(0x31 + answer as u64))
+                .collect())
+        },
+    )
+}
+
+/// Runs the same demonstration with a caller-supplied SEND answer provider.
+/// The provider receives the actual session G_u shape and the seed set drawn
+/// after the fixed root. The verifier registers the returned answers as
+/// pending sample claims; it has no standard-answer comparison path.
+pub fn verify_gu_combine_session_with_provider<F>(
+    public: &ModelCommitmentPublic,
+    trusted: &TrustedModel<'_>,
+    input: &ColumnBindingInput,
+    asset_path: &str,
+    opening: &AssetOpening,
+    gu_root: Digest,
+    answer_provider: F,
+) -> Result<GuCombineOutcome>
+where
+    F: FnOnce(&GuShape, &[SampleSeed]) -> Result<Vec<Fp3>>,
+{
     let configuration = input.parameters.digest()?;
     let table = build_authenticated_encoding_table_with_configuration(
         public,
@@ -329,7 +363,13 @@ pub fn verify_gu_combine_session(
         configuration,
     )?;
     let binding = bind_table(&table, input)?;
-    let flow = open_gu_flow(&table, binding, input.edge.clone())?;
+    let flow = open_gu_flow_with_answers(
+        &table,
+        binding,
+        input.edge.clone(),
+        gu_root,
+        answer_provider,
+    )?;
     let crate::proof::column_session::GuFlow {
         session,
         gu_root,
@@ -434,6 +474,8 @@ pub fn verify_gu_combine_session(
         permanent_format: false,
         adapter_only: true,
         downstream_fold_connected: false,
+        sample_answers_provider_constructed: true,
+        verifier_standard_answer_comparison: false,
     })
 }
 
