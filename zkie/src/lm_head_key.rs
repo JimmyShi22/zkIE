@@ -23,7 +23,9 @@ use zkie_engine::pcs::request::bat::{
 };
 use zkie_engine::pcs::request::binding::{BindingParameters, BindingStatement};
 use zkie_engine::pcs::request::chain::{Chain, KIND_ALGEBRAIC, KIND_EPSILON};
-use zkie_engine::pcs::request::cs_stage::{switch_tree_plan_multi, SwitchTarget, SwitchedClaims, SwitchedRows};
+use zkie_engine::pcs::request::cs_stage::{
+    switch_tree_plan_multi, SwitchTarget, SwitchedClaims, SwitchedRows,
+};
 use zkie_engine::pcs::request::code::encode_row_fp3;
 use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE};
 use zkie_engine::pcs::request::fold::{
@@ -490,6 +492,9 @@ pub struct LimitedSharedSession {
     pub base: BaseStarBinding,
     pub switches: Vec<SwitchTarget>,
     pub switch_positions: Vec<u64>,
+    /// The trusted-derived public view of every switch plan, carried to the
+    /// verifier setup.
+    pub switch_public_plans: Vec<SwitchPlanPublic>,
     pub column_work_bits: u8,
     pub switch_work_bits: u8,
 }
@@ -515,6 +520,228 @@ pub fn limited_key_binding_parameters(
     )
 }
 
+/// The trusted-derived public fields of one switch's runtime tree plan. The
+/// run seed is not part of this view: it stays a committed private value
+/// carried by the handoff. Every other field is derived from the compiled
+/// plan by the same rules the prover's plan follows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeTreePlanPublic {
+    pub tree_number: u64,
+    pub leaf_class: u32,
+    pub log_n: u32,
+    pub log_n_zk: u32,
+    pub parts: Vec<RuntimeTreePart>,
+    pub salt_bytes: usize,
+    pub configuration: Digest,
+}
+
+impl RuntimeTreePlanPublic {
+    fn from_plan(plan: &RuntimeTreePlan) -> Self {
+        Self {
+            tree_number: plan.tree_number,
+            leaf_class: plan.leaf_class,
+            log_n: plan.log_n,
+            log_n_zk: plan.log_n_zk,
+            parts: plan.parts.clone(),
+            salt_bytes: plan.salt_bytes,
+            configuration: plan.configuration,
+        }
+    }
+}
+
+/// The trusted-derived public fields of a fresh mask tree plan. The run seed
+/// is not part of this view: it stays a committed private value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaskTreePlanPublic {
+    pub tree_number: u64,
+    pub leaf_class: u32,
+    pub log_n: u32,
+    pub mask_rows: u64,
+    pub salt_bytes: usize,
+    pub configuration: Digest,
+}
+
+impl MaskTreePlanPublic {
+    fn from_plan(plan: &MaskTreePlan) -> Self {
+        Self {
+            tree_number: plan.tree_number,
+            leaf_class: plan.leaf_class,
+            log_n: plan.log_n,
+            mask_rows: plan.mask_rows,
+            salt_bytes: plan.salt_bytes,
+            configuration: plan.configuration,
+        }
+    }
+
+    fn to_plan(self, run: Digest) -> MaskTreePlan {
+        MaskTreePlan {
+            tree_number: self.tree_number,
+            leaf_class: self.leaf_class,
+            log_n: self.log_n,
+            mask_rows: self.mask_rows,
+            salt_bytes: self.salt_bytes,
+            run,
+            configuration: self.configuration,
+        }
+    }
+}
+
+/// The trusted-derived public fields of one stage FOLD plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageFoldPlanPublic {
+    pub shape: FoldShape,
+    pub layout: FoldGroupLayout,
+    pub mask_tree: MaskTreePlanPublic,
+    pub group: u64,
+    pub member: u64,
+    pub fresh: u64,
+}
+
+impl StageFoldPlanPublic {
+    fn from_plan(plan: &LimitedStageFoldPlan) -> Self {
+        Self {
+            shape: plan.shape,
+            layout: plan.layout.clone(),
+            mask_tree: MaskTreePlanPublic::from_plan(&plan.mask_tree),
+            group: plan.group,
+            member: plan.member,
+            fresh: plan.fresh,
+        }
+    }
+}
+
+/// The trusted-derived public fields of one switch plan: its position count,
+/// its runtime tree plan and its following stage FOLD plan, if any. The run
+/// seeds and the column salts are absent because they stay committed private
+/// values rather than values the verifier rebuilds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SwitchPlanPublic {
+    pub positions: u64,
+    pub tree: RuntimeTreePlanPublic,
+    pub stage_fold: Option<StageFoldPlanPublic>,
+}
+
+impl SwitchPlanPublic {
+    fn from_plan(plan: &LimitedSwitchPlan) -> Self {
+        Self {
+            positions: plan.positions,
+            tree: RuntimeTreePlanPublic::from_plan(&plan.plan),
+            stage_fold: plan.stage_fold.as_ref().map(StageFoldPlanPublic::from_plan),
+        }
+    }
+}
+
+/// A nonzero constructor witness for a runtime tree's run seed. The expected
+/// public view never compares the run, so this value is neither committed nor
+/// sent anywhere.
+const PUBLIC_PLAN_RUN_PLACEHOLDER: Digest = Digest([1; 32]);
+
+/// Derives one stage FOLD's trusted public fields from the compiled plan and
+/// its switch target. The prover's stage plan and the verifier's expected plan
+/// both use this function; only the fresh mask tree's run seed is supplied
+/// separately as a private value.
+fn stage_fold_public_plan(
+    compiled: &CompiledPlan,
+    target: &SwitchTarget,
+    stage_index: u64,
+    configuration: Digest,
+) -> Result<StageFoldPlanPublic> {
+    let shape = FoldShape {
+        code: target.code,
+        mask_code: target.mask_code,
+        k: target.main.bits,
+        h: target.rest.bits,
+        mask_leaf_class: compiled.once_foldeq.shared_split_leaf_class,
+    };
+    if fold_mask_shape_fault(&shape).is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let layout = FoldGroupLayout {
+        group: LM_HEAD_FOLD_GROUP,
+        k: shape.k,
+        h: shape.h,
+        members: vec![FoldMemberLayout {
+            oracle: LM_HEAD_FOLD_GROUP,
+            main_rows: target.main_rows,
+            mask_rows: target.mask_rows,
+            kept: false,
+        }],
+    };
+    if layout.fault(&shape).is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let mask_tree = MaskTreePlanPublic {
+        tree_number: 0x500u64
+            .checked_add(stage_index)
+            .ok_or(Error::ResourceLimit)?,
+        leaf_class: compiled.once_foldeq.shared_split_leaf_class,
+        log_n: target.mask_code.log_n,
+        mask_rows: target.mask_rows,
+        salt_bytes: compiled.once_foldeq.base_salt_bytes,
+        configuration,
+    };
+    if mask_tree
+        .to_plan(PUBLIC_PLAN_RUN_PLACEHOLDER)
+        .fault()
+        .is_some()
+    {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(StageFoldPlanPublic {
+        shape,
+        layout,
+        mask_tree,
+        group: LM_HEAD_FOLD_GROUP,
+        member: LM_HEAD_FOLD_GROUP,
+        fresh: LM_HEAD_FRESH_MASK,
+    })
+}
+
+/// Derives every switch's trusted public plan view from the compiled one-time
+/// stages and the switch targets built from them. The run seeds and the column
+/// salts stay private commitments carried by the handoff.
+fn expected_switch_public_plans(
+    compiled: &CompiledPlan,
+    targets: &[SwitchTarget],
+    configuration: Digest,
+) -> Result<Vec<SwitchPlanPublic>> {
+    let stages = &compiled.once.folded.stages;
+    if stages.len() != targets.len() {
+        return Err(Error::InvalidConfig);
+    }
+    let mut plans = Vec::with_capacity(targets.len());
+    for (index, target) in targets.iter().enumerate() {
+        let stage_index = u64::try_from(index).map_err(|_| Error::ResourceLimit)?;
+        let tree = switch_tree_plan_multi(
+            stage_index + 1,
+            target,
+            compiled.once_foldeq.base_salt_bytes,
+            PUBLIC_PLAN_RUN_PLACEHOLDER,
+            configuration,
+        )?;
+        let stage_fold = if index + 1 < targets.len() {
+            Some(stage_fold_public_plan(
+                compiled,
+                target,
+                stage_index,
+                configuration,
+            )?)
+        } else {
+            None
+        };
+        plans.push(SwitchPlanPublic {
+            positions: if index == 0 {
+                compiled.once.folded.positions
+            } else {
+                stages[index - 1].positions
+            },
+            tree: RuntimeTreePlanPublic::from_plan(&tree),
+            stage_fold,
+        });
+    }
+    Ok(plans)
+}
+
 /// Builds the real shared-only FOLDEQ plan for the committed key table. The
 /// fold shape comes from the compiled one-time lines, the fresh mask root from
 /// the provider's pre-committed mask message, and every runtime tree's run and
@@ -533,6 +760,8 @@ struct LimitedPlanParts {
     base: BaseStarBinding,
     switches: Vec<SwitchTarget>,
     switch_positions: Vec<u64>,
+    /// The trusted-derived public view of every switch plan.
+    switch_public_plans: Vec<SwitchPlanPublic>,
     column_work_bits: u8,
     switch_work_bits: u8,
     reader: IndexReader,
@@ -553,6 +782,15 @@ pub struct LimitedVerifySetup {
     /// The old group's real position count at each switch, from the trusted
     /// compiled plan. The verifier rejects a public switch plan that differs.
     pub switch_positions: Vec<u64>,
+    /// The trusted-derived public fields of every switch plan. A handoff plan
+    /// whose public fields differ is rejected. Trusted-derived: the position
+    /// count; the runtime tree's tree_number, leaf_class, log_n, log_n_zk,
+    /// parts, salt_bytes and configuration; the stage FOLD's shape, layout,
+    /// group, member and fresh numbers; and its mask tree's tree_number,
+    /// leaf_class, log_n, mask_rows, salt_bytes and configuration. Not
+    /// rebuilt: the runtime tree and mask tree run seeds and all column
+    /// salts, which stay committed private values carried by the handoff.
+    pub switch_public_plans: Vec<SwitchPlanPublic>,
     /// Work bits of the column draw and of each switch draw, from the trusted
     /// plan's once and shared scopes.
     pub column_work_bits: u8,
@@ -624,6 +862,7 @@ fn build_limited_plan_parts(
             answers,
         )?);
     }
+    let switch_public_plans = expected_switch_public_plans(compiled, &switches, configuration)?;
     let last = compiled
         .once
         .folded
@@ -790,6 +1029,7 @@ fn build_limited_plan_parts(
         base,
         switches,
         switch_positions,
+        switch_public_plans,
         column_work_bits,
         switch_work_bits,
         reader: reader.clone(),
@@ -883,6 +1123,7 @@ fn finish_limited_setup(
         base: parts.base,
         switches: parts.switches,
         switch_positions: parts.switch_positions,
+        switch_public_plans: parts.switch_public_plans,
         column_work_bits: parts.column_work_bits,
         switch_work_bits: parts.switch_work_bits,
         fresh_plan: parts.mask_tree,
@@ -901,6 +1142,7 @@ impl LimitedSharedSession {
             base: self.base.clone(),
             switches: self.switches.clone(),
             switch_positions: self.switch_positions.clone(),
+            switch_public_plans: self.switch_public_plans.clone(),
             column_work_bits: self.column_work_bits,
             switch_work_bits: self.switch_work_bits,
             fresh_plan: self.mask.tree().plan.clone(),
@@ -1018,6 +1260,7 @@ pub fn build_limited_shared_session(
         base: setup.base,
         switches: setup.switches,
         switch_positions: setup.switch_positions,
+        switch_public_plans: setup.switch_public_plans,
         column_work_bits: setup.column_work_bits,
         switch_work_bits: setup.switch_work_bits,
     })
@@ -2820,6 +3063,24 @@ impl LimitedSwitchPlan {
     }
 }
 
+/// Rejects a handoff switch plan whose trusted-derived public fields differ
+/// from the compiled plan's. The runtime tree's run seed and the column salts
+/// are committed private values and are not compared.
+fn check_switch_public_plans(
+    expected: &[SwitchPlanPublic],
+    switches: &[LimitedSwitchPlan],
+) -> Result<()> {
+    if switches.len() != expected.len() {
+        return Err(Error::IncompleteArtifact);
+    }
+    for (plan, expected) in switches.iter().zip(expected) {
+        if SwitchPlanPublic::from_plan(plan) != *expected {
+            return Err(Error::InvalidProof);
+        }
+    }
+    Ok(())
+}
+
 /// Replays the whole chain from the public setup, the public switch plans and
 /// the artifact messages. The replay builds only zero coefficient vectors of
 /// the required shapes; every claim used for a check is recomputed from the
@@ -2834,9 +3095,11 @@ pub fn verify_limited_chain(
 ) -> Result<Digest> {
     if artifact.switches.len() != switches.len()
         || setup.switch_positions.len() != switches.len()
+        || setup.switch_public_plans.len() != switches.len()
     {
         return Err(Error::IncompleteArtifact);
     }
+    check_switch_public_plans(&setup.switch_public_plans, switches)?;
     let provided_targets: Vec<SwitchTarget> =
         switches.iter().map(|plan| plan.target.clone()).collect();
     if provided_targets != setup.switches {
@@ -4480,49 +4743,16 @@ pub fn plan_stage_chain(
             stage_index,
         )?;
         let stage_fold = if index + 1 < stages.len() {
-            let shape = FoldShape {
-                code: target.code,
-                mask_code: target.mask_code,
-                k: target.main.bits,
-                h: target.rest.bits,
-                mask_leaf_class: compiled.once_foldeq.shared_split_leaf_class,
-            };
-            if fold_mask_shape_fault(&shape).is_some() {
-                return Err(Error::InvalidConfig);
-            }
-            let layout = FoldGroupLayout {
-                group: 1,
-                k: shape.k,
-                h: shape.h,
-                members: vec![FoldMemberLayout {
-                    oracle: 1,
-                    main_rows: target.main_rows,
-                    mask_rows: target.mask_rows,
-                    kept: false,
-                }],
-            };
-            if layout.fault(&shape).is_some() {
-                return Err(Error::InvalidConfig);
-            }
-            let mask_tree = MaskTreePlan {
-                tree_number: 0x500 + stage_index,
-                leaf_class: compiled.once_foldeq.shared_split_leaf_class,
-                log_n: target.mask_code.log_n,
-                mask_rows: target.mask_rows,
-                salt_bytes,
-                run: derive_seed(&master, stage_index, 10)?,
-                configuration,
-            };
-            if mask_tree.fault().is_some() {
-                return Err(Error::InvalidConfig);
-            }
+            let public = stage_fold_public_plan(compiled, &target, stage_index, configuration)?;
             Some(StageFoldSpec {
-                shape,
-                layout,
-                mask_tree,
-                group: 1,
-                member: 1,
-                fresh: 3,
+                shape: public.shape,
+                layout: public.layout,
+                mask_tree: public
+                    .mask_tree
+                    .to_plan(derive_seed(&master, stage_index, 10)?),
+                group: public.group,
+                member: public.member,
+                fresh: public.fresh,
                 randomness: expand_fold_mask(&target, salt_bytes, &master, stage_index)?,
             })
         } else {
@@ -6035,6 +6265,83 @@ mod tests {
             base,
             switches: vec![target, target2, final_target],
             switch_positions: vec![2, 2, 2],
+            switch_public_plans: vec![
+                SwitchPlanPublic {
+                    positions: 2,
+                    tree: RuntimeTreePlanPublic::from_plan(&switch_plan),
+                    stage_fold: Some(StageFoldPlanPublic {
+                        shape: FoldShape {
+                            code: next_code,
+                            mask_code: next_mask,
+                            k: 2,
+                            h: 2,
+                            mask_leaf_class: 0,
+                        },
+                        layout: FoldGroupLayout {
+                            group: 1,
+                            k: 2,
+                            h: 2,
+                            members: vec![FoldMemberLayout {
+                                oracle: 1,
+                                main_rows: 4,
+                                mask_rows: 4,
+                                kept: false,
+                            }],
+                        },
+                        mask_tree: MaskTreePlanPublic {
+                            tree_number: 1,
+                            leaf_class: 0,
+                            log_n: next_mask.log_n,
+                            mask_rows: 4,
+                            salt_bytes: 40,
+                            configuration: key.reader.configuration,
+                        },
+                        group: 1,
+                        member: 1,
+                        fresh: 3,
+                    }),
+                },
+                SwitchPlanPublic {
+                    positions: 2,
+                    tree: RuntimeTreePlanPublic::from_plan(&plan2),
+                    stage_fold: Some(StageFoldPlanPublic {
+                        shape: FoldShape {
+                            code: next_code,
+                            mask_code: next_mask,
+                            k: 2,
+                            h: 2,
+                            mask_leaf_class: 0,
+                        },
+                        layout: FoldGroupLayout {
+                            group: 1,
+                            k: 2,
+                            h: 2,
+                            members: vec![FoldMemberLayout {
+                                oracle: 1,
+                                main_rows: 4,
+                                mask_rows: 4,
+                                kept: false,
+                            }],
+                        },
+                        mask_tree: MaskTreePlanPublic {
+                            tree_number: 2,
+                            leaf_class: 0,
+                            log_n: next_mask.log_n,
+                            mask_rows: 4,
+                            salt_bytes: 40,
+                            configuration: key.reader.configuration,
+                        },
+                        group: 1,
+                        member: 1,
+                        fresh: 3,
+                    }),
+                },
+                SwitchPlanPublic {
+                    positions: 2,
+                    tree: RuntimeTreePlanPublic::from_plan(&final_plan),
+                    stage_fold: None,
+                },
+            ],
             column_work_bits: 0,
             switch_work_bits: 0,
         };
@@ -6682,6 +6989,38 @@ mod tests {
             &decoded,
         )
         .is_err());
+        let reject_public_plan = |edit: &dyn Fn(&mut LimitedSwitchPlan)| {
+            let mut plans = verify_plans.clone();
+            edit(&mut plans[0]);
+            assert!(verify_limited_chain(
+                &verify_setup,
+                &masked,
+                &plans,
+                Some(old_mask_plan.clone()),
+                Some(old_mask_root),
+                &decoded,
+            )
+            .is_err());
+        };
+        reject_public_plan(&|plan| plan.plan.log_n += 1);
+        reject_public_plan(&|plan| plan.plan.leaf_class += 1);
+        reject_public_plan(&|plan| plan.plan.tree_number ^= 1);
+        reject_public_plan(&|plan| plan.plan.salt_bytes += 8);
+        reject_public_plan(&|plan| plan.plan.parts[0].main_symbols += E_DEGREE as u64);
+        reject_public_plan(&|plan| {
+            plan.stage_fold
+                .as_mut()
+                .expect("stage fold")
+                .mask_tree
+                .log_n += 1
+        });
+        reject_public_plan(&|plan| {
+            plan.stage_fold
+                .as_mut()
+                .expect("stage fold")
+                .mask_tree
+                .tree_number ^= 1
+        });
         let mut wrong_statement = decoded.clone();
         wrong_statement.statement.table_root = Digest([0x77; 32]);
         assert!(verify(&wrong_statement).is_err());
@@ -6872,6 +7211,102 @@ mod tests {
         .expect("some chain");
         assert_ne!(changed.main_tails, chain.main_tails);
         assert_ne!(changed.salts, chain.salts);
+    }
+
+    #[test]
+    fn the_trusted_public_switch_plans_reject_edited_handoff_fields() {
+        let request = zkie_models_gpt2::lm_head_plan::lm_head_plan().expect("request plan");
+        let compiled =
+            zkie_models_gpt2::lm_head_plan::lm_head_compiled().expect("compiled plan");
+        let answers = u32::try_from(request.samples).expect("answers");
+        let configuration = Digest([0x11; 32]);
+        let run = Digest([0x22; 32]);
+        let master = Digest([0x33; 32]);
+        let last = compiled
+            .once
+            .folded
+            .stages
+            .last()
+            .expect("final stage");
+        let base = BaseStarBinding {
+            plan: RuntimeTreePlan {
+                tree_number: compiled.once_foldeq.base_tree_number,
+                leaf_class: compiled.once_foldeq.base_leaf_class,
+                log_n: last.main.log_n,
+                log_n_zk: last.mask.log_n,
+                parts: vec![RuntimeTreePart {
+                    main_symbols: E_DEGREE as u64,
+                    mask_symbols: E_DEGREE as u64,
+                }],
+                salt_bytes: compiled.once_foldeq.base_salt_bytes,
+                run,
+                configuration,
+            },
+            positions: usize::try_from(last.positions).expect("positions"),
+        };
+        let chain = plan_stage_chain(&compiled, answers, configuration, run, master, &base)
+            .expect("stage chain")
+            .expect("some chain");
+        let plans = LimitedSwitchPlan::from_inputs(Some(&chain));
+        let targets: Vec<SwitchTarget> = plans.iter().map(|plan| plan.target.clone()).collect();
+        let expected = expected_switch_public_plans(&compiled, &targets, configuration)
+            .expect("expected plans");
+        check_switch_public_plans(&expected, &plans).expect("matching plans");
+
+        let mut edited = plans.clone();
+        edited[0].positions += 1;
+        assert!(check_switch_public_plans(&expected, &edited).is_err());
+
+        let mut edited = plans.clone();
+        edited[0].plan.log_n += 1;
+        assert!(check_switch_public_plans(&expected, &edited).is_err());
+
+        let mut edited = plans.clone();
+        edited[0].plan.leaf_class += 1;
+        assert!(check_switch_public_plans(&expected, &edited).is_err());
+
+        let mut edited = plans.clone();
+        edited[0].plan.tree_number ^= 1;
+        assert!(check_switch_public_plans(&expected, &edited).is_err());
+
+        let mut edited = plans.clone();
+        edited[0].plan.salt_bytes += 8;
+        assert!(check_switch_public_plans(&expected, &edited).is_err());
+
+        let mut edited = plans.clone();
+        edited[0].plan.parts[0].main_symbols += E_DEGREE as u64;
+        assert!(check_switch_public_plans(&expected, &edited).is_err());
+
+        let mut edited = plans.clone();
+        edited[0]
+            .stage_fold
+            .as_mut()
+            .expect("stage fold")
+            .mask_tree
+            .log_n += 1;
+        assert!(check_switch_public_plans(&expected, &edited).is_err());
+
+        let mut edited = plans.clone();
+        edited[0]
+            .stage_fold
+            .as_mut()
+            .expect("stage fold")
+            .mask_tree
+            .tree_number ^= 1;
+        assert!(check_switch_public_plans(&expected, &edited).is_err());
+
+        let mut edited = plans.clone();
+        edited[0]
+            .stage_fold
+            .as_mut()
+            .expect("stage fold")
+            .shape
+            .mask_leaf_class += 1;
+        assert!(check_switch_public_plans(&expected, &edited).is_err());
+
+        let mut edited = plans.clone();
+        edited[0].stage_fold = None;
+        assert!(check_switch_public_plans(&expected, &edited).is_err());
     }
 
     #[test]
