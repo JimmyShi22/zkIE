@@ -14,6 +14,7 @@ use zkie_core::error::{Error, Result};
 
 use crate::pcs::request::code::{build_code_plan, CodeParams, MOST_LOG_N};
 use crate::pcs::request::field::E_DEGREE;
+use crate::pcs::request::cs_stage::SWITCH_LEAF_CLASS;
 use crate::pcs::request::params::{LEAF_SALT_MAX_BYTES, LEAF_SALT_MIN_BYTES};
 use crate::pcs::request::table::{index_fault, tree_shape_fault, IndexShape, TableDistances};
 
@@ -400,6 +401,9 @@ pub struct CompiledFoldeq {
     pub w_leaf_class: u32,
     pub shared_split_leaf_class: u32,
     pub own_split_leaf_class: u32,
+    pub base_leaf_class: u32,
+    pub base_tree_number: u64,
+    pub base_salt_bytes: usize,
 }
 
 /// The compiled form of the one-time and batch group sets.
@@ -415,8 +419,29 @@ impl RequestPlan {
     pub fn validate_compiled(&self, compiled: &CompiledPlan) -> Result<()> {
         validate_compiled_lines(&self.once, &compiled.once, self.samples)?;
         validate_compiled_lines(&self.proof, &compiled.proof, self.samples)?;
-        check_compiled_foldeq(self, &compiled.once_foldeq)
+        check_compiled_foldeq(self, &compiled.once_foldeq)?;
+        check_compiled_base(&compiled.once, &compiled.once_foldeq)
     }
+}
+
+/// Checks the last stage's independent masking oracle configuration: the
+/// final stage has no fold variables, its star tree uses the final codes'
+/// depths, and its leaf class differs from the switched oracle's so their
+/// leaves never share a tree.
+fn check_compiled_base(lines: &CompiledLines, shape: &CompiledFoldeq) -> Result<()> {
+    let last = lines.folded.stages.last().ok_or(Error::InvalidConfig)?;
+    if last.k != 0 || last.h != 0 {
+        return Err(Error::InvalidConfig);
+    }
+    if shape.base_tree_number >= (1u64 << 16)
+        || shape.base_salt_bytes < LEAF_SALT_MIN_BYTES
+        || shape.base_salt_bytes > LEAF_SALT_MAX_BYTES
+        || shape.base_salt_bytes % 8 != 0
+        || shape.base_leaf_class == SWITCH_LEAF_CLASS
+    {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(())
 }
 
 /// Checks one compiled set against its lines.

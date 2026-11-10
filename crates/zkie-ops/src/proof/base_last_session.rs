@@ -36,11 +36,25 @@ const STAGE_ROWS: u64 = 26;
 const STAGE_POSITIONS: u64 = 27;
 const STAGE_SEAL: u64 = 28;
 
-/// The private randomness of the BASE masking oracle. The production caller
-/// fills the seed from a cryptographic generator; the module only expands it.
+/// The private randomness of the BASE masking oracle. Tests pass an explicit
+/// fixed seed; production draws the seed from the operating system generator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LastBaseRandomness {
-    pub seed: Digest,
+pub enum LastBaseRandomness {
+    Fixed(Digest),
+    Private,
+}
+
+impl LastBaseRandomness {
+    fn seed(self) -> Result<Digest> {
+        match self {
+            LastBaseRandomness::Fixed(seed) => Ok(seed),
+            LastBaseRandomness::Private => {
+                let mut bytes = [0u8; 32];
+                getrandom::fill(&mut bytes).map_err(|_| Error::EntropyUnavailable)?;
+                Ok(Digest(bytes))
+            }
+        }
+    }
 }
 
 /// The masking oracle's message and random tail: one main row and one mask row.
@@ -74,7 +88,7 @@ fn draw_star(
     rows: &SingleRows,
     randomness: &LastBaseRandomness,
 ) -> Result<LastBaseStar> {
-    let mut coins = ByteMaskCoins::new(randomness.seed)?;
+    let mut coins = ByteMaskCoins::new(randomness.seed()?)?;
     let mut draw = |count: u64| -> Result<Vec<Fp3>> {
         let count = usize::try_from(count).map_err(|_| Error::ResourceLimit)?;
         let mut out = Vec::with_capacity(count);
@@ -645,9 +659,14 @@ mod tests {
     }
 
     fn randomness() -> LastBaseRandomness {
-        LastBaseRandomness {
-            seed: Digest([0x33; 32]),
-        }
+        LastBaseRandomness::Fixed(Digest([0x33; 32]))
+    }
+
+    #[test]
+    fn the_fixed_seed_is_reproducible_and_the_private_source_is_available() {
+        let fixed = LastBaseRandomness::Fixed(Digest([0x44; 32]));
+        assert_eq!(fixed.seed().unwrap(), Digest([0x44; 32]));
+        assert!(LastBaseRandomness::Private.seed().is_ok());
     }
 
     #[test]

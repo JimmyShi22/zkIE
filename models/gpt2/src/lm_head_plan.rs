@@ -219,6 +219,9 @@ pub fn lm_head_compiled() -> Result<CompiledPlan> {
         w_leaf_class: 0,
         shared_split_leaf_class: 2,
         own_split_leaf_class: 3,
+        base_leaf_class: 4,
+        base_tree_number: 0x401,
+        base_salt_bytes: 40,
     };
     Ok(CompiledPlan {
         once: CompiledLines {
@@ -356,6 +359,21 @@ mod tests {
         assert!(plan.validate_compiled(&compiled).is_err());
         let mut compiled = lm_head_compiled().expect("compiled");
         compiled.once_foldeq.shared_split = None;
+        assert!(plan.validate_compiled(&compiled).is_err());
+    }
+
+    #[test]
+    fn a_compiled_base_star_is_checked() {
+        let plan = lm_head_plan().expect("plan");
+        let mut compiled = lm_head_compiled().expect("compiled");
+        compiled.once_foldeq.base_leaf_class =
+            zkie_engine::pcs::request::cs_stage::SWITCH_LEAF_CLASS;
+        assert!(plan.validate_compiled(&compiled).is_err());
+        let mut compiled = lm_head_compiled().expect("compiled");
+        compiled.once_foldeq.base_tree_number = 1 << 16;
+        assert!(plan.validate_compiled(&compiled).is_err());
+        let mut compiled = lm_head_compiled().expect("compiled");
+        compiled.once_foldeq.base_salt_bytes = 32;
         assert!(plan.validate_compiled(&compiled).is_err());
     }
 

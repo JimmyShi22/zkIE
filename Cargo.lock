@@ -786,6 +786,7 @@ name = "zkie-ops"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "getrandom",
  "p3-maybe-rayon",
  "rayon",
  "serde",

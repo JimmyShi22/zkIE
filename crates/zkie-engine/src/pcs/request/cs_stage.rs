@@ -741,6 +741,11 @@ pub fn switched_rows_multi(
 
 /// The runtime tree plan of the multi-row switched oracle message: one part
 /// with `2^k` main rows and `2^h` mask rows over the target's codes.
+/// The leaf class of a switched oracle's message tree. The last stage's
+/// independent masking oracle uses a different class so the two trees never
+/// share leaves.
+pub const SWITCH_LEAF_CLASS: u32 = 7;
+
 pub fn switch_tree_plan_multi(
     tag: u64,
     target: &SwitchTarget,
@@ -750,7 +755,7 @@ pub fn switch_tree_plan_multi(
 ) -> Result<RuntimeTreePlan> {
     let plan = RuntimeTreePlan {
         tree_number: 0x300u64.wrapping_add(tag & 0xff),
-        leaf_class: 7,
+        leaf_class: SWITCH_LEAF_CLASS,
         log_n: target.code.log_n,
         log_n_zk: target.mask_code.log_n,
         parts: vec![RuntimeTreePart {

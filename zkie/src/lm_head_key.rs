@@ -439,6 +439,8 @@ pub struct LimitedSharedSession {
     pub chain: Chain,
     pub first_query: Vec<u8>,
     pub mask: LmHeadMaskProvider,
+    pub base: BaseStarBinding,
+    pub switches: Vec<SwitchTarget>,
 }
 
 /// Builds the binding parameters of the limited key. The plan identifier is
@@ -514,6 +516,46 @@ pub fn build_limited_shared_session(
     if run == Digest::ZERO {
         return Err(Error::InvalidConfig);
     }
+    let answers = u32::try_from(request_plan.samples).map_err(|_| Error::InvalidConfig)?;
+    let mut switches = Vec::with_capacity(compiled.once.folded.stages.len());
+    for stage in &compiled.once.folded.stages {
+        switches.push(SwitchTarget::from_stage(
+            stage.main,
+            stage.mask,
+            stage.k,
+            stage.h,
+            answers,
+        )?);
+    }
+    let last = compiled
+        .once
+        .folded
+        .stages
+        .last()
+        .ok_or(Error::InvalidConfig)?;
+    if last.k != 0 || last.h != 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let base_plan = RuntimeTreePlan {
+        tree_number: compiled.once_foldeq.base_tree_number,
+        leaf_class: compiled.once_foldeq.base_leaf_class,
+        log_n: last.main.log_n,
+        log_n_zk: last.mask.log_n,
+        parts: vec![RuntimeTreePart {
+            main_symbols: E_DEGREE as u64,
+            mask_symbols: E_DEGREE as u64,
+        }],
+        salt_bytes: compiled.once_foldeq.base_salt_bytes,
+        run,
+        configuration,
+    };
+    if base_plan.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let base = BaseStarBinding {
+        plan: base_plan,
+        positions: usize::try_from(last.positions).map_err(|_| Error::ResourceLimit)?,
+    };
 
     let folded = &compiled.once.folded;
     let fold = FoldShape {
@@ -733,6 +775,8 @@ pub fn build_limited_shared_session(
         chain,
         first_query,
         mask,
+        base,
+        switches,
     })
 }
 
@@ -1182,6 +1226,8 @@ pub fn run_limited_shared_to_columns(
     old_mask: Option<&LmHeadOldMaskProvider>,
     switch: Option<LimitedSwitchInputs>,
 ) -> Result<LimitedSharedColumns> {
+    let base_binding = setup.base.clone();
+    let expected_switches = setup.switches.clone();
     let mut session = FoldeqSession::open(setup.plan, setup.binder, setup.chain)?;
     session.bind_first_query(&setup.first_query)?;
     session.draw_gamma()?;
@@ -1396,6 +1442,15 @@ pub fn run_limited_shared_to_columns(
         fold_output = Some(output);
         pending_rows = session.pending_gu_rows().len();
         transcript = *session.transcript_value();
+        if let Some(inputs) = switch.as_ref() {
+            let mut provided = Vec::new();
+            let mut cursor = Some(inputs);
+            while let Some(step) = cursor {
+                provided.push(step.target);
+                cursor = step.next.as_deref();
+            }
+            check_stage_sequence(&expected_switches, &provided)?;
+        }
         if let (Some(inputs), Some(stage0)) = (switch, fold_stage.as_ref()) {
             let mut chain = session.take_chain_for_base()?;
             let mut stage = stage0.clone();
@@ -1489,7 +1544,7 @@ pub fn run_limited_shared_to_columns(
                 let rows = last_stage_single_rows(target, claims, message)?;
                 let prover = LastBaseProver::new(
                     rows.clone(),
-                    base.plan.clone(),
+                    base_binding.plan.clone(),
                     &base.salts,
                     &base.randomness,
                 )?;
@@ -1499,13 +1554,13 @@ pub fn run_limited_shared_to_columns(
                     rows,
                     last.plan().clone(),
                     root,
-                    base.plan.clone(),
+                    base_binding.plan.clone(),
                 )?;
                 session.receive_star(messages.star_root, messages.target_star)?;
                 let lambda = session.draw_lambda()?;
                 let prepared = prover.base_rows(lambda)?;
                 session.receive_rows(prepared)?;
-                let positions = session.draw_base_positions(base.positions)?;
+                let positions = session.draw_base_positions(base_binding.positions)?;
                 let star_opening = prover.open_star(&positions)?;
                 let final_opening = last.open(&positions)?;
                 session.verify_openings(&star_opening, &final_opening)?;
@@ -2412,13 +2467,19 @@ pub fn build_stage_fold_stage(
     })
 }
 
-/// The last-stage BASE inputs: the independent masking oracle's tree plan,
-/// its private randomness and salts, and the number of drawn positions.
+/// The last-stage BASE private inputs: salts and randomness. The masking
+/// oracle's tree plan and position count come from the bound compiled plan.
 #[derive(Clone)]
 pub struct BaseStep {
-    pub plan: RuntimeTreePlan,
     pub salts: Vec<Vec<u8>>,
     pub randomness: LastBaseRandomness,
+}
+
+/// The plan-bound last-stage BASE configuration: the independent masking
+/// oracle's tree plan and the stage's position count.
+#[derive(Clone)]
+pub struct BaseStarBinding {
+    pub plan: RuntimeTreePlan,
     pub positions: usize,
 }
 
@@ -2530,6 +2591,21 @@ fn run_switch(
         prover,
         declared_root,
     })
+}
+
+/// Checks that the switch sequence is exactly the compiled stage sequence:
+/// the same number of switches, in the same order, with the same codes, row
+/// variables and answer count. A skipped, added or reordered stage fails.
+fn check_stage_sequence(expected: &[SwitchTarget], provided: &[SwitchTarget]) -> Result<()> {
+    if expected.len() != provided.len() {
+        return Err(Error::StatementMismatch);
+    }
+    for (want, got) in expected.iter().zip(provided) {
+        if want != got {
+            return Err(Error::StatementMismatch);
+        }
+    }
+    Ok(())
 }
 
 /// Turns the final switched GroupRow into the last stage's SingleRows. The
@@ -3687,13 +3763,6 @@ mod tests {
         )?;
         let first_query = binder.first_query().to_vec();
         let chain = binder.chain()?;
-        let setup = LimitedSharedSession {
-            plan,
-            binder,
-            chain,
-            first_query,
-            mask: fresh_mask,
-        };
         let omega_randomness = LmHeadOmegaRandomness {
             code_tails: vec![vec![Fp3::from_u64(9)]],
             salts: (0..16)
@@ -3721,14 +3790,14 @@ mod tests {
         let mask_tails: Vec<Vec<Fp3>> = (0..4)
             .map(|row| vec![Fp3::from_u64(0x300 + row as u64)])
             .collect();
-        let plan = switch_tree_plan_multi(
+        let switch_plan = switch_tree_plan_multi(
             1,
             &target,
             40,
             Digest([0x41; 32]),
             Digest([0x42; 32]),
         )?;
-        let salts: Vec<Vec<u8>> = (0..plan.columns())
+        let salts: Vec<Vec<u8>> = (0..switch_plan.columns())
             .map(|position| vec![(position as u8) ^ 0x7a; 40])
             .collect();
         let target2 = SwitchTarget::from_stage(next_code, next_mask, 2, 2, 1)?;
@@ -3755,6 +3824,31 @@ mod tests {
         let final_salts: Vec<Vec<u8>> = (0..final_plan.columns())
             .map(|position| vec![(position as u8) ^ 0x7c; 40])
             .collect();
+        let base = BaseStarBinding {
+            plan: RuntimeTreePlan {
+                tree_number: 0x401,
+                leaf_class: 0,
+                log_n: final_code.log_n,
+                log_n_zk: final_mask.log_n,
+                parts: vec![RuntimeTreePart {
+                    main_symbols: 3,
+                    mask_symbols: 3,
+                }],
+                salt_bytes: 40,
+                run: Digest([0x83; 32]),
+                configuration: key.reader.configuration,
+            },
+            positions: 2,
+        };
+        let setup = LimitedSharedSession {
+            plan,
+            binder,
+            chain,
+            first_query,
+            mask: fresh_mask,
+            base,
+            switches: vec![target, target2, final_target],
+        };
         run_limited_shared_to_columns(
             setup,
             &key,
@@ -3764,7 +3858,7 @@ mod tests {
             Some(&old_mask),
             Some(LimitedSwitchInputs {
                 target,
-                plan,
+                plan: switch_plan,
                 main_tails,
                 mask_tails,
                 pad: Fp3::from_u64(0x9a),
@@ -3868,26 +3962,10 @@ mod tests {
                         stage_fold: None,
                         next: None,
                         base: Some(BaseStep {
-                            plan: RuntimeTreePlan {
-                                tree_number: 0x401,
-                                leaf_class: 0,
-                                log_n: final_code.log_n,
-                                log_n_zk: final_mask.log_n,
-                                parts: vec![RuntimeTreePart {
-                                    main_symbols: 3,
-                                    mask_symbols: 3,
-                                }],
-                                salt_bytes: 40,
-                                run: Digest([0x83; 32]),
-                                configuration: key.reader.configuration,
-                            },
                             salts: (0..64)
                                 .map(|position| vec![(position as u8) ^ 0x7d; 40])
                                 .collect(),
-                            randomness: LastBaseRandomness {
-                                seed: Digest([0x81; 32]),
-                            },
-                            positions: 2,
+                            randomness: LastBaseRandomness::Fixed(Digest([0x81; 32])),
                         }),
                     })),
                 })),
@@ -4003,6 +4081,20 @@ mod tests {
         assert_eq!(rows.target, claims.combined.target);
         assert_eq!(rows.main.len(), code.ell as usize);
         assert_eq!(rows.masks.len(), 1);
+    }
+
+    #[test]
+    fn the_stage_sequence_rejects_missing_or_reordered_switches() {
+        use zkie_engine::pcs::request::code::build_code_plan;
+        let code = build_code_plan(5, 4, 1).expect("code");
+        let mask_code = build_code_plan(5, 8, 1).expect("mask code");
+        let first = SwitchTarget::from_stage(code, mask_code, 2, 2, 1).expect("first");
+        let second = SwitchTarget::from_stage(code, mask_code, 1, 1, 1).expect("second");
+        let last = SwitchTarget::from_stage(code, mask_code, 0, 0, 1).expect("last");
+        assert!(check_stage_sequence(&[first, second, last], &[first, last]).is_err());
+        assert!(check_stage_sequence(&[first, second, last], &[second, first, last]).is_err());
+        assert!(check_stage_sequence(&[first, second, last], &[first, second]).is_err());
+        assert!(check_stage_sequence(&[first, second, last], &[first, second, last]).is_ok());
     }
 
     #[test]
