@@ -869,21 +869,51 @@ pub fn validate_shared_sample_seeds(shapes: &[&GuShape], seeds: &[SampleSeed]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pcs::request::binding::{BindingParameters, BindingStatement};
     use crate::pcs::request::code::build_code_plan;
     use crate::pcs::request::fold::{
         FoldShape, OracleMetadata, RuntimeOracles, VerifiedGroup, VerifiedGroups,
         VerifiedStatement,
     };
-    use crate::pcs::request::foldeq::{FoldeqPlan, GammaPath};
+    use crate::pcs::request::foldeq::{
+        reader_table_identity, FoldeqBinding, FoldeqPlan, GammaPath,
+    };
     use crate::pcs::request::gu::{GuNotice, GuOracleShape, GuShape};
     use crate::pcs::request::read::ReadLedger;
     use crate::pcs::request::runtime_tree::MaskTreePlan;
     use crate::pcs::request::table::commit_table;
     use std::sync::{Arc, Mutex};
-    use crate::pcs::request::params::LEAF_SALT_MIN_BYTES;
+    use crate::pcs::request::params::{RequestParams, LEAF_SALT_MIN_BYTES};
     use crate::pcs::request::runtime_tree::{RuntimeTreePart, RuntimeTreePlan};
     use crate::pcs::request::table::{index_name, IndexShape, TableDistances};
+    use zkie_core::proof_header::PROOF_VERSION_WORD;
     use zkie_core::types::Digest;
+
+    fn binding_parameters(shape: &IndexShape) -> BindingParameters {
+        let request_parameters =
+            RequestParams::default_with_code(shape.code.log_n, shape.code.ell, shape.code.r)
+                .unwrap();
+        BindingParameters::new(
+            PROOF_VERSION_WORD,
+            Digest([0x61; 32]),
+            &request_parameters,
+            Digest([0x62; 32]),
+        )
+        .unwrap()
+    }
+
+    fn binding_for(reader: &crate::pcs::request::table::IndexReader) -> FoldeqBinding {
+        let parameters = binding_parameters(&reader.shape);
+        let statement = BindingStatement::new(
+            PROOF_VERSION_WORD,
+            Digest([0x61; 32]),
+            b"case".to_vec(),
+            Digest([0x63; 32]),
+            reader_table_identity(reader).unwrap(),
+        )
+        .unwrap();
+        FoldeqBinding::new(&parameters, statement, reader).unwrap()
+    }
 
     fn index_shape() -> IndexShape {
         IndexShape {
@@ -2531,7 +2561,8 @@ mod tests {
         let salts: Vec<Vec<u8>> = (0..index.code.n() as usize)
             .map(|position| vec![(position as u8).wrapping_add(1); index.salt_bytes])
             .collect();
-        let table = commit_table(index, Digest([7; 32]), &messages, &tails, &salts).unwrap();
+        let configuration = binding_parameters(&index).digest().unwrap();
+        let table = commit_table(index, configuration, &messages, &tails, &salts).unwrap();
         let fold = FoldShape {
             code: build_code_plan(3, 4, 1).unwrap(),
             mask_code: build_code_plan(3, 4, 1).unwrap(),
@@ -2573,6 +2604,7 @@ mod tests {
         );
         FoldeqPlan {
             reader: table.reader.clone(),
+            binding: binding_for(&table.reader),
             fold,
             statement,
             oracles: Arc::new(Mutex::new(RuntimeOracles::default())),

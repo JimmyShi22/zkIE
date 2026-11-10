@@ -6,15 +6,16 @@ use std::time::Instant;
 
 use zkie_core::types::Digest;
 use zkie_engine::pcs::request::field::Fp3;
+use zkie_engine::pcs::request::foldeq::reader_table_identity;
 use zkie_engine::pcs::request::relation::{foldeq_weights, GuRelationKind, GuRelationRow};
 use zkie_engine::pcs::request::table::verify_columns;
 use zkie_ops::proof::column_session::{
     build_authenticated_encoding_table_with_configuration, check_full_columns, check_merge_targets,
-    open_columns_for_queries, verify_column_session,
+    open_columns_for_queries, verify_column_session, ColumnBindingInput,
 };
 use zkie_ops::proof::model_commitment::{ModelCommitmentPublic, SharedTrace};
 use zkie_ops::proof::session_baseline::{
-    assemble_binding, verify_selected_step, SelectedMatmulStep, TrustedModel,
+    verify_selected_step, SelectedMatmulStep, TrustedModel,
 };
 
 #[test]
@@ -48,13 +49,13 @@ fn selected_gpt2_column_verification_components() {
         control_started.elapsed().as_millis()
     );
 
-    let binding = assemble_binding(&public, &plan, &selection).unwrap();
+    let input = ColumnBindingInput::demo().unwrap();
     let asset_path = "gpt2/weights/lm_head_w_i32.bin";
     let started = Instant::now();
     let outcome = verify_column_session(
         &public,
         &trusted,
-        &binding,
+        &input,
         asset_path,
         &trace.assets[192],
     )
@@ -89,10 +90,18 @@ fn selected_gpt2_column_verification_components() {
         &trusted,
         asset_path,
         &trace.assets[192],
-        binding.first_query,
+        input.parameters.digest().unwrap(),
     )
     .unwrap();
     assert_eq!(table.reader.root, outcome.table_root);
+    assert_eq!(
+        outcome.binding_parameters_digest,
+        input.parameters.digest().unwrap()
+    );
+    assert_eq!(
+        outcome.binding_table_identity,
+        reader_table_identity(&table.reader).unwrap()
+    );
     let openings = open_columns_for_queries(&table, &outcome.queries).unwrap();
     let positions = zkie_engine::pcs::request::read::unique_sorted(&outcome.queries);
     let unique: Vec<_> = positions
@@ -163,14 +172,14 @@ fn selected_gpt2_column_verification_components() {
         &trusted,
         asset_path,
         &root_tamper,
-        binding.first_query
+        input.parameters.digest().unwrap()
     )
     .is_err());
 
     assert!(verify_column_session(
         &public,
         &trusted,
-        &binding,
+        &input,
         asset_path,
         &trace.assets[192]
     )

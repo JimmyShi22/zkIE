@@ -33,9 +33,11 @@
 
 use std::sync::{Arc, Mutex};
 
+use zkie_core::artifact::digest_bytes;
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
 
+use crate::pcs::request::binding::{BindingParameters, BindingStatement};
 use crate::pcs::request::chain::{
     Chain, KIND_ALGEBRAIC, KIND_EPSILON, KIND_EMPTY, KIND_POSITIONS, KIND_SEAL, KIND_SEED,
 };
@@ -211,6 +213,106 @@ pub struct LinShapeBinding {
     pub k_col: u32,
 }
 
+/// The maximum canonical statement length admitted into a first query.
+pub const MAX_BINDING_STATEMENT_BYTES: usize = 1 << 20;
+
+/// The verifier-side typed binding prefix for one FOLDEQ plan.
+///
+/// The parameters digest is the table/chain configuration; the statement is
+/// canonically encoded from the typed 2b statement after the reader exists.
+/// The statement's table identity must equal the reader's actual root, shape,
+/// configuration and record. The bytes are constructed here, never supplied
+/// as an untyped prover string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoldeqBinding {
+    parameters_digest: Digest,
+    version_word: u32,
+    protocol_identity: Digest,
+    statement_bytes: Vec<u8>,
+    table_identity: Digest,
+}
+
+impl FoldeqBinding {
+    pub fn new(
+        parameters: &BindingParameters,
+        statement: BindingStatement,
+        reader: &IndexReader,
+    ) -> Result<Self> {
+        parameters.validate()?;
+        statement.validate()?;
+        if statement.version_word != parameters.version_word
+            || statement.protocol_identity != parameters.protocol_identity
+        {
+            return Err(Error::StatementMismatch);
+        }
+        let table_identity = reader_table_identity(reader)?;
+        if statement.table_identity != table_identity {
+            return Err(Error::StatementMismatch);
+        }
+        let statement_bytes = statement.canonical_bytes()?;
+        if statement_bytes.is_empty() || statement_bytes.len() > MAX_BINDING_STATEMENT_BYTES {
+            return Err(Error::ResourceLimit);
+        }
+        Ok(Self {
+            parameters_digest: parameters.digest()?,
+            version_word: parameters.version_word,
+            protocol_identity: parameters.protocol_identity,
+            statement_bytes,
+            table_identity,
+        })
+    }
+
+    pub fn parameters_digest(&self) -> Digest {
+        self.parameters_digest
+    }
+
+    pub fn version_word(&self) -> u32 {
+        self.version_word
+    }
+
+    pub fn protocol_identity(&self) -> Digest {
+        self.protocol_identity
+    }
+
+    pub fn statement_bytes(&self) -> &[u8] {
+        &self.statement_bytes
+    }
+
+    pub fn table_identity(&self) -> Digest {
+        self.table_identity
+    }
+}
+
+/// The reader's actual table identity: root, shape, configuration and record.
+/// This is the value a binding statement must name; it is not a separate
+/// caller-supplied identity.
+pub fn reader_table_identity(reader: &IndexReader) -> Result<Digest> {
+    if reader.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let mut writer = CanonicalWriter::new();
+    writer.put_digest(&reader.root);
+    writer.put_digest(&reader.configuration);
+    for value in [
+        reader.shape.code.log_n as u64,
+        reader.shape.code.ell,
+        reader.shape.code.r,
+        reader.shape.v as u64,
+        reader.shape.answers as u64,
+        reader.shape.salt_bytes as u64,
+    ] {
+        writer.put_u64(value);
+    }
+    writer.put_bytes(
+        &IndexName {
+            commitment: reader.commitment(),
+            record: reader.record.clone(),
+        }
+        .encode(),
+    );
+    Ok(digest_bytes(&writer.into_bytes()))
+}
+
 /// The verifier's FOLDEQ plan. The reader is the committed table, the fold and
 /// runtime mask-tree layouts and the group registry come from the statement,
 /// and the seed/read budgets and column draw count come from the plan. None of
@@ -219,6 +321,10 @@ pub struct LinShapeBinding {
 #[derive(Clone, Debug)]
 pub struct FoldeqPlan {
     pub reader: IndexReader,
+    /// The required typed binding for this plan. The statement bytes are part
+    /// of the first query; the parameters digest must equal the reader's
+    /// configuration. There is no unbound production form.
+    pub binding: FoldeqBinding,
     pub fold: FoldShape,
     pub statement: Arc<VerifiedStatement>,
     pub oracles: Arc<Mutex<RuntimeOracles>>,
@@ -242,6 +348,21 @@ impl FoldeqPlan {
     pub fn fault(&self) -> Option<&'static str> {
         if let Some(fault) = self.reader.fault() {
             return Some(fault);
+        }
+        if self.binding.parameters_digest != self.reader.configuration {
+            return Some("the binding parameters are not the table configuration");
+        }
+        let expected_identity = match reader_table_identity(&self.reader) {
+            Ok(identity) => identity,
+            Err(_) => return Some("the reader has no table identity"),
+        };
+        if self.binding.table_identity != expected_identity {
+            return Some("the binding table identity is not the reader's");
+        }
+        if self.binding.statement_bytes.is_empty()
+            || self.binding.statement_bytes.len() > MAX_BINDING_STATEMENT_BYTES
+        {
+            return Some("the binding statement has no admitted bytes");
         }
         if let Some(fault) = fold_mask_shape_fault(&self.fold) {
             return Some(fault);
@@ -366,6 +487,10 @@ impl FoldeqPlan {
             }
             .encode(),
         );
+        // The typed binding statement, after the reader root/record and before
+        // the verified statement id. The parameters digest is the binder's
+        // parameter value, not these bytes.
+        writer.put_bytes(&self.binding.statement_bytes);
         // The trusted table and fold shapes. Distances are the first-query
         // exception and stay plan values; the configuration is the binder's
         // parameters digest, not this statement.
@@ -1371,7 +1496,10 @@ mod tests {
         MaskOracle, OracleMetadata, RuntimeOracles, VerifiedGroup, VerifiedGroups,
         VerifiedStatement,
     };
-    use crate::pcs::request::params::{LEAF_SALT_MIN_BYTES, REQUEST_CHAIN_LABEL};
+    use crate::pcs::request::binding::{BindingParameters, BindingStatement};
+    use crate::pcs::request::params::{
+        RequestParams, LEAF_SALT_MIN_BYTES, REQUEST_CHAIN_LABEL,
+    };
     use crate::pcs::request::gu::{GuNotice, GuOracleShape, GuRegistry, GuShape};
     use crate::pcs::request::read::{unique_sorted, HidingState, ProverReads};
     use crate::pcs::request::relation::{gu_table, GuRelationKind, GuWitness};
@@ -1382,6 +1510,42 @@ mod tests {
     };
     use crate::primitives::transcript::{hash_labeled, tag_word, TEST_COINS};
     use zkie_core::common::field::PrimeCharacteristicRing;
+    use zkie_core::proof_header::PROOF_VERSION_WORD;
+
+    fn binding_parameters(shape: &IndexShape) -> BindingParameters {
+        let request_parameters =
+            RequestParams::default_with_code(shape.code.log_n, shape.code.ell, shape.code.r)
+                .unwrap();
+        BindingParameters::new(
+            PROOF_VERSION_WORD,
+            Digest([0x61; 32]),
+            &request_parameters,
+            Digest([0x62; 32]),
+        )
+        .unwrap()
+    }
+
+    fn binding_with(
+        reader: &IndexReader,
+        parameters: &BindingParameters,
+        case_id: &[u8],
+        request_id: Digest,
+    ) -> FoldeqBinding {
+        let statement = BindingStatement::new(
+            parameters.version_word,
+            parameters.protocol_identity,
+            case_id.to_vec(),
+            request_id,
+            reader_table_identity(reader).unwrap(),
+        )
+        .unwrap();
+        FoldeqBinding::new(parameters, statement, reader).unwrap()
+    }
+
+    fn binding_for(reader: &IndexReader) -> FoldeqBinding {
+        let parameters = binding_parameters(&reader.shape);
+        binding_with(reader, &parameters, b"case", Digest([0x63; 32]))
+    }
 
     fn shape() -> IndexShape {
         IndexShape {
@@ -1418,7 +1582,8 @@ mod tests {
         let salts: Vec<Vec<u8>> = (0..shape.code.n() as usize)
             .map(|position| vec![(position as u8).wrapping_add(1); shape.salt_bytes])
             .collect();
-        commit_table(shape, Digest([7; 32]), &messages, &tails, &salts).unwrap()
+        let configuration = binding_parameters(&shape).digest().unwrap();
+        commit_table(shape, configuration, &messages, &tails, &salts).unwrap()
     }
 
     fn fold_shape() -> FoldShape {
@@ -1629,6 +1794,7 @@ mod tests {
         );
         let plan = FoldeqPlan {
             reader: table.reader.clone(),
+            binding: binding_for(&table.reader),
             fold: fold_shape(),
             statement,
             oracles: Arc::new(Mutex::new(RuntimeOracles::default())),
@@ -2030,6 +2196,192 @@ mod tests {
         session.bind_first_query(&own).unwrap();
     }
 
+    fn gamma_for(plan: FoldeqPlan) -> Vec<Fp3> {
+        let binder = FoldeqBinder::new(
+            REQUEST_CHAIN_LABEL,
+            plan.reader.configuration,
+            &plan,
+        )
+        .unwrap();
+        let chain = binder.chain().unwrap();
+        let mut session = FoldeqSession::open(plan, binder, chain).unwrap();
+        let first = session.plan().first_query();
+        session.bind_first_query(&first).unwrap();
+        session.draw_gamma().unwrap();
+        session.gamma().unwrap().to_vec()
+    }
+
+    #[test]
+    fn binding_identity_and_canonical_fields_are_checked() {
+        let table = committed();
+        let reader = &table.reader;
+        let parameters = binding_parameters(&reader.shape);
+        let identity = reader_table_identity(reader).unwrap();
+        let good = BindingStatement::new(
+            PROOF_VERSION_WORD,
+            parameters.protocol_identity,
+            b"case".to_vec(),
+            Digest([0x63; 32]),
+            identity,
+        )
+        .unwrap();
+        assert!(FoldeqBinding::new(&parameters, good.clone(), reader).is_ok());
+
+        let mut changed_identity = good.clone();
+        changed_identity.table_identity = Digest([0x64; 32]);
+        assert!(FoldeqBinding::new(&parameters, changed_identity, reader).is_err());
+
+        let mut changed_protocol = good.clone();
+        changed_protocol.protocol_identity = Digest([0x65; 32]);
+        assert!(FoldeqBinding::new(&parameters, changed_protocol, reader).is_err());
+
+        assert!(BindingStatement::new(
+            PROOF_VERSION_WORD,
+            parameters.protocol_identity,
+            Vec::<u8>::new(),
+            Digest([0x63; 32]),
+            identity,
+        )
+        .is_err());
+        assert!(BindingStatement::new(
+            PROOF_VERSION_WORD,
+            parameters.protocol_identity,
+            b"case".to_vec(),
+            Digest::ZERO,
+            identity,
+        )
+        .is_err());
+        let huge = BindingStatement::new(
+            PROOF_VERSION_WORD,
+            parameters.protocol_identity,
+            vec![b'a'; MAX_BINDING_STATEMENT_BYTES + 1],
+            Digest([0x63; 32]),
+            identity,
+        )
+        .unwrap();
+        assert!(FoldeqBinding::new(&parameters, huge, reader).is_err());
+    }
+
+    #[test]
+    fn five_binding_inputs_change_the_actual_session_prefix_or_first_challenge() {
+        let (plan, _table) = plan_fixture();
+        let parameters = binding_parameters(&plan.reader.shape);
+        let base_first = plan.first_query();
+        let base_start = *FoldeqBinder::new(
+            REQUEST_CHAIN_LABEL,
+            plan.reader.configuration,
+            &plan,
+        )
+        .unwrap()
+        .start();
+        let base_gamma = gamma_for(plan.clone());
+        let request = Digest([0x63; 32]);
+
+        let mut case_plan = plan.clone();
+        case_plan.binding =
+            binding_with(&case_plan.reader, &parameters, b"other-case", request);
+        assert_ne!(base_first, case_plan.first_query());
+        assert_ne!(
+            base_gamma,
+            gamma_for(case_plan.clone())
+        );
+
+        let mut request_plan = plan.clone();
+        request_plan.binding =
+            binding_with(&request_plan.reader, &parameters, b"case", Digest([0x66; 32]));
+        assert_ne!(base_first, request_plan.first_query());
+        assert_ne!(base_gamma, gamma_for(request_plan.clone()));
+
+        let mut root_plan = plan.clone();
+        root_plan.reader.root = Digest([0x67; 32]);
+        root_plan.binding = binding_with(&root_plan.reader, &parameters, b"case", request);
+        assert_ne!(base_first, root_plan.first_query());
+        assert_ne!(base_gamma, gamma_for(root_plan.clone()));
+
+        let mut record_plan = plan.clone();
+        record_plan.reader.record.y[0] =
+            record_plan.reader.record.y[0].add(&Fp3::ONE);
+        record_plan.binding =
+            binding_with(&record_plan.reader, &parameters, b"case", request);
+        assert_ne!(base_first, record_plan.first_query());
+        assert_ne!(base_gamma, gamma_for(record_plan.clone()));
+
+        let mut config_plan = plan.clone();
+        let changed_parameters = BindingParameters::new(
+            PROOF_VERSION_WORD,
+            parameters.protocol_identity,
+            &RequestParams::default_with_code(
+                plan.reader.shape.code.log_n,
+                plan.reader.shape.code.ell,
+                plan.reader.shape.code.r,
+            )
+            .unwrap(),
+            Digest([0x68; 32]),
+        )
+        .unwrap();
+        config_plan.reader.configuration = changed_parameters.digest().unwrap();
+        config_plan.binding = binding_with(
+            &config_plan.reader,
+            &changed_parameters,
+            b"case",
+            request,
+        );
+        assert_ne!(base_first, config_plan.first_query());
+        assert_ne!(base_gamma, gamma_for(config_plan.clone()));
+        assert_ne!(
+            base_start,
+            *FoldeqBinder::new(
+                REQUEST_CHAIN_LABEL,
+                config_plan.reader.configuration,
+                &config_plan,
+            )
+            .unwrap()
+            .start()
+        );
+    }
+
+    #[test]
+    fn plan_and_binding_substitution_is_rejected_at_open_and_bind() {
+        let (plan, _table) = plan_fixture();
+        let parameters = binding_parameters(&plan.reader.shape);
+        let binder = FoldeqBinder::new(
+            REQUEST_CHAIN_LABEL,
+            plan.reader.configuration,
+            &plan,
+        )
+        .unwrap();
+        let chain = binder.chain().unwrap();
+        let mut changed = plan.clone();
+        changed.binding =
+            binding_with(&changed.reader, &parameters, b"other-case", Digest([0x63; 32]));
+        assert!(FoldeqSession::open(changed, binder, chain).is_err());
+
+        let binder = FoldeqBinder::new(
+            REQUEST_CHAIN_LABEL,
+            plan.reader.configuration,
+            &plan,
+        )
+        .unwrap();
+        let chain = binder.chain().unwrap();
+        let mut session = FoldeqSession::open(plan.clone(), binder, chain).unwrap();
+        assert!(session.bind_first_query(&plan.first_query()).is_ok());
+
+        let binder = FoldeqBinder::new(
+            REQUEST_CHAIN_LABEL,
+            plan.reader.configuration,
+            &plan,
+        )
+        .unwrap();
+        let chain = binder.chain().unwrap();
+        let mut replaced_reader = plan.clone();
+        replaced_reader.reader.root = Digest([0x69; 32]);
+        assert!(FoldeqSession::open(replaced_reader, binder, chain).is_err());
+        let mut other = plan.clone();
+        other.binding =
+            binding_with(&other.reader, &parameters, b"other-case", Digest([0x63; 32]));
+        assert!(session.bind_first_query(&other.first_query()).is_err());
+    }
+
     #[test]
     fn lin_gamma_is_the_psi_suffix() {
         let psi = vec![
@@ -2353,23 +2705,25 @@ mod tests {
         let (mut plan, _table) = plan_fixture();
         // A shape whose plain width admits the largest row count; only the
         // numbers are built, no row or matrix is allocated.
-        plan.reader = IndexReader {
-            shape: IndexShape {
-                code: build_code_plan(32, (1u64 << 30) + 3, 1).unwrap(),
-                v: 0,
-                answers: 1,
-                salt_bytes: LEAF_SALT_MIN_BYTES,
-                distances: TableDistances {
-                    radius: 0,
-                    later_radius: 0,
-                    m_once: 0,
-                    m_later: 0,
-                },
+        let reader_shape = IndexShape {
+            code: build_code_plan(32, (1u64 << 30) + 3, 1).unwrap(),
+            v: 0,
+            answers: 1,
+            salt_bytes: LEAF_SALT_MIN_BYTES,
+            distances: TableDistances {
+                radius: 0,
+                later_radius: 0,
+                m_once: 0,
+                m_later: 0,
             },
-            configuration: Digest([9; 32]),
+        };
+        plan.reader = IndexReader {
+            shape: reader_shape,
+            configuration: binding_parameters(&reader_shape).digest().unwrap(),
             root: Digest([7; 32]),
             record: IndexRecord { y: vec![Fp3::ZERO] },
         };
+        plan.binding = binding_for(&plan.reader);
         plan.gamma_path = GammaPath::Lin {
             shape: LinShapeBinding { matrix_rows: 1u64 << 30, k_lo: 0, k_col: 0 },
         };

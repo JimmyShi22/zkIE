@@ -161,6 +161,14 @@ impl BindingStatement {
         writer.put_digest(&self.table_identity);
         writer.into_bytes()
     }
+
+    /// The canonical statement bytes for a session prefix. The statement is
+    /// validated first; the returned bytes are the typed encoding, not a
+    /// caller-supplied byte string.
+    pub(crate) fn canonical_bytes(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        Ok(self.encode())
+    }
 }
 
 /// The assembled candidate. It is not a production acceptance object.

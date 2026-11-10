@@ -33,10 +33,15 @@
 //! in the table. This is an expensive isolation control, not evidence that the
 //! production mmap/ranged commit or memory path is closed. The message layout,
 //! zero padding, zero tails, deterministic salts and the slice mapping are
-//! demonstration choices and are replaceable. The existing binding candidate's
-//! first-query digest is used as the table/chain configuration; its protocol
-//! identity and request parameters are demo placeholders. The G_u
-//! runtime-tree starts and the FOLD fresh root are also demo placeholders.
+//! demonstration choices and are replaceable. The table/chain configuration is
+//! an independently constructed candidate parameters digest (version word,
+//! candidate protocol identity, request parameters and plan identifier). The
+//! typed 2b statement is built only after the reader exists and enters the
+//! plan's first query before gamma; its table identity is the reader's actual
+//! root, shape, configuration and record. The request id and case id are
+//! explicit placeholders: this does not claim a real request identity or that
+//! different real requests are distinguished. The G_u runtime-tree starts and
+//! the FOLD fresh root are also demo placeholders.
 //!
 //! The asset-to-FOLD witness derivation interface remains unclosed: there is
 //! no public construction path from an authenticated asset table to the FOLD
@@ -56,8 +61,9 @@ use std::sync::{Arc, Mutex};
 
 use zkie_core::common::field::PrimeCharacteristicRing;
 use zkie_core::error::{Error, Result};
+use zkie_core::proof_header::PROOF_VERSION_WORD;
 use zkie_core::types::Digest;
-use zkie_engine::pcs::request::binding::BindingCandidate;
+use zkie_engine::pcs::request::binding::{BindingParameters, BindingStatement};
 use zkie_engine::pcs::request::chain::Chain;
 use zkie_engine::pcs::request::code::{build_code_plan, encode_row_fp, CodeParams};
 use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE};
@@ -66,9 +72,11 @@ use zkie_engine::pcs::request::fold::{
     FoldOutput, FoldShape, FoldStartMessage, OracleMetadata, RuntimeOracles,
     VerifiedGroup, VerifiedGroups, VerifiedStatement,
 };
-use zkie_engine::pcs::request::foldeq::{FoldeqBinder, FoldeqPlan, FoldeqSession, GammaPath};
+use zkie_engine::pcs::request::foldeq::{
+    reader_table_identity, FoldeqBinder, FoldeqBinding, FoldeqPlan, FoldeqSession, GammaPath,
+};
 use zkie_engine::pcs::request::gu::{GuOracleShape, GuShape};
-use zkie_engine::pcs::request::params::{LEAF_SALT_MIN_BYTES, REQUEST_CHAIN_LABEL};
+use zkie_engine::pcs::request::params::{RequestParams, LEAF_SALT_MIN_BYTES, REQUEST_CHAIN_LABEL};
 use zkie_engine::pcs::request::read::{unique_sorted, HidingState, ReadLedger};
 use zkie_engine::pcs::request::relation::{foldeq_weights, GuRelationKind, GuRelationRow};
 use zkie_engine::pcs::request::runtime_tree::{MaskTreePlan, RuntimeTreePart, RuntimeTreePlan};
@@ -82,6 +90,10 @@ use crate::proof::model_commitment::{
 use crate::proof::session_baseline::TrustedModel;
 
 const TABLE_CONFIGURATION: Digest = Digest([0x5a; 32]);
+const SESSION_PROTOCOL_IDENTITY: Digest = Digest([0x53; 32]);
+const PLAN_IDENTIFIER: Digest = Digest([0x54; 32]);
+const DEMO_REQUEST_ID: Digest = Digest([0x52; 32]);
+const DEMO_CASE_ID: &[u8] = b"demo-column-case";
 const GU_NOTICE_ROOT: Digest = Digest([0x47; 32]);
 const FRESH_MASK_ROOT: Digest = Digest([0x46; 32]);
 
@@ -128,9 +140,40 @@ pub struct TableComparison {
     pub matches: bool,
 }
 
+/// The independent candidate configuration for the column session. The
+/// parameters are built from the version word, protocol identity, request
+/// parameters and plan identifier; the statement is built only after the
+/// reader exists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnBindingInput {
+    pub parameters: BindingParameters,
+    pub case_id: Vec<u8>,
+    pub request_id: Digest,
+}
+
+impl ColumnBindingInput {
+    pub fn demo() -> Result<Self> {
+        let request_parameters =
+            RequestParams::default_with_code(TABLE_LOG_N, TABLE_ELL, TABLE_R)?;
+        let parameters = BindingParameters::new(
+            PROOF_VERSION_WORD,
+            SESSION_PROTOCOL_IDENTITY,
+            &request_parameters,
+            PLAN_IDENTIFIER,
+        )?;
+        Ok(Self {
+            parameters,
+            case_id: DEMO_CASE_ID.to_vec(),
+            request_id: DEMO_REQUEST_ID,
+        })
+    }
+}
+
 /// One session run. This is a component harness result, not an accepted proof.
 struct SessionRun {
     gu_root: Digest,
+    binding_parameters_digest: Digest,
+    binding_table_identity: Digest,
     gamma: Vec<Fp3>,
     eq_gamma: Vec<Fp3>,
     queries: Vec<u64>,
@@ -151,6 +194,8 @@ pub struct ColumnSessionOutcome {
     pub table_root: Digest,
     pub gu_root: Digest,
     pub shape: IndexShape,
+    pub binding_parameters_digest: Digest,
+    pub binding_table_identity: Digest,
     pub queries: Vec<u64>,
     pub opened_positions: Vec<u64>,
     pub gamma: Vec<Fp3>,
@@ -237,10 +282,10 @@ pub fn build_authenticated_encoding_table(
 }
 
 /// The same table construction with the caller's table configuration. The
-/// candidate binding's first-query digest is the configuration used by the
-/// session entry; this keeps the existing binding candidate in the transcript
-/// while the fixed demo configuration remains available for the isolated
-/// component probes.
+/// independent candidate parameters digest is the configuration used by the
+/// session entry; the fixed demo configuration remains available for isolated
+/// component probes. The table root and record are produced after this
+/// configuration and are never part of it.
 pub fn build_authenticated_encoding_table_with_configuration(
     public: &ModelCommitmentPublic,
     trusted: &TrustedModel<'_>,
@@ -555,6 +600,21 @@ fn demo_mask_tree() -> Result<MaskTreePlan> {
     Ok(tree)
 }
 
+fn bind_table(
+    table: &AssetEncodingTable,
+    input: &ColumnBindingInput,
+) -> Result<FoldeqBinding> {
+    let table_identity = reader_table_identity(&table.reader)?;
+    let statement = BindingStatement::new(
+        input.parameters.version_word,
+        input.parameters.protocol_identity,
+        input.case_id.clone(),
+        input.request_id,
+        table_identity,
+    )?;
+    FoldeqBinding::new(&input.parameters, statement, &table.reader)
+}
+
 struct DemoSetup {
     plan: FoldeqPlan,
     binder: FoldeqBinder,
@@ -565,7 +625,7 @@ struct DemoSetup {
     fold_start: FoldStartMessage,
 }
 
-fn build_demo_setup(table: &AssetEncodingTable) -> Result<DemoSetup> {
+fn build_demo_setup(table: &AssetEncodingTable, binding: FoldeqBinding) -> Result<DemoSetup> {
     let fold_shape = demo_fold_shape(table.shape)?;
     let gu_shape = demo_gu_shape(table.shape, fold_shape.mask_code)?;
     let fold_layout = demo_fold_layout(&fold_shape)?;
@@ -604,6 +664,7 @@ fn build_demo_setup(table: &AssetEncodingTable) -> Result<DemoSetup> {
     let ledger = Arc::new(Mutex::new(ReadLedger::new(DRAW_COUNT as u64)));
     let plan = FoldeqPlan {
         reader: table.reader.clone(),
+        binding,
         fold: fold_shape,
         statement,
         oracles: Arc::new(Mutex::new(oracles)),
@@ -646,13 +707,31 @@ fn build_demo_setup(table: &AssetEncodingTable) -> Result<DemoSetup> {
     })
 }
 
+/// Runs the candidate FOLDEQ session with the fixed G_u root and the demo
+/// binding. The same path as `run_session` with a default input.
+#[cfg(test)]
+fn run_session_with_demo_binding(
+    table: &AssetEncodingTable,
+    gu_root: &Digest,
+) -> Result<SessionRun> {
+    let input = ColumnBindingInput::demo()?;
+    let binding = bind_table(table, &input)?;
+    run_session(table, gu_root, binding)
+}
+
 /// Runs the candidate FOLDEQ session with the fixed G_u root. The root is an
 /// immutable reference: the same value is sent in the G_u message and carried
 /// into the run result, so the fixed root and the used root are the same value.
 /// The session derives gamma before G_u, sends G_u before drawing columns, and
 /// only then reads and verifies the columns.
-fn run_session(table: &AssetEncodingTable, gu_root: &Digest) -> Result<SessionRun> {
-    let setup = build_demo_setup(table)?;
+fn run_session(
+    table: &AssetEncodingTable,
+    gu_root: &Digest,
+    binding: FoldeqBinding,
+) -> Result<SessionRun> {
+    let binding_parameters_digest = binding.parameters_digest();
+    let binding_table_identity = binding.table_identity();
+    let setup = build_demo_setup(table, binding)?;
     let mut session =
         FoldeqSession::open(setup.plan, setup.binder, setup.chain)?;
     session.bind_first_query(&setup.first_query)?;
@@ -695,6 +774,8 @@ fn run_session(table: &AssetEncodingTable, gu_root: &Digest) -> Result<SessionRu
 
     Ok(SessionRun {
         gu_root: *gu_root,
+        binding_parameters_digest,
+        binding_table_identity,
         gamma,
         eq_gamma,
         queries,
@@ -715,22 +796,24 @@ fn run_session(table: &AssetEncodingTable, gu_root: &Digest) -> Result<SessionRu
 pub fn verify_column_session(
     public: &ModelCommitmentPublic,
     trusted: &TrustedModel<'_>,
-    binding: &BindingCandidate,
+    input: &ColumnBindingInput,
     asset_path: &str,
     opening: &AssetOpening,
 ) -> Result<ColumnSessionOutcome> {
-    // The existing binding candidate supplies the chain/table configuration.
-    // Its protocol identity and request parameters are demo placeholders, not
-    // real protocol values.
+    // The independent candidate parameters are the table/chain configuration;
+    // the table root/record are produced after it, and the typed statement is
+    // built only from the resulting reader.
+    let parameters_digest = input.parameters.digest()?;
     let table = build_authenticated_encoding_table_with_configuration(
         public,
         trusted,
         asset_path,
         opening,
-        binding.first_query,
+        parameters_digest,
     )?;
+    let binding = bind_table(&table, input)?;
     let gu_root = GU_NOTICE_ROOT;
-    let run = run_session(&table, &gu_root)?;
+    let run = run_session(&table, &gu_root, binding)?;
     if run.gu_root != gu_root
         || !run.merge_targets
         || !run.comparison.matches
@@ -745,6 +828,8 @@ pub fn verify_column_session(
         table_root: table.reader.root,
         gu_root: run.gu_root,
         shape: table.shape,
+        binding_parameters_digest: run.binding_parameters_digest,
+        binding_table_identity: run.binding_table_identity,
         queries: run.queries,
         opened_positions: run.opened_positions,
         gamma: run.gamma,
@@ -768,10 +853,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use zkie_core::proof_header::PROOF_VERSION_WORD;
-    use zkie_engine::pcs::request::binding::{assemble, BindingParameters, BindingStatement};
     use zkie_engine::pcs::request::gu::{GuMembership, GuNotice, GuRegistry};
-    use zkie_engine::pcs::request::params::RequestParams;
     use zkie_engine::pcs::request::table::verify_columns;
 
     use crate::proof::model_commitment::{commit_assets, AssetStore, ModelAssetSpec};
@@ -797,36 +879,13 @@ mod tests {
         anchor_id: Digest,
         model_id: Digest,
         parameters_digest: Digest,
-        binding: BindingCandidate,
+        input: ColumnBindingInput,
     }
 
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
-    }
-
-    fn binding(public: &ModelCommitmentPublic) -> BindingCandidate {
-        let request_parameters =
-            RequestParams::default_with_code(TABLE_LOG_N, TABLE_ELL, TABLE_R).unwrap();
-        let plan_digest = Digest([0x33; 32]);
-        let protocol_identity = Digest([0x44; 32]);
-        let parameters = BindingParameters::with_plan_parts(
-            PROOF_VERSION_WORD,
-            protocol_identity,
-            &request_parameters,
-            &[plan_digest],
-        )
-        .unwrap();
-        let statement = BindingStatement::new(
-            PROOF_VERSION_WORD,
-            protocol_identity,
-            b"case".to_vec(),
-            plan_digest,
-            public.anchor.anchor_id,
-        )
-        .unwrap();
-        assemble(&parameters, &statement, None).unwrap()
     }
 
     fn fixture() -> Fixture {
@@ -859,7 +918,7 @@ mod tests {
         let anchor_id = public.anchor.anchor_id;
         let model_id = Digest([1; 32]);
         let parameters_digest = Digest([2; 32]);
-        let binding = binding(&public);
+        let input = ColumnBindingInput::demo().unwrap();
         Fixture {
             root,
             public,
@@ -868,7 +927,7 @@ mod tests {
             anchor_id,
             model_id,
             parameters_digest,
-            binding,
+            input,
         }
     }
 
@@ -888,7 +947,7 @@ mod tests {
             &trusted,
             "table_i32.bin",
             &fixture.opening,
-            fixture.binding.first_query,
+            fixture.input.parameters.digest().unwrap(),
         )
         .unwrap()
     }
@@ -898,7 +957,7 @@ mod tests {
         verify_column_session(
             &fixture.public,
             &trusted,
-            &fixture.binding,
+            &fixture.input,
             "table_i32.bin",
             &fixture.opening,
         )
@@ -908,7 +967,9 @@ mod tests {
         table: &AssetEncodingTable,
         gu_root: &Digest,
     ) -> Result<(FoldeqSession, Vec<Fp3>)> {
-        let setup = build_demo_setup(table)?;
+        let input = ColumnBindingInput::demo()?;
+        let binding = bind_table(table, &input)?;
+        let setup = build_demo_setup(table, binding)?;
         let mut session = FoldeqSession::open(setup.plan, setup.binder, setup.chain)?;
         session.bind_first_query(&setup.first_query)?;
         session.draw_gamma()?;
@@ -944,6 +1005,15 @@ mod tests {
         assert_ne!(outcome.asset_root, outcome.table_root);
         assert_ne!(outcome.asset_root, outcome.gu_root);
         assert_ne!(outcome.table_root, outcome.gu_root);
+        let input = ColumnBindingInput::demo().unwrap();
+        assert_eq!(
+            outcome.binding_parameters_digest,
+            input.parameters.digest().unwrap()
+        );
+        assert_eq!(
+            outcome.binding_table_identity,
+            reader_table_identity(&table(&fixture).reader).unwrap()
+        );
     }
 
     #[test]
@@ -958,9 +1028,9 @@ mod tests {
     fn changed_gu_message_changes_the_query_transcript_and_order() {
         let fixture = fixture();
         let table = table(&fixture);
-        let base = run_session(&table, &GU_NOTICE_ROOT).unwrap();
+        let base = run_session_with_demo_binding(&table, &GU_NOTICE_ROOT).unwrap();
         let changed_root = Digest([0x48; 32]);
-        let changed = run_session(&table, &changed_root).unwrap();
+        let changed = run_session_with_demo_binding(&table, &changed_root).unwrap();
         assert_eq!(base.gu_root, GU_NOTICE_ROOT);
         assert_eq!(changed.gu_root, changed_root);
         assert_ne!(
@@ -989,7 +1059,7 @@ mod tests {
     fn column_path_tamper_is_rejected_by_authentication() {
         let fixture = fixture();
         let table = table(&fixture);
-        let run = run_session(&table, &GU_NOTICE_ROOT).unwrap();
+        let run = run_session_with_demo_binding(&table, &GU_NOTICE_ROOT).unwrap();
         let openings = open_columns_for_queries(&table, &run.queries).unwrap();
         let positions = unique_sorted(&run.queries);
         let mut unique: Vec<ColumnOpening> = positions
@@ -1004,7 +1074,7 @@ mod tests {
             .collect();
         unique[0].path.push(Digest([9; 32]));
         assert!(verify_columns(&table.reader, &positions, &unique).is_err());
-        assert!(run_session(&table, &GU_NOTICE_ROOT).is_ok());
+        assert!(run_session_with_demo_binding(&table, &GU_NOTICE_ROOT).is_ok());
     }
 
     #[test]
@@ -1095,7 +1165,7 @@ mod tests {
     fn full_table_comparison_detects_a_wrong_opened_cell() {
         let fixture = fixture();
         let table = table(&fixture);
-        let run = run_session(&table, &GU_NOTICE_ROOT).unwrap();
+        let run = run_session_with_demo_binding(&table, &GU_NOTICE_ROOT).unwrap();
         assert!(run.comparison.matches);
         let mut columns = run.columns.clone();
         columns[0] = Fp3::from_u64(999).c[0];
@@ -1108,7 +1178,7 @@ mod tests {
     fn fold_component_checks_the_public_row_and_stops_at_the_closed_boundary() {
         let fixture = fixture();
         let table = table(&fixture);
-        let run = run_session(&table, &GU_NOTICE_ROOT).unwrap();
+        let run = run_session_with_demo_binding(&table, &GU_NOTICE_ROOT).unwrap();
         assert!(run.next_stage_closed);
         assert!(run.fold_output.next_stage().is_err());
         let shape = demo_fold_shape(table.shape).unwrap();
