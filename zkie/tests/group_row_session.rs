@@ -76,20 +76,20 @@ fn selected_gpt2_group_row_component() {
             asset_opening: true,
             main_rows: true,
             table_commitment: true,
-            fresh_commitment: true,
+            fresh_local_consistency: true,
         }
     );
     assert!(outcome.same_source);
     assert!(outcome.fold_next_stage_closed);
     assert!(outcome.handoff_rejected);
+    assert!(!outcome.main_tail_folded);
+    assert!(!outcome.old_mask_tail_folded);
+    assert!(!outcome.fresh_tail_folded);
     assert_ne!(outcome.asset_root, outcome.table_root);
     assert_ne!(outcome.table_root, outcome.fresh_root);
     assert_eq!(outcome.main_messages.len(), 16);
-    assert_eq!(outcome.main_tails.len(), 4);
     assert_eq!(outcome.old_mask_messages.len(), 6);
-    assert_eq!(outcome.old_mask_tail.len(), 1);
     assert_eq!(outcome.fresh_mask.len(), 6);
-    assert_eq!(outcome.fresh_tail.len(), 1);
     assert_eq!(outcome.coefficients.len(), 16);
     assert_eq!(outcome.mask_coefficients.len(), 6);
     assert_ne!(outcome.main_messages[0], outcome.old_mask_messages[0]);

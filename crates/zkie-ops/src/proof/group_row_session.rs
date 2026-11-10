@@ -1,9 +1,15 @@
-//! Isolated GroupRow source and FOLD component demonstration.
+//! Main-row/message demonstration for the isolated GroupRow source and FOLD
+//! component.
 //!
-//! This module builds a candidate GroupRow witness from the complete
-//! authenticated asset opening, compares the witness against an independent
+//! This module builds a candidate main-row witness from the complete
+//! authenticated asset opening, compares the main rows against an independent
 //! verifier-side reconstruction, and runs the isolated FOLD component over the
-//! same sources. It does not run G_u or BAT, does not authenticate the fresh
+//! same sources. Folding-tail derivation (`fold_low`/`fold_gather_mask`
+//! equivalent) is not implemented: the stored tail fields are fixture values,
+//! they do not participate in FOLD folding, and the outcome must not be read as
+//! a completed witness fold. The candidate witness derivation conditions are
+//! incomplete for that reason; this does not change the T-002 final
+//! acceptance. It does not run G_u or BAT, does not authenticate the fresh
 //! mask as a production commitment, and does not accept a proof. The production
 //! verify entry is unchanged.
 //!
@@ -12,11 +18,11 @@
 //! | GroupRow component | source | shape |
 //! | --- | --- | --- |
 //! | main messages | authenticated asset opening rows, fixed slice/encoding | `2^k * ell` |
-//! | main random tails | fixed zero tail fixture (not read by the FOLD component) | `2^k * r` |
+//! | main random tails | fixed zero tail fixture; **not folded, not checked** | `2^k * r` |
 //! | old-mask messages | fixed old-mask fixture | `2^h * mask_ell` |
-//! | old-mask random tail | fixed old-mask tail fixture | `2^h * mask_r` |
+//! | old-mask random tail | fixed old-mask tail fixture; **not folded, not checked** | `2^h * mask_r` |
 //! | fresh-mask rows | derived from the fixed fresh-mask coefficients | `2^h * mask_ell` |
-//! | fresh-mask random tail | fixed fresh-mask tail fixture | `2^h * mask_r` |
+//! | fresh-mask random tail | fixed fresh-mask tail fixture; **not folded, not checked** | `2^h * mask_r` |
 //! | main claim coefficients | fixed plan values | `2^k * ell` |
 //! | old-mask claim coefficients | fixed plan values | `2^h * mask_ell` |
 //! | kept forms | none (no-kept subset) | 0 |
@@ -28,10 +34,19 @@
 //! the outcome. The challenges are used according to each component's role;
 //! not every witness entry depends on epsilon.
 //!
-//! The comparison path verifies the trusted anchor and the complete opening
-//! independently, reconstructs the expected main rows and their commitment
-//! from the fixed plan, and compares them with the sources the FOLD component
-//! consumes. A prover-side recomputation is not used as independent
+//! Two comparisons are distinguished:
+//!
+//! - the main rows are compared in full against the asset opening under the
+//!   anchor premise and the verifier's fixed shape/configuration. This is the
+//!   comparison path;
+//! - the fresh fixture is only checked for local consistency with a root
+//!   rebuilt from the same fixture data. This is not trusted fresh
+//!   authentication.
+//!
+//! Shape and configuration come from the verifier's fixed `GroupRowPlan`, not
+//! from the source's self-report; the source construction checks the table
+//! against that plan. The `Arc::ptr_eq` assertion only records that the demo
+//! consumes the same object as the comparison; it is not independent
 //! authentication. The complete opening is resident; this is intentionally
 //! expensive and is not a production authentication or memory path.
 //!
@@ -133,16 +148,44 @@ fn table_salts(shape: IndexShape) -> Result<Vec<Vec<u8>>> {
         .collect())
 }
 
+/// The verifier's fixed shape and configuration for this demonstration. It is
+/// supplied independently of the source, which must match it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupRowPlan {
+    pub table_shape: IndexShape,
+    pub configuration: Digest,
+}
+
+impl GroupRowPlan {
+    pub fn new(configuration: Digest) -> Result<Self> {
+        let table_shape = IndexShape {
+            code: build_code_plan(3, 4, 1)?,
+            v: 2,
+            answers: 1,
+            salt_bytes: zkie_engine::pcs::request::params::LEAF_SALT_MIN_BYTES,
+            distances: zkie_engine::pcs::request::table::TableDistances {
+                radius: 0,
+                later_radius: 0,
+                m_once: 0,
+                m_later: 0,
+            },
+        };
+        Ok(Self {
+            table_shape,
+            configuration,
+        })
+    }
+}
+
 /// The candidate GroupRow source. Main, old-mask, fresh-mask and random tails
 /// are separate fields.
 pub struct GroupRowSource {
+    pub plan: GroupRowPlan,
     pub shape: FoldShape,
     pub layout: FoldGroupLayout,
     pub group: u64,
     pub fresh: u64,
     pub tree_number: u64,
-    pub table_shape: IndexShape,
-    pub configuration: Digest,
     pub table_root: Digest,
     pub table_messages: Vec<Vec<Fp>>,
     pub table_tails: Vec<Vec<Fp>>,
@@ -163,15 +206,30 @@ pub struct GroupRowSource {
 
 impl GroupRowSource {
     pub fn mask_tree_plan(&self) -> Result<MaskTreePlan> {
-        mask_tree_plan(self.table_shape.code.log_n, self.table_shape.salt_bytes)
+        mask_tree_plan(
+            self.plan.table_shape.code.log_n,
+            self.plan.table_shape.salt_bytes,
+        )
     }
 }
 
 fn source_from_table(
     table: &crate::proof::column_session::AssetEncodingTable,
-    configuration: Digest,
+    plan: GroupRowPlan,
 ) -> Result<GroupRowSource> {
-    let mask_code = build_code_plan(table.shape.code.log_n, MASK_ELL, MASK_R)?;
+    source_from_table_with_old_mask(table, plan, None, None)
+}
+
+fn source_from_table_with_old_mask(
+    table: &crate::proof::column_session::AssetEncodingTable,
+    plan: GroupRowPlan,
+    old_mask_override: Option<Vec<Fp3>>,
+    old_mask_tail_override: Option<Vec<Fp3>>,
+) -> Result<GroupRowSource> {
+    if table.shape != plan.table_shape || table.reader.configuration != plan.configuration {
+        return Err(Error::StatementMismatch);
+    }
+    let mask_code = build_code_plan(plan.table_shape.code.log_n, MASK_ELL, MASK_R)?;
     let shape = FoldShape {
         code: table.shape.code,
         mask_code,
@@ -204,7 +262,8 @@ fn source_from_table(
     if layout.fault(&shape).is_some() {
         return Err(Error::InvalidConfig);
     }
-    let rows = usize::try_from(table.shape.rows_checked()?).map_err(|_| Error::ResourceLimit)?;
+    let rows =
+        usize::try_from(plan.table_shape.rows_checked()?).map_err(|_| Error::ResourceLimit)?;
     let ell = usize::try_from(shape.code.ell).map_err(|_| Error::ResourceLimit)?;
     let r = usize::try_from(shape.code.r).map_err(|_| Error::ResourceLimit)?;
     if table.messages.len() != rows || table.tails.len() != rows {
@@ -228,12 +287,24 @@ fn source_from_table(
     let mask_len = usize::try_from(shape.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
     let mask_tail_len =
         usize::try_from(shape.mask_code.r).map_err(|_| Error::ResourceLimit)?;
-    let old_mask_messages: Vec<Fp3> = (0..mask_rows * mask_len)
-        .map(|index| Fp3::from_u64(0x200 + index as u64))
-        .collect();
-    let old_mask_tail: Vec<Fp3> = (0..mask_rows * mask_tail_len)
-        .map(|index| Fp3::from_u64(0x300 + index as u64))
-        .collect();
+    let old_mask_messages: Vec<Fp3> = match old_mask_override {
+        Some(values) => values,
+        None => (0..mask_rows * mask_len)
+            .map(|index| Fp3::from_u64(0x200 + index as u64))
+            .collect(),
+    };
+    if old_mask_messages.len() != mask_rows * mask_len {
+        return Err(Error::ShapeMismatch);
+    }
+    let old_mask_tail: Vec<Fp3> = match old_mask_tail_override {
+        Some(values) => values,
+        None => (0..mask_rows * mask_tail_len)
+            .map(|index| Fp3::from_u64(0x300 + index as u64))
+            .collect(),
+    };
+    if old_mask_tail.len() != mask_rows * mask_tail_len {
+        return Err(Error::ShapeMismatch);
+    }
     let coefficients: Vec<Fp3> = (0..rows * ell)
         .map(|index| Fp3::from_u64(1 + index as u64))
         .collect();
@@ -267,9 +338,9 @@ fn source_from_table(
         .ok_or(Error::ProverStateMissing)?
         .values
         .clone();
-    let salts = table_salts(table.shape)?;
+    let salts = table_salts(plan.table_shape)?;
     let fresh_tree = MaskTree::commit(
-        mask_tree_plan(table.shape.code.log_n, table.shape.salt_bytes)?,
+        mask_tree_plan(plan.table_shape.code.log_n, plan.table_shape.salt_bytes)?,
         &shape,
         &[fresh_mask.clone()],
         &[fresh_tail.clone()],
@@ -288,13 +359,12 @@ fn source_from_table(
         prover.sum()
     };
     Ok(GroupRowSource {
+        plan,
         shape,
         layout,
         group: GROUP,
         fresh: FRESH_ID,
         tree_number: TREE_NUMBER,
-        table_shape: table.shape,
-        configuration,
         table_root: table.reader.root,
         table_messages: table.messages.clone(),
         table_tails: table.tails.clone(),
@@ -320,7 +390,9 @@ pub struct GroupRowComparison {
     pub asset_opening: bool,
     pub main_rows: bool,
     pub table_commitment: bool,
-    pub fresh_commitment: bool,
+    /// Local consistency of the fresh fixture with a root rebuilt from the same
+    /// fixture data. This is not trusted fresh authentication.
+    pub fresh_local_consistency: bool,
 }
 
 fn compare_main_rows(
@@ -340,7 +412,11 @@ fn compare_source(
     asset_path: &str,
     opening: &AssetOpening,
     source: &GroupRowSource,
+    plan: &GroupRowPlan,
 ) -> Result<GroupRowComparison> {
+    if source.plan != *plan {
+        return Err(Error::StatementMismatch);
+    }
     verify_model_anchor(
         public,
         trusted.anchor_id,
@@ -363,7 +439,7 @@ fn compare_source(
     }
     public.verify_opening(opening)?;
 
-    let shape = source.table_shape;
+    let shape = plan.table_shape;
     let rows = usize::try_from(shape.rows_checked()?).map_err(|_| Error::ResourceLimit)?;
     let ell = usize::try_from(shape.code.ell).map_err(|_| Error::ResourceLimit)?;
     let r = usize::try_from(shape.code.r).map_err(|_| Error::ResourceLimit)?;
@@ -392,7 +468,7 @@ fn compare_source(
     let salts = table_salts(shape)?;
     let expected_table = commit_table(
         shape,
-        source.configuration,
+        plan.configuration,
         &expected_messages,
         &expected_tail_rows,
         &salts,
@@ -414,7 +490,7 @@ fn compare_source(
         asset_opening: true,
         main_rows: true,
         table_commitment: true,
-        fresh_commitment: true,
+        fresh_local_consistency: true,
     })
 }
 
@@ -426,10 +502,13 @@ pub struct GroupRowOutcome {
     pub comparison: GroupRowComparison,
     pub same_source: bool,
     pub main_messages: Vec<Fp3>,
+    /// Fixed fixture tail; not folded and not checked in this step.
     pub main_tails: Vec<Fp3>,
     pub old_mask_messages: Vec<Fp3>,
+    /// Fixed fixture tail; not folded and not checked in this step.
     pub old_mask_tail: Vec<Fp3>,
     pub fresh_mask: Vec<Fp3>,
+    /// Fixed fixture tail; not folded and not checked in this step.
     pub fresh_tail: Vec<Fp3>,
     pub coefficients: Vec<Fp3>,
     pub mask_coefficients: Vec<Fp3>,
@@ -441,6 +520,9 @@ pub struct GroupRowOutcome {
     pub fold_output: FoldOutput,
     pub fold_next_stage_closed: bool,
     pub handoff_rejected: bool,
+    pub main_tail_folded: bool,
+    pub old_mask_tail_folded: bool,
+    pub fresh_tail_folded: bool,
 }
 
 fn start_bytes(source: &GroupRowSource, sum: Fp3) -> Result<Vec<u8>> {
@@ -476,6 +558,9 @@ struct ComponentRun {
     order: Vec<&'static str>,
     output: FoldOutput,
     handoff_rejected: bool,
+    main_tail_folded: bool,
+    old_mask_tail_folded: bool,
+    fresh_tail_folded: bool,
 }
 
 fn run_component(source: Arc<GroupRowSource>) -> Result<ComponentRun> {
@@ -558,6 +643,9 @@ fn run_component(source: Arc<GroupRowSource>) -> Result<ComponentRun> {
         order,
         output,
         handoff_rejected,
+        main_tail_folded: false,
+        old_mask_tail_folded: false,
+        fresh_tail_folded: false,
     })
 }
 
@@ -571,6 +659,7 @@ pub fn verify_group_row_session(
     opening: &AssetOpening,
 ) -> Result<GroupRowOutcome> {
     let configuration = input.parameters.digest()?;
+    let plan = GroupRowPlan::new(configuration)?;
     let table = build_authenticated_encoding_table_with_configuration(
         public,
         trusted,
@@ -578,8 +667,8 @@ pub fn verify_group_row_session(
         opening,
         configuration,
     )?;
-    let source = Arc::new(source_from_table(&table, configuration)?);
-    let comparison = compare_source(public, trusted, asset_path, opening, &source)?;
+    let source = Arc::new(source_from_table(&table, plan)?);
+    let comparison = compare_source(public, trusted, asset_path, opening, &source, &plan)?;
     let run = run_component(Arc::clone(&source))?;
     let same_source = Arc::ptr_eq(&source, &run.source);
     if !same_source {
@@ -611,6 +700,9 @@ pub fn verify_group_row_session(
         fold_output: run.output,
         fold_next_stage_closed,
         handoff_rejected: run.handoff_rejected,
+        main_tail_folded: run.main_tail_folded,
+        old_mask_tail_folded: run.old_mask_tail_folded,
+        fresh_tail_folded: run.fresh_tail_folded,
     })
 }
 
@@ -651,7 +743,11 @@ mod tests {
         }
     }
 
-    fn source_fixture() -> GroupRowSource {
+    fn plan_fixture() -> GroupRowPlan {
+        GroupRowPlan::new(Digest([0x61; 32])).unwrap()
+    }
+
+    fn table_fixture() -> crate::proof::column_session::AssetEncodingTable {
         let messages = (0..4)
             .map(|row| {
                 (0..4)
@@ -659,19 +755,31 @@ mod tests {
                     .collect()
             })
             .collect();
-        let table = table_from(messages);
-        source_from_table(&table, Digest([0x61; 32])).unwrap()
+        table_from(messages)
+    }
+
+    fn source_fixture() -> GroupRowSource {
+        source_from_table(&table_fixture(), plan_fixture()).unwrap()
+    }
+
+    fn fresh_root_matches(source: &GroupRowSource) -> bool {
+        MaskTree::commit(
+            source.mask_tree_plan().unwrap(),
+            &source.shape,
+            &[source.fresh_mask.clone()],
+            &[source.fresh_tail.clone()],
+            &table_salts(source.plan.table_shape).unwrap(),
+        )
+        .map(|tree| tree.root == source.fresh_root)
+        .unwrap_or(false)
     }
 
     #[test]
     fn source_components_and_fixed_randomness_are_separate() {
         let source = source_fixture();
         assert_eq!(source.main_messages.len(), 16);
-        assert_eq!(source.main_tails.len(), 4);
         assert_eq!(source.old_mask_messages.len(), 6);
-        assert_eq!(source.old_mask_tail.len(), 1);
         assert_eq!(source.fresh_mask.len(), 6);
-        assert_eq!(source.fresh_tail.len(), 1);
         assert_ne!(source.main_messages[0], source.old_mask_messages[0]);
         assert_ne!(source.old_mask_messages[0], source.fresh_mask[0]);
         assert_eq!(source.mask.coefficients().len(), 5);
@@ -701,6 +809,9 @@ mod tests {
         assert_eq!(run.output.fresh_coefficients.len(), 6);
         assert!(run.output.next_stage().is_err());
         assert!(run.handoff_rejected);
+        assert!(!run.main_tail_folded);
+        assert!(!run.old_mask_tail_folded);
+        assert!(!run.fresh_tail_folded);
         assert_eq!(run.output.mask_coefficients.len(), 6);
         assert_eq!(run.output.fresh_coefficients.len(), 6);
     }
@@ -708,12 +819,13 @@ mod tests {
     #[test]
     fn independent_reconstruction_rejects_a_valid_recommitment_mismatch() {
         let source = source_fixture();
-        let shape = source.table_shape;
+        let plan = plan_fixture();
+        let shape = plan.table_shape;
         let mut messages = source.table_messages.clone();
         messages[0][0] = Fp::from_u64(999);
         let salts = table_salts(shape).unwrap();
         let tails = source.table_tails.clone();
-        let changed = commit_table(shape, source.configuration, &messages, &tails, &salts).unwrap();
+        let changed = commit_table(shape, plan.configuration, &messages, &tails, &salts).unwrap();
         assert_ne!(changed.reader.root, source.table_root);
         let expected: Vec<Fp3> = source
             .table_messages
@@ -734,12 +846,69 @@ mod tests {
             Err(Error::StatementMismatch)
         ));
         let altered_table = table_from(messages);
-        let altered_source = source_from_table(&altered_table, source.configuration).unwrap();
+        let altered_source = source_from_table(&altered_table, plan).unwrap();
         assert_ne!(altered_source.table_root, source.table_root);
         assert!(matches!(
             compare_main_rows(&expected, &altered_source.main_tails, &altered_source),
             Err(Error::StatementMismatch)
         ));
+    }
+
+    #[test]
+    fn verifier_plan_shape_and_configuration_are_checked() {
+        let table = table_fixture();
+        let mut wrong_configuration = plan_fixture();
+        wrong_configuration.configuration = Digest([0x63; 32]);
+        assert!(source_from_table(&table, wrong_configuration).is_err());
+        let mut wrong_shape = plan_fixture();
+        wrong_shape.table_shape.code = build_code_plan(3, 6, 1).unwrap();
+        assert!(source_from_table(&table, wrong_shape).is_err());
+    }
+
+    #[test]
+    fn input_parts_change_their_own_layer_and_tails_are_not_folded() {
+        let plan = plan_fixture();
+        let source = source_fixture();
+        let mut altered_main = source.main_messages.clone();
+        altered_main[0] = altered_main[0].add(&Fp3::ONE);
+        assert!(matches!(
+            compare_main_rows(&altered_main, &source.main_tails, &source),
+            Err(Error::StatementMismatch)
+        ));
+        let mut altered_main_tail = source.main_tails.clone();
+        altered_main_tail[0] = altered_main_tail[0].add(&Fp3::ONE);
+        assert!(matches!(
+            compare_main_rows(&source.main_messages, &altered_main_tail, &source),
+            Err(Error::StatementMismatch)
+        ));
+
+        let table = table_fixture();
+        let mut altered_old = source.old_mask_messages.clone();
+        altered_old[0] = altered_old[0].add(&Fp3::ONE);
+        let altered_old_source = source_from_table_with_old_mask(
+            &table,
+            plan,
+            Some(altered_old),
+            None,
+        )
+        .unwrap();
+        assert_ne!(altered_old_source.target, source.target);
+        let altered_old_tail_source = source_from_table_with_old_mask(
+            &table,
+            plan,
+            None,
+            Some(vec![source.old_mask_tail[0].add(&Fp3::ONE)]),
+        )
+        .unwrap();
+        assert_eq!(altered_old_tail_source.target, source.target);
+
+        let mut altered_fresh = source_fixture();
+        altered_fresh.fresh_mask[0] = altered_fresh.fresh_mask[0].add(&Fp3::ONE);
+        assert!(!fresh_root_matches(&altered_fresh));
+        let mut altered_fresh_tail = source_fixture();
+        altered_fresh_tail.fresh_tail[0] =
+            altered_fresh_tail.fresh_tail[0].add(&Fp3::ONE);
+        assert!(!fresh_root_matches(&altered_fresh_tail));
     }
 
     #[test]
