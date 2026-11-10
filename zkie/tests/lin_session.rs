@@ -7,9 +7,10 @@ use std::time::Instant;
 use zkie_core::common::field::PrimeField64;
 use zkie_core::types::Digest;
 use zkie_engine::pcs::request::field::Fp3;
-use zkie_engine::pcs::request::lin::{eval, LinClaim, LinShape};
+use zkie_engine::pcs::request::lin::LinShape;
 use zkie_ops::proof::lin_session::{
-    build_authenticated_lin_table, fp3_from_signed_word, prove_lin_session, verify_lin_session,
+    build_authenticated_lin_table, fp3_from_signed_word, prove_lin_request, verify_lin_request,
+    verify_lin_request_bytes, LinRequestMessages,
 };
 use zkie_ops::proof::model_commitment::{ModelCommitmentPublic, SharedTrace};
 use zkie_ops::proof::session_baseline::{
@@ -18,6 +19,10 @@ use zkie_ops::proof::session_baseline::{
 
 fn fp3(value: u64) -> Fp3 {
     fp3_from_signed_word(value)
+}
+
+fn next(value: &Fp3) -> Fp3 {
+    fp3(value.c[0].as_canonical_u64().wrapping_add(1))
 }
 
 #[test]
@@ -65,148 +70,199 @@ fn selected_gpt2_linear_claim_session() {
         .take(64)
         .map(|value| fp3(*value))
         .collect();
-    let psi: Vec<Fp3> = (1..=shape.k_col as u64).map(fp3).collect();
-    let target = eval(&w_values, &psi).unwrap();
-    let claim = LinClaim {
-        weights,
-        psi,
-        masks: Vec::new(),
-        target,
-    };
+    let masks = Vec::new();
 
     let started = Instant::now();
-    let prover = prove_lin_session(
+    let prover = prove_lin_request(
         &public,
         &trusted,
         &binding,
         asset_path,
         &trace.assets[192],
         shape,
-        &claim,
+        &weights,
+        &masks,
         &w_values,
     )
     .unwrap();
-    let verifier = verify_lin_session(
+    let verifier = verify_lin_request(
         &public,
         &trusted,
         &binding,
         asset_path,
         &trace.assets[192],
         shape,
-        &claim,
-        &prover.messages,
+        &prover,
     )
     .unwrap();
-    println!("lin_session_ms={}", started.elapsed().as_millis());
-    assert_eq!(prover.shared_rho, verifier.shared_rho);
-    assert_eq!(prover.shared, verifier.shared);
-    assert_eq!(prover.zeta_rho, verifier.zeta_rho);
-    assert_eq!(prover.zeta, verifier.zeta);
-    assert_eq!(verifier.shared_dimension, shape.k_col as usize);
+    println!("lin_request_ms={}", started.elapsed().as_millis());
+    assert_eq!(prover.first.psi, verifier.psi);
+    assert_eq!(prover.shared.point, verifier.shared);
+    assert_eq!(prover.shared.zeta, verifier.zeta);
+    assert_eq!(prover.shared.first_seal, verifier.first_seal);
+    assert_eq!(prover.second.shared_seal, verifier.shared_seal);
+    assert_eq!(prover.second.seal, verifier.seal);
+    assert_eq!(verifier.shared.len(), shape.k_col as usize);
     assert!(verifier.eval_holds && verifier.dot_holds && verifier.fold_holds);
     assert!(verifier.control_w && verifier.control_omega);
 
-    let mut messages = prover.messages.clone();
-    messages.w.values[0] = fp3(
-        messages.w.values[0]
-            .c[0]
-            .as_canonical_u64()
-            .wrapping_add(1),
-    );
-    assert!(verify_lin_session(
+    let bytes = prover.encode();
+    let decoded = LinRequestMessages::decode(&bytes).unwrap();
+    assert_eq!(decoded, prover);
+    let mut trailing = bytes;
+    trailing.push(0);
+    assert!(LinRequestMessages::decode(&trailing).is_err());
+    assert!(verify_lin_request_bytes(
         &public,
         &trusted,
         &binding,
         asset_path,
         &trace.assets[192],
         shape,
-        &claim,
+        &trailing
+    )
+    .is_err());
+
+    let mut messages = prover.clone();
+    messages.first.w.values[0] = next(&messages.first.w.values[0]);
+    assert!(verify_lin_request(
+        &public,
+        &trusted,
+        &binding,
+        asset_path,
+        &trace.assets[192],
+        shape,
         &messages
     )
     .is_err());
 
-    let mut messages = prover.messages.clone();
-    messages.omega.values[0] = fp3(
-        messages.omega.values[0]
-            .c[0]
-            .as_canonical_u64()
-            .wrapping_add(1),
-    );
-    assert!(verify_lin_session(
+    let mut messages = prover.clone();
+    messages.first.weights.values[0] = next(&messages.first.weights.values[0]);
+    assert!(verify_lin_request(
         &public,
         &trusted,
         &binding,
         asset_path,
         &trace.assets[192],
         shape,
-        &claim,
         &messages
     )
     .is_err());
 
-    let mut messages = prover.messages.clone();
-    messages.folded.values[0] = fp3(
-        messages.folded.values[0]
-            .c[0]
-            .as_canonical_u64()
-            .wrapping_add(1),
-    );
-    assert!(verify_lin_session(
+    let mut messages = prover.clone();
+    messages.shared.omega.values[0] = next(&messages.shared.omega.values[0]);
+    assert!(verify_lin_request(
         &public,
         &trusted,
         &binding,
         asset_path,
         &trace.assets[192],
         shape,
-        &claim,
         &messages
     )
     .is_err());
 
-    let mut messages = prover.messages.clone();
-    messages.w.root.0[0] ^= 1;
-    assert!(verify_lin_session(
+    let mut messages = prover.clone();
+    messages.shared.folded.values[0] = next(&messages.shared.folded.values[0]);
+    assert!(verify_lin_request(
         &public,
         &trusted,
         &binding,
         asset_path,
         &trace.assets[192],
         shape,
-        &claim,
         &messages
     )
     .is_err());
 
-    let mut claim_tamper = claim.clone();
-    claim_tamper.target = fp3(claim.target.c[0].as_canonical_u64().wrapping_add(1));
-    assert!(verify_lin_session(
+    let mut messages = prover.clone();
+    messages.first.psi[0] = next(&messages.first.psi[0]);
+    assert!(verify_lin_request(
         &public,
         &trusted,
         &binding,
         asset_path,
         &trace.assets[192],
         shape,
-        &claim_tamper,
-        &prover.messages
+        &messages
     )
     .is_err());
 
-    let mut claim_tamper = claim.clone();
-    claim_tamper.weights[0] = fp3(
-        claim_tamper.weights[0]
-            .c[0]
-            .as_canonical_u64()
-            .wrapping_add(1),
-    );
-    assert!(verify_lin_session(
+    let mut messages = prover.clone();
+    messages.shared.point[0] = next(&messages.shared.point[0]);
+    assert!(verify_lin_request(
         &public,
         &trusted,
         &binding,
         asset_path,
         &trace.assets[192],
         shape,
-        &claim_tamper,
-        &prover.messages
+        &messages
+    )
+    .is_err());
+
+    let mut messages = prover.clone();
+    messages.shared.zeta[0] = next(&messages.shared.zeta[0]);
+    assert!(verify_lin_request(
+        &public,
+        &trusted,
+        &binding,
+        asset_path,
+        &trace.assets[192],
+        shape,
+        &messages
+    )
+    .is_err());
+
+    let mut messages = prover.clone();
+    messages.shared.first_seal.0[0] ^= 1;
+    assert!(verify_lin_request(
+        &public,
+        &trusted,
+        &binding,
+        asset_path,
+        &trace.assets[192],
+        shape,
+        &messages
+    )
+    .is_err());
+
+    let mut messages = prover.clone();
+    messages.second.shared_seal.0[0] ^= 1;
+    assert!(verify_lin_request(
+        &public,
+        &trusted,
+        &binding,
+        asset_path,
+        &trace.assets[192],
+        shape,
+        &messages
+    )
+    .is_err());
+
+    let mut messages = prover.clone();
+    messages.second.seal.0[0] ^= 1;
+    assert!(verify_lin_request(
+        &public,
+        &trusted,
+        &binding,
+        asset_path,
+        &trace.assets[192],
+        shape,
+        &messages
+    )
+    .is_err());
+
+    let mut messages = prover.clone();
+    messages.first.w.root.0[0] ^= 1;
+    assert!(verify_lin_request(
+        &public,
+        &trusted,
+        &binding,
+        asset_path,
+        &trace.assets[192],
+        shape,
+        &messages
     )
     .is_err());
 
@@ -233,15 +289,14 @@ fn selected_gpt2_linear_claim_session() {
     .is_err());
     trace.assets[192].rows[0].path.pop();
 
-    assert!(verify_lin_session(
+    assert!(verify_lin_request(
         &public,
         &trusted,
         &binding,
         asset_path,
         &trace.assets[192],
         shape,
-        &claim,
-        &prover.messages
+        &prover
     )
     .is_ok());
 }
