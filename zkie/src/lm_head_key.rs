@@ -71,6 +71,119 @@ use zkie_ops::proof::session_baseline::SESSION_PROTOCOL_IDENTITY;
 
 use crate::s7_context::LmHeadContext;
 
+/// One LIN request declaration of the output-head relation. It names the
+/// trusted MatMul step, its activation source and its output consumer, binds
+/// the weight asset identity and the matrix shape, and carries the canonical
+/// digests of X, Y and the final output. It is a declaration, not a proof; the
+/// LIN first/shared/second checks and the trace binding are verified beside
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinRequestDeclaration {
+    pub version: u64,
+    pub model_id: Digest,
+    pub plan_identifier: Digest,
+    pub activation_step: u64,
+    pub activation_output: u64,
+    pub matmul_step: u64,
+    pub output_step: u64,
+    pub weight_asset_id: u64,
+    pub weight_table_identity: Digest,
+    pub matrix_rows: u64,
+    pub k_col: u32,
+    pub k_lo: u32,
+    pub activation_digest: Digest,
+    pub output_digest: Digest,
+    pub final_output_digest: Digest,
+}
+
+pub const LIN_REQUEST_DECLARATION_VERSION: u64 = 1;
+const LIN_REQUEST_DOMAIN: &[u8] = b"zkie/lin-request/v1";
+
+impl LinRequestDeclaration {
+    pub fn validate(&self) -> Result<()> {
+        if self.version != LIN_REQUEST_DECLARATION_VERSION
+            || self.model_id == Digest::ZERO
+            || self.plan_identifier == Digest::ZERO
+            || self.weight_table_identity == Digest::ZERO
+            || self.activation_digest == Digest::ZERO
+            || self.output_digest == Digest::ZERO
+            || self.final_output_digest == Digest::ZERO
+        {
+            return Err(Error::InvalidConfig);
+        }
+        if !(self.activation_step < self.matmul_step && self.matmul_step < self.output_step) {
+            return Err(Error::InvalidConfig);
+        }
+        if self.matrix_rows == 0
+            || !self.matrix_rows.is_power_of_two()
+            || self.k_lo >= self.k_col
+            || self.k_col > 63
+        {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        use bincode::Options;
+        let mut bytes = self.version.to_le_bytes().to_vec();
+        bytes.extend_from_slice(LIN_REQUEST_DOMAIN);
+        bytes.extend_from_slice(
+            &bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .serialize(self)
+                .map_err(|_| Error::InvalidEncoding)?,
+        );
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        use bincode::Options;
+        if bytes.len() < 8 + LIN_REQUEST_DOMAIN.len() {
+            return Err(Error::InvalidEncoding);
+        }
+        let version = u64::from_le_bytes(
+            bytes[..8]
+                .try_into()
+                .map_err(|_| Error::InvalidEncoding)?,
+        );
+        if version != LIN_REQUEST_DECLARATION_VERSION || &bytes[8..8 + LIN_REQUEST_DOMAIN.len()] != LIN_REQUEST_DOMAIN {
+            return Err(Error::InvalidConfig);
+        }
+        let value: Self = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .reject_trailing_bytes()
+            .deserialize(&bytes[8 + LIN_REQUEST_DOMAIN.len()..])
+            .map_err(|_| Error::InvalidEncoding)?;
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn digest(&self) -> Result<Digest> {
+        let mut writer = zkie_engine::primitives::codec::CanonicalWriter::new();
+        writer.put_bytes(LIN_REQUEST_DOMAIN);
+        writer.put_bytes(&self.encode()?);
+        Ok(zkie_core::artifact::digest_bytes(&writer.into_bytes()))
+    }
+}
+
+/// Canonical, domain-separated digest of one tensor: a label, the shape and
+/// the values in little-endian two's complement. The label keeps values from
+/// two positions or two tensors from colliding.
+pub fn lin_values_digest(label: &[u8], shape: &[u64], values: &[i64]) -> Digest {
+    let mut writer = zkie_engine::primitives::codec::CanonicalWriter::new();
+    writer.put_bytes(label);
+    writer.put_u64(shape.len() as u64);
+    for dim in shape {
+        writer.put_u64(*dim);
+    }
+    writer.put_u64(values.len() as u64);
+    for value in values {
+        writer.put_u64(*value as u64);
+    }
+    zkie_core::artifact::digest_bytes(&writer.into_bytes())
+}
+
 /// The private values of one table: one random tail for each row, one salt for
 /// each column and one pad for each answer of each row.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -7874,5 +7987,75 @@ mod stage_tests {
         );
         let _ = positive;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+
+#[cfg(test)]
+mod lin_request_tests {
+    use super::*;
+
+    fn sample() -> LinRequestDeclaration {
+        LinRequestDeclaration {
+            version: LIN_REQUEST_DECLARATION_VERSION,
+            model_id: Digest([1; 32]),
+            plan_identifier: Digest([2; 32]),
+            activation_step: 4443,
+            activation_output: 0,
+            matmul_step: 4444,
+            output_step: 4445,
+            weight_asset_id: 7,
+            weight_table_identity: Digest([3; 32]),
+            matrix_rows: 16,
+            k_col: 16,
+            k_lo: 6,
+            activation_digest: lin_values_digest(b"x", &[16, 64], &[1, 2, 3]),
+            output_digest: lin_values_digest(b"y", &[16, 16], &[4, 5]),
+            final_output_digest: lin_values_digest(b"final", &[16], &[6]),
+        }
+    }
+
+    #[test]
+    fn the_declaration_round_trips_and_binds_its_domain() {
+        let value = sample();
+        let bytes = value.encode().expect("encode");
+        let decoded = LinRequestDeclaration::decode(&bytes).expect("decode");
+        assert_eq!(decoded, value);
+        assert_eq!(decoded.digest().expect("digest"), value.digest().expect("digest"));
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(LinRequestDeclaration::decode(&trailing).is_err());
+        let mut version = value.clone();
+        version.version += 1;
+        assert!(version.validate().is_err());
+    }
+
+    #[test]
+    fn every_bound_field_changes_the_digest_or_is_rejected() {
+        let value = sample();
+        let digest = value.digest().expect("digest");
+        let mut step = value.clone();
+        step.activation_step = 4442;
+        assert_ne!(step.digest().expect("digest"), digest);
+        let mut asset = value.clone();
+        asset.weight_table_identity = Digest([9; 32]);
+        assert_ne!(asset.digest().expect("digest"), digest);
+        let mut shape = value.clone();
+        shape.matrix_rows = 32;
+        assert_ne!(shape.digest().expect("digest"), digest);
+        let mut bad_order = value.clone();
+        bad_order.output_step = 4444;
+        assert!(bad_order.validate().is_err());
+        let mut zero = value.clone();
+        zero.model_id = Digest::ZERO;
+        assert!(zero.validate().is_err());
+    }
+
+    #[test]
+    fn value_digests_separate_labels_shapes_and_values() {
+        let base = lin_values_digest(b"x", &[2], &[1, 2]);
+        assert_ne!(base, lin_values_digest(b"y", &[2], &[1, 2]));
+        assert_ne!(base, lin_values_digest(b"x", &[1, 2], &[1, 2]));
+        assert_ne!(base, lin_values_digest(b"x", &[2], &[1, 3]));
     }
 }
