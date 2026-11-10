@@ -120,6 +120,33 @@ impl LmHeadPublicHandoff {
     }
 }
 
+/// The persisted commitment state of the committed table: its public reader
+/// and name, the column leaves, the private salts and the commit peak. It is
+/// enough to rebuild the table without recomputing any codeword.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LmHeadTableState {
+    pub reader: IndexReader,
+    pub name: Vec<u8>,
+    pub leaves: Vec<Digest>,
+    pub salts: Vec<Vec<u8>>,
+    pub peak_bytes: u64,
+}
+
+impl LmHeadTableState {
+    pub fn validate(&self) -> Result<()> {
+        if self.reader.fault().is_some() || self.name.is_empty() {
+            return Err(Error::InvalidConfig);
+        }
+        let expected = 1usize
+            .checked_shl(self.reader.shape.code.log_n)
+            .ok_or(Error::ResourceLimit)?;
+        if self.leaves.len() != expected || self.salts.len() != expected {
+            return Err(Error::ShapeMismatch);
+        }
+        Ok(())
+    }
+}
+
 /// One private prove state. It is fresh for one session and bound to the
 /// public handoff digest; a second prove with the same state is rejected by
 /// the budget journal.
@@ -127,6 +154,7 @@ impl LmHeadPublicHandoff {
 pub struct LmHeadPrivateState {
     pub version: u64,
     pub public_digest: Digest,
+    pub table: LmHeadTableState,
     pub key: LmHeadKeyRandomness,
     pub gu: LmHeadGuRandomness,
     pub omega: LmHeadOmegaRandomness,
@@ -147,6 +175,7 @@ impl LmHeadPrivateState {
         {
             return Err(Error::InvalidConfig);
         }
+        self.table.validate()?;
         Ok(())
     }
 
@@ -293,6 +322,10 @@ pub fn write_private_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBu
 
 pub fn read_public(path: &Path) -> Result<LmHeadPublicHandoff> {
     LmHeadPublicHandoff::decode(&read_bytes(path)?)
+}
+
+pub fn prepare_private_dir(dir: &Path) -> Result<()> {
+    ensure_private_dir(dir)
 }
 
 pub fn write_private(dir: &Path, state: &LmHeadPrivateState) -> Result<PathBuf> {
@@ -514,9 +547,31 @@ mod tests {
     }
 
     fn sample_private(public_digest: Digest) -> LmHeadPrivateState {
+        let statement_bytes = statement();
+        let statement = LimitedKeyStatement::decode(&statement_bytes).expect("statement");
+        let reader = IndexReader {
+            shape: statement.table_shape,
+            configuration: statement.table_configuration,
+            root: statement.table_root,
+            record: IndexRecord {
+                y: vec![
+                    Fp3::ZERO;
+                    (1usize << statement.table_shape.v)
+                        * statement.table_shape.answers as usize
+                ],
+            },
+        };
+        let n = 1usize << statement.table_shape.code.log_n;
         LmHeadPrivateState {
             version: LM_HEAD_STAGE_VERSION,
             public_digest,
+            table: LmHeadTableState {
+                reader,
+                name: b"name".to_vec(),
+                leaves: vec![Digest::ZERO; n],
+                salts: vec![vec![0; 40]; n],
+                peak_bytes: 0,
+            },
             key: LmHeadKeyRandomness {
                 tails: vec![vec![Fp::default()]],
                 salts: vec![vec![1; 40]],

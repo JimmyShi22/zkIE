@@ -481,6 +481,49 @@ impl StreamingTable {
         &self.leaves
     }
 
+    /// The private salts of the stored columns, in position order.
+    pub fn salts(&self) -> &[Vec<u8>] {
+        &self.salts
+    }
+
+    /// Rebuilds a committed table from its persisted public reader, name,
+    /// leaves, salts and peak byte count. The leaves are re-hashed into the
+    /// tree and the rebuilt root must equal the reader's root; no codeword is
+    /// recomputed and no asset row is read.
+    pub fn rebuild(
+        reader: IndexReader,
+        name: Vec<u8>,
+        leaves: Vec<Digest>,
+        salts: Vec<Vec<u8>>,
+        peak_bytes: u64,
+    ) -> Result<Self> {
+        if reader.fault().is_some() {
+            return Err(Error::InvalidConfig);
+        }
+        let expected = 1usize
+            .checked_shl(reader.shape.code.log_n)
+            .ok_or(Error::ResourceLimit)?;
+        if leaves.len() != expected || salts.len() != expected {
+            return Err(Error::ShapeMismatch);
+        }
+        let tree = merkle_build(&reader.configuration, &leaves)?;
+        if tree.root != reader.root {
+            return Err(Error::InvalidProof);
+        }
+        let derived_name = index_name(&tree.root, &reader.shape, &reader.configuration);
+        if derived_name != name {
+            return Err(Error::StatementMismatch);
+        }
+        Ok(Self {
+            reader,
+            name,
+            tree,
+            salts,
+            leaves,
+            peak_bytes,
+        })
+    }
+
     /// Recomputes the drawn columns from the row source and opens them against
     /// the stored tree. One row's message, one tail and one codeword are held
     /// at a time; no column is stored.

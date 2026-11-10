@@ -4378,7 +4378,7 @@ pub struct BaseStep {
 
 /// The plan-bound last-stage BASE configuration: the independent masking
 /// oracle's tree plan and the stage's position count.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BaseStarBinding {
     pub plan: RuntimeTreePlan,
     pub positions: usize,
@@ -7042,4 +7042,689 @@ mod tests {
         assert_eq!(provider.mu().expect("mu"), rows.concat());
     }
 
+}
+
+#[cfg(test)]
+mod stage_tests {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::lm_head_stage::{
+        claim_budget, initialize_budget, read_private, read_public, read_public_file,
+        write_private, write_public, write_public_file, LmHeadPrivateState, LmHeadTableState,
+    };
+    use crate::s7_context::load_gpt2_lm_head_context;
+    use zkie_engine::pcs::request::field::{Fp, Fp3};
+    use zkie_engine::pcs::request::runtime_tree::MaskTreePlan;
+    use zkie_engine::pcs::request::relation::gu_sample_pad_offsets;
+    use zkie_engine::pcs::request::table::{EncodedRowStore, StreamingTable};
+    use zkie_engine::storage::encoded_store::FileRowStore;
+    use zkie_ops::proof::base_last_session::LastBaseRandomness;
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    fn random_bytes(count: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; count];
+        getrandom::fill(&mut bytes).expect("entropy");
+        bytes
+    }
+
+    fn random_digest() -> Digest {
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes).expect("entropy");
+        Digest(bytes)
+    }
+
+    fn random_fp() -> Fp {
+        loop {
+            let mut bytes = [0u8; 8];
+            getrandom::fill(&mut bytes).expect("entropy");
+            let word = u64::from_le_bytes(bytes);
+            if word < zkie_engine::pcs::request::field::MODULUS {
+                return Fp::from_u64(word);
+            }
+        }
+    }
+
+    fn random_fp3() -> Fp3 {
+        Fp3::new(random_fp(), random_fp(), random_fp())
+    }
+
+    fn random_fps(count: usize) -> Vec<Fp> {
+        (0..count).map(|_| random_fp()).collect()
+    }
+
+    fn vm_hwm_kb() -> u64 {
+        let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+            return 0;
+        };
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmHWM:") {
+                return rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+            }
+        }
+        0
+    }
+
+    fn io_bytes() -> (u64, u64) {
+        let Ok(text) = std::fs::read_to_string("/proc/self/io") else {
+            return (0, 0);
+        };
+        let mut read = 0;
+        let mut written = 0;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("read_bytes:") {
+                read = rest.trim().parse().unwrap_or(0);
+            } else if let Some(rest) = line.strip_prefix("write_bytes:") {
+                written = rest.trim().parse().unwrap_or(0);
+            }
+        }
+        (read, written)
+    }
+
+    fn stage_dir() -> PathBuf {
+        PathBuf::from(std::env::var("ZKIE_LM_HEAD_DIR").expect("stage dir"))
+    }
+
+    struct Inputs {
+        context: LmHeadContext,
+        request_plan: RequestPlan,
+        compiled: CompiledPlan,
+        configuration: Digest,
+    }
+
+    fn load_inputs() -> Result<Inputs> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repository root");
+        let case = root.join("models/gpt2/case.toml");
+        let policy_path = root.join("models/gpt2/case.policy");
+        let public = root.join(
+            "docs/benchmarks/20261110-0547-verify-bytes-109934bd-670a98c9/prod/gpt2-seq16/commit/public",
+        );
+        let statement_path = root.join(
+            "docs/benchmarks/20261110-0547-verify-bytes-109934bd-670a98c9/prod/gpt2-seq16/proof/statement.bin",
+        );
+        let statement_bytes = std::fs::read(&statement_path).map_err(|_| Error::Io)?;
+        let statement_data: crate::provider::StatementData =
+            bincode::deserialize(&statement_bytes).map_err(|_| Error::InvalidEncoding)?;
+        let context = load_gpt2_lm_head_context(
+            &case,
+            &policy_path,
+            &public,
+            &statement_path,
+            statement_data.model_commitment,
+        )?;
+        let request_plan = zkie_models_gpt2::lm_head_plan::lm_head_plan()?;
+        let compiled = zkie_models_gpt2::lm_head_plan::lm_head_compiled()?;
+        request_plan.validate()?;
+        request_plan.validate_compiled(&compiled)?;
+        let parameters =
+            limited_key_binding_parameters(&request_plan, context.plan_identifier)?;
+        let configuration = parameters.digest()?;
+        Ok(Inputs {
+            context,
+            request_plan,
+            compiled,
+            configuration,
+        })
+    }
+
+    fn masked_statement(inputs: &Inputs, reader: &IndexReader) -> LimitedKeyStatement {
+        LimitedKeyStatement {
+            version: LIMITED_KEY_VERSION,
+            model_commitment: inputs.context.model_id,
+            table_root: reader.root,
+            table_configuration: reader.configuration,
+            table_shape: reader.shape,
+            matrix_rows: 1 << inputs.request_plan.table.v,
+            k_lo: inputs.request_plan.lin.k_lo,
+            k_col: inputs.request_plan.lin.k_col,
+            valid_min: i32::MIN as i64,
+            valid_max: i32::MAX as i64,
+            no_wf: true,
+            trusted_i32_mapping: true,
+        }
+    }
+
+    fn random_key(shape: IndexShape) -> LmHeadKeyRandomness {
+        let rows = shape.rows() as usize;
+        let n = shape.code.n() as usize;
+        let tail_len = shape.code.r as usize;
+        let pads_len = E_DEGREE * shape.answers as usize;
+        LmHeadKeyRandomness {
+            tails: (0..rows).map(|_| random_fps(tail_len)).collect(),
+            salts: (0..n).map(|_| random_bytes(shape.salt_bytes)).collect(),
+            pads: (0..rows).map(|_| random_fps(pads_len)).collect(),
+        }
+    }
+
+    fn random_gu(shape: &GuShape, salt_bytes: usize) -> Result<LmHeadGuRandomness> {
+        let tail_len = shape.u.code.r as usize;
+        Ok(LmHeadGuRandomness {
+            code_tails: (0..shape.u.main_rows)
+                .map(|_| (0..tail_len).map(|_| random_fp3()).collect())
+                .collect(),
+            salts: (0..shape.tree.columns())
+                .map(|_| random_bytes(salt_bytes))
+                .collect(),
+            pads: (0..gu_sample_pad_offsets(shape)?.0.len())
+                .map(|_| random_fp3())
+                .collect(),
+        })
+    }
+
+    fn random_omega(plan: &OmegaShapePlan, salt_bytes: usize) -> LmHeadOmegaRandomness {
+        LmHeadOmegaRandomness {
+            code_tails: vec![
+                (0..plan.u.code.r as usize)
+                    .map(|_| random_fp3())
+                    .collect(),
+            ],
+            salts: (0..plan.tree.columns())
+                .map(|_| random_bytes(salt_bytes))
+                .collect(),
+            pad: random_fp3(),
+        }
+    }
+
+    fn old_mask_plan(
+        inputs: &Inputs,
+        public_plan: &LimitedPublicPlan,
+    ) -> MaskTreePlan {
+        MaskTreePlan {
+            tree_number: 0x600,
+            leaf_class: inputs.compiled.once_foldeq.shared_split_leaf_class,
+            log_n: public_plan.fold.mask_code.log_n,
+            mask_rows: public_plan.fold.mask_rows().expect("mask rows"),
+            salt_bytes: inputs.request_plan.salt_bytes,
+            run: public_plan.base.plan.run,
+            configuration: inputs.configuration,
+        }
+    }
+
+    fn random_old_mask(
+        plan: &MaskTreePlan,
+        fold: FoldShape,
+        salt_bytes: usize,
+    ) -> LmHeadOldMaskRandomness {
+        LmHeadOldMaskRandomness {
+            rows: (0..plan.mask_rows)
+                .map(|_| (0..fold.mask_code.ell as usize).map(|_| random_fp3()).collect())
+                .collect(),
+            tails: (0..plan.mask_rows)
+                .map(|_| (0..fold.mask_code.r as usize).map(|_| random_fp3()).collect())
+                .collect(),
+            salts: (0..plan.columns())
+                .map(|_| random_bytes(salt_bytes))
+                .collect(),
+        }
+    }
+
+    fn stage_json(
+        wall: f64,
+        hwm: u64,
+        io: (u64, u64),
+        temp: u64,
+        extra: serde_json::Value,
+    ) -> serde_json::Value {
+        json!({
+            "ok": true,
+            "wall_s": wall,
+            "hwm_kb": hwm,
+            "io_read": io.0,
+            "io_write": io.1,
+            "temp_bytes": temp,
+            "extra": extra,
+        })
+    }
+
+    fn stage_commit(dir: &Path) -> Result<serde_json::Value> {
+        let start = Instant::now();
+        let inputs = load_inputs()?;
+        let shape = inputs.request_plan.table_shape()?;
+        let key = random_key(shape);
+        let private_dir = dir.join("private");
+        crate::lm_head_stage::prepare_private_dir(&private_dir)?;
+        let store_dir = private_dir.join("commit-store");
+        std::fs::create_dir_all(&store_dir).map_err(|_| Error::Io)?;
+        let mut store = FileRowStore::new(
+            &store_dir,
+            random_digest(),
+            shape.rows(),
+            shape.code.n(),
+            inputs.configuration,
+            4u64 << 30,
+        )?;
+        let holder = build_lm_head_holder(
+            &inputs.context,
+            &inputs.request_plan,
+            inputs.configuration,
+            &key,
+            &mut store,
+            4096,
+            2u64 << 30,
+            1_700_000_000,
+            1 << 20,
+            1 << 30,
+        )?;
+        let reader = holder.reader().clone();
+        let table = LmHeadTableState {
+            reader: reader.clone(),
+            name: holder.table().name.clone(),
+            leaves: holder.table().leaves().to_vec(),
+            salts: holder.table().salts().to_vec(),
+            peak_bytes: holder.table().peak_bytes(),
+        };
+        let store_len = store.file_len()?;
+        let store_written = store.bytes_written();
+        let store_read = store.bytes_read();
+        drop(holder);
+        store.cleanup()?;
+        let statement = masked_statement(&inputs, &reader);
+        statement.validate()?;
+        let session_bytes = random_digest();
+        let public_plan = build_limited_public_plan(
+            &inputs.request_plan,
+            &inputs.compiled,
+            &statement,
+            &reader,
+            inputs.context.plan_identifier,
+            inputs.context.policy.case_id.as_bytes(),
+            session_bytes,
+        )?;
+        let gu = random_gu(&public_plan.gu, inputs.request_plan.salt_bytes)?;
+        let omega = random_omega(&public_plan.omega, inputs.request_plan.salt_bytes);
+        let mask = LmHeadMaskRandomness {
+            seed: random_digest(),
+            salts: (0..public_plan.fresh_plan.columns())
+                .map(|_| random_bytes(inputs.request_plan.salt_bytes))
+                .collect(),
+        };
+        let old_plan = old_mask_plan(&inputs, &public_plan);
+        let old_mask = random_old_mask(&old_plan, public_plan.fold, inputs.request_plan.salt_bytes);
+        let old_root = commit_lm_head_old_mask(&public_plan.fold, old_plan, &old_mask)?.root();
+        let master = random_digest();
+        let switches = plan_stage_chain(
+            &inputs.compiled,
+            inputs.request_plan.samples as u32,
+            inputs.configuration,
+            public_plan.base.plan.run,
+            master,
+            &public_plan.base,
+        )?
+        .ok_or(Error::InvalidConfig)?;
+        let public_switches = LimitedSwitchPlan::from_inputs(Some(&switches));
+        let handoff = crate::lm_head_stage::LmHeadPublicHandoff {
+            version: crate::lm_head_stage::LM_HEAD_STAGE_VERSION,
+            protocol_identity: zkie_ops::proof::session_baseline::SESSION_PROTOCOL_IDENTITY,
+            statement: statement.encode(),
+            reader: reader.clone(),
+            plan_identifier: inputs.context.plan_identifier,
+            case_id: inputs.context.policy.case_id.as_bytes().to_vec(),
+            random_bytes: session_bytes,
+            base: public_plan.base.clone(),
+            old_mask: Some(crate::lm_head_stage::OldMaskPublic {
+                plan: old_plan,
+                root: old_root,
+            }),
+            fresh_plan: public_plan.fresh_plan,
+            switches: public_switches,
+        };
+        handoff.validate()?;
+        let digest = handoff.digest()?;
+        write_public(&dir.join("public"), &handoff)?;
+        let private = LmHeadPrivateState {
+            version: crate::lm_head_stage::LM_HEAD_STAGE_VERSION,
+            public_digest: digest,
+            table,
+            key,
+            gu,
+            omega,
+            mask,
+            old_mask,
+            master,
+            base_salts: vec![random_bytes(inputs.request_plan.salt_bytes)],
+            base_randomness: LastBaseRandomness::Fixed(random_digest()),
+        };
+        write_private(&private_dir, &private)?;
+        initialize_budget(&private_dir, digest, LM_HEAD_COLUMN_DRAWS as u64)?;
+        let private_bytes = std::fs::metadata(private_dir.join("prove-state.bin"))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let wall = start.elapsed().as_secs_f64();
+        Ok(stage_json(
+            wall,
+            vm_hwm_kb(),
+            io_bytes(),
+            store_len,
+            json!({
+                "store_written": store_written,
+                "store_read": store_read,
+                "store_len": store_len,
+                "public_digest": format!("{digest:?}"),
+                "switch_count": handoff.switches.len(),
+                "private_state_bytes": private_bytes,
+            }),
+        ))
+    }
+
+    fn load_handoff(dir: &Path) -> Result<crate::lm_head_stage::LmHeadPublicHandoff> {
+        read_public(&dir.join("public").join("public.bin"))
+    }
+
+    fn stage_prove(dir: &Path) -> Result<serde_json::Value> {
+        let start = Instant::now();
+        let handoff = load_handoff(dir)?;
+        let digest = handoff.digest()?;
+        let statement = handoff.validate()?;
+        let private_dir = dir.join("private");
+        let private = read_private(&private_dir.join("prove-state.bin"), digest)?;
+        let _claim = claim_budget(&private_dir, digest, LM_HEAD_COLUMN_DRAWS as u64)?;
+        let inputs = load_inputs()?;
+        if handoff.plan_identifier != inputs.context.plan_identifier
+            || handoff.case_id != inputs.context.policy.case_id.as_bytes()
+        {
+            return Err(Error::StatementMismatch);
+        }
+        let public_plan = build_limited_public_plan(
+            &inputs.request_plan,
+            &inputs.compiled,
+            &statement,
+            &handoff.reader,
+            inputs.context.plan_identifier,
+            inputs.context.policy.case_id.as_bytes(),
+            handoff.random_bytes,
+        )?;
+        if public_plan.base != handoff.base
+            || public_plan.fresh_plan != handoff.fresh_plan
+            || public_plan
+                .switches
+                .iter()
+                .map(|target| target)
+                .collect::<Vec<_>>()
+                != handoff.switches.iter().map(|switch| &switch.target).collect::<Vec<_>>()
+        {
+            return Err(Error::StatementMismatch);
+        }
+        let setup_start = Instant::now();
+        let table = StreamingTable::rebuild(
+            private.table.reader.clone(),
+            private.table.name.clone(),
+            private.table.leaves.clone(),
+            private.table.salts.clone(),
+            private.table.peak_bytes,
+        )?;
+        if table.reader != handoff.reader {
+            return Err(Error::StatementMismatch);
+        }
+        let source = LmHeadAssetSource::open(
+            &inputs.context,
+            &inputs.request_plan,
+            handoff.reader.configuration,
+            &private.key,
+            1_700_000_000,
+            1 << 20,
+            1 << 30,
+        )?;
+        let holder = StreamingHolder::new(table, source, LM_HEAD_COLUMN_DRAWS as u64)?;
+        let session = build_limited_shared_session_for_context(
+            &inputs.context,
+            &inputs.request_plan,
+            &inputs.compiled,
+            &statement,
+            &handoff.reader,
+            handoff.random_bytes,
+            &private.mask,
+        )?;
+        let switches = plan_stage_chain(
+            &inputs.compiled,
+            inputs.request_plan.samples as u32,
+            handoff.reader.configuration,
+            public_plan.base.plan.run,
+            private.master,
+            &public_plan.base,
+        )?
+        .ok_or(Error::InvalidConfig)?;
+        if LimitedSwitchPlan::from_inputs(Some(&switches)) != handoff.switches {
+            return Err(Error::StatementMismatch);
+        }
+        let old_public = handoff.old_mask.as_ref().ok_or(Error::IncompleteArtifact)?;
+        let old_mask = commit_lm_head_old_mask(&public_plan.fold, old_public.plan, &private.old_mask)?;
+        if old_mask.root() != old_public.root {
+            return Err(Error::StatementMismatch);
+        }
+        let setup_wall = setup_start.elapsed().as_secs_f64();
+        let chain_start = Instant::now();
+        let mut source = HolderSharedSource::new(holder, private.gu);
+        let result = run_limited_shared_to_columns(
+            session,
+            &mut source,
+            Some(&private.omega),
+            Some(&old_mask),
+            Some(switches),
+        )?;
+        let chain_wall = chain_start.elapsed().as_secs_f64();
+        let artifact = LimitedChainArtifact::from_record(&statement, &result.record)?;
+        let bytes = artifact.encode();
+        write_public_file(&dir.join("proof"), "artifact.bin", &bytes)?;
+        let sealed = result.sealed.ok_or(Error::IncompleteArtifact)?;
+        let wall = start.elapsed().as_secs_f64();
+        Ok(stage_json(
+            wall,
+            vm_hwm_kb(),
+            io_bytes(),
+            bytes.len() as u64,
+            json!({
+                "setup_wall_s": setup_wall,
+                "chain_wall_s": chain_wall,
+                "artifact_bytes": bytes.len(),
+                "sealed": format!("{sealed:?}"),
+            }),
+        ))
+    }
+
+    fn stage_verify(dir: &Path) -> Result<serde_json::Value> {
+        let start = Instant::now();
+        let handoff = load_handoff(dir)?;
+        let statement = handoff.validate()?;
+        let bytes = read_public_file(&dir.join("proof").join("artifact.bin"))?;
+        let artifact = LimitedChainArtifact::decode(&bytes)?;
+        let inputs = load_inputs()?;
+        if handoff.plan_identifier != inputs.context.plan_identifier
+            || handoff.case_id != inputs.context.policy.case_id.as_bytes()
+        {
+            return Err(Error::StatementMismatch);
+        }
+        let setup = build_limited_verify_setup(
+            &inputs.request_plan,
+            &inputs.compiled,
+            &statement,
+            &handoff.reader,
+            inputs.context.plan_identifier,
+            inputs.context.policy.case_id.as_bytes(),
+            handoff.random_bytes,
+            artifact.fold_start.root,
+        )?;
+        let old_public = handoff.old_mask.as_ref().ok_or(Error::IncompleteArtifact)?;
+        let sealed = verify_limited_chain(
+            &setup,
+            &statement,
+            &handoff.switches,
+            Some(old_public.plan),
+            Some(old_public.root),
+            &artifact,
+        )?;
+        if sealed != artifact.sealed {
+            return Err(Error::InvalidProof);
+        }
+        let wall = start.elapsed().as_secs_f64();
+        Ok(stage_json(
+            wall,
+            vm_hwm_kb(),
+            io_bytes(),
+            0,
+            json!({
+                "artifact_bytes": bytes.len(),
+                "verdict": "accept",
+                "sealed": format!("{sealed:?}"),
+            }),
+        ))
+    }
+
+    #[test]
+    #[ignore]
+    fn lm_head_stage_worker() {
+        let Ok(stage) = std::env::var("ZKIE_LM_HEAD_STAGE") else {
+            return;
+        };
+        let dir = stage_dir();
+        let result = match stage.as_str() {
+            "commit" => stage_commit(&dir),
+            "prove" => stage_prove(&dir),
+            "verify" => stage_verify(&dir),
+            _ => Err(Error::UnsupportedPrimitive),
+        };
+        let stage_dir = dir.join(&stage);
+        let _ = std::fs::create_dir_all(&stage_dir);
+        let value = match result {
+            Ok(value) => value,
+            Err(error) => json!({"ok": false, "error": format!("{error:?}")}),
+        };
+        let _ = std::fs::write(
+            stage_dir.join("result.json"),
+            serde_json::to_vec_pretty(&value).unwrap_or_default(),
+        );
+        if !value.get("ok").and_then(|value| value.as_bool()).unwrap_or(false) {
+            panic!("stage {stage} failed");
+        }
+    }
+
+    fn run_stage(executable: &Path, dir: &Path, stage: &str) -> std::process::Output {
+        Command::new(executable)
+            .args([
+                "--exact",
+                "lm_head_key::stage_tests::lm_head_stage_worker",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("ZKIE_LM_HEAD_STAGE", stage)
+            .env("ZKIE_LM_HEAD_DIR", dir)
+            .output()
+            .expect("spawn")
+    }
+
+    fn stage_result(dir: &Path, stage: &str) -> serde_json::Value {
+        std::fs::read(dir.join(stage).join("result.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or(json!({"ok": false, "error": "missing result"}))
+    }
+
+    #[test]
+    #[ignore]
+    fn lm_head_stage_processes() {
+        let dir = std::env::temp_dir().join(format!(
+            "zkie-stage-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let executable = std::env::current_exe().expect("test executable");
+        let mut positive = Vec::new();
+        for stage in ["commit", "prove", "verify"] {
+            let output = run_stage(&executable, &dir, stage);
+            let value = stage_result(&dir, stage);
+            eprintln!(
+                "stage {stage}: {}",
+                serde_json::to_string(&value).unwrap_or_default()
+            );
+            assert!(
+                output.status.success(),
+                "stage {stage} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false));
+            positive.push((stage, value));
+        }
+
+        // A second prove must not reuse the spent budget.
+        let output = run_stage(&executable, &dir, "prove");
+        assert!(!output.status.success());
+        assert!(!stage_result(&dir, "prove")
+            .get("ok")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false));
+
+        // Missing private state fails closed.
+        let private = dir.join("private").join("prove-state.bin");
+        let backup = dir.join("private").join("prove-state.backup");
+        std::fs::rename(&private, &backup).expect("move private");
+        let output = run_stage(&executable, &dir, "prove");
+        assert!(!output.status.success());
+        std::fs::rename(&backup, &private).expect("restore private");
+
+        // A truncated artifact is rejected by the verifier.
+        let artifact_path = dir.join("proof").join("artifact.bin");
+        let artifact = std::fs::read(&artifact_path).expect("artifact");
+        std::fs::write(&artifact_path, &artifact[..artifact.len() / 2]).expect("truncate");
+        let output = run_stage(&executable, &dir, "verify");
+        assert!(!output.status.success());
+        std::fs::write(&artifact_path, &artifact).expect("restore artifact");
+
+        // A changed public handoff is rejected by the verifier.
+        let public_path = dir.join("public").join("public.bin");
+        let public_bytes = std::fs::read(&public_path).expect("public");
+        let mut changed = public_bytes.clone();
+        changed[0] ^= 1;
+        std::fs::write(&public_path, &changed).expect("change public");
+        let output = run_stage(&executable, &dir, "verify");
+        assert!(!output.status.success());
+        std::fs::write(&public_path, &public_bytes).expect("restore public");
+
+        // A replaced plan identity is rejected by the verifier.
+        let mut handoff = read_public(&public_path).expect("handoff");
+        handoff.plan_identifier = Digest([0xee; 32]);
+        std::fs::write(
+            &public_path,
+            &handoff.encode().expect("encode handoff"),
+        )
+        .expect("change identity");
+        let output = run_stage(&executable, &dir, "verify");
+        assert!(!output.status.success());
+        std::fs::write(&public_path, &public_bytes).expect("restore public identity");
+
+        // Replaced private bytes are rejected before any proof work.
+        let private_bytes = std::fs::read(&private).expect("private");
+        let mut changed_private = private_bytes.clone();
+        changed_private[0] ^= 1;
+        std::fs::write(&private, &changed_private).expect("change private");
+        let output = run_stage(&executable, &dir, "prove");
+        assert!(!output.status.success());
+        std::fs::write(&private, &private_bytes).expect("restore private bytes");
+
+        // A stale reservation lock fails closed.
+        std::fs::write(dir.join("private").join("budget.lock"), b"stale").expect("lock");
+        let output = run_stage(&executable, &dir, "prove");
+        assert!(!output.status.success());
+        let _ = std::fs::remove_file(dir.join("private").join("budget.lock"));
+
+        let artifact_bytes = std::fs::read(dir.join("proof").join("artifact.bin"))
+            .expect("artifact copy");
+        let _ = std::fs::write(
+            std::env::temp_dir().join(format!("zkie-stage-artifact-{}.bin", std::process::id())),
+            artifact_bytes,
+        );
+        let _ = positive;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
