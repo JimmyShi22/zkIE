@@ -15,7 +15,7 @@ use zkie_ops::proof::column_session::{
 };
 use zkie_ops::proof::model_commitment::{ModelCommitmentPublic, SharedTrace};
 use zkie_ops::proof::session_baseline::{
-    verify_selected_step, SelectedMatmulStep, TrustedModel,
+    selected_plan_identifier, verify_selected_step, SelectedMatmulStep, TrustedModel,
 };
 
 #[test]
@@ -49,7 +49,14 @@ fn selected_gpt2_column_verification_components() {
         control_started.elapsed().as_millis()
     );
 
-    let input = ColumnBindingInput::demo().unwrap();
+    let plan_identifier = selected_plan_identifier(&public, &plan, &selection).unwrap();
+    let input = ColumnBindingInput::from_plan(
+        plan_identifier,
+        trusted_request.case_id.as_bytes().to_vec(),
+    )
+    .unwrap();
+    assert_eq!(input.parameters.plan_identifier, plan_identifier);
+    assert_eq!(input.case_id, trusted_request.case_id.as_bytes());
     let asset_path = "gpt2/weights/lm_head_w_i32.bin";
     let started = Instant::now();
     let outcome = verify_column_session(
@@ -184,4 +191,42 @@ fn selected_gpt2_column_verification_components() {
         &trace.assets[192]
     )
     .is_ok());
+
+    let case_changed = ColumnBindingInput::from_plan(
+        plan_identifier,
+        b"gpt2-seq16-other".to_vec(),
+    )
+    .unwrap();
+    let case_outcome = verify_column_session(
+        &public,
+        &trusted,
+        &case_changed,
+        asset_path,
+        &trace.assets[192],
+    )
+    .unwrap();
+    assert_eq!(case_outcome.table_root, outcome.table_root);
+    assert_ne!(
+        case_outcome.transcript_after_queries,
+        outcome.transcript_after_queries
+    );
+
+    let plan_changed = ColumnBindingInput::from_plan(
+        Digest([0x77; 32]),
+        trusted_request.case_id.as_bytes().to_vec(),
+    )
+    .unwrap();
+    let plan_outcome = verify_column_session(
+        &public,
+        &trusted,
+        &plan_changed,
+        asset_path,
+        &trace.assets[192],
+    )
+    .unwrap();
+    assert_ne!(plan_outcome.table_root, outcome.table_root);
+    assert_ne!(
+        plan_outcome.transcript_after_queries,
+        outcome.transcript_after_queries
+    );
 }

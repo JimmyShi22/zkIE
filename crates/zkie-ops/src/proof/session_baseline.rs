@@ -184,7 +184,11 @@ fn push_digest(words: &mut Vec<u64>, digest: &Digest) {
     words.extend_from_slice(&digest_words(digest));
 }
 
-fn encode_plan_source(writer: &mut CanonicalWriter, source: &PlanSource) -> Result<()> {
+fn encode_plan_source(
+    writer: &mut CanonicalWriter,
+    public: &ModelCommitmentPublic,
+    source: &PlanSource,
+) -> Result<()> {
     match source {
         PlanSource::Prev {
             step,
@@ -200,17 +204,37 @@ fn encode_plan_source(writer: &mut CanonicalWriter, source: &PlanSource) -> Resu
             path,
             layout: PlanLayout::Flat,
         } => {
+            let meta = public
+                .assets
+                .iter()
+                .find(|asset| asset.path == path.as_str())
+                .ok_or(Error::AssetMismatch)?;
             writer.put_u64(2);
             writer.put_bytes(path.as_bytes());
+            writer.put_u64(meta.asset_id);
+            writer.put_digest(&meta.start);
+            writer.put_digest(&meta.root);
+            writer.put_u64(meta.rows);
+            writer.put_u64(meta.row_width as u64);
+            writer.put_u64(meta.element_count);
+            writer.put_u64(meta.leaf_record.leaf_id);
+            writer.put_u64(meta.leaf_record.generation);
+            writer.put_digest(&meta.leaf_record.table_identity);
+            writer.put_digest(&meta.leaf_record.leaf_root);
             Ok(())
         }
         _ => Err(Error::UnsupportedPrimitive),
     }
 }
 
-/// Candidate plan summary for the selected step. The item order is
+/// Candidate identifier for the verifier's selected static plan. It covers
+/// the selected step, its config, every input port and source, and the
+/// identity of every asset named by those sources. It does not cover the rest
+/// of the trace graph, the case, the request, the protocol/security
+/// parameters, or the source authenticity of the plan. The item order is
 /// candidate-internal and replaceable.
-fn selected_plan_digest(
+pub fn selected_plan_identifier(
+    public: &ModelCommitmentPublic,
     plan: &TracePlan,
     selection: &SelectedMatmulStep,
 ) -> Result<Digest> {
@@ -223,8 +247,9 @@ fn selected_plan_digest(
         writer.put_u64(*value as u64);
     }
     writer.put_u64(selection.inputs.len() as u64);
-    for source in &selection.inputs {
-        encode_plan_source(&mut writer, source)?;
+    for (port, source) in selection.inputs.iter().enumerate() {
+        writer.put_u64(port as u64);
+        encode_plan_source(&mut writer, public, source)?;
     }
     writer.put_u64(1);
     Ok(digest_bytes(&writer.into_bytes()))
@@ -238,7 +263,7 @@ pub fn assemble_binding(
     plan: &TracePlan,
     selection: &SelectedMatmulStep,
 ) -> Result<BindingCandidate> {
-    let plan_digest = selected_plan_digest(plan, selection)?;
+    let plan_digest = selected_plan_identifier(public, plan, selection)?;
     let request_parameters = RequestParams::default_with_code(4, 4, 0)?;
     let parameters = BindingParameters::with_plan_parts(
         PROOF_VERSION_WORD,

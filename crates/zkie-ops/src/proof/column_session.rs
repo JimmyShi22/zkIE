@@ -91,8 +91,10 @@ use crate::proof::session_baseline::TrustedModel;
 
 const TABLE_CONFIGURATION: Digest = Digest([0x5a; 32]);
 const SESSION_PROTOCOL_IDENTITY: Digest = Digest([0x53; 32]);
+#[cfg(test)]
 const PLAN_IDENTIFIER: Digest = Digest([0x54; 32]);
 const DEMO_REQUEST_ID: Digest = Digest([0x52; 32]);
+#[cfg(test)]
 const DEMO_CASE_ID: &[u8] = b"demo-column-case";
 const GU_NOTICE_ROOT: Digest = Digest([0x47; 32]);
 const FRESH_MASK_ROOT: Digest = Digest([0x46; 32]);
@@ -143,7 +145,9 @@ pub struct TableComparison {
 /// The independent candidate configuration for the column session. The
 /// parameters are built from the version word, protocol identity, request
 /// parameters and plan identifier; the statement is built only after the
-/// reader exists.
+/// reader exists. `case_id` and `request_id` are explicit demo placeholders:
+/// this does not claim a real request identity or that different real requests
+/// are distinguished.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnBindingInput {
     pub parameters: BindingParameters,
@@ -152,20 +156,35 @@ pub struct ColumnBindingInput {
 }
 
 impl ColumnBindingInput {
-    pub fn demo() -> Result<Self> {
+    /// Builds the candidate binding input from the verifier's selected static
+    /// plan identifier and the real case identifier. The request id is the
+    /// explicit demo placeholder. The plan identifier source and coverage are
+    /// recorded by the caller; this constructor does not make them trusted.
+    pub fn from_plan(plan_identifier: Digest, case_id: impl Into<Vec<u8>>) -> Result<Self> {
         let request_parameters =
             RequestParams::default_with_code(TABLE_LOG_N, TABLE_ELL, TABLE_R)?;
         let parameters = BindingParameters::new(
             PROOF_VERSION_WORD,
             SESSION_PROTOCOL_IDENTITY,
             &request_parameters,
-            PLAN_IDENTIFIER,
+            plan_identifier,
         )?;
+        let case_id = case_id.into();
+        if case_id.is_empty() {
+            return Err(Error::InvalidConfig);
+        }
         Ok(Self {
             parameters,
-            case_id: DEMO_CASE_ID.to_vec(),
+            case_id,
             request_id: DEMO_REQUEST_ID,
         })
+    }
+
+    /// The unit-test-only fixed input. It is not used by the real fixture and
+    /// does not represent a real plan or case.
+    #[cfg(test)]
+    pub fn demo() -> Result<Self> {
+        Self::from_plan(PLAN_IDENTIFIER, DEMO_CASE_ID)
     }
 }
 
