@@ -1,5 +1,6 @@
 //! Engine storage services.
 
+pub mod encoded_store;
 pub mod mmap;
 pub mod scratch;
 

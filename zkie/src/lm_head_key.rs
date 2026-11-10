@@ -51,7 +51,7 @@ use zkie_engine::pcs::request::runtime_tree::{
 use zkie_engine::storage::mmap::BoundedAssetReader;
 use zkie_engine::pcs::request::table::{
     commit_table_streaming, verify_columns, ColumnOpening, IndexReader, IndexShape, SampleSeed,
-    StreamingHolder, TableRowSource, VecTableSource,
+    EncodedRowStore, StreamingHolder, TableRowSource, VecTableSource,
 };
 use zkie_engine::memory::BudgetedMemoryGovernor;
 use zkie_engine::primitives::transcript::run_value;
@@ -1308,6 +1308,7 @@ pub fn build_lm_head_holder(
     configuration: Digest,
     key_randomness: &LmHeadKeyRandomness,
     gu_randomness: LmHeadGuRandomness,
+    store: &mut dyn EncodedRowStore,
     panel_columns: u64,
     max_bytes: u64,
     cap_bytes: u64,
@@ -1324,8 +1325,9 @@ pub fn build_lm_head_holder(
         window_bytes,
         total_bytes,
     )?;
-    let table = zkie_engine::pcs::request::table::commit_table_streaming(
+    let table = zkie_engine::pcs::request::table::commit_table_stored(
         &mut source,
+        store,
         shape,
         configuration,
         &key_randomness.salts,

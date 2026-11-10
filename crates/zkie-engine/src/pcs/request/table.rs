@@ -846,6 +846,257 @@ impl<S: TableRowSource> StreamingHolder<S> {
     }
 }
 
+/// A private store of the encoded codewords of one commit. It is a cache of
+/// values derived from the trusted table rows under one identity, parameters
+/// and private material; it is not a trust root. A store must be fresh for one
+/// commit, keep the codewords at their positions, and report truncation or a
+/// version mismatch instead of returning other values.
+pub trait EncodedRowStore {
+    fn rows(&self) -> u64;
+    fn columns(&self) -> u64;
+    fn put_row(&mut self, row: u64, codeword: &[Fp]) -> Result<()>;
+    /// Reads a column panel: `out[column * rows + row]` is the codeword
+    /// symbol at `first + column` of `row`.
+    fn read_columns(
+        &mut self,
+        first: u64,
+        count: usize,
+        rows: usize,
+        out: &mut [Fp],
+    ) -> Result<()>;
+    /// Flushes and checks what was written (length, per-row digests, version).
+    fn finish(&mut self) -> Result<()>;
+    /// Removes the stored bytes. A best-effort removal, not a claim of secure
+    /// erasure.
+    fn cleanup(&mut self) -> Result<()>;
+    fn bytes_written(&self) -> u64;
+    fn bytes_read(&self) -> u64;
+}
+
+/// An in-memory row store for small tables and tests.
+pub struct MemoryRowStore {
+    rows: u64,
+    columns: u64,
+    codewords: Vec<Vec<Fp>>,
+    written: u64,
+    read: u64,
+    finished: bool,
+}
+
+impl MemoryRowStore {
+    pub fn new(rows: u64, columns: u64) -> Result<Self> {
+        let rows_usize = usize::try_from(rows).map_err(|_| Error::ResourceLimit)?;
+        let columns_usize = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+        Ok(Self {
+            rows,
+            columns,
+            codewords: vec![Vec::new(); rows_usize],
+            written: 0,
+            read: 0,
+            finished: false,
+        })
+    }
+}
+
+impl EncodedRowStore for MemoryRowStore {
+    fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    fn columns(&self) -> u64 {
+        self.columns
+    }
+
+    fn put_row(&mut self, row: u64, codeword: &[Fp]) -> Result<()> {
+        if self.finished || row >= self.rows || codeword.len() as u64 != self.columns {
+            return Err(Error::InvalidSessionState);
+        }
+        let at = self
+            .codewords
+            .get_mut(row as usize)
+            .ok_or(Error::InvalidIndex)?;
+        if !at.is_empty() {
+            return Err(Error::InvalidSessionState);
+        }
+        *at = codeword.to_vec();
+        self.written = self
+            .written
+            .checked_add((codeword.len() as u64).saturating_mul(8))
+            .ok_or(Error::ResourceLimit)?;
+        Ok(())
+    }
+
+    fn read_columns(
+        &mut self,
+        first: u64,
+        count: usize,
+        rows: usize,
+        out: &mut [Fp],
+    ) -> Result<()> {
+        if !self.finished || rows as u64 != self.rows {
+            return Err(Error::InvalidSessionState);
+        }
+        if out.len() != count.saturating_mul(rows)
+            || first.checked_add(count as u64).ok_or(Error::ResourceLimit)? > self.columns
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        for row in 0..rows {
+            let codeword = self.codewords.get(row).ok_or(Error::InvalidIndex)?;
+            if codeword.is_empty() {
+                return Err(Error::IncompleteArtifact);
+            }
+            for column in 0..count {
+                out[column * rows + row] = codeword[first as usize + column];
+            }
+        }
+        self.read = self
+            .read
+            .checked_add((count.saturating_mul(rows) as u64).saturating_mul(8))
+            .ok_or(Error::ResourceLimit)?;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if self.codewords.iter().any(Vec::is_empty) {
+            return Err(Error::IncompleteArtifact);
+        }
+        self.finished = true;
+        Ok(())
+    }
+
+    fn cleanup(&mut self) -> Result<()> {
+        self.codewords.clear();
+        Ok(())
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.written
+    }
+
+    fn bytes_read(&self) -> u64 {
+        self.read
+    }
+}
+
+/// Commits a table through a bounded row source and a private store of the
+/// encoded rows. The first pass encodes each row once into the store; the
+/// second pass reads column panels from the store and builds the leaves. The
+/// root, record and openings are the same as the plain streaming committer's;
+/// the store holds no plaintext and is not trusted.
+pub fn commit_table_stored<S: TableRowSource, T: EncodedRowStore + ?Sized>(
+    source: &mut S,
+    store: &mut T,
+    shape: IndexShape,
+    configuration: Digest,
+    salts: &[Vec<u8>],
+    panel_columns: u64,
+    max_bytes: u64,
+) -> Result<StreamingTable> {
+    validate_index_shape(&shape)?;
+    if configuration == Digest::ZERO || panel_columns == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let rows = shape.rows();
+    let n = shape.code.n();
+    if source.rows() != rows
+        || salts.len() as u64 != n
+        || salts.iter().any(|salt| salt.len() != shape.salt_bytes)
+        || store.rows() != rows
+        || store.columns() != n
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let rows_usize = usize::try_from(rows).map_err(|_| Error::ResourceLimit)?;
+    let n_usize = usize::try_from(n).map_err(|_| Error::ResourceLimit)?;
+    let ell = usize::try_from(shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let tail_len = usize::try_from(shape.code.r).map_err(|_| Error::ResourceLimit)?;
+    let panel = usize::try_from(panel_columns.min(n)).map_err(|_| Error::ResourceLimit)?;
+    let panel_bytes = rows_usize
+        .checked_mul(panel)
+        .and_then(|value| value.checked_mul(8))
+        .ok_or(Error::ResourceLimit)?;
+    let message_bytes = ell
+        .checked_add(tail_len)
+        .and_then(|value| value.checked_mul(8))
+        .ok_or(Error::ResourceLimit)?;
+    let leaf_bytes = n_usize.checked_mul(32).ok_or(Error::ResourceLimit)?;
+    let tree_bytes = n_usize
+        .checked_mul(64)
+        .ok_or(Error::ResourceLimit)?;
+    let codeword_bytes = n_usize.checked_mul(8).ok_or(Error::ResourceLimit)?;
+    let needed = panel_bytes
+        .checked_add(message_bytes)
+        .and_then(|value| value.checked_add(leaf_bytes))
+        .and_then(|value| value.checked_add(tree_bytes))
+        .and_then(|value| value.checked_add(codeword_bytes))
+        .ok_or(Error::ResourceLimit)?;
+    if (needed as u64) > max_bytes {
+        return Err(Error::ResourceLimit);
+    }
+    let mut message = vec![Fp::ZERO; ell];
+    let mut tail = vec![Fp::ZERO; tail_len];
+    for row in 0..rows_usize {
+        source.row(row as u64, &mut message, &mut tail)?;
+        let codeword = encode_row_fp(&shape.code, &message, &tail)?;
+        store.put_row(row as u64, &codeword)?;
+    }
+    store.finish()?;
+    let mut symbols = vec![Fp::ZERO; rows_usize * panel];
+    let mut leaves = Vec::with_capacity(n_usize);
+    let mut start = 0usize;
+    while start < n_usize {
+        let count = panel.min(n_usize - start);
+        store.read_columns(start as u64, count, rows_usize, &mut symbols)?;
+        for column in 0..count {
+            leaves.push(column_leaf(
+                &configuration,
+                shape.code.log_n,
+                (start + column) as u64,
+                &salts[start + column],
+                &symbols[column * rows_usize..(column + 1) * rows_usize],
+            )?);
+        }
+        start += count;
+    }
+    let tree = merkle_build(&configuration, &leaves)?;
+    let root = tree.root;
+    let name = index_name(&root, &shape, &configuration);
+    let answers = usize::try_from(shape.answers).map_err(|_| Error::ResourceLimit)?;
+    let seeds = record_seeds(&shape, &name, answers)?;
+    let mut record = IndexRecord {
+        y: Vec::with_capacity(rows_usize.saturating_mul(answers)),
+    };
+    for row in 0..rows_usize {
+        source.row(row as u64, &mut message, &mut tail)?;
+        for answer in 0..answers {
+            record.y.push(record_value(
+                &shape,
+                &seeds[answer],
+                answer as u32,
+                &message,
+            )?);
+        }
+    }
+    let reader = IndexReader {
+        shape,
+        configuration,
+        root,
+        record,
+    };
+    if reader.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(StreamingTable {
+        reader,
+        name,
+        tree,
+        salts: salts.to_vec(),
+        leaves,
+        peak_bytes: needed as u64,
+    })
+}
+
 /// The test-only table entry. It has the same reader, name and opening
 /// behaviour the unit fixtures used, but it is built by the production
 /// streaming committer over an in-memory row source; it never materializes a
@@ -1769,6 +2020,119 @@ mod streaming_tests {
         let (again, _) = holder.fold(&gamma).expect("fold again");
         assert_eq!(again, folded);
         assert!(holder.peak_bytes() > 0);
+    }
+
+    struct TamperedStore {
+        inner: MemoryRowStore,
+        tamper: bool,
+    }
+
+    impl EncodedRowStore for TamperedStore {
+        fn rows(&self) -> u64 {
+            self.inner.rows()
+        }
+        fn columns(&self) -> u64 {
+            self.inner.columns()
+        }
+        fn put_row(&mut self, row: u64, codeword: &[Fp]) -> Result<()> {
+            self.inner.put_row(row, codeword)
+        }
+        fn read_columns(
+            &mut self,
+            first: u64,
+            count: usize,
+            rows: usize,
+            out: &mut [Fp],
+        ) -> Result<()> {
+            self.inner.read_columns(first, count, rows, out)?;
+            if self.tamper && !out.is_empty() {
+                out[0] = out[0] + Fp::from_u64(1);
+            }
+            Ok(())
+        }
+        fn finish(&mut self) -> Result<()> {
+            self.inner.finish()
+        }
+        fn cleanup(&mut self) -> Result<()> {
+            self.inner.cleanup()
+        }
+        fn bytes_written(&self) -> u64 {
+            self.inner.bytes_written()
+        }
+        fn bytes_read(&self) -> u64 {
+            self.inner.bytes_read()
+        }
+    }
+
+    #[test]
+    fn the_stored_commit_matches_the_plain_stream_and_rejects_corruption() {
+        let (shape, configuration, messages, tails, salts) = fixture();
+        let expected = commit_table_streaming(
+            &mut VecSource {
+                messages: messages.clone(),
+                tails: tails.clone(),
+            },
+            shape,
+            configuration,
+            &salts,
+            2,
+            u64::MAX,
+        )
+        .expect("plain");
+        let mut source = VecSource {
+            messages: messages.clone(),
+            tails: tails.clone(),
+        };
+        let mut store = MemoryRowStore::new(shape.rows(), shape.code.n()).expect("store");
+        let stored = commit_table_stored(
+            &mut source,
+            &mut store,
+            shape,
+            configuration,
+            &salts,
+            2,
+            u64::MAX,
+        )
+        .expect("stored");
+        assert_eq!(stored.reader.root, expected.reader.root);
+        assert_eq!(stored.name, expected.name);
+        assert_eq!(stored.reader.record.y, expected.reader.record.y);
+        assert_eq!(
+            store.bytes_written(),
+            shape.rows() * shape.code.n() * 8
+        );
+        assert_eq!(store.bytes_read(), shape.rows() * shape.code.n() * 8);
+        let positions = [1u64, 4, 6];
+        let opened = stored.open_columns(&mut source, &positions).expect("open");
+        let want = expected
+            .open_columns(
+                &mut VecSource {
+                    messages: messages.clone(),
+                    tails: tails.clone(),
+                },
+                &positions,
+            )
+            .expect("plain open");
+        assert_eq!(opened, want);
+        store.cleanup().expect("cleanup");
+        assert!(store.bytes_written() > 0);
+
+        let mut tampered = TamperedStore {
+            inner: MemoryRowStore::new(shape.rows(), shape.code.n()).expect("store"),
+            tamper: true,
+        };
+        let mut source = VecSource { messages, tails };
+        let changed = commit_table_stored(
+            &mut source,
+            &mut tampered,
+            shape,
+            configuration,
+            &salts,
+            2,
+            u64::MAX,
+        )
+        .expect("tampered commit");
+        assert_ne!(changed.reader.root, expected.reader.root);
     }
 
     #[test]
