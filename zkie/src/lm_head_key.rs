@@ -12,9 +12,11 @@ use zkie_core::common::field::PrimeCharacteristicRing;
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
 use zkie_engine::pcs::request::field::{Fp, E_DEGREE};
+use zkie_engine::pcs::request::chain::Chain;
 use zkie_engine::pcs::request::plan::RequestPlan;
+use zkie_engine::pcs::request::read::HidingState;
 use zkie_engine::pcs::request::table::{
-    commit_table, CommittedTable, IndexReader, IndexShape,
+    commit_table, verify_columns, ColumnOpening, CommittedTable, IndexReader, IndexShape,
 };
 use zkie_ops::proof::column_session::fp_from_signed_word;
 
@@ -482,6 +484,72 @@ pub fn establish_limited_tested(
     })
 }
 
+
+/// Starts the shared chain from the table's public name and record and the
+/// caller's statement bytes. The chain's configuration is the table's.
+pub fn start_shared_chain(
+    reader: &IndexReader,
+    label: u64,
+    statement_bytes: &[u8],
+    random_bytes: Option<&Digest>,
+) -> Result<Chain> {
+    if reader.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    Chain::begin(
+        label,
+        &reader.configuration,
+        statement_bytes,
+        &reader.record.encode(),
+        random_bytes,
+    )
+}
+
+/// Draws and normalizes the column positions of the shared chain.
+pub fn draw_shared_columns(chain: &mut Chain, log_n: u32, count: usize) -> Result<Vec<u64>> {
+    let mut positions = Vec::with_capacity(count);
+    for _ in 0..count {
+        positions.push(chain.draw_position(log_n)?);
+    }
+    positions.sort_unstable();
+    positions.dedup();
+    Ok(positions)
+}
+
+/// The verifier's column check against the table's reader.
+pub fn verify_shared_columns(
+    reader: &IndexReader,
+    positions: &[u64],
+    openings: &[ColumnOpening],
+) -> Result<Vec<Fp>> {
+    verify_columns(reader, positions, openings)
+}
+
+/// The prover's charged opening of the drawn columns.
+pub fn open_shared_columns(
+    table: &CommittedTable,
+    positions: &[u64],
+    max_columns: u64,
+) -> Result<Vec<ColumnOpening>> {
+    let mut state = HidingState::new(table.reader.root, 1, max_columns);
+    let charge = state.begin_charge(table.reader.root, 1, positions.len())?;
+    table.open_columns_charged(&charge, positions)
+}
+
+/// Reports only the column check. The remaining shared checks stay false, so
+/// the limited tested gate stays closed until they are produced.
+pub fn shared_column_check(
+    reader: &IndexReader,
+    positions: &[u64],
+    openings: &[ColumnOpening],
+) -> Result<SharedChainChecks> {
+    verify_shared_columns(reader, positions, openings)?;
+    Ok(SharedChainChecks {
+        columns_verified: true,
+        ..SharedChainChecks::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -751,5 +819,46 @@ mod tests {
         let mut reordered = key_plan.clone();
         reordered.stages.swap(1, 2);
         assert!(reordered.validate().is_err());
+    }
+
+    #[test]
+    fn the_shared_column_check_follows_the_chain() {
+        use zkie_engine::pcs::request::code::build_code_plan;
+        use zkie_engine::pcs::request::table::TableDistances;
+        let shape = IndexShape {
+            code: build_code_plan(5, 8, 2).expect("code"),
+            v: 2,
+            answers: 1,
+            salt_bytes: 40,
+            distances: TableDistances {
+                radius: 1,
+                later_radius: 1,
+                m_once: 0,
+                m_later: 0,
+            },
+        };
+        let messages: Vec<Vec<Fp>> = (0..4)
+            .map(|row| (0..8).map(|column| Fp::from_u64((row * 8 + column) as u64)).collect())
+            .collect();
+        let tails: Vec<Vec<Fp>> = (0..4).map(|_| vec![Fp::ZERO; 2]).collect();
+        let salts: Vec<Vec<u8>> = (0..32).map(|position| vec![position as u8; 40]).collect();
+        let table = commit_table(shape, Digest([0x55; 32]), &messages, &tails, &salts)
+            .expect("table");
+        let mut chain = start_shared_chain(&table.reader, 0x1234, b"statement", None)
+            .expect("chain");
+        let prefix = chain.message().prefix(0, 0).expect("prefix");
+        assert!(chain.step(&prefix, 0).expect("step"));
+        let positions = draw_shared_columns(&mut chain, shape.code.log_n, 4).expect("positions");
+        assert!(!positions.is_empty());
+        let openings = open_shared_columns(&table, &positions, 100).expect("openings");
+        let columns = verify_shared_columns(&table.reader, &positions, &openings)
+            .expect("columns");
+        assert_eq!(columns.len(), positions.len() * 4);
+        let checks = shared_column_check(&table.reader, &positions, &openings).expect("check");
+        assert!(checks.columns_verified);
+        assert!(!checks.all());
+        let mut tampered = openings.clone();
+        tampered[0].symbols[0] = Fp::from_u64(999);
+        assert!(verify_shared_columns(&table.reader, &positions, &tampered).is_err());
     }
 }
