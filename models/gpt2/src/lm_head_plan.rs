@@ -10,8 +10,8 @@ use zkie_core::error::Result;
 use zkie_engine::pcs::request::code::{build_code_plan, CodeParams};
 use zkie_engine::pcs::request::field::E_DEGREE;
 use zkie_engine::pcs::request::plan::{
-    CodeLine, GroupLine, LinLines, LinPlan, RequestPlan, ScopeWork, StageChoice, TablePlan,
-    WorkPlan,
+    CodeLine, CompiledGroup, CompiledLines, CompiledPlan, CompiledStage, GroupLine, LinLines,
+    LinPlan, RequestPlan, ScopeWork, StageChoice, TablePlan, WorkPlan,
 };
 
 fn code(log_n: u32, ell: u64, r: u64) -> Result<CodeParams> {
@@ -80,6 +80,113 @@ pub fn lm_head_plan() -> Result<RequestPlan> {
         work: WorkPlan::new(scope(0)?, scope(12)?, scope(12)?)?,
         samples: 1,
         salt_bytes: 40,
+    })
+}
+
+
+fn ccode(log_n: u32, ell: u64, r: u64) -> Result<CodeParams> {
+    build_code_plan(log_n, ell, r)
+}
+
+fn cstage(
+    k: u32,
+    h: u32,
+    main: CodeParams,
+    mask: CodeParams,
+    positions: u64,
+) -> CompiledStage {
+    CompiledStage {
+        k,
+        h,
+        main,
+        mask,
+        positions,
+    }
+}
+
+fn cgroup(
+    k: u32,
+    h: u32,
+    main: CodeParams,
+    mask: CodeParams,
+    positions: u64,
+    stages: Vec<CompiledStage>,
+) -> CompiledGroup {
+    CompiledGroup {
+        k,
+        h,
+        main,
+        mask,
+        positions,
+        stages,
+    }
+}
+
+/// The compiled groups for the fixed plan, as the reference frame derives them
+/// from the plan lines and the table. These are plan data; a runtime checks
+/// them against the lines before any proof is made or read. The values are
+/// provisional: the frozen package regenerates them from the production
+/// parameter file through the same frame.
+pub fn lm_head_compiled() -> Result<CompiledPlan> {
+    let proof_folded = cgroup(
+        6,
+        0,
+        ccode(17, 4096, 962)?,
+        ccode(14, 64, 50)?,
+        50,
+        vec![
+            cstage(4, 3, ccode(12, 256, 64)?, ccode(12, 256, 64)?, 64),
+            cstage(3, 3, ccode(12, 32, 69)?, ccode(11, 128, 69)?, 69),
+            cstage(0, 0, ccode(13, 32, 84)?, ccode(12, 512, 84)?, 84),
+        ],
+    );
+    let proof_own = cgroup(
+        5,
+        1,
+        ccode(17, 4096, 962)?,
+        ccode(14, 256, 57)?,
+        57,
+        vec![
+            cstage(4, 3, ccode(12, 256, 73)?, ccode(12, 256, 73)?, 73),
+            cstage(3, 3, ccode(12, 32, 81)?, ccode(11, 128, 81)?, 81),
+            cstage(0, 0, ccode(13, 32, 97)?, ccode(12, 512, 97)?, 97),
+        ],
+    );
+    let once_folded = cgroup(
+        6,
+        0,
+        ccode(17, 4096, 94)?,
+        ccode(14, 64, 47)?,
+        47,
+        vec![
+            cstage(4, 3, ccode(12, 256, 63)?, ccode(12, 64, 63)?, 63),
+            cstage(3, 3, ccode(12, 32, 57)?, ccode(11, 64, 57)?, 57),
+            cstage(0, 0, ccode(13, 32, 84)?, ccode(12, 512, 84)?, 84),
+        ],
+    );
+    let once_own = cgroup(
+        5,
+        1,
+        ccode(17, 4096, 94)?,
+        ccode(14, 256, 47)?,
+        47,
+        vec![
+            cstage(4, 3, ccode(12, 256, 63)?, ccode(12, 128, 63)?, 63),
+            cstage(3, 3, ccode(12, 32, 57)?, ccode(11, 64, 57)?, 57),
+            cstage(0, 0, ccode(13, 32, 84)?, ccode(12, 512, 84)?, 84),
+        ],
+    );
+    Ok(CompiledPlan {
+        once: CompiledLines {
+            folded: once_folded,
+            omega: None,
+            own: once_own,
+        },
+        proof: CompiledLines {
+            folded: proof_folded,
+            omega: None,
+            own: proof_own,
+        },
     })
 }
 
@@ -160,5 +267,44 @@ mod tests {
         let mut plan = lm_head_plan().expect("plan");
         plan.proof.folded.mask = line(14, 7);
         assert!(plan.validate().is_err());
+    }
+
+    #[test]
+    fn the_compiled_plan_matches_the_lines() {
+        let plan = lm_head_plan().expect("plan");
+        let compiled = lm_head_compiled().expect("compiled");
+        plan.validate_compiled(&compiled).expect("compiled plan");
+    }
+
+    #[test]
+    fn a_compiled_stage_with_another_message_is_rejected() {
+        let plan = lm_head_plan().expect("plan");
+        let mut compiled = lm_head_compiled().expect("compiled");
+        compiled.proof.folded.stages[0].main.ell += 1;
+        assert!(plan.validate_compiled(&compiled).is_err());
+    }
+
+    #[test]
+    fn a_compiled_stage_with_another_mask_message_is_rejected() {
+        let plan = lm_head_plan().expect("plan");
+        let mut compiled = lm_head_compiled().expect("compiled");
+        compiled.once.own.stages[0].mask.ell *= 2;
+        assert!(plan.validate_compiled(&compiled).is_err());
+    }
+
+    #[test]
+    fn a_compiled_omega_where_the_codes_agree_is_rejected() {
+        let plan = lm_head_plan().expect("plan");
+        let mut compiled = lm_head_compiled().expect("compiled");
+        compiled.proof.omega = Some(compiled.proof.folded.clone());
+        assert!(plan.validate_compiled(&compiled).is_err());
+    }
+
+    #[test]
+    fn a_compiled_position_count_is_checked() {
+        let plan = lm_head_plan().expect("plan");
+        let mut compiled = lm_head_compiled().expect("compiled");
+        compiled.proof.own.stages[1].positions = 0;
+        assert!(plan.validate_compiled(&compiled).is_err());
     }
 }

@@ -337,6 +337,168 @@ pub fn ceil_log2(value: u64) -> Result<u32> {
     Ok(64 - (value - 1).leading_zeros())
 }
 
+
+/// One compiled stage: the fold's k and h, the two codes with their random
+/// tails, and the number of positions. The reference frame derives these from
+/// the plan lines and the table; a runtime consumes them and checks that they
+/// agree with the lines.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompiledStage {
+    pub k: u32,
+    pub h: u32,
+    pub main: CodeParams,
+    pub mask: CodeParams,
+    pub positions: u64,
+}
+
+/// One compiled group: its row variables, the two codes and the later stages.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompiledGroup {
+    pub k: u32,
+    pub h: u32,
+    pub main: CodeParams,
+    pub mask: CodeParams,
+    pub positions: u64,
+    pub stages: Vec<CompiledStage>,
+}
+
+/// The compiled form of one set of group lines. Omega is absent when its main
+/// code equals the folded row's; the two are then tested together.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompiledLines {
+    pub folded: CompiledGroup,
+    pub omega: Option<CompiledGroup>,
+    pub own: CompiledGroup,
+}
+
+/// The compiled form of the one-time and batch group sets.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompiledPlan {
+    pub once: CompiledLines,
+    pub proof: CompiledLines,
+}
+
+impl RequestPlan {
+    /// Checks the compiled groups against the plan lines and each other.
+    pub fn validate_compiled(&self, compiled: &CompiledPlan) -> Result<()> {
+        validate_compiled_lines(&self.once, &compiled.once, self.samples)?;
+        validate_compiled_lines(&self.proof, &compiled.proof, self.samples)?;
+        Ok(())
+    }
+}
+
+/// Checks one compiled set against its lines.
+pub fn validate_compiled_lines(
+    lines: &LinLines,
+    compiled: &CompiledLines,
+    samples: u64,
+) -> Result<()> {
+    validate_lin_lines(lines)?;
+    check_compiled_group(&lines.folded, &compiled.folded, samples)?;
+    check_compiled_group(&lines.own, &compiled.own, samples)?;
+    let merged = lines.folded.main == lines.omega.main;
+    match (&compiled.omega, merged) {
+        (None, true) => Ok(()),
+        (Some(group), false) => check_compiled_group(&lines.omega, group, samples),
+        _ => Err(Error::InvalidConfig),
+    }
+}
+
+fn check_compiled_group(line: &GroupLine, group: &CompiledGroup, samples: u64) -> Result<()> {
+    if group.main.log_n != line.main.log_n
+        || group.main.ell != line.main.ell()?
+        || group.mask.log_n != line.mask.log_n
+        || group.mask.ell != line.mask.ell()?
+    {
+        return Err(Error::InvalidConfig);
+    }
+    build_code_plan(group.main.log_n, group.main.ell, group.main.r)?;
+    build_code_plan(group.mask.log_n, group.mask.ell, group.mask.r)?;
+    if group.k == 0
+        || group.h > group.k
+        || group.positions == 0
+        || group.mask.r != group.positions
+        || group.main.r < group.positions
+        || group.stages.len() != line.stages.len()
+    {
+        return Err(Error::InvalidConfig);
+    }
+    let mut main_ell = group.main.ell;
+    let mut prev_main_r = group.main.r;
+    let mut prev_mask_ell = group.mask.ell;
+    let mut prev_mask_r = group.mask.r;
+    for (index, (line_stage, stage)) in line.stages.iter().zip(&group.stages).enumerate() {
+        let last = index + 1 == group.stages.len();
+        if stage.k != line_stage.k
+            || stage.h != line_stage.h
+            || stage.main.log_n != line_stage.log_n
+            || stage.mask.log_n != line_stage.mask_log_n
+            || stage.positions == 0
+            || stage.main.r != stage.positions
+            || stage.mask.r != stage.positions
+        {
+            return Err(Error::InvalidConfig);
+        }
+        if last && (stage.k != 0 || stage.h != 0) {
+            return Err(Error::InvalidConfig);
+        }
+        let divisor = 1u64 << stage.k;
+        if main_ell % divisor != 0 {
+            return Err(Error::InvalidConfig);
+        }
+        main_ell /= divisor;
+        if stage.main.ell != main_ell {
+            return Err(Error::InvalidConfig);
+        }
+        let carried = (2u64
+            .checked_mul(prev_mask_ell)
+            .ok_or(Error::InvalidConfig)?)
+        .checked_add(prev_main_r)
+        .ok_or(Error::InvalidConfig)?
+        .checked_add(
+            2u64.checked_mul(prev_mask_r)
+                .ok_or(Error::InvalidConfig)?,
+        )
+        .ok_or(Error::InvalidConfig)?;
+        let rounded = carried
+            .checked_add(samples)
+            .ok_or(Error::InvalidConfig)?
+            .checked_add(1u64 << stage.h)
+            .ok_or(Error::InvalidConfig)?
+            .checked_sub(1)
+            .ok_or(Error::InvalidConfig)?;
+        let own_fold = if stage.k > 0 {
+            2u64.checked_mul(stage.k as u64)
+                .ok_or(Error::InvalidConfig)?
+                .checked_add(1)
+                .ok_or(Error::InvalidConfig)?
+                .checked_sub(stage.h as u64)
+                .ok_or(Error::InvalidConfig)?
+        } else {
+            1
+        };
+        let mask_ell = pow2_at_least(rounded >> stage.h)?.max(pow2_at_least(own_fold)?);
+        if stage.mask.ell != mask_ell {
+            return Err(Error::InvalidConfig);
+        }
+        build_code_plan(stage.main.log_n, stage.main.ell, stage.main.r)?;
+        build_code_plan(stage.mask.log_n, stage.mask.ell, stage.mask.r)?;
+        prev_main_r = stage.main.r;
+        prev_mask_ell = stage.mask.ell;
+        prev_mask_r = stage.mask.r;
+    }
+    Ok(())
+}
+
+/// The smallest power of two at least `value`.
+pub fn pow2_at_least(value: u64) -> Result<u64> {
+    let bits = ceil_log2(value)?;
+    if bits >= 64 {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(1u64 << bits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
