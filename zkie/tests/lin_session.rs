@@ -300,3 +300,160 @@ fn selected_gpt2_linear_claim_session() {
     )
     .is_ok());
 }
+
+#[test]
+#[ignore = "requires ZKIE_SESSION_FIXTURE with the multi-GiB gpt2-seq16 artifact"]
+fn selected_gpt2_output_head_request_session() {
+    use zkie_ops::proof::output_head_lin::{
+        output_head_shape, prove_output_head_lin_request, select_output_head_step,
+        verify_output_head_lin_request_bytes,
+    };
+
+    let fixture = env::var("ZKIE_SESSION_FIXTURE").expect("set ZKIE_SESSION_FIXTURE");
+    let root = Path::new(&fixture).join("gpt2-seq16");
+    let public: ModelCommitmentPublic =
+        bincode::deserialize(&fs::read(root.join("public/model-commitment.bin")).unwrap()).unwrap();
+    let file = fs::File::open(root.join("proof.bin")).unwrap();
+    let trace_bytes = file.metadata().unwrap().len();
+    let mut trace: SharedTrace = bincode::deserialize_from(BufReader::new(file)).unwrap();
+    let plan = zkie_models_gpt2::plan::trace_plan(16).unwrap();
+    let step = select_output_head_step(&plan).unwrap();
+
+    let policy = zkie::policy::parse(&fs::read(root.join("policy.toml")).unwrap()).unwrap();
+    let trusted_request =
+        zkie::policy::select(&policy, "gpt2-seq16", "gpt2", trace.tokens.len()).unwrap();
+    let specs = zkie_models_gpt2::plan::asset_specs();
+    let trusted = TrustedModel {
+        anchor_id: trusted_request.anchor_id,
+        model_id: trusted_request.model_id,
+        parameters_digest: zkie_models_gpt2::plan::parameters_digest().unwrap(),
+        asset_specs: &specs,
+    };
+    let shape = output_head_shape().unwrap();
+
+    let started = Instant::now();
+    let proof = prove_output_head_lin_request(
+        &public,
+        &trusted,
+        &plan,
+        &trace,
+        &trace.tokens,
+        shape,
+        &[],
+    )
+    .unwrap();
+    let prove_ms = started.elapsed().as_millis();
+
+    let bytes = proof.encode();
+    let started = Instant::now();
+    let outcome = verify_output_head_lin_request_bytes(
+        &public,
+        &trusted,
+        &plan,
+        &trace,
+        &trace.tokens,
+        shape,
+        &bytes,
+        &[],
+    )
+    .unwrap();
+    let verify_ms = started.elapsed().as_millis();
+    assert_eq!(outcome.outcomes.len(), 16);
+    for value in &outcome.outcomes {
+        assert!(value.eval_holds && value.dot_holds && value.fold_holds);
+        assert!(value.control_w && value.control_omega);
+    }
+    assert_eq!(outcome.proof_bytes, bytes.len());
+    println!("output_head_step={}", step.step);
+    println!("trace_proof_bytes={trace_bytes}");
+    println!("request_proof_bytes={}", bytes.len());
+    println!(
+        "total_verification_bytes={}",
+        trace_bytes + bytes.len() as u64
+    );
+    println!("prove_ms={prove_ms}");
+    println!("verify_ms={verify_ms}");
+
+    let padded_column = 60000;
+    let original = trace.steps[step.step].message.proof.outputs[0][0].values[padded_column];
+    trace.steps[step.step].message.proof.outputs[0][0].values[padded_column] = original ^ 1;
+    assert!(verify_output_head_lin_request_bytes(
+        &public,
+        &trusted,
+        &plan,
+        &trace,
+        &trace.tokens,
+        shape,
+        &bytes,
+        &[]
+    )
+    .is_err());
+    trace.steps[step.step].message.proof.outputs[0][0].values[padded_column] = original;
+
+    let original = trace.steps[step.step].message.proof.inputs[0][0].values[0];
+    trace.steps[step.step].message.proof.inputs[0][0].values[0] = original ^ 1;
+    assert!(verify_output_head_lin_request_bytes(
+        &public,
+        &trusted,
+        &plan,
+        &trace,
+        &trace.tokens,
+        shape,
+        &bytes,
+        &[]
+    )
+    .is_err());
+    trace.steps[step.step].message.proof.inputs[0][0].values[0] = original;
+
+    let meta = public
+        .assets
+        .iter()
+        .find(|asset| asset.path == step.asset_path)
+        .unwrap();
+    let asset_index = trace
+        .assets
+        .iter()
+        .position(|opening| opening.asset_id == meta.asset_id)
+        .unwrap();
+    let original = trace.assets[asset_index].root;
+    trace.assets[asset_index].root.0[0] ^= 1;
+    assert!(verify_output_head_lin_request_bytes(
+        &public,
+        &trusted,
+        &plan,
+        &trace,
+        &trace.tokens,
+        shape,
+        &bytes,
+        &[]
+    )
+    .is_err());
+    trace.assets[asset_index].root = original;
+
+    let mut changed_plan = plan.clone();
+    changed_plan.steps[step.step].inputs[0] =
+        zkie_ops::proof::plan::PlanSource::prev(step.activation_step.saturating_sub(1), 0);
+    assert!(verify_output_head_lin_request_bytes(
+        &public,
+        &trusted,
+        &changed_plan,
+        &trace,
+        &trace.tokens,
+        shape,
+        &bytes,
+        &[]
+    )
+    .is_err());
+
+    assert!(verify_output_head_lin_request_bytes(
+        &public,
+        &trusted,
+        &plan,
+        &trace,
+        &trace.tokens,
+        shape,
+        &bytes,
+        &[]
+    )
+    .is_ok());
+}

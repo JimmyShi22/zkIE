@@ -604,6 +604,23 @@ pub fn prove_lin_request(
     w_values: &[Fp3],
 ) -> Result<LinRequestMessages> {
     let table = build_authenticated_lin_table(public, trusted, asset_path, opening, shape)?;
+    prove_lin_request_with_table(&table, binding, shape, weights, masks, w_values)
+}
+
+/// Prover path over an already authenticated table. The caller must build the
+/// table with `build_authenticated_lin_table`; this function does not
+/// re-authenticate it.
+pub(crate) fn prove_lin_request_with_table(
+    table: &LinTable,
+    binding: &BindingCandidate,
+    shape: LinShape,
+    weights: &[Fp3],
+    masks: &[LinMask],
+    w_values: &[Fp3],
+) -> Result<LinRequestMessages> {
+    if table.shape != shape {
+        return Err(Error::ShapeMismatch);
+    }
     shape.check()?;
     if w_values.len() as u64 != shape.matrix_columns()? {
         return Err(Error::ShapeMismatch);
@@ -635,7 +652,7 @@ pub fn prove_lin_request(
     }
     let omega_values = table.omega(&shared_point)?;
     let omega = commit_oracle(&OMEGA_LABEL, &omega_values)?;
-    let folded_values = folded_message(&table, &shared_point)?;
+    let folded_values = folded_message(table, &shared_point)?;
     let folded = commit_oracle(&FOLDED_LABEL, &folded_values)?;
     absorb_shared_commit(&mut shared_chain, &omega, &folded)?;
     let zeta = draw_zeta(&mut shared_chain, &shape)?;
@@ -691,6 +708,21 @@ pub fn verify_lin_request(
     messages: &LinRequestMessages,
 ) -> Result<LinRequestOutcome> {
     let table = build_authenticated_lin_table(public, trusted, asset_path, opening, shape)?;
+    verify_lin_request_with_table(&table, binding, shape, messages)
+}
+
+/// Verifier path over an already authenticated table. The caller must build
+/// the table with `build_authenticated_lin_table`; this function does not
+/// re-authenticate it.
+pub(crate) fn verify_lin_request_with_table(
+    table: &LinTable,
+    binding: &BindingCandidate,
+    shape: LinShape,
+    messages: &LinRequestMessages,
+) -> Result<LinRequestOutcome> {
+    if table.shape != shape {
+        return Err(Error::ShapeMismatch);
+    }
     shape.check()?;
     let matrix_rows = usize::try_from(shape.matrix_rows).map_err(|_| Error::ResourceLimit)?;
     let matrix_columns =
@@ -750,11 +782,11 @@ pub fn verify_lin_request(
         target: messages.first.target,
     };
     claim.check(&shape)?;
-    let eval_holds = lin_eval_holds_with(&table, &claim, &messages.first.w.values)?;
+    let eval_holds = lin_eval_holds_with(table, &claim, &messages.first.w.values)?;
     if !eval_holds {
         return Err(Error::InvalidProof);
     }
-    let control_w = check_lin_w_control(&table, weights, &messages.first.w.values)?;
+    let control_w = check_lin_w_control(table, weights, &messages.first.w.values)?;
     if !control_w {
         return Err(Error::InvalidProof);
     }
@@ -783,7 +815,7 @@ pub fn verify_lin_request(
     }
 
     let dot_holds = lin_dot_holds_with_w(
-        &table,
+        table,
         &claim,
         &shared_point,
         &messages.shared.omega.values,
@@ -793,7 +825,7 @@ pub fn verify_lin_request(
         return Err(Error::InvalidProof);
     }
     let control_omega =
-        check_lin_omega_control(&table, &shared_point, &messages.shared.omega.values)?;
+        check_lin_omega_control(table, &shared_point, &messages.shared.omega.values)?;
     if !control_omega {
         return Err(Error::InvalidProof);
     }
