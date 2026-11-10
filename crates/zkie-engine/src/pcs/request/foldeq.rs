@@ -44,7 +44,8 @@ use crate::pcs::request::chain::{
 use crate::pcs::request::field::{Fp, Fp3};
 use crate::pcs::request::gu::{GuMembership, GuNotice, GuOracleShape, GuRegistry, GuShape};
 use crate::pcs::request::relation::{
-    column_plan_rows, foldeq_weights, oracle_sample_row, record_row, sample_cube_of,
+    column_plan_columns, column_row, column_target, foldeq_weights, gu_layout_fault,
+    oracle_sample_row, record_row, sample_cube_of,
     sample_row, GuRelationRow,
 };
 use crate::pcs::request::runtime_tree::{RuntimeTreeOpening, RuntimeTreePlan};
@@ -1000,7 +1001,9 @@ pub struct FoldeqSession {
     gu_answered: usize,
     gu_membership: Option<GuMembership>,
     gu_read_columns: Option<Vec<Vec<Fp>>>,
+    gu_fixture_columns: Option<Vec<(u64, Vec<Fp3>)>>,
     gu_columns_source: Option<GuColumnSource>,
+    gu_column_targets: Vec<Fp3>,
     gu_rows: Vec<GuRelationRow>,
     omega_root: Option<Digest>,
     omega_seeds: Vec<SampleSeed>,
@@ -1051,7 +1054,9 @@ impl FoldeqSession {
             gu_answered: 0,
             gu_membership: None,
             gu_read_columns: None,
+            gu_fixture_columns: None,
             gu_columns_source: None,
+            gu_column_targets: Vec::new(),
             gu_rows: Vec::new(),
             omega_root: None,
             omega_seeds: Vec::new(),
@@ -1113,7 +1118,9 @@ impl FoldeqSession {
             gu_answered: 0,
             gu_membership: None,
             gu_read_columns: None,
+            gu_fixture_columns: None,
             gu_columns_source: None,
+            gu_column_targets: Vec::new(),
             gu_rows: Vec::new(),
             omega_root: None,
             omega_seeds: Vec::new(),
@@ -1448,19 +1455,22 @@ impl FoldeqSession {
         membership.require(&gu, &self.gu_registry)?;
         let gamma = self.gamma.clone().ok_or(Error::InvalidSessionState)?;
         let eq_gamma = foldeq_weights(&gamma, self.plan.reader.shape.v)?;
-        let rows = column_plan_rows(
+        let columns = column_plan_columns(
             &gu,
-            &self.gu_registry,
             self.plan.column_draws,
             self.plan.reader.shape.code.log_n,
             &self.queries,
             fixture_columns,
-            &eq_gamma,
         )?;
-        for row in &rows {
-            membership.check_row(row)?;
+        if gu_layout_fault(&gu).is_some() {
+            return Err(Error::InvalidConfig);
         }
-        self.gu_rows.extend(rows);
+        let mut targets = Vec::with_capacity(columns.len());
+        for (_, column) in &columns {
+            targets.push(column_target(&gu, column, &eq_gamma)?);
+        }
+        self.gu_fixture_columns = Some(fixture_columns.to_vec());
+        self.gu_column_targets = targets;
         self.gu_columns_source = Some(GuColumnSource::Fixture);
         Ok(())
     }
@@ -1522,19 +1532,21 @@ impl FoldeqSession {
         }
         let gamma = self.gamma.clone().ok_or(Error::InvalidSessionState)?;
         let eq_gamma = foldeq_weights(&gamma, self.plan.reader.shape.v)?;
-        let rows = column_plan_rows(
+        let columns = column_plan_columns(
             &gu,
-            &self.gu_registry,
             self.plan.column_draws,
             self.plan.reader.shape.code.log_n,
             &self.queries,
             &columns,
-            &eq_gamma,
         )?;
-        for row in &rows {
-            membership.check_row(row)?;
+        if gu_layout_fault(&gu).is_some() {
+            return Err(Error::InvalidConfig);
         }
-        self.gu_rows.extend(rows);
+        let mut targets = Vec::with_capacity(columns.len());
+        for (_, column) in &columns {
+            targets.push(column_target(&gu, column, &eq_gamma)?);
+        }
+        self.gu_column_targets = targets;
         self.gu_columns_source = Some(GuColumnSource::Verified);
         Ok(())
     }
@@ -1740,6 +1752,51 @@ impl FoldeqSession {
 
     pub fn pending_gu_rows(&self) -> &[GuRelationRow] {
         &self.gu_rows
+    }
+
+    /// The logical column draws whose targets are pending in this session.
+    /// Column coefficient rows are built one at a time on demand from the
+    /// verified columns instead of being retained as dense tables.
+    pub fn pending_column_count(&self) -> usize {
+        self.gu_column_targets.len()
+    }
+
+    pub fn column_targets(&self) -> &[Fp3] {
+        &self.gu_column_targets
+    }
+
+    /// Build one pending column relation row from its source. The caller gets
+    /// one row at a time, so a large draw set is never all materialized.
+    pub fn column_relation_row(&self, draw: usize) -> Result<GuRelationRow> {
+        let source = self
+            .gu_columns_source
+            .ok_or(Error::InvalidSessionState)?;
+        let gu = self.plan.gu.as_ref().ok_or(Error::InvalidSessionState)?;
+        let position = *self.queries.get(draw).ok_or(Error::InvalidIndex)?;
+        let gamma = self.gamma.as_ref().ok_or(Error::InvalidSessionState)?;
+        let eq_gamma = foldeq_weights(gamma, self.plan.reader.shape.v)?;
+        match source {
+            GuColumnSource::Fixture => {
+                let fixture = self
+                    .gu_fixture_columns
+                    .as_ref()
+                    .ok_or(Error::InvalidSessionState)?;
+                let (_, column) = fixture
+                    .iter()
+                    .find(|(at, _)| *at == position)
+                    .ok_or(Error::StatementMismatch)?;
+                column_row(gu, &self.gu_registry, position, column, &eq_gamma)
+            }
+            GuColumnSource::Verified => {
+                let reads = self
+                    .gu_read_columns
+                    .as_ref()
+                    .ok_or(Error::InvalidSessionState)?;
+                let read = reads.get(draw).ok_or(Error::InvalidIndex)?;
+                let column: Vec<Fp3> = read.iter().map(|value| Fp3::from_base(*value)).collect();
+                column_row(gu, &self.gu_registry, position, &column, &eq_gamma)
+            }
+        }
     }
 
     pub fn omega_rows(&self) -> &[GuRelationRow] {
@@ -3556,11 +3613,16 @@ mod tests {
         assert!(session.join_gu_columns(&fixture).is_err());
         assert!(session.draw_queries().is_err());
         let rows = session.pending_gu_rows();
-        assert_eq!(rows.len(), 1 + 1 + queries.len());
+        assert_eq!(rows.len(), 2);
         assert_eq!(rows.iter().filter(|row| row.kind == GuRelationKind::Sample).count(), 1);
         assert_eq!(rows.iter().filter(|row| row.kind == GuRelationKind::Record).count(), 1);
-        assert_eq!(rows.iter().filter(|row| row.kind == GuRelationKind::Column).count(), queries.len());
-        assert!(rows.iter().all(|row| row.oracle == 10 && row.group == 1));
+        assert_eq!(session.pending_column_count(), queries.len());
+        for draw in 0..session.pending_column_count() {
+            let column = session.column_relation_row(draw).unwrap();
+            assert_eq!(column.oracle, 10);
+            assert_eq!(column.group, 1);
+            assert_eq!(column.kind, GuRelationKind::Column);
+        }
     }
 
     #[test]
@@ -3719,7 +3781,8 @@ mod tests {
         session.join_gu_read_columns().unwrap();
         assert!(session.join_gu_read_columns().is_err());
         session.start_fold(&start.message).unwrap();
-        assert_eq!(session.pending_gu_rows().len(), 2 + queries.len());
+        assert_eq!(session.pending_gu_rows().len(), 2);
+        assert_eq!(session.pending_column_count(), queries.len());
     }
 
     #[test]
@@ -3800,13 +3863,9 @@ mod tests {
             .collect();
         session.read_queries(&ordered).unwrap();
         session.join_gu_read_columns().unwrap();
-        let rows = session.pending_gu_rows();
-        let columns: Vec<_> = rows
-            .iter()
-            .filter(|row| row.kind == GuRelationKind::Column)
-            .collect();
-        assert_eq!(columns.len(), queries.len());
-        for column in columns {
+        assert_eq!(session.pending_column_count(), queries.len());
+        for draw in 0..session.pending_column_count() {
+            let column = session.column_relation_row(draw).unwrap();
             assert_eq!(column.evaluate(&witness).unwrap(), column.target);
         }
     }
@@ -3862,15 +3921,11 @@ mod tests {
         );
         assert_eq!(session.plan().column_draws, queries.len());
         session.join_gu_read_columns().unwrap();
-        let rows = session.pending_gu_rows();
-        let columns: Vec<_> = rows
-            .iter()
-            .filter(|row| row.kind == GuRelationKind::Column)
-            .collect();
-        assert_eq!(columns.len(), queries.len());
+        assert_eq!(session.pending_column_count(), queries.len());
         let mut targets = std::collections::HashMap::new();
         let mut repeats = 0usize;
-        for (position, row) in queries.iter().zip(columns) {
+        for (draw, position) in queries.iter().enumerate() {
+            let row = session.column_relation_row(draw).unwrap();
             match targets.get(position) {
                 Some(target) => {
                     assert_eq!(*target, row.target);

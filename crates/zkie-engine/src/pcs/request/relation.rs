@@ -501,6 +501,28 @@ fn generator_tail(
     Ok(tail)
 }
 
+/// Validate one provided column against a column-relation shape and fold it
+/// at `eq_gamma` into the target. The caller has already checked the shape's
+/// binding and layout; the column length, base-field limbs and weights are
+/// checked here. This is the target half of `column_row`.
+pub fn column_target(shape: &GuShape, column: &[Fp3], eq_gamma: &[Fp3]) -> Result<Fp3> {
+    let rows = usize::try_from(shape.index.rows()).map_err(|_| Error::ResourceLimit)?;
+    if column.len() != rows || eq_gamma.len() != rows {
+        return Err(Error::ShapeMismatch);
+    }
+    if column
+        .iter()
+        .any(|value| value.c[1] != Fp::ZERO || value.c[2] != Fp::ZERO)
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut target = Fp3::ZERO;
+    for (weight, value) in eq_gamma.iter().zip(column) {
+        target = target.add(&weight.mul(value));
+    }
+    Ok(target)
+}
+
 /// Build one column-query relation row: the generator coefficients of the
 /// indexed code at the drawn position, placed on the G_u main table, with the
 /// target equal to the provided index column (a fixture; the opening is not
@@ -516,16 +538,10 @@ pub fn column_row(
     if gu_layout_fault(shape).is_some() {
         return Err(Error::InvalidConfig);
     }
-    let rows = usize::try_from(shape.index.rows()).map_err(|_| Error::ResourceLimit)?;
-    if position >= shape.index.code.n() || column.len() != rows || eq_gamma.len() != rows {
+    if position >= shape.index.code.n() {
         return Err(Error::ShapeMismatch);
     }
-    if column
-        .iter()
-        .any(|value| value.c[1] != Fp::ZERO || value.c[2] != Fp::ZERO)
-    {
-        return Err(Error::ShapeMismatch);
-    }
+    let target = column_target(shape, column, eq_gamma)?;
     let message = generator_message(&shape.index.code, position)?;
     let tail = generator_tail(&shape.index.code, position)?;
     let first = tail_first(&shape.index.code)?;
@@ -550,10 +566,6 @@ pub fn column_row(
         )?;
     }
     mask.iter_mut().for_each(|coefficient| *coefficient = Fp3::ZERO);
-    let mut target = Fp3::ZERO;
-    for (weight, value) in eq_gamma.iter().zip(column) {
-        target = target.add(&weight.mul(value));
-    }
     Ok(GuRelationRow {
         oracle: shape.oracle,
         group: shape.group,
@@ -591,13 +603,11 @@ pub fn unique_positions(trusted: &[u64]) -> Vec<u64> {
 /// every logical draw, repeats included, reuses the column of its position.
 /// A repeated position with two different columns is rejected before any
 /// target comparison, so a zero equation weight cannot hide the difference.
-pub fn column_rows_from_draws(
+fn checked_column_draws<'a>(
     shape: &GuShape,
-    registry: &GuRegistry,
     trusted_draws: &[u64],
-    fixture_columns: &[(u64, Vec<Fp3>)],
-    eq_gamma: &[Fp3],
-) -> Result<Vec<GuRelationRow>> {
+    fixture_columns: &'a [(u64, Vec<Fp3>)],
+) -> Result<Vec<(u64, &'a [Fp3])>> {
     if trusted_draws.is_empty() || fixture_columns.is_empty() {
         return Err(Error::StatementMismatch);
     }
@@ -615,15 +625,29 @@ pub fn column_rows_from_draws(
             return Err(Error::ShapeMismatch);
         }
     }
-    let mut rows = Vec::with_capacity(trusted_draws.len());
+    let mut columns = Vec::with_capacity(trusted_draws.len());
     for position in trusted_draws {
         let (_, column) = fixture_columns
             .iter()
             .find(|(at, _)| at == position)
             .ok_or(Error::StatementMismatch)?;
-        rows.push(column_row(shape, registry, *position, column, eq_gamma)?);
+        columns.push((*position, column.as_slice()));
     }
-    Ok(rows)
+    Ok(columns)
+}
+
+pub fn column_rows_from_draws(
+    shape: &GuShape,
+    registry: &GuRegistry,
+    trusted_draws: &[u64],
+    fixture_columns: &[(u64, Vec<Fp3>)],
+    eq_gamma: &[Fp3],
+) -> Result<Vec<GuRelationRow>> {
+    let columns = checked_column_draws(shape, trusted_draws, fixture_columns)?;
+    columns
+        .into_iter()
+        .map(|(position, column)| column_row(shape, registry, position, column, eq_gamma))
+        .collect()
 }
 
 /// The isolated plan-driven column entry: the trusted plan supplies the
@@ -643,6 +667,24 @@ pub fn column_plan_rows(
     fixture_columns: &[(u64, Vec<Fp3>)],
     eq_gamma: &[Fp3],
 ) -> Result<Vec<GuRelationRow>> {
+    let columns = column_plan_columns(shape, planned_columns, index_log_n, draws, fixture_columns)?;
+    columns
+        .into_iter()
+        .map(|(position, column)| column_row(shape, registry, position, column, eq_gamma))
+        .collect()
+}
+
+/// Validate the plan-driven draw and fixture-column list and resolve the
+/// provided column of every logical draw, without building relation rows.
+/// The checks are the ones `column_plan_rows` applies: planned count, index
+/// domain, and the unique-position column list in draw order.
+pub fn column_plan_columns<'a>(
+    shape: &GuShape,
+    planned_columns: usize,
+    index_log_n: u32,
+    draws: &[u64],
+    fixture_columns: &'a [(u64, Vec<Fp3>)],
+) -> Result<Vec<(u64, &'a [Fp3])>> {
     if planned_columns == 0 || draws.len() != planned_columns {
         return Err(Error::ShapeMismatch);
     }
@@ -653,7 +695,7 @@ pub fn column_plan_rows(
     if draws.iter().any(|position| *position >= domain) {
         return Err(Error::InvalidIndex);
     }
-    column_rows_from_draws(shape, registry, draws, fixture_columns, eq_gamma)
+    checked_column_draws(shape, draws, fixture_columns)
 }
 
 /// The sample cube of one G_u oracle shape: the main and mask table bit

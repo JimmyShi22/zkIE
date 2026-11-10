@@ -557,22 +557,23 @@ impl BatStatement {
     pub fn begin_run(&mut self, group: u64) -> Result<BatRunInput> {
         let layout = self.layout(group)?;
         let (members, mut plain, mut generator) = {
-            let entry = self.group(group)?;
+            let entry = self.group_mut(group)?;
             if entry.in_run || entry.members.is_empty() {
                 return Err(Error::InvalidSessionState);
             }
-            let plain = entry
-                .rows
-                .iter()
-                .filter(|row| row.kind == BatRowKind::Plain)
-                .cloned()
-                .collect::<Vec<_>>();
-            let generator = entry
-                .rows
-                .iter()
-                .filter(|row| row.kind == BatRowKind::Generator)
-                .cloned()
-                .collect::<Vec<_>>();
+            // The frozen run owns the registered rows; moving them out keeps
+            // one representation of the claim set instead of duplicating it
+            // while the group is closed.
+            let rows = std::mem::take(&mut entry.rows);
+            let mut plain = Vec::new();
+            let mut generator = Vec::new();
+            for row in rows {
+                match row.kind {
+                    BatRowKind::Plain => plain.push(row),
+                    BatRowKind::Generator => generator.push(row),
+                    BatRowKind::Sample => {}
+                }
+            }
             (entry.members.clone(), plain, generator)
         };
         let mut rows = Vec::new();
@@ -592,7 +593,6 @@ impl BatStatement {
         }
         let entry = self.group_mut(group)?;
         entry.in_run = true;
-        entry.rows.clear();
         Ok(BatRunInput { layout, rows })
     }
 
@@ -1041,6 +1041,66 @@ fn carry_table(
         let slot = target
             .get_mut(at as usize)
             .ok_or(Error::InvalidIndex)?;
+        *slot = slot.add(&scale.mul(value));
+    }
+    Ok(())
+}
+
+/// Add one compact row-major main-table coefficient vector to a combined
+/// group row. The vector is stored as `row * ell + place`, the compact table
+/// layout, and is mapped into the group row one entry at a time without
+/// materializing the virtual table. A kept member is rejected: its compact
+/// form would need the whole virtual table, and this bounded entry is only for
+/// members whose table is folded into the group row.
+pub fn carry_compact_table(
+    statement: &BatStatement,
+    layout: &BatGroupLayout,
+    oracle: u64,
+    main: &[Fp3],
+    main_rows: u64,
+    ell: u64,
+    scale: Fp3,
+    out: &mut BatGroupRow,
+) -> Result<()> {
+    let shape = statement.oracle(oracle)?.shape;
+    let member = layout
+        .members
+        .iter()
+        .find(|member| member.oracle == oracle)
+        .ok_or(Error::StatementMismatch)?;
+    if !shape.has(BatPart::Main) || member.kept {
+        return Err(Error::UnsupportedPrimitive);
+    }
+    let ell_bits = 1u64
+        .checked_shl(shape.log_ell(BatPart::Main))
+        .ok_or(Error::ResourceLimit)?;
+    if main_rows != shape.main_rows || ell != ell_bits {
+        return Err(Error::ShapeMismatch);
+    }
+    let len = usize::try_from(
+        main_rows
+            .checked_mul(ell)
+            .ok_or(Error::ResourceLimit)?,
+    )
+    .map_err(|_| Error::ResourceLimit)?;
+    if main.len() != len {
+        return Err(Error::ShapeMismatch);
+    }
+    let row_bits = shape.row_bits(BatPart::Main);
+    let bits = layout.group_row_bits(BatPart::Main);
+    let first = member.main_first.ok_or(Error::StatementMismatch)?;
+    for (offset, value) in main.iter().enumerate() {
+        if *value == Fp3::ZERO {
+            continue;
+        }
+        let offset = offset as u64;
+        let row = offset / ell;
+        let place = offset % ell;
+        let virtual_index = row
+            .checked_add(place.checked_shl(row_bits).ok_or(Error::ResourceLimit)?)
+            .ok_or(Error::ResourceLimit)?;
+        let at = group_index(virtual_index, row_bits, first, bits)?;
+        let slot = out.main.get_mut(at as usize).ok_or(Error::InvalidIndex)?;
         *slot = slot.add(&scale.mul(value));
     }
     Ok(())
