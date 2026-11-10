@@ -31,7 +31,7 @@ use zkie_engine::pcs::request::params::{RequestParams, SHARED_CHAIN_LABEL};
 use zkie_engine::pcs::request::plan::{CompiledPlan, RequestPlan};
 use zkie_engine::pcs::request::read::{unique_sorted, HidingState, ReadLedger};
 use zkie_engine::pcs::request::relation::{
-    foldeq_weights, gu_sample_pad_offsets, gu_table, sample_row, GuWitness,
+    foldeq_weights, gu_sample_pad_offsets, gu_table, oracle_sample_row, sample_row, GuWitness,
 };
 use zkie_engine::pcs::request::runtime_tree::{
     MaskTreePlan, RuntimePartRows, RuntimeTree, RuntimeTreePart, RuntimeTreePlan,
@@ -709,6 +709,7 @@ pub struct LmHeadGuRandomness {
 pub struct LmHeadGuProvider {
     shape: GuShape,
     witness: GuWitness,
+    folded: Vec<Fp3>,
     root: Digest,
     registry: GuRegistry,
 }
@@ -724,6 +725,12 @@ impl LmHeadGuProvider {
 
     pub fn root(&self) -> Digest {
         self.root
+    }
+
+    /// The folded message before its placement in the G_u table. Omega is the
+    /// block sum of this vector under the low column point.
+    pub fn folded(&self) -> &[Fp3] {
+        &self.folded
     }
 
     /// The complete ordered sample answers for the verifier's seeds. The
@@ -860,8 +867,184 @@ pub fn fold_lm_head_gu(
     Ok(LmHeadGuProvider {
         shape: shape.clone(),
         witness,
+        folded,
         root,
         registry,
+    })
+}
+
+/// The private values of one Omega commitment: the oracle code tails, one
+/// salt per runtime-tree column and one sample pad.
+pub struct LmHeadOmegaRandomness {
+    pub code_tails: Vec<Vec<Fp3>>,
+    pub salts: Vec<Vec<u8>>,
+    pub pad: Fp3,
+}
+
+/// The provider's committed Omega message: its row view, root and the plan
+/// shape it was committed under.
+pub struct LmHeadOmegaProvider {
+    oracle: u64,
+    group: u64,
+    u: GuOracleShape,
+    tree: RuntimeTreePlan,
+    message: Vec<Fp3>,
+    root: Digest,
+}
+
+impl LmHeadOmegaProvider {
+    pub fn oracle(&self) -> u64 {
+        self.oracle
+    }
+
+    pub fn group(&self) -> u64 {
+        self.group
+    }
+
+    pub fn shape(&self) -> &GuOracleShape {
+        &self.u
+    }
+
+    pub fn root(&self) -> Digest {
+        self.root
+    }
+
+    pub fn message(&self) -> &[Fp3] {
+        &self.message
+    }
+
+    /// The complete ordered sample answers for the verifier's seeds. It uses
+    /// the same ordinary-oracle sample relation the verifier will apply.
+    pub fn answers(&self, seeds: &[SampleSeed]) -> Result<Vec<Fp3>> {
+        let witness = GuWitness {
+            main: self.message.clone(),
+            mask: Vec::new(),
+        };
+        let mut answers = Vec::with_capacity(self.u.answers as usize);
+        for answer in 0..self.u.answers {
+            let row = oracle_sample_row(
+                self.oracle,
+                self.group,
+                &self.u,
+                seeds,
+                answer,
+                Fp3::ZERO,
+            )?;
+            answers.push(row.evaluate(&witness)?);
+        }
+        Ok(answers)
+    }
+}
+
+/// The block sums of the folded message under the low column point:
+/// `Omega[y] = Σ_{low < 2^k_lo} eq(psi_lo, low) · folded[low + (y << k_lo)]`.
+/// It reads only the matrix rows, never the folded tail.
+pub fn omega_blocks(
+    folded: &[Fp3],
+    matrix_rows: u64,
+    k_lo: u32,
+    psi_lo: &[Fp3],
+) -> Result<Vec<Fp3>> {
+    if matrix_rows == 0 || psi_lo.len() != k_lo as usize || k_lo >= 32 {
+        return Err(Error::InvalidConfig);
+    }
+    let weights = foldeq_weights(psi_lo, k_lo)?;
+    let required = matrix_rows
+        .checked_shl(k_lo)
+        .ok_or(Error::ResourceLimit)?;
+    if required > folded.len() as u64 {
+        return Err(Error::ShapeMismatch);
+    }
+    let rows = usize::try_from(matrix_rows).map_err(|_| Error::ResourceLimit)?;
+    let low_count = 1usize
+        .checked_shl(k_lo)
+        .ok_or(Error::ResourceLimit)?;
+    let mut omega = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let base = row.checked_mul(low_count).ok_or(Error::ResourceLimit)?;
+        let mut value = Fp3::ZERO;
+        for (low, weight) in weights.iter().enumerate() {
+            value = value.add(&weight.mul(
+                folded
+                    .get(base + low)
+                    .ok_or(Error::ShapeMismatch)?,
+            ));
+        }
+        omega.push(value);
+    }
+    Ok(omega)
+}
+
+/// Commits the Omega message for the folded row. The omega vector occupies the
+/// leading message slots; the sample pad sits in the reserved slot and the
+/// code tails are the caller's private values. The runtime tree is the plan's.
+#[allow(clippy::too_many_arguments)]
+pub fn commit_lm_head_omega(
+    gu: &LmHeadGuProvider,
+    oracle: u64,
+    group: u64,
+    u: &GuOracleShape,
+    tree: &RuntimeTreePlan,
+    matrix_rows: u64,
+    k_lo: u32,
+    psi_lo: &[Fp3],
+    randomness: &LmHeadOmegaRandomness,
+) -> Result<LmHeadOmegaProvider> {
+    if u.fault().is_some() || u.mask_rows != 0 || tree.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let ell = usize::try_from(u.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let rows = usize::try_from(u.main_rows).map_err(|_| Error::ResourceLimit)?;
+    let tail = usize::try_from(u.code.r).map_err(|_| Error::ResourceLimit)?;
+    if u.answers != 1
+        || randomness.code_tails.len() != rows
+        || randomness
+            .code_tails
+            .iter()
+            .any(|values| values.len() != tail)
+        || randomness.salts.len() != usize::try_from(tree.columns())
+            .map_err(|_| Error::ResourceLimit)?
+        || randomness
+            .salts
+            .iter()
+            .any(|salt| salt.len() != tree.salt_bytes)
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let omega = omega_blocks(gu.folded(), matrix_rows, k_lo, psi_lo)?;
+    let mut message = vec![Fp3::ZERO; rows.checked_mul(ell).ok_or(Error::ResourceLimit)?];
+    let pad_slot = ell - u.answers as usize;
+    if omega.len() > pad_slot {
+        return Err(Error::ShapeMismatch);
+    }
+    message[..omega.len()].copy_from_slice(&omega);
+    message[pad_slot] = randomness.pad;
+    let mut codewords = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let start = row.checked_mul(ell).ok_or(Error::ResourceLimit)?;
+        let end = start.checked_add(ell).ok_or(Error::ResourceLimit)?;
+        codewords.push(encode_row_fp3(
+            &u.code,
+            message.get(start..end).ok_or(Error::ShapeMismatch)?,
+            &randomness.code_tails[row],
+        )?);
+    }
+    let committed = RuntimeTree::commit(
+        tree.clone(),
+        &[RuntimePartRows {
+            main: codewords,
+            mask: Vec::new(),
+            main_deg: u.main_deg,
+        }],
+        &randomness.salts,
+    )?;
+    Ok(LmHeadOmegaProvider {
+        oracle,
+        group,
+        u: *u,
+        tree: tree.clone(),
+        message,
+        root: *committed.root(),
     })
 }
 
@@ -2001,6 +2184,88 @@ mod tests {
         assert_eq!(run.answers.len(), 1);
         assert_eq!(run.queries.len(), 2);
         assert_eq!(session.pending_gu_rows().len(), 4);
+    }
+
+
+    #[test]
+    fn omega_blocks_sum_the_folded_matrix_rows() {
+        let psi_lo = vec![Fp3::from_u64(2), Fp3::from_u64(3)];
+        let folded: Vec<Fp3> = (0..16).map(|index| Fp3::from_u64(index + 1)).collect();
+        let omega = omega_blocks(&folded, 4, 2, &psi_lo).expect("omega");
+        let weights = foldeq_weights(&psi_lo, 2).expect("weights");
+        for row in 0..4usize {
+            let mut expected = Fp3::ZERO;
+            for low in 0..4usize {
+                expected = expected.add(&weights[low].mul(&folded[row * 4 + low]));
+            }
+            assert_eq!(omega[row], expected);
+        }
+        assert!(omega_blocks(&folded, 4, 3, &psi_lo).is_err());
+        assert!(omega_blocks(&folded[..8], 4, 2, &psi_lo).is_err());
+    }
+
+    #[test]
+    fn the_omega_message_commits_and_answers_the_seed() {
+        use zkie_engine::pcs::request::code::build_code_plan;
+        let (key, gu_shape, randomness, tails, _parameters) = small_gu_fixture();
+        let gamma = vec![Fp3::from_u64(2), Fp3::from_u64(3)];
+        let gu = fold_lm_head_gu(&key, &tails, &gu_shape, &gamma, &randomness)
+            .expect("fold");
+        let omega_code = build_code_plan(4, 8, 1).expect("omega code");
+        let u = GuOracleShape {
+            code: omega_code,
+            main_rows: 1,
+            main_deg: 3,
+            mask_rows: 0,
+            mask_code: None,
+            answers: 1,
+        };
+        let tree = RuntimeTreePlan {
+            tree_number: 3,
+            leaf_class: 1,
+            log_n: omega_code.log_n,
+            log_n_zk: omega_code.log_n,
+            parts: vec![RuntimeTreePart {
+                main_symbols: 3,
+                mask_symbols: 0,
+            }],
+            salt_bytes: 40,
+            run: Digest([0x34; 32]),
+            configuration: key.reader.configuration,
+        };
+        let psi_lo: Vec<Fp3> = Vec::new();
+        let omega_randomness = LmHeadOmegaRandomness {
+            code_tails: vec![vec![Fp3::from_u64(9)]],
+            salts: (0..16)
+                .map(|position| vec![(position as u8) ^ 0x33; 40])
+                .collect(),
+            pad: Fp3::from_u64(0x888),
+        };
+        let omega = commit_lm_head_omega(
+            &gu,
+            2,
+            1,
+            &u,
+            &tree,
+            4,
+            0,
+            &psi_lo,
+            &omega_randomness,
+        )
+        .expect("omega commit");
+        assert_ne!(omega.root(), Digest::ZERO);
+        let seeds = vec![SampleSeed {
+            z: vec![Fp3::from_u64(3); 3],
+            beta: Fp3::from_u64(7),
+        }];
+        let answers = omega.answers(&seeds).expect("answers");
+        assert_eq!(answers.len(), 1);
+        let row = oracle_sample_row(2, 1, &u, &seeds, 0, answers[0]).expect("row");
+        let witness = GuWitness {
+            main: omega.message().to_vec(),
+            mask: Vec::new(),
+        };
+        assert_eq!(row.evaluate(&witness).expect("eval"), answers[0]);
     }
 
 }

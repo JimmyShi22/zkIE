@@ -22,7 +22,7 @@ use zkie_core::error::{Error, Result};
 
 use crate::pcs::request::code::factors;
 use crate::pcs::request::field::{Fp, Fp3, E_DEGREE};
-use crate::pcs::request::gu::{GuRegistry, GuShape};
+use crate::pcs::request::gu::{GuOracleShape, GuRegistry, GuShape};
 use crate::pcs::request::table::{
     record_seeds, IndexRecord, SampleSeed,
 };
@@ -193,21 +193,19 @@ fn check_binding(shape: &GuShape, registry: &GuRegistry) -> Result<()> {
     Ok(())
 }
 
-fn empty_main(shape: &GuShape) -> Result<Vec<Fp3>> {
-    let len = shape
-        .u
+fn empty_main(u: &GuOracleShape) -> Result<Vec<Fp3>> {
+    let len = u
         .main_rows
-        .checked_mul(shape.u.code.ell)
+        .checked_mul(u.code.ell)
         .ok_or(Error::ResourceLimit)?;
     usize::try_from(len)
         .map(|len| vec![Fp3::ZERO; len])
         .map_err(|_| Error::ResourceLimit)
 }
 
-fn empty_mask(shape: &GuShape) -> Result<Vec<Fp3>> {
-    let len = match shape.u.mask_code {
-        Some(code) => shape
-            .u
+fn empty_mask(u: &GuOracleShape) -> Result<Vec<Fp3>> {
+    let len = match u.mask_code {
+        Some(code) => u
             .mask_rows
             .checked_mul(code.ell)
             .ok_or(Error::ResourceLimit)?,
@@ -322,8 +320,8 @@ pub fn gu_table(shape: &GuShape, message: &[Fp3], tail: &[Fp3]) -> Result<GuWitn
         return Err(Error::ShapeMismatch);
     }
     let (main_pads, mask_pads) = gu_sample_pad_offsets(shape)?;
-    let mut main = empty_main(shape)?;
-    let mask = empty_mask(shape)?;
+    let mut main = empty_main(&shape.u)?;
+    let mask = empty_mask(&shape.u)?;
     let first = tail_first(&shape.index.code)?;
     for (entry, value) in message.iter().enumerate() {
         let offset = vector_index(shape, entry as u64)
@@ -393,8 +391,8 @@ pub fn record_row(
     if seed.z.len() < bits as usize || seed.beta == Fp3::ZERO {
         return Err(Error::ShapeMismatch);
     }
-    let mut main = empty_main(shape)?;
-    let mut mask = empty_mask(shape)?;
+    let mut main = empty_main(&shape.u)?;
+    let mut mask = empty_mask(&shape.u)?;
     for entry in 0..shape.index.code.ell {
         add_entry(shape, &mut main, entry, eq_index(entry, &seed.z, bits)?, true)?;
     }
@@ -520,8 +518,8 @@ pub fn column_row(
     let message = generator_message(&shape.index.code, position)?;
     let tail = generator_tail(&shape.index.code, position)?;
     let first = tail_first(&shape.index.code)?;
-    let mut main = empty_main(shape)?;
-    let mut mask = empty_mask(shape)?;
+    let mut main = empty_main(&shape.u)?;
+    let mut mask = empty_mask(&shape.u)?;
     for (entry, coefficient) in message.iter().enumerate() {
         add_entry(
             shape,
@@ -661,7 +659,12 @@ pub struct SampleCube {
 }
 
 pub fn sample_cube(shape: &GuShape) -> Result<SampleCube> {
-    let u = &shape.u;
+    sample_cube_of(&shape.u)
+}
+
+/// The sample cube of an ordinary oracle message: its own code, rows, mask
+/// and answer count. It is the same cube the G_u path uses.
+pub fn sample_cube_of(u: &GuOracleShape) -> Result<SampleCube> {
     let main_bits = ceil_log2(u.main_rows)
         .checked_add(u.code.log_ell())
         .ok_or(Error::ResourceLimit)?;
@@ -759,16 +762,58 @@ pub fn sample_row(
     target: Fp3,
 ) -> Result<GuRelationRow> {
     check_binding(shape, registry)?;
-    if answer >= shape.u.answers || seeds.len() < shape.u.answers as usize {
+    let (main, mask) = sample_coefficients(&shape.u, seeds, answer, target)?;
+    Ok(GuRelationRow {
+        oracle: shape.oracle,
+        group: shape.group,
+        kind: GuRelationKind::Sample,
+        main,
+        mask,
+        target,
+    })
+}
+
+/// The SEND sample row of an ordinary oracle message, built from the same
+/// cube and helpers as the G_u path. The coefficients are over the oracle's
+/// own main table (and mask rows, if any); the target is the received answer.
+pub fn oracle_sample_row(
+    oracle: u64,
+    group: u64,
+    u: &GuOracleShape,
+    seeds: &[SampleSeed],
+    answer: u32,
+    target: Fp3,
+) -> Result<GuRelationRow> {
+    if u.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let (main, mask) = sample_coefficients(u, seeds, answer, target)?;
+    Ok(GuRelationRow {
+        oracle,
+        group,
+        kind: GuRelationKind::Sample,
+        main,
+        mask,
+        target,
+    })
+}
+
+fn sample_coefficients(
+    u: &GuOracleShape,
+    seeds: &[SampleSeed],
+    answer: u32,
+    target: Fp3,
+) -> Result<(Vec<Fp3>, Vec<Fp3>)> {
+    if answer >= u.answers || seeds.len() < u.answers as usize {
         return Err(Error::ShapeMismatch);
     }
-    let cube = sample_cube(shape)?;
+    let cube = sample_cube_of(u)?;
     let seed = &seeds[answer as usize];
     if seed.z.len() < cube.bits as usize || seed.beta == Fp3::ZERO {
         return Err(Error::ShapeMismatch);
     }
-    let mut main = empty_main(shape)?;
-    let mut mask = empty_mask(shape)?;
+    let mut main = empty_main(u)?;
+    let mut mask = empty_mask(u)?;
     if cube.has_main {
         let front = sample_front(seed, &cube, cube.main_bits, false)?;
         let count = 1u64
@@ -776,9 +821,9 @@ pub fn sample_row(
             .ok_or(Error::ResourceLimit)?;
         for virtual_index in 0..count {
             if let Some(offset) = physical_offset(
-                shape.u.main_rows,
+                u.main_rows,
                 cube.main_row_bits,
-                shape.u.code.ell,
+                u.code.ell,
                 virtual_index,
             )? {
                 main[offset] =
@@ -789,25 +834,25 @@ pub fn sample_row(
             sample_pad(
                 &mut main,
                 seed,
-                shape.u.answers,
+                u.answers,
                 answer,
-                shape.u.main_rows,
+                u.main_rows,
                 cube.main_row_bits,
-                shape.u.code.ell,
+                u.code.ell,
                 cube.main_bits,
                 front,
             )?;
         }
     }
     if cube.has_mask {
-        let code = shape.u.mask_code.ok_or(Error::ShapeMismatch)?;
+        let code = u.mask_code.ok_or(Error::ShapeMismatch)?;
         let front = sample_front(seed, &cube, cube.mask_bits, true)?;
         let count = 1u64
             .checked_shl(cube.mask_bits)
             .ok_or(Error::ResourceLimit)?;
         for virtual_index in 0..count {
             if let Some(offset) = physical_offset(
-                shape.u.mask_rows,
+                u.mask_rows,
                 cube.mask_row_bits,
                 code.ell,
                 virtual_index,
@@ -819,23 +864,16 @@ pub fn sample_row(
         sample_pad(
             &mut mask,
             seed,
-            shape.u.answers,
+            u.answers,
             answer,
-            shape.u.mask_rows,
+            u.mask_rows,
             cube.mask_row_bits,
             code.ell,
             cube.mask_bits,
             front,
         )?;
     }
-    Ok(GuRelationRow {
-        oracle: shape.oracle,
-        group: shape.group,
-        kind: GuRelationKind::Sample,
-        main,
-        mask,
-        target,
-    })
+    Ok((main, mask))
 }
 
 /// One shared seed set for the sampled oracles of one SEND message: the
