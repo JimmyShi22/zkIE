@@ -1,9 +1,15 @@
-//! Isolated two-stage proximity plan and single-row handoff.
+//! CS/BASE local algebraic component: plan, statement view and row handoff.
 //!
 //! This is candidate development code. It defines only the verifier-side plan
 //! constraints, the verifier-side statement view and the prover-side row
-//! handoff used by the isolated CS/BASE demonstration. It does not implement a
-//! complete proximity test, a production statement or a proof-byte format.
+//! handoff used by the local CS/BASE algebraic component. It does not implement
+//! a complete proximity test, a production statement or a proof-byte format.
+//!
+//! The checks are the implemented subset, not an iopp_fault-equivalent check.
+//! The k = 0, ell = 6 fixture is an algebraic fixture and is not claimed to
+//! satisfy iopp_fault. Real IOPP needs a real FOLD output and witness source,
+//! every applicable plan constraint, and a real SEND sample declaration with
+//! its follow-up checks; those remain on the project unclosed list.
 
 use zkie_core::error::{Error, Result};
 
@@ -38,12 +44,13 @@ pub struct ProximityStage {
     pub choice: ChoiceReference,
 }
 
-/// The independent verifier plan for the isolated CS -> BASE chain.
+/// The independent verifier plan for the local CS -> BASE algebraic component.
 ///
 /// The plan is supplied by the verifier, not by the proof. It fixes the input
 /// codes and the two stage shapes. The implemented subset requires exactly one
 /// code-switch stage followed by one BASE stage; adjacent code lengths and
-/// mask capacity are checked, and the last stage has no folded rows.
+/// mask capacity are checked, and the last stage has no folded rows. These are
+/// implemented-subset constraints, not an iopp_fault-equivalent check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProximityPlan {
     pub input_code: CodeParams,

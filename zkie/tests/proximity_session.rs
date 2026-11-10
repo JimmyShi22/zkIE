@@ -4,8 +4,9 @@ use std::io::BufReader;
 use std::path::Path;
 use std::time::Instant;
 
-use zkie_engine::pcs::request::code::build_code_plan;
+use zkie_engine::pcs::request::code::{build_code_plan, evaluate_ood_fp3, CodeParams};
 use zkie_engine::pcs::request::field::Fp3;
+use zkie_engine::pcs::request::cs_stage;
 use zkie_engine::pcs::request::proximity::{
     ProximityPlan, ProximityStage, ProximityStatement, SingleRows, StageRole,
 };
@@ -13,8 +14,22 @@ use zkie_ops::proof::lin_session::fp3_from_signed_word;
 use zkie_ops::proof::model_commitment::{
     verify_model_anchor, ModelCommitmentPublic, SharedTrace,
 };
-use zkie_ops::proof::proximity_session::{verify_proximity_session, ProximityProver};
+use zkie_ops::proof::proximity_session::{
+    verify_proximity_session, ProximityProver, SampleOracle,
+};
 use zkie_ops::proof::session_baseline::TrustedModel;
+
+struct FixtureOracle {
+    code: CodeParams,
+    main: Vec<Fp3>,
+    tail: Vec<Fp3>,
+}
+
+impl SampleOracle for FixtureOracle {
+    fn expected(&self, seed: Fp3) -> zkie_core::Result<Fp3> {
+        evaluate_ood_fp3(&self.code, &self.main, &self.tail, seed)
+    }
+}
 
 fn dot(a: &[Fp3], b: &[Fp3]) -> Fp3 {
     let mut sum = Fp3::ZERO;
@@ -119,6 +134,12 @@ fn selected_gpt2_cs_base_component() {
     let star_tail_original = star_tail.clone();
     let star_mask_original = star_mask.clone();
     let star_mask_tail_original = star_mask_tail.clone();
+    let switched = cs_stage::switched_message(&rows, new_code, new_code).unwrap();
+    let oracle = FixtureOracle {
+        code: new_code,
+        main: switched.main,
+        tail: switched.main_tail,
+    };
     let prover = ProximityProver::new(
         &plan,
         rows,
@@ -130,7 +151,7 @@ fn selected_gpt2_cs_base_component() {
     .unwrap();
     let messages = prover.messages().unwrap();
     let started = Instant::now();
-    let outcome = verify_proximity_session(&plan, &statement, messages, &prover).unwrap();
+    let outcome = verify_proximity_session(&plan, &statement, messages, &prover, &oracle).unwrap();
     println!("proximity_session_ms={}", started.elapsed().as_millis());
     println!("old_main_root={:?}", outcome.old_main_root);
     println!("old_mask_root={:?}", outcome.old_mask_root);
@@ -142,11 +163,11 @@ fn selected_gpt2_cs_base_component() {
     println!("theta={:?}", outcome.theta);
     println!("lambda={:?}", outcome.lambda);
     assert!(outcome.stage_handoff);
-    assert!(outcome.sample_verified);
+    assert!(outcome.sample_oracle_match);
     assert!(outcome.base_linear);
     assert!(outcome.symbol_checks);
-    assert!(outcome.next_stage);
-    assert_eq!(outcome.next_stage().unwrap(), zkie_ops::proof::proximity_session::ProximityNext::BaseComplete);
+    assert!(outcome.component_checks_passed);
+    assert_eq!(outcome.component_complete().unwrap(), zkie_ops::proof::proximity_session::ProximityComponent::ComponentComplete);
     assert_eq!(outcome.registration_count, 7);
 
     let mut bad_rows = bad_rows;
@@ -162,15 +183,15 @@ fn selected_gpt2_cs_base_component() {
     )
     .unwrap();
     let bad_messages = bad_prover.messages().unwrap();
-    assert!(verify_proximity_session(&plan, &bad_statement, bad_messages, &bad_prover).is_err());
+    assert!(verify_proximity_session(&plan, &bad_statement, bad_messages, &bad_prover, &oracle).is_err());
 
     let mut bad_plan = plan.clone();
     bad_plan.stages.truncate(1);
-    assert!(verify_proximity_session(&bad_plan, &statement, messages, &prover).is_err());
+    assert!(verify_proximity_session(&bad_plan, &statement, messages, &prover, &oracle).is_err());
 
     let mut bad_plan = plan.clone();
     bad_plan.input_code = new_code;
-    assert!(verify_proximity_session(&bad_plan, &statement, messages, &prover).is_err());
+    assert!(verify_proximity_session(&bad_plan, &statement, messages, &prover, &oracle).is_err());
 
-    assert!(verify_proximity_session(&plan, &statement, messages, &prover).is_ok());
+    assert!(verify_proximity_session(&plan, &statement, messages, &prover, &oracle).is_ok());
 }

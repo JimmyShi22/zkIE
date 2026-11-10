@@ -1,10 +1,14 @@
-//! Isolated BASE algebra.
+//! CS/BASE local algebraic component: local BASE algebra.
 //!
 //! The prover sends target* and the plaintext M'/R' rows. The verifier checks
 //! the linear relation and the sampled symbol relations against authenticated
 //! openings. Commitments, SEND and opening verification belong to the isolated
 //! session; this module never treats a public target or a fixture row as
 //! authenticated.
+//!
+//! This is a local algebraic component, not a complete BASE, IOPP or proof
+//! acceptance. The fixture is not claimed to satisfy iopp_fault parameters, and
+//! the real SEND sample declaration and its follow-up checks remain unclosed.
 
 use zkie_core::error::{Error, Result};
 

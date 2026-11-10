@@ -1,10 +1,16 @@
-//! Isolated code-switch stage.
+//! CS/BASE local algebraic component: code-switch claim registration.
 //!
 //! The prover side builds the switched message. The verifier side registers
 //! the original claim and one generator-position claim per authenticated old
 //! opening, then combines them by powers of theta. Registration is not a proof
 //! that the switched message is a correct re-encoding; that is the later
 //! proximity test's task. No kept-row path is exercised in this subset.
+//!
+//! This is an implemented algebraic subset. It is not an IOPP, not a complete
+//! BASE result and not an iopp_fault-equivalent parameter check. The k = 0
+//! fixture is algebraic only; real FOLD output/witness, all applicable plan
+//! constraints, and a real SEND sample declaration with follow-up checks
+//! remain unclosed.
 
 use zkie_core::error::{Error, Result};
 
@@ -161,6 +167,12 @@ fn add_scaled(target: &mut [Fp3], source: &[Fp3], scale: Fp3) -> Result<()> {
 
 /// Registers the original claim and one generator-position claim per
 /// authenticated old position, then combines them with the supplied theta.
+/// Data flow: the original statement claim/target enter at theta^0; each
+/// authenticated main symbol at position p contributes a main-message
+/// coefficient claim with target equal to that symbol; each authenticated mask
+/// symbol at p mod mask_n contributes a separate mask-message coefficient claim
+/// with target equal to that symbol. The claims are combined as
+/// sum(theta^i * claim_i) and are pending, not proved.
 /// The returned claims are pending: registration is not verification, and a
 /// false claim is for the later proximity test to catch.
 pub fn register_switch(

@@ -1,18 +1,26 @@
-//! Isolated CS -> BASE component session.
+//! CS/BASE local algebraic component session.
+//!
+//! This component checks only the local algebraic relations between the
+//! authenticated old openings, the pending CS claims and the local BASE
+//! equations. It is not a complete BASE, IOPP or proof acceptance and does not
+//! claim that the pending CS claims are proved.
+//!
+//! The sample comparison is an auxiliary test-side check: the expected value
+//! comes from an independent `SampleOracle` built from fixed test data, not
+//! from the prover channel, and is not a verifier trust source.
 //!
 //! The protocol is split into a prover channel and a verifier session. The
 //! prover owns the plaintext rows, commitments and openings; the verifier owns
 //! the independent plan, the statement view and its own registry built from the
 //! public commitments. The verifier draws every challenge, verifies every
 //! opening it receives against its own registry, and never reads prover fields.
-//! The only plaintext oracle is the explicit `sample_oracle` comparison, which
-//! is a component check, not the protocol under test.
-//!
 //! Boundary update: the earlier 2e/2f `FoldOutput::next_stage` remains
 //! fail-closed; this module adds a separate component outcome whose
-//! `next_stage()` returns `BaseComplete` only after the verifier-side CS
-//! registration, handoff, BASE linear check and symbol checks pass. That is a
-//! component result, not a production proof acceptance.
+//! `component_complete()` returns `ComponentComplete` only after the
+//! verifier-side CS registration, handoff, local BASE linear check and symbol
+//! checks pass. That is a local algebraic component result, not a production
+//! proof acceptance, not a complete BASE/IOPP result, and it does not prove
+//! the pending CS claims.
 
 use zkie_core::artifact::digest_bytes;
 use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
@@ -32,17 +40,18 @@ use crate::proof::binding::{
     commit_rows_with_openings, verify_opening, OracleId, OracleOpening, OracleRegistry,
 };
 
-/// The concrete component returned after the isolated CS -> BASE checks. It
-/// is not a production stage and does not accept a proof.
+/// The local algebraic component marker returned after the CS -> BASE checks.
+/// It is not a production stage, not a complete BASE/IOPP result and does not
+/// accept a proof.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProximityNext {
-    BaseComplete,
+pub enum ProximityComponent {
+    ComponentComplete,
 }
 
-/// The result of the isolated two-stage component chain. This is not an
-/// accepted proof and does not claim a complete proximity test. The private
-/// `verified` field prevents a caller from forming the value from the public
-/// booleans alone.
+/// The result of the local CS/BASE algebraic component. This is not an
+/// accepted proof, not a complete proximity test and not a complete BASE/IOPP
+/// result. The private `verified` field prevents a caller from forming the
+/// value from the public booleans alone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProximityOutcome {
     pub old_main_root: Digest,
@@ -58,20 +67,28 @@ pub struct ProximityOutcome {
     pub stage_handoff: bool,
     pub base_linear: bool,
     pub symbol_checks: bool,
-    /// The sample answer matched the explicit plaintext oracle. This is a
-    /// component check; it is not a check performed by the protocol.
-    pub sample_verified: bool,
-    pub next_stage: bool,
+    /// The sample answer matched the independent test-side oracle. This is an
+    /// auxiliary component check; it is not a verifier trust source and not a
+    /// protocol verification of an OOD claim.
+    pub sample_oracle_match: bool,
+    pub component_checks_passed: bool,
     verified: bool,
 }
 
 impl ProximityOutcome {
-    /// Returns the concrete component only when every recorded check passed.
-    /// A missing stage or a failed check is rejected; `FoldOutput` remains
-    /// independently fail-closed.
-    pub fn next_stage(&self) -> Result<ProximityNext> {
-        if self.verified && self.stage_handoff && self.sample_verified && self.base_linear && self.symbol_checks && self.next_stage {
-            Ok(ProximityNext::BaseComplete)
+    /// Returns the local algebraic component marker only when every recorded
+    /// check passed. This does not accept a proof, does not prove the pending
+    /// CS claims and does not claim a complete BASE/IOPP result. `FoldOutput`
+    /// remains independently fail-closed.
+    pub fn component_complete(&self) -> Result<ProximityComponent> {
+        if self.verified
+            && self.stage_handoff
+            && self.sample_oracle_match
+            && self.base_linear
+            && self.symbol_checks
+            && self.component_checks_passed
+        {
+            Ok(ProximityComponent::ComponentComplete)
         } else {
             Err(Error::InvalidSessionState)
         }
@@ -107,14 +124,19 @@ pub struct ProximityMessages {
     pub star_mask: Commitment,
 }
 
+/// An independent test-side oracle for the declared OOD sample answer. It is
+/// built from fixed test data separately from the prover channel, so the
+/// comparison does not trust a value supplied by the channel. It is an
+/// auxiliary component check only and is not a verifier trust source.
+pub trait SampleOracle {
+    fn expected(&self, seed: Fp3) -> Result<Fp3>;
+}
+
 /// The prover message channel. The verifier knows only this interface; it
 /// cannot read the prover's rows or commitments directly.
 pub trait ProximityProverChannel {
     /// The prover's declared OOD sample answer.
     fn sample_answer(&self, seed: Fp3) -> Result<Fp3>;
-    /// The explicit plaintext oracle for the component check. This is not a
-    /// protocol message and is not available in a real deployment.
-    fn sample_oracle(&self, seed: Fp3) -> Result<Fp3>;
     fn open_old_main(&self, position: u64) -> Result<ProverOpening>;
     fn open_old_mask(&self, position: u64) -> Result<ProverOpening>;
     fn open_switched_main(&self, position: u64) -> Result<ProverOpening>;
@@ -360,10 +382,6 @@ impl ProximityProverChannel for ProximityProver {
         )
     }
 
-    fn sample_oracle(&self, seed: Fp3) -> Result<Fp3> {
-        self.sample_answer(seed)
-    }
-
     fn open_old_main(&self, position: u64) -> Result<ProverOpening> {
         self.old_main.open(position)
     }
@@ -494,8 +512,9 @@ enum Slot {
     StarMask,
 }
 
-/// The verifier session. It owns the independent plan, the statement and its
-/// own registry; the prover is an external channel.
+/// The verifier session for the local algebraic component. It owns the
+/// independent plan, the statement and its own registry; the prover is an
+/// external channel.
 pub struct ProximityVerifier<'a> {
     plan: &'a ProximityPlan,
     statement: &'a ProximityStatement,
@@ -504,7 +523,7 @@ pub struct ProximityVerifier<'a> {
     ids: [OracleId; 6],
     chain: Chain,
     sample_answer: Option<Fp3>,
-    sample_verified: bool,
+    sample_oracle_match: bool,
     cs_positions: Vec<u64>,
     theta: Fp3,
     claims: Option<cs_stage::SwitchedClaims>,
@@ -554,7 +573,7 @@ impl<'a> ProximityVerifier<'a> {
             ids: ids_array,
             chain,
             sample_answer: None,
-            sample_verified: false,
+            sample_oracle_match: false,
             cs_positions: Vec::new(),
             theta: Fp3::ZERO,
             claims: None,
@@ -596,7 +615,11 @@ impl<'a> ProximityVerifier<'a> {
     /// CS: sends the switched commitments, draws the sample seed, the sample
     /// positions and theta, authenticates the old openings and registers the
     /// pending claims.
-    pub fn run_code_switch(&mut self, prover: &dyn ProximityProverChannel) -> Result<()> {
+    pub fn run_code_switch(
+        &mut self,
+        prover: &dyn ProximityProverChannel,
+        oracle: &dyn SampleOracle,
+    ) -> Result<()> {
         let switch = self.plan.stages[0];
         let mut send_words = Vec::new();
         push_digest(&mut send_words, &self.messages.switched_main.root);
@@ -606,8 +629,8 @@ impl<'a> ProximityVerifier<'a> {
         let answer = prover.sample_answer(sample_seed)?;
         self.sample_answer = Some(answer);
         absorb(&mut self.chain, 2, &fp3_words(&answer))?;
-        let oracle = prover.sample_oracle(sample_seed)?;
-        self.sample_verified = answer == oracle;
+        let expected = oracle.expected(sample_seed)?;
+        self.sample_oracle_match = answer == expected;
 
         self.cs_positions = draw_positions(
             &mut self.chain,
@@ -641,7 +664,7 @@ impl<'a> ProximityVerifier<'a> {
         Ok(())
     }
 
-    /// BASE: sends the star commitments and target*, draws lambda, absorbs all
+    /// Local BASE algebra: sends the star commitments and target*, draws lambda, absorbs all
     /// M' then all R', draws the positions, authenticates the final and star
     /// openings, and checks the linear and symbol relations.
     pub fn run_base(&mut self, prover: &dyn ProximityProverChannel) -> Result<()> {
@@ -735,7 +758,11 @@ impl<'a> ProximityVerifier<'a> {
 
     pub fn finish(self) -> Result<ProximityOutcome> {
         let claims = self.claims.as_ref().ok_or(Error::InvalidSessionState)?;
-        if !self.sample_verified || !self.stage_handoff || !self.base_linear || !self.symbol_checks {
+        if !self.sample_oracle_match
+            || !self.stage_handoff
+            || !self.base_linear
+            || !self.symbol_checks
+        {
             return Err(Error::InvalidProof);
         }
         Ok(ProximityOutcome {
@@ -752,23 +779,25 @@ impl<'a> ProximityVerifier<'a> {
             stage_handoff: self.stage_handoff,
             base_linear: self.base_linear,
             symbol_checks: self.symbol_checks,
-            sample_verified: self.sample_verified,
-            next_stage: true,
+            sample_oracle_match: self.sample_oracle_match,
+            component_checks_passed: true,
             verified: true,
         })
     }
 }
 
-/// Runs the component chain. The caller supplies the independent plan, the
-/// verifier-side statement, the public commitments and a prover channel.
+/// Runs the local CS/BASE algebraic component. The caller supplies the
+/// independent plan, the verifier-side statement, the public commitments, a
+/// prover channel and an independent test-side sample oracle.
 pub fn verify_proximity_session(
     plan: &ProximityPlan,
     statement: &ProximityStatement,
     messages: ProximityMessages,
     prover: &dyn ProximityProverChannel,
+    oracle: &dyn SampleOracle,
 ) -> Result<ProximityOutcome> {
     let mut verifier = ProximityVerifier::new(plan, statement, messages)?;
-    verifier.run_code_switch(prover)?;
+    verifier.run_code_switch(prover, oracle)?;
     verifier.run_base(prover)?;
     verifier.finish()
 }
@@ -834,10 +863,38 @@ mod tests {
         }
     }
 
-    fn fixture() -> (ProximityPlan, ProximityStatement, ProximityMessages, ProximityProver) {
+    /// Test-side oracle built from the fixed fixture rows and the switch code.
+    /// It never reads or calls the prover channel; the values are fixed before
+    /// the prover is constructed.
+    struct FixedOracle {
+        code: CodeParams,
+        main: Vec<Fp3>,
+        tail: Vec<Fp3>,
+    }
+
+    impl SampleOracle for FixedOracle {
+        fn expected(&self, seed: Fp3) -> Result<Fp3> {
+            evaluate_ood_fp3(&self.code, &self.main, &self.tail, seed)
+        }
+    }
+
+    fn fixture() -> (
+        ProximityPlan,
+        ProximityStatement,
+        ProximityMessages,
+        ProximityProver,
+        FixedOracle,
+    ) {
         let rows = fixture_rows();
         let statement = ProximityStatement::from_rows(&rows).unwrap();
         let plan = plan();
+        let switch = plan.stages[0];
+        let switched = cs_stage::switched_message(&rows, switch.code, switch.mask_code).unwrap();
+        let oracle = FixedOracle {
+            code: switch.code,
+            main: switched.main.clone(),
+            tail: switched.main_tail.clone(),
+        };
         let prover = ProximityProver::new(
             &plan,
             rows,
@@ -848,7 +905,7 @@ mod tests {
         )
         .unwrap();
         let messages = prover.messages().unwrap();
-        (plan, statement, messages, prover)
+        (plan, statement, messages, prover, oracle)
     }
 
     fn session(
@@ -856,8 +913,9 @@ mod tests {
         statement: &ProximityStatement,
         messages: ProximityMessages,
         prover: &dyn ProximityProverChannel,
+        oracle: &dyn SampleOracle,
     ) -> Result<ProximityOutcome> {
-        verify_proximity_session(plan, statement, messages, prover)
+        verify_proximity_session(plan, statement, messages, prover, oracle)
     }
 
     #[derive(Clone, Copy)]
@@ -882,9 +940,6 @@ mod tests {
                 Tamper::SampleAnswer => value.add(&Fp3::ONE),
                 _ => value,
             })
-        }
-        fn sample_oracle(&self, seed: Fp3) -> Result<Fp3> {
-            self.inner.sample_oracle(seed)
         }
         fn open_old_main(&self, position: u64) -> Result<ProverOpening> {
             let mut opening = self.inner.open_old_main(position)?;
@@ -942,9 +997,6 @@ mod tests {
         fn sample_answer(&self, seed: Fp3) -> Result<Fp3> {
             self.inner.sample_answer(seed)
         }
-        fn sample_oracle(&self, seed: Fp3) -> Result<Fp3> {
-            self.inner.sample_oracle(seed)
-        }
         fn open_old_main(&self, position: u64) -> Result<ProverOpening> {
             self.inner.open_old_main(position)
         }
@@ -980,9 +1032,6 @@ mod tests {
         fn sample_answer(&self, seed: Fp3) -> Result<Fp3> {
             self.order.borrow_mut().push("sample_answer");
             self.inner.sample_answer(seed)
-        }
-        fn sample_oracle(&self, seed: Fp3) -> Result<Fp3> {
-            self.inner.sample_oracle(seed)
         }
         fn open_old_main(&self, position: u64) -> Result<ProverOpening> {
             self.order.borrow_mut().push("old_main");
@@ -1020,25 +1069,37 @@ mod tests {
 
     #[test]
     fn component_chain_is_deterministic_and_verified() {
-        let (plan, statement, messages, prover) = fixture();
-        let first = session(&plan, &statement, messages, &prover).unwrap();
-        let second = session(&plan, &statement, messages, &prover).unwrap();
+        let (plan, statement, messages, prover, oracle) = fixture();
+        let first = session(&plan, &statement, messages, &prover, &oracle).unwrap();
+        let second = session(&plan, &statement, messages, &prover, &oracle).unwrap();
         assert_eq!(first, second);
-        assert!(first.stage_handoff && first.sample_verified && first.base_linear && first.symbol_checks && first.next_stage);
-        assert_eq!(first.next_stage().unwrap(), ProximityNext::BaseComplete);
+        assert!(first.stage_handoff && first.sample_oracle_match && first.base_linear && first.symbol_checks && first.component_checks_passed);
+        assert_eq!(first.component_complete().unwrap(), ProximityComponent::ComponentComplete);
         assert_eq!(first.registration_count, 5);
     }
 
     #[test]
-    fn plan_statement_or_commitment_mismatch_fails_closed() {
-        let (plan, statement, messages, prover) = fixture();
+    fn plan_or_statement_shape_mismatch_fails_closed() {
+        let (plan, statement, messages, _prover, _oracle) = fixture();
         let mut bad_plan = plan.clone();
         bad_plan.stages.truncate(1);
-        assert!(ProximityVerifier::new(&bad_plan, &statement, messages).is_err());
+        assert!(matches!(
+            ProximityVerifier::new(&bad_plan, &statement, messages),
+            Err(Error::InvalidConfig)
+        ));
         let mut bad_statement = statement.clone();
         bad_statement.code = build_code_plan(3, 6, 1).unwrap();
-        assert!(ProximityVerifier::new(&plan, &bad_statement, messages).is_err());
-        let mut wrong_count = messages;
+        assert!(matches!(
+            ProximityVerifier::new(&plan, &bad_statement, messages),
+            Err(Error::ShapeMismatch)
+        ));
+    }
+
+    #[test]
+    fn wrong_commitment_is_rejected_at_the_commitment_check() {
+        // Class 1: the commitment object itself is wrong, so the failure is
+        // reached before any claim relation is built.
+        let (plan, statement, messages, prover, oracle) = fixture();
         let mut extra_registry = OracleRegistry::new();
         let extra_rows = vec![vec![0u64]; 16];
         let (extra, _) = commit_rows_with_openings(
@@ -1048,52 +1109,100 @@ mod tests {
         )
         .unwrap();
         let extra_root = extra_registry.get(extra).unwrap();
+        let mut wrong_count = messages;
         wrong_count.switched_main = Commitment {
             root: extra_root.root,
             start: extra_root.start,
             count: extra_root.count,
         };
-        assert!(ProximityVerifier::new(&plan, &statement, wrong_count).is_err());
-        let mut wrong_statement = statement.clone();
-        wrong_statement.target = wrong_statement.target.add(&Fp3::ONE);
-        assert!(session(&plan, &wrong_statement, messages, &prover).is_err());
-        assert!(session(&plan, &statement, messages, &prover).is_ok());
+        assert!(matches!(
+            ProximityVerifier::new(&plan, &statement, wrong_count),
+            Err(Error::StatementMismatch)
+        ));
+        // A valid same-shape commitment cannot authenticate openings produced
+        // for the original switched commitment.
+        let mut swapped = messages;
+        swapped.switched_main = messages.old_main;
+        assert!(matches!(
+            session(&plan, &statement, swapped, &prover, &oracle),
+            Err(Error::InvalidProof)
+        ));
     }
 
     #[test]
-    fn prover_message_tampering_is_rejected() {
-        let (plan, statement, messages, prover) = fixture();
-        for mode in [Tamper::SampleAnswer, Tamper::BaseTarget, Tamper::BaseRows] {
-            let channel = Tampered { inner: &prover, mode };
-            assert!(session(&plan, &statement, messages, &channel).is_err());
-        }
-        assert!(session(&plan, &statement, messages, &prover).is_ok());
+    fn valid_commitment_with_a_wrong_statement_is_rejected_at_the_relation_check() {
+        // Class 2: all commitments are valid and authenticate; the statement
+        // is wrong, so the failure is reached at the local algebraic relation.
+        let (plan, statement, messages, prover, oracle) = fixture();
+        let mut wrong_statement = statement.clone();
+        wrong_statement.target = wrong_statement.target.add(&Fp3::ONE);
+        assert!(matches!(
+            session(&plan, &wrong_statement, messages, &prover, &oracle),
+            Err(Error::InvalidProof)
+        ));
+        let mut wrong_statement = statement.clone();
+        wrong_statement.claim[0] = wrong_statement.claim[0].add(&Fp3::ONE);
+        assert!(matches!(
+            session(&plan, &wrong_statement, messages, &prover, &oracle),
+            Err(Error::InvalidProof)
+        ));
+        assert!(session(&plan, &statement, messages, &prover, &oracle).is_ok());
+    }
+
+    #[test]
+    fn valid_commitment_with_a_wrong_prover_message_is_rejected() {
+        let (plan, statement, messages, prover, oracle) = fixture();
+        let target = Tampered {
+            inner: &prover,
+            mode: Tamper::BaseTarget,
+        };
+        assert!(matches!(
+            session(&plan, &statement, messages, &target, &oracle),
+            Err(Error::StatementMismatch)
+        ));
+        let rows = Tampered {
+            inner: &prover,
+            mode: Tamper::BaseRows,
+        };
+        assert!(matches!(
+            session(&plan, &statement, messages, &rows, &oracle),
+            Err(Error::InvalidProof)
+        ));
+        let sample = Tampered {
+            inner: &prover,
+            mode: Tamper::SampleAnswer,
+        };
+        assert!(matches!(
+            session(&plan, &statement, messages, &sample, &oracle),
+            Err(Error::InvalidProof)
+        ));
+        assert!(session(&plan, &statement, messages, &prover, &oracle).is_ok());
     }
 
     #[test]
     fn opening_tampering_is_rejected_before_any_relation_check() {
-        let (plan, statement, messages, prover) = fixture();
+        let (plan, statement, messages, prover, oracle) = fixture();
         for mode in [Tamper::OldMainValue, Tamper::OldMainPath, Tamper::OldMainIndex] {
             let channel = Tampered { inner: &prover, mode };
-            assert!(session(&plan, &statement, messages, &channel).is_err());
+            assert!(session(&plan, &statement, messages, &channel, &oracle).is_err());
         }
-        assert!(session(&plan, &statement, messages, &prover).is_ok());
+        assert!(session(&plan, &statement, messages, &prover, &oracle).is_ok());
     }
 
     #[test]
     fn cs_output_replacement_with_a_valid_commitment_is_rejected() {
-        let (plan, statement, messages, prover) = fixture();
+        let (plan, statement, messages, prover, oracle) = fixture();
         // A valid commitment with the same shape cannot authenticate the old
         // switched openings; the opening check rejects it.
         let mut swapped = messages;
         swapped.switched_main = messages.old_main;
-        assert!(session(&plan, &statement, swapped, &prover).is_err());
-        assert!(session(&plan, &statement, messages, &prover).is_ok());
+        assert!(session(&plan, &statement, swapped, &prover, &oracle).is_err());
+        assert!(session(&plan, &statement, messages, &prover, &oracle).is_ok());
     }
 
     #[test]
     fn a_consistent_replaced_switched_message_is_caught_by_base_symbols() {
-        let (plan, statement, messages, prover) = fixture();
+        let (plan, statement, messages, prover, oracle) = fixture();
         let mut changed = prover.switched.main.clone();
         for value in changed.iter_mut() {
             *value = value.add(&Fp3::ONE);
@@ -1111,18 +1220,18 @@ mod tests {
             inner: &prover,
             switched: &replacement,
         };
-        assert!(session(&plan, &statement, replaced_messages, &channel).is_err());
-        assert!(session(&plan, &statement, messages, &prover).is_ok());
+        assert!(session(&plan, &statement, replaced_messages, &channel, &oracle).is_err());
+        assert!(session(&plan, &statement, messages, &prover, &oracle).is_ok());
     }
 
     #[test]
     fn challenge_order_is_fixed() {
-        let (plan, statement, messages, prover) = fixture();
+        let (plan, statement, messages, prover, oracle) = fixture();
         let tracked = Tracked {
             inner: &prover,
             order: RefCell::new(Vec::new()),
         };
-        assert!(session(&plan, &statement, messages, &tracked).is_ok());
+        assert!(session(&plan, &statement, messages, &tracked, &oracle).is_ok());
         let order = tracked.order.borrow();
         let first_base_target = order.iter().position(|entry| *entry == "base_target").unwrap();
         let first_switched = order.iter().position(|entry| *entry == "switched_main").unwrap();
@@ -1139,9 +1248,6 @@ mod tests {
 
     impl ProximityProverChannel for Refusing {
         fn sample_answer(&self, _seed: Fp3) -> Result<Fp3> {
-            Err(Error::ProverStateMissing)
-        }
-        fn sample_oracle(&self, _seed: Fp3) -> Result<Fp3> {
             Err(Error::ProverStateMissing)
         }
         fn open_old_main(&self, _position: u64) -> Result<ProverOpening> {
@@ -1177,22 +1283,22 @@ mod tests {
 
     #[test]
     fn a_missing_message_never_completes_the_component() {
-        let (plan, statement, messages, _prover) = fixture();
-        assert!(session(&plan, &statement, messages, &Refusing).is_err());
+        let (plan, statement, messages, _prover, oracle) = fixture();
+        assert!(session(&plan, &statement, messages, &Refusing, &oracle).is_err());
     }
 
     #[test]
     fn public_booleans_alone_do_not_form_the_component() {
-        let (plan, statement, messages, prover) = fixture();
-        let mut outcome = session(&plan, &statement, messages, &prover).unwrap();
-        assert!(outcome.stage_handoff && outcome.sample_verified && outcome.base_linear);
+        let (plan, statement, messages, prover, oracle) = fixture();
+        let mut outcome = session(&plan, &statement, messages, &prover, &oracle).unwrap();
+        assert!(outcome.stage_handoff && outcome.sample_oracle_match && outcome.base_linear);
         outcome.verified = false;
-        assert!(outcome.next_stage().is_err());
+        assert!(outcome.component_complete().is_err());
     }
 
     #[test]
     fn decision_inputs_are_bound_in_the_prefix() {
-        let (plan, statement, messages, _prover) = fixture();
+        let (plan, statement, messages, _prover, _oracle) = fixture();
         let base = plan_prefix(&plan, &statement, &messages);
         let mut changed_plan = plan.clone();
         changed_plan.stages[0].samples += 1;
