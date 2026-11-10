@@ -1006,6 +1006,59 @@ impl<S: TableRowSource> StreamingHolder<S> {
     }
 }
 
+/// The test-only table entry. It has the same reader, name and opening
+/// behaviour the unit fixtures used, but it is built by the production
+/// streaming committer over an in-memory row source; it never materializes a
+/// codeword matrix and is not a production constructor.
+#[cfg(test)]
+pub struct TestTable {
+    pub reader: IndexReader,
+    pub name: Vec<u8>,
+    table: StreamingTable,
+    source: std::cell::RefCell<VecTableSource>,
+}
+
+#[cfg(test)]
+impl TestTable {
+    pub fn open_columns(&self, positions: &[u64]) -> Result<Vec<ColumnOpening>> {
+        let mut source = self.source.borrow_mut();
+        self.table.open_columns(&mut *source, positions)
+    }
+
+    pub fn open_columns_charged(
+        &self,
+        charge: &HidingCharge,
+        positions: &[u64],
+    ) -> Result<Vec<ColumnOpening>> {
+        if charge.table() != self.reader.root {
+            return Err(Error::StatementMismatch);
+        }
+        charge.consume(positions)?;
+        self.open_columns(positions)
+    }
+}
+
+/// Builds the test-only table entry through the streaming committer.
+#[cfg(test)]
+pub fn test_commit_table(
+    shape: IndexShape,
+    configuration: Digest,
+    messages: &[Vec<Fp>],
+    tails: &[Vec<Fp>],
+    salts: &[Vec<u8>],
+) -> Result<TestTable> {
+    let mut source = VecTableSource::new(messages.to_vec(), tails.to_vec())?;
+    let table = commit_table_streaming(&mut source, shape, configuration, salts, 64, u64::MAX)?;
+    let reader = table.reader.clone();
+    let name = table.name.clone();
+    Ok(TestTable {
+        reader,
+        name,
+        table,
+        source: std::cell::RefCell::new(source),
+    })
+}
+
 /// Check column openings against a reader and return the columns as
 /// `columns[i * rows + r]`.
 pub fn verify_columns(
