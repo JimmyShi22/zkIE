@@ -887,6 +887,123 @@ fn sample_coefficients(
     Ok((main, mask))
 }
 
+/// The SEND sample row of an ordinary oracle message in the table-index
+/// convention: entry `index` is row `index mod 2^row_bits` at place
+/// `index div 2^row_bits`, and the sample reads `eq(index, z)` on that index.
+/// It is the form the switched oracle message and the ordinary SEND path use;
+/// the G_u witness has its own compact row-major layout and keeps its own
+/// builder.
+pub fn oracle_sample_row_index(
+    oracle: u64,
+    group: u64,
+    u: &GuOracleShape,
+    seeds: &[SampleSeed],
+    answer: u32,
+    target: Fp3,
+) -> Result<GuRelationRow> {
+    if u.fault().is_some() || answer >= u.answers || seeds.len() < u.answers as usize {
+        return Err(Error::ShapeMismatch);
+    }
+    let cube = sample_cube_of(u)?;
+    let seed = &seeds[answer as usize];
+    if seed.z.len() < cube.bits as usize || seed.beta == Fp3::ZERO {
+        return Err(Error::ShapeMismatch);
+    }
+    let main_len = usize::try_from(
+        u.main_rows
+            .checked_mul(u.code.ell)
+            .ok_or(Error::ResourceLimit)?,
+    )
+    .map_err(|_| Error::ResourceLimit)?;
+    let mut main = vec![Fp3::ZERO; main_len];
+    if cube.has_main {
+        let front = sample_front(seed, &cube, cube.main_bits, false)?;
+        for (index, value) in main.iter_mut().enumerate() {
+            *value = front.mul(&eq_index(index as u64, &seed.z, cube.main_bits)?);
+        }
+        if !cube.has_mask {
+            sample_pad_index(
+                &mut main,
+                seed,
+                u.answers,
+                answer,
+                u.main_rows,
+                cube.main_row_bits,
+                u.code.ell,
+                cube.main_bits,
+                front,
+            )?;
+        }
+    }
+    let mask_len = match u.mask_code {
+        Some(code) => usize::try_from(
+            u.mask_rows
+                .checked_mul(code.ell)
+                .ok_or(Error::ResourceLimit)?,
+        )
+        .map_err(|_| Error::ResourceLimit)?,
+        None => 0,
+    };
+    let mut mask = vec![Fp3::ZERO; mask_len];
+    if cube.has_mask {
+        let code = u.mask_code.ok_or(Error::ShapeMismatch)?;
+        let front = sample_front(seed, &cube, cube.mask_bits, true)?;
+        for (index, value) in mask.iter_mut().enumerate() {
+            *value = front.mul(&eq_index(index as u64, &seed.z, cube.mask_bits)?);
+        }
+        sample_pad_index(
+            &mut mask,
+            seed,
+            u.answers,
+            answer,
+            u.mask_rows,
+            cube.mask_row_bits,
+            code.ell,
+            cube.mask_bits,
+            front,
+        )?;
+    }
+    Ok(GuRelationRow {
+        oracle,
+        group,
+        kind: GuRelationKind::Sample,
+        main,
+        mask,
+        target,
+    })
+}
+
+fn sample_pad_index(
+    coefficients: &mut [Fp3],
+    seed: &SampleSeed,
+    answers: u32,
+    target: u32,
+    rows: u64,
+    row_bits: u32,
+    len: u64,
+    bits: u32,
+    front: Fp3,
+) -> Result<()> {
+    if len < answers as u64 {
+        return Err(Error::ShapeMismatch);
+    }
+    for pad_answer in 0..answers {
+        let place = len - answers as u64 + pad_answer as u64;
+        let index = (rows - 1)
+            .checked_add(place.checked_shl(row_bits).ok_or(Error::ResourceLimit)?)
+            .ok_or(Error::ResourceLimit)?;
+        let under = front.mul(&eq_index(index, &seed.z, bits)?);
+        let mut value = Fp3::ZERO.sub(&under);
+        if pad_answer == target {
+            value = value.add(&seed.beta.mul(&theta(0)));
+        }
+        let slot = usize::try_from(index).map_err(|_| Error::ResourceLimit)?;
+        let entry = coefficients.get_mut(slot).ok_or(Error::ShapeMismatch)?;
+        *entry = entry.add(&value);
+    }
+    Ok(())
+}
+
 /// One shared seed set for the sampled oracles of one SEND message: the
 /// number of seeds is the largest answer count, each seed has the largest
 /// cube's coordinates, and each oracle reads the prefix its own cube needs.
