@@ -1,30 +1,34 @@
-//! Isolated fixture handoff from a BAT group row to the FOLD stage.
+//! Isolated algebraic/chain interface demonstration from a BAT group row to the
+//! FOLD stage, without a group commitment.
 //!
-//! This module builds one deterministic fixture group that BAT and FOLD use
-//! natively: the BAT group's base and mask codes are the FOLD shape's codes, the
-//! member mask width is already a power of two, and the BAT layout is the FOLD
-//! fixture layout. No field is copied from a width adapter and no code or tail
-//! parameter is transformed. The BAT combined row is converted by the existing
-//! BAT-to-FOLD input-row conversion and enters FOLD with the same main
-//! coefficients, mask coefficients and target.
+//! This is not a same-commitment positive case. The group message tables are
+//! plaintext fixture data with no oracle root: nothing binds the BAT
+//! declarations, the prover's FOLD messages or the sample-class rows to a group
+//! commitment, and the same-tag inner products in this module establish only
+//! fixture arithmetic consistency. A witness replacement or mismatch after a
+//! fixed group root cannot be tested here because no group root exists; that
+//! establishment remains unclosed.
 //!
-//! The fixture has one source for the positive case. The group message tables
-//! are fixed before the run and each BAT claim target is the inner product of
-//! that claim's coefficients (mapped through BAT's own combination) with the
-//! same group message tables. The combined target is therefore the true inner
-//! product of the combined row against the fixture witness. Those group tables
-//! are the prover's FOLD messages; they are plaintext fixture data and are not
-//! bound to an asset root. The group also carries fixture sample-class rows
-//! required by the BAT member registration; their targets are ordinary inner
-//! products against the same tables, not authenticated send receipts.
+//! The local interface progress demonstrated here: the BAT group's base and
+//! mask codes are the FOLD shape's codes, the member mask width is already a
+//! power of two, and the BAT layout is the FOLD fixture layout. No field is
+//! copied from a width adapter and no code or tail parameter is transformed.
+//! The BAT combined row is converted by the existing BAT-to-FOLD input-row
+//! conversion and enters FOLD with the same main coefficients, mask
+//! coefficients and target.
+//!
+//! The BAT sample-class rows are fixture rows required by the member
+//! registration; their targets are plaintext inner products against the same
+//! group tables, not authenticated send receipts.
 //!
 //! The fresh-mask witness is built from a deterministic numbered test source.
 //! Its coefficients, encoding tail and mask rows produce the committed mask
 //! tree root and the hiding sum carried by the FOLD start message; the fixture
 //! independently re-commits the stored rows and tails and checks the same root.
 //! The verifier's runtime registry receives that root before any challenge.
-//! The values are public and reproducible, provide no hiding, and are only a
-//! test fixture. The root is registered, not authenticated by openings.
+//! The fresh-mask root commits only the fresh mask; it is not a group oracle
+//! root. The values are public and reproducible, provide no hiding, and are
+//! only a test fixture. The root is registered, not authenticated by openings.
 //!
 //! Order and ownership: the group is frozen, the BAT session draws `x` and is
 //! consumed by `into_chain`, the returned chain is moved into the FOLD-only
@@ -38,12 +42,15 @@
 //! messages. FOLD does not decide truth: a wrong BAT target still completes the
 //! rounds and remains pending, and only a later relation or proximity check
 //! could reject it. Wrong shape, code, oracle, root and order violations fail
-//! closed.
+//! closed. The wrong-target case is not evidence that FOLD judges an arbitrary
+//! declaration.
 //!
-//! Unclosed: real SEND/G_u, authenticated asset roots, fresh-mask openings,
-//! hiding, folded tails, a proximity/relation connection, single-shot
-//! semantics and production wiring. The plan's reader and binding are a valid
-//! but inert scaffold required by the existing plan type; the FOLD-only entry
+//! Unclosed: establishing a group oracle root and a witness bound to it, real
+//! SEND/G_u and send receipts, authenticated assets, fresh-mask openings,
+//! folded tails, a proximity/relation connection, hiding, single-shot semantics
+//! and production wiring. The group-root witness-replacement negative is not
+//! applicable in this step. The plan's reader and binding are a valid but
+//! inert scaffold required by the existing plan type; the FOLD-only entry
 //! never reads them and they are not a witness or an asset binding.
 //! `verify_request` is unchanged.
 
@@ -295,7 +302,8 @@ fn probe_bat_statement(
     Ok((layout, probe))
 }
 
-/// One deterministic fixture group shared natively by BAT and FOLD.
+/// One deterministic fixture group shared natively by BAT and FOLD. The group
+/// has no commitment; only the fresh mask is committed.
 pub struct BatFoldFixture {
     tag: u64,
     target_shift: Fp3,
@@ -728,8 +736,9 @@ fn fixture_plan_scaffold() -> Result<(IndexReader, FoldeqBinding)> {
     Ok((reader, binding))
 }
 
-/// The result of one fixture BAT-to-FOLD run. The FOLD output is a pending
-/// candidate, not an acceptance.
+/// The result of one fixture BAT-to-FOLD run. The group and declaration flags
+/// record that this demonstration has no group commitment; the FOLD output is a
+/// pending candidate, not an acceptance.
 pub struct BatFoldOutcome {
     pub tag: u64,
     pub shape: FoldShape,
@@ -753,6 +762,10 @@ pub struct BatFoldOutcome {
     pub fold_decides_truth: bool,
     pub native_shared_codes: bool,
     pub adapter_used: bool,
+    pub group_root_committed: bool,
+    pub witness_bound_to_group_commitment: bool,
+    pub sample_rows_are_send_receipts: bool,
+    pub declarations_from_bound_messages: bool,
     pub real_assets_bound: bool,
     pub mask_root_authenticated: bool,
     pub production_wired: bool,
@@ -886,6 +899,10 @@ pub fn run_bat_fold(fixture: &BatFoldFixture, chain: Chain) -> Result<BatFoldOut
         fold_decides_truth: false,
         native_shared_codes: true,
         adapter_used: false,
+        group_root_committed: false,
+        witness_bound_to_group_commitment: false,
+        sample_rows_are_send_receipts: false,
+        declarations_from_bound_messages: false,
         real_assets_bound: false,
         mask_root_authenticated: false,
         production_wired: false,
@@ -991,6 +1008,10 @@ mod tests {
         assert!(!run.fold_decides_truth);
         assert!(!run.adapter_used);
         assert!(run.native_shared_codes);
+        assert!(!run.group_root_committed);
+        assert!(!run.witness_bound_to_group_commitment);
+        assert!(!run.sample_rows_are_send_receipts);
+        assert!(!run.declarations_from_bound_messages);
         assert!(!run.real_assets_bound);
         assert!(!run.mask_root_authenticated);
         assert!(!run.production_wired);
@@ -1202,6 +1223,26 @@ mod tests {
         assert!(session
             .receive_fold_round(Fp3::ONE, Fp3::ONE)
             .is_err());
+    }
+
+    #[test]
+    fn the_demonstration_has_no_group_commitment() {
+        let fixture = BatFoldFixture::new(30).unwrap();
+        let run = run_bat_fold(&fixture, chain(b"no group commitment")).unwrap();
+        assert!(!run.group_root_committed);
+        assert!(!run.witness_bound_to_group_commitment);
+        assert!(!run.sample_rows_are_send_receipts);
+        assert!(!run.declarations_from_bound_messages);
+        // The only committed root in this fixture is the fresh mask's, and it
+        // commits only the fresh mask rows and tail.
+        assert_eq!(fixture.recompute_root().unwrap(), run.start.root);
+        assert_eq!(run.witness_root, run.start.root);
+        assert!(run.pending);
+        assert!(!run.fold_decides_truth);
+        // The arithmetic consistency check uses the plaintext group tables; it
+        // is not a commitment check.
+        assert!(run.combined_matches_witness);
+        assert!(run.fold_matches_witness);
     }
 
     #[test]

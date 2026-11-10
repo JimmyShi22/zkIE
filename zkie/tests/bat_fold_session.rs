@@ -1,4 +1,6 @@
-//! Isolated fixture BAT-to-FOLD component handoff.
+//! Isolated fixture BAT-to-FOLD algebraic/chain interface demonstration. This
+//! is not a same-commitment positive case: the group tables have no oracle
+//! root and only the fresh mask is committed.
 
 use zkie_core::types::Digest;
 use zkie_engine::pcs::request::chain::Chain;
@@ -22,6 +24,10 @@ fn the_fixture_bat_row_enters_fold_natively() {
     assert!(!run.fold_decides_truth);
     assert!(!run.adapter_used);
     assert!(run.native_shared_codes);
+    assert!(!run.group_root_committed);
+    assert!(!run.witness_bound_to_group_commitment);
+    assert!(!run.sample_rows_are_send_receipts);
+    assert!(!run.declarations_from_bound_messages);
     assert!(run.combined_matches_witness);
     assert!(run.fold_matches_witness);
     assert_eq!(run.fold_row.coefficients, run.combined.main);
