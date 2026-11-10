@@ -10,6 +10,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 use zkie_core::common::field::PrimeCharacteristicRing;
 use zkie_core::compute::{MemoryGovernor, MemoryRequest};
 use zkie_core::error::{Error, Result};
@@ -71,6 +73,7 @@ use crate::s7_context::LmHeadContext;
 
 /// The private values of one table: one random tail for each row, one salt for
 /// each column and one pad for each answer of each row.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LmHeadKeyRandomness {
     pub tails: Vec<Vec<Fp>>,
     pub salts: Vec<Vec<u8>>,
@@ -402,7 +405,36 @@ pub fn limited_key_binding_parameters(
 /// configuration from the session chain and the table. The plan is rejected
 /// unless the binding parameters digest is exactly the reader's configuration.
 #[allow(clippy::too_many_arguments)]
-pub fn build_limited_shared_session(
+struct LimitedPlanParts {
+    parameters: BindingParameters,
+    configuration: Digest,
+    random_bytes: Digest,
+    fold: FoldShape,
+    mask_tree: MaskTreePlan,
+    verified: Arc<VerifiedStatement>,
+    gu: GuShape,
+    omega: OmegaShapePlan,
+    base: BaseStarBinding,
+    switches: Vec<SwitchTarget>,
+    reader: IndexReader,
+    statement_digest: Digest,
+    leaf_class: u32,
+    lin: LinShapeBinding,
+}
+
+/// The public verifier setup: the same plan, binder, chain and targets the
+/// prover uses, without the private fresh-mask provider.
+pub struct LimitedVerifySetup {
+    pub plan: FoldeqPlan,
+    pub binder: FoldeqBinder,
+    pub chain: Chain,
+    pub first_query: Vec<u8>,
+    pub base: BaseStarBinding,
+    pub switches: Vec<SwitchTarget>,
+    pub fresh_plan: MaskTreePlan,
+}
+
+fn build_limited_plan_parts(
     request_plan: &RequestPlan,
     compiled: &CompiledPlan,
     statement: &LimitedKeyStatement,
@@ -410,8 +442,7 @@ pub fn build_limited_shared_session(
     plan_identifier: Digest,
     case_id: &[u8],
     random_bytes: Digest,
-    mask_randomness: &LmHeadMaskRandomness,
-) -> Result<LimitedSharedSession> {
+) -> Result<LimitedPlanParts> {
     request_plan.validate()?;
     request_plan.validate_compiled(compiled)?;
     if random_bytes == Digest::ZERO || case_id.is_empty() {
@@ -608,107 +639,177 @@ pub fn build_limited_shared_session(
             mask_code: fold.mask_code,
         }],
     )?);
-    let mask_oracle = MaskOracle {
-        id: LM_HEAD_FRESH_MASK,
-        claimed_group: LM_HEAD_FOLD_GROUP,
-        main_rows: 0,
-        mask_rows: mask_tree.mask_rows,
-        mask_code: fold.mask_code,
-        answers: 0,
-        sampled: false,
+    let lin = LinShapeBinding {
+        matrix_rows: 1u64 << request_plan.lin.matrix_rows_log,
+        k_lo: request_plan.lin.k_lo,
+        k_col: request_plan.lin.k_col,
     };
-    let mask = make_lm_head_mask(
-        &fold,
-        &mask_oracle,
-        verified.groups(),
+    Ok(LimitedPlanParts {
+        parameters,
+        configuration,
+        random_bytes,
+        fold,
         mask_tree,
-        mask_randomness,
-    )?;
+        verified,
+        gu,
+        omega,
+        base,
+        switches,
+        reader: reader.clone(),
+        statement_digest: statement.digest(),
+        leaf_class: compiled.once_foldeq.fold_leaf_class,
+        lin,
+    })
+}
+
+fn finish_limited_setup(
+    parts: LimitedPlanParts,
+    case_id: &[u8],
+    fresh_root: Digest,
+) -> Result<LimitedVerifySetup> {
     let mut oracles = RuntimeOracles::default();
     oracles.receive_mask(
-        &verified,
-        &mask_tree,
+        &parts.verified,
+        &parts.mask_tree,
         LM_HEAD_FRESH_MASK,
-        &fold_mask_notice(&fold)?,
-        mask.root(),
+        &fold_mask_notice(&parts.fold)?,
+        fresh_root,
     )?;
     let layout = FoldGroupLayout {
         group: LM_HEAD_FOLD_GROUP,
-        k: fold.k,
-        h: fold.h,
+        k: parts.fold.k,
+        h: parts.fold.h,
         members: vec![
             FoldMemberLayout {
                 oracle: LM_HEAD_GU_ORACLE,
-                main_rows: gu.u.main_rows,
-                mask_rows: gu.u.mask_rows,
+                main_rows: parts.gu.u.main_rows,
+                mask_rows: parts.gu.u.mask_rows,
                 kept: false,
             },
             FoldMemberLayout {
                 oracle: LM_HEAD_OMEGA_ORACLE,
-                main_rows: omega_oracle.main_rows,
-                mask_rows: omega_oracle.mask_rows,
+                main_rows: parts.omega.u.main_rows,
+                mask_rows: parts.omega.u.mask_rows,
                 kept: false,
             },
         ],
     };
-    if layout.fault(&fold).is_some() {
+    if layout.fault(&parts.fold).is_some() {
         return Err(Error::InvalidConfig);
     }
 
-    let table_identity = reader_table_identity(reader)?;
+    let table_identity = reader_table_identity(&parts.reader)?;
     let binding_statement = BindingStatement::new(
-        parameters.version_word,
-        parameters.protocol_identity,
+        parts.parameters.version_word,
+        parts.parameters.protocol_identity,
         case_id.to_vec(),
-        statement.digest(),
+        parts.statement_digest,
         table_identity,
     )?;
-    let binding = FoldeqBinding::new(&parameters, binding_statement, reader)?;
+    let binding = FoldeqBinding::new(&parts.parameters, binding_statement, &parts.reader)?;
 
     let plan = FoldeqPlan {
-        reader: reader.clone(),
+        reader: parts.reader.clone(),
         binding,
         edge: FoldeqEdgeBinding::NotAnEdge,
-        fold,
-        statement: verified,
+        fold: parts.fold,
+        statement: parts.verified.clone(),
         oracles: Arc::new(Mutex::new(oracles)),
-        mask_tree_number: mask_tree.tree_number,
+        mask_tree_number: parts.mask_tree.tree_number,
         group_id: LM_HEAD_FOLD_GROUP,
-        leaf_class: compiled.once_foldeq.fold_leaf_class,
-        seed_budget: reader.shape.answers as usize,
+        leaf_class: parts.leaf_class,
+        seed_budget: parts.reader.shape.answers as usize,
         ledger: Arc::new(Mutex::new(ReadLedger::new(LM_HEAD_COLUMN_DRAWS as u64))),
         column_draws: LM_HEAD_COLUMN_DRAWS,
         mask_query_count: 0,
-        gamma_path: GammaPath::Lin {
-            shape: LinShapeBinding {
-                matrix_rows: 1u64 << request_plan.lin.matrix_rows_log,
-                k_lo: request_plan.lin.k_lo,
-                k_col: request_plan.lin.k_col,
-            },
-        },
-        gu: Some(gu),
+        gamma_path: GammaPath::Lin { shape: parts.lin },
+        gu: Some(parts.gu),
         fold_layout: Some(layout),
-        omega: Some(omega),
+        omega: Some(parts.omega),
     };
     if plan.fault().is_some() {
         return Err(Error::InvalidConfig);
     }
     let binder = FoldeqBinder::new_with_random_bytes(
         SHARED_CHAIN_LABEL,
-        configuration,
+        parts.configuration,
         &plan,
-        Some(random_bytes),
+        Some(parts.random_bytes),
     )?;
     let first_query = binder.first_query().to_vec();
     let chain = binder.chain()?;
-    Ok(LimitedSharedSession {
+    Ok(LimitedVerifySetup {
         plan,
         binder,
         chain,
         first_query,
+        base: parts.base,
+        switches: parts.switches,
+        fresh_plan: parts.mask_tree,
+    })
+}
+
+impl LimitedSharedSession {
+    /// The public verifier view of this session. The private mask provider is
+    /// not carried into it.
+    pub fn verify_setup(&self) -> LimitedVerifySetup {
+        LimitedVerifySetup {
+            plan: self.plan.clone(),
+            binder: self.binder.clone(),
+            chain: self.chain.clone(),
+            first_query: self.first_query.clone(),
+            base: self.base.clone(),
+            switches: self.switches.clone(),
+            fresh_plan: self.mask.tree().plan.clone(),
+        }
+    }
+}
+
+pub fn build_limited_shared_session(
+    request_plan: &RequestPlan,
+    compiled: &CompiledPlan,
+    statement: &LimitedKeyStatement,
+    reader: &IndexReader,
+    plan_identifier: Digest,
+    case_id: &[u8],
+    random_bytes: Digest,
+    mask_randomness: &LmHeadMaskRandomness,
+) -> Result<LimitedSharedSession> {
+    let parts = build_limited_plan_parts(
+        request_plan,
+        compiled,
+        statement,
+        reader,
+        plan_identifier,
+        case_id,
+        random_bytes,
+    )?;
+    let mask_oracle = MaskOracle {
+        id: LM_HEAD_FRESH_MASK,
+        claimed_group: LM_HEAD_FOLD_GROUP,
+        main_rows: 0,
+        mask_rows: parts.mask_tree.mask_rows,
+        mask_code: parts.fold.mask_code,
+        answers: 0,
+        sampled: false,
+    };
+    let mask = make_lm_head_mask(
+        &parts.fold,
+        &mask_oracle,
+        parts.verified.groups(),
+        parts.mask_tree,
+        mask_randomness,
+    )?;
+    let root = mask.root();
+    let setup = finish_limited_setup(parts, case_id, root)?;
+    Ok(LimitedSharedSession {
+        plan: setup.plan,
+        binder: setup.binder,
+        chain: setup.chain,
+        first_query: setup.first_query,
         mask,
-        base,
-        switches,
+        base: setup.base,
+        switches: setup.switches,
     })
 }
 
@@ -738,6 +839,7 @@ pub fn build_limited_shared_session_for_context(
 
 /// The private values of one G_u commitment: the oracle code tails, one salt
 /// per runtime-tree column and one pad per sample answer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LmHeadGuRandomness {
     pub code_tails: Vec<Vec<Fp3>>,
     pub salts: Vec<Vec<u8>>,
@@ -962,6 +1064,7 @@ pub fn fold_lm_head_gu_holder<S: TableRowSource>(
 
 /// The private values of one Omega commitment: the oracle code tails, one
 /// salt per runtime-tree column and one sample pad.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LmHeadOmegaRandomness {
     pub code_tails: Vec<Vec<Fp3>>,
     pub salts: Vec<Vec<u8>>,
@@ -2444,7 +2547,7 @@ pub fn run_limited_shared_to_columns(
 /// The public part of one switch input: the target, the tree plan and the
 /// optional following stage FOLD shape. Private tails, salts and pads are not
 /// copied into the verifier plan.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LimitedStageFoldPlan {
     pub shape: FoldShape,
     pub layout: FoldGroupLayout,
@@ -2454,7 +2557,7 @@ pub struct LimitedStageFoldPlan {
     pub fresh: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LimitedSwitchPlan {
     pub target: SwitchTarget,
     pub plan: RuntimeTreePlan,
@@ -2488,7 +2591,7 @@ impl LimitedSwitchPlan {
 /// the required shapes; every claim used for a check is recomputed from the
 /// verifier session or the artifact. Returns the final seal.
 pub fn verify_limited_chain(
-    setup: &LimitedSharedSession,
+    setup: &LimitedVerifySetup,
     trusted: &LimitedKeyStatement,
     switches: &[LimitedSwitchPlan],
     old_mask_plan: Option<MaskTreePlan>,
@@ -2500,7 +2603,7 @@ pub fn verify_limited_chain(
     }
     let (session, fold_output) = verify_limited_fold(setup, trusted, artifact)?;
     let mut chain = session.take_chain_for_base()?;
-    let initial_fresh_plan = setup.mask.tree().plan.clone();
+    let initial_fresh_plan = setup.fresh_plan.clone();
     let mut stage = public_initial_basis(setup, artifact, &fold_output, &initial_fresh_plan)?;
     let mut last_plan = None;
     let mut last_root = None;
@@ -2629,7 +2732,7 @@ pub fn verify_limited_chain(
 }
 
 fn public_initial_basis(
-    setup: &LimitedSharedSession,
+    setup: &LimitedVerifySetup,
     artifact: &LimitedChainArtifact,
     output: &FoldOutput,
     fresh_plan: &MaskTreePlan,
@@ -2829,7 +2932,7 @@ fn verify_stage_fold(
 /// witness, while the target is recomputed from the public claim targets and
 /// the drawn challenge.
 pub fn verify_limited_fold(
-    setup: &LimitedSharedSession,
+    setup: &LimitedVerifySetup,
     trusted: &LimitedKeyStatement,
     artifact: &LimitedChainArtifact,
 ) -> Result<(FoldeqSession, FoldOutput)> {
@@ -3020,6 +3123,7 @@ pub fn build_fold_row(
 
 /// The private values of the fresh FOLD mask: the coin seed and one salt per
 /// committed mask-tree column.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LmHeadMaskRandomness {
     pub seed: Digest,
     pub salts: Vec<Vec<u8>>,
@@ -3119,6 +3223,7 @@ pub fn make_lm_head_mask(
 /// The private values of the group's old mask message: its message rows, the
 /// encoding tails and one salt per mask-tree column. This message is sent with
 /// G_u; it is not the FOLD fresh mask.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LmHeadOldMaskRandomness {
     pub rows: Vec<Vec<Fp3>>,
     pub tails: Vec<Vec<Fp3>>,
@@ -4209,7 +4314,7 @@ pub struct BaseStep {
 
 /// The plan-bound last-stage BASE configuration: the independent masking
 /// oracle's tree plan and the stage's position count.
-#[derive(Clone)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BaseStarBinding {
     pub plan: RuntimeTreePlan,
     pub positions: usize,
@@ -6210,7 +6315,7 @@ mod tests {
         let prove_hwm = vm_hwm_kb();
         // A second public-only setup is used by the independent fold replay;
         // the private mask provider it carries is never read by the verifier.
-        let verify_session = build_limited_shared_session_for_context(
+        let verify_setup = build_limited_shared_session_for_context(
             &context,
             &request_plan,
             &compiled,
@@ -6219,7 +6324,8 @@ mod tests {
             random_digest_bytes,
             &mask_randomness,
         )
-        .expect("verify session");
+        .expect("verify session")
+        .verify_setup();
         let artifact = LimitedChainArtifact::from_record(&masked, &result.record)
             .expect("artifact");
         let artifact_bytes = artifact.encode();
@@ -6263,7 +6369,7 @@ mod tests {
         );
         let decoded = LimitedChainArtifact::decode(&artifact_bytes).expect("artifact decode");
         let verified_seal = verify_limited_chain(
-            &verify_session,
+            &verify_setup,
             &masked,
             &verify_plans,
             Some(old_mask_plan),
@@ -6277,7 +6383,7 @@ mod tests {
 
         let verify = |artifact: &LimitedChainArtifact| {
             verify_limited_chain(
-                &verify_session,
+                &verify_setup,
                 &masked,
                 &verify_plans,
                 Some(old_mask_plan.clone()),
@@ -6345,14 +6451,14 @@ mod tests {
         assert!(LimitedChainArtifact::decode(&truncated).is_err());
         let mut wrong_statement = decoded.clone();
         wrong_statement.statement.model_commitment = Digest([0xee; 32]);
-        assert!(verify_limited_fold(&verify_session, &masked, &wrong_statement).is_err());
+        assert!(verify_limited_fold(&verify_setup, &masked, &wrong_statement).is_err());
         let mut wrong_opening = decoded.clone();
         wrong_opening.column_openings[0].symbols[0] =
             wrong_opening.column_openings[0].symbols[0] + Fp::ONE;
-        assert!(verify_limited_fold(&verify_session, &masked, &wrong_opening).is_err());
+        assert!(verify_limited_fold(&verify_setup, &masked, &wrong_opening).is_err());
         let mut missing_opening = decoded.clone();
         missing_opening.column_openings.pop();
-        assert!(verify_limited_fold(&verify_session, &masked, &missing_opening).is_err());
+        assert!(verify_limited_fold(&verify_setup, &masked, &missing_opening).is_err());
         let sealed = result.sealed.expect("sealed");
         let proof = result.base_proof.expect("base proof");
         eprintln!(

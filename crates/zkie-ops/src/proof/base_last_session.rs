@@ -18,6 +18,8 @@
 //! the linear check, not corrected.
 
 use zkie_core::common::codec::DecodeLimits;
+use serde::{Deserialize, Serialize};
+
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
 use zkie_engine::pcs::request::base_stage::{self, BaseRows};
@@ -41,7 +43,7 @@ const STAGE_SEAL: u64 = 28;
 
 /// The private randomness of the BASE masking oracle. Tests pass an explicit
 /// fixed seed; production draws the seed from the operating system generator.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LastBaseRandomness {
     Fixed(Digest),
     Private,

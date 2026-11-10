@@ -12,6 +12,7 @@ pub mod report;
 pub mod run;
 pub mod s7_context;
 pub mod lm_head_key;
+pub mod lm_head_stage;
 pub mod verify;
 
 use provider::production_provider;

@@ -12,6 +12,8 @@
 //! constraints, and a real SEND sample declaration with follow-up checks
 //! remain unclosed.
 
+use serde::{Deserialize, Serialize};
+
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
 
@@ -264,7 +266,7 @@ pub fn register_switch(
 
 
 /// The part of the switched message's table a cut fills.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CutPart {
     Main,
     Mask,
@@ -273,7 +275,7 @@ pub enum CutPart {
 /// An aligned block of `2^bits` rows of one table of the switched message. A
 /// vector fills it row first: entry `j` is in row `first_row + (j mod 2^bits)`
 /// at place `j div 2^bits`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cut {
     pub part: CutPart,
     pub bits: u32,
@@ -284,7 +286,7 @@ pub struct Cut {
 /// row counts and answer count, and where the old main message and the rest
 /// go. The current stage's openings and samples use the current shape; this
 /// target is built from the next stage of the same bound plan.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwitchTarget {
     pub code: CodeParams,
     pub mask_code: CodeParams,

@@ -67,7 +67,7 @@ impl FoldShape {
 /// `kept` is the layout mark that permits that member to appear as a kept
 /// form. `mask_rows` is used by the isolated mask-block space check, not only
 /// as identity.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FoldMemberLayout {
     pub oracle: u64,
     pub main_rows: u64,
@@ -80,7 +80,7 @@ pub struct FoldMemberLayout {
 /// this isolated test layer; its production source is not authenticated, and a
 /// proof cannot supply or change it. The checks below are only candidate
 /// self-consistency checks, not a reference layout derivation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FoldGroupLayout {
     pub group: u64,
     pub k: u32,
