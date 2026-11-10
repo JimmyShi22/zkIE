@@ -340,6 +340,11 @@ pub fn read_private(path: &Path, public_digest: Digest) -> Result<LmHeadPrivateS
     LmHeadPrivateState::decode(&read_bytes(path)?, public_digest)
 }
 
+fn sync_dir(dir: &Path) -> Result<()> {
+    let file = File::open(dir).map_err(|_| Error::Io)?;
+    file.sync_all().map_err(|_| Error::Io)
+}
+
 fn budget_path(dir: &Path) -> PathBuf {
     dir.join(BUDGET_FILE)
 }
@@ -371,7 +376,8 @@ pub fn initialize_budget(dir: &Path, session: Digest, max_columns: u64) -> Resul
         used_columns: 0,
         mask_consumed: false,
     };
-    write_budget(dir, &state)
+    write_budget(dir, &state)?;
+    sync_dir(dir)
 }
 
 pub fn read_budget(dir: &Path) -> Result<LmHeadBudgetState> {
@@ -379,6 +385,9 @@ pub fn read_budget(dir: &Path) -> Result<LmHeadBudgetState> {
 }
 
 /// Atomically reserves the columns and the mask material for one proof. The
+/// journal fences reuse within this directory lifetime; rolling back the whole
+/// machine or directory snapshot to an earlier state is an external
+/// deployment trust assumption and is not detected here. The
 /// lock file is created exclusively; a stale lock or a spent budget makes a
 /// later claim fail. A successful claim never rolls back.
 pub fn claim_budget(dir: &Path, session: Digest, columns: u64) -> Result<LmHeadBudgetClaim> {
@@ -404,7 +413,14 @@ pub fn claim_budget(dir: &Path, session: Digest, columns: u64) -> Result<LmHeadB
     let temp = dir.join("budget.tmp");
     write_bytes(&temp, &encode_bytes(&claimed)?, true)?;
     std::fs::rename(&temp, &path).map_err(|_| Error::Io)?;
-    let _ = std::fs::remove_file(&lock);
+    // The replacement is durable before the lock is released: the file is
+    // synced, then the parent directory entry, then the lock is removed and
+    // the directory synced again. A crash before the first directory sync
+    // leaves the old state or the lock in place and every retry fails closed;
+    // a crash after it leaves the spent state durable.
+    sync_dir(dir)?;
+    std::fs::remove_file(&lock).map_err(|_| Error::Io)?;
+    sync_dir(dir)?;
     Ok(LmHeadBudgetClaim { state: claimed })
 }
 
@@ -682,6 +698,56 @@ mod tests {
         let session = Digest([13; 32]);
         initialize_budget(&dir, session, 10).expect("initialize");
         assert!(claim_budget(&dir, Digest([14; 32]), 1).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_successful_claim_is_durable_and_leaves_no_journal_temporary() {
+        let dir = dir();
+        let session = Digest([15; 32]);
+        initialize_budget(&dir, session, 10).expect("initialize");
+        let _claim = claim_budget(&dir, session, 4).expect("claim");
+        assert!(!dir.join(BUDGET_LOCK).exists());
+        assert!(!dir.join("budget.tmp").exists());
+        // A fresh reader, as after a restart, sees the spent journal.
+        let state = read_budget(&dir).expect("reopen");
+        assert_eq!(state.used_columns, 4);
+        assert!(state.mask_consumed);
+        assert!(claim_budget(&dir, session, 4).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_claims_have_one_winner_and_no_mask_reuse() {
+        let dir = dir();
+        let session = Digest([16; 32]);
+        initialize_budget(&dir, session, 10).expect("initialize");
+        let first = dir.clone();
+        let second = dir.clone();
+        let a = std::thread::spawn(move || claim_budget(&first, session, 4).is_ok());
+        let b = std::thread::spawn(move || claim_budget(&second, session, 4).is_ok());
+        let wins = [a.join().expect("join"), b.join().expect("join")]
+            .into_iter()
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(wins, 1);
+        let state = read_budget(&dir).expect("state");
+        assert_eq!(state.used_columns, 4);
+        assert!(state.mask_consumed);
+        assert!(claim_budget(&dir, session, 4).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_journal_lock_fails_closed_and_keeps_the_old_state() {
+        let dir = dir();
+        let session = Digest([17; 32]);
+        initialize_budget(&dir, session, 10).expect("initialize");
+        std::fs::write(dir.join(BUDGET_LOCK), b"stale").expect("lock");
+        assert!(claim_budget(&dir, session, 4).is_err());
+        let state = read_budget(&dir).expect("state");
+        assert_eq!(state.used_columns, 0);
+        assert!(!state.mask_consumed);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
