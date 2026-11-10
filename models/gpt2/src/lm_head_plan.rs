@@ -1,15 +1,17 @@
 //! Fixed request plan for the GPT-2 output-head linear relation.
 //!
 //! The plan binds the committed table (2^10 rows of 2^16 entries beside the
-//! answer pads), the main and mask codes, the five groups, the later stages
-//! and the eight trees. The numbers are protocol data; a runtime validates
-//! them with [`RequestPlan::validate`] before any proof is made or read.
+//! answer pads), the two sets of group lines (the committer's one-time test
+//! and a batch's test), the linear shape and the work scopes. The folded row
+//! and Omega share one main code and one mask code here, so the two are tested
+//! together and no split message is needed.
 
 use zkie_core::error::Result;
 use zkie_engine::pcs::request::code::{build_code_plan, CodeParams};
+use zkie_engine::pcs::request::field::E_DEGREE;
 use zkie_engine::pcs::request::plan::{
-    derive_stages, CodeId, CodesPlan, GroupPlan, GroupsPlan, LinPlan, RequestPlan, ScopeWork,
-    StageChoice, StagesPlan, TablePlan, TreePlan, TreesPlan, WorkPlan, WorkScope,
+    CodeLine, GroupLine, LinLines, LinPlan, RequestPlan, ScopeWork, StageChoice, TablePlan,
+    WorkPlan,
 };
 
 fn code(log_n: u32, ell: u64, r: u64) -> Result<CodeParams> {
@@ -20,45 +22,45 @@ fn scope(positions: u8) -> Result<ScopeWork> {
     ScopeWork::new(positions, 0)
 }
 
-fn group(main: CodeId, mask: CodeId, k: u32, scope: WorkScope) -> GroupPlan {
-    GroupPlan {
-        main,
-        mask,
-        k,
-        h: 0,
-        rows_log: 10,
-        cube: 17,
-        scope,
-    }
+fn line(log_n: u32, log_ell: u32) -> CodeLine {
+    CodeLine { log_n, log_ell }
 }
 
-fn stage(k: u32, h: u32, log_n: u32, mask_log_n: u32, positions: u64) -> StageChoice {
+fn stage(k: u32, h: u32, log_n: u32, mask_log_n: u32) -> StageChoice {
     StageChoice {
         k,
         h,
         log_n,
         mask_log_n,
-        positions,
     }
 }
 
-fn tree(log_n: u32, rows: u64) -> TreePlan {
-    TreePlan { log_n, rows }
+fn stages() -> Vec<StageChoice> {
+    vec![
+        stage(4, 3, 12, 12),
+        stage(3, 3, 12, 11),
+        stage(0, 0, 13, 12),
+    ]
 }
 
-fn codes() -> Result<CodesPlan> {
-    Ok(CodesPlan {
-        u: code(11, 512, 300)?,
-        om: code(17, 4096, 3640)?,
-        mask_u: code(10, 64, 300)?,
-        mask_o: code(14, 64, 300)?,
-        mask_c: code(14, 256, 300)?,
-    })
+fn group(main: CodeLine, mask: CodeLine) -> GroupLine {
+    GroupLine {
+        main,
+        mask,
+        stages: stages(),
+    }
+}
+
+fn lines() -> LinLines {
+    LinLines {
+        folded: group(line(17, 12), line(14, 6)),
+        omega: group(line(17, 12), line(14, 6)),
+        own: group(line(17, 12), line(14, 8)),
+    }
 }
 
 /// The fixed request plan of the output-head relation.
 pub fn lm_head_plan() -> Result<RequestPlan> {
-    let codes = codes()?;
     Ok(RequestPlan {
         table: TablePlan {
             code: code(17, 65539, 8192)?,
@@ -66,51 +68,8 @@ pub fn lm_head_plan() -> Result<RequestPlan> {
             delta_once_num: 1,
             delta_once_den: 8,
         },
-        codes,
-        groups: GroupsPlan {
-            guo: group(CodeId::U, CodeId::MaskU, 7, WorkScope::Once),
-            omo: group(CodeId::Om, CodeId::MaskO, 4, WorkScope::Once),
-            gu: group(CodeId::U, CodeId::MaskU, 7, WorkScope::Shared),
-            om: group(CodeId::Om, CodeId::MaskO, 4, WorkScope::Shared),
-            own: group(CodeId::Om, CodeId::MaskC, 4, WorkScope::Request),
-        },
-        stages: StagesPlan {
-            guo: vec![
-                stage(4, 2, 12, 11, 141),
-                stage(3, 2, 12, 11, 141),
-                stage(0, 0, 13, 13, 122),
-            ],
-            omo: vec![
-                stage(4, 3, 12, 12, 127),
-                stage(3, 3, 12, 11, 141),
-                stage(0, 0, 13, 12, 287),
-            ],
-            gu: vec![
-                stage(4, 2, 12, 11, 141),
-                stage(3, 2, 12, 11, 141),
-                stage(0, 0, 13, 13, 122),
-            ],
-            om: vec![
-                stage(4, 3, 12, 12, 127),
-                stage(3, 3, 12, 11, 141),
-                stage(0, 0, 13, 12, 287),
-            ],
-            own: vec![
-                stage(4, 3, 12, 12, 142),
-                stage(3, 3, 12, 11, 160),
-                stage(0, 0, 13, 12, 327),
-            ],
-        },
-        trees: TreesPlan {
-            t: tree(17, 1024),
-            gu: tree(11, 1),
-            om: tree(17, 1),
-            wc: tree(17, 1),
-            gu2: tree(11, 1),
-            om2: tree(17, 1),
-            oc2: tree(17, 1),
-            wc2: tree(17, 1),
-        },
+        once: lines(),
+        proof: lines(),
         lin: LinPlan {
             matrix_rows_log: 10,
             k_col: 16,
@@ -127,7 +86,6 @@ pub fn lm_head_plan() -> Result<RequestPlan> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zkie_engine::pcs::request::field::E_DEGREE;
 
     #[test]
     fn the_fixed_plan_is_admissible() {
@@ -143,8 +101,6 @@ mod tests {
         assert_eq!(plan.table.v, plan.lin.matrix_rows_log);
         assert_eq!(plan.lin.matrix_rows_log + plan.lin.k_lo, plan.lin.k_col);
         assert_eq!(shape.cube_bits(), 17);
-        assert_eq!(plan.groups.guo.cube_bits(&plan.codes).expect("cube"), 17);
-        assert_eq!(plan.groups.omo.cube_bits(&plan.codes).expect("cube"), 17);
         assert_eq!(plan.work.request.positions, 0);
         assert_eq!(plan.work.shared.positions, 12);
         assert_eq!(plan.work.once.positions, 12);
@@ -154,23 +110,11 @@ mod tests {
     }
 
     #[test]
-    fn the_stage_codes_follow_the_fold() {
+    fn the_folded_and_omega_groups_share_their_mask_code() {
         let plan = lm_head_plan().expect("plan");
-        let expected = [
-            (&plan.groups.guo, &plan.stages.guo, vec![(32, 141, 512, 141), (4, 141, 512, 141), (4, 122, 2048, 122)]),
-            (&plan.groups.omo, &plan.stages.omo, vec![(256, 127, 1024, 127), (32, 141, 512, 141), (32, 287, 2048, 287)]),
-            (&plan.groups.gu, &plan.stages.gu, vec![(32, 141, 512, 141), (4, 141, 512, 141), (4, 122, 2048, 122)]),
-            (&plan.groups.om, &plan.stages.om, vec![(256, 127, 1024, 127), (32, 141, 512, 141), (32, 287, 2048, 287)]),
-            (&plan.groups.own, &plan.stages.own, vec![(256, 142, 1024, 142), (32, 160, 512, 160), (32, 327, 2048, 327)]),
-        ];
-        for (group, stages, want) in expected {
-            let derived = derive_stages(&plan.codes, group, stages, plan.samples).expect("stages");
-            let got: Vec<(u64, u64, u64, u64)> = derived
-                .iter()
-                .map(|(main, mask)| (main.ell, main.r, mask.ell, mask.r))
-                .collect();
-            assert_eq!(got, want);
-        }
+        assert_eq!(plan.proof.folded.mask, plan.proof.omega.mask);
+        assert_eq!(plan.once.folded.mask, plan.once.omega.mask);
+        assert_eq!(plan.proof.own.main, plan.proof.omega.main);
     }
 
     #[test]
@@ -181,40 +125,23 @@ mod tests {
     }
 
     #[test]
-    fn a_wrong_table_tree_is_rejected() {
-        let mut plan = lm_head_plan().expect("plan");
-        plan.trees.t.log_n = 18;
-        assert!(plan.validate().is_err());
-    }
-
-    #[test]
     fn a_wrong_last_stage_is_rejected() {
         let mut plan = lm_head_plan().expect("plan");
-        plan.stages.omo[2] = stage(1, 0, 13, 12, 287);
+        plan.proof.omega.stages[2] = stage(1, 0, 13, 12);
         assert!(plan.validate().is_err());
     }
 
     #[test]
-    fn a_wrong_group_cube_is_rejected() {
+    fn a_wrong_group_mask_is_rejected() {
         let mut plan = lm_head_plan().expect("plan");
-        plan.groups.own.cube = 16;
+        plan.proof.omega.mask = line(14, 7);
         assert!(plan.validate().is_err());
     }
 
     #[test]
-    fn a_wrong_instance_count_is_rejected() {
+    fn a_wrong_own_main_code_is_rejected() {
         let mut plan = lm_head_plan().expect("plan");
-        plan.lin.proof_instances = 0;
-        assert!(plan.validate().is_err());
-        let mut plan = lm_head_plan().expect("plan");
-        plan.lin.key_instances = 2;
-        assert!(plan.validate().is_err());
-    }
-
-    #[test]
-    fn a_mask_code_with_a_larger_rate_is_rejected() {
-        let mut plan = lm_head_plan().expect("plan");
-        plan.codes.mask_c = code(14, 4096, 300).expect("code");
+        plan.once.own.main = line(16, 11);
         assert!(plan.validate().is_err());
     }
 
@@ -226,9 +153,12 @@ mod tests {
     }
 
     #[test]
-    fn a_stage_with_a_wrong_position_count_is_rejected() {
+    fn the_once_and_proof_sets_are_checked_separately() {
         let mut plan = lm_head_plan().expect("plan");
-        plan.stages.guo[0] = stage(4, 2, 12, 11, 0);
+        plan.once.folded.mask = line(14, 7);
+        assert!(plan.validate().is_err());
+        let mut plan = lm_head_plan().expect("plan");
+        plan.proof.folded.mask = line(14, 7);
         assert!(plan.validate().is_err());
     }
 }
