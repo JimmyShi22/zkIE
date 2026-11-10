@@ -13,10 +13,14 @@
 //! remain unclosed.
 
 use zkie_core::error::{Error, Result};
+use zkie_core::types::Digest;
 
 use crate::pcs::request::code::{build_code_plan, encode_row_fp3, CodeParams};
-use crate::pcs::request::field::Fp3;
+use crate::pcs::request::field::{Fp3, E_DEGREE};
 use crate::pcs::request::proximity::{ProximityStatement, SingleRows};
+use crate::pcs::request::runtime_tree::{
+    RuntimePartRows, RuntimeTree, RuntimeTreePart, RuntimeTreePlan,
+};
 
 /// One registered linear claim on the new-code main/mask messages.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -657,6 +661,173 @@ pub fn register_switch_multi(
         mask_tail_len: 0,
     })
 }
+
+/// The multi-row switched message with one encoding tail per new row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SwitchedRows {
+    pub main: Vec<Fp3>,
+    pub main_tails: Vec<Vec<Fp3>>,
+    pub mask: Vec<Fp3>,
+    pub mask_tails: Vec<Vec<Fp3>>,
+}
+
+/// Builds the multi-row switched message with a private encoding tail for
+/// every main and mask row. The rest (old messages and old tails) is laid out
+/// exactly as `switched_message_multi`; the new tails are not part of it.
+pub fn switched_rows_multi(
+    rows: &SingleRows,
+    target: &SwitchTarget,
+    main_tails: Vec<Vec<Fp3>>,
+    mask_tails: Vec<Vec<Fp3>>,
+    pad_value: Fp3,
+) -> Result<SwitchedRows> {
+    target.check(rows)?;
+    if main_tails.len() as u64 != target.main_rows
+        || mask_tails.len() as u64 != target.mask_rows
+        || main_tails.iter().any(|tail| tail.len() as u64 != target.code.r)
+        || mask_tails
+            .iter()
+            .any(|tail| tail.len() as u64 != target.mask_code.r)
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let main_len = usize::try_from(
+        target
+            .main_rows
+            .checked_mul(target.code.ell)
+            .ok_or(Error::ResourceLimit)?,
+    )
+    .map_err(|_| Error::ResourceLimit)?;
+    let mask_len = usize::try_from(
+        target
+            .mask_rows
+            .checked_mul(target.mask_code.ell)
+            .ok_or(Error::ResourceLimit)?,
+    )
+    .map_err(|_| Error::ResourceLimit)?;
+    let mut main = vec![Fp3::ZERO; main_len];
+    for (j, value) in rows.main.iter().enumerate() {
+        let index = SwitchTarget::cut_index(&target.main, target.main.bits, j as u64)?;
+        *main.get_mut(index as usize).ok_or(Error::ShapeMismatch)? = *value;
+    }
+    let mut rest = Vec::with_capacity(SwitchTarget::rest_length(rows));
+    for row in &rows.masks {
+        rest.extend_from_slice(row);
+    }
+    rest.extend_from_slice(&rows.main_tail);
+    for tail in &rows.mask_tails {
+        rest.extend_from_slice(tail);
+    }
+    let places = target.rest_places()?;
+    if rest.len() > places.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut mask = vec![Fp3::ZERO; mask_len];
+    for (value, index) in rest.iter().zip(&places) {
+        *mask.get_mut(*index as usize).ok_or(Error::ShapeMismatch)? = *value;
+    }
+    for (part, index) in target.pads()? {
+        if part == CutPart::Mask {
+            *mask.get_mut(index as usize).ok_or(Error::ShapeMismatch)? = pad_value;
+        }
+    }
+    Ok(SwitchedRows {
+        main,
+        main_tails,
+        mask,
+        mask_tails,
+    })
+}
+
+/// The runtime tree plan of the multi-row switched oracle message: one part
+/// with `2^k` main rows and `2^h` mask rows over the target's codes.
+pub fn switch_tree_plan_multi(
+    tag: u64,
+    target: &SwitchTarget,
+    salt_bytes: usize,
+    run: Digest,
+    configuration: Digest,
+) -> Result<RuntimeTreePlan> {
+    let plan = RuntimeTreePlan {
+        tree_number: 0x300u64.wrapping_add(tag & 0xff),
+        leaf_class: 7,
+        log_n: target.code.log_n,
+        log_n_zk: target.mask_code.log_n,
+        parts: vec![RuntimeTreePart {
+            main_symbols: target
+                .main_rows
+                .checked_mul(E_DEGREE as u64)
+                .ok_or(Error::ResourceLimit)?,
+            mask_symbols: target
+                .mask_rows
+                .checked_mul(E_DEGREE as u64)
+                .ok_or(Error::ResourceLimit)?,
+        }],
+        salt_bytes,
+        run,
+        configuration,
+    };
+    if plan.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(plan)
+}
+
+/// Encodes every new main and mask row with its own tail and commits the
+/// runtime tree of the switched oracle message.
+pub fn commit_switch(
+    target: &SwitchTarget,
+    rows: &SwitchedRows,
+    plan: &RuntimeTreePlan,
+    salts: &[Vec<u8>],
+) -> Result<RuntimeTree> {
+    let main_rows = usize::try_from(target.main_rows).map_err(|_| Error::ResourceLimit)?;
+    let mask_rows = usize::try_from(target.mask_rows).map_err(|_| Error::ResourceLimit)?;
+    let ell = usize::try_from(target.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let mask_ell = usize::try_from(target.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
+    if rows.main_tails.len() != main_rows || rows.mask_tails.len() != mask_rows {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut main = Vec::with_capacity(main_rows);
+    for row in 0..main_rows {
+        let mut message = Vec::with_capacity(ell);
+        for place in 0..ell {
+            let index = row
+                .checked_add(place << target.main.bits)
+                .ok_or(Error::ResourceLimit)?;
+            message.push(*rows.main.get(index).ok_or(Error::ShapeMismatch)?);
+        }
+        main.push(encode_row_fp3(
+            &target.code,
+            &message,
+            &rows.main_tails[row],
+        )?);
+    }
+    let mut mask = Vec::with_capacity(mask_rows);
+    for row in 0..mask_rows {
+        let mut message = Vec::with_capacity(mask_ell);
+        for place in 0..mask_ell {
+            let index = row
+                .checked_add(place << target.rest.bits)
+                .ok_or(Error::ResourceLimit)?;
+            message.push(*rows.mask.get(index).ok_or(Error::ShapeMismatch)?);
+        }
+        mask.push(encode_row_fp3(
+            &target.mask_code,
+            &message,
+            &rows.mask_tails[row],
+        )?);
+    }
+    RuntimeTree::commit(
+        plan.clone(),
+        &[RuntimePartRows {
+            main,
+            mask,
+            main_deg: E_DEGREE as u32,
+        }],
+        salts,
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -822,6 +993,68 @@ mod tests {
             value = value.add(&coefficient.mul(symbol));
         }
         assert_eq!(value, switched.combined.target);
+    }
+
+
+    #[test]
+    fn the_multi_row_switch_commits_one_codeword_per_new_row() {
+        use crate::pcs::request::code::build_code_plan;
+        use crate::pcs::request::params::LEAF_SALT_MIN_BYTES;
+        let old_code = build_code_plan(17, 4096, 94).unwrap();
+        let old_mask = build_code_plan(14, 64, 47).unwrap();
+        let rows = SingleRows {
+            code: old_code,
+            mask_code: old_mask,
+            main: (0..4096).map(|index| Fp3::from_u64(index + 1)).collect(),
+            main_tail: (0..94).map(|index| Fp3::from_u64(0x1000 + index)).collect(),
+            masks: vec![
+                (0..64).map(|index| Fp3::from_u64(0x2000 + index)).collect(),
+                (0..64).map(|index| Fp3::from_u64(0x3000 + index)).collect(),
+            ],
+            mask_tails: vec![
+                (0..47).map(|index| Fp3::from_u64(0x4000 + index)).collect(),
+                (0..47).map(|index| Fp3::from_u64(0x5000 + index)).collect(),
+            ],
+            claim: vec![Fp3::ZERO; 4096],
+            mask_claims: vec![vec![Fp3::ZERO; 64], vec![Fp3::ZERO; 64]],
+            target: Fp3::ZERO,
+        };
+        let next_code = build_code_plan(12, 256, 64).unwrap();
+        let next_mask = build_code_plan(12, 64, 64).unwrap();
+        let target = SwitchTarget::from_stage(next_code, next_mask, 4, 3, 1).unwrap();
+        let main_tails: Vec<Vec<Fp3>> = (0..16)
+            .map(|row| (0..64).map(|entry| Fp3::from_u64(0x6000 + row * 0x100 + entry)).collect())
+            .collect();
+        let mask_tails: Vec<Vec<Fp3>> = (0..8)
+            .map(|row| (0..64).map(|entry| Fp3::from_u64(0x7000 + row * 0x100 + entry)).collect())
+            .collect();
+        let rows = switched_rows_multi(
+            &rows,
+            &target,
+            main_tails,
+            mask_tails,
+            Fp3::from_u64(0x99),
+        )
+        .unwrap();
+        let plan = switch_tree_plan_multi(
+            1,
+            &target,
+            LEAF_SALT_MIN_BYTES,
+            Digest([0xc1; 32]),
+            Digest([0xc2; 32]),
+        )
+        .unwrap();
+        let salts: Vec<Vec<u8>> = (0..plan.columns())
+            .map(|position| vec![(position as u8) ^ 0x77; plan.salt_bytes])
+            .collect();
+        let tree = commit_switch(&target, &rows, &plan, &salts).unwrap();
+        assert_ne!(tree.root(), &Digest::ZERO);
+        let again = commit_switch(&target, &rows, &plan, &salts).unwrap();
+        assert_eq!(tree.root(), again.root());
+        let mut changed = rows.clone();
+        changed.main_tails[0][0] = Fp3::from_u64(0xdead);
+        let other = commit_switch(&target, &changed, &plan, &salts).unwrap();
+        assert_ne!(tree.root(), other.root());
     }
 
 }
