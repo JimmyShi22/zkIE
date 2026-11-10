@@ -1,0 +1,21 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/zkie_ops-a527cf57462e281a)
+
+running 14 tests
+test proof::session_baseline::tests::forged_trusted_anchor_identity_is_rejected ... ok
+test proof::session_baseline::tests::forged_asset_meta_root_is_rejected_before_use ... ok
+test proof::session_baseline::tests::changing_an_absorbed_input_value_changes_the_words ... ok
+test proof::session_baseline::tests::changing_an_absorbed_asset_value_changes_the_words ... ok
+test proof::session_baseline::tests::prover_and_verifier_derive_the_same_challenge ... ok
+test proof::session_baseline::tests::positive_selected_matmul_step_verifies ... ok
+test proof::session_baseline::tests::binding_assembly_outputs_are_used ... ok
+test proof::session_baseline::tests::malformed_plan_dimensions_are_rejected ... ok
+test proof::session_baseline::tests::rounded_output_mismatch_is_rejected ... ok
+test proof::session_baseline::tests::authenticated_wrong_asset_value_is_rejected ... ok
+test proof::session_baseline::tests::authenticated_wrong_input_or_output_or_raw_is_rejected ... ok
+test proof::session_baseline::tests::plan_port_asset_and_root_tampering_is_rejected ... ok
+test proof::session_baseline::tests::opening_position_and_malformed_shapes_are_rejected ... ok
+test proof::session_baseline::tests::any_opening_position_is_checked ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.01s
+
