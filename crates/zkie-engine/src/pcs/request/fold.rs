@@ -221,7 +221,9 @@ pub fn fold_member_firsts(
         let block = checked_block(rows).ok_or(Error::ResourceLimit)?;
         let start = aligned_start(cursor, block).ok_or(Error::ResourceLimit)?;
         firsts.push(Some(start));
-        cursor = start.checked_add(rows).ok_or(Error::ResourceLimit)?;
+        // A member occupies its complete power-of-two block; the next member
+        // starts after that block, matching the BAT group layout.
+        cursor = start.checked_add(block).ok_or(Error::ResourceLimit)?;
     }
     Ok(firsts)
 }

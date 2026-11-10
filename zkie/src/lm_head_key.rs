@@ -22,6 +22,7 @@ use zkie_engine::pcs::request::chain::Chain;
 use zkie_engine::pcs::request::code::encode_row_fp3;
 use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE};
 use zkie_engine::pcs::request::fold::{
+    fold_member_firsts, FoldPart,
     fold_mask_make, fold_mask_make_tail, fold_mask_notice, fold_mask_shape_fault,
     fold_start_prove, ByteMaskCoins, FoldGroupLayout, FoldInputRow, FoldMask, FoldMemberLayout,
     FoldOutput, FoldProverSession, FoldShape, FoldStartMessage, FoldStartProver, MaskOracle,
@@ -49,7 +50,10 @@ use zkie_engine::pcs::request::table::{
     SampleSeed,
 };
 use zkie_engine::primitives::transcript::run_value;
+use zkie_engine::pcs::request::proximity::SingleRows;
+use zkie_ops::proof::base_final_session::{FoldBasis, FoldMember};
 use zkie_ops::proof::column_session::fp_from_signed_word;
+use zkie_ops::proof::fold_handoff::{FoldHandoff, FoldHandoffAnchor};
 use zkie_ops::proof::session_baseline::SESSION_PROTOCOL_IDENTITY;
 
 use crate::s7_context::LmHeadContext;
@@ -799,6 +803,10 @@ impl LmHeadGuProvider {
         &self.main_tails
     }
 
+    pub fn tree_plan(&self) -> RuntimeTreePlan {
+        self.tree.plan().clone()
+    }
+
     /// The complete ordered sample answers for the verifier's seeds. The
     /// target is the evaluation of the verifier's own coefficient row on the
     /// committed witness; it is not supplied by the verifier.
@@ -991,6 +999,10 @@ impl LmHeadOmegaProvider {
         &self.main_tails
     }
 
+    pub fn tree_plan(&self) -> RuntimeTreePlan {
+        self.committed.plan().clone()
+    }
+
     /// The complete ordered sample answers for the verifier's seeds. It uses
     /// the same ordinary-oracle sample relation the verifier will apply.
     pub fn answers(&self, seeds: &[SampleSeed]) -> Result<Vec<Fp3>> {
@@ -1142,6 +1154,7 @@ pub struct LimitedSharedColumns {
     pub zeta: Vec<Fp3>,
     pub fold_output: Option<FoldOutput>,
     pub folded_main_message: Vec<Fp3>,
+    pub fold_stage: Option<LimitedFoldStage>,
     pub transcript: Digest,
 }
 
@@ -1204,6 +1217,7 @@ pub fn run_limited_shared_to_columns(
     let mut zeta = Vec::new();
     let mut fold_output = None;
     let mut folded_main_message = Vec::new();
+    let mut fold_stage = None;
     if let Some(omega) = session.plan().omega.as_ref().cloned() {
         let omega_randomness = omega_randomness.ok_or(Error::InvalidConfig)?;
         let psi_lo: Vec<Fp3> = match session.psi() {
@@ -1347,8 +1361,18 @@ pub fn run_limited_shared_to_columns(
                 .ok_or(Error::InvalidSessionState)?;
             prover.bind(gamma)?;
         }
-        fold_output = Some(session.fold_finish()?);
+        let output = session.fold_finish()?;
         folded_main_message = prover.main_messages().to_vec();
+        fold_stage = Some(build_limited_fold_stage(
+            session.plan(),
+            &setup.mask,
+            &provider,
+            &omega_provider,
+            old_mask,
+            &output,
+            &folded_main_message,
+        )?);
+        fold_output = Some(output);
         }
     } else if omega_randomness.is_some() {
         return Err(Error::InvalidConfig);
@@ -1366,6 +1390,7 @@ pub fn run_limited_shared_to_columns(
             zeta,
             fold_output,
             folded_main_message,
+            fold_stage,
             transcript,
         },
     ))
@@ -1811,6 +1836,154 @@ fn group_main_messages(
         }
     }
     Ok(out)
+}
+
+/// The FOLD-to-CS handoff of one shared run: the verified handoff, the
+/// original member commitments and the prover's two-mask single rows.
+pub struct LimitedFoldStage {
+    pub handoff: FoldHandoff,
+    pub basis: FoldBasis,
+    pub rows: SingleRows,
+}
+
+/// Builds the FOLD-to-CS handoff from the verified FOLD output and the real
+/// committed member trees. The single rows carry the folded main message, the
+/// folded tails of the member encodings, the old mask message and the FOLD
+/// fresh mask, with the handoff's main/mask/fresh claims.
+#[allow(clippy::too_many_arguments)]
+pub fn build_limited_fold_stage(
+    plan: &FoldeqPlan,
+    fresh: &LmHeadMaskProvider,
+    gu: &LmHeadGuProvider,
+    omega: &LmHeadOmegaProvider,
+    old_mask: &LmHeadOldMaskProvider,
+    output: &FoldOutput,
+    folded_main: &[Fp3],
+) -> Result<LimitedFoldStage> {
+    let layout = plan
+        .fold_layout
+        .clone()
+        .ok_or(Error::InvalidConfig)?;
+    let fresh_root = fresh.root();
+    let anchor = FoldHandoffAnchor {
+        shape: plan.fold,
+        group: plan.group_id,
+        members: layout.members.iter().map(|member| member.oracle).collect(),
+        fresh: LM_HEAD_FRESH_MASK,
+        fresh_root,
+        tree_number: plan.mask_tree_number,
+        layout: layout.clone(),
+        fold_gamma: output.gamma.clone(),
+        fold_epsilon: output.eps,
+        fold_sum: output.sum,
+    };
+    let handoff = FoldHandoff::from_output(output, &anchor)?;
+    if handoff.members.len() != 2
+        || handoff.members[0] != gu.shape().oracle
+        || handoff.members[1] != omega.oracle()
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let mut members = Vec::with_capacity(2);
+    for member in &layout.members {
+        if member.oracle == gu.shape().oracle {
+            members.push(FoldMember {
+                oracle: member.oracle,
+                main_code: gu.shape().u.code,
+                mask_code: handoff.mask_code,
+                root: gu.root(),
+                tree: gu.tree_plan(),
+            });
+        } else if member.oracle == omega.oracle() {
+            members.push(FoldMember {
+                oracle: member.oracle,
+                main_code: omega.shape().code,
+                mask_code: handoff.mask_code,
+                root: omega.root(),
+                tree: omega.tree_plan(),
+            });
+        } else {
+            return Err(Error::StatementMismatch);
+        }
+    }
+    let basis = FoldBasis {
+        layout: handoff.layout.clone(),
+        fresh_root: handoff.fresh_root,
+        fresh_tree: fresh.tree().plan,
+        members,
+    };
+    let main_coeff = foldeq_weights(&handoff.gamma, handoff.k)?;
+    let mask_coeff = foldeq_weights(&handoff.gamma[..handoff.h as usize], handoff.h)?;
+    let main_firsts = fold_member_firsts(&layout, FoldPart::Main)?;
+    let mask_firsts = fold_member_firsts(&layout, FoldPart::Mask)?;
+    let main_tail_len = usize::try_from(handoff.code.r).map_err(|_| Error::ResourceLimit)?;
+    let mask_tail_len = usize::try_from(handoff.mask_code.r).map_err(|_| Error::ResourceLimit)?;
+    let mut main_tail = vec![Fp3::ZERO; main_tail_len];
+    let mut mask_tail = vec![Fp3::ZERO; mask_tail_len];
+    for (index, member) in layout.members.iter().enumerate() {
+        let first = main_firsts[index];
+        if member.main_rows > 0 && !member.kept {
+            let first = first.ok_or(Error::StatementMismatch)?;
+            let tails: &[Vec<Fp3>] = if member.oracle == gu.shape().oracle {
+                gu.main_tails()
+            } else if member.oracle == omega.oracle() {
+                omega.main_tails()
+            } else {
+                return Err(Error::StatementMismatch);
+            };
+            for row in 0..usize::try_from(member.main_rows).map_err(|_| Error::ResourceLimit)? {
+                let tail = tails.get(row).ok_or(Error::ShapeMismatch)?;
+                let group = first
+                    .checked_add(row as u64)
+                    .ok_or(Error::ResourceLimit)?;
+                let coefficient = *main_coeff
+                    .get(group as usize)
+                    .ok_or(Error::InvalidIndex)?;
+                for (value, entry) in main_tail.iter_mut().zip(tail) {
+                    *value = value.add(&coefficient.mul(entry));
+                }
+            }
+        }
+        if member.mask_rows > 0 {
+            let first = mask_firsts[index].ok_or(Error::StatementMismatch)?;
+            let _ = first;
+            return Err(Error::UnsupportedPrimitive);
+        }
+    }
+    let mut masks = vec![old_mask.mu()?, fresh.coefficients().to_vec()];
+    let mut mask_tails = vec![
+        old_mask
+            .tails()
+            .first()
+            .cloned()
+            .ok_or(Error::ShapeMismatch)?,
+        fresh.tails()?.to_vec(),
+    ];
+    if masks.iter().any(|mask| mask.len() != handoff.mask_code.ell as usize)
+        || mask_tails
+            .iter()
+            .any(|tail| tail.len() != handoff.mask_code.r as usize)
+        || mask_coeff.len() != 1
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let rows = SingleRows {
+        code: handoff.code,
+        mask_code: handoff.mask_code,
+        main: folded_main.to_vec(),
+        main_tail,
+        masks: std::mem::take(&mut masks),
+        mask_tails: std::mem::take(&mut mask_tails),
+        claim: handoff.main_claim.clone(),
+        mask_claims: vec![handoff.mask_claim.clone(), handoff.fresh_claim.clone()],
+        target: handoff.target,
+    };
+    rows.check()?;
+    Ok(LimitedFoldStage {
+        handoff,
+        basis,
+        rows,
+    })
 }
 
 /// The checks that the shared-only chain must report before a limited tested
@@ -2979,6 +3152,15 @@ mod tests {
         assert!(run.omega_root.is_some());
         assert_eq!(run.zeta.len(), 0);
         assert!(run.fold_output.is_some());
+        let stage = run.fold_stage.as_ref().expect("fold stage");
+        assert_eq!(stage.handoff.code, stage.rows.code);
+        assert_eq!(stage.handoff.k, 3);
+        assert_eq!(stage.handoff.h, 0);
+        assert_eq!(stage.basis.members.len(), 2);
+        assert_eq!(stage.rows.main.len(), 4);
+        assert_eq!(stage.rows.masks.len(), 2);
+        assert_eq!(stage.rows.main_tail.len(), 1);
+        assert_eq!(stage.rows.mask_tails.len(), 2);
         assert!(session.zeta().is_some());
     }
 
