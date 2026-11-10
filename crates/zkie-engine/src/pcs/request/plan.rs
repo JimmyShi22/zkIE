@@ -596,6 +596,10 @@ mod tests {
         assert!(plan.validate().is_err());
         plan.table.code.ell = 65536;
         assert!(plan.validate().is_err());
+        let mut underflow = base_plan();
+        underflow.table.code.ell = 1;
+        underflow.table.code.r = 0;
+        assert!(underflow.validate().is_err());
     }
 
     #[test]
