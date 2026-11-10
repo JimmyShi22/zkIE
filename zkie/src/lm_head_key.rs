@@ -766,6 +766,7 @@ pub struct LmHeadGuProvider {
     shape: GuShape,
     witness: GuWitness,
     folded: Vec<Fp3>,
+    main_tails: Vec<Vec<Fp3>>,
     root: Digest,
     registry: GuRegistry,
     tree: RuntimeTree,
@@ -792,6 +793,10 @@ impl LmHeadGuProvider {
 
     pub fn open(&self, positions: &[u64]) -> Result<RuntimeTreeOpening> {
         self.tree.open(positions)
+    }
+
+    pub fn main_tails(&self) -> &[Vec<Fp3>] {
+        &self.main_tails
     }
 
     /// The complete ordered sample answers for the verifier's seeds. The
@@ -929,6 +934,7 @@ pub fn fold_lm_head_gu(
         shape: shape.clone(),
         witness,
         folded,
+        main_tails: randomness.code_tails.clone(),
         root,
         registry,
         tree,
@@ -952,6 +958,7 @@ pub struct LmHeadOmegaProvider {
     tree: RuntimeTreePlan,
     committed: RuntimeTree,
     message: Vec<Fp3>,
+    main_tails: Vec<Vec<Fp3>>,
     root: Digest,
 }
 
@@ -978,6 +985,10 @@ impl LmHeadOmegaProvider {
 
     pub fn open(&self, positions: &[u64]) -> Result<RuntimeTreeOpening> {
         self.committed.open(positions)
+    }
+
+    pub fn main_tails(&self) -> &[Vec<Fp3>] {
+        &self.main_tails
     }
 
     /// The complete ordered sample answers for the verifier's seeds. It uses
@@ -1113,6 +1124,7 @@ pub fn commit_lm_head_omega(
         tree: tree.clone(),
         committed,
         message,
+        main_tails: randomness.code_tails.clone(),
         root,
     })
 }
@@ -1129,6 +1141,7 @@ pub struct LimitedSharedColumns {
     pub omega_root: Option<Digest>,
     pub zeta: Vec<Fp3>,
     pub fold_output: Option<FoldOutput>,
+    pub folded_main_message: Vec<Fp3>,
     pub transcript: Digest,
 }
 
@@ -1190,6 +1203,7 @@ pub fn run_limited_shared_to_columns(
     let mut omega_root = None;
     let mut zeta = Vec::new();
     let mut fold_output = None;
+    let mut folded_main_message = Vec::new();
     if let Some(omega) = session.plan().omega.as_ref().cloned() {
         let omega_randomness = omega_randomness.ok_or(Error::InvalidConfig)?;
         let psi_lo: Vec<Fp3> = match session.psi() {
@@ -1334,6 +1348,7 @@ pub fn run_limited_shared_to_columns(
             prover.bind(gamma)?;
         }
         fold_output = Some(session.fold_finish()?);
+        folded_main_message = prover.main_messages().to_vec();
         }
     } else if omega_randomness.is_some() {
         return Err(Error::InvalidConfig);
@@ -1350,6 +1365,7 @@ pub fn run_limited_shared_to_columns(
             omega_root,
             zeta,
             fold_output,
+            folded_main_message,
             transcript,
         },
     ))
@@ -1501,6 +1517,13 @@ impl LmHeadMaskProvider {
     pub fn open(&self, positions: &[u64]) -> Result<RuntimeTreeOpening> {
         self.start.tree.open(positions)
     }
+
+    pub fn tails(&self) -> Result<&[Fp3]> {
+        self.mask
+            .tail()
+            .map(|tail| tail.values.as_slice())
+            .ok_or(Error::InvalidSessionState)
+    }
 }
 
 /// Builds the fresh mask from the existing mask maker: draws the coefficients
@@ -1561,6 +1584,7 @@ pub struct LmHeadOldMaskRandomness {
 pub struct LmHeadOldMaskProvider {
     root: Digest,
     rows: Vec<Vec<Fp3>>,
+    tails: Vec<Vec<Fp3>>,
     tree: MaskTree,
 }
 
@@ -1581,6 +1605,10 @@ impl LmHeadOldMaskProvider {
 
     pub fn open(&self, positions: &[u64]) -> Result<RuntimeTreeOpening> {
         self.tree.open(positions)
+    }
+
+    pub fn tails(&self) -> &[Vec<Fp3>] {
+        &self.tails
     }
 }
 
@@ -1605,6 +1633,7 @@ pub fn commit_lm_head_old_mask(
     Ok(LmHeadOldMaskProvider {
         root: committed.root,
         rows: randomness.rows.clone(),
+        tails: randomness.tails.clone(),
         tree: committed,
     })
 }
