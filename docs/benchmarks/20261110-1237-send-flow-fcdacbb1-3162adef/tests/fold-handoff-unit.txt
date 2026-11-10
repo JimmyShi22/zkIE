@@ -1,0 +1,11 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/zkie_ops-a527cf57462e281a)
+
+running 4 tests
+test proof::fold_handoff::tests::mapping_enters_claim_and_target_and_keeps_identity_separate ... ok
+test proof::fold_handoff::tests::identity_or_kept_mismatch_is_rejected_at_the_handoff ... ok
+test proof::fold_handoff::tests::no_output_obtains_a_valid_handoff ... ok
+test proof::fold_handoff::tests::shape_mismatch_or_truncation_is_rejected ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 61 filtered out; finished in 0.00s
+
