@@ -765,6 +765,70 @@ impl LimitedSharedSession {
     }
 }
 
+/// The public plan values the commit stage persists beside the statement and
+/// reader. They are recomputed by the verify process and must agree.
+#[derive(Clone, Debug)]
+pub struct LimitedPublicPlan {
+    pub base: BaseStarBinding,
+    pub switches: Vec<SwitchTarget>,
+    pub fresh_plan: MaskTreePlan,
+    pub fold: FoldShape,
+    pub gu: GuShape,
+    pub omega: OmegaShapePlan,
+    pub configuration: Digest,
+}
+
+pub fn build_limited_public_plan(
+    request_plan: &RequestPlan,
+    compiled: &CompiledPlan,
+    statement: &LimitedKeyStatement,
+    reader: &IndexReader,
+    plan_identifier: Digest,
+    case_id: &[u8],
+    random_bytes: Digest,
+) -> Result<LimitedPublicPlan> {
+    let parts = build_limited_plan_parts(
+        request_plan,
+        compiled,
+        statement,
+        reader,
+        plan_identifier,
+        case_id,
+        random_bytes,
+    )?;
+    Ok(LimitedPublicPlan {
+        base: parts.base.clone(),
+        switches: parts.switches.clone(),
+        fresh_plan: parts.mask_tree,
+        fold: parts.fold,
+        gu: parts.gu.clone(),
+        omega: parts.omega,
+        configuration: parts.configuration,
+    })
+}
+
+pub fn build_limited_verify_setup(
+    request_plan: &RequestPlan,
+    compiled: &CompiledPlan,
+    statement: &LimitedKeyStatement,
+    reader: &IndexReader,
+    plan_identifier: Digest,
+    case_id: &[u8],
+    random_bytes: Digest,
+    fresh_root: Digest,
+) -> Result<LimitedVerifySetup> {
+    let parts = build_limited_plan_parts(
+        request_plan,
+        compiled,
+        statement,
+        reader,
+        plan_identifier,
+        case_id,
+        random_bytes,
+    )?;
+    finish_limited_setup(parts, case_id, fresh_root)
+}
+
 pub fn build_limited_shared_session(
     request_plan: &RequestPlan,
     compiled: &CompiledPlan,
@@ -2547,7 +2611,7 @@ pub fn run_limited_shared_to_columns(
 /// The public part of one switch input: the target, the tree plan and the
 /// optional following stage FOLD shape. Private tails, salts and pads are not
 /// copied into the verifier plan.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LimitedStageFoldPlan {
     pub shape: FoldShape,
     pub layout: FoldGroupLayout,
@@ -2557,7 +2621,7 @@ pub struct LimitedStageFoldPlan {
     pub fresh: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LimitedSwitchPlan {
     pub target: SwitchTarget,
     pub plan: RuntimeTreePlan,

@@ -270,6 +270,27 @@ pub fn write_public(dir: &Path, handoff: &LmHeadPublicHandoff) -> Result<PathBuf
     Ok(path)
 }
 
+/// Writes one public stage file. The directory is created if absent; the file
+/// is created fresh and never overwrites.
+pub fn write_public_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).map_err(|_| Error::Io)?;
+    let path = dir.join(name);
+    write_bytes(&path, bytes, false)?;
+    Ok(path)
+}
+
+pub fn read_public_file(path: &Path) -> Result<Vec<u8>> {
+    read_bytes(path)
+}
+
+/// Writes one private stage file under an owner-only directory.
+pub fn write_private_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
+    ensure_private_dir(dir)?;
+    let path = dir.join(name);
+    write_bytes(&path, bytes, true)?;
+    Ok(path)
+}
+
 pub fn read_public(path: &Path) -> Result<LmHeadPublicHandoff> {
     LmHeadPublicHandoff::decode(&read_bytes(path)?)
 }
