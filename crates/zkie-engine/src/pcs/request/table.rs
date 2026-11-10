@@ -610,6 +610,201 @@ pub fn commit_table(
     })
 }
 
+/// A bounded source of a table's row messages and random tails. The models
+/// layer maps the read-only asset into these rows and the committer reads one
+/// row at a time; no caller hands over the whole table.
+pub trait TableRowSource {
+    fn rows(&self) -> u64;
+    fn row(&mut self, row: u64, message: &mut [Fp], tail: &mut [Fp]) -> Result<()>;
+}
+
+/// A table committed by bounded column panels. It keeps the column leaves and
+/// the Merkle tree, not the codewords; an opening recomputes the drawn columns
+/// from the row source and checks them against this tree.
+pub struct StreamingTable {
+    pub reader: IndexReader,
+    pub name: Vec<u8>,
+    tree: MerkleTree,
+    salts: Vec<Vec<u8>>,
+    leaves: Vec<Digest>,
+    peak_bytes: u64,
+}
+
+impl StreamingTable {
+    pub fn peak_bytes(&self) -> u64 {
+        self.peak_bytes
+    }
+
+    /// The stored column leaves, in position order.
+    pub fn leaves(&self) -> &[Digest] {
+        &self.leaves
+    }
+
+    /// Recomputes the drawn columns from the row source and opens them against
+    /// the stored tree. One row's message, one tail and one codeword are held
+    /// at a time; no column is stored.
+    pub fn open_columns<S: TableRowSource>(
+        &self,
+        source: &mut S,
+        positions: &[u64],
+    ) -> Result<Vec<ColumnOpening>> {
+        if self.reader.fault().is_some() {
+            return Err(Error::InvalidConfig);
+        }
+        let shape = self.reader.shape;
+        if source.rows() != shape.rows() {
+            return Err(Error::ShapeMismatch);
+        }
+        let n = shape.code.n();
+        let rows = shape.rows() as usize;
+        let ell = usize::try_from(shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+        let tail_len = usize::try_from(shape.code.r).map_err(|_| Error::ResourceLimit)?;
+        let mut message = vec![Fp::ZERO; ell];
+        let mut tail = vec![Fp::ZERO; tail_len];
+        let mut openings = Vec::with_capacity(positions.len());
+        let mut previous = None;
+        for position in positions {
+            if *position >= n {
+                return Err(Error::InvalidIndex);
+            }
+            if let Some(previous) = previous {
+                if *position <= previous {
+                    return Err(Error::InvalidIndex);
+                }
+            }
+            previous = Some(*position);
+            let mut symbols = Vec::with_capacity(rows);
+            for row in 0..rows {
+                source.row(row as u64, &mut message, &mut tail)?;
+                let codeword = encode_row_fp(&shape.code, &message, &tail)?;
+                symbols.push(codeword[*position as usize]);
+            }
+            openings.push(ColumnOpening {
+                position: *position,
+                salt: self.salts[*position as usize].clone(),
+                symbols,
+                path: self.tree.open(*position as usize)?,
+            });
+        }
+        Ok(openings)
+    }
+}
+
+/// Commits a table in bounded column panels. The source is read once for the
+/// leaves and once for the record; the peak buffers are one panel of symbols,
+/// one codeword, one message, one tail and the column leaves, bounded by
+/// `max_bytes`. The root, name, record and openings are the same as the
+/// in-memory test committer's.
+pub fn commit_table_streaming<S: TableRowSource>(
+    source: &mut S,
+    shape: IndexShape,
+    configuration: Digest,
+    salts: &[Vec<u8>],
+    panel_columns: u64,
+    max_bytes: u64,
+) -> Result<StreamingTable> {
+    validate_index_shape(&shape)?;
+    if configuration == Digest::ZERO || panel_columns == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    if source.rows() != shape.rows() {
+        return Err(Error::ShapeMismatch);
+    }
+    let rows = shape.rows() as usize;
+    let n = shape.code.n() as usize;
+    if salts.len() != n || salts.iter().any(|salt| salt.len() != shape.salt_bytes) {
+        return Err(Error::ShapeMismatch);
+    }
+    let ell = usize::try_from(shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let tail_len = usize::try_from(shape.code.r).map_err(|_| Error::ResourceLimit)?;
+    let panel = usize::try_from(panel_columns.min(n as u64)).map_err(|_| Error::ResourceLimit)?;
+    let panel_bytes = rows
+        .checked_mul(panel)
+        .and_then(|value| value.checked_mul(8))
+        .ok_or(Error::ResourceLimit)?;
+    let codeword_bytes = n.checked_mul(8).ok_or(Error::ResourceLimit)?;
+    let message_bytes = ell
+        .checked_add(tail_len)
+        .and_then(|value| value.checked_mul(8))
+        .ok_or(Error::ResourceLimit)?;
+    let leaf_bytes = n.checked_mul(32).ok_or(Error::ResourceLimit)?;
+    let tree_bytes = n
+        .checked_mul(32)
+        .and_then(|value| value.checked_mul(2))
+        .ok_or(Error::ResourceLimit)?;
+    let needed = panel_bytes
+        .checked_add(codeword_bytes)
+        .and_then(|value| value.checked_add(message_bytes))
+        .and_then(|value| value.checked_add(leaf_bytes))
+        .and_then(|value| value.checked_add(tree_bytes))
+        .ok_or(Error::ResourceLimit)?;
+    if (needed as u64) > max_bytes {
+        return Err(Error::ResourceLimit);
+    }
+    let mut message = vec![Fp::ZERO; ell];
+    let mut tail = vec![Fp::ZERO; tail_len];
+    let mut symbols = vec![Fp::ZERO; rows * panel];
+    let mut leaves = Vec::with_capacity(n);
+    let mut start = 0usize;
+    while start < n {
+        let count = panel.min(n - start);
+        for row in 0..rows {
+            source.row(row as u64, &mut message, &mut tail)?;
+            let codeword = encode_row_fp(&shape.code, &message, &tail)?;
+            for column in 0..count {
+                symbols[column * rows + row] = codeword[start + column];
+            }
+        }
+        for column in 0..count {
+            let position = start + column;
+            leaves.push(column_leaf(
+                &configuration,
+                shape.code.log_n,
+                position as u64,
+                &salts[position],
+                &symbols[column * rows..(column + 1) * rows],
+            )?);
+        }
+        start += count;
+    }
+    let tree = merkle_build(&configuration, &leaves)?;
+    let root = tree.root;
+    let name = index_name(&root, &shape, &configuration);
+    let answers = usize::try_from(shape.answers).map_err(|_| Error::ResourceLimit)?;
+    let seeds = record_seeds(&shape, &name, answers)?;
+    let mut record = IndexRecord {
+        y: Vec::with_capacity(rows.saturating_mul(answers)),
+    };
+    for row in 0..rows {
+        source.row(row as u64, &mut message, &mut tail)?;
+        for answer in 0..answers {
+            record.y.push(record_value(
+                &shape,
+                &seeds[answer],
+                answer as u32,
+                &message,
+            )?);
+        }
+    }
+    let reader = IndexReader {
+        shape,
+        configuration,
+        root,
+        record,
+    };
+    if reader.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(StreamingTable {
+        reader,
+        name,
+        tree,
+        salts: salts.to_vec(),
+        leaves,
+        peak_bytes: needed as u64,
+    })
+}
+
 /// Check column openings against a reader and return the columns as
 /// `columns[i * rows + r]`.
 pub fn verify_columns(
@@ -1301,5 +1496,163 @@ mod tests {
         let mut other = table.reader.clone();
         other.root = Digest([1; 32]);
         assert!(verify_columns(&other, &positions, &openings).is_err());
+    }
+}
+
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use crate::pcs::request::code::build_code_plan;
+    use zkie_core::common::field::PrimeCharacteristicRing;
+
+    struct VecSource {
+        messages: Vec<Vec<Fp>>,
+        tails: Vec<Vec<Fp>>,
+    }
+
+    impl TableRowSource for VecSource {
+        fn rows(&self) -> u64 {
+            self.messages.len() as u64
+        }
+
+        fn row(&mut self, row: u64, message: &mut [Fp], tail: &mut [Fp]) -> Result<()> {
+            let message_row = self
+                .messages
+                .get(row as usize)
+                .ok_or(Error::InvalidIndex)?;
+            let tail_row = self
+                .tails
+                .get(row as usize)
+                .ok_or(Error::InvalidIndex)?;
+            if message.len() != message_row.len() || tail.len() != tail_row.len() {
+                return Err(Error::ShapeMismatch);
+            }
+            message.copy_from_slice(message_row);
+            tail.copy_from_slice(tail_row);
+            Ok(())
+        }
+    }
+
+    fn shape() -> IndexShape {
+        IndexShape {
+            code: build_code_plan(3, 4, 1).expect("code"),
+            v: 2,
+            answers: 1,
+            salt_bytes: LEAF_SALT_MIN_BYTES,
+            distances: TableDistances {
+                radius: 0,
+                later_radius: 0,
+                m_once: 0,
+                m_later: 0,
+            },
+        }
+    }
+
+    fn fixture() -> (IndexShape, Digest, Vec<Vec<Fp>>, Vec<Vec<Fp>>, Vec<Vec<u8>>) {
+        let shape = shape();
+        let messages: Vec<Vec<Fp>> = (0..shape.rows() as usize)
+            .map(|row| {
+                (0..shape.code.ell as usize)
+                    .map(|index| Fp::from_u64((row * 10 + index + 1) as u64))
+                    .collect()
+            })
+            .collect();
+        let tails: Vec<Vec<Fp>> = (0..shape.rows() as usize)
+            .map(|row| {
+                (0..shape.code.r as usize)
+                    .map(|index| Fp::from_u64((row + index + 1) as u64))
+                    .collect()
+            })
+            .collect();
+        let salts: Vec<Vec<u8>> = (0..shape.code.n() as usize)
+            .map(|position| vec![(position as u8).wrapping_add(1); shape.salt_bytes])
+            .collect();
+        (shape, Digest([7; 32]), messages, tails, salts)
+    }
+
+    #[test]
+    fn streaming_matches_the_in_memory_committer() {
+        let (shape, configuration, messages, tails, salts) = fixture();
+        let table = commit_table(
+            shape,
+            configuration,
+            &messages,
+            &tails,
+            &salts,
+        )
+        .expect("in-memory");
+        for panel in [1u64, 2, 8] {
+            let mut source = VecSource {
+                messages: messages.clone(),
+                tails: tails.clone(),
+            };
+            let streamed = commit_table_streaming(
+                &mut source,
+                shape,
+                configuration,
+                &salts,
+                panel,
+                u64::MAX,
+            )
+            .expect("streaming");
+            assert_eq!(streamed.reader.root, table.reader.root);
+            assert_eq!(streamed.name, table.name);
+            assert_eq!(streamed.reader.record.y, table.reader.record.y);
+            assert_eq!(streamed.reader.shape, table.reader.shape);
+            assert_eq!(streamed.reader.configuration, table.reader.configuration);
+            assert!(streamed.peak_bytes() > 0);
+            let positions = [1u64, 4, 6];
+            let expected = table.open_columns(&positions).expect("open");
+            let opened = streamed
+                .open_columns(&mut source, &positions)
+                .expect("stream open");
+            assert_eq!(opened, expected);
+        }
+    }
+
+    #[test]
+    fn a_tampered_source_changes_the_root() {
+        let (shape, configuration, messages, tails, salts) = fixture();
+        let mut source = VecSource {
+            messages: messages.clone(),
+            tails: tails.clone(),
+        };
+        let honest =
+            commit_table_streaming(&mut source, shape, configuration, &salts, 2, u64::MAX)
+                .expect("honest");
+        let mut tampered_messages = messages;
+        tampered_messages[1][0] = tampered_messages[1][0] + Fp::from_u64(1);
+        let mut tampered = VecSource {
+            messages: tampered_messages,
+            tails,
+        };
+        let changed =
+            commit_table_streaming(&mut tampered, shape, configuration, &salts, 2, u64::MAX)
+                .expect("tampered");
+        assert_ne!(changed.reader.root, honest.reader.root);
+    }
+
+    #[test]
+    fn a_source_with_the_wrong_row_count_is_rejected() {
+        let (shape, configuration, messages, tails, salts) = fixture();
+        let mut source = VecSource {
+            messages: messages[..2].to_vec(),
+            tails: tails[..2].to_vec(),
+        };
+        assert!(matches!(
+            commit_table_streaming(&mut source, shape, configuration, &salts, 2, u64::MAX),
+            Err(Error::ShapeMismatch)
+        ));
+    }
+
+    #[test]
+    fn a_memory_cap_below_the_buffers_is_rejected() {
+        let (shape, configuration, messages, tails, salts) = fixture();
+        let mut source = VecSource { messages, tails };
+        assert!(matches!(
+            commit_table_streaming(&mut source, shape, configuration, &salts, 2, 1),
+            Err(Error::ResourceLimit)
+        ));
     }
 }
