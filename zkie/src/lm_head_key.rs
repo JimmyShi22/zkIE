@@ -368,6 +368,120 @@ pub fn limited_key_plan(
     Ok(key_plan)
 }
 
+
+/// The checks that the shared-only chain must report before a limited tested
+/// state may exist. Each flag is set by a real check of the chain; a false flag
+/// keeps the state from being created.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SharedChainChecks {
+    pub columns_verified: bool,
+    pub record_rows_verified: bool,
+    pub omega_verified: bool,
+    pub iopp_all_stages_verified: bool,
+    pub artifact_ended: bool,
+    pub record_matches_root_and_configuration: bool,
+    pub premises_hold: bool,
+}
+
+impl SharedChainChecks {
+    pub fn all(&self) -> bool {
+        self.columns_verified
+            && self.record_rows_verified
+            && self.omega_verified
+            && self.iopp_all_stages_verified
+            && self.artifact_ended
+            && self.record_matches_root_and_configuration
+            && self.premises_hold
+    }
+}
+
+/// A limited tested state: the table's proximity and record passed the
+/// shared-only checks under the stated premises. It is not the reference WF
+/// tested state and carries no range claim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LimitedTableTested {
+    statement_digest: Digest,
+    root: Digest,
+    record_digest: Digest,
+    configuration: Digest,
+    shape: IndexShape,
+    plan_version: u64,
+}
+
+impl LimitedTableTested {
+    pub fn statement_digest(&self) -> Digest {
+        self.statement_digest
+    }
+
+    pub fn root(&self) -> Digest {
+        self.root
+    }
+
+    pub fn record_digest(&self) -> Digest {
+        self.record_digest
+    }
+
+    pub fn configuration(&self) -> Digest {
+        self.configuration
+    }
+
+    pub fn shape(&self) -> &IndexShape {
+        &self.shape
+    }
+
+    pub fn plan_version(&self) -> u64 {
+        self.plan_version
+    }
+}
+
+/// Creates the limited tested state only when every required check passed and
+/// the reader's root, record, configuration, shape and name match the
+/// statement and the table's own derivation.
+pub fn establish_limited_tested(
+    statement: &LimitedKeyStatement,
+    plan: &LimitedKeyPlan,
+    reader: &IndexReader,
+    name: &[u8],
+    checks: &SharedChainChecks,
+) -> Result<LimitedTableTested> {
+    statement.validate()?;
+    plan.validate()?;
+    if reader.fault().is_some()
+        || reader.shape != statement.table_shape
+        || reader.root != statement.table_root
+        || reader.configuration != statement.table_configuration
+        || !checks.all()
+    {
+        return Err(Error::InvalidConfig);
+    }
+    let answers = reader.shape.answers as usize;
+    let rows = usize::try_from(reader.shape.rows_checked()?).map_err(|_| Error::ResourceLimit)?;
+    let record_rows = rows.checked_mul(answers).ok_or(Error::ResourceLimit)?;
+    if reader.record.y.len() != record_rows {
+        return Err(Error::ShapeMismatch);
+    }
+    let seeds = zkie_engine::pcs::request::table::record_seeds(&reader.shape, name, answers)?;
+    if seeds.len() != answers {
+        return Err(Error::InvalidConfig);
+    }
+    let expected_name = zkie_engine::pcs::request::table::index_name(
+        &reader.root,
+        &reader.shape,
+        &reader.configuration,
+    );
+    if expected_name != name {
+        return Err(Error::StatementMismatch);
+    }
+    Ok(LimitedTableTested {
+        statement_digest: statement.digest(),
+        root: reader.root,
+        record_digest: zkie_core::artifact::digest_bytes(&reader.record.encode()),
+        configuration: reader.configuration,
+        shape: reader.shape,
+        plan_version: plan.version,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,6 +651,90 @@ mod tests {
         let mut other = statement.clone();
         other.no_wf = false;
         assert!(other.validate().is_err());
+    }
+
+    fn test_reader(statement: &LimitedKeyStatement) -> (IndexReader, Vec<u8>) {
+        use zkie_engine::pcs::request::field::Fp3;
+        use zkie_engine::pcs::request::table::{index_name, IndexRecord, IndexReader};
+        let name = index_name(
+            &statement.table_root,
+            &statement.table_shape,
+            &statement.table_configuration,
+        );
+        let rows = statement.table_shape.rows() as usize;
+        let reader = IndexReader {
+            shape: statement.table_shape,
+            configuration: statement.table_configuration,
+            root: statement.table_root,
+            record: IndexRecord {
+                y: vec![Fp3::ZERO; rows],
+            },
+        };
+        (reader, name)
+    }
+
+    fn test_statement() -> LimitedKeyStatement {
+        let plan = zkie_models_gpt2::lm_head_plan::lm_head_plan().expect("plan");
+        let shape = plan.table_shape().expect("shape");
+        LimitedKeyStatement {
+            version: LIMITED_KEY_VERSION,
+            model_commitment: Digest([0x11; 32]),
+            table_root: Digest([0x22; 32]),
+            table_configuration: Digest([0x33; 32]),
+            table_shape: shape,
+            matrix_rows: 1 << plan.table.v,
+            k_lo: plan.lin.k_lo,
+            k_col: plan.lin.k_col,
+            valid_min: i32::MIN as i64,
+            valid_max: i32::MAX as i64,
+            no_wf: true,
+            trusted_i32_mapping: true,
+        }
+    }
+
+    #[test]
+    fn the_limited_tested_state_needs_every_check() {
+        use zkie_engine::pcs::request::field::Fp3;
+        let plan = zkie_models_gpt2::lm_head_plan::lm_head_plan().expect("plan");
+        let compiled = zkie_models_gpt2::lm_head_plan::lm_head_compiled().expect("compiled");
+        let key_plan = limited_key_plan(&plan, &compiled).expect("key plan");
+        let statement = test_statement();
+        let (reader, name) = test_reader(&statement);
+        let checks = SharedChainChecks {
+            columns_verified: true,
+            record_rows_verified: true,
+            omega_verified: true,
+            iopp_all_stages_verified: true,
+            artifact_ended: true,
+            record_matches_root_and_configuration: true,
+            premises_hold: true,
+        };
+        let tested = establish_limited_tested(&statement, &key_plan, &reader, &name, &checks)
+            .expect("tested");
+        assert_eq!(tested.root(), statement.table_root);
+        assert_eq!(tested.statement_digest(), statement.digest());
+        let mut missing = checks;
+        missing.iopp_all_stages_verified = false;
+        assert!(establish_limited_tested(&statement, &key_plan, &reader, &name, &missing).is_err());
+        let mut missing = checks;
+        missing.artifact_ended = false;
+        assert!(establish_limited_tested(&statement, &key_plan, &reader, &name, &missing).is_err());
+        let mut missing = checks;
+        missing.premises_hold = false;
+        assert!(establish_limited_tested(&statement, &key_plan, &reader, &name, &missing).is_err());
+        let mut replaced = statement.clone();
+        replaced.table_root = Digest([0x44; 32]);
+        assert!(establish_limited_tested(&replaced, &key_plan, &reader, &name, &checks).is_err());
+        let mut wrong_record = reader.clone();
+        wrong_record.record.y.pop();
+        assert!(establish_limited_tested(
+            &statement,
+            &key_plan,
+            &wrong_record,
+            &name,
+            &checks
+        )
+        .is_err());
     }
 
     #[test]
