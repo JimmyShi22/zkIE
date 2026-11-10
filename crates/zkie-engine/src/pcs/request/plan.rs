@@ -286,8 +286,10 @@ impl RequestPlan {
             }
             let main = self.codes.get(group.main);
             let mask = self.codes.get(group.mask);
-            if (mask.dim() as u128) * (main.n() as u128)
-                > (main.dim() as u128) * (mask.n() as u128)
+            if group.k > 0
+                && group.h == 0
+                && (mask.dim() as u128) * (main.n() as u128)
+                    > (main.dim() as u128) * (mask.n() as u128)
             {
                 return Err(Error::InvalidConfig);
             }
