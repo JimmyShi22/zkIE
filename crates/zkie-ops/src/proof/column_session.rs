@@ -641,7 +641,7 @@ fn demo_mask_tree() -> Result<MaskTreePlan> {
     Ok(tree)
 }
 
-fn bind_table(
+pub(crate) fn bind_table(
     table: &AssetEncodingTable,
     input: &ColumnBindingInput,
 ) -> Result<FoldeqBinding> {
@@ -656,17 +656,17 @@ fn bind_table(
     FoldeqBinding::new(&input.parameters, statement, &table.reader)
 }
 
-struct DemoSetup {
-    plan: FoldeqPlan,
-    binder: FoldeqBinder,
-    chain: Chain,
-    first_query: Vec<u8>,
-    fold_shape: FoldShape,
-    fold_row: FoldInputRow,
-    fold_start: FoldStartMessage,
+pub(crate) struct DemoSetup {
+    pub(crate) plan: FoldeqPlan,
+    pub(crate) binder: FoldeqBinder,
+    pub(crate) chain: Chain,
+    pub(crate) first_query: Vec<u8>,
+    pub(crate) fold_shape: FoldShape,
+    pub(crate) fold_row: FoldInputRow,
+    pub(crate) fold_start: FoldStartMessage,
 }
 
-fn build_demo_setup(
+pub(crate) fn build_demo_setup(
     table: &AssetEncodingTable,
     binding: FoldeqBinding,
     edge: FoldeqEdgeBinding,
@@ -858,6 +858,53 @@ fn run_session(
         fold_output,
         fold_anchor,
         next_stage_closed,
+    })
+}
+
+/// The session state after the G_u, record, column-query and column-read
+/// registration, before any FOLD round. It is an isolated inspection input for
+/// the candidate G_u declaration combination.
+pub(crate) struct GuFlow {
+    pub(crate) session: FoldeqSession,
+    pub(crate) gu_root: Digest,
+    pub(crate) queries: Vec<u64>,
+    pub(crate) table_identity: Digest,
+    pub(crate) transcript_after_columns: Digest,
+}
+
+/// Runs the fixed pre-FOLD G_u/record/column flow and returns the session at
+/// the read stage. The G_u root, SEND answers and the sample row are the same
+/// demonstration values used by the column session; they are not real SEND
+/// values. Column openings are authenticated only against the table column
+/// root.
+pub(crate) fn open_gu_flow(
+    table: &AssetEncodingTable,
+    binding: FoldeqBinding,
+    edge: FoldeqEdgeBinding,
+) -> Result<GuFlow> {
+    let setup = build_demo_setup(table, binding, edge)?;
+    let mut session = FoldeqSession::open(setup.plan, setup.binder, setup.chain)?;
+    session.bind_first_query(&setup.first_query)?;
+    session.draw_gamma()?;
+    session.send_gu(&GU_NOTICE_ROOT)?;
+    session.shared_seeds()?;
+    for answer in 0..GU_ANSWERS {
+        session.receive_gu_answer(Fp3::from_u64(0x31 + answer as u64))?;
+    }
+    session.join_gu_record()?;
+    session.draw_queries()?;
+    let queries = session.queries().to_vec();
+    let openings = open_columns_for_queries(table, &queries)?;
+    session.read_queries(&openings)?;
+    session.join_gu_read_columns()?;
+    let transcript_after_columns = *session.transcript_value();
+    let table_identity = reader_table_identity(&table.reader)?;
+    Ok(GuFlow {
+        session,
+        gu_root: GU_NOTICE_ROOT,
+        queries,
+        table_identity,
+        transcript_after_columns,
     })
 }
 

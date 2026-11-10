@@ -924,6 +924,13 @@ impl FoldeqSession {
 
     /// The current chain value. This is session state for inspection, not a
     /// proof field and not a public transcript artifact.
+    /// The session chain at the current stage. This is an isolated inspection
+    /// accessor for the candidate G_u declaration combination; it does not
+    /// expose a production acceptance path.
+    pub fn chain(&self) -> &crate::pcs::request::chain::Chain {
+        &self.chain
+    }
+
     pub fn transcript_value(&self) -> &Digest {
         self.chain.value()
     }
