@@ -12,6 +12,7 @@ pub mod lin;
 pub mod link;
 pub mod model_tied;
 pub mod params;
+pub mod plan;
 pub mod proximity;
 pub mod persistent_count;
 pub mod send;
