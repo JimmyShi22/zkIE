@@ -1252,11 +1252,67 @@ pub struct LimitedSharedColumns {
 /// answers the seeds, and opens the verifier's drawn table columns. The FOLD
 /// group still needs its second member (Omega), so no FOLD round is entered
 /// here.
+/// One committed table as the ops layer sees it: the caller starts a proof
+/// with a column reservation, folds and opens through the holder, and never
+/// receives the complete weight matrix. The production implementation wraps
+/// the bounded holder; the small fixture uses an in-memory row source behind
+/// the same interface.
+pub trait SharedTableSource {
+    fn reader(&self) -> &IndexReader;
+    fn shape(&self) -> IndexShape;
+    fn begin(&mut self, columns: usize) -> Result<()>;
+    fn fold(&mut self, gamma: &[Fp3], shape: &GuShape) -> Result<LmHeadGuProvider>;
+    fn open(&mut self, positions: &[u64]) -> Result<Vec<ColumnOpening>>;
+    fn forget(&mut self) -> Result<()>;
+}
+
+/// The holder-backed source: folding and opening use the holder's bounded
+/// passes and its column reservation; the G_u assembly uses the same private
+/// randomness the key path uses.
+pub struct HolderSharedSource<S: TableRowSource> {
+    holder: StreamingHolder<S>,
+    randomness: LmHeadGuRandomness,
+}
+
+impl<S: TableRowSource> HolderSharedSource<S> {
+    pub fn new(holder: StreamingHolder<S>, randomness: LmHeadGuRandomness) -> Self {
+        Self { holder, randomness }
+    }
+
+    pub fn holder(&self) -> &StreamingHolder<S> {
+        &self.holder
+    }
+}
+
+impl<S: TableRowSource> SharedTableSource for HolderSharedSource<S> {
+    fn reader(&self) -> &IndexReader {
+        self.holder.reader()
+    }
+
+    fn shape(&self) -> IndexShape {
+        self.holder.reader().shape
+    }
+
+    fn begin(&mut self, columns: usize) -> Result<()> {
+        self.holder.begin(columns)
+    }
+
+    fn fold(&mut self, gamma: &[Fp3], shape: &GuShape) -> Result<LmHeadGuProvider> {
+        fold_lm_head_gu_holder(&mut self.holder, shape, gamma, &self.randomness)
+    }
+
+    fn open(&mut self, positions: &[u64]) -> Result<Vec<ColumnOpening>> {
+        self.holder.open(positions)
+    }
+
+    fn forget(&mut self) -> Result<()> {
+        self.holder.forget()
+    }
+}
+
 pub fn run_limited_shared_to_columns(
     setup: LimitedSharedSession,
-    key: &LmHeadKey,
-    table_tails: &[Vec<Fp>],
-    randomness: &LmHeadGuRandomness,
+    table: &mut dyn SharedTableSource,
     omega_randomness: Option<&LmHeadOmegaRandomness>,
     old_mask: Option<&LmHeadOldMaskProvider>,
     switch: Option<LimitedSwitchInputs>,
@@ -1276,7 +1332,8 @@ pub fn run_limited_shared_to_columns(
         .as_ref()
         .ok_or(Error::InvalidConfig)?
         .clone();
-    let provider = fold_lm_head_gu(key, table_tails, &gu_shape, &gamma, randomness)?;
+    table.begin(LM_HEAD_COLUMN_DRAWS as usize)?;
+    let provider = table.fold(&gamma, &gu_shape)?;
     session.send_gu(&provider.root())?;
     session.shared_seeds()?;
     let seeds = session.gu_shared_seeds().to_vec();
@@ -1288,11 +1345,7 @@ pub fn run_limited_shared_to_columns(
     session.draw_queries()?;
     let queries = session.queries().to_vec();
     let positions = unique_sorted(&queries);
-    let unique = open_shared_columns(
-        &key.table,
-        &positions,
-        LM_HEAD_COLUMN_DRAWS as u64,
-    )?;
+    let unique = table.open(&positions)?;
     let mut openings = Vec::with_capacity(queries.len());
     for query in &queries {
         openings.push(
@@ -1304,6 +1357,7 @@ pub fn run_limited_shared_to_columns(
         );
     }
     session.read_queries(&openings)?;
+    table.forget()?;
     session.join_gu_read_columns()?;
     let mut omega_root = None;
     let mut zeta = Vec::new();
@@ -4161,11 +4215,33 @@ mod tests {
             base,
             switches: vec![target, target2, final_target],
         };
+        let source_salts: Vec<Vec<u8>> = (0..16)
+            .map(|position| vec![(position as u8) ^ 0x5a; 40])
+            .collect();
+        let mut source = VecSource {
+            messages: key.messages.clone(),
+            tails: tails.clone(),
+        };
+        let streamed = zkie_engine::pcs::request::table::commit_table_streaming(
+            &mut source,
+            key.shape,
+            key.reader.configuration,
+            &source_salts,
+            16,
+            u64::MAX,
+        )?;
+        if streamed.reader.root != key.reader.root {
+            return Err(Error::StatementMismatch);
+        }
+        let holder = StreamingHolder::new(
+            streamed,
+            source,
+            LM_HEAD_COLUMN_DRAWS as u64,
+        )?;
+        let mut table = HolderSharedSource::new(holder, randomness);
         run_limited_shared_to_columns(
             setup,
-            &key,
-            &tails,
-            &randomness,
+            &mut table,
             Some(&omega_randomness),
             Some(&old_mask),
             Some(LimitedSwitchInputs {
