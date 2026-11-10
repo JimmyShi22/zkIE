@@ -1,0 +1,12 @@
+   Compiling zkie-ops v0.1.0 (/data/zkIE/crates/zkie-ops)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.42s
+     Running unittests src/lib.rs (target/debug/deps/zkie_ops-a527cf57462e281a)
+
+running 4 tests
+test proof::gu_combine_session::tests::a_wrong_declaration_is_still_pending_not_judged ... ok
+test proof::gu_combine_session::tests::combination_uses_powers_of_x_and_keeps_kinds_separate ... ok
+test proof::gu_combine_session::tests::mismatched_group_or_shape_is_rejected ... ok
+test proof::gu_combine_session::tests::challenge_changes_with_the_declarations ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 58 filtered out; finished in 0.00s
+

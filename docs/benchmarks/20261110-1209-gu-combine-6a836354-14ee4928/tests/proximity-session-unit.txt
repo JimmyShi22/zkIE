@@ -1,0 +1,19 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/zkie_ops-a527cf57462e281a)
+
+running 12 tests
+test proof::proximity_session::tests::a_missing_message_never_completes_the_component ... ok
+test proof::proximity_session::tests::plan_or_statement_shape_mismatch_fails_closed ... ok
+test proof::proximity_session::tests::decision_inputs_are_bound_in_the_prefix ... ok
+test proof::proximity_session::tests::challenge_order_is_fixed ... ok
+test proof::proximity_session::tests::wrong_commitment_is_rejected_at_the_commitment_check ... ok
+test proof::proximity_session::tests::public_booleans_alone_do_not_form_the_component ... ok
+test proof::proximity_session::tests::opening_tampering_is_rejected_before_any_relation_check ... ok
+test proof::proximity_session::tests::cs_output_replacement_with_a_valid_commitment_is_rejected ... ok
+test proof::proximity_session::tests::component_chain_is_deterministic_and_verified ... ok
+test proof::proximity_session::tests::a_consistent_replaced_switched_message_is_caught_by_base_symbols ... ok
+test proof::proximity_session::tests::valid_commitment_with_a_wrong_statement_is_rejected_at_the_relation_check ... ok
+test proof::proximity_session::tests::valid_commitment_with_a_wrong_prover_message_is_rejected ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 50 filtered out; finished in 0.00s
+
