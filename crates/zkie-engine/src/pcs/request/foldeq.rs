@@ -896,6 +896,59 @@ impl FoldeqSession {
         })
     }
 
+    /// Opens the isolated FOLD-only fixture session on a chain already advanced
+    /// by a fixture prior stage. This entry bypasses the first-query binder and
+    /// the G_u/record/column prefix: it exists for one isolated component
+    /// handoff, cannot accept a proof, and is not a production entry. The
+    /// ordinary `open` remains the only full-session constructor. The caller
+    /// must pass the chain returned by the prior stage; this constructor cannot
+    /// verify that origin. The plan's reader and binding are a valid but inert
+    /// scaffold here: the FOLD start/rounds read only the fold shape, group,
+    /// statement, runtime registry and layout. A plan with a G_u shape is
+    /// rejected because its start path needs joined membership and verified
+    /// read state that this entry does not produce.
+    pub fn open_fold_fixture(plan: FoldeqPlan, chain: Chain) -> Result<Self> {
+        if plan.fault().is_some() {
+            return Err(Error::InvalidConfig);
+        }
+        if plan.gu.is_some() {
+            return Err(Error::UnsupportedPrimitive);
+        }
+        let layout = plan.fold_layout.as_ref().ok_or(Error::InvalidConfig)?;
+        if layout.fault(&plan.fold).is_some() || layout.group != plan.group_id {
+            return Err(Error::InvalidConfig);
+        }
+        if chain.rounds() == 0 {
+            return Err(Error::InvalidSessionState);
+        }
+        let reads = VerifierReads::new(Arc::clone(&plan.ledger));
+        Ok(Self {
+            plan,
+            chain,
+            reads,
+            stage: Stage::Read,
+            gamma: None,
+            gu_root: None,
+            start: None,
+            epsilon: None,
+            queries: Vec::new(),
+            mask_queries: Vec::new(),
+            gu_registry: GuRegistry::new(),
+            gu_seeds: Vec::new(),
+            gu_answers: Vec::new(),
+            gu_answered: 0,
+            gu_membership: None,
+            gu_read_columns: None,
+            gu_columns_source: None,
+            gu_rows: Vec::new(),
+            fold_row: None,
+            fold_claim: None,
+            fold_gamma: Vec::new(),
+            fold_rounds: 0,
+            fold_result: None,
+        })
+    }
+
     pub fn plan(&self) -> &FoldeqPlan {
         &self.plan
     }

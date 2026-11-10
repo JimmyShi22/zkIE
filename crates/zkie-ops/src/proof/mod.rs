@@ -1,4 +1,5 @@
 //! Relation proof interfaces and shared model commitment.
+pub mod bat_fold_session;
 pub mod binding;
 pub mod column_session;
 pub mod edge_session;
