@@ -1,0 +1,4 @@
+spec asset_id=192 count=67108864 width=65536
+opening rows=1024 row_count=1024 min_row=Some(0) max_row=Some(1023) widths={65536}
+missing_row_sample=[]
+short_row_sample=[]
