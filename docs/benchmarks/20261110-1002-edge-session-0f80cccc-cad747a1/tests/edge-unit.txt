@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/zkie_ops-a527cf57462e281a)
+
+running 2 tests
+test proof::edge_session::tests::edge_value_comparison_is_exact_and_shaped ... ok
+test proof::edge_session::tests::previous_and_asset_edges_have_distinct_semantics ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s
+
