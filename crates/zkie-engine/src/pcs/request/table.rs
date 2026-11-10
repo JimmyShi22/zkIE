@@ -824,6 +824,43 @@ pub struct FoldedTable {
     pub values: Vec<Fp3>,
 }
 
+/// A row source over fixture messages and tails. It carries no asset; tests
+/// and fixture sessions use it to exercise the one streaming committer
+/// without a second table implementation.
+pub struct VecTableSource {
+    messages: Vec<Vec<Fp>>,
+    tails: Vec<Vec<Fp>>,
+}
+
+impl VecTableSource {
+    pub fn new(messages: Vec<Vec<Fp>>, tails: Vec<Vec<Fp>>) -> Result<Self> {
+        if messages.is_empty() || messages.len() != tails.len() {
+            return Err(Error::ShapeMismatch);
+        }
+        Ok(Self { messages, tails })
+    }
+}
+
+impl TableRowSource for VecTableSource {
+    fn rows(&self) -> u64 {
+        self.messages.len() as u64
+    }
+
+    fn row(&mut self, row: u64, message: &mut [Fp], tail: &mut [Fp]) -> Result<()> {
+        let message_row = self
+            .messages
+            .get(row as usize)
+            .ok_or(Error::InvalidIndex)?;
+        let tail_row = self.tails.get(row as usize).ok_or(Error::InvalidIndex)?;
+        if message.len() != message_row.len() || tail.len() != tail_row.len() {
+            return Err(Error::ShapeMismatch);
+        }
+        message.copy_from_slice(message_row);
+        tail.copy_from_slice(tail_row);
+        Ok(())
+    }
+}
+
 /// A committed table and its row source. FOLDEQ and its callers fold and open
 /// through this holder: the fold is one pass over the rows and the opening one
 /// pass over the drawn columns, both with the source's bounded buffers; the
