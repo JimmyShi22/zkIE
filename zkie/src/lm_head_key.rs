@@ -19,7 +19,7 @@ use zkie_engine::pcs::request::chain::Chain;
 use zkie_engine::pcs::request::code::encode_row_fp3;
 use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE};
 use zkie_engine::pcs::request::fold::{
-    fold_mask_notice, fold_mask_shape_fault, FoldGroupLayout, FoldMemberLayout, FoldShape,
+    fold_mask_notice, fold_mask_shape_fault, FoldGroupLayout, FoldInputRow, FoldMemberLayout, FoldShape,
     OracleMetadata, RuntimeOracles, VerifiedGroup, VerifiedGroups, VerifiedStatement,
 };
 use zkie_engine::pcs::request::foldeq::{
@@ -31,7 +31,8 @@ use zkie_engine::pcs::request::params::{RequestParams, SHARED_CHAIN_LABEL};
 use zkie_engine::pcs::request::plan::{CompiledPlan, RequestPlan};
 use zkie_engine::pcs::request::read::{unique_sorted, HidingState, ReadLedger};
 use zkie_engine::pcs::request::relation::{
-    foldeq_weights, gu_sample_pad_offsets, gu_table, oracle_sample_row, sample_row, GuWitness,
+    foldeq_weights, gu_sample_pad_offsets, gu_table, gu_vector_offset, oracle_sample_row,
+    sample_row, GuWitness,
 };
 use zkie_engine::pcs::request::runtime_tree::{
     MaskTreePlan, RuntimePartRows, RuntimeTree, RuntimeTreePart, RuntimeTreePlan,
@@ -1196,6 +1197,108 @@ pub fn run_limited_shared_to_columns(
             transcript,
         },
     ))
+}
+
+/// Builds the FOLD group's input row from the real G_u and Omega messages.
+///
+/// The G_u part maps every entry of the dense folded row (the `k_lo` place
+/// bits and the `k_row` row bits) through the trusted G_u layout to its
+/// message slot, weighted by `eq(psi_lo, place) * eq(zeta, row)`. The Omega
+/// part is `eq(zeta, row)` on the leading slots of its single message row.
+/// The fresh mask's coefficients are supplied by the mask provider; the
+/// relation itself is homogeneous, so the row target is zero.
+#[allow(clippy::too_many_arguments)]
+pub fn build_fold_row(
+    gu: &LmHeadGuProvider,
+    omega: &LmHeadOmegaProvider,
+    fold: &FoldShape,
+    layout: &FoldGroupLayout,
+    matrix_rows: u64,
+    k_lo: u32,
+    psi_lo: &[Fp3],
+    zeta: &[Fp3],
+    mask_coefficients: &[Fp3],
+) -> Result<FoldInputRow> {
+    if layout.fault(fold).is_some()
+        || gu.shape().u.code != fold.code
+        || omega.shape().code != fold.code
+        || layout.members.len() != 2
+        || layout.members[0].oracle != gu.shape().oracle
+        || layout.members[1].oracle != omega.oracle()
+        || layout.members[0].main_rows != gu.shape().u.main_rows
+        || layout.members[1].main_rows != omega.shape().main_rows
+    {
+        return Err(Error::InvalidConfig);
+    }
+    if matrix_rows < 1 || !matrix_rows.is_power_of_two() || psi_lo.len() != k_lo as usize {
+        return Err(Error::InvalidConfig);
+    }
+    let k_row = matrix_rows.trailing_zeros();
+    if zeta.len() != k_row as usize {
+        return Err(Error::ShapeMismatch);
+    }
+    let eq_psi = foldeq_weights(psi_lo, k_lo)?;
+    let eq_zeta = foldeq_weights(zeta, k_row)?;
+    let rows = 1usize
+        .checked_shl(fold.k)
+        .ok_or(Error::ResourceLimit)?;
+    let ell = usize::try_from(fold.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let mut coefficients = vec![
+        Fp3::ZERO;
+        rows.checked_mul(ell).ok_or(Error::ResourceLimit)?
+    ];
+    let gu_base = 0usize;
+    let omega_base = usize::try_from(layout.members[0].main_rows)
+        .map_err(|_| Error::ResourceLimit)?
+        .checked_mul(ell)
+        .ok_or(Error::ResourceLimit)?;
+    let entries = matrix_rows
+        .checked_shl(k_lo)
+        .ok_or(Error::ResourceLimit)?;
+    let low_count = 1u64
+        .checked_shl(k_lo)
+        .ok_or(Error::ResourceLimit)?;
+    for entry in 0..entries {
+        let row = entry / low_count;
+        let place = entry % low_count;
+        let Some(offset) = gu_vector_offset(gu.shape(), entry)? else {
+            return Err(Error::ShapeMismatch);
+        };
+        let weight = eq_psi[place as usize].mul(&eq_zeta[row as usize]);
+        let slot = gu_base
+            .checked_add(offset)
+            .ok_or(Error::ResourceLimit)?;
+        let target = coefficients.get_mut(slot).ok_or(Error::ShapeMismatch)?;
+        *target = target.add(&weight);
+    }
+    for (row, weight) in eq_zeta.iter().enumerate() {
+        let slot = omega_base.checked_add(row).ok_or(Error::ResourceLimit)?;
+        let target = coefficients.get_mut(slot).ok_or(Error::ShapeMismatch)?;
+        *target = target.add(weight);
+    }
+    let mask_len = 1usize
+        .checked_shl(fold.h)
+        .and_then(|rows| {
+            usize::try_from(fold.mask_code.ell)
+                .ok()
+                .and_then(|ell| rows.checked_mul(ell))
+        })
+        .ok_or(Error::ResourceLimit)?;
+    if mask_coefficients.len() != mask_len {
+        return Err(Error::ShapeMismatch);
+    }
+    let row = FoldInputRow {
+        group: layout.group,
+        k: fold.k,
+        h: fold.h,
+        members: layout.members.iter().map(|member| member.oracle).collect(),
+        coefficients,
+        mask_coefficients: mask_coefficients.to_vec(),
+        kept: Vec::new(),
+        target: Fp3::ZERO,
+    };
+    row.check(fold, layout)?;
+    Ok(row)
 }
 
 /// The checks that the shared-only chain must report before a limited tested
@@ -2385,6 +2488,103 @@ mod tests {
             mask: Vec::new(),
         };
         assert_eq!(row.evaluate(&witness).expect("eval"), answers[0]);
+    }
+
+
+    #[test]
+    fn the_fold_row_binds_the_g_u_and_omega_coefficients() {
+        use zkie_engine::pcs::request::code::build_code_plan;
+        let (key, gu_shape, randomness, tails, _parameters) = small_gu_fixture();
+        let gamma = vec![Fp3::from_u64(2), Fp3::from_u64(3)];
+        let gu = fold_lm_head_gu(&key, &tails, &gu_shape, &gamma, &randomness)
+            .expect("fold");
+        let omega_code = key.shape.code;
+        let u = GuOracleShape {
+            code: omega_code,
+            main_rows: 1,
+            main_deg: 3,
+            mask_rows: 0,
+            mask_code: None,
+            answers: 1,
+        };
+        let omega_tree = RuntimeTreePlan {
+            tree_number: 3,
+            leaf_class: 1,
+            log_n: omega_code.log_n,
+            log_n_zk: omega_code.log_n,
+            parts: vec![RuntimeTreePart {
+                main_symbols: 3,
+                mask_symbols: 0,
+            }],
+            salt_bytes: 40,
+            run: Digest([0x34; 32]),
+            configuration: key.reader.configuration,
+        };
+        let omega_randomness = LmHeadOmegaRandomness {
+            code_tails: vec![vec![Fp3::from_u64(9)]],
+            salts: (0..8)
+                .map(|position| vec![(position as u8) ^ 0x33; 40])
+                .collect(),
+            pad: Fp3::from_u64(0x888),
+        };
+        let omega = commit_lm_head_omega(
+            &gu,
+            2,
+            1,
+            &u,
+            &omega_tree,
+            1,
+            0,
+            &[],
+            &omega_randomness,
+        )
+        .expect("omega");
+        let mask_code = build_code_plan(3, 7, 1).expect("mask code");
+        let fold = FoldShape {
+            code: key.shape.code,
+            mask_code,
+            k: 3,
+            h: 0,
+            mask_leaf_class: 0,
+        };
+        let layout = FoldGroupLayout {
+            group: 1,
+            k: 3,
+            h: 0,
+            members: vec![
+                FoldMemberLayout {
+                    oracle: 1,
+                    main_rows: 4,
+                    mask_rows: 0,
+                    kept: false,
+                },
+                FoldMemberLayout {
+                    oracle: 2,
+                    main_rows: 1,
+                    mask_rows: 0,
+                    kept: false,
+                },
+            ],
+        };
+        let zeta: Vec<Fp3> = Vec::new();
+        let mask_coefficients = vec![Fp3::from_u64(1); 7];
+        let row = build_fold_row(
+            &gu,
+            &omega,
+            &fold,
+            &layout,
+            1,
+            0,
+            &[],
+            &zeta,
+            &mask_coefficients,
+        )
+        .expect("fold row");
+        assert_eq!(row.coefficients.len(), 8 * 4);
+        assert_eq!(row.members, vec![1, 2]);
+        assert_eq!(row.coefficients[0], Fp3::ONE);
+        assert_eq!(row.coefficients[4 * 4], Fp3::ONE);
+        assert_eq!(row.target, Fp3::ZERO);
     }
 
 }

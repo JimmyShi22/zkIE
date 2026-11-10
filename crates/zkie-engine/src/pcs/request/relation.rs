@@ -127,6 +127,17 @@ fn vector_index(shape: &GuShape, j: u64) -> Result<u64> {
     })
 }
 
+/// The compact main-table offset of one entry of the folded vector under the
+/// trusted G_u layout. `None` means the entry falls in a virtual padded row or
+/// a place past the code length; it is not a table slot.
+pub fn gu_vector_offset(shape: &GuShape, entry: u64) -> Result<Option<usize>> {
+    if shape.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let virtual_index = vector_index(shape, entry)?;
+    physical_index(shape, virtual_index)
+}
+
 /// The compact row-major offset of a virtual table index: `row = v mod
 /// 2^row_bits`, `place = v div 2^row_bits`, `offset = row * ell + place`.
 /// Virtual padded rows and places past the code length are not stored.
