@@ -70,6 +70,8 @@ pub struct CsMultiProver {
     plan: RuntimeTreePlan,
     tree: RuntimeTree,
     u: GuOracleShape,
+    main_tails: Vec<Vec<Fp3>>,
+    mask_tails: Vec<Vec<Fp3>>,
 }
 
 impl CsMultiProver {
@@ -83,7 +85,13 @@ impl CsMultiProver {
         plan: RuntimeTreePlan,
         salts: &[Vec<u8>],
     ) -> Result<Self> {
-        let message = switched_rows_multi(&rows, &target, main_tails, mask_tails, pad_value)?;
+        let message = switched_rows_multi(
+            &rows,
+            &target,
+            main_tails.clone(),
+            mask_tails.clone(),
+            pad_value,
+        )?;
         let tree = commit_switch(&target, &message, &plan, salts)?;
         let u = GuOracleShape {
             code: target.code,
@@ -103,11 +111,25 @@ impl CsMultiProver {
             plan,
             tree,
             u,
+            main_tails,
+            mask_tails,
         })
     }
 
     pub fn root(&self) -> Digest {
         *self.tree.root()
+    }
+
+    pub fn open(&self, positions: &[u64]) -> Result<RuntimeTreeOpening> {
+        self.tree.open(positions)
+    }
+
+    pub fn main_tails(&self) -> &[Vec<Fp3>] {
+        &self.main_tails
+    }
+
+    pub fn mask_tails(&self) -> &[Vec<Fp3>] {
+        &self.mask_tails
     }
 
     pub fn plan(&self) -> &RuntimeTreePlan {
@@ -143,6 +165,15 @@ impl CsMultiProver {
     }
 }
 
+/// Where the switch stage's old mask rows come from: a dedicated mask-only
+/// commitment (the first stage's mask) or the mask part of the switched
+/// member's general commitment (every following stage).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OldMaskSource {
+    Tree { plan: MaskTreePlan, root: Digest },
+    Member,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stage {
     Fresh,
@@ -161,8 +192,7 @@ pub struct CsMultiSession {
     target: SwitchTarget,
     u: GuOracleShape,
     plan: RuntimeTreePlan,
-    old_mask_tree: MaskTreePlan,
-    old_mask_root: Digest,
+    old_mask: OldMaskSource,
     stage: Stage,
     identity: Digest,
     root: Option<Digest>,
@@ -181,13 +211,21 @@ impl CsMultiSession {
         target: SwitchTarget,
         u: GuOracleShape,
         plan: RuntimeTreePlan,
-        old_mask_tree: MaskTreePlan,
-        old_mask_root: Digest,
+        old_mask: OldMaskSource,
     ) -> Result<Self> {
+        let old_mask_ok = match old_mask {
+            OldMaskSource::Tree { plan, root } => {
+                plan.fault().is_none() && root != Digest::ZERO
+            }
+            OldMaskSource::Member => basis
+                .layout
+                .members
+                .iter()
+                .any(|member| member.mask_rows > 0),
+        };
         if u.fault().is_some()
             || plan.fault().is_some()
-            || old_mask_tree.fault().is_some()
-            || old_mask_root == Digest::ZERO
+            || !old_mask_ok
             || basis.layout != handoff.layout
             || handoff.kept_rows != 0
         {
@@ -201,8 +239,7 @@ impl CsMultiSession {
             target,
             u,
             plan,
-            old_mask_tree,
-            old_mask_root,
+            old_mask,
             stage: Stage::Fresh,
             identity,
             root: None,
@@ -282,7 +319,7 @@ impl CsMultiSession {
         &mut self,
         member_openings: &[RuntimeTreeOpening],
         fresh_opening: &RuntimeTreeOpening,
-        old_mask_opening: &RuntimeTreeOpening,
+        old_mask_opening: Option<&RuntimeTreeOpening>,
     ) -> Result<&SwitchedClaims> {
         if self.stage != Stage::Positions {
             return Err(Error::InvalidSessionState);
@@ -290,7 +327,7 @@ impl CsMultiSession {
         let seed = self.seed.clone().ok_or(Error::InvalidSessionState)?;
         let answer = self.answer.ok_or(Error::InvalidSessionState)?;
         let unique = unique_sorted(&self.positions);
-        let (fold_main, _fold_mask) =
+        let (fold_main, fold_mask) =
             fold_original_columns(&self.handoff, &self.basis, member_openings, &unique)?;
         let mask_positions: Vec<u64> = self
             .positions
@@ -300,26 +337,46 @@ impl CsMultiSession {
         let mask_unique = unique_sorted(&mask_positions);
         let fold_fresh =
             fold_fresh_columns(&self.handoff, &self.basis, fresh_opening, &mask_unique)?;
-        let old_symbols = verify_mask_opening(
-            &self.old_mask_tree,
-            &self.old_mask_root,
-            &mask_unique,
-            old_mask_opening,
-        )?;
-        let old_width = usize::try_from(
-            self.old_mask_tree
-                .mask_rows
-                .checked_mul(3)
-                .ok_or(Error::ResourceLimit)?,
-        )
-        .map_err(|_| Error::ResourceLimit)?;
-        if old_symbols.len() != mask_unique.len() * old_width || old_width < 3 {
-            return Err(Error::ShapeMismatch);
-        }
-        let old_mask_symbols: Vec<Fp3> = old_symbols
-            .chunks_exact(old_width)
-            .map(|symbols| Fp3::new(symbols[0], symbols[1], symbols[2]))
-            .collect();
+        let old_mask_symbols: Vec<Fp3> = match self.old_mask {
+            OldMaskSource::Tree { plan, root } => {
+                let opening = old_mask_opening.ok_or(Error::StatementMismatch)?;
+                let old_symbols = verify_mask_opening(&plan, &root, &mask_unique, opening)?;
+                let old_width = usize::try_from(
+                    plan.mask_rows
+                        .checked_mul(3)
+                        .ok_or(Error::ResourceLimit)?,
+                )
+                .map_err(|_| Error::ResourceLimit)?;
+                if old_symbols.len() != mask_unique.len() * old_width || old_width < 3 {
+                    return Err(Error::ShapeMismatch);
+                }
+                old_symbols
+                    .chunks_exact(old_width)
+                    .map(|symbols| Fp3::new(symbols[0], symbols[1], symbols[2]))
+                    .collect()
+            }
+            OldMaskSource::Member => {
+                if old_mask_opening.is_some() {
+                    return Err(Error::StatementMismatch);
+                }
+                let mut folded = vec![None; mask_unique.len()];
+                for (at, position) in unique.iter().enumerate() {
+                    let mask_position = *position % self.handoff.mask_code.n();
+                    let mask_at = mask_unique
+                        .binary_search(&mask_position)
+                        .map_err(|_| Error::InvalidIndex)?;
+                    let value = *fold_mask.get(at).ok_or(Error::InvalidIndex)?;
+                    match folded[mask_at] {
+                        Some(seen) if seen != value => return Err(Error::InvalidProof),
+                        _ => folded[mask_at] = Some(value),
+                    }
+                }
+                folded
+                    .into_iter()
+                    .map(|value| value.ok_or(Error::ShapeMismatch))
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
         let mut authenticated = Vec::with_capacity(self.positions.len());
         for position in &self.positions {
             let at = unique
