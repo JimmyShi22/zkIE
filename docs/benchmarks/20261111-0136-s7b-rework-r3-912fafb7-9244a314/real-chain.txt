@@ -1,0 +1,143 @@
+warning: unused variable: `target`
+   --> crates/zkie-engine/src/pcs/request/relation.rs:858:5
+    |
+858 |     target: Fp3,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `columns_usize`
+   --> crates/zkie-engine/src/pcs/request/table.rs:952:13
+    |
+952 |         let columns_usize = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_columns_usize`
+
+warning: `zkie-engine` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-engine` to apply 2 suggestions)
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/base_last_session.rs:578:13
+    |
+578 |         let mut message = self.chain.message();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `plan` is never read
+   --> crates/zkie-ops/src/proof/cs_multi_session.rs:195:5
+    |
+189 | pub struct CsMultiSession {
+    |            -------------- field in this struct
+...
+195 |     plan: RuntimeTreePlan,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-ops` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-ops` to apply 1 suggestion)
+warning: unused import: `zkie_engine::pcs::request::field::E_DEGREE`
+  --> models/gpt2/src/lm_head_plan.rs:11:5
+   |
+11 | use zkie_engine::pcs::request::field::E_DEGREE;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_step`
+   --> models/gpt2/src/executor.rs:346:21
+    |
+346 |             let (k, k_step) = {
+    |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_step`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `m`
+   --> models/gemma3/src/executor.rs:277:5
+    |
+277 |     m: usize,
+    |     ^ help: if this is intentional, prefix it with an underscore: `_m`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_rot_step`
+   --> models/gemma3/src/executor.rs:390:21
+    |
+390 |         let (k_rot, k_rot_step) = rope(&mut builder, k, k_step, cos_prefix.clone(), sin_prefix.clone(), m)?;
+    |                     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_rot_step`
+
+warning: `zkie-models-gpt2` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gpt2` to apply 2 suggestions)
+warning: `zkie-models-gemma3` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gemma3` to apply 2 suggestions)
+warning: unused variable: `mask_oracle`
+    --> zkie/src/lm_head_key.rs:2993:9
+     |
+2993 |     let mask_oracle = MaskOracle {
+     |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mask_oracle`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> zkie/src/lm_head_key.rs:3859:9
+     |
+3859 |     let mut mask_tail = vec![Fp3::ZERO; mask_tail_len];
+     |         ----^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `mask_tail`
+    --> zkie/src/lm_head_key.rs:3859:9
+     |
+3859 |     let mut mask_tail = vec![Fp3::ZERO; mask_tail_len];
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mask_tail`
+
+warning: variable does not need to be mutable
+   --> zkie/src/lm_head_stage.rs:274:9
+    |
+274 |     let mut options = if private {
+    |         ----^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: field `tree` is never read
+    --> zkie/src/lm_head_key.rs:1177:5
+     |
+1173 | pub struct LmHeadOmegaProvider {
+     |            ------------------- field in this struct
+...
+1177 |     tree: RuntimeTreePlan,
+     |     ^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie` (lib test) generated 5 warnings (run `cargo fix --lib -p zkie --tests` to apply 4 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.02s
+     Running unittests src/lib.rs (target/release/deps/zkie-c7b8d42a057b8bea)
+
+running 1 test
+MEM commit-keys-dropped hwm_kb 526744 rss_kb 491564 anon_kb 225412 file_kb 266152 shmem_kb 0
+MEM fold hwm_kb 604240 rss_kb 604240 anon_kb 338056 file_kb 266184 shmem_kb 0
+MEM record hwm_kb 604240 rss_kb 604240 anon_kb 338056 file_kb 266184 shmem_kb 0
+MEM queries hwm_kb 604240 rss_kb 604240 anon_kb 338056 file_kb 266184 shmem_kb 0
+MEM released hwm_kb 603796 rss_kb 342096 anon_kb 338056 file_kb 4040 shmem_kb 0
+MEM columns hwm_kb 603796 rss_kb 342096 anon_kb 338056 file_kb 4040 shmem_kb 0
+MEM omega hwm_kb 603796 rss_kb 342096 anon_kb 338056 file_kb 4040 shmem_kb 0
+MEM bat-rows hwm_kb 603796 rss_kb 342096 anon_kb 338056 file_kb 4040 shmem_kb 0
+MEM bat-frozen hwm_kb 603796 rss_kb 342096 anon_kb 338056 file_kb 4040 shmem_kb 0
+MEM bat-combine hwm_kb 603796 rss_kb 342096 anon_kb 338056 file_kb 4040 shmem_kb 0
+MEM bat-columns hwm_kb 603796 rss_kb 342096 anon_kb 338056 file_kb 4040 shmem_kb 0
+MEM fold-stage hwm_kb 603796 rss_kb 342096 anon_kb 338056 file_kb 4040 shmem_kb 0
+MEM switch hwm_kb 603796 rss_kb 342104 anon_kb 338064 file_kb 4040 shmem_kb 0
+MEM switch hwm_kb 603796 rss_kb 342104 anon_kb 338064 file_kb 4040 shmem_kb 0
+MEM switch hwm_kb 603796 rss_kb 342104 anon_kb 338064 file_kb 4040 shmem_kb 0
+MEM base hwm_kb 603796 rss_kb 342104 anon_kb 338064 file_kb 4040 shmem_kb 0
+artifact breakdown: total 5578904 openings 600 unique 600 opening_bytes 5284800 symbol_bytes 4915200 path_bytes 326400 base 63464 switches 3
+MEM bat-rows hwm_kb 603796 rss_kb 277836 anon_kb 273796 file_kb 4040 shmem_kb 0
+MEM bat-frozen hwm_kb 603796 rss_kb 277836 anon_kb 273796 file_kb 4040 shmem_kb 0
+MEM bat-combine hwm_kb 603796 rss_kb 277836 anon_kb 273796 file_kb 4040 shmem_kb 0
+MEM bat-columns hwm_kb 603796 rss_kb 277836 anon_kb 273796 file_kb 4040 shmem_kb 0
+real lm head: commit 29.59804601s prove 9.507461222s hwm_commit_kb 526744 hwm_prove_kb 603796 store_written 1073741824 store_read 2147483648 store_len 1073774656 base_proof 63464 artifact_bytes 5578904 sealed Digest([201, 69, 180, 1, 23, 136, 79, 188, 104, 67, 60, 84, 187, 181, 222, 246, 111, 161, 57, 56, 52, 248, 240, 44, 10, 78, 210, 187, 19, 219, 243, 214])
+test lm_head_key::tests::real_gpt2_lm_head_chain ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 45.85s
+

@@ -1,0 +1,175 @@
+warning: unused variable: `target`
+   --> crates/zkie-engine/src/pcs/request/relation.rs:858:5
+    |
+858 |     target: Fp3,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `columns_usize`
+   --> crates/zkie-engine/src/pcs/request/table.rs:952:13
+    |
+952 |         let columns_usize = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_columns_usize`
+
+warning: `zkie-engine` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-engine` to apply 2 suggestions)
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/base_last_session.rs:578:13
+    |
+578 |         let mut message = self.chain.message();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `plan` is never read
+   --> crates/zkie-ops/src/proof/cs_multi_session.rs:195:5
+    |
+189 | pub struct CsMultiSession {
+    |            -------------- field in this struct
+...
+195 |     plan: RuntimeTreePlan,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-ops` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-ops` to apply 1 suggestion)
+warning: unused variable: `m`
+   --> models/gemma3/src/executor.rs:277:5
+    |
+277 |     m: usize,
+    |     ^ help: if this is intentional, prefix it with an underscore: `_m`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_rot_step`
+   --> models/gemma3/src/executor.rs:390:21
+    |
+390 |         let (k_rot, k_rot_step) = rope(&mut builder, k, k_step, cos_prefix.clone(), sin_prefix.clone(), m)?;
+    |                     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_rot_step`
+
+warning: unused import: `zkie_engine::pcs::request::field::E_DEGREE`
+  --> models/gpt2/src/lm_head_plan.rs:11:5
+   |
+11 | use zkie_engine::pcs::request::field::E_DEGREE;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_step`
+   --> models/gpt2/src/executor.rs:346:21
+    |
+346 |             let (k, k_step) = {
+    |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_step`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-models-gemma3` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gemma3` to apply 2 suggestions)
+warning: `zkie-models-gpt2` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gpt2` to apply 2 suggestions)
+warning: unused variable: `mask_oracle`
+    --> zkie/src/lm_head_key.rs:2993:9
+     |
+2993 |     let mask_oracle = MaskOracle {
+     |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mask_oracle`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> zkie/src/lm_head_key.rs:3859:9
+     |
+3859 |     let mut mask_tail = vec![Fp3::ZERO; mask_tail_len];
+     |         ----^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `mask_tail`
+    --> zkie/src/lm_head_key.rs:3859:9
+     |
+3859 |     let mut mask_tail = vec![Fp3::ZERO; mask_tail_len];
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mask_tail`
+
+warning: variable does not need to be mutable
+   --> zkie/src/lm_head_stage.rs:274:9
+    |
+274 |     let mut options = if private {
+    |         ----^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: field `tree` is never read
+    --> zkie/src/lm_head_key.rs:1177:5
+     |
+1173 | pub struct LmHeadOmegaProvider {
+     |            ------------------- field in this struct
+...
+1177 |     tree: RuntimeTreePlan,
+     |     ^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie` (lib test) generated 5 warnings (run `cargo fix --lib -p zkie --tests` to apply 4 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.02s
+     Running unittests src/lib.rs (target/release/deps/zkie-c7b8d42a057b8bea)
+
+running 40 tests
+MEM fold hwm_kb 6552 rss_kb 6552 anon_kb 2352 file_kb 4200 shmem_kb 0
+MEM record hwm_kb 6688 rss_kb 6688 anon_kb 2488 file_kb 4200 shmem_kb 0
+MEM queries hwm_kb 6740 rss_kb 6740 anon_kb 2540 file_kb 4200 shmem_kb 0
+MEM released hwm_kb 6884 rss_kb 6884 anon_kb 2684 file_kb 4200 shmem_kb 0
+MEM columns hwm_kb 6900 rss_kb 6900 anon_kb 2700 file_kb 4200 shmem_kb 0
+MEM omega hwm_kb 6928 rss_kb 6928 anon_kb 2728 file_kb 4200 shmem_kb 0
+MEM bat-rows hwm_kb 6972 rss_kb 6972 anon_kb 2772 file_kb 4200 shmem_kb 0
+MEM bat-frozen hwm_kb 7028 rss_kb 7028 anon_kb 2828 file_kb 4200 shmem_kb 0
+MEM bat-combine hwm_kb 7096 rss_kb 7096 anon_kb 2896 file_kb 4200 shmem_kb 0
+MEM bat-columns hwm_kb 7168 rss_kb 7168 anon_kb 2968 file_kb 4200 shmem_kb 0
+test lm_head_key::stage_tests::lm_head_stage_processes ... ignored
+test lm_head_key::stage_tests::lm_head_stage_worker ... ignored
+test lm_head_key::tests::real_gpt2_lm_head_chain ... ignored
+test lm_head_key::tests::an_incomplete_record_has_no_artifact ... ok
+test lm_head_key::tests::omega_blocks_sum_the_folded_matrix_rows ... ok
+test lm_head_key::tests::repeated_column_openings_are_stored_once ... ok
+test lm_head_key::tests::the_chain_artifact_round_trips_and_rejects_damage ... ok
+test lm_head_key::tests::the_fresh_mask_commits_and_is_reproducible_from_private_bytes ... ok
+test lm_head_key::tests::the_fold_row_binds_the_g_u_and_omega_coefficients ... ok
+test lm_head_key::tests::the_last_stage_carries_the_group_row_unchanged ... ok
+test lm_head_key::tests::the_g_u_fold_binds_the_challenge_and_the_private_pads ... ok
+MEM fold-stage hwm_kb 7308 rss_kb 7308 anon_kb 3108 file_kb 4200 shmem_kb test lm_head_key::tests::the_g_u_fold_rejects_mismatched_inputs ... 0ok
+
+test lm_head_key::tests::the_g_u_fold_commits_the_folded_table_and_answers_the_seed ... ok
+test lm_head_key::tests::the_last_stage_rejects_a_folded_final_target ... ok
+test lm_head_key::tests::the_holder_fold_matches_the_key_fold ... ok
+test lm_head_key::tests::the_limited_tested_state_needs_every_check ... ok
+test lm_head_key::tests::the_old_mask_commits_its_message_rows_separately_from_the_fresh_mask ... ok
+test lm_head_key::tests::the_omega_message_commits_and_answers_the_seed ... ok
+test lm_head_key::tests::the_stage_sequence_rejects_missing_or_reordered_switches ... ok
+test lm_head_key::tests::the_shared_column_check_follows_the_chain ... ok
+test lm_head_stage::tests::a_stale_journal_lock_fails_closed_and_keeps_the_old_state ... ok
+test lm_head_stage::tests::a_successful_claim_is_durable_and_leaves_no_journal_temporary ... ok
+test lm_head_stage::tests::another_session_cannot_claim_the_budget ... ok
+test lm_head_stage::tests::private_files_are_owner_only_and_do_not_overwrite ... ok
+test lm_head_stage::tests::concurrent_claims_have_one_winner_and_no_mask_reuse ... ok
+test lm_head_stage::tests::public_and_private_records_round_trip_and_reject_damage ... ok
+test lm_head_stage::tests::the_budget_is_reserved_once_and_never_rolls_back ... ok
+MEM switch hwm_kb 7820 rss_kb 7820 anon_kb 3620 file_kb 4200 shmem_kb 0
+MEM switch hwm_kb 8924 rss_kb 8924 anon_kb 4724 file_kb 4200 shmem_kb 0
+MEM switch hwm_kb 9896 rss_kb 9896 anon_kb 5696 file_kb 4200 shmem_kb 0
+MEM base hwm_kb 10412 rss_kb 10412 anon_kb 6212 file_kb 4200 shmem_kb 0
+test lm_head_key::tests::the_shared_chain_reaches_the_record_and_column_joins ... ok
+test lm_head_key::tests::the_limited_shared_plan_rejects_a_compiled_shape_that_does_not_fit ... ok
+test lm_head_key::tests::the_limited_shared_plan_rejects_a_reader_with_another_configuration ... ok
+test lm_head_key::tests::the_limited_shared_plan_rejects_a_statement_that_does_not_name_the_reader ... ok
+test lm_head_key::tests::the_limited_shared_plan_needs_private_bytes_and_a_mask_root ... ok
+test lm_head_key::tests::the_limited_key_plan_keeps_every_stage_in_order ... ok
+test lm_head_key::tests::the_limited_statement_binds_its_semantics_and_range ... ok
+test lm_head_key::tests::the_mapping_covers_the_matrix ... ok
+test lm_head_key::tests::the_mapping_matches_sampled_source_entries ... ok
+test lm_head_key::tests::the_limited_shared_plan_binds_the_real_configuration_run_and_trees ... ok
+test lm_head_key::tests::the_limited_shared_run_and_binding_follow_the_private_bytes ... ok
+test lm_head_key::tests::the_selected_plan_identifier_enters_the_first_query ... ok
+test lm_head_key::tests::the_planned_stage_chain_follows_the_compiled_stages ... ok
+
+test result: ok. 37 passed; 0 failed; 3 ignored; 0 measured; 18 filtered out; finished in 0.05s
+
