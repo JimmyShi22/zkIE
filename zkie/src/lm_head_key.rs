@@ -49,7 +49,7 @@ use zkie_engine::pcs::request::runtime_tree::{
 };
 use zkie_engine::pcs::request::table::{
     commit_table, verify_columns, ColumnOpening, CommittedTable, IndexReader, IndexShape,
-    SampleSeed,
+    SampleSeed, StreamingHolder, TableRowSource,
 };
 use zkie_engine::primitives::transcript::run_value;
 use zkie_engine::pcs::request::proximity::SingleRows;
@@ -940,6 +940,18 @@ pub fn fold_lm_head_gu(
         }
     }
 
+    finish_lm_head_gu(shape, folded, folded_tail, randomness)
+}
+
+/// The shared G_u assembly: place the folded row, add the private sample
+/// pads, encode each main row with its tail and commit the runtime tree.
+fn finish_lm_head_gu(
+    shape: &GuShape,
+    folded: Vec<Fp3>,
+    folded_tail: Vec<Fp3>,
+    randomness: &LmHeadGuRandomness,
+) -> Result<LmHeadGuProvider> {
+    let main_rows = usize::try_from(shape.u.main_rows).map_err(|_| Error::ResourceLimit)?;
     let mut witness = gu_table(shape, &folded, &folded_tail)?;
     let (main_pads, mask_pads) = gu_sample_pad_offsets(shape)?;
     if !mask_pads.is_empty() || main_pads.len() != randomness.pads.len() {
@@ -998,6 +1010,25 @@ pub fn fold_lm_head_gu(
         registry,
         tree,
     })
+}
+
+/// Folds the committed table through the holder and assembles G_u. The
+/// holder reads the rows in bounded windows; no complete weight message is
+/// kept by this path.
+pub fn fold_lm_head_gu_holder<S: TableRowSource>(
+    holder: &mut StreamingHolder<S>,
+    shape: &GuShape,
+    gamma: &[Fp3],
+    randomness: &LmHeadGuRandomness,
+) -> Result<LmHeadGuProvider> {
+    if holder.reader().shape != shape.index || holder.reader().fault().is_some() {
+        return Err(Error::StatementMismatch);
+    }
+    if shape.fault().is_some() || gamma.len() != shape.index.v as usize {
+        return Err(Error::InvalidConfig);
+    }
+    let (folded, folded_tail) = holder.fold(gamma)?;
+    finish_lm_head_gu(shape, folded, folded_tail, randomness)
 }
 
 /// The private values of one Omega commitment: the oracle code tails, one
@@ -4510,6 +4541,67 @@ mod tests {
             last_stage_single_rows(target, &claims, &message),
             Err(Error::UnsupportedPrimitive)
         ));
+    }
+
+    struct VecSource {
+        messages: Vec<Vec<Fp>>,
+        tails: Vec<Vec<Fp>>,
+    }
+
+    impl TableRowSource for VecSource {
+        fn rows(&self) -> u64 {
+            self.messages.len() as u64
+        }
+
+        fn row(&mut self, row: u64, message: &mut [Fp], tail: &mut [Fp]) -> Result<()> {
+            let message_row = self
+                .messages
+                .get(row as usize)
+                .ok_or(Error::InvalidIndex)?;
+            let tail_row = self.tails.get(row as usize).ok_or(Error::InvalidIndex)?;
+            if message.len() != message_row.len() || tail.len() != tail_row.len() {
+                return Err(Error::ShapeMismatch);
+            }
+            message.copy_from_slice(message_row);
+            tail.copy_from_slice(tail_row);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_holder_fold_matches_the_key_fold() {
+        let (key, gu_shape, randomness, tails, _parameters) = small_gu_fixture();
+        let gamma = vec![Fp3::from_u64(2), Fp3::from_u64(3)];
+        let from_key = fold_lm_head_gu(&key, &tails, &gu_shape, &gamma, &randomness)
+            .expect("key fold");
+        let salts: Vec<Vec<u8>> = (0..16)
+            .map(|position| vec![(position as u8) ^ 0x5a; 40])
+            .collect();
+        let mut source = VecSource {
+            messages: key.messages.clone(),
+            tails: tails.clone(),
+        };
+        let table = zkie_engine::pcs::request::table::commit_table_streaming(
+            &mut source,
+            key.shape,
+            key.reader.configuration,
+            &salts,
+            4,
+            u64::MAX,
+        )
+        .expect("streaming table");
+        assert_eq!(table.reader.root, key.reader.root);
+        let mut holder = StreamingHolder::new(table, source, 8).expect("holder");
+        holder.begin(1).expect("begin");
+        let from_holder =
+            fold_lm_head_gu_holder(&mut holder, &gu_shape, &gamma, &randomness)
+                .expect("holder fold");
+        assert_eq!(from_key.root(), from_holder.root());
+        assert_eq!(from_key.folded(), from_holder.folded());
+        assert_eq!(
+            from_key.relation().main,
+            from_holder.relation().main
+        );
     }
 
     #[test]

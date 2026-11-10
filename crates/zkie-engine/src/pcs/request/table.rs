@@ -19,7 +19,7 @@ use crate::pcs::request::chain::{Chain, KIND_SEED};
 use crate::pcs::request::code::{encode_row_fp, CodeParams};
 use crate::pcs::request::field::{E_DEGREE, Fp, Fp3, FP3_BYTES};
 use crate::pcs::request::params::{LEAF_SALT_MAX_BYTES, LEAF_SALT_MIN_BYTES};
-use crate::pcs::request::read::HidingCharge;
+use crate::pcs::request::read::{HidingCharge, HidingState};
 use crate::pcs::request::relation::foldeq_weights;
 use crate::primitives::codec::{CanonicalReader, CanonicalWriter};
 use crate::primitives::transcript::{hash_labeled, tag_word, LEAF_STORED_MAIN};
@@ -833,19 +833,43 @@ pub struct StreamingHolder<S: TableRowSource> {
     table: StreamingTable,
     source: S,
     peak_bytes: u64,
+    hiding: HidingState,
+    charge: Option<HidingCharge>,
 }
 
 impl<S: TableRowSource> StreamingHolder<S> {
-    pub fn new(table: StreamingTable, source: S) -> Result<Self> {
-        if source.rows() != table.reader.shape.rows() {
+    /// `max_columns` is the table-life column budget of the hiding tails: the
+    /// number of columns that may be opened over this table's lifetime.
+    pub fn new(table: StreamingTable, source: S, max_columns: u64) -> Result<Self> {
+        if source.rows() != table.reader.shape.rows() || max_columns == 0 {
             return Err(Error::ShapeMismatch);
         }
         let peak = table.peak_bytes();
+        let hiding = HidingState::new(table.reader.root, 1, max_columns);
         Ok(Self {
             table,
             source,
             peak_bytes: peak,
+            hiding,
+            charge: None,
         })
+    }
+
+    /// Reserves `columns` opened columns before any fold. The reservation is
+    /// spent whether or not the proof is finished; repeated reservations fail
+    /// once the table-life budget is exhausted. The count is in-memory in this
+    /// layer; a production caller persists it before folding.
+    pub fn begin(&mut self, columns: usize) -> Result<()> {
+        if columns == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        let root = self.table.reader.root;
+        self.charge = Some(self.hiding.begin_charge(root, 1, columns)?);
+        Ok(())
+    }
+
+    pub fn hiding_used(&self) -> u64 {
+        self.hiding.used()
     }
 
     pub fn reader(&self) -> &IndexReader {
@@ -863,6 +887,9 @@ impl<S: TableRowSource> StreamingHolder<S> {
     /// message[j] = sum_r eq(r, gamma) * message entry j of row r, pads
     /// included; tail likewise. One row's message and tail are held at a time.
     pub fn fold(&mut self, gamma: &[Fp3]) -> Result<(Vec<Fp3>, Vec<Fp3>)> {
+        if self.charge.is_none() {
+            return Err(Error::InvalidSessionState);
+        }
         let shape = self.table.reader.shape;
         if validate_index_shape(&shape).is_err() || gamma.len() != shape.v as usize {
             return Err(Error::ShapeMismatch);
@@ -929,12 +956,15 @@ impl<S: TableRowSource> StreamingHolder<S> {
     /// Recomputes the drawn columns from the source and checks them against
     /// the stored tree.
     pub fn open(&mut self, positions: &[u64]) -> Result<Vec<ColumnOpening>> {
+        let charge = self.charge.as_ref().ok_or(Error::InvalidSessionState)?;
+        charge.consume(positions)?;
         self.table.open_columns(&mut self.source, positions)
     }
 
     /// Releases fold state. This holder keeps no folded row between calls; a
     /// caller that caches the returned rows drops them itself.
     pub fn forget(&mut self) -> Result<()> {
+        self.charge = None;
         Ok(())
     }
 }
@@ -1757,7 +1787,8 @@ mod streaming_tests {
         let streamed =
             commit_table_streaming(&mut source, shape, configuration, &salts, 2, u64::MAX)
                 .expect("streaming");
-        let mut holder = StreamingHolder::new(streamed, source).expect("holder");
+        let mut holder = StreamingHolder::new(streamed, source, 8).expect("holder");
+        holder.begin(3).expect("begin");
         let gamma = vec![Fp3::from_u64(2), Fp3::from_u64(3)];
         let (folded, folded_tail) = holder.fold(&gamma).expect("fold");
         let eq = foldeq_weights(&gamma, shape.v).expect("eq");
@@ -1790,9 +1821,48 @@ mod streaming_tests {
         let expected_open = expected_table.open_columns(&positions).expect("in-memory open");
         assert_eq!(opened, expected_open);
         holder.forget().expect("forget");
+        holder.begin(2).expect("begin again");
         let (again, _) = holder.fold(&gamma).expect("fold again");
         assert_eq!(again, folded);
         assert!(holder.peak_bytes() > 0);
+    }
+
+    #[test]
+    fn the_holder_requires_a_reservation_and_enforces_its_budget() {
+        let (shape, configuration, messages, tails, salts) = fixture();
+        let mut source = VecSource {
+            messages: messages.clone(),
+            tails: tails.clone(),
+        };
+        let streamed =
+            commit_table_streaming(&mut source, shape, configuration, &salts, 2, u64::MAX)
+                .expect("streaming");
+        let mut holder = StreamingHolder::new(streamed, source, 4).expect("holder");
+        let gamma = vec![Fp3::from_u64(2), Fp3::from_u64(3)];
+        assert!(matches!(holder.fold(&gamma), Err(Error::InvalidSessionState)));
+        assert!(matches!(
+            holder.open(&[1, 4, 6]),
+            Err(Error::InvalidSessionState)
+        ));
+        holder.begin(3).expect("first reservation");
+        assert_eq!(holder.hiding_used(), 3);
+        assert!(matches!(
+            holder.begin(3),
+            Err(Error::ResourceLimit)
+        ));
+        let (folded, _) = holder.fold(&gamma).expect("fold");
+        assert!(!folded.is_empty());
+        let opened = holder.open(&[1, 4, 6]).expect("open");
+        assert_eq!(opened.len(), 3);
+        assert!(matches!(
+            holder.open(&[1, 4, 6, 7]),
+            Err(Error::ResourceLimit)
+        ));
+        holder.forget().expect("forget");
+        assert!(matches!(
+            holder.open(&[1]),
+            Err(Error::InvalidSessionState)
+        ));
     }
 
     #[test]
