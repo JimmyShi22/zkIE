@@ -20,6 +20,7 @@ use crate::pcs::request::code::{encode_row_fp, CodeParams};
 use crate::pcs::request::field::{E_DEGREE, Fp, Fp3, FP3_BYTES};
 use crate::pcs::request::params::{LEAF_SALT_MAX_BYTES, LEAF_SALT_MIN_BYTES};
 use crate::pcs::request::read::HidingCharge;
+use crate::pcs::request::relation::foldeq_weights;
 use crate::primitives::codec::{CanonicalReader, CanonicalWriter};
 use crate::primitives::transcript::{hash_labeled, tag_word, LEAF_STORED_MAIN};
 
@@ -803,6 +804,139 @@ pub fn commit_table_streaming<S: TableRowSource>(
         leaves,
         peak_bytes: needed as u64,
     })
+}
+
+/// Where fold_table() places the folded row: `rows` rows of `len` entries,
+/// the folded message from entry 0 and the folded tail from `tail_first`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FoldedWant {
+    pub rows: usize,
+    pub len: usize,
+    pub tail_first: usize,
+}
+
+/// A folded row in the caller's table layout. The values are the index space
+/// of `FoldedWant`; zeros fill the unused entries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoldedTable {
+    pub rows: usize,
+    pub len: usize,
+    pub values: Vec<Fp3>,
+}
+
+/// A committed table and its row source. FOLDEQ and its callers fold and open
+/// through this holder: the fold is one pass over the rows and the opening one
+/// pass over the drawn columns, both with the source's bounded buffers; the
+/// complete codewords are never kept. `forget` releases fold state; the stored
+/// tree and salts stay with the table.
+pub struct StreamingHolder<S: TableRowSource> {
+    table: StreamingTable,
+    source: S,
+    peak_bytes: u64,
+}
+
+impl<S: TableRowSource> StreamingHolder<S> {
+    pub fn new(table: StreamingTable, source: S) -> Result<Self> {
+        if source.rows() != table.reader.shape.rows() {
+            return Err(Error::ShapeMismatch);
+        }
+        let peak = table.peak_bytes();
+        Ok(Self {
+            table,
+            source,
+            peak_bytes: peak,
+        })
+    }
+
+    pub fn reader(&self) -> &IndexReader {
+        &self.table.reader
+    }
+
+    pub fn table(&self) -> &StreamingTable {
+        &self.table
+    }
+
+    pub fn peak_bytes(&self) -> u64 {
+        self.peak_bytes
+    }
+
+    /// message[j] = sum_r eq(r, gamma) * message entry j of row r, pads
+    /// included; tail likewise. One row's message and tail are held at a time.
+    pub fn fold(&mut self, gamma: &[Fp3]) -> Result<(Vec<Fp3>, Vec<Fp3>)> {
+        let shape = self.table.reader.shape;
+        if validate_index_shape(&shape).is_err() || gamma.len() != shape.v as usize {
+            return Err(Error::ShapeMismatch);
+        }
+        let eq_gamma = foldeq_weights(gamma, shape.v)?;
+        let rows = shape.rows() as usize;
+        let ell = usize::try_from(shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+        let tail_len = usize::try_from(shape.code.r).map_err(|_| Error::ResourceLimit)?;
+        let mut message = vec![Fp::ZERO; ell];
+        let mut tail = vec![Fp::ZERO; tail_len];
+        let mut folded = vec![Fp3::ZERO; ell];
+        let mut folded_tail = vec![Fp3::ZERO; tail_len];
+        for row in 0..rows {
+            self.source.row(row as u64, &mut message, &mut tail)?;
+            let weight = eq_gamma[row];
+            for (place, value) in message.iter().enumerate() {
+                folded[place] = folded[place].add(&weight.mul(&Fp3::from_base(*value)));
+            }
+            for (place, value) in tail.iter().enumerate() {
+                folded_tail[place] =
+                    folded_tail[place].add(&weight.mul(&Fp3::from_base(*value)));
+            }
+        }
+        let fold_bytes = ((ell + tail_len) * 8 + (ell + tail_len) * 24 + rows * 24) as u64;
+        self.peak_bytes = self.peak_bytes.max(fold_bytes);
+        Ok((folded, folded_tail))
+    }
+
+    /// The same fold placed in the caller's table layout, without a second
+    /// pass over the rows.
+    pub fn fold_table(
+        &mut self,
+        gamma: &[Fp3],
+        want: &FoldedWant,
+    ) -> Result<FoldedTable> {
+        if want.rows == 0 || want.len == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        let (message, tail) = self.fold(gamma)?;
+        let total = want
+            .rows
+            .checked_mul(want.len)
+            .ok_or(Error::ResourceLimit)?;
+        if want.tail_first < message.len()
+            || want
+                .tail_first
+                .checked_add(tail.len())
+                .ok_or(Error::ResourceLimit)?
+                > total
+            || message.len() > total
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut values = vec![Fp3::ZERO; total];
+        values[..message.len()].copy_from_slice(&message);
+        values[want.tail_first..want.tail_first + tail.len()].copy_from_slice(&tail);
+        Ok(FoldedTable {
+            rows: want.rows,
+            len: want.len,
+            values,
+        })
+    }
+
+    /// Recomputes the drawn columns from the source and checks them against
+    /// the stored tree.
+    pub fn open(&mut self, positions: &[u64]) -> Result<Vec<ColumnOpening>> {
+        self.table.open_columns(&mut self.source, positions)
+    }
+
+    /// Releases fold state. This holder keeps no folded row between calls; a
+    /// caller that caches the returned rows drops them itself.
+    pub fn forget(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Check column openings against a reader and return the columns as
@@ -1609,6 +1743,56 @@ mod streaming_tests {
                 .expect("stream open");
             assert_eq!(opened, expected);
         }
+    }
+
+    #[test]
+    fn the_holder_folds_opens_and_places_the_folded_row() {
+        let (shape, configuration, messages, tails, salts) = fixture();
+        let expected_table =
+            commit_table(shape, configuration, &messages, &tails, &salts).expect("in-memory");
+        let mut source = VecSource {
+            messages: messages.clone(),
+            tails: tails.clone(),
+        };
+        let streamed =
+            commit_table_streaming(&mut source, shape, configuration, &salts, 2, u64::MAX)
+                .expect("streaming");
+        let mut holder = StreamingHolder::new(streamed, source).expect("holder");
+        let gamma = vec![Fp3::from_u64(2), Fp3::from_u64(3)];
+        let (folded, folded_tail) = holder.fold(&gamma).expect("fold");
+        let eq = foldeq_weights(&gamma, shape.v).expect("eq");
+        let mut expected = vec![Fp3::ZERO; shape.code.ell as usize];
+        let mut expected_tail = vec![Fp3::ZERO; shape.code.r as usize];
+        for (row, weight) in eq.iter().enumerate() {
+            for (place, value) in messages[row].iter().enumerate() {
+                expected[place] = expected[place].add(&weight.mul(&Fp3::from_base(*value)));
+            }
+            for (place, value) in tails[row].iter().enumerate() {
+                expected_tail[place] =
+                    expected_tail[place].add(&weight.mul(&Fp3::from_base(*value)));
+            }
+        }
+        assert_eq!(folded, expected);
+        assert_eq!(folded_tail, expected_tail);
+        let want = FoldedWant {
+            rows: 5,
+            len: 8,
+            tail_first: 8,
+        };
+        let placed = holder.fold_table(&gamma, &want).expect("fold table");
+        assert_eq!(&placed.values[..folded.len()], folded.as_slice());
+        assert_eq!(
+            &placed.values[want.tail_first..want.tail_first + folded_tail.len()],
+            folded_tail.as_slice()
+        );
+        let positions = [1u64, 4, 6];
+        let opened = holder.open(&positions).expect("open");
+        let expected_open = expected_table.open_columns(&positions).expect("in-memory open");
+        assert_eq!(opened, expected_open);
+        holder.forget().expect("forget");
+        let (again, _) = holder.fold(&gamma).expect("fold again");
+        assert_eq!(again, folded);
+        assert!(holder.peak_bytes() > 0);
     }
 
     #[test]
