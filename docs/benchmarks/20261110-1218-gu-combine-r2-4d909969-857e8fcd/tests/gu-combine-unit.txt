@@ -1,0 +1,11 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/zkie_ops-a527cf57462e281a)
+
+running 4 tests
+test proof::gu_combine_session::tests::shape_mismatch_is_rejected_at_the_adapter ... ok
+test proof::gu_combine_session::tests::a_wrong_declaration_is_still_pending ... ok
+test proof::gu_combine_session::tests::bat_combines_the_frozen_declarations ... ok
+test proof::gu_combine_session::tests::declaration_values_change_the_combination_not_the_challenge ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 58 filtered out; finished in 0.00s
+
