@@ -1235,10 +1235,33 @@ pub struct LimitedChainArtifact {
     pub sealed: Digest,
 }
 
+/// Keeps one physical opening per unique position. Repeats of a draw carry
+/// the same opening; a repeated position with different values is rejected.
+/// The list is sorted by position so the decoder can check the order.
+fn unique_column_openings(openings: &[ColumnOpening]) -> Result<Vec<ColumnOpening>> {
+    if openings.is_empty() {
+        return Err(Error::IncompleteArtifact);
+    }
+    let mut sorted = openings.to_vec();
+    sorted.sort_by_key(|opening| opening.position);
+    let mut unique: Vec<ColumnOpening> = Vec::new();
+    for opening in sorted {
+        match unique.last() {
+            Some(last) if last.position == opening.position => {
+                if *last != opening {
+                    return Err(Error::InvalidProof);
+                }
+            }
+            _ => unique.push(opening),
+        }
+    }
+    Ok(unique)
+}
+
 fn artifact_limits() -> zkie_core::common::codec::DecodeLimits {
     zkie_core::common::codec::DecodeLimits {
-        max_bytes: 1 << 34,
-        max_elements: 1 << 28,
+        max_bytes: 1 << 30,
+        max_elements: 1 << 22,
     }
 }
 
@@ -1609,7 +1632,7 @@ impl LimitedChainArtifact {
             gu_answers: record.gu_answers.clone(),
             omega_root,
             omega_answers: record.omega_answers.clone(),
-            column_openings: record.column_openings.clone(),
+            column_openings: unique_column_openings(&record.column_openings)?,
             fold_start,
             fold_rounds: record.fold_rounds.clone(),
             switches,
@@ -1686,6 +1709,12 @@ impl LimitedChainArtifact {
             .map_err(|_| Error::ResourceLimit)?;
         for _ in 0..opening_count {
             column_openings.push(read_column_opening(&mut reader, limits)?);
+        }
+        if column_openings
+            .windows(2)
+            .any(|pair| pair[0].position >= pair[1].position)
+        {
+            return Err(Error::InvalidEncoding);
         }
         let fold_start = read_fold_start(&mut reader)?;
         let round_count = read_count(&mut reader, limits)?;
@@ -2164,135 +2193,19 @@ pub fn run_limited_shared_to_columns(
         omega_root = Some(omega_provider.root());
         if let Some(old_mask) = old_mask {
         let fold_shape = session.plan().fold;
-        let mut bat = BatStatement::new();
-        bat.add_oracle(BatOracleShape {
-            oracle: 0,
-            main_rows: provider.shape().u.main_rows,
-            mask_rows: provider.shape().u.mask_rows,
-            main_code: Some(provider.shape().u.code),
-            mask_code: provider.shape().u.mask_code,
-            answers: provider.shape().u.answers,
-        })?;
-        bat.add_oracle(BatOracleShape {
-            oracle: 1,
-            main_rows: omega_provider.shape().main_rows,
-            mask_rows: 0,
-            main_code: Some(omega_provider.shape().code),
-            mask_code: None,
-            answers: omega_provider.shape().answers,
-        })?;
-        let sample_g = session
-            .pending_gu_rows()
-            .iter()
-            .find(|row| row.kind == zkie_engine::pcs::request::relation::GuRelationKind::Sample)
-            .ok_or(Error::InvalidSessionState)?;
-        let sample_o = session
-            .omega_rows()
-            .first()
-            .ok_or(Error::InvalidSessionState)?;
-        bat.sample(
-            0,
-            vec![bat_row_from_relation(
-                sample_g,
-                0,
-                provider.shape().u.main_rows,
-                provider.shape().u.code.ell,
-                BatRowKind::Sample,
-            )?],
+        let group_id = session.plan().group_id;
+        let (fold_row, bat_layout) = assemble_limited_fold_row(
+            &mut session,
+            provider.shape(),
+            omega_provider.shape(),
+            fold_shape,
+            group_id,
+            &psi_lo,
+            &zeta,
+            omega.matrix_rows,
+            omega.k_lo,
+            omega_provider.oracle(),
         )?;
-        bat.sample(
-            1,
-            vec![bat_row_from_relation(
-                sample_o,
-                1,
-                omega_provider.shape().main_rows,
-                omega_provider.shape().code.ell,
-                BatRowKind::Sample,
-            )?],
-        )?;
-        let group = bat.new_group(fold_shape.code, fold_shape.mask_code)?;
-        bat.join(group, 0, false)?;
-        bat.join(group, 1, false)?;
-        let mut plain_rows = 0usize;
-        for row in session.pending_gu_rows().iter().filter(|row| {
-            row.kind != zkie_engine::pcs::request::relation::GuRelationKind::Sample
-        }) {
-            bat.add_row(
-                group,
-                bat_row_from_relation(
-                    row,
-                    0,
-                    provider.shape().u.main_rows,
-                    provider.shape().u.code.ell,
-                    BatRowKind::Plain,
-                )?,
-            )?;
-            plain_rows += 1;
-        }
-        // Column draws take their frozen claim slots and targets here; their
-        // coefficient rows are built one at a time after x is drawn, so the
-        // draw set is not retained as dense tables.
-        let column_start = plain_rows;
-        let column_targets = session.column_targets().to_vec();
-        for target in &column_targets {
-            let mut row = BatRow::new(BatRowKind::Plain);
-            row.target = *target;
-            bat.add_row(group, row)?;
-        }
-        bat.add_row(
-            group,
-            bat_lin_fold_row(
-                &provider,
-                &omega_provider,
-                &psi_lo,
-                &zeta,
-                omega.matrix_rows,
-                omega.k_lo,
-            )?,
-        )?;
-        mem("bat-rows");
-        let input = bat.begin_run(group)?;
-        mem("bat-frozen");
-        let x = session.draw_bat_challenge()?;
-        let mut combined = combine(&bat, &input.layout, &input.rows, x)?;
-        mem("bat-combine");
-        let mut power = Fp3::ONE;
-        for _ in 0..column_start {
-            power = power.mul(&x);
-        }
-        for (draw, target) in column_targets.iter().enumerate() {
-            let at = column_start
-                .checked_add(draw)
-                .ok_or(Error::ResourceLimit)?;
-            let frozen = input.rows.get(at).ok_or(Error::StatementMismatch)?;
-            if frozen.target != *target
-                || !frozen.terms.is_empty()
-                || !frozen.units.is_empty()
-                || !frozen.runs.is_empty()
-                || !frozen.forms.is_empty()
-            {
-                return Err(Error::StatementMismatch);
-            }
-            let row = session.column_relation_row(draw)?;
-            if row.target != *target {
-                return Err(Error::StatementMismatch);
-            }
-            carry_compact_table(
-                &bat,
-                &input.layout,
-                0,
-                &row.main,
-                provider.shape().u.main_rows,
-                provider.shape().u.code.ell,
-                power,
-                &mut combined,
-            )?;
-            power = power.mul(&x);
-        }
-        mem("bat-columns");
-        let mut fold_row = bat.to_fold_input_row(&combined, &input.layout)?;
-        fold_row.group = session.plan().group_id;
-        fold_row.members = vec![provider.shape().oracle, omega_provider.oracle()];
         let prover_row = fold_row.clone();
         session.fold_bind_row(fold_row)?;
         session.start_fold(setup.mask.message())?;
@@ -2304,7 +2217,7 @@ pub fn run_limited_shared_to_columns(
             .fold_layout
             .clone()
             .ok_or(Error::InvalidConfig)?;
-        let main_messages = group_main_messages(&provider, &omega_provider, &input.layout)?;
+        let main_messages = group_main_messages(&provider, &omega_provider, &bat_layout)?;
         let old_mu = old_mask.mu()?;
     let mut prover = FoldProverSession::new(
             &fold_shape,
@@ -2526,6 +2439,481 @@ pub fn run_limited_shared_to_columns(
         transcript,
         record,
     })
+}
+
+/// The public part of one switch input: the target, the tree plan and the
+/// optional following stage FOLD shape. Private tails, salts and pads are not
+/// copied into the verifier plan.
+#[derive(Clone, Debug)]
+pub struct LimitedStageFoldPlan {
+    pub shape: FoldShape,
+    pub layout: FoldGroupLayout,
+    pub mask_tree: MaskTreePlan,
+    pub group: u64,
+    pub member: u64,
+    pub fresh: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct LimitedSwitchPlan {
+    pub target: SwitchTarget,
+    pub plan: RuntimeTreePlan,
+    pub stage_fold: Option<LimitedStageFoldPlan>,
+}
+
+impl LimitedSwitchPlan {
+    pub fn from_inputs(mut inputs: Option<&LimitedSwitchInputs>) -> Vec<Self> {
+        let mut plans = Vec::new();
+        while let Some(input) = inputs {
+            plans.push(Self {
+                target: input.target.clone(),
+                plan: input.plan.clone(),
+                stage_fold: input.stage_fold.as_ref().map(|spec| LimitedStageFoldPlan {
+                    shape: spec.shape,
+                    layout: spec.layout.clone(),
+                    mask_tree: spec.mask_tree.clone(),
+                    group: spec.group,
+                    member: spec.member,
+                    fresh: spec.fresh,
+                }),
+            });
+            inputs = input.next.as_deref();
+        }
+        plans
+    }
+}
+
+/// Replays the whole chain from the public setup, the public switch plans and
+/// the artifact messages. The replay builds only zero coefficient vectors of
+/// the required shapes; every claim used for a check is recomputed from the
+/// verifier session or the artifact. Returns the final seal.
+pub fn verify_limited_chain(
+    setup: &LimitedSharedSession,
+    trusted: &LimitedKeyStatement,
+    switches: &[LimitedSwitchPlan],
+    old_mask_plan: Option<MaskTreePlan>,
+    old_mask_root: Option<Digest>,
+    artifact: &LimitedChainArtifact,
+) -> Result<Digest> {
+    if artifact.switches.len() != switches.len() {
+        return Err(Error::IncompleteArtifact);
+    }
+    let (session, fold_output) = verify_limited_fold(setup, trusted, artifact)?;
+    let mut chain = session.take_chain_for_base()?;
+    let initial_fresh_plan = setup.mask.tree().plan.clone();
+    let mut stage = public_initial_basis(setup, artifact, &fold_output, &initial_fresh_plan)?;
+    let mut last_plan = None;
+    let mut last_root = None;
+    let mut last_claims = None;
+    let mut last_target = None;
+    for (index, plan) in switches.iter().enumerate() {
+        let record = artifact
+            .switches
+            .get(index)
+            .ok_or(Error::IncompleteArtifact)?;
+        let target = plan.target.clone();
+        let source = if index == 0 {
+            OldMaskSource::Tree {
+                plan: old_mask_plan.clone().ok_or(Error::IncompleteArtifact)?,
+                root: old_mask_root.ok_or(Error::IncompleteArtifact)?,
+            }
+        } else {
+            OldMaskSource::Member
+        };
+        if index == 0 && record.old_mask_root != old_mask_root {
+            return Err(Error::InvalidProof);
+        }
+        if index > 0 && record.old_mask_opening.is_some() {
+            return Err(Error::InvalidProof);
+        }
+        let u = GuOracleShape {
+            code: target.code,
+            main_rows: target.main_rows,
+            main_deg: 3,
+            mask_rows: target.mask_rows,
+            mask_code: Some(target.mask_code),
+            answers: target.answers,
+        };
+        let identity = fold_identity(&stage.0);
+        if record.identity != identity {
+            return Err(Error::InvalidProof);
+        }
+        let mut cs = CsMultiSession::new(
+            chain.clone(),
+            stage.0.clone(),
+            stage.1.clone(),
+            target.clone(),
+            u,
+            plan.plan.clone(),
+            source,
+        )?;
+        cs.receive_declarations(record.identity, record.declared_root)?;
+        cs.draw_sample_seed()?;
+        cs.receive_answer(record.sample_answer)?;
+        cs.draw_positions_theta(2)?;
+        let claims = cs
+            .authenticate_and_register(
+                &record.member_openings,
+                &record.fresh_opening,
+                record.old_mask_opening.as_ref(),
+            )?
+            .clone();
+        chain = cs.into_chain();
+        last_plan = Some(plan.plan.clone());
+        last_root = Some(record.declared_root);
+        last_target = Some(target);
+        last_claims = Some(claims.clone());
+        if let Some(spec) = &plan.stage_fold {
+            let record_stage = record
+                .stage_fold
+                .as_ref()
+                .ok_or(Error::IncompleteArtifact)?;
+            let row = FoldInputRow {
+                group: spec.group,
+                k: spec.shape.k,
+                h: spec.shape.h,
+                members: vec![spec.member],
+                coefficients: claims.combined.main.clone(),
+                mask_coefficients: claims.combined.mask.clone(),
+                kept: Vec::new(),
+                target: claims.combined.target,
+            };
+            let (new_chain, output) = verify_stage_fold(chain, spec, &row, record_stage)?;
+            chain = new_chain;
+            stage = public_stage_basis(
+                spec,
+                &output,
+                record.declared_root,
+                plan.plan.clone(),
+                record_stage.start.root,
+            )?;
+        } else if index + 1 < switches.len() {
+            return Err(Error::IncompleteArtifact);
+        }
+    }
+    let claims = last_claims.ok_or(Error::IncompleteArtifact)?;
+    let target = last_target.ok_or(Error::IncompleteArtifact)?;
+    let final_plan = last_plan.ok_or(Error::IncompleteArtifact)?;
+    let final_root = last_root.ok_or(Error::IncompleteArtifact)?;
+    if artifact.base_proof.is_empty() || target.main_rows != 1 || target.mask_rows != 1 {
+        return Err(Error::IncompleteArtifact);
+    }
+    let ell = usize::try_from(target.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let r = usize::try_from(target.code.r).map_err(|_| Error::ResourceLimit)?;
+    let mask_ell = usize::try_from(target.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
+    let mask_r = usize::try_from(target.mask_code.r).map_err(|_| Error::ResourceLimit)?;
+    let rows = SingleRows {
+        code: target.code,
+        mask_code: target.mask_code,
+        main: vec![Fp3::ZERO; ell],
+        main_tail: vec![Fp3::ZERO; r],
+        masks: vec![vec![Fp3::ZERO; mask_ell]],
+        mask_tails: vec![vec![Fp3::ZERO; mask_r]],
+        claim: claims.combined.main.clone(),
+        mask_claims: vec![claims.combined.mask.clone()],
+        target: claims.combined.target,
+    };
+    rows.check()?;
+    let verifier = LastBaseSession::new(
+        chain,
+        rows,
+        final_plan,
+        final_root,
+        setup.base.plan.clone(),
+    )?;
+    let sealed = verify_last_base_proof(verifier, setup.base.positions, &artifact.base_proof)?;
+    if sealed != artifact.sealed {
+        return Err(Error::InvalidProof);
+    }
+    Ok(sealed)
+}
+
+fn public_initial_basis(
+    setup: &LimitedSharedSession,
+    artifact: &LimitedChainArtifact,
+    output: &FoldOutput,
+    fresh_plan: &MaskTreePlan,
+) -> Result<(FoldHandoff, FoldBasis)> {
+    let layout = setup
+        .plan
+        .fold_layout
+        .clone()
+        .ok_or(Error::InvalidConfig)?;
+    let anchor = FoldHandoffAnchor {
+        shape: setup.plan.fold,
+        group: setup.plan.group_id,
+        members: layout.members.iter().map(|member| member.oracle).collect(),
+        fresh: LM_HEAD_FRESH_MASK,
+        fresh_root: artifact.fold_start.root,
+        tree_number: artifact.fold_start.tree_number,
+        layout: layout.clone(),
+        fold_gamma: output.gamma.clone(),
+        fold_epsilon: output.eps,
+        fold_sum: output.sum,
+    };
+    let handoff = FoldHandoff::from_output(output, &anchor)?;
+    let mut members = Vec::with_capacity(layout.members.len());
+    for member in &layout.members {
+        if let Some(gu) = setup.plan.gu.as_ref() {
+            if member.oracle == gu.oracle {
+                members.push(FoldMember {
+                    oracle: member.oracle,
+                    main_code: gu.u.code,
+                    mask_code: handoff.mask_code,
+                    root: artifact.gu_root,
+                    tree: gu.tree.clone(),
+                });
+                continue;
+            }
+        }
+        if let Some(omega) = setup.plan.omega.as_ref() {
+            if member.oracle == omega.oracle {
+                members.push(FoldMember {
+                    oracle: member.oracle,
+                    main_code: omega.u.code,
+                    mask_code: handoff.mask_code,
+                    root: artifact.omega_root.ok_or(Error::IncompleteArtifact)?,
+                    tree: omega.tree.clone(),
+                });
+                continue;
+            }
+        }
+        return Err(Error::StatementMismatch);
+    }
+    let basis = FoldBasis {
+        layout: handoff.layout.clone(),
+        fresh_root: handoff.fresh_root,
+        fresh_tree: fresh_plan.clone(),
+        members,
+    };
+    Ok((handoff, basis))
+}
+
+fn public_stage_basis(
+    spec: &LimitedStageFoldPlan,
+    output: &FoldOutput,
+    member_root: Digest,
+    member_plan: RuntimeTreePlan,
+    fresh_root: Digest,
+) -> Result<(FoldHandoff, FoldBasis)> {
+    let anchor = FoldHandoffAnchor {
+        shape: spec.shape,
+        group: spec.group,
+        members: vec![spec.member],
+        fresh: spec.fresh,
+        fresh_root,
+        tree_number: spec.mask_tree.tree_number,
+        layout: spec.layout.clone(),
+        fold_gamma: output.gamma.clone(),
+        fold_epsilon: output.eps,
+        fold_sum: output.sum,
+    };
+    let handoff = FoldHandoff::from_output(output, &anchor)?;
+    let basis = FoldBasis {
+        layout: handoff.layout.clone(),
+        fresh_root: handoff.fresh_root,
+        fresh_tree: spec.mask_tree.clone(),
+        members: vec![FoldMember {
+            oracle: spec.member,
+            main_code: spec.shape.code,
+            mask_code: handoff.mask_code,
+            root: member_root,
+            tree: member_plan,
+        }],
+    };
+    Ok((handoff, basis))
+}
+
+fn verify_stage_fold(
+    mut chain: Chain,
+    spec: &LimitedStageFoldPlan,
+    row: &FoldInputRow,
+    record: &LimitedStageFoldArtifact,
+) -> Result<(Chain, FoldOutput)> {
+    let metadata = OracleMetadata {
+        id: spec.fresh,
+        group: spec.group,
+        tree_number: spec.mask_tree.tree_number,
+        leaf_class: spec.mask_tree.leaf_class,
+        mask_rows: spec.mask_tree.mask_rows,
+        mask_code: spec.shape.mask_code,
+    };
+    let statement = Arc::new(VerifiedStatement::new(
+        VerifiedGroups {
+            groups: vec![VerifiedGroup {
+                group: spec.group,
+                members: vec![spec.member],
+                fresh: Some(spec.fresh),
+                code: None,
+                mask_code: None,
+            }],
+        },
+        vec![spec.mask_tree.clone()],
+        vec![metadata],
+    )?);
+    let mask_oracle = MaskOracle {
+        id: spec.fresh,
+        claimed_group: spec.group,
+        main_rows: 0,
+        mask_rows: spec.mask_tree.mask_rows,
+        mask_code: spec.shape.mask_code,
+        answers: 0,
+        sampled: false,
+    };
+    let mut oracles = RuntimeOracles::default();
+    oracles.receive_mask(
+        &statement,
+        &spec.mask_tree,
+        spec.fresh,
+        &fold_mask_notice(&spec.shape)?,
+        record.start.root,
+    )?;
+    fold_start_verify(&spec.shape, &record.start, &statement, &oracles)?;
+    let mut message = chain.message();
+    message.push_u64(record.start.id);
+    message.push_u64(record.start.claimed_group);
+    message.push_u64(record.start.notice.mask_rows);
+    message.push_u64(record.start.notice.mask_code.log_n as u64);
+    message.push_u64(record.start.notice.mask_code.ell);
+    message.push_u64(record.start.notice.mask_code.r);
+    message.push_u64(record.start.notice.answers as u64);
+    message.push_u64(record.start.notice.leaf_class as u64);
+    for chunk in record.start.root.0.chunks(8) {
+        let word = u64::from_le_bytes(chunk.try_into().map_err(|_| Error::InvalidEncoding)?);
+        message.push_u64(word);
+    }
+    message.push_fp3(&record.start.sum);
+    let prefix = message.prefix(KIND_EPSILON, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    let eps = chain.draw_e()?;
+    if record.rounds.len() != spec.shape.k as usize {
+        return Err(Error::InvalidProof);
+    }
+    let mut claim = FoldRoundVerifier::new(record.start.sum, eps, row.target);
+    let mut gammas = Vec::with_capacity(record.rounds.len());
+    for (first, second) in &record.rounds {
+        let mut message = chain.message();
+        message.push_fp3(first);
+        message.push_fp3(second);
+        let prefix = message.prefix(KIND_ALGEBRAIC, 0)?;
+        if !chain.step(&prefix, 0)? {
+            return Err(Error::InvalidProof);
+        }
+        let gamma = chain.draw_e()?;
+        claim.round(*first, *second, gamma);
+        gammas.push(gamma);
+    }
+    let output = fold_output(
+        &spec.shape,
+        &spec.layout,
+        row,
+        record.start.id,
+        record.start.root,
+        record.start.tree_number,
+        eps,
+        record.start.sum,
+        &gammas,
+        claim.claim(),
+    )?;
+    if output.fresh_root != record.start.root || output.sum != record.start.sum {
+        return Err(Error::InvalidProof);
+    }
+    Ok((chain, output))
+}
+
+/// Replays the shared part of the chain from public inputs and the artifact
+/// messages, then verifies the first FOLD. The only constructed coefficients
+/// are zeros of the shape's length: the claim vector itself is a prover
+/// witness, while the target is recomputed from the public claim targets and
+/// the drawn challenge.
+pub fn verify_limited_fold(
+    setup: &LimitedSharedSession,
+    trusted: &LimitedKeyStatement,
+    artifact: &LimitedChainArtifact,
+) -> Result<(FoldeqSession, FoldOutput)> {
+    if artifact.statement != *trusted {
+        return Err(Error::InvalidProof);
+    }
+    if artifact.column_openings.is_empty()
+        || artifact.column_openings.len() > setup.plan.column_draws
+        || artifact.fold_rounds.len() != setup.plan.fold.k as usize
+    {
+        return Err(Error::InvalidProof);
+    }
+    let mut session = FoldeqSession::open(
+        setup.plan.clone(),
+        setup.binder.clone(),
+        setup.chain.clone(),
+    )?;
+    session.bind_first_query(&setup.first_query)?;
+    session.draw_gamma()?;
+    session.send_gu(&artifact.gu_root)?;
+    session.shared_seeds()?;
+    for answer in &artifact.gu_answers {
+        session.receive_gu_answer(*answer)?;
+    }
+    session.join_gu_record()?;
+    session.draw_queries()?;
+    let mut openings = Vec::with_capacity(session.queries().len());
+    for query in session.queries() {
+        let at = artifact
+            .column_openings
+            .binary_search_by_key(query, |opening| opening.position)
+            .map_err(|_| Error::InvalidProof)?;
+        openings.push(artifact.column_openings[at].clone());
+    }
+    session.read_queries(&openings)?;
+    session.join_gu_read_columns()?;
+    let mut zeta = Vec::new();
+    if let Some(root) = artifact.omega_root {
+        session.send_omega(&root)?;
+        session.omega_seeds()?;
+        for answer in &artifact.omega_answers {
+            session.receive_omega_answer(*answer)?;
+        }
+        session.join_omega()?;
+        zeta = session.draw_zeta()?;
+    } else if !artifact.omega_answers.is_empty() {
+        return Err(Error::IncompleteArtifact);
+    }
+    let gu = setup.plan.gu.as_ref().ok_or(Error::InvalidConfig)?;
+    let omega_plan = setup.plan.omega.as_ref().ok_or(Error::InvalidConfig)?;
+    let psi_lo: Vec<Fp3> = match session.psi() {
+        Some(psi) => psi
+            .get(..omega_plan.k_lo as usize)
+            .ok_or(Error::ShapeMismatch)?
+            .to_vec(),
+        None if omega_plan.k_lo == 0 => Vec::new(),
+        None => return Err(Error::StatementMismatch),
+    };
+    let (row, _) = assemble_limited_fold_row(
+        &mut session,
+        gu,
+        &omega_plan.u,
+        setup.plan.fold,
+        setup.plan.group_id,
+        &psi_lo,
+        &zeta,
+        omega_plan.matrix_rows,
+        omega_plan.k_lo,
+        omega_plan.oracle,
+    )?;
+    session.fold_bind_row(row)?;
+    session.start_fold(&artifact.fold_start)?;
+    session.fold_rounds_start()?;
+    for (first, second) in &artifact.fold_rounds {
+        session.receive_fold_round(*first, *second)?;
+    }
+    let output = session.fold_finish()?;
+    if output.sum != artifact.fold_start.sum
+        || output.fresh_root != artifact.fold_start.root
+        || output.tree_number != artifact.fold_start.tree_number
+    {
+        return Err(Error::InvalidProof);
+    }
+    Ok((session, output))
 }
 
 /// Builds the FOLD group's input row from the real G_u and Omega messages.
@@ -2857,15 +3245,163 @@ fn bat_row_from_relation(
 /// The LIN fold row as BAT terms: Omega at eq(zeta, row) on its leading
 /// slots, and the folded row at eq(psi_lo, place) * eq(zeta, row) through the
 /// trusted G_u layout.
+/// Builds the FOLD input row from the public claim set and the BAT challenge.
+/// Sample and record rows come from the verifier session, column rows from the
+/// verified openings, and the LIN row from the public psi/zeta weights. Both
+/// the prover driver and the independent verifier use this function, so the
+/// handoff is derived from the same declarations and challenge.
+#[allow(clippy::too_many_arguments)]
+fn assemble_limited_fold_row(
+    session: &mut FoldeqSession,
+    gu: &GuShape,
+    omega: &GuOracleShape,
+    fold_shape: FoldShape,
+    group_id: u64,
+    psi_lo: &[Fp3],
+    zeta: &[Fp3],
+    matrix_rows: u64,
+    k_lo: u32,
+    omega_oracle_id: u64,
+) -> Result<(FoldInputRow, zkie_engine::pcs::request::bat::BatGroupLayout)> {
+    let mut bat = BatStatement::new();
+    bat.add_oracle(BatOracleShape {
+        oracle: 0,
+        main_rows: gu.u.main_rows,
+        mask_rows: gu.u.mask_rows,
+        main_code: Some(gu.u.code),
+        mask_code: gu.u.mask_code,
+        answers: gu.u.answers,
+    })?;
+    bat.add_oracle(BatOracleShape {
+        oracle: 1,
+        main_rows: omega.main_rows,
+        mask_rows: 0,
+        main_code: Some(omega.code),
+        mask_code: None,
+        answers: omega.answers,
+    })?;
+    let mut gu_samples = Vec::new();
+    let mut plain = Vec::new();
+    for row in session.pending_gu_rows() {
+        match row.kind {
+            zkie_engine::pcs::request::relation::GuRelationKind::Sample => {
+                gu_samples.push(bat_row_from_relation(
+                    row,
+                    0,
+                    gu.u.main_rows,
+                    gu.u.code.ell,
+                    BatRowKind::Sample,
+                )?);
+            }
+            zkie_engine::pcs::request::relation::GuRelationKind::Record => {
+                plain.push(bat_row_from_relation(
+                    row,
+                    0,
+                    gu.u.main_rows,
+                    gu.u.code.ell,
+                    BatRowKind::Plain,
+                )?);
+            }
+            zkie_engine::pcs::request::relation::GuRelationKind::Column => {
+                return Err(Error::InvalidSessionState);
+            }
+        }
+    }
+    if gu_samples.len() != gu.u.answers as usize {
+        return Err(Error::ShapeMismatch);
+    }
+    bat.sample(0, gu_samples)?;
+    let mut omega_samples = Vec::new();
+    for row in session.omega_rows() {
+        if row.kind != zkie_engine::pcs::request::relation::GuRelationKind::Sample {
+            return Err(Error::InvalidSessionState);
+        }
+        omega_samples.push(bat_row_from_relation(
+            row,
+            1,
+            omega.main_rows,
+            omega.code.ell,
+            BatRowKind::Sample,
+        )?);
+    }
+    if omega_samples.len() != omega.answers as usize {
+        return Err(Error::ShapeMismatch);
+    }
+    bat.sample(1, omega_samples)?;
+    let group = bat.new_group(fold_shape.code, fold_shape.mask_code)?;
+    bat.join(group, 0, false)?;
+    bat.join(group, 1, false)?;
+    let mut plain_rows = 0usize;
+    for row in plain {
+        bat.add_row(group, row)?;
+        plain_rows += 1;
+    }
+    let column_start = plain_rows;
+    let column_targets = session.column_targets().to_vec();
+    for target in &column_targets {
+        let mut row = BatRow::new(BatRowKind::Plain);
+        row.target = *target;
+        bat.add_row(group, row)?;
+    }
+    bat.add_row(
+        group,
+        bat_lin_fold_row(gu, omega, psi_lo, zeta, matrix_rows, k_lo)?,
+    )?;
+    mem("bat-rows");
+    let input = bat.begin_run(group)?;
+    mem("bat-frozen");
+    let x = session.draw_bat_challenge()?;
+    let mut combined = combine(&bat, &input.layout, &input.rows, x)?;
+    mem("bat-combine");
+    let mut power = Fp3::ONE;
+    for _ in 0..column_start {
+        power = power.mul(&x);
+    }
+    for (draw, target) in column_targets.iter().enumerate() {
+        let at = column_start
+            .checked_add(draw)
+            .ok_or(Error::ResourceLimit)?;
+        let frozen = input.rows.get(at).ok_or(Error::StatementMismatch)?;
+        if frozen.target != *target
+            || !frozen.terms.is_empty()
+            || !frozen.units.is_empty()
+            || !frozen.runs.is_empty()
+            || !frozen.forms.is_empty()
+        {
+            return Err(Error::StatementMismatch);
+        }
+        let row = session.column_relation_row(draw)?;
+        if row.target != *target {
+            return Err(Error::StatementMismatch);
+        }
+        carry_compact_table(
+            &bat,
+            &input.layout,
+            0,
+            &row.main,
+            gu.u.main_rows,
+            gu.u.code.ell,
+            power,
+            &mut combined,
+        )?;
+        power = power.mul(&x);
+    }
+    mem("bat-columns");
+    let mut fold_row = bat.to_fold_input_row(&combined, &input.layout)?;
+    fold_row.group = group_id;
+    fold_row.members = vec![gu.oracle, omega_oracle_id];
+    Ok((fold_row, input.layout))
+}
+
 fn bat_lin_fold_row(
-    gu: &LmHeadGuProvider,
-    omega: &LmHeadOmegaProvider,
+    gu: &GuShape,
+    omega: &GuOracleShape,
     psi_lo: &[Fp3],
     zeta: &[Fp3],
     matrix_rows: u64,
     k_lo: u32,
 ) -> Result<BatRow> {
-    let shape = gu.shape();
+    let shape = gu;
     let k_row = bit_count(matrix_rows);
     if !matrix_rows.is_power_of_two() || zeta.len() != k_row as usize {
         return Err(Error::ShapeMismatch);
@@ -2900,7 +3436,7 @@ fn bat_lin_fold_row(
         let at = real_row + (real_place << row_bits);
         gu_values[at] = gu_values[at].sub(&weight);
     }
-    let omega_ell = usize::try_from(omega.shape().code.ell).map_err(|_| Error::ResourceLimit)?;
+    let omega_ell = usize::try_from(omega.code.ell).map_err(|_| Error::ResourceLimit)?;
     let mut omega_values = vec![Fp3::ZERO; omega_ell];
     for (row, weight) in eq_zeta.iter().enumerate().take(matrix_rows as usize) {
         if row >= omega_values.len() {
@@ -4242,6 +4778,30 @@ mod tests {
     }
 
     #[test]
+    fn repeated_column_openings_are_stored_once() {
+        let first = ColumnOpening {
+            position: 1,
+            salt: vec![1],
+            symbols: vec![Fp::from_u64(2)],
+            path: vec![Digest([3; 32])],
+        };
+        let same = first.clone();
+        let unique = unique_column_openings(&[first.clone(), same]).expect("unique");
+        assert_eq!(unique.len(), 1);
+        let mut changed = first.clone();
+        changed.symbols[0] = Fp::from_u64(9);
+        assert!(unique_column_openings(&[first.clone(), changed]).is_err());
+        let second = ColumnOpening {
+            position: 2,
+            ..first.clone()
+        };
+        let unique = unique_column_openings(&[first, second]).expect("unique");
+        assert_eq!(unique.len(), 2);
+        assert_eq!(unique[0].position, 1);
+        assert_eq!(unique[1].position, 2);
+    }
+
+    #[test]
     fn an_incomplete_record_has_no_artifact() {
         let statement = test_statement();
         let record = LimitedChainRecord::default();
@@ -5556,6 +6116,7 @@ mod tests {
             &mask_randomness,
         )
         .expect("session");
+        let verify_reader = holder.reader().clone();
         let gu_shape = session
             .plan
             .gu
@@ -5632,6 +6193,9 @@ mod tests {
             &session.base,
         )
         .expect("stage chain");
+        let verify_plans = LimitedSwitchPlan::from_inputs(switches.as_ref());
+        let old_mask_plan = old_mask.tree_plan();
+        let old_mask_root = old_mask.root();
         let mut source = HolderSharedSource::new(holder, gu_randomness);
         let prove_start = Instant::now();
         let result = run_limited_shared_to_columns(
@@ -5644,10 +6208,155 @@ mod tests {
         .expect("real chain");
         let prove_wall = prove_start.elapsed();
         let prove_hwm = vm_hwm_kb();
+        // A second public-only setup is used by the independent fold replay;
+        // the private mask provider it carries is never read by the verifier.
+        let verify_session = build_limited_shared_session_for_context(
+            &context,
+            &request_plan,
+            &compiled,
+            &masked,
+            &verify_reader,
+            random_digest_bytes,
+            &mask_randomness,
+        )
+        .expect("verify session");
+        let artifact = LimitedChainArtifact::from_record(&masked, &result.record)
+            .expect("artifact");
+        let artifact_bytes = artifact.encode();
+        let unique_count = unique_sorted(&result.queries).len();
+        let symbol_bytes: usize = artifact
+            .column_openings
+            .iter()
+            .map(|opening| 8 * opening.symbols.len())
+            .sum();
+        let path_bytes: usize = artifact
+            .column_openings
+            .iter()
+            .map(|opening| 32 * opening.path.len())
+            .sum();
+        let opening_bytes: usize = artifact
+            .column_openings
+            .iter()
+            .map(|opening| {
+                8 + 8
+                    + opening.salt.len()
+                    + 8
+                    + 8 * opening.symbols.len()
+                    + 8
+                    + 32 * opening.path.len()
+            })
+            .sum();
+        eprintln!(
+            "artifact breakdown: total {} openings {} unique {} opening_bytes {} symbol_bytes {} path_bytes {} base {} switches {}",
+            artifact_bytes.len(),
+            artifact.column_openings.len(),
+            unique_count,
+            opening_bytes,
+            symbol_bytes,
+            path_bytes,
+            artifact.base_proof.len(),
+            artifact.switches.len(),
+        );
+        let _ = std::fs::write(
+            std::env::temp_dir().join("zkie-lm-head-artifact.bin"),
+            &artifact_bytes,
+        );
+        let decoded = LimitedChainArtifact::decode(&artifact_bytes).expect("artifact decode");
+        let verified_seal = verify_limited_chain(
+            &verify_session,
+            &masked,
+            &verify_plans,
+            Some(old_mask_plan),
+            Some(old_mask_root),
+            &decoded,
+        )
+        .expect("independent verify");
+        let prover_fold = result.fold_output.as_ref().expect("fold output");
+        assert_eq!(prover_fold.fresh_root, decoded.fold_start.root);
+        assert_eq!(verified_seal, decoded.sealed);
+
+        let verify = |artifact: &LimitedChainArtifact| {
+            verify_limited_chain(
+                &verify_session,
+                &masked,
+                &verify_plans,
+                Some(old_mask_plan.clone()),
+                Some(old_mask_root),
+                artifact,
+            )
+        };
+        let mut wrong_statement = decoded.clone();
+        wrong_statement.statement.table_root = Digest([0x77; 32]);
+        assert!(verify(&wrong_statement).is_err());
+        let mut wrong_gu_root = decoded.clone();
+        wrong_gu_root.gu_root = Digest([0x78; 32]);
+        assert!(verify(&wrong_gu_root).is_err());
+        let mut wrong_omega_root = decoded.clone();
+        wrong_omega_root.omega_root = Some(Digest([0x79; 32]));
+        assert!(verify(&wrong_omega_root).is_err());
+        let mut wrong_column = decoded.clone();
+        wrong_column.column_openings[0].path[0] = Digest([0x7a; 32]);
+        assert!(verify(&wrong_column).is_err());
+        let mut wrong_round = decoded.clone();
+        wrong_round.fold_rounds[0].0 = wrong_round.fold_rounds[0].0.add(&Fp3::ONE);
+        assert!(verify(&wrong_round).is_err());
+        let mut wrong_identity = decoded.clone();
+        wrong_identity.switches[0].identity = Digest([0x7b; 32]);
+        assert!(verify(&wrong_identity).is_err());
+        let mut wrong_declared = decoded.clone();
+        wrong_declared.switches[0].declared_root = Digest([0x7c; 32]);
+        assert!(verify(&wrong_declared).is_err());
+        let mut wrong_member = decoded.clone();
+        wrong_member.switches[0].member_openings[0].columns[0].symbols[0] =
+            wrong_member.switches[0].member_openings[0].columns[0].symbols[0] + Fp::ONE;
+        assert!(verify(&wrong_member).is_err());
+        let mut wrong_order = decoded.clone();
+        wrong_order.switches.swap(0, 1);
+        assert!(verify(&wrong_order).is_err());
+        let mut missing_switch = decoded.clone();
+        missing_switch.switches.pop();
+        assert!(verify(&missing_switch).is_err());
+        let mut missing_stage = decoded.clone();
+        missing_stage.switches[0].stage_fold = None;
+        assert!(verify(&missing_stage).is_err());
+        let mut missing_answer = decoded.clone();
+        missing_answer.gu_answers.clear();
+        assert!(verify(&missing_answer).is_err());
+        let mut wrong_answer = decoded.clone();
+        wrong_answer.gu_answers[0] = wrong_answer.gu_answers[0].add(&Fp3::ONE);
+        assert!(verify(&wrong_answer).is_err());
+        let mut over_budget = decoded.clone();
+        over_budget.column_openings.push(ColumnOpening {
+            position: u64::MAX,
+            salt: Vec::new(),
+            symbols: Vec::new(),
+            path: Vec::new(),
+        });
+        assert!(verify(&over_budget).is_err());
+
+        let mut version = decoded.encode();
+        version[0] ^= 1;
+        assert!(LimitedChainArtifact::decode(&version).is_err());
+        let mut trailing = decoded.encode();
+        trailing.push(0);
+        assert!(LimitedChainArtifact::decode(&trailing).is_err());
+        let mut truncated = decoded.encode();
+        truncated.truncate(truncated.len() - 8);
+        assert!(LimitedChainArtifact::decode(&truncated).is_err());
+        let mut wrong_statement = decoded.clone();
+        wrong_statement.statement.model_commitment = Digest([0xee; 32]);
+        assert!(verify_limited_fold(&verify_session, &masked, &wrong_statement).is_err());
+        let mut wrong_opening = decoded.clone();
+        wrong_opening.column_openings[0].symbols[0] =
+            wrong_opening.column_openings[0].symbols[0] + Fp::ONE;
+        assert!(verify_limited_fold(&verify_session, &masked, &wrong_opening).is_err());
+        let mut missing_opening = decoded.clone();
+        missing_opening.column_openings.pop();
+        assert!(verify_limited_fold(&verify_session, &masked, &missing_opening).is_err());
         let sealed = result.sealed.expect("sealed");
         let proof = result.base_proof.expect("base proof");
         eprintln!(
-            "real lm head: commit {:?} prove {:?} hwm_commit_kb {} hwm_prove_kb {} store_written {} store_read {} store_len {} base_proof {} sealed {:?}",
+            "real lm head: commit {:?} prove {:?} hwm_commit_kb {} hwm_prove_kb {} store_written {} store_read {} store_len {} base_proof {} artifact_bytes {} sealed {:?}",
             commit_wall,
             prove_wall,
             commit_hwm,
@@ -5656,6 +6365,7 @@ mod tests {
             store_read,
             store_len,
             proof.len(),
+            artifact_bytes.len(),
             sealed
         );
         assert_ne!(sealed, Digest::ZERO);

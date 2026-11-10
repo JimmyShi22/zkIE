@@ -84,7 +84,9 @@ use zkie_engine::pcs::request::foldeq::{
 use zkie_engine::pcs::request::gu::{GuOracleShape, GuShape};
 use zkie_engine::pcs::request::params::{RequestParams, LEAF_SALT_MIN_BYTES, REQUEST_CHAIN_LABEL};
 use zkie_engine::pcs::request::read::{unique_sorted, HidingState, ReadLedger};
-use zkie_engine::pcs::request::relation::{foldeq_weights, GuRelationKind, GuRelationRow};
+use zkie_engine::pcs::request::relation::{foldeq_weights, GuRelationRow};
+#[cfg(test)]
+use zkie_engine::pcs::request::relation::GuRelationKind;
 use zkie_engine::pcs::request::runtime_tree::{MaskTreePlan, RuntimeTreePart, RuntimeTreePlan};
 use std::cell::RefCell;
 
