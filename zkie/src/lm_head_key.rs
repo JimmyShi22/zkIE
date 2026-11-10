@@ -2724,6 +2724,11 @@ pub fn verify_limited_chain(
     {
         return Err(Error::IncompleteArtifact);
     }
+    let provided_targets: Vec<SwitchTarget> =
+        switches.iter().map(|plan| plan.target.clone()).collect();
+    if provided_targets != setup.switches {
+        return Err(Error::InvalidProof);
+    }
     let (session, fold_output) = verify_limited_fold(setup, trusted, artifact)?;
     let mut chain = session.take_chain_for_base()?;
     let initial_fresh_plan = setup.fresh_plan.clone();
@@ -6553,6 +6558,17 @@ mod tests {
                 artifact,
             )
         };
+        let mut wrong_target = verify_plans.clone();
+        wrong_target[0].target = verify_setup.switches[1].clone();
+        assert!(verify_limited_chain(
+            &verify_setup,
+            &masked,
+            &wrong_target,
+            Some(old_mask_plan.clone()),
+            Some(old_mask_root),
+            &decoded,
+        )
+        .is_err());
         let mut wrong_statement = decoded.clone();
         wrong_statement.statement.table_root = Digest([0x77; 32]);
         assert!(verify(&wrong_statement).is_err());
@@ -7537,6 +7553,7 @@ mod stage_tests {
         let inputs = load_inputs()?;
         if handoff.plan_identifier != inputs.context.plan_identifier
             || handoff.case_id != inputs.context.policy.case_id.as_bytes()
+            || statement.model_commitment != inputs.context.model_id
         {
             return Err(Error::StatementMismatch);
         }
@@ -7672,6 +7689,7 @@ mod stage_tests {
         let inputs = load_inputs()?;
         if handoff.plan_identifier != inputs.context.plan_identifier
             || handoff.case_id != inputs.context.policy.case_id.as_bytes()
+            || statement.model_commitment != inputs.context.model_id
         {
             return Err(Error::StatementMismatch);
         }
