@@ -4,11 +4,12 @@ use std::io::BufReader;
 use std::path::Path;
 use std::time::Instant;
 
+use zkie_core::error::Error;
 use zkie_engine::pcs::request::code::{build_code_plan, evaluate_ood_fp3, CodeParams};
 use zkie_engine::pcs::request::field::Fp3;
 use zkie_engine::pcs::request::cs_stage;
 use zkie_engine::pcs::request::proximity::{
-    ProximityPlan, ProximityStage, ProximityStatement, SingleRows, StageRole,
+    ChoiceReference, ProximityPlan, ProximityStage, ProximityStatement, SingleRows, StageRole,
 };
 use zkie_ops::proof::lin_session::fp3_from_signed_word;
 use zkie_ops::proof::model_commitment::{
@@ -17,7 +18,11 @@ use zkie_ops::proof::model_commitment::{
 use zkie_ops::proof::proximity_session::{
     verify_proximity_session, ProximityProver, SampleOracle,
 };
-use zkie_ops::proof::session_baseline::TrustedModel;
+use zkie_ops::proof::column_session::{verify_column_session, ColumnBindingInput};
+use zkie_ops::proof::fold_handoff::FoldHandoff;
+use zkie_ops::proof::session_baseline::{
+    selected_plan_identifier, SelectedMatmulStep, TrustedModel,
+};
 
 struct FixtureOracle {
     code: CodeParams,
@@ -37,6 +42,84 @@ fn dot(a: &[Fp3], b: &[Fp3]) -> Fp3 {
         sum = sum.add(&x.mul(y));
     }
     sum
+}
+
+
+fn handoff_plan(handoff: &FoldHandoff) -> ProximityPlan {
+    let switch_code = build_code_plan(
+        handoff.code.log_n,
+        handoff.code.ell + handoff.code.r,
+        handoff.code.r,
+    )
+    .unwrap();
+    let switch_mask = build_code_plan(
+        handoff.mask_code.log_n,
+        handoff.mask_code.ell + handoff.mask_code.r,
+        handoff.mask_code.r,
+    )
+    .unwrap();
+    ProximityPlan {
+        input_code: handoff.code,
+        input_mask_code: handoff.mask_code,
+        stages: vec![
+            ProximityStage {
+                role: StageRole::CodeSwitch,
+                code: switch_code,
+                mask_code: switch_mask,
+                k: 0,
+                h: 0,
+                answers: 1,
+                samples: 3,
+                folds: false,
+                choice: ChoiceReference::VerifierPlan,
+            },
+            ProximityStage {
+                role: StageRole::Base,
+                code: switch_code,
+                mask_code: switch_mask,
+                k: 0,
+                h: 0,
+                answers: 1,
+                samples: 4,
+                folds: false,
+                choice: ChoiceReference::VerifierPlan,
+            },
+        ],
+    }
+}
+
+/// Fixture witness for the candidate claim: the plaintext rows are not part of
+/// the FOLD output. One coordinate is set so the fixture satisfies the mapped
+/// claim target; this is not the real FOLD witness.
+fn handoff_rows(handoff: &FoldHandoff) -> SingleRows {
+    let mut main = vec![Fp3::ZERO; handoff.code.ell as usize];
+    let mut mask = vec![Fp3::ZERO; handoff.mask_code.ell as usize];
+    let mut assigned = false;
+    for (index, coefficient) in handoff.main_claim.iter().enumerate() {
+        if *coefficient != Fp3::ZERO {
+            main[index] = handoff.target.mul(&coefficient.inverse().unwrap());
+            assigned = true;
+            break;
+        }
+    }
+    if !assigned {
+        for (index, coefficient) in handoff.mask_claim.iter().enumerate() {
+            if *coefficient != Fp3::ZERO {
+                mask[index] = handoff.target.mul(&coefficient.inverse().unwrap());
+                assigned = true;
+                break;
+            }
+        }
+    }
+    assert!(assigned || handoff.target == Fp3::ZERO);
+    handoff
+        .single_rows(
+            main,
+            vec![Fp3::ZERO; handoff.code.r as usize],
+            mask,
+            vec![Fp3::ZERO; handoff.mask_code.r as usize],
+        )
+        .unwrap()
 }
 
 #[test]
@@ -194,4 +277,155 @@ fn selected_gpt2_cs_base_component() {
     assert!(verify_proximity_session(&bad_plan, &statement, messages, &prover, &oracle).is_err());
 
     assert!(verify_proximity_session(&plan, &statement, messages, &prover, &oracle).is_ok());
+}
+
+#[test]
+#[ignore = "requires ZKIE_SESSION_FIXTURE with the multi-GiB gpt2-seq16 artifact"]
+fn selected_gpt2_fold_output_handoff_component() {
+    let fixture = env::var("ZKIE_SESSION_FIXTURE").expect("set ZKIE_SESSION_FIXTURE");
+    let root = Path::new(&fixture).join("gpt2-seq16");
+    let public: ModelCommitmentPublic =
+        bincode::deserialize(&fs::read(root.join("public/model-commitment.bin")).unwrap()).unwrap();
+    let file = fs::File::open(root.join("proof.bin")).unwrap();
+    let trace: SharedTrace = bincode::deserialize_from(BufReader::new(file)).unwrap();
+    let policy = zkie::policy::parse(&fs::read(root.join("policy.toml")).unwrap()).unwrap();
+    let request =
+        zkie::policy::select(&policy, "gpt2-seq16", "gpt2", trace.tokens.len()).unwrap();
+    let specs = zkie_models_gpt2::plan::asset_specs();
+    let trusted = TrustedModel {
+        anchor_id: request.anchor_id,
+        model_id: request.model_id,
+        parameters_digest: zkie_models_gpt2::plan::parameters_digest().unwrap(),
+        asset_specs: &specs,
+    };
+    verify_model_anchor(
+        &public,
+        trusted.anchor_id,
+        trusted.model_id,
+        trusted.parameters_digest,
+        trusted.asset_specs,
+    )
+    .unwrap();
+    let public_opening = &trace.assets[192];
+    public.verify_opening(public_opening).unwrap();
+
+    let model_plan = zkie_models_gpt2::plan::trace_plan(16).unwrap();
+    let selection = SelectedMatmulStep::select(&model_plan, 4444).unwrap();
+    let plan_identifier = selected_plan_identifier(&public, &model_plan, &selection).unwrap();
+    let input =
+        ColumnBindingInput::from_plan(plan_identifier, request.case_id.as_bytes().to_vec()).unwrap();
+    let column = verify_column_session(
+        &public,
+        &trusted,
+        &input,
+        "gpt2/weights/lm_head_w_i32.bin",
+        public_opening,
+    )
+    .unwrap();
+    let handoff = FoldHandoff::from_output(&column.fold_output, &column.fold_anchor).unwrap();
+    assert_eq!(handoff.main_claim, column.fold_output.coefficients);
+    assert_eq!(handoff.mask_claim, column.fold_output.mask_coefficients);
+    assert_eq!(handoff.fresh_claim, column.fold_output.fresh_coefficients);
+    assert_eq!(handoff.target, column.fold_output.target);
+    assert_eq!(handoff.group, column.fold_output.group);
+    assert_eq!(handoff.members, column.fold_output.members);
+    assert_eq!(handoff.kept_rows, 0);
+    assert!(column.fold_output.kept.is_empty());
+
+    let statement = handoff.statement().unwrap();
+    let plan = handoff_plan(&handoff);
+    let switch_code = plan.stages[0].code;
+    let switch_mask = plan.stages[0].mask_code;
+    let rows = handoff_rows(&handoff);
+    let switched = cs_stage::switched_message(&rows, switch_code, switch_mask).unwrap();
+    let oracle = FixtureOracle {
+        code: switch_code,
+        main: switched.main,
+        tail: switched.main_tail,
+    };
+    let star_main = vec![Fp3::from_u64(11); switch_code.ell as usize];
+    let star_tail = vec![Fp3::from_u64(12); switch_code.r as usize];
+    let star_mask = vec![Fp3::from_u64(13); switch_mask.ell as usize];
+    let star_mask_tail = vec![Fp3::from_u64(14); switch_mask.r as usize];
+    let prover = ProximityProver::new(
+        &plan,
+        rows,
+        star_main,
+        star_tail,
+        star_mask,
+        star_mask_tail,
+    )
+    .unwrap();
+    let messages = prover.messages().unwrap();
+    let started = Instant::now();
+    let outcome = verify_proximity_session(&plan, &statement, messages, &prover, &oracle).unwrap();
+    println!(
+        "handoff_session_ms={} registration_count={} cs_positions={:?} base_positions={:?}",
+        started.elapsed().as_millis(),
+        outcome.registration_count,
+        outcome.cs_positions,
+        outcome.base_positions
+    );
+    assert_eq!(
+        outcome.component_complete().unwrap(),
+        zkie_ops::proof::proximity_session::ProximityComponent::ComponentComplete
+    );
+
+    let mut bad_output = column.fold_output.clone();
+    bad_output.target = bad_output.target.add(&Fp3::ONE);
+    let bad_handoff = FoldHandoff::from_output(&bad_output, &column.fold_anchor).unwrap();
+    let bad_statement = bad_handoff.statement().unwrap();
+    assert!(matches!(
+        verify_proximity_session(&plan, &bad_statement, messages, &prover, &oracle),
+        Err(Error::InvalidProof)
+    ));
+
+    let mut bad_output = column.fold_output.clone();
+    bad_output.coefficients[0] = bad_output.coefficients[0].add(&Fp3::ONE);
+    let bad_handoff = FoldHandoff::from_output(&bad_output, &column.fold_anchor).unwrap();
+    let bad_statement = bad_handoff.statement().unwrap();
+    assert!(matches!(
+        verify_proximity_session(&plan, &bad_statement, messages, &prover, &oracle),
+        Err(Error::InvalidProof)
+    ));
+
+    let mut bad_output = column.fold_output.clone();
+    bad_output.mask_coefficients[0] = bad_output.mask_coefficients[0].add(&Fp3::ONE);
+    let bad_handoff = FoldHandoff::from_output(&bad_output, &column.fold_anchor).unwrap();
+    let bad_statement = bad_handoff.statement().unwrap();
+    assert!(matches!(
+        verify_proximity_session(&plan, &bad_statement, messages, &prover, &oracle),
+        Err(Error::InvalidProof)
+    ));
+
+    let mut bad_output = column.fold_output.clone();
+    bad_output.group += 1;
+    assert!(matches!(
+        FoldHandoff::from_output(&bad_output, &column.fold_anchor),
+        Err(Error::StatementMismatch)
+    ));
+    let mut bad_output = column.fold_output.clone();
+    bad_output.fresh_root = zkie_core::types::Digest::ZERO;
+    assert!(matches!(
+        FoldHandoff::from_output(&bad_output, &column.fold_anchor),
+        Err(Error::StatementMismatch)
+    ));
+    let mut bad_output = column.fold_output.clone();
+    bad_output.fresh_coefficients[0] = bad_output.fresh_coefficients[0].add(&Fp3::ONE);
+    assert!(matches!(
+        FoldHandoff::from_output(&bad_output, &column.fold_anchor),
+        Err(Error::StatementMismatch)
+    ));
+    let mut bad_output = column.fold_output.clone();
+    bad_output.coefficients.pop();
+    assert!(matches!(
+        FoldHandoff::from_output(&bad_output, &column.fold_anchor),
+        Err(Error::ShapeMismatch)
+    ));
+    let mut bad_output = column.fold_output.clone();
+    bad_output.kept_rows = 1;
+    assert!(matches!(
+        FoldHandoff::from_output(&bad_output, &column.fold_anchor),
+        Err(Error::StatementMismatch)
+    ));
 }

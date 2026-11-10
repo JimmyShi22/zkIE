@@ -76,6 +76,7 @@ use zkie_engine::pcs::request::fold::{
     FoldOutput, FoldShape, FoldStartMessage, OracleMetadata, RuntimeOracles,
     VerifiedGroup, VerifiedGroups, VerifiedStatement,
 };
+use crate::proof::fold_handoff::FoldHandoffAnchor;
 use zkie_engine::pcs::request::foldeq::{
     reader_table_identity, FoldeqBinder, FoldeqBinding, FoldeqEdgeBinding, FoldeqPlan, FoldeqSession,
     GammaPath,
@@ -220,6 +221,7 @@ struct SessionRun {
     comparison: TableComparison,
     merge_targets: bool,
     fold_output: FoldOutput,
+    fold_anchor: FoldHandoffAnchor,
     next_stage_closed: bool,
 }
 
@@ -246,6 +248,8 @@ pub struct ColumnSessionOutcome {
     pub full_table_comparison: bool,
     pub fold_component: bool,
     pub fold_next_stage_closed: bool,
+    pub fold_output: FoldOutput,
+    pub fold_anchor: FoldHandoffAnchor,
 }
 
 /// Converts a signed fixed-point word stored as two's-complement `u64` into a
@@ -776,6 +780,15 @@ fn run_session(
     let binding_table_identity = binding.table_identity();
     let edge_bound = edge.is_bound();
     let setup = build_demo_setup(table, binding, edge)?;
+    let fold_shape = setup.fold_shape;
+    let fold_start = setup.fold_start.clone();
+    let fold_group = setup.plan.group_id;
+    let fold_layout = setup
+        .plan
+        .fold_layout
+        .as_ref()
+        .ok_or(Error::InvalidConfig)?
+        .clone();
     let mut session =
         FoldeqSession::open(setup.plan, setup.binder, setup.chain)?;
     session.bind_first_query(&setup.first_query)?;
@@ -807,12 +820,24 @@ fn run_session(
     let comparison = check_full_columns(table, &queries, &columns)?;
 
     session.fold_bind_row(setup.fold_row)?;
-    session.start_fold(&setup.fold_start)?;
+    session.start_fold(&fold_start)?;
     session.fold_rounds_start()?;
-    for _ in 0..setup.fold_shape.k {
+    for _ in 0..fold_shape.k {
         session.receive_fold_round(Fp3::ZERO, Fp3::ZERO)?;
     }
     let fold_output = session.fold_finish()?;
+    let fold_anchor = FoldHandoffAnchor {
+        shape: fold_shape,
+        group: fold_group,
+        members: fold_layout.members.iter().map(|member| member.oracle).collect(),
+        fresh: fold_start.id,
+        fresh_root: fold_start.root,
+        tree_number: fold_start.tree_number,
+        layout: fold_layout,
+        fold_gamma: session.fold_gamma().to_vec(),
+        fold_epsilon: session.epsilon().ok_or(Error::InvalidSessionState)?,
+        fold_sum: fold_start.sum,
+    };
     let next_stage_closed = session.fold_next_stage().is_err();
     let opened_positions = unique_sorted(&queries);
 
@@ -831,6 +856,7 @@ fn run_session(
         comparison,
         merge_targets,
         fold_output,
+        fold_anchor,
         next_stage_closed,
     })
 }
@@ -889,6 +915,8 @@ pub fn verify_column_session(
         full_table_comparison: run.comparison.matches,
         fold_component: true,
         fold_next_stage_closed: run.next_stage_closed,
+        fold_output: run.fold_output,
+        fold_anchor: run.fold_anchor,
     })
 }
 
