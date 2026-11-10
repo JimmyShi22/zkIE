@@ -103,3 +103,60 @@ the chain's commitments, and the caller-word items above remain open items.
 - The table-to-asset opening authentication and the activation-to-output
   declaration are the remaining R1/R3 work.
 - No production tested state is established by this note.
+
+
+## Entry and performance scope
+
+The positive and negative tests of this chain pass through the real public
+serialization and the callable stage entry, not through the production CLI:
+
+- commit: the stage worker builds the table, the public handoff and the
+  private state; the handoff and the private files are encoded and decoded and
+  the decoded values are used.
+- prove: the worker reloads the handoff and private state, checks the plan and
+  case identifiers, rebuilds the table commitment, runs the chain, and encodes
+  the versioned artifact.
+- verify: the worker reads only the public handoff and the artifact, decodes
+  both, rebuilds the trusted setup from the policy, plan and statement, and
+  runs the independent chain verifier. Any failure rejects.
+
+The production `commit`, `prove` and `verify` commands and the pipeline
+provider do not carry this chain yet. This boundary is a property of this
+round, not a claim that the production entry was exercised.
+
+Positives: the three processes accept with the same seal; the artifact
+round-trips; a fresh decode verifies. Negatives include a repeated proof with
+the spent budget, a missing or replaced private state, a stale journal lock, a
+truncated artifact, trailing bytes, a changed handoff, a replaced plan
+identity, a modified nonce, a different switch target, a changed statement,
+root, opening, identity or order, and a version change. Each is rejected
+before acceptance.
+
+Performance numbers in this round are for the limited output-head chain at 16
+positions on one machine, release build:
+
+- artifact 5.59 MB; prove about 9.9 s; verify about 5.6 s; 1.62 tokens/s
+  end-to-end and 1.67 tokens/s chain-only;
+- the earlier 5.38 MB and 1.854 tokens/s figures used two draws per switch and
+  are superseded, not comparable;
+- full-model proof, real sampling at other sequence lengths, stage I/O,
+  caching and the production baseline are not measured here. Memory is not an
+  acceptance red line in this round.
+
+## Shared-trace combination and confidentiality
+
+A possible R1 combination verifies the existing shared trace independently and
+uses its step outputs for X and Y. The trace proof carries the asset openings
+that the step relations consume, and each opening contains the opened weight
+rows as values. A verifier that reads the trace proof therefore sees those
+weights in the clear. If the weights are private, the combination cannot be
+presented as a hidden production proof; it can only be a controlled diagnostic
+until the trace proof stops carrying the opened weights or another
+weight-hiding path is built.
+
+The full verification bytes of that combination are the trace proof
+(4.16 GB in the measured production run) plus this chain's artifact (about
+5.6 MB) plus the public bundle, policy and configuration. The new artifact's
+size alone is not the proof size and must not be reported as such. The trace
+proof is a required input, not an optional cache; a missing or trailing-byte
+trace is rejected.
