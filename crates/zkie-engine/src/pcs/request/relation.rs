@@ -271,7 +271,7 @@ pub fn gu_layout_fault(shape: &GuShape) -> Option<&'static str> {
     None
 }
 
-fn gu_sample_pad_offsets(shape: &GuShape) -> Result<(Vec<usize>, Vec<usize>)> {
+pub fn gu_sample_pad_offsets(shape: &GuShape) -> Result<(Vec<usize>, Vec<usize>)> {
     let mut main = Vec::new();
     let mut mask = Vec::new();
     if shape.u.mask_code.is_none() && shape.u.answers > 0 {

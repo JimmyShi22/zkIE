@@ -16,21 +16,29 @@ use zkie_core::proof_header::PROOF_VERSION_WORD;
 use zkie_core::types::Digest;
 use zkie_engine::pcs::request::binding::{BindingParameters, BindingStatement};
 use zkie_engine::pcs::request::chain::Chain;
-use zkie_engine::pcs::request::field::{Fp, E_DEGREE};
+use zkie_engine::pcs::request::code::encode_row_fp3;
+use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE};
 use zkie_engine::pcs::request::fold::{
     fold_mask_notice, fold_mask_shape_fault, FoldGroupLayout, FoldMemberLayout, FoldShape,
     OracleMetadata, RuntimeOracles, VerifiedGroup, VerifiedGroups, VerifiedStatement,
 };
 use zkie_engine::pcs::request::foldeq::{
-    reader_table_identity, FoldeqBinder, FoldeqBinding, FoldeqEdgeBinding, FoldeqPlan, GammaPath,
+    reader_table_identity, FoldeqBinder, FoldeqBinding, FoldeqEdgeBinding, FoldeqPlan,
+    FoldeqSession, GammaPath,
 };
-use zkie_engine::pcs::request::gu::{GuOracleShape, GuShape};
+use zkie_engine::pcs::request::gu::{GuNotice, GuOracleShape, GuRegistry, GuShape};
 use zkie_engine::pcs::request::params::{RequestParams, SHARED_CHAIN_LABEL};
 use zkie_engine::pcs::request::plan::{CompiledPlan, RequestPlan};
-use zkie_engine::pcs::request::read::{HidingState, ReadLedger};
-use zkie_engine::pcs::request::runtime_tree::{MaskTreePlan, RuntimeTreePart, RuntimeTreePlan};
+use zkie_engine::pcs::request::read::{unique_sorted, HidingState, ReadLedger};
+use zkie_engine::pcs::request::relation::{
+    foldeq_weights, gu_sample_pad_offsets, gu_table, sample_row, GuWitness,
+};
+use zkie_engine::pcs::request::runtime_tree::{
+    MaskTreePlan, RuntimePartRows, RuntimeTree, RuntimeTreePart, RuntimeTreePlan,
+};
 use zkie_engine::pcs::request::table::{
     commit_table, verify_columns, ColumnOpening, CommittedTable, IndexReader, IndexShape,
+    SampleSeed,
 };
 use zkie_engine::primitives::transcript::run_value;
 use zkie_ops::proof::column_session::fp_from_signed_word;
@@ -52,6 +60,8 @@ pub struct LmHeadKey {
     pub reader: IndexReader,
     pub table: CommittedTable,
     pub name: Vec<u8>,
+    /// The committed message rows, kept for the one-time fold of this table.
+    pub messages: Vec<Vec<Fp>>,
 }
 
 /// The table entry of one matrix cell, read through the authenticated row path.
@@ -202,6 +212,7 @@ pub fn build_lm_head_key(
         reader,
         table,
         name,
+        messages,
     })
 }
 
@@ -681,6 +692,254 @@ pub fn build_limited_shared_session_for_context(
     )
 }
 
+/// The private values of one G_u commitment: the oracle code tails, one salt
+/// per runtime-tree column and one pad per sample answer.
+pub struct LmHeadGuRandomness {
+    pub code_tails: Vec<Vec<Fp3>>,
+    pub salts: Vec<Vec<u8>>,
+    pub pads: Vec<Fp3>,
+}
+
+/// The provider's committed G_u oracle: the folded relation view, its root and
+/// the registry entry that the answer rows are built from.
+pub struct LmHeadGuProvider {
+    shape: GuShape,
+    witness: GuWitness,
+    root: Digest,
+    registry: GuRegistry,
+}
+
+impl LmHeadGuProvider {
+    pub fn shape(&self) -> &GuShape {
+        &self.shape
+    }
+
+    pub fn relation(&self) -> &GuWitness {
+        &self.witness
+    }
+
+    pub fn root(&self) -> Digest {
+        self.root
+    }
+
+    /// The complete ordered sample answers for the verifier's seeds. The
+    /// target is the evaluation of the verifier's own coefficient row on the
+    /// committed witness; it is not supplied by the verifier.
+    pub fn answers(&self, seeds: &[SampleSeed]) -> Result<Vec<Fp3>> {
+        let mut answers = Vec::with_capacity(self.shape.u.answers as usize);
+        for answer in 0..self.shape.u.answers {
+            let row = sample_row(&self.shape, &self.registry, seeds, answer, Fp3::ZERO)?;
+            answers.push(row.evaluate(&self.witness)?);
+        }
+        Ok(answers)
+    }
+}
+
+/// Folds the committed table's message rows with the session's equation
+/// weights, places the folded message and its tail in the trusted G_u layout,
+/// writes the private sample pads, and commits the G_u runtime tree. The G_u
+/// message rows and salts are the caller's private values.
+pub fn fold_lm_head_gu(
+    key: &LmHeadKey,
+    table_tails: &[Vec<Fp>],
+    shape: &GuShape,
+    gamma: &[Fp3],
+    randomness: &LmHeadGuRandomness,
+) -> Result<LmHeadGuProvider> {
+    if key.shape != shape.index || key.reader.fault().is_some() {
+        return Err(Error::StatementMismatch);
+    }
+    if shape.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let rows = usize::try_from(shape.index.rows())
+        .map_err(|_| Error::ResourceLimit)?;
+    if gamma.len() != shape.index.v as usize
+        || key.messages.len() != rows
+        || table_tails.len() != rows
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let ell = usize::try_from(shape.index.code.ell)
+        .map_err(|_| Error::ResourceLimit)?;
+    let tail = usize::try_from(shape.index.code.r)
+        .map_err(|_| Error::ResourceLimit)?;
+    if key
+        .messages
+        .iter()
+        .any(|message| message.len() != ell)
+        || table_tails.iter().any(|values| values.len() != tail)
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let main_rows = usize::try_from(shape.u.main_rows)
+        .map_err(|_| Error::ResourceLimit)?;
+    let main_tail = usize::try_from(shape.u.code.r)
+        .map_err(|_| Error::ResourceLimit)?;
+    if randomness.code_tails.len() != main_rows
+        || randomness
+            .code_tails
+            .iter()
+            .any(|values| values.len() != main_tail)
+        || randomness.salts.len() != usize::try_from(shape.tree.columns())
+            .map_err(|_| Error::ResourceLimit)?
+        || randomness
+            .salts
+            .iter()
+            .any(|salt| salt.len() != shape.tree.salt_bytes)
+    {
+        return Err(Error::ShapeMismatch);
+    }
+
+    let eq_gamma = foldeq_weights(gamma, shape.index.v)?;
+    let mut folded = vec![Fp3::ZERO; ell];
+    let mut folded_tail = vec![Fp3::ZERO; tail];
+    for (row, weight) in eq_gamma.iter().enumerate() {
+        for (place, value) in key.messages[row].iter().enumerate() {
+            folded[place] = folded[place].add(&weight.mul(&Fp3::from_base(*value)));
+        }
+        for (place, value) in table_tails[row].iter().enumerate() {
+            folded_tail[place] =
+                folded_tail[place].add(&weight.mul(&Fp3::from_base(*value)));
+        }
+    }
+
+    let mut witness = gu_table(shape, &folded, &folded_tail)?;
+    let (main_pads, mask_pads) = gu_sample_pad_offsets(shape)?;
+    if !mask_pads.is_empty() || main_pads.len() != randomness.pads.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    for (offset, pad) in main_pads.iter().zip(&randomness.pads) {
+        let slot = witness
+            .main
+            .get_mut(*offset)
+            .ok_or(Error::ShapeMismatch)?;
+        *slot = *pad;
+    }
+
+    let mut codewords = Vec::with_capacity(main_rows);
+    let message_len = usize::try_from(shape.u.code.ell)
+        .map_err(|_| Error::ResourceLimit)?;
+    for row in 0..main_rows {
+        let start = row.checked_mul(message_len).ok_or(Error::ResourceLimit)?;
+        let end = start.checked_add(message_len).ok_or(Error::ResourceLimit)?;
+        let message = witness
+            .main
+            .get(start..end)
+            .ok_or(Error::ShapeMismatch)?;
+        let tail = randomness
+            .code_tails
+            .get(row)
+            .ok_or(Error::ShapeMismatch)?;
+        codewords.push(encode_row_fp3(&shape.u.code, message, tail)?);
+    }
+    let tree = RuntimeTree::commit(
+        shape.tree.clone(),
+        &[RuntimePartRows {
+            main: codewords,
+            mask: Vec::new(),
+            main_deg: shape.u.main_deg,
+        }],
+        &randomness.salts,
+    )?;
+    let root = *tree.root();
+    let mut registry = GuRegistry::new();
+    registry.receive(
+        shape,
+        &GuNotice {
+            root,
+            oracle: shape.oracle,
+            tree_number: shape.tree.tree_number,
+            part: shape.part,
+        },
+    )?;
+    Ok(LmHeadGuProvider {
+        shape: shape.clone(),
+        witness,
+        root,
+        registry,
+    })
+}
+
+/// The values one shared-only run records before the FOLD stage: the gamma,
+/// the seed set, the provider's ordered answers, the drawn table columns and
+/// the transcript value after the two joins.
+pub struct LimitedSharedColumns {
+    pub gamma: Vec<Fp3>,
+    pub seeds: Vec<SampleSeed>,
+    pub answers: Vec<Fp3>,
+    pub queries: Vec<u64>,
+    pub root: Digest,
+    pub transcript: Digest,
+}
+
+/// Runs the shared-only chain through the record and column joins. The
+/// provider folds the committed table after the gamma challenge, sends G_u,
+/// answers the seeds, and opens the verifier's drawn table columns. The FOLD
+/// group still needs its second member (Omega), so no FOLD round is entered
+/// here.
+pub fn run_limited_shared_to_columns(
+    setup: LimitedSharedSession,
+    key: &LmHeadKey,
+    table_tails: &[Vec<Fp>],
+    randomness: &LmHeadGuRandomness,
+) -> Result<(FoldeqSession, LimitedSharedColumns)> {
+    let mut session = FoldeqSession::open(setup.plan, setup.binder, setup.chain)?;
+    session.bind_first_query(&setup.first_query)?;
+    session.draw_gamma()?;
+    let gamma = session
+        .gamma()
+        .ok_or(Error::InvalidSessionState)?
+        .to_vec();
+    let gu_shape = session
+        .plan()
+        .gu
+        .as_ref()
+        .ok_or(Error::InvalidConfig)?
+        .clone();
+    let provider = fold_lm_head_gu(key, table_tails, &gu_shape, &gamma, randomness)?;
+    session.send_gu(&provider.root())?;
+    session.shared_seeds()?;
+    let seeds = session.gu_shared_seeds().to_vec();
+    let answers = provider.answers(&seeds)?;
+    for answer in &answers {
+        session.receive_gu_answer(*answer)?;
+    }
+    session.join_gu_record()?;
+    session.draw_queries()?;
+    let queries = session.queries().to_vec();
+    let positions = unique_sorted(&queries);
+    let unique = open_shared_columns(
+        &key.table,
+        &positions,
+        LM_HEAD_COLUMN_DRAWS as u64,
+    )?;
+    let mut openings = Vec::with_capacity(queries.len());
+    for query in &queries {
+        openings.push(
+            unique
+                .iter()
+                .find(|opening| opening.position == *query)
+                .cloned()
+                .ok_or(Error::InvalidIndex)?,
+        );
+    }
+    session.read_queries(&openings)?;
+    session.join_gu_read_columns()?;
+    let transcript = *session.transcript_value();
+    Ok((
+        session,
+        LimitedSharedColumns {
+            gamma,
+            seeds,
+            answers,
+            queries,
+            root: provider.root(),
+            transcript,
+        },
+    ))
+}
+
 /// The checks that the shared-only chain must report before a limited tested
 /// state may exist. Each flag is set by a real check of the chain; a false flag
 /// keeps the state from being created.
@@ -843,7 +1102,6 @@ pub fn shared_column_check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zkie_engine::pcs::request::field::Fp3;
     use std::path::{Path, PathBuf};
 
     use crate::s7_context::load_gpt2_lm_head_context;
@@ -1432,6 +1690,303 @@ mod tests {
         )
         .expect("second");
         assert_ne!(first.first_query, second.first_query);
+    }
+
+
+    fn small_gu_fixture() -> (
+        LmHeadKey,
+        GuShape,
+        LmHeadGuRandomness,
+        Vec<Vec<Fp>>,
+        BindingParameters,
+    ) {
+        use zkie_engine::pcs::request::code::build_code_plan;
+        use zkie_engine::pcs::request::table::TableDistances;
+        let shape = IndexShape {
+            code: build_code_plan(3, 4, 1).expect("code"),
+            v: 2,
+            answers: 1,
+            salt_bytes: 40,
+            distances: TableDistances {
+                radius: 0,
+                later_radius: 0,
+                m_once: 0,
+                m_later: 0,
+            },
+        };
+        let messages: Vec<Vec<Fp>> = (0..4)
+            .map(|row| {
+                (0..4)
+                    .map(|place| Fp::from_u64((row * 4 + place + 1) as u64))
+                    .collect()
+            })
+            .collect();
+        let tails: Vec<Vec<Fp>> = (0..4)
+            .map(|row| vec![Fp::from_u64(row as u64 + 7)])
+            .collect();
+        let salts: Vec<Vec<u8>> = (0..8)
+            .map(|position| vec![(position as u8) ^ 0x5a; 40])
+            .collect();
+        let request_parameters = RequestParams::default_with_code(3, 4, 1).expect("params");
+        let parameters = BindingParameters::with_plan_parts(
+            PROOF_VERSION_WORD,
+            SESSION_PROTOCOL_IDENTITY,
+            &request_parameters,
+            &[Digest([0x30; 32])],
+        )
+        .expect("binding parameters");
+        let configuration = parameters.digest().expect("configuration");
+        let table = commit_table(shape, configuration, &messages, &tails, &salts)
+            .expect("table");
+        let reader = table.reader.clone();
+        let name = table.name.clone();
+        let key = LmHeadKey {
+            shape,
+            reader,
+            table,
+            name,
+            messages,
+        };
+        let tree = RuntimeTreePlan {
+            tree_number: 2,
+            leaf_class: 0,
+            log_n: shape.code.log_n,
+            log_n_zk: shape.code.log_n,
+            parts: vec![RuntimeTreePart {
+                main_symbols: 12,
+                mask_symbols: 0,
+            }],
+            salt_bytes: 40,
+            run: Digest([0x32; 32]),
+            configuration,
+        };
+        let gu = GuShape {
+            oracle: 1,
+            group: 1,
+            tree,
+            part: 0,
+            rows_high: true,
+            u: GuOracleShape {
+                code: shape.code,
+                main_rows: 4,
+                main_deg: 3,
+                mask_rows: 0,
+                mask_code: None,
+                answers: 1,
+            },
+            index: shape,
+        };
+        let randomness = LmHeadGuRandomness {
+            code_tails: (0..4)
+                .map(|row| vec![Fp3::from_u64(0x100 + row)])
+                .collect(),
+            salts: (0..8)
+                .map(|position| vec![(position as u8) ^ 0xa5; 40])
+                .collect(),
+            pads: vec![Fp3::from_u64(0x777)],
+        };
+        (key, gu, randomness, tails, parameters)
+    }
+
+    #[test]
+    fn the_g_u_fold_commits_the_folded_table_and_answers_the_seed() {
+        let (key, shape, randomness, tails, _parameters) = small_gu_fixture();
+        let gamma = vec![Fp3::from_u64(2), Fp3::from_u64(3)];
+        let provider =
+            fold_lm_head_gu(&key, &tails, &shape, &gamma, &randomness).expect("fold");
+        assert_ne!(provider.root(), Digest::ZERO);
+        let seeds = vec![SampleSeed {
+            z: vec![Fp3::from_u64(5); 4],
+            beta: Fp3::from_u64(7),
+        }];
+        let answers = provider.answers(&seeds).expect("answers");
+        assert_eq!(answers.len(), 1);
+        let mut registry = GuRegistry::new();
+        registry
+            .receive(
+                &shape,
+                &GuNotice {
+                    root: provider.root(),
+                    oracle: shape.oracle,
+                    tree_number: shape.tree.tree_number,
+                    part: shape.part,
+                },
+            )
+            .expect("notice");
+        let row = sample_row(&shape, &registry, &seeds, 0, answers[0]).expect("row");
+        assert_eq!(
+            row.evaluate(provider.relation()).expect("evaluate"),
+            answers[0]
+        );
+    }
+
+    #[test]
+    fn the_g_u_fold_binds_the_challenge_and_the_private_pads() {
+        let (key, shape, randomness, tails, _parameters) = small_gu_fixture();
+        let gamma = vec![Fp3::from_u64(2), Fp3::from_u64(3)];
+        let first =
+            fold_lm_head_gu(&key, &tails, &shape, &gamma, &randomness).expect("first");
+        let mut other_gamma = gamma.clone();
+        other_gamma[0] = Fp3::from_u64(4);
+        let second =
+            fold_lm_head_gu(&key, &tails, &shape, &other_gamma, &randomness).expect("second");
+        assert_ne!(first.root(), second.root());
+        let changed = LmHeadGuRandomness {
+            code_tails: randomness.code_tails.clone(),
+            salts: randomness.salts.clone(),
+            pads: vec![Fp3::from_u64(0x778)],
+        };
+        let third =
+            fold_lm_head_gu(&key, &tails, &shape, &gamma, &changed).expect("third");
+        assert_ne!(first.root(), third.root());
+    }
+
+    #[test]
+    fn the_g_u_fold_rejects_mismatched_inputs() {
+        let (key, shape, randomness, tails, _parameters) = small_gu_fixture();
+        let gamma = vec![Fp3::from_u64(2), Fp3::from_u64(3)];
+        assert!(fold_lm_head_gu(&key, &tails, &shape, &gamma[..1], &randomness).is_err());
+        let mut wrong = LmHeadGuRandomness {
+            code_tails: randomness.code_tails[..3].to_vec(),
+            salts: randomness.salts.clone(),
+            pads: randomness.pads.clone(),
+        };
+        assert!(fold_lm_head_gu(&key, &tails, &shape, &gamma, &wrong).is_err());
+        wrong.code_tails = randomness.code_tails.clone();
+        wrong.salts.pop();
+        assert!(fold_lm_head_gu(&key, &tails, &shape, &gamma, &wrong).is_err());
+        wrong.salts = randomness.salts.clone();
+        wrong.pads.clear();
+        assert!(fold_lm_head_gu(&key, &tails, &shape, &gamma, &wrong).is_err());
+    }
+
+
+    fn small_shared_run() -> Result<(FoldeqSession, LimitedSharedColumns)> {
+        use zkie_engine::pcs::request::code::build_code_plan;
+        let (key, gu, randomness, tails, parameters) = small_gu_fixture();
+        let mask_code = build_code_plan(3, 7, 1)?;
+        let fold = FoldShape {
+            code: key.shape.code,
+            mask_code,
+            k: 3,
+            h: 0,
+            mask_leaf_class: 0,
+        };
+        let mask_tree = MaskTreePlan {
+            tree_number: 0,
+            leaf_class: 0,
+            log_n: mask_code.log_n,
+            mask_rows: 1,
+            salt_bytes: 40,
+            run: Digest([0x32; 32]),
+            configuration: key.reader.configuration,
+        };
+        let statement = Arc::new(VerifiedStatement::new(
+            VerifiedGroups {
+                groups: vec![VerifiedGroup {
+                    group: 1,
+                    members: vec![2],
+                    fresh: Some(3),
+                    code: Some(gu.u.code),
+                    mask_code: None,
+                }],
+            },
+            vec![mask_tree],
+            vec![OracleMetadata {
+                id: 3,
+                group: 1,
+                tree_number: 0,
+                leaf_class: 0,
+                mask_rows: 1,
+                mask_code,
+            }],
+        )?);
+        let mut oracles = RuntimeOracles::default();
+        oracles.receive_mask(
+            &statement,
+            &mask_tree,
+            3,
+            &fold_mask_notice(&fold)?,
+            Digest([0x77; 32]),
+        )?;
+        let layout = FoldGroupLayout {
+            group: 1,
+            k: 3,
+            h: 0,
+            members: vec![
+                FoldMemberLayout {
+                    oracle: 1,
+                    main_rows: 4,
+                    mask_rows: 0,
+                    kept: false,
+                },
+                FoldMemberLayout {
+                    oracle: 2,
+                    main_rows: 1,
+                    mask_rows: 0,
+                    kept: false,
+                },
+            ],
+        };
+        let table_identity = reader_table_identity(&key.reader)?;
+        let binding_statement = BindingStatement::new(
+            parameters.version_word,
+            parameters.protocol_identity,
+            b"small-shared".to_vec(),
+            Digest([0x55; 32]),
+            table_identity,
+        )?;
+        let binding = FoldeqBinding::new(&parameters, binding_statement, &key.reader)?;
+        let plan = FoldeqPlan {
+            reader: key.reader.clone(),
+            binding,
+            edge: FoldeqEdgeBinding::NotAnEdge,
+            fold,
+            statement,
+            oracles: Arc::new(Mutex::new(oracles)),
+            mask_tree_number: 0,
+            group_id: 1,
+            leaf_class: 0,
+            seed_budget: 1,
+            ledger: Arc::new(Mutex::new(ReadLedger::new(2))),
+            column_draws: 2,
+            mask_query_count: 0,
+            gamma_path: GammaPath::Direct {
+                columns: key.shape.v,
+            },
+            gu: Some(gu),
+            fold_layout: Some(layout),
+        };
+        if plan.fault().is_some() {
+            return Err(Error::InvalidConfig);
+        }
+        let binder = FoldeqBinder::new_with_random_bytes(
+            SHARED_CHAIN_LABEL,
+            key.reader.configuration,
+            &plan,
+            Some(Digest([0x44; 32])),
+        )?;
+        let first_query = binder.first_query().to_vec();
+        let chain = binder.chain()?;
+        let setup = LimitedSharedSession {
+            plan,
+            binder,
+            chain,
+            first_query,
+        };
+        run_limited_shared_to_columns(setup, &key, &tails, &randomness)
+    }
+
+    #[test]
+    fn the_shared_chain_reaches_the_record_and_column_joins() {
+        let (session, run) = small_shared_run().expect("shared run");
+        assert_ne!(run.root, Digest::ZERO);
+        assert_ne!(run.transcript, Digest::ZERO);
+        assert_eq!(run.gamma.len(), 2);
+        assert_eq!(run.seeds.len(), 1);
+        assert_eq!(run.answers.len(), 1);
+        assert_eq!(run.queries.len(), 2);
+        assert_eq!(session.pending_gu_rows().len(), 4);
     }
 
 }
