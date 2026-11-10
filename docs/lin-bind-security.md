@@ -145,14 +145,19 @@ positions on one machine, release build:
 
 ## Shared-trace combination and confidentiality
 
-A possible R1 combination verifies the existing shared trace independently and
-uses its step outputs for X and Y. The trace proof carries the asset openings
-that the step relations consume, and each opening contains the opened weight
-rows as values. A verifier that reads the trace proof therefore sees those
-weights in the clear. If the weights are private, the combination cannot be
-presented as a hidden production proof; it can only be a controlled diagnostic
-until the trace proof stops carrying the opened weights or another
-weight-hiding path is built.
+The R1 combination verifies the existing shared trace independently and uses
+its step outputs for X and Y. The trace proof carries the asset openings that
+the step relations consume, and each opening contains the opened weight rows as
+values. A verifier that reads the trace proof therefore sees those weights in
+the clear.
+
+The ruled scope for this round is therefore a **controlled diagnostic**, not a
+hidden production proof. The combination may be accepted as evidence that the
+request relation is real and independently checked; it must not be described
+as hiding the weights, and it must not be used as the hidden production proof.
+Replacing it with a weight-hiding relation is a later round. The acceptance
+material must say that the combination sends plaintext weight rows and that
+the hidden relation is outstanding.
 
 The full verification bytes of that combination are the trace proof
 (4.16 GB in the measured production run) plus this chain's artifact (about
@@ -160,3 +165,28 @@ The full verification bytes of that combination are the trace proof
 size alone is not the proof size and must not be reported as such. The trace
 proof is a required input, not an optional cache; a missing or trailing-byte
 trace is rejected.
+
+
+## R1 controlled-diagnostic acceptance checklist
+
+- The new chain verifies the LIN request itself over all 16 positions and the
+  full column domain, with the first, shared and second checks and the checks
+  they need. A tested key table or a recomputed shared trace alone is not the
+  LIN request.
+- X and Y are bound to step outputs of the verified trace; the verifier pins
+  the model version, asset identity, step, port, shape and the upstream and
+  downstream mapping from the trusted policy and plan.
+- The declaration, its digests and its commitments use canonical encoding with
+  domain separation and bind shape and identity; the verifier checks that both
+  sides verify the same values or commitments before the challenges are drawn.
+- Old and new roots are equal under the published-release trust assumption,
+  not as a cryptographic equality claim.
+- A versioned manifest lists every file the verifier needs, checks identity,
+  missing files and trailing bytes. The full verification bytes are the trace
+  proof (4.16 GB in the measured production run), this artifact and the public
+  bundle/config; the new artifact's size is reported separately.
+- Negatives: another valid trace, changed X or Y, another asset, another
+  step or port, changed statement or root, wrong order, truncation and
+  trailing bytes all reject.
+- The material states plainly: the combination sends plaintext weight rows;
+  it is a controlled diagnostic; the hidden relation is a later round.
