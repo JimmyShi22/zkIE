@@ -755,6 +755,19 @@ pub fn verify_shared_trace(
     Ok(trace.argmax.clone())
 }
 
+/// Verifies the trace exactly as `verify_shared_trace` does and returns the
+/// verified output tensors of every step. A request binding uses the step it
+/// names in the trusted plan and takes the activation and output values from
+/// this verified result, never from a caller-supplied copy.
+pub fn verify_shared_trace_outputs(
+    public: &ModelCommitmentPublic,
+    trace: &SharedTrace,
+    expected_tokens: &[u32],
+    plan: &crate::proof::plan::TracePlan,
+) -> Result<Vec<Vec<Vec<i64>>>> {
+    verify_shared_trace_steps(public, trace, expected_tokens, plan)
+}
+
 /// Verifies the trace and returns the recorded final output tensor, which must
 /// match the output of the last relation step.
 pub fn verify_shared_trace_output(
