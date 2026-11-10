@@ -43,7 +43,7 @@ const SESSION_SCHEMA_VERSION: u64 = 1;
 
 /// Candidate protocol identity for this baseline. It is not a final external
 /// protocol identity.
-const SESSION_PROTOCOL_IDENTITY: Digest = Digest([0x5a; 32]);
+pub const SESSION_PROTOCOL_IDENTITY: Digest = Digest([0x5a; 32]);
 
 const GROUP_INPUTS: u64 = 1;
 const GROUP_OUTPUTS: u64 = 2;

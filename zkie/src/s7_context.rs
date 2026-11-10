@@ -29,6 +29,7 @@ use zkie_ops::proof::model_commitment::{
     ModelCommitmentPublic,
 };
 use zkie_ops::proof::plan::{PlanConfigValue, PlanSource, TracePlan};
+use zkie_ops::proof::session_baseline::{selected_plan_identifier, SelectedMatmulStep};
 
 use crate::policy::{self, TrustedRequest};
 use crate::provider::StatementData;
@@ -73,6 +74,7 @@ pub struct LmHeadContext {
     pub asset_root: PathBuf,
     pub asset: LmHeadAsset,
     pub matmul: LmHeadStep,
+    pub plan_identifier: Digest,
     pub plan_steps: usize,
 }
 
@@ -214,6 +216,8 @@ pub fn load_gpt2_lm_head_context(
     let specs = zkie_models_gpt2::plan::asset_specs();
     verify_model_anchor(&public, trusted.anchor_id, model_id, parameters, &specs)?;
     let matmul = find_lm_head_matmul(&plan)?;
+    let selection = SelectedMatmulStep::select(&plan, matmul.index)?;
+    let plan_identifier = selected_plan_identifier(&public, &plan, &selection)?;
     let spec = lm_head_spec(&specs, &matmul.weight_path)?;
     let meta = public
         .assets
@@ -250,6 +254,7 @@ pub fn load_gpt2_lm_head_context(
         asset_root,
         asset,
         matmul,
+        plan_identifier,
         plan_steps: plan.steps.len(),
     })
 }

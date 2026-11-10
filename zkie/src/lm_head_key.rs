@@ -8,17 +8,33 @@
 //! caller's private values; the builder checks their sizes and binds them
 //! before the table's root is computed.
 
+use std::sync::{Arc, Mutex};
+
 use zkie_core::common::field::PrimeCharacteristicRing;
 use zkie_core::error::{Error, Result};
+use zkie_core::proof_header::PROOF_VERSION_WORD;
 use zkie_core::types::Digest;
-use zkie_engine::pcs::request::field::{Fp, E_DEGREE};
+use zkie_engine::pcs::request::binding::{BindingParameters, BindingStatement};
 use zkie_engine::pcs::request::chain::Chain;
-use zkie_engine::pcs::request::plan::RequestPlan;
-use zkie_engine::pcs::request::read::HidingState;
+use zkie_engine::pcs::request::field::{Fp, E_DEGREE};
+use zkie_engine::pcs::request::fold::{
+    fold_mask_notice, fold_mask_shape_fault, FoldGroupLayout, FoldMemberLayout, FoldShape,
+    OracleMetadata, RuntimeOracles, VerifiedGroup, VerifiedGroups, VerifiedStatement,
+};
+use zkie_engine::pcs::request::foldeq::{
+    reader_table_identity, FoldeqBinder, FoldeqBinding, FoldeqEdgeBinding, FoldeqPlan, GammaPath,
+};
+use zkie_engine::pcs::request::gu::{GuOracleShape, GuShape};
+use zkie_engine::pcs::request::params::{RequestParams, SHARED_CHAIN_LABEL};
+use zkie_engine::pcs::request::plan::{CompiledPlan, RequestPlan};
+use zkie_engine::pcs::request::read::{HidingState, ReadLedger};
+use zkie_engine::pcs::request::runtime_tree::{MaskTreePlan, RuntimeTreePart, RuntimeTreePlan};
 use zkie_engine::pcs::request::table::{
     commit_table, verify_columns, ColumnOpening, CommittedTable, IndexReader, IndexShape,
 };
+use zkie_engine::primitives::transcript::run_value;
 use zkie_ops::proof::column_session::fp_from_signed_word;
+use zkie_ops::proof::session_baseline::SESSION_PROTOCOL_IDENTITY;
 
 use crate::s7_context::LmHeadContext;
 
@@ -371,6 +387,300 @@ pub fn limited_key_plan(
 }
 
 
+/// The fixed plan identities of the output-head shared-only test: the
+/// one-time FOLD group, its two folded members, the fresh mask oracle and its
+/// runtime tree. They are plan values, not proof values; the first query binds
+/// every one of them.
+pub const LM_HEAD_FOLD_GROUP: u64 = 1;
+pub const LM_HEAD_GU_ORACLE: u64 = 1;
+pub const LM_HEAD_OMEGA_ORACLE: u64 = 2;
+pub const LM_HEAD_FRESH_MASK: u64 = 3;
+pub const LM_HEAD_MASK_TREE: u64 = 0;
+pub const LM_HEAD_GU_TREE: u64 = 2;
+
+/// The table columns drawn by the one-time shared test.
+pub const LM_HEAD_COLUMN_DRAWS: usize = 603;
+
+/// The verifier's plan for one shared-only key session and the binder that
+/// starts it. The table root, record and configuration come from the reader;
+/// the run and both runtime trees are derived from the caller's private
+/// random bytes; the binding parameters are the table's configuration.
+pub struct LimitedSharedSession {
+    pub plan: FoldeqPlan,
+    pub binder: FoldeqBinder,
+    pub chain: Chain,
+    pub first_query: Vec<u8>,
+}
+
+/// Builds the binding parameters of the limited key. The plan identifier is
+/// the selected static plan's digest; the request parameters are the table
+/// code's. The table's configuration is this value's digest.
+pub fn limited_key_binding_parameters(
+    plan: &RequestPlan,
+    plan_identifier: Digest,
+) -> Result<BindingParameters> {
+    plan.validate()?;
+    let request_parameters = RequestParams::default_with_code(
+        plan.table.code.log_n,
+        plan.table.code.ell,
+        plan.table.code.r,
+    )?;
+    BindingParameters::with_plan_parts(
+        PROOF_VERSION_WORD,
+        SESSION_PROTOCOL_IDENTITY,
+        &request_parameters,
+        &[plan_identifier],
+    )
+}
+
+/// Builds the real shared-only FOLDEQ plan for the committed key table. The
+/// fold shape comes from the compiled one-time lines, the fresh mask root from
+/// the provider's pre-committed mask message, and every runtime tree's run and
+/// configuration from the session chain and the table. The plan is rejected
+/// unless the binding parameters digest is exactly the reader's configuration.
+#[allow(clippy::too_many_arguments)]
+pub fn build_limited_shared_session(
+    request_plan: &RequestPlan,
+    compiled: &CompiledPlan,
+    statement: &LimitedKeyStatement,
+    reader: &IndexReader,
+    plan_identifier: Digest,
+    case_id: &[u8],
+    random_bytes: Digest,
+    fresh_mask_root: Digest,
+) -> Result<LimitedSharedSession> {
+    request_plan.validate()?;
+    request_plan.validate_compiled(compiled)?;
+    if fresh_mask_root == Digest::ZERO
+        || random_bytes == Digest::ZERO
+        || case_id.is_empty()
+    {
+        return Err(Error::InvalidConfig);
+    }
+    let parameters = limited_key_binding_parameters(request_plan, plan_identifier)?;
+    let configuration = parameters.digest()?;
+    if configuration != reader.configuration {
+        return Err(Error::StatementMismatch);
+    }
+    statement.validate()?;
+    if statement.table_root != reader.root
+        || statement.table_configuration != reader.configuration
+        || statement.table_shape != reader.shape
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let factor = 1u64
+        .checked_shl(request_plan.lin.k_lo)
+        .ok_or(Error::InvalidConfig)?;
+    if statement.matrix_rows != 1u64 << request_plan.table.v
+        || statement.matrix_rows != 1u64 << request_plan.lin.matrix_rows_log
+        || statement.k_lo != request_plan.lin.k_lo
+        || statement.k_col != request_plan.lin.k_col
+        || factor
+            .checked_mul(statement.matrix_rows)
+            .ok_or(Error::InvalidConfig)?
+            != 1u64 << request_plan.lin.k_col
+    {
+        return Err(Error::InvalidConfig);
+    }
+
+    let run = run_value(SHARED_CHAIN_LABEL, &configuration, &random_bytes)?;
+    if run == Digest::ZERO {
+        return Err(Error::InvalidConfig);
+    }
+
+    let folded = &compiled.once.folded;
+    let fold = FoldShape {
+        code: folded.main,
+        mask_code: folded.mask,
+        k: folded.k,
+        h: folded.h,
+        mask_leaf_class: compiled.once_foldeq.shared_split_leaf_class,
+    };
+    if fold_mask_shape_fault(&fold).is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let fresh = compiled
+        .once_foldeq
+        .shared_split
+        .as_ref()
+        .ok_or(Error::InvalidConfig)?;
+    if fresh.main_rows != 0
+        || fresh.mask_rows != fold.mask_rows()?
+        || fresh.mask_code != Some(fold.mask_code)
+    {
+        return Err(Error::InvalidConfig);
+    }
+
+    let gu_oracle = compiled.once_foldeq.u.clone();
+    let omega = compiled.once_foldeq.omega.clone();
+    let gu_tree = RuntimeTreePlan {
+        tree_number: LM_HEAD_GU_TREE,
+        leaf_class: compiled.once_foldeq.fold_leaf_class,
+        log_n: gu_oracle.code.log_n,
+        log_n_zk: gu_oracle.code.log_n,
+        parts: vec![RuntimeTreePart {
+            main_symbols: gu_oracle
+                .main_rows
+                .checked_mul(gu_oracle.main_deg as u64)
+                .ok_or(Error::ResourceLimit)?,
+            mask_symbols: 0,
+        }],
+        salt_bytes: request_plan.salt_bytes,
+        run,
+        configuration,
+    };
+    let gu = GuShape {
+        oracle: LM_HEAD_GU_ORACLE,
+        group: LM_HEAD_FOLD_GROUP,
+        tree: gu_tree,
+        part: 0,
+        rows_high: compiled.once_foldeq.rows_high,
+        u: GuOracleShape {
+            code: gu_oracle.code,
+            main_rows: gu_oracle.main_rows,
+            main_deg: gu_oracle.main_deg,
+            mask_rows: gu_oracle.mask_rows,
+            mask_code: gu_oracle.mask_code,
+            answers: gu_oracle.answers,
+        },
+        index: reader.shape,
+    };
+
+    let mask_tree = MaskTreePlan {
+        tree_number: LM_HEAD_MASK_TREE,
+        leaf_class: fold.mask_leaf_class,
+        log_n: fold.mask_code.log_n,
+        mask_rows: fold.mask_rows()?,
+        salt_bytes: request_plan.salt_bytes,
+        run,
+        configuration,
+    };
+    let group = VerifiedGroup {
+        group: LM_HEAD_FOLD_GROUP,
+        members: vec![LM_HEAD_OMEGA_ORACLE],
+        fresh: Some(LM_HEAD_FRESH_MASK),
+        code: Some(fold.code),
+        mask_code: gu.u.mask_code,
+    };
+    let verified = Arc::new(VerifiedStatement::new(
+        VerifiedGroups {
+            groups: vec![group],
+        },
+        vec![mask_tree],
+        vec![OracleMetadata {
+            id: LM_HEAD_FRESH_MASK,
+            group: LM_HEAD_FOLD_GROUP,
+            tree_number: mask_tree.tree_number,
+            leaf_class: mask_tree.leaf_class,
+            mask_rows: mask_tree.mask_rows,
+            mask_code: fold.mask_code,
+        }],
+    )?);
+    let mut oracles = RuntimeOracles::default();
+    oracles.receive_mask(
+        &verified,
+        &mask_tree,
+        LM_HEAD_FRESH_MASK,
+        &fold_mask_notice(&fold)?,
+        fresh_mask_root,
+    )?;
+    let layout = FoldGroupLayout {
+        group: LM_HEAD_FOLD_GROUP,
+        k: fold.k,
+        h: fold.h,
+        members: vec![
+            FoldMemberLayout {
+                oracle: LM_HEAD_GU_ORACLE,
+                main_rows: gu.u.main_rows,
+                mask_rows: gu.u.mask_rows,
+                kept: false,
+            },
+            FoldMemberLayout {
+                oracle: LM_HEAD_OMEGA_ORACLE,
+                main_rows: omega.main_rows,
+                mask_rows: omega.mask_rows,
+                kept: false,
+            },
+        ],
+    };
+    if layout.fault(&fold).is_some() {
+        return Err(Error::InvalidConfig);
+    }
+
+    let table_identity = reader_table_identity(reader)?;
+    let binding_statement = BindingStatement::new(
+        parameters.version_word,
+        parameters.protocol_identity,
+        case_id.to_vec(),
+        statement.digest(),
+        table_identity,
+    )?;
+    let binding = FoldeqBinding::new(&parameters, binding_statement, reader)?;
+
+    let plan = FoldeqPlan {
+        reader: reader.clone(),
+        binding,
+        edge: FoldeqEdgeBinding::NotAnEdge,
+        fold,
+        statement: verified,
+        oracles: Arc::new(Mutex::new(oracles)),
+        mask_tree_number: mask_tree.tree_number,
+        group_id: LM_HEAD_FOLD_GROUP,
+        leaf_class: compiled.once_foldeq.fold_leaf_class,
+        seed_budget: reader.shape.answers as usize,
+        ledger: Arc::new(Mutex::new(ReadLedger::new(LM_HEAD_COLUMN_DRAWS as u64))),
+        column_draws: LM_HEAD_COLUMN_DRAWS,
+        mask_query_count: 0,
+        gamma_path: GammaPath::Direct {
+            columns: reader.shape.v,
+        },
+        gu: Some(gu),
+        fold_layout: Some(layout),
+    };
+    if plan.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let binder = FoldeqBinder::new_with_random_bytes(
+        SHARED_CHAIN_LABEL,
+        configuration,
+        &plan,
+        Some(random_bytes),
+    )?;
+    let first_query = binder.first_query().to_vec();
+    let chain = binder.chain()?;
+    Ok(LimitedSharedSession {
+        plan,
+        binder,
+        chain,
+        first_query,
+    })
+}
+
+/// Builds the shared-only session for the trusted output-head context. The
+/// plan identifier and the case id are the context's; the caller supplies the
+/// private random bytes and the provider's pre-committed fresh mask root.
+pub fn build_limited_shared_session_for_context(
+    context: &LmHeadContext,
+    request_plan: &RequestPlan,
+    compiled: &CompiledPlan,
+    statement: &LimitedKeyStatement,
+    reader: &IndexReader,
+    random_bytes: Digest,
+    fresh_mask_root: Digest,
+) -> Result<LimitedSharedSession> {
+    build_limited_shared_session(
+        request_plan,
+        compiled,
+        statement,
+        reader,
+        context.plan_identifier,
+        context.policy.case_id.as_bytes(),
+        random_bytes,
+        fresh_mask_root,
+    )
+}
+
 /// The checks that the shared-only chain must report before a limited tested
 /// state may exist. Each flag is set by a real check of the chain; a false flag
 /// keeps the state from being created.
@@ -485,26 +795,6 @@ pub fn establish_limited_tested(
 }
 
 
-/// Starts the shared chain from the table's public name and record and the
-/// caller's statement bytes. The chain's configuration is the table's.
-pub fn start_shared_chain(
-    reader: &IndexReader,
-    label: u64,
-    statement_bytes: &[u8],
-    random_bytes: Option<&Digest>,
-) -> Result<Chain> {
-    if reader.fault().is_some() {
-        return Err(Error::InvalidConfig);
-    }
-    Chain::begin(
-        label,
-        &reader.configuration,
-        statement_bytes,
-        &reader.record.encode(),
-        random_bytes,
-    )
-}
-
 /// Draws and normalizes the column positions of the shared chain.
 pub fn draw_shared_columns(chain: &mut Chain, log_n: u32, count: usize) -> Result<Vec<u64>> {
     let mut positions = Vec::with_capacity(count);
@@ -553,6 +843,7 @@ pub fn shared_column_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zkie_engine::pcs::request::field::Fp3;
     use std::path::{Path, PathBuf};
 
     use crate::s7_context::load_gpt2_lm_head_context;
@@ -722,7 +1013,6 @@ mod tests {
     }
 
     fn test_reader(statement: &LimitedKeyStatement) -> (IndexReader, Vec<u8>) {
-        use zkie_engine::pcs::request::field::Fp3;
         use zkie_engine::pcs::request::table::{index_name, IndexRecord, IndexReader};
         let name = index_name(
             &statement.table_root,
@@ -762,7 +1052,6 @@ mod tests {
 
     #[test]
     fn the_limited_tested_state_needs_every_check() {
-        use zkie_engine::pcs::request::field::Fp3;
         let plan = zkie_models_gpt2::lm_head_plan::lm_head_plan().expect("plan");
         let compiled = zkie_models_gpt2::lm_head_plan::lm_head_compiled().expect("compiled");
         let key_plan = limited_key_plan(&plan, &compiled).expect("key plan");
@@ -844,8 +1133,14 @@ mod tests {
         let salts: Vec<Vec<u8>> = (0..32).map(|position| vec![position as u8; 40]).collect();
         let table = commit_table(shape, Digest([0x55; 32]), &messages, &tails, &salts)
             .expect("table");
-        let mut chain = start_shared_chain(&table.reader, 0x1234, b"statement", None)
-            .expect("chain");
+        let mut chain = Chain::begin(
+            0x1234,
+            &table.reader.configuration,
+            b"statement",
+            &table.reader.record.encode(),
+            None,
+        )
+        .expect("chain");
         let prefix = chain.message().prefix(0, 0).expect("prefix");
         assert!(chain.step(&prefix, 0).expect("step"));
         let positions = draw_shared_columns(&mut chain, shape.code.log_n, 4).expect("positions");
@@ -861,4 +1156,282 @@ mod tests {
         tampered[0].symbols[0] = Fp::from_u64(999);
         assert!(verify_shared_columns(&table.reader, &positions, &tampered).is_err());
     }
+
+    fn shared_plan_fixture() -> (
+        RequestPlan,
+        CompiledPlan,
+        LimitedKeyStatement,
+        IndexReader,
+        Digest,
+    ) {
+        use zkie_engine::pcs::request::table::IndexRecord;
+        let request_plan =
+            zkie_models_gpt2::lm_head_plan::lm_head_plan().expect("request plan");
+        let compiled =
+            zkie_models_gpt2::lm_head_plan::lm_head_compiled().expect("compiled");
+        let plan_identifier = Digest([0x91; 32]);
+        let parameters = limited_key_binding_parameters(&request_plan, plan_identifier)
+            .expect("parameters");
+        let configuration = parameters.digest().expect("configuration");
+        let shape = request_plan.table_shape().expect("shape");
+        let rows = usize::try_from(shape.rows()).expect("rows");
+        let reader = IndexReader {
+            shape,
+            configuration,
+            root: Digest([0x92; 32]),
+            record: IndexRecord {
+                y: vec![Fp3::ZERO; rows],
+            },
+        };
+        let statement = LimitedKeyStatement {
+            version: LIMITED_KEY_VERSION,
+            model_commitment: Digest([0x93; 32]),
+            table_root: reader.root,
+            table_configuration: reader.configuration,
+            table_shape: reader.shape,
+            matrix_rows: 1 << request_plan.table.v,
+            k_lo: request_plan.lin.k_lo,
+            k_col: request_plan.lin.k_col,
+            valid_min: i32::MIN as i64,
+            valid_max: i32::MAX as i64,
+            no_wf: true,
+            trusted_i32_mapping: true,
+        };
+        (request_plan, compiled, statement, reader, plan_identifier)
+    }
+
+    fn build_shared(
+        request_plan: &RequestPlan,
+        compiled: &CompiledPlan,
+        statement: &LimitedKeyStatement,
+        reader: &IndexReader,
+        plan_identifier: Digest,
+        salt: Digest,
+        mask_root: Digest,
+    ) -> Result<LimitedSharedSession> {
+        build_limited_shared_session(
+            request_plan,
+            compiled,
+            statement,
+            reader,
+            plan_identifier,
+            b"gpt2-seq16",
+            salt,
+            mask_root,
+        )
+    }
+
+    #[test]
+    fn the_limited_shared_plan_binds_the_real_configuration_run_and_trees() {
+        let (request_plan, compiled, statement, reader, plan_identifier) =
+            shared_plan_fixture();
+        let salt = Digest([0x94; 32]);
+        let mask_root = Digest([0x95; 32]);
+        let session = build_shared(
+            &request_plan,
+            &compiled,
+            &statement,
+            &reader,
+            plan_identifier,
+            salt,
+            mask_root,
+        )
+        .expect("shared session");
+        let plan = &session.plan;
+        assert!(plan.fault().is_none());
+        assert_eq!(
+            plan.reader.configuration,
+            plan.binding.parameters_digest()
+        );
+        let expected_run = run_value(
+            SHARED_CHAIN_LABEL,
+            &plan.reader.configuration,
+            &salt,
+        )
+        .expect("run");
+        assert_eq!(session.binder.run(), Some(expected_run));
+        let gu = plan.gu.as_ref().expect("G_u shape");
+        assert_eq!(gu.tree.run, expected_run);
+        assert_eq!(gu.tree.configuration, plan.reader.configuration);
+        assert_eq!(gu.tree.log_n, gu.u.code.log_n);
+        assert_eq!(gu.tree.parts.len(), 1);
+        assert_eq!(
+            gu.tree.parts[0].main_symbols,
+            gu.u.main_rows * gu.u.main_deg as u64
+        );
+        assert_eq!(gu.tree.parts[0].mask_symbols, 0);
+        let mask_tree = plan
+            .statement
+            .mask_tree(plan.mask_tree_number)
+            .expect("mask tree");
+        assert_eq!(mask_tree.run, expected_run);
+        assert_eq!(mask_tree.configuration, plan.reader.configuration);
+        assert_eq!(mask_tree.leaf_class, plan.fold.mask_leaf_class);
+        assert_eq!(mask_tree.mask_rows, plan.fold.mask_rows().expect("rows"));
+        assert_eq!(plan.column_draws, LM_HEAD_COLUMN_DRAWS);
+        assert_eq!(
+            plan.ledger.lock().expect("ledger").max_reads(),
+            LM_HEAD_COLUMN_DRAWS as u64
+        );
+        assert_eq!(session.binder.start(), session.chain.value());
+        assert_eq!(session.first_query, session.binder.first_query());
+        plan.check_first_query(&session.first_query)
+            .expect("first query");
+    }
+
+    #[test]
+    fn the_limited_shared_plan_rejects_a_reader_with_another_configuration() {
+        let (request_plan, compiled, statement, mut reader, plan_identifier) =
+            shared_plan_fixture();
+        reader.configuration = Digest([0x96; 32]);
+        assert!(build_shared(
+            &request_plan,
+            &compiled,
+            &statement,
+            &reader,
+            plan_identifier,
+            Digest([0x94; 32]),
+            Digest([0x95; 32]),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_limited_shared_plan_rejects_a_statement_that_does_not_name_the_reader() {
+        let (request_plan, compiled, statement, reader, plan_identifier) =
+            shared_plan_fixture();
+        let mut other = statement.clone();
+        other.table_root = Digest([0x97; 32]);
+        assert!(build_shared(
+            &request_plan,
+            &compiled,
+            &other,
+            &reader,
+            plan_identifier,
+            Digest([0x94; 32]),
+            Digest([0x95; 32]),
+        )
+        .is_err());
+        let mut other = statement.clone();
+        other.k_col = request_plan.lin.k_col - 1;
+        assert!(build_shared(
+            &request_plan,
+            &compiled,
+            &other,
+            &reader,
+            plan_identifier,
+            Digest([0x94; 32]),
+            Digest([0x95; 32]),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_limited_shared_plan_rejects_a_compiled_shape_that_does_not_fit() {
+        let (request_plan, mut compiled, statement, reader, plan_identifier) =
+            shared_plan_fixture();
+        compiled.once.folded.h = 1;
+        assert!(build_shared(
+            &request_plan,
+            &compiled,
+            &statement,
+            &reader,
+            plan_identifier,
+            Digest([0x94; 32]),
+            Digest([0x95; 32]),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_limited_shared_plan_needs_private_bytes_and_a_mask_root() {
+        let (request_plan, compiled, statement, reader, plan_identifier) =
+            shared_plan_fixture();
+        assert!(build_shared(
+            &request_plan,
+            &compiled,
+            &statement,
+            &reader,
+            plan_identifier,
+            Digest::ZERO,
+            Digest([0x95; 32]),
+        )
+        .is_err());
+        assert!(build_shared(
+            &request_plan,
+            &compiled,
+            &statement,
+            &reader,
+            plan_identifier,
+            Digest([0x94; 32]),
+            Digest::ZERO,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_limited_shared_run_and_binding_follow_the_private_bytes() {
+        let (request_plan, compiled, statement, reader, plan_identifier) =
+            shared_plan_fixture();
+        let first = build_shared(
+            &request_plan,
+            &compiled,
+            &statement,
+            &reader,
+            plan_identifier,
+            Digest([0x94; 32]),
+            Digest([0x95; 32]),
+        )
+        .expect("first");
+        let second = build_shared(
+            &request_plan,
+            &compiled,
+            &statement,
+            &reader,
+            plan_identifier,
+            Digest([0x96; 32]),
+            Digest([0x95; 32]),
+        )
+        .expect("second");
+        assert_ne!(first.binder.run(), second.binder.run());
+        assert_ne!(first.binder.start(), second.binder.start());
+        // The G_u tree run is a plan value in the first query, so a different
+        // private run changes the first query as well as the chain start.
+        assert_ne!(first.first_query, second.first_query);
+    }
+
+    #[test]
+    fn the_selected_plan_identifier_enters_the_first_query() {
+        let (request_plan, compiled, statement, reader, plan_identifier) =
+            shared_plan_fixture();
+        let first = build_shared(
+            &request_plan,
+            &compiled,
+            &statement,
+            &reader,
+            plan_identifier,
+            Digest([0x94; 32]),
+            Digest([0x95; 32]),
+        )
+        .expect("first");
+        let other_identifier = Digest([0x98; 32]);
+        let parameters =
+            limited_key_binding_parameters(&request_plan, other_identifier).expect("parameters");
+        let mut other_reader = reader.clone();
+        other_reader.configuration = parameters.digest().expect("configuration");
+        let mut other_statement = statement.clone();
+        other_statement.table_configuration = other_reader.configuration;
+        let second = build_shared(
+            &request_plan,
+            &compiled,
+            &other_statement,
+            &other_reader,
+            other_identifier,
+            Digest([0x94; 32]),
+            Digest([0x95; 32]),
+        )
+        .expect("second");
+        assert_ne!(first.first_query, second.first_query);
+    }
+
 }
