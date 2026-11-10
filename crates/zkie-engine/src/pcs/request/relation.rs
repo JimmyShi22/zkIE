@@ -876,7 +876,7 @@ mod tests {
         VerifiedStatement,
     };
     use crate::pcs::request::foldeq::{
-        reader_table_identity, FoldeqBinding, FoldeqPlan, GammaPath,
+        reader_table_identity, FoldeqBinding, FoldeqEdgeBinding, FoldeqPlan, GammaPath,
     };
     use crate::pcs::request::gu::{GuNotice, GuOracleShape, GuShape};
     use crate::pcs::request::read::ReadLedger;
@@ -2605,6 +2605,7 @@ mod tests {
         FoldeqPlan {
             reader: table.reader.clone(),
             binding: binding_for(&table.reader),
+            edge: FoldeqEdgeBinding::NotAnEdge,
             fold,
             statement,
             oracles: Arc::new(Mutex::new(RuntimeOracles::default())),

@@ -38,10 +38,14 @@
 //! candidate protocol identity, request parameters and plan identifier). The
 //! typed 2b statement is built only after the reader exists and enters the
 //! plan's first query before gamma; its table identity is the reader's actual
-//! root, shape, configuration and record. The request id and case id are
-//! explicit placeholders: this does not claim a real request identity or that
-//! different real requests are distinguished. The G_u runtime-tree starts and
-//! the FOLD fresh root are also demo placeholders.
+//! root, shape, configuration and record. The real fixture supplies a plan
+//! identifier rebuilt from the selected static plan and the actual case id;
+//! unit tests use a fixed demo input. The request id remains an explicit
+//! placeholder: this does not claim a real request identity or that different
+//! real requests are distinguished. The interface guarantees that the
+//! supplied bytes enter the challenge prefix; it does not by itself make the
+//! parameters, case or plan trusted. The G_u runtime-tree starts and the FOLD
+//! fresh root are also demo placeholders.
 //!
 //! The asset-to-FOLD witness derivation interface remains unclosed: there is
 //! no public construction path from an authenticated asset table to the FOLD
@@ -73,7 +77,8 @@ use zkie_engine::pcs::request::fold::{
     VerifiedGroup, VerifiedGroups, VerifiedStatement,
 };
 use zkie_engine::pcs::request::foldeq::{
-    reader_table_identity, FoldeqBinder, FoldeqBinding, FoldeqPlan, FoldeqSession, GammaPath,
+    reader_table_identity, FoldeqBinder, FoldeqBinding, FoldeqEdgeBinding, FoldeqPlan, FoldeqSession,
+    GammaPath,
 };
 use zkie_engine::pcs::request::gu::{GuOracleShape, GuShape};
 use zkie_engine::pcs::request::params::{RequestParams, LEAF_SALT_MIN_BYTES, REQUEST_CHAIN_LABEL};
@@ -145,14 +150,16 @@ pub struct TableComparison {
 /// The independent candidate configuration for the column session. The
 /// parameters are built from the version word, protocol identity, request
 /// parameters and plan identifier; the statement is built only after the
-/// reader exists. `case_id` and `request_id` are explicit demo placeholders:
-/// this does not claim a real request identity or that different real requests
-/// are distinguished.
+/// reader exists. The real fixture supplies the actual case id through
+/// `from_plan`; unit tests use `demo`. `request_id` remains an explicit demo
+/// placeholder: this does not claim a real request identity or that different
+/// real requests are distinguished.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnBindingInput {
     pub parameters: BindingParameters,
     pub case_id: Vec<u8>,
     pub request_id: Digest,
+    pub edge: FoldeqEdgeBinding,
 }
 
 impl ColumnBindingInput {
@@ -177,7 +184,16 @@ impl ColumnBindingInput {
             parameters,
             case_id,
             request_id: DEMO_REQUEST_ID,
+            edge: FoldeqEdgeBinding::NotAnEdge,
         })
+    }
+
+    /// Adds a typed edge identity to this candidate input. The caller is
+    /// responsible for checking it against its independent plan; this method
+    /// only carries the typed value into the first query.
+    pub fn with_edge(mut self, edge: FoldeqEdgeBinding) -> Self {
+        self.edge = edge;
+        self
     }
 
     /// The unit-test-only fixed input. It is not used by the real fixture and
@@ -193,6 +209,7 @@ struct SessionRun {
     gu_root: Digest,
     binding_parameters_digest: Digest,
     binding_table_identity: Digest,
+    edge_bound: bool,
     gamma: Vec<Fp3>,
     eq_gamma: Vec<Fp3>,
     queries: Vec<u64>,
@@ -215,6 +232,7 @@ pub struct ColumnSessionOutcome {
     pub shape: IndexShape,
     pub binding_parameters_digest: Digest,
     pub binding_table_identity: Digest,
+    pub edge_bound: bool,
     pub queries: Vec<u64>,
     pub opened_positions: Vec<u64>,
     pub gamma: Vec<Fp3>,
@@ -644,7 +662,11 @@ struct DemoSetup {
     fold_start: FoldStartMessage,
 }
 
-fn build_demo_setup(table: &AssetEncodingTable, binding: FoldeqBinding) -> Result<DemoSetup> {
+fn build_demo_setup(
+    table: &AssetEncodingTable,
+    binding: FoldeqBinding,
+    edge: FoldeqEdgeBinding,
+) -> Result<DemoSetup> {
     let fold_shape = demo_fold_shape(table.shape)?;
     let gu_shape = demo_gu_shape(table.shape, fold_shape.mask_code)?;
     let fold_layout = demo_fold_layout(&fold_shape)?;
@@ -684,6 +706,7 @@ fn build_demo_setup(table: &AssetEncodingTable, binding: FoldeqBinding) -> Resul
     let plan = FoldeqPlan {
         reader: table.reader.clone(),
         binding,
+        edge,
         fold: fold_shape,
         statement,
         oracles: Arc::new(Mutex::new(oracles)),
@@ -735,7 +758,7 @@ fn run_session_with_demo_binding(
 ) -> Result<SessionRun> {
     let input = ColumnBindingInput::demo()?;
     let binding = bind_table(table, &input)?;
-    run_session(table, gu_root, binding)
+    run_session(table, gu_root, binding, FoldeqEdgeBinding::NotAnEdge)
 }
 
 /// Runs the candidate FOLDEQ session with the fixed G_u root. The root is an
@@ -747,10 +770,12 @@ fn run_session(
     table: &AssetEncodingTable,
     gu_root: &Digest,
     binding: FoldeqBinding,
+    edge: FoldeqEdgeBinding,
 ) -> Result<SessionRun> {
     let binding_parameters_digest = binding.parameters_digest();
     let binding_table_identity = binding.table_identity();
-    let setup = build_demo_setup(table, binding)?;
+    let edge_bound = edge.is_bound();
+    let setup = build_demo_setup(table, binding, edge)?;
     let mut session =
         FoldeqSession::open(setup.plan, setup.binder, setup.chain)?;
     session.bind_first_query(&setup.first_query)?;
@@ -795,6 +820,7 @@ fn run_session(
         gu_root: *gu_root,
         binding_parameters_digest,
         binding_table_identity,
+        edge_bound,
         gamma,
         eq_gamma,
         queries,
@@ -832,7 +858,7 @@ pub fn verify_column_session(
     )?;
     let binding = bind_table(&table, input)?;
     let gu_root = GU_NOTICE_ROOT;
-    let run = run_session(&table, &gu_root, binding)?;
+    let run = run_session(&table, &gu_root, binding, input.edge.clone())?;
     if run.gu_root != gu_root
         || !run.merge_targets
         || !run.comparison.matches
@@ -849,6 +875,7 @@ pub fn verify_column_session(
         shape: table.shape,
         binding_parameters_digest: run.binding_parameters_digest,
         binding_table_identity: run.binding_table_identity,
+        edge_bound: run.edge_bound,
         queries: run.queries,
         opened_positions: run.opened_positions,
         gamma: run.gamma,
@@ -988,7 +1015,7 @@ mod tests {
     ) -> Result<(FoldeqSession, Vec<Fp3>)> {
         let input = ColumnBindingInput::demo()?;
         let binding = bind_table(table, &input)?;
-        let setup = build_demo_setup(table, binding)?;
+        let setup = build_demo_setup(table, binding, input.edge)?;
         let mut session = FoldeqSession::open(setup.plan, setup.binder, setup.chain)?;
         session.bind_first_query(&setup.first_query)?;
         session.draw_gamma()?;

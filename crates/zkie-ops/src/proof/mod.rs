@@ -1,6 +1,7 @@
 //! Relation proof interfaces and shared model commitment.
 pub mod binding;
 pub mod column_session;
+pub mod edge_session;
 pub mod lin_session;
 pub mod plan;
 pub mod relations;

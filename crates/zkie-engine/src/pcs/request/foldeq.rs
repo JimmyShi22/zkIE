@@ -313,6 +313,221 @@ pub fn reader_table_identity(reader: &IndexReader) -> Result<Digest> {
     Ok(digest_bytes(&writer.into_bytes()))
 }
 
+/// Direction of a graph edge. The candidate step plan currently only carries
+/// forward edges; the tag is explicit so a future direction cannot be implied
+/// by field order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EdgeDirection {
+    Forward,
+}
+
+/// A typed layout or slice on one edge. It mirrors the selected static plan's
+/// layout vocabulary without importing the plan module.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EdgeLayout {
+    Flat,
+    Range { start: u64, count: u64 },
+    Rows { row_width: u64, start: u64, count: u64 },
+    Columns { row_width: u64, start: u64, count: u64 },
+    Transpose { rows: u64, cols: u64 },
+    Broadcast { rows: u64 },
+    Chain(Vec<EdgeLayout>),
+}
+
+impl EdgeLayout {
+    fn check(&self, depth: u32) -> Result<()> {
+        if depth > 16 {
+            return Err(Error::ResourceLimit);
+        }
+        match self {
+            Self::Flat => Ok(()),
+            Self::Range { count, .. } => {
+                if *count == 0 {
+                    return Err(Error::InvalidConfig);
+                }
+                Ok(())
+            }
+            Self::Rows {
+                row_width, count, ..
+            }
+            | Self::Columns {
+                row_width, count, ..
+            } => {
+                if *row_width == 0 || *count == 0 {
+                    return Err(Error::InvalidConfig);
+                }
+                Ok(())
+            }
+            Self::Transpose { rows, cols } => {
+                if *rows == 0 || *cols == 0 {
+                    return Err(Error::InvalidConfig);
+                }
+                Ok(())
+            }
+            Self::Broadcast { rows } => {
+                if *rows == 0 {
+                    return Err(Error::InvalidConfig);
+                }
+                Ok(())
+            }
+            Self::Chain(parts) => {
+                if parts.is_empty() || parts.len() > 16 {
+                    return Err(Error::InvalidConfig);
+                }
+                for part in parts {
+                    part.check(depth + 1)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn encode(&self, writer: &mut CanonicalWriter) {
+        match self {
+            Self::Flat => writer.put_u64(0),
+            Self::Range { start, count } => {
+                writer.put_u64(1);
+                writer.put_u64(*start);
+                writer.put_u64(*count);
+            }
+            Self::Rows {
+                row_width,
+                start,
+                count,
+            } => {
+                writer.put_u64(2);
+                writer.put_u64(*row_width);
+                writer.put_u64(*start);
+                writer.put_u64(*count);
+            }
+            Self::Columns {
+                row_width,
+                start,
+                count,
+            } => {
+                writer.put_u64(3);
+                writer.put_u64(*row_width);
+                writer.put_u64(*start);
+                writer.put_u64(*count);
+            }
+            Self::Transpose { rows, cols } => {
+                writer.put_u64(4);
+                writer.put_u64(*rows);
+                writer.put_u64(*cols);
+            }
+            Self::Broadcast { rows } => {
+                writer.put_u64(5);
+                writer.put_u64(*rows);
+            }
+            Self::Chain(parts) => {
+                writer.put_u64(6);
+                writer.put_u64(parts.len() as u64);
+                for part in parts {
+                    part.encode(writer);
+                }
+            }
+        }
+    }
+}
+
+/// A previous-step output edge. It has no asset identity: the source is a
+/// producer output, not an asset reference.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrevEdge {
+    pub producer_step: u64,
+    pub producer_output: u64,
+    pub consumer_step: u64,
+    pub input_port: u64,
+    pub direction: EdgeDirection,
+    pub layout: EdgeLayout,
+}
+
+/// An asset-reference edge. It has no producer step/output: the source is an
+/// asset identity, not a previous-step output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetEdge {
+    pub consumer_step: u64,
+    pub input_port: u64,
+    pub direction: EdgeDirection,
+    pub asset_id: u64,
+    pub path: Vec<u8>,
+    pub start: Digest,
+    pub root: Digest,
+    pub rows: u64,
+    pub row_width: u64,
+    pub element_count: u64,
+    pub layout: EdgeLayout,
+}
+
+/// A typed edge declaration. `NotAnEdge` is explicit for sessions that are
+/// not graph-edge sessions; the two bound variants keep previous-step and
+/// asset-reference semantics separate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FoldeqEdgeBinding {
+    NotAnEdge,
+    Prev(PrevEdge),
+    Asset(AssetEdge),
+}
+
+impl FoldeqEdgeBinding {
+    pub fn is_bound(&self) -> bool {
+        !matches!(self, Self::NotAnEdge)
+    }
+
+    pub fn check(&self) -> Result<()> {
+        match self {
+            Self::NotAnEdge => Ok(()),
+            Self::Prev(edge) => {
+                if edge.producer_step == edge.consumer_step {
+                    return Err(Error::InvalidConfig);
+                }
+                edge.layout.check(0)
+            }
+            Self::Asset(edge) => {
+                if edge.path.is_empty()
+                    || edge.rows == 0
+                    || edge.row_width == 0
+                    || edge.element_count == 0
+                    || edge.start == Digest::ZERO
+                    || edge.root == Digest::ZERO
+                {
+                    return Err(Error::InvalidConfig);
+                }
+                edge.layout.check(0)
+            }
+        }
+    }
+
+    fn encode(&self, writer: &mut CanonicalWriter) {
+        match self {
+            Self::NotAnEdge => {}
+            Self::Prev(edge) => {
+                writer.put_u64(1);
+                writer.put_u64(edge.producer_step);
+                writer.put_u64(edge.producer_output);
+                writer.put_u64(edge.consumer_step);
+                writer.put_u64(edge.input_port);
+                writer.put_u64(0);
+                edge.layout.encode(writer);
+            }
+            Self::Asset(edge) => {
+                writer.put_u64(2);
+                writer.put_u64(edge.consumer_step);
+                writer.put_u64(edge.input_port);
+                writer.put_u64(0);
+                writer.put_u64(edge.asset_id);
+                writer.put_bytes(&edge.path);
+                writer.put_digest(&edge.start);
+                writer.put_digest(&edge.root);
+                writer.put_u64(edge.rows);
+                writer.put_u64(edge.row_width);
+                writer.put_u64(edge.element_count);
+                edge.layout.encode(writer);
+            }
+        }
+    }
+}
+
 /// The verifier's FOLDEQ plan. The reader is the committed table, the fold and
 /// runtime mask-tree layouts and the group registry come from the statement,
 /// and the seed/read budgets and column draw count come from the plan. None of
@@ -325,6 +540,9 @@ pub struct FoldeqPlan {
     /// of the first query; the parameters digest must equal the reader's
     /// configuration. There is no unbound production form.
     pub binding: FoldeqBinding,
+    /// The typed graph edge, if this is an edge session. `NotAnEdge` is
+    /// explicit and is the only non-edge form.
+    pub edge: FoldeqEdgeBinding,
     pub fold: FoldShape,
     pub statement: Arc<VerifiedStatement>,
     pub oracles: Arc<Mutex<RuntimeOracles>>,
@@ -363,6 +581,9 @@ impl FoldeqPlan {
             || self.binding.statement_bytes.len() > MAX_BINDING_STATEMENT_BYTES
         {
             return Some("the binding statement has no admitted bytes");
+        }
+        if self.edge.check().is_err() {
+            return Some("the edge binding is not well formed");
         }
         if let Some(fault) = fold_mask_shape_fault(&self.fold) {
             return Some(fault);
@@ -491,6 +712,10 @@ impl FoldeqPlan {
         // the verified statement id. The parameters digest is the binder's
         // parameter value, not these bytes.
         writer.put_bytes(&self.binding.statement_bytes);
+        // The typed edge identity, after the statement and before all shapes
+        // and challenge fields. A non-edge session writes no edge marker, so
+        // the 2f single-step first query is unchanged.
+        self.edge.encode(&mut writer);
         // The trusted table and fold shapes. Distances are the first-query
         // exception and stay plan values; the configuration is the binder's
         // parameters digest, not this statement.
@@ -1795,6 +2020,7 @@ mod tests {
         let plan = FoldeqPlan {
             reader: table.reader.clone(),
             binding: binding_for(&table.reader),
+            edge: FoldeqEdgeBinding::NotAnEdge,
             fold: fold_shape(),
             statement,
             oracles: Arc::new(Mutex::new(RuntimeOracles::default())),
