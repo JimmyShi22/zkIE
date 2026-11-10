@@ -1,0 +1,17 @@
+   Compiling zkie-ops v0.1.0 (/data/zkIE/crates/zkie-ops)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.40s
+     Running unittests src/lib.rs (target/debug/deps/zkie_ops-a527cf57462e281a)
+
+running 9 tests
+test proof::lin_session::tests::wrong_folded_message_with_a_valid_commitment_is_rejected ... ok
+test proof::lin_session::tests::replaced_commitment_root_changes_the_challenge_or_rejects ... ok
+test proof::lin_session::tests::prover_and_verifier_agree_and_all_local_checks_hold ... ok
+test proof::lin_session::tests::wrong_omega_message_with_a_valid_commitment_is_rejected_by_control ... ok
+test proof::lin_session::tests::fixed_test_seed_is_reproducible ... ok
+test proof::lin_session::tests::message_field_order_is_bound ... ok
+test proof::lin_session::tests::table_opening_root_row_and_path_are_checked ... ok
+test proof::lin_session::tests::claim_target_and_weights_tampering_is_rejected ... ok
+test proof::lin_session::tests::wrong_w_message_with_a_valid_commitment_is_rejected_by_control ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; finished in 0.00s
+
