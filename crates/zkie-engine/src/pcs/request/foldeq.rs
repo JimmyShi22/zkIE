@@ -42,6 +42,7 @@ use crate::pcs::request::chain::{
     Chain, KIND_ALGEBRAIC, KIND_EPSILON, KIND_EMPTY, KIND_POSITIONS, KIND_SEAL, KIND_SEED,
 };
 use crate::pcs::request::field::{Fp, Fp3};
+use crate::pcs::request::pow::{search_nonce, verify_nonce, MAX_WORK_BITS};
 use crate::pcs::request::gu::{GuMembership, GuNotice, GuOracleShape, GuRegistry, GuShape};
 use crate::pcs::request::relation::{
     column_plan_columns, column_row, column_target, foldeq_weights, gu_layout_fault,
@@ -1804,21 +1805,42 @@ impl FoldeqSession {
     }
 
     pub fn draw_queries(&mut self) -> Result<()> {
+        self.draw_queries_with_work(0, Some(0)).map(|_| ())
+    }
+
+    /// Draws the column positions with `work_bits` of proof of work before the
+    /// verifier's message. The prover passes `None` and searches; the verifier
+    /// passes the nonce carried by the proof. A failed work test does not
+    /// advance the chain. Returns the nonce (zero when no work is asked).
+    pub fn draw_queries_with_work(
+        &mut self,
+        work_bits: u8,
+        nonce: Option<u64>,
+    ) -> Result<u64> {
         let expected = if self.plan.gu.is_some() {
             Stage::GuJoined
         } else {
             Stage::Gu
         };
-        if self.stage != expected {
+        if self.stage != expected || work_bits > MAX_WORK_BITS {
             return Err(Error::InvalidSessionState);
         }
-        let prefix = self.chain.message().prefix(KIND_POSITIONS, 0)?;
-        if !self.chain.step(&prefix, 0)? {
+        let prefix = self.chain.message().prefix(KIND_POSITIONS, work_bits)?;
+        let nonce = match nonce {
+            Some(value) => {
+                if !verify_nonce(&prefix, value, work_bits)? {
+                    return Err(Error::InvalidProof);
+                }
+                value
+            }
+            None => search_nonce(&prefix, 1u64 << 24)?,
+        };
+        if !self.chain.step(&prefix, nonce)? {
             return Err(Error::InvalidProof);
         }
         self.queries = self.plan.draw_queries(&mut self.chain)?;
         self.stage = Stage::Queried;
-        Ok(())
+        Ok(nonce)
     }
 
     /// Verify one opening per unique physical position and map the verified

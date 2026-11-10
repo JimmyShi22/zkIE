@@ -15,6 +15,7 @@ use zkie_engine::pcs::request::cs_stage::{
 };
 use zkie_engine::pcs::request::field::Fp3;
 use zkie_engine::pcs::request::gu::GuOracleShape;
+use zkie_engine::pcs::request::pow::{search_nonce, verify_nonce, MAX_WORK_BITS};
 use zkie_engine::pcs::request::proximity::SingleRows;
 use zkie_engine::pcs::request::read::{draw_positions, unique_sorted};
 use zkie_engine::pcs::request::relation::{oracle_sample_row_index, sample_cube_of, GuWitness};
@@ -200,6 +201,7 @@ pub struct CsMultiSession {
     answer: Option<Fp3>,
     positions: Vec<u64>,
     theta: Fp3,
+    work_bits: u8,
     claims: Option<SwitchedClaims>,
 }
 
@@ -247,6 +249,7 @@ impl CsMultiSession {
             answer: None,
             positions: Vec::new(),
             theta: Fp3::ZERO,
+            work_bits: 0,
             claims: None,
         })
     }
@@ -305,16 +308,54 @@ impl CsMultiSession {
     }
 
     pub fn draw_positions_theta(&mut self, count: usize) -> Result<(Vec<u64>, Fp3)> {
+        let (positions, theta, _nonce) = self.draw_positions_theta_with_nonce(count, Some(0))?;
+        Ok((positions, theta))
+    }
+
+    /// Sets the work bits of the following position draw. The value comes from
+    /// the trusted request plan; zero keeps the plain draw.
+    pub fn set_work_bits(&mut self, bits: u8) -> Result<()> {
+        if self.stage != Stage::Answered || bits > MAX_WORK_BITS {
+            return Err(Error::InvalidSessionState);
+        }
+        self.work_bits = bits;
+        Ok(())
+    }
+
+    /// Draws the positions with proof of work before the verifier's message.
+    /// The prover passes `None` and searches; the verifier passes the nonce the
+    /// prover carried. A failed test leaves the chain unchanged. Returns the
+    /// positions, theta and the nonce.
+    pub fn draw_positions_theta_with_nonce(
+        &mut self,
+        count: usize,
+        nonce: Option<u64>,
+    ) -> Result<(Vec<u64>, Fp3, u64)> {
         if self.stage != Stage::Answered || count == 0 {
             return Err(Error::InvalidSessionState);
         }
-        absorb(&mut self.chain, STAGE_POSITIONS, &[count as u64])?;
+        let mut message = self.chain.message();
+        message.push_u64(STAGE_POSITIONS);
+        message.push_u64(count as u64);
+        let prefix = message.prefix(KIND_ALGEBRAIC, self.work_bits)?;
+        let nonce = match nonce {
+            Some(value) => {
+                if !verify_nonce(&prefix, value, self.work_bits)? {
+                    return Err(Error::InvalidProof);
+                }
+                value
+            }
+            None => search_nonce(&prefix, 1u64 << 24)?,
+        };
+        if !self.chain.step(&prefix, nonce)? {
+            return Err(Error::InvalidProof);
+        }
         let positions = draw_positions(&mut self.chain, count, self.handoff.code.log_n)?;
         let theta = self.chain.draw_e()?;
         self.positions = positions.clone();
         self.theta = theta;
         self.stage = Stage::Positions;
-        Ok((positions, theta))
+        Ok((positions, theta, nonce))
     }
 
     /// Authenticates the old main and mask symbols through the original member

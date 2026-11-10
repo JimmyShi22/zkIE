@@ -377,6 +377,8 @@ pub struct LimitedSharedSession {
     pub base: BaseStarBinding,
     pub switches: Vec<SwitchTarget>,
     pub switch_positions: Vec<u64>,
+    pub column_work_bits: u8,
+    pub switch_work_bits: u8,
 }
 
 /// Builds the binding parameters of the limited key. The plan identifier is
@@ -418,6 +420,8 @@ struct LimitedPlanParts {
     base: BaseStarBinding,
     switches: Vec<SwitchTarget>,
     switch_positions: Vec<u64>,
+    column_work_bits: u8,
+    switch_work_bits: u8,
     reader: IndexReader,
     statement_digest: Digest,
     leaf_class: u32,
@@ -436,6 +440,10 @@ pub struct LimitedVerifySetup {
     /// The old group's real position count at each switch, from the trusted
     /// compiled plan. The verifier rejects a public switch plan that differs.
     pub switch_positions: Vec<u64>,
+    /// Work bits of the column draw and of each switch draw, from the trusted
+    /// plan's once and shared scopes.
+    pub column_work_bits: u8,
+    pub switch_work_bits: u8,
     pub fresh_plan: MaskTreePlan,
 }
 
@@ -450,6 +458,8 @@ fn build_limited_plan_parts(
 ) -> Result<LimitedPlanParts> {
     request_plan.validate()?;
     request_plan.validate_compiled(compiled)?;
+    let column_work_bits = request_plan.work.once.positions;
+    let switch_work_bits = request_plan.work.shared.positions;
     if random_bytes == Digest::ZERO || case_id.is_empty() {
         return Err(Error::InvalidConfig);
     }
@@ -667,6 +677,8 @@ fn build_limited_plan_parts(
         base,
         switches,
         switch_positions,
+        column_work_bits,
+        switch_work_bits,
         reader: reader.clone(),
         statement_digest: statement.digest(),
         leaf_class: compiled.once_foldeq.fold_leaf_class,
@@ -758,6 +770,8 @@ fn finish_limited_setup(
         base: parts.base,
         switches: parts.switches,
         switch_positions: parts.switch_positions,
+        column_work_bits: parts.column_work_bits,
+        switch_work_bits: parts.switch_work_bits,
         fresh_plan: parts.mask_tree,
     })
 }
@@ -774,6 +788,8 @@ impl LimitedSharedSession {
             base: self.base.clone(),
             switches: self.switches.clone(),
             switch_positions: self.switch_positions.clone(),
+            column_work_bits: self.column_work_bits,
+            switch_work_bits: self.switch_work_bits,
             fresh_plan: self.mask.tree().plan.clone(),
         }
     }
@@ -889,6 +905,8 @@ pub fn build_limited_shared_session(
         base: setup.base,
         switches: setup.switches,
         switch_positions: setup.switch_positions,
+        column_work_bits: setup.column_work_bits,
+        switch_work_bits: setup.switch_work_bits,
     })
 }
 
@@ -1345,6 +1363,7 @@ pub struct LimitedSwitchRecord {
     pub identity: Digest,
     pub declared_root: Digest,
     pub sample_answer: Fp3,
+    pub nonce: u64,
     pub member_openings: Vec<RuntimeTreeOpening>,
     pub fresh_opening: RuntimeTreeOpening,
     pub old_mask_root: Option<Digest>,
@@ -1365,6 +1384,7 @@ pub struct LimitedStageFoldRecord {
 /// sent and the final BASE artifact.
 #[derive(Clone, Debug, Default)]
 pub struct LimitedChainRecord {
+    pub column_nonce: u64,
     pub gu_root: Option<Digest>,
     pub gu_answers: Vec<Fp3>,
     pub omega_root: Option<Digest>,
@@ -1380,7 +1400,7 @@ pub struct LimitedChainRecord {
 /// One versioned whole-chain artifact. It carries the statement and every
 /// public prover message; no folded message, switched row, tail or mask
 /// coefficient is included.
-pub const LIMITED_CHAIN_ARTIFACT_VERSION: u64 = 1;
+pub const LIMITED_CHAIN_ARTIFACT_VERSION: u64 = 2;
 
 #[derive(Clone, Debug)]
 pub struct LimitedStageFoldArtifact {
@@ -1393,6 +1413,7 @@ pub struct LimitedSwitchArtifact {
     pub identity: Digest,
     pub declared_root: Digest,
     pub sample_answer: Fp3,
+    pub nonce: u64,
     pub member_openings: Vec<RuntimeTreeOpening>,
     pub fresh_opening: RuntimeTreeOpening,
     pub old_mask_root: Option<Digest>,
@@ -1410,6 +1431,7 @@ pub struct LimitedChainArtifact {
     pub omega_root: Option<Digest>,
     pub omega_answers: Vec<Fp3>,
     pub column_openings: Vec<ColumnOpening>,
+    pub column_nonce: u64,
     pub fold_start: FoldStartMessage,
     pub fold_rounds: Vec<(Fp3, Fp3)>,
     pub switches: Vec<LimitedSwitchArtifact>,
@@ -1547,6 +1569,7 @@ fn put_switch(
     writer.put_digest(&switch.identity);
     writer.put_digest(&switch.declared_root);
     writer.put_fp3(&switch.sample_answer);
+    writer.put_u64(switch.nonce);
     writer.put_u64(switch.member_openings.len() as u64);
     for opening in &switch.member_openings {
         put_runtime_opening(writer, opening);
@@ -1735,6 +1758,7 @@ fn read_switch(
     let identity = reader.get_digest()?;
     let declared_root = reader.get_digest()?;
     let sample_answer = reader.get_fp3()?;
+    let nonce = reader.get_u64()?;
     let member_count = read_count(reader, limits)?;
     let mut member_openings = Vec::new();
     member_openings
@@ -1763,6 +1787,7 @@ fn read_switch(
         identity,
         declared_root,
         sample_answer,
+        nonce,
         member_openings,
         fresh_opening,
         old_mask_root,
@@ -1796,6 +1821,7 @@ impl LimitedChainArtifact {
                 identity: switch.identity,
                 declared_root: switch.declared_root,
                 sample_answer: switch.sample_answer,
+                nonce: switch.nonce,
                 member_openings: switch.member_openings.clone(),
                 fresh_opening: switch.fresh_opening.clone(),
                 old_mask_root: switch.old_mask_root,
@@ -1815,6 +1841,7 @@ impl LimitedChainArtifact {
             omega_root,
             omega_answers: record.omega_answers.clone(),
             column_openings: unique_column_openings(&record.column_openings)?,
+            column_nonce: record.column_nonce,
             fold_start,
             fold_rounds: record.fold_rounds.clone(),
             switches,
@@ -1843,6 +1870,7 @@ impl LimitedChainArtifact {
         for opening in &self.column_openings {
             put_column_opening(&mut writer, opening);
         }
+        writer.put_u64(self.column_nonce);
         put_fold_start(&mut writer, &self.fold_start);
         writer.put_u64(self.fold_rounds.len() as u64);
         for (first, second) in &self.fold_rounds {
@@ -1898,6 +1926,7 @@ impl LimitedChainArtifact {
         {
             return Err(Error::InvalidEncoding);
         }
+        let column_nonce = reader.get_u64()?;
         let fold_start = read_fold_start(&mut reader)?;
         let round_count = read_count(&mut reader, limits)?;
         let mut fold_rounds = Vec::new();
@@ -1927,6 +1956,7 @@ impl LimitedChainArtifact {
             omega_root,
             omega_answers,
             column_openings,
+            column_nonce,
             fold_start,
             fold_rounds,
             switches,
@@ -2279,6 +2309,8 @@ pub fn run_limited_shared_to_columns(
     let base_binding = setup.base.clone();
     let expected_switches = setup.switches.clone();
     let expected_positions = setup.switch_positions.clone();
+    let column_work_bits = setup.column_work_bits;
+    let switch_work_bits = setup.switch_work_bits;
     let mut session = FoldeqSession::open(setup.plan, setup.binder, setup.chain)?;
     let mut record = LimitedChainRecord::default();
     session.bind_first_query(&setup.first_query)?;
@@ -2307,7 +2339,7 @@ pub fn run_limited_shared_to_columns(
     }
     session.join_gu_record()?;
     mem("record");
-    session.draw_queries()?;
+    record.column_nonce = session.draw_queries_with_work(column_work_bits, None)?;
     mem("queries");
     let queries = session.queries().to_vec();
     let positions = unique_sorted(&queries);
@@ -2487,6 +2519,7 @@ pub fn run_limited_shared_to_columns(
                     &stage,
                     inputs.target,
                     inputs.positions,
+                    switch_work_bits,
                     inputs.plan.clone(),
                     inputs.main_tails.clone(),
                     inputs.mask_tails.clone(),
@@ -2746,11 +2779,12 @@ pub fn verify_limited_chain(
         cs.receive_declarations(record.identity, record.declared_root)?;
         cs.draw_sample_seed()?;
         cs.receive_answer(record.sample_answer)?;
+        cs.set_work_bits(setup.switch_work_bits)?;
         let count = usize::try_from(plan.positions).map_err(|_| Error::ResourceLimit)?;
         if count == 0 {
             return Err(Error::IncompleteArtifact);
         }
-        cs.draw_positions_theta(count)?;
+        cs.draw_positions_theta_with_nonce(count, Some(record.nonce))?;
         let claims = cs
             .authenticate_and_register(
                 &record.member_openings,
@@ -3055,7 +3089,10 @@ pub fn verify_limited_fold(
         session.receive_gu_answer(*answer)?;
     }
     session.join_gu_record()?;
-    session.draw_queries()?;
+    session.draw_queries_with_work(
+        setup.column_work_bits,
+        Some(artifact.column_nonce),
+    )?;
     let mut openings = Vec::with_capacity(session.queries().len());
     for query in session.queries() {
         let at = artifact
@@ -4466,6 +4503,7 @@ fn run_switch(
     stage: &LimitedFoldStage,
     target: SwitchTarget,
     positions: u64,
+    work_bits: u8,
     plan: RuntimeTreePlan,
     main_tails: Vec<Vec<Fp3>>,
     mask_tails: Vec<Vec<Fp3>>,
@@ -4508,8 +4546,9 @@ fn run_switch(
     let seed = cs.draw_sample_seed()?;
     let sample_answer = prover.sample_answer(&seed)?;
     cs.receive_answer(sample_answer)?;
+    cs.set_work_bits(work_bits)?;
     let count = usize::try_from(positions).map_err(|_| Error::ResourceLimit)?;
-    let (positions, _theta) = cs.draw_positions_theta(count)?;
+    let (positions, _theta, nonce) = cs.draw_positions_theta_with_nonce(count, None)?;
     let unique = unique_sorted(&positions);
     let mask_positions: Vec<u64> = positions
         .iter()
@@ -4546,6 +4585,7 @@ fn run_switch(
             identity,
             declared_root,
             sample_answer,
+            nonce,
             member_openings,
             fresh_opening,
             old_mask_root,
@@ -4918,6 +4958,7 @@ mod tests {
         let code = build_code_plan(3, 4, 1).expect("code");
         LimitedChainArtifact {
             version: LIMITED_CHAIN_ARTIFACT_VERSION,
+            column_nonce: 0,
             protocol_identity: SESSION_PROTOCOL_IDENTITY,
             statement: test_statement(),
             gu_root: Digest([0x44; 32]),
@@ -4945,6 +4986,7 @@ mod tests {
             },
             fold_rounds: vec![(Fp3::ONE, Fp3::from_u64(9))],
             switches: vec![LimitedSwitchArtifact {
+                nonce: 0,
                 identity: Digest([0x47; 32]),
                 declared_root: Digest([0x48; 32]),
                 sample_answer: Fp3::from_u64(10),
@@ -5875,6 +5917,8 @@ mod tests {
             base,
             switches: vec![target, target2, final_target],
             switch_positions: vec![2, 2, 2],
+            column_work_bits: 0,
+            switch_work_bits: 0,
         };
         let source_salts: Vec<Vec<u8>> = (0..16)
             .map(|position| vec![(position as u8) ^ 0x5a; 40])
@@ -6483,6 +6527,9 @@ mod tests {
             &artifact_bytes,
         );
         let decoded = LimitedChainArtifact::decode(&artifact_bytes).expect("artifact decode");
+        assert_eq!(verify_setup.column_work_bits, request_plan.work.once.positions);
+        assert_eq!(verify_setup.switch_work_bits, request_plan.work.shared.positions);
+        assert!(verify_setup.column_work_bits > 0 && verify_setup.switch_work_bits > 0);
         let verified_seal = verify_limited_chain(
             &verify_setup,
             &masked,
@@ -6531,6 +6578,12 @@ mod tests {
         wrong_member.switches[0].member_openings[0].columns[0].symbols[0] =
             wrong_member.switches[0].member_openings[0].columns[0].symbols[0] + Fp::ONE;
         assert!(verify(&wrong_member).is_err());
+        let mut wrong_column_nonce = decoded.clone();
+        wrong_column_nonce.column_nonce ^= 1;
+        assert!(verify(&wrong_column_nonce).is_err());
+        let mut wrong_switch_nonce = decoded.clone();
+        wrong_switch_nonce.switches[0].nonce ^= 1;
+        assert!(verify(&wrong_switch_nonce).is_err());
         let mut wrong_order = decoded.clone();
         wrong_order.switches.swap(0, 1);
         assert!(verify(&wrong_order).is_err());
@@ -7578,6 +7631,7 @@ mod stage_tests {
             .map(|(plan, record)| {
                 json!({
                     "positions": plan.positions,
+                    "nonce": record.nonce,
                     "unique_main": record
                         .member_openings
                         .iter()
@@ -7599,6 +7653,11 @@ mod stage_tests {
                 "chain_wall_s": chain_wall,
                 "artifact_bytes": bytes.len(),
                 "sealed": format!("{sealed:?}"),
+                "column_nonce": result.record.column_nonce,
+                "work_bits": {
+                    "columns": inputs.request_plan.work.once.positions,
+                    "switches": inputs.request_plan.work.shared.positions,
+                },
                 "draws": draws,
             }),
         ))
