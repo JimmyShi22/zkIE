@@ -77,7 +77,7 @@ fn selected_gpt2_fixture_send_data_flow() {
     )
     .unwrap();
     println!("send_session_ms={}", started.elapsed().as_millis());
-    println!("committed_root={:?}", outcome.committed.root);
+    println!("committed_root={:?}", outcome.committed.root());
     println!("seeds={:?}", outcome.seeds);
     println!("provider_answers={:?}", outcome.provider_answers);
     println!("sample_target={:?}", sample_target(&outcome));
@@ -101,10 +101,10 @@ fn selected_gpt2_fixture_send_data_flow() {
         outcome.provider_answers[0]
     );
     assert!(outcome.combine.chain_handoff);
-    assert_eq!(outcome.committed.root, outcome.gu_root);
+    assert_eq!(outcome.committed.root(), outcome.gu_root);
     assert_eq!(
         outcome.committed.recompute_root().unwrap(),
-        outcome.committed.root
+        outcome.committed.root()
     );
 
     // Auxiliary test oracle: recompute the provider's sample-form answers from
@@ -117,6 +117,36 @@ fn selected_gpt2_fixture_send_data_flow() {
     ));
     let oracle_answers = provider.answers(&outcome.seeds).unwrap();
     assert_eq!(oracle_answers, outcome.provider_answers);
+    assert_eq!(
+        provider.answers(&outcome.seeds).unwrap(),
+        oracle_answers
+    );
+
+    // The mask pad is a reserved message value encoded before the seed; the
+    // seed only supplies its linear coefficient. A different nonzero pad must
+    // change both the committed root and the sample answer.
+    let mask_code = outcome.gu_shape.u.mask_code.unwrap();
+    let pad_index = (mask_code.ell - outcome.gu_shape.u.answers as u64) as usize;
+    let zero_pad = Arc::new(
+        CommittedGuWitness::new_with_mask_pad(&outcome.gu_shape, Fp3::ZERO).unwrap(),
+    );
+    let nonzero_pad = Arc::new(
+        CommittedGuWitness::new_with_mask_pad(&outcome.gu_shape, Fp3::from_u64(0x1234))
+            .unwrap(),
+    );
+    assert_eq!(zero_pad.mask_messages()[0][pad_index], Fp3::ZERO);
+    assert_eq!(
+        nonzero_pad.mask_messages()[0][pad_index],
+        Fp3::from_u64(0x1234)
+    );
+    assert_ne!(zero_pad.root(), nonzero_pad.root());
+    assert_eq!(zero_pad.recompute_root().unwrap(), zero_pad.root());
+    let zero_provider = FixtureSendProvider::from_committed(Arc::clone(&zero_pad)).unwrap();
+    let nonzero_provider =
+        FixtureSendProvider::from_committed(Arc::clone(&nonzero_pad)).unwrap();
+    let zero_answers = zero_provider.answers(&outcome.seeds).unwrap();
+    let nonzero_answers = nonzero_provider.answers(&outcome.seeds).unwrap();
+    assert_ne!(zero_answers, nonzero_answers);
 
     // A syntactically valid wrong answer is registered as a pending sample
     // claim, not rejected or self-certified.
@@ -152,9 +182,9 @@ fn selected_gpt2_fixture_send_data_flow() {
     assert!(matches!(truncated, Err(Error::ShapeMismatch)));
 
     let other = Arc::new(CommittedGuWitness::new_with_tag(&outcome.gu_shape, 7).unwrap());
-    assert_ne!(other.root, outcome.committed.root);
+    assert_ne!(other.root(), outcome.committed.root());
     assert!(matches!(
-        FixtureSendProvider::from_committed_with_root(other, Some(outcome.committed.root)),
+        FixtureSendProvider::from_committed_with_root(other, Some(outcome.committed.root())),
         Err(Error::StatementMismatch)
     ));
 
