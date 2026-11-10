@@ -16,6 +16,7 @@ use zkie_core::types::Digest;
 use zkie_engine::pcs::request::code::build_code_plan;
 use zkie_engine::pcs::request::table::{validate_index_shape, IndexShape, TableDistances};
 use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
+use zkie_ops::proof::hidden_send_session::{ActivationCommitment, ActivationShape};
 
 pub const POLICY_VERSION: u32 = 1;
 pub const TOKEN_MAX_SEQUENCE: usize = 512;
@@ -27,6 +28,12 @@ pub const TIMESFM_PATCH_TOKENS: usize = 16;
 pub const LIMITED_TABLE_IDENTITY_VERSION: u32 = 1;
 const LIMITED_TABLE_IDENTITY_DOMAIN: &[u8] = b"zkie/limited-table-identity";
 const LIMITED_TABLE_IDENTITY_FIELDS: u64 = 24;
+
+/// The version of the trusted activation commitment identity. The version is
+/// part of the identity's canonical encoding and therefore of its digest.
+pub const ACTIVATION_COMMITMENT_IDENTITY_VERSION: u32 = 1;
+const ACTIVATION_COMMITMENT_IDENTITY_DOMAIN: &[u8] = b"zkie/activation-commitment-identity";
+const ACTIVATION_COMMITMENT_IDENTITY_FIELDS: u64 = 11;
 
 mod digest_hex {
     use serde::{Deserialize, Deserializer, Serializer};
@@ -421,6 +428,175 @@ impl LimitedTableIdentity {
     }
 }
 
+/// The trusted activation commitment of one request.
+///
+/// The identity binds the old side (model, version, case, anchor and model
+/// id) to the new side (the hiding row commitment of the independent trusted
+/// activation `X`): its root, the matrix shape, the salt length and the
+/// configuration digest. It is a canonical, domain-separated digest. The
+/// verifier compares this value with the commitment carried by the request
+/// session; a prover-supplied commitment cannot substitute for it.
+///
+/// The field is optional in the document so an older or partial operator copy
+/// still parses. The formal request verifier fails closed when the value is
+/// absent; it is never defaulted or inferred from a proof.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivationCommitmentIdentity {
+    pub version: u32,
+    pub model: String,
+    pub model_version: u32,
+    pub case_id: String,
+    #[serde(with = "digest_hex")]
+    pub anchor_id: Digest,
+    #[serde(with = "digest_hex")]
+    pub model_id: Digest,
+    #[serde(with = "digest_hex")]
+    pub activation_root: Digest,
+    pub positions: u32,
+    pub hidden: u32,
+    pub salt_bytes: u64,
+    #[serde(with = "digest_hex")]
+    pub configuration: Digest,
+    #[serde(with = "digest_hex")]
+    pub protocol_identity: Digest,
+}
+
+impl ActivationCommitmentIdentity {
+    /// The activation commitment this identity pins.
+    pub fn commitment(&self) -> Result<ActivationCommitment> {
+        if self.version != ACTIVATION_COMMITMENT_IDENTITY_VERSION {
+            return Err(Error::UnsupportedVersion);
+        }
+        if self.model.is_empty()
+            || self.case_id.is_empty()
+            || self.anchor_id == Digest::ZERO
+            || self.model_id == Digest::ZERO
+            || self.activation_root == Digest::ZERO
+            || self.configuration == Digest::ZERO
+            || self.protocol_identity == Digest::ZERO
+        {
+            return Err(Error::InvalidConfig);
+        }
+        let shape = ActivationShape::new(
+            self.positions,
+            self.hidden,
+            usize::try_from(self.salt_bytes).map_err(|_| Error::InvalidConfig)?,
+        )?;
+        let commitment = ActivationCommitment {
+            root: self.activation_root,
+            shape,
+            configuration: self.configuration,
+        };
+        if commitment.fault().is_some() {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(commitment)
+    }
+
+    /// Checks the identity's own version, fields, digests and shape.
+    pub fn validate(&self) -> Result<()> {
+        self.commitment()?;
+        Ok(())
+    }
+
+    /// The canonical tagged encoding under the fixed domain and version.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let mut writer = CanonicalWriter::new();
+        writer.put_bytes(ACTIVATION_COMMITMENT_IDENTITY_DOMAIN);
+        writer.put_u64(self.version as u64);
+        writer.put_u64(ACTIVATION_COMMITMENT_IDENTITY_FIELDS);
+        put_field(&mut writer, 1, self.model.as_bytes());
+        put_number(&mut writer, 2, self.model_version as u64);
+        put_field(&mut writer, 3, self.case_id.as_bytes());
+        put_digest(&mut writer, 4, &self.anchor_id);
+        put_digest(&mut writer, 5, &self.model_id);
+        put_digest(&mut writer, 6, &self.activation_root);
+        put_number(&mut writer, 7, self.positions as u64);
+        put_number(&mut writer, 8, self.hidden as u64);
+        put_number(&mut writer, 9, self.salt_bytes);
+        put_digest(&mut writer, 10, &self.configuration);
+        put_digest(&mut writer, 11, &self.protocol_identity);
+        Ok(writer.into_bytes())
+    }
+
+    /// The domain-separated, versioned digest of the canonical encoding.
+    pub fn digest(&self) -> Result<Digest> {
+        Ok(digest_bytes(&self.encode()?))
+    }
+
+    /// Decodes a canonical identity. Unknown, missing, duplicate or
+    /// out-of-order tags, a wrong version and trailing bytes are rejected.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let limits = DecodeLimits {
+            max_bytes: 1 << 16,
+            max_elements: 32,
+        };
+        let mut reader = CanonicalReader::new(bytes, limits);
+        if reader.get_bytes()? != ACTIVATION_COMMITMENT_IDENTITY_DOMAIN {
+            return Err(Error::InvalidConfig);
+        }
+        if reader.get_u64()? != ACTIVATION_COMMITMENT_IDENTITY_VERSION as u64 {
+            return Err(Error::UnsupportedVersion);
+        }
+        if reader.get_u64()? != ACTIVATION_COMMITMENT_IDENTITY_FIELDS {
+            return Err(Error::InvalidConfig);
+        }
+        let mut model: Option<String> = None;
+        let mut model_version: Option<u32> = None;
+        let mut case_id: Option<String> = None;
+        let mut anchor_id: Option<Digest> = None;
+        let mut model_id: Option<Digest> = None;
+        let mut activation_root: Option<Digest> = None;
+        let mut positions: Option<u32> = None;
+        let mut hidden: Option<u32> = None;
+        let mut salt_bytes: Option<u64> = None;
+        let mut configuration: Option<Digest> = None;
+        let mut protocol_identity: Option<Digest> = None;
+        let mut last_tag = 0u64;
+        for _ in 0..ACTIVATION_COMMITMENT_IDENTITY_FIELDS {
+            let tag = reader.get_u64()?;
+            if tag <= last_tag || tag > ACTIVATION_COMMITMENT_IDENTITY_FIELDS {
+                return Err(Error::InvalidConfig);
+            }
+            last_tag = tag;
+            let value = reader.get_bytes()?;
+            match tag {
+                1 => model = Some(value_string(value)?),
+                2 => model_version = Some(value_u32(value)?),
+                3 => case_id = Some(value_string(value)?),
+                4 => anchor_id = Some(value_digest(value)?),
+                5 => model_id = Some(value_digest(value)?),
+                6 => activation_root = Some(value_digest(value)?),
+                7 => positions = Some(value_u32(value)?),
+                8 => hidden = Some(value_u32(value)?),
+                9 => salt_bytes = Some(value_u64(value)?),
+                10 => configuration = Some(value_digest(value)?),
+                11 => protocol_identity = Some(value_digest(value)?),
+                _ => return Err(Error::InvalidConfig),
+            }
+        }
+        reader.finish()?;
+        let identity = Self {
+            version: ACTIVATION_COMMITMENT_IDENTITY_VERSION,
+            model: model.ok_or(Error::InvalidConfig)?,
+            model_version: model_version.ok_or(Error::InvalidConfig)?,
+            case_id: case_id.ok_or(Error::InvalidConfig)?,
+            anchor_id: anchor_id.ok_or(Error::InvalidConfig)?,
+            model_id: model_id.ok_or(Error::InvalidConfig)?,
+            activation_root: activation_root.ok_or(Error::InvalidConfig)?,
+            positions: positions.ok_or(Error::InvalidConfig)?,
+            hidden: hidden.ok_or(Error::InvalidConfig)?,
+            salt_bytes: salt_bytes.ok_or(Error::InvalidConfig)?,
+            configuration: configuration.ok_or(Error::InvalidConfig)?,
+            protocol_identity: protocol_identity.ok_or(Error::InvalidConfig)?,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyDocument {
@@ -449,6 +625,11 @@ pub struct PolicyCase {
     /// case entry; absent and rejected for the other models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limited_table_identity: Option<LimitedTableIdentity>,
+    /// The trusted activation commitment. Optional in the document so an
+    /// older copy still parses; the formal request verifier requires it and
+    /// fails closed when it is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_commitment: Option<ActivationCommitmentIdentity>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -492,6 +673,10 @@ pub struct TrustedRequest {
     pub model_id: Digest,
     pub output: OutputExpectation,
     pub limited_table_identity: Option<LimitedTableIdentity>,
+    /// The trusted activation commitment of the request. The formal request
+    /// verifier requires it; the presence of this field in the selected
+    /// request is the operator's pin, never a proof value.
+    pub activation_commitment: Option<ActivationCommitmentIdentity>,
 }
 
 impl TrustedRequest {
@@ -499,6 +684,14 @@ impl TrustedRequest {
     /// output-head cases.
     pub fn trusted_limited_table_identity(&self) -> Result<&LimitedTableIdentity> {
         self.limited_table_identity
+            .as_ref()
+            .ok_or(Error::InvalidConfig)
+    }
+
+    /// The trusted activation commitment pin. A request without one fails
+    /// closed; the verifier never substitutes a proof-reported commitment.
+    pub fn trusted_activation_commitment(&self) -> Result<&ActivationCommitmentIdentity> {
+        self.activation_commitment
             .as_ref()
             .ok_or(Error::InvalidConfig)
     }
@@ -591,6 +784,23 @@ fn validate_document(document: &PolicyDocument) -> Result<()> {
                 }
             }
         }
+        match &case.activation_commitment {
+            Some(identity) => {
+                identity.validate()?;
+                let anchor_id = digest_from_hex(&case.anchor_id)?;
+                let model_id = digest_from_hex(&case.model_id)?;
+                if document.model != "gpt2"
+                    || identity.model != document.model
+                    || identity.model_version != document.model_version
+                    || identity.case_id != case.case_id
+                    || identity.anchor_id != anchor_id
+                    || identity.model_id != model_id
+                {
+                    return Err(Error::StatementMismatch);
+                }
+            }
+            None => {}
+        }
     }
     Ok(())
 }
@@ -654,6 +864,16 @@ pub fn select(
             {
                 return Err(Error::StatementMismatch);
             }
+            if let Some(activation) = &case.activation_commitment {
+                if activation.model != document.model
+                    || activation.model_version != document.model_version
+                    || activation.case_id != case.case_id
+                    || activation.anchor_id != anchor_id
+                    || activation.model_id != model_id
+                {
+                    return Err(Error::StatementMismatch);
+                }
+            }
             let output = select_output(case, OutputKind::Argmax, Some(sequence))?;
             Ok(TrustedRequest {
                 model: document.model.clone(),
@@ -666,6 +886,7 @@ pub fn select(
                 model_id,
                 output,
                 limited_table_identity: Some(identity),
+                activation_commitment: case.activation_commitment.clone(),
             })
         }
         "gemma3" => {
@@ -691,6 +912,7 @@ pub fn select(
                 model_id: digest_from_hex(&case.model_id)?,
                 output,
                 limited_table_identity: None,
+                activation_commitment: None,
             })
         }
         "timesfm" => {
@@ -717,6 +939,7 @@ pub fn select(
                 model_id: digest_from_hex(&case.model_id)?,
                 output,
                 limited_table_identity: None,
+                activation_commitment: None,
             })
         }
         _ => Err(Error::UnsupportedPrimitive),
@@ -746,6 +969,38 @@ pub fn bind_limited_table_identity(
             }
             found = true;
             case.limited_table_identity = Some(identity.clone());
+        }
+    }
+    if !found {
+        return Err(Error::StatementMismatch);
+    }
+    validate_document(&updated)?;
+    Ok(updated)
+}
+
+/// Replaces one case entry's activation commitment with a provisioned one and
+/// validates the whole document. The operator calls this after the trusted
+/// activation commitment is known; a prover does not call it on its own copy.
+pub fn bind_activation_commitment(
+    document: &PolicyDocument,
+    case_id: &str,
+    identity: ActivationCommitmentIdentity,
+) -> Result<PolicyDocument> {
+    if identity.case_id != case_id
+        || identity.model != document.model
+        || identity.model_version != document.model_version
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let mut updated = document.clone();
+    let mut found = false;
+    for case in &mut updated.case {
+        if case.case_id == case_id {
+            if found {
+                return Err(Error::StatementMismatch);
+            }
+            found = true;
+            case.activation_commitment = Some(identity.clone());
         }
     }
     if !found {
@@ -1205,4 +1460,101 @@ mod tests {
             )
             .is_err());
     }
+    fn activation_block(case_id: &str, anchor: &str, model_id: &str) -> String {
+        format!(
+            "\n[case.activation_commitment]\nversion = 1\nmodel = \"gpt2\"\nmodel_version = 1\ncase_id = \"{case_id}\"\nanchor_id = \"{anchor}\"\nmodel_id = \"{model_id}\"\nactivation_root = \"{C}\"\npositions = 16\nhidden = 1024\nsalt_bytes = 40\nconfiguration = \"{D}\"\nprotocol_identity = \"{E}\"\n"
+        )
+    }
+
+    fn policy_with_activation() -> String {
+        format!(
+            "policy_version = 1\nmodel = \"gpt2\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"gpt2-seq16\"\nsequence_length = 16\nanchor_id = \"{A}\"\nmodel_id = \"{B}\"\noutput_mode = \"none\"\n{}{}\n\n[[case]]\ncase_id = \"gpt2-seq512\"\nsequence_length = 512\nanchor_id = \"{A}\"\nmodel_id = \"{B}\"\noutput_mode = \"none\"\n{}\n",
+            identity_block("gpt2-seq16", A, B),
+            activation_block("gpt2-seq16", A, B),
+            identity_block("gpt2-seq512", A, B),
+        )
+    }
+
+    #[test]
+    fn activation_commitment_is_selected_and_bound() {
+        let document = parse(policy_with_activation().as_bytes()).unwrap();
+        let selected = select(&document, "gpt2-seq16", "gpt2", 16).unwrap();
+        let identity = selected.trusted_activation_commitment().unwrap();
+        assert_eq!(identity.activation_root.0, [0x33; 32]);
+        assert_eq!(identity.positions, 16);
+        assert_eq!(identity.hidden, 1024);
+        assert_eq!(identity.salt_bytes, 40);
+        let commitment = identity.commitment().unwrap();
+        assert_eq!(commitment.root, identity.activation_root);
+        assert_eq!(commitment.shape.positions, 16);
+        assert_eq!(commitment.shape.hidden, 1024);
+        assert_eq!(commitment.configuration, Digest([0x44; 32]));
+
+        // The second case has no activation pin: the accessor fails closed.
+        let selected = select(&document, "gpt2-seq512", "gpt2", 512).unwrap();
+        assert!(selected.trusted_activation_commitment().is_err());
+
+        // An operator bind adds the pin to the second case.
+        let mut second = identity.clone();
+        second.case_id = "gpt2-seq512".into();
+        let bound = bind_activation_commitment(&document, "gpt2-seq512", second).unwrap();
+        let selected = select(&bound, "gpt2-seq512", "gpt2", 512).unwrap();
+        assert_eq!(
+            selected.trusted_activation_commitment().unwrap().activation_root,
+            identity.activation_root
+        );
+        // A bind for another case is rejected.
+        assert!(bind_activation_commitment(&document, "gpt2-seq16", {
+            let mut other = identity.clone();
+            other.case_id = "gpt2-seq512".into();
+            other
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn activation_commitment_binds_the_case_model_and_version() {
+        let other_case = format!(
+            "policy_version = 1\nmodel = \"gpt2\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"gpt2-seq16\"\nsequence_length = 16\nanchor_id = \"{A}\"\nmodel_id = \"{B}\"\noutput_mode = \"none\"\n{}{}\n",
+            identity_block("gpt2-seq16", A, B),
+            activation_block("gpt2-seq512", A, B),
+        );
+        assert!(parse(other_case.as_bytes()).is_err());
+
+        let other_model = format!(
+            "policy_version = 1\nmodel = \"gpt2\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"gpt2-seq16\"\nsequence_length = 16\nanchor_id = \"{A}\"\nmodel_id = \"{B}\"\noutput_mode = \"none\"\n{}{}\n",
+            identity_block("gpt2-seq16", A, B),
+            activation_block("gpt2-seq16", A, F),
+        );
+        assert!(parse(other_model.as_bytes()).is_err());
+
+        let old_version = policy_with_activation().replace(
+            "[case.activation_commitment]\nversion = 1",
+            "[case.activation_commitment]\nversion = 2",
+        );
+        assert!(parse(old_version.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn activation_commitment_encoding_is_canonical() {
+        let document = parse(policy_with_activation().as_bytes()).unwrap();
+        let identity = document.case[0]
+            .activation_commitment
+            .clone()
+            .expect("identity");
+        let bytes = identity.encode().unwrap();
+        let decoded = ActivationCommitmentIdentity::decode(&bytes).unwrap();
+        assert_eq!(decoded, identity);
+        assert_eq!(decoded.digest().unwrap(), identity.digest().unwrap());
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(ActivationCommitmentIdentity::decode(&trailing).is_err());
+        let mut changed = identity.clone();
+        changed.activation_root = Digest([0x99; 32]);
+        assert_ne!(changed.digest().unwrap(), identity.digest().unwrap());
+        let mut missing = bytes.clone();
+        missing.truncate(missing.len() - 1);
+        assert!(ActivationCommitmentIdentity::decode(&missing).is_err());
+    }
+
 }

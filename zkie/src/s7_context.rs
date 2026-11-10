@@ -41,8 +41,10 @@ use zkie_ops::proof::session_baseline::{
     selected_plan_identifier, SelectedMatmulStep, SESSION_PROTOCOL_IDENTITY,
 };
 
+use zkie_ops::proof::hidden_send_session::ActivationCommitment;
+
 use crate::lm_head_key::LimitedKeyStatement;
-use crate::policy::{self, LimitedTableIdentity, TrustedRequest};
+use crate::policy::{self, ActivationCommitmentIdentity, LimitedTableIdentity, TrustedRequest};
 use crate::provider::StatementData;
 
 const LM_HEAD_SUFFIX: &str = "gpt2/weights/lm_head_w_i32.bin";
@@ -86,6 +88,10 @@ pub struct LmHeadContext {
     pub asset: LmHeadAsset,
     /// The trusted policy identity of the limited output-head table.
     pub limited_table_identity: LimitedTableIdentity,
+    /// The trusted activation commitment pin, when the operator provisioned
+    /// one. A request verifier that consumes the independent trusted input
+    /// requires it and fails closed when it is absent.
+    pub activation_commitment: Option<ActivationCommitmentIdentity>,
     pub matmul: LmHeadStep,
     pub plan_identifier: Digest,
     pub plan_steps: usize,
@@ -252,6 +258,23 @@ pub fn load_gpt2_lm_head_context(
         return Err(Error::InvalidConfig);
     }
     let limited_table_identity = trusted.trusted_limited_table_identity()?.clone();
+    // The activation commitment pin is an operator value, never a proof value.
+    // When present it must cover the request's position count and the MatMul
+    // hidden dimension. The formal request verifier requires it; this context
+    // keeps it optional and lets that verifier fail closed.
+    let activation_commitment = match &trusted.activation_commitment {
+        Some(identity) => {
+            let commitment = identity.commitment()?;
+            let hidden = *matmul.config.get(2).ok_or(Error::StatementMismatch)?;
+            if commitment.shape.positions() != statement.tokens.len()
+                || i64::from(commitment.shape.hidden) != hidden
+            {
+                return Err(Error::StatementMismatch);
+            }
+            Some(identity.clone())
+        }
+        None => None,
+    };
     let table_plan = zkie_models_gpt2::lm_head_plan::lm_head_plan()?;
     table_plan.validate()?;
     let planned_shape = table_plan.table_shape()?;
@@ -289,6 +312,7 @@ pub fn load_gpt2_lm_head_context(
         asset_root,
         asset,
         limited_table_identity,
+        activation_commitment,
         matmul,
         plan_identifier,
         plan_steps: plan.steps.len(),
@@ -358,6 +382,21 @@ impl LmHeadContext {
     ) -> Result<()> {
         let actual = committed_limited_table_identity(self, reader, statement)?;
         if actual.digest()? != self.limited_table_identity.digest()? {
+            return Err(Error::StatementMismatch);
+        }
+        Ok(())
+    }
+
+    /// Compares a request session's activation commitment with the operator
+    /// pin. A missing pin, a changed root, shape or configuration, or a
+    /// commitment from another case or request is rejected.
+    pub fn verify_activation_commitment(&self, actual: &ActivationCommitment) -> Result<()> {
+        let pinned = self
+            .activation_commitment
+            .as_ref()
+            .ok_or(Error::InvalidConfig)?
+            .commitment()?;
+        if pinned != *actual {
             return Err(Error::StatementMismatch);
         }
         Ok(())

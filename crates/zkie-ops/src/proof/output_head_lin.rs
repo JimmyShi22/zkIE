@@ -6,42 +6,53 @@
 //! Y[t][j] = sum_y X[t][y] * M[y][j]
 //! ```
 //!
-//! over the padded hidden dimension and the full padded vocabulary. This
-//! module binds the trusted MatMul step and its trace tensors to the merged
-//! hidden session: `X` is committed under a hiding row commitment, the public
-//! row weights and output `Y` are plan values derived from the independently
-//! verified trace, and the session itself folds the committed encoded table,
-//! samples the reduced weight rows and runs both proximity tests. The
-//! verifier takes only the committed table reader, the public weights, `Y`
-//! and the proof; it never receives an activation row, a table message row or
-//! a reduced weight row in the clear.
+//! over the padded hidden dimension and the full padded vocabulary. The
+//! merged session folds the committed encoded table, samples the reduced
+//! weight rows and runs both proximity tests. The verifier never receives an
+//! activation row, a table message row or a reduced weight row in the clear.
 //!
-//! The trace is still verified for the model/anchor/step binding and for the
-//! activation and output values. The old plaintext weight-table path is gone:
-//! the table comes from the caller's committed table handle, not from a trace
-//! asset opening.
+//! The module has two paths.
 //!
-//! This is a diagnostic and development entry. It does not claim a formal
-//! soundness bound, a production CLI wiring or a full-model proof. The
-//! proximity tests run on toy or stage-harness plans supplied by the caller;
-//! the plan values are trusted inputs, not proof bytes.
+//! The formal path in the parent module keeps `X` and `Y` out of the verifier
+//! boundary. `X` is an independent trusted input whose hiding commitment is
+//! pinned by the operator policy; `Y` is the prover's reduced row `W = X M`,
+//! committed under the hiding product-form encoding. The trusted output
+//! relation (vocabulary mask, valid-vocabulary range, ordering comparison,
+//! first-maximum tie rule and expected output) is bound into the first
+//! statement and checked over the full padded rows. The verifier receives the
+//! policy-pinned commitment, the trusted relation, the committed table reader
+//! and the proof message only.
+//!
+//! The [`diagnostic`] module below keeps the earlier development entries that
+//! read plaintext `X` and `Y` from a verified shared trace. They are a
+//! controlled diagnostic and real-fixture harness, not the hidden production
+//! path; the formal path does not call them.
+//!
+//! Neither path claims a formal soundness bound, production CLI wiring or a
+//! full-model proof. In particular, the formal path does not prove that the
+//! committed reduced rows were derived from the pinned activation and the
+//! committed table: the Dot relation under hidden `X` is an open item recorded
+//! in the documentation.
 
 use zkie_core::common::codec::DecodeLimits;
+use zkie_core::common::field::PrimeField64;
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
 use zkie_engine::pcs::request::binding::BindingCandidate;
-use zkie_engine::pcs::request::field::Fp3;
+use zkie_engine::pcs::request::field::{Fp3, MODULUS};
 use zkie_engine::pcs::request::foldeq::reader_table_identity;
 use zkie_engine::pcs::request::lin::{LinMask, LinShape};
 use zkie_engine::pcs::request::table::IndexReader;
 use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
+use zkie_engine::primitives::transcript::{hash_labeled, tag_word, STATEMENT};
 
 use crate::op::OpCode;
 use crate::proof::column_session::fp_from_signed_word;
 use crate::proof::hidden_send_session::{
-    prove_hidden_lin, verify_hidden_lin, ActivationShape, CommittedActivation, HiddenLinMessages,
-    HiddenLinOutcome, HiddenLinPlan, HiddenLinWitness, HiddenOutputShape, HiddenProximityPlan,
-    HiddenSendPlan, HiddenTableProver,
+    prove_hidden_lin, prove_hidden_lin_hidden, verify_hidden_lin, verify_hidden_lin_hidden,
+    ActivationCommitment, ActivationShape, CommittedActivation, HiddenLinMessages, HiddenLinOutcome,
+    HiddenLinPlan, HiddenLinWitness, HiddenOutputShape, HiddenProximityPlan, HiddenSendPlan,
+    HiddenTableProver,
 };
 use crate::proof::model_commitment::{
     verify_shared_trace_outputs, ModelCommitmentPublic, SharedTrace,
@@ -265,6 +276,570 @@ pub fn select_output_head_step(plan: &TracePlan) -> Result<OutputHeadStep> {
     )
 }
 
+fn fp3_from_signed_i64(value: i64) -> Fp3 {
+    Fp3::from_base(fp_from_signed_word(value as u64))
+}
+
+/// The trusted plan items and private inputs of one merged output-head
+/// request. `send` carries the table identity, the shape of the reduced weight
+/// message and the group/oracle numbers; its activation fields are filled from
+/// the committed activation. The proximity plan fixes both groups, the fresh
+/// masks, the column draws and the BASE position counts. All fields are plan
+/// or caller inputs, never proof bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputHeadLinSetup {
+    /// The weight asset path named by the trusted MatMul step.
+    pub asset_path: String,
+    pub send: HiddenSendPlan,
+    pub proximity: HiddenProximityPlan,
+    pub activation_configuration: Digest,
+    pub activation_salts: Vec<Vec<u8>>,
+    pub seed: Digest,
+    pub masks: Vec<Vec<LinMask>>,
+    /// The diagnostic verifier's pinned activation root. The prover ignores
+    /// it. The formal path takes its pin from the operator policy instead and
+    /// never reads this field.
+    pub expected_activation_root: Option<Digest>,
+    /// An optional fixture expectation for the reduced roots. The prover may
+    /// leave it empty; the hidden-input verifier accepts proof-valued roots
+    /// and checks them through the openings. It is a test hook, not a policy
+    /// pin.
+    pub expected_roots: Option<Vec<Digest>>,
+}
+
+/// The merged request proof. One session covers every position; the canonical
+/// encoding is the session's own message encoding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputHeadLinProof {
+    pub session: HiddenLinMessages,
+}
+
+impl OutputHeadLinProof {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut writer = CanonicalWriter::new();
+        writer.put_u64(OUTPUT_HEAD_PROOF_VERSION);
+        writer.put_bytes(&self.session.encode()?);
+        Ok(writer.into_bytes())
+    }
+
+    pub fn decode(plan: &HiddenLinPlan, bytes: &[u8]) -> Result<Self> {
+        let limits = DecodeLimits {
+            max_bytes: bytes.len(),
+            max_elements: bytes.len(),
+        };
+        let mut reader = CanonicalReader::new(bytes, limits);
+        if reader.get_u64()? != OUTPUT_HEAD_PROOF_VERSION {
+            return Err(Error::InvalidEncoding);
+        }
+        let session = HiddenLinMessages::decode(plan, reader.get_bytes()?)?;
+        reader.finish()?;
+        Ok(Self { session })
+    }
+
+    pub fn encoded_len(&self) -> Result<usize> {
+        Ok(8 + 8 + self.session.encode()?.len())
+    }
+}
+
+/// The verifier outcome over all positions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputHeadLinOutcome {
+    pub outcome: HiddenLinOutcome,
+    pub proof_bytes: usize,
+}
+
+
+// ---------------------------------------------------------------------------
+// Trusted-input closure (formal path)
+// ---------------------------------------------------------------------------
+//
+// This is the formal path: the verifier receives neither `X` nor `Y`. `X` is
+// an independent trusted input whose hiding commitment is pinned by the
+// operator policy; the proof session carries the same commitment and the
+// verifier compares the two. `Y` is the prover's reduced row `W = X M`: it is
+// committed as the SEND group members under a hiding product-form encoding,
+// and the Eval targets bind it to the linear output claim. The vocabulary
+// mask, validity range, ordering comparison, first-maximum tie rule and final
+// output are trusted graph values; their digest is absorbed into the first
+// statement.
+//
+// This closure does not prove to the verifier that `W` was derived from the
+// pinned `X` and the committed table. That derivation (the Dot relation with
+// hidden `X`) needs a committed inner-product mechanism that this unit does
+// not have; it stays an open item in the documentation. The diagnostic module
+// below keeps the plaintext-`X`/plaintext-`Y` paths for development and real
+// trace fixtures only.
+
+/// The trusted output relation of the output-head graph: the vocabulary mask,
+/// the valid-vocabulary range, the ordering comparison, the first-maximum tie
+/// rule and the expected final output. The proof does not supply any field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputHeadOutputPlan {
+    /// The selected MatMul step and its graph neighbours.
+    pub step: OutputHeadStep,
+    /// Number of valid vocabulary columns. Columns at or above this index are
+    /// masked out of the ordering comparison.
+    pub valid: usize,
+    /// The complete padded column domain of the mask.
+    pub vocab: usize,
+    /// The constant added to every column at or above `valid`.
+    pub mask_value: i64,
+    /// The separate argmax step of every position, in position order.
+    pub argmax_steps: Vec<usize>,
+    /// The expected final output, one index per position.
+    pub expected_argmax: Vec<u32>,
+}
+
+impl OutputHeadOutputPlan {
+    /// Checks the declaration against the matrix shape and its own ranges. A
+    /// missing argmax step, an out-of-range name or an expected index outside
+    /// the valid vocabulary is rejected.
+    pub fn validate(&self, shape: LinShape) -> Result<()> {
+        shape.check()?;
+        if self.step.positions == 0
+            || self.step.hidden as u64 != shape.matrix_rows
+            || self.step.columns as u64 != shape.matrix_columns()?
+            || self.vocab != self.step.columns
+            || self.valid == 0
+            || self.valid >= self.vocab
+            || self.mask_value >= 0
+        {
+            return Err(Error::InvalidConfig);
+        }
+        if self.argmax_steps.len() != self.step.positions
+            || self.expected_argmax.len() != self.step.positions
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        if self
+            .expected_argmax
+            .iter()
+            .any(|index| *index as usize >= self.valid)
+        {
+            return Err(Error::BoundViolation);
+        }
+        Ok(())
+    }
+
+    /// The canonical digest absorbed into the first statement.
+    pub fn digest(&self) -> Result<Digest> {
+        let mut writer = CanonicalWriter::new();
+        writer.put_bytes(b"zkie/output-head-relation");
+        writer.put_u64(1);
+        writer.put_u64(self.step.step as u64);
+        writer.put_u64(self.step.activation_step as u64);
+        writer.put_u64(self.step.activation_output as u64);
+        writer.put_u64(self.step.masked_step as u64);
+        writer.put_u64(self.step.positions as u64);
+        writer.put_u64(self.step.hidden as u64);
+        writer.put_u64(self.step.columns as u64);
+        writer.put_bytes(self.step.asset_path.as_bytes());
+        writer.put_u64(self.valid as u64);
+        writer.put_u64(self.vocab as u64);
+        writer.put_u64(self.mask_value as u64);
+        writer.put_u64(self.argmax_steps.len() as u64);
+        for step in &self.argmax_steps {
+            writer.put_u64(*step as u64);
+        }
+        writer.put_u64(self.expected_argmax.len() as u64);
+        for value in &self.expected_argmax {
+            writer.put_u64(*value as u64);
+        }
+        hash_labeled(tag_word(STATEMENT, 2), 0, None, &writer.into_bytes())
+    }
+}
+
+/// The local result of the full-row output closure: the first-maximum index of
+/// every position and a digest over the complete masked rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputHeadClosure {
+    pub argmax: Vec<u32>,
+    pub masked_digest: Digest,
+}
+
+/// Runs the complete masked output relation over the full rows. Every column
+/// takes part: the mask is applied to the padded domain, the ordering
+/// comparison is a strict `>` scan from the first column so a tie keeps the
+/// earliest index, and the resulting index must equal the trusted expected
+/// output. This is the prover-side local closure; it never samples columns.
+pub fn close_output_relation(
+    plan: &OutputHeadOutputPlan,
+    rows: &[Vec<i64>],
+) -> Result<OutputHeadClosure> {
+    if rows.len() != plan.step.positions || rows.iter().any(|row| row.len() != plan.step.columns) {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut writer = CanonicalWriter::new();
+    writer.put_bytes(b"zkie/output-head-masked");
+    writer.put_u64(rows.len() as u64);
+    writer.put_u64(plan.step.columns as u64);
+    let mut argmax = Vec::with_capacity(rows.len());
+    for (position, row) in rows.iter().enumerate() {
+        let mut best = 0usize;
+        let mut best_value = i64::MIN;
+        for (column, value) in row.iter().enumerate() {
+            let masked = if column >= plan.valid {
+                value.checked_add(plan.mask_value).ok_or(Error::BoundViolation)?
+            } else {
+                *value
+            };
+            writer.put_u64(masked as u64);
+            if column == 0 || masked > best_value {
+                best = column;
+                best_value = masked;
+            }
+        }
+        if best >= plan.valid {
+            return Err(Error::StatementMismatch);
+        }
+        if plan.expected_argmax.get(position) != Some(&(best as u32)) {
+            return Err(Error::StatementMismatch);
+        }
+        argmax.push(best as u32);
+    }
+    let masked_digest = hash_labeled(
+        tag_word(STATEMENT, 3),
+        0,
+        None,
+        &writer.into_bytes(),
+    )?;
+    Ok(OutputHeadClosure {
+        argmax,
+        masked_digest,
+    })
+}
+
+/// The verifier's trusted inputs: the operator-pinned activation commitment
+/// and the trusted output relation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputHeadTrustedInputs {
+    pub activation: ActivationCommitment,
+    pub output: OutputHeadOutputPlan,
+}
+
+fn hidden_plan(
+    shape: LinShape,
+    setup: &OutputHeadLinSetup,
+    reader: &IndexReader,
+    activation: ActivationCommitment,
+    output: &OutputHeadOutputPlan,
+) -> Result<HiddenLinPlan> {
+    shape.check()?;
+    if activation.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    if setup.send.table_shape != reader.shape
+        || setup.send.table_identity != reader_table_identity(reader)?
+        || setup.send.matrix_rows != shape.matrix_rows
+        || setup.send.k_lo != shape.k_lo
+        || setup.send.columns != shape.matrix_columns()?
+    {
+        return Err(Error::StatementMismatch);
+    }
+    if output.step.positions != activation.shape.positions() as usize
+        || output.step.hidden as u64 != shape.matrix_rows
+        || output.step.columns as u64 != shape.matrix_columns()?
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut send = setup.send.clone();
+    send.activation = activation.shape;
+    send.activation_configuration = activation.configuration;
+    send.activation_root = activation.root;
+    send.expected_roots = setup.expected_roots.clone();
+    let plan = HiddenLinPlan {
+        send,
+        output: HiddenOutputShape {
+            positions: activation.shape.positions,
+            columns: shape.matrix_columns()?,
+        },
+        weights: Vec::new(),
+        masks: vec![Vec::new(); activation.shape.positions()],
+        proximity: setup.proximity.clone(),
+        output_relation: Some(output.digest()?),
+    };
+    plan.validate()?;
+    Ok(plan)
+}
+
+/// Builds the verifier's hidden-input plan from trusted values. The caller
+/// supplies the trusted setup (table identity, proximity shapes and seed
+/// policy), the committed table reader and the pin/relation pair; no prover
+/// message contributes to this plan.
+pub fn build_output_head_hidden_plan(
+    shape: LinShape,
+    setup: &OutputHeadLinSetup,
+    reader: &IndexReader,
+    trusted: &OutputHeadTrustedInputs,
+) -> Result<HiddenLinPlan> {
+    trusted.output.validate(shape)?;
+    hidden_plan(
+        shape,
+        setup,
+        reader,
+        trusted.activation,
+        &trusted.output,
+    )
+}
+
+/// Converts one committed base-field value back to its signed integer. A
+/// non-base extension value or a magnitude outside `i64` is rejected, so an
+/// unsigned modular reduction of a negative value cannot pass as the same
+/// signed value.
+fn fp3_to_signed_i64(value: &Fp3) -> Result<i64> {
+    if value.c[1].as_canonical_u64() != 0 || value.c[2].as_canonical_u64() != 0 {
+        return Err(Error::BoundViolation);
+    }
+    let canonical = value.c[0].as_canonical_u64();
+    if canonical <= i64::MAX as u64 {
+        return Ok(canonical as i64);
+    }
+    let magnitude = MODULUS
+        .checked_sub(canonical)
+        .ok_or(Error::BoundViolation)?;
+    if magnitude > (1u64 << 63) {
+        return Err(Error::BoundViolation);
+    }
+    if magnitude == (1u64 << 63) {
+        Ok(i64::MIN)
+    } else {
+        Ok(-(magnitude as i64))
+    }
+}
+
+/// Reconstructs the full reduced rows from the prover's committed message
+/// rows. This is a prover-side helper; the rows never enter the verifier.
+pub fn witness_output_rows(witness: &HiddenLinWitness) -> Result<Vec<Vec<i64>>> {
+    let positions = witness.send.positions as usize;
+    let columns = usize::try_from(witness.send.columns).map_err(|_| Error::ResourceLimit)?;
+    let rows = usize::try_from(witness.send.w.main_rows).map_err(|_| Error::ResourceLimit)?;
+    let places = usize::try_from(witness.send.w.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let mut output = Vec::with_capacity(positions);
+    for position in 0..positions {
+        let message = witness
+            .send
+            .messages
+            .get(position)
+            .ok_or(Error::ShapeMismatch)?;
+        if message.len() != rows || message.iter().any(|row| row.len() != places) {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut values = Vec::with_capacity(columns);
+        for column in 0..columns {
+            let row = column % rows;
+            let place = column / rows;
+            let value = message
+                .get(row)
+                .and_then(|row| row.get(place))
+                .ok_or(Error::ShapeMismatch)?;
+            values.push(fp3_to_signed_i64(value)?);
+        }
+        output.push(values);
+    }
+    Ok(output)
+}
+
+/// Builds the trusted output relation from the trusted graph plan and the
+/// trusted expected output. The mask constant, its valid range and its
+/// separate argmax consumers are read from the plan, not from the proof.
+pub fn build_output_head_output_plan(
+    plan: &TracePlan,
+    expected_argmax: &[u32],
+) -> Result<OutputHeadOutputPlan> {
+    build_output_head_output_plan_for(
+        plan,
+        OUTPUT_HEAD_POSITIONS,
+        OUTPUT_HEAD_HIDDEN,
+        OUTPUT_HEAD_COLUMNS,
+        OUTPUT_HEAD_ASSET_PATH,
+        expected_argmax,
+    )
+}
+
+/// The explicit-dimension form of [`build_output_head_output_plan`]. The
+/// trusted caller supplies the graph dimensions and the weight asset path; the
+/// production entry fixes them to the output-head constants.
+pub fn build_output_head_output_plan_for(
+    plan: &TracePlan,
+    positions: usize,
+    hidden: usize,
+    columns: usize,
+    asset_path: &str,
+    expected_argmax: &[u32],
+) -> Result<OutputHeadOutputPlan> {
+    let step = select_output_head_step_for(plan, positions, hidden, columns, asset_path)?;
+    let masked = plan
+        .steps
+        .get(step.masked_step)
+        .ok_or(Error::StatementMismatch)?;
+    let mut mask = None;
+    for source in &masked.inputs {
+        if let PlanSource::Constant(PlanConstant::VocabMask {
+            rows,
+            vocab,
+            valid,
+            masked,
+        }) = source
+        {
+            if mask.replace((*rows, *vocab, *valid, *masked)).is_some() {
+                return Err(Error::InvalidConfig);
+            }
+        }
+    }
+    let (rows, vocab, valid, mask_value) = mask.ok_or(Error::StatementMismatch)?;
+    if rows != step.positions
+        || vocab != step.columns
+        || valid == 0
+        || valid >= step.columns
+        || mask_value >= 0
+    {
+        return Err(Error::StatementMismatch);
+    }
+    if plan.argmax_steps.len() != step.positions || expected_argmax.len() != step.positions {
+        return Err(Error::ShapeMismatch);
+    }
+    for (position, index) in plan.argmax_steps.iter().enumerate() {
+        let layout = PlanLayout::rows(step.columns, position, 1);
+        let expected_source = PlanSource::Prev {
+            step: step.masked_step,
+            output: 0,
+            layout,
+        };
+        let argmax = plan
+            .steps
+            .get(*index)
+            .ok_or(Error::StatementMismatch)?;
+        if argmax.opcode != OpCode::Argmax
+            || argmax.inputs.len() != 1
+            || argmax.inputs[0] != expected_source
+        {
+            return Err(Error::StatementMismatch);
+        }
+    }
+    let output = OutputHeadOutputPlan {
+        step,
+        valid,
+        vocab,
+        mask_value,
+        argmax_steps: plan.argmax_steps.clone(),
+        expected_argmax: expected_argmax.to_vec(),
+    };
+    Ok(output)
+}
+
+/// Prover entry of the formal path. `X` is a private trusted input supplied
+/// outside the proof; the prover commits it with fresh salts, derives the
+/// reduced rows from the committed table, runs the hidden three-stage session
+/// and closes the full-row output relation. The returned proof carries only
+/// the hiding commitments and the public message; the closure result is for
+/// the caller's own checks.
+pub fn prove_output_head_lin_hidden(
+    shape: LinShape,
+    setup: &OutputHeadLinSetup,
+    output: &OutputHeadOutputPlan,
+    table: &mut dyn HiddenTableProver,
+    activation_rows: &[Vec<i64>],
+    activation_salts: &[Vec<u8>],
+) -> Result<(OutputHeadLinProof, HiddenLinWitness, OutputHeadClosure)> {
+    shape.check()?;
+    output.validate(shape)?;
+    let positions = output.step.positions;
+    let hidden = output.step.hidden;
+    if activation_rows.len() != positions
+        || activation_rows.iter().any(|row| row.len() != hidden)
+        || activation_salts.len() != positions
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let salt_bytes = activation_salts
+        .first()
+        .map(Vec::len)
+        .ok_or(Error::InvalidConfig)?;
+    if activation_salts.iter().any(|salt| salt.len() != salt_bytes) {
+        return Err(Error::ShapeMismatch);
+    }
+    let activation_shape =
+        ActivationShape::new(positions as u32, hidden as u32, salt_bytes)?;
+    let activation = CommittedActivation::commit_signed(
+        activation_shape,
+        activation_rows,
+        activation_salts,
+        setup.activation_configuration,
+    )?;
+    let reader = table.reader().clone();
+    let plan = hidden_plan(shape, setup, &reader, *activation.commitment(), output)?;
+    let (session, witness) = prove_hidden_lin_hidden(&plan, &activation, table, setup.seed)?;
+    let rows = witness_output_rows(&witness)?;
+    let closure = close_output_relation(output, &rows)?;
+    Ok((OutputHeadLinProof { session }, witness, closure))
+}
+
+/// Verifier entry of the formal path. The plan is rebuilt by the verifier from
+/// trusted values; the activation commitment in the proof session must equal
+/// the operator-pinned commitment. Neither `X` nor `Y` enters this entry.
+pub fn verify_output_head_lin_hidden(
+    shape: LinShape,
+    plan: &HiddenLinPlan,
+    trusted: &OutputHeadTrustedInputs,
+    reader: &IndexReader,
+    proof: &OutputHeadLinProof,
+) -> Result<OutputHeadLinOutcome> {
+    shape.check()?;
+    trusted.output.validate(shape)?;
+    if !plan.weights.is_empty() {
+        return Err(Error::InvalidConfig);
+    }
+    if plan.send.activation_root != trusted.activation.root
+        || plan.send.activation != trusted.activation.shape
+        || plan.send.activation_configuration != trusted.activation.configuration
+    {
+        return Err(Error::StatementMismatch);
+    }
+    if plan.output.positions != trusted.output.step.positions as u32
+        || plan.output.columns != trusted.output.step.columns as u64
+    {
+        return Err(Error::StatementMismatch);
+    }
+    if plan.output_relation != Some(trusted.output.digest()?) {
+        return Err(Error::StatementMismatch);
+    }
+    if proof.session.first.activation != trusted.activation {
+        return Err(Error::StatementMismatch);
+    }
+    let outcome = verify_hidden_lin_hidden(plan, reader, &proof.session)?;
+    if outcome.activation != trusted.activation {
+        return Err(Error::StatementMismatch);
+    }
+    Ok(OutputHeadLinOutcome {
+        outcome,
+        proof_bytes: proof.encoded_len()?,
+    })
+}
+
+/// Verifier entry of the formal path over the canonical request encoding.
+pub fn verify_output_head_lin_hidden_bytes(
+    shape: LinShape,
+    plan: &HiddenLinPlan,
+    trusted: &OutputHeadTrustedInputs,
+    reader: &IndexReader,
+    bytes: &[u8],
+) -> Result<OutputHeadLinOutcome> {
+    let proof = OutputHeadLinProof::decode(plan, bytes)?;
+    let mut outcome = verify_output_head_lin_hidden(shape, plan, trusted, reader, &proof)?;
+    outcome.proof_bytes = bytes.len();
+    Ok(outcome)
+}
+
+
+pub mod diagnostic {
+//! Non-production diagnostic path.
+//!
+//! These entries read plaintext `X` and `Y` from a verified shared trace and
+//! exist for development, unit tests and the real-fixture harness. They are
+//! not the hidden production path; the formal entries in the parent module do
+//! not call them and never accept plaintext `X` or `Y`.
+use super::*;
+
 /// The activation and output tensors of the verified trace.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputHeadInputs {
@@ -284,7 +859,7 @@ pub struct OutputHeadTrace {
     pub asset_index: usize,
 }
 
-fn prepare_output_head_trace_for(
+pub(crate) fn prepare_output_head_trace_for(
     public: &ModelCommitmentPublic,
     plan: &TracePlan,
     trace: &SharedTrace,
@@ -395,10 +970,6 @@ pub fn prepare_output_head_trace(
 // Public claims and the merged setup
 // ---------------------------------------------------------------------------
 
-fn fp3_from_signed_i64(value: i64) -> Fp3 {
-    Fp3::from_base(fp_from_signed_word(value as u64))
-}
-
 /// The per-position public weights and field values derived from the verified
 /// trace. `weights` is the activation row `g_t`; `output_values` is `Fp(Y_t)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -465,30 +1036,7 @@ pub fn output_head_claims(
     })
 }
 
-/// The trusted plan items and private inputs of one merged output-head
-/// request. `send` carries the table identity, the shape of the reduced weight
-/// message and the group/oracle numbers; its activation fields are filled from
-/// the committed activation. The proximity plan fixes both groups, the fresh
-/// masks, the column draws and the BASE position counts. All fields are plan
-/// or caller inputs, never proof bytes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OutputHeadLinSetup {
-    /// The weight asset path named by the trusted MatMul step.
-    pub asset_path: String,
-    pub send: HiddenSendPlan,
-    pub proximity: HiddenProximityPlan,
-    pub activation_configuration: Digest,
-    pub activation_salts: Vec<Vec<u8>>,
-    pub seed: Digest,
-    pub masks: Vec<Vec<LinMask>>,
-    /// The verifier's pinned activation root. The prover ignores it.
-    pub expected_activation_root: Option<Digest>,
-    /// The verifier's pinned reduced weight roots. The prover may leave it
-    /// empty; the verifier requires a value.
-    pub expected_roots: Option<Vec<Digest>>,
-}
-
-fn merged_plan(
+pub(crate) fn merged_plan(
     shape: LinShape,
     setup: &OutputHeadLinSetup,
     reader: &IndexReader,
@@ -544,53 +1092,13 @@ fn merged_plan(
         weights: claims.weights.clone(),
         masks: claims.masks.clone(),
         proximity: setup.proximity.clone(),
+        output_relation: None,
     };
     plan.validate()?;
     Ok(plan)
 }
 
-/// The merged request proof. One session covers every position; the canonical
-/// encoding is the session's own message encoding.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OutputHeadLinProof {
-    pub session: HiddenLinMessages,
-}
-
-impl OutputHeadLinProof {
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        let mut writer = CanonicalWriter::new();
-        writer.put_u64(OUTPUT_HEAD_PROOF_VERSION);
-        writer.put_bytes(&self.session.encode()?);
-        Ok(writer.into_bytes())
-    }
-
-    pub fn decode(plan: &HiddenLinPlan, bytes: &[u8]) -> Result<Self> {
-        let limits = DecodeLimits {
-            max_bytes: bytes.len(),
-            max_elements: bytes.len(),
-        };
-        let mut reader = CanonicalReader::new(bytes, limits);
-        if reader.get_u64()? != OUTPUT_HEAD_PROOF_VERSION {
-            return Err(Error::InvalidEncoding);
-        }
-        let session = HiddenLinMessages::decode(plan, reader.get_bytes()?)?;
-        reader.finish()?;
-        Ok(Self { session })
-    }
-
-    pub fn encoded_len(&self) -> Result<usize> {
-        Ok(8 + 8 + self.session.encode()?.len())
-    }
-}
-
-/// The verifier outcome over all positions.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OutputHeadLinOutcome {
-    pub outcome: HiddenLinOutcome,
-    pub proof_bytes: usize,
-}
-
-fn verify_trace(
+pub(crate) fn verify_trace(
     public: &ModelCommitmentPublic,
     plan: &TracePlan,
     trace: &SharedTrace,
@@ -623,7 +1131,7 @@ fn verify_trace(
     Ok((request, claims))
 }
 
-fn values_match(shape: LinShape, positions: usize) -> bool {
+pub(crate) fn values_match(shape: LinShape, positions: usize) -> bool {
     positions
         .checked_mul(usize::try_from(shape.matrix_rows).unwrap_or(0))
         .is_some()
@@ -888,15 +1396,18 @@ pub fn verify_output_head_lin_request_bytes(
 }
 
 
+}
+
 #[cfg(test)]
 mod tests {
+    use super::diagnostic::*;
     use super::*;
     use std::cell::RefCell;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use zkie_core::common::field::PrimeCharacteristicRing;
+    use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
     use zkie_engine::pcs::request::code::{build_code_plan, CodeParams};
     use zkie_engine::pcs::request::field::{Fp, E_DEGREE};
     use zkie_engine::pcs::request::foldeq::OmegaShapePlan;
@@ -912,7 +1423,7 @@ mod tests {
     };
     use crate::proof::model_commitment::{commit_assets, AssetStore, ModelAssetSpec};
     use crate::proof::plan::{config, PlanBuilder};
-    use crate::proof::session_baseline::{SelectedMatmulStep, TrustedModel};
+    use crate::proof::session_baseline::TrustedModel;
     use crate::registry::PureForward;
 
     const TOY_POSITIONS: usize = 16;
@@ -1594,4 +2105,353 @@ mod tests {
         truncated.truncate(truncated.len() - 3);
         assert!(OutputHeadLinProof::decode(&merged, &truncated).is_err());
     }
+    fn masked_row_argmax(row: &[i64]) -> u32 {
+        let mut best = 0usize;
+        let mut best_value = i64::MIN;
+        for (column, value) in row.iter().enumerate() {
+            let masked = if column >= TOY_VALID {
+                value - (1i64 << 41)
+            } else {
+                *value
+            };
+            if column == 0 || masked > best_value {
+                best = column;
+                best_value = masked;
+            }
+        }
+        best as u32
+    }
+
+    fn toy_expected_argmax(output: &[i64]) -> Vec<u32> {
+        (0..TOY_POSITIONS)
+            .map(|position| {
+                let row = &output[position * TOY_COLUMNS..(position + 1) * TOY_COLUMNS];
+                masked_row_argmax(row)
+            })
+            .collect()
+    }
+
+    fn formal_inputs(
+        fixture: &Fixture,
+    ) -> (Vec<Vec<i64>>, OutputHeadOutputPlan, ActivationCommitment) {
+        let rows: Vec<Vec<i64>> = (0..TOY_POSITIONS)
+            .map(|position| {
+                fixture.outputs[0][0][position * TOY_HIDDEN..(position + 1) * TOY_HIDDEN].to_vec()
+            })
+            .collect();
+        let expected = toy_expected_argmax(&fixture.outputs[1][0]);
+        let output = build_output_head_output_plan_for(
+            &fixture.plan,
+            TOY_POSITIONS,
+            TOY_HIDDEN,
+            TOY_COLUMNS,
+            TOY_ASSET,
+            &expected,
+        )
+        .unwrap();
+        let activation = CommittedActivation::commit_signed(
+            ActivationShape::new(TOY_POSITIONS as u32, TOY_HIDDEN as u32, SALT).unwrap(),
+            &rows,
+            &fixture.activation_salts,
+            ACTIVATION_CONFIGURATION,
+        )
+        .unwrap()
+        .commitment()
+        .clone();
+        (rows, output, activation)
+    }
+
+    #[test]
+    fn hidden_formal_closure_accepts_and_rejects_tampering() {
+        let mut fixture = fixture();
+        let (rows, output, activation) = formal_inputs(&fixture);
+        let setup = fixture.setup.clone();
+        let (proof, witness, closure) = prove_output_head_lin_hidden(
+            fixture.shape,
+            &setup,
+            &output,
+            &mut fixture.table,
+            &rows,
+            &fixture.activation_salts,
+        )
+        .unwrap();
+        assert_eq!(closure.argmax, output.expected_argmax);
+        assert_eq!(proof.session.first.activation, activation);
+        let expected_output: Vec<Vec<i64>> = (0..TOY_POSITIONS)
+            .map(|position| {
+                fixture.outputs[1][0]
+                    [position * TOY_COLUMNS..(position + 1) * TOY_COLUMNS]
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(witness_output_rows(&witness).unwrap(), expected_output);
+
+        let plan =
+            hidden_plan(fixture.shape, &setup, &fixture.table.reader, activation, &output).unwrap();
+        let trusted = OutputHeadTrustedInputs {
+            activation,
+            output: output.clone(),
+        };
+        let outcome = verify_output_head_lin_hidden(
+            fixture.shape,
+            &plan,
+            &trusted,
+            &fixture.table.reader,
+            &proof,
+        )
+        .unwrap();
+        assert_eq!(outcome.outcome.eval_rows.len(), TOY_POSITIONS);
+
+        let bytes = proof.encode().unwrap();
+        let decoded = verify_output_head_lin_hidden_bytes(
+            fixture.shape,
+            &plan,
+            &trusted,
+            &fixture.table.reader,
+            &bytes,
+        )
+        .unwrap();
+        assert_eq!(decoded.proof_bytes, bytes.len());
+
+        // Changed activation commitment: the policy pin no longer matches.
+        let mut changed = trusted.clone();
+        changed.activation.root.0[0] ^= 1;
+        assert!(verify_output_head_lin_hidden(
+            fixture.shape,
+            &plan,
+            &changed,
+            &fixture.table.reader,
+            &proof
+        )
+        .is_err());
+
+        // Changed Y commitment: the group root is absorbed and opened.
+        let mut changed_proof = proof.clone();
+        changed_proof.session.first.group.entries[0].root.0[0] ^= 1;
+        assert!(verify_output_head_lin_hidden(
+            fixture.shape,
+            &plan,
+            &trusted,
+            &fixture.table.reader,
+            &changed_proof
+        )
+        .is_err());
+
+        // Changed Eval target: no longer the committed row's evaluation.
+        let mut changed_proof = proof.clone();
+        changed_proof.session.first.eval_targets[0] =
+            changed_proof.session.first.eval_targets[0].add(&Fp3::ONE);
+        assert!(verify_output_head_lin_hidden(
+            fixture.shape,
+            &plan,
+            &trusted,
+            &fixture.table.reader,
+            &changed_proof
+        )
+        .is_err());
+
+        // Changed model request position: the relation digest no longer
+        // matches the trusted declaration.
+        let mut changed_output = output.clone();
+        changed_output.step.step += 1;
+        let mut changed_trusted = trusted.clone();
+        changed_trusted.output = changed_output;
+        assert!(verify_output_head_lin_hidden(
+            fixture.shape,
+            &plan,
+            &changed_trusted,
+            &fixture.table.reader,
+            &proof
+        )
+        .is_err());
+
+        // Missing declaration: the first statement carries no relation digest.
+        let mut missing = plan.clone();
+        missing.output_relation = None;
+        assert!(verify_output_head_lin_hidden(
+            fixture.shape,
+            &missing,
+            &trusted,
+            &fixture.table.reader,
+            &proof
+        )
+        .is_err());
+
+        // Spliced request: an activation commitment of the same shape made
+        // with other salts is a different request.
+        let other_salts: Vec<Vec<u8>> = (0..TOY_POSITIONS)
+            .map(|position| vec![(position as u8).wrapping_mul(7) ^ 0xA5; SALT])
+            .collect();
+        let other = CommittedActivation::commit_signed(
+            ActivationShape::new(TOY_POSITIONS as u32, TOY_HIDDEN as u32, SALT).unwrap(),
+            &rows,
+            &other_salts,
+            ACTIVATION_CONFIGURATION,
+        )
+        .unwrap()
+        .commitment()
+        .clone();
+        let mut spliced = trusted.clone();
+        spliced.activation = other;
+        assert!(verify_output_head_lin_hidden(
+            fixture.shape,
+            &plan,
+            &spliced,
+            &fixture.table.reader,
+            &proof
+        )
+        .is_err());
+
+        // Opened-row leakage: an activation opening appended to the request
+        // bytes is not part of the formal encoding.
+        let opening = CommittedActivation::commit_signed(
+            ActivationShape::new(TOY_POSITIONS as u32, TOY_HIDDEN as u32, SALT).unwrap(),
+            &rows,
+            &fixture.activation_salts,
+            ACTIVATION_CONFIGURATION,
+        )
+        .unwrap()
+        .open(0)
+        .unwrap();
+        let mut leaky = bytes.clone();
+        leaky.extend_from_slice(&opening.encode());
+        assert!(verify_output_head_lin_hidden_bytes(
+            fixture.shape,
+            &plan,
+            &trusted,
+            &fixture.table.reader,
+            &leaky
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn arbitrary_activation_is_rejected_by_the_policy_pin() {
+        let mut fixture = fixture();
+        let (mut rows, output, activation) = formal_inputs(&fixture);
+        rows[0][0] = rows[0][0].wrapping_add(1);
+        let setup = fixture.setup.clone();
+        let arbitrary = CommittedActivation::commit_signed(
+            ActivationShape::new(TOY_POSITIONS as u32, TOY_HIDDEN as u32, SALT).unwrap(),
+            &rows,
+            &fixture.activation_salts,
+            ACTIVATION_CONFIGURATION,
+        )
+        .unwrap();
+        let prover_plan = hidden_plan(
+            fixture.shape,
+            &setup,
+            &fixture.table.reader,
+            *arbitrary.commitment(),
+            &output,
+        )
+        .unwrap();
+        let (session, _) =
+            prove_hidden_lin_hidden(&prover_plan, &arbitrary, &mut fixture.table, setup.seed)
+                .unwrap();
+        let proof = OutputHeadLinProof { session };
+        assert_ne!(proof.session.first.activation, activation);
+        let plan =
+            hidden_plan(fixture.shape, &setup, &fixture.table.reader, activation, &output).unwrap();
+        let trusted = OutputHeadTrustedInputs {
+            activation,
+            output,
+        };
+        assert!(verify_output_head_lin_hidden(
+            fixture.shape,
+            &plan,
+            &trusted,
+            &fixture.table.reader,
+            &proof
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn forged_mask_and_argmax_tie_are_rejected() {
+        let fixture = fixture();
+        let (rows, output, _) = formal_inputs(&fixture);
+        // A forged tie resolution claims a later index.
+        let mut forged = output.clone();
+        forged.expected_argmax[0] = (forged.expected_argmax[0] + 1) % TOY_VALID as u32;
+        assert!(close_output_relation(&forged, &rows).is_err());
+        // A forged validity range makes the declared winner invalid.
+        let mut forged = output.clone();
+        forged.valid = 1;
+        assert!(close_output_relation(&forged, &rows).is_err());
+        // A forged mask constant is not a negative mask.
+        let mut bad_plan = fixture.plan.clone();
+        for source in &mut bad_plan.steps[2].inputs {
+            if let PlanSource::Constant(PlanConstant::VocabMask { masked, .. }) = source {
+                *masked = 0;
+            }
+        }
+        assert!(build_output_head_output_plan_for(
+            &bad_plan,
+            TOY_POSITIONS,
+            TOY_HIDDEN,
+            TOY_COLUMNS,
+            TOY_ASSET,
+            &output.expected_argmax,
+        )
+        .is_err());
+        // A missing argmax declaration is rejected before the proof runs.
+        let mut missing = fixture.plan.clone();
+        missing.argmax_steps.clear();
+        assert!(build_output_head_output_plan_for(
+            &missing,
+            TOY_POSITIONS,
+            TOY_HIDDEN,
+            TOY_COLUMNS,
+            TOY_ASSET,
+            &output.expected_argmax,
+        )
+        .is_err());
+        // A changed expected output is rejected by the full-row closure.
+        let mut changed = output.clone();
+        changed.expected_argmax[0] = (changed.expected_argmax[0] + 1) % TOY_VALID as u32;
+        assert!(close_output_relation(&changed, &rows).is_err());
+    }
+
+    #[test]
+    fn signed_encoding_and_masked_overflow_are_rejected() {
+        let extension = Fp3::new(Fp::from_u64(1), Fp::from_u64(1), Fp::from_u64(0));
+        assert!(fp3_to_signed_i64(&extension).is_err());
+        let fixture = fixture();
+        let (rows, output, _) = formal_inputs(&fixture);
+        let unsigned_rows: Vec<Vec<Fp3>> = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| Fp3::from_base(Fp::from_u64(*value as u64)))
+                    .collect()
+            })
+            .collect();
+        let signed = CommittedActivation::commit_signed(
+            ActivationShape::new(TOY_POSITIONS as u32, TOY_HIDDEN as u32, SALT).unwrap(),
+            &rows,
+            &fixture.activation_salts,
+            ACTIVATION_CONFIGURATION,
+        )
+        .unwrap();
+        let unsigned = CommittedActivation::commit(
+            ActivationShape::new(TOY_POSITIONS as u32, TOY_HIDDEN as u32, SALT).unwrap(),
+            &unsigned_rows,
+            &fixture.activation_salts,
+            ACTIVATION_CONFIGURATION,
+        )
+        .unwrap();
+        assert_ne!(signed.root(), unsigned.root());
+        let output_rows: Vec<Vec<i64>> = (0..TOY_POSITIONS)
+            .map(|position| {
+                fixture.outputs[1][0]
+                    [position * TOY_COLUMNS..(position + 1) * TOY_COLUMNS]
+                    .to_vec()
+            })
+            .collect();
+        let mut overflowing = output_rows.clone();
+        overflowing[0][TOY_VALID] = i64::MIN;
+        assert!(close_output_relation(&output, &overflowing).is_err());
+    }
+
 }

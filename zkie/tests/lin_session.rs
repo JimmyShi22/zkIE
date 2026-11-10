@@ -329,18 +329,22 @@ fn selected_gpt2_output_head_request_session() {
     };
     use zkie_engine::storage::encoded_store::FileRowStore;
     use zkie_ops::proof::hidden_send_session::{
-        ActivationShape, HiddenLinPlan, HiddenOutputShape, HiddenProximityPlan, HiddenSendPlan,
-        HiddenTableProver, WShape,
+        ActivationShape, CommittedActivation, HiddenLinPlan, HiddenOutputShape,
+        HiddenProximityPlan, HiddenSendPlan, HiddenTableProver, WShape,
     };
     use zkie_ops::proof::model_commitment::verify_shared_trace_outputs;
+    use zkie_ops::proof::output_head_lin::diagnostic::{
+        output_head_claims, prepare_output_head_trace, prove_output_head_lin_prepared,
+        verify_output_head_lin_prepared, verify_output_head_lin_request_bytes, OutputHeadTrace,
+    };
     use zkie_ops::proof::output_head_lin::{
-        output_head_claims, output_head_shape, prepare_output_head_trace,
-        prove_output_head_lin_prepared, select_output_head_step, verify_output_head_lin_prepared,
-        verify_output_head_lin_request_bytes, OutputHeadLinProof, OutputHeadLinSetup,
-        OUTPUT_HEAD_ASSET_PATH, OUTPUT_HEAD_COLUMNS, OUTPUT_HEAD_HIDDEN, OUTPUT_HEAD_K_LO,
-        OUTPUT_HEAD_POSITIONS,
+        build_output_head_hidden_plan, build_output_head_output_plan, output_head_shape,
+        prove_output_head_lin_hidden, select_output_head_step, verify_output_head_lin_hidden,
+        OutputHeadLinProof, OutputHeadLinSetup, OutputHeadTrustedInputs, OUTPUT_HEAD_ASSET_PATH,
+        OUTPUT_HEAD_COLUMNS, OUTPUT_HEAD_HIDDEN, OUTPUT_HEAD_K_LO, OUTPUT_HEAD_POSITIONS,
     };
     use zkie_ops::proof::plan::PlanSource;
+    use zkie_ops::proof::session_baseline::SESSION_PROTOCOL_IDENTITY;
 
     use zkie::lm_head_key::{
         build_lm_head_holder, limited_key_binding_parameters, LmHeadAssetSource,
@@ -703,6 +707,55 @@ fn selected_gpt2_output_head_request_session() {
         .output_values
         .iter()
         .all(|row| row.len() == OUTPUT_HEAD_COLUMNS));
+    // The operator pins the independent trusted activation commitment through
+    // the policy channel. The commitment is built from the verified trace
+    // activation values; the prover does not supply this policy entry.
+    let activation_rows: Vec<Vec<i64>> = (0..OUTPUT_HEAD_POSITIONS)
+        .map(|position| {
+            request.inputs.activation
+                [position * OUTPUT_HEAD_HIDDEN..(position + 1) * OUTPUT_HEAD_HIDDEN]
+                .to_vec()
+        })
+        .collect();
+    let activation_commitment = CommittedActivation::commit_signed(
+        ActivationShape::new(
+            OUTPUT_HEAD_POSITIONS as u32,
+            OUTPUT_HEAD_HIDDEN as u32,
+            SALT,
+        )
+        .unwrap(),
+        &activation_rows,
+        &setup.activation_salts,
+        ACTIVATION_CONFIGURATION,
+    )
+    .unwrap();
+    let activation_identity = zkie::policy::ActivationCommitmentIdentity {
+        version: zkie::policy::ACTIVATION_COMMITMENT_IDENTITY_VERSION,
+        model: "gpt2".into(),
+        model_version: 1,
+        case_id: "gpt2-seq16".into(),
+        anchor_id: trusted_request.anchor_id,
+        model_id: trusted_request.model_id,
+        activation_root: activation_commitment.root(),
+        positions: OUTPUT_HEAD_POSITIONS as u32,
+        hidden: OUTPUT_HEAD_HIDDEN as u32,
+        salt_bytes: SALT as u64,
+        configuration: ACTIVATION_CONFIGURATION,
+        protocol_identity: SESSION_PROTOCOL_IDENTITY,
+    };
+    let bound_policy =
+        zkie::policy::bind_activation_commitment(&policy, "gpt2-seq16", activation_identity)
+            .unwrap();
+    let bound_request =
+        zkie::policy::select(&bound_policy, "gpt2-seq16", "gpt2", trace.tokens.len()).unwrap();
+    assert_eq!(
+        bound_request
+            .trusted_activation_commitment()
+            .unwrap()
+            .commitment()
+            .unwrap(),
+        *activation_commitment.commitment()
+    );
     drop(outputs);
 
     let started = Instant::now();
@@ -843,6 +896,7 @@ fn selected_gpt2_output_head_request_session() {
         weights: claims.weights,
         masks: claims.masks,
         proximity: verifier_setup.proximity.clone(),
+        output_relation: None,
     };
     let decoded = OutputHeadLinProof::decode(&merged, &bytes).unwrap();
     assert_eq!(decoded, proof);
@@ -853,7 +907,7 @@ fn selected_gpt2_output_head_request_session() {
     truncated.truncate(bytes.len() - 1);
     assert!(OutputHeadLinProof::decode(&merged, &truncated).is_err());
 
-    let reject = |request: &zkie_ops::proof::output_head_lin::OutputHeadTrace,
+    let reject = |request: &OutputHeadTrace,
                   setup: &OutputHeadLinSetup,
                   reader: &IndexReader,
                   proof: &OutputHeadLinProof| {
@@ -921,6 +975,68 @@ fn selected_gpt2_output_head_request_session() {
         &proof
     )
     .is_ok());
+
+    // The formal hidden-input closure on the same real fixture. The verifier
+    // receives the policy-pinned activation commitment and the trusted output
+    // relation; neither plaintext X nor plaintext Y enters this path. This
+    // section re-reads the full weight asset and is enabled explicitly so the
+    // existing diagnostic fixture run keeps its own measurement basis.
+    if env::var_os("ZKIE_SESSION_FORMAL").is_some() {
+        let output_plan = build_output_head_output_plan(&plan, &trace.argmax).unwrap();
+        let trusted = OutputHeadTrustedInputs {
+            activation: *activation_commitment.commitment(),
+            output: output_plan.clone(),
+        };
+        let started = Instant::now();
+        let (hidden_proof, hidden_witness, closure) = prove_output_head_lin_hidden(
+            shape,
+            &setup,
+            &output_plan,
+            &mut table,
+            &activation_rows,
+            &setup.activation_salts,
+        )
+        .unwrap();
+        println!("hidden_prove_ms={}", started.elapsed().as_millis());
+        assert_eq!(closure.argmax, output_plan.expected_argmax);
+        let trace_output_rows: Vec<Vec<i64>> = (0..OUTPUT_HEAD_POSITIONS)
+            .map(|position| {
+                request.inputs.output
+                    [position * OUTPUT_HEAD_COLUMNS..(position + 1) * OUTPUT_HEAD_COLUMNS]
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(
+            zkie_ops::proof::output_head_lin::witness_output_rows(&hidden_witness).unwrap(),
+            trace_output_rows
+        );
+        let hidden_plan =
+            build_output_head_hidden_plan(shape, &setup, &table.reader(), &trusted).unwrap();
+        let started = Instant::now();
+        let hidden_outcome = verify_output_head_lin_hidden(
+            shape,
+            &hidden_plan,
+            &trusted,
+            &table.reader(),
+            &hidden_proof,
+        )
+        .unwrap();
+        println!("hidden_verify_ms={}", started.elapsed().as_millis());
+        assert_eq!(hidden_outcome.outcome.eval_rows.len(), OUTPUT_HEAD_POSITIONS);
+        assert_eq!(hidden_proof.session.first.activation, trusted.activation);
+
+        // A changed activation commitment against the policy pin is rejected.
+        let mut changed_trusted = trusted.clone();
+        changed_trusted.activation.root.0[0] ^= 1;
+        assert!(verify_output_head_lin_hidden(
+            shape,
+            &hidden_plan,
+            &changed_trusted,
+            &table.reader(),
+            &hidden_proof
+        )
+        .is_err());
+    }
 
     fs::remove_dir_all(&link_dir).ok();
     fs::remove_dir_all(&work_dir).ok();

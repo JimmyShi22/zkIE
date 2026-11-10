@@ -221,3 +221,83 @@ trace is rejected.
   trailing bytes all reject.
 - The material states plainly: the combination sends plaintext weight rows;
   it is a controlled diagnostic; the hidden relation is a later round.
+
+## Independent trusted activation and hidden output closure
+
+### What this round closes
+
+The output-head request now has a formal path that consumes an independent
+trusted activation `X` and keeps both `X` and the MatMul output `Y` out of the
+verifier boundary:
+
+- The operator policy carries an optional activation commitment identity: a
+  canonical, domain-separated, versioned digest over the model, version, case,
+  anchor and model ids plus the hiding row commitment's root, position count,
+  hidden width, salt length and configuration. The identity binds the request
+  to the request-level activation the operator warrants. The operator writes
+  it after commit through the policy channel; the formal request verifier fails
+  closed when the entry is absent. The verifier compares the commitment carried
+  by the request session with this pin, so a prover-reported commitment cannot
+  substitute for it.
+- The prover commits `X` with fresh private salts, derives the reduced rows
+  `W = X M` from the committed encoded table, and treats those rows as `Y`:
+  they are committed as the SEND group members under the hiding product-form
+  encoding. The verifier receives only the roots, the SEND samples and
+  openings, the Eval targets and the BAT/FOLD/BASE checks. A separate
+  plaintext `Y` input no longer exists on this path.
+- The output relation is a trusted graph value: the vocabulary-mask step, its
+  valid-vocabulary range, the separate argmax step of every position, the
+  strict first-maximum tie rule and the expected final output. Its canonical
+  digest is absorbed into the first statement, so a swapped mask, range,
+  ordering rule or expected output changes the first query and the seals. The
+  prover runs the complete full-row closure over all padded columns and must
+  reproduce the trusted expected output; no argmax value is inferred from a
+  sampled column.
+- The complete hidden first, shared and second stages stay in one verifier:
+  the group declaration, SEND samples/answers, drawn positions and openings,
+  Eval rows, table record and column openings, FOLD rounds, the two proximity
+  tests and the seals are all replayed. The limited-table policy pin is
+  unchanged.
+
+### Trust assumptions
+
+- The correspondence of `X` to the request and the model is warranted by the
+  operator beforehand. It is a request-level trust assumption, not a proved
+  previous-layer relation. A prover self-report does not constitute a trusted
+  input.
+- The equality of the old and new static-weight commitments is a separate
+  trusted publication assumption, not a cryptographic proof.
+- `Y`, the weight rows and the other agreed private intermediates remain
+  hidden on the formal path. The shared-trace path still carries opened weight
+  rows and plaintext `X`/`Y`; it is a controlled diagnostic, not the hidden
+  production proof.
+- Passing this round does not imply the previous-layer hidden relation, a
+  full-model proof or single-shot decode semantics.
+
+### What the verifier does not check
+
+- The hiding property of the activation row commitment is not proven here; the
+  salted Merkle construction is used as the repository's existing primitive.
+- The derivation `W = X M` is not proven to the verifier. The Dot identity
+  `<X_t, Omega_t> = W_t(psi*)` is linear in the reduced row with the activation
+  row as its public coefficient vector; with `X` hidden there is no public
+  coefficient source, and the repository has no committed inner-product
+  mechanism that could replace it. The formal path therefore omits the Dot
+  row; the diagnostic path keeps it with plaintext weights. Closing the hidden
+  Dot relation needs an approved committed inner-product mechanism, which is
+  not part of this round.
+- The previous-layer relation from the model to `X` is not proven.
+- Any plaintext `X` source is diagnostic only.
+- The production `commit`/`prove`/`verify` entry wiring is pending.
+- Formal soundness is not done. No equivalence with any reference system and
+  no equal security or performance claim follows from this round.
+
+### Negatives exercised
+
+The unit and fixture tests reject a changed activation commitment against the
+policy pin, an arbitrary activation not matching the pin, a changed output
+commitment, a changed Eval target, a changed MatMul step position, a missing
+output-relation declaration, a forged mask constant, a forged tie or expected
+argmax, an unsigned modular encoding of a negative value, a masked-arithmetic
+overflow, spliced request material and activation-opening bytes appended to the
+request encoding.

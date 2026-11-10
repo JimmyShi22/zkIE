@@ -157,6 +157,20 @@
 //! single-shot decode or production CLI wiring. The public entry keeps the
 //! Eval/Dot/Fold claims pending until the proximity tests accept them; the
 //! auxiliary witness entry checks the prover's samples in unit tests only.
+//!
+//! # Hidden-input mode
+//!
+//! A plan with an empty public weights list selects the hidden-input mode. The
+//! verifier then holds no activation row: the first statement binds the
+//! activation commitment (which is already part of the SEND statement) and the
+//! Eval targets are message values, each bound to its committed reduced row by
+//! a BAT row. The reduced rows are the MatMul output and are committed under
+//! the same hiding product-form encoding, so the output never needs a separate
+//! plaintext input. The Dot row, whose coefficients are the activation row, is
+//! not part of this mode because the verifier has no public coefficient
+//! source; the diagnostic mode keeps it. Closing the Dot relation with a
+//! hidden activation requires a committed inner-product mechanism that this
+//! session does not have.
 
 use zkie_core::common::codec::DecodeLimits;
 use zkie_core::common::field::PrimeCharacteristicRing;
@@ -2433,13 +2447,22 @@ pub struct HiddenLinPlan {
     pub send: HiddenSendPlan,
     pub output: HiddenOutputShape,
     /// The public row weights of every position, one vector of `matrix_rows`
-    /// entries per position. They are plan values, never proof bytes.
+    /// entries per position. They are plan values, never proof bytes. The list
+    /// is empty in the hidden-input mode: the verifier does not receive the
+    /// activation rows, and the first statement binds the activation
+    /// commitment instead of a weights digest.
     pub weights: Vec<Vec<Fp3>>,
     /// The public claim masks. The hidden path supports the empty list; a
     /// non-empty list needs a mask oracle message that this session does not
     /// have and is rejected.
     pub masks: Vec<Vec<LinMask>>,
     pub proximity: HiddenProximityPlan,
+    /// The canonical digest of the trusted output relation declaration. It is
+    /// absorbed into the first statement so a swapped mask, validity range,
+    /// argmax rule or expected output changes the first query and the seals.
+    /// The diagnostic path leaves it empty; the formal hidden-input path
+    /// requires it.
+    pub output_relation: Option<Digest>,
 }
 
 impl HiddenLinPlan {
@@ -2451,8 +2474,15 @@ impl HiddenLinPlan {
         {
             return Err(Error::InvalidConfig);
         }
-        if self.weights.len() != self.send.activation.positions as usize
-            || self.masks.len() != self.send.activation.positions as usize
+        if self.masks.len() != self.send.activation.positions as usize {
+            return Err(Error::ShapeMismatch);
+        }
+        // An empty weights list selects the hidden-input mode. The verifier
+        // then has no plaintext row weights and takes the Eval targets from
+        // the proof message; the committed activation root, which is already
+        // part of the first statement, is the only public binding of `X`.
+        if !self.weights.is_empty()
+            && self.weights.len() != self.send.activation.positions as usize
         {
             return Err(Error::ShapeMismatch);
         }
@@ -2464,6 +2494,9 @@ impl HiddenLinPlan {
             return Err(Error::UnsupportedPrimitive);
         }
         if self.proximity.fault(&self.send).is_some() {
+            return Err(Error::InvalidConfig);
+        }
+        if self.output_relation == Some(Digest::ZERO) {
             return Err(Error::InvalidConfig);
         }
         Ok(())
@@ -2522,6 +2555,13 @@ impl HiddenLinPlan {
         writer.put_u64(self.proximity.column_work_bits as u64);
         writer.put_u64(self.proximity.shared_base_positions as u64);
         writer.put_u64(self.proximity.own_base_positions as u64);
+        match &self.output_relation {
+            Some(digest) => {
+                writer.put_u64(1);
+                writer.put_digest(digest);
+            }
+            None => writer.put_u64(0),
+        }
         Ok(writer.into_bytes())
     }
 }
@@ -3582,6 +3622,42 @@ fn absorb_digest_round(chain: &mut Chain, stage: u64, digests: &[Digest], words:
 }
 
 /// The first stage: the hidden activation commitment, the public claim items,
+/// Computes one Eval target per position. In the diagnostic mode the target is
+/// the multilinear evaluation of the public output rows. In the hidden-input
+/// mode the same evaluation is taken from the prover's derived reduced rows,
+/// which are the private MatMul output and are committed as the group members;
+/// the verifier never receives those rows.
+fn eval_targets(
+    plan: &HiddenLinPlan,
+    rows: &[Vec<Fp3>],
+    output: Option<&[Vec<Fp3>]>,
+    psi: &[Vec<Fp3>],
+) -> Result<Vec<Fp3>> {
+    let positions = plan.send.positions() as usize;
+    let values: &[Vec<Fp3>] = match (output, plan.weights.is_empty()) {
+        (None, true) => rows,
+        (Some(output), false) => output,
+        _ => return Err(Error::InvalidConfig),
+    };
+    if values.len() != positions
+        || values
+            .iter()
+            .any(|row| row.len() as u64 != plan.output.columns)
+        || psi.len() != positions
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut targets = Vec::with_capacity(positions);
+    for (position, point) in psi.iter().enumerate() {
+        let mut target = eval_fp3_vector(&values[position], point)?;
+        for mask in &plan.masks[position] {
+            target = target.add(&mask.value.mul(&mask.coefficient));
+        }
+        targets.push(target);
+    }
+    Ok(targets)
+}
+
 /// the committed `W` oracles, the SEND samples, the drawn points and the Eval
 /// targets. Returns the public messages, the first seal and the private
 /// witness.
@@ -3589,17 +3665,10 @@ fn prove_first(
     plan: &HiddenLinPlan,
     activation: &CommittedActivation,
     table: &mut dyn HiddenTableProver,
-    output: &[Vec<Fp3>],
+    output: Option<&[Vec<Fp3>]>,
     randomness: &WCommitRandomness,
 ) -> Result<(HiddenSendMessages, Digest, HiddenSendWitness)> {
     plan.validate()?;
-    if output.len() != plan.weights.len()
-        || output
-            .iter()
-            .any(|row| row.len() as u64 != plan.output.columns)
-    {
-        return Err(Error::ShapeMismatch);
-    }
     let reader = table.reader().clone();
     check_activation(&plan.send, activation)?;
     check_table(&plan.send, &reader)?;
@@ -3619,14 +3688,7 @@ fn prove_first(
         openings.push(witness.tree(position as u32)?.open(list)?);
     }
     let psi = draw_psi(&mut chain, &plan.send)?;
-    let mut targets = Vec::with_capacity(psi.len());
-    for (position, point) in psi.iter().enumerate() {
-        let mut target = eval_fp3_vector(&output[position], point)?;
-        for mask in &plan.masks[position] {
-            target = target.add(&mask.value.mul(&mask.coefficient));
-        }
-        targets.push(target);
-    }
+    let targets = eval_targets(plan, &rows, output, &psi)?;
     let expected = witness.eval_values(&psi)?;
     if expected != targets {
         return Err(Error::InvalidProof);
@@ -3649,22 +3711,19 @@ fn prove_first(
 fn verify_first(
     plan: &HiddenLinPlan,
     reader: &IndexReader,
-    output: &[Vec<Fp3>],
+    output: Option<&[Vec<Fp3>]>,
     messages: &HiddenSendMessages,
 ) -> Result<(Vec<EvalSampleRow>, Digest)> {
     plan.validate()?;
-    if output.len() != plan.weights.len()
-        || output
-            .iter()
-            .any(|row| row.len() as u64 != plan.output.columns)
-    {
-        return Err(Error::ShapeMismatch);
+    // A fixture may pin the reduced roots as a negative-test expectation. The
+    // hidden-input entry leaves them unpinned: the roots are proof values
+    // absorbed into the first chain and checked through the openings below.
+    let expected_roots = plan.send.expected_roots.as_ref();
+    if let Some(roots) = expected_roots {
+        if roots.len() != plan.send.positions() as usize {
+            return Err(Error::ShapeMismatch);
+        }
     }
-    let expected_roots = plan
-        .send
-        .expected_roots
-        .as_ref()
-        .ok_or(Error::StatementMismatch)?;
     if messages.activation.fault().is_some()
         || messages.activation.root != plan.send.activation_root
         || messages.activation.shape != plan.send.activation
@@ -3683,9 +3742,14 @@ fn verify_first(
             || entry.oracle != plan.send.oracle(position as u32)?
             || entry.shape != plan.send.w.oracle_shape()
             || entry.tree != plan.send.w.tree_plan(position as u32)?
-            || entry.root != expected_roots[position]
+            || entry.root == Digest::ZERO
         {
             return Err(Error::StatementMismatch);
+        }
+        if let Some(roots) = expected_roots {
+            if entry.root != roots[position] {
+                return Err(Error::StatementMismatch);
+            }
         }
     }
     let mut chain = first_chain(plan, reader)?;
@@ -3709,7 +3773,13 @@ fn verify_first(
             return Err(Error::InvalidIndex);
         }
         let tree = plan.send.w.tree_plan(position as u32)?;
-        verify_runtime_opening(&tree, &expected_roots[position], list, opening)?;
+        let root = messages
+            .group
+            .entries
+            .get(position)
+            .map(|entry| entry.root)
+            .ok_or(Error::ShapeMismatch)?;
+        verify_runtime_opening(&tree, &root, list, opening)?;
     }
     let psi = draw_psi(&mut chain, &plan.send)?;
     if psi != messages.psi {
@@ -3718,12 +3788,16 @@ fn verify_first(
     if messages.eval_targets.len() != plan.send.positions() as usize {
         return Err(Error::ShapeMismatch);
     }
-    for (position, point) in psi.iter().enumerate() {
-        let mut target = eval_fp3_vector(&output[position], point)?;
-        for mask in &plan.masks[position] {
-            target = target.add(&mask.value.mul(&mask.coefficient));
+    if plan.weights.is_empty() {
+        // Hidden-input mode: the Eval targets are message values. No plaintext
+        // output row is accepted here; the BAT rows built from the messages
+        // bind every target to the committed reduced rows.
+        if output.is_some() {
+            return Err(Error::InvalidConfig);
         }
-        if target != messages.eval_targets[position] {
+    } else {
+        let expected = eval_targets(plan, &[], output, &psi)?;
+        if expected != messages.eval_targets {
             return Err(Error::InvalidProof);
         }
     }
@@ -4877,39 +4951,46 @@ fn own_plain_rows(
         row.target = first.eval_targets[position as usize];
         rows.push(row);
     }
-    let omega = bat_of
-        .get(&plan.proximity.omega.oracle)
-        .ok_or(Error::StatementMismatch)?;
-    let omega_len = omega_rows * omega_ell;
-    for position in 0..plan.send.positions() {
-        let w_member = bat_of
-            .get(&plan.send.oracle(position)?)
+    // The Dot row is linear in the reduced row with the activation row as its
+    // public coefficients. In the hidden-input mode the verifier holds no
+    // activation row, so there is no public coefficient source and the Dot
+    // row is not part of this session; the diagnostic mode keeps it. See the
+    // module documentation for the open relation this leaves.
+    if !plan.weights.is_empty() {
+        let omega = bat_of
+            .get(&plan.proximity.omega.oracle)
             .ok_or(Error::StatementMismatch)?;
-        let weights = plan
-            .weights
-            .get(position as usize)
-            .ok_or(Error::ShapeMismatch)?;
-        let mut omega_coefficients = vec![Fp3::ZERO; omega_len];
-        for (row, weight) in weights.iter().enumerate() {
-            let slot = omega_coefficients.get_mut(row).ok_or(Error::ShapeMismatch)?;
-            *slot = *weight;
-        }
-        let mut w_coefficients = vec![Fp3::ZERO; w_rows * w_ell];
-        for column in 0..plan.send.columns {
-            let coefficient = eq_index(
-                shared_point,
-                column,
-                plan.send.columns.trailing_zeros(),
-            )?;
-            let slot = w_coefficients
-                .get_mut(usize::try_from(column).map_err(|_| Error::ResourceLimit)?)
+        let omega_len = omega_rows * omega_ell;
+        for position in 0..plan.send.positions() {
+            let w_member = bat_of
+                .get(&plan.send.oracle(position)?)
+                .ok_or(Error::StatementMismatch)?;
+            let weights = plan
+                .weights
+                .get(position as usize)
                 .ok_or(Error::ShapeMismatch)?;
-            *slot = Fp3::ZERO.sub(&coefficient);
+            let mut omega_coefficients = vec![Fp3::ZERO; omega_len];
+            for (row, weight) in weights.iter().enumerate() {
+                let slot = omega_coefficients.get_mut(row).ok_or(Error::ShapeMismatch)?;
+                *slot = *weight;
+            }
+            let mut w_coefficients = vec![Fp3::ZERO; w_rows * w_ell];
+            for column in 0..plan.send.columns {
+                let coefficient = eq_index(
+                    shared_point,
+                    column,
+                    plan.send.columns.trailing_zeros(),
+                )?;
+                let slot = w_coefficients
+                    .get_mut(usize::try_from(column).map_err(|_| Error::ResourceLimit)?)
+                    .ok_or(Error::ShapeMismatch)?;
+                *slot = Fp3::ZERO.sub(&coefficient);
+            }
+            let mut row = BatRow::new(BatRowKind::Plain);
+            row.add_term(omega.bat_oracle, BatPart::Main, omega_coefficients);
+            row.add_term(w_member.bat_oracle, BatPart::Main, w_coefficients);
+            rows.push(row);
         }
-        let mut row = BatRow::new(BatRowKind::Plain);
-        row.add_term(omega.bat_oracle, BatPart::Main, omega_coefficients);
-        row.add_term(w_member.bat_oracle, BatPart::Main, w_coefficients);
-        rows.push(row);
     }
     Ok(rows)
 }
@@ -5109,16 +5190,11 @@ fn verify_second(
 // Public entries
 // ---------------------------------------------------------------------------
 
-/// Prover entry of the merged three-stage run. The activation commitment is
-/// an in-memory witness only; the public message carries its root. The public
-/// output `Y`, the public row weights and the block tree are plan/statement
-/// values; they never come from the prover message. The private randomness is
-/// derived from one master seed through the numbered mask-coin ledger.
-pub fn prove_hidden_lin(
+fn prove_hidden_lin_inner(
     plan: &HiddenLinPlan,
     activation: &CommittedActivation,
     table: &mut dyn HiddenTableProver,
-    output: &[Vec<Fp3>],
+    output: Option<&[Vec<Fp3>]>,
     seed: Digest,
 ) -> Result<(HiddenLinMessages, HiddenLinWitness)> {
     plan.validate()?;
@@ -5160,15 +5236,44 @@ pub fn prove_hidden_lin(
     Ok((messages, witness))
 }
 
-/// Verifier entry of the merged three-stage run. It replays all three chains,
-/// checks every commitment, sample answer, drawn position, opening and seal,
-/// and runs the two proximity tests against its own table reader and member
-/// roots. The activation rows, the table message rows and the `W` message rows
-/// never enter this entry.
-pub fn verify_hidden_lin(
+/// Prover entry of the merged three-stage run with the public output rows as a
+/// diagnostic plan value. The activation commitment is an in-memory witness
+/// only; the public message carries its root. This entry is the diagnostic
+/// path: the output rows are plaintext caller values. The hidden-input entry
+/// below is the formal path.
+pub fn prove_hidden_lin(
+    plan: &HiddenLinPlan,
+    activation: &CommittedActivation,
+    table: &mut dyn HiddenTableProver,
+    output: &[Vec<Fp3>],
+    seed: Digest,
+) -> Result<(HiddenLinMessages, HiddenLinWitness)> {
+    if plan.weights.is_empty() {
+        return Err(Error::InvalidConfig);
+    }
+    prove_hidden_lin_inner(plan, activation, table, Some(output), seed)
+}
+
+/// Prover entry of the merged three-stage run in the hidden-input mode. The
+/// activation rows stay private; the derived reduced rows are the MatMul
+/// output and are committed as the group members. The Eval targets are the
+/// evaluations of those committed rows, so no plaintext output is supplied.
+pub fn prove_hidden_lin_hidden(
+    plan: &HiddenLinPlan,
+    activation: &CommittedActivation,
+    table: &mut dyn HiddenTableProver,
+    seed: Digest,
+) -> Result<(HiddenLinMessages, HiddenLinWitness)> {
+    if !plan.weights.is_empty() {
+        return Err(Error::InvalidConfig);
+    }
+    prove_hidden_lin_inner(plan, activation, table, None, seed)
+}
+
+fn verify_hidden_lin_inner(
     plan: &HiddenLinPlan,
     reader: &IndexReader,
-    output: &[Vec<Fp3>],
+    output: Option<&[Vec<Fp3>]>,
     messages: &HiddenLinMessages,
 ) -> Result<HiddenLinOutcome> {
     plan.validate()?;
@@ -5207,6 +5312,39 @@ pub fn verify_hidden_lin(
         shared_base,
         own_base,
     })
+}
+
+/// Verifier entry of the merged three-stage run with the public output rows as
+/// a diagnostic plan value. The activation rows, the table message rows and
+/// the reduced rows never enter this entry; the output rows do, so this entry
+/// is the diagnostic path, not the formal hidden-input path.
+pub fn verify_hidden_lin(
+    plan: &HiddenLinPlan,
+    reader: &IndexReader,
+    output: &[Vec<Fp3>],
+    messages: &HiddenLinMessages,
+) -> Result<HiddenLinOutcome> {
+    if plan.weights.is_empty() {
+        return Err(Error::InvalidConfig);
+    }
+    verify_hidden_lin_inner(plan, reader, Some(output), messages)
+}
+
+/// Verifier entry of the merged three-stage run in the hidden-input mode. It
+/// replays all three chains, checks every commitment, sample answer, drawn
+/// position, opening and seal, and runs the two proximity tests against its
+/// own table reader and member roots. Neither the activation rows nor any
+/// output rows enter this entry; the Eval targets are message values bound to
+/// the committed reduced rows by the BAT rows.
+pub fn verify_hidden_lin_hidden(
+    plan: &HiddenLinPlan,
+    reader: &IndexReader,
+    messages: &HiddenLinMessages,
+) -> Result<HiddenLinOutcome> {
+    if !plan.weights.is_empty() {
+        return Err(Error::InvalidConfig);
+    }
+    verify_hidden_lin_inner(plan, reader, None, messages)
 }
 
 /// Auxiliary verifier for unit and fixture runs. It runs the public entry and
@@ -6653,6 +6791,7 @@ mod merged_tests {
                 shared_base_positions: 2,
                 own_base_positions: 2,
             },
+            output_relation: None,
         }
     }
 
@@ -6690,6 +6829,32 @@ mod merged_tests {
         let bytes = messages.encode().unwrap();
         let decoded = HiddenLinMessages::decode(&plan, &bytes).unwrap();
         assert_eq!(decoded, messages);
+    }
+
+    #[test]
+    fn hidden_input_mode_accepts_without_output_rows() {
+        let activation = activation();
+        let diagnostic_plan = plan(&activation);
+        let mut plan = diagnostic_plan.clone();
+        plan.weights = Vec::new();
+        let mut table = table();
+        let (messages, witness) =
+            prove_hidden_lin_hidden(&plan, &activation, &mut table, Digest([0x71; 32])).unwrap();
+        // The Eval targets are the evaluations of the committed reduced rows.
+        let expected = witness.send.eval_values(&messages.first.psi).unwrap();
+        assert_eq!(expected, messages.first.eval_targets);
+        let outcome = verify_hidden_lin_hidden(&plan, &table.reader, &messages).unwrap();
+        assert_eq!(outcome.eval_rows.len(), POSITIONS as usize);
+        assert!(outcome.own_base.fold_main);
+        assert!(outcome.own_base.base_linear);
+        // A changed target no longer matches the committed row.
+        let mut changed = messages.clone();
+        changed.first.eval_targets[0] = changed.first.eval_targets[0].add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &changed).is_err());
+        // The diagnostic entries require the other mode.
+        let output = output_values(&activation);
+        assert!(verify_hidden_lin(&plan, &table.reader, &output, &messages).is_err());
+        assert!(verify_hidden_lin_hidden(&diagnostic_plan, &table.reader, &messages).is_err());
     }
 
     fn assert_reject(result: Result<HiddenLinOutcome>) {
