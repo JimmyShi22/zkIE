@@ -14,7 +14,7 @@
 
 use zkie_core::error::{Error, Result};
 
-use crate::pcs::request::code::{encode_row_fp3, CodeParams};
+use crate::pcs::request::code::{build_code_plan, encode_row_fp3, CodeParams};
 use crate::pcs::request::field::Fp3;
 use crate::pcs::request::proximity::{ProximityStatement, SingleRows};
 
@@ -269,6 +269,265 @@ pub fn register_switch(
     })
 }
 
+
+/// The part of the switched message's table a cut fills.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CutPart {
+    Main,
+    Mask,
+}
+
+/// An aligned block of `2^bits` rows of one table of the switched message. A
+/// vector fills it row first: entry `j` is in row `first_row + (j mod 2^bits)`
+/// at place `j div 2^bits`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cut {
+    pub part: CutPart,
+    pub bits: u32,
+    pub first_row: u64,
+}
+
+/// The public shape of one switch stage: the next stage's code, mask code,
+/// row counts and answer count, and where the old main message and the rest
+/// go. The current stage's openings and samples use the current shape; this
+/// target is built from the next stage of the same bound plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwitchTarget {
+    pub code: CodeParams,
+    pub mask_code: CodeParams,
+    pub main_rows: u64,
+    pub mask_rows: u64,
+    pub answers: u32,
+    pub main: Cut,
+    pub rest: Cut,
+}
+
+impl SwitchTarget {
+    pub fn from_stage(
+        code: CodeParams,
+        mask_code: CodeParams,
+        k: u32,
+        h: u32,
+        answers: u32,
+    ) -> Result<Self> {
+        build_code_plan(code.log_n, code.ell, code.r)?;
+        build_code_plan(mask_code.log_n, mask_code.ell, mask_code.r)?;
+        if k >= 32 || h >= 32 || answers < 1 {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(Self {
+            code,
+            mask_code,
+            main_rows: 1u64 << k,
+            mask_rows: 1u64 << h,
+            answers,
+            main: Cut {
+                part: CutPart::Main,
+                bits: k,
+                first_row: 0,
+            },
+            rest: Cut {
+                part: CutPart::Mask,
+                bits: h,
+                first_row: 0,
+            },
+        })
+    }
+
+    /// The index of entry `j` of a vector filling `cut` in a table whose row
+    /// bits are `table_row_bits`.
+    pub fn cut_index(cut: &Cut, table_row_bits: u32, j: u64) -> Result<u64> {
+        if table_row_bits >= 64 || cut.bits >= 64 || cut.bits > table_row_bits {
+            return Err(Error::InvalidConfig);
+        }
+        let block = 1u64
+            .checked_shl(cut.bits)
+            .ok_or(Error::ResourceLimit)?;
+        let row = cut
+            .first_row
+            .checked_add(j & (block - 1))
+            .ok_or(Error::ResourceLimit)?;
+        let place = j >> cut.bits;
+        row.checked_add(place.checked_shl(table_row_bits).ok_or(Error::ResourceLimit)?)
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// The sample pad entries of the new oracle message, in table-index order.
+    /// Pads live in the mask table when it has rows, otherwise in the main
+    /// table; with `2^rows` real rows the pad of answer `a` is in the last row
+    /// at place `ell - answers + a`.
+    pub fn pads(&self) -> Result<Vec<(CutPart, u64)>> {
+        let mut pads = Vec::with_capacity(self.answers as usize);
+        if self.mask_rows > 0 {
+            let row_bits = self.mask_rows.trailing_zeros();
+            for answer in 0..self.answers as u64 {
+                let place = self
+                    .mask_code
+                    .ell
+                    .checked_sub(self.answers as u64)
+                    .and_then(|base| base.checked_add(answer))
+                    .ok_or(Error::ShapeMismatch)?;
+                let index = (self.mask_rows - 1)
+                    .checked_add(place.checked_shl(row_bits).ok_or(Error::ResourceLimit)?)
+                    .ok_or(Error::ResourceLimit)?;
+                pads.push((CutPart::Mask, index));
+            }
+        } else {
+            let row_bits = self.main_rows.trailing_zeros();
+            for answer in 0..self.answers as u64 {
+                let place = self
+                    .code
+                    .ell
+                    .checked_sub(self.answers as u64)
+                    .and_then(|base| base.checked_add(answer))
+                    .ok_or(Error::ShapeMismatch)?;
+                let index = (self.main_rows - 1)
+                    .checked_add(place.checked_shl(row_bits).ok_or(Error::ResourceLimit)?)
+                    .ok_or(Error::ResourceLimit)?;
+                pads.push((CutPart::Main, index));
+            }
+        }
+        Ok(pads)
+    }
+
+    /// The table indices of the rest's entries, in fill order, with the pad
+    /// entries skipped. The list is small enough for this subset (the rest
+    /// block has `2^h * mask ell` entries).
+    pub fn rest_places(&self) -> Result<Vec<u64>> {
+        if self.rest.part != CutPart::Mask {
+            return Err(Error::UnsupportedPrimitive);
+        }
+        let room = self
+            .mask_code
+            .ell
+            .checked_mul(1u64 << self.rest.bits)
+            .ok_or(Error::ResourceLimit)?;
+        let row_bits = self.rest.bits;
+        let mut skip = vec![false; usize::try_from(room).map_err(|_| Error::ResourceLimit)?];
+        for (part, index) in self.pads()? {
+            if part == CutPart::Mask {
+                let fill = (index & ((1u64 << row_bits) - 1)) - self.rest.first_row
+                    + ((index >> row_bits) << row_bits);
+                let at = usize::try_from(fill).map_err(|_| Error::ResourceLimit)?;
+                if at >= skip.len() {
+                    return Err(Error::ShapeMismatch);
+                }
+                skip[at] = true;
+            }
+        }
+        let mut places = Vec::with_capacity(skip.len());
+        let mut fill = 0u64;
+        for (at, skipped) in skip.iter().enumerate() {
+            if *skipped {
+                continue;
+            }
+            let _ = at;
+            places.push(Self::cut_index(&self.rest, row_bits, fill)?);
+            fill = fill.checked_add(1).ok_or(Error::ResourceLimit)?;
+        }
+        Ok(places)
+    }
+
+    /// The number of entries the rest contributes.
+    pub fn rest_length(rows: &SingleRows) -> usize {
+        let masks = rows.masks.len();
+        masks * rows.mask_code.ell as usize
+            + rows.main_tail.len()
+            + masks * rows.mask_code.r as usize
+    }
+
+    /// Checks the public configuration. The old main message must be a power
+    /// of two and fit the main block; the rest must fit its block after pads.
+    pub fn check(&self, rows: &SingleRows) -> Result<()> {
+        if rows.masks.len() != 2
+            || rows.mask_tails.len() != 2
+            || rows.mask_claims.len() != 2
+            || rows.main.len() as u64 != rows.code.ell
+            || rows.main_tail.len() as u64 != rows.code.r
+            || rows.claim.len() as u64 != rows.code.ell
+            || rows.masks.iter().any(|row| row.len() as u64 != rows.mask_code.ell)
+            || rows.mask_tails.iter().any(|row| row.len() as u64 != rows.mask_code.r)
+            || rows.mask_claims.iter().any(|row| row.len() as u64 != rows.mask_code.ell)
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        if !rows.code.ell.is_power_of_two() {
+            return Err(Error::UnsupportedPrimitive);
+        }
+        let main_block = 1u64 << self.main.bits;
+        if rows.code.ell < main_block
+            || rows.code.ell > self.code.ell << self.main.bits
+            || self.main.part != CutPart::Main
+            || self.main.first_row != 0
+            || main_block != self.main_rows
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        if self.rest.part != CutPart::Mask
+            || self.rest.first_row != 0
+            || (1u64 << self.rest.bits) != self.mask_rows
+        {
+            return Err(Error::UnsupportedPrimitive);
+        }
+        if Self::rest_length(rows) > self.rest_places()?.len() {
+            return Err(Error::ShapeMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Builds the multi-row switched message: the old main message fills the
+/// target's main block through its cut; the rest fills the target's mask block
+/// in the reference order (mask messages, main tail, mask tails), skipping the
+/// sample pads; the pads take the caller's private pad values; the new
+/// encoding tails are the caller's private values.
+pub fn switched_message_multi(
+    rows: &SingleRows,
+    target: &SwitchTarget,
+    main_tail: Vec<Fp3>,
+    mask_tail: Vec<Fp3>,
+    pad_value: Fp3,
+) -> Result<SwitchedMessage> {
+    target.check(rows)?;
+    if main_tail.len() as u64 != target.code.r || mask_tail.len() as u64 != target.mask_code.r {
+        return Err(Error::ShapeMismatch);
+    }
+    let main_len = usize::try_from(target.main_rows.checked_mul(target.code.ell).ok_or(Error::ResourceLimit)?).map_err(|_| Error::ResourceLimit)?;
+    let mask_len = usize::try_from(target.mask_rows.checked_mul(target.mask_code.ell).ok_or(Error::ResourceLimit)?).map_err(|_| Error::ResourceLimit)?;
+    let mut main = vec![Fp3::ZERO; main_len];
+    let main_row_bits = target.main.bits;
+    for (j, value) in rows.main.iter().enumerate() {
+        let index = SwitchTarget::cut_index(&target.main, main_row_bits, j as u64)?;
+        *main.get_mut(index as usize).ok_or(Error::ShapeMismatch)? = *value;
+    }
+    let mut rest = Vec::with_capacity(SwitchTarget::rest_length(rows));
+    for row in &rows.masks {
+        rest.extend_from_slice(row);
+    }
+    rest.extend_from_slice(&rows.main_tail);
+    for tail in &rows.mask_tails {
+        rest.extend_from_slice(tail);
+    }
+    let places = target.rest_places()?;
+    if rest.len() > places.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut mask = vec![Fp3::ZERO; mask_len];
+    for (value, index) in rest.iter().zip(&places) {
+        *mask.get_mut(*index as usize).ok_or(Error::ShapeMismatch)? = *value;
+    }
+    for (part, index) in target.pads()? {
+        if part == CutPart::Mask {
+            *mask.get_mut(index as usize).ok_or(Error::ShapeMismatch)? = pad_value;
+        }
+    }
+    Ok(SwitchedMessage {
+        main,
+        main_tail,
+        mask,
+        mask_tail,
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,4 +581,54 @@ mod tests {
         bad.main.pop();
         assert!(bad.base_ready().is_err());
     }
+
+    #[test]
+    fn the_multi_row_switch_fills_the_next_stage_blocks() {
+        use crate::pcs::request::code::build_code_plan;
+        let old_code = build_code_plan(17, 4096, 94).unwrap();
+        let old_mask = build_code_plan(14, 64, 47).unwrap();
+        let rows = SingleRows {
+            code: old_code,
+            mask_code: old_mask,
+            main: (0..4096).map(|index| Fp3::from_u64(index + 1)).collect(),
+            main_tail: (0..94).map(|index| Fp3::from_u64(0x1000 + index)).collect(),
+            masks: vec![
+                (0..64).map(|index| Fp3::from_u64(0x2000 + index)).collect(),
+                (0..64).map(|index| Fp3::from_u64(0x3000 + index)).collect(),
+            ],
+            mask_tails: vec![
+                (0..47).map(|index| Fp3::from_u64(0x4000 + index)).collect(),
+                (0..47).map(|index| Fp3::from_u64(0x5000 + index)).collect(),
+            ],
+            claim: vec![Fp3::ZERO; 4096],
+            mask_claims: vec![vec![Fp3::ZERO; 64], vec![Fp3::ZERO; 64]],
+            target: Fp3::ZERO,
+        };
+        let next_code = build_code_plan(12, 256, 64).unwrap();
+        let next_mask = build_code_plan(12, 64, 64).unwrap();
+        let target = SwitchTarget::from_stage(next_code, next_mask, 4, 3, 1).unwrap();
+        assert_eq!(SwitchTarget::rest_length(&rows), 316);
+        target.check(&rows).unwrap();
+        let message = switched_message_multi(
+            &rows,
+            &target,
+            vec![Fp3::from_u64(7); 64],
+            vec![Fp3::from_u64(8); 64],
+            Fp3::from_u64(9),
+        )
+        .unwrap();
+        assert_eq!(message.main.len(), 16 * 256);
+        assert_eq!(message.mask.len(), 8 * 64);
+        assert_eq!(message.main[0], rows.main[0]);
+        assert_eq!(message.main[1], rows.main[1]);
+        assert_eq!(message.main[16], rows.main[16]);
+        let places = target.rest_places().unwrap();
+        assert_eq!(message.mask[places[0] as usize], rows.masks[0][0]);
+        assert_eq!(message.mask[places[64] as usize], rows.masks[1][0]);
+        assert_eq!(message.mask[places[128] as usize], rows.main_tail[0]);
+        assert_eq!(message.mask[places[222] as usize], rows.mask_tails[0][0]);
+        // The pad entry is not in the rest and carries the private pad value.
+        assert_eq!(message.mask[511], Fp3::from_u64(9));
+    }
+
 }
