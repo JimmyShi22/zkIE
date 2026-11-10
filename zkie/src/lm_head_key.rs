@@ -16,7 +16,8 @@ use zkie_core::error::{Error, Result};
 use zkie_core::proof_header::PROOF_VERSION_WORD;
 use zkie_core::types::{Digest, DType, TensorSpec};
 use zkie_engine::pcs::request::bat::{
-    combine, group_index, BatOracleShape, BatPart, BatRow, BatRowKind, BatStatement,
+    carry_compact_table, combine, group_index, BatOracleShape, BatPart, BatRow, BatRowKind,
+    BatStatement,
 };
 use zkie_engine::pcs::request::binding::{BindingParameters, BindingStatement};
 use zkie_engine::pcs::request::chain::{Chain, KIND_ALGEBRAIC, KIND_EPSILON};
@@ -1348,6 +1349,12 @@ pub trait SharedTableSource {
     fn fold(&mut self, gamma: &[Fp3], shape: &GuShape) -> Result<LmHeadGuProvider>;
     fn open(&mut self, positions: &[u64]) -> Result<Vec<ColumnOpening>>;
     fn forget(&mut self) -> Result<()>;
+
+    /// Releases the row source after its last use. Implementations that keep
+    /// no source may leave the default.
+    fn release(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The holder-backed source: folding and opening use the holder's bounded
@@ -1392,6 +1399,41 @@ impl<S: TableRowSource> SharedTableSource for HolderSharedSource<S> {
     fn forget(&mut self) -> Result<()> {
         self.holder.forget()
     }
+
+    fn release(&mut self) -> Result<()> {
+        self.holder.release_source()
+    }
+}
+
+#[cfg(not(test))]
+fn mem(_stage: &str) {}
+
+#[cfg(test)]
+fn mem(stage: &str) {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return;
+    };
+    let mut hwm = 0u64;
+    let mut rss = 0u64;
+    let mut anon = 0u64;
+    let mut file = 0u64;
+    let mut shmem = 0u64;
+    for line in status.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(name) = parts.next() else { continue };
+        let value = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        match name {
+            "VmHWM:" => hwm = value,
+            "VmRSS:" => rss = value,
+            "RssAnon:" => anon = value,
+            "RssFile:" => file = value,
+            "RssShmem:" => shmem = value,
+            _ => {}
+        }
+    }
+    eprintln!(
+        "MEM {stage} hwm_kb {hwm} rss_kb {rss} anon_kb {anon} file_kb {file} shmem_kb {shmem}"
+    );
 }
 
 pub fn run_limited_shared_to_columns(
@@ -1418,6 +1460,7 @@ pub fn run_limited_shared_to_columns(
         .clone();
     table.begin(LM_HEAD_COLUMN_DRAWS as usize)?;
     let provider = table.fold(&gamma, &gu_shape)?;
+    mem("fold");
     session.send_gu(&provider.root())?;
     session.shared_seeds()?;
     let seeds = session.gu_shared_seeds().to_vec();
@@ -1426,7 +1469,9 @@ pub fn run_limited_shared_to_columns(
         session.receive_gu_answer(*answer)?;
     }
     session.join_gu_record()?;
+    mem("record");
     session.draw_queries()?;
+    mem("queries");
     let queries = session.queries().to_vec();
     let positions = unique_sorted(&queries);
     let unique = table.open(&positions)?;
@@ -1442,7 +1487,10 @@ pub fn run_limited_shared_to_columns(
     }
     session.read_queries(&openings)?;
     table.forget()?;
+    table.release()?;
+    mem("released");
     session.join_gu_read_columns()?;
+    mem("columns");
     let mut omega_root = None;
     let mut zeta = Vec::new();
     let mut fold_output = None;
@@ -1483,6 +1531,7 @@ pub fn run_limited_shared_to_columns(
             session.receive_omega_answer(answer)?;
         }
         session.join_omega()?;
+        mem("omega");
         zeta = session.draw_zeta()?;
         omega_root = Some(omega_provider.root());
         if let Some(old_mask) = old_mask {
@@ -1536,6 +1585,7 @@ pub fn run_limited_shared_to_columns(
         let group = bat.new_group(fold_shape.code, fold_shape.mask_code)?;
         bat.join(group, 0, false)?;
         bat.join(group, 1, false)?;
+        let mut plain_rows = 0usize;
         for row in session.pending_gu_rows().iter().filter(|row| {
             row.kind != zkie_engine::pcs::request::relation::GuRelationKind::Sample
         }) {
@@ -1549,6 +1599,17 @@ pub fn run_limited_shared_to_columns(
                     BatRowKind::Plain,
                 )?,
             )?;
+            plain_rows += 1;
+        }
+        // Column draws take their frozen claim slots and targets here; their
+        // coefficient rows are built one at a time after x is drawn, so the
+        // draw set is not retained as dense tables.
+        let column_start = plain_rows;
+        let column_targets = session.column_targets().to_vec();
+        for target in &column_targets {
+            let mut row = BatRow::new(BatRowKind::Plain);
+            row.target = *target;
+            bat.add_row(group, row)?;
         }
         bat.add_row(
             group,
@@ -1561,9 +1622,46 @@ pub fn run_limited_shared_to_columns(
                 omega.k_lo,
             )?,
         )?;
+        mem("bat-rows");
         let input = bat.begin_run(group)?;
+        mem("bat-frozen");
         let x = session.draw_bat_challenge()?;
-        let combined = combine(&bat, &input.layout, &input.rows, x)?;
+        let mut combined = combine(&bat, &input.layout, &input.rows, x)?;
+        mem("bat-combine");
+        let mut power = Fp3::ONE;
+        for _ in 0..column_start {
+            power = power.mul(&x);
+        }
+        for (draw, target) in column_targets.iter().enumerate() {
+            let at = column_start
+                .checked_add(draw)
+                .ok_or(Error::ResourceLimit)?;
+            let frozen = input.rows.get(at).ok_or(Error::StatementMismatch)?;
+            if frozen.target != *target
+                || !frozen.terms.is_empty()
+                || !frozen.units.is_empty()
+                || !frozen.runs.is_empty()
+                || !frozen.forms.is_empty()
+            {
+                return Err(Error::StatementMismatch);
+            }
+            let row = session.column_relation_row(draw)?;
+            if row.target != *target {
+                return Err(Error::StatementMismatch);
+            }
+            carry_compact_table(
+                &bat,
+                &input.layout,
+                0,
+                &row.main,
+                provider.shape().u.main_rows,
+                provider.shape().u.code.ell,
+                power,
+                &mut combined,
+            )?;
+            power = power.mul(&x);
+        }
+        mem("bat-columns");
         let mut fold_row = bat.to_fold_input_row(&combined, &input.layout)?;
         fold_row.group = session.plan().group_id;
         fold_row.members = vec![provider.shape().oracle, omega_provider.oracle()];
@@ -1614,7 +1712,8 @@ pub fn run_limited_shared_to_columns(
             &end.fresh,
         )?);
         fold_output = Some(output);
-        pending_rows = session.pending_gu_rows().len();
+        mem("fold-stage");
+        pending_rows = session.pending_gu_rows().len() + session.pending_column_count();
         transcript = *session.transcript_value();
         if let Some(inputs) = switch.as_ref() {
             let mut provided = Vec::new();
@@ -1671,6 +1770,7 @@ pub fn run_limited_shared_to_columns(
                 cs_message = Some(run.message.clone());
                 transcript = *chain.value();
                 previous = Some(run.prover);
+                mem("switch");
                 if let Some(spec) = inputs.stage_fold {
                     let row = FoldInputRow {
                         group: spec.group,
@@ -1760,6 +1860,7 @@ pub fn run_limited_shared_to_columns(
                     return Err(Error::InvalidProof);
                 }
                 sealed = Some(decoded_seal);
+                mem("base");
                 base_proof = Some(proof);
                 transcript = decoded_seal;
             }
@@ -4656,6 +4757,8 @@ mod tests {
         let store_read = store.bytes_read();
         let store_len = store.file_len().expect("file len");
         store.cleanup().expect("cleanup after commit");
+        drop(key_randomness);
+        mem("commit-keys-dropped");
         let masked = LimitedKeyStatement {
             version: LIMITED_KEY_VERSION,
             model_commitment: context.model_id,
