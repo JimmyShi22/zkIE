@@ -358,6 +358,62 @@ fn selected_gpt2_output_head_request_session() {
     )
     .unwrap();
     let verify_ms = started.elapsed().as_millis();
+
+    // The stage manifest binds every file the verifier needs. The trace is a
+    // required input, not a cache; the request proof is reported separately
+    // from the full verification bytes.
+    use zkie::lm_head_stage::{
+        read_manifest, write_manifest, ManifestFile, VerificationManifest,
+    };
+    let fixture_dir = Path::new(&fixture).join("gpt2-seq16");
+    let request_rel = "output-head-request.bin";
+    let request_path = fixture_dir.join(request_rel);
+    let _ = fs::remove_file(&request_path);
+    fs::write(&request_path, &bytes).expect("write request");
+    let entry = |role: &str, rel: &str| {
+        let data = fs::read(fixture_dir.join(rel)).expect("read manifest file");
+        ManifestFile {
+            role: role.to_string(),
+            path: rel.to_string(),
+            bytes: data.len() as u64,
+            digest: zkie_core::artifact::digest_bytes(&data),
+        }
+    };
+    let manifest = VerificationManifest::new(vec![
+        entry("public-commitment", "public/model-commitment.bin"),
+        entry("trace", "proof.bin"),
+        entry("lin-request", request_rel),
+    ])
+    .expect("manifest");
+    let _ = fs::remove_file(fixture_dir.join(zkie::lm_head_stage::VERIFICATION_MANIFEST_FILE));
+    write_manifest(&fixture_dir, &manifest).expect("write manifest");
+    read_manifest(&fixture_dir)
+        .expect("read manifest")
+        .verify(&fixture_dir)
+        .expect("verify manifest");
+    let total_bytes: u64 = manifest.files.iter().map(|file| file.bytes).sum();
+    println!("manifest_total_bytes={total_bytes}");
+    println!("manifest_request_bytes={}", bytes.len());
+    assert_eq!(total_bytes, trace_bytes + bytes.len() as u64 + entry("public-commitment", "public/model-commitment.bin").bytes);
+
+    let mut tampered = bytes.clone();
+    tampered[0] ^= 1;
+    fs::write(&request_path, &tampered).expect("tamper request");
+    assert!(manifest.verify(&fixture_dir).is_err());
+    assert!(verify_output_head_lin_request_bytes(
+        &public,
+        &trusted,
+        &plan,
+        &trace,
+        &trace.tokens,
+        shape,
+        &tampered,
+        &[],
+    )
+    .is_err());
+    fs::write(&request_path, &bytes).expect("restore request");
+    std::fs::remove_file(fixture_dir.join("proof.bin")).ok();
+    assert!(manifest.verify(&fixture_dir).is_err());
     assert_eq!(outcome.outcomes.len(), 16);
     for value in &outcome.outcomes {
         assert!(value.eval_holds && value.dot_holds && value.fold_holds);
