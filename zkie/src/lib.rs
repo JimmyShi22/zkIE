@@ -10,6 +10,7 @@ pub mod profile;
 pub mod prove;
 pub mod report;
 pub mod run;
+pub mod s7_context;
 pub mod verify;
 
 use provider::production_provider;
