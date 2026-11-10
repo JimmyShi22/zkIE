@@ -932,6 +932,17 @@ mod tests {
     }
 
 
+    fn evaluate_claims(message: &SwitchedMessage, claims: &SwitchedClaims) -> Fp3 {
+        let mut value = Fp3::ZERO;
+        for (coefficient, symbol) in claims.combined.main.iter().zip(&message.main) {
+            value = value.add(&coefficient.mul(symbol));
+        }
+        for (coefficient, symbol) in claims.combined.mask.iter().zip(&message.mask) {
+            value = value.add(&coefficient.mul(symbol));
+        }
+        value
+    }
+
     #[test]
     fn the_multi_row_switch_claims_hold_on_the_honest_message() {
         use crate::pcs::request::code::{build_code_plan, encode_row_fp3};
@@ -993,6 +1004,71 @@ mod tests {
             value = value.add(&coefficient.mul(symbol));
         }
         assert_eq!(value, switched.combined.target);
+        let mut tampered = message.clone();
+        tampered.main[0] = tampered.main[0].add(&Fp3::ONE);
+        assert_ne!(evaluate_claims(&tampered, &switched), switched.combined.target);
+        let mut tampered = message.clone();
+        let first_rest = target.rest_places().unwrap()[0] as usize;
+        tampered.mask[first_rest] = tampered.mask[first_rest].add(&Fp3::ONE);
+        assert_ne!(evaluate_claims(&tampered, &switched), switched.combined.target);
+        let mut bad_auth = auth.clone();
+        bad_auth[0].main = bad_auth[0].main.add(&Fp3::ONE);
+        let bad = register_switch_multi(&rows, &target, &bad_auth, theta).unwrap();
+        assert_ne!(evaluate_claims(&message, &bad), bad.combined.target);
+    }
+
+    fn evaluate_rows_claims(message: &SwitchedRows, claims: &SwitchedClaims) -> Fp3 {
+        let mut value = Fp3::ZERO;
+        for (coefficient, symbol) in claims.combined.main.iter().zip(&message.main) {
+            value = value.add(&coefficient.mul(symbol));
+        }
+        for (coefficient, symbol) in claims.combined.mask.iter().zip(&message.mask) {
+            value = value.add(&coefficient.mul(symbol));
+        }
+        value
+    }
+
+    #[test]
+    fn the_multi_row_switch_accepts_a_zero_target_claim() {
+        use crate::pcs::request::code::build_code_plan;
+        let code = build_code_plan(3, 4, 1).unwrap();
+        let mask_code = build_code_plan(3, 4, 1).unwrap();
+        let rows = SingleRows {
+            code,
+            mask_code,
+            main: vec![Fp3::ZERO; 4],
+            main_tail: vec![Fp3::ZERO; 1],
+            masks: vec![vec![Fp3::ZERO; 4], vec![Fp3::ZERO; 4]],
+            mask_tails: vec![vec![Fp3::ZERO; 1], vec![Fp3::ZERO; 1]],
+            claim: vec![Fp3::ZERO; 4],
+            mask_claims: vec![vec![Fp3::ZERO; 4], vec![Fp3::ZERO; 4]],
+            target: Fp3::ZERO,
+        };
+        let target = SwitchTarget::from_stage(
+            build_code_plan(4, 2, 1).unwrap(),
+            build_code_plan(4, 2, 1).unwrap(),
+            2,
+            3,
+            1,
+        )
+        .unwrap();
+        let message = switched_rows_multi(
+            &rows,
+            &target,
+            vec![vec![Fp3::ZERO; 1]; 4],
+            vec![vec![Fp3::ZERO; 1]; 8],
+            Fp3::ZERO,
+        )
+        .unwrap();
+        let auth = [AuthenticatedRows {
+            position: 1,
+            main: Fp3::ZERO,
+            masks: [Fp3::ZERO, Fp3::ZERO],
+        }];
+        let switched =
+            register_switch_multi(&rows, &target, &auth, Fp3::from_u64(7)).unwrap();
+        assert_eq!(switched.combined.target, Fp3::ZERO);
+        assert_eq!(evaluate_rows_claims(&message, &switched), Fp3::ZERO);
     }
 
 

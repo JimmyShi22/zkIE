@@ -19,6 +19,7 @@ use zkie_engine::pcs::request::bat::{
 };
 use zkie_engine::pcs::request::binding::{BindingParameters, BindingStatement};
 use zkie_engine::pcs::request::chain::Chain;
+use zkie_engine::pcs::request::cs_stage::{switch_tree_plan_multi, SwitchTarget, SwitchedClaims, SwitchedRows};
 use zkie_engine::pcs::request::code::encode_row_fp3;
 use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE};
 use zkie_engine::pcs::request::fold::{
@@ -51,8 +52,9 @@ use zkie_engine::pcs::request::table::{
 };
 use zkie_engine::primitives::transcript::run_value;
 use zkie_engine::pcs::request::proximity::SingleRows;
-use zkie_ops::proof::base_final_session::{FoldBasis, FoldMember};
+use zkie_ops::proof::base_final_session::{fold_identity, FoldBasis, FoldMember};
 use zkie_ops::proof::column_session::fp_from_signed_word;
+use zkie_ops::proof::cs_multi_session::{CsMultiProver, CsMultiSession};
 use zkie_ops::proof::fold_handoff::{FoldHandoff, FoldHandoffAnchor};
 use zkie_ops::proof::session_baseline::SESSION_PROTOCOL_IDENTITY;
 
@@ -1155,6 +1157,9 @@ pub struct LimitedSharedColumns {
     pub fold_output: Option<FoldOutput>,
     pub folded_main_message: Vec<Fp3>,
     pub fold_stage: Option<LimitedFoldStage>,
+    pub cs_claims: Option<SwitchedClaims>,
+    pub cs_message: Option<SwitchedRows>,
+    pub pending_rows: usize,
     pub transcript: Digest,
 }
 
@@ -1170,7 +1175,8 @@ pub fn run_limited_shared_to_columns(
     randomness: &LmHeadGuRandomness,
     omega_randomness: Option<&LmHeadOmegaRandomness>,
     old_mask: Option<&LmHeadOldMaskProvider>,
-) -> Result<(FoldeqSession, LimitedSharedColumns)> {
+    switch: Option<LimitedSwitchInputs>,
+) -> Result<LimitedSharedColumns> {
     let mut session = FoldeqSession::open(setup.plan, setup.binder, setup.chain)?;
     session.bind_first_query(&setup.first_query)?;
     session.draw_gamma()?;
@@ -1218,6 +1224,10 @@ pub fn run_limited_shared_to_columns(
     let mut fold_output = None;
     let mut folded_main_message = Vec::new();
     let mut fold_stage = None;
+    let mut cs_claims = None;
+    let mut cs_message = None;
+    let mut pending_rows = 0usize;
+    let mut transcript = *session.transcript_value();
     if let Some(omega) = session.plan().omega.as_ref().cloned() {
         let omega_randomness = omega_randomness.ok_or(Error::InvalidConfig)?;
         let psi_lo: Vec<Fp3> = match session.psi() {
@@ -1346,8 +1356,8 @@ pub fn run_limited_shared_to_columns(
             &fold_layout,
             setup.mask.mask(),
             &prover_row,
-            main_messages,
-            old_mu,
+            main_messages.clone(),
+            old_mu.clone(),
             Vec::new(),
         )?;
         prover.start(eps, &coins)?;
@@ -1361,6 +1371,7 @@ pub fn run_limited_shared_to_columns(
                 .ok_or(Error::InvalidSessionState)?;
             prover.bind(gamma)?;
         }
+        let end = prover.end()?;
         let output = session.fold_finish()?;
         folded_main_message = prover.main_messages().to_vec();
         fold_stage = Some(build_limited_fold_stage(
@@ -1371,29 +1382,77 @@ pub fn run_limited_shared_to_columns(
             old_mask,
             &output,
             &folded_main_message,
+            &end.mu,
+            &end.fresh,
         )?);
         fold_output = Some(output);
+        pending_rows = session.pending_gu_rows().len();
+        transcript = *session.transcript_value();
+        if let (Some(inputs), Some(stage)) = (switch, fold_stage.as_ref()) {
+            let chain = session.take_chain_for_base()?;
+            let prover = CsMultiProver::new(
+                stage.rows.clone(),
+                inputs.target,
+                inputs.main_tails,
+                inputs.mask_tails,
+                inputs.pad,
+                inputs.plan.clone(),
+                &inputs.salts,
+            )?;
+            let mut cs = CsMultiSession::new(
+                chain,
+                stage.handoff.clone(),
+                stage.basis.clone(),
+                inputs.target,
+                *prover.shape(),
+                inputs.plan,
+                old_mask.tree_plan(),
+                old_mask.root(),
+            )?;
+            cs.receive_declarations(fold_identity(&stage.handoff), prover.root())?;
+            let seed = cs.draw_sample_seed()?;
+            cs.receive_answer(prover.sample_answer(&seed)?)?;
+            let (positions, _theta) = cs.draw_positions_theta(2)?;
+            let unique = unique_sorted(&positions);
+            let member_openings = vec![provider.open(&unique)?, omega_provider.open(&unique)?];
+            let mask_positions: Vec<u64> = positions
+                .iter()
+                .map(|position| *position % stage.handoff.mask_code.n())
+                .collect();
+            let mask_unique = unique_sorted(&mask_positions);
+            let fresh_opening = setup.mask.open(&mask_unique)?;
+            let old_mask_opening = old_mask.open(&mask_unique)?;
+            cs_claims = Some(
+                cs.authenticate_and_register(
+                    &member_openings,
+                    &fresh_opening,
+                    &old_mask_opening,
+                )?
+                .clone(),
+            );
+            cs_message = Some(prover.message().clone());
+            transcript = *cs.chain_value();
+        }
         }
     } else if omega_randomness.is_some() {
         return Err(Error::InvalidConfig);
     }
-    let transcript = *session.transcript_value();
-    Ok((
-        session,
-        LimitedSharedColumns {
-            gamma,
-            seeds,
-            answers,
-            queries,
-            root: provider.root(),
-            omega_root,
-            zeta,
-            fold_output,
-            folded_main_message,
-            fold_stage,
-            transcript,
-        },
-    ))
+    Ok(LimitedSharedColumns {
+        gamma,
+        seeds,
+        answers,
+        queries,
+        root: provider.root(),
+        omega_root,
+        zeta,
+        fold_output,
+        folded_main_message,
+        fold_stage,
+        cs_claims,
+        cs_message,
+        pending_rows,
+        transcript,
+    })
 }
 
 /// Builds the FOLD group's input row from the real G_u and Omega messages.
@@ -1466,7 +1525,7 @@ pub fn build_fold_row(
             .checked_add(offset)
             .ok_or(Error::ResourceLimit)?;
         let target = coefficients.get_mut(slot).ok_or(Error::ShapeMismatch)?;
-        *target = target.add(&weight);
+        *target = target.sub(&weight);
     }
     for (row, weight) in eq_zeta.iter().enumerate() {
         let slot = omega_base.checked_add(row).ok_or(Error::ResourceLimit)?;
@@ -1635,6 +1694,10 @@ impl LmHeadOldMaskProvider {
     pub fn tails(&self) -> &[Vec<Fp3>] {
         &self.tails
     }
+
+    pub fn tree_plan(&self) -> MaskTreePlan {
+        self.tree.plan
+    }
 }
 
 /// Commits the group's old mask message under the plan's mask tree. The root
@@ -1762,7 +1825,7 @@ fn bat_lin_fold_row(
         let real_place = offset % ell;
         let weight = eq_psi[place as usize].mul(&eq_zeta[row as usize]);
         let at = real_row + (real_place << row_bits);
-        gu_values[at] = gu_values[at].add(&weight);
+        gu_values[at] = gu_values[at].sub(&weight);
     }
     let omega_ell = usize::try_from(omega.shape().code.ell).map_err(|_| Error::ResourceLimit)?;
     let mut omega_values = vec![Fp3::ZERO; omega_ell];
@@ -1846,6 +1909,18 @@ pub struct LimitedFoldStage {
     pub rows: SingleRows,
 }
 
+/// The private inputs of one switch stage: the next stage's target, the new
+/// oracle tree plan and salts, the per-row encoding tails and the private
+/// sample pad.
+pub struct LimitedSwitchInputs {
+    pub target: SwitchTarget,
+    pub plan: RuntimeTreePlan,
+    pub main_tails: Vec<Vec<Fp3>>,
+    pub mask_tails: Vec<Vec<Fp3>>,
+    pub pad: Fp3,
+    pub salts: Vec<Vec<u8>>,
+}
+
 /// Builds the FOLD-to-CS handoff from the verified FOLD output and the real
 /// committed member trees. The single rows carry the folded main message, the
 /// folded tails of the member encodings, the old mask message and the FOLD
@@ -1859,6 +1934,8 @@ pub fn build_limited_fold_stage(
     old_mask: &LmHeadOldMaskProvider,
     output: &FoldOutput,
     folded_main: &[Fp3],
+    old_mask_message: &[Fp3],
+    fresh_message: &[Fp3],
 ) -> Result<LimitedFoldStage> {
     let layout = plan
         .fold_layout
@@ -1950,7 +2027,7 @@ pub fn build_limited_fold_stage(
             return Err(Error::UnsupportedPrimitive);
         }
     }
-    let mut masks = vec![old_mask.mu()?, fresh.coefficients().to_vec()];
+    let mut masks = vec![old_mask_message.to_vec(), fresh_message.to_vec()];
     let mut mask_tails = vec![
         old_mask
             .tails()
@@ -2946,7 +3023,7 @@ mod tests {
     }
 
 
-    fn small_shared_run() -> Result<(FoldeqSession, LimitedSharedColumns)> {
+    fn small_shared_run() -> Result<LimitedSharedColumns> {
         use zkie_engine::pcs::request::code::build_code_plan;
         let (key, gu, randomness, tails, parameters) = small_gu_fixture();
         let mask_code = build_code_plan(4, 8, 1)?;
@@ -3129,6 +3206,25 @@ mod tests {
                     .collect(),
             },
         )?;
+        let next_code = build_code_plan(5, 2, 1)?;
+        let next_mask = build_code_plan(5, 4, 1)?;
+        let target = SwitchTarget::from_stage(next_code, next_mask, 2, 3, 1)?;
+        let main_tails: Vec<Vec<Fp3>> = (0..4)
+            .map(|row| vec![Fp3::from_u64(0x200 + row as u64)])
+            .collect();
+        let mask_tails: Vec<Vec<Fp3>> = (0..8)
+            .map(|row| vec![Fp3::from_u64(0x300 + row as u64)])
+            .collect();
+        let plan = switch_tree_plan_multi(
+            1,
+            &target,
+            40,
+            Digest([0x41; 32]),
+            Digest([0x42; 32]),
+        )?;
+        let salts: Vec<Vec<u8>> = (0..plan.columns())
+            .map(|position| vec![(position as u8) ^ 0x7a; 40])
+            .collect();
         run_limited_shared_to_columns(
             setup,
             &key,
@@ -3136,22 +3232,43 @@ mod tests {
             &randomness,
             Some(&omega_randomness),
             Some(&old_mask),
+            Some(LimitedSwitchInputs {
+                target,
+                plan,
+                main_tails,
+                mask_tails,
+                pad: Fp3::from_u64(0x9a),
+                salts,
+            }),
         )
     }
 
     #[test]
     fn the_shared_chain_reaches_the_record_and_column_joins() {
-        let (session, run) = small_shared_run().expect("shared run");
+        let run = small_shared_run().expect("shared run");
         assert_ne!(run.root, Digest::ZERO);
         assert_ne!(run.transcript, Digest::ZERO);
         assert_eq!(run.gamma.len(), 2);
         assert_eq!(run.seeds.len(), 1);
         assert_eq!(run.answers.len(), 1);
         assert_eq!(run.queries.len(), 2);
-        assert_eq!(session.pending_gu_rows().len(), 4);
+        assert_eq!(run.pending_rows, 4);
         assert!(run.omega_root.is_some());
         assert_eq!(run.zeta.len(), 0);
         assert!(run.fold_output.is_some());
+        let claims = run.cs_claims.as_ref().expect("cs claims");
+        let message = run.cs_message.as_ref().expect("cs message");
+        assert_eq!(claims.claims.len(), 8);
+        assert_eq!(claims.combined.main.len(), 8);
+        assert_eq!(claims.combined.mask.len(), 32);
+        let mut value = Fp3::ZERO;
+        for (coefficient, symbol) in claims.combined.main.iter().zip(&message.main) {
+            value = value.add(&coefficient.mul(symbol));
+        }
+        for (coefficient, symbol) in claims.combined.mask.iter().zip(&message.mask) {
+            value = value.add(&coefficient.mul(symbol));
+        }
+        assert_eq!(value, claims.combined.target);
         let stage = run.fold_stage.as_ref().expect("fold stage");
         assert_eq!(stage.handoff.code, stage.rows.code);
         assert_eq!(stage.handoff.k, 3);
@@ -3161,7 +3278,7 @@ mod tests {
         assert_eq!(stage.rows.masks.len(), 2);
         assert_eq!(stage.rows.main_tail.len(), 1);
         assert_eq!(stage.rows.mask_tails.len(), 2);
-        assert!(session.zeta().is_some());
+
     }
 
 
@@ -3339,7 +3456,7 @@ mod tests {
         .expect("fold row");
         assert_eq!(row.coefficients.len(), 8 * 4);
         assert_eq!(row.members, vec![1, 2]);
-        assert_eq!(row.coefficients[0], Fp3::ONE);
+        assert_eq!(row.coefficients[0], Fp3::ZERO.sub(&Fp3::ONE));
         assert_eq!(row.coefficients[4 * 4], Fp3::ONE);
         assert_eq!(row.target, Fp3::ZERO);
     }
