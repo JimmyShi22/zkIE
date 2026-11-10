@@ -371,11 +371,43 @@ pub struct CompiledLines {
     pub own: CompiledGroup,
 }
 
+/// One oracle message of the compiled linear shape.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompiledOracle {
+    pub code: CodeParams,
+    pub main_rows: u64,
+    pub main_deg: u32,
+    pub mask_rows: u64,
+    pub mask_code: Option<CodeParams>,
+    pub answers: u32,
+}
+
+/// The compiled linear shape's oracle messages and leaf classes: the folded
+/// row, Omega, a request's W, the split masks and the leaf classes that keep
+/// messages read at different lists in different trees.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompiledFoldeq {
+    pub u: CompiledOracle,
+    pub omega: CompiledOracle,
+    pub w: CompiledOracle,
+    pub shared_split: Option<CompiledOracle>,
+    pub own_split: Option<CompiledOracle>,
+    pub rows_high: bool,
+    pub masks_ahead: bool,
+    pub masks_ride: bool,
+    pub fold_leaf_class: u32,
+    pub omega_leaf_class: u32,
+    pub w_leaf_class: u32,
+    pub shared_split_leaf_class: u32,
+    pub own_split_leaf_class: u32,
+}
+
 /// The compiled form of the one-time and batch group sets.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompiledPlan {
     pub once: CompiledLines,
     pub proof: CompiledLines,
+    pub once_foldeq: CompiledFoldeq,
 }
 
 impl RequestPlan {
@@ -383,7 +415,7 @@ impl RequestPlan {
     pub fn validate_compiled(&self, compiled: &CompiledPlan) -> Result<()> {
         validate_compiled_lines(&self.once, &compiled.once, self.samples)?;
         validate_compiled_lines(&self.proof, &compiled.proof, self.samples)?;
-        Ok(())
+        check_compiled_foldeq(self, &compiled.once_foldeq)
     }
 }
 
@@ -486,6 +518,113 @@ fn check_compiled_group(line: &GroupLine, group: &CompiledGroup, samples: u64) -
         prev_main_r = stage.main.r;
         prev_mask_ell = stage.mask.ell;
         prev_mask_r = stage.mask.r;
+    }
+    Ok(())
+}
+
+/// Checks the compiled linear shape's oracle messages against the plan's
+/// once lines and the table's shape. The row counts follow the reference's
+/// placement: the folded row and Omega include the sample's pad; W's pad is in
+/// its mask row.
+fn check_compiled_foldeq(plan: &RequestPlan, shape: &CompiledFoldeq) -> Result<()> {
+    let lines = &plan.once;
+    let u_line = lines.folded.main;
+    let omega_line = lines.omega.main;
+    let w_line = lines.own.main;
+    let fold_mask_line = lines.folded.mask;
+    let own_mask_line = lines.own.mask;
+    let u_ell = u_line.ell()?;
+    let omega_ell = omega_line.ell()?;
+    let w_ell = w_line.ell()?;
+    let table = &plan.table;
+    let step = pow2_at_least(table.code.r)?;
+    let tail_first = table
+        .code
+        .ell
+        .checked_add(step - 1)
+        .and_then(|value| value.checked_div(step))
+        .and_then(|value| value.checked_mul(step))
+        .ok_or(Error::InvalidConfig)?;
+    let entries = tail_first
+        .checked_add(table.code.r)
+        .ok_or(Error::InvalidConfig)?;
+    let u_rows = entries
+        .checked_add(plan.samples)
+        .and_then(|value| value.checked_add(u_ell - 1))
+        .and_then(|value| value.checked_div(u_ell))
+        .ok_or(Error::InvalidConfig)?;
+    let matrix_rows = 1u64
+        .checked_shl(plan.lin.matrix_rows_log)
+        .ok_or(Error::InvalidConfig)?;
+    let omega_rows = matrix_rows
+        .checked_add(plan.samples)
+        .and_then(|value| value.checked_add(omega_ell - 1))
+        .and_then(|value| value.checked_div(omega_ell))
+        .ok_or(Error::InvalidConfig)?;
+    let matrix_columns = 1u64
+        .checked_shl(plan.lin.k_col)
+        .ok_or(Error::InvalidConfig)?;
+    let w_rows = matrix_columns
+        .checked_add(w_ell - 1)
+        .and_then(|value| value.checked_div(w_ell))
+        .ok_or(Error::InvalidConfig)?;
+    if shape.u.code.log_n != u_line.log_n
+        || shape.u.code.ell != u_ell
+        || shape.u.main_rows != u_rows
+        || shape.u.main_deg != E_DEGREE as u32
+        || shape.u.mask_rows != 0
+        || shape.u.answers != plan.samples as u32
+        || shape.omega.code.log_n != omega_line.log_n
+        || shape.omega.code.ell != omega_ell
+        || shape.omega.main_rows != omega_rows
+        || shape.omega.mask_rows != 0
+        || shape.omega.answers != plan.samples as u32
+        || shape.w.code.log_n != w_line.log_n
+        || shape.w.code.ell != w_ell
+        || shape.w.main_rows != w_rows
+        || shape.w.mask_rows != 1
+        || shape
+            .w
+            .mask_code
+            .map(|code| (code.log_n, code.ell))
+            != Some((own_mask_line.log_n, own_mask_line.ell()?))
+        || shape.w.answers != plan.samples as u32
+        || !shape.rows_high
+        || !shape.masks_ahead
+        || !shape.masks_ride
+        || shape.fold_leaf_class != 0
+        || shape.w_leaf_class != 0
+        || shape.omega_leaf_class == shape.fold_leaf_class
+        || shape.shared_split_leaf_class == shape.omega_leaf_class
+        || shape.own_split_leaf_class == shape.w_leaf_class
+    {
+        return Err(Error::InvalidConfig);
+    }
+    if w_rows
+        .checked_mul(w_ell)
+        .and_then(|capacity| capacity.checked_sub(matrix_columns))
+        .ok_or(Error::InvalidConfig)?
+        >= plan.samples
+    {
+        return Err(Error::InvalidConfig);
+    }
+    match &shape.shared_split {
+        Some(shared) => {
+            if shared.main_rows != 0
+                || shared.mask_rows != 1
+                || shared
+                    .mask_code
+                    .map(|code| (code.log_n, code.ell))
+                    != Some((fold_mask_line.log_n, fold_mask_line.ell()?))
+                || shared.answers != plan.samples as u32
+            {
+                return Err(Error::InvalidConfig);
+            }
+        }
+        None => return Err(Error::InvalidConfig),
+    }
+    if shape.own_split.is_some() {
+        return Err(Error::InvalidConfig);
     }
     Ok(())
 }

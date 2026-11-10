@@ -10,8 +10,9 @@ use zkie_core::error::Result;
 use zkie_engine::pcs::request::code::{build_code_plan, CodeParams};
 use zkie_engine::pcs::request::field::E_DEGREE;
 use zkie_engine::pcs::request::plan::{
-    CodeLine, CompiledGroup, CompiledLines, CompiledPlan, CompiledStage, GroupLine, LinLines,
-    LinPlan, RequestPlan, ScopeWork, StageChoice, TablePlan, WorkPlan,
+    CodeLine, CompiledFoldeq, CompiledGroup, CompiledLines, CompiledOracle, CompiledPlan,
+    CompiledStage, GroupLine, LinLines, LinPlan, RequestPlan, ScopeWork, StageChoice, TablePlan,
+    WorkPlan,
 };
 
 fn code(log_n: u32, ell: u64, r: u64) -> Result<CodeParams> {
@@ -176,6 +177,49 @@ pub fn lm_head_compiled() -> Result<CompiledPlan> {
             cstage(0, 0, ccode(13, 32, 84)?, ccode(12, 512, 84)?, 84),
         ],
     );
+    let once_foldeq = CompiledFoldeq {
+        u: CompiledOracle {
+            code: ccode(17, 4096, 94)?,
+            main_rows: 21,
+            main_deg: 3,
+            mask_rows: 0,
+            mask_code: None,
+            answers: 1,
+        },
+        omega: CompiledOracle {
+            code: ccode(17, 4096, 94)?,
+            main_rows: 1,
+            main_deg: 3,
+            mask_rows: 0,
+            mask_code: None,
+            answers: 1,
+        },
+        w: CompiledOracle {
+            code: ccode(17, 4096, 94)?,
+            main_rows: 16,
+            main_deg: 3,
+            mask_rows: 1,
+            mask_code: Some(ccode(14, 256, 47)?),
+            answers: 1,
+        },
+        shared_split: Some(CompiledOracle {
+            code: ccode(14, 64, 47)?,
+            main_rows: 0,
+            main_deg: 3,
+            mask_rows: 1,
+            mask_code: Some(ccode(14, 64, 47)?),
+            answers: 1,
+        }),
+        own_split: None,
+        rows_high: true,
+        masks_ahead: true,
+        masks_ride: true,
+        fold_leaf_class: 0,
+        omega_leaf_class: 1,
+        w_leaf_class: 0,
+        shared_split_leaf_class: 2,
+        own_split_leaf_class: 3,
+    };
     Ok(CompiledPlan {
         once: CompiledLines {
             folded: once_folded,
@@ -187,6 +231,7 @@ pub fn lm_head_compiled() -> Result<CompiledPlan> {
             omega: None,
             own: proof_own,
         },
+        once_foldeq,
     })
 }
 
@@ -297,6 +342,20 @@ mod tests {
         let plan = lm_head_plan().expect("plan");
         let mut compiled = lm_head_compiled().expect("compiled");
         compiled.proof.omega = Some(compiled.proof.folded.clone());
+        assert!(plan.validate_compiled(&compiled).is_err());
+    }
+
+    #[test]
+    fn a_compiled_linear_shape_is_checked() {
+        let plan = lm_head_plan().expect("plan");
+        let mut compiled = lm_head_compiled().expect("compiled");
+        compiled.once_foldeq.u.main_rows = 20;
+        assert!(plan.validate_compiled(&compiled).is_err());
+        let mut compiled = lm_head_compiled().expect("compiled");
+        compiled.once_foldeq.w.mask_code = None;
+        assert!(plan.validate_compiled(&compiled).is_err());
+        let mut compiled = lm_head_compiled().expect("compiled");
+        compiled.once_foldeq.shared_split = None;
         assert!(plan.validate_compiled(&compiled).is_err());
     }
 
