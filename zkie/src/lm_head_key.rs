@@ -24,7 +24,7 @@ use zkie_engine::pcs::request::fold::{
 };
 use zkie_engine::pcs::request::foldeq::{
     reader_table_identity, FoldeqBinder, FoldeqBinding, FoldeqEdgeBinding, FoldeqPlan,
-    FoldeqSession, GammaPath,
+    FoldeqSession, GammaPath, LinShapeBinding,
 };
 use zkie_engine::pcs::request::gu::{GuNotice, GuOracleShape, GuRegistry, GuShape};
 use zkie_engine::pcs::request::params::{RequestParams, SHARED_CHAIN_LABEL};
@@ -643,8 +643,12 @@ pub fn build_limited_shared_session(
         ledger: Arc::new(Mutex::new(ReadLedger::new(LM_HEAD_COLUMN_DRAWS as u64))),
         column_draws: LM_HEAD_COLUMN_DRAWS,
         mask_query_count: 0,
-        gamma_path: GammaPath::Direct {
-            columns: reader.shape.v,
+        gamma_path: GammaPath::Lin {
+            shape: LinShapeBinding {
+                matrix_rows: 1u64 << request_plan.lin.matrix_rows_log,
+                k_lo: request_plan.lin.k_lo,
+                k_col: request_plan.lin.k_col,
+            },
         },
         gu: Some(gu),
         fold_layout: Some(layout),
@@ -1526,6 +1530,16 @@ mod tests {
         assert_eq!(mask_tree.configuration, plan.reader.configuration);
         assert_eq!(mask_tree.leaf_class, plan.fold.mask_leaf_class);
         assert_eq!(mask_tree.mask_rows, plan.fold.mask_rows().expect("rows"));
+        assert_eq!(
+            plan.gamma_path,
+            GammaPath::Lin {
+                shape: LinShapeBinding {
+                    matrix_rows: 1u64 << request_plan.lin.matrix_rows_log,
+                    k_lo: request_plan.lin.k_lo,
+                    k_col: request_plan.lin.k_col,
+                },
+            }
+        );
         assert_eq!(plan.column_draws, LM_HEAD_COLUMN_DRAWS);
         assert_eq!(
             plan.ledger.lock().expect("ledger").max_reads(),

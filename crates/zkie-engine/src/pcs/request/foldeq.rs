@@ -877,6 +877,7 @@ pub struct FoldeqSession {
     reads: VerifierReads,
     stage: Stage,
     gamma: Option<Vec<Fp3>>,
+    psi: Option<Vec<Fp3>>,
     gu_root: Option<Digest>,
     start: Option<FoldStartMessage>,
     epsilon: Option<Fp3>,
@@ -919,6 +920,7 @@ impl FoldeqSession {
             reads,
             stage: Stage::FirstQuery,
             gamma: None,
+            psi: None,
             gu_root: None,
             start: None,
             epsilon: None,
@@ -972,6 +974,7 @@ impl FoldeqSession {
             reads,
             stage: Stage::Read,
             gamma: None,
+            psi: None,
             gu_root: None,
             start: None,
             epsilon: None,
@@ -1007,6 +1010,12 @@ impl FoldeqSession {
 
     pub fn gamma(&self) -> Option<&[Fp3]> {
         self.gamma.as_deref()
+    }
+
+    /// The complete LIN point drawn before the gamma suffix. It is present
+    /// only on the LIN challenge path.
+    pub fn psi(&self) -> Option<&[Fp3]> {
+        self.psi.as_deref()
     }
 
     /// The seed set drawn from the received G_u root's SEND round. It is
@@ -1082,7 +1091,9 @@ impl FoldeqSession {
         let gamma = match self.plan.gamma_path {
             GammaPath::Lin { shape } => {
                 let psi = self.draw_challenge(shape.k_col as usize)?;
-                lin_gamma(&psi, shape.k_lo, self.plan.reader.shape.v)?
+                let gamma = lin_gamma(&psi, shape.k_lo, self.plan.reader.shape.v)?;
+                self.psi = Some(psi);
+                gamma
             }
             GammaPath::Direct { columns } => self.draw_challenge(columns as usize)?,
         };
