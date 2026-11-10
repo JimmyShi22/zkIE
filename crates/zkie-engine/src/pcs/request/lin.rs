@@ -266,6 +266,26 @@ pub fn lin_eval_holds(table: &LinTable, claim: &LinClaim) -> Result<bool> {
     Ok(value == claim.target)
 }
 
+/// The (Eval) check with a fixed submitted W. This variant checks the value at
+/// the claim point directly against the submitted vector and does not recompute
+/// W from the table. The caller must fix and authenticate W separately; the
+/// vector's source is outside this function.
+pub fn lin_eval_holds_with(
+    table: &LinTable,
+    claim: &LinClaim,
+    w: &[Fp3],
+) -> Result<bool> {
+    claim.check(&table.shape)?;
+    if w.len() as u64 != table.shape.matrix_columns()? {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut value = eval(w, &claim.psi)?;
+    for mask in &claim.masks {
+        value = value.add(&mask.value.mul(&mask.coefficient));
+    }
+    Ok(value == claim.target)
+}
+
 /// The (Dot) check: <weights, Omega> = W(psi*). `shared_point` is the shared
 /// challenge point, distinct from the request's `claim.psi` used by Eval.
 /// This convenience recomputes Omega at that point; it cannot by itself reject
@@ -308,6 +328,37 @@ pub fn lin_dot_holds_with(
         left = left.add(&weight.mul(value));
     }
     Ok(left == eval(&w, shared_point)?)
+}
+
+/// The (Dot) check with a fixed submitted W and shared Omega. The right side
+/// uses the submitted W directly; this variant does not recompute W from the
+/// table. The caller must fix and authenticate W separately.
+pub fn lin_dot_holds_with_w(
+    table: &LinTable,
+    claim: &LinClaim,
+    shared_point: &[Fp3],
+    omega: &[Fp3],
+    w: &[Fp3],
+) -> Result<bool> {
+    table.shape.check()?;
+    claim.check(&table.shape)?;
+    let expected = power_of_two_len(table.shape.k_row() as usize)?;
+    if claim.weights.len() != table.shape.matrix_rows as usize
+        || shared_point.len() != table.shape.k_col as usize
+        || omega.len() != expected
+        || w.len() as u64 != table.shape.matrix_columns()?
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut left = Fp3::ZERO;
+    for (weight, value) in claim
+        .weights
+        .iter()
+        .zip(omega.iter().take(table.shape.matrix_rows as usize))
+    {
+        left = left.add(&weight.mul(value));
+    }
+    Ok(left == eval(w, shared_point)?)
 }
 
 /// The (Fold) check: Omega at zeta equals the folded-row inner product.

@@ -9,8 +9,10 @@
 //! The table `M` is built from an authenticated asset opening: the trusted
 //! model anchor is verified first, then the opening is checked with the
 //! existing Merkle opener, including asset id, root, row order and width. The
-//! candidate Eval and Dot relations and the candidate fold relation are invoked
-//! through the existing LIN helpers.
+//! candidate Eval and Dot relations use the submitted, authenticated W vector
+//! directly; they do not recompute W. The candidate fold relation is invoked
+//! through the existing LIN helper. A separately named row-wise control
+//! recomputes W and Omega for full-value comparison.
 //!
 //! The weights, claim point, target, W message, Omega message and folded rows
 //! are self-reported values. W and Omega openings only show membership in the
@@ -25,6 +27,13 @@
 //! are therefore drawn with the existing chain draw interface, and no parallel
 //! generator is introduced.
 //!
+//! The base field has `p < 2^64` and `Fp3` is a cubic extension, so
+//! `|Fp3| = p^3 < 2^192`. This demonstration gives no soundness bound: a
+//! multivariate nonzero polynomial detection bound needs its degree and the
+//! challenge distribution, and Omega is chosen after the shared challenge, so
+//! a bound fixed before that point does not apply. Only local equality checks
+//! and the deterministic full-value control are run.
+//!
 //! The binding is assembled by the caller with the existing binding candidate.
 //! The candidate protocol identity and request parameters are demo
 //! placeholders, not real protocol values. Fixed test seeds, where used, are
@@ -38,7 +47,7 @@ use zkie_engine::pcs::request::binding::BindingCandidate;
 use zkie_engine::pcs::request::chain::{Chain, KIND_ALGEBRAIC};
 use zkie_engine::pcs::request::field::Fp3;
 use zkie_engine::pcs::request::lin::{
-    lin_dot_holds_with, lin_eval_holds, lin_fold_holds, LinClaim, LinShape, LinTable,
+    lin_dot_holds_with_w, lin_eval_holds_with, lin_fold_holds, LinClaim, LinShape, LinTable,
 };
 use zkie_engine::pcs::request::params::REQUEST_CHAIN_LABEL;
 
@@ -53,12 +62,6 @@ use crate::proof::session_baseline::TrustedModel;
 const SESSION_SCHEMA_VERSION: u64 = 1;
 const STAGE_BIND_W: u64 = 1;
 const STAGE_OMEGA_FOLD: u64 = 2;
-
-/// One candidate protocol field element is a cubic extension over the
-/// 64-bit base field, so a local nonzero linear relation has at most
-/// `1/|Fp3|` chance of holding for an independent random challenge.
-pub const FIELD_BITS: u32 = 192;
-pub const LOCAL_LINEAR_BOUND_BITS: u32 = 192;
 
 const W_LABEL: Digest = Digest([0x71; 32]);
 const OMEGA_LABEL: Digest = Digest([0x72; 32]);
@@ -98,13 +101,24 @@ pub struct LinVerifierOutcome {
     pub zeta_rho: Digest,
     pub zeta: Vec<Fp3>,
     pub shared_dimension: usize,
-    pub field_bits: u32,
-    pub local_bound_bits: u32,
     pub eval_holds: bool,
     pub dot_holds: bool,
     pub fold_holds: bool,
     pub control_w: bool,
     pub control_omega: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinComponentChecks {
+    pub eval_holds: bool,
+    pub dot_holds: bool,
+    pub fold_holds: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinControlChecks {
+    pub w_matches: bool,
+    pub omega_matches: bool,
 }
 
 fn digest_words(digest: &Digest) -> [u64; 4] {
@@ -399,6 +413,58 @@ pub fn prove_lin_session(
     })
 }
 
+/// Component-layer checks. Eval and Dot use the submitted W values directly;
+/// Fold uses the submitted Omega and folded values. These are relation checks,
+/// not a soundness bound.
+pub fn check_lin_components(
+    table: &LinTable,
+    claim: &LinClaim,
+    shared: &[Fp3],
+    zeta: &[Fp3],
+    messages: &LinMessages,
+) -> Result<LinComponentChecks> {
+    claim.check(&table.shape)?;
+    let eval_holds = lin_eval_holds_with(table, claim, &messages.w.values)?;
+    let dot_holds = lin_dot_holds_with_w(
+        table,
+        claim,
+        shared,
+        &messages.omega.values,
+        &messages.w.values,
+    )?;
+    let psi_lo = &claim.psi[..table.shape.k_lo as usize];
+    let fold_holds = lin_fold_holds(
+        table.shape,
+        &messages.omega.values,
+        psi_lo,
+        zeta,
+        &messages.folded.values,
+    )?;
+    Ok(LinComponentChecks {
+        eval_holds,
+        dot_holds,
+        fold_holds,
+    })
+}
+
+/// Full-value control layer. It recomputes W and Omega from the authenticated
+/// table and compares every submitted value. This is the deterministic
+/// full-protection comparison and is not a proof-verifier acceptance.
+pub fn check_lin_control(
+    table: &LinTable,
+    claim: &LinClaim,
+    shared: &[Fp3],
+    messages: &LinMessages,
+) -> Result<LinControlChecks> {
+    claim.check(&table.shape)?;
+    let w_matches = table.w(&claim.weights)? == messages.w.values;
+    let omega_matches = table.omega(shared)? == messages.omega.values;
+    Ok(LinControlChecks {
+        w_matches,
+        omega_matches,
+    })
+}
+
 /// Verifier path. It reconstructs the same binding and stage order, verifies
 /// the three commitments, runs the candidate Eval, Dot and Fold checks, and
 /// then runs the authenticated full-recompute isolation control for W and
@@ -428,24 +494,12 @@ pub fn verify_lin_session(
     verify_oracle(&messages.omega)?;
     verify_oracle(&messages.folded)?;
 
-    let eval_holds = lin_eval_holds(&table, claim)?;
-    let dot_holds =
-        lin_dot_holds_with(&table, claim, &shared, &messages.omega.values)?;
-    let psi_lo = &claim.psi[..shape.k_lo as usize];
-    let fold_holds = lin_fold_holds(
-        shape,
-        &messages.omega.values,
-        psi_lo,
-        &zeta,
-        &messages.folded.values,
-    )?;
-    if !eval_holds || !dot_holds || !fold_holds {
+    let components = check_lin_components(&table, claim, &shared, &zeta, messages)?;
+    if !components.eval_holds || !components.dot_holds || !components.fold_holds {
         return Err(Error::InvalidProof);
     }
-
-    let control_w = table.w(&claim.weights)? == messages.w.values;
-    let control_omega = table.omega(&shared)? == messages.omega.values;
-    if !control_w || !control_omega {
+    let control = check_lin_control(&table, claim, &shared, messages)?;
+    if !control.w_matches || !control.omega_matches {
         return Err(Error::InvalidProof);
     }
 
@@ -455,13 +509,11 @@ pub fn verify_lin_session(
         zeta_rho,
         zeta,
         shared_dimension: shape.k_col as usize,
-        field_bits: FIELD_BITS,
-        local_bound_bits: LOCAL_LINEAR_BOUND_BITS,
-        eval_holds,
-        dot_holds,
-        fold_holds,
-        control_w,
-        control_omega,
+        eval_holds: components.eval_holds,
+        dot_holds: components.dot_holds,
+        fold_holds: components.fold_holds,
+        control_w: control.w_matches,
+        control_omega: control.omega_matches,
     })
 }
 
@@ -646,6 +698,18 @@ mod tests {
         .unwrap()
     }
 
+    fn table(fixture: &Fixture) -> LinTable {
+        let trusted = trusted(fixture);
+        build_authenticated_lin_table(
+            &fixture.public,
+            &trusted,
+            "table_i32.bin",
+            &fixture.opening,
+            fixture.shape,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn prover_and_verifier_agree_and_all_local_checks_hold() {
         let fixture = fixture();
@@ -656,9 +720,21 @@ mod tests {
         assert_eq!(prover.zeta_rho, verifier.zeta_rho);
         assert_eq!(prover.zeta, verifier.zeta);
         assert_eq!(verifier.shared_dimension, fixture.shape.k_col as usize);
-        assert_eq!(verifier.field_bits, FIELD_BITS);
         assert!(verifier.eval_holds && verifier.dot_holds && verifier.fold_holds);
         assert!(verifier.control_w && verifier.control_omega);
+        let table = table(&fixture);
+        let components = check_lin_components(
+            &table,
+            &fixture.claim,
+            &prover.shared,
+            &prover.zeta,
+            &prover.messages,
+        )
+        .unwrap();
+        assert!(components.eval_holds && components.dot_holds && components.fold_holds);
+        let control =
+            check_lin_control(&table, &fixture.claim, &prover.shared, &prover.messages).unwrap();
+        assert!(control.w_matches && control.omega_matches);
     }
 
     #[test]
@@ -676,32 +752,72 @@ mod tests {
     }
 
     #[test]
-    fn wrong_w_message_with_a_valid_commitment_is_rejected_by_control() {
+    fn wrong_submitted_w_fails_component_eval_and_dot_before_control() {
         let fixture = fixture();
         let mut prover = prove(&fixture);
         let mut values = prover.messages.w.values.clone();
         values[0] = Fp3::from_u64(999);
         prover.messages.w = commit_oracle(&W_LABEL, &values).unwrap();
+        let table = table(&fixture);
+        let components = check_lin_components(
+            &table,
+            &fixture.claim,
+            &prover.shared,
+            &prover.zeta,
+            &prover.messages,
+        )
+        .unwrap();
+        assert!(!components.eval_holds);
+        assert!(!components.dot_holds);
+        let control =
+            check_lin_control(&table, &fixture.claim, &prover.shared, &prover.messages).unwrap();
+        assert!(!control.w_matches);
         assert!(verify(&fixture, &prover.messages).is_err());
     }
 
     #[test]
-    fn wrong_omega_message_with_a_valid_commitment_is_rejected_by_control() {
+    fn wrong_omega_message_is_seen_by_component_and_control_layers() {
         let fixture = fixture();
         let mut prover = prove(&fixture);
         let mut values = prover.messages.omega.values.clone();
         values[0] = Fp3::from_u64(999);
         prover.messages.omega = commit_oracle(&OMEGA_LABEL, &values).unwrap();
+        let table = table(&fixture);
+        let components = check_lin_components(
+            &table,
+            &fixture.claim,
+            &prover.shared,
+            &prover.zeta,
+            &prover.messages,
+        )
+        .unwrap();
+        assert!(!components.dot_holds || !components.fold_holds);
+        let control =
+            check_lin_control(&table, &fixture.claim, &prover.shared, &prover.messages).unwrap();
+        assert!(!control.omega_matches);
         assert!(verify(&fixture, &prover.messages).is_err());
     }
 
     #[test]
-    fn wrong_folded_message_with_a_valid_commitment_is_rejected() {
+    fn wrong_folded_message_fails_component_fold_but_not_control() {
         let fixture = fixture();
         let mut prover = prove(&fixture);
         let mut values = prover.messages.folded.values.clone();
         values[0] = Fp3::from_u64(999);
         prover.messages.folded = commit_oracle(&FOLDED_LABEL, &values).unwrap();
+        let table = table(&fixture);
+        let components = check_lin_components(
+            &table,
+            &fixture.claim,
+            &prover.shared,
+            &prover.zeta,
+            &prover.messages,
+        )
+        .unwrap();
+        assert!(!components.fold_holds);
+        let control =
+            check_lin_control(&table, &fixture.claim, &prover.shared, &prover.messages).unwrap();
+        assert!(control.w_matches && control.omega_matches);
         assert!(verify(&fixture, &prover.messages).is_err());
     }
 
@@ -751,8 +867,21 @@ mod tests {
     fn claim_target_and_weights_tampering_is_rejected() {
         let fixture = fixture();
         let prover = prove(&fixture);
+        let table = table(&fixture);
         let mut claim = fixture.claim.clone();
         claim.target = Fp3::from_u64(999);
+        let components = check_lin_components(
+            &table,
+            &claim,
+            &prover.shared,
+            &prover.zeta,
+            &prover.messages,
+        )
+        .unwrap();
+        assert!(!components.eval_holds);
+        let control =
+            check_lin_control(&table, &claim, &prover.shared, &prover.messages).unwrap();
+        assert!(control.w_matches && control.omega_matches);
         let trusted = trusted(&fixture);
         assert!(verify_lin_session(
             &fixture.public,
@@ -768,6 +897,20 @@ mod tests {
 
         let mut claim = fixture.claim.clone();
         claim.weights[0] = Fp3::from_u64(999);
+        let components = check_lin_components(
+            &table,
+            &claim,
+            &prover.shared,
+            &prover.zeta,
+            &prover.messages,
+        )
+        .unwrap();
+        assert!(components.eval_holds);
+        assert!(!components.dot_holds);
+        let control =
+            check_lin_control(&table, &claim, &prover.shared, &prover.messages).unwrap();
+        assert!(!control.w_matches);
+        assert!(control.omega_matches);
         assert!(verify_lin_session(
             &fixture.public,
             &trusted,
