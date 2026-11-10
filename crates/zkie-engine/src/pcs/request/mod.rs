@@ -1,7 +1,9 @@
+pub mod base_stage;
 pub mod bat;
 pub mod binding;
 pub mod chain;
 pub mod code;
+pub mod cs_stage;
 pub mod field;
 pub mod fold;
 pub mod foldeq;
@@ -10,6 +12,7 @@ pub mod lin;
 pub mod link;
 pub mod model_tied;
 pub mod params;
+pub mod proximity;
 pub mod persistent_count;
 pub mod send;
 pub mod oracle_opening;
