@@ -1,47 +1,59 @@
-//! Isolated G_u declaration registration and BAT combination demonstration.
+//! Isolated G_u declaration registration adapted to the existing BAT layer.
 //!
-//! This module runs the fixed pre-FOLD column session, takes the record,
-//! sample and column declarations that session registered, fixes the session
-//! identity and declarations into the session chain snapshot, draws one
-//! combination challenge `x`, and combines every declaration coefficient and
-//! target by powers of `x`.
+//! This module runs the fixed pre-FOLD column session, takes the record, sample
+//! and column declarations registered by that session, adapts them to BAT
+//! claims, freezes one BAT group, closes the algebraic round on a snapshot of
+//! the session chain, draws `x`, and lets BAT combine the declarations.
+//!
+//! The declaration adapter is semantic: a G_u relation row becomes a BAT claim
+//! with a main term and, when present, a mask term. BAT requires power-of-two
+//! code widths; the G_u mask code has six entries, so the BAT mask term is
+//! zero-padded to the next power of two. The padding preserves the linear
+//! functional because the padded coefficients are zero. The G_u oracle/group
+//! ids are mapped to BAT's sequential registration ids; the original ids are
+//! retained in the outcome. This is an adapter, not a second BAT.
+//!
+//! The chain snapshot is a **same-prefix forked isolated snapshot**: cloning the
+//! session chain and running BAT on the clone does not advance the original
+//! FOLDEQ session, and this result is not a later FOLD-ready state of that
+//! session. Future linkage requires one continuous session, with declarations
+//! fixed in the confirmed order before the challenge is drawn; copying the
+//! state must not create two independent protocol paths.
+//!
+//! The BAT round is a candidate demonstration. BAT's close-algebraic step and
+//! the session prefix are used, but this is not an exact reproduction of a
+//! reference transcript and is not a permanent proof format. The binding basis
+//! is the frozen `BatRunInput` (group layout, member order, declaration class
+//! order and row count); the challenge domain is BAT's empty algebraic close;
+//! the declaration order is BAT's fixed class order. No extra hashing or
+//! redundant protocol round is introduced.
 //!
 //! Supported declarations come from the same session reader, G_u identity,
 //! shape and opened columns:
 //!
-//! | declaration | source | note |
+//! | declaration | source | BAT class |
 //! | --- | --- | --- |
-//! | sample | the session SEND answer path | the answer is a fake demonstration value |
-//! | record | the session record join under the bound index name | pending declaration |
-//! | column | the session column read path | opens are authenticated against the column root only |
+//! | sample | the session SEND answer path | `Sample` (fake demonstration answer) |
+//! | record | the session record join | `Plain` |
+//! | column | the session column read path | `Plain` (opens bind only the column root) |
 //!
-//! Not supported in this step: multi-oracle SEND, a real SEND provider and a
-//! fresh-mask declaration. These are listed rather than filled with extra
-//! fixtures.
-//!
-//! The G_u row is a pending declaration. Registration binds the claimed G_u
-//! root and the declaration coefficients/targets; it does not prove the G_u
-//! value, its source or the declaration correctness. The G_u root is a
-//! self-reported demonstration value and the SEND answer is a fake value; both
-//! are recorded as such. Column openings are authenticated only against the
-//! column root. BAT combines declarations and does not judge truth. Without a
-//! later proximity/relation check, a successful combination is not a check
-//! pass and no proof is accepted.
-//!
-//! The combined row is not connected to the 3c FOLD source in this step. The
-//! 3c source has its own fixture claim/target relation; rewriting its target to
-//! match this combination would not establish real consistency. The independent
-//! registration/combination result is kept, and the 3c handoff remains
-//! fail-closed.
+//! Not supported and listed: multi-oracle SEND, a real SEND provider and a
+//! fresh-mask declaration. The G_u root is self-reported; the G_u row is a
+//! pending declaration. BAT combines claims and does not judge truth. Without a
+//! later proximity/relation check this is not a check pass.
 
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
-use zkie_engine::pcs::request::chain::{Chain, KIND_ALGEBRAIC};
+use zkie_engine::pcs::request::bat::{
+    BatGroupLayout, BatGroupRow, BatOracleShape, BatPart, BatRow, BatRowKind, BatSession,
+    BatStatement,
+};
+use zkie_engine::pcs::request::chain::Chain;
+use zkie_engine::pcs::request::code::{build_code_plan, CodeParams};
 use zkie_engine::pcs::request::field::Fp3;
 use zkie_engine::pcs::request::foldeq::reader_table_identity;
 use zkie_engine::pcs::request::relation::{GuRelationKind, GuRelationRow};
 use zkie_engine::pcs::request::table::IndexShape;
-use zkie_engine::primitives::codec::CanonicalWriter;
 
 use crate::proof::column_session::{
     bind_table, build_authenticated_encoding_table_with_configuration, open_gu_flow,
@@ -50,137 +62,166 @@ use crate::proof::column_session::{
 use crate::proof::model_commitment::{AssetOpening, ModelCommitmentPublic};
 use crate::proof::session_baseline::TrustedModel;
 
-/// The combined declaration row. It is pending, not a validated relation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CombinedGuRow {
+/// The BAT adapter shape for one G_u oracle. The oracle/group ids are BAT's
+/// sequential ids; the original G_u ids are kept separately in the outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatAdapterShape {
     pub oracle: u64,
     pub group: u64,
-    pub main: Vec<Fp3>,
-    pub mask: Vec<Fp3>,
-    pub target: Fp3,
-    pub kinds: Vec<GuRelationKind>,
-    pub count: usize,
+    pub main_rows: u64,
+    pub mask_rows: u64,
+    pub main_code: CodeParams,
+    pub mask_code: CodeParams,
+    /// The original G_u mask code width before power-of-two padding.
+    pub mask_orig_ell: u64,
+    pub answers: u32,
 }
 
-fn kind_word(kind: GuRelationKind) -> u64 {
-    match kind {
-        GuRelationKind::Sample => 1,
-        GuRelationKind::Record => 2,
-        GuRelationKind::Column => 3,
+impl BatAdapterShape {
+    fn from_gu(gu: &zkie_engine::pcs::request::gu::GuShape) -> Result<Self> {
+        let original_mask_code = gu.u.mask_code.ok_or(Error::UnsupportedPrimitive)?;
+        let mask_ell = original_mask_code
+            .ell
+            .checked_next_power_of_two()
+            .ok_or(Error::ResourceLimit)?;
+        // BAT requires power-of-two code widths. When padding leaves no room
+        // for the original tail, use an empty tail for the BAT-only mask term;
+        // the padded coefficients are zero and the original tail is not part
+        // of the declaration target.
+        let n = 1u64
+            .checked_shl(original_mask_code.log_n)
+            .ok_or(Error::ResourceLimit)?;
+        let mask_r = if mask_ell.saturating_add(original_mask_code.r) <= n {
+            original_mask_code.r
+        } else {
+            0
+        };
+        let mask_code = build_code_plan(original_mask_code.log_n, mask_ell, mask_r)?;
+        if !gu.u.code.ell.is_power_of_two() || !mask_code.ell.is_power_of_two() {
+            return Err(Error::UnsupportedPrimitive);
+        }
+        Ok(Self {
+            oracle: 0,
+            group: 0,
+            main_rows: gu.u.main_rows,
+            mask_rows: gu.u.mask_rows,
+            main_code: gu.u.code,
+            mask_code,
+            mask_orig_ell: original_mask_code.ell,
+            answers: gu.u.answers,
+        })
+    }
+
+    fn oracle_shape(&self) -> BatOracleShape {
+        BatOracleShape {
+            oracle: self.oracle,
+            main_rows: self.main_rows,
+            mask_rows: self.mask_rows,
+            main_code: Some(self.main_code),
+            mask_code: Some(self.mask_code),
+            answers: self.answers,
+        }
+    }
+
+    fn main_table_len(&self) -> Result<usize> {
+        let bits = self.oracle_shape().table_bits(BatPart::Main);
+        1usize.checked_shl(bits).ok_or(Error::ResourceLimit)
+    }
+
+    fn mask_table_len(&self) -> Result<usize> {
+        let bits = self.oracle_shape().table_bits(BatPart::Mask);
+        1usize.checked_shl(bits).ok_or(Error::ResourceLimit)
     }
 }
 
-/// Combines every declaration by powers of `x` in the order supplied.
-/// Committed rows must share the oracle, group and coefficient shapes. The
-/// function does not evaluate or judge the declarations.
-pub fn combine_declarations(rows: &[GuRelationRow], x: Fp3) -> Result<CombinedGuRow> {
-    let first = rows.first().ok_or(Error::InvalidConfig)?;
-    let mut main = vec![Fp3::ZERO; first.main.len()];
-    let mut mask = vec![Fp3::ZERO; first.mask.len()];
-    let mut target = Fp3::ZERO;
-    let mut power = Fp3::ONE;
-    let mut kinds = Vec::with_capacity(rows.len());
+fn adapt_row(row: &GuRelationRow, shape: &BatAdapterShape) -> Result<BatRow> {
+    if row.main.len() as u64 != shape.main_rows.saturating_mul(shape.main_code.ell)
+        || row.mask.len() as u64 != shape.mask_rows.saturating_mul(shape.mask_orig_ell)
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let kind = match row.kind {
+        GuRelationKind::Sample => BatRowKind::Sample,
+        GuRelationKind::Record | GuRelationKind::Column => BatRowKind::Plain,
+    };
+    let mut out = BatRow::new(kind);
+    if !row.main.is_empty() {
+        let mut main = row.main.clone();
+        main.resize(shape.main_table_len()?, Fp3::ZERO);
+        out.add_term(shape.oracle, BatPart::Main, main);
+    }
+    if !row.mask.is_empty() {
+        let mut mask = row.mask.clone();
+        mask.resize(shape.mask_table_len()?, Fp3::ZERO);
+        out.add_term(shape.oracle, BatPart::Mask, mask);
+    }
+    out.target = row.target;
+    Ok(out)
+}
+
+/// The BAT run result and its retained declaration order.
+pub struct BatCombineRun {
+    pub layout: BatGroupLayout,
+    pub combined: BatGroupRow,
+    pub x: Fp3,
+    pub order: Vec<BatRowKind>,
+}
+
+/// Adapts the G_u declarations to BAT, freezes the group, closes the BAT
+/// algebraic round on the supplied chain snapshot, draws `x` and combines.
+pub fn run_bat_combine(
+    rows: &[GuRelationRow],
+    shape: &BatAdapterShape,
+    chain: Chain,
+) -> Result<BatCombineRun> {
+    if rows.is_empty() {
+        return Err(Error::InvalidConfig);
+    }
+    let planned_rows = u64::try_from(rows.len()).map_err(|_| Error::ResourceLimit)?;
+    let mut bat = BatSession::new(BatStatement::new(), chain, planned_rows)?;
+    let statement = bat.statement_mut();
+    statement.add_oracle(shape.oracle_shape())?;
+    let group = statement.new_group(shape.main_code, shape.mask_code)?;
+    let mut samples = Vec::new();
+    let mut plains = Vec::new();
     for row in rows {
-        if row.oracle != first.oracle
-            || row.group != first.group
-            || row.main.len() != main.len()
-            || row.mask.len() != mask.len()
-        {
-            return Err(Error::StatementMismatch);
+        let adapted = adapt_row(row, shape)?;
+        match adapted.kind {
+            BatRowKind::Sample => samples.push(adapted),
+            BatRowKind::Plain => plains.push(adapted),
+            BatRowKind::Generator => return Err(Error::UnsupportedPrimitive),
         }
-        for (sum, value) in main.iter_mut().zip(&row.main) {
-            *sum = sum.add(&power.mul(value));
-        }
-        for (sum, value) in mask.iter_mut().zip(&row.mask) {
-            *sum = sum.add(&power.mul(value));
-        }
-        target = target.add(&power.mul(&row.target));
-        kinds.push(row.kind);
-        power = power.mul(&x);
     }
-    Ok(CombinedGuRow {
-        oracle: first.oracle,
-        group: first.group,
-        main,
-        mask,
-        target,
-        kinds,
-        count: rows.len(),
+    if samples.len() != shape.answers as usize {
+        return Err(Error::ShapeMismatch);
+    }
+    statement.sample(shape.oracle, samples)?;
+    statement.join(group, shape.oracle, false)?;
+    for row in plains {
+        statement.add_row(group, row)?;
+    }
+    let layout = statement.layout(group)?;
+    let input = bat.begin_run(group)?;
+    let order = input.rows.iter().map(|row| row.kind).collect::<Vec<_>>();
+    let combined = bat.finish_run(input)?;
+    let x = bat.last_x().ok_or(Error::InvalidSessionState)?;
+    Ok(BatCombineRun {
+        layout,
+        combined,
+        x,
+        order,
     })
 }
 
-/// Absorbs only session-bound identity and declaration values. No additional
-/// digest or unbound hash layer is introduced; the x challenge is the next
-/// chain draw after these declarations.
-fn absorb_declarations(
-    chain: &mut Chain,
-    gu_root: Digest,
-    table_identity: Digest,
-    reader_root: Digest,
-    configuration: Digest,
-    queries: &[u64],
-    rows: &[GuRelationRow],
-) -> Result<()> {
-    let mut writer = CanonicalWriter::new();
-    writer.put_u64(1);
-    writer.put_digest(&gu_root);
-    writer.put_digest(&table_identity);
-    writer.put_digest(&reader_root);
-    writer.put_digest(&configuration);
-    writer.put_u64(queries.len() as u64);
-    for query in queries {
-        writer.put_u64(*query);
+fn kind_name(kind: GuRelationKind) -> &'static str {
+    match kind {
+        GuRelationKind::Sample => "Sample",
+        GuRelationKind::Record => "Record",
+        GuRelationKind::Column => "Column",
     }
-    writer.put_u64(rows.len() as u64);
-    for row in rows {
-        writer.put_u64(kind_word(row.kind));
-        writer.put_u64(row.oracle);
-        writer.put_u64(row.group);
-        writer.put_u64(row.main.len() as u64);
-        for value in &row.main {
-            writer.put_fp3(value);
-        }
-        writer.put_u64(row.mask.len() as u64);
-        for value in &row.mask {
-            writer.put_fp3(value);
-        }
-        writer.put_fp3(&row.target);
-    }
-    let bytes = writer.into_bytes();
-    let mut message = chain.message();
-    message.push_u64(bytes.len() as u64);
-    for byte in bytes {
-        message.push_u64(byte as u64);
-    }
-    let prefix = message.prefix(KIND_ALGEBRAIC, 0)?;
-    if !chain.step(&prefix, 0)? {
-        return Err(Error::InvalidProof);
-    }
-    Ok(())
 }
 
-fn draw_combine_challenge(
-    chain: &mut Chain,
-    gu_root: Digest,
-    table_identity: Digest,
-    reader_root: Digest,
-    configuration: Digest,
-    queries: &[u64],
-    rows: &[GuRelationRow],
-) -> Result<Fp3> {
-    absorb_declarations(
-        chain,
-        gu_root,
-        table_identity,
-        reader_root,
-        configuration,
-        queries,
-        rows,
-    )?;
-    chain.draw_e()
-}
-
-/// The declaration counts and the independent combination result.
+/// The declaration counts and the BAT combination result.
 pub struct GuCombineOutcome {
     pub reader_root: Digest,
     pub configuration: Digest,
@@ -192,24 +233,32 @@ pub struct GuCombineOutcome {
     pub gu_tree_number: u64,
     pub queries: Vec<u64>,
     pub declarations: Vec<GuRelationRow>,
+    pub declaration_names: Vec<&'static str>,
     pub sample_count: usize,
     pub record_count: usize,
     pub column_count: usize,
     pub unsupported: Vec<&'static str>,
-    pub combined: CombinedGuRow,
+    pub bat_group: u64,
+    pub bat_oracle: u64,
+    pub bat_layout: BatGroupLayout,
+    pub bat_planned_rows: u64,
+    pub bat_order: Vec<BatRowKind>,
+    pub combined: BatGroupRow,
     pub x: Fp3,
     pub transcript_after_columns: Digest,
     pub same_session: bool,
+    pub snapshot_fork: bool,
     pub column_root_only: bool,
     pub self_reported_gu_root: bool,
     pub fake_send_answer: bool,
     pub bat_decides_truth: bool,
     pub three_c_connected: bool,
+    pub reference_exact: bool,
+    pub permanent_format: bool,
 }
 
 /// Runs the candidate G_u declaration registration and BAT combination over
-/// one real session. The result is an isolated data-flow demonstration, not a
-/// verification closure.
+/// one real session. The result is an isolated data-flow demonstration.
 pub fn verify_gu_combine_session(
     public: &ModelCommitmentPublic,
     trusted: &TrustedModel<'_>,
@@ -240,21 +289,21 @@ pub fn verify_gu_combine_session(
     if rows.is_empty() {
         return Err(Error::InvalidConfig);
     }
+    let shape = BatAdapterShape::from_gu(gu)?;
     let main_len = usize::try_from(
-        gu.u.main_rows
-            .checked_mul(gu.u.code.ell)
+        shape
+            .main_rows
+            .checked_mul(shape.main_code.ell)
             .ok_or(Error::ResourceLimit)?,
     )
     .map_err(|_| Error::ResourceLimit)?;
-    let mask_len = match gu.u.mask_code {
-        Some(code) => usize::try_from(
-            gu.u.mask_rows
-                .checked_mul(code.ell)
-                .ok_or(Error::ResourceLimit)?,
-        )
-        .map_err(|_| Error::ResourceLimit)?,
-        None => 0,
-    };
+    let mask_len = usize::try_from(
+        shape
+            .mask_rows
+            .checked_mul(shape.mask_orig_ell)
+            .ok_or(Error::ResourceLimit)?,
+    )
+    .map_err(|_| Error::ResourceLimit)?;
     for row in &rows {
         if row.oracle != gu.oracle
             || row.group != gu.group
@@ -264,17 +313,9 @@ pub fn verify_gu_combine_session(
             return Err(Error::StatementMismatch);
         }
     }
-    let mut chain = flow.session.chain().clone();
-    let x = draw_combine_challenge(
-        &mut chain,
-        flow.gu_root,
-        flow.table_identity,
-        plan.reader.root,
-        plan.reader.configuration,
-        &flow.queries,
-        &rows,
-    )?;
-    let combined = combine_declarations(&rows, x)?;
+    let run = run_bat_combine(&rows, &shape, flow.session.chain().clone())?;
+    let bat_planned_rows =
+        u64::try_from(rows.len()).map_err(|_| Error::ResourceLimit)?;
     let sample_count = rows
         .iter()
         .filter(|row| row.kind == GuRelationKind::Sample)
@@ -297,6 +338,7 @@ pub fn verify_gu_combine_session(
         gu_group: gu.group,
         gu_tree_number: gu.tree.tree_number,
         queries: flow.queries,
+        declaration_names: rows.iter().map(|row| kind_name(row.kind)).collect(),
         declarations: rows,
         sample_count,
         record_count,
@@ -306,15 +348,23 @@ pub fn verify_gu_combine_session(
             "real SEND provider",
             "fresh-mask declaration",
         ],
-        combined,
-        x,
+        bat_group: run.layout.group,
+        bat_oracle: shape.oracle,
+        bat_layout: run.layout,
+        bat_planned_rows,
+        bat_order: run.order,
+        combined: run.combined,
+        x: run.x,
         transcript_after_columns: flow.transcript_after_columns,
         same_session: true,
+        snapshot_fork: true,
         column_root_only: true,
         self_reported_gu_root: true,
         fake_send_answer: true,
         bat_decides_truth: false,
         three_c_connected: false,
+        reference_exact: false,
+        permanent_format: false,
     })
 }
 
@@ -323,122 +373,99 @@ mod tests {
     use super::*;
     use zkie_engine::pcs::request::params::REQUEST_CHAIN_LABEL;
 
+    fn shape() -> BatAdapterShape {
+        BatAdapterShape {
+            oracle: 0,
+            group: 0,
+            main_rows: 2,
+            mask_rows: 1,
+            main_code: build_code_plan(3, 4, 1).unwrap(),
+            mask_code: build_code_plan(3, 4, 1).unwrap(),
+            mask_orig_ell: 4,
+            answers: 1,
+        }
+    }
+
     fn row(kind: GuRelationKind, target: u64) -> GuRelationRow {
         GuRelationRow {
             oracle: 11,
             group: 5,
             kind,
-            main: vec![Fp3::from_u64(1), Fp3::from_u64(2), Fp3::from_u64(3)],
-            mask: vec![Fp3::from_u64(4), Fp3::from_u64(5)],
+            main: (0..8).map(|index| Fp3::from_u64(index + 1)).collect(),
+            mask: (0..4).map(|index| Fp3::from_u64(index + 10)).collect(),
             target: Fp3::from_u64(target),
         }
     }
 
+    fn chain() -> Chain {
+        Chain::begin(
+            REQUEST_CHAIN_LABEL,
+            &Digest::ZERO,
+            b"bat-adapter",
+            &[],
+            None,
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn combination_uses_powers_of_x_and_keeps_kinds_separate() {
+    fn bat_combines_the_frozen_declarations() {
         let rows = vec![
             row(GuRelationKind::Sample, 7),
             row(GuRelationKind::Record, 8),
             row(GuRelationKind::Column, 9),
         ];
-        let x = Fp3::from_u64(5);
-        let combined = combine_declarations(&rows, x).unwrap();
-        assert_eq!(combined.count, 3);
+        let run = run_bat_combine(&rows, &shape(), chain()).unwrap();
         assert_eq!(
-            combined.kinds,
-            vec![
-                GuRelationKind::Sample,
-                GuRelationKind::Record,
-                GuRelationKind::Column
-            ]
+            run.order,
+            vec![BatRowKind::Plain, BatRowKind::Plain, BatRowKind::Sample]
         );
+        assert_eq!(run.combined.main.len(), 8);
+        assert_eq!(run.combined.mask.len(), 4);
+        assert_eq!(run.combined.group, 0);
+        let x = run.x;
         let x2 = x.mul(&x);
-        let power_sum = Fp3::ONE.add(&x).add(&x2);
-        for index in 0..3 {
-            assert_eq!(
-                combined.main[index],
-                Fp3::from_u64(index as u64 + 1).mul(&power_sum)
-            );
-        }
         assert_eq!(
-            combined.target,
-            Fp3::from_u64(7)
-                .add(&x.mul(&Fp3::from_u64(8)))
-                .add(&x2.mul(&Fp3::from_u64(9)))
+            run.combined.target,
+            Fp3::from_u64(8)
+                .add(&x.mul(&Fp3::from_u64(9)))
+                .add(&x2.mul(&Fp3::from_u64(7)))
         );
     }
 
     #[test]
-    fn a_wrong_declaration_is_still_pending_not_judged() {
+    fn a_wrong_declaration_is_still_pending() {
         let mut rows = vec![
             row(GuRelationKind::Sample, 7),
             row(GuRelationKind::Record, 8),
         ];
         rows[0].target = Fp3::from_u64(1000);
-        let x = Fp3::from_u64(3);
-        let combined = combine_declarations(&rows, x).unwrap();
+        let run = run_bat_combine(&rows, &shape(), chain()).unwrap();
         assert_eq!(
-            combined.target,
-            Fp3::from_u64(1000).add(&x.mul(&Fp3::from_u64(8)))
+            run.combined.target,
+            Fp3::from_u64(8).add(&run.x.mul(&Fp3::from_u64(1000)))
         );
-        assert_ne!(
-            combined.target,
-            Fp3::from_u64(7).add(&x.mul(&Fp3::from_u64(8)))
-        );
+        assert!(!run.combined.main.is_empty());
     }
 
     #[test]
-    fn mismatched_group_or_shape_is_rejected() {
-        let rows = vec![row(GuRelationKind::Sample, 7)];
-        let mut other = row(GuRelationKind::Record, 8);
-        other.group = 6;
-        assert!(combine_declarations(&[rows[0].clone(), other], Fp3::ONE).is_err());
-        let mut other = row(GuRelationKind::Record, 8);
-        other.main.pop();
-        assert!(combine_declarations(&[rows[0].clone(), other], Fp3::ONE).is_err());
+    fn shape_mismatch_is_rejected_at_the_adapter() {
+        let mut bad = row(GuRelationKind::Record, 8);
+        bad.main.pop();
+        assert!(run_bat_combine(&[bad], &shape(), chain()).is_err());
+        let mut bad = row(GuRelationKind::Record, 8);
+        bad.mask.pop();
+        assert!(run_bat_combine(&[bad], &shape(), chain()).is_err());
     }
 
     #[test]
-    fn challenge_changes_with_the_declarations() {
+    fn declaration_values_change_the_combination_not_the_challenge() {
         let rows = vec![row(GuRelationKind::Sample, 7)];
         let mut changed = rows.clone();
         changed[0].target = Fp3::from_u64(8);
-        let mut first = Chain::begin(
-            REQUEST_CHAIN_LABEL,
-            &Digest::ZERO,
-            b"gu-combine",
-            &[],
-            None,
-        )
-        .unwrap();
-        let x1 = draw_combine_challenge(
-            &mut first,
-            Digest([0x47; 32]),
-            Digest([0x48; 32]),
-            Digest([0x49; 32]),
-            Digest([0x4a; 32]),
-            &[0, 1],
-            &rows,
-        )
-        .unwrap();
-        let mut second = Chain::begin(
-            REQUEST_CHAIN_LABEL,
-            &Digest::ZERO,
-            b"gu-combine",
-            &[],
-            None,
-        )
-        .unwrap();
-        let x2 = draw_combine_challenge(
-            &mut second,
-            Digest([0x47; 32]),
-            Digest([0x48; 32]),
-            Digest([0x49; 32]),
-            Digest([0x4a; 32]),
-            &[0, 1],
-            &changed,
-        )
-        .unwrap();
-        assert_ne!(x1, x2);
+        let first = run_bat_combine(&rows, &shape(), chain()).unwrap();
+        let second = run_bat_combine(&changed, &shape(), chain()).unwrap();
+        assert_eq!(first.x, second.x);
+        assert_ne!(first.combined.target, second.combined.target);
     }
 }

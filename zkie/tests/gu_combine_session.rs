@@ -4,12 +4,9 @@ use std::io::BufReader;
 use std::path::Path;
 use std::time::Instant;
 
-use zkie_engine::pcs::request::field::Fp3;
-use zkie_engine::pcs::request::relation::GuRelationKind;
+use zkie_engine::pcs::request::bat::BatRowKind;
 use zkie_ops::proof::column_session::ColumnBindingInput;
-use zkie_ops::proof::gu_combine_session::{
-    combine_declarations, verify_gu_combine_session,
-};
+use zkie_ops::proof::gu_combine_session::verify_gu_combine_session;
 use zkie_ops::proof::model_commitment::{
     verify_model_anchor, ModelCommitmentPublic, SharedTrace,
 };
@@ -73,20 +70,24 @@ fn selected_gpt2_gu_declaration_combination() {
     println!("declarations={}", outcome.declarations.len());
     println!("x={:?}", outcome.x);
     println!(
-        "combined={{oracle:{},group:{},count:{},kinds:{:?},target:{:?}}}",
-        outcome.combined.oracle,
+        "combined={{group:{},main_len:{},mask_len:{},target:{:?}}}",
         outcome.combined.group,
-        outcome.combined.count,
-        outcome.combined.kinds,
+        outcome.combined.main.len(),
+        outcome.combined.mask.len(),
         outcome.combined.target
     );
+    println!("bat_order={:?}", outcome.bat_order);
+    println!("declaration_names={:?}", outcome.declaration_names);
 
     assert!(outcome.same_session);
+    assert!(outcome.snapshot_fork);
     assert!(outcome.column_root_only);
     assert!(outcome.self_reported_gu_root);
     assert!(outcome.fake_send_answer);
     assert!(!outcome.bat_decides_truth);
     assert!(!outcome.three_c_connected);
+    assert!(!outcome.reference_exact);
+    assert!(!outcome.permanent_format);
     assert_ne!(outcome.gu_root, zkie_core::types::Digest::ZERO);
     assert_eq!(outcome.sample_count, 1);
     assert_eq!(outcome.record_count, 1);
@@ -95,20 +96,24 @@ fn selected_gpt2_gu_declaration_combination() {
         outcome.declarations.len(),
         outcome.sample_count + outcome.record_count + outcome.column_count
     );
-    assert_eq!(outcome.combined.count, outcome.declarations.len());
-    assert_eq!(outcome.combined.kinds.len(), outcome.declarations.len());
-    assert!(outcome.combined.kinds.contains(&GuRelationKind::Sample));
-    assert!(outcome.combined.kinds.contains(&GuRelationKind::Record));
-    assert!(outcome.combined.kinds.contains(&GuRelationKind::Column));
-    assert_eq!(outcome.combined.oracle, outcome.gu_oracle);
-    assert_eq!(outcome.combined.group, outcome.gu_group);
-    assert_eq!(outcome.combined.main.len(), 16);
-    assert_eq!(outcome.combined.mask.len(), 6);
-    assert_eq!(outcome.combined.kinds[0], GuRelationKind::Sample);
-    assert_eq!(outcome.combined.kinds[1], GuRelationKind::Record);
-    assert!(outcome.combined.kinds[2..]
+    assert_eq!(outcome.bat_order.len(), outcome.declarations.len());
+    assert_eq!(outcome.declaration_names.len(), outcome.declarations.len());
+    assert_eq!(outcome.declaration_names[0], "Sample");
+    assert_eq!(outcome.declaration_names[1], "Record");
+    assert!(outcome.declaration_names[2..]
         .iter()
-        .all(|kind| *kind == GuRelationKind::Column));
+        .all(|name| *name == "Column"));
+    assert_eq!(outcome.bat_group, 0);
+    assert_eq!(outcome.bat_oracle, 0);
+    assert_eq!(outcome.bat_layout.group, 0);
+    assert_eq!(outcome.bat_planned_rows as usize, outcome.declarations.len());
+    assert_eq!(outcome.combined.group, 0);
+    assert_eq!(outcome.combined.main.len(), 16);
+    assert_eq!(outcome.combined.mask.len(), 8);
+    assert!(outcome.bat_order[..outcome.bat_order.len() - 1]
+        .iter()
+        .all(|kind| *kind == BatRowKind::Plain));
+    assert_eq!(outcome.bat_order[outcome.bat_order.len() - 1], BatRowKind::Sample);
     assert!(!outcome.queries.is_empty());
     assert_ne!(outcome.transcript_after_columns, zkie_core::types::Digest::ZERO);
     assert!(outcome.unsupported.contains(&"multi-oracle SEND"));
@@ -126,9 +131,4 @@ fn selected_gpt2_gu_declaration_combination() {
     assert_eq!(second.transcript_after_columns, outcome.transcript_after_columns);
     assert_eq!(second.x, outcome.x);
     assert_eq!(second.combined, outcome.combined);
-
-    let mut wrong = outcome.declarations.clone();
-    wrong[0].target = wrong[0].target.add(&Fp3::ONE);
-    let wrong_combined = combine_declarations(&wrong, outcome.x).unwrap();
-    assert_ne!(wrong_combined.target, outcome.combined.target);
 }
