@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/zkie_engine-8aa968ebbad7c68c)
+
+running 2 tests
+test pcs::request::cs_stage::tests::wrong_code_capacity_or_shape_is_rejected ... ok
+test pcs::request::cs_stage::tests::registration_is_deterministic_and_pending ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 230 filtered out; finished in 0.00s
+
