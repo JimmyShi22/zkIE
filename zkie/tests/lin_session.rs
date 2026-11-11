@@ -342,6 +342,7 @@ fn selected_gpt2_output_head_request_session() {
     use zkie_ops::proof::output_head_lin::{
         build_output_head_hidden_plan, build_output_head_output_plan, output_head_shape,
         prove_output_head_lin_hidden, select_output_head_step, verify_output_head_lin_hidden,
+        verify_output_head_lin_hidden_bytes,
         OutputClosureSetup, OutputHeadLinProof, OutputHeadLinSetup, OutputHeadTrustedInputs,
         OUTPUT_HEAD_ASSET_PATH, OUTPUT_HEAD_COLUMNS, OUTPUT_HEAD_HIDDEN, OUTPUT_HEAD_K_LO,
         OUTPUT_HEAD_POSITIONS, OUTPUT_HEAD_RANGE_BITS, OUTPUT_HEAD_SLACK_BITS,
@@ -1628,6 +1629,33 @@ fn selected_gpt2_output_head_request_session() {
             "closure_range_bits={} closure_slack_bits={}",
             OUTPUT_HEAD_RANGE_BITS, OUTPUT_HEAD_SLACK_BITS
         );
+        // Test-only historical-artifact branch: decode and verify a proof
+        // produced by a previous build with the current verifier. It is off
+        // unless the load path is set, so the formal run is unchanged.
+        if let Some(path) = env::var_os("ZKIE_SESSION_PROOF_LOAD") {
+            let bytes = fs::read(path).expect("read the loaded proof");
+            let load_setup = setup.clone();
+            let load_plan = build_output_head_hidden_plan(
+                shape,
+                &load_setup,
+                &table.reader(),
+                &trusted,
+            )
+            .expect("loaded proof plan");
+            let loaded = verify_output_head_lin_hidden_bytes(
+                shape,
+                &load_plan,
+                &trusted,
+                &table.reader(),
+                &bytes,
+            );
+            match &loaded {
+                Ok(outcome) => println!("loaded_proof_ok=1 bytes={}", outcome.proof_bytes),
+                Err(error) => println!("loaded_proof_ok=0 error={error:?}"),
+            }
+            loaded.unwrap();
+            return;
+        }
         let started = Instant::now();
         let (hidden_proof, hidden_witness, closure) = prove_output_head_lin_hidden(
             shape,
