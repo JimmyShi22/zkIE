@@ -1,611 +1,557 @@
-# Closed output-head relation: public view, opening union and composition accounting
+# Closed output-head relation: random quantities, public positions and hiding
 
 ## Status and labels
 
-This note covers the closed hidden output-head relation implemented in the
-local chain. It is an accounting and argument document, not a formal
-zero-knowledge proof, not a mechanized composition theorem and not a claim that
-the trusted X source is proved. Labels:
+This note is the whole-chain argument for the closed hidden output-head
+relation. It follows one path: actual random quantity -> every public
+position -> sharing relations -> hiding or binding reason -> exception
+probability -> code or plan basis. It is an accounting and argument document,
+not a mechanized proof and not a claim that the trusted X source is proved.
 
-- `[FACT]` checked in the code or arithmetic at the stated snapshot.
-- `[ASSUMPTION]` a condition the argument needs.
-- `[UNPROVEN]` stated but not proved here.
-- `[GAP]` a missing check or mechanism; an executable condition fails the
-  run closed, a condition that cannot be checked at runtime withdraws the
-  security conclusion.
+Every claim carries two labels:
+
+- a status label: `[FACT]` checked in the code or arithmetic at the snapshot;
+  `[ASSUMPTION]` a condition the argument needs; `[UNPROVEN]` stated but not
+  proved here; `[GAP]` a missing check or mechanism (an executable condition
+  rejects the run when it fails, otherwise the security conclusion is
+  conditional);
+- an evidence grade: `NUM` a real-evaluation-path numerical test; `CODE` a
+  manual derivation from the implementation; `MATH` a general mathematical
+  result cited for the stated code (for example the Vandermonde theorem).
+
+`NUM` is not a proof of the general statement and does not claim that every
+actual opening set was numerically measured. Passing the test-only module is
+not a production runtime detector for all bad ranks; the workspace and run
+numbers in this round are reported results, not an independent external
+verification.
 
 Snapshot: the closed relation at code basis `3b3e8ecc`, with the bounded-read
 rollback `8d32d3de`; fixture `gpt2-seq16`, 16 positions, proof 9,939,144 B.
+The committed document is version 5.
 
-## 1. Public view
+## 1. The chain in one view
 
-The verifier receives the trusted policy, the public statement and the proof
-artifact. The relevant public items are:
+| # | Actual random quantity | Where it is used publicly | Shared with | Why the public view hides or binds | Exception probability | Evidence |
+|---|---|---|---|---|---|---|
+| 1 | table row tail and leaf salt | table column openings, table root | nothing across trees | Vandermonde tail covers the opened symbols; salt plus leaf hash hides unopened leaves | none for the rank step; hash model terms in section 6 | `NUM` q=603 block, `MATH` Vandermonde |
+| 2 | W/closure/mask row tails and leaf salts | their SEND answers, openings and roots | nothing across trees | tail Vandermonde covers the opened symbols; the same tail is reused across stages of one tree (union); leaf hash hides unopened leaves | hash model terms | `NUM` q<=4 blocks, `CODE` union, `MATH` |
+| 3 | index-mask 73 entries | mask root, SEND answer, Dot PSC transcript, tilde/Eval values, public residual | `g_t` in tilde and R; `c_t` in R and Dot PSC sigma | each entry is a one-time pad or a unit-triangular hiding coefficient; the shared columns are explicit in the joint matrix | `chi=0` and sumcheck degrees in section 6 | `NUM` 58-row joint matrix, `CODE` |
+| 4 | closure-mask 49 hiding plus 5 shown per position | mask root and openings, per-position PSC transcript and end values, three point values | the same message entry appears in the encoding opening and in the PSC or point values | tail covers the opening symbols; the hiding map covers the message vector including the product-dependent last round; the shown masks one-time pad the two end values and the three point values | sumcheck degrees; beta nonzero by construction | `NUM` joint mask object and real-prover decomposition, `CODE` |
+| 5 | SEND pads and per-message pads | SEND answers | the answer's own pad | one-time pad on the sampled value | none beyond the sample/answer check | `NUM` real answer function, `CODE` |
+| 6 | Eval masks `e_t` | masked Eval targets | one per position | one-time pad on `W(psi)` | none | `NUM` real evaluation function, `CODE` |
+| 7 | Dot PSC hiding coefficients | Dot PSC transcript and end values | the same 23-entry hiding class | the hiding map is triangular with a nonzero constant determinant; the two shown end masks one-time pad the end values | sumcheck degree terms in section 6 | `NUM` 23x23 map, `CODE` triangularity |
+| 8 | closure PSC hiding coefficients | per-position PSC transcript | the same closure mask message | same triangular map, one instance per position | sumcheck degree terms; 16 instances | `NUM` 49x49 map, `CODE` |
+| 9 | FOLD fresh coefficients | FOLD start sum and round values | the same fold instance | triangular coefficient map with constant nonzero determinant; the start sum and every sent round value are covered | sumcheck degree terms; two FOLD instances | `NUM` k=2 and k=14, `CODE` |
+| 10 | BASE star main/mask rows and tails | BASE target, combined rows and star openings | target, rows and openings of the same star | fresh one-time pads on the target dot product, each combined coordinate and each tail coordinate | lambda and position checks | `NUM` real star path, `CODE` |
+| 11 | challenge draws | every PSC/FOLD/BASE/position challenge | none | drawn after the message they test; zero-fallback event bounded | 2^-192 per draw fallback, `chi=0` term | `CODE` draw functions, `NUM` order tests |
 
-| View item | Contents |
-|---|---|
-| policy pin | limited table identity: model, case, anchor, asset and table identity, committed table root, record digest, configuration, code parameters, shape, distances, matrix mapping, protocol identity |
-| statement | activation commitment root, output plan (winner, valid range, tie rule), table identity, public claim items |
-| committed group roots | W rows, index-mask message, shown map, Omega, G_u, closure slack, closure bits, closure map, closure mask, fresh/star messages |
-| SEND material | shared seeds and their public answers, index-mask answers, masked Eval targets, drawn positions and their openings |
-| Dot material | tilde values, the public residual `R`, the masked product-sumcheck transcript and its end values |
-| FOLD/BASE material | fold start, round messages and challenges, lambda, base positions, base openings and final rows |
-| output | first-max winner, valid range, tie result, seal |
+The rest of the note expands each column.
 
-`[FACT]` The verifier holds no table message rows, no activation rows, no
-reduced weight rows and no private tails, salts or pads.
+## 2. Actual random quantities
 
-## 2. Random material and one-time masks
+`[FACT]` `CODE` The generation paths are:
 
-`[FACT]` There are two separate mask allocations, in two different messages.
-They are not summed.
+- table rows use the base field `Fp`; the row tail is drawn from the stage
+  stream by the base-field draw;
+- W, closure and mask rows use the cubic field `Fp3`; their tails, salts and
+  mask entries are drawn by `ByteMaskCoins::value_at`, which builds three
+  `Fp` coordinates from one hash output (`word mod p`) and returns
+  `Fp3::new(c0, c1, c2)`;
+- the challenges use the chain draw: `draw_f` takes a 64-bit word below the
+  modulus by rejection sampling (`DRAW_TRIES = 6` attempts), `draw_e` takes
+  three base draws, and `draw_e_nonzero` retries a fixed number of times and
+  then returns one;
+- the per-oracle streams are separated by a material commitment and a run
+  seed; one stream is not reused by another oracle.
 
-The index-mask message (Dot relation) allocates 73 entries for 16 positions:
+`[FACT]` `CODE` Field and distribution transfer:
 
-| Class | Entries | Use |
-|---|---:|---|
-| PSC hiding coefficients | 23 | hides the Dot product-sumcheck polynomial |
-| shown-value masks | 2 | the two Dot shown-map end values |
-| claim masks `c_t` | 16 | one per position |
-| tilde masks `g_t` | 16 | one per position |
-| Eval masks `e_t` | 16 | one per position |
+- an `Fp3` random quantity is a triple of independent `Fp` draws, so it is
+  uniform over `Fp3`; a linear map over `Fp3` applied to such a vector is
+  uniform over its image;
+- the base-coded table uses `Fp` on both sides; its rank argument is over
+  `Fp`;
+- the secret values (weights, reduced rows, bit values) are `Fp` elements
+  embedded in `Fp3`; the covering map has `Fp3` coefficients and the random
+  vector is `Fp3`-uniform, so the rank criterion over `Fp3` applies to the
+  embedded secret directions as well;
+- the challenge draw uses rejection sampling, so the accepted word is uniform
+  on `Fp`; the fixed-attempt fallback returns zero with probability below
+  `(1 - p/2^64)^6 < 2^-192` per challenge draw. This is carried as a small
+  exception term in section 6.
 
-The separate closure mask-only message allocates, per position, 49 PSC hiding
-coefficients and 5 shown-value masks: two PSC end masks, one committed-bit
-point mask and two relation-function masks (`CLOSURE_MASK_SHOWN = 5`). For 16
-positions that is 864 entries. These entries are not part of the 73-entry
-index-mask schema; the two plans are different oracles.
+`[ASSUMPTION]` `CODE` The mask coin stream is modeled as a random oracle into
+`Fp`: the implementation reduces a 64-bit word modulo `p`, so each coordinate
+has a statistical bias of at most `2^-32` from uniform. The computational
+argument below treats the mask stream as uniform. The modulo bias is a
+separate statistical term, not included in the 128-bit bound; a strict
+statistical hiding claim would need rejection sampling in the mask stream.
+This is recorded as a conditional premise in section 7 and as an open item in
+section 10.
 
-The classes in each message occupy disjoint ranges. The claim and tilde
-entries are independent draws from the same stage-1 stream; the public
-difference row ties their chi-weighted sums to `R` without forcing equality.
-The Eval mask is fixed before the Eval point is drawn, so the masked target
-`W_t(psi_t) + e_t` is uniform. The PSC hiding coefficients are one-time. The
-closure mask's five shown entries are one-time per position, in this order:
-entries 0 and 1 cover the shown-map ends; entries 2, 3 and 4 cover
-`(B(pt), D(q), weighted B(q))`.
+## 3. Public positions
 
-`[FACT]` The table, W rows, shown map, Omega and G_u messages carry distinct
-tails and salts drawn from the stage stream; the SEND answers use per-message
-pads. The generation stream of one oracle is identified by a material
-commitment, not by observed equal positions or values; a repeated material
-commitment is rejected. `[ASSUMPTION]` The draws are independent uniform field
-elements.
+`[FACT]` `CODE` The public view consists of:
 
-### 2.1 Output view and full-row boundary
+| Public item | Actual form | Depends on random | Depends on secret |
+|---|---|---|---|
+| policy pin and statement | table identity, roots, output plan | none | no |
+| table root and column openings | codeword symbols `sum_{i<r} t_i z^i + sum_{i<ell} m_i z^{r+i}` | tail, salt | table message rows |
+| W and closure roots, SEND answers, openings | codeword symbols; sampled value plus pad | tail, pad, salt | W/closure message values |
+| index-mask root, answer, openings | codeword symbols; sampled mask value plus pad | 73 entries, tail, salt | none (mask message is random) |
+| tilde values, public residual R | `W_t + g_t`; `sum chi^t (g_t - c_t)` | `g_t`, `c_t` | W values enter tilde only |
+| Dot PSC transcript | 23 values, an affine image of the 23 hiding entries plus the target shift | 23 hiding entries, two shown masks | claim target / witness message vector |
+| Eval targets | `W_t(psi) + e_t` | `e_t` | W values |
+| closure mask root and openings | encoded mask symbols | 49+5 entries per position, tail, salt | none |
+| closure PSC transcripts | one per position, affine image of the 49 hiding entries and the two shown end masks | 49 hiding, 2 shown per position | message vector and target shift |
+| closure point values | `(B(pt)+shown_2, D(q)+shown_3, weighted B(q)+shown_4)` | 3 shown masks per position | bit/map values |
+| FOLD start and round values | start sum and `(c0,c2)` per round | 2k+1 fresh coefficients | group-row values |
+| BASE target, combined rows and openings | `target*`, `star + lambda*row`, encoded star symbols | star main/mask/tails | final row and claims |
+| output and seal | winner, valid range, tie result | none | approved output boundary |
 
-The approved output-binding boundary makes the public first-max winner, valid
-range and tie result protocol outputs. The full reduced output row `Y` is not
-public; hiding it beyond those three items is a condition of this round, not a
-`[GAP]`.
+The secret enters public positions only through the message values encoded in
+the committed rows, the masked SEND/Eval/point values, and the PSC/FOLD
+message vectors. It never appears as a plaintext row.
 
-| Public item | Actual form | What the verifier receives |
+## 4. Sharing relations
+
+`[FACT]` `CODE` `NUM` The shared-variable attribution is:
+
+| Random variable | Public positions | Shared? |
 |---|---|---|
-| closure slack/bits/map openings | codeword symbol `sum_{i<r} t_i z^i + sum_{i<ell} f_i(Y) z^{r+i}` | `q` linear equations; no plaintext `Y` |
-| closure SEND answers | sample of `f(Y)` plus a one-time pad | a padded field value |
-| closure PSC transcripts | affine image of the 49 hiding coefficients plus the target shift, one instance per position | transcripts; targets covered by the hiding maps |
-| closure fresh-point values | three masked values per position | each covered by its one-time shown mask |
-| W SEND answers / Eval targets | W sample plus pad / `W(psi)+e` | masked field values |
-| output winner/valid/tie | protocol output | public by the approved boundary |
-| residual `R` | chi-weighted difference of `c` and `g` | one mask combination |
-| roots and seal | digest | binding only |
+| table/W/closure/mask tails and salts | the tree's own openings and answer samples | no across trees; union within one tree across stages |
+| `g_t` | tilde value and R | yes, both rows, explicit |
+| `c_t` | R and Dot PSC sigma; the claim relation is checked by proximity, not sent as a field value | yes, R and sigma explicit |
+| `e_t` | one Eval target | no |
+| Dot `U` (23 entries) | Dot PSC transcript | no |
+| closure hiding `U` (49 per position) | that position's PSC transcript | the same message entry also appears in the mask opening |
+| closure shown (5 per position) | two end values and three point values | the same message entry also appears in the mask opening |
+| SEND pads | the answer they pad | no |
+| FOLD fresh (`2k+1`) | start sum and round values of one fold | no |
+| BASE star main/mask/tails | target, combined rows and openings of one star | yes, the same star; explicit in the BASE matrix |
 
-The codeword symbol is a function of `Y` plus a random tail; "no plaintext
-`Y`" means the message part is masked by the tail, not that the symbol is
-independent of `Y`. Section 3.6 states the same fact in linear-form terms.
+The explicit counterexample check is the pair `(tilde, R)` with shared `g_t`
+and the pair `(R, sigma)` with shared `c_t`: the joint mask matrix keeps the
+same column in both rows, so the `v1 = s + r, v2 = r` shape is represented
+rather than assumed away.
 
-`[ARGUMENT]` Every public item that depends on `Y` is one of: a codeword
-symbol whose message part is masked by the code tail on the opened set, a
-padded sample answer, or a PSC transcript whose target shift lies in the image
-of the hiding map. Under the assumptions in section 3.10, the verifier cannot
-recover the plaintext `Y` row beyond winner/valid/tie. This is a conditional
-conclusion of the argument; if any assumption fails, the security conclusion
-is withdrawn. Executable conditions (tail overrun, reuse) are ledger
-rejections; conditions that are not runtime-checked are stated as conditional
-assumptions, not as program fail-closed checks.
+The encoded mask message adds a second sharing: one mask entry appears in
+the tree opening (inside an encoded symbol), in the PSC transcript (through
+the hiding map), and in the published end or point value (for the shown
+entries). Section 5.5 treats these three positions in one joint matrix.
 
-## 3. Joint-view hiding: linear-cover criterion
+The BASE star adds a third sharing: the same star main/mask row appears in
+the target dot product, in each combined row and in the encoded opening. The
+joint BASE test in section 5.6 uses the same star.
 
-### 3.1 The criterion
+Across different oracles the tails, salts, streams, pads and mask plans are
+different; the concatenated view is block diagonal and ranks add. Within one
+oracle the shared columns are explicit.
 
-For one public view write
+## 5. Hiding and binding reasons
 
-```text
-v = A r + B s,
-```
+### 5.1 Linear-cover criterion
 
-where `r` is the random material, `s` the secret material, and `A`, `B` are the
-coefficient matrices. Hiding holds if
+For one public view write `v = A r + B s`, where `r` is the random material
+and `s` the secret. Hiding holds if
 
 ```text
 Im(B) subset Im(A),   equivalently rank([A | B]) = rank(A).
 ```
 
-For every secret `s` there is then an `r'` with `A r' = A r + B s`, so the view
-is independent of `s`. This is the criterion used below. A large kernel by
-itself is not used as evidence: a large kernel can coexist with a directly
-leaked secret.
+For every secret `s` there is an `r'` with `A r' = A r + B s`, so the view is
+independent of `s`. A large kernel alone is not used as evidence. This is the
+criterion applied below. `MATH`.
 
-### 3.2 Openings: Vandermonde submatrix
+The field transfer from section 2 applies: when the random vector is a triple
+of independent `Fp` draws, it is `Fp3`-uniform; when the code and message are
+base-field, the argument is over `Fp`. The secret values embedded from `Fp`
+are covered by the same inclusion. `CODE`.
 
-A codeword is the evaluation of a polynomial with tail coefficients at degrees
-`0..r-1` and message coefficients at degrees `r..r+ell-1`. For an opening set
-`S` of `q` distinct positions,
+### 5.2 Openings: Vandermonde submatrix
+
+`[FACT]` `MATH` A codeword is the evaluation of a polynomial with tail
+coefficients at degrees `0..r-1` and message coefficients at `r..r+ell-1`.
+For an opening set `S` of `q` distinct positions,
 
 ```text
 A_tail = [ z_j^i ]_{j in S, i < r}       (q x r)
 B_msg  = [ z_j^{r+i} ]_{j in S, i < ell} (q x ell)
 ```
 
-`A_tail` is a Vandermonde matrix on distinct points. If `q <= r`, it has full
-row rank `q`, so `Im(A_tail) = F^q` and `Im(B_msg) subset F^q = Im(A_tail)`.
-The opened symbols are uniform over `F^q` and independent of the message. This
-is the submatrix property used for every opening view. The union `S` of a
-tree's SEND and BASE openings is used, so cross-stage reuse is included.
+If `q <= r`, the q x q left block of `A_tail` is a Vandermonde matrix; it is
+invertible for distinct points, so `A_tail` has row rank q and
+`Im(B_msg) subset F^q = Im(A_tail)`. The opened symbols are uniform over
+`F^q`, independent of the message. The union of a tree's SEND and BASE
+openings is used, so cross-stage reuse is included.
 
-### 3.3 SEND answers and Eval targets
+`[FACT]` `NUM` The real code parameters and the actual opening counts are:
+table `r = 8192`, `q = 603`; W and closure main `r = 8192`, `q <= 4`; index
+and closure mask `r = 256`, `q <= 4`. The test builds the actual q x q
+Vandermonde block with the code's point function and confirms full rank for
+q = 603, 256, 16 and 4. The q x r matrix then has rank q because its q x q
+block does. This is a numerical check at the actual q, not a claim that every
+actual opening set was measured; distinctness of the actual set follows from
+the transcript/ledger positions.
 
-- SEND answer: `answer = sample(message) + pad`. `A = [1]` on the pad,
-  `B = [sample]` on the secret; rank 1, covered.
-- Eval target: `target = W(psi) + e`. `A = [1]` on `e`, `B = [W(psi)]`;
-  rank 1, covered. `e` is fixed before `psi`.
-
-### 3.4 Dot values, tilde and `R`
-
-`tilde_t = W_t + g_t`: `A = [1]` on `g_t`, `B = [1]` on `W_t`; covered.
-`R = sum chi^t g_t - sum chi^t c_t` has `B = 0` on the secret; it is a public
-combination of masks only. The pair `(tilde, R)` has rank 17 on the 32
-`(g, c)` entries and kernel 15, as in the existing mask analysis; `R` does not
-add a secret direction. `chi = 0` is an exception event handled in section 6.
-
-### 3.5 PSC transcript
-
-The Dot PSC (transcript tags 16/17/18) sends 23 scalars. They are an affine
-bijection of the 23 hiding coefficients of the 73-entry index-mask schema,
-plus the `sigma` shift in one claim-mask direction. The hiding map is 23 x 23. Its
-determinant is a nonzero polynomial (triangular by variable and degree with
-unit diagonal on the direct entries), checked full rank at three points; a
-conservative degree bound gives a bad-challenge probability below
-`23^2/p^3 < 2^-181` (sections 3.12 and 6).
-
-The closure PSC (tags 20/21/22) is a second, separate family with one
-instance per position (16 instances). The closure mask plan allocates, per
-position, 49 hiding coefficients and five shown masks
-(`CLOSURE_MASK_SHOWN = 5`): two PSC end masks, one committed-bit point
-mask and two relation-function masks. Each shown mask is one-time and gives
-one random dimension per masked value. The closure PSC transcript and the
-three fresh-point values `(B(pt), D(q), weighted B(q))` are covered by that
-per-position instance; the 23 Dot scalars and the 49 closure coefficients are
-not the same mask plan and are not summed. The closure hiding map is 49 x 49
-per position and the same argument applies: its determinant is a nonzero
-polynomial, checked full rank at three points. With one instance per
-position, the union bound over the 16 instances is
-`16*49^2/p^3 < 2^-176` (sections 3.12 and 6).
-
-### 3.6 Closure messages and the full output row
-
-The closure slack, packed-bit and product messages encode functions `f(Y)`.
-Their openings are covered by the Vandermonde property in 3.2, their SEND
-answers by the pads in 3.3, and their PSC transcripts by the closure instances
-in 3.5 (49 per-position hiding coefficients and five shown masks per
-position). The Dot PSC's 23-entry index-mask schema is a different oracle and
-is not used for the closure messages.
-The same argument applies to every closure message and every position, so the
-full `Y` row is hidden beyond the approved winner/valid/tie items. This is a
-conditional conclusion, not a `[GAP]`.
-
-### 3.7 Hash roots and commitment hiding
-
-Roots are Merkle commitments over salted leaves. The algebraic argument is made
-conditional on the roots: under the random-oracle or collision-resistant hash
-model, a root hides its input when the input has sufficient min-entropy; the
-salt, tail and pad supplies that entropy. The combination is a hybrid: first
-replace the roots by random oracle outputs, run the algebraic cover argument on
-the openings, answers and transcripts, then use the commitment hiding for the
-roots. The statement "algebraic rank 0 means the root leaks nothing" is not
-used. If the hash model or the min-entropy assumption fails, the conclusion is
-withdrawn.
-
-### 3.8 Cross-stage and multi-request view
-
-- The opening union per tree is taken over every stage; the Vandermonde
-  property is applied to that union.
-- Mask slots are disjoint and one-time; claim, tilde and Eval masks are not
-  reused across positions.
-- Material streams are one-use; the ledger rejects a repeated material
-  commitment, a repeated seed commitment and a reused table reservation.
-- For multiple requests, the same per-request criterion applies; the table
-  union is the cumulative union checked by the ledger. A global multi-request
-  bound needs a bound on the number of requests; without one, no global figure
-  is claimed.
-
-### 3.9 FOLD, BASE and CS verification values
-
-The verification transcript also includes the FOLD start sum/rounds and the
-BASE symbols.
-
-- FOLD: the fresh hiding polynomial supplies `2k+1` random coefficients. The
-  start sum and every published round value are affine in those coefficients;
-  the secret group-row contribution is a shift of that affine map. The
-  construction uses the full coefficient set for the hiding polynomial (the
-  reference check `fold_mask_as_drawn` verifies every coefficient and tail).
-  The coefficient map is triangular by variable and degree with unit diagonal,
-  so its determinant is a nonzero polynomial. It is checked full rank at
-  three points; per instance the bad-challenge probability is below
-  `(2k+1)^2/p^3`. The closed path has two FOLD instances, so the union is
-  `2*(2k+1)^2/p^3 < 2^-178` for `k <= 32` (sections 3.12 and 6). The
-  linear-cover criterion holds for every non-degenerate challenge.
-- BASE: the star main row, star mask row and their random tails are fresh
-  draws. The public BASE rows and openings are affine in those draws, so the
-  secret row contribution is covered by the star randomness one entry at a
-  time. The BASE target includes the same star rows, so it does not add a
-  separate secret direction.
-- CS: the hidden output-head path runs no code-switch stage; the plan rejects
-  a switch configuration. If a code-switch stage is added later, its fresh
-  mask and star rows must be included in the same criterion; this document
-  does not cover a CS path.
-- The BAT `x` challenge is drawn after the frozen rows; the combined group
-  row is internal and enters FOLD, where the fresh mask covers it. There is no
-  separate public BAT row to analyze.
-- The BASE `lambda` challenge is public; the BASE rows and openings are
-  covered by the fresh star rows and tails as above.
-- The FOLD/BASE public values are functions of committed codewords; they do
-  not add a plaintext weight or output-row direction beyond the covered
-  openings, answers and tails.
-
-### 3.10 Assumptions and exception events
-
-- The random draws are independent uniform field elements.
-- The opening positions are distinct; the union per tree is used.
-- `|S| <= r` for every actual opening set; section 4 checks the actual sets.
-- The code tail rank is the stated `r`.
-- The PSC hiding maps are full rank except on a bad challenge set bounded in
-  section 6: their determinants are nonzero polynomials (triangular by
-  variable and degree), checked at three points, with degree bounds `23^2`
-  for the single Dot instance and `49^2` for each of the 16 closure
-  instances.
-- `chi != 0`; if `chi = 0`, the residual combines only the `t = 0` term and
-  the corresponding term is in section 6.
-- The SEND sample's beta is drawn nonzero by the implementation; the pad
-  value itself may be zero and still hides (the verifier does not observe the
-  zero event).
-- The hash model is random-oracle or collision-resistant and the salted
-  inputs have the stated min-entropy.
-- The FOLD fresh-mask coefficient map is full rank except on a bad challenge
-  set per instance; the two FOLD instances have the union bound
-  `2*(2k+1)^2/p^3 < 2^-178` for `k <= 32`. The BASE star rows and tails are
-  fresh and independent.
-- The hidden path has no code-switch stage; a CS path would need its own
-  fresh-mask/star coverage.
-- No pad, mask class, material stream or table reservation is reused outside
-  the ledger policy.
-- The output-binding boundary is the approved winner/valid/tie boundary.
-
-If an assumption fails, the linear-cover conclusion does not apply. Once
-established, the linear-cover criterion is met for every view listed in this
-section: the joint hiding argument is conditional and no secret leak is
-identified. Assumptions that cannot be checked at runtime (PSC/FOLD rank,
-hash model, output boundary) withdraw the security conclusion rather than
-claiming that the program fail-closed. `[UNPROVEN]` A
-full simulation and the adaptive composition of the hash and algebraic
-arguments are not mechanized here; the argument above is the conditional
-linear-cover argument, not a theorem.
-
-### 3.10b Oracle encoding and hash order
-
-| Oracle family | Code layout | Random values | Openings | Public values |
-|---|---|---|---|---|
-| table | base field, `log_n=17`, `ell=65539` (65536 columns plus 3 padding symbols), `r=8192` | row tail and leaf salt | 603 columns | root, record, column openings |
-| W rows | cubic field, `log_n=17`, `ell=65536`, `r=8192` | per-tree tail and salts | 2 SEND + 2 BASE | W roots, openings, sample answers |
-| closure slack/bits/map | cubic field, `log_n=17`, `ell=65536`, `r=8192` | per-tree tail and salts | 2 SEND + 2 BASE each | roots, answers, openings, PSC |
-| index mask | cubic field, `log_n=17`, `ell=512`, `r=256` | tail, salt, 73-entry mask | 2 SEND + 2 BASE | root, answers, openings |
-| closure mask | cubic field, `log_n=17`, `ell=512`, `r=256` | tail, salt, 49+5 per position | 2 SEND + 2 BASE | root, answers, openings |
-| FOLD fresh | `2k+1` cubic-field coefficients | fresh mask polynomial | round messages | start sum, round values |
-| BASE star | cubic-field rows and tails | fresh per value | base openings | base rows and openings |
-
-The hash hybrid order is fixed: first replace every Merkle root by a random
-oracle output (the commitment-hiding step), then run the algebraic cover
-argument on the opened values, answers, transcripts and star rows, then use
-the collision-resistant/random-oracle model for the roots. Roots are never
-treated as independent random field values. The salt/tail/pad entropy is the
-input min-entropy the commitment step needs. The transcript fixes positions
-after the roots and answers are absorbed; conditional on a root, the tail is
-uniform, and the only constraints are distinct positions and the root binding.
-
-### 3.10c Shared random-variable attribution
-
-| Random variable | Public items where it appears | Shared? |
-|---|---|---|
-| table/W/closure/mask tails | the corresponding tree openings | no across trees |
-| `g_t` | `tilde_t`, `R` | yes: both rows, explicit |
-| `c_t` | `R`, Dot PSC `sigma`; also the claim relation row (checked by proximity, not a sent field value) | yes: `R` and `sigma` explicit |
-| `e_t` | the position's Eval target | no |
-| Dot `U` (23) | Dot PSC transcript | no |
-| closure `U` (49 per position) | closure PSC transcript | no |
-| closure shown (5 per position) | two end values, three fresh-point values | no |
-| SEND pads | the corresponding answer | no |
-| FOLD fresh (`2k+1`) | FOLD start sum and rounds | no |
-| BASE star rows/tails | the corresponding BASE values | no |
-
-The only cross-public-item sharing is `g_t` between `tilde` and `R`, and `c_t`
-between `R` and the Dot PSC `sigma`; `c_t` also appears in the claim relation,
-which is checked by proximity rather than sent as a field value. The `R` and
-`sigma` columns are present in the joint mask matrix; no other variable is
-silently reused. This table is
-the explicit check for the `v1 = s + r, v2 = r` counterexample.
-
-### 3.11 Joint matrix checks
-
-The test module constructs `A` and `B` from the actual protocol evaluation
-paths at fixed oracle/challenge structure and computes the ranks numerically
-over the cubic field. It does not assume that per-view full rank implies joint
-rank; shared variables are explicit columns.
-
-| Block | Random columns | Secret columns | Rows | Result |
-|---|---|---:|---:|---|
-| opening (table/W/closure/mask) | tail Vandermonde | message Vandermonde | `q` | `rank([A|B])=rank(A)=q` |
-| mask joint (tilde, R, Eval, Dot PSC, ends) | `g16, c16, e16, U23, end2` | `W16` | 58 | rank 58, joint 58, kernel 15 |
-| closure joint (PSC, ends, points) | `U49, shown5` | `f(Y)3` | 54 | rank 54, joint 54 |
-| SEND/Eval/end/shown identity blocks | one per value | one per value | <=5 | rank equality |
-
-The mask joint block explicitly places the same `c_t` in `R` and in the PSC
-`sigma` column, so the `v1 = s + r, v2 = r` shape is represented rather than
-assumed away. Across blocks, each tree has its own uniform tail and salts,
-the material streams are one-use, the pads and the two mask plans are
-separate, and the FOLD/BASE randomness is fresh. No random variable appears
-in two blocks, so the concatenated matrix is block diagonal and the ranks add;
-within the mask block the shared `c_t`/`g_t` columns are explicit. The test evaluates at deterministic and several random points.
-No rank deficiency was found; if a run finds one, the run stops and reports a
-possible leak. The tests are `joint_opening_submatrices_cover_the_message`,
-`joint_mask_block_covers_the_secret_with_shared_claim_masks`,
-`joint_closure_block_covers_psc_and_point_values`,
-`joint_psc_hiding_maps_are_full_rank_at_multiple_points`,
-`joint_fold_fresh_coefficients_map_is_full_rank`,
-`joint_dot_mask_block_is_covered_for_zero_and_nonzero_chi` and the identity
-block test.
-
-### 3.12 PSC, FOLD and BASE coefficient maps
-
-- Dot PSC: the 23 hiding entries map to the hiding sum and the sent round
-  coefficients; the map is triangular by variable/degree, with unit diagonal
-  on the entries that appear directly. The test computes rank 23 at three
-  points. The determinant is a nonzero polynomial; a conservative degree
-  bound is `D_PSC <= 23^2`, so a bad challenge has probability at most
-  `D_PSC/p^3 < 2^-181`.
-- Closure PSC: the same construction with 23 sumcheck variables and 49
-  hiding entries per position; rank 49 at three points; per-instance degree
-  `49^2`. With one instance per position, the union bound over 16 instances
-  is `16*49^2/p^3 < 2^-176`. The five shown masks per position cover the two
-  end values and the three fresh-point values.
-- FOLD: the fresh mask's `2k+1` coefficients fill the start sum and the sent
-  `(c0,c2)` round values; the coefficient map is triangular by variable and
-  degree with unit diagonal. Its determinant is a nonzero polynomial; a
-  conservative per-instance degree bound is `(2k+1)^2`. With two FOLD
-  instances the union bound is below `2^-178` for `k <= 32`.
-- BASE: the star main row, star mask row and their tails are fresh per value;
-  each public BASE value has its own star random dimension, so the multi-value
-  map is an identity block (rank equal to the number of values), not a
-  per-value implication. The joint test includes the multiple values in one
-  matrix.
-- The closed relation has no code-switch stage; a future CS path would need
-  its own fresh-mask and star coverage and is not covered here.
-
-## 4. Opening sets and submatrix property
-
-The harness builds the code parameters actually used:
-
-| Code family | `r` | Opening set per oracle | Remaining |
-|---|---:|---:|---:|
-| table | 8192 | 603 | 7589 |
-| W and closure main | 8192 | up to 4 | at least 8188 |
-| index and closure mask | 256 | up to 4 | at least 252 |
-
-The ledger measures 72 code-bearing oracles, total rank 558,080, code-oracle
-unique positions 879, minimum remaining 252 and zero exhausted tails. The
-full opening accounting is 143 events, 887 logical draws and 887 unique
-positions; the 8-position difference from the code-oracle total is on the
-star messages, which have no code tail. Table reuse is zero.
-
-`[ARGUMENT]` Every actual opening set has `|S| <= r` (603 <= 8192; each W and
-closure set <= 4 <= 8192; each mask set <= 4 <= 256). By the Vandermonde
-property in 3.2, `Im(B_msg) subset Im(A_tail)` for every such set, so the
-message direction is masked on the opened positions. The old statement
-"hiding dimension = r - union" is withdrawn: `r - q` is the unobserved tail
-dimension, while message masking follows from surjectivity `|S| <= r`. The
-ledger's minimum remaining 252 is the empirical margin; if a set exceeded
-`r`, the argument would fail and the run must fail closed.
+`[FACT]` `CODE` The ledger measures 72 code-bearing oracles, total tail rank
+558,080, code-oracle unique positions 879, minimum remaining 252 and zero
+exhausted tails; the full opening accounting is 143 events, 887 logical and
+887 unique positions. The 8-position difference is on the star messages, which
+have no code tail. If a set exceeded `r`, the executable ledger rejects the
+run.
 
 `[UNPROVEN]` The union count is accounting, not a formal rank theorem for the
-programs. The Vandermonde property is exact for the stated polynomial code;
-the program's execution of it is assumed.
+programs; the Vandermonde property is exact for the stated polynomial code,
+and the program's execution of it is assumed.
 
-## 5. Challenge order and verifier rejection chain
+### 5.3 SEND answers, Eval targets and shown values
 
-`[FACT]` The order of the closed hidden session is:
+`[FACT]` `CODE` `NUM`
 
-| Step | Absorbed before the challenge | Challenge | Verifier layer |
-|---|---|---|---|
-| 1 | activation commitment, W roots, mask and shown-map roots, group declaration | shared seeds | root and declaration checks |
-| 2 | complete ordered answers | W/mask positions | sampled-answer and opening checks |
-| 3 | closure group roots, closure mask root, closure seeds and answers | `r_bool` | closure root, answer and shape checks |
-| 4 | map group and map answers | map positions | map root, answer and opening checks |
-| 5 | index-mask answers | index-mask positions | mask opening and slot checks |
-| 6 | W/mask/closure positions and openings | Eval point `psi` | opening checks; `psi` is drawn after all openings |
-| 7 | Eval targets computed from `psi` and absorbed after it | none at this step | masked Eval row checks; the mask `e_t` was fixed before `psi` |
-| 8 | tilde values and public residual `R` | PSC challenges | residual absorbed before PSC; PSC row and end-value checks |
-| 9 | fold start | epsilon, then round challenges | fold shape, sum and round checks |
-| 10 | base positions | lambda | base opening and final-row checks |
-| 11 | final seal | none | seal recomputation and output relation |
+- SEND answer: `answer = sample(message) + pad`. The answer function reads the
+  mask/message entries at the sampled cube point and adds the reserved pad
+  coefficient; the reserved coefficient is the nonzero beta of the seed. The
+  numerical test builds the answer by calling the real answer function on unit
+  messages and checks the coefficient of every entry: the ordinary entries
+  carry the equal-weight coefficients, the last entry carries beta. The map is
+  one row with a nonzero pad coefficient, so a uniform pad makes the answer
+  uniform.
+- Eval target: `target = W(psi) + e`. The test calls the real multilinear
+  message evaluation on unit messages and checks every coefficient; the mask
+  `e_t` is fixed before `psi` is drawn and gives one random dimension on the
+  single target row.
+- shown values: the closure point values are the real multilinear and
+  equal-weight inner products plus the shown masks at offsets 2, 3 and 4; the
+  two PSC end values are the two shown maps at beta plus the shown masks at
+  offsets 0 and 1. Section 5.5 puts them in the joint matrix.
 
-`[FACT]` The Eval targets are not absorbed before `psi`; they are computed from
-`psi` and absorbed after it. The hiding property uses the fact that the mask
-`e_t` is fixed before `psi`, not that the target is fixed before it. An earlier
-version of this table stated the reverse order; the code order above is the
-correct one.
+### 5.4 PSC hiding map and end values
 
-`[FACT]` The negative matrix maps to these layers:
+`[FACT]` `CODE` The hiding polynomial is
+`U(X) = sum_l w_l(X_l) prod_{j>l} psi_j(X_j)` with coefficients in
+`hp_place` order. The sent values are the hiding sum and, for every variable,
+the round coefficients with the fixed coefficient omitted. The map from the
+entries to the sent values has a block-triangular form when processed from
+the last variable backward:
 
-| Negative | Rejection layer |
-|---|---|
-| changed trusted activation commitment | policy pin |
-| changed output winner or valid range | output plan validation |
-| tampered closure PSC round | PSC verifier |
-| changed closure point values | closure second-stage verifier |
-| changed closure slack/bits/map/mask root | group root check |
-| changed slack sample answer | sampled-answer check |
-| missing closure section | plan/encoding check |
-| changed fold round, position or nonce | fold/base verifier |
-| changed W root or row | W root and opening check |
-| tampered hidden request bytes | manifest/decode check |
-| independent identical `finish_run` input | frozen-input ownership check |
-| malformed group table | shape check |
-| wrong retained tree plan or root | tree-association check |
+- the last variable has three entries. Its power-0 entry appears in the sum
+  row, and its power-1 and power-2 entries are the two sent coefficients of
+  its own round; this is a 3 x 3 block with nonzero constant diagonal;
+- for a plain variable `l`, the power-2 entry is its own sent power-2
+  coefficient; the power-1 entry appears in the preceding variable's `after`
+  value and hence in that variable's sent power-0 coefficient, with the
+  nonzero constant factor from `apply_l`; this is a 2 x 2 block with nonzero
+  constant diagonal.
 
-`[UNPROVEN]` The matrix covers the implemented negative entries. It is not a
-proof that every message field has a dedicated negative; fields reached only
-through a shared root or a later relation are covered indirectly. A production
-verifier must keep the full chain, not a subset.
+The fixed coefficient is reconstructed by the verifier with `fixed_inv = 1`,
+so the same triangular system covers the full public view. The determinant is
+the product of these nonzero constants and is independent of the challenges;
+there is no bad-challenge set for this map, so no Schwartz-Zippel term is
+needed here.
 
-## 6. Composition error accounting
+`[FACT]` `NUM` The 23 x 23 Dot map and the 49 x 49 closure map are full rank
+at three deterministic/random challenge points. Their determinants are `+1`
+for k = 10 and `-1` for k = 23 on every tested point; the sign may depend on
+the variable count, but it does not depend on the challenges. The FOLD map
+has determinant `+1` for k = 2 and k = 14 on every tested point. These are
+numerical confirmations of the constant-determinant derivation, not the
+derivation itself.
 
-`[FACT]` The base field is `p = 2^64 - 2^32 + 1`. Its cubic extension has
-`p^3` elements with `log2(p^3) = 191.99999999899`, so `1/p^3` is slightly
-larger than `2^-192`. The conservative bounds below use the looser powers:
-`1/p^3 < 2^-191`, `30/p^3 < 2^-187` for the Dot PSC,
-`1134/p^3 < 2^-181` for the Dot and 16 closure PSC degree terms,
-`16*166/p^3 < 2^-180` and `2/p^3 < 2^-190`.
+`[FACT]` `CODE` The two shown end masks are used once each:
+`end_i = ends_i + beta * shown_i`, with `beta` drawn nonzero and after the
+round message. For fixed `ends`, the two end values are one-time padded; for
+uniform shown masks they are uniform. The numerical test checks the affine
+relation with the real prover.
 
-The existing plan ledger gives a 128-bit target per round. With work counted,
-the largest round errors are 2^-128.00 (FOLD rounds and BASE lambda); the four
-position rounds are 2^-128.16, 2^-128.48, 2^-128.01 and 2^-128.50. Without work
-the chain bottoms out at 2^-116.01. The plan's compiled per-request hash bound
-is
+`[FACT]` `CODE` The last round is the product of the two masked shown maps,
+so it contains products of the shown masks. That dependence is part of the
+unmasked message vector, not a separate public direction: the hiding
+polynomial covers the whole sent message vector, including the last round.
+The numerical test fixes the shown masks and checks that the public transcript
+is affine in the hiding entries for the real prover; the end-value test checks
+the separate one-time pad. The two facts together give the hiding reduction:
+first the message vector is masked by the invertible hiding map, then the two
+end values are padded by the nonzero beta.
 
-```text
-(t + q_V + 1) * 2^-128.00 + (17/2) * (t + q_V)^2 / 2^256,
-```
+### 5.5 The closure joint object
 
-with 126.21 bits with work and 116.01 without work. These are plan-ledger
-numbers, not a new end-to-end security level.
+`[FACT]` `CODE` One position of the closure mask message has 49 hiding
+entries, five shown entries and the encoding tail. The same message entry
+appears in three public positions:
 
-`[ARGUMENT]` The component union bound used here is
+1. the encoded mask opening: a codeword symbol is
+   `sum_{i<r} tail_i z^i + sum_{j<ell} message_j z^{r+j}`;
+2. the per-position PSC transcript: the hiding map applied to the 49 hiding
+   entries, plus the message vector and the two shown end values;
+3. the published values: the two end values and the three point values, each
+   padded by one of the five shown entries.
 
-```text
-eps_total <= eps_hash + eps_components
+`[FACT]` `NUM` The joint matrix uses the real formulas: the hiding block is
+built from the real hiding polynomial, the shown block is the identity on the
+two end and three point rows, and the opening block is built by calling the
+real encoder on unit message and tail vectors. The rows are the 2k+3
+transcript values, the two end values, the three point values and the q
+opening symbols; the random columns are the mask message entries and the
+tail; the secret columns are the transcript/message coordinates and the
+published values. At k = 4, ell = 32, r = 16, q = 2 the random rank is 18 and
+the joint rank is 18: every secret column lies in the image of the random
+columns. The real-prover decomposition test confirms that, with the shown
+masks fixed, the transcript is affine in the hiding entries; the end-value
+test confirms the one-time pad.
 
-eps_hash = (t + q_V + 1) * 2^-128.00
-         + (17/2) * (t + q_V)^2 / 2^256
-eps_components = 8 * 2^-128 + 2^-180 + 2^-181 + 2^-190 + 2^-191 + eps_rank_bad
-eps_rank_bad <= (23^2 + 16*49^2 + 2*(2k+1)^2) / p^3 < 2^-176
-```
+The derivation for the actual k = 23, ell = 512, r = 256 is the same block
+argument: the 49 x 49 hiding map is invertible for every challenge by the
+triangular constant determinant; the five shown entries are independent unit
+columns on the end/point rows; the tail block has rank q for q <= r and its
+image contains the opening parts of the message columns. The blocks are
+orthogonal in row coordinates, so the ranks add; the secret rows are covered
+by the hiding block and the shown columns. This is why the encoded mask
+message, the PSC transcript and the published values are jointly hidden even
+though they share the same message entries. `CODE` `MATH`.
 
-The terms are:
+`[UNPROVEN]` The closure point values are evaluated at points drawn after the
+opening and before the next challenge; the adaptive composition of these
+challenge draws with the hiding argument is not mechanized. The hybrid
+argument in section 5.7 states the condition.
+
+### 5.6 FOLD and BASE
+
+`[FACT]` `CODE` `NUM` FOLD: the fresh mask has `2k+1` coefficients; the sent
+values are the start sum and `(c0,c2)` for each of the k rounds. The same
+block-triangular argument as the PSC applies to the fold round recursion: the
+diagonal blocks are nonzero constants, so the determinant is a nonzero
+constant independent of the challenges and the map is full rank for every
+challenge. The test runs the real fold prover
+for the actual own-fold size k = 14 and for k = 2 at three challenge seeds;
+the 29 x 29 and 5 x 5 matrices are full rank and have determinant one. The
+closed path has two FOLD instances (the shared and own proximity groups);
+their randomness is fresh and their openings/tails are separate.
+
+BASE: `LastBaseProver` draws a fresh star main row, mask row and tails from
+its own stream. The public target is
+`dot(claim, star.main) + dot(mask_claim, star.mask)`; each combined row is
+`star + lambda * row`; each tail is combined the same way; the star opening
+is the encoding of the same star rows. The real-path test checks:
+
+- two different seeds give different star rows and tails;
+- the target equals the two real dot products of the same star;
+- every combined row and tail equals the real one-time pad formula.
+
+The joint BASE view is therefore a set of one-time pads on the secret rows
+and on the target dot product; the star coordinates are fresh and appear in
+the target, the rows and the opening consistently, which is exactly the
+shared-variable pattern the joint criterion handles. `CODE` `NUM`.
+
+The FOLD and BASE parts share the opening/tail accounting: a BASE opening is
+an encoded star symbol masked by the star tail; a FOLD transcript is masked by
+the fresh coefficients. They do not share random coordinates across the two
+mechanisms, so their blocks concatenate diagonally.
+
+### 5.7 Hash roots and commitment hiding
+
+`[FACT]` `CODE` A runtime leaf is
+`hash(tag, leaf_index, run, width, salt_length, symbols, salt)`; inner nodes
+use the tree configuration. The salt has 40 bytes. The leaf hash is the only
+place the unopened symbols enter the root.
+
+The correct model is a random-oracle commitment, not a generic collision-
+resistant hash:
+
+- **RO commitment (hiding).** In the random-oracle model the leaf digest is a
+  uniform random value independent of the leaf symbols and salt; the root is a
+  hash of these values. An unopened leaf's digest is therefore uniform and
+  independent of its symbols. This is the unopened-leaf hiding lemma.
+- **CR hashing (binding).** Collision resistance is used for binding: the
+  root binds the opened leaves and the leaf index/plan bind the position. CR
+  alone does not imply hiding; the two assumptions are not interchangeable.
+- **Per-use record.** Root hiding uses RO; root binding uses CR; leaf binding
+  uses CR plus the index/run/plan; salt entropy supports the RO input
+  distinctness; the mask/tail/pad entropy supports the leaf input
+  min-entropy. In the fixture the inputs meet the stated lengths.
+
+`[FACT]` `CODE` Hybrid order:
+
+1. Replace every root and leaf digest by an independent uniform RO output
+   (or program the RO at those points in the simulator).
+2. Run the algebraic cover argument on the openings, answers, transcripts and
+   star rows, with the roots treated as fixed public values.
+3. Use the RO commitment hiding for the unopened leaves and the CR binding
+   for the opened ones.
+
+Roots are never treated as independent random field elements. In particular the
+old statement "conditional on a root the tail remains uniform" is withdrawn:
+conditioning on a hash output can correlate with the input in a CR-only model.
+The correct statement is the RO replacement above, where the root is uniform
+and independent of the input by construction; after the replacement the tail
+is uniform conditional on the programmed root.
+
+`[CODE]` Adaptive challenges: the challenges are drawn after the roots and
+answers are absorbed. Under the RO replacement, a root is independent of the
+message and tail, so the challenge distribution is independent of the secret;
+the algebraic cover argument can be conditioned on the root without changing
+the secret distribution. This adaptation argument depends on the RO model for
+the root and leaf outputs, not on CR.
+
+`[ASSUMPTION]` The RO/CR model is not quantified against a concrete hash. The
+hybrid failure probability is therefore a model-level condition, not a
+numerical term; the composition expression in section 6 lists the algebraic
+terms and states the hash-model term separately.
+
+## 6. Exception probabilities
+
+`[FACT]` `CODE` The base field is `p = 2^64 - 2^32 + 1`; the cubic extension
+has `p^3` elements with `log2(p^3) = 191.99999999899`, so `1/p^3` is slightly
+larger than `2^-192`. The conservative bounds use the looser powers:
+`1/p^3 < 2^-191`, `30/p^3 < 2^-187`, `1134/p^3 < 2^-181`,
+`16*166/p^3 < 2^-180`, `2/p^3 < 2^-190`.
+
+The hiding-rank maps have constant nonzero determinant (section 5.4), so the
+former bad-challenge rank term is withdrawn: there is no Schwartz-Zippel
+event for the PSC or FOLD hiding maps. The remaining degree terms are
+soundness checks of the sumcheck and range relations, not hiding-rank terms.
+The entries are:
 
 | Component | Count/degree | Bound |
 |---|---|---:|
 | audited proximity/LKP rounds | 8 rounds from the plan | `8 * 2^-128 = 2^-125` |
 | range booleanity | 16 positions, degree at most 166 each | `16*166/p^3 < 2^-180` |
-| PSC | 10 variables for the Dot instance and 23 for each of 16 closure instances, degree 3 each | `(30 + 16*69)/p^3 < 2^-181` |
+| PSC sumcheck (Dot once, closure 16 positions) | 10 and 23 variables, degree 3 each | `(30 + 16*69)/p^3 < 2^-181` |
 | single equality | degree 2 | `2/p^3 < 2^-190` |
 | `chi = 0` | one event | `1/p^3 < 2^-191` |
-| PSC/FOLD rank determinant | degrees `23^2`, `16*49^2`, `2*(2k+1)^2` | `eps_rank_bad < 2^-176` for `k <= 32` |
+| challenge-draw zero fallback | at most 6 rejected words per draw, `(1-p/2^64)^6` | below `2^-192` per draw |
+| hash model | plan-ledger term | `(t + q_V + 1) * 2^-128 + (17/2) * (t + q_V)^2 / 2^256` |
 
-`[FACT]` The draw census behind these terms is the actual plan: 73 index-mask
-entries; 864 closure-mask entries (16 positions times 49 hiding plus 5 shown);
-padded SEND answers among the 143 opening events and 887 logical/unique
-openings; code tail rank 558,080 over 72 code-bearing oracles; FOLD fresh
-coefficients per fold round and BASE star rows per value as fresh draws
-(section 3.10b). The index-mask and closure-mask entries are separate oracles
-and are not summed into one mask count.
+`[ARGUMENT]` `CODE` The component union bound used here is
 
-The `t`/`q_V` factor is carried by the hash term, which is the adaptive
-composition term; the algebraic component count is fixed per proof. If the
-prover uses `Q_A` adaptive retry attempts, multiply the component terms by
-`Q_A`; the hash term already carries the transcript query count. The challenge
-draws are uniform over the cubic field. The hash term assumes the
-plan's random-oracle/collision-resistant model and work bits; it is not
-re-derived here. For `Q_R` independent requests, multiply the component sum by
-`Q_R`; no global bound is claimed without a bound on `Q_R`.
+```text
+eps_total <= eps_hash + eps_components
+eps_hash = (t + q_V + 1) * 2^-128 + (17/2) * (t + q_V)^2 / 2^256
+eps_components = 8 * 2^-128 + 2^-180 + 2^-181 + 2^-190 + 2^-191
+```
 
-The reference range check's error is counted as `2^-N` over its random
-combination matrix, with a union bound over columns; this implementation's
-closure booleanity is a polynomial identity checked at a random point, so the
-degree-based `16*166/p^3` term is the relevant arithmetic model. The two are
-not the same check and are not added as if they were; the plan's 128-bit round
-accounting is used for the audited proximity/LKP rounds.
+The `t`/`q_V` factor is carried by the hash term; the algebraic component
+count is fixed per proof. If the prover uses `Q_A` adaptive retry attempts,
+multiply the component terms by `Q_A`; the hash term already carries the
+transcript query count. For `Q_R` independent requests, multiply the
+component sum by `Q_R`; no global bound is claimed without a bound on `Q_R`.
+The challenge draws are uniform on the cubic field except for the zero
+fallback term above. The hash term assumes the plan's RO/CR model and work
+bits; it is not re-derived here.
 
-At `t = 2^64`, `2^96` and `2^120` the hash term dominates at about `2^-64`,
-`2^-32` and `2^-8`; the component sum is about `2^-125` (before the `Q_R`
-factor) and `chi = 0` is below `2^-191`. The figures `126.21` and `116.01`
-bits remain plan-ledger numbers and are not presented as a new closed-chain
-security level.
+`[UNPROVEN]` The `126.21` and `116.01` bit figures remain plan-ledger numbers,
+not a new closed-chain theorem. The degrees and counts above are arithmetic
+assumptions; a conservative union bound over the components is not mechanized.
 
-`[UNPROVEN]` No independent composition theorem is proved here. The round
-figures are taken from the plan's accounting; the degrees and counts above are
-arithmetic assumptions; some code-proximity bounds are assumed; the programs'
-computation of the protocol is not proved. The `Q_R` multi-request factor is
-not bounded. A conservative union bound over the components is not mechanized.
+`[ASSUMPTION]` The mask coin modulo bias from section 2 is not in this
+computational expression. If a statistical hiding statement is required, the
+bias term must be added or the mask stream must use rejection sampling; this
+is a conditional premise, not a runtime failure.
 
-`[GAP]` If the range-decomposition, PSC or LKP terms are not instantiated at
-the stated degrees/parameters, or if the number of requests is unbounded, the
-composition figure does not apply; the security conclusion is conditional
-and the 128-bit target is not claimed.
+## 7. Assumption support table
 
-## 7. Runtime fail-closed controls
+| Assumption | Support | Status |
+|---|---|---|
+| independent uniform `Fp`/`Fp3` draws | `ByteMaskCoins::value_at` and `draw_f/draw_e`; three `Fp` coordinates per `Fp3` | supported for the RO model; modulo bias conditional (section 2) |
+| challenge zero fallback bounded | `DRAW_TRIES = 6`, rejection sampling in `draw_f` | supported; term in section 6 |
+| opening positions distinct, `q <= r` | transcript/ledger; actual counts 603/4/4; ledger min remaining 252 | supported by the ledger; the numerical rank check is `NUM` |
+| tail union across SEND and BASE | the tree opening set is the union; ledger evidence | supported by the ledger |
+| PSC hiding map constant nonzero determinant | triangular derivation from `HidingPolynomial`/`hp_place`; determinant `+1` at k=10 and `-1` at k=23 | `CODE` `NUM`; no SZ term |
+| FOLD fresh map constant nonzero determinant | triangular derivation from `FoldRoundProver`; determinant `+1` at k=2 and k=14 | `CODE` `NUM`; no SZ term |
+| shown end masks one-time, beta nonzero | `draw_e_nonzero`; real-prover end-value test | supported |
+| closure joint mask object rank equality | real encoder + real hiding polynomial + joint matrix | `NUM` at k=4; `CODE` block derivation for k=23 |
+| BASE star fresh and one-time | `draw_star` from a fresh stream; real-path test | supported |
+| hash RO for hiding, CR for binding | leaf/root hash construction and salt lengths; model statement | supported as a model; no concrete-hash quantification |
+| no mask/pad/stream/table reuse | ledger state validation and rejects | supported; executable |
+| approved output boundary | policy/plan; the full `Y` row is hidden beyond winner/valid/tie | `FACT` boundary; conditional full-row hiding |
+| closed path has two FOLD instances and one closure PSC per position | `member_fold_shape` call sites; `messages.psc.len() == positions` | `CODE`; actual k=14 own fold |
+| no code-switch stage in the hidden path | plan rejects a switch configuration | supported |
+| asset inventory only for this fixture | the stated shapes and code parameters | scoped, not extrapolated |
+| strict statistical hiding against the concrete mask stream | not supported by the RO argument alone (modulo bias) | `UNPROVEN` conditional |
 
-`[FACT]` The following controls are executable and have direct tests:
+## 8. Rejection chain and tree-reuse tamper
 
-| Control | Executable evidence |
-|---|---|
-| material/seed/commitment reuse | ledger state validation and tests `the_same_material_stream_across_requests_is_rejected_even_with_another_root`, `the_same_seed_commitment_across_requests_is_rejected`, `the_same_commitment_root_under_another_stream_is_rejected` |
-| table reuse | `TableReusePolicy::Forbidden` and `table_reuse_is_forbidden_or_counted_by_policy` |
-| tail budget exhaustion | `LeafBudgetExhausted` and `a_declared_budget_above_the_tail_rank_is_rejected_before_any_event`, `tail_union_accumulates_across_stages_and_an_overrun_fails_closed` |
-| state rollback or edited log | `StateRollbackSuspected`, `a_damaged_state_is_rejected`, `a_truncated_or_edited_event_log_is_rejected` |
-| proof/verify lifecycle | `success_requires_the_complete_verification`, `a_failed_verification_marks_the_request_failed_and_blocks_retry` |
-| frozen BAT input | `finish_run_rejects_independent_content_identical_input` |
-| group-table shape | `group_table_rejects_malformed_members_and_cross_block_placement` |
-| retained tree plan/root | `retained_tree_checks_plan_and_sealed_root` |
-| mask slot schema | `mask_slot_schema_is_separate_and_one_time` |
-| final proof negatives | hidden proof negative matrix: changed roots, PSC rows, point values, sample answers, missing closure, fold rounds, positions, nonces, wrong plan |
+`[FACT]` `CODE` The closed session absorbs messages and draws challenges in
+this order: roots and declarations, answers, closure roots/answers and
+`r_bool`, map answers and positions, index-mask answers and positions,
+openings and `psi`, Eval targets after `psi`, tilde and residual, PSC
+challenges, fold start and rounds, base positions and lambda, seal. Each
+challenge is drawn after the data it tests.
 
-Items not backed by an executable rejection:
+`[FACT]` `NUM``CODE` The negative matrix maps changed roots, PSC rows, point
+values, sample answers, missing closure, fold rounds, positions, nonces and
+wrong plans to the verifier layer that rejects them. The changed-message
+component test keeps the original tree and root and changes only the
+prover-side message: the group table changes. This is a component result, not
+a final-verifier run.
 
-- `chi = 0` has no explicit check; it is covered only by the `1/p^3 < 2^-191`
-  term in the composition argument.
-- The full joint simulation and the composition theorem are document-level
-  arguments; the all-challenge PSC/FOLD rank rests on the
-  nonzero-determinant step with the section 6 bad-challenge bound.
-- The output-binding boundary is the approved one; the full `Y` row is hidden
-  by the conditional argument in 3.6. A change to the boundary requires a new
-  review.
-- The trusted X source, policy distribution/freshness and chain-based
-  production verification are long-term direction records, not debts of this
-  round.
+`[ARGUMENT]` `CODE` Tree-reuse tamper bound. Suppose the prover keeps the
+original committed tree/root but uses a changed message row in the group
+table. The root and opening checks do not see the change because the openings
+come from the original tree. The difference enters the FOLD/BASE checks as a
+nonzero group-row difference. For a nonzero difference polynomial, the FOLD
+round checks are polynomials of degree at most two in each challenge; with
+the actual own-fold k = 14 the union over the 14 rounds is at most
+`28/p^3`. The shared fold's members are the 1024-row Gu message, the one-row
+Omega message, the record row and the opened-column rows (at most the table's
+603 opening events), so its k is at most 11; the bound below charges
+`2k/p^3` with k = 14 for both instances as a conservative value. The BASE
+lambda check is linear and adds `1/p^3`; the base symbol checks are linear. The audited proximity/opening
+error is the `8 * 2^-128` term. A conservative bound for the two-instance
+closed path is therefore
 
-## 8. Conditional conclusions and open items
+```text
+2 * (2 * 14) / p^3 + 2 / p^3 + 8 * 2^-128  <  2^-124.9,
+```
 
-The following are open or conditional:
+dominated by the audited proximity term. This is a loose bound under the
+degree assumption, not a measured probability. If the changed message
+difference lies in the kernel of the FOLD/BASE map, the check is not claimed
+to catch it. A final-verifier exact negative for this tamper is not
+implemented because the hidden prover has no message-injection point after the
+tree commit; the component test plus this bound are what the current API
+supports. `[UNPROVEN]` The exact final-verifier negative.
 
-- `[UNPROVEN]` a full simulation and the adaptive composition of the hash and
-  algebraic arguments; the linear-cover criterion itself is argued per view.
-- `[UNPROVEN]` a mechanized symbolic proof that the PSC/FOLD determinants
-  are nonzero for every challenge; the triangular structure and three-point
-  checks support the nonzero-polynomial step and section 6 carries the
-  bad-challenge bound.
-- `[UNPROVEN]` a mechanized composition theorem and an end-to-end 128-bit
+## 9. Engineering boundaries and wording
+
+`[FACT]` The joint-view module is test-only. It exercises the real encoder,
+the real hiding polynomial and the real fold/base paths, but a passing test
+module is not a production runtime detector for every bad rank or every
+tampered message. The workspace result and the three seq16 runs are the
+delivery evidence reported by the implementation side; they are not an
+independent external verification.
+
+`[FACT]` The production proof code is unchanged from `1f80e682`; the proof
+bytes and hash are unchanged by this document and the test-only module.
+
+`[FACT]` The asset inventory and its bounds apply only to the listed
+`gpt2-seq16` fixture path and its shapes/code parameters; they are not
+extrapolated to other models, lengths, batches or production entries.
+
+`[FACT]` The output-binding boundary keeps winner, valid range and tie result
+public; the full reduced output row is hidden by the conditional argument in
+5.5/5.6, not by a `[GAP]` waiver.
+
+## 10. Open items
+
+- `[UNPROVEN]` A full simulation and a mechanized adaptive composition of the
+  hash and algebraic arguments; the linear-cover criterion is argued per view.
+- `[UNPROVEN]` A mechanized symbolic proof of the constant determinant of the
+  PSC/FOLD hiding maps; the triangular derivation and the numerical checks
+  support it, but they are not a formal proof.
+- `[UNPROVEN]` A strict statistical hiding bound for the concrete mask stream
+  (modulo reduction bias). The computational argument uses the RO model; if a
+  statistical claim is required, the mask stream needs rejection sampling.
+  This is a same-topic candidate for the expert, not a change made here.
+- `[UNPROVEN]` An exact final-verifier negative for the tree-reuse tamper; the
+  current API has no prover-side message injection point after the tree
+  commit. The component test and the degree bound are delivered instead.
+- `[UNPROVEN]` A mechanized composition theorem and an end-to-end 128-bit
   claim; `126.21`/`116.01` remain plan-ledger numbers.
-- `[ASSUMPTION]` the approved output-binding boundary (winner/valid/tie); the
-  full `Y` row is hidden by the conditional argument, not by a `[GAP]` waiver.
-- `[LONG-TERM]` the trusted X source, policy distribution/freshness and
+- `[LONG-TERM]` The trusted X source, policy distribution/freshness and
   chain-based commitment/verification are recorded as long-term direction;
   they are not implemented here and are not debts of this round.
-- `[EXCEPTION]` `chi = 0` is a public event included as a term. An opening
-  union above the tail rank or a reused mask/pad/material stream is an
-  executable ledger rejection. A failed hash model, a broken PSC/FOLD
-  full-rank assumption or an unapproved output boundary withdraws the
-  security conclusion; these are conditional assumptions, not runtime
-  fail-closed checks.
 
-No statement in this note claims that the trusted X source is proved, that the
-weights are hidden under a formal ZK definition, or that the run is a
-production acceptance.
+No statement in this note claims that the trusted X source is proved, that
+weights are hidden under a formal zero-knowledge definition, or that the run
+is a production acceptance.
