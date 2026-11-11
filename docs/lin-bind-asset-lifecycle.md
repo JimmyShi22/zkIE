@@ -11,6 +11,10 @@ Snapshot: code basis `3b3e8ecc`, bounded-read rollback `8d32d3de`; fixture
 `gpt2-seq16`, table shape `2^10` rows by `2^16` columns of `i32`, table code
 `log_n = 17`, `ell = 65539`, `r = 8192`.
 
+The inventory and every bound below apply only to this fixture path and these
+listed shapes and code parameters. They are not extrapolated to other models,
+sequence lengths, batch shapes or production entry points.
+
 ## Asset and reader
 
 - The asset is opened by `BoundedAssetReader` over the read-only file. The
