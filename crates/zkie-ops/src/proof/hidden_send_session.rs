@@ -11483,6 +11483,54 @@ mod tests {
         assert_eq!(serial[6], member.message[0][3]);
         assert_eq!(serial[7], member.message[1][3]);
 
+        let layout_second = FoldGroupLayout {
+            group: 7,
+            k: 2,
+            h: 1,
+            members: vec![FoldMemberLayout {
+                oracle: 1,
+                main_rows: 2,
+                mask_rows: 0,
+                kept: false,
+            }],
+        };
+        let bat_second = BatGroupLayout {
+            group: 7,
+            k: 2,
+            h: 1,
+            log_ell: 1,
+            log_ell_zk: 2,
+            members: vec![BatMemberLayout {
+                oracle: 1,
+                kept: false,
+                main_first: Some(0),
+                mask_first: None,
+            }],
+        };
+        let serial_second = build_group_table_with_min(
+            &layout_second,
+            &bat_second,
+            std::slice::from_ref(&member),
+            usize::MAX,
+        )
+        .unwrap();
+        for threads in [1usize, 2, 64] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let parallel_second = pool.install(|| {
+                build_group_table_with_min(
+                    &layout_second,
+                    &bat_second,
+                    std::slice::from_ref(&member),
+                    0,
+                )
+                .unwrap()
+            });
+            assert_eq!(serial_second, parallel_second, "second shape threads {threads}");
+        }
+
         let mut too_long = member.clone();
         too_long.message[0].push(Fp3::from_u64(99));
         assert!(matches!(
@@ -11529,6 +11577,51 @@ mod tests {
             build_group_table_with_min(&layout, &overflow, &[member], 0),
             Err(Error::ResourceLimit)
         ));
+    }
+
+    #[test]
+    fn changed_message_with_original_tree_changes_the_group_table() {
+        let mut member = group_table_member(2, 4);
+        let plan = group_table_tree_plan(500, 2);
+        let tails = vec![vec![Fp3::ZERO; 4]; 2];
+        let salts = vec![vec![0u8; SALT]; 1 << W_CODE_LOG_N];
+        let tree = commit_rows_tree(
+            plan,
+            member.main_code,
+            &member.message,
+            &tails,
+            &salts,
+        )
+        .unwrap();
+        member.root = *tree.root();
+        let trees = RetainedTrees(vec![Arc::new(tree)]);
+        let (layout, bat_layout) = group_table_layout(2, 2);
+        let original = build_group_table_with_min(
+            &layout,
+            &bat_layout,
+            std::slice::from_ref(&member),
+            usize::MAX,
+        )
+        .unwrap();
+        assert!(retained_member_tree(&trees, 0, &member).is_ok());
+        assert!(ProximityMemberProver::sealed(
+            member.clone(),
+            Arc::clone(&trees.0[0])
+        )
+        .is_ok());
+
+        // Keep the original tree and root; change only the prover-side message.
+        let mut changed = member;
+        changed.message[0][0] = changed.message[0][0].add(&Fp3::ONE);
+        assert!(retained_member_tree(&trees, 0, &changed).is_ok());
+        let changed_table = build_group_table_with_min(
+            &layout,
+            &bat_layout,
+            std::slice::from_ref(&changed),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_ne!(original, changed_table);
     }
 
     #[test]

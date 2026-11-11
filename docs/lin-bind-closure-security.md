@@ -58,6 +58,28 @@ commitment, not by observed equal positions or values; a repeated material
 commitment is rejected. `[ASSUMPTION]` The draws are independent uniform field
 elements.
 
+### 2.1 Output-view boundary
+
+This relation is within the approved output-binding boundary: the public
+first-max winner, valid range and tie result are protocol outputs, and the full
+reduced output row is not opened. The public items have the following form:
+
+| Public item | Form | What the verifier can derive |
+|---|---|---|
+| closure slack/bits/map openings | encoded codeword symbols, linear in the code tail plus a function of the output row | linear equations in the tail; at most the union positions, leaving `r - union` tail dimensions under the stated rank |
+| SEND answers | raw field values, message sample plus a one-time pad | only the padded value; the pad is one-use |
+| Eval targets | raw field values, `W_t(psi_t) + e_t` | the target; `e_t` is fixed before `psi_t`, so the masked value is uniform for a fixed message |
+| output winner/valid/tie | raw protocol output | the approved output semantics; no weight row |
+| residual `R` | raw field value, one chi-weighted difference of the claim and tilde masks | one linear combination; no individual mask |
+| table/W openings | encoded codeword symbols | linear equations in the tail; `r - union` dimensions under the rank assumption |
+| roots and seal | digests | binding only; no raw value |
+
+No item above is a plaintext weight row. The table and W messages are opened
+as encoded symbols; the closure messages are functions of the reduced output
+row. `[GAP]` If the deployment requires the output row itself to stay hidden
+beyond the approved winner/valid/tie boundary, the closure openings are a leak
+and the run must fail closed.
+
 ## 3. Joint-view hiding argument
 
 The argument is made value by value. It is not a simulation proof.
@@ -79,9 +101,12 @@ The argument is made value by value. It is not a simulation proof.
    independent masks. It reduces the joint entropy by one field element but
    leaves each individual mask marginal uniform; the marginals of the masked
    Dot values are therefore unchanged. `[ASSUMPTION]` `chi` and its powers are
-   nonzero and the mask draws are independent uniform field elements. If
-   `chi = 0`, the residual does not combine the positions as assumed and the
-   run must fail closed.
+   nonzero and the mask draws are independent uniform field elements.
+   `[FACT]` The implementation draws `chi` with the ordinary field challenge
+   and has no explicit nonzero check. If `chi = 0`, the residual combines only
+   the `t = 0` term; the probability is `1/p^3 = 2^-192` for the cubic field,
+   and that term is included in the composition bound in section 6. No
+   executable rejection of `chi = 0` is claimed.
 6. `[FACT]` The closure bits, slack and product map are functions of the
    committed reduced output row and the public winner. Their openings reveal
    those functions at the drawn positions, not the weight rows.
@@ -102,6 +127,50 @@ union accounting in section 4 is a necessary condition, not a simulation.
 `[GAP]` If any mask class is reused, if a pad is reused across messages, if a
 material commitment repeats, or if the table union reaches its tail rank, the
 argument does not apply. The ledger is the fail-closed gate for those cases.
+
+### 3.5 Joint linear system over the full public view
+
+`[ARGUMENT]` Write the public view as linear forms in the random material. The
+mask block has 73 entries `(c, g, e, end, U)`. The code-tail block has one
+random tail per code-bearing oracle, with total rank 558,080. The pads form a
+third independent block. The coefficient structure is:
+
+| Public item | Linear form | Random variables | Rank contribution |
+|---|---|---|---:|
+| `tilde_t` | `W_t + g_t` | `g_t` | 16 |
+| `R` | `sum chi^t g_t - sum chi^t c_t` | `g_t, c_t` | 1 new direction |
+| Eval target `tau_t` | `W_t(psi_t) + e_t` | `e_t` | 16 |
+| shown end values | two forms on `end` | `end` | 2 |
+| PSC transcript | affine bijection on `U`, plus one `sigma` direction | `U`, `c` | 23 |
+| SEND answers | `message sample + pad` | `pad` | one per pad |
+| table/W/closure openings | codeword symbol = tail combination + message symbol | per-tree tail | at most the union per tree |
+| roots, seals | hash commitments | hash randomness | 0 algebraic |
+| output winner/valid/tie | protocol output | none | 0 |
+
+The mask block therefore has rank 58 on 73 entries and kernel 15, recovering
+the existing `(tilde, R)` rank 17 / kernel 15 result and the 58/73 total. The
+code-tail block contributes at most the 879 distinct code-oracle positions;
+its kernel is at least `558,080 - 879 = 557,201`. The pads add one random
+dimension and one revealed form each, so they cancel in the kernel.
+
+`[ARGUMENT]` Under the independence assumptions in section 2, the joint
+leakage dimension is
+
+```text
+rank <= 58 + 879 + P = 937 + P
+dimension >= 73 + 558,080 + P = 558,153 + P
+kernel >= 15 + 557,201 = 557,216
+```
+
+where `P` is the number of padded SEND answers. The kernel lower bound does
+not depend on `P`. This is an argument about the linear forms, not a
+simulation: roots and seals are hash commitments, and the code-tail rank is
+the stated product-form rank.
+
+`[UNPROVEN]` The full joint simulation and the all-challenge rank statement
+are not proved. The count above is the algebraic accounting; the hash
+commitments, the code's actual rank and the independence of the streams are
+the assumptions listed in section 6.
 
 ## 4. Opening union and tail budget
 
@@ -136,6 +205,14 @@ without a code tail (the star messages); the budget summary covers the 72
 code-bearing oracles and accounts 879 of them. The minimum remaining 252 is
 the conservative per-oracle bound; no code oracle is exhausted.
 
+`[ASSUMPTION]` The statement "hiding dimension = `r - union`" is conditional
+on the code's actual tail rank being `r`. Known plan values are: table code
+`r = 8192`; the folded/shared main code `r = 962`; the mask codes `r = 50`,
+`57` or `47`; the closure codes use the setup's code parameters. If an actual
+rank is lower than the plan value, use the lower value; the bound only
+decreases. The ledger's measured minimum remaining 252 is the empirical check
+over the actual plan.
+
 `[ASSUMPTION]` The relevant hiding budget is per tree: a union of `u` positions
 against rank `r` leaves `r - u` random dimensions. Summing ranks across trees is
 not meaningful because the trees are independent.
@@ -156,11 +233,18 @@ hiding dimension in that tree and must fail closed.
 | 3 | closure group roots, closure mask root, closure seeds and answers | `r_bool` | closure root, answer and shape checks |
 | 4 | map group and map answers | map positions | map root, answer and opening checks |
 | 5 | index-mask answers | index-mask positions | mask opening and slot checks |
-| 6 | Eval targets | Eval point `psi` | masked Eval row checks |
-| 7 | tilde values and public residual `R` | PSC challenges | residual absorbed before PSC; PSC row and end-value checks |
-| 8 | fold start | epsilon, then round challenges | fold shape, sum and round checks |
-| 9 | base positions | lambda | base opening and final-row checks |
-| 10 | final seal | none | seal recomputation and output relation |
+| 6 | W/mask/closure positions and openings | Eval point `psi` | opening checks; `psi` is drawn after all openings |
+| 7 | Eval targets computed from `psi` and absorbed after it | none at this step | masked Eval row checks; the mask `e_t` was fixed before `psi` |
+| 8 | tilde values and public residual `R` | PSC challenges | residual absorbed before PSC; PSC row and end-value checks |
+| 9 | fold start | epsilon, then round challenges | fold shape, sum and round checks |
+| 10 | base positions | lambda | base opening and final-row checks |
+| 11 | final seal | none | seal recomputation and output relation |
+
+`[FACT]` The Eval targets are not absorbed before `psi`; they are computed from
+`psi` and absorbed after it. The hiding property uses the fact that the mask
+`e_t` is fixed before `psi`, not that the target is fixed before it. An earlier
+version of this table stated the reverse order; the code order above is the
+correct one.
 
 `[FACT]` The negative matrix maps to these layers:
 
@@ -209,6 +293,29 @@ The closed relation adds:
 - the closure PSC rows and their end values;
 - the LKP membership and the proximity tests already in the chain.
 
+`[ARGUMENT]` A parameterized union bound over the components is
+
+```text
+eps_total <= eps_hash + eps_chi + eps_IOPP + eps_LKP
+           + eps_range + eps_PSC + eps_eq
+
+eps_hash = (t + q_V + 1) * 2^-128.00
+         + (17/2) * (t + q_V)^2 / 2^256
+eps_chi  = 2^-192
+```
+
+The component terms use the plan's accounting: each audited proximity/LKP
+round is at most `2^-128.00`, so eight such terms sum to about `2^-125`; the
+range booleanity term is bounded by the decomposition degree over the cubic
+field, `16 * 166 / p^3 <= 2^-180.6`; the PSC term by `10 * 3 / p^3 <= 2^-187.1`;
+the single-equality term by `2 / p^3 <= 2^-191`. These are arithmetic bounds
+under the stated degrees, not a mechanized proof.
+
+At `t = 2^64`, `2^96` and `2^120` the hash term dominates: about `2^-64`,
+`2^-32` and `2^-8`; the component sum is about `2^-125` and the `chi = 0` term
+is `2^-192`. The figures `126.21` and `116.01` bits above remain plan-ledger
+numbers, not a new end-to-end security level for the closed chain.
+
 `[UNPROVEN]` No independent composition theorem is proved here. The round
 figures are taken from the plan's accounting; some code-proximity bounds are
 assumed; the programs' computation of the protocol is not proved. A
@@ -219,7 +326,33 @@ figure is therefore a plan-accounting figure, not an end-to-end security level.
 not all instantiated at the stated parameters, the composition figure does not
 apply. The run must fail closed rather than claim the 128-bit target.
 
-## 7. Fail-closed summary
+## 7. Runtime fail-closed controls
+
+`[FACT]` The following controls are executable and have direct tests:
+
+| Control | Executable evidence |
+|---|---|
+| material/seed/commitment reuse | ledger state validation and tests `the_same_material_stream_across_requests_is_rejected_even_with_another_root`, `the_same_seed_commitment_across_requests_is_rejected`, `the_same_commitment_root_under_another_stream_is_rejected` |
+| table reuse | `TableReusePolicy::Forbidden` and `table_reuse_is_forbidden_or_counted_by_policy` |
+| tail budget exhaustion | `LeafBudgetExhausted` and `a_declared_budget_above_the_tail_rank_is_rejected_before_any_event`, `tail_union_accumulates_across_stages_and_an_overrun_fails_closed` |
+| state rollback or edited log | `StateRollbackSuspected`, `a_damaged_state_is_rejected`, `a_truncated_or_edited_event_log_is_rejected` |
+| proof/verify lifecycle | `success_requires_the_complete_verification`, `a_failed_verification_marks_the_request_failed_and_blocks_retry` |
+| frozen BAT input | `finish_run_rejects_independent_content_identical_input` |
+| group-table shape | `group_table_rejects_malformed_members_and_cross_block_placement` |
+| retained tree plan/root | `retained_tree_checks_plan_and_sealed_root` |
+| mask slot schema | `mask_slot_schema_is_separate_and_one_time` |
+| final proof negatives | hidden proof negative matrix: changed roots, PSC rows, point values, sample answers, missing closure, fold rounds, positions, nonces, wrong plan |
+
+`[UNPROVEN]` or `[GAP]` items are not backed by an executable rejection:
+
+- `chi = 0` has no explicit check; it is covered only by the `2^-192`
+  probability term in the composition argument.
+- Full joint-view hiding, the opening-union rank proof and the composition
+  theorem are document-level arguments.
+- Output confidentiality, the trusted X source, policy distribution/freshness
+  and production CLI wiring are assumptions or gaps.
+
+## 8. Fail-closed summary
 
 The following are open and must be stated as open:
 

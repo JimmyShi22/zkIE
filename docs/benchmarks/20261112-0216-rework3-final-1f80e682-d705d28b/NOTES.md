@@ -25,8 +25,10 @@ protocol parameter or hiding boundary changes.
 `seq16×3` means three no-profile reruns of the same GPT-2 formal fixture
 (`gpt2-seq16`), not three cases. Only `gpt2-seq16` is covered. The five-case set
 was not run because no seq512 logic and no all-case structural path changed;
-the five-case set belongs to the full acceptance basis. All GiB values are
-KiB / 1048576.
+the five-case set belongs to the full acceptance basis. The judgment basis is
+that the batch changes implementation, tests and documentation only; the final
+evidence is the three run logs and the workspace log in this directory. All
+GiB values are KiB / 1048576.
 
 ## Runs
 
