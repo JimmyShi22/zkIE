@@ -13105,3 +13105,91 @@ mod merged_tests {
         assert!(base.validate().is_ok());
     }
 }
+
+#[cfg(test)]
+mod rework7_joint_tests {
+    use super::*;
+
+    #[test]
+    fn eval_target_is_the_real_multilinear_evaluation_plus_a_one_time_mask() {
+        let point = [Fp3::from_u64(3), Fp3::from_u64(5)];
+        let main_rows = 2u64;
+        let columns = 4u64;
+        let mut coefficients = Vec::new();
+        for index in 0..4u64 {
+            let mut message = vec![vec![Fp3::ZERO; 2]; 2];
+            message[(index % main_rows) as usize][(index / main_rows) as usize] = Fp3::ONE;
+            coefficients.push(eval_message(&point, &message, main_rows, columns).unwrap());
+        }
+        for (index, coefficient) in coefficients.iter().enumerate() {
+            assert_eq!(*coefficient, eq_index(&point, index as u64, 2).unwrap());
+        }
+        assert_eq!(
+            coefficients.iter().filter(|value| !value.is_zero()).count(),
+            4
+        );
+        let base = eval_message(
+            &point,
+            &vec![vec![Fp3::from_u64(7); 2]; 2],
+            main_rows,
+            columns,
+        )
+        .unwrap();
+        let mask = Fp3::from_u64(11);
+        assert_eq!(base.add(&mask).sub(&base), mask);
+    }
+
+    #[test]
+    fn send_answer_is_the_real_index_mask_sample_plus_its_pad() {
+        let mask_code = build_code_plan(6, 32, 1).unwrap();
+        let plan = ClosureMaskPlan {
+            oracle: 9,
+            group: 1,
+            mask_code,
+            mask_rows: 1,
+            answers: 1,
+            openings: 1,
+            tree: RuntimeTreePlan {
+                tree_number: 9,
+                leaf_class: 1,
+                log_n: 6,
+                log_n_zk: 4,
+                parts: vec![RuntimeTreePart {
+                    main_symbols: 0,
+                    mask_symbols: 3,
+                }],
+                salt_bytes: 40,
+                run: Digest([0x61; 32]),
+                configuration: Digest([0x62; 32]),
+            },
+            positions: 1,
+            hiding: hp_entries(&psc_variables(4).unwrap()).unwrap(),
+            shown: 5,
+        };
+        let seed = SampleSeed {
+            z: vec![
+                Fp3::from_u64(3),
+                Fp3::from_u64(5),
+                Fp3::from_u64(7),
+                Fp3::from_u64(9),
+                Fp3::from_u64(11),
+            ],
+            beta: Fp3::from_u64(13),
+        };
+        let mut coefficients = Vec::new();
+        for column in 0..32usize {
+            let mut row = vec![Fp3::ZERO; 32];
+            row[column] = Fp3::ONE;
+            coefficients.push(closure_mask_answer(&plan, &[row], &seed).unwrap());
+        }
+        for (index, coefficient) in coefficients.iter().enumerate() {
+            if index + 1 == 32 {
+                assert_eq!(*coefficient, seed.beta);
+            } else {
+                assert_eq!(*coefficient, eq_index(&seed.z, index as u64, 5).unwrap());
+            }
+        }
+        assert!(!coefficients[31].is_zero());
+    }
+}
+
