@@ -410,6 +410,81 @@ mod tests {
         assert_eq!(joint_rank, random_rank);
     }
 
+    #[test]
+    fn joint_closure_mask_object_at_production_parameters() {
+        use zkie_engine::pcs::request::code::evaluate_ood_fp3;
+
+        let k = 23usize;
+        let positions = 16usize;
+        let entries = hp_entries(&psc_variables(k).unwrap()).unwrap(); // 49
+        let shown = 5usize;
+        let per_position = entries + shown; // 54
+        let rows = 2usize; // mask message rows
+        let ell = 512usize;
+        let tail_len = 256usize;
+        let q = 4usize; // opening positions per mask row
+        let total_rows = positions * per_position + rows * q;
+        let columns = rows * (ell + tail_len);
+        let plan = build_code_plan(17, 512, 256).unwrap();
+        let mut random = vec![vec![Fp3::ZERO; columns]; total_rows];
+        let slot_column = |position: usize, index: usize| {
+            let slot = position * per_position + index;
+            let row = slot / ell;
+            let place = slot % ell;
+            row * ell + place
+        };
+        for position in 0..positions {
+            let challenges = (0..=k)
+                .map(|index| {
+                    Fp3::from_u64((position as u64 * 97 + index as u64 * 13 + 5) % 1009)
+                })
+                .collect::<Vec<_>>();
+            let hiding = psc_hiding_map(k, &challenges);
+            for row in 0..entries {
+                for column in 0..entries {
+                    random[position * per_position + row][slot_column(position, column)] =
+                        hiding[row][column];
+                }
+            }
+            for index in 0..shown {
+                random[position * per_position + entries + index]
+                    [slot_column(position, entries + index)] = Fp3::ONE;
+            }
+        }
+        // The opening block uses the real one-symbol evaluation formula on
+        // unit messages and tails: two mask rows, four positions each.
+        let opening_base = positions * per_position;
+        let opening_positions = [0u64, 1, 2, 3];
+        for mask_row in 0..rows {
+            for (slot, opening) in opening_positions.iter().enumerate() {
+                let row = opening_base + mask_row * q + slot;
+                let z = Fp3::from_base(point(plan.log_n, *opening).unwrap());
+                for column in 0..ell {
+                    let mut message = vec![Fp3::ZERO; ell];
+                    message[column] = Fp3::ONE;
+                    let tail = vec![Fp3::ZERO; tail_len];
+                    random[row][mask_row * ell + column] =
+                        evaluate_ood_fp3(&plan, &message, &tail, z).unwrap();
+                }
+                for column in 0..tail_len {
+                    let message = vec![Fp3::ZERO; ell];
+                    let mut tail = vec![Fp3::ZERO; tail_len];
+                    tail[column] = Fp3::ONE;
+                    random[row][rows * ell + mask_row * tail_len + column] =
+                        evaluate_ood_fp3(&plan, &message, &tail, z).unwrap();
+                }
+            }
+        }
+        let mut secret = vec![vec![Fp3::ZERO; positions * per_position]; total_rows];
+        for row in 0..(positions * per_position) {
+            secret[row][row] = Fp3::ONE;
+        }
+        let random_rank = rank(random.clone());
+        let joint_rank = rank(joined(random, secret));
+        assert_eq!(random_rank, total_rows);
+        assert_eq!(joint_rank, random_rank);
+    }
+
     fn dot_mask_rank(chi: Fp3) -> (usize, usize) {
         let mut random = vec![vec![Fp3::ZERO; 32]; 17];
         let mut secret = vec![vec![Fp3::ZERO; 16]; 17];
