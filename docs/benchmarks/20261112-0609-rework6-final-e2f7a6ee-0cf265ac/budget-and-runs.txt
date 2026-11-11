@@ -1,0 +1,61 @@
+run1:
+192:ledger_events=143
+193:ledger_logical_openings=887
+194:ledger_unique_positions=887
+195:ledger_table_logical=603
+199:ledger_closure_logical=196
+202:ledger_table_reuse=0
+203:ledger_code_oracles=72
+204:ledger_min_tail_remaining=252
+205:ledger_total_tail_rank=558080
+206:ledger_total_tail_unique=879
+207:ledger_exhausted_tail_oracles=0
+208:hidden_prove_ms=355883
+209:hidden_proof_bytes=9939144
+210:hidden_verify_ms=50210
+211:hidden_own_fold_rounds=14
+215:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 642.08s
+226:	Maximum resident set size (kbytes): 169363776
+
+run2:
+186:ledger_events=143
+187:ledger_logical_openings=887
+188:ledger_unique_positions=887
+189:ledger_table_logical=603
+193:ledger_closure_logical=196
+196:ledger_table_reuse=0
+197:ledger_code_oracles=72
+198:ledger_min_tail_remaining=252
+199:ledger_total_tail_rank=558080
+200:ledger_total_tail_unique=879
+201:ledger_exhausted_tail_oracles=0
+202:hidden_prove_ms=357024
+203:hidden_proof_bytes=9939144
+204:hidden_verify_ms=50079
+205:hidden_own_fold_rounds=14
+209:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 642.78s
+220:	Maximum resident set size (kbytes): 169385776
+
+run3:
+186:ledger_events=143
+187:ledger_logical_openings=887
+188:ledger_unique_positions=887
+189:ledger_table_logical=603
+193:ledger_closure_logical=196
+196:ledger_table_reuse=0
+197:ledger_code_oracles=72
+198:ledger_min_tail_remaining=252
+199:ledger_total_tail_rank=558080
+200:ledger_total_tail_unique=879
+201:ledger_exhausted_tail_oracles=0
+202:hidden_prove_ms=354659
+203:hidden_proof_bytes=9939144
+204:hidden_verify_ms=50906
+205:hidden_own_fold_rounds=14
+209:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 641.55s
+220:	Maximum resident set size (kbytes): 169387412
+
+workspace:
+48
+passed=734
+ignored=17
