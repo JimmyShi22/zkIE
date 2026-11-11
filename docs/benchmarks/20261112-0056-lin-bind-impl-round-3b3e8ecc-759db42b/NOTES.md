@@ -26,9 +26,12 @@ absorbed transcript are the hard invariant.
 ## Validation basis
 
 This round touches implementation paths only. It does not modify seq512 logic or
-the five-case structure, so the routine verification is `seq16×3`; the five-case
-set was not run. The three no-profile runs after the final cluster and the
-instrumented profile are archived here.
+the five-case structure. `seq16×3` here means three no-profile reruns of the same
+GPT-2 formal fixture (`gpt2-seq16`), not three cases; only `gpt2-seq16` is covered.
+The five-case set was not run because no seq512 logic and no all-case structural
+path changed; the five-case set belongs to the full acceptance basis. The three
+no-profile runs after the final cluster and the instrumented profile are
+archived here. All GiB values in this note are KiB / 1048576.
 
 The test machine was shared during the parallel-scheduling cluster. The
 no-profile runs span 179,441 / 319,262 / 367,556 ms prove. The same-basis
@@ -37,8 +40,8 @@ not the fastest run. Both the representative and the idle rerun are recorded.
 CPU share rose from 117% to 254–271%, so the parallel gain is real rather than a
 clock or fixture change.
 
-The idle rerun peak RSS is 207,153,712 KiB, +215,232 KiB (+0.104%) over the
-206,938,480 KiB preceding value. This is inside the agreed 0.5% noise band and
+The idle rerun peak RSS is 207,153,712 KiB (197.6 GiB), +215,232 KiB (+0.104%)
+over the 206,938,480 KiB (197.4 GiB) preceding value. This is inside the agreed 0.5% noise band and
 is recorded as noise, not as a memory increase. No proof byte changed in any
 cluster: 9,939,144 B, sha256
 `f8f512c0e67407210f19dd92d038fd4c71a6bac3a12e1166cd4825d9413215f5`.
@@ -64,8 +67,12 @@ cluster: 9,939,144 B, sha256
 | final instrumented profile | 355,164 | 50,589 | 640.72 | 170,170,260 | 9,939,144 |
 
 The fresh worktree at `bdc2e7d8` predates the exact-closure commits, so its
-proof is 8,973,672 B. It confirms that the pre-closure baseline run is not a
-worktree artifact; it is not used as a proof-content-equivalent cluster gate.
+proof is 8,973,672 B, not the closed 9,939,144 B. The closure adds the exact
+per-unit range relation, the hidden argmax/winner relation and the output
+binding; the 36.5 s baseline therefore compares a smaller proof and a smaller
+relation. It confirms only that the pre-closure baseline is not a worktree
+artifact; the ratio to the closure-bearing 355 s indicates magnitude, not a
+controlled speedup. It is not used as a proof-content-equivalent cluster gate.
 All cluster comparisons use the immediately preceding run of the same proof
 content.
 
@@ -91,9 +98,10 @@ Compared with the pre-round profile (`ef46c560`): prove 940,640 → 355,164 ms
 - The runtime-tree cluster saved 420,283 ms, more than the 317.3 s predicted for
   tree reuse. The excess is attributed to copy removal and allocator churn in
   the same commit; the mechanism was checked as copy elimination.
-- The verifier-side peak-memory drop (207.1 → 169.4 GiB across the two after
-  runs) includes machine-load differences and the duplicate-proof-state
-  removal; it is not presented as a single-factor attribution.
+- The verifier-side peak-memory drop (207,138,524 → 169,393,348 KiB, i.e.
+  197.5 → 161.5 GiB across the two after runs) includes machine-load
+  differences and the duplicate-proof-state removal; it is not presented as a
+  single-factor attribution.
 - The parallel-scheduling cluster used 179 / 319 / 367 s runs on a shared
   machine. The representative choice and the idle rerun are stated above; no
   best-run number is used as the cluster result.

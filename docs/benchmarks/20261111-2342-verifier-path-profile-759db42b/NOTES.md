@@ -41,8 +41,9 @@ Positive hidden verify (52,635 ms), nested scopes overlap:
 | verify.second.proximity | 19,430 |
 | verify.hidden_lin | 52,631 |
 
-The verifier starts at 87,214,432 KiB resident and raises the process to its
-173.7 GiB high-water mark; the second-stage rows reach 137.2 GiB resident.
+The verifier starts at 87,214,432 KiB (83.2 GiB) resident and raises the
+process to its 197.6 GiB high-water mark (207,138,524 KiB / 1048576); the
+second-stage rows reach 137.2 GiB resident.
 
 Negative replay section (144,613 ms), ten verifier entries (nine full):
 
