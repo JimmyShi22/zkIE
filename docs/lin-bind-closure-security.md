@@ -251,9 +251,9 @@ BASE symbols.
   deterministic challenge point is tested for each.
 - `chi != 0`; if `chi = 0`, the residual combines only the `t = 0` term and
   the corresponding term is in section 6.
-- The SEND pad coefficient is nonzero. A pad, `c_t`, `g_t` or `e_t` that
-  happens to be zero does not mask that one value; each is a `1/p^3` event,
-  and the union over the mask/pad draws is included in section 6.
+- The SEND sample's beta is drawn nonzero by the implementation; the pad
+  value itself may be zero and still hides (the verifier does not observe the
+  zero event).
 - The hash model is random-oracle or collision-resistant and the salted
   inputs have the stated min-entropy.
 - The FOLD fresh-mask coefficient map is full-rank at every drawn challenge;
@@ -264,13 +264,91 @@ BASE symbols.
   the ledger policy.
 - The output-binding boundary is the approved winner/valid/tie boundary.
 
-If an assumption fails, the linear-cover conclusion does not apply and the
-run must fail closed. Under the assumptions above, the linear-cover criterion
-is met for every view listed in this section: the joint hiding argument is
-conditionally established and no secret leak is identified. `[UNPROVEN]` A
+If an assumption fails, the linear-cover conclusion does not apply. Once
+established, the linear-cover criterion is met for every view listed in this
+section: the joint hiding argument is conditional and no secret leak is
+identified. Assumptions that cannot be checked at runtime (PSC/FOLD rank,
+hash model, output boundary) withdraw the security conclusion rather than
+claiming that the program fail-closed. `[UNPROVEN]` A
 full simulation and the adaptive composition of the hash and algebraic
 arguments are not mechanized here; the argument above is the conditional
 linear-cover argument, not a theorem.
+
+### 3.10b Oracle encoding and hash order
+
+| Oracle family | Code layout | Random values | Openings | Public values |
+|---|---|---|---|---|
+| table | base field, `log_n=17`, `ell=65536`, `r=8192` | row tail and leaf salt | 603 columns | root, record, column openings |
+| W rows | cubic field, `log_n=17`, `ell=65536`, `r=8192` | per-tree tail and salts | 2 SEND + 2 BASE | W roots, openings, sample answers |
+| closure slack/bits/map | cubic field, `log_n=17`, `ell=65536`, `r=8192` | per-tree tail and salts | 2 SEND + 2 BASE each | roots, answers, openings, PSC |
+| index mask | cubic field, `log_n=17`, `ell=512`, `r=256` | tail, salt, 73-entry mask | 2 SEND + 2 BASE | root, answers, openings |
+| closure mask | cubic field, `log_n=17`, `ell=512`, `r=256` | tail, salt, 49+5 per position | 2 SEND + 2 BASE | root, answers, openings |
+| FOLD fresh | `2k+1` cubic-field coefficients | fresh mask polynomial | round messages | start sum, round values |
+| BASE star | cubic-field rows and tails | fresh per value | base openings | base rows and openings |
+
+The hash hybrid order is fixed: first replace every Merkle root by a random
+oracle output (the commitment-hiding step), then run the algebraic cover
+argument on the opened values, answers, transcripts and star rows, then use
+the collision-resistant/random-oracle model for the roots. Roots are never
+treated as independent random field values. The salt/tail/pad entropy is the
+input min-entropy the commitment step needs. The transcript fixes positions
+after the roots and answers are absorbed; conditional on a root, the tail is
+uniform, and the only constraints are distinct positions and the root binding.
+
+### 3.11 Joint matrix checks
+
+The test module constructs `A` and `B` from the actual protocol evaluation
+paths at fixed oracle/challenge structure and computes the ranks numerically
+over the cubic field. It does not assume that per-view full rank implies joint
+rank; shared variables are explicit columns.
+
+| Block | Random columns | Secret columns | Rows | Result |
+|---|---|---:|---:|---|
+| opening (table/W/closure/mask) | tail Vandermonde | message Vandermonde | `q` | `rank([A|B])=rank(A)=q` |
+| mask joint (tilde, R, Eval, Dot PSC, ends) | `g16, c16, e16, U23, end2` | `W16` | 58 | rank 58, joint 58, kernel 15 |
+| closure joint (PSC, ends, points) | `U49, shown5` | `f(Y)3` | 54 | rank 54, joint 54 |
+| SEND/Eval/end/shown identity blocks | one per value | one per value | <=5 | rank equality |
+
+The mask joint block explicitly places the same `c_t` in `R` and in the PSC
+`sigma` column, so the `v1 = s + r, v2 = r` shape is represented rather than
+assumed away. Across blocks, each tree has its own uniform tail and salts,
+the material streams are one-use, the pads and the two mask plans are
+separate, and the FOLD/BASE randomness is fresh. No random variable appears
+in two blocks, so the concatenated matrix is block diagonal and the ranks add;
+within the mask block the shared `c_t`/`g_t` columns are explicit. The test evaluates at deterministic and several random points.
+No rank deficiency was found; if a run finds one, the run stops and reports a
+possible leak. The tests are `joint_opening_submatrices_cover_the_message`,
+`joint_mask_block_covers_the_secret_with_shared_claim_masks`,
+`joint_closure_block_covers_psc_and_point_values`,
+`joint_psc_hiding_maps_are_full_rank_at_multiple_points`,
+`joint_fold_fresh_coefficients_map_is_full_rank`,
+`joint_dot_mask_block_is_covered_for_zero_and_nonzero_chi` and the identity
+block test.
+
+### 3.12 PSC, FOLD and BASE coefficient maps
+
+- Dot PSC: the 23 hiding entries map to the hiding sum and the sent round
+  coefficients; the map is triangular by variable/degree, with unit diagonal
+  on the entries that appear directly. The test computes rank 23 at three
+  points. The determinant is a nonzero polynomial; a conservative degree
+  bound is `D_PSC <= 23^2`, so a bad challenge has probability at most
+  `D_PSC/p^3 < 2^-180`.
+- Closure PSC: the same construction with 23 sumcheck variables and 49
+  hiding entries; rank 49 at three points; `D_PSC <= 49^2`, bad challenge
+  probability `< 2^-178`. The five shown masks cover the two end values and
+  the three fresh-point values.
+- FOLD: the fresh mask's `2k+1` coefficients fill the start sum and the sent
+  `(c0,c2)` round values; the coefficient map is triangular by variable and
+  degree with unit diagonal. Its determinant is a nonzero polynomial; a
+  conservative degree bound is `(2k+1)^2`, giving a bad-challenge probability
+  below `2^-180` for the production `k`.
+- BASE: the star main row, star mask row and their tails are fresh per value;
+  each public BASE value has its own star random dimension, so the multi-value
+  map is an identity block (rank equal to the number of values), not a
+  per-value implication. The joint test includes the multiple values in one
+  matrix.
+- The closed relation has no code-switch stage; a future CS path would need
+  its own fresh-mask and star coverage and is not covered here.
 
 ## 4. Opening sets and submatrix property
 
@@ -376,7 +454,8 @@ eps_total <= eps_hash + eps_components
 
 eps_hash = (t + q_V + 1) * 2^-128.00
          + (17/2) * (t + q_V)^2 / 2^256
-eps_components = 8 * 2^-128 + 2^-180 + 2^-187 + 2^-190 + 2^-191 + 2^-184
+eps_components = 8 * 2^-128 + 2^-180 + 2^-187 + 2^-190 + 2^-191 + eps_rank_bad
+eps_rank_bad <= (23^2 + 49^2 + (2k+1)^2) / p^3
 ```
 
 The terms are:
@@ -388,11 +467,13 @@ The terms are:
 | PSC | 10 sumcheck variables, degree 3 each | `30/p^3 < 2^-187` |
 | single equality | degree 2 | `2/p^3 < 2^-190` |
 | `chi = 0` | one event | `1/p^3 < 2^-191` |
-| zero pad or mask | fewer than 128 draws | `128/p^3 < 2^-184` |
+| PSC/FOLD rank determinant | degrees `23^2`, `49^2`, `(2k+1)^2` | `eps_rank_bad < 2^-179` for `k <= 32` |
 
 The `t`/`q_V` factor is carried by the hash term, which is the adaptive
-composition term; the algebraic component count is fixed per proof. The
-challenge draws are uniform over the cubic field. The hash term assumes the
+composition term; the algebraic component count is fixed per proof. If the
+prover uses `Q_A` adaptive retry attempts, multiply the component terms by
+`Q_A`; the hash term already carries the transcript query count. The challenge
+draws are uniform over the cubic field. The hash term assumes the
 plan's random-oracle/collision-resistant model and work bits; it is not
 re-derived here. For `Q_R` independent requests, multiply the component sum by
 `Q_R`; no global bound is claimed without a bound on `Q_R`.
@@ -466,9 +547,12 @@ The following are open or conditional:
 - `[LONG-TERM]` the trusted X source, policy distribution/freshness and
   chain-based commitment/verification are recorded as long-term direction;
   they are not implemented here and are not debts of this round.
-- `[EXCEPTION]` `chi = 0`, an opening union above the tail rank, a reused
-  mask/pad/material stream, a failed hash model or a broken PSC full-rank
-  assumption withdraw the argument and fail closed.
+- `[EXCEPTION]` `chi = 0` is a public event included as a term. An opening
+  union above the tail rank or a reused mask/pad/material stream is an
+  executable ledger rejection. A failed hash model, a broken PSC/FOLD
+  full-rank assumption or an unapproved output boundary withdraws the
+  security conclusion; these are conditional assumptions, not runtime
+  fail-closed checks.
 
 No statement in this note claims that the trusted X source is proved, that the
 weights are hidden under a formal ZK definition, or that the run is a

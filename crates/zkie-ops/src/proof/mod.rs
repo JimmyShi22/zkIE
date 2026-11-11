@@ -22,3 +22,6 @@ pub mod psc;
 pub mod relations;
 pub mod session_baseline;
 pub mod model_commitment;
+
+#[cfg(test)]
+mod joint_view_tests;

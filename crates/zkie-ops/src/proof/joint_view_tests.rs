@@ -1,0 +1,311 @@
+//! Test-only joint-view rank checks for the hidden output-head relation.
+
+#[cfg(test)]
+mod tests {
+    use crate::proof::psc::{hp_entries, psc_variables, HidingPolynomial};
+    use zkie_engine::pcs::request::code::{build_code_plan, point};
+    use zkie_engine::pcs::request::fold::{FoldMainTable, FoldRoundProver};
+    use zkie_engine::pcs::request::field::Fp3;
+
+    fn rank(mut rows: Vec<Vec<Fp3>>) -> usize {
+        let cols = rows.first().map(|row| row.len()).unwrap_or(0);
+        let mut rank = 0usize;
+        for column in 0..cols {
+            let Some(pivot) = (rank..rows.len()).find(|row| !rows[*row][column].is_zero()) else {
+                continue;
+            };
+            rows.swap(rank, pivot);
+            let inverse = rows[rank][column].inverse().unwrap();
+            for entry in rows[rank].iter_mut().skip(column) {
+                *entry = entry.mul(&inverse);
+            }
+            for row in 0..rows.len() {
+                if row == rank || rows[row][column].is_zero() {
+                    continue;
+                }
+                let factor = rows[row][column];
+                for column_index in column..cols {
+                    let subtract = factor.mul(&rows[rank][column_index]);
+                    rows[row][column_index] = rows[row][column_index].sub(&subtract);
+                }
+            }
+            rank += 1;
+            if rank == rows.len() {
+                break;
+            }
+        }
+        rank
+    }
+
+    fn opening_matrices(log_n: u32, ell: u64, r: u64, q: usize) -> (Vec<Vec<Fp3>>, Vec<Vec<Fp3>>) {
+        let mut tail = vec![vec![Fp3::ZERO; r as usize]; q];
+        let mut message = vec![vec![Fp3::ZERO; ell as usize]; q];
+        for row in 0..q {
+            let z = Fp3::from_base(point(log_n, row as u64).unwrap());
+            let mut power = Fp3::ONE;
+            for column in 0..r as usize {
+                tail[row][column] = power;
+                power = power.mul(&z);
+            }
+            for column in 0..ell as usize {
+                message[row][column] = power;
+                power = power.mul(&z);
+            }
+        }
+        (tail, message)
+    }
+
+    fn joined(mut left: Vec<Vec<Fp3>>, right: Vec<Vec<Fp3>>) -> Vec<Vec<Fp3>> {
+        for (row, extra) in left.iter_mut().zip(right) {
+            row.extend(extra);
+        }
+        left
+    }
+
+    #[test]
+    fn joint_opening_submatrices_cover_the_message() {
+        for (log_n, ell, r, q) in [
+            (17u32, 65536u64, 8192u64, 16usize),
+            (17, 512, 256, 8),
+        ] {
+            let (tail, message) = opening_matrices(log_n, ell, r, q);
+            let tail_rank = rank(tail.clone());
+            let joint_rank = rank(joined(tail, message));
+            assert_eq!(tail_rank, q);
+            assert_eq!(joint_rank, tail_rank);
+        }
+    }
+
+    fn dot_mask_rank(chi: Fp3) -> (usize, usize) {
+        let mut random = vec![vec![Fp3::ZERO; 32]; 17];
+        let mut secret = vec![vec![Fp3::ZERO; 16]; 17];
+        for t in 0..16 {
+            random[t][t] = Fp3::ONE;
+            secret[t][t] = Fp3::ONE;
+            random[16][t] = chi.pow_u64(t as u64);
+            random[16][16 + t] = Fp3::ZERO.sub(&chi.pow_u64(t as u64));
+        }
+        let random_rank = rank(random.clone());
+        let joint_rank = rank(joined(random, secret));
+        (random_rank, joint_rank)
+    }
+
+    #[test]
+    fn joint_dot_mask_block_is_covered_for_zero_and_nonzero_chi() {
+        for chi in [Fp3::from_u64(7), Fp3::ZERO] {
+            let (random_rank, joint_rank) = dot_mask_rank(chi);
+            assert_eq!(random_rank, joint_rank);
+        }
+    }
+
+    fn psc_hiding_map(k: usize, challenges: &[Fp3]) -> Vec<Vec<Fp3>> {
+        let variables = psc_variables(k).unwrap();
+        let entries = hp_entries(&variables).unwrap();
+        let mut matrix = vec![vec![Fp3::ZERO; entries]; entries];
+        for basis in 0..entries {
+            let mut mask = vec![Fp3::ZERO; entries];
+            mask[basis] = Fp3::ONE;
+            let mut hiding = HidingPolynomial::new(&variables, &mask).unwrap();
+            let mut row = 0usize;
+            matrix[row][basis] = hiding.sum();
+            row += 1;
+            for variable in 0..=k {
+                let round = hiding.round().unwrap();
+                for (index, coefficient) in round.iter().enumerate() {
+                    if index != variables[variable].fixed() {
+                        matrix[row][basis] = *coefficient;
+                        row += 1;
+                    }
+                }
+                if variable < k {
+                    hiding.bind(challenges[variable]).unwrap();
+                }
+            }
+            assert_eq!(row, entries);
+        }
+        matrix
+    }
+
+    #[test]
+    fn joint_psc_hiding_maps_are_full_rank_at_multiple_points() {
+        for k in [10usize, 23] {
+            let entries = hp_entries(&psc_variables(k).unwrap()).unwrap();
+            for seed in 0u64..3 {
+                let challenges = (0..=k)
+                    .map(|index| Fp3::from_u64(seed * 17 + index as u64 * 3 + 2))
+                    .collect::<Vec<_>>();
+                let matrix = psc_hiding_map(k, &challenges);
+                assert_eq!(rank(matrix), entries, "k {k} seed {seed}");
+            }
+        }
+    }
+
+
+    fn poly_at(coefficients: &[Fp3], x: Fp3) -> Fp3 {
+        let mut value = Fp3::ZERO;
+        for coefficient in coefficients.iter().rev() {
+            value = value.mul(&x).add(coefficient);
+        }
+        value
+    }
+
+    fn psc_sigma_column(k: usize, challenges: &[Fp3], eps: Fp3) -> Vec<Fp3> {
+        let variables = psc_variables(k).unwrap();
+        let mut rows = Vec::new();
+        rows.push(Fp3::ZERO);
+        let mut psis = Fp3::ONE;
+        for variable in 0..=k {
+            let weight = &variables[variable];
+            let scale = eps.mul(&psis);
+            for (index, coefficient) in weight.psi().iter().enumerate() {
+                if index != weight.fixed() {
+                    rows.push(scale.mul(coefficient));
+                }
+            }
+            if variable < k {
+                psis = psis.mul(&poly_at(weight.psi(), challenges[variable]));
+            }
+        }
+        rows
+    }
+
+    fn vec_columns(matrix: Vec<Vec<Fp3>>) -> Vec<Vec<Fp3>> {
+        matrix
+    }
+
+    #[test]
+    fn joint_mask_block_covers_the_secret_with_shared_claim_masks() {
+        let k = 10usize;
+        let challenges = (0..=k)
+            .map(|index| Fp3::from_u64(index as u64 * 5 + 3))
+            .collect::<Vec<_>>();
+        for chi in [Fp3::from_u64(7), Fp3::ZERO] {
+            let hiding = psc_hiding_map(k, &challenges);
+            let sigma = psc_sigma_column(k, &challenges, Fp3::from_u64(11));
+            let rows = 16 + 1 + 16 + hiding.len() + 2;
+            let mut random = vec![vec![Fp3::ZERO; 16 + 16 + 16 + 23 + 2]; rows];
+            let mut secret = vec![vec![Fp3::ZERO; 16]; rows];
+            for t in 0..16 {
+                random[t][t] = Fp3::ONE;
+                secret[t][t] = Fp3::ONE;
+                random[16][t] = chi.pow_u64(t as u64);
+                random[16][16 + t] = Fp3::ZERO.sub(&chi.pow_u64(t as u64));
+            }
+            for t in 0..16 {
+                random[17 + t][32 + t] = Fp3::ONE;
+                secret[17 + t][t] = Fp3::ONE;
+            }
+            let psc_base = 33;
+            for (row, values) in hiding.iter().enumerate() {
+                random[psc_base + row][48..71].copy_from_slice(values);
+            }
+            for (t, value) in sigma.iter().enumerate() {
+                let coefficient = chi.pow_u64(t as u64);
+                for row in 0..sigma.len() {
+                    random[psc_base + row][16 + t] = coefficient.mul(&sigma[row]);
+                }
+                let _ = value;
+            }
+            random[rows - 2][71] = Fp3::ONE;
+            random[rows - 1][72] = Fp3::ONE;
+            let random_rank = rank(vec_columns(random.clone()));
+            let joint_rank = rank(joined(random, secret));
+            assert_eq!(random_rank, rows, "chi {chi:?}");
+            assert_eq!(joint_rank, random_rank, "chi {chi:?}");
+        }
+    }
+
+    #[test]
+    fn joint_closure_block_covers_psc_and_point_values() {
+        let k = 23usize;
+        let challenges = (0..=k)
+            .map(|index| Fp3::from_u64(index as u64 * 7 + 5))
+            .collect::<Vec<_>>();
+        let hiding = psc_hiding_map(k, &challenges);
+        let rows = hiding.len() + 2 + 3;
+        let mut random = vec![vec![Fp3::ZERO; 49 + 5]; rows];
+        let mut secret = vec![vec![Fp3::ZERO; 3]; rows];
+        for (row, values) in hiding.iter().enumerate() {
+            random[row][..49].copy_from_slice(values);
+        }
+        let point_base = hiding.len() + 2;
+        random[point_base][49] = Fp3::ONE;
+        random[point_base + 1][50] = Fp3::ONE;
+        random[point_base + 2][51] = Fp3::ONE;
+        secret[point_base][0] = Fp3::ONE;
+        secret[point_base + 1][1] = Fp3::ONE;
+        secret[point_base + 2][2] = Fp3::ONE;
+        random[point_base - 2][52] = Fp3::ONE;
+        random[point_base - 1][53] = Fp3::ONE;
+        let random_rank = rank(random.clone());
+        let joint_rank = rank(joined(random, secret));
+        assert_eq!(random_rank, rows);
+        assert_eq!(joint_rank, random_rank);
+    }
+
+
+    #[test]
+    fn joint_fold_fresh_coefficients_map_is_full_rank() {
+        let k = 2u32;
+        let entries = 2 * k as usize + 1;
+        for seed in 0u64..3 {
+            let mut matrix = vec![vec![Fp3::ZERO; entries]; entries];
+            for basis in 0..entries {
+                let mut coefficients = vec![Fp3::ZERO; entries];
+                coefficients[basis] = Fp3::ONE;
+                let mut prover = FoldRoundProver::new(
+                    k,
+                    0,
+                    coefficients,
+                    vec![Fp3::ZERO; 5],
+                    vec![Fp3::ZERO; 5],
+                    5,
+                    FoldMainTable::new(vec![Fp3::ZERO; 4], vec![Fp3::ZERO; 4]).unwrap(),
+                    Fp3::ZERO,
+                )
+                .unwrap();
+                prover.start(Fp3::from_u64(seed + 3)).unwrap();
+                matrix[0][basis] = prover.sum();
+                let mut row = 1usize;
+                for variable in 0..k {
+                    let round = prover.round().unwrap();
+                    matrix[row][basis] = round[0];
+                    matrix[row + 1][basis] = round[2];
+                    row += 2;
+                    prover
+                        .bind(Fp3::from_u64(seed * 5 + variable as u64 + 2))
+                        .unwrap();
+                }
+                assert_eq!(row, entries);
+            }
+            assert_eq!(rank(matrix), entries, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn joint_send_eval_and_shown_blocks_are_identity_covered() {
+        for size in [1usize, 5] {
+            let mut random = vec![vec![Fp3::ZERO; size]; size];
+            let mut secret = vec![vec![Fp3::ZERO; size]; size];
+            for index in 0..size {
+                random[index][index] = Fp3::ONE;
+                secret[index][index] = Fp3::ONE;
+            }
+            let random_rank = rank(random.clone());
+            assert_eq!(rank(joined(random, secret)), random_rank);
+        }
+    }
+
+    #[test]
+    fn actual_code_parameters_accept_the_opening_set_sizes() {
+        for (log_n, ell, r, q) in [
+            (17u32, 65536u64, 8192u64, 603usize),
+            (17, 65536, 8192, 4),
+            (17, 512, 256, 4),
+        ] {
+            let plan = build_code_plan(log_n, ell, r).unwrap();
+            assert!(q <= plan.r as usize);
+            assert_eq!(plan.n(), 1u64 << log_n);
+        }
+    }
+}

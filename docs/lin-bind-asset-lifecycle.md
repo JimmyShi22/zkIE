@@ -113,6 +113,9 @@ profile is a cross-check, not the proof.
 
 ## Boundary
 
+This inventory supports the listed GPT-2 `gpt2-seq16` fixture path only; it is
+not extrapolated to other models, sequence lengths or production entries.
+
 `[FACT]` No code path in the hidden prove entry allocates a `Vec` of
 `element_count` entries or a buffer of 268,435,456 B for the asset.
 `[ASSUMPTION]` The OS may keep mmap pages of the read-only asset in the page
