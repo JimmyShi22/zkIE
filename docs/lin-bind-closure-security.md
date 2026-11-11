@@ -290,7 +290,7 @@ linear-cover argument, not a theorem.
 
 | Oracle family | Code layout | Random values | Openings | Public values |
 |---|---|---|---|---|
-| table | base field, `log_n=17`, `ell=65536`, `r=8192` | row tail and leaf salt | 603 columns | root, record, column openings |
+| table | base field, `log_n=17`, `ell=65539` (65536 columns plus 3 padding symbols), `r=8192` | row tail and leaf salt | 603 columns | root, record, column openings |
 | W rows | cubic field, `log_n=17`, `ell=65536`, `r=8192` | per-tree tail and salts | 2 SEND + 2 BASE | W roots, openings, sample answers |
 | closure slack/bits/map | cubic field, `log_n=17`, `ell=65536`, `r=8192` | per-tree tail and salts | 2 SEND + 2 BASE each | roots, answers, openings, PSC |
 | index mask | cubic field, `log_n=17`, `ell=512`, `r=256` | tail, salt, 73-entry mask | 2 SEND + 2 BASE | root, answers, openings |
