@@ -805,6 +805,18 @@ pub struct LedgerState {
     pub events: Vec<LedgerEvent>,
 }
 
+/// The tail-hiding budget over every code-bearing oracle. `min_remaining` is
+/// the smallest `rank - union`; zero means at least one oracle has no hiding
+/// dimension left and the run must fail closed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OpeningBudgetSummary {
+    pub code_oracles: u64,
+    pub min_remaining: u64,
+    pub total_rank: u64,
+    pub total_unique: u64,
+    pub exhausted: u64,
+}
+
 impl LedgerState {
     pub fn record(&self, key: LedgerKey) -> Option<&CommitmentRecord> {
         self.commitments.get(&key)
@@ -860,6 +872,31 @@ impl LedgerState {
                 .checked_add(record.table_reuse)
                 .ok_or(Error::ResourceLimit)
         })
+    }
+
+    /// The tail-hiding budget over every code-bearing oracle.
+    pub fn opening_budget_summary(&self) -> OpeningBudgetSummary {
+        let mut summary = OpeningBudgetSummary {
+            min_remaining: u64::MAX,
+            ..OpeningBudgetSummary::default()
+        };
+        for record in self.oracles.values() {
+            if record.tail_rank == 0 {
+                continue;
+            }
+            let remaining = record.remaining_tail();
+            summary.code_oracles = summary.code_oracles.saturating_add(1);
+            summary.total_rank = summary.total_rank.saturating_add(record.tail_rank);
+            summary.total_unique = summary.total_unique.saturating_add(record.unique_positions);
+            summary.min_remaining = summary.min_remaining.min(remaining);
+            if remaining == 0 {
+                summary.exhausted = summary.exhausted.saturating_add(1);
+            }
+        }
+        if summary.code_oracles == 0 {
+            summary.min_remaining = 0;
+        }
+        summary
     }
 
     /// The opening totals of one oracle kind.

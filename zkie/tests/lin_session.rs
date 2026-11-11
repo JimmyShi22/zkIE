@@ -2095,6 +2095,12 @@ fn selected_gpt2_output_head_request_session() {
             "ledger_table_reuse={}",
             ledger_state.total_table_reuse().expect("table reuse")
         );
+        let budget = ledger_state.opening_budget_summary();
+        println!("ledger_code_oracles={}", budget.code_oracles);
+        println!("ledger_min_tail_remaining={}", budget.min_remaining);
+        println!("ledger_total_tail_rank={}", budget.total_rank);
+        println!("ledger_total_tail_unique={}", budget.total_unique);
+        println!("ledger_exhausted_tail_oracles={}", budget.exhausted);
         println!("hidden_prove_ms={hidden_prove_ms}");
         let mut hidden_encode_profile =
             zkie_engine::profile::Scope::new("harness.hidden_proof_encode");
