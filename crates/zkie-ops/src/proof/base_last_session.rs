@@ -1006,6 +1006,58 @@ mod tests {
     }
 
     #[test]
+    fn star_values_are_fresh_one_time_pads_for_the_target_and_rows() {
+        let rows = rows();
+        let plan = star_plan();
+        let salt_values = salts(plan.columns() as usize, 0x72);
+        let first = LastBaseProver::new(
+            rows.clone(),
+            plan.clone(),
+            &salt_values,
+            &LastBaseRandomness::Fixed(Digest([0x33; 32])),
+        )
+        .unwrap();
+        let second = LastBaseProver::new(
+            rows.clone(),
+            plan.clone(),
+            &salt_values,
+            &LastBaseRandomness::Fixed(Digest([0x44; 32])),
+        )
+        .unwrap();
+        assert_ne!(first.star().main, second.star().main);
+        assert_ne!(first.star().mask, second.star().mask);
+        assert_ne!(first.star().main_tail, second.star().main_tail);
+        assert_ne!(first.star().mask_tail, second.star().mask_tail);
+        let lambda = Fp3::from_u64(7);
+        let prepared = first.base_rows(lambda).unwrap();
+        let target = dot(&rows.claim, &first.star().main)
+            .unwrap()
+            .add(&dot(&rows.mask_claims[0], &first.star().mask).unwrap());
+        assert_eq!(prepared.target_star, target);
+        assert_eq!(prepared.target_star, first.messages().unwrap().target_star);
+        for (index, value) in prepared.main_prime.iter().enumerate() {
+            assert_eq!(
+                *value,
+                first.star().main[index].add(&lambda.mul(&rows.main[index]))
+            );
+        }
+        for (index, value) in prepared.mask_prime.iter().enumerate() {
+            assert_eq!(
+                *value,
+                first.star().mask[index].add(&lambda.mul(&rows.masks[0][index]))
+            );
+        }
+        assert_eq!(
+            prepared.main_tail_prime[0],
+            first.star().main_tail[0].add(&lambda.mul(&rows.main_tail[0]))
+        );
+        assert_eq!(
+            prepared.mask_tail_prime[0],
+            first.star().mask_tail[0].add(&lambda.mul(&rows.mask_tails[0][0]))
+        );
+    }
+
+    #[test]
     fn the_last_base_rejects_a_second_masking_oracle() {
         let rows = rows();
         let oracle = final_oracle(&rows);
