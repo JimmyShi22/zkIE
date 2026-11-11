@@ -199,6 +199,7 @@
 
 use std::sync::Arc;
 
+use rayon::prelude::*;
 use zkie_core::common::codec::DecodeLimits;
 use zkie_core::common::field::PrimeCharacteristicRing;
 use zkie_core::error::{Error, Result};
@@ -2163,17 +2164,39 @@ pub fn derive_w_rows(
         if base + factor > columns {
             return Err(Error::ShapeMismatch);
         }
-        for (position, g) in weights.iter().enumerate() {
-            for low in 0..factor {
-                let mut sum = Fp3::ZERO;
-                for (row, weight) in g.iter().enumerate() {
-                    let entry = low + (row << plan.k_lo);
-                    let value = *message.get(entry).ok_or(Error::ShapeMismatch)?;
-                    if !weight.is_zero() {
-                        sum = sum.add(&weight.mul(&Fp3::from_base(value)));
+        // The table row is read in order; the independent position rows are
+        // derived in parallel. Each output cell keeps its serial sum order.
+        if positions > 1 && (factor as u64).saturating_mul(plan.matrix_rows) >= 4096 {
+            w.par_iter_mut()
+                .enumerate()
+                .try_for_each(|(position, w_row)| -> Result<()> {
+                    let g = &weights[position];
+                    for low in 0..factor {
+                        let mut sum = Fp3::ZERO;
+                        for (row, weight) in g.iter().enumerate() {
+                            let entry = low + (row << plan.k_lo);
+                            let value = *message.get(entry).ok_or(Error::ShapeMismatch)?;
+                            if !weight.is_zero() {
+                                sum = sum.add(&weight.mul(&Fp3::from_base(value)));
+                            }
+                        }
+                        w_row[base + low] = sum;
                     }
+                    Ok(())
+                })?;
+        } else {
+            for (position, g) in weights.iter().enumerate() {
+                for low in 0..factor {
+                    let mut sum = Fp3::ZERO;
+                    for (row, weight) in g.iter().enumerate() {
+                        let entry = low + (row << plan.k_lo);
+                        let value = *message.get(entry).ok_or(Error::ShapeMismatch)?;
+                        if !weight.is_zero() {
+                            sum = sum.add(&weight.mul(&Fp3::from_base(value)));
+                        }
+                    }
+                    w[position][base + low] = sum;
                 }
-                w[position][base + low] = sum;
             }
         }
     }
@@ -2887,10 +2910,11 @@ pub fn prove_hidden_send(
         index_mask_opening = Some(opening);
     }
     let positions = draw_positions(&mut chain, plan)?;
-    let mut openings = Vec::with_capacity(positions.len());
-    for (position, list) in positions.iter().enumerate() {
-        openings.push(witness.tree(position as u32)?.open(list)?);
-    }
+    let openings = zkie_engine::scheduling::try_map_range_bounded(
+        positions.len(),
+        zkie_engine::scheduling::DEFAULT_UNITS_IN_FLIGHT,
+        |position| witness.tree(position as u32)?.open(&positions[position]),
+    )?;
     let psi = draw_psi(&mut chain, plan)?;
     let mut eval_targets = witness.eval_values(&psi)?;
     if let (Some(index), Some(mask_witness)) = (&plan.index_mask, &witness.index_mask) {
@@ -3896,15 +3920,17 @@ fn open_value_group_openings(
     {
         return Err(Error::ShapeMismatch);
     }
-    let mut openings = Vec::with_capacity(positions.len());
-    for (position, list) in positions.iter().enumerate() {
-        let tree = trees.get(position).ok_or(Error::ShapeMismatch)?;
-        if tree.plan() != &shape.tree_plan(position as u32)? {
-            return Err(Error::StatementMismatch);
-        }
-        openings.push(tree.open(list)?);
-    }
-    Ok(openings)
+    zkie_engine::scheduling::try_map_range_bounded(
+        positions.len(),
+        zkie_engine::scheduling::DEFAULT_UNITS_IN_FLIGHT,
+        |position| {
+            let tree = trees.get(position).ok_or(Error::ShapeMismatch)?;
+            if tree.plan() != &shape.tree_plan(position as u32)? {
+                return Err(Error::StatementMismatch);
+            }
+            tree.open(&positions[position])
+        },
+    )
 }
 
 /// The compact mask entries of every position, hiding entries first and the
@@ -4959,6 +4985,7 @@ fn build_group_table(
         return Err(Error::StatementMismatch);
     }
     let firsts = fold_member_firsts(layout, FoldPart::Main)?;
+    let mut placed = Vec::new();
     for (index, (fold_member, bat_member)) in
         layout.members.iter().zip(&bat_layout.members).enumerate()
     {
@@ -4983,20 +5010,39 @@ fn build_group_table(
             }
             continue;
         }
-        let first = firsts[index].ok_or(Error::StatementMismatch)?;
-        for (row, message) in member.message.iter().enumerate() {
-            for (place, value) in message.iter().enumerate() {
-                let at = first
-                    .checked_add(row as u64)
-                    .and_then(|value| value.checked_add((place as u64).checked_shl(group_bits)?))
-                    .ok_or(Error::ResourceLimit)?;
-                let slot = values.get_mut(at as usize).ok_or(Error::InvalidIndex)?;
-                *slot = *value;
+        let first = usize::try_from(firsts[index].ok_or(Error::StatementMismatch)?)
+            .map_err(|_| Error::ResourceLimit)?;
+        placed.push((first, member.message.as_slice()));
+    }
+    let chunk_len = 1usize
+        .checked_shl(group_bits)
+        .ok_or(Error::ResourceLimit)?;
+    let write_chunk = |place: usize, chunk: &mut [Fp3]| -> Result<()> {
+        for (first, message) in &placed {
+            for (row, message_row) in message.iter().enumerate() {
+                if let Some(value) = message_row.get(place) {
+                    let slot = chunk.get_mut(first + row).ok_or(Error::InvalidIndex)?;
+                    *slot = *value;
+                }
             }
+        }
+        Ok(())
+    };
+    if group_len >= GROUP_TABLE_PARALLEL_MIN {
+        values
+            .par_chunks_mut(chunk_len)
+            .enumerate()
+            .try_for_each(|(place, chunk)| write_chunk(place, chunk))?;
+    } else {
+        for (place, chunk) in values.chunks_mut(chunk_len).enumerate() {
+            write_chunk(place, chunk)?;
         }
     }
     Ok(values)
 }
+
+/// Group tables switch to the place-block parallel fill at this length.
+const GROUP_TABLE_PARALLEL_MIN: usize = 1 << 22;
 
 /// Builds the group mask table in the FOLD layout order from the committed
 /// member mask rows. Exactly the members with mask rows occupy mask blocks.
@@ -5463,10 +5509,11 @@ fn proximity_prove(
         provers.push(ProximityMemberProver::sealed(member, tree)?);
     }
     provers.sort_by_key(|member| member.member.bat_oracle);
-    let member_openings = provers
-        .iter()
-        .map(|member| member.tree.open(&unique))
-        .collect::<Result<Vec<_>>>()?;
+    let member_openings = zkie_engine::scheduling::try_map_bounded(
+        provers.as_slice(),
+        zkie_engine::scheduling::DEFAULT_UNITS_IN_FLIGHT,
+        |member| member.tree.open(&unique),
+    )?;
     let mask_positions: Vec<u64> = positions
         .iter()
         .map(|position| position % fold.mask_code.n())
@@ -6221,10 +6268,11 @@ fn prove_first(
     }
     let _profile_w_openings = zkie_engine::profile::Scope::new("first.w_openings");
     let positions = draw_positions(&mut chain, &plan.send)?;
-    let mut openings = Vec::with_capacity(positions.len());
-    for (position, list) in positions.iter().enumerate() {
-        openings.push(witness.tree(position as u32)?.open(list)?);
-    }
+    let openings = zkie_engine::scheduling::try_map_range_bounded(
+        positions.len(),
+        zkie_engine::scheduling::DEFAULT_UNITS_IN_FLIGHT,
+        |position| witness.tree(position as u32)?.open(&positions[position]),
+    )?;
     drop(_profile_w_openings);
     let closure = match (
         plan.closure.as_ref(),
@@ -8180,8 +8228,10 @@ fn own_sample_rows(
     shared: &HiddenSharedMessages,
 ) -> Result<Vec<Vec<GuRelationRow>>> {
     let shape = plan.send.w.oracle_shape();
-    let mut rows = Vec::with_capacity(members.len());
-    for member in members {
+    zkie_engine::scheduling::try_map_bounded(
+        members,
+        zkie_engine::scheduling::DEFAULT_UNITS_IN_FLIGHT,
+        |member| -> Result<Vec<GuRelationRow>> {
         if let (Some(closure_plan), Some(closure_first)) = (&plan.closure, &first.closure) {
             let positions = plan.send.positions() as u64;
             let slack_base = closure_plan.slack_oracle_base;
@@ -8195,7 +8245,7 @@ fn own_sample_rows(
                     .answers
                     .get(position)
                     .ok_or(Error::ShapeMismatch)?;
-                rows.push(vec![oracle_sample_row(
+                return Ok(vec![oracle_sample_row(
                     member.source_oracle,
                     plan.send.group,
                     &closure_plan.slack.oracle_shape(),
@@ -8203,7 +8253,6 @@ fn own_sample_rows(
                     0,
                     target,
                 )?]);
-                continue;
             }
             if member.source_oracle >= bits_base
                 && member.source_oracle < bits_base.saturating_add(positions)
@@ -8214,7 +8263,7 @@ fn own_sample_rows(
                     .answers
                     .get(position)
                     .ok_or(Error::ShapeMismatch)?;
-                rows.push(vec![oracle_sample_row(
+                return Ok(vec![oracle_sample_row(
                     member.source_oracle,
                     plan.send.group,
                     &closure_plan.bits.oracle_shape(),
@@ -8222,7 +8271,6 @@ fn own_sample_rows(
                     0,
                     target,
                 )?]);
-                continue;
             }
             let map_base = closure_plan.map_oracle_base;
             if member.source_oracle >= map_base
@@ -8234,7 +8282,7 @@ fn own_sample_rows(
                     .answers
                     .get(position)
                     .ok_or(Error::ShapeMismatch)?;
-                rows.push(vec![oracle_sample_row(
+                return Ok(vec![oracle_sample_row(
                     member.source_oracle,
                     plan.send.group,
                     &closure_plan.map.oracle_shape(),
@@ -8242,7 +8290,6 @@ fn own_sample_rows(
                     0,
                     target,
                 )?]);
-                continue;
             }
             if member.source_oracle == closure_plan.mask.oracle {
                 let target = *closure_first
@@ -8251,12 +8298,11 @@ fn own_sample_rows(
                     .answers
                     .first()
                     .ok_or(Error::ShapeMismatch)?;
-                rows.push(vec![closure_mask_sample_row(
+                return Ok(vec![closure_mask_sample_row(
                     &closure_plan.mask,
                     &closure_first.mask,
                     target,
                 )?]);
-                continue;
             }
         }
         if let Some(index) = &plan.send.index_mask {
@@ -8267,8 +8313,7 @@ fn own_sample_rows(
                     .answers
                     .first()
                     .ok_or(Error::ShapeMismatch)?;
-                rows.push(vec![index_mask_sample_row(index, message, target)?]);
-                continue;
+                return Ok(vec![index_mask_sample_row(index, message, target)?]);
             }
         }
         if let Some(dot) = &plan.send.dot {
@@ -8279,7 +8324,7 @@ fn own_sample_rows(
                     .answers
                     .first()
                     .ok_or(Error::ShapeMismatch)?;
-                rows.push(vec![oracle_sample_row(
+                return Ok(vec![oracle_sample_row(
                     dot.oracle,
                     dot.group,
                     &dot.oracle_shape(),
@@ -8287,7 +8332,6 @@ fn own_sample_rows(
                     0,
                     target,
                 )?]);
-                continue;
             }
         }
         if member.source_oracle == plan.proximity.omega.oracle {
@@ -8302,7 +8346,7 @@ fn own_sample_rows(
                     *target,
                 )?);
             }
-            rows.push(list);
+            return Ok(list);
         } else {
             let position = (member.source_oracle - plan.send.oracle_base) as usize;
             if position >= plan.send.positions() as usize {
@@ -8314,7 +8358,7 @@ fn own_sample_rows(
                 .answers
                 .get(index)
                 .ok_or(Error::ShapeMismatch)?;
-            rows.push(vec![oracle_sample_row(
+            return Ok(vec![oracle_sample_row(
                 member.source_oracle,
                 plan.send.group,
                 &shape,
@@ -8323,8 +8367,8 @@ fn own_sample_rows(
                 target,
             )?]);
         }
-    }
-    Ok(rows)
+        },
+    )
 }
 
 

@@ -9,4 +9,5 @@ pub mod primitives;
 pub mod pcs;
 pub mod profile;
 pub mod progress;
+pub mod scheduling;
 pub mod storage;

@@ -49,6 +49,7 @@
 //! hiding through the existing product-form encoding with fresh tails, salts
 //! and non-zero sample pads.
 
+use rayon::prelude::*;
 use zkie_core::common::field::PrimeField64;
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
@@ -1752,7 +1753,16 @@ pub fn closure_map_values_with_eq(bits: &[Fp3], eq: &[Fp3]) -> Result<Vec<Fp3>> 
     if bits.len() != eq.len() {
         return Err(Error::ShapeMismatch);
     }
-    Ok(eq.iter().zip(bits).map(|(eq, bit)| eq.mul(bit)).collect())
+    const PARALLEL_MIN: usize = 1 << 14;
+    if bits.len() >= PARALLEL_MIN {
+        Ok(eq
+            .par_iter()
+            .zip(bits.par_iter())
+            .map(|(eq, bit)| eq.mul(bit))
+            .collect())
+    } else {
+        Ok(eq.iter().zip(bits).map(|(eq, bit)| eq.mul(bit)).collect())
+    }
 }
 
 /// The committed product vector `D(u) = eq(r,u) B(u)` over the cube.
@@ -1766,12 +1776,23 @@ pub fn eq_vector(point: &[Fp3]) -> Result<Vec<Fp3>> {
     if point.len() >= 30 {
         return Err(Error::ResourceLimit);
     }
+    const PARALLEL_MIN: usize = 1 << 14;
     let mut values = vec![Fp3::ONE];
     for coordinate in point.iter().rev() {
-        let mut next = vec![Fp3::ZERO; values.len() * 2];
-        for (index, value) in values.iter().enumerate() {
-            next[2 * index] = value.mul(&Fp3::ONE.sub(coordinate));
-            next[2 * index + 1] = value.mul(coordinate);
+        let next_len = values.len() * 2;
+        let mut next = vec![Fp3::ZERO; next_len];
+        if next_len >= PARALLEL_MIN {
+            next.par_chunks_mut(2)
+                .zip(values.par_iter())
+                .for_each(|(pair, value)| {
+                    pair[0] = value.mul(&Fp3::ONE.sub(coordinate));
+                    pair[1] = value.mul(coordinate);
+                });
+        } else {
+            for (index, value) in values.iter().enumerate() {
+                next[2 * index] = value.mul(&Fp3::ONE.sub(coordinate));
+                next[2 * index + 1] = value.mul(coordinate);
+            }
         }
         values = next;
     }

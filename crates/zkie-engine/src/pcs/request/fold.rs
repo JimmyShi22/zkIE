@@ -19,6 +19,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
@@ -513,22 +514,93 @@ fn fold_pair(low: Fp3, high: Fp3, gamma: Fp3) -> Fp3 {
     low.add(&gamma.mul(&high.sub(&low)))
 }
 
+/// Outputs are folded in parallel from this row count upward.
+const FOLD_PARALLEL_MIN_ROWS: usize = 1 << 16;
+/// Number of independent outputs folded between scheduling barriers.
+const FOLD_PARALLEL_BLOCK: usize = 1 << 18;
+/// Pair products run in parallel from this pair count upward.
+const PAIR_PARALLEL_MIN_PAIRS: usize = 1 << 15;
+/// Pairs per parallel partial sum.
+const PAIR_PARALLEL_CHUNK: usize = 1 << 15;
+
 fn fold_low_once(values: &mut Vec<Fp3>, gamma: Fp3) -> Result<()> {
     if values.len() % 2 != 0 {
         return Err(Error::InvalidConfig);
     }
     let rows = values.len() / 2;
-    for index in 0..rows {
-        values[index] = fold_pair(values[2 * index], values[2 * index + 1], gamma);
+    if rows >= FOLD_PARALLEL_MIN_ROWS {
+        fold_low_once_bounded(values, rows, gamma);
+    } else {
+        for index in 0..rows {
+            values[index] = fold_pair(values[2 * index], values[2 * index + 1], gamma);
+        }
     }
     values.truncate(rows);
     Ok(())
+}
+
+/// Folds every pair of `values` into its first `rows` entries. Blocks run in
+/// ascending order with a barrier between them, so a block only reads source
+/// entries that no earlier block has overwritten; inside a block the exact
+/// independent outputs are folded in bounded parallel chunks.
+fn fold_low_once_bounded(values: &mut [Fp3], rows: usize, gamma: Fp3) {
+    let mut start = 0usize;
+    while start < rows {
+        let end = (start + FOLD_PARALLEL_BLOCK).min(rows);
+        if 2 * start < end {
+            // This block reads its own output range; copy the exact source
+            // entries before they are overwritten.
+            let scratch = values[2 * start..2 * end].to_vec();
+            values[start..end]
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(offset, slot)| {
+                    *slot = fold_pair(scratch[2 * offset], scratch[2 * offset + 1], gamma);
+                });
+        } else {
+            // The source range lies above this block, so splitting at `end`
+            // gives disjoint read and write slices.
+            let (low, high) = values.split_at_mut(end);
+            let write = &mut low[start..end];
+            let read = &high[(2 * start - end)..(2 * end - end)];
+            write
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(offset, slot)| {
+                    *slot = fold_pair(read[2 * offset], read[2 * offset + 1], gamma);
+                });
+        }
+        start = end;
+    }
 }
 
 fn pair_products(a: &[Fp3], m: &[Fp3]) -> Result<[Fp3; 3]> {
     if a.len() != m.len() || a.len() % 2 != 0 {
         return Err(Error::InvalidConfig);
     }
+    let pairs = a.len() / 2;
+    if pairs < PAIR_PARALLEL_MIN_PAIRS {
+        return Ok(pair_products_range(a, m));
+    }
+    // Every pair contributes an independent exact product; the chunk sums are
+    // collected in order so the final accumulation is reproducible.
+    let partials: Vec<[Fp3; 3]> = a
+        .par_chunks(2 * PAIR_PARALLEL_CHUNK)
+        .zip(m.par_chunks(2 * PAIR_PARALLEL_CHUNK))
+        .map(|(left, right)| pair_products_range(left, right))
+        .collect();
+    let mut q = [Fp3::ZERO; 3];
+    for partial in partials {
+        q[0] = q[0].add(&partial[0]);
+        q[1] = q[1].add(&partial[1]);
+        q[2] = q[2].add(&partial[2]);
+    }
+    Ok(q)
+}
+
+fn pair_products_range(a: &[Fp3], m: &[Fp3]) -> [Fp3; 3] {
+    debug_assert_eq!(a.len(), m.len());
+    debug_assert_eq!(a.len() % 2, 0);
     let mut q = [Fp3::ZERO; 3];
     for index in 0..a.len() / 2 {
         let a0 = a[2 * index];
@@ -539,7 +611,7 @@ fn pair_products(a: &[Fp3], m: &[Fp3]) -> Result<[Fp3; 3]> {
         q[1] = q[1].add(&a0.mul(&m1).add(&a1.mul(&m0)));
         q[2] = q[2].add(&a1.mul(&m1));
     }
-    Ok(q)
+    q
 }
 
 fn inner(a: &[Fp3], b: &[Fp3]) -> Result<Fp3> {

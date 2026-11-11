@@ -19,6 +19,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
 
@@ -964,12 +966,15 @@ pub fn group_index(index: u64, row_bits: u32, first: u64, group_bits: u32) -> Re
         .ok_or(Error::ResourceLimit)
 }
 
-/// Combine the frozen rows by powers of x. This is the item-by-item baseline;
-/// no aside optimization is claimed, and every occurrence of a claim is
+/// Combine the frozen rows by powers of x. Every occurrence of a claim is
 /// accumulated. The function does not check when or from where x was drawn:
 /// the ordinary session draws it from the chain, while a code-switch caller
 /// may combine directly after its own x. The statement, layout and rows here
 /// are unauthenticated fixtures, not a production wiring.
+///
+/// Folded main tables are scattered into disjoint place blocks of the group
+/// row in parallel; every other term keeps the item-by-item path. Exact field
+/// addition is order-independent, so the combined values are unchanged.
 pub fn combine(
     statement: &BatStatement,
     layout: &BatGroupLayout,
@@ -979,6 +984,10 @@ pub fn combine(
     if statement.layout(layout.group)? != *layout {
         return Err(Error::StatementMismatch);
     }
+    let group_bits = layout.group_row_bits(BatPart::Main);
+    let chunk_len = 1usize
+        .checked_shl(group_bits)
+        .ok_or(Error::ResourceLimit)?;
     let mut out = BatGroupRow {
         group: layout.group,
         main: vec![Fp3::ZERO; layout.group_len(BatPart::Main)?],
@@ -986,12 +995,258 @@ pub fn combine(
         kept: Vec::new(),
         target: Fp3::ZERO,
     };
+    // Powers follow claim order so every row keeps the same x power.
+    let mut powers = Vec::with_capacity(rows.len());
     let mut power = Fp3::ONE;
-    for row in rows {
-        add_claim_row(statement, layout, row, power, &mut out)?;
+    for _ in rows {
+        powers.push(power);
         power = power.mul(&x);
     }
+    let mut scatter: Vec<Vec<MainScatter<'_>>> = Vec::with_capacity(rows.len());
+    let mut units: Vec<Vec<MainUnitScatter>> = Vec::with_capacity(rows.len());
+    for (row, scale) in rows.iter().zip(&powers) {
+        let mut row_scatter = Vec::new();
+        let mut row_units = Vec::new();
+        for term in &row.terms {
+            let shape = statement.oracle(term.oracle)?.shape;
+            let member = layout
+                .members
+                .iter()
+                .find(|member| member.oracle == term.oracle)
+                .ok_or(Error::StatementMismatch)?;
+            if term.part == BatPart::Main && !member.kept {
+                if !shape.has(term.part) || term.values.len() != shape.table_len(term.part)? {
+                    return Err(Error::ShapeMismatch);
+                }
+                row_scatter.push(main_scatter(
+                    &term.values,
+                    member.main_first.ok_or(Error::StatementMismatch)?,
+                    shape.row_bits(term.part),
+                    *scale,
+                )?);
+            } else {
+                carry_table(
+                    statement,
+                    layout,
+                    term.oracle,
+                    term.part,
+                    &term.values,
+                    *scale,
+                    &mut out,
+                )?;
+            }
+        }
+        for unit in &row.units {
+            let shape = statement.oracle(unit.oracle)?.shape;
+            let member = layout
+                .members
+                .iter()
+                .find(|member| member.oracle == unit.oracle)
+                .ok_or(Error::StatementMismatch)?;
+            let len = shape.table_len(unit.part)?;
+            if !shape.has(unit.part) || unit.index >= len as u64 {
+                return Err(Error::InvalidIndex);
+            }
+            if unit.part == BatPart::Main && !member.kept {
+                row_units.push(main_unit_scatter(
+                    member.main_first.ok_or(Error::StatementMismatch)?,
+                    shape.row_bits(unit.part),
+                    unit.index,
+                    scale.mul(&unit.coefficient),
+                )?);
+            } else {
+                carry_entry(
+                    statement,
+                    layout,
+                    unit.oracle,
+                    unit.part,
+                    unit.index,
+                    unit.coefficient,
+                    *scale,
+                    &mut out,
+                )?;
+            }
+        }
+        for run in &row.runs {
+            if run.step == 0 {
+                return Err(Error::ShapeMismatch);
+            }
+            let shape = statement.oracle(run.oracle)?.shape;
+            let member = layout
+                .members
+                .iter()
+                .find(|member| member.oracle == run.oracle)
+                .ok_or(Error::StatementMismatch)?;
+            let len = shape.table_len(run.part)?;
+            for (offset, value) in run.values.iter().enumerate() {
+                let index = run
+                    .first
+                    .checked_add(
+                        run.step
+                            .checked_mul(offset as u64)
+                            .ok_or(Error::ResourceLimit)?,
+                    )
+                    .ok_or(Error::ResourceLimit)?;
+                if !shape.has(run.part) || index >= len as u64 {
+                    return Err(Error::InvalidIndex);
+                }
+                if run.part == BatPart::Main && !member.kept {
+                    row_units.push(main_unit_scatter(
+                        member.main_first.ok_or(Error::StatementMismatch)?,
+                        shape.row_bits(run.part),
+                        index,
+                        scale.mul(value),
+                    )?);
+                } else {
+                    carry_entry(
+                        statement,
+                        layout,
+                        run.oracle,
+                        run.part,
+                        index,
+                        *value,
+                        *scale,
+                        &mut out,
+                    )?;
+                }
+            }
+        }
+        for form in &row.forms {
+            let shape = statement.oracle(form.oracle)?.shape;
+            let member = layout
+                .members
+                .iter()
+                .find(|member| member.oracle == form.oracle)
+                .ok_or(Error::StatementMismatch)?;
+            if !member.kept {
+                if !shape.has(BatPart::Main)
+                    || form.values.len() != shape.table_len(BatPart::Main)?
+                {
+                    return Err(Error::ShapeMismatch);
+                }
+                row_scatter.push(main_scatter(
+                    &form.values,
+                    member.main_first.ok_or(Error::StatementMismatch)?,
+                    shape.row_bits(BatPart::Main),
+                    *scale,
+                )?);
+            } else {
+                carry_table(
+                    statement,
+                    layout,
+                    form.oracle,
+                    BatPart::Main,
+                    &form.values,
+                    *scale,
+                    &mut out,
+                )?;
+            }
+        }
+        out.target = out.target.add(&scale.mul(&row.target));
+        scatter.push(row_scatter);
+        units.push(row_units);
+    }
+    let scatter_at = |place: usize, chunk: &mut [Fp3]| -> Result<()> {
+        for (row_scatter, row_units) in scatter.iter().zip(&units) {
+            for term in row_scatter {
+                if place >= term.places {
+                    continue;
+                }
+                let lo = place * term.rows_per_place;
+                let hi = lo + term.rows_per_place;
+                let target = chunk
+                    .get_mut(term.first..term.first + term.rows_per_place)
+                    .ok_or(Error::InvalidIndex)?;
+                for (slot, value) in target.iter_mut().zip(&term.values[lo..hi]) {
+                    *slot = slot.add(&term.scale.mul(value));
+                }
+            }
+            for unit in row_units {
+                if unit.place != place {
+                    continue;
+                }
+                let slot = chunk
+                    .get_mut(unit.first + unit.row)
+                    .ok_or(Error::InvalidIndex)?;
+                *slot = slot.add(&unit.scaled);
+            }
+        }
+        Ok(())
+    };
+    if out.main.len() >= COMBINE_PARALLEL_MIN && chunk_len <= out.main.len() {
+        out.main
+            .par_chunks_mut(chunk_len)
+            .enumerate()
+            .try_for_each(|(place, chunk)| scatter_at(place, chunk))?;
+    } else {
+        for (place, chunk) in out.main.chunks_mut(chunk_len).enumerate() {
+            scatter_at(place, chunk)?;
+        }
+    }
     Ok(out)
+}
+
+/// Folded-main terms use the parallel block scatter from this group-row
+/// length upward; smaller groups keep the sequential chunk loop.
+const COMBINE_PARALLEL_MIN: usize = 1 << 22;
+
+/// One folded main-table coefficient vector and its destination block.
+struct MainScatter<'a> {
+    values: &'a [Fp3],
+    first: usize,
+    rows_per_place: usize,
+    places: usize,
+    scale: Fp3,
+}
+
+/// One folded main-table point coefficient.
+struct MainUnitScatter {
+    first: usize,
+    place: usize,
+    row: usize,
+    scaled: Fp3,
+}
+
+fn main_scatter(
+    values: &[Fp3],
+    first: u64,
+    row_bits: u32,
+    scale: Fp3,
+) -> Result<MainScatter<'_>> {
+    let first = usize::try_from(first).map_err(|_| Error::ResourceLimit)?;
+    let rows_per_place = 1usize
+        .checked_shl(row_bits)
+        .ok_or(Error::ResourceLimit)?;
+    if values.len() % rows_per_place != 0 {
+        return Err(Error::ShapeMismatch);
+    }
+    Ok(MainScatter {
+        values,
+        first,
+        rows_per_place,
+        places: values.len() / rows_per_place,
+        scale,
+    })
+}
+
+fn main_unit_scatter(
+    first: u64,
+    row_bits: u32,
+    index: u64,
+    scaled: Fp3,
+) -> Result<MainUnitScatter> {
+    let first = usize::try_from(first).map_err(|_| Error::ResourceLimit)?;
+    let rows_per_place = 1u64
+        .checked_shl(row_bits)
+        .ok_or(Error::ResourceLimit)?;
+    let place = index / rows_per_place;
+    let row = index % rows_per_place;
+    Ok(MainUnitScatter {
+        first,
+        place: usize::try_from(place).map_err(|_| Error::ResourceLimit)?,
+        row: usize::try_from(row).map_err(|_| Error::ResourceLimit)?,
+        scaled,
+    })
 }
 
 fn kept_slot<'a>(
@@ -1163,76 +1418,6 @@ fn carry_entry(
         .get_mut(at as usize)
         .ok_or(Error::InvalidIndex)?;
     *slot = slot.add(&scaled);
-    Ok(())
-}
-
-fn add_claim_row(
-    statement: &BatStatement,
-    layout: &BatGroupLayout,
-    row: &BatRow,
-    power: Fp3,
-    out: &mut BatGroupRow,
-) -> Result<()> {
-    for term in &row.terms {
-        carry_table(
-            statement,
-            layout,
-            term.oracle,
-            term.part,
-            &term.values,
-            power,
-            out,
-        )?;
-    }
-    for unit in &row.units {
-        carry_entry(
-            statement,
-            layout,
-            unit.oracle,
-            unit.part,
-            unit.index,
-            unit.coefficient,
-            power,
-            out,
-        )?;
-    }
-    for run in &row.runs {
-        if run.step == 0 {
-            return Err(Error::ShapeMismatch);
-        }
-        for (offset, value) in run.values.iter().enumerate() {
-            let index = run
-                .first
-                .checked_add(
-                    run.step
-                        .checked_mul(offset as u64)
-                        .ok_or(Error::ResourceLimit)?,
-                )
-                .ok_or(Error::ResourceLimit)?;
-            carry_entry(
-                statement,
-                layout,
-                run.oracle,
-                run.part,
-                index,
-                *value,
-                power,
-                out,
-            )?;
-        }
-    }
-    for form in &row.forms {
-        carry_table(
-            statement,
-            layout,
-            form.oracle,
-            BatPart::Main,
-            &form.values,
-            power,
-            out,
-        )?;
-    }
-    out.target = out.target.add(&power.mul(&row.target));
     Ok(())
 }
 
