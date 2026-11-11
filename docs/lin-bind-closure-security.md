@@ -10,7 +10,9 @@ the trusted X source is proved. Labels:
 - `[FACT]` checked in the code or arithmetic at the stated snapshot.
 - `[ASSUMPTION]` a condition the argument needs.
 - `[UNPROVEN]` stated but not proved here.
-- `[GAP]` a missing check or mechanism; the run must fail closed.
+- `[GAP]` a missing check or mechanism; an executable condition fails the
+  run closed, a condition that cannot be checked at runtime withdraws the
+  security conclusion.
 
 Snapshot: the closed relation at code basis `3b3e8ecc`, with the bounded-read
 rollback `8d32d3de`; fixture `gpt2-seq16`, 16 positions, proof 9,939,144 B.
@@ -97,8 +99,10 @@ symbol whose message part is masked by the code tail on the opened set, a
 padded sample answer, or a PSC transcript whose target shift lies in the image
 of the hiding map. Under the assumptions in section 3.10, the verifier cannot
 recover the plaintext `Y` row beyond winner/valid/tie. This is a conditional
-conclusion of the argument; if any assumption fails, the conclusion is
-withdrawn and the run must fail closed.
+conclusion of the argument; if any assumption fails, the security conclusion
+is withdrawn. Executable conditions (tail overrun, reuse) are ledger
+rejections; conditions that are not runtime-checked are stated as conditional
+assumptions, not as program fail-closed checks.
 
 ## 3. Joint-view hiding: linear-cover criterion
 
@@ -443,9 +447,9 @@ correct one.
 | malformed group table | shape check |
 | wrong retained tree plan or root | tree-association check |
 
-`[GAP]` The matrix covers the implemented negative entries. It is not a proof
-that every message field has a dedicated negative; fields reached only through
-a shared root or a later relation are covered indirectly. A production
+`[UNPROVEN]` The matrix covers the implemented negative entries. It is not a
+proof that every message field has a dedicated negative; fields reached only
+through a shared root or a later relation are covered indirectly. A production
 verifier must keep the full chain, not a subset.
 
 ## 6. Composition error accounting
@@ -521,8 +525,8 @@ not bounded. A conservative union bound over the components is not mechanized.
 
 `[GAP]` If the range-decomposition, PSC or LKP terms are not instantiated at
 the stated degrees/parameters, or if the number of requests is unbounded, the
-composition figure does not apply. The run must fail closed rather than claim
-the 128-bit target.
+composition figure does not apply; the security conclusion is conditional
+and the 128-bit target is not claimed.
 
 ## 7. Runtime fail-closed controls
 
