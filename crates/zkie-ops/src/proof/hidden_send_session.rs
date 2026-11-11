@@ -4769,6 +4769,13 @@ pub struct HiddenLinWitness {
 pub trait HiddenTableProver: TableRowSource {
     fn reader(&self) -> &IndexReader;
     fn open_columns(&mut self, positions: &[u64]) -> Result<Vec<ColumnOpening>>;
+
+    /// Releases any row cache retained for the prove lifetime. The prove path
+    /// calls this after the last table row read; implementations without a
+    /// cache keep the default.
+    fn release_cached_rows(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// One committed member of a proximity group.
@@ -6138,10 +6145,13 @@ fn prove_first(
             let r_bool = draw_closure_r(&mut chain, closure_plan.boolean_variables)?;
             let _profile_map_values =
                 zkie_engine::profile::Scope::new("first.closure_map_values");
+            let eq_bool = crate::proof::output_closure::eq_vector(&r_bool)?;
             let map_values = closure
                 .bit_values
                 .iter()
-                .map(|bits| crate::proof::output_closure::closure_map_values(bits, &r_bool))
+                .map(|bits| {
+                    crate::proof::output_closure::closure_map_values_with_eq(bits, &eq_bool)
+                })
                 .collect::<Result<Vec<_>>>()?;
             drop(_profile_map_values);
             let _profile_map_commit =
@@ -7218,6 +7228,7 @@ fn prove_shared(
     let _profile_open_columns = zkie_engine::profile::Scope::new("shared.table_open_columns");
     let gu_openings = table.open_columns(&unique)?;
     drop(_profile_open_columns);
+    table.release_cached_rows()?;
     let _profile_column_rows = zkie_engine::profile::Scope::new("shared.column_rows");
     let column_map = table_column_map(reader, &positions, &gu_openings)?;
     let eq_gamma = foldeq_weights(&gamma, reader.shape.v)?;
@@ -8355,10 +8366,19 @@ fn closure_plain_rows(
     {
         return Err(Error::StatementMismatch);
     }
+    let shared_r_bool = binding
+        .positions
+        .first()
+        .map(|word| word.r_bool.as_slice())
+        .unwrap_or(&[]);
+    let eq_r = crate::proof::output_closure::eq_vector(shared_r_bool)?;
     let mut rows = Vec::with_capacity(positions * 7);
     for position in 0..positions {
         let word = &binding.positions[position];
-        if word.r_bool.len() != k || word.r_diff.len() != k_col || word.r_recon.len() != k_col
+        if word.r_bool.len() != k
+            || word.r_bool.as_slice() != shared_r_bool
+            || word.r_diff.len() != k_col
+            || word.r_recon.len() != k_col
             || word.output.point.len() != k
             || word.output.ends.iter().any(|end| end.point != word.output.point)
         {
@@ -8548,7 +8568,6 @@ fn closure_plain_rows(
             return Err(Error::InvalidProof);
         }
         let eq_q = crate::proof::output_closure::eq_vector(&word.q)?;
-        let eq_r = crate::proof::output_closure::eq_vector(&word.r_bool)?;
         if eq_q.len() != bits_columns || eq_r.len() != bits_columns {
             return Err(Error::InvalidProof);
         }

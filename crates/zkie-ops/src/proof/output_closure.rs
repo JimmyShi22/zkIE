@@ -1695,13 +1695,20 @@ fn empty_mask_entries(plan: &ClosurePlan) -> DotMaskEntries {
 }
 
 
-/// The committed product vector `D(u) = eq(r,u) B(u)` over the cube.
-pub fn closure_map_values(bits: &[Fp3], r: &[Fp3]) -> Result<Vec<Fp3>> {
-    let eq = eq_vector(r)?;
+/// The committed product vector `D(u) = eq(r,u) B(u)` over the cube with the
+/// shared `eq(r, .)` vector supplied by the caller, so every position reuses
+/// one draw of the boolean point.
+pub fn closure_map_values_with_eq(bits: &[Fp3], eq: &[Fp3]) -> Result<Vec<Fp3>> {
     if bits.len() != eq.len() {
         return Err(Error::ShapeMismatch);
     }
     Ok(eq.iter().zip(bits).map(|(eq, bit)| eq.mul(bit)).collect())
+}
+
+/// The committed product vector `D(u) = eq(r,u) B(u)` over the cube.
+pub fn closure_map_values(bits: &[Fp3], r: &[Fp3]) -> Result<Vec<Fp3>> {
+    let eq = eq_vector(r)?;
+    closure_map_values_with_eq(bits, &eq)
 }
 
 /// The complete `eq(point, .)` vector over the Boolean cube in `O(2^k)`.
@@ -1755,6 +1762,7 @@ pub fn prove_closure_second(
     }
     let k = plan.boolean_variables as usize;
     let k_col = plan.vocab.trailing_zeros() as usize;
+    let eq_r = eq_vector(r_bool)?;
     let mut proofs = Vec::with_capacity(positions);
     let mut point_values = Vec::with_capacity(positions);
     let mut bindings = Vec::with_capacity(positions);
@@ -1786,7 +1794,6 @@ pub fn prove_closure_second(
         }
         let b_point = multilinear(&bit_values[position], &output.point)?;
         let eq_q = eq_vector(&q)?;
-        let eq_r = eq_vector(r_bool)?;
         let d_value_masked = inner_product(&eq_q, &map_values[position])?
             .add(&mask_entries[position][plan.mask.hiding + 3]);
         let weighted: Vec<Fp3> = eq_q

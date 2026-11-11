@@ -550,6 +550,11 @@ fn selected_gpt2_output_head_request_session() {
         fn open_columns(&mut self, positions: &[u64]) -> Result<Vec<ColumnOpening>> {
             self.table.open_columns(&mut self.source, positions)
         }
+
+        fn release_cached_rows(&mut self) -> Result<()> {
+            self.source.release_row_cache();
+            Ok(())
+        }
     }
 
     let fixture = env::var("ZKIE_SESSION_FIXTURE").expect("set ZKIE_SESSION_FIXTURE");
@@ -2080,8 +2085,12 @@ fn selected_gpt2_output_head_request_session() {
         println!("hidden_prove_ms={hidden_prove_ms}");
         let mut hidden_encode_profile =
             zkie_engine::profile::Scope::new("harness.hidden_proof_encode");
-        let hidden_proof_bytes = hidden_proof.encode().unwrap().len();
+        let hidden_proof_encoded = hidden_proof.encode().unwrap();
+        let hidden_proof_bytes = hidden_proof_encoded.len();
         hidden_encode_profile.add_bytes(hidden_proof_bytes as u64);
+        if let Some(path) = env::var_os("ZKIE_SESSION_PROOF_DUMP") {
+            fs::write(path, &hidden_proof_encoded).unwrap();
+        }
         println!("hidden_proof_bytes={hidden_proof_bytes}");
         drop(hidden_encode_profile);
         zkie_engine::profile::dump();
