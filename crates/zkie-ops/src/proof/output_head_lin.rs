@@ -52,7 +52,7 @@ use crate::proof::hidden_send_session::{
     prove_hidden_lin, prove_hidden_lin_hidden, verify_hidden_lin, verify_hidden_lin_hidden,
     ActivationCommitment, ActivationShape, CommittedActivation, HiddenLinMessages, HiddenLinOutcome,
     HiddenLinPlan, HiddenLinWitness, HiddenOutputShape, HiddenProximityPlan, HiddenSendPlan,
-    HiddenTableProver,
+    HiddenTableProver, IndexMaskPlan,
 };
 use crate::proof::model_commitment::{
     verify_shared_trace_outputs, ModelCommitmentPublic, SharedTrace,
@@ -63,7 +63,7 @@ use crate::proof::plan::{
 use crate::proof::session_baseline::{assemble_binding, SelectedMatmulStep};
 
 
-const OUTPUT_HEAD_PROOF_VERSION: u64 = 2;
+const OUTPUT_HEAD_PROOF_VERSION: u64 = 3;
 
 /// Positions of one output-head MatMul request.
 pub const OUTPUT_HEAD_POSITIONS: usize = 16;
@@ -292,6 +292,9 @@ pub struct OutputHeadLinSetup {
     pub asset_path: String,
     pub send: HiddenSendPlan,
     pub proximity: HiddenProximityPlan,
+    /// The sampled index-mask message of the hidden-input path. The diagnostic
+    /// path leaves it empty and keeps plaintext output rows.
+    pub index_mask: Option<IndexMaskPlan>,
     pub activation_configuration: Digest,
     pub activation_salts: Vec<Vec<u8>>,
     pub seed: Digest,
@@ -357,11 +360,13 @@ pub struct OutputHeadLinOutcome {
 // an independent trusted input whose hiding commitment is pinned by the
 // operator policy; the proof session carries the same commitment and the
 // verifier compares the two. `Y` is the prover's reduced row `W = X M`: it is
-// committed as the SEND group members under a hiding product-form encoding,
-// and the Eval targets bind it to the linear output claim. The vocabulary
-// mask, validity range, ordering comparison, first-maximum tie rule and final
-// output are trusted graph values; their digest is absorbed into the first
-// statement.
+// committed as the SEND group members under a hiding product-form encoding.
+// The Eval targets are masked as `W_t(psi_t) + e_t`, with the one-time `e_t`
+// entry of the sampled index-mask message, and the masked Dot right-hand side
+// is `W_t(psi*) + g_t`; both rows are checked by the own-group proximity test
+// against the committed roots. The vocabulary mask, validity range, ordering
+// comparison, first-maximum tie rule and final output are trusted graph
+// values; their digest is absorbed into the first statement.
 //
 // This closure does not prove to the verifier that `W` was derived from the
 // pinned `X` and the committed table. That derivation (the Dot relation with
@@ -546,6 +551,7 @@ fn hidden_plan(
     send.activation = activation.shape;
     send.activation_configuration = activation.configuration;
     send.activation_root = activation.root;
+    send.index_mask = setup.index_mask.clone();
     send.expected_roots = setup.expected_roots.clone();
     let plan = HiddenLinPlan {
         send,
@@ -1082,7 +1088,13 @@ pub(crate) fn merged_plan(
     send.activation = activation;
     send.activation_configuration = setup.activation_configuration;
     send.activation_root = activation_root;
+    send.index_mask = None;
     send.expected_roots = expected_roots;
+    // The diagnostic mode has no mask message, so its fresh own mask has the
+    // single row of a maskless group. The setup's proximity plan describes the
+    // formal mode.
+    let mut proximity = setup.proximity.clone();
+    proximity.own_mask_tree.mask_rows = 1;
     let plan = HiddenLinPlan {
         send,
         output: HiddenOutputShape {
@@ -1091,7 +1103,7 @@ pub(crate) fn merged_plan(
         },
         weights: claims.weights.clone(),
         masks: claims.masks.clone(),
-        proximity: setup.proximity.clone(),
+        proximity,
         output_relation: None,
     };
     plan.validate()?;
@@ -1419,7 +1431,8 @@ mod tests {
 
     use crate::matmul::MatMulOp;
     use crate::proof::hidden_send_session::{
-        WShape, HiddenProximityPlan, HiddenSendPlan, HiddenTableProver,
+        WShape, HiddenProximityPlan, HiddenSendPlan, HiddenTableProver, IndexMaskPlan,
+        MaskEntryAllocation,
     };
     use crate::proof::model_commitment::{commit_assets, AssetStore, ModelAssetSpec};
     use crate::proof::plan::{config, PlanBuilder};
@@ -1450,6 +1463,9 @@ mod tests {
     const OMEGA_TREE_NUMBER: u64 = 301;
     const SHARED_MASK_TREE: u64 = 200;
     const OWN_MASK_TREE: u64 = 201;
+    const INDEX_MASK_ORACLE: u64 = 40;
+    const INDEX_MASK_TREE: u64 = 202;
+    const INDEX_MASK_RUN: Digest = Digest([0x65; 32]);
     const ACTIVATION_CONFIGURATION: Digest = Digest([0x31; 32]);
     const W_RUN: Digest = Digest([0x41; 32]);
     const W_CONFIGURATION: Digest = Digest([0x51; 32]);
@@ -1631,6 +1647,31 @@ mod tests {
         }
     }
 
+    fn index_mask_plan() -> IndexMaskPlan {
+        IndexMaskPlan {
+            oracle: INDEX_MASK_ORACLE,
+            group: SEND_GROUP,
+            mask_code: group_code(),
+            mask_rows: 3,
+            answers: 1,
+            openings: 1,
+            tree: RuntimeTreePlan {
+                tree_number: INDEX_MASK_TREE,
+                leaf_class: 1,
+                log_n: GROUP_CODE_LOG_N,
+                log_n_zk: GROUP_CODE_LOG_N,
+                parts: vec![RuntimeTreePart {
+                    main_symbols: 0,
+                    mask_symbols: 3 * E_DEGREE as u64,
+                }],
+                salt_bytes: SALT,
+                run: INDEX_MASK_RUN,
+                configuration: W_CONFIGURATION,
+            },
+            entries: MaskEntryAllocation::new(TOY_POSITIONS as u32).unwrap(),
+        }
+    }
+
     fn proximity() -> HiddenProximityPlan {
         HiddenProximityPlan {
             gu: gu_shape(),
@@ -1638,7 +1679,10 @@ mod tests {
             code: group_code(),
             mask_code: group_code(),
             shared_mask_tree: mask_tree(SHARED_MASK_TREE),
-            own_mask_tree: mask_tree(OWN_MASK_TREE),
+            own_mask_tree: MaskTreePlan {
+                mask_rows: 4,
+                ..mask_tree(OWN_MASK_TREE)
+            },
             shared_fresh: 50,
             own_fresh: 51,
             column_draws: 2,
@@ -1842,6 +1886,7 @@ mod tests {
             oracle_base: ORACLE_BASE,
             openings_per_oracle: 2,
             w: w_shape(),
+            index_mask: None,
             expected_roots: None,
         };
         let salts: Vec<Vec<u8>> = (0..TOY_POSITIONS)
@@ -1851,6 +1896,7 @@ mod tests {
             asset_path: TOY_ASSET.into(),
             send,
             proximity: proximity(),
+            index_mask: Some(index_mask_plan()),
             activation_configuration: ACTIVATION_CONFIGURATION,
             activation_salts: salts.clone(),
             seed: Digest([0x72; 32]),

@@ -330,7 +330,8 @@ fn selected_gpt2_output_head_request_session() {
     use zkie_engine::storage::encoded_store::FileRowStore;
     use zkie_ops::proof::hidden_send_session::{
         ActivationShape, CommittedActivation, HiddenLinPlan, HiddenOutputShape,
-        HiddenProximityPlan, HiddenSendPlan, HiddenTableProver, WShape,
+        HiddenProximityPlan, HiddenSendPlan, HiddenTableProver, IndexMaskPlan,
+        MaskEntryAllocation, WShape,
     };
     use zkie_ops::proof::model_commitment::verify_shared_trace_outputs;
     use zkie_ops::proof::output_head_lin::diagnostic::{
@@ -376,6 +377,9 @@ fn selected_gpt2_output_head_request_session() {
     const OWN_MASK_TREE: u64 = 201;
     const GU_TREE_NUMBER: u64 = 300;
     const OMEGA_TREE_NUMBER: u64 = 301;
+    const INDEX_MASK_ORACLE: u64 = 40;
+    const INDEX_MASK_TREE: u64 = 202;
+    const INDEX_MASK_RUN: Digest = Digest([0x66; 32]);
     /// The real compiled plan draws this many table columns in the shared
     /// stage; the merged session charges the same number from the reader.
     const COLUMN_DRAWS: usize = 603;
@@ -650,7 +654,10 @@ fn selected_gpt2_output_head_request_session() {
         code,
         mask_code,
         shared_mask_tree: mask_tree(SHARED_MASK_TREE),
-        own_mask_tree: mask_tree(OWN_MASK_TREE),
+        own_mask_tree: MaskTreePlan {
+            mask_rows: 2,
+            ..mask_tree(OWN_MASK_TREE)
+        },
         shared_fresh: SHARED_FRESH,
         own_fresh: OWN_FRESH,
         column_draws: COLUMN_DRAWS,
@@ -668,6 +675,28 @@ fn selected_gpt2_output_head_request_session() {
         SALT,
     )
     .unwrap();
+    let index_mask = IndexMaskPlan {
+        oracle: INDEX_MASK_ORACLE,
+        group: GROUP,
+        mask_code,
+        mask_rows: 2,
+        answers: 1,
+        openings: 2,
+        tree: RuntimeTreePlan {
+            tree_number: INDEX_MASK_TREE,
+            leaf_class: 2,
+            log_n: mask_code.log_n,
+            log_n_zk: mask_code.log_n,
+            parts: vec![RuntimeTreePart {
+                main_symbols: 0,
+                mask_symbols: 2 * E_DEGREE as u64,
+            }],
+            salt_bytes: SALT,
+            run: INDEX_MASK_RUN,
+            configuration,
+        },
+        entries: MaskEntryAllocation::new(OUTPUT_HEAD_POSITIONS as u32).unwrap(),
+    };
     let setup = OutputHeadLinSetup {
         asset_path: OUTPUT_HEAD_ASSET_PATH.to_string(),
         send: HiddenSendPlan {
@@ -683,9 +712,11 @@ fn selected_gpt2_output_head_request_session() {
             oracle_base: ORACLE_BASE,
             openings_per_oracle: 2,
             w,
+            index_mask: None,
             expected_roots: None,
         },
         proximity,
+        index_mask: Some(index_mask),
         activation_configuration: ACTIVATION_CONFIGURATION,
         activation_salts,
         seed: SEED,
@@ -1065,8 +1096,33 @@ fn selected_gpt2_output_head_request_session() {
                     .expect("reserve the W openings"),
             );
         }
+        // The sampled mask message is one committed oracle; its one-time
+        // entries, including every Eval mask, are charged to this reservation.
+        let mask_root = hidden_proof
+            .session
+            .first
+            .index_mask
+            .as_ref()
+            .expect("the hidden path commits the mask message")
+            .root;
+        ledger
+            .record_commitment(CommitmentKind::Mask, mask_root, mask_root)
+            .expect("record the mask commitment");
+        let mask_claim = ledger
+            .reserve(
+                CommitmentKind::Mask,
+                mask_root,
+                request_id,
+                setup
+                    .index_mask
+                    .as_ref()
+                    .expect("the mask plan")
+                    .openings as u64,
+            )
+            .expect("reserve the mask openings");
         activation_claim.succeed().expect("finish the activation attempt");
         table_claim.succeed().expect("finish the table attempt");
+        mask_claim.succeed().expect("finish the mask attempt");
         for claim in weight_claims {
             claim.succeed().expect("finish a W attempt");
         }
@@ -1089,6 +1145,17 @@ fn selected_gpt2_output_head_request_session() {
                     table_identity,
                     second_request,
                     COLUMN_DRAWS as u64,
+                )
+                .unwrap_err(),
+            zkie_core::error::Error::StateRollbackSuspected
+        );
+        assert_eq!(
+            ledger
+                .reserve(
+                    CommitmentKind::Mask,
+                    mask_root,
+                    second_request,
+                    setup.index_mask.as_ref().unwrap().openings as u64,
                 )
                 .unwrap_err(),
             zkie_core::error::Error::StateRollbackSuspected
