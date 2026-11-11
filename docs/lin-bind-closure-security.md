@@ -503,6 +503,14 @@ The terms are:
 | `chi = 0` | one event | `1/p^3 < 2^-191` |
 | PSC/FOLD rank determinant | degrees `23^2`, `49^2`, `(2k+1)^2` | `eps_rank_bad < 2^-178` for `k <= 32` |
 
+`[FACT]` The draw census behind these terms is the actual plan: 73 index-mask
+entries; 864 closure-mask entries (16 positions times 49 hiding plus 5 shown);
+padded SEND answers among the 143 opening events and 887 logical/unique
+openings; code tail rank 558,080 over 72 code-bearing oracles; FOLD fresh
+coefficients per fold round and BASE star rows per value as fresh draws
+(section 3.10b). The index-mask and closure-mask entries are separate oracles
+and are not summed into one mask count.
+
 The `t`/`q_V` factor is carried by the hash term, which is the adaptive
 composition term; the algebraic component count is fixed per proof. If the
 prover uses `Q_A` adaptive retry attempts, multiply the component terms by
