@@ -61,7 +61,7 @@ cluster: 9,939,144 B, sha256
 | verifier profile + duplicate-state removal, after 1 | 363,951 | 50,086 | 688.70 | 181,961,776 | 9,939,144 |
 | verifier profile + duplicate-state removal, after 2 | 355,184 | 50,453 | 641.20 | 169,393,348 | 9,939,144 |
 | final no-profile seq16 run 3 | 355,755 | 50,607 | 642.64 | 169,395,556 | 9,939,144 |
-| final instrumented profile | 355,163 | 50,589 | 640.72 | 170,170,260 | 9,939,144 |
+| final instrumented profile | 355,164 | 50,589 | 640.72 | 170,170,260 | 9,939,144 |
 
 The fresh worktree at `bdc2e7d8` predates the exact-closure commits, so its
 proof is 8,973,672 B. It confirms that the pre-closure baseline run is not a
@@ -82,7 +82,7 @@ Instrumented cold run at `3b3e8ecc`:
 - table bytes 268,435,456, one table pass, down from 805,306,368 before the
   round.
 
-Compared with the pre-round profile (`ef46c560`): prove 940,640 → 355,163 ms
+Compared with the pre-round profile (`ef46c560`): prove 940,640 → 355,164 ms
 (−62.2%), first stage 399,363 → 227,882 ms (−43.0%), second stage
 512,842 → 99,858 ms (−80.5%), proximity 242,207 → 47,486 ms (−80.4%).
 
