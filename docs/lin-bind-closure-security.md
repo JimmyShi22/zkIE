@@ -209,6 +209,11 @@ BASE symbols.
   a switch configuration. If a code-switch stage is added later, its fresh
   mask and star rows must be included in the same criterion; this document
   does not cover a CS path.
+- The BAT `x` challenge is drawn after the frozen rows; the combined group
+  row is internal and enters FOLD, where the fresh mask covers it. There is no
+  separate public BAT row to analyze.
+- The BASE `lambda` challenge is public; the BASE rows and openings are
+  covered by the fresh star rows and tails as above.
 - The FOLD/BASE public values are functions of committed codewords; they do
   not add a plaintext weight or output-row direction beyond the covered
   openings, answers and tails.
