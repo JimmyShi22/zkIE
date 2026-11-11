@@ -230,9 +230,12 @@ BASE symbols.
 - The output-binding boundary is the approved winner/valid/tie boundary.
 
 If an assumption fails, the linear-cover conclusion does not apply and the
-run must fail closed. `[UNPROVEN]` A full simulation and the adaptive
-composition of the hash and algebraic arguments are not mechanized here; the
-argument above is the conditional linear-cover argument, not a theorem.
+run must fail closed. Under the assumptions above, the linear-cover criterion
+is met for every view listed in this section: the joint hiding argument is
+conditionally established and no secret leak is identified. `[UNPROVEN]` A
+full simulation and the adaptive composition of the hash and algebraic
+arguments are not mechanized here; the argument above is the conditional
+linear-cover argument, not a theorem.
 
 ## 4. Opening sets and submatrix property
 
