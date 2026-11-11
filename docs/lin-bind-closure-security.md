@@ -370,6 +370,13 @@ plan's random-oracle/collision-resistant model and work bits; it is not
 re-derived here. For `Q_R` independent requests, multiply the component sum by
 `Q_R`; no global bound is claimed without a bound on `Q_R`.
 
+The reference range check's error is counted as `2^-N` over its random
+combination matrix, with a union bound over columns; this implementation's
+closure booleanity is a polynomial identity checked at a random point, so the
+degree-based `16*166/p^3` term is the relevant arithmetic model. The two are
+not the same check and are not added as if they were; the plan's 128-bit round
+accounting is used for the audited proximity/LKP rounds.
+
 At `t = 2^64`, `2^96` and `2^120` the hash term dominates at about `2^-64`,
 `2^-32` and `2^-8`; the component sum is about `2^-125` (before the `Q_R`
 factor) and `chi = 0` is below `2^-191`. The figures `126.21` and `116.01`
