@@ -1,0 +1,11 @@
+Source: docs/benchmarks/20261111-2342-verifier-path-profile-759db42b/fixture.txt
+266:hidden_prove_ms=362908
+267:hidden_proof_bytes=9939144
+351:hidden_verify_ms=52635
+420:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 701.02s
+425:	Percent of CPU this job got: 252%
+426:	Elapsed (wall clock) time (h:mm:ss or m:ss): 11:43.30
+431:	Maximum resident set size (kbytes): 207138524
+Proof before: /tmp/p24-before-hidden.bin
+f8f512c0e67407210f19dd92d038fd4c71a6bac3a12e1166cd4825d9413215f5  /tmp/p24-before-hidden.bin
+/tmp/p24-before-hidden.bin 9939144 2026-11-11 23:50:22.324752838 +0800
