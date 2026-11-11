@@ -83,7 +83,7 @@ public; hiding it beyond those three items is a condition of this round, not a
 |---|---|---|
 | closure slack/bits/map openings | codeword symbol `sum_{i<r} t_i z^i + sum_{i<ell} f_i(Y) z^{r+i}` | `q` linear equations; no plaintext `Y` |
 | closure SEND answers | sample of `f(Y)` plus a one-time pad | a padded field value |
-| closure PSC transcript | affine image of the 49 hiding coefficients plus the target shift | transcript; target covered by the hiding map |
+| closure PSC transcripts | affine image of the 49 hiding coefficients plus the target shift, one instance per position | transcripts; targets covered by the hiding maps |
 | closure fresh-point values | three masked values per position | each covered by its one-time shown mask |
 | W SEND answers / Eval targets | W sample plus pad / `W(psi)+e` | masked field values |
 | output winner/valid/tie | protocol output | public by the approved boundary |
@@ -168,23 +168,25 @@ unit diagonal on the direct entries), checked full rank at three points; a
 conservative degree bound gives a bad-challenge probability below
 `23^2/p^3 < 2^-181` (sections 3.12 and 6).
 
-The closure PSC (tags 20/21/22) is a second, separate instance. The closure
-mask plan allocates, per position, 49 hiding coefficients and five shown
-masks (`CLOSURE_MASK_SHOWN = 5`): two PSC end masks, one committed-bit point
+The closure PSC (tags 20/21/22) is a second, separate family with one
+instance per position (16 instances). The closure mask plan allocates, per
+position, 49 hiding coefficients and five shown masks
+(`CLOSURE_MASK_SHOWN = 5`): two PSC end masks, one committed-bit point
 mask and two relation-function masks. Each shown mask is one-time and gives
 one random dimension per masked value. The closure PSC transcript and the
 three fresh-point values `(B(pt), D(q), weighted B(q))` are covered by that
 per-position instance; the 23 Dot scalars and the 49 closure coefficients are
 not the same mask plan and are not summed. The closure hiding map is 49 x 49
-and the same argument applies: its determinant is a nonzero polynomial,
-checked full rank at three points, with bad-challenge probability below
-`49^2/p^3 < 2^-179` (sections 3.12 and 6).
+per position and the same argument applies: its determinant is a nonzero
+polynomial, checked full rank at three points. With one instance per
+position, the union bound over the 16 instances is
+`16*49^2/p^3 < 2^-176` (sections 3.12 and 6).
 
 ### 3.6 Closure messages and the full output row
 
 The closure slack, packed-bit and product messages encode functions `f(Y)`.
 Their openings are covered by the Vandermonde property in 3.2, their SEND
-answers by the pads in 3.3, and their PSC transcript by the closure instance
+answers by the pads in 3.3, and their PSC transcripts by the closure instances
 in 3.5 (49 per-position hiding coefficients and five shown masks per
 position). The Dot PSC's 23-entry index-mask schema is a different oracle and
 is not used for the closure messages.
@@ -229,8 +231,9 @@ BASE symbols.
   reference check `fold_mask_as_drawn` verifies every coefficient and tail).
   The coefficient map is triangular by variable and degree with unit diagonal,
   so its determinant is a nonzero polynomial. It is checked full rank at
-  three points, and the bad-challenge probability is below
-  `(2k+1)^2/p^3 < 2^-178` for `k <= 32` (sections 3.12 and 6). The
+  three points; per instance the bad-challenge probability is below
+  `(2k+1)^2/p^3`. The closed path has two FOLD instances, so the union is
+  `2*(2k+1)^2/p^3 < 2^-178` for `k <= 32` (sections 3.12 and 6). The
   linear-cover criterion holds for every non-degenerate challenge.
 - BASE: the star main row, star mask row and their random tails are fresh
   draws. The public BASE rows and openings are affine in those draws, so the
@@ -259,7 +262,8 @@ BASE symbols.
 - The PSC hiding maps are full rank except on a bad challenge set bounded in
   section 6: their determinants are nonzero polynomials (triangular by
   variable and degree), checked at three points, with degree bounds `23^2`
-  and `49^2`.
+  for the single Dot instance and `49^2` for each of the 16 closure
+  instances.
 - `chi != 0`; if `chi = 0`, the residual combines only the `t = 0` term and
   the corresponding term is in section 6.
 - The SEND sample's beta is drawn nonzero by the implementation; the pad
@@ -268,8 +272,9 @@ BASE symbols.
 - The hash model is random-oracle or collision-resistant and the salted
   inputs have the stated min-entropy.
 - The FOLD fresh-mask coefficient map is full rank except on a bad challenge
-  set bounded by `(2k+1)^2/p^3 < 2^-178` for `k <= 32`; the BASE star rows
-  and tails are fresh and independent.
+  set per instance; the two FOLD instances have the union bound
+  `2*(2k+1)^2/p^3 < 2^-178` for `k <= 32`. The BASE star rows and tails are
+  fresh and independent.
 - The hidden path has no code-switch stage; a CS path would need its own
   fresh-mask/star coverage.
 - No pad, mask class, material stream or table reservation is reused outside
@@ -368,14 +373,15 @@ block test.
   bound is `D_PSC <= 23^2`, so a bad challenge has probability at most
   `D_PSC/p^3 < 2^-181`.
 - Closure PSC: the same construction with 23 sumcheck variables and 49
-  hiding entries; rank 49 at three points; `D_PSC <= 49^2`, bad challenge
-  probability `< 2^-179`. The five shown masks cover the two end values and
-  the three fresh-point values.
+  hiding entries per position; rank 49 at three points; per-instance degree
+  `49^2`. With one instance per position, the union bound over 16 instances
+  is `16*49^2/p^3 < 2^-176`. The five shown masks per position cover the two
+  end values and the three fresh-point values.
 - FOLD: the fresh mask's `2k+1` coefficients fill the start sum and the sent
   `(c0,c2)` round values; the coefficient map is triangular by variable and
   degree with unit diagonal. Its determinant is a nonzero polynomial; a
-  conservative degree bound is `(2k+1)^2`, giving a bad-challenge probability
-  below `2^-178` for `k <= 32`.
+  conservative per-instance degree bound is `(2k+1)^2`. With two FOLD
+  instances the union bound is below `2^-178` for `k <= 32`.
 - BASE: the star main row, star mask row and their tails are fresh per value;
   each public BASE value has its own star random dimension, so the multi-value
   map is an identity block (rank equal to the number of values), not a
@@ -465,8 +471,9 @@ verifier must keep the full chain, not a subset.
 `[FACT]` The base field is `p = 2^64 - 2^32 + 1`. Its cubic extension has
 `p^3` elements with `log2(p^3) = 191.99999999899`, so `1/p^3` is slightly
 larger than `2^-192`. The conservative bounds below use the looser powers:
-`1/p^3 < 2^-191`, `30/p^3 < 2^-187`, `16*166/p^3 < 2^-180` and
-`2/p^3 < 2^-190`.
+`1/p^3 < 2^-191`, `30/p^3 < 2^-187` for the Dot PSC,
+`1134/p^3 < 2^-181` for the Dot and 16 closure PSC degree terms,
+`16*166/p^3 < 2^-180` and `2/p^3 < 2^-190`.
 
 The existing plan ledger gives a 128-bit target per round. With work counted,
 the largest round errors are 2^-128.00 (FOLD rounds and BASE lambda); the four
@@ -488,8 +495,8 @@ eps_total <= eps_hash + eps_components
 
 eps_hash = (t + q_V + 1) * 2^-128.00
          + (17/2) * (t + q_V)^2 / 2^256
-eps_components = 8 * 2^-128 + 2^-180 + 2^-187 + 2^-190 + 2^-191 + eps_rank_bad
-eps_rank_bad <= (23^2 + 49^2 + (2k+1)^2) / p^3 < 2^-178
+eps_components = 8 * 2^-128 + 2^-180 + 2^-181 + 2^-190 + 2^-191 + eps_rank_bad
+eps_rank_bad <= (23^2 + 16*49^2 + 2*(2k+1)^2) / p^3 < 2^-176
 ```
 
 The terms are:
@@ -498,10 +505,10 @@ The terms are:
 |---|---|---:|
 | audited proximity/LKP rounds | 8 rounds from the plan | `8 * 2^-128 = 2^-125` |
 | range booleanity | 16 positions, degree at most 166 each | `16*166/p^3 < 2^-180` |
-| PSC | 10 sumcheck variables, degree 3 each | `30/p^3 < 2^-187` |
+| PSC | 10 variables for the Dot instance and 23 for each of 16 closure instances, degree 3 each | `(30 + 16*69)/p^3 < 2^-181` |
 | single equality | degree 2 | `2/p^3 < 2^-190` |
 | `chi = 0` | one event | `1/p^3 < 2^-191` |
-| PSC/FOLD rank determinant | degrees `23^2`, `49^2`, `(2k+1)^2` | `eps_rank_bad < 2^-178` for `k <= 32` |
+| PSC/FOLD rank determinant | degrees `23^2`, `16*49^2`, `2*(2k+1)^2` | `eps_rank_bad < 2^-176` for `k <= 32` |
 
 `[FACT]` The draw census behind these terms is the actual plan: 73 index-mask
 entries; 864 closure-mask entries (16 positions times 49 hiding plus 5 shown);
