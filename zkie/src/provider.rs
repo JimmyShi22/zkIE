@@ -5,7 +5,7 @@
 //! proof. Verify reads only the public commitment/proof/inputs.
 
 use std::fs;
-use std::io::{BufReader, Cursor, Read};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
@@ -80,20 +80,8 @@ fn deserialize_exact<T: DeserializeOwned>(bytes: &[u8], trailing_error: Error) -
     Ok(value)
 }
 
-fn read_proof_exact(path: &Path) -> Result<SharedTrace> {
-    let file = fs::File::open(path).map_err(|_| Error::IncompleteArtifact)?;
-    let mut reader = BufReader::new(file);
-    read_proof_from(&mut reader)
-}
-
-fn read_proof_from<R: Read>(reader: &mut R) -> Result<SharedTrace> {
-    let trace = bincode::deserialize_from(&mut *reader).map_err(|_| Error::InvalidEncoding)?;
-    let mut trailing = [0u8; 1];
-    match reader.read(&mut trailing) {
-        Ok(0) => Ok(trace),
-        Ok(_) => Err(Error::InvalidProof),
-        Err(_) => Err(Error::Io),
-    }
+fn read_proof_exact(path: &Path, memory_budget_bytes: u64) -> Result<SharedTrace> {
+    crate::bounded_trace::read_file(path, memory_budget_bytes)
 }
 
 fn parse_case(case: &Path) -> Result<ProviderConfig> {
@@ -404,7 +392,7 @@ impl PipelineProvider for ProductionProvider {
         let statement_bytes = fs::read(&request.statement).map_err(|_| Error::IncompleteArtifact)?;
         let statement: StatementData =
             deserialize_exact(&statement_bytes, Error::InvalidProof)?;
-        let trace = read_proof_exact(&request.proof)?;
+        let trace = read_proof_exact(&request.proof, ctx.runtime.memory_budget_bytes)?;
         let public_inputs =
             fs::read(&request.public_inputs).map_err(|_| Error::IncompleteArtifact)?;
 
@@ -568,7 +556,7 @@ pub fn production_provider() -> ProductionProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{self, Cursor};
+    use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
     fn trace() -> SharedTrace {
         SharedTrace {
@@ -629,17 +617,17 @@ mod tests {
         let path = root.join("proof.bin");
         let bytes = bincode::serialize(&trace()).unwrap();
         fs::write(&path, &bytes).unwrap();
-        read_proof_exact(&path).unwrap();
+        read_proof_exact(&path, 1 << 20).unwrap();
         let mut trailing = bytes.clone();
         trailing.push(0);
         fs::write(&path, &trailing).unwrap();
         assert_eq!(
-            read_proof_exact(&path).unwrap_err().code(),
+            read_proof_exact(&path, 1 << 20).unwrap_err().code(),
             "invalid_proof"
         );
         fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
         assert_eq!(
-            read_proof_exact(&path).unwrap_err().code(),
+            read_proof_exact(&path, 1 << 20).unwrap_err().code(),
             "invalid_encoding"
         );
         let _ = fs::remove_dir_all(&root);
@@ -660,6 +648,12 @@ mod tests {
         }
     }
 
+    impl Seek for ErrorAfter {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            self.bytes.seek(position)
+        }
+    }
+
     #[test]
     fn proof_eof_read_error_is_not_success() {
         let bytes = bincode::serialize(&trace()).unwrap();
@@ -667,7 +661,9 @@ mod tests {
             bytes: Cursor::new(bytes),
         };
         assert_eq!(
-            read_proof_from(&mut reader).unwrap_err().code(),
+            crate::bounded_trace::read_from(&mut reader, 1 << 20)
+                .unwrap_err()
+                .code(),
             "io"
         );
     }
@@ -677,7 +673,7 @@ mod tests {
         let root = temp_path("proof-dir");
         let path = root.join("proof.bin");
         fs::create_dir_all(&path).unwrap();
-        assert!(read_proof_exact(&path).is_err());
+        assert!(read_proof_exact(&path, 1 << 20).is_err());
         let _ = fs::remove_dir_all(&root);
     }
 }
