@@ -982,6 +982,19 @@ fn selected_gpt2_output_head_request_session() {
     // section re-reads the full weight asset and is enabled explicitly so the
     // existing diagnostic fixture run keeps its own measurement basis.
     if env::var_os("ZKIE_SESSION_FORMAL").is_some() {
+        // The formal section runs on a fresh read-only source, as a separate
+        // prover process would. The diagnostic section above has already
+        // consumed the bounded read budget of the shared source.
+        table.source = LmHeadAssetSource::open(
+            &context,
+            &request_plan,
+            configuration,
+            &key,
+            CAP_BYTES,
+            WINDOW_BYTES,
+            TOTAL_BYTES,
+        )
+        .unwrap();
         let output_plan = build_output_head_output_plan(&plan, &trace.argmax).unwrap();
         let trusted = OutputHeadTrustedInputs {
             activation: *activation_commitment.commitment(),
@@ -998,6 +1011,10 @@ fn selected_gpt2_output_head_request_session() {
         )
         .unwrap();
         println!("hidden_prove_ms={}", started.elapsed().as_millis());
+        println!(
+            "hidden_proof_bytes={}",
+            hidden_proof.encode().unwrap().len()
+        );
         assert_eq!(closure.argmax, output_plan.expected_argmax);
         let trace_output_rows: Vec<Vec<i64>> = (0..OUTPUT_HEAD_POSITIONS)
             .map(|position| {
@@ -1022,6 +1039,50 @@ fn selected_gpt2_output_head_request_session() {
         )
         .unwrap();
         println!("hidden_verify_ms={}", started.elapsed().as_millis());
+        // The formal manifest binds the hidden proof, not the diagnostic
+        // request. The diagnostic byte count stays a separate diagnostic
+        // figure; the formal total is trace + hidden proof + public.
+        let hidden_bytes = hidden_proof.encode().unwrap();
+        let fixture_dir = Path::new(&fixture).join("gpt2-seq16");
+        let hidden_rel = "output-head-hidden-request.bin";
+        let hidden_path = fixture_dir.join(hidden_rel);
+        let _ = fs::remove_file(&hidden_path);
+        fs::write(&hidden_path, &hidden_bytes).expect("write hidden request");
+        let entry = |role: &str, rel: &str| {
+            let data = fs::read(fixture_dir.join(rel)).expect("read formal manifest file");
+            ManifestFile {
+                role: role.to_string(),
+                path: rel.to_string(),
+                bytes: data.len() as u64,
+                digest: zkie_core::artifact::digest_bytes(&data),
+            }
+        };
+        let formal_manifest = VerificationManifest::new(vec![
+            entry("public-commitment", "public/model-commitment.bin"),
+            entry("trace", "proof.bin"),
+            entry("lin-request", hidden_rel),
+        ])
+        .expect("formal manifest");
+        let _ = fs::remove_file(fixture_dir.join(zkie::lm_head_stage::VERIFICATION_MANIFEST_FILE));
+        write_manifest(&fixture_dir, &formal_manifest).expect("write formal manifest");
+        read_manifest(&fixture_dir)
+            .expect("read formal manifest")
+            .verify(&fixture_dir)
+            .expect("verify formal manifest");
+        let formal_total: u64 = formal_manifest.files.iter().map(|file| file.bytes).sum();
+        println!("formal_manifest_total_bytes={formal_total}");
+        let public_bytes = fs::metadata(fixture_dir.join("public/model-commitment.bin"))
+            .expect("public metadata")
+            .len();
+        assert_eq!(
+            formal_total,
+            trace_bytes + hidden_bytes.len() as u64 + public_bytes
+        );
+        let mut tampered_hidden = hidden_bytes.clone();
+        tampered_hidden[0] ^= 1;
+        fs::write(&hidden_path, &tampered_hidden).expect("tamper hidden request");
+        assert!(formal_manifest.verify(&fixture_dir).is_err());
+        fs::write(&hidden_path, &hidden_bytes).expect("restore hidden request");
         assert_eq!(hidden_outcome.outcome.eval_rows.len(), OUTPUT_HEAD_POSITIONS);
         assert_eq!(hidden_proof.session.first.activation, trusted.activation);
 
