@@ -228,6 +228,9 @@ BASE symbols.
   deterministic challenge point is tested.
 - `chi != 0`; if `chi = 0`, the residual combines only the `t = 0` term and
   the corresponding term is in section 6.
+- The SEND pad coefficient is nonzero. A pad, `c_t`, `g_t` or `e_t` that
+  happens to be zero does not mask that one value; each is a `1/p^3` event,
+  and the union over the mask/pad draws is included in section 6.
 - The hash model is random-oracle or collision-resistant and the salted
   inputs have the stated min-entropy.
 - The FOLD fresh-mask coefficient map is full-rank at every drawn challenge;
@@ -350,7 +353,7 @@ eps_total <= eps_hash + eps_components
 
 eps_hash = (t + q_V + 1) * 2^-128.00
          + (17/2) * (t + q_V)^2 / 2^256
-eps_components = 8 * 2^-128 + 2^-180 + 2^-187 + 2^-190 + 2^-191
+eps_components = 8 * 2^-128 + 2^-180 + 2^-187 + 2^-190 + 2^-191 + 2^-184
 ```
 
 The terms are:
@@ -362,6 +365,7 @@ The terms are:
 | PSC | 10 sumcheck variables, degree 3 each | `30/p^3 < 2^-187` |
 | single equality | degree 2 | `2/p^3 < 2^-190` |
 | `chi = 0` | one event | `1/p^3 < 2^-191` |
+| zero pad or mask | fewer than 128 draws | `128/p^3 < 2^-184` |
 
 The `t`/`q_V` factor is carried by the hash term, which is the adaptive
 composition term; the algebraic component count is fixed per proof. The
