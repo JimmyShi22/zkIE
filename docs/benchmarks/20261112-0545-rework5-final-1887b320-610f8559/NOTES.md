@@ -37,7 +37,10 @@ log in this directory.
 
 The proof is 9,939,144 B in every run; sha256
 `f8f512c0e67407210f19dd92d038fd4c71a6bac3a12e1166cd4825d9413215f5`.
-The runs are the full raw set; no best-run selection is used.
+The runs are the full raw set; no best-run selection is used. The earlier
+355 s / 161.5 GiB reference remains the performance record; these runs are
+355.1-356.4 s and 161.5-162.0 GiB, within the recorded spread and not a new
+baseline. No numeric threshold is preset.
 
 ## Workspace
 
