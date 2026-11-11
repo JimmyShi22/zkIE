@@ -2515,6 +2515,11 @@ impl TableRowSource for LmHeadAssetSource {
         }
         let tail_row = self.tails.get(row as usize).ok_or(Error::ShapeMismatch)?;
         tail.copy_from_slice(tail_row);
+        zkie_engine::profile::add_table_bytes(
+            self.matrix_rows
+                .saturating_mul(self.factor)
+                .saturating_mul(4),
+        );
         Ok(())
     }
 }
@@ -2536,6 +2541,7 @@ pub fn build_lm_head_holder(
     total_bytes: u64,
 ) -> Result<StreamingHolder<LmHeadAssetSource>> {
     let shape = plan.table_shape()?;
+    let _profile_open = zkie_engine::profile::Scope::new("table.open");
     let mut source = LmHeadAssetSource::open(
         context,
         plan,
@@ -2545,6 +2551,8 @@ pub fn build_lm_head_holder(
         window_bytes,
         total_bytes,
     )?;
+    drop(_profile_open);
+    let _profile_commit = zkie_engine::profile::Scope::new("table.commit");
     let table = zkie_engine::pcs::request::table::commit_table_stored(
         &mut source,
         store,
@@ -2554,6 +2562,7 @@ pub fn build_lm_head_holder(
         panel_columns,
         max_bytes,
     )?;
+    drop(_profile_commit);
     StreamingHolder::new(table, source, LM_HEAD_COLUMN_DRAWS as u64)
 }
 

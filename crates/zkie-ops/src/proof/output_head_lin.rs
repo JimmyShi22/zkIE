@@ -871,6 +871,7 @@ pub fn prove_output_head_lin_hidden(
     activation_rows: &[Vec<i64>],
     activation_salts: &[Vec<u8>],
 ) -> Result<(OutputHeadLinProof, HiddenLinWitness, OutputHeadClosure)> {
+    let _profile_total = zkie_engine::profile::Scope::new("total.prove_output_head_lin_hidden");
     shape.check()?;
     output.validate(shape)?;
     let positions = output.step.positions;
@@ -890,21 +891,29 @@ pub fn prove_output_head_lin_hidden(
     }
     let activation_shape =
         ActivationShape::new(positions as u32, hidden as u32, salt_bytes)?;
+    let _profile_activation = zkie_engine::profile::Scope::new("activation.commit_signed");
     let activation = CommittedActivation::commit_signed(
         activation_shape,
         activation_rows,
         activation_salts,
         setup.activation_configuration,
     )?;
+    drop(_profile_activation);
     let reader = table.reader().clone();
+    let _profile_plan = zkie_engine::profile::Scope::new("plan.hidden_plan");
     let plan = hidden_plan(shape, setup, &reader, *activation.commitment(), output)
         ?;
+    drop(_profile_plan);
     let (session, witness) = prove_hidden_lin_hidden(&plan, &activation, table, setup.seed)
         ?;
+    let _profile_rows = zkie_engine::profile::Scope::new("post.witness_output_rows");
     let rows = witness_output_rows(&witness)
         ?;
+    drop(_profile_rows);
+    let _profile_close = zkie_engine::profile::Scope::new("post.close_output_relation");
     let closure = close_output_relation(output, &rows)
         ?;
+    drop(_profile_close);
     Ok((OutputHeadLinProof { session }, witness, closure))
 }
 

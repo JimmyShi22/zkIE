@@ -5252,9 +5252,11 @@ fn proximity_prove(
     seed: Digest,
     base_positions: usize,
 ) -> Result<ProximityProof> {
+    let _profile_proximity = zkie_engine::profile::Scope::new("prox.proximity_prove");
     if members.is_empty() || sample_rows.len() != members.len() {
         return Err(Error::ShapeMismatch);
     }
+    let _profile_bat = zkie_engine::profile::Scope::new("prox.bat");
     let plain_members: Vec<ProximityMember> = members.iter().map(|m| m.member.clone()).collect();
     let mut statement = BatStatement::new();
     for member in &plain_members {
@@ -5289,10 +5291,14 @@ fn proximity_prove(
     let combined = bat.finish_run(input)?;
     let fold_row = bat.statement().to_fold_input_row(&combined, &layout)?;
     let chain = bat.into_chain()?;
+    drop(_profile_bat);
 
+    let _profile_group_tables = zkie_engine::profile::Scope::new("prox.group_tables");
     let group_main = build_group_table(&fold_layout, &layout, &plain_members)?;
     let group_mask = build_group_mask(&fold_layout, &layout, &plain_members)?;
+    drop(_profile_group_tables);
 
+    let _profile_fold_start = zkie_engine::profile::Scope::new("prox.fold_start");
     let mut coins = ByteMaskCoins::new(seed)?;
     let mut mask = fold_mask_make(&fold, &mut coins)?;
     fold_mask_make_tail(&fold, &mut mask, &mut coins)?;
@@ -5325,6 +5331,7 @@ fn proximity_prove(
     )?;
     let start_message = start.message.clone();
     let (fresh_rows, fresh_tails) = mask_rows_of_draft(&start.draft, &fold)?;
+    drop(_profile_fold_start);
     let mut chain = chain;
     absorb_fold_start(&mut chain, &start_message)?;
     let epsilon = chain.draw_e()?;
@@ -5345,6 +5352,7 @@ fn proximity_prove(
     prover.start(epsilon, &coins)?;
     let mut gamma = Vec::with_capacity(fold.k as usize);
     let mut rounds = Vec::with_capacity(fold.k as usize);
+    let _profile_fold_rounds = zkie_engine::profile::Scope::new("prox.fold_rounds");
     for _ in 0..fold.k {
         let round = prover.round()?;
         absorb_fold_round(&mut chain, round[0], round[2])?;
@@ -5354,6 +5362,8 @@ fn proximity_prove(
         gamma.push(challenge);
         rounds.push((round[0], round[2]));
     }
+    drop(_profile_fold_rounds);
+    let _profile_fold_output = zkie_engine::profile::Scope::new("prox.fold_output");
     let output = fold_output(
         &fold,
         &fold_layout,
@@ -5389,6 +5399,8 @@ fn proximity_prove(
         mask_tail,
     )?;
     let identity = fold_identity(&handoff);
+    drop(_profile_fold_output);
+    let _profile_base_prover = zkie_engine::profile::Scope::new("prox.base_prover");
     let star_main = draw_values(
         &mut coins,
         usize::try_from(fold.code.ell).map_err(|_| Error::ResourceLimit)?,
@@ -5437,6 +5449,8 @@ fn proximity_prove(
     let lambda = verifier.draw_lambda()?;
     let base_rows = base_prover.base_rows(lambda)?;
     verifier.receive_base_rows(base_rows.clone())?;
+    drop(_profile_base_prover);
+    let _profile_base_openings = zkie_engine::profile::Scope::new("prox.base_openings");
     let positions = verifier.draw_base_positions(base_positions)?;
     let unique = unique_sorted(&positions);
     let member_openings = members
@@ -5463,6 +5477,8 @@ fn proximity_prove(
         fresh: fresh_opening,
     };
     verifier.verify_openings(&openings)?;
+    drop(_profile_base_openings);
+    let _profile_base_finish = zkie_engine::profile::Scope::new("prox.base_finish");
     let (seal, _base) = match verifier.finish()? {
         BaseFinalCheck::Passed(base) => (base.check_value, base),
         BaseFinalCheck::Rejected(_) => return Err(Error::InvalidProof),
@@ -5924,15 +5940,22 @@ fn prove_first(
     output: Option<&[Vec<Fp3>]>,
     randomness: &WCommitRandomness,
 ) -> Result<(HiddenSendMessages, Digest, HiddenSendWitness)> {
+    let _profile_first = zkie_engine::profile::Scope::new("first.prove_first");
     plan.validate()?;
     let reader = table.reader().clone();
     check_activation(&plan.send, activation)?;
     check_table(&plan.send, &reader)?;
+    let _profile_derive = zkie_engine::profile::Scope::new("first.derive_w_rows");
     let rows = derive_w_rows(&plan.send, activation, &reader, table)?;
+    drop(_profile_derive);
+    let _profile_commit_w = zkie_engine::profile::Scope::new("first.commit_w_rows");
     let (group, mut witness) = commit_w_rows(&plan.send, &rows, randomness)?;
+    drop(_profile_commit_w);
     let dot_root = match &plan.send.dot {
         Some(_) => {
+            let _profile_dot = zkie_engine::profile::Scope::new("first.commit_dot_map");
             let (root, map) = commit_dot_map(&plan.send, activation, randomness)?;
+            drop(_profile_dot);
             witness.dot = Some(map);
             Some(root)
         }
@@ -5940,7 +5963,10 @@ fn prove_first(
     };
     let closure_commit = match (&plan.closure, &randomness.closure) {
         (Some(closure_plan), Some(closure_randomness)) => {
+            let _profile_values = zkie_engine::profile::Scope::new("first.closure_values");
             let (slack_values, bit_values) = closure_values_from_rows(closure_plan, &rows)?;
+            drop(_profile_values);
+            let _profile_slack = zkie_engine::profile::Scope::new("first.closure_slack_commit");
             let slack = commit_value_group(
                 &closure_plan.slack,
                 closure_plan.vocab as u64,
@@ -5952,6 +5978,8 @@ fn prove_first(
                 &closure_randomness.slack_salts,
                 plan.send.positions(),
             )?;
+            drop(_profile_slack);
+            let _profile_bits = zkie_engine::profile::Scope::new("first.closure_bits_commit");
             let bits = commit_value_group(
                 &closure_plan.bits,
                 closure_plan.bits_columns,
@@ -5963,8 +5991,13 @@ fn prove_first(
                 &closure_randomness.bits_salts,
                 plan.send.positions(),
             )?;
+            drop(_profile_bits);
+            let _profile_mask = zkie_engine::profile::Scope::new("first.closure_mask_commit");
             let mask = commit_closure_mask(&closure_plan.mask, closure_randomness)?;
+            drop(_profile_mask);
+            let _profile_entries = zkie_engine::profile::Scope::light("first.closure_mask_entries");
             let mask_entries = closure_mask_entry_rows(closure_plan, &mask)?;
+            drop(_profile_entries);
             Some(ClosureWitness {
                 slack,
                 slack_tails: closure_randomness.slack_tails.clone(),
@@ -5996,7 +6029,9 @@ fn prove_first(
         _ => return Err(Error::ShapeMismatch),
     };
     witness.closure = closure_commit;
+    let _profile_check = zkie_engine::profile::Scope::light("first.witness_check");
     witness.check(&plan.send)?;
+    drop(_profile_check);
 
     let mut chain = first_chain(plan, &reader)?;
     absorb_group(&mut chain, &group)?;
@@ -6025,7 +6060,9 @@ fn prove_first(
         Some(dot) => Some(draw_seed_set(&mut chain, dot.sample_bits()?, 1)?),
         None => None,
     };
+    let _profile_answers = zkie_engine::profile::Scope::new("first.w_answers");
     let answers = witness.answers(&seeds)?;
+    drop(_profile_answers);
     absorb_answers(&mut chain, &answers)?;
     let dot_sample = match (&plan.send.dot, &dot_seeds, &witness.dot) {
         (Some(_dot), Some(seed_set), Some(map)) => {
@@ -6059,6 +6096,8 @@ fn prove_first(
                 closure_plan.mask.sample_bits()?,
                 closure_plan.mask.answers,
             )?;
+            let _profile_closure_answers =
+                zkie_engine::profile::Scope::new("first.closure_answers");
             let slack_answers = value_group_answers(
                 &closure_plan.slack,
                 closure_plan.slack_oracle_base,
@@ -6075,6 +6114,7 @@ fn prove_first(
             )?;
             let mask_answer =
                 closure_mask_answer(&closure_plan.mask, &closure.mask.rows, &mask_seeds[0])?;
+            drop(_profile_closure_answers);
             absorb_closure_answers(
                 &mut chain,
                 &slack_answers,
@@ -6096,11 +6136,16 @@ fn prove_first(
     let closure_map = match (plan.closure.as_ref(), &mut witness.closure, &randomness.closure) {
         (Some(closure_plan), Some(closure), Some(closure_randomness)) => {
             let r_bool = draw_closure_r(&mut chain, closure_plan.boolean_variables)?;
+            let _profile_map_values =
+                zkie_engine::profile::Scope::new("first.closure_map_values");
             let map_values = closure
                 .bit_values
                 .iter()
                 .map(|bits| crate::proof::output_closure::closure_map_values(bits, &r_bool))
                 .collect::<Result<Vec<_>>>()?;
+            drop(_profile_map_values);
+            let _profile_map_commit =
+                zkie_engine::profile::Scope::new("first.closure_map_commit");
             let map = commit_value_group(
                 &closure_plan.map,
                 closure_plan.bits_columns,
@@ -6112,6 +6157,7 @@ fn prove_first(
                 &closure_randomness.map_salts,
                 plan.send.positions(),
             )?;
+            drop(_profile_map_commit);
             absorb_closure_group(&mut chain, 26, &map.group)?;
             let map_seeds = draw_closure_seed_set(
                 &mut chain,
@@ -6119,6 +6165,8 @@ fn prove_first(
                 closure_plan.map.sample_bits()?,
                 closure_plan.map.answers,
             )?;
+            let _profile_map_answers =
+                zkie_engine::profile::Scope::new("first.closure_map_answers");
             let map_answers = value_group_answers(
                 &closure_plan.map,
                 closure_plan.map_oracle_base,
@@ -6126,11 +6174,15 @@ fn prove_first(
                 &map.messages,
                 &map_seeds,
             )?;
+            drop(_profile_map_answers);
             absorb_tagged_answers(&mut chain, 36, &map_answers)?;
+            let _profile_closure_check =
+                zkie_engine::profile::Scope::new("first.closure_check");
             closure.map = map.clone();
             closure.map_values = map_values;
             closure.r_bool = r_bool.clone();
             closure.check(closure_plan, &plan.send)?;
+            drop(_profile_closure_check);
             Some((map, map_seeds, map_answers, r_bool))
         }
         (None, None, None) => None,
@@ -6141,6 +6193,8 @@ fn prove_first(
     let mut index_mask_positions = None;
     let mut index_mask_opening = None;
     if let Some((index, mask_witness)) = index_mask {
+        let _profile_index_openings =
+            zkie_engine::profile::Scope::new("first.index_mask_openings");
         let seed = seeds.first().ok_or(Error::ShapeMismatch)?.clone();
         let answer = index_mask_answer(index, &mask_witness.rows, &seed)?;
         absorb_index_mask_answer(&mut chain, answer)?;
@@ -6151,11 +6205,13 @@ fn prove_first(
         index_mask_positions = Some(positions);
         index_mask_opening = Some(opening);
     }
+    let _profile_w_openings = zkie_engine::profile::Scope::new("first.w_openings");
     let positions = draw_positions(&mut chain, &plan.send)?;
     let mut openings = Vec::with_capacity(positions.len());
     for (position, list) in positions.iter().enumerate() {
         openings.push(witness.tree(position as u32)?.open(list)?);
     }
+    drop(_profile_w_openings);
     let closure = match (
         plan.closure.as_ref(),
         &witness.closure,
@@ -6175,6 +6231,8 @@ fn prove_first(
             )),
             Some((map, map_seeds, map_answers, _r_bool)),
         ) => {
+            let _profile_closure_openings =
+                zkie_engine::profile::Scope::new("first.closure_openings");
             let slack_positions = draw_closure_group_positions(
                 &mut chain,
                 31,
@@ -6182,6 +6240,8 @@ fn prove_first(
                 closure_plan.slack_openings,
                 closure_plan.slack.code.log_n,
             )?;
+            let _profile_slack_open =
+                zkie_engine::profile::Scope::new("first.closure_slack_openings");
             let slack_openings = open_value_group_openings(
                 &closure_plan.slack,
                 &closure.slack.messages,
@@ -6189,6 +6249,7 @@ fn prove_first(
                 &closure.slack_salts,
                 &slack_positions,
             )?;
+            drop(_profile_slack_open);
             let bits_positions = draw_closure_group_positions(
                 &mut chain,
                 32,
@@ -6196,6 +6257,8 @@ fn prove_first(
                 closure_plan.bits_openings,
                 closure_plan.bits.code.log_n,
             )?;
+            let _profile_bits_open =
+                zkie_engine::profile::Scope::new("first.closure_bits_openings");
             let bits_openings = open_value_group_openings(
                 &closure_plan.bits,
                 &closure.bits.messages,
@@ -6203,8 +6266,12 @@ fn prove_first(
                 &closure.bits_salts,
                 &bits_positions,
             )?;
+            drop(_profile_bits_open);
             let mask_positions = draw_closure_mask_positions(&mut chain, &closure_plan.mask)?;
+            let _profile_mask_open =
+                zkie_engine::profile::Scope::new("first.closure_mask_openings");
             let mask_opening = closure.mask.tree(&closure_plan.mask)?.open(&mask_positions)?;
+            drop(_profile_mask_open);
             let map_positions = draw_closure_group_positions(
                 &mut chain,
                 37,
@@ -6212,6 +6279,8 @@ fn prove_first(
                 closure_plan.map_openings,
                 closure_plan.map.code.log_n,
             )?;
+            let _profile_map_open =
+                zkie_engine::profile::Scope::new("first.closure_map_openings");
             let map_openings = open_value_group_openings(
                 &closure_plan.map,
                 &map.messages,
@@ -6219,6 +6288,7 @@ fn prove_first(
                 &closure.map_salts,
                 &map_positions,
             )?;
+            drop(_profile_map_open);
             Some(ClosureFirstMessages {
                 slack: closure.slack.clone(),
                 slack_sample: SendSamples {
@@ -6256,9 +6326,11 @@ fn prove_first(
         (None, None, None, None) => None,
         _ => return Err(Error::ShapeMismatch),
     };
+    let _profile_eval = zkie_engine::profile::Scope::new("first.eval_targets");
     let psi = draw_psi(&mut chain, &plan.send)?;
     let mut targets = eval_targets(plan, &rows, output, &psi)?;
     let expected = witness.eval_values(&psi)?;
+    drop(_profile_eval);
     if expected != targets {
         return Err(Error::InvalidProof);
     }
@@ -7060,6 +7132,7 @@ fn prove_shared(
     first_seal: &Digest,
     seed: &Digest,
 ) -> Result<SharedProveResult> {
+    let _profile_shared = zkie_engine::profile::Scope::new("shared.prove_shared");
     let k_col = shared_point_bits(plan)?;
     let mut chain = shared_start_chain(plan, reader, first_seal)?;
     let psi = draw_point_round(
@@ -7069,7 +7142,9 @@ fn prove_shared(
         k_col,
     )?;
     let gamma = psi[plan.send.k_lo as usize..].to_vec();
+    let _profile_fold_table = zkie_engine::profile::Scope::new("shared.fold_table");
     let (folded, folded_tail) = fold_table(table, reader.shape, &gamma)?;
+    drop(_profile_fold_table);
     let gu = plan.proximity.gu.clone();
     let mut gu_coins = ByteMaskCoins::new(derive_run_seed(seed, 2, 0)?)?;
     let gu_pads = draw_values(&mut gu_coins, gu.u.answers as usize)?;
@@ -7087,7 +7162,9 @@ fn prove_shared(
         usize::try_from(gu.tree.columns()).map_err(|_| Error::ResourceLimit)?,
         gu.tree.salt_bytes,
     )?;
+    let _profile_gu_table = zkie_engine::profile::Scope::new("shared.gu_table");
     let mut gu_witness = gu_table(&gu, &folded, &folded_tail)?;
+    drop(_profile_gu_table);
     let (main_pads, mask_pads) = gu_sample_pad_offsets(&gu)?;
     if !mask_pads.is_empty() || main_pads.len() != gu_pads.len() {
         return Err(Error::ShapeMismatch);
@@ -7110,7 +7187,9 @@ fn prove_shared(
                 .to_vec(),
         );
     }
+    let _profile_gu_commit = zkie_engine::profile::Scope::new("shared.gu_commit");
     let gu_tree = commit_rows_tree(gu.tree.clone(), gu.u.code, &gu_message, &gu_tails, &gu_salts)?;
+    drop(_profile_gu_commit);
     let gu_root = *gu_tree.root();
     let mut registry = GuRegistry::new();
     registry.receive(
@@ -7136,7 +7215,10 @@ fn prove_shared(
         None,
     )?;
     let unique = unique_sorted(&positions);
+    let _profile_open_columns = zkie_engine::profile::Scope::new("shared.table_open_columns");
     let gu_openings = table.open_columns(&unique)?;
+    drop(_profile_open_columns);
+    let _profile_column_rows = zkie_engine::profile::Scope::new("shared.column_rows");
     let column_map = table_column_map(reader, &positions, &gu_openings)?;
     let eq_gamma = foldeq_weights(&gamma, reader.shape.v)?;
     let record_seeds = record_seeds(&reader.shape, &reader.name(), reader.shape.answers as usize)?;
@@ -7157,6 +7239,7 @@ fn prove_shared(
         let column = column_for(&column_map, *position)?;
         column_rows.push(column_row(&gu, &registry, *position, &column, &eq_gamma)?);
     }
+    drop(_profile_column_rows);
 
     let omega = plan.proximity.omega.clone();
     let matrix_rows = omega.matrix_rows;
@@ -7166,6 +7249,7 @@ fn prove_shared(
     }
     let low_count = 1u64 << k_lo;
     let mut omega_vector = vec![Fp3::ZERO; usize::try_from(matrix_rows).map_err(|_| Error::ResourceLimit)?];
+    let _profile_omega_vector = zkie_engine::profile::Scope::new("shared.omega_vector");
     for y in 0..matrix_rows {
         let mut sum = Fp3::ZERO;
         for low in 0..low_count {
@@ -7180,6 +7264,7 @@ fn prove_shared(
         }
         omega_vector[usize::try_from(y).map_err(|_| Error::ResourceLimit)?] = sum;
     }
+    drop(_profile_omega_vector);
     let mut omega_coins = ByteMaskCoins::new(derive_run_seed(seed, 3, 0)?)?;
     let omega_pads = draw_values(&mut omega_coins, omega.u.answers as usize)?;
     let omega_tail_len = usize::try_from(omega.u.code.r).map_err(|_| Error::ResourceLimit)?;
@@ -7194,6 +7279,7 @@ fn prove_shared(
         omega.tree.salt_bytes,
     )?;
     let omega_ell = usize::try_from(omega.u.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let _profile_omega_commit = zkie_engine::profile::Scope::new("shared.omega_commit");
     let mut omega_message = vec![vec![Fp3::ZERO; omega_ell]; omega_rows];
     for (index, value) in omega_vector.iter().enumerate() {
         let row = index % omega_rows;
@@ -7225,6 +7311,7 @@ fn prove_shared(
         &omega_tails,
         &omega_salts,
     )?;
+    drop(_profile_omega_commit);
     let omega_root = *omega_tree.root();
     absorb_root_round(&mut chain, &omega_root)?;
     let omega_bits = sample_cube_of(&omega.u)?.bits;
@@ -7310,6 +7397,7 @@ fn prove_shared(
             )?]);
         }
     }
+    let _profile_plain_rows = zkie_engine::profile::Scope::new("shared.plain_rows");
     let mut plain_rows = Vec::new();
     for row in &record_rows {
         plain_rows.push(relation_row_bat(row, &members[gu_bat as usize])?);
@@ -7327,6 +7415,7 @@ fn prove_shared(
         matrix_rows,
         k_lo,
     )?);
+    drop(_profile_plain_rows);
     let gu_prover = ProximityMemberProver::sealed(members[gu_bat as usize].clone(), gu_tree)?;
     let omega_prover =
         ProximityMemberProver::sealed(members[omega_bat as usize].clone(), omega_tree)?;
@@ -7338,6 +7427,7 @@ fn prove_shared(
         &members,
         plan.proximity.shared_mask_tree.leaf_class,
     )?;
+    let _profile_proximity = zkie_engine::profile::Scope::new("shared.proximity");
     let proximity = proximity_prove(
         chain,
         fold,
@@ -7349,6 +7439,7 @@ fn prove_shared(
         derive_run_seed(seed, 4, 0)?,
         plan.proximity.shared_base_positions,
     )?;
+    drop(_profile_proximity);
     let messages = HiddenSharedMessages {
         gu_root,
         gu_seeds: gu_seeds.clone(),
@@ -7408,9 +7499,11 @@ fn commit_rows_tree(
         return Err(Error::ShapeMismatch);
     }
     let mut codewords = Vec::with_capacity(message_rows.len());
+    let _profile_encode = zkie_engine::profile::Scope::light("commit_rows_tree.encode");
     for (message, tail) in message_rows.iter().zip(tails) {
         codewords.push(encode_row_fp3(&code, message, tail)?);
     }
+    drop(_profile_encode);
     RuntimeTree::commit(
         tree_plan,
         &[RuntimePartRows {
@@ -9261,6 +9354,8 @@ fn prove_second(
     seed: &Digest,
     bind_residual: bool,
 ) -> Result<OwnProveResult> {
+    let _profile_second = zkie_engine::profile::Scope::new("second.prove_second");
+    let _profile_own_members = zkie_engine::profile::Scope::new("second.own_members");
     let (members, order) = own_members(
         plan,
         first,
@@ -9268,10 +9363,13 @@ fn prove_second(
         Some(witness),
         Some((&shared_witness.omega_message, &shared_witness.omega_tails)),
     )?;
+    drop(_profile_own_members);
+    let _profile_tilde = zkie_engine::profile::Scope::light("second.tilde");
     let tilde = match &plan.send.index_mask {
         Some(_) => tilde_values(plan, witness, shared_point)?,
         None => Vec::new(),
     };
+    drop(_profile_tilde);
     let mut chain = second_chain(
         plan,
         reader,
@@ -9286,6 +9384,7 @@ fn prove_second(
     }
     let (dot_proof, dot_binding) = match &plan.send.dot {
         Some(_) => {
+            let _profile_dot = zkie_engine::profile::Scope::new("second.dot_identity");
             let (proof, binding) = prove_dot_identity(
                 plan,
                 &mut chain,
@@ -9294,6 +9393,7 @@ fn prove_second(
                 &tilde,
                 bind_residual,
             )?;
+            drop(_profile_dot);
             (Some(proof), Some(binding))
         }
         None => (None, None),
@@ -9313,7 +9413,10 @@ fn prove_second(
         (None, None) => (None, None),
         _ => return Err(Error::ShapeMismatch),
     };
+    let _profile_sample_rows = zkie_engine::profile::Scope::new("second.sample_rows");
     let sample_rows = own_sample_rows(plan, &members, first, shared)?;
+    drop(_profile_sample_rows);
+    let _profile_plain_rows = zkie_engine::profile::Scope::new("second.plain_rows");
     let plain_rows = own_plain_rows(
         plan,
         &members,
@@ -9323,7 +9426,9 @@ fn prove_second(
         dot_binding.as_ref(),
         closure_binding.as_ref(),
     )?;
+    drop(_profile_plain_rows);
     let mut provers = Vec::with_capacity(members.len());
+    let _profile_witness_trees = zkie_engine::profile::Scope::new("second.witness_trees");
     for member in &members {
         let tree = witness_tree_for(
             member,
@@ -9335,6 +9440,7 @@ fn prove_second(
         provers.push(ProximityMemberProver::sealed(member.clone(), tree)
             ?);
     }
+    drop(_profile_witness_trees);
     provers.sort_by_key(|member| member.member.bat_oracle);
     let fold = member_fold_shape(
         plan.proximity.code,
@@ -9342,6 +9448,7 @@ fn prove_second(
         &members,
         plan.proximity.own_mask_tree.leaf_class,
     )?;
+    let _profile_proximity = zkie_engine::profile::Scope::new("second.proximity");
     let proximity = proximity_prove(
         chain,
         fold,
@@ -9353,6 +9460,7 @@ fn prove_second(
         derive_run_seed(seed, 5, 0)?,
         plan.proximity.own_base_positions,
     )?;
+    drop(_profile_proximity);
     let mut claims = sample_rows.into_iter().flatten().collect::<Vec<_>>();
     let _ = order;
     Ok(OwnProveResult {
@@ -9406,6 +9514,7 @@ fn witness_tree_for(
                         .to_vec(),
                 );
             }
+            let _profile_tree = zkie_engine::profile::Scope::light("witness_tree.slack");
             return commit_rows_tree(
                 member.tree_plan.clone(),
                 member.main_code,
@@ -9439,6 +9548,7 @@ fn witness_tree_for(
                         .to_vec(),
                 );
             }
+            let _profile_tree = zkie_engine::profile::Scope::light("witness_tree.bits");
             return commit_rows_tree(
                 member.tree_plan.clone(),
                 member.main_code,
@@ -9472,6 +9582,7 @@ fn witness_tree_for(
                         .to_vec(),
                 );
             }
+            let _profile_tree = zkie_engine::profile::Scope::light("witness_tree.map");
             return commit_rows_tree(
                 member.tree_plan.clone(),
                 member.main_code,
@@ -9494,16 +9605,19 @@ fn witness_tree_for(
                 .index_mask
                 .as_ref()
                 .ok_or(Error::ShapeMismatch)?;
+            let _profile_tree = zkie_engine::profile::Scope::light("witness_tree.index_mask");
             return mask_witness.tree(index);
         }
     }
     if let Some(dot) = &plan.send.dot {
         if member.source_oracle == dot.oracle {
             let map = witness.dot.as_ref().ok_or(Error::ShapeMismatch)?;
+            let _profile_tree = zkie_engine::profile::Scope::light("witness_tree.dot");
             return map.tree(dot);
         }
     }
     if member.source_oracle == plan.proximity.omega.oracle {
+        let _profile_tree = zkie_engine::profile::Scope::light("witness_tree.omega");
         commit_rows_tree(
             member.tree_plan.clone(),
             member.main_code,
@@ -9533,6 +9647,7 @@ fn witness_tree_for(
             .get(position)
             .ok_or(Error::ShapeMismatch)?
             .clone();
+        let _profile_tree = zkie_engine::profile::Scope::light("witness_tree.w");
         commit_rows_tree(
             member.tree_plan.clone(),
             member.main_code,
@@ -9683,17 +9798,20 @@ fn prove_hidden_lin_inner(
     seed: Digest,
     bind_residual: bool,
 ) -> Result<(HiddenLinMessages, HiddenLinWitness)> {
+    let _profile_session = zkie_engine::profile::Scope::new("session.prove_hidden_lin_inner");
     plan.validate()?;
     if seed == Digest::ZERO {
         return Err(Error::InvalidConfig);
     }
     let reader = table.reader().clone();
     let mut coins = ByteMaskCoins::new(derive_run_seed(&seed, 1, 0)?)?;
+    let _profile_randomness = zkie_engine::profile::Scope::light("session.w_commit_randomness");
     let randomness = WCommitRandomness::from_coins(
         &mut coins,
         &plan.send,
         plan.closure.as_ref(),
     )?;
+    drop(_profile_randomness);
     let (first, first_seal, send_witness) =
         prove_first(plan, activation, table, output, &randomness)?;
     let first_query = *first_chain(plan, &reader)?.value();

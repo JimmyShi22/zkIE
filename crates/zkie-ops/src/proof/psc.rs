@@ -648,6 +648,7 @@ pub fn prove_dot_sumcheck(
     masks: &DotMaskEntries,
     challenges: &mut dyn PscChallenges,
 ) -> Result<(DotProof, DotOutput)> {
+    let _profile_psc = zkie_engine::profile::Scope::new("psc.prove_dot_sumcheck");
     if x_chi.len() != omega.len() {
         return Err(Error::ShapeMismatch);
     }
@@ -661,8 +662,12 @@ pub fn prove_dot_sumcheck(
     }
     let sigma = claim.mask_sum()?;
 
+    let _profile_product_new = zkie_engine::profile::Scope::new("psc.product_new");
     let mut inner = ProductSumcheckProver::new(x_chi, omega)?;
+    drop(_profile_product_new);
+    let _profile_hiding_new = zkie_engine::profile::Scope::light("psc.hiding_new");
     let mut hiding = HidingPolynomial::new(&variables, &masks.hiding)?;
+    drop(_profile_hiding_new);
 
     let mut proof = DotProof {
         hiding_sum: hiding.sum(),
@@ -679,8 +684,12 @@ pub fn prove_dot_sumcheck(
     let mut drawn = Vec::with_capacity(k + 1);
 
     for variable in 0..k {
+        let _profile_product_round = zkie_engine::profile::Scope::light("psc.product_round");
         let summand_round = inner.round()?;
+        drop(_profile_product_round);
+        let _profile_hiding_round = zkie_engine::profile::Scope::light("psc.hiding_round");
         let mut round = hiding.round()?;
+        drop(_profile_hiding_round);
         add_scaled(&mut round, &summand_round, eps)?;
         add_weight(&mut round, &variables[variable], eps.mul(&sigma).mul(&psis))?;
         if variables[variable].apply(&round)? != running {
@@ -696,13 +705,16 @@ pub fn prove_dot_sumcheck(
         let challenge = challenges.draw()?;
         drawn.push(challenge);
         running = poly_at(&round, challenge);
+        let _profile_bind = zkie_engine::profile::Scope::light("psc.bind");
         hiding.bind(challenge)?;
         psis = psis.mul(&poly_at(variables[variable].psi(), challenge));
         inner.bind(challenge)?;
+        drop(_profile_bind);
     }
 
     // The last variable masks the shown end values. Its round polynomial is
     // the product summand in Y, read from its values at 0, 1 and 2.
+    let _profile_end = zkie_engine::profile::Scope::new("psc.end");
     let ends = inner.end_values()?;
     let mut values = Vec::with_capacity(PRODUCT_DEGREE + 1);
     for node in 0..=PRODUCT_DEGREE {

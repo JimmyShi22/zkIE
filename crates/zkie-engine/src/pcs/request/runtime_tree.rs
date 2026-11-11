@@ -144,6 +144,7 @@ impl MaskTree {
         tails: &[Vec<Fp3>],
         salts: &[Vec<u8>],
     ) -> Result<Self> {
+        let _profile_commit = crate::profile::Scope::new("mask_tree.commit");
         if plan.fault().is_some() {
             return Err(Error::InvalidConfig);
         }
@@ -832,6 +833,7 @@ impl RuntimeTree {
         parts: &[RuntimePartRows],
         salts: &[Vec<u8>],
     ) -> Result<Self> {
+        let _profile_commit = crate::profile::Scope::new("runtime_tree.commit");
         if plan.fault().is_some() {
             return Err(Error::InvalidConfig);
         }

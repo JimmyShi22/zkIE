@@ -1099,15 +1099,20 @@ pub fn commit_table_stored<S: TableRowSource, T: EncodedRowStore + ?Sized>(
     }
     let mut message = vec![Fp::ZERO; ell];
     let mut tail = vec![Fp::ZERO; tail_len];
+    let _profile_encode_rows = crate::profile::Scope::new("table.commit.encode_rows");
     for row in 0..rows_usize {
         source.row(row as u64, &mut message, &mut tail)?;
         let codeword = encode_row_fp(&shape.code, &message, &tail)?;
         store.put_row(row as u64, &codeword)?;
     }
+    drop(_profile_encode_rows);
+    let _profile_store_finish = crate::profile::Scope::new("table.commit.store_finish");
     store.finish()?;
+    drop(_profile_store_finish);
     let mut symbols = vec![Fp::ZERO; rows_usize * panel];
     let mut leaves = Vec::with_capacity(n_usize);
     let mut start = 0usize;
+    let _profile_leaves = crate::profile::Scope::new("table.commit.leaves");
     while start < n_usize {
         let count = panel.min(n_usize - start);
         store.read_columns(start as u64, count, rows_usize, &mut symbols)?;
@@ -1122,7 +1127,10 @@ pub fn commit_table_stored<S: TableRowSource, T: EncodedRowStore + ?Sized>(
         }
         start += count;
     }
+    drop(_profile_leaves);
+    let _profile_merkle = crate::profile::Scope::new("table.commit.merkle");
     let tree = merkle_build(&configuration, &leaves)?;
+    drop(_profile_merkle);
     let root = tree.root;
     let name = index_name(&root, &shape, &configuration);
     let answers = usize::try_from(shape.answers).map_err(|_| Error::ResourceLimit)?;
@@ -1130,6 +1138,7 @@ pub fn commit_table_stored<S: TableRowSource, T: EncodedRowStore + ?Sized>(
     let mut record = IndexRecord {
         y: Vec::with_capacity(rows_usize.saturating_mul(answers)),
     };
+    let _profile_record = crate::profile::Scope::new("table.commit.record");
     for row in 0..rows_usize {
         source.row(row as u64, &mut message, &mut tail)?;
         for answer in 0..answers {
@@ -1141,6 +1150,7 @@ pub fn commit_table_stored<S: TableRowSource, T: EncodedRowStore + ?Sized>(
             )?);
         }
     }
+    drop(_profile_record);
     let reader = IndexReader {
         shape,
         configuration,

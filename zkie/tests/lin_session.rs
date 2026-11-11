@@ -1221,9 +1221,15 @@ fn selected_gpt2_output_head_request_session() {
     // section re-reads the full weight asset and is enabled explicitly so the
     // existing diagnostic fixture run keeps its own measurement basis.
     if env::var_os("ZKIE_SESSION_FORMAL").is_some() {
+        // Close the pre-formal profile window (table commit and the
+        // diagnostic prove), then profile the formal hidden path alone.
+        zkie_engine::profile::dump();
+        zkie_engine::profile::reset();
         // The formal section runs on a fresh read-only source, as a separate
         // prover process would. The diagnostic section above has already
         // consumed the bounded read budget of the shared source.
+        let _profile_formal_open =
+            zkie_engine::profile::Scope::new("harness.formal_table_open");
         table.source = LmHeadAssetSource::open(
             &context,
             &request_plan,
@@ -1234,6 +1240,7 @@ fn selected_gpt2_output_head_request_session() {
             TOTAL_BYTES,
         )
         .unwrap();
+        drop(_profile_formal_open);
         let output_plan = build_output_head_output_plan(&plan, &trace.argmax).unwrap();
         let trusted = OutputHeadTrustedInputs {
             activation: *activation_commitment.commitment(),
@@ -2071,10 +2078,13 @@ fn selected_gpt2_output_head_request_session() {
             ledger_state.total_table_reuse().expect("table reuse")
         );
         println!("hidden_prove_ms={hidden_prove_ms}");
-        println!(
-            "hidden_proof_bytes={}",
-            hidden_proof.encode().unwrap().len()
-        );
+        let mut hidden_encode_profile =
+            zkie_engine::profile::Scope::new("harness.hidden_proof_encode");
+        let hidden_proof_bytes = hidden_proof.encode().unwrap().len();
+        hidden_encode_profile.add_bytes(hidden_proof_bytes as u64);
+        println!("hidden_proof_bytes={hidden_proof_bytes}");
+        drop(hidden_encode_profile);
+        zkie_engine::profile::dump();
         assert_eq!(closure.argmax, output_plan.expected_argmax);
         let trace_output_rows: Vec<Vec<i64>> = (0..OUTPUT_HEAD_POSITIONS)
             .map(|position| {

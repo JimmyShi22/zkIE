@@ -920,6 +920,7 @@ pub fn commit_value_group(
     salts: &[Vec<Vec<u8>>],
     positions: u32,
 ) -> Result<CommittedValueGroup> {
+    let _profile_commit = zkie_engine::profile::Scope::new("value_group.commit");
     if values.len() != positions as usize
         || values.iter().any(|row| row.len() as u64 != columns)
         || pads.len() != positions as usize * shape.answers as usize
@@ -936,6 +937,7 @@ pub fn commit_value_group(
     let mut messages = Vec::with_capacity(positions as usize);
     let mut roots = Vec::with_capacity(positions as usize);
     for (position, values) in values.iter().enumerate() {
+        let _profile_layout = zkie_engine::profile::Scope::light("value_group.layout");
         let mut message = vec![vec![Fp3::ZERO; ell]; rows];
         for (column, value) in values.iter().enumerate() {
             let row = column % rows;
@@ -963,9 +965,11 @@ pub fn commit_value_group(
             }
             *entry = pad;
         }
+        drop(_profile_layout);
         let tail = tails
             .get(position)
             .ok_or(Error::ShapeMismatch)?;
+        let _profile_encode = zkie_engine::profile::Scope::light("value_group.encode");
         let mut codewords = Vec::with_capacity(rows);
         for row in 0..rows {
             let message_row = message.get(row).ok_or(Error::ShapeMismatch)?;
@@ -974,6 +978,7 @@ pub fn commit_value_group(
                 .ok_or(Error::ShapeMismatch)?;
             codewords.push(encode_row_fp3(&shape.code, message_row, row_tail)?);
         }
+        drop(_profile_encode);
         let salt = salts.get(position).ok_or(Error::ShapeMismatch)?;
         let tree_plan = shape.tree_plan(position as u32)?;
         let tree = RuntimeTree::commit(
@@ -1739,6 +1744,7 @@ pub fn prove_closure_second(
     mask_entries: &[Vec<Fp3>],
     r_bool: &[Fp3],
 ) -> Result<(ClosureSecondMessages, ClosureRowBinding)> {
+    let _profile_psc = zkie_engine::profile::Scope::new("second.closure_psc");
     let positions = plan.winner.len();
     if bit_values.len() != positions
         || map_values.len() != positions
@@ -1753,6 +1759,8 @@ pub fn prove_closure_second(
     let mut point_values = Vec::with_capacity(positions);
     let mut bindings = Vec::with_capacity(positions);
     for position in 0..positions {
+        let _profile_position =
+            zkie_engine::profile::Scope::new("second.closure_psc_position");
         let omega: Vec<Fp3> = bit_values[position]
             .iter()
             .map(|value| Fp3::ONE.sub(value))
@@ -1886,6 +1894,7 @@ pub fn closure_values_from_rows(
     plan: &ClosurePlan,
     w_rows: &[Vec<Fp3>],
 ) -> Result<(Vec<Vec<Fp3>>, Vec<Vec<Fp3>>)> {
+    let _profile_values = zkie_engine::profile::Scope::new("closure.values_from_rows");
     if w_rows.len() != plan.winner.len() {
         return Err(Error::ShapeMismatch);
     }

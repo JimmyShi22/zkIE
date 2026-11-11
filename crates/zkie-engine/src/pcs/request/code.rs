@@ -372,10 +372,12 @@ mod coefficients_tests {
 /// Encode one row with the protocol's product-form transform. The output is
 /// the codeword in position order and equals direct evaluation at the points.
 pub fn encode_row_fp(plan: &CodeParams, message: &[Fp], tail: &[Fp]) -> Result<Vec<Fp>> {
+    let _profile_encode = crate::profile::Scope::light("code.encode_row_fp");
     product_form_fp(plan, message, tail)
 }
 
 pub fn encode_row_fp3(plan: &CodeParams, message: &[Fp3], tail: &[Fp3]) -> Result<Vec<Fp3>> {
+    let _profile_encode = crate::profile::Scope::light("code.encode_row_fp3");
     product_form_fp3(plan, message, tail)
 }
 
