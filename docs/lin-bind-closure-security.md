@@ -83,7 +83,7 @@ public; hiding it beyond those three items is a condition of this round, not a
 |---|---|---|
 | closure slack/bits/map openings | codeword symbol `sum_{i<r} t_i z^i + sum_{i<ell} f_i(Y) z^{r+i}` | `q` linear equations; no plaintext `Y` |
 | closure SEND answers | sample of `f(Y)` plus a one-time pad | a padded field value |
-| closure PSC transcript | affine image of the 23 hiding coefficients plus the target shift | transcript; target covered by the hiding map |
+| closure PSC transcript | affine image of the 49 hiding coefficients plus the target shift | transcript; target covered by the hiding map |
 | closure fresh-point values | three masked values per position | each covered by its one-time shown mask |
 | W SEND answers / Eval targets | W sample plus pad / `W(psi)+e` | masked field values |
 | output winner/valid/tie | protocol output | public by the approved boundary |
