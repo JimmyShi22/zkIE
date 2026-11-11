@@ -1,0 +1,19 @@
+BEFORE
+hidden_prove_ms=963386
+hidden_verify_ms=186847
+whole_test_s=1703.60
+max_rss_kib=336385392
+proof_bytes=9939144
+proof_sha256=f8f512c0e67407210f19dd92d038fd4c71a6bac3a12e1166cd4825d9413215f5
+AFTER
+hidden_prove_ms=955806
+hidden_verify_ms=182916
+whole_test_s=1692.66
+max_rss_kib=336303764
+proof_bytes=9939144
+proof_sha256=f8f512c0e67407210f19dd92d038fd4c71a6bac3a12e1166cd4825d9413215f5
+NOTE
+The /tmp run logs for this cluster were overwritten by later runs. The values
+above are the cluster session record printed from those logs at the time of the
+run; both proof files were hashed in that session. The other cluster logs in
+this directory are the original run tail records.

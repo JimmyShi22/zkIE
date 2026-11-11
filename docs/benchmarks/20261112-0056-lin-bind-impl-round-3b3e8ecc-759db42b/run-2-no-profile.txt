@@ -1,0 +1,10 @@
+FINISHED2
+hidden_prove_ms=355184
+hidden_verify_ms=50453
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 10:42.68
+	Maximum resident set size (kbytes): 169393348
+EXIT=0
+f8f512c0e67407210f19dd92d038fd4c71a6bac3a12e1166cd4825d9413215f5  /tmp/p24-after2-hidden.bin
+proof_bytes=9939144
+
+[exited with code 0]

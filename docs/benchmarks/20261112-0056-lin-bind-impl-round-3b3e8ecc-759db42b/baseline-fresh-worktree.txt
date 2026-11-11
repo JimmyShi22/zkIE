@@ -1,0 +1,9 @@
+Preparing worktree (detached HEAD bdc2e7d8)
+HEAD is now at bdc2e7d8 Decouple the hidden Dot claim and tilde masks with a public residual
+TEST=0
+hidden_prove_ms=36536
+hidden_proof_bytes=8973672
+hidden_verify_ms=9054
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 211.21s
+
+[exited with code 0]

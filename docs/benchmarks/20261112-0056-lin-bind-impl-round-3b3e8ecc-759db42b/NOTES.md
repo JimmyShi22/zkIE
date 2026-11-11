@@ -111,16 +111,16 @@ diagnostic remain open. The verifier negative section is still ~100 s.
 
 ## Artifacts
 
-- `baseline-fresh-worktree.log` — fresh `bdc2e7d8` baseline.
-- `cluster-shared-vector-row-reuse.log` — before/after record for the first
+- `baseline-fresh-worktree.txt` — fresh `bdc2e7d8` baseline.
+- `cluster-shared-vector-row-reuse.txt` — before/after record for the first
   cluster; the original `/tmp` log was overwritten, so the session record is
   archived with a provenance note.
-- `cluster-f1f3-after.log` — runtime-tree/copy-removal after-run tail.
-- `run-1-no-profile.log`, `run-2-no-profile.log`, `run-3-no-profile.log` — final
+- `cluster-f1f3-after.txt` — runtime-tree/copy-removal after-run tail.
+- `run-1-no-profile.txt`, `run-2-no-profile.txt`, `run-3-no-profile.txt` — final
   `seq16×3` no-profile runs.
-- `idle-rerun-759db42b.log` — idle rerun for the parallel cluster and its
+- `idle-rerun-759db42b.txt` — idle rerun for the parallel cluster and its
   +0.104% peak-RSS noise check.
-- `profile-final.log` — final instrumented segment profile.
+- `profile-final.txt` — final instrumented segment profile.
 
 `proof.bin` (9,939,144 B) remains on the test machine and is not committed; no
 binary artifact was deleted for this directory. All textual records above are

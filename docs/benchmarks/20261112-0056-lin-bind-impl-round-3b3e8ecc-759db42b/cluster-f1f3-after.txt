@@ -1,0 +1,9 @@
+hidden_prove_ms=535523
+hidden_proof_bytes=9939144
+hidden_verify_ms=143750
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1152.65s
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 19:22.53
+	Maximum resident set size (kbytes): 206938480
+EXIT:0
+
+[exited with code 0]

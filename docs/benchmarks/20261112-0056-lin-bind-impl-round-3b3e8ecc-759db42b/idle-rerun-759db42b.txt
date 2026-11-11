@@ -1,0 +1,12 @@
+Preparing worktree (detached HEAD 759db42b)
+HEAD is now at 759db42b Parallelize independent exact-domain work with bounded Rayon scheduling
+TEST=0
+hidden_prove_ms=363333
+hidden_proof_bytes=9939144
+hidden_verify_ms=52769
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 702.29s
+	Percent of CPU this job got: 261%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 12:00.63
+	Maximum resident set size (kbytes): 207153712
+
+[exited with code 0]

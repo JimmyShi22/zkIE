@@ -1,0 +1,10 @@
+TEST=0
+hidden_prove_ms=355755
+hidden_proof_bytes=9939144
+hidden_verify_ms=50607
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 642.64s
+	Percent of CPU this job got: 270%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 10:44.13
+	Maximum resident set size (kbytes): 169395556
+
+[exited with code 0]

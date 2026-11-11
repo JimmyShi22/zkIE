@@ -1,0 +1,21 @@
+TEST=0
+hidden_profile_segment name=first.prove_first wall_ms=4001.301 calls=1 bytes=0 table_bytes=268435456 rss_start_kb=4692232 rss_end_kb=5917484 hwm_kb=6051024 threads=66
+hidden_profile_segment name=prox.proximity_prove wall_ms=3987.627 calls=2 bytes=0 table_bytes=0 rss_start_kb=9458752 rss_end_kb=9561812 hwm_kb=9753172 threads=66
+hidden_profile_segment name=witness_tree.omega wall_ms=94.297 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=second.prove_second wall_ms=844.857 calls=1 bytes=0 table_bytes=0 rss_start_kb=9469512 rss_end_kb=9561812 hwm_kb=9753172 threads=66
+hidden_prove_ms=355163
+hidden_profile_segment name=first.prove_first wall_ms=227882.025 calls=1 bytes=0 table_bytes=268435456 rss_start_kb=11890960 rss_end_kb=67534616 hwm_kb=67729964 threads=66
+hidden_profile_segment name=prox.proximity_prove wall_ms=50723.974 calls=2 bytes=0 table_bytes=0 rss_start_kb=67534616 rss_end_kb=88129952 hwm_kb=170170260 threads=66
+hidden_profile_segment name=witness_tree.dot wall_ms=89.040 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=witness_tree.omega wall_ms=94.867 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=witness_tree.mask wall_ms=90.308 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=witness_tree.index_mask wall_ms=89.563 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=second.prove_second wall_ms=99857.667 calls=1 bytes=0 table_bytes=0 rss_start_kb=67534620 rss_end_kb=88129952 hwm_kb=170170260 threads=66
+hidden_profile_segment name=total.prove_output_head_lin_hidden wall_ms=355163.555 calls=1 bytes=0 table_bytes=268435456 rss_start_kb=11500712 rss_end_kb=75251976 hwm_kb=170170260 threads=66
+hidden_verify_ms=50589
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 640.72s
+	Percent of CPU this job got: 270%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 10:42.19
+	Maximum resident set size (kbytes): 170170260
+
+[exited with code 0]
