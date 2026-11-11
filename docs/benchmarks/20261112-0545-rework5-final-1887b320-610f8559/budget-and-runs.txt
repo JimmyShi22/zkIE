@@ -1,0 +1,35 @@
+run1:
+203:ledger_code_oracles=72
+204:ledger_min_tail_remaining=252
+205:ledger_total_tail_rank=558080
+206:ledger_total_tail_unique=879
+207:ledger_exhausted_tail_oracles=0
+208:hidden_prove_ms=356337
+209:hidden_proof_bytes=9939144
+210:hidden_verify_ms=50523
+215:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 643.21s
+226:	Maximum resident set size (kbytes): 169906264
+
+run2:
+197:ledger_code_oracles=72
+198:ledger_min_tail_remaining=252
+199:ledger_total_tail_rank=558080
+200:ledger_total_tail_unique=879
+201:ledger_exhausted_tail_oracles=0
+202:hidden_prove_ms=356404
+203:hidden_proof_bytes=9939144
+204:hidden_verify_ms=50458
+209:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 642.22s
+220:	Maximum resident set size (kbytes): 169376228
+
+run3:
+197:ledger_code_oracles=72
+198:ledger_min_tail_remaining=252
+199:ledger_total_tail_rank=558080
+200:ledger_total_tail_unique=879
+201:ledger_exhausted_tail_oracles=0
+202:hidden_prove_ms=355107
+203:hidden_proof_bytes=9939144
+204:hidden_verify_ms=50187
+209:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 641.28s
+220:	Maximum resident set size (kbytes): 169409472
