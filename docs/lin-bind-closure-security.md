@@ -70,6 +70,7 @@ public; hiding it beyond those three items is a condition of this round, not a
 | closure slack/bits/map openings | codeword symbol `sum_{i<r} t_i z^i + sum_{i<ell} f_i(Y) z^{r+i}` | `q` linear equations; no plaintext `Y` |
 | closure SEND answers | sample of `f(Y)` plus a one-time pad | a padded field value |
 | closure PSC transcript | affine image of the 23 hiding coefficients plus the target shift | transcript; target covered by the hiding map |
+| closure fresh-point values | three masked values per position | each covered by its one-time shown mask |
 | W SEND answers / Eval targets | W sample plus pad / `W(psi)+e` | masked field values |
 | output winner/valid/tie | protocol output | public by the approved boundary |
 | residual `R` | chi-weighted difference of `c` and `g` | one mask combination |
@@ -148,6 +149,9 @@ The 23 sent scalars are an affine bijection of the 23 hiding coefficients
 23 x 23 and is checked full-rank at one deterministic challenge point; the
 all-challenge statement is an assumption. The secret target shift lies in the
 image of that map, so the criterion holds under the full-rank assumption.
+Each position also sends three fresh-point values `(B(pt), D(q), weighted
+B(q))`; their five shown-value mask entries per position are one-time and give
+one random dimension per value, so the same criterion covers them.
 
 ### 3.6 Closure messages and the full output row
 
