@@ -29,10 +29,13 @@
 //! path; the formal path does not call them.
 //!
 //! Neither path claims a formal soundness bound, production CLI wiring or a
-//! full-model proof. In particular, the formal path does not prove that the
-//! committed reduced rows were derived from the pinned activation and the
-//! committed table: the Dot relation under hidden `X` is an open item recorded
-//! in the documentation.
+//! full-model proof. The formal path proves the Dot identity
+//! `<X_t, Omega> = W_t(psi*)` over the committed shown-map message and the
+//! committed reduced row, through the masked product-sumcheck transcript and
+//! the own-group BAT/FOLD/BASE test. The equality of the shown-map commitment
+//! to the operator-pinned activation commitment is a trusted-input warranty:
+//! the verifier pins both commitments, and no cross-commitment proof is
+//! claimed.
 
 use zkie_core::common::codec::DecodeLimits;
 use zkie_core::common::field::PrimeField64;
@@ -63,7 +66,7 @@ use crate::proof::plan::{
 use crate::proof::session_baseline::{assemble_binding, SelectedMatmulStep};
 
 
-const OUTPUT_HEAD_PROOF_VERSION: u64 = 3;
+const OUTPUT_HEAD_PROOF_VERSION: u64 = 4;
 
 /// Positions of one output-head MatMul request.
 pub const OUTPUT_HEAD_POSITIONS: usize = 16;
@@ -364,16 +367,21 @@ pub struct OutputHeadLinOutcome {
 // The Eval targets are masked as `W_t(psi_t) + e_t`, with the one-time `e_t`
 // entry of the sampled index-mask message, and the masked Dot right-hand side
 // is `W_t(psi*) + g_t`; both rows are checked by the own-group proximity test
-// against the committed roots. The vocabulary mask, validity range, ordering
+// against the committed roots. The activation rows are also committed as one
+// shown-map message; after the tilde values and the batching challenge, the
+// masked product-sumcheck transcript yields the `(U)` row and the two `(E_j)`
+// end-value rows, and the public `c_t = g_t` tie rows join the claim masks to
+// the tilde masks. Those rows are checked by the same own-group test, so the
+// verifier checks `<X_t, Omega> = W_t(psi*)` over the committed shown maps and
+// the committed reduced rows. The vocabulary mask, validity range, ordering
 // comparison, first-maximum tie rule and final output are trusted graph
 // values; their digest is absorbed into the first statement.
 //
-// This closure does not prove to the verifier that `W` was derived from the
-// pinned `X` and the committed table. That derivation (the Dot relation with
-// hidden `X`) needs a committed inner-product mechanism that this unit does
-// not have; it stays an open item in the documentation. The diagnostic module
-// below keeps the plaintext-`X`/plaintext-`Y` paths for development and real
-// trace fixtures only.
+// The shown-map commitment and the activation commitment are two commitments
+// of the same `X`; the verifier pins both, and their equality is an
+// operator-policy warranty, not a cross-commitment proof. The diagnostic
+// module below keeps the plaintext-`X`/plaintext-`Y` paths for development and
+// real trace fixtures only.
 
 /// The trusted output relation of the output-head graph: the vocabulary mask,
 /// the valid-vocabulary range, the ordering comparison, the first-maximum tie
@@ -552,6 +560,11 @@ fn hidden_plan(
     send.activation_configuration = activation.configuration;
     send.activation_root = activation.root;
     send.index_mask = setup.index_mask.clone();
+    send.dot = if setup.index_mask.is_some() {
+        setup.send.dot.clone()
+    } else {
+        None
+    };
     send.expected_roots = setup.expected_roots.clone();
     let plan = HiddenLinPlan {
         send,
@@ -1089,6 +1102,7 @@ pub(crate) fn merged_plan(
     send.activation_configuration = setup.activation_configuration;
     send.activation_root = activation_root;
     send.index_mask = None;
+    send.dot = None;
     send.expected_roots = expected_roots;
     // The diagnostic mode has no mask message, so its fresh own mask has the
     // single row of a maskless group. The setup's proximity plan describes the
@@ -1431,8 +1445,8 @@ mod tests {
 
     use crate::matmul::MatMulOp;
     use crate::proof::hidden_send_session::{
-        WShape, HiddenProximityPlan, HiddenSendPlan, HiddenTableProver, IndexMaskPlan,
-        MaskEntryAllocation,
+        DotMapPlan, HiddenProximityPlan, HiddenSendPlan, HiddenTableProver, IndexMaskPlan,
+        MaskEntryAllocation, WShape,
     };
     use crate::proof::model_commitment::{commit_assets, AssetStore, ModelAssetSpec};
     use crate::proof::plan::{config, PlanBuilder};
@@ -1668,7 +1682,31 @@ mod tests {
                 run: INDEX_MASK_RUN,
                 configuration: W_CONFIGURATION,
             },
-            entries: MaskEntryAllocation::new(TOY_POSITIONS as u32).unwrap(),
+            entries: MaskEntryAllocation::for_variables(
+                TOY_HIDDEN.trailing_zeros() as usize,
+                TOY_POSITIONS as u32,
+            )
+            .unwrap(),
+        }
+    }
+
+    fn dot_plan() -> DotMapPlan {
+        DotMapPlan {
+            oracle: 12,
+            group: SEND_GROUP,
+            shape: WShape::new(
+                (TOY_POSITIONS * TOY_HIDDEN) as u64,
+                group_code(),
+                1,
+                TOY_POSITIONS as u32,
+                SALT,
+                302,
+                2,
+                Digest([0x67; 32]),
+                W_CONFIGURATION,
+            )
+            .unwrap(),
+            hidden: TOY_HIDDEN as u32,
         }
     }
 
@@ -1887,6 +1925,8 @@ mod tests {
             openings_per_oracle: 2,
             w: w_shape(),
             index_mask: None,
+            dot: Some(dot_plan()),
+            expected_dot_root: None,
             expected_roots: None,
         };
         let salts: Vec<Vec<u8>> = (0..TOY_POSITIONS)

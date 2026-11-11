@@ -31,7 +31,7 @@ use crate::lm_head_stage::{
 };
 
 /// The ledger schema version. It covers the state file and every record.
-pub const COMMITMENT_LEDGER_VERSION: u64 = 1;
+pub const COMMITMENT_LEDGER_VERSION: u64 = 2;
 
 const LEDGER_FILE: &str = "commitments.state";
 const LEDGER_LOCK: &str = "commitments.lock";
@@ -54,6 +54,8 @@ pub enum CommitmentKind {
     Table,
     /// A hiding mask commitment.
     Mask,
+    /// The committed shown-map message of the hidden Dot sumcheck.
+    Dot,
 }
 
 impl CommitmentKind {
@@ -63,6 +65,7 @@ impl CommitmentKind {
             Self::Weight => "weight",
             Self::Table => "table",
             Self::Mask => "mask",
+            Self::Dot => "dot",
         }
     }
 }
@@ -247,7 +250,8 @@ impl LedgerState {
                 }
                 CommitmentKind::Activation
                 | CommitmentKind::Weight
-                | CommitmentKind::Mask => {
+                | CommitmentKind::Mask
+                | CommitmentKind::Dot => {
                     if record.attempts.len() > 1 || record.table_reuse != 0 {
                         return Err(Error::StateRollbackSuspected);
                     }
@@ -472,7 +476,8 @@ impl CommitmentLedger {
                     entry.attempts.len() as u64
                 }
             },
-            CommitmentKind::Activation | CommitmentKind::Weight | CommitmentKind::Mask => {
+            CommitmentKind::Activation | CommitmentKind::Weight | CommitmentKind::Mask
+            | CommitmentKind::Dot => {
                 if !entry.attempts.is_empty() {
                     return abort(&self.dir, Error::StateRollbackSuspected);
                 }
@@ -950,6 +955,7 @@ mod tests {
             CommitmentKind::Weight => "weight",
             CommitmentKind::Table => "table",
             CommitmentKind::Mask => "mask",
+            CommitmentKind::Dot => "dot",
         };
         Command::new(executable)
             .args([

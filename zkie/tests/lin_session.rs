@@ -329,7 +329,7 @@ fn selected_gpt2_output_head_request_session() {
     };
     use zkie_engine::storage::encoded_store::FileRowStore;
     use zkie_ops::proof::hidden_send_session::{
-        ActivationShape, CommittedActivation, HiddenLinPlan, HiddenOutputShape,
+        ActivationShape, CommittedActivation, DotMapPlan, HiddenLinPlan, HiddenOutputShape,
         HiddenProximityPlan, HiddenSendPlan, HiddenTableProver, IndexMaskPlan,
         MaskEntryAllocation, WShape,
     };
@@ -380,6 +380,9 @@ fn selected_gpt2_output_head_request_session() {
     const INDEX_MASK_ORACLE: u64 = 40;
     const INDEX_MASK_TREE: u64 = 202;
     const INDEX_MASK_RUN: Digest = Digest([0x66; 32]);
+    const DOT_ORACLE: u64 = 41;
+    const DOT_TREE_NUMBER: u64 = 302;
+    const DOT_RUN: Digest = Digest([0x67; 32]);
     /// The real compiled plan draws this many table columns in the shared
     /// stage; the merged session charges the same number from the reader.
     const COLUMN_DRAWS: usize = 603;
@@ -713,6 +716,24 @@ fn selected_gpt2_output_head_request_session() {
             openings_per_oracle: 2,
             w,
             index_mask: None,
+            dot: Some(DotMapPlan {
+                oracle: DOT_ORACLE,
+                group: GROUP,
+                shape: WShape::new(
+                    (OUTPUT_HEAD_POSITIONS * OUTPUT_HEAD_HIDDEN) as u64,
+                    code,
+                    1,
+                    OUTPUT_HEAD_POSITIONS as u32,
+                    SALT,
+                    DOT_TREE_NUMBER,
+                    2,
+                    DOT_RUN,
+                    configuration,
+                )
+                .unwrap(),
+                hidden: OUTPUT_HEAD_HIDDEN as u32,
+            }),
+            expected_dot_root: None,
             expected_roots: None,
         },
         proximity,
@@ -919,6 +940,8 @@ fn selected_gpt2_output_head_request_session() {
     decode_send.activation_configuration = proof.session.first.activation.configuration;
     decode_send.activation_root = proof.session.first.activation.root;
     decode_send.expected_roots = verifier_setup.expected_roots.clone();
+    decode_send.dot = None;
+    decode_send.expected_dot_root = None;
     let merged = HiddenLinPlan {
         send: decode_send,
         output: HiddenOutputShape {
@@ -1120,9 +1143,31 @@ fn selected_gpt2_output_head_request_session() {
                     .openings as u64,
             )
             .expect("reserve the mask openings");
+        // The shown-map message of the hidden Dot sumcheck is a commitment of
+        // this run. Its own tree is opened by the own-group BASE round at the
+        // drawn positions, so the reservation charges those logical openings.
+        let dot_root = hidden_proof
+            .session
+            .first
+            .dot
+            .as_ref()
+            .expect("the hidden path commits the shown-map message")
+            .root;
+        ledger
+            .record_commitment(CommitmentKind::Dot, dot_root, dot_root)
+            .expect("record the shown-map commitment");
+        let dot_claim = ledger
+            .reserve(
+                CommitmentKind::Dot,
+                dot_root,
+                request_id,
+                setup.proximity.own_base_positions as u64,
+            )
+            .expect("reserve the shown-map openings");
         activation_claim.succeed().expect("finish the activation attempt");
         table_claim.succeed().expect("finish the table attempt");
         mask_claim.succeed().expect("finish the mask attempt");
+        dot_claim.succeed().expect("finish the shown-map attempt");
         for claim in weight_claims {
             claim.succeed().expect("finish a W attempt");
         }
@@ -1156,6 +1201,17 @@ fn selected_gpt2_output_head_request_session() {
                     mask_root,
                     second_request,
                     setup.index_mask.as_ref().unwrap().openings as u64,
+                )
+                .unwrap_err(),
+            zkie_core::error::Error::StateRollbackSuspected
+        );
+        assert_eq!(
+            ledger
+                .reserve(
+                    CommitmentKind::Dot,
+                    dot_root,
+                    second_request,
+                    setup.proximity.own_base_positions as u64,
                 )
                 .unwrap_err(),
             zkie_core::error::Error::StateRollbackSuspected
@@ -1197,8 +1253,10 @@ fn selected_gpt2_output_head_request_session() {
             zkie_ops::proof::output_head_lin::witness_output_rows(&hidden_witness).unwrap(),
             trace_output_rows
         );
+        let mut hidden_setup = setup.clone();
+        hidden_setup.send.expected_dot_root = Some(dot_root);
         let hidden_plan =
-            build_output_head_hidden_plan(shape, &setup, &table.reader(), &trusted).unwrap();
+            build_output_head_hidden_plan(shape, &hidden_setup, &table.reader(), &trusted).unwrap();
         let started = Instant::now();
         let hidden_outcome = verify_output_head_lin_hidden(
             shape,

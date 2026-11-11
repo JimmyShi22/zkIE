@@ -278,14 +278,14 @@ verifier boundary:
 
 - The hiding property of the activation row commitment is not proven here; the
   salted Merkle construction is used as the repository's existing primitive.
-- The derivation `W = X M` is not proven to the verifier. The Dot identity
-  `<X_t, Omega_t> = W_t(psi*)` is linear in the reduced row with the activation
-  row as its public coefficient vector; with `X` hidden there is no public
-  coefficient source, and the repository has no committed inner-product
-  mechanism that could replace it. The formal path therefore omits the Dot
-  row; the diagnostic path keeps it with plaintext weights. Closing the hidden
-  Dot relation needs an approved committed inner-product mechanism, which is
-  not part of this round.
+- The Dot identity `<X_t, Omega> = W_t(psi*)` is checked over the committed
+  shown-map message, the committed `Omega` message and the committed reduced
+  rows: the masked product-sumcheck transcript yields the `(U)` row and the
+  two `(E_j)` end-value rows, the public `c_t = g_t` tie rows join the claim
+  and tilde masks, and the own-group BAT/FOLD/BASE test checks every row. The
+  verifier pins the shown-map commitment and the activation commitment
+  separately; that the two commitments carry the same `X` is an
+  operator-policy warranty, not a cross-commitment proof.
 - The previous-layer relation from the model to `X` is not proven.
 - Any plaintext `X` source is diagnostic only.
 - The production `commit`/`prove`/`verify` entry wiring is pending.

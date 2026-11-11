@@ -587,11 +587,33 @@ pub struct DotOutput {
 /// A source of verifier challenges.
 ///
 /// The source must absorb every message sent so far before it yields the next
-/// challenge. The seedable source in this module's tests does not; it only
-/// exercises the arithmetic.
+/// challenge. The hooks below are called at the points where the prover sends
+/// a value: the hiding sum before the first challenge, each round message
+/// before its challenge, and the masked end values after the last challenge.
+/// A production source absorbs them into its transcript; the default
+/// implementations do nothing, so the seedable source in this module's tests
+/// only exercises the arithmetic.
 pub trait PscChallenges {
     fn draw(&mut self) -> Result<Fp3>;
     fn draw_nonzero(&mut self) -> Result<Fp3>;
+
+    /// Absorbs `mu'`, the hiding polynomial's sum, before the first challenge.
+    fn send_hiding_sum(&mut self, value: Fp3) -> Result<()> {
+        let _ = value;
+        Ok(())
+    }
+
+    /// Absorbs the round message of variable `index` before its challenge.
+    fn send_round(&mut self, index: usize, round: &PscRound) -> Result<()> {
+        let _ = (index, round);
+        Ok(())
+    }
+
+    /// Absorbs the masked end values after the last challenge.
+    fn send_end_values(&mut self, values: &[Fp3; SHOWN_MAPS]) -> Result<()> {
+        let _ = values;
+        Ok(())
+    }
 }
 
 impl PscChallenges for XorShift64 {
@@ -650,6 +672,7 @@ pub fn prove_dot_sumcheck(
         },
         end_values: [Fp3::ZERO; SHOWN_MAPS],
     };
+    challenges.send_hiding_sum(proof.hiding_sum)?;
     let eps = challenges.draw()?;
     let mut running = proof.hiding_sum.add(&eps.mul(&claim.target));
     let mut psis = Fp3::ONE;
@@ -666,6 +689,10 @@ pub fn prove_dot_sumcheck(
         proof.rounds.push(PscRound {
             coefficients: sent_coefficients(&variables[variable], &round)?,
         });
+        challenges.send_round(
+            variable,
+            proof.rounds.last().ok_or(Error::InvalidProof)?,
+        )?;
         let challenge = challenges.draw()?;
         drawn.push(challenge);
         running = poly_at(&round, challenge);
@@ -700,6 +727,7 @@ pub fn prove_dot_sumcheck(
     proof.y_round = PscRound {
         coefficients: sent_coefficients(&variables[k], &round)?,
     };
+    challenges.send_round(k, &proof.y_round)?;
     let beta = challenges.draw_nonzero()?;
     drawn.push(beta);
     running = poly_at(&round, beta);
@@ -709,6 +737,7 @@ pub fn prove_dot_sumcheck(
         ends[0].add(&beta.mul(&masks.shown[0])),
         ends[1].add(&beta.mul(&masks.shown[1])),
     ];
+    challenges.send_end_values(&proof.end_values)?;
     let output = build_output(&variables, eps, &drawn, running, &proof.end_values)?;
     Ok((proof, output))
 }
@@ -734,19 +763,23 @@ pub fn verify_psc_transcript(
     if proof.rounds.len() != k {
         return Err(Error::InvalidProof);
     }
+    challenges.send_hiding_sum(proof.hiding_sum)?;
     let eps = challenges.draw()?;
     let mut running = proof.hiding_sum.add(&eps.mul(&claim.target));
     let mut drawn = Vec::with_capacity(k + 1);
     for variable in 0..k {
         let round = complete_round(&variables[variable], &proof.rounds[variable], running)?;
+        challenges.send_round(variable, &proof.rounds[variable])?;
         let challenge = challenges.draw()?;
         drawn.push(challenge);
         running = poly_at(&round, challenge);
     }
     let round = complete_round(&variables[k], &proof.y_round, running)?;
+    challenges.send_round(k, &proof.y_round)?;
     let beta = challenges.draw_nonzero()?;
     drawn.push(beta);
     running = poly_at(&round, beta);
+    challenges.send_end_values(&proof.end_values)?;
     build_output(&variables, eps, &drawn, running, &proof.end_values)
 }
 
@@ -1519,6 +1552,75 @@ mod tests {
             }
             Ok(value)
         }
+    }
+
+    struct RecordingChallenges {
+        inner: XorShift64,
+        events: Vec<String>,
+    }
+
+    impl RecordingChallenges {
+        fn new(seed: u64) -> Self {
+            Self {
+                inner: XorShift64::new(seed),
+                events: Vec::new(),
+            }
+        }
+    }
+
+    impl PscChallenges for RecordingChallenges {
+        fn draw(&mut self) -> Result<Fp3> {
+            self.events.push("draw".to_string());
+            self.inner.draw()
+        }
+
+        fn draw_nonzero(&mut self) -> Result<Fp3> {
+            self.events.push("draw_nonzero".to_string());
+            self.inner.draw_nonzero()
+        }
+
+        fn send_hiding_sum(&mut self, _value: Fp3) -> Result<()> {
+            self.events.push("hiding_sum".to_string());
+            Ok(())
+        }
+
+        fn send_round(&mut self, index: usize, _round: &PscRound) -> Result<()> {
+            self.events.push(format!("round_{index}"));
+            Ok(())
+        }
+
+        fn send_end_values(&mut self, _values: &[Fp3; SHOWN_MAPS]) -> Result<()> {
+            self.events.push("end_values".to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn every_sent_value_is_absorbed_before_its_challenge() {
+        let x = field_vector(&[1, 2, 3, 4]);
+        let omega = field_vector(&[5, 6, 7, 8]);
+        let claim = test_claim(&x, &omega, f(3), &[7, 11]);
+        let masks = test_masks(2);
+        let expected = [
+            "hiding_sum",
+            "draw",
+            "round_0",
+            "draw",
+            "round_1",
+            "draw",
+            "round_2",
+            "draw_nonzero",
+            "end_values",
+        ];
+
+        let mut prover = RecordingChallenges::new(9);
+        let (proof, _) =
+            prove_dot_sumcheck(&x, &omega, &claim, &masks, &mut prover).unwrap();
+        assert_eq!(prover.events, expected);
+
+        let mut verifier = RecordingChallenges::new(9);
+        verify_dot_sumcheck(&x, &omega, &claim, &masks, &proof, &mut verifier).unwrap();
+        assert_eq!(verifier.events, expected);
     }
 
     fn honest_k2() -> (Vec<Fp3>, Vec<Fp3>, DotClaim, DotMaskEntries, DotProof) {

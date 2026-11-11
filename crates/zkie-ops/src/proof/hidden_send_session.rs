@@ -119,15 +119,15 @@
 //!
 //! # Scope
 //!
-//! This unit fixes and samples the hidden inputs; it does not run the proximity
-//! tests, the Dot/Fold relations, the code switch or a soundness bound. The
-//! relation between the `W` roots and the encoded table root is established by
-//! the later Eval/Dot/Fold relations, not by the SEND phase. The encoded table
-//! identity is checked against the plan, and the `W` derivation reads the
-//! table's row source and checks its shape, but no function here proves to the
-//! verifier that the `W` message is `g^T M`: the verifier holds no `M` and no
-//! `X`. The sample answers are public and padded with a private random value;
-//! the pads and tails of this unit are supplied by the caller and the tests use
+//! This unit fixes and samples the hidden inputs; it does not run the
+//! proximity tests, the code switch or a soundness bound. The relation between
+//! the `W` roots and the encoded table root is established by the later
+//! Eval/Dot/Fold relations, not by the SEND phase. The encoded table identity
+//! is checked against the plan, and the `W` derivation reads the table's row
+//! source and checks its shape, but no function here proves to the verifier
+//! that the `W` message is `g^T M`: the verifier holds no `M` and no `X`. The
+//! sample answers are public and padded with a private random value; the pads
+//! and tails of this unit are supplied by the caller and the tests use
 //! deterministic values, which are not hiding evidence.
 //!
 //! The unit is deliberately in-memory and uses bounded vectors; the production
@@ -143,9 +143,11 @@
 //! table through its row source, authenticates the record and the drawn
 //! columns, sends the folded row and `Omega`, registers the Fold row and runs
 //! a proximity test on the folded-row group. The second part starts from the
-//! first query and the shared seal, adopts `Omega`, registers the Dot rows and
-//! runs the proximity test on the request's own group, ending in the BASE
-//! consumption and the final seal.
+//! first query and the shared seal, adopts `Omega`, registers the masked Dot
+//! right-hand side rows, draws the batching challenge, registers the committed
+//! product-sumcheck rows of the hidden Dot identity, and runs the proximity
+//! test on the request's own group, ending in the BASE consumption and the
+//! final seal.
 //!
 //! The public claim items are the activation commitment root, the output `Y`,
 //! the public row weights and the table identity. `Y` is bound through the
@@ -174,10 +176,21 @@
 //! `W_t(psi*) + g_t` is bound the same way. The reduced rows are the MatMul
 //! output and are committed under the same hiding product-form encoding, so
 //! the output never needs a separate plaintext input. The diagnostic mode
-//! keeps the public-weight Dot row and has no mask message. Closing the Dot
-//! identity with a hidden activation requires the committed product-sumcheck
-//! transcript, which is a separate item; this session binds its masked
-//! right-hand side rows but does not prove the identity itself.
+//! keeps the public-weight Dot row and has no mask message.
+//!
+//! The hidden-input mode also commits a shown-map message: one main table
+//! holding the activation rows, with its own encoding tail, salts and sample
+//! pad. After the tilde values and the batching challenge, the prover sends
+//! the masked product-sumcheck transcript and the verifier rebuilds the `(U)`
+//! row and the two `(E_j)` end-value rows from it. Those rows, the public
+//! `c_t = g_t` tie rows and the existing tilde rows are registered in the own
+//! group, so the BAT/FOLD/BASE test checks `<X_t, Omega> = W_t(psi*)` against
+//! the committed shown maps and the committed reduced rows. The shown-map
+//! commitment is pinned like the activation commitment: the equality of the
+//! two commitments of `X` is an operator warranty, not a proof. The mask
+//! entries come from the separate one-time schema: the hiding coefficients,
+//! the two end masks, the claim masks `c_t`, the tilde masks `g_t` and the
+//! Eval masks `e_t` occupy disjoint slots and none is reused.
 
 use zkie_core::common::codec::DecodeLimits;
 use zkie_core::common::field::PrimeCharacteristicRing;
@@ -229,7 +242,10 @@ use zkie_engine::primitives::transcript::{
     hash_labeled, tag_word, LEAF_MAIN, PARAMETERS,
 };
 
-use crate::proof::psc::{hp_entries, psc_variables, DOT_VARIABLES, SHOWN_MAPS};
+use crate::proof::psc::{
+    hp_entries, psc_variables, ClaimMask, DotClaim, DotMaskEntries, DotOutput, DotProof,
+    PscChallenges, PscRound, DOT_VARIABLES, PLAIN_DEGREE, SHOWN_MAPS,
+};
 use crate::proof::base_final_session::{
     fold_identity, BaseFinalCheck, BaseFinalOutcome, BaseFinalRows, BaseFinalSession, BaseMessages,
     BaseCommitment, BaseOpening, BaseOpenings, BaseProver, FoldBasis, FoldMember,
@@ -237,7 +253,7 @@ use crate::proof::base_final_session::{
 use crate::proof::fold_handoff::{FoldHandoff, FoldHandoffAnchor};
 
 /// Version of the canonical messages of this interface.
-const HIDDEN_SEND_SCHEMA_VERSION: u64 = 2;
+const HIDDEN_SEND_SCHEMA_VERSION: u64 = 3;
 /// Chain label of the hidden SEND-sample message.
 const HIDDEN_SEND_CHAIN_LABEL: u64 = 0x4853_4e44;
 /// The activation row tree's number in the runtime leaf domain. The value is
@@ -837,6 +853,136 @@ impl WShape {
     }
 }
 
+/// The trusted plan of the committed shown-map message of the hidden Dot
+/// identity. One main row block holds the activation rows: entry
+/// `t * hidden + j` is value `j` of position `t`, placed with the same
+/// entry-to-place map as a `W` message. The message is maskless, has one
+/// sample answer and lives in the own proximity group, so the `(E_j)` row on
+/// the batched activation map is checked by the same BAT/FOLD/BASE test as
+/// the reduced rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DotMapPlan {
+    /// The oracle id of the shown-map message.
+    pub oracle: u64,
+    /// The SEND group the message belongs to.
+    pub group: u64,
+    /// The message shape: one row block over the group's main code.
+    pub shape: WShape,
+    /// Entries per position.
+    pub hidden: u32,
+}
+
+impl DotMapPlan {
+    /// The number of message entries: one row of `hidden` values per position.
+    pub fn columns(&self, positions: u32) -> Result<u64> {
+        if positions == 0 || self.hidden == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        (positions as u64)
+            .checked_mul(self.hidden as u64)
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// The runtime tree of the shown-map message. The message uses the first
+    /// tree number of the shape; the caller keeps that number distinct.
+    pub fn tree_plan(&self) -> Result<RuntimeTreePlan> {
+        self.shape.tree_plan(0)
+    }
+
+    /// The oracle shape of the shown-map message.
+    pub fn oracle_shape(&self) -> GuOracleShape {
+        self.shape.oracle_shape()
+    }
+
+    /// The number of seed coordinates the sample form reads.
+    pub fn sample_bits(&self) -> Result<u32> {
+        self.shape.sample_bits()
+    }
+
+    /// What is wrong with the shape for the `positions` positions and the
+    /// `matrix_rows` hidden entries of one position.
+    pub fn fault(&self, positions: u32, matrix_rows: u64) -> Option<&'static str> {
+        if self.oracle == 0 || self.group == 0 {
+            return Some("the shown-map message has no identity");
+        }
+        if self.hidden == 0 || self.hidden as u64 != matrix_rows {
+            return Some("the shown-map message does not carry the hidden entry count");
+        }
+        if self.shape.answers != 1 {
+            return Some("the shown-map message does not have one answer");
+        }
+        let columns = match self.columns(positions) {
+            Ok(columns) => columns,
+            Err(_) => return Some("the shown-map message width overflows"),
+        };
+        if self.shape.fault(columns, positions).is_some() {
+            return Some("the shown-map message shape is not a message shape");
+        }
+        None
+    }
+
+    fn encode_into(&self, writer: &mut CanonicalWriter) {
+        writer.put_u64(self.oracle);
+        writer.put_u64(self.group);
+        writer.put_u64(self.hidden as u64);
+        self.shape.encode_into(writer);
+    }
+}
+
+/// The prover's private shown-map message: the unencoded rows, their encoding
+/// tails, the tree salts and the committed root. The rows and salts are never
+/// serialized.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DotMapWitness {
+    pub message: Vec<Vec<Fp3>>,
+    pub tails: Vec<Vec<Fp3>>,
+    pub salts: Vec<Vec<u8>>,
+    pub pad: Fp3,
+    pub root: Digest,
+}
+
+impl DotMapWitness {
+    fn check(&self, plan: &DotMapPlan) -> Result<()> {
+        let rows = usize::try_from(plan.shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+        let places = usize::try_from(plan.shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+        let tail = usize::try_from(plan.shape.code.r).map_err(|_| Error::ResourceLimit)?;
+        let columns = usize::try_from(plan.shape.code.n()).map_err(|_| Error::ResourceLimit)?;
+        if self.message.len() != rows
+            || self.message.iter().any(|row| row.len() != places)
+            || self.tails.len() != rows
+            || self.tails.iter().any(|row| row.len() != tail)
+            || self.salts.len() != columns
+            || self.salts.iter().any(|salt| salt.len() != plan.shape.salt_bytes)
+            || self.pad == Fp3::ZERO
+            || self.root == Digest::ZERO
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        let last = self
+            .message
+            .get(rows - 1)
+            .and_then(|row| row.get(places - 1))
+            .ok_or(Error::ShapeMismatch)?;
+        if *last != self.pad {
+            return Err(Error::StatementMismatch);
+        }
+        if *self.tree(plan)?.root() != self.root {
+            return Err(Error::StatementMismatch);
+        }
+        Ok(())
+    }
+
+    fn tree(&self, plan: &DotMapPlan) -> Result<RuntimeTree> {
+        commit_rows_tree(
+            plan.tree_plan()?,
+            plan.shape.code,
+            &self.message,
+            &self.tails,
+            &self.salts,
+        )
+    }
+}
+
 /// One registered `W` oracle: its position, identity, shape, tree and root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SendGroupEntry {
@@ -1026,6 +1172,11 @@ pub struct MaskEntryAllocation {
     /// The number of positions; the claim, tilde and Eval classes have one
     /// entry per position.
     pub positions: u32,
+    /// The number of sumcheck variables of the masked product sumcheck. The
+    /// production shape fixes it to [`DOT_VARIABLES`]; the entry count of the
+    /// hiding class follows from it, so a smaller test shape carries a
+    /// smaller allocation and the 73-entry production schema is unchanged.
+    pub variables: usize,
     /// The PSC hiding-polynomial coefficients.
     pub hiding: usize,
     /// The two shown-map end masks.
@@ -1041,14 +1192,23 @@ pub struct MaskEntryAllocation {
 impl MaskEntryAllocation {
     /// The 73-entry fallback allocation for `positions` positions.
     pub fn new(positions: u32) -> Result<Self> {
-        if positions == 0 {
+        Self::for_variables(DOT_VARIABLES, positions)
+    }
+
+    /// The separate-mask allocation for a sumcheck of `variables` variables
+    /// and `positions` positions. Production uses [`Self::new`], whose
+    /// variable count is [`DOT_VARIABLES`] and whose entry count is 73 for 16
+    /// positions.
+    pub fn for_variables(variables: usize, positions: u32) -> Result<Self> {
+        if positions == 0 || variables == 0 {
             return Err(Error::InvalidConfig);
         }
-        let variables = psc_variables(DOT_VARIABLES)?;
+        let variables_weights = psc_variables(variables)?;
         let count = positions as usize;
         let allocation = Self {
             positions,
-            hiding: hp_entries(&variables)?,
+            variables,
+            hiding: hp_entries(&variables_weights)?,
             end: SHOWN_MAPS,
             claim: count,
             tilde: count,
@@ -1060,8 +1220,9 @@ impl MaskEntryAllocation {
 
     /// Checks the class counts against the PSC sizes and the position count.
     pub fn check(&self) -> Result<()> {
-        let variables = psc_variables(DOT_VARIABLES)?;
+        let variables = psc_variables(self.variables)?;
         if self.positions == 0
+            || self.variables == 0
             || self.hiding != hp_entries(&variables)?
             || self.end != SHOWN_MAPS
             || self.claim != self.positions as usize
@@ -1293,6 +1454,7 @@ impl IndexMaskPlan {
         writer.put_digest(&self.tree.run);
         writer.put_digest(&self.tree.configuration);
         writer.put_u64(self.entries.positions as u64);
+        writer.put_u64(self.entries.variables as u64);
         writer.put_u64(self.entries.hiding as u64);
         writer.put_u64(self.entries.end as u64);
         writer.put_u64(self.entries.claim as u64);
@@ -1331,6 +1493,15 @@ impl IndexMaskRandomness {
         }
         if values[pad_row][pad_place] == Fp3::ZERO {
             return Err(Error::EntropyUnavailable);
+        }
+        // The PSC claim mask `c_t` and the tilde mask `g_t` are distinct
+        // one-time entries with the same value; the Dot layer registers a
+        // public row that ties them. Neither entry is reused.
+        for position in 0..plan.entries.positions {
+            let claim = plan.entries.claim_slot(position)?;
+            let tilde = plan.entries.tilde_slot(position)?;
+            let value = values[tilde / ell][tilde % ell];
+            values[claim / ell][claim % ell] = value;
         }
         let mut tails = Vec::with_capacity(rows);
         for _ in 0..rows {
@@ -1461,6 +1632,13 @@ pub struct HiddenSendPlan {
     /// The sampled mask-only message that carries the one-time mask entries.
     /// The hidden-input mode requires it; the diagnostic mode leaves it empty.
     pub index_mask: Option<IndexMaskPlan>,
+    /// The committed shown-map message of the hidden Dot identity. The
+    /// hidden-input mode requires it; the diagnostic mode leaves it empty.
+    pub dot: Option<DotMapPlan>,
+    /// A fixture expectation for the shown-map message root. It is a test
+    /// hook, not a policy pin: a production verifier pins the message through
+    /// the operator policy that also pins the activation commitment.
+    pub expected_dot_root: Option<Digest>,
     pub expected_roots: Option<Vec<Digest>>,
 }
 
@@ -1497,17 +1675,21 @@ impl HiddenSendPlan {
         if self.table_shape.plain() < self.columns {
             return Err(Error::ShapeMismatch);
         }
-        if self.activation.hidden as u64 > self.matrix_rows {
-            return Err(Error::ShapeMismatch);
-        }
         if self.openings_per_oracle == 0 || self.openings_per_oracle as u64 > self.w.code.n() {
             return Err(Error::InvalidConfig);
         }
         if self.w.fault(self.columns, self.activation.positions).is_some() {
             return Err(Error::InvalidConfig);
         }
+        if self.activation.hidden as u64 > self.matrix_rows {
+            return Err(Error::ShapeMismatch);
+        }
         for position in 0..self.activation.positions {
             self.oracle(position)?;
+        }
+        match (&self.index_mask, &self.dot) {
+            (Some(_), Some(_)) | (None, None) => {}
+            _ => return Err(Error::InvalidConfig),
         }
         if let Some(index) = &self.index_mask {
             if index.fault().is_some() || index.group != self.group {
@@ -1522,6 +1704,48 @@ impl HiddenSendPlan {
             {
                 return Err(Error::InvalidConfig);
             }
+            if index.entries.variables != self.matrix_rows.trailing_zeros() as usize {
+                return Err(Error::InvalidConfig);
+            }
+        }
+        if let Some(dot) = &self.dot {
+            if dot.fault(self.activation.positions, self.matrix_rows).is_some()
+                || self.activation.hidden as u64 != self.matrix_rows
+                || dot.group != self.group
+                || dot.shape.code != self.w.code
+            {
+                return Err(Error::InvalidConfig);
+            }
+            let in_w_oracles = dot.oracle >= self.oracle_base
+                && dot.oracle
+                    < self
+                        .oracle_base
+                        .checked_add(self.activation.positions as u64)
+                        .ok_or(Error::ResourceLimit)?;
+            let in_w_trees = dot.shape.tree_number >= self.w.tree_number
+                && dot.shape.tree_number
+                    < self
+                        .w
+                        .tree_number
+                        .checked_add(self.activation.positions as u64)
+                        .ok_or(Error::ResourceLimit)?;
+            if in_w_oracles || in_w_trees {
+                return Err(Error::InvalidConfig);
+            }
+            if let Some(index) = &self.index_mask {
+                if dot.oracle == index.oracle
+                    || dot.shape.tree_number == index.tree.tree_number
+                {
+                    return Err(Error::InvalidConfig);
+                }
+            }
+            if let Some(root) = self.expected_dot_root {
+                if root == Digest::ZERO {
+                    return Err(Error::ShapeMismatch);
+                }
+            }
+        } else if self.expected_dot_root.is_some() {
+            return Err(Error::InvalidConfig);
         }
         if let Some(roots) = &self.expected_roots {
             if roots.len() != self.activation.positions() || roots.iter().any(|root| *root == Digest::ZERO)
@@ -1568,6 +1792,13 @@ impl HiddenSendPlan {
             }
             None => writer.put_u64(0),
         }
+        match &self.dot {
+            Some(dot) => {
+                writer.put_u64(1);
+                dot.encode_into(&mut writer);
+            }
+            None => writer.put_u64(0),
+        }
         self.w.encode_into(&mut writer);
         hash_labeled(tag_word(PARAMETERS, 0), 0, None, &writer.into_bytes())
             .unwrap_or(Digest::ZERO)
@@ -1596,6 +1827,13 @@ impl HiddenSendPlan {
             }
             None => writer.put_u64(0),
         }
+        match &self.dot {
+            Some(dot) => {
+                writer.put_u64(1);
+                dot.encode_into(&mut writer);
+            }
+            None => writer.put_u64(0),
+        }
         self.w.encode_into(&mut writer);
         writer.into_bytes()
     }
@@ -1604,6 +1842,17 @@ impl HiddenSendPlan {
 // ---------------------------------------------------------------------------
 // Prover-side W derivation and commitment
 // ---------------------------------------------------------------------------
+
+/// The private random values of the committed shown-map message: one encoding
+/// tail per message row, one salt per tree column and one non-zero sample pad.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DotMapRandomness {
+    /// `tail[row * r + i]`.
+    pub tail: Vec<Fp3>,
+    /// `salts[column]`.
+    pub salts: Vec<Vec<u8>>,
+    pub pad: Fp3,
+}
 
 /// The private random values of one `W` commitment: one tail per message row,
 /// one salt per tree column and one pad per answer. Every pad must be non-zero.
@@ -1620,6 +1869,9 @@ pub struct WCommitRandomness {
     /// carries one. It is drawn from the same private source after the `W`
     /// values, so all masks of one run are independent of the challenges.
     pub index_mask: Option<IndexMaskRandomness>,
+    /// The private randomness of the shown-map message, when the plan carries
+    /// one. It is drawn from the same private source after the mask values.
+    pub dot: Option<DotMapRandomness>,
 }
 
 impl WCommitRandomness {
@@ -1643,6 +1895,25 @@ impl WCommitRandomness {
         }
         match (&plan.index_mask, &self.index_mask) {
             (Some(index), Some(randomness)) => randomness.check(index)?,
+            (None, None) => {}
+            _ => return Err(Error::ShapeMismatch),
+        }
+        match (&plan.dot, &self.dot) {
+            (Some(dot), Some(randomness)) => {
+                let rows = usize::try_from(dot.shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+                let tail = usize::try_from(dot.shape.code.r).map_err(|_| Error::ResourceLimit)?;
+                let columns = usize::try_from(dot.shape.code.n()).map_err(|_| Error::ResourceLimit)?;
+                if randomness.tail.len() != rows * tail
+                    || randomness.salts.len() != columns
+                    || randomness
+                        .salts
+                        .iter()
+                        .any(|salt| salt.len() != dot.shape.salt_bytes)
+                    || randomness.pad == Fp3::ZERO
+                {
+                    return Err(Error::ShapeMismatch);
+                }
+            }
             (None, None) => {}
             _ => return Err(Error::ShapeMismatch),
         }
@@ -1670,6 +1941,8 @@ pub struct HiddenSendWitness {
     pub roots: Vec<Digest>,
     /// The private index-mask message, when the plan carries one.
     pub index_mask: Option<IndexMaskWitness>,
+    /// The private shown-map message, when the plan carries one.
+    pub dot: Option<DotMapWitness>,
 }
 
 impl HiddenSendWitness {
@@ -1707,6 +1980,15 @@ impl HiddenSendWitness {
                 (None, None) => None,
                 _ => return Err(Error::ShapeMismatch),
             },
+            dot: match (&plan.dot, &self.dot) {
+                (Some(_dot), Some(witness)) => Some(DotMapRandomness {
+                    tail: witness.tails.concat(),
+                    salts: witness.salts.clone(),
+                    pad: witness.pad,
+                }),
+                (None, None) => None,
+                _ => return Err(Error::ShapeMismatch),
+            },
         };
         randomness.check(plan)?;
         if let Some(index) = &self.index_mask {
@@ -1715,6 +1997,14 @@ impl HiddenSendWitness {
                     .as_ref()
                     .ok_or(Error::ShapeMismatch)?,
             )?;
+        }
+        if let Some(dot) = &self.dot {
+            dot.check(plan.dot.as_ref().ok_or(Error::ShapeMismatch)?)?;
+            if let Some(root) = plan.expected_dot_root {
+                if dot.root != root {
+                    return Err(Error::StatementMismatch);
+                }
+            }
         }
         if let Some(roots) = &plan.expected_roots {
             if self.roots != *roots {
@@ -2029,8 +2319,89 @@ pub fn commit_w_rows(
         pads: randomness.pads.clone(),
         roots,
         index_mask,
+        dot: None,
     };
     Ok((group, witness))
+}
+
+// ---------------------------------------------------------------------------
+// The shown-map message of the hidden Dot identity
+// ---------------------------------------------------------------------------
+
+/// Commits the shown-map message from the activation rows. The entry
+/// `t * hidden + j` holds value `j` of position `t`; the sample pad is the
+/// last entry of the last message row. The rows, tails and salts stay with the
+/// prover; only the root and the sample answer are public.
+fn commit_dot_map(
+    plan: &HiddenSendPlan,
+    activation: &CommittedActivation,
+    randomness: &WCommitRandomness,
+) -> Result<(Digest, DotMapWitness)> {
+    plan.validate()?;
+    check_activation(plan, activation)?;
+    let dot = plan.dot.as_ref().ok_or(Error::InvalidConfig)?;
+    let positions = plan.positions() as usize;
+    let hidden = dot.hidden as usize;
+    let rows = usize::try_from(dot.shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+    let places = usize::try_from(dot.shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let tail_len = usize::try_from(dot.shape.code.r).map_err(|_| Error::ResourceLimit)?;
+    let random = randomness.dot.as_ref().ok_or(Error::ShapeMismatch)?;
+    if activation.rows().len() != positions
+        || activation.rows().iter().any(|row| row.len() != hidden)
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut message = vec![vec![Fp3::ZERO; places]; rows];
+    for (position, values) in activation.rows().iter().enumerate() {
+        for (value_at, value) in values.iter().enumerate() {
+            let entry = position
+                .checked_mul(hidden)
+                .and_then(|base| base.checked_add(value_at))
+                .ok_or(Error::ResourceLimit)?;
+            let row = entry % rows;
+            let place = entry / rows;
+            let slot = message
+                .get_mut(row)
+                .and_then(|row| row.get_mut(place))
+                .ok_or(Error::ShapeMismatch)?;
+            *slot = *value;
+        }
+    }
+    let pad_slot = message
+        .get_mut(rows - 1)
+        .and_then(|row| row.get_mut(places - 1))
+        .ok_or(Error::ShapeMismatch)?;
+    if !pad_slot.is_zero() {
+        return Err(Error::StatementMismatch);
+    }
+    *pad_slot = random.pad;
+    let mut tails = Vec::with_capacity(rows);
+    for row in 0..rows {
+        tails.push(
+            random
+                .tail
+                .get(row * tail_len..(row + 1) * tail_len)
+                .ok_or(Error::ShapeMismatch)?
+                .to_vec(),
+        );
+    }
+    let tree = commit_rows_tree(
+        dot.tree_plan()?,
+        dot.shape.code,
+        &message,
+        &tails,
+        &random.salts,
+    )?;
+    let root = *tree.root();
+    let witness = DotMapWitness {
+        message,
+        tails,
+        salts: random.salts.clone(),
+        pad: random.pad,
+        root,
+    };
+    witness.check(dot)?;
+    Ok((root, witness))
 }
 
 // ---------------------------------------------------------------------------
@@ -2139,6 +2510,16 @@ fn eq_index(point: &[Fp3], index: u64, bits: u32) -> Result<Fp3> {
 // The message and the session
 // ---------------------------------------------------------------------------
 
+/// The public shown-map message of the hidden Dot identity: the trusted tree
+/// plan, the committed root and the one SEND sample answer that the own group
+/// checks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DotMapMessage {
+    pub tree: RuntimeTreePlan,
+    pub root: Digest,
+    pub sample: SendSamples,
+}
+
 /// The complete public message of one hidden SEND-sample run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HiddenSendMessages {
@@ -2155,6 +2536,8 @@ pub struct HiddenSendMessages {
     pub eval_targets: Vec<Fp3>,
     /// The sampled mask-only message. The hidden-input mode requires it.
     pub index_mask: Option<IndexMaskMessage>,
+    /// The committed shown-map message. The hidden-input mode requires it.
+    pub dot: Option<DotMapMessage>,
     pub chain_value: Digest,
 }
 
@@ -2208,6 +2591,15 @@ impl HiddenSendMessages {
                     writer.put_u64(*position);
                 }
                 writer.put_bytes(&encode_runtime_opening(&message.tree, &message.opening)?);
+            }
+            None => writer.put_u64(0),
+        }
+        match &self.dot {
+            Some(message) => {
+                writer.put_u64(1);
+                put_tree_plan(&mut writer, &message.tree);
+                writer.put_digest(&message.root);
+                writer.put_bytes(&message.sample.encode());
             }
             None => writer.put_u64(0),
         }
@@ -2319,6 +2711,32 @@ impl HiddenSendMessages {
             }
             _ => return Err(Error::InvalidEncoding),
         };
+        let dot = match reader.get_u64()? {
+            0 => None,
+            1 => {
+                let map = plan.dot.as_ref().ok_or(Error::InvalidEncoding)?;
+                let tree = get_tree_plan(&mut reader)?;
+                if tree != map.tree_plan()? {
+                    return Err(Error::StatementMismatch);
+                }
+                let root = reader.get_digest()?;
+                if root == Digest::ZERO {
+                    return Err(Error::InvalidEncoding);
+                }
+                let sample = SendSamples::decode(reader.get_bytes()?)?;
+                if sample.seed.len() != map.shape.answers as usize
+                    || sample.answers.len() != map.shape.answers as usize
+                {
+                    return Err(Error::ShapeMismatch);
+                }
+                Some(DotMapMessage {
+                    tree,
+                    root,
+                    sample,
+                })
+            }
+            _ => return Err(Error::InvalidEncoding),
+        };
         let chain_value = reader.get_digest()?;
         reader.finish()?;
         Ok(Self {
@@ -2330,6 +2748,7 @@ impl HiddenSendMessages {
             psi,
             eval_targets,
             index_mask,
+            dot,
             chain_value,
         })
     }
@@ -2350,6 +2769,8 @@ pub struct HiddenSendOutcome {
     pub eval_targets: Vec<Fp3>,
     /// The committed index-mask root, when the plan carries the mask message.
     pub index_mask_root: Option<Digest>,
+    /// The committed shown-map root, when the plan carries the Dot message.
+    pub dot_root: Option<Digest>,
     pub chain_value: Digest,
 }
 
@@ -2368,7 +2789,15 @@ pub fn prove_hidden_send(
     check_activation(plan, activation)?;
     check_table(plan, table_reader)?;
     let rows = derive_w_rows(plan, activation, table_reader, table_source)?;
-    let (group, witness) = commit_w_rows(plan, &rows, randomness)?;
+    let (group, mut witness) = commit_w_rows(plan, &rows, randomness)?;
+    let dot_map = match &plan.dot {
+        Some(_) => {
+            let (root, map) = commit_dot_map(plan, activation, randomness)?;
+            witness.dot = Some(map);
+            Some(root)
+        }
+        None => None,
+    };
     witness.check(plan)?;
 
     let mut chain = Chain::begin(
@@ -2387,11 +2816,34 @@ pub fn prove_hidden_send(
         (None, None) => None,
         _ => return Err(Error::ShapeMismatch),
     };
+    let dot_root = match (&plan.dot, &dot_map) {
+        (Some(_), Some(root)) => {
+            absorb_dot_root(&mut chain, plan, root)?;
+            Some(*root)
+        }
+        (None, None) => None,
+        _ => return Err(Error::ShapeMismatch),
+    };
     let seeds = draw_seeds(&mut chain, plan)?;
+    let dot_seeds = match &plan.dot {
+        Some(dot) => Some(draw_seed_set(&mut chain, dot.sample_bits()?, 1)?),
+        None => None,
+    };
     let answers = witness.answers(&seeds)?;
     absorb_answers(&mut chain, &answers)?;
-    let mut index_mask_seed = None;
-    let mut index_mask_answer_value = None;
+    let dot_sample = match (&plan.dot, &dot_seeds, &witness.dot) {
+        (Some(_dot), Some(seed_set), Some(map)) => {
+            let answer = dot_sample_answer(plan, map, &seed_set[0])?;
+            absorb_dot_answer(&mut chain, answer)?;
+            Some(SendSamples {
+                seed: seed_set.clone(),
+                answers: vec![answer],
+            })
+        }
+        (None, None, None) => None,
+        _ => return Err(Error::InvalidProof),
+    };
+    let mut index_mask_seed = None;    let mut index_mask_answer_value = None;
     let mut index_mask_positions = None;
     let mut index_mask_opening = None;
     if let Some((index, mask_witness)) = index_mask {
@@ -2444,6 +2896,15 @@ pub fn prove_hidden_send(
         (None, None, None, None) => None,
         _ => return Err(Error::InvalidProof),
     };
+    let dot = match (plan.dot.as_ref(), dot_root, dot_sample) {
+        (Some(map), Some(root), Some(sample)) => Some(DotMapMessage {
+            tree: map.tree_plan()?,
+            root,
+            sample,
+        }),
+        (None, None, None) => None,
+        _ => return Err(Error::InvalidProof),
+    };
     let messages = HiddenSendMessages {
         activation: *activation.commitment(),
         group,
@@ -2453,6 +2914,7 @@ pub fn prove_hidden_send(
         psi,
         eval_targets,
         index_mask,
+        dot,
         chain_value,
     };
     Ok((messages, witness))
@@ -2579,15 +3041,55 @@ fn run_verify(plan: &HiddenSendPlan, messages: &HiddenSendMessages) -> Result<Hi
         (None, None) => {}
         _ => return Err(Error::ShapeMismatch),
     }
+    match (&plan.dot, &messages.dot) {
+        (Some(map), Some(message)) => {
+            if message.tree != map.tree_plan()?
+                || message.root == Digest::ZERO
+                || message.sample.seed.len() != map.shape.answers as usize
+                || message.sample.answers.len() != map.shape.answers as usize
+            {
+                return Err(Error::StatementMismatch);
+            }
+            if let Some(root) = plan.expected_dot_root {
+                if message.root != root {
+                    return Err(Error::StatementMismatch);
+                }
+            }
+            absorb_dot_root(&mut chain, plan, &message.root)?;
+        }
+        (None, None) => {}
+        _ => return Err(Error::ShapeMismatch),
+    }
     let seeds = draw_seeds(&mut chain, plan)?;
     if seeds != messages.samples.seed {
         return Err(Error::InvalidProof);
     }
+    let dot_seeds = match &plan.dot {
+        Some(dot) => {
+            let drawn = draw_seed_set(&mut chain, dot.sample_bits()?, 1)?;
+            let message = messages.dot.as_ref().ok_or(Error::ShapeMismatch)?;
+            if drawn != message.sample.seed {
+                return Err(Error::InvalidProof);
+            }
+            Some(drawn)
+        }
+        None => None,
+    };
     let expected_answers = plan.positions() as usize * plan.w.answers as usize;
     if messages.samples.answers.len() != expected_answers {
         return Err(Error::ShapeMismatch);
     }
     absorb_answers(&mut chain, &messages.samples.answers)?;
+    if let (Some(_seed), Some(message)) = (&dot_seeds, &messages.dot) {
+        absorb_dot_answer(
+            &mut chain,
+            *message
+                .sample
+                .answers
+                .first()
+                .ok_or(Error::ShapeMismatch)?,
+        )?;
+    }
     if let (Some(index), Some(message)) = (&plan.index_mask, &messages.index_mask) {
         if message.sample.seed != seeds {
             return Err(Error::InvalidProof);
@@ -2667,6 +3169,21 @@ fn run_verify(plan: &HiddenSendPlan, messages: &HiddenSendMessages) -> Result<Hi
             .ok_or(Error::ShapeMismatch)?;
         sample_rows.push(index_mask_sample_row(index, message, target)?);
     }
+    if let (Some(dot), Some(seed_set), Some(message)) = (&plan.dot, &dot_seeds, &messages.dot) {
+        let target = *message
+            .sample
+            .answers
+            .first()
+            .ok_or(Error::ShapeMismatch)?;
+        sample_rows.push(oracle_sample_row(
+            dot.oracle,
+            dot.group,
+            &dot.oracle_shape(),
+            seed_set,
+            0,
+            target,
+        )?);
+    }
     let mut eval_rows = Vec::with_capacity(plan.positions() as usize);
     for (position, point) in psi.iter().enumerate() {
         let target = *messages
@@ -2687,6 +3204,7 @@ fn run_verify(plan: &HiddenSendPlan, messages: &HiddenSendMessages) -> Result<Hi
         psi,
         eval_targets: messages.eval_targets.clone(),
         index_mask_root: messages.index_mask.as_ref().map(|message| message.root),
+        dot_root: messages.dot.as_ref().map(|message| message.root),
         chain_value: *chain.value(),
     })
 }
@@ -2812,6 +3330,59 @@ fn absorb_answers(chain: &mut Chain, answers: &[Fp3]) -> Result<()> {
         return Err(Error::InvalidProof);
     }
     Ok(())
+}
+
+/// Absorbs the shown-map message root before its sample seed is drawn.
+fn absorb_dot_root(chain: &mut Chain, plan: &HiddenSendPlan, root: &Digest) -> Result<()> {
+    let dot = plan.dot.as_ref().ok_or(Error::InvalidConfig)?;
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(14);
+    message.push_u64(dot.oracle);
+    message.push_u64(dot.group);
+    push_tree_plan(&mut message, &dot.tree_plan()?);
+    push_digest(&mut message, root);
+    let prefix = message.prefix(KIND_SEED, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
+/// Absorbs the shown-map sample answer after the reduced-row answers.
+fn absorb_dot_answer(chain: &mut Chain, answer: Fp3) -> Result<()> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(15);
+    message.push_fp3(&answer);
+    let prefix = message.prefix(KIND_EMPTY, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
+/// The sample answer of the shown-map message: the `eq` form over the message
+/// cube plus the reserved pad under the seed's `beta`.
+fn dot_sample_answer(
+    plan: &HiddenSendPlan,
+    witness: &DotMapWitness,
+    seed: &SampleSeed,
+) -> Result<Fp3> {
+    let dot = plan.dot.as_ref().ok_or(Error::InvalidConfig)?;
+    let gu = GuWitness {
+        main: witness.message.concat(),
+        mask: Vec::new(),
+    };
+    let row = oracle_sample_row(
+        dot.oracle,
+        dot.group,
+        &dot.oracle_shape(),
+        std::slice::from_ref(seed),
+        0,
+        Fp3::ZERO,
+    )?;
+    row.evaluate(&gu)
 }
 
 fn draw_positions(chain: &mut Chain, plan: &HiddenSendPlan) -> Result<Vec<Vec<u64>>> {
@@ -3317,7 +3888,18 @@ impl HiddenProximityPlan {
         if self.shared_mask_tree.tree_number == self.own_mask_tree.tree_number {
             return Some("the two fresh masks share one tree number");
         }
-        if self.shared_fresh == self.own_fresh {
+        if let Some(dot) = &send.dot {
+            if dot.shape.code != self.code
+                || dot.oracle == self.gu.oracle
+                || dot.oracle == self.omega.oracle
+                || dot.shape.tree_number == self.gu.tree.tree_number
+                || dot.shape.tree_number == self.omega.tree.tree_number
+                || dot.shape.tree_number == self.shared_mask_tree.tree_number
+                || dot.shape.tree_number == self.own_mask_tree.tree_number
+            {
+                return Some("the shown-map message does not match the own group");
+            }
+        }        if self.shared_fresh == self.own_fresh {
             return Some("the two fresh masks share one oracle id");
         }
         if self.column_draws == 0 || self.column_budget == 0 {
@@ -3521,6 +4103,9 @@ pub struct HiddenSecondMessages {
     /// The masked Dot right-hand side `tilde_t = W_t(psi*) + g_t` in the
     /// hidden-input mode; empty in the diagnostic mode.
     pub tilde: Vec<Fp3>,
+    /// The masked product-sumcheck transcript of the hidden Dot identity in
+    /// the hidden-input mode; empty in the diagnostic mode.
+    pub dot: Option<DotProof>,
     pub fold_start: FoldStartMessage,
     pub fold_rounds: Vec<(Fp3, Fp3)>,
     pub base: BaseMessages,
@@ -4554,11 +5139,36 @@ impl WCommitRandomness {
             Some(index) => Some(IndexMaskRandomness::from_coins(coins, index)?),
             None => None,
         };
+        let dot = match &plan.dot {
+            Some(dot) => {
+                let rows = usize::try_from(dot.shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+                let tail_len = usize::try_from(dot.shape.code.r).map_err(|_| Error::ResourceLimit)?;
+                let columns = usize::try_from(dot.shape.code.n()).map_err(|_| Error::ResourceLimit)?;
+                let mut tail = Vec::with_capacity(rows * tail_len);
+                for _ in 0..rows * tail_len {
+                    tail.push(coins.draw()?.0);
+                }
+                let salts = draw_salt_bytes(coins, columns, dot.shape.salt_bytes)?;
+                let mut pad = Fp3::ZERO;
+                for _ in 0..64 {
+                    pad = coins.draw()?.0;
+                    if pad != Fp3::ZERO {
+                        break;
+                    }
+                }
+                if pad == Fp3::ZERO {
+                    return Err(Error::EntropyUnavailable);
+                }
+                Some(DotMapRandomness { tail, salts, pad })
+            }
+            None => None,
+        };
         let randomness = Self {
             tails,
             salts,
             pads,
             index_mask,
+            dot,
         };
         randomness.check(plan)?;
         Ok(randomness)
@@ -4701,7 +5311,15 @@ fn prove_first(
     check_activation(&plan.send, activation)?;
     check_table(&plan.send, &reader)?;
     let rows = derive_w_rows(&plan.send, activation, &reader, table)?;
-    let (group, witness) = commit_w_rows(&plan.send, &rows, randomness)?;
+    let (group, mut witness) = commit_w_rows(&plan.send, &rows, randomness)?;
+    let dot_root = match &plan.send.dot {
+        Some(_) => {
+            let (root, map) = commit_dot_map(&plan.send, activation, randomness)?;
+            witness.dot = Some(map);
+            Some(root)
+        }
+        None => None,
+    };
     witness.check(&plan.send)?;
 
     let mut chain = first_chain(plan, &reader)?;
@@ -4715,9 +5333,30 @@ fn prove_first(
         (None, None) => None,
         _ => return Err(Error::ShapeMismatch),
     };
+    match (&plan.send.dot, dot_root) {
+        (Some(_), Some(root)) => absorb_dot_root(&mut chain, &plan.send, &root)?,
+        (None, None) => {}
+        _ => return Err(Error::ShapeMismatch),
+    }
     let seeds = draw_seeds(&mut chain, &plan.send)?;
+    let dot_seeds = match &plan.send.dot {
+        Some(dot) => Some(draw_seed_set(&mut chain, dot.sample_bits()?, 1)?),
+        None => None,
+    };
     let answers = witness.answers(&seeds)?;
     absorb_answers(&mut chain, &answers)?;
+    let dot_sample = match (&plan.send.dot, &dot_seeds, &witness.dot) {
+        (Some(_dot), Some(seed_set), Some(map)) => {
+            let answer = dot_sample_answer(&plan.send, map, &seed_set[0])?;
+            absorb_dot_answer(&mut chain, answer)?;
+            Some(SendSamples {
+                seed: seed_set.clone(),
+                answers: vec![answer],
+            })
+        }
+        (None, None, None) => None,
+        _ => return Err(Error::InvalidProof),
+    };
     let mut index_mask_seed = None;
     let mut index_mask_answer_value = None;
     let mut index_mask_positions = None;
@@ -4776,6 +5415,15 @@ fn prove_first(
         (None, None, None, None) => None,
         _ => return Err(Error::InvalidProof),
     };
+    let dot = match (plan.send.dot.as_ref(), dot_root, dot_sample) {
+        (Some(map), Some(root), Some(sample)) => Some(DotMapMessage {
+            tree: map.tree_plan()?,
+            root,
+            sample,
+        }),
+        (None, None, None) => None,
+        _ => return Err(Error::InvalidProof),
+    };
     let messages = HiddenSendMessages {
         activation: *activation.commitment(),
         group,
@@ -4785,6 +5433,7 @@ fn prove_first(
         psi,
         eval_targets: targets,
         index_mask,
+        dot,
         chain_value: first_seal,
     };
     Ok((messages, first_seal, witness))
@@ -4851,15 +5500,55 @@ fn verify_first(
         (None, None) => {}
         _ => return Err(Error::ShapeMismatch),
     }
+    match (&plan.send.dot, &messages.dot) {
+        (Some(map), Some(message)) => {
+            if message.tree != map.tree_plan()?
+                || message.root == Digest::ZERO
+                || message.sample.seed.len() != map.shape.answers as usize
+                || message.sample.answers.len() != map.shape.answers as usize
+            {
+                return Err(Error::StatementMismatch);
+            }
+            if let Some(root) = plan.send.expected_dot_root {
+                if message.root != root {
+                    return Err(Error::StatementMismatch);
+                }
+            }
+            absorb_dot_root(&mut chain, &plan.send, &message.root)?;
+        }
+        (None, None) => {}
+        _ => return Err(Error::ShapeMismatch),
+    }
     let seeds = draw_seeds(&mut chain, &plan.send)?;
     if seeds != messages.samples.seed {
         return Err(Error::InvalidProof);
     }
+    let dot_seeds = match &plan.send.dot {
+        Some(dot) => {
+            let drawn = draw_seed_set(&mut chain, dot.sample_bits()?, 1)?;
+            let message = messages.dot.as_ref().ok_or(Error::ShapeMismatch)?;
+            if drawn != message.sample.seed {
+                return Err(Error::InvalidProof);
+            }
+            Some(drawn)
+        }
+        None => None,
+    };
     let answer_count = plan.send.positions() as usize * plan.send.w.answers as usize;
     if messages.samples.answers.len() != answer_count {
         return Err(Error::ShapeMismatch);
     }
     absorb_answers(&mut chain, &messages.samples.answers)?;
+    if let (Some(_seed), Some(message)) = (&dot_seeds, &messages.dot) {
+        absorb_dot_answer(
+            &mut chain,
+            *message
+                .sample
+                .answers
+                .first()
+                .ok_or(Error::ShapeMismatch)?,
+        )?;
+    }
     if let (Some(index), Some(message)) = (&plan.send.index_mask, &messages.index_mask) {
         if message.sample.seed != seeds {
             return Err(Error::InvalidProof);
@@ -6003,6 +6692,35 @@ fn own_members(
         mask_message: Vec::new(),
         mask_tails: Vec::new(),
     });
+    if let Some(dot) = &plan.send.dot {
+        let message = first.dot.as_ref().ok_or(Error::ShapeMismatch)?;
+        if message.tree != dot.tree_plan()? {
+            return Err(Error::StatementMismatch);
+        }
+        let (main_message, main_tails) = match witness {
+            Some(witness) => {
+                let map = witness.dot.as_ref().ok_or(Error::ShapeMismatch)?;
+                map.check(dot)?;
+                (map.message.clone(), map.tails.clone())
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        members.push(ProximityMember {
+            bat_oracle: 0,
+            source_oracle: dot.oracle,
+            main_code: dot.shape.code,
+            mask_code: plan.proximity.mask_code,
+            main_rows: dot.shape.main_rows,
+            mask_rows: 0,
+            answers: dot.shape.answers,
+            root: message.root,
+            tree_plan: message.tree.clone(),
+            message: main_message,
+            tails: main_tails,
+            mask_message: Vec::new(),
+            mask_tails: Vec::new(),
+        });
+    }
     if let (Some(index), Some(message)) = (&plan.send.index_mask, &first.index_mask) {
         let (mask_message, mask_tails) = match witness {
             Some(witness) => {
@@ -6061,6 +6779,25 @@ fn own_sample_rows(
                 continue;
             }
         }
+        if let Some(dot) = &plan.send.dot {
+            if member.source_oracle == dot.oracle {
+                let message = first.dot.as_ref().ok_or(Error::ShapeMismatch)?;
+                let target = *message
+                    .sample
+                    .answers
+                    .first()
+                    .ok_or(Error::ShapeMismatch)?;
+                rows.push(vec![oracle_sample_row(
+                    dot.oracle,
+                    dot.group,
+                    &dot.oracle_shape(),
+                    &message.sample.seed,
+                    0,
+                    target,
+                )?]);
+                continue;
+            }
+        }
         if member.source_oracle == plan.proximity.omega.oracle {
             let mut list = Vec::with_capacity(shared.omega_answers.len());
             for (answer, target) in shared.omega_answers.iter().enumerate() {
@@ -6104,6 +6841,7 @@ fn own_plain_rows(
     first: &HiddenSendMessages,
     shared_point: &[Fp3],
     tilde: &[Fp3],
+    dot: Option<&DotRowBinding>,
 ) -> Result<Vec<BatRow>> {
     let mut bat_of = std::collections::HashMap::new();
     for member in members {
@@ -6186,8 +6924,8 @@ fn own_plain_rows(
     // The diagnostic Dot row is linear in the reduced row with the public
     // activation row as its coefficients. The hidden-input mode has no public
     // activation row; its masked Dot right-hand side rows above carry the
-    // `tilde_t` binding instead. The hidden Dot identity itself remains the
-    // product-sumcheck item outside this session.
+    // `tilde_t` binding instead, and the committed sumcheck rows below close
+    // the identity against the committed shown maps.
     if !plan.weights.is_empty() {
         let omega = bat_of
             .get(&plan.proximity.omega.oracle)
@@ -6223,6 +6961,9 @@ fn own_plain_rows(
             row.add_term(w_member.bat_oracle, BatPart::Main, w_coefficients);
             rows.push(row);
         }
+    }
+    if let Some(binding) = dot {
+        rows.extend(dot_plain_rows(plan, members, binding)?);
     }
     Ok(rows)
 }
@@ -6277,6 +7018,431 @@ fn absorb_tilde(chain: &mut Chain, tilde: &[Fp3]) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// The committed product-sumcheck rows of the hidden Dot identity
+// ---------------------------------------------------------------------------
+
+/// The checked transcript output and the batching challenge. Both sides derive
+/// the committed `(U)` and `(E_j)` rows from this binding; the arithmetic
+/// module never binds a row by itself.
+struct DotRowBinding {
+    output: DotOutput,
+    chi: Fp3,
+}
+
+/// The number of product-sumcheck variables of `matrix_rows` entries.
+fn dot_variables(matrix_rows: u64) -> Result<usize> {
+    if matrix_rows < 2 || !matrix_rows.is_power_of_two() {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(matrix_rows.trailing_zeros() as usize)
+}
+
+/// `sum_t chi^t tilde_t`, the public target of the batched Dot claim.
+fn dot_claim_target(tilde: &[Fp3], chi: Fp3) -> Result<Fp3> {
+    if tilde.is_empty() {
+        return Err(Error::InvalidConfig);
+    }
+    let mut target = Fp3::ZERO;
+    let mut power = Fp3::ONE;
+    for value in tilde {
+        target = target.add(&power.mul(value));
+        power = power.mul(&chi);
+    }
+    Ok(target)
+}
+
+/// The `hidden` values of every position, read out of the committed shown-map
+/// message with the same entry-to-place map the message uses.
+fn dot_witness_values(
+    plan: &HiddenLinPlan,
+    witness: &HiddenSendWitness,
+) -> Result<Vec<Vec<Fp3>>> {
+    let dot = plan.send.dot.as_ref().ok_or(Error::InvalidConfig)?;
+    let map = witness.dot.as_ref().ok_or(Error::ShapeMismatch)?;
+    let rows = usize::try_from(dot.shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+    let places = usize::try_from(dot.shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let hidden = dot.hidden as usize;
+    let positions = plan.send.positions() as usize;
+    if hidden == 0
+        || map.message.len() != rows
+        || map.message.iter().any(|row| row.len() != places)
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut values = vec![vec![Fp3::ZERO; hidden]; positions];
+    for (position, row_values) in values.iter_mut().enumerate() {
+        for (value_at, slot) in row_values.iter_mut().enumerate() {
+            let entry = position
+                .checked_mul(hidden)
+                .and_then(|base| base.checked_add(value_at))
+                .ok_or(Error::ResourceLimit)?;
+            let row = entry % rows;
+            let place = entry / rows;
+            *slot = *map
+                .message
+                .get(row)
+                .and_then(|row| row.get(place))
+                .ok_or(Error::ShapeMismatch)?;
+        }
+    }
+    Ok(values)
+}
+
+/// The committed `Omega` entries, `matrix_rows` of them, read out of the flat
+/// message with the message's entry-to-place map.
+fn omega_message_values(plan: &HiddenLinPlan, message: &[Fp3]) -> Result<Vec<Fp3>> {
+    let omega = &plan.proximity.omega;
+    let rows = usize::try_from(omega.u.main_rows).map_err(|_| Error::ResourceLimit)?;
+    let places = usize::try_from(omega.u.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let count = usize::try_from(plan.send.matrix_rows).map_err(|_| Error::ResourceLimit)?;
+    if message.len() != rows * places {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut values = Vec::with_capacity(count);
+    for value_at in 0..count {
+        let entry = (value_at % rows)
+            .checked_mul(places)
+            .and_then(|base| base.checked_add(value_at / rows))
+            .ok_or(Error::ResourceLimit)?;
+        values.push(*message.get(entry).ok_or(Error::ShapeMismatch)?);
+    }
+    Ok(values)
+}
+
+/// The chain-backed challenge source of one product sumcheck. Every prover
+/// message is absorbed before the challenge that tests it is drawn.
+struct ChainChallenges<'a> {
+    chain: &'a mut Chain,
+}
+
+impl PscChallenges for ChainChallenges<'_> {
+    fn draw(&mut self) -> Result<Fp3> {
+        self.chain.draw_e()
+    }
+
+    fn draw_nonzero(&mut self) -> Result<Fp3> {
+        self.chain.draw_e_nonzero()
+    }
+
+    fn send_hiding_sum(&mut self, value: Fp3) -> Result<()> {
+        absorb_psc_hiding_sum(self.chain, value)
+    }
+
+    fn send_round(&mut self, index: usize, round: &PscRound) -> Result<()> {
+        absorb_psc_round(self.chain, index, round)
+    }
+
+    fn send_end_values(&mut self, values: &[Fp3; SHOWN_MAPS]) -> Result<()> {
+        absorb_psc_end_values(self.chain, values)
+    }
+}
+
+fn absorb_psc_hiding_sum(chain: &mut Chain, value: Fp3) -> Result<()> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(16);
+    message.push_fp3(&value);
+    let prefix = message.prefix(KIND_ALGEBRAIC, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
+fn absorb_psc_round(chain: &mut Chain, index: usize, round: &PscRound) -> Result<()> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(17);
+    message.push_u64(index as u64);
+    message.push_u64(round.coefficients.len() as u64);
+    for coefficient in &round.coefficients {
+        message.push_fp3(coefficient);
+    }
+    let prefix = message.prefix(KIND_ALGEBRAIC, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
+fn absorb_psc_end_values(
+    chain: &mut Chain,
+    values: &[Fp3; SHOWN_MAPS],
+) -> Result<()> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(18);
+    message.push_u64(values.len() as u64);
+    for value in values {
+        message.push_fp3(value);
+    }
+    let prefix = message.prefix(KIND_EMPTY, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
+/// Prover side of the hidden Dot sumcheck: draws the batching challenge after
+/// the tilde values are fixed, runs the masked product sumcheck with the
+/// separate mask entries and returns the transcript and the row binding.
+fn prove_dot_identity(
+    plan: &HiddenLinPlan,
+    chain: &mut Chain,
+    witness: &HiddenSendWitness,
+    omega_message: &[Fp3],
+    tilde: &[Fp3],
+) -> Result<(DotProof, DotRowBinding)> {
+    let dot = plan.send.dot.as_ref().ok_or(Error::InvalidConfig)?;
+    let index = plan.send.index_mask.as_ref().ok_or(Error::InvalidConfig)?;
+    let mask_witness = witness.index_mask.as_ref().ok_or(Error::ShapeMismatch)?;
+    let positions = plan.send.positions() as usize;
+    let hidden = dot.hidden as usize;
+    if hidden != plan.send.matrix_rows as usize || tilde.len() != positions {
+        return Err(Error::ShapeMismatch);
+    }
+    let chi = chain.draw_e()?;
+    let values = dot_witness_values(plan, witness)?;
+    let mut x_chi = vec![Fp3::ZERO; hidden];
+    let mut power = Fp3::ONE;
+    for position_values in &values {
+        for (slot, value) in x_chi.iter_mut().zip(position_values) {
+            *slot = slot.add(&power.mul(value));
+        }
+        power = power.mul(&chi);
+    }
+    let omega = omega_message_values(plan, omega_message)?;
+
+    let mut masks = Vec::with_capacity(positions);
+    power = Fp3::ONE;
+    for position in 0..plan.send.positions() {
+        let value = mask_witness.entry(index, index.entries.claim_slot(position)?)?;
+        masks.push(ClaimMask {
+            coefficient: power,
+            value,
+        });
+        power = power.mul(&chi);
+    }
+    let claim = DotClaim {
+        masks,
+        target: dot_claim_target(tilde, chi)?,
+    };
+    let hiding = index
+        .entries
+        .hiding_range()?
+        .map(|slot| mask_witness.entry(index, slot))
+        .collect::<Result<Vec<_>>>()?;
+    let end_start = index.entries.end_range()?.start;
+    let shown = [
+        mask_witness.entry(index, end_start)?,
+        mask_witness.entry(index, end_start + 1)?,
+    ];
+    let entries = DotMaskEntries { hiding, shown };
+
+    let mut challenges = ChainChallenges { chain };
+    let (proof, output) =
+        crate::proof::psc::prove_dot_sumcheck(&x_chi, &omega, &claim, &entries, &mut challenges)?;
+    crate::proof::psc::check_product_claims(&output, &claim, &entries, &x_chi, &omega)?;
+    Ok((proof, DotRowBinding { output, chi }))
+}
+
+/// Verifier side of the hidden Dot sumcheck: draws the same batching challenge
+/// and checks the transcript against the target formed from the public tilde
+/// values. The mask entries are not needed: the committed rows below carry
+/// them.
+fn verify_dot_identity(
+    plan: &HiddenLinPlan,
+    chain: &mut Chain,
+    messages: &HiddenSecondMessages,
+    tilde: &[Fp3],
+) -> Result<DotRowBinding> {
+    let dot = plan.send.dot.as_ref().ok_or(Error::InvalidConfig)?;
+    let index = plan.send.index_mask.as_ref().ok_or(Error::InvalidConfig)?;
+    let positions = plan.send.positions() as usize;
+    let hidden = dot.hidden as usize;
+    let variables = dot_variables(plan.send.matrix_rows)?;
+    if hidden != plan.send.matrix_rows as usize || tilde.len() != positions {
+        return Err(Error::ShapeMismatch);
+    }
+    let proof = messages.dot.as_ref().ok_or(Error::ShapeMismatch)?;
+    let chi = chain.draw_e()?;
+    let mut masks = Vec::with_capacity(positions);
+    let mut power = Fp3::ONE;
+    for _ in 0..positions {
+        masks.push(ClaimMask {
+            coefficient: power,
+            value: Fp3::ZERO,
+        });
+        power = power.mul(&chi);
+    }
+    let claim = DotClaim {
+        masks,
+        target: dot_claim_target(tilde, chi)?,
+    };
+    // The transcript check needs only the entry counts; the mask values are
+    // committed and checked through the rows.
+    let entries = DotMaskEntries {
+        hiding: vec![Fp3::ZERO; index.entries.hiding],
+        shown: [Fp3::ZERO; SHOWN_MAPS],
+    };
+    let mut challenges = ChainChallenges { chain };
+    let output = crate::proof::psc::verify_psc_transcript(
+        &claim,
+        &entries,
+        proof,
+        variables,
+        &mut challenges,
+    )?;
+    Ok(DotRowBinding { output, chi })
+}
+
+/// The committed rows of the hidden Dot identity: one tie row per position,
+/// the `(U)` row, and the two `(E_j)` rows on the committed shown maps. The
+/// rows are built from the checked transcript, so the arithmetic module does
+/// not decide a row on its own.
+fn dot_plain_rows(
+    plan: &HiddenLinPlan,
+    members: &[ProximityMember],
+    binding: &DotRowBinding,
+) -> Result<Vec<BatRow>> {
+    let dot = plan.send.dot.as_ref().ok_or(Error::InvalidConfig)?;
+    let index = plan.send.index_mask.as_ref().ok_or(Error::InvalidConfig)?;
+    let output = &binding.output;
+    let variables = dot_variables(plan.send.matrix_rows)?;
+    let hidden = dot.hidden as usize;
+    let positions = plan.send.positions();
+    if output.point.len() != variables
+        || output.ends.iter().any(|end| end.point != output.point)
+        || hidden != plan.send.matrix_rows as usize
+    {
+        return Err(Error::InvalidProof);
+    }
+    let mut bat_of = std::collections::HashMap::new();
+    for member in members {
+        bat_of.insert(member.source_oracle, member);
+    }
+    let mask_member = bat_of.get(&index.oracle).ok_or(Error::StatementMismatch)?;
+    let dot_member = bat_of.get(&dot.oracle).ok_or(Error::StatementMismatch)?;
+    let omega_member = bat_of
+        .get(&plan.proximity.omega.oracle)
+        .ok_or(Error::StatementMismatch)?;
+    let mut rows = Vec::with_capacity(positions as usize + 3);
+
+    // c_t - g_t = 0: the claim mask and the tilde mask are distinct one-time
+    // entries with the same value, tied by this public row.
+    for position in 0..positions {
+        let mut row = BatRow::new(BatRowKind::Plain);
+        row.add_unit(
+            mask_member.bat_oracle,
+            BatPart::Mask,
+            index
+                .entry_virtual_index(index.entries.claim_slot(position)?)?,
+            Fp3::ONE,
+        );
+        row.add_unit(
+            mask_member.bat_oracle,
+            BatPart::Mask,
+            index
+                .entry_virtual_index(index.entries.tilde_slot(position)?)?,
+            Fp3::ZERO.sub(&Fp3::ONE),
+        );
+        row.target = Fp3::ZERO;
+        rows.push(row);
+    }
+
+    // (U): <hiding_form, hiding entries> + claim_scale <chi^t, c_t> = row_target.
+    let hiding = index.entries.hiding_range()?;
+    if output.hiding_form.len() != hiding.len() {
+        return Err(Error::InvalidProof);
+    }
+    let mut row = BatRow::new(BatRowKind::Plain);
+    for (slot, coefficient) in hiding.zip(&output.hiding_form) {
+        row.add_unit(
+            mask_member.bat_oracle,
+            BatPart::Mask,
+            index.entry_virtual_index(slot)?,
+            *coefficient,
+        );
+    }
+    let mut power = Fp3::ONE;
+    for position in 0..positions {
+        let coefficient = output.claim_scale.mul(&power);
+        row.add_unit(
+            mask_member.bat_oracle,
+            BatPart::Mask,
+            index
+                .entry_virtual_index(index.entries.claim_slot(position)?)?,
+            coefficient,
+        );
+        power = power.mul(&binding.chi);
+    }
+    row.target = output.row_target;
+    rows.push(row);
+
+    // (E_0): the batched activation map at the sumcheck point plus the first
+    // end mask, against the first masked end value. A BAT term is indexed by
+    // the message's virtual entry `row + place * 2^row_bits`, which is the
+    // entry index of the shown-map message.
+    let dot_rows = usize::try_from(dot.shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+    let dot_ell = usize::try_from(dot.shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let mut coefficients = vec![Fp3::ZERO; dot_rows * dot_ell];
+    let mut power = Fp3::ONE;
+    for position in 0..positions as usize {
+        for value_at in 0..hidden {
+            let coefficient = power.mul(&eq_index(
+                &output.point,
+                value_at as u64,
+                variables as u32,
+            )?);
+            let entry = position
+                .checked_mul(hidden)
+                .and_then(|base| base.checked_add(value_at))
+                .ok_or(Error::ResourceLimit)?;
+            let slot = coefficients.get_mut(entry).ok_or(Error::ShapeMismatch)?;
+            *slot = slot.add(&coefficient);
+        }
+        power = power.mul(&binding.chi);
+    }
+    let end_start = index.entries.end_range()?.start;
+    let mut row = BatRow::new(BatRowKind::Plain);
+    row.add_term(dot_member.bat_oracle, BatPart::Main, coefficients);
+    row.add_unit(
+        mask_member.bat_oracle,
+        BatPart::Mask,
+        index.entry_virtual_index(end_start)?,
+        output.ends[0].mask_scale,
+    );
+    row.target = output.ends[0].value;
+    rows.push(row);
+
+    // (E_1): the committed Omega map at the sumcheck point plus the second
+    // end mask, against the second masked end value.
+    let omega_rows = usize::try_from(plan.proximity.omega.u.main_rows)
+        .map_err(|_| Error::ResourceLimit)?;
+    let omega_ell = usize::try_from(plan.proximity.omega.u.code.ell)
+        .map_err(|_| Error::ResourceLimit)?;
+    let mut coefficients = vec![Fp3::ZERO; omega_rows * omega_ell];
+    for value_at in 0..hidden {
+        let coefficient = eq_index(&output.point, value_at as u64, variables as u32)?;
+        let slot = coefficients
+            .get_mut(value_at)
+            .ok_or(Error::ShapeMismatch)?;
+        *slot = slot.add(&coefficient);
+    }
+    let mut row = BatRow::new(BatRowKind::Plain);
+    row.add_term(omega_member.bat_oracle, BatPart::Main, coefficients);
+    row.add_unit(
+        mask_member.bat_oracle,
+        BatPart::Mask,
+        index.entry_virtual_index(end_start + 1)?,
+        output.ends[1].mask_scale,
+    );
+    row.target = output.ends[1].value;
+    rows.push(row);
+    Ok(rows)
+}
+
 fn prove_second(
     plan: &HiddenLinPlan,
     reader: &IndexReader,
@@ -6299,8 +7465,6 @@ fn prove_second(
         Some(_) => tilde_values(plan, witness, shared_point)?,
         None => Vec::new(),
     };
-    let sample_rows = own_sample_rows(plan, &members, first, shared)?;
-    let plain_rows = own_plain_rows(plan, &members, first, shared_point, &tilde)?;
     let mut chain = second_chain(
         plan,
         reader,
@@ -6313,6 +7477,28 @@ fn prove_second(
     if !tilde.is_empty() {
         absorb_tilde(&mut chain, &tilde)?;
     }
+    let (dot_proof, dot_binding) = match &plan.send.dot {
+        Some(_) => {
+            let (proof, binding) = prove_dot_identity(
+                plan,
+                &mut chain,
+                witness,
+                &shared_witness.omega_message,
+                &tilde,
+            )?;
+            (Some(proof), Some(binding))
+        }
+        None => (None, None),
+    };
+    let sample_rows = own_sample_rows(plan, &members, first, shared)?;
+    let plain_rows = own_plain_rows(
+        plan,
+        &members,
+        first,
+        shared_point,
+        &tilde,
+        dot_binding.as_ref(),
+    )?;
     let mut provers = Vec::with_capacity(members.len());
     for member in &members {
         let tree = witness_tree_for(
@@ -6350,6 +7536,7 @@ fn prove_second(
             first_query: *first_query,
             shared_seal: shared.seal,
             tilde,
+            dot: dot_proof,
             fold_start: proximity.messages.fold_start.clone(),
             fold_rounds: proximity.messages.fold_rounds.clone(),
             base: proximity.messages.base,
@@ -6375,6 +7562,12 @@ fn witness_tree_for(
                 .as_ref()
                 .ok_or(Error::ShapeMismatch)?;
             return mask_witness.tree(index);
+        }
+    }
+    if let Some(dot) = &plan.send.dot {
+        if member.source_oracle == dot.oracle {
+            let map = witness.dot.as_ref().ok_or(Error::ShapeMismatch)?;
+            return map.tree(dot);
         }
     }
     if member.source_oracle == plan.proximity.omega.oracle {
@@ -6439,21 +7632,24 @@ fn verify_second(
     {
         return Err(Error::StatementMismatch);
     }
-    match &plan.send.index_mask {
-        Some(_) => {
+    match (&plan.send.index_mask, &plan.send.dot) {
+        (Some(_), Some(_)) => {
             if messages.tilde.len() != plan.send.positions() as usize {
                 return Err(Error::ShapeMismatch);
             }
-        }
-        None => {
-            if !messages.tilde.is_empty() {
+            if messages.dot.is_none() {
                 return Err(Error::ShapeMismatch);
             }
         }
+        (None, None) => {
+            if !messages.tilde.is_empty() || messages.dot.is_some() {
+                return Err(Error::ShapeMismatch);
+            }
+        }
+        _ => return Err(Error::InvalidConfig),
     }
     let (members, _order) = own_members(plan, first, shared, None, None)?;
     let sample_rows = own_sample_rows(plan, &members, first, shared)?;
-    let plain_rows = own_plain_rows(plan, &members, first, shared_point, &messages.tilde)?;
     let mut chain = second_chain(
         plan,
         reader,
@@ -6466,6 +7662,23 @@ fn verify_second(
     if !messages.tilde.is_empty() {
         absorb_tilde(&mut chain, &messages.tilde)?;
     }
+    let dot_binding = match &plan.send.dot {
+        Some(_) => Some(verify_dot_identity(
+            plan,
+            &mut chain,
+            messages,
+            &messages.tilde,
+        )?),
+        None => None,
+    };
+    let plain_rows = own_plain_rows(
+        plan,
+        &members,
+        first,
+        shared_point,
+        &messages.tilde,
+        dot_binding.as_ref(),
+    )?;
     let fold = member_fold_shape(
         plan.proximity.code,
         plan.proximity.mask_code,
@@ -7183,6 +8396,80 @@ fn get_shared(reader: &mut CanonicalReader<'_>) -> Result<HiddenSharedMessages> 
     })
 }
 
+fn put_psc_round(writer: &mut CanonicalWriter, round: &PscRound) {
+    writer.put_u64(round.coefficients.len() as u64);
+    for coefficient in &round.coefficients {
+        writer.put_fp3(coefficient);
+    }
+}
+
+fn get_psc_round(reader: &mut CanonicalReader<'_>, max: usize) -> Result<PscRound> {
+    let count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+    if count > max {
+        return Err(Error::ResourceLimit);
+    }
+    let mut coefficients = Vec::with_capacity(count);
+    for _ in 0..count {
+        coefficients.push(reader.get_fp3()?);
+    }
+    Ok(PscRound { coefficients })
+}
+
+fn put_dot_proof(writer: &mut CanonicalWriter, proof: &DotProof) {
+    writer.put_fp3(&proof.hiding_sum);
+    writer.put_u64(proof.rounds.len() as u64);
+    for round in &proof.rounds {
+        put_psc_round(writer, round);
+    }
+    put_psc_round(writer, &proof.y_round);
+    writer.put_u64(proof.end_values.len() as u64);
+    for value in &proof.end_values {
+        writer.put_fp3(value);
+    }
+}
+
+fn get_dot_proof(reader: &mut CanonicalReader<'_>, plan: &HiddenLinPlan) -> Result<DotProof> {
+    let hidden = plan
+        .send
+        .dot
+        .as_ref()
+        .ok_or(Error::InvalidEncoding)?
+        .hidden as u64;
+    let variables = psc_variables(dot_variables(plan.send.matrix_rows)?)?;
+    let k = variables.len() - 1;
+    let hiding_sum = reader.get_fp3()?;
+    let round_count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+    if round_count != k || hidden != plan.send.matrix_rows {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut rounds = Vec::with_capacity(k);
+    for weight in &variables[..k] {
+        let round = get_psc_round(reader, PLAIN_DEGREE)?;
+        if round.coefficients.len() != weight.degree() - 1 {
+            return Err(Error::ShapeMismatch);
+        }
+        rounds.push(round);
+    }
+    let y_round = get_psc_round(reader, PLAIN_DEGREE)?;
+    if y_round.coefficients.len() != variables[k].degree() - 1 {
+        return Err(Error::ShapeMismatch);
+    }
+    let end_count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+    if end_count != SHOWN_MAPS {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut end_values = [Fp3::ZERO; SHOWN_MAPS];
+    for value in end_values.iter_mut() {
+        *value = reader.get_fp3()?;
+    }
+    Ok(DotProof {
+        hiding_sum,
+        rounds,
+        y_round,
+        end_values,
+    })
+}
+
 fn put_second(writer: &mut CanonicalWriter, message: &HiddenSecondMessages) {
     writer.put_digest(&message.omega_root);
     writer.put_digest(&message.first_query);
@@ -7190,6 +8477,13 @@ fn put_second(writer: &mut CanonicalWriter, message: &HiddenSecondMessages) {
     writer.put_u64(message.tilde.len() as u64);
     for value in &message.tilde {
         writer.put_fp3(value);
+    }
+    match &message.dot {
+        Some(proof) => {
+            writer.put_u64(1);
+            put_dot_proof(writer, proof);
+        }
+        None => writer.put_u64(0),
     }
     put_fold_start(writer, &message.fold_start);
     writer.put_u64(message.fold_rounds.len() as u64);
@@ -7203,7 +8497,7 @@ fn put_second(writer: &mut CanonicalWriter, message: &HiddenSecondMessages) {
     writer.put_digest(&message.seal);
 }
 
-fn get_second(reader: &mut CanonicalReader<'_>) -> Result<HiddenSecondMessages> {
+fn get_second(reader: &mut CanonicalReader<'_>, plan: &HiddenLinPlan) -> Result<HiddenSecondMessages> {
     let omega_root = reader.get_digest()?;
     let first_query = reader.get_digest()?;
     let shared_seal = reader.get_digest()?;
@@ -7215,6 +8509,16 @@ fn get_second(reader: &mut CanonicalReader<'_>) -> Result<HiddenSecondMessages> 
     for _ in 0..tilde_count {
         tilde.push(reader.get_fp3()?);
     }
+    let dot = match reader.get_u64()? {
+        0 => {
+            if plan.send.dot.is_some() {
+                return Err(Error::ShapeMismatch);
+            }
+            None
+        }
+        1 => Some(get_dot_proof(reader, plan)?),
+        _ => return Err(Error::InvalidEncoding),
+    };
     let fold_start = get_fold_start(reader)?;
     let round_count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
     if round_count > 64 {
@@ -7233,6 +8537,7 @@ fn get_second(reader: &mut CanonicalReader<'_>) -> Result<HiddenSecondMessages> 
         first_query,
         shared_seal,
         tilde,
+        dot,
         fold_start,
         fold_rounds,
         base,
@@ -7272,7 +8577,7 @@ impl HiddenLinMessages {
         let shared = get_shared(&mut shared_reader)?;
         shared_reader.finish()?;
         let mut second_reader = CanonicalReader::new(&second_bytes, DecodeLimits::unlimited());
-        let second = get_second(&mut second_reader)?;
+        let second = get_second(&mut second_reader, plan)?;
         second_reader.finish()?;
         Ok(Self {
             first,
@@ -7418,6 +8723,7 @@ mod tests {
                 })
                 .collect(),
             index_mask: None,
+            dot: None,
             pads: (0..POSITIONS as usize)
                 .map(|position| vec![Fp3::from_u64(0x900 + position as u64)])
                 .collect(),
@@ -7464,6 +8770,8 @@ mod tests {
             openings_per_oracle: 2,
             w: w_shape(),
             index_mask: None,
+            dot: None,
+            expected_dot_root: None,
             expected_roots: None,
         };
         let mut source = VecTableSource::new(messages, tails).unwrap();
@@ -8005,7 +9313,31 @@ mod merged_tests {
                 run: INDEX_MASK_RUN,
                 configuration: W_CONFIGURATION,
             },
-            entries: MaskEntryAllocation::new(POSITIONS).unwrap(),
+            entries: MaskEntryAllocation::for_variables(
+                MATRIX_ROWS.trailing_zeros() as usize,
+                POSITIONS,
+            )
+            .unwrap(),
+        }
+    }
+
+    fn dot_plan() -> DotMapPlan {
+        DotMapPlan {
+            oracle: 12,
+            group: GROUP,
+            shape: WShape::new(
+                POSITIONS as u64 * HIDDEN as u64,
+                code(),
+                1,
+                POSITIONS,
+                SALT,
+                400,
+                2,
+                Digest([0x67; 32]),
+                W_CONFIGURATION,
+            )
+            .unwrap(),
+            hidden: HIDDEN,
         }
     }
 
@@ -8136,6 +9468,8 @@ mod merged_tests {
             openings_per_oracle: 2,
             w,
             index_mask: None,
+            dot: None,
+            expected_dot_root: None,
             expected_roots: None,
         };
         let weights: Vec<Vec<Fp3>> = (0..POSITIONS)
@@ -8185,10 +9519,12 @@ mod merged_tests {
         let mut plan = plan(&activation);
         plan.weights = Vec::new();
         plan.send.index_mask = Some(index_mask_plan());
+        plan.send.dot = Some(dot_plan());
         plan.proximity.own_mask_tree.mask_rows = 4;
         let mut table = table();
         let (messages, witness) =
             prove_hidden_lin_hidden(&plan, &activation, &mut table, Digest([0x71; 32])).unwrap();
+        plan.send.expected_dot_root = witness.send.dot.as_ref().map(|map| map.root);
         (plan, messages, witness)
     }
 
@@ -8209,6 +9545,7 @@ mod merged_tests {
             &messages.first,
             &outcome.shared_point,
             &messages.second.tilde,
+            None,
         )
         .unwrap();
         let index = plan.send.index_mask.as_ref().unwrap();
@@ -8334,6 +9671,119 @@ mod merged_tests {
     }
 
     #[test]
+    fn hidden_dot_row_negatives_reach_the_final_verifier() {
+        let table = table();
+
+        // The honest proof, including the canonical encoding of the new
+        // transcript, is accepted first.
+        let (plan, messages, _) = hidden_run();
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &messages).is_ok());
+        let bytes = messages.encode().unwrap();
+        let decoded = HiddenLinMessages::decode(&plan, &bytes).unwrap();
+        assert_eq!(decoded, messages);
+
+        // Changed U row: one round coefficient.
+        let (plan, mut messages, _) = hidden_run();
+        messages.second.dot.as_mut().unwrap().rounds[0].coefficients[0] =
+            messages.second.dot.as_ref().unwrap().rounds[0].coefficients[0].add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &messages).is_err());
+
+        // Changed hiding sum, the first value of the `(U)` row.
+        let (plan, mut messages, _) = hidden_run();
+        messages.second.dot.as_mut().unwrap().hiding_sum =
+            messages.second.dot.as_ref().unwrap().hiding_sum.add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &messages).is_err());
+
+        // Changed end value of the first `(E_j)` row.
+        let (plan, mut messages, _) = hidden_run();
+        messages.second.dot.as_mut().unwrap().end_values[0] =
+            messages.second.dot.as_ref().unwrap().end_values[0].add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &messages).is_err());
+
+        // Changed end value of the second `(E_j)` row.
+        let (plan, mut messages, _) = hidden_run();
+        messages.second.dot.as_mut().unwrap().end_values[1] =
+            messages.second.dot.as_ref().unwrap().end_values[1].add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &messages).is_err());
+
+        // Wrong challenge order: the last (Y) round is sent in the first
+        // position, so the challenge drawn after it differs.
+        let (plan, mut messages, _) = hidden_run();
+        if let Some(dot) = messages.second.dot.as_mut() {
+            let y_round = dot.y_round.clone();
+            dot.rounds[0] = y_round;
+        }
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &messages).is_err());
+
+        // Changed shown-map commitment.
+        let (plan, mut messages, _) = hidden_run();
+        messages.first.dot.as_mut().unwrap().root = Digest([0x68; 32]);
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &messages).is_err());
+
+        // Changed Omega commitment.
+        let (plan, mut messages, _) = hidden_run();
+        messages.shared.omega_root = Digest([0x69; 32]);
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &messages).is_err());
+
+        // Missing shown-map message: the U and E rows cannot be built.
+        let (plan, mut messages, _) = hidden_run();
+        messages.first.dot = None;
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &messages).is_err());
+        let (plan, mut messages, _) = hidden_run();
+        messages.second.dot = None;
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &messages).is_err());
+        let (mut plan, _messages, _) = hidden_run();
+        plan.send.dot = None;
+        assert!(plan.validate().is_err());
+
+        // A changed or reused mask slot is rejected before proof work: every
+        // class keeps its own entries and the claim and tilde slots are never
+        // the same slot.
+        let allocation = MaskEntryAllocation::new(16).unwrap();
+        for position in 0..16u32 {
+            assert_ne!(
+                allocation.claim_slot(position).unwrap(),
+                allocation.tilde_slot(position).unwrap()
+            );
+            assert_ne!(
+                allocation.claim_slot(position).unwrap(),
+                allocation.eval_slot(position).unwrap()
+            );
+            assert_ne!(
+                allocation.tilde_slot(position).unwrap(),
+                allocation.eval_slot(position).unwrap()
+            );
+        }
+        let (mut plan, _messages, _) = hidden_run();
+        plan.send.index_mask.as_mut().unwrap().entries.claim = 0;
+        assert!(plan.validate().is_err());
+        let (mut plan, _messages, _) = hidden_run();
+        plan.send.index_mask.as_mut().unwrap().entries.tilde = 0;
+        assert!(plan.validate().is_err());
+        let (mut plan, _messages, _) = hidden_run();
+        plan.send.index_mask.as_mut().unwrap().entries.end = 0;
+        assert!(plan.validate().is_err());
+        let (mut plan, _messages, _) = hidden_run();
+        plan.send.index_mask.as_mut().unwrap().entries.hiding = 0;
+        assert!(plan.validate().is_err());
+        let (mut plan, _messages, _) = hidden_run();
+        plan.send.index_mask.as_mut().unwrap().entries.variables = 0;
+        assert!(plan.validate().is_err());
+
+        // The shown-map plan must carry the hidden entry count and a tree that
+        // does not collide with the reduced-row trees.
+        let (mut plan, _messages, _) = hidden_run();
+        plan.send.dot.as_mut().unwrap().hidden = 1;
+        assert!(plan.validate().is_err());
+        let (mut plan, _messages, _) = hidden_run();
+        plan.send.dot.as_mut().unwrap().shape.tree_number = plan.send.w.tree_number;
+        assert!(plan.validate().is_err());
+        let (mut plan, _messages, _) = hidden_run();
+        plan.send.dot.as_mut().unwrap().shape.answers = 2;
+        assert!(plan.validate().is_err());
+    }
+
+    #[test]
     fn mask_slot_schema_is_separate_and_one_time() {
         let allocation = MaskEntryAllocation::new(POSITIONS).unwrap();
         assert_eq!(
@@ -8423,6 +9873,7 @@ mod merged_tests {
         let mut plan = diagnostic_plan.clone();
         plan.weights = Vec::new();
         plan.send.index_mask = Some(index_mask_plan());
+        plan.send.dot = Some(dot_plan());
         plan.proximity.own_mask_tree.mask_rows = 4;
         let mut table = table();
         let (messages, witness) =

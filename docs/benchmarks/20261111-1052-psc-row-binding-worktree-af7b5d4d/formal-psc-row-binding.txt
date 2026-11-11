@@ -1,0 +1,49 @@
+
+running 1 test
+table_root=Digest([148, 228, 18, 92, 159, 9, 235, 1, 142, 70, 95, 7, 171, 134, 119, 36, 68, 154, 52, 186, 184, 27, 87, 156, 197, 93, 34, 5, 64, 158, 198, 32])
+table_configuration=Digest([180, 94, 164, 247, 112, 238, 158, 61, 81, 31, 160, 72, 176, 98, 98, 175, 194, 254, 212, 79, 91, 67, 103, 212, 93, 18, 105, 88, 173, 10, 55, 228])
+table_record_digest=Digest([36, 38, 230, 57, 231, 65, 175, 140, 75, 91, 42, 73, 167, 56, 10, 209, 58, 205, 0, 227, 94, 110, 44, 23, 231, 207, 94, 170, 205, 34, 32, 7])
+table_commit_ms=29430
+trace_verify_ms=17091
+test selected_gpt2_output_head_request_session has been running for over 60 seconds
+output_head_step=4444
+request_proof_bytes=8993152
+prove_ms=35862
+prepared_verify_ms=8926
+verify_ms=25766
+manifest_total_bytes=4170818219
+manifest_request_bytes=8993152
+total_verification_bytes=4170775726
+commitment_ledger_openings=655
+commitment_ledger_table_reuse=0
+hidden_prove_ms=36762
+hidden_proof_bytes=8982392
+hidden_verify_ms=8895
+formal_manifest_total_bytes=4170807459
+test selected_gpt2_output_head_request_session ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 206.69s
+
+	Command being timed: "target/release/deps/lin_session-57244f2b8a6ff03d selected_gpt2_output_head_request_session --ignored --nocapture"
+	User time (seconds): 245.02
+	System time (seconds): 124.90
+	Percent of CPU this job got: 178%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 3:26.91
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 18337768
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 6290738
+	Voluntary context switches: 629926
+	Involuntary context switches: 34208
+	Swaps: 0
+	File system inputs: 8
+	File system outputs: 105352
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
