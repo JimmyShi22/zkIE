@@ -1267,6 +1267,37 @@ fn selected_gpt2_output_head_request_session() {
         )
         .unwrap();
         println!("hidden_verify_ms={}", started.elapsed().as_millis());
+        println!(
+            "hidden_own_fold_rounds={}",
+            hidden_proof.session.second.fold_rounds.len()
+        );
+        // The optional auxiliary agreement check uses the already-computed
+        // public outcome and checks the prover's private mask entries against
+        // the tilde row, the residual and the product-sumcheck output rows.
+        // It is enabled explicitly so the formal run keeps its established
+        // memory and wall-time measurement basis.
+        if env::var_os("ZKIE_SESSION_WITNESS").is_some() {
+            let started = Instant::now();
+            zkie_ops::proof::hidden_send_session::verify_hidden_lin_witness_agreement(
+                &hidden_plan,
+                &hidden_proof.session,
+                &hidden_witness,
+                &hidden_outcome.outcome,
+            )
+            .unwrap();
+            println!(
+                "hidden_witness_check_ms={}",
+                started.elapsed().as_millis()
+            );
+            assert_eq!(
+                hidden_outcome
+                    .outcome
+                    .dot
+                    .as_ref()
+                    .map(|binding| binding.residual),
+                hidden_proof.session.second.residual
+            );
+        }
         // The formal manifest binds the hidden proof, not the diagnostic
         // request. The diagnostic byte count stays a separate diagnostic
         // figure; the formal total is trace + hidden proof + public.

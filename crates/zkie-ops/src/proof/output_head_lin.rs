@@ -370,8 +370,11 @@ pub struct OutputHeadLinOutcome {
 // against the committed roots. The activation rows are also committed as one
 // shown-map message; after the tilde values and the batching challenge, the
 // masked product-sumcheck transcript yields the `(U)` row and the two `(E_j)`
-// end-value rows, and the public `c_t = g_t` tie rows join the claim masks to
-// the tilde masks. Those rows are checked by the same own-group test, so the
+// end-value rows; one public difference row joins the chi-weighted claim and
+// tilde masks to the residual `R = sum_t chi^t (g_t - c_t)`, which also
+// adjusts the product-sumcheck target. The claim and tilde masks are
+// independent; the difference row does not force them to be equal. Those rows
+// are checked by the same own-group test, so the
 // verifier checks `<X_t, Omega> = W_t(psi*)` over the committed shown maps and
 // the committed reduced rows. The vocabulary mask, validity range, ordering
 // comparison, first-maximum tie rule and final output are trusted graph

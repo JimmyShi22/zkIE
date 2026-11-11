@@ -1,0 +1,307 @@
+warning: variable does not need to be mutable
+   --> tools/zkie-check/src/assets.rs:165:9
+    |
+165 |     let mut flush = |current: &mut Option<Record>, records: &mut Vec<Record>| {
+    |         ----^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-check` (bin "zkie-check" test) generated 1 warning (run `cargo fix --bin "zkie-check" -p zkie-check --tests` to apply 1 suggestion)
+warning: unused variable: `target`
+   --> crates/zkie-engine/src/pcs/request/relation.rs:858:5
+    |
+858 |     target: Fp3,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `columns_usize`
+   --> crates/zkie-engine/src/pcs/request/table.rs:952:13
+    |
+952 |         let columns_usize = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_columns_usize`
+
+warning: unused import: `zkie_core::common::field::PrimeCharacteristicRing`
+   --> crates/zkie-engine/src/pcs/request/code.rs:348:9
+    |
+348 |     use zkie_core::common::field::PrimeCharacteristicRing;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-engine` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-engine` to apply 2 suggestions)
+warning: `zkie-engine` (lib test) generated 3 warnings (2 duplicates)
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/base_last_session.rs:578:13
+    |
+578 |         let mut message = self.chain.message();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `plan` is never read
+   --> crates/zkie-ops/src/proof/cs_multi_session.rs:195:5
+    |
+189 | pub struct CsMultiSession {
+    |            -------------- field in this struct
+...
+195 |     plan: RuntimeTreePlan,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `PrimeField64`
+    --> crates/zkie-ops/src/proof/output_head_lin.rs:1439:61
+     |
+1439 |     use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
+     |                                                             ^^^^^^^^^^^^
+     |
+     = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `FallbackPolicy`
+  --> crates/zkie-engine/tests/memory_budget.rs:19:41
+   |
+19 | use zkie_engine::context::{ExecContext, FallbackPolicy, Metrics, RuntimeConfig};
+   |                                         ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-ops` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-ops` to apply 1 suggestion)
+warning: `zkie-ops` (lib test) generated 3 warnings (2 duplicates) (run `cargo fix --lib -p zkie-ops --tests` to apply 1 suggestion)
+warning: `zkie-engine` (test "memory_budget") generated 1 warning (run `cargo fix --test "memory_budget" -p zkie-engine` to apply 1 suggestion)
+   Compiling zkie-models-common v0.1.0 (/data/zkIE/models/common)
+   Compiling zkie-ops v0.1.0 (/data/zkIE/crates/zkie-ops)
+warning: unused variable: `m`
+   --> models/gemma3/src/executor.rs:277:5
+    |
+277 |     m: usize,
+    |     ^ help: if this is intentional, prefix it with an underscore: `_m`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_rot_step`
+   --> models/gemma3/src/executor.rs:390:21
+    |
+390 |         let (k_rot, k_rot_step) = rope(&mut builder, k, k_step, cos_prefix.clone(), sin_prefix.clone(), m)?;
+    |                     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_rot_step`
+
+warning: unused import: `zkie_engine::pcs::request::field::E_DEGREE`
+  --> models/gpt2/src/lm_head_plan.rs:11:5
+   |
+11 | use zkie_engine::pcs::request::field::E_DEGREE;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_step`
+   --> models/gpt2/src/executor.rs:346:21
+    |
+346 |             let (k, k_step) = {
+    |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_step`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling zkie-models-timesfm v0.1.0 (/data/zkIE/models/timesfm)
+   Compiling zkie-models-gpt2 v0.1.0 (/data/zkIE/models/gpt2)
+   Compiling zkie-models-gemma3 v0.1.0 (/data/zkIE/models/gemma3)
+warning: `zkie-models-gemma3` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gemma3` to apply 2 suggestions)
+warning: `zkie-models-gpt2` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gpt2` to apply 2 suggestions)
+warning: unused import: `digest_to_hex`
+  --> zkie/src/policy.rs:12:58
+   |
+12 | use zkie_core::artifact::{digest_bytes, digest_from_hex, digest_to_hex};
+   |                                                          ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `VecTableSource` and `commit_table_streaming`
+  --> zkie/src/lm_head_key.rs:58:5
+   |
+58 |     commit_table_streaming, verify_columns, ColumnOpening, IndexReader, IndexShape, SampleSeed,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+59 |     EncodedRowStore, StreamingHolder, TableRowSource, VecTableSource,
+   |                                                       ^^^^^^^^^^^^^^
+
+warning: unused import: `zkie_core::common::field::PrimeCharacteristicRing`
+  --> zkie/src/lm_head_key.rs:15:5
+   |
+15 | use zkie_core::common::field::PrimeCharacteristicRing;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `mask_oracle`
+    --> zkie/src/lm_head_key.rs:3406:9
+     |
+3406 |     let mask_oracle = MaskOracle {
+     |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mask_oracle`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> zkie/src/lm_head_key.rs:4272:9
+     |
+4272 |     let mut mask_tail = vec![Fp3::ZERO; mask_tail_len];
+     |         ----^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `mask_tail`
+    --> zkie/src/lm_head_key.rs:4272:9
+     |
+4272 |     let mut mask_tail = vec![Fp3::ZERO; mask_tail_len];
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mask_tail`
+
+warning: variable does not need to be mutable
+   --> zkie/src/lm_head_stage.rs:288:9
+    |
+288 |     let mut options = if private {
+    |         ----^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: field `tree` is never read
+    --> zkie/src/lm_head_key.rs:1534:5
+     |
+1530 | pub struct LmHeadOmegaProvider {
+     |            ------------------- field in this struct
+...
+1534 |     tree: RuntimeTreePlan,
+     |     ^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie` (lib) generated 8 warnings (run `cargo fix --lib -p zkie` to apply 6 suggestions)
+warning: `zkie` (lib test) generated 6 warnings (6 duplicates)
+warning: unused imports: `GuRelationKind` and `GuRelationRow`
+  --> zkie/tests/column_session.rs:10:59
+   |
+10 | use zkie_engine::pcs::request::relation::{foldeq_weights, GuRelationKind, GuRelationRow};
+   |                                                           ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie` (test "column_session") generated 1 warning (run `cargo fix --test "column_session" -p zkie` to apply 1 suggestion)
+warning: unused variable: `oracle`
+   --> crates/zkie-ops/tests/relation_openings.rs:252:10
+    |
+252 |     let (oracle, openings) =
+    |          ^^^^^^ help: if this is intentional, prefix it with an underscore: `_oracle`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-ops` (test "relation_openings") generated 1 warning (run `cargo fix --test "relation_openings" -p zkie-ops` to apply 1 suggestion)
+warning: `zkie-models-gpt2` (lib test) generated 1 warning (1 duplicate)
+warning: `zkie-models-gemma3` (lib test) generated 2 warnings (2 duplicates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+     Running unittests src/lib.rs (target/debug/deps/zkie-4ea752f31345480f)
+
+running 88 tests
+test commitment_ledger::tests::commitment_ledger_worker ... ignored
+test anchor::tests::rejects_ambiguous_inputs_and_bad_shapes ... ok
+test commitment_ledger::tests::a_damaged_state_is_rejected ... ok
+test anchor::tests::selects_the_entry_matching_the_input ... FAILED
+test commitment_ledger::tests::a_failed_attempt_cannot_be_retried ... ok
+test commitment_ledger::tests::a_reservation_records_the_attempt_and_the_logical_opening_count ... ok
+test commitment_ledger::tests::initialization_is_fresh_and_rejects_a_second_state ... ok
+test commitment_ledger::tests::a_stale_temporary_fails_closed_without_consuming_the_ledger ... ok
+test lm_head_key::stage_tests::lm_head_stage_processes ... ignored
+test lm_head_key::stage_tests::lm_head_stage_worker ... ignored
+test commitment_ledger::tests::the_actual_commitment_is_recorded_once_and_conflicts_are_rejected ... ok
+test lm_head_key::tests::real_gpt2_lm_head_chain ... ignored
+test lm_head_key::lin_request_tests::value_digests_separate_labels_shapes_and_values ... ok
+test lm_head_key::lin_request_tests::every_bound_field_changes_the_digest_or_is_rejected ... ok
+test lm_head_key::tests::an_incomplete_record_has_no_artifact ... ok
+test commitment_ledger::tests::the_same_activation_root_cannot_serve_a_second_request ... ok
+test lm_head_key::tests::omega_blocks_sum_the_folded_matrix_rows ... ok
+test lm_head_key::lin_request_tests::the_declaration_round_trips_and_binds_its_domain ... ok
+test lm_head_key::tests::repeated_column_openings_are_stored_once ... ok
+test commitment_ledger::tests::concurrent_threads_have_one_winner ... ok
+test lm_head_key::tests::the_chain_artifact_round_trips_and_rejects_damage ... ok
+test commitment_ledger::tests::table_reuse_is_forbidden_or_counted_by_policy ... ok
+test lm_head_key::tests::the_last_stage_carries_the_group_row_unchanged ... ok
+test lm_head_key::tests::the_last_stage_rejects_a_folded_final_target ... ok
+test lm_head_key::tests::the_g_u_fold_rejects_mismatched_inputs ... ok
+test lm_head_key::tests::the_fresh_mask_commits_and_is_reproducible_from_private_bytes ... ok
+test lm_head_key::tests::the_g_u_fold_commits_the_folded_table_and_answers_the_seed ... ok
+test lm_head_key::tests::the_old_mask_commits_its_message_rows_separately_from_the_fresh_mask ... ok
+test lm_head_key::tests::the_fold_row_binds_the_g_u_and_omega_coefficients ... ok
+test lm_head_key::tests::the_stage_sequence_rejects_missing_or_reordered_switches ... ok
+test lm_head_stage::tests::a_stale_journal_lock_fails_closed_and_keeps_the_old_state ... ok
+test lm_head_stage::tests::another_session_cannot_claim_the_budget ... ok
+test commitment_ledger::tests::a_restart_sees_the_spent_state_and_cannot_reuse_it ... ok
+test lm_head_stage::tests::a_successful_claim_is_durable_and_leaves_no_journal_temporary ... ok
+test lm_head_key::tests::the_g_u_fold_binds_the_challenge_and_the_private_pads ... ok
+test lm_head_stage::tests::the_budget_is_reserved_once_and_never_rolls_back ... ok
+test commitment_ledger::tests::a_failed_attempt_in_another_process_cannot_reuse_its_reservation ... ok
+test lm_head_key::tests::the_holder_fold_matches_the_key_fold ... ok
+test output::tests::argmax_and_int_output_keep_their_widths ... ok
+test lm_head_stage::tests::the_manifest_rejects_trailing_bytes_and_duplicate_roles ... ok
+test lm_head_stage::tests::the_manifest_binds_whole_files_and_rejects_damage ... ok
+test output::tests::binds_a_matching_public_inputs_file ... ok
+test output::tests::no_expectation_mode_returns_the_authenticated_output ... ok
+test lm_head_key::tests::the_omega_message_commits_and_answers_the_seed ... ok
+test lm_head_key::tests::the_limited_tested_state_needs_every_check ... ok
+test lm_head_stage::tests::concurrent_claims_have_one_winner_and_no_mask_reuse ... ok
+test output::tests::rejects_bad_encodings_and_values ... ok
+test output::tests::rejects_digest_and_value_mismatches ... ok
+test output::tests::timesfm_values_keep_i32_semantics ... ok
+test lm_head_key::tests::the_shared_column_check_follows_the_chain ... ok
+test lm_head_stage::tests::private_files_are_owner_only_and_do_not_overwrite ... ok
+test provider::tests::exact_bincode_rejects_trailing_and_truncation ... ok
+test policy::tests::parses_and_selects_timesfm_case ... ok
+test provider::tests::proof_eof_read_error_is_not_success ... ok
+test provider::tests::proof_bincode_requires_eof ... ok
+test provider::tests::proof_directory_is_not_success ... ok
+test lm_head_stage::tests::public_and_private_records_round_trip_and_reject_damage ... ok
+test policy::tests::a_timesfm_case_rejects_an_identity ... ok
+test policy::tests::parses_and_selects_token_case ... ok
+test policy::tests::rejects_unknown_fields_and_duplicate_keys ... ok
+test policy::tests::rejects_duplicate_case_ids ... ok
+test policy::tests::activation_commitment_is_selected_and_bound ... ok
+test policy::tests::activation_commitment_encoding_is_canonical ... ok
+test policy::tests::rejects_a_gpt2_case_without_an_identity ... ok
+test policy::tests::a_committed_identity_must_match_the_policy_identity ... ok
+test policy::tests::the_identity_digest_is_domain_separated_and_versioned ... ok
+test policy::tests::the_identity_encoding_round_trips_and_rejects_malformed_fields ... ok
+test policy::tests::every_identity_field_changes_the_digest_or_is_rejected ... ok
+test lm_head_key::tests::the_limited_shared_plan_rejects_a_reader_with_another_configuration ... ok
+test lm_head_key::tests::the_limited_shared_plan_rejects_a_compiled_shape_that_does_not_fit ... ok
+test lm_head_key::tests::the_limited_shared_plan_rejects_a_statement_that_does_not_name_the_reader ... ok
+test policy::tests::rejects_bad_shapes_and_versions ... ok
+test commitment_ledger::tests::concurrent_processes_have_one_winner ... ok
+test policy::tests::activation_commitment_binds_the_case_model_and_version ... ok
+test policy::tests::rejects_an_identity_from_another_case_or_version ... ok
+test lm_head_key::tests::the_limited_shared_plan_needs_private_bytes_and_a_mask_root ... ok
+test policy::tests::selects_expected_output_mode_and_rejects_partial_declarations ... ok
+test lm_head_key::tests::the_shared_chain_reaches_the_record_and_column_joins ... ok
+test lm_head_key::tests::the_limited_key_plan_keeps_every_stage_in_order ... ok
+test lm_head_key::tests::the_limited_statement_binds_its_semantics_and_range ... ok
+test lm_head_key::tests::the_mapping_covers_the_matrix ... ok
+test lm_head_key::tests::the_mapping_matches_sampled_source_entries ... ok
+test lm_head_key::tests::the_limited_shared_plan_binds_the_real_configuration_run_and_trees ... ok
+test commitment_ledger::tests::a_stale_lock_fails_closed_without_consuming_the_ledger ... ok
+test lm_head_key::tests::the_trusted_public_switch_plans_reject_edited_handoff_fields ... ok
+test lm_head_key::tests::the_selected_plan_identifier_enters_the_first_query ... ok
+test lm_head_key::tests::the_limited_shared_run_and_binding_follow_the_private_bytes ... ok
+test lm_head_key::tests::the_planned_stage_chain_follows_the_compiled_stages ... ok
+
+failures:
+
+---- anchor::tests::selects_the_entry_matching_the_input stdout ----
+
+thread 'anchor::tests::selects_the_entry_matching_the_input' (2448478) panicked at zkie/src/anchor.rs:443:68:
+called `Result::unwrap()` on an `Err` value: InvalidConfig
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    anchor::tests::selects_the_entry_matching_the_input
+
+test result: FAILED. 83 passed; 1 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.66s
+
+error: test failed, to rerun pass `-p zkie --lib`

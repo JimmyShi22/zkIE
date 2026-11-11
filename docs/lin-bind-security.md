@@ -281,11 +281,15 @@ verifier boundary:
 - The Dot identity `<X_t, Omega> = W_t(psi*)` is checked over the committed
   shown-map message, the committed `Omega` message and the committed reduced
   rows: the masked product-sumcheck transcript yields the `(U)` row and the
-  two `(E_j)` end-value rows, the public `c_t = g_t` tie rows join the claim
-  and tilde masks, and the own-group BAT/FOLD/BASE test checks every row. The
-  verifier pins the shown-map commitment and the activation commitment
-  separately; that the two commitments carry the same `X` is an
-  operator-policy warranty, not a cross-commitment proof.
+  two `(E_j)` end-value rows, one public difference row
+  `sum_t chi^t g_t - sum_t chi^t c_t = R` joins the independent claim and
+  tilde masks, and the own-group BAT/FOLD/BASE test checks every row. The
+  residual `R` also adjusts the product-sumcheck target to
+  `sum_t chi^t tilde_t - R`. The verifier pins the shown-map commitment and
+  the activation commitment separately; that the two commitments carry the
+  same `X` is an operator-policy warranty, not a cross-commitment proof. The
+  mask joint-view analysis, the leakage-rank budget and the updated error
+  terms are in `docs/hidden-dot-mask.md`; that argument is not a formal proof.
 - The previous-layer relation from the model to `X` is not proven.
 - Any plaintext `X` source is diagnostic only.
 - The production `commit`/`prove`/`verify` entry wiring is pending.

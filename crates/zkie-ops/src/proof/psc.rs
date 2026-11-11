@@ -1369,6 +1369,75 @@ mod tests {
         }
     }
 
+    fn rank_over_fp3(matrix: &[Vec<Fp3>]) -> usize {
+        let rows = matrix.len();
+        let cols = matrix.first().map_or(0, Vec::len);
+        let mut work = matrix.to_vec();
+        let mut rank = 0usize;
+        for column in 0..cols {
+            let pivot = (rank..rows).find(|&row| work[row][column] != Fp3::ZERO);
+            let Some(pivot) = pivot else {
+                continue;
+            };
+            work.swap(rank, pivot);
+            let inverse = work[rank][column].inverse().unwrap();
+            for value in work[rank].iter_mut().skip(column) {
+                *value = value.mul(&inverse);
+            }
+            for row in 0..rows {
+                if row == rank || work[row][column] == Fp3::ZERO {
+                    continue;
+                }
+                let factor = work[row][column];
+                for column_after in column..cols {
+                    work[row][column_after] =
+                        work[row][column_after].sub(&factor.mul(&work[rank][column_after]));
+                }
+            }
+            rank += 1;
+        }
+        rank
+    }
+
+    #[test]
+    fn production_hiding_coefficient_map_is_full_rank() {
+        // The 23 hiding coefficients randomize the 23 sent scalars: the
+        // hiding sum plus the 22 non-fixed round coefficients. The sigma
+        // direction is one of the coefficient directions (`w_0 = sigma psi_0`),
+        // so it adds no rank beyond the hiding map. A full-rank map is the
+        // per-session one-to-one property the hiding argument uses.
+        let variables = psc_variables(DOT_VARIABLES).unwrap();
+        let entries = hp_entries(&variables).unwrap();
+        assert_eq!(entries, 23);
+        let challenges: Vec<Fp3> = (0..variables.len())
+            .map(|index| f(0x100 + index as u64))
+            .collect();
+        let mut matrix = vec![vec![Fp3::ZERO; entries]; entries];
+        for (basis, row) in matrix.iter_mut().enumerate() {
+            let mut unit = vec![Fp3::ZERO; entries];
+            unit[basis] = Fp3::ONE;
+            let mut hiding = HidingPolynomial::new(&variables, &unit).unwrap();
+            let mut values = vec![hiding.sum()];
+            for (variable, weight) in variables.iter().enumerate() {
+                let round = hiding.round().unwrap();
+                for (index, coefficient) in round.iter().enumerate() {
+                    if index != weight.fixed() {
+                        values.push(*coefficient);
+                    }
+                }
+                hiding.bind(challenges[variable]).unwrap();
+            }
+            assert_eq!(values.len(), entries);
+            for (sent, value) in values.into_iter().enumerate() {
+                row[sent] = value;
+            }
+        }
+        assert_eq!(rank_over_fp3(&matrix), entries);
+        // The sigma direction is the degree-one coefficient of the first
+        // variable, which is the first sent hiding entry.
+        assert_eq!(hp_place(&variables, 0, 1).unwrap(), 0);
+    }
+
     #[test]
     fn interpolation_matches_the_three_nodes() {
         let values = [f(5), f(11), f(23)];

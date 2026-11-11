@@ -181,16 +181,21 @@
 //! The hidden-input mode also commits a shown-map message: one main table
 //! holding the activation rows, with its own encoding tail, salts and sample
 //! pad. After the tilde values and the batching challenge, the prover sends
-//! the masked product-sumcheck transcript and the verifier rebuilds the `(U)`
-//! row and the two `(E_j)` end-value rows from it. Those rows, the public
-//! `c_t = g_t` tie rows and the existing tilde rows are registered in the own
-//! group, so the BAT/FOLD/BASE test checks `<X_t, Omega> = W_t(psi*)` against
-//! the committed shown maps and the committed reduced rows. The shown-map
+//! the public residual `R = sum_t chi^t (g_t - c_t)` and the masked
+//! product-sumcheck transcript. The verifier absorbs the residual before the
+//! product-sumcheck challenges and rebuilds the adjusted target
+//! `sum_t chi^t tilde_t - R`, the `(U)` row, the two `(E_j)` end-value rows
+//! and one difference row `sum_t chi^t g_t - sum_t chi^t c_t = R` from it.
+//! Those rows and the existing tilde rows are registered in the own group, so
+//! the BAT/FOLD/BASE test checks `<X_t, Omega> = W_t(psi*)` against the
+//! committed shown maps and the committed reduced rows. The shown-map
 //! commitment is pinned like the activation commitment: the equality of the
 //! two commitments of `X` is an operator warranty, not a proof. The mask
 //! entries come from the separate one-time schema: the hiding coefficients,
 //! the two end masks, the claim masks `c_t`, the tilde masks `g_t` and the
-//! Eval masks `e_t` occupy disjoint slots and none is reused.
+//! Eval masks `e_t` occupy disjoint slots and none is reused. The claim and
+//! tilde masks are independent draws from the same stage-1 stream; the one
+//! difference row is their only consistency use and does not force equality.
 
 use zkie_core::common::codec::DecodeLimits;
 use zkie_core::common::field::PrimeCharacteristicRing;
@@ -243,8 +248,8 @@ use zkie_engine::primitives::transcript::{
 };
 
 use crate::proof::psc::{
-    hp_entries, psc_variables, ClaimMask, DotClaim, DotMaskEntries, DotOutput, DotProof,
-    PscChallenges, PscRound, DOT_VARIABLES, PLAIN_DEGREE, SHOWN_MAPS,
+    check_product_claims, hp_entries, psc_variables, ClaimMask, DotClaim, DotMaskEntries,
+    DotOutput, DotProof, PscChallenges, PscRound, DOT_VARIABLES, PLAIN_DEGREE, SHOWN_MAPS,
 };
 use crate::proof::base_final_session::{
     fold_identity, BaseFinalCheck, BaseFinalOutcome, BaseFinalRows, BaseFinalSession, BaseMessages,
@@ -252,8 +257,17 @@ use crate::proof::base_final_session::{
 };
 use crate::proof::fold_handoff::{FoldHandoff, FoldHandoffAnchor};
 
-/// Version of the canonical messages of this interface.
-const HIDDEN_SEND_SCHEMA_VERSION: u64 = 3;
+/// Version of the canonical messages of this interface. Version 4 carries the
+/// public Dot residual, the independent claim/tilde mask draws and the one
+/// difference row that replaces the per-position equality rows.
+const HIDDEN_SEND_SCHEMA_VERSION: u64 = 4;
+/// Domain tag of the public Dot residual in the second-stage transcript.
+const DOT_RESIDUAL_MESSAGE_TAG: u64 = 19;
+/// Version of the Dot residual relation. It fixes the sign convention
+/// `R = sum_t chi^t (g_t - c_t)` and the directed adjusted target
+/// `T = sum_t chi^t tilde_t - R`; a different convention is a different
+/// relation and must use a new version.
+const DOT_RESIDUAL_RELATION: u64 = 1;
 /// Chain label of the hidden SEND-sample message.
 const HIDDEN_SEND_CHAIN_LABEL: u64 = 0x4853_4e44;
 /// The activation row tree's number in the runtime leaf domain. The value is
@@ -1164,9 +1178,10 @@ fn ceil_log2_u64(value: u64) -> u32 {
 /// The fixed allocation of the one-time mask entries in the index-mask
 /// message. The five classes occupy disjoint ranges in this order: the PSC
 /// hiding coefficients, the two shown-value masks, the claim masks, the tilde
-/// masks and the Eval masks. The claim and tilde entries are never merged:
-/// `tilde_t` reads a `tilde` entry and the claim reads a `claim` entry, tied by
-/// a separate public row.
+/// masks and the Eval masks. The claim and tilde entries are never merged and
+/// carry independent draws: `tilde_t` reads a `tilde` entry and the claim
+/// reads a `claim` entry; one public difference row ties their chi-weighted
+/// sums to the published residual without forcing the values to be equal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MaskEntryAllocation {
     /// The number of positions; the claim, tilde and Eval classes have one
@@ -1495,14 +1510,11 @@ impl IndexMaskRandomness {
             return Err(Error::EntropyUnavailable);
         }
         // The PSC claim mask `c_t` and the tilde mask `g_t` are distinct
-        // one-time entries with the same value; the Dot layer registers a
-        // public row that ties them. Neither entry is reused.
-        for position in 0..plan.entries.positions {
-            let claim = plan.entries.claim_slot(position)?;
-            let tilde = plan.entries.tilde_slot(position)?;
-            let value = values[tilde / ell][tilde % ell];
-            values[claim / ell][claim % ell] = value;
-        }
+        // one-time entries and keep independent draws from the stage-1
+        // stream. The Dot layer publishes their chi-weighted residual and
+        // checks it with one difference row; it does not copy the tilde value
+        // into the claim slot and does not force the two values to be equal.
+        // The allocation's disjoint slot ranges are checked by `fault`.
         let mut tails = Vec::with_capacity(rows);
         for _ in 0..rows {
             tails.push(draw_values(coins, tail)?);
@@ -4103,6 +4115,12 @@ pub struct HiddenSecondMessages {
     /// The masked Dot right-hand side `tilde_t = W_t(psi*) + g_t` in the
     /// hidden-input mode; empty in the diagnostic mode.
     pub tilde: Vec<Fp3>,
+    /// The public residual `R = sum_t chi^t (g_t - c_t)` of the independent
+    /// claim and tilde masks. It is absorbed after `chi` and before the
+    /// product-sumcheck challenges; the adjusted target is
+    /// `sum_t chi^t tilde_t - R`. `None` in the diagnostic mode, where the
+    /// equality rows bind the masks instead.
+    pub residual: Option<Fp3>,
     /// The masked product-sumcheck transcript of the hidden Dot identity in
     /// the hidden-input mode; empty in the diagnostic mode.
     pub dot: Option<DotProof>,
@@ -4142,6 +4160,10 @@ pub struct HiddenLinOutcome {
     pub column_positions: Vec<u64>,
     pub shared_base: BaseFinalOutcome,
     pub own_base: BaseFinalOutcome,
+    /// The checked Dot transcript binding when the hidden Dot mode is active:
+    /// the batching challenge, the public residual and the product-sumcheck
+    /// output claims. `None` in the diagnostic mode.
+    pub dot: Option<DotRowBinding>,
 }
 
 /// The prover's private material for the auxiliary unit checks. It is never
@@ -7018,16 +7040,37 @@ fn absorb_tilde(chain: &mut Chain, tilde: &[Fp3]) -> Result<()> {
     Ok(())
 }
 
+/// Absorbs the public residual and its relation description. The binding
+/// happens after `chi` and before the product-sumcheck challenges: the next
+/// challenge drawn from the chain is `eps`, which multiplies the adjusted
+/// target `sum_t chi^t tilde_t - R`.
+fn absorb_dot_residual(chain: &mut Chain, residual: Fp3) -> Result<()> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(DOT_RESIDUAL_MESSAGE_TAG);
+    message.push_u64(DOT_RESIDUAL_RELATION);
+    message.push_fp3(&residual);
+    let prefix = message.prefix(KIND_ALGEBRAIC, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // The committed product-sumcheck rows of the hidden Dot identity
 // ---------------------------------------------------------------------------
 
-/// The checked transcript output and the batching challenge. Both sides derive
-/// the committed `(U)` and `(E_j)` rows from this binding; the arithmetic
-/// module never binds a row by itself.
-struct DotRowBinding {
-    output: DotOutput,
-    chi: Fp3,
+/// The checked transcript output, the batching challenge and the public
+/// residual. Both sides derive the committed `(U)`, `(E_j)` and difference
+/// rows from this binding; the arithmetic module never binds a row by itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DotRowBinding {
+    pub output: DotOutput,
+    pub chi: Fp3,
+    /// `R = sum_t chi^t (g_t - c_t)`, the target of the difference row and
+    /// the value absorbed into the second-stage transcript after `chi`.
+    pub residual: Fp3,
 }
 
 /// The number of product-sumcheck variables of `matrix_rows` entries.
@@ -7050,6 +7093,95 @@ fn dot_claim_target(tilde: &[Fp3], chi: Fp3) -> Result<Fp3> {
         power = power.mul(&chi);
     }
     Ok(target)
+}
+
+/// `R = sum_t chi^t (g_t - c_t)`, computed from the committed claim and tilde
+/// entries. The prover reads it from the same mask witness that committed the
+/// message; the verifier receives the same field element and binds it through
+/// the difference row instead of recomputing it from hidden values.
+fn dot_residual(
+    index: &IndexMaskPlan,
+    mask_witness: &IndexMaskWitness,
+    chi: Fp3,
+) -> Result<Fp3> {
+    let mut residual = Fp3::ZERO;
+    let mut power = Fp3::ONE;
+    for position in 0..index.entries.positions {
+        let tilde = mask_witness.entry(index, index.entries.tilde_slot(position)?)?;
+        let claim = mask_witness.entry(index, index.entries.claim_slot(position)?)?;
+        residual = residual.add(&power.mul(&tilde.sub(&claim)));
+        power = power.mul(&chi);
+    }
+    Ok(residual)
+}
+
+/// `T = sum_t chi^t tilde_t - R`, the target of the masked Dot claim. This is
+/// the only place the residual enters the product sumcheck: it cancels the
+/// chi-weighted mask difference exactly, so the PSC still proves
+/// `sum_t chi^t <X_t, Omega> = sum_t chi^t W_t(psi*)`.
+fn dot_adjusted_target(tilde: &[Fp3], chi: Fp3, residual: Fp3) -> Result<Fp3> {
+    Ok(dot_claim_target(tilde, chi)?.sub(&residual))
+}
+
+/// The claim masks of the Dot claim, read from the committed claim entries.
+fn dot_claim_from_witness(
+    index: &IndexMaskPlan,
+    mask_witness: &IndexMaskWitness,
+    chi: Fp3,
+    target: Fp3,
+) -> Result<DotClaim> {
+    let mut masks = Vec::with_capacity(index.entries.positions as usize);
+    let mut power = Fp3::ONE;
+    for position in 0..index.entries.positions {
+        let value = mask_witness.entry(index, index.entries.claim_slot(position)?)?;
+        masks.push(ClaimMask {
+            coefficient: power,
+            value,
+        });
+        power = power.mul(&chi);
+    }
+    Ok(DotClaim { masks, target })
+}
+
+/// The hiding coefficients and end masks of the Dot claim, read from the
+/// committed mask entries.
+fn dot_entries_from_witness(
+    index: &IndexMaskPlan,
+    mask_witness: &IndexMaskWitness,
+) -> Result<DotMaskEntries> {
+    let hiding = index
+        .entries
+        .hiding_range()?
+        .map(|slot| mask_witness.entry(index, slot))
+        .collect::<Result<Vec<_>>>()?;
+    let end_start = index.entries.end_range()?.start;
+    let shown = [
+        mask_witness.entry(index, end_start)?,
+        mask_witness.entry(index, end_start + 1)?,
+    ];
+    Ok(DotMaskEntries { hiding, shown })
+}
+
+/// The chi-batched hidden values `X_chi` of the committed shown-map message.
+fn dot_batched_x(
+    plan: &HiddenLinPlan,
+    witness: &HiddenSendWitness,
+    chi: Fp3,
+) -> Result<Vec<Fp3>> {
+    let values = dot_witness_values(plan, witness)?;
+    let hidden = values.first().map_or(0, Vec::len);
+    if hidden == 0 {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut x_chi = vec![Fp3::ZERO; hidden];
+    let mut power = Fp3::ONE;
+    for position_values in &values {
+        for (slot, value) in x_chi.iter_mut().zip(position_values) {
+            *slot = slot.add(&power.mul(value));
+        }
+        power = power.mul(&chi);
+    }
+    Ok(x_chi)
 }
 
 /// The `hidden` values of every position, read out of the committed shown-map
@@ -7193,6 +7325,7 @@ fn prove_dot_identity(
     witness: &HiddenSendWitness,
     omega_message: &[Fp3],
     tilde: &[Fp3],
+    bind_residual: bool,
 ) -> Result<(DotProof, DotRowBinding)> {
     let dot = plan.send.dot.as_ref().ok_or(Error::InvalidConfig)?;
     let index = plan.send.index_mask.as_ref().ok_or(Error::InvalidConfig)?;
@@ -7203,54 +7336,35 @@ fn prove_dot_identity(
         return Err(Error::ShapeMismatch);
     }
     let chi = chain.draw_e()?;
-    let values = dot_witness_values(plan, witness)?;
-    let mut x_chi = vec![Fp3::ZERO; hidden];
-    let mut power = Fp3::ONE;
-    for position_values in &values {
-        for (slot, value) in x_chi.iter_mut().zip(position_values) {
-            *slot = slot.add(&power.mul(value));
-        }
-        power = power.mul(&chi);
+    let residual = dot_residual(index, mask_witness, chi)?;
+    if bind_residual {
+        absorb_dot_residual(chain, residual)?;
     }
+    let x_chi = dot_batched_x(plan, witness, chi)?;
     let omega = omega_message_values(plan, omega_message)?;
 
-    let mut masks = Vec::with_capacity(positions);
-    power = Fp3::ONE;
-    for position in 0..plan.send.positions() {
-        let value = mask_witness.entry(index, index.entries.claim_slot(position)?)?;
-        masks.push(ClaimMask {
-            coefficient: power,
-            value,
-        });
-        power = power.mul(&chi);
-    }
-    let claim = DotClaim {
-        masks,
-        target: dot_claim_target(tilde, chi)?,
-    };
-    let hiding = index
-        .entries
-        .hiding_range()?
-        .map(|slot| mask_witness.entry(index, slot))
-        .collect::<Result<Vec<_>>>()?;
-    let end_start = index.entries.end_range()?.start;
-    let shown = [
-        mask_witness.entry(index, end_start)?,
-        mask_witness.entry(index, end_start + 1)?,
-    ];
-    let entries = DotMaskEntries { hiding, shown };
+    let target = dot_adjusted_target(tilde, chi, residual)?;
+    let claim = dot_claim_from_witness(index, mask_witness, chi, target)?;
+    let entries = dot_entries_from_witness(index, mask_witness)?;
 
     let mut challenges = ChainChallenges { chain };
     let (proof, output) =
         crate::proof::psc::prove_dot_sumcheck(&x_chi, &omega, &claim, &entries, &mut challenges)?;
-    crate::proof::psc::check_product_claims(&output, &claim, &entries, &x_chi, &omega)?;
-    Ok((proof, DotRowBinding { output, chi }))
+    check_product_claims(&output, &claim, &entries, &x_chi, &omega)?;
+    Ok((
+        proof,
+        DotRowBinding {
+            output,
+            chi,
+            residual,
+        },
+    ))
 }
 
-/// Verifier side of the hidden Dot sumcheck: draws the same batching challenge
-/// and checks the transcript against the target formed from the public tilde
-/// values. The mask entries are not needed: the committed rows below carry
-/// them.
+/// Verifier side of the hidden Dot sumcheck: draws the same batching challenge,
+/// absorbs the public residual with its relation description, and checks the
+/// transcript against `sum_t chi^t tilde_t - R`. The mask entries are not
+/// needed: the committed `(U)`, `(E_j)` and difference rows below carry them.
 fn verify_dot_identity(
     plan: &HiddenLinPlan,
     chain: &mut Chain,
@@ -7266,7 +7380,9 @@ fn verify_dot_identity(
         return Err(Error::ShapeMismatch);
     }
     let proof = messages.dot.as_ref().ok_or(Error::ShapeMismatch)?;
+    let residual = messages.residual.ok_or(Error::ShapeMismatch)?;
     let chi = chain.draw_e()?;
+    absorb_dot_residual(chain, residual)?;
     let mut masks = Vec::with_capacity(positions);
     let mut power = Fp3::ONE;
     for _ in 0..positions {
@@ -7278,7 +7394,7 @@ fn verify_dot_identity(
     }
     let claim = DotClaim {
         masks,
-        target: dot_claim_target(tilde, chi)?,
+        target: dot_adjusted_target(tilde, chi, residual)?,
     };
     // The transcript check needs only the entry counts; the mask values are
     // committed and checked through the rows.
@@ -7294,13 +7410,19 @@ fn verify_dot_identity(
         variables,
         &mut challenges,
     )?;
-    Ok(DotRowBinding { output, chi })
+    Ok(DotRowBinding {
+        output,
+        chi,
+        residual,
+    })
 }
 
-/// The committed rows of the hidden Dot identity: one tie row per position,
+/// The committed rows of the hidden Dot identity: one public difference row,
 /// the `(U)` row, and the two `(E_j)` rows on the committed shown maps. The
-/// rows are built from the checked transcript, so the arithmetic module does
-/// not decide a row on its own.
+/// difference row ties the chi-weighted claim and tilde entries to the public
+/// residual; it does not force the two mask values to be equal. The rows are
+/// built from the checked transcript, so the arithmetic module does not
+/// decide a row on its own.
 fn dot_plain_rows(
     plan: &HiddenLinPlan,
     members: &[ProximityMember],
@@ -7323,33 +7445,60 @@ fn dot_plain_rows(
         bat_of.insert(member.source_oracle, member);
     }
     let mask_member = bat_of.get(&index.oracle).ok_or(Error::StatementMismatch)?;
+    // The difference row must name the mask member with the planned mask
+    // batch, not a swapped object or a member with a different mask shape.
+    if mask_member.mask_rows != index.mask_rows
+        || mask_member.mask_code != index.mask_code
+        || mask_member.answers != index.answers
+    {
+        return Err(Error::StatementMismatch);
+    }
     let dot_member = bat_of.get(&dot.oracle).ok_or(Error::StatementMismatch)?;
     let omega_member = bat_of
         .get(&plan.proximity.omega.oracle)
         .ok_or(Error::StatementMismatch)?;
-    let mut rows = Vec::with_capacity(positions as usize + 3);
+    let mut rows = Vec::with_capacity(4);
 
-    // c_t - g_t = 0: the claim mask and the tilde mask are distinct one-time
-    // entries with the same value, tied by this public row.
-    for position in 0..positions {
-        let mut row = BatRow::new(BatRowKind::Plain);
-        row.add_unit(
-            mask_member.bat_oracle,
-            BatPart::Mask,
-            index
-                .entry_virtual_index(index.entries.claim_slot(position)?)?,
-            Fp3::ONE,
-        );
-        row.add_unit(
-            mask_member.bat_oracle,
-            BatPart::Mask,
-            index
-                .entry_virtual_index(index.entries.tilde_slot(position)?)?,
-            Fp3::ZERO.sub(&Fp3::ONE),
-        );
-        row.target = Fp3::ZERO;
-        rows.push(row);
+    // One difference row: sum_t chi^t g_t - sum_t chi^t c_t = R. The claim and
+    // tilde entries are independent; this row binds only their chi-weighted
+    // difference, which is exactly the residual removed from the PSC target.
+    // Both units name the same committed mask member and the coefficient
+    // powers are recomputed here from the checked transcript challenge.
+    let tilde_range = index.entries.tilde_range()?;
+    let claim_range = index.entries.claim_range()?;
+    if tilde_range.len() != positions as usize || claim_range.len() != positions as usize {
+        return Err(Error::InvalidConfig);
     }
+    let mut row = BatRow::new(BatRowKind::Plain);
+    let mut power = Fp3::ONE;
+    for position in 0..positions {
+        let tilde_slot = index.entries.tilde_slot(position)?;
+        let claim_slot = index.entries.claim_slot(position)?;
+        if !tilde_range.contains(&tilde_slot)
+            || !claim_range.contains(&claim_slot)
+            || tilde_slot == claim_slot
+        {
+            return Err(Error::InvalidConfig);
+        }
+        row.add_unit(
+            mask_member.bat_oracle,
+            BatPart::Mask,
+            index.entry_virtual_index(tilde_slot)?,
+            power,
+        );
+        row.add_unit(
+            mask_member.bat_oracle,
+            BatPart::Mask,
+            index.entry_virtual_index(claim_slot)?,
+            Fp3::ZERO.sub(&power),
+        );
+        power = power.mul(&binding.chi);
+    }
+    if row.terms.len() != 0 || row.units.len() != 2 * positions as usize {
+        return Err(Error::InvalidConfig);
+    }
+    row.target = binding.residual;
+    rows.push(row);
 
     // (U): <hiding_form, hiding entries> + claim_scale <chi^t, c_t> = row_target.
     let hiding = index.entries.hiding_range()?;
@@ -7440,6 +7589,12 @@ fn dot_plain_rows(
     );
     row.target = output.ends[1].value;
     rows.push(row);
+    // Exactly the difference row, the (U) row and the two (E_j) rows. The
+    // complete-row check rejects a derived-row plan that drops, duplicates or
+    // reorders a row before the proximity test sees it.
+    if rows.len() != 4 {
+        return Err(Error::InvalidConfig);
+    }
     Ok(rows)
 }
 
@@ -7453,6 +7608,7 @@ fn prove_second(
     witness: &HiddenSendWitness,
     shared_point: &[Fp3],
     seed: &Digest,
+    bind_residual: bool,
 ) -> Result<OwnProveResult> {
     let (members, order) = own_members(
         plan,
@@ -7485,6 +7641,7 @@ fn prove_second(
                 witness,
                 &shared_witness.omega_message,
                 &tilde,
+                bind_residual,
             )?;
             (Some(proof), Some(binding))
         }
@@ -7536,6 +7693,7 @@ fn prove_second(
             first_query: *first_query,
             shared_seal: shared.seal,
             tilde,
+            residual: dot_binding.as_ref().map(|binding| binding.residual),
             dot: dot_proof,
             fold_start: proximity.messages.fold_start.clone(),
             fold_rounds: proximity.messages.fold_rounds.clone(),
@@ -7625,7 +7783,12 @@ fn verify_second(
     shared: &HiddenSharedMessages,
     shared_point: &[Fp3],
     messages: &HiddenSecondMessages,
-) -> Result<(Digest, Vec<GuRelationRow>, BaseFinalOutcome)> {
+) -> Result<(
+    Digest,
+    Vec<GuRelationRow>,
+    BaseFinalOutcome,
+    Option<DotRowBinding>,
+)> {
     if messages.omega_root != shared.omega_root
         || messages.first_query != *first_query
         || messages.shared_seal != shared.seal
@@ -7637,12 +7800,15 @@ fn verify_second(
             if messages.tilde.len() != plan.send.positions() as usize {
                 return Err(Error::ShapeMismatch);
             }
-            if messages.dot.is_none() {
+            if messages.dot.is_none() || messages.residual.is_none() {
                 return Err(Error::ShapeMismatch);
             }
         }
         (None, None) => {
-            if !messages.tilde.is_empty() || messages.dot.is_some() {
+            if !messages.tilde.is_empty()
+                || messages.dot.is_some()
+                || messages.residual.is_some()
+            {
                 return Err(Error::ShapeMismatch);
             }
         }
@@ -7709,6 +7875,7 @@ fn verify_second(
         proximity.seal,
         sample_rows.into_iter().flatten().collect(),
         proximity.base,
+        dot_binding,
     ))
 }
 
@@ -7723,6 +7890,7 @@ fn prove_hidden_lin_inner(
     table: &mut dyn HiddenTableProver,
     output: Option<&[Vec<Fp3>]>,
     seed: Digest,
+    bind_residual: bool,
 ) -> Result<(HiddenLinMessages, HiddenLinWitness)> {
     plan.validate()?;
     if seed == Digest::ZERO {
@@ -7745,6 +7913,7 @@ fn prove_hidden_lin_inner(
         &send_witness,
         &shared.points.psi,
         &seed,
+        bind_residual,
     )?;
     let messages = HiddenLinMessages {
         first: first.clone(),
@@ -7778,7 +7947,7 @@ pub fn prove_hidden_lin(
     if plan.weights.is_empty() {
         return Err(Error::InvalidConfig);
     }
-    prove_hidden_lin_inner(plan, activation, table, Some(output), seed)
+    prove_hidden_lin_inner(plan, activation, table, Some(output), seed, true)
 }
 
 /// Prover entry of the merged three-stage run in the hidden-input mode. The
@@ -7794,7 +7963,24 @@ pub fn prove_hidden_lin_hidden(
     if !plan.weights.is_empty() {
         return Err(Error::InvalidConfig);
     }
-    prove_hidden_lin_inner(plan, activation, table, None, seed)
+    prove_hidden_lin_inner(plan, activation, table, None, seed, true)
+}
+
+/// Test-only prover entry that omits the residual absorption before the
+/// product-sumcheck challenges. The canonical verifier must reject its
+/// messages; the flag exists so the challenge-order negative can be built
+/// from the real prover path instead of a hand-assembled transcript.
+#[cfg(test)]
+fn prove_hidden_lin_hidden_unbound_residual(
+    plan: &HiddenLinPlan,
+    activation: &CommittedActivation,
+    table: &mut dyn HiddenTableProver,
+    seed: Digest,
+) -> Result<(HiddenLinMessages, HiddenLinWitness)> {
+    if !plan.weights.is_empty() {
+        return Err(Error::InvalidConfig);
+    }
+    prove_hidden_lin_inner(plan, activation, table, None, seed, false)
 }
 
 fn verify_hidden_lin_inner(
@@ -7814,7 +8000,7 @@ fn verify_hidden_lin_inner(
     if shared_seal != messages.shared.seal {
         return Err(Error::InvalidProof);
     }
-    let (seal, own_claims, own_base) = verify_second(
+    let (seal, own_claims, own_base, dot_binding) = verify_second(
         plan,
         reader,
         &messages.first,
@@ -7838,6 +8024,7 @@ fn verify_hidden_lin_inner(
         column_positions: messages.shared.column_positions.clone(),
         shared_base,
         own_base,
+        dot: dot_binding,
     })
 }
 
@@ -7884,8 +8071,40 @@ pub fn verify_hidden_lin_with_witness(
     messages: &HiddenLinMessages,
     witness: &HiddenLinWitness,
 ) -> Result<HiddenLinOutcome> {
-    witness.send.check(&plan.send)?;
     let outcome = verify_hidden_lin(plan, reader, output, messages)?;
+    verify_hidden_lin_witness_agreement(plan, messages, witness, &outcome)?;
+    Ok(outcome)
+}
+
+/// Auxiliary verifier for the hidden-input mode. It runs the public entry and
+/// then checks the prover's private samples and mask entries against the
+/// public values, including the tilde row, the public residual, the difference
+/// row target and the product-sumcheck output rows. The witness is never
+/// serialized and this entry is not a production path.
+pub fn verify_hidden_lin_hidden_with_witness(
+    plan: &HiddenLinPlan,
+    reader: &IndexReader,
+    messages: &HiddenLinMessages,
+    witness: &HiddenLinWitness,
+) -> Result<HiddenLinOutcome> {
+    let outcome = verify_hidden_lin_hidden(plan, reader, messages)?;
+    verify_hidden_lin_witness_agreement(plan, messages, witness, &outcome)?;
+    Ok(outcome)
+}
+
+/// Checks the prover's private samples and mask entries against an outcome
+/// that the public verifier already produced. The auxiliary witness verifier
+/// calls this after its own verification; a caller that already holds the
+/// outcome (for example a fixture that verified once) can call it directly
+/// without replaying the verifier. The witness is never serialized and this
+/// entry is not a production path.
+pub fn verify_hidden_lin_witness_agreement(
+    plan: &HiddenLinPlan,
+    messages: &HiddenLinMessages,
+    witness: &HiddenLinWitness,
+    outcome: &HiddenLinOutcome,
+) -> Result<()> {
+    witness.send.check(&plan.send)?;
     let expected = witness.send.answers(&messages.first.samples.seed)?;
     if expected != messages.first.samples.answers {
         return Err(Error::InvalidProof);
@@ -7901,6 +8120,17 @@ pub fn verify_hidden_lin_with_witness(
                     return Err(Error::InvalidProof);
                 }
             }
+            // The plaintext mask relation: `tilde_t = W_t(psi*) + g_t`, the
+            // published residual is the chi-weighted difference of the
+            // committed claim and tilde entries, and the product-sumcheck
+            // output rows hold for the same entries and the adjusted target.
+            check_hidden_dot_mask_relation(
+                plan,
+                messages,
+                &witness.send,
+                &witness.omega_message,
+                outcome,
+            )?;
         }
         (None, None) => {
             if eval != messages.first.eval_targets {
@@ -7948,7 +8178,41 @@ pub fn verify_hidden_lin_with_witness(
     if omega_expected != messages.shared.omega_answers {
         return Err(Error::InvalidProof);
     }
-    Ok(outcome)
+    Ok(())
+}
+
+/// The exact plaintext form of the hidden Dot mask relation, used by the
+/// auxiliary witness verifier and by the negatives. The production verifier
+/// does not see these values; it checks the same equations through the
+/// committed own-group rows.
+fn check_hidden_dot_mask_relation(
+    plan: &HiddenLinPlan,
+    messages: &HiddenLinMessages,
+    witness: &HiddenSendWitness,
+    omega_message: &[Fp3],
+    outcome: &HiddenLinOutcome,
+) -> Result<()> {
+    let index = plan.send.index_mask.as_ref().ok_or(Error::ShapeMismatch)?;
+    let mask_witness = witness.index_mask.as_ref().ok_or(Error::ShapeMismatch)?;
+    let binding = outcome.dot.as_ref().ok_or(Error::ShapeMismatch)?;
+    let chi = binding.chi;
+    let residual = binding.residual;
+    if messages.second.residual != Some(residual) {
+        return Err(Error::InvalidProof);
+    }
+    let expected_tilde = tilde_values(plan, witness, &outcome.shared_point)?;
+    if expected_tilde != messages.second.tilde {
+        return Err(Error::InvalidProof);
+    }
+    if dot_residual(index, mask_witness, chi)? != residual {
+        return Err(Error::InvalidProof);
+    }
+    let target = dot_adjusted_target(&messages.second.tilde, chi, residual)?;
+    let claim = dot_claim_from_witness(index, mask_witness, chi, target)?;
+    let entries = dot_entries_from_witness(index, mask_witness)?;
+    let x_chi = dot_batched_x(plan, witness, chi)?;
+    let omega = omega_message_values(plan, omega_message)?;
+    check_product_claims(&binding.output, &claim, &entries, &x_chi, &omega)
 }
 
 
@@ -8470,7 +8734,7 @@ fn get_dot_proof(reader: &mut CanonicalReader<'_>, plan: &HiddenLinPlan) -> Resu
     })
 }
 
-fn put_second(writer: &mut CanonicalWriter, message: &HiddenSecondMessages) {
+fn put_second(writer: &mut CanonicalWriter, message: &HiddenSecondMessages) -> Result<()> {
     writer.put_digest(&message.omega_root);
     writer.put_digest(&message.first_query);
     writer.put_digest(&message.shared_seal);
@@ -8481,9 +8745,15 @@ fn put_second(writer: &mut CanonicalWriter, message: &HiddenSecondMessages) {
     match &message.dot {
         Some(proof) => {
             writer.put_u64(1);
+            writer.put_fp3(&message.residual.ok_or(Error::ShapeMismatch)?);
             put_dot_proof(writer, proof);
         }
-        None => writer.put_u64(0),
+        None => {
+            if message.residual.is_some() {
+                return Err(Error::ShapeMismatch);
+            }
+            writer.put_u64(0);
+        }
     }
     put_fold_start(writer, &message.fold_start);
     writer.put_u64(message.fold_rounds.len() as u64);
@@ -8495,6 +8765,7 @@ fn put_second(writer: &mut CanonicalWriter, message: &HiddenSecondMessages) {
     put_base_rows(writer, &message.base_rows);
     put_base_openings(writer, &message.base_openings);
     writer.put_digest(&message.seal);
+    Ok(())
 }
 
 fn get_second(reader: &mut CanonicalReader<'_>, plan: &HiddenLinPlan) -> Result<HiddenSecondMessages> {
@@ -8509,14 +8780,20 @@ fn get_second(reader: &mut CanonicalReader<'_>, plan: &HiddenLinPlan) -> Result<
     for _ in 0..tilde_count {
         tilde.push(reader.get_fp3()?);
     }
-    let dot = match reader.get_u64()? {
+    let (residual, dot) = match reader.get_u64()? {
         0 => {
             if plan.send.dot.is_some() {
                 return Err(Error::ShapeMismatch);
             }
-            None
+            (None, None)
         }
-        1 => Some(get_dot_proof(reader, plan)?),
+        1 => {
+            if plan.send.dot.is_none() {
+                return Err(Error::ShapeMismatch);
+            }
+            let residual = reader.get_fp3()?;
+            (Some(residual), Some(get_dot_proof(reader, plan)?))
+        }
         _ => return Err(Error::InvalidEncoding),
     };
     let fold_start = get_fold_start(reader)?;
@@ -8537,6 +8814,7 @@ fn get_second(reader: &mut CanonicalReader<'_>, plan: &HiddenLinPlan) -> Result<
         first_query,
         shared_seal,
         tilde,
+        residual,
         dot,
         fold_start,
         fold_rounds,
@@ -8558,7 +8836,7 @@ impl HiddenLinMessages {
         put_shared(&mut shared, &self.shared);
         writer.put_bytes(&shared.into_bytes());
         let mut second = CanonicalWriter::new();
-        put_second(&mut second, &self.second);
+        put_second(&mut second, &self.second)?;
         writer.put_bytes(&second.into_bytes());
         Ok(writer.into_bytes())
     }
@@ -9514,18 +9792,69 @@ mod merged_tests {
         (verifier_plan, messages, witness)
     }
 
-    fn hidden_run() -> (HiddenLinPlan, HiddenLinMessages, HiddenLinWitness) {
-        let activation = activation();
-        let mut plan = plan(&activation);
+    fn hidden_plan(activation: &CommittedActivation) -> HiddenLinPlan {
+        let mut plan = plan(activation);
         plan.weights = Vec::new();
         plan.send.index_mask = Some(index_mask_plan());
         plan.send.dot = Some(dot_plan());
         plan.proximity.own_mask_tree.mask_rows = 4;
+        plan
+    }
+
+    fn hidden_run() -> (HiddenLinPlan, HiddenLinMessages, HiddenLinWitness) {
+        let activation = activation();
+        let mut plan = hidden_plan(&activation);
         let mut table = table();
         let (messages, witness) =
             prove_hidden_lin_hidden(&plan, &activation, &mut table, Digest([0x71; 32])).unwrap();
         plan.send.expected_dot_root = witness.send.dot.as_ref().map(|map| map.root);
         (plan, messages, witness)
+    }
+
+    fn hidden_run_unbound_residual() -> (HiddenLinPlan, HiddenLinMessages, HiddenLinWitness) {
+        let activation = activation();
+        let mut plan = hidden_plan(&activation);
+        let mut table = table();
+        let (messages, witness) = prove_hidden_lin_hidden_unbound_residual(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+        )
+        .unwrap();
+        plan.send.expected_dot_root = witness.send.dot.as_ref().map(|map| map.root);
+        (plan, messages, witness)
+    }
+
+    /// Gaussian-elimination rank over `Fp3`.
+    fn rank_over_fp3(matrix: &[Vec<Fp3>]) -> usize {
+        let rows = matrix.len();
+        let cols = matrix.first().map_or(0, Vec::len);
+        let mut work = matrix.to_vec();
+        let mut rank = 0usize;
+        for column in 0..cols {
+            let pivot = (rank..rows).find(|&row| work[row][column] != Fp3::ZERO);
+            let Some(pivot) = pivot else {
+                continue;
+            };
+            work.swap(rank, pivot);
+            let inverse = work[rank][column].inverse().unwrap();
+            for value in work[rank].iter_mut().skip(column) {
+                *value = value.mul(&inverse);
+            }
+            for row in 0..rows {
+                if row == rank || work[row][column] == Fp3::ZERO {
+                    continue;
+                }
+                let factor = work[row][column];
+                for column_after in column..cols {
+                    work[row][column_after] =
+                        work[row][column_after].sub(&factor.mul(&work[rank][column_after]));
+                }
+            }
+            rank += 1;
+        }
+        rank
     }
 
     #[test]
@@ -9781,6 +10110,260 @@ mod merged_tests {
         let (mut plan, _messages, _) = hidden_run();
         plan.send.dot.as_mut().unwrap().shape.answers = 2;
         assert!(plan.validate().is_err());
+    }
+
+    #[test]
+    fn hidden_dot_residual_is_independent_and_batched() {
+        let (plan, messages, witness) = hidden_run();
+        let table = table();
+        let outcome = verify_hidden_lin_hidden(&plan, &table.reader, &messages).unwrap();
+        let binding = outcome.dot.as_ref().expect("the hidden Dot binding");
+        let index = plan.send.index_mask.as_ref().unwrap();
+        let mask_witness = witness.send.index_mask.as_ref().unwrap();
+        let positions = POSITIONS as usize;
+
+        // The claim and tilde entries keep independent draws: at least one
+        // position of the deterministic fixture differs.
+        let mut independent = false;
+        let mut expected_residual = Fp3::ZERO;
+        let mut power = Fp3::ONE;
+        for position in 0..POSITIONS {
+            let claim = mask_witness
+                .entry(index, index.entries.claim_slot(position).unwrap())
+                .unwrap();
+            let tilde = mask_witness
+                .entry(index, index.entries.tilde_slot(position).unwrap())
+                .unwrap();
+            if claim != tilde {
+                independent = true;
+            }
+            expected_residual = expected_residual.add(&power.mul(&tilde.sub(&claim)));
+            power = power.mul(&binding.chi);
+        }
+        assert!(independent, "the claim and tilde draws must be independent");
+        assert_eq!(binding.residual, expected_residual);
+        assert_eq!(messages.second.residual, Some(expected_residual));
+        assert_ne!(expected_residual, Fp3::ZERO);
+
+        // The verifier rebuilds the Eval and tilde rows followed by exactly
+        // four Dot rows: one difference row with both entries for every
+        // position, then the (U) and (E_j) rows. No per-position tie row
+        // survives.
+        let (members, _) =
+            own_members(&plan, &messages.first, &messages.shared, None, None).unwrap();
+        let rows = own_plain_rows(
+            &plan,
+            &members,
+            &messages.first,
+            &outcome.shared_point,
+            &messages.second.tilde,
+            Some(binding),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2 * positions + 4);
+        let dot_rows = &rows[2 * positions..];
+        assert_eq!(dot_rows.len(), 4);
+        let difference = &dot_rows[0];
+        assert_eq!(difference.kind, BatRowKind::Plain);
+        assert_eq!(difference.target, binding.residual);
+        assert!(difference.terms.is_empty());
+        assert_eq!(difference.units.len(), 2 * positions);
+        let mut power = Fp3::ONE;
+        for position in 0..positions {
+            let tilde_slot = index.entries.tilde_slot(position as u32).unwrap();
+            let claim_slot = index.entries.claim_slot(position as u32).unwrap();
+            assert_eq!(difference.units[2 * position].part, BatPart::Mask);
+            assert_eq!(
+                difference.units[2 * position].index,
+                index.entry_virtual_index(tilde_slot).unwrap()
+            );
+            assert_eq!(difference.units[2 * position].coefficient, power);
+            assert_eq!(difference.units[2 * position + 1].part, BatPart::Mask);
+            assert_eq!(
+                difference.units[2 * position + 1].index,
+                index.entry_virtual_index(claim_slot).unwrap()
+            );
+            assert_eq!(
+                difference.units[2 * position + 1].coefficient,
+                Fp3::ZERO.sub(&power)
+            );
+            power = power.mul(&binding.chi);
+        }
+        assert_eq!(dot_rows[1].target, binding.output.row_target);
+        assert_eq!(dot_rows[2].target, binding.output.ends[0].value);
+        assert_eq!(dot_rows[3].target, binding.output.ends[1].value);
+    }
+
+    #[test]
+    fn public_mask_view_rank_leaves_the_expected_kernel() {
+        // The public mask-dependent linear forms on (g, c) are the sixteen
+        // tilde values and the residual. For P positions they have rank P + 1
+        // and kernel P - 1, the claim-mask directions orthogonal to chi.
+        let positions = 16usize;
+        let chi = Fp3::from_u64(0x1234_5678);
+        let mut matrix = vec![vec![Fp3::ZERO; 2 * positions]; positions + 1];
+        let mut power = Fp3::ONE;
+        for position in 0..positions {
+            matrix[position][position] = Fp3::ONE;
+            matrix[positions][position] = power;
+            matrix[positions][positions + position] = Fp3::ZERO.sub(&power);
+            power = power.mul(&chi);
+        }
+        assert_eq!(rank_over_fp3(&matrix), positions + 1);
+    }
+
+    #[test]
+    fn hidden_dot_residual_negatives_reach_the_verifier() {
+        let table = table();
+        let (plan, messages, _) = hidden_run();
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &messages).is_ok());
+
+        // A changed residual moves both the absorbed transcript value and the
+        // adjusted target.
+        let (plan, mut messages, _) = hidden_run();
+        let residual = messages.second.residual.unwrap();
+        messages.second.residual = Some(residual.add(&Fp3::ONE));
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &messages).is_err());
+
+        // The opposite sign convention is a different relation.
+        let (plan, mut messages, _) = hidden_run();
+        let residual = messages.second.residual.unwrap();
+        messages.second.residual = Some(Fp3::ZERO.sub(&residual));
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &messages).is_err());
+
+        // The residual must be present exactly when the Dot proof is present.
+        let (plan, mut messages, _) = hidden_run();
+        messages.second.residual = None;
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &messages).is_err());
+        let (plan, mut messages, _) = hidden_run();
+        messages.second.dot = None;
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &messages).is_err());
+
+        // A residual that is not absorbed before the product-sumcheck
+        // challenges leaves the prover and verifier on different challenges.
+        let (plan, messages, _) = hidden_run_unbound_residual();
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &messages).is_err());
+    }
+
+    #[test]
+    fn hidden_dot_changed_mask_entries_are_rejected_by_the_plaintext_check() {
+        let (plan, messages, witness) = hidden_run();
+        let table = table();
+        let outcome = verify_hidden_lin_hidden(&plan, &table.reader, &messages).unwrap();
+        assert!(
+            verify_hidden_lin_hidden_with_witness(&plan, &table.reader, &messages, &witness)
+                .is_ok()
+        );
+        let index = plan.send.index_mask.as_ref().unwrap();
+        let ell = index.mask_code.ell as usize;
+
+        let changed_entry = |slot: usize| {
+            let mut changed = witness.clone();
+            let rows = &mut changed.send.index_mask.as_mut().unwrap().rows;
+            rows[slot / ell][slot % ell] = rows[slot / ell][slot % ell].add(&Fp3::ONE);
+            changed
+        };
+
+        // A changed tilde mask breaks the tilde row and the residual.
+        let changed = changed_entry(index.entries.tilde_slot(0).unwrap());
+        assert!(
+            check_hidden_dot_mask_relation(
+                &plan,
+                &messages,
+                &changed.send,
+                &changed.omega_message,
+                &outcome,
+            )
+            .is_err()
+        );
+        // A changed claim mask breaks the residual and the (U) row.
+        let changed = changed_entry(index.entries.claim_slot(0).unwrap());
+        assert!(
+            check_hidden_dot_mask_relation(
+                &plan,
+                &messages,
+                &changed.send,
+                &changed.omega_message,
+                &outcome,
+            )
+            .is_err()
+        );
+        // A changed hiding coefficient breaks the (U) row.
+        let changed = changed_entry(index.entries.hiding_range().unwrap().start);
+        assert!(
+            check_hidden_dot_mask_relation(
+                &plan,
+                &messages,
+                &changed.send,
+                &changed.omega_message,
+                &outcome,
+            )
+            .is_err()
+        );
+        // A changed end mask breaks an (E_j) row.
+        let changed = changed_entry(index.entries.end_range().unwrap().start);
+        assert!(
+            check_hidden_dot_mask_relation(
+                &plan,
+                &messages,
+                &changed.send,
+                &changed.omega_message,
+                &outcome,
+            )
+            .is_err()
+        );
+
+        // A wrong residual in the checked binding changes the difference-row
+        // target and the adjusted PSC target; the plaintext check rejects it.
+        let mut wrong_target = outcome.clone();
+        wrong_target.dot.as_mut().unwrap().residual = outcome
+            .dot
+            .as_ref()
+            .unwrap()
+            .residual
+            .add(&Fp3::ONE);
+        assert!(
+            check_hidden_dot_mask_relation(
+                &plan,
+                &messages,
+                &witness.send,
+                &witness.omega_message,
+                &wrong_target,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn hidden_dot_residual_encoding_is_canonical() {
+        let (plan, messages, witness) = hidden_run();
+        let bytes = messages.encode().unwrap();
+        let decoded = HiddenLinMessages::decode(&plan, &bytes).unwrap();
+        assert_eq!(decoded, messages);
+        assert_eq!(decoded.second.residual, messages.second.residual);
+
+        // No trailing bytes are accepted.
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(HiddenLinMessages::decode(&plan, &trailing).is_err());
+
+        // An individual per-position difference is never a valid extra field:
+        // appending one rejects the canonical encoding.
+        let index = plan.send.index_mask.as_ref().unwrap();
+        let mask_witness = witness.send.index_mask.as_ref().unwrap();
+        let mut leaked = bytes;
+        for position in 0..POSITIONS {
+            let claim = mask_witness
+                .entry(index, index.entries.claim_slot(position).unwrap())
+                .unwrap();
+            let tilde = mask_witness
+                .entry(index, index.entries.tilde_slot(position).unwrap())
+                .unwrap();
+            let mut writer = CanonicalWriter::new();
+            writer.put_fp3(&tilde.sub(&claim));
+            leaked.extend_from_slice(&writer.into_bytes());
+        }
+        assert!(HiddenLinMessages::decode(&plan, &leaked).is_err());
     }
 
     #[test]
