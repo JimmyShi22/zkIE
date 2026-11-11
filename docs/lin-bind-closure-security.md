@@ -35,21 +35,33 @@ reduced weight rows and no private tails, salts or pads.
 
 ## 2. Random material and one-time masks
 
-`[FACT]` The separate-mask schema allocates 73 entries for 16 positions:
+`[FACT]` There are two separate mask allocations, in two different messages.
+They are not summed.
+
+The index-mask message (Dot relation) allocates 73 entries for 16 positions:
 
 | Class | Entries | Use |
 |---|---:|---|
-| PSC hiding coefficients | 23 | hides the masked product-sumcheck polynomial |
-| shown-value masks | 2 | the two shown-map end values |
+| PSC hiding coefficients | 23 | hides the Dot product-sumcheck polynomial |
+| shown-value masks | 2 | the two Dot shown-map end values |
 | claim masks `c_t` | 16 | one per position |
 | tilde masks `g_t` | 16 | one per position |
 | Eval masks `e_t` | 16 | one per position |
 
-The classes occupy disjoint ranges. The claim and tilde entries are independent
-draws from the same stage-1 stream; the public difference row ties their
-chi-weighted sums to `R` without forcing equality. The Eval mask is fixed
-before the Eval point is drawn, so the masked target `W_t(psi_t) + e_t` is
-uniform. The PSC hiding coefficients are one-time.
+The separate closure mask-only message allocates, per position, 49 PSC hiding
+coefficients and 5 shown-value masks: two PSC end masks, one committed-bit
+point mask and two relation-function masks (`CLOSURE_MASK_SHOWN = 5`). For 16
+positions that is 864 entries. These entries are not part of the 73-entry
+index-mask schema; the two plans are different oracles.
+
+The classes in each message occupy disjoint ranges. The claim and tilde
+entries are independent draws from the same stage-1 stream; the public
+difference row ties their chi-weighted sums to `R` without forcing equality.
+The Eval mask is fixed before the Eval point is drawn, so the masked target
+`W_t(psi_t) + e_t` is uniform. The PSC hiding coefficients are one-time. The
+closure mask's five shown entries are one-time per position, in this order:
+entries 0 and 1 cover the shown-map ends; entries 2, 3 and 4 cover
+`(B(pt), D(q), weighted B(q))`.
 
 `[FACT]` The table, W rows, shown map, Omega and G_u messages carry distinct
 tails and salts drawn from the stage stream; the SEND answers use per-message
@@ -144,20 +156,30 @@ add a secret direction. `chi = 0` is an exception event handled in section 6.
 
 ### 3.5 PSC transcript
 
-The 23 sent scalars are an affine bijection of the 23 hiding coefficients
-`U`, plus the `sigma` shift in one claim-mask direction. The hiding map is
-23 x 23 and is checked full-rank at one deterministic challenge point; the
-all-challenge statement is an assumption. The secret target shift lies in the
-image of that map, so the criterion holds under the full-rank assumption.
-Each position also sends three fresh-point values `(B(pt), D(q), weighted
-B(q))`; their five shown-value mask entries per position are one-time and give
-one random dimension per value, so the same criterion covers them.
+The Dot PSC (transcript tags 16/17/18) sends 23 scalars. They are an affine
+bijection of the 23 hiding coefficients of the 73-entry index-mask schema,
+plus the `sigma` shift in one claim-mask direction. The hiding map is 23 x 23
+and is checked full-rank at one deterministic challenge point; the
+all-challenge statement is an assumption.
+
+The closure PSC (tags 20/21/22) is a second, separate instance. The closure
+mask plan allocates, per position, 49 hiding coefficients and five shown
+masks (`CLOSURE_MASK_SHOWN = 5`): two PSC end masks, one committed-bit point
+mask and two relation-function masks. Each shown mask is one-time and gives
+one random dimension per masked value. The closure PSC transcript and the
+three fresh-point values `(B(pt), D(q), weighted B(q))` are covered by that
+per-position instance; the 23 Dot scalars and the 49 closure coefficients are
+not the same mask plan and are not summed. The closure hiding map's
+all-challenge full-rank statement is an assumption.
 
 ### 3.6 Closure messages and the full output row
 
 The closure slack, packed-bit and product messages encode functions `f(Y)`.
 Their openings are covered by the Vandermonde property in 3.2, their SEND
-answers by the pads in 3.3, and their PSC transcript by the hiding map in 3.5.
+answers by the pads in 3.3, and their PSC transcript by the closure instance
+in 3.5 (49 per-position hiding coefficients and five shown masks per
+position). The Dot PSC's 23-entry index-mask schema is a different oracle and
+is not used for the closure messages.
 The same argument applies to every closure message and every position, so the
 full `Y` row is hidden beyond the approved winner/valid/tie items. This is a
 conditional conclusion, not a `[GAP]`.
@@ -224,8 +246,9 @@ BASE symbols.
 - The opening positions are distinct; the union per tree is used.
 - `|S| <= r` for every actual opening set; section 4 checks the actual sets.
 - The code tail rank is the stated `r`.
-- The PSC hiding map has full rank for every challenge; only one
-  deterministic challenge point is tested.
+- The PSC hiding maps have full rank for every challenge, for both the
+  23-entry Dot instance and the 49-coefficient closure instance; only one
+  deterministic challenge point is tested for each.
 - `chi != 0`; if `chi = 0`, the residual combines only the `t = 0` term and
   the corresponding term is in section 6.
 - The SEND pad coefficient is nonzero. A pad, `c_t`, `g_t` or `e_t` that
