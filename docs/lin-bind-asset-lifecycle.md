@@ -76,7 +76,25 @@ The reduced rows are the W messages, not a copy of the table. Each W message
 is one row of the small W code; the retained W messages are far below the
 table size.
 
+## Simultaneous asset-related allocations
+
+The asset-related allocations do not all live at once. The overlap peaks are:
+
+| Phase | Live allocations | Total |
+|---|---|---:|
+| table commit | buffer 256 B + message 524,312 B + tail 65,536 B + panel 33,554,432 B + codeword 1,048,576 B + leaves 4,194,304 B + tree 8,388,608 B + salts 4,194,304 B + record 8,192 B | 51,978,520 B (~49.6 MiB) |
+| column opening | buffer + message + tail + symbols 4,939,776 B + codeword 1,048,576 B + retained table 16,777,216 B + opening values about 5,242,880 B | about 28.6 MiB |
+| reduced rows | buffer + message + tail + reduced rows 25,165,824 B + weights 393,216 B | about 25.0 MiB |
+
+The largest simultaneous asset-related total is therefore below **64 MiB**,
+while the asset itself is 256 MiB. The source buffer (256 B) lives for the
+whole prove; the message/tail are reused; the panel, codeword, leaves/tree and
+opening buffers have the lifetimes listed above. This bound covers the
+asset-related copies, not the process baseline or the later closure/proximity
+allocations.
+
 ## Trees and later messages
+
 
 The W runtime trees, fold state, closure bits/map/slack messages and BASE rows
 are derived from the reduced rows and the output relation. They have their own
