@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::BufReader;
@@ -354,7 +355,10 @@ fn selected_gpt2_output_head_request_session() {
         build_lm_head_holder, limited_key_binding_parameters, LmHeadAssetSource,
         LmHeadKeyRandomness,
     };
-    use zkie::commitment_ledger::{CommitmentKind, CommitmentLedger, LedgerPolicy};
+    use zkie::commitment_ledger::{
+        CommitmentLedger, LedgerPolicy, OpeningCounts, OpeningSource, OracleBudget, OracleKey,
+        OracleKind, RequestState, Stage, StreamKey,
+    };
     use zkie::lm_head_stage::{
         read_manifest, write_manifest, ManifestFile, VerificationManifest,
         VERIFICATION_MANIFEST_FILE,
@@ -412,6 +416,86 @@ fn selected_gpt2_output_head_request_session() {
     const COMMIT_PANEL_COLUMNS: u64 = 4096;
     const COMMIT_MAX_BYTES: u64 = 2 << 30;
     const STORE_MAX_BYTES: u64 = 4 << 30;
+
+    fn ledger_seed_commitment(seed: &Digest) -> Digest {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"zkie/ledger/seed-commitment");
+        bytes.extend_from_slice(&seed.0);
+        digest_bytes(&bytes)
+    }
+
+    fn ledger_identity(kind: OracleKind, oracle_id: u64, tree_number: u64) -> Digest {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"zkie/ledger/oracle-identity");
+        bytes.extend_from_slice(kind.label().as_bytes());
+        bytes.extend_from_slice(&oracle_id.to_le_bytes());
+        bytes.extend_from_slice(&tree_number.to_le_bytes());
+        digest_bytes(&bytes)
+    }
+
+    fn ledger_oracle(
+        kind: OracleKind,
+        identity: Digest,
+        oracle_id: u64,
+        tree_number: u64,
+        run: Digest,
+        configuration: Digest,
+    ) -> OracleKey {
+        OracleKey::new(kind, identity, oracle_id, tree_number, run, configuration)
+            .expect("oracle key")
+    }
+
+    fn ledger_stream(oracle: &OracleKey, material: Digest) -> StreamKey {
+        StreamKey::new(
+            oracle.kind,
+            oracle.oracle_id,
+            oracle.tree_number,
+            oracle.run,
+            oracle.configuration,
+            material,
+        )
+        .expect("stream key")
+    }
+
+    fn ledger_material(seed_commitment: &Digest, oracle: &OracleKey) -> Digest {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"zkie/ledger/material");
+        bytes.extend_from_slice(&seed_commitment.0);
+        bytes.extend_from_slice(oracle.kind.label().as_bytes());
+        bytes.extend_from_slice(&oracle.oracle_id.to_le_bytes());
+        bytes.extend_from_slice(&oracle.tree_number.to_le_bytes());
+        bytes.extend_from_slice(&oracle.run.0);
+        bytes.extend_from_slice(&oracle.configuration.0);
+        digest_bytes(&bytes)
+    }
+
+    fn ledger_table_run(root: &Digest) -> Digest {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"zkie/ledger/table-run");
+        bytes.extend_from_slice(&root.0);
+        digest_bytes(&bytes)
+    }
+
+    fn ledger_table_material(root: &Digest) -> Digest {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"zkie/ledger/table-material");
+        bytes.extend_from_slice(&root.0);
+        digest_bytes(&bytes)
+    }
+
+    fn ledger_star_run(own: u8) -> Digest {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"zkie/ledger/star-run");
+        bytes.push(own);
+        digest_bytes(&bytes)
+    }
+
+    fn ledger_unique(positions: &[u64]) -> Vec<u64> {
+        let mut unique = positions.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        unique
+    }
 
     fn fixed_key_randomness(shape: zkie_engine::pcs::request::table::IndexShape) -> LmHeadKeyRandomness {
         let rows = shape.rows() as usize;
@@ -1155,43 +1239,351 @@ fn selected_gpt2_output_head_request_session() {
             activation: *activation_commitment.commitment(),
             output: output_plan.clone(),
         };
-        // The authoritative commitment ledger is reserved before the hidden
-        // proof starts. X and the table root are known here; the W roots are
-        // proof values and are reserved as soon as the prover returns them.
-        // The ledger is a test-run directory, so a repeated formal run starts
-        // from a fresh ledger instead of reusing a spent commitment.
+        // The authoritative opening ledger reserves the generation stream and
+        // every oracle material before the hidden proof starts. The actual
+        // roots are proof values and are bound as soon as the prover returns
+        // them; success is recorded only after the verifier accepts.
         let ledger_dir = work_dir.join("commitment-ledger");
         let ledger = CommitmentLedger::initialize(&ledger_dir, LedgerPolicy::default())
             .expect("initialize commitment ledger");
         let request_id = digest_bytes(b"formal-output-head-request");
+        let seed_commitment = ledger_seed_commitment(&SEED);
+        ledger
+            .begin_request(request_id, seed_commitment, setup.send.parameters_digest())
+            .expect("begin the ledger request");
+        let material = |oracle: &OracleKey| ledger_material(&seed_commitment, oracle);
+        let reserve = |oracle: OracleKey, budget: OracleBudget| {
+            ledger
+                .reserve_oracle(
+                    request_id,
+                    oracle,
+                    ledger_stream(&oracle, material(&oracle)),
+                    budget,
+                )
+                .expect("reserve an oracle material stream");
+        };
+
         let activation_root = activation_commitment.root();
+        let activation_oracle = ledger_oracle(
+            OracleKind::Activation,
+            activation_root,
+            0,
+            0xE001,
+            ACTIVATION_CONFIGURATION,
+            ACTIVATION_CONFIGURATION,
+        );
+        reserve(
+            activation_oracle,
+            OracleBudget {
+                logical_draws: 0,
+                tail_rank: 0,
+                allocated_rows: OUTPUT_HEAD_POSITIONS as u64,
+                committed_entries: 0,
+            },
+        );
         ledger
-            .record_commitment(
-                CommitmentKind::Activation,
-                activation_root,
-                activation_root,
-            )
-            .expect("record the activation commitment");
+            .bind_commitment(request_id, activation_oracle, activation_root)
+            .expect("bind the activation commitment");
+
         let table_identity = reader_table_identity(&reader).unwrap();
+        let table_oracle = ledger_oracle(
+            OracleKind::Table,
+            table_identity,
+            0,
+            0,
+            ledger_table_run(&reader.root),
+            reader.configuration,
+        );
         ledger
-            .record_commitment(CommitmentKind::Table, table_identity, reader.root)
-            .expect("record the table commitment");
-        let activation_claim = ledger
-            .reserve(
-                CommitmentKind::Activation,
-                activation_root,
+            .reserve_oracle(
                 request_id,
-                OUTPUT_HEAD_POSITIONS as u64,
+                table_oracle,
+                ledger_stream(&table_oracle, ledger_table_material(&reader.root)),
+                OracleBudget::new(COLUMN_DRAWS as u64, reader.shape.code.r)
+                    .expect("table budget"),
             )
-            .expect("reserve the activation openings");
-        let table_claim = ledger
-            .reserve(
-                CommitmentKind::Table,
-                table_identity,
-                request_id,
-                COLUMN_DRAWS as u64,
+            .expect("reserve the table material");
+        ledger
+            .bind_commitment(request_id, table_oracle, reader.root)
+            .expect("bind the table commitment");
+
+        let mut weight_oracles = Vec::with_capacity(OUTPUT_HEAD_POSITIONS);
+        for position in 0..OUTPUT_HEAD_POSITIONS as u64 {
+            let oracle_id = setup.send.oracle_base + position;
+            let tree_number = setup.send.w.tree_number + position;
+            let oracle = ledger_oracle(
+                OracleKind::Weight,
+                ledger_identity(OracleKind::Weight, oracle_id, tree_number),
+                oracle_id,
+                tree_number,
+                setup.send.w.run,
+                setup.send.w.configuration,
+            );
+            reserve(
+                oracle,
+                OracleBudget::new(
+                    (setup.send.openings_per_oracle + setup.proximity.own_base_positions) as u64,
+                    setup.send.w.code.r,
+                )
+                .expect("W budget"),
+            );
+            weight_oracles.push(oracle);
+        }
+
+        let index_plan = setup
+            .index_mask
+            .as_ref()
+            .expect("the formal plan carries an index mask");
+        let index_oracle = ledger_oracle(
+            OracleKind::IndexMask,
+            ledger_identity(
+                OracleKind::IndexMask,
+                index_plan.oracle,
+                index_plan.tree.tree_number,
+            ),
+            index_plan.oracle,
+            index_plan.tree.tree_number,
+            index_plan.tree.run,
+            index_plan.tree.configuration,
+        );
+        reserve(
+            index_oracle,
+            OracleBudget::new(
+                (index_plan.openings + setup.proximity.own_base_positions) as u64,
+                index_plan.mask_code.r,
             )
-            .expect("reserve the table openings");
+            .expect("index-mask budget")
+            .with_allocation(0, index_plan.entries.total().unwrap() as u64 + 1),
+        );
+
+        let dot_plan = setup
+            .send
+            .dot
+            .as_ref()
+            .expect("the formal plan carries a shown map");
+        let dot_oracle = ledger_oracle(
+            OracleKind::DotMap,
+            ledger_identity(OracleKind::DotMap, dot_plan.oracle, dot_plan.shape.tree_number),
+            dot_plan.oracle,
+            dot_plan.shape.tree_number,
+            dot_plan.shape.run,
+            dot_plan.shape.configuration,
+        );
+        reserve(
+            dot_oracle,
+            OracleBudget::new(
+                setup.proximity.own_base_positions as u64,
+                dot_plan.shape.code.r,
+            )
+            .expect("shown-map budget"),
+        );
+
+        let omega_plan = &setup.proximity.omega;
+        let omega_oracle = ledger_oracle(
+            OracleKind::Omega,
+            ledger_identity(OracleKind::Omega, omega_plan.oracle, omega_plan.tree.tree_number),
+            omega_plan.oracle,
+            omega_plan.tree.tree_number,
+            omega_plan.tree.run,
+            omega_plan.tree.configuration,
+        );
+        reserve(
+            omega_oracle,
+            OracleBudget::new(
+                (setup.proximity.shared_base_positions + setup.proximity.own_base_positions) as u64,
+                omega_plan.u.code.r,
+            )
+            .expect("Omega budget"),
+        );
+
+        let gu_plan = &setup.proximity.gu;
+        let gu_oracle = ledger_oracle(
+            OracleKind::Gu,
+            ledger_identity(OracleKind::Gu, gu_plan.oracle, gu_plan.tree.tree_number),
+            gu_plan.oracle,
+            gu_plan.tree.tree_number,
+            gu_plan.tree.run,
+            gu_plan.tree.configuration,
+        );
+        reserve(
+            gu_oracle,
+            OracleBudget::new(
+                setup.proximity.shared_base_positions as u64,
+                gu_plan.u.code.r,
+            )
+            .expect("G_u budget"),
+        );
+
+        let fresh_shared_oracle = ledger_oracle(
+            OracleKind::FreshMask,
+            ledger_identity(
+                OracleKind::FreshMask,
+                setup.proximity.shared_fresh,
+                setup.proximity.shared_mask_tree.tree_number,
+            ),
+            setup.proximity.shared_fresh,
+            setup.proximity.shared_mask_tree.tree_number,
+            setup.proximity.shared_mask_tree.run,
+            setup.proximity.shared_mask_tree.configuration,
+        );
+        reserve(
+            fresh_shared_oracle,
+            OracleBudget::new(
+                setup.proximity.shared_base_positions as u64,
+                setup.proximity.mask_code.r,
+            )
+            .expect("shared fresh-mask budget"),
+        );
+        let fresh_own_oracle = ledger_oracle(
+            OracleKind::FreshMask,
+            ledger_identity(
+                OracleKind::FreshMask,
+                setup.proximity.own_fresh,
+                setup.proximity.own_mask_tree.tree_number,
+            ),
+            setup.proximity.own_fresh,
+            setup.proximity.own_mask_tree.tree_number,
+            setup.proximity.own_mask_tree.run,
+            setup.proximity.own_mask_tree.configuration,
+        );
+        reserve(
+            fresh_own_oracle,
+            OracleBudget::new(
+                setup.proximity.own_base_positions as u64,
+                setup.proximity.mask_code.r,
+            )
+            .expect("own fresh-mask budget"),
+        );
+
+        let star_shared_run = ledger_star_run(0);
+        let star_own_run = ledger_star_run(1);
+        let star_shared = ledger_oracle(
+            OracleKind::Star,
+            ledger_identity(OracleKind::Star, 0, 0),
+            0,
+            0,
+            star_shared_run,
+            setup.send.w.configuration,
+        );
+        reserve(
+            star_shared,
+            OracleBudget::new(setup.proximity.shared_base_positions as u64, 0)
+                .expect("shared star budget"),
+        );
+        let star_mask_shared = ledger_oracle(
+            OracleKind::StarMask,
+            ledger_identity(OracleKind::StarMask, 1, 0),
+            1,
+            0,
+            star_shared_run,
+            setup.send.w.configuration,
+        );
+        reserve(
+            star_mask_shared,
+            OracleBudget::new(setup.proximity.shared_base_positions as u64, 0)
+                .expect("shared star-mask budget"),
+        );
+        let star_own = ledger_oracle(
+            OracleKind::Star,
+            ledger_identity(OracleKind::Star, 0, 0),
+            0,
+            0,
+            star_own_run,
+            setup.send.w.configuration,
+        );
+        reserve(
+            star_own,
+            OracleBudget::new(setup.proximity.own_base_positions as u64, 0)
+                .expect("own star budget"),
+        );
+        let star_mask_own = ledger_oracle(
+            OracleKind::StarMask,
+            ledger_identity(OracleKind::StarMask, 1, 0),
+            1,
+            0,
+            star_own_run,
+            setup.send.w.configuration,
+        );
+        reserve(
+            star_mask_own,
+            OracleBudget::new(setup.proximity.own_base_positions as u64, 0)
+                .expect("own star-mask budget"),
+        );
+
+        let closure_setup = setup
+            .closure
+            .as_ref()
+            .expect("the formal plan carries the output closure");
+        let mut closure_slack_oracles = Vec::with_capacity(OUTPUT_HEAD_POSITIONS);
+        let mut closure_bits_oracles = Vec::with_capacity(OUTPUT_HEAD_POSITIONS);
+        let mut closure_map_oracles = Vec::with_capacity(OUTPUT_HEAD_POSITIONS);
+        for position in 0..OUTPUT_HEAD_POSITIONS as u64 {
+            for (kind, base, shape, openings, oracles) in [
+                (
+                    OracleKind::ClosureSlack,
+                    closure_setup.slack_oracle_base,
+                    closure_setup.slack,
+                    closure_setup.slack_openings,
+                    &mut closure_slack_oracles,
+                ),
+                (
+                    OracleKind::ClosureBits,
+                    closure_setup.bits_oracle_base,
+                    closure_setup.bits,
+                    closure_setup.bits_openings,
+                    &mut closure_bits_oracles,
+                ),
+                (
+                    OracleKind::ClosureMap,
+                    closure_setup.map_oracle_base,
+                    closure_setup.map,
+                    closure_setup.map_openings,
+                    &mut closure_map_oracles,
+                ),
+            ] {
+                let oracle_id = base + position;
+                let tree_number = shape.tree_number + position;
+                let oracle = ledger_oracle(
+                    kind,
+                    ledger_identity(kind, oracle_id, tree_number),
+                    oracle_id,
+                    tree_number,
+                    shape.run,
+                    shape.configuration,
+                );
+                reserve(
+                    oracle,
+                    OracleBudget::new(
+                        (openings + setup.proximity.own_base_positions) as u64,
+                        shape.code.r,
+                    )
+                    .expect("closure value budget"),
+                );
+                oracles.push(oracle);
+            }
+        }
+        let closure_mask_plan = &closure_setup.mask;
+        let closure_mask_oracle = ledger_oracle(
+            OracleKind::ClosureMask,
+            ledger_identity(
+                OracleKind::ClosureMask,
+                closure_mask_plan.oracle,
+                closure_mask_plan.tree.tree_number,
+            ),
+            closure_mask_plan.oracle,
+            closure_mask_plan.tree.tree_number,
+            closure_mask_plan.tree.run,
+            closure_mask_plan.tree.configuration,
+        );
+        reserve(
+            closure_mask_oracle,
+            OracleBudget::new(
+                (closure_mask_plan.openings + setup.proximity.own_base_positions) as u64,
+                closure_mask_plan.mask_code.r,
+            )
+            .expect("closure-mask budget")
+            .with_allocation(0, closure_mask_plan.total_entries().unwrap() as u64 + 1),
+        );
         // The actual model-bound witness: the largest magnitude of one
         // reduced output cell and the largest comparison slack under the
         // trusted mask and winner.
@@ -1231,138 +1623,452 @@ fn selected_gpt2_output_head_request_session() {
         )
         .unwrap();
         let hidden_prove_ms = started.elapsed().as_millis();
-        let mut weight_claims = Vec::new();
-        for weight_root in &hidden_witness.send.roots {
-            ledger
-                .record_commitment(CommitmentKind::Weight, *weight_root, *weight_root)
-                .expect("record a W commitment");
-            weight_claims.push(
-                ledger
-                    .reserve(
-                        CommitmentKind::Weight,
-                        *weight_root,
-                        request_id,
-                        setup.send.openings_per_oracle as u64,
-                    )
-                    .expect("reserve the W openings"),
-            );
-        }
-        // The sampled mask message is one committed oracle; its one-time
-        // entries, including every Eval mask, are charged to this reservation.
-        let mask_root = hidden_proof
-            .session
-            .first
+        let first = &hidden_proof.session.first;
+        let first_closure = first
+            .closure
+            .as_ref()
+            .expect("the hidden path commits the closure messages");
+        let index_message = first
             .index_mask
             .as_ref()
-            .expect("the hidden path commits the mask message")
-            .root;
-        ledger
-            .record_commitment(CommitmentKind::Mask, mask_root, mask_root)
-            .expect("record the mask commitment");
-        let mask_claim = ledger
-            .reserve(
-                CommitmentKind::Mask,
-                mask_root,
-                request_id,
-                setup
-                    .index_mask
-                    .as_ref()
-                    .expect("the mask plan")
-                    .openings as u64,
-            )
-            .expect("reserve the mask openings");
-        // The shown-map message of the hidden Dot sumcheck is a commitment of
-        // this run. Its own tree is opened by the own-group BASE round at the
-        // drawn positions, so the reservation charges those logical openings.
-        let dot_root = hidden_proof
-            .session
-            .first
+            .expect("the hidden path commits the mask message");
+        let dot_message = first
             .dot
             .as_ref()
-            .expect("the hidden path commits the shown-map message")
-            .root;
-        ledger
-            .record_commitment(CommitmentKind::Dot, dot_root, dot_root)
-            .expect("record the shown-map commitment");
-        let dot_claim = ledger
-            .reserve(
-                CommitmentKind::Dot,
-                dot_root,
-                request_id,
-                setup.proximity.own_base_positions as u64,
-            )
-            .expect("reserve the shown-map openings");
-        activation_claim.succeed().expect("finish the activation attempt");
-        table_claim.succeed().expect("finish the table attempt");
-        mask_claim.succeed().expect("finish the mask attempt");
-        dot_claim.succeed().expect("finish the shown-map attempt");
-        for claim in weight_claims {
-            claim.succeed().expect("finish a W attempt");
+            .expect("the hidden path commits the shown-map message");
+
+        for (position, oracle) in weight_oracles.iter().enumerate() {
+            ledger
+                .bind_commitment(request_id, *oracle, hidden_witness.send.roots[position])
+                .expect("bind a W commitment");
         }
-        let second_request = digest_bytes(b"formal-output-head-second-request");
-        assert_eq!(
+        ledger
+            .bind_commitment(request_id, index_oracle, index_message.root)
+            .expect("bind the mask commitment");
+        ledger
+            .bind_commitment(request_id, dot_oracle, dot_message.root)
+            .expect("bind the shown-map commitment");
+        for (position, oracle) in closure_slack_oracles.iter().enumerate() {
             ledger
-                .reserve(
-                    CommitmentKind::Activation,
-                    activation_root,
-                    second_request,
-                    OUTPUT_HEAD_POSITIONS as u64,
-                )
-                .unwrap_err(),
-            zkie_core::error::Error::StateRollbackSuspected
-        );
-        assert_eq!(
+                .bind_commitment(request_id, *oracle, first_closure.slack.roots[position])
+                .expect("bind a slack commitment");
+        }
+        for (position, oracle) in closure_bits_oracles.iter().enumerate() {
             ledger
-                .reserve(
-                    CommitmentKind::Table,
-                    table_identity,
-                    second_request,
-                    COLUMN_DRAWS as u64,
-                )
-                .unwrap_err(),
-            zkie_core::error::Error::StateRollbackSuspected
-        );
-        assert_eq!(
+                .bind_commitment(request_id, *oracle, first_closure.bits.roots[position])
+                .expect("bind a packed-bit commitment");
+        }
+        for (position, oracle) in closure_map_oracles.iter().enumerate() {
             ledger
-                .reserve(
-                    CommitmentKind::Mask,
-                    mask_root,
-                    second_request,
-                    setup.index_mask.as_ref().unwrap().openings as u64,
-                )
-                .unwrap_err(),
-            zkie_core::error::Error::StateRollbackSuspected
+                .bind_commitment(request_id, *oracle, first_closure.map.roots[position])
+                .expect("bind a product-map commitment");
+        }
+        ledger
+            .bind_commitment(request_id, closure_mask_oracle, first_closure.mask.root)
+            .expect("bind the closure-mask commitment");
+
+        let shared_members = &hidden_proof.session.shared.base_openings.members;
+        let shared_base = shared_members
+            .first()
+            .expect("the shared group opens its members")
+            .positions
+            .clone();
+        assert!(
+            shared_members
+                .iter()
+                .all(|opening| opening.positions == shared_base),
+            "every shared member opens the same BASE position set"
         );
+        let own_members = &hidden_proof.session.second.base_openings.members;
+        let own_base = own_members
+            .first()
+            .expect("the own group opens its members")
+            .positions
+            .clone();
+        assert!(
+            own_members
+                .iter()
+                .all(|opening| opening.positions == own_base),
+            "every own member opens the same BASE position set"
+        );
+        let shared_fresh = hidden_proof
+            .session
+            .shared
+            .base_openings
+            .fresh
+            .positions
+            .clone();
+        let own_fresh = hidden_proof
+            .session
+            .second
+            .base_openings
+            .fresh
+            .positions
+            .clone();
+        let shared_star_raw: Vec<u64> = hidden_proof
+            .session
+            .shared
+            .base_openings
+            .star
+            .iter()
+            .map(|opening| opening.index)
+            .collect();
+        let shared_star = ledger_unique(&shared_star_raw);
+        let shared_star_mask_raw: Vec<u64> = hidden_proof
+            .session
+            .shared
+            .base_openings
+            .star_mask
+            .iter()
+            .map(|opening| opening.index)
+            .collect();
+        let shared_star_mask = ledger_unique(&shared_star_mask_raw);
+        let own_star_raw: Vec<u64> = hidden_proof
+            .session
+            .second
+            .base_openings
+            .star
+            .iter()
+            .map(|opening| opening.index)
+            .collect();
+        let own_star = ledger_unique(&own_star_raw);
+        let own_star_mask_raw: Vec<u64> = hidden_proof
+            .session
+            .second
+            .base_openings
+            .star_mask
+            .iter()
+            .map(|opening| opening.index)
+            .collect();
+        let own_star_mask = ledger_unique(&own_star_mask_raw);
+
+        let opening_counts = |logical: u64, positions: &[u64]| {
+            OpeningCounts::new(logical, positions.len() as u64, positions.len() as u64)
+                .expect("opening counts")
+        };
+        let star_counts = |raw: &[u64], unique: &[u64]| {
+            OpeningCounts::new(raw.len() as u64, raw.len() as u64, unique.len() as u64)
+                .expect("star opening counts")
+        };
+
+        let mut expected_unions: BTreeMap<OracleKey, BTreeSet<u64>> = BTreeMap::new();
+        let mut expected_logical: BTreeMap<OracleKey, u64> = BTreeMap::new();
+        let mut record = |oracle: OracleKey,
+                          stage: Stage,
+                          source: OpeningSource,
+                          counts: OpeningCounts,
+                          positions: Vec<u64>| {
+            let tail = ledger
+                .record_openings(request_id, oracle, stage, source, counts, &positions)
+                .expect("record an opening event");
+            let union = expected_unions.entry(oracle).or_default();
+            for position in &positions {
+                union.insert(*position);
+            }
+            *expected_logical.entry(oracle).or_insert(0) += counts.logical_draws;
+            assert!(
+                tail.rank == 0 || tail.new_union <= tail.rank,
+                "the ledger keeps the tail union inside the rank"
+            );
+        };
+
+        for (position, oracle) in weight_oracles.iter().enumerate() {
+            let positions = first.positions[position].clone();
+            record(
+                *oracle,
+                Stage::Send,
+                OpeningSource::SendSample,
+                opening_counts(setup.send.openings_per_oracle as u64, &positions),
+                positions,
+            );
+            record(
+                *oracle,
+                Stage::Base,
+                OpeningSource::BaseMember,
+                opening_counts(setup.proximity.own_base_positions as u64, &own_base),
+                own_base.clone(),
+            );
+        }
+        let column_draws = hidden_proof.session.shared.column_positions.clone();
+        let column_unique = ledger_unique(&column_draws);
+        record(
+            table_oracle,
+            Stage::Table,
+            OpeningSource::TableColumn,
+            opening_counts(column_draws.len() as u64, &column_unique),
+            column_unique.clone(),
+        );
+        record(
+            index_oracle,
+            Stage::Send,
+            OpeningSource::SendSample,
+            opening_counts(index_plan.openings as u64, &index_message.positions),
+            index_message.positions.clone(),
+        );
+        record(
+            index_oracle,
+            Stage::Base,
+            OpeningSource::BaseMember,
+            opening_counts(setup.proximity.own_base_positions as u64, &own_base),
+            own_base.clone(),
+        );
+        record(
+            dot_oracle,
+            Stage::Base,
+            OpeningSource::BaseMember,
+            opening_counts(setup.proximity.own_base_positions as u64, &own_base),
+            own_base.clone(),
+        );
+        record(
+            omega_oracle,
+            Stage::Shared,
+            OpeningSource::BaseMember,
+            opening_counts(setup.proximity.shared_base_positions as u64, &shared_base),
+            shared_base.clone(),
+        );
+        record(
+            omega_oracle,
+            Stage::Base,
+            OpeningSource::BaseMember,
+            opening_counts(setup.proximity.own_base_positions as u64, &own_base),
+            own_base.clone(),
+        );
+        record(
+            gu_oracle,
+            Stage::Shared,
+            OpeningSource::BaseMember,
+            opening_counts(setup.proximity.shared_base_positions as u64, &shared_base),
+            shared_base.clone(),
+        );
+        record(
+            fresh_shared_oracle,
+            Stage::Shared,
+            OpeningSource::BaseFresh,
+            opening_counts(setup.proximity.shared_base_positions as u64, &shared_fresh),
+            shared_fresh.clone(),
+        );
+        record(
+            fresh_own_oracle,
+            Stage::Base,
+            OpeningSource::BaseFresh,
+            opening_counts(setup.proximity.own_base_positions as u64, &own_fresh),
+            own_fresh.clone(),
+        );
+        record(
+            star_shared,
+            Stage::Shared,
+            OpeningSource::BaseStar,
+            star_counts(&shared_star_raw, &shared_star),
+            shared_star.clone(),
+        );
+        record(
+            star_mask_shared,
+            Stage::Shared,
+            OpeningSource::BaseStar,
+            star_counts(&shared_star_mask_raw, &shared_star_mask),
+            shared_star_mask.clone(),
+        );
+        record(
+            star_own,
+            Stage::Base,
+            OpeningSource::BaseStar,
+            star_counts(&own_star_raw, &own_star),
+            own_star.clone(),
+        );
+        record(
+            star_mask_own,
+            Stage::Base,
+            OpeningSource::BaseStar,
+            star_counts(&own_star_mask_raw, &own_star_mask),
+            own_star_mask.clone(),
+        );
+        for (position, oracle) in closure_slack_oracles.iter().enumerate() {
+            let positions = first_closure.slack_positions[position].clone();
+            record(
+                *oracle,
+                Stage::Send,
+                OpeningSource::SendSample,
+                opening_counts(closure_setup.slack_openings as u64, &positions),
+                positions,
+            );
+            record(
+                *oracle,
+                Stage::Base,
+                OpeningSource::BaseMember,
+                opening_counts(setup.proximity.own_base_positions as u64, &own_base),
+                own_base.clone(),
+            );
+        }
+        for (position, oracle) in closure_bits_oracles.iter().enumerate() {
+            let positions = first_closure.bits_positions[position].clone();
+            record(
+                *oracle,
+                Stage::Send,
+                OpeningSource::SendSample,
+                opening_counts(closure_setup.bits_openings as u64, &positions),
+                positions,
+            );
+            record(
+                *oracle,
+                Stage::Base,
+                OpeningSource::BaseMember,
+                opening_counts(setup.proximity.own_base_positions as u64, &own_base),
+                own_base.clone(),
+            );
+        }
+        for (position, oracle) in closure_map_oracles.iter().enumerate() {
+            let positions = first_closure.map_positions[position].clone();
+            record(
+                *oracle,
+                Stage::Send,
+                OpeningSource::SendSample,
+                opening_counts(closure_setup.map_openings as u64, &positions),
+                positions,
+            );
+            record(
+                *oracle,
+                Stage::Base,
+                OpeningSource::BaseMember,
+                opening_counts(setup.proximity.own_base_positions as u64, &own_base),
+                own_base.clone(),
+            );
+        }
+        record(
+            closure_mask_oracle,
+            Stage::Send,
+            OpeningSource::SendSample,
+            opening_counts(closure_mask_plan.openings as u64, &first_closure.mask.positions),
+            first_closure.mask.positions.clone(),
+        );
+        record(
+            closure_mask_oracle,
+            Stage::Base,
+            OpeningSource::BaseMember,
+            opening_counts(setup.proximity.own_base_positions as u64, &own_base),
+            own_base.clone(),
+        );
+
+        ledger.mark_proved(request_id).expect("the prover returned");
         assert_eq!(
-            ledger
-                .reserve(
-                    CommitmentKind::Dot,
-                    dot_root,
-                    second_request,
-                    setup.proximity.own_base_positions as u64,
-                )
-                .unwrap_err(),
-            zkie_core::error::Error::StateRollbackSuspected
+            ledger.succeed_request(request_id).unwrap_err(),
+            zkie_core::error::Error::InvalidSessionState,
+            "success before the complete verification is rejected"
         );
+        let ledger_state = ledger.read_state().expect("read the opening ledger");
         assert_eq!(
-            ledger
-                .reserve(
-                    CommitmentKind::Activation,
-                    activation_root,
-                    request_id,
-                    OUTPUT_HEAD_POSITIONS as u64,
-                )
-                .unwrap_err(),
-            zkie_core::error::Error::LeafBudgetExhausted
+            ledger_state.total_event_draws().expect("logical draws"),
+            887,
+            "the closed relation charges every logical draw"
         );
-        let ledger_state = ledger.read_state().expect("read commitment ledger");
+        assert_eq!(ledger_state.events.len(), 143);
+        let event_count = |kind: OracleKind| {
+            ledger_state
+                .events
+                .iter()
+                .filter(|event| event.oracle.kind == kind)
+                .count()
+        };
+        assert_eq!(event_count(OracleKind::Weight), 32);
+        assert_eq!(event_count(OracleKind::Table), 1);
+        assert_eq!(event_count(OracleKind::IndexMask), 2);
+        assert_eq!(event_count(OracleKind::DotMap), 1);
+        assert_eq!(event_count(OracleKind::Omega), 2);
+        assert_eq!(event_count(OracleKind::Gu), 1);
+        assert_eq!(event_count(OracleKind::FreshMask), 2);
+        assert_eq!(event_count(OracleKind::Star), 2);
+        assert_eq!(event_count(OracleKind::StarMask), 2);
+        assert_eq!(event_count(OracleKind::ClosureSlack), 32);
+        assert_eq!(event_count(OracleKind::ClosureBits), 32);
+        assert_eq!(event_count(OracleKind::ClosureMap), 32);
+        assert_eq!(event_count(OracleKind::ClosureMask), 2);
+        assert_eq!(event_count(OracleKind::Activation), 0);
+        assert_eq!(event_count(OracleKind::Switch), 0);
+        assert_eq!(event_count(OracleKind::Cs), 0);
+        let activation_record = ledger_state
+            .oracle(activation_oracle)
+            .expect("activation record");
+        assert_eq!(activation_record.allocated_rows, OUTPUT_HEAD_POSITIONS as u64);
+        assert_eq!(activation_record.logical_openings, 0);
+        assert_eq!(activation_record.opened_positions.len(), 0);
+        let table_record = ledger_state.oracle(table_oracle).expect("table record");
+        assert_eq!(table_record.logical_openings, COLUMN_DRAWS as u64);
+        assert_eq!(table_record.unique_positions, column_unique.len() as u64);
+        let closure_draws = ledger_state
+            .totals_by_kind(OracleKind::ClosureSlack)
+            .expect("slack")
+            .logical_draws
+            + ledger_state
+                .totals_by_kind(OracleKind::ClosureBits)
+                .expect("bits")
+                .logical_draws
+            + ledger_state
+                .totals_by_kind(OracleKind::ClosureMap)
+                .expect("map")
+                .logical_draws
+            + ledger_state
+                .totals_by_kind(OracleKind::ClosureMask)
+                .expect("mask")
+                .logical_draws;
+        assert_eq!(closure_draws, 196);
+        assert_eq!(
+            ledger_state.total_event_draws().expect("draws") - closure_draws,
+            691
+        );
+        for (oracle, union) in &expected_unions {
+            let record = ledger_state.oracle(*oracle).expect("oracle record");
+            assert_eq!(&record.opened_positions, union);
+            assert_eq!(record.logical_openings, expected_logical[oracle]);
+            assert_eq!(record.unique_positions, union.len() as u64);
+            assert_eq!(record.totals().logical_draws, expected_logical[oracle]);
+        }
+        let expected_unique: u64 = expected_unions
+            .values()
+            .map(|union| union.len() as u64)
+            .sum();
+        assert_eq!(
+            ledger_state
+                .total_event_unique_positions()
+                .expect("unique positions"),
+            expected_unique
+        );
+        println!("ledger_events={}", ledger_state.events.len());
         println!(
-            "commitment_ledger_openings={}",
-            ledger_state.total_logical_openings().unwrap()
+            "ledger_logical_openings={}",
+            ledger_state.total_event_draws().expect("draws")
         );
         println!(
-            "commitment_ledger_table_reuse={}",
-            ledger_state.total_table_reuse().unwrap()
+            "ledger_unique_positions={}",
+            ledger_state.total_event_unique_positions().expect("unique")
+        );
+        println!("ledger_table_logical={}", table_record.logical_openings);
+        println!("ledger_table_unique={}", table_record.unique_positions);
+        println!(
+            "ledger_activation_openings={}",
+            activation_record.logical_openings
+        );
+        println!("ledger_activation_rows={}", activation_record.allocated_rows);
+        println!("ledger_closure_logical={closure_draws}");
+        println!(
+            "ledger_pre_closure_logical={}",
+            ledger_state.total_event_draws().expect("draws") - closure_draws
+        );
+        let pre_closure_unique: u64 = expected_unions
+            .iter()
+            .filter(|(oracle, _)| {
+                !matches!(
+                    oracle.kind,
+                    OracleKind::ClosureSlack
+                        | OracleKind::ClosureBits
+                        | OracleKind::ClosureMap
+                        | OracleKind::ClosureMask
+                )
+            })
+            .map(|(_, union)| union.len() as u64)
+            .sum();
+        println!("ledger_pre_closure_unique={pre_closure_unique}");
+        println!(
+            "ledger_table_reuse={}",
+            ledger_state.total_table_reuse().expect("table reuse")
         );
         println!("hidden_prove_ms={hidden_prove_ms}");
         println!(
@@ -1382,7 +2088,7 @@ fn selected_gpt2_output_head_request_session() {
             trace_output_rows
         );
         let mut hidden_setup = setup.clone();
-        hidden_setup.send.expected_dot_root = Some(dot_root);
+        hidden_setup.send.expected_dot_root = Some(dot_message.root);
         let hidden_plan =
             build_output_head_hidden_plan(shape, &hidden_setup, &table.reader(), &trusted).unwrap();
         let started = Instant::now();
@@ -1395,6 +2101,56 @@ fn selected_gpt2_output_head_request_session() {
         )
         .unwrap();
         println!("hidden_verify_ms={}", started.elapsed().as_millis());
+        ledger
+            .mark_verified(request_id)
+            .expect("the complete verification accepted");
+        ledger
+            .succeed_request(request_id)
+            .expect("close the verified request");
+        let closed = ledger
+            .request_record(request_id)
+            .expect("read the request")
+            .expect("request");
+        assert_eq!(closed.state, RequestState::Succeeded);
+        assert_eq!(closed.event_count(), 143);
+        // A second request with the same generation seed, or the same material
+        // stream under another seed, is rejected even though the roots would
+        // differ.
+        assert_eq!(
+            ledger
+                .begin_request(
+                    digest_bytes(b"formal-output-head-second-request"),
+                    seed_commitment,
+                    setup.send.parameters_digest(),
+                )
+                .unwrap_err(),
+            zkie_core::error::Error::StateRollbackSuspected
+        );
+        let other_request = digest_bytes(b"formal-output-head-third-request");
+        ledger
+            .begin_request(
+                other_request,
+                digest_bytes(b"formal-output-head-other-seed"),
+                setup.send.parameters_digest(),
+            )
+            .expect("independent request");
+        assert_eq!(
+            ledger
+                .reserve_oracle(
+                    other_request,
+                    weight_oracles[0],
+                    ledger_stream(&weight_oracles[0], material(&weight_oracles[0])),
+                    OracleBudget::new(
+                        (setup.send.openings_per_oracle
+                            + setup.proximity.own_base_positions) as u64,
+                        setup.send.w.code.r,
+                    )
+                    .expect("retry budget"),
+                )
+                .unwrap_err(),
+            zkie_core::error::Error::StateRollbackSuspected
+        );
+
         println!(
             "hidden_own_fold_rounds={}",
             hidden_proof.session.second.fold_rounds.len()

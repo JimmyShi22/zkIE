@@ -4242,6 +4242,51 @@ impl HiddenProximityPlan {
         {
             return Some("a proximity member is not a maskless single-answer message");
         }
+        // The hiding budget of every member is the union of its distinct
+        // opened positions against the code tail rank. The declared counts are
+        // summed here as a conservative pre-check; the runtime ledger checks
+        // the exact union of SEND, BASE and any later opening.
+        let own_base = self.own_base_positions as u64;
+        let shared_base = self.shared_base_positions as u64;
+        if send.openings_per_oracle as u64 + own_base > send.w.code.r {
+            return Some("the W SEND and own-BASE openings exceed the code tail");
+        }
+        if let Some(index) = &send.index_mask {
+            if index.openings as u64 + own_base > index.mask_code.r {
+                return Some("the index-mask SEND and own-BASE openings exceed the mask tail");
+            }
+        }
+        if let Some(dot) = &send.dot {
+            if own_base > dot.shape.code.r {
+                return Some("the shown-map own-BASE openings exceed the code tail");
+            }
+        }
+        if shared_base + own_base > self.code.r {
+            return Some("the Omega shared and own-BASE openings exceed the code tail");
+        }
+        if shared_base > self.code.r {
+            return Some("the G_u shared-BASE openings exceed the code tail");
+        }
+        if shared_base > self.mask_code.r || own_base > self.mask_code.r {
+            return Some("the fresh-mask BASE openings exceed the mask tail");
+        }
+        if self.column_budget as u64 > send.table_shape.code.r {
+            return Some("the table column budget exceeds the table code tail");
+        }
+        if let Some(closure) = closure {
+            if closure.slack_openings as u64 + own_base > closure.slack.code.r {
+                return Some("the slack SEND and own-BASE openings exceed the code tail");
+            }
+            if closure.bits_openings as u64 + own_base > closure.bits.code.r {
+                return Some("the packed-bit SEND and own-BASE openings exceed the code tail");
+            }
+            if closure.map_openings as u64 + own_base > closure.map.code.r {
+                return Some("the product-map SEND and own-BASE openings exceed the code tail");
+            }
+            if closure.mask.openings as u64 + own_base > closure.mask.mask_code.r {
+                return Some("the closure-mask SEND and own-BASE openings exceed the mask tail");
+            }
+        }
         if self.shared_mask_tree.fault().is_some() || self.own_mask_tree.fault().is_some() {
             return Some("a fresh mask tree is not valid");
         }
@@ -10657,7 +10702,7 @@ mod tests {
     const TABLE_CODE_R: u64 = 1;
     const W_CODE_LOG_N: u32 = 3;
     const W_CODE_ELL: u64 = 4;
-    const W_CODE_R: u64 = 1;
+    const W_CODE_R: u64 = 4;
     const TABLE_CONFIGURATION: Digest = Digest([0x21; 32]);
     const ACTIVATION_CONFIGURATION: Digest = Digest([0x31; 32]);
     const W_CONFIGURATION: Digest = Digest([0x51; 32]);
@@ -11215,10 +11260,10 @@ mod merged_tests {
     const TABLE_ROWS: u64 = 2;
     const TABLE_LOG_N: u32 = 4;
     const TABLE_ELL: u64 = 8;
-    const TABLE_R: u64 = 1;
+    const TABLE_R: u64 = 8;
     const CODE_LOG_N: u32 = 6;
     const CODE_ELL: u64 = 32;
-    const CODE_R: u64 = 1;
+    const CODE_R: u64 = 4;
     const INDEX_MASK_ORACLE: u64 = 30;
     const INDEX_MASK_TREE: u64 = 202;
     const INDEX_MASK_RUN: Digest = Digest([0x66; 32]);
@@ -12566,5 +12611,49 @@ mod merged_tests {
             &changed,
             &witness,
         ));
+    }
+
+    #[test]
+    fn proximity_tail_union_is_enforced_by_the_plan() {
+        let activation = activation();
+        let base = hidden_plan(&activation);
+        base.validate().expect("baseline plan");
+        let proximity = base.proximity.clone();
+        let own = proximity.own_base_positions as u64;
+
+        let mut send = base.send.clone();
+        send.openings_per_oracle = (send.w.code.r + 1 - own) as usize;
+        assert_eq!(
+            proximity.fault(&send, None),
+            Some("the W SEND and own-BASE openings exceed the code tail")
+        );
+
+        let mut send = base.send.clone();
+        let index = send.index_mask.as_mut().expect("index mask");
+        index.openings = (index.mask_code.r + 1 - own) as usize;
+        assert_eq!(
+            proximity.fault(&send, None),
+            Some("the index-mask SEND and own-BASE openings exceed the mask tail")
+        );
+
+        let mut wide = proximity.clone();
+        wide.shared_base_positions = (base.proximity.code.r + 1 - own) as usize;
+        assert_eq!(
+            wide.fault(&base.send, None),
+            Some("the Omega shared and own-BASE openings exceed the code tail")
+        );
+
+        let mut budget = proximity.clone();
+        budget.column_draws = base.send.table_shape.code.r as usize + 1;
+        budget.column_budget = budget.column_draws;
+        assert_eq!(
+            budget.fault(&base.send, None),
+            Some("the table column budget exceeds the table code tail")
+        );
+
+        let mut shown = base.send.clone();
+        shown.dot.as_mut().expect("shown map").shape.code.r = own - 1;
+        assert!(proximity.fault(&shown, None).is_some());
+        assert!(base.validate().is_ok());
     }
 }

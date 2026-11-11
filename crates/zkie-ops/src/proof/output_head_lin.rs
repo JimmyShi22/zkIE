@@ -1594,7 +1594,7 @@ mod tests {
     const TOY_RANGE_BITS: u32 = 40;
     const TOY_SLACK_BITS: u32 = 42;
     const GROUP_CODE_ELL: u64 = 32;
-    const GROUP_CODE_R: u64 = 1;
+    const GROUP_CODE_R: u64 = 8;
     const TABLE_CODE_LOG_N: u32 = 5;
     const TABLE_CODE_ELL: u64 = 24;
     const TABLE_CODE_R: u64 = 1;
@@ -1867,8 +1867,8 @@ mod tests {
             },
             shared_fresh: 50,
             own_fresh: 1000,
-            column_draws: 2,
-            column_budget: 4,
+            column_draws: 1,
+            column_budget: 1,
             column_work_bits: 0,
             shared_base_positions: 2,
             own_base_positions: 2,
@@ -2884,4 +2884,21 @@ mod tests {
         assert!(close_output_relation(&output, &overflowing).is_err());
     }
 
+    #[test]
+    fn closure_tail_union_is_enforced_by_the_plan() {
+        let mut fixture = fixture();
+        let (rows, output, _activation) = formal_inputs(&fixture);
+        let mut setup = fixture.setup.clone();
+        let closure = setup.closure.as_mut().expect("closure setup");
+        closure.slack_openings = closure.slack.code.r as usize;
+        assert!(prove_output_head_lin_hidden(
+            fixture.shape,
+            &setup,
+            &output,
+            &mut fixture.table,
+            &rows,
+            &fixture.activation_salts,
+        )
+        .is_err());
+    }
 }
