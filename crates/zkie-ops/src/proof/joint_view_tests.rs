@@ -65,7 +65,8 @@ mod tests {
     #[test]
     fn joint_opening_submatrices_cover_the_message() {
         for (log_n, ell, r, q) in [
-            (17u32, 65536u64, 8192u64, 16usize),
+            (17u32, 65539u64, 8192u64, 16usize),
+            (17, 65536, 8192, 16),
             (17, 512, 256, 8),
         ] {
             let (tail, message) = opening_matrices(log_n, ell, r, q);
@@ -199,12 +200,14 @@ mod tests {
             for (row, values) in hiding.iter().enumerate() {
                 random[psc_base + row][48..71].copy_from_slice(values);
             }
-            for (t, value) in sigma.iter().enumerate() {
+            // The claim mask direction: each of the 16 claim masks `c_t`
+            // enters the PSC sigma with weight `chi^t`, so every claim-mask
+            // column is the same sigma vector scaled by that weight.
+            for t in 0..16usize {
                 let coefficient = chi.pow_u64(t as u64);
                 for row in 0..sigma.len() {
                     random[psc_base + row][16 + t] = coefficient.mul(&sigma[row]);
                 }
-                let _ = value;
             }
             random[rows - 2][71] = Fp3::ONE;
             random[rows - 1][72] = Fp3::ONE;
@@ -299,7 +302,7 @@ mod tests {
     #[test]
     fn actual_code_parameters_accept_the_opening_set_sizes() {
         for (log_n, ell, r, q) in [
-            (17u32, 65536u64, 8192u64, 603usize),
+            (17u32, 65539u64, 8192u64, 603usize),
             (17, 65536, 8192, 4),
             (17, 512, 256, 4),
         ] {
