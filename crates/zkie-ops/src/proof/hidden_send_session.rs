@@ -4761,13 +4761,6 @@ pub struct HiddenLinWitness {
 pub trait HiddenTableProver: TableRowSource {
     fn reader(&self) -> &IndexReader;
     fn open_columns(&mut self, positions: &[u64]) -> Result<Vec<ColumnOpening>>;
-
-    /// Releases any row cache retained for the prove lifetime. The prove path
-    /// calls this after the last table row read; implementations without a
-    /// cache keep the default.
-    fn release_cached_rows(&mut self) -> Result<()> {
-        Ok(())
-    }
 }
 
 /// One committed member of a proximity group.
@@ -7294,7 +7287,6 @@ fn prove_shared(
     let _profile_open_columns = zkie_engine::profile::Scope::new("shared.table_open_columns");
     let gu_openings = table.open_columns(&unique)?;
     drop(_profile_open_columns);
-    table.release_cached_rows()?;
     let _profile_column_rows = zkie_engine::profile::Scope::new("shared.column_rows");
     let column_map = table_column_map(reader, &positions, &gu_openings)?;
     let eq_gamma = foldeq_weights(&gamma, reader.shape.v)?;

@@ -551,10 +551,6 @@ fn selected_gpt2_output_head_request_session() {
             self.table.open_columns(&mut self.source, positions)
         }
 
-        fn release_cached_rows(&mut self) -> Result<()> {
-            self.source.release_row_cache();
-            Ok(())
-        }
     }
 
     let fixture = env::var("ZKIE_SESSION_FIXTURE").expect("set ZKIE_SESSION_FIXTURE");

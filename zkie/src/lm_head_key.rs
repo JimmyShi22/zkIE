@@ -2365,10 +2365,6 @@ pub struct LmHeadAssetSource {
     pads: Vec<Vec<Fp>>,
     tails: Vec<Vec<Fp>>,
     buffer: Vec<u8>,
-    /// The table's raw matrix words, kept for the prove lifetime so the fold
-    /// and column-opening passes reuse the first read instead of mapping the
-    /// asset again.
-    row_cache: Option<Vec<Option<Box<[i32]>>>>,
 }
 
 impl LmHeadAssetSource {
@@ -2457,7 +2453,6 @@ impl LmHeadAssetSource {
             pads: randomness.pads.clone(),
             tails: randomness.tails.clone(),
             buffer,
-            row_cache: None,
         })
     }
 
@@ -2467,12 +2462,6 @@ impl LmHeadAssetSource {
 
     pub fn shape(&self) -> IndexShape {
         self.shape
-    }
-
-    /// Releases the raw row cache. The prove path calls this after the last
-    /// table row read so the cache does not outlive the proof.
-    pub fn release_row_cache(&mut self) {
-        self.row_cache = None;
     }
 }
 
@@ -2490,78 +2479,34 @@ impl TableRowSource for LmHeadAssetSource {
             return Err(Error::ShapeMismatch);
         }
         let factor = usize::try_from(self.factor).map_err(|_| Error::ResourceLimit)?;
-        let cached = self
-            .row_cache
-            .as_ref()
-            .and_then(|cache| cache.get(row as usize))
-            .and_then(|entry| entry.as_deref());
-        if let Some(words) = cached {
-            for matrix_row in 0..self.matrix_rows {
-                for low in 0..factor {
-                    let place = usize::try_from(
-                        matrix_row
-                            .checked_mul(self.factor)
-                            .and_then(|base| base.checked_add(low as u64))
-                            .ok_or(Error::ResourceLimit)?,
-                    )
-                    .map_err(|_| Error::ResourceLimit)?;
-                    let value = *words.get(place).ok_or(Error::ShapeMismatch)?;
-                    *message.get_mut(place).ok_or(Error::ShapeMismatch)? =
-                        fp_from_signed_word(value as u64);
-                }
+        let table_row = row;
+        for matrix_row in 0..self.matrix_rows {
+            let start = matrix_row
+                .checked_mul(self.row_width)
+                .and_then(|value| {
+                    table_row
+                        .checked_mul(self.factor)
+                        .and_then(|offset| value.checked_add(offset))
+                })
+                .ok_or(Error::ResourceLimit)?;
+            self.reader
+                .read_range(start, factor, &mut self.buffer)?;
+            for low in 0..factor {
+                let value = i32::from_le_bytes(
+                    self.buffer[low * 4..low * 4 + 4]
+                        .try_into()
+                        .map_err(|_| Error::InvalidEncoding)?,
+                ) as i64;
+                let place = usize::try_from(
+                    matrix_row
+                        .checked_mul(self.factor)
+                        .and_then(|base| base.checked_add(low as u64))
+                        .ok_or(Error::ResourceLimit)?,
+                )
+                .map_err(|_| Error::ResourceLimit)?;
+                *message.get_mut(place).ok_or(Error::ShapeMismatch)? =
+                    fp_from_signed_word(value as u64);
             }
-        } else {
-            let row_words = usize::try_from(
-                self.matrix_rows
-                    .checked_mul(self.factor)
-                    .ok_or(Error::ResourceLimit)?,
-            )
-            .map_err(|_| Error::ResourceLimit)?;
-            let mut words = vec![0i32; row_words];
-            for matrix_row in 0..self.matrix_rows {
-                let start = matrix_row
-                    .checked_mul(self.row_width)
-                    .and_then(|value| {
-                        row.checked_mul(self.factor)
-                            .and_then(|offset| value.checked_add(offset))
-                    })
-                    .ok_or(Error::ResourceLimit)?;
-                self.reader
-                    .read_range(start, factor, &mut self.buffer)?;
-                for low in 0..factor {
-                    let value = i32::from_le_bytes(
-                        self.buffer[low * 4..low * 4 + 4]
-                            .try_into()
-                            .map_err(|_| Error::InvalidEncoding)?,
-                    );
-                    let place = usize::try_from(
-                        matrix_row
-                            .checked_mul(self.factor)
-                            .and_then(|base| base.checked_add(low as u64))
-                            .ok_or(Error::ResourceLimit)?,
-                    )
-                    .map_err(|_| Error::ResourceLimit)?;
-                    *words.get_mut(place).ok_or(Error::ShapeMismatch)? = value;
-                    *message.get_mut(place).ok_or(Error::ShapeMismatch)? =
-                        fp_from_signed_word(value as u64);
-                }
-            }
-            if self.row_cache.is_none() {
-                let len = usize::try_from(rows).map_err(|_| Error::ResourceLimit)?;
-                self.row_cache = Some((0..len).map(|_| None).collect());
-            }
-            if let Some(entry) = self
-                .row_cache
-                .as_mut()
-                .and_then(|cache| cache.get_mut(row as usize))
-            {
-                *entry = Some(words.into_boxed_slice());
-            }
-            zkie_engine::profile::add_table_bytes(
-                self.matrix_rows
-                    .saturating_mul(self.factor)
-                    .saturating_mul(4),
-            );
         }
         let pads = self.pads.get(row as usize).ok_or(Error::ShapeMismatch)?;
         for (offset, pad) in pads.iter().enumerate() {
@@ -2570,6 +2515,11 @@ impl TableRowSource for LmHeadAssetSource {
         }
         let tail_row = self.tails.get(row as usize).ok_or(Error::ShapeMismatch)?;
         tail.copy_from_slice(tail_row);
+        zkie_engine::profile::add_table_bytes(
+            self.matrix_rows
+                .saturating_mul(self.factor)
+                .saturating_mul(4),
+        );
         Ok(())
     }
 }
