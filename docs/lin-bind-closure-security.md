@@ -582,7 +582,7 @@ Items not backed by an executable rejection:
   production verification are long-term direction records, not debts of this
   round.
 
-## 8. Fail-closed summary
+## 8. Conditional conclusions and open items
 
 The following are open or conditional:
 
