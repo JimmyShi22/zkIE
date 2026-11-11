@@ -524,11 +524,19 @@ const PAIR_PARALLEL_MIN_PAIRS: usize = 1 << 15;
 const PAIR_PARALLEL_CHUNK: usize = 1 << 15;
 
 fn fold_low_once(values: &mut Vec<Fp3>, gamma: Fp3) -> Result<()> {
+    fold_low_once_with_min(values, gamma, FOLD_PARALLEL_MIN_ROWS)
+}
+
+fn fold_low_once_with_min(
+    values: &mut Vec<Fp3>,
+    gamma: Fp3,
+    parallel_min_rows: usize,
+) -> Result<()> {
     if values.len() % 2 != 0 {
         return Err(Error::InvalidConfig);
     }
     let rows = values.len() / 2;
-    if rows >= FOLD_PARALLEL_MIN_ROWS {
+    if rows >= parallel_min_rows {
         fold_low_once_bounded(values, rows, gamma);
     } else {
         for index in 0..rows {
@@ -3643,6 +3651,46 @@ mod tests {
         let other = ByteMaskCoins::new(Digest([0x12; 32])).unwrap();
         assert_ne!(a, other.redraw(0).unwrap());
         assert!(ByteMaskCoins::new(Digest::ZERO).is_err());
+    }
+
+    fn fold_low_serial(values: &[Fp3], gamma: Fp3) -> Vec<Fp3> {
+        let rows = values.len() / 2;
+        (0..rows)
+            .map(|index| fold_pair(values[2 * index], values[2 * index + 1], gamma))
+            .collect()
+    }
+
+    #[test]
+    fn fold_low_once_matches_serial_across_threshold_blocks_and_threads() {
+        let threshold = 1usize << 16;
+        let block = 1usize << 18;
+        let row_counts = [
+            threshold - 1,
+            threshold,
+            threshold + 1,
+            block - 1,
+            block,
+            block + 1,
+        ];
+        for rows in row_counts {
+            let len = rows * 2;
+            let gamma = Fp3::from_u64(17);
+            let input: Vec<Fp3> = (0..len)
+                .map(|index| Fp3::from_u64(index as u64 + 1))
+                .collect();
+            let expected = fold_low_serial(&input, gamma);
+            for threads in [1usize, 2, 64] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                let mut got = input.clone();
+                pool.install(|| fold_low_once(&mut got, gamma).unwrap());
+                assert_eq!(got, expected, "rows {rows} threads {threads}");
+            }
+        }
+        let mut odd = vec![Fp3::ONE; 3];
+        assert!(fold_low_once(&mut odd, Fp3::from_u64(3)).is_err());
     }
 
 }

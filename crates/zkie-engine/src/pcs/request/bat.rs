@@ -981,6 +981,16 @@ pub fn combine(
     rows: &[BatRow],
     x: Fp3,
 ) -> Result<BatGroupRow> {
+    combine_with_min(statement, layout, rows, x, COMBINE_PARALLEL_MIN)
+}
+
+fn combine_with_min(
+    statement: &BatStatement,
+    layout: &BatGroupLayout,
+    rows: &[BatRow],
+    x: Fp3,
+    parallel_min: usize,
+) -> Result<BatGroupRow> {
     if statement.layout(layout.group)? != *layout {
         return Err(Error::StatementMismatch);
     }
@@ -1173,7 +1183,7 @@ pub fn combine(
         }
         Ok(())
     };
-    if out.main.len() >= COMBINE_PARALLEL_MIN && chunk_len <= out.main.len() {
+    if out.main.len() >= parallel_min && chunk_len <= out.main.len() {
         out.main
             .par_chunks_mut(chunk_len)
             .enumerate()
@@ -1994,5 +2004,50 @@ mod tests {
         assert!(st.to_fold_input_row(broken, &input.layout).is_err());
         let fold_row = st.to_fold_input_row(combined, &input.layout).unwrap();
         fold_row.check(&fold_shape, &fold_layout).unwrap();
+    }
+
+    #[test]
+    fn finish_run_rejects_independent_content_identical_input() {
+        let (mut session, group) = session_fixture(5);
+        let input = session.begin_run(group).unwrap();
+        let mut independent = input.clone();
+        independent.rows = Arc::new((*input.rows).clone());
+        assert_eq!(independent.layout, input.layout);
+        assert_eq!(independent.rows.as_slice(), input.rows.as_slice());
+        assert!(!Arc::ptr_eq(&independent.rows, &input.rows));
+        assert!(matches!(
+            session.finish_run(independent),
+            Err(Error::StatementMismatch)
+        ));
+    }
+
+    #[test]
+    fn combine_parallel_matches_serial_across_threads() {
+        let (mut st, group) = group_fixture();
+        let mut first = BatRow::new(BatRowKind::Plain);
+        first.target = Fp3::from_u64(5);
+        first.add_term(0, BatPart::Main, one_at(16, 5, 3));
+        first.add_unit(1, BatPart::Mask, 3, Fp3::from_u64(2));
+        first.add_run(2, BatPart::Main, 1, 2, vec![Fp3::from_u64(7), Fp3::from_u64(9)]);
+        first.add_form(0, one_at(16, 0, 1));
+        let mut second = BatRow::new(BatRowKind::Plain);
+        second.target = Fp3::from_u64(6);
+        second.add_term(1, BatPart::Main, one_at(32, 0, 5));
+        second.add_term(2, BatPart::Main, one_at(32, 9, 11));
+        st.add_row(group, first).unwrap();
+        st.add_row(group, second).unwrap();
+        let input = st.begin_run(group).unwrap();
+        let x = Fp3::from_u64(7);
+        let serial = combine_with_min(&st, &input.layout, &input.rows, x, usize::MAX).unwrap();
+        for threads in [1usize, 2, 64] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let parallel = pool.install(|| {
+                combine_with_min(&st, &input.layout, &input.rows, x, 0).unwrap()
+            });
+            assert_eq!(serial, parallel, "threads {threads}");
+        }
     }
 }

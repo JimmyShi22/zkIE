@@ -208,7 +208,8 @@ use zkie_core::types::Digest;
 use zkie_core::common::field::PrimeField64;
 use zkie_engine::compute::cpu::{merkle_build, merkle_verify};
 use zkie_engine::pcs::request::bat::{
-    BatGroupLayout, BatOracleShape, BatPart, BatRow, BatRowKind, BatSession, BatStatement,
+    BatGroupLayout, BatOracleShape, BatPart, BatRow, BatRowKind, BatSession,
+    BatStatement,
 };
 use zkie_engine::pcs::request::chain::{
     Chain, ChainMessage, KIND_ALGEBRAIC, KIND_EMPTY, KIND_EPSILON, KIND_POSITIONS,
@@ -4971,6 +4972,18 @@ fn build_group_table(
     bat_layout: &BatGroupLayout,
     members: &[ProximityMember],
 ) -> Result<Vec<Fp3>> {
+    build_group_table_with_min(layout, bat_layout, members, GROUP_TABLE_PARALLEL_MIN)
+}
+
+fn build_group_table_with_min(
+    layout: &FoldGroupLayout,
+    bat_layout: &BatGroupLayout,
+    members: &[ProximityMember],
+    parallel_min: usize,
+) -> Result<Vec<Fp3>> {
+    if members.is_empty() {
+        return Err(Error::ShapeMismatch);
+    }
     let group_bits = bat_layout.group_row_bits(BatPart::Main);
     let group_len = bat_layout.group_len(BatPart::Main)?;
     let mut values = vec![Fp3::ZERO; group_len];
@@ -5010,6 +5023,9 @@ fn build_group_table(
     let chunk_len = 1usize
         .checked_shl(group_bits)
         .ok_or(Error::ResourceLimit)?;
+    if chunk_len == 0 || group_len % chunk_len != 0 {
+        return Err(Error::ShapeMismatch);
+    }
     let write_chunk = |place: usize, chunk: &mut [Fp3]| -> Result<()> {
         for (first, message) in &placed {
             for (row, message_row) in message.iter().enumerate() {
@@ -5021,7 +5037,7 @@ fn build_group_table(
         }
         Ok(())
     };
-    if group_len >= GROUP_TABLE_PARALLEL_MIN {
+    if group_len >= parallel_min {
         values
             .par_chunks_mut(chunk_len)
             .enumerate()
@@ -10807,7 +10823,9 @@ impl HiddenLinMessages {
 mod tests {
     use super::*;
     use crate::proof::column_session::fp_from_signed_word;
+    use zkie_engine::pcs::request::bat::BatMemberLayout;
     use zkie_engine::pcs::request::field::Fp;
+    use zkie_engine::pcs::request::fold::FoldMemberLayout;
     use zkie_engine::pcs::request::relation::GuRelationKind;
     use zkie_engine::pcs::request::table::{
         commit_table_streaming, IndexShape, TableDistances, VecTableSource,
@@ -11359,6 +11377,221 @@ mod tests {
         assert_eq!(shape.main_rows, 1);
         assert!(shape.fault(1u64 << 16, 16).is_none());
         assert_eq!(shape.code.ell - 1, 65538);
+    }
+
+
+    fn group_table_tree_plan(tree_number: u64, main_rows: u64) -> RuntimeTreePlan {
+        RuntimeTreePlan {
+            tree_number,
+            leaf_class: 1,
+            log_n: W_CODE_LOG_N,
+            log_n_zk: W_CODE_LOG_N,
+            parts: vec![RuntimeTreePart {
+                main_symbols: main_rows * E_DEGREE as u64,
+                mask_symbols: 0,
+            }],
+            salt_bytes: SALT,
+            run: W_RUN,
+            configuration: W_CONFIGURATION,
+        }
+    }
+
+    fn group_table_member(main_rows: u64, ell: u64) -> ProximityMember {
+        let code = build_code_plan(3, ell, 4).unwrap();
+        let message = (0..main_rows)
+            .map(|row| {
+                (0..ell)
+                    .map(|place| Fp3::from_u64(row * ell + place + 1))
+                    .collect()
+            })
+            .collect::<Vec<Vec<Fp3>>>();
+        ProximityMember {
+            bat_oracle: 1,
+            source_oracle: 1,
+            main_code: code,
+            mask_code: code,
+            main_rows,
+            mask_rows: 0,
+            answers: 1,
+            root: Digest::ZERO,
+            tree_plan: group_table_tree_plan(500, main_rows),
+            message,
+            tails: Vec::new(),
+            mask_message: Vec::new(),
+            mask_tails: Vec::new(),
+        }
+    }
+
+    fn group_table_layout(
+        main_rows: u64,
+        log_ell: u32,
+    ) -> (FoldGroupLayout, BatGroupLayout) {
+        let k = 1;
+        (
+            FoldGroupLayout {
+                group: 7,
+                k,
+                h: 1,
+                members: vec![FoldMemberLayout {
+                    oracle: 1,
+                    main_rows,
+                    mask_rows: 0,
+                    kept: false,
+                }],
+            },
+            BatGroupLayout {
+                group: 7,
+                k,
+                h: 1,
+                log_ell,
+                log_ell_zk: 2,
+                members: vec![BatMemberLayout {
+                    oracle: 1,
+                    kept: false,
+                    main_first: Some(0),
+                    mask_first: None,
+                }],
+            },
+        )
+    }
+
+    #[test]
+    fn group_table_rejects_malformed_members_and_cross_block_placement() {
+        let member = group_table_member(2, 4);
+        let (layout, bat_layout) = group_table_layout(2, 2);
+        let serial = build_group_table_with_min(
+            &layout,
+            &bat_layout,
+            std::slice::from_ref(&member),
+            usize::MAX,
+        )
+        .unwrap();
+        for threads in [1usize, 2, 64] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let parallel = pool.install(|| {
+                build_group_table_with_min(&layout, &bat_layout, std::slice::from_ref(&member), 0)
+                    .unwrap()
+            });
+            assert_eq!(serial, parallel, "threads {threads}");
+        }
+        assert_eq!(serial.len(), 8);
+        assert_eq!(serial[0], member.message[0][0]);
+        assert_eq!(serial[1], member.message[1][0]);
+        assert_eq!(serial[6], member.message[0][3]);
+        assert_eq!(serial[7], member.message[1][3]);
+
+        let mut too_long = member.clone();
+        too_long.message[0].push(Fp3::from_u64(99));
+        assert!(matches!(
+            build_group_table_with_min(&layout, &bat_layout, &[too_long], 0),
+            Err(Error::ShapeMismatch)
+        ));
+
+        let mut short = member.clone();
+        short.message.pop();
+        assert!(matches!(
+            build_group_table_with_min(&layout, &bat_layout, &[short], 0),
+            Err(Error::ShapeMismatch)
+        ));
+
+        let empty_layout = FoldGroupLayout {
+            group: 7,
+            k: 1,
+            h: 1,
+            members: Vec::new(),
+        };
+        let empty_bat = BatGroupLayout {
+            group: 7,
+            k: 1,
+            h: 1,
+            log_ell: 2,
+            log_ell_zk: 2,
+            members: Vec::new(),
+        };
+        assert!(matches!(
+            build_group_table_with_min(&empty_layout, &empty_bat, &[], 0),
+            Err(Error::ShapeMismatch)
+        ));
+
+        let crossing = group_table_member(3, 4);
+        let (layout3, bat3) = group_table_layout(3, 2);
+        assert!(matches!(
+            build_group_table_with_min(&layout3, &bat3, &[crossing], 0),
+            Err(Error::InvalidIndex)
+        ));
+
+        let mut overflow = bat_layout.clone();
+        overflow.k = 64;
+        assert!(matches!(
+            build_group_table_with_min(&layout, &overflow, &[member], 0),
+            Err(Error::ResourceLimit)
+        ));
+    }
+
+    #[test]
+    fn retained_tree_checks_plan_and_sealed_root() {
+        let mut member = group_table_member(2, 4);
+        let plan = group_table_tree_plan(500, 2);
+        let tails = vec![vec![Fp3::ZERO; 4]; 2];
+        let salts = vec![vec![0u8; SALT]; 1 << W_CODE_LOG_N];
+        let tree = commit_rows_tree(
+            plan.clone(),
+            member.main_code,
+            &member.message,
+            &tails,
+            &salts,
+        )
+        .unwrap();
+        member.root = *tree.root();
+        let trees = RetainedTrees(vec![Arc::new(tree)]);
+        assert!(retained_member_tree(&trees, 0, &member).is_ok());
+
+        let mut wrong_plan = member.clone();
+        wrong_plan.tree_plan.tree_number += 1;
+        assert!(matches!(
+            retained_member_tree(&trees, 0, &wrong_plan),
+            Err(Error::StatementMismatch)
+        ));
+
+        let mut wrong_root = member.clone();
+        wrong_root.root.0[0] ^= 1;
+        assert!(matches!(
+            ProximityMemberProver::sealed(wrong_root, Arc::clone(&trees.0[0])),
+            Err(Error::StatementMismatch)
+        ));
+
+        let mut wrong_message = member.clone();
+        wrong_message.message[0][0] = Fp3::from_u64(999);
+        let other_tree = commit_rows_tree(
+            plan,
+            wrong_message.main_code,
+            &wrong_message.message,
+            &tails,
+            &salts,
+        )
+        .unwrap();
+        assert!(matches!(
+            ProximityMemberProver::sealed(wrong_message, Arc::new(other_tree)),
+            Err(Error::StatementMismatch)
+        ));
+
+        let other_plan = group_table_tree_plan(501, 2);
+        let other_tree = commit_rows_tree(
+            other_plan,
+            member.main_code,
+            &member.message,
+            &tails,
+            &salts,
+        )
+        .unwrap();
+        let other_trees = RetainedTrees(vec![Arc::new(other_tree)]);
+        assert!(matches!(
+            retained_member_tree(&other_trees, 0, &member),
+            Err(Error::StatementMismatch)
+        ));
     }
 }
 

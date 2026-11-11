@@ -54,3 +54,60 @@ where
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_map_preserves_order_and_errors_across_widths() {
+        let items: Vec<u64> = (0..37).collect();
+        let expected: Vec<u64> = items.iter().map(|item| item * 3 + 1).collect();
+        for threads in [1usize, 2, 64] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            for in_flight in [1usize, 2, 4, 64] {
+                let got = pool
+                    .install(|| try_map_bounded(&items, in_flight, |item| Ok(item * 3 + 1)).unwrap());
+                assert_eq!(got, expected, "threads {threads} width {in_flight}");
+            }
+        }
+        let failed = try_map_bounded(&items, 2, |item| {
+            if *item == 19 {
+                Err(zkie_core::error::Error::ShapeMismatch)
+            } else {
+                Ok(*item)
+            }
+        });
+        assert!(failed.is_err());
+        assert!(try_map_range_bounded(0, 4, |index| Ok(index)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn range_map_preserves_order_and_errors_across_widths() {
+        let expected: Vec<usize> = (0..37).map(|index| index * 5 + 2).collect();
+        for threads in [1usize, 2, 64] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            for in_flight in [1usize, 2, 4, 64] {
+                let got = pool.install(|| {
+                    try_map_range_bounded(37, in_flight, |index| Ok(index * 5 + 2)).unwrap()
+                });
+                assert_eq!(got, expected, "threads {threads} width {in_flight}");
+            }
+        }
+        let failed = try_map_range_bounded(37, 4, |index| {
+            if index == 19 {
+                Err(zkie_core::error::Error::ShapeMismatch)
+            } else {
+                Ok(index)
+            }
+        });
+        assert!(failed.is_err());
+        assert_eq!(try_map_range_bounded(1, 64, |index| Ok(index)).unwrap(), vec![0]);
+    }
+}

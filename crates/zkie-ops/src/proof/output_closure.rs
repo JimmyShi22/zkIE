@@ -1752,11 +1752,18 @@ fn empty_mask_entries(plan: &ClosurePlan) -> DotMaskEntries {
 /// shared `eq(r, .)` vector supplied by the caller, so every position reuses
 /// one draw of the boolean point.
 pub fn closure_map_values_with_eq(bits: &[Fp3], eq: &[Fp3]) -> Result<Vec<Fp3>> {
+    closure_map_values_with_eq_min(bits, eq, 1 << 14)
+}
+
+fn closure_map_values_with_eq_min(
+    bits: &[Fp3],
+    eq: &[Fp3],
+    parallel_min: usize,
+) -> Result<Vec<Fp3>> {
     if bits.len() != eq.len() {
         return Err(Error::ShapeMismatch);
     }
-    const PARALLEL_MIN: usize = 1 << 14;
-    if bits.len() >= PARALLEL_MIN {
+    if bits.len() >= parallel_min {
         Ok(eq
             .par_iter()
             .zip(bits.par_iter())
@@ -1775,15 +1782,18 @@ pub fn closure_map_values(bits: &[Fp3], r: &[Fp3]) -> Result<Vec<Fp3>> {
 
 /// The complete `eq(point, .)` vector over the Boolean cube in `O(2^k)`.
 pub fn eq_vector(point: &[Fp3]) -> Result<Vec<Fp3>> {
+    eq_vector_with_min(point, 1 << 14)
+}
+
+fn eq_vector_with_min(point: &[Fp3], parallel_min: usize) -> Result<Vec<Fp3>> {
     if point.len() >= 30 {
         return Err(Error::ResourceLimit);
     }
-    const PARALLEL_MIN: usize = 1 << 14;
     let mut values = vec![Fp3::ONE];
     for coordinate in point.iter().rev() {
         let next_len = values.len() * 2;
         let mut next = vec![Fp3::ZERO; next_len];
-        if next_len >= PARALLEL_MIN {
+        if next_len >= parallel_min {
             next.par_chunks_mut(2)
                 .zip(values.par_iter())
                 .for_each(|(pair, value)| {
@@ -2250,5 +2260,71 @@ mod tests {
         // A consumed coin stream is not needed here; the source type is only
         // named so the module compiles the same imports in every test build.
         let _ = ByteMaskCoins::new(Digest([0x72; 32])).unwrap();
+    }
+
+    fn eq_serial(point: &[Fp3]) -> Vec<Fp3> {
+        let mut values = vec![Fp3::ONE];
+        for coordinate in point.iter().rev() {
+            let mut next = vec![Fp3::ZERO; values.len() * 2];
+            for (index, value) in values.iter().enumerate() {
+                next[2 * index] = value.mul(&Fp3::ONE.sub(coordinate));
+                next[2 * index + 1] = value.mul(coordinate);
+            }
+            values = next;
+        }
+        values
+    }
+
+    #[test]
+    fn eq_vector_parallel_matches_serial_across_threshold_and_threads() {
+        for k in [0usize, 1, 13, 14, 15] {
+            let point = (0..k)
+                .map(|index| Fp3::from_u64(index as u64 + 2))
+                .collect::<Vec<_>>();
+            let expected = eq_serial(&point);
+            assert_eq!(eq_vector_with_min(&point, usize::MAX).unwrap(), expected);
+            for threads in [1usize, 2, 64] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                let got = pool
+                    .install(|| eq_vector_with_min(&point, 0).unwrap());
+                assert_eq!(got, expected, "k {k} threads {threads}");
+            }
+            assert_eq!(eq_vector(&point).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn closure_map_parallel_matches_serial_across_threshold_and_threads() {
+        for len in [(1usize << 14) - 1, 1usize << 14] {
+            let eq = (0..len)
+                .map(|index| Fp3::from_u64(index as u64 + 3))
+                .collect::<Vec<_>>();
+            let bits = (0..len)
+                .map(|index| Fp3::from_u64((index as u64 % 2) + 1))
+                .collect::<Vec<_>>();
+            let expected: Vec<Fp3> = eq
+                .iter()
+                .zip(&bits)
+                .map(|(left, right)| left.mul(right))
+                .collect();
+            assert_eq!(
+                closure_map_values_with_eq_min(&bits, &eq, usize::MAX).unwrap(),
+                expected
+            );
+            for threads in [1usize, 2, 64] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                let got = pool.install(|| {
+                    closure_map_values_with_eq_min(&bits, &eq, 0).unwrap()
+                });
+                assert_eq!(got, expected, "len {len} threads {threads}");
+            }
+            assert_eq!(closure_map_values_with_eq(&bits, &eq).unwrap(), expected);
+        }
     }
 }
