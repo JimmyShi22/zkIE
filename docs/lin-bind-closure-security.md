@@ -241,7 +241,8 @@ the last variable backward:
 - for a plain variable `l`, the power-2 entry is its own sent power-2
   coefficient; the power-1 entry appears in the preceding variable's `after`
   value and hence in that variable's sent power-0 coefficient, with the
-  nonzero constant factor from `apply_l`; this is a 2 x 2 block with nonzero
+  nonzero constant factor from `apply_l` (for the first variable the sum row
+  plays the role of the preceding row); this is a 2 x 2 block with nonzero
   constant diagonal.
 
 The fixed coefficient is reconstructed by the verifier with `fixed_inv = 1`,
