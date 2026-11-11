@@ -295,6 +295,28 @@ input min-entropy the commitment step needs. The transcript fixes positions
 after the roots and answers are absorbed; conditional on a root, the tail is
 uniform, and the only constraints are distinct positions and the root binding.
 
+### 3.10c Shared random-variable attribution
+
+| Random variable | Public items where it appears | Shared? |
+|---|---|---|
+| table/W/closure/mask tails | the corresponding tree openings | no across trees |
+| `g_t` | `tilde_t`, `R` | yes: both rows, explicit |
+| `c_t` | `R`, Dot PSC `sigma`; also the claim relation row (checked by proximity, not a sent field value) | yes: `R` and `sigma` explicit |
+| `e_t` | the position's Eval target | no |
+| Dot `U` (23) | Dot PSC transcript | no |
+| closure `U` (49 per position) | closure PSC transcript | no |
+| closure shown (5 per position) | two end values, three fresh-point values | no |
+| SEND pads | the corresponding answer | no |
+| FOLD fresh (`2k+1`) | FOLD start sum and rounds | no |
+| BASE star rows/tails | the corresponding BASE values | no |
+
+The only cross-public-item sharing is `g_t` between `tilde` and `R`, and `c_t`
+between `R` and the Dot PSC `sigma`; `c_t` also appears in the claim relation,
+which is checked by proximity rather than sent as a field value. The `R` and
+`sigma` columns are present in the joint mask matrix; no other variable is
+silently reused. This table is
+the explicit check for the `v1 = s + r, v2 = r` counterexample.
+
 ### 3.11 Joint matrix checks
 
 The test module constructs `A` and `B` from the actual protocol evaluation
@@ -332,16 +354,16 @@ block test.
   on the entries that appear directly. The test computes rank 23 at three
   points. The determinant is a nonzero polynomial; a conservative degree
   bound is `D_PSC <= 23^2`, so a bad challenge has probability at most
-  `D_PSC/p^3 < 2^-180`.
+  `D_PSC/p^3 < 2^-181`.
 - Closure PSC: the same construction with 23 sumcheck variables and 49
   hiding entries; rank 49 at three points; `D_PSC <= 49^2`, bad challenge
-  probability `< 2^-178`. The five shown masks cover the two end values and
+  probability `< 2^-179`. The five shown masks cover the two end values and
   the three fresh-point values.
 - FOLD: the fresh mask's `2k+1` coefficients fill the start sum and the sent
   `(c0,c2)` round values; the coefficient map is triangular by variable and
   degree with unit diagonal. Its determinant is a nonzero polynomial; a
   conservative degree bound is `(2k+1)^2`, giving a bad-challenge probability
-  below `2^-180` for the production `k`.
+  below `2^-178` for `k <= 32`.
 - BASE: the star main row, star mask row and their tails are fresh per value;
   each public BASE value has its own star random dimension, so the multi-value
   map is an identity block (rank equal to the number of values), not a
@@ -455,7 +477,7 @@ eps_total <= eps_hash + eps_components
 eps_hash = (t + q_V + 1) * 2^-128.00
          + (17/2) * (t + q_V)^2 / 2^256
 eps_components = 8 * 2^-128 + 2^-180 + 2^-187 + 2^-190 + 2^-191 + eps_rank_bad
-eps_rank_bad <= (23^2 + 49^2 + (2k+1)^2) / p^3
+eps_rank_bad <= (23^2 + 49^2 + (2k+1)^2) / p^3 < 2^-178
 ```
 
 The terms are:
@@ -467,7 +489,7 @@ The terms are:
 | PSC | 10 sumcheck variables, degree 3 each | `30/p^3 < 2^-187` |
 | single equality | degree 2 | `2/p^3 < 2^-190` |
 | `chi = 0` | one event | `1/p^3 < 2^-191` |
-| PSC/FOLD rank determinant | degrees `23^2`, `49^2`, `(2k+1)^2` | `eps_rank_bad < 2^-179` for `k <= 32` |
+| PSC/FOLD rank determinant | degrees `23^2`, `49^2`, `(2k+1)^2` | `eps_rank_bad < 2^-178` for `k <= 32` |
 
 The `t`/`q_V` factor is carried by the hash term, which is the adaptive
 composition term; the algebraic component count is fixed per proof. If the
