@@ -2,8 +2,12 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::proof::psc::{hp_entries, psc_variables, HidingPolynomial};
-    use zkie_engine::pcs::request::code::{build_code_plan, point};
+    use crate::proof::psc::{
+        hp_entries, prove_dot_sumcheck, psc_variables, DotClaim, DotMaskEntries, HidingPolynomial,
+        PscChallenges,
+    };
+    use zkie_core::error::Result as CoreResult;
+    use zkie_engine::pcs::request::code::{build_code_plan, encode_row_fp3, point};
     use zkie_engine::pcs::request::fold::{FoldMainTable, FoldRoundProver};
     use zkie_engine::pcs::request::field::Fp3;
 
@@ -35,6 +39,48 @@ mod tests {
             }
         }
         rank
+    }
+
+    fn det(mut matrix: Vec<Vec<Fp3>>) -> Fp3 {
+        let n = matrix.len();
+        assert!(matrix.iter().all(|row| row.len() == n));
+        let mut value = Fp3::ONE;
+        for column in 0..n {
+            let Some(pivot) = (column..n).find(|row| !matrix[*row][column].is_zero()) else {
+                return Fp3::ZERO;
+            };
+            if pivot != column {
+                matrix.swap(pivot, column);
+                value = Fp3::ZERO.sub(&value);
+            }
+            let diagonal = matrix[column][column];
+            value = value.mul(&diagonal);
+            let inverse = diagonal.inverse().unwrap();
+            for row in (column + 1)..n {
+                if matrix[row][column].is_zero() {
+                    continue;
+                }
+                let factor = matrix[row][column].mul(&inverse);
+                for col in column..n {
+                    let subtract = factor.mul(&matrix[column][col]);
+                    matrix[row][col] = matrix[row][col].sub(&subtract);
+                }
+            }
+        }
+        value
+    }
+
+    fn vandermonde_block(log_n: u32, q: usize) -> Vec<Vec<Fp3>> {
+        let mut matrix = vec![vec![Fp3::ZERO; q]; q];
+        for row in 0..q {
+            let z = Fp3::from_base(point(log_n, row as u64).unwrap());
+            let mut power = Fp3::ONE;
+            for col in 0..q {
+                matrix[row][col] = power;
+                power = power.mul(&z);
+            }
+        }
+        matrix
     }
 
     fn opening_matrices(log_n: u32, ell: u64, r: u64, q: usize) -> (Vec<Vec<Fp3>>, Vec<Vec<Fp3>>) {
@@ -75,6 +121,243 @@ mod tests {
             assert_eq!(tail_rank, q);
             assert_eq!(joint_rank, tail_rank);
         }
+    }
+
+    #[test]
+    fn opening_vandermonde_block_is_full_rank_at_the_actual_table_size() {
+        // The left q x q block of the q x r tail matrix is a Vandermonde
+        // matrix. Its invertibility gives rank q of the full tail block, so
+        // the message columns cannot raise the joint rank above q.
+        for (log_n, q) in [
+            (17u32, 603usize),
+            (17, 16),
+            (17, 4),
+            (17, 4),
+            (17, 256),
+        ] {
+            let block = vandermonde_block(log_n, q);
+            assert_eq!(rank(block), q, "log_n {log_n} q {q}");
+        }
+    }
+
+    struct FixedChallenges {
+        values: Vec<Fp3>,
+        at: usize,
+    }
+
+    impl FixedChallenges {
+        fn new(values: Vec<Fp3>) -> Self {
+            Self { values, at: 0 }
+        }
+    }
+
+    impl PscChallenges for FixedChallenges {
+        fn draw(&mut self) -> CoreResult<Fp3> {
+            let value = self.values[self.at % self.values.len()];
+            self.at += 1;
+            Ok(value)
+        }
+
+        fn draw_nonzero(&mut self) -> CoreResult<Fp3> {
+            Ok(Fp3::from_u64(3))
+        }
+    }
+
+    fn flatten_proof(proof: crate::proof::psc::DotProof) -> Vec<Fp3> {
+        let mut rows = Vec::new();
+        rows.push(proof.hiding_sum);
+        for round in &proof.rounds {
+            rows.extend(round.coefficients.iter().copied());
+        }
+        rows.extend(proof.y_round.coefficients.iter().copied());
+        rows.extend(proof.end_values.iter().copied());
+        rows
+    }
+
+    fn closure_transcript_rows(
+        hiding: &[Fp3],
+        shown: [Fp3; 2],
+        map_values: &[Fp3],
+        bits: &[Fp3],
+        challenges: &[Fp3],
+    ) -> Vec<Fp3> {
+        let omega = bits
+            .iter()
+            .map(|bit| Fp3::ONE.sub(bit))
+            .collect::<Vec<_>>();
+        let masks = DotMaskEntries {
+            hiding: hiding.to_vec(),
+            shown,
+        };
+        let claim = DotClaim {
+            masks: Vec::new(),
+            target: Fp3::ZERO,
+        };
+        let mut source = FixedChallenges::new(challenges.to_vec());
+        let (proof, _) =
+            prove_dot_sumcheck(map_values, &omega, &claim, &masks, &mut source).unwrap();
+        flatten_proof(proof)
+    }
+
+    #[test]
+    fn closure_transcript_decomposition_uses_the_real_prover() {
+        let k = 4usize;
+        let entries = hp_entries(&psc_variables(k).unwrap()).unwrap();
+        let cells = 1usize << k;
+        let challenges = (0..=k + 2)
+            .map(|index| Fp3::from_u64(index as u64 * 11 + 5))
+            .collect::<Vec<_>>();
+        // The closure claim is satisfied by the boolean witness
+        // `map = eq(r, .) * bit`; the product sum is zero. The shown masks
+        // are fixed across the three runs: the public rounds are affine in
+        // the hiding entries for every fixed secret and shown value.
+        let r_bool = (0..k)
+            .map(|index| Fp3::from_u64(index as u64 + 2))
+            .collect::<Vec<_>>();
+        let eq = crate::proof::output_closure::eq_vector(&r_bool).unwrap();
+        let bits = (0..cells)
+            .map(|index| {
+                if index % 3 == 0 {
+                    Fp3::ONE
+                } else {
+                    Fp3::ZERO
+                }
+            })
+            .collect::<Vec<_>>();
+        let map_values = bits
+            .iter()
+            .zip(&eq)
+            .map(|(bit, weight)| weight.mul(bit))
+            .collect::<Vec<_>>();
+        let shown = [Fp3::from_u64(9), Fp3::from_u64(10)];
+        let base = closure_transcript_rows(
+            &vec![Fp3::ZERO; entries],
+            shown,
+            &map_values,
+            &bits,
+            &challenges,
+        );
+        let random = (0..entries)
+            .map(|index| Fp3::from_u64(index as u64 * 5 + 2))
+            .collect::<Vec<_>>();
+        let combined =
+            closure_transcript_rows(&random, shown, &map_values, &bits, &challenges);
+        let mut expected = base.clone();
+        for (column, weight) in random.iter().enumerate() {
+            let mut basis = vec![Fp3::ZERO; entries];
+            basis[column] = Fp3::ONE;
+            let column_rows = closure_transcript_rows(
+                &basis,
+                shown,
+                &map_values,
+                &bits,
+                &challenges,
+            );
+            for (row, value) in column_rows.iter().enumerate() {
+                expected[row] = expected[row].add(&weight.mul(&value.sub(&base[row])));
+            }
+        }
+        for (row, value) in combined.iter().enumerate() {
+            assert_eq!(*value, expected[row], "row {row}");
+        }
+    }
+
+    #[test]
+    fn closure_end_values_are_one_time_padded() {
+        let k = 4usize;
+        let entries = hp_entries(&psc_variables(k).unwrap()).unwrap();
+        let cells = 1usize << k;
+        let challenges = (0..=k + 2)
+            .map(|index| Fp3::from_u64(index as u64 * 17 + 3))
+            .collect::<Vec<_>>();
+        let r_bool = (0..k)
+            .map(|index| Fp3::from_u64(index as u64 + 2))
+            .collect::<Vec<_>>();
+        let eq = crate::proof::output_closure::eq_vector(&r_bool).unwrap();
+        let bits = (0..cells)
+            .map(|index| {
+                if index % 2 == 0 {
+                    Fp3::ONE
+                } else {
+                    Fp3::ZERO
+                }
+            })
+            .collect::<Vec<_>>();
+        let map_values = bits
+            .iter()
+            .zip(&eq)
+            .map(|(bit, weight)| weight.mul(bit))
+            .collect::<Vec<_>>();
+        let hiding = vec![Fp3::ZERO; entries];
+        let zero = closure_transcript_rows(
+            &hiding,
+            [Fp3::ZERO; 2],
+            &map_values,
+            &bits,
+            &challenges,
+        );
+        let shown = [Fp3::from_u64(4), Fp3::from_u64(6)];
+        let masked =
+            closure_transcript_rows(&hiding, shown, &map_values, &bits, &challenges);
+        let beta = Fp3::from_u64(3);
+        for index in 0..2 {
+            let row = zero.len() - 2 + index;
+            assert_eq!(masked[row].sub(&zero[row]), beta.mul(&shown[index]));
+        }
+    }
+
+    #[test]
+    fn joint_closure_mask_object_covers_psc_shown_and_openings() {
+        let k = 4usize;
+        let entries = hp_entries(&psc_variables(k).unwrap()).unwrap();
+        let shown = 5usize;
+        let challenge_values = (0..=k)
+            .map(|index| Fp3::from_u64(index as u64 * 13 + 7))
+            .collect::<Vec<_>>();
+        let hiding = psc_hiding_map(k, &challenge_values);
+        let plan = build_code_plan(10, 32, 16).unwrap();
+        let ell = 32usize;
+        let tail_len = 16usize;
+        let q = 2usize;
+        let rows = entries + shown + q;
+        let columns = ell + tail_len;
+        let mut random = vec![vec![Fp3::ZERO; columns]; rows];
+        for row in 0..entries {
+            for column in 0..entries {
+                random[row][column] = hiding[row][column];
+            }
+        }
+        for index in 0..shown {
+            random[entries + index][entries + index] = Fp3::ONE;
+        }
+        let positions = [0u64, 1];
+        for column in 0..ell {
+            let mut message = vec![Fp3::ZERO; ell];
+            message[column] = Fp3::ONE;
+            let tail = vec![Fp3::ZERO; tail_len];
+            let code = encode_row_fp3(&plan, &message, &tail).unwrap();
+            for (row, position) in positions.iter().enumerate() {
+                random[entries + shown + row][column] = code[*position as usize];
+            }
+        }
+        for column in 0..tail_len {
+            let message = vec![Fp3::ZERO; ell];
+            let mut tail = vec![Fp3::ZERO; tail_len];
+            tail[column] = Fp3::ONE;
+            let code = encode_row_fp3(&plan, &message, &tail).unwrap();
+            for (row, position) in positions.iter().enumerate() {
+                random[entries + shown + row][ell + column] =
+                    code[*position as usize];
+            }
+        }
+        let mut secret = vec![vec![Fp3::ZERO; entries + shown]; rows];
+        for row in 0..(entries + shown) {
+            secret[row][row] = Fp3::ONE;
+        }
+        let random_rank = rank(random.clone());
+        let joint_rank = rank(joined(random, secret));
+        assert_eq!(random_rank, rows);
+        assert_eq!(joint_rank, random_rank);
     }
 
     fn dot_mask_rank(chi: Fp3) -> (usize, usize) {
@@ -136,7 +419,12 @@ mod tests {
                     .map(|index| Fp3::from_u64(seed * 17 + index as u64 * 3 + 2))
                     .collect::<Vec<_>>();
                 let matrix = psc_hiding_map(k, &challenges);
-                assert_eq!(rank(matrix), entries, "k {k} seed {seed}");
+                assert_eq!(rank(matrix.clone()), entries, "k {k} seed {seed}");
+                let value = det(matrix);
+                assert!(
+                    value == Fp3::ONE || value == Fp3::ZERO.sub(&Fp3::ONE),
+                    "k {k} seed {seed}"
+                );
             }
         }
     }
@@ -249,7 +537,7 @@ mod tests {
 
     #[test]
     fn joint_fold_fresh_coefficients_map_is_full_rank() {
-        let k = 2u32;
+        for k in [2u32, 14] {
         let entries = 2 * k as usize + 1;
         for seed in 0u64..3 {
             let mut matrix = vec![vec![Fp3::ZERO; entries]; entries];
@@ -260,10 +548,14 @@ mod tests {
                     k,
                     0,
                     coefficients,
-                    vec![Fp3::ZERO; 5],
-                    vec![Fp3::ZERO; 5],
-                    5,
-                    FoldMainTable::new(vec![Fp3::ZERO; 4], vec![Fp3::ZERO; 4]).unwrap(),
+                    vec![Fp3::ZERO; entries],
+                    vec![Fp3::ZERO; entries],
+                    entries,
+                    FoldMainTable::new(
+                        vec![Fp3::ZERO; 1usize << k],
+                        vec![Fp3::ZERO; 1usize << k],
+                    )
+                    .unwrap(),
                     Fp3::ZERO,
                 )
                 .unwrap();
@@ -281,7 +573,13 @@ mod tests {
                 }
                 assert_eq!(row, entries);
             }
-            assert_eq!(rank(matrix), entries, "seed {seed}");
+            assert_eq!(rank(matrix.clone()), entries, "k {k} seed {seed}");
+            let value = det(matrix);
+            assert!(
+                value == Fp3::ONE || value == Fp3::ZERO.sub(&Fp3::ONE),
+                "k {k} seed {seed}"
+            );
+        }
         }
     }
 
