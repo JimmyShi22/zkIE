@@ -221,7 +221,7 @@ pub struct LmHeadBudgetClaim {
     pub state: LmHeadBudgetState,
 }
 
-fn encode_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+pub(crate) fn encode_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     use bincode::Options;
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
@@ -229,7 +229,7 @@ fn encode_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
         .map_err(|_| Error::InvalidEncoding)
 }
 
-fn decode_bytes<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+pub(crate) fn decode_bytes<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     use bincode::Options;
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
@@ -238,7 +238,7 @@ fn decode_bytes<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
         .map_err(|_| Error::InvalidEncoding)
 }
 
-fn private_options() -> OpenOptions {
+pub(crate) fn private_options() -> OpenOptions {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -260,7 +260,7 @@ fn public_options() -> OpenOptions {
     options
 }
 
-fn ensure_private_dir(dir: &Path) -> Result<()> {
+pub(crate) fn ensure_private_dir(dir: &Path) -> Result<()> {
     if let Ok(metadata) = std::fs::symlink_metadata(dir) {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(Error::Io);
@@ -284,7 +284,7 @@ fn ensure_private_dir(dir: &Path) -> Result<()> {
     builder.create(dir).map_err(|_| Error::Io)
 }
 
-fn write_bytes(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
+pub(crate) fn write_bytes(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
     let mut options = if private {
         private_options()
     } else {
@@ -295,7 +295,7 @@ fn write_bytes(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
     file.sync_all().map_err(|_| Error::Io)
 }
 
-fn read_bytes(path: &Path) -> Result<Vec<u8>> {
+pub(crate) fn read_bytes(path: &Path) -> Result<Vec<u8>> {
     if let Ok(metadata) = std::fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() {
             return Err(Error::Io);
@@ -354,7 +354,7 @@ pub fn read_private(path: &Path, public_digest: Digest) -> Result<LmHeadPrivateS
     LmHeadPrivateState::decode(&read_bytes(path)?, public_digest)
 }
 
-fn sync_dir(dir: &Path) -> Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     let file = File::open(dir).map_err(|_| Error::Io)?;
     file.sync_all().map_err(|_| Error::Io)
 }

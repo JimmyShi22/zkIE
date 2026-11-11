@@ -350,6 +350,7 @@ fn selected_gpt2_output_head_request_session() {
         build_lm_head_holder, limited_key_binding_parameters, LmHeadAssetSource,
         LmHeadKeyRandomness,
     };
+    use zkie::commitment_ledger::{CommitmentKind, CommitmentLedger, LedgerPolicy};
     use zkie::lm_head_stage::{
         read_manifest, write_manifest, ManifestFile, VerificationManifest,
         VERIFICATION_MANIFEST_FILE,
@@ -1000,6 +1001,43 @@ fn selected_gpt2_output_head_request_session() {
             activation: *activation_commitment.commitment(),
             output: output_plan.clone(),
         };
+        // The authoritative commitment ledger is reserved before the hidden
+        // proof starts. X and the table root are known here; the W roots are
+        // proof values and are reserved as soon as the prover returns them.
+        // The ledger is a test-run directory, so a repeated formal run starts
+        // from a fresh ledger instead of reusing a spent commitment.
+        let ledger_dir = work_dir.join("commitment-ledger");
+        let ledger = CommitmentLedger::initialize(&ledger_dir, LedgerPolicy::default())
+            .expect("initialize commitment ledger");
+        let request_id = digest_bytes(b"formal-output-head-request");
+        let activation_root = activation_commitment.root();
+        ledger
+            .record_commitment(
+                CommitmentKind::Activation,
+                activation_root,
+                activation_root,
+            )
+            .expect("record the activation commitment");
+        let table_identity = reader_table_identity(&reader).unwrap();
+        ledger
+            .record_commitment(CommitmentKind::Table, table_identity, reader.root)
+            .expect("record the table commitment");
+        let activation_claim = ledger
+            .reserve(
+                CommitmentKind::Activation,
+                activation_root,
+                request_id,
+                OUTPUT_HEAD_POSITIONS as u64,
+            )
+            .expect("reserve the activation openings");
+        let table_claim = ledger
+            .reserve(
+                CommitmentKind::Table,
+                table_identity,
+                request_id,
+                COLUMN_DRAWS as u64,
+            )
+            .expect("reserve the table openings");
         let started = Instant::now();
         let (hidden_proof, hidden_witness, closure) = prove_output_head_lin_hidden(
             shape,
@@ -1010,7 +1048,72 @@ fn selected_gpt2_output_head_request_session() {
             &setup.activation_salts,
         )
         .unwrap();
-        println!("hidden_prove_ms={}", started.elapsed().as_millis());
+        let hidden_prove_ms = started.elapsed().as_millis();
+        let mut weight_claims = Vec::new();
+        for weight_root in &hidden_witness.send.roots {
+            ledger
+                .record_commitment(CommitmentKind::Weight, *weight_root, *weight_root)
+                .expect("record a W commitment");
+            weight_claims.push(
+                ledger
+                    .reserve(
+                        CommitmentKind::Weight,
+                        *weight_root,
+                        request_id,
+                        setup.send.openings_per_oracle as u64,
+                    )
+                    .expect("reserve the W openings"),
+            );
+        }
+        activation_claim.succeed().expect("finish the activation attempt");
+        table_claim.succeed().expect("finish the table attempt");
+        for claim in weight_claims {
+            claim.succeed().expect("finish a W attempt");
+        }
+        let second_request = digest_bytes(b"formal-output-head-second-request");
+        assert_eq!(
+            ledger
+                .reserve(
+                    CommitmentKind::Activation,
+                    activation_root,
+                    second_request,
+                    OUTPUT_HEAD_POSITIONS as u64,
+                )
+                .unwrap_err(),
+            zkie_core::error::Error::StateRollbackSuspected
+        );
+        assert_eq!(
+            ledger
+                .reserve(
+                    CommitmentKind::Table,
+                    table_identity,
+                    second_request,
+                    COLUMN_DRAWS as u64,
+                )
+                .unwrap_err(),
+            zkie_core::error::Error::StateRollbackSuspected
+        );
+        assert_eq!(
+            ledger
+                .reserve(
+                    CommitmentKind::Activation,
+                    activation_root,
+                    request_id,
+                    OUTPUT_HEAD_POSITIONS as u64,
+                )
+                .unwrap_err(),
+            zkie_core::error::Error::LeafBudgetExhausted
+        );
+        let ledger_state = ledger.read_state().expect("read commitment ledger");
+        println!(
+            "commitment_ledger_openings={}",
+            ledger_state.total_logical_openings().unwrap()
+        );
+        println!(
+            "commitment_ledger_table_reuse={}",
+            ledger_state.total_table_reuse().unwrap()
+        );
+        println!("hidden_prove_ms={hidden_prove_ms}");
         println!(
             "hidden_proof_bytes={}",
             hidden_proof.encode().unwrap().len()
