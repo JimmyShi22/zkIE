@@ -209,17 +209,19 @@ impl FixtureMaskCoins {
     }
 
     fn value_at(&self, number: u32) -> Result<Fp3> {
-        let digest = hash_labeled(
-            tag_word(TEST_COINS, 0),
-            number as u64,
-            Some(&self.seed),
-            &[],
-        )?;
         let mut coefficients = [Fp::ZERO; E_DEGREE];
-        for (index, coefficient) in coefficients.iter_mut().enumerate() {
-            let bytes = &digest.0[index * 8..(index + 1) * 8];
-            let word = u64::from_le_bytes(bytes.try_into().map_err(|_| Error::InvalidEncoding)?);
-            *coefficient = Fp::from_u64(word % MODULUS);
+        for (coordinate, coefficient) in coefficients.iter_mut().enumerate() {
+            *coefficient = zkie_engine::pcs::request::field::uniform_fp(|attempt| {
+                let digest = hash_labeled(
+                    tag_word(TEST_COINS, 1 + coordinate as u64),
+                    number as u64,
+                    Some(&self.seed),
+                    &attempt.to_le_bytes(),
+                )?;
+                Ok(u64::from_le_bytes(
+                    digest.0[0..8].try_into().map_err(|_| Error::InvalidEncoding)?,
+                ))
+            })?;
         }
         Ok(Fp3::new(coefficients[0], coefficients[1], coefficients[2]))
     }

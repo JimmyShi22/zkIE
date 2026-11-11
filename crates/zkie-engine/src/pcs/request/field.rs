@@ -22,6 +22,28 @@ pub fn fp_from_u64(value: u64) -> Fp {
     Fp::from_u64(value)
 }
 
+/// Number of candidate words one base-field rejection sample may consume.
+/// The rejection probability is `1 - p/2^64 < 2^-32`, so exhaustion is below
+/// `2^-2048` per sample.
+pub const SAMPLE_TRIES: u32 = 64;
+
+/// Uniform base-field sample by rejection. `word(attempt)` must return a fresh
+/// 64-bit candidate; a candidate at or above the modulus is rejected and the
+/// next attempt is drawn. Exhaustion returns `EntropyUnavailable`; there is no
+/// modulo fallback.
+pub fn uniform_fp<F>(mut word: F) -> Result<Fp>
+where
+    F: FnMut(u32) -> Result<u64>,
+{
+    for attempt in 0..SAMPLE_TRIES {
+        let candidate = word(attempt)?;
+        if candidate < MODULUS {
+            return Ok(Fp::from_u64(candidate));
+        }
+    }
+    Err(Error::EntropyUnavailable)
+}
+
 pub fn fp_to_u64(value: Fp) -> u64 {
     value.as_canonical_u64()
 }
@@ -168,3 +190,44 @@ impl Fp3 {
         Ok(Self { c: coefficients })
     }
 }
+
+#[cfg(test)]
+mod uniform_tests {
+    use super::*;
+
+    #[test]
+    fn boundary_words_are_accepted_or_rejected_without_reduction() {
+        let last = MODULUS - 1;
+        assert_eq!(uniform_fp(|_| Ok(last)).unwrap(), Fp::from_u64(last));
+        let first_retry = uniform_fp(|attempt| {
+            if attempt == 0 {
+                Ok(MODULUS)
+            } else {
+                Ok(7)
+            }
+        })
+        .unwrap();
+        assert_eq!(first_retry, Fp::from_u64(7));
+        let top = uniform_fp(|attempt| {
+            if attempt == 0 {
+                Ok(u64::MAX)
+            } else {
+                Ok(9)
+            }
+        })
+        .unwrap();
+        assert_eq!(top, Fp::from_u64(9));
+    }
+
+    #[test]
+    fn exhaustion_returns_an_error_after_the_fixed_number_of_tries() {
+        let mut calls = 0u32;
+        let result = uniform_fp(|_| {
+            calls += 1;
+            Ok(u64::MAX)
+        });
+        assert!(matches!(result, Err(Error::EntropyUnavailable)));
+        assert_eq!(calls, SAMPLE_TRIES);
+    }
+}
+

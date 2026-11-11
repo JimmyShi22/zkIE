@@ -1471,9 +1471,15 @@ impl ByteMaskCoins {
     fn value_at(&self, number: u32) -> Result<Fp3> {
         use zkie_core::common::field::PrimeCharacteristicRing;
 
-        use crate::pcs::request::field::{Fp, E_DEGREE, MODULUS};
+        use crate::pcs::request::field::{uniform_fp, Fp, E_DEGREE};
         use crate::primitives::transcript::{hash_labeled, tag_word, COIN_INPUTS};
 
+        // The base hash supplies one candidate word per coordinate. A
+        // rejected candidate is retried in a coordinate- and attempt-specific
+        // domain: the draw number is the hash index, the coordinate selects
+        // the retry subdomain, and the attempt number is part of the data.
+        // The sequential and random-access paths both call this function, so
+        // `draw`, `redraw` and `value_at` agree for the same number.
         let digest = hash_labeled(
             tag_word(COIN_INPUTS, 0),
             number as u64,
@@ -1481,10 +1487,28 @@ impl ByteMaskCoins {
             &self.seed.0,
         )?;
         let mut coefficients = [Fp::ZERO; E_DEGREE];
-        for (index, coefficient) in coefficients.iter_mut().enumerate() {
-            let bytes = &digest.0[index * 8..(index + 1) * 8];
-            let word = u64::from_le_bytes(bytes.try_into().map_err(|_| Error::InvalidEncoding)?);
-            *coefficient = Fp::from_u64(word % MODULUS);
+        for (coordinate, coefficient) in coefficients.iter_mut().enumerate() {
+            let bytes = &digest.0[coordinate * 8..(coordinate + 1) * 8];
+            let base = u64::from_le_bytes(bytes.try_into().map_err(|_| Error::InvalidEncoding)?);
+            *coefficient = uniform_fp(|attempt| {
+                if attempt == 0 {
+                    return Ok(base);
+                }
+                let mut data = Vec::with_capacity(self.seed.0.len() + 8);
+                data.extend_from_slice(&self.seed.0);
+                data.extend_from_slice(&(attempt as u64).to_le_bytes());
+                let retry = hash_labeled(
+                    tag_word(COIN_INPUTS, 1 + coordinate as u64),
+                    number as u64,
+                    None,
+                    &data,
+                )?;
+                Ok(u64::from_le_bytes(
+                    retry.0[0..8]
+                        .try_into()
+                        .map_err(|_| Error::InvalidEncoding)?,
+                ))
+            })?;
         }
         Ok(Fp3::new(coefficients[0], coefficients[1], coefficients[2]))
     }
@@ -2601,18 +2625,19 @@ mod tests {
         }
 
         fn value_at(&self, number: u32) -> Result<Fp3> {
-            let digest = hash_labeled(
-                tag_word(TEST_COINS, 0),
-                number as u64,
-                Some(&self.seed),
-                &[],
-            )?;
             let mut coefficients = [Fp::ZERO; E_DEGREE];
-            for (index, coefficient) in coefficients.iter_mut().enumerate() {
-                let bytes = &digest.0[index * 8..(index + 1) * 8];
-                let word =
-                    u64::from_le_bytes(bytes.try_into().map_err(|_| Error::InvalidEncoding)?);
-                *coefficient = Fp::from_u64(word % MODULUS);
+            for (coordinate, coefficient) in coefficients.iter_mut().enumerate() {
+                *coefficient = crate::pcs::request::field::uniform_fp(|attempt| {
+                    let digest = hash_labeled(
+                        tag_word(TEST_COINS, 1 + coordinate as u64),
+                        number as u64,
+                        Some(&self.seed),
+                        &attempt.to_le_bytes(),
+                    )?;
+                    Ok(u64::from_le_bytes(
+                        digest.0[0..8].try_into().map_err(|_| Error::InvalidEncoding)?,
+                    ))
+                })?;
             }
             Ok(Fp3::new(coefficients[0], coefficients[1], coefficients[2]))
         }
@@ -3694,3 +3719,36 @@ mod tests {
     }
 
 }
+
+#[cfg(test)]
+mod unbiased_coin_tests {
+    use super::*;
+
+    fn stream(seed: u8, count: usize) -> Vec<Fp3> {
+        let mut coins = ByteMaskCoins::new(Digest([seed; 32])).unwrap();
+        (0..count)
+            .map(|_| coins.draw().unwrap().0)
+            .collect()
+    }
+
+    #[test]
+    fn sequential_and_random_access_agree_for_the_same_number() {
+        let mut coins = ByteMaskCoins::new(Digest([0x21; 32])).unwrap();
+        for number in 0..8u32 {
+            let (value, drawn) = coins.draw().unwrap();
+            assert_eq!(drawn, number);
+            assert_eq!(coins.redraw(number).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn the_stream_is_deterministic_per_seed_and_distinct_across_seeds() {
+        assert_eq!(stream(0x31, 8), stream(0x31, 8));
+        assert_ne!(stream(0x31, 8), stream(0x32, 8));
+        let values = stream(0x31, 8);
+        for (index, value) in values.iter().enumerate() {
+            assert!(!values[index + 1..].contains(value));
+        }
+    }
+}
+
