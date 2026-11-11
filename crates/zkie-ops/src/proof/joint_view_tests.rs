@@ -3,8 +3,8 @@
 #[cfg(test)]
 mod tests {
     use crate::proof::psc::{
-        hp_entries, prove_dot_sumcheck, psc_variables, DotClaim, DotMaskEntries, HidingPolynomial,
-        PscChallenges,
+        hp_entries, multilinear_eval, prove_dot_sumcheck, psc_variables, DotClaim, DotMaskEntries,
+        HidingPolynomial, PscChallenges,
     };
     use zkie_core::error::Result as CoreResult;
     use zkie_engine::pcs::request::code::{build_code_plan, encode_row_fp3, point};
@@ -303,6 +303,56 @@ mod tests {
         for index in 0..2 {
             let row = zero.len() - 2 + index;
             assert_eq!(masked[row].sub(&zero[row]), beta.mul(&shown[index]));
+        }
+    }
+
+    fn closure_inner(left: &[Fp3], right: &[Fp3]) -> Fp3 {
+        left.iter()
+            .zip(right)
+            .fold(Fp3::ZERO, |sum, (a, b)| sum.add(&a.mul(b)))
+    }
+
+    #[test]
+    fn closure_point_values_are_real_products_plus_the_shown_masks() {
+        let k = 4usize;
+        let cells = 1usize << k;
+        let r_bool = (0..k)
+            .map(|index| Fp3::from_u64(index as u64 + 2))
+            .collect::<Vec<_>>();
+        let q_vector = (0..k)
+            .map(|index| Fp3::from_u64(index as u64 * 3 + 4))
+            .collect::<Vec<_>>();
+        let eq = crate::proof::output_closure::eq_vector(&r_bool).unwrap();
+        let eq_q = crate::proof::output_closure::eq_vector(&q_vector).unwrap();
+        let bits = (0..cells)
+            .map(|index| {
+                if index % 3 == 0 {
+                    Fp3::ONE
+                } else {
+                    Fp3::ZERO
+                }
+            })
+            .collect::<Vec<_>>();
+        let map_values = bits
+            .iter()
+            .zip(&eq)
+            .map(|(bit, weight)| weight.mul(bit))
+            .collect::<Vec<_>>();
+        let point = (0..k)
+            .map(|index| Fp3::from_u64(index as u64 * 5 + 1))
+            .collect::<Vec<_>>();
+        let b_point = multilinear_eval(&bits, &point).unwrap();
+        let d_value = closure_inner(&eq_q, &map_values);
+        let weighted = eq_q
+            .iter()
+            .zip(&eq)
+            .map(|(q, r)| q.mul(r))
+            .collect::<Vec<_>>();
+        let bq_value = closure_inner(&weighted, &bits);
+        for (index, base) in [b_point, d_value, bq_value].iter().enumerate() {
+            let shown = Fp3::from_u64(index as u64 * 7 + 21);
+            let value = base.add(&shown);
+            assert_eq!(value.sub(base), shown);
         }
     }
 
