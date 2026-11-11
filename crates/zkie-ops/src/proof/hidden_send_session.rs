@@ -258,7 +258,7 @@ use crate::proof::output_closure::{
     commit_closure_mask, commit_value_group, closure_values_from_rows, prove_closure_second,
     verify_closure_second, ClosureFirstMessages, ClosureMaskMessage, ClosureMaskPlan, ClosurePlan,
     ClosureRandomness, ClosureRowBinding, ClosureSecondMessages, ClosureWitness,
-    CommittedClosureMask, CommittedValueGroup, RetainedTrees,
+    CommittedClosureMask, CommittedGroupMessage, CommittedValueGroup, RetainedTrees,
 };
 use crate::proof::base_final_session::{
     fold_identity, BaseFinalCheck, BaseFinalOutcome, BaseFinalRows, BaseFinalSession, BaseMessages,
@@ -5568,9 +5568,11 @@ fn proximity_verify(
     mask_tree: MaskTreePlan,
     base_positions: usize,
 ) -> Result<ProximityVerification> {
+    let _profile = zkie_engine::profile::Scope::new("verify.proximity");
     if members.is_empty() || sample_rows.len() != members.len() {
         return Err(Error::ShapeMismatch);
     }
+    let _profile_statement = zkie_engine::profile::Scope::light("verify.proximity.statement");
     let mut statement = BatStatement::new();
     for member in members {
         statement.add_oracle(member_bat_shape(member))?;
@@ -5596,12 +5598,16 @@ fn proximity_verify(
     }
     let layout = statement.layout(group)?;
     let fold_layout = statement.to_fold_layout_checked(group, &fold)?;
+    drop(_profile_statement);
+    let _profile_bat = zkie_engine::profile::Scope::new("verify.proximity.bat");
     let mut bat = BatSession::new(statement, chain, planned)?;
     let input = bat.begin_run(group)?;
     let combined = bat.finish_run(input)?;
     let fold_row = bat.statement().to_fold_input_row(combined, &layout)?;
     let chain = bat.into_chain()?;
+    drop(_profile_bat);
 
+    let _profile_fold = zkie_engine::profile::Scope::new("verify.proximity.fold");
     let verified_groups = VerifiedGroups {
         groups: vec![VerifiedGroup {
             group,
@@ -5678,6 +5684,8 @@ fn proximity_verify(
         fold_sum: output.sum,
     };
     let handoff = FoldHandoff::from_output(&output, &anchor)?;
+    drop(_profile_fold);
+    let _profile_base = zkie_engine::profile::Scope::new("verify.proximity.base");
     let basis = FoldBasis {
         layout: handoff.layout.clone(),
         fresh_root: handoff.fresh_root,
@@ -6355,21 +6363,21 @@ fn prove_first(
             )?;
             drop(_profile_map_open);
             Some(ClosureFirstMessages {
-                slack: closure.slack.clone(),
+                slack: CommittedGroupMessage::new(closure.slack.group.clone()),
                 slack_sample: SendSamples {
                     seed: slack_seeds,
                     answers: slack_answers,
                 },
                 slack_positions,
                 slack_openings,
-                bits: closure.bits.clone(),
+                bits: CommittedGroupMessage::new(closure.bits.group.clone()),
                 bits_sample: SendSamples {
                     seed: bits_seeds,
                     answers: bits_answers,
                 },
                 bits_positions,
                 bits_openings,
-                map: map.clone(),
+                map: CommittedGroupMessage::new(map.group.clone()),
                 map_sample: SendSamples {
                     seed: map_seeds,
                     answers: map_answers,
@@ -6462,6 +6470,7 @@ fn verify_first(
     output: Option<&[Vec<Fp3>]>,
     messages: &HiddenSendMessages,
 ) -> Result<(Vec<EvalSampleRow>, Digest, Option<Vec<Fp3>>)> {
+    let _profile = zkie_engine::profile::Scope::new("verify.first");
     plan.validate()?;
     // A fixture may pin the reduced roots as a negative-test expectation. The
     // hidden-input entry leaves them unpinned: the roots are proof values
@@ -6719,6 +6728,7 @@ fn verify_first(
     if positions != messages.positions || messages.openings.len() != positions.len() {
         return Err(Error::InvalidProof);
     }
+    let _profile_openings = zkie_engine::profile::Scope::light("verify.first.openings");
     for (position, (list, opening)) in positions.iter().zip(&messages.openings).enumerate() {
         if opening.positions != *list {
             return Err(Error::InvalidIndex);
@@ -6836,6 +6846,7 @@ fn verify_first(
             verify_runtime_opening(&tree, &root, list, opening)?;
         }
     }
+    drop(_profile_openings);
     let psi = draw_psi(&mut chain, &plan.send)?;
     if psi != messages.psi {
         return Err(Error::InvalidProof);
@@ -7591,6 +7602,7 @@ fn verify_shared(
     first_seal: &Digest,
     messages: &HiddenSharedMessages,
 ) -> Result<(Digest, Vec<GuRelationRow>, SharedPoints, BaseFinalOutcome)> {
+    let _profile = zkie_engine::profile::Scope::new("verify.shared");
     let k_col = shared_point_bits(plan)?;
     let mut chain = shared_start_chain(plan, reader, first_seal)?;
     let psi = draw_point_round(
@@ -7623,7 +7635,9 @@ fn verify_shared(
         return Err(Error::InvalidProof);
     }
     let unique = unique_sorted(&positions);
+    let _profile_columns = zkie_engine::profile::Scope::new("verify.shared.columns");
     let column_map = table_column_map(reader, &positions, &messages.column_openings)?;
+    drop(_profile_columns);
     let _ = unique;
     let mut registry = GuRegistry::new();
     registry.receive(
@@ -7635,16 +7649,7 @@ fn verify_shared(
             part: gu.part,
         },
     )?;
-    let mut sample_rows = Vec::with_capacity(gu.u.answers as usize);
-    for (answer, target) in messages.gu_answers.iter().enumerate() {
-        sample_rows.push(sample_row(
-            &gu,
-            &registry,
-            &gu_seeds,
-            answer as u32,
-            *target,
-        )?);
-    }
+    let _profile_record_rows = zkie_engine::profile::Scope::new("verify.shared.record_rows");
     let record_seeds = record_seeds(&reader.shape, &reader.name(), reader.shape.answers as usize)?;
     let mut record_rows = Vec::with_capacity(reader.shape.answers as usize);
     for answer in 0..reader.shape.answers {
@@ -7658,11 +7663,14 @@ fn verify_shared(
             answer,
         )?);
     }
+    drop(_profile_record_rows);
+    let _profile_column_rows = zkie_engine::profile::Scope::new("verify.shared.column_rows");
     let mut column_rows = Vec::with_capacity(positions.len());
     for position in &positions {
         let column = column_for(&column_map, *position)?;
         column_rows.push(column_row(&gu, &registry, *position, &column, &eq_gamma)?);
     }
+    drop(_profile_column_rows);
 
     let omega = plan.proximity.omega.clone();
     absorb_root_round(&mut chain, &messages.omega_root)?;
@@ -7749,6 +7757,7 @@ fn verify_shared(
             sample_rows.push(rows);
         }
     }
+    let _profile_plain_rows = zkie_engine::profile::Scope::new("verify.shared.plain_rows");
     let mut plain_rows = Vec::new();
     for row in &record_rows {
         plain_rows.push(relation_row_bat(row, &members[gu_bat as usize])?);
@@ -7766,12 +7775,14 @@ fn verify_shared(
         omega.matrix_rows,
         omega.k_lo,
     )?);
+    drop(_profile_plain_rows);
     let fold = member_fold_shape(
         plan.proximity.code,
         plan.proximity.mask_code,
         &members,
         plan.proximity.shared_mask_tree.leaf_class,
     )?;
+    let _profile_proximity = zkie_engine::profile::Scope::new("verify.shared.proximity");
     let proximity = proximity_verify(
         chain,
         fold,
@@ -7789,6 +7800,7 @@ fn verify_shared(
         plan.proximity.shared_mask_tree,
         plan.proximity.shared_base_positions,
     )?;
+    drop(_profile_proximity);
     if proximity.seal != messages.seal {
         return Err(Error::InvalidProof);
     }
@@ -8471,11 +8483,17 @@ fn closure_plain_rows(
         //   = -(M sum_{j>=V} c_j + sum_{j<a} c_j).
         let mut slack_coefficients = vec![Fp3::ZERO; slack_rows * slack_ell];
         let mut w_coefficients = vec![Fp3::ZERO; w_rows * w_ell];
+        let eq_diff = crate::proof::output_closure::eq_vector(
+            word.r_diff.get(..k_col).ok_or(Error::ShapeMismatch)?,
+        )?;
+        if eq_diff.len() != closure_plan.vocab {
+            return Err(Error::ShapeMismatch);
+        }
         let mut c_sum = Fp3::ZERO;
         let mut masked_sum = Fp3::ZERO;
         let mut low_sum = Fp3::ZERO;
         for column in 0..closure_plan.vocab {
-            let coefficient = eq_index(&word.r_diff, column as u64, k_col as u32)?;
+            let coefficient = eq_diff[column];
             c_sum = c_sum.add(&coefficient);
             if column >= closure_plan.valid {
                 masked_sum = masked_sum.add(&coefficient);
@@ -8499,6 +8517,12 @@ fn closure_plain_rows(
 
         // Reconstruction at one random point: u = Y + A, v = A - Y and the
         // slack bit vector equal the committed slack message.
+        let eq_recon = crate::proof::output_closure::eq_vector(
+            word.r_recon.get(..k_col).ok_or(Error::ShapeMismatch)?,
+        )?;
+        if eq_recon.len() != closure_plan.vocab {
+            return Err(Error::ShapeMismatch);
+        }
         for (which, target) in [(0u8, offset), (1u8, offset), (2u8, 0i128)] {
             let mut bit_coefficients = vec![Fp3::ZERO; bits_rows * bits_ell];
             let mut main_coefficients = if which < 2 {
@@ -8517,7 +8541,7 @@ fn closure_plain_rows(
                 closure_plan.slack_bits as usize
             };
             for column in 0..closure_plan.vocab {
-                let eq = eq_index(&word.r_recon, column as u64, k_col as u32)?;
+                let eq = eq_recon[column];
                 main_coefficients[column] = if which < 2 {
                     crate::proof::output_closure::fp3_signed(weight)?.mul(&eq)
                 } else {
@@ -8690,22 +8714,22 @@ fn own_plain_rows(
     let omega_ell =
         usize::try_from(plan.proximity.omega.u.code.ell).map_err(|_| Error::ResourceLimit)?;
     let mut rows = Vec::with_capacity(2 * plan.send.positions() as usize);
+    let eq_bits = plan.send.columns.trailing_zeros() as usize;
     for position in 0..plan.send.positions() {
         let member = bat_of
             .get(&plan.send.oracle(position)?)
             .ok_or(Error::StatementMismatch)?;
+        let point = first
+            .psi
+            .get(position as usize)
+            .and_then(|point| point.get(..eq_bits))
+            .ok_or(Error::ShapeMismatch)?;
+        let eq = crate::proof::output_closure::eq_vector(point)?;
         let mut coefficients = vec![Fp3::ZERO; w_rows * w_ell];
-        for column in 0..plan.send.columns {
-            let coefficient = eq_index(
-                &first.psi[position as usize],
-                column,
-                plan.send.columns.trailing_zeros(),
-            )?;
-            let slot = coefficients
-                .get_mut(usize::try_from(column).map_err(|_| Error::ResourceLimit)?)
-                .ok_or(Error::ShapeMismatch)?;
-            *slot = coefficient;
-        }
+        coefficients
+            .get_mut(..eq.len())
+            .ok_or(Error::ShapeMismatch)?
+            .copy_from_slice(&eq);
         let mut row = BatRow::new(BatRowKind::Plain);
         row.add_term(member.bat_oracle, BatPart::Main, coefficients);
         if let Some(index) = &plan.send.index_mask {
@@ -8727,22 +8751,18 @@ fn own_plain_rows(
             return Err(Error::ShapeMismatch);
         }
         let mask_member = bat_of.get(&index.oracle).ok_or(Error::StatementMismatch)?;
+        let eq_shared = crate::proof::output_closure::eq_vector(
+            shared_point.get(..eq_bits).ok_or(Error::ShapeMismatch)?,
+        )?;
         for position in 0..plan.send.positions() {
             let w_member = bat_of
                 .get(&plan.send.oracle(position)?)
                 .ok_or(Error::StatementMismatch)?;
             let mut coefficients = vec![Fp3::ZERO; w_rows * w_ell];
-            for column in 0..plan.send.columns {
-                let coefficient = eq_index(
-                    shared_point,
-                    column,
-                    plan.send.columns.trailing_zeros(),
-                )?;
-                let slot = coefficients
-                    .get_mut(usize::try_from(column).map_err(|_| Error::ResourceLimit)?)
-                    .ok_or(Error::ShapeMismatch)?;
-                *slot = coefficient;
-            }
+            coefficients
+                .get_mut(..eq_shared.len())
+                .ok_or(Error::ShapeMismatch)?
+                .copy_from_slice(&eq_shared);
             let mut row = BatRow::new(BatRowKind::Plain);
             row.add_term(w_member.bat_oracle, BatPart::Main, coefficients);
             let slot = index.entries.tilde_slot(position)?;
@@ -8767,6 +8787,9 @@ fn own_plain_rows(
             .get(&plan.proximity.omega.oracle)
             .ok_or(Error::StatementMismatch)?;
         let omega_len = omega_rows * omega_ell;
+        let eq_shared = crate::proof::output_closure::eq_vector(
+            shared_point.get(..eq_bits).ok_or(Error::ShapeMismatch)?,
+        )?;
         for position in 0..plan.send.positions() {
             let w_member = bat_of
                 .get(&plan.send.oracle(position)?)
@@ -8781,16 +8804,11 @@ fn own_plain_rows(
                 *slot = *weight;
             }
             let mut w_coefficients = vec![Fp3::ZERO; w_rows * w_ell];
-            for column in 0..plan.send.columns {
-                let coefficient = eq_index(
-                    shared_point,
-                    column,
-                    plan.send.columns.trailing_zeros(),
-                )?;
-                let slot = w_coefficients
-                    .get_mut(usize::try_from(column).map_err(|_| Error::ResourceLimit)?)
-                    .ok_or(Error::ShapeMismatch)?;
-                *slot = Fp3::ZERO.sub(&coefficient);
+            let span = w_coefficients
+                .get_mut(..eq_shared.len())
+                .ok_or(Error::ShapeMismatch)?;
+            for (slot, coefficient) in span.iter_mut().zip(&eq_shared) {
+                *slot = Fp3::ZERO.sub(coefficient);
             }
             let mut row = BatRow::new(BatRowKind::Plain);
             row.add_term(omega.bat_oracle, BatPart::Main, omega_coefficients);
@@ -9653,6 +9671,7 @@ fn verify_second(
     Option<DotRowBinding>,
     Option<ClosureRowBinding>,
 )> {
+    let _profile = zkie_engine::profile::Scope::new("verify.second");
     if messages.omega_root != shared.omega_root
         || messages.first_query != *first_query
         || messages.shared_seal != shared.seal
@@ -9678,8 +9697,12 @@ fn verify_second(
         }
         _ => return Err(Error::InvalidConfig),
     }
+    let _profile_members = zkie_engine::profile::Scope::new("verify.second.members");
     let (members, _order) = own_members(plan, first, shared, None, None)?;
+    drop(_profile_members);
+    let _profile_sample_rows = zkie_engine::profile::Scope::new("verify.second.sample_rows");
     let sample_rows = own_sample_rows(plan, &members, first, shared)?;
+    drop(_profile_sample_rows);
     let mut chain = second_chain(
         plan,
         reader,
@@ -9692,6 +9715,7 @@ fn verify_second(
     if !messages.tilde.is_empty() {
         absorb_tilde(&mut chain, &messages.tilde)?;
     }
+    let _profile_dot = zkie_engine::profile::Scope::new("verify.second.dot");
     let dot_binding = match &plan.send.dot {
         Some(_) => Some(verify_dot_identity(
             plan,
@@ -9701,6 +9725,8 @@ fn verify_second(
         )?),
         None => None,
     };
+    drop(_profile_dot);
+    let _profile_closure = zkie_engine::profile::Scope::new("verify.second.closure");
     let closure_binding = match (&plan.closure, &messages.closure, closure_r) {
         (Some(closure_plan), Some(closure_messages), Some(r_bool)) => {
             Some(verify_closure_second(
@@ -9713,6 +9739,8 @@ fn verify_second(
         (None, None, None) => None,
         _ => return Err(Error::ShapeMismatch),
     };
+    drop(_profile_closure);
+    let _profile_plain_rows = zkie_engine::profile::Scope::new("verify.second.plain_rows");
     let plain_rows = own_plain_rows(
         plan,
         &members,
@@ -9722,12 +9750,14 @@ fn verify_second(
         dot_binding.as_ref(),
         closure_binding.as_ref(),
     )?;
+    drop(_profile_plain_rows);
     let fold = member_fold_shape(
         plan.proximity.code,
         plan.proximity.mask_code,
         &members,
         plan.proximity.own_mask_tree.leaf_class,
     )?;
+    let _profile_proximity = zkie_engine::profile::Scope::new("verify.second.proximity");
     let proximity = proximity_verify(
         chain,
         fold,
@@ -9745,6 +9775,7 @@ fn verify_second(
         plan.proximity.own_mask_tree,
         plan.proximity.own_base_positions,
     )?;
+    drop(_profile_proximity);
     if proximity.seal != messages.seal {
         return Err(Error::InvalidProof);
     }
@@ -9874,18 +9905,26 @@ fn verify_hidden_lin_inner(
     output: Option<&[Vec<Fp3>]>,
     messages: &HiddenLinMessages,
 ) -> Result<HiddenLinOutcome> {
+    let _profile_verify = zkie_engine::profile::Scope::new("verify.hidden_lin");
     plan.validate()?;
+    let _profile_first = zkie_engine::profile::Scope::new("verify.hidden_lin.first");
     let (eval_rows, first_seal, closure_r) =
         verify_first(plan, reader, output, &messages.first)?;
+    drop(_profile_first);
     if first_seal != messages.first_seal || messages.first.chain_value != first_seal {
         return Err(Error::InvalidProof);
     }
+    let _profile_first_query = zkie_engine::profile::Scope::light("verify.hidden_lin.first_query");
     let first_query = *first_chain(plan, reader)?.value();
+    drop(_profile_first_query);
+    let _profile_shared = zkie_engine::profile::Scope::new("verify.hidden_lin.shared");
     let (shared_seal, shared_claims, points, shared_base) =
         verify_shared(plan, reader, &first_seal, &messages.shared)?;
+    drop(_profile_shared);
     if shared_seal != messages.shared.seal {
         return Err(Error::InvalidProof);
     }
+    let _profile_second = zkie_engine::profile::Scope::new("verify.hidden_lin.second");
     let (seal, own_claims, own_base, dot_binding, closure_binding) = verify_second(
         plan,
         reader,
@@ -9896,6 +9935,7 @@ fn verify_hidden_lin_inner(
         &messages.second,
         closure_r.as_deref(),
     )?;
+    drop(_profile_second);
     Ok(HiddenLinOutcome {
         activation: messages.first.activation,
         group: messages.first.group.clone(),

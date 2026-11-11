@@ -927,6 +927,7 @@ pub fn verify_output_head_lin_hidden(
     reader: &IndexReader,
     proof: &OutputHeadLinProof,
 ) -> Result<OutputHeadLinOutcome> {
+    let _profile = zkie_engine::profile::Scope::new("verify.output_head_lin_hidden");
     shape.check()?;
     trusted.output.validate(shape)?;
     if !plan.weights.is_empty() {

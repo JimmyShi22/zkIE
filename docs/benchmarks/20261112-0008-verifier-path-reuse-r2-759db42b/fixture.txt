@@ -1,0 +1,458 @@
+warning: unused variable: `target`
+   --> crates/zkie-engine/src/pcs/request/relation.rs:881:5
+    |
+881 |     target: Fp3,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `columns_usize`
+   --> crates/zkie-engine/src/pcs/request/table.rs:952:13
+    |
+952 |         let columns_usize = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_columns_usize`
+
+warning: field `target` is never read
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1110:5
+     |
+1104 | struct FoldOutputMeta {
+     |        -------------- field in this struct
+...
+1110 |     target: Fp3,
+     |     ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-engine` (lib) generated 3 warnings (run `cargo fix --lib -p zkie-engine` to apply 2 suggestions)
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/base_last_session.rs:578:13
+    |
+578 |         let mut message = self.chain.message();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `first`
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:8394:5
+     |
+8394 |     first: &HiddenSendMessages,
+     |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_first`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `plan` is never read
+   --> crates/zkie-ops/src/proof/cs_multi_session.rs:195:5
+    |
+189 | pub struct CsMultiSession {
+    |            -------------- field in this struct
+...
+195 |     plan: RuntimeTreePlan,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-ops` (lib) generated 3 warnings (run `cargo fix --lib -p zkie-ops` to apply 2 suggestions)
+warning: unused import: `zkie_engine::pcs::request::field::E_DEGREE`
+  --> models/gpt2/src/lm_head_plan.rs:11:5
+   |
+11 | use zkie_engine::pcs::request::field::E_DEGREE;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_step`
+   --> models/gpt2/src/executor.rs:346:21
+    |
+346 |             let (k, k_step) = {
+    |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_step`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `m`
+   --> models/gemma3/src/executor.rs:277:5
+    |
+277 |     m: usize,
+    |     ^ help: if this is intentional, prefix it with an underscore: `_m`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_rot_step`
+   --> models/gemma3/src/executor.rs:390:21
+    |
+390 |         let (k_rot, k_rot_step) = rope(&mut builder, k, k_step, cos_prefix.clone(), sin_prefix.clone(), m)?;
+    |                     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_rot_step`
+
+warning: `zkie-models-gpt2` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gpt2` to apply 2 suggestions)
+warning: `zkie-models-gemma3` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gemma3` to apply 2 suggestions)
+warning: unused import: `digest_to_hex`
+  --> zkie/src/policy.rs:12:58
+   |
+12 | use zkie_core::artifact::{digest_bytes, digest_from_hex, digest_to_hex};
+   |                                                          ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `VecTableSource` and `commit_table_streaming`
+  --> zkie/src/lm_head_key.rs:58:5
+   |
+58 |     commit_table_streaming, verify_columns, ColumnOpening, IndexReader, IndexShape, SampleSeed,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+59 |     EncodedRowStore, StreamingHolder, TableRowSource, VecTableSource,
+   |                                                       ^^^^^^^^^^^^^^
+
+warning: unused import: `zkie_core::common::field::PrimeCharacteristicRing`
+  --> zkie/src/lm_head_key.rs:15:5
+   |
+15 | use zkie_core::common::field::PrimeCharacteristicRing;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `mask_oracle`
+    --> zkie/src/lm_head_key.rs:3465:9
+     |
+3465 |     let mask_oracle = MaskOracle {
+     |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mask_oracle`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> zkie/src/lm_head_key.rs:4331:9
+     |
+4331 |     let mut mask_tail = vec![Fp3::ZERO; mask_tail_len];
+     |         ----^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `mask_tail`
+    --> zkie/src/lm_head_key.rs:4331:9
+     |
+4331 |     let mut mask_tail = vec![Fp3::ZERO; mask_tail_len];
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mask_tail`
+
+warning: variable does not need to be mutable
+   --> zkie/src/lm_head_stage.rs:288:9
+    |
+288 |     let mut options = if private {
+    |         ----^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: field `tree` is never read
+    --> zkie/src/lm_head_key.rs:1534:5
+     |
+1530 | pub struct LmHeadOmegaProvider {
+     |            ------------------- field in this struct
+...
+1534 |     tree: RuntimeTreePlan,
+     |     ^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie` (lib) generated 8 warnings (run `cargo fix --lib -p zkie` to apply 6 suggestions)
+warning: value assigned to `hidden_witness` is never read
+    --> zkie/tests/lin_session.rs:2241:9
+     |
+2241 |         hidden_witness = None;
+     |         ^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie` (test "lin_session") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.02s
+     Running tests/lin_session.rs (target/release/deps/lin_session-951d599c581fbfea)
+
+running 1 test
+table_root=Digest([148, 228, 18, 92, 159, 9, 235, 1, 142, 70, 95, 7, 171, 134, 119, 36, 68, 154, 52, 186, 184, 27, 87, 156, 197, 93, 34, 5, 64, 158, 198, 32])
+table_configuration=Digest([180, 94, 164, 247, 112, 238, 158, 61, 81, 31, 160, 72, 176, 98, 98, 175, 194, 254, 212, 79, 91, 67, 103, 212, 93, 18, 105, 88, 173, 10, 55, 228])
+table_record_digest=Digest([36, 38, 230, 57, 231, 65, 175, 140, 75, 91, 42, 73, 167, 56, 10, 209, 58, 205, 0, 227, 94, 110, 44, 23, 231, 207, 94, 170, 205, 34, 32, 7])
+table_commit_ms=30083
+trace_verify_ms=16561
+test selected_gpt2_output_head_request_session has been running for over 60 seconds
+output_head_step=4444
+request_proof_bytes=8982616
+prove_ms=16959
+prepared_verify_ms=7862
+verify_ms=23496
+manifest_total_bytes=4170807683
+manifest_request_bytes=8982616
+total_verification_bytes=4170765190
+hidden_profile_begin
+hidden_profile_segment name=table.open wall_ms=29.185 calls=1 bytes=0 table_bytes=0 rss_start_kb=4280000 rss_end_kb=4345632 hwm_kb=4345632 threads=2
+hidden_profile_segment name=code.encode_row_fp wall_ms=4766.540 calls=2048 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=table.commit.encode_rows wall_ms=5130.755 calls=1 bytes=0 table_bytes=268435456 rss_start_kb=4346208 rss_end_kb=4871244 hwm_kb=4875016 threads=2
+hidden_profile_segment name=table.commit.store_finish wall_ms=1468.982 calls=1 bytes=0 table_bytes=0 rss_start_kb=4871244 rss_end_kb=4871244 hwm_kb=4875016 threads=2
+hidden_profile_segment name=table.commit.leaves wall_ms=2456.488 calls=1 bytes=0 table_bytes=0 rss_start_kb=4904020 rss_end_kb=4908116 hwm_kb=4908116 threads=2
+hidden_profile_segment name=table.commit.merkle wall_ms=29.073 calls=1 bytes=0 table_bytes=0 rss_start_kb=4908116 rss_end_kb=4915932 hwm_kb=4915932 threads=2
+hidden_profile_segment name=table.commit.record wall_ms=20902.208 calls=1 bytes=0 table_bytes=0 rss_start_kb=4915932 rss_end_kb=4915932 hwm_kb=4915932 threads=2
+hidden_profile_segment name=table.commit wall_ms=29999.556 calls=1 bytes=0 table_bytes=268435456 rss_start_kb=4345636 rss_end_kb=4892276 hwm_kb=4924068 threads=2
+hidden_profile_segment name=harness.trace_verify wall_ms=16561.610 calls=1 bytes=0 table_bytes=0 rss_start_kb=4436472 rss_end_kb=4525736 hwm_kb=5568712 threads=66
+hidden_profile_segment name=session.w_commit_randomness wall_ms=979.466 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=first.derive_w_rows wall_ms=1155.909 calls=1 bytes=0 table_bytes=268435456 rss_start_kb=4693604 rss_end_kb=5243448 hwm_kb=5568712 threads=66
+hidden_profile_segment name=code.encode_row_fp3 wall_ms=819.969 calls=71 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=runtime_tree.commit wall_ms=1913.204 calls=23 bytes=0 table_bytes=0 rss_start_kb=5255424 rss_end_kb=9747396 hwm_kb=9747396 threads=66
+hidden_profile_segment name=first.commit_w_rows wall_ms=1909.317 calls=1 bytes=0 table_bytes=0 rss_start_kb=5243448 rss_end_kb=5904400 hwm_kb=5904400 threads=66
+hidden_profile_segment name=first.witness_check wall_ms=138.736 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=first.w_answers wall_ms=110.440 calls=1 bytes=0 table_bytes=0 rss_start_kb=5913744 rss_end_kb=5918736 hwm_kb=6052468 threads=66
+hidden_profile_segment name=first.w_openings wall_ms=0.395 calls=1 bytes=0 table_bytes=0 rss_start_kb=5918736 rss_end_kb=5918756 hwm_kb=6052468 threads=66
+hidden_profile_segment name=first.eval_targets wall_ms=619.608 calls=1 bytes=0 table_bytes=0 rss_start_kb=5918756 rss_end_kb=5918756 hwm_kb=6052468 threads=66
+hidden_profile_segment name=first.prove_first wall_ms=3936.406 calls=1 bytes=0 table_bytes=268435456 rss_start_kb=4693504 rss_end_kb=5918756 hwm_kb=6052468 threads=66
+hidden_profile_segment name=shared.fold_table wall_ms=608.191 calls=1 bytes=0 table_bytes=0 rss_start_kb=5918756 rss_end_kb=5918756 hwm_kb=6052468 threads=66
+hidden_profile_segment name=shared.gu_table wall_ms=1.721 calls=1 bytes=0 table_bytes=0 rss_start_kb=5918756 rss_end_kb=5918756 hwm_kb=6052468 threads=66
+hidden_profile_segment name=commit_rows_tree.encode wall_ms=53.845 calls=3 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=shared.gu_commit wall_ms=106.108 calls=1 bytes=0 table_bytes=0 rss_start_kb=5918756 rss_end_kb=5939236 hwm_kb=6052468 threads=66
+hidden_profile_segment name=shared.table_open_columns wall_ms=2226.645 calls=1 bytes=0 table_bytes=0 rss_start_kb=5943332 rss_end_kb=5943332 hwm_kb=6052468 threads=66
+hidden_profile_segment name=shared.column_rows wall_ms=3945.572 calls=1 bytes=0 table_bytes=0 rss_start_kb=5943332 rss_end_kb=7553160 hwm_kb=7553160 threads=66
+hidden_profile_segment name=shared.omega_vector wall_ms=7.985 calls=1 bytes=0 table_bytes=0 rss_start_kb=7553160 rss_end_kb=7553160 hwm_kb=7553160 threads=66
+hidden_profile_segment name=shared.omega_commit wall_ms=98.605 calls=1 bytes=0 table_bytes=0 rss_start_kb=7561396 rss_end_kb=7590584 hwm_kb=7590584 threads=66
+hidden_profile_segment name=shared.plain_rows wall_ms=744.333 calls=1 bytes=0 table_bytes=0 rss_start_kb=7603640 rss_end_kb=9460012 hwm_kb=9460012 threads=66
+hidden_profile_segment name=prox.bat wall_ms=2796.179 calls=2 bytes=0 table_bytes=0 rss_start_kb=9460020 rss_end_kb=9649048 hwm_kb=9649048 threads=66
+hidden_profile_segment name=prox.group_tables wall_ms=14.961 calls=2 bytes=0 table_bytes=0 rss_start_kb=9470772 rss_end_kb=9747392 hwm_kb=9747392 threads=66
+hidden_profile_segment name=mask_tree.commit wall_ms=336.107 calls=4 bytes=0 table_bytes=0 rss_start_kb=9470776 rss_end_kb=9747396 hwm_kb=9747396 threads=66
+hidden_profile_segment name=prox.fold_start wall_ms=275.631 calls=2 bytes=0 table_bytes=0 rss_start_kb=9470772 rss_end_kb=9747392 hwm_kb=9747392 threads=66
+hidden_profile_segment name=prox.fold_rounds wall_ms=142.101 calls=2 bytes=0 table_bytes=0 rss_start_kb=9470776 rss_end_kb=9747392 hwm_kb=9747392 threads=66
+hidden_profile_segment name=prox.fold_output wall_ms=7.924 calls=2 bytes=0 table_bytes=0 rss_start_kb=9470776 rss_end_kb=9747392 hwm_kb=9747392 threads=66
+hidden_profile_segment name=prox.base_prover wall_ms=407.803 calls=2 bytes=0 table_bytes=0 rss_start_kb=9470776 rss_end_kb=9747392 hwm_kb=9747392 threads=66
+hidden_profile_segment name=prox.base_openings wall_ms=262.168 calls=2 bytes=0 table_bytes=0 rss_start_kb=9470776 rss_end_kb=9747396 hwm_kb=9747396 threads=66
+hidden_profile_segment name=prox.base_finish wall_ms=58.840 calls=2 bytes=0 table_bytes=0 rss_start_kb=9470780 rss_end_kb=9747396 hwm_kb=9747396 threads=66
+hidden_profile_segment name=prox.proximity_prove wall_ms=4031.201 calls=2 bytes=0 table_bytes=0 rss_start_kb=9460020 rss_end_kb=9550780 hwm_kb=9742144 threads=66
+hidden_profile_segment name=shared.proximity wall_ms=3278.570 calls=1 bytes=0 table_bytes=0 rss_start_kb=9460012 rss_end_kb=9470780 hwm_kb=9470780 threads=66
+hidden_profile_segment name=shared.prove_shared wall_ms=11159.329 calls=1 bytes=0 table_bytes=0 rss_start_kb=5918756 rss_end_kb=9470780 hwm_kb=9470780 threads=66
+hidden_profile_segment name=second.own_members wall_ms=6.180 calls=1 bytes=0 table_bytes=0 rss_start_kb=9470780 rss_end_kb=9470780 hwm_kb=9470780 threads=66
+hidden_profile_segment name=second.tilde wall_ms=0.000 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=second.sample_rows wall_ms=31.261 calls=1 bytes=0 table_bytes=0 rss_start_kb=9470780 rss_end_kb=9550648 hwm_kb=9550648 threads=66
+hidden_profile_segment name=second.plain_rows wall_ms=36.095 calls=1 bytes=0 table_bytes=0 rss_start_kb=9550648 rss_end_kb=9550648 hwm_kb=9550648 threads=66
+hidden_profile_segment name=witness_tree.omega wall_ms=94.030 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=second.proximity wall_ms=761.996 calls=1 bytes=0 table_bytes=0 rss_start_kb=9550648 rss_end_kb=9550780 hwm_kb=9742144 threads=66
+hidden_profile_segment name=second.prove_second wall_ms=835.689 calls=1 bytes=0 table_bytes=0 rss_start_kb=9470780 rss_end_kb=9550780 hwm_kb=9742144 threads=66
+hidden_profile_segment name=session.prove_hidden_lin_inner wall_ms=16956.060 calls=1 bytes=0 table_bytes=268435456 rss_start_kb=4525872 rss_end_kb=9550780 hwm_kb=9742144 threads=66
+hidden_profile_segment name=harness.diagnostic_prove wall_ms=16959.322 calls=1 bytes=0 table_bytes=268435456 rss_start_kb=4525816 rss_end_kb=9550780 hwm_kb=9742144 threads=66
+hidden_profile_segment name=verify.first.openings wall_ms=1.482 calls=6 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=verify.first wall_ms=3344.891 calls=8 bytes=0 table_bytes=0 rss_start_kb=9550780 rss_end_kb=11895132 hwm_kb=13684748 threads=66
+hidden_profile_segment name=verify.hidden_lin.first wall_ms=3345.156 calls=8 bytes=0 table_bytes=0 rss_start_kb=9550780 rss_end_kb=11895132 hwm_kb=13684748 threads=66
+hidden_profile_segment name=verify.hidden_lin.first_query wall_ms=2.888 calls=5 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=verify.shared.columns wall_ms=44.492 calls=4 bytes=0 table_bytes=0 rss_start_kb=9550780 rss_end_kb=11895132 hwm_kb=13684748 threads=66
+hidden_profile_segment name=verify.shared.record_rows wall_ms=82.633 calls=4 bytes=0 table_bytes=0 rss_start_kb=9550780 rss_end_kb=11895132 hwm_kb=13684748 threads=66
+hidden_profile_segment name=verify.shared.column_rows wall_ms=14875.162 calls=4 bytes=0 table_bytes=0 rss_start_kb=9550780 rss_end_kb=11895132 hwm_kb=13684748 threads=66
+hidden_profile_segment name=verify.shared.plain_rows wall_ms=2587.909 calls=4 bytes=0 table_bytes=0 rss_start_kb=9550780 rss_end_kb=13351352 hwm_kb=13684748 threads=66
+hidden_profile_segment name=verify.proximity.statement wall_ms=54.110 calls=8 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=verify.proximity.bat wall_ms=11889.611 calls=8 bytes=0 table_bytes=0 rss_start_kb=9550780 rss_end_kb=13360568 hwm_kb=13684748 threads=66
+hidden_profile_segment name=verify.proximity.fold wall_ms=108.831 calls=8 bytes=0 table_bytes=0 rss_start_kb=9550780 rss_end_kb=13360568 hwm_kb=13684748 threads=66
+hidden_profile_segment name=verify.proximity.base wall_ms=248.887 calls=7 bytes=0 table_bytes=0 rss_start_kb=9550780 rss_end_kb=13360568 hwm_kb=13684748 threads=66
+hidden_profile_segment name=verify.proximity wall_ms=12403.734 calls=8 bytes=0 table_bytes=0 rss_start_kb=9550780 rss_end_kb=11916652 hwm_kb=13684748 threads=66
+hidden_profile_segment name=verify.shared.proximity wall_ms=12086.381 calls=4 bytes=0 table_bytes=0 rss_start_kb=9550780 rss_end_kb=11895132 hwm_kb=13684748 threads=66
+hidden_profile_segment name=verify.shared wall_ms=29714.098 calls=5 bytes=0 table_bytes=0 rss_start_kb=9550780 rss_end_kb=11895132 hwm_kb=13684748 threads=66
+hidden_profile_segment name=verify.hidden_lin.shared wall_ms=29714.223 calls=5 bytes=0 table_bytes=0 rss_start_kb=9550780 rss_end_kb=11895132 hwm_kb=13684748 threads=66
+hidden_profile_segment name=verify.second.members wall_ms=0.019 calls=4 bytes=0 table_bytes=0 rss_start_kb=9550780 rss_end_kb=11895132 hwm_kb=13684748 threads=66
+hidden_profile_segment name=verify.second.sample_rows wall_ms=114.171 calls=4 bytes=0 table_bytes=0 rss_start_kb=9550780 rss_end_kb=11916636 hwm_kb=13684748 threads=66
+hidden_profile_segment name=verify.second.dot wall_ms=0.000 calls=4 bytes=0 table_bytes=0 rss_start_kb=9563072 rss_end_kb=11916636 hwm_kb=13684748 threads=66
+hidden_profile_segment name=verify.second.closure wall_ms=0.000 calls=4 bytes=0 table_bytes=0 rss_start_kb=9563072 rss_end_kb=11916636 hwm_kb=13684748 threads=66
+hidden_profile_segment name=verify.second.plain_rows wall_ms=145.535 calls=4 bytes=0 table_bytes=0 rss_start_kb=9563072 rss_end_kb=11916636 hwm_kb=13684748 threads=66
+hidden_profile_segment name=verify.second.proximity wall_ms=319.508 calls=4 bytes=0 table_bytes=0 rss_start_kb=9563072 rss_end_kb=11916652 hwm_kb=13684748 threads=66
+hidden_profile_segment name=verify.second wall_ms=579.964 calls=4 bytes=0 table_bytes=0 rss_start_kb=9550780 rss_end_kb=11916652 hwm_kb=13684748 threads=66
+hidden_profile_segment name=verify.hidden_lin.second wall_ms=580.040 calls=4 bytes=0 table_bytes=0 rss_start_kb=9550780 rss_end_kb=11916652 hwm_kb=13684748 threads=66
+hidden_profile_segment name=verify.hidden_lin wall_ms=33642.762 calls=8 bytes=0 table_bytes=0 rss_start_kb=9550780 rss_end_kb=11916652 hwm_kb=13684748 threads=66
+hidden_profile_segment name=harness.diagnostic_verify_prepared wall_ms=7862.336 calls=1 bytes=0 table_bytes=0 rss_start_kb=9550780 rss_end_kb=9563164 hwm_kb=9754428 threads=66
+hidden_profile_segment name=harness.diagnostic_verify_bytes wall_ms=23496.012 calls=1 bytes=0 table_bytes=0 rss_start_kb=9563164 rss_end_kb=9624316 hwm_kb=11331496 threads=66
+hidden_profile_end
+output_abs_max=622653884972
+output_slack_max=2143462175194
+closure_range_bits=40 closure_slack_bits=42
+ledger_events=143
+ledger_logical_openings=887
+ledger_unique_positions=887
+ledger_table_logical=603
+ledger_table_unique=603
+ledger_activation_openings=0
+ledger_activation_rows=16
+ledger_closure_logical=196
+ledger_pre_closure_logical=691
+ledger_pre_closure_unique=691
+ledger_table_reuse=0
+hidden_prove_ms=355184
+hidden_proof_bytes=9939144
+hidden_profile_begin
+hidden_profile_segment name=harness.formal_table_open wall_ms=11.407 calls=1 bytes=0 table_bytes=0 rss_start_kb=11916652 rss_end_kb=11654508 hwm_kb=13684748 threads=66
+hidden_profile_segment name=activation.commit_signed wall_ms=0.598 calls=1 bytes=0 table_bytes=0 rss_start_kb=11654508 rss_end_kb=11654508 hwm_kb=13684748 threads=66
+hidden_profile_segment name=plan.hidden_plan wall_ms=0.048 calls=1 bytes=0 table_bytes=0 rss_start_kb=11654508 rss_end_kb=11654508 hwm_kb=13684748 threads=66
+hidden_profile_segment name=session.w_commit_randomness wall_ms=16607.819 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=first.derive_w_rows wall_ms=1219.277 calls=1 bytes=0 table_bytes=268435456 rss_start_kb=11851300 rss_end_kb=12401100 hwm_kb=13684748 threads=66
+hidden_profile_segment name=code.encode_row_fp3 wall_ms=110224.389 calls=8305 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=runtime_tree.commit wall_ms=61721.252 calls=86 bytes=0 table_bytes=0 rss_start_kb=12413068 rss_end_kb=137723444 hwm_kb=169393348 threads=66
+hidden_profile_segment name=first.commit_w_rows wall_ms=2066.169 calls=1 bytes=0 table_bytes=0 rss_start_kb=12401100 rss_end_kb=13071308 hwm_kb=13684748 threads=66
+hidden_profile_segment name=commit_rows_tree.encode wall_ms=121.058 calls=8 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=first.commit_dot_map wall_ms=211.987 calls=1 bytes=0 table_bytes=0 rss_start_kb=13071308 rss_end_kb=13134484 hwm_kb=13684748 threads=66
+hidden_profile_segment name=closure.values_from_rows wall_ms=871.171 calls=1 bytes=0 table_bytes=0 rss_start_kb=13134484 rss_end_kb=16280276 hwm_kb=16280276 threads=66
+hidden_profile_segment name=first.closure_values wall_ms=871.236 calls=1 bytes=0 table_bytes=0 rss_start_kb=13134484 rss_end_kb=16280276 hwm_kb=16280276 threads=66
+hidden_profile_segment name=value_group.layout wall_ms=2966.397 calls=48 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=value_group.encode wall_ms=109331.642 calls=48 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=value_group.commit wall_ms=170919.034 calls=3 bytes=0 table_bytes=0 rss_start_kb=16280276 rss_end_kb=61368168 hwm_kb=61368168 threads=66
+hidden_profile_segment name=first.closure_slack_commit wall_ms=1757.666 calls=1 bytes=0 table_bytes=0 rss_start_kb=16280276 rss_end_kb=16767088 hwm_kb=16767088 threads=66
+hidden_profile_segment name=first.closure_bits_commit wall_ms=84551.883 calls=1 bytes=0 table_bytes=0 rss_start_kb=16767088 rss_end_kb=36782812 hwm_kb=36782812 threads=66
+hidden_profile_segment name=first.closure_mask_commit wall_ms=98.193 calls=1 bytes=0 table_bytes=0 rss_start_kb=36782812 rss_end_kb=36782812 hwm_kb=36782812 threads=66
+hidden_profile_segment name=first.closure_mask_entries wall_ms=0.018 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=first.witness_check wall_ms=350.642 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=first.w_answers wall_ms=107.465 calls=1 bytes=0 table_bytes=0 rss_start_kb=38218908 rss_end_kb=38218908 hwm_kb=38218908 threads=66
+hidden_profile_segment name=first.closure_answers wall_ms=23966.489 calls=1 bytes=0 table_bytes=0 rss_start_kb=38218908 rss_end_kb=38218908 hwm_kb=39197424 threads=66
+hidden_profile_segment name=first.closure_map_values wall_ms=165.870 calls=1 bytes=0 table_bytes=0 rss_start_kb=38218908 rss_end_kb=41562288 hwm_kb=41562288 threads=66
+hidden_profile_segment name=first.closure_map_commit wall_ms=84609.563 calls=1 bytes=0 table_bytes=0 rss_start_kb=41562288 rss_end_kb=61368168 hwm_kb=61368168 threads=66
+hidden_profile_segment name=first.closure_map_answers wall_ms=23866.668 calls=1 bytes=0 table_bytes=0 rss_start_kb=61368168 rss_end_kb=61368168 hwm_kb=62348524 threads=66
+hidden_profile_segment name=first.closure_check wall_ms=2585.316 calls=1 bytes=0 table_bytes=0 rss_start_kb=61368168 rss_end_kb=66911936 hwm_kb=66911936 threads=66
+hidden_profile_segment name=first.index_mask_openings wall_ms=92.984 calls=1 bytes=0 table_bytes=0 rss_start_kb=66715324 rss_end_kb=66715324 hwm_kb=66909744 threads=66
+hidden_profile_segment name=first.w_openings wall_ms=0.346 calls=1 bytes=0 table_bytes=0 rss_start_kb=66715324 rss_end_kb=66715324 hwm_kb=66909744 threads=66
+hidden_profile_segment name=first.closure_slack_openings wall_ms=0.333 calls=1 bytes=0 table_bytes=0 rss_start_kb=66715324 rss_end_kb=66715332 hwm_kb=66909744 threads=66
+hidden_profile_segment name=first.closure_bits_openings wall_ms=0.304 calls=1 bytes=0 table_bytes=0 rss_start_kb=66715332 rss_end_kb=66715424 hwm_kb=66909744 threads=66
+hidden_profile_segment name=first.closure_mask_openings wall_ms=100.014 calls=1 bytes=0 table_bytes=0 rss_start_kb=66715424 rss_end_kb=66715424 hwm_kb=66909744 threads=66
+hidden_profile_segment name=first.closure_map_openings wall_ms=0.320 calls=1 bytes=0 table_bytes=0 rss_start_kb=66715424 rss_end_kb=66715480 hwm_kb=66909744 threads=66
+hidden_profile_segment name=first.closure_openings wall_ms=101.139 calls=1 bytes=0 table_bytes=0 rss_start_kb=66715324 rss_end_kb=66715480 hwm_kb=66909744 threads=66
+hidden_profile_segment name=first.eval_targets wall_ms=619.019 calls=1 bytes=0 table_bytes=0 rss_start_kb=66715480 rss_end_kb=66715480 hwm_kb=66909744 threads=66
+hidden_profile_segment name=first.prove_first wall_ms=227699.524 calls=1 bytes=0 table_bytes=268435456 rss_start_kb=11851200 rss_end_kb=66715480 hwm_kb=66909744 threads=66
+hidden_profile_segment name=shared.fold_table wall_ms=611.039 calls=1 bytes=0 table_bytes=0 rss_start_kb=66715480 rss_end_kb=66715480 hwm_kb=66909744 threads=66
+hidden_profile_segment name=shared.gu_table wall_ms=1.686 calls=1 bytes=0 table_bytes=0 rss_start_kb=66715480 rss_end_kb=66715480 hwm_kb=66909744 threads=66
+hidden_profile_segment name=shared.gu_commit wall_ms=109.165 calls=1 bytes=0 table_bytes=0 rss_start_kb=66715480 rss_end_kb=66715480 hwm_kb=66909744 threads=66
+hidden_profile_segment name=code.encode_row_fp wall_ms=2088.478 calls=1024 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=shared.table_open_columns wall_ms=2223.320 calls=1 bytes=0 table_bytes=0 rss_start_kb=66715480 rss_end_kb=66715480 hwm_kb=66909744 threads=66
+hidden_profile_segment name=shared.column_rows wall_ms=3679.763 calls=1 bytes=0 table_bytes=0 rss_start_kb=66715480 rss_end_kb=66715480 hwm_kb=66909744 threads=66
+hidden_profile_segment name=shared.omega_vector wall_ms=7.987 calls=1 bytes=0 table_bytes=0 rss_start_kb=66715480 rss_end_kb=66715480 hwm_kb=66909744 threads=66
+hidden_profile_segment name=shared.omega_commit wall_ms=90.294 calls=1 bytes=0 table_bytes=0 rss_start_kb=66715480 rss_end_kb=66715480 hwm_kb=66909744 threads=66
+hidden_profile_segment name=shared.plain_rows wall_ms=443.180 calls=1 bytes=0 table_bytes=0 rss_start_kb=66715480 rss_end_kb=66715480 hwm_kb=66909744 threads=66
+hidden_profile_segment name=prox.bat wall_ms=14333.848 calls=2 bytes=0 table_bytes=0 rss_start_kb=66715484 rss_end_kb=112359752 hwm_kb=169393348 threads=66
+hidden_profile_segment name=prox.group_tables wall_ms=3477.863 calls=2 bytes=0 table_bytes=0 rss_start_kb=66715484 rss_end_kb=137525580 hwm_kb=169393348 threads=66
+hidden_profile_segment name=mask_tree.commit wall_ms=455.540 calls=4 bytes=0 table_bytes=0 rss_start_kb=66715484 rss_end_kb=137723444 hwm_kb=169393348 threads=66
+hidden_profile_segment name=prox.fold_start wall_ms=339.005 calls=2 bytes=0 table_bytes=0 rss_start_kb=66715484 rss_end_kb=137536812 hwm_kb=169393348 threads=66
+hidden_profile_segment name=prox.fold_rounds wall_ms=30903.057 calls=2 bytes=0 table_bytes=0 rss_start_kb=66715484 rss_end_kb=137536812 hwm_kb=169393348 threads=66
+hidden_profile_segment name=prox.fold_output wall_ms=635.758 calls=2 bytes=0 table_bytes=0 rss_start_kb=66715484 rss_end_kb=137536812 hwm_kb=169393348 threads=66
+hidden_profile_segment name=prox.base_prover wall_ms=461.123 calls=2 bytes=0 table_bytes=0 rss_start_kb=66715484 rss_end_kb=137723276 hwm_kb=169393348 threads=66
+hidden_profile_segment name=prox.base_openings wall_ms=596.192 calls=2 bytes=0 table_bytes=0 rss_start_kb=66715484 rss_end_kb=137723444 hwm_kb=169393348 threads=66
+hidden_profile_segment name=prox.base_finish wall_ms=58.944 calls=2 bytes=0 table_bytes=0 rss_start_kb=66715484 rss_end_kb=137723444 hwm_kb=169393348 threads=66
+hidden_profile_segment name=prox.proximity_prove wall_ms=50999.114 calls=2 bytes=0 table_bytes=0 rss_start_kb=66715480 rss_end_kb=87327192 hwm_kb=169393348 threads=66
+hidden_profile_segment name=shared.proximity wall_ms=3246.229 calls=1 bytes=0 table_bytes=0 rss_start_kb=66715480 rss_end_kb=66715484 hwm_kb=66909744 threads=66
+hidden_profile_segment name=shared.prove_shared wall_ms=10547.862 calls=1 bytes=0 table_bytes=0 rss_start_kb=66715480 rss_end_kb=66715484 hwm_kb=66909744 threads=66
+hidden_profile_segment name=second.own_members wall_ms=4305.822 calls=1 bytes=0 table_bytes=0 rss_start_kb=66715484 rss_end_kb=74411732 hwm_kb=74411732 threads=66
+hidden_profile_segment name=second.tilde wall_ms=311.609 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=psc.product_new wall_ms=1108.215 calls=17 bytes=0 table_bytes=0 rss_start_kb=74411732 rss_end_kb=75222576 hwm_kb=75222576 threads=66
+hidden_profile_segment name=psc.hiding_new wall_ms=0.434 calls=17 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=psc.product_round wall_ms=9892.514 calls=378 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=psc.hiding_round wall_ms=0.313 calls=378 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=psc.bind wall_ms=3720.740 calls=378 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=psc.end wall_ms=0.222 calls=17 bytes=0 table_bytes=0 rss_start_kb=74411732 rss_end_kb=75222576 hwm_kb=75222576 threads=66
+hidden_profile_segment name=psc.prove_dot_sumcheck wall_ms=14742.751 calls=17 bytes=0 table_bytes=0 rss_start_kb=74411732 rss_end_kb=74829352 hwm_kb=75220068 threads=66
+hidden_profile_segment name=second.dot_identity wall_ms=0.498 calls=1 bytes=0 table_bytes=0 rss_start_kb=74411732 rss_end_kb=74411732 hwm_kb=74411732 threads=66
+hidden_profile_segment name=second.closure_psc_position wall_ms=23821.186 calls=16 bytes=0 table_bytes=0 rss_start_kb=74632728 rss_end_kb=74632740 hwm_kb=75220068 threads=66
+hidden_profile_segment name=second.closure_psc wall_ms=23883.518 calls=1 bytes=0 table_bytes=0 rss_start_kb=74411732 rss_end_kb=74436128 hwm_kb=75220068 threads=66
+hidden_profile_segment name=second.sample_rows wall_ms=10321.753 calls=1 bytes=0 table_bytes=0 rss_start_kb=74436128 rss_end_kb=87145772 hwm_kb=89492856 threads=66
+hidden_profile_segment name=second.plain_rows wall_ms=13512.596 calls=1 bytes=0 table_bytes=0 rss_start_kb=87145772 rss_end_kb=131554072 hwm_kb=132140992 threads=66
+hidden_profile_segment name=witness_tree.dot wall_ms=89.983 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=witness_tree.omega wall_ms=94.313 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=witness_tree.mask wall_ms=89.007 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=witness_tree.index_mask wall_ms=89.957 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=second.proximity wall_ms=47762.484 calls=1 bytes=0 table_bytes=0 rss_start_kb=131554072 rss_end_kb=87327192 hwm_kb=169393348 threads=66
+hidden_profile_segment name=second.prove_second wall_ms=100098.631 calls=1 bytes=0 table_bytes=0 rss_start_kb=66715484 rss_end_kb=87327192 hwm_kb=169393348 threads=66
+hidden_profile_segment name=session.prove_hidden_lin_inner wall_ms=355162.349 calls=1 bytes=0 table_bytes=268435456 rss_start_kb=11654508 rss_end_kb=74596684 hwm_kb=169393348 threads=66
+hidden_profile_segment name=post.witness_output_rows wall_ms=6.470 calls=1 bytes=0 table_bytes=0 rss_start_kb=74596684 rss_end_kb=74596684 hwm_kb=169393348 threads=66
+hidden_profile_segment name=post.close_output_relation wall_ms=14.579 calls=1 bytes=0 table_bytes=0 rss_start_kb=74596684 rss_end_kb=74596684 hwm_kb=169393348 threads=66
+hidden_profile_segment name=total.prove_output_head_lin_hidden wall_ms=355184.526 calls=1 bytes=0 table_bytes=268435456 rss_start_kb=11654508 rss_end_kb=74596684 hwm_kb=169393348 threads=66
+hidden_profile_segment name=harness.hidden_proof_encode wall_ms=9.094 calls=1 bytes=9939144 table_bytes=0 rss_start_kb=74596684 rss_end_kb=74596684 hwm_kb=169393348 threads=66
+hidden_profile_end
+hidden_verify_ms=50453
+hidden_own_fold_rounds=14
+formal_manifest_total_bytes=4171764211
+hidden_profile_begin
+hidden_profile_segment name=harness.verify_setup wall_ms=0.080 calls=1 bytes=0 table_bytes=0 rss_start_kb=67174512 rss_end_kb=67174512 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.first.openings wall_ms=1.476 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=verify.first wall_ms=298.971 calls=1 bytes=0 table_bytes=0 rss_start_kb=67174512 rss_end_kb=67174512 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.hidden_lin.first wall_ms=299.034 calls=1 bytes=0 table_bytes=0 rss_start_kb=67174512 rss_end_kb=67174512 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.hidden_lin.first_query wall_ms=0.028 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=verify.shared.columns wall_ms=11.637 calls=1 bytes=0 table_bytes=0 rss_start_kb=67174512 rss_end_kb=67174512 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.shared.record_rows wall_ms=20.802 calls=1 bytes=0 table_bytes=0 rss_start_kb=67174512 rss_end_kb=67174512 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.shared.column_rows wall_ms=3660.506 calls=1 bytes=0 table_bytes=0 rss_start_kb=67174512 rss_end_kb=67174512 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.shared.plain_rows wall_ms=469.175 calls=1 bytes=0 table_bytes=0 rss_start_kb=67174512 rss_end_kb=67174512 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.proximity.statement wall_ms=7253.252 calls=2 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=verify.proximity.bat wall_ms=6709.994 calls=2 bytes=0 table_bytes=0 rss_start_kb=67174512 rss_end_kb=105027960 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.proximity.fold wall_ms=8042.631 calls=2 bytes=0 table_bytes=0 rss_start_kb=67174512 rss_end_kb=130193788 hwm_kb=169393348 threads=66
+hidden_profile_segment name=code.encode_row_fp3 wall_ms=57.982 calls=6 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=verify.proximity.base wall_ms=77.303 calls=2 bytes=0 table_bytes=0 rss_start_kb=67174512 rss_end_kb=130193788 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.proximity wall_ms=22189.134 calls=2 bytes=0 table_bytes=0 rss_start_kb=67174512 rss_end_kb=79862132 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.shared.proximity wall_ms=2623.512 calls=1 bytes=0 table_bytes=0 rss_start_kb=67174512 rss_end_kb=67174512 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.shared wall_ms=6794.584 calls=1 bytes=0 table_bytes=0 rss_start_kb=67174512 rss_end_kb=67174512 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.hidden_lin.shared wall_ms=6794.627 calls=1 bytes=0 table_bytes=0 rss_start_kb=67174512 rss_end_kb=67174512 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.second.members wall_ms=0.033 calls=1 bytes=0 table_bytes=0 rss_start_kb=67174512 rss_end_kb=67174512 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.second.sample_rows wall_ms=10363.326 calls=1 bytes=0 table_bytes=0 rss_start_kb=67174512 rss_end_kb=79862088 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.second.dot wall_ms=0.033 calls=1 bytes=0 table_bytes=0 rss_start_kb=79862088 rss_end_kb=79862088 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.second.closure wall_ms=0.548 calls=1 bytes=0 table_bytes=0 rss_start_kb=79862088 rss_end_kb=79862088 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.second.plain_rows wall_ms=13423.820 calls=1 bytes=0 table_bytes=0 rss_start_kb=79862088 rss_end_kb=123902772 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.second.proximity wall_ms=19566.332 calls=1 bytes=0 table_bytes=0 rss_start_kb=123902772 rss_end_kb=79862132 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.second wall_ms=43354.433 calls=1 bytes=0 table_bytes=0 rss_start_kb=67174512 rss_end_kb=79862132 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.hidden_lin.second wall_ms=43354.454 calls=1 bytes=0 table_bytes=0 rss_start_kb=67174512 rss_end_kb=79862132 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.hidden_lin wall_ms=50448.229 calls=1 bytes=0 table_bytes=0 rss_start_kb=67174512 rss_end_kb=79862132 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.output_head_lin_hidden wall_ms=50453.204 calls=1 bytes=0 table_bytes=0 rss_start_kb=67174512 rss_end_kb=79862132 hwm_kb=169393348 threads=66
+hidden_profile_segment name=harness.hidden_verify wall_ms=50453.266 calls=1 bytes=0 table_bytes=0 rss_start_kb=67174512 rss_end_kb=79862132 hwm_kb=169393348 threads=66
+hidden_profile_segment name=harness.ledger_checks wall_ms=3.862 calls=1 bytes=0 table_bytes=0 rss_start_kb=79862132 rss_end_kb=79862132 hwm_kb=169393348 threads=66
+hidden_profile_end
+hidden_profile_begin
+hidden_profile_segment name=verify.output_head_lin_hidden wall_ms=100921.077 calls=10 bytes=0 table_bytes=0 rss_start_kb=67279092 rss_end_kb=67349224 hwm_kb=169393348 threads=66
+hidden_profile_segment name=harness.negative_proof_clone wall_ms=10.366 calls=8 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=verify.first.openings wall_ms=2.972 calls=2 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=verify.first wall_ms=597.625 calls=9 bytes=0 table_bytes=0 rss_start_kb=67279092 rss_end_kb=67349224 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.hidden_lin.first wall_ms=597.858 calls=9 bytes=0 table_bytes=0 rss_start_kb=67279092 rss_end_kb=67349224 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.hidden_lin.first_query wall_ms=0.045 calls=2 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=verify.shared.columns wall_ms=22.937 calls=2 bytes=0 table_bytes=0 rss_start_kb=67279092 rss_end_kb=67327768 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.shared.record_rows wall_ms=41.548 calls=2 bytes=0 table_bytes=0 rss_start_kb=67279092 rss_end_kb=67327768 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.shared.column_rows wall_ms=7305.768 calls=2 bytes=0 table_bytes=0 rss_start_kb=67279092 rss_end_kb=67327768 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.shared.plain_rows wall_ms=915.120 calls=2 bytes=0 table_bytes=0 rss_start_kb=67279092 rss_end_kb=67327768 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.proximity.statement wall_ms=14561.517 calls=4 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=verify.proximity.bat wall_ms=13403.140 calls=4 bytes=0 table_bytes=0 rss_start_kb=67279092 rss_end_kb=105098092 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.proximity.fold wall_ms=16069.903 calls=4 bytes=0 table_bytes=0 rss_start_kb=67279092 rss_end_kb=130263920 hwm_kb=169393348 threads=66
+hidden_profile_segment name=code.encode_row_fp3 wall_ms=58.049 calls=6 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=verify.proximity.base wall_ms=74.335 calls=4 bytes=0 table_bytes=0 rss_start_kb=67279092 rss_end_kb=130263920 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.proximity wall_ms=44320.938 calls=4 bytes=0 table_bytes=0 rss_start_kb=67279092 rss_end_kb=79932264 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.shared.proximity wall_ms=5219.014 calls=2 bytes=0 table_bytes=0 rss_start_kb=67279092 rss_end_kb=67327768 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.shared wall_ms=13522.137 calls=2 bytes=0 table_bytes=0 rss_start_kb=67279092 rss_end_kb=67327768 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.hidden_lin.shared wall_ms=13522.248 calls=2 bytes=0 table_bytes=0 rss_start_kb=67279092 rss_end_kb=67327768 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.second.members wall_ms=0.035 calls=2 bytes=0 table_bytes=0 rss_start_kb=67279092 rss_end_kb=67327768 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.second.sample_rows wall_ms=20772.918 calls=2 bytes=0 table_bytes=0 rss_start_kb=67279092 rss_end_kb=79932256 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.second.dot wall_ms=0.053 calls=2 bytes=0 table_bytes=0 rss_start_kb=79910784 rss_end_kb=79932256 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.second.closure wall_ms=0.933 calls=2 bytes=0 table_bytes=0 rss_start_kb=79910784 rss_end_kb=79932256 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.second.plain_rows wall_ms=26856.636 calls=2 bytes=0 table_bytes=0 rss_start_kb=79910784 rss_end_kb=123972904 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.second.proximity wall_ms=39103.290 calls=2 bytes=0 table_bytes=0 rss_start_kb=123951448 rss_end_kb=79932264 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.second wall_ms=86799.333 calls=2 bytes=0 table_bytes=0 rss_start_kb=67279092 rss_end_kb=67349224 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.hidden_lin.second wall_ms=86799.510 calls=2 bytes=0 table_bytes=0 rss_start_kb=67279092 rss_end_kb=67349224 hwm_kb=169393348 threads=66
+hidden_profile_segment name=verify.hidden_lin wall_ms=100920.195 calls=9 bytes=0 table_bytes=0 rss_start_kb=67279092 rss_end_kb=67349224 hwm_kb=169393348 threads=66
+hidden_profile_segment name=harness.negative_closure wall_ms=100931.623 calls=1 bytes=0 table_bytes=0 rss_start_kb=67279092 rss_end_kb=67349224 hwm_kb=169393348 threads=66
+hidden_profile_segment name=harness.negative_wrong_plan wall_ms=0.182 calls=1 bytes=0 table_bytes=0 rss_start_kb=67349224 rss_end_kb=67349224 hwm_kb=169393348 threads=66
+hidden_profile_segment name=harness.negative_encoding wall_ms=6.918 calls=1 bytes=0 table_bytes=0 rss_start_kb=67349224 rss_end_kb=67349224 hwm_kb=169393348 threads=66
+hidden_profile_segment name=harness.verify_negatives wall_ms=100938.810 calls=1 bytes=0 table_bytes=0 rss_start_kb=67279092 rss_end_kb=67349224 hwm_kb=169393348 threads=66
+hidden_profile_end
+test selected_gpt2_output_head_request_session ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 641.20s
+
+	Command being timed: "env ZKIE_SESSION_FIXTURE=/data/lin-fixture ZKIE_SESSION_FORMAL=1 ZKIE_PROFILE_HIDDEN=1 ZKIE_SESSION_PROOF_DUMP=/tmp/p24-after2-hidden.bin cargo test --release -p zkie --test lin_session selected_gpt2_output_head_request_session -- --ignored --nocapture"
+	User time (seconds): 1564.88
+	System time (seconds): 178.00
+	Percent of CPU this job got: 271%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 10:42.68
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 169393348
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 17676839
+	Voluntary context switches: 764495
+	Involuntary context switches: 134458
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 110920
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+EXIT=0
+f8f512c0e67407210f19dd92d038fd4c71a6bac3a12e1166cd4825d9413215f5  /tmp/p24-after2-hidden.bin
+proof_bytes=9939144

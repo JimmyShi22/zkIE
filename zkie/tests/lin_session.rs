@@ -930,9 +930,11 @@ fn selected_gpt2_output_head_request_session() {
     };
 
     // X and Y come only from the verified trace outputs.
+    let _profile_trace = zkie_engine::profile::Scope::new("harness.trace_verify");
     let started = Instant::now();
     let outputs = verify_shared_trace_outputs(&public, &trace, &trace.tokens, &plan).unwrap();
     println!("trace_verify_ms={}", started.elapsed().as_millis());
+    drop(_profile_trace);
     let request = prepare_output_head_trace(&public, &plan, &trace, &outputs, shape).unwrap();
     let claims = output_head_claims(shape, &request.inputs, &[]).unwrap();
     assert_eq!(request.inputs.activation.len(), OUTPUT_HEAD_POSITIONS * OUTPUT_HEAD_HIDDEN);
@@ -999,10 +1001,12 @@ fn selected_gpt2_output_head_request_session() {
     // pre-closure row count.
     let mut diagnostic_setup = setup.clone();
     diagnostic_setup.proximity.own_mask_tree.mask_rows = 2;
+    let _profile_prove = zkie_engine::profile::Scope::new("harness.diagnostic_prove");
     let started = Instant::now();
     let (proof, witness) =
         prove_output_head_lin_prepared(&request, shape, &diagnostic_setup, &mut table).unwrap();
     let prove_ms = started.elapsed().as_millis();
+    drop(_profile_prove);
     let bytes = proof.encode().unwrap();
     assert_eq!(bytes.len(), proof.encoded_len().unwrap());
     println!("output_head_step={}", step.step);
@@ -1013,6 +1017,7 @@ fn selected_gpt2_output_head_request_session() {
     verifier_setup.expected_activation_root = Some(proof.session.first.activation.root);
     verifier_setup.expected_roots = Some(witness.send.roots.clone());
 
+    let _profile_prepared = zkie_engine::profile::Scope::new("harness.diagnostic_verify_prepared");
     let started = Instant::now();
     let prepared = verify_output_head_lin_prepared(
         &request,
@@ -1023,6 +1028,7 @@ fn selected_gpt2_output_head_request_session() {
     )
     .unwrap();
     println!("prepared_verify_ms={}", started.elapsed().as_millis());
+    drop(_profile_prepared);
     assert_eq!(prepared.proof_bytes, bytes.len());
     assert_eq!(prepared.outcome.eval_rows.len(), OUTPUT_HEAD_POSITIONS);
     assert!(prepared.outcome.shared_base.fold_main);
@@ -1032,6 +1038,7 @@ fn selected_gpt2_output_head_request_session() {
 
     // The byte-level entry reruns the trace check and decodes the canonical
     // request encoding against the same merged plan.
+    let _profile_bytes = zkie_engine::profile::Scope::new("harness.diagnostic_verify_bytes");
     let started = Instant::now();
     let outcome = verify_output_head_lin_request_bytes(
         &public,
@@ -1046,6 +1053,7 @@ fn selected_gpt2_output_head_request_session() {
     .unwrap();
     let verify_ms = started.elapsed().as_millis();
     println!("verify_ms={verify_ms}");
+    drop(_profile_bytes);
     assert_eq!(outcome.proof_bytes, bytes.len());
     assert_eq!(outcome.outcome.eval_rows.len(), OUTPUT_HEAD_POSITIONS);
     assert_eq!(outcome.outcome.first_seal, prepared.outcome.first_seal);
@@ -1634,6 +1642,7 @@ fn selected_gpt2_output_head_request_session() {
             &setup.activation_salts,
         )
         .unwrap();
+        let mut hidden_witness = Some(hidden_witness);
         let hidden_prove_ms = started.elapsed().as_millis();
         let first = &hidden_proof.session.first;
         let first_closure = first
@@ -1651,7 +1660,15 @@ fn selected_gpt2_output_head_request_session() {
 
         for (position, oracle) in weight_oracles.iter().enumerate() {
             ledger
-                .bind_commitment(request_id, *oracle, hidden_witness.send.roots[position])
+                .bind_commitment(
+                    request_id,
+                    *oracle,
+                    hidden_witness
+                        .as_ref()
+                        .expect("the hidden witness is alive before the verifier")
+                        .send
+                        .roots[position],
+                )
                 .expect("bind a W commitment");
         }
         ledger
@@ -2094,6 +2111,7 @@ fn selected_gpt2_output_head_request_session() {
         println!("hidden_proof_bytes={hidden_proof_bytes}");
         drop(hidden_encode_profile);
         zkie_engine::profile::dump();
+        zkie_engine::profile::reset();
         assert_eq!(closure.argmax, output_plan.expected_argmax);
         let trace_output_rows: Vec<Vec<i64>> = (0..OUTPUT_HEAD_POSITIONS)
             .map(|position| {
@@ -2103,13 +2121,27 @@ fn selected_gpt2_output_head_request_session() {
             })
             .collect();
         assert_eq!(
-            zkie_ops::proof::output_head_lin::witness_output_rows(&hidden_witness).unwrap(),
+            zkie_ops::proof::output_head_lin::witness_output_rows(
+                hidden_witness
+                    .as_ref()
+                    .expect("the hidden witness is alive before the verifier"),
+            )
+            .unwrap(),
             trace_output_rows
         );
+        // The prover witness holds the retained runtime trees and value rows;
+        // the verifier path does not read it, so release it before verifying.
+        // The optional agreement check below needs it only when enabled.
+        if env::var_os("ZKIE_SESSION_WITNESS").is_none() {
+            hidden_witness = None;
+        }
         let mut hidden_setup = setup.clone();
         hidden_setup.send.expected_dot_root = Some(dot_message.root);
+        let _profile_verify_setup = zkie_engine::profile::Scope::new("harness.verify_setup");
         let hidden_plan =
             build_output_head_hidden_plan(shape, &hidden_setup, &table.reader(), &trusted).unwrap();
+        drop(_profile_verify_setup);
+        let _profile_hidden_verify = zkie_engine::profile::Scope::new("harness.hidden_verify");
         let started = Instant::now();
         let hidden_outcome = verify_output_head_lin_hidden(
             shape,
@@ -2120,6 +2152,8 @@ fn selected_gpt2_output_head_request_session() {
         )
         .unwrap();
         println!("hidden_verify_ms={}", started.elapsed().as_millis());
+        drop(_profile_hidden_verify);
+        let _profile_ledger_checks = zkie_engine::profile::Scope::new("harness.ledger_checks");
         ledger
             .mark_verified(request_id)
             .expect("the complete verification accepted");
@@ -2169,6 +2203,7 @@ fn selected_gpt2_output_head_request_session() {
                 .unwrap_err(),
             zkie_core::error::Error::StateRollbackSuspected
         );
+        drop(_profile_ledger_checks);
 
         println!(
             "hidden_own_fold_rounds={}",
@@ -2184,7 +2219,9 @@ fn selected_gpt2_output_head_request_session() {
             zkie_ops::proof::hidden_send_session::verify_hidden_lin_witness_agreement(
                 &hidden_plan,
                 &hidden_proof.session,
-                &hidden_witness,
+                hidden_witness
+                    .as_ref()
+                    .expect("the witness agreement check requires the witness"),
                 &hidden_outcome.outcome,
             )
             .unwrap();
@@ -2201,6 +2238,7 @@ fn selected_gpt2_output_head_request_session() {
                 hidden_proof.session.second.residual
             );
         }
+        hidden_witness = None;
         // The formal manifest binds the hidden proof, not the diagnostic
         // request. The diagnostic byte count stays a separate diagnostic
         // figure; the formal total is trace + hidden proof + public.
@@ -2247,7 +2285,18 @@ fn selected_gpt2_output_head_request_session() {
         fs::write(&hidden_path, &hidden_bytes).expect("restore hidden request");
         assert_eq!(hidden_outcome.outcome.eval_rows.len(), OUTPUT_HEAD_POSITIONS);
         assert_eq!(hidden_proof.session.first.activation, trusted.activation);
+        // The verifier outcome carries the reconstructed claim rows; the
+        // negative section replays the verifier from the proof alone.
+        drop(hidden_outcome);
+        drop(hidden_proof_encoded);
 
+        zkie_engine::profile::dump();
+        zkie_engine::profile::reset();
+        let _profile_negatives = zkie_engine::profile::Scope::new("harness.verify_negatives");
+        let clone_proof = |proof: &OutputHeadLinProof| {
+            let _profile = zkie_engine::profile::Scope::light("harness.negative_proof_clone");
+            proof.clone()
+        };
         // A changed activation commitment against the policy pin is rejected.
         let mut changed_trusted = trusted.clone();
         changed_trusted.activation.root.0[0] ^= 1;
@@ -2273,7 +2322,9 @@ fn selected_gpt2_output_head_request_session() {
             )
             .is_err()
         };
-        let mut tampered = hidden_proof.clone();
+        let _profile_closure_negatives =
+            zkie_engine::profile::Scope::new("harness.negative_closure");
+        let mut tampered = clone_proof(&hidden_proof);
         tampered
             .session
             .second
@@ -2284,11 +2335,11 @@ fn selected_gpt2_output_head_request_session() {
             .rounds[0]
             .coefficients[0] = Fp3::from_u64(1);
         assert!(reject(&tampered));
-        let mut tampered = hidden_proof.clone();
+        let mut tampered = clone_proof(&hidden_proof);
         tampered.session.second.closure.as_mut().unwrap().point_values[0][1] =
             Fp3::from_u64(1);
         assert!(reject(&tampered));
-        let mut tampered = hidden_proof.clone();
+        let mut tampered = clone_proof(&hidden_proof);
         tampered
             .session
             .first
@@ -2301,7 +2352,7 @@ fn selected_gpt2_output_head_request_session() {
             .root
             .0[0] ^= 1;
         assert!(reject(&tampered));
-        let mut tampered = hidden_proof.clone();
+        let mut tampered = clone_proof(&hidden_proof);
         tampered
             .session
             .first
@@ -2314,7 +2365,7 @@ fn selected_gpt2_output_head_request_session() {
             .root
             .0[0] ^= 1;
         assert!(reject(&tampered));
-        let mut tampered = hidden_proof.clone();
+        let mut tampered = clone_proof(&hidden_proof);
         tampered
             .session
             .first
@@ -2327,19 +2378,21 @@ fn selected_gpt2_output_head_request_session() {
             .root
             .0[0] ^= 1;
         assert!(reject(&tampered));
-        let mut tampered = hidden_proof.clone();
+        let mut tampered = clone_proof(&hidden_proof);
         tampered.session.first.closure.as_mut().unwrap().mask.root.0[0] ^= 1;
         assert!(reject(&tampered));
-        let mut tampered = hidden_proof.clone();
+        let mut tampered = clone_proof(&hidden_proof);
         tampered.session.first.closure.as_mut().unwrap().slack_sample.answers[0] =
             Fp3::from_u64(1);
         assert!(reject(&tampered));
-        let mut missing = hidden_proof.clone();
+        let mut missing = clone_proof(&hidden_proof);
         missing.session.first.closure = None;
         assert!(reject(&missing));
+        drop(_profile_closure_negatives);
 
         // A different trusted public winner changes the closure plan and the
         // comparison rows.
+        let _profile_wrong_plan = zkie_engine::profile::Scope::new("harness.negative_wrong_plan");
         let mut wrong_output = output_plan.clone();
         wrong_output.expected_argmax[0] =
             (wrong_output.expected_argmax[0] + 1) % wrong_output.valid as u32;
@@ -2362,15 +2415,20 @@ fn selected_gpt2_output_head_request_session() {
             &hidden_proof
         )
         .is_err());
+        drop(_profile_wrong_plan);
 
         // The canonical hidden encoding rejects a trailing byte and a
         // truncated tail against the closure-bearing plan.
+        let _profile_encoding = zkie_engine::profile::Scope::new("harness.negative_encoding");
         let mut trailing = hidden_bytes.clone();
         trailing.push(0);
         assert!(OutputHeadLinProof::decode(&hidden_plan, &trailing).is_err());
         let mut truncated = hidden_bytes.clone();
         truncated.truncate(truncated.len() - 1);
         assert!(OutputHeadLinProof::decode(&hidden_plan, &truncated).is_err());
+        drop(_profile_encoding);
+        drop(_profile_negatives);
+        zkie_engine::profile::dump();
     }
 
     fs::remove_dir_all(&link_dir).ok();

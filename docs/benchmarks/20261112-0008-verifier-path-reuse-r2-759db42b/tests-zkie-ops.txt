@@ -1,0 +1,319 @@
+warning: unused variable: `target`
+   --> crates/zkie-engine/src/pcs/request/relation.rs:881:5
+    |
+881 |     target: Fp3,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `columns_usize`
+   --> crates/zkie-engine/src/pcs/request/table.rs:952:13
+    |
+952 |         let columns_usize = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_columns_usize`
+
+warning: field `target` is never read
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1110:5
+     |
+1104 | struct FoldOutputMeta {
+     |        -------------- field in this struct
+...
+1110 |     target: Fp3,
+     |     ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-engine` (lib) generated 3 warnings (run `cargo fix --lib -p zkie-engine` to apply 2 suggestions)
+   Compiling zkie-ops v0.1.0 (/data/zkIE/crates/zkie-ops)
+warning: unused import: `ClosurePlan`
+    --> crates/zkie-ops/src/proof/output_head_lin.rs:1567:57
+     |
+1567 |     use crate::proof::output_closure::{ClosureMaskPlan, ClosurePlan};
+     |                                                         ^^^^^^^^^^^
+     |
+     = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `PrimeField64`
+    --> crates/zkie-ops/src/proof/output_head_lin.rs:1574:61
+     |
+1574 |     use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
+     |                                                             ^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/base_last_session.rs:578:13
+    |
+578 |         let mut message = self.chain.message();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `first`
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:8394:5
+     |
+8394 |     first: &HiddenSendMessages,
+     |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_first`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `plan` is never read
+   --> crates/zkie-ops/src/proof/cs_multi_session.rs:195:5
+    |
+189 | pub struct CsMultiSession {
+    |            -------------- field in this struct
+...
+195 |     plan: RuntimeTreePlan,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-ops` (lib) generated 3 warnings (run `cargo fix --lib -p zkie-ops` to apply 2 suggestions)
+warning: unused variable: `oracle`
+   --> crates/zkie-ops/tests/relation_openings.rs:252:10
+    |
+252 |     let (oracle, openings) =
+    |          ^^^^^^ help: if this is intentional, prefix it with an underscore: `_oracle`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-ops` (test "relation_openings") generated 1 warning (run `cargo fix --test "relation_openings" -p zkie-ops` to apply 1 suggestion)
+warning: `zkie-ops` (lib test) generated 5 warnings (3 duplicates) (run `cargo fix --lib -p zkie-ops --tests` to apply 2 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.15s
+     Running unittests src/lib.rs (target/debug/deps/zkie_ops-d20b4f9af95f6295)
+
+running 183 tests
+test proof::base_last_session::tests::the_fixed_seed_is_reproducible_and_the_private_source_is_available ... ok
+test proof::base_last_session::tests::the_last_base_rejects_an_unsupported_layout ... ok
+test proof::base_last_session::tests::the_last_base_rejects_a_second_masking_oracle ... ok
+test proof::base_last_session::tests::the_last_base_rejects_a_shifted_target_star ... ok
+test proof::base_last_session::tests::the_last_base_rejects_a_wrong_claim_target ... ok
+test proof::base_last_session::tests::the_last_base_accepts_an_honest_run_and_seals ... ok
+test proof::base_last_session::tests::the_last_base_rejects_messages_out_of_order ... ok
+test proof::base_last_session::tests::the_last_base_rejects_a_wrong_star_root ... ok
+test proof::base_last_session::tests::the_last_base_rejects_tampered_masked_rows ... ok
+test proof::base_last_session::tests::the_last_base_rejects_a_wrong_final_root ... ok
+test proof::base_last_session::tests::the_last_base_proof_rejects_a_tampered_masked_row ... ok
+test proof::base_last_session::tests::the_last_base_rejects_tampered_final_symbols ... ok
+test proof::base_last_session::tests::the_last_base_rejects_tampered_star_symbols ... ok
+test proof::base_last_session::tests::the_last_base_proof_decodes_to_the_same_seal_and_rejects_leftovers ... ok
+test proof::column_session::tests::asset_root_tamper_is_rejected_before_the_table_is_used ... ok
+test proof::edge_session::tests::edge_value_comparison_is_exact_and_shaped ... ok
+test proof::edge_session::tests::previous_and_asset_edges_have_distinct_semantics ... ok
+test proof::fold_handoff::tests::mapping_enters_claim_and_target_and_keeps_identity_separate ... ok
+test proof::fold_handoff::tests::identity_or_kept_mismatch_is_rejected_at_the_handoff ... ok
+test proof::fold_handoff::tests::no_output_obtains_a_valid_handoff ... ok
+test proof::fold_handoff::tests::shape_mismatch_or_truncation_is_rejected ... ok
+test proof::group_row_session::tests::order_violation_is_rejected_at_the_transcript_layer ... ok
+test proof::gu_combine_session::tests::a_closed_group_rejects_replacement ... ok
+test proof::gu_combine_session::tests::a_wrong_declaration_is_still_pending ... ok
+test proof::gu_combine_session::tests::bat_combines_the_frozen_declarations ... ok
+test proof::group_row_session::tests::component_order_and_fold_output_are_consistent ... ok
+test proof::group_row_session::tests::verifier_plan_shape_and_configuration_are_checked ... ok
+test proof::cs_multi_session::tests::the_switch_session_accepts_honest_openings ... ok
+test proof::group_row_session::tests::source_components_and_fixed_randomness_are_separate ... ok
+test proof::cs_multi_session::tests::the_switch_session_rejects_a_wrong_fresh_root ... ok
+test proof::cs_multi_session::tests::the_switch_session_rejects_a_wrong_member_root ... ok
+test proof::gu_combine_session::tests::bat_chain_transfer_requires_a_completed_run ... ok
+test proof::gu_combine_session::tests::shape_mismatch_is_rejected_at_the_adapter ... ok
+test proof::gu_combine_session::tests::challenge_prefix_change_propagates_to_x_on_a_fixed_sample ... ok
+test proof::cs_multi_session::tests::the_switch_session_rejects_a_tree_old_mask_under_a_member_source ... ok
+test proof::group_row_session::tests::independent_reconstruction_rejects_a_valid_recommitment_mismatch ... ok
+test proof::gu_combine_session::tests::declaration_values_change_the_combination_not_the_challenge ... ok
+test proof::bat_fold_session::tests::a_frozen_group_rejects_replacement ... ok
+test proof::bat_fold_session::tests::order_violations_are_rejected ... ok
+test proof::group_commitment_session::tests::order_and_plan_faults_fail_closed ... ok
+test proof::cs_multi_session::tests::the_switch_session_rejects_a_tampered_member_opening ... ok
+test proof::group_commitment_session::tests::send_order_rejects_early_positions_wrong_oracle_and_extra_answers ... ok
+test proof::cs_multi_session::tests::the_switch_session_rejects_a_tampered_fresh_opening ... ok
+test proof::bat_fold_session::tests::the_fixture_group_is_native_and_the_witness_is_committed ... ok
+test proof::hidden_send_session::merged_tests::public_mask_view_rank_leaves_the_expected_kernel ... ok
+test proof::group_commitment_session::tests::roots_seeds_answers_and_openings_follow_the_chain_order ... ok
+test proof::group_commitment_session::tests::pad_changes_root_and_answer_under_a_fixed_seed ... ok
+test proof::group_row_session::tests::input_parts_change_their_own_layer_and_tails_are_not_folded ... ok
+test proof::bat_fold_session::tests::wrong_shape_code_and_row_are_rejected ... ok
+test proof::bat_fold_session::tests::a_wrong_declaration_remains_pending_after_fold ... ok
+test proof::hidden_send_session::merged_tests::proximity_tail_union_is_enforced_by_the_plan ... ok
+test proof::hidden_send_session::tests::full_matrix_w_shape_fits_the_large_message ... ok
+test proof::group_commitment_session::tests::wrong_order_metadata_and_replaced_roots_are_rejected ... ok
+test proof::bat_fold_session::tests::a_well_formed_wrong_answer_stays_pending_after_fold ... ok
+test proof::group_commitment_session::tests::independent_reencoding_matches_every_member_root_and_layout ... ok
+test proof::bat_fold_session::tests::truncated_or_overlong_answer_lists_are_rejected ... ok
+test proof::bat_fold_session::tests::the_bat_row_enters_fold_unchanged_and_the_run_is_pending ... ok
+test proof::bat_fold_session::tests::the_base_final_wiring_passes_but_stays_pending ... ok
+test proof::bat_fold_session::tests::group_commitment_is_per_oracle_and_fixture_only ... ok
+test proof::bat_fold_session::tests::a_wrong_upstream_answer_is_rejected_at_base ... ok
+test proof::output_closure::tests::closure_values_decompose_an_honest_row ... ok
+test proof::bat_fold_session::tests::wrong_oracle_and_root_are_rejected_before_epsilon ... ok
+test proof::output_closure::tests::closure_values_reject_out_of_range_cells ... ok
+test proof::output_closure::tests::eq_vector_matches_the_product_formula ... ok
+test proof::bat_fold_session::tests::a_fixed_base_target_shift_is_rejected_at_the_target_layer ... ok
+test proof::output_closure::tests::map_values_are_eq_times_bits_and_booleanity_sum_holds ... ok
+test proof::output_closure::tests::multilinear_evaluation_matches_the_eq_dot_product ... ok
+test proof::lin_session::tests::wrong_table_opening_is_rejected_through_the_request_path ... ok
+test proof::column_session::tests::full_table_comparison_detects_a_wrong_opened_cell ... ok
+test proof::lin_session::tests::request_is_deterministic_for_the_same_inputs ... ok
+test proof::column_session::tests::path_valid_but_wrong_merge_is_seen_by_the_target_control ... ok
+test proof::bat_fold_session::tests::the_same_fixture_replays_with_another_chain ... ok
+test proof::bat_fold_session::tests::unsupported_switch_shapes_fail_closed ... ok
+test proof::hidden_send_session::tests::derived_rows_follow_the_matrix_mapping ... ok
+test proof::hidden_send_session::tests::changed_seed_or_position_is_rejected ... ok
+test proof::hidden_send_session::tests::changed_encoded_table_identity_is_rejected ... ok
+test proof::lin_session::tests::request_prover_and_verifier_agree_on_all_three_stages ... ok
+test proof::lin_session::tests::changed_target_or_mask_is_rejected ... ok
+test proof::lin_session::tests::stage_order_is_rejected ... ok
+test proof::hidden_send_session::tests::honest_run_registers_samples_and_eval_rows ... ok
+test proof::proximity_session::tests::a_missing_message_never_completes_the_component ... ok
+test proof::group_commitment_session::tests::changed_rows_tails_and_openings_fail_the_opening_check ... ok
+test proof::hidden_send_session::tests::changed_activation_commitment_or_value_is_rejected ... ok
+test proof::lin_session::tests::changed_seals_and_first_query_are_rejected ... ok
+test proof::hidden_send_session::tests::changed_eval_target_or_chain_value_is_rejected ... ok
+test proof::column_session::tests::session_passes_all_four_component_layers_and_records_three_roots ... ok
+test proof::hidden_send_session::tests::changed_sample_answer_is_rejected_by_the_witness_check ... ok
+test proof::column_session::tests::gu_registration_rejects_a_wrong_oracle_or_group ... ok
+test proof::proximity_session::tests::challenge_order_is_fixed ... ok
+test proof::lin_session::tests::changed_weights_are_rejected ... ok
+test proof::column_session::tests::fold_component_checks_the_public_row_and_stops_at_the_closed_boundary ... ok
+test proof::lin_session::tests::table_opening_root_row_and_path_are_checked ... ok
+test proof::column_session::tests::changed_gu_message_changes_the_query_transcript_and_order ... ok
+test proof::proximity_session::tests::opening_tampering_is_rejected_before_any_relation_check ... ok
+test proof::column_session::tests::column_path_tamper_is_rejected_by_authentication ... ok
+test proof::proximity_session::tests::cs_output_replacement_with_a_valid_commitment_is_rejected ... ok
+test proof::proximity_session::tests::a_consistent_replaced_switched_message_is_caught_by_base_symbols ... ok
+test proof::plan::tests::cache_keys_select_only_reused_sources ... ok
+test proof::plan::tests::head_concat_rejects_mismatched_part_lengths ... ok
+test proof::hidden_send_session::tests::missing_sample_is_rejected ... ok
+test proof::hidden_send_session::tests::wrong_row_or_root_is_rejected ... ok
+test proof::hidden_send_session::tests::canonical_messages_round_trip_and_reject_tampering ... ok
+test proof::lin_session::tests::changed_w_is_rejected ... ok
+test proof::hidden_send_session::tests::x_commitment_is_hiding_and_bound ... ok
+test proof::proximity_session::tests::component_chain_is_deterministic_and_verified ... ok
+test proof::lin_session::tests::changed_folded_is_rejected ... ok
+test proof::bat_fold_session::tests::the_fold_cs_base_chain_passes_but_stays_pending ... ok
+test proof::lin_session::tests::changed_points_are_rejected ... ok
+test proof::lin_session::tests::canonical_encoding_round_trips_and_rejects_trailing_bytes ... ok
+test proof::proximity_session::tests::decision_inputs_are_bound_in_the_prefix ... ok
+test proof::proximity_session::tests::plan_or_statement_shape_mismatch_fails_closed ... ok
+test proof::lin_session::tests::changed_omega_is_rejected ... ok
+test proof::proximity_session::tests::public_booleans_alone_do_not_form_the_component ... ok
+test proof::psc::tests::interpolation_matches_the_three_nodes ... ok
+test proof::psc::tests::hiding_polynomial_matches_its_definition ... ok
+test proof::psc::tests::summand_constants_match_the_specification ... ok
+test proof::psc::tests::rejects_short_mask_entries ... ok
+test proof::psc::tests::rejects_malformed_round_lists ... ok
+test proof::psc::tests::rejects_changed_witness_vectors ... ok
+test proof::psc::tests::rejects_wrong_challenge_order ... ok
+test proof::psc::tests::rejects_wrong_target_and_scaled_target ... ok
+test proof::psc::tests::weights_follow_the_plain_and_at_zero_functionals ... ok
+test proof::psc::tests::hand_k2_matches_independent_evaluation ... ok
+test proof::column_session::tests::fixed_fixture_is_reproducible ... ok
+test proof::psc::tests::every_sent_value_is_absorbed_before_its_challenge ... ok
+test proof::psc::tests::accepts_cancellation_and_zero_sums ... ok
+test proof::session_baseline::tests::changing_an_absorbed_asset_value_changes_the_words ... ok
+test proof::psc::tests::psc_accepts_chi_batched_positions ... ok
+test proof::send_session::tests::a_forged_relation_with_the_same_root_is_rejected ... ok
+test proof::psc::tests::psc_accepts_honest_proof_k2 ... ok
+test proof::psc::tests::hand_k3_matches_independent_evaluation ... ok
+test proof::bat_fold_session::tests::altered_send_answer_and_fresh_block_are_rejected_after_registration ... ok
+test proof::psc::tests::rejects_changed_messages ... ok
+test proof::proximity_session::tests::wrong_commitment_is_rejected_at_the_commitment_check ... ok
+test proof::session_baseline::tests::prover_and_verifier_derive_the_same_challenge ... ok
+test proof::proximity_session::tests::valid_commitment_with_a_wrong_statement_is_rejected_at_the_relation_check ... ok
+test proof::proximity_session::tests::valid_commitment_with_a_wrong_prover_message_is_rejected ... ok
+test proof::psc::tests::production_hiding_coefficient_map_is_full_rank ... ok
+test proof::session_baseline::tests::binding_assembly_outputs_are_used ... ok
+test proof::session_baseline::tests::authenticated_wrong_asset_value_is_rejected ... ok
+test proof::session_baseline::tests::changing_an_absorbed_input_value_changes_the_words ... ok
+test proof::session_baseline::tests::forged_asset_meta_root_is_rejected_before_use ... ok
+test proof::session_baseline::tests::forged_trusted_anchor_identity_is_rejected ... ok
+test proof::session_baseline::tests::positive_selected_matmul_step_verifies ... ok
+test proof::bat_fold_session::tests::replaced_folded_rows_are_rejected_at_the_named_layer ... ok
+test proof::psc::tests::control_1024_matches_direct_inner_product ... ok
+test proof::session_baseline::tests::rounded_output_mismatch_is_rejected ... ok
+test proof::session_baseline::tests::malformed_plan_dimensions_are_rejected ... ok
+test proof::session_baseline::tests::authenticated_wrong_input_or_output_or_raw_is_rejected ... ok
+test proof::session_baseline::tests::plan_port_asset_and_root_tampering_is_rejected ... ok
+test proof::session_baseline::tests::opening_position_and_malformed_shapes_are_rejected ... ok
+test proof::session_baseline::tests::any_opening_position_is_checked ... ok
+test proof::bat_fold_session::tests::replaced_identity_layout_and_commitments_fail_closed ... ok
+test proof::bat_fold_session::tests::replaced_cs_inputs_fail_closed ... ok
+test proof::hidden_send_session::merged_tests::column_budget_is_enforced ... ok
+test proof::hidden_send_session::merged_tests::changed_table_root_or_record_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::changed_output_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::missing_stage_or_seal_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::merged_toy_run_accepts ... ok
+test proof::hidden_send_session::merged_tests::changed_activation_commitment_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::hidden_dot_residual_encoding_is_canonical ... ok
+test proof::hidden_send_session::merged_tests::hidden_masked_eval_and_dot_rows_are_bound ... ok
+test proof::hidden_send_session::merged_tests::hidden_dot_residual_is_independent_and_batched ... ok
+test proof::hidden_send_session::merged_tests::hidden_dot_changed_mask_entries_are_rejected_by_the_plaintext_check ... ok
+test proof::hidden_send_session::merged_tests::hidden_input_mode_accepts_without_output_rows ... ok
+test proof::hidden_send_session::merged_tests::mask_slot_schema_is_separate_and_one_time ... ok
+test proof::hidden_send_session::merged_tests::changed_w_root_or_row_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::changed_column_position_or_nonce_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::changed_plan_or_statement_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::changed_second_values_are_rejected ... ok
+test proof::hidden_send_session::merged_tests::changed_shared_values_are_rejected ... ok
+test proof::hidden_send_session::merged_tests::hidden_dot_residual_negatives_reach_the_verifier ... ok
+test proof::hidden_send_session::merged_tests::hidden_masked_negatives_reach_the_final_verifier ... ok
+test proof::output_head_lin::tests::forged_mask_and_argmax_tie_are_rejected ... ok
+test proof::output_head_lin::tests::changed_activation_or_output_is_rejected ... ok
+test proof::output_head_lin::tests::signed_encoding_and_masked_overflow_are_rejected ... ok
+test proof::output_head_lin::tests::closure_tail_union_is_enforced_by_the_plan ... ok
+test proof::output_head_lin::tests::changed_roots_or_plan_are_rejected ... ok
+test proof::output_head_lin::tests::changed_or_missing_proof_stage_is_rejected ... ok
+test proof::output_head_lin::tests::merged_request_accepts_and_round_trips ... ok
+test proof::hidden_send_session::merged_tests::hidden_dot_row_negatives_reach_the_final_verifier ... ok
+test proof::output_head_lin::tests::arbitrary_activation_is_rejected_by_the_policy_pin ... ok
+test proof::output_head_lin::tests::hidden_formal_closure_accepts_and_rejects_tampering ... ok
+
+test result: ok. 183 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.21s
+
+     Running tests/anchor_check.rs (target/debug/deps/anchor_check-caf28f694e3a6b03)
+
+running 2 tests
+test positive_anchor_and_negative_mutations ... ok
+test opening_structure_is_checked ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/plan_check.rs (target/debug/deps/plan_check-3943ead61eabf449)
+
+running 8 tests
+test negative_wrong_asset ... ok
+test negative_external_and_missing_ports ... ok
+test negative_cross_step_edge_with_equal_values ... ok
+test negative_final_output ... ok
+test negative_slice ... ok
+test negative_external_opening_must_cover_the_full_asset ... ok
+test positive_and_missing_extra_reorder ... ok
+test negative_sources_and_argmax ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/relation_openings.rs (target/debug/deps/relation_openings-6b99078b27fefaef)
+
+running 13 tests
+test profile_rms_norm_square_overflow_is_rejected ... ok
+test profile_layer_norm_variance_overflow_is_rejected ... ok
+test layout_lengths_must_match_the_grid ... ok
+test rope_projection_short_raw_is_rejected ... ok
+test unchecked_accumulation_branches_fail_closed ... ok
+test softmax_raw_length_must_match_the_input ... ok
+test wide_group_structure_is_checked ... ok
+test bounds_do_not_panic ... ok
+test extra_zero_leaves_are_rejected ... ok
+test empty_and_missing_ports_are_rejected ... ok
+test width_padding_depth_length_and_coverage_are_rejected ... ok
+test reordered_and_duplicated_openings_are_rejected ... ok
+test positive_group_openings_verify ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests zkie_ops
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+OPS_EXIT=0

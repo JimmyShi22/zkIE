@@ -1115,19 +1115,36 @@ pub fn commit_closure_mask(
     Ok(CommittedClosureMask { root, ..committed })
 }
 
+/// The committed group declaration carried by a proof message. The value rows
+/// and the retained commit trees are witness state: they stay with the prover
+/// and are never part of the verifier-held message or of its encoding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommittedGroupMessage {
+    pub group: SendGroup,
+    /// The committed roots in position order, derived from the group entries.
+    pub roots: Vec<Digest>,
+}
+
+impl CommittedGroupMessage {
+    pub fn new(group: SendGroup) -> Self {
+        let roots = group.entries.iter().map(|entry| entry.root).collect();
+        Self { group, roots }
+    }
+}
+
 /// The public first-stage closure messages: the three roots, the SEND samples
 /// and the drawn opening positions of the new messages.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClosureFirstMessages {
-    pub slack: CommittedValueGroup,
+    pub slack: CommittedGroupMessage,
     pub slack_sample: SendSamples,
     pub slack_positions: Vec<Vec<u64>>,
     pub slack_openings: Vec<RuntimeTreeOpening>,
-    pub bits: CommittedValueGroup,
+    pub bits: CommittedGroupMessage,
     pub bits_sample: SendSamples,
     pub bits_positions: Vec<Vec<u64>>,
     pub bits_openings: Vec<RuntimeTreeOpening>,
-    pub map: CommittedValueGroup,
+    pub map: CommittedGroupMessage,
     pub map_sample: SendSamples,
     pub map_positions: Vec<Vec<u64>>,
     pub map_openings: Vec<RuntimeTreeOpening>,
@@ -1229,30 +1246,15 @@ impl ClosureFirstMessages {
         )?;
         reader.finish()?;
         Ok(Self {
-            slack: CommittedValueGroup {
-                group: slack_group,
-                messages: Vec::new(),
-                roots: Vec::new(),
-                trees: RetainedTrees::default(),
-            },
+            slack: CommittedGroupMessage::new(slack_group),
             slack_sample,
             slack_positions,
             slack_openings,
-            bits: CommittedValueGroup {
-                group: bits_group,
-                messages: Vec::new(),
-                roots: Vec::new(),
-                trees: RetainedTrees::default(),
-            },
+            bits: CommittedGroupMessage::new(bits_group),
             bits_sample,
             bits_positions,
             bits_openings,
-            map: CommittedValueGroup {
-                group: map_group,
-                messages: Vec::new(),
-                roots: Vec::new(),
-                trees: RetainedTrees::default(),
-            },
+            map: CommittedGroupMessage::new(map_group),
             map_sample,
             map_positions,
             map_openings,
