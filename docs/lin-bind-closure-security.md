@@ -162,9 +162,11 @@ add a secret direction. `chi = 0` is an exception event handled in section 6.
 
 The Dot PSC (transcript tags 16/17/18) sends 23 scalars. They are an affine
 bijection of the 23 hiding coefficients of the 73-entry index-mask schema,
-plus the `sigma` shift in one claim-mask direction. The hiding map is 23 x 23
-and is checked full-rank at one deterministic challenge point; the
-all-challenge statement is an assumption.
+plus the `sigma` shift in one claim-mask direction. The hiding map is 23 x 23. Its
+determinant is a nonzero polynomial (triangular by variable and degree with
+unit diagonal on the direct entries), checked full rank at three points; a
+conservative degree bound gives a bad-challenge probability below
+`23^2/p^3 < 2^-181` (sections 3.12 and 6).
 
 The closure PSC (tags 20/21/22) is a second, separate instance. The closure
 mask plan allocates, per position, 49 hiding coefficients and five shown
@@ -173,8 +175,10 @@ mask and two relation-function masks. Each shown mask is one-time and gives
 one random dimension per masked value. The closure PSC transcript and the
 three fresh-point values `(B(pt), D(q), weighted B(q))` are covered by that
 per-position instance; the 23 Dot scalars and the 49 closure coefficients are
-not the same mask plan and are not summed. The closure hiding map's
-all-challenge full-rank statement is an assumption.
+not the same mask plan and are not summed. The closure hiding map is 49 x 49
+and the same argument applies: its determinant is a nonzero polynomial,
+checked full rank at three points, with bad-challenge probability below
+`49^2/p^3 < 2^-179` (sections 3.12 and 6).
 
 ### 3.6 Closure messages and the full output row
 
@@ -223,9 +227,11 @@ BASE symbols.
   the secret group-row contribution is a shift of that affine map. The
   construction uses the full coefficient set for the hiding polynomial (the
   reference check `fold_mask_as_drawn` verifies every coefficient and tail).
-  The linear-cover criterion therefore holds under the assumption that the
-  fresh-mask coefficient map has full rank at the drawn challenge; a
-  degenerate challenge is an exception.
+  The coefficient map is triangular by variable and degree with unit diagonal,
+  so its determinant is a nonzero polynomial. It is checked full rank at
+  three points, and the bad-challenge probability is below
+  `(2k+1)^2/p^3 < 2^-178` for `k <= 32` (sections 3.12 and 6). The
+  linear-cover criterion holds for every non-degenerate challenge.
 - BASE: the star main row, star mask row and their random tails are fresh
   draws. The public BASE rows and openings are affine in those draws, so the
   secret row contribution is covered by the star randomness one entry at a
@@ -250,9 +256,10 @@ BASE symbols.
 - The opening positions are distinct; the union per tree is used.
 - `|S| <= r` for every actual opening set; section 4 checks the actual sets.
 - The code tail rank is the stated `r`.
-- The PSC hiding maps have full rank for every challenge, for both the
-  23-entry Dot instance and the 49-coefficient closure instance; only one
-  deterministic challenge point is tested for each.
+- The PSC hiding maps are full rank except on a bad challenge set bounded in
+  section 6: their determinants are nonzero polynomials (triangular by
+  variable and degree), checked at three points, with degree bounds `23^2`
+  and `49^2`.
 - `chi != 0`; if `chi = 0`, the residual combines only the `t = 0` term and
   the corresponding term is in section 6.
 - The SEND sample's beta is drawn nonzero by the implementation; the pad
@@ -260,8 +267,9 @@ BASE symbols.
   zero event).
 - The hash model is random-oracle or collision-resistant and the salted
   inputs have the stated min-entropy.
-- The FOLD fresh-mask coefficient map is full-rank at every drawn challenge;
-  the BASE star rows and tails are fresh and independent.
+- The FOLD fresh-mask coefficient map is full rank except on a bad challenge
+  set bounded by `(2k+1)^2/p^3 < 2^-178` for `k <= 32`; the BASE star rows
+  and tails are fresh and independent.
 - The hidden path has no code-switch stage; a CS path would need its own
   fresh-mask/star coverage.
 - No pad, mask class, material stream or table reservation is reused outside
@@ -549,8 +557,9 @@ Items not backed by an executable rejection:
 
 - `chi = 0` has no explicit check; it is covered only by the `1/p^3 < 2^-191`
   term in the composition argument.
-- The full joint simulation, the all-challenge PSC rank and the composition
-  theorem are document-level arguments.
+- The full joint simulation and the composition theorem are document-level
+  arguments; the all-challenge PSC/FOLD rank rests on the
+  nonzero-determinant step with the section 6 bad-challenge bound.
 - The output-binding boundary is the approved one; the full `Y` row is hidden
   by the conditional argument in 3.6. A change to the boundary requires a new
   review.
@@ -564,8 +573,10 @@ The following are open or conditional:
 
 - `[UNPROVEN]` a full simulation and the adaptive composition of the hash and
   algebraic arguments; the linear-cover criterion itself is argued per view.
-- `[UNPROVEN]` the all-challenge PSC rank; only one deterministic challenge
-  point is tested.
+- `[UNPROVEN]` a mechanized symbolic proof that the PSC/FOLD determinants
+  are nonzero for every challenge; the triangular structure and three-point
+  checks support the nonzero-polynomial step and section 6 carries the
+  bad-challenge bound.
 - `[UNPROVEN]` a mechanized composition theorem and an end-to-end 128-bit
   claim; `126.21`/`116.01` remain plan-ledger numbers.
 - `[ASSUMPTION]` the approved output-binding boundary (winner/valid/tie); the
