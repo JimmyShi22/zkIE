@@ -2854,7 +2854,7 @@ pub fn run_limited_shared_to_columns(
             &fold_shape,
             &fold_layout,
             setup.mask.mask(),
-            &prover_row,
+            prover_row,
             main_messages.clone(),
             old_mu.clone(),
             Vec::new(),
@@ -4103,7 +4103,7 @@ fn assemble_limited_fold_row(
         power = power.mul(&x);
     }
     mem("bat-columns");
-    let mut fold_row = bat.to_fold_input_row(&combined, &input.layout)?;
+    let mut fold_row = bat.to_fold_input_row(combined, &input.layout)?;
     fold_row.group = group_id;
     fold_row.members = vec![gu.oracle, omega_oracle_id];
     Ok((fold_row, input.layout))
@@ -4496,11 +4496,12 @@ pub fn run_stage_fold(
     }
     let eps = chain.draw_e()?;
     let coins = ByteMaskCoins::new(spec.randomness.seed)?;
+    let row_target = row.target;
     let mut prover = FoldProverSession::new(
         &spec.shape,
         &spec.layout,
         fresh.mask(),
-        &row,
+        row,
         main_messages,
         mask_messages,
         Vec::new(),
@@ -4509,7 +4510,7 @@ pub fn run_stage_fold(
         return Err(Error::StatementMismatch);
     }
     prover.start(eps, &coins)?;
-    let mut claim = FoldRoundVerifier::new(fresh.message().sum, eps, row.target);
+    let mut claim = FoldRoundVerifier::new(fresh.message().sum, eps, row_target);
     let mut gammas = Vec::with_capacity(spec.shape.k as usize);
     let mut rounds = Vec::with_capacity(spec.shape.k as usize);
     for _ in 0..spec.shape.k {
@@ -4528,10 +4529,8 @@ pub fn run_stage_fold(
         prover.bind(gamma)?;
     }
     let end = prover.end()?;
-    let output = fold_output(
-        &spec.shape,
+    let output = prover.output(
         &spec.layout,
-        &row,
         spec.fresh,
         fresh.root(),
         spec.mask_tree.tree_number,

@@ -841,12 +841,6 @@ pub fn fold_output(
     }
     let mask_coefficients =
         fold_mask_form_values(shape.k, shape.h, &row.mask_coefficients, eps, gamma)?;
-    let fresh_coefficients = fold_mask_weights(
-        shape.k,
-        shape.h,
-        usize::try_from(shape.mask_code.ell).map_err(|_| Error::ResourceLimit)?,
-        gamma,
-    )?;
     let mut kept_factor = eps;
     for challenge in gamma {
         kept_factor = kept_factor.mul(&Fp3::ONE.sub(challenge));
@@ -862,13 +856,60 @@ pub fn fold_output(
                 .collect(),
         });
     }
+    assemble_fold_output(
+        shape,
+        layout,
+        row.group,
+        row.k,
+        row.h,
+        row.members.clone(),
+        coefficients,
+        mask_coefficients,
+        kept,
+        kept_factor,
+        claim,
+        fresh,
+        fresh_root,
+        tree_number,
+        eps,
+        sum,
+        gamma,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assemble_fold_output(
+    shape: &FoldShape,
+    layout: &FoldGroupLayout,
+    group: u64,
+    k: u32,
+    h: u32,
+    members: Vec<u64>,
+    coefficients: Vec<Fp3>,
+    mask_coefficients: Vec<Fp3>,
+    kept: Vec<FoldKeptForm>,
+    kept_factor: Fp3,
+    target: Fp3,
+    fresh: u64,
+    fresh_root: Digest,
+    tree_number: u64,
+    eps: Fp3,
+    sum: Fp3,
+    gamma: &[Fp3],
+) -> Result<FoldOutput> {
+    let fresh_coefficients = fold_mask_weights(
+        k,
+        h,
+        usize::try_from(shape.mask_code.ell).map_err(|_| Error::ResourceLimit)?,
+        gamma,
+    )?;
     Ok(FoldOutput {
         code: shape.code,
         mask_code: shape.mask_code,
-        group: row.group,
-        k: row.k,
-        h: row.h,
-        members: row.members.clone(),
+        group,
+        k,
+        h,
+        members,
         gamma: gamma.to_vec(),
         eps,
         sum,
@@ -882,7 +923,7 @@ pub fn fold_output(
         kept_factor,
         layout: layout.clone(),
         kept_rows: layout.kept_rows_checked()?,
-        target: claim,
+        target,
     })
 }
 
@@ -986,6 +1027,17 @@ impl FoldRoundSession {
     }
 }
 
+/// The group-row metadata a FOLD output is assembled from. The coefficient
+/// vectors themselves live in the live round state.
+struct FoldOutputMeta {
+    group: u64,
+    k: u32,
+    h: u32,
+    members: Vec<u64>,
+    kept: Vec<FoldKeptForm>,
+    target: Fp3,
+}
+
 /// The prover's isolated FOLD rounds over the actual main row, the old mask
 /// rows and the fresh mask. The fresh mask must already have passed the start
 /// path's first as-drawn check; `start` performs the second check before the
@@ -998,6 +1050,7 @@ pub struct FoldProverSession {
     draws: Vec<u32>,
     tail: MaskTail,
     rounds: FoldRoundProver,
+    meta: FoldOutputMeta,
     started: bool,
 }
 
@@ -1006,7 +1059,7 @@ impl FoldProverSession {
         shape: &FoldShape,
         layout: &FoldGroupLayout,
         mask: &FoldMask,
-        row: &FoldInputRow,
+        row: FoldInputRow,
         main_messages: Vec<Fp3>,
         mask_messages: Vec<Fp3>,
         kept_messages: Vec<Vec<Fp3>>,
@@ -1027,13 +1080,23 @@ impl FoldProverSession {
             return Err(Error::InvalidConfig);
         }
         let tail = mask.tail().cloned().ok_or(Error::InvalidProof)?;
-        let main = FoldMainTable::new(row.coefficients.clone(), main_messages)?;
+        let FoldInputRow {
+            group,
+            k,
+            h,
+            members,
+            coefficients,
+            mask_coefficients,
+            kept: kept_forms,
+            target,
+        } = row;
+        let main = FoldMainTable::new(coefficients, main_messages)?;
         let len_zk = usize::try_from(shape.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
         let rounds = FoldRoundProver::new(
             shape.k,
             shape.h,
             mask.coefficients().to_vec(),
-            row.mask_coefficients.clone(),
+            mask_coefficients,
             mask_messages,
             len_zk,
             main,
@@ -1045,6 +1108,14 @@ impl FoldProverSession {
             draws: mask.draws().to_vec(),
             tail,
             rounds,
+            meta: FoldOutputMeta {
+                group,
+                k,
+                h,
+                members,
+                kept: kept_forms,
+                target,
+            },
             started: false,
         })
     }
@@ -1084,6 +1155,76 @@ impl FoldProverSession {
 
     pub fn main_messages(&self) -> &[Fp3] {
         self.rounds.main_messages()
+    }
+
+    /// Builds the final FOLD output from the live round state. The main and
+    /// old-mask coefficients were folded in place by the rounds, so the output
+    /// is derived from those vectors instead of keeping a second copy of the
+    /// input row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn output(
+        &self,
+        layout: &FoldGroupLayout,
+        fresh: u64,
+        fresh_root: Digest,
+        tree_number: u64,
+        eps: Fp3,
+        sum: Fp3,
+        gamma: &[Fp3],
+        claim: Fp3,
+    ) -> Result<FoldOutput> {
+        if gamma.len() != self.shape.k as usize || self.rounds.next() != self.shape.k {
+            return Err(Error::InvalidSessionState);
+        }
+        if layout.fault(&self.shape).is_some()
+            || layout.group != self.meta.group
+            || layout.k != self.meta.k
+            || layout.h != self.meta.h
+        {
+            return Err(Error::InvalidConfig);
+        }
+        let end = self.rounds.end()?;
+        let coefficients = self
+            .rounds
+            .main
+            .coefficients
+            .iter()
+            .map(|value| value.mul(&eps))
+            .collect::<Vec<_>>();
+        let mut kept_factor = eps;
+        for challenge in gamma {
+            kept_factor = kept_factor.mul(&Fp3::ONE.sub(challenge));
+        }
+        let mut kept = Vec::with_capacity(self.meta.kept.len());
+        for form in &self.meta.kept {
+            kept.push(FoldKeptForm {
+                oracle: form.oracle,
+                coefficients: form
+                    .coefficients
+                    .iter()
+                    .map(|value| value.mul(&kept_factor))
+                    .collect(),
+            });
+        }
+        assemble_fold_output(
+            &self.shape,
+            layout,
+            self.meta.group,
+            self.meta.k,
+            self.meta.h,
+            self.meta.members.clone(),
+            coefficients,
+            end.d,
+            kept,
+            kept_factor,
+            claim,
+            fresh,
+            fresh_root,
+            tree_number,
+            eps,
+            sum,
+            gamma,
+        )
     }
 }
 

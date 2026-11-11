@@ -1184,22 +1184,19 @@ where
     let bat_input_targets = input.rows.iter().map(|row| row.target).collect::<Vec<_>>();
     let combined = bat.finish_run(input.clone())?;
     let x = bat.last_x().ok_or(Error::InvalidSessionState)?;
+    let combined_value = dot(&combined.main, &fixture.group_main)?
+        .add(&dot(&combined.mask, &fixture.group_mask)?);
+    let combined_matches_witness = combined.target == combined_value;
+    let combined_target = combined.target;
     let fold_row = bat
         .statement()
-        .to_fold_input_row(&combined, &bat_layout)?;
-    if fold_row.coefficients != combined.main
-        || fold_row.mask_coefficients != combined.mask
-        || fold_row.target != combined.target
-    {
+        .to_fold_input_row(combined.clone(), &bat_layout)?;
+    if fold_row.target != combined_target {
         return Err(Error::StatementMismatch);
     }
     let bat_chain = bat.into_chain()?;
     let bat_chain_rounds = bat_chain.rounds();
     let bat_chain_value = *bat_chain.value();
-
-    let combined_value = dot(&combined.main, &fixture.group_main)?
-        .add(&dot(&combined.mask, &fixture.group_mask)?);
-    let combined_matches_witness = combined.target == combined_value;
 
     let plan = fixture.plan_for(&fixture.shape, &fixture.layout, fixture.start.root)?;
     let mut fold = FoldeqSession::open_fold_fixture(plan, bat_chain)?;
@@ -1220,7 +1217,7 @@ where
         &fixture.shape,
         &fixture.layout,
         &fixture.mask,
-        &fold_row,
+        fold_row.clone(),
         fixture.group_main.clone(),
         fixture.group_mask.clone(),
         Vec::new(),
@@ -1763,7 +1760,7 @@ mod tests {
         let mut bat = BatSession::new(statement, handoff, fixture.planned_rows())?;
         let input = bat.begin_run(fixture.group())?;
         let combined = bat.finish_run(input.clone())?;
-        let row = bat.statement().to_fold_input_row(&combined, &input.layout)?;
+        let row = bat.statement().to_fold_input_row(combined, &input.layout)?;
         Ok((bat.into_chain()?, row))
     }
 
@@ -1979,7 +1976,7 @@ mod tests {
             Err(Error::InvalidSessionState)
         ));
         let mut changed = input.clone();
-        changed.rows[0].target = Fp3::from_u64(9999);
+        std::sync::Arc::make_mut(&mut changed.rows)[0].target = Fp3::from_u64(9999);
         assert!(matches!(
             bat.finish_run(changed),
             Err(Error::StatementMismatch)

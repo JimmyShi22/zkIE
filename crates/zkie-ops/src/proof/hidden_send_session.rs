@@ -197,6 +197,8 @@
 //! tilde masks are independent draws from the same stage-1 stream; the one
 //! difference row is their only consistency use and does not force equality.
 
+use std::sync::Arc;
+
 use zkie_core::common::codec::DecodeLimits;
 use zkie_core::common::field::PrimeCharacteristicRing;
 use zkie_core::error::{Error, Result};
@@ -255,7 +257,7 @@ use crate::proof::output_closure::{
     commit_closure_mask, commit_value_group, closure_values_from_rows, prove_closure_second,
     verify_closure_second, ClosureFirstMessages, ClosureMaskMessage, ClosureMaskPlan, ClosurePlan,
     ClosureRandomness, ClosureRowBinding, ClosureSecondMessages, ClosureWitness,
-    CommittedClosureMask, CommittedValueGroup,
+    CommittedClosureMask, CommittedValueGroup, RetainedTrees,
 };
 use crate::proof::base_final_session::{
     fold_identity, BaseFinalCheck, BaseFinalOutcome, BaseFinalRows, BaseFinalSession, BaseMessages,
@@ -1962,6 +1964,8 @@ pub struct HiddenSendWitness {
     /// `pads[position][answer]`.
     pub pads: Vec<Vec<Fp3>>,
     pub roots: Vec<Digest>,
+    /// The runtime trees built by the same W commit, in position order.
+    pub trees: RetainedTrees,
     /// The private index-mask message, when the plan carries one.
     pub index_mask: Option<IndexMaskWitness>,
     /// The private shown-map message, when the plan carries one.
@@ -2045,45 +2049,16 @@ impl HiddenSendWitness {
         Ok(())
     }
 
-    /// Rebuilds the committed runtime tree of one position from the retained
-    /// messages, tails and salts. The root must equal the registered root.
-    pub fn tree(&self, position: u32) -> Result<RuntimeTree> {
+    /// Returns the runtime tree built by the W commit for one position. The
+    /// root must equal the registered root.
+    pub fn tree(&self, position: u32) -> Result<&RuntimeTree> {
         if position >= self.positions {
             return Err(Error::InvalidIndex);
         }
-        let message = self
-            .messages
+        self.trees
             .get(position as usize)
-            .ok_or(Error::InvalidIndex)?;
-        let tails = self
-            .tails
-            .get(position as usize)
-            .ok_or(Error::InvalidIndex)?;
-        let salts = self
-            .salts
-            .get(position as usize)
-            .ok_or(Error::InvalidIndex)?;
-        let main_rows = usize::try_from(self.w.main_rows).map_err(|_| Error::ResourceLimit)?;
-        let tail_len = usize::try_from(self.w.code.r).map_err(|_| Error::ResourceLimit)?;
-        if message.len() != main_rows || tails.len() != main_rows * tail_len {
-            return Err(Error::ShapeMismatch);
-        }
-        let mut codewords = Vec::with_capacity(main_rows);
-        for (row, message_row) in message.iter().enumerate() {
-            let tail = tails
-                .get(row * tail_len..(row + 1) * tail_len)
-                .ok_or(Error::ShapeMismatch)?;
-            codewords.push(encode_row_fp3(&self.w.code, message_row, tail)?);
-        }
-        RuntimeTree::commit(
-            self.w.tree_plan(position)?,
-            &[RuntimePartRows {
-                main: codewords,
-                mask: Vec::new(),
-                main_deg: E_DEGREE as u32,
-            }],
-            salts,
-        )
+            .map(|tree| tree.as_ref())
+            .ok_or(Error::InvalidIndex)
     }
 
     pub fn oracle(&self, position: u32) -> Result<u64> {
@@ -2227,6 +2202,7 @@ pub fn commit_w_rows(
     let mut entries = Vec::with_capacity(positions);
     let mut messages = Vec::with_capacity(positions);
     let mut roots = Vec::with_capacity(positions);
+    let mut trees = Vec::with_capacity(positions);
     for (position, values) in rows.iter().enumerate() {
         let position = position as u32;
         let mut message = vec![vec![Fp3::ZERO; ell]; main_rows];
@@ -2292,6 +2268,7 @@ pub fn commit_w_rows(
             root,
         });
         roots.push(root);
+        trees.push(Arc::new(tree));
         messages.push(message);
     }
     if let Some(expected) = &plan.expected_roots {
@@ -2344,6 +2321,7 @@ pub fn commit_w_rows(
         salts: randomness.salts.clone(),
         pads: randomness.pads.clone(),
         roots,
+        trees: RetainedTrees(trees),
         index_mask,
         dot: None,
         closure: None,
@@ -3909,33 +3887,21 @@ fn open_value_group_openings(
     tails: &[Vec<Fp3>],
     salts: &[Vec<Vec<u8>>],
     positions: &[Vec<u64>],
+    trees: &RetainedTrees,
 ) -> Result<Vec<RuntimeTreeOpening>> {
-    let rows = usize::try_from(shape.main_rows).map_err(|_| Error::ResourceLimit)?;
-    let tail_len = usize::try_from(shape.code.r).map_err(|_| Error::ResourceLimit)?;
     if messages.len() != positions.len()
         || tails.len() != positions.len()
         || salts.len() != positions.len()
+        || trees.len() != positions.len()
     {
         return Err(Error::ShapeMismatch);
     }
     let mut openings = Vec::with_capacity(positions.len());
     for (position, list) in positions.iter().enumerate() {
-        let tail = tails.get(position).ok_or(Error::ShapeMismatch)?;
-        let mut tail_rows = Vec::with_capacity(rows);
-        for row in 0..rows {
-            tail_rows.push(
-                tail.get(row * tail_len..(row + 1) * tail_len)
-                    .ok_or(Error::ShapeMismatch)?
-                    .to_vec(),
-            );
+        let tree = trees.get(position).ok_or(Error::ShapeMismatch)?;
+        if tree.plan() != &shape.tree_plan(position as u32)? {
+            return Err(Error::StatementMismatch);
         }
-        let tree = commit_rows_tree(
-            shape.tree_plan(position as u32)?,
-            shape.code,
-            messages.get(position).ok_or(Error::ShapeMismatch)?,
-            &tail_rows,
-            salts.get(position).ok_or(Error::ShapeMismatch)?,
-        )?;
         openings.push(tree.open(list)?);
     }
     Ok(openings)
@@ -4801,11 +4767,11 @@ struct ProximityMember {
 /// A committed proximity member built by the prover.
 struct ProximityMemberProver {
     member: ProximityMember,
-    tree: RuntimeTree,
+    tree: Arc<RuntimeTree>,
 }
 
 impl ProximityMemberProver {
-    fn sealed(member: ProximityMember, tree: RuntimeTree) -> Result<Self> {
+    fn sealed(member: ProximityMember, tree: Arc<RuntimeTree>) -> Result<Self> {
         if *tree.root() != member.root {
             return Err(Error::StatementMismatch);
         }
@@ -5243,6 +5209,38 @@ fn mask_rows_of_draft(draft: &MaskDraft, shape: &FoldShape) -> Result<(Vec<Vec<F
     Ok((messages, tails))
 }
 
+/// Where the proximity prover takes a member's committed runtime tree. The
+/// value groups and W retain the trees built by their commits, so the retained
+/// source returns a shared handle without rebuilding; the mask, index-mask and
+/// Dot trees are built from their witnesses when they are first needed.
+enum ProximityTreeSource<'a> {
+    Ready(Vec<(u64, Arc<RuntimeTree>)>),
+    Retained {
+        witness: &'a HiddenSendWitness,
+        shared_witness: &'a SharedWitness,
+        first: &'a HiddenSendMessages,
+        plan: &'a HiddenLinPlan,
+    },
+}
+
+impl ProximityTreeSource<'_> {
+    fn tree_for(&self, member: &ProximityMember) -> Result<Arc<RuntimeTree>> {
+        match self {
+            Self::Ready(trees) => trees
+                .iter()
+                .find(|(oracle, _)| *oracle == member.source_oracle)
+                .map(|(_, tree)| Arc::clone(tree))
+                .ok_or(Error::ShapeMismatch),
+            Self::Retained {
+                witness,
+                shared_witness,
+                first,
+                plan,
+            } => witness_tree_for(member, witness, shared_witness, first, plan),
+        }
+    }
+}
+
 /// The prover side of one proximity test: BAT over the registered claims,
 /// FOLD rounds with a fresh mask, then BASE on the same chain. Every value the
 /// verifier needs is in the returned messages; the member rows never leave the
@@ -5251,9 +5249,10 @@ fn mask_rows_of_draft(draft: &MaskDraft, shape: &FoldShape) -> Result<(Vec<Vec<F
 fn proximity_prove(
     chain: Chain,
     fold: FoldShape,
-    members: &[ProximityMemberProver],
+    members: Vec<ProximityMember>,
+    trees: ProximityTreeSource<'_>,
     sample_rows: &[Vec<GuRelationRow>],
-    plain_rows: &[BatRow],
+    plain_rows: Vec<BatRow>,
     fresh_id: u64,
     mask_tree: MaskTreePlan,
     seed: Digest,
@@ -5264,12 +5263,11 @@ fn proximity_prove(
         return Err(Error::ShapeMismatch);
     }
     let _profile_bat = zkie_engine::profile::Scope::new("prox.bat");
-    let plain_members: Vec<ProximityMember> = members.iter().map(|m| m.member.clone()).collect();
     let mut statement = BatStatement::new();
-    for member in &plain_members {
+    for member in &members {
         statement.add_oracle(member_bat_shape(member))?;
     }
-    for (index, member) in plain_members.iter().enumerate() {
+    for (index, member) in members.iter().enumerate() {
         let rows = sample_rows[index]
             .iter()
             .map(|row| adapt_sample_row(row, member))
@@ -5280,29 +5278,26 @@ fn proximity_prove(
         statement.sample(member.bat_oracle, rows)?;
     }
     let group = statement.new_group(fold.code, fold.mask_code)?;
-    for member in &plain_members {
+    for member in &members {
         statement.join(group, member.bat_oracle, false)?;
     }
+    let planned = plain_rows.len() as u64
+        + members.iter().map(|member| member.answers as u64).sum::<u64>();
     for row in plain_rows {
-        statement.add_row(group, row.clone())?;
+        statement.add_row(group, row)?;
     }
     let layout = statement.layout(group)?;
     let fold_layout = statement.to_fold_layout_checked(group, &fold)?;
-    let planned = plain_rows.len() as u64
-        + plain_members
-            .iter()
-            .map(|member| member.answers as u64)
-            .sum::<u64>();
     let mut bat = BatSession::new(statement, chain, planned)?;
     let input = bat.begin_run(group)?;
     let combined = bat.finish_run(input)?;
-    let fold_row = bat.statement().to_fold_input_row(&combined, &layout)?;
+    let fold_row = bat.statement().to_fold_input_row(combined, &layout)?;
     let chain = bat.into_chain()?;
     drop(_profile_bat);
 
     let _profile_group_tables = zkie_engine::profile::Scope::new("prox.group_tables");
-    let group_main = build_group_table(&fold_layout, &layout, &plain_members)?;
-    let group_mask = build_group_mask(&fold_layout, &layout, &plain_members)?;
+    let group_main = build_group_table(&fold_layout, &layout, &members)?;
+    let group_mask = build_group_mask(&fold_layout, &layout, &members)?;
     drop(_profile_group_tables);
 
     let _profile_fold_start = zkie_engine::profile::Scope::new("prox.fold_start");
@@ -5313,7 +5308,7 @@ fn proximity_prove(
     let groups = VerifiedGroups {
         groups: vec![VerifiedGroup {
             group,
-            members: plain_members.iter().map(|m| m.bat_oracle).collect(),
+            members: members.iter().map(|m| m.bat_oracle).collect(),
             fresh: Some(fresh_id),
             code: Some(fold.code),
             mask_code: Some(fold.mask_code),
@@ -5348,7 +5343,7 @@ fn proximity_prove(
         &fold,
         &fold_layout,
         &mask,
-        &fold_row,
+        fold_row,
         group_main,
         group_mask,
         Vec::new(),
@@ -5371,10 +5366,8 @@ fn proximity_prove(
     }
     drop(_profile_fold_rounds);
     let _profile_fold_output = zkie_engine::profile::Scope::new("prox.fold_output");
-    let output = fold_output(
-        &fold,
+    let output = prover.output(
         &fold_layout,
-        &fold_row,
         fresh_id,
         start_message.root,
         mask_tree.tree_number,
@@ -5387,7 +5380,7 @@ fn proximity_prove(
     let anchor = FoldHandoffAnchor {
         shape: fold,
         group,
-        members: plain_members.iter().map(|m| m.bat_oracle).collect(),
+        members: members.iter().map(|m| m.bat_oracle).collect(),
         fresh: fresh_id,
         fresh_root: start_message.root,
         tree_number: mask_tree.tree_number,
@@ -5398,7 +5391,7 @@ fn proximity_prove(
     };
     let handoff = FoldHandoff::from_output(&output, &anchor)?;
     let (main_tail, mask_tail, fresh_tail) =
-        folded_tails(&handoff, &plain_members, &fresh_tails)?;
+        folded_tails(&handoff, &members, &fresh_tails)?;
     let rows = handoff.single_rows(
         prover.main_messages().to_vec(),
         main_tail,
@@ -5439,7 +5432,7 @@ fn proximity_prove(
         layout: handoff.layout.clone(),
         fresh_root: handoff.fresh_root,
         fresh_tree: mask_tree,
-        members: plain_members
+        members: members
             .iter()
             .map(|member| FoldMember {
                 oracle: member.bat_oracle,
@@ -5460,7 +5453,17 @@ fn proximity_prove(
     let _profile_base_openings = zkie_engine::profile::Scope::new("prox.base_openings");
     let positions = verifier.draw_base_positions(base_positions)?;
     let unique = unique_sorted(&positions);
-    let member_openings = members
+    let mut provers = Vec::with_capacity(members.len());
+    for mut member in members {
+        let tree = trees.tree_for(&member)?;
+        member.message = Vec::new();
+        member.tails = Vec::new();
+        member.mask_message = Vec::new();
+        member.mask_tails = Vec::new();
+        provers.push(ProximityMemberProver::sealed(member, tree)?);
+    }
+    provers.sort_by_key(|member| member.member.bat_oracle);
+    let member_openings = provers
         .iter()
         .map(|member| member.tree.open(&unique))
         .collect::<Result<Vec<_>>>()?;
@@ -5512,7 +5515,7 @@ fn proximity_verify(
     fold: FoldShape,
     members: &[ProximityMember],
     sample_rows: &[Vec<GuRelationRow>],
-    plain_rows: &[BatRow],
+    plain_rows: Vec<BatRow>,
     messages: &ProximityMessages,
     fresh_id: u64,
     mask_tree: MaskTreePlan,
@@ -5539,17 +5542,17 @@ fn proximity_verify(
     for member in members {
         statement.join(group, member.bat_oracle, false)?;
     }
+    let planned = plain_rows.len() as u64
+        + members.iter().map(|member| member.answers as u64).sum::<u64>();
     for row in plain_rows {
-        statement.add_row(group, row.clone())?;
+        statement.add_row(group, row)?;
     }
     let layout = statement.layout(group)?;
     let fold_layout = statement.to_fold_layout_checked(group, &fold)?;
-    let planned = plain_rows.len() as u64
-        + members.iter().map(|member| member.answers as u64).sum::<u64>();
     let mut bat = BatSession::new(statement, chain, planned)?;
     let input = bat.begin_run(group)?;
     let combined = bat.finish_run(input)?;
-    let fold_row = bat.statement().to_fold_input_row(&combined, &layout)?;
+    let fold_row = bat.statement().to_fold_input_row(combined, &layout)?;
     let chain = bat.into_chain()?;
 
     let verified_groups = VerifiedGroups {
@@ -6022,6 +6025,7 @@ fn prove_first(
                     },
                     messages: Vec::new(),
                     roots: Vec::new(),
+                    trees: RetainedTrees::default(),
                 },
                 map_tails: closure_randomness.map_tails.clone(),
                 map_salts: closure_randomness.map_salts.clone(),
@@ -6258,6 +6262,7 @@ fn prove_first(
                 &closure.slack_tails,
                 &closure.slack_salts,
                 &slack_positions,
+                &closure.slack.trees,
             )?;
             drop(_profile_slack_open);
             let bits_positions = draw_closure_group_positions(
@@ -6275,6 +6280,7 @@ fn prove_first(
                 &closure.bits_tails,
                 &closure.bits_salts,
                 &bits_positions,
+                &closure.bits.trees,
             )?;
             drop(_profile_bits_open);
             let mask_positions = draw_closure_mask_positions(&mut chain, &closure_plan.mask)?;
@@ -6297,6 +6303,7 @@ fn prove_first(
                 &closure.map_tails,
                 &closure.map_salts,
                 &map_positions,
+                &map.trees,
             )?;
             drop(_profile_map_open);
             Some(ClosureFirstMessages {
@@ -7427,11 +7434,13 @@ fn prove_shared(
         k_lo,
     )?);
     drop(_profile_plain_rows);
-    let gu_prover = ProximityMemberProver::sealed(members[gu_bat as usize].clone(), gu_tree)?;
-    let omega_prover =
-        ProximityMemberProver::sealed(members[omega_bat as usize].clone(), omega_tree)?;
-    let mut provers = vec![gu_prover, omega_prover];
-    provers.sort_by_key(|member| member.member.bat_oracle);
+    let trees = ProximityTreeSource::Ready(vec![
+        (members[gu_bat as usize].source_oracle, Arc::new(gu_tree)),
+        (
+            members[omega_bat as usize].source_oracle,
+            Arc::new(omega_tree),
+        ),
+    ]);
     let fold = member_fold_shape(
         plan.proximity.code,
         plan.proximity.mask_code,
@@ -7442,9 +7451,10 @@ fn prove_shared(
     let proximity = proximity_prove(
         chain,
         fold,
-        &provers,
+        members,
+        trees,
         &sample_rows,
-        &plain_rows,
+        plain_rows,
         plan.proximity.shared_fresh,
         plan.proximity.shared_mask_tree,
         derive_run_seed(seed, 4, 0)?,
@@ -7719,7 +7729,7 @@ fn verify_shared(
         fold,
         &members,
         &sample_rows,
-        &plain_rows,
+        plain_rows,
         &ProximityMessages {
             fold_start: messages.fold_start.clone(),
             fold_rounds: messages.fold_rounds.clone(),
@@ -9446,21 +9456,6 @@ fn prove_second(
         closure_binding.as_ref(),
     )?;
     drop(_profile_plain_rows);
-    let mut provers = Vec::with_capacity(members.len());
-    let _profile_witness_trees = zkie_engine::profile::Scope::new("second.witness_trees");
-    for member in &members {
-        let tree = witness_tree_for(
-            member,
-            witness,
-            shared_witness,
-            first,
-            plan,
-        )?;
-        provers.push(ProximityMemberProver::sealed(member.clone(), tree)
-            ?);
-    }
-    drop(_profile_witness_trees);
-    provers.sort_by_key(|member| member.member.bat_oracle);
     let fold = member_fold_shape(
         plan.proximity.code,
         plan.proximity.mask_code,
@@ -9471,9 +9466,15 @@ fn prove_second(
     let proximity = proximity_prove(
         chain,
         fold,
-        &provers,
+        members,
+        ProximityTreeSource::Retained {
+            witness,
+            shared_witness,
+            first,
+            plan,
+        },
         &sample_rows,
-        &plain_rows,
+        plain_rows,
         plan.proximity.own_fresh,
         plan.proximity.own_mask_tree,
         derive_run_seed(seed, 5, 0)?,
@@ -9508,114 +9509,35 @@ fn witness_tree_for(
     shared_witness: &SharedWitness,
     first: &HiddenSendMessages,
     plan: &HiddenLinPlan,
-) -> Result<RuntimeTree> {
+) -> Result<Arc<RuntimeTree>> {
+    let _ = first;
     if let Some(closure_plan) = &plan.closure {
         let positions = plan.send.positions() as u64;
+        let closure = witness.closure.as_ref().ok_or(Error::ShapeMismatch)?;
         if member.source_oracle >= closure_plan.slack_oracle_base
             && member.source_oracle
                 < closure_plan.slack_oracle_base.saturating_add(positions)
         {
             let position = (member.source_oracle - closure_plan.slack_oracle_base) as usize;
-            let closure = witness.closure.as_ref().ok_or(Error::ShapeMismatch)?;
-            let rows = usize::try_from(closure_plan.slack.main_rows)
-                .map_err(|_| Error::ResourceLimit)?;
-            let tail_len = usize::try_from(closure_plan.slack.code.r)
-                .map_err(|_| Error::ResourceLimit)?;
-            let flat = closure
-                .slack_tails
-                .get(position)
-                .ok_or(Error::ShapeMismatch)?;
-            let mut tails = Vec::with_capacity(rows);
-            for row in 0..rows {
-                tails.push(
-                    flat.get(row * tail_len..(row + 1) * tail_len)
-                        .ok_or(Error::ShapeMismatch)?
-                        .to_vec(),
-                );
-            }
-            let _profile_tree = zkie_engine::profile::Scope::light("witness_tree.slack");
-            return commit_rows_tree(
-                member.tree_plan.clone(),
-                member.main_code,
-                &member.message,
-                &tails,
-                closure
-                    .slack_salts
-                    .get(position)
-                    .ok_or(Error::ShapeMismatch)?,
-            );
+            return retained_member_tree(&closure.slack.trees, position, member);
         }
         if member.source_oracle >= closure_plan.bits_oracle_base
             && member.source_oracle
                 < closure_plan.bits_oracle_base.saturating_add(positions)
         {
             let position = (member.source_oracle - closure_plan.bits_oracle_base) as usize;
-            let closure = witness.closure.as_ref().ok_or(Error::ShapeMismatch)?;
-            let rows = usize::try_from(closure_plan.bits.main_rows)
-                .map_err(|_| Error::ResourceLimit)?;
-            let tail_len = usize::try_from(closure_plan.bits.code.r)
-                .map_err(|_| Error::ResourceLimit)?;
-            let flat = closure
-                .bits_tails
-                .get(position)
-                .ok_or(Error::ShapeMismatch)?;
-            let mut tails = Vec::with_capacity(rows);
-            for row in 0..rows {
-                tails.push(
-                    flat.get(row * tail_len..(row + 1) * tail_len)
-                        .ok_or(Error::ShapeMismatch)?
-                        .to_vec(),
-                );
-            }
-            let _profile_tree = zkie_engine::profile::Scope::light("witness_tree.bits");
-            return commit_rows_tree(
-                member.tree_plan.clone(),
-                member.main_code,
-                &member.message,
-                &tails,
-                closure
-                    .bits_salts
-                    .get(position)
-                    .ok_or(Error::ShapeMismatch)?,
-            );
+            return retained_member_tree(&closure.bits.trees, position, member);
         }
         if member.source_oracle >= closure_plan.map_oracle_base
             && member.source_oracle
                 < closure_plan.map_oracle_base.saturating_add(positions)
         {
             let position = (member.source_oracle - closure_plan.map_oracle_base) as usize;
-            let closure = witness.closure.as_ref().ok_or(Error::ShapeMismatch)?;
-            let rows = usize::try_from(closure_plan.map.main_rows)
-                .map_err(|_| Error::ResourceLimit)?;
-            let tail_len = usize::try_from(closure_plan.map.code.r)
-                .map_err(|_| Error::ResourceLimit)?;
-            let flat = closure
-                .map_tails
-                .get(position)
-                .ok_or(Error::ShapeMismatch)?;
-            let mut tails = Vec::with_capacity(rows);
-            for row in 0..rows {
-                tails.push(
-                    flat.get(row * tail_len..(row + 1) * tail_len)
-                        .ok_or(Error::ShapeMismatch)?
-                        .to_vec(),
-                );
-            }
-            let _profile_tree = zkie_engine::profile::Scope::light("witness_tree.map");
-            return commit_rows_tree(
-                member.tree_plan.clone(),
-                member.main_code,
-                &member.message,
-                &tails,
-                closure
-                    .map_salts
-                    .get(position)
-                    .ok_or(Error::ShapeMismatch)?,
-            );
+            return retained_member_tree(&closure.map.trees, position, member);
         }
         if member.source_oracle == closure_plan.mask.oracle {
-            let closure = witness.closure.as_ref().ok_or(Error::ShapeMismatch)?;
-            return closure.mask.tree(&closure_plan.mask);
+            let _profile_tree = zkie_engine::profile::Scope::light("witness_tree.mask");
+            return Ok(Arc::new(closure.mask.tree(&closure_plan.mask)?));
         }
     }
     if let Some(index) = &plan.send.index_mask {
@@ -9625,56 +9547,43 @@ fn witness_tree_for(
                 .as_ref()
                 .ok_or(Error::ShapeMismatch)?;
             let _profile_tree = zkie_engine::profile::Scope::light("witness_tree.index_mask");
-            return mask_witness.tree(index);
+            return Ok(Arc::new(mask_witness.tree(index)?));
         }
     }
     if let Some(dot) = &plan.send.dot {
         if member.source_oracle == dot.oracle {
             let map = witness.dot.as_ref().ok_or(Error::ShapeMismatch)?;
             let _profile_tree = zkie_engine::profile::Scope::light("witness_tree.dot");
-            return map.tree(dot);
+            return Ok(Arc::new(map.tree(dot)?));
         }
     }
     if member.source_oracle == plan.proximity.omega.oracle {
         let _profile_tree = zkie_engine::profile::Scope::light("witness_tree.omega");
-        commit_rows_tree(
+        return Ok(Arc::new(commit_rows_tree(
             member.tree_plan.clone(),
             member.main_code,
             &member.message,
             &member.tails,
             &omega_salts_of(shared_witness)?,
-        )
-    } else {
-        let position = (member.source_oracle - plan.send.oracle_base) as usize;
-        if position >= plan.send.positions() as usize {
-            return Err(Error::StatementMismatch);
-        }
-        let _ = first;
-        let tails_len = usize::try_from(plan.send.w.code.r).map_err(|_| Error::ResourceLimit)?;
-        let rows = usize::try_from(plan.send.w.main_rows).map_err(|_| Error::ResourceLimit)?;
-        let tail = witness.tails.get(position).ok_or(Error::ShapeMismatch)?;
-        let mut tails = Vec::with_capacity(rows);
-        for row in 0..rows {
-            tails.push(
-                tail.get(row * tails_len..(row + 1) * tails_len)
-                    .ok_or(Error::ShapeMismatch)?
-                    .to_vec(),
-            );
-        }
-        let salts = witness
-            .salts
-            .get(position)
-            .ok_or(Error::ShapeMismatch)?
-            .clone();
-        let _profile_tree = zkie_engine::profile::Scope::light("witness_tree.w");
-        commit_rows_tree(
-            member.tree_plan.clone(),
-            member.main_code,
-            &member.message,
-            &tails,
-            &salts,
-        )
+        )?));
     }
+    let position = (member.source_oracle - plan.send.oracle_base) as usize;
+    if position >= plan.send.positions() as usize {
+        return Err(Error::StatementMismatch);
+    }
+    retained_member_tree(&witness.trees, position, member)
+}
+
+fn retained_member_tree(
+    trees: &RetainedTrees,
+    position: usize,
+    member: &ProximityMember,
+) -> Result<Arc<RuntimeTree>> {
+    let tree = trees.get(position).ok_or(Error::ShapeMismatch)?;
+    if tree.plan() != &member.tree_plan {
+        return Err(Error::StatementMismatch);
+    }
+    Ok(Arc::clone(tree))
 }
 
 fn omega_salts_of(witness: &SharedWitness) -> Result<Vec<Vec<u8>>> {
@@ -9780,7 +9689,7 @@ fn verify_second(
         fold,
         &members,
         &sample_rows,
-        &plain_rows,
+        plain_rows,
         &ProximityMessages {
             fold_start: messages.fold_start.clone(),
             fold_rounds: messages.fold_rounds.clone(),

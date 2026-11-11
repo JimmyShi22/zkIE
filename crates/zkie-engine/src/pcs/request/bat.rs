@@ -17,6 +17,7 @@
 //! not hidden assumptions.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
@@ -286,15 +287,17 @@ struct BatGroup {
 }
 
 /// One run's frozen input: the layout and the claims in the fixed class order.
+/// The rows are shared rather than copied when the session retains the frozen
+/// input for the completion check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BatRunInput {
     pub layout: BatGroupLayout,
-    pub rows: Vec<BatRow>,
+    pub rows: Arc<Vec<BatRow>>,
 }
 
 impl BatRunInput {
     pub fn rows(&self) -> &[BatRow] {
-        &self.rows
+        self.rows.as_slice()
     }
 }
 
@@ -576,8 +579,6 @@ impl BatStatement {
             }
             (entry.members.clone(), plain, generator)
         };
-        let mut rows = Vec::new();
-        rows.append(&mut plain);
         for oracle in &members {
             let entry = self.oracle(*oracle)?;
             if entry.shape.answers > 0
@@ -585,7 +586,13 @@ impl BatStatement {
             {
                 return Err(Error::ShapeMismatch);
             }
-            rows.extend(entry.sample_rows.iter().cloned());
+        }
+        let mut rows = Vec::new();
+        rows.append(&mut plain);
+        for oracle in &members {
+            rows.extend(std::mem::take(
+                &mut self.oracle_mut(*oracle)?.sample_rows,
+            ));
         }
         rows.append(&mut generator);
         for oracle in &members {
@@ -593,7 +600,10 @@ impl BatStatement {
         }
         let entry = self.group_mut(group)?;
         entry.in_run = true;
-        Ok(BatRunInput { layout, rows })
+        Ok(BatRunInput {
+            layout,
+            rows: Arc::new(rows),
+        })
     }
 
     /// The current group mask placeholder. It has no hiding guarantee; after
@@ -693,7 +703,7 @@ impl BatStatement {
     /// padding entry must be zero.
     pub fn to_fold_input_row(
         &self,
-        row: &BatGroupRow,
+        row: BatGroupRow,
         layout: &BatGroupLayout,
     ) -> Result<FoldInputRow> {
         if row.group != layout.group
@@ -703,8 +713,15 @@ impl BatStatement {
         {
             return Err(Error::StatementMismatch);
         }
-        let mut kept = Vec::new();
-        for form in &row.kept {
+        let BatGroupRow {
+            group,
+            main,
+            mask,
+            kept,
+            target,
+        } = row;
+        let mut compact_kept = Vec::new();
+        for form in &kept {
             let member = layout
                 .members
                 .iter()
@@ -740,20 +757,20 @@ impl BatStatement {
                     }
                 }
             }
-            kept.push(FoldKeptForm {
+            compact_kept.push(FoldKeptForm {
                 oracle: form.oracle,
                 coefficients: compact,
             });
         }
         Ok(FoldInputRow {
-            group: row.group,
+            group,
             k: layout.k,
             h: layout.h,
             members: layout.members.iter().map(|member| member.oracle).collect(),
-            coefficients: row.main.clone(),
-            mask_coefficients: row.mask.clone(),
-            kept,
-            target: row.target,
+            coefficients: main,
+            mask_coefficients: mask,
+            kept: compact_kept,
+            target,
         })
     }
 }
@@ -914,7 +931,7 @@ impl BatSession {
     /// time or source of x; the session's call order is the isolated boundary.
     pub fn finish_run(&mut self, input: BatRunInput) -> Result<BatGroupRow> {
         let pending = self.pending.take().ok_or(Error::InvalidSessionState)?;
-        if pending != input {
+        if pending.layout != input.layout || !Arc::ptr_eq(&pending.rows, &input.rows) {
             return Err(Error::StatementMismatch);
         }
         let prefix = self.chain.message().prefix(KIND_ALGEBRAIC, 0)?;
@@ -926,7 +943,7 @@ impl BatSession {
         }
         let x = self.chain.draw_e()?;
         self.last_x = Some(x);
-        combine(&self.statement, &input.layout, &input.rows, x)
+        combine(&self.statement, &input.layout, input.rows.as_slice(), x)
     }
 
     pub fn run(&mut self, group: u64) -> Result<BatGroupRow> {
@@ -1483,13 +1500,13 @@ mod tests {
         let (mut session, group) = session_fixture(5);
         let input = session.begin_run(group).unwrap();
         let mut removed = input.clone();
-        removed.rows.pop();
+        Arc::make_mut(&mut removed.rows).pop();
         assert!(session.finish_run(removed).is_err());
 
         let (mut session, group) = session_fixture(5);
         let input = session.begin_run(group).unwrap();
         let mut replaced = input.clone();
-        replaced.rows[0].target = Fp3::from_u64(99);
+        Arc::make_mut(&mut replaced.rows)[0].target = Fp3::from_u64(99);
         assert!(session.finish_run(replaced).is_err());
     }
 
@@ -1786,12 +1803,11 @@ mod tests {
         let mut wrong_shape = fold_shape;
         wrong_shape.k += 1;
         assert!(st.to_fold_layout_checked(group, &wrong_shape).is_err());
-        let fold_row = st.to_fold_input_row(&combined, &input.layout).unwrap();
-        fold_row.check(&fold_shape, &fold_layout).unwrap();
-
         let mut broken = combined.clone();
         let form = broken.kept.iter_mut().find(|form| form.oracle == 2).unwrap();
         form.coefficients[3] = Fp3::ONE;
-        assert!(st.to_fold_input_row(&broken, &input.layout).is_err());
+        assert!(st.to_fold_input_row(broken, &input.layout).is_err());
+        let fold_row = st.to_fold_input_row(combined, &input.layout).unwrap();
+        fold_row.check(&fold_shape, &fold_layout).unwrap();
     }
 }

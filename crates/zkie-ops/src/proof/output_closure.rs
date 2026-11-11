@@ -898,14 +898,58 @@ fn check_shape_randomness(
     Ok(())
 }
 
+/// The commit trees retained from one value-group commit, in position order.
+/// A tree is derived data: equality compares the tree plan and root rather
+/// than the materialized columns.
+#[derive(Clone, Debug, Default)]
+pub struct RetainedTrees(pub Vec<std::sync::Arc<RuntimeTree>>);
+
+impl RetainedTrees {
+    pub fn get(&self, position: usize) -> Option<&std::sync::Arc<RuntimeTree>> {
+        self.0.get(position)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl PartialEq for RetainedTrees {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self
+                .0
+                .iter()
+                .zip(&other.0)
+                .all(|(left, right)| left.plan() == right.plan() && left.root() == right.root())
+    }
+}
+
+impl Eq for RetainedTrees {}
+
 /// One committed value message group (the slack rows or the packed bit rows).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct CommittedValueGroup {
     pub group: SendGroup,
     /// `messages[position][row][place]`, the unencoded message rows.
     pub messages: Vec<Vec<Vec<Fp3>>>,
     pub roots: Vec<Digest>,
+    /// The trees built by the same commit, reused by the witness and the
+    /// drawn opening steps instead of rebuilding from the same inputs.
+    pub trees: RetainedTrees,
 }
+
+impl PartialEq for CommittedValueGroup {
+    fn eq(&self, other: &Self) -> bool {
+        self.group == other.group && self.messages == other.messages && self.roots == other.roots
+    }
+}
+
+impl Eq for CommittedValueGroup {}
 
 /// Commits one value message per position with the product-form encoding.
 #[allow(clippy::too_many_arguments)]
@@ -936,6 +980,7 @@ pub fn commit_value_group(
     let mut entries = Vec::with_capacity(positions as usize);
     let mut messages = Vec::with_capacity(positions as usize);
     let mut roots = Vec::with_capacity(positions as usize);
+    let mut trees = Vec::with_capacity(positions as usize);
     for (position, values) in values.iter().enumerate() {
         let _profile_layout = zkie_engine::profile::Scope::light("value_group.layout");
         let mut message = vec![vec![Fp3::ZERO; ell]; rows];
@@ -1001,6 +1046,7 @@ pub fn commit_value_group(
             root,
         });
         roots.push(root);
+        trees.push(std::sync::Arc::new(tree));
         messages.push(message);
     }
     let group = SendGroup { group, entries };
@@ -1011,6 +1057,7 @@ pub fn commit_value_group(
         group,
         messages,
         roots,
+        trees: RetainedTrees(trees),
     })
 }
 
@@ -1185,6 +1232,7 @@ impl ClosureFirstMessages {
                 group: slack_group,
                 messages: Vec::new(),
                 roots: Vec::new(),
+                trees: RetainedTrees::default(),
             },
             slack_sample,
             slack_positions,
@@ -1193,6 +1241,7 @@ impl ClosureFirstMessages {
                 group: bits_group,
                 messages: Vec::new(),
                 roots: Vec::new(),
+                trees: RetainedTrees::default(),
             },
             bits_sample,
             bits_positions,
@@ -1201,6 +1250,7 @@ impl ClosureFirstMessages {
                 group: map_group,
                 messages: Vec::new(),
                 roots: Vec::new(),
+                trees: RetainedTrees::default(),
             },
             map_sample,
             map_positions,
