@@ -17,6 +17,7 @@ pub mod lin_session;
 pub mod output_head_lin;
 pub mod plan;
 pub mod proximity_session;
+pub mod psc;
 pub mod relations;
 pub mod session_baseline;
 pub mod model_commitment;
