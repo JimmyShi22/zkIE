@@ -253,6 +253,32 @@ verifier boundary:
   prover runs the complete full-row closure over all padded columns and must
   reproduce the trusted expected output; no argmax value is inferred from a
   sampled column.
+- The exact integer output closure is checked by the same final verifier, not
+  only bound by the digest. The trusted relation declares `D` (`|Y_j| < 2^D`),
+  `b` (`0 <= S_j < 2^b`), the valid boundary `V`, the mask constant `M` and
+  the public winner, and the proof commits four new messages: the slack row
+  `S_j = Z_a - Z_j - [j < a]`, one packed bit message per position with the
+  `D+1` bits of `u = Y + A`, the `D+1` bits of `v = A - Y` and the `b` bits of
+  `S`, the product message `D(u) = eq(r,u) B(u)`, and one mask-only message
+  carrying the one-time product-sumcheck and relation masks. The verifier rebuilds,
+  from the transcript and the trusted plan:
+  - one comparison row per position on the slack and reduced rows,
+  - two reconstruction rows per position binding the `u` and `v` bit vectors
+    to the committed reduced row, and one binding the slack bit vector to the
+    committed slack row,
+  - two public linear-functional rows and one equality row that tie the
+    product message to the bit message,
+  - one masked product-sumcheck per position proving
+    `sum_u D(u)(1 - B(u)) = 0`; with `D = eq(r,.) B` this is the random-point
+    booleanity sum `sum_u eq(r,u) B(u)(1 - B(u))`. The first map is the
+    committed product message; the second map `1 - B` is affine in the
+    committed bit message, so its end claim is one linear row over the bit
+    point value and the closure mask.
+  All rows join the existing own-group BAT/FOLD/CS/BASE test. The relation
+  version is 2 and the no-wrap condition is `B + 2(2^D - 1) + |M| < p`. The
+  comparison, reconstruction and booleanity checks are random-point checks
+  over the extension field; the deterministic plan checks are `M <= -2^D`,
+  `0 <= a_t < V`, the no-wrap inequality and the bound/shape checks.
 - The complete hidden first, shared and second stages stay in one verifier:
   the group declaration, SEND samples/answers, drawn positions and openings,
   Eval rows, table record and column openings, FOLD rounds, the two proximity
@@ -271,6 +297,10 @@ verifier boundary:
   hidden on the formal path. The shared-trace path still carries opened weight
   rows and plaintext `X`/`Y`; it is a controlled diagnostic, not the hidden
   production proof.
+- `D` and `b` are operator-declared model bounds. The proof proves the bound
+  for the committed rows; a model whose logits or slacks exceed the declared
+  bounds cannot produce an accepting proof. For the fixture, the measured
+  largest magnitude is below `2^40` and the largest slack is below `2^42`.
 - Passing this round does not imply the previous-layer hidden relation, a
   full-model proof or single-shot decode semantics.
 
@@ -290,6 +320,15 @@ verifier boundary:
   same `X` is an operator-policy warranty, not a cross-commitment proof. The
   mask joint-view analysis, the leakage-rank budget and the updated error
   terms are in `docs/hidden-dot-mask.md`; that argument is not a formal proof.
+- The output closure is not a separate lookup/range proof over each cell. The
+  range and comparison checks are random-point checks with the stated
+  Schwartz-Zippel terms; they are not a formal soundness proof. The booleanity
+  argument draws `r` after the bit commitment and before the product message,
+  draws the sumcheck point after the product commitment, and draws the
+  linear-functional point after it as well; the one-time closure-mask entries
+  cover the sent product-sumcheck and relation scalars. The joint-view hiding
+  and opening-union budgets are not mechanized. The base-field membership of the committed
+  reduced row remains the activation/table warranty described above.
 - The previous-layer relation from the model to `X` is not proven.
 - Any plaintext `X` source is diagnostic only.
 - The production `commit`/`prove`/`verify` entry wiring is pending.
@@ -304,4 +343,9 @@ commitment, a changed Eval target, a changed MatMul step position, a missing
 output-relation declaration, a forged mask constant, a forged tie or expected
 argmax, an unsigned modular encoding of a negative value, a masked-arithmetic
 overflow, spliced request material and activation-opening bytes appended to the
-request encoding.
+request encoding. The output-closure tests additionally reject a changed
+booleanity round, changed fresh-point functionals, changed slack/bit/product
+roots, a changed slack SEND answer, a changed closure-mask root, a missing
+closure block, a different trusted winner, a widened integer bound and
+truncated or trailing proof encodings; the prover-side value checks reject a
+cell outside `|Y| < 2^D` and a slack at or above `2^b`.

@@ -99,6 +99,29 @@ fn eq_index(index: u64, z: &[Fp3], bits: u32) -> Result<Fp3> {
     Ok(value)
 }
 
+/// The complete `eq(index, z)` vector over the Boolean cube in `O(2^bits)`.
+/// The index convention is the same as [`eq_index`]: the lowest bit is the
+/// first seed coordinate. Callers that fill a whole sample row use this
+/// vector instead of one `eq_index` evaluation per entry.
+fn eq_vector(z: &[Fp3], bits: u32) -> Result<Vec<Fp3>> {
+    if z.len() < bits as usize {
+        return Err(Error::ShapeMismatch);
+    }
+    if bits >= 30 {
+        return Err(Error::ResourceLimit);
+    }
+    let mut values = vec![Fp3::ONE];
+    for coordinate in z[..bits as usize].iter().rev() {
+        let mut next = vec![Fp3::ZERO; values.len() * 2];
+        for (index, value) in values.iter().enumerate() {
+            next[2 * index] = value.mul(&Fp3::ONE.sub(coordinate));
+            next[2 * index + 1] = value.mul(coordinate);
+        }
+        values = next;
+    }
+    Ok(values)
+}
+
 fn theta(coefficient: usize) -> Fp3 {
     match coefficient {
         0 => Fp3::ONE,
@@ -872,6 +895,10 @@ fn sample_coefficients(
         let count = 1u64
             .checked_shl(cube.main_bits)
             .ok_or(Error::ResourceLimit)?;
+        let eq = eq_vector(&seed.z, cube.main_bits)?;
+        if eq.len() as u64 != count {
+            return Err(Error::ShapeMismatch);
+        }
         for virtual_index in 0..count {
             if let Some(offset) = physical_offset(
                 u.main_rows,
@@ -879,8 +906,7 @@ fn sample_coefficients(
                 u.code.ell,
                 virtual_index,
             )? {
-                main[offset] =
-                    front.mul(&eq_index(virtual_index, &seed.z, cube.main_bits)?);
+                main[offset] = front.mul(&eq[virtual_index as usize]);
             }
         }
         if !cube.has_mask {
@@ -903,6 +929,10 @@ fn sample_coefficients(
         let count = 1u64
             .checked_shl(cube.mask_bits)
             .ok_or(Error::ResourceLimit)?;
+        let eq = eq_vector(&seed.z, cube.mask_bits)?;
+        if eq.len() as u64 != count {
+            return Err(Error::ShapeMismatch);
+        }
         for virtual_index in 0..count {
             if let Some(offset) = physical_offset(
                 u.mask_rows,
@@ -910,8 +940,7 @@ fn sample_coefficients(
                 code.ell,
                 virtual_index,
             )? {
-                mask[offset] =
-                    front.mul(&eq_index(virtual_index, &seed.z, cube.mask_bits)?);
+                mask[offset] = front.mul(&eq[virtual_index as usize]);
             }
         }
         sample_pad(

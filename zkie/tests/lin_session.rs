@@ -341,9 +341,12 @@ fn selected_gpt2_output_head_request_session() {
     use zkie_ops::proof::output_head_lin::{
         build_output_head_hidden_plan, build_output_head_output_plan, output_head_shape,
         prove_output_head_lin_hidden, select_output_head_step, verify_output_head_lin_hidden,
-        OutputHeadLinProof, OutputHeadLinSetup, OutputHeadTrustedInputs, OUTPUT_HEAD_ASSET_PATH,
-        OUTPUT_HEAD_COLUMNS, OUTPUT_HEAD_HIDDEN, OUTPUT_HEAD_K_LO, OUTPUT_HEAD_POSITIONS,
+        OutputClosureSetup, OutputHeadLinProof, OutputHeadLinSetup, OutputHeadTrustedInputs,
+        OUTPUT_HEAD_ASSET_PATH, OUTPUT_HEAD_COLUMNS, OUTPUT_HEAD_HIDDEN, OUTPUT_HEAD_K_LO,
+        OUTPUT_HEAD_POSITIONS, OUTPUT_HEAD_RANGE_BITS, OUTPUT_HEAD_SLACK_BITS,
     };
+    use zkie_ops::proof::output_closure::ClosureMaskPlan;
+    use zkie_ops::proof::psc::{hp_entries, psc_variables};
     use zkie_ops::proof::plan::PlanSource;
     use zkie_ops::proof::session_baseline::SESSION_PROTOCOL_IDENTITY;
 
@@ -371,7 +374,7 @@ fn selected_gpt2_output_head_request_session() {
     const OMEGA_ORACLE: u64 = 11;
     const PROXIMITY_GROUP: u64 = 5;
     const SHARED_FRESH: u64 = 50;
-    const OWN_FRESH: u64 = 51;
+    const OWN_FRESH: u64 = 1000;
     const W_TREE_NUMBER: u64 = 100;
     const SHARED_MASK_TREE: u64 = 200;
     const OWN_MASK_TREE: u64 = 201;
@@ -383,6 +386,18 @@ fn selected_gpt2_output_head_request_session() {
     const DOT_ORACLE: u64 = 41;
     const DOT_TREE_NUMBER: u64 = 302;
     const DOT_RUN: Digest = Digest([0x67; 32]);
+    const SLACK_ORACLE_BASE: u64 = 60;
+    const SLACK_TREE_NUMBER: u64 = 400;
+    const SLACK_RUN: Digest = Digest([0x68; 32]);
+    const BITS_ORACLE_BASE: u64 = 100;
+    const BITS_TREE_NUMBER: u64 = 420;
+    const BITS_RUN: Digest = Digest([0x69; 32]);
+    const MAP_ORACLE_BASE: u64 = 180;
+    const MAP_TREE_NUMBER: u64 = 440;
+    const MAP_RUN: Digest = Digest([0x6B; 32]);
+    const CLOSURE_MASK_ORACLE: u64 = 140;
+    const CLOSURE_MASK_TREE: u64 = 500;
+    const CLOSURE_MASK_RUN: Digest = Digest([0x6A; 32]);
     /// The real compiled plan draws this many table columns in the shared
     /// stage; the merged session charges the same number from the reader.
     const COLUMN_DRAWS: usize = 603;
@@ -658,7 +673,7 @@ fn selected_gpt2_output_head_request_session() {
         mask_code,
         shared_mask_tree: mask_tree(SHARED_MASK_TREE),
         own_mask_tree: MaskTreePlan {
-            mask_rows: 2,
+            mask_rows: 4,
             ..mask_tree(OWN_MASK_TREE)
         },
         shared_fresh: SHARED_FRESH,
@@ -699,6 +714,84 @@ fn selected_gpt2_output_head_request_session() {
             configuration,
         },
         entries: MaskEntryAllocation::new(OUTPUT_HEAD_POSITIONS as u32).unwrap(),
+    };
+    let closure_width = 2 * (OUTPUT_HEAD_RANGE_BITS + 1) + OUTPUT_HEAD_SLACK_BITS;
+    let bits_columns = (OUTPUT_HEAD_COLUMNS as u64)
+        .checked_mul(closure_width as u64)
+        .unwrap()
+        .next_power_of_two();
+    let boolean_variables = bits_columns.trailing_zeros() as usize;
+    let closure_slack = WShape::new(
+        OUTPUT_HEAD_COLUMNS as u64,
+        code,
+        1,
+        OUTPUT_HEAD_POSITIONS as u32,
+        SALT,
+        SLACK_TREE_NUMBER,
+        2,
+        SLACK_RUN,
+        configuration,
+    )
+    .unwrap();
+    let closure_bits = WShape::new(
+        bits_columns,
+        code,
+        1,
+        OUTPUT_HEAD_POSITIONS as u32,
+        SALT,
+        BITS_TREE_NUMBER,
+        2,
+        BITS_RUN,
+        configuration,
+    )
+    .unwrap();
+    let closure_variables = psc_variables(boolean_variables).unwrap();
+    let closure_mask = ClosureMaskPlan {
+        oracle: CLOSURE_MASK_ORACLE,
+        group: GROUP,
+        mask_code,
+        mask_rows: 2,
+        answers: 1,
+        openings: 2,
+        tree: RuntimeTreePlan {
+            tree_number: CLOSURE_MASK_TREE,
+            leaf_class: 3,
+            log_n: mask_code.log_n,
+            log_n_zk: mask_code.log_n,
+            parts: vec![RuntimeTreePart {
+                main_symbols: 0,
+                mask_symbols: 2 * E_DEGREE as u64,
+            }],
+            salt_bytes: SALT,
+            run: CLOSURE_MASK_RUN,
+            configuration,
+        },
+        positions: OUTPUT_HEAD_POSITIONS as u32,
+        hiding: hp_entries(&closure_variables).unwrap(),
+        shown: 5,
+    };
+    let closure_setup = OutputClosureSetup {
+        slack: closure_slack,
+        slack_oracle_base: SLACK_ORACLE_BASE,
+        slack_openings: 2,
+        bits: closure_bits,
+        bits_oracle_base: BITS_ORACLE_BASE,
+        bits_openings: 2,
+        map: WShape::new(
+            bits_columns,
+            code,
+            1,
+            OUTPUT_HEAD_POSITIONS as u32,
+            SALT,
+            MAP_TREE_NUMBER,
+            2,
+            MAP_RUN,
+            configuration,
+        )
+        .unwrap(),
+        map_oracle_base: MAP_ORACLE_BASE,
+        map_openings: 2,
+        mask: closure_mask,
     };
     let setup = OutputHeadLinSetup {
         asset_path: OUTPUT_HEAD_ASSET_PATH.to_string(),
@@ -744,6 +837,7 @@ fn selected_gpt2_output_head_request_session() {
         masks: Vec::new(),
         expected_activation_root: None,
         expected_roots: None,
+        closure: Some(closure_setup),
     };
 
     // X and Y come only from the verified trace outputs.
@@ -811,9 +905,14 @@ fn selected_gpt2_output_head_request_session() {
     );
     drop(outputs);
 
+    // The diagnostic path keeps its own proximity basis: the closure mask is
+    // not part of the diagnostic proof, so its fresh-mask table stays at the
+    // pre-closure row count.
+    let mut diagnostic_setup = setup.clone();
+    diagnostic_setup.proximity.own_mask_tree.mask_rows = 2;
     let started = Instant::now();
     let (proof, witness) =
-        prove_output_head_lin_prepared(&request, shape, &setup, &mut table).unwrap();
+        prove_output_head_lin_prepared(&request, shape, &diagnostic_setup, &mut table).unwrap();
     let prove_ms = started.elapsed().as_millis();
     let bytes = proof.encode().unwrap();
     assert_eq!(bytes.len(), proof.encoded_len().unwrap());
@@ -821,7 +920,7 @@ fn selected_gpt2_output_head_request_session() {
     println!("request_proof_bytes={}", bytes.len());
     println!("prove_ms={prove_ms}");
 
-    let mut verifier_setup = setup.clone();
+    let mut verifier_setup = diagnostic_setup.clone();
     verifier_setup.expected_activation_root = Some(proof.session.first.activation.root);
     verifier_setup.expected_roots = Some(witness.send.roots.clone());
 
@@ -952,6 +1051,7 @@ fn selected_gpt2_output_head_request_session() {
         masks: claims.masks,
         proximity: verifier_setup.proximity.clone(),
         output_relation: None,
+        closure: None,
     };
     let decoded = OutputHeadLinProof::decode(&merged, &bytes).unwrap();
     assert_eq!(decoded, proof);
@@ -1092,6 +1192,34 @@ fn selected_gpt2_output_head_request_session() {
                 COLUMN_DRAWS as u64,
             )
             .expect("reserve the table openings");
+        // The actual model-bound witness: the largest magnitude of one
+        // reduced output cell and the largest comparison slack under the
+        // trusted mask and winner.
+        let mut max_abs_output = 0i64;
+        let mut max_slack = 0i64;
+        for position in 0..OUTPUT_HEAD_POSITIONS {
+            let row =
+                &request.inputs.output[position * OUTPUT_HEAD_COLUMNS..(position + 1) * OUTPUT_HEAD_COLUMNS];
+            let winner = output_plan.expected_argmax[position] as usize;
+            let winner_value = row[winner];
+            for (column, value) in row.iter().enumerate() {
+                max_abs_output = max_abs_output.max(value.saturating_abs());
+                let masked = value
+                    .saturating_add(if column >= output_plan.valid {
+                        output_plan.mask_value
+                    } else {
+                        0
+                    });
+                let low = if column < winner { 1 } else { 0 };
+                max_slack = max_slack.max(winner_value.saturating_sub(masked).saturating_sub(low));
+            }
+        }
+        println!("output_abs_max={max_abs_output}");
+        println!("output_slack_max={max_slack}");
+        println!(
+            "closure_range_bits={} closure_slack_bits={}",
+            OUTPUT_HEAD_RANGE_BITS, OUTPUT_HEAD_SLACK_BITS
+        );
         let started = Instant::now();
         let (hidden_proof, hidden_witness, closure) = prove_output_head_lin_hidden(
             shape,
@@ -1356,6 +1484,118 @@ fn selected_gpt2_output_head_request_session() {
             &hidden_proof
         )
         .is_err());
+
+        // Output-closure negatives on the real proof: the booleanity
+        // transcript, the fresh-point evaluations and every new commitment
+        // reach the final verifier.
+        let reject = |candidate: &OutputHeadLinProof| {
+            verify_output_head_lin_hidden(
+                shape,
+                &hidden_plan,
+                &trusted,
+                &table.reader(),
+                candidate,
+            )
+            .is_err()
+        };
+        let mut tampered = hidden_proof.clone();
+        tampered
+            .session
+            .second
+            .closure
+            .as_mut()
+            .unwrap()
+            .psc[0]
+            .rounds[0]
+            .coefficients[0] = Fp3::from_u64(1);
+        assert!(reject(&tampered));
+        let mut tampered = hidden_proof.clone();
+        tampered.session.second.closure.as_mut().unwrap().point_values[0][1] =
+            Fp3::from_u64(1);
+        assert!(reject(&tampered));
+        let mut tampered = hidden_proof.clone();
+        tampered
+            .session
+            .first
+            .closure
+            .as_mut()
+            .unwrap()
+            .bits
+            .group
+            .entries[0]
+            .root
+            .0[0] ^= 1;
+        assert!(reject(&tampered));
+        let mut tampered = hidden_proof.clone();
+        tampered
+            .session
+            .first
+            .closure
+            .as_mut()
+            .unwrap()
+            .map
+            .group
+            .entries[0]
+            .root
+            .0[0] ^= 1;
+        assert!(reject(&tampered));
+        let mut tampered = hidden_proof.clone();
+        tampered
+            .session
+            .first
+            .closure
+            .as_mut()
+            .unwrap()
+            .slack
+            .group
+            .entries[0]
+            .root
+            .0[0] ^= 1;
+        assert!(reject(&tampered));
+        let mut tampered = hidden_proof.clone();
+        tampered.session.first.closure.as_mut().unwrap().mask.root.0[0] ^= 1;
+        assert!(reject(&tampered));
+        let mut tampered = hidden_proof.clone();
+        tampered.session.first.closure.as_mut().unwrap().slack_sample.answers[0] =
+            Fp3::from_u64(1);
+        assert!(reject(&tampered));
+        let mut missing = hidden_proof.clone();
+        missing.session.first.closure = None;
+        assert!(reject(&missing));
+
+        // A different trusted public winner changes the closure plan and the
+        // comparison rows.
+        let mut wrong_output = output_plan.clone();
+        wrong_output.expected_argmax[0] =
+            (wrong_output.expected_argmax[0] + 1) % wrong_output.valid as u32;
+        let wrong_trusted = OutputHeadTrustedInputs {
+            activation: trusted.activation,
+            output: wrong_output.clone(),
+        };
+        let wrong_plan = build_output_head_hidden_plan(
+            shape,
+            &hidden_setup,
+            &table.reader(),
+            &wrong_trusted,
+        )
+        .unwrap();
+        assert!(verify_output_head_lin_hidden(
+            shape,
+            &wrong_plan,
+            &wrong_trusted,
+            &table.reader(),
+            &hidden_proof
+        )
+        .is_err());
+
+        // The canonical hidden encoding rejects a trailing byte and a
+        // truncated tail against the closure-bearing plan.
+        let mut trailing = hidden_bytes.clone();
+        trailing.push(0);
+        assert!(OutputHeadLinProof::decode(&hidden_plan, &trailing).is_err());
+        let mut truncated = hidden_bytes.clone();
+        truncated.truncate(truncated.len() - 1);
+        assert!(OutputHeadLinProof::decode(&hidden_plan, &truncated).is_err());
     }
 
     fs::remove_dir_all(&link_dir).ok();

@@ -55,8 +55,9 @@ use crate::proof::hidden_send_session::{
     prove_hidden_lin, prove_hidden_lin_hidden, verify_hidden_lin, verify_hidden_lin_hidden,
     ActivationCommitment, ActivationShape, CommittedActivation, HiddenLinMessages, HiddenLinOutcome,
     HiddenLinPlan, HiddenLinWitness, HiddenOutputShape, HiddenProximityPlan, HiddenSendPlan,
-    HiddenTableProver, IndexMaskPlan,
+    HiddenTableProver, IndexMaskPlan, WShape,
 };
+use crate::proof::output_closure::{ClosureMaskPlan, ClosurePlan};
 use crate::proof::model_commitment::{
     verify_shared_trace_outputs, ModelCommitmentPublic, SharedTrace,
 };
@@ -66,6 +67,9 @@ use crate::proof::plan::{
 use crate::proof::session_baseline::{assemble_binding, SelectedMatmulStep};
 
 
+/// Canonical encoding version of the merged request proof. Version 4 is the
+/// versioned envelope around the session encoding; the optional closure block
+/// is part of the session encoding and is selected by the trusted plan.
 const OUTPUT_HEAD_PROOF_VERSION: u64 = 4;
 
 /// Positions of one output-head MatMul request.
@@ -76,6 +80,10 @@ pub const OUTPUT_HEAD_HIDDEN: usize = 1024;
 pub const OUTPUT_HEAD_COLUMNS: usize = 65536;
 /// Low column bits placed inside one table row.
 pub const OUTPUT_HEAD_K_LO: u32 = 6;
+/// The public integer bound `D` of one reduced output cell: `|Y_j| < 2^D`.
+pub const OUTPUT_HEAD_RANGE_BITS: u32 = 40;
+/// The public slack bound exponent `b`: `0 <= S_j < 2^b`.
+pub const OUTPUT_HEAD_SLACK_BITS: u32 = 42;
 /// Table rows; `2^(k_col - k_lo)` with `k_col = 16`.
 pub const OUTPUT_HEAD_TABLE_ROWS: u64 = 1024;
 
@@ -311,6 +319,27 @@ pub struct OutputHeadLinSetup {
     /// and checks them through the openings. It is a test hook, not a policy
     /// pin.
     pub expected_roots: Option<Vec<Digest>>,
+    /// The trusted shapes and ids of the output-closure messages. The formal
+    /// hidden-input path requires it.
+    pub closure: Option<OutputClosureSetup>,
+}
+
+/// The trusted setup of the output-closure messages: the slack and packed-bit
+/// message shapes, their oracle bases and opening counts, and the mask-only
+/// message plan. The integer bounds and the public winner come from the
+/// trusted output relation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputClosureSetup {
+    pub slack: WShape,
+    pub slack_oracle_base: u64,
+    pub slack_openings: usize,
+    pub bits: WShape,
+    pub bits_oracle_base: u64,
+    pub bits_openings: usize,
+    pub map: WShape,
+    pub map_oracle_base: u64,
+    pub map_openings: usize,
+    pub mask: ClosureMaskPlan,
 }
 
 /// The merged request proof. One session covers every position; the canonical
@@ -404,6 +433,13 @@ pub struct OutputHeadOutputPlan {
     pub argmax_steps: Vec<usize>,
     /// The expected final output, one index per position.
     pub expected_argmax: Vec<u32>,
+    /// Version of the output relation. Version 2 carries the exact integer
+    /// range and comparison closure.
+    pub relation_version: u64,
+    /// The integer bound `D` of `|Y_j|`: `A = 2^D - 1`.
+    pub range_bits: u32,
+    /// The slack bound exponent `b`: `B = 2^b`.
+    pub slack_bits: u32,
 }
 
 impl OutputHeadOutputPlan {
@@ -434,6 +470,26 @@ impl OutputHeadOutputPlan {
         {
             return Err(Error::BoundViolation);
         }
+        if self.relation_version != 2
+            || self.range_bits == 0
+            || self.range_bits > 62
+            || self.slack_bits == 0
+            || self.slack_bits > 62
+        {
+            return Err(Error::InvalidConfig);
+        }
+        let offset = (1u128 << self.range_bits) - 1;
+        if (self.mask_value as i128) > -((offset as i128) + 1) {
+            return Err(Error::InvalidConfig);
+        }
+        let bound = 1u128 << self.slack_bits;
+        let no_wrap = bound
+            .checked_add(2 * offset)
+            .and_then(|value| value.checked_add((self.mask_value as i128).unsigned_abs()));
+        match no_wrap {
+            Some(value) if value < MODULUS as u128 => {}
+            _ => return Err(Error::BoundViolation),
+        }
         Ok(())
     }
 
@@ -441,7 +497,7 @@ impl OutputHeadOutputPlan {
     pub fn digest(&self) -> Result<Digest> {
         let mut writer = CanonicalWriter::new();
         writer.put_bytes(b"zkie/output-head-relation");
-        writer.put_u64(1);
+        writer.put_u64(self.relation_version);
         writer.put_u64(self.step.step as u64);
         writer.put_u64(self.step.activation_step as u64);
         writer.put_u64(self.step.activation_output as u64);
@@ -461,6 +517,8 @@ impl OutputHeadOutputPlan {
         for value in &self.expected_argmax {
             writer.put_u64(*value as u64);
         }
+        writer.put_u64(self.range_bits as u64);
+        writer.put_u64(self.slack_bits as u64);
         hash_labeled(tag_word(STATEMENT, 2), 0, None, &writer.into_bytes())
     }
 }
@@ -569,6 +627,48 @@ fn hidden_plan(
         None
     };
     send.expected_roots = setup.expected_roots.clone();
+    let closure = match &setup.closure {
+        Some(closure) => {
+            let width = (output.range_bits as u64 + 1)
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(output.slack_bits as u64))
+                .ok_or(Error::ResourceLimit)?;
+            let columns = (output.vocab as u64)
+                .checked_mul(width)
+                .ok_or(Error::ResourceLimit)?;
+            if columns == 0 || columns > (1u64 << 30) {
+                return Err(Error::ResourceLimit);
+            }
+            let bits_columns = columns.next_power_of_two();
+            let boolean_variables = bits_columns.trailing_zeros();
+            let plan = ClosurePlan {
+                range_bits: output.range_bits,
+                slack_bits: output.slack_bits,
+                valid: output.valid,
+                vocab: output.vocab,
+                mask_value: output.mask_value,
+                winner: output.expected_argmax.clone(),
+                slack: closure.slack.clone(),
+                slack_oracle_base: closure.slack_oracle_base,
+                slack_openings: closure.slack_openings,
+                bits: closure.bits.clone(),
+                bits_oracle_base: closure.bits_oracle_base,
+                bits_openings: closure.bits_openings,
+                map: closure.map.clone(),
+                map_oracle_base: closure.map_oracle_base,
+                map_openings: closure.map_openings,
+                bits_columns,
+                bits_per_cell: width as u32,
+                boolean_variables,
+                mask: closure.mask.clone(),
+            };
+            if plan.fault(&send).is_some() {
+                return Err(Error::InvalidConfig);
+            }
+            Some(plan)
+        }
+        None => None,
+    };
     let plan = HiddenLinPlan {
         send,
         output: HiddenOutputShape {
@@ -579,6 +679,7 @@ fn hidden_plan(
         masks: vec![Vec::new(); activation.shape.positions()],
         proximity: setup.proximity.clone(),
         output_relation: Some(output.digest()?),
+        closure,
     };
     plan.validate()?;
     Ok(plan)
@@ -674,6 +775,8 @@ pub fn build_output_head_output_plan(
         OUTPUT_HEAD_HIDDEN,
         OUTPUT_HEAD_COLUMNS,
         OUTPUT_HEAD_ASSET_PATH,
+        OUTPUT_HEAD_RANGE_BITS,
+        OUTPUT_HEAD_SLACK_BITS,
         expected_argmax,
     )
 }
@@ -687,6 +790,8 @@ pub fn build_output_head_output_plan_for(
     hidden: usize,
     columns: usize,
     asset_path: &str,
+    range_bits: u32,
+    slack_bits: u32,
     expected_argmax: &[u32],
 ) -> Result<OutputHeadOutputPlan> {
     let step = select_output_head_step_for(plan, positions, hidden, columns, asset_path)?;
@@ -745,6 +850,9 @@ pub fn build_output_head_output_plan_for(
         mask_value,
         argmax_steps: plan.argmax_steps.clone(),
         expected_argmax: expected_argmax.to_vec(),
+        relation_version: 2,
+        range_bits,
+        slack_bits,
     };
     Ok(output)
 }
@@ -789,10 +897,14 @@ pub fn prove_output_head_lin_hidden(
         setup.activation_configuration,
     )?;
     let reader = table.reader().clone();
-    let plan = hidden_plan(shape, setup, &reader, *activation.commitment(), output)?;
-    let (session, witness) = prove_hidden_lin_hidden(&plan, &activation, table, setup.seed)?;
-    let rows = witness_output_rows(&witness)?;
-    let closure = close_output_relation(output, &rows)?;
+    let plan = hidden_plan(shape, setup, &reader, *activation.commitment(), output)
+        ?;
+    let (session, witness) = prove_hidden_lin_hidden(&plan, &activation, table, setup.seed)
+        ?;
+    let rows = witness_output_rows(&witness)
+        ?;
+    let closure = close_output_relation(output, &rows)
+        ?;
     Ok((OutputHeadLinProof { session }, witness, closure))
 }
 
@@ -823,6 +935,16 @@ pub fn verify_output_head_lin_hidden(
         return Err(Error::StatementMismatch);
     }
     if plan.output_relation != Some(trusted.output.digest()?) {
+        return Err(Error::StatementMismatch);
+    }
+    let closure = plan.closure.as_ref().ok_or(Error::InvalidConfig)?;
+    if closure.range_bits != trusted.output.range_bits
+        || closure.slack_bits != trusted.output.slack_bits
+        || closure.valid != trusted.output.valid
+        || closure.vocab != trusted.output.vocab
+        || closure.mask_value != trusted.output.mask_value
+        || closure.winner != trusted.output.expected_argmax
+    {
         return Err(Error::StatementMismatch);
     }
     if proof.session.first.activation != trusted.activation {
@@ -1122,6 +1244,7 @@ pub(crate) fn merged_plan(
         masks: claims.masks.clone(),
         proximity,
         output_relation: None,
+        closure: None,
     };
     plan.validate()?;
     Ok(plan)
@@ -1431,6 +1554,8 @@ pub fn verify_output_head_lin_request_bytes(
 mod tests {
     use super::diagnostic::*;
     use super::*;
+    use crate::proof::output_closure::{ClosureMaskPlan, ClosurePlan};
+    use crate::proof::psc::{hp_entries, psc_variables};
     use std::cell::RefCell;
     use std::fs;
     use std::path::PathBuf;
@@ -1463,7 +1588,11 @@ mod tests {
     const TOY_TABLE_ROWS: u64 = 4;
     const TOY_VALID: usize = 6;
     const TOY_ASSET: &str = "toy_head_i32.bin";
-    const GROUP_CODE_LOG_N: u32 = 6;
+    const GROUP_CODE_LOG_N: u32 = 10;
+    /// The toy fixture carries i32 extreme activations, so its output bound is
+    /// larger than the production output-head bound.
+    const TOY_RANGE_BITS: u32 = 40;
+    const TOY_SLACK_BITS: u32 = 42;
     const GROUP_CODE_ELL: u64 = 32;
     const GROUP_CODE_R: u64 = 1;
     const TABLE_CODE_LOG_N: u32 = 5;
@@ -1483,6 +1612,18 @@ mod tests {
     const INDEX_MASK_ORACLE: u64 = 40;
     const INDEX_MASK_TREE: u64 = 202;
     const INDEX_MASK_RUN: Digest = Digest([0x65; 32]);
+    const SLACK_ORACLE_BASE: u64 = 100;
+    const SLACK_TREE_NUMBER: u64 = 400;
+    const SLACK_RUN: Digest = Digest([0x68; 32]);
+    const BITS_ORACLE_BASE: u64 = 120;
+    const BITS_TREE_NUMBER: u64 = 420;
+    const BITS_RUN: Digest = Digest([0x69; 32]);
+    const MAP_ORACLE_BASE: u64 = 160;
+    const MAP_TREE_NUMBER: u64 = 460;
+    const MAP_RUN: Digest = Digest([0x6B; 32]);
+    const CLOSURE_MASK_ORACLE: u64 = 140;
+    const CLOSURE_MASK_TREE: u64 = 500;
+    const CLOSURE_MASK_RUN: Digest = Digest([0x6A; 32]);
     const ACTIVATION_CONFIGURATION: Digest = Digest([0x31; 32]);
     const W_RUN: Digest = Digest([0x41; 32]);
     const W_CONFIGURATION: Digest = Digest([0x51; 32]);
@@ -1721,11 +1862,11 @@ mod tests {
             mask_code: group_code(),
             shared_mask_tree: mask_tree(SHARED_MASK_TREE),
             own_mask_tree: MaskTreePlan {
-                mask_rows: 4,
+                mask_rows: 32,
                 ..mask_tree(OWN_MASK_TREE)
             },
             shared_fresh: 50,
-            own_fresh: 51,
+            own_fresh: 1000,
             column_draws: 2,
             column_budget: 4,
             column_work_bits: 0,
@@ -1935,6 +2076,82 @@ mod tests {
         let salts: Vec<Vec<u8>> = (0..TOY_POSITIONS)
             .map(|position| vec![(position as u8).wrapping_mul(11) ^ 0x3C; SALT])
             .collect();
+        let closure_width = 2 * (TOY_RANGE_BITS + 1) + TOY_SLACK_BITS;
+        let bits_columns = (TOY_COLUMNS as u64)
+            .checked_mul(closure_width as u64)
+            .unwrap()
+            .next_power_of_two();
+        let boolean_variables = bits_columns.trailing_zeros() as usize;
+        let closure_variables = psc_variables(boolean_variables).unwrap();
+        let closure_mask = ClosureMaskPlan {
+            oracle: CLOSURE_MASK_ORACLE,
+            group: SEND_GROUP,
+            mask_code: group_code(),
+            mask_rows: 16,
+            answers: 1,
+            openings: 1,
+            tree: RuntimeTreePlan {
+                tree_number: CLOSURE_MASK_TREE,
+                leaf_class: 1,
+                log_n: GROUP_CODE_LOG_N,
+                log_n_zk: GROUP_CODE_LOG_N,
+                parts: vec![RuntimeTreePart {
+                    main_symbols: 0,
+                    mask_symbols: 16 * E_DEGREE as u64,
+                }],
+                salt_bytes: SALT,
+                run: CLOSURE_MASK_RUN,
+                configuration: W_CONFIGURATION,
+            },
+            positions: TOY_POSITIONS as u32,
+            hiding: hp_entries(&closure_variables).unwrap(),
+            shown: 5,
+        };
+        let closure_setup = OutputClosureSetup {
+            slack: WShape::new(
+                TOY_COLUMNS as u64,
+                group_code(),
+                1,
+                TOY_POSITIONS as u32,
+                SALT,
+                SLACK_TREE_NUMBER,
+                1,
+                SLACK_RUN,
+                W_CONFIGURATION,
+            )
+            .unwrap(),
+            slack_oracle_base: SLACK_ORACLE_BASE,
+            slack_openings: 1,
+            bits: WShape::new(
+                bits_columns,
+                group_code(),
+                1,
+                TOY_POSITIONS as u32,
+                SALT,
+                BITS_TREE_NUMBER,
+                1,
+                BITS_RUN,
+                W_CONFIGURATION,
+            )
+            .unwrap(),
+            bits_oracle_base: BITS_ORACLE_BASE,
+            bits_openings: 1,
+            map: WShape::new(
+                bits_columns,
+                group_code(),
+                1,
+                TOY_POSITIONS as u32,
+                SALT,
+                MAP_TREE_NUMBER,
+                1,
+                MAP_RUN,
+                W_CONFIGURATION,
+            )
+            .unwrap(),
+            map_oracle_base: MAP_ORACLE_BASE,
+            map_openings: 1,
+            mask: closure_mask,
+        };
         let setup = OutputHeadLinSetup {
             asset_path: TOY_ASSET.into(),
             send,
@@ -1946,6 +2163,7 @@ mod tests {
             masks: Vec::new(),
             expected_activation_root: None,
             expected_roots: None,
+            closure: Some(closure_setup),
         };
         let mut encoded = encoded;
         let request = prepare_output_head_trace_for(
@@ -2235,6 +2453,8 @@ mod tests {
             TOY_HIDDEN,
             TOY_COLUMNS,
             TOY_ASSET,
+            TOY_RANGE_BITS,
+            TOY_SLACK_BITS,
             &expected,
         )
         .unwrap();
@@ -2412,6 +2632,123 @@ mod tests {
             &leaky
         )
         .is_err());
+
+        // Output-closure negatives: every new message and every booleanity
+        // transcript value is bound by the final verifier.
+        let reject = |candidate: &OutputHeadLinProof| {
+            verify_output_head_lin_hidden(
+                fixture.shape,
+                &plan,
+                &trusted,
+                &fixture.table.reader,
+                candidate,
+            )
+            .is_err()
+        };
+        let mut tampered = proof.clone();
+        tampered
+            .session
+            .second
+            .closure
+            .as_mut()
+            .unwrap()
+            .psc[0]
+            .rounds[0]
+            .coefficients[0] = Fp3::from_u64(1);
+        assert!(reject(&tampered));
+        let mut tampered = proof.clone();
+        tampered.session.second.closure.as_mut().unwrap().point_values[0][0] =
+            Fp3::from_u64(1);
+        assert!(reject(&tampered));
+        let mut tampered = proof.clone();
+        tampered
+            .session
+            .first
+            .closure
+            .as_mut()
+            .unwrap()
+            .bits
+            .group
+            .entries[0]
+            .root
+            .0[0] ^= 1;
+        assert!(reject(&tampered));
+        let mut tampered = proof.clone();
+        tampered
+            .session
+            .first
+            .closure
+            .as_mut()
+            .unwrap()
+            .map
+            .group
+            .entries[0]
+            .root
+            .0[0] ^= 1;
+        assert!(reject(&tampered));
+        let mut tampered = proof.clone();
+        tampered
+            .session
+            .first
+            .closure
+            .as_mut()
+            .unwrap()
+            .slack
+            .group
+            .entries[0]
+            .root
+            .0[0] ^= 1;
+        assert!(reject(&tampered));
+        let mut tampered = proof.clone();
+        tampered.session.first.closure.as_mut().unwrap().slack_sample.answers[0] =
+            Fp3::from_u64(1);
+        assert!(reject(&tampered));
+        let mut tampered = proof.clone();
+        tampered.session.first.closure.as_mut().unwrap().mask.root.0[0] ^= 1;
+        assert!(reject(&tampered));
+        let mut missing = proof.clone();
+        missing.session.first.closure = None;
+        assert!(reject(&missing));
+
+        // A different trusted winner changes the closure plan and rows.
+        let mut wrong_output = output.clone();
+        wrong_output.expected_argmax[0] =
+            (wrong_output.expected_argmax[0] + 1) % TOY_VALID as u32;
+        let wrong_trusted = OutputHeadTrustedInputs {
+            activation,
+            output: wrong_output.clone(),
+        };
+        let wrong_plan = hidden_plan(
+            fixture.shape,
+            &setup,
+            &fixture.table.reader,
+            activation,
+            &wrong_output,
+        )
+        .unwrap();
+        assert!(verify_output_head_lin_hidden(
+            fixture.shape,
+            &wrong_plan,
+            &wrong_trusted,
+            &fixture.table.reader,
+            &proof
+        )
+        .is_err());
+
+        // A wider integer bound changes the packed bit shape and is rejected
+        // before any proof runs with the old setup.
+        let mut wider = output.clone();
+        wider.range_bits += 10;
+        assert!(build_output_head_hidden_plan(
+            fixture.shape,
+            &setup,
+            &fixture.table.reader,
+            &OutputHeadTrustedInputs {
+                activation,
+                output: wider,
+            },
+        )
+        .is_err());
     }
 
     #[test]
@@ -2481,6 +2818,8 @@ mod tests {
             TOY_HIDDEN,
             TOY_COLUMNS,
             TOY_ASSET,
+            OUTPUT_HEAD_RANGE_BITS,
+            OUTPUT_HEAD_SLACK_BITS,
             &output.expected_argmax,
         )
         .is_err());
@@ -2493,6 +2832,8 @@ mod tests {
             TOY_HIDDEN,
             TOY_COLUMNS,
             TOY_ASSET,
+            OUTPUT_HEAD_RANGE_BITS,
+            OUTPUT_HEAD_SLACK_BITS,
             &output.expected_argmax,
         )
         .is_err());

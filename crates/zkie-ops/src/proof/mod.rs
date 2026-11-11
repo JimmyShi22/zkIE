@@ -15,6 +15,7 @@ pub mod hidden_send_session;
 pub mod send_session;
 pub mod lin_session;
 pub mod output_head_lin;
+pub mod output_closure;
 pub mod plan;
 pub mod proximity_session;
 pub mod psc;
