@@ -27,7 +27,7 @@ verification.
 
 Snapshot: the closed relation at code basis `3b3e8ecc`, with the bounded-read
 rollback `8d32d3de`; fixture `gpt2-seq16`, 16 positions, proof 9,939,144 B.
-The committed document is version 8.
+The committed document is version 9.
 
 ## 1. The chain in one view
 
@@ -42,7 +42,7 @@ The committed document is version 8.
 | 7 | Dot PSC hiding coefficients | Dot PSC transcript and end values | the same 23-entry hiding class | the hiding map is triangular with a nonzero constant determinant; the two shown end masks one-time pad the end values | sumcheck degree terms in section 6 | `NUM` 23x23 map, `CODE` triangularity |
 | 8 | closure PSC hiding coefficients | per-position PSC transcript | the same closure mask message | same triangular map, one instance per position | sumcheck degree terms; 16 instances | `NUM` 49x49 map, `CODE` |
 | 9 | FOLD fresh coefficients | FOLD start sum and round values | the same fold instance | triangular coefficient map with constant nonzero determinant; the start sum and every sent round value are covered | sumcheck degree terms; two FOLD instances | `NUM` k=2 and k=14, `CODE` |
-| 10 | BASE star main/mask rows and tails | BASE target, combined rows and star openings | target, rows and openings of the same star | fresh one-time pads on the target dot product, each combined coordinate and each tail coordinate | lambda and position checks | `NUM` real star path, `CODE` |
+| 10 | BASE star main/mask rows and tails | BASE target, combined rows and star openings | target, rows and openings of the same star | fresh one-time pads on the target dot product, each combined coordinate and each tail coordinate | BASE lambda/position terms are in `eps_proximity = UNKNOWN` (section 6) | `NUM` real star path, `CODE` |
 | 11 | challenge draws | every PSC/FOLD/BASE/position challenge | none | drawn after the message they test; zero-fallback event bounded | 2^-192 per draw fallback, `chi=0` term | `CODE` draw functions, `NUM` order tests |
 
 The rest of the note expands each column.
@@ -520,7 +520,7 @@ mask'   = star.mask + lambda * mask
   = target* + lambda * target
 ```
 
-The star cancels. The relation left after elimination is the approved public
+The star cancels. The relation left after elimination is the public
 claim relation `target` (the verifier knows the claim and target from the
 committed rows), not the secret row. The combined rows and the target alone
 leave the star underdetermined: they give one dot product and one padded
@@ -588,50 +588,85 @@ the algebraic cover argument can be conditioned on the root without changing
 the secret distribution. This adaptation argument depends on the RO model for
 the root and leaf outputs, not on CR.
 
-`[FACT]` `CODE` `MATH` Specific hybrid for opened and unopened leaves. The
-standard salted-Merkle random-oracle commitment lemma applies with the
-following simulator, events and mapping:
+`[FACT]` `CODE` `MATH` Simulator construction for the opened and unopened
+leaves. The standard salted-Merkle random-oracle commitment lemma applies with
+the following ordered simulator. Write `q` for the cumulative number of
+random-oracle queries and calls made by the adversary and the simulator up to
+the event, including leaf, node, root, challenge and opening queries. The
+simulator receives only the public statement/plan and the random-oracle
+interface; it receives neither the prover's witness nor the opening set.
 
-1. **Query count.** `q` is the cumulative number of random-oracle queries and
-   calls made by the adversary and the simulator up to the event, including
-   leaf, node, root, challenge and opening queries. All bounds below use this
-   cumulative `q`.
-2. **Simulator inputs.** The simulator receives the public statement and plan,
-   the random-oracle interface, and the algebraic hiding-map randomness it
-   needs to choose the opened leaf values. It does **not** receive the opening
-   set, and it does not precompute the leaves from the prover's witness: the
-   opening positions are produced only after the roots and the Fiat-Shamir
-   challenges.
-3. **Commitment phase.** For every leaf it chooses a salt and a uniform
-   digest `com_i` independently (lazily sampled); it keeps the pair
-   `(salt_i, com_i)` and builds the inner nodes and the root from the
-   digests. In the ideal RO model `com_i = H(salt_i || leaf_i)` is uniform and
-   independent of the leaf, and the root is a hash of uniform digests.
-4. **Query phase.** The simulator maintains a random-function table. A query
-   to a new input is answered with a fresh uniform value and recorded; a
-   repeated query to the same input returns the recorded value. This is
-   consistent with the real random oracle.
-5. **Adaptive opening phase.** After the root and challenges, the adversary
-   chooses openings. For an opened leaf the simulator chooses its salt and,
-   from the algebraic hiding simulation, its leaf value; it programs
-   `H(salt || leaf) = com_i` and reveals `(salt, leaf)`. The path recomputes
-   to the root because `com_i` is the digest used in the root. If the
-   adversary had already queried the exact input `salt || leaf`, the simulator
-   had returned a random value; matching it requires guessing the input (bad
-   event). The opened leaf values are covered by the algebraic hiding
-   argument, not by a per-leaf fresh pad.
-6. **Bad events.** The simulation can fail only through:
-   - a collision or a programming inconsistency between two distinct inputs
-     in the random oracle, probability at most `(q + 1)^2 / 2^256`;
-   - the adversary guessing an unopened or not-yet-open leaf's exact input
-     (salt and leaf), probability at most `q / 2^320` for the cumulative
-     query count `q`; the salt is 40 bytes, and the tail/pad entropy gives the
-     message min-entropy the commitment needs.
-   If neither event occurs, the simulated view is identical to the real view,
-   including the adaptive openings and challenge queries. The challenges
-   derived from the root/transcript are random-oracle outputs independent of
-   the unopened leaf values; no separate "conditioning on the root" step is
-   used.
+1. **Domain-level public values (1).** Before any hash is fixed, the simulator
+   chooses the algebraic public values it will publish: the SEND answers, Eval
+   targets, tilde values and residual, the PSC transcripts and end values, the
+   closure point values, the FOLD start/rounds, and the BASE target and
+   combined rows. Each value is either prescribed by the public instance
+   (public constants and the approved winner/valid/tie outputs) or sampled
+   uniformly. The choices are recorded as the domain-value vector; they are
+   not derived from a witness. The algebraic cover of sections 5.2-5.6 says
+   that the tail/pad/mask/star coordinates can later realize these values.
+2. **Salt once (2).** For every leaf the simulator chooses one 40-byte salt
+   from its own randomness at allocation time and stores it. The salt is never
+   reselected later and is not revealed before that leaf's opening.
+3. **Uniform commitment (3).** For every leaf it announces a uniformly sampled
+   digest `com_i`, lazily and recorded. It does not compute `com_i` from a
+   leaf value; in the ideal RO model `com_i = H(salt_i || leaf_i)` is uniform
+   and independent of the leaf.
+4. **Root (4).** The root is the Merkle hash of the recorded `com_i`. Under
+   the RO replacement it is a hash of uniform digests and is uniform and
+   independent of the leaf symbols.
+5. **Challenges (5).** The Fiat-Shamir challenges are answers of the same
+   random-function table on the transcript so far. The table has no input that
+   depends on an unopened leaf, so the challenges are independent of the
+   unopened leaf values; the domain values of step 1 are fixed before these
+   draws, matching the real order.
+6. **Opening-time message/tail choice (6).** When an opening position is
+   drawn, the simulator solves the algebraic hiding map for message and tail
+   coordinates that (a) realize the domain values of step 1 and (b) produce the
+   opened codeword symbols. The maps are the Vandermonde tail block for
+   `q <= r` (section 5.2), the invertible PSC/FOLD coefficient maps (sections
+   5.4 and 5.6) and the BASE star split (section 5.6). It maintains the set of
+   message/tail assignments consistent with all revealed symbols; at each new
+   opening it chooses an assignment in that set that produces the next symbol
+   and keeps the unconstrained coordinates free. The Vandermonde rows of
+   distinct opened positions are independent and the total number of opened
+   positions is at most `r`, so the set stays nonempty for every adaptive
+   opening sequence; the revealed symbols are therefore jointly consistent
+   with one assignment, while the internal choice of the extension (the
+   unopened tail coordinates) is never revealed. The PSC/FOLD/BASE blocks are
+   separate systems with their own invertible maps, and the shared entries are
+   explicit columns (sections 4 and 5.5), so the solutions agree on them. The
+   inverse maps use only public challenges and the step-1 domain values, never
+   the witness. The simulator then computes the leaf, programs
+   `H(salt_i || leaf_i) = com_i`, reveals `(salt_i, leaf_i)`, and keeps the
+   choice in its state. It does not reselect the salt or `com_i`.
+7. **Path consistency (7).** The opened path is recomputed from the recorded
+   child digests; every queried leaf/node/FS point returns the recorded value,
+   and a repeated query returns the same answer. An opening set that violated
+   `q <= r` or the block rank condition would make step 6 unsolvable; the
+   protocol samples `q <= r` by the ledger, and the joint rank tests of
+   section 5.5 cover the production shape, so this is not an
+   adversary-chosen event.
+
+`[FACT]` `MATH` Bad events. The simulation can fail only through:
+
+- **Guess before opening.** A query made before a leaf is opened hits the
+  exact input `salt_i || leaf_i`. Conditional on the view, the input has
+  min-entropy at least `H_salt + H_leaf`, where the salt contributes 320 bits
+  (chosen once at step 2 and hidden until step 6) and `H_leaf` is the
+  conditional min-entropy supplied by the algebraic tail/pad/mask/star
+  randomness of step 1 (nonnegative; the pads and tails are the mask sources of
+  sections 2-5). Over `q` cumulative queries the probability is at most
+  `q * 2^{-(320 + H_leaf)} <= q * 2^-320`. The count `q` is cumulative over
+  leaf, node, root, challenge and opening queries.
+- **Collision or programming inconsistency.** Two distinct inputs receive the
+  same random-oracle output, or a programmed value conflicts with an earlier
+  answer: probability at most `(q + 1)^2 / 2^256`.
+
+If neither event occurs, the simulated view is identical to the real view for
+every adaptive opening sequence, including repeated queries to
+already-programmed points. The challenges are RO outputs independent of the
+unopened leaves; no separate "conditioning on the root" step is used.
 
 The mapping to the construction is literal: the leaf hash input is
 `(tag, leaf_index, run, width, salt_length, symbols, salt)`, the node hash
@@ -719,8 +754,11 @@ the equations cancels the star and leaves
 The left side is the public BASE claim relation; the right side is the claim
 target that the verifier knows from the committed rows/statement. The hidden
 row `Y` enters the committed rows, not the eliminated relation as a free
-value. If the claim itself is a function of `Y`, it is the approved public
-claim (the relation the verifier checks), not the raw row. The combined rows
+value. A claim value that depends on `Y` is never approved merely because it is
+a claim: the approved output boundary is winner/valid/tie plus the public
+statement, and the target inventory of section 5.9 shows that every BAT target
+is either a public constant/deterministic public value or an already-published
+transcript value whose dependence on `Y` is one-time masked. The combined rows
 and the target alone leave the star underdetermined; the openings reveal
 encoded star symbols masked by the star tail (`q <= r`) and the old row
 symbols masked by the old tail. The star is a fresh one-time pad from its own
@@ -730,35 +768,126 @@ stream; the two-seed test is illustrative, not the uniformity proof.
 argument above is the per-round conditional/block derivation, and the
 production-size tests are local evidence for their blocks.
 
-### 5.9 BASE target source and the joint mask/star view
+### 5.9 BAT target inventory and the joint mask/star view
 
-`[FACT]` `CODE` The BASE target is not a function of the hidden row. The
-actual target sources are:
+`[FACT]` `CODE` The approved output boundary is winner/valid/tie plus the
+public statement; it is not expanded to arbitrary functions of the hidden
+row. The rows below are the complete target inventory of the three plain-row
+families actually emitted in the hidden path (`closure_plain_rows`,
+`dot_plain_rows`, `own_plain_rows`), followed by the shared/base rows. For
+every row the table gives the exact target, the public coefficients, the
+secret functional that the target is a masked version of, the one-time mask
+entry, and the other public positions where the same value appears.
 
-- `record_row` and `column_row`: the target is the public table record or the
-  public column value combined with the public `eq_gamma` weights;
-- `sample_row` and `oracle_sample_row`: the target is the received SEND
-  answer, which is the public sampled value plus its one-time pad;
-- `fold_plain_row`: the target is the public `G_u`/`Omega` relation target
-  combined with the public `psi` and `zeta` challenges;
-- the BAT row target is the `row.target` above; the group/fold claim
-  coefficients are the public relation coefficients and the public batching
-  challenge.
+**Closure plain rows (one block of 11 rows per position `p`).** The mask
+entries `shown0..shown4` are the five shown slots of position `p` in the
+closure mask message; `hiding0..hiding48` are its 49 hiding slots. The
+coefficients `eq_point`, `eq_q`, `eq_r`, `eq_diff`, `eq_recon` and
+`hiding_form` are recomputed by the verifier from the public challenges; the
+`mask_scale` of the two end claims is the nonzero last PSC challenge `beta`.
 
-The hidden reduced row `W`/`Y` enters the oracle message values (the
-prover's witness), not the targets and not the public BAT relation
-coefficients. The target values are therefore determined by the public
-table/reader data, the public SEND answers and the public statement. The
-winner/valid/tie public outputs are checked by the closure/output plan, not by
-the BASE target; the BASE claim coefficients are the public table/generator
-relation coefficients and the public batching challenge, not the
-winner/valid/tie values. The BASE target is the linear-table claim target, and
-the approved output boundary is not expanded by it. This is not an expansion of the approved output boundary:
-the target is a protocol message value derived from public data and masked
-answers, not a new Y-dependent output. If a target were Y-dependent, it would
-be a leak; none of the traced row families is. The handoff target is supplied
-by the caller's verified FOLD output; the caller/anchor trust is a deployment
-assumption, not part of this derivation.
+| Row | Target `row.target` | Row coefficients (all public) | Secret functional in the target | Pad (one-time mask entry) | Other public occurrence |
+|---|---|---|---|---|---|
+| slack/winner | `-(M*sum_{j>=valid} eq_diff_j + sum_{j<winner} eq_diff_j)` (`M = mask_value`) | `eq_diff` on the slack message; `eq_diff - c_sum*e_winner` on `W` | none: public plan/statement plus the public `r_diff` challenge | none | none; the value is a public constant of `winner`, `valid`, `mask_value`, `r_diff` |
+| recon `u` | `offset` (public plan constant) | `weight*eq_recon` on the packed bits at `u_off`; `-eq_recon` on `W` | none in the target; the row binds the bit packing | none | none |
+| recon `v` | `offset` | `eq_recon` powers at `v_off`; `+eq_recon` on `W` | none in the target | none | none |
+| recon slack | `0` | `eq_recon` powers at `s_off`; `-eq_recon` on the slack message | none in the target | none | none |
+| `(E_0)` | `ends[0].value` of the closure PSC | `eq_point` on the committed map message | `map(point)` (committed activation map at the PSC point) | `shown0`, coefficient `beta` | `DotProof.end_values[0]`, absorbed by `send_end_values`; also used to derive `row_target` |
+| `B(point)` | `b_point` | `eq_point` on the committed bit message | `B(point)` (multilinear bit map at the PSC point) | `shown2`, coefficient `1` | `point_values[0]`, absorbed by `absorb_closure_point`; also in the virtual target below |
+| virtual second map | `ends[1].value - 1 + b_point` | `shown2` with `1` and `shown1` with `beta`; no main term | none: since `Omega = 1 - B`, the target equals `beta*shown1 + shown2`; the row is mask-only | `shown1`, `shown2` (shared with the `(E_0)`/`B(point)` rows) | derived from the two absorbed values; no new wire value |
+| `(U)` | `row_target` (the PSC last round value minus `eps*ends[0].value*ends[1].value`) | `hiding_form[j]` on `hiding_j`, `j = 0..48` | none in the row: it is the mask-side linear form; the hidden map enters through the PSC transcript, whose hiding map is invertible (5.4) | `hiding_j` (the same entries appear in the PSC transcript as shared columns) | `row_target` is recomputed by the verifier from the absorbed round messages and end values; no separate wire value |
+| `D(q)` | `d_value` | `eq_q` on the committed map message | `D(q) = <eq_q, map message>` | `shown3`, coefficient `1` | `point_values[1]`, absorbed by `absorb_closure_point`; also in the difference target |
+| `B(q)` | `bq_value` | `eq_q[j]*eq_r[j]` on the committed bit message | `Bq = <eq_q*eq_r, bit message>` | `shown4`, coefficient `1` | `point_values[2]`, absorbed by `absorb_closure_point`; also in the difference target |
+| `D(q)-B(q)` | `d_value - bq_value` | `shown3` with `1`, `shown4` with `-1`; no main term | none: mask-only difference of the two rows above | `shown3`, `shown4` (shared) | derived from the two absorbed values; no new wire value |
+
+**Dot plain rows (4 rows per proof).** `chi` is the public batching challenge;
+`tilde_t` and `claim_t` are the two disjoint per-position mask classes of the
+index-mask message; `hiding_j` is its PSC hiding class; `end_0`, `end_1` are
+its two end slots. `eq_index(point, value_at)` is the public equality-weight
+coefficient; `beta_dot` is the nonzero last Dot PSC challenge.
+
+| Row | Target `row.target` | Row coefficients (all public) | Secret functional in the target | Pad (one-time mask entry) | Other public occurrence |
+|---|---|---|---|---|---|
+| difference | `residual R` | `chi^t` on `tilde_t`, `-chi^t` on `claim_t`, `t = 0..positions-1` | none: `tilde_t` is already public and `claim_t` is a random mask; the row publishes only the mask sum `sum_t chi^t claim_t = sum_t chi^t tilde_t - R` | `tilde_t`, `claim_t` (both one-time; `tilde_t` also in the public tilde) | `R` absorbed by `absorb_dot_residual`; `tilde_t` absorbed by `absorb_tilde`; `claim_t` not separately published |
+| `(U)` | `output.row_target` of the Dot PSC | `hiding_form[j]` on `hiding_j`; `claim_scale*chi^t` on `claim_t` | none: the row is mask-side; the hidden batched maps enter through the Dot PSC transcript | `hiding_j`, `claim_t` | `row_target` recomputed by the verifier from the absorbed Dot PSC rounds and end values |
+| `(E_0)` | `ends[0].value` of the Dot PSC | `chi^t*eq_index(point, value_at)` on the batched dot message entry `(t, value_at)` | `sum_t chi^t W_t(point)` (the batched activation map) | `end_0`, coefficient `beta_dot` | `DotProof.end_values[0]`, absorbed by `send_end_values` |
+| `(E_1)` | `ends[1].value` of the Dot PSC | `eq_index(point, value_at)` on the Omega message entry `value_at` | `sum_t chi^t Omega_t(point)` (the committed Omega map) | `end_1`, coefficient `beta_dot` | `DotProof.end_values[1]`, absorbed by `send_end_values` |
+
+**Own plain rows (2 rows per position; the diagnostic rows are absent in the
+hidden path).** `eval_t` and `tilde_t` are the eval and tilde mask classes of
+the index-mask message; `psi` is the Eval point and `psi*` the shared point.
+
+| Row | Target `row.target` | Row coefficients (all public) | Secret functional in the target | Pad (one-time mask entry) | Other public occurrence |
+|---|---|---|---|---|---|
+| Eval | `eval_targets[t]` | `eq(psi)` on the `W_t` message | `W_t(psi)` | `eval_t`, coefficient `1` | the serialized/absorbed Eval target itself; `eval_t` not separately published |
+| tilde | `tilde_t` | `eq(psi*)` on the `W_t` message | `W_t(psi*)` | `tilde_t`, coefficient `1` | the absorbed tilde value; `tilde_t` also in the difference row |
+| diagnostic Dot (only when `plan.weights` is non-empty) | `0` | public activation weights on Omega; `-eq(psi*)` on `W_t` | none | none | not emitted in the hidden-input path; excluded from this inventory |
+
+**Shared and base rows.** `record_row`: the target is the public table record
+weighted by the public `eq_gamma`; the witness is the message row, and no
+secret enters the target. `column_row`: the target is the public column value
+weighted by `eq_gamma`. `sample_row`/`oracle_sample_row`: the target is the
+received SEND answer, i.e. the sampled message value plus the reserved SEND
+pad; the pad is one-time per answer, the answer is serialized in `SendSamples`
+and absorbed. `fold_plain_row`: the target is the public `G_u`/`Omega`
+relation target with the public `psi`/`zeta` challenges; no hidden row enters
+it. The BASE `handoff` target is supplied by the caller's verified FOLD output;
+the caller/anchor trust is a deployment assumption, not part of this
+derivation.
+
+`[FACT]` `CODE` Every target in the three tables is a member of the public
+view already present before the BAT rows: it is either a public plan/statement
+constant or a value that the verifier itself reconstructs from the absorbed or
+serialized transcript (the verifier calls the same row functions in
+`verify_shared`/`verify_second`, so the target is not an extra wire value).
+The only new data in a BAT row are its public coefficients, which are
+recomputed from the challenges. Consequently the joint conditional
+distribution of the BAT targets given the public view is degenerate: it adds
+no public position and no secret coordinate.
+
+`[FACT]` `CODE` `MATH` Joint conditional distribution of the values and the
+masks. The existing public view already contains the secret directions, and
+they are covered blockwise:
+
+- closure block: per position the five shown columns `shown0..shown4` are the
+  unit/`beta` pivots of the five values `ends[0].value`, `b_point`,
+  `ends[1].value`, `d_value`, `bq_value`; the virtual and difference rows are
+  the exact linear combinations `ends[1].value - 1 + b_point` and
+  `d_value - bq_value` of those pivoted values, so they add no independent
+  secret direction; the `(U)` row uses the 49 hiding columns whose map to the
+  PSC transcript has the constant nonzero determinant of 5.4; the encoded
+  opening uses the tail Vandermonde block for `q <= r`. This is the 54-column
+  per-position block of the joint matrix in 5.5.
+- dot block: the two end slots and the hidden map evaluations are distinct
+  one-time columns; the difference and `(U)` rows are mask-only relations (no
+  hidden functional); the hiding/claim classes are disjoint from the end
+  class.
+- own block: `eval_t` and `tilde_t` are distinct one-time columns, one per
+  position; the Eval point and the shared point are distinct public
+  challenges.
+- SEND/base blocks: each answer has its own reserved pad; the BASE `target*`
+  is one-time in the star, and the same star appears in the combined rows and
+  openings (5.6); the star/mask blocks share no random coordinates and
+  concatenate diagonally.
+
+For each block the matrix `[A | B]` has the random pad/tail/star columns `A`
+and the secret columns `B`; the pivots above put every secret column of `B`
+into the image of `A` (row by row for the padded values, and through the
+invertible hiding maps for the transcript/message coordinates), so
+`rank([A | B]) = rank(A)`, i.e. `Im(B) subset Im(A)`. Because the blocks use
+disjoint streams and disjoint mask classes, the direct sum inherits the
+inclusion. This is the joint conditional statement for the targets together
+with the same mask/opening/BASE star: conditional on the public view, the
+targets are either fixed values or uniform one-time-padded values, and their
+distribution contains no direction of `Y` beyond the approved winner/valid/tie
+plus public statement boundary. No traced target reveals `Y` outside that
+boundary, so the stop condition does not trigger.
+
+`[UNPROVEN]` The adaptive composition and mechanization of this blockwise
+conditional argument; the deployment randomness of the asset/table tails and
+salts; and the concrete-hash hiding advantage. These remain explicit
+assumptions/unknowns (sections 5.7 and 7), not silently covered by the target
+argument.
 
 `[FACT]` `CODE` The BASE equations are
 `target* = <claim, star.main> + <mask_claim, star.mask>`,
@@ -793,9 +922,21 @@ uniformity is the `draw_star` generation relation.
 
 `[FACT]` `CODE` The base field is `p = 2^64 - 2^32 + 1`; the cubic extension
 has `p^3` elements with `log2(p^3) = 191.99999999899`, so `1/p^3` is slightly
-larger than `2^-192`. The conservative bounds use the looser powers:
-`1/p^3 < 2^-191`, `30/p^3 < 2^-187`, `1134/p^3 < 2^-181`,
-`16*166/p^3 < 2^-180`, `2/p^3 < 2^-190`.
+larger than `2^-192` and `2/p^3` is slightly larger than `2^-191`. Every
+strict bound below is exact or looser than the exact value:
+`1/p^3 < 2^-191`, `2/p^3 < 2^-190.9`, `3/p^3 < 2^-190.4`,
+`6/p^3 < 2^-189.4`, `22/p^3 < 2^-187`, `28/p^3 < 2^-186`,
+`30/p^3 < 2^-186.9`, `50/p^3 < 2^-186.3`, `1134/p^3 < 2^-181`,
+`16*166/p^3 < 2^-180`. The exact quantities used in the self-check are
+`1/p^3 = 2^-191.99999999899`, `2/p^3 = 2^-190.99999999899`,
+`3/p^3 = 2^-190.4150374983`, `6/p^3 = 2^-189.4150374983`,
+`22/p^3 = 2^-187.5405683804`, `28/p^3 = 2^-187.1926450769`,
+`30/p^3 = 2^-187.0931094034`, `50/p^3 = 2^-186.3561438092`,
+`128/p^3 = 2^-184.99999999899`, `1134/p^3 = 2^-181.852...` and
+`16*166/p^3 = 2^-180.625...`. In particular `128/p^3` is slightly larger than
+`2^-185`, so no strict `< 2^-185` claim is made for it; it is not used in the
+bound. The `3/p^3` and `6/p^3` entries are listed only for the arithmetic
+self-check; neither is used as a retained union term below.
 
 The hiding-rank maps have constant nonzero determinant (section 5.4), so the
 former bad-challenge rank term is withdrawn: there is no Schwartz-Zippel
@@ -807,13 +948,12 @@ The entries are:
 |---|---|---:|
 | direct shared FOLD check | k <= 11, 11 rounds, degree 2 | `22/p^3 < 2^-187` |
 | direct own FOLD check | k = 14, 14 rounds, degree 2 | `28/p^3 < 2^-186` |
-| BASE lambda check | one Fp3 challenge, linear polynomial (`d = 1`) | `1/p^3 < 2^-192` |
-| BASE symbol checks | two position checks, linear each | `2/p^3 < 2^-191` |
-| base position sampling | `s = 2` codeword-index positions; distance parameter `delta` | miss `1 - (1 - delta)^s`; local `delta` convention not derived, in `eps_proximity` |
+| BASE lambda and symbol checks | withdrawn from the algebraic union: no independent-uniform field-domain/order derivation for the Fp3 lambda challenge, and the two checks are codeword-index samples, not field challenges | carried in `eps_proximity = UNKNOWN`, not in `eps_components` |
+| base position sampling | real sampler `draw -> unique_sorted`: `t` draws, `s` unique positions, `t >= s`; distance parameter `delta` | miss `(1 - delta)^t`; the local `delta` convention is not derived, in `eps_proximity` |
 | range booleanity | 16 positions, degree at most 166 each | `16*166/p^3 < 2^-180` |
 | PSC sumcheck (Dot once, closure 16 positions) | 10 and 23 variables, degree 3 each | `(30 + 16*69)/p^3 < 2^-181` |
-| single equality | degree 2 | `2/p^3 < 2^-191` |
-| `chi = 0` | one event | `1/p^3 < 2^-191` |
+| single equality | the check exists, but its polynomial-degree/event derivation is not written in this note | not counted in `eps_components`; carried in `eps_proximity = UNKNOWN` |
+| `chi = 0` | one event: a uniform `Fp3` challenge equals zero | `1/p^3 < 2^-191` |
 | challenge-draw zero fallback | at most 6 rejected words per draw, `(1-p/2^64)^6` | below `2^-192` per draw |
 | mask-coordinate retry exhaustion | at most 64 attempts, `(1-p/2^64)^64` | below `N * 2^-2048` over `N` coordinates |
 | hash model | plan-ledger term | `(t + q_V + 1) * 2^-128 + (17/2) * (t + q_V)^2 / 2^256` |
@@ -823,22 +963,29 @@ The entries are:
 ```text
 eps_total <= eps_hash + eps_components + eps_proximity
 eps_hash = (t + q_V + 1) * 2^-128 + (17/2) * (t + q_V)^2 / 2^256
-eps_components = 2^-180 + 2^-181 + 2^-186 + 2^-187 + 2^-189
-                (BASE lambda 1/p^3 + BASE symbol 2/p^3 + single equality
-                 2/p^3 + chi 1/p^3 merge to 6/p^3 < 2^-189.4; the shared and
-                 own FOLD terms merge to 50/p^3 < 2^-186.4; the loose bounds
-                 above are used)
+eps_components <= 16*166/p^3 + 1134/p^3 + 50/p^3 + 1/p^3
+                < 2^-180 + 2^-181.85 + 2^-186.3 + 2^-191
+                < 2^-179.6
 eps_proximity = UNKNOWN
 eps_total also carries the retry exhaustion N * 2^-2048 and the Q_R / Q_A factors
 ```
 
-`eps_proximity` is an explicit unknown, not zero: the local base-position and
-proximity distance/query soundness is not derived here. The document does not
+`eps_proximity` is an explicit unknown, not zero: the base-position sampler
+(`draw -> unique_sorted`), the local proximity distance/query soundness, the
+single-equality term whose degree/event basis is not derived here, and the
+withdrawn BASE lambda/symbol terms are carried here. The document does not
 claim a total security bit count. The `BASE 3/p^3` figure of the previous
-version is split: the lambda challenge is one Fp3 challenge with a linear
-check (`d = 1`), and the two position checks are the symbol checks; the
-previous single `2^-190` merged term is replaced by the explicit
-`6/p^3 < 2^-189.4` merge above, which does not fit under `2^-190`.
+version is withdrawn from `eps_components`: the lambda challenge is an `Fp3`
+field value whose independent-uniform-domain/order derivation is not given
+here, and the two symbol checks are codeword-index samples produced by the
+real sampler, not uniform field challenges. The earlier
+`6/p^3 < 2^-189.4` merge is likewise not used, because two of its
+`2/p^3` single-equality units lack a written degree/event derivation. The
+counted terms are the FOLD merge `22/p^3 + 28/p^3 = 50/p^3 < 2^-186.3`, the
+range term, the PSC term and the `chi = 0` event; each has an explicit degree
+or event basis (FOLD round checks of degree 2, PSC round checks of degree 3,
+range checks of degree at most 166 per position, and one uniform-zero-challenge
+event). No term without a derivation is kept in the union.
 
 The `t`/`q_V` factor is carried by the hash term; the algebraic component
 count is fixed per proof. If the prover uses `Q_A` adaptive retry attempts,
@@ -853,24 +1000,31 @@ bits; it is not re-derived here.
 distance radius 16,384, later radius 16,384, `m_once = m_later = 0`, `v = 10`,
 `answers = 1`; column draws 603 with a 603 column budget and 12 column work
 bits; shared/base positions 2 each. The direct FOLD checks have k <= 11
-(shared) and k = 14 (own); the BASE lambda is linear and the two base
-positions are symbol checks. The prior "8 rounds each <= 2^-128" term is a
+(shared) and k = 14 (own). The plan does draw one `Fp3` BASE lambda and two
+base positions, but their numeric error terms are not kept in
+`eps_components`: they are carried in `eps_proximity = UNKNOWN` for the
+domain/order reason above. The prior "8 rounds each <= 2^-128" term is a
 multi-stage ledger figure that is not mapped to this direct FOLD-to-BASE
 compiled plan; it is withdrawn from this chain's bound and replaced by the
 per-round degree terms above.
 
-`[FACT]` `CODE` The BASE lambda is one challenge in the cubic field and the
-check is linear in it (`d = 1`), so the Schwartz-Zippel term is `1/p^3`; the
-general form is `d/p^3` if a check of degree `d` is used. The two base
-positions are codeword-index samples: the plan's `plan_loc` convention draws
-`t` positions and charges the agreement bound raised to `t` (`agree^t`); in
-the distance form the miss probability is `1 - (1 - delta)^s` for `s`
-positions at relative distance `delta`. The local plan exposes `s = 2` but
-does not turn its distance parameter into a numeric agreement/distance term in
-this document, so the base-position and proximity soundness is the explicit
-`eps_proximity = UNKNOWN` above, not zero and not the withdrawn ledger term.
-The retry exhaustion (`N * 2^-2048`) and the multi-request `Q_R`/adaptive
-`Q_A` factors are carried separately; they are not dropped.
+`[FACT]` `CODE` The real base-position sampler is `draw -> unique_sorted`: the
+plan's `plan_loc` convention draws `t` codeword-index positions and keeps the
+`s <= t` unique ones; a repeated draw is discarded. If the committed word is at
+relative distance `delta` from the code (agreement `1 - delta`), each
+independent uniform draw misses the disagreement set with probability at most
+`1 - delta`, so the miss probability after `t` draws is `(1 - delta)^t`; the
+hit probability is `1 - (1 - delta)^t`. Deduplication can only reduce the
+number of distinct tested positions, so it does not increase the miss
+probability and the bound uses the draw count `t`, not `s`. The local plan
+exposes `s = 2` and a radius parameter but does not derive a numeric
+`delta`/agreement value from the radius and work bits; the base-position and
+proximity soundness is therefore the explicit `eps_proximity = UNKNOWN` above,
+not zero and not the withdrawn ledger term. The `Fp3` BASE lambda challenge
+and the two codeword-index checks are likewise carried in `eps_proximity`
+(withdrawal above), not in `eps_components`. The retry exhaustion
+(`N * 2^-2048`) and the multi-request `Q_R`/adaptive `Q_A` factors are carried
+separately; they are not dropped.
 
 `[UNPROVEN]` The local proximity/base-position distance/query soundness
 derivation; the plan parameters and the reference plan-loc convention are
@@ -902,6 +1056,8 @@ mask values, not the algebraic checks.
 | closure joint mask object rank equality | real encoder + real hiding polynomial + joint matrix | `NUM` at k=4; `CODE` block derivation for k=23 |
 | BASE star fresh and one-time | `draw_star` from a fresh stream; real-path test | supported |
 | local proximity distance/query soundness | plan radius 16,384, 603 column draws, 12 work bits, two base positions | `UNPROVEN` numeric bound; the prior 8-round ledger term is withdrawn, not imported |
+| BASE lambda and symbol-check terms | `Fp3` lambda challenge and two codeword-index samples; no independent-uniform-domain/order derivation here | withdrawn to `eps_proximity = UNKNOWN`; not in `eps_components` |
+| single-equality term | the check is present; its polynomial-degree/event derivation is not written here | not counted; carried in `eps_proximity = UNKNOWN` |
 | hash RO for hiding, CR for binding | leaf/root hash construction and salt lengths; model statement | supported as a model; no concrete-hash quantification |
 | no mask/pad/stream/table reuse | ledger state validation and rejects | supported; executable |
 | approved output boundary | policy/plan; the full `Y` row is hidden beyond winner/valid/tie | `FACT` boundary; conditional full-row hiding |
@@ -961,12 +1117,16 @@ compare the same star on both sides, so the star does not mask the difference.
 The star and tail sampling change the values, not the check equations; the
 tamper bound is unchanged by section 2.1.
 
-**BASE lambda and symbol checks.** The lambda check is linear and adds
-`1/p^3`; the base symbol checks are linear in the drawn positions.
+**BASE lambda and symbol checks.** These are not counted in the algebraic
+union: the lambda is an `Fp3` field challenge without an
+independent-uniform-domain/order derivation here, and the two base positions
+are codeword-index samples of the real `draw -> unique_sorted` sampler; both
+are carried in `eps_proximity = UNKNOWN` (section 6).
 
 **Proximity/opening.** The direct FOLD checks are the per-round degree terms
 above (22/p^3 shared, 28/p^3 own); the BASE lambda and the two base-position
-symbol checks add 3/p^3. The opening sets satisfy `q <= r` by the ledger
+checks add no term to the algebraic union and are carried in `eps_proximity`
+(withdrawal above). The opening sets satisfy `q <= r` by the ledger
 (table 603, W/closure and mask at most 4, minimum remaining 252); `q <= r` is
 the Vandermonde hiding-budget condition, not a proximity soundness term. The
 tail union is the accounted union. The local proximity distance/query/work
@@ -980,7 +1140,7 @@ spaces are independent and that the difference is fixed before each challenge;
 both hold by the order above. The local polynomial bound is
 
 ```text
-(2 * 14 + 2 * 11) / p^3 + 3 / p^3  <  2^-185,
+(2 * 14 + 2 * 11) / p^3 = 50 / p^3 < 2^-186.3,
 ```
 
 plus the conditional proximity distance/query term above. This is a loose
@@ -992,22 +1152,30 @@ API supports.
 
 **Kernel scope and binding derivation.** If the changed message's difference
 is in the kernel of the group-row map, the FOLD/BASE checks do not see it.
-The conditional conclusion is proved as follows under the stated binding
-assumptions:
+Only the following conditional connection can be stated; the kernel case
+itself is not proven:
 
 1. The verifier's public claim and target are functions of the committed
    roots and the public statement, not of the hidden row directly (section
-   5.9). A false statement requires a different public claim or target.
+   5.9). A false statement requires a different public claim or target. This
+   is the intended binding; the wiring from the root to the claim/target is a
+   deployment assumption, not independently trusted here.
 2. If the changed message changes that public claim or target, its difference
    is nonzero in the group-row map (otherwise the public value is unchanged);
    the FOLD/BASE checks see a nonzero difference polynomial, and the
    challenges are drawn after the difference is fixed, so the polynomial
    bound applies.
 3. If the difference is in the kernel, the public claim and target are
-   unchanged. The verifier accepts the same public statement as for the
-   original committed message. A kernel difference is a different private
-   witness for the same committed claim, not a false-statement acceptance,
-   provided the original statement/root is the true committed one.
+   unchanged and the verifier accepts the same public statement as for the
+   original committed message. This does **not** by itself imply that the
+   accepted statement is true: with the public target fixed, the changed
+   message is a committed witness that may fail to satisfy that target, and
+   the FOLD/BASE layer cannot see the kernel difference. The conclusion "a
+   kernel difference is only another witness for the same true claim" is not
+   valid without an additional proof that every committed witness satisfying
+   the visible relation also satisfies the public target. No such proof is
+   given here; the kernel case is therefore `[UNPROVEN]` and is not counted
+   as a detected negative.
 4. The root/leaf index/run bind the committed message under the CR hash
    assumption: a different message with the same root is a collision or a
    hash-model event (`(q+1)^2/2^256` in the RO analysis). If the changed
@@ -1018,11 +1186,10 @@ The residual assumptions are: the original statement/root is the true
 committed one, the claim/target really are bound to the committed
 statement/roots (the wiring is not independently trusted; a deployment
 assumption), and the concrete hash's CR advantage is not quantified. The
-document does not claim that the FOLD/BASE layer detects a kernel difference;
-it claims that a kernel difference does not create a false-statement
-acceptance under these binding assumptions. `[UNPROVEN]` The exact
-final-verifier negative for the combined tamper and the concrete-hash binding
-bound.
+document does not claim that the FOLD/BASE layer detects a kernel difference,
+and it does not claim that a kernel difference is harmless: the exact
+final-verifier negative for the combined tamper is not implemented, and the
+kernel/accepted-statement connection is `[UNPROVEN]`.
 
 ## 9. Engineering boundaries and wording
 
@@ -1031,14 +1198,20 @@ the real hiding polynomial and the real fold/base paths, but a passing test
 module is not a production runtime detector for every bad rank or every
 tampered message. The workspace result and the three seq16 runs are the
 delivery evidence reported by the implementation side; they are not an
-independent external verification.
+independent external verification. The 751-test workspace figure, the three
+proof hashes and the HEAD are the TL-reported delivery figures, not an
+independent expert validation of the protocol. Editing the document or the
+test-only module is not a new validation of the production protocol either;
+the production messages, commitments and challenge order are unchanged.
 
-`[FACT]` The production proof code is unchanged in this round; the v7/v8
+`[FACT]` The production proof code is unchanged in this round; the v7/v8/v9
 changes are test-only and document. The earlier mask sampling source change
 (section 2.1) changed only the prover's random values; the protocol
 relations, commitments, challenge order, parameters and encoding format are
 unchanged. The proof content and hash are the measured fixture result from
-that source.
+that source. The previously closed counter-scope, sample-path and
+fixture-assumption wording is maintained; the v9 target inventory, simulator
+construction and constant corrections do not reopen those items.
 
 `[FACT]` `NUM` Compatibility evidence. The new proof length is 9,939,144
 bytes and its sha256 is `f8f512c0...3215f5` in the three seq16 runs; the
