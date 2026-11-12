@@ -1663,7 +1663,7 @@ claim a closed joint theorem.
   current API has no prover-side message injection point after the tree
   commit. The component test and the degree bound are delivered instead.
 - `[GAP]` The direct FOLD-to-BASE proximity at the current parameters does not
-  provide a security bound: `t = 2`, `delta_main = 0.1111`,
+  provide a security bound: `t = 2`, `delta_main = 0.4374847412`,
   `(1 - delta_main)^2 = 0.3164234164`; the mask miss is `3.424292663e-5`. The
   algebraic FOLD terms do not cover the folded-row error class. Candidates:
   about 155 independent query positions for `2^-128`, a complete IOPP
