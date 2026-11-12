@@ -9974,6 +9974,122 @@ fn norm_plain_rows(
                 right.target = word.output.ends[1].value.sub(&eq[columns]);
                 rows.push(right);
             }
+            2 => {
+                let sum_member = bat_of
+                    .get(
+                        &norm
+                            .sum
+                            .oracle_base
+                            .checked_add(position as u64)
+                            .ok_or(Error::ResourceLimit)?,
+                    )
+                    .ok_or(Error::StatementMismatch)?;
+                let mean_member = bat_of
+                    .get(
+                        &norm
+                            .mean
+                            .oracle_base
+                            .checked_add(position as u64)
+                            .ok_or(Error::ResourceLimit)?,
+                    )
+                    .ok_or(Error::StatementMismatch)?;
+                let sum_coefficient = eq[0].sub(&eq[2]);
+                let mean_coefficient = crate::proof::output_closure::fp3_signed(
+                    valid as i128,
+                )?
+                .mul(&eq[2].sub(&eq[1]));
+                let mut left = BatRow::new(BatRowKind::Plain);
+                left.add_term(
+                    sum_member.bat_oracle,
+                    BatPart::Main,
+                    scalar_message_coefficients(&norm.sum.shape, sum_coefficient)?,
+                );
+                left.add_term(
+                    mean_member.bat_oracle,
+                    BatPart::Main,
+                    scalar_message_coefficients(&norm.mean.shape, mean_coefficient)?,
+                );
+                left.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown0)?,
+                    word.output.ends[0].mask_scale,
+                );
+                left.target = word.output.ends[0].value;
+                rows.push(left);
+
+                let constant = eq[0].add(&eq[1]).add(&eq[2]);
+                let mut right = BatRow::new(BatRowKind::Plain);
+                right.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown1)?,
+                    word.output.ends[1].mask_scale,
+                );
+                right.target = word.output.ends[1].value.sub(&constant);
+                rows.push(right);
+            }
+            3 => {
+                let squares_member = bat_of
+                    .get(
+                        &norm
+                            .squares
+                            .oracle_base
+                            .checked_add(position as u64)
+                            .ok_or(Error::ResourceLimit)?,
+                    )
+                    .ok_or(Error::StatementMismatch)?;
+                let variance_member = bat_of
+                    .get(
+                        &norm
+                            .variance
+                            .oracle_base
+                            .checked_add(position as u64)
+                            .ok_or(Error::ResourceLimit)?,
+                    )
+                    .ok_or(Error::StatementMismatch)?;
+                let squares_coefficient = eq[0].sub(&eq[2]);
+                let variance_coefficient = crate::proof::output_closure::fp3_signed(
+                    valid as i128,
+                )?
+                .mul(&eq[2].sub(&eq[1]));
+                let mut left = BatRow::new(BatRowKind::Plain);
+                left.add_term(
+                    squares_member.bat_oracle,
+                    BatPart::Main,
+                    scalar_message_coefficients(
+                        &norm.squares.shape,
+                        squares_coefficient,
+                    )?,
+                );
+                left.add_term(
+                    variance_member.bat_oracle,
+                    BatPart::Main,
+                    scalar_message_coefficients(
+                        &norm.variance.shape,
+                        variance_coefficient,
+                    )?,
+                );
+                left.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown0)?,
+                    word.output.ends[0].mask_scale,
+                );
+                left.target = word.output.ends[0].value;
+                rows.push(left);
+
+                let constant = eq[0].add(&eq[1]).add(&eq[2]);
+                let mut right = BatRow::new(BatRowKind::Plain);
+                right.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown1)?,
+                    word.output.ends[1].mask_scale,
+                );
+                right.target = word.output.ends[1].value.sub(&constant);
+                rows.push(right);
+            }
             _ => return Err(Error::UnsupportedPrimitive),
         }
         let mut row = BatRow::new(BatRowKind::Plain);
@@ -13856,7 +13972,7 @@ mod merged_tests {
                 .unwrap(),
             columns,
             variables: columns.trailing_zeros() as usize + 1,
-            relations: vec![0, 1],
+            relations: vec![0, 1, 2, 3],
             x: norm_group(columns, 80, 9000, 60000),
             x_roots: (0..POSITIONS)
                 .map(|position| Digest([0x90 + position as u8; 32]))
@@ -14105,7 +14221,7 @@ mod merged_tests {
                 .unwrap(),
             columns,
             variables: columns.trailing_zeros() as usize + 1,
-            relations: vec![0, 1],
+            relations: vec![0, 1, 2, 3],
             x: group(columns, GROUP, 9000, 60000),
             x_roots: Vec::new(),
             sum: group(1, GROUP, 9100, 60100),
@@ -14284,6 +14400,138 @@ mod merged_tests {
         let mut other = verifier_plan;
         other.norm.as_mut().unwrap().relations = vec![0];
         assert!(verify_hidden_lin_hidden(&other, &table.reader(), &base).is_err());
+    }
+
+    #[test]
+    fn norm_four_relation_negative_matrix() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness) = norm_fixture(&activation);
+        let (messages, hidden_witness) = prove_hidden_lin_hidden_with_norm(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+        )
+        .unwrap();
+        let base =
+            HiddenLinMessages::decode(&plan, &messages.encode().unwrap()).unwrap();
+        let mut verifier_plan = plan.clone();
+        verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &base).is_ok());
+        let instances = base.second.norm.as_ref().unwrap().psc.len();
+        assert_eq!(instances, POSITIONS as usize * 4);
+
+        // Endpoint values of every relation instance.
+        for instance in 0..instances {
+            let mut changed = base.clone();
+            let value = &mut changed.second.norm.as_mut().unwrap().point_values[instance][0];
+            *value = value.add(&Fp3::ONE);
+            assert!(
+                verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err(),
+                "a changed endpoint of instance {instance} was accepted"
+            );
+        }
+
+        // Product-sumcheck end values of every relation instance.
+        for instance in 0..instances {
+            let mut changed = base.clone();
+            let value = &mut changed.second.norm.as_mut().unwrap().psc[instance].end_values[0];
+            *value = value.add(&Fp3::ONE);
+            assert!(
+                verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err(),
+                "a changed transcript end of instance {instance} was accepted"
+            );
+        }
+
+        // Challenge order: the first two instances exchange transcripts.
+        let mut changed = base.clone();
+        changed.second.norm.as_mut().unwrap().psc.swap(0, 1);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        // Mask root and mask sample answer.
+        let mut changed = base.clone();
+        changed.first.norm.as_mut().unwrap().mask.as_mut().unwrap().root = Digest::ZERO;
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+        let mut changed = base.clone();
+        let answer = &mut changed
+            .first
+            .norm
+            .as_mut()
+            .unwrap()
+            .mask
+            .as_mut()
+            .unwrap()
+            .sample
+            .answers[0];
+        *answer = answer.add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        // Wrong sample row target of every group.
+        for group in 0..5 {
+            let mut changed = base.clone();
+            let norm = changed.first.norm.as_mut().unwrap();
+            let target = match group {
+                0 => &mut norm.x.sample.answers[0],
+                1 => &mut norm.sum.sample.answers[0],
+                2 => &mut norm.squares.sample.answers[0],
+                3 => &mut norm.mean.sample.answers[0],
+                _ => &mut norm.variance.sample.answers[0],
+            };
+            *target = target.add(&Fp3::ONE);
+            assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+        }
+
+        // Source mapping: a committed mean root and its entry root move together.
+        let mut changed = base.clone();
+        let mean = &mut changed.first.norm.as_mut().unwrap().mean;
+        mean.message.group.entries[0].root = Digest([0x99; 32]);
+        mean.message.roots[0] = Digest([0x99; 32]);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        // Source mapping: a committed group oracle is renumbered.
+        let mut changed = base.clone();
+        changed
+            .first
+            .norm
+            .as_mut()
+            .unwrap()
+            .variance
+            .message
+            .group
+            .entries[0]
+            .oracle += 1;
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        // Coordinate domain and relation domain changes.
+        let mut other = verifier_plan.clone();
+        other.norm.as_mut().unwrap().shape.valid -= 1;
+        assert!(verify_hidden_lin_hidden(&other, &table.reader(), &base).is_err());
+        let mut other = verifier_plan.clone();
+        other.norm.as_mut().unwrap().relations = vec![0, 1, 2];
+        assert!(verify_hidden_lin_hidden(&other, &table.reader(), &base).is_err());
+    }
+
+    #[test]
+    fn norm_inconsistent_remainder_witness_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness) = norm_fixture(&activation);
+        let mut changed = witness.clone();
+        changed.core[0].mean_remainder += 1;
+        changed.core[0].variance_remainder -= 1;
+        let proved = prove_hidden_lin_hidden_with_norm(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &changed,
+        );
+        assert!(
+            proved.is_err(),
+            "an inconsistent quotient remainder must not produce a proof"
+        );
     }
 
     #[test]

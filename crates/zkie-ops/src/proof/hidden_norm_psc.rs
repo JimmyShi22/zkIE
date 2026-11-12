@@ -8,13 +8,13 @@
 //! committed one-time mask message.
 //!
 //! The integrated product-sumcheck runs one instance per position and per
-//! relation listed by the plan. The supported row binding covers the sum and
-//! squares relations: each shown endpoint is a linear form of the committed x,
-//! sum, squares and mean messages, and the one-time hiding and shown masks are
-//! committed entries of the same mask group. The mean and variance relations,
-//! the carry/range digits, the rsqrt lookup, the weight product and the output
-//! consumer are not part of this module. No soundness or privacy proof is
-//! claimed.
+//! relation listed by the plan. The supported row binding covers the sum,
+//! squares, mean and variance relations: each shown endpoint is a linear form
+//! of the committed x, sum, squares, mean and variance messages, and the
+//! one-time hiding and shown masks are committed entries of the same mask
+//! group. The remainder range and digit checks, the rsqrt lookup, the weight
+//! product and the output consumer are not part of this module. No soundness
+//! or privacy proof is claimed.
 
 use zkie_core::artifact::digest_bytes;
 use zkie_core::common::codec::DecodeLimits;
@@ -564,21 +564,22 @@ fn fp3_signed(value: i128) -> Result<Fp3> {
 
 
 // ---------------------------------------------------------------------------
-// Stage A: the integrated norm plan and first/second messages.
+// The integrated norm plan and first/second messages.
 //
 // The trusted fixture input is the product-form x group: its roots are plan
 // values. The sum/squares/mean/variance groups are proof-fixed witness
 // messages: the plan fixes their shapes, identifiers and opening counts, while
-// their roots arrive in the first message. The mask message is optional in
-// this stage and becomes required when the committed mask entries are wired.
+// their roots arrive in the first message. The mask message is committed in
+// the first stage and its entries are consumed by the second-stage product-
+// sumcheck and the row binding.
 
 /// Version of the integrated norm plan and first message.
 pub const NORM_BIND_VERSION: u64 = 2;
 
-/// The relation indices the bound core supports: sum and squares. The map
-/// construction of every relation is fixed by the relation index; the plan
-/// may list only relations whose row binding is implemented.
-pub const NORM_BOUND_RELATIONS: [usize; 2] = [0, 1];
+/// The relation indices the bound core supports. The map construction of
+/// every relation is fixed by the relation index; the plan may list only
+/// relations whose row binding is implemented.
+pub const NORM_BOUND_RELATIONS: [usize; 4] = [0, 1, 2, 3];
 
 /// One committed witness group of the integrated norm plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1556,28 +1557,11 @@ mod tests {
 
     fn integrated_fixture() -> (NormPlan, NormFirstMessages, NormPscSecond) {
         let (psc, _rows, first, second) = fixture();
-        let selected = (0..psc.shape.positions as usize)
-            .flat_map(|position| {
-                [0usize, 1]
-                    .into_iter()
-                    .map(move |relation| position * NORM_PSC_RELATIONS + relation)
-            })
-            .collect::<Vec<_>>();
-        let second = NormPscSecond {
-            psc: selected
-                .iter()
-                .map(|index| second.psc[*index].clone())
-                .collect(),
-            point_values: selected
-                .iter()
-                .map(|index| second.point_values[*index])
-                .collect(),
-        };
         let plan = NormPlan {
             shape: psc.shape,
             columns: psc.columns,
             variables: psc.variables,
-            relations: vec![0, 1],
+            relations: vec![0, 1, 2, 3],
             x: integrated_group(&psc.groups.x),
             x_roots: psc.groups.x.roots.clone(),
             sum: integrated_group(&psc.groups.sum),
@@ -1637,7 +1621,7 @@ mod tests {
             oracle: 7000,
             group: 7001,
             mask_code: build_code_plan(4, 8, 1).unwrap(),
-            mask_rows: 8,
+            mask_rows: 16,
             answers: 1,
             openings: 1,
             tree: zkie_engine::pcs::request::runtime_tree::RuntimeTreePlan {
@@ -1647,7 +1631,7 @@ mod tests {
                 log_n_zk: 4,
                 parts: vec![RuntimeTreePart {
                     main_symbols: 0,
-                    mask_symbols: 24,
+                    mask_symbols: 48,
                 }],
                 salt_bytes: 40,
                 run: Digest([0x71; 32]),
