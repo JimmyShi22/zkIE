@@ -121,10 +121,12 @@ artifacts, so the loop's measured opening budget is recorded by the acceptance
 run, not by the harness constants.
 
 `[FACT]` The acceptance run measured on the GPT-2 seq16 formal fixture, same
-machine, after the loop wiring and the `k=14` stage-0 correction:
-hidden prove 744,204 ms, hidden verify 51,142 ms, whole test 1,035.04 s,
-hidden proof 9,527,120 bytes and maximum RSS 213,833,272 KiB. The proof
-reports 14 own fold rounds. The previous single-stage trace on the same
+machine, after the loop wiring and the `k=14` stage-0 correction. Three runs:
+hidden prove 736,296-744,204 ms (median 740,925), hidden verify
+51,142-51,681 ms (median 51,428), whole test 1,027.94-1,035.04 s (median
+1,028.43), hidden proof 9,527,120 bytes in every run and maximum RSS
+213,775,000-213,833,272 KiB (median 213,788,360). The proof reports 14 own
+fold rounds. The previous single-stage trace on the same
 fixture (scheme `rework10-final`, code `473e395d`) recorded hidden prove
 359,802 ms, hidden verify 50,538 ms, maximum RSS 169,394,600 KiB and a
 646.80 s test. The loop therefore roughly doubles hidden prove wall time and

@@ -1,0 +1,206 @@
+warning: unused variable: `number`
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1513:9
+     |
+1513 |         number: u32,
+     |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_number`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `target`
+   --> crates/zkie-engine/src/pcs/request/relation.rs:881:5
+    |
+881 |     target: Fp3,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+
+warning: unused variable: `columns_usize`
+   --> crates/zkie-engine/src/pcs/request/table.rs:952:13
+    |
+952 |         let columns_usize = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_columns_usize`
+
+warning: field `target` is never read
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1118:5
+     |
+1112 | struct FoldOutputMeta {
+     |        -------------- field in this struct
+...
+1118 |     target: Fp3,
+     |     ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-engine` (lib) generated 4 warnings (run `cargo fix --lib -p zkie-engine` to apply 3 suggestions)
+warning: unused import: `MODULUS`
+   --> crates/zkie-ops/src/proof/bat_fold_session.rs:147:59
+    |
+147 | use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE, MODULUS};
+    |                                                           ^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `ClosurePlan`
+    --> crates/zkie-ops/src/proof/output_head_lin.rs:1579:57
+     |
+1579 |     use crate::proof::output_closure::{ClosureMaskPlan, ClosurePlan};
+     |                                                         ^^^^^^^^^^^
+
+warning: unused import: `PrimeField64`
+    --> crates/zkie-ops/src/proof/output_head_lin.rs:1586:61
+     |
+1586 |     use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
+     |                                                             ^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/base_last_session.rs:578:13
+    |
+578 |         let mut message = self.chain.message();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `first`
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:8744:5
+     |
+8744 |     first: &HiddenSendMessages,
+     |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_first`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `plan` is never read
+   --> crates/zkie-ops/src/proof/cs_multi_session.rs:201:5
+    |
+195 | pub struct CsMultiSession {
+    |            -------------- field in this struct
+...
+201 |     plan: RuntimeTreePlan,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-ops` (lib test) generated 6 warnings (run `cargo fix --lib -p zkie-ops --tests` to apply 5 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/zkie_ops-d20b4f9af95f6295)
+
+running 1 test
+test proof::hidden_send_session::merged_tests::staged_final_verifier_accepts_and_rejects_tampering ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 247 filtered out; finished in 0.07s
+
+warning: unused variable: `number`
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1513:9
+     |
+1513 |         number: u32,
+     |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_number`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `target`
+   --> crates/zkie-engine/src/pcs/request/relation.rs:881:5
+    |
+881 |     target: Fp3,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+
+warning: unused variable: `columns_usize`
+   --> crates/zkie-engine/src/pcs/request/table.rs:952:13
+    |
+952 |         let columns_usize = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_columns_usize`
+
+warning: field `target` is never read
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1118:5
+     |
+1112 | struct FoldOutputMeta {
+     |        -------------- field in this struct
+...
+1118 |     target: Fp3,
+     |     ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-engine` (lib) generated 4 warnings (run `cargo fix --lib -p zkie-engine` to apply 3 suggestions)
+warning: unused import: `MODULUS`
+   --> crates/zkie-ops/src/proof/bat_fold_session.rs:147:59
+    |
+147 | use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE, MODULUS};
+    |                                                           ^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `ClosurePlan`
+    --> crates/zkie-ops/src/proof/output_head_lin.rs:1579:57
+     |
+1579 |     use crate::proof::output_closure::{ClosureMaskPlan, ClosurePlan};
+     |                                                         ^^^^^^^^^^^
+
+warning: unused import: `PrimeField64`
+    --> crates/zkie-ops/src/proof/output_head_lin.rs:1586:61
+     |
+1586 |     use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
+     |                                                             ^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/base_last_session.rs:578:13
+    |
+578 |         let mut message = self.chain.message();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `first`
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:8744:5
+     |
+8744 |     first: &HiddenSendMessages,
+     |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_first`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `plan` is never read
+   --> crates/zkie-ops/src/proof/cs_multi_session.rs:201:5
+    |
+195 | pub struct CsMultiSession {
+    |            -------------- field in this struct
+...
+201 |     plan: RuntimeTreePlan,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-ops` (lib test) generated 6 warnings (run `cargo fix --lib -p zkie-ops --tests` to apply 5 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/zkie_ops-d20b4f9af95f6295)
+
+running 27 tests
+test proof::multi_stage_iopp::tests::duplicate_stage_identifiers_are_rejected ... ok
+test proof::multi_stage_iopp::tests::actual_stage_lists_derive ... ok
+test proof::multi_stage_iopp::tests::stage_derivation_values_are_per_stage ... ok
+test proof::multi_stage_iopp::tests::stage_derivation_values_must_cover_every_stage_and_be_nonzero ... ok
+test proof::multi_stage_iopp::tests::wrong_mask_room_is_rejected_by_the_plan ... ok
+test proof::multi_stage_iopp::tests::nonzero_fold_mask_claim_without_members_is_rejected ... ok
+test proof::multi_stage_iopp::tests::fresh_mask_tree_cannot_stand_in_for_the_old_mask ... ok
+test proof::multi_stage_iopp::tests::missing_stage_is_rejected ... ok
+test proof::multi_stage_iopp::tests::a_proof_from_another_chain_is_rejected ... ok
+test proof::multi_stage_iopp::tests::proof_codec_rejects_missing_and_reordered_stages ... ok
+test proof::multi_stage_iopp::tests::nonzero_kept_rows_are_rejected_by_the_verifier ... ok
+test proof::multi_stage_iopp::tests::reordered_stage_is_rejected ... ok
+test proof::multi_stage_iopp::tests::proof_codec_rejects_a_target_that_differs_from_the_plan ... ok
+test proof::multi_stage_iopp::tests::proof_codec_rejects_truncated_and_trailing_bytes ... ok
+test proof::multi_stage_iopp::tests::stage_fold_group_must_not_reuse_the_stage_zero_group ... ok
+test proof::multi_stage_iopp::tests::stage_fold_identifiers_must_not_reuse_stage_zero_identifiers ... ok
+test proof::multi_stage_iopp::tests::wrong_fresh_opening_is_rejected ... ok
+test proof::multi_stage_iopp::tests::wrong_old_opening_is_rejected ... ok
+test proof::multi_stage_iopp::tests::wrong_old_mask_root_is_rejected ... ok
+test proof::multi_stage_iopp::tests::wrong_leaf_class_is_rejected_by_the_stage_fold ... ok
+test proof::multi_stage_iopp::tests::verifier_derives_the_zero_old_mask_from_the_layout ... ok
+test proof::multi_stage_iopp::tests::last_switch_positions_come_from_the_previous_entry ... ok
+test proof::multi_stage_iopp::tests::a_tampered_last_base_is_rejected ... ok
+test proof::multi_stage_iopp::tests::fast_fixture_round_trips ... ok
+test proof::multi_stage_iopp::tests::zero_old_mask_round_trips_without_a_tree ... ok
+test proof::multi_stage_iopp::tests::proof_codec_round_trips_against_the_plan ... ok
+test proof::multi_stage_iopp::tests::last_switch_work_comes_from_the_previous_entry ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 221 filtered out; finished in 0.01s
+
