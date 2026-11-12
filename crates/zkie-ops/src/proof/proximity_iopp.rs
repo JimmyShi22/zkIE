@@ -151,6 +151,36 @@ fn push_range(values: &mut Vec<u64>, start: u64, count: u64) -> Result<()> {
     Ok(())
 }
 
+/// Derives one group's trusted IOPP chain from the hidden plan. An empty stage
+/// list keeps the single-stage path and returns `None`; a non-empty list is
+/// derived against the request's bound identifier and tree sets.
+pub fn proximity_iopp_plan(
+    proximity: &HiddenProximityPlan,
+    send: &HiddenSendPlan,
+    closure: Option<&ClosurePlan>,
+    role: ProximityGroupRole,
+) -> Result<Option<ProximityIoppPlan>> {
+    let (stages, mask_tree, fresh, base_positions) = match role {
+        ProximityGroupRole::Shared => (
+            proximity.shared_stages.as_slice(),
+            &proximity.shared_mask_tree,
+            proximity.shared_fresh,
+            proximity.shared_base_positions,
+        ),
+        ProximityGroupRole::Own => (
+            proximity.own_stages.as_slice(),
+            &proximity.own_mask_tree,
+            proximity.own_fresh,
+            proximity.own_base_positions,
+        ),
+    };
+    if stages.is_empty() {
+        return Ok(None);
+    }
+    let bound = proximity_bound_ids(proximity, send, closure)?;
+    derive_proximity_iopp(stages, role, mask_tree, 0, fresh, base_positions, &bound).map(Some)
+}
+
 /// The derived trusted chain of one proximity group.
 #[derive(Clone, Debug)]
 pub struct ProximityIoppPlan {
