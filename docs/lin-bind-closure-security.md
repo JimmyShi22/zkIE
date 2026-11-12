@@ -819,9 +819,10 @@ The entries are:
 eps_total <= eps_hash + eps_components + eps_proximity
 eps_hash = (t + q_V + 1) * 2^-128 + (17/2) * (t + q_V)^2 / 2^256
 eps_components = 2^-180 + 2^-181 + 2^-186 + 2^-187 + 2^-189
-                (BASE symbol 2/p^3 + single equality 2/p^3 + chi 1/p^3
-                 merge to 5/p^3 < 2^-189.4; the shared and own FOLD terms
-                 merge to 50/p^3 < 2^-186.4; the loose bounds above are used)
+                (BASE lambda 1/p^3 + BASE symbol 2/p^3 + single equality
+                 2/p^3 + chi 1/p^3 merge to 6/p^3 < 2^-189.4; the shared and
+                 own FOLD terms merge to 50/p^3 < 2^-186.4; the loose bounds
+                 above are used)
 eps_proximity = UNKNOWN
 eps_total also carries the retry exhaustion N * 2^-2048 and the Q_R / Q_A factors
 ```
@@ -832,7 +833,7 @@ claim a total security bit count. The `BASE 3/p^3` figure of the previous
 version is split: the lambda challenge is one Fp3 challenge with a linear
 check (`d = 1`), and the two position checks are the symbol checks; the
 previous single `2^-190` merged term is replaced by the explicit
-`5/p^3 < 2^-189.4` merge above, which does not fit under `2^-190`.
+`6/p^3 < 2^-189.4` merge above, which does not fit under `2^-190`.
 
 The `t`/`q_V` factor is carried by the hash term; the algebraic component
 count is fixed per proof. If the prover uses `Q_A` adaptive retry attempts,
