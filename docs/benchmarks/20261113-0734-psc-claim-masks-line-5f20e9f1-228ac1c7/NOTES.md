@@ -28,7 +28,7 @@
 - `cargo test --workspace`: 48 suites, 838 passed, 0 failed, 17 ignored.
 - Focused `psc_general`: 8 passed, 0 failed.
 - Norm-free byte gate: 45,080 B before and after, sha256
-  `7a5da6ebcbfdb61d5ee88ab60e67f45613906959b0c5de998cb870f5e1dc4cfb`;
+  `7a5da6ebcbfdb61d5ee88ab60e67f45613906959b0c5de998cb870f5e1de4cfb`;
   `cmp` reports the files identical.
 
 ## Scope and next
