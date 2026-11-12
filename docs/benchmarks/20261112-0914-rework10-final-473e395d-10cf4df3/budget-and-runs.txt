@@ -1,0 +1,71 @@
+run1:
+207:ledger_events=143
+208:ledger_logical_openings=887
+209:ledger_unique_positions=887
+210:ledger_table_logical=603
+214:ledger_closure_logical=196
+217:ledger_table_reuse=0
+218:ledger_code_oracles=72
+219:ledger_min_tail_remaining=252
+220:ledger_total_tail_rank=558080
+221:ledger_total_tail_unique=879
+222:ledger_exhausted_tail_oracles=0
+223:hidden_prove_ms=359802
+224:hidden_proof_bytes=9939144
+225:hidden_verify_ms=50538
+226:hidden_own_fold_rounds=14
+228:sample_accepts=276343251
+229:sample_rejects=0
+232:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 646.80s
+243:	Maximum resident set size (kbytes): 169394600
+
+run2:
+200:ledger_events=143
+201:ledger_logical_openings=887
+202:ledger_unique_positions=887
+203:ledger_table_logical=603
+207:ledger_closure_logical=196
+210:ledger_table_reuse=0
+211:ledger_code_oracles=72
+212:ledger_min_tail_remaining=252
+213:ledger_total_tail_rank=558080
+214:ledger_total_tail_unique=879
+215:ledger_exhausted_tail_oracles=0
+216:hidden_prove_ms=358777
+217:hidden_proof_bytes=9939144
+218:hidden_verify_ms=50224
+219:hidden_own_fold_rounds=14
+221:sample_accepts=276343251
+222:sample_rejects=0
+225:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 644.51s
+236:	Maximum resident set size (kbytes): 169315672
+
+run3:
+200:ledger_events=143
+201:ledger_logical_openings=887
+202:ledger_unique_positions=887
+203:ledger_table_logical=603
+207:ledger_closure_logical=196
+210:ledger_table_reuse=0
+211:ledger_code_oracles=72
+212:ledger_min_tail_remaining=252
+213:ledger_total_tail_rank=558080
+214:ledger_total_tail_unique=879
+215:ledger_exhausted_tail_oracles=0
+216:hidden_prove_ms=358806
+217:hidden_proof_bytes=9939144
+218:hidden_verify_ms=49829
+219:hidden_own_fold_rounds=14
+221:sample_accepts=276343251
+222:sample_rejects=0
+225:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 644.82s
+236:	Maximum resident set size (kbytes): 169404380
+
+workspace:
+48
+passed=751
+ignored=17
+engine:
+test result: ok. 281 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.50s
+ops:
+test result: ok. 205 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.22s
