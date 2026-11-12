@@ -12481,6 +12481,37 @@ mod merged_tests {
         plan
     }
 
+    /// One two-stage chain on the toy group's own codes. The stage list is
+    /// plan data: it derives a loop chain but no proof is made against it.
+    fn staged_plan(plan: &HiddenLinPlan) -> HiddenLinPlan {
+        let mut staged = plan.clone();
+        let main = plan.proximity.code;
+        let mask = plan.proximity.mask_code;
+        let next_main = build_code_plan(main.log_n + 2, main.ell, main.r).unwrap();
+        let next_mask = build_code_plan(main.log_n + 2, mask.ell * 4, mask.r).unwrap();
+        let stage_zero = IoppStagePlan {
+            main,
+            mask,
+            k: 2,
+            h: 0,
+            positions: plan.proximity.shared_base_positions,
+            samples: 1,
+            work_bits: 0,
+        };
+        let last = IoppStagePlan {
+            main: next_main,
+            mask: next_mask,
+            k: 0,
+            h: 0,
+            positions: plan.proximity.shared_base_positions,
+            samples: 1,
+            work_bits: 0,
+        };
+        staged.proximity.shared_stages = vec![stage_zero.clone(), last.clone()];
+        staged.proximity.own_stages = vec![stage_zero, last];
+        staged
+    }
+
     fn hidden_run() -> (HiddenLinPlan, HiddenLinMessages, HiddenLinWitness) {
         let activation = activation();
         let mut plan = hidden_plan(&activation);
@@ -13132,6 +13163,62 @@ mod merged_tests {
         let bytes = messages.encode().unwrap();
         let decoded = HiddenLinMessages::decode(&plan, &bytes).unwrap();
         assert_eq!(decoded, messages);
+    }
+
+    #[test]
+    fn old_or_unknown_session_layout_is_rejected() {
+        let (plan, messages, _witness) = run();
+        // The current schema with the previous single-stage layout is an
+        // unsupported version, not a silent fallback.
+        let mut old = CanonicalWriter::new();
+        old.put_u64(HIDDEN_SEND_SCHEMA_VERSION);
+        old.put_u64(13);
+        assert_eq!(
+            HiddenLinMessages::decode(&plan, &old.into_bytes()).unwrap_err(),
+            Error::UnsupportedVersion
+        );
+        // A newer unknown layout cannot decode either.
+        let mut newer = CanonicalWriter::new();
+        newer.put_u64(HIDDEN_SEND_SCHEMA_VERSION);
+        newer.put_u64(15);
+        assert_eq!(
+            HiddenLinMessages::decode(&plan, &newer.into_bytes()).unwrap_err(),
+            Error::InvalidEncoding
+        );
+        // The current layout still round trips.
+        let bytes = messages.encode().unwrap();
+        assert_eq!(HiddenLinMessages::decode(&plan, &bytes).unwrap(), messages);
+    }
+
+    #[test]
+    fn a_staged_plan_rejects_the_single_stage_tail() {
+        let (plan, messages, _witness) = run();
+        let staged = staged_plan(&plan);
+        // The trusted plan derives a loop chain for both groups.
+        assert!(proximity_iopp_plan(
+            &staged.proximity,
+            &staged.send,
+            staged.closure.as_ref(),
+            ProximityGroupRole::Shared,
+        )
+        .unwrap()
+        .is_some());
+        assert!(proximity_iopp_plan(
+            &staged.proximity,
+            &staged.send,
+            staged.closure.as_ref(),
+            ProximityGroupRole::Own,
+        )
+        .unwrap()
+        .is_some());
+        // An artifact whose tails are the single-stage artifacts cannot
+        // decode against a plan that requires the loop: there is no silent
+        // fallback to the old delivery.
+        let bytes = messages.encode().unwrap();
+        assert_eq!(
+            HiddenLinMessages::decode(&staged, &bytes).unwrap_err(),
+            Error::ShapeMismatch
+        );
     }
 
     #[test]

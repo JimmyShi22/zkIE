@@ -2333,6 +2333,36 @@ mod tests {
     }
 
     #[test]
+    fn a_proof_from_another_chain_is_rejected() {
+        let (plan, proof, _seal, zero) = run_proof();
+        let mut other = Chain::begin(
+            CHAIN_LABEL + 1,
+            &CHAIN_PARAMETERS,
+            b"multi-stage iopp fixture",
+            b"",
+            None,
+        )
+        .unwrap();
+        assert!(verify_multi_stage_iopp(other, &plan, zero, &proof).is_err());
+    }
+
+    #[test]
+    fn nonzero_kept_rows_are_rejected_by_the_verifier() {
+        let (plan, proof, _seal, mut zero) = run_proof();
+        zero.handoff.kept_rows = 1;
+        assert!(verify_multi_stage_iopp(chain(), &plan, zero, &proof).is_err());
+    }
+
+    #[test]
+    fn a_tampered_last_base_is_rejected() {
+        let (plan, proof, _seal, zero) = run_proof();
+        let mut tampered = proof.clone();
+        let last = tampered.base.len() - 1;
+        tampered.base[last] ^= 1;
+        assert!(verify_multi_stage_iopp(chain(), &plan, zero, &tampered).is_err());
+    }
+
+    #[test]
     fn zero_old_mask_round_trips_without_a_tree() {
         let plan = IoppChain::derive(&stages(), &config()).unwrap();
         let (zero, verify_zero) = zero_mask_stage_zero();

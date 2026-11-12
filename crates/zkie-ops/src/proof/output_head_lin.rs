@@ -2312,6 +2312,50 @@ mod tests {
     }
 
     #[test]
+    fn old_or_unknown_envelope_version_is_rejected() {
+        let fixture = fixture();
+        let setup = verifier_setup(&fixture);
+        let merged = merged_plan(
+            fixture.shape,
+            &setup,
+            &fixture.table.reader,
+            &output_head_claims(
+                fixture.shape,
+                &OutputHeadInputs {
+                    activation: fixture.outputs[0][0].clone(),
+                    output: fixture.outputs[1][0].clone(),
+                },
+                &[],
+            )
+            .unwrap(),
+            setup.expected_activation_root.unwrap(),
+            setup.expected_roots.clone(),
+        )
+        .unwrap();
+        let session = fixture.proof.session.encode().unwrap();
+        // A proof from the previous envelope version is unsupported, not a
+        // silent fallback to the single-stage tail.
+        let mut old = CanonicalWriter::new();
+        old.put_u64(4);
+        old.put_bytes(&session);
+        assert_eq!(
+            OutputHeadLinProof::decode(&merged, &old.into_bytes()).unwrap_err(),
+            Error::UnsupportedVersion
+        );
+        // A newer unknown version cannot decode either.
+        let mut newer = CanonicalWriter::new();
+        newer.put_u64(OUTPUT_HEAD_PROOF_VERSION + 1);
+        newer.put_bytes(&session);
+        assert_eq!(
+            OutputHeadLinProof::decode(&merged, &newer.into_bytes()).unwrap_err(),
+            Error::InvalidEncoding
+        );
+        // The current envelope still decodes.
+        let bytes = fixture.proof.encode().unwrap();
+        assert_eq!(OutputHeadLinProof::decode(&merged, &bytes).unwrap(), fixture.proof);
+    }
+
+    #[test]
     fn changed_activation_or_output_is_rejected() {
         let mut fixture = fixture();
         let setup = verifier_setup(&fixture);
