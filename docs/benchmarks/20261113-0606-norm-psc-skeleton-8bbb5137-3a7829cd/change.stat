@@ -1,0 +1,4 @@
+8bbb5137 Add the norm committed-message and PSC verifier skeleton
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs | 817 +++++++++++++++++++++++++++
+ crates/zkie-ops/src/proof/mod.rs             |   1 +
+ 2 files changed, 818 insertions(+)

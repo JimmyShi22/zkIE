@@ -1,0 +1,4 @@
+workspace: 48 suites, 820 passed, 0 failed, 17 ignored
+focused hidden_norm_psc: 5 passed, 0 failed
+proof path changed: no; no proof generated in this slice
+soundness/privacy claim: none (row binding deferred)
