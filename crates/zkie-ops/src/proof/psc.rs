@@ -97,13 +97,13 @@ impl Weight {
         })
     }
 
-    /// `phi(g) = g(0)`, used for a further variable that does not change the
-    /// sum, with `psi = 1`.
-    pub fn at_zero(degree: usize) -> Result<Self> {
+    /// `phi(g) = (1 - z) g(0) + z g(1)`: a sum over the two Boolean points
+    /// weighted by the equality polynomial's factor at `z`, with `psi = 1`.
+    pub fn equality(z: Fp3, degree: usize) -> Result<Self> {
         if degree < 2 {
             return Err(Error::InvalidConfig);
         }
-        let mut moment = vec![Fp3::ZERO; degree];
+        let mut moment = vec![z; degree];
         moment[0] = Fp3::ONE;
         let fixed = 0;
         let fixed_inv = moment[fixed].inverse()?;
@@ -113,6 +113,12 @@ impl Weight {
             fixed,
             fixed_inv,
         })
+    }
+
+    /// `phi(g) = g(0)`, used for a further variable that does not change the
+    /// sum, with `psi = 1`.
+    pub fn at_zero(degree: usize) -> Result<Self> {
+        Self::equality(Fp3::ZERO, degree)
     }
 
     /// Number of coefficients of a polynomial in this variable.
@@ -1987,6 +1993,22 @@ mod tests {
             &mut proving_source(5),
         )
         .is_err());
+    }
+
+    #[test]
+    fn equality_weight_sums_the_two_boolean_points() {
+        let z = f(3);
+        let weight = Weight::equality(z, 3).unwrap();
+        let g = [f(5), f(7), f(11)];
+        assert_eq!(weight.apply(&g).unwrap(), Fp3::ONE.sub(&z).mul(&f(5)).add(&z.mul(&f(23))));
+        assert_eq!(weight.psi(), &[Fp3::ONE]);
+        assert_eq!(weight.fixed(), 0);
+        assert_eq!(weight.of_one(), Fp3::ONE);
+        assert!(Weight::equality(z, 1).is_err());
+        assert_eq!(
+            Weight::at_zero(3).unwrap().apply(&g).unwrap(),
+            Weight::equality(Fp3::ZERO, 3).unwrap().apply(&g).unwrap()
+        );
     }
 
     #[test]
