@@ -533,6 +533,55 @@ pub struct GeneralMaskEntries {
     pub shown: Vec<Fp3>,
 }
 
+/// One claim mask term: a slot in the mask message and its coefficient.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaskTerm {
+    pub slot: usize,
+    pub coefficient: Fp3,
+}
+
+/// A claim on a multilinear map at a point, with a linear form in mask entries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GeneralClaim {
+    pub point: Vec<Fp3>,
+    pub value: Fp3,
+    pub masks: Vec<MaskTerm>,
+}
+
+/// LINE: reduces two claims on the two halves of a multilinear map at one point
+/// to one claim on the whole map. The verifier draws the last coordinate.
+pub fn line(
+    challenges: &mut dyn GeneralChallenges,
+    half0: GeneralClaim,
+    half1: GeneralClaim,
+) -> Result<GeneralClaim> {
+    if half0.point != half1.point {
+        return Err(Error::ShapeMismatch);
+    }
+    let rho = challenges.draw()?;
+    let one_minus = Fp3::ONE.sub(&rho);
+    let mut point = half0.point;
+    point.push(rho);
+    let mut masks = Vec::with_capacity(half0.masks.len() + half1.masks.len());
+    for term in half0.masks {
+        masks.push(MaskTerm {
+            slot: term.slot,
+            coefficient: one_minus.mul(&term.coefficient),
+        });
+    }
+    for term in half1.masks {
+        masks.push(MaskTerm {
+            slot: term.slot,
+            coefficient: rho.mul(&term.coefficient),
+        });
+    }
+    Ok(GeneralClaim {
+        point,
+        value: one_minus.mul(&half0.value).add(&rho.mul(&half1.value)),
+        masks,
+    })
+}
+
 /// The prover's messages of one general sumcheck.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GeneralProof {
@@ -557,6 +606,8 @@ pub struct GeneralOutput {
     pub ends: Vec<PointClaim>,
     /// The kept-map terms of the `(U)` row: map index and coefficient.
     pub row_maps: Vec<(usize, Fp3)>,
+    /// The claim's mask terms, scaled by the output claim scale.
+    pub claim_masks: Vec<MaskTerm>,
 }
 
 /// The variables of the general sumcheck: the claim's X variables and, when a
@@ -617,6 +668,16 @@ fn add_scaled(target: &mut [Fp3], source: &[Fp3], scale: Fp3) -> Result<()> {
     Ok(())
 }
 
+fn add_weight(target: &mut [Fp3], weight: &Weight, scale: Fp3) -> Result<()> {
+    if weight.psi().len() > target.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    for (index, coefficient) in weight.psi().iter().enumerate() {
+        target[index] = target[index].add(&scale.mul(coefficient));
+    }
+    Ok(())
+}
+
 fn sent_coefficients(weight: &Weight, round: &[Fp3]) -> Result<Vec<Fp3>> {
     if round.len() != weight.degree() {
         return Err(Error::ShapeMismatch);
@@ -653,6 +714,7 @@ fn output(
     challenges: &[Fp3],
     last: Fp3,
     end_values: &[Fp3],
+    claim_masks: &[MaskTerm],
 ) -> Result<GeneralOutput> {
     let x_count = variables.len() - usize::from(summand.shown() > 0);
     let point = challenges[..x_count].to_vec();
@@ -692,6 +754,13 @@ fn output(
         row_target: last.sub(&eps.mul(&coefficients[0])),
         ends,
         row_maps,
+        claim_masks: claim_masks
+            .iter()
+            .map(|term| MaskTerm {
+                slot: term.slot,
+                coefficient: psis.mul(&term.coefficient),
+            })
+            .collect(),
     })
 }
 
@@ -699,6 +768,8 @@ fn output(
 /// the masked summand's sum. `inner` supplies the unmasked round polynomials.
 pub fn prove_general(
     x_variables: &[Weight],
+    claim_masks: &[MaskTerm],
+    mask_value: &dyn Fn(usize) -> Result<Fp3>,
     target: Fp3,
     summand: &Summand,
     table: Option<&dyn TableAt>,
@@ -720,6 +791,10 @@ pub fn prove_general(
         },
         end_values: Vec::new(),
     };
+    let mut sigma = Fp3::ZERO;
+    for term in claim_masks {
+        sigma = sigma.add(&term.coefficient.mul(&mask_value(term.slot)?));
+    }
     challenges.send_hiding_sum(proof.hiding_sum)?;
     let eps = challenges.draw()?;
     let mut running = proof.hiding_sum.add(&eps.mul(&target));
@@ -728,6 +803,7 @@ pub fn prove_general(
     for variable in 0..x_count {
         let mut round = hiding.round()?;
         add_scaled(&mut round, &inner.round()?, eps)?;
+        add_weight(&mut round, &variables[variable], eps.mul(&sigma).mul(&psis))?;
         if variables[variable].apply(&round)? != running {
             return Err(Error::InvalidProof);
         }
@@ -764,6 +840,11 @@ pub fn prove_general(
         let summand_round = interpolate(&values)?;
         let mut round = hiding.round()?;
         add_scaled(&mut round, &summand_round, eps)?;
+        add_weight(
+            &mut round,
+            &variables[x_count],
+            eps.mul(&sigma).mul(&psis),
+        )?;
         if variables[x_count].apply(&round)? != running {
             return Err(Error::InvalidProof);
         }
@@ -790,6 +871,7 @@ pub fn prove_general(
         &drawn,
         running,
         &all_values,
+        claim_masks,
     )?;
     Ok((proof, out))
 }
@@ -799,6 +881,7 @@ pub fn prove_general(
 /// output claim to committed messages.
 pub fn verify_general(
     x_variables: &[Weight],
+    claim_masks: &[MaskTerm],
     target: Fp3,
     summand: &Summand,
     table: Option<&dyn TableAt>,
@@ -842,6 +925,7 @@ pub fn verify_general(
         &drawn,
         running,
         &proof.end_values,
+        claim_masks,
     )
 }
 
@@ -919,6 +1003,8 @@ mod tests {
         let mut inner = WeightedProductInner::new(&x, &omega, &z).unwrap();
         let (proof, proven) = prove_general(
             &variables,
+            &[],
+            &|_| Ok(Fp3::ZERO),
             target,
             &Summand::Product,
             None,
@@ -929,6 +1015,7 @@ mod tests {
         .unwrap();
         let verified = verify_general(
             &variables,
+            &[],
             target,
             &Summand::Product,
             None,
@@ -952,6 +1039,8 @@ mod tests {
         let mut inner = BitsInner::new(&values).unwrap();
         let (proof, proven) = prove_general(
             &variables,
+            &[],
+            &|_| Ok(Fp3::ZERO),
             Fp3::ZERO,
             &Summand::Bits,
             None,
@@ -962,6 +1051,7 @@ mod tests {
         .unwrap();
         let verified = verify_general(
             &variables,
+            &[],
             Fp3::ZERO,
             &Summand::Bits,
             None,
@@ -976,6 +1066,8 @@ mod tests {
         let mut inner = BitsInner::new(&bad).unwrap();
         assert!(prove_general(
             &variables,
+            &[],
+            &|_| Ok(Fp3::ZERO),
             Fp3::ZERO,
             &Summand::Bits,
             None,
@@ -984,6 +1076,85 @@ mod tests {
             &mut Source(11),
         )
         .is_err());
+    }
+
+    #[test]
+    fn claim_mask_terms_enter_the_output() {
+        let variables = [Weight::plain(3).unwrap(), Weight::plain(3).unwrap()];
+        let values = [f(0), f(1), f(1), f(0)];
+        let masks = GeneralMaskEntries {
+            hiding: (0..7).map(|index| f(60 + index as u64)).collect(),
+            shown: vec![f(600)],
+        };
+        let claim_masks = [MaskTerm {
+            slot: 3,
+            coefficient: f(5),
+        }];
+        let provider = |slot: usize| -> Result<Fp3> {
+            if slot == 3 {
+                Ok(f(7))
+            } else {
+                Err(Error::InvalidIndex)
+            }
+        };
+        let mut inner = BitsInner::new(&values).unwrap();
+        let (proof, proven) = prove_general(
+            &variables,
+            &claim_masks,
+            &provider,
+            f(35),
+            &Summand::Bits,
+            None,
+            &mut inner,
+            &masks,
+            &mut Source(29),
+        )
+        .unwrap();
+        let verified = verify_general(
+            &variables,
+            &claim_masks,
+            f(35),
+            &Summand::Bits,
+            None,
+            &proof,
+            masks.hiding.len(),
+            &mut Source(29),
+        )
+        .unwrap();
+        assert_eq!(proven, verified);
+        assert_eq!(proven.claim_masks.len(), 1);
+        assert_eq!(proven.claim_masks[0].slot, 3);
+    }
+
+    #[test]
+    fn line_combines_two_halves() {
+        let half0 = GeneralClaim {
+            point: vec![f(2)],
+            value: f(10),
+            masks: vec![MaskTerm {
+                slot: 1,
+                coefficient: f(3),
+            }],
+        };
+        let half1 = GeneralClaim {
+            point: vec![f(2)],
+            value: f(20),
+            masks: vec![MaskTerm {
+                slot: 2,
+                coefficient: f(4),
+            }],
+        };
+        let combined = line(&mut Source(31), half0, half1).unwrap();
+        assert_eq!(combined.point.len(), 2);
+        assert_eq!(combined.point[0], f(2));
+        let rho = combined.point[1];
+        assert_eq!(
+            combined.value,
+            Fp3::ONE.sub(&rho).mul(&f(10)).add(&rho.mul(&f(20)))
+        );
+        assert_eq!(combined.masks.len(), 2);
+        assert_eq!(combined.masks[0].slot, 1);
+        assert_eq!(combined.masks[1].slot, 2);
     }
 
     #[test]
@@ -998,6 +1169,8 @@ mod tests {
         let mut inner = ScalarInner::new(&[f(2), f(1), f(1)]).unwrap();
         let (proof, proven) = prove_general(
             &variables,
+            &[],
+            &|_| Ok(Fp3::ZERO),
             Fp3::ZERO,
             &Summand::TieFirst { a: f(2) },
             None,
@@ -1008,6 +1181,7 @@ mod tests {
         .unwrap();
         let verified = verify_general(
             &variables,
+            &[],
             Fp3::ZERO,
             &Summand::TieFirst { a: f(2) },
             None,
@@ -1035,6 +1209,8 @@ mod tests {
         let mut inner = WeightedBitsInner::new(&values, &z).unwrap();
         let (proof, proven) = prove_general(
             &variables,
+            &[],
+            &|_| Ok(Fp3::ZERO),
             Fp3::ZERO,
             &Summand::Bits,
             None,
@@ -1045,6 +1221,7 @@ mod tests {
         .unwrap();
         let verified = verify_general(
             &variables,
+            &[],
             Fp3::ZERO,
             &Summand::Bits,
             None,
@@ -1088,6 +1265,8 @@ mod tests {
         let mut inner = LeavesInner::new(&values, &table, &z, alpha).unwrap();
         let (proof, proven) = prove_general(
             &variables,
+            &[],
+            &|_| Ok(Fp3::ZERO),
             target,
             &Summand::Leaves { alpha },
             Some(&table_impl),
@@ -1098,6 +1277,7 @@ mod tests {
         .unwrap();
         let verified = verify_general(
             &variables,
+            &[],
             target,
             &Summand::Leaves { alpha },
             Some(&table_impl),
