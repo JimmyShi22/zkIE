@@ -23,6 +23,15 @@ Every later stage is made by a code switch: the folded main message fills the
 next stage rows, the mask room grows by the stage's hiding shift, and the
 last stage has zero fold rounds and the BASE position count.
 
+`[FACT]` The actual fixture's own group has 8,258 main rows: 16 W messages
+(2 rows each), Omega (1), the Dot shown map (1), 16 slack messages (2 rows
+each), 16 bits messages (256 rows each, rounded up from 129 by the answer-pad
+capacity and the power-of-two rule), 16 map messages (256 rows each) and the
+closure mask (0 main rows). Its stage-0 fold is therefore `k=14, h=2`; the
+next stage is `k=13, h=13` and the last stage is `k=h=0`. The earlier
+`4,162`/`k=13` figure divided by `ell` without the `ell - answers` capacity
+and is withdrawn.
+
 `[FACT]` The stage FOLD and switch tree numbers, the fold group, member and
 fresh identifiers, the stage seeds and the BASE star plan are derived from
 the trusted stage list. Identifiers are allocated in stage order from the
@@ -111,7 +120,23 @@ session harness. The loop moves those openings into the switch and LastBase
 artifacts, so the loop's measured opening budget is recorded by the acceptance
 run, not by the harness constants.
 
+`[FACT]` The acceptance run measured on the GPT-2 seq16 formal fixture, same
+machine, after the loop wiring and the `k=14` stage-0 correction:
+hidden prove 744,204 ms, hidden verify 51,142 ms, whole test 1,035.04 s,
+hidden proof 9,527,120 bytes and maximum RSS 213,833,272 KiB. The proof
+reports 14 own fold rounds. The previous single-stage trace on the same
+fixture (scheme `rework10-final`, code `473e395d`) recorded hidden prove
+359,802 ms, hidden verify 50,538 ms, maximum RSS 169,394,600 KiB and a
+646.80 s test. The loop therefore roughly doubles hidden prove wall time and
+raises peak RSS by about 26% on this fixture; the numbers are recorded as a
+resource cost of the multi-stage scheme, not as an optimization gain. The
+baseline is from a different commit and is cited with its trace.
+
 `[GAP]` The security bound that combines code distance, list size, batching,
 hash, work and mask hiding budgets at the production parameters is not
 restated here. It is part of the batch review together with the measured
-resource budget; small-fixture parameters are not final parameters.
+resource budget; small-fixture parameters are not final parameters. The
+`positions=2` and `work=0` stage values remain candidate plan values; the
+planner-derived proximity positions for a `2^-128` per-stage target are much
+larger (shared stage0 155, shared last 129, own stage0 155, own stage1 15,
+own last 20).

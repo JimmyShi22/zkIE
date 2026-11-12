@@ -474,7 +474,7 @@ block-triangular argument as the PSC applies to the fold round recursion: the
 diagonal blocks are nonzero constants, so the determinant is a nonzero
 constant independent of the challenges and the map is full rank for every
 challenge. The test runs the real fold prover
-for the test point k = 14 (the actual fixture own fold is k = 13) and for k = 2 at three challenge seeds;
+for the test point k = 14 (the actual fixture own fold is also k = 14) and for k = 2 at three challenge seeds;
 the 29 x 29 and 5 x 5 matrices are full rank and have determinant one. The
 closed path has two FOLD instances (the shared and own proximity groups);
 their randomness is fresh and their openings/tails are separate.
@@ -1138,17 +1138,22 @@ larger than `2^-192` and `2/p^3` is slightly larger than `2^-191`. Every
 strict bound below is exact or looser than the exact value:
 `1/p^3 < 2^-191`, `2/p^3 < 2^-190.9`, `3/p^3 < 2^-190.4`,
 `4/p^3 < 2^-189.9`, `6/p^3 < 2^-189.4`, `26/p^3 < 2^-187.2`,
-`30/p^3 < 2^-186.9`, `1134/p^3 < 2^-181`, `16*166/p^3 < 2^-180`. The exact
+`28/p^3 < 2^-187.1`, `30/p^3 < 2^-186.9`, `32/p^3 < 2^-186.9`,
+`58/p^3 < 2^-186.1`, `1134/p^3 < 2^-181`, `16*166/p^3 < 2^-180`. The exact
 quantities used in the self-check are
 `1/p^3 = 2^-191.99999999899`, `2/p^3 = 2^-190.99999999899`,
 `3/p^3 = 2^-190.4150374983`, `4/p^3 = 2^-189.99999999899`,
 `6/p^3 = 2^-189.4150374983`, `26/p^3 = 2^-187.299560...`,
-`30/p^3 = 2^-187.0931094034`, `128/p^3 = 2^-184.99999999899`,
+`28/p^3 = 2^-187.192645...`, `30/p^3 = 2^-187.0931094034`,
+`32/p^3 = 2^-186.999999...`, `58/p^3 = 2^-186.142019...`,
+`128/p^3 = 2^-184.99999999899`,
 `1134/p^3 = 2^-181.852...` and `16*166/p^3 = 2^-180.625...`. In particular
 `128/p^3` is slightly larger than `2^-185`, so no strict `< 2^-185` claim is
 made for it; it is not used in the bound. The `3/p^3`, `4/p^3`, `6/p^3` and
-`30/p^3` entries are listed for the arithmetic self-check; the retained union
-terms are the FOLD `30/p^3`, the range, the PSC and the `chi = 0` terms.
+`30/p^3`, `32/p^3` and `58/p^3` entries are listed for the arithmetic
+self-check; the retained single-stage union terms are the FOLD `32/p^3`, the
+range, the PSC and the `chi = 0` terms; the multi-stage loop's candidate FOLD
+merge is `58/p^3`.
 
 The hiding-rank maps have constant nonzero determinant (section 5.4), so the
 former bad-challenge rank term is withdrawn: there is no Schwartz-Zippel
@@ -1159,7 +1164,7 @@ The entries are:
 | Component | Count/degree | Bound |
 |---|---|---:|
 | direct shared FOLD check | k = 2, 2 rounds, degree 2 | `4/p^3 < 2^-189.9` |
-| direct own FOLD check | k = 13, 13 rounds, degree 2 | `26/p^3 < 2^-187.2` |
+| direct own FOLD check | k = 14, 14 rounds, degree 2 | `28/p^3 < 2^-187.1` |
 | BASE lambda and symbol checks | withdrawn from the algebraic union: no independent-uniform field-domain/order derivation for the Fp3 lambda challenge, and the two checks are codeword-index samples, not field challenges | carried in `eps_proximity` (unknown term, not in `eps_components`) |
 | base position sampling | real sampler `draw -> unique_sorted`: `t = 2` draws, `s <= 2` unique positions and `s` is variable; distance parameter `delta` | miss `(1 - delta)^t` for the original-draw event; the actual `delta`/miss are computed in section 8 (`0.3163976` main, `3.42e-5` mask): ineffective |
 | range booleanity | 16 positions, degree at most 166 each | `16*166/p^3 < 2^-180` |
@@ -1175,7 +1180,7 @@ The entries are:
 ```text
 eps_total <= eps_hash + eps_components + eps_proximity
 eps_hash = (t + q_V + 1) * 2^-128 + (17/2) * (t + q_V)^2 / 2^256
-eps_components <= 16*166/p^3 + 1134/p^3 + 30/p^3 + 1/p^3
+eps_components <= 16*166/p^3 + 1134/p^3 + 32/p^3 + 1/p^3
                 < 2^-180 + 2^-181.85 + 2^-186.9 + 2^-191
                 < 2^-179.6
 eps_proximity = INEFFECTIVE
@@ -1210,7 +1215,7 @@ from `eps_components`: the lambda challenge is an `Fp3` field value whose
 independent-uniform-domain/order derivation is not given here, the two symbol
 checks are codeword-index samples of the real sampler, and two `2/p^3`
 single-equality units lack a written degree/event derivation. The counted
-terms are the FOLD merge `4/p^3 + 26/p^3 = 30/p^3 < 2^-186.9`, the range
+terms are the FOLD merge `4/p^3 + 28/p^3 = 32/p^3 < 2^-186.9`, the range
 term, the PSC term and the `chi = 0` event; each has an explicit degree or
 event basis (FOLD round checks of degree 2, PSC round checks of degree 3,
 range checks of degree at most 166 per position, and one
@@ -1230,7 +1235,7 @@ bits; it is not re-derived here.
 distance radius 16,384, later radius 16,384, `m_once = m_later = 0`, `v = 10`,
 `answers = 1`; column draws 603 with a 603 column budget and 12 column work
 bits; shared/base positions 2 each. The direct FOLD checks have k = 2
-(shared) and k = 13 (own). The plan does draw one `Fp3` BASE lambda and two
+(shared) and k = 14 (own). The plan does draw one `Fp3` BASE lambda and two
 base positions, but their numeric error terms are not kept in
 `eps_components`: they are carried in `eps_proximity`, which is ineffective at
 the current parameters (section 8). The prior "8 rounds each <= 2^-128" term
@@ -1360,7 +1365,7 @@ challenges drawn after the difference is fixed:
 
 | Difference class | Nonzero condition | Degree / term |
 |---|---|---|
-| FOLD round difference | the folded claim difference is nonzero in the round polynomial | degree 2 per variable; `4/p^3` shared, `26/p^3` own |
+| FOLD round difference | the folded claim difference is nonzero in the round polynomial | degree 2 per variable; `4/p^3` shared, `28/p^3` own |
 | PSC round difference | the sumcheck difference is nonzero in the round polynomial | degree 3 per variable; `1134/p^3` |
 | range / booleanity difference | the range polynomial difference is nonzero | degree at most 166 per position; `2656/p^3` |
 | BAT row difference | the row linear form differs at the batching challenge | degree 1; `1/p^3` |
@@ -1436,7 +1441,7 @@ negatives at the component level. Until one is supplied, the soundness
 conclusion is conditional on kernel coverage.
 
 `[FACT]` `CODE` Algebraic terms and preconditions. The shared/own FOLD terms
-`4/p^3` and `26/p^3` enter only when the actual difference in the
+`4/p^3` and `28/p^3` enter only when the actual difference in the
 corresponding folded claim is nonzero and the challenge is drawn after the
 difference is fixed; if the difference is zero (kernel), those terms do not
 apply to that difference, and the kernel case is handled (or left open) in the
@@ -1480,7 +1485,7 @@ that of `e`, i.e. `delta_main`, and the coefficient combination is nonzero
 except with the counted probability `1/p`. The FOLD checks see no difference
 because the claimed fold includes the same error; the proximity is the only
 distance check. The fold therefore does not contract the distance for this
-pattern for `k = 2` or `k = 13`. If the errors were independent across the
+pattern for `k = 2` or `k = 14`. If the errors were independent across the
 `2^k` rows, the folded error weight would be near
 `1 - (1 - delta)^{2^k}` and the check would be strong, but soundness must use
 the worst-case fold-consistent pattern, so the effective `delta` is
@@ -1541,11 +1546,11 @@ nonzero, the verifier's FOLD checks are polynomials in the challenges.
 
 **Degree.** Each FOLD round polynomial has degree at most two in its
 challenge; a nonzero difference polynomial has degree at most two per
-variable. The own fold has k = 13 (the actual fixture's members total 4,162 main rows;
-the next power of two is 8,192). The shared fold's members are the
+variable. The own fold has k = 14 (the actual fixture's members total 8,258 main rows;
+the next power of two is 16,384). The shared fold's members are the
 Gu message (2 main rows) and the one-row Omega message, so its k is 2.
-Charging k = 13 for both instances, the union over the two fold checks is at
-most `2 * 2 * 13 / p^3`; the exact actual merge is `2*13 + 2*2 = 30` terms.
+Charging k = 14 for both instances, the union over the two fold checks is at
+most `2 * 2 * 14 / p^3`; the exact actual merge is `2*14 + 2*2 = 32` terms.
 
 **Challenge order.** The fold challenges, the BASE lambda and the base
 positions are drawn after the committed rows and roots; the difference is
@@ -1568,7 +1573,7 @@ are carried in `eps_proximity` (unknown term; the proximity itself is
 ineffective, section 8).
 
 **Proximity/opening.** The direct FOLD checks are the per-round degree terms
-above (4/p^3 shared, 26/p^3 own); the BASE lambda and the two base-position
+above (4/p^3 shared, 28/p^3 own); the BASE lambda and the two base-position
 checks add no term to the algebraic union and are carried in `eps_proximity`
 (withdrawal above). The opening sets satisfy `q <= r` by the ledger
 (table 603, W/closure and mask at most 4, minimum remaining 252); `q <= r` is
@@ -1612,7 +1617,7 @@ quantified.
 **Honest soundness ledger.** The pieces of the reduction are:
 
 ```text
-eps_algebraic  <= 16*166/p^3 + 1134/p^3 + 30/p^3 + 1/p^3 < 2^-179.6
+eps_algebraic  <= 16*166/p^3 + 1134/p^3 + 32/p^3 + 1/p^3 < 2^-179.6
 eps_proximity  = INEFFECTIVE: main miss 0.3163976670, mask miss 3.424292663e-5
 eps_hash       = the RO/CR model term of section 6 (not a concrete-hash bound)
 eps_kernel     = UNPROVEN: the open error classes of the kernel-coverage table
@@ -1638,13 +1643,16 @@ snapshot). The shared proximity group uses main code `(log_n,ell,r) =
 each; Gu/Omega leaf class 2, mask tree leaf class 3. The own proximity
 group uses the same codes; its members are 16 W messages (2 rows each), Omega
 (1), the Dot shown map (1), the index mask (2 mask rows), 16 slack messages
-(2 rows each), 16 bits messages (128 rows each), 16 map messages (128 rows
-each) and the closure mask (2 mask rows), so the main-row total is 4,162 and
-`k = 13`; the mask-row total is 4 and `h = 2`; sample answers 1 each; W leaf
+(2 rows each), 16 bits messages (256 rows each), 16 map messages (256 rows
+each) and the closure mask (2 mask rows), so the main-row total is 8,258 and
+`k = 14`; the mask-row total is 4 and `h = 2`; sample answers 1 each; W leaf
 class 1, Omega/Dot/slack/bits/map leaf class 2, mask trees leaf class 3. The
-FOLD terms are therefore `2*2 = 4/p^3`
-(shared) and `2*13 = 26/p^3` (own); the earlier `22/28` figures (k=11/14)
-belong to a different plan and are withdrawn.
+bits/map row count is 256, not 128: `WShape` divides by `ell - answers` and
+rounds the row count up to a power of two, so 8,388,608 entries need 129 rows
+and are padded to 256. The direct own FOLD term is therefore `2*14 = 28/p^3`;
+the earlier `4,162`/`k=13`/`26/p^3` figures (which divided by `ell` and
+ignored the answer pad) and the earlier `22/28` figures (k=11/14) are
+withdrawn.
 
 `[FACT]` `CODE` The table does not enter the IOPP. The shared members are only
 Gu and Omega; the own members are the W/Omega/Dot/closure messages listed
@@ -1666,10 +1674,10 @@ has `k >= 1`, `h <= k`; main and mask message lengths are powers of two; the
 next main length satisfies `ell_i = 2^{k_{i+1}} ell_{i+1}`; the next mask room
 satisfies `ell_zk_{i+1} 2^{h_{i+1}} >= 2 ell_zk_i + r_i + 2 r_zk_i + answers`;
 the last stage has `k = h = 0`. For the actual first stage (shared `k=2,h=0`,
-own `k=13,h=2`, `ell=65,536`, `r=8,192`, mask `ell=512,r=256`, `answers=1`)
+own `k=14,h=2`, `ell=65,536`, `r=8,192`, mask `ell=512,r=256`, `answers=1`)
 shape-legal continuations exist: for example `k'=2` gives `ell'=16,384` and a
 next mask `ell=4,096` (room `16,384 >= 9,729`); the own group can step down
-`65,536 -> ... -> 1` with `k=13` followed by `k=2` steps. These are
+`65,536 -> ... -> 1` with `k=14` followed by `k=13` steps. These are
 shape-feasible values, not yet the trusted parameters.
 
 `[FACT]` `CODE` The fixture plan now carries the candidate trusted stage lists.
@@ -1683,13 +1691,13 @@ bound in the fixture are:
 - shared: stage0 `(17, 65,536, 8,192)/(17, 512, 256)`, `k=2,h=0`,
   positions 2, samples 1, work 0; stage1 (last)
   `(17, 65,536, 256)/(17, 16,384, 256)`, `k=h=0`, positions 2, samples 1.
-- own: stage0 `(17, 65,536, 8,192)/(17, 512, 256)`, `k=13,h=2`, positions 2,
+- own: stage0 `(17, 65,536, 8,192)/(17, 512, 256)`, `k=14,h=2`, positions 2,
   samples 1, work 0; stage1 `(17, 8, 256)/(17, 16, 256)`, `k=13,h=13`,
   positions 2, samples 1; stage2 (last) `(17, 8, 256)/(17, 1,024, 256)`,
   `k=h=0`, positions 2, samples 1.
 
 The first-stage codes equal the group codes and the first-stage `k`/`h` equal
-the actual member counts (shared 2/0, own 13/2). Unit tests
+the actual member counts (shared 2/0, own 14/2). Unit tests
 `actual_shared_and_own_stage_lists_are_legal` and
 `bad_stage_chains_are_rejected` cover the actual lists and the failures
 (wrong first code, wrong folded length, non-last last stage). The lists are
@@ -1712,9 +1720,9 @@ two-sided miss `(1 - delta)^t` needs the following minimum positions
 (main/mask maxima): shared stage0 155, shared last 129, own stage0 155, own
 stage1 15, own last 20. The current `positions=2` is far below this and is not
 a security setting. The FOLD terms in the future chain are `4/p^3` (shared
-stage0), `26/p^3` (own stage0) and `26/p^3` (own stage1), total
-`56/p^3 < 2^-186.1`; the current single-stage path remains
-`4 + 26 = 30/p^3`. `work=0` is the no-PoW candidate; the plan's
+stage0), `28/p^3` (own stage0) and `26/p^3` (own stage1), total
+`58/p^3 < 2^-186.1`; the current single-stage path remains
+`4 + 28 = 32/p^3`. `work=0` is the no-PoW candidate; the plan's
 `column_work_bits=12` applies to table columns, not the IOPP positions. The
 CS/other per-stage terms and the final positions/work/error budget require the
 reference planner rules and remain `[UNPROVEN]`.
