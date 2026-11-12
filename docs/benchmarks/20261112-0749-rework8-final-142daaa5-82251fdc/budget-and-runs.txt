@@ -1,0 +1,68 @@
+run1:
+194:ledger_events=143
+195:ledger_logical_openings=887
+196:ledger_unique_positions=887
+197:ledger_table_logical=603
+201:ledger_closure_logical=196
+204:ledger_table_reuse=0
+205:ledger_code_oracles=72
+206:ledger_min_tail_remaining=252
+207:ledger_total_tail_rank=558080
+208:ledger_total_tail_unique=879
+209:ledger_exhausted_tail_oracles=0
+210:hidden_prove_ms=357017
+211:hidden_proof_bytes=9939144
+212:hidden_verify_ms=50484
+213:hidden_own_fold_rounds=14
+217:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 643.71s
+228:	Maximum resident set size (kbytes): 169373740
+
+run2:
+194:ledger_events=143
+195:ledger_logical_openings=887
+196:ledger_unique_positions=887
+197:ledger_table_logical=603
+201:ledger_closure_logical=196
+204:ledger_table_reuse=0
+205:ledger_code_oracles=72
+206:ledger_min_tail_remaining=252
+207:ledger_total_tail_rank=558080
+208:ledger_total_tail_unique=879
+209:ledger_exhausted_tail_oracles=0
+210:hidden_prove_ms=356741
+211:hidden_proof_bytes=9939144
+212:hidden_verify_ms=50476
+213:hidden_own_fold_rounds=14
+217:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 644.21s
+228:	Maximum resident set size (kbytes): 169390348
+
+run3:
+194:ledger_events=143
+195:ledger_logical_openings=887
+196:ledger_unique_positions=887
+197:ledger_table_logical=603
+201:ledger_closure_logical=196
+204:ledger_table_reuse=0
+205:ledger_code_oracles=72
+206:ledger_min_tail_remaining=252
+207:ledger_total_tail_rank=558080
+208:ledger_total_tail_unique=879
+209:ledger_exhausted_tail_oracles=0
+210:hidden_prove_ms=355955
+211:hidden_proof_bytes=9939144
+212:hidden_verify_ms=50798
+213:hidden_own_fold_rounds=14
+217:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 642.29s
+228:	Maximum resident set size (kbytes): 169425044
+
+workspace:
+48
+passed=747
+ignored=17
+engine:
+test result: ok. 277 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.50s
+ops:
+test result: ok. 205 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.17s
+historical:
+loaded_proof_ok=1 bytes=9939144
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 178.36s
