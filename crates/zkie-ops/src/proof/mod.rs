@@ -14,6 +14,7 @@ pub mod group_row_session;
 pub mod gu_combine_session;
 pub mod hidden_send_session;
 pub mod hidden_norm;
+pub mod hidden_norm_psc;
 pub mod send_session;
 pub mod lin_session;
 pub mod output_head_lin;
