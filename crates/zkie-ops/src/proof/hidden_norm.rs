@@ -10,8 +10,8 @@
 //! * for every position the core computes the valid-column sum, the
 //!   round-half-up mean, the centered squares and the round-half-up variance,
 //!   and a canonical base-256 digit row for the sum magnitude, the squares and
-//!   the variance. The full carry equations of the later relation are not
-//!   part of this slice.
+//!   the variance; it also computes the exact offset/complement decomposition
+//!   of the mean and variance rounding and the byte digits of both.
 //!
 //! The module is prover/fixture-side. The verifier-side commitment binding,
 //! the rsqrt table, the weight product and the output rounding are later
@@ -130,6 +130,18 @@ pub struct NormCoreRow {
     pub sum_digits: Vec<u8>,
     pub squares_digits: Vec<u8>,
     pub variance_digits: Vec<u8>,
+    /// The exact rounding decomposition of the mean: `u = r - lo` and
+    /// `s = valid - 1 - u`, with the byte digits of both, least significant
+    /// first.
+    pub mean_offset: i128,
+    pub mean_complement: i128,
+    pub mean_offset_digits: Vec<u8>,
+    pub mean_complement_digits: Vec<u8>,
+    /// The same decomposition of the variance rounding.
+    pub variance_offset: i128,
+    pub variance_complement: i128,
+    pub variance_offset_digits: Vec<u8>,
+    pub variance_complement_digits: Vec<u8>,
 }
 
 impl NormCoreRow {
@@ -179,6 +191,30 @@ impl NormCoreRow {
         }
         let squares_digits = unsigned_digits(squares.unsigned_abs() as u128)?;
         let variance_digits = unsigned_digits(variance.unsigned_abs() as u128)?;
+        let half = (valid / 2) as i128;
+        let mean_offset = mean_remainder
+            .checked_add(half)
+            .ok_or(Error::BoundViolation)?;
+        let mean_complement = (valid as i128 - 1)
+            .checked_sub(mean_offset)
+            .ok_or(Error::BoundViolation)?;
+        let variance_offset = variance_remainder
+            .checked_add(half)
+            .ok_or(Error::BoundViolation)?;
+        let variance_complement = (valid as i128 - 1)
+            .checked_sub(variance_offset)
+            .ok_or(Error::BoundViolation)?;
+        if mean_offset < 0
+            || mean_complement < 0
+            || variance_offset < 0
+            || variance_complement < 0
+        {
+            return Err(Error::BoundViolation);
+        }
+        let mean_offset_digits = unsigned_digits(mean_offset as u128)?;
+        let mean_complement_digits = unsigned_digits(mean_complement as u128)?;
+        let variance_offset_digits = unsigned_digits(variance_offset as u128)?;
+        let variance_complement_digits = unsigned_digits(variance_complement as u128)?;
         Ok(Self {
             sum,
             mean,
@@ -190,6 +226,14 @@ impl NormCoreRow {
             sum_digits,
             squares_digits,
             variance_digits,
+            mean_offset,
+            mean_complement,
+            mean_offset_digits,
+            mean_complement_digits,
+            variance_offset,
+            variance_complement,
+            variance_offset_digits,
+            variance_complement_digits,
         })
     }
 
@@ -201,11 +245,29 @@ impl NormCoreRow {
         if *self != expected {
             return Err(Error::InvalidProof);
         }
-        if self.mean_remainder <= -(valid as i128) || self.mean_remainder > valid as i128 {
+        let low = -((valid / 2) as i128);
+        let high = low + valid as i128 - 1;
+        if self.mean_remainder < low || self.mean_remainder > high {
             return Err(Error::InvalidProof);
         }
-        if self.variance_remainder <= -(valid as i128)
-            || self.variance_remainder > valid as i128
+        if self.variance_remainder < low || self.variance_remainder > high {
+            return Err(Error::InvalidProof);
+        }
+        if self.mean_offset != self.mean_remainder - low
+            || self.mean_complement != valid as i128 - 1 - self.mean_offset
+            || digits_value(&self.mean_offset_digits).map_err(|_| Error::InvalidProof)?
+                != self.mean_offset as u128
+            || digits_value(&self.mean_complement_digits).map_err(|_| Error::InvalidProof)?
+                != self.mean_complement as u128
+        {
+            return Err(Error::InvalidProof);
+        }
+        if self.variance_offset != self.variance_remainder - low
+            || self.variance_complement != valid as i128 - 1 - self.variance_offset
+            || digits_value(&self.variance_offset_digits).map_err(|_| Error::InvalidProof)?
+                != self.variance_offset as u128
+            || digits_value(&self.variance_complement_digits).map_err(|_| Error::InvalidProof)?
+                != self.variance_complement as u128
         {
             return Err(Error::InvalidProof);
         }
@@ -214,6 +276,26 @@ impl NormCoreRow {
         }
         Ok(())
     }
+}
+
+/// Reconstructs a canonical byte-digit row. Empty rows and rows with a zero
+/// most significant digit are rejected.
+fn digits_value(digits: &[u8]) -> Result<u128> {
+    if digits.is_empty() {
+        return Err(Error::InvalidProof);
+    }
+    if digits.len() > 1 && digits.last() == Some(&0) {
+        return Err(Error::InvalidProof);
+    }
+    let mut value: u128 = 0;
+    for (index, digit) in digits.iter().enumerate() {
+        let shift = index.checked_mul(8).ok_or(Error::BoundViolation)?;
+        let term = (*digit as u128)
+            .checked_shl(u32::try_from(shift).map_err(|_| Error::BoundViolation)?)
+            .ok_or(Error::BoundViolation)?;
+        value = value.checked_add(term).ok_or(Error::BoundViolation)?;
+    }
+    Ok(value)
 }
 
 fn unsigned_digits(value: u128) -> Result<Vec<u8>> {
@@ -455,6 +537,41 @@ mod tests {
         let mut changed = witness.clone();
         changed.rows[0].sum_digits[0] ^= 1;
         assert!(changed.check(&plan).is_err());
+        let mut changed = witness.clone();
+        changed.rows[0].mean_offset += 1;
+        assert!(changed.check(&plan).is_err());
+        let mut changed = witness.clone();
+        changed.rows[0].variance_complement_digits[0] ^= 1;
+        assert!(changed.check(&plan).is_err());
+    }
+
+    #[test]
+    fn rounding_decomposition_covers_ties_negatives_and_unit_divisor() {
+        let tie = NormCoreRow::from_values(&[-2, 0, 0, 0], 4).unwrap();
+        assert_eq!(tie.mean_remainder, -2);
+        assert_eq!(tie.mean_offset, 0);
+        assert_eq!(tie.mean_complement, 3);
+        tie.check(&[-2, 0, 0, 0], 4).unwrap();
+
+        let negative = NormCoreRow::from_values(&[-3, 0, 0, 0], 4).unwrap();
+        assert_eq!(negative.mean_remainder, 1);
+        assert_eq!(negative.mean_offset, 3);
+        assert_eq!(negative.mean_complement, 0);
+        negative.check(&[-3, 0, 0, 0], 4).unwrap();
+
+        let odd = NormCoreRow::from_values(&[1, 0, 0], 3).unwrap();
+        assert_eq!(odd.mean_remainder, 1);
+        assert_eq!(odd.mean_offset, 2);
+        assert_eq!(odd.mean_complement, 0);
+        odd.check(&[1, 0, 0], 3).unwrap();
+
+        let unit = NormCoreRow::from_values(&[5], 1).unwrap();
+        assert_eq!(unit.mean_remainder, 0);
+        assert_eq!(unit.mean_offset, 0);
+        assert_eq!(unit.mean_complement, 0);
+        assert_eq!(unit.variance_offset, 0);
+        assert_eq!(unit.variance_complement, 0);
+        unit.check(&[5], 1).unwrap();
     }
 
     #[test]
