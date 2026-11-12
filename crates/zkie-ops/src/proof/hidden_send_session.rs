@@ -13222,6 +13222,49 @@ mod merged_tests {
     }
 
     #[test]
+    fn the_two_groups_share_one_registry() {
+        let (plan, _messages, _witness) = run();
+        let staged = staged_plan(&plan);
+        let shared = proximity_iopp_plan(
+            &staged.proximity,
+            &staged.send,
+            staged.closure.as_ref(),
+            ProximityGroupRole::Shared,
+        )
+        .unwrap()
+        .expect("the shared group has stages");
+        let own = proximity_iopp_plan(
+            &staged.proximity,
+            &staged.send,
+            staged.closure.as_ref(),
+            ProximityGroupRole::Own,
+        )
+        .unwrap()
+        .expect("the own group has stages");
+        // The two groups and stage 0 allocate from one registry: a tree
+        // number or a stage FOLD identifier is never bound twice.
+        for shared_tree in &shared.chain.config.switch_tree_numbers {
+            assert!(!own.chain.config.switch_tree_numbers.contains(shared_tree));
+        }
+        for shared_tree in &shared.chain.config.fold_tree_numbers {
+            assert!(!own.chain.config.fold_tree_numbers.contains(shared_tree));
+        }
+        assert_ne!(
+            shared.chain.config.base_star.tree_number,
+            own.chain.config.base_star.tree_number
+        );
+        let mut shared_ids: Vec<u64> = Vec::new();
+        for ids in &shared.chain.config.fold_ids {
+            shared_ids.extend([ids.group, ids.member, ids.fresh]);
+        }
+        for ids in &own.chain.config.fold_ids {
+            for id in [ids.group, ids.member, ids.fresh] {
+                assert!(!shared_ids.contains(&id));
+            }
+        }
+    }
+
+    #[test]
     fn hidden_input_mode_accepts_without_output_rows() {
         let activation = activation();
         let diagnostic_plan = plan(&activation);

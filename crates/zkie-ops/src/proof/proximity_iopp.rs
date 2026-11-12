@@ -83,6 +83,23 @@ impl IoppBoundIds {
         trees.dedup();
         Self { oracles, trees }
     }
+
+    /// Reserves one derived chain's stage identifiers and tree numbers in this
+    /// registry. The two groups derive in canonical shared-then-own order over
+    /// one registry, so a later group never repeats an identifier or a tree
+    /// number that an earlier group already bound.
+    fn reserve(&mut self, config: &IoppChainConfig) {
+        for ids in &config.fold_ids {
+            self.oracles.extend([ids.group, ids.member, ids.fresh]);
+        }
+        self.trees.extend(&config.switch_tree_numbers);
+        self.trees.extend(&config.fold_tree_numbers);
+        self.trees.push(config.base_star.tree_number);
+        self.oracles.sort_unstable();
+        self.oracles.dedup();
+        self.trees.sort_unstable();
+        self.trees.dedup();
+    }
 }
 
 /// Collects the oracle identifiers and tree numbers already bound by the
@@ -154,10 +171,32 @@ fn push_range(values: &mut Vec<u64>, start: u64, count: u64) -> Result<()> {
 /// Derives one group's trusted IOPP chain from the hidden plan. An empty stage
 /// list keeps the single-stage path and returns `None`; a non-empty list is
 /// derived against the request's bound identifier and tree sets.
+///
+/// The two groups and stage 0 allocate from one registry in canonical
+/// shared-then-own order: the shared group derives first and everything it
+/// bound is reserved before the own group allocates. The verifier calls the
+/// same function on the same trusted plan and obtains the same chains.
 pub fn proximity_iopp_plan(
     proximity: &HiddenProximityPlan,
     send: &HiddenSendPlan,
     closure: Option<&ClosurePlan>,
+    role: ProximityGroupRole,
+) -> Result<Option<ProximityIoppPlan>> {
+    let mut bound = proximity_bound_ids(proximity, send, closure)?;
+    let shared = derive_group(proximity, &bound, ProximityGroupRole::Shared)?;
+    if let Some(plan) = &shared {
+        bound.reserve(&plan.chain.config);
+    }
+    let own = derive_group(proximity, &bound, ProximityGroupRole::Own)?;
+    match role {
+        ProximityGroupRole::Shared => Ok(shared),
+        ProximityGroupRole::Own => Ok(own),
+    }
+}
+
+fn derive_group(
+    proximity: &HiddenProximityPlan,
+    bound: &IoppBoundIds,
     role: ProximityGroupRole,
 ) -> Result<Option<ProximityIoppPlan>> {
     let (stages, mask_tree, fresh, base_positions) = match role {
@@ -177,8 +216,7 @@ pub fn proximity_iopp_plan(
     if stages.is_empty() {
         return Ok(None);
     }
-    let bound = proximity_bound_ids(proximity, send, closure)?;
-    derive_proximity_iopp(stages, role, mask_tree, 0, fresh, base_positions, &bound).map(Some)
+    derive_proximity_iopp(stages, role, mask_tree, 0, fresh, base_positions, bound).map(Some)
 }
 
 /// The derived trusted chain of one proximity group.
