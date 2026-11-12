@@ -12,6 +12,7 @@ pub mod group_commitment_session;
 pub mod group_row_session;
 pub mod gu_combine_session;
 pub mod hidden_send_session;
+pub mod hidden_norm;
 pub mod send_session;
 pub mod lin_session;
 pub mod output_head_lin;
