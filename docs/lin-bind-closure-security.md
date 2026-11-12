@@ -27,7 +27,7 @@ verification.
 
 Snapshot: the closed relation at code basis `3b3e8ecc`, with the bounded-read
 rollback `8d32d3de`; fixture `gpt2-seq16`, 16 positions, proof 9,939,144 B.
-The committed document is version 10.
+The committed document is version 11.
 
 ## 1. The chain in one view
 
@@ -42,7 +42,7 @@ The committed document is version 10.
 | 7 | Dot PSC hiding coefficients | Dot PSC transcript and end values | the same 23-entry hiding class | the hiding map is triangular with a nonzero constant determinant; the two shown end masks one-time pad the end values | sumcheck degree terms in section 6 | `NUM` 23x23 map, `CODE` triangularity |
 | 8 | closure PSC hiding coefficients | per-position PSC transcript | the same closure mask message | same triangular map, one instance per position | sumcheck degree terms; 16 instances | `NUM` 49x49 map, `CODE` |
 | 9 | FOLD fresh coefficients | FOLD start sum and round values | the same fold instance | triangular coefficient map with constant nonzero determinant; the start sum and every sent round value are covered | sumcheck degree terms; two FOLD instances | `NUM` k=2 and k=14, `CODE` |
-| 10 | BASE star main/mask rows and tails | BASE target, combined rows and star openings | target, rows and openings of the same star | fresh one-time pads on the target dot product, each combined coordinate and each tail coordinate | BASE lambda/position terms are in `eps_proximity = UNKNOWN` (section 6) | `NUM` real star path, `CODE` |
+| 10 | BASE star main/mask rows and tails | BASE target, combined rows and star openings | target, rows and openings of the same star | fresh one-time pads on the target dot product, each combined coordinate and each tail coordinate | BASE lambda/position terms are in `eps_proximity` (ineffective at current parameters; section 8) | `NUM` real star path, `CODE` |
 | 11 | challenge draws | every PSC/FOLD/BASE/position challenge | none | drawn after the message they test; zero-fallback event bounded | 2^-192 per draw fallback, `chi=0` term | `CODE` draw functions, `NUM` order tests |
 
 The rest of the note expands each column.
@@ -221,10 +221,10 @@ the target dot product, in each combined row and in the encoded opening. The
 joint BASE test in section 5.6 uses the same star.
 
 Across different oracles the tails, salts, streams, pads and mask plans are
-different. This is a list of separated sources, not a proof that the
-concatenated view is block diagonal: the cross-oracle joint composition of all
-shared columns with the roots/PSC/BASE transcripts is the open item of section
-5.9. Within one oracle the shared columns are explicit.
+different. This is the plan's source separation and the basis of the block
+partition of section 5.7; section 5.7 proves the block-diagonal composition
+(disjoint fresh variables plus the conditional block lemma). Within one oracle
+the shared columns are explicit.
 
 ## 5. Hiding and binding reasons
 
@@ -544,9 +544,8 @@ shared-variable pattern the joint criterion handles. `CODE` `NUM`.
 The FOLD and BASE parts share the opening/tail accounting: a BASE opening is
 an encoded star symbol masked by the star tail; a FOLD transcript is masked by
 the fresh coefficients. They do not share random coordinates across the two
-mechanisms, but this is a per-block statement: the full joint composition of
-the FOLD/BASE blocks with the mask classes and the roots is the open item of
-section 5.9, not a direct-sum conclusion.
+mechanisms; the per-block statements are composed by the block partition and
+the conditional block lemma of section 5.7.
 
 ### 5.7 Hash roots and commitment hiding
 
@@ -667,32 +666,99 @@ starts from the same conditional view. This is the online analogue of the
 per-block covers, and it is the sense in which the dummy run and the real run
 are claimed to have the same distribution.
 
-`[UNPROVEN]` Global online composition and the dummy-witness condition. The
-full joint distribution of all public values — all mask classes together with
-the roots, the PSC/FOLD/BASE transcripts and all openings — is not assembled
-here. The per-block witness-independence statements do not imply a direct sum:
-the same `c_t` appears in `R`, the Dot target `T`, `sigma` and the opening; the
-same `g_t` appears in `tilde`, `R` and the opening; the W directions appear in
-`tilde`, the Eval target and the Dot target; and the roots/star couple the
-blocks through the transcript. The specific shared-constraint case is the
-opening-time extension: the same codeword must satisfy the already-published
-messages, the existing claims and every later adaptive opening. The per-tree
-Vandermonde condition `q <= r` gives a solution for the opened positions of
-one tree, but the cross-tree/cross-stage coupling through the shared `g_t`,
-`c_t` and W columns and through the roots is part of the missing full system.
-The dummy-witness strategy is therefore proven blockwise but not globally. The
-mechanism obstruction is the missing full shared-constraint system. Candidate
-repairs: (i) build the full joint matrix of all shared columns in the real
-challenge order and prove `Im(B) subset Im(A)` for it; (ii) prove a
-hybrid/coupling lemma that conditions the blocks on the shared variables
-(`g_t`, `c_t`, shown/end/eval, star, roots) and composes the conditional
-statements; (iii) prove witness-independence of the composed transcript by a
-different invariant. In addition, to run the
-real prover the dummy witness must satisfy the same public statement (public
-output and fixed statement roots); this construction is not a witness-free
-simulator. If a witness-free simulator is required, that remains an open
-mechanism, with the same candidates plus the direct programming of the
-algebraic checks. None of these is claimed as completed.
+`[FACT]` `CODE` `MATH` Block-diagonal closure. The fresh random variables of
+the proof partition into blocks with no shared variable:
+
+| Block | Fresh random variables | Public values generated from them |
+|---|---|---|
+| B1 W/SEND | W per-position tails, salts, pads | SEND answers, W openings; W roots are RO outputs |
+| B2 index-mask/Dot | index-mask entries (23 hiding, 2 end, 16 claim, 16 tilde, 16 eval), its tail/salts/pad; Dot shown-map X tails/salts/pad | Eval targets, tilde, residual `R`, Dot PSC transcript/U, Dot end values, X answers/openings |
+| B3 closure | per-position 49 hiding + 5 shown, closure mask tail/salts/pad; map/bit/slack trees, tails, salts, answers | closure PSC transcripts/U, ends/points, closure rows, closure openings |
+| B4 shared | Gu/Omega trees; shared FOLD fresh `2k+1` | shared fold start/rounds, Gu/Omega answers/openings, shared base rows |
+| B5 own | own FOLD fresh `2k+1`; switched/folded fresh masks | own fold start/rounds, own base rows |
+| B6 BASE | star main/mask rows and tails | `target*`, combined rows, star openings |
+
+No fresh variable appears in two blocks: the plan allocates disjoint entry
+ranges for the mask classes and reserved SEND pads, every tree has its own
+tail/salt stream, and the FOLD and star draws are per instance; the ledger
+rejects reuse. The quantities shared across blocks are the secret
+`W`/`Omega`/`Gu`/map/bit values and the public challenges, not fresh random
+variables.
+
+`[FACT]` `MATH` Conditional block lemma. Let `X_b` be the fresh vector of
+block `b`, uniform on its range and independent of the prior view `V` and the
+secret `S`. If for every `(V,S)` the map `X_b -> P_b` (the block public values)
+is surjective, then `P_b` is uniform on its public range conditional on
+`(V,S)`; in particular its distribution is the same for every `S`. Proof: for
+fixed `(V,S)`, `X_b` is uniform and independent, and a surjective map pushes
+it to the uniform distribution on the image; the image and the distribution do
+not depend on `S`. Conditioning on `V` with any posterior over `S` is a
+mixture of the same uniform distribution.
+
+`[FACT]` `CODE` `MATH` Block covers. For each block the random-to-public map
+is surjective for every secret and every challenge in the stated conditions:
+
+- **B1.** The answer pads and the tail Vandermonde: for any answer point and
+  any distinct opening set with `q <= r`, the pad/tail coordinates solve the
+  equations; the maps do not depend on the secret.
+- **B2.** With `T = sum_t chi^t tilde_t - R = sum_t chi^t(W_t(psi*) + c_t)`,
+  the public rows are the 16 tilde rows `tilde_t = W_t + g_t`, the difference
+  row `R = sum_t chi^t(g_t - c_t)`, the 23 PSC sent rows (the invertible
+  hiding map on `h` plus the secret terms), the `(U)` row
+  `<hiding_form,h> + claim_scale*sum_t chi^t c_t`, and the two ends
+  `X_chi(point) + beta_dot*end_0`, `Omega(point) + beta_dot*end_1`. The random
+  columns are `g` (16), `c` (16), `h` (23) and `end` (2); the secret columns
+  are `W` (16), `X_chi(point)` (1), `Omega(point)` (1). The `g` columns give
+  the identity on the tilde rows and cover the W direction; the `c` columns
+  give the `chi` combination on `R`/`T` and the claim term in `(U)`; the `h`
+  columns are the invertible 23 x 23 PSC hiding map of section 5.4 (constant
+  determinant) and cover the PSC secret directions; the `end` columns are the
+  unit pivots of `X_chi(point)` and `Omega(point)`. `T` is the public
+  combination `sum_t chi^t tilde_t - R`, not an independent row. The only
+  challenge condition is `chi != 0`, the counted `chi = 0` event; the
+  Vandermonde, identity and unit blocks are challenge-independent. The
+  corrected 17-row tilde/difference matrix is exercised by the existing
+  `joint_dot_mask_block_is_covered_for_zero_and_nonzero_chi` test (16 tilde
+  rows plus the difference row with `chi` on `g` and `-chi` on `c`); the PSC
+  hiding map and the ends are covered by the PSC and closure tests.
+- **B3.** The per-position joint matrix of section 5.5 (49 hiding + 5 shown
+  columns; transcript, ends, points, `(U)` and opening rows) is full rank at
+  the production shape (872/872); the hiding map has constant determinant, the
+  shown entries are the unit/`beta` pivots, the virtual/difference rows are
+  mask-only combinations, and the opening is the tail Vandermonde for
+  `q <= r`.
+- **B4/B5.** The FOLD sent rows are the invertible fresh-coefficient map with
+  constant determinant (section 5.6); the start sum and rounds are covered;
+  the shared and own instances are separate.
+- **B6.** The star rows/tails are fresh; `target* = <claim, star>`; the
+  combined rows are `star + lambda*row`; the star openings are the encoded
+  star masked by the star tail. The map is surjective for every claim/row; the
+  star is a one-time pad on the old row, and `target*` is one public linear
+  functional.
+
+`[FACT]` `MATH` Online order and adaptive openings. The block covers are
+challenge-independent (the only challenge condition is `chi != 0`, counted;
+the Vandermonde blocks hold for any distinct positions; the determinants are
+constant). Each block can therefore be generated online after the challenges
+that precede it, and the conditional block lemma applies inductively over the
+real order. For adaptive openings the ledger ensures `q <= r` per tree; the
+tail Vandermonde `q x r` matrix has full row rank for any distinct position
+set, so the block map remains surjective for every opening sequence; the
+simulator never reselects a message or salt. Hash hybrid: the public
+activation/table roots are public inputs, not witness-dependent, and need no
+programming; only the prover's commitment trees are simulated by RO lazy
+sampling with a consistent history, programming unqueried inputs and charging
+the failure events `q * 2^-320` and `(q + 1)^2 / 2^256`.
+
+`[FACT]` `CODE` Conclusion. The block partition, the conditional block lemma
+and the block covers give a witness-independence proof of the full public
+transcript: for every two valid witnesses of the same public statement, the
+transcript distribution is the same. The conditions are the per-block rank
+conditions (constant determinants, `q <= r`, `chi != 0`), the ledger budget,
+and the RO/CR hash model. No counterexample to the block partition or to a
+block cover was found. The scope condition remains: the dummy witness must
+satisfy the same public statement, so this is a witness-independence proof,
+not a witness-free simulator; a witness-free simulator is not claimed.
 
 `[FACT]` `MATH` Bad events. The simulation can fail only through:
 
@@ -774,11 +840,13 @@ BASE target/rows/openings) are explicit columns in the corresponding joint
 blocks; they are not treated as independent.
 
 **Assembly.** The full view is the concatenation of these blocks. The block
-structure is given by the distinct streams and by the explicit shared list;
-the blocks are not inferred to be independent merely from the sub-block ranks.
-The production-size closure joint test (section 5.5) is a local numerical
-confirmation of one block; the whole-chain statement is this conditional/block
-derivation. A complete multi-oracle matrix extraction is not claimed.
+structure is the partition of section 5.7; the blocks are not inferred to be
+independent merely from the sub-block ranks. The composition is proved there
+by the block partition (disjoint fresh variables) and the conditional block
+lemma, applied inductively in the challenge order. The production-size closure
+joint test (section 5.5) is a local numerical confirmation of one block; a
+complete multi-oracle matrix extraction is not claimed and is not needed for
+the block-diagonal proof.
 
 **BASE elimination.** The equations are
 
@@ -810,9 +878,12 @@ encoded star symbols masked by the star tail (`q <= r`) and the old row
 symbols masked by the old tail. The star is a fresh one-time pad from its own
 stream; the two-seed test is illustrative, not the uniformity proof.
 
-`[UNPROVEN]` The multi-oracle conditional composition is not mechanized; the
-argument above is the per-round conditional/block derivation, and the
-production-size tests are local evidence for their blocks.
+`[FACT]` The multi-oracle conditional composition is supplied by the block
+partition and conditional block lemma of section 5.7. The per-block ranks are
+`CODE` derivations with `NUM` tests; a mechanized symbolic proof of the
+partition and rank conditions is not delivered, so the statement is
+model/derivation-conditional, not machine-checked. The production-size tests
+remain local evidence for their blocks.
 
 ### 5.9 BAT target inventory and the joint mask/star view
 
@@ -945,23 +1016,20 @@ columns `B` has `Im(B) subset Im(A)` on the rows above (the pivots are
 unit/`beta`/invertible), so the block's conditional distribution hides the
 secret directions it touches.
 
-`[UNPROVEN]` Full joint composition. The complete joint distribution of all
-public values — the mask classes above together with the roots, the
-PSC/FOLD/BASE transcripts and all openings — is not assembled in this note.
-The per-block pivots and the same-stream lists do not imply a direct sum: the
-same `c_t` is in `R`, `T`, `sigma` and the opening; the same `g_t` is in
-`tilde`, `R` and the opening; the W directions appear in `tilde`, the Eval
-target and the Dot target; and the roots/star couple the blocks through the
-transcript. The open items are (i) the full joint matrix of all shared columns
-with the real challenge order, or (ii) a hybrid/coupling proof that the blocks
-compose; neither is delivered. This is a joint-composition unknown, not a
-per-target leak finding: every traced target value is individually covered as
-above, and no target reveals `Y` beyond winner/valid/tie plus the public
-statement, so the stop condition does not trigger. The target inventory is the
-basis for the next round, not a closed joint theorem. The adaptive online
-composition is the unknown of section 5.7; the deployment randomness of the
-asset/table tails and salts and the concrete-hash advantage remain the
-assumptions of sections 5.7 and 7.
+`[FACT]` `CODE` Full joint composition. The per-block pivots above are not by
+themselves a direct sum; the composition is supplied by the block partition
+and the conditional block lemma of section 5.7. The fresh random variables
+partition into blocks B1-B6; every public value uses fresh variables from
+exactly one block; the shared `c_t`/`g_t` and W directions are within B2 or
+are secret coupling handled by conditioning, not a shared random variable; and
+the roots/star are RO/public values. Applying the conditional block lemma
+inductively in the real challenge order gives the full joint distribution.
+The earlier "full joint not assembled" status is superseded by this
+block-diagonal proof; the scope condition (the dummy witness must satisfy the
+same public statement; this is not a witness-free simulator) remains. The
+joint tests are the per-block evidence; the block partition is the
+code/ledger allocation fact. No counterexample to the partition or to a block
+cover was found.
 
 `[FACT]` `CODE` The BASE equations are
 `target* = <claim, star.main> + <mask_claim, star.mask>`,
@@ -1022,11 +1090,11 @@ The entries are:
 |---|---|---:|
 | direct shared FOLD check | k <= 11, 11 rounds, degree 2 | `22/p^3 < 2^-187` |
 | direct own FOLD check | k = 14, 14 rounds, degree 2 | `28/p^3 < 2^-186` |
-| BASE lambda and symbol checks | withdrawn from the algebraic union: no independent-uniform field-domain/order derivation for the Fp3 lambda challenge, and the two checks are codeword-index samples, not field challenges | carried in `eps_proximity = UNKNOWN`, not in `eps_components` |
-| base position sampling | real sampler `draw -> unique_sorted`: `t = 2` draws, `s <= 2` unique positions and `s` is variable; distance parameter `delta` | miss `(1 - delta)^t` for the original-draw event; the local `delta` convention is not derived, in `eps_proximity` |
+| BASE lambda and symbol checks | withdrawn from the algebraic union: no independent-uniform field-domain/order derivation for the Fp3 lambda challenge, and the two checks are codeword-index samples, not field challenges | carried in `eps_proximity` (unknown term, not in `eps_components`) |
+| base position sampling | real sampler `draw -> unique_sorted`: `t = 2` draws, `s <= 2` unique positions and `s` is variable; distance parameter `delta` | miss `(1 - delta)^t` for the original-draw event; the actual `delta`/miss are computed in section 8 (`0.790` main, `0.444` mask): ineffective |
 | range booleanity | 16 positions, degree at most 166 each | `16*166/p^3 < 2^-180` |
 | PSC sumcheck (Dot once, closure 16 positions) | 10 and 23 variables, degree 3 each | `(30 + 16*69)/p^3 < 2^-181` |
-| single equality | the check exists, but its polynomial-degree/event derivation is not written in this note | not counted in `eps_components`; carried in `eps_proximity = UNKNOWN` |
+| single equality | the check exists, but its polynomial-degree/event derivation is not written in this note | not counted in `eps_components`; carried in `eps_proximity` (unknown term) |
 | `chi = 0` | one event: a uniform `Fp3` challenge equals zero | `1/p^3 < 2^-191` |
 | challenge-draw zero fallback | at most 6 rejected words per draw, `(1-p/2^64)^6` | below `2^-192` per draw |
 | mask-coordinate retry exhaustion | at most 64 attempts, `(1-p/2^64)^64` | below `N * 2^-2048` over `N` coordinates |
@@ -1040,26 +1108,35 @@ eps_hash = (t + q_V + 1) * 2^-128 + (17/2) * (t + q_V)^2 / 2^256
 eps_components <= 16*166/p^3 + 1134/p^3 + 50/p^3 + 1/p^3
                 < 2^-180 + 2^-181.85 + 2^-186.3 + 2^-191
                 < 2^-179.6
-eps_proximity = UNKNOWN
+eps_proximity = INEFFECTIVE
+                (direct FOLD->BASE miss at the actual code parameters is
+                 ~0.790 for the main code and ~0.444 for the mask code;
+                 section 8 gives the derivation and the candidates)
 eps_total also carries the retry exhaustion N * 2^-2048 and the Q_R / Q_A factors
 ```
 
-`eps_proximity` is an explicit unknown, not zero: the base-position sampler
-(`draw -> unique_sorted`), the local proximity distance/query soundness, the
-single-equality term whose degree/event basis is not derived here, and the
-withdrawn BASE lambda/symbol terms are carried here. The document does not
-claim a total security bit count. The `BASE 3/p^3` figure of the previous
-version is withdrawn from `eps_components`: the lambda challenge is an `Fp3`
-field value whose independent-uniform-domain/order derivation is not given
-here, and the two symbol checks are codeword-index samples produced by the
-real sampler, not uniform field challenges. The earlier
-`6/p^3 < 2^-189.4` merge is likewise not used, because two of its
-`2/p^3` single-equality units lack a written degree/event derivation. The
-counted terms are the FOLD merge `22/p^3 + 28/p^3 = 50/p^3 < 2^-186.3`, the
-range term, the PSC term and the `chi = 0` event; each has an explicit degree
-or event basis (FOLD round checks of degree 2, PSC round checks of degree 3,
-range checks of degree at most 166 per position, and one uniform-zero-challenge
-event). No term without a derivation is kept in the union.
+`eps_proximity` is not zero and not a conservative placeholder: section 8
+computes the direct FOLD-to-BASE two-position miss from the actual code
+parameters. The main code `(ell = 65,539, r = 8,192)` has relative distance
+`0.1111` and miss `0.7901`; the mask code `(512, 256)` has distance `1/3` and
+miss `0.4444`. A fold-consistent correlated error (a common error pattern in
+the rows, or a difference whose fold cancellation is exact) survives the fold
+with the same relative distance, so the folded check does not improve the
+bound. The proximity sub-term is therefore **ineffective** at the current
+parameters, not merely unknown; the algebraic components below are separate.
+The document does not claim a total security bit count.
+
+The `BASE 3/p^3` figure and the earlier `6/p^3 < 2^-189.4` merge are withdrawn
+from `eps_components`: the lambda challenge is an `Fp3` field value whose
+independent-uniform-domain/order derivation is not given here, the two symbol
+checks are codeword-index samples of the real sampler, and two `2/p^3`
+single-equality units lack a written degree/event derivation. The counted
+terms are the FOLD merge `22/p^3 + 28/p^3 = 50/p^3 < 2^-186.3`, the range
+term, the PSC term and the `chi = 0` event; each has an explicit degree or
+event basis (FOLD round checks of degree 2, PSC round checks of degree 3,
+range checks of degree at most 166 per position, and one
+uniform-zero-challenge event). No term without a derivation is kept in the
+union.
 
 The `t`/`q_V` factor is carried by the hash term; the algebraic component
 count is fixed per proof. If the prover uses `Q_A` adaptive retry attempts,
@@ -1076,9 +1153,9 @@ distance radius 16,384, later radius 16,384, `m_once = m_later = 0`, `v = 10`,
 bits; shared/base positions 2 each. The direct FOLD checks have k <= 11
 (shared) and k = 14 (own). The plan does draw one `Fp3` BASE lambda and two
 base positions, but their numeric error terms are not kept in
-`eps_components`: they are carried in `eps_proximity = UNKNOWN` for the
-domain/order reason above. The prior "8 rounds each <= 2^-128" term is a
-multi-stage ledger figure that is not mapped to this direct FOLD-to-BASE
+`eps_components`: they are carried in `eps_proximity`, which is ineffective at
+the current parameters (section 8). The prior "8 rounds each <= 2^-128" term
+is a multi-stage ledger figure that is not mapped to this direct FOLD-to-BASE
 compiled plan; it is withdrawn from this chain's bound and replaced by the
 per-round degree terms above.
 
@@ -1093,19 +1170,23 @@ in the agreement set, every unique position agrees. Thus the miss event for the
 original sampling is "both draws agree", with probability `(1 - delta)^t` for a
 word at relative distance `delta` (agreement `1 - delta`); the hit probability
 is `1 - (1 - delta)^t`. This is not an argument from "the number of distinct
-positions decreased": it is the same original-draw event. The local plan
-exposes `t = 2`, `s <= 2` and a radius parameter but does not derive a numeric
-`delta`/agreement value from the radius and work bits; the base-position and
-proximity soundness is therefore the explicit `eps_proximity = UNKNOWN` above,
-not zero and not the withdrawn ledger term. The `Fp3` BASE lambda challenge
-and the two codeword-index checks are likewise carried in `eps_proximity`
-(withdrawal above), not in `eps_components`. The retry exhaustion
-(`N * 2^-2048`) and the multi-request `Q_R`/adaptive `Q_A` factors are carried
-separately; they are not dropped.
+positions decreased": it is the same original-draw event. The actual
+parameters give `delta_main = 8192/73731 = 0.1111065902` and
+`delta_mask = 256/768 = 1/3`; the corresponding misses are `0.7901314940`
+and `0.4444444444` (section 8). The base-position and proximity soundness is
+therefore **ineffective at the current parameters**, not zero and not a
+conservative placeholder. The `Fp3` BASE lambda challenge and the two
+codeword-index checks are likewise carried in `eps_proximity` (withdrawal
+above), not in `eps_components`. The retry exhaustion (`N * 2^-2048`) and the
+multi-request `Q_R`/adaptive `Q_A` factors are carried separately; they are
+not dropped.
 
-`[UNPROVEN]` The local proximity/base-position distance/query soundness
-derivation; the plan parameters and the reference plan-loc convention are
-stated, but the local numeric error term is not derived here.
+`[FACT]` `CODE` The numerical proximity miss at the actual code parameters is
+computed above: `0.7901314940` (main) and `0.4444444444` (mask). `[UNPROVEN]`
+The exact composition of this miss with the algebraic FOLD detection for each
+error class (which differences are kernel-only and which are seen by the fold
+polynomials) is not mechanized; the worst-case single-row error is the basis
+of the ineffective-proximity conclusion.
 
 `[UNPROVEN]` The `126.21` and `116.01` bit figures remain plan-ledger numbers,
 not a new closed-chain theorem. The degrees and counts above are arithmetic
@@ -1131,14 +1212,14 @@ mask values, not the algebraic checks.
 | FOLD fresh map constant nonzero determinant | triangular derivation from `FoldRoundProver`; determinant `+1` at k=2 and k=14 | `CODE` `NUM`; no SZ term |
 | shown end masks one-time, beta nonzero | `draw_e_nonzero`; real-prover end-value test | supported |
 | closure joint mask object rank equality | real encoder + real hiding polynomial + joint matrix | `NUM` at k=4; `CODE` block derivation for k=23 |
-| full joint composition of all blocks, shared columns and roots | per-block pivots/same-stream lists | `UNPROVEN`; the per-block statements do not imply a direct sum (section 5.9) |
+| full joint composition of all blocks, shared columns and roots | block partition B1-B6 + conditional block lemma, per-block rank tests | `FACT` `CODE` `MATH` (section 5.7); the scope condition is witness-independence, not a witness-free simulator |
 | BASE star fresh and one-time | `draw_star` from a fresh stream; real-path test | supported |
-| local proximity distance/query soundness | plan radius 16,384, 603 column draws, 12 work bits, two base positions | `UNPROVEN` numeric bound; the prior 8-round ledger term is withdrawn, not imported |
-| BASE lambda and symbol-check terms | `Fp3` lambda challenge and two codeword-index samples; no independent-uniform-domain/order derivation here | withdrawn to `eps_proximity = UNKNOWN`; not in `eps_components` |
-| single-equality term | the check is present; its polynomial-degree/event derivation is not written here | not counted; carried in `eps_proximity = UNKNOWN` |
+| local proximity distance/query soundness | plan radius 16,384, 603 column draws, 12 work bits, two base positions; main code (65,539, 8,192), mask (512, 256) | `FACT`: main miss `0.7901314940`, mask miss `0.4444444444`; the proximity is ineffective at the current parameters (section 8) |
+| BASE lambda and symbol-check terms | `Fp3` lambda challenge and two codeword-index samples; no independent-uniform-domain/order derivation here | withdrawn to `eps_proximity` (ineffective proximity; unknown lambda term), not in `eps_components` |
+| single-equality term | the check is present; its polynomial-degree/event derivation is not written here | not counted; carried in `eps_proximity` (unknown term) |
 | hash RO for hiding, CR for binding | leaf/root hash construction and salt lengths; model statement | supported as a model; no concrete-hash quantification |
 | no mask/pad/stream/table reuse | ledger state validation and rejects | supported; executable |
-| approved output boundary | policy/plan; the full `Y` row is hidden beyond winner/valid/tie per block | `FACT` boundary; per-block hiding, full joint composition `UNPROVEN` |
+| approved output boundary | policy/plan; the full `Y` row is hidden beyond winner/valid/tie | `FACT` boundary; per-block hiding and the block-diagonal composition of section 5.7 |
 | closed path has two FOLD instances and one closure PSC per position | `member_fold_shape` call sites; `messages.psc.len() == positions` | `CODE`; actual k=14 own fold |
 | no code-switch stage in the hidden path | plan rejects a switch configuration | supported |
 | asset inventory only for this fixture | the stated shapes and code parameters | scoped, not extrapolated |
@@ -1177,6 +1258,40 @@ check:
    plan and the final seal; the verifier accepts the public statement only if
    these bindings pass.
 
+`[FACT]` `CODE` Statement component to binding object. The public statement
+components and the objects that bind them are:
+
+| Statement component | Bound object | Verifier check |
+|---|---|---|
+| output winner / valid range / tie | closure slack/winner/recon rows, closure PSC, output plan | closure rows and PSC; output plan |
+| output `Y` / Eval relation | activation root, Eval targets, tilde values | first-statement root binding; Eval/tilde BAT rows; SEND samples |
+| table identity / record | reader identity, record row | reader/statement binding; record row |
+| activation commitment | activation root | first-chain statement binding |
+| public claim / target | committed roots, absorbed transcript | BAT rows; PSC; BASE target* and combined rows |
+| transcript order / seal | chain messages and seals | three-chain replay and seal equality |
+
+Each row is either a deterministic binding (plan/reader/statement/root/seal)
+or an algebraic row that the next subsections charge; a mismatch in the table
+is a mismatch in the bound object, not a free public value.
+
+`[ARGUMENT]` `CODE` Difference classes and nonzero conditions. For a fixed
+prover message difference, the algebraic checks see a polynomial in the
+challenges drawn after the difference is fixed:
+
+| Difference class | Nonzero condition | Degree / term |
+|---|---|---|
+| FOLD round difference | the folded claim difference is nonzero in the round polynomial | degree 2 per variable; `22/p^3` shared, `28/p^3` own |
+| PSC round difference | the sumcheck difference is nonzero in the round polynomial | degree 3 per variable; `1134/p^3` |
+| range / booleanity difference | the range polynomial difference is nonzero | degree at most 166 per position; `2656/p^3` |
+| BAT row difference | the row linear form differs at the batching challenge | degree 1; `1/p^3` |
+| BASE lambda difference | the linear check differs at lambda | degree 1; currently in `eps_proximity` |
+| proximity / folded-row difference | the committed word is far from the code | `(1-delta)^t`; `0.790` main / `0.444` mask (ineffective) |
+
+The FOLD terms enter only when the difference is nonzero in the folded claim
+and the challenge is drawn after the difference is fixed; the order is the one
+above. A zero difference is the kernel case of the next table, not a
+polynomial-root event.
+
 `[ARGUMENT]` `CODE` False-statement event. Fix the prover's messages. If the
 public statement is false, at least one acceptance condition fails at the
 drawn challenges or sampled positions, provided the semantic error is not in a
@@ -1211,6 +1326,29 @@ that would require the coverage proposition above. In particular the statement
 statement" is treated as a proposition to be proved by the per-error-class
 coverage table, not as a premise of the reduction. Obstruction: no full
 kernel/coverage matrix across BAT/FOLD/PSC/closure/BASE/output is built.
+
+`[FACT]` `CODE` Kernel-capture outcome. The table separates three groups:
+
+- Covered or conditional: plan/reader/statement/root/seal bindings and the
+  CR/hash model for table identity, activation root and opening paths.
+- Captured by another algebraic relation: BAT row differences by the PSC,
+  range or Eval/tilde rows; closure point/end differences by the closure PSC;
+  the corresponding polynomial terms are in `eps_components`.
+- Not captured with an effective bound: (i) fold-consistent committed rows that
+  are far from the code — the algebraic fold checks pass, the folded-row
+  proximity is the only distance check, and its actual miss is `0.790` (main)
+  / `0.444` (mask), so it provides no bound; (ii) kernel differences of the
+  fold relation that change the statement semantics and are not caught by
+  another relation — the folded row is the honest one, so the proximity cannot
+  see them; the capture must come from the Eval/closure/BAT/statement binding
+  layers, and the composition is not proven. This is a real soundness gap at
+  the current parameters, not a wording unknown.
+
+Candidates for the open group: a complete IOPP proximity round set; increasing
+the independent query rounds (`t >= 754` for `(1-delta_main)^t <= 2^-128`); or
+changing the code parameters to a lower rate / larger `r`. The kernel/coverage
+matrix, the final output-consistency check and the component-level kernel
+negatives from the previous paragraph remain the structural candidates.
 Candidate repairs: (i) build the kernel/coverage matrix for each semantic
 error class; (ii) add a final output-consistency check that recomputes the
 output from the committed rows; (iii) construct explicit kernel-error
@@ -1227,19 +1365,58 @@ their degrees in section 6; the terms without a written derivation (single
 equality) and the BASE lambda/symbol terms remain in `eps_proximity`. The
 union is an arithmetic assumption, not a mechanized composition.
 
-`[UNPROVEN]` Proximity sub-term. The direct FOLD-to-BASE proximity soundness is
-not derived: the plan exposes radius 16,384, 12 work bits, 603 column draws,
-two base positions (`t = 2`, `s <= 2` variable) and the FOLD sizes (shared
-`k <= 11`, own `k = 14`), but not a per-stage relative-distance/agreement
-propagation through the fold and base checks, nor a numeric proximity-gap term
-for the local code. The mechanical obstruction is that the direct path is not
-the multi-stage ledger composition and no local distance/query theorem is
-instantiated. Candidate repairs: (i) derive the Reed-Solomon distance `r+1`
-and the fold distance contraction, then bound the sampled checks with
-`(1-delta)^t` at the plan's rate/radius; (ii) instantiate a proximity-gap
-theorem at the plan's radius/work; (iii) add an executable per-stage
-distance/query/work ledger and prove the composition. Until one is done, this
-sub-term is `eps_proximity = UNKNOWN`, not zero.
+`[FACT]` `CODE` `MATH` Proximity miss at the actual code parameters. The main
+table/W/closure code is `(log_n = 17, ell = 65,539, r = 8,192)`; the mask code
+is `(17, 512, 256)`. Their relative distances are
+
+```text
+delta_main = 8192 / 73731 = 0.1111065902,
+delta_mask = 256 / 768   = 1/3.
+```
+
+The Reed-Solomon minimum distance is `r+1`; the relative value `(r+1)/n`
+gives the very close `0.1111201529`. The document uses the slightly smaller
+`r/n` so the miss below is the conservative (larger) one.
+
+The BASE check samples `t = 2` uniformly drawn positions; for a word at
+relative distance `delta`, the miss probability is `(1 - delta)^2` (the
+original-draw event; deduplication does not change it). The actual values are
+
+```text
+main: (65539/73731)^2 = 0.7901314940 = 2^-0.3398,
+mask: (512/768)^2     = 0.4444444444 = 2^-1.1699.
+```
+
+The effective distance after folding: the FOLD is a linear combination of the
+committed rows with the drawn fold coefficients. A fold-consistent error
+pattern is a common error `e` added to every committed row (or any pattern
+whose fold combination equals the claimed fold); its folded relative weight is
+that of `e`, i.e. `delta_main`, and the coefficient combination is nonzero
+except with the counted probability `1/p`. The FOLD checks see no difference
+because the claimed fold includes the same error; the proximity is the only
+distance check. The fold therefore does not contract the distance for this
+pattern for `k = 11` or `k = 14`. If the errors were independent across the
+`2^k` rows, the folded error weight would be near
+`1 - (1 - delta)^{2^k}` and the check would be strong, but soundness must use
+the worst-case fold-consistent pattern, so the effective `delta` is
+`delta_main`.
+
+`[FACT]` `CODE` Conclusion for the direct FOLD-to-BASE proximity. At the
+current parameters the proximity check does not provide a meaningful security
+bound: the main-code two-position miss is `0.790` (about `2^-0.34`) and the
+mask-code miss is `0.444` (`2^-1.17`). For fold-consistent rows that are far
+from the code, the algebraic fold checks see no difference (the fold relation
+holds), so the proximity is the only distance check and it misses with
+probability `0.790`/`0.444`; the algebraic terms cover the separate
+nonzero-difference class. This is the explicit audit statement: **direct
+FOLD-to-BASE under the current parameters does not provide a security bound
+for the proximity sub-term.** Candidates: (i) increase the number of
+independent query rounds: `(1 - delta_main)^t <= 2^-128` needs
+`t >= 753.4`, i.e. about 754 positions; (ii) add a complete IOPP proximity
+round set at the plan's radius/work; (iii) change the code parameters
+(increase `r` or lower the rate) so that `(1 - delta)^t` is meaningful for a
+realistic `t`. Until one is adopted, `eps_proximity` is **ineffective, not
+merely unknown**, and no total soundness bound is claimed.
 
 `[FACT]` `CODE` The closed session absorbs messages and draws challenges in
 this order: roots and declarations, answers, closure roots/answers and
@@ -1294,7 +1471,8 @@ tamper bound is unchanged by section 2.1.
 union: the lambda is an `Fp3` field challenge without an
 independent-uniform-domain/order derivation here, and the two base positions
 are codeword-index samples of the real `draw -> unique_sorted` sampler; both
-are carried in `eps_proximity = UNKNOWN` (section 6).
+are carried in `eps_proximity` (unknown term; the proximity itself is
+ineffective, section 8).
 
 **Proximity/opening.** The direct FOLD checks are the per-round degree terms
 above (22/p^3 shared, 28/p^3 own); the BASE lambda and the two base-position
@@ -1303,10 +1481,10 @@ checks add no term to the algebraic union and are carried in `eps_proximity`
 (table 603, W/closure and mask at most 4, minimum remaining 252); `q <= r` is
 the Vandermonde hiding-budget condition, not a proximity soundness term. The
 tail union is the accounted union. The local proximity sub-term is the
-explicit `UNKNOWN` in the proximity block above: the plan samples `t = 2`
+computed result in the proximity block above: the plan samples `t = 2`
 positions (`s <= 2` variable; deduplication does not change the original-draw
-hit event), and the numeric distance/query/work derivation for the direct
-FOLD-to-BASE path is not supplied here.
+hit event), and the actual main/mask misses are `0.790`/`0.444`, so the
+proximity is ineffective at the current parameters.
 
 **Combination conditions.** The union bound requires that the challenge
 spaces are independent and that the difference is fixed before each challenge;
@@ -1319,12 +1497,14 @@ bound is
 
 under the nonzero-difference and challenge-order preconditions. The
 zero-difference (kernel) case is not charged to this bound; it is covered or
-left open in the kernel-coverage table above. The proximity sub-term is the
-`UNKNOWN` of the proximity block. This is a loose bound under the degree
-assumption, not a measured probability. A final-verifier exact negative for
-this tamper is not implemented because the hidden prover has no
-message-injection point after the tree commit; the component test (the group
-table changes) plus this bound are what the current API supports.
+left open in the kernel-coverage table above. The proximity sub-term is
+**ineffective** (`0.790` main / `0.444` mask), so this polynomial bound is
+only the algebraic part and does not yield a total soundness bound. This is a
+loose bound under the degree assumption, not a measured probability. A
+final-verifier exact negative for this tamper is not implemented because the
+hidden prover has no message-injection point after the tree commit; the
+component test (the group table changes) plus this bound are what the current
+API supports.
 
 **Kernel scope (cross-reference).** The tree-reuse component test changes the
 group table while keeping the original root; its difference can be zero in the
@@ -1335,6 +1515,26 @@ for the combined tamper is not implemented. The residual assumptions are: the
 original statement/root is the true committed one, the claim/target wiring is
 a deployment assumption, and the concrete hash's CR advantage is not
 quantified.
+
+**Honest soundness ledger.** The pieces of the reduction are:
+
+```text
+eps_algebraic  <= 16*166/p^3 + 1134/p^3 + 50/p^3 + 1/p^3 < 2^-179.6
+eps_proximity  = INEFFECTIVE: main miss 0.7901314940, mask miss 0.4444444444
+eps_hash       = the RO/CR model term of section 6 (not a concrete-hash bound)
+eps_kernel     = UNPROVEN: the open error classes of the kernel-coverage table
+```
+
+The algebraic terms are the only part with a numeric bound, and they are
+conditional on the nonzero-difference/challenge-order preconditions. The
+proximity term is not a small unknown to be filled in later: at the current
+code parameters the direct FOLD-to-BASE two-position miss is `0.790`, so the
+proximity check does not provide a security bound. The kernel-coverage table
+has open classes that the ineffective proximity was supposed to capture.
+Therefore no total soundness bound is claimed for the current parameters; the
+honest conclusion is that the chain is not closed on the proximity side, and
+the candidates are the query-round increase, the full IOPP, or a code-parameter
+change listed above.
 
 ## 9. Engineering boundaries and wording
 
@@ -1349,24 +1549,25 @@ independent expert validation of the protocol. Editing the document or the
 test-only module is not a new validation of the production protocol either;
 the production messages, commitments and challenge order are unchanged.
 
-`[FACT]` The production proof code is unchanged in this round; the
-v7/v8/v9/v10 changes are test-only and document. The earlier mask sampling
+`[FACT]` The production proof code is unchanged in this round; the v7-v11
+changes are test-only and document. The earlier mask sampling
 source change (section 2.1) changed only the prover's random values; the
 protocol relations, commitments, challenge order, parameters and encoding
 format are unchanged. The proof content and hash are the measured fixture
 result from that source. The previously closed counter-scope, sample-path and
-fixture-assumption wording is maintained; the v10 target inventory, online
+fixture-assumption wording is maintained; the v10/v11 target inventory, online
 simulator and soundness reduction do not reopen those items.
 
 `[FACT]` The target row list of section 5.9 is the basis for the next round's
-argument, not a closed joint theorem. The full joint distribution of all
-shared columns together with the roots, the PSC and BASE transcripts cannot be
-derived from the per-block pivots or from the same-stream lists in this note;
-that composition is `[UNPROVEN]` (sections 5.7 and 5.9). The soundness
-reduction of section 8 is likewise conditional on the kernel-coverage and
-proximity sub-terms stated there, not a total bound. The workspace counts,
-proof hashes and HEAD remain the implementation side's reported figures; the
-TL self-check is not an independent expert verification, and editing this
+argument. The full joint composition of the fresh variables is supplied by the
+block partition and conditional block lemma of section 5.7, not by a direct sum
+from per-block pivots; its scope condition is witness-independence (a dummy
+witness for the same public statement), not a witness-free simulator. The
+soundness reduction of section 8 is not a total bound: the kernel-coverage
+table has open classes, and the direct FOLD-to-BASE proximity is ineffective
+at the current parameters (`0.790` main miss). The workspace counts, proof
+hashes and HEAD remain the implementation side's reported figures; the TL
+self-check is not an independent expert verification, and editing this
 document or the test-only module is not a new validation of the production
 protocol.
 
@@ -1432,10 +1633,11 @@ claim a closed joint theorem.
 
 ## 10. Open items
 
-- `[UNPROVEN]` The global online simulator composition: the dummy-witness
-  strategy and the per-block witness-independence are written, but the full
-  joint distribution of all shared columns, roots and PSC/BASE transcripts is
-  not assembled, and a witness-free simulator is not provided (section 5.7).
+- `[FACT]` The global online composition is supplied by the block partition
+  and conditional block lemma of section 5.7. The remaining scope item is a
+  witness-free simulator: the dummy witness must satisfy the same public
+  statement, so the note proves witness-independence, not a witness-free
+  simulation (section 5.7).
 - `[UNPROVEN]` Kernel coverage in the soundness reduction: the note does not
   assert that kernel differences are irrelevant; the open error classes and
   candidate repairs are listed in the kernel-coverage table of section 8.
@@ -1450,12 +1652,13 @@ claim a closed joint theorem.
 - `[UNPROVEN]` An exact final-verifier negative for the tree-reuse tamper; the
   current API has no prover-side message injection point after the tree
   commit. The component test and the degree bound are delivered instead.
-- `[UNPROVEN]` A local numeric proximity soundness bound for the direct
-  FOLD-to-BASE plan (radius 16,384, 603 draws, 12 work bits, `t = 2`,
-  `s <= 2` variable); the prior eight-round ledger term is withdrawn rather
-  than imported. The distance/query/work derivation, its obstruction and the
-  candidate repairs are stated in section 8. `eps_proximity` is carried as
-  `UNKNOWN` in section 6; no total security bit count is claimed.
+- `[GAP]` The direct FOLD-to-BASE proximity at the current parameters does not
+  provide a security bound: `t = 2`, `delta_main = 0.1111`,
+  `(1 - delta_main)^2 = 0.7901314940`; the mask miss is `0.4444444444`. The
+  algebraic FOLD terms do not cover the folded-row error class. Candidates:
+  about 754 independent query positions for `2^-128`, a complete IOPP
+  proximity round set, or a lower-rate/larger-`r` code parameter change
+  (section 8). `eps_proximity` is ineffective, not a small unknown.
 - `[UNPROVEN]` A mechanized composition theorem and an end-to-end 128-bit
   claim; `126.21`/`116.01` remain plan-ledger numbers.
 - `[LONG-TERM]` The trusted X source, policy distribution/freshness and
