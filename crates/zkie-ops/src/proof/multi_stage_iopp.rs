@@ -80,6 +80,18 @@ pub struct IoppStageFold {
     pub fresh: u64,
 }
 
+/// The identifiers one non-last stage FOLD binds in its own registry.
+///
+/// The identifiers are allocated by the trusted plan from the bound identifier
+/// set in canonical (chain, stage, role) order; the loop checks that the
+/// sequence carries no duplicate and that stage 0's identifiers are not reused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IoppStageFoldIds {
+    pub group: u64,
+    pub member: u64,
+    pub fresh: u64,
+}
+
 /// The caller's plan values that are not part of the stage list itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IoppChainConfig {
@@ -88,11 +100,8 @@ pub struct IoppChainConfig {
     pub first_mask: CodeParams,
     /// The BASE position count; it must equal the last stage's count.
     pub base_positions: usize,
-    /// The group and member id used by every stage FOLD layout.
-    pub group: u64,
-    pub member: u64,
-    /// One fresh mask id per non-last switch, in stage order.
-    pub fold_fresh: Vec<u64>,
+    /// One identifier triple per non-last switch, in stage order.
+    pub fold_ids: Vec<IoppStageFoldIds>,
     /// The leaf class of every stage FOLD mask tree.
     pub mask_leaf_class: u32,
     pub switch_salt_bytes: usize,
@@ -145,14 +154,10 @@ impl IoppChain {
             return Err(Error::InvalidConfig);
         }
         let switch_count = stages.len() - 1;
-        if config.fold_fresh.len() != switch_count - 1 {
+        if config.fold_ids.len() != switch_count - 1 {
             return Err(Error::ShapeMismatch);
         }
-        if config
-            .fold_fresh
-            .iter()
-            .any(|fresh| *fresh == 0 || *fresh == config.member)
-        {
+        if fold_ids_fault(&config.fold_ids) {
             return Err(Error::InvalidConfig);
         }
         let mut derived = Vec::with_capacity(stages.len());
@@ -184,7 +189,7 @@ impl IoppChain {
                 return Err(Error::InvalidConfig);
             }
             let fold = if index + 1 < stages.len() {
-                let fresh = config.fold_fresh[index - 1];
+                let ids = config.fold_ids[index - 1];
                 let shape = FoldShape {
                     code: target.code,
                     mask_code: target.mask_code,
@@ -196,11 +201,11 @@ impl IoppChain {
                     return Err(Error::InvalidConfig);
                 }
                 let layout = FoldGroupLayout {
-                    group: config.group,
+                    group: ids.group,
                     k: plan.k,
                     h: plan.h,
                     members: vec![FoldMemberLayout {
-                        oracle: config.member,
+                        oracle: ids.member,
                         main_rows: target.main_rows,
                         mask_rows: target.mask_rows,
                         kept: false,
@@ -227,9 +232,9 @@ impl IoppChain {
                     shape,
                     layout,
                     mask_tree,
-                    group: config.group,
-                    member: config.member,
-                    fresh,
+                    group: ids.group,
+                    member: ids.member,
+                    fresh: ids.fresh,
                 })
             } else {
                 None
@@ -477,6 +482,7 @@ pub fn prove_multi_stage_iopp(
         fresh_tree.plan,
         fresh_tree.root,
     )?;
+    check_stage_zero_ids(plan, &handoff, &basis)?;
     let initial_members: Vec<IoppInitialMember> = member_trees
         .iter()
         .zip(basis.members.iter())
@@ -683,6 +689,7 @@ pub fn verify_multi_stage_iopp(
             return Err(Error::StatementMismatch);
         }
     }
+    check_stage_zero_ids(plan, &handoff, &basis)?;
     let provided: Vec<SwitchTarget> = proof
         .switches
         .iter()
@@ -963,6 +970,51 @@ fn validate_stage_zero(
                     .any(|value| *value != Fp3::ZERO))
         {
             return Err(Error::StatementMismatch);
+        }
+    }
+    Ok(())
+}
+
+/// Rejects zero identifiers, a fresh identifier equal to its member, and any
+/// identifier repeated in the stage sequence. Each stage's fresh mask and
+/// switched-member registration is a distinct object in the shared registry.
+fn fold_ids_fault(ids: &[IoppStageFoldIds]) -> bool {
+    if ids.iter().any(|entry| {
+        entry.group == 0 || entry.member == 0 || entry.fresh == 0 || entry.fresh == entry.member
+    }) {
+        return true;
+    }
+    ids.iter().enumerate().any(|(index, entry)| {
+        ids[index + 1..].iter().any(|other| {
+            entry.member == other.member
+                || entry.fresh == other.fresh
+                || entry.group == other.group
+        })
+    })
+}
+
+/// Checks the allocated stage FOLD identifiers against stage 0's bound
+/// identifiers. Stage 0 and every later stage share one identifier registry,
+/// so no later stage may reuse a group, member or fresh identifier.
+fn check_stage_zero_ids(
+    chain_plan: &IoppChain,
+    handoff: &FoldHandoff,
+    basis: &FoldBasis,
+) -> Result<()> {
+    let mut bound = Vec::with_capacity(basis.layout.members.len() + 2);
+    bound.push(handoff.group);
+    bound.push(handoff.fresh);
+    bound.extend(basis.layout.members.iter().map(|member| member.oracle));
+    for stage in chain_plan
+        .stages
+        .iter()
+        .filter_map(|stage| stage.fold.as_ref())
+    {
+        if bound.contains(&stage.group)
+            || bound.contains(&stage.member)
+            || bound.contains(&stage.fresh)
+        {
+            return Err(Error::InvalidConfig);
         }
     }
     Ok(())
@@ -1494,9 +1546,11 @@ mod tests {
             first_main: code(5, 8, 1),
             first_mask: code(5, 16, 1),
             base_positions: 1,
-            group: GROUP,
-            member: MEMBER1,
-            fold_fresh: vec![FRESH1],
+            fold_ids: vec![IoppStageFoldIds {
+                group: GROUP + 1,
+                member: MEMBER1,
+                fresh: FRESH1,
+            }],
             mask_leaf_class: IOPP_MASK_LEAF_CLASS,
             switch_salt_bytes: SALT_BYTES,
             switch_run: SWITCH_RUN,
@@ -2095,6 +2149,59 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_stage_identifiers_are_rejected() {
+        let base = IoppStageFoldIds {
+            group: GROUP + 1,
+            member: MEMBER1,
+            fresh: FRESH1,
+        };
+        assert!(!fold_ids_fault(&[base]));
+        assert!(fold_ids_fault(&[
+            base,
+            IoppStageFoldIds {
+                fresh: base.fresh,
+                ..base
+            }
+        ]));
+        assert!(fold_ids_fault(&[
+            base,
+            IoppStageFoldIds {
+                member: base.member,
+                ..base
+            }
+        ]));
+        assert!(fold_ids_fault(&[
+            base,
+            IoppStageFoldIds {
+                group: base.group,
+                ..base
+            }
+        ]));
+        assert!(fold_ids_fault(&[IoppStageFoldIds {
+            fresh: base.member,
+            ..base
+        }]));
+    }
+
+    #[test]
+    fn stage_fold_identifiers_must_not_reuse_stage_zero_identifiers() {
+        let (_, proof, _, zero) = run_proof();
+        let mut bad = config();
+        bad.fold_ids[0].member = MEMBER0;
+        let plan = IoppChain::derive(&stages(), &bad).unwrap();
+        assert!(verify_multi_stage_iopp(chain(), &plan, zero, &proof).is_err());
+    }
+
+    #[test]
+    fn stage_fold_group_must_not_reuse_the_stage_zero_group() {
+        let (_, proof, _, zero) = run_proof();
+        let mut bad = config();
+        bad.fold_ids[0].group = GROUP;
+        let plan = IoppChain::derive(&stages(), &bad).unwrap();
+        assert!(verify_multi_stage_iopp(chain(), &plan, zero, &proof).is_err());
+    }
+
+    #[test]
     fn actual_stage_lists_derive() {
         let shared = vec![
             stage_plan(code(17, 65536, 8192), code(17, 512, 256), 2, 0, 2),
@@ -2104,7 +2211,7 @@ mod tests {
             first_main: code(17, 65_536, 8_192),
             first_mask: code(17, 512, 256),
             base_positions: 2,
-            fold_fresh: Vec::new(),
+            fold_ids: Vec::new(),
             base_star: RuntimeTreePlan {
                 tree_number: 0x700,
                 leaf_class: 5,
@@ -2130,7 +2237,11 @@ mod tests {
             first_main: code(17, 65_536, 8_192),
             first_mask: code(17, 512, 256),
             base_positions: 2,
-            fold_fresh: vec![FRESH1],
+            fold_ids: vec![IoppStageFoldIds {
+                group: GROUP + 1,
+                member: MEMBER1,
+                fresh: FRESH1,
+            }],
             base_star: RuntimeTreePlan {
                 tree_number: 0x701,
                 leaf_class: 5,
