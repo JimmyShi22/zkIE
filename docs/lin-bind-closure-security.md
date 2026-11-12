@@ -1092,7 +1092,7 @@ The entries are:
 | direct shared FOLD check | k <= 11, 11 rounds, degree 2 | `22/p^3 < 2^-187` |
 | direct own FOLD check | k = 14, 14 rounds, degree 2 | `28/p^3 < 2^-186` |
 | BASE lambda and symbol checks | withdrawn from the algebraic union: no independent-uniform field-domain/order derivation for the Fp3 lambda challenge, and the two checks are codeword-index samples, not field challenges | carried in `eps_proximity` (unknown term, not in `eps_components`) |
-| base position sampling | real sampler `draw -> unique_sorted`: `t = 2` draws, `s <= 2` unique positions and `s` is variable; distance parameter `delta` | miss `(1 - delta)^t` for the original-draw event; the actual `delta`/miss are computed in section 8 (`0.790` main, `0.444` mask): ineffective |
+| base position sampling | real sampler `draw -> unique_sorted`: `t = 2` draws, `s <= 2` unique positions and `s` is variable; distance parameter `delta` | miss `(1 - delta)^t` for the original-draw event; the actual `delta`/miss are computed in section 8 (`0.3164` main, `3.42e-5` mask): ineffective |
 | range booleanity | 16 positions, degree at most 166 each | `16*166/p^3 < 2^-180` |
 | PSC sumcheck (Dot once, closure 16 positions) | 10 and 23 variables, degree 3 each | `(30 + 16*69)/p^3 < 2^-181` |
 | single equality | the check exists, but its polynomial-degree/event derivation is not written in this note | not counted in `eps_components`; carried in `eps_proximity` (unknown term) |
@@ -1111,21 +1111,25 @@ eps_components <= 16*166/p^3 + 1134/p^3 + 50/p^3 + 1/p^3
                 < 2^-179.6
 eps_proximity = INEFFECTIVE
                 (direct FOLD->BASE miss at the actual code parameters is
-                 ~0.790 for the main code and ~0.444 for the mask code;
+                 ~0.3164 for the main code and ~3.42e-5 for the mask code;
                  section 8 gives the derivation and the candidates)
 eps_total also carries the retry exhaustion N * 2^-2048 and the Q_R / Q_A factors
 ```
 
 `eps_proximity` is not zero and not a conservative placeholder: section 8
 computes the direct FOLD-to-BASE two-position miss from the actual code
-parameters. The main code `(ell = 65,539, r = 8,192)` has relative distance
-`0.1111` and miss `0.7901`; the mask code `(512, 256)` has distance `1/3` and
-miss `0.4444`. A fold-consistent correlated error (a common error pattern in
+parameters. The codeword length is `n = 2^log_n = 131,072` (the product-form
+encoder returns `n` symbols; `CodeParams::n()`); the main code has
+`ell + r = 73,731` message/tail coefficients, relative distance
+`(n - (ell + r - 1))/n = 57,342/131,072 = 0.4374847412`, and two-position miss
+`0.3164234164 = 2^-1.6601`. The mask code `(ell + r = 768)` has relative
+distance `130,305/131,072 = 0.9941482544` and miss `3.424292663e-5 =
+2^-14.8338`. A fold-consistent correlated error (a common error pattern in
 the rows, or a difference whose fold cancellation is exact) survives the fold
 with the same relative distance, so the folded check does not improve the
-bound. The proximity sub-term is therefore **ineffective** at the current
-parameters, not merely unknown; the algebraic components below are separate.
-The document does not claim a total security bit count.
+main-code bound. The proximity sub-term is therefore **ineffective** at the
+current parameters, not merely unknown; the algebraic components below are
+separate. The document does not claim a total security bit count.
 
 The `BASE 3/p^3` figure and the earlier `6/p^3 < 2^-189.4` merge are withdrawn
 from `eps_components`: the lambda challenge is an `Fp3` field value whose
@@ -1172,10 +1176,11 @@ original sampling is "both draws agree", with probability `(1 - delta)^t` for a
 word at relative distance `delta` (agreement `1 - delta`); the hit probability
 is `1 - (1 - delta)^t`. This is not an argument from "the number of distinct
 positions decreased": it is the same original-draw event. The actual
-parameters give `delta_main = 8192/73731 = 0.1111065902` and
-`delta_mask = 256/768 = 1/3`; the corresponding misses are `0.7901314940`
-and `0.4444444444` (section 8). The base-position and proximity soundness is
-therefore **ineffective at the current parameters**, not zero and not a
+parameters give `n = 131,072`, `delta_main = 57,342/131,072 =
+0.4374847412` and `delta_mask = 130,305/131,072 = 0.9941482544`; the
+corresponding misses are `0.3164234164` and `3.424292663e-5` (section 8). The
+base-position and proximity soundness is therefore **ineffective at the
+current parameters** (the main code dominates), not zero and not a
 conservative placeholder. The `Fp3` BASE lambda challenge and the two
 codeword-index checks are likewise carried in `eps_proximity` (withdrawal
 above), not in `eps_components`. The retry exhaustion (`N * 2^-2048`) and the
@@ -1183,7 +1188,7 @@ multi-request `Q_R`/adaptive `Q_A` factors are carried separately; they are
 not dropped.
 
 `[FACT]` `CODE` The numerical proximity miss at the actual code parameters is
-computed above: `0.7901314940` (main) and `0.4444444444` (mask). `[UNPROVEN]`
+computed above: `0.3164234164` (main) and `3.424292663e-5` (mask). `[UNPROVEN]`
 The exact composition of this miss with the algebraic FOLD detection for each
 error class (which differences are kernel-only and which are seen by the fold
 polynomials) is not mechanized; the worst-case single-row error is the basis
@@ -1215,7 +1220,7 @@ mask values, not the algebraic checks.
 | closure joint mask object rank equality | real encoder + real hiding polynomial + joint matrix | `NUM` at k=4; `CODE` block derivation for k=23 |
 | full joint composition of all blocks, shared columns and roots | block partition B0-B6 + conditional block lemma, per-block rank tests | `FACT` `CODE` `MATH` (section 5.7); the scope condition is witness-independence, not a witness-free simulator |
 | BASE star fresh and one-time | `draw_star` from a fresh stream; real-path test | supported |
-| local proximity distance/query soundness | plan radius 16,384, 603 column draws, 12 work bits, two base positions; main code (65,539, 8,192), mask (512, 256) | `FACT`: main miss `0.7901314940`, mask miss `0.4444444444`; the proximity is ineffective at the current parameters (section 8) |
+| local proximity distance/query soundness | `n = 131,072`; main `ell + r = 73,731`, mask `ell + r = 768`; two base positions | `FACT`: main relative distance `0.4374847412`, miss `0.3164234164`; mask miss `3.424292663e-5`; the main code makes the proximity ineffective at the current parameters (section 8) |
 | BASE lambda and symbol-check terms | `Fp3` lambda challenge and two codeword-index samples; no independent-uniform-domain/order derivation here | withdrawn to `eps_proximity` (ineffective proximity; unknown lambda term), not in `eps_components` |
 | single-equality term | the check is present; its polynomial-degree/event derivation is not written here | not counted; carried in `eps_proximity` (unknown term) |
 | hash RO for hiding, CR for binding | leaf/root hash construction and salt lengths; model statement | supported as a model; no concrete-hash quantification |
@@ -1286,7 +1291,7 @@ challenges drawn after the difference is fixed:
 | range / booleanity difference | the range polynomial difference is nonzero | degree at most 166 per position; `2656/p^3` |
 | BAT row difference | the row linear form differs at the batching challenge | degree 1; `1/p^3` |
 | BASE lambda difference | the linear check differs at lambda | degree 1; currently in `eps_proximity` |
-| proximity / folded-row difference | the committed word is far from the code | `(1-delta)^t`; `0.790` main / `0.444` mask (ineffective) |
+| proximity / folded-row difference | the committed word is far from the code | `(1-delta)^t`; `0.3164` main / `3.42e-5` mask (ineffective) |
 
 The FOLD terms enter only when the difference is nonzero in the folded claim
 and the challenge is drawn after the difference is fixed; the order is the one
@@ -1337,8 +1342,8 @@ kernel/coverage matrix across BAT/FOLD/PSC/closure/BASE/output is built.
   the corresponding polynomial terms are in `eps_components`.
 - Not captured with an effective bound: (i) fold-consistent committed rows that
   are far from the code — the algebraic fold checks pass, the folded-row
-  proximity is the only distance check, and its actual miss is `0.790` (main)
-  / `0.444` (mask), so it provides no bound; (ii) kernel differences of the
+  proximity is the only distance check, and its actual miss is `0.3164` (main)
+  / `3.42e-5` (mask), so it provides no bound; (ii) kernel differences of the
   fold relation that change the statement semantics and are not caught by
   another relation — the folded row is the honest one, so the proximity cannot
   see them; the capture must come from the Eval/closure/BAT/statement binding
@@ -1346,7 +1351,7 @@ kernel/coverage matrix across BAT/FOLD/PSC/closure/BASE/output is built.
   the current parameters, not a wording unknown.
 
 Candidates for the open group: a complete IOPP proximity round set; increasing
-the independent query rounds (`t >= 754` for `(1-delta_main)^t <= 2^-128`); or
+the independent query rounds (`t >= 155` for `(1-delta_main)^t <= 2^-128`); or
 changing the code parameters to a lower rate / larger `r`. The kernel/coverage
 matrix, the final output-consistency check and the component-level kernel
 negatives from the previous paragraph remain the structural candidates.
@@ -1366,26 +1371,29 @@ their degrees in section 6; the terms without a written derivation (single
 equality) and the BASE lambda/symbol terms remain in `eps_proximity`. The
 union is an arithmetic assumption, not a mechanized composition.
 
-`[FACT]` `CODE` `MATH` Proximity miss at the actual code parameters. The main
-table/W/closure code is `(log_n = 17, ell = 65,539, r = 8,192)`; the mask code
-is `(17, 512, 256)`. Their relative distances are
+`[FACT]` `CODE` `MATH` Proximity miss at the actual code parameters. The code
+length is `n = 2^log_n = 131,072` (the product-form encoder returns `n`
+symbols: `CodeParams::n()` and `product_form_fp3`), not the coefficient count
+`ell + r`. The main table/W/closure code has `ell + r = 73,731` coefficients;
+the mask code has `ell + r = 768`. The Reed-Solomon minimum distance is
+`n - (ell + r) + 1` (a polynomial of degree below `ell + r` evaluated at the
+`n` distinct coset points). The relative distances and the `(1 - delta)`
+factors are
 
 ```text
-delta_main = 8192 / 73731 = 0.1111065902,
-delta_mask = 256 / 768   = 1/3.
+main: distance 131072 - 73730 = 57342, delta = 57342/131072 = 0.4374847412,
+      1 - delta = 73730/131072 = 0.5625152588;
+mask: distance 131072 - 767 = 130305, delta = 130305/131072 = 0.9941482544,
+      1 - delta = 767/131072 = 0.0058517456.
 ```
-
-The Reed-Solomon minimum distance is `r+1`; the relative value `(r+1)/n`
-gives the very close `0.1111201529`. The document uses the slightly smaller
-`r/n` so the miss below is the conservative (larger) one.
 
 The BASE check samples `t = 2` uniformly drawn positions; for a word at
 relative distance `delta`, the miss probability is `(1 - delta)^2` (the
 original-draw event; deduplication does not change it). The actual values are
 
 ```text
-main: (65539/73731)^2 = 0.7901314940 = 2^-0.3398,
-mask: (512/768)^2     = 0.4444444444 = 2^-1.1699.
+main: (73730/131072)^2 = 0.3164234164 = 2^-1.6601,
+mask: (767/131072)^2   = 3.424292663e-5 = 2^-14.8338.
 ```
 
 The effective distance after folding: the FOLD is a linear combination of the
@@ -1404,16 +1412,17 @@ the worst-case fold-consistent pattern, so the effective `delta` is
 
 `[FACT]` `CODE` Conclusion for the direct FOLD-to-BASE proximity. At the
 current parameters the proximity check does not provide a meaningful security
-bound: the main-code two-position miss is `0.790` (about `2^-0.34`) and the
-mask-code miss is `0.444` (`2^-1.17`). For fold-consistent rows that are far
-from the code, the algebraic fold checks see no difference (the fold relation
-holds), so the proximity is the only distance check and it misses with
-probability `0.790`/`0.444`; the algebraic terms cover the separate
-nonzero-difference class. This is the explicit audit statement: **direct
-FOLD-to-BASE under the current parameters does not provide a security bound
-for the proximity sub-term.** Candidates: (i) increase the number of
-independent query rounds: `(1 - delta_main)^t <= 2^-128` needs
-`t >= 753.4`, i.e. about 754 positions; (ii) add a complete IOPP proximity
+bound: the main-code two-position miss is `0.3164234164` (about `2^-1.66`)
+and the mask-code miss is `3.424292663e-5` (`2^-14.83`); the main code
+dominates. For fold-consistent rows that are far from the code, the algebraic
+fold checks see no difference (the fold relation holds), so the proximity is
+the only distance check and it misses with probability `0.3164` (main); the
+algebraic terms cover the separate nonzero-difference class. This is the
+explicit audit statement: **direct FOLD-to-BASE under the current parameters
+does not provide a security bound for the proximity sub-term.** Candidates:
+(i) increase the number of independent query rounds:
+`(1 - delta_main)^t <= 2^-128` needs
+`t >= 154.3`, i.e. about 155 positions; (ii) add a complete IOPP proximity
 round set at the plan's radius/work; (iii) change the code parameters
 (increase `r` or lower the rate) so that `(1 - delta)^t` is meaningful for a
 realistic `t`. Until one is adopted, `eps_proximity` is **ineffective, not
@@ -1484,7 +1493,7 @@ the Vandermonde hiding-budget condition, not a proximity soundness term. The
 tail union is the accounted union. The local proximity sub-term is the
 computed result in the proximity block above: the plan samples `t = 2`
 positions (`s <= 2` variable; deduplication does not change the original-draw
-hit event), and the actual main/mask misses are `0.790`/`0.444`, so the
+hit event), and the actual main/mask misses are `0.3164`/`3.42e-5`, so the
 proximity is ineffective at the current parameters.
 
 **Combination conditions.** The union bound requires that the challenge
@@ -1499,7 +1508,7 @@ bound is
 under the nonzero-difference and challenge-order preconditions. The
 zero-difference (kernel) case is not charged to this bound; it is covered or
 left open in the kernel-coverage table above. The proximity sub-term is
-**ineffective** (`0.790` main / `0.444` mask), so this polynomial bound is
+**ineffective** (`0.3164` main / `3.42e-5` mask), so this polynomial bound is
 only the algebraic part and does not yield a total soundness bound. This is a
 loose bound under the degree assumption, not a measured probability. A
 final-verifier exact negative for this tamper is not implemented because the
@@ -1521,7 +1530,7 @@ quantified.
 
 ```text
 eps_algebraic  <= 16*166/p^3 + 1134/p^3 + 50/p^3 + 1/p^3 < 2^-179.6
-eps_proximity  = INEFFECTIVE: main miss 0.7901314940, mask miss 0.4444444444
+eps_proximity  = INEFFECTIVE: main miss 0.3164234164, mask miss 3.424292663e-5
 eps_hash       = the RO/CR model term of section 6 (not a concrete-hash bound)
 eps_kernel     = UNPROVEN: the open error classes of the kernel-coverage table
 ```
@@ -1529,7 +1538,7 @@ eps_kernel     = UNPROVEN: the open error classes of the kernel-coverage table
 The algebraic terms are the only part with a numeric bound, and they are
 conditional on the nonzero-difference/challenge-order preconditions. The
 proximity term is not a small unknown to be filled in later: at the current
-code parameters the direct FOLD-to-BASE two-position miss is `0.790`, so the
+code parameters the direct FOLD-to-BASE two-position miss is `0.3164`, so the
 proximity check does not provide a security bound. The kernel-coverage table
 has open classes that the ineffective proximity was supposed to capture.
 Therefore no total soundness bound is claimed for the current parameters; the
@@ -1566,7 +1575,7 @@ from per-block pivots; its scope condition is witness-independence (a dummy
 witness for the same public statement), not a witness-free simulator. The
 soundness reduction of section 8 is not a total bound: the kernel-coverage
 table has open classes, and the direct FOLD-to-BASE proximity is ineffective
-at the current parameters (`0.790` main miss). The workspace counts, proof
+at the current parameters (`0.3164` main miss). The workspace counts, proof
 hashes and HEAD remain the implementation side's reported figures; the TL
 self-check is not an independent expert verification, and editing this
 document or the test-only module is not a new validation of the production
@@ -1655,9 +1664,9 @@ claim a closed joint theorem.
   commit. The component test and the degree bound are delivered instead.
 - `[GAP]` The direct FOLD-to-BASE proximity at the current parameters does not
   provide a security bound: `t = 2`, `delta_main = 0.1111`,
-  `(1 - delta_main)^2 = 0.7901314940`; the mask miss is `0.4444444444`. The
+  `(1 - delta_main)^2 = 0.3164234164`; the mask miss is `3.424292663e-5`. The
   algebraic FOLD terms do not cover the folded-row error class. Candidates:
-  about 754 independent query positions for `2^-128`, a complete IOPP
+  about 155 independent query positions for `2^-128`, a complete IOPP
   proximity round set, or a lower-rate/larger-`r` code parameter change
   (section 8). `eps_proximity` is ineffective, not a small unknown.
 - `[UNPROVEN]` A mechanized composition theorem and an end-to-end 128-bit
