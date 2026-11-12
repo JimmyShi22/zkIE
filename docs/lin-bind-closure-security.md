@@ -1672,14 +1672,38 @@ next mask `ell=4,096` (room `16,384 >= 9,729`); the own group can step down
 `65,536 -> ... -> 1` with `k=13` followed by `k=2` steps. These are
 shape-feasible values, not yet the trusted parameters.
 
-`[FACT]` `CODE` The actual fixture plan does not carry the stage list,
-per-stage codes, position counts, sample counts or work values;
-`HiddenProximityPlan` has one code, one mask code and one `FoldShape` per
-group. The provisional `lm_head_compiled` stage list is for a different shape.
-The trusted plan for the actual fixture's multi-stage chain therefore does not
-exist in the tree; it must be produced by the planner for these shapes
-(codes, positions, samples, work, error terms and hiding budget) and bound.
-Choosing those parameters here would be a plan/parameter change.
+`[FACT]` `CODE` The fixture plan now carries the candidate trusted stage lists.
+`IoppStagePlan` stores `main`, `mask`, `k`, `h`, `positions`, `samples` and
+`work_bits`; `HiddenProximityPlan` has `shared_stages` and `own_stages`, and
+`iopp_stage_fault` checks the reference shape conditions (non-last `k >= 1`,
+`h <= k`, power-of-two message lengths, adjacent
+`ell_i = 2^{k_{i+1}} ell_{i+1}`, next mask room, last `k = h = 0`). The lists
+bound in the fixture are:
+
+- shared: stage0 `(17, 65,536, 8,192)/(17, 512, 256)`, `k=2,h=0`,
+  positions 2, samples 1, work 0; stage1 (last)
+  `(17, 65,536, 256)/(17, 16,384, 256)`, `k=h=0`, positions 2, samples 1.
+- own: stage0 `(17, 65,536, 8,192)/(17, 512, 256)`, `k=13,h=2`, positions 2,
+  samples 1, work 0; stage1 `(17, 8, 256)/(17, 16, 256)`, `k=13,h=13`,
+  positions 2, samples 1; stage2 (last) `(17, 8, 256)/(17, 1,024, 256)`,
+  `k=h=0`, positions 2, samples 1.
+
+The first-stage codes equal the group codes and the first-stage `k`/`h` equal
+the actual member counts (shared 2/0, own 13/2). Unit tests
+`actual_shared_and_own_stage_lists_are_legal` and
+`bad_stage_chains_are_rejected` cover the actual lists and the failures
+(wrong first code, wrong folded length, non-last last stage). The lists are
+plan data, not prover self-report.
+
+`[UNPROVEN]` The prover/verifier loop is not yet wired: the stage list is
+present and validated, but the BAT -> (FOLD -> CS)* -> BASE execution, the
+per-stage old/new row authentication, the independent verifier reconstruction
+of the stages, and the per-stage failure/rejection matrix are not implemented.
+The `positions=2`, `samples=1`, `work=0` entries are candidate plan values
+taken from the actual plan; the planner-sized error/position derivation is
+still to be done. The provisional `lm_head_compiled` stage list remains a
+different shape and is not used. Choosing the final positions/work/error
+parameters is the plan/parameter step for the TL/expert.
 
 `[FACT]` `MATH` c-difference and `Im(A)`. For a public value `P = A X + c(V,S)`,
 two secrets `(V,S)` and `(V',S')` give the same image exactly when
@@ -1828,14 +1852,12 @@ claim a closed joint theorem.
   decrease `ell + r`; fixing `n`/`ell` and increasing `r` raises the rate and
   lowers the distance) (section 8). `eps_proximity` is ineffective, not a
   small unknown.
-- `[GAP]` The reference-style multi-stage IOPP is not implemented. The actual
-  W/closure main code is `ell = 65,536` (a power of two) and the table
-  `ell = 65,539` is not an IOPP member, so the earlier non-power-of-two
-  blocker is withdrawn. The remaining gap is that the actual fixture plan has
-  no trusted stage list, per-stage codes/positions/samples/work, and the
-  provisional `lm_head_compiled` is a different shape; a planner output for
-  the actual shapes is required (section 8.7). Choosing those parameters is a
-  seven-category plan change for the TL/expert.
+- `[GAP]` The multi-stage IOPP stage lists are now in the plan and validated
+  (shared 2 stages, own 3 stages; reference shape conditions pass). The
+  BAT -> (FOLD -> CS)* -> BASE prover/verifier loop, per-stage opening
+  authentication, independent stage reconstruction and failure matrix are
+  not implemented; the per-stage positions/work/error parameters are
+  candidate values, not a planner-sized derivation (section 8.7).
 - `[UNPROVEN]` A mechanized composition theorem and an end-to-end 128-bit
   claim; `126.21`/`116.01` remain plan-ledger numbers.
 - `[LONG-TERM]` The trusted X source, policy distribution/freshness and
