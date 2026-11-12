@@ -3,8 +3,9 @@
 ## Scheme and baseline
 
 - Scheme: `rework13-final`.
-- Code: document commit `c297f484` (the v11 block-diagonal proof), with the
-  preceding v11 commit `8b71bbf3`; previous round head `100ec87d`.
+- Code: document commit `c297f484` (the v11 block-diagonal proof), corrected
+  by `6aff57f9` (the code-length basis of the proximity miss); preceding v11
+  commit `8b71bbf3`; previous round head `100ec87d`.
 - This round changes only `docs/lin-bind-closure-security.md` (v10 -> v11).
   The production code, test path, plan, parameters, commitments, challenge
   order and proof format are unchanged.
@@ -65,20 +66,33 @@ re-measured in this round. The proof length is 9,939,144 B in all three runs.
   the statement-component binding map, the difference classes and their
   nonzero/degree conditions, and the kernel-capture table. The direct
   FOLD-to-BASE proximity is computed at the actual code parameters:
-  `delta_main = 8192/73731 = 0.1111065902`,
-  `delta_mask = 256/768 = 1/3`; with `t = 2`, the misses are
-  `0.7901314940 = 2^-0.3398` (main) and `0.4444444444 = 2^-1.1699` (mask).
+  `delta_main = (131072 - 73730)/131072 = 0.4374847412`,
+  `delta_mask = (131072 - 767)/131072 = 0.9941482544`; with `t = 2`, the
+  misses are `0.3164234164 = 2^-1.6601` (main) and
+  `3.424292663e-5 = 2^-14.8338` (mask). The code length is
+  `n = 2^17 = 131,072`, not `ell + r`; the product-form encoder returns `n`
+  symbols and the RS minimum distance is `n - (ell + r) + 1`.
   A fold-consistent common-error pattern survives the fold with the same
-  relative distance, so the folded check does not improve the bound. The
-  proximity sub-term is therefore **ineffective**, not a small unknown; the
-  direct FOLD-to-BASE path does not provide a security bound at the current
-  parameters. This is a real soundness gap (`[GAP]`), with candidates: about
-  754 independent query positions for `2^-128`, a complete IOPP proximity
-  round set, or a lower-rate/larger-`r` code parameter change.
+  relative distance, so the folded check does not improve the main-code bound.
+  The proximity sub-term is therefore **ineffective**, not a small unknown;
+  the direct FOLD-to-BASE path does not provide a security bound at the
+  current parameters. This is a real soundness gap (`[GAP]`), with candidates:
+  about 155 independent query positions for `2^-128`, a complete IOPP
+  proximity round set, or a lower-rate/larger-`r` code parameter change.
 - The honest ledger has `eps_algebraic < 2^-179.6` (conditional on the
   nonzero-difference/order preconditions), `eps_proximity` ineffective,
   `eps_hash` model-level, and `eps_kernel` with open error classes. No total
   soundness bound is claimed.
+
+## Correction
+
+The first v11 draft used `n = ell + r = 73,731` as the codeword length and
+reported a main miss of `0.7901314940`. The actual code length is
+`n = 2^log_n = 131,072` (`CodeParams::n()`; the product-form encoder returns
+`n` symbols), and the RS minimum distance is `n - (ell + r) + 1`. The corrected
+values are `0.3164234164` (main) and `3.424292663e-5` (mask); the candidate
+query count is 155, not 754. The qualitative conclusion (no security bound at
+`t = 2`) is unchanged. The correction is in document commit `6aff57f9`.
 
 ## Open items
 
