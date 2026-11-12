@@ -1,38 +1,32 @@
-//! PSC message and verifier skeleton for the norm core.
+//! Committed messages, product-sumcheck instances and row bindings for the
+//! final norm core.
 //!
-//! This module builds the committed messages of the norm's `x`, `sum`,
-//! `squares`, `mean` and `variance` groups and a verifier skeleton that checks
-//! their group declarations, openings, challenge order and product-sumcheck
-//! transcripts.
+//! `NormPlan` fixes the five committed group shapes, their identifiers, the
+//! opening counts and the relation domain. The x group is the trusted
+//! product-form input: its roots are plan values. The sum, squares, mean and
+//! variance groups are proof-fixed witness messages, and the mask group is a
+//! committed one-time mask message.
 //!
-//! Scope, stated explicitly: the skeleton does not yet bind the product-
-//! sumcheck point values to the committed rows through BAT/FOLD/CS/BASE. The
-//! row-level relation (including carry/range, the rsqrt lookup, the weight
-//! product and the output commitment) is the next slice. The transcript
-//! targets are zero. The first-stage openings are product-form encoded and
-//! salted; the second-stage point values are masked with prover-private
-//! one-time entries, and those masks are not committed or verified in this
-//! skeleton. The verifier backend is the commitment-free transcript checker:
-//! it checks group identity, roots, opening positions, message versions,
-//! challenge order and the equality of each shown point value with the
-//! transcript's shown end value. It does not reject arbitrary transcript or
-//! challenge tampering; that rejection requires the BAT/FOLD/CS/BASE row
-//! binding and is deliberately not claimed here. What this module does
-//! establish is the exact message layout, group identity, opening positions,
-//! challenge order and PSC transcript consistency that the later row binding
-//! consumes.
-//!
-//! The five group roots are trusted plan inputs in this skeleton. The proof
-//! does not yet derive the sum/squares/mean/variance roots from the x rows;
-//! that derivation is exactly the deferred row binding.
+//! The integrated product-sumcheck runs one instance per position and per
+//! relation listed by the plan. The supported row binding covers the sum and
+//! squares relations: each shown endpoint is a linear form of the committed x,
+//! sum, squares and mean messages, and the one-time hiding and shown masks are
+//! committed entries of the same mask group. The mean and variance relations,
+//! the carry/range digits, the rsqrt lookup, the weight product and the output
+//! consumer are not part of this module. No soundness or privacy proof is
+//! claimed.
 
 use zkie_core::artifact::digest_bytes;
 use zkie_core::common::codec::DecodeLimits;
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
 use zkie_engine::pcs::request::chain::Chain;
+use zkie_engine::pcs::request::code::encode_row_fp3;
 use zkie_engine::pcs::request::fold::{ByteMaskCoins, MaskCoins};
 use zkie_engine::pcs::request::field::Fp3;
+use zkie_engine::pcs::request::runtime_tree::{
+    RuntimePartRows, RuntimeTree, RuntimeTreeOpening, RuntimeTreePlan,
+};
 use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
 
 use crate::proof::committed_psc::{
@@ -41,9 +35,10 @@ use crate::proof::committed_psc::{
 };
 use crate::proof::hidden_norm::{NormCoreRow, NormShape};
 use crate::proof::hidden_send_session::{SendSamples, WShape};
+use crate::proof::output_closure::{CommittedValueGroup, RetainedTrees};
 use crate::proof::psc::{
     hp_entries, prove_dot_sumcheck, psc_variables, verify_psc_transcript, DotClaim,
-    DotMaskEntries, DotProof, SHOWN_MAPS,
+    DotMaskEntries, DotOutput, DotProof, SHOWN_MAPS,
 };
 
 /// Version of the norm PSC message skeleton.
@@ -55,7 +50,7 @@ pub const NORM_PSC_RELATIONS: usize = 4;
 const NORM_PSC_CHAIN_LABEL: u64 = 77;
 /// Transcript tags of the norm product-sumcheck, distinct from the closure
 /// tags and the hidden Dot tags.
-const NORM_PSC_TAGS: PscTranscriptTags = PscTranscriptTags {
+pub(crate) const NORM_PSC_TAGS: PscTranscriptTags = PscTranscriptTags {
     version: NORM_PSC_VERSION,
     hiding_sum: 50,
     round: 51,
@@ -341,7 +336,7 @@ impl NormPscSecond {
         let instances = plan
             .shape
             .positions
-            .checked_mul(NORM_PSC_RELATIONS as u32)
+            .checked_mul(plan.relations.len() as u32)
             .ok_or(Error::ResourceLimit)?;
         let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
         let (psc, point_values) = get_psc_transcript::<2>(
@@ -358,7 +353,7 @@ impl NormPscSecond {
 
     pub fn check_for(&self, plan: &NormPlan) -> Result<()> {
         plan.validate()?;
-        let instances = plan.shape.positions as usize * NORM_PSC_RELATIONS;
+        let instances = plan.shape.positions as usize * plan.relations.len();
         if self.psc.len() != instances || self.point_values.len() != instances {
             return Err(Error::ShapeMismatch);
         }
@@ -422,7 +417,7 @@ fn map_pair(columns: usize) -> (Vec<Fp3>, Vec<Fp3>) {
     (vec![Fp3::ZERO; 2 * columns], vec![Fp3::ZERO; 2 * columns])
 }
 
-fn rel_map(
+pub(crate) fn rel_map(
     row: &NormCoreRow,
     values: &[i64],
     valid: usize,
@@ -578,7 +573,12 @@ fn fp3_signed(value: i128) -> Result<Fp3> {
 // this stage and becomes required when the committed mask entries are wired.
 
 /// Version of the integrated norm plan and first message.
-pub const NORM_BIND_VERSION: u64 = 1;
+pub const NORM_BIND_VERSION: u64 = 2;
+
+/// The relation indices the bound core supports: sum and squares. The map
+/// construction of every relation is fixed by the relation index; the plan
+/// may list only relations whose row binding is implemented.
+pub const NORM_BOUND_RELATIONS: [usize; 2] = [0, 1];
 
 /// One committed witness group of the integrated norm plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -611,6 +611,10 @@ pub struct NormPlan {
     pub shape: NormShape,
     pub columns: u64,
     pub variables: usize,
+    /// The relation indices of the product-sumcheck instances, in transcript
+    /// order. The plan fixes the domain; only the relations whose row binding
+    /// is implemented may be listed.
+    pub relations: Vec<usize>,
     /// The trusted product-form x group. Its roots are plan values.
     pub x: NormGroupPlan,
     pub x_roots: Vec<Digest>,
@@ -638,6 +642,18 @@ impl NormPlan {
         if self.variables != self.columns.trailing_zeros() as usize + 1 {
             return Err(Error::InvalidConfig);
         }
+        if self.relations.is_empty()
+            || self.relations.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(Error::InvalidConfig);
+        }
+        if self
+            .relations
+            .iter()
+            .any(|relation| !NORM_BOUND_RELATIONS.contains(relation))
+        {
+            return Err(Error::UnsupportedPrimitive);
+        }
         if self.x.columns != self.columns
             || self.sum.columns != 1
             || self.squares.columns != 1
@@ -662,15 +678,17 @@ impl NormPlan {
         let groups = [&self.x, &self.sum, &self.squares, &self.mean, &self.variance];
         for left in 0..groups.len() {
             for right in left + 1..groups.len() {
-                if groups[left].group == groups[right].group
-                    || groups[left].oracle_base == groups[right].oracle_base
-                {
+                if groups[left].oracle_base == groups[right].oracle_base {
                     return Err(Error::InvalidConfig);
                 }
             }
         }
         if let Some(mask) = &self.mask {
-            mask.validate(self.shape.positions)?;
+            mask.validate(
+                self.shape.positions,
+                self.variables,
+                self.relations.len(),
+            )?;
         }
         Ok(())
     }
@@ -682,6 +700,10 @@ impl NormPlan {
         writer.put_u64(self.shape.valid as u64);
         writer.put_u64(self.columns);
         writer.put_u64(self.variables as u64);
+        writer.put_u64(self.relations.len() as u64);
+        for relation in &self.relations {
+            writer.put_u64(*relation as u64);
+        }
         put_norm_group(writer, &self.x);
         writer.put_u64(self.x_roots.len() as u64);
         for root in &self.x_roots {
@@ -732,14 +754,135 @@ pub struct NormMaskPlan {
 }
 
 impl NormMaskPlan {
-    fn validate(&self, positions: u32) -> Result<()> {
+    /// The number of allocated entries of one product-sumcheck instance.
+    pub fn per_instance(&self) -> Result<usize> {
+        self.hiding
+            .checked_add(self.shown)
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// The number of product-sumcheck instances of the plan.
+    pub fn instances(&self, relations: usize) -> Result<usize> {
+        (self.positions as usize)
+            .checked_mul(relations)
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// The total number of allocated entries: one block per instance plus the
+    /// reserved claim entries.
+    pub fn total_entries(&self, relations: usize) -> Result<usize> {
+        self.instances(relations)?
+            .checked_mul(self.per_instance()?)
+            .and_then(|value| value.checked_add(self.claims))
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// The compact slot of one hiding entry of one instance.
+    pub fn hiding_slot(&self, instance: usize, index: usize) -> Result<usize> {
+        if index >= self.hiding {
+            return Err(Error::InvalidIndex);
+        }
+        instance
+            .checked_mul(self.per_instance()?)
+            .and_then(|base| base.checked_add(index))
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// The compact slot of one shown-value mask of one instance.
+    pub fn shown_slot(&self, instance: usize, index: usize) -> Result<usize> {
+        if index >= self.shown {
+            return Err(Error::InvalidIndex);
+        }
+        instance
+            .checked_mul(self.per_instance()?)
+            .and_then(|base| base.checked_add(self.hiding))
+            .and_then(|base| base.checked_add(index))
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// The compact slot of one reserved claim entry.
+    pub fn claim_slot(&self, instance_count: usize, index: usize) -> Result<usize> {
+        if index >= self.claims {
+            return Err(Error::InvalidIndex);
+        }
+        instance_count
+            .checked_mul(self.per_instance()?)
+            .and_then(|base| base.checked_add(index))
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// The compact row-major offset of an allocated entry.
+    pub fn entry_offset(&self, slot: usize) -> Result<usize> {
+        let rows = usize::try_from(self.mask_rows).map_err(|_| Error::ResourceLimit)?;
+        let ell = usize::try_from(self.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
+        let length = rows.checked_mul(ell).ok_or(Error::ResourceLimit)?;
+        if slot >= length {
+            return Err(Error::InvalidIndex);
+        }
+        Ok(slot)
+    }
+
+    /// The BAT virtual table index of an allocated entry.
+    pub fn entry_virtual_index(&self, slot: usize) -> Result<u64> {
+        let offset = self.entry_offset(slot)?;
+        let ell = usize::try_from(self.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
+        let row = offset / ell;
+        let place = offset % ell;
+        let row_bits = ceil_log2_u64(self.mask_rows);
+        (row as u64)
+            .checked_add((place as u64) << row_bits)
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// The compact offset of the SEND pad: the last cell of the last row.
+    pub fn pad_offset(&self) -> Result<usize> {
+        let rows = usize::try_from(self.mask_rows).map_err(|_| Error::ResourceLimit)?;
+        let ell = usize::try_from(self.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
+        rows.checked_mul(ell)
+            .and_then(|value| value.checked_sub(1))
+            .ok_or(Error::ShapeMismatch)
+    }
+
+    /// The number of seed coordinates the mask sample form reads.
+    pub fn sample_bits(&self) -> Result<u32> {
+        ceil_log2_u64(self.mask_rows)
+            .checked_add(self.mask_code.log_ell())
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// The free entries of the mask rows, excluding the SEND pad.
+    pub fn free_entries(&self) -> Result<usize> {
+        let rows = usize::try_from(self.mask_rows).map_err(|_| Error::ResourceLimit)?;
+        let ell = usize::try_from(self.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
+        let answers = self.answers as usize;
+        if answers == 0 || answers > ell {
+            return Err(Error::InvalidConfig);
+        }
+        let per_row = ell.checked_sub(answers).ok_or(Error::ResourceLimit)?;
+        rows.checked_mul(per_row)
+            .and_then(|value| value.checked_add(rows.saturating_sub(1)))
+            .ok_or(Error::ResourceLimit)
+    }
+
+    fn validate(&self, positions: u32, variables: usize, relations: usize) -> Result<()> {
         if self.oracle == 0 || self.group == 0 {
             return Err(Error::InvalidConfig);
         }
-        if self.mask_rows == 0 || self.answers == 0 || self.openings == 0 {
+        if self.mask_rows == 0
+            || !self.mask_rows.is_power_of_two()
+            || self.answers != 1
+            || self.openings == 0
+        {
             return Err(Error::InvalidConfig);
         }
-        if self.positions != positions || self.hiding == 0 || self.shown == 0 || self.claims == 0 {
+        if self.openings as u64 > self.mask_code.r {
+            return Err(Error::InvalidConfig);
+        }
+        if self.positions != positions || self.shown != SHOWN_MAPS || self.claims == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        let variables = psc_variables(variables).map_err(|_| Error::InvalidConfig)?;
+        if self.hiding != hp_entries(&variables).map_err(|_| Error::InvalidConfig)? {
             return Err(Error::InvalidConfig);
         }
         if zkie_engine::pcs::request::code::build_code_plan(
@@ -752,6 +895,26 @@ impl NormMaskPlan {
             return Err(Error::InvalidConfig);
         }
         if self.tree.fault().is_some() {
+            return Err(Error::InvalidConfig);
+        }
+        if self.tree.log_n != self.mask_code.log_n
+            || self.tree.log_n_zk != self.mask_code.log_n
+            || self.tree.parts.len() != 1
+        {
+            return Err(Error::InvalidConfig);
+        }
+        let mask_symbols = self
+            .mask_rows
+            .checked_mul(
+                zkie_engine::pcs::request::field::E_DEGREE as u64,
+            )
+            .ok_or(Error::ResourceLimit)?;
+        if self.tree.parts[0].main_symbols != 0
+            || self.tree.parts[0].mask_symbols != mask_symbols
+        {
+            return Err(Error::InvalidConfig);
+        }
+        if self.total_entries(relations)? > self.free_entries()? {
             return Err(Error::InvalidConfig);
         }
         Ok(())
@@ -772,6 +935,13 @@ impl NormMaskPlan {
         writer.put_u64(self.shown as u64);
         writer.put_u64(self.claims as u64);
     }
+}
+
+fn ceil_log2_u64(value: u64) -> u32 {
+    if value <= 1 {
+        return 0;
+    }
+    u64::BITS - (value - 1).leading_zeros()
 }
 
 /// The public mask-only norm message.
@@ -843,25 +1013,135 @@ impl NormMaskMessage {
     }
 }
 
-/// The prover-side message rows and encoding tails of one norm group.
+/// The prover-side message rows and encoding material of one norm group.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormGroupWitness {
     /// `messages[position][row][place]`, the unencoded message rows.
     pub messages: Vec<Vec<Vec<Fp3>>>,
     /// `tails[position][row * r + i]`.
     pub tails: Vec<Vec<Fp3>>,
+    /// `salts[position][column]`.
+    pub salts: Vec<Vec<Vec<u8>>>,
+    /// One non-zero sample pad per position.
+    pub pads: Vec<Fp3>,
+    /// The committed group, including the retained runtime trees.
+    pub committed: CommittedValueGroup,
+}
+
+/// The committed mask-only norm message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommittedNormMask {
+    pub root: Digest,
+    pub rows: Vec<Vec<Fp3>>,
+    pub tails: Vec<Vec<Fp3>>,
+    pub salts: Vec<Vec<u8>>,
+}
+
+impl CommittedNormMask {
+    pub fn tree(&self, plan: &NormMaskPlan) -> Result<RuntimeTree> {
+        let mut codewords = Vec::with_capacity(self.rows.len());
+        for (row, tail) in self.rows.iter().zip(&self.tails) {
+            codewords.push(encode_row_fp3(&plan.mask_code, row, tail)?);
+        }
+        RuntimeTree::commit(
+            plan.tree.clone(),
+            &[RuntimePartRows {
+                main: Vec::new(),
+                mask: codewords,
+                main_deg: 1,
+            }],
+            &self.salts,
+        )
+    }
+
+    /// The compact mask entry at one slot.
+    pub fn entry(&self, plan: &NormMaskPlan, slot: usize) -> Result<Fp3> {
+        let offset = plan.entry_offset(slot)?;
+        let ell = usize::try_from(plan.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
+        self.rows
+            .get(offset / ell)
+            .and_then(|row| row.get(offset % ell))
+            .copied()
+            .ok_or(Error::ShapeMismatch)
+    }
+}
+
+/// Commits the mask-only norm message from its private rows.
+pub fn commit_norm_mask(
+    plan: &NormMaskPlan,
+    rows: Vec<Vec<Fp3>>,
+    tails: Vec<Vec<Fp3>>,
+    salts: Vec<Vec<u8>>,
+) -> Result<CommittedNormMask> {
+    let committed = CommittedNormMask {
+        root: Digest::ZERO,
+        rows,
+        tails,
+        salts,
+    };
+    let root = *committed.tree(plan)?.root();
+    Ok(CommittedNormMask { root, ..committed })
+}
+
+/// The compact mask entries of every product-sumcheck instance, in instance
+/// order: hiding entries first and the two shown masks last.
+pub fn norm_mask_entries(
+    plan: &NormMaskPlan,
+    mask: &CommittedNormMask,
+    relations: usize,
+) -> Result<Vec<DotMaskEntries>> {
+    let instances = plan.instances(relations)?;
+    let mut entries = Vec::with_capacity(instances);
+    for instance in 0..instances {
+        let mut hiding = Vec::with_capacity(plan.hiding);
+        for index in 0..plan.hiding {
+            hiding.push(mask.entry(plan, plan.hiding_slot(instance, index)?)?);
+        }
+        let shown = [
+            mask.entry(plan, plan.shown_slot(instance, 0)?)?,
+            mask.entry(plan, plan.shown_slot(instance, 1)?)?,
+        ];
+        entries.push(DotMaskEntries { hiding, shown });
+    }
+    Ok(entries)
+}
+
+/// The prover-side mask witness of the integrated norm relation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormMaskWitness {
+    pub committed: CommittedNormMask,
+    /// One mask entry set per product-sumcheck instance.
+    pub entries: Vec<DotMaskEntries>,
 }
 
 /// The prover-side witness of the integrated norm groups.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormWitness {
+    /// The private integer rows the norm relation consumes.
+    pub rows: Vec<Vec<i64>>,
+    /// The exact integer core of every row.
+    pub core: Vec<NormCoreRow>,
     pub x: NormGroupWitness,
     pub sum: NormGroupWitness,
     pub squares: NormGroupWitness,
     pub mean: NormGroupWitness,
     pub variance: NormGroupWitness,
-    pub mask_rows: Vec<Vec<Fp3>>,
-    pub mask_tails: Vec<Vec<Fp3>>,
+    pub mask: Option<NormMaskWitness>,
+}
+
+/// One checked product-sumcheck instance of the norm relation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormPositionBinding {
+    pub position: u32,
+    /// The relation index, in the plan's relation order.
+    pub relation: usize,
+    pub output: DotOutput,
+}
+
+/// The checked product-sumcheck bindings of every instance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormRowBinding {
+    pub positions: Vec<NormPositionBinding>,
 }
 
 /// The public first-stage message of the integrated norm relation.
@@ -1276,10 +1556,28 @@ mod tests {
 
     fn integrated_fixture() -> (NormPlan, NormFirstMessages, NormPscSecond) {
         let (psc, _rows, first, second) = fixture();
+        let selected = (0..psc.shape.positions as usize)
+            .flat_map(|position| {
+                [0usize, 1]
+                    .into_iter()
+                    .map(move |relation| position * NORM_PSC_RELATIONS + relation)
+            })
+            .collect::<Vec<_>>();
+        let second = NormPscSecond {
+            psc: selected
+                .iter()
+                .map(|index| second.psc[*index].clone())
+                .collect(),
+            point_values: selected
+                .iter()
+                .map(|index| second.point_values[*index])
+                .collect(),
+        };
         let plan = NormPlan {
             shape: psc.shape,
             columns: psc.columns,
             variables: psc.variables,
+            relations: vec![0, 1],
             x: integrated_group(&psc.groups.x),
             x_roots: psc.groups.x.roots.clone(),
             sum: integrated_group(&psc.groups.sum),
@@ -1339,7 +1637,7 @@ mod tests {
             oracle: 7000,
             group: 7001,
             mask_code: build_code_plan(4, 8, 1).unwrap(),
-            mask_rows: 1,
+            mask_rows: 8,
             answers: 1,
             openings: 1,
             tree: zkie_engine::pcs::request::runtime_tree::RuntimeTreePlan {
@@ -1349,14 +1647,14 @@ mod tests {
                 log_n_zk: 4,
                 parts: vec![RuntimeTreePart {
                     main_symbols: 0,
-                    mask_symbols: 1,
+                    mask_symbols: 24,
                 }],
                 salt_bytes: 40,
                 run: Digest([0x71; 32]),
                 configuration: Digest([0x72; 32]),
             },
             positions: 2,
-            hiding: 1,
+            hiding: 9,
             shown: 2,
             claims: 1,
         }

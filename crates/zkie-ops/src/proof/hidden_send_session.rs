@@ -262,7 +262,11 @@ use crate::proof::output_closure::{
     ClosureRandomness, ClosureRowBinding, ClosureSecondMessages, ClosureWitness,
     CommittedClosureMask, CommittedGroupMessage, CommittedValueGroup, RetainedTrees,
 };
-use crate::proof::hidden_norm_psc::{NormFirstMessages, NormPlan, NormPscSecond, NormWitness};
+use crate::proof::hidden_norm_psc::{
+    NormFirstMessages, NormGroupPlan, NormGroupWitness, NormMaskMessage, NormMaskPlan,
+    NormMaskWitness, NormPlan, NormPositionBinding, NormPscSecond, NormRowBinding, NormWitness,
+};
+use crate::proof::committed_psc::CommittedPscGroup;
 use crate::proof::base_final_session::{
     fold_identity, BaseFinalCheck, BaseFinalOutcome, BaseFinalRows, BaseFinalSession, BaseMessages,
     BaseCommitment, BaseOpening, BaseOpenings, BaseProver, FoldBasis, FoldMember,
@@ -4329,13 +4333,13 @@ impl HiddenProximityPlan {
         }
         if let Some(norm) = norm {
             for group in [&norm.x, &norm.sum, &norm.squares, &norm.mean, &norm.variance] {
-                if group.shape.code != self.code {
-                    return Some("a norm group does not share the proximity main code");
+                if group.shape.code != self.code || group.group != send.group {
+                    return Some("a norm group does not share the proximity group");
                 }
             }
             if let Some(mask) = &norm.mask {
-                if mask.mask_code != self.mask_code {
-                    return Some("the norm mask does not share the proximity mask code");
+                if mask.mask_code != self.mask_code || mask.group != send.group {
+                    return Some("the norm mask does not share the proximity mask group");
                 }
             }
         }
@@ -4562,6 +4566,15 @@ impl HiddenProximityPlan {
                 Some(rows) => rows,
                 None => return Some("the own mask row count overflows"),
             };
+        }
+        if let Some(norm) = norm {
+            if let Some(mask) = &norm.mask {
+                let rows = mask.mask_rows.next_power_of_two();
+                own_mask_rows = match own_mask_rows.checked_add(rows) {
+                    Some(rows) => rows,
+                    None => return Some("the own mask row count overflows"),
+                };
+            }
         }
         if own_mask_rows == 0 {
             own_mask_rows = 1;
@@ -4838,7 +4851,7 @@ impl HiddenLinPlan {
     }
 
     fn parameters_digest(&self) -> Digest {
-        match &self.closure {
+        let base = match &self.closure {
             Some(closure) => {
                 let mut writer = CanonicalWriter::new();
                 writer.put_bytes(&self.send.parameters_digest().0);
@@ -4848,6 +4861,16 @@ impl HiddenLinPlan {
                     .unwrap_or(Digest::ZERO)
             }
             None => self.send.parameters_digest(),
+        };
+        match &self.norm {
+            Some(norm) => {
+                let mut writer = CanonicalWriter::new();
+                writer.put_bytes(&base.0);
+                writer.put_digest(&norm.digest());
+                hash_labeled(tag_word(PARAMETERS, 6), 0, None, &writer.into_bytes())
+                    .unwrap_or(Digest::ZERO)
+            }
+            None => base,
         }
     }
 
@@ -6526,6 +6549,7 @@ fn prove_first(
     table: &mut dyn HiddenTableProver,
     output: Option<&[Vec<Fp3>]>,
     randomness: &WCommitRandomness,
+    norm: Option<&NormWitness>,
 ) -> Result<(HiddenSendMessages, Digest, HiddenSendWitness)> {
     let _profile_first = zkie_engine::profile::Scope::new("first.prove_first");
     plan.validate()?;
@@ -6643,6 +6667,15 @@ fn prove_first(
         absorb_closure_group(&mut chain, 24, &closure.bits.group)?;
         absorb_closure_mask_root(&mut chain, &closure_plan.mask, &closure.mask.root)?;
     }
+    let norm_first = match (&plan.norm, norm) {
+        (Some(_), Some(norm_witness)) => {
+            let message = prove_norm_first(plan, &mut chain, norm_witness)?;
+            witness.norm = Some(norm_witness.clone());
+            Some(message)
+        }
+        (None, None) => None,
+        _ => return Err(Error::ShapeMismatch),
+    };
     let seeds = draw_seeds(&mut chain, &plan.send)?;
     let dot_seeds = match &plan.send.dot {
         Some(dot) => Some(draw_seed_set(&mut chain, dot.sample_bits()?, 1)?),
@@ -6982,7 +7015,7 @@ fn prove_first(
         dot,
         chain_value: first_seal,
         closure,
-        norm: None,
+        norm: norm_first,
     };
     Ok((messages, first_seal, witness))
 }
@@ -7135,6 +7168,11 @@ fn verify_first(
             absorb_closure_group(&mut chain, 24, &closure.bits.group)?;
             absorb_closure_mask_root(&mut chain, &closure_plan.mask, &closure.mask.root)?;
         }
+        (None, None) => {}
+        _ => return Err(Error::ShapeMismatch),
+    }
+    match (&plan.norm, &messages.norm) {
+        (Some(_), Some(message)) => verify_norm_first(&mut chain, plan, message)?,
         (None, None) => {}
         _ => return Err(Error::ShapeMismatch),
     }
@@ -8836,7 +8874,10 @@ fn own_members(
                 return Err(Error::StatementMismatch);
             }
             let (mask_rows, mask_tails) = match norm_witness {
-                Some(witness) => (witness.mask_rows.clone(), witness.mask_tails.clone()),
+                Some(witness) => match &witness.mask {
+                    Some(mask) => (mask.committed.rows.clone(), mask.committed.tails.clone()),
+                    None => (Vec::new(), Vec::new()),
+                },
                 None => (Vec::new(), Vec::new()),
             };
             members.push(ProximityMember {
@@ -8876,6 +8917,52 @@ fn own_sample_rows(
         members,
         zkie_engine::scheduling::DEFAULT_UNITS_IN_FLIGHT,
         |member| -> Result<Vec<GuRelationRow>> {
+        if let Some(norm_plan) = &plan.norm {
+            let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
+            let groups = norm_group_plans(norm_plan);
+            let messages = [
+                &norm_first.x,
+                &norm_first.sum,
+                &norm_first.squares,
+                &norm_first.mean,
+                &norm_first.variance,
+            ];
+            let positions = plan.send.positions() as u64;
+            for (group_plan, message) in groups.iter().zip(messages.iter()) {
+                let base = group_plan.oracle_base;
+                if member.source_oracle >= base
+                    && member.source_oracle < base.saturating_add(positions)
+                {
+                    let position = (member.source_oracle - base) as usize;
+                    let target = *message
+                        .sample
+                        .answers
+                        .get(position)
+                        .ok_or(Error::ShapeMismatch)?;
+                    return Ok(vec![oracle_sample_row(
+                        member.source_oracle,
+                        plan.send.group,
+                        &group_plan.shape.oracle_shape(),
+                        &message.sample.seed,
+                        0,
+                        target,
+                    )?]);
+                }
+            }
+            if let Some(mask_plan) = &norm_plan.mask {
+                if member.source_oracle == mask_plan.oracle {
+                    let message = norm_first.mask.as_ref().ok_or(Error::ShapeMismatch)?;
+                    let target = *message
+                        .sample
+                        .answers
+                        .first()
+                        .ok_or(Error::ShapeMismatch)?;
+                    let mut row = norm_mask_sample_row(mask_plan, message, target)?;
+                    row.group = plan.send.group;
+                    return Ok(vec![row]);
+                }
+            }
+        }
         if let (Some(closure_plan), Some(closure_first)) = (&plan.closure, &first.closure) {
             let positions = plan.send.positions() as u64;
             let slack_base = closure_plan.slack_oracle_base;
@@ -9020,6 +9107,891 @@ fn own_sample_rows(
 /// reconstruction rows, one bit end-value row, the `(U)` row and the virtual
 /// Omega row per position. Every row names the same committed members the
 /// existing Eval/tilde/Dot rows use for the reduced rows.
+// ---------------------------------------------------------------------------
+// Integrated norm relation
+// ---------------------------------------------------------------------------
+
+const NORM_ROOT_TAGS: [u64; 5] = [60, 61, 62, 63, 64];
+const NORM_MASK_ROOT_TAG: u64 = 65;
+const NORM_SEED_TAGS: [u64; 5] = [66, 67, 68, 69, 70];
+const NORM_MASK_SEED_TAG: u64 = 71;
+const NORM_ANSWER_TAGS: [u64; 5] = [72, 73, 74, 75, 76];
+const NORM_MASK_ANSWER_TAG: u64 = 77;
+const NORM_POSITION_TAGS: [u64; 5] = [78, 79, 80, 81, 82];
+const NORM_MASK_POSITION_TAG: u64 = 83;
+
+fn norm_group_plans(plan: &NormPlan) -> [&NormGroupPlan; 5] {
+    [&plan.x, &plan.sum, &plan.squares, &plan.mean, &plan.variance]
+}
+
+fn norm_group_witnesses(witness: &NormWitness) -> [&NormGroupWitness; 5] {
+    [
+        &witness.x,
+        &witness.sum,
+        &witness.squares,
+        &witness.mean,
+        &witness.variance,
+    ]
+}
+
+fn absorb_norm_mask_root(
+    chain: &mut Chain,
+    plan: &NormMaskPlan,
+    root: &Digest,
+) -> Result<()> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(NORM_MASK_ROOT_TAG);
+    message.push_u64(plan.oracle);
+    message.push_u64(plan.group);
+    message.push_u64(plan.mask_rows);
+    message.push_u64(plan.answers as u64);
+    message.push_u64(plan.mask_code.log_n as u64);
+    message.push_u64(plan.mask_code.ell);
+    message.push_u64(plan.mask_code.r);
+    push_tree_plan(&mut message, &plan.tree);
+    push_digest(&mut message, root);
+    let prefix = message.prefix(KIND_SEED, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
+fn draw_norm_mask_positions(chain: &mut Chain, plan: &NormMaskPlan) -> Result<Vec<u64>> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(NORM_MASK_POSITION_TAG);
+    message.push_u64(1);
+    message.push_u64(plan.openings as u64);
+    let prefix = message.prefix(KIND_POSITIONS, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    let mut positions = Vec::with_capacity(plan.openings);
+    for _ in 0..plan.openings {
+        positions.push(chain.draw_position(plan.mask_code.log_n)?);
+    }
+    Ok(unique_sorted(&positions))
+}
+
+fn norm_mask_answer(
+    plan: &NormMaskPlan,
+    rows: &[Vec<Fp3>],
+    seed: &SampleSeed,
+) -> Result<Fp3> {
+    if plan.oracle == 0 || plan.group == 0 || plan.answers != 1 {
+        return Err(Error::InvalidConfig);
+    }
+    let bits = plan.sample_bits()?;
+    if seed.z.len() < bits as usize || seed.beta == Fp3::ZERO {
+        return Err(Error::ShapeMismatch);
+    }
+    let ell = usize::try_from(plan.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
+    let mask_rows = usize::try_from(plan.mask_rows).map_err(|_| Error::ResourceLimit)?;
+    if rows.len() != mask_rows || rows.iter().any(|row| row.len() != ell) {
+        return Err(Error::ShapeMismatch);
+    }
+    let row_bits = ceil_log2_u64(plan.mask_rows);
+    let point = &seed.z[..bits as usize];
+    let count = 1u64.checked_shl(bits).ok_or(Error::ResourceLimit)?;
+    let mut answer = Fp3::ZERO;
+    for index in 0..count {
+        let row = (index & ((1u64 << row_bits) - 1)) as usize;
+        let place = (index >> row_bits) as usize;
+        if row >= mask_rows || place >= ell {
+            continue;
+        }
+        let coefficient = if row + 1 == mask_rows && place + 1 == ell {
+            seed.beta
+        } else {
+            eq_index(point, index, bits)?
+        };
+        answer = answer.add(&coefficient.mul(&rows[row][place]));
+    }
+    Ok(answer)
+}
+
+fn norm_mask_sample_row(
+    plan: &NormMaskPlan,
+    message: &NormMaskMessage,
+    target: Fp3,
+) -> Result<GuRelationRow> {
+    if message.sample.answers.len() != 1 || message.sample.seed.len() < 1 {
+        return Err(Error::ShapeMismatch);
+    }
+    let seed = &message.sample.seed[0];
+    let bits = plan.sample_bits()?;
+    if seed.z.len() < bits as usize || seed.beta == Fp3::ZERO {
+        return Err(Error::ShapeMismatch);
+    }
+    let ell = usize::try_from(plan.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
+    let mask_rows = usize::try_from(plan.mask_rows).map_err(|_| Error::ResourceLimit)?;
+    let mut mask = vec![Fp3::ZERO; mask_rows * ell];
+    let row_bits = ceil_log2_u64(plan.mask_rows);
+    let stride = 1usize.checked_shl(row_bits).ok_or(Error::ResourceLimit)?;
+    let point = &seed.z[..bits as usize];
+    let count = 1u64.checked_shl(bits).ok_or(Error::ResourceLimit)?;
+    for index in 0..count {
+        let row = (index & (stride as u64 - 1)) as usize;
+        let place = (index >> row_bits) as usize;
+        if row >= mask_rows || place >= ell {
+            continue;
+        }
+        let coefficient = if row + 1 == mask_rows && place + 1 == ell {
+            seed.beta
+        } else {
+            eq_index(point, index, bits)?
+        };
+        mask[row * ell + place] = coefficient;
+    }
+    Ok(GuRelationRow {
+        oracle: plan.oracle,
+        group: plan.group,
+        kind: GuRelationKind::Sample,
+        main: Vec::new(),
+        mask,
+        target,
+    })
+}
+
+fn prove_norm_first(
+    plan: &HiddenLinPlan,
+    chain: &mut Chain,
+    witness: &NormWitness,
+) -> Result<NormFirstMessages> {
+    let norm = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
+    let positions = norm.shape.positions;
+    let groups = norm_group_plans(norm);
+    let group_witnesses = norm_group_witnesses(witness);
+    if witness.rows.len() != positions as usize
+        || witness.core.len() != positions as usize
+        || witness.x.committed.roots != norm.x_roots
+    {
+        return Err(Error::StatementMismatch);
+    }
+    for (group_plan, group_witness) in groups.iter().zip(group_witnesses.iter()) {
+        if group_witness.committed.group.group != group_plan.group
+            || group_witness.committed.group.fault(positions).is_some()
+            || group_witness.committed.roots.len() != positions as usize
+            || group_witness.messages.len() != positions as usize
+            || group_witness.tails.len() != positions as usize
+            || group_witness.salts.len() != positions as usize
+            || group_witness.pads.len() != positions as usize
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        for (position, entry) in group_witness
+            .committed
+            .group
+            .entries
+            .iter()
+            .enumerate()
+        {
+            if entry.position != position as u32
+                || entry.oracle
+                    != group_plan
+                        .oracle_base
+                        .checked_add(position as u64)
+                        .ok_or(Error::ResourceLimit)?
+                || entry.shape != group_plan.shape.oracle_shape()
+                || entry.tree != group_plan.shape.tree_plan(position as u32)?
+                || entry.root == Digest::ZERO
+            {
+                return Err(Error::StatementMismatch);
+            }
+        }
+    }
+    let mask_witness = match (&norm.mask, &witness.mask) {
+        (Some(mask_plan), Some(mask_witness)) => {
+            let ell = usize::try_from(mask_plan.mask_code.ell)
+                .map_err(|_| Error::ResourceLimit)?;
+            let tail = usize::try_from(mask_plan.mask_code.r)
+                .map_err(|_| Error::ResourceLimit)?;
+            let rows = usize::try_from(mask_plan.mask_rows)
+                .map_err(|_| Error::ResourceLimit)?;
+            let columns = usize::try_from(mask_plan.tree.columns())
+                .map_err(|_| Error::ResourceLimit)?;
+            if mask_witness.committed.root == Digest::ZERO
+                || mask_witness.committed.rows.len() != rows
+                || mask_witness.committed
+                    .rows
+                    .iter()
+                    .any(|row| row.len() != ell)
+                || mask_witness.committed.tails.len() != rows
+                || mask_witness
+                    .committed
+                    .tails
+                    .iter()
+                    .any(|row| row.len() != tail)
+                || mask_witness.committed.salts.len() != columns
+                || mask_witness.committed.salts.iter().any(|salt| {
+                    salt.len() != mask_plan.tree.salt_bytes
+                })
+            {
+                return Err(Error::ShapeMismatch);
+            }
+            Some(mask_witness)
+        }
+        (None, None) => None,
+        _ => return Err(Error::ShapeMismatch),
+    };
+    for (tag, group_witness) in NORM_ROOT_TAGS.iter().zip(group_witnesses.iter()) {
+        absorb_closure_group(chain, *tag, &group_witness.committed.group)?;
+    }
+    if let (Some(mask_plan), Some(mask_witness)) = (&norm.mask, mask_witness) {
+        absorb_norm_mask_root(chain, mask_plan, &mask_witness.committed.root)?;
+    }
+    let mut seeds = Vec::with_capacity(groups.len());
+    for (tag, group_plan) in NORM_SEED_TAGS.iter().zip(groups.iter()) {
+        seeds.push(draw_closure_seed_set(
+            chain,
+            *tag,
+            group_plan.shape.sample_bits()?,
+            group_plan.shape.answers,
+        )?);
+    }
+    let mask_seeds = match norm.mask.as_ref() {
+        Some(mask_plan) => Some(draw_closure_seed_set(
+            chain,
+            NORM_MASK_SEED_TAG,
+            mask_plan.sample_bits()?,
+            mask_plan.answers,
+        )?),
+        None => None,
+    };
+    let mut answers = Vec::with_capacity(groups.len());
+    for (index, ((group_plan, group_witness), seed_set)) in groups
+        .iter()
+        .zip(group_witnesses.iter())
+        .zip(seeds.iter())
+        .enumerate()
+    {
+        let values = value_group_answers(
+            &group_plan.shape,
+            group_plan.oracle_base,
+            group_plan.group,
+            &group_witness.committed.messages,
+            seed_set,
+        )?;
+        absorb_tagged_answers(chain, NORM_ANSWER_TAGS[index], &values)?;
+        answers.push(values);
+    }
+    let mask_sample = match (
+        norm.mask.as_ref(),
+        mask_witness,
+        mask_seeds,
+    ) {
+        (Some(mask_plan), Some(mask_witness), Some(seed_set)) => {
+            let answer =
+                norm_mask_answer(mask_plan, &mask_witness.committed.rows, &seed_set[0])?;
+            absorb_tagged_answers(chain, NORM_MASK_ANSWER_TAG, &[answer])?;
+            Some((seed_set, answer))
+        }
+        (None, None, None) => None,
+        _ => return Err(Error::ShapeMismatch),
+    };
+    let mut group_messages = Vec::with_capacity(groups.len());
+    for (index, ((group_plan, group_witness), seed_set)) in groups
+        .iter()
+        .zip(group_witnesses.iter())
+        .zip(seeds.iter())
+        .enumerate()
+    {
+        let positions = draw_closure_group_positions(
+            chain,
+            NORM_POSITION_TAGS[index],
+            positions,
+            group_plan.openings,
+            group_plan.shape.code.log_n,
+        )?;
+        let openings = open_value_group_openings(
+            &group_plan.shape,
+            &group_witness.committed.messages,
+            &group_witness.tails,
+            &group_witness.salts,
+            &positions,
+            &group_witness.committed.trees,
+        )?;
+        group_messages.push(CommittedPscGroup {
+            message: CommittedGroupMessage::new(group_witness.committed.group.clone()),
+            sample: SendSamples {
+                seed: seed_set.clone(),
+                answers: answers[index].clone(),
+            },
+            positions,
+            openings,
+        });
+    }
+    let (mask_positions, mask_opening) = match (norm.mask.as_ref(), mask_witness) {
+        (Some(mask_plan), Some(mask_witness)) => {
+            let positions = draw_norm_mask_positions(chain, mask_plan)?;
+            let opening = mask_witness.committed.tree(mask_plan)?.open(&positions)?;
+            (positions, opening)
+        }
+        (None, None) => (Vec::new(), zkie_engine::pcs::request::runtime_tree::RuntimeTreeOpening {
+            positions: Vec::new(),
+            columns: Vec::new(),
+            given: Vec::new(),
+        }),
+        _ => return Err(Error::ShapeMismatch),
+    };
+    let mask = match (norm.mask.as_ref(), mask_sample) {
+        (Some(mask_plan), Some((seed_set, answer))) => Some(NormMaskMessage {
+            tree: mask_plan.tree.clone(),
+            root: mask_witness
+                .ok_or(Error::ShapeMismatch)?
+                .committed
+                .root,
+            sample: SendSamples {
+                seed: seed_set,
+                answers: vec![answer],
+            },
+            positions: mask_positions,
+            opening: mask_opening,
+        }),
+        (None, None) => None,
+        _ => return Err(Error::ShapeMismatch),
+    };
+    let mut iter = group_messages.into_iter();
+    Ok(NormFirstMessages {
+        x: iter.next().ok_or(Error::ShapeMismatch)?,
+        sum: iter.next().ok_or(Error::ShapeMismatch)?,
+        squares: iter.next().ok_or(Error::ShapeMismatch)?,
+        mean: iter.next().ok_or(Error::ShapeMismatch)?,
+        variance: iter.next().ok_or(Error::ShapeMismatch)?,
+        mask,
+    })
+}
+
+fn verify_norm_first(
+    chain: &mut Chain,
+    plan: &HiddenLinPlan,
+    message: &NormFirstMessages,
+) -> Result<()> {
+    let norm = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
+    let positions = norm.shape.positions;
+    let groups = norm_group_plans(norm);
+    let messages = [
+        &message.x,
+        &message.sum,
+        &message.squares,
+        &message.mean,
+        &message.variance,
+    ];
+    for (group_plan, message) in groups.iter().zip(messages.iter()) {
+        if message.message.group.group != group_plan.group
+            || message.fault(&group_plan.shape, positions).is_some()
+            || message.message.roots.len() != positions as usize
+        {
+            return Err(Error::StatementMismatch);
+        }
+        for (position, entry) in message.message.group.entries.iter().enumerate() {
+            if entry.position != position as u32
+                || entry.oracle
+                    != group_plan
+                        .oracle_base
+                        .checked_add(position as u64)
+                        .ok_or(Error::ResourceLimit)?
+                || entry.shape != group_plan.shape.oracle_shape()
+                || entry.tree != group_plan.shape.tree_plan(position as u32)?
+                || entry.root == Digest::ZERO
+            {
+                return Err(Error::StatementMismatch);
+            }
+        }
+    }
+    if message.x.message.roots != norm.x_roots {
+        return Err(Error::StatementMismatch);
+    }
+    match (&norm.mask, &message.mask) {
+        (Some(mask_plan), Some(mask)) => {
+            if mask.tree != mask_plan.tree
+                || mask.root == Digest::ZERO
+                || mask.sample.seed.len() != mask_plan.answers as usize
+                || mask.sample.answers.len() != mask_plan.answers as usize
+                || mask.positions.len() != mask_plan.openings
+                || mask.opening.positions != mask.positions
+            {
+                return Err(Error::StatementMismatch);
+            }
+        }
+        (None, None) => {}
+        _ => return Err(Error::ShapeMismatch),
+    }
+    for (tag, message) in NORM_ROOT_TAGS.iter().zip(messages.iter()) {
+        absorb_closure_group(chain, *tag, &message.message.group)?;
+    }
+    if let (Some(mask_plan), Some(mask)) = (&norm.mask, &message.mask) {
+        absorb_norm_mask_root(chain, mask_plan, &mask.root)?;
+    }
+    for (tag, (group_plan, message)) in NORM_SEED_TAGS
+        .iter()
+        .zip(groups.iter().zip(messages.iter()))
+    {
+        let seed_set = draw_closure_seed_set(
+            chain,
+            *tag,
+            group_plan.shape.sample_bits()?,
+            group_plan.shape.answers,
+        )?;
+        if seed_set != message.sample.seed {
+            return Err(Error::InvalidProof);
+        }
+    }
+    if let Some(mask_plan) = &norm.mask {
+        let seed_set = draw_closure_seed_set(
+            chain,
+            NORM_MASK_SEED_TAG,
+            mask_plan.sample_bits()?,
+            mask_plan.answers,
+        )?;
+        if seed_set != message.mask.as_ref().ok_or(Error::ShapeMismatch)?.sample.seed {
+            return Err(Error::InvalidProof);
+        }
+    }
+    for (index, message) in messages.iter().enumerate() {
+        if message.sample.answers.len() != positions as usize {
+            return Err(Error::ShapeMismatch);
+        }
+        absorb_tagged_answers(chain, NORM_ANSWER_TAGS[index], &message.sample.answers)?;
+    }
+    if let Some(mask) = &message.mask {
+        absorb_tagged_answers(chain, NORM_MASK_ANSWER_TAG, &mask.sample.answers)?;
+    }
+    for (index, (group_plan, message)) in groups.iter().zip(messages.iter()).enumerate() {
+        let positions = draw_closure_group_positions(
+            chain,
+            NORM_POSITION_TAGS[index],
+            positions,
+            group_plan.openings,
+            group_plan.shape.code.log_n,
+        )?;
+        if positions != message.positions
+            || message.openings.len() != message.positions.len()
+        {
+            return Err(Error::InvalidProof);
+        }
+        for (position, (list, opening)) in positions.iter().zip(&message.openings).enumerate() {
+            if opening.positions != *list {
+                return Err(Error::InvalidIndex);
+            }
+            let tree = group_plan.shape.tree_plan(position as u32)?;
+            let root = message
+                .message
+                .group
+                .entries
+                .get(position)
+                .map(|entry| entry.root)
+                .ok_or(Error::ShapeMismatch)?;
+            verify_runtime_opening(&tree, &root, list, opening)?;
+        }
+    }
+    if let (Some(mask_plan), Some(mask)) = (&norm.mask, &message.mask) {
+        let positions = draw_norm_mask_positions(chain, mask_plan)?;
+        if positions != mask.positions || mask.opening.positions != mask.positions {
+            return Err(Error::InvalidProof);
+        }
+        verify_runtime_opening(
+            &mask_plan.tree,
+            &mask.root,
+            &mask.positions,
+            &mask.opening,
+        )?;
+    }
+    Ok(())
+}
+
+fn prove_norm_second(
+    chain: &mut Chain,
+    plan: &NormPlan,
+    first: &NormFirstMessages,
+    witness: &NormWitness,
+) -> Result<(NormPscSecond, NormRowBinding)> {
+    let positions = plan.shape.positions as usize;
+    let relations = plan.relations.clone();
+    let valid = plan.shape.valid as usize;
+    let columns = usize::try_from(plan.columns).map_err(|_| Error::ResourceLimit)?;
+    let mask_plan = plan.mask.as_ref().ok_or(Error::InvalidConfig)?;
+    let mask_witness = witness.mask.as_ref().ok_or(Error::ShapeMismatch)?;
+    if first.mask.is_none()
+        || witness.rows.len() != positions
+        || witness.core.len() != positions
+        || witness.rows.iter().any(|row| row.len() != plan.shape.hidden as usize)
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let instances = positions
+        .checked_mul(relations.len())
+        .ok_or(Error::ResourceLimit)?;
+    if mask_witness.entries.len() != instances
+        || mask_plan.hiding != mask_witness.entries[0].hiding.len()
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let claim = DotClaim {
+        masks: Vec::new(),
+        target: Fp3::ZERO,
+    };
+    let mut psc = Vec::with_capacity(instances);
+    let mut point_values = Vec::with_capacity(instances);
+    let mut bindings = Vec::with_capacity(instances);
+    for position in 0..positions {
+        for (relation_index, relation) in relations.iter().enumerate() {
+            let (left, right) = crate::proof::hidden_norm_psc::rel_map(
+                &witness.core[position],
+                &witness.rows[position],
+                valid,
+                columns,
+                *relation,
+            )?;
+            let instance = position * relations.len() + relation_index;
+            let entries = &mask_witness.entries[instance];
+            let mut challenges = crate::proof::committed_psc::PositionPscChallenges::new(
+                chain,
+                crate::proof::hidden_norm_psc::NORM_PSC_TAGS,
+                instance as u64,
+            );
+            let (proof, output) = crate::proof::psc::prove_dot_sumcheck(
+                &left,
+                &right,
+                &claim,
+                entries,
+                &mut challenges,
+            )?;
+            psc.push(proof);
+            point_values.push([output.ends[0].value, output.ends[1].value]);
+            bindings.push(NormPositionBinding {
+                position: position as u32,
+                relation: *relation,
+                output,
+            });
+        }
+    }
+    Ok((
+        NormPscSecond { psc, point_values },
+        NormRowBinding {
+            positions: bindings,
+        },
+    ))
+}
+
+fn verify_norm_second(
+    chain: &mut Chain,
+    plan: &NormPlan,
+    first: &NormFirstMessages,
+    messages: &NormPscSecond,
+) -> Result<NormRowBinding> {
+    let positions = plan.shape.positions as usize;
+    let relations = plan.relations.clone();
+    let variables = plan.variables;
+    let mask_plan = plan.mask.as_ref().ok_or(Error::InvalidConfig)?;
+    if first.mask.is_none() {
+        return Err(Error::ShapeMismatch);
+    }
+    messages.check_for(plan)?;
+    let instances = positions
+        .checked_mul(relations.len())
+        .ok_or(Error::ResourceLimit)?;
+    let weights = psc_variables(variables).map_err(|_| Error::InvalidConfig)?;
+    let hiding = hp_entries(&weights).map_err(|_| Error::InvalidConfig)?;
+    if hiding != mask_plan.hiding {
+        return Err(Error::InvalidConfig);
+    }
+    let entries = DotMaskEntries {
+        hiding: vec![Fp3::ZERO; hiding],
+        shown: [Fp3::ZERO; SHOWN_MAPS],
+    };
+    let claim = DotClaim {
+        masks: Vec::new(),
+        target: Fp3::ZERO,
+    };
+    let mut bindings = Vec::with_capacity(instances);
+    for position in 0..positions {
+        for (relation_index, relation) in relations.iter().enumerate() {
+            let instance = position * relations.len() + relation_index;
+            let proof = messages
+                .psc
+                .get(instance)
+                .ok_or(Error::ShapeMismatch)?;
+            let mut challenges = crate::proof::committed_psc::PositionPscChallenges::new(
+                chain,
+                crate::proof::hidden_norm_psc::NORM_PSC_TAGS,
+                instance as u64,
+            );
+            let output = crate::proof::psc::verify_psc_transcript(
+                &claim,
+                &entries,
+                proof,
+                variables,
+                &mut challenges,
+            )?;
+            let expected = [
+                output.ends[0].value,
+                output.ends[1].value,
+            ];
+            if messages
+                .point_values
+                .get(instance)
+                .copied()
+                .ok_or(Error::ShapeMismatch)?
+                != expected
+            {
+                return Err(Error::InvalidProof);
+            }
+            bindings.push(NormPositionBinding {
+                position: position as u32,
+                relation: *relation,
+                output,
+            });
+        }
+    }
+    Ok(NormRowBinding {
+        positions: bindings,
+    })
+}
+
+fn scatter_message_coefficients(
+    shape: &WShape,
+    columns: u64,
+    coefficients: &[Fp3],
+) -> Result<Vec<Fp3>> {
+    let rows = usize::try_from(shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+    let ell = usize::try_from(shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let mut values = vec![Fp3::ZERO; rows.checked_mul(ell).ok_or(Error::ResourceLimit)?];
+    for (column, coefficient) in coefficients
+        .iter()
+        .enumerate()
+        .take(usize::try_from(columns).map_err(|_| Error::ResourceLimit)?)
+    {
+        if coefficient.is_zero() {
+            continue;
+        }
+        let row = column % rows;
+        let place = column / rows;
+        let slot = values
+            .get_mut(row * ell + place)
+            .ok_or(Error::ShapeMismatch)?;
+        *slot = *coefficient;
+    }
+    to_bat_table(&values, shape.main_rows, shape.code.ell)
+}
+
+fn scalar_message_coefficients(shape: &WShape, coefficient: Fp3) -> Result<Vec<Fp3>> {
+    let rows = usize::try_from(shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+    let ell = usize::try_from(shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let mut values = vec![Fp3::ZERO; rows.checked_mul(ell).ok_or(Error::ResourceLimit)?];
+    let slot = values.first_mut().ok_or(Error::ShapeMismatch)?;
+    *slot = coefficient;
+    to_bat_table(&values, shape.main_rows, shape.code.ell)
+}
+
+fn norm_plain_rows(
+    plan: &HiddenLinPlan,
+    members: &[ProximityMember],
+    first: &HiddenSendMessages,
+    binding: &NormRowBinding,
+) -> Result<Vec<BatRow>> {
+    let norm = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
+    let mask_plan = norm.mask.as_ref().ok_or(Error::InvalidConfig)?;
+    let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
+    if norm_first.mask.is_none() {
+        return Err(Error::ShapeMismatch);
+    }
+    let positions = plan.send.positions() as usize;
+    let relations = norm.relations.len();
+    if binding.positions.len() != positions * relations {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut bat_of = std::collections::HashMap::new();
+    for member in members {
+        bat_of.insert(member.source_oracle, member);
+    }
+    let mask_member = bat_of
+        .get(&mask_plan.oracle)
+        .ok_or(Error::StatementMismatch)?;
+    if mask_member.mask_rows != mask_plan.mask_rows
+        || mask_member.mask_code != mask_plan.mask_code
+        || mask_member.answers != mask_plan.answers
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let valid = norm.shape.valid as usize;
+    let columns = usize::try_from(norm.columns).map_err(|_| Error::ResourceLimit)?;
+    let mut rows = Vec::with_capacity(binding.positions.len());
+    for (index, word) in binding.positions.iter().enumerate() {
+        let position = index / relations;
+        let relation_index = index % relations;
+        if word.position as usize != position
+            || word.relation != norm.relations[relation_index]
+            || word.output.point.len() != norm.variables
+            || word
+                .output
+                .ends
+                .iter()
+                .any(|end| end.point != word.output.point)
+        {
+            return Err(Error::InvalidProof);
+        }
+        let eq = crate::proof::output_closure::eq_vector(&word.output.point)?;
+        if eq.len() != 2 * columns {
+            return Err(Error::ShapeMismatch);
+        }
+        let x_member = bat_of
+            .get(
+                &norm
+                    .x
+                    .oracle_base
+                    .checked_add(position as u64)
+                    .ok_or(Error::ResourceLimit)?,
+            )
+            .ok_or(Error::StatementMismatch)?;
+        let instance = index;
+        let shown0 = mask_plan.shown_slot(instance, 0)?;
+        let shown1 = mask_plan.shown_slot(instance, 1)?;
+        let mut x_coefficients = vec![Fp3::ZERO; 2 * columns];
+        for entry in 0..valid.min(columns) {
+            x_coefficients[entry] = eq[entry];
+        }
+        let eq_sum = eq[..valid.min(columns)]
+            .iter()
+            .fold(Fp3::ZERO, |sum, value| sum.add(value));
+        match word.relation {
+            0 => {
+                let sum_member = bat_of
+                    .get(
+                        &norm
+                            .sum
+                            .oracle_base
+                            .checked_add(position as u64)
+                            .ok_or(Error::ResourceLimit)?,
+                    )
+                    .ok_or(Error::StatementMismatch)?;
+                let mut row = BatRow::new(BatRowKind::Plain);
+                row.add_term(
+                    x_member.bat_oracle,
+                    BatPart::Main,
+                    scatter_message_coefficients(&norm.x.shape, norm.columns, &x_coefficients)?,
+                );
+                row.add_term(
+                    sum_member.bat_oracle,
+                    BatPart::Main,
+                    scalar_message_coefficients(
+                        &norm.sum.shape,
+                        Fp3::ZERO.sub(&eq[columns]),
+                    )?,
+                );
+                row.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown0)?,
+                    word.output.ends[0].mask_scale,
+                );
+                row.target = word.output.ends[0].value;
+                rows.push(row);
+
+                let constant = eq_sum.add(&eq[columns]);
+                let mut row = BatRow::new(BatRowKind::Plain);
+                row.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown1)?,
+                    word.output.ends[1].mask_scale,
+                );
+                row.target = word.output.ends[1].value.sub(&constant);
+                rows.push(row);
+            }
+            1 => {
+                let mean_member = bat_of
+                    .get(
+                        &norm
+                            .mean
+                            .oracle_base
+                            .checked_add(position as u64)
+                            .ok_or(Error::ResourceLimit)?,
+                    )
+                    .ok_or(Error::StatementMismatch)?;
+                let squares_member = bat_of
+                    .get(
+                        &norm
+                            .squares
+                            .oracle_base
+                            .checked_add(position as u64)
+                            .ok_or(Error::ResourceLimit)?,
+                    )
+                    .ok_or(Error::StatementMismatch)?;
+                let mut left = BatRow::new(BatRowKind::Plain);
+                left.add_term(
+                    x_member.bat_oracle,
+                    BatPart::Main,
+                    scatter_message_coefficients(&norm.x.shape, norm.columns, &x_coefficients)?,
+                );
+                left.add_term(
+                    mean_member.bat_oracle,
+                    BatPart::Main,
+                    scalar_message_coefficients(
+                        &norm.mean.shape,
+                        Fp3::ZERO.sub(&eq_sum),
+                    )?,
+                );
+                left.add_term(
+                    squares_member.bat_oracle,
+                    BatPart::Main,
+                    scalar_message_coefficients(
+                        &norm.squares.shape,
+                        Fp3::ZERO.sub(&eq[columns]),
+                    )?,
+                );
+                left.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown0)?,
+                    word.output.ends[0].mask_scale,
+                );
+                left.target = word.output.ends[0].value;
+                rows.push(left);
+
+                let mut right = BatRow::new(BatRowKind::Plain);
+                right.add_term(
+                    x_member.bat_oracle,
+                    BatPart::Main,
+                    scatter_message_coefficients(&norm.x.shape, norm.columns, &x_coefficients)?,
+                );
+                right.add_term(
+                    mean_member.bat_oracle,
+                    BatPart::Main,
+                    scalar_message_coefficients(
+                        &norm.mean.shape,
+                        Fp3::ZERO.sub(&eq_sum),
+                    )?,
+                );
+                right.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown1)?,
+                    word.output.ends[1].mask_scale,
+                );
+                right.target = word.output.ends[1].value.sub(&eq[columns]);
+                rows.push(right);
+            }
+            _ => return Err(Error::UnsupportedPrimitive),
+        }
+        let mut row = BatRow::new(BatRowKind::Plain);
+        for (entry, coefficient) in word.output.hiding_form.iter().enumerate() {
+            let slot = mask_plan.hiding_slot(instance, entry)?;
+            row.add_unit(
+                mask_member.bat_oracle,
+                BatPart::Mask,
+                mask_plan.entry_virtual_index(slot)?,
+                *coefficient,
+            );
+        }
+        row.target = word.output.row_target;
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
 fn closure_plain_rows(
     plan: &HiddenLinPlan,
     members: &[ProximityMember],
@@ -9334,6 +10306,7 @@ fn own_plain_rows(
     tilde: &[Fp3],
     dot: Option<&DotRowBinding>,
     closure: Option<&ClosureRowBinding>,
+    norm: Option<&NormRowBinding>,
 ) -> Result<Vec<BatRow>> {
     let mut bat_of = std::collections::HashMap::new();
     for member in members {
@@ -9453,6 +10426,9 @@ fn own_plain_rows(
     }
     if let Some(binding) = closure {
         rows.extend(closure_plain_rows(plan, members, first, binding)?);
+    }
+    if let Some(binding) = norm {
+        rows.extend(norm_plain_rows(plan, members, first, binding)?);
     }
     Ok(rows)
 }
@@ -10136,6 +11112,19 @@ fn prove_second(
         (None, None) => (None, None),
         _ => return Err(Error::ShapeMismatch),
     };
+    let (norm_proof, norm_binding) = match (
+        plan.norm.as_ref(),
+        witness.norm.as_ref(),
+        first.norm.as_ref(),
+    ) {
+        (Some(norm_plan), Some(norm_witness), Some(first_norm)) => {
+            let (proof, binding) =
+                prove_norm_second(&mut chain, norm_plan, first_norm, norm_witness)?;
+            (Some(proof), Some(binding))
+        }
+        (None, None, None) => (None, None),
+        _ => return Err(Error::ShapeMismatch),
+    };
     let _profile_sample_rows = zkie_engine::profile::Scope::new("second.sample_rows");
     let sample_rows = own_sample_rows(plan, &members, first, shared)?;
     drop(_profile_sample_rows);
@@ -10148,6 +11137,7 @@ fn prove_second(
         &tilde,
         dot_binding.as_ref(),
         closure_binding.as_ref(),
+        norm_binding.as_ref(),
     )?;
     drop(_profile_plain_rows);
     let fold = member_fold_shape(
@@ -10194,7 +11184,7 @@ fn prove_second(
             residual: dot_binding.as_ref().map(|binding| binding.residual),
             dot: dot_proof,
             closure: closure_proof,
-            norm: None,
+            norm: norm_proof,
             fold_start: proximity.messages.fold_start.clone(),
             fold_rounds: proximity.messages.fold_rounds.clone(),
             tail: proximity.messages.tail,
@@ -10212,6 +11202,31 @@ fn witness_tree_for(
     plan: &HiddenLinPlan,
 ) -> Result<Arc<RuntimeTree>> {
     let _ = first;
+    if let Some(norm_plan) = &plan.norm {
+        let norm_witness = witness.norm.as_ref().ok_or(Error::ShapeMismatch)?;
+        let groups = norm_group_plans(norm_plan);
+        let group_witnesses = norm_group_witnesses(norm_witness);
+        let positions = plan.send.positions() as u64;
+        for (group_plan, group_witness) in groups.iter().zip(group_witnesses.iter()) {
+            let base = group_plan.oracle_base;
+            if member.source_oracle >= base
+                && member.source_oracle < base.saturating_add(positions)
+            {
+                let position = (member.source_oracle - base) as usize;
+                return retained_member_tree(
+                    &group_witness.committed.trees,
+                    position,
+                    member,
+                );
+            }
+        }
+        if let Some(mask_plan) = &norm_plan.mask {
+            if member.source_oracle == mask_plan.oracle {
+                let mask = norm_witness.mask.as_ref().ok_or(Error::ShapeMismatch)?;
+                return Ok(Arc::new(mask.committed.tree(mask_plan)?));
+            }
+        }
+    }
     if let Some(closure_plan) = &plan.closure {
         let positions = plan.send.positions() as u64;
         let closure = witness.closure.as_ref().ok_or(Error::ShapeMismatch)?;
@@ -10379,6 +11394,13 @@ fn verify_second(
         _ => return Err(Error::ShapeMismatch),
     };
     drop(_profile_closure);
+    let norm_binding = match (&plan.norm, &messages.norm, &first.norm) {
+        (Some(norm_plan), Some(norm_messages), Some(first_norm)) => Some(
+            verify_norm_second(&mut chain, norm_plan, first_norm, norm_messages)?,
+        ),
+        (None, None, None) => None,
+        _ => return Err(Error::ShapeMismatch),
+    };
     let _profile_plain_rows = zkie_engine::profile::Scope::new("verify.second.plain_rows");
     let plain_rows = own_plain_rows(
         plan,
@@ -10388,6 +11410,7 @@ fn verify_second(
         &messages.tilde,
         dot_binding.as_ref(),
         closure_binding.as_ref(),
+        norm_binding.as_ref(),
     )?;
     drop(_profile_plain_rows);
     let fold = member_fold_shape(
@@ -10445,6 +11468,7 @@ fn prove_hidden_lin_inner(
     output: Option<&[Vec<Fp3>]>,
     seed: Digest,
     bind_residual: bool,
+    norm: Option<&NormWitness>,
 ) -> Result<(HiddenLinMessages, HiddenLinWitness)> {
     let _profile_session = zkie_engine::profile::Scope::new("session.prove_hidden_lin_inner");
     plan.validate()?;
@@ -10461,7 +11485,7 @@ fn prove_hidden_lin_inner(
     )?;
     drop(_profile_randomness);
     let (first, first_seal, send_witness) =
-        prove_first(plan, activation, table, output, &randomness)?;
+        prove_first(plan, activation, table, output, &randomness, norm)?;
     let first_query = *first_chain(plan, &reader)?.value();
     let shared = prove_shared(plan, &reader, table, &first_seal, &seed)?;
     let own = prove_second(
@@ -10508,7 +11532,7 @@ pub fn prove_hidden_lin(
     if plan.weights.is_empty() {
         return Err(Error::InvalidConfig);
     }
-    prove_hidden_lin_inner(plan, activation, table, Some(output), seed, true)
+    prove_hidden_lin_inner(plan, activation, table, Some(output), seed, true, None)
 }
 
 /// Prover entry of the merged three-stage run in the hidden-input mode. The
@@ -10521,10 +11545,26 @@ pub fn prove_hidden_lin_hidden(
     table: &mut dyn HiddenTableProver,
     seed: Digest,
 ) -> Result<(HiddenLinMessages, HiddenLinWitness)> {
-    if !plan.weights.is_empty() {
+    if !plan.weights.is_empty() || plan.norm.is_some() {
         return Err(Error::InvalidConfig);
     }
-    prove_hidden_lin_inner(plan, activation, table, None, seed, true)
+    prove_hidden_lin_inner(plan, activation, table, None, seed, true, None)
+}
+
+/// Prover entry of the hidden-input mode with the private norm witness. The
+/// norm groups are committed and sampled before the second stage draws its
+/// challenges; the witness never enters the proof bytes.
+pub fn prove_hidden_lin_hidden_with_norm(
+    plan: &HiddenLinPlan,
+    activation: &CommittedActivation,
+    table: &mut dyn HiddenTableProver,
+    seed: Digest,
+    norm: &NormWitness,
+) -> Result<(HiddenLinMessages, HiddenLinWitness)> {
+    if !plan.weights.is_empty() || plan.norm.is_none() {
+        return Err(Error::InvalidConfig);
+    }
+    prove_hidden_lin_inner(plan, activation, table, None, seed, true, Some(norm))
 }
 
 /// Test-only prover entry that omits the residual absorption before the
@@ -10541,7 +11581,7 @@ fn prove_hidden_lin_hidden_unbound_residual(
     if !plan.weights.is_empty() {
         return Err(Error::InvalidConfig);
     }
-    prove_hidden_lin_inner(plan, activation, table, None, seed, false)
+    prove_hidden_lin_inner(plan, activation, table, None, seed, false, None)
 }
 
 fn verify_hidden_lin_inner(
@@ -12816,6 +13856,7 @@ mod merged_tests {
                 .unwrap(),
             columns,
             variables: columns.trailing_zeros() as usize + 1,
+            relations: vec![0, 1],
             x: norm_group(columns, 80, 9000, 60000),
             x_roots: (0..POSITIONS)
                 .map(|position| Digest([0x90 + position as u8; 32]))
@@ -12833,25 +13874,25 @@ mod merged_tests {
             oracle: 9500,
             group: 85,
             mask_code: mask_code(),
-            mask_rows: 1,
+            mask_rows: 4,
             answers: 1,
             openings: 1,
             tree: zkie_engine::pcs::request::runtime_tree::RuntimeTreePlan {
                 tree_number: 60500,
                 leaf_class: 1,
-                log_n: 4,
-                log_n_zk: 4,
+                log_n: 6,
+                log_n_zk: 6,
                 parts: vec![zkie_engine::pcs::request::runtime_tree::RuntimeTreePart {
                     main_symbols: 0,
-                    mask_symbols: 1,
+                    mask_symbols: 12,
                 }],
                 salt_bytes: SALT,
                 run: W_RUN,
                 configuration: W_CONFIGURATION,
             },
             positions: POSITIONS,
-            hiding: 1,
-            shown: 1,
+            hiding: 9,
+            shown: 2,
             claims: 1,
         }
     }
@@ -12863,7 +13904,16 @@ mod merged_tests {
         let plan = plan(&activation);
         let positions = plan.send.positions() as u64;
         let without = proximity_bound_ids(&plan.proximity, &plan.send, None, None).unwrap();
-        let norm = norm_plan();
+        let mut norm = norm_plan();
+        for group in [
+            &mut norm.x,
+            &mut norm.sum,
+            &mut norm.squares,
+            &mut norm.mean,
+            &mut norm.variance,
+        ] {
+            group.group = plan.send.group;
+        }
         norm.validate().unwrap();
         let mut integrated = plan.clone();
         integrated.norm = Some(norm.clone());
@@ -12896,6 +13946,374 @@ mod merged_tests {
         assert!(with_mask.trees.contains(&60500));
         assert!(!with.oracles.contains(&9500));
         assert!(!with.trees.contains(&60500));
+    }
+
+    fn norm_values(row: &[i64], columns: u64) -> Vec<Fp3> {
+        let mut values = vec![Fp3::ZERO; columns as usize];
+        for (slot, value) in values.iter_mut().zip(row.iter()) {
+            *slot = crate::proof::output_closure::fp3_signed(*value as i128).unwrap();
+        }
+        values
+    }
+
+    fn draw_norm_tails(shape: &WShape, positions: usize, coins: &mut ByteMaskCoins) -> Vec<Vec<Fp3>> {
+        let rows = shape.main_rows as usize;
+        let tail = shape.code.r as usize;
+        (0..positions)
+            .map(|_| (0..rows * tail).map(|_| coins.draw().unwrap().0).collect())
+            .collect()
+    }
+
+    fn draw_norm_pads(shape: &WShape, positions: usize, coins: &mut ByteMaskCoins) -> Vec<Fp3> {
+        let answers = shape.answers as usize;
+        let mut pads = Vec::with_capacity(positions * answers);
+        for _ in 0..positions * answers {
+            let mut pad = Fp3::ZERO;
+            for _ in 0..64 {
+                pad = coins.draw().unwrap().0;
+                if pad != Fp3::ZERO {
+                    break;
+                }
+            }
+            assert_ne!(pad, Fp3::ZERO);
+            pads.push(pad);
+        }
+        pads
+    }
+
+    fn draw_norm_salts(
+        shape: &WShape,
+        positions: usize,
+        coins: &mut ByteMaskCoins,
+    ) -> Vec<Vec<Vec<u8>>> {
+        use zkie_core::common::field::PrimeField64;
+        let columns = shape.code.n() as usize;
+        (0..positions)
+            .map(|_| {
+                (0..columns)
+                    .map(|_| {
+                        let mut salt = Vec::with_capacity(shape.salt_bytes);
+                        while salt.len() < shape.salt_bytes {
+                            let (value, _) = coins.draw().unwrap();
+                            for coefficient in value.c {
+                                salt.extend_from_slice(
+                                    &coefficient.as_canonical_u64().to_le_bytes(),
+                                );
+                            }
+                        }
+                        salt.truncate(shape.salt_bytes);
+                        salt
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn commit_norm_group(
+        group: &crate::proof::hidden_norm_psc::NormGroupPlan,
+        values: &[Vec<Fp3>],
+        coins: &mut ByteMaskCoins,
+    ) -> crate::proof::hidden_norm_psc::NormGroupWitness {
+        let positions = values.len();
+        let pads = draw_norm_pads(&group.shape, positions, coins);
+        let tails = draw_norm_tails(&group.shape, positions, coins);
+        let salts = draw_norm_salts(&group.shape, positions, coins);
+        let committed = commit_value_group(
+            &group.shape,
+            group.columns,
+            group.oracle_base,
+            group.group,
+            values,
+            &pads,
+            &tails,
+            &salts,
+            positions as u32,
+        )
+        .unwrap();
+        crate::proof::hidden_norm_psc::NormGroupWitness {
+            messages: committed.messages.clone(),
+            tails,
+            salts,
+            pads,
+            committed,
+        }
+    }
+
+    fn norm_fixture(
+        _activation: &CommittedActivation,
+    ) -> (
+        HiddenLinPlan,
+        crate::proof::hidden_norm_psc::NormWitness,
+    ) {
+        use crate::proof::hidden_norm_psc::{
+            commit_norm_mask, norm_mask_entries, NormGroupPlan, NormMaskPlan, NormMaskWitness,
+            NormPlan, NormWitness,
+        };
+        use crate::proof::hidden_norm::NormCoreRow;
+
+        let rows = activation_rows();
+        let core = rows
+            .iter()
+            .map(|row| NormCoreRow::from_values(row, HIDDEN as usize).unwrap())
+            .collect::<Vec<_>>();
+        let columns = COLUMNS;
+        let group = |columns: u64, id: u64, oracle: u64, tree: u64| NormGroupPlan {
+            shape: WShape::new(
+                columns,
+                code(),
+                1,
+                POSITIONS,
+                SALT,
+                tree,
+                1,
+                W_RUN,
+                W_CONFIGURATION,
+            )
+            .unwrap(),
+            columns,
+            group: id,
+            oracle_base: oracle,
+            openings: 1,
+        };
+        let mask_plan = NormMaskPlan {
+            oracle: 9500,
+            group: GROUP,
+            mask_code: mask_code(),
+            mask_rows: 4,
+            answers: 1,
+            openings: 1,
+            tree: RuntimeTreePlan {
+                tree_number: 60500,
+                leaf_class: 1,
+                log_n: CODE_LOG_N,
+                log_n_zk: CODE_LOG_N,
+                parts: vec![RuntimeTreePart {
+                    main_symbols: 0,
+                    mask_symbols: 12,
+                }],
+                salt_bytes: SALT,
+                run: W_RUN,
+                configuration: W_CONFIGURATION,
+            },
+            positions: POSITIONS,
+            hiding: 9,
+            shown: 2,
+            claims: 1,
+        };
+        let mut norm = NormPlan {
+            shape: crate::proof::hidden_norm::NormShape::new(POSITIONS, HIDDEN, HIDDEN)
+                .unwrap(),
+            columns,
+            variables: columns.trailing_zeros() as usize + 1,
+            relations: vec![0, 1],
+            x: group(columns, GROUP, 9000, 60000),
+            x_roots: Vec::new(),
+            sum: group(1, GROUP, 9100, 60100),
+            squares: group(1, GROUP, 9200, 60200),
+            mean: group(1, GROUP, 9300, 60300),
+            variance: group(1, GROUP, 9400, 60400),
+            mask: Some(mask_plan.clone()),
+        };
+        let mut coins = ByteMaskCoins::new(Digest([0x91; 32])).unwrap();
+        let x_values = rows
+            .iter()
+            .map(|row| norm_values(row, columns))
+            .collect::<Vec<_>>();
+        let x = commit_norm_group(&norm.x, &x_values, &mut coins);
+        norm.x_roots = x.committed.roots.clone();
+        let scalar_values = |value: &dyn Fn(&NormCoreRow) -> i128| {
+            core.iter()
+                .map(|row| {
+                    vec![crate::proof::output_closure::fp3_signed(value(row)).unwrap()]
+                })
+                .collect::<Vec<_>>()
+        };
+        let sum = commit_norm_group(
+            &norm.sum,
+            &scalar_values(&|row| row.sum),
+            &mut coins,
+        );
+        let squares = commit_norm_group(
+            &norm.squares,
+            &scalar_values(&|row| row.squares),
+            &mut coins,
+        );
+        let mean = commit_norm_group(
+            &norm.mean,
+            &scalar_values(&|row| row.mean as i128),
+            &mut coins,
+        );
+        let variance = commit_norm_group(
+            &norm.variance,
+            &scalar_values(&|row| row.variance as i128),
+            &mut coins,
+        );
+        let mask_rows = mask_plan.mask_rows as usize;
+        let ell = mask_plan.mask_code.ell as usize;
+        let mut mask_values = Vec::with_capacity(mask_rows);
+        for _ in 0..mask_rows {
+            mask_values.push(
+                (0..ell)
+                    .map(|_| coins.draw().unwrap().0)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let mut pad = Fp3::ZERO;
+        while pad == Fp3::ZERO {
+            pad = coins.draw().unwrap().0;
+        }
+        mask_values[mask_rows - 1][ell - 1] = pad;
+        let mask_tails = (0..mask_rows)
+            .map(|_| {
+                (0..mask_plan.mask_code.r as usize)
+                    .map(|_| coins.draw().unwrap().0)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mask_salts = (0..mask_plan.tree.columns() as usize)
+            .map(|_| {
+                let mut salt = Vec::with_capacity(mask_plan.tree.salt_bytes);
+                while salt.len() < mask_plan.tree.salt_bytes {
+                    let (value, _) = coins.draw().unwrap();
+                    for coefficient in value.c {
+                        salt.extend_from_slice(
+                            &zkie_core::common::field::PrimeField64::as_canonical_u64(
+                                &coefficient,
+                            )
+                            .to_le_bytes(),
+                        );
+                    }
+                }
+                salt.truncate(mask_plan.tree.salt_bytes);
+                salt
+            })
+            .collect::<Vec<_>>();
+        let committed_mask =
+            commit_norm_mask(&mask_plan, mask_values, mask_tails, mask_salts).unwrap();
+        let entries =
+            norm_mask_entries(&mask_plan, &committed_mask, norm.relations.len()).unwrap();
+        let mask_witness = NormMaskWitness {
+            committed: committed_mask,
+            entries,
+        };
+        let witness = NormWitness {
+            rows,
+            core,
+            x,
+            sum,
+            squares,
+            mean,
+            variance,
+            mask: Some(mask_witness),
+        };
+        let mut plan = hidden_plan(_activation);
+        plan.proximity.own_mask_tree.mask_rows = 8;
+        plan.norm = Some(norm);
+        plan.validate().unwrap();
+        (plan, witness)
+    }
+
+    #[test]
+    fn norm_inconsistent_sum_witness_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness) = norm_fixture(&activation);
+        let norm = plan.norm.as_ref().unwrap();
+        let mut coins = ByteMaskCoins::new(Digest([0x92; 32])).unwrap();
+        let altered = witness
+            .core
+            .iter()
+            .map(|row| {
+                vec![crate::proof::output_closure::fp3_signed(row.sum + 1).unwrap()]
+            })
+            .collect::<Vec<_>>();
+        let mut changed = witness.clone();
+        changed.sum = commit_norm_group(&norm.sum, &altered, &mut coins);
+        let proved = prove_hidden_lin_hidden_with_norm(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &changed,
+        );
+        assert!(
+            proved.is_err(),
+            "an inconsistent committed sum must not produce a proof"
+        );
+    }
+
+    #[test]
+    fn norm_message_tampering_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness) = norm_fixture(&activation);
+        let (messages, hidden_witness) =
+            prove_hidden_lin_hidden_with_norm(
+                &plan,
+                &activation,
+                &mut table,
+                Digest([0x71; 32]),
+                &witness,
+            )
+            .unwrap();
+        let bytes = messages.encode().unwrap();
+        let base = HiddenLinMessages::decode(&plan, &bytes).unwrap();
+        let mut verifier_plan = plan.clone();
+        verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &base).is_ok());
+
+        let mut changed = base.clone();
+        let value = &mut changed.second.norm.as_mut().unwrap().point_values[0][0];
+        *value = value.add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = base.clone();
+        changed.first.norm.as_mut().unwrap().mask.as_mut().unwrap().root = Digest::ZERO;
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = base.clone();
+        let answer = &mut changed.first.norm.as_mut().unwrap().sum.sample.answers[0];
+        *answer = answer.add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = base.clone();
+        let end = &mut changed.second.norm.as_mut().unwrap().psc[0].end_values[0];
+        *end = end.add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut other = verifier_plan;
+        other.norm.as_mut().unwrap().relations = vec![0];
+        assert!(verify_hidden_lin_hidden(&other, &table.reader(), &base).is_err());
+    }
+
+    #[test]
+    fn norm_bound_relations_accept_the_hidden_fixture() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness) = norm_fixture(&activation);
+        let (messages, hidden_witness) = prove_hidden_lin_hidden_with_norm(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+        )
+        .unwrap();
+        let mut verifier_plan = plan;
+        verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        let outcome =
+            verify_hidden_lin_hidden_with_witness(
+                &verifier_plan,
+                &table.reader(),
+                &messages,
+                &hidden_witness,
+            )
+            .unwrap();
+        assert!(outcome
+            .own_base
+            .single()
+            .expect("the fixture ends in BASE")
+            .fold_main);
     }
 
     fn staged_plan(plan: &HiddenLinPlan) -> HiddenLinPlan {
@@ -13148,6 +14566,7 @@ mod merged_tests {
             &messages.first,
             &outcome.shared_point,
             &messages.second.tilde,
+            None,
             None,
             None,
         )
@@ -13433,6 +14852,7 @@ mod merged_tests {
             &outcome.shared_point,
             &messages.second.tilde,
             Some(binding),
+            None,
             None,
         )
         .unwrap();
