@@ -1695,15 +1695,29 @@ the actual member counts (shared 2/0, own 13/2). Unit tests
 (wrong first code, wrong folded length, non-last last stage). The lists are
 plan data, not prover self-report.
 
-`[UNPROVEN]` The prover/verifier loop is not yet wired: the stage list is
-present and validated, but the BAT -> (FOLD -> CS)* -> BASE execution, the
-per-stage old/new row authentication, the independent verifier reconstruction
-of the stages, and the per-stage failure/rejection matrix are not implemented.
-The `positions=2`, `samples=1`, `work=0` entries are candidate plan values
-taken from the actual plan; the planner-sized error/position derivation is
-still to be done. The provisional `lm_head_compiled` stage list remains a
-different shape and is not used. Choosing the final positions/work/error
-parameters is the plan/parameter step for the TL/expert.
+`[FACT]` `CODE` The multi-stage loop is implemented as a separate module and
+tested on a small fixture (stage0 BAT/FOLD -> (CS switch -> stage FOLD)* ->
+LastBase; the verifier rebuilds the stage sequence and checks the switch
+targets before using proof-supplied roots/openings). The hidden shared/own
+paths are not wired yet: the plan does not carry the extra per-stage fresh
+ids, the stage-FOLD group/member id, the switch/mask run/configuration digests,
+the base-star tree plan, the first-switch old-mask source, or the loop proof
+format. These are plan/proof-format values (seven-category); they are reported
+to the TL/expert, not chosen here. The stage list remains validated; the
+`positions=2/samples=1/work=0` entries are candidate plan values.
+
+`[FACT]` `CODE` `MATH` Planner-level candidate derivation for the multi-stage
+chain (not yet bound). For a per-stage proximity target of `2^-128`, the
+two-sided miss `(1 - delta)^t` needs the following minimum positions
+(main/mask maxima): shared stage0 155, shared last 129, own stage0 155, own
+stage1 15, own last 20. The current `positions=2` is far below this and is not
+a security setting. The FOLD terms in the future chain are `4/p^3` (shared
+stage0), `26/p^3` (own stage0) and `26/p^3` (own stage1), total
+`56/p^3 < 2^-186.1`; the current single-stage path remains
+`4 + 26 = 30/p^3`. `work=0` is the no-PoW candidate; the plan's
+`column_work_bits=12` applies to table columns, not the IOPP positions. The
+CS/other per-stage terms and the final positions/work/error budget require the
+reference planner rules and remain `[UNPROVEN]`.
 
 `[FACT]` `MATH` c-difference and `Im(A)`. For a public value `P = A X + c(V,S)`,
 two secrets `(V,S)` and `(V',S')` give the same image exactly when
