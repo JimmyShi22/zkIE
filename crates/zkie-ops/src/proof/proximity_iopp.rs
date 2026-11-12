@@ -16,7 +16,7 @@ use zkie_engine::pcs::request::runtime_tree::{MaskTreePlan, RuntimeTreePart, Run
 use zkie_engine::primitives::codec::CanonicalWriter;
 use zkie_engine::primitives::transcript::{hash_labeled, tag_word, PARAMETERS};
 
-use crate::proof::hidden_send_session::{iopp_stage_fault, IoppStagePlan};
+use crate::proof::hidden_send_session::{iopp_stage_fault, HiddenLinPlan, IoppStagePlan};
 use crate::proof::multi_stage_iopp::{
     IoppChain, IoppChainConfig, IoppStageFoldIds, IoppStageSeed,
 };
@@ -76,6 +76,69 @@ impl IoppBoundIds {
     }
 }
 
+/// Collects the oracle identifiers and tree numbers already bound by the
+/// trusted plan: the hidden SEND oracles, the proximity member identifier
+/// range, the two fresh masks, the optional shown-map and index-mask members
+/// and the output closure. The stage FOLD allocation may not reuse any of
+/// them, and no derived tree may take one of their tree numbers.
+pub fn proximity_bound_ids(plan: &HiddenLinPlan) -> Result<IoppBoundIds> {
+    let send = &plan.send;
+    let positions = send.positions() as u64;
+    let mut oracles = vec![0u64, send.group];
+    // The two shared members and the declared bound of the own group's
+    // members are BAT-local identifiers in [0, bound).
+    oracles.extend(0..2);
+    let own_member_bound = positions
+        .checked_mul(3)
+        .and_then(|value| value.checked_add(4))
+        .ok_or(Error::ResourceLimit)?;
+    oracles.extend(0..own_member_bound);
+    oracles.push(plan.proximity.gu.oracle);
+    oracles.push(plan.proximity.omega.oracle);
+    oracles.push(plan.proximity.shared_fresh);
+    oracles.push(plan.proximity.own_fresh);
+    push_range(&mut oracles, send.oracle_base, positions)?;
+    if let Some(index) = &send.index_mask {
+        oracles.push(index.oracle);
+    }
+    if let Some(dot) = &send.dot {
+        oracles.push(dot.oracle);
+    }
+    if let Some(closure) = &plan.closure {
+        push_range(&mut oracles, closure.slack_oracle_base, positions)?;
+        push_range(&mut oracles, closure.bits_oracle_base, positions)?;
+        push_range(&mut oracles, closure.map_oracle_base, positions)?;
+        oracles.push(closure.mask.oracle);
+    }
+
+    let mut trees = vec![
+        plan.proximity.gu.tree.tree_number,
+        plan.proximity.omega.tree.tree_number,
+        plan.proximity.shared_mask_tree.tree_number,
+        plan.proximity.own_mask_tree.tree_number,
+    ];
+    push_range(&mut trees, send.w.tree_number, positions)?;
+    if let Some(index) = &send.index_mask {
+        trees.push(index.tree.tree_number);
+    }
+    if let Some(dot) = &send.dot {
+        trees.push(dot.shape.tree_number);
+    }
+    if let Some(closure) = &plan.closure {
+        push_range(&mut trees, closure.slack.tree_number, positions)?;
+        push_range(&mut trees, closure.bits.tree_number, positions)?;
+        push_range(&mut trees, closure.map.tree_number, positions)?;
+        trees.push(closure.mask.tree.tree_number);
+    }
+    Ok(IoppBoundIds::new(oracles, trees))
+}
+
+fn push_range(values: &mut Vec<u64>, start: u64, count: u64) -> Result<()> {
+    let end = start.checked_add(count).ok_or(Error::ResourceLimit)?;
+    values.extend(start..end);
+    Ok(())
+}
+
 /// The derived trusted chain of one proximity group.
 #[derive(Clone, Debug)]
 pub struct ProximityIoppPlan {
@@ -97,11 +160,15 @@ pub fn derive_proximity_iopp(
     stages: &[IoppStagePlan],
     role: ProximityGroupRole,
     mask_tree: &MaskTreePlan,
+    stage_zero_group: u64,
     stage_zero_fresh: u64,
     base_positions: usize,
     bound: &IoppBoundIds,
 ) -> Result<ProximityIoppPlan> {
-    if mask_tree.fault().is_some() || stage_zero_fresh == 0 {
+    if mask_tree.fault().is_some()
+        || bound.oracles.binary_search(&stage_zero_group).is_err()
+        || bound.oracles.binary_search(&stage_zero_fresh).is_err()
+    {
         return Err(Error::InvalidConfig);
     }
     if iopp_stage_fault(
@@ -406,7 +473,7 @@ mod tests {
 
     fn bound() -> IoppBoundIds {
         IoppBoundIds::new(
-            vec![0, 1, 2, 5, 7, 11, 12, 50],
+            vec![0, 1, 2, 5, 7, 11, 12, 50, 51],
             vec![0x120, 0x210, 0x300],
         )
     }
@@ -435,6 +502,30 @@ mod tests {
                 .unwrap(),
         };
         assert!(IoppChain::derive(&stages(), &config).is_ok());
+    }
+
+    #[test]
+    fn stage_zero_identifiers_must_be_bound() {
+        assert!(derive_proximity_iopp(
+            &stages(),
+            ProximityGroupRole::Shared,
+            &mask_tree(),
+            0,
+            999,
+            1,
+            &bound(),
+        )
+        .is_err());
+        assert!(derive_proximity_iopp(
+            &stages(),
+            ProximityGroupRole::Shared,
+            &mask_tree(),
+            999,
+            50,
+            1,
+            &bound(),
+        )
+        .is_err());
     }
 
     #[test]
@@ -473,6 +564,7 @@ mod tests {
             &stages(),
             ProximityGroupRole::Shared,
             &mask_tree(),
+            0,
             50,
             1,
             &bound(),
@@ -496,6 +588,7 @@ mod tests {
             &stages(),
             ProximityGroupRole::Shared,
             &mask_tree(),
+            0,
             50,
             1,
             &bound(),
@@ -505,6 +598,7 @@ mod tests {
             &stages(),
             ProximityGroupRole::Shared,
             &mask_tree(),
+            0,
             50,
             1,
             &bound(),
@@ -514,6 +608,7 @@ mod tests {
             &stages(),
             ProximityGroupRole::Own,
             &mask_tree(),
+            0,
             51,
             1,
             &bound(),
@@ -562,6 +657,7 @@ mod tests {
             &stages(),
             ProximityGroupRole::Shared,
             &mask_tree(),
+            0,
             50,
             1,
             &bound,
@@ -577,6 +673,7 @@ mod tests {
             &stages(),
             ProximityGroupRole::Shared,
             &mask_tree(),
+            0,
             50,
             1,
             &bound,
@@ -592,6 +689,7 @@ mod tests {
             &stages(),
             ProximityGroupRole::Shared,
             &mask_tree(),
+            0,
             50,
             1,
             &bound,
