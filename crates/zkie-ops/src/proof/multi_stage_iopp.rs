@@ -56,8 +56,10 @@ pub const IOPP_SWITCH_LEAF_CLASS: u32 = 7;
 /// One stage's trusted code and row-variable shape.
 ///
 /// Entry 0 describes the stage 0 FOLD shape; entries 1.. are switch stages.
-/// A switch at plan index `i` uses entry `i` as its target and entry `i - 1`
-/// for its drawn position count. The last entry has `k = h = 0`.
+/// A switch at plan index `i` uses entry `i` as its target and reads the old
+/// rows drawn by entry `i - 1`, so entry `i - 1` supplies that switch's
+/// position count and work bits. The last entry has `k = h = 0`; its position
+/// count is the BASE opening count.
 #[derive(Clone, Debug)]
 pub struct IoppStage {
     pub plan: IoppStagePlan,
@@ -122,6 +124,13 @@ impl IoppChain {
             config.base_positions,
         )
         .is_some()
+        {
+            return Err(Error::InvalidConfig);
+        }
+        if stages
+            .iter()
+            .take(stages.len() - 1)
+            .any(|stage| stage.positions == 0)
         {
             return Err(Error::InvalidConfig);
         }
@@ -292,7 +301,9 @@ pub enum IoppSwitchMembers<'a> {
 
 impl<'a> IoppSwitchMembers<'a> {
     /// The old-mask source the session must register, matching this adapter.
-    pub fn old_mask_source(&self) -> OldMaskSource {
+    /// A dedicated mask tree wins; otherwise the members' mask parts are used,
+    /// or the trusted layout's zero mask when no member carries mask rows.
+    pub fn old_mask_source(&self, layout: &FoldGroupLayout) -> OldMaskSource {
         match self {
             Self::Initial {
                 old_mask: Some(tree),
@@ -301,7 +312,14 @@ impl<'a> IoppSwitchMembers<'a> {
                 plan: tree.plan,
                 root: tree.root,
             },
-            _ => OldMaskSource::Member,
+            Self::Initial { .. } => {
+                if layout.members.iter().any(|member| member.mask_rows > 0) {
+                    OldMaskSource::Member
+                } else {
+                    OldMaskSource::Zero
+                }
+            }
+            Self::Stage { .. } => OldMaskSource::Member,
         }
     }
 
@@ -506,16 +524,17 @@ pub fn prove_multi_stage_iopp(
             target,
             *prover.shape(),
             tree_plan.clone(),
-            members.old_mask_source(),
+            members.old_mask_source(&basis.layout),
         )?;
         let identity = fold_identity(&handoff);
         session.receive_declarations(identity, prover.root())?;
         let seed = session.draw_sample_seed()?;
         let sample_answer = prover.sample_answer(&seed)?;
         session.receive_answer(sample_answer)?;
-        session.set_work_bits(stage.plan.work_bits)?;
+        let previous_stage = &plan.stages[index - 1].plan;
+        session.set_work_bits(previous_stage.work_bits)?;
         let (positions, _theta, nonce) =
-            session.draw_positions_theta_with_nonce(stage.plan.positions, None)?;
+            session.draw_positions_theta_with_nonce(previous_stage.positions, None)?;
         let unique = unique_sorted(&positions);
         let mask_positions: Vec<u64> = positions
             .iter()
@@ -659,6 +678,10 @@ pub fn verify_multi_stage_iopp(
     )?;
     if let Some((old_plan, old_root)) = first_old_mask {
         check_old_mask(&old_plan, old_root, &handoff)?;
+        if old_root == basis.fresh_root || old_plan == basis.fresh_tree {
+            // The stage 0 FOLD's fresh mask is not the group's old mask.
+            return Err(Error::StatementMismatch);
+        }
     }
     let provided: Vec<SwitchTarget> = proof
         .switches
@@ -677,7 +700,15 @@ pub fn verify_multi_stage_iopp(
         let source = if index == 1 {
             match first_old_mask {
                 Some((plan, root)) => OldMaskSource::Tree { plan, root },
-                None => OldMaskSource::Member,
+                None if basis
+                    .layout
+                    .members
+                    .iter()
+                    .any(|member| member.mask_rows > 0) =>
+                {
+                    OldMaskSource::Member
+                }
+                None => OldMaskSource::Zero,
             }
         } else {
             OldMaskSource::Member
@@ -694,9 +725,10 @@ pub fn verify_multi_stage_iopp(
         session.receive_declarations(record.identity, record.declared_root)?;
         let _seed = session.draw_sample_seed()?;
         session.receive_answer(record.sample_answer)?;
-        session.set_work_bits(stage.plan.work_bits)?;
+        let previous_stage = &plan.stages[index - 1].plan;
+        session.set_work_bits(previous_stage.work_bits)?;
         let _ = session.draw_positions_theta_with_nonce(
-            stage.plan.positions,
+            previous_stage.positions,
             Some(record.nonce),
         )?;
         let claims = session
@@ -872,13 +904,28 @@ fn validate_stage_zero(
     }
     if let Some(tree) = old_mask_tree {
         check_old_mask(&tree.plan, tree.root, handoff)?;
+        if tree.root == basis.fresh_root || tree.plan == basis.fresh_tree {
+            // The stage 0 FOLD's fresh mask is not the group's old mask.
+            return Err(Error::StatementMismatch);
+        }
     } else if !basis
         .layout
         .members
         .iter()
         .any(|member| member.mask_rows > 0)
     {
-        return Err(Error::StatementMismatch);
+        // No member carries a mask part, so the fold input's mask table is the
+        // zero vector by the trusted layout: the fold hides no mask variable
+        // and the FOLD output's mask claim must be zero. It is derived here,
+        // never taken from a proof-declared zero tree.
+        if handoff.h != 0
+            || handoff
+                .mask_claim
+                .iter()
+                .any(|value| *value != Fp3::ZERO)
+        {
+            return Err(Error::StatementMismatch);
+        }
     }
     if let Some(trees) = member_trees {
         if trees.len() != basis.members.len() {
@@ -901,6 +948,19 @@ fn validate_stage_zero(
             || rows.mask_claims[0] != handoff.mask_claim
             || rows.mask_claims[1] != handoff.fresh_claim
             || rows.target != handoff.target
+        {
+            return Err(Error::StatementMismatch);
+        }
+        if old_mask_tree.is_none()
+            && !basis
+                .layout
+                .members
+                .iter()
+                .any(|member| member.mask_rows > 0)
+            && (rows.masks[0].iter().any(|value| *value != Fp3::ZERO)
+                || rows.mask_tails[0]
+                    .iter()
+                    .any(|value| *value != Fp3::ZERO))
         {
             return Err(Error::StatementMismatch);
         }
@@ -1397,9 +1457,18 @@ mod tests {
     }
 
     fn stages() -> Vec<IoppStagePlan> {
+        // Adjacent stages differ in both the old-row draw count and the work
+        // bits, so reading the wrong entry is rejected by the transcript.
         vec![
-            stage_plan(code(5, 8, 1), code(5, 16, 1), 2, 0, 1),
-            stage_plan(code(6, 4, 1), code(6, 32, 1), 1, 1, 1),
+            IoppStagePlan {
+                work_bits: 2,
+                ..stage_plan(code(5, 8, 1), code(5, 16, 1), 2, 0, 1)
+            },
+            IoppStagePlan {
+                positions: 2,
+                work_bits: 1,
+                ..stage_plan(code(6, 4, 2), code(6, 32, 2), 1, 1, 1)
+            },
             stage_plan(code(8, 4, 1), code(8, 128, 1), 0, 0, 1),
         ]
     }
@@ -1644,6 +1713,165 @@ mod tests {
         (prover, verifier)
     }
 
+    /// Stage 0 whose members carry no mask rows: the trusted layout makes the
+    /// old mask the zero vector, so no dedicated old mask tree is supplied.
+    fn zero_mask_stage_zero() -> (IoppStageZero, IoppVerifyStageZero) {
+        let shape = FoldShape {
+            code: code(5, 8, 1),
+            mask_code: code(5, 16, 1),
+            k: 2,
+            h: 0,
+            mask_leaf_class: IOPP_MASK_LEAF_CLASS,
+        };
+        let layout = FoldGroupLayout {
+            group: GROUP,
+            k: 2,
+            h: 0,
+            members: vec![FoldMemberLayout {
+                oracle: MEMBER0,
+                main_rows: 4,
+                mask_rows: 0,
+                kept: false,
+            }],
+        };
+        assert!(layout.fault(&shape).is_none());
+        let gamma = vec![Fp3::from_u64(3), Fp3::from_u64(5)];
+        let eps = Fp3::from_u64(7);
+        let main_claim = (1..=8).map(Fp3::from_u64).collect::<Vec<_>>();
+        let mask_claim = vec![Fp3::ZERO; 16];
+        let fresh_claim = fold_mask_weights(2, 0, 16, &gamma).unwrap();
+        let old_mask_row = vec![Fp3::ZERO; 16];
+        let fresh_mask_row = (0..16)
+            .map(|index| Fp3::from_u64(3000 + index))
+            .collect::<Vec<_>>();
+        let old_mask_tail = vec![Fp3::ZERO];
+        let fresh_mask_tail = vec![Fp3::from_u64(52)];
+        let member_main = (0..4)
+            .map(|row| {
+                (0..8)
+                    .map(|column| Fp3::from_u64((row * 8 + column + 1) as u64))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let member_tails = (0..4)
+            .map(|row| vec![Fp3::from_u64(900 + row as u64)])
+            .collect::<Vec<_>>();
+        let weights = fold_coefficients(2, &gamma).unwrap();
+        let mut main_row = vec![Fp3::ZERO; 8];
+        for (weight, row) in weights.iter().zip(&member_main) {
+            for (value, entry) in main_row.iter_mut().zip(row) {
+                *value = value.add(&weight.mul(entry));
+            }
+        }
+        let mut main_tail = Fp3::ZERO;
+        for (weight, tail) in weights.iter().zip(&member_tails) {
+            main_tail = main_tail.add(&weight.mul(&tail[0]));
+        }
+        let mut target = Fp3::ZERO;
+        for (coefficient, value) in main_claim.iter().zip(&main_row) {
+            target = target.add(&coefficient.mul(value));
+        }
+        for (coefficient, value) in mask_claim.iter().zip(&old_mask_row) {
+            target = target.add(&coefficient.mul(value));
+        }
+        for (coefficient, value) in fresh_claim.iter().zip(&fresh_mask_row) {
+            target = target.add(&coefficient.mul(value));
+        }
+        let mut kept_factor = eps;
+        for challenge in &gamma {
+            kept_factor = kept_factor.mul(&Fp3::ONE.sub(challenge));
+        }
+        let sum = Fp3::from_u64(17);
+        let member_plan = RuntimeTreePlan {
+            parts: vec![RuntimeTreePart {
+                main_symbols: 12,
+                mask_symbols: 0,
+            }],
+            ..member_plan()
+        };
+        let mut main = Vec::with_capacity(member_main.len());
+        for (row, tail) in member_main.iter().zip(&member_tails) {
+            main.push(encode_row_fp3(&code(5, 8, 1), row, tail).unwrap());
+        }
+        let tree = RuntimeTree::commit(
+            member_plan.clone(),
+            &[RuntimePartRows {
+                main,
+                mask: Vec::new(),
+                main_deg: E_DEGREE as u32,
+            }],
+            &salts(32, 0x11),
+        )
+        .unwrap();
+        let fresh_plan = mask_plan(0x480, 0xa1);
+        let fresh_tree = mask_tree(
+            fresh_plan,
+            &shape,
+            &fresh_mask_row,
+            &fresh_mask_tail,
+            0x23,
+        );
+        let handoff = FoldHandoff {
+            code: shape.code,
+            mask_code: shape.mask_code,
+            main_claim: main_claim.clone(),
+            mask_claim: mask_claim.clone(),
+            target,
+            fresh_claim: fresh_claim.clone(),
+            group: GROUP,
+            k: 2,
+            h: 0,
+            members: vec![MEMBER0],
+            gamma: gamma.clone(),
+            eps,
+            sum,
+            fresh: FRESH0,
+            fresh_root: fresh_tree.root,
+            tree_number: fresh_plan.tree_number,
+            kept_factor,
+            kept_rows: 0,
+            layout: layout.clone(),
+        };
+        let basis = FoldBasis {
+            layout: layout.clone(),
+            fresh_root: fresh_tree.root,
+            fresh_tree: fresh_plan,
+            members: vec![FoldMember {
+                oracle: MEMBER0,
+                main_code: shape.code,
+                mask_code: shape.mask_code,
+                root: *tree.root(),
+                tree: member_plan,
+            }],
+        };
+        let rows = SingleRows {
+            code: shape.code,
+            mask_code: shape.mask_code,
+            main: main_row,
+            main_tail: vec![main_tail],
+            masks: vec![old_mask_row, fresh_mask_row],
+            mask_tails: vec![old_mask_tail, fresh_mask_tail],
+            claim: main_claim,
+            mask_claims: vec![mask_claim, fresh_claim],
+            target,
+        };
+        rows.check().unwrap();
+        let prover = IoppStageZero {
+            handoff: handoff.clone(),
+            basis: basis.clone(),
+            rows,
+            member_trees: vec![tree],
+            old_mask_tree: None,
+            fresh_tree,
+        };
+        let verifier = IoppVerifyStageZero {
+            handoff,
+            basis,
+            first_old_mask: None,
+        };
+        (prover, verifier)
+    }
+
     fn switches(chain_plan: &IoppChain) -> Vec<IoppSwitchPrivate> {
         chain_plan
             .stages
@@ -1654,10 +1882,18 @@ mod tests {
                 let tree = stage.tree.as_ref().unwrap();
                 IoppSwitchPrivate {
                     main_tails: (0..target.main_rows as usize)
-                        .map(|row| vec![Fp3::from_u64(400 + row as u64)])
+                        .map(|row| {
+                            (0..target.code.r as usize)
+                                .map(|at| Fp3::from_u64(400 + (row * 8 + at) as u64))
+                                .collect()
+                        })
                         .collect(),
                     mask_tails: (0..target.mask_rows as usize)
-                        .map(|row| vec![Fp3::from_u64(500 + row as u64)])
+                        .map(|row| {
+                            (0..target.mask_code.r as usize)
+                                .map(|at| Fp3::from_u64(500 + (row * 8 + at) as u64))
+                                .collect()
+                        })
                         .collect(),
                     pad: Fp3::from_u64(31),
                     salts: salts(tree.columns(), 0x33),
@@ -1719,6 +1955,85 @@ mod tests {
         assert!(proof.switches[1].stage_fold.is_none());
         let verified = verify_multi_stage_iopp(chain(), &plan, zero, &proof).unwrap();
         assert_eq!(verified, seal);
+    }
+
+    #[test]
+    fn last_switch_work_comes_from_the_previous_entry() {
+        let (_, proof, _, _) = run_proof();
+        let mut list = stages();
+        // The last entry describes the BASE target, not an old stage: its work
+        // bits never enter a switch replay.
+        list[2].work_bits = 3;
+        let plan = IoppChain::derive(&list, &config()).unwrap();
+        assert!(verify_multi_stage_iopp(chain(), &plan, stage_zero().1, &proof).is_ok());
+    }
+
+    #[test]
+    fn last_switch_positions_come_from_the_previous_entry() {
+        let (_, proof, _, _) = run_proof();
+        let mut list = stages();
+        // Entry 1 supplies the last switch's old-row count; shrinking it must
+        // break the replay even though entry 2 still matches the BASE count.
+        list[1].positions = 1;
+        let plan = IoppChain::derive(&list, &config()).unwrap();
+        assert!(verify_multi_stage_iopp(chain(), &plan, stage_zero().1, &proof).is_err());
+    }
+
+    #[test]
+    fn zero_old_mask_round_trips_without_a_tree() {
+        let plan = IoppChain::derive(&stages(), &config()).unwrap();
+        let (zero, verify_zero) = zero_mask_stage_zero();
+        let (proof, seal) = prove_multi_stage_iopp(
+            chain(),
+            &plan,
+            zero,
+            &switches(&plan),
+            &stage_folds(&plan),
+            &base_private(&plan),
+        )
+        .unwrap();
+        assert!(proof.switches[0].old_mask_opening.is_none());
+        assert_eq!(
+            verify_multi_stage_iopp(chain(), &plan, verify_zero, &proof).unwrap(),
+            seal
+        );
+    }
+
+    #[test]
+    fn nonzero_fold_mask_claim_without_members_is_rejected() {
+        let plan = IoppChain::derive(&stages(), &config()).unwrap();
+        let (mut zero, _) = zero_mask_stage_zero();
+        zero.handoff.mask_claim[0] = Fp3::from_u64(9);
+        assert!(prove_multi_stage_iopp(
+            chain(),
+            &plan,
+            zero,
+            &switches(&plan),
+            &stage_folds(&plan),
+            &base_private(&plan),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn verifier_derives_the_zero_old_mask_from_the_layout() {
+        let plan = IoppChain::derive(&stages(), &config()).unwrap();
+        let (_, proof, _, _) = run_proof();
+        let (_, mut verify_zero) = zero_mask_stage_zero();
+        // A handoff that declares a nonzero mask claim where the trusted
+        // layout has no member mask rows is rejected before any transcript
+        // value is used.
+        verify_zero.handoff.mask_claim[0] = Fp3::from_u64(9);
+        assert!(verify_multi_stage_iopp(chain(), &plan, verify_zero, &proof).is_err());
+    }
+
+    #[test]
+    fn fresh_mask_tree_cannot_stand_in_for_the_old_mask() {
+        let plan = IoppChain::derive(&stages(), &config()).unwrap();
+        let (_, proof, _, mut zero) = run_proof();
+        let (fresh_plan, fresh_root) = (zero.basis.fresh_tree, zero.basis.fresh_root);
+        zero.first_old_mask = Some((fresh_plan, fresh_root));
+        assert!(verify_multi_stage_iopp(chain(), &plan, zero, &proof).is_err());
     }
 
     #[test]

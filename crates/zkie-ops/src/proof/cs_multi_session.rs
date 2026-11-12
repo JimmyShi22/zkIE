@@ -167,12 +167,18 @@ impl CsMultiProver {
 }
 
 /// Where the switch stage's old mask rows come from: a dedicated mask-only
-/// commitment (the first stage's mask) or the mask part of the switched
-/// member's general commitment (every following stage).
+/// commitment (the first stage's mask), the mask part of the switched member's
+/// general commitment (every following stage), or the trusted layout's zero
+/// mask when no member carries mask rows and the fold hides nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OldMaskSource {
     Tree { plan: MaskTreePlan, root: Digest },
     Member,
+    /// The old mask is the zero vector by the trusted layout: no member has
+    /// mask rows, the fold hides no mask variable, and the FOLD output's mask
+    /// claim is zero. It is derived from the layout, not claimed by the proof,
+    /// and carries no tree or opening.
+    Zero,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -224,6 +230,15 @@ impl CsMultiSession {
                 .members
                 .iter()
                 .any(|member| member.mask_rows > 0),
+            OldMaskSource::Zero => {
+                handoff.h == 0
+                    && !basis
+                        .layout
+                        .members
+                        .iter()
+                        .any(|member| member.mask_rows > 0)
+                    && handoff.mask_claim.iter().all(|value| *value == Fp3::ZERO)
+            }
         };
         if u.fault().is_some()
             || plan.fault().is_some()
@@ -400,6 +415,12 @@ impl CsMultiSession {
                     .chunks_exact(old_width)
                     .map(|symbols| Fp3::new(symbols[0], symbols[1], symbols[2]))
                     .collect()
+            }
+            OldMaskSource::Zero => {
+                if old_mask_opening.is_some() {
+                    return Err(Error::StatementMismatch);
+                }
+                vec![Fp3::ZERO; mask_unique.len()]
             }
             OldMaskSource::Member => {
                 if old_mask_opening.is_some() {
