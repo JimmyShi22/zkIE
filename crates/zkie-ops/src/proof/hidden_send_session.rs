@@ -12587,6 +12587,40 @@ mod merged_tests {
         assert!(
             verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &tampered).is_err()
         );
+        // A switch target that differs from the trusted plan is rejected
+        // before its openings are used.
+        let mut tampered = messages.clone();
+        match &mut tampered.second.tail {
+            ProximityTail::Stages(proof) => proof.switches[0].target.main_rows += 1,
+            ProximityTail::Single { .. } => panic!("the fixture is staged"),
+        }
+        assert!(
+            verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &tampered).is_err()
+        );
+        // A changed old-member opening reaches the final verifier and is
+        // rejected by the switch authentication.
+        let mut tampered = messages.clone();
+        match &mut tampered.second.tail {
+            ProximityTail::Stages(proof) => {
+                proof.switches[0].member_openings[0].columns[0].symbols[0] =
+                    fp_from_signed_word(0x1234_5678);
+            }
+            ProximityTail::Single { .. } => panic!("the fixture is staged"),
+        }
+        assert!(
+            verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &tampered).is_err()
+        );
+        // A missing switch is a sequence mismatch at the final verifier.
+        let mut tampered = messages.clone();
+        match &mut tampered.second.tail {
+            ProximityTail::Stages(proof) => {
+                proof.switches.pop();
+            }
+            ProximityTail::Single { .. } => panic!("the fixture is staged"),
+        }
+        assert!(
+            verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &tampered).is_err()
+        );
     }
 
     fn hidden_run() -> (HiddenLinPlan, HiddenLinMessages, HiddenLinWitness) {
