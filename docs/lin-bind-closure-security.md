@@ -1,4 +1,4 @@
-# Closed output-head relation: random quantities, public positions and hiding
+# Closed output-head relation: unbiased sampling, joint views and the whole-chain argument
 
 ## Status and labels
 
@@ -27,7 +27,7 @@ verification.
 
 Snapshot: the closed relation at code basis `3b3e8ecc`, with the bounded-read
 rollback `8d32d3de`; fixture `gpt2-seq16`, 16 positions, proof 9,939,144 B.
-The committed document is version 5.
+The committed document is version 6.
 
 ## 1. The chain in one view
 
@@ -55,8 +55,8 @@ The rest of the note expands each column.
   stream by the base-field draw;
 - W, closure and mask rows use the cubic field `Fp3`; their tails, salts and
   mask entries are drawn by `ByteMaskCoins::value_at`, which builds three
-  `Fp` coordinates from one hash output (`word mod p`) and returns
-  `Fp3::new(c0, c1, c2)`;
+  `Fp` coordinates from one base hash and a coordinate/attempt-specific retry
+  domain, and returns `Fp3::new(c0, c1, c2)`;
 - the challenges use the chain draw: `draw_f` takes a 64-bit word below the
   modulus by rejection sampling (`DRAW_TRIES = 6` attempts), `draw_e` takes
   three base draws, and `draw_e_nonzero` retries a fixed number of times and
@@ -80,14 +80,53 @@ The rest of the note expands each column.
   `(1 - p/2^64)^6 < 2^-192` per challenge draw. This is carried as a small
   exception term in section 6.
 
-`[ASSUMPTION]` `CODE` The mask coin stream is modeled as a random oracle into
-`Fp`: the implementation reduces a 64-bit word modulo `p`, so each coordinate
-has a statistical bias of at most `2^-32` from uniform. The computational
-argument below treats the mask stream as uniform. The modulo bias is a
-separate statistical term, not included in the 128-bit bound; a strict
-statistical hiding claim would need rejection sampling in the mask stream.
-This is recorded as a conditional premise in section 7 and as an open item in
-section 10.
+### 2.1 Unbiased mask sampling
+
+`[FACT]` `CODE` The mask stream rejects a candidate word at or above the
+modulus instead of reducing it:
+
+- the base hash of a draw supplies one candidate word per coordinate; the
+  draw number is the hash index and the seed is the hash data;
+- a rejected coordinate is retried in a coordinate- and attempt-specific
+  domain: the retry subdomain is `1 + coordinate` and the attempt number is
+  part of the hash data, so the draw number, coordinate and retry number are
+  domain-separated;
+- the sequential `draw`, the random-access `redraw(number)` and the pure
+  `value_at(number)` all call the same function, so they agree for the same
+  draw number;
+- exhaustion returns `EntropyUnavailable`. There is no modulo fallback.
+
+`[FACT]` `CODE` `MATH` Ideal-word distribution. If each candidate word is
+uniform on 64 bits, a candidate is accepted exactly when it is below `p`, so
+the accepted value is uniform on `Fp`; rejection does not bias the accepted
+distribution. The three coordinates use independent words (the base-hash word
+index or distinct retry domains), so the resulting `Fp3` element is uniform on
+`Fp3` in the ideal-word model. The retry-exhaustion probability per coordinate
+is `(1 - p/2^64)^64 < 2^-2048`; for `N` coordinate draws the union is below
+`N * 2^-2048`, which is far below every other term in section 6.
+
+`[ASSUMPTION]` `CODE` Real finite seed. The implementation derives the
+candidate words from `hash_labeled` with a per-run seed. The uniform
+ideal-word statement is therefore a model-level statement: the hash is treated
+as a random oracle (or a pseudorandom generator/function) so that its outputs
+are computationally indistinguishable from independent uniform words. It is
+not an unconditional infinite-independence claim about the concrete hash.
+
+`[FACT]` `CODE` `NUM` The audit found four modulo reductions of random words:
+the production `ByteMaskCoins::value_at`, and three test/fixture coin sources.
+All four now use the rejection helper; no `word % p` reduction of a random
+word remains. The production hidden chain draws masks, tails, pads and stars
+through `ByteMaskCoins`; the test/fixture sources are used by component tests
+and fixtures, not by the hidden production path. The table fixture's tails and
+salts are deterministic fixture data supplied by the holder, not draws of the
+per-proof mask stream; the production table commitment is external and
+policy-pinned.
+
+`[FACT]` `NUM` The tests cover: `p-1` accepted, `p` and `2^64-1` rejected and
+retried, exhaustion after the fixed number of attempts, sequential/random
+access agreement, deterministic replay for the same seed, distinct streams for
+different seeds, and no repeated values in a sample. The source tests are in
+the field, fold and hidden-session modules.
 
 ## 3. Public positions
 
@@ -251,6 +290,29 @@ the product of these nonzero constants and is independent of the challenges;
 there is no bad-challenge set for this map, so no Schwartz-Zippel term is
 needed here.
 
+`[FACT]` `CODE` The per-entry correspondence for k = 23 (49 entries, 49 sent
+rows) is:
+
+| Entry (hp_place order) | Count | First public occurrence | Direct coefficient | Challenge dependence |
+|---|---:|---|---:|---|
+| last variable, power 0 | 1 | sum row | 1 | none on the direct term |
+| last variable, power 1 | 1 | last round, sent power 1 | 1 | none on the direct term |
+| last variable, power 2 | 1 | last round, sent power 2 | 1 | none on the direct term |
+| plain variable `l`, power 2 | 23 | its own round, sent power 2 | 1 | none on the direct term |
+| plain variable `l`, power 1 | 23 | preceding variable's sent power 0; for `l=0`, the sum row | 1 | the preceding row also carries its own challenge-dependent terms |
+
+The sent-row order is the hiding sum, then for every plain variable the two
+non-fixed coefficients (powers 0 and 2), then the last variable's two
+non-fixed coefficients (powers 1 and 2). In the order
+`[sum, last round, variable 22 round, ..., variable 0 round]` the direct
+entries above form the diagonal blocks; entries of a later variable that
+appear in an earlier row are the strictly triangular part and are multiplied
+by challenge-dependent `after`/`apply` factors. The determinant is the
+product of the constant diagonal entries up to the sign of the block
+ordering, so it is a nonzero constant independent of the challenges; the
+observed signs (`+1` at k=10, `-1` at k=23) are numerical corroboration, not
+the general proof.
+
 `[FACT]` `NUM` The 23 x 23 Dot map and the 49 x 49 closure map are full rank
 at three deterministic/random challenge points. Their determinants are `+1`
 for k = 10 and `-1` for k = 23 on every tested point; the sign may depend on
@@ -311,6 +373,17 @@ by the hiding block and the shown columns. This is why the encoded mask
 message, the PSC transcript and the published values are jointly hidden even
 though they share the same message entries. `CODE` `MATH`.
 
+`[FACT]` `NUM` The production-parameter check uses 16 positions, k = 23, two
+mask rows, ell = 512, r = 256 and q = 4. The real one-symbol evaluation
+builds an 872 x 1536 matrix: 16*49 PSC rows, 16*5 shown rows and 2*4 opening
+rows; the random columns are the 2*(512+256) message and tail entries; the
+secret columns are the 16*54 transcript/shown coordinates. The random rank is
+872 and the joint rank is 872. This is a numerical confirmation of the block
+derivation at the production shape. It is not a claim that the complete
+multi-oracle transcript (index-mask, FOLD, BASE and closure together) was
+extracted into one matrix; those blocks are separate and concatenate
+diagonally by the sharing table in section 4.
+
 `[UNPROVEN]` The closure point values are evaluated at points drawn after the
 opening and before the next challenge; the adaptive composition of these
 challenge draws with the hiding argument is not mechanized. The hybrid
@@ -338,6 +411,32 @@ is the encoding of the same star rows. The real-path test checks:
 - two different seeds give different star rows and tails;
 - the target equals the two real dot products of the same star;
 - every combined row and tail equals the real one-time pad formula.
+
+`[FACT]` `CODE` Simultaneous elimination. The verifier's linear check uses
+the same star in the target and in the combined rows:
+
+```text
+target* = <claim, star.main> + <mask_claim, star.mask>
+main'   = star.main + lambda * main
+mask'   = star.mask + lambda * mask
+
+<claim, main'> + <mask_claim, mask'>
+  = target* + lambda * (<claim, main> + <mask_claim, mask>)
+  = target* + lambda * target
+```
+
+The star cancels. The relation left after elimination is the approved public
+claim relation `target` (the verifier knows the claim and target from the
+committed rows), not the secret row. The combined rows and the target alone
+leave the star underdetermined: they give one dot product and one padded
+coordinate per row, while the star has many coordinates. The openings reveal
+the encoded star symbols at the drawn positions, masked by the star tail with
+`q <= r`, and the old row symbols masked by the old row tail. The star is
+fresh per base value and drawn from its own stream; the two-seed test is an
+illustration, not the uniformity proof. The uniformity/one-time argument is
+the generation relation: `draw_star` fills the star rows and tails from a
+fresh `ByteMaskCoins` stream, and the public formulas above are the only
+places they enter.
 
 The joint BASE view is therefore a set of one-time pads on the secret rows
 and on the target dot product; the star coordinates are fresh and appear in
@@ -394,10 +493,45 @@ the algebraic cover argument can be conditioned on the root without changing
 the secret distribution. This adaptation argument depends on the RO model for
 the root and leaf outputs, not on CR.
 
-`[ASSUMPTION]` The RO/CR model is not quantified against a concrete hash. The
-hybrid failure probability is therefore a model-level condition, not a
-numerical term; the composition expression in section 6 lists the algebraic
-terms and states the hash-model term separately.
+`[FACT]` `CODE` `MATH` Specific hybrid for opened and unopened leaves. The
+standard salted-Merkle random-oracle commitment lemma applies with the
+following mapping and events:
+
+1. The simulator chooses the salt and the message for every leaf, commits the
+   opened leaves with the real leaf hash, and for every unopened leaf chooses
+   a uniform digest and programs the random oracle at that leaf input only
+   when the adversary queries it. Inner nodes are computed from the children;
+   the root is the resulting digest.
+2. The verifier's view is the root, the opened leaves and the answers and
+   transcripts. The unopened leaves' symbols and salts are not in the view.
+   The unopened digests are uniform in the ideal RO model, so the root is
+   consistent with the opened leaves and independent of the unopened inputs.
+3. The simulation can fail only through one of these events:
+   - two distinct leaf or node inputs collide in the RO (including a
+     programming inconsistency at the same input): probability at most
+     `(q + 1)^2 / 2^256` over `q` queries;
+   - the adversary guesses an unopened leaf's exact input (salt and message):
+     the salt is 40 bytes, so the guessing probability is at most
+     `q / 2^320`; the tail and pad entropy give the message min-entropy the
+     commitment needs.
+4. Adaptive queries. The adversary may query the RO, the root and the
+   transcript before choosing its openings or challenges. The simulator
+   answers every query consistently. Conditional on the opened leaves, the
+   unopened leaf outputs and the root are uniform, so the challenge derived
+   from them is independent of the unopened symbols. The adaptive composition
+   is therefore covered by the same two events; no separate "conditioning on
+   the root" step is used.
+
+The mapping to the construction is literal: the leaf hash input is
+`(tag, leaf_index, run, width, salt_length, symbols, salt)`, the node hash
+input is `(tag, tree_number, configuration, left, right)`, the salt is 40
+bytes, and the index/run/plan bind the leaf position. The argument uses RO for
+hiding and CR for binding; it does not follow from CR alone. The concrete
+hash's RO/CR advantage is not quantified, so the statement remains
+model-conditional. `[ASSUMPTION]` The RO/CR model is not quantified against a
+concrete hash. The hybrid failure probability is therefore a model-level
+condition, not a numerical term; the composition expression in section 6
+lists the algebraic terms and states the hash-model term separately.
 
 ## 6. Exception probabilities
 
@@ -421,6 +555,7 @@ The entries are:
 | single equality | degree 2 | `2/p^3 < 2^-190` |
 | `chi = 0` | one event | `1/p^3 < 2^-191` |
 | challenge-draw zero fallback | at most 6 rejected words per draw, `(1-p/2^64)^6` | below `2^-192` per draw |
+| mask-coordinate retry exhaustion | at most 64 attempts, `(1-p/2^64)^64` | below `N * 2^-2048` over `N` coordinates |
 | hash model | plan-ledger term | `(t + q_V + 1) * 2^-128 + (17/2) * (t + q_V)^2 / 2^256` |
 
 `[ARGUMENT]` `CODE` The component union bound used here is
@@ -444,16 +579,19 @@ bits; it is not re-derived here.
 not a new closed-chain theorem. The degrees and counts above are arithmetic
 assumptions; a conservative union bound over the components is not mechanized.
 
-`[ASSUMPTION]` The mask coin modulo bias from section 2 is not in this
-computational expression. If a statistical hiding statement is required, the
-bias term must be added or the mask stream must use rejection sampling; this
-is a conditional premise, not a runtime failure.
+`[FACT]` `CODE` The mask-coordinate rejection sampling is exact in the
+ideal-word model (section 2.1); the only sampling term is the retry-exhaustion
+abort probability above. The real finite-seed statement is computational under
+the PRG/RO model for `hash_labeled`; it is not an unconditional statistical
+independence claim. The table's rank and degree terms do not change under the
+rejection sampling because the sampling only changes the distribution of the
+mask values, not the algebraic checks.
 
 ## 7. Assumption support table
 
 | Assumption | Support | Status |
 |---|---|---|
-| independent uniform `Fp`/`Fp3` draws | `ByteMaskCoins::value_at` and `draw_f/draw_e`; three `Fp` coordinates per `Fp3` | supported for the RO model; modulo bias conditional (section 2) |
+| independent uniform `Fp`/`Fp3` draws | `ByteMaskCoins::value_at` rejection sampling and `draw_f/draw_e`; three `Fp` coordinates per `Fp3` | supported in the ideal-word model; real seed is PRG/RO-conditional (section 2.1) |
 | challenge zero fallback bounded | `DRAW_TRIES = 6`, rejection sampling in `draw_f` | supported; term in section 6 |
 | opening positions distinct, `q <= r` | transcript/ledger; actual counts 603/4/4; ledger min remaining 252 | supported by the ledger; the numerical rank check is `NUM` |
 | tail union across SEND and BASE | the tree opening set is the union; ledger evidence | supported by the ledger |
@@ -468,7 +606,7 @@ is a conditional premise, not a runtime failure.
 | closed path has two FOLD instances and one closure PSC per position | `member_fold_shape` call sites; `messages.psc.len() == positions` | `CODE`; actual k=14 own fold |
 | no code-switch stage in the hidden path | plan rejects a switch configuration | supported |
 | asset inventory only for this fixture | the stated shapes and code parameters | scoped, not extrapolated |
-| strict statistical hiding against the concrete mask stream | not supported by the RO argument alone (modulo bias) | `UNPROVEN` conditional |
+| concrete-hash PRG/RO indistinguishability | the ideal-word sampling proof plus the hash model | `UNPROVEN` model-conditional; no concrete-hash bound |
 
 ## 8. Rejection chain and tree-reuse tamper
 
@@ -486,32 +624,64 @@ component test keeps the original tree and root and changes only the
 prover-side message: the group table changes. This is a component result, not
 a final-verifier run.
 
-`[ARGUMENT]` `CODE` Tree-reuse tamper bound. Suppose the prover keeps the
-original committed tree/root but uses a changed message row in the group
-table. The root and opening checks do not see the change because the openings
-come from the original tree. The difference enters the FOLD/BASE checks as a
-nonzero group-row difference. For a nonzero difference polynomial, the FOLD
-round checks are polynomials of degree at most two in each challenge; with
-the actual own-fold k = 14 the union over the 14 rounds is at most
-`28/p^3`. The shared fold's members are the 1024-row Gu message, the one-row
-Omega message, the record row and the opened-column rows (at most the table's
-603 opening events), so its k is at most 11; the bound below charges
-`2k/p^3` with k = 14 for both instances as a conservative value. The BASE
-lambda check is linear and adds `1/p^3`; the base symbol checks are linear. The audited proximity/opening
-error is the `8 * 2^-128` term. A conservative bound for the two-instance
-closed path is therefore
+`[ARGUMENT]` `CODE` Tree-reuse tamper bound, itemized.
+
+**Frozen difference.** The prover keeps the original committed tree/root and
+uses a changed message row in the group table. Let `Delta` be the difference
+of the affected folded/combined claim. The root and opening checks do not see
+the change because the openings are the original tree's symbols. The
+difference is fixed before the FOLD/BASE challenges are drawn.
+
+**Nonzero condition.** If `Delta` is zero in the group-row map (the kernel),
+the check is not claimed to catch the change; this document does not claim a
+kernel negative. If `Delta` is nonzero, the verifier's FOLD checks are
+polynomials in the challenges.
+
+**Degree.** Each FOLD round polynomial has degree at most two in its
+challenge; a nonzero difference polynomial has degree at most two per
+variable. The own fold has k = 14 (the run reports 14 rounds); the shared
+fold's members are the 1024-row Gu message, the one-row Omega message, the
+record row and the opened-column rows (at most the table's 603 opening
+events), so its k is at most 11. Charging k = 14 for both instances, the
+union over the two fold checks is at most `2 * 2 * 14 / p^3`.
+
+**Challenge order.** The fold challenges, the BASE lambda and the base
+positions are drawn after the committed rows and roots; the difference is
+fixed when they are drawn. The challenge draws are independent of the mask
+sampling source (the masks are prover randomness; the challenges are verifier
+randomness). The polynomial root bound therefore applies to the same
+difference.
+
+**BASE detection.** The BASE linear check cancels the star exactly (section
+5.6) and reduces to the claim relation; the combined-row and symbol checks
+compare the same star on both sides, so the star does not mask the difference.
+The star and tail sampling change the values, not the check equations; the
+tamper bound is unchanged by section 2.1.
+
+**BASE lambda and symbol checks.** The lambda check is linear and adds
+`1/p^3`; the base symbol checks are linear in the drawn positions.
+
+**Proximity/opening.** The audited proximity/LKP rounds contribute
+`8 * 2^-128`; the opening sets satisfy `q <= r` by the ledger (table 603,
+W/closure and mask at most 4, minimum remaining 252) and the tail union is the
+accounted union. These terms are independent of the difference polynomial and
+are added by the union bound.
+
+**Combination conditions.** The union bound requires that the challenge
+spaces are independent and that the difference is fixed before each challenge;
+both hold by the order above. The bound is
 
 ```text
 2 * (2 * 14) / p^3 + 2 / p^3 + 8 * 2^-128  <  2^-124.9,
 ```
 
 dominated by the audited proximity term. This is a loose bound under the
-degree assumption, not a measured probability. If the changed message
-difference lies in the kernel of the FOLD/BASE map, the check is not claimed
-to catch it. A final-verifier exact negative for this tamper is not
-implemented because the hidden prover has no message-injection point after the
-tree commit; the component test plus this bound are what the current API
-supports. `[UNPROVEN]` The exact final-verifier negative.
+degree assumption, not a measured probability. A final-verifier exact
+negative for this tamper is not implemented because the hidden prover has no
+message-injection point after the tree commit; the component test (the group
+table changes) plus this bound are what the current API supports.
+`[UNPROVEN]` The exact final-verifier negative; the kernel difference is not
+claimed to be caught.
 
 ## 9. Engineering boundaries and wording
 
@@ -522,8 +692,35 @@ tampered message. The workspace result and the three seq16 runs are the
 delivery evidence reported by the implementation side; they are not an
 independent external verification.
 
-`[FACT]` The production proof code is unchanged from `1f80e682`; the proof
-bytes and hash are unchanged by this document and the test-only module.
+`[FACT]` The production proof code changed only in the mask sampling source
+(section 2.1); the protocol relations, commitments, challenge order,
+parameters and encoding format are unchanged. The proof content and hash
+change because the prover's random values change.
+
+`[FACT]` `NUM` Compatibility evidence. The new proof length is
+9,939,144 bytes and its sha256 is `f8f512c0...3215f5` in the three seq16
+runs. The rejection sampling only changes a draw when a candidate word is at
+or above the modulus; this deterministic fixture produced no such word, so
+the proof content is byte-identical to the previous round. The sampling
+distribution is still the unbiased one; the boundary and retry tests exercise
+the rejection path, and the fixture outcome is reported as measured, not
+assumed. The
+encoding version and the hidden schema version are unchanged because the
+message structure is unchanged. A proof produced before the sampling change
+(`9,939,144` bytes, the previous round's dump) was decoded and verified by the
+new verifier through the bytes entry: `loaded_proof_ok=1`, with the same
+`9,939,144` byte length. The verifier never re-derives the prover's mask
+values, so the changed sampling does not invalidate old proofs under the same
+plan and public statement. This is stronger than the expected "old artifact
+does not verify"; it is recorded as measured, not assumed.
+
+`[FACT]` `NUM` Sampling tests: boundary `p-1` accepted; `p` and `2^64-1`
+rejected and retried; retry exhaustion returns an error after the fixed
+number of attempts; sequential and random-access draws agree; the same seed
+replays identically and different seeds give different streams; the sample
+has no repeated values; cross-request material/seed/commitment reuse is
+rejected by the existing ledger tests; the full prover/verifier suite and the
+three seq16 runs pass.
 
 `[FACT]` The asset inventory and its bounds apply only to the listed
 `gpt2-seq16` fixture path and its shapes/code parameters; they are not
@@ -540,10 +737,11 @@ public; the full reduced output row is hidden by the conditional argument in
 - `[UNPROVEN]` A mechanized symbolic proof of the constant determinant of the
   PSC/FOLD hiding maps; the triangular derivation and the numerical checks
   support it, but they are not a formal proof.
-- `[UNPROVEN]` A strict statistical hiding bound for the concrete mask stream
-  (modulo reduction bias). The computational argument uses the RO model; if a
-  statistical claim is required, the mask stream needs rejection sampling.
-  This is a same-topic candidate for the expert, not a change made here.
+- `[UNPROVEN]` A concrete-hash (non-model) hiding bound. The mask sampling is
+  exactly uniform in the ideal-word model; the real finite-seed statement is
+  computational under the PRG/RO model, and the concrete hash's advantage is
+  not quantified. This is a model-level condition, not a residual modulo
+  bias; the modulo reduction has been removed.
 - `[UNPROVEN]` An exact final-verifier negative for the tree-reuse tamper; the
   current API has no prover-side message injection point after the tree
   commit. The component test and the degree bound are delivered instead.
