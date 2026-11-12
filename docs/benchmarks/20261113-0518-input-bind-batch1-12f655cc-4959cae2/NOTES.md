@@ -34,7 +34,7 @@
 
 - Command: `cargo test --workspace`.
 - Result: 48 test suites, 804 passed, 0 failed, 17 ignored.
-- Text result: `workspace.log`; summary: `test-summary.txt`; change stat:
+- Text result: `workspace.txt`; summary: `test-summary.txt`; change stat:
   `change.stat`.
 - No benchmark and no proof artifact are part of this batch; no performance or
   proof-byte number is claimed.
