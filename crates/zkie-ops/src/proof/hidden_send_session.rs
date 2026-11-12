@@ -4170,7 +4170,7 @@ pub struct IoppStagePlan {
     pub work_bits: u8,
 }
 
-fn iopp_stage_fault(
+pub(crate) fn iopp_stage_fault(
     stages: &[IoppStagePlan],
     first_main: CodeParams,
     first_mask: CodeParams,

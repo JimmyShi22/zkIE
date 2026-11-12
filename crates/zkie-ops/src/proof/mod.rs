@@ -21,6 +21,7 @@ pub mod proximity_session;
 pub mod psc;
 pub mod relations;
 pub mod session_baseline;
+pub mod multi_stage_iopp;
 pub mod model_commitment;
 
 #[cfg(test)]
