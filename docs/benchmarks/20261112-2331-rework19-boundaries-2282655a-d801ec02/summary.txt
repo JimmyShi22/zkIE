@@ -1,0 +1,36 @@
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run1-key-map.txt:hidden_prove_ms=386319
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run1-key-map.txt:hidden_proof_bytes=65432832
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run1-key-map.txt:hidden_verify_ms=64768
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run1-key-map.txt:ledger_final_events=145
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run1-key-map.txt:ledger_final_logical=18912
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run1-key-map.txt:ledger_final_unique=18841
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run1-key-map.txt:ledger_final_min_tail_remaining=0
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run1-key-map.txt:ledger_final_exhausted=1
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run1-key-map.txt:ledger_exhausted_key kind=Cs oracle=1 tree=2049 rank=259 unique=259 logical=259
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run1-key-map.txt:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1194.05s
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run1-key-map.txt:	Elapsed (wall clock) time (h:mm:ss or m:ss): 20:06.14
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run1-key-map.txt:	Maximum resident set size (kbytes): 169428876
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run2.txt:hidden_prove_ms=387126
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run2.txt:hidden_proof_bytes=65432832
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run2.txt:hidden_verify_ms=64598
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run2.txt:ledger_final_events=145
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run2.txt:ledger_final_logical=18912
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run2.txt:ledger_final_unique=18841
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run2.txt:ledger_final_min_tail_remaining=0
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run2.txt:ledger_final_exhausted=1
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run2.txt:ledger_exhausted_key kind=Cs oracle=1 tree=2049 rank=259 unique=259 logical=259
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run2.txt:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1194.83s
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run2.txt:	Elapsed (wall clock) time (h:mm:ss or m:ss): 19:56.32
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run2.txt:	Maximum resident set size (kbytes): 169415396
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run3.txt:hidden_prove_ms=385997
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run3.txt:hidden_proof_bytes=65432832
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run3.txt:hidden_verify_ms=64753
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run3.txt:ledger_final_events=145
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run3.txt:ledger_final_logical=18912
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run3.txt:ledger_final_unique=18841
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run3.txt:ledger_final_min_tail_remaining=0
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run3.txt:ledger_final_exhausted=1
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run3.txt:ledger_exhausted_key kind=Cs oracle=1 tree=2049 rank=259 unique=259 logical=259
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run3.txt:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1194.69s
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run3.txt:	Elapsed (wall clock) time (h:mm:ss or m:ss): 19:56.16
+docs/benchmarks/20261112-2331-rework19-boundaries-2282655a-d801ec02/run3.txt:	Maximum resident set size (kbytes): 169403640

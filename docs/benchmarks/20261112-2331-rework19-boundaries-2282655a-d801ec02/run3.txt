@@ -1,0 +1,282 @@
+warning: unused variable: `number`
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1513:9
+     |
+1513 |         number: u32,
+     |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_number`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `target`
+   --> crates/zkie-engine/src/pcs/request/relation.rs:881:5
+    |
+881 |     target: Fp3,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+
+warning: unused variable: `columns_usize`
+   --> crates/zkie-engine/src/pcs/request/table.rs:952:13
+    |
+952 |         let columns_usize = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_columns_usize`
+
+warning: field `target` is never read
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1118:5
+     |
+1112 | struct FoldOutputMeta {
+     |        -------------- field in this struct
+...
+1118 |     target: Fp3,
+     |     ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-engine` (lib) generated 4 warnings (run `cargo fix --lib -p zkie-engine` to apply 3 suggestions)
+warning: unused import: `MODULUS`
+   --> crates/zkie-ops/src/proof/bat_fold_session.rs:147:59
+    |
+147 | use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE, MODULUS};
+    |                                                           ^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/base_last_session.rs:589:13
+    |
+589 |         let mut message = self.chain.message();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `first`
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:8880:5
+     |
+8880 |     first: &HiddenSendMessages,
+     |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_first`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `n`
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:214:9
+    |
+214 |     let n = word_n(word)?;
+    |         ^ help: if this is intentional, prefix it with an underscore: `_n`
+
+warning: unused variable: `group`
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:376:15
+    |
+376 | fn base_error(group: &GroupShape, analysis: &Analysis) -> Bound {
+    |               ^^^^^ help: if this is intentional, prefix it with an underscore: `_group`
+
+warning: field `plan` is never read
+   --> crates/zkie-ops/src/proof/cs_multi_session.rs:201:5
+    |
+195 | pub struct CsMultiSession {
+    |            -------------- field in this struct
+...
+201 |     plan: RuntimeTreePlan,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `m` is never read
+  --> crates/zkie-ops/src/proof/proximity_planner.rs:57:5
+   |
+52 | struct Proximity {
+   |        --------- field in this struct
+...
+57 |     m: u64,
+   |     ^
+   |
+   = note: `Proximity` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: function `batched_rows` is never used
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:516:4
+    |
+516 | fn batched_rows(word: &Word) -> u64 {
+    |    ^^^^^^^^^^^^
+
+warning: `zkie-ops` (lib) generated 8 warnings (run `cargo fix --lib -p zkie-ops` to apply 5 suggestions)
+warning: unused variable: `m`
+   --> models/gemma3/src/executor.rs:277:5
+    |
+277 |     m: usize,
+    |     ^ help: if this is intentional, prefix it with an underscore: `_m`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_rot_step`
+   --> models/gemma3/src/executor.rs:390:21
+    |
+390 |         let (k_rot, k_rot_step) = rope(&mut builder, k, k_step, cos_prefix.clone(), sin_prefix.clone(), m)?;
+    |                     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_rot_step`
+
+warning: unused import: `zkie_engine::pcs::request::field::E_DEGREE`
+  --> models/gpt2/src/lm_head_plan.rs:11:5
+   |
+11 | use zkie_engine::pcs::request::field::E_DEGREE;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_step`
+   --> models/gpt2/src/executor.rs:346:21
+    |
+346 |             let (k, k_step) = {
+    |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_step`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-models-gemma3` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gemma3` to apply 2 suggestions)
+warning: `zkie-models-gpt2` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gpt2` to apply 2 suggestions)
+warning: unused import: `digest_to_hex`
+  --> zkie/src/policy.rs:12:58
+   |
+12 | use zkie_core::artifact::{digest_bytes, digest_from_hex, digest_to_hex};
+   |                                                          ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `VecTableSource` and `commit_table_streaming`
+  --> zkie/src/lm_head_key.rs:58:5
+   |
+58 |     commit_table_streaming, verify_columns, ColumnOpening, IndexReader, IndexShape, SampleSeed,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+59 |     EncodedRowStore, StreamingHolder, TableRowSource, VecTableSource,
+   |                                                       ^^^^^^^^^^^^^^
+
+warning: unused import: `zkie_core::common::field::PrimeCharacteristicRing`
+  --> zkie/src/lm_head_key.rs:15:5
+   |
+15 | use zkie_core::common::field::PrimeCharacteristicRing;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `mask_oracle`
+    --> zkie/src/lm_head_key.rs:3415:9
+     |
+3415 |     let mask_oracle = MaskOracle {
+     |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mask_oracle`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> zkie/src/lm_head_key.rs:4281:9
+     |
+4281 |     let mut mask_tail = vec![Fp3::ZERO; mask_tail_len];
+     |         ----^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `mask_tail`
+    --> zkie/src/lm_head_key.rs:4281:9
+     |
+4281 |     let mut mask_tail = vec![Fp3::ZERO; mask_tail_len];
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mask_tail`
+
+warning: variable does not need to be mutable
+   --> zkie/src/lm_head_stage.rs:288:9
+    |
+288 |     let mut options = if private {
+    |         ----^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: field `tree` is never read
+    --> zkie/src/lm_head_key.rs:1534:5
+     |
+1530 | pub struct LmHeadOmegaProvider {
+     |            ------------------- field in this struct
+...
+1534 |     tree: RuntimeTreePlan,
+     |     ^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie` (lib) generated 8 warnings (run `cargo fix --lib -p zkie` to apply 6 suggestions)
+warning: value assigned to `hidden_witness` is never read
+    --> zkie/tests/lin_session.rs:2822:9
+     |
+2822 |         hidden_witness = None;
+     |         ^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie` (test "lin_session") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running tests/lin_session.rs (target/release/deps/lin_session-951d599c581fbfea)
+
+running 1 test
+table_root=Digest([148, 228, 18, 92, 159, 9, 235, 1, 142, 70, 95, 7, 171, 134, 119, 36, 68, 154, 52, 186, 184, 27, 87, 156, 197, 93, 34, 5, 64, 158, 198, 32])
+table_configuration=Digest([180, 94, 164, 247, 112, 238, 158, 61, 81, 31, 160, 72, 176, 98, 98, 175, 194, 254, 212, 79, 91, 67, 103, 212, 93, 18, 105, 88, 173, 10, 55, 228])
+table_record_digest=Digest([36, 38, 230, 57, 231, 65, 175, 140, 75, 91, 42, 73, 167, 56, 10, 209, 58, 205, 0, 227, 94, 110, 44, 23, 231, 207, 94, 170, 205, 34, 32, 7])
+table_commit_ms=29123
+trace_verify_ms=17143
+test selected_gpt2_output_head_request_session has been running for over 60 seconds
+output_head_step=4444
+request_proof_bytes=8982632
+prove_ms=17353
+prepared_verify_ms=7984
+verify_ms=23310
+manifest_total_bytes=4170807699
+manifest_request_bytes=8982632
+total_verification_bytes=4170765206
+output_abs_max=622653884972
+output_slack_max=2143462175194
+closure_range_bits=40 closure_slack_bits=42
+ledger_events=139
+ledger_logical_openings=18129
+ledger_unique_positions=18058
+ledger_table_logical=603
+ledger_table_unique=601
+ledger_activation_openings=0
+ledger_activation_rows=16
+ledger_closure_logical=12446
+ledger_pre_closure_logical=5683
+ledger_pre_closure_unique=5661
+ledger_table_reuse=0
+ledger_code_oracles=74
+ledger_min_tail_remaining=3
+ledger_total_tail_rank=558595
+ledger_total_tail_unique=18058
+ledger_exhausted_tail_oracles=0
+hidden_prove_ms=385997
+hidden_proof_bytes=65432832
+hidden_verify_ms=64753
+ledger_final_events=145
+ledger_final_logical=18912
+ledger_final_unique=18841
+ledger_final_min_tail_remaining=0
+ledger_final_exhausted=1
+ledger_exhausted_key kind=Cs oracle=1 tree=2049 rank=259 unique=259 logical=259
+hidden_own_fold_rounds=14
+formal_manifest_total_bytes=4227257899
+test selected_gpt2_output_head_request_session ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1194.69s
+
+	Command being timed: "cargo test --release -p zkie --test lin_session selected_gpt2_output_head_request_session -- --ignored --nocapture"
+	User time (seconds): 4064.48
+	System time (seconds): 351.64
+	Percent of CPU this job got: 369%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 19:56.16
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 169403640
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 20159462
+	Voluntary context switches: 1274366
+	Involuntary context switches: 365102
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 436376
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
