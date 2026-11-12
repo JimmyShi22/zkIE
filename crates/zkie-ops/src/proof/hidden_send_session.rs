@@ -262,7 +262,7 @@ use crate::proof::output_closure::{
     ClosureRandomness, ClosureRowBinding, ClosureSecondMessages, ClosureWitness,
     CommittedClosureMask, CommittedGroupMessage, CommittedValueGroup, RetainedTrees,
 };
-use crate::proof::hidden_norm_psc::{NormFirstMessages, NormPlan, NormPscSecond};
+use crate::proof::hidden_norm_psc::{NormFirstMessages, NormPlan, NormPscSecond, NormWitness};
 use crate::proof::base_final_session::{
     fold_identity, BaseFinalCheck, BaseFinalOutcome, BaseFinalRows, BaseFinalSession, BaseMessages,
     BaseCommitment, BaseOpening, BaseOpenings, BaseProver, FoldBasis, FoldMember,
@@ -1988,6 +1988,8 @@ pub struct HiddenSendWitness {
     pub dot: Option<DotMapWitness>,
     /// The private closure messages, when the plan carries them.
     pub closure: Option<ClosureWitness>,
+    /// The private norm group messages, when the plan carries the norm.
+    pub norm: Option<NormWitness>,
 }
 
 impl HiddenSendWitness {
@@ -2363,6 +2365,7 @@ pub fn commit_w_rows(
         index_mask,
         dot: None,
         closure: None,
+        norm: None,
     };
     Ok((group, witness))
 }
@@ -4305,6 +4308,7 @@ impl HiddenProximityPlan {
         &self,
         send: &HiddenSendPlan,
         closure: Option<&ClosurePlan>,
+        norm: Option<&NormPlan>,
     ) -> Option<&'static str> {
         if self.gu.fault().is_some() || self.omega.fault().is_some() {
             return Some("a proximity message shape is not valid");
@@ -4322,6 +4326,18 @@ impl HiddenProximityPlan {
         if self.gu.u.code != self.code || self.omega.u.code != self.code || send.w.code != self.code
         {
             return Some("the proximity members do not share one main code");
+        }
+        if let Some(norm) = norm {
+            for group in [&norm.x, &norm.sum, &norm.squares, &norm.mean, &norm.variance] {
+                if group.shape.code != self.code {
+                    return Some("a norm group does not share the proximity main code");
+                }
+            }
+            if let Some(mask) = &norm.mask {
+                if mask.mask_code != self.mask_code {
+                    return Some("the norm mask does not share the proximity mask code");
+                }
+            }
         }
         if self.gu.tree.log_n_zk != self.mask_code.log_n
             || self.omega.tree.log_n_zk != self.mask_code.log_n
@@ -4444,10 +4460,10 @@ impl HiddenProximityPlan {
             }
         }
         if !self.shared_stages.is_empty() || !self.own_stages.is_empty() {
-            if proximity_iopp_plan(self, send, closure, ProximityGroupRole::Shared).is_err() {
+            if proximity_iopp_plan(self, send, closure, norm, ProximityGroupRole::Shared).is_err() {
                 return Some("the shared IOPP chain cannot be derived from the trusted plan");
             }
-            if proximity_iopp_plan(self, send, closure, ProximityGroupRole::Own).is_err() {
+            if proximity_iopp_plan(self, send, closure, norm, ProximityGroupRole::Own).is_err() {
                 return Some("the own IOPP chain cannot be derived from the trusted plan");
             }
         }
@@ -4792,7 +4808,11 @@ impl HiddenLinPlan {
             (Some(_), false) => return Err(Error::InvalidConfig),
             (None, true) => return Err(Error::InvalidConfig),
         }
-        if self.proximity.fault(&self.send, self.closure.as_ref()).is_some() {
+        if self
+            .proximity
+            .fault(&self.send, self.closure.as_ref(), self.norm.as_ref())
+            .is_some()
+        {
             return Err(Error::InvalidConfig);
         }
         if self.output_relation == Some(Digest::ZERO) {
@@ -8013,6 +8033,7 @@ fn prove_shared(
         &plan.proximity,
         &plan.send,
         plan.closure.as_ref(),
+        plan.norm.as_ref(),
         ProximityGroupRole::Shared,
     )?;
     let proximity = proximity_prove(
@@ -8293,6 +8314,7 @@ fn verify_shared(
         &plan.proximity,
         &plan.send,
         plan.closure.as_ref(),
+        plan.norm.as_ref(),
         ProximityGroupRole::Shared,
     )?;
     let _profile_proximity = zkie_engine::profile::Scope::new("verify.shared.proximity");
@@ -8735,6 +8757,104 @@ fn own_members(
             mask_message,
             mask_tails,
         });
+    }
+    if let Some(norm_plan) = &plan.norm {
+        let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
+        let norm_witness = witness.and_then(|witness| witness.norm.as_ref());
+        let positions = plan.send.positions();
+        let groups = [
+            (&norm_first.x, &norm_plan.x, norm_witness.map(|w| &w.x)),
+            (&norm_first.sum, &norm_plan.sum, norm_witness.map(|w| &w.sum)),
+            (&norm_first.squares, &norm_plan.squares, norm_witness.map(|w| &w.squares)),
+            (&norm_first.mean, &norm_plan.mean, norm_witness.map(|w| &w.mean)),
+            (&norm_first.variance, &norm_plan.variance, norm_witness.map(|w| &w.variance)),
+        ];
+        for (message, group_plan, group_witness) in groups {
+            if message.message.group.group != group_plan.group
+                || message.message.roots.len() != positions as usize
+            {
+                return Err(Error::StatementMismatch);
+            }
+            for position in 0..positions {
+                let root = message
+                    .message
+                    .group
+                    .entries
+                    .get(position as usize)
+                    .ok_or(Error::ShapeMismatch)?
+                    .root;
+                let (message_rows, tails) = match group_witness {
+                    Some(group_witness) => {
+                        let rows = group_witness
+                            .messages
+                            .get(position as usize)
+                            .ok_or(Error::ShapeMismatch)?
+                            .clone();
+                        let row_count = usize::try_from(group_plan.shape.main_rows)
+                            .map_err(|_| Error::ResourceLimit)?;
+                        let tail_len = usize::try_from(group_plan.shape.code.r)
+                            .map_err(|_| Error::ResourceLimit)?;
+                        let flat = group_witness
+                            .tails
+                            .get(position as usize)
+                            .ok_or(Error::ShapeMismatch)?;
+                        let mut tails = Vec::with_capacity(row_count);
+                        for row in 0..row_count {
+                            tails.push(
+                                flat.get(row * tail_len..(row + 1) * tail_len)
+                                    .ok_or(Error::ShapeMismatch)?
+                                    .to_vec(),
+                            );
+                        }
+                        (rows, tails)
+                    }
+                    None => (Vec::new(), Vec::new()),
+                };
+                members.push(ProximityMember {
+                    bat_oracle: 0,
+                    source_oracle: group_plan
+                        .oracle_base
+                        .checked_add(position as u64)
+                        .ok_or(Error::ResourceLimit)?,
+                    main_code: group_plan.shape.code,
+                    mask_code: plan.proximity.mask_code,
+                    main_rows: group_plan.shape.main_rows,
+                    mask_rows: 0,
+                    answers: group_plan.shape.answers,
+                    root,
+                    tree_plan: group_plan.shape.tree_plan(position)?,
+                    message: message_rows,
+                    tails,
+                    mask_message: Vec::new(),
+                    mask_tails: Vec::new(),
+                });
+            }
+        }
+        if let Some(mask_plan) = &norm_plan.mask {
+            let mask_first = norm_first.mask.as_ref().ok_or(Error::ShapeMismatch)?;
+            if mask_first.tree != mask_plan.tree {
+                return Err(Error::StatementMismatch);
+            }
+            let (mask_rows, mask_tails) = match norm_witness {
+                Some(witness) => (witness.mask_rows.clone(), witness.mask_tails.clone()),
+                None => (Vec::new(), Vec::new()),
+            };
+            members.push(ProximityMember {
+                bat_oracle: 0,
+                source_oracle: mask_plan.oracle,
+                main_code: plan.proximity.code,
+                mask_code: mask_plan.mask_code,
+                main_rows: 0,
+                mask_rows: mask_plan.mask_rows,
+                answers: mask_plan.answers,
+                root: mask_first.root,
+                tree_plan: mask_plan.tree.clone(),
+                message: Vec::new(),
+                tails: Vec::new(),
+                mask_message: mask_rows,
+                mask_tails,
+            });
+        }
     }
     members.sort_by_key(|member| std::cmp::Reverse((member.main_rows, member.source_oracle)));
     let mut order = Vec::with_capacity(members.len());
@@ -10040,6 +10160,7 @@ fn prove_second(
         &plan.proximity,
         &plan.send,
         plan.closure.as_ref(),
+        plan.norm.as_ref(),
         ProximityGroupRole::Own,
     )?;
     let _profile_proximity = zkie_engine::profile::Scope::new("second.proximity");
@@ -10279,6 +10400,7 @@ fn verify_second(
         &plan.proximity,
         &plan.send,
         plan.closure.as_ref(),
+        plan.norm.as_ref(),
         ProximityGroupRole::Own,
     )?;
     let _profile_proximity = zkie_engine::profile::Scope::new("verify.second.proximity");
@@ -11146,6 +11268,7 @@ fn get_shared(
         &plan.proximity,
         &plan.send,
         plan.closure.as_ref(),
+        plan.norm.as_ref(),
         ProximityGroupRole::Shared,
     )?;
     let tail = get_tail(reader, iopp.as_ref())?;
@@ -11338,6 +11461,7 @@ fn get_second(reader: &mut CanonicalReader<'_>, plan: &HiddenLinPlan) -> Result<
         &plan.proximity,
         &plan.send,
         plan.closure.as_ref(),
+        plan.norm.as_ref(),
         ProximityGroupRole::Own,
     )?;
     let tail = get_tail(reader, iopp.as_ref())?;
@@ -12664,6 +12788,116 @@ mod merged_tests {
 
     /// One two-stage chain on the toy group's own codes. The stage list is
     /// plan data: it derives a loop chain but no proof is made against it.
+    fn norm_group(columns: u64, group: u64, oracle: u64, tree: u64) -> crate::proof::hidden_norm_psc::NormGroupPlan {
+        crate::proof::hidden_norm_psc::NormGroupPlan {
+            shape: WShape::new(
+                columns,
+                code(),
+                1,
+                POSITIONS,
+                SALT,
+                tree,
+                1,
+                W_RUN,
+                W_CONFIGURATION,
+            )
+            .unwrap(),
+            columns,
+            group,
+            oracle_base: oracle,
+            openings: 1,
+        }
+    }
+
+    fn norm_plan() -> crate::proof::hidden_norm_psc::NormPlan {
+        let columns = COLUMNS;
+        crate::proof::hidden_norm_psc::NormPlan {
+            shape: crate::proof::hidden_norm::NormShape::new(POSITIONS, HIDDEN, HIDDEN)
+                .unwrap(),
+            columns,
+            variables: columns.trailing_zeros() as usize + 1,
+            x: norm_group(columns, 80, 9000, 60000),
+            x_roots: (0..POSITIONS)
+                .map(|position| Digest([0x90 + position as u8; 32]))
+                .collect(),
+            sum: norm_group(1, 81, 9100, 60100),
+            squares: norm_group(1, 82, 9200, 60200),
+            mean: norm_group(1, 83, 9300, 60300),
+            variance: norm_group(1, 84, 9400, 60400),
+            mask: None,
+        }
+    }
+
+    fn norm_mask_plan() -> crate::proof::hidden_norm_psc::NormMaskPlan {
+        crate::proof::hidden_norm_psc::NormMaskPlan {
+            oracle: 9500,
+            group: 85,
+            mask_code: mask_code(),
+            mask_rows: 1,
+            answers: 1,
+            openings: 1,
+            tree: zkie_engine::pcs::request::runtime_tree::RuntimeTreePlan {
+                tree_number: 60500,
+                leaf_class: 1,
+                log_n: 4,
+                log_n_zk: 4,
+                parts: vec![zkie_engine::pcs::request::runtime_tree::RuntimeTreePart {
+                    main_symbols: 0,
+                    mask_symbols: 1,
+                }],
+                salt_bytes: SALT,
+                run: W_RUN,
+                configuration: W_CONFIGURATION,
+            },
+            positions: POSITIONS,
+            hiding: 1,
+            shown: 1,
+            claims: 1,
+        }
+    }
+
+    #[test]
+    fn norm_groups_are_counted_in_the_proximity_bound() {
+        use crate::proof::proximity_iopp::proximity_bound_ids;
+        let activation = activation();
+        let plan = plan(&activation);
+        let positions = plan.send.positions() as u64;
+        let without = proximity_bound_ids(&plan.proximity, &plan.send, None, None).unwrap();
+        let norm = norm_plan();
+        norm.validate().unwrap();
+        let mut integrated = plan.clone();
+        integrated.norm = Some(norm.clone());
+        integrated.validate().unwrap();
+        let with =
+            proximity_bound_ids(&plan.proximity, &plan.send, None, Some(&norm)).unwrap();
+
+        let groups = [&norm.x, &norm.sum, &norm.squares, &norm.mean, &norm.variance];
+        for group in groups {
+            for position in 0..positions {
+                let oracle = group.oracle_base + position;
+                assert!(!without.oracles.contains(&oracle));
+                assert!(with.oracles.contains(&oracle));
+                let tree = group.shape.tree_number + position;
+                assert!(!without.trees.contains(&tree));
+                assert!(with.trees.contains(&tree));
+            }
+        }
+        let last_member = positions + 1 + 5 * positions - 1;
+        assert!(!without.oracles.contains(&last_member));
+        assert!(with.oracles.contains(&last_member));
+
+        let mut masked = norm.clone();
+        masked.mask = Some(norm_mask_plan());
+        masked.validate().unwrap();
+        let with_mask =
+            proximity_bound_ids(&plan.proximity, &plan.send, None, Some(&masked)).unwrap();
+        assert!(with_mask.oracles.contains(&(last_member + 1)));
+        assert!(with_mask.oracles.contains(&9500));
+        assert!(with_mask.trees.contains(&60500));
+        assert!(!with.oracles.contains(&9500));
+        assert!(!with.trees.contains(&60500));
+    }
+
     fn staged_plan(plan: &HiddenLinPlan) -> HiddenLinPlan {
         let mut staged = plan.clone();
         let main = plan.proximity.code;
@@ -13527,6 +13761,7 @@ mod merged_tests {
             &staged.proximity,
             &staged.send,
             staged.closure.as_ref(),
+            staged.norm.as_ref(),
             ProximityGroupRole::Shared,
         )
         .unwrap()
@@ -13535,6 +13770,7 @@ mod merged_tests {
             &staged.proximity,
             &staged.send,
             staged.closure.as_ref(),
+            staged.norm.as_ref(),
             ProximityGroupRole::Own,
         )
         .unwrap()
@@ -13557,6 +13793,7 @@ mod merged_tests {
             &staged.proximity,
             &staged.send,
             staged.closure.as_ref(),
+            staged.norm.as_ref(),
             ProximityGroupRole::Shared,
         )
         .unwrap()
@@ -13565,6 +13802,7 @@ mod merged_tests {
             &staged.proximity,
             &staged.send,
             staged.closure.as_ref(),
+            staged.norm.as_ref(),
             ProximityGroupRole::Own,
         )
         .unwrap()
@@ -13953,7 +14191,7 @@ mod merged_tests {
         let mut send = base.send.clone();
         send.openings_per_oracle = (send.w.code.r + 1 - own) as usize;
         assert_eq!(
-            proximity.fault(&send, None),
+            proximity.fault(&send, None, None),
             Some("the W SEND and own-BASE openings exceed the code tail")
         );
 
@@ -13961,14 +14199,14 @@ mod merged_tests {
         let index = send.index_mask.as_mut().expect("index mask");
         index.openings = (index.mask_code.r + 1 - own) as usize;
         assert_eq!(
-            proximity.fault(&send, None),
+            proximity.fault(&send, None, None),
             Some("the index-mask SEND and own-BASE openings exceed the mask tail")
         );
 
         let mut wide = proximity.clone();
         wide.shared_base_positions = (base.proximity.code.r + 1 - own) as usize;
         assert_eq!(
-            wide.fault(&base.send, None),
+            wide.fault(&base.send, None, None),
             Some("the Omega shared and own-BASE openings exceed the code tail")
         );
 
@@ -13976,13 +14214,13 @@ mod merged_tests {
         budget.column_draws = base.send.table_shape.code.r as usize + 1;
         budget.column_budget = budget.column_draws;
         assert_eq!(
-            budget.fault(&base.send, None),
+            budget.fault(&base.send, None, None),
             Some("the table column budget exceeds the table code tail")
         );
 
         let mut shown = base.send.clone();
         shown.dot.as_mut().expect("shown map").shape.code.r = own - 1;
-        assert!(proximity.fault(&shown, None).is_some());
+        assert!(proximity.fault(&shown, None, None).is_some());
         assert!(base.validate().is_ok());
     }
 }

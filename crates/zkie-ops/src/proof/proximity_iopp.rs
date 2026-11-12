@@ -23,6 +23,7 @@ use crate::proof::multi_stage_iopp::{
     IoppChain, IoppChainConfig, IoppStageFoldIds, IoppStageSeed,
 };
 use crate::proof::output_closure::ClosurePlan;
+use crate::proof::hidden_norm_psc::NormPlan;
 
 /// The leaf class of the BASE star tree. It is distinct from the mask-only
 /// class and from the switched-message class, so a star tree can never be
@@ -111,6 +112,7 @@ pub fn proximity_bound_ids(
     proximity: &HiddenProximityPlan,
     send: &HiddenSendPlan,
     closure: Option<&ClosurePlan>,
+    norm: Option<&NormPlan>,
 ) -> Result<IoppBoundIds> {
     let positions = send.positions() as u64;
     let mut oracles = vec![0u64, send.group];
@@ -142,6 +144,17 @@ pub fn proximity_bound_ids(
             .checked_add(closure_members)
             .ok_or(Error::ResourceLimit)?;
     }
+    if let Some(norm) = norm {
+        let norm_members = positions
+            .checked_mul(5)
+            .and_then(|value| {
+                value.checked_add(if norm.mask.is_some() { 1 } else { 0 })
+            })
+            .ok_or(Error::ResourceLimit)?;
+        own_member_bound = own_member_bound
+            .checked_add(norm_members)
+            .ok_or(Error::ResourceLimit)?;
+    }
     oracles.extend(0..own_member_bound);
     oracles.push(proximity.gu.oracle);
     oracles.push(proximity.omega.oracle);
@@ -159,6 +172,20 @@ pub fn proximity_bound_ids(
         push_range(&mut oracles, closure.bits_oracle_base, positions)?;
         push_range(&mut oracles, closure.map_oracle_base, positions)?;
         oracles.push(closure.mask.oracle);
+    }
+    if let Some(norm) = norm {
+        for group in [
+            &norm.x,
+            &norm.sum,
+            &norm.squares,
+            &norm.mean,
+            &norm.variance,
+        ] {
+            push_range(&mut oracles, group.oracle_base, positions)?;
+        }
+        if let Some(mask) = &norm.mask {
+            oracles.push(mask.oracle);
+        }
     }
 
     let mut trees = vec![
@@ -179,6 +206,20 @@ pub fn proximity_bound_ids(
         push_range(&mut trees, closure.bits.tree_number, positions)?;
         push_range(&mut trees, closure.map.tree_number, positions)?;
         trees.push(closure.mask.tree.tree_number);
+    }
+    if let Some(norm) = norm {
+        for group in [
+            &norm.x,
+            &norm.sum,
+            &norm.squares,
+            &norm.mean,
+            &norm.variance,
+        ] {
+            push_range(&mut trees, group.shape.tree_number, positions)?;
+        }
+        if let Some(mask) = &norm.mask {
+            trees.push(mask.tree.tree_number);
+        }
     }
     Ok(IoppBoundIds::new(oracles, trees))
 }
@@ -201,9 +242,10 @@ pub fn proximity_iopp_plan(
     proximity: &HiddenProximityPlan,
     send: &HiddenSendPlan,
     closure: Option<&ClosurePlan>,
+    norm: Option<&NormPlan>,
     role: ProximityGroupRole,
 ) -> Result<Option<ProximityIoppPlan>> {
-    let mut bound = proximity_bound_ids(proximity, send, closure)?;
+    let mut bound = proximity_bound_ids(proximity, send, closure, norm)?;
     let shared = derive_group(proximity, &bound, ProximityGroupRole::Shared)?;
     if let Some(plan) = &shared {
         bound.reserve(&plan.chain.config);

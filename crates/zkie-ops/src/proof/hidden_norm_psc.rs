@@ -843,6 +843,27 @@ impl NormMaskMessage {
     }
 }
 
+/// The prover-side message rows and encoding tails of one norm group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormGroupWitness {
+    /// `messages[position][row][place]`, the unencoded message rows.
+    pub messages: Vec<Vec<Vec<Fp3>>>,
+    /// `tails[position][row * r + i]`.
+    pub tails: Vec<Vec<Fp3>>,
+}
+
+/// The prover-side witness of the integrated norm groups.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormWitness {
+    pub x: NormGroupWitness,
+    pub sum: NormGroupWitness,
+    pub squares: NormGroupWitness,
+    pub mean: NormGroupWitness,
+    pub variance: NormGroupWitness,
+    pub mask_rows: Vec<Vec<Fp3>>,
+    pub mask_tails: Vec<Vec<Fp3>>,
+}
+
 /// The public first-stage message of the integrated norm relation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormFirstMessages {
@@ -965,6 +986,7 @@ impl NormFirstMessages {
 mod tests {
     use super::*;
     use zkie_engine::pcs::request::code::build_code_plan;
+    use zkie_engine::pcs::request::runtime_tree::RuntimeTreePart;
     use zkie_engine::pcs::request::fold::{ByteMaskCoins, MaskCoins};
     use zkie_engine::pcs::request::table::SampleSeed;
 
@@ -1252,8 +1274,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn integrated_first_round_trips_with_trusted_x_and_witness_roots() {
+    fn integrated_fixture() -> (NormPlan, NormFirstMessages, NormPscSecond) {
         let (psc, _rows, first, second) = fixture();
         let plan = NormPlan {
             shape: psc.shape,
@@ -1275,6 +1296,12 @@ mod tests {
             variance: first.variance.clone(),
             mask: None,
         };
+        (plan, message, second)
+    }
+
+    #[test]
+    fn integrated_first_round_trips_with_trusted_x_and_witness_roots() {
+        let (plan, message, second) = integrated_fixture();
         let bytes = message.encode().unwrap();
         let decoded = NormFirstMessages::decode(&plan, &bytes).unwrap();
         assert_eq!(decoded, message);
@@ -1282,6 +1309,99 @@ mod tests {
         let second_bytes = second.encode().unwrap();
         let decoded_second = NormPscSecond::decode_for(&plan, &second_bytes).unwrap();
         assert_eq!(decoded_second, second);
+    }
+
+    #[test]
+    fn integrated_trusted_x_root_and_opening_budget_are_checked() {
+        let (plan, message, second) = integrated_fixture();
+        let mut changed = message.clone();
+        changed.x.message.roots[0] = Digest([0x99; 32]);
+        assert!(changed.check_trusted(&plan).is_err());
+
+        let mut changed = message.clone();
+        changed.sum.message.group.entries[0].root = Digest([0x99; 32]);
+        changed.sum.message.roots[0] = Digest([0x99; 32]);
+        assert!(changed.check_trusted(&plan).is_ok());
+
+        let mut changed = plan.clone();
+        changed.x.openings = 0;
+        assert!(changed.validate().is_err());
+
+        let mut changed = plan.clone();
+        changed.squares.shape.main_rows = 0;
+        assert!(changed.validate().is_err());
+
+        assert!(NormPscSecond::decode_for(&plan, &second.encode().unwrap()).is_ok());
+    }
+
+    fn mask_plan() -> NormMaskPlan {
+        NormMaskPlan {
+            oracle: 7000,
+            group: 7001,
+            mask_code: build_code_plan(4, 8, 1).unwrap(),
+            mask_rows: 1,
+            answers: 1,
+            openings: 1,
+            tree: zkie_engine::pcs::request::runtime_tree::RuntimeTreePlan {
+                tree_number: 7002,
+                leaf_class: 1,
+                log_n: 4,
+                log_n_zk: 4,
+                parts: vec![RuntimeTreePart {
+                    main_symbols: 0,
+                    mask_symbols: 1,
+                }],
+                salt_bytes: 40,
+                run: Digest([0x71; 32]),
+                configuration: Digest([0x72; 32]),
+            },
+            positions: 2,
+            hiding: 1,
+            shown: 2,
+            claims: 1,
+        }
+    }
+
+    fn mask_message(plan: &NormMaskPlan) -> NormMaskMessage {
+        NormMaskMessage {
+            tree: plan.tree.clone(),
+            root: Digest([0x73; 32]),
+            sample: SendSamples {
+                seed: vec![zkie_engine::pcs::request::table::SampleSeed {
+                    z: Vec::new(),
+                    beta: Fp3::ONE,
+                }],
+                answers: vec![Fp3::ONE],
+            },
+            positions: vec![0],
+            opening: zkie_engine::pcs::request::runtime_tree::RuntimeTreeOpening {
+                positions: vec![0],
+                columns: Vec::new(),
+                given: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn integrated_mask_root_and_opening_shape_are_checked() {
+        let (mut plan, mut message, _second) = integrated_fixture();
+        let mask = mask_plan();
+        plan.mask = Some(mask.clone());
+        message.mask = Some(mask_message(&mask));
+        plan.validate().unwrap();
+        message.check_trusted(&plan).unwrap();
+
+        let mut changed = message.clone();
+        changed.mask.as_mut().unwrap().root = Digest::ZERO;
+        assert!(changed.check_trusted(&plan).is_err());
+
+        let mut changed = message.clone();
+        changed.mask.as_mut().unwrap().tree.tree_number = 9999;
+        assert!(changed.check_trusted(&plan).is_err());
+
+        let mut changed = message.clone();
+        changed.mask.as_mut().unwrap().positions = vec![1];
+        assert!(changed.check_trusted(&plan).is_err());
     }
 
 }

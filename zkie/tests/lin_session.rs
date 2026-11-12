@@ -1375,6 +1375,7 @@ fn selected_gpt2_output_head_request_session() {
             &ledger_plan.proximity,
             &ledger_plan.send,
             ledger_plan.closure.as_ref(),
+            ledger_plan.norm.as_ref(),
             ProximityGroupRole::Own,
         )
         .expect("derive the own loop chain")
@@ -1383,6 +1384,7 @@ fn selected_gpt2_output_head_request_session() {
             &ledger_plan.proximity,
             &ledger_plan.send,
             ledger_plan.closure.as_ref(),
+            ledger_plan.norm.as_ref(),
             ProximityGroupRole::Shared,
         )
         .expect("derive the shared loop chain")
@@ -1883,7 +1885,11 @@ fn selected_gpt2_output_head_request_session() {
         bad_own.own_stages[0].positions += 1;
         assert!(
             bad_own
-                .fault(&fault_plan.send, fault_plan.closure.as_ref())
+                .fault(
+                    &fault_plan.send,
+                    fault_plan.closure.as_ref(),
+                    fault_plan.norm.as_ref(),
+                )
                 .is_some(),
             "a changed own position must fail the trusted plan"
         );
@@ -1891,7 +1897,11 @@ fn selected_gpt2_output_head_request_session() {
         bad_shared.shared_stages[0].positions = 3;
         assert!(
             bad_shared
-                .fault(&fault_plan.send, fault_plan.closure.as_ref())
+                .fault(
+                    &fault_plan.send,
+                    fault_plan.closure.as_ref(),
+                    fault_plan.norm.as_ref(),
+                )
                 .is_some(),
             "a changed shared join count must fail the trusted plan"
         );
