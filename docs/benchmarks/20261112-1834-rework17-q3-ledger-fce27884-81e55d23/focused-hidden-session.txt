@@ -1,0 +1,134 @@
+warning: unused variable: `number`
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1513:9
+     |
+1513 |         number: u32,
+     |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_number`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `target`
+   --> crates/zkie-engine/src/pcs/request/relation.rs:881:5
+    |
+881 |     target: Fp3,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+
+warning: unused variable: `columns_usize`
+   --> crates/zkie-engine/src/pcs/request/table.rs:952:13
+    |
+952 |         let columns_usize = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_columns_usize`
+
+warning: field `target` is never read
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1118:5
+     |
+1112 | struct FoldOutputMeta {
+     |        -------------- field in this struct
+...
+1118 |     target: Fp3,
+     |     ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-engine` (lib) generated 4 warnings (run `cargo fix --lib -p zkie-engine` to apply 3 suggestions)
+warning: unused import: `MODULUS`
+   --> crates/zkie-ops/src/proof/bat_fold_session.rs:147:59
+    |
+147 | use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE, MODULUS};
+    |                                                           ^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `ClosurePlan`
+    --> crates/zkie-ops/src/proof/output_head_lin.rs:1583:57
+     |
+1583 |     use crate::proof::output_closure::{ClosureMaskPlan, ClosurePlan};
+     |                                                         ^^^^^^^^^^^
+
+warning: unused import: `PrimeField64`
+    --> crates/zkie-ops/src/proof/output_head_lin.rs:1590:61
+     |
+1590 |     use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
+     |                                                             ^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/base_last_session.rs:589:13
+    |
+589 |         let mut message = self.chain.message();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `first`
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:8855:5
+     |
+8855 |     first: &HiddenSendMessages,
+     |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_first`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `plan` is never read
+   --> crates/zkie-ops/src/proof/cs_multi_session.rs:201:5
+    |
+195 | pub struct CsMultiSession {
+    |            -------------- field in this struct
+...
+201 |     plan: RuntimeTreePlan,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-ops` (lib test) generated 6 warnings (run `cargo fix --lib -p zkie-ops --tests` to apply 5 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/zkie_ops-d20b4f9af95f6295)
+
+running 45 tests
+test proof::hidden_send_session::iopp_stage_plan_tests::actual_shared_and_own_stage_lists_are_legal ... ok
+test proof::hidden_send_session::iopp_stage_plan_tests::bad_stage_chains_are_rejected ... ok
+test proof::hidden_send_session::merged_tests::public_mask_view_rank_leaves_the_expected_kernel ... ok
+test proof::hidden_send_session::rework7_joint_tests::eval_target_is_the_real_multilinear_evaluation_plus_a_one_time_mask ... ok
+test proof::hidden_send_session::merged_tests::proximity_tail_union_is_enforced_by_the_plan ... ok
+test proof::hidden_send_session::tests::changed_message_with_original_tree_changes_the_group_table ... ok
+test proof::hidden_send_session::tests::full_matrix_w_shape_fits_the_large_message ... ok
+test proof::hidden_send_session::rework7_joint_tests::send_answer_is_the_real_index_mask_sample_plus_its_pad ... ok
+test proof::hidden_send_session::tests::retained_tree_checks_plan_and_sealed_root ... ok
+test proof::hidden_send_session::tests::changed_activation_commitment_or_value_is_rejected ... ok
+test proof::hidden_send_session::tests::derived_rows_follow_the_matrix_mapping ... ok
+test proof::hidden_send_session::tests::x_commitment_is_hiding_and_bound ... ok
+test proof::hidden_send_session::tests::missing_sample_is_rejected ... ok
+test proof::hidden_send_session::tests::changed_encoded_table_identity_is_rejected ... ok
+test proof::hidden_send_session::tests::wrong_row_or_root_is_rejected ... ok
+test proof::hidden_send_session::tests::honest_run_registers_samples_and_eval_rows ... ok
+test proof::hidden_send_session::tests::changed_sample_answer_is_rejected_by_the_witness_check ... ok
+test proof::hidden_send_session::tests::changed_seed_or_position_is_rejected ... ok
+test proof::hidden_send_session::tests::changed_eval_target_or_chain_value_is_rejected ... ok
+test proof::hidden_send_session::tests::canonical_messages_round_trip_and_reject_tampering ... ok
+test proof::hidden_send_session::tests::group_table_rejects_malformed_members_and_cross_block_placement ... ok
+test proof::hidden_send_session::merged_tests::changed_output_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::column_budget_is_enforced ... ok
+test proof::hidden_send_session::merged_tests::the_two_groups_share_one_registry ... ok
+test proof::hidden_send_session::merged_tests::a_staged_plan_rejects_the_single_stage_tail ... ok
+test proof::hidden_send_session::merged_tests::changed_activation_commitment_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::old_or_unknown_session_layout_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::changed_table_root_or_record_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::missing_stage_or_seal_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::merged_toy_run_accepts ... ok
+test proof::hidden_send_session::merged_tests::hidden_input_mode_accepts_without_output_rows ... ok
+test proof::hidden_send_session::merged_tests::hidden_masked_eval_and_dot_rows_are_bound ... ok
+test proof::hidden_send_session::merged_tests::mask_slot_schema_is_separate_and_one_time ... ok
+test proof::hidden_send_session::merged_tests::hidden_dot_residual_encoding_is_canonical ... ok
+test proof::hidden_send_session::merged_tests::changed_plan_or_statement_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::changed_column_position_or_nonce_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::hidden_dot_residual_is_independent_and_batched ... ok
+test proof::hidden_send_session::merged_tests::changed_w_root_or_row_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::hidden_dot_changed_mask_entries_are_rejected_by_the_plaintext_check ... ok
+test proof::hidden_send_session::merged_tests::changed_second_values_are_rejected ... ok
+test proof::hidden_send_session::merged_tests::staged_final_verifier_accepts_and_rejects_tampering ... ok
+test proof::hidden_send_session::merged_tests::changed_shared_values_are_rejected ... ok
+test proof::hidden_send_session::merged_tests::hidden_dot_residual_negatives_reach_the_verifier ... ok
+test proof::hidden_send_session::merged_tests::hidden_masked_negatives_reach_the_final_verifier ... ok
+test proof::hidden_send_session::merged_tests::hidden_dot_row_negatives_reach_the_final_verifier ... ok
+
+test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 205 filtered out; finished in 0.49s
+

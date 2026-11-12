@@ -1,0 +1,14 @@
+ledger_events=141
+ledger_logical_openings=18775
+ledger_unique_positions=18772
+hidden_prove_ms=771636
+hidden_proof_bytes=214228928
+hidden_verify_ms=76442
+ledger_final_events=147
+ledger_final_logical=19558
+ledger_final_unique=19555
+ledger_final_min_tail_remaining=0
+ledger_final_exhausted=3
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1622.63s
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 27:04.12
+	Maximum resident set size (kbytes): 213944084
