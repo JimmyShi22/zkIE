@@ -1,0 +1,6 @@
+12f655cc Add the plan-level previous object identity and layout checks
+ crates/zkie-ops/src/proof/output_head_lin.rs  | 201 ++++++++++++--
+ crates/zkie-ops/src/proof/plan.rs             | 363 ++++++++++++++++++++++++++
+ crates/zkie-ops/src/proof/session_baseline.rs |   1 +
+ models/gpt2/src/plan.rs                       |  32 +++
+ 4 files changed, 570 insertions(+), 27 deletions(-)
