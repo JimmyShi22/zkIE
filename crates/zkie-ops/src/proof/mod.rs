@@ -23,6 +23,7 @@ pub mod plan;
 pub mod proximity_session;
 pub mod psc;
 pub mod psc_general;
+pub mod lookup;
 pub mod relations;
 pub mod session_baseline;
 pub mod multi_stage_iopp;

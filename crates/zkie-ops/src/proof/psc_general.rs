@@ -52,7 +52,7 @@ pub enum Summand {
     /// `y_0^2 - y_0`: one shown map, degree two.
     Bits,
     /// `1 + b_i (alpha - 1 - tau(point))`: no shown map, one kept map.
-    Leaves { alpha: Fp3 },
+    Leaves { alpha: Fp3, mu: usize },
 }
 
 impl Summand {
@@ -102,8 +102,11 @@ impl Summand {
             )]),
             Self::TieNext => Ok(vec![shown[0].mul(&shown[0]).mul(&shown[1])]),
             Self::Bits => Ok(vec![shown[0].mul(&shown[0]).sub(&shown[0])]),
-            Self::Leaves { alpha } => {
-                let table_at = table.ok_or(Error::UnsupportedPrimitive)?.at(point)?;
+            Self::Leaves { alpha, mu } => {
+                let table_point = point.get(*mu..).ok_or(Error::ShapeMismatch)?;
+                let table_at = table
+                    .ok_or(Error::UnsupportedPrimitive)?
+                    .at(table_point)?;
                 Ok(vec![Fp3::ONE, alpha.sub(&Fp3::ONE).sub(&table_at)])
             }
         }
@@ -660,7 +663,9 @@ fn interpolate(values: &[Fp3]) -> Result<Vec<Fp3>> {
 
 fn add_scaled(target: &mut [Fp3], source: &[Fp3], scale: Fp3) -> Result<()> {
     if source.len() > target.len() {
-        return Err(Error::ShapeMismatch);
+        if source[target.len()..].iter().any(|value| *value != Fp3::ZERO) {
+            return Err(Error::ShapeMismatch);
+        }
     }
     for (slot, value) in target.iter_mut().zip(source) {
         *slot = slot.add(&scale.mul(value));
@@ -916,7 +921,9 @@ pub fn verify_general(
         drawn.push(beta);
         running = poly_at(&round, beta);
     }
-    challenges.send_end_values(&proof.end_values)?;
+    if summand.shown() > 0 {
+        challenges.send_end_values(&proof.end_values)?;
+    }
     output(
         &variables,
         summand,
@@ -1248,6 +1255,7 @@ mod tests {
         let table = [f(3), f(5)];
         let values = [f(1), f(0)];
         let alpha = f(9);
+        let leaves = Summand::Leaves { alpha, mu: 0 };
         let variables = [Weight::equality(z[0], 3).unwrap()];
         let mut target = Fp3::ZERO;
         for index in 0..2 {
@@ -1256,7 +1264,7 @@ mod tests {
             target = target.add(&weight.mul(&Fp3::ONE.add(&values[index].mul(&coefficient))));
         }
         let masks = GeneralMaskEntries {
-            hiding: (0..hp_entries(&general_variables(&variables, &Summand::Leaves { alpha }).unwrap()).unwrap())
+            hiding: (0..hp_entries(&general_variables(&variables, &leaves).unwrap()).unwrap())
                 .map(|index| f(70 + index as u64))
                 .collect(),
             shown: Vec::new(),
@@ -1268,7 +1276,7 @@ mod tests {
             &[],
             &|_| Ok(Fp3::ZERO),
             target,
-            &Summand::Leaves { alpha },
+            &leaves,
             Some(&table_impl),
             &mut inner,
             &masks,
@@ -1279,7 +1287,7 @@ mod tests {
             &variables,
             &[],
             target,
-            &Summand::Leaves { alpha },
+            &leaves,
             Some(&table_impl),
             &proof,
             masks.hiding.len(),
@@ -1301,13 +1309,13 @@ mod tests {
             }
         }
         let table = TwoPointTable;
-        let coefficients = Summand::Leaves { alpha: f(9) }
+        let coefficients = Summand::Leaves { alpha: f(9), mu: 0 }
             .at(&[f(1)], &[], &[Fp3::ZERO], Some(&table))
             .unwrap();
         assert_eq!(coefficients.len(), 2);
         assert_eq!(coefficients[0], Fp3::ONE);
         assert_eq!(coefficients[1], f(9).sub(&Fp3::ONE).sub(&f(5)));
-        assert!(Summand::Leaves { alpha: f(9) }
+        assert!(Summand::Leaves { alpha: f(9), mu: 0 }
             .at(&[f(1)], &[], &[Fp3::ZERO], None)
             .is_err());
     }
