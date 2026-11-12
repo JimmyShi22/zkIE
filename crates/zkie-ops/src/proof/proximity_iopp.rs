@@ -16,10 +16,13 @@ use zkie_engine::pcs::request::runtime_tree::{MaskTreePlan, RuntimeTreePart, Run
 use zkie_engine::primitives::codec::CanonicalWriter;
 use zkie_engine::primitives::transcript::{hash_labeled, tag_word, PARAMETERS};
 
-use crate::proof::hidden_send_session::{iopp_stage_fault, HiddenLinPlan, IoppStagePlan};
+use crate::proof::hidden_send_session::{
+    iopp_stage_fault, HiddenProximityPlan, HiddenSendPlan, IoppStagePlan,
+};
 use crate::proof::multi_stage_iopp::{
     IoppChain, IoppChainConfig, IoppStageFoldIds, IoppStageSeed,
 };
+use crate::proof::output_closure::ClosurePlan;
 
 /// The leaf class of the BASE star tree. It is distinct from the mask-only
 /// class and from the switched-message class, so a star tree can never be
@@ -81,8 +84,11 @@ impl IoppBoundIds {
 /// range, the two fresh masks, the optional shown-map and index-mask members
 /// and the output closure. The stage FOLD allocation may not reuse any of
 /// them, and no derived tree may take one of their tree numbers.
-pub fn proximity_bound_ids(plan: &HiddenLinPlan) -> Result<IoppBoundIds> {
-    let send = &plan.send;
+pub fn proximity_bound_ids(
+    proximity: &HiddenProximityPlan,
+    send: &HiddenSendPlan,
+    closure: Option<&ClosurePlan>,
+) -> Result<IoppBoundIds> {
     let positions = send.positions() as u64;
     let mut oracles = vec![0u64, send.group];
     // The two shared members and the declared bound of the own group's
@@ -93,10 +99,10 @@ pub fn proximity_bound_ids(plan: &HiddenLinPlan) -> Result<IoppBoundIds> {
         .and_then(|value| value.checked_add(4))
         .ok_or(Error::ResourceLimit)?;
     oracles.extend(0..own_member_bound);
-    oracles.push(plan.proximity.gu.oracle);
-    oracles.push(plan.proximity.omega.oracle);
-    oracles.push(plan.proximity.shared_fresh);
-    oracles.push(plan.proximity.own_fresh);
+    oracles.push(proximity.gu.oracle);
+    oracles.push(proximity.omega.oracle);
+    oracles.push(proximity.shared_fresh);
+    oracles.push(proximity.own_fresh);
     push_range(&mut oracles, send.oracle_base, positions)?;
     if let Some(index) = &send.index_mask {
         oracles.push(index.oracle);
@@ -104,7 +110,7 @@ pub fn proximity_bound_ids(plan: &HiddenLinPlan) -> Result<IoppBoundIds> {
     if let Some(dot) = &send.dot {
         oracles.push(dot.oracle);
     }
-    if let Some(closure) = &plan.closure {
+    if let Some(closure) = closure {
         push_range(&mut oracles, closure.slack_oracle_base, positions)?;
         push_range(&mut oracles, closure.bits_oracle_base, positions)?;
         push_range(&mut oracles, closure.map_oracle_base, positions)?;
@@ -112,10 +118,10 @@ pub fn proximity_bound_ids(plan: &HiddenLinPlan) -> Result<IoppBoundIds> {
     }
 
     let mut trees = vec![
-        plan.proximity.gu.tree.tree_number,
-        plan.proximity.omega.tree.tree_number,
-        plan.proximity.shared_mask_tree.tree_number,
-        plan.proximity.own_mask_tree.tree_number,
+        proximity.gu.tree.tree_number,
+        proximity.omega.tree.tree_number,
+        proximity.shared_mask_tree.tree_number,
+        proximity.own_mask_tree.tree_number,
     ];
     push_range(&mut trees, send.w.tree_number, positions)?;
     if let Some(index) = &send.index_mask {
@@ -124,7 +130,7 @@ pub fn proximity_bound_ids(plan: &HiddenLinPlan) -> Result<IoppBoundIds> {
     if let Some(dot) = &send.dot {
         trees.push(dot.shape.tree_number);
     }
-    if let Some(closure) = &plan.closure {
+    if let Some(closure) = closure {
         push_range(&mut trees, closure.slack.tree_number, positions)?;
         push_range(&mut trees, closure.bits.tree_number, positions)?;
         push_range(&mut trees, closure.map.tree_number, positions)?;

@@ -266,6 +266,9 @@ use crate::proof::base_final_session::{
     BaseCommitment, BaseOpening, BaseOpenings, BaseProver, FoldBasis, FoldMember,
 };
 use crate::proof::fold_handoff::{FoldHandoff, FoldHandoffAnchor};
+use crate::proof::proximity_iopp::{
+    derive_proximity_iopp, proximity_bound_ids, ProximityGroupRole,
+};
 
 /// Version of the canonical messages of this interface. Version 4 carries the
 /// public Dot residual, the independent claim/tilde mask draws, the one
@@ -4385,6 +4388,40 @@ impl HiddenProximityPlan {
                 self.own_base_positions,
             ) {
                 return Some(message);
+            }
+        }
+        if !self.shared_stages.is_empty() || !self.own_stages.is_empty() {
+            let bound = match proximity_bound_ids(self, send, closure) {
+                Ok(bound) => bound,
+                Err(_) => return Some("the request identifier set cannot be derived"),
+            };
+            if !self.shared_stages.is_empty()
+                && derive_proximity_iopp(
+                    &self.shared_stages,
+                    ProximityGroupRole::Shared,
+                    &self.shared_mask_tree,
+                    0,
+                    self.shared_fresh,
+                    self.shared_base_positions,
+                    &bound,
+                )
+                .is_err()
+            {
+                return Some("the shared IOPP chain cannot be derived from the trusted plan");
+            }
+            if !self.own_stages.is_empty()
+                && derive_proximity_iopp(
+                    &self.own_stages,
+                    ProximityGroupRole::Own,
+                    &self.own_mask_tree,
+                    0,
+                    self.own_fresh,
+                    self.own_base_positions,
+                    &bound,
+                )
+                .is_err()
+            {
+                return Some("the own IOPP chain cannot be derived from the trusted plan");
             }
         }
         if self.shared_mask_tree.fault().is_some() || self.own_mask_tree.fault().is_some() {
