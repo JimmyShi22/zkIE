@@ -262,6 +262,7 @@ use crate::proof::output_closure::{
     ClosureRandomness, ClosureRowBinding, ClosureSecondMessages, ClosureWitness,
     CommittedClosureMask, CommittedGroupMessage, CommittedValueGroup, RetainedTrees,
 };
+use crate::proof::hidden_norm_psc::{NormFirstMessages, NormPlan, NormPscSecond};
 use crate::proof::base_final_session::{
     fold_identity, BaseFinalCheck, BaseFinalOutcome, BaseFinalRows, BaseFinalSession, BaseMessages,
     BaseCommitment, BaseOpening, BaseOpenings, BaseProver, FoldBasis, FoldMember,
@@ -2583,6 +2584,8 @@ pub struct HiddenSendMessages {
     /// The committed closure messages. The formal output-relation mode
     /// requires them.
     pub closure: Option<ClosureFirstMessages>,
+    /// The integrated norm first message, when the plan carries the norm.
+    pub norm: Option<NormFirstMessages>,
     pub chain_value: Digest,
 }
 
@@ -2652,6 +2655,9 @@ impl HiddenSendMessages {
             writer.put_u64(1);
             writer.put_bytes(&closure.encode()?);
         }
+        if let Some(norm) = &self.norm {
+            writer.put_bytes(&norm.encode()?);
+        }
         writer.put_digest(&self.chain_value);
         Ok(writer.into_bytes())
     }
@@ -2661,6 +2667,7 @@ impl HiddenSendMessages {
     pub fn decode(
         plan: &HiddenSendPlan,
         closure: Option<&ClosurePlan>,
+        norm: Option<&NormPlan>,
         bytes: &[u8],
     ) -> Result<Self> {
         plan.validate()?;
@@ -2802,6 +2809,10 @@ impl HiddenSendMessages {
             },
             None => None,
         };
+        let norm = match norm {
+            Some(norm_plan) => Some(NormFirstMessages::decode(norm_plan, reader.get_bytes()?)?),
+            None => None,
+        };
         let chain_value = reader.get_digest()?;
         reader.finish()?;
         Ok(Self {
@@ -2815,6 +2826,7 @@ impl HiddenSendMessages {
             index_mask,
             dot,
             closure,
+            norm,
             chain_value,
         })
     }
@@ -2984,6 +2996,7 @@ pub fn prove_hidden_send(
         dot,
         chain_value,
         closure: None,
+        norm: None,
     };
     Ok((messages, witness))
 }
@@ -4733,6 +4746,10 @@ pub struct HiddenLinPlan {
     /// The exact integer range and comparison closure. The formal
     /// hidden-input path requires it; the diagnostic path leaves it empty.
     pub closure: Option<ClosurePlan>,
+    /// The integrated norm relation. The trusted fixture input is the
+    /// product-form x group; the sum/squares/mean/variance groups are
+    /// proof-fixed witness messages. `None` keeps the existing layout.
+    pub norm: Option<NormPlan>,
 }
 
 impl HiddenLinPlan {
@@ -4746,6 +4763,12 @@ impl HiddenLinPlan {
         }
         if self.masks.len() != self.send.activation.positions as usize {
             return Err(Error::ShapeMismatch);
+        }
+        if let Some(norm) = &self.norm {
+            norm.validate()?;
+            if norm.shape.positions != self.send.activation.positions {
+                return Err(Error::ShapeMismatch);
+            }
         }
         // An empty weights list selects the hidden-input mode. The verifier
         // then has no plaintext row weights and takes the Eval targets from
@@ -4938,6 +4961,8 @@ pub struct HiddenSecondMessages {
     /// The booleanity product-sumcheck transcripts of the output closure,
     /// one per position, when the plan carries the closure.
     pub closure: Option<ClosureSecondMessages>,
+    /// The norm product-sumcheck transcripts when the plan carries the norm.
+    pub norm: Option<NormPscSecond>,
     pub fold_start: FoldStartMessage,
     pub fold_rounds: Vec<(Fp3, Fp3)>,
     /// The group's end: the single-stage BASE artifact, or the multi-stage
@@ -6937,6 +6962,7 @@ fn prove_first(
         dot,
         chain_value: first_seal,
         closure,
+        norm: None,
     };
     Ok((messages, first_seal, witness))
 }
@@ -10047,6 +10073,7 @@ fn prove_second(
             residual: dot_binding.as_ref().map(|binding| binding.residual),
             dot: dot_proof,
             closure: closure_proof,
+            norm: None,
             fold_start: proximity.messages.fold_start.clone(),
             fold_rounds: proximity.messages.fold_rounds.clone(),
             tail: proximity.messages.tail,
@@ -11240,6 +11267,9 @@ fn put_second(writer: &mut CanonicalWriter, message: &HiddenSecondMessages) -> R
         writer.put_u64(1);
         writer.put_bytes(&closure.encode()?);
     }
+    if let Some(norm) = &message.norm {
+        writer.put_bytes(&norm.encode()?);
+    }
     put_fold_start(writer, &message.fold_start);
     writer.put_u64(message.fold_rounds.len() as u64);
     for (c0, c2) in &message.fold_rounds {
@@ -11291,6 +11321,10 @@ fn get_second(reader: &mut CanonicalReader<'_>, plan: &HiddenLinPlan) -> Result<
         },
         None => None,
     };
+    let norm = match plan.norm.as_ref() {
+        Some(norm_plan) => Some(NormPscSecond::decode_for(norm_plan, reader.get_bytes()?)?),
+        None => None,
+    };
     let fold_start = get_fold_start(reader)?;
     let round_count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
     if round_count > 64 {
@@ -11316,6 +11350,7 @@ fn get_second(reader: &mut CanonicalReader<'_>, plan: &HiddenLinPlan) -> Result<
         residual,
         dot,
         closure,
+        norm,
         fold_start,
         fold_rounds,
         tail,
@@ -11351,7 +11386,12 @@ impl HiddenLinMessages {
         if layout != 14 {
             return Err(Error::InvalidEncoding);
         }
-        let first = HiddenSendMessages::decode(&plan.send, plan.closure.as_ref(), reader.get_bytes()?)?;
+        let first = HiddenSendMessages::decode(
+            &plan.send,
+            plan.closure.as_ref(),
+            plan.norm.as_ref(),
+            reader.get_bytes()?,
+        )?;
         let first_seal = reader.get_digest()?;
         let shared_bytes = reader.get_bytes()?.to_vec();
         let second_bytes = reader.get_bytes()?.to_vec();
@@ -11788,7 +11828,7 @@ mod tests {
     fn canonical_messages_round_trip_and_reject_tampering() {
         let fixture = fixture();
         let bytes = fixture.messages.encode().unwrap();
-        let decoded = HiddenSendMessages::decode(&fixture.verifier_plan, None, &bytes).unwrap();
+        let decoded = HiddenSendMessages::decode(&fixture.verifier_plan, None, None, &bytes).unwrap();
         assert_eq!(decoded, fixture.messages);
         verify_hidden_send(&fixture.verifier_plan, &decoded, &fixture.witness).unwrap();
 
@@ -11796,7 +11836,7 @@ mod tests {
         let mut tampered = bytes.clone();
         let at = tampered.len() / 2;
         tampered[at] ^= 1;
-        let accepted = HiddenSendMessages::decode(&fixture.verifier_plan, None, &tampered)
+        let accepted = HiddenSendMessages::decode(&fixture.verifier_plan, None, None, &tampered)
             .and_then(|message| {
                 verify_hidden_send(&fixture.verifier_plan, &message, &fixture.witness)
             })
@@ -12570,6 +12610,7 @@ mod merged_tests {
             .map(|position| activation.weights(position, MATRIX_ROWS).unwrap())
             .collect();
         HiddenLinPlan {
+        norm: None,
             send,
             output: HiddenOutputShape {
                 positions: POSITIONS,

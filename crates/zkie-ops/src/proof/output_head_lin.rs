@@ -686,6 +686,7 @@ fn hidden_plan(
         None => None,
     };
     let plan = HiddenLinPlan {
+        norm: None,
         send,
         output: HiddenOutputShape {
             positions: activation.shape.positions,
@@ -1272,6 +1273,7 @@ pub(crate) fn merged_plan(
     // single-stage basis, not the staged own BASE count.
     proximity.own_base_positions = 2;
     let plan = HiddenLinPlan {
+        norm: None,
         send,
         output: HiddenOutputShape {
             positions,

@@ -36,7 +36,7 @@ use zkie_engine::pcs::request::field::Fp3;
 use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
 
 use crate::proof::committed_psc::{
-    get_psc_transcript, put_psc_transcript, CommittedPscGroup,
+    get_psc_transcript, get_tree_plan, put_psc_transcript, put_tree_plan, CommittedPscGroup,
     PositionPscChallenges, PscTranscriptTags,
 };
 use crate::proof::hidden_norm::{NormCoreRow, NormShape};
@@ -336,6 +336,40 @@ impl NormPscSecond {
         Ok(message)
     }
 
+    pub fn decode_for(plan: &NormPlan, bytes: &[u8]) -> Result<Self> {
+        plan.validate()?;
+        let instances = plan
+            .shape
+            .positions
+            .checked_mul(NORM_PSC_RELATIONS as u32)
+            .ok_or(Error::ResourceLimit)?;
+        let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
+        let (psc, point_values) = get_psc_transcript::<2>(
+            &mut reader,
+            NORM_PSC_VERSION,
+            instances,
+            plan.variables,
+        )?;
+        reader.finish()?;
+        let message = Self { psc, point_values };
+        message.check_for(plan)?;
+        Ok(message)
+    }
+
+    pub fn check_for(&self, plan: &NormPlan) -> Result<()> {
+        plan.validate()?;
+        let instances = plan.shape.positions as usize * NORM_PSC_RELATIONS;
+        if self.psc.len() != instances || self.point_values.len() != instances {
+            return Err(Error::ShapeMismatch);
+        }
+        for proof in &self.psc {
+            if proof.rounds.len() != plan.variables || proof.y_round.coefficients.len() != 2 {
+                return Err(Error::ShapeMismatch);
+            }
+        }
+        Ok(())
+    }
+
     pub fn check(&self, plan: &NormPscPlan) -> Result<()> {
         plan.validate()?;
         let instances = plan.shape.positions as usize * NORM_PSC_RELATIONS;
@@ -531,6 +565,400 @@ pub fn verify_norm_psc(
 
 fn fp3_signed(value: i128) -> Result<Fp3> {
     crate::proof::output_closure::fp3_signed(value)
+}
+
+
+// ---------------------------------------------------------------------------
+// Stage A: the integrated norm plan and first/second messages.
+//
+// The trusted fixture input is the product-form x group: its roots are plan
+// values. The sum/squares/mean/variance groups are proof-fixed witness
+// messages: the plan fixes their shapes, identifiers and opening counts, while
+// their roots arrive in the first message. The mask message is optional in
+// this stage and becomes required when the committed mask entries are wired.
+
+/// Version of the integrated norm plan and first message.
+pub const NORM_BIND_VERSION: u64 = 1;
+
+/// One committed witness group of the integrated norm plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormGroupPlan {
+    pub shape: WShape,
+    pub columns: u64,
+    pub group: u64,
+    pub oracle_base: u64,
+    pub openings: usize,
+}
+
+impl NormGroupPlan {
+    fn fault(&self, positions: u32) -> Option<&'static str> {
+        if self.columns == 0 || !self.columns.is_power_of_two() || self.columns > (1 << 20) {
+            return Some("a norm group has no power-of-two column count");
+        }
+        if self.openings == 0 || self.openings as u64 > self.shape.code.r {
+            return Some("a norm group has no bounded opening count");
+        }
+        if self.shape.fault(self.columns, positions).is_some() {
+            return Some("a norm group is not a message shape");
+        }
+        None
+    }
+}
+
+/// The trusted plan of the integrated norm relation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormPlan {
+    pub shape: NormShape,
+    pub columns: u64,
+    pub variables: usize,
+    /// The trusted product-form x group. Its roots are plan values.
+    pub x: NormGroupPlan,
+    pub x_roots: Vec<Digest>,
+    /// The proof-fixed sum/squares/mean/variance witness groups.
+    pub sum: NormGroupPlan,
+    pub squares: NormGroupPlan,
+    pub mean: NormGroupPlan,
+    pub variance: NormGroupPlan,
+    /// The committed mask group; optional in this stage.
+    pub mask: Option<NormMaskPlan>,
+}
+
+impl NormPlan {
+    pub fn validate(&self) -> Result<()> {
+        if self.shape.fault().is_some() {
+            return Err(Error::InvalidConfig);
+        }
+        if self.columns < 2
+            || !self.columns.is_power_of_two()
+            || self.columns < self.shape.hidden as u64
+            || self.columns > (1 << 20)
+        {
+            return Err(Error::InvalidConfig);
+        }
+        if self.variables != self.columns.trailing_zeros() as usize + 1 {
+            return Err(Error::InvalidConfig);
+        }
+        if self.x.columns != self.columns
+            || self.sum.columns != 1
+            || self.squares.columns != 1
+            || self.mean.columns != 1
+            || self.variance.columns != 1
+        {
+            return Err(Error::InvalidConfig);
+        }
+        for group in [&self.x, &self.sum, &self.squares, &self.mean, &self.variance] {
+            if group.fault(self.shape.positions).is_some() {
+                return Err(Error::InvalidConfig);
+            }
+            if group.shape.answers != 1 {
+                return Err(Error::InvalidConfig);
+            }
+        }
+        if self.x_roots.len() != self.shape.positions as usize
+            || self.x_roots.iter().any(|root| *root == Digest::ZERO)
+        {
+            return Err(Error::InvalidConfig);
+        }
+        let groups = [&self.x, &self.sum, &self.squares, &self.mean, &self.variance];
+        for left in 0..groups.len() {
+            for right in left + 1..groups.len() {
+                if groups[left].group == groups[right].group
+                    || groups[left].oracle_base == groups[right].oracle_base
+                {
+                    return Err(Error::InvalidConfig);
+                }
+            }
+        }
+        if let Some(mask) = &self.mask {
+            mask.validate(self.shape.positions)?;
+        }
+        Ok(())
+    }
+
+    pub fn encode_into(&self, writer: &mut CanonicalWriter) {
+        writer.put_u64(NORM_BIND_VERSION);
+        writer.put_u64(self.shape.positions as u64);
+        writer.put_u64(self.shape.hidden as u64);
+        writer.put_u64(self.shape.valid as u64);
+        writer.put_u64(self.columns);
+        writer.put_u64(self.variables as u64);
+        put_norm_group(writer, &self.x);
+        writer.put_u64(self.x_roots.len() as u64);
+        for root in &self.x_roots {
+            writer.put_digest(root);
+        }
+        put_norm_group(writer, &self.sum);
+        put_norm_group(writer, &self.squares);
+        put_norm_group(writer, &self.mean);
+        put_norm_group(writer, &self.variance);
+        match &self.mask {
+            Some(mask) => {
+                writer.put_u64(1);
+                mask.encode_into(writer);
+            }
+            None => writer.put_u64(0),
+        }
+    }
+
+    pub fn digest(&self) -> Digest {
+        let mut writer = CanonicalWriter::new();
+        self.encode_into(&mut writer);
+        digest_bytes(&writer.into_bytes())
+    }
+}
+
+fn put_norm_group(writer: &mut CanonicalWriter, group: &NormGroupPlan) {
+    writer.put_u64(group.columns);
+    writer.put_u64(group.group);
+    writer.put_u64(group.oracle_base);
+    writer.put_u64(group.openings as u64);
+    put_wshape(writer, &group.shape);
+}
+
+/// The committed mask-only group of the norm relation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormMaskPlan {
+    pub oracle: u64,
+    pub group: u64,
+    pub mask_code: zkie_engine::pcs::request::code::CodeParams,
+    pub mask_rows: u64,
+    pub answers: u32,
+    pub openings: usize,
+    pub tree: zkie_engine::pcs::request::runtime_tree::RuntimeTreePlan,
+    pub positions: u32,
+    pub hiding: usize,
+    pub shown: usize,
+    pub claims: usize,
+}
+
+impl NormMaskPlan {
+    fn validate(&self, positions: u32) -> Result<()> {
+        if self.oracle == 0 || self.group == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        if self.mask_rows == 0 || self.answers == 0 || self.openings == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        if self.positions != positions || self.hiding == 0 || self.shown == 0 || self.claims == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        if zkie_engine::pcs::request::code::build_code_plan(
+            self.mask_code.log_n,
+            self.mask_code.ell,
+            self.mask_code.r,
+        )
+        .is_err()
+        {
+            return Err(Error::InvalidConfig);
+        }
+        if self.tree.fault().is_some() {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(())
+    }
+
+    fn encode_into(&self, writer: &mut CanonicalWriter) {
+        writer.put_u64(self.oracle);
+        writer.put_u64(self.group);
+        writer.put_u64(self.mask_code.log_n as u64);
+        writer.put_u64(self.mask_code.ell);
+        writer.put_u64(self.mask_code.r);
+        writer.put_u64(self.mask_rows);
+        writer.put_u64(self.answers as u64);
+        writer.put_u64(self.openings as u64);
+        put_tree_plan(writer, &self.tree);
+        writer.put_u64(self.positions as u64);
+        writer.put_u64(self.hiding as u64);
+        writer.put_u64(self.shown as u64);
+        writer.put_u64(self.claims as u64);
+    }
+}
+
+/// The public mask-only norm message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormMaskMessage {
+    pub tree: zkie_engine::pcs::request::runtime_tree::RuntimeTreePlan,
+    pub root: Digest,
+    pub sample: SendSamples,
+    pub positions: Vec<u64>,
+    pub opening: zkie_engine::pcs::request::runtime_tree::RuntimeTreeOpening,
+}
+
+impl NormMaskMessage {
+    fn encode(&self) -> Result<Vec<u8>> {
+        let mut writer = CanonicalWriter::new();
+        put_tree_plan(&mut writer, &self.tree);
+        writer.put_digest(&self.root);
+        writer.put_bytes(&self.sample.encode());
+        writer.put_u64(self.positions.len() as u64);
+        for position in &self.positions {
+            writer.put_u64(*position);
+        }
+        writer.put_bytes(
+            &zkie_engine::pcs::request::runtime_tree::encode_runtime_opening(
+                &self.tree,
+                &self.opening,
+            )?,
+        );
+        Ok(writer.into_bytes())
+    }
+
+    fn decode(plan: &NormMaskPlan, bytes: &[u8]) -> Result<Self> {
+        let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
+        let tree = get_tree_plan(&mut reader)?;
+        if tree != plan.tree {
+            return Err(Error::StatementMismatch);
+        }
+        let root = reader.get_digest()?;
+        if root == Digest::ZERO {
+            return Err(Error::InvalidEncoding);
+        }
+        let sample = SendSamples::decode(reader.get_bytes()?)?;
+        if sample.seed.len() != plan.answers as usize
+            || sample.answers.len() != plan.answers as usize
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        let count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+        if count != plan.openings {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut positions = Vec::with_capacity(count);
+        for _ in 0..count {
+            positions.push(reader.get_u64()?);
+        }
+        let opening = zkie_engine::pcs::request::runtime_tree::decode_runtime_opening(
+            &tree,
+            &positions,
+            reader.get_bytes()?,
+        )?;
+        reader.finish()?;
+        Ok(Self {
+            tree,
+            root,
+            sample,
+            positions,
+            opening,
+        })
+    }
+}
+
+/// The public first-stage message of the integrated norm relation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormFirstMessages {
+    pub x: CommittedPscGroup,
+    pub sum: CommittedPscGroup,
+    pub squares: CommittedPscGroup,
+    pub mean: CommittedPscGroup,
+    pub variance: CommittedPscGroup,
+    pub mask: Option<NormMaskMessage>,
+}
+
+impl NormFirstMessages {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut writer = CanonicalWriter::new();
+        writer.put_u64(NORM_BIND_VERSION);
+        self.x.encode_into(&mut writer)?;
+        self.sum.encode_into(&mut writer)?;
+        self.squares.encode_into(&mut writer)?;
+        self.mean.encode_into(&mut writer)?;
+        self.variance.encode_into(&mut writer)?;
+        match &self.mask {
+            Some(mask) => {
+                writer.put_u64(1);
+                writer.put_bytes(&mask.encode()?);
+            }
+            None => writer.put_u64(0),
+        }
+        Ok(writer.into_bytes())
+    }
+
+    pub fn decode(plan: &NormPlan, bytes: &[u8]) -> Result<Self> {
+        plan.validate()?;
+        let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
+        if reader.get_u64()? != NORM_BIND_VERSION {
+            return Err(Error::InvalidEncoding);
+        }
+        let positions = plan.shape.positions;
+        let x = CommittedPscGroup::decode(&mut reader, &plan.x.shape, positions)?;
+        let sum = CommittedPscGroup::decode(&mut reader, &plan.sum.shape, positions)?;
+        let squares = CommittedPscGroup::decode(&mut reader, &plan.squares.shape, positions)?;
+        let mean = CommittedPscGroup::decode(&mut reader, &plan.mean.shape, positions)?;
+        let variance = CommittedPscGroup::decode(&mut reader, &plan.variance.shape, positions)?;
+        let mask = match reader.get_u64()? {
+            0 => {
+                if plan.mask.is_some() {
+                    return Err(Error::ShapeMismatch);
+                }
+                None
+            }
+            1 => {
+                let mask_plan = plan.mask.as_ref().ok_or(Error::ShapeMismatch)?;
+                Some(NormMaskMessage::decode(mask_plan, reader.get_bytes()?)?)
+            }
+            _ => return Err(Error::InvalidEncoding),
+        };
+        reader.finish()?;
+        let message = Self {
+            x,
+            sum,
+            squares,
+            mean,
+            variance,
+            mask,
+        };
+        message.check_trusted(plan)?;
+        Ok(message)
+    }
+
+    /// Checks the trusted x roots and every public group declaration. The
+    /// witness group roots are proof values and are not compared with the plan.
+    pub fn check_trusted(&self, plan: &NormPlan) -> Result<()> {
+        plan.validate()?;
+        let groups = [
+            (&self.x, &plan.x, true),
+            (&self.sum, &plan.sum, false),
+            (&self.squares, &plan.squares, false),
+            (&self.mean, &plan.mean, false),
+            (&self.variance, &plan.variance, false),
+        ];
+        for (message, group_plan, trusted) in groups {
+            if message.message.group.group != group_plan.group {
+                return Err(Error::StatementMismatch);
+            }
+            if message.fault(&group_plan.shape, plan.shape.positions).is_some() {
+                return Err(Error::ShapeMismatch);
+            }
+            if trusted && message.message.roots != plan.x_roots {
+                return Err(Error::StatementMismatch);
+            }
+            for (position, entry) in message.message.group.entries.iter().enumerate() {
+                if entry.oracle
+                    != group_plan
+                        .oracle_base
+                        .checked_add(position as u64)
+                        .ok_or(Error::ResourceLimit)?
+                {
+                    return Err(Error::StatementMismatch);
+                }
+            }
+        }
+        if let (Some(plan_mask), Some(message_mask)) = (&plan.mask, &self.mask) {
+            if message_mask.root == Digest::ZERO
+                || message_mask.tree != plan_mask.tree
+                || message_mask.sample.seed.len() != plan_mask.answers as usize
+                || message_mask.sample.answers.len() != plan_mask.answers as usize
+                || message_mask.positions.len() != plan_mask.openings
+                || message_mask.opening.positions != message_mask.positions
+            {
+                return Err(Error::ShapeMismatch);
+            }
+        }
+        if plan.mask.is_some() != self.mask.is_some() {
+            return Err(Error::ShapeMismatch);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -814,4 +1242,46 @@ mod tests {
         bytes.push(0);
         assert!(NormPscSecond::decode(&plan, &bytes).is_err());
     }
+    fn integrated_group(plan: &NormPscGroupPlan) -> NormGroupPlan {
+        NormGroupPlan {
+            shape: plan.shape.clone(),
+            columns: plan.columns,
+            group: plan.group,
+            oracle_base: plan.oracle_base,
+            openings: plan.openings,
+        }
+    }
+
+    #[test]
+    fn integrated_first_round_trips_with_trusted_x_and_witness_roots() {
+        let (psc, _rows, first, second) = fixture();
+        let plan = NormPlan {
+            shape: psc.shape,
+            columns: psc.columns,
+            variables: psc.variables,
+            x: integrated_group(&psc.groups.x),
+            x_roots: psc.groups.x.roots.clone(),
+            sum: integrated_group(&psc.groups.sum),
+            squares: integrated_group(&psc.groups.squares),
+            mean: integrated_group(&psc.groups.mean),
+            variance: integrated_group(&psc.groups.variance),
+            mask: None,
+        };
+        let message = NormFirstMessages {
+            x: first.x.clone(),
+            sum: first.sum.clone(),
+            squares: first.squares.clone(),
+            mean: first.mean.clone(),
+            variance: first.variance.clone(),
+            mask: None,
+        };
+        let bytes = message.encode().unwrap();
+        let decoded = NormFirstMessages::decode(&plan, &bytes).unwrap();
+        assert_eq!(decoded, message);
+        decoded.check_trusted(&plan).unwrap();
+        let second_bytes = second.encode().unwrap();
+        let decoded_second = NormPscSecond::decode_for(&plan, &second_bytes).unwrap();
+        assert_eq!(decoded_second, second);
+    }
+
 }

@@ -1208,6 +1208,7 @@ fn selected_gpt2_output_head_request_session() {
     decode_proximity.shared_stages.clear();
     decode_proximity.own_stages.clear();
     let merged = HiddenLinPlan {
+        norm: None,
         send: decode_send,
         output: HiddenOutputShape {
             positions: OUTPUT_HEAD_POSITIONS as u32,
