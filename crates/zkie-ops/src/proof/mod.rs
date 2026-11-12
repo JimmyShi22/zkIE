@@ -23,6 +23,7 @@ pub mod relations;
 pub mod session_baseline;
 pub mod multi_stage_iopp;
 pub mod proximity_iopp;
+pub mod interval;
 pub mod proximity_planner;
 pub mod model_commitment;
 

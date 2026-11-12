@@ -797,7 +797,7 @@ fn selected_gpt2_output_head_request_session() {
                     mask: mask_code,
                     k: 14,
                     h: 2,
-                    positions: 254,
+                    positions: 252,
                     samples: 1,
                     work_bits: 24,
                 },
@@ -819,7 +819,7 @@ fn selected_gpt2_output_head_request_session() {
                         mask: build_code_plan(17, 16, 256).unwrap(),
                         k: 13,
                         h: 13,
-                        positions: 254,
+                        positions: 252,
                         samples: 1,
                         work_bits: 24,
                     },
@@ -2673,6 +2673,19 @@ fn selected_gpt2_output_head_request_session() {
         let final_budget = final_ledger.opening_budget_summary();
         println!("ledger_final_min_tail_remaining={}", final_budget.min_remaining);
         println!("ledger_final_exhausted={}", final_budget.exhausted);
+        for (key, record) in &final_ledger.oracles {
+            if record.tail_rank != 0 && record.remaining_tail() == 0 {
+                println!(
+                    "ledger_exhausted_key kind={:?} oracle={} tree={} rank={} unique={} logical={}",
+                    key.kind,
+                    key.oracle_id,
+                    key.tree_number,
+                    record.tail_rank,
+                    record.unique_positions,
+                    record.logical_openings
+                );
+            }
+        }
         for (oracle, union) in &expected_unions {
             let record = final_ledger.oracle(*oracle).expect("final oracle record");
             assert_eq!(&record.opened_positions, union);
@@ -3084,6 +3097,21 @@ fn selected_gpt2_output_head_request_session() {
             panic!("the own group is staged");
         }
         assert!(reject(&tampered));
+
+        // A real three-stage proof has two own switches; swapping them changes
+        // the final verifier's sequence and must be rejected. The default
+        // two-stage proof has one switch, so this row runs only with the
+        // three-stage comparison list.
+        if env::var_os("ZKIE_SESSION_THREE_STAGE").is_some() {
+            let mut tampered = clone_proof(&hidden_proof);
+            if let ProximityTail::Stages(proof) = &mut tampered.session.second.tail {
+                assert!(proof.switches.len() >= 2);
+                proof.switches.swap(0, 1);
+            } else {
+                panic!("the own group is staged");
+            }
+            assert!(reject(&tampered));
+        }
 
         // The final seal is bound to the staged base transcript.
         let mut tampered = clone_proof(&hidden_proof);

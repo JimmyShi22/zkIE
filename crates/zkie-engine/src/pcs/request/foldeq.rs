@@ -42,7 +42,7 @@ use crate::pcs::request::chain::{
     Chain, KIND_ALGEBRAIC, KIND_EPSILON, KIND_EMPTY, KIND_POSITIONS, KIND_SEAL, KIND_SEED,
 };
 use crate::pcs::request::field::{Fp, Fp3};
-use crate::pcs::request::pow::{search_nonce, verify_nonce, MAX_WORK_BITS};
+use crate::pcs::request::pow::{search_nonce_for_plan, verify_nonce, MAX_WORK_BITS};
 use crate::pcs::request::gu::{GuMembership, GuNotice, GuOracleShape, GuRegistry, GuShape};
 use crate::pcs::request::relation::{
     column_plan_columns, column_row, column_target, foldeq_weights, gu_layout_fault,
@@ -1833,7 +1833,7 @@ impl FoldeqSession {
                 }
                 value
             }
-            None => search_nonce(&prefix, 1u64 << 24)?,
+            None => search_nonce_for_plan(&prefix)?,
         };
         if !self.chain.step(&prefix, nonce)? {
             return Err(Error::InvalidProof);

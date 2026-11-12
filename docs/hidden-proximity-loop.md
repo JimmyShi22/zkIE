@@ -32,20 +32,20 @@ next stage is `k=13, h=13` and the last stage is `k=h=0`. The earlier
 `4,162`/`k=13` figure divided by `ell` without the `ell - answers` capacity
 and is withdrawn.
 
-`[FACT]` The own group now uses the approved two-stage candidate: stage 0
-keeps the frozen `(17,65,536,8,192)/(17,512,256)` codes with `k=14,h=2`, the
-trusted planner chooses `positions=254` and 24 work bits from the mask tail
-minus the SEND openings, and the last stage is
-`(17,65,536,259)/(17,16,384,259)` with `k=h=0` and `positions=259`. The
-planner lives in `crates/zkie-ops/src/proof/proximity_planner.rs`; the
-verifier re-derives the values and `HiddenProximityPlan::fault` rejects a
-mismatch before the first query. The same-machine comparison with the
-same-parameter three-stage chain measured hidden prove 372,116 ms vs 768,920
-ms, verify 64,736 ms vs 75,151 ms, proof 66,135,784 bytes vs 214,228,928
-bytes, peak RSS 169,961,812 KiB vs 212,843,964 KiB, and whole test 674.20 s
-vs 1,083.66 s. The planner uses floating-point logarithms with a 0.2-bit
-planning margin; the reference interval arithmetic is not ported yet and is a
-`[GAP]`.
+`[FACT]` The own group now uses the interval-derived two-stage candidate:
+stage 0 keeps the frozen `(17,65,536,8,192)/(17,512,256)` codes with
+`k=14,h=2`, the trusted planner chooses `positions=252` and 24 work bits by
+the conservative search under the mask-tail cap 254 (Johnson m = 616), and
+the last stage is `(17,65,536,259)/(17,16,384,259)` with `k=h=0`,
+`positions=259` and Johnson m = 595. The planner lives in
+`crates/zkie-ops/src/proof/proximity_planner.rs`; the verifier re-derives the
+values and `HiddenProximityPlan::fault` rejects a mismatch before the first
+query. The same-machine comparison with the same-parameter three-stage chain
+is recorded in the trace notes; the interval run is the current candidate.
+The planner uses outward-rounded interval arithmetic (`proof/interval.rs`)
+and no floating-point decision. The naive sum of all counted round terms is
+`2^-123.69`, while the worst single round is `2^-128.000035`; the batch does
+not claim the sum meets 128 bits (see the rework18 evidence note).
 
 `[FACT]` The stage FOLD and switch tree numbers, the fold group, member and
 fresh identifiers, the stage seeds and the BASE star plan are derived from
@@ -160,10 +160,12 @@ non-union event is the switch sample answer described above. See the evidence
 note for the measured totals.
 
 
-`[FACT]` The two-stage candidate acceptance run on the GPT-2 seq16 formal
-fixture, same machine, measured hidden prove 372,116 ms, hidden verify
-64,736 ms, proof 66,135,784 bytes, maximum RSS 169,961,812 KiB and whole test
-674.20 s, with 14 own fold rounds. The Q3 ledger rerun measured hidden prove
+`[FACT]` The rework18 interval run on the GPT-2 seq16 formal fixture measured
+hidden prove 389,493 ms, hidden verify 64,434 ms, proof 65,432,832 bytes,
+maximum RSS 169,342,676 KiB and whole test 1,197.38 s, with 14 own fold
+rounds. The earlier 254-position candidate measured hidden prove 372,116 ms,
+hidden verify 64,736 ms, proof 66,135,784 bytes, maximum RSS 169,961,812 KiB
+and whole test 674.20 s. The Q3 ledger rerun measured hidden prove
 377,899 ms, hidden verify 64,966 ms, the same 66,135,784-byte proof and
 169,442,488 KiB maximum RSS; its 1,192.65 s test wall includes the enlarged
 outer negative matrix. The same-parameter three-stage comparison
@@ -178,7 +180,7 @@ optimization gain; the trace directories carry the raw logs.
 hash, work and mask hiding budgets at the production parameters is not
 restated here. It is part of the batch review together with the measured
 resource budget. The two-stage candidate uses planner-derived stage-0
-positions/work 254/24 and last positions/r 259/259; those are bound in the
-trusted plan but are not final parameters. The reference interval arithmetic
-and the largest-m fixed point are not ported; the evidence note records the
-observed f64 difference.
+positions/work 252/24 and last positions/r 259/259; those are bound in the
+trusted plan but are not final parameters. The interval arithmetic and the
+largest-m search are implemented; the evidence note records the per-round
+table and the union-sum caveat.

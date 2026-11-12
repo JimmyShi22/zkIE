@@ -37,6 +37,20 @@ pub fn verify_nonce(prefix: &ChainPrefix, nonce: u64, bits: u8) -> Result<bool> 
 
 /// Search nonces `0, 1, 2, ...` and return the first that passes. The search
 /// is bounded; exhaustion is an error, never a silent pass.
+/// Searches for a nonce with a bounded tail that does not make an honest
+/// prover fail with constant probability. The expected number of attempts is
+/// `2^work_bits`; the cap keeps eight further bits of search headroom, so the
+/// failure probability of an honest search is below `e^-256` for the work
+/// sizes used by the plan, while the expected work is unchanged.
+pub fn search_nonce_for_plan(prefix: &ChainPrefix) -> Result<u64> {
+    let bits = prefix.work_bits as u32;
+    if bits == 0 {
+        return Ok(0);
+    }
+    let cap_bits = (bits + 8).min(40);
+    search_nonce(prefix, 1u64 << cap_bits)
+}
+
 pub fn search_nonce(prefix: &ChainPrefix, max_tries: u64) -> Result<u64> {
     let bits = prefix.work_bits;
     if bits > MAX_WORK_BITS {

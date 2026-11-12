@@ -232,7 +232,7 @@ use zkie_engine::pcs::request::lin::LinMask;
 use zkie_engine::pcs::request::params::{
     FINAL_CHAIN_LABEL, LEAF_SALT_MAX_BYTES, LEAF_SALT_MIN_BYTES, SHARED_CHAIN_LABEL,
 };
-use zkie_engine::pcs::request::pow::{search_nonce, verify_nonce};
+use zkie_engine::pcs::request::pow::{search_nonce_for_plan, verify_nonce};
 use zkie_engine::pcs::request::proximity::SingleRows;
 use zkie_engine::pcs::request::read::unique_sorted;
 use zkie_engine::pcs::request::relation::{
@@ -4490,6 +4490,31 @@ impl HiddenProximityPlan {
                 return Some("the own stage list differs from the trusted planner");
             }
         }
+        // The shared group is a join over table-derived rows that the table
+        // column openings already authenticate. Its two positions and zero
+        // work are a fixed join count, not a proximity parameter: the
+        // proximity guarantee comes from the table column draws. Any other
+        // count changes the plan semantics and is rejected here.
+        let shared = &self.shared_stages;
+        if self.planner_checked
+            && !shared.is_empty()
+            && (shared.len() != 2
+            || self.shared_base_positions != 2
+            || shared[0].main != self.code
+            || shared[0].mask != self.mask_code
+            || shared[0].k != 2
+            || shared[0].h != 0
+            || shared[0].samples != 1
+            || shared[0].positions != 2
+            || shared[0].work_bits != 0
+            || shared[1].k != 0
+            || shared[1].h != 0
+            || shared[1].samples != 1
+            || shared[1].positions != 2
+                || shared[1].work_bits != 0)
+        {
+            return Some("the shared join stage list differs from the trusted plan");
+        }
         if self.shared_mask_tree.fault().is_some() || self.own_mask_tree.fault().is_some() {
             return Some("a fresh mask tree is not valid");
         }
@@ -7467,7 +7492,7 @@ fn draw_columns(
             }
             value
         }
-        None => search_nonce(&prefix, 1u64 << 24)?,
+        None => search_nonce_for_plan(&prefix)?,
     };
     if !chain.step(&prefix, nonce)? {
         return Err(Error::InvalidProof);

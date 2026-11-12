@@ -15,7 +15,7 @@ use zkie_engine::pcs::request::cs_stage::{
 };
 use zkie_engine::pcs::request::field::Fp3;
 use zkie_engine::pcs::request::gu::GuOracleShape;
-use zkie_engine::pcs::request::pow::{search_nonce, verify_nonce, MAX_WORK_BITS};
+use zkie_engine::pcs::request::pow::{search_nonce_for_plan, verify_nonce, MAX_WORK_BITS};
 use zkie_engine::pcs::request::proximity::SingleRows;
 use zkie_engine::pcs::request::read::{draw_positions, unique_sorted};
 use zkie_engine::pcs::request::relation::{oracle_sample_row_index, sample_cube_of, GuWitness};
@@ -360,7 +360,7 @@ impl CsMultiSession {
                 }
                 value
             }
-            None => search_nonce(&prefix, 1u64 << 24)?,
+            None => search_nonce_for_plan(&prefix)?,
         };
         if !self.chain.step(&prefix, nonce)? {
             return Err(Error::InvalidProof);

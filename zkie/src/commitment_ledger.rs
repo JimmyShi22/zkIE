@@ -806,8 +806,11 @@ pub struct LedgerState {
 }
 
 /// The tail-hiding budget over every code-bearing oracle. `min_remaining` is
-/// the smallest `rank - union`; zero means at least one oracle has no hiding
-/// dimension left and the run must fail closed.
+/// the smallest `rank - union`; zero means at least one oracle has no unused
+/// tail coordinate. Equality is a planning condition, not an automatic
+/// failure: the caller must include every opening in the union and argue the
+/// equality (the square Vandermonde case), or fail closed. `record_openings`
+/// rejects any union above the rank.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OpeningBudgetSummary {
     pub code_oracles: u64,

@@ -29,7 +29,7 @@ Snapshot: the closed relation at code basis `3b3e8ecc`, with the bounded-read
 rollback `8d32d3de`; fixture `gpt2-seq16`, 16 positions. The default two-stage
 formal proof is 66,135,784 B (the previous single-stage snapshot was
 9,939,144 B); the three-stage same-parameter comparison is 214,228,928 B.
-The committed document is version 14; version 14 adds the CS switch random
+The committed document is version 15; version 15 adds the interval planner and its accounting; version 14 added the CS switch random
 material and the wired multi-stage status.
 
 ## 1. The chain in one view
@@ -1219,7 +1219,7 @@ The entries are:
 | direct shared FOLD check | k = 2, 2 rounds, degree 2 | `4/p^3 < 2^-189.9` |
 | direct own FOLD check | k = 14, 14 rounds, degree 2 | `28/p^3 < 2^-187.1` |
 | BASE lambda and symbol checks | withdrawn from the algebraic union: no independent-uniform field-domain/order derivation for the Fp3 lambda challenge, and the two checks are codeword-index samples, not field challenges | carried in `eps_proximity` (unknown term, not in `eps_components`) |
-| base position sampling | real sampler `draw -> unique_sorted`: `t = 2` draws, `s <= 2` unique positions and `s` is variable; distance parameter `delta` | miss `(1 - delta)^t` for the original-draw event; the actual `delta`/miss are computed in section 8 (`0.3163976` main, `3.42e-5` mask): ineffective |
+| own base position sampling | interval planner: stage0 252 draws with 24 work bits, last 259 draws; shared join fixed at 2 and covered by the table column test | counted in the interval round table; the old two-position miss is withdrawn as the own-chain term |
 | range booleanity | 16 positions, degree at most 166 each | `16*166/p^3 < 2^-180` |
 | PSC sumcheck (Dot once, closure 16 positions) | 10 and 23 variables, degree 3 each | `(30 + 16*69)/p^3 < 2^-181` |
 | single equality | the check exists, but its polynomial-degree/event derivation is not written in this note | not counted in `eps_components`; carried in `eps_proximity` (unknown term) |
@@ -1236,32 +1236,24 @@ eps_hash = (t + q_V + 1) * 2^-128 + (17/2) * (t + q_V)^2 / 2^256
 eps_components <= 16*166/p^3 + 1134/p^3 + 32/p^3 + 1/p^3
                 < 2^-180 + 2^-181.85 + 2^-186.9 + 2^-191
                 < 2^-179.6
-eps_proximity = INEFFECTIVE
-                (direct FOLD->BASE miss at the actual code parameters is
-                 ~0.3163976 for the main code and ~3.42e-5 for the mask code;
-                 section 8 gives the derivation and the candidates)
+eps_proximity = the interval round terms: own stage0 252/24 and last 259,
+                 shared join backed by the table columns at 603 draws with 12
+                 work bits; the counted table is in the rework18 evidence
+                 (worst round 2^-128.000035, naive union 2^-123.69)
 eps_total also carries the retry exhaustion N * 2^-2048 and the Q_R / Q_A factors
 ```
 
-`eps_proximity` is not zero and not a conservative placeholder: section 8
-computes the direct FOLD-to-BASE two-position miss from the actual code
-parameters. The codeword length is `n = 2^log_n = 131,072` (the product-form
-encoder returns `n` symbols; `CodeParams::n()`); the main W/closure code has
-`ell + r = 73,728` coefficients (the table code `ell = 65,539` is only the
-reader/column-opening object and is not an IOPP member), relative distance
-`(n - (ell + r - 1))/n = 57,345/131,072 = 0.4375076294`, and two-position miss
-`0.3163976670 = 2^-1.6601`. The mask code `(ell + r = 768)` has relative
-distance `130,305/131,072 = 0.9941482544` and miss `3.424292663e-5 =
-2^-14.8338`. A fold-consistent correlated error pattern (a common error
-pattern in the rows, or a difference whose fold cancellation is exact; not a
-complete attack construction) survives the fold with the same relative
-distance, so the folded check does not improve the main-code bound. The
-proximity sub-term is therefore **ineffective** at the current parameters,
-not merely unknown; the algebraic components below are separate. The miss is
-a single conditional event (two independent index draws), not a full-proof
-attack probability and not a proximity-gap bound; the finding is a major
-security-bound gap/risk, not a demonstrated attack. The document does not
-claim a total security bit count.
+`eps_proximity` is no longer the direct two-position FOLD-to-BASE miss for
+the own chain. The interval planner fixes own stage0 at 252 positions with
+24 work bits and the last stage at 259; the counted own FOLD, BASE and query
+terms are in the rework18 interval table (worst single round
+`2^-128.000035`; naive union sum `2^-123.69`). The shared group keeps two
+positions, but its proximity is supplied by the table column test at 603
+columns with 12 work bits (`2^-128.164982`); the two-position miss
+(`0.3163976` main, `3.42e-5` mask) is retained only as the historical
+single-stage observation and is not the own-chain bound. This note does not
+claim a total security bit count; the union sum does not meet 128 bits and
+is reported as such.
 
 The `BASE 3/p^3` figure and the earlier `6/p^3 < 2^-189.4` merge are withdrawn
 from `eps_components`: the lambda challenge is an `Fp3` field value whose
@@ -1745,11 +1737,11 @@ bound in the fixture are:
   positions 2, samples 1, work 0; stage1 (last)
   `(17, 65,536, 256)/(17, 16,384, 256)`, `k=h=0`, positions 2, samples 1.
 - own (default two-stage candidate): stage0
-  `(17, 65,536, 8,192)/(17, 512, 256)`, `k=14,h=2`, positions 254, samples 1,
+  `(17, 65,536, 8,192)/(17, 512, 256)`, `k=14,h=2`, positions 252, samples 1,
   work 24; stage1 (last) `(17, 65,536, 259)/(17, 16,384, 259)`, `k=h=0`,
   positions 259, samples 1, work 0.
 - own (same-parameter three-stage comparison only): stage0 as above; stage1
-  `(17, 8, 256)/(17, 16, 256)`, `k=13,h=13`, positions 254, samples 1,
+  `(17, 8, 256)/(17, 16, 256)`, `k=13,h=13`, positions 252, samples 1,
   work 24; stage2 (last) `(17, 8, 259)/(17, 1,024, 259)`, `k=h=0`,
   positions 259, samples 1, work 0. The three-stage list is not the default
   and has no planner check for the middle stage; it is a comparison basis.
@@ -1765,23 +1757,23 @@ plan data, not prover self-report.
 carries the per-stage fresh ids, the stage-FOLD group/member id, the switch and
 mask run/configuration digests, the base-star tree plan and the first-switch
 old-mask source; the proof envelope is version 5. The default own stage list is
-two stages with stage-0 positions/work 254/24 and last positions/r 259/259
+two stages with stage-0 positions/work 252/24 and last positions/r 259/259
 (the shared group uses its measured 2/0 stages). The three-stage list is
 retained only for the same-parameter comparison. The prover/verifier loop,
 per-stage opening authentication, independent stage reconstruction, switch
 target checks and the staged final-verifier negatives are exercised by the
 formal seq16 run.
 
-`[FACT]` `CODE` `MATH` Planner-level candidate derivation for the multi-stage
-chain (bound in the plan, not a final security parameter). The trusted planner
-computes Johnson/list/MCA/FOLD/BASE/sample/field/batching terms with a 0.2-bit
-margin and returns stage-0 positions/work 254/24 for both groups and last
-positions/r 259/259 for the own group (the shared last stage is sized by the
-same rule and the measured two-position chain). The earlier
-155/129/155/15/20 values were reference-interval candidates; the f64 planner
-difference and its direction are recorded in the evidence note. The final
-interval arithmetic, the largest-m fixed point and the CS/other error terms
-remain the expert's decision and are `[UNPROVEN]` here.
+`[FACT]` `CODE` `MATH` Planner-level derivation for the multi-stage chain
+(bound in the plan, not a final security parameter). The trusted interval
+planner computes Johnson/list/MCA/FOLD/BASE/sample/field/batching terms from
+outward-rounded bounds and returns stage-0 positions/work 252/24 and last
+positions/r 259/259 for the own group; the shared join keeps its pinned two
+positions. The naive union sum of the counted round terms is
+`2^-123.69`, while the worst round is `2^-128.000035`; the per-round target
+does not imply a 128-bit union bound, and that gap is carried as an explicit
+boundary in the rework18 evidence note. The 155/129/155/15/20 values remain
+reference-interval candidates only.
 
 `[FACT]` `MATH` c-difference and `Im(A)`. For a public value `P = A X + c(V,S)`,
 two secrets `(V,S)` and `(V',S')` give the same image exactly when
@@ -1811,7 +1803,7 @@ the real hiding polynomial and the real fold/base paths, but a passing test
 module is not a production runtime detector for every bad rank or every
 tampered message. The workspace result and the three seq16 runs are the
 delivery evidence reported by the implementation side; they are not an
-independent external verification. The 796-test workspace figure (17
+independent external verification. The 800-test workspace figure (17
 ignored in 48 suites), the proof hashes and the HEAD are the
 implementation-side delivery figures, not an independent expert validation of
 the protocol. Editing the document or the
@@ -1929,10 +1921,11 @@ claim a closed joint theorem.
 - `[GAP]` The multi-stage IOPP stage lists are in the plan and the
   BAT -> (FOLD -> CS)* -> BASE loop is implemented and exercised on the real
   seq16 fixture; the per-stage positions/work come from the candidate planner
-  (254/24, 259/259) and are bound in the plan. The reference interval
-  arithmetic, a mechanized soundness/joint-hiding composition, and the
-  resource decision for the 66 MB/170 GB shape remain expert/boss items
-  (section 8.7).
+  (252/24, 259/259) and are bound in the plan. The interval arithmetic and
+  largest-m search are implemented; the union-sum gap (2^-123.69 versus
+  per-round 2^-128.000035), a mechanized soundness/joint-hiding composition,
+  and the resource decision for the 66 MB/170 GB shape remain expert/boss
+  items (section 8.7).
 - `[UNPROVEN]` A mechanized composition theorem and an end-to-end 128-bit
   claim; `126.21`/`116.01` remain plan-ledger numbers.
 - `[LONG-TERM]` The trusted X source, policy distribution/freshness and
