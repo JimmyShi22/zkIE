@@ -64,3 +64,37 @@ toy/three-stage comparison mode, not an acceptance path.
 
 - `run1-key-map.txt`, `run2.txt`, `run3.txt`, `workspace.txt`, `check.txt`,
   `focused-*.txt`, `summary.txt`, `NOTES.md`.
+
+## Round closing record
+
+Expert verdict: TURN 460 PASS, limited to the formal-fixture planning wiring,
+ledger wiring and the listed regression evidence. This trace is part of the
+`[lin-bind]` round closure. The candidate marker `83072eaa` is kept as
+history; this record is appended, not squashed or rewritten.
+
+### Key numbers
+
+- Two-stage interval seq16 (three runs): prove 386.319 / 387.126 / 385.997 s,
+  verify 64.598 / 64.753 / 64.768 s, proof 65,432,832 B (65.4 MB),
+  VmHWM 169.4M KiB (~161.6 GiB), all PASS, ledger 145 / 18,912 / 18,841
+  with one exhausted last-switch key.
+- Five-case warm medians (prove / verify): gpt2-seq16 21,858 / 25,339 ms;
+  gpt2-seq512 167,634 / 232,400 ms; gemma3-seq16 45,153 / 46,312 ms;
+  gemma3-seq512 417,925 / 830,363 ms; timesfm-16patch 35,584 / 43,141 ms.
+  All cases PASS; proof bytes match the rework16 same-basis matrix.
+- Workspace: 48 suites, 802 passed, 0 failed, 17 ignored.
+- Overall provable union bound written separately: 2^-123.692866; no
+  whole-chain 128-bit claim.
+
+### Open items
+
+- Joint hiding and the whole-chain composition bound: deferred to the
+  expert notes for later evaluation.
+- Production CLI integration and trusted-X distribution: recorded as
+  long-term direction, not part of this round.
+- Single-shot all-model coverage: next phase B-1.
+- A formal soundness theorem: not claimed in this round.
+
+The final source snapshot and HEAD are recorded in the batch message; no
+further code or plan change was made after the acceptance runs.
+
