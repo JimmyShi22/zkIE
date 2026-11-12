@@ -793,7 +793,7 @@ fn selected_gpt2_output_head_request_session() {
             IoppStagePlan {
                 main: code,
                 mask: mask_code,
-                k: 13,
+                k: 14,
                 h: 2,
                 positions: 2,
                 samples: 1,
@@ -1077,8 +1077,18 @@ fn selected_gpt2_output_head_request_session() {
     drop(_profile_prepared);
     assert_eq!(prepared.proof_bytes, bytes.len());
     assert_eq!(prepared.outcome.eval_rows.len(), OUTPUT_HEAD_POSITIONS);
-    assert!(prepared.outcome.shared_base.is_stages());
-    assert!(prepared.outcome.own_base.is_stages());
+    assert!(prepared
+        .outcome
+        .shared_base
+        .single()
+        .expect("the diagnostic shared group ends in BASE")
+        .fold_main);
+    assert!(prepared
+        .outcome
+        .own_base
+        .single()
+        .expect("the diagnostic own group ends in BASE")
+        .fold_main);
 
     // The byte-level entry reruns the trace check and decodes the canonical
     // request encoding against the same merged plan.
@@ -1182,6 +1192,9 @@ fn selected_gpt2_output_head_request_session() {
     decode_send.expected_roots = verifier_setup.expected_roots.clone();
     decode_send.dot = None;
     decode_send.expected_dot_root = None;
+    let mut decode_proximity = verifier_setup.proximity.clone();
+    decode_proximity.shared_stages.clear();
+    decode_proximity.own_stages.clear();
     let merged = HiddenLinPlan {
         send: decode_send,
         output: HiddenOutputShape {
@@ -1190,7 +1203,7 @@ fn selected_gpt2_output_head_request_session() {
         },
         weights: claims.weights,
         masks: claims.masks,
-        proximity: verifier_setup.proximity.clone(),
+        proximity: decode_proximity,
         output_relation: None,
         closure: None,
     };

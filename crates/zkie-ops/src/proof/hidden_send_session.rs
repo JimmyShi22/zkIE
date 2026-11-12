@@ -4554,8 +4554,11 @@ impl HiddenProximityPlan {
         if self.shared_fresh < 2 {
             return Some("the shared fresh mask id collides with a group member id");
         }
+        // Upper bound of the own BAT member set: one W member per position,
+        // one Omega member, optional Dot and index-mask members, three
+        // closure members per position and one closure-mask member.
         let own_member_bound = (send.positions() as u64)
-            .checked_mul(3)
+            .checked_mul(4)
             .and_then(|value| value.checked_add(4))
             .unwrap_or(u64::MAX);
         if self.own_fresh < own_member_bound {
@@ -12512,6 +12515,80 @@ mod merged_tests {
         staged
     }
 
+    /// One legal two-stage chain for the hidden toy fixture. The stage-0
+    /// k/h values are the fixture group's actual fold shape; the last stage
+    /// uses a wider mask code so the switch mask room holds every old tail.
+    fn staged_two_stage(
+        plan: &HiddenLinPlan,
+        shared_k: u32,
+        shared_h: u32,
+        own_k: u32,
+        own_h: u32,
+    ) -> HiddenLinPlan {
+        let mut staged = plan.clone();
+        let main = plan.proximity.code;
+        let mask = plan.proximity.mask_code;
+        let next_main =
+            build_code_plan(main.log_n + 2, main.ell, main.r).unwrap();
+        let next_mask =
+            build_code_plan(mask.log_n + 2, mask.ell * 4, mask.r).unwrap();
+        let stage_zero = |k: u32, h: u32| IoppStagePlan {
+            main,
+            mask,
+            k,
+            h,
+            positions: plan.proximity.shared_base_positions,
+            samples: 1,
+            work_bits: 0,
+        };
+        let last = IoppStagePlan {
+            main: next_main,
+            mask: next_mask,
+            k: 0,
+            h: 0,
+            positions: plan.proximity.own_base_positions,
+            samples: 1,
+            work_bits: 0,
+        };
+        staged.proximity.shared_stages =
+            vec![stage_zero(shared_k, shared_h), last.clone()];
+        staged.proximity.own_stages = vec![stage_zero(own_k, own_h), last];
+        staged
+    }
+
+    #[test]
+    fn staged_final_verifier_accepts_and_rejects_tampering() {
+        let activation = activation();
+        let mut table = table();
+        let base = hidden_plan(&activation);
+        let staged = staged_two_stage(&base, 1, 0, 2, 2);
+        let (messages, witness) =
+            prove_hidden_lin_hidden(&staged, &activation, &mut table, Digest([0x71; 32]))
+                .unwrap();
+        let mut verifier_plan = staged;
+        verifier_plan.send.expected_roots = Some(witness.send.roots.clone());
+        let outcome =
+            verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &messages).unwrap();
+        assert!(outcome.shared_base.is_stages());
+        assert!(outcome.own_base.is_stages());
+        let mut tampered = messages.clone();
+        match &mut tampered.shared.tail {
+            ProximityTail::Stages(proof) => proof.switches[0].declared_root.0[0] ^= 1,
+            ProximityTail::Single { .. } => panic!("the fixture is staged"),
+        }
+        assert!(
+            verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &tampered).is_err()
+        );
+        let mut tampered = messages.clone();
+        match &mut tampered.second.tail {
+            ProximityTail::Stages(proof) => proof.base[0] ^= 1,
+            ProximityTail::Single { .. } => panic!("the fixture is staged"),
+        }
+        assert!(
+            verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &tampered).is_err()
+        );
+    }
+
     fn hidden_run() -> (HiddenLinPlan, HiddenLinMessages, HiddenLinWitness) {
         let activation = activation();
         let mut plan = hidden_plan(&activation);
@@ -13780,7 +13857,7 @@ mod iopp_stage_plan_tests {
         ];
         assert!(iopp_stage_fault(&shared, main, mask, 2).is_none());
         let own = vec![
-            stage(main, mask, 13, 2, 2),
+            stage(main, mask, 14, 2, 2),
             stage(
                 build_code_plan(17, 8, 256).unwrap(),
                 build_code_plan(17, 16, 256).unwrap(),

@@ -1249,6 +1249,13 @@ pub(crate) fn merged_plan(
     // formal mode.
     let mut proximity = setup.proximity.clone();
     proximity.own_mask_tree.mask_rows = 1;
+    // The setup's stage lists describe the formal hidden group, which carries
+    // the Dot, index-mask and closure members. The diagnostic group drops
+    // those members, so its fold shape differs; it keeps the single-stage
+    // tail instead of claiming a stage chain that the trusted inputs do not
+    // describe.
+    proximity.shared_stages.clear();
+    proximity.own_stages.clear();
     let plan = HiddenLinPlan {
         send,
         output: HiddenOutputShape {

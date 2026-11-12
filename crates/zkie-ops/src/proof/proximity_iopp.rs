@@ -117,10 +117,31 @@ pub fn proximity_bound_ids(
     // The two shared members and the declared bound of the own group's
     // members are BAT-local identifiers in [0, bound).
     oracles.extend(0..2);
-    let own_member_bound = positions
-        .checked_mul(3)
-        .and_then(|value| value.checked_add(4))
-        .ok_or(Error::ResourceLimit)?;
+    // The own BAT group has one W member per position, one Omega member,
+    // and optional Dot and index-mask members. The closure contributes one
+    // slack, one packed-bits and one product-map member per position plus one
+    // closure-mask member. The stage FOLD identifiers share this registry, so
+    // every member identifier must be inside the bound.
+    let mut own_member_bound = positions.checked_add(1).ok_or(Error::ResourceLimit)?;
+    if send.dot.is_some() {
+        own_member_bound = own_member_bound
+            .checked_add(1)
+            .ok_or(Error::ResourceLimit)?;
+    }
+    if send.index_mask.is_some() {
+        own_member_bound = own_member_bound
+            .checked_add(1)
+            .ok_or(Error::ResourceLimit)?;
+    }
+    if closure.is_some() {
+        let closure_members = positions
+            .checked_mul(3)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(Error::ResourceLimit)?;
+        own_member_bound = own_member_bound
+            .checked_add(closure_members)
+            .ok_or(Error::ResourceLimit)?;
+    }
     oracles.extend(0..own_member_bound);
     oracles.push(proximity.gu.oracle);
     oracles.push(proximity.omega.oracle);

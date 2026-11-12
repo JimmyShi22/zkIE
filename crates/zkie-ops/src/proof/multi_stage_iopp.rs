@@ -2564,7 +2564,7 @@ mod tests {
         };
         assert!(IoppChain::derive(&shared, &shared_config).is_ok());
         let own = vec![
-            stage_plan(code(17, 65536, 8192), code(17, 512, 256), 13, 2, 2),
+            stage_plan(code(17, 65536, 8192), code(17, 512, 256), 14, 2, 2),
             stage_plan(code(17, 8, 256), code(17, 16, 256), 13, 13, 2),
             stage_plan(code(17, 8, 256), code(17, 1024, 256), 0, 0, 2),
         ];
