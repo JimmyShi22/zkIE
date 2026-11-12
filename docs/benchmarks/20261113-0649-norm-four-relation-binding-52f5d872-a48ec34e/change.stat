@@ -1,0 +1,4 @@
+52f5d872 Bind the norm mean and variance rows
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     |  52 ++---
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 252 ++++++++++++++++++++++-
+ 2 files changed, 268 insertions(+), 36 deletions(-)
