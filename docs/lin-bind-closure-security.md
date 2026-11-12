@@ -671,6 +671,7 @@ the proof partition into blocks with no shared variable:
 
 | Block | Fresh random variables | Public values generated from them |
 |---|---|---|
+| B0 activation | activation leaf salts (the rows are never opened in the hidden path) | activation root (public statement) |
 | B1 W/SEND | W per-position tails, salts, pads | SEND answers, W openings; W roots are RO outputs |
 | B2 index-mask/Dot | index-mask entries (23 hiding, 2 end, 16 claim, 16 tilde, 16 eval), its tail/salts/pad; Dot shown-map X tails/salts/pad | Eval targets, tilde, residual `R`, Dot PSC transcript/U, Dot end values, X answers/openings |
 | B3 closure | per-position 49 hiding + 5 shown, closure mask tail/salts/pad; map/bit/slack trees, tails, salts, answers | closure PSC transcripts/U, ends/points, closure rows, closure openings |
@@ -1019,7 +1020,7 @@ secret directions it touches.
 `[FACT]` `CODE` Full joint composition. The per-block pivots above are not by
 themselves a direct sum; the composition is supplied by the block partition
 and the conditional block lemma of section 5.7. The fresh random variables
-partition into blocks B1-B6; every public value uses fresh variables from
+partition into blocks B0-B6; every public value uses fresh variables from
 exactly one block; the shared `c_t`/`g_t` and W directions are within B2 or
 are secret coupling handled by conditioning, not a shared random variable; and
 the roots/star are RO/public values. Applying the conditional block lemma
@@ -1212,7 +1213,7 @@ mask values, not the algebraic checks.
 | FOLD fresh map constant nonzero determinant | triangular derivation from `FoldRoundProver`; determinant `+1` at k=2 and k=14 | `CODE` `NUM`; no SZ term |
 | shown end masks one-time, beta nonzero | `draw_e_nonzero`; real-prover end-value test | supported |
 | closure joint mask object rank equality | real encoder + real hiding polynomial + joint matrix | `NUM` at k=4; `CODE` block derivation for k=23 |
-| full joint composition of all blocks, shared columns and roots | block partition B1-B6 + conditional block lemma, per-block rank tests | `FACT` `CODE` `MATH` (section 5.7); the scope condition is witness-independence, not a witness-free simulator |
+| full joint composition of all blocks, shared columns and roots | block partition B0-B6 + conditional block lemma, per-block rank tests | `FACT` `CODE` `MATH` (section 5.7); the scope condition is witness-independence, not a witness-free simulator |
 | BASE star fresh and one-time | `draw_star` from a fresh stream; real-path test | supported |
 | local proximity distance/query soundness | plan radius 16,384, 603 column draws, 12 work bits, two base positions; main code (65,539, 8,192), mask (512, 256) | `FACT`: main miss `0.7901314940`, mask miss `0.4444444444`; the proximity is ineffective at the current parameters (section 8) |
 | BASE lambda and symbol-check terms | `Fp3` lambda challenge and two codeword-index samples; no independent-uniform-domain/order derivation here | withdrawn to `eps_proximity` (ineffective proximity; unknown lambda term), not in `eps_components` |
