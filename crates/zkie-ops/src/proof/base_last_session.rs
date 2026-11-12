@@ -298,10 +298,21 @@ pub fn encode_last_base_proof(
 /// lambda and the positions from the transcript, decodes exactly the prover's
 /// messages, and requires the artifact to end after the openings.
 pub fn verify_last_base_proof(
-    mut session: LastBaseSession,
+    session: LastBaseSession,
     positions_count: usize,
     bytes: &[u8],
 ) -> Result<Digest> {
+    verify_last_base_proof_with_positions(session, positions_count, bytes).map(|(seal, _)| seal)
+}
+
+/// The same verification, also returning the BASE positions the verifier
+/// drew. The ledger harness uses them to record the LastBase openings under
+/// the same external keys as the rest of the run.
+pub fn verify_last_base_proof_with_positions(
+    mut session: LastBaseSession,
+    positions_count: usize,
+    bytes: &[u8],
+) -> Result<(Digest, Vec<u64>)> {
     let limits = DecodeLimits {
         max_bytes: bytes.len(),
         max_elements: bytes.len(),
@@ -331,7 +342,7 @@ pub fn verify_last_base_proof(
     session.verify_openings(&star_opening, &final_opening)?;
     let sealed = session.finish()?;
     reader.finish()?;
-    Ok(sealed)
+    Ok((sealed, positions))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

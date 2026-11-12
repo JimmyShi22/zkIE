@@ -26,8 +26,11 @@ numbers in this round are reported results, not an independent external
 verification.
 
 Snapshot: the closed relation at code basis `3b3e8ecc`, with the bounded-read
-rollback `8d32d3de`; fixture `gpt2-seq16`, 16 positions, proof 9,939,144 B.
-The committed document is version 13.
+rollback `8d32d3de`; fixture `gpt2-seq16`, 16 positions. The default two-stage
+formal proof is 66,135,784 B (the previous single-stage snapshot was
+9,939,144 B); the three-stage same-parameter comparison is 214,228,928 B.
+The committed document is version 14; version 14 adds the CS switch random
+material and the wired multi-stage status.
 
 ## 1. The chain in one view
 
@@ -42,6 +45,7 @@ The committed document is version 13.
 | 7 | Dot PSC hiding coefficients | Dot PSC transcript and end values | the same 23-entry hiding class | the hiding map is triangular with a nonzero constant determinant; the two shown end masks one-time pad the end values | sumcheck degree terms in section 6 | `NUM` 23x23 map, `CODE` triangularity |
 | 8 | closure PSC hiding coefficients | per-position PSC transcript | the same closure mask message | same triangular map, one instance per position | sumcheck degree terms; 16 instances | `NUM` 49x49 map, `CODE` |
 | 9 | FOLD fresh coefficients | FOLD start sum and round values | the same fold instance | triangular coefficient map with constant nonzero determinant; the start sum and every sent round value are covered | sumcheck degree terms; two FOLD instances | `NUM` k=2 and k=14, `CODE` |
+| 9a | switch main/mask tails, pad and salts | switch root, sampled answer and switch openings | the previous stage's tails are placed in the switched message; fresh switch values are one per switch | the fresh switch tail is the Vandermonde block on the opened symbols; old tails are fixed or fiber-uniform after the previous tree conditioning; the leaf hash hides unopened symbols | hash model terms; per-stage sampling terms | `NUM` real staged path, `CODE` |
 | 10 | BASE star main/mask rows and tails | BASE target, combined rows and star openings | target, rows and openings of the same star | fresh one-time pads on the target dot product, each combined coordinate and each tail coordinate | BASE lambda/position terms are in `eps_proximity` (ineffective at current parameters; section 8) | `NUM` real star path, `CODE` |
 | 11 | challenge draws | every PSC/FOLD/BASE/position challenge | none | drawn after the message they test; zero-fallback event bounded | 2^-192 per draw fallback, `chi=0` term | `CODE` draw functions, `NUM` order tests |
 
@@ -62,7 +66,14 @@ The rest of the note expands each column.
   three base draws, and `draw_e_nonzero` retries a fixed number of times and
   then returns one;
 - the per-oracle streams are separated by a material commitment and a run
-  seed; one stream is not reused by another oracle.
+  seed; one stream is not reused by another oracle;
+- each switch draws per-row main and mask tails, one nonzero pad and one salt
+  per switched-tree column from a stage-indexed switch domain; each stage FOLD
+  draws `2k+1` fresh coefficients from its stage seed and its own column
+  salts; the last BASE star draws its main/mask rows and tails from a separate
+  stream. `switched_rows_multi` places the previous stage's main/mask tails
+  into the new mask message, so those old tail values are shared between the
+  old tree and the switch tree rather than independently resampled.
 
 `[FACT]` `CODE` Field and distribution transfer:
 
@@ -181,6 +192,7 @@ would be escalated rather than decided locally.
 | closure mask root and openings | encoded mask symbols | 49+5 entries per position, tail, salt | none |
 | closure PSC transcripts | one per position, affine image of the 49 hiding entries and the two shown end masks | 49 hiding, 2 shown per position | message vector and target shift |
 | closure point values | `(B(pt)+shown_2, D(q)+shown_3, weighted B(q)+shown_4)` | 3 shown masks per position | bit/map values |
+| switched message roots, sample answers and openings | the new message's codeword symbols at the drawn positions; the sampled row evaluation | switch main/mask tails, pad and salts; old tails; stage-FOLD coefficients | old row values through the cut map; no plaintext |
 | FOLD start and round values | start sum and `(c0,c2)` per round | 2k+1 fresh coefficients | group-row values |
 | BASE target, combined rows and openings | `target*`, `star + lambda*row`, encoded star symbols | star main/mask/tails | final row and claims |
 | output and seal | winner, valid range, tie result | none | approved output boundary |
@@ -203,6 +215,7 @@ message vectors. It never appears as a plaintext row.
 | closure hiding `U` (49 per position) | that position's PSC transcript | the same message entry also appears in the mask opening |
 | closure shown (5 per position) | two end values and three point values | the same message entry also appears in the mask opening |
 | SEND pads | the answer they pad | no |
+| switch main/mask tails, pad and salts | switch root, sample answer and switch openings | old tails are placed in the switched message and shared with the previous tree; fresh switch values are per switch |
 | FOLD fresh (`2k+1`) | start sum and round values of one fold | no |
 | BASE star main/mask/tails | target, combined rows and openings of one star | yes, the same star; explicit in the BASE matrix |
 
@@ -475,9 +488,10 @@ diagonal blocks are nonzero constants, so the determinant is a nonzero
 constant independent of the challenges and the map is full rank for every
 challenge. The test runs the real fold prover
 for the test point k = 14 (the actual fixture own fold is also k = 14) and for k = 2 at three challenge seeds;
-the 29 x 29 and 5 x 5 matrices are full rank and have determinant one. The
-closed path has two FOLD instances (the shared and own proximity groups);
-their randomness is fresh and their openings/tails are separate.
+the 29 x 29 and 5 x 5 matrices are full rank and have determinant one. The single-stage
+closed path has two FOLD instances (the shared and own proximity groups); a
+staged group adds one stage FOLD after each switch, using the same
+fresh-coefficient map, with fresh per-stage seeds and separate openings/tails.
 
 `[FACT]` `CODE` The FOLD round/bind steps are the actual code behavior:
 
@@ -499,6 +513,34 @@ coefficients fill the start sum and the sent `(c0,c2)` rows with nonzero
 constant diagonal blocks; the linear coefficient of each round is the
 `before` value from the earlier entries and is not an independent public
 entry. The three-point determinant check is corroboration of this derivation.
+
+`[FACT]` `CODE` CS switch. For a non-last stage, `switched_rows_multi`
+maps the old single rows into the target codes: old main values are cut by the
+target index, old masks and old main/mask tails are placed in the target mask
+message at the plan's rest places, and the plan pads are filled with one fresh
+nonzero pad. The new message has fresh main and mask tails per row and one
+salt per column; `commit_switch` commits it under the stage tree plan. The
+public switch record carries the plan-derived target, the declared root, one
+sampled answer, the old-member opening, the fresh-mask opening, and the stage
+FOLD transcript when present. The target is compared with the trusted plan
+before any opening is used; the root is an RO output; the sample answer is the
+sampled row evaluation; the openings are the encoded symbols at the drawn
+positions.
+
+`[MATH]` The switch map is affine in the old row values, the old tails and the
+fresh switch tails. The fresh switch tail is the new tree's tail Vandermonde
+for `q <= r`; the old tails are the same variables that already appear in the
+previous tree, so conditioning on that tree's root/opening either fixes them
+or leaves them uniform over the unopened fiber. The old secret row values
+enter through the deterministic cut map, not as a new plaintext position. The
+switch opening is therefore covered by the previous tree's tail map plus the
+fresh switch tail; the sample answer is a single evaluated row with the switch
+pad. The following stage FOLD is the invertible fresh-coefficient map above,
+and the fresh-mask opening uses the stage-fold tail. The new switch tree is a
+new random source: its tree number, run, configuration and salt stream are
+disjoint from the stage-0 group, the stage FOLD and the BASE star, and the
+external ledger rejects reuse. No plaintext old row appears in the switch
+record.
 
 BASE: `LastBaseProver` draws a fresh star main row, mask row and tails from
 its own stream. The public target is
@@ -677,16 +719,19 @@ the proof partition into blocks with no shared variable:
 | B1 W/SEND | W per-position tails, salts, pads | SEND answers, W openings; W roots are RO outputs |
 | B2 index-mask/Dot | index-mask entries (23 hiding, 2 end, 16 claim, 16 tilde, 16 eval), its tail/salts/pad; Dot shown-map X tails/salts/pad | Eval targets, tilde, residual `R`, Dot PSC transcript/U, Dot end values, X answers/openings |
 | B3 closure | per-position 49 hiding + 5 shown, closure mask tail/salts/pad; map/bit/slack trees, tails, salts, answers | closure PSC transcripts/U, ends/points, closure rows, closure openings |
-| B4 shared | Gu/Omega trees; shared FOLD fresh `2k+1` | shared fold start/rounds, Gu/Omega answers/openings, shared base rows |
-| B5 own | own FOLD fresh `2k+1`; switched/folded fresh masks | own fold start/rounds, own base rows |
-| B6 BASE | star main/mask rows and tails | `target*`, combined rows, star openings |
+| B4 shared | Gu/Omega trees; shared stage-0 tails and FOLD fresh `2k+1`; stage switch tails/pad/salts; stage-FOLD seed/salts | shared fold start/rounds, Gu/Omega answers/openings, switch root/answer/openings, shared base rows |
+| B5 own | own stage-0 tails and FOLD fresh `2k+1`; stage switch tails/pad/salts; stage-FOLD seed/salts | own fold start/rounds, switch root/answer/openings, own base rows |
+| B6 BASE | star main/mask rows and tails; BASE positions | `target*`, combined rows, star openings |
 
-No fresh variable appears in two blocks: the plan allocates disjoint entry
-ranges for the mask classes and reserved SEND pads, every tree has its own
-tail/salt stream, and the FOLD and star draws are per instance; the ledger
-rejects reuse. The quantities shared across blocks are the secret
-`W`/`Omega`/`Gu`/map/bit values and the public challenges, not fresh random
-variables.
+The fresh switch tails, pads and salts are disjoint per switch: the plan
+allocates disjoint tree numbers, the stage seeds differ, and the external
+ledger rejects reuse. The one deliberate sharing is the previous stage's
+main/mask tails, which `switched_rows_multi` places in the new mask message:
+those variables belong to the previous block by physical source, and the
+switch cover conditions on the previous tree's root/opening and uses the fresh
+switch tails as its new random columns. The quantities shared across blocks
+are therefore the secret `W`/`Omega`/`Gu`/map/bit values, the old tails at the
+switch boundary, and the public challenges.
 
 `[FACT]` `MATH` Conditional block lemma (affine form). Let `X_b` be the fresh
 vector of block `b`, uniform on a finite `Fp3`-vector space and independent of
@@ -753,9 +798,17 @@ onto the whole public space" is not used:
   shown entries are the unit/`beta` pivots, the virtual/difference rows are
   mask-only combinations, and the opening is the tail Vandermonde for
   `q <= r`.
-- **B4/B5.** The FOLD sent rows are the invertible fresh-coefficient map with
-  constant determinant (section 5.6); the start sum and rounds are covered;
-  the shared and own instances are separate.
+- **B4/B5 (FOLD).** The FOLD sent rows are the invertible fresh-coefficient
+  map with constant determinant (section 5.6); the start sum and rounds are
+  covered; the shared and own instances are separate.
+- **B4/B5 (switch).** The switch message is affine in the old row values, the
+  old tails and the fresh switch tails. The old-member opening is the encoded
+  old symbol at the drawn positions, the fresh-mask opening is the stage-FOLD
+  mask, and the sample answer is one row evaluation with the switch pad. The
+  fresh switch tail is the Vandermonde row block for `q <= r`; the old tails
+  are fixed (or fiber-uniform) after the previous tree conditioning, so the
+  switch opening inherits the previous tree's cover plus the fresh tail. The
+  switch target is plan-derived and adds no witness-dependent public value.
 - **B6 (affine constraint space).** Write `a = claim`, `b = mask_claim`,
   `M`/`R` for the old main/mask rows, `s`/`t` for the star main/mask rows and
   `lambda` for the challenge. The public values are
@@ -1666,8 +1719,8 @@ non-power-of-two length does not enter the IOPP shape check.
 `[FACT]` `CODE` The compiled `lm_head_compiled` plan is not the hidden
 fixture's run plan: it has main `ell = 4,096`, `r = 962`, mask `ell = 64/256`,
 `k = 6/5` and three stages; the fixture has main `ell = 65,536`, `r = 8,192`,
-mask `512`, `k = 2/13` and no stage list. Using `lm_head_compiled` directly
-would run a different protocol.
+mask `512` and the same two-stage own candidate described below. Using
+`lm_head_compiled` directly would run a different protocol.
 
 `[FACT]` `CODE` Reference multi-stage shape conditions: every non-last stage
 has `k >= 1`, `h <= k`; main and mask message lengths are powers of two; the
@@ -1691,10 +1744,15 @@ bound in the fixture are:
 - shared: stage0 `(17, 65,536, 8,192)/(17, 512, 256)`, `k=2,h=0`,
   positions 2, samples 1, work 0; stage1 (last)
   `(17, 65,536, 256)/(17, 16,384, 256)`, `k=h=0`, positions 2, samples 1.
-- own: stage0 `(17, 65,536, 8,192)/(17, 512, 256)`, `k=14,h=2`, positions 2,
-  samples 1, work 0; stage1 `(17, 8, 256)/(17, 16, 256)`, `k=13,h=13`,
-  positions 2, samples 1; stage2 (last) `(17, 8, 256)/(17, 1,024, 256)`,
-  `k=h=0`, positions 2, samples 1.
+- own (default two-stage candidate): stage0
+  `(17, 65,536, 8,192)/(17, 512, 256)`, `k=14,h=2`, positions 254, samples 1,
+  work 24; stage1 (last) `(17, 65,536, 259)/(17, 16,384, 259)`, `k=h=0`,
+  positions 259, samples 1, work 0.
+- own (same-parameter three-stage comparison only): stage0 as above; stage1
+  `(17, 8, 256)/(17, 16, 256)`, `k=13,h=13`, positions 254, samples 1,
+  work 24; stage2 (last) `(17, 8, 259)/(17, 1,024, 259)`, `k=h=0`,
+  positions 259, samples 1, work 0. The three-stage list is not the default
+  and has no planner check for the middle stage; it is a comparison basis.
 
 The first-stage codes equal the group codes and the first-stage `k`/`h` equal
 the actual member counts (shared 2/0, own 14/2). Unit tests
@@ -1703,29 +1761,27 @@ the actual member counts (shared 2/0, own 14/2). Unit tests
 (wrong first code, wrong folded length, non-last last stage). The lists are
 plan data, not prover self-report.
 
-`[FACT]` `CODE` The multi-stage loop is implemented as a separate module and
-tested on a small fixture (stage0 BAT/FOLD -> (CS switch -> stage FOLD)* ->
-LastBase; the verifier rebuilds the stage sequence and checks the switch
-targets before using proof-supplied roots/openings). The hidden shared/own
-paths are not wired yet: the plan does not carry the extra per-stage fresh
-ids, the stage-FOLD group/member id, the switch/mask run/configuration digests,
-the base-star tree plan, the first-switch old-mask source, or the loop proof
-format. These are plan/proof-format values (seven-category); they are reported
-to the TL/expert, not chosen here. The stage list remains validated; the
-`positions=2/samples=1/work=0` entries are candidate plan values.
+`[FACT]` `CODE` The multi-stage loop is wired into the hidden path. The plan
+carries the per-stage fresh ids, the stage-FOLD group/member id, the switch and
+mask run/configuration digests, the base-star tree plan and the first-switch
+old-mask source; the proof envelope is version 5. The default own stage list is
+two stages with stage-0 positions/work 254/24 and last positions/r 259/259
+(the shared group uses its measured 2/0 stages). The three-stage list is
+retained only for the same-parameter comparison. The prover/verifier loop,
+per-stage opening authentication, independent stage reconstruction, switch
+target checks and the staged final-verifier negatives are exercised by the
+formal seq16 run.
 
 `[FACT]` `CODE` `MATH` Planner-level candidate derivation for the multi-stage
-chain (not yet bound). For a per-stage proximity target of `2^-128`, the
-two-sided miss `(1 - delta)^t` needs the following minimum positions
-(main/mask maxima): shared stage0 155, shared last 129, own stage0 155, own
-stage1 15, own last 20. The current `positions=2` is far below this and is not
-a security setting. The FOLD terms in the future chain are `4/p^3` (shared
-stage0), `28/p^3` (own stage0) and `26/p^3` (own stage1), total
-`58/p^3 < 2^-186.1`; the current single-stage path remains
-`4 + 28 = 32/p^3`. `work=0` is the no-PoW candidate; the plan's
-`column_work_bits=12` applies to table columns, not the IOPP positions. The
-CS/other per-stage terms and the final positions/work/error budget require the
-reference planner rules and remain `[UNPROVEN]`.
+chain (bound in the plan, not a final security parameter). The trusted planner
+computes Johnson/list/MCA/FOLD/BASE/sample/field/batching terms with a 0.2-bit
+margin and returns stage-0 positions/work 254/24 for both groups and last
+positions/r 259/259 for the own group (the shared last stage is sized by the
+same rule and the measured two-position chain). The earlier
+155/129/155/15/20 values were reference-interval candidates; the f64 planner
+difference and its direction are recorded in the evidence note. The final
+interval arithmetic, the largest-m fixed point and the CS/other error terms
+remain the expert's decision and are `[UNPROVEN]` here.
 
 `[FACT]` `MATH` c-difference and `Im(A)`. For a public value `P = A X + c(V,S)`,
 two secrets `(V,S)` and `(V',S')` give the same image exactly when
@@ -1740,14 +1796,13 @@ cross-tree openings are covered by the same affine maps. A fixed public root
 is an input and cannot be replaced by a single tree's `q <= r` condition; the
 joint root/RO history is part of the statement view.
 
-`[UNPROVEN]` The multi-stage chain is not implemented. The next step is a
-trusted planner output for the actual group shapes (`ell=65,536`, `r=8,192`,
-mask `512/256`, `answers=1`, per-stage positions/work) followed by the
-BAT -> (FOLD -> CS)* -> BASE implementation; until then the present
-single-stage path and the proximity `[GAP]` stand. The table remains outside
-the IOPP (N4); if a future plan moves a switched old main to `ell=65,539`, the
-task requires stopping and handing the pad/representation question to the
-expert.
+`[UNPROVEN]` The multi-stage joint-hiding and soundness composition is
+extended in sections 5.6/5.7 for the switch tree, but it remains a derivation,
+not a mechanized proof. The reference interval planner port, the full
+soundness composition and the trusted X source remain open. The table remains
+outside the IOPP (N4); if a future plan moves a switched old main to
+`ell=65,539`, the task requires stopping and handing the pad/representation
+question to the expert.
 
 ## 9. Engineering boundaries and wording
 
@@ -1756,20 +1811,23 @@ the real hiding polynomial and the real fold/base paths, but a passing test
 module is not a production runtime detector for every bad rank or every
 tampered message. The workspace result and the three seq16 runs are the
 delivery evidence reported by the implementation side; they are not an
-independent external verification. The 751-test workspace figure, the three
-proof hashes and the HEAD are the TL-reported delivery figures, not an
-independent expert validation of the protocol. Editing the document or the
+independent external verification. The 796-test workspace figure (17
+ignored in 48 suites), the proof hashes and the HEAD are the
+implementation-side delivery figures, not an independent expert validation of
+the protocol. Editing the document or the
 test-only module is not a new validation of the production protocol either;
 the production messages, commitments and challenge order are unchanged.
 
-`[FACT]` The production proof code is unchanged in this round; the v7-v13
-changes are test-only and document. The earlier mask sampling
-source change (section 2.1) changed only the prover's random values; the
-protocol relations, commitments, challenge order, parameters and encoding
-format are unchanged. The proof content and hash are the measured fixture
-result from that source. The previously closed counter-scope, sample-path and
-fixture-assumption wording is maintained; the v10-v13 target inventory, online
-simulator and soundness reduction do not reopen those items.
+`[FACT]` The staged loop is wired in this round: the proof envelope is
+version 5, the hidden session layout is 14, and the LastBase verifier also
+returns the drawn positions to the ledger harness. The earlier v7-v13
+mask-sampling and joint-view changes were test-only; the loop wiring changes
+the proof path, so the compatibility statement below applies to the staged
+proof. The protocol relations, commitments, challenge order, parameters and
+encoding format for the single-stage path are otherwise unchanged. The
+previously closed counter-scope, sample-path and fixture-assumption wording is
+maintained; the v10-v13 target inventory, online simulator and soundness
+reduction do not reopen those items.
 
 `[FACT]` The target row list of section 5.9 is the basis for the next round's
 argument. The full joint composition of the fresh variables is supplied by the
@@ -1784,30 +1842,23 @@ self-check is not an independent expert verification, and editing this
 document or the test-only module is not a new validation of the production
 protocol.
 
-`[FACT]` `NUM` Compatibility evidence. The new proof length is 9,939,144
-bytes and its sha256 is `f8f512c0...3215f5` in the three seq16 runs; the
-process-level counter recorded `sample_accepts = 276,343,251` and
-`sample_rejects = 0` in each run. The rejection sampling only changes a draw
-when a candidate word is at or above the modulus; this deterministic fixture
-produced no such word, so the proof content is byte-identical to the previous
-round. The sampling distribution is still the unbiased one; the boundary and
-retry tests exercise the rejection path. The counter includes `redraw` and
-repeated evaluations, and the timed runs include the atomic overhead; they
-are not exactly comparable to the earlier no-counter baseline. The encoding
-version and the hidden schema version are unchanged because the message
-structure is unchanged. A proof produced before the sampling change
-(`9,939,144` bytes, the previous round's dump) was decoded and verified by the
-new verifier through the bytes entry: `loaded_proof_ok=1`, with the same
-`9,939,144` byte length. The verifier never re-derives the prover's mask
-values, so the changed sampling does not invalidate old proofs under the same
-plan and public statement.
+`[FACT]` `NUM` Compatibility evidence. The default two-stage formal seq16
+proof is 66,135,784 bytes (three-stage same-parameter 214,228,928 bytes); the
+old single-stage 9,939,144-byte artifact was a version-4 envelope and is not
+accepted by the version-5 decoder (UnsupportedVersion; the formal outer
+negative matrix checks this). The earlier mask-sampling counter evidence still
+applies to the prover's draws: the sampling distribution is the unbiased one,
+and the boundary/retry tests exercise the rejection path. The counter includes
+`redraw` and repeated evaluations, and the timed runs include the atomic
+overhead when the counter is enabled; they are not exactly comparable to the
+earlier no-counter baseline.
 
-`[FACT]` The old proof verifying does **not** prove that the old prover
+`[FACT]` An old proof verifying would **not** prove that the old prover
 sampled unbiasedly. The verification equations are the same; the mask
-distribution is a prover-side implementation property. The version being
-unchanged is an encoding-compatibility statement, not a proof of the security
-source. The unbiasedness conclusion is the honest-prover assumption of
-section 2.1, not the compatibility test.
+distribution is a prover-side implementation property. The version change is
+an encoding-compatibility change, not a proof of the security source. The
+unbiasedness conclusion is the honest-prover assumption of section 2.1, not
+the compatibility test.
 
 `[FACT]` `NUM` Sampling tests: boundary `p-1` accepted; `p` and `2^64-1`
 rejected and retried; retry exhaustion returns an error after the fixed
@@ -1824,15 +1875,16 @@ source is a deployment trust assumption, listed separately from the per-proof
 `ByteMaskCoins` stream; this document does not prove the deployment setup's
 randomness.
 
-`[FACT]` The GPT-2 single-fixture seq16 runs are not three models or all
-models. No performance or proof-size equivalence to another system is claimed
-from these runs. All test numbers in this note are the implementation side's
-reported results (TL self-check), not an independent expert verification.
+`[FACT]` The five-case matrix covers gpt2 and gemma3 at seq16/seq512 and
+timesfm at 16 patches; the detailed two-stage measurement is the gpt2-seq16
+formal fixture. No performance or proof-size equivalence to another system is
+claimed. All test numbers in this note are the implementation side's reported
+results (TL self-check), not an independent expert verification.
 
-`[FACT]` The schema and encoding versions are unchanged because the message
-structure is unchanged and there is no deployed compatibility surface the
-version would need to distinguish. A security-semantics version change is not
-made here; it would be escalated.
+`[FACT]` The envelope version is 5 and the hidden session layout is 14. A
+version-4 or unknown version is rejected before decoding; there is no silent
+fallback to the single-stage tail. A security-semantics version change beyond
+this staged envelope is not made here; it would be escalated.
 
 `[FACT]` The asset inventory and its bounds apply only to the listed
 `gpt2-seq16` fixture path and its shapes/code parameters; they are not
@@ -1874,12 +1926,13 @@ claim a closed joint theorem.
   decrease `ell + r`; fixing `n`/`ell` and increasing `r` raises the rate and
   lowers the distance) (section 8). `eps_proximity` is ineffective, not a
   small unknown.
-- `[GAP]` The multi-stage IOPP stage lists are now in the plan and validated
-  (shared 2 stages, own 3 stages; reference shape conditions pass). The
-  BAT -> (FOLD -> CS)* -> BASE prover/verifier loop, per-stage opening
-  authentication, independent stage reconstruction and failure matrix are
-  not implemented; the per-stage positions/work/error parameters are
-  candidate values, not a planner-sized derivation (section 8.7).
+- `[GAP]` The multi-stage IOPP stage lists are in the plan and the
+  BAT -> (FOLD -> CS)* -> BASE loop is implemented and exercised on the real
+  seq16 fixture; the per-stage positions/work come from the candidate planner
+  (254/24, 259/259) and are bound in the plan. The reference interval
+  arithmetic, a mechanized soundness/joint-hiding composition, and the
+  resource decision for the 66 MB/170 GB shape remain expert/boss items
+  (section 8.7).
 - `[UNPROVEN]` A mechanized composition theorem and an end-to-end 128-bit
   claim; `126.21`/`116.01` remain plan-ledger numbers.
 - `[LONG-TERM]` The trusted X source, policy distribution/freshness and

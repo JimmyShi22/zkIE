@@ -89,6 +89,29 @@ nonce and the stated openings into the transcript in a fixed order; the next
 stage member is the code-switch output actually registered and root-verified
 by the previous switch, and the following FOLD layout must equal the plan.
 
+## Opening ledger
+
+`[FACT]` The formal harness books each loop tree from the trusted plan before
+proof work: one `OracleKind::Cs` key per switch tree, one `OracleKind::Fold`
+key per stage-FOLD mask tree, and `Star`/`StarMask` keys for the plan-derived
+BASE star tree. Each key is reserved with the plan's logical draws and tail
+rank. The switch member and fresh openings are recorded against those keys
+after the prover returns; the LastBase verifier exposes the drawn base
+positions, and the harness records the last switch tree and both star trees at
+those positions after verification. Recording requires the request to be in
+the reserved state, enforces the per-tree union bound and fails closed on
+excess, reuse or recovery. In the GPT-2 seq16 two-stage run the ledger reports
+139 events / 18,267 logical / 18,265 unique positions before LastBase and 145
+events / 19,050 logical / 19,042 unique after it; the total tail rank is
+558,595, the minimum remaining is 0 and two oracles are exactly exhausted (not
+over). The raw totals are in the trace notes.
+
+The switch sample answer is a single evaluated row carrying the switch pad,
+not a tree-opening vector: the canonical switch record carries no opening
+positions for it, so it is not a position-union event of the ledger. Its
+transcript value and pad are part of the public view covered by the switch
+argument.
+
 ## Envelope and compatibility
 
 `[FACT]` The hidden output-head proof envelope version is `5`; the session
@@ -130,33 +153,32 @@ the star plan is bound in the trusted plan.
 
 ## Open items
 
-`[GAP]` The joint opening ledger accounts the single-stage basis in the
-session harness. The staged harness now budgets the stage-0 member openings
-at the stage-0 positions, but it does not yet reserve the loop switch trees,
-stage-FOLD mask trees and plan-derived BASE star trees, and it does not record
-their actual openings (the LastBase positions are drawn during verification).
-The loop opening ledger therefore remains open; see the evidence note.
+`[FACT]` The joint opening ledger includes the loop switch trees, the
+stage-FOLD mask trees and the plan-derived BASE star trees, and records their
+actual member, fresh and LastBase openings under the plan keys. The single
+non-union event is the switch sample answer described above. See the evidence
+note for the measured totals.
 
 
-`[FACT]` The acceptance run measured on the GPT-2 seq16 formal fixture, same
-machine, after the loop wiring and the `k=14` stage-0 correction. Three runs:
-hidden prove 736,296-744,204 ms (median 740,925), hidden verify
-51,142-51,681 ms (median 51,428), whole test 1,027.94-1,035.04 s (median
-1,028.43), hidden proof 9,527,120 bytes in every run and maximum RSS
-213,775,000-213,833,272 KiB (median 213,788,360). The proof reports 14 own
-fold rounds. The previous single-stage trace on the same
-fixture (scheme `rework10-final`, code `473e395d`) recorded hidden prove
-359,802 ms, hidden verify 50,538 ms, maximum RSS 169,394,600 KiB and a
-646.80 s test. The loop therefore roughly doubles hidden prove wall time and
-raises peak RSS by about 26% on this fixture; the numbers are recorded as a
-resource cost of the multi-stage scheme, not as an optimization gain. The
-baseline is from a different commit and is cited with its trace.
+`[FACT]` The two-stage candidate acceptance run on the GPT-2 seq16 formal
+fixture, same machine, measured hidden prove 372,116 ms, hidden verify
+64,736 ms, proof 66,135,784 bytes, maximum RSS 169,961,812 KiB and whole test
+674.20 s, with 14 own fold rounds. The Q3 ledger rerun measured hidden prove
+377,899 ms, hidden verify 64,966 ms, the same 66,135,784-byte proof and
+169,442,488 KiB maximum RSS; its 1,192.65 s test wall includes the enlarged
+outer negative matrix. The same-parameter three-stage comparison
+measured hidden prove 768,920 ms, hidden verify 75,151 ms, proof 214,228,928
+bytes, maximum RSS 212,843,964 KiB and whole test 1,083.66 s. The earlier
+positions=2 three-stage run (prove 736,296-744,204 ms, proof 9,527,120 bytes)
+is a different security setting and is not compared as a cost baseline. The
+numbers are recorded as a resource cost of the safe-parameter loop, not as an
+optimization gain; the trace directories carry the raw logs.
 
 `[GAP]` The security bound that combines code distance, list size, batching,
 hash, work and mask hiding budgets at the production parameters is not
 restated here. It is part of the batch review together with the measured
-resource budget; small-fixture parameters are not final parameters. The
-`positions=2` and `work=0` stage values remain candidate plan values; the
-planner-derived proximity positions for a `2^-128` per-stage target are much
-larger (shared stage0 155, shared last 129, own stage0 155, own stage1 15,
-own last 20).
+resource budget. The two-stage candidate uses planner-derived stage-0
+positions/work 254/24 and last positions/r 259/259; those are bound in the
+trusted plan but are not final parameters. The reference interval arithmetic
+and the largest-m fixed point are not ported; the evidence note records the
+observed f64 difference.

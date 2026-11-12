@@ -43,8 +43,8 @@ use zkie_core::common::codec::DecodeLimits;
 
 use crate::proof::base_final_session::{fold_identity, FoldBasis, FoldMember};
 use crate::proof::base_last_session::{
-    encode_last_base_proof, verify_last_base_proof, LastBaseProver, LastBaseRandomness,
-    LastBaseSession,
+    encode_last_base_proof, verify_last_base_proof_with_positions, LastBaseProver,
+    LastBaseRandomness, LastBaseSession,
 };
 use crate::proof::cs_multi_session::{CsMultiProver, CsMultiSession, OldMaskSource};
 use crate::proof::fold_handoff::{FoldHandoff, FoldHandoffAnchor};
@@ -899,11 +899,23 @@ pub fn prove_multi_stage_iopp(
 /// The proof's switch sequence must equal the plan's sequence before any
 /// proof-supplied root, opening or stage FOLD message is used.
 pub fn verify_multi_stage_iopp(
-    mut chain: Chain,
+    chain: Chain,
     plan: &IoppChain,
     stage_zero: IoppVerifyStageZero,
     proof: &IoppProof,
 ) -> Result<Digest> {
+    verify_multi_stage_iopp_with_last_positions(chain, plan, stage_zero, proof)
+        .map(|(seal, _)| seal)
+}
+
+/// Verifies the loop and also returns the last-stage BASE positions. The
+/// external opening ledger uses the positions for the LastBase artifact.
+pub fn verify_multi_stage_iopp_with_last_positions(
+    mut chain: Chain,
+    plan: &IoppChain,
+    stage_zero: IoppVerifyStageZero,
+    proof: &IoppProof,
+) -> Result<(Digest, Vec<u64>)> {
     let switch_count = plan.stages.len() - 1;
     if proof.switches.len() != switch_count {
         return Err(Error::StatementMismatch);
@@ -1003,7 +1015,7 @@ pub fn verify_multi_stage_iopp(
                 declared_root,
                 plan.config.base_star.clone(),
             )?;
-            return verify_last_base_proof(
+            return verify_last_base_proof_with_positions(
                 base_session,
                 plan.base_positions(),
                 &proof.base,

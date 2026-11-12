@@ -335,6 +335,7 @@ fn selected_gpt2_output_head_request_session() {
         IoppStagePlan, MaskEntryAllocation, ProximityTail, WShape,
     };
     use zkie_ops::proof::model_commitment::verify_shared_trace_outputs;
+    use zkie_ops::proof::proximity_iopp::{proximity_iopp_plan, ProximityGroupRole};
     use zkie_ops::proof::output_head_lin::diagnostic::{
         output_head_claims, prepare_output_head_trace, prove_output_head_lin_prepared,
         verify_output_head_lin_prepared, verify_output_head_lin_request_bytes, OutputHeadTrace,
@@ -1363,6 +1364,135 @@ fn selected_gpt2_output_head_request_session() {
             .first()
             .map(|stage| stage.positions)
             .unwrap_or(setup.proximity.shared_base_positions);
+        // The loop's switch, stage-FOLD and BASE-star trees are reserved under
+        // the plan-derived keys before any proof work. Their actual openings
+        // are recorded after the prover/verifier returns.
+        let ledger_plan =
+            build_output_head_hidden_plan(shape, &setup, &table.reader(), &trusted)
+                .expect("build the ledger plan");
+        let own_iopp = proximity_iopp_plan(
+            &ledger_plan.proximity,
+            &ledger_plan.send,
+            ledger_plan.closure.as_ref(),
+            ProximityGroupRole::Own,
+        )
+        .expect("derive the own loop chain")
+        .expect("the own group has stages");
+        let shared_iopp = proximity_iopp_plan(
+            &ledger_plan.proximity,
+            &ledger_plan.send,
+            ledger_plan.closure.as_ref(),
+            ProximityGroupRole::Shared,
+        )
+        .expect("derive the shared loop chain")
+        .expect("the shared group has stages");
+        let mut own_switch_oracles = Vec::new();
+        let mut own_fold_oracles = Vec::new();
+        let mut shared_switch_oracles = Vec::new();
+        let mut shared_fold_oracles = Vec::new();
+        for (oracles, folds, iopp) in [
+            (&mut own_switch_oracles, &mut own_fold_oracles, &own_iopp),
+            (
+                &mut shared_switch_oracles,
+                &mut shared_fold_oracles,
+                &shared_iopp,
+            ),
+        ] {
+            for (index, stage) in iopp.chain.stages.iter().enumerate().skip(1) {
+                let tree = stage.tree.as_ref().expect("a switch tree plan");
+                let oracle_id = index as u64;
+                let key = ledger_oracle(
+                    OracleKind::Cs,
+                    ledger_identity(OracleKind::Cs, oracle_id, tree.tree_number),
+                    oracle_id,
+                    tree.tree_number,
+                    tree.run,
+                    tree.configuration,
+                );
+                reserve(
+                    key,
+                    OracleBudget::new(
+                        stage.plan.positions as u64,
+                        stage.plan.main.r.min(stage.plan.mask.r),
+                    )
+                    .expect("switch-tree budget"),
+                );
+                oracles.push(key);
+                if let Some(fold) = &stage.fold {
+                    let fold_key = ledger_oracle(
+                        OracleKind::Fold,
+                        ledger_identity(OracleKind::Fold, oracle_id, fold.mask_tree.tree_number),
+                        oracle_id,
+                        fold.mask_tree.tree_number,
+                        fold.mask_tree.run,
+                        fold.mask_tree.configuration,
+                    );
+                    reserve(
+                        fold_key,
+                        OracleBudget::new(
+                            stage.plan.positions as u64,
+                            fold.shape.mask_code.r,
+                        )
+                        .expect("stage-fold budget"),
+                    );
+                    folds.push(fold_key);
+                }
+            }
+        }
+        let own_star = own_iopp.chain.config.base_star;
+        let own_star_key = ledger_oracle(
+            OracleKind::Star,
+            ledger_identity(OracleKind::Star, 1, own_star.tree_number),
+            1,
+            own_star.tree_number,
+            own_star.run,
+            own_star.configuration,
+        );
+        reserve(
+            own_star_key,
+            OracleBudget::new(setup.proximity.own_base_positions as u64, 0)
+                .expect("own loop star budget"),
+        );
+        let own_star_mask_key = ledger_oracle(
+            OracleKind::StarMask,
+            ledger_identity(OracleKind::StarMask, 1, own_star.tree_number),
+            1,
+            own_star.tree_number,
+            own_star.run,
+            own_star.configuration,
+        );
+        reserve(
+            own_star_mask_key,
+            OracleBudget::new(setup.proximity.own_base_positions as u64, 0)
+                .expect("own loop star-mask budget"),
+        );
+        let shared_star = shared_iopp.chain.config.base_star;
+        let shared_star_key = ledger_oracle(
+            OracleKind::Star,
+            ledger_identity(OracleKind::Star, 2, shared_star.tree_number),
+            2,
+            shared_star.tree_number,
+            shared_star.run,
+            shared_star.configuration,
+        );
+        reserve(
+            shared_star_key,
+            OracleBudget::new(setup.proximity.shared_base_positions as u64, 0)
+                .expect("shared loop star budget"),
+        );
+        let shared_star_mask_key = ledger_oracle(
+            OracleKind::StarMask,
+            ledger_identity(OracleKind::StarMask, 2, shared_star.tree_number),
+            2,
+            shared_star.tree_number,
+            shared_star.run,
+            shared_star.configuration,
+        );
+        reserve(
+            shared_star_mask_key,
+            OracleBudget::new(setup.proximity.shared_base_positions as u64, 0)
+                .expect("shared loop star-mask budget"),
+        );
         let activation_root = activation_commitment.root();
         let activation_oracle = ledger_oracle(
             OracleKind::Activation,
@@ -1904,8 +2034,11 @@ fn selected_gpt2_output_head_request_session() {
                 .expect("star opening counts")
         };
 
+        let column_draws = hidden_proof.session.shared.column_positions.clone();
+        let column_unique = ledger_unique(&column_draws);
         let mut expected_unions: BTreeMap<OracleKey, BTreeSet<u64>> = BTreeMap::new();
         let mut expected_logical: BTreeMap<OracleKey, u64> = BTreeMap::new();
+        {
         let mut record = |oracle: OracleKey,
                           stage: Stage,
                           source: OpeningSource,
@@ -1944,8 +2077,6 @@ fn selected_gpt2_output_head_request_session() {
                 );
             }
         }
-        let column_draws = hidden_proof.session.shared.column_positions.clone();
-        let column_unique = ledger_unique(&column_draws);
         record(
             table_oracle,
             Stage::Table,
@@ -2113,7 +2244,143 @@ fn selected_gpt2_output_head_request_session() {
             );
         }
 
-        ledger.mark_proved(request_id).expect("the prover returned");
+        // The loop's switch openings are recorded against the plan-derived
+        // keys. Stage 0 opens every original member at the same position set;
+        // later switches open the previous switch tree.
+        if let ProximityTail::Stages(proof) = &hidden_proof.session.shared.tail {
+            for (index, switch) in proof.switches.iter().enumerate() {
+                let logical = shared_iopp.chain.stages[index].plan.positions as u64;
+                let main_positions = switch
+                    .member_openings
+                    .first()
+                    .map(|opening| opening.positions.clone())
+                    .unwrap_or_default();
+                if index == 0 {
+                    assert_eq!(switch.member_openings.len(), 2);
+                    assert!(
+                        switch
+                            .member_openings
+                            .iter()
+                            .all(|opening| opening.positions == main_positions),
+                        "every shared member opens the same stage-0 positions"
+                    );
+                    record(
+                        gu_oracle,
+                        Stage::Switch,
+                        OpeningSource::Switch,
+                        opening_counts(logical, &main_positions),
+                        main_positions.clone(),
+                    );
+                    record(
+                        omega_oracle,
+                        Stage::Switch,
+                        OpeningSource::Switch,
+                        opening_counts(logical, &main_positions),
+                        main_positions,
+                    );
+                } else {
+                    assert_eq!(switch.member_openings.len(), 1);
+                    record(
+                        shared_switch_oracles[index - 1],
+                        Stage::Switch,
+                        OpeningSource::Switch,
+                        opening_counts(logical, &main_positions),
+                        main_positions,
+                    );
+                }
+                let fresh = if index == 0 {
+                    fresh_shared_oracle
+                } else {
+                    shared_fold_oracles[index - 1]
+                };
+                record(
+                    fresh,
+                    Stage::Switch,
+                    OpeningSource::Switch,
+                    opening_counts(logical, &switch.fresh_opening.positions),
+                    switch.fresh_opening.positions.clone(),
+                );
+                assert!(
+                    switch.old_mask_opening.is_none(),
+                    "the current shared old-mask source has no opening"
+                );
+            }
+        }
+        if let ProximityTail::Stages(proof) = &hidden_proof.session.second.tail {
+            for (index, switch) in proof.switches.iter().enumerate() {
+                let logical = own_iopp.chain.stages[index].plan.positions as u64;
+                let main_positions = switch
+                    .member_openings
+                    .first()
+                    .map(|opening| opening.positions.clone())
+                    .unwrap_or_default();
+                if index == 0 {
+                    assert_eq!(
+                        switch.member_openings.len(),
+                        weight_oracles.len() + 1 + 1 + closure_slack_oracles.len()
+                            + closure_bits_oracles.len()
+                            + closure_map_oracles.len()
+                            + 1
+                            + 1
+                    );
+                    assert!(
+                        switch
+                            .member_openings
+                            .iter()
+                            .all(|opening| opening.positions == main_positions),
+                        "every own member opens the same stage-0 positions"
+                    );
+                    for oracle in weight_oracles
+                        .iter()
+                        .chain(std::iter::once(&index_oracle))
+                        .chain(std::iter::once(&dot_oracle))
+                        .chain(closure_slack_oracles.iter())
+                        .chain(closure_bits_oracles.iter())
+                        .chain(closure_map_oracles.iter())
+                        .chain(std::iter::once(&closure_mask_oracle))
+                        .chain(std::iter::once(&omega_oracle))
+                    {
+                        record(
+                            *oracle,
+                            Stage::Switch,
+                            OpeningSource::Switch,
+                            opening_counts(logical, &main_positions),
+                            main_positions.clone(),
+                        );
+                    }
+                } else {
+                    assert_eq!(switch.member_openings.len(), 1);
+                    record(
+                        own_switch_oracles[index - 1],
+                        Stage::Switch,
+                        OpeningSource::Switch,
+                        opening_counts(logical, &main_positions),
+                        main_positions,
+                    );
+                }
+                let fresh = if index == 0 {
+                    fresh_own_oracle
+                } else {
+                    own_fold_oracles[index - 1]
+                };
+                record(
+                    fresh,
+                    Stage::Switch,
+                    OpeningSource::Switch,
+                    opening_counts(logical, &switch.fresh_opening.positions),
+                    switch.fresh_opening.positions.clone(),
+                );
+                assert!(
+                    switch.old_mask_opening.is_none(),
+                    "the current own old-mask source has no opening"
+                );
+            }
+        }
+
+        }
+        if single_stage {
+            ledger.mark_proved(request_id).expect("the prover returned");
+        }
         assert_eq!(
             ledger.succeed_request(request_id).unwrap_err(),
             zkie_core::error::Error::InvalidSessionState,
@@ -2304,6 +2571,81 @@ fn selected_gpt2_output_head_request_session() {
         .unwrap();
         println!("hidden_verify_ms={}", started.elapsed().as_millis());
         drop(_profile_hidden_verify);
+        if !single_stage {
+            let mut record = |oracle: OracleKey,
+                              stage: Stage,
+                              source: OpeningSource,
+                              counts: OpeningCounts,
+                              positions: Vec<u64>| {
+                let tail = ledger
+                    .record_openings(request_id, oracle, stage, source, counts, &positions)
+                    .expect("record a LastBase opening event");
+                let union = expected_unions.entry(oracle).or_default();
+                for position in &positions {
+                    union.insert(*position);
+                }
+                *expected_logical.entry(oracle).or_insert(0) += counts.logical_draws;
+                assert!(
+                    tail.rank == 0 || tail.new_union <= tail.rank,
+                    "the ledger keeps the tail union inside the rank"
+                );
+            };
+            if let Some(positions) = hidden_outcome.outcome.shared_base.last_positions() {
+                record(
+                    *shared_switch_oracles
+                        .last()
+                        .expect("the shared last switch key"),
+                    Stage::Base,
+                    OpeningSource::BaseMember,
+                    opening_counts(setup.proximity.shared_base_positions as u64, positions),
+                    positions.to_vec(),
+                );
+                record(
+                    shared_star_key,
+                    Stage::Base,
+                    OpeningSource::BaseStar,
+                    opening_counts(setup.proximity.shared_base_positions as u64, positions),
+                    positions.to_vec(),
+                );
+                record(
+                    shared_star_mask_key,
+                    Stage::Base,
+                    OpeningSource::BaseStar,
+                    opening_counts(setup.proximity.shared_base_positions as u64, positions),
+                    positions.to_vec(),
+                );
+            } else {
+                panic!("the shared loop did not return BASE positions");
+            }
+            if let Some(positions) = hidden_outcome.outcome.own_base.last_positions() {
+                record(
+                    *own_switch_oracles
+                        .last()
+                        .expect("the own last switch key"),
+                    Stage::Base,
+                    OpeningSource::BaseMember,
+                    opening_counts(setup.proximity.own_base_positions as u64, positions),
+                    positions.to_vec(),
+                );
+                record(
+                    own_star_key,
+                    Stage::Base,
+                    OpeningSource::BaseStar,
+                    opening_counts(setup.proximity.own_base_positions as u64, positions),
+                    positions.to_vec(),
+                );
+                record(
+                    own_star_mask_key,
+                    Stage::Base,
+                    OpeningSource::BaseStar,
+                    opening_counts(setup.proximity.own_base_positions as u64, positions),
+                    positions.to_vec(),
+                );
+            } else {
+                panic!("the own loop did not return BASE positions");
+            }
+            ledger.mark_proved(request_id).expect("the prover returned");
+        }
         let _profile_ledger_checks = zkie_engine::profile::Scope::new("harness.ledger_checks");
         ledger
             .mark_verified(request_id)
@@ -2316,6 +2658,38 @@ fn selected_gpt2_output_head_request_session() {
             .expect("read the request")
             .expect("request");
         assert_eq!(closed.state, RequestState::Succeeded);
+        let final_ledger = ledger.read_state().expect("read the final ledger");
+        println!("ledger_final_events={}", final_ledger.events.len());
+        println!(
+            "ledger_final_logical={}",
+            final_ledger.total_event_draws().expect("final draws")
+        );
+        println!(
+            "ledger_final_unique={}",
+            final_ledger
+                .total_event_unique_positions()
+                .expect("final unique")
+        );
+        let final_budget = final_ledger.opening_budget_summary();
+        println!("ledger_final_min_tail_remaining={}", final_budget.min_remaining);
+        println!("ledger_final_exhausted={}", final_budget.exhausted);
+        for (oracle, union) in &expected_unions {
+            let record = final_ledger.oracle(*oracle).expect("final oracle record");
+            assert_eq!(&record.opened_positions, union);
+            assert_eq!(record.logical_openings, expected_logical[oracle]);
+            assert_eq!(record.unique_positions, union.len() as u64);
+            assert_eq!(record.totals().logical_draws, expected_logical[oracle]);
+        }
+        let expected_unique: u64 = expected_unions
+            .values()
+            .map(|union| union.len() as u64)
+            .sum();
+        assert_eq!(
+            final_ledger
+                .total_event_unique_positions()
+                .expect("final unique"),
+            expected_unique
+        );
         if single_stage {
             assert_eq!(closed.event_count(), 143);
         }
@@ -2576,9 +2950,156 @@ fn selected_gpt2_output_head_request_session() {
         let mut trailing = hidden_bytes.clone();
         trailing.push(0);
         assert!(OutputHeadLinProof::decode(&hidden_plan, &trailing).is_err());
+        assert!(verify_output_head_lin_hidden_bytes(
+            shape,
+            &hidden_plan,
+            &trusted,
+            &table.reader(),
+            &trailing
+        )
+        .is_err());
         let mut truncated = hidden_bytes.clone();
         truncated.truncate(truncated.len() - 1);
         assert!(OutputHeadLinProof::decode(&hidden_plan, &truncated).is_err());
+        assert!(verify_output_head_lin_hidden_bytes(
+            shape,
+            &hidden_plan,
+            &trusted,
+            &table.reader(),
+            &truncated
+        )
+        .is_err());
+        // Version gate on the real staged envelope: v4 is unsupported and a
+        // newer unknown version cannot decode; neither falls back to a
+        // single-stage tail.
+        let session_bytes = hidden_proof.session.encode().unwrap();
+        let mut old_version = zkie_engine::primitives::codec::CanonicalWriter::new();
+        old_version.put_u64(4);
+        old_version.put_bytes(&session_bytes);
+        let old_version = old_version.into_bytes();
+        assert_eq!(
+            OutputHeadLinProof::decode(&hidden_plan, &old_version).unwrap_err(),
+            zkie_core::error::Error::UnsupportedVersion
+        );
+        assert!(verify_output_head_lin_hidden_bytes(
+            shape,
+            &hidden_plan,
+            &trusted,
+            &table.reader(),
+            &old_version
+        )
+        .is_err());
+        let mut new_version = zkie_engine::primitives::codec::CanonicalWriter::new();
+        new_version.put_u64(6);
+        new_version.put_bytes(&session_bytes);
+        assert_eq!(
+            OutputHeadLinProof::decode(&hidden_plan, &new_version.into_bytes()).unwrap_err(),
+            zkie_core::error::Error::InvalidEncoding
+        );
+
+        // Per-source outer negatives on the real staged proof. Each mutation
+        // reaches the final verifier, not only a module-level decoder. The
+        // default candidate is two stages per group, so each group carries one
+        // switch; the three-stage comparison uses the same code path.
+        let mut tampered = clone_proof(&hidden_proof);
+        if let ProximityTail::Stages(proof) = &mut tampered.session.shared.tail {
+            proof.switches[0].declared_root.0[0] ^= 1;
+        } else {
+            panic!("the shared group is staged");
+        }
+        assert!(reject(&tampered));
+
+        let mut tampered = clone_proof(&hidden_proof);
+        if let ProximityTail::Stages(proof) = &mut tampered.session.second.tail {
+            proof.switches[0].declared_root.0[0] ^= 1;
+        } else {
+            panic!("the own group is staged");
+        }
+        assert!(reject(&tampered));
+
+        let mut tampered = clone_proof(&hidden_proof);
+        if let ProximityTail::Stages(proof) = &mut tampered.session.second.tail {
+            proof.switches[0].target.main_rows += 1;
+        } else {
+            panic!("the own group is staged");
+        }
+        assert!(reject(&tampered));
+
+        let mut tampered = clone_proof(&hidden_proof);
+        if let ProximityTail::Stages(proof) = &mut tampered.session.second.tail {
+            proof.switches[0].member_openings[0].columns[0].symbols[0] = Fp::from_u64(1);
+        } else {
+            panic!("the own group is staged");
+        }
+        assert!(reject(&tampered));
+
+        let mut tampered = clone_proof(&hidden_proof);
+        if let ProximityTail::Stages(proof) = &mut tampered.session.second.tail {
+            proof.switches[0].fresh_opening.columns[0].symbols[0] = Fp::from_u64(1);
+        } else {
+            panic!("the own group is staged");
+        }
+        assert!(reject(&tampered));
+
+        let mut tampered = clone_proof(&hidden_proof);
+        if let ProximityTail::Stages(proof) = &mut tampered.session.shared.tail {
+            proof.switches[0].old_mask_opening = Some(proof.switches[0].fresh_opening.clone());
+        } else {
+            panic!("the shared group is staged");
+        }
+        assert!(reject(&tampered));
+
+        let mut tampered = clone_proof(&hidden_proof);
+        if let ProximityTail::Stages(proof) = &mut tampered.session.second.tail {
+            proof.switches[0].old_mask_opening = Some(proof.switches[0].fresh_opening.clone());
+        } else {
+            panic!("the own group is staged");
+        }
+        assert!(reject(&tampered));
+
+        let mut tampered = clone_proof(&hidden_proof);
+        if let ProximityTail::Stages(proof) = &mut tampered.session.second.tail {
+            proof.base[0] ^= 1;
+        } else {
+            panic!("the own group is staged");
+        }
+        assert!(reject(&tampered));
+
+        // A missing switch leaves the stage claim pending; a duplicated stage
+        // changes the sequence. Both are rejected before the pending claim can
+        // be used.
+        let mut tampered = clone_proof(&hidden_proof);
+        if let ProximityTail::Stages(proof) = &mut tampered.session.second.tail {
+            proof.switches.pop();
+        } else {
+            panic!("the own group is staged");
+        }
+        assert!(reject(&tampered));
+
+        let mut tampered = clone_proof(&hidden_proof);
+        if let ProximityTail::Stages(proof) = &mut tampered.session.second.tail {
+            let duplicate = proof.switches[0].clone();
+            proof.switches.push(duplicate);
+        } else {
+            panic!("the own group is staged");
+        }
+        assert!(reject(&tampered));
+
+        // The final seal is bound to the staged base transcript.
+        let mut tampered = clone_proof(&hidden_proof);
+        tampered.session.second.seal.0[0] ^= 1;
+        assert!(reject(&tampered));
+
+        // Swapping the two groups tails mixes opening sources across the
+        // trusted plans and cannot verify.
+        let mut tampered = clone_proof(&hidden_proof);
+        std::mem::swap(&mut tampered.session.shared.tail, &mut tampered.session.second.tail);
+        assert!(reject(&tampered));
+
+        // A changed W root is rejected by the first group trusted roots.
+        let mut tampered = clone_proof(&hidden_proof);
+        tampered.session.first.group.entries[0].root.0[0] ^= 1;
+        assert!(reject(&tampered));
         drop(_profile_encoding);
         drop(_profile_negatives);
         zkie_engine::profile::dump();

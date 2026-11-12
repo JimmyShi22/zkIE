@@ -269,8 +269,9 @@ use crate::proof::base_final_session::{
 use crate::proof::base_last_session::LastBaseRandomness;
 use crate::proof::fold_handoff::{FoldHandoff, FoldHandoffAnchor};
 use crate::proof::multi_stage_iopp::{
-    prove_multi_stage_iopp, verify_multi_stage_iopp, IoppBasePrivate, IoppChain,
-    IoppProof, IoppStageFoldPrivate, IoppStageZero, IoppSwitchPrivate, IoppVerifyStageZero,
+    prove_multi_stage_iopp, verify_multi_stage_iopp_with_last_positions, IoppBasePrivate,
+    IoppChain, IoppProof, IoppStageFoldPrivate, IoppStageZero, IoppSwitchPrivate,
+    IoppVerifyStageZero,
 };
 use crate::proof::proximity_iopp::{
     proximity_iopp_plan, ProximityGroupRole, ProximityIoppPlan,
@@ -5048,7 +5049,7 @@ struct ProximityVerification {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProximityBaseOutcome {
     Single(BaseFinalOutcome),
-    Stages,
+    Stages { last_positions: Vec<u64> },
 }
 
 impl ProximityBaseOutcome {
@@ -5056,13 +5057,21 @@ impl ProximityBaseOutcome {
     pub fn single(&self) -> Option<&BaseFinalOutcome> {
         match self {
             Self::Single(base) => Some(base),
-            Self::Stages => None,
+            Self::Stages { .. } => None,
         }
     }
 
     /// True when the group ended in the verified multi-stage loop.
     pub fn is_stages(&self) -> bool {
-        matches!(self, Self::Stages)
+        matches!(self, Self::Stages { .. })
+    }
+
+    /// The last-stage BASE positions, when the group ended in the loop.
+    pub fn last_positions(&self) -> Option<&[u64]> {
+        match self {
+            Self::Single(_) => None,
+            Self::Stages { last_positions } => Some(last_positions),
+        }
     }
 }
 
@@ -6025,7 +6034,7 @@ fn proximity_verify(
             ProximityTail::Stages(proof) => proof,
             ProximityTail::Single { .. } => return Err(Error::StatementMismatch),
         };
-        let seal = verify_multi_stage_iopp(
+        let (seal, last_positions) = verify_multi_stage_iopp_with_last_positions(
             chain,
             &iopp.chain,
             IoppVerifyStageZero {
@@ -6037,7 +6046,7 @@ fn proximity_verify(
         )?;
         return Ok(ProximityVerification {
             seal,
-            base: ProximityBaseOutcome::Stages,
+            base: ProximityBaseOutcome::Stages { last_positions },
         });
     }
     let ProximityTail::Single {
