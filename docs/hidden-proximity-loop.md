@@ -32,6 +32,21 @@ next stage is `k=13, h=13` and the last stage is `k=h=0`. The earlier
 `4,162`/`k=13` figure divided by `ell` without the `ell - answers` capacity
 and is withdrawn.
 
+`[FACT]` The own group now uses the approved two-stage candidate: stage 0
+keeps the frozen `(17,65,536,8,192)/(17,512,256)` codes with `k=14,h=2`, the
+trusted planner chooses `positions=254` and 24 work bits from the mask tail
+minus the SEND openings, and the last stage is
+`(17,65,536,259)/(17,16,384,259)` with `k=h=0` and `positions=259`. The
+planner lives in `crates/zkie-ops/src/proof/proximity_planner.rs`; the
+verifier re-derives the values and `HiddenProximityPlan::fault` rejects a
+mismatch before the first query. The same-machine comparison with the
+same-parameter three-stage chain measured hidden prove 372,116 ms vs 768,920
+ms, verify 64,736 ms vs 75,151 ms, proof 66,135,784 bytes vs 214,228,928
+bytes, peak RSS 169,961,812 KiB vs 212,843,964 KiB, and whole test 674.20 s
+vs 1,083.66 s. The planner uses floating-point logarithms with a 0.2-bit
+planning margin; the reference interval arithmetic is not ported yet and is a
+`[GAP]`.
+
 `[FACT]` The stage FOLD and switch tree numbers, the fold group, member and
 fresh identifiers, the stage seeds and the BASE star plan are derived from
 the trusted stage list. Identifiers are allocated in stage order from the
@@ -116,9 +131,12 @@ the star plan is bound in the trusted plan.
 ## Open items
 
 `[GAP]` The joint opening ledger accounts the single-stage basis in the
-session harness. The loop moves those openings into the switch and LastBase
-artifacts, so the loop's measured opening budget is recorded by the acceptance
-run, not by the harness constants.
+session harness. The staged harness now budgets the stage-0 member openings
+at the stage-0 positions, but it does not yet reserve the loop switch trees,
+stage-FOLD mask trees and plan-derived BASE star trees, and it does not record
+their actual openings (the LastBase positions are drawn during verification).
+The loop opening ledger therefore remains open; see the evidence note.
+
 
 `[FACT]` The acceptance run measured on the GPT-2 seq16 formal fixture, same
 machine, after the loop wiring and the `k=14` stage-0 correction. Three runs:
