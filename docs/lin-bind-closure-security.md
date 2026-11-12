@@ -27,7 +27,7 @@ verification.
 
 Snapshot: the closed relation at code basis `3b3e8ecc`, with the bounded-read
 rollback `8d32d3de`; fixture `gpt2-seq16`, 16 positions, proof 9,939,144 B.
-The committed document is version 7.
+The committed document is version 8.
 
 ## 1. The chain in one view
 
@@ -139,10 +139,19 @@ the real path returns `EntropyUnavailable`. The helper-level tests and the
 real-path tests both cover the rejection branch.
 
 `[FACT]` `NUM` The env-gated counter (`ZKIE_SAMPLE_COUNTS`) records the
-accepted and rejected candidate counts in the run log. The run counter recorded `sample_accepts = 276,343,251` and
-`sample_rejects = 0` for the first run; the identical proof hash is reported
-together with the measured rejection count, not as an inference from the
-hash. The counter overhead is inside the recorded timing.
+accepted and rejected candidate counts in the run log. The counter is
+process-level: after it is enabled, every `uniform_fp` call increments,
+including `redraw` and repeated evaluations of the same draw. The accept and
+reject totals are two separate `Relaxed` atomics, not a single atomic
+snapshot of one draw, and the totals are not the number of independent random
+coordinates or all randomness in the system. The three timed runs include the
+atomic overhead; they are not exactly comparable to the earlier no-counter
+baseline and are read within the recorded spread. The runs recorded
+`sample_accepts = 276,343,251` and `sample_rejects = 0` in each run; the
+identical proof hash is reported together with the measured rejection count,
+not as an inference from the hash. The helper that follows the first accepted
+retry uses attempts `1..SAMPLE_TRIES` (1..=63), matching the production
+attempts 0..=63; attempt 64 cannot execute.
 
 `[ASSUMPTION]` Unbiasedness is a property of the honest prover implementation:
 the verifier does not rederive the hidden mask stream and cannot enforce the
@@ -588,39 +597,41 @@ following simulator, events and mapping:
    leaf, node, root, challenge and opening queries. All bounds below use this
    cumulative `q`.
 2. **Simulator inputs.** The simulator receives the public statement and plan,
-   the opened leaves' messages and salts (the prover's witness), the ability
-   to choose the unopened leaves' salts and messages uniformly, and the query
-   log of the random oracle.
-3. **Steps.** It chooses the salts and messages; computes the opened leaves
-   with the real leaf hash; for each unopened leaf chooses a uniform digest
-   and, when the adversary queries that leaf input, programs the random oracle
-   at that input; computes the inner nodes and the root from the children;
-   answers adaptive openings: an opened leaf is answered by the real hash, an
-   unopened leaf by its programmed digest. The path recomputes to the root
-   because the digests are the same as those used in the root computation.
-   Challenges derived from the transcript are answered by the same random
-   oracle.
-4. **View.** The verifier sees the root, the opened leaves and the answers and
-   transcripts. The unopened leaves' symbols and salts are not in the view. In
-   the ideal RO model every leaf digest is uniform and independent of its
-   input, so the root is consistent with the opened leaves and independent of
-   the unopened symbols.
-5. **Bad events.** The simulation can fail only through:
+   the random-oracle interface, and the algebraic hiding-map randomness it
+   needs to choose the opened leaf values. It does **not** receive the opening
+   set, and it does not precompute the leaves from the prover's witness: the
+   opening positions are produced only after the roots and the Fiat-Shamir
+   challenges.
+3. **Commitment phase.** For every leaf it chooses a salt and a uniform
+   digest `com_i` independently (lazily sampled); it keeps the pair
+   `(salt_i, com_i)` and builds the inner nodes and the root from the
+   digests. In the ideal RO model `com_i = H(salt_i || leaf_i)` is uniform and
+   independent of the leaf, and the root is a hash of uniform digests.
+4. **Query phase.** The simulator maintains a random-function table. A query
+   to a new input is answered with a fresh uniform value and recorded; a
+   repeated query to the same input returns the recorded value. This is
+   consistent with the real random oracle.
+5. **Adaptive opening phase.** After the root and challenges, the adversary
+   chooses openings. For an opened leaf the simulator chooses its salt and,
+   from the algebraic hiding simulation, its leaf value; it programs
+   `H(salt || leaf) = com_i` and reveals `(salt, leaf)`. The path recomputes
+   to the root because `com_i` is the digest used in the root. If the
+   adversary had already queried the exact input `salt || leaf`, the simulator
+   had returned a random value; matching it requires guessing the input (bad
+   event). The opened leaf values are covered by the algebraic hiding
+   argument, not by a per-leaf fresh pad.
+6. **Bad events.** The simulation can fail only through:
    - a collision or a programming inconsistency between two distinct inputs
      in the random oracle, probability at most `(q + 1)^2 / 2^256`;
-   - the adversary guessing an unopened leaf's exact input (salt and
-     message), probability at most `q / 2^320` for the cumulative query count
-     `q`; the salt is 40 bytes, and the tail/pad entropy gives the message
-     min-entropy the commitment needs.
+   - the adversary guessing an unopened or not-yet-open leaf's exact input
+     (salt and leaf), probability at most `q / 2^320` for the cumulative
+     query count `q`; the salt is 40 bytes, and the tail/pad entropy gives the
+     message min-entropy the commitment needs.
    If neither event occurs, the simulated view is identical to the real view,
-   including the adaptive openings and challenge queries.
-6. **Adaptive openings.** The adversary chooses openings after seeing the root
-   and answers. The simulator's programmed digests are consistent for every
-   queried leaf; an opening of an unopened leaf either uses a programmed
-   digest (consistent) or requires guessing its exact input (the `q/2^320`
-   event). The challenge derived from the root/transcript is a random-oracle
-   output and is independent of the unopened symbols. No separate
-   "conditioning on the root" step is used.
+   including the adaptive openings and challenge queries. The challenges
+   derived from the root/transcript are random-oracle outputs independent of
+   the unopened leaf values; no separate "conditioning on the root" step is
+   used.
 
 The mapping to the construction is literal: the leaf hash input is
 `(tag, leaf_index, run, width, salt_length, symbols, salt)`, the node hash
@@ -629,9 +640,6 @@ bytes, and the index/run/plan bind the leaf position. The argument uses RO for
 hiding and CR for binding; it does not follow from CR alone. The concrete
 hash's RO/CR advantage is not quantified, so the statement remains
 model-conditional. `[ASSUMPTION]` The RO/CR model is not quantified against a
-concrete hash. The hybrid failure probability is therefore a model-level
-condition, not a numerical term; the composition expression in section 6
-lists the algebraic terms and states the hash-model term separately.`[ASSUMPTION]` The RO/CR model is not quantified against a
 concrete hash. The hybrid failure probability is therefore a model-level
 condition, not a numerical term; the composition expression in section 6
 lists the algebraic terms and states the hash-model term separately.
@@ -722,6 +730,60 @@ stream; the two-seed test is illustrative, not the uniformity proof.
 argument above is the per-round conditional/block derivation, and the
 production-size tests are local evidence for their blocks.
 
+### 5.9 BASE target source and the joint mask/star view
+
+`[FACT]` `CODE` The BASE target is not a function of the hidden row. The
+actual target sources are:
+
+- `record_row` and `column_row`: the target is the public table record or the
+  public column value combined with the public `eq_gamma` weights;
+- `sample_row` and `oracle_sample_row`: the target is the received SEND
+  answer, which is the public sampled value plus its one-time pad;
+- `fold_plain_row`: the target is the public `G_u`/`Omega` relation target
+  combined with the public `psi` and `zeta` challenges;
+- the BAT row target is the `row.target` above; the group/fold claim
+  coefficients are the public relation coefficients and the public batching
+  challenge.
+
+The hidden reduced row `W`/`Y` enters the BAT row `main` coefficients (the
+sampled message values), not the targets. The target values are therefore
+determined by the public table/reader data, the public SEND answers and the
+public statement. This is not an expansion of the approved output boundary:
+the target is a protocol message value derived from public data and masked
+answers, not a new Y-dependent output. If a target were Y-dependent, it would
+be a leak; none of the traced row families is. The handoff target is supplied
+by the caller's verified FOLD output; the caller/anchor trust is a deployment
+assumption, not part of this derivation.
+
+`[FACT]` `CODE` The BASE equations are
+`target* = <claim, star.main> + <mask_claim, star.mask>`,
+`main' = star.main + lambda * main`, `mask' = star.mask + lambda * mask`.
+The claims and the target are public; the star is fresh; the hidden row
+enters `main`/`mask`. The verifier's linear check cancels the star
+(section 5.6/5.8) and leaves the public claim relation. The target* is a
+masked public value; it has no secret direction to protect.
+
+`[FACT]` `CODE` Joint mask-entry view. Condition on the public view before
+the mask message. The 49 hiding and five shown entries are fresh uniform
+draws. The encoded opening, the PSC transcript and the end/point values are
+affine in the same entries and the tail; the block matrix of section 5.5 has
+the hiding map as an invertible block, the shown identity on the end/point
+rows, and the tail Vandermonde on the opening rows. Conditional on the view so
+far, the joint distribution of these three public positions contains no
+secret direction; the same entry appearing three times is a shared column in
+one matrix, not three independent one-time pads.
+
+`[FACT]` `CODE` Joint star view. Condition on the public view before the
+star. The star main/mask rows and tails are fresh uniform draws. The target*,
+the combined rows and the star openings are affine in the same star; the
+target is public, the combined rows are `star + lambda * row`, and the
+openings are the encoded star. The BASE elimination (section 5.6) cancels the
+star and leaves the public claim relation; the combined rows and target alone
+leave the star underdetermined, and the openings are masked by the star tail
+(`q <= r`) and the old row tail. The three appearances are one shared random
+vector, not three independent pads. The two-seed test is illustrative; the
+uniformity is the `draw_star` generation relation.
+
 ## 6. Exception probabilities
 
 `[FACT]` `CODE` The base field is `p = 2^64 - 2^32 + 1`; the cubic extension
@@ -740,10 +802,12 @@ The entries are:
 |---|---|---:|
 | direct shared FOLD check | k <= 11, 11 rounds, degree 2 | `22/p^3 < 2^-187` |
 | direct own FOLD check | k = 14, 14 rounds, degree 2 | `28/p^3 < 2^-186` |
-| BASE lambda and symbol checks | lambda linear, two base positions | `3/p^3 < 2^-190` |
+| BASE lambda check | one Fp3 challenge, linear polynomial (`d = 1`) | `1/p^3 < 2^-192` |
+| BASE symbol checks | two position checks, linear each | `2/p^3 < 2^-191` |
+| base position sampling | `s = 2` codeword-index positions; distance parameter `delta` | miss `1 - (1 - delta)^s`; local `delta` convention not derived, in `eps_proximity` |
 | range booleanity | 16 positions, degree at most 166 each | `16*166/p^3 < 2^-180` |
 | PSC sumcheck (Dot once, closure 16 positions) | 10 and 23 variables, degree 3 each | `(30 + 16*69)/p^3 < 2^-181` |
-| single equality | degree 2 | `2/p^3 < 2^-190` |
+| single equality | degree 2 | `2/p^3 < 2^-191` |
 | `chi = 0` | one event | `1/p^3 < 2^-191` |
 | challenge-draw zero fallback | at most 6 rejected words per draw, `(1-p/2^64)^6` | below `2^-192` per draw |
 | mask-coordinate retry exhaustion | at most 64 attempts, `(1-p/2^64)^64` | below `N * 2^-2048` over `N` coordinates |
@@ -752,10 +816,23 @@ The entries are:
 `[ARGUMENT]` `CODE` The component union bound used here is
 
 ```text
-eps_total <= eps_hash + eps_components
+eps_total <= eps_hash + eps_components + eps_proximity
 eps_hash = (t + q_V + 1) * 2^-128 + (17/2) * (t + q_V)^2 / 2^256
-eps_components = 2^-180 + 2^-181 + 2^-186 + 2^-187 + 2^-190 + 2^-191
+eps_components = 2^-180 + 2^-181 + 2^-186 + 2^-187 + 2^-189
+                (BASE symbol 2/p^3 + single equality 2/p^3 + chi 1/p^3
+                 merge to 5/p^3 < 2^-189.4; the shared and own FOLD terms
+                 merge to 50/p^3 < 2^-186.4; the loose bounds above are used)
+eps_proximity = UNKNOWN
+eps_total also carries the retry exhaustion N * 2^-2048 and the Q_R / Q_A factors
 ```
+
+`eps_proximity` is an explicit unknown, not zero: the local base-position and
+proximity distance/query soundness is not derived here. The document does not
+claim a total security bit count. The `BASE 3/p^3` figure of the previous
+version is split: the lambda challenge is one Fp3 challenge with a linear
+check (`d = 1`), and the two position checks are the symbol checks; the
+previous single `2^-190` merged term is replaced by the explicit
+`5/p^3 < 2^-189.4` merge above, which does not fit under `2^-190`.
 
 The `t`/`q_V` factor is carried by the hash term; the algebraic component
 count is fixed per proof. If the prover uses `Q_A` adaptive retry attempts,
@@ -774,12 +851,24 @@ bits; shared/base positions 2 each. The direct FOLD checks have k <= 11
 positions are symbol checks. The prior "8 rounds each <= 2^-128" term is a
 multi-stage ledger figure that is not mapped to this direct FOLD-to-BASE
 compiled plan; it is withdrawn from this chain's bound and replaced by the
-per-round degree terms above. The local table's distance/query/work model is
-the proximity layer's parameter set; a numerical proximity soundness bound
-for these parameters is not derived here and is not claimed as the 8-round
-ledger term. `[UNPROVEN]` The local proximity distance/query soundness
-derivation; the plan parameters are stated but not turned into a numeric
-error term in this document.
+per-round degree terms above.
+
+`[FACT]` `CODE` The BASE lambda is one challenge in the cubic field and the
+check is linear in it (`d = 1`), so the Schwartz-Zippel term is `1/p^3`; the
+general form is `d/p^3` if a check of degree `d` is used. The two base
+positions are codeword-index samples: the plan's `plan_loc` convention draws
+`t` positions and charges the agreement bound raised to `t` (`agree^t`); in
+the distance form the miss probability is `1 - (1 - delta)^s` for `s`
+positions at relative distance `delta`. The local plan exposes `s = 2` but
+does not turn its distance parameter into a numeric agreement/distance term in
+this document, so the base-position and proximity soundness is the explicit
+`eps_proximity = UNKNOWN` above, not zero and not the withdrawn ledger term.
+The retry exhaustion (`N * 2^-2048`) and the multi-request `Q_R`/adaptive
+`Q_A` factors are carried separately; they are not dropped.
+
+`[UNPROVEN]` The local proximity/base-position distance/query soundness
+derivation; the plan parameters and the reference plan-loc convention are
+stated, but the local numeric error term is not derived here.
 
 `[UNPROVEN]` The `126.21` and `116.01` bit figures remain plan-ledger numbers,
 not a new closed-chain theorem. The degrees and counts above are arithmetic
@@ -895,18 +984,39 @@ hidden prover has no message-injection point after the tree commit; the
 component test (the group table changes) plus this bound are what the current
 API supports.
 
-**Kernel scope.** If the changed message's difference is in the kernel of the
-group-row map, the FOLD/BASE checks do not see it. The conditional conclusion
-is: any difference that changes the verified public claim relation is nonzero
-in the group map and is covered by the polynomial bound; a kernel difference
-leaves the verified public relation unchanged by construction, so it is a
-different private witness for the same statement, not a false-statement
-acceptance. If the changed message must also match the original commitment
-root, the root/opening layer binds the original message. The document does not
-claim that the FOLD/BASE layer detects a kernel difference, and does not
-establish a separate proof that every wrong public claim yields a nonzero
-difference outside this scope. `[UNPROVEN]` The exact final-verifier negative
-and the kernel subcase outside this scope.
+**Kernel scope and binding derivation.** If the changed message's difference
+is in the kernel of the group-row map, the FOLD/BASE checks do not see it.
+The conditional conclusion is proved as follows under the stated binding
+assumptions:
+
+1. The verifier's public claim and target are functions of the committed
+   roots and the public statement, not of the hidden row directly (section
+   5.9). A false statement requires a different public claim or target.
+2. If the changed message changes that public claim or target, its difference
+   is nonzero in the group-row map (otherwise the public value is unchanged);
+   the FOLD/BASE checks see a nonzero difference polynomial, and the
+   challenges are drawn after the difference is fixed, so the polynomial
+   bound applies.
+3. If the difference is in the kernel, the public claim and target are
+   unchanged. The verifier accepts the same public statement as for the
+   original committed message. A kernel difference is a different private
+   witness for the same committed claim, not a false-statement acceptance,
+   provided the original statement/root is the true committed one.
+4. The root/leaf index/run bind the committed message under the CR hash
+   assumption: a different message with the same root is a collision or a
+   hash-model event (`(q+1)^2/2^256` in the RO analysis). If the changed
+   message also changes the root or the statement, the binding checks reject
+   it at the root/statement layer.
+
+The residual assumptions are: the original statement/root is the true
+committed one, the claim/target really are bound to the committed
+statement/roots (the wiring is not independently trusted; a deployment
+assumption), and the concrete hash's CR advantage is not quantified. The
+document does not claim that the FOLD/BASE layer detects a kernel difference;
+it claims that a kernel difference does not create a false-statement
+acceptance under these binding assumptions. `[UNPROVEN]` The exact
+final-verifier negative for the combined tamper and the concrete-hash binding
+bound.
 
 ## 9. Engineering boundaries and wording
 
@@ -917,27 +1027,37 @@ tampered message. The workspace result and the three seq16 runs are the
 delivery evidence reported by the implementation side; they are not an
 independent external verification.
 
-`[FACT]` The production proof code changed only in the mask sampling source
-(section 2.1); the protocol relations, commitments, challenge order,
-parameters and encoding format are unchanged. The proof content and hash
-change because the prover's random values change.
+`[FACT]` The production proof code is unchanged in this round; the v7/v8
+changes are test-only and document. The earlier mask sampling source change
+(section 2.1) changed only the prover's random values; the protocol
+relations, commitments, challenge order, parameters and encoding format are
+unchanged. The proof content and hash are the measured fixture result from
+that source.
 
-`[FACT]` `NUM` Compatibility evidence. The new proof length is 9,939,144 bytes and its sha256 is
-`f8f512c0...3215f5` in the three seq16 runs; the measured counter is
-`sample_rejects = 0` with `sample_accepts = 276,343,251` in the first run. The rejection sampling only changes a draw when a candidate word is at
-or above the modulus; this deterministic fixture produced no such word, so
-the proof content is byte-identical to the previous round. The sampling
-distribution is still the unbiased one; the boundary and retry tests exercise
-the rejection path, and the fixture outcome is reported as measured, not
-assumed. The
-encoding version and the hidden schema version are unchanged because the
-message structure is unchanged. A proof produced before the sampling change
+`[FACT]` `NUM` Compatibility evidence. The new proof length is 9,939,144
+bytes and its sha256 is `f8f512c0...3215f5` in the three seq16 runs; the
+process-level counter recorded `sample_accepts = 276,343,251` and
+`sample_rejects = 0` in each run. The rejection sampling only changes a draw
+when a candidate word is at or above the modulus; this deterministic fixture
+produced no such word, so the proof content is byte-identical to the previous
+round. The sampling distribution is still the unbiased one; the boundary and
+retry tests exercise the rejection path. The counter includes `redraw` and
+repeated evaluations, and the timed runs include the atomic overhead; they
+are not exactly comparable to the earlier no-counter baseline. The encoding
+version and the hidden schema version are unchanged because the message
+structure is unchanged. A proof produced before the sampling change
 (`9,939,144` bytes, the previous round's dump) was decoded and verified by the
 new verifier through the bytes entry: `loaded_proof_ok=1`, with the same
 `9,939,144` byte length. The verifier never re-derives the prover's mask
 values, so the changed sampling does not invalidate old proofs under the same
-plan and public statement. This is stronger than the expected "old artifact
-does not verify"; it is recorded as measured, not assumed.
+plan and public statement.
+
+`[FACT]` The old proof verifying does **not** prove that the old prover
+sampled unbiasedly. The verification equations are the same; the mask
+distribution is a prover-side implementation property. The version being
+unchanged is an encoding-compatibility statement, not a proof of the security
+source. The unbiasedness conclusion is the honest-prover assumption of
+section 2.1, not the compatibility test.
 
 `[FACT]` `NUM` Sampling tests: boundary `p-1` accepted; `p` and `2^64-1`
 rejected and retried; retry exhaustion returns an error after the fixed
@@ -989,7 +1109,9 @@ public; the full reduced output row is hidden by the conditional argument in
   commit. The component test and the degree bound are delivered instead.
 - `[UNPROVEN]` A local numeric proximity soundness bound for the direct
   FOLD-to-BASE plan (radius 16,384, 603 draws, 12 work bits); the prior
-  eight-round ledger term is withdrawn rather than imported.
+  eight-round ledger term is withdrawn rather than imported. `eps_proximity`
+  is carried as `UNKNOWN` in section 6; no total security bit count is
+  claimed.
 - `[UNPROVEN]` A mechanized composition theorem and an end-to-end 128-bit
   claim; `126.21`/`116.01` remain plan-ledger numbers.
 - `[LONG-TERM]` The trusted X source, policy distribution/freshness and
