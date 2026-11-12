@@ -2335,7 +2335,7 @@ mod tests {
     #[test]
     fn a_proof_from_another_chain_is_rejected() {
         let (plan, proof, _seal, zero) = run_proof();
-        let mut other = Chain::begin(
+        let other = Chain::begin(
             CHAIN_LABEL + 1,
             &CHAIN_PARAMETERS,
             b"multi-stage iopp fixture",
