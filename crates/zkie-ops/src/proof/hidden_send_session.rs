@@ -233,6 +233,7 @@ use zkie_engine::pcs::request::params::{
     FINAL_CHAIN_LABEL, LEAF_SALT_MAX_BYTES, LEAF_SALT_MIN_BYTES, SHARED_CHAIN_LABEL,
 };
 use zkie_engine::pcs::request::pow::{search_nonce, verify_nonce};
+use zkie_engine::pcs::request::proximity::SingleRows;
 use zkie_engine::pcs::request::read::unique_sorted;
 use zkie_engine::pcs::request::relation::{
     column_row, foldeq_weights, gu_sample_pad_offsets, gu_table, oracle_sample_row, record_row,
@@ -265,9 +266,14 @@ use crate::proof::base_final_session::{
     fold_identity, BaseFinalCheck, BaseFinalOutcome, BaseFinalRows, BaseFinalSession, BaseMessages,
     BaseCommitment, BaseOpening, BaseOpenings, BaseProver, FoldBasis, FoldMember,
 };
+use crate::proof::base_last_session::LastBaseRandomness;
 use crate::proof::fold_handoff::{FoldHandoff, FoldHandoffAnchor};
+use crate::proof::multi_stage_iopp::{
+    prove_multi_stage_iopp, verify_multi_stage_iopp, IoppBasePrivate, IoppChain,
+    IoppProof, IoppStageFoldPrivate, IoppStageZero, IoppSwitchPrivate, IoppVerifyStageZero,
+};
 use crate::proof::proximity_iopp::{
-    proximity_iopp_plan, ProximityGroupRole,
+    proximity_iopp_plan, ProximityGroupRole, ProximityIoppPlan,
 };
 
 /// Version of the canonical messages of this interface. Version 4 carries the
@@ -294,6 +300,9 @@ const ACTIVATION_DECODE_BOUND: usize = 1 << 20;
 const SEED_COORDINATE_BOUND: usize = 1 << 12;
 /// Upper bound on the number of group entries.
 const GROUP_ENTRY_BOUND: usize = 1 << 12;
+/// Upper bound on a decoded proximity loop proof. The bound is on the encoded
+/// artifact; the proof's internal counts are bounded again by its own decoder.
+const PROXIMITY_LOOP_DECODE_BOUND: usize = 1 << 28;
 
 // ---------------------------------------------------------------------------
 // The activation matrix and its hiding row commitment
@@ -4769,9 +4778,9 @@ pub struct HiddenSharedMessages {
     pub zeta: Vec<Fp3>,
     pub fold_start: FoldStartMessage,
     pub fold_rounds: Vec<(Fp3, Fp3)>,
-    pub base: BaseMessages,
-    pub base_rows: BaseFinalRows,
-    pub base_openings: BaseOpenings,
+    /// The group's end: the single-stage BASE artifact, or the multi-stage
+    /// loop proof whose final segment is the LastBase artifact.
+    pub tail: ProximityTail,
     pub seal: Digest,
 }
 
@@ -4800,9 +4809,9 @@ pub struct HiddenSecondMessages {
     pub closure: Option<ClosureSecondMessages>,
     pub fold_start: FoldStartMessage,
     pub fold_rounds: Vec<(Fp3, Fp3)>,
-    pub base: BaseMessages,
-    pub base_rows: BaseFinalRows,
-    pub base_openings: BaseOpenings,
+    /// The group's end: the single-stage BASE artifact, or the multi-stage
+    /// loop proof whose final segment is the LastBase artifact.
+    pub tail: ProximityTail,
     pub seal: Digest,
 }
 
@@ -4832,8 +4841,8 @@ pub struct HiddenLinOutcome {
     pub shared_seal: Digest,
     pub seal: Digest,
     pub column_positions: Vec<u64>,
-    pub shared_base: BaseFinalOutcome,
-    pub own_base: BaseFinalOutcome,
+    pub shared_base: ProximityBaseOutcome,
+    pub own_base: ProximityBaseOutcome,
     /// The checked Dot transcript binding when the hidden Dot mode is active:
     /// the batching challenge, the public residual and the product-sumcheck
     /// output claims. `None` in the diagnostic mode.
@@ -4902,15 +4911,54 @@ impl ProximityMemberProver {
 struct ProximityMessages {
     fold_start: FoldStartMessage,
     fold_rounds: Vec<(Fp3, Fp3)>,
-    base: BaseMessages,
-    base_rows: BaseFinalRows,
-    base_openings: BaseOpenings,
+    tail: ProximityTail,
+}
+
+/// The end of one proximity group: the single-stage BASE artifact, or the
+/// multi-stage loop proof. Which one is legal is decided by the trusted plan;
+/// the decoder rejects a tail that disagrees with the plan's stage list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProximityTail {
+    /// The group ended in the single-stage BASE test, which uses an empty
+    /// stage list.
+    Single {
+        base: BaseMessages,
+        base_rows: BaseFinalRows,
+        base_openings: BaseOpenings,
+    },
+    /// The group ended in the multi-stage loop; the loop proof's last segment
+    /// is its canonical LastBase artifact.
+    Stages(IoppProof),
 }
 
 /// The verifier-side result of one proximity test.
 struct ProximityVerification {
     seal: Digest,
-    base: BaseFinalOutcome,
+    base: ProximityBaseOutcome,
+}
+
+/// The verified end of one proximity group. `Single` carries the single-stage
+/// BASE verdict; `Stages` records that the loop replayed every switch, every
+/// stage FOLD and the final LastBase artifact and returned its seal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProximityBaseOutcome {
+    Single(BaseFinalOutcome),
+    Stages,
+}
+
+impl ProximityBaseOutcome {
+    /// The single-stage BASE verdict, when the group ended in BASE.
+    pub fn single(&self) -> Option<&BaseFinalOutcome> {
+        match self {
+            Self::Single(base) => Some(base),
+            Self::Stages => None,
+        }
+    }
+
+    /// True when the group ended in the verified multi-stage loop.
+    pub fn is_stages(&self) -> bool {
+        matches!(self, Self::Stages)
+    }
 }
 
 /// The prover-side result of one proximity test.
@@ -5410,6 +5458,7 @@ fn proximity_prove(
     mask_tree: MaskTreePlan,
     seed: Digest,
     base_positions: usize,
+    iopp: Option<&ProximityIoppPlan>,
 ) -> Result<ProximityProof> {
     let _profile_proximity = zkie_engine::profile::Scope::new("prox.proximity_prove");
     if members.is_empty() || sample_rows.len() != members.len() {
@@ -5545,6 +5594,71 @@ fn proximity_prove(
     let handoff = FoldHandoff::from_output(&output, &anchor)?;
     let (main_tail, mask_tail, fresh_tail) =
         folded_tails(&handoff, &members, &fresh_tails)?;
+    let basis = FoldBasis {
+        layout: handoff.layout.clone(),
+        fresh_root: handoff.fresh_root,
+        fresh_tree: mask_tree,
+        members: members
+            .iter()
+            .map(|member| FoldMember {
+                oracle: member.bat_oracle,
+                main_code: fold.code,
+                mask_code: fold.mask_code,
+                root: member.root,
+                tree: member.tree_plan.clone(),
+            })
+            .collect(),
+    };
+    if let Some(iopp) = iopp {
+        let stage_zero_tree = MaskTree::commit(
+            mask_tree,
+            &fold,
+            &fresh_rows,
+            &fresh_tails,
+            &salts,
+        )?;
+        let member_trees = members
+            .iter()
+            .map(|member| trees.tree_for(member))
+            .collect::<Result<Vec<_>>>()?;
+        let stage_zero_rows = SingleRows {
+            code: handoff.code,
+            mask_code: handoff.mask_code,
+            main: prover.main_messages().to_vec(),
+            main_tail,
+            masks: vec![end.mu.clone(), end.fresh.clone()],
+            mask_tails: vec![mask_tail, fresh_tail],
+            claim: handoff.main_claim.clone(),
+            mask_claims: vec![handoff.mask_claim.clone(), handoff.fresh_claim.clone()],
+            target: handoff.target,
+        };
+        drop(prover);
+        let private = loop_private_material(&seed, &iopp.chain)?;
+        drop(_profile_fold_output);
+        let (proof, seal) = prove_multi_stage_iopp(
+            chain,
+            &iopp.chain,
+            IoppStageZero {
+                handoff,
+                basis,
+                rows: stage_zero_rows,
+                member_trees,
+                old_mask_tree: None,
+                fresh_tree: stage_zero_tree,
+            },
+            &private.switches,
+            &private.stage_folds,
+            &private.base,
+        )?;
+        return Ok(ProximityProof {
+            messages: ProximityMessages {
+                fold_start: start_message,
+                fold_rounds: rounds,
+                tail: ProximityTail::Stages(proof),
+            },
+            seal,
+        });
+    }
     let rows = handoff.single_rows(
         prover.main_messages().to_vec(),
         main_tail,
@@ -5581,21 +5695,6 @@ fn proximity_prove(
         star_mask_tail,
         Fp3::ZERO,
     )?;
-    let basis = FoldBasis {
-        layout: handoff.layout.clone(),
-        fresh_root: handoff.fresh_root,
-        fresh_tree: mask_tree,
-        members: members
-            .iter()
-            .map(|member| FoldMember {
-                oracle: member.bat_oracle,
-                main_code: fold.code,
-                mask_code: fold.mask_code,
-                root: member.root,
-                tree: member.tree_plan.clone(),
-            })
-            .collect(),
-    };
     let mut verifier = BaseFinalSession::new(chain, handoff, basis)?;
     let base_messages = base_prover.messages()?;
     verifier.receive_commitments(base_messages)?;
@@ -5651,9 +5750,11 @@ fn proximity_prove(
         messages: ProximityMessages {
             fold_start: start_message,
             fold_rounds: rounds,
-            base: base_messages,
-            base_rows,
-            base_openings: openings,
+            tail: ProximityTail::Single {
+                base: base_messages,
+                base_rows,
+                base_openings: openings,
+            },
         },
         seal,
     })
@@ -5674,6 +5775,7 @@ fn proximity_verify(
     fresh_id: u64,
     mask_tree: MaskTreePlan,
     base_positions: usize,
+    iopp: Option<&ProximityIoppPlan>,
 ) -> Result<ProximityVerification> {
     let _profile = zkie_engine::profile::Scope::new("verify.proximity");
     if members.is_empty() || sample_rows.len() != members.len() {
@@ -5808,20 +5910,56 @@ fn proximity_verify(
             })
             .collect(),
     };
+    if let Some(iopp) = iopp {
+        if iopp.stage_zero_fresh != fresh_id
+            || iopp.chain.config.base_positions != base_positions
+        {
+            return Err(Error::InvalidConfig);
+        }
+        let proof = match &messages.tail {
+            ProximityTail::Stages(proof) => proof,
+            ProximityTail::Single { .. } => return Err(Error::StatementMismatch),
+        };
+        let seal = verify_multi_stage_iopp(
+            chain,
+            &iopp.chain,
+            IoppVerifyStageZero {
+                handoff,
+                basis,
+                first_old_mask: None,
+            },
+            proof,
+        )?;
+        return Ok(ProximityVerification {
+            seal,
+            base: ProximityBaseOutcome::Stages,
+        });
+    }
+    let ProximityTail::Single {
+        base: base_messages,
+        base_rows,
+        base_openings,
+    } = &messages.tail
+    else {
+        return Err(Error::StatementMismatch);
+    };
     let mut verifier = BaseFinalSession::new(chain, handoff, basis)?;
-    verifier.receive_commitments(messages.base)?;
+    verifier.receive_commitments(*base_messages)?;
     let lambda = verifier.draw_lambda()?;
-    if messages.base_rows.base.lambda != lambda {
+    if base_rows.base.lambda != lambda {
         return Err(Error::InvalidProof);
     }
-    verifier.receive_base_rows(messages.base_rows.clone())?;
+    verifier.receive_base_rows(base_rows.clone())?;
     verifier.draw_base_positions(base_positions)?;
-    verifier.verify_openings(&messages.base_openings)?;
-    let (seal, _base) = match verifier.finish()? {
+    verifier.verify_openings(base_openings)?;
+    let (seal, base) = match verifier.finish()? {
         BaseFinalCheck::Passed(base) => (base.check_value, base),
         BaseFinalCheck::Rejected(_) => return Err(Error::InvalidProof),
     };
-    Ok(ProximityVerification { seal, base: _base })
+    Ok(ProximityVerification {
+        seal,
+        base: ProximityBaseOutcome::Single(base),
+    })
 }
 
 fn absorb_fold_start(chain: &mut Chain, message: &FoldStartMessage) -> Result<()> {
@@ -5884,6 +6022,99 @@ fn derive_run_seed(master: &Digest, stage: u64, purpose: u64) -> Result<Digest> 
         bytes.extend_from_slice(&value.to_le_bytes());
     }
     hash_labeled(tag_word(PARAMETERS, 2), stage, None, &bytes)
+}
+
+/// The loop's private one-time material for one proximity group: every
+/// switch's row tails, pad and tree salts, every stage FOLD's fresh-mask seed
+/// and salts, and the BASE salts and randomness.
+struct LoopPrivateMaterial {
+    switches: Vec<IoppSwitchPrivate>,
+    stage_folds: Vec<IoppStageFoldPrivate>,
+    base: IoppBasePrivate,
+}
+
+/// Draws the loop's private material from the group's message seed. Every
+/// switch, stage FOLD and the BASE star uses a domain-separated stream keyed
+/// by its purpose and stage ordinal, so no stream is reused; the draw order
+/// inside one stream is fixed by the trusted chain.
+fn loop_private_material(seed: &Digest, plan: &IoppChain) -> Result<LoopPrivateMaterial> {
+    let mut switches = Vec::with_capacity(plan.stages.len() - 1);
+    for (index, stage) in plan.stages.iter().enumerate().skip(1) {
+        let target = stage.target.ok_or(Error::InvalidConfig)?;
+        let tree = stage.tree.as_ref().ok_or(Error::InvalidConfig)?;
+        let mut coins = ByteMaskCoins::new(derive_run_seed(seed, 6, index as u64)?)?;
+        let mut main_tails = Vec::with_capacity(
+            usize::try_from(target.main_rows).map_err(|_| Error::ResourceLimit)?,
+        );
+        for _ in 0..target.main_rows {
+            let main_tail = draw_values(
+                &mut coins,
+                usize::try_from(target.code.r).map_err(|_| Error::ResourceLimit)?,
+            )?;
+            main_tails.push(main_tail);
+        }
+        let mut mask_tails = Vec::with_capacity(
+            usize::try_from(target.mask_rows).map_err(|_| Error::ResourceLimit)?,
+        );
+        for _ in 0..target.mask_rows {
+            let mask_tail = draw_values(
+                &mut coins,
+                usize::try_from(target.mask_code.r).map_err(|_| Error::ResourceLimit)?,
+            )?;
+            mask_tails.push(mask_tail);
+        }
+        let mut pad = Fp3::ZERO;
+        for _ in 0..64 {
+            pad = coins.draw()?.0;
+            if pad != Fp3::ZERO {
+                break;
+            }
+        }
+        if pad == Fp3::ZERO {
+            return Err(Error::EntropyUnavailable);
+        }
+        let salts = draw_salt_bytes(
+            &mut coins,
+            usize::try_from(tree.columns()).map_err(|_| Error::ResourceLimit)?,
+            tree.salt_bytes,
+        )?;
+        switches.push(IoppSwitchPrivate {
+            main_tails,
+            mask_tails,
+            pad,
+            salts,
+        });
+    }
+    let mut stage_folds = Vec::with_capacity(plan.stages.len().saturating_sub(2));
+    for (index, stage) in plan.stages.iter().enumerate().skip(1) {
+        let Some(fold) = stage.fold.as_ref() else {
+            continue;
+        };
+        let fold_seed = derive_run_seed(seed, 7, index as u64)?;
+        let mut coins = ByteMaskCoins::new(derive_run_seed(&fold_seed, 8, index as u64)?)?;
+        let salts = draw_salt_bytes(
+            &mut coins,
+            usize::try_from(fold.mask_tree.columns()).map_err(|_| Error::ResourceLimit)?,
+            fold.mask_tree.salt_bytes,
+        )?;
+        stage_folds.push(IoppStageFoldPrivate {
+            seed: fold_seed,
+            salts,
+        });
+    }
+    let star = &plan.config.base_star;
+    let mut coins = ByteMaskCoins::new(derive_run_seed(seed, 9, 0)?)?;
+    let salts = draw_salt_bytes(
+        &mut coins,
+        usize::try_from(star.columns()).map_err(|_| Error::ResourceLimit)?,
+        star.salt_bytes,
+    )?;
+    let randomness = LastBaseRandomness::Fixed(derive_run_seed(seed, 9, 1)?);
+    Ok(LoopPrivateMaterial {
+        switches,
+        stage_folds,
+        base: IoppBasePrivate { salts, randomness },
+    })
 }
 
 impl WCommitRandomness {
@@ -7613,6 +7844,12 @@ fn prove_shared(
         plan.proximity.shared_mask_tree.leaf_class,
     )?;
     let _profile_proximity = zkie_engine::profile::Scope::new("shared.proximity");
+    let iopp = proximity_iopp_plan(
+        &plan.proximity,
+        &plan.send,
+        plan.closure.as_ref(),
+        ProximityGroupRole::Shared,
+    )?;
     let proximity = proximity_prove(
         chain,
         fold,
@@ -7624,6 +7861,7 @@ fn prove_shared(
         plan.proximity.shared_mask_tree,
         derive_run_seed(seed, 4, 0)?,
         plan.proximity.shared_base_positions,
+        iopp.as_ref(),
     )?;
     drop(_profile_proximity);
     let messages = HiddenSharedMessages {
@@ -7639,9 +7877,7 @@ fn prove_shared(
         zeta: zeta.clone(),
         fold_start: proximity.messages.fold_start.clone(),
         fold_rounds: proximity.messages.fold_rounds.clone(),
-        base: proximity.messages.base,
-        base_rows: proximity.messages.base_rows,
-        base_openings: proximity.messages.base_openings,
+        tail: proximity.messages.tail,
         seal: proximity.seal,
     };
     Ok(SharedProveResult {
@@ -7707,7 +7943,7 @@ fn verify_shared(
     reader: &IndexReader,
     first_seal: &Digest,
     messages: &HiddenSharedMessages,
-) -> Result<(Digest, Vec<GuRelationRow>, SharedPoints, BaseFinalOutcome)> {
+) -> Result<(Digest, Vec<GuRelationRow>, SharedPoints, ProximityBaseOutcome)> {
     let _profile = zkie_engine::profile::Scope::new("verify.shared");
     let k_col = shared_point_bits(plan)?;
     let mut chain = shared_start_chain(plan, reader, first_seal)?;
@@ -7888,6 +8124,12 @@ fn verify_shared(
         &members,
         plan.proximity.shared_mask_tree.leaf_class,
     )?;
+    let iopp = proximity_iopp_plan(
+        &plan.proximity,
+        &plan.send,
+        plan.closure.as_ref(),
+        ProximityGroupRole::Shared,
+    )?;
     let _profile_proximity = zkie_engine::profile::Scope::new("verify.shared.proximity");
     let proximity = proximity_verify(
         chain,
@@ -7898,13 +8140,12 @@ fn verify_shared(
         &ProximityMessages {
             fold_start: messages.fold_start.clone(),
             fold_rounds: messages.fold_rounds.clone(),
-            base: messages.base,
-            base_rows: messages.base_rows.clone(),
-            base_openings: messages.base_openings.clone(),
+            tail: messages.tail.clone(),
         },
         plan.proximity.shared_fresh,
         plan.proximity.shared_mask_tree,
         plan.proximity.shared_base_positions,
+        iopp.as_ref(),
     )?;
     drop(_profile_proximity);
     if proximity.seal != messages.seal {
@@ -9630,6 +9871,12 @@ fn prove_second(
         &members,
         plan.proximity.own_mask_tree.leaf_class,
     )?;
+    let iopp = proximity_iopp_plan(
+        &plan.proximity,
+        &plan.send,
+        plan.closure.as_ref(),
+        ProximityGroupRole::Own,
+    )?;
     let _profile_proximity = zkie_engine::profile::Scope::new("second.proximity");
     let proximity = proximity_prove(
         chain,
@@ -9647,6 +9894,7 @@ fn prove_second(
         plan.proximity.own_mask_tree,
         derive_run_seed(seed, 5, 0)?,
         plan.proximity.own_base_positions,
+        iopp.as_ref(),
     )?;
     drop(_profile_proximity);
     let mut claims = sample_rows.into_iter().flatten().collect::<Vec<_>>();
@@ -9662,9 +9910,7 @@ fn prove_second(
             closure: closure_proof,
             fold_start: proximity.messages.fold_start.clone(),
             fold_rounds: proximity.messages.fold_rounds.clone(),
-            base: proximity.messages.base,
-            base_rows: proximity.messages.base_rows,
-            base_openings: proximity.messages.base_openings,
+            tail: proximity.messages.tail,
             seal: proximity.seal,
         },
         claims: std::mem::take(&mut claims),
@@ -9773,7 +10019,7 @@ fn verify_second(
 ) -> Result<(
     Digest,
     Vec<GuRelationRow>,
-    BaseFinalOutcome,
+    ProximityBaseOutcome,
     Option<DotRowBinding>,
     Option<ClosureRowBinding>,
 )> {
@@ -9863,6 +10109,12 @@ fn verify_second(
         &members,
         plan.proximity.own_mask_tree.leaf_class,
     )?;
+    let iopp = proximity_iopp_plan(
+        &plan.proximity,
+        &plan.send,
+        plan.closure.as_ref(),
+        ProximityGroupRole::Own,
+    )?;
     let _profile_proximity = zkie_engine::profile::Scope::new("verify.second.proximity");
     let proximity = proximity_verify(
         chain,
@@ -9873,13 +10125,12 @@ fn verify_second(
         &ProximityMessages {
             fold_start: messages.fold_start.clone(),
             fold_rounds: messages.fold_rounds.clone(),
-            base: messages.base,
-            base_rows: messages.base_rows.clone(),
-            base_openings: messages.base_openings.clone(),
+            tail: messages.tail.clone(),
         },
         plan.proximity.own_fresh,
         plan.proximity.own_mask_tree,
         plan.proximity.own_base_positions,
+        iopp.as_ref(),
     )?;
     drop(_profile_proximity);
     if proximity.seal != messages.seal {
@@ -10637,13 +10888,68 @@ fn put_shared(writer: &mut CanonicalWriter, message: &HiddenSharedMessages) {
         writer.put_fp3(c0);
         writer.put_fp3(c2);
     }
-    put_base_messages(writer, &message.base);
-    put_base_rows(writer, &message.base_rows);
-    put_base_openings(writer, &message.base_openings);
+    put_tail(writer, &message.tail);
     writer.put_digest(&message.seal);
 }
 
-fn get_shared(reader: &mut CanonicalReader<'_>) -> Result<HiddenSharedMessages> {
+/// Encodes the group's end. The tag names which end the plan produced; the
+/// decoder derives the same choice from the trusted plan and rejects the
+/// other tag.
+fn put_tail(writer: &mut CanonicalWriter, tail: &ProximityTail) {
+    match tail {
+        ProximityTail::Single {
+            base,
+            base_rows,
+            base_openings,
+        } => {
+            writer.put_u64(0);
+            put_base_messages(writer, base);
+            put_base_rows(writer, base_rows);
+            put_base_openings(writer, base_openings);
+        }
+        ProximityTail::Stages(proof) => {
+            writer.put_u64(1);
+            writer.put_bytes(&proof.encode());
+        }
+    }
+}
+
+/// Decodes the group's end against the trusted plan. A group with an empty
+/// stage list carries the single-stage BASE artifact; a group with stages
+/// carries a loop proof that is decoded against the plan-derived chain.
+fn get_tail(
+    reader: &mut CanonicalReader<'_>,
+    iopp: Option<&ProximityIoppPlan>,
+) -> Result<ProximityTail> {
+    match (reader.get_u64()?, iopp) {
+        (0, None) => {
+            let base = get_base_messages(reader)?;
+            let base_rows = get_base_rows(reader, ACTIVATION_DECODE_BOUND)?;
+            let base_openings = get_base_openings(reader, ACTIVATION_DECODE_BOUND)?;
+            Ok(ProximityTail::Single {
+                base,
+                base_rows,
+                base_openings,
+            })
+        }
+        (1, Some(iopp)) => {
+            let bytes = reader.get_bytes()?;
+            if bytes.len() > PROXIMITY_LOOP_DECODE_BOUND {
+                return Err(Error::ResourceLimit);
+            }
+            Ok(ProximityTail::Stages(IoppProof::decode(
+                &iopp.chain,
+                bytes,
+            )?))
+        }
+        _ => Err(Error::ShapeMismatch),
+    }
+}
+
+fn get_shared(
+    reader: &mut CanonicalReader<'_>,
+    plan: &HiddenLinPlan,
+) -> Result<HiddenSharedMessages> {
     let gu_root = reader.get_digest()?;
     let gu_seeds = get_seed_vec(reader)?;
     let gu_answers = get_fp3_vec(reader, SEED_COORDINATE_BOUND)?;
@@ -10670,9 +10976,13 @@ fn get_shared(reader: &mut CanonicalReader<'_>) -> Result<HiddenSharedMessages> 
     for _ in 0..round_count {
         fold_rounds.push((reader.get_fp3()?, reader.get_fp3()?));
     }
-    let base = get_base_messages(reader)?;
-    let base_rows = get_base_rows(reader, ACTIVATION_DECODE_BOUND)?;
-    let base_openings = get_base_openings(reader, ACTIVATION_DECODE_BOUND)?;
+    let iopp = proximity_iopp_plan(
+        &plan.proximity,
+        &plan.send,
+        plan.closure.as_ref(),
+        ProximityGroupRole::Shared,
+    )?;
+    let tail = get_tail(reader, iopp.as_ref())?;
     let seal = reader.get_digest()?;
     Ok(HiddenSharedMessages {
         gu_root,
@@ -10687,9 +10997,7 @@ fn get_shared(reader: &mut CanonicalReader<'_>) -> Result<HiddenSharedMessages> 
         zeta,
         fold_start,
         fold_rounds,
-        base,
-        base_rows,
-        base_openings,
+        tail,
         seal,
     })
 }
@@ -10799,9 +11107,7 @@ fn put_second(writer: &mut CanonicalWriter, message: &HiddenSecondMessages) -> R
         writer.put_fp3(c0);
         writer.put_fp3(c2);
     }
-    put_base_messages(writer, &message.base);
-    put_base_rows(writer, &message.base_rows);
-    put_base_openings(writer, &message.base_openings);
+    put_tail(writer, &message.tail);
     writer.put_digest(&message.seal);
     Ok(())
 }
@@ -10855,9 +11161,13 @@ fn get_second(reader: &mut CanonicalReader<'_>, plan: &HiddenLinPlan) -> Result<
     for _ in 0..round_count {
         fold_rounds.push((reader.get_fp3()?, reader.get_fp3()?));
     }
-    let base = get_base_messages(reader)?;
-    let base_rows = get_base_rows(reader, ACTIVATION_DECODE_BOUND)?;
-    let base_openings = get_base_openings(reader, ACTIVATION_DECODE_BOUND)?;
+    let iopp = proximity_iopp_plan(
+        &plan.proximity,
+        &plan.send,
+        plan.closure.as_ref(),
+        ProximityGroupRole::Own,
+    )?;
+    let tail = get_tail(reader, iopp.as_ref())?;
     let seal = reader.get_digest()?;
     Ok(HiddenSecondMessages {
         omega_root,
@@ -10869,9 +11179,7 @@ fn get_second(reader: &mut CanonicalReader<'_>, plan: &HiddenLinPlan) -> Result<
         closure,
         fold_start,
         fold_rounds,
-        base,
-        base_rows,
-        base_openings,
+        tail,
         seal,
     })
 }
@@ -10880,7 +11188,7 @@ impl HiddenLinMessages {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut writer = CanonicalWriter::new();
         writer.put_u64(HIDDEN_SEND_SCHEMA_VERSION);
-        writer.put_u64(13);
+        writer.put_u64(14);
         writer.put_bytes(&self.first.encode()?);
         writer.put_digest(&self.first_seal);
         let mut shared = CanonicalWriter::new();
@@ -10894,7 +11202,14 @@ impl HiddenLinMessages {
 
     pub fn decode(plan: &HiddenLinPlan, bytes: &[u8]) -> Result<Self> {
         let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
-        if reader.get_u64()? != HIDDEN_SEND_SCHEMA_VERSION || reader.get_u64()? != 13 {
+        if reader.get_u64()? != HIDDEN_SEND_SCHEMA_VERSION {
+            return Err(Error::InvalidEncoding);
+        }
+        let layout = reader.get_u64()?;
+        if layout < 14 {
+            return Err(Error::UnsupportedVersion);
+        }
+        if layout != 14 {
             return Err(Error::InvalidEncoding);
         }
         let first = HiddenSendMessages::decode(&plan.send, plan.closure.as_ref(), reader.get_bytes()?)?;
@@ -10903,7 +11218,7 @@ impl HiddenLinMessages {
         let second_bytes = reader.get_bytes()?.to_vec();
         reader.finish()?;
         let mut shared_reader = CanonicalReader::new(&shared_bytes, DecodeLimits::unlimited());
-        let shared = get_shared(&mut shared_reader)?;
+        let shared = get_shared(&mut shared_reader, plan)?;
         shared_reader.finish()?;
         let mut second_reader = CanonicalReader::new(&second_bytes, DecodeLimits::unlimited());
         let second = get_second(&mut second_reader, plan)?;
@@ -12228,8 +12543,9 @@ mod merged_tests {
         let table = table();
         let outcome = verify_hidden_lin_hidden(&plan, &table.reader, &messages).unwrap();
         assert_eq!(outcome.eval_rows.len(), POSITIONS as usize);
-        assert!(outcome.own_base.fold_main);
-        assert!(outcome.own_base.base_linear);
+        let own_base = outcome.own_base.single().expect("the fixture ends in BASE");
+        assert!(own_base.fold_main);
+        assert!(own_base.base_linear);
 
         // The verifier rebuilds both masked rows from the trusted plan.
         let (members, _) = own_members(&plan, &messages.first, &messages.shared, None, None).unwrap();
@@ -12802,10 +13118,12 @@ mod merged_tests {
             verify_hidden_lin_with_witness(&plan, &table.reader, &output, &messages, &witness)
                 .unwrap();
         assert_eq!(outcome.eval_rows.len(), POSITIONS as usize);
-        assert!(outcome.shared_base.fold_main);
-        assert!(outcome.own_base.fold_main);
-        assert!(outcome.shared_base.base_linear);
-        assert!(outcome.own_base.base_linear);
+        let shared_base = outcome.shared_base.single().expect("the fixture ends in BASE");
+        let own_base = outcome.own_base.single().expect("the fixture ends in BASE");
+        assert!(shared_base.fold_main);
+        assert!(own_base.fold_main);
+        assert!(shared_base.base_linear);
+        assert!(own_base.base_linear);
         assert_eq!(outcome.first_seal, messages.first_seal);
         assert_eq!(outcome.shared_seal, messages.shared.seal);
         assert_eq!(outcome.seal, messages.second.seal);
@@ -12848,8 +13166,9 @@ mod merged_tests {
         }
         let outcome = verify_hidden_lin_hidden(&plan, &table.reader, &messages).unwrap();
         assert_eq!(outcome.eval_rows.len(), POSITIONS as usize);
-        assert!(outcome.own_base.fold_main);
-        assert!(outcome.own_base.base_linear);
+        let own_base = outcome.own_base.single().expect("the fixture ends in BASE");
+        assert!(own_base.fold_main);
+        assert!(own_base.base_linear);
         // A changed target no longer matches the committed row.
         let mut changed = messages.clone();
         changed.first.eval_targets[0] = changed.first.eval_targets[0].add(&Fp3::ONE);
@@ -13057,8 +13376,12 @@ mod merged_tests {
             &witness,
         ));
         let (plan, mut messages, witness) = run();
-        messages.second.base_rows.base.lambda =
-            messages.second.base_rows.base.lambda.add(&Fp3::ONE);
+        match &mut messages.second.tail {
+            ProximityTail::Single { base_rows, .. } => {
+                base_rows.base.lambda = base_rows.base.lambda.add(&Fp3::ONE);
+            }
+            ProximityTail::Stages(_) => panic!("the fixture has no stages"),
+        }
         assert_reject(verify_hidden_lin_with_witness(
             &plan,
             &table.reader,

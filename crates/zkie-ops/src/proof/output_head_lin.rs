@@ -67,10 +67,11 @@ use crate::proof::plan::{
 use crate::proof::session_baseline::{assemble_binding, SelectedMatmulStep};
 
 
-/// Canonical encoding version of the merged request proof. Version 4 is the
-/// versioned envelope around the session encoding; the optional closure block
-/// is part of the session encoding and is selected by the trusted plan.
-const OUTPUT_HEAD_PROOF_VERSION: u64 = 4;
+/// Canonical encoding version of the merged request proof. Version 5 carries
+/// the proximity group's end as a plan-selected union: the single-stage BASE
+/// artifact or the multi-stage loop proof. Older versions are rejected
+/// explicitly instead of being read under the new layout.
+const OUTPUT_HEAD_PROOF_VERSION: u64 = 5;
 
 /// Positions of one output-head MatMul request.
 pub const OUTPUT_HEAD_POSITIONS: usize = 16;
@@ -363,7 +364,11 @@ impl OutputHeadLinProof {
             max_elements: bytes.len(),
         };
         let mut reader = CanonicalReader::new(bytes, limits);
-        if reader.get_u64()? != OUTPUT_HEAD_PROOF_VERSION {
+        let version = reader.get_u64()?;
+        if version < OUTPUT_HEAD_PROOF_VERSION {
+            return Err(Error::UnsupportedVersion);
+        }
+        if version != OUTPUT_HEAD_PROOF_VERSION {
             return Err(Error::InvalidEncoding);
         }
         let session = HiddenLinMessages::decode(plan, reader.get_bytes()?)?;
@@ -2257,8 +2262,18 @@ mod tests {
         let setup = verifier_setup(&fixture);
         let outcome = verify(&fixture, &setup, &fixture.table.reader, &fixture.proof).unwrap();
         assert_eq!(outcome.outcome.eval_rows.len(), TOY_POSITIONS);
-        assert!(outcome.outcome.shared_base.fold_main);
-        assert!(outcome.outcome.own_base.fold_main);
+        assert!(outcome
+            .outcome
+            .shared_base
+            .single()
+            .expect("the fixture ends in BASE")
+            .fold_main);
+        assert!(outcome
+            .outcome
+            .own_base
+            .single()
+            .expect("the fixture ends in BASE")
+            .fold_main);
         let bytes = fixture.proof.encode().unwrap();
         let merged = merged_plan(
             fixture.shape,
@@ -2396,8 +2411,14 @@ mod tests {
         tampered.session.second.fold_rounds.clear();
         assert!(verify(&fixture, &setup, &fixture.table.reader, &tampered).is_err());
         let mut tampered = fixture.proof.clone();
-        tampered.session.second.base_rows.base.lambda =
-            tampered.session.second.base_rows.base.lambda.add(&Fp3::ONE);
+        match &mut tampered.session.second.tail {
+            crate::proof::hidden_send_session::ProximityTail::Single { base_rows, .. } => {
+                base_rows.base.lambda = base_rows.base.lambda.add(&Fp3::ONE);
+            }
+            crate::proof::hidden_send_session::ProximityTail::Stages(_) => {
+                panic!("the fixture has no stages")
+            }
+        }
         assert!(verify(&fixture, &setup, &fixture.table.reader, &tampered).is_err());
         let bytes = fixture.proof.encode().unwrap();
         let merged = merged_plan(
