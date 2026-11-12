@@ -92,6 +92,20 @@ pub struct IoppStageFoldIds {
     pub fresh: u64,
 }
 
+/// The public derivation values of one stage's committed trees.
+///
+/// The switch tree and the following FOLD mask tree of stage `i` carry these
+/// values, so every stage's public labels are derived from the trusted stage
+/// ordinal and purpose instead of repeating one chain-wide value. Entry 0 is
+/// the stage 0 FOLD's own fresh mask tree; the loop never derives a tree from
+/// it, and it is carried so the caller binds the same trusted values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IoppStageSeed {
+    pub switch_run: Digest,
+    pub mask_run: Digest,
+    pub configuration: Digest,
+}
+
 /// The caller's plan values that are not part of the stage list itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IoppChainConfig {
@@ -105,9 +119,8 @@ pub struct IoppChainConfig {
     /// The leaf class of every stage FOLD mask tree.
     pub mask_leaf_class: u32,
     pub switch_salt_bytes: usize,
-    pub switch_run: Digest,
-    pub mask_run: Digest,
-    pub configuration: Digest,
+    /// One derivation entry per stage, in stage order.
+    pub stage_seeds: Vec<IoppStageSeed>,
     /// The BASE masking tree, distinct from the last switch's tree.
     pub base_star: RuntimeTreePlan,
 }
@@ -146,9 +159,12 @@ impl IoppChain {
         if config.base_positions == 0
             || config.mask_leaf_class == IOPP_SWITCH_LEAF_CLASS
             || config.mask_leaf_class == config.base_star.leaf_class
-            || config.switch_run == Digest::ZERO
-            || config.mask_run == Digest::ZERO
-            || config.configuration == Digest::ZERO
+            || config.stage_seeds.len() != stages.len()
+            || config.stage_seeds.iter().any(|seed| {
+                seed.switch_run == Digest::ZERO
+                    || seed.mask_run == Digest::ZERO
+                    || seed.configuration == Digest::ZERO
+            })
             || config.switch_salt_bytes == 0
         {
             return Err(Error::InvalidConfig);
@@ -182,8 +198,8 @@ impl IoppChain {
                 index as u64,
                 &target,
                 config.switch_salt_bytes,
-                config.switch_run,
-                config.configuration,
+                config.stage_seeds[index].switch_run,
+                config.stage_seeds[index].configuration,
             )?;
             if tree.fault().is_some() {
                 return Err(Error::InvalidConfig);
@@ -222,8 +238,8 @@ impl IoppChain {
                     log_n: target.mask_code.log_n,
                     mask_rows: target.mask_rows,
                     salt_bytes: config.switch_salt_bytes,
-                    run: config.mask_run,
-                    configuration: config.configuration,
+                    run: config.stage_seeds[index].mask_run,
+                    configuration: config.stage_seeds[index].configuration,
                 };
                 if mask_tree.fault().is_some() {
                     return Err(Error::InvalidConfig);
@@ -1553,9 +1569,23 @@ mod tests {
             }],
             mask_leaf_class: IOPP_MASK_LEAF_CLASS,
             switch_salt_bytes: SALT_BYTES,
-            switch_run: SWITCH_RUN,
-            mask_run: MASK_RUN,
-            configuration: CONFIGURATION,
+            stage_seeds: vec![
+                IoppStageSeed {
+                    switch_run: SWITCH_RUN,
+                    mask_run: MASK_RUN,
+                    configuration: CONFIGURATION,
+                },
+                IoppStageSeed {
+                    switch_run: Digest([0xb1; 32]),
+                    mask_run: Digest([0xb2; 32]),
+                    configuration: Digest([0xb3; 32]),
+                },
+                IoppStageSeed {
+                    switch_run: Digest([0xc1; 32]),
+                    mask_run: Digest([0xc2; 32]),
+                    configuration: Digest([0xc3; 32]),
+                },
+            ],
             base_star: base_star(),
         }
     }
@@ -2212,6 +2242,10 @@ mod tests {
             first_mask: code(17, 512, 256),
             base_positions: 2,
             fold_ids: Vec::new(),
+            stage_seeds: vec![
+                config().stage_seeds[0],
+                config().stage_seeds[0],
+            ],
             base_star: RuntimeTreePlan {
                 tree_number: 0x700,
                 leaf_class: 5,
@@ -2242,6 +2276,7 @@ mod tests {
                 member: MEMBER1,
                 fresh: FRESH1,
             }],
+            stage_seeds: config().stage_seeds,
             base_star: RuntimeTreePlan {
                 tree_number: 0x701,
                 leaf_class: 5,
@@ -2258,5 +2293,36 @@ mod tests {
             ..config()
         };
         assert!(IoppChain::derive(&own, &own_config).is_ok());
+    }
+
+    #[test]
+    fn stage_derivation_values_are_per_stage() {
+        let plan = IoppChain::derive(&stages(), &config()).unwrap();
+        let mut changed = config();
+        changed.stage_seeds[1].switch_run = Digest([0xd1; 32]);
+        changed.stage_seeds[1].mask_run = Digest([0xd2; 32]);
+        let changed = IoppChain::derive(&stages(), &changed).unwrap();
+        assert_ne!(
+            plan.stages[1].tree.as_ref().unwrap().run,
+            changed.stages[1].tree.as_ref().unwrap().run
+        );
+        assert_ne!(
+            plan.stages[1].fold.as_ref().unwrap().mask_tree.run,
+            changed.stages[1].fold.as_ref().unwrap().mask_tree.run
+        );
+        assert_eq!(
+            plan.stages[2].tree.as_ref().unwrap().run,
+            changed.stages[2].tree.as_ref().unwrap().run
+        );
+    }
+
+    #[test]
+    fn stage_derivation_values_must_cover_every_stage_and_be_nonzero() {
+        let mut short = config();
+        short.stage_seeds.pop();
+        assert!(IoppChain::derive(&stages(), &short).is_err());
+        let mut zero = config();
+        zero.stage_seeds[2].configuration = Digest::ZERO;
+        assert!(IoppChain::derive(&stages(), &zero).is_err());
     }
 }
