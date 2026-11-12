@@ -3826,7 +3826,9 @@ mod unbiased_coin_tests {
     }
 
     fn first_accepted_retry(coins: &ByteMaskCoins, number: u32, coordinate: usize) -> Fp {
-        for attempt in 1..=64u32 {
+        // The production sampler tries attempts 0..SAMPLE_TRIES (0..=63);
+        // attempt 64 cannot execute. The helper range matches that bound.
+        for attempt in 1..crate::pcs::request::field::SAMPLE_TRIES {
             let word = coins.retry_candidate(number, coordinate, attempt).unwrap();
             if word < MODULUS {
                 return crate::pcs::request::field::fp_from_u64(word);
