@@ -27,6 +27,27 @@ pub fn fp_from_u64(value: u64) -> Fp {
 /// `2^-2048` per sample.
 pub const SAMPLE_TRIES: u32 = 64;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+
+static SAMPLE_ACCEPTS: AtomicU64 = AtomicU64::new(0);
+static SAMPLE_REJECTS: AtomicU64 = AtomicU64::new(0);
+
+fn sample_counts_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("ZKIE_SAMPLE_COUNTS").is_some())
+}
+
+/// The accept/reject counts of the mask sampler in this process. The counters
+/// are enabled by `ZKIE_SAMPLE_COUNTS`; with the variable unset they are not
+/// incremented.
+pub fn sampling_counts() -> (u64, u64) {
+    (
+        SAMPLE_ACCEPTS.load(Ordering::Relaxed),
+        SAMPLE_REJECTS.load(Ordering::Relaxed),
+    )
+}
+
 /// Uniform base-field sample by rejection. `word(attempt)` must return a fresh
 /// 64-bit candidate; a candidate at or above the modulus is rejected and the
 /// next attempt is drawn. Exhaustion returns `EntropyUnavailable`; there is no
@@ -35,10 +56,17 @@ pub fn uniform_fp<F>(mut word: F) -> Result<Fp>
 where
     F: FnMut(u32) -> Result<u64>,
 {
+    let count = sample_counts_enabled();
     for attempt in 0..SAMPLE_TRIES {
         let candidate = word(attempt)?;
         if candidate < MODULUS {
+            if count {
+                SAMPLE_ACCEPTS.fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(Fp::from_u64(candidate));
+        }
+        if count {
+            SAMPLE_REJECTS.fetch_add(1, Ordering::Relaxed);
         }
     }
     Err(Error::EntropyUnavailable)

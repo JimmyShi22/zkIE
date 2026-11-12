@@ -1458,6 +1458,8 @@ pub trait MaskCoins {
 pub struct ByteMaskCoins {
     seed: Digest,
     draw: u32,
+    #[cfg(test)]
+    forced: Option<Vec<(u32, usize, u32, u64)>>,
 }
 
 impl ByteMaskCoins {
@@ -1465,13 +1467,90 @@ impl ByteMaskCoins {
         if seed == Digest::ZERO {
             return Err(Error::InvalidConfig);
         }
-        Ok(Self { seed, draw: 0 })
+        Ok(Self {
+            seed,
+            draw: 0,
+            #[cfg(test)]
+            forced: None,
+        })
     }
 
-    fn value_at(&self, number: u32) -> Result<Fp3> {
+    /// A test-only coin source that forces selected `(draw, coordinate,
+    /// attempt)` candidates. Unlisted candidates fall through to the real
+    /// hash path.
+    #[cfg(test)]
+    pub fn with_forced(
+        seed: Digest,
+        forced: Vec<(u32, usize, u32, u64)>,
+    ) -> Result<Self> {
+        let mut coins = Self::new(seed)?;
+        coins.forced = Some(forced);
+        Ok(coins)
+    }
+
+    /// One retry candidate in the coordinate- and attempt-specific domain.
+    fn retry_candidate(&self, number: u32, coordinate: usize, attempt: u32) -> Result<u64> {
+        use crate::primitives::transcript::{hash_labeled, tag_word, COIN_INPUTS};
+
+        let mut data = Vec::with_capacity(self.seed.0.len() + 8);
+        data.extend_from_slice(&self.seed.0);
+        data.extend_from_slice(&(attempt as u64).to_le_bytes());
+        let retry = hash_labeled(
+            tag_word(COIN_INPUTS, 1 + coordinate as u64),
+            number as u64,
+            None,
+            &data,
+        )?;
+        Ok(u64::from_le_bytes(
+            retry.0[0..8]
+                .try_into()
+                .map_err(|_| Error::InvalidEncoding)?,
+        ))
+    }
+
+    fn candidate<F>(
+        &self,
+        number: u32,
+        coordinate: usize,
+        attempt: u32,
+        word: &mut F,
+    ) -> Result<u64>
+    where
+        F: FnMut(usize, u32) -> Result<u64>,
+    {
+        #[cfg(test)]
+        if let Some(forced) = &self.forced {
+            if let Some(value) = forced
+                .iter()
+                .find(|entry| {
+                    entry.0 == number && entry.1 == coordinate && entry.2 == attempt
+                })
+                .map(|entry| entry.3)
+            {
+                return Ok(value);
+            }
+        }
+        word(coordinate, attempt)
+    }
+
+    fn value_from<F>(&self, number: u32, mut word: F) -> Result<Fp3>
+    where
+        F: FnMut(usize, u32) -> Result<u64>,
+    {
         use zkie_core::common::field::PrimeCharacteristicRing;
 
         use crate::pcs::request::field::{uniform_fp, Fp, E_DEGREE};
+
+        let mut coefficients = [Fp::ZERO; E_DEGREE];
+        for (coordinate, coefficient) in coefficients.iter_mut().enumerate() {
+            *coefficient = uniform_fp(|attempt| {
+                self.candidate(number, coordinate, attempt, &mut word)
+            })?;
+        }
+        Ok(Fp3::new(coefficients[0], coefficients[1], coefficients[2]))
+    }
+
+    fn value_at(&self, number: u32) -> Result<Fp3> {
         use crate::primitives::transcript::{hash_labeled, tag_word, COIN_INPUTS};
 
         // The base hash supplies one candidate word per coordinate. A
@@ -1486,31 +1565,18 @@ impl ByteMaskCoins {
             None,
             &self.seed.0,
         )?;
-        let mut coefficients = [Fp::ZERO; E_DEGREE];
-        for (coordinate, coefficient) in coefficients.iter_mut().enumerate() {
+        let mut base = [0u64; 3];
+        for (coordinate, slot) in base.iter_mut().enumerate() {
             let bytes = &digest.0[coordinate * 8..(coordinate + 1) * 8];
-            let base = u64::from_le_bytes(bytes.try_into().map_err(|_| Error::InvalidEncoding)?);
-            *coefficient = uniform_fp(|attempt| {
-                if attempt == 0 {
-                    return Ok(base);
-                }
-                let mut data = Vec::with_capacity(self.seed.0.len() + 8);
-                data.extend_from_slice(&self.seed.0);
-                data.extend_from_slice(&(attempt as u64).to_le_bytes());
-                let retry = hash_labeled(
-                    tag_word(COIN_INPUTS, 1 + coordinate as u64),
-                    number as u64,
-                    None,
-                    &data,
-                )?;
-                Ok(u64::from_le_bytes(
-                    retry.0[0..8]
-                        .try_into()
-                        .map_err(|_| Error::InvalidEncoding)?,
-                ))
-            })?;
+            *slot = u64::from_le_bytes(bytes.try_into().map_err(|_| Error::InvalidEncoding)?);
         }
-        Ok(Fp3::new(coefficients[0], coefficients[1], coefficients[2]))
+        self.value_from(number, |coordinate, attempt| {
+            if attempt == 0 {
+                Ok(base[coordinate])
+            } else {
+                self.retry_candidate(number, coordinate, attempt)
+            }
+        })
     }
 }
 
@@ -2604,7 +2670,7 @@ pub fn fold_mask_check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pcs::request::field::{Fp, MODULUS};
+    use crate::pcs::request::field::{fp_from_u64, Fp, MODULUS};
     use crate::pcs::request::params::LEAF_SALT_MIN_BYTES;
     use crate::pcs::request::runtime_tree::verify_mask_opening;
     use zkie_core::common::field::PrimeCharacteristicRing;
@@ -3723,6 +3789,8 @@ mod tests {
 #[cfg(test)]
 mod unbiased_coin_tests {
     use super::*;
+    use crate::pcs::request::field::{fp_from_u64, Fp, MODULUS};
+    use crate::primitives::transcript::COIN_INPUTS;
 
     fn stream(seed: u8, count: usize) -> Vec<Fp3> {
         let mut coins = ByteMaskCoins::new(Digest([seed; 32])).unwrap();
@@ -3750,5 +3818,110 @@ mod unbiased_coin_tests {
             assert!(!values[index + 1..].contains(value));
         }
     }
-}
 
+    fn forced_base_words(number: u32) -> Vec<(u32, usize, u32, u64)> {
+        (0..3)
+            .map(|coordinate| (number, coordinate, 0, MODULUS))
+            .collect()
+    }
+
+    fn first_accepted_retry(coins: &ByteMaskCoins, number: u32, coordinate: usize) -> Fp {
+        for attempt in 1..=64u32 {
+            let word = coins.retry_candidate(number, coordinate, attempt).unwrap();
+            if word < MODULUS {
+                return crate::pcs::request::field::fp_from_u64(word);
+            }
+        }
+        panic!("retry exhaustion in the test seed");
+    }
+
+    #[test]
+    fn forced_base_rejection_uses_the_real_retry_domain() {
+        let seed = Digest([0x55; 32]);
+        let number = 5u32;
+        let coins = ByteMaskCoins::with_forced(seed, forced_base_words(number)).unwrap();
+        let value = coins.redraw(number).unwrap();
+        for coordinate in 0..3 {
+            assert_eq!(
+                value.c[coordinate],
+                first_accepted_retry(&coins, number, coordinate)
+            );
+        }
+    }
+
+    #[test]
+    fn forced_retries_cover_second_attempt_coordinates_and_random_access() {
+        let seed = Digest([0x56; 32]);
+        let number = 0u32;
+        let forced = vec![
+            (number, 0, 0, MODULUS),
+            (number, 0, 1, MODULUS),
+            (number, 0, 2, 7),
+            (number, 1, 0, 9),
+            (number, 2, 0, u64::MAX),
+            (number, 2, 1, 11),
+        ];
+        let mut coins = ByteMaskCoins::with_forced(seed, forced).unwrap();
+        let (drawn, drawn_number) = coins.draw().unwrap();
+        assert_eq!(drawn_number, number);
+        assert_eq!(
+            drawn,
+            Fp3::new(fp_from_u64(7), fp_from_u64(9), fp_from_u64(11))
+        );
+        let other = coins.redraw(1).unwrap();
+        assert_ne!(other, drawn);
+        assert_eq!(coins.redraw(drawn_number).unwrap(), drawn);
+    }
+
+    #[test]
+    fn forced_exhaustion_returns_an_error() {
+        let seed = Digest([0x57; 32]);
+        let number = 3u32;
+        let forced = (0..64u32)
+            .map(|attempt| (number, 0, attempt, MODULUS))
+            .collect::<Vec<_>>();
+        let coins = ByteMaskCoins::with_forced(seed, forced).unwrap();
+        assert!(matches!(
+            coins.redraw(number),
+            Err(Error::EntropyUnavailable)
+        ));
+    }
+
+    #[test]
+    fn retry_tag_uses_the_coordinate_subdomain_and_attempt_data() {
+        let seed = Digest([0x58; 32]);
+        let number = 4u32;
+        let coins = ByteMaskCoins::new(seed).unwrap();
+        for coordinate in 0..3usize {
+            for attempt in 1..=3u32 {
+                let mut data = Vec::new();
+                data.extend_from_slice(&seed.0);
+                data.extend_from_slice(&(attempt as u64).to_le_bytes());
+                let digest = hash_labeled(
+                    tag_word(COIN_INPUTS, 1 + coordinate as u64),
+                    number as u64,
+                    None,
+                    &data,
+                )
+                .unwrap();
+                let expected = u64::from_le_bytes(digest.0[0..8].try_into().unwrap());
+                assert_eq!(
+                    coins.retry_candidate(number, coordinate, attempt).unwrap(),
+                    expected
+                );
+            }
+        }
+        assert_ne!(
+            coins.retry_candidate(number, 0, 1).unwrap(),
+            coins.retry_candidate(number, 1, 1).unwrap()
+        );
+        assert_ne!(
+            coins.retry_candidate(number, 0, 1).unwrap(),
+            coins.retry_candidate(number, 0, 2).unwrap()
+        );
+        assert_ne!(
+            coins.retry_candidate(number, 0, 1).unwrap(),
+            coins.retry_candidate(number + 1, 0, 1).unwrap()
+        );
+    }
+}

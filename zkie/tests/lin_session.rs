@@ -2462,5 +2462,10 @@ fn selected_gpt2_output_head_request_session() {
     }
 
     fs::remove_dir_all(&link_dir).ok();
+    if env::var_os("ZKIE_SAMPLE_COUNTS").is_some() {
+        let (accepts, rejects) = zkie_engine::pcs::request::field::sampling_counts();
+        println!("sample_accepts={accepts}");
+        println!("sample_rejects={rejects}");
+    }
     fs::remove_dir_all(&work_dir).ok();
 }
