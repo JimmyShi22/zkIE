@@ -1,0 +1,18 @@
+ledger_events=139
+ledger_logical_openings=18129
+ledger_unique_positions=18058
+ledger_min_tail_remaining=3
+ledger_total_tail_rank=558595
+ledger_total_tail_unique=18058
+hidden_prove_ms=389493
+hidden_proof_bytes=65432832
+hidden_verify_ms=64434
+ledger_final_events=145
+ledger_final_logical=18912
+ledger_final_unique=18841
+ledger_final_min_tail_remaining=0
+ledger_final_exhausted=1
+ledger_exhausted_key kind=Cs oracle=1 tree=2049 rank=259 unique=259 logical=259
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1197.38s
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 20:12.00
+	Maximum resident set size (kbytes): 169342676
