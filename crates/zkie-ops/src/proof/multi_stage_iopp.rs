@@ -485,24 +485,13 @@ pub struct IoppProof {
 }
 
 impl IoppProof {
-    /// Encodes the proof against the trusted chain. The switch count, every
-    /// target field, the stage FOLD presence and the round count come from the
-    /// plan; a proof that disagrees is rejected before any byte is written.
-    pub fn encode(&self, plan: &IoppChain) -> Result<Vec<u8>> {
-        let switch_count = plan.stages.len() - 1;
-        if self.switches.len() != switch_count {
-            return Err(Error::ShapeMismatch);
-        }
-        let last_index = plan.stages.len() - 1;
+    /// Encodes the proof. Every field is written field by field, including
+    /// the switch count, each target and the stage FOLD presence and round
+    /// count; the decoder checks them all against the trusted chain.
+    pub fn encode(&self) -> Vec<u8> {
         let mut writer = CanonicalWriter::new();
-        for (index, record) in self.switches.iter().enumerate() {
-            let stage_index = index + 1;
-            let target = plan.stages[stage_index]
-                .target
-                .ok_or(Error::InvalidConfig)?;
-            if record.target != target {
-                return Err(Error::StatementMismatch);
-            }
+        writer.put_u64(self.switches.len() as u64);
+        for record in &self.switches {
             put_switch_target(&mut writer, &record.target);
             writer.put_digest(&record.identity);
             writer.put_digest(&record.declared_root);
@@ -520,42 +509,36 @@ impl IoppProof {
                 }
                 None => writer.put_u64(0),
             }
-            if stage_index == last_index {
-                if record.stage_fold.is_some() {
-                    return Err(Error::StatementMismatch);
+            match &record.stage_fold {
+                Some(fold) => {
+                    writer.put_u64(1);
+                    writer.put_u64(fold.rounds.len() as u64);
+                    put_fold_start(&mut writer, &fold.start);
+                    for (c0, c2) in &fold.rounds {
+                        writer.put_fp3(c0);
+                        writer.put_fp3(c2);
+                    }
                 }
-            } else {
-                let fold = plan.stages[stage_index]
-                    .fold
-                    .as_ref()
-                    .ok_or(Error::InvalidConfig)?;
-                let message = record
-                    .stage_fold
-                    .as_ref()
-                    .ok_or(Error::StatementMismatch)?;
-                if message.rounds.len() != fold.shape.k as usize {
-                    return Err(Error::ShapeMismatch);
-                }
-                writer.put_u64(fold.shape.k as u64);
-                put_fold_start(&mut writer, &message.start);
-                for (c0, c2) in &message.rounds {
-                    writer.put_fp3(c0);
-                    writer.put_fp3(c2);
-                }
+                None => writer.put_u64(0),
             }
         }
         writer.put_bytes(&self.base);
-        Ok(writer.into_bytes())
+        writer.into_bytes()
     }
 
-    /// Decodes the proof against the trusted chain. Every target is checked
-    /// field by field against the plan before its value is kept, the stage FOLD
-    /// message is expected exactly on the planned stages with the planned round
-    /// count, and trailing bytes are rejected.
+    /// Decodes the proof against the trusted chain. The switch count, every
+    /// target field, the stage FOLD presence and its round count are checked
+    /// against the plan before any value is used, and trailing bytes are
+    /// rejected.
     pub fn decode(plan: &IoppChain, bytes: &[u8]) -> Result<Self> {
-        let switch_count = plan.stages.len() - 1;
+        let expected_switches = plan.stages.len() - 1;
         let last_index = plan.stages.len() - 1;
         let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
+        let switch_count =
+            usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+        if switch_count != expected_switches {
+            return Err(Error::ShapeMismatch);
+        }
         let mut switches = Vec::with_capacity(switch_count);
         for index in 0..switch_count {
             let stage_index = index + 1;
@@ -589,27 +572,37 @@ impl IoppProof {
                 )?),
                 _ => return Err(Error::InvalidEncoding),
             };
-            let stage_fold = if stage_index == last_index {
-                None
-            } else {
-                let fold = plan.stages[stage_index]
-                    .fold
-                    .as_ref()
-                    .ok_or(Error::InvalidConfig)?;
-                let rounds =
-                    usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
-                if rounds != fold.shape.k as usize {
-                    return Err(Error::ShapeMismatch);
+            let stage_fold = match reader.get_u64()? {
+                0 => {
+                    if stage_index != last_index {
+                        return Err(Error::ShapeMismatch);
+                    }
+                    None
                 }
-                let start = get_fold_start(&mut reader)?;
-                let mut values = Vec::with_capacity(rounds);
-                for _ in 0..rounds {
-                    values.push((reader.get_fp3()?, reader.get_fp3()?));
+                1 => {
+                    if stage_index == last_index {
+                        return Err(Error::ShapeMismatch);
+                    }
+                    let fold = plan.stages[stage_index]
+                        .fold
+                        .as_ref()
+                        .ok_or(Error::InvalidConfig)?;
+                    let rounds = usize::try_from(reader.get_u64()?)
+                        .map_err(|_| Error::ResourceLimit)?;
+                    if rounds != fold.shape.k as usize {
+                        return Err(Error::ShapeMismatch);
+                    }
+                    let start = get_fold_start(&mut reader)?;
+                    let mut values = Vec::with_capacity(rounds);
+                    for _ in 0..rounds {
+                        values.push((reader.get_fp3()?, reader.get_fp3()?));
+                    }
+                    Some(IoppStageFoldMessage {
+                        start,
+                        rounds: values,
+                    })
                 }
-                Some(IoppStageFoldMessage {
-                    start,
-                    rounds: values,
-                })
+                _ => return Err(Error::InvalidEncoding),
             };
             switches.push(IoppSwitchMessage {
                 target,
@@ -2278,7 +2271,7 @@ mod tests {
     #[test]
     fn proof_codec_round_trips_against_the_plan() {
         let (plan, proof, seal, zero) = run_proof();
-        let bytes = proof.encode(&plan).unwrap();
+        let bytes = proof.encode();
         let decoded = IoppProof::decode(&plan, &bytes).unwrap();
         assert_eq!(decoded, proof);
         let verified = verify_multi_stage_iopp(chain(), &plan, zero, &decoded).unwrap();
@@ -2288,7 +2281,7 @@ mod tests {
     #[test]
     fn proof_codec_rejects_truncated_and_trailing_bytes() {
         let (plan, proof, _, _) = run_proof();
-        let bytes = proof.encode(&plan).unwrap();
+        let bytes = proof.encode();
         assert!(IoppProof::decode(&plan, &bytes[..bytes.len() - 1]).is_err());
         let mut trailing = bytes;
         trailing.push(0);
@@ -2297,22 +2290,23 @@ mod tests {
 
     #[test]
     fn proof_codec_rejects_missing_and_reordered_stages() {
-        let (plan, mut proof, _, _) = run_proof();
-        let complete = proof.clone();
-        proof.switches.pop();
-        assert!(proof.encode(&plan).is_err());
-        let mut reordered = complete;
+        let (plan, proof, _, _) = run_proof();
+        let mut missing = proof.clone();
+        missing.switches.pop();
+        assert!(IoppProof::decode(&plan, &missing.encode()).is_err());
+        let mut reordered = proof;
         reordered.switches.swap(0, 1);
-        assert!(reordered.encode(&plan).is_err());
+        assert!(IoppProof::decode(&plan, &reordered.encode()).is_err());
     }
 
     #[test]
     fn proof_codec_rejects_a_target_that_differs_from_the_plan() {
         let (plan, proof, _, _) = run_proof();
-        let mut bytes = proof.encode(&plan).unwrap();
-        // The first target starts at offset zero; flipping an answer-count bit
-        // makes the decoded target differ from the trusted one.
-        bytes[42] ^= 1;
+        let mut bytes = proof.encode();
+        // The encoded proof starts with its switch count; the first target
+        // follows. Flipping an answer-count bit makes the decoded target
+        // differ from the trusted one.
+        bytes[50] ^= 1;
         assert!(IoppProof::decode(&plan, &bytes).is_err());
     }
 
