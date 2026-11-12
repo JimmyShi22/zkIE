@@ -73,6 +73,45 @@ single-stage tail and a plan without stages rejects a loop tail. The
 diagnostic plan carries no stage list because its group drops the Dot,
 index-mask and closure members; the formal hidden plan carries the loop.
 
+## Five-case matrix (TL decision)
+
+The TL ruled that the loop is a structural proof-path change and hit the full
+case structure, so the five-case set (`gpt2-seq16`, `gpt2-seq512`,
+`gemma3-seq16`, `gemma3-seq512`, `timesfm-16patch`) is run with the standard
+matrix (one cold run and three warm runs per case):
+
+`target/release/zkie matrix --cases models/gpt2/case.toml
+models/gemma3/case.toml models/timesfm/case.toml --cold-runs 1
+--warm-runs 3 --out <trace>/matrix5`.
+
+Hit basis recorded as ruled: the loop changes the structural proof path, so
+the full five-case set is the validation basis. The hidden loop itself is
+exercised by the seq16 formal runs above; this matrix is the production
+commit/prove/verify regression over all five cases. Results are in
+`matrix5/matrix.json` and the per-run `result.json` files.
+
+All five cases completed commit, prove and verify with `PASS` (one cold run
+and three warm runs each; the warm runs reuse the cold commit). Reference
+proof bytes are unchanged from the `473e395d` baseline:
+
+| case | commit ms (cold) | prove ms cold | verify ms cold | prove ms warm median | verify ms warm median | proof bytes | prove VmHWM KiB | verify VmHWM KiB |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| gpt2-seq16 | 3,640 | 21,773 | 25,515 | 21,750 | 25,392 | 4,161,786,553 | 8,315,400 | 5,387,880 |
+| gpt2-seq512 | 3,406 | 166,992 | 232,866 | 166,710 | 231,372 | 38,992,550,944 | 78,570,344 | 47,036,760 |
+| gemma3-seq16 | 11,201 | 44,967 | 45,828 | 45,212 | 46,366 | 8,766,306,050 | 17,523,660 | 13,346,648 |
+| gemma3-seq512 | 9,359 | 418,122 | 820,862 | 416,845 | 822,000 | 101,812,159,615 | 207,848,748 | 120,674,800 |
+| timesfm-16patch | 5,676 | 35,524 | 43,154 | 35,484 | 43,046 | 6,865,533,616 | 13,824,216 | 7,322,336 |
+
+The production commit/prove/verify entries do not call the hidden
+`hidden_send_session` proximity loop; the matrix is a full-path regression,
+and the loop's own real-shape acceptance is the seq16 formal set above.
+
+
+The previous scheme's gitignored `proof.bin` files under
+`docs/benchmarks/20261110-0547-verify-bytes-109934bd-670a98c9/prod/` were
+deleted to free 159 GB before this matrix; every textual `result.json` and
+`NOTES.md` in that trace was kept.
+
 ## Open items
 
 - The planner-derived stage positions, work and error budget; `positions=2`
@@ -85,7 +124,6 @@ index-mask and closure members; the formal hidden plan carries the loop.
 - The joint security bound and the loop openings in the external ledger.
 - The outer-envelope negative matrix for every source type (the loop-level
   matrix is broader than the final-verifier matrix).
-- The five-case scope.
 
 ## Artifacts
 
