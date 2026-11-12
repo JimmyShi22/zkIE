@@ -755,8 +755,27 @@ pub fn switch_tree_plan_multi(
     run: Digest,
     configuration: Digest,
 ) -> Result<RuntimeTreePlan> {
+    switch_tree_plan_multi_at(
+        0x300u64.wrapping_add(tag & 0xff),
+        target,
+        salt_bytes,
+        run,
+        configuration,
+    )
+}
+
+/// Builds the same switched oracle tree with a tree number allocated by the
+/// caller's trusted plan. Two stage trees may not share a number with any
+/// other request tree, so the number is an input instead of a tag formula.
+pub fn switch_tree_plan_multi_at(
+    tree_number: u64,
+    target: &SwitchTarget,
+    salt_bytes: usize,
+    run: Digest,
+    configuration: Digest,
+) -> Result<RuntimeTreePlan> {
     let plan = RuntimeTreePlan {
-        tree_number: 0x300u64.wrapping_add(tag & 0xff),
+        tree_number,
         leaf_class: SWITCH_LEAF_CLASS,
         log_n: target.code.log_n,
         log_n_zk: target.mask_code.log_n,
