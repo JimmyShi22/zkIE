@@ -1,0 +1,6 @@
+9bf823bd Add the norm proximity members
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     | 124 ++++++++++-
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 256 ++++++++++++++++++++++-
+ crates/zkie-ops/src/proof/proximity_iopp.rs      |  44 +++-
+ zkie/tests/lin_session.rs                        |  14 +-
+ 4 files changed, 424 insertions(+), 14 deletions(-)

@@ -1,0 +1,5 @@
+norm-free toy output-head proof, norm absent
+before: 7a5da6ebcbfdb61d5ee88ab60e67f45613906959b0c5de998cb870f5e1de4cfb  /tmp/zkie-proof-before.bin
+after:  7a5da6ebcbfdb61d5ee88ab60e67f45613906959b0c5de998cb870f5e1de4cfb  /tmp/zkie-proof-final.bin
+size: 45080 bytes
+cmp: identical
