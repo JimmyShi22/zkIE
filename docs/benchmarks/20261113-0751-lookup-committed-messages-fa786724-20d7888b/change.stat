@@ -1,0 +1,5 @@
+fa786724 Attach committed lookup messages and absorb their roots (partial progress)
+ crates/zkie-ops/src/proof/lookup.rs          | 137 ++++++++++---
+ crates/zkie-ops/src/proof/lookup_messages.rs | 294 +++++++++++++++++++++++++++
+ crates/zkie-ops/src/proof/mod.rs             |   1 +
+ 3 files changed, 408 insertions(+), 24 deletions(-)
