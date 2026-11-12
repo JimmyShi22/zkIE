@@ -1,0 +1,6 @@
+22c7dc28 Add the norm plan and message envelope
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     | 472 ++++++++++++++++++++++-
+ crates/zkie-ops/src/proof/hidden_send_session.rs |  47 ++-
+ crates/zkie-ops/src/proof/output_head_lin.rs     |   2 +
+ zkie/tests/lin_session.rs                        |   1 +
+ 4 files changed, 518 insertions(+), 4 deletions(-)

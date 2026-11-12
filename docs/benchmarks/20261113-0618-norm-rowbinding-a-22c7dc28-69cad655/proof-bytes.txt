@@ -1,0 +1,3 @@
+7a5da6ebcbfdb61d5ee88ab60e67f45613906959b0c5de998cb870f5e1de4cfb  /tmp/zkie-proof-before.bin
+7a5da6ebcbfdb61d5ee88ab60e67f45613906959b0c5de998cb870f5e1de4cfb  /tmp/zkie-proof-stageA.bin
+cmp_exit:0
