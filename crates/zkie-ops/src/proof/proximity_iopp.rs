@@ -36,6 +36,12 @@ const DERIVATION_VERSION: u64 = 1;
 const STAR_TREE_BASE_SHARED: u64 = 0x900;
 const STAR_TREE_BASE_OWN: u64 = 0xa00;
 
+/// The base of the switch and stage FOLD mask tree-number namespaces. Both
+/// ranges are below the star bases, and every allocation walks upward from its
+/// base skipping bound and already allocated numbers.
+const SWITCH_TREE_BASE: u64 = 0x800;
+const FOLD_TREE_BASE: u64 = 0x880;
+
 /// The two proximity groups. The role is part of every derivation label and
 /// selects the group's stage list, mask tree and BASE position count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,12 +194,16 @@ pub fn derive_proximity_iopp(
         return Err(Error::InvalidConfig);
     }
     let stage_seeds = derive_stage_seeds(stages, role, mask_tree, base_positions)?;
-    let base_star = derive_base_star(stages, role, mask_tree, bound)?;
+    let mut used_trees = bound.trees.clone();
+    let (switch_tree_numbers, fold_tree_numbers) = allocate_stage_trees(stages.len(), &mut used_trees)?;
+    let base_star = derive_base_star(stages, role, mask_tree, &used_trees)?;
     let config = IoppChainConfig {
         first_main: first_main(stages)?,
         first_mask: first_mask(stages)?,
         base_positions,
         fold_ids: allocate_fold_ids(stages.len(), &bound.oracles)?,
+        switch_tree_numbers,
+        fold_tree_numbers,
         mask_leaf_class: mask_tree.leaf_class,
         switch_salt_bytes: mask_tree.salt_bytes,
         stage_seeds,
@@ -274,6 +284,42 @@ fn insert_sorted(values: &mut Vec<u64>, value: u64) {
         Ok(_) => {}
         Err(index) => values.insert(index, value),
     }
+}
+
+/// Allocates one switch tree number per switch and one stage FOLD mask tree
+/// number per non-last switch, in stage order and purpose order. The switches
+/// walk up from the switch namespace base and the stage FOLD trees from the
+/// fold namespace base; both skip every bound tree number and every number
+/// allocated before them. `used_trees` grows with the allocation so the BASE
+/// star tree, derived next, skips the same values.
+fn allocate_stage_trees(
+    stage_count: usize,
+    used_trees: &mut Vec<u64>,
+) -> Result<(Vec<u64>, Vec<u64>)> {
+    if stage_count < 2 {
+        return Err(Error::InvalidConfig);
+    }
+    let mut switches = Vec::with_capacity(stage_count - 1);
+    for _ in 1..stage_count {
+        switches.push(next_unused_tree(used_trees, SWITCH_TREE_BASE)?);
+    }
+    let mut folds = Vec::with_capacity(stage_count - 2);
+    for _ in 1..stage_count.saturating_sub(1) {
+        folds.push(next_unused_tree(used_trees, FOLD_TREE_BASE)?);
+    }
+    Ok((switches, folds))
+}
+
+fn next_unused_tree(used: &mut Vec<u64>, mut candidate: u64) -> Result<u64> {
+    while used.binary_search(&candidate).is_ok() {
+        candidate = candidate.checked_add(1).ok_or(Error::ResourceLimit)?;
+    }
+    let index = used
+        .binary_search(&candidate)
+        .err()
+        .ok_or(Error::InvalidConfig)?;
+    used.insert(index, candidate);
+    Ok(candidate)
 }
 
 /// The canonical bytes that every derived label of this chain depends on.
@@ -366,7 +412,7 @@ fn derive_base_star(
     stages: &[IoppStagePlan],
     role: ProximityGroupRole,
     mask_tree: &MaskTreePlan,
-    bound: &IoppBoundIds,
+    used_trees: &[u64],
 ) -> Result<RuntimeTreePlan> {
     let last = stages.last().ok_or(Error::InvalidConfig)?;
     let domain = derivation_domain(stages, role, mask_tree, 0);
@@ -380,7 +426,7 @@ fn derive_base_star(
         return Err(Error::InvalidConfig);
     }
     let mut tree_number = role.star_tree_base();
-    while bound.trees.binary_search(&tree_number).is_ok() {
+    while used_trees.binary_search(&tree_number).is_ok() {
         tree_number = tree_number.checked_add(1).ok_or(Error::ResourceLimit)?;
     }
     let plan = RuntimeTreePlan {
@@ -494,18 +540,24 @@ mod tests {
         )
         .is_none());
         assert!(derive_stage_seeds(&stages(), ProximityGroupRole::Shared, &mask_tree(), 1).is_ok());
-        assert!(derive_base_star(&stages(), ProximityGroupRole::Shared, &mask_tree(), &bound()).is_ok());
+        assert!(derive_base_star(&stages(), ProximityGroupRole::Shared, &mask_tree(), &bound().trees).is_ok());
+        let mut used = bound().trees.clone();
+        let (switch_tree_numbers, fold_tree_numbers) =
+            allocate_stage_trees(stages().len(), &mut used).unwrap();
+        let base_star =
+            derive_base_star(&stages(), ProximityGroupRole::Shared, &mask_tree(), &used).unwrap();
         let config = IoppChainConfig {
             first_main: first_main(&stages()).unwrap(),
             first_mask: first_mask(&stages()).unwrap(),
             base_positions: 1,
             fold_ids: allocate_fold_ids(stages().len(), &bound().oracles).unwrap(),
+            switch_tree_numbers,
+            fold_tree_numbers,
             mask_leaf_class: mask_tree().leaf_class,
             switch_salt_bytes: mask_tree().salt_bytes,
             stage_seeds: derive_stage_seeds(&stages(), ProximityGroupRole::Shared, &mask_tree(), 1)
                 .unwrap(),
-            base_star: derive_base_star(&stages(), ProximityGroupRole::Shared, &mask_tree(), &bound())
-                .unwrap(),
+            base_star,
         };
         assert!(IoppChain::derive(&stages(), &config).is_ok());
     }
@@ -656,10 +708,10 @@ mod tests {
     }
 
     #[test]
-    fn a_bound_tree_number_collision_is_rejected() {
+    fn a_bound_tree_number_is_skipped_by_the_switch_allocation() {
         let mut bound = bound();
-        bound.trees.push(0x301);
-        assert!(derive_proximity_iopp(
+        bound.trees.push(SWITCH_TREE_BASE);
+        let plan = derive_proximity_iopp(
             &stages(),
             ProximityGroupRole::Shared,
             &mask_tree(),
@@ -668,14 +720,22 @@ mod tests {
             1,
             &bound,
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(
+            plan.chain.stages[1].tree.as_ref().unwrap().tree_number,
+            SWITCH_TREE_BASE + 1
+        );
+        assert_eq!(
+            plan.chain.stages[2].tree.as_ref().unwrap().tree_number,
+            SWITCH_TREE_BASE + 2
+        );
     }
 
     #[test]
-    fn a_bound_fold_tree_number_collision_is_rejected() {
+    fn a_bound_tree_number_is_skipped_by_the_fold_allocation() {
         let mut bound = bound();
-        bound.trees.push(0x500);
-        assert!(derive_proximity_iopp(
+        bound.trees.push(FOLD_TREE_BASE);
+        let plan = derive_proximity_iopp(
             &stages(),
             ProximityGroupRole::Shared,
             &mask_tree(),
@@ -684,7 +744,11 @@ mod tests {
             1,
             &bound,
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(
+            plan.chain.stages[1].fold.as_ref().unwrap().mask_tree.tree_number,
+            FOLD_TREE_BASE + 1
+        );
     }
 
     #[test]

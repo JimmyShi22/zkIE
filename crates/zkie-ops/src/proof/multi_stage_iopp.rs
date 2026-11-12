@@ -19,7 +19,7 @@ use zkie_core::types::Digest;
 use zkie_engine::pcs::request::chain::{Chain, KIND_ALGEBRAIC, KIND_EPSILON};
 use zkie_engine::pcs::request::code::CodeParams;
 use zkie_engine::pcs::request::cs_stage::{
-    switch_tree_plan_multi, SwitchTarget, SwitchedClaims, SwitchedRows,
+    switch_tree_plan_multi_at, SwitchTarget, SwitchedClaims, SwitchedRows,
 };
 use zkie_engine::pcs::request::field::{Fp3, E_DEGREE};
 use zkie_engine::pcs::request::fold::{
@@ -116,6 +116,11 @@ pub struct IoppChainConfig {
     pub base_positions: usize,
     /// One identifier triple per non-last switch, in stage order.
     pub fold_ids: Vec<IoppStageFoldIds>,
+    /// One allocated tree number per switch, in stage order.
+    pub switch_tree_numbers: Vec<u64>,
+    /// One allocated tree number per non-last switch's stage FOLD mask tree,
+    /// in stage order.
+    pub fold_tree_numbers: Vec<u64>,
     /// The leaf class of every stage FOLD mask tree.
     pub mask_leaf_class: u32,
     pub switch_salt_bytes: usize,
@@ -170,10 +175,21 @@ impl IoppChain {
             return Err(Error::InvalidConfig);
         }
         let switch_count = stages.len() - 1;
-        if config.fold_ids.len() != switch_count - 1 {
+        if config.fold_ids.len() != switch_count - 1
+            || config.switch_tree_numbers.len() != switch_count
+            || config.fold_tree_numbers.len() != switch_count - 1
+        {
             return Err(Error::ShapeMismatch);
         }
         if fold_ids_fault(&config.fold_ids) {
+            return Err(Error::InvalidConfig);
+        }
+        let mut used_trees = Vec::with_capacity(switch_count * 2);
+        used_trees.extend_from_slice(&config.switch_tree_numbers);
+        used_trees.extend_from_slice(&config.fold_tree_numbers);
+        used_trees.push(config.base_star.tree_number);
+        used_trees.sort_unstable();
+        if used_trees[0] == 0 || used_trees.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err(Error::InvalidConfig);
         }
         let mut derived = Vec::with_capacity(stages.len());
@@ -194,8 +210,8 @@ impl IoppChain {
                 plan.h,
                 plan.samples,
             )?;
-            let tree = switch_tree_plan_multi(
-                index as u64,
+            let tree = switch_tree_plan_multi_at(
+                config.switch_tree_numbers[index - 1],
                 &target,
                 config.switch_salt_bytes,
                 config.stage_seeds[index].switch_run,
@@ -231,9 +247,7 @@ impl IoppChain {
                     return Err(Error::InvalidConfig);
                 }
                 let mask_tree = MaskTreePlan {
-                    tree_number: 0x500u64
-                        .checked_add((index - 1) as u64)
-                        .ok_or(Error::ResourceLimit)?,
+                    tree_number: config.fold_tree_numbers[index - 1],
                     leaf_class: config.mask_leaf_class,
                     log_n: target.mask_code.log_n,
                     mask_rows: target.mask_rows,
@@ -1567,6 +1581,8 @@ mod tests {
                 member: MEMBER1,
                 fresh: FRESH1,
             }],
+            switch_tree_numbers: vec![0x310, 0x311],
+            fold_tree_numbers: vec![0x510],
             mask_leaf_class: IOPP_MASK_LEAF_CLASS,
             switch_salt_bytes: SALT_BYTES,
             stage_seeds: vec![
@@ -2242,6 +2258,8 @@ mod tests {
             first_mask: code(17, 512, 256),
             base_positions: 2,
             fold_ids: Vec::new(),
+            switch_tree_numbers: vec![0x710],
+            fold_tree_numbers: Vec::new(),
             stage_seeds: vec![
                 config().stage_seeds[0],
                 config().stage_seeds[0],
