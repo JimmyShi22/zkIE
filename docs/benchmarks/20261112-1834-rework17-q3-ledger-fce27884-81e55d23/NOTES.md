@@ -1,5 +1,9 @@
 # rework17 Q3: loop opening ledger and staged outer negatives
 
+> Superseded as primary evidence by `20261112-1925-rework17-q3-ledger-clean-fce27884-81e55d23`,
+> the clean final-code run. This trace is retained; the run 3 binary predates
+> the final test-only ledger-consistency assertions.
+
 ## Scheme and baseline
 
 - Scheme: `rework17-q3-ledger`.
