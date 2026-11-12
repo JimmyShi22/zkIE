@@ -4281,6 +4281,9 @@ pub struct HiddenProximityPlan {
     /// keeps the current single-stage path.
     pub shared_stages: Vec<IoppStagePlan>,
     pub own_stages: Vec<IoppStagePlan>,
+    /// When true, the own two-stage list is re-derived by the trusted planner
+    /// and must match this plan. The toy fixtures leave it false.
+    pub planner_checked: bool,
 }
 
 impl HiddenProximityPlan {
@@ -4340,43 +4343,90 @@ impl HiddenProximityPlan {
         // the exact union of SEND, BASE and any later opening.
         let own_base = self.own_base_positions as u64;
         let shared_base = self.shared_base_positions as u64;
-        if send.openings_per_oracle as u64 + own_base > send.w.code.r {
-            return Some("the W SEND and own-BASE openings exceed the code tail");
-        }
-        if let Some(index) = &send.index_mask {
-            if index.openings as u64 + own_base > index.mask_code.r {
-                return Some("the index-mask SEND and own-BASE openings exceed the mask tail");
+        // A staged group opens its original members at the stage-0 switch,
+        // not at BASE; the last stage's own codes bound the BASE openings.
+        // The single-stage checks below therefore apply only to an empty stage
+        // list. The staged form checks the stage-0 opening against the member
+        // and fresh-mask tails, and `iopp_stage_fault` checks the last stage's
+        // positions against the last stage codes.
+        let own_switch = self
+            .own_stages
+            .first()
+            .map(|stage| stage.positions as u64)
+            .unwrap_or(own_base);
+        let shared_switch = self
+            .shared_stages
+            .first()
+            .map(|stage| stage.positions as u64)
+            .unwrap_or(shared_base);
+        if self.own_stages.is_empty() {
+            if send.openings_per_oracle as u64 + own_base > send.w.code.r {
+                return Some("the W SEND and own-BASE openings exceed the code tail");
+            }
+            if let Some(index) = &send.index_mask {
+                if index.openings as u64 + own_base > index.mask_code.r {
+                    return Some("the index-mask SEND and own-BASE openings exceed the mask tail");
+                }
+            }
+            if let Some(dot) = &send.dot {
+                if own_base > dot.shape.code.r {
+                    return Some("the shown-map own-BASE openings exceed the code tail");
+                }
+            }
+            if own_base > self.mask_code.r {
+                return Some("the fresh-mask BASE openings exceed the mask tail");
+            }
+        } else {
+            if send.openings_per_oracle as u64 + own_switch > send.w.code.r
+                || own_switch > self.code.r
+                || own_switch > self.mask_code.r
+            {
+                return Some("the own stage-0 switch openings exceed a group tail");
+            }
+            if let Some(index) = &send.index_mask {
+                if index.openings as u64 + own_switch > index.mask_code.r {
+                    return Some("the index-mask stage-0 openings exceed the mask tail");
+                }
+            }
+            if let Some(dot) = &send.dot {
+                if own_switch > dot.shape.code.r {
+                    return Some("the shown-map stage-0 openings exceed the code tail");
+                }
             }
         }
-        if let Some(dot) = &send.dot {
-            if own_base > dot.shape.code.r {
-                return Some("the shown-map own-BASE openings exceed the code tail");
+        if self.shared_stages.is_empty() {
+            if shared_base + own_base > self.code.r {
+                return Some("the Omega shared and own-BASE openings exceed the code tail");
             }
-        }
-        if shared_base + own_base > self.code.r {
-            return Some("the Omega shared and own-BASE openings exceed the code tail");
-        }
-        if shared_base > self.code.r {
-            return Some("the G_u shared-BASE openings exceed the code tail");
-        }
-        if shared_base > self.mask_code.r || own_base > self.mask_code.r {
-            return Some("the fresh-mask BASE openings exceed the mask tail");
+            if shared_base > self.code.r {
+                return Some("the G_u shared-BASE openings exceed the code tail");
+            }
+            if shared_base > self.mask_code.r {
+                return Some("the fresh-mask BASE openings exceed the mask tail");
+            }
+        } else if shared_switch > self.code.r || shared_switch > self.mask_code.r {
+            return Some("the shared stage-0 switch openings exceed a group tail");
         }
         if self.column_budget as u64 > send.table_shape.code.r {
             return Some("the table column budget exceeds the table code tail");
         }
         if let Some(closure) = closure {
-            if closure.slack_openings as u64 + own_base > closure.slack.code.r {
-                return Some("the slack SEND and own-BASE openings exceed the code tail");
+            let own_open = if self.own_stages.is_empty() {
+                own_base
+            } else {
+                own_switch
+            };
+            if closure.slack_openings as u64 + own_open > closure.slack.code.r {
+                return Some("the slack SEND and own openings exceed the code tail");
             }
-            if closure.bits_openings as u64 + own_base > closure.bits.code.r {
-                return Some("the packed-bit SEND and own-BASE openings exceed the code tail");
+            if closure.bits_openings as u64 + own_open > closure.bits.code.r {
+                return Some("the packed-bit SEND and own openings exceed the code tail");
             }
-            if closure.map_openings as u64 + own_base > closure.map.code.r {
-                return Some("the product-map SEND and own-BASE openings exceed the code tail");
+            if closure.map_openings as u64 + own_open > closure.map.code.r {
+                return Some("the product-map SEND and own openings exceed the code tail");
             }
-            if closure.mask.openings as u64 + own_base > closure.mask.mask_code.r {
-                return Some("the closure-mask SEND and own-BASE openings exceed the mask tail");
+            if closure.mask.openings as u64 + own_open > closure.mask.mask_code.r {
+                return Some("the closure-mask SEND and own openings exceed the mask tail");
             }
         }
         if !self.shared_stages.is_empty() || !self.own_stages.is_empty() {
@@ -4385,6 +4435,58 @@ impl HiddenProximityPlan {
             }
             if proximity_iopp_plan(self, send, closure, ProximityGroupRole::Own).is_err() {
                 return Some("the own IOPP chain cannot be derived from the trusted plan");
+            }
+        }
+        if self.planner_checked {
+            let own = &self.own_stages;
+            if own.len() != 2
+                || own[0].main != self.code
+                || own[0].mask != self.mask_code
+                || own[0].k == 0
+                || own[0].h > own[0].k
+                || own[0].samples != 1
+                || own[1].k != 0
+                || own[1].h != 0
+                || own[1].samples != 1
+            {
+                return Some("the planner-checked own stage list is not the two-stage shape");
+            }
+            let mut max_zero = self.code.r.min(self.mask_code.r);
+            max_zero = max_zero
+                .checked_sub(send.openings_per_oracle as u64)
+                .unwrap_or(0);
+            if let Some(index) = &send.index_mask {
+                let room = index.mask_code.r.saturating_sub(index.openings as u64);
+                max_zero = max_zero.min(room);
+            }
+            if let Some(closure) = closure {
+                let room = closure
+                    .mask
+                    .mask_code
+                    .r
+                    .saturating_sub(closure.mask.openings as u64);
+                max_zero = max_zero.min(room);
+            }
+            let planned = match crate::proof::proximity_planner::plan_own_two_stage(
+                self.code,
+                self.mask_code,
+                own[1].main,
+                own[1].mask,
+                own[0].k,
+                own[0].h,
+                max_zero as usize,
+            ) {
+                Ok(planned) => planned,
+                Err(_) => return Some("the trusted planner rejects the own two-stage stage list"),
+            };
+            if own[0].positions != planned.stage_zero_positions
+                || own[0].work_bits != planned.stage_zero_work_bits
+                || own[1].positions != planned.last_positions
+                || own[1].main.r != planned.last_main_r
+                || own[1].mask.r != planned.last_mask_r
+                || self.own_base_positions != planned.last_positions
+            {
+                return Some("the own stage list differs from the trusted planner");
             }
         }
         if self.shared_mask_tree.fault().is_some() || self.own_mask_tree.fault().is_some() {
@@ -12457,6 +12559,7 @@ mod merged_tests {
                 own_base_positions: 2,
                 shared_stages: Vec::new(),
                 own_stages: Vec::new(),
+                planner_checked: false,
             },
             output_relation: None,
             closure: None,
@@ -12615,6 +12718,45 @@ mod merged_tests {
         match &mut tampered.second.tail {
             ProximityTail::Stages(proof) => {
                 proof.switches.pop();
+            }
+            ProximityTail::Single { .. } => panic!("the fixture is staged"),
+        }
+        assert!(
+            verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &tampered).is_err()
+        );
+        // The shared group's old mask is the trusted layout's zero: an
+        // old-mask opening is rejected at the final verifier.
+        let mut tampered = messages.clone();
+        match &mut tampered.shared.tail {
+            ProximityTail::Stages(proof) => {
+                proof.switches[0].old_mask_opening =
+                    Some(proof.switches[0].fresh_opening.clone());
+            }
+            ProximityTail::Single { .. } => panic!("the fixture is staged"),
+        }
+        assert!(
+            verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &tampered).is_err()
+        );
+        // The own group's old mask comes from its committed members: an
+        // old-mask opening is rejected at the final verifier.
+        let mut tampered = messages.clone();
+        match &mut tampered.second.tail {
+            ProximityTail::Stages(proof) => {
+                proof.switches[0].old_mask_opening =
+                    Some(proof.switches[0].fresh_opening.clone());
+            }
+            ProximityTail::Single { .. } => panic!("the fixture is staged"),
+        }
+        assert!(
+            verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &tampered).is_err()
+        );
+        // The stage-0 fresh mask is a separate object: a changed fresh
+        // opening is rejected at the final verifier.
+        let mut tampered = messages.clone();
+        match &mut tampered.second.tail {
+            ProximityTail::Stages(proof) => {
+                proof.switches[0].fresh_opening.columns[0].symbols[0] =
+                    fp_from_signed_word(0x2345_6789);
             }
             ProximityTail::Single { .. } => panic!("the fixture is staged"),
         }

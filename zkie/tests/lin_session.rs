@@ -768,7 +768,7 @@ fn selected_gpt2_output_head_request_session() {
         column_budget: COLUMN_DRAWS,
         column_work_bits: COLUMN_WORK_BITS,
         shared_base_positions: 2,
-        own_base_positions: 2,
+        own_base_positions: 259,
         shared_stages: vec![
             IoppStagePlan {
                 main: code,
@@ -789,35 +789,46 @@ fn selected_gpt2_output_head_request_session() {
                 work_bits: 0,
             },
         ],
-        own_stages: vec![
-            IoppStagePlan {
-                main: code,
-                mask: mask_code,
-                k: 14,
-                h: 2,
-                positions: 2,
-                samples: 1,
-                work_bits: 0,
-            },
-            IoppStagePlan {
-                main: build_code_plan(17, 8, 256).unwrap(),
-                mask: build_code_plan(17, 16, 256).unwrap(),
-                k: 13,
-                h: 13,
-                positions: 2,
-                samples: 1,
-                work_bits: 0,
-            },
-            IoppStagePlan {
-                main: build_code_plan(17, 8, 256).unwrap(),
-                mask: build_code_plan(17, 1_024, 256).unwrap(),
-                k: 0,
-                h: 0,
-                positions: 2,
-                samples: 1,
-                work_bits: 0,
-            },
-        ],
+        own_stages: {
+            let mut stages = vec![
+                IoppStagePlan {
+                    main: code,
+                    mask: mask_code,
+                    k: 14,
+                    h: 2,
+                    positions: 254,
+                    samples: 1,
+                    work_bits: 24,
+                },
+                IoppStagePlan {
+                    main: build_code_plan(17, 65_536, 259).unwrap(),
+                    mask: build_code_plan(17, 16_384, 259).unwrap(),
+                    k: 0,
+                    h: 0,
+                    positions: 259,
+                    samples: 1,
+                    work_bits: 0,
+                },
+            ];
+            if env::var_os("ZKIE_SESSION_THREE_STAGE").is_some() {
+                stages.insert(
+                    1,
+                    IoppStagePlan {
+                        main: build_code_plan(17, 8, 256).unwrap(),
+                        mask: build_code_plan(17, 16, 256).unwrap(),
+                        k: 13,
+                        h: 13,
+                        positions: 254,
+                        samples: 1,
+                        work_bits: 24,
+                    },
+                );
+                stages[2].main = build_code_plan(17, 8, 259).unwrap();
+                stages[2].mask = build_code_plan(17, 1_024, 259).unwrap();
+            }
+            stages
+        },
+        planner_checked: env::var_os("ZKIE_SESSION_THREE_STAGE").is_none(),
     };
     let activation_salts: Vec<Vec<u8>> = (0..OUTPUT_HEAD_POSITIONS)
         .map(|position| vec![(position as u8).wrapping_mul(11) ^ 0x3C; SALT])
@@ -1340,6 +1351,18 @@ fn selected_gpt2_output_head_request_session() {
                 .expect("reserve an oracle material stream");
         };
 
+        let own_ledger_positions = setup
+            .proximity
+            .own_stages
+            .first()
+            .map(|stage| stage.positions)
+            .unwrap_or(setup.proximity.own_base_positions);
+        let shared_ledger_positions = setup
+            .proximity
+            .shared_stages
+            .first()
+            .map(|stage| stage.positions)
+            .unwrap_or(setup.proximity.shared_base_positions);
         let activation_root = activation_commitment.root();
         let activation_oracle = ledger_oracle(
             OracleKind::Activation,
@@ -1399,7 +1422,7 @@ fn selected_gpt2_output_head_request_session() {
             reserve(
                 oracle,
                 OracleBudget::new(
-                    (setup.send.openings_per_oracle + setup.proximity.own_base_positions) as u64,
+                    (setup.send.openings_per_oracle as usize + own_ledger_positions) as u64,
                     setup.send.w.code.r,
                 )
                 .expect("W budget"),
@@ -1426,7 +1449,7 @@ fn selected_gpt2_output_head_request_session() {
         reserve(
             index_oracle,
             OracleBudget::new(
-                (index_plan.openings + setup.proximity.own_base_positions) as u64,
+                (index_plan.openings as usize + own_ledger_positions) as u64,
                 index_plan.mask_code.r,
             )
             .expect("index-mask budget")
@@ -1449,7 +1472,7 @@ fn selected_gpt2_output_head_request_session() {
         reserve(
             dot_oracle,
             OracleBudget::new(
-                setup.proximity.own_base_positions as u64,
+                own_ledger_positions as u64,
                 dot_plan.shape.code.r,
             )
             .expect("shown-map budget"),
@@ -1467,7 +1490,7 @@ fn selected_gpt2_output_head_request_session() {
         reserve(
             omega_oracle,
             OracleBudget::new(
-                (setup.proximity.shared_base_positions + setup.proximity.own_base_positions) as u64,
+                (shared_ledger_positions + own_ledger_positions) as u64,
                 omega_plan.u.code.r,
             )
             .expect("Omega budget"),
@@ -1485,7 +1508,7 @@ fn selected_gpt2_output_head_request_session() {
         reserve(
             gu_oracle,
             OracleBudget::new(
-                setup.proximity.shared_base_positions as u64,
+                shared_ledger_positions as u64,
                 gu_plan.u.code.r,
             )
             .expect("G_u budget"),
@@ -1506,7 +1529,7 @@ fn selected_gpt2_output_head_request_session() {
         reserve(
             fresh_shared_oracle,
             OracleBudget::new(
-                setup.proximity.shared_base_positions as u64,
+                shared_ledger_positions as u64,
                 setup.proximity.mask_code.r,
             )
             .expect("shared fresh-mask budget"),
@@ -1526,7 +1549,7 @@ fn selected_gpt2_output_head_request_session() {
         reserve(
             fresh_own_oracle,
             OracleBudget::new(
-                setup.proximity.own_base_positions as u64,
+                own_ledger_positions as u64,
                 setup.proximity.mask_code.r,
             )
             .expect("own fresh-mask budget"),
@@ -1631,7 +1654,7 @@ fn selected_gpt2_output_head_request_session() {
                 reserve(
                     oracle,
                     OracleBudget::new(
-                        (openings + setup.proximity.own_base_positions) as u64,
+                        (openings as usize + own_ledger_positions) as u64,
                         shape.code.r,
                     )
                     .expect("closure value budget"),
@@ -1655,7 +1678,7 @@ fn selected_gpt2_output_head_request_session() {
         reserve(
             closure_mask_oracle,
             OracleBudget::new(
-                (closure_mask_plan.openings + setup.proximity.own_base_positions) as u64,
+                (closure_mask_plan.openings as usize + own_ledger_positions) as u64,
                 closure_mask_plan.mask_code.r,
             )
             .expect("closure-mask budget")

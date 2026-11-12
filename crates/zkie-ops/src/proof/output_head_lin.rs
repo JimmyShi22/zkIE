@@ -1256,6 +1256,10 @@ pub(crate) fn merged_plan(
     // describe.
     proximity.shared_stages.clear();
     proximity.own_stages.clear();
+    proximity.planner_checked = false;
+    // The diagnostic group has no staged BASE; it keeps the two-position
+    // single-stage basis, not the staged own BASE count.
+    proximity.own_base_positions = 2;
     let plan = HiddenLinPlan {
         send,
         output: HiddenOutputShape {
@@ -1896,6 +1900,7 @@ mod tests {
             own_base_positions: 2,
             shared_stages: Vec::new(),
             own_stages: Vec::new(),
+            planner_checked: false,
         }
     }
 
