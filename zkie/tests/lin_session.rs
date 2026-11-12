@@ -332,7 +332,7 @@ fn selected_gpt2_output_head_request_session() {
     use zkie_ops::proof::hidden_send_session::{
         ActivationShape, CommittedActivation, DotMapPlan, HiddenLinPlan, HiddenOutputShape,
         HiddenProximityPlan, HiddenSendPlan, HiddenTableProver, IndexMaskPlan,
-        MaskEntryAllocation, WShape,
+        IoppStagePlan, MaskEntryAllocation, WShape,
     };
     use zkie_ops::proof::model_commitment::verify_shared_trace_outputs;
     use zkie_ops::proof::output_head_lin::diagnostic::{
@@ -769,6 +769,55 @@ fn selected_gpt2_output_head_request_session() {
         column_work_bits: COLUMN_WORK_BITS,
         shared_base_positions: 2,
         own_base_positions: 2,
+        shared_stages: vec![
+            IoppStagePlan {
+                main: code,
+                mask: mask_code,
+                k: 2,
+                h: 0,
+                positions: 2,
+                samples: 1,
+                work_bits: 0,
+            },
+            IoppStagePlan {
+                main: build_code_plan(17, OUTPUT_HEAD_COLUMNS as u64, 256).unwrap(),
+                mask: build_code_plan(17, 16_384, 256).unwrap(),
+                k: 0,
+                h: 0,
+                positions: 2,
+                samples: 1,
+                work_bits: 0,
+            },
+        ],
+        own_stages: vec![
+            IoppStagePlan {
+                main: code,
+                mask: mask_code,
+                k: 13,
+                h: 2,
+                positions: 2,
+                samples: 1,
+                work_bits: 0,
+            },
+            IoppStagePlan {
+                main: build_code_plan(17, 8, 256).unwrap(),
+                mask: build_code_plan(17, 16, 256).unwrap(),
+                k: 13,
+                h: 13,
+                positions: 2,
+                samples: 1,
+                work_bits: 0,
+            },
+            IoppStagePlan {
+                main: build_code_plan(17, 8, 256).unwrap(),
+                mask: build_code_plan(17, 1_024, 256).unwrap(),
+                k: 0,
+                h: 0,
+                positions: 2,
+                samples: 1,
+                work_bits: 0,
+            },
+        ],
     };
     let activation_salts: Vec<Vec<u8>> = (0..OUTPUT_HEAD_POSITIONS)
         .map(|position| vec![(position as u8).wrapping_mul(11) ^ 0x3C; SALT])

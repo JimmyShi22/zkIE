@@ -1882,6 +1882,8 @@ mod tests {
             column_work_bits: 0,
             shared_base_positions: 2,
             own_base_positions: 2,
+            shared_stages: Vec::new(),
+            own_stages: Vec::new(),
         }
     }
 

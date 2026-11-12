@@ -4156,6 +4156,89 @@ impl HiddenOutputShape {
     }
 }
 
+/// One stage of the trusted multi-stage IOPP chain. The first stage is the
+/// caller's group; each later stage is made by a code switch. The fields are
+/// plan data, never proof bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IoppStagePlan {
+    pub main: CodeParams,
+    pub mask: CodeParams,
+    pub k: u32,
+    pub h: u32,
+    pub positions: usize,
+    pub samples: u32,
+    pub work_bits: u8,
+}
+
+fn iopp_stage_fault(
+    stages: &[IoppStagePlan],
+    first_main: CodeParams,
+    first_mask: CodeParams,
+    base_positions: usize,
+) -> Option<&'static str> {
+    if stages.len() < 2 {
+        return Some("a multi-stage IOPP needs at least two stages");
+    }
+    for (index, stage) in stages.iter().enumerate() {
+        if build_code_plan(stage.main.log_n, stage.main.ell, stage.main.r).is_err()
+            || build_code_plan(stage.mask.log_n, stage.mask.ell, stage.mask.r).is_err()
+        {
+            return Some("an IOPP stage code is not a code");
+        }
+        if !stage.main.ell.is_power_of_two() || !stage.mask.ell.is_power_of_two() {
+            return Some("an IOPP stage message length is not a power of two");
+        }
+        if stage.mask.log_n > stage.main.log_n {
+            return Some("an IOPP mask code is longer than its main code");
+        }
+        if stage.samples != 1 {
+            return Some("an IOPP stage sample count is not one");
+        }
+        if stage.positions as u64 > stage.main.r || stage.positions as u64 > stage.mask.r {
+            return Some("an IOPP stage position count exceeds a code tail");
+        }
+        let last = index + 1 == stages.len();
+        if last {
+            if stage.k != 0 || stage.h != 0 {
+                return Some("the last IOPP stage is not k=h=0");
+            }
+            if stage.positions != base_positions {
+                return Some("the last IOPP stage positions differ from the base positions");
+            }
+        } else {
+            if stage.k < 1 || stage.h > stage.k {
+                return Some("an IOPP non-last stage has k/h out of range");
+            }
+            if stage.mask.ell < 2 * stage.k as u64 + 1 - stage.h as u64 {
+                return Some("an IOPP mask message is too short for the fold hiding polynomial");
+            }
+        }
+        if index == 0 {
+            if stage.main != first_main || stage.mask != first_mask {
+                return Some("the first IOPP stage codes differ from the group codes");
+            }
+        } else {
+            let prev = &stages[index - 1];
+            let folded = match stage.main.ell.checked_shl(stage.k) {
+                Some(value) => value,
+                None => return Some("an IOPP stage shift overflows"),
+            };
+            if folded != prev.main.ell {
+                return Some("the IOPP folded main message does not fill the next rows");
+            }
+            let room = match stage.mask.ell.checked_shl(stage.h) {
+                Some(value) => value,
+                None => return Some("an IOPP mask shift overflows"),
+            };
+            let carried = 2 * prev.mask.ell + prev.main.r + 2 * prev.mask.r + 1;
+            if room < carried {
+                return Some("the IOPP mask rows have no room for the fold masks and randomness");
+            }
+        }
+    }
+    None
+}
+
 /// The trusted shapes of the two proximity tests and of the folded table
 /// message. All members of both groups share one main code and one mask code so
 /// that the split path is not needed; a shape that names other codes
@@ -4182,6 +4265,10 @@ pub struct HiddenProximityPlan {
     pub column_work_bits: u8,
     pub shared_base_positions: usize,
     pub own_base_positions: usize,
+    /// The trusted multi-stage IOPP stage lists for the two groups. Empty
+    /// keeps the current single-stage path.
+    pub shared_stages: Vec<IoppStagePlan>,
+    pub own_stages: Vec<IoppStagePlan>,
 }
 
 impl HiddenProximityPlan {
@@ -4278,6 +4365,26 @@ impl HiddenProximityPlan {
             }
             if closure.mask.openings as u64 + own_base > closure.mask.mask_code.r {
                 return Some("the closure-mask SEND and own-BASE openings exceed the mask tail");
+            }
+        }
+        if !self.shared_stages.is_empty() {
+            if let Some(message) = iopp_stage_fault(
+                &self.shared_stages,
+                self.code,
+                self.mask_code,
+                self.shared_base_positions,
+            ) {
+                return Some(message);
+            }
+        }
+        if !self.own_stages.is_empty() {
+            if let Some(message) = iopp_stage_fault(
+                &self.own_stages,
+                self.code,
+                self.mask_code,
+                self.own_base_positions,
+            ) {
+                return Some(message);
             }
         }
         if self.shared_mask_tree.fault().is_some() || self.own_mask_tree.fault().is_some() {
@@ -12039,6 +12146,8 @@ mod merged_tests {
                 column_work_bits: 0,
                 shared_base_positions: 2,
                 own_base_positions: 2,
+                shared_stages: Vec::new(),
+                own_stages: Vec::new(),
             },
             output_relation: None,
             closure: None,
@@ -13193,3 +13302,80 @@ mod rework7_joint_tests {
     }
 }
 
+
+
+#[cfg(test)]
+mod iopp_stage_plan_tests {
+    use super::*;
+
+    fn stage(main: CodeParams, mask: CodeParams, k: u32, h: u32, positions: usize) -> IoppStagePlan {
+        IoppStagePlan {
+            main,
+            mask,
+            k,
+            h,
+            positions,
+            samples: 1,
+            work_bits: 0,
+        }
+    }
+
+    #[test]
+    fn actual_shared_and_own_stage_lists_are_legal() {
+        let main = build_code_plan(17, 65_536, 8_192).unwrap();
+        let mask = build_code_plan(17, 512, 256).unwrap();
+        let shared = vec![
+            stage(main, mask, 2, 0, 2),
+            stage(
+                build_code_plan(17, 65_536, 256).unwrap(),
+                build_code_plan(17, 16_384, 256).unwrap(),
+                0,
+                0,
+                2,
+            ),
+        ];
+        assert!(iopp_stage_fault(&shared, main, mask, 2).is_none());
+        let own = vec![
+            stage(main, mask, 13, 2, 2),
+            stage(
+                build_code_plan(17, 8, 256).unwrap(),
+                build_code_plan(17, 16, 256).unwrap(),
+                13,
+                13,
+                2,
+            ),
+            stage(
+                build_code_plan(17, 8, 256).unwrap(),
+                build_code_plan(17, 1_024, 256).unwrap(),
+                0,
+                0,
+                2,
+            ),
+        ];
+        assert!(iopp_stage_fault(&own, main, mask, 2).is_none());
+    }
+
+    #[test]
+    fn bad_stage_chains_are_rejected() {
+        let main = build_code_plan(17, 65_536, 8_192).unwrap();
+        let mask = build_code_plan(17, 512, 256).unwrap();
+        // Wrong first code.
+        let wrong_first = vec![
+            stage(build_code_plan(17, 32_768, 8_192).unwrap(), mask, 2, 0, 2),
+            stage(main, build_code_plan(17, 16_384, 256).unwrap(), 0, 0, 2),
+        ];
+        assert!(iopp_stage_fault(&wrong_first, main, mask, 2).is_some());
+        // Wrong adjacent folded length.
+        let wrong_fold = vec![
+            stage(main, mask, 2, 0, 2),
+            stage(build_code_plan(17, 8_192, 256).unwrap(), build_code_plan(17, 16_384, 256).unwrap(), 0, 0, 2),
+        ];
+        assert!(iopp_stage_fault(&wrong_fold, main, mask, 2).is_some());
+        // Last stage not k=h=0.
+        let wrong_last = vec![
+            stage(main, mask, 2, 0, 2),
+            stage(build_code_plan(17, 65_536, 256).unwrap(), build_code_plan(17, 16_384, 256).unwrap(), 1, 0, 2),
+        ];
+        assert!(iopp_stage_fault(&wrong_last, main, mask, 2).is_some());
+    }
+}
