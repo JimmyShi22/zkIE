@@ -1,0 +1,5 @@
+1e3be78f Add the byte lookup driver
+ crates/zkie-ops/src/proof/lookup.rs      | 1201 ++++++++++++++++++++++++++++++
+ crates/zkie-ops/src/proof/mod.rs         |    1 +
+ crates/zkie-ops/src/proof/psc_general.rs |   28 +-
+ 3 files changed, 1220 insertions(+), 10 deletions(-)
