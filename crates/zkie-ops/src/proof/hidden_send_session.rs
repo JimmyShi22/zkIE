@@ -4732,7 +4732,7 @@ impl HiddenLinPlan {
     }
 }
 
-fn put_code_public(writer: &mut CanonicalWriter, code: CodeParams) {
+pub(crate) fn put_code_public(writer: &mut CanonicalWriter, code: CodeParams) {
     writer.put_u64(code.log_n as u64);
     writer.put_u64(code.ell);
     writer.put_u64(code.r);
@@ -10388,7 +10388,7 @@ fn get_digest_vec_public(reader: &mut CanonicalReader<'_>, max: usize) -> Result
     Ok(values)
 }
 
-fn put_runtime_opening(writer: &mut CanonicalWriter, opening: &RuntimeTreeOpening) {
+pub(crate) fn put_runtime_opening(writer: &mut CanonicalWriter, opening: &RuntimeTreeOpening) {
     writer.put_u64(opening.positions.len() as u64);
     for position in &opening.positions {
         writer.put_u64(*position);
@@ -10408,7 +10408,7 @@ fn put_runtime_opening(writer: &mut CanonicalWriter, opening: &RuntimeTreeOpenin
     }
 }
 
-fn get_runtime_opening(
+pub(crate) fn get_runtime_opening(
     reader: &mut CanonicalReader<'_>,
     max: usize,
 ) -> Result<RuntimeTreeOpening> {
@@ -10443,7 +10443,7 @@ fn get_runtime_opening(
     })
 }
 
-fn put_fold_start(writer: &mut CanonicalWriter, message: &FoldStartMessage) {
+pub(crate) fn put_fold_start(writer: &mut CanonicalWriter, message: &FoldStartMessage) {
     writer.put_u64(message.id);
     writer.put_u64(message.claimed_group);
     writer.put_u64(message.tree_number);
@@ -10455,7 +10455,7 @@ fn put_fold_start(writer: &mut CanonicalWriter, message: &FoldStartMessage) {
     writer.put_fp3(&message.sum);
 }
 
-fn get_fold_start(reader: &mut CanonicalReader<'_>) -> Result<FoldStartMessage> {
+pub(crate) fn get_fold_start(reader: &mut CanonicalReader<'_>) -> Result<FoldStartMessage> {
     let id = reader.get_u64()?;
     let claimed_group = reader.get_u64()?;
     let tree_number = reader.get_u64()?;
@@ -10480,7 +10480,7 @@ fn get_fold_start(reader: &mut CanonicalReader<'_>) -> Result<FoldStartMessage> 
     })
 }
 
-fn get_code_public(reader: &mut CanonicalReader<'_>) -> Result<CodeParams> {
+pub(crate) fn get_code_public(reader: &mut CanonicalReader<'_>) -> Result<CodeParams> {
     let log_n = u32::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
     let ell = reader.get_u64()?;
     let r = reader.get_u64()?;

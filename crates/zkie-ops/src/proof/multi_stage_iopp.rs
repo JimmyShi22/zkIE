@@ -14,12 +14,14 @@
 //! mask tree for the first switch, and the previous switch's committed message
 //! for later switches.
 
+use std::sync::Arc;
+
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
 use zkie_engine::pcs::request::chain::{Chain, KIND_ALGEBRAIC, KIND_EPSILON};
 use zkie_engine::pcs::request::code::CodeParams;
 use zkie_engine::pcs::request::cs_stage::{
-    switch_tree_plan_multi_at, SwitchTarget, SwitchedClaims, SwitchedRows,
+    switch_tree_plan_multi_at, Cut, CutPart, SwitchTarget, SwitchedClaims, SwitchedRows,
 };
 use zkie_engine::pcs::request::field::{Fp3, E_DEGREE};
 use zkie_engine::pcs::request::fold::{
@@ -36,6 +38,8 @@ use zkie_engine::pcs::request::relation::foldeq_weights;
 use zkie_engine::pcs::request::runtime_tree::{
     MaskTree, MaskTreePlan, RuntimeTree, RuntimeTreeOpening, RuntimeTreePlan,
 };
+use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
+use zkie_core::common::codec::DecodeLimits;
 
 use crate::proof::base_final_session::{fold_identity, FoldBasis, FoldMember};
 use crate::proof::base_last_session::{
@@ -44,7 +48,10 @@ use crate::proof::base_last_session::{
 };
 use crate::proof::cs_multi_session::{CsMultiProver, CsMultiSession, OldMaskSource};
 use crate::proof::fold_handoff::{FoldHandoff, FoldHandoffAnchor};
-use crate::proof::hidden_send_session::{iopp_stage_fault, IoppStagePlan};
+use crate::proof::hidden_send_session::{
+    get_code_public, get_fold_start, get_runtime_opening, iopp_stage_fault, put_code_public,
+    put_fold_start, put_runtime_opening, IoppStagePlan,
+};
 
 /// The leaf class of the mask-only trees this loop commits. It is distinct
 /// from the switched message class and from the caller's BASE star class.
@@ -52,6 +59,15 @@ pub const IOPP_MASK_LEAF_CLASS: u32 = 3;
 
 /// The leaf class of a switched oracle message tree.
 pub const IOPP_SWITCH_LEAF_CLASS: u32 = 7;
+
+/// The decode bound of one runtime opening: positions, columns, symbols and
+/// supplied digests each decode within this count. The session still checks
+/// every opening against the trusted tree and drawn positions.
+const IOPP_OPENING_DECODE_BOUND: usize = 1 << 20;
+
+/// The decode bound of one switch's old-member opening count. The session
+/// rejects a count that disagrees with the trusted group layout.
+const IOPP_MEMBER_DECODE_BOUND: usize = 1 << 12;
 
 /// One stage's trusted code and row-variable shape.
 ///
@@ -395,12 +411,13 @@ impl<'a> IoppSwitchMembers<'a> {
 }
 
 /// The prover's stage 0 input: the BAT/FOLD handoff, its authentication basis,
-/// the folded rows, the member commitments and the two mask trees.
+/// the folded rows, the member commitments and the two mask trees. The member
+/// trees are shared with the session's own commitments, never copied.
 pub struct IoppStageZero {
     pub handoff: FoldHandoff,
     pub basis: FoldBasis,
     pub rows: SingleRows,
-    pub member_trees: Vec<RuntimeTree>,
+    pub member_trees: Vec<Arc<RuntimeTree>>,
     pub old_mask_tree: Option<MaskTree>,
     pub fresh_tree: MaskTree,
 }
@@ -467,6 +484,207 @@ pub struct IoppProof {
     pub base: Vec<u8>,
 }
 
+impl IoppProof {
+    /// Encodes the proof against the trusted chain. The switch count, every
+    /// target field, the stage FOLD presence and the round count come from the
+    /// plan; a proof that disagrees is rejected before any byte is written.
+    pub fn encode(&self, plan: &IoppChain) -> Result<Vec<u8>> {
+        let switch_count = plan.stages.len() - 1;
+        if self.switches.len() != switch_count {
+            return Err(Error::ShapeMismatch);
+        }
+        let last_index = plan.stages.len() - 1;
+        let mut writer = CanonicalWriter::new();
+        for (index, record) in self.switches.iter().enumerate() {
+            let stage_index = index + 1;
+            let target = plan.stages[stage_index]
+                .target
+                .ok_or(Error::InvalidConfig)?;
+            if record.target != target {
+                return Err(Error::StatementMismatch);
+            }
+            put_switch_target(&mut writer, &record.target);
+            writer.put_digest(&record.identity);
+            writer.put_digest(&record.declared_root);
+            writer.put_fp3(&record.sample_answer);
+            writer.put_u64(record.nonce);
+            writer.put_u64(record.member_openings.len() as u64);
+            for opening in &record.member_openings {
+                put_runtime_opening(&mut writer, opening);
+            }
+            put_runtime_opening(&mut writer, &record.fresh_opening);
+            match &record.old_mask_opening {
+                Some(opening) => {
+                    writer.put_u64(1);
+                    put_runtime_opening(&mut writer, opening);
+                }
+                None => writer.put_u64(0),
+            }
+            if stage_index == last_index {
+                if record.stage_fold.is_some() {
+                    return Err(Error::StatementMismatch);
+                }
+            } else {
+                let fold = plan.stages[stage_index]
+                    .fold
+                    .as_ref()
+                    .ok_or(Error::InvalidConfig)?;
+                let message = record
+                    .stage_fold
+                    .as_ref()
+                    .ok_or(Error::StatementMismatch)?;
+                if message.rounds.len() != fold.shape.k as usize {
+                    return Err(Error::ShapeMismatch);
+                }
+                writer.put_u64(fold.shape.k as u64);
+                put_fold_start(&mut writer, &message.start);
+                for (c0, c2) in &message.rounds {
+                    writer.put_fp3(c0);
+                    writer.put_fp3(c2);
+                }
+            }
+        }
+        writer.put_bytes(&self.base);
+        Ok(writer.into_bytes())
+    }
+
+    /// Decodes the proof against the trusted chain. Every target is checked
+    /// field by field against the plan before its value is kept, the stage FOLD
+    /// message is expected exactly on the planned stages with the planned round
+    /// count, and trailing bytes are rejected.
+    pub fn decode(plan: &IoppChain, bytes: &[u8]) -> Result<Self> {
+        let switch_count = plan.stages.len() - 1;
+        let last_index = plan.stages.len() - 1;
+        let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
+        let mut switches = Vec::with_capacity(switch_count);
+        for index in 0..switch_count {
+            let stage_index = index + 1;
+            let expected = plan.stages[stage_index]
+                .target
+                .ok_or(Error::InvalidConfig)?;
+            let target = get_switch_target(&mut reader, &expected)?;
+            let identity = reader.get_digest()?;
+            let declared_root = reader.get_digest()?;
+            let sample_answer = reader.get_fp3()?;
+            let nonce = reader.get_u64()?;
+            let member_count =
+                usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+            if member_count == 0 || member_count > IOPP_MEMBER_DECODE_BOUND {
+                return Err(Error::ResourceLimit);
+            }
+            let mut member_openings = Vec::with_capacity(member_count);
+            for _ in 0..member_count {
+                member_openings.push(get_runtime_opening(
+                    &mut reader,
+                    IOPP_OPENING_DECODE_BOUND,
+                )?);
+            }
+            let fresh_opening =
+                get_runtime_opening(&mut reader, IOPP_OPENING_DECODE_BOUND)?;
+            let old_mask_opening = match reader.get_u64()? {
+                0 => None,
+                1 => Some(get_runtime_opening(
+                    &mut reader,
+                    IOPP_OPENING_DECODE_BOUND,
+                )?),
+                _ => return Err(Error::InvalidEncoding),
+            };
+            let stage_fold = if stage_index == last_index {
+                None
+            } else {
+                let fold = plan.stages[stage_index]
+                    .fold
+                    .as_ref()
+                    .ok_or(Error::InvalidConfig)?;
+                let rounds =
+                    usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+                if rounds != fold.shape.k as usize {
+                    return Err(Error::ShapeMismatch);
+                }
+                let start = get_fold_start(&mut reader)?;
+                let mut values = Vec::with_capacity(rounds);
+                for _ in 0..rounds {
+                    values.push((reader.get_fp3()?, reader.get_fp3()?));
+                }
+                Some(IoppStageFoldMessage {
+                    start,
+                    rounds: values,
+                })
+            };
+            switches.push(IoppSwitchMessage {
+                target,
+                identity,
+                declared_root,
+                sample_answer,
+                nonce,
+                member_openings,
+                fresh_opening,
+                old_mask_opening,
+                stage_fold,
+            });
+        }
+        let base = reader.get_bytes()?.to_vec();
+        reader.finish()?;
+        Ok(Self { switches, base })
+    }
+}
+
+/// Writes one switch target field by field.
+fn put_switch_target(writer: &mut CanonicalWriter, target: &SwitchTarget) {
+    put_code_public(writer, target.code);
+    put_code_public(writer, target.mask_code);
+    writer.put_u64(target.main_rows);
+    writer.put_u64(target.mask_rows);
+    writer.put_u64(target.answers as u64);
+    put_cut(writer, target.main);
+    put_cut(writer, target.rest);
+}
+
+/// Reads one switch target and rejects it unless it equals the trusted target.
+fn get_switch_target(
+    reader: &mut CanonicalReader<'_>,
+    expected: &SwitchTarget,
+) -> Result<SwitchTarget> {
+    let target = SwitchTarget {
+        code: get_code_public(reader)?,
+        mask_code: get_code_public(reader)?,
+        main_rows: reader.get_u64()?,
+        mask_rows: reader.get_u64()?,
+        answers: u32::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?,
+        main: get_cut(reader)?,
+        rest: get_cut(reader)?,
+    };
+    if target != *expected {
+        return Err(Error::StatementMismatch);
+    }
+    Ok(target)
+}
+
+fn put_cut(writer: &mut CanonicalWriter, cut: Cut) {
+    let part = match cut.part {
+        CutPart::Main => 0,
+        CutPart::Mask => 1,
+    };
+    writer.put_u64(part);
+    writer.put_u64(cut.bits as u64);
+    writer.put_u64(cut.first_row);
+}
+
+fn get_cut(reader: &mut CanonicalReader<'_>) -> Result<Cut> {
+    let part = match reader.get_u64()? {
+        0 => CutPart::Main,
+        1 => CutPart::Mask,
+        _ => return Err(Error::InvalidEncoding),
+    };
+    let bits = u32::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+    let first_row = reader.get_u64()?;
+    Ok(Cut {
+        part,
+        bits,
+        first_row,
+    })
+}
+
 struct StageFoldOutcome {
     output: FoldOutput,
     chain: Chain,
@@ -518,7 +736,7 @@ pub fn prove_multi_stage_iopp(
         .zip(basis.members.iter())
         .map(|(tree, member)| IoppInitialMember {
             oracle: member.oracle,
-            tree,
+            tree: tree.as_ref(),
         })
         .collect();
     let mut handoff = handoff;
@@ -862,7 +1080,7 @@ fn validate_stage_zero(
     basis: &FoldBasis,
     rows: Option<&SingleRows>,
     old_mask_tree: Option<&MaskTree>,
-    member_trees: Option<&[RuntimeTree]>,
+    member_trees: Option<&[Arc<RuntimeTree>]>,
     fresh_plan: MaskTreePlan,
     fresh_root: Digest,
 ) -> Result<()> {
@@ -1801,7 +2019,7 @@ mod tests {
             handoff: handoff.clone(),
             basis: basis.clone(),
             rows,
-            member_trees: vec![tree],
+            member_trees: vec![Arc::new(tree)],
             old_mask_tree: Some(old_tree),
             fresh_tree,
         };
@@ -1960,7 +2178,7 @@ mod tests {
             handoff: handoff.clone(),
             basis: basis.clone(),
             rows,
-            member_trees: vec![tree],
+            member_trees: vec![Arc::new(tree)],
             old_mask_tree: None,
             fresh_tree,
         };
@@ -2055,6 +2273,47 @@ mod tests {
         assert!(proof.switches[1].stage_fold.is_none());
         let verified = verify_multi_stage_iopp(chain(), &plan, zero, &proof).unwrap();
         assert_eq!(verified, seal);
+    }
+
+    #[test]
+    fn proof_codec_round_trips_against_the_plan() {
+        let (plan, proof, seal, zero) = run_proof();
+        let bytes = proof.encode(&plan).unwrap();
+        let decoded = IoppProof::decode(&plan, &bytes).unwrap();
+        assert_eq!(decoded, proof);
+        let verified = verify_multi_stage_iopp(chain(), &plan, zero, &decoded).unwrap();
+        assert_eq!(verified, seal);
+    }
+
+    #[test]
+    fn proof_codec_rejects_truncated_and_trailing_bytes() {
+        let (plan, proof, _, _) = run_proof();
+        let bytes = proof.encode(&plan).unwrap();
+        assert!(IoppProof::decode(&plan, &bytes[..bytes.len() - 1]).is_err());
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(IoppProof::decode(&plan, &trailing).is_err());
+    }
+
+    #[test]
+    fn proof_codec_rejects_missing_and_reordered_stages() {
+        let (plan, mut proof, _, _) = run_proof();
+        let complete = proof.clone();
+        proof.switches.pop();
+        assert!(proof.encode(&plan).is_err());
+        let mut reordered = complete;
+        reordered.switches.swap(0, 1);
+        assert!(reordered.encode(&plan).is_err());
+    }
+
+    #[test]
+    fn proof_codec_rejects_a_target_that_differs_from_the_plan() {
+        let (plan, proof, _, _) = run_proof();
+        let mut bytes = proof.encode(&plan).unwrap();
+        // The first target starts at offset zero; flipping an answer-count bit
+        // makes the decoded target differ from the trusted one.
+        bytes[42] ^= 1;
+        assert!(IoppProof::decode(&plan, &bytes).is_err());
     }
 
     #[test]
