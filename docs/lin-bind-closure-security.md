@@ -745,10 +745,10 @@ actual target sources are:
   coefficients are the public relation coefficients and the public batching
   challenge.
 
-The hidden reduced row `W`/`Y` enters the BAT row `main` coefficients (the
-sampled message values), not the targets. The target values are therefore
-determined by the public table/reader data, the public SEND answers and the
-public statement. This is not an expansion of the approved output boundary:
+The hidden reduced row `W`/`Y` enters the oracle message values (the
+prover's witness), not the targets and not the public BAT relation
+coefficients. The target values are therefore determined by the public
+table/reader data, the public SEND answers and the public statement. This is not an expansion of the approved output boundary:
 the target is a protocol message value derived from public data and masked
 answers, not a new Y-dependent output. If a target were Y-dependent, it would
 be a leak; none of the traced row families is. The handoff target is supplied
