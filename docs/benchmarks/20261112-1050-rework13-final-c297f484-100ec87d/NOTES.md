@@ -92,7 +92,8 @@ reported a main miss of `0.7901314940`. The actual code length is
 `n` symbols), and the RS minimum distance is `n - (ell + r) + 1`. The corrected
 values are `0.3164234164` (main) and `3.424292663e-5` (mask); the candidate
 query count is 155, not 754. The qualitative conclusion (no security bound at
-`t = 2`) is unchanged. The correction is in document commit `6aff57f9`.
+`t = 2`) is unchanged. The correction is in document commit `6aff57f9`; the
+open-items gap entry uses the corrected distance from `b46dcd39`.
 
 ## Open items
 
