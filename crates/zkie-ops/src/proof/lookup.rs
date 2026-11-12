@@ -24,6 +24,9 @@ use zkie_core::error::{Error, Result};
 use zkie_engine::pcs::request::field::Fp3;
 use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
 
+use crate::proof::lookup_messages::{
+    commit_lookup, LookupCommitPlan, LookupMessages, LookupRandomSource, LookupRoots,
+};
 use crate::proof::psc::Weight;
 use crate::proof::psc_general::{
     general_variables, line, prove_general, verify_general, GeneralChallenges, GeneralClaim,
@@ -225,19 +228,11 @@ pub struct ProverMasks {
 }
 
 impl ProverMasks {
-    pub fn new(count: usize, seed: u64) -> Result<Self> {
-        let mut state = seed | 1;
-        let mut values = Vec::with_capacity(count);
-        for _ in 0..count {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            values.push(Fp3::from_u64(state));
-        }
-        Ok(Self {
+    fn from_entries(values: Vec<Fp3>) -> Self {
+        Self {
             values,
             slots: MaskSlots::default(),
-        })
+        }
     }
 
     fn value(&self, slot: usize) -> Result<Fp3> {
@@ -484,9 +479,10 @@ fn equality_variables(point: &[Fp3], plane_count: usize) -> Result<Vec<Weight>> 
 /// Proves the byte lookup for one key vector and its multiplicity bits.
 pub fn prove_lookup(
     plan: &LookupPlan,
+    commit_plan: &LookupCommitPlan,
     witness: &LookupWitness,
     seed: u64,
-) -> Result<(LookupProof, LookupOutcome)> {
+) -> Result<(LookupMessages, LookupProof, LookupOutcome)> {
     plan.validate()?;
     let keys = plan.key_count()?;
     let planes = plan.planes()?;
@@ -494,11 +490,29 @@ pub fn prove_lookup(
     if witness.keys.len() != keys {
         return Err(Error::ShapeMismatch);
     }
+    let mask_entries = mask_count(plan)?;
+    commit_plan.validate(keys, witness.bits.len(), mask_entries)?;
+    let mut random_source = LookupRandomSource::new(seed ^ 0x5A5A_5A5A);
+    let messages = commit_lookup(
+        commit_plan,
+        keys,
+        &witness.keys,
+        &witness.bits,
+        mask_entries,
+        &mut random_source,
+    )?;
     let mut challenges = LookupChallenges::new(seed);
     challenges.absorb(LOOKUP_VERSION, &plan.digest());
+    challenges.absorb(commit_plan.key_oracle, &messages.key_root().0);
+    challenges.absorb(commit_plan.bits_oracle, &messages.bits_root().0);
+    challenges.absorb(commit_plan.mask_oracle, &messages.mask_root.0);
     let alpha = challenges.draw()?;
     let (key_levels, table_levels) = key_and_table_levels(plan, witness, alpha)?;
-    let mut masks = ProverMasks::new(mask_count(plan)?, seed ^ 0xA5A5_A5A5)?;
+    let mut mask_values = Vec::with_capacity(mask_entries);
+    for slot in 0..mask_entries {
+        mask_values.push(messages.mask_entry(commit_plan, slot)?);
+    }
+    let mut masks = ProverMasks::from_entries(mask_values);
     let mut rows_out = Vec::new();
     let table = ByteTable;
 
@@ -706,6 +720,7 @@ pub fn prove_lookup(
     let multiplicity = (coefficients, Fp3::from_u64(keys as u64));
 
     Ok((
+        messages,
         LookupProof {
             tie: tie_proofs,
             key_levels: key_proofs,
@@ -724,14 +739,20 @@ pub fn prove_lookup(
 /// Verifies the lookup messages and returns the same claims and rows.
 pub fn verify_lookup(
     plan: &LookupPlan,
+    commit_plan: &LookupCommitPlan,
+    roots: &LookupRoots,
     proof: &LookupProof,
     seed: u64,
 ) -> Result<LookupOutcome> {
     plan.validate()?;
     let planes = plan.planes()?;
     let table_rows = plan.table_rows()?;
+    commit_plan.validate(plan.key_count()?, planes * table_rows, mask_count(plan)?)?;
     let mut challenges = LookupChallenges::new(seed);
     challenges.absorb(LOOKUP_VERSION, &plan.digest());
+    challenges.absorb(commit_plan.key_oracle, &roots.key.0);
+    challenges.absorb(commit_plan.bits_oracle, &roots.bits.0);
+    challenges.absorb(commit_plan.mask_oracle, &roots.mask.0);
     let alpha = challenges.draw()?;
     let mut slots = MaskSlots::default();
     let mut rows_out = Vec::new();
@@ -1105,6 +1126,11 @@ impl LookupProof {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zkie_core::types::Digest;
+    use zkie_engine::pcs::request::code::build_code_plan;
+    use zkie_engine::pcs::request::runtime_tree::{RuntimeTreePart, RuntimeTreePlan};
+
+    use crate::proof::hidden_send_session::WShape;
 
     fn witness(keys: &[u64], plan: &LookupPlan) -> LookupWitness {
         let planes = plan.planes().unwrap();
@@ -1137,12 +1163,62 @@ mod tests {
         }
     }
 
+    fn commit_plan() -> LookupCommitPlan {
+        let key_shape = WShape::new(
+            4,
+            build_code_plan(4, 8, 1).unwrap(),
+            1,
+            1,
+            40,
+            700,
+            1,
+            Digest([0x41; 32]),
+            Digest([0x51; 32]),
+        )
+        .unwrap();
+        let bits_shape = WShape::new(
+            1024,
+            build_code_plan(12, 2048, 1).unwrap(),
+            1,
+            1,
+            40,
+            701,
+            1,
+            Digest([0x42; 32]),
+            Digest([0x51; 32]),
+        )
+        .unwrap();
+        LookupCommitPlan {
+            key_shape,
+            bits_shape,
+            key_oracle: 900,
+            bits_oracle: 901,
+            group: 7,
+            mask_oracle: 902,
+            mask_code: build_code_plan(6, 32, 1).unwrap(),
+            mask_rows: 8,
+            mask_tree: RuntimeTreePlan {
+                tree_number: 702,
+                leaf_class: 1,
+                log_n: 6,
+                log_n_zk: 6,
+                parts: vec![RuntimeTreePart {
+                    main_symbols: 0,
+                    mask_symbols: 24,
+                }],
+                salt_bytes: 40,
+                run: Digest([0x43; 32]),
+                configuration: Digest([0x51; 32]),
+            },
+        }
+    }
+
     #[test]
     fn honest_byte_lookup_proves_and_verifies() {
         let plan = plan();
         let witness = witness(&[0, 1, 2, 255], &plan);
-        let (proof, proven) = prove_lookup(&plan, &witness, 7).unwrap();
-        let verified = verify_lookup(&plan, &proof, 7).unwrap();
+        let (messages, proof, proven) = prove_lookup(&plan, &commit_plan(), &witness, 7).unwrap();
+        let verified = verify_lookup(&plan, &commit_plan(), &messages.roots(), &proof, 7).unwrap();
         assert_eq!(proven, verified);
         assert_eq!(proven.multiplicity.0.len(), plan.planes().unwrap() * 256);
         assert_eq!(proven.multiplicity.1, Fp3::from_u64(4));
@@ -1152,11 +1228,11 @@ mod tests {
     fn lookup_messages_round_trip_and_reject_bad_versions() {
         let plan = plan();
         let witness = witness(&[0, 1, 2, 255], &plan);
-        let (proof, _) = prove_lookup(&plan, &witness, 13).unwrap();
+        let (messages, proof, _) = prove_lookup(&plan, &commit_plan(), &witness, 13).unwrap();
         let bytes = proof.encode().unwrap();
         let decoded = LookupProof::decode(&plan, &bytes).unwrap();
         assert_eq!(decoded, proof);
-        assert!(verify_lookup(&plan, &decoded, 13).is_ok());
+        assert!(verify_lookup(&plan, &commit_plan(), &messages.roots(), &decoded, 13).is_ok());
         let mut changed = bytes.clone();
         changed[0] ^= 1;
         assert!(LookupProof::decode(&plan, &changed).is_err());
@@ -1172,30 +1248,43 @@ mod tests {
     fn malformed_lookup_messages_are_rejected() {
         let plan = plan();
         let witness = witness(&[0, 1, 2, 255], &plan);
-        let (proof, _) = prove_lookup(&plan, &witness, 9).unwrap();
-        assert!(verify_lookup(&plan, &proof, 9).is_ok());
+        let (messages, proof, _) = prove_lookup(&plan, &commit_plan(), &witness, 9).unwrap();
+        assert!(verify_lookup(&plan, &commit_plan(), &messages.roots(), &proof, 9).is_ok());
 
         let mut changed = proof.clone();
         changed.tie[0].y_round.coefficients.pop();
-        assert!(verify_lookup(&plan, &changed, 9).is_err());
+        assert!(verify_lookup(&plan, &commit_plan(), &messages.roots(), &changed, 9).is_err());
 
         let mut changed = proof.clone();
         changed.table_levels[0].rounds[0].coefficients.clear();
-        assert!(verify_lookup(&plan, &changed, 9).is_err());
+        assert!(verify_lookup(&plan, &commit_plan(), &messages.roots(), &changed, 9).is_err());
 
         let mut changed = proof.clone();
         changed.bits.end_values.clear();
-        assert!(verify_lookup(&plan, &changed, 9).is_err());
+        assert!(verify_lookup(&plan, &commit_plan(), &messages.roots(), &changed, 9).is_err());
 
         let mut changed = proof.clone();
         changed.key_levels.pop();
-        assert!(verify_lookup(&plan, &changed, 9).is_err());
+        assert!(verify_lookup(&plan, &commit_plan(), &messages.roots(), &changed, 9).is_err());
+
+        let honest =
+            verify_lookup(&plan, &commit_plan(), &messages.roots(), &proof, 9).unwrap();
+        let mut changed = messages.clone();
+        changed.key.roots[0] = Digest([0x99; 32]);
+        let tampered =
+            verify_lookup(&plan, &commit_plan(), &changed.roots(), &proof, 9).unwrap();
+        assert_ne!(honest.key, tampered.key);
+        let mut changed = messages.clone();
+        changed.mask_root = Digest([0x98; 32]);
+        let tampered =
+            verify_lookup(&plan, &commit_plan(), &changed.roots(), &proof, 9).unwrap();
+        assert_ne!(honest.key, tampered.key);
     }
 
     #[test]
     fn an_out_of_table_key_cannot_be_proved() {
         let plan = plan();
         let witness = witness(&[0, 1, 2, 999], &plan);
-        assert!(prove_lookup(&plan, &witness, 11).is_err());
+        assert!(prove_lookup(&plan, &commit_plan(), &witness, 11).is_err());
     }
 }

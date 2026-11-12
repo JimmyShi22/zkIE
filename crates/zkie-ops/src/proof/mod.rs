@@ -24,6 +24,7 @@ pub mod proximity_session;
 pub mod psc;
 pub mod psc_general;
 pub mod lookup;
+pub mod lookup_messages;
 pub mod relations;
 pub mod session_baseline;
 pub mod multi_stage_iopp;
