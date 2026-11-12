@@ -64,7 +64,12 @@ use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
 
 use crate::proof::psc::{
     hp_entries, prove_dot_sumcheck, psc_variables, verify_psc_transcript, DotClaim, DotMaskEntries,
-    DotOutput, DotProof, PscChallenges, PscRound, SHOWN_MAPS,
+    DotOutput, DotProof, SHOWN_MAPS,
+};
+pub use crate::proof::committed_psc::CommittedGroupMessage;
+use crate::proof::committed_psc::{
+    absorb_point, get_psc_transcript, get_tree_plan, put_psc_transcript, put_tree_plan,
+    CommittedPscGroup, CommittedPscGroupRef, PositionPscChallenges, PscTranscriptTags,
 };
 use crate::proof::hidden_send_session::{
     HiddenSendPlan, SendGroup, SendGroupEntry, SendSamples,
@@ -90,6 +95,13 @@ const CLOSURE_MASK_SCHEMA_VERSION: u64 = 1;
 const CLOSURE_HIDING_SUM_TAG: u64 = 20;
 const CLOSURE_ROUND_TAG: u64 = 21;
 const CLOSURE_END_TAG: u64 = 22;
+/// The transcript tags of the closure product-sumcheck.
+const CLOSURE_PSC_TAGS: PscTranscriptTags = PscTranscriptTags {
+    version: CLOSURE_MASK_SCHEMA_VERSION,
+    hiding_sum: CLOSURE_HIDING_SUM_TAG,
+    round: CLOSURE_ROUND_TAG,
+    end: CLOSURE_END_TAG,
+};
 
 /// The trusted plan of the mask-only closure message. Its rows carry the
 /// one-time product-sumcheck hiding coefficients and the two shown-value end
@@ -1115,23 +1127,6 @@ pub fn commit_closure_mask(
     Ok(CommittedClosureMask { root, ..committed })
 }
 
-/// The committed group declaration carried by a proof message. The value rows
-/// and the retained commit trees are witness state: they stay with the prover
-/// and are never part of the verifier-held message or of its encoding.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CommittedGroupMessage {
-    pub group: SendGroup,
-    /// The committed roots in position order, derived from the group entries.
-    pub roots: Vec<Digest>,
-}
-
-impl CommittedGroupMessage {
-    pub fn new(group: SendGroup) -> Self {
-        let roots = group.entries.iter().map(|entry| entry.root).collect();
-        Self { group, roots }
-    }
-}
-
 /// The public first-stage closure messages: the three roots, the SEND samples
 /// and the drawn opening positions of the new messages.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1165,22 +1160,27 @@ impl ClosureFirstMessages {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut writer = CanonicalWriter::new();
         writer.put_u64(CLOSURE_MASK_SCHEMA_VERSION);
-        writer.put_bytes(&self.slack.group.encode());
-        writer.put_bytes(&self.slack_sample.encode());
-        put_positions(&mut writer, &self.slack_positions)?;
-        put_openings(
-            &mut writer,
-            &self.slack.group.entries,
-            &self.slack_openings,
-        )?;
-        writer.put_bytes(&self.bits.group.encode());
-        writer.put_bytes(&self.bits_sample.encode());
-        put_positions(&mut writer, &self.bits_positions)?;
-        put_openings(&mut writer, &self.bits.group.entries, &self.bits_openings)?;
-        writer.put_bytes(&self.map.group.encode());
-        writer.put_bytes(&self.map_sample.encode());
-        put_positions(&mut writer, &self.map_positions)?;
-        put_openings(&mut writer, &self.map.group.entries, &self.map_openings)?;
+        CommittedPscGroupRef {
+            message: &self.slack,
+            sample: &self.slack_sample,
+            positions: &self.slack_positions,
+            openings: &self.slack_openings,
+        }
+        .encode_into(&mut writer)?;
+        CommittedPscGroupRef {
+            message: &self.bits,
+            sample: &self.bits_sample,
+            positions: &self.bits_positions,
+            openings: &self.bits_openings,
+        }
+        .encode_into(&mut writer)?;
+        CommittedPscGroupRef {
+            message: &self.map,
+            sample: &self.map_sample,
+            positions: &self.map_positions,
+            openings: &self.map_openings,
+        }
+        .encode_into(&mut writer)?;
         put_tree_plan(&mut writer, &self.mask.tree);
         writer.put_digest(&self.mask.root);
         writer.put_bytes(&self.mask.sample.encode());
@@ -1200,23 +1200,9 @@ impl ClosureFirstMessages {
         if reader.get_u64()? != CLOSURE_MASK_SCHEMA_VERSION {
             return Err(Error::InvalidEncoding);
         }
-        let slack_group = SendGroup::decode(reader.get_bytes()?)?;
-        let slack_sample = SendSamples::decode(reader.get_bytes()?)?;
-        let slack_positions = get_positions(&mut reader)?;
-        let slack_openings = get_openings(
-            &mut reader,
-            &plan.slack,
-            positions,
-            &slack_positions,
-        )?;
-        let bits_group = SendGroup::decode(reader.get_bytes()?)?;
-        let bits_sample = SendSamples::decode(reader.get_bytes()?)?;
-        let bits_positions = get_positions(&mut reader)?;
-        let bits_openings = get_openings(&mut reader, &plan.bits, positions, &bits_positions)?;
-        let map_group = SendGroup::decode(reader.get_bytes()?)?;
-        let map_sample = SendSamples::decode(reader.get_bytes()?)?;
-        let map_positions = get_positions(&mut reader)?;
-        let map_openings = get_openings(&mut reader, &plan.map, positions, &map_positions)?;
+        let slack = CommittedPscGroup::decode(&mut reader, &plan.slack, positions)?;
+        let bits = CommittedPscGroup::decode(&mut reader, &plan.bits, positions)?;
+        let map = CommittedPscGroup::decode(&mut reader, &plan.map, positions)?;
         let tree = get_tree_plan(&mut reader)?;
         if tree != plan.mask.tree {
             return Err(Error::StatementMismatch);
@@ -1246,18 +1232,18 @@ impl ClosureFirstMessages {
         )?;
         reader.finish()?;
         Ok(Self {
-            slack: CommittedGroupMessage::new(slack_group),
-            slack_sample,
-            slack_positions,
-            slack_openings,
-            bits: CommittedGroupMessage::new(bits_group),
-            bits_sample,
-            bits_positions,
-            bits_openings,
-            map: CommittedGroupMessage::new(map_group),
-            map_sample,
-            map_positions,
-            map_openings,
+            slack: slack.message,
+            slack_sample: slack.sample,
+            slack_positions: slack.positions,
+            slack_openings: slack.openings,
+            bits: bits.message,
+            bits_sample: bits.sample,
+            bits_positions: bits.positions,
+            bits_openings: bits.openings,
+            map: map.message,
+            map_sample: map.sample,
+            map_positions: map.positions,
+            map_openings: map.openings,
             mask: ClosureMaskMessage {
                 tree,
                 root,
@@ -1267,130 +1253,6 @@ impl ClosureFirstMessages {
             },
         })
     }
-}
-
-fn put_positions(writer: &mut CanonicalWriter, positions: &[Vec<u64>]) -> Result<()> {
-    writer.put_u64(positions.len() as u64);
-    for list in positions {
-        writer.put_u64(list.len() as u64);
-        for position in list {
-            writer.put_u64(*position);
-        }
-    }
-    Ok(())
-}
-
-fn get_positions(reader: &mut CanonicalReader) -> Result<Vec<Vec<u64>>> {
-    let count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
-    let mut positions = Vec::with_capacity(count);
-    for _ in 0..count {
-        let length = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
-        if length == 0 || length > (1 << 20) {
-            return Err(Error::InvalidEncoding);
-        }
-        let mut list = Vec::with_capacity(length);
-        for _ in 0..length {
-            list.push(reader.get_u64()?);
-        }
-        positions.push(list);
-    }
-    Ok(positions)
-}
-
-fn put_openings(
-    writer: &mut CanonicalWriter,
-    entries: &[SendGroupEntry],
-    openings: &[RuntimeTreeOpening],
-) -> Result<()> {
-    if entries.len() != openings.len() {
-        return Err(Error::ShapeMismatch);
-    }
-    writer.put_u64(openings.len() as u64);
-    for (entry, opening) in entries.iter().zip(openings) {
-        if opening.positions.len() != entry.tree.parts.len() || false {
-            // The runtime opening carries its own plan; the tree plan check is
-            // done by the encoder.
-        }
-        writer.put_bytes(
-            &zkie_engine::pcs::request::runtime_tree::encode_runtime_opening(
-                &entry.tree,
-                opening,
-            )?,
-        );
-    }
-    Ok(())
-}
-
-fn get_openings(
-    reader: &mut CanonicalReader,
-    shape: &crate::proof::hidden_send_session::WShape,
-    positions: u32,
-    opening_positions: &[Vec<u64>],
-) -> Result<Vec<RuntimeTreeOpening>> {
-    let count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
-    if count != positions as usize || opening_positions.len() != positions as usize {
-        return Err(Error::ShapeMismatch);
-    }
-    let mut openings = Vec::with_capacity(count);
-    for position in 0..positions {
-        let tree = shape.tree_plan(position)?;
-        let opening = zkie_engine::pcs::request::runtime_tree::decode_runtime_opening(
-            &tree,
-            &opening_positions[position as usize],
-            reader.get_bytes()?,
-        )?;
-        if opening.positions != opening_positions[position as usize] {
-            return Err(Error::InvalidEncoding);
-        }
-        openings.push(opening);
-    }
-    Ok(openings)
-}
-
-fn put_tree_plan(writer: &mut CanonicalWriter, plan: &RuntimeTreePlan) {
-    writer.put_u64(plan.tree_number);
-    writer.put_u64(plan.leaf_class as u64);
-    writer.put_u64(plan.log_n as u64);
-    writer.put_u64(plan.log_n_zk as u64);
-    writer.put_u64(plan.parts.len() as u64);
-    for part in &plan.parts {
-        writer.put_u64(part.main_symbols);
-        writer.put_u64(part.mask_symbols);
-    }
-    writer.put_u64(plan.salt_bytes as u64);
-    writer.put_digest(&plan.run);
-    writer.put_digest(&plan.configuration);
-}
-
-fn get_tree_plan(reader: &mut CanonicalReader) -> Result<RuntimeTreePlan> {
-    let tree_number = reader.get_u64()?;
-    let leaf_class = u32::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
-    let log_n = u32::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
-    let log_n_zk = u32::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
-    let count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
-    if count == 0 || count > 4 {
-        return Err(Error::InvalidEncoding);
-    }
-    let mut parts = Vec::with_capacity(count);
-    for _ in 0..count {
-        parts.push(zkie_engine::pcs::request::runtime_tree::RuntimeTreePart {
-            main_symbols: reader.get_u64()?,
-            mask_symbols: reader.get_u64()?,
-        });
-    }
-    let salt_bytes = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
-    let run = reader.get_digest()?;
-    let configuration = reader.get_digest()?;
-    Ok(RuntimeTreePlan {
-        tree_number,
-        leaf_class,
-        log_n,
-        log_n_zk,
-        parts,
-        salt_bytes,
-        run,
-        configuration,
-    })
 }
 
 /// The prover's private closure material.
@@ -1499,98 +1361,23 @@ pub struct ClosureSecondMessages {
 impl ClosureSecondMessages {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut writer = CanonicalWriter::new();
-        writer.put_u64(CLOSURE_MASK_SCHEMA_VERSION);
-        writer.put_u64(self.psc.len() as u64);
-        writer.put_u64(self.point_values.len() as u64);
-        for values in &self.point_values {
-            for value in values {
-                writer.put_fp3(value);
-            }
-        }
-        for proof in &self.psc {
-            writer.put_fp3(&proof.hiding_sum);
-            writer.put_u64(proof.rounds.len() as u64);
-            for round in &proof.rounds {
-                writer.put_u64(round.coefficients.len() as u64);
-                for coefficient in &round.coefficients {
-                    writer.put_fp3(coefficient);
-                }
-            }
-            writer.put_u64(proof.y_round.coefficients.len() as u64);
-            for coefficient in &proof.y_round.coefficients {
-                writer.put_fp3(coefficient);
-            }
-            writer.put_u64(proof.end_values.len() as u64);
-            for value in &proof.end_values {
-                writer.put_fp3(value);
-            }
-        }
+        put_psc_transcript(
+            &mut writer,
+            CLOSURE_MASK_SCHEMA_VERSION,
+            &self.psc,
+            &self.point_values,
+        )?;
         Ok(writer.into_bytes())
     }
 
     pub fn decode(plan: &ClosurePlan, positions: u32, bytes: &[u8]) -> Result<Self> {
         let mut reader = CanonicalReader::new(bytes, zkie_core::common::codec::DecodeLimits::unlimited());
-        if reader.get_u64()? != CLOSURE_MASK_SCHEMA_VERSION {
-            return Err(Error::InvalidEncoding);
-        }
-        let count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
-        if count != positions as usize {
-            return Err(Error::ShapeMismatch);
-        }
-        let value_count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
-        if value_count != positions as usize {
-            return Err(Error::ShapeMismatch);
-        }
-        let mut point_values = Vec::with_capacity(value_count);
-        for _ in 0..value_count {
-            point_values.push([reader.get_fp3()?, reader.get_fp3()?, reader.get_fp3()?]);
-        }
-        let variables = plan.boolean_variables as usize;
-        let expected_rounds = variables;
-        let mut psc = Vec::with_capacity(count);
-        for _ in 0..count {
-            let hiding_sum = reader.get_fp3()?;
-            let round_count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
-            if round_count != expected_rounds {
-                return Err(Error::ShapeMismatch);
-            }
-            let mut rounds = Vec::with_capacity(round_count);
-            for _ in 0..round_count {
-                let length = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
-                if length != 2 {
-                    return Err(Error::ShapeMismatch);
-                }
-                let mut coefficients = Vec::with_capacity(length);
-                for _ in 0..length {
-                    coefficients.push(reader.get_fp3()?);
-                }
-                rounds.push(PscRound { coefficients });
-            }
-            let y_len = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
-            if y_len != 2 {
-                return Err(Error::ShapeMismatch);
-            }
-            let mut y_coefficients = Vec::with_capacity(y_len);
-            for _ in 0..y_len {
-                y_coefficients.push(reader.get_fp3()?);
-            }
-            let end_len = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
-            if end_len != CLOSURE_SHOWN {
-                return Err(Error::ShapeMismatch);
-            }
-            let mut end_values = [Fp3::ZERO; CLOSURE_SHOWN];
-            for value in &mut end_values {
-                *value = reader.get_fp3()?;
-            }
-            psc.push(DotProof {
-                hiding_sum,
-                rounds,
-                y_round: PscRound {
-                    coefficients: y_coefficients,
-                },
-                end_values,
-            });
-        }
+        let (psc, point_values) = get_psc_transcript::<3>(
+            &mut reader,
+            CLOSURE_MASK_SCHEMA_VERSION,
+            positions,
+            plan.boolean_variables as usize,
+        )?;
         reader.finish()?;
         Ok(Self { psc, point_values })
     }
@@ -1617,70 +1404,6 @@ pub struct ClosureRowBinding {
     pub positions: Vec<ClosurePositionBinding>,
 }
 
-/// One chain-backed challenge source of one closure product-sumcheck. The
-/// position is part of every absorbed message so the instances cannot be
-/// reordered or replayed.
-struct ClosureChallenges<'a> {
-    chain: &'a mut Chain,
-    position: u64,
-}
-
-impl PscChallenges for ClosureChallenges<'_> {
-    fn draw(&mut self) -> Result<Fp3> {
-        self.chain.draw_e()
-    }
-
-    fn draw_nonzero(&mut self) -> Result<Fp3> {
-        self.chain.draw_e_nonzero()
-    }
-
-    fn send_hiding_sum(&mut self, value: Fp3) -> Result<()> {
-        let mut message = self.chain.message();
-        message.push_u64(CLOSURE_MASK_SCHEMA_VERSION);
-        message.push_u64(CLOSURE_HIDING_SUM_TAG);
-        message.push_u64(self.position);
-        message.push_fp3(&value);
-        let prefix = message.prefix(zkie_engine::pcs::request::chain::KIND_ALGEBRAIC, 0)?;
-        if !self.chain.step(&prefix, 0)? {
-            return Err(Error::InvalidProof);
-        }
-        Ok(())
-    }
-
-    fn send_round(&mut self, index: usize, round: &PscRound) -> Result<()> {
-        let mut message = self.chain.message();
-        message.push_u64(CLOSURE_MASK_SCHEMA_VERSION);
-        message.push_u64(CLOSURE_ROUND_TAG);
-        message.push_u64(self.position);
-        message.push_u64(index as u64);
-        message.push_u64(round.coefficients.len() as u64);
-        for coefficient in &round.coefficients {
-            message.push_fp3(coefficient);
-        }
-        let prefix = message.prefix(zkie_engine::pcs::request::chain::KIND_ALGEBRAIC, 0)?;
-        if !self.chain.step(&prefix, 0)? {
-            return Err(Error::InvalidProof);
-        }
-        Ok(())
-    }
-
-    fn send_end_values(&mut self, values: &[Fp3; SHOWN_MAPS]) -> Result<()> {
-        let mut message = self.chain.message();
-        message.push_u64(CLOSURE_MASK_SCHEMA_VERSION);
-        message.push_u64(CLOSURE_END_TAG);
-        message.push_u64(self.position);
-        message.push_u64(values.len() as u64);
-        for value in values {
-            message.push_fp3(value);
-        }
-        let prefix = message.prefix(zkie_engine::pcs::request::chain::KIND_EMPTY, 0)?;
-        if !self.chain.step(&prefix, 0)? {
-            return Err(Error::InvalidProof);
-        }
-        Ok(())
-    }
-}
-
 fn multilinear(values: &[Fp3], point: &[Fp3]) -> Result<Fp3> {
     if values.len() != (1usize << point.len()) {
         return Err(Error::ShapeMismatch);
@@ -1699,19 +1422,7 @@ fn multilinear(values: &[Fp3], point: &[Fp3]) -> Result<Fp3> {
 }
 
 fn absorb_closure_point(chain: &mut Chain, position: u64, values: &[Fp3]) -> Result<()> {
-    let mut message = chain.message();
-    message.push_u64(CLOSURE_MASK_SCHEMA_VERSION);
-    message.push_u64(38);
-    message.push_u64(position);
-    message.push_u64(values.len() as u64);
-    for value in values {
-        message.push_fp3(value);
-    }
-    let prefix = message.prefix(zkie_engine::pcs::request::chain::KIND_EMPTY, 0)?;
-    if !chain.step(&prefix, 0)? {
-        return Err(Error::InvalidProof);
-    }
-    Ok(())
+    absorb_point(chain, CLOSURE_MASK_SCHEMA_VERSION, 38, position, values)
 }
 
 fn closure_claim() -> DotClaim {
@@ -1859,10 +1570,8 @@ pub fn prove_closure_second(
         let claim = closure_claim();
         let entries = closure_mask_entries(plan, &mask_entries[position])?;
         let (proof, output) = {
-            let mut challenges = ClosureChallenges {
-                chain,
-                position: position as u64,
-            };
+            let mut challenges =
+                PositionPscChallenges::new(chain, CLOSURE_PSC_TAGS, position as u64);
             prove_dot_sumcheck(
                 &map_values[position],
                 &omega,
@@ -1940,10 +1649,8 @@ pub fn verify_closure_second(
     let mut bindings = Vec::with_capacity(positions);
     for (position, proof) in messages.psc.iter().enumerate() {
         let output = {
-            let mut challenges = ClosureChallenges {
-                chain,
-                position: position as u64,
-            };
+            let mut challenges =
+                PositionPscChallenges::new(chain, CLOSURE_PSC_TAGS, position as u64);
             verify_psc_transcript(&claim, &entries, proof, k, &mut challenges)?
         };
         let mut q = Vec::with_capacity(k);

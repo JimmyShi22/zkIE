@@ -4,6 +4,7 @@ pub mod base_last_session;
 pub mod bat_fold_session;
 pub mod binding;
 pub mod column_session;
+pub mod committed_psc;
 pub mod cs_final_session;
 pub mod cs_multi_session;
 pub mod edge_session;
