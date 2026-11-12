@@ -748,7 +748,12 @@ actual target sources are:
 The hidden reduced row `W`/`Y` enters the oracle message values (the
 prover's witness), not the targets and not the public BAT relation
 coefficients. The target values are therefore determined by the public
-table/reader data, the public SEND answers and the public statement. This is not an expansion of the approved output boundary:
+table/reader data, the public SEND answers and the public statement. The
+winner/valid/tie public outputs are checked by the closure/output plan, not by
+the BASE target; the BASE claim coefficients are the public table/generator
+relation coefficients and the public batching challenge, not the
+winner/valid/tie values. The BASE target is the linear-table claim target, and
+the approved output boundary is not expanded by it. This is not an expansion of the approved output boundary:
 the target is a protocol message value derived from public data and masked
 answers, not a new Y-dependent output. If a target were Y-dependent, it would
 be a leak; none of the traced row families is. The handoff target is supplied
