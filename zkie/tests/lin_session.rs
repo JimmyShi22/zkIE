@@ -1869,6 +1869,32 @@ fn selected_gpt2_output_head_request_session() {
             loaded.unwrap();
             return;
         }
+        // The planner is part of the trusted plan fault path: a changed
+        // own or shared position must be rejected before any proof work.
+        let fault_plan = build_output_head_hidden_plan(
+            shape,
+            &setup,
+            &table.reader(),
+            &trusted,
+        )
+        .expect("build the fault-path plan");
+        let mut bad_own = fault_plan.proximity.clone();
+        bad_own.own_stages[0].positions += 1;
+        assert!(
+            bad_own
+                .fault(&fault_plan.send, fault_plan.closure.as_ref())
+                .is_some(),
+            "a changed own position must fail the trusted plan"
+        );
+        let mut bad_shared = fault_plan.proximity.clone();
+        bad_shared.shared_stages[0].positions = 3;
+        assert!(
+            bad_shared
+                .fault(&fault_plan.send, fault_plan.closure.as_ref())
+                .is_some(),
+            "a changed shared join count must fail the trusted plan"
+        );
+
         let started = Instant::now();
         let (hidden_proof, hidden_witness, closure) = prove_output_head_lin_hidden(
             shape,
@@ -2673,6 +2699,21 @@ fn selected_gpt2_output_head_request_session() {
         let final_budget = final_ledger.opening_budget_summary();
         println!("ledger_final_min_tail_remaining={}", final_budget.min_remaining);
         println!("ledger_final_exhausted={}", final_budget.exhausted);
+        if env::var_os("ZKIE_SESSION_KEY_MAP").is_some() {
+            for (key, record) in &final_ledger.oracles {
+                println!(
+                    "ledger_key kind={:?} oracle={} tree={} run={:?} configuration={:?} rank={} unique={} logical={}",
+                    key.kind,
+                    key.oracle_id,
+                    key.tree_number,
+                    key.run,
+                    key.configuration,
+                    record.tail_rank,
+                    record.unique_positions,
+                    record.logical_openings
+                );
+            }
+        }
         for (key, record) in &final_ledger.oracles {
             if record.tail_rank != 0 && record.remaining_tail() == 0 {
                 println!(

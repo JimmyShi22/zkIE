@@ -745,4 +745,41 @@ mod tests {
         assert!(bits_of(&error.hi) <= 254.0 * 0.4150375 + 1e-9);
         assert!(!error.bad);
     }
+    #[test]
+    fn limb_boundaries_and_directed_cuts_hold() {
+        let a = Big::from_u64(u32::MAX as u64);
+        let b = Big::from_u64(u32::MAX as u64);
+        let product = a.mul(&b);
+        let (quotient, remainder) = product.divmod(&b);
+        assert_eq!(quotient, a);
+        assert!(remainder.is_zero());
+        let large = Big::two_to(130).add(&Big::from_u64(1));
+        let (q, r) = large.divmod(&Big::from_u64(3));
+        assert_eq!(q.mul(&Big::from_u64(3)).add(&r), large);
+        let root = Big::two_to(192).add(&Big::from_u64(1)).isqrt();
+        assert_eq!(root, Big::two_to(96));
+        let root_next = root.add(&Big::from_u64(1));
+        assert!(root_next.mul(&root_next).cmp(&Big::two_to(192)) == Ordering::Greater);
+
+        let exact = Real::from_big(Big::two_to(192).add(&Big::from_u64(1)));
+        let down = exact.cut(Dir::Down);
+        let up = exact.cut(Dir::Up);
+        assert!(down.cmp(&exact) != Ordering::Greater);
+        assert!(up.cmp(&exact) != Ordering::Less);
+        assert!(down.cmp(&up) != Ordering::Greater);
+
+        let tiny = Real::two_to(-1000);
+        let tiny_root = tiny.sqrt(Dir::Up);
+        assert!(tiny_root.cmp(&Real::zero()) == Ordering::Greater);
+        assert!(tiny_root.cmp(&Real::two_to(-499)) != Ordering::Greater);
+
+        let bad = Bound::failed();
+        assert!(bad.bad);
+        assert!(bad.add(&Bound::from_u64(1)).bad);
+        assert!(bad.mul(&Bound::from_u64(1)).bad);
+        assert!(bad.div(&Bound::from_u64(1)).bad);
+        assert!(bad.sqrt().bad);
+        assert!(bad.pow(3).bad);
+    }
+
 }

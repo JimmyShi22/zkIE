@@ -814,4 +814,34 @@ mod tests {
         let last_mask = build_code_plan(17, 16_384, 1).unwrap();
         assert!(plan_own_two_stage(main, mask, last_main, last_mask, 14, 2, 0).is_err());
     }
+    #[test]
+    fn position_search_boundaries_and_bad_searches() {
+        let zero = Bound::from_u64(0);
+        let half = Bound::from_u64(1).div(&Bound::from_u64(2));
+        assert_eq!(positions(&half, 128, &zero, 1), 128);
+        let three_quarters = Bound::from_u64(3).div(&Bound::from_u64(4));
+        assert_eq!(positions(&three_quarters, 128, &zero, 1), 309);
+        let one = Bound::from_u64(1);
+        assert_eq!(positions(&one, 128, &zero, 1), 0);
+        let goal = Bound::from_real(Real::two_to(-128));
+        assert_eq!(positions(&half, 128, &goal, 1), 0);
+        assert_eq!(positions(&half, 128, &zero, 0), 0);
+        let near_one = Bound::from_u64(1)
+            .sub(&Bound::from_real(Real::two_to(-40)));
+        assert_eq!(positions(&near_one, 128, &zero, 1), 0);
+
+        let tiny = GroupShape {
+            main: Word { log_n: 2, ell: 3, k: 2 },
+            mask: Word { log_n: 2, ell: 3, k: 2 },
+            k: 1,
+            h: 0,
+        };
+        let load = GroupLoad {
+            cube_bits: 3,
+            messages: 1,
+            batched_rows: u64::MAX,
+        };
+        assert_eq!(largest_m(&tiny, load), 0);
+    }
+
 }
