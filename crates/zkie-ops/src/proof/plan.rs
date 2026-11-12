@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
+use zkie_core::artifact::digest_bytes;
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
 
@@ -305,6 +306,350 @@ pub struct PlanFinalOutput {
     pub output: usize,
 }
 
+/// The owner of a plan-level previous object: the producer step and an
+/// identity derived from that step's plan description.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviousObjectOwner {
+    pub step: usize,
+    pub id: Digest,
+}
+
+/// The tensor shape of a plan-level previous object.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviousObjectShape {
+    pub positions: usize,
+    pub hidden: usize,
+}
+
+/// The position of a plan-level previous object in the consumer's flat input
+/// tensor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviousObjectLayout {
+    pub rows: usize,
+    pub columns: usize,
+    pub row_start: usize,
+    pub column_start: usize,
+}
+
+/// A previous object declared by the trusted plan: the input matrix of the
+/// selected final norm, produced by an earlier plan step and consumed by the
+/// output-head segment. The fields are plan values; the verifier derives the
+/// same object from the plan and compares it; no proof message contributes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviousObjectPlan {
+    /// Identity of the object, derived from the fields below.
+    pub id: Digest,
+    pub owner: PreviousObjectOwner,
+    pub shape: PreviousObjectShape,
+    pub layout: PreviousObjectLayout,
+    /// The activation step whose input port reads the object.
+    pub consumer_step: usize,
+    pub consumer_port: usize,
+    /// The producer's output port.
+    pub producer_output: usize,
+}
+
+impl PreviousObjectPlan {
+    /// Derives the object from the trusted plan and the selected activation
+    /// step. The activation must be a final norm whose first input is the flat
+    /// output of an earlier step; the object's shape is the norm's row/column
+    /// shape and the consumer reads it at port 0 without a slice.
+    pub fn derive_for_activation(
+        plan: &TracePlan,
+        activation_step: usize,
+        positions: usize,
+        hidden: usize,
+    ) -> Result<Self> {
+        if positions == 0 || hidden == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        positions
+            .checked_mul(hidden)
+            .ok_or(Error::ResourceLimit)?;
+        let activation = plan
+            .steps
+            .get(activation_step)
+            .ok_or(Error::StatementMismatch)?;
+        if activation.opcode != OpCode::ProfileLayerNorm || activation.outputs == 0 {
+            return Err(Error::StatementMismatch);
+        }
+        let config = literal_config_values(activation).ok_or(Error::InvalidConfig)?;
+        if config.len() < 2
+            || config[0] != positions as i64
+            || config[1] != hidden as i64
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        let source = activation
+            .inputs
+            .first()
+            .ok_or(Error::ShapeMismatch)?;
+        let (producer_step, producer_output) = match source {
+            PlanSource::Prev {
+                step,
+                output,
+                layout: PlanLayout::Flat,
+            } => (*step, *output),
+            _ => return Err(Error::StatementMismatch),
+        };
+        if producer_step == activation_step {
+            return Err(Error::StatementMismatch);
+        }
+        let producer = plan
+            .steps
+            .get(producer_step)
+            .ok_or(Error::StatementMismatch)?;
+        if producer.outputs == 0 || producer_output >= producer.outputs {
+            return Err(Error::ShapeMismatch);
+        }
+        let owner = PreviousObjectOwner {
+            step: producer_step,
+            id: owner_id(plan, producer_step),
+        };
+        let shape = PreviousObjectShape {
+            positions,
+            hidden,
+        };
+        let layout = PreviousObjectLayout {
+            rows: positions,
+            columns: hidden,
+            row_start: 0,
+            column_start: 0,
+        };
+        let mut object = Self {
+            id: Digest::ZERO,
+            owner,
+            shape,
+            layout,
+            consumer_step: activation_step,
+            consumer_port: 0,
+            producer_output,
+        };
+        object.id = object.digest();
+        Ok(object)
+    }
+
+    /// Checks a declared object against the plan-derived object.
+    pub fn validate_for_activation(
+        &self,
+        plan: &TracePlan,
+        activation_step: usize,
+        positions: usize,
+        hidden: usize,
+    ) -> Result<()> {
+        let expected =
+            Self::derive_for_activation(plan, activation_step, positions, hidden)?;
+        if *self != expected {
+            return Err(Error::StatementMismatch);
+        }
+        Ok(())
+    }
+
+    fn digest(&self) -> Digest {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"zkie/previous-object/v1");
+        bytes.extend_from_slice(&self.owner.id.0);
+        put_word(&mut bytes, self.owner.step as u64);
+        put_word(&mut bytes, self.shape.positions as u64);
+        put_word(&mut bytes, self.shape.hidden as u64);
+        put_word(&mut bytes, self.layout.rows as u64);
+        put_word(&mut bytes, self.layout.columns as u64);
+        put_word(&mut bytes, self.layout.row_start as u64);
+        put_word(&mut bytes, self.layout.column_start as u64);
+        put_word(&mut bytes, self.consumer_step as u64);
+        put_word(&mut bytes, self.consumer_port as u64);
+        put_word(&mut bytes, self.producer_output as u64);
+        digest_bytes(&bytes)
+    }
+}
+
+fn literal_config_values(step: &PlanStep) -> Option<Vec<i64>> {
+    step.config
+        .iter()
+        .map(|value| match value {
+            PlanConfigValue::Literal(value) => Some(*value),
+            PlanConfigValue::AssetI64 { .. } => None,
+        })
+        .collect()
+}
+
+fn put_word(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_text(bytes: &mut Vec<u8>, value: &str) {
+    put_word(bytes, value.len() as u64);
+    bytes.extend_from_slice(value.as_bytes());
+}
+
+fn put_layout(bytes: &mut Vec<u8>, layout: &PlanLayout) {
+    match layout {
+        PlanLayout::Flat => put_word(bytes, 0),
+        PlanLayout::Range { start, count } => {
+            put_word(bytes, 1);
+            put_word(bytes, *start);
+            put_word(bytes, *count as u64);
+        }
+        PlanLayout::Rows {
+            row_width,
+            start,
+            count,
+        } => {
+            put_word(bytes, 2);
+            put_word(bytes, *row_width as u64);
+            put_word(bytes, *start as u64);
+            put_word(bytes, *count as u64);
+        }
+        PlanLayout::Columns {
+            row_width,
+            start,
+            count,
+        } => {
+            put_word(bytes, 3);
+            put_word(bytes, *row_width as u64);
+            put_word(bytes, *start as u64);
+            put_word(bytes, *count as u64);
+        }
+        PlanLayout::Transpose { rows, cols } => {
+            put_word(bytes, 4);
+            put_word(bytes, *rows as u64);
+            put_word(bytes, *cols as u64);
+        }
+        PlanLayout::Broadcast { rows } => {
+            put_word(bytes, 5);
+            put_word(bytes, *rows as u64);
+        }
+        PlanLayout::Chain(layouts) => {
+            put_word(bytes, 6);
+            put_word(bytes, layouts.len() as u64);
+            for layout in layouts {
+                put_layout(bytes, layout);
+            }
+        }
+    }
+}
+
+fn put_constant(bytes: &mut Vec<u8>, constant: &PlanConstant) {
+    match constant {
+        PlanConstant::Tokens => put_word(bytes, 0),
+        PlanConstant::CausalMask {
+            rows,
+            cols,
+            masked,
+        } => {
+            put_word(bytes, 1);
+            put_word(bytes, *rows as u64);
+            put_word(bytes, *cols as u64);
+            put_word(bytes, *masked as u64);
+        }
+        PlanConstant::VocabMask {
+            rows,
+            vocab,
+            valid,
+            masked,
+        } => {
+            put_word(bytes, 2);
+            put_word(bytes, *rows as u64);
+            put_word(bytes, *vocab as u64);
+            put_word(bytes, *valid as u64);
+            put_word(bytes, *masked as u64);
+        }
+        PlanConstant::Zeros { count } => {
+            put_word(bytes, 3);
+            put_word(bytes, *count as u64);
+        }
+        PlanConstant::ScalarBroadcast { value, count } => {
+            put_word(bytes, 4);
+            put_word(bytes, *value as u64);
+            put_word(bytes, *count as u64);
+        }
+        PlanConstant::Literal(values) => {
+            put_word(bytes, 5);
+            put_word(bytes, values.len() as u64);
+            for value in values {
+                put_word(bytes, *value as u64);
+            }
+        }
+    }
+}
+
+fn put_source(bytes: &mut Vec<u8>, source: &PlanSource) {
+    match source {
+        PlanSource::Prev {
+            step,
+            output,
+            layout,
+        } => {
+            put_word(bytes, 0);
+            put_word(bytes, *step as u64);
+            put_word(bytes, *output as u64);
+            put_layout(bytes, layout);
+        }
+        PlanSource::Asset { path, layout } => {
+            put_word(bytes, 1);
+            put_text(bytes, path);
+            put_layout(bytes, layout);
+        }
+        PlanSource::Constant(constant) => {
+            put_word(bytes, 2);
+            put_constant(bytes, constant);
+        }
+        PlanSource::Concat(parts) => {
+            put_word(bytes, 3);
+            put_word(bytes, parts.len() as u64);
+            for part in parts {
+                put_source(bytes, part);
+            }
+        }
+        PlanSource::HeadConcat { parts, rows } => {
+            put_word(bytes, 4);
+            put_word(bytes, parts.len() as u64);
+            for part in parts {
+                put_source(bytes, part);
+            }
+            put_word(bytes, *rows as u64);
+        }
+        PlanSource::Layout(inner, layout) => {
+            put_word(bytes, 5);
+            put_source(bytes, inner);
+            put_layout(bytes, layout);
+        }
+    }
+}
+
+fn put_step(bytes: &mut Vec<u8>, step: &PlanStep) {
+    put_word(bytes, step.opcode as u16 as u64);
+    put_word(bytes, step.outputs as u64);
+    put_word(bytes, step.config.len() as u64);
+    for value in &step.config {
+        match value {
+            PlanConfigValue::Literal(value) => {
+                put_word(bytes, 0);
+                put_word(bytes, *value as u64);
+            }
+            PlanConfigValue::AssetI64 { path, index } => {
+                put_word(bytes, 1);
+                put_text(bytes, path);
+                put_word(bytes, *index as u64);
+            }
+        }
+    }
+    put_word(bytes, step.inputs.len() as u64);
+    for source in &step.inputs {
+        put_source(bytes, source);
+    }
+}
+
+fn owner_id(plan: &TracePlan, step_index: usize) -> Digest {
+    let step = &plan.steps[step_index];
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"zkie/previous-object-owner/v1");
+    put_word(&mut bytes, plan.model_version as u64);
+    put_word(&mut bytes, step_index as u64);
+    put_step(&mut bytes, step);
+    digest_bytes(&bytes)
+}
+
 /// A complete static trace plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TracePlan {
@@ -312,6 +657,9 @@ pub struct TracePlan {
     pub argmax_steps: Vec<usize>,
     pub final_output: Option<PlanFinalOutput>,
     pub model_version: u32,
+    /// The plan-level previous object of the output-head segment, when the
+    /// plan has one. The verifier derives it from the plan and checks it.
+    pub previous_object: Option<PreviousObjectPlan>,
 }
 
 impl TracePlan {
@@ -321,7 +669,22 @@ impl TracePlan {
             argmax_steps: Vec::new(),
             final_output: None,
             model_version: 0,
+            previous_object: None,
         }
+    }
+
+    /// Derives and records the previous object of an output-head plan whose
+    /// activation is the final norm at `activation_step`.
+    pub fn declare_previous_object_for_activation(
+        &mut self,
+        activation_step: usize,
+        positions: usize,
+        hidden: usize,
+    ) -> Result<()> {
+        let object =
+            PreviousObjectPlan::derive_for_activation(self, activation_step, positions, hidden)?;
+        self.previous_object = Some(object);
+        Ok(())
     }
 }
 

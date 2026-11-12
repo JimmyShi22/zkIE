@@ -375,6 +375,7 @@ pub fn trace_plan(m: usize) -> Result<TracePlan> {
     }
     let mut plan = builder.finish();
     plan.model_version = MODEL_VERSION;
+    plan.declare_previous_object_for_activation(hf, m, HIDDEN)?;
     Ok(plan)
 }
 
@@ -417,5 +418,36 @@ mod tests {
     fn plan_step_counts_match_executor() {
         assert_eq!(trace_plan(16).unwrap().steps.len(), 4462);
         assert_eq!(trace_plan(512).unwrap().steps.len(), 2798);
+    }
+
+    #[test]
+    fn output_head_declares_the_previous_object() {
+        for m in [16, 512] {
+            let plan = trace_plan(m).unwrap();
+            let object = plan
+                .previous_object
+                .as_ref()
+                .expect("the output-head plan declares a previous object");
+            assert_eq!(object.shape.positions, m);
+            assert_eq!(object.shape.hidden, HIDDEN);
+            assert_eq!(object.layout.rows, m);
+            assert_eq!(object.layout.columns, HIDDEN);
+            assert_eq!(object.layout.row_start, 0);
+            assert_eq!(object.layout.column_start, 0);
+            assert_eq!(object.consumer_port, 0);
+            assert!(object.owner.step < object.consumer_step);
+            assert_eq!(
+                plan.steps[object.consumer_step].opcode,
+                OpCode::ProfileLayerNorm
+            );
+            let derived = zkie_ops::proof::plan::PreviousObjectPlan::derive_for_activation(
+                &plan,
+                object.consumer_step,
+                m,
+                HIDDEN,
+            )
+            .unwrap();
+            assert_eq!(&derived, object);
+        }
     }
 }

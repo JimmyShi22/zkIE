@@ -62,7 +62,7 @@ use crate::proof::model_commitment::{
     verify_shared_trace_outputs, ModelCommitmentPublic, SharedTrace,
 };
 use crate::proof::plan::{
-    PlanConfigValue, PlanConstant, PlanLayout, PlanSource, PlanStep, TracePlan,
+    PlanConfigValue, PlanConstant, PlanLayout, PlanSource, PlanStep, PreviousObjectPlan, TracePlan,
 };
 use crate::proof::session_baseline::{assemble_binding, SelectedMatmulStep};
 
@@ -118,6 +118,8 @@ pub struct OutputHeadStep {
     pub columns: usize,
     /// The weight asset named by the MatMul input port.
     pub asset_path: String,
+    /// The plan-declared previous object consumed by the final norm.
+    pub previous: PreviousObjectPlan,
 }
 
 fn literal_config(step: &PlanStep) -> Option<Vec<i64>> {
@@ -264,6 +266,14 @@ fn select_output_head_step_for(
         }
     }
 
+    let previous =
+        PreviousObjectPlan::derive_for_activation(plan, activation_step, positions, hidden)?;
+    let declared = plan
+        .previous_object
+        .as_ref()
+        .ok_or(Error::StatementMismatch)?;
+    declared.validate_for_activation(plan, activation_step, positions, hidden)?;
+
     Ok(OutputHeadStep {
         step,
         activation_step,
@@ -273,6 +283,7 @@ fn select_output_head_step_for(
         hidden,
         columns,
         asset_path: asset_path.to_owned(),
+        previous,
     })
 }
 
@@ -1580,6 +1591,7 @@ pub fn verify_output_head_lin_request_bytes(
 mod tests {
     use super::diagnostic::*;
     use super::*;
+    use crate::proof::plan::{PreviousObjectLayout, PreviousObjectOwner, PreviousObjectShape};
     use crate::proof::output_closure::{ClosureMaskPlan, ClosurePlan};
     use crate::proof::psc::{hp_entries, psc_variables};
     use std::cell::RefCell;
@@ -1669,14 +1681,33 @@ mod tests {
 
     fn build_plan(activation_steps: usize) -> TracePlan {
         let mut builder = PlanBuilder::new();
-        let mut activation = 0;
-        for _ in 0..activation_steps {
+        let producer = builder.step(
+            OpCode::Add,
+            Vec::new(),
+            vec![PlanSource::Constant(PlanConstant::Zeros {
+                count: TOY_POSITIONS * TOY_HIDDEN,
+            })],
+            1,
+        );
+        let mut activation = producer;
+        for _ in 0..activation_steps.max(1) {
             activation = builder.step(
-                OpCode::Add,
-                Vec::new(),
-                vec![PlanSource::Constant(PlanConstant::Zeros {
-                    count: TOY_POSITIONS * TOY_HIDDEN,
-                })],
+                OpCode::ProfileLayerNorm,
+                config(vec![
+                    TOY_POSITIONS as i64,
+                    TOY_HIDDEN as i64,
+                    TOY_HIDDEN as i64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ]),
+                vec![
+                    PlanSource::prev(activation, 0),
+                    PlanSource::asset(TOY_ASSET),
+                    PlanSource::asset(TOY_ASSET),
+                    PlanSource::asset(TOY_ASSET),
+                ],
                 1,
             );
         }
@@ -1724,7 +1755,112 @@ mod tests {
         }
         let mut plan = builder.finish();
         plan.model_version = 1;
+        plan.declare_previous_object_for_activation(activation, TOY_POSITIONS, TOY_HIDDEN)
+            .unwrap();
         plan
+    }
+
+    #[test]
+    fn previous_object_is_plan_derived_and_tampering_is_rejected() {
+        let plan = build_plan(1);
+        let activation = plan
+            .steps
+            .iter()
+            .position(|step| step.opcode == OpCode::ProfileLayerNorm)
+            .unwrap();
+        let object = plan.previous_object.clone().unwrap();
+        let derived = PreviousObjectPlan::derive_for_activation(
+            &plan,
+            activation,
+            TOY_POSITIONS,
+            TOY_HIDDEN,
+        )
+        .unwrap();
+        assert_eq!(object, derived);
+        assert_eq!(object.consumer_step, activation);
+        assert_eq!(object.consumer_port, 0);
+        assert_eq!(object.shape.positions, TOY_POSITIONS);
+        assert_eq!(object.shape.hidden, TOY_HIDDEN);
+        assert_eq!(object.layout.rows, TOY_POSITIONS);
+        assert_eq!(object.layout.columns, TOY_HIDDEN);
+        assert_eq!(object.layout.row_start, 0);
+        assert_eq!(object.layout.column_start, 0);
+        let (producer_step, producer_output) = match &plan.steps[activation].inputs[0] {
+            PlanSource::Prev {
+                step,
+                output,
+                layout: PlanLayout::Flat,
+            } => (*step, *output),
+            _ => panic!("the activation must read a flat previous step"),
+        };
+        assert_eq!(object.owner.step, producer_step);
+        assert_eq!(object.producer_output, producer_output);
+
+        let wrong_owner = PreviousObjectPlan {
+            owner: PreviousObjectOwner {
+                id: Digest([0xA1; 32]),
+                ..object.owner.clone()
+            },
+            ..object.clone()
+        };
+        assert!(wrong_owner
+            .validate_for_activation(&plan, activation, TOY_POSITIONS, TOY_HIDDEN)
+            .is_err());
+        let wrong_shape = PreviousObjectPlan {
+            shape: PreviousObjectShape {
+                positions: TOY_POSITIONS + 1,
+                ..object.shape.clone()
+            },
+            ..object.clone()
+        };
+        assert!(wrong_shape
+            .validate_for_activation(&plan, activation, TOY_POSITIONS, TOY_HIDDEN)
+            .is_err());
+        let wrong_layout = PreviousObjectPlan {
+            layout: PreviousObjectLayout {
+                row_start: 1,
+                ..object.layout.clone()
+            },
+            ..object.clone()
+        };
+        assert!(wrong_layout
+            .validate_for_activation(&plan, activation, TOY_POSITIONS, TOY_HIDDEN)
+            .is_err());
+        let wrong_object = PreviousObjectPlan {
+            id: Digest([0xA2; 32]),
+            ..object.clone()
+        };
+        assert!(wrong_object
+            .validate_for_activation(&plan, activation, TOY_POSITIONS, TOY_HIDDEN)
+            .is_err());
+        let wrong_consumer = PreviousObjectPlan {
+            consumer_port: 1,
+            ..object.clone()
+        };
+        assert!(wrong_consumer
+            .validate_for_activation(&plan, activation, TOY_POSITIONS, TOY_HIDDEN)
+            .is_err());
+
+        let mut missing = plan.clone();
+        missing.previous_object = None;
+        assert!(select_output_head_step_for(
+            &missing,
+            TOY_POSITIONS,
+            TOY_HIDDEN,
+            TOY_COLUMNS,
+            TOY_ASSET,
+        )
+        .is_err());
+        let mut swapped = plan.clone();
+        swapped.previous_object.as_mut().unwrap().owner.step += 1;
+        assert!(select_output_head_step_for(
+            &swapped,
+            TOY_POSITIONS,
+            TOY_HIDDEN,
+            TOY_COLUMNS,
+            TOY_ASSET,
+        )
+        .is_err());
     }
 
     fn group_code() -> CodeParams {
@@ -2081,7 +2217,11 @@ mod tests {
             argmax: (0..TOY_POSITIONS as u32).collect(),
             output: Vec::new(),
         };
-        let outputs = vec![vec![activation.clone()], vec![output.clone()]];
+        let outputs = vec![
+            vec![activation.clone()],
+            vec![activation.clone()],
+            vec![output.clone()],
+        ];
 
         let encoded = encoded_table(&values);
         let send = HiddenSendPlan {
@@ -2294,8 +2434,8 @@ mod tests {
             &output_head_claims(
                 fixture.shape,
                 &OutputHeadInputs {
-                    activation: fixture.outputs[0][0].clone(),
-                    output: fixture.outputs[1][0].clone(),
+                    activation: fixture.outputs[1][0].clone(),
+                    output: fixture.outputs[2][0].clone(),
                 },
                 &[],
             )
@@ -2334,8 +2474,8 @@ mod tests {
             &output_head_claims(
                 fixture.shape,
                 &OutputHeadInputs {
-                    activation: fixture.outputs[0][0].clone(),
-                    output: fixture.outputs[1][0].clone(),
+                    activation: fixture.outputs[1][0].clone(),
+                    output: fixture.outputs[2][0].clone(),
                 },
                 &[],
             )
@@ -2371,8 +2511,8 @@ mod tests {
     fn changed_activation_or_output_is_rejected() {
         let mut fixture = fixture();
         let setup = verifier_setup(&fixture);
-        let original_zero = fixture.outputs[0][0][0];
-        fixture.outputs[0][0][0] = original_zero.wrapping_add(1);
+        let original_zero = fixture.outputs[1][0][0];
+        fixture.outputs[1][0][0] = original_zero.wrapping_add(1);
         let outputs = fixture.outputs.clone();
         let request = trace_request(&fixture, &outputs).unwrap();
         let claims = output_head_claims(fixture.shape, &request.inputs, &[]).unwrap();
@@ -2393,9 +2533,9 @@ mod tests {
             &fixture.proof.session,
         )
         .is_err());
-        fixture.outputs[0][0][0] = original_zero;
+        fixture.outputs[1][0][0] = original_zero;
 
-        fixture.outputs[1][0][0] = fixture.outputs[1][0][0].wrapping_add(1);
+        fixture.outputs[2][0][0] = fixture.outputs[2][0][0].wrapping_add(1);
         let outputs = fixture.outputs.clone();
         let request = trace_request(&fixture, &outputs).unwrap();
         let claims = output_head_claims(fixture.shape, &request.inputs, &[]).unwrap();
@@ -2437,7 +2577,12 @@ mod tests {
         )
         .is_err());
         let mut changed = fixture.plan.clone();
-        changed.steps[1].inputs[1] = PlanSource::asset("missing_head_i32.bin");
+        let matmul = changed
+            .steps
+            .iter()
+            .position(|step| step.opcode == OpCode::MatMul)
+            .unwrap();
+        changed.steps[matmul].inputs[1] = PlanSource::asset("missing_head_i32.bin");
         let _setup = verifier_setup(&fixture);
         let request = prepare_output_head_trace_for(
             &fixture.public,
@@ -2484,8 +2629,8 @@ mod tests {
             &output_head_claims(
                 fixture.shape,
                 &OutputHeadInputs {
-                    activation: fixture.outputs[0][0].clone(),
-                    output: fixture.outputs[1][0].clone(),
+                    activation: fixture.outputs[1][0].clone(),
+                    output: fixture.outputs[2][0].clone(),
                 },
                 &[],
             )
@@ -2532,10 +2677,10 @@ mod tests {
     ) -> (Vec<Vec<i64>>, OutputHeadOutputPlan, ActivationCommitment) {
         let rows: Vec<Vec<i64>> = (0..TOY_POSITIONS)
             .map(|position| {
-                fixture.outputs[0][0][position * TOY_HIDDEN..(position + 1) * TOY_HIDDEN].to_vec()
+                fixture.outputs[1][0][position * TOY_HIDDEN..(position + 1) * TOY_HIDDEN].to_vec()
             })
             .collect();
-        let expected = toy_expected_argmax(&fixture.outputs[1][0]);
+        let expected = toy_expected_argmax(&fixture.outputs[2][0]);
         let output = build_output_head_output_plan_for(
             &fixture.plan,
             TOY_POSITIONS,
@@ -2577,7 +2722,7 @@ mod tests {
         assert_eq!(proof.session.first.activation, activation);
         let expected_output: Vec<Vec<i64>> = (0..TOY_POSITIONS)
             .map(|position| {
-                fixture.outputs[1][0]
+                fixture.outputs[2][0]
                     [position * TOY_COLUMNS..(position + 1) * TOY_COLUMNS]
                     .to_vec()
             })
@@ -2896,9 +3041,11 @@ mod tests {
         assert!(close_output_relation(&forged, &rows).is_err());
         // A forged mask constant is not a negative mask.
         let mut bad_plan = fixture.plan.clone();
-        for source in &mut bad_plan.steps[2].inputs {
-            if let PlanSource::Constant(PlanConstant::VocabMask { masked, .. }) = source {
-                *masked = 0;
+        for step in &mut bad_plan.steps {
+            for source in &mut step.inputs {
+                if let PlanSource::Constant(PlanConstant::VocabMask { masked, .. }) = source {
+                    *masked = 0;
+                }
             }
         }
         assert!(build_output_head_output_plan_for(
@@ -2963,7 +3110,7 @@ mod tests {
         assert_ne!(signed.root(), unsigned.root());
         let output_rows: Vec<Vec<i64>> = (0..TOY_POSITIONS)
             .map(|position| {
-                fixture.outputs[1][0]
+                fixture.outputs[2][0]
                     [position * TOY_COLUMNS..(position + 1) * TOY_COLUMNS]
                     .to_vec()
             })

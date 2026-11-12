@@ -1016,6 +1016,7 @@ mod tests {
             argmax_steps: Vec::new(),
             final_output: None,
             model_version: 1,
+            previous_object: None,
         };
         let selection = SelectedMatmulStep::select(&plan, 1).unwrap();
         let trace = SharedTrace {
