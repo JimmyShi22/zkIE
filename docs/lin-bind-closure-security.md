@@ -27,8 +27,8 @@ verification.
 
 Snapshot: the closed relation at code basis `3b3e8ecc`, with the bounded-read
 rollback `8d32d3de`; fixture `gpt2-seq16`, 16 positions. The default two-stage
-formal proof is 66,135,784 B (the previous single-stage snapshot was
-9,939,144 B); the three-stage same-parameter comparison is 214,228,928 B.
+formal proof is 65,432,832 B (the previous single-stage snapshot was
+9,939,144 B); the interval three-stage comparison is 212,523,920 B.
 The committed document is version 15; version 15 adds the interval planner and its accounting; version 14 added the CS switch random
 material and the wired multi-stage status.
 
@@ -1835,7 +1835,7 @@ document or the test-only module is not a new validation of the production
 protocol.
 
 `[FACT]` `NUM` Compatibility evidence. The default two-stage formal seq16
-proof is 66,135,784 bytes (three-stage same-parameter 214,228,928 bytes); the
+proof is 65,432,832 bytes (three-stage same-parameter 212,523,920 bytes); the
 old single-stage 9,939,144-byte artifact was a version-4 envelope and is not
 accepted by the version-5 decoder (UnsupportedVersion; the formal outer
 negative matrix checks this). The earlier mask-sampling counter evidence still

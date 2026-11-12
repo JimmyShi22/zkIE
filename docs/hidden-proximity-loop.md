@@ -169,8 +169,9 @@ and whole test 674.20 s. The Q3 ledger rerun measured hidden prove
 377,899 ms, hidden verify 64,966 ms, the same 66,135,784-byte proof and
 169,442,488 KiB maximum RSS; its 1,192.65 s test wall includes the enlarged
 outer negative matrix. The same-parameter three-stage comparison
-measured hidden prove 768,920 ms, hidden verify 75,151 ms, proof 214,228,928
-bytes, maximum RSS 212,843,964 KiB and whole test 1,083.66 s. The earlier
+measured hidden prove 768,897 ms, hidden verify 74,595 ms, proof 212,523,920
+bytes, maximum RSS 213,916,484 KiB and whole test 1,667.56 s (the wall
+includes the outer normal/negative matrix). The earlier
 positions=2 three-stage run (prove 736,296-744,204 ms, proof 9,527,120 bytes)
 is a different security setting and is not compared as a cost baseline. The
 numbers are recorded as a resource cost of the safe-parameter loop, not as an
