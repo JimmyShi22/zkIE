@@ -1,0 +1,5 @@
+ef077275 Extract the committed product-sumcheck group and transcript layer
+ crates/zkie-ops/src/proof/committed_psc.rs  | 775 ++++++++++++++++++++++++++++
+ crates/zkie-ops/src/proof/mod.rs            |   1 +
+ crates/zkie-ops/src/proof/output_closure.rs | 425 +++------------
+ 3 files changed, 842 insertions(+), 359 deletions(-)

@@ -1,0 +1,159 @@
+warning: unused variable: `number`
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1513:9
+     |
+1513 |         number: u32,
+     |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_number`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `target`
+   --> crates/zkie-engine/src/pcs/request/relation.rs:881:5
+    |
+881 |     target: Fp3,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+
+warning: unused variable: `columns_usize`
+   --> crates/zkie-engine/src/pcs/request/table.rs:952:13
+    |
+952 |         let columns_usize = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_columns_usize`
+
+warning: field `target` is never read
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1118:5
+     |
+1112 | struct FoldOutputMeta {
+     |        -------------- field in this struct
+...
+1118 |     target: Fp3,
+     |     ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-engine` (lib) generated 4 warnings (run `cargo fix --lib -p zkie-engine` to apply 3 suggestions)
+warning: unused import: `MODULUS`
+   --> crates/zkie-ops/src/proof/bat_fold_session.rs:147:59
+    |
+147 | use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE, MODULUS};
+    |                                                           ^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/base_last_session.rs:589:13
+    |
+589 |         let mut message = self.chain.message();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `first`
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:8880:5
+     |
+8880 |     first: &HiddenSendMessages,
+     |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_first`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `n`
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:214:9
+    |
+214 |     let n = word_n(word)?;
+    |         ^ help: if this is intentional, prefix it with an underscore: `_n`
+
+warning: unused variable: `group`
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:376:15
+    |
+376 | fn base_error(group: &GroupShape, analysis: &Analysis) -> Bound {
+    |               ^^^^^ help: if this is intentional, prefix it with an underscore: `_group`
+
+warning: field `plan` is never read
+   --> crates/zkie-ops/src/proof/cs_multi_session.rs:201:5
+    |
+195 | pub struct CsMultiSession {
+    |            -------------- field in this struct
+...
+201 |     plan: RuntimeTreePlan,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `m` is never read
+  --> crates/zkie-ops/src/proof/proximity_planner.rs:57:5
+   |
+52 | struct Proximity {
+   |        --------- field in this struct
+...
+57 |     m: u64,
+   |     ^
+   |
+   = note: `Proximity` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: function `batched_rows` is never used
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:516:4
+    |
+516 | fn batched_rows(word: &Word) -> u64 {
+    |    ^^^^^^^^^^^^
+
+warning: unused import: `zkie_core::common::field::PrimeField64`
+   --> crates/zkie-ops/src/proof/committed_psc.rs:517:9
+    |
+517 |     use zkie_core::common::field::PrimeField64;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ClosurePlan`
+    --> crates/zkie-ops/src/proof/output_head_lin.rs:1595:57
+     |
+1595 |     use crate::proof::output_closure::{ClosureMaskPlan, ClosurePlan};
+     |                                                         ^^^^^^^^^^^
+
+warning: unused import: `PrimeField64`
+    --> crates/zkie-ops/src/proof/output_head_lin.rs:1602:61
+     |
+1602 |     use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
+     |                                                             ^^^^^^^^^^^^
+
+warning: `zkie-ops` (lib) generated 8 warnings (run `cargo fix --lib -p zkie-ops` to apply 5 suggestions)
+warning: `zkie-ops` (lib test) generated 11 warnings (8 duplicates) (run `cargo fix --lib -p zkie-ops --tests` to apply 3 suggestions)
+warning: unused variable: `oracle`
+   --> crates/zkie-ops/tests/relation_openings.rs:252:10
+    |
+252 |     let (oracle, openings) =
+    |          ^^^^^^ help: if this is intentional, prefix it with an underscore: `_oracle`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-ops` (test "relation_openings") generated 1 warning (run `cargo fix --test "relation_openings" -p zkie-ops` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/zkie_ops-d20b4f9af95f6295)
+
+running 7 tests
+test proof::committed_psc::tests::malformed_position_and_tree_messages_are_rejected ... ok
+test proof::committed_psc::tests::absorbed_points_are_deterministic_and_tagged ... ok
+test proof::committed_psc::tests::positions_and_tree_plans_round_trip ... ok
+test proof::committed_psc::tests::malformed_product_sumcheck_transcripts_are_rejected ... ok
+test proof::committed_psc::tests::committed_groups_derive_roots_and_reject_broken_shapes ... ok
+test proof::committed_psc::tests::challenge_sources_are_deterministic_and_position_domain_separated ... ok
+test proof::committed_psc::tests::product_sumcheck_transcript_round_trips ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 261 filtered out; finished in 0.00s
+
+     Running tests/anchor_check.rs (target/debug/deps/anchor_check-caf28f694e3a6b03)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/plan_check.rs (target/debug/deps/plan_check-3943ead61eabf449)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/relation_openings.rs (target/debug/deps/relation_openings-6b99078b27fefaef)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s
+

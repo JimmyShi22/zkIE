@@ -1,0 +1,6 @@
+workspace: 48 suites, 815 passed, 0 failed, 17 ignored
+focused committed_psc: 7 passed, 0 failed
+cargo check -p zkie-ops: clean, 8 pre-existing warnings
+proof bytes before: 45,080 B sha256 7a5da6ebcbfdb61d5ee88ab60e67f45613906959b0c5de998cb870f5e1de4cfb
+proof bytes after:  45,080 B sha256 7a5da6ebcbfdb61d5ee88ab60e67f45613906959b0c5de998cb870f5e1de4cfb
+cmp: identical
