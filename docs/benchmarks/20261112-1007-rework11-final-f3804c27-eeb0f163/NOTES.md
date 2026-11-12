@@ -3,7 +3,8 @@
 ## Scheme and baseline
 
 - Scheme: `rework11-final`.
-- Code: `f3804c27`; previous round head `eeb0f163`.
+- Code: document commit `f3804c27`; trace and final workspace head `46de871f`;
+  previous round head `eeb0f163`.
 - This round changes only `docs/lin-bind-closure-security.md` (v8 -> v9). The
   production code, test path, plan, parameters, commitments, challenge order
   and proof format are unchanged.
@@ -32,7 +33,10 @@ path changed.
 ## Workspace
 
 `cargo test --workspace`: 48 test binaries, 751 passed, 0 failed, 17 ignored.
-The complete log is `workspace-test.log`.
+The first run was on the v9 document commit `f3804c27` (`workspace-test.txt`);
+the final rerun was on `46de871f` (`workspace-final.txt`). Both give the same
+counts. The only commits after `f3804c27` are this trace note and its log, so
+the tested production/test tree is unchanged.
 
 ## Reused seq16x3 numbers
 
