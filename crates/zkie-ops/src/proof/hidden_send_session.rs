@@ -22096,7 +22096,7 @@ mod merged_tests {
             tail: Some(crate::proof::hidden_norm_psc::NormOutputTailPlan {
                 group: NormGroupPlan {
                     shape: WShape::new(
-                        128,
+                        256,
                         code(),
                         1,
                         POSITIONS,
@@ -22107,7 +22107,7 @@ mod merged_tests {
                         W_CONFIGURATION,
                     )
                     .unwrap(),
-                    columns: 128,
+                    columns: 256,
                     group: 94,
                     oracle_base: 20_400,
                     openings: 1,
@@ -22123,6 +22123,10 @@ mod merged_tests {
                 clamp: Some(crate::proof::hidden_norm_psc::NormClampWidths {
                     low: 4,
                     high: 4,
+                    low_strict: 4,
+                    low_nonstrict: 4,
+                    high_strict: 4,
+                    high_nonstrict: 4,
                 }),
             }),
         }

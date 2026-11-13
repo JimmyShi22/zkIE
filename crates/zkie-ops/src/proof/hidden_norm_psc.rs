@@ -2745,11 +2745,16 @@ impl NormOutputTailWidths {
 }
 
 /// The byte widths of the clamp comparison rows: the offset distances to the
-/// low and high bounds.
+/// low and high bounds and the four sign-consistency slacks (strict and
+/// non-strict per bound).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NormClampWidths {
     pub low: usize,
     pub high: usize,
+    pub low_strict: usize,
+    pub low_nonstrict: usize,
+    pub high_strict: usize,
+    pub high_nonstrict: usize,
 }
 
 /// The trusted plan of the output tail witness rows: the quotient, remainder,
@@ -2770,6 +2775,10 @@ impl NormOutputTailPlan {
             Some(clamp) => clamp
                 .low
                 .checked_add(clamp.high)
+                .and_then(|value| value.checked_add(clamp.low_strict))
+                .and_then(|value| value.checked_add(clamp.low_nonstrict))
+                .and_then(|value| value.checked_add(clamp.high_strict))
+                .and_then(|value| value.checked_add(clamp.high_nonstrict))
                 .and_then(|value| value.checked_add(2))
                 .ok_or(Error::ResourceLimit)?,
             None => 0,
@@ -2794,7 +2803,14 @@ impl NormOutputTailPlan {
         }
         match (&self.clamp, output.clamp) {
             (Some(clamp), Some((low, high))) => {
-                for width in [clamp.low, clamp.high] {
+                for width in [
+                    clamp.low,
+                    clamp.high,
+                    clamp.low_strict,
+                    clamp.low_nonstrict,
+                    clamp.high_strict,
+                    clamp.high_nonstrict,
+                ] {
                     if width == 0 || width > 7 {
                         return Err(Error::InvalidConfig);
                     }
@@ -2857,6 +2873,10 @@ impl NormOutputTailPlan {
                 writer.put_u64(1);
                 writer.put_u64(clamp.low as u64);
                 writer.put_u64(clamp.high as u64);
+                writer.put_u64(clamp.low_strict as u64);
+                writer.put_u64(clamp.low_nonstrict as u64);
+                writer.put_u64(clamp.high_strict as u64);
+                writer.put_u64(clamp.high_nonstrict as u64);
             }
             None => writer.put_u64(0),
         }
@@ -2974,12 +2994,61 @@ impl NormOutputTailPlan {
                 put(&mut values, low_at, low_value, clamp_widths.low)?;
                 put(&mut values, high_at, high_value, clamp_widths.high)?;
                 let low_selector = high_at + clamp_widths.high;
-                if row.pre_clamp[column] < low as i128 {
+                let pre = row.pre_clamp[column];
+                let below = pre < low as i128;
+                let above = pre > high as i128;
+                if below {
                     values[low_selector] = Fp3::ONE;
                 }
-                if row.pre_clamp[column] > high as i128 {
+                if above {
                     values[low_selector + 1] = Fp3::ONE;
                 }
+                let low_strict_at = low_selector + 2;
+                let low_nonstrict_at = low_strict_at + clamp_widths.low_strict;
+                let high_strict_at = low_nonstrict_at + clamp_widths.low_nonstrict;
+                let high_nonstrict_at = high_strict_at + clamp_widths.high_strict;
+                let low_strict = if below {
+                    (low as i128)
+                        .checked_sub(pre)
+                        .and_then(|value| value.checked_sub(1))
+                        .ok_or(Error::BoundViolation)?
+                } else {
+                    0
+                };
+                let low_nonstrict = if below {
+                    0
+                } else {
+                    pre.checked_sub(low as i128)
+                        .ok_or(Error::BoundViolation)?
+                };
+                let high_strict = if above {
+                    pre.checked_sub(high as i128)
+                        .and_then(|value| value.checked_sub(1))
+                        .ok_or(Error::BoundViolation)?
+                } else {
+                    0
+                };
+                let high_nonstrict = if above {
+                    0
+                } else {
+                    (high as i128)
+                        .checked_sub(pre)
+                        .ok_or(Error::BoundViolation)?
+                };
+                put(&mut values, low_strict_at, low_strict, clamp_widths.low_strict)?;
+                put(
+                    &mut values,
+                    low_nonstrict_at,
+                    low_nonstrict,
+                    clamp_widths.low_nonstrict,
+                )?;
+                put(&mut values, high_strict_at, high_strict, clamp_widths.high_strict)?;
+                put(
+                    &mut values,
+                    high_nonstrict_at,
+                    high_nonstrict,
+                    clamp_widths.high_nonstrict,
+                )?;
             }
         }
         Ok(values)
@@ -6180,8 +6249,15 @@ mod tests {
             shifted: 3,
             pre_clamp: 3,
         };
-        let clamp_widths = NormClampWidths { low: 4, high: 4 };
-        let tail_columns = 128u64;
+        let clamp_widths = NormClampWidths {
+            low: 4,
+            high: 4,
+            low_strict: 4,
+            low_nonstrict: 4,
+            high_strict: 4,
+            high_nonstrict: 4,
+        };
+        let tail_columns = 256u64;
         let tail_group = NormGroupPlan {
             shape: WShape::new(
                 tail_columns,
@@ -6217,7 +6293,7 @@ mod tests {
                 .unwrap()
                 .columns(plan.columns)
                 .unwrap(),
-            128
+            256
         );
 
         let mut changed = with_tail.clone();
