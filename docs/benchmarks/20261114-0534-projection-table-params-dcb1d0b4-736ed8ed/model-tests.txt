@@ -1,0 +1,181 @@
+warning: unused variable: `number`
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1513:9
+     |
+1513 |         number: u32,
+     |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_number`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `target`
+   --> crates/zkie-engine/src/pcs/request/relation.rs:881:5
+    |
+881 |     target: Fp3,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+
+warning: unused variable: `columns_usize`
+   --> crates/zkie-engine/src/pcs/request/table.rs:952:13
+    |
+952 |         let columns_usize = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_columns_usize`
+
+warning: field `target` is never read
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1118:5
+     |
+1112 | struct FoldOutputMeta {
+     |        -------------- field in this struct
+...
+1118 |     target: Fp3,
+     |     ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-engine` (lib) generated 4 warnings (run `cargo fix --lib -p zkie-engine` to apply 3 suggestions)
+warning: unused import: `MODULUS`
+   --> crates/zkie-ops/src/proof/bat_fold_session.rs:147:59
+    |
+147 | use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE, MODULUS};
+    |                                                           ^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/base_last_session.rs:589:13
+    |
+589 |         let mut message = self.chain.message();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reader`
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:2233:5
+     |
+2233 |     reader: &IndexReader,
+     |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_reader`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `first`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:14108:5
+      |
+14108 |     first: &HiddenSendMessages,
+      |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_first`
+
+warning: unused variable: `q_at`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:14914:9
+      |
+14914 |     let q_at = 0usize;
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_q_at`
+
+warning: unused variable: `q_at`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:15014:9
+      |
+15014 |     let q_at = 0usize;
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_q_at`
+
+warning: unused variable: `i`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:16006:10
+      |
+16006 |     for (i, m) in members.iter().enumerate() {
+      |          ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `m`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:16006:13
+      |
+16006 |     for (i, m) in members.iter().enumerate() {
+      |             ^ help: if this is intentional, prefix it with an underscore: `_m`
+
+warning: unused variable: `n`
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:214:9
+    |
+214 |     let n = word_n(word)?;
+    |         ^ help: if this is intentional, prefix it with an underscore: `_n`
+
+warning: unused variable: `group`
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:376:15
+    |
+376 | fn base_error(group: &GroupShape, analysis: &Analysis) -> Bound {
+    |               ^^^^^ help: if this is intentional, prefix it with an underscore: `_group`
+
+warning: field `plan` is never read
+   --> crates/zkie-ops/src/proof/cs_multi_session.rs:201:5
+    |
+195 | pub struct CsMultiSession {
+    |            -------------- field in this struct
+...
+201 |     plan: RuntimeTreePlan,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `m` is never read
+  --> crates/zkie-ops/src/proof/proximity_planner.rs:57:5
+   |
+52 | struct Proximity {
+   |        --------- field in this struct
+...
+57 |     m: u64,
+   |     ^
+   |
+   = note: `Proximity` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: function `batched_rows` is never used
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:516:4
+    |
+516 | fn batched_rows(word: &Word) -> u64 {
+    |    ^^^^^^^^^^^^
+
+warning: `zkie-ops` (lib) generated 13 warnings (run `cargo fix --lib -p zkie-ops` to apply 10 suggestions)
+warning: unused import: `zkie_engine::pcs::request::field::E_DEGREE`
+  --> models/gpt2/src/lm_head_plan.rs:11:5
+   |
+11 | use zkie_engine::pcs::request::field::E_DEGREE;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_step`
+   --> models/gpt2/src/executor.rs:346:21
+    |
+346 |             let (k, k_step) = {
+    |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_step`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-models-gpt2` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gpt2` to apply 2 suggestions)
+warning: `zkie-models-gpt2` (lib test) generated 1 warning (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/zkie_models_gpt2-8e64cd2bc4584365)
+
+running 21 tests
+test config::tests::fixed_point_profile_is_frozen ... ok
+test lm_head_plan::tests::a_compiled_base_star_is_checked ... ok
+test lm_head_plan::tests::a_compiled_omega_where_the_codes_agree_is_rejected ... ok
+test lm_head_plan::tests::a_compiled_position_count_is_checked ... ok
+test lm_head_plan::tests::a_compiled_linear_shape_is_checked ... ok
+test lm_head_plan::tests::a_compiled_stage_with_another_mask_message_is_rejected ... ok
+test lm_head_plan::tests::a_compiled_stage_with_another_message_is_rejected ... ok
+test lm_head_plan::tests::a_table_without_room_for_the_matrix_beside_its_pads_is_rejected ... ok
+test lm_head_plan::tests::a_wrong_group_mask_is_rejected ... ok
+test lm_head_plan::tests::a_wrong_last_stage_is_rejected ... ok
+test lm_head_plan::tests::a_wrong_own_main_code_is_rejected ... ok
+test lm_head_plan::tests::a_wrong_table_row_count_is_rejected ... ok
+test lm_head_plan::tests::the_compiled_plan_matches_the_lines ... ok
+test lm_head_plan::tests::the_fixed_plan_is_admissible ... ok
+test lm_head_plan::tests::the_folded_and_omega_groups_share_their_mask_code ... ok
+test config::tests::asset_specs_have_declared_shapes ... ok
+test lm_head_plan::tests::the_once_and_proof_sets_are_checked_separately ... ok
+test plan::tests::projection_table_params_describe_the_first_k_weight ... ok
+test config::tests::graph_is_topologically_valid ... ok
+test plan::tests::output_head_declares_the_previous_object ... ok
+test plan::tests::plan_step_counts_match_executor ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests zkie_models_gpt2
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -1,0 +1,86 @@
+commit dcb1d0b40c3d35413391659dd9eba27e933c31ad
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Sat Nov 14 05:34:52 2026 +0800
+
+    Add the trusted table parameters for the first projection weight
+    
+    The gpt2 plan now expresses the encoded table geometry of the first K projection weight and validates the parameters against the real asset specification. The commit and proof wiring are the next step; no anchor, policy or proof path changes here.
+
+diff --git a/models/gpt2/src/plan.rs b/models/gpt2/src/plan.rs
+index 52324c42..4cc48185 100644
+--- a/models/gpt2/src/plan.rs
++++ b/models/gpt2/src/plan.rs
+@@ -7,6 +7,9 @@ use zkie_core::error::{Error, Result};
+ use zkie_core::types::Digest;
+ use zkie_ops::op::OpCode;
+ use zkie_ops::proof::model_commitment::ModelAssetSpec;
++use zkie_engine::pcs::request::code::CodeParams;
++use zkie_engine::pcs::request::table::{IndexShape, TableDistances};
++use zkie_ops::proof::asset_table::{AssetTableLayout, AssetTableParams};
+ use zkie_ops::proof::plan::{
+     config, PlanBuilder, PlanConstant, PlanLayout, PlanSource, TracePlan,
+ };
+@@ -410,10 +413,63 @@ pub fn asset_specs() -> Vec<ModelAssetSpec> {
+     crate::executor::asset_specs()
+ }
+ 
++/// The trusted table parameters of one square projection weight. The table
++/// geometry is plan data: 1024 rows, a 2048-entry message with an eight-entry
++/// code tail, and a 1024-element valid row. The parameters are validated
++/// against the asset specification before they are used.
++pub fn projection_table_params(path: &str) -> Option<AssetTableParams> {
++    let spec = asset_specs().into_iter().find(|spec| spec.path == path)?;
++    if spec.row_width != HIDDEN as usize || spec.element_count != (HIDDEN as u64) * (HIDDEN as u64) {
++        return None;
++    }
++    Some(AssetTableParams {
++        asset_id: spec.asset_id,
++        path: spec.path.clone(),
++        element_count: spec.element_count,
++        row_width: spec.row_width as u64,
++        encoding: spec.encoding.clone(),
++        shape: IndexShape {
++            code: CodeParams { log_n: 12, ell: 2048, r: 8 },
++            v: 10,
++            answers: 1,
++            salt_bytes: 40,
++            distances: TableDistances {
++                radius: 0,
++                later_radius: 0,
++                m_once: 0,
++                m_later: 0,
++            },
++        },
++        valid_min: i32::MIN as i64,
++        valid_max: i32::MAX as i64,
++        layout: AssetTableLayout {
++            row_width: spec.row_width as u64,
++            message_len: 2048,
++            tail_len: 8,
++            pads: 3,
++            valid_elements: spec.element_count,
++            padding_zero: true,
++        },
++    })
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn projection_table_params_describe_the_first_k_weight() {
++        let path = "gpt2/weights/L0_k_w_i32.bin";
++        let params = projection_table_params(path).expect("table params");
++        let spec = asset_specs()
++            .into_iter()
++            .find(|spec| spec.path == path)
++            .expect("asset spec");
++        zkie_ops::proof::asset_table::validate_asset_table_params(&spec, &params).unwrap();
++        assert_eq!(params.shape.rows(), 1024);
++        assert_eq!(params.element_count, 1024 * 1024);
++    }
++
+     #[test]
+     fn plan_step_counts_match_executor() {
+         assert_eq!(trace_plan(16).unwrap().steps.len(), 4462);
