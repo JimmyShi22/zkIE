@@ -3743,6 +3743,14 @@ pub struct NormOutputPlan {
 }
 
 impl NormOutputPlan {
+    /// The hidden output object the next layer consumes. The out group is the
+    /// same committed group the tail relation rows address, at the same
+    /// oracles and roots; the consumer reads this object, not a copy and not a
+    /// second root.
+    pub fn hd_group(&self) -> &NormGroupPlan {
+        &self.out
+    }
+
     fn validate(&self, plan: &NormPlan) -> Result<()> {
         for group in [&self.broadcast, &self.product, &self.image, &self.out] {
             if group.columns != plan.columns

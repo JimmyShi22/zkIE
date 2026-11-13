@@ -23230,6 +23230,183 @@ mod merged_tests {
     }
 
     #[test]
+    fn norm_output_hd_is_the_committed_out_object() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = slack_lookup_fixture(&activation);
+        let output_plan = plan.norm.as_ref().unwrap().output.as_ref().unwrap();
+        assert_eq!(output_plan.hd_group(), &output_plan.out);
+        let (messages, hidden_witness) = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+            &mut params,
+        )
+        .unwrap();
+        let mut verifier_plan = plan.clone();
+        verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &messages).is_ok());
+        let output = messages.first.norm.as_ref().unwrap().output.as_ref().unwrap();
+        let committed = &witness.output.as_ref().unwrap().out;
+        for entry in &output.out.message.group.entries {
+            assert_eq!(
+                entry.oracle,
+                output_plan.out.oracle_base + entry.position as u64
+            );
+            assert_eq!(entry.shape, output_plan.out.shape.oracle_shape());
+        }
+        assert_eq!(output.out.message.roots, committed.committed.roots);
+        // The consumer reads the same committed object: the out value at a
+        // column is the committed cell, not a second root.
+        let rows = usize::try_from(output_plan.out.shape.main_rows).unwrap();
+        let ell = usize::try_from(output_plan.out.shape.code.ell).unwrap();
+        let op_rows = &witness.output.as_ref().unwrap().rows;
+        for position in 0..POSITIONS as usize {
+            for column in 0..COLUMNS as usize {
+                let row = column % rows;
+                let place = column / rows;
+                if place >= ell {
+                    break;
+                }
+                assert_eq!(
+                    committed.messages[position][row][place],
+                    crate::proof::output_closure::fp3_signed(op_rows[position].out[column] as i128)
+                        .unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn norm_output_hd_cross_position_substitution_is_rejected() {
+        let activation = activation();
+        let (plan, witness, mut params) = slack_lookup_fixture(&activation);
+        let output_plan = plan.norm.as_ref().unwrap().output.as_ref().unwrap().clone();
+        let columns = usize::try_from(output_plan.out.columns).unwrap();
+        let rows = usize::try_from(output_plan.out.shape.main_rows).unwrap();
+        let ell = usize::try_from(output_plan.out.shape.code.ell).unwrap();
+        let messages = witness
+            .output
+            .as_ref()
+            .unwrap()
+            .out
+            .committed
+            .messages
+            .clone();
+        let mut values = Vec::with_capacity(messages.len());
+        for (position, message) in messages.iter().enumerate() {
+            let source = if position == 1 { &messages[0] } else { message };
+            let mut slots = vec![Fp3::ZERO; columns];
+            for (slot, value) in slots.iter_mut().enumerate() {
+                if slot / rows < ell {
+                    *value = source[slot % rows][slot / rows];
+                }
+            }
+            values.push(slots);
+        }
+        let mut coins = ByteMaskCoins::new(Digest([0x9a; 32])).unwrap();
+        let substituted = commit_norm_group(&output_plan.out, &values, &mut coins);
+        let mut changed = witness.clone();
+        changed.output.as_mut().unwrap().out.committed = substituted.committed;
+        let mut table = table();
+        let proved = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &changed,
+            &mut params,
+        );
+        match proved {
+            Err(_) => {}
+            Ok((messages, hidden_witness)) => {
+                let mut verifier_plan = plan.clone();
+                verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+                assert!(
+                    verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &messages).is_err(),
+                    "another position's output object must not verify in this position"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn norm_output_hd_root_tampering_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = slack_lookup_fixture(&activation);
+        let (messages, hidden_witness) = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+            &mut params,
+        )
+        .unwrap();
+        let mut verifier_plan = plan.clone();
+        verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        let base = HiddenLinMessages::decode(&plan, &messages.encode().unwrap()).unwrap();
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &base).is_ok());
+        let mut changed = base.clone();
+        changed
+            .first
+            .norm
+            .as_mut()
+            .unwrap()
+            .output
+            .as_mut()
+            .unwrap()
+            .out
+            .message
+            .group
+            .entries[0]
+            .root = Digest([0x9b; 32]);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+        let mut changed = base.clone();
+        let answer = &mut changed
+            .first
+            .norm
+            .as_mut()
+            .unwrap()
+            .output
+            .as_mut()
+            .unwrap()
+            .out
+            .sample
+            .answers[0];
+        *answer = answer.add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+    }
+
+    #[test]
+    fn norm_output_hd_shift_mismatch_is_rejected() {
+        let activation = activation();
+        let (mut plan, witness, mut params) = slack_lookup_fixture(&activation);
+        plan.norm
+            .as_mut()
+            .unwrap()
+            .output
+            .as_mut()
+            .unwrap()
+            .shift += 1;
+        let proved = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table(),
+            Digest([0x71; 32]),
+            &witness,
+            &mut params,
+        );
+        assert!(
+            proved.is_err(),
+            "an output shift that differs from the committed tail rows must not prove"
+        );
+    }
+
+    #[test]
     fn norm_output_groups_prove_and_verify() {
         let activation = activation();
         let mut table = table();
