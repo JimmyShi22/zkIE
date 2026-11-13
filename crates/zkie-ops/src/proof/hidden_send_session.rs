@@ -5231,6 +5231,11 @@ pub struct HiddenLinOutcome {
     pub dot: Option<DotRowBinding>,
     /// The checked output-closure bindings when the plan carries the closure.
     pub closure: Option<ClosureRowBinding>,
+    /// The checked output product bindings when the plan carries the norm
+    /// output: the original column point and the masked claim the verifier
+    /// accepted. The claim is the masked value, never the private product
+    /// evaluation.
+    pub norm_output: Option<Vec<crate::proof::hidden_norm_psc::NormOutputBinding>>,
 }
 
 /// The prover's private material for the auxiliary unit checks. It is never
@@ -12424,31 +12429,41 @@ fn prove_norm_second(
                     let entries = pointwise_entries
                         .get(instance)
                         .ok_or(Error::ShapeMismatch)?;
+                    let claim_slot = mask_plan.claim_slot(instances, instance)?;
+                    let claim_mask =
+                        mask_witness.committed.entry(mask_plan, claim_slot)?;
+                    let sent = target.add(&claim_mask);
+                    let claim_masks = [crate::proof::psc_general::MaskTerm {
+                        slot: claim_slot,
+                        coefficient: Fp3::ONE,
+                    }];
+                    let mask_entry = |slot: usize| -> Result<Fp3> {
+                        mask_witness.committed.entry(mask_plan, slot)
+                    };
                     let mut challenges =
                         crate::proof::committed_psc::PositionPscChallenges::new(
                             chain,
                             crate::proof::hidden_norm_psc::NORM_OUTPUT_PSC_TAGS,
                             instance as u64,
                         );
-                    let no_masks = |_: usize| -> Result<Fp3> { Err(Error::InvalidIndex) };
                     let (proof, checked) = crate::proof::psc_general::prove_general(
                         &variables,
-                        &[],
-                        &no_masks,
-                        target,
+                        &claim_masks,
+                        &mask_entry,
+                        sent,
                         &crate::proof::psc_general::Summand::Product,
                         None,
                         &mut inner,
                         entries,
                         &mut challenges,
                     )?;
-                    claims.push(target);
+                    claims.push(sent);
                     proofs.push(proof);
                     output_bindings.push(crate::proof::hidden_norm_psc::NormOutputBinding {
                         position: position as u32,
                         kind,
                         point: point.clone(),
-                        claim: target,
+                        claim: sent,
                         output: checked,
                     });
                 }
@@ -12723,9 +12738,14 @@ fn verify_norm_second(
                             crate::proof::hidden_norm_psc::NORM_OUTPUT_PSC_TAGS,
                             instance as u64,
                         );
+                    let claim_slot = mask_plan.claim_slot(instances, instance)?;
+                    let claim_masks = [crate::proof::psc_general::MaskTerm {
+                        slot: claim_slot,
+                        coefficient: Fp3::ONE,
+                    }];
                     let checked = crate::proof::psc_general::verify_general(
                         &variables,
-                        &[],
+                        &claim_masks,
                         claim,
                         &crate::proof::psc_general::Summand::Product,
                         None,
@@ -14385,11 +14405,18 @@ fn output_plain_rows(
             ),
         };
         let claim_member = member_for(claim_oracle)?;
+        let claim_slot = mask_plan.claim_slot(instances, instance)?;
         let mut row = BatRow::new(BatRowKind::Plain);
         row.add_term(
             claim_member.bat_oracle,
             BatPart::Main,
             output_message_coefficients(&claim_group.shape, &eq_claim, columns)?,
+        );
+        row.add_unit(
+            mask_member.bat_oracle,
+            BatPart::Mask,
+            mask_plan.entry_virtual_index(claim_slot)?,
+            Fp3::ONE,
         );
         row.target = word.claim;
         rows.push(row);
@@ -14499,6 +14526,14 @@ fn output_plain_rows(
                 BatPart::Mask,
                 mask_plan.entry_virtual_index(slot)?,
                 *coefficient,
+            );
+        }
+        for term in &word.output.claim_masks {
+            row.add_unit(
+                mask_member.bat_oracle,
+                BatPart::Mask,
+                mask_plan.entry_virtual_index(term.slot)?,
+                term.coefficient,
             );
         }
         row.target = word.output.row_target;
@@ -16097,6 +16132,7 @@ fn verify_second(
     ProximityBaseOutcome,
     Option<DotRowBinding>,
     Option<ClosureRowBinding>,
+    Option<Vec<crate::proof::hidden_norm_psc::NormOutputBinding>>,
 )> {
     let _profile = zkie_engine::profile::Scope::new("verify.second");
     if messages.omega_root != shared.omega_root
@@ -16232,6 +16268,7 @@ fn verify_second(
         proximity.base,
         dot_binding,
         closure_binding,
+        norm_binding.as_ref().and_then(|binding| binding.output.clone()),
     ))
 }
 
@@ -16430,7 +16467,7 @@ fn verify_hidden_lin_inner(
         return Err(Error::InvalidProof);
     }
     let _profile_second = zkie_engine::profile::Scope::new("verify.hidden_lin.second");
-    let (seal, own_claims, own_base, dot_binding, closure_binding) = verify_second(
+    let (seal, own_claims, own_base, dot_binding, closure_binding, norm_output) = verify_second(
         plan,
         reader,
         &messages.first,
@@ -16459,6 +16496,7 @@ fn verify_hidden_lin_inner(
         own_base,
         dot: dot_binding,
         closure: closure_binding,
+        norm_output,
     })
 }
 
@@ -22540,9 +22578,13 @@ mod merged_tests {
         {
             let norm = plan.norm.as_mut().unwrap();
             norm.output = Some(output_plan.clone());
-            norm.mask.as_mut().unwrap().pointwise = 2;
-            norm.mask.as_mut().unwrap().tail =
-                crate::proof::hidden_norm_psc::NORM_OUTPUT_TAIL_RELATIONS;
+            let mask = norm.mask.as_mut().unwrap();
+            mask.pointwise = 2;
+            mask.tail = crate::proof::hidden_norm_psc::NORM_OUTPUT_TAIL_RELATIONS;
+            mask.claims = usize::try_from(norm.shape.positions)
+                .unwrap()
+                .checked_mul(2)
+                .unwrap();
         }
         let gain = vec![2i64, -1, 3, 1];
         let bias = vec![1i64, 2, -1, 2];
@@ -24065,6 +24107,164 @@ mod merged_tests {
         assert!(
             proved.is_err(),
             "a closure winner that differs from the logits must not prove"
+        );
+    }
+
+    #[test]
+    fn norm_output_claims_are_masked() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = slack_lookup_fixture(&activation);
+        let (messages, hidden_witness) = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+            &mut params,
+        )
+        .unwrap();
+        let mut verifier_plan = plan.clone();
+        verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        let outcome = verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &messages).unwrap();
+        let bindings = outcome.norm_output.as_ref().unwrap();
+        assert_eq!(bindings.len(), POSITIONS as usize * 2);
+        let output_witness = witness.output.as_ref().unwrap();
+        let params_values = witness.params.as_ref().unwrap();
+        let proof_bytes = messages.encode().unwrap();
+        for word in bindings {
+            let position = word.position as usize;
+            let (left, right) = norm_pointwise_maps(
+                plan.norm.as_ref().unwrap(),
+                &witness.rows[position],
+                &witness.core[position],
+                &params_values.gain,
+                &output_witness.rows[position],
+                word.kind,
+            )
+            .unwrap();
+            let eq = crate::proof::output_closure::eq_vector(&word.point).unwrap();
+            let mut plain = Fp3::ZERO;
+            for index in 0..left.len() {
+                plain = plain.add(&eq[index].mul(&left[index]).mul(&right[index]));
+            }
+            assert_ne!(
+                word.claim, plain,
+                "the sent product claim must be masked, not the private evaluation"
+            );
+            let mut writer = CanonicalWriter::new();
+            writer.put_fp3(&plain);
+            let needle = writer.into_bytes();
+            assert!(
+                !proof_bytes
+                    .windows(needle.len())
+                    .any(|window| window == needle.as_slice()),
+                "the private product evaluation must not appear in the proof bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn norm_output_claim_tampering_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = slack_lookup_fixture(&activation);
+        let (messages, hidden_witness) = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+            &mut params,
+        )
+        .unwrap();
+        let mut verifier_plan = plan.clone();
+        verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        let mut changed = HiddenLinMessages::decode(&plan, &messages.encode().unwrap()).unwrap();
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_ok());
+        let claim = &mut changed
+            .second
+            .norm
+            .as_mut()
+            .unwrap()
+            .output
+            .as_mut()
+            .unwrap()
+            .claims[0];
+        *claim = claim.add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+    }
+
+    #[test]
+    fn norm_output_claim_mask_tampering_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = slack_lookup_fixture(&activation);
+        let (messages, hidden_witness) = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+            &mut params,
+        )
+        .unwrap();
+        let mut verifier_plan = plan.clone();
+        verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        let mut changed = HiddenLinMessages::decode(&plan, &messages.encode().unwrap()).unwrap();
+        let mask = changed
+            .first
+            .norm
+            .as_mut()
+            .unwrap()
+            .mask
+            .as_mut()
+            .unwrap();
+        mask.root = Digest([0x9e; 32]);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = HiddenLinMessages::decode(&plan, &messages.encode().unwrap()).unwrap();
+        let answer = &mut changed
+            .first
+            .norm
+            .as_mut()
+            .unwrap()
+            .mask
+            .as_mut()
+            .unwrap()
+            .sample
+            .answers[0];
+        *answer = answer.add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+    }
+
+    #[test]
+    fn norm_output_claim_mask_entry_tampering_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = slack_lookup_fixture(&activation);
+        let norm_plan = plan.norm.as_ref().unwrap();
+        let mask_plan = norm_plan.mask.as_ref().unwrap();
+        let instances = norm_plan.shape.positions as usize * norm_plan.relations.len();
+        let slot = mask_plan.claim_slot(instances, 0).unwrap();
+        let ell = usize::try_from(mask_plan.mask_code.ell).unwrap();
+        let mut changed = witness.clone();
+        {
+            let mask = changed.mask.as_mut().unwrap();
+            mask.committed.rows[slot / ell][slot % ell] =
+                mask.committed.rows[slot / ell][slot % ell].add(&Fp3::ONE);
+        }
+        let proved = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &changed,
+            &mut params,
+        );
+        assert!(
+            proved.is_err(),
+            "a claim mask entry that differs from the committed mask message must not prove"
         );
     }
 

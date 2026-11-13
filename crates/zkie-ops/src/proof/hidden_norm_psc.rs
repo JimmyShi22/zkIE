@@ -2523,6 +2523,9 @@ impl NormMaskPlan {
         {
             return Err(Error::InvalidConfig);
         }
+        if self.pointwise > 0 && self.claims < self.pointwise_instances()? {
+            return Err(Error::InvalidConfig);
+        }
         if zkie_engine::pcs::request::code::build_code_plan(
             self.mask_code.log_n,
             self.mask_code.ell,
