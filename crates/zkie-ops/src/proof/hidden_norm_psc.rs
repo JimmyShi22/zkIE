@@ -1033,7 +1033,7 @@ fn fp3_signed(value: i128) -> Result<Fp3> {
 // sumcheck and the row binding.
 
 /// Version of the integrated norm plan and first message.
-pub const NORM_BIND_VERSION: u64 = 11;
+pub const NORM_BIND_VERSION: u64 = 12;
 
 /// The relation indices the bound core supports. The map construction of
 /// every relation is fixed by the relation index; the plan may list only
@@ -2557,6 +2557,88 @@ impl NormOutputTailPlan {
         writer.put_u64(self.widths.shifted as u64);
         writer.put_u64(self.widths.pre_clamp as u64);
     }
+
+    /// The slot values of one position, position-major over the column
+    /// domain: per column the offset quotient digits, the remainder digits,
+    /// the half selector, the offset shifted digits and the offset pre-clamp
+    /// digits. Signed quantities use a public half-range offset.
+    pub fn values(
+        &self,
+        row: &crate::proof::hidden_norm::NormOutputRow,
+        columns: u64,
+    ) -> Result<Vec<Fp3>> {
+        use crate::proof::output_closure::fp3_signed;
+
+        let width = usize::try_from(self.group.columns).map_err(|_| Error::ResourceLimit)?;
+        let count = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+        let slots = self.widths.slots()?;
+        let needed = count.checked_mul(slots).ok_or(Error::ResourceLimit)?;
+        if width < needed {
+            return Err(Error::ShapeMismatch);
+        }
+        for list in [&row.quotient, &row.remainder, &row.shifted, &row.pre_clamp] {
+            if list.len() != count {
+                return Err(Error::ShapeMismatch);
+            }
+        }
+        if row.selector.len() != count {
+            return Err(Error::ShapeMismatch);
+        }
+        let half = |bytes: usize| -> Result<i128> {
+            if bytes == 0 || bytes > 7 {
+                return Err(Error::InvalidConfig);
+            }
+            Ok(1i128 << (8 * bytes - 1))
+        };
+        let put = |values: &mut [Fp3], at: usize, value: i128, bytes: usize| -> Result<()> {
+            if value < 0 {
+                return Err(Error::BoundViolation);
+            }
+            let mut remaining = value as u128;
+            let mut used = 0usize;
+            while used < bytes {
+                values[at + used] = fp3_signed((remaining & 0xff) as i128)?;
+                remaining >>= 8;
+                used += 1;
+            }
+            if remaining != 0 {
+                return Err(Error::BoundViolation);
+            }
+            Ok(())
+        };
+        let half_q = half(self.widths.quotient)?;
+        let half_s = half(self.widths.shifted)?;
+        let half_p = half(self.widths.pre_clamp)?;
+        let mut values = vec![Fp3::ZERO; width];
+        for column in 0..count {
+            let base = column.checked_mul(slots).ok_or(Error::ResourceLimit)?;
+            let quotient = row.quotient[column]
+                .checked_add(half_q)
+                .ok_or(Error::BoundViolation)?;
+            put(&mut values, base, quotient, self.widths.quotient)?;
+            put(
+                &mut values,
+                base + self.widths.quotient,
+                row.remainder[column],
+                self.widths.remainder,
+            )?;
+            let selector = base + self.widths.quotient + self.widths.remainder;
+            if row.selector[column] {
+                values[selector] = Fp3::ONE;
+            }
+            let shifted_at = selector + 1;
+            let shifted = row.shifted[column]
+                .checked_add(half_s)
+                .ok_or(Error::BoundViolation)?;
+            put(&mut values, shifted_at, shifted, self.widths.shifted)?;
+            let pre_at = shifted_at + self.widths.shifted;
+            let pre_clamp = row.pre_clamp[column]
+                .checked_add(half_p)
+                .ok_or(Error::BoundViolation)?;
+            put(&mut values, pre_at, pre_clamp, self.widths.pre_clamp)?;
+        }
+        Ok(values)
+    }
 }
 
 /// The trusted plan of the norm output tail. The first three groups are the
@@ -2727,8 +2809,16 @@ pub struct NormParamWitness {
     pub bias_claim: Option<NormParamClaimWitness>,
 }
 
-/// The prover-side output tail: the exact integer rows and the committed
-/// column groups of the broadcast, product, image and out rows.
+/// The committed output tail group of the first stage. The slot values are
+/// recomputed from the exact output rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormOutputTailWitness {
+    pub committed: NormGroupWitness,
+}
+
+/// The prover-side output tail: the exact integer rows, the committed column
+/// groups of the broadcast, product, image and out rows, and the committed
+/// tail group.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormOutputWitness {
     pub rows: Vec<crate::proof::hidden_norm::NormOutputRow>,
@@ -2736,6 +2826,7 @@ pub struct NormOutputWitness {
     pub product: NormGroupWitness,
     pub image: NormGroupWitness,
     pub out: NormGroupWitness,
+    pub tail: Option<NormOutputTailWitness>,
 }
 
 /// The prover-side witness of the integrated norm groups.
@@ -3192,6 +3283,54 @@ impl NormParamMessage {
     }
 }
 
+/// The public first-stage commitment of the output tail group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormOutputTailMessage {
+    pub group: CommittedPscGroup,
+}
+
+impl NormOutputTailMessage {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut writer = CanonicalWriter::new();
+        self.group.encode_into(&mut writer)?;
+        Ok(writer.into_bytes())
+    }
+
+    pub fn decode(plan: &NormOutputTailPlan, positions: u32, bytes: &[u8]) -> Result<Self> {
+        let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
+        let group = CommittedPscGroup::decode(&mut reader, &plan.group.shape, positions)?;
+        reader.finish()?;
+        let message = Self { group };
+        message.check(plan, positions)?;
+        Ok(message)
+    }
+
+    pub fn check(&self, plan: &NormOutputTailPlan, positions: u32) -> Result<()> {
+        if self.group.message.group.group != plan.group.group
+            || self.group.fault(&plan.group.shape, positions).is_some()
+            || self.group.message.roots.len() != positions as usize
+        {
+            return Err(Error::StatementMismatch);
+        }
+        for (position, entry) in self.group.message.group.entries.iter().enumerate() {
+            if entry.position != position as u32
+                || entry.oracle
+                    != plan
+                        .group
+                        .oracle_base
+                        .checked_add(position as u64)
+                        .ok_or(Error::ResourceLimit)?
+                || entry.shape != plan.group.shape.oracle_shape()
+                || entry.tree != plan.group.shape.tree_plan(position as u32)?
+                || entry.root == Digest::ZERO
+            {
+                return Err(Error::StatementMismatch);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The public first-stage message of the integrated norm relation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormFirstMessages {
@@ -3213,6 +3352,8 @@ pub struct NormFirstMessages {
     pub params: Option<NormParamMessage>,
     /// The output tail group commitments, when the plan carries them.
     pub output: Option<NormOutputMessage>,
+    /// The rounding/bias/clamp tail group, when the plan carries it.
+    pub tail: Option<NormOutputTailMessage>,
 }
 
 impl NormFirstMessages {
@@ -3249,6 +3390,9 @@ impl NormFirstMessages {
         }
         if let Some(output) = &self.output {
             writer.put_bytes(&output.encode()?);
+        }
+        if let Some(tail) = &self.tail {
+            writer.put_bytes(&tail.encode()?);
         }
         Ok(writer.into_bytes())
     }
@@ -3324,6 +3468,14 @@ impl NormFirstMessages {
             )?),
             None => None,
         };
+        let tail = match plan.output.as_ref().and_then(|output| output.tail.as_ref()) {
+            Some(tail_plan) => Some(NormOutputTailMessage::decode(
+                tail_plan,
+                positions,
+                reader.get_bytes()?,
+            )?),
+            None => None,
+        };
         reader.finish()?;
         let message = Self {
             x,
@@ -3337,6 +3489,7 @@ impl NormFirstMessages {
             rstd,
             params,
             output,
+            tail,
         };
         message.check_trusted(plan)?;
         Ok(message)
@@ -3433,6 +3586,14 @@ impl NormFirstMessages {
         match (&plan.output, &self.output) {
             (Some(output_plan), Some(message)) => {
                 message.check(output_plan, plan.shape.positions)?
+            }
+            (None, None) => {}
+            _ => return Err(Error::ShapeMismatch),
+        }
+        let tail_plan = plan.output.as_ref().and_then(|output| output.tail.as_ref());
+        match (tail_plan, &self.tail) {
+            (Some(tail_plan), Some(message)) => {
+                message.check(tail_plan, plan.shape.positions)?
             }
             (None, None) => {}
             _ => return Err(Error::ShapeMismatch),
@@ -5092,6 +5253,7 @@ mod tests {
             rstd: None,
             params: None,
             output: None,
+            tail: None,
         };
         (plan, message, second)
     }
