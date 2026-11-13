@@ -865,7 +865,7 @@ fn fp3_signed(value: i128) -> Result<Fp3> {
 // sumcheck and the row binding.
 
 /// Version of the integrated norm plan and first message.
-pub const NORM_BIND_VERSION: u64 = 9;
+pub const NORM_BIND_VERSION: u64 = 10;
 
 /// The relation indices the bound core supports. The map construction of
 /// every relation is fixed by the relation index; the plan may list only
@@ -1619,6 +1619,10 @@ impl NormPlan {
                 self.variables,
                 self.relations.len(),
             )?;
+            let expected = if self.output.is_some() { 2 } else { 0 };
+            if mask.pointwise != expected {
+                return Err(Error::InvalidConfig);
+            }
         }
         Ok(())
     }
@@ -1725,6 +1729,28 @@ pub struct NormMaskPlan {
     pub hiding: usize,
     pub shown: usize,
     pub claims: usize,
+    /// The number of equality-weighted pointwise product instances per
+    /// position; zero when the plan carries no output tail.
+    pub pointwise: usize,
+    /// The hiding entries of one pointwise instance.
+    pub pointwise_hiding: usize,
+    /// The shown-map masks of one pointwise instance.
+    pub pointwise_shown: usize,
+}
+
+/// The hiding and shown mask counts of one equality-weighted pointwise
+/// product instance over the column domain of a plan with `variables`
+/// product-sumcheck variables (one more than the column bits).
+pub fn norm_pointwise_masks(variables: usize) -> Result<(usize, usize)> {
+    if variables < 2 {
+        return Err(Error::InvalidConfig);
+    }
+    let weights = (0..variables - 1)
+        .map(|_| crate::proof::psc::Weight::equality(Fp3::ZERO, 3))
+        .collect::<Result<Vec<_>>>()?;
+    let summand = crate::proof::psc_general::Summand::Product;
+    let all = crate::proof::psc_general::general_variables(&weights, &summand)?;
+    Ok((hp_entries(&all)?, summand.shown()))
 }
 
 /// The power-of-two own-mask row count from the index-mask rows and the
@@ -1755,11 +1781,86 @@ impl NormMaskPlan {
             .ok_or(Error::ResourceLimit)
     }
 
-    /// The total number of allocated entries: one block per instance plus the
-    /// reserved claim entries.
-    pub fn total_entries(&self, relations: usize) -> Result<usize> {
-        self.instances(relations)?
+    /// The number of pointwise product instances of the plan.
+    pub fn pointwise_instances(&self) -> Result<usize> {
+        (self.positions as usize)
+            .checked_mul(self.pointwise)
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// The allocated entries of one pointwise instance.
+    pub fn pointwise_per_instance(&self) -> Result<usize> {
+        self.pointwise_hiding
+            .checked_add(self.pointwise_shown)
+            .ok_or(Error::ResourceLimit)
+    }
+
+    fn pointwise_entries(&self) -> Result<usize> {
+        self.pointwise_instances()?
+            .checked_mul(self.pointwise_per_instance()?)
+            .ok_or(Error::ResourceLimit)
+    }
+
+    fn pointwise_base(&self, instances: usize) -> Result<usize> {
+        instances
             .checked_mul(self.per_instance()?)
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// The compact slot of one hiding entry of one pointwise instance.
+    pub fn pointwise_hiding_slot(
+        &self,
+        instances: usize,
+        instance: usize,
+        index: usize,
+    ) -> Result<usize> {
+        if self.pointwise == 0
+            || instance >= self.pointwise_instances()?
+            || index >= self.pointwise_hiding
+        {
+            return Err(Error::InvalidIndex);
+        }
+        self.pointwise_base(instances)?
+            .checked_add(
+                instance
+                    .checked_mul(self.pointwise_per_instance()?)
+                    .ok_or(Error::ResourceLimit)?,
+            )
+            .and_then(|base| base.checked_add(index))
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// The compact slot of one shown-value mask of one pointwise instance.
+    pub fn pointwise_shown_slot(
+        &self,
+        instances: usize,
+        instance: usize,
+        index: usize,
+    ) -> Result<usize> {
+        if self.pointwise == 0
+            || instance >= self.pointwise_instances()?
+            || index >= self.pointwise_shown
+        {
+            return Err(Error::InvalidIndex);
+        }
+        self.pointwise_base(instances)?
+            .checked_add(
+                instance
+                    .checked_mul(self.pointwise_per_instance()?)
+                    .ok_or(Error::ResourceLimit)?,
+            )
+            .and_then(|base| base.checked_add(self.pointwise_hiding))
+            .and_then(|base| base.checked_add(index))
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// The total number of allocated entries: one block per product-sumcheck
+    /// instance, one block per pointwise instance, plus the reserved claim
+    /// entries.
+    pub fn total_entries(&self, relations: usize) -> Result<usize> {
+        let instances = self.instances(relations)?;
+        self.pointwise_base(instances)?
+            .checked_add(self.pointwise_entries()?)
             .and_then(|value| value.checked_add(self.claims))
             .ok_or(Error::ResourceLimit)
     }
@@ -1792,8 +1893,8 @@ impl NormMaskPlan {
         if index >= self.claims {
             return Err(Error::InvalidIndex);
         }
-        instance_count
-            .checked_mul(self.per_instance()?)
+        self.pointwise_base(instance_count)?
+            .checked_add(self.pointwise_entries()?)
             .and_then(|base| base.checked_add(index))
             .ok_or(Error::ResourceLimit)
     }
@@ -1893,8 +1994,16 @@ impl NormMaskPlan {
         if self.positions != positions || self.shown != SHOWN_MAPS || self.claims == 0 {
             return Err(Error::InvalidConfig);
         }
+        let (pointwise_hiding, pointwise_shown) =
+            norm_pointwise_masks(variables).map_err(|_| Error::InvalidConfig)?;
         let variables = psc_variables(variables).map_err(|_| Error::InvalidConfig)?;
         if self.hiding != hp_entries(&variables).map_err(|_| Error::InvalidConfig)? {
+            return Err(Error::InvalidConfig);
+        }
+        if self.pointwise_hiding != pointwise_hiding
+            || self.pointwise_shown != pointwise_shown
+            || self.pointwise > 2
+        {
             return Err(Error::InvalidConfig);
         }
         if zkie_engine::pcs::request::code::build_code_plan(
@@ -1946,6 +2055,9 @@ impl NormMaskPlan {
         writer.put_u64(self.hiding as u64);
         writer.put_u64(self.shown as u64);
         writer.put_u64(self.claims as u64);
+        writer.put_u64(self.pointwise as u64);
+        writer.put_u64(self.pointwise_hiding as u64);
+        writer.put_u64(self.pointwise_shown as u64);
     }
 }
 
@@ -2125,6 +2237,35 @@ pub fn norm_mask_entries(
             mask.entry(plan, plan.shown_slot(instance, 1)?)?,
         ];
         entries.push(DotMaskEntries { hiding, shown });
+    }
+    Ok(entries)
+}
+
+/// The committed mask entries of the pointwise product instances, in
+/// position-major order (product, image).
+pub fn norm_pointwise_entries(
+    plan: &NormMaskPlan,
+    mask: &CommittedNormMask,
+    instances: usize,
+) -> Result<Vec<crate::proof::psc_general::GeneralMaskEntries>> {
+    let count = plan.pointwise_instances()?;
+    let mut entries = Vec::with_capacity(count);
+    for instance in 0..count {
+        let mut hiding = Vec::with_capacity(plan.pointwise_hiding);
+        for index in 0..plan.pointwise_hiding {
+            hiding.push(mask.entry(
+                plan,
+                plan.pointwise_hiding_slot(instances, instance, index)?,
+            )?);
+        }
+        let mut shown = Vec::with_capacity(plan.pointwise_shown);
+        for index in 0..plan.pointwise_shown {
+            shown.push(mask.entry(
+                plan,
+                plan.pointwise_shown_slot(instances, instance, index)?,
+            )?);
+        }
+        entries.push(crate::proof::psc_general::GeneralMaskEntries { hiding, shown });
     }
     Ok(entries)
 }
@@ -3655,6 +3796,9 @@ mod tests {
             hiding: 9,
             shown: 2,
             claims: 1,
+            pointwise: 0,
+            pointwise_hiding: norm_pointwise_masks(3).unwrap().0,
+            pointwise_shown: norm_pointwise_masks(3).unwrap().1,
         };
         assert_eq!(plan.required_rows(4).unwrap(), 4);
         assert_eq!(plan.required_rows(8).unwrap(), 8);
@@ -5096,6 +5240,9 @@ mod tests {
             hiding: 9,
             shown: 2,
             claims: 1,
+            pointwise: 0,
+            pointwise_hiding: norm_pointwise_masks(3).unwrap().0,
+            pointwise_shown: norm_pointwise_masks(3).unwrap().1,
         }
     }
 

@@ -17209,6 +17209,13 @@ mod merged_tests {
             hiding: 9,
             shown: 2,
             claims: 1,
+            pointwise: 0,
+            pointwise_hiding: crate::proof::hidden_norm_psc::norm_pointwise_masks(3)
+                .unwrap()
+                .0,
+            pointwise_shown: crate::proof::hidden_norm_psc::norm_pointwise_masks(3)
+                .unwrap()
+                .1,
         }
     }
 
@@ -17441,6 +17448,13 @@ mod merged_tests {
             hiding: 9,
             shown: 2,
             claims: 1,
+            pointwise: 0,
+            pointwise_hiding: crate::proof::hidden_norm_psc::norm_pointwise_masks(3)
+                .unwrap()
+                .0,
+            pointwise_shown: crate::proof::hidden_norm_psc::norm_pointwise_masks(3)
+                .unwrap()
+                .1,
         };
         let mut norm = NormPlan {
             shape: crate::proof::hidden_norm::NormShape::new(POSITIONS, HIDDEN, HIDDEN)
@@ -20882,7 +20896,11 @@ mod merged_tests {
 
         let (mut plan, mut witness, params) = norm_params_fixture(activation);
         let output_plan = norm_output_plan();
-        plan.norm.as_mut().unwrap().output = Some(output_plan.clone());
+        {
+            let norm = plan.norm.as_mut().unwrap();
+            norm.output = Some(output_plan.clone());
+            norm.mask.as_mut().unwrap().pointwise = 2;
+        }
         let gain = vec![2i64, -1, 3, 1];
         let bias = vec![1i64, 2, -1, 2];
         let shift = output_plan.shift;
@@ -21024,6 +21042,55 @@ mod merged_tests {
         wrong_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
         wrong_plan.norm.as_mut().unwrap().output.as_mut().unwrap().out.group = 94;
         assert!(verify_hidden_lin_hidden(&wrong_plan, &table.reader(), &base).is_err());
+    }
+
+    #[test]
+    fn norm_pointwise_masks_are_allocated_after_the_relation_blocks() {
+        use crate::proof::hidden_norm_psc::{norm_pointwise_entries, norm_pointwise_masks};
+
+        let activation = activation();
+        let (plan, witness, _) = norm_output_fixture(&activation);
+        let norm = plan.norm.as_ref().unwrap();
+        let mask_plan = norm.mask.as_ref().unwrap();
+        let mask_witness = witness.mask.as_ref().unwrap();
+        let relations = norm.relations.len();
+        let instances = POSITIONS as usize * relations;
+        let (hiding, shown) = norm_pointwise_masks(norm.variables).unwrap();
+        assert_eq!(mask_plan.pointwise, 2);
+        assert_eq!(mask_plan.pointwise_hiding, hiding);
+        assert_eq!(mask_plan.pointwise_shown, shown);
+        let entries = norm_pointwise_entries(mask_plan, &mask_witness.committed, instances).unwrap();
+        assert_eq!(entries.len(), POSITIONS as usize * 2);
+        for entry in &entries {
+            assert_eq!(entry.hiding.len(), hiding);
+            assert_eq!(entry.shown.len(), shown);
+        }
+        let first = mask_plan.pointwise_hiding_slot(instances, 0, 0).unwrap();
+        let last = mask_plan
+            .pointwise_shown_slot(instances, entries.len() - 1, shown - 1)
+            .unwrap();
+        assert!(first >= instances * mask_plan.per_instance().unwrap());
+        assert!(last + 1 <= mask_plan.total_entries(relations).unwrap());
+
+        let mut without_output = plan.clone();
+        without_output.norm.as_mut().unwrap().output = None;
+        without_output.norm.as_mut().unwrap().mask.as_mut().unwrap().pointwise = 2;
+        assert!(without_output.validate().is_err());
+
+        let mut without_allocation = plan.clone();
+        without_allocation.norm.as_mut().unwrap().mask.as_mut().unwrap().pointwise = 0;
+        assert!(without_allocation.validate().is_err());
+
+        let mut wrong_counts = plan.clone();
+        wrong_counts
+            .norm
+            .as_mut()
+            .unwrap()
+            .mask
+            .as_mut()
+            .unwrap()
+            .pointwise_hiding = hiding + 1;
+        assert!(wrong_counts.validate().is_err());
     }
 }
 
