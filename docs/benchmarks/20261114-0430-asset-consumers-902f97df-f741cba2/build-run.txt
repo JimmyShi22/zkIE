@@ -1,0 +1,9 @@
+tool: zkie-b2-consumers (read-only plan inventory)
+code: 902f97df78e1a33da4b06000125575ab4efa1e98
+parent: f741cba2fb2fd68677b3316210d479efd3b5d9aa
+Sat Nov 14 04:30:37 CST 2026
+build+run:
+warning: `zkie-models-gemma3` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gemma3` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.02s
+run exit=0
+14561 /tmp/b2-consumers.tsv

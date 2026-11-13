@@ -1,0 +1,11 @@
+[package]
+name = "zkie-b2-consumers"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zkie-core = { path = "/data/zkIE/crates/zkie-core" }
+zkie-ops = { path = "/data/zkIE/crates/zkie-ops" }
+zkie-models-gpt2 = { path = "/data/zkIE/models/gpt2" }
+zkie-models-gemma3 = { path = "/data/zkIE/models/gemma3" }
+zkie-models-timesfm = { path = "/data/zkIE/models/timesfm" }
