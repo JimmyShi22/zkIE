@@ -96,3 +96,13 @@
 `identity.txt`, `change.diff`, `workspace.txt`, `proof-bytes.txt`,
 `proof-45080.bin`, `asset-table-tests.txt`, `model-tests.txt`,
 `s7-context-tests.txt`, `smoke/`, `NOTES.md`.
+
+## Development note
+
+The first same-machine smoke of the working tree failed in the prove stage
+with `invalid_index` and no proof was written. The asset link proof was built
+over the asset leaf records only, while the anchor registry now also covered
+the table leaf; the maximum registry index check rejected the opening. The fix
+builds the link proof over the full anchor record list and is part of the
+same code commit, covered by the table-anchor opening test. The failed run
+used a temporary directory and its logs were overwritten by the final smoke.
