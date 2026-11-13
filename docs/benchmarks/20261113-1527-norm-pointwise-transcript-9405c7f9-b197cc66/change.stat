@@ -1,0 +1,5 @@
+9405c7f9 Prove the pointwise product instances in the norm second stage
+ crates/zkie-ops/src/proof/committed_psc.rs       |  34 +++
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     | 186 +++++++++++++++-
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 257 +++++++++++++++++++++++
+ 3 files changed, 476 insertions(+), 1 deletion(-)
