@@ -105,6 +105,21 @@ by the five-case acceptance matrix; no proof was regenerated.
   change; no verification check was relaxed.
 - No push.
 
+## Acceptance closure
+
+- The buffered decode repair and the work package are accepted for closure
+  (expert review TURN 520).
+- After-fix production CLI verify warm medians: gpt2-seq16 17,562 ms;
+  gpt2-seq512 39,596 ms; gemma3-seq16 29,895 ms; gemma3-seq512 75,554 ms;
+  timesfm-16patch 22,303 ms. All are below the pre-work baseline
+  (25,339 / 232,400 / 46,312 / 830,363 / 43,141 ms).
+- The regression numbers measured before the fix (warm medians 71,609 /
+  313,535 / 183,594 / 486,512 / 116,243 ms) remain in the table above and in
+  the five-case acceptance trace. They are retained as history and are not
+  overwritten.
+- Push target: `https://github.com/JimmyShi22/zkIE.git`, branch `refactor/v2`.
+  The upstream `trustless-ai` repository is not pushed.
+
 ## Artifacts
 
 `identity.txt`, `fix-stat.txt`, `fix.diff`,
