@@ -1,0 +1,5 @@
+f47d984e Add the frozen-table lookup plan and message carriers
+
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     | 435 ++++++++++++++++++++++-
+ crates/zkie-ops/src/proof/hidden_send_session.rs |   7 +
+ 2 files changed, 440 insertions(+), 2 deletions(-)
