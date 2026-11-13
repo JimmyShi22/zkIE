@@ -1,0 +1,5 @@
+1da2436e Add the rsqrt relation maps and their hidden row binding
+
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     | 197 +++++++++++++-
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 328 ++++++++++++++++++++++-
+ 2 files changed, 514 insertions(+), 11 deletions(-)
