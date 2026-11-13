@@ -1,0 +1,4 @@
+fa569e54 Add the clamp value and selector exclusivity relations
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     | 110 ++++++++++++++++++++---
+ crates/zkie-ops/src/proof/hidden_send_session.rs |  45 +++++++---
+ 2 files changed, 130 insertions(+), 25 deletions(-)
