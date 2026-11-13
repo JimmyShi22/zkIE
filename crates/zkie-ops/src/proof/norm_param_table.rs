@@ -74,7 +74,7 @@ impl NormParamTableIdentity {
         }
         if self.width == 0
             || !self.width.is_power_of_two()
-            || self.width > self.reader.shape.code.ell
+            || self.width > self.reader.shape.plain()
         {
             return Err(Error::InvalidConfig);
         }
@@ -212,7 +212,7 @@ mod tests {
             asset_table_identity: Digest([2; 32]),
             reader,
             row,
-            width: 8,
+            width: 4,
             valid_min: -128,
             valid_max: 127,
             trusted_i32_mapping: true,
@@ -240,7 +240,7 @@ mod tests {
         assert_ne!(changed.digest(), digest);
 
         let mut changed = identity.clone();
-        changed.width = 4;
+        changed.width = 2;
         assert_ne!(changed.digest(), digest);
 
         let mut changed = identity.clone();
@@ -284,7 +284,7 @@ mod tests {
         changed.row = 8;
         assert!(changed.validate().is_err());
 
-        for width in [0u64, 3, 6, 16] {
+        for width in [0u64, 3, 6, 8, 16] {
             let mut changed = identity.clone();
             changed.width = width;
             assert!(changed.validate().is_err(), "width {width} must be rejected");

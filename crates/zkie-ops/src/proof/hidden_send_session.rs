@@ -10314,6 +10314,7 @@ fn prove_norm_first(
             mask,
             lookup,
             rstd,
+            params: None,
         },
         lookup_messages,
         rstd_messages,
@@ -14190,7 +14191,7 @@ fn get_u64_vec(reader: &mut CanonicalReader<'_>, max: usize) -> Result<Vec<u64>>
     Ok(values)
 }
 
-fn put_column_opening(writer: &mut CanonicalWriter, opening: &ColumnOpening) {
+pub(crate) fn put_column_opening(writer: &mut CanonicalWriter, opening: &ColumnOpening) {
     writer.put_u64(opening.position);
     writer.put_bytes(&opening.salt);
     writer.put_u64(opening.symbols.len() as u64);
@@ -14203,7 +14204,10 @@ fn put_column_opening(writer: &mut CanonicalWriter, opening: &ColumnOpening) {
     }
 }
 
-fn get_column_opening(reader: &mut CanonicalReader<'_>, max: usize) -> Result<ColumnOpening> {
+pub(crate) fn get_column_opening(
+    reader: &mut CanonicalReader<'_>,
+    max: usize,
+) -> Result<ColumnOpening> {
     let position = reader.get_u64()?;
     let salt = reader.get_bytes()?.to_vec();
     if salt.len() < LEAF_SALT_MIN_BYTES || salt.len() > LEAF_SALT_MAX_BYTES {
@@ -16571,6 +16575,7 @@ mod merged_tests {
             mask: Some(mask_witness),
             lookup: None,
             rstd: None,
+            params: None,
         };
         let mut plan = hidden_plan(_activation);
         plan.norm = Some(norm);

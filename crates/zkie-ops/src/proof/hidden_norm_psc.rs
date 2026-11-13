@@ -24,6 +24,7 @@ use zkie_engine::pcs::request::chain::Chain;
 use zkie_engine::pcs::request::code::encode_row_fp3;
 use zkie_engine::pcs::request::fold::{ByteMaskCoins, MaskCoins};
 use zkie_engine::pcs::request::field::{Fp3, MODULUS};
+use zkie_engine::pcs::request::table::ColumnOpening;
 use zkie_engine::pcs::request::runtime_tree::{
     RuntimePartRows, RuntimeTree, RuntimeTreeOpening, RuntimeTreePart, RuntimeTreePlan,
 };
@@ -34,13 +35,15 @@ use crate::proof::committed_psc::{
     PositionPscChallenges, PscTranscriptTags,
 };
 use crate::proof::hidden_norm::{NormCoreRow, NormShape};
-use crate::proof::hidden_send_session::{SendSamples, WShape};
+use crate::proof::hidden_send_session::{
+    get_column_opening, put_column_opening, SendSamples, WShape,
+};
 use crate::proof::lookup::{
     LookupKeyPlan, LookupKeySource, LookupOutcome, LookupPlan, LookupProof,
 };
 use crate::proof::lookup_table::{TableConfig, TABLE_ENCODING_VERSION};
 use crate::proof::lookup_messages::LookupCommitPlan;
-use crate::proof::norm_param_table::NormParamTablesPlan;
+use crate::proof::norm_param_table::{NormParamTableIdentity, NormParamTablesPlan};
 use crate::proof::output_closure::{CommittedValueGroup, RetainedTrees};
 use crate::registry::{RSQRT_COARSE, RSQRT_COARSE_END, RSQRT_FINE, RSQRT_HALF, RSQRT_SHIFT};
 use crate::proof::psc::{
@@ -2115,6 +2118,13 @@ pub struct NormMaskWitness {
     pub entries: Vec<DotMaskEntries>,
 }
 
+/// The prover-side parameter vectors of the two norm parameter tables.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormParamWitness {
+    pub gain: Vec<i64>,
+    pub bias: Vec<i64>,
+}
+
 /// The prover-side witness of the integrated norm groups.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormWitness {
@@ -2135,6 +2145,8 @@ pub struct NormWitness {
     pub lookup: Option<NormLookupWitness>,
     /// The private frozen-table lookup material, when the plan carries it.
     pub rstd: Option<NormLookupWitness>,
+    /// The private parameter vectors, when the plan carries the tables.
+    pub params: Option<NormParamWitness>,
 }
 
 /// The private lookup material of one norm session. The multiplicity bits are
@@ -2339,6 +2351,116 @@ impl NormLookupSecond {
     }
 }
 
+/// The first-stage column openings of one norm parameter table. The positions
+/// are drawn after the table identity is fixed, and the openings are checked
+/// against the plan's committed reader before any dependent challenge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormParamOpenings {
+    pub openings: Vec<ColumnOpening>,
+}
+
+impl NormParamOpenings {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut writer = CanonicalWriter::new();
+        writer.put_u64(self.openings.len() as u64);
+        for opening in &self.openings {
+            put_column_opening(&mut writer, opening);
+        }
+        Ok(writer.into_bytes())
+    }
+
+    fn decode(identity: &NormParamTableIdentity, bytes: &[u8]) -> Result<Self> {
+        let shape = &identity.reader.shape;
+        let rows = shape.rows() as usize;
+        let log_n = shape.code.log_n as usize;
+        let n = shape.code.n();
+        let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
+        let count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+        if count == 0 || count as u64 > n {
+            return Err(Error::ResourceLimit);
+        }
+        let mut openings = Vec::with_capacity(count);
+        let mut previous = None;
+        for _ in 0..count {
+            let opening = get_column_opening(&mut reader, rows.max(log_n))?;
+            if opening.symbols.len() != rows
+                || opening.path.len() != log_n
+                || opening.salt.len() != shape.salt_bytes
+                || opening.position >= n
+            {
+                return Err(Error::ShapeMismatch);
+            }
+            if let Some(previous) = previous {
+                if opening.position <= previous {
+                    return Err(Error::ShapeMismatch);
+                }
+            }
+            previous = Some(opening.position);
+            openings.push(opening);
+        }
+        reader.finish()?;
+        Ok(Self { openings })
+    }
+
+    pub fn check(&self, plan: &NormParamTablesPlan) -> Result<()> {
+        if self.openings.is_empty() || self.openings.len() > plan.column_draws {
+            return Err(Error::ShapeMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// The first-stage openings of the norm parameter tables. The bias openings
+/// are absent when the bias row shares the gain table; one opening set then
+/// covers both rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormParamMessage {
+    pub gain: NormParamOpenings,
+    pub bias: Option<NormParamOpenings>,
+}
+
+impl NormParamMessage {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut writer = CanonicalWriter::new();
+        writer.put_bytes(&self.gain.encode()?);
+        match &self.bias {
+            Some(bias) => {
+                writer.put_u64(1);
+                writer.put_bytes(&bias.encode()?);
+            }
+            None => writer.put_u64(0),
+        }
+        Ok(writer.into_bytes())
+    }
+
+    fn decode(plan: &NormParamTablesPlan, bytes: &[u8]) -> Result<Self> {
+        let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
+        let gain = NormParamOpenings::decode(&plan.gain, reader.get_bytes()?)?;
+        let bias = match reader.get_u64()? {
+            0 => {
+                if plan.bias.reader != plan.gain.reader {
+                    return Err(Error::ShapeMismatch);
+                }
+                None
+            }
+            1 => Some(NormParamOpenings::decode(&plan.bias, reader.get_bytes()?)?),
+            _ => return Err(Error::InvalidEncoding),
+        };
+        reader.finish()?;
+        Ok(Self { gain, bias })
+    }
+
+    pub fn check(&self, plan: &NormParamTablesPlan) -> Result<()> {
+        self.gain.check(plan)?;
+        match (&self.bias, plan.bias.reader == plan.gain.reader) {
+            (None, true) => {}
+            (Some(bias), false) => bias.check(plan)?,
+            _ => return Err(Error::ShapeMismatch),
+        }
+        Ok(())
+    }
+}
+
 /// The public first-stage message of the integrated norm relation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormFirstMessages {
@@ -2356,6 +2478,8 @@ pub struct NormFirstMessages {
     /// The frozen-table lookup commitments, samples and openings, when the
     /// plan carries it.
     pub rstd: Option<NormLookupMessage>,
+    /// The norm parameter table openings, when the plan carries the tables.
+    pub params: Option<NormParamMessage>,
 }
 
 impl NormFirstMessages {
@@ -2386,6 +2510,9 @@ impl NormFirstMessages {
         }
         if let Some(rstd) = &self.rstd {
             writer.put_bytes(&rstd.encode_rstd()?);
+        }
+        if let Some(params) = &self.params {
+            writer.put_bytes(&params.encode()?);
         }
         Ok(writer.into_bytes())
     }
@@ -2446,6 +2573,13 @@ impl NormFirstMessages {
             )?),
             None => None,
         };
+        let params = match &plan.params {
+            Some(params_plan) => Some(NormParamMessage::decode(
+                params_plan,
+                reader.get_bytes()?,
+            )?),
+            None => None,
+        };
         reader.finish()?;
         let message = Self {
             x,
@@ -2457,6 +2591,7 @@ impl NormFirstMessages {
             mask,
             lookup,
             rstd,
+            params,
         };
         message.check_trusted(plan)?;
         Ok(message)
@@ -2542,6 +2677,11 @@ impl NormFirstMessages {
         }
         match (&plan.rstd, &self.rstd) {
             (Some(rstd_plan), Some(message)) => message.check_rstd_for(rstd_plan)?,
+            (None, None) => {}
+            _ => return Err(Error::ShapeMismatch),
+        }
+        match (&plan.params, &self.params) {
+            (Some(params_plan), Some(message)) => message.check(params_plan)?,
             (None, None) => {}
             _ => return Err(Error::ShapeMismatch),
         }
@@ -4194,6 +4334,7 @@ mod tests {
             mask: None,
             lookup: None,
             rstd: None,
+            params: None,
         };
         (plan, message, second)
     }
@@ -4214,7 +4355,7 @@ mod tests {
         let (mut plan, _, _) = integrated_fixture();
         let reader = || IndexReader {
             shape: IndexShape {
-                code: build_code_plan(3, 4, 1).unwrap(),
+                code: build_code_plan(4, 7, 2).unwrap(),
                 v: 1,
                 answers: 1,
                 salt_bytes: LEAF_SALT_MIN_BYTES,
@@ -4264,6 +4405,100 @@ mod tests {
         let mut changed = plan;
         changed.params.as_mut().unwrap().bias.row = 0;
         assert!(changed.validate().is_err());
+    }
+
+    #[test]
+    fn parameter_table_openings_round_trip_and_are_plan_gated() {
+        use crate::proof::norm_param_table::{
+            NormParamKind, NormParamTableIdentity, NormParamTablesPlan,
+            NORM_PARAM_TABLE_VERSION,
+        };
+        use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
+        use zkie_engine::pcs::request::code::build_code_plan;
+        use zkie_engine::pcs::request::field::Fp;
+        use zkie_engine::pcs::request::params::LEAF_SALT_MIN_BYTES;
+        use zkie_engine::pcs::request::table::{
+            ColumnOpening, IndexReader, IndexRecord, IndexShape, TableDistances,
+        };
+
+        let (mut plan, message, _) = integrated_fixture();
+        let reader = || IndexReader {
+            shape: IndexShape {
+                code: build_code_plan(4, 7, 2).unwrap(),
+                v: 1,
+                answers: 1,
+                salt_bytes: LEAF_SALT_MIN_BYTES,
+                distances: TableDistances {
+                    radius: 0,
+                    later_radius: 0,
+                    m_once: 0,
+                    m_later: 0,
+                },
+            },
+            configuration: Digest([0x31; 32]),
+            root: Digest([0x32; 32]),
+            record: IndexRecord {
+                y: vec![Fp3::ZERO; 2],
+            },
+        };
+        let identity = |kind: NormParamKind, row: u64| NormParamTableIdentity {
+            version: NORM_PARAM_TABLE_VERSION,
+            kind,
+            model_identity: Digest([0x33; 32]),
+            asset_table_identity: Digest([0x34; 32]),
+            reader: reader(),
+            row,
+            width: plan.columns,
+            valid_min: -128,
+            valid_max: 127,
+            trusted_i32_mapping: true,
+        };
+        plan.params = Some(NormParamTablesPlan {
+            gain: identity(NormParamKind::Gain, 0),
+            bias: identity(NormParamKind::Bias, 1),
+            column_draws: 2,
+            seed_budget: 1,
+        });
+        plan.validate().unwrap();
+        let opening = |position: u64| ColumnOpening {
+            position,
+            salt: vec![0u8; LEAF_SALT_MIN_BYTES],
+            symbols: vec![Fp::from_u64(0); 2],
+            path: vec![Digest::ZERO; 4],
+        };
+        let params = NormParamMessage {
+            gain: NormParamOpenings {
+                openings: vec![opening(1), opening(3)],
+            },
+            bias: None,
+        };
+        params.check(plan.params.as_ref().unwrap()).unwrap();
+
+        let mut first = message;
+        first.params = Some(params.clone());
+        let bytes = first.encode().unwrap();
+        let decoded = NormFirstMessages::decode(&plan, &bytes).unwrap();
+        assert_eq!(decoded.params, Some(params.clone()));
+
+        let (plain_plan, _, _) = integrated_fixture();
+        assert!(NormFirstMessages::decode(&plain_plan, &bytes).is_err());
+
+        let mut swapped = params.clone();
+        swapped.gain.openings.swap(0, 1);
+        let encoded = swapped.gain.encode().unwrap();
+        assert!(NormParamOpenings::decode(
+            &plan.params.as_ref().unwrap().gain,
+            &encoded
+        )
+        .is_err());
+
+        let mut separate = plan.clone();
+        separate.params.as_mut().unwrap().bias.reader = IndexReader {
+            configuration: Digest([0x35; 32]),
+            root: Digest([0x36; 32]),
+            ..reader()
+        };
+        assert!(params.check(separate.params.as_ref().unwrap()).is_err());
     }
 
     #[test]
