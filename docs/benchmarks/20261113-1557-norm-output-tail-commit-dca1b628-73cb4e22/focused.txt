@@ -1,0 +1,16 @@
+=== filter: hidden_norm ===
+running 34 tests
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 329 filtered out; finished in 0.00s
+=== filter: norm_output ===
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 362 filtered out; finished in 0.04s
+=== filter: norm_pointwise ===
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 362 filtered out; finished in 0.01s
+=== filter: rstd ===
+running 16 tests
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 347 filtered out; finished in 0.02s
+=== filter: lookup ===
+running 24 tests
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 339 filtered out; finished in 0.03s
+=== filter: norm_param_table ===
+running 4 tests
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 359 filtered out; finished in 0.00s
