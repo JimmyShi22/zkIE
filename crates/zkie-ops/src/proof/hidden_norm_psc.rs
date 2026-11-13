@@ -1175,6 +1175,41 @@ impl NormRstdPlan {
     }
 }
 
+/// The plan fields the row registration reads from either lookup plan.
+pub trait NormLookupView {
+    fn lookup_plan(&self) -> &LookupPlan;
+    fn commit_plan(&self) -> &LookupCommitPlan;
+    fn key_plan(&self) -> &LookupKeyPlan;
+}
+
+impl NormLookupView for NormLookupPlan {
+    fn lookup_plan(&self) -> &LookupPlan {
+        &self.lookup
+    }
+
+    fn commit_plan(&self) -> &LookupCommitPlan {
+        &self.commit
+    }
+
+    fn key_plan(&self) -> &LookupKeyPlan {
+        &self.key
+    }
+}
+
+impl NormLookupView for NormRstdPlan {
+    fn lookup_plan(&self) -> &LookupPlan {
+        &self.lookup
+    }
+
+    fn commit_plan(&self) -> &LookupCommitPlan {
+        &self.commit
+    }
+
+    fn key_plan(&self) -> &LookupKeyPlan {
+        &self.key
+    }
+}
+
 /// The parent-plan values of the frozen-table lookup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NormRstdParams {

@@ -279,6 +279,14 @@ impl<S: TableRowSource> LookupTable for RangeTable<S> {
         self.config.identity
     }
 
+    fn config(&self) -> TableConfig {
+        self.config
+    }
+
+    fn check_content(&self) -> Result<()> {
+        RangeTable::verify_content(self).map(|_| ())
+    }
+
     fn column_at(&self, column: usize, point: &[Fp3]) -> Result<Fp3> {
         if point.len() != self.table_log as usize {
             return Err(Error::ShapeMismatch);

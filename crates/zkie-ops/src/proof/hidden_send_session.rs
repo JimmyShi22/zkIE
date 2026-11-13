@@ -4588,6 +4588,12 @@ impl HiddenProximityPlan {
                 None => return Some("the lookup mask row count overflows"),
             };
         }
+        if let Some(rstd) = norm.and_then(|norm| norm.rstd.as_ref()) {
+            norm_rows = match norm_rows.checked_add(rstd.commit.mask_rows) {
+                Some(rows) => rows,
+                None => return Some("the rstd mask row count overflows"),
+            };
+        }
         let own_mask_rows = match crate::proof::hidden_norm_psc::norm_own_mask_rows(
             own_mask_rows,
             norm_rows,
@@ -5934,7 +5940,8 @@ fn proximity_prove(
         member.tails = Vec::new();
         member.mask_message = Vec::new();
         member.mask_tails = Vec::new();
-        provers.push(ProximityMemberProver::sealed(member, tree)?);
+        let prover = ProximityMemberProver::sealed(member, tree)?;
+        provers.push(prover);
     }
     provers.sort_by_key(|member| member.member.bat_oracle);
     let member_openings = zkie_engine::scheduling::try_map_bounded(
@@ -6685,11 +6692,14 @@ fn prove_first(
     }
     let norm_first = match (&plan.norm, norm) {
         (Some(_), Some(norm_witness)) => {
-            let (message, lookup_messages) =
+            let (message, lookup_messages, rstd_messages) =
                 prove_norm_first(plan, &mut chain, norm_witness, seed)?;
             let mut owned = norm_witness.clone();
             if let Some(lookup) = owned.lookup.as_mut() {
                 lookup.messages = lookup_messages;
+            }
+            if let Some(rstd) = owned.rstd.as_mut() {
+                rstd.messages = rstd_messages;
             }
             witness.norm = Some(owned);
             Some(message)
@@ -9011,6 +9021,93 @@ fn own_members(
                 mask_tails: lookup_mask_tails,
             });
         }
+
+        // frozen-table lookup: own members
+        if let Some(lookup_plan) = &norm_plan.rstd {
+            let lookup_first = norm_first.rstd.as_ref().ok_or(Error::ShapeMismatch)?;
+            let commit = &lookup_plan.commit;
+            let bits_entry = lookup_first
+                .bits
+                .message
+                .group
+                .entries
+                .first()
+                .ok_or(Error::ShapeMismatch)?;
+            if bits_entry.tree != commit.bits_shape.tree_plan(0)?
+                || lookup_first.mask.tree != commit.mask_tree
+            {
+                return Err(Error::StatementMismatch);
+            }
+            let lookup_messages = norm_witness
+                .and_then(|witness| witness.rstd.as_ref())
+                .and_then(|lookup| lookup.messages.as_ref());
+            let row_count = usize::try_from(commit.bits_shape.main_rows)
+                .map_err(|_| Error::ResourceLimit)?;
+            let tail_len = usize::try_from(commit.bits_shape.code.r)
+                .map_err(|_| Error::ResourceLimit)?;
+            let (bits_message, bits_tails) = match lookup_messages {
+                Some(messages) => {
+                    let message = messages
+                        .bits
+                        .messages
+                        .first()
+                        .ok_or(Error::ShapeMismatch)?
+                        .clone();
+                    let mut tails = Vec::with_capacity(row_count);
+                    for row in 0..row_count {
+                        tails.push(
+                            messages
+                                .bits_tails
+                                .get(row * tail_len..(row + 1) * tail_len)
+                                .ok_or(Error::ShapeMismatch)?
+                                .to_vec(),
+                        );
+                    }
+                    (message, tails)
+                }
+                None => (Vec::new(), Vec::new()),
+            };
+            let (lookup_mask_rows, lookup_mask_tails) = match lookup_messages {
+                Some(messages) => (messages.mask_rows.clone(), messages.mask_tails.clone()),
+                None => (Vec::new(), Vec::new()),
+            };
+            members.push(ProximityMember {
+                bat_oracle: 0,
+                source_oracle: commit.bits_oracle,
+                main_code: commit.bits_shape.code,
+                mask_code: plan.proximity.mask_code,
+                main_rows: commit.bits_shape.main_rows,
+                mask_rows: 0,
+                answers: commit.bits_shape.answers,
+                root: lookup_first
+                    .bits
+                    .message
+                    .roots
+                    .first()
+                    .copied()
+                    .ok_or(Error::ShapeMismatch)?,
+                tree_plan: commit.bits_shape.tree_plan(0)?,
+                message: bits_message,
+                tails: bits_tails,
+                mask_message: Vec::new(),
+                mask_tails: Vec::new(),
+            });
+            members.push(ProximityMember {
+                bat_oracle: 0,
+                source_oracle: commit.mask_oracle,
+                main_code: plan.proximity.code,
+                mask_code: commit.mask_code,
+                main_rows: 0,
+                mask_rows: commit.mask_rows,
+                answers: 1,
+                root: lookup_first.mask.root,
+                tree_plan: commit.mask_tree.clone(),
+                message: Vec::new(),
+                tails: Vec::new(),
+                mask_message: lookup_mask_rows,
+                mask_tails: lookup_mask_tails,
+            });
+        }
     }
     // The isolated FOLD fixture places blocks in registration order, so the
     // member order must follow the BAT block order: larger main blocks first,
@@ -9087,6 +9184,38 @@ fn own_sample_rows(
             }
             if let Some(lookup_plan) = &norm_plan.lookup {
                 let lookup_first = norm_first.lookup.as_ref().ok_or(Error::ShapeMismatch)?;
+                let commit = &lookup_plan.commit;
+                if member.source_oracle == commit.bits_oracle {
+                    let target = *lookup_first
+                        .bits
+                        .sample
+                        .answers
+                        .first()
+                        .ok_or(Error::ShapeMismatch)?;
+                    return Ok(vec![oracle_sample_row(
+                        member.source_oracle,
+                        lookup_first.bits.message.group.group,
+                        &commit.bits_shape.oracle_shape(),
+                        &lookup_first.bits.sample.seed,
+                        0,
+                        target,
+                    )?]);
+                }
+                if member.source_oracle == commit.mask_oracle {
+                    let target = *lookup_first
+                        .mask
+                        .sample
+                        .answers
+                        .first()
+                        .ok_or(Error::ShapeMismatch)?;
+                    let row =
+                        lookup_mask_sample_row(commit, &lookup_first.mask, target)?;
+                    return Ok(vec![row]);
+                }
+            }
+            // frozen-table lookup: own sample rows
+            if let Some(lookup_plan) = &norm_plan.rstd {
+                let lookup_first = norm_first.rstd.as_ref().ok_or(Error::ShapeMismatch)?;
                 let commit = &lookup_plan.commit;
                 if member.source_oracle == commit.bits_oracle {
                     let target = *lookup_first
@@ -9286,6 +9415,15 @@ const NORM_LOOKUP_MASK_ANSWER_TAG: u64 = 93;
 const NORM_LOOKUP_BITS_POSITION_TAG: u64 = 94;
 const NORM_LOOKUP_MASK_POSITION_TAG: u64 = 95;
 const NORM_LOOKUP_SEED_TAG: u64 = 96;
+const NORM_RSTD_BITS_ROOT_TAG: u64 = 97;
+const NORM_RSTD_MASK_ROOT_TAG: u64 = 98;
+const NORM_RSTD_BITS_SEED_TAG: u64 = 99;
+const NORM_RSTD_MASK_SEED_TAG: u64 = 100;
+const NORM_RSTD_BITS_ANSWER_TAG: u64 = 101;
+const NORM_RSTD_MASK_ANSWER_TAG: u64 = 102;
+const NORM_RSTD_BITS_POSITION_TAG: u64 = 103;
+const NORM_RSTD_MASK_POSITION_TAG: u64 = 104;
+const NORM_RSTD_SEED_TAG: u64 = 105;
 
 fn norm_group_plans(plan: &NormPlan) -> Vec<&NormGroupPlan> {
     let mut groups = vec![
@@ -9366,6 +9504,15 @@ fn lookup_commit_seed(seed: &Digest) -> Result<u64> {
     ))
 }
 
+fn rstd_commit_seed(seed: &Digest) -> Result<u64> {
+    let digest = derive_run_seed(seed, 11, 0)?;
+    Ok(u64::from_le_bytes(
+        digest.0[..8]
+            .try_into()
+            .map_err(|_| Error::InvalidConfig)?,
+    ))
+}
+
 /// Absorbs the lookup mask root before its sample seed is drawn.
 fn absorb_lookup_mask_root(
     chain: &mut Chain,
@@ -9393,6 +9540,51 @@ fn absorb_lookup_mask_root(
 }
 
 /// The number of seed coordinates the lookup mask sample form reads.
+fn absorb_rstd_mask_root(
+    chain: &mut Chain,
+    plan: &crate::proof::hidden_norm_psc::NormRstdPlan,
+    root: &Digest,
+) -> Result<()> {
+    let commit = &plan.commit;
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(NORM_RSTD_MASK_ROOT_TAG);
+    message.push_u64(commit.mask_oracle);
+    message.push_u64(commit.group);
+    message.push_u64(commit.mask_rows);
+    message.push_u64(1);
+    message.push_u64(commit.mask_code.log_n as u64);
+    message.push_u64(commit.mask_code.ell);
+    message.push_u64(commit.mask_code.r);
+    push_tree_plan(&mut message, &commit.mask_tree);
+    push_digest(&mut message, root);
+    let prefix = message.prefix(KIND_SEED, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
+fn draw_rstd_mask_positions(
+    chain: &mut Chain,
+    plan: &crate::proof::hidden_norm_psc::NormRstdPlan,
+) -> Result<Vec<u64>> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(NORM_RSTD_MASK_POSITION_TAG);
+    message.push_u64(1);
+    message.push_u64(plan.commit.mask_openings as u64);
+    let prefix = message.prefix(KIND_POSITIONS, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    let mut positions = Vec::with_capacity(plan.commit.mask_openings);
+    for _ in 0..plan.commit.mask_openings {
+        positions.push(chain.draw_position(plan.commit.mask_code.log_n)?);
+    }
+    Ok(unique_sorted(&positions))
+}
+
 fn lookup_mask_sample_bits(
     commit: &crate::proof::lookup_messages::LookupCommitPlan,
 ) -> Result<u32> {
@@ -9600,6 +9792,7 @@ fn prove_norm_first(
     seed: &Digest,
 ) -> Result<(
     NormFirstMessages,
+    Option<crate::proof::lookup_messages::LookupMessages>,
     Option<crate::proof::lookup_messages::LookupMessages>,
 )> {
     let norm = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
@@ -10020,6 +10213,95 @@ fn prove_norm_first(
         }
         None => (None, None),
     };
+    let (rstd, rstd_messages) = match &norm.rstd {
+        Some(rstd_plan) => {
+            let rstd_witness = witness.rstd.as_ref().ok_or(Error::ShapeMismatch)?;
+            let mask_entries = crate::proof::lookup::mask_count(&rstd_plan.lookup)?;
+            let mut source = crate::proof::lookup_messages::LookupRandomSource::new(
+                rstd_commit_seed(seed)?,
+            );
+            let messages = crate::proof::lookup_messages::commit_lookup(
+                &rstd_plan.commit,
+                &rstd_witness.bits,
+                mask_entries,
+                &mut source,
+            )?;
+            absorb_closure_group(chain, NORM_RSTD_BITS_ROOT_TAG, &messages.bits.group)?;
+            absorb_rstd_mask_root(chain, rstd_plan, &messages.mask_root)?;
+            let bits_shape = &rstd_plan.commit.bits_shape;
+            let bits_seed = draw_closure_seed_set(
+                chain,
+                NORM_RSTD_BITS_SEED_TAG,
+                bits_shape.sample_bits()?,
+                bits_shape.answers,
+            )?;
+            let bits_answers = value_group_answers(
+                bits_shape,
+                rstd_plan.commit.bits_oracle,
+                rstd_plan.commit.group,
+                &messages.bits.messages,
+                &bits_seed,
+            )?;
+            absorb_tagged_answers(chain, NORM_RSTD_BITS_ANSWER_TAG, &bits_answers)?;
+            let mask_seed = draw_closure_seed_set(
+                chain,
+                NORM_RSTD_MASK_SEED_TAG,
+                lookup_mask_sample_bits(&rstd_plan.commit)?,
+                1,
+            )?;
+            let mask_answer = lookup_mask_answer(
+                &rstd_plan.commit,
+                &messages.mask_rows,
+                &mask_seed[0],
+            )?;
+            absorb_tagged_answers(chain, NORM_RSTD_MASK_ANSWER_TAG, &[mask_answer])?;
+            let bits_positions = draw_closure_group_positions(
+                chain,
+                NORM_RSTD_BITS_POSITION_TAG,
+                1,
+                rstd_plan.commit.bits_openings,
+                bits_shape.code.log_n,
+            )?;
+            let bits_tree = messages
+                .bits
+                .trees
+                .get(0)
+                .ok_or(Error::ShapeMismatch)?;
+            if bits_tree.plan() != &bits_shape.tree_plan(0)? {
+                return Err(Error::StatementMismatch);
+            }
+            let bits_opening = bits_tree.open(&bits_positions[0])?;
+            let mask_positions = draw_rstd_mask_positions(chain, rstd_plan)?;
+            let mask_tree = messages.mask_tree(&rstd_plan.commit)?;
+            if *mask_tree.root() != messages.mask_root {
+                return Err(Error::StatementMismatch);
+            }
+            let mask_opening = mask_tree.open(&mask_positions)?;
+            let message = NormLookupMessage {
+                bits: CommittedPscGroup {
+                    message: CommittedGroupMessage::new(messages.bits.group.clone()),
+                    sample: SendSamples {
+                        seed: bits_seed,
+                        answers: bits_answers,
+                    },
+                    positions: bits_positions,
+                    openings: vec![bits_opening],
+                },
+                mask: NormMaskMessage {
+                    tree: rstd_plan.commit.mask_tree.clone(),
+                    root: messages.mask_root,
+                    sample: SendSamples {
+                        seed: mask_seed,
+                        answers: vec![mask_answer],
+                    },
+                    positions: mask_positions,
+                    opening: mask_opening,
+                },
+            };
+            (Some(message), Some(messages))
+        }
+        None => (None, None),
+    };
     let mut iter = group_messages.into_iter();
     Ok((
         NormFirstMessages {
@@ -10031,9 +10313,10 @@ fn prove_norm_first(
             round: round_message,
             mask,
             lookup,
-            rstd: None,
+            rstd,
         },
         lookup_messages,
+        rstd_messages,
     ))
 }
 
@@ -10312,6 +10595,103 @@ fn verify_norm_first(
         (None, None) => {}
         _ => return Err(Error::ShapeMismatch),
     }
+    match (&norm.rstd, &message.rstd) {
+        (Some(rstd_plan), Some(rstd)) => {
+            absorb_closure_group(chain, NORM_RSTD_BITS_ROOT_TAG, &rstd.bits.message.group)?;
+            absorb_rstd_mask_root(chain, rstd_plan, &rstd.mask.root)?;
+            let bits_shape = &rstd_plan.commit.bits_shape;
+            let bits_seed = draw_closure_seed_set(
+                chain,
+                NORM_RSTD_BITS_SEED_TAG,
+                bits_shape.sample_bits()?,
+                bits_shape.answers,
+            )?;
+            if bits_seed != rstd.bits.sample.seed {
+                return Err(Error::InvalidProof);
+            }
+            absorb_tagged_answers(chain, NORM_RSTD_BITS_ANSWER_TAG, &rstd.bits.sample.answers)?;
+            let mask_seed = draw_closure_seed_set(
+                chain,
+                NORM_RSTD_MASK_SEED_TAG,
+                lookup_mask_sample_bits(&rstd_plan.commit)?,
+                1,
+            )?;
+            if mask_seed != rstd.mask.sample.seed {
+                return Err(Error::InvalidProof);
+            }
+            absorb_tagged_answers(chain, NORM_RSTD_MASK_ANSWER_TAG, &rstd.mask.sample.answers)?;
+            let bits_positions = draw_closure_group_positions(
+                chain,
+                NORM_RSTD_BITS_POSITION_TAG,
+                1,
+                rstd_plan.commit.bits_openings,
+                bits_shape.code.log_n,
+            )?;
+            if bits_positions != rstd.bits.positions {
+                return Err(Error::InvalidProof);
+            }
+            let bits_entry = rstd
+                .bits
+                .message
+                .group
+                .entries
+                .first()
+                .ok_or(Error::ShapeMismatch)?;
+            verify_runtime_opening(
+                &bits_entry.tree,
+                &bits_entry.root,
+                &bits_positions[0],
+                &rstd.bits.openings[0],
+            )?;
+            let mask_positions = draw_rstd_mask_positions(chain, rstd_plan)?;
+            if mask_positions != rstd.mask.positions {
+                return Err(Error::InvalidProof);
+            }
+            verify_runtime_opening(
+                &rstd_plan.commit.mask_tree,
+                &rstd.mask.root,
+                &mask_positions,
+                &rstd.mask.opening,
+            )?;
+        }
+        (None, None) => {}
+        _ => return Err(Error::ShapeMismatch),
+    }
+    Ok(())
+}
+
+fn draw_rstd_seed(chain: &mut Chain) -> Result<u64> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(NORM_RSTD_SEED_TAG);
+    let prefix = message.prefix(KIND_SEED, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    Ok(chain.draw_f()?.as_canonical_u64())
+}
+
+/// Checks the trusted table view against the plan and the public first-row
+/// padding pair. The all-zero point evaluates each column at row zero.
+fn check_rstd_table_view(
+    plan: &crate::proof::hidden_norm_psc::NormRstdPlan,
+    table: &dyn crate::proof::lookup::LookupTable,
+) -> Result<()> {
+    if table.config() != plan.table
+        || table.columns() != plan.lookup.columns as usize
+        || table.row_count() != plan.lookup.table_rows()?
+    {
+        return Err(Error::StatementMismatch);
+    }
+    table.check_content()?;
+    let point = vec![Fp3::ZERO; plan.lookup.table_log as usize];
+    let first_index = table.column_at(0, &point)?;
+    let first_value = table.column_at(1, &point)?;
+    if first_index != plan.key.padding_values[0]
+        || first_value != plan.key.padding_values[1]
+    {
+        return Err(Error::StatementMismatch);
+    }
     Ok(())
 }
 
@@ -10320,6 +10700,7 @@ fn prove_norm_second(
     plan: &NormPlan,
     first: &NormFirstMessages,
     witness: &NormWitness,
+    rstd_table: Option<&dyn crate::proof::lookup::LookupTable>,
 ) -> Result<(NormPscSecond, NormRowBinding)> {
     let positions = plan.shape.positions as usize;
     let relations = plan.relations.clone();
@@ -10374,6 +10755,40 @@ fn prove_norm_second(
         }
         None => None,
     };
+    let rstd = match (&plan.rstd, rstd_table) {
+        (Some(rstd_plan), Some(table)) => {
+            let rstd_witness = witness.rstd.as_ref().ok_or(Error::ShapeMismatch)?;
+            let messages = rstd_witness
+                .messages
+                .as_ref()
+                .ok_or(Error::InvalidSessionState)?;
+            let round_witness = witness.round.as_ref().ok_or(Error::ShapeMismatch)?;
+            let first_rstd = first.rstd.as_ref().ok_or(Error::ShapeMismatch)?;
+            if first_rstd.bits.message.roots.len() != 1
+                || first_rstd.bits.message.roots[0] != messages.bits_root()
+                || first_rstd.mask.root != messages.mask_root
+            {
+                return Err(Error::StatementMismatch);
+            }
+            check_rstd_table_view(rstd_plan, table)?;
+            let seed = draw_rstd_seed(chain)?;
+            let (proof, claims) = crate::proof::lookup::prove_lookup_with_messages(
+                &rstd_plan.lookup,
+                &rstd_plan.commit,
+                &rstd_plan.key,
+                &round_witness.messages,
+                &crate::proof::lookup::LookupWitness {
+                    bits: rstd_witness.bits.clone(),
+                },
+                messages,
+                table,
+                seed,
+            )?;
+            Some(NormLookupSecond { proof, claims })
+        }
+        (None, None) => None,
+        _ => return Err(Error::ShapeMismatch),
+    };
     let claim = DotClaim {
         masks: Vec::new(),
         target: Fp3::ZERO,
@@ -10423,12 +10838,12 @@ fn prove_norm_second(
             psc,
             point_values,
             lookup: lookup.clone(),
-            rstd: None,
+            rstd: rstd.clone(),
         },
         NormRowBinding {
             positions: bindings,
             lookup,
-            rstd: None,
+            rstd,
         },
     ))
 }
@@ -10438,6 +10853,7 @@ fn verify_norm_second(
     plan: &NormPlan,
     first: &NormFirstMessages,
     messages: &NormPscSecond,
+    rstd_table: Option<&dyn crate::proof::lookup::LookupTable>,
 ) -> Result<NormRowBinding> {
     let positions = plan.shape.positions as usize;
     let relations = plan.relations.clone();
@@ -10479,6 +10895,41 @@ fn verify_norm_second(
             })
         }
         (None, None) => None,
+        _ => return Err(Error::ShapeMismatch),
+    };
+    let rstd_binding = match (&plan.rstd, &messages.rstd, rstd_table) {
+        (Some(rstd_plan), Some(rstd), Some(table)) => {
+            let first_rstd = first.rstd.as_ref().ok_or(Error::ShapeMismatch)?;
+            let roots = crate::proof::lookup_messages::LookupRoots {
+                bits: first_rstd
+                    .bits
+                    .message
+                    .roots
+                    .first()
+                    .copied()
+                    .ok_or(Error::ShapeMismatch)?,
+                mask: first_rstd.mask.root,
+            };
+            check_rstd_table_view(rstd_plan, table)?;
+            let seed = draw_rstd_seed(chain)?;
+            let claims = crate::proof::lookup::verify_lookup(
+                &rstd_plan.lookup,
+                &rstd_plan.commit,
+                &rstd_plan.key,
+                &roots,
+                &rstd.proof,
+                table,
+                seed,
+            )?;
+            if claims != rstd.claims {
+                return Err(Error::InvalidProof);
+            }
+            Some(NormLookupSecond {
+                proof: rstd.proof.clone(),
+                claims,
+            })
+        }
+        (None, None, None) => None,
         _ => return Err(Error::ShapeMismatch),
     };
     let instances = positions
@@ -10540,7 +10991,7 @@ fn verify_norm_second(
     Ok(NormRowBinding {
         positions: bindings,
         lookup: lookup_binding,
-        rstd: None,
+        rstd: rstd_binding,
     })
 }
 
@@ -10568,14 +11019,14 @@ fn lookup_mask_virtual_index(
 /// term becomes a unit on the committed lookup mask member.
 fn lookup_plain_rows(
     plan: &HiddenLinPlan,
+    lookup_plan: &dyn crate::proof::hidden_norm_psc::NormLookupView,
     members: &[ProximityMember],
     binding: &NormLookupSecond,
 ) -> Result<Vec<BatRow>> {
     let norm = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
-    let lookup_plan = norm.lookup.as_ref().ok_or(Error::InvalidConfig)?;
     let round_plan = norm.round.as_ref().ok_or(Error::UnsupportedPrimitive)?;
-    let lookup = &lookup_plan.lookup;
-    let commit = &lookup_plan.commit;
+    let lookup = lookup_plan.lookup_plan();
+    let commit = lookup_plan.commit_plan();
     let claims = &binding.claims;
     let planes = lookup.planes()?;
     let table_rows = lookup.table_rows()?;
@@ -10608,7 +11059,7 @@ fn lookup_plain_rows(
 
     // The key-leaf claim expanded on the committed rounding cells.
     let mut key_members = Vec::new();
-    for source in &lookup_plan.key.sources {
+    for source in &lookup_plan.key_plan().sources {
         let member = bat_of
             .get(&source.oracle)
             .ok_or(Error::StatementMismatch)?;
@@ -10636,7 +11087,7 @@ fn lookup_plain_rows(
             columns: round_plan.group.columns,
         });
     }
-    rows.push(lookup_plan.key.registration_row(
+    rows.push(lookup_plan.key_plan().registration_row(
         lookup,
         &claims.key,
         claims.theta,
@@ -12137,8 +12588,22 @@ fn own_plain_rows(
     }
     if let Some(binding) = norm {
         rows.extend(norm_plain_rows(plan, members, first, binding)?);
+        let norm_plan = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
         if let Some(lookup) = &binding.lookup {
-            rows.extend(lookup_plain_rows(plan, members, lookup)?);
+            rows.extend(lookup_plain_rows(
+                plan,
+                norm_plan.lookup.as_ref().ok_or(Error::InvalidConfig)?,
+                members,
+                lookup,
+            )?);
+        }
+        if let Some(rstd) = &binding.rstd {
+            rows.extend(lookup_plain_rows(
+                plan,
+                norm_plan.rstd.as_ref().ok_or(Error::InvalidConfig)?,
+                members,
+                rstd,
+            )?);
         }
     }
     Ok(rows)
@@ -12763,6 +13228,7 @@ fn prove_second(
     shared_point: &[Fp3],
     seed: &Digest,
     bind_residual: bool,
+    rstd_table: Option<&dyn crate::proof::lookup::LookupTable>,
 ) -> Result<OwnProveResult> {
     let _profile_second = zkie_engine::profile::Scope::new("second.prove_second");
     let _profile_own_members = zkie_engine::profile::Scope::new("second.own_members");
@@ -12830,7 +13296,7 @@ fn prove_second(
     ) {
         (Some(norm_plan), Some(norm_witness), Some(first_norm)) => {
             let (proof, binding) =
-                prove_norm_second(&mut chain, norm_plan, first_norm, norm_witness)?;
+                prove_norm_second(&mut chain, norm_plan, first_norm, norm_witness, rstd_table)?;
             (Some(proof), Some(binding))
         }
         (None, None, None) => (None, None),
@@ -12864,6 +13330,8 @@ fn prove_second(
         plan.norm.as_ref(),
         ProximityGroupRole::Own,
     )?;
+    for (i, m) in members.iter().enumerate() {
+    }
     let _profile_proximity = zkie_engine::profile::Scope::new("second.proximity");
     let proximity = proximity_prove(
         chain,
@@ -12943,6 +13411,31 @@ fn witness_tree_for(
             {
                 let messages = norm_witness
                     .lookup
+                    .as_ref()
+                    .and_then(|lookup| lookup.messages.as_ref())
+                    .ok_or(Error::ShapeMismatch)?;
+                if member.source_oracle == commit.bits_oracle {
+                    let tree = messages.bits.trees.get(0).ok_or(Error::ShapeMismatch)?;
+                    if tree.plan() != &member.tree_plan || *tree.root() != member.root {
+                        return Err(Error::StatementMismatch);
+                    }
+                    return Ok(tree.clone());
+                }
+                let tree = messages.mask_tree(commit)?;
+                if tree.plan() != &member.tree_plan || *tree.root() != member.root {
+                    return Err(Error::StatementMismatch);
+                }
+                return Ok(Arc::new(tree));
+            }
+        }
+        // frozen-table lookup: retained trees
+        if let Some(lookup_plan) = &norm_plan.rstd {
+            let commit = &lookup_plan.commit;
+            if member.source_oracle == commit.bits_oracle
+                || member.source_oracle == commit.mask_oracle
+            {
+                let messages = norm_witness
+                    .rstd
                     .as_ref()
                     .and_then(|lookup| lookup.messages.as_ref())
                     .ok_or(Error::ShapeMismatch)?;
@@ -13052,6 +13545,7 @@ fn verify_second(
     shared_point: &[Fp3],
     messages: &HiddenSecondMessages,
     closure_r: Option<&[Fp3]>,
+    rstd_table: Option<&dyn crate::proof::lookup::LookupTable>,
 ) -> Result<(
     Digest,
     Vec<GuRelationRow>,
@@ -13130,7 +13624,13 @@ fn verify_second(
     drop(_profile_closure);
     let norm_binding = match (&plan.norm, &messages.norm, &first.norm) {
         (Some(norm_plan), Some(norm_messages), Some(first_norm)) => Some(
-            verify_norm_second(&mut chain, norm_plan, first_norm, norm_messages)?,
+            verify_norm_second(
+                &mut chain,
+                norm_plan,
+                first_norm,
+                norm_messages,
+                rstd_table,
+            )?,
         ),
         (None, None, None) => None,
         _ => return Err(Error::ShapeMismatch),
@@ -13203,6 +13703,7 @@ fn prove_hidden_lin_inner(
     seed: Digest,
     bind_residual: bool,
     norm: Option<&NormWitness>,
+    rstd_table: Option<&dyn crate::proof::lookup::LookupTable>,
 ) -> Result<(HiddenLinMessages, HiddenLinWitness)> {
     let _profile_session = zkie_engine::profile::Scope::new("session.prove_hidden_lin_inner");
     plan.validate()?;
@@ -13233,6 +13734,7 @@ fn prove_hidden_lin_inner(
         &shared.points.psi,
         &seed,
         bind_residual,
+        rstd_table,
     )?;
     let messages = HiddenLinMessages {
         first: first.clone(),
@@ -13266,7 +13768,7 @@ pub fn prove_hidden_lin(
     if plan.weights.is_empty() {
         return Err(Error::InvalidConfig);
     }
-    prove_hidden_lin_inner(plan, activation, table, Some(output), seed, true, None)
+    prove_hidden_lin_inner(plan, activation, table, Some(output), seed, true, None, None)
 }
 
 /// Prover entry of the merged three-stage run in the hidden-input mode. The
@@ -13282,7 +13784,7 @@ pub fn prove_hidden_lin_hidden(
     if !plan.weights.is_empty() || plan.norm.is_some() {
         return Err(Error::InvalidConfig);
     }
-    prove_hidden_lin_inner(plan, activation, table, None, seed, true, None)
+    prove_hidden_lin_inner(plan, activation, table, None, seed, true, None, None)
 }
 
 /// Prover entry of the hidden-input mode with the private norm witness. The
@@ -13298,7 +13800,7 @@ pub fn prove_hidden_lin_hidden_with_norm(
     if !plan.weights.is_empty() || plan.norm.is_none() {
         return Err(Error::InvalidConfig);
     }
-    prove_hidden_lin_inner(plan, activation, table, None, seed, true, Some(norm))
+    prove_hidden_lin_inner(plan, activation, table, None, seed, true, Some(norm), None)
 }
 
 /// Test-only prover entry that omits the residual absorption before the
@@ -13315,7 +13817,7 @@ fn prove_hidden_lin_hidden_unbound_residual(
     if !plan.weights.is_empty() {
         return Err(Error::InvalidConfig);
     }
-    prove_hidden_lin_inner(plan, activation, table, None, seed, false, None)
+    prove_hidden_lin_inner(plan, activation, table, None, seed, false, None, None)
 }
 
 fn verify_hidden_lin_inner(
@@ -13323,6 +13825,7 @@ fn verify_hidden_lin_inner(
     reader: &IndexReader,
     output: Option<&[Vec<Fp3>]>,
     messages: &HiddenLinMessages,
+    rstd_table: Option<&dyn crate::proof::lookup::LookupTable>,
 ) -> Result<HiddenLinOutcome> {
     let _profile_verify = zkie_engine::profile::Scope::new("verify.hidden_lin");
     plan.validate()?;
@@ -13353,6 +13856,7 @@ fn verify_hidden_lin_inner(
         &points.psi,
         &messages.second,
         closure_r.as_deref(),
+        rstd_table,
     )?;
     drop(_profile_second);
     Ok(HiddenLinOutcome {
@@ -13388,7 +13892,7 @@ pub fn verify_hidden_lin(
     if plan.weights.is_empty() {
         return Err(Error::InvalidConfig);
     }
-    verify_hidden_lin_inner(plan, reader, Some(output), messages)
+    verify_hidden_lin_inner(plan, reader, Some(output), messages, None)
 }
 
 /// Verifier entry of the merged three-stage run in the hidden-input mode. It
@@ -13405,7 +13909,45 @@ pub fn verify_hidden_lin_hidden(
     if !plan.weights.is_empty() {
         return Err(Error::InvalidConfig);
     }
-    verify_hidden_lin_inner(plan, reader, None, messages)
+    verify_hidden_lin_inner(plan, reader, None, messages, None)
+}
+
+/// Proves the hidden chain with the frozen-table lookup witness and the
+/// trusted table view.
+pub fn prove_hidden_lin_hidden_with_norm_and_rstd_table(
+    plan: &HiddenLinPlan,
+    activation: &CommittedActivation,
+    table: &mut dyn HiddenTableProver,
+    seed: Digest,
+    norm: &NormWitness,
+    rstd_table: &dyn crate::proof::lookup::LookupTable,
+) -> Result<(HiddenLinMessages, HiddenLinWitness)> {
+    if !plan.weights.is_empty() || plan.norm.is_none() {
+        return Err(Error::InvalidConfig);
+    }
+    prove_hidden_lin_inner(
+        plan,
+        activation,
+        table,
+        None,
+        seed,
+        true,
+        Some(norm),
+        Some(rstd_table),
+    )
+}
+
+/// Verifies the hidden chain with the trusted frozen-table view.
+pub fn verify_hidden_lin_hidden_with_rstd_table(
+    plan: &HiddenLinPlan,
+    reader: &IndexReader,
+    messages: &HiddenLinMessages,
+    rstd_table: &dyn crate::proof::lookup::LookupTable,
+) -> Result<HiddenLinOutcome> {
+    if !plan.weights.is_empty() {
+        return Err(Error::InvalidConfig);
+    }
+    verify_hidden_lin_inner(plan, reader, None, messages, Some(rstd_table))
 }
 
 /// Auxiliary verifier for unit and fixture runs. It runs the public entry and
@@ -16043,6 +16585,617 @@ mod merged_tests {
         .unwrap();
         plan.validate().unwrap();
         (plan, witness)
+    }
+
+    struct RstdRows {
+        identity: Digest,
+        root: Digest,
+        rows: Vec<i64>,
+    }
+
+    impl RstdRows {
+        fn new(identity: u8, rows: Vec<i64>) -> Self {
+            use crate::proof::lookup_table::{content_digest, TableEncoding};
+            let root = content_digest(TableEncoding::I32Le, &rows).unwrap();
+            Self {
+                identity: Digest([identity; 32]),
+                root,
+                rows,
+            }
+        }
+
+        fn config(&self) -> crate::proof::lookup_table::TableConfig {
+            use crate::proof::lookup_table::{TableConfig, TableEncoding, TABLE_ENCODING_VERSION};
+            TableConfig {
+                identity: self.identity,
+                content_root: self.root,
+                real_len: self.rows.len(),
+                encoding: TableEncoding::I32Le,
+                version: TABLE_ENCODING_VERSION,
+            }
+        }
+    }
+
+    impl crate::proof::lookup_table::TableRowSource for RstdRows {
+        fn identity(&self) -> Digest {
+            self.identity
+        }
+
+        fn content_root(&self) -> Digest {
+            self.root
+        }
+
+        fn real_len(&self) -> usize {
+            self.rows.len()
+        }
+
+        fn encoding(&self) -> crate::proof::lookup_table::TableEncoding {
+            crate::proof::lookup_table::TableEncoding::I32Le
+        }
+
+        fn read_rows(&self, start: usize, count: usize) -> Result<Vec<i64>> {
+            let end = start.checked_add(count).ok_or(Error::ResourceLimit)?;
+            if end > self.rows.len() {
+                return Err(Error::ShapeMismatch);
+            }
+            Ok(self.rows[start..end].to_vec())
+        }
+    }
+
+    fn rstd_bits_from_counts(
+        plan: &crate::proof::lookup::LookupPlan,
+        counts: &[u64],
+    ) -> Vec<Fp3> {
+        let planes = plan.planes().unwrap();
+        let rows = plan.table_rows().unwrap();
+        assert_eq!(counts.len(), rows);
+        let mut bits = vec![Fp3::ZERO; planes * rows];
+        for row in 0..rows {
+            for plane in 0..planes {
+                if (counts[row] >> plane) & 1 == 1 {
+                    bits[plane + planes * row] = Fp3::ONE;
+                }
+            }
+        }
+        bits
+    }
+
+    fn rstd_fixture(
+        activation: &CommittedActivation,
+    ) -> (
+        HiddenLinPlan,
+        crate::proof::hidden_norm_psc::NormWitness,
+        crate::proof::lookup_table::RangeTable<RstdRows>,
+    ) {
+        use crate::proof::hidden_norm_psc::{NormRstdParams, NormRstdPlan};
+        use crate::proof::lookup_table::RangeTable;
+
+        let (mut plan, mut witness) = norm_fixture(activation);
+        let values: Vec<i64> = (0..8).map(|index| 100 + 7 * index).collect();
+        let source = RstdRows::new(0x81, values.clone());
+        let config = source.config();
+        let table = RangeTable::open(source, 3, &config).unwrap();
+        let mut rows = witness.rsqrt.clone().unwrap();
+        for row in rows.iter_mut() {
+            assert_eq!(row.index, 0);
+            row.rstd = values[0];
+        }
+        witness.rsqrt = Some(rows.clone());
+        let round_plan = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .round
+            .as_ref()
+            .unwrap()
+            .clone();
+        let round_values = witness
+            .core
+            .iter()
+            .zip(&rows)
+            .map(|(core, rsqrt)| {
+                round_plan
+                    .layout
+                    .values_with_rsqrt(core, rsqrt, round_plan.group.columns)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut coins = ByteMaskCoins::new(Digest([0x94; 32])).unwrap();
+        witness.round = Some(commit_norm_group(&round_plan.group, &round_values, &mut coins));
+        let params = NormRstdParams {
+            code: code(),
+            mask_code: mask_code(),
+            group: GROUP,
+            bits_oracle: 9800,
+            mask_oracle: 9801,
+            bits_tree: 60900,
+            mask_tree: 60901,
+            leaf_class: 1,
+            salt_bytes: SALT,
+            run: W_RUN,
+            configuration: W_CONFIGURATION,
+        };
+        let rstd_plan = NormRstdPlan::from_round(
+            &round_plan,
+            POSITIONS,
+            config,
+            Fp3::from_u64(values[0] as u64),
+            &params,
+        )
+        .unwrap();
+        let messages = &witness.round.as_ref().unwrap().messages;
+        let columns = rstd_plan
+            .key
+            .read_columns(&rstd_plan.lookup, messages)
+            .unwrap();
+        let keys = rstd_plan.lookup.key_count().unwrap();
+        let entries = rstd_plan.key.sources.len() / 2;
+        let mut counts = vec![0u64; rstd_plan.lookup.table_rows().unwrap()];
+        for key in 0..entries {
+            assert_eq!(columns[0][key], Fp3::ZERO);
+            assert_eq!(columns[1][key], Fp3::from_u64(values[0] as u64));
+            counts[0] += 1;
+        }
+        for _ in entries..keys {
+            counts[0] += 1;
+        }
+        let bits = rstd_bits_from_counts(&rstd_plan.lookup, &counts);
+        witness.rstd = Some(crate::proof::hidden_norm_psc::NormLookupWitness {
+            bits,
+            messages: None,
+        });
+        plan.norm.as_mut().unwrap().rstd = Some(rstd_plan);
+        let norm_mask_rows = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .mask
+            .as_ref()
+            .unwrap()
+            .mask_rows;
+        let rstd_mask_rows = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .rstd
+            .as_ref()
+            .unwrap()
+            .commit
+            .mask_rows;
+        let index_rows = plan
+            .send
+            .index_mask
+            .as_ref()
+            .map(|index| index.tree_rows().unwrap())
+            .unwrap_or(0);
+        plan.proximity.own_mask_tree.mask_rows =
+            crate::proof::hidden_norm_psc::norm_own_mask_rows(
+                index_rows,
+                norm_mask_rows + rstd_mask_rows,
+            )
+            .unwrap();
+        plan.validate().unwrap();
+        (plan, witness, table)
+    }
+
+    #[test]
+    fn rstd_lookup_proves_and_verifies() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, rstd_table) = rstd_fixture(&activation);
+        let (messages, hidden_witness) = prove_hidden_lin_hidden_with_norm_and_rstd_table(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+            &rstd_table,
+        )
+        .unwrap();
+        let mut verifier_plan = plan.clone();
+        verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        let outcome = verify_hidden_lin_hidden_with_rstd_table(
+            &verifier_plan,
+            &table.reader(),
+            &messages,
+            &rstd_table,
+        )
+        .unwrap();
+        assert_eq!(outcome.first_seal, messages.first_seal);
+    }
+
+    fn recommit_round(
+        round_plan: &crate::proof::hidden_norm_psc::NormRoundPlan,
+        core: &[crate::proof::hidden_norm::NormCoreRow],
+        rows: &[crate::proof::hidden_norm::RsqrtRow],
+    ) -> crate::proof::hidden_norm_psc::NormGroupWitness {
+        use zkie_engine::pcs::request::fold::ByteMaskCoins;
+
+        let values = core
+            .iter()
+            .zip(rows)
+            .map(|(core, rsqrt)| {
+                round_plan
+                    .layout
+                    .values_with_rsqrt(core, rsqrt, round_plan.group.columns)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut coins = ByteMaskCoins::new(Digest([0x95; 32])).unwrap();
+        commit_norm_group(&round_plan.group, &values, &mut coins)
+    }
+
+    /// Re-runs the prove entry with one internally consistent but dishonest
+    /// committed round row and asserts that the chain rejects it.
+    fn prove_with_tampered_rstd(
+        activation: &CommittedActivation,
+        plan: &HiddenLinPlan,
+        witness: &crate::proof::hidden_norm_psc::NormWitness,
+        rstd_table: &dyn crate::proof::lookup::LookupTable,
+        edit: impl FnOnce(&mut crate::proof::hidden_norm::RsqrtRow),
+    ) -> Result<()> {
+        let mut table = table();
+        let round_plan = plan.norm.as_ref().unwrap().round.as_ref().unwrap();
+        let mut changed = witness.clone();
+        let mut rows = changed.rsqrt.clone().unwrap();
+        edit(&mut rows[0]);
+        changed.rsqrt = Some(rows.clone());
+        changed.round = Some(recommit_round(round_plan, &changed.core, &rows));
+        let proved = prove_hidden_lin_hidden_with_norm_and_rstd_table(
+            plan,
+            activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &changed,
+            rstd_table,
+        );
+        proved.map(|_| ())
+    }
+
+    #[test]
+    fn rstd_committed_value_tampering_is_rejected() {
+        let activation = activation();
+        let (plan, witness, rstd_table) = rstd_fixture(&activation);
+        // 107 is a real table value, but it belongs to index 1, not index 0.
+        let proved = prove_with_tampered_rstd(&activation, &plan, &witness, &rstd_table, |row| {
+            row.rstd = 107;
+        });
+        assert!(
+            proved.is_err(),
+            "a committed value that is not the row of the committed index must not produce a proof"
+        );
+    }
+
+    #[test]
+    fn rstd_committed_index_tampering_is_rejected() {
+        let activation = activation();
+        let (plan, witness, rstd_table) = rstd_fixture(&activation);
+        let proved = prove_with_tampered_rstd(&activation, &plan, &witness, &rstd_table, |row| {
+            row.index = 1;
+        });
+        assert!(
+            proved.is_err(),
+            "a committed index that breaks the index relation must not produce a proof"
+        );
+    }
+
+    #[test]
+    fn rstd_index_past_the_real_length_is_rejected() {
+        let activation = activation();
+        let (plan, witness, rstd_table) = rstd_fixture(&activation);
+        // The trusted table has eight real rows, so index 8 is out of range.
+        let proved = prove_with_tampered_rstd(&activation, &plan, &witness, &rstd_table, |row| {
+            row.index = 8;
+        });
+        assert!(
+            proved.is_err(),
+            "an index past the real table length must not produce a proof"
+        );
+    }
+
+    fn rstd_values() -> Vec<i64> {
+        (0..8).map(|index| 100 + 7 * index).collect()
+    }
+
+    fn verify_with_rstd_table(
+        activation: &CommittedActivation,
+        table_log: u32,
+        source: impl crate::proof::lookup_table::TableRowSource,
+    ) -> Result<()> {
+        use crate::proof::lookup_table::RangeTable;
+
+        let mut table = table();
+        let (plan, witness, rstd_table) = rstd_fixture(activation);
+        let (messages, hidden_witness) = prove_hidden_lin_hidden_with_norm_and_rstd_table(
+            &plan,
+            activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+            &rstd_table,
+        )?;
+        let config = source_config(&source);
+        let wrong = RangeTable::open(source, table_log, &config)?;
+        let mut verifier_plan = plan.clone();
+        verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        let verified = verify_hidden_lin_hidden_with_rstd_table(
+            &verifier_plan,
+            &table.reader(),
+            &messages,
+            &wrong,
+        );
+        verified.map(|_| ())
+    }
+
+    fn source_config(
+        source: &impl crate::proof::lookup_table::TableRowSource,
+    ) -> crate::proof::lookup_table::TableConfig {
+        use crate::proof::lookup_table::{TableConfig, TABLE_ENCODING_VERSION};
+
+        TableConfig {
+            identity: source.identity(),
+            content_root: source.content_root(),
+            real_len: source.real_len(),
+            encoding: source.encoding(),
+            version: TABLE_ENCODING_VERSION,
+        }
+    }
+
+    #[test]
+    fn rstd_table_identity_tampering_is_rejected() {
+        let activation = activation();
+        let (plan, _, _) = rstd_fixture(&activation);
+        let table_log = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .rstd
+            .as_ref()
+            .unwrap()
+            .lookup
+            .table_log;
+        let source = RstdRows::new(0x82, rstd_values());
+        let verified = verify_with_rstd_table(&activation, table_log, source);
+        assert!(
+            verified.is_err(),
+            "a table whose identity differs from the trusted plan must be rejected"
+        );
+    }
+
+    #[test]
+    fn rstd_table_content_tampering_is_rejected() {
+        let activation = activation();
+        let (plan, _, _) = rstd_fixture(&activation);
+        let table_log = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .rstd
+            .as_ref()
+            .unwrap()
+            .lookup
+            .table_log;
+        let mut values = rstd_values();
+        values[3] += 1;
+        let source = RstdRows::new(0x81, values);
+        let verified = verify_with_rstd_table(&activation, table_log, source);
+        assert!(
+            verified.is_err(),
+            "a table whose content root differs from the trusted plan must be rejected"
+        );
+    }
+
+    #[test]
+    fn rstd_table_length_tampering_is_rejected() {
+        let activation = activation();
+        let (plan, _, _) = rstd_fixture(&activation);
+        let table_log = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .rstd
+            .as_ref()
+            .unwrap()
+            .lookup
+            .table_log;
+        let source = RstdRows::new(0x81, rstd_values()[..7].to_vec());
+        let verified = verify_with_rstd_table(&activation, table_log, source);
+        assert!(
+            verified.is_err(),
+            "a table whose real length differs from the trusted plan must be rejected"
+        );
+    }
+
+    /// A source that claims the trusted metadata but returns a different first
+    /// row, so only the content check can catch it.
+    struct LyingRows {
+        identity: Digest,
+        root: Digest,
+        rows: Vec<i64>,
+    }
+
+    impl crate::proof::lookup_table::TableRowSource for LyingRows {
+        fn identity(&self) -> Digest {
+            self.identity
+        }
+
+        fn content_root(&self) -> Digest {
+            self.root
+        }
+
+        fn real_len(&self) -> usize {
+            self.rows.len()
+        }
+
+        fn encoding(&self) -> crate::proof::lookup_table::TableEncoding {
+            crate::proof::lookup_table::TableEncoding::I64Le
+        }
+
+        fn read_rows(&self, start: usize, count: usize) -> Result<Vec<i64>> {
+            let end = start.checked_add(count).ok_or(Error::ResourceLimit)?;
+            if end > self.rows.len() {
+                return Err(Error::ShapeMismatch);
+            }
+            let mut rows = self.rows[start..end].to_vec();
+            if start == 0 {
+                rows[0] += 1;
+            }
+            Ok(rows)
+        }
+    }
+
+    #[test]
+    fn rstd_table_padding_tampering_is_rejected() {
+        use crate::proof::lookup_table::{content_digest, TableEncoding};
+
+        let activation = activation();
+        let (plan, _, _) = rstd_fixture(&activation);
+        let table_log = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .rstd
+            .as_ref()
+            .unwrap()
+            .lookup
+            .table_log;
+        let values = rstd_values();
+        let root = content_digest(TableEncoding::I64Le, &values).unwrap();
+        let source = LyingRows {
+            identity: Digest([0x81; 32]),
+            root,
+            rows: values,
+        };
+        let verified = verify_with_rstd_table(&activation, table_log, source);
+        assert!(
+            verified.is_err(),
+            "a padded table whose read rows do not match the trusted content must be rejected"
+        );
+    }
+
+    #[test]
+    fn rstd_key_padding_tampering_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (mut plan, witness, rstd_table) = rstd_fixture(&activation);
+        plan.norm
+            .as_mut()
+            .unwrap()
+            .rstd
+            .as_mut()
+            .unwrap()
+            .key
+            .padding_values[1] = Fp3::from_u64(101);
+        let proved = prove_hidden_lin_hidden_with_norm_and_rstd_table(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+            &rstd_table,
+        );
+        assert!(
+            proved.is_err(),
+            "a key-side padding pair that differs from the trusted first table row must be rejected"
+        );
+    }
+
+    #[test]
+    fn rstd_message_tampering_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, rstd_table) = rstd_fixture(&activation);
+        let (messages, hidden_witness) = prove_hidden_lin_hidden_with_norm_and_rstd_table(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+            &rstd_table,
+        )
+        .unwrap();
+        let bytes = messages.encode().unwrap();
+        let base = HiddenLinMessages::decode(&plan, &bytes).unwrap();
+        let mut verifier_plan = plan.clone();
+        verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        assert!(
+            verify_hidden_lin_hidden_with_rstd_table(
+                &verifier_plan,
+                &table.reader(),
+                &base,
+                &rstd_table
+            )
+            .is_ok()
+        );
+
+        let mut changed = base.clone();
+        changed
+            .first
+            .norm
+            .as_mut()
+            .unwrap()
+            .rstd
+            .as_mut()
+            .unwrap()
+            .bits
+            .message
+            .roots[0] = Digest::ZERO;
+        assert!(
+            verify_hidden_lin_hidden_with_rstd_table(
+                &verifier_plan,
+                &table.reader(),
+                &changed,
+                &rstd_table
+            )
+            .is_err(),
+            "a changed rstd bits root must be rejected"
+        );
+
+        let mut changed = base.clone();
+        changed
+            .first
+            .norm
+            .as_mut()
+            .unwrap()
+            .rstd
+            .as_mut()
+            .unwrap()
+            .mask
+            .root = Digest::ZERO;
+        assert!(
+            verify_hidden_lin_hidden_with_rstd_table(
+                &verifier_plan,
+                &table.reader(),
+                &changed,
+                &rstd_table
+            )
+            .is_err(),
+            "a changed rstd mask root must be rejected"
+        );
+
+        let mut changed = base.clone();
+        let value = &mut changed
+            .second
+            .norm
+            .as_mut()
+            .unwrap()
+            .rstd
+            .as_mut()
+            .unwrap()
+            .claims
+            .key
+            .value;
+        *value = value.add(&Fp3::ONE);
+        assert!(
+            verify_hidden_lin_hidden_with_rstd_table(
+                &verifier_plan,
+                &table.reader(),
+                &changed,
+                &rstd_table
+            )
+            .is_err(),
+            "a changed rstd key claim must be rejected"
+        );
     }
 
     #[test]

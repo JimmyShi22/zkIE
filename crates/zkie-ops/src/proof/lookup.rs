@@ -30,6 +30,7 @@ use crate::proof::hidden_send_session::WShape;
 use crate::proof::lookup_messages::{
     commit_lookup, LookupCommitPlan, LookupMessages, LookupRandomSource, LookupRoots,
 };
+use crate::proof::lookup_table::{content_digest, TableConfig, TableEncoding, TABLE_ENCODING_VERSION};
 use crate::proof::psc::Weight;
 use crate::proof::psc_general::{
     general_variables, line, prove_general, verify_general, GeneralChallenges, GeneralClaim,
@@ -61,6 +62,12 @@ pub trait LookupTable {
     fn column_at(&self, column: usize, point: &[Fp3]) -> Result<Fp3>;
     /// Reads one column's row values in row order (prover side).
     fn column_rows(&self, column: usize) -> Result<Vec<Fp3>>;
+    /// The trusted configuration the verifier binds into the statement:
+    /// identity, content root, real length, encoding and encoding version.
+    fn config(&self) -> TableConfig;
+    /// Streams the real rows and checks their canonical digest against the
+    /// trusted content root of the table's own configuration.
+    fn check_content(&self) -> Result<()>;
 }
 
 /// The public byte table, as a multilinear extension over eight coordinates.
@@ -92,6 +99,32 @@ impl LookupTable for ByteTable {
             return Err(Error::InvalidIndex);
         }
         Ok((0..256u64).map(Fp3::from_u64).collect())
+    }
+
+    fn config(&self) -> TableConfig {
+        byte_table_config()
+    }
+
+    fn check_content(&self) -> Result<()> {
+        let rows: Vec<i64> = (0..=255).collect();
+        if content_digest(TableEncoding::I64Le, &rows)? != byte_table_config().content_root {
+            return Err(Error::StatementMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// The trusted configuration of the public byte table.
+fn byte_table_config() -> TableConfig {
+    let rows: Vec<i64> = (0..=255).collect();
+    let content_root =
+        content_digest(TableEncoding::I64Le, &rows).expect("the byte table rows encode");
+    TableConfig {
+        identity: BYTE_TABLE_IDENTITY,
+        content_root,
+        real_len: 256,
+        encoding: TableEncoding::I64Le,
+        version: TABLE_ENCODING_VERSION,
     }
 }
 
@@ -2360,6 +2393,40 @@ mod tests {
 
         fn column_rows(&self, column: usize) -> Result<Vec<Fp3>> {
             column_rows(self, column)
+        }
+
+        fn config(&self) -> TableConfig {
+            pair_config(self)
+        }
+
+        fn check_content(&self) -> Result<()> {
+            let rows = pair_flat_rows(self);
+            if content_digest(TableEncoding::I64Le, &rows)? != pair_config(self).content_root {
+                return Err(Error::StatementMismatch);
+            }
+            Ok(())
+        }
+    }
+
+    fn pair_flat_rows(table: &PairTable) -> Vec<i64> {
+        let mut rows = Vec::with_capacity(table.rows.len() * 2);
+        for (index, value) in &table.rows {
+            rows.push(*index as i64);
+            rows.push(*value as i64);
+        }
+        rows
+    }
+
+    fn pair_config(table: &PairTable) -> TableConfig {
+        let rows = pair_flat_rows(table);
+        let content_root =
+            content_digest(TableEncoding::I64Le, &rows).expect("pair table rows encode");
+        TableConfig {
+            identity: table.identity,
+            content_root,
+            real_len: table.rows.len(),
+            encoding: TableEncoding::I64Le,
+            version: TABLE_ENCODING_VERSION,
         }
     }
 
