@@ -32,8 +32,9 @@ use zkie_engine::pcs::request::table::IndexReader;
 use zkie_engine::storage::mmap::MmapTensorReader;
 use zkie_ops::op::OpCode;
 use zkie_ops::proof::binding::oracle_start;
+use zkie_ops::proof::asset_table::AssetTableMeta;
 use zkie_ops::proof::model_commitment::{
-    asset_table_identity, expected_asset_rows, verify_model_anchor, ModelAssetSpec,
+    asset_table_identity, expected_asset_rows, verify_model_anchor_with_tables, ModelAssetSpec,
     ModelCommitmentPublic,
 };
 use zkie_ops::proof::plan::{PlanConfigValue, PlanSource, TracePlan};
@@ -227,13 +228,33 @@ pub fn load_gpt2_lm_head_context(
     {
         return Err(Error::StatementMismatch);
     }
+    // The version gate runs before the anchor check, so an old-version
+    // artifact keeps the existing rejection semantics even though the anchor
+    // now also covers the encoded table leaves.
+    if trusted.model_version != zkie_models_gpt2::plan::MODEL_VERSION {
+        return Err(Error::InvalidConfig);
+    }
     let plan = zkie_models_gpt2::plan::trace_plan(statement.tokens.len())?;
     if zkie_models_gpt2::plan::model_commitment(&statement.tokens)? != model_id {
         return Err(Error::StatementMismatch);
     }
     let parameters = zkie_models_gpt2::plan::parameters_digest()?;
     let specs = zkie_models_gpt2::plan::asset_specs();
-    verify_model_anchor(&public, trusted.anchor_id, model_id, parameters, &specs)?;
+    let table_metas: Vec<AssetTableMeta> =
+        match fs::read(public_bundle_dir.join("asset-tables.bin")) {
+            Ok(bytes) => deserialize_exact(&bytes)?,
+            Err(_) => Vec::new(),
+        };
+    let table_params = zkie_models_gpt2::plan::asset_table_params()?;
+    verify_model_anchor_with_tables(
+        &public,
+        trusted.anchor_id,
+        model_id,
+        parameters,
+        &specs,
+        &table_metas,
+        &table_params,
+    )?;
     let matmul = find_lm_head_matmul(&plan)?;
     let selection = SelectedMatmulStep::select(&plan, matmul.index)?;
     let plan_identifier = selected_plan_identifier(&public, &plan, &selection)?;
@@ -253,9 +274,6 @@ pub fn load_gpt2_lm_head_context(
         || meta.leaf_record.table_identity != asset_identity
     {
         return Err(Error::StatementMismatch);
-    }
-    if trusted.model_version != zkie_models_gpt2::plan::MODEL_VERSION {
-        return Err(Error::InvalidConfig);
     }
     let limited_table_identity = trusted.trusted_limited_table_identity()?.clone();
     // The activation commitment pin is an operator value, never a proof value.

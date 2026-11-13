@@ -229,8 +229,8 @@ fn proof_manifest(model: Digest, files: Vec<ArtifactFile>) -> ArtifactManifest {
     }
 }
 
-fn commitment_table_params(config: &ProviderConfig) -> Result<Vec<AssetTableParams>> {
-    match config.model.as_str() {
+fn trusted_table_params(model: &str) -> Result<Vec<AssetTableParams>> {
+    match model {
         "gpt2" => zkie_models_gpt2::plan::asset_table_params(),
         "gemma3" => Ok(Vec::new()),
         "timesfm" => Ok(Vec::new()),
@@ -297,7 +297,7 @@ impl PipelineProvider for ProductionProvider {
         ctx: &mut PipelineContext<'_>,
     ) -> Result<CommitReceipt> {
         let config = parse_case(&request.case_config)?;
-        let table_params = commitment_table_params(&config)?;
+        let table_params = trusted_table_params(&config.model)?;
         let tables = sample_asset_table_inputs(&table_params)?;
         let commitment = build_commitment(&config, &tables)?;
         let asset_units = commitment.assets.len() as u64;
@@ -364,7 +364,7 @@ impl PipelineProvider for ProductionProvider {
         let config_bytes = fs::read(request.commit_dir.join("public/provider-config.bin"))
             .map_err(|_| Error::MissingCommitArtifact)?;
         let config: ProviderConfig = bincode::deserialize(&config_bytes).map_err(|_| Error::InvalidEncoding)?;
-        let table_params = commitment_table_params(&config)?;
+        let table_params = trusted_table_params(&config.model)?;
         let randomness_bytes =
             fs::read(request.commit_dir.join("private/asset-table-randomness.bin"))
                 .map_err(|_| Error::MissingCommitArtifact)?;
@@ -465,6 +465,7 @@ impl PipelineProvider for ProductionProvider {
         {
             return Err(Error::StatementMismatch);
         }
+        let table_params = trusted_table_params(&trusted.model)?;
 
         let (bound, statement_matches) = match trusted.model.as_str() {
             "gpt2" => {
@@ -484,7 +485,7 @@ impl PipelineProvider for ProductionProvider {
                     parameters,
                     &specs,
                     &table_metas,
-                    &[],
+                    &table_params,
                 )?;
                 let argmax =
                     verify_shared_trace(&public, &trace, &statement.tokens, &plan)?;
@@ -519,7 +520,7 @@ impl PipelineProvider for ProductionProvider {
                     parameters,
                     &specs,
                     &table_metas,
-                    &[],
+                    &table_params,
                 )?;
                 let argmax =
                     verify_shared_trace(&public, &trace, &statement.tokens, &plan)?;
@@ -557,7 +558,7 @@ impl PipelineProvider for ProductionProvider {
                     parameters,
                     &specs,
                     &table_metas,
-                    &[],
+                    &table_params,
                 )?;
                 let output = verify_shared_trace_output(
                     &public,
