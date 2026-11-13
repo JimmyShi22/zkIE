@@ -21585,6 +21585,8 @@ mod merged_tests {
                 widths: crate::proof::hidden_norm_psc::NormOutputTailWidths {
                     quotient: 3,
                     remainder: 2,
+                    doubled_remainder: 2,
+                    tie_slack: 2,
                     shifted: 3,
                     pre_clamp: 3,
                 },

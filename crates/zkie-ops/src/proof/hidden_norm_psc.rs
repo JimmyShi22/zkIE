@@ -2461,13 +2461,25 @@ pub struct NormParamClaimWitness {
 pub struct NormOutputTailWidths {
     pub quotient: usize,
     pub remainder: usize,
+    /// The doubled remainder `2 r` used by the half-up selector row.
+    pub doubled_remainder: usize,
+    /// The tie slack `2 r - 2^shift * selector`, nonnegative below the
+    /// divisor.
+    pub tie_slack: usize,
     pub shifted: usize,
     pub pre_clamp: usize,
 }
 
 impl NormOutputTailWidths {
     pub fn fault(&self, shift: u32) -> Option<&'static str> {
-        for width in [self.quotient, self.remainder, self.shifted, self.pre_clamp] {
+        for width in [
+            self.quotient,
+            self.remainder,
+            self.doubled_remainder,
+            self.tie_slack,
+            self.shifted,
+            self.pre_clamp,
+        ] {
             if width == 0 || width > 7 {
                 return Some("an output tail width is out of range");
             }
@@ -2482,6 +2494,12 @@ impl NormOutputTailWidths {
         if digit_bound(self.remainder).ok()? + 1 < divisor {
             return Some("the remainder width does not cover the shift divisor");
         }
+        if digit_bound(self.doubled_remainder).ok()? + 1 < 2 * divisor {
+            return Some("the doubled remainder width does not cover twice the divisor");
+        }
+        if digit_bound(self.tie_slack).ok()? + 1 < divisor {
+            return Some("the tie slack width does not cover the divisor");
+        }
         None
     }
 
@@ -2490,6 +2508,8 @@ impl NormOutputTailWidths {
     pub fn slots(&self) -> Result<usize> {
         self.quotient
             .checked_add(self.remainder)
+            .and_then(|value| value.checked_add(self.doubled_remainder))
+            .and_then(|value| value.checked_add(self.tie_slack))
             .and_then(|value| value.checked_add(1))
             .and_then(|value| value.checked_add(self.shifted))
             .and_then(|value| value.checked_add(self.pre_clamp))
@@ -2554,6 +2574,8 @@ impl NormOutputTailPlan {
         put_norm_group(writer, &self.group);
         writer.put_u64(self.widths.quotient as u64);
         writer.put_u64(self.widths.remainder as u64);
+        writer.put_u64(self.widths.doubled_remainder as u64);
+        writer.put_u64(self.widths.tie_slack as u64);
         writer.put_u64(self.widths.shifted as u64);
         writer.put_u64(self.widths.pre_clamp as u64);
     }
@@ -2616,13 +2638,31 @@ impl NormOutputTailPlan {
                 .checked_add(half_q)
                 .ok_or(Error::BoundViolation)?;
             put(&mut values, base, quotient, self.widths.quotient)?;
+            let remainder_at = base + self.widths.quotient;
             put(
                 &mut values,
-                base + self.widths.quotient,
+                remainder_at,
                 row.remainder[column],
                 self.widths.remainder,
             )?;
-            let selector = base + self.widths.quotient + self.widths.remainder;
+            let doubled_at = remainder_at + self.widths.remainder;
+            let divisor = 1i128 << row.shift;
+            let doubled = row.remainder[column]
+                .checked_mul(2)
+                .ok_or(Error::BoundViolation)?;
+            let selector_value = if row.selector[column] { 1i128 } else { 0 };
+            let tie = doubled
+                .checked_sub(divisor * selector_value)
+                .ok_or(Error::BoundViolation)?;
+            put(
+                &mut values,
+                doubled_at,
+                doubled,
+                self.widths.doubled_remainder,
+            )?;
+            let tie_at = doubled_at + self.widths.doubled_remainder;
+            put(&mut values, tie_at, tie, self.widths.tie_slack)?;
+            let selector = tie_at + self.widths.tie_slack;
             if row.selector[column] {
                 values[selector] = Fp3::ONE;
             }
@@ -5480,6 +5520,8 @@ mod tests {
         let widths = NormOutputTailWidths {
             quotient: 3,
             remainder: 2,
+            doubled_remainder: 2,
+            tie_slack: 2,
             shifted: 3,
             pre_clamp: 3,
         };
@@ -5543,7 +5585,7 @@ mod tests {
             .quotient = 8;
         assert!(changed.validate().is_err());
 
-        assert!(widths.slots().unwrap() == 12);
+        assert_eq!(widths.slots().unwrap(), 16);
     }
 
     #[test]
