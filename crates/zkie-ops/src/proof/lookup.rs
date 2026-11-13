@@ -104,18 +104,32 @@ impl TableAt for ByteTable {
         // least significant row bit, matching the leaf inner sumcheck and the
         // equality weights. On the Boolean basis `e_j` the table therefore
         // takes the value `2^j`.
-        let mut values = (0..256u64).map(Fp3::from_u64).collect::<Vec<_>>();
-        for coordinate in point {
-            let half = values.len() / 2;
-            for index in 0..half {
-                let low = values[2 * index];
-                let high = values[2 * index + 1];
-                values[index] = low.add(&coordinate.mul(&high.sub(&low)));
-            }
-            values.truncate(half);
-        }
-        values.first().copied().ok_or(Error::ShapeMismatch)
+        let values = (0..256u64).map(Fp3::from_u64).collect::<Vec<_>>();
+        fold_adjacent(&values, point)
     }
+}
+
+/// Folds a row table to one value at `point`, one coordinate at a time. The
+/// first point coordinate is the least significant row bit, so adjacent row
+/// pairs differ in that bit. Every table view uses this order.
+pub(crate) fn fold_adjacent(values: &[Fp3], point: &[Fp3]) -> Result<Fp3> {
+    let expected = 1usize
+        .checked_shl(point.len() as u32)
+        .ok_or(Error::ShapeMismatch)?;
+    if values.len() != expected {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut values = values.to_vec();
+    for coordinate in point {
+        let half = values.len() / 2;
+        for index in 0..half {
+            let low = values[2 * index];
+            let high = values[2 * index + 1];
+            values[index] = low.add(&coordinate.mul(&high.sub(&low)));
+        }
+        values.truncate(half);
+    }
+    values.first().copied().ok_or(Error::ShapeMismatch)
 }
 
 /// The random linear combination of a table's value columns over the same row
@@ -671,7 +685,7 @@ fn tree_levels(values: &[Fp3], fixed: usize, variables: usize) -> Vec<Vec<Fp3>> 
 /// processed coordinate is the least significant index bit. This matches the
 /// sumcheck's variable order, where the first point coordinate is the least
 /// significant bit of the map index.
-fn eq_weights(point: &[Fp3]) -> Vec<Fp3> {
+pub(crate) fn eq_weights(point: &[Fp3]) -> Vec<Fp3> {
     let mut weights = vec![Fp3::ONE];
     for coordinate in point.iter().rev() {
         let mut next = vec![Fp3::ZERO; weights.len() * 2];
