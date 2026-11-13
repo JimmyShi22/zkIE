@@ -1,0 +1,4 @@
+43dc5e75 Bind the hidden output object to the same position
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     |   8 +
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 177 +++++++++++++++++++++++
+ 2 files changed, 185 insertions(+)
