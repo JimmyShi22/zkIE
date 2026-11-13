@@ -184,6 +184,67 @@ impl LookupKeyPlan {
     }
 }
 
+/// One key's contribution to the linear claim on its committed rounding cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyLinearTerm {
+    pub oracle: u64,
+    pub position: u32,
+    pub row: u32,
+    pub place: u32,
+    pub coefficient: Fp3,
+}
+
+/// The key-leaf claim expanded into linear terms on the committed rounding
+/// cells, a public padding constant and the mask terms of the claim. The
+/// caller registers each term on its physical member; no virtual tree or root
+/// is involved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyClaimExpansion {
+    pub terms: Vec<KeyLinearTerm>,
+    pub constant: Fp3,
+    pub masks: Vec<MaskTerm>,
+    pub value: Fp3,
+}
+
+impl LookupKeyPlan {
+    /// Expands the key-leaf claim at its random point into linear claims on the
+    /// committed rounding cells named by this plan.
+    pub fn expand_claim(
+        &self,
+        plan: &LookupPlan,
+        claim: &GeneralClaim,
+    ) -> Result<KeyClaimExpansion> {
+        self.validate(plan)?;
+        let keys = plan.key_count()?;
+        let eq = eq_weights(&claim.point);
+        if eq.len() != keys {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut terms = Vec::with_capacity(self.sources.len());
+        let mut constant = Fp3::ZERO;
+        for (index, source) in self.sources.iter().enumerate() {
+            let weight = eq[index];
+            terms.push(KeyLinearTerm {
+                oracle: source.oracle,
+                position: source.position,
+                row: source.row,
+                place: source.place,
+                coefficient: weight.mul(&source.coefficient),
+            });
+            constant = constant.add(&weight.mul(&source.offset));
+        }
+        for weight in eq.iter().skip(self.sources.len()) {
+            constant = constant.add(&weight.mul(&self.padding_value));
+        }
+        Ok(KeyClaimExpansion {
+            terms,
+            constant,
+            masks: claim.masks.clone(),
+            value: claim.value,
+        })
+    }
+}
+
 /// A deterministic challenge source for the standalone lookup. The send hooks
 /// mix every prover message into the state, so a tampered message changes the
 /// later challenges.
@@ -1231,6 +1292,35 @@ mod tests {
 
     fn key_rows(keys: &[u64]) -> Vec<Vec<Vec<Fp3>>> {
         vec![vec![keys.iter().map(|key| Fp3::from_u64(*key)).collect()]]
+    }
+
+    #[test]
+    fn key_claim_expands_to_linear_terms() {
+        let plan = plan();
+        let keys = [0u64, 1, 2];
+        let cells = [Fp3::from_u64(3), Fp3::from_u64(5), Fp3::from_u64(7)];
+        let mut key_plan = key_plan(&keys);
+        key_plan.padding_value = Fp3::from_u64(11);
+        key_plan.sources[0].coefficient = Fp3::from_u64(2);
+        key_plan.sources[1].offset = Fp3::from_u64(4);
+        let point = [Fp3::from_u64(9), Fp3::from_u64(13)];
+        let eq = eq_weights(&point);
+        let mut value = Fp3::ZERO;
+        for index in 0..cells.len() {
+            let key = key_plan.sources[index]
+                .coefficient
+                .mul(&cells[index])
+                .add(&key_plan.sources[index].offset);
+            value = value.add(&eq[index].mul(&key));
+        }
+        value = value.add(&eq[3].mul(&key_plan.padding_value));
+        let claim = GeneralClaim { point: point.to_vec(), value, masks: Vec::new() };
+        let expansion = key_plan.expand_claim(&plan, &claim).unwrap();
+        let mut lhs = expansion.constant;
+        for (index, term) in expansion.terms.iter().enumerate() {
+            lhs = lhs.add(&term.coefficient.mul(&cells[index]));
+        }
+        assert_eq!(lhs, expansion.value);
     }
 
     fn plan() -> LookupPlan {
