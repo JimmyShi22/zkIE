@@ -1,0 +1,437 @@
+commit d1824d495f44f7b1e2722e472c38a2e37be58421
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Sat Nov 14 06:37:31 2026 +0800
+
+    Register the encoded table instance and reuse it by public identity
+    
+    The anchor command accepts the saved private table randomness, rebuilds the
+    same encoded-table commitment the commit published, and prints the public
+    instance identity: the anchor leaf count and, per table, the identity,
+    configuration, root and record digest. A model with trusted tables and no
+    saved material is rejected, and a model without trusted tables rejects
+    unexpected material. The matrix accepts a registered commit per case and
+    reuses it for every run, so a registered instance is exercised by reruns while
+    the new-commit cost is measured by the separate provisioning run. The context
+    test reads the registered instance artifacts from the registration archive
+    and keeps the old-version artifact rejection under a version-one policy.
+    
+    The policy registration of the provisioned instances is the next commit.
+
+diff --git a/crates/zkie-ops/src/proof/model_commitment.rs b/crates/zkie-ops/src/proof/model_commitment.rs
+index cd223d9f..15f45117 100644
+--- a/crates/zkie-ops/src/proof/model_commitment.rs
++++ b/crates/zkie-ops/src/proof/model_commitment.rs
+@@ -292,6 +292,19 @@ pub fn commit_assets_with_tables(
+         .map(|(commitment, _)| commitment)
+ }
+ 
++/// Like `commit_assets_with_tables`, and returns one SHA-256 per asset. The
++/// operator identity check uses it to rebuild the same table commitment from
++/// the saved private randomness.
++pub fn commit_assets_with_digests_and_tables(
++    root: &Path,
++    model_commitment: Digest,
++    parameters_digest: Digest,
++    specs: &[ModelAssetSpec],
++    tables: &[AssetTableInput],
++) -> Result<(ModelCommitment, Vec<AssetDigest>)> {
++    commit_assets_inner(root, model_commitment, parameters_digest, specs, true, tables)
++}
++
+ fn commit_assets_inner(
+     root: &Path,
+     model_commitment: Digest,
+diff --git a/zkie/src/anchor.rs b/zkie/src/anchor.rs
+index e1ed542c..a26ba1c4 100644
+--- a/zkie/src/anchor.rs
++++ b/zkie/src/anchor.rs
+@@ -12,8 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
+ use zkie_core::artifact::{digest_bytes, digest_from_hex, digest_to_hex};
+ use zkie_core::error::{Error, Result};
+ use zkie_core::types::Digest;
++use zkie_ops::proof::asset_table::decode_asset_table_randomness_set;
+ use zkie_ops::proof::model_commitment::{
+-    commit_assets_with_digests, AssetDigest, ModelCommitment,
++    commit_assets_with_digests_and_tables, AssetDigest, ModelCommitment,
+ };
+ 
+ use crate::report::{parse_flags, path_flag};
+@@ -25,13 +26,22 @@ pub struct AnchorArgs {
+     pub out: Option<PathBuf>,
+     pub asset_hashes: Option<PathBuf>,
+     pub policy: Option<PathBuf>,
++    pub table_randomness: Option<PathBuf>,
+ }
+ 
+ impl AnchorArgs {
+     pub fn parse(args: &[String]) -> Result<Self> {
+         let flags = parse_flags(
+             args,
+-            &["case", "input", "asset-root", "out", "asset-hashes", "policy"],
++            &[
++                "case",
++                "input",
++                "asset-root",
++                "out",
++                "asset-hashes",
++                "policy",
++                "table-randomness",
++            ],
+         )?;
+         Ok(Self {
+             case: path_flag(&flags, "case")?,
+@@ -40,6 +50,7 @@ impl AnchorArgs {
+             out: flags.get("out").map(PathBuf::from),
+             asset_hashes: flags.get("asset-hashes").map(PathBuf::from),
+             policy: flags.get("policy").map(PathBuf::from),
++            table_randomness: flags.get("table-randomness").map(PathBuf::from),
+         })
+     }
+ }
+@@ -152,36 +163,54 @@ fn confirmation(
+     model: &str,
+     asset_root: &Path,
+     values: &[i32],
++    table_randomness: Option<&Path>,
+ ) -> Result<Confirmation> {
+     let tokens: Vec<u32> = values.iter().map(|value| *value as u32).collect();
+-    let (model_id, parameters, specs, spec_version) = match model {
++    let (model_id, parameters, specs, spec_version, table_params) = match model {
+         "gpt2" => (
+             zkie_models_gpt2::plan::model_commitment(&tokens)?,
+             zkie_models_gpt2::plan::parameters_digest()?,
+             zkie_models_gpt2::plan::asset_specs(),
+             zkie_models_gpt2::plan::MODEL_VERSION,
++            zkie_models_gpt2::plan::asset_table_params()?,
+         ),
+         "gemma3" => (
+             zkie_models_gemma3::plan::model_commitment(&tokens)?,
+             zkie_models_gemma3::plan::parameters_digest()?,
+             zkie_models_gemma3::plan::asset_specs(),
+             zkie_models_gemma3::plan::MODEL_VERSION,
++            Vec::new(),
+         ),
+         "timesfm" => (
+             zkie_models_timesfm::plan::model_commitment(&tokens)?,
+             zkie_models_timesfm::plan::parameters_digest()?,
+             zkie_models_timesfm::plan::asset_specs(),
+             zkie_models_timesfm::plan::MODEL_VERSION,
++            Vec::new(),
+         ),
+         _ => return Err(Error::UnsupportedPrimitive),
+     };
++    // The encoded-table instance is rebuilt from the saved private material,
++    // so the operator identity check names the same public commitment the
++    // commit published. A model without trusted tables must not receive one.
++    let tables = if table_params.is_empty() {
++        if table_randomness.is_some() {
++            return Err(Error::InvalidConfig);
++        }
++        Vec::new()
++    } else {
++        let path = table_randomness.ok_or(Error::MissingCommitArtifact)?;
++        let bytes = std::fs::read(path).map_err(|_| Error::Io)?;
++        decode_asset_table_randomness_set(&bytes, &table_params)?
++    };
+     let spec_count = specs.len();
+     let (commitment, digests) =
+-        commit_assets_with_digests(asset_root, model_id, parameters, &specs)?;
++        commit_assets_with_digests_and_tables(asset_root, model_id, parameters, &specs, &tables)?;
+     if commitment.anchor.record.model_commitment != model_id
+         || commitment.anchor.record.parameters_digest != parameters
+         || commitment.assets.len() != spec_count
+         || digests.len() != spec_count
++        || commitment.tables.len() != tables.len()
+     {
+         return Err(Error::StatementMismatch);
+     }
+@@ -327,7 +356,12 @@ pub fn run(args: &[String]) -> Result<()> {
+     } else {
+         "argmax"
+     };
+-    let confirmed = confirmation(&case.model, &asset_root, &values)?;
++    let confirmed = confirmation(
++        &case.model,
++        &asset_root,
++        &values,
++        parsed.table_randomness.as_deref(),
++    )?;
+     if let Some(previous) = &parsed.asset_hashes {
+         let bytes = std::fs::read(previous).map_err(|_| Error::Io)?;
+         let value: serde_json::Value =
+@@ -360,6 +394,24 @@ pub fn run(args: &[String]) -> Result<()> {
+             })
+         })
+         .collect();
++    let table_instances: Vec<serde_json::Value> = confirmed
++        .commitment
++        .tables
++        .iter()
++        .map(|meta| {
++            serde_json::json!({
++                "asset_id": meta.asset_id,
++                "path": meta.path,
++                "identity": digest_to_hex(&meta.identity),
++                "configuration": digest_to_hex(&meta.configuration),
++                "root": digest_to_hex(&meta.root),
++                "record_digest": digest_to_hex(&digest_bytes(&meta.record.encode())),
++                "valid_min": meta.valid_min,
++                "valid_max": meta.valid_max,
++                "valid_elements": meta.valid_elements,
++            })
++        })
++        .collect();
+     let registered_at = SystemTime::now()
+         .duration_since(UNIX_EPOCH)
+         .ok()
+@@ -374,7 +426,9 @@ pub fn run(args: &[String]) -> Result<()> {
+         "spec_version": confirmed.spec_version,
+         "model_id": digest_to_hex(&confirmed.model_id),
+         "anchor_id": digest_to_hex(&confirmed.commitment.anchor.record.anchor_id),
++        "anchor_leaf_count": confirmed.commitment.anchor.record.leaf_count,
+         "parameters_digest": digest_to_hex(&confirmed.parameters),
++        "table_instances": table_instances,
+         "assets_checked": confirmed.digests.len(),
+         "input_elements": values.len(),
+         "registered_at_unix": registered_at,
+diff --git a/zkie/src/lib.rs b/zkie/src/lib.rs
+index 3352d7ac..fb3b239d 100644
+--- a/zkie/src/lib.rs
++++ b/zkie/src/lib.rs
+@@ -81,6 +81,6 @@ fn exit_code<T>(result: zkie_core::error::Result<T>) -> i32 {
+ 
+ pub fn print_usage() {
+     println!(
+-        "usage:\n  zkie anchor --case <path> --input <path> --asset-root <path> [--out <path>]\n  zkie matrix --cases <case.toml>... --cold-runs 1 --warm-runs 3 --out <dir>\n  zkie decode-matrix --cases <case.toml>... --prompt-len 16 --decode-lengths 16 512 --out <dir>\n  zkie profile-matrix --cases <case.toml>... --threads 1 8 64 --runs 3 --out <dir>\n  zkie commit --case <path> --assets-manifest <path> --parameters <path> --out <dir> --run-dir <dir>\n  zkie prove --commit <dir> --input <path> --model-id <hex> --out <dir> --run-dir <dir>\n  zkie verify --public <dir> --statement <path> --proof <path> --public-inputs <path> --model-id <hex> --policy <path> --run-dir <dir>\n  zkie run --commit-policy create|reuse [--commit-dir <dir>] --case <path> --assets-manifest <path> --parameters <path> --input <path> --model-id <hex> --policy <path> --run-dir <dir>"
++        "usage:\n  zkie anchor --case <path> --input <path> --asset-root <path> [--table-randomness <path>] [--out <path>]\n  zkie matrix --cases <case.toml>... --cold-runs 1 --warm-runs 3 [--commit-dir <case_id>=<path>]... --out <dir>\n  zkie decode-matrix --cases <case.toml>... --prompt-len 16 --decode-lengths 16 512 [--commit-dir <case_id>=<path>]... --out <dir>\n  zkie profile-matrix --cases <case.toml>... --threads 1 8 64 --runs 3 --out <dir>\n  zkie commit --case <path> --assets-manifest <path> --parameters <path> --out <dir> --run-dir <dir>\n  zkie prove --commit <dir> --input <path> --model-id <hex> --out <dir> --run-dir <dir>\n  zkie verify --public <dir> --statement <path> --proof <path> --public-inputs <path> --model-id <hex> --policy <path> --run-dir <dir>\n  zkie run --commit-policy create|reuse [--commit-dir <dir>] --case <path> --assets-manifest <path> --parameters <path> --input <path> --model-id <hex> --policy <path> --run-dir <dir>"
+     );
+ }
+diff --git a/zkie/src/run.rs b/zkie/src/run.rs
+index 2f6656c0..ed82d710 100644
+--- a/zkie/src/run.rs
++++ b/zkie/src/run.rs
+@@ -336,6 +336,8 @@ fn run_one(
+ fn collect(args: &[String], decode: bool) -> Result<serde_json::Value> {
+     let mut cases: Vec<String> = Vec::new();
+     let mut out: Option<std::path::PathBuf> = None;
++    let mut commit_dirs: std::collections::BTreeMap<String, std::path::PathBuf> =
++        std::collections::BTreeMap::new();
+     let mut cold_runs = 1u32;
+     let mut warm_runs = 3u32;
+     let mut index = 0;
+@@ -369,6 +371,27 @@ fn collect(args: &[String], decode: bool) -> Result<serde_json::Value> {
+                     .and_then(|value| value.parse().ok())
+                     .ok_or(Error::InvalidConfig)?;
+             }
++            "--commit-dir" => {
++                // A registered commit instance for this case: every run reuses
++                // it. The instance is provisioned and registered separately;
++                // its cost is measured there, not in the matrix.
++                index += 1;
++                while index < args.len() && !args[index].starts_with("--") {
++                    let (case_id, path) = args[index]
++                        .split_once('=')
++                        .ok_or(Error::InvalidConfig)?;
++                    if case_id.is_empty()
++                        || path.is_empty()
++                        || commit_dirs
++                            .insert(case_id.to_owned(), std::path::PathBuf::from(path))
++                            .is_some()
++                    {
++                        return Err(Error::InvalidConfig);
++                    }
++                    index += 1;
++                }
++                continue;
++            }
+             "--prompt-len" | "--decode-lengths" | "--compute" | "--asset-root" => {
+                 index += 1;
+                 while index < args.len() && !args[index].starts_with("--") {
+@@ -403,22 +426,25 @@ fn collect(args: &[String], decode: bool) -> Result<serde_json::Value> {
+             }
+             let case_dir = out.join(&entry.id);
+             fs::create_dir_all(&case_dir).map_err(|_| Error::Io)?;
++            let registered = commit_dirs.get(&entry.id).cloned();
+             let commit_dir = case_dir.join("cold-0").join("commit");
+             let mut runs = Vec::new();
+             for run in 0..cold_runs {
+                 let run_dir = case_dir.join(format!("cold-{run}"));
++                let registered_dir = registered.clone();
+                 runs.push(run_one(
+                     &executable,
+                     &case_path,
+                     &entry.id,
+                     &input,
+                     &run_dir,
+-                    "create",
+-                    None,
++                    if registered_dir.is_some() { "reuse" } else { "create" },
++                    registered_dir.as_deref(),
+                 )?);
+             }
+             for run in 0..warm_runs {
+                 let run_dir = case_dir.join(format!("warm-{run}"));
++                let registered_dir = registered.clone().unwrap_or_else(|| commit_dir.clone());
+                 runs.push(run_one(
+                     &executable,
+                     &case_path,
+@@ -426,15 +452,19 @@ fn collect(args: &[String], decode: bool) -> Result<serde_json::Value> {
+                     &input,
+                     &run_dir,
+                     "reuse",
+-                    Some(&commit_dir),
++                    Some(registered_dir.as_path()),
+                 )?);
+             }
+-            report.push(serde_json::json!({
++            let mut case_report = serde_json::json!({
+                 "case_id": entry.id,
+                 "seq_tokens": entry.seq_tokens,
+                 "input": input,
+                 "runs": runs,
+-            }));
++            });
++            if let Some(dir) = &registered {
++                case_report["registered_commit"] = serde_json::json!(dir.to_string_lossy());
++            }
++            report.push(case_report);
+         }
+     }
+     let body = serde_json::to_string_pretty(&serde_json::json!({
+diff --git a/zkie/tests/s7_context.rs b/zkie/tests/s7_context.rs
+index db1d0d6c..181e1142 100644
+--- a/zkie/tests/s7_context.rs
++++ b/zkie/tests/s7_context.rs
+@@ -14,7 +14,7 @@ fn repo_root() -> PathBuf {
+         .to_path_buf()
+ }
+ 
+-fn artifacts() -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
++fn legacy_artifacts() -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
+     let root = repo_root();
+     let case = root.join("models/gpt2/case.toml");
+     let policy = root.join("models/gpt2/case.policy");
+@@ -34,6 +34,44 @@ fn artifacts() -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
+     }
+ }
+ 
++/// The most recent registered table-instance run that kept a seq16 commit and
++/// statement on disk. The registration archive holds the instance artifacts;
++/// a checkout without them skips the positive context test.
++fn registered_artifacts() -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
++    let root = repo_root();
++    let case = root.join("models/gpt2/case.toml");
++    let policy = root.join("models/gpt2/case.policy");
++    let mut dirs: Vec<PathBuf> = fs::read_dir(root.join("docs/benchmarks"))
++        .ok()?
++        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
++        .filter(|path| {
++            path.file_name()
++                .and_then(|name| name.to_str())
++                .map_or(false, |name| name.contains("-model-table-instance-"))
++        })
++        .collect();
++    dirs.sort();
++    for dir in dirs.into_iter().rev() {
++        let base = dir.join("smoke/gpt2-seq16");
++        let public = base.join("commit/public");
++        let statement = base.join("proof/statement.bin");
++        if case.exists()
++            && policy.exists()
++            && public.join("model-commitment.bin").exists()
++            && statement.exists()
++        {
++            return Some((case, policy, public, statement));
++        }
++    }
++    None
++}
++
++fn first_anchor_hex(text: &str) -> Option<String> {
++    let start = text.find("anchor_id = \"")? + "anchor_id = \"".len();
++    let end = start.checked_add(64)?;
++    text.get(start..end).map(str::to_owned)
++}
++
+ fn read_statement(path: &Path) -> StatementData {
+     bincode::deserialize(&fs::read(path).expect("statement bytes")).expect("statement")
+ }
+@@ -59,33 +97,10 @@ fn the_compiled_plan_has_one_lm_head_matmul_step() {
+ 
+ #[test]
+ fn the_real_context_is_loaded_with_the_lm_head_identity() {
+-    let Some((case, policy, public, statement)) = artifacts() else {
++    let Some((case, policy, public, statement)) = registered_artifacts() else {
+         return;
+     };
+     let statement_data = read_statement(&statement);
+-    // The fixture artifact predates the current model version. The existing
+-    // gate rejects a version mismatch; the historical artifact stays on disk.
+-    let policy_document =
+-        zkie::policy::parse(&fs::read(&policy).expect("policy bytes")).expect("policy");
+-    let trusted = zkie::policy::select(
+-        &policy_document,
+-        &statement_data.case_id,
+-        &statement_data.model,
+-        statement_data.tokens.len(),
+-    )
+-    .expect("trusted policy");
+-    if trusted.model_version != zkie_models_gpt2::plan::MODEL_VERSION {
+-        let error = load_gpt2_lm_head_context(
+-            &case,
+-            &policy,
+-            &public,
+-            &statement,
+-            statement_data.model_commitment,
+-        )
+-        .expect_err("an artifact of another model version must be rejected");
+-        assert_eq!(error.code(), "invalid_config");
+-        return;
+-    }
+     let context = load_gpt2_lm_head_context(
+         &case,
+         &policy,
+@@ -135,9 +150,29 @@ fn the_real_context_is_loaded_with_the_lm_head_identity() {
+     }
+ }
+ 
++#[test]
++fn legacy_artifacts_are_rejected_by_the_version_gate() {
++    let Some((case, policy, public, statement)) = legacy_artifacts() else {
++        return;
++    };
++    let statement_data = read_statement(&statement);
++    let policy_text = fs::read_to_string(&policy).expect("policy text");
++    let old_policy = policy_text.replace("model_version = 2", "model_version = 1");
++    let old_policy = temp_file("policy-v1.toml", old_policy.as_bytes());
++    let error = load_gpt2_lm_head_context(
++        &case,
++        &old_policy,
++        &public,
++        &statement,
++        statement_data.model_commitment,
++    )
++    .expect_err("an artifact of another model version must be rejected");
++    assert_eq!(error.code(), "invalid_config");
++}
++
+ #[test]
+ fn wrong_identities_and_shapes_are_rejected() {
+-    let Some((case, policy, public, statement)) = artifacts() else {
++    let Some((case, policy, public, statement)) = registered_artifacts() else {
+         return;
+     };
+     let statement_data = read_statement(&statement);
+@@ -146,10 +181,8 @@ fn wrong_identities_and_shapes_are_rejected() {
+     assert!(load_gpt2_lm_head_context(&case, &policy, &public, &statement, Digest::ZERO).is_err());
+ 
+     let policy_text = fs::read_to_string(&policy).expect("policy text");
+-    let wrong_policy = policy_text.replace(
+-        "dd08df8bcbba41adea6182709e00adb2f897fde4abc241d1ba09c552fd77ae36",
+-        &"00".repeat(32),
+-    );
++    let anchor = first_anchor_hex(&policy_text).expect("policy anchor");
++    let wrong_policy = policy_text.replace(&anchor, &"00".repeat(32));
+     let wrong_policy = temp_file("policy.toml", wrong_policy.as_bytes());
+     assert!(
+         load_gpt2_lm_head_context(&case, &wrong_policy, &public, &statement, model_id).is_err()

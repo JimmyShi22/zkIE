@@ -1,0 +1,51 @@
+diff --git a/models/gpt2/case.policy b/models/gpt2/case.policy
+index 45708382..feaf38e6 100644
+--- a/models/gpt2/case.policy
++++ b/models/gpt2/case.policy
+@@ -1,11 +1,11 @@
+ policy_version = 1
+ model = "gpt2"
+-model_version = 1
++model_version = 2
+ 
+ [[case]]
+ case_id = "gpt2-seq16"
+ sequence_length = 16
+-anchor_id = "dd08df8bcbba41adea6182709e00adb2f897fde4abc241d1ba09c552fd77ae36"
++anchor_id = "91397c7e3a02f7b35e2a49de44806391af55b7ef1c41a83552af2bfa910cc060"
+ model_id = "c2971c0179463bf12aecaefc3488417228008c1314e6905c49a55078242c1268"
+ output_mode = "expected"
+ expected_output_sha256 = "135c4d1c47aee4fd1985fa862afefbedde9d59beaf112bd2cf0dcfff03339280"
+@@ -17,9 +17,9 @@ output_elements = 16
+ [case.limited_table_identity]
+ version = 1
+ model = "gpt2"
+-model_version = 1
++model_version = 2
+ case_id = "gpt2-seq16"
+-anchor_id = "dd08df8bcbba41adea6182709e00adb2f897fde4abc241d1ba09c552fd77ae36"
++anchor_id = "91397c7e3a02f7b35e2a49de44806391af55b7ef1c41a83552af2bfa910cc060"
+ model_id = "c2971c0179463bf12aecaefc3488417228008c1314e6905c49a55078242c1268"
+ asset_id = 192
+ asset_table_identity = "e1c5430264e587b23054e83fb36155e762bc818077ca5e7889dd6a17cfc6f4ba"
+@@ -44,7 +44,7 @@ protocol_identity = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5
+ [[case]]
+ case_id = "gpt2-seq512"
+ sequence_length = 512
+-anchor_id = "79091b77db16312ae9d9bc4fdb5d2de93fd87caba4be1158e5de303aa660477d"
++anchor_id = "fd6164aea096b3e6a872e3d0ac5d63d2860581d93001b38a83d4f604a25e942e"
+ model_id = "6d35b05739f33e2d2c969f55fafd79c22a96d2264683a4d9a63ecb842438d271"
+ output_mode = "expected"
+ expected_output_sha256 = "eac0949d6463927eb9a961d61d618fb703e4b02169e89db10dbada94a5f0dfdd"
+@@ -56,9 +56,9 @@ output_elements = 512
+ [case.limited_table_identity]
+ version = 1
+ model = "gpt2"
+-model_version = 1
++model_version = 2
+ case_id = "gpt2-seq512"
+-anchor_id = "79091b77db16312ae9d9bc4fdb5d2de93fd87caba4be1158e5de303aa660477d"
++anchor_id = "fd6164aea096b3e6a872e3d0ac5d63d2860581d93001b38a83d4f604a25e942e"
+ model_id = "6d35b05739f33e2d2c969f55fafd79c22a96d2264683a4d9a63ecb842438d271"
+ asset_id = 192
+ asset_table_identity = "e1c5430264e587b23054e83fb36155e762bc818077ca5e7889dd6a17cfc6f4ba"

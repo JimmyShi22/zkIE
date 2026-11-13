@@ -1,0 +1,36 @@
+{
+  "seq16": {
+    "anchor_id": "91397c7e3a02f7b35e2a49de44806391af55b7ef1c41a83552af2bfa910cc060",
+    "anchor_leaf_count": 200,
+    "table_instances": [
+      {
+        "asset_id": 2,
+        "configuration": "d95ed11322007bd3892fd04ef30e4079b57fc6924029c1ea18fe7c6d71f07dd9",
+        "identity": "f1e9fda76cf41a390ceda044841e16057eec2774deb26dde0e1a87953f8ca5a5",
+        "path": "gpt2/weights/L0_k_w_i32.bin",
+        "record_digest": "67bbede244fefebb21a381f8c70c08589dea6ec4bceaa515da267bb54605fc4a",
+        "root": "4819d90bc9546ab4771db199c8e864de4249d3ccbc9419469a3065b712b32dff",
+        "valid_elements": 1048576,
+        "valid_max": 2147483647,
+        "valid_min": -2147483648
+      }
+    ]
+  },
+  "seq512": {
+    "anchor_id": "fd6164aea096b3e6a872e3d0ac5d63d2860581d93001b38a83d4f604a25e942e",
+    "anchor_leaf_count": 200,
+    "table_instances": [
+      {
+        "asset_id": 2,
+        "configuration": "7351a3db2a9ac8b08eb14705733f713395b807a711e748adc7201a0cebb4c5a2",
+        "identity": "18b36cf3d96c59db0f217084b8dccd21640757c3804d1c0f3e65d6b7ad09b67d",
+        "path": "gpt2/weights/L0_k_w_i32.bin",
+        "record_digest": "27803e857d7a14b576b7ff86a48157c03ecac862086fd5a41f732e73d4efcd33",
+        "root": "b6c10232b321466e855573955334cac6471c6eb662dc4ead720d773b9de6d40c",
+        "valid_elements": 1048576,
+        "valid_max": 2147483647,
+        "valid_min": -2147483648
+      }
+    ]
+  }
+}
