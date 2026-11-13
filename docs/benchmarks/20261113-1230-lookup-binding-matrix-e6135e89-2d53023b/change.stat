@@ -1,0 +1,14 @@
+commit e6135e89659e9d4699080d30aeb86999204e7e38
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Fri Nov 13 12:30:14 2026 +0800
+
+    Close the lookup binding matrix and wire the production plan (partial progress)
+    
+    The hidden fixture proximity code is sized for the full digit-set multiplicity message, and the lookup plan is built by the parent-plan constructor from the trusted rounding layout and the parent codes instead of hand-picked sources. The binding matrix adds first-message root, sample and opening tampering, a missing second-stage lookup carrier, a changed committed digit, duplicate and multi-message key sources, and a d=1 zero-range digit check; the verifier-visible proof is checked not to carry the private key vector.
+    
+    The rounding claim and the model-level plan assembly are not part of this step.
+
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     |  35 ++++
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 243 +++++++++++++++--------
+ crates/zkie-ops/src/proof/lookup.rs              |  72 +++++++
+ 3 files changed, 266 insertions(+), 84 deletions(-)
