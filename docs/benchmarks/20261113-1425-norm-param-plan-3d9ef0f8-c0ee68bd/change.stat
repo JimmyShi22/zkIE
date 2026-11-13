@@ -1,0 +1,21 @@
+commit 3d9ef0f8bf500a6b39a969f865f350e0fc1744b4
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Fri Nov 13 14:25:32 2026 +0800
+
+    Bind the norm parameter tables into the norm plan
+    
+    The norm plan can carry the gain and bias parameter table identities: the plan
+    validates the tables plan, requires both parameter widths to equal the padded
+    column domain, absorbs the tables digest into the plan digest and bumps the
+    bind version. The digest of each identity now encodes the committed reader
+    (root, configuration, shape numbers, distances and the record) inline, so the
+    plan digest binds the whole table identity without a separate fallible step. A
+    plan test checks the digest change, the width binding, the kind swap and the
+    duplicate row rejection.
+    
+    partial progress
+
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     | 87 +++++++++++++++++++++++-
+ crates/zkie-ops/src/proof/hidden_send_session.rs |  2 +
+ crates/zkie-ops/src/proof/norm_param_table.rs    | 56 ++++++++++-----
+ 3 files changed, 126 insertions(+), 19 deletions(-)
