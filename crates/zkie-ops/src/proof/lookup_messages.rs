@@ -23,9 +23,13 @@ pub struct LookupCommitPlan {
     pub bits_shape: WShape,
     pub bits_oracle: u64,
     pub group: u64,
+    /// The number of opened positions of the multiplicity-bit tree.
+    pub bits_openings: usize,
     pub mask_oracle: u64,
     pub mask_code: CodeParams,
     pub mask_rows: u64,
+    /// The number of opened positions of the mask tree.
+    pub mask_openings: usize,
     pub mask_tree: RuntimeTreePlan,
 }
 
@@ -35,6 +39,13 @@ impl LookupCommitPlan {
             || self.mask_oracle == 0
             || self.group == 0
             || self.bits_oracle == self.mask_oracle
+        {
+            return Err(Error::InvalidConfig);
+        }
+        if self.bits_openings == 0
+            || self.bits_openings as u64 > self.bits_shape.code.r
+            || self.mask_openings == 0
+            || self.mask_openings as u64 > self.mask_code.r
         {
             return Err(Error::InvalidConfig);
         }

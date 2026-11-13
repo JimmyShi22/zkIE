@@ -470,9 +470,13 @@ fn tree_levels(values: &[Fp3], fixed: usize, variables: usize) -> Vec<Vec<Fp3>> 
     levels
 }
 
+/// The equality weights of a point, in little-endian index order: the last
+/// processed coordinate is the least significant index bit. This matches the
+/// sumcheck's variable order, where the first point coordinate is the least
+/// significant bit of the map index.
 fn eq_weights(point: &[Fp3]) -> Vec<Fp3> {
     let mut weights = vec![Fp3::ONE];
-    for coordinate in point {
+    for coordinate in point.iter().rev() {
         let mut next = vec![Fp3::ZERO; weights.len() * 2];
         for (index, weight) in weights.iter().enumerate() {
             next[2 * index] = weight.mul(&Fp3::ONE.sub(coordinate));
@@ -657,7 +661,7 @@ fn equality_variables(point: &[Fp3], plane_count: usize) -> Result<Vec<Weight>> 
         .collect()
 }
 
-/// Proves the byte lookup for one key vector and its multiplicity bits.
+/// Commits the lookup messages and proves the byte lookup for one key vector.
 pub fn prove_lookup(
     plan: &LookupPlan,
     commit_plan: &LookupCommitPlan,
@@ -666,6 +670,41 @@ pub fn prove_lookup(
     witness: &LookupWitness,
     seed: u64,
 ) -> Result<(LookupMessages, LookupProof, LookupOutcome)> {
+    plan.validate()?;
+    let mask_entries = mask_count(plan)?;
+    commit_plan.validate(witness.bits.len(), mask_entries)?;
+    let mut random_source = LookupRandomSource::new(seed ^ 0x5A5A_5A5A);
+    let messages = commit_lookup(
+        commit_plan,
+        &witness.bits,
+        mask_entries,
+        &mut random_source,
+    )?;
+    let (proof, outcome) = prove_lookup_with_messages(
+        plan,
+        commit_plan,
+        key_plan,
+        key_rows,
+        witness,
+        &messages,
+        seed,
+    )?;
+    Ok((messages, proof, outcome))
+}
+
+/// Proves the byte lookup on messages that are already committed and sampled
+/// by the enclosing session. The challenges are drawn from the transcript in
+/// the fixed order: plan and message roots first, then the lookup challenge,
+/// then the product-sumcheck transcript.
+pub fn prove_lookup_with_messages(
+    plan: &LookupPlan,
+    commit_plan: &LookupCommitPlan,
+    key_plan: &LookupKeyPlan,
+    key_rows: &[Vec<Vec<Fp3>>],
+    witness: &LookupWitness,
+    messages: &LookupMessages,
+    seed: u64,
+) -> Result<(LookupProof, LookupOutcome)> {
     plan.validate()?;
     let keys = plan.key_count()?;
     let planes = plan.planes()?;
@@ -676,13 +715,23 @@ pub fn prove_lookup(
     }
     let mask_entries = mask_count(plan)?;
     commit_plan.validate(witness.bits.len(), mask_entries)?;
-    let mut random_source = LookupRandomSource::new(seed ^ 0x5A5A_5A5A);
-    let messages = commit_lookup(
-        commit_plan,
-        &witness.bits,
-        mask_entries,
-        &mut random_source,
-    )?;
+    let mask_rows = usize::try_from(commit_plan.mask_rows).map_err(|_| Error::ResourceLimit)?;
+    let ell = usize::try_from(commit_plan.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
+    let bit_rows = usize::try_from(commit_plan.bits_shape.main_rows)
+        .map_err(|_| Error::ResourceLimit)?;
+    if messages.bits.group.group != commit_plan.group
+        || messages.bits.roots.len() != 1
+        || messages.bits.roots[0] == Digest::ZERO
+        || messages.bits.messages.len() != 1
+        || messages.bits.messages[0].len() != bit_rows
+        || messages.mask_root == Digest::ZERO
+        || messages.mask_rows.len() != mask_rows
+        || messages.mask_rows.iter().any(|row| row.len() != ell)
+        || messages.mask_tails.len() != mask_rows
+        || messages.mask_salts.is_empty()
+    {
+        return Err(Error::ShapeMismatch);
+    }
     let mut challenges = LookupChallenges::new(seed);
     challenges.absorb(LOOKUP_VERSION, &plan.digest());
     challenges.absorb(commit_plan.bits_oracle, &messages.bits_root().0);
@@ -901,7 +950,6 @@ pub fn prove_lookup(
     let multiplicity = (coefficients, Fp3::from_u64(keys as u64));
 
     Ok((
-        messages,
         LookupProof {
             tie: tie_proofs,
             key_levels: key_proofs,
@@ -1303,6 +1351,287 @@ impl LookupProof {
     }
 }
 
+fn put_claim(writer: &mut CanonicalWriter, claim: &GeneralClaim) {
+    writer.put_u64(claim.point.len() as u64);
+    for coordinate in &claim.point {
+        writer.put_fp3(coordinate);
+    }
+    writer.put_fp3(&claim.value);
+    writer.put_u64(claim.masks.len() as u64);
+    for term in &claim.masks {
+        writer.put_u64(term.slot as u64);
+        writer.put_fp3(&term.coefficient);
+    }
+}
+
+fn get_claim(
+    reader: &mut CanonicalReader<'_>,
+    max_point: usize,
+    max_masks: usize,
+) -> Result<GeneralClaim> {
+    let point_count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+    if point_count > max_point {
+        return Err(Error::InvalidEncoding);
+    }
+    let mut point = Vec::with_capacity(point_count);
+    for _ in 0..point_count {
+        point.push(reader.get_fp3()?);
+    }
+    let value = reader.get_fp3()?;
+    let mask_count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+    if mask_count > max_masks {
+        return Err(Error::InvalidEncoding);
+    }
+    let mut masks = Vec::with_capacity(mask_count);
+    for _ in 0..mask_count {
+        masks.push(MaskTerm {
+            slot: usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?,
+            coefficient: reader.get_fp3()?,
+        });
+    }
+    Ok(GeneralClaim {
+        point,
+        value,
+        masks,
+    })
+}
+
+fn put_general_output(writer: &mut CanonicalWriter, output: &GeneralOutput) {
+    put_claim(
+        writer,
+        &GeneralClaim {
+            point: output.point.clone(),
+            value: output.claim_scale,
+            masks: output.claim_masks.clone(),
+        },
+    );
+    writer.put_fp3(&output.row_target);
+    writer.put_u64(output.hiding_form.len() as u64);
+    for coefficient in &output.hiding_form {
+        writer.put_fp3(coefficient);
+    }
+    writer.put_u64(output.ends.len() as u64);
+    for end in &output.ends {
+        writer.put_u64(end.point.len() as u64);
+        for coordinate in &end.point {
+            writer.put_fp3(coordinate);
+        }
+        writer.put_fp3(&end.mask_scale);
+        writer.put_fp3(&end.value);
+    }
+    writer.put_u64(output.row_maps.len() as u64);
+    for (map, coefficient) in &output.row_maps {
+        writer.put_u64(*map as u64);
+        writer.put_fp3(coefficient);
+    }
+}
+
+fn get_general_output(
+    reader: &mut CanonicalReader<'_>,
+    max_point: usize,
+    max_masks: usize,
+) -> Result<GeneralOutput> {
+    let claim = get_claim(reader, max_point, max_masks)?;
+    let row_target = reader.get_fp3()?;
+    let hiding_count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+    if hiding_count > max_masks {
+        return Err(Error::InvalidEncoding);
+    }
+    let mut hiding_form = Vec::with_capacity(hiding_count);
+    for _ in 0..hiding_count {
+        hiding_form.push(reader.get_fp3()?);
+    }
+    let end_count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+    if end_count > 4 {
+        return Err(Error::InvalidEncoding);
+    }
+    let mut ends = Vec::with_capacity(end_count);
+    for _ in 0..end_count {
+        let point_count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+        if point_count > max_point {
+            return Err(Error::InvalidEncoding);
+        }
+        let mut point = Vec::with_capacity(point_count);
+        for _ in 0..point_count {
+            point.push(reader.get_fp3()?);
+        }
+        ends.push(crate::proof::psc::PointClaim {
+            point,
+            mask_scale: reader.get_fp3()?,
+            value: reader.get_fp3()?,
+        });
+    }
+    let map_count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+    if map_count > 4 {
+        return Err(Error::InvalidEncoding);
+    }
+    let mut row_maps = Vec::with_capacity(map_count);
+    for _ in 0..map_count {
+        row_maps.push((
+            usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?,
+            reader.get_fp3()?,
+        ));
+    }
+    Ok(GeneralOutput {
+        point: claim.point,
+        hiding_form,
+        claim_scale: claim.value,
+        row_target,
+        ends,
+        row_maps,
+        claim_masks: claim.masks,
+    })
+}
+
+/// The number of general-sumcheck outputs the lookup transcript leaves.
+pub fn outcome_rows(plan: &LookupPlan) -> Result<usize> {
+    plan.validate()?;
+    let planes = plan.planes()?;
+    planes
+        .checked_sub(1)
+        .and_then(|value| value.checked_add(plan.key_bits as usize))
+        .and_then(|value| value.checked_add(plan.table_log as usize))
+        .and_then(|value| value.checked_add(2))
+        .ok_or(Error::ResourceLimit)
+}
+
+impl LookupOutcome {
+    /// Fixes the expected end maps and X-variable counts of one output row.
+    fn row_shape(plan: &LookupPlan, index: usize) -> Result<(usize, usize, usize)> {
+        let planes = plan.planes()?;
+        let key_bits = plan.key_bits as usize;
+        let mu = plan.mu as usize;
+        let table_log = plan.table_log as usize;
+        if index < planes - 1 {
+            let ends = if index == 0 { 3 } else { 2 };
+            return Ok((0, ends, 0));
+        }
+        let index = index - (planes - 1);
+        if index < key_bits {
+            return Ok((index, 2, 0));
+        }
+        let index = index - key_bits;
+        if index < table_log {
+            return Ok((mu + index, 2, 0));
+        }
+        let index = index - table_log;
+        match index {
+            0 => Ok((mu + table_log, 0, 1)),
+            1 => Ok((mu + table_log, 1, 0)),
+            _ => Err(Error::ShapeMismatch),
+        }
+    }
+
+    pub fn check(&self, plan: &LookupPlan) -> Result<()> {
+        plan.validate()?;
+        let planes = plan.planes()?;
+        let rows = plan.table_rows()?;
+        let keys = plan.key_count()?;
+        let count = mask_count(plan)?;
+        if self.rows.len() != outcome_rows(plan)?
+            || self.key.point.len() != plan.key_bits as usize
+            || self.multiplicity.0.len() != planes * rows
+            || self.multiplicity.1 != Fp3::from_u64(keys as u64)
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        if self
+            .key
+            .masks
+            .iter()
+            .any(|term| term.slot >= count)
+        {
+            return Err(Error::InvalidIndex);
+        }
+        for (index, output) in self.rows.iter().enumerate() {
+            let (point, ends, maps) = Self::row_shape(plan, index)?;
+            if output.point.len() != point
+                || output.ends.len() != ends
+                || output.row_maps.len() != maps
+                || output.hiding_form.len() > count
+                || output.claim_masks.iter().any(|term| term.slot >= count)
+                || output
+                    .row_maps
+                    .iter()
+                    .any(|(map, _)| *map >= maps.max(1))
+            {
+                return Err(Error::ShapeMismatch);
+            }
+            for end in &output.ends {
+                if end.point.len() != point {
+                    return Err(Error::ShapeMismatch);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self, plan: &LookupPlan) -> Result<Vec<u8>> {
+        self.check(plan)?;
+        Ok(self.encode_unchecked())
+    }
+
+    /// Writes the outcome without re-checking it against a plan. The enclosing
+    /// message checks it on decode; the prover path checks it before calling.
+    pub(crate) fn encode_unchecked(&self) -> Vec<u8> {
+        let mut writer = CanonicalWriter::new();
+        writer.put_u64(LOOKUP_VERSION);
+        put_claim(&mut writer, &self.key);
+        writer.put_u64(self.multiplicity.0.len() as u64);
+        for coefficient in &self.multiplicity.0 {
+            writer.put_fp3(coefficient);
+        }
+        writer.put_fp3(&self.multiplicity.1);
+        writer.put_u64(self.rows.len() as u64);
+        for output in &self.rows {
+            put_general_output(&mut writer, output);
+        }
+        writer.into_bytes()
+    }
+
+    pub fn decode(plan: &LookupPlan, bytes: &[u8]) -> Result<Self> {
+        plan.validate()?;
+        let mut reader = CanonicalReader::new(
+            bytes,
+            zkie_core::common::codec::DecodeLimits::unlimited(),
+        );
+        if reader.get_u64()? != LOOKUP_VERSION {
+            return Err(Error::InvalidEncoding);
+        }
+        let max_point = plan.key_bits as usize + plan.mu as usize + plan.table_log as usize;
+        let count = mask_count(plan)?;
+        let key = get_claim(&mut reader, plan.key_bits as usize, count)?;
+        let coefficient_count =
+            usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+        let planes = plan.planes()?;
+        let rows = plan.table_rows()?;
+        if coefficient_count != planes * rows {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut coefficients = Vec::with_capacity(coefficient_count);
+        for _ in 0..coefficient_count {
+            coefficients.push(reader.get_fp3()?);
+        }
+        let total = reader.get_fp3()?;
+        let row_count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+        if row_count != outcome_rows(plan)? {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut outputs = Vec::with_capacity(row_count);
+        for _ in 0..row_count {
+            outputs.push(get_general_output(&mut reader, max_point, count)?);
+        }
+        reader.finish()?;
+        let outcome = Self {
+            key,
+            multiplicity: (coefficients, total),
+            rows: outputs,
+        };
+        outcome.check(plan)?;
+        Ok(outcome)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1438,9 +1767,11 @@ mod tests {
             bits_shape,
             bits_oracle: 901,
             group: 7,
+            bits_openings: 1,
             mask_oracle: 902,
             mask_code: build_code_plan(6, 32, 1).unwrap(),
             mask_rows: 8,
+            mask_openings: 1,
             mask_tree: RuntimeTreePlan {
                 tree_number: 702,
                 leaf_class: 1,
@@ -1467,6 +1798,57 @@ mod tests {
         assert_eq!(proven, verified);
         assert_eq!(proven.multiplicity.0.len(), plan.planes().unwrap() * 256);
         assert_eq!(proven.multiplicity.1, Fp3::from_u64(4));
+    }
+
+    #[test]
+    fn duplicate_keys_prove_and_verify() {
+        let plan = plan();
+        let keys = [0u64, 0, 1, 2];
+        let witness = witness(&keys, &plan);
+        let (messages, proof, proven) = prove_lookup(
+            &plan,
+            &commit_plan(),
+            &key_plan(&keys),
+            &key_rows(&keys),
+            &witness,
+            7,
+        )
+        .unwrap();
+        let verified =
+            verify_lookup(&plan, &commit_plan(), &messages.roots(), &proof, 7).unwrap();
+        assert_eq!(proven, verified);
+    }
+
+    #[test]
+    fn committed_lookup_messages_prove_without_recommitting() {
+        let plan = plan();
+        let keys = [0u64, 1, 2, 255];
+        let witness = witness(&keys, &plan);
+        let commit_plan = commit_plan();
+        let mask_entries = mask_count(&plan).unwrap();
+        let mut source = LookupRandomSource::new(7 ^ 0x5A5A_5A5A);
+        let messages = commit_lookup(
+            &commit_plan,
+            &witness.bits,
+            mask_entries,
+            &mut source,
+        )
+        .unwrap();
+        let (proof, proven) = prove_lookup_with_messages(
+            &plan,
+            &commit_plan,
+            &key_plan(&keys),
+            &key_rows(&keys),
+            &witness,
+            &messages,
+            7,
+        )
+        .unwrap();
+        let verified =
+            verify_lookup(&plan, &commit_plan, &messages.roots(), &proof, 7).unwrap();
+        assert_eq!(proven, verified);
+        let bytes = proven.encode(&plan).unwrap();
+        assert_eq!(LookupOutcome::decode(&plan, &bytes).unwrap(), proven);
     }
 
     #[test]

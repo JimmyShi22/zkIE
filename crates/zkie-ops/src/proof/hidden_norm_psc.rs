@@ -35,6 +35,8 @@ use crate::proof::committed_psc::{
 };
 use crate::proof::hidden_norm::{NormCoreRow, NormShape};
 use crate::proof::hidden_send_session::{SendSamples, WShape};
+use crate::proof::lookup::{LookupOutcome, LookupPlan, LookupProof};
+use crate::proof::lookup_messages::LookupCommitPlan;
 use crate::proof::output_closure::{CommittedValueGroup, RetainedTrees};
 use crate::proof::psc::{
     hp_entries, prove_dot_sumcheck, psc_variables, verify_psc_transcript, DotClaim,
@@ -297,6 +299,9 @@ impl NormPscFirst {
 pub struct NormPscSecond {
     pub psc: Vec<DotProof>,
     pub point_values: Vec<[Fp3; 2]>,
+    /// The lookup transcript and claims, when the plan carries the lookup.
+    /// The wire layout omits the field when the plan has no lookup.
+    pub lookup: Option<NormLookupSecond>,
 }
 
 impl NormPscSecond {
@@ -308,6 +313,9 @@ impl NormPscSecond {
             &self.psc,
             &self.point_values,
         )?;
+        if let Some(lookup) = &self.lookup {
+            writer.put_bytes(&lookup.encode()?);
+        }
         Ok(writer.into_bytes())
     }
 
@@ -326,7 +334,11 @@ impl NormPscSecond {
             plan.variables,
         )?;
         reader.finish()?;
-        let message = Self { psc, point_values };
+        let message = Self {
+            psc,
+            point_values,
+            lookup: None,
+        };
         message.check(plan)?;
         Ok(message)
     }
@@ -345,8 +357,19 @@ impl NormPscSecond {
             instances,
             plan.variables,
         )?;
+        let lookup = match &plan.lookup {
+            Some(lookup_plan) => Some(NormLookupSecond::decode(
+                lookup_plan,
+                reader.get_bytes()?,
+            )?),
+            None => None,
+        };
         reader.finish()?;
-        let message = Self { psc, point_values };
+        let message = Self {
+            psc,
+            point_values,
+            lookup,
+        };
         message.check_for(plan)?;
         Ok(message)
     }
@@ -361,6 +384,11 @@ impl NormPscSecond {
             if proof.rounds.len() != plan.variables || proof.y_round.coefficients.len() != 2 {
                 return Err(Error::ShapeMismatch);
             }
+        }
+        match (&plan.lookup, &self.lookup) {
+            (Some(lookup_plan), Some(lookup)) => lookup.check(lookup_plan)?,
+            (None, None) => {}
+            _ => return Err(Error::ShapeMismatch),
         }
         Ok(())
     }
@@ -377,6 +405,9 @@ impl NormPscSecond {
             {
                 return Err(Error::ShapeMismatch);
             }
+        }
+        if self.lookup.is_some() {
+            return Err(Error::ShapeMismatch);
         }
         Ok(())
     }
@@ -622,7 +653,11 @@ pub fn prove_norm_psc(
             point_values.push([output.ends[0].value, output.ends[1].value]);
         }
     }
-    Ok(NormPscSecond { psc, point_values })
+    Ok(NormPscSecond {
+        psc,
+        point_values,
+        lookup: None,
+    })
 }
 
 /// Verifier side of the skeleton: checks the plan, the first message, the
@@ -728,8 +763,8 @@ pub struct NormRoundPlan {
 /// and mask messages are committed for the lookup itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormLookupPlan {
-    pub lookup: crate::proof::lookup::LookupPlan,
-    pub commit: crate::proof::lookup_messages::LookupCommitPlan,
+    pub lookup: LookupPlan,
+    pub commit: LookupCommitPlan,
     pub key: crate::proof::lookup::LookupKeyPlan,
 }
 
@@ -762,8 +797,10 @@ impl NormLookupPlan {
         writer.put_fp3(&self.key.padding_value);
         writer.put_digest(&self.key.table_identity);
         writer.put_u64(self.commit.bits_oracle);
+        writer.put_u64(self.commit.bits_openings as u64);
         writer.put_u64(self.commit.group);
         writer.put_u64(self.commit.mask_oracle);
+        writer.put_u64(self.commit.mask_openings as u64);
         put_wshape(&mut writer, &self.commit.bits_shape);
         writer.put_u64(self.commit.mask_code.log_n as u64);
         writer.put_u64(self.commit.mask_code.ell);
@@ -1241,9 +1278,20 @@ impl NormMaskMessage {
     }
 
     fn decode(plan: &NormMaskPlan, bytes: &[u8]) -> Result<Self> {
+        Self::decode_with(&plan.tree, plan.answers, plan.openings, bytes)
+    }
+
+    /// Reads a mask-only message against a trusted tree plan, answer count and
+    /// opening count. The norm mask and the lookup mask share this form.
+    fn decode_with(
+        plan_tree: &zkie_engine::pcs::request::runtime_tree::RuntimeTreePlan,
+        answers: u32,
+        openings: usize,
+        bytes: &[u8],
+    ) -> Result<Self> {
         let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
         let tree = get_tree_plan(&mut reader)?;
-        if tree != plan.tree {
+        if tree != *plan_tree {
             return Err(Error::StatementMismatch);
         }
         let root = reader.get_digest()?;
@@ -1251,13 +1299,13 @@ impl NormMaskMessage {
             return Err(Error::InvalidEncoding);
         }
         let sample = SendSamples::decode(reader.get_bytes()?)?;
-        if sample.seed.len() != plan.answers as usize
-            || sample.answers.len() != plan.answers as usize
+        if sample.seed.len() != answers as usize
+            || sample.answers.len() != answers as usize
         {
             return Err(Error::ShapeMismatch);
         }
         let count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
-        if count != plan.openings {
+        if count != openings {
             return Err(Error::ShapeMismatch);
         }
         let mut positions = Vec::with_capacity(count);
@@ -1395,6 +1443,18 @@ pub struct NormWitness {
     pub variance: NormGroupWitness,
     pub round: Option<NormGroupWitness>,
     pub mask: Option<NormMaskWitness>,
+    /// The private lookup material, when the plan carries the lookup.
+    pub lookup: Option<NormLookupWitness>,
+}
+
+/// The private lookup material of one norm session. The multiplicity bits are
+/// supplied by the caller; the committed messages are filled by the first
+/// stage and consumed by the second-stage lookup transcript.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormLookupWitness {
+    /// The multiplicity-bit values, plane-major.
+    pub bits: Vec<Fp3>,
+    pub messages: Option<crate::proof::lookup_messages::LookupMessages>,
 }
 
 /// One checked product-sumcheck instance of the norm relation.
@@ -1412,6 +1472,109 @@ pub struct NormRowBinding {
     pub positions: Vec<NormPositionBinding>,
 }
 
+/// The lookup commitments of the first stage: the multiplicity-bit group and
+/// the mask-only message, each with its SEND sample answer, opening positions
+/// and runtime opening. The key vector is read from the committed rounding
+/// rows and is not a message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormLookupMessage {
+    pub bits: CommittedPscGroup,
+    pub mask: NormMaskMessage,
+}
+
+impl NormLookupMessage {
+    fn encode(&self) -> Result<Vec<u8>> {
+        let mut writer = CanonicalWriter::new();
+        self.bits.encode_into(&mut writer)?;
+        writer.put_bytes(&self.mask.encode()?);
+        Ok(writer.into_bytes())
+    }
+
+    fn decode(plan: &NormLookupPlan, bytes: &[u8]) -> Result<Self> {
+        let commit = &plan.commit;
+        let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
+        let bits = CommittedPscGroup::decode(&mut reader, &commit.bits_shape, 1)?;
+        let mask = NormMaskMessage::decode_with(
+            &commit.mask_tree,
+            1,
+            commit.mask_openings,
+            reader.get_bytes()?,
+        )?;
+        reader.finish()?;
+        let message = Self { bits, mask };
+        message.check(plan)?;
+        Ok(message)
+    }
+
+    fn check(&self, plan: &NormLookupPlan) -> Result<()> {
+        let commit = &plan.commit;
+        if self.bits.fault(&commit.bits_shape, 1).is_some() {
+            return Err(Error::ShapeMismatch);
+        }
+        let entry = self
+            .bits
+            .message
+            .group
+            .entries
+            .first()
+            .ok_or(Error::ShapeMismatch)?;
+        if self.bits.message.group.group != commit.group
+            || entry.position != 0
+            || entry.oracle != commit.bits_oracle
+            || entry.shape != commit.bits_shape.oracle_shape()
+            || entry.tree != commit.bits_shape.tree_plan(0)?
+            || entry.root == Digest::ZERO
+            || self.bits.message.roots.len() != 1
+            || self.bits.sample.seed.len() != commit.bits_shape.answers as usize
+            || self.bits.sample.answers.len() != 1
+            || self.bits.positions.len() != 1
+            || self.bits.positions[0].len() != commit.bits_openings
+            || self.bits.openings.len() != 1
+            || self.bits.openings[0].positions != self.bits.positions[0]
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        if self.mask.tree != commit.mask_tree
+            || self.mask.root == Digest::ZERO
+            || self.mask.sample.seed.len() != 1
+            || self.mask.sample.answers.len() != 1
+            || self.mask.positions.len() != commit.mask_openings
+            || self.mask.opening.positions != self.mask.positions
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// The lookup proof and the claims it leaves for the later row registration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormLookupSecond {
+    pub proof: LookupProof,
+    pub claims: LookupOutcome,
+}
+
+impl NormLookupSecond {
+    fn encode(&self) -> Result<Vec<u8>> {
+        let mut writer = CanonicalWriter::new();
+        writer.put_bytes(&self.proof.encode()?);
+        writer.put_bytes(&self.claims.encode_unchecked());
+        Ok(writer.into_bytes())
+    }
+
+    fn decode(plan: &NormLookupPlan, bytes: &[u8]) -> Result<Self> {
+        let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
+        let proof = LookupProof::decode(&plan.lookup, reader.get_bytes()?)?;
+        let claims = LookupOutcome::decode(&plan.lookup, reader.get_bytes()?)?;
+        reader.finish()?;
+        Ok(Self { proof, claims })
+    }
+
+    fn check(&self, plan: &NormLookupPlan) -> Result<()> {
+        self.claims.check(&plan.lookup)
+    }
+}
+
 /// The public first-stage message of the integrated norm relation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormFirstMessages {
@@ -1422,6 +1585,10 @@ pub struct NormFirstMessages {
     pub variance: CommittedPscGroup,
     pub round: Option<CommittedPscGroup>,
     pub mask: Option<NormMaskMessage>,
+    /// The lookup commitments, samples and openings, when the plan carries
+    /// the lookup. The wire layout omits the field entirely when the plan has
+    /// no lookup, so the lookup-free bytes stay unchanged.
+    pub lookup: Option<NormLookupMessage>,
 }
 
 impl NormFirstMessages {
@@ -1446,6 +1613,9 @@ impl NormFirstMessages {
                 writer.put_bytes(&mask.encode()?);
             }
             None => writer.put_u64(0),
+        }
+        if let Some(lookup) = &self.lookup {
+            writer.put_bytes(&lookup.encode()?);
         }
         Ok(writer.into_bytes())
     }
@@ -1492,6 +1662,13 @@ impl NormFirstMessages {
             }
             _ => return Err(Error::InvalidEncoding),
         };
+        let lookup = match &plan.lookup {
+            Some(lookup_plan) => Some(NormLookupMessage::decode(
+                lookup_plan,
+                reader.get_bytes()?,
+            )?),
+            None => None,
+        };
         reader.finish()?;
         let message = Self {
             x,
@@ -1501,6 +1678,7 @@ impl NormFirstMessages {
             variance,
             round,
             mask,
+            lookup,
         };
         message.check_trusted(plan)?;
         Ok(message)
@@ -1578,6 +1756,11 @@ impl NormFirstMessages {
         }
         if plan.mask.is_some() != self.mask.is_some() {
             return Err(Error::ShapeMismatch);
+        }
+        match (&plan.lookup, &self.lookup) {
+            (Some(lookup_plan), Some(message)) => message.check(lookup_plan)?,
+            (None, None) => {}
+            _ => return Err(Error::ShapeMismatch),
         }
         Ok(())
     }
@@ -2086,9 +2269,11 @@ mod tests {
             .unwrap(),
             bits_oracle: 9700,
             group: 1,
+            bits_openings: 1,
             mask_oracle: 9701,
             mask_code: build_code_plan(6, 32, 1).unwrap(),
             mask_rows: 8,
+            mask_openings: 1,
             mask_tree: RuntimeTreePlan {
                 tree_number: 60700,
                 leaf_class: 1,
@@ -2542,6 +2727,7 @@ mod tests {
             variance: first.variance.clone(),
             round: None,
             mask: None,
+            lookup: None,
         };
         (plan, message, second)
     }
