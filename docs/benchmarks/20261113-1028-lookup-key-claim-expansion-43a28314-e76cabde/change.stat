@@ -1,0 +1,3 @@
+43a28314 Expand the lookup key claim into committed-cell terms (partial progress)
+ crates/zkie-ops/src/proof/lookup.rs | 90 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 90 insertions(+)
