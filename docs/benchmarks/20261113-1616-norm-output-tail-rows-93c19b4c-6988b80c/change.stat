@@ -1,0 +1,4 @@
+93c19b4c Bind the tail relation maps to the committed slots
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     | 285 +++++++++++++++-------
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 290 ++++++++++++++++++++++-
+ 2 files changed, 482 insertions(+), 93 deletions(-)
