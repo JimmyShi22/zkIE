@@ -23,6 +23,10 @@ use zkie_engine::pcs::request::link::{
 use zkie_engine::primitives::transcript::{hash_labeled, tag_word, STATEMENT};
 
 use crate::proof::binding::{oracle_leaf, oracle_start};
+use crate::proof::asset_table::{
+    asset_table_statement_identity, build_asset_table, verify_asset_table_meta, AssetTableInput,
+    AssetTableMeta, AssetTableParams,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelAssetSpec {
@@ -51,6 +55,7 @@ pub struct AssetCommit {
 pub struct ModelCommitment {
     pub anchor: Anchor,
     pub assets: Vec<AssetCommit>,
+    pub tables: Vec<AssetTableMeta>,
     pub root: PathBuf,
 }
 
@@ -79,6 +84,11 @@ fn table_identity(spec: &ModelAssetSpec) -> Digest {
     data.extend_from_slice(&(spec.row_width as u64).to_le_bytes());
     data.extend_from_slice(spec.encoding.as_bytes());
     hash_labeled(tag_word(STATEMENT, 13), 0, None, &data).unwrap_or(Digest::ZERO)
+}
+
+/// The raw asset identity, exposed for the encoded table binding.
+pub fn asset_identity(spec: &ModelAssetSpec) -> Digest {
+    table_identity(spec)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,7 +262,7 @@ pub fn commit_assets(
     parameters_digest: Digest,
     specs: &[ModelAssetSpec],
 ) -> Result<ModelCommitment> {
-    commit_assets_inner(root, model_commitment, parameters_digest, specs, false)
+    commit_assets_inner(root, model_commitment, parameters_digest, specs, false, &[])
         .map(|(commitment, _)| commitment)
 }
 
@@ -265,7 +275,21 @@ pub fn commit_assets_with_digests(
     parameters_digest: Digest,
     specs: &[ModelAssetSpec],
 ) -> Result<(ModelCommitment, Vec<AssetDigest>)> {
-    commit_assets_inner(root, model_commitment, parameters_digest, specs, true)
+    commit_assets_inner(root, model_commitment, parameters_digest, specs, true, &[])
+}
+
+/// Commits the raw asset rows and, for every table in `tables`, the encoded
+/// table over the same rows. The table leaf records join the anchor, so a
+/// changed table root breaks the anchor identity.
+pub fn commit_assets_with_tables(
+    root: &Path,
+    model_commitment: Digest,
+    parameters_digest: Digest,
+    specs: &[ModelAssetSpec],
+    tables: &[AssetTableInput],
+) -> Result<ModelCommitment> {
+    commit_assets_inner(root, model_commitment, parameters_digest, specs, false, tables)
+        .map(|(commitment, _)| commitment)
 }
 
 fn commit_assets_inner(
@@ -274,13 +298,15 @@ fn commit_assets_inner(
     parameters_digest: Digest,
     specs: &[ModelAssetSpec],
     emit_digests: bool,
+    tables: &[AssetTableInput],
 ) -> Result<(ModelCommitment, Vec<AssetDigest>)> {
     if specs.is_empty() {
         return Err(Error::InvalidConfig);
     }
     let mut assets = Vec::with_capacity(specs.len());
-    let mut records = Vec::with_capacity(specs.len());
+    let mut records = Vec::with_capacity(specs.len() + tables.len());
     let mut asset_digests = Vec::with_capacity(specs.len());
+    let mut table_by_asset: BTreeMap<u64, AssetTableMeta> = BTreeMap::new();
     for (position, spec) in specs.iter().enumerate() {
         if spec.row_width == 0 || spec.element_count == 0 {
             return Err(Error::InvalidConfig);
@@ -353,12 +379,44 @@ fn commit_assets_inner(
             leaf_record,
             tree: Arc::new(tree),
         });
+        if let Some(input) = tables
+            .iter()
+            .find(|input| input.params.asset_id == spec.asset_id)
+        {
+            if input.params.path != spec.path || table_by_asset.contains_key(&spec.asset_id) {
+                return Err(Error::StatementMismatch);
+            }
+            let meta =
+                build_asset_table(&reader, model_commitment, spec, input, 1 << 30)?;
+            table_by_asset.insert(spec.asset_id, meta);
+        }
+    }
+    let mut table_metas = Vec::with_capacity(tables.len());
+    for (index, input) in tables.iter().enumerate() {
+        let meta = table_by_asset
+            .remove(&input.params.asset_id)
+            .ok_or(Error::StatementMismatch)?;
+        records.push(LeafRecord {
+            leaf_id: specs.len() as u64 + index as u64,
+            generation: 0,
+            table_identity: asset_table_statement_identity(
+                meta.identity,
+                meta.root,
+                &meta.record,
+            ),
+            leaf_root: meta.root,
+        });
+        table_metas.push(meta);
+    }
+    if !table_by_asset.is_empty() {
+        return Err(Error::StatementMismatch);
     }
     let anchor = make_anchor(model_commitment, parameters_digest, &records)?;
     Ok((
         ModelCommitment {
             anchor,
             assets,
+            tables: table_metas,
             root: root.to_path_buf(),
         },
         asset_digests,
@@ -927,11 +985,33 @@ pub fn verify_model_anchor(
     expected_parameters_digest: Digest,
     specs: &[ModelAssetSpec],
 ) -> Result<()> {
+    verify_model_anchor_with_tables(
+        public,
+        expected_anchor_id,
+        expected_model_commitment,
+        expected_parameters_digest,
+        specs,
+        &[],
+        &[],
+    )
+}
+
+/// Like `verify_model_anchor`, and checks every committed encoded table
+/// against the trusted plan and the anchor.
+pub fn verify_model_anchor_with_tables(
+    public: &ModelCommitmentPublic,
+    expected_anchor_id: Digest,
+    expected_model_commitment: Digest,
+    expected_parameters_digest: Digest,
+    specs: &[ModelAssetSpec],
+    table_metas: &[AssetTableMeta],
+    tables: &[AssetTableParams],
+) -> Result<()> {
     let anchor = &public.anchor;
     if anchor.anchor_id != expected_anchor_id
         || anchor.model_commitment != expected_model_commitment
         || anchor.parameters_digest != expected_parameters_digest
-        || anchor.leaf_count != specs.len() as u64
+        || anchor.leaf_count != specs.len() as u64 + tables.len() as u64
         || public.assets.len() != specs.len()
     {
         return Err(Error::StatementMismatch);
@@ -973,6 +1053,38 @@ pub fn verify_model_anchor(
         records.push(meta.leaf_record.clone());
     }
 
+    if table_metas.len() != tables.len() {
+        return Err(Error::StatementMismatch);
+    }
+    let mut table_assets = BTreeSet::new();
+    let mut table_ids: BTreeSet<u64> = BTreeSet::new();
+    for (index, params) in tables.iter().enumerate() {
+        if !table_assets.insert(params.asset_id) {
+            return Err(Error::StatementMismatch);
+        }
+        let spec = specs
+            .iter()
+            .find(|spec| spec.asset_id == params.asset_id && spec.path == params.path)
+            .ok_or(Error::StatementMismatch)?;
+        let meta = table_metas
+            .iter()
+            .find(|meta| meta.asset_id == params.asset_id && meta.path == params.path)
+            .ok_or(Error::AssetMismatch)?;
+        if !table_ids.insert(meta.asset_id) {
+            return Err(Error::StatementMismatch);
+        }
+        verify_asset_table_meta(meta, anchor.model_commitment, spec, params)?;
+        records.push(LeafRecord {
+            leaf_id: specs.len() as u64 + index as u64,
+            generation: 0,
+            table_identity: asset_table_statement_identity(
+                meta.identity,
+                meta.root,
+                &meta.record,
+            ),
+            leaf_root: meta.root,
+        });
+    }
     let rebuilt = make_anchor(anchor.model_commitment, anchor.parameters_digest, &records)?;
     if rebuilt.record.anchor_id != anchor.anchor_id
         || rebuilt.record.registry_root != anchor.registry_root

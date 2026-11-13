@@ -32,6 +32,7 @@ pub mod multi_stage_iopp;
 pub mod proximity_iopp;
 pub mod interval;
 pub mod proximity_planner;
+pub mod asset_table;
 pub mod model_commitment;
 pub mod norm_param_table;
 

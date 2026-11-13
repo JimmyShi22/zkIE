@@ -26,9 +26,10 @@ use zkie_ops::pipeline::{
     ProofReceipt, ProveRequest, VerifyReceipt, VerifyRequest,
 };
 use zkie_ops::proof::model_commitment::{
-    verify_model_anchor, verify_shared_trace, verify_shared_trace_output,
+    verify_model_anchor_with_tables, verify_shared_trace, verify_shared_trace_output,
     ModelCommitmentPublic, SharedTrace,
 };
+use zkie_ops::proof::asset_table::AssetTableMeta;
 
 const PROTOCOL_ID: Digest = Digest([0xA1; 32]);
 const PARAMETERS_DIGEST: Digest = Digest([0xA2; 32]);
@@ -285,20 +286,24 @@ impl PipelineProvider for ProductionProvider {
         let config_bytes = bincode::serialize(&config).map_err(|_| Error::InvalidEncoding)?;
         let protocol_bytes = fs::read(&request.case_config).map_err(|_| Error::Io)?;
         let parameters_bytes = fs::read(&request.parameters).map_err(|_| Error::Io)?;
+        let tables_bytes = bincode::serialize(&commitment.tables).map_err(|_| Error::InvalidEncoding)?;
         let commitment_digest = digest_bytes(&commitment_bytes);
         let config_digest = digest_bytes(&config_bytes);
         let protocol_digest = digest_bytes(&protocol_bytes);
         let parameters_digest = digest_bytes(&parameters_bytes);
+        let tables_digest = digest_bytes(&tables_bytes);
         let files: Vec<(&str, &[u8])> = vec![
             ("public/model-commitment.bin", commitment_bytes.as_slice()),
             ("public/provider-config.bin", config_bytes.as_slice()),
             ("public/protocol.bin", protocol_bytes.as_slice()),
+            ("public/asset-tables.bin", tables_bytes.as_slice()),
             ("private/parameters.bin", parameters_bytes.as_slice()),
         ];
         let digests: Vec<(&str, Digest)> = vec![
             ("public/model-commitment.bin", commitment_digest),
             ("public/provider-config.bin", config_digest),
             ("public/protocol.bin", protocol_digest),
+            ("public/asset-tables.bin", tables_digest),
             ("private/parameters.bin", parameters_digest),
         ];
         let manifest = commit_manifest(
@@ -307,6 +312,7 @@ impl PipelineProvider for ProductionProvider {
                 ArtifactFile::new("public/model-commitment.bin", commitment_bytes.len() as u64, commitment_digest),
                 ArtifactFile::new("public/provider-config.bin", config_bytes.len() as u64, config_digest),
                 ArtifactFile::new("public/protocol.bin", protocol_bytes.len() as u64, protocol_digest),
+                ArtifactFile::new("public/asset-tables.bin", tables_bytes.len() as u64, tables_digest),
                 ArtifactFile::new("private/parameters.bin", parameters_bytes.len() as u64, parameters_digest),
             ],
         );
@@ -395,6 +401,11 @@ impl PipelineProvider for ProductionProvider {
         let trace = read_proof_exact(&request.proof, ctx.runtime.memory_budget_bytes)?;
         let public_inputs =
             fs::read(&request.public_inputs).map_err(|_| Error::IncompleteArtifact)?;
+        let table_metas: Vec<AssetTableMeta> =
+            match fs::read(request.public_bundle_dir.join("asset-tables.bin")) {
+                Ok(bytes) => bincode::deserialize(&bytes).map_err(|_| Error::InvalidEncoding)?,
+                Err(_) => Vec::new(),
+            };
 
         let trusted = crate::policy::select(
             &policy,
@@ -421,12 +432,14 @@ impl PipelineProvider for ProductionProvider {
                 }
                 let parameters = zkie_models_gpt2::plan::parameters_digest()?;
                 let specs = zkie_models_gpt2::plan::asset_specs();
-                verify_model_anchor(
+                verify_model_anchor_with_tables(
                     &public,
                     trusted.anchor_id,
                     model_id,
                     parameters,
                     &specs,
+                    &table_metas,
+                    &[],
                 )?;
                 let argmax =
                     verify_shared_trace(&public, &trace, &statement.tokens, &plan)?;
@@ -454,12 +467,14 @@ impl PipelineProvider for ProductionProvider {
                 }
                 let parameters = zkie_models_gemma3::plan::parameters_digest()?;
                 let specs = zkie_models_gemma3::plan::asset_specs();
-                verify_model_anchor(
+                verify_model_anchor_with_tables(
                     &public,
                     trusted.anchor_id,
                     model_id,
                     parameters,
                     &specs,
+                    &table_metas,
+                    &[],
                 )?;
                 let argmax =
                     verify_shared_trace(&public, &trace, &statement.tokens, &plan)?;
@@ -490,12 +505,14 @@ impl PipelineProvider for ProductionProvider {
                 }
                 let parameters = zkie_models_timesfm::plan::parameters_digest()?;
                 let specs = zkie_models_timesfm::plan::asset_specs();
-                verify_model_anchor(
+                verify_model_anchor_with_tables(
                     &public,
                     trusted.anchor_id,
                     model_id,
                     parameters,
                     &specs,
+                    &table_metas,
+                    &[],
                 )?;
                 let output = verify_shared_trace_output(
                     &public,
