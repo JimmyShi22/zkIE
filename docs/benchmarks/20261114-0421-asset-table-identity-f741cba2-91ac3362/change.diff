@@ -1,0 +1,972 @@
+commit f741cba2fb2fd68677b3316210d479efd3b5d9aa
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Sat Nov 14 04:20:56 2026 +0800
+
+    Bind encoded asset tables into the model anchor
+    
+    Add the general asset table identity and layout from the trusted plan, build the encoded table from the same read-only asset rows through the existing table base, and bind the table root and record into the anchor as an extra leaf record. The verifier recomputes the identity from the trusted plan and rebuilds the anchor; the raw row commitment and every existing check are unchanged. Production plans pass no table inputs yet, so no production anchor, proof or byte changes.
+
+diff --git a/crates/zkie-ops/src/proof/asset_table.rs b/crates/zkie-ops/src/proof/asset_table.rs
+new file mode 100644
+index 00000000..8e821544
+--- /dev/null
++++ b/crates/zkie-ops/src/proof/asset_table.rs
+@@ -0,0 +1,361 @@
++//! Encoded asset tables: the trusted plan parameters, the commit-side table
++//! construction and the independent identity check.
++//!
++//! The raw row commitment in `model_commitment` stays the asset's storage
++//! commitment. This module adds the column-encoded table over the same asset
++//! rows. The table parameters come from the trusted model plan; the committer
++//! builds the table from the read-only asset rows, and the verifier rebuilds
++//! the expected identity from the plan and checks the committed table against
++//! it. The table root enters the anchor through an extra leaf record, so a
++//! changed table root breaks the anchor identity.
++
++use zkie_core::error::{Error as ZkieError, Result};
++use zkie_core::types::Digest;
++use zkie_engine::pcs::request::field::{fp_from_u64, Fp};
++use zkie_engine::pcs::request::table::{
++    commit_table_streaming, validate_index_shape, IndexRecord, IndexReader, IndexShape,
++    TableRowSource,
++};
++use zkie_engine::primitives::transcript::{hash_labeled, tag_word, STATEMENT};
++
++use crate::proof::column_session::fp_from_signed_word;
++use crate::proof::model_commitment::{
++    asset_identity, expected_asset_rows, AssetReader, ModelAssetSpec,
++};
++
++/// The fixed trusted-plan layout of an asset table.
++#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
++pub struct AssetTableLayout {
++    pub row_width: u64,
++    pub message_len: u64,
++    pub tail_len: u64,
++    pub pads: u64,
++    pub valid_elements: u64,
++    pub padding_zero: bool,
++}
++
++/// The trusted-plan parameters of one asset table.
++#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
++pub struct AssetTableParams {
++    pub asset_id: u64,
++    pub path: String,
++    pub element_count: u64,
++    pub row_width: u64,
++    pub encoding: String,
++    pub shape: IndexShape,
++    pub valid_min: i64,
++    pub valid_max: i64,
++    pub layout: AssetTableLayout,
++}
++
++/// The committer's private random material for one table. The salts and tails
++/// never enter the public bundle; the table root commits them.
++#[derive(Clone, Debug)]
++pub struct AssetTableRandomness {
++    pub salts: Vec<Vec<u8>>,
++    pub tails: Vec<Vec<Fp>>,
++}
++
++/// One table to build during the commit.
++#[derive(Clone, Debug)]
++pub struct AssetTableInput {
++    pub params: AssetTableParams,
++    pub randomness: AssetTableRandomness,
++}
++
++/// The committed table, public. The identity, shape, configuration and valid
++/// range come from the trusted plan; the root and record are the committer's
++/// data and are bound by the anchor.
++#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
++pub struct AssetTableMeta {
++    pub asset_id: u64,
++    pub path: String,
++    pub identity: Digest,
++    pub shape: IndexShape,
++    pub configuration: Digest,
++    pub root: Digest,
++    pub record: IndexRecord,
++    pub valid_min: i64,
++    pub valid_max: i64,
++    pub valid_elements: u64,
++}
++
++fn push_bytes(data: &mut Vec<u8>, bytes: &[u8]) {
++    data.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
++    data.extend_from_slice(bytes);
++}
++
++fn push_shape(data: &mut Vec<u8>, shape: &IndexShape) {
++    data.extend_from_slice(&shape.code.log_n.to_le_bytes());
++    data.extend_from_slice(&shape.code.ell.to_le_bytes());
++    data.extend_from_slice(&shape.code.r.to_le_bytes());
++    data.extend_from_slice(&shape.v.to_le_bytes());
++    data.extend_from_slice(&shape.answers.to_le_bytes());
++    data.extend_from_slice(&(shape.salt_bytes as u64).to_le_bytes());
++    data.extend_from_slice(&shape.distances.radius.to_le_bytes());
++    data.extend_from_slice(&shape.distances.later_radius.to_le_bytes());
++    data.extend_from_slice(&shape.distances.m_once.to_le_bytes());
++    data.extend_from_slice(&shape.distances.m_later.to_le_bytes());
++}
++
++fn push_layout(data: &mut Vec<u8>, layout: &AssetTableLayout) {
++    data.extend_from_slice(&layout.row_width.to_le_bytes());
++    data.extend_from_slice(&layout.message_len.to_le_bytes());
++    data.extend_from_slice(&layout.tail_len.to_le_bytes());
++    data.extend_from_slice(&layout.pads.to_le_bytes());
++    data.extend_from_slice(&layout.valid_elements.to_le_bytes());
++    data.push(u8::from(layout.padding_zero));
++}
++
++fn table_configuration_bytes(spec: &ModelAssetSpec, params: &AssetTableParams) -> Vec<u8> {
++    let mut data = Vec::new();
++    push_bytes(&mut data, b"asset-table-configuration-v1");
++    data.extend_from_slice(&params.asset_id.to_le_bytes());
++    push_bytes(&mut data, params.path.as_bytes());
++    data.extend_from_slice(&params.element_count.to_le_bytes());
++    data.extend_from_slice(&params.row_width.to_le_bytes());
++    push_bytes(&mut data, params.encoding.as_bytes());
++    data.extend_from_slice(&(params.valid_min as u64).to_le_bytes());
++    data.extend_from_slice(&(params.valid_max as u64).to_le_bytes());
++    push_shape(&mut data, &params.shape);
++    push_layout(&mut data, &params.layout);
++    data.extend_from_slice(&asset_identity(spec).0);
++    data
++}
++
++/// The configuration digest the table tree starts from. It is a function of
++/// the trusted model identity and the trusted table parameters, never of the
++/// committer's data.
++pub fn asset_table_configuration(
++    model_commitment: Digest,
++    spec: &ModelAssetSpec,
++    params: &AssetTableParams,
++) -> Result<Digest> {
++    let mut data = model_commitment.0.to_vec();
++    data.extend_from_slice(&table_configuration_bytes(spec, params));
++    hash_labeled(tag_word(STATEMENT, 18), 0, None, &data)
++}
++
++/// The identity of the encoded table. It covers the model identity, the raw
++/// asset identity, the trusted shape/layout/range and the configuration.
++pub fn asset_table_identity(
++    model_commitment: Digest,
++    spec: &ModelAssetSpec,
++    params: &AssetTableParams,
++) -> Result<Digest> {
++    validate_asset_table_params(spec, params)?;
++    let configuration = asset_table_configuration(model_commitment, spec, params)?;
++    let mut data = model_commitment.0.to_vec();
++    data.extend_from_slice(&asset_identity(spec).0);
++    data.extend_from_slice(&configuration.0);
++    data.extend_from_slice(&table_configuration_bytes(spec, params));
++    hash_labeled(tag_word(STATEMENT, 19), 0, None, &data)
++}
++
++/// The statement identity of the committed table. It covers the plan identity,
++/// the table root and the record, so the anchor binds all three.
++pub fn asset_table_statement_identity(
++    plan_identity: Digest,
++    root: Digest,
++    record: &IndexRecord,
++) -> Digest {
++    let record_bytes = record.encode();
++    let mut data = plan_identity.0.to_vec();
++    data.extend_from_slice(&root.0);
++    data.extend_from_slice(&(record_bytes.len() as u64).to_le_bytes());
++    data.extend_from_slice(&record_bytes);
++    hash_labeled(tag_word(STATEMENT, 19), 1, None, &data).unwrap_or(Digest::ZERO)
++}
++
++/// Checks that the plan's table parameters describe this asset and are
++/// internally consistent. Both the committer and the verifier run it.
++pub fn validate_asset_table_params(spec: &ModelAssetSpec, params: &AssetTableParams) -> Result<()> {
++    if params.asset_id != spec.asset_id
++        || params.path != spec.path
++        || params.element_count != spec.element_count
++        || params.row_width != spec.row_width as u64
++        || params.encoding != spec.encoding
++    {
++        return Err(ZkieError::StatementMismatch);
++    }
++    if params.valid_min > params.valid_max {
++        return Err(ZkieError::InvalidConfig);
++    }
++    validate_index_shape(&params.shape)?;
++    let pads = params.shape.pads() as u64;
++    let layout = &params.layout;
++    if params.shape.code.ell != layout.message_len
++        || params.shape.code.r != layout.tail_len
++        || pads != layout.pads
++        || layout.valid_elements != spec.element_count
++        || layout.row_width != spec.row_width as u64
++        || !layout.padding_zero
++    {
++        return Err(ZkieError::InvalidConfig);
++    }
++    if layout.message_len < layout.row_width.saturating_add(pads) {
++        return Err(ZkieError::InvalidConfig);
++    }
++    if expected_asset_rows(spec)? != params.shape.rows() {
++        return Err(ZkieError::ShapeMismatch);
++    }
++    Ok(())
++}
++
++struct AssetRowSource<'a> {
++    reader: &'a AssetReader,
++    rows: u64,
++    row_width: usize,
++    valid_elements: u64,
++    message_len: usize,
++    valid_min: i64,
++    valid_max: i64,
++    tails: &'a [Vec<Fp>],
++    tail_len: usize,
++}
++
++impl TableRowSource for AssetRowSource<'_> {
++    fn rows(&self) -> u64 {
++        self.rows
++    }
++
++    fn row(&mut self, row: u64, message: &mut [Fp], tail: &mut [Fp]) -> Result<()> {
++        if row >= self.rows
++            || message.len() != self.message_len
++            || tail.len() != self.tail_len
++        {
++            return Err(ZkieError::ShapeMismatch);
++        }
++        let values = self.reader.read_row(row, self.row_width)?;
++        for slot in message.iter_mut() {
++            *slot = fp_from_u64(0);
++        }
++        let row_start = row
++            .checked_mul(self.row_width as u64)
++            .ok_or(ZkieError::ResourceLimit)?;
++        for (column, value) in values.iter().enumerate() {
++            let place = row_start
++                .checked_add(column as u64)
++                .ok_or(ZkieError::ResourceLimit)?;
++            if place >= self.valid_elements {
++                break;
++            }
++            let signed = *value as i64;
++            if signed < self.valid_min || signed > self.valid_max {
++                return Err(ZkieError::StatementMismatch);
++            }
++            message[column] = fp_from_signed_word(*value);
++        }
++        let row_tail = self
++            .tails
++            .get(row as usize)
++            .ok_or(ZkieError::ShapeMismatch)?;
++        tail.copy_from_slice(row_tail);
++        Ok(())
++    }
++}
++
++/// Builds one encoded table from the same read-only rows as the raw asset
++/// commitment. The provider-side caller keeps `randomness` private.
++pub fn build_asset_table(
++    reader: &AssetReader,
++    model_commitment: Digest,
++    spec: &ModelAssetSpec,
++    input: &AssetTableInput,
++    max_bytes: u64,
++) -> Result<AssetTableMeta> {
++    let params = &input.params;
++    validate_asset_table_params(spec, params)?;
++    let shape = params.shape;
++    let rows = shape.rows();
++    let columns = shape.code.n() as usize;
++    if input.randomness.salts.len() != columns
++        || input
++            .randomness
++            .salts
++            .iter()
++            .any(|salt| salt.len() != shape.salt_bytes)
++    {
++        return Err(ZkieError::ShapeMismatch);
++    }
++    if input.randomness.tails.len() as u64 != rows
++        || input
++            .randomness
++            .tails
++            .iter()
++            .any(|tail| tail.len() as u64 != shape.code.r)
++    {
++        return Err(ZkieError::ShapeMismatch);
++    }
++    let configuration = asset_table_configuration(model_commitment, spec, params)?;
++    let identity = asset_table_identity(model_commitment, spec, params)?;
++    let mut source = AssetRowSource {
++        reader,
++        rows,
++        row_width: spec.row_width,
++        valid_elements: spec.element_count,
++        message_len: usize::try_from(shape.code.ell).map_err(|_| ZkieError::ResourceLimit)?,
++        valid_min: params.valid_min,
++        valid_max: params.valid_max,
++        tails: &input.randomness.tails,
++        tail_len: usize::try_from(shape.code.r).map_err(|_| ZkieError::ResourceLimit)?,
++    };
++    let panel_columns = shape.code.n().min(1024).max(1);
++    let table = commit_table_streaming(
++        &mut source,
++        shape,
++        configuration,
++        &input.randomness.salts,
++        panel_columns,
++        max_bytes,
++    )?;
++    let record = table.reader.record;
++    let root = table.reader.root;
++    Ok(AssetTableMeta {
++        asset_id: spec.asset_id,
++        path: spec.path.clone(),
++        identity,
++        shape,
++        configuration,
++        root,
++        record,
++        valid_min: params.valid_min,
++        valid_max: params.valid_max,
++        valid_elements: spec.element_count,
++    })
++}
++
++/// Independently checks one committed table against the trusted plan. The
++/// root and record are data; the anchor check binds them separately.
++pub fn verify_asset_table_meta(
++    meta: &AssetTableMeta,
++    model_commitment: Digest,
++    spec: &ModelAssetSpec,
++    params: &AssetTableParams,
++) -> Result<()> {
++    validate_asset_table_params(spec, params)?;
++    let identity = asset_table_identity(model_commitment, spec, params)?;
++    let configuration = asset_table_configuration(model_commitment, spec, params)?;
++    if meta.asset_id != spec.asset_id
++        || meta.path != spec.path
++        || meta.identity != identity
++        || meta.shape != params.shape
++        || meta.configuration != configuration
++        || meta.valid_min != params.valid_min
++        || meta.valid_max != params.valid_max
++        || meta.valid_elements != spec.element_count
++        || meta.root == Digest::ZERO
++    {
++        return Err(ZkieError::StatementMismatch);
++    }
++    let reader = IndexReader {
++        shape: meta.shape,
++        configuration: meta.configuration,
++        root: meta.root,
++        record: meta.record.clone(),
++    };
++    if reader.fault().is_some() {
++        return Err(ZkieError::StatementMismatch);
++    }
++    Ok(())
++}
+diff --git a/crates/zkie-ops/src/proof/mod.rs b/crates/zkie-ops/src/proof/mod.rs
+index a25c10e0..78ec4afd 100644
+--- a/crates/zkie-ops/src/proof/mod.rs
++++ b/crates/zkie-ops/src/proof/mod.rs
+@@ -32,6 +32,7 @@ pub mod multi_stage_iopp;
+ pub mod proximity_iopp;
+ pub mod interval;
+ pub mod proximity_planner;
++pub mod asset_table;
+ pub mod model_commitment;
+ pub mod norm_param_table;
+ 
+diff --git a/crates/zkie-ops/src/proof/model_commitment.rs b/crates/zkie-ops/src/proof/model_commitment.rs
+index a093e370..53cbc9d4 100644
+--- a/crates/zkie-ops/src/proof/model_commitment.rs
++++ b/crates/zkie-ops/src/proof/model_commitment.rs
+@@ -23,6 +23,10 @@ use zkie_engine::pcs::request::link::{
+ use zkie_engine::primitives::transcript::{hash_labeled, tag_word, STATEMENT};
+ 
+ use crate::proof::binding::{oracle_leaf, oracle_start};
++use crate::proof::asset_table::{
++    asset_table_statement_identity, build_asset_table, verify_asset_table_meta, AssetTableInput,
++    AssetTableMeta, AssetTableParams,
++};
+ 
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub struct ModelAssetSpec {
+@@ -51,6 +55,7 @@ pub struct AssetCommit {
+ pub struct ModelCommitment {
+     pub anchor: Anchor,
+     pub assets: Vec<AssetCommit>,
++    pub tables: Vec<AssetTableMeta>,
+     pub root: PathBuf,
+ }
+ 
+@@ -81,6 +86,11 @@ fn table_identity(spec: &ModelAssetSpec) -> Digest {
+     hash_labeled(tag_word(STATEMENT, 13), 0, None, &data).unwrap_or(Digest::ZERO)
+ }
+ 
++/// The raw asset identity, exposed for the encoded table binding.
++pub fn asset_identity(spec: &ModelAssetSpec) -> Digest {
++    table_identity(spec)
++}
++
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ enum AssetEncoding {
+     I32Le,
+@@ -252,7 +262,7 @@ pub fn commit_assets(
+     parameters_digest: Digest,
+     specs: &[ModelAssetSpec],
+ ) -> Result<ModelCommitment> {
+-    commit_assets_inner(root, model_commitment, parameters_digest, specs, false)
++    commit_assets_inner(root, model_commitment, parameters_digest, specs, false, &[])
+         .map(|(commitment, _)| commitment)
+ }
+ 
+@@ -265,7 +275,21 @@ pub fn commit_assets_with_digests(
+     parameters_digest: Digest,
+     specs: &[ModelAssetSpec],
+ ) -> Result<(ModelCommitment, Vec<AssetDigest>)> {
+-    commit_assets_inner(root, model_commitment, parameters_digest, specs, true)
++    commit_assets_inner(root, model_commitment, parameters_digest, specs, true, &[])
++}
++
++/// Commits the raw asset rows and, for every table in `tables`, the encoded
++/// table over the same rows. The table leaf records join the anchor, so a
++/// changed table root breaks the anchor identity.
++pub fn commit_assets_with_tables(
++    root: &Path,
++    model_commitment: Digest,
++    parameters_digest: Digest,
++    specs: &[ModelAssetSpec],
++    tables: &[AssetTableInput],
++) -> Result<ModelCommitment> {
++    commit_assets_inner(root, model_commitment, parameters_digest, specs, false, tables)
++        .map(|(commitment, _)| commitment)
+ }
+ 
+ fn commit_assets_inner(
+@@ -274,13 +298,15 @@ fn commit_assets_inner(
+     parameters_digest: Digest,
+     specs: &[ModelAssetSpec],
+     emit_digests: bool,
++    tables: &[AssetTableInput],
+ ) -> Result<(ModelCommitment, Vec<AssetDigest>)> {
+     if specs.is_empty() {
+         return Err(Error::InvalidConfig);
+     }
+     let mut assets = Vec::with_capacity(specs.len());
+-    let mut records = Vec::with_capacity(specs.len());
++    let mut records = Vec::with_capacity(specs.len() + tables.len());
+     let mut asset_digests = Vec::with_capacity(specs.len());
++    let mut table_by_asset: BTreeMap<u64, AssetTableMeta> = BTreeMap::new();
+     for (position, spec) in specs.iter().enumerate() {
+         if spec.row_width == 0 || spec.element_count == 0 {
+             return Err(Error::InvalidConfig);
+@@ -353,12 +379,44 @@ fn commit_assets_inner(
+             leaf_record,
+             tree: Arc::new(tree),
+         });
++        if let Some(input) = tables
++            .iter()
++            .find(|input| input.params.asset_id == spec.asset_id)
++        {
++            if input.params.path != spec.path || table_by_asset.contains_key(&spec.asset_id) {
++                return Err(Error::StatementMismatch);
++            }
++            let meta =
++                build_asset_table(&reader, model_commitment, spec, input, 1 << 30)?;
++            table_by_asset.insert(spec.asset_id, meta);
++        }
++    }
++    let mut table_metas = Vec::with_capacity(tables.len());
++    for (index, input) in tables.iter().enumerate() {
++        let meta = table_by_asset
++            .remove(&input.params.asset_id)
++            .ok_or(Error::StatementMismatch)?;
++        records.push(LeafRecord {
++            leaf_id: specs.len() as u64 + index as u64,
++            generation: 0,
++            table_identity: asset_table_statement_identity(
++                meta.identity,
++                meta.root,
++                &meta.record,
++            ),
++            leaf_root: meta.root,
++        });
++        table_metas.push(meta);
++    }
++    if !table_by_asset.is_empty() {
++        return Err(Error::StatementMismatch);
+     }
+     let anchor = make_anchor(model_commitment, parameters_digest, &records)?;
+     Ok((
+         ModelCommitment {
+             anchor,
+             assets,
++            tables: table_metas,
+             root: root.to_path_buf(),
+         },
+         asset_digests,
+@@ -926,12 +984,34 @@ pub fn verify_model_anchor(
+     expected_model_commitment: Digest,
+     expected_parameters_digest: Digest,
+     specs: &[ModelAssetSpec],
++) -> Result<()> {
++    verify_model_anchor_with_tables(
++        public,
++        expected_anchor_id,
++        expected_model_commitment,
++        expected_parameters_digest,
++        specs,
++        &[],
++        &[],
++    )
++}
++
++/// Like `verify_model_anchor`, and checks every committed encoded table
++/// against the trusted plan and the anchor.
++pub fn verify_model_anchor_with_tables(
++    public: &ModelCommitmentPublic,
++    expected_anchor_id: Digest,
++    expected_model_commitment: Digest,
++    expected_parameters_digest: Digest,
++    specs: &[ModelAssetSpec],
++    table_metas: &[AssetTableMeta],
++    tables: &[AssetTableParams],
+ ) -> Result<()> {
+     let anchor = &public.anchor;
+     if anchor.anchor_id != expected_anchor_id
+         || anchor.model_commitment != expected_model_commitment
+         || anchor.parameters_digest != expected_parameters_digest
+-        || anchor.leaf_count != specs.len() as u64
++        || anchor.leaf_count != specs.len() as u64 + tables.len() as u64
+         || public.assets.len() != specs.len()
+     {
+         return Err(Error::StatementMismatch);
+@@ -973,6 +1053,38 @@ pub fn verify_model_anchor(
+         records.push(meta.leaf_record.clone());
+     }
+ 
++    if table_metas.len() != tables.len() {
++        return Err(Error::StatementMismatch);
++    }
++    let mut table_assets = BTreeSet::new();
++    let mut table_ids: BTreeSet<u64> = BTreeSet::new();
++    for (index, params) in tables.iter().enumerate() {
++        if !table_assets.insert(params.asset_id) {
++            return Err(Error::StatementMismatch);
++        }
++        let spec = specs
++            .iter()
++            .find(|spec| spec.asset_id == params.asset_id && spec.path == params.path)
++            .ok_or(Error::StatementMismatch)?;
++        let meta = table_metas
++            .iter()
++            .find(|meta| meta.asset_id == params.asset_id && meta.path == params.path)
++            .ok_or(Error::AssetMismatch)?;
++        if !table_ids.insert(meta.asset_id) {
++            return Err(Error::StatementMismatch);
++        }
++        verify_asset_table_meta(meta, anchor.model_commitment, spec, params)?;
++        records.push(LeafRecord {
++            leaf_id: specs.len() as u64 + index as u64,
++            generation: 0,
++            table_identity: asset_table_statement_identity(
++                meta.identity,
++                meta.root,
++                &meta.record,
++            ),
++            leaf_root: meta.root,
++        });
++    }
+     let rebuilt = make_anchor(anchor.model_commitment, anchor.parameters_digest, &records)?;
+     if rebuilt.record.anchor_id != anchor.anchor_id
+         || rebuilt.record.registry_root != anchor.registry_root
+diff --git a/crates/zkie-ops/tests/asset_table.rs b/crates/zkie-ops/tests/asset_table.rs
+new file mode 100644
+index 00000000..2481b413
+--- /dev/null
++++ b/crates/zkie-ops/tests/asset_table.rs
+@@ -0,0 +1,266 @@
++//! Encoded asset table identity and commit binding.
++
++use std::fs;
++use std::path::{Path, PathBuf};
++
++use zkie_core::types::Digest;
++use zkie_engine::pcs::request::code::CodeParams;
++use zkie_engine::pcs::request::field::Fp3;
++use zkie_engine::pcs::request::table::{IndexShape, TableDistances};
++use zkie_ops::proof::asset_table::{
++    validate_asset_table_params, AssetTableInput, AssetTableLayout, AssetTableMeta,
++    AssetTableParams, AssetTableRandomness,
++};
++use zkie_ops::proof::model_commitment::{
++    commit_assets_with_tables, verify_model_anchor, verify_model_anchor_with_tables, ModelAssetSpec,
++    ModelCommitmentPublic,
++};
++
++const MODEL: Digest = Digest([0x11; 32]);
++const PARAMS_DIGEST: Digest = Digest([0x22; 32]);
++const ASSET_ID: u64 = 7;
++
++fn temp_dir(name: &str) -> PathBuf {
++    let path = std::env::temp_dir().join(format!(
++        "zkie-asset-table-{}-{name}",
++        std::process::id()
++    ));
++    let _ = fs::remove_dir_all(&path);
++    fs::create_dir_all(&path).unwrap();
++    path
++}
++
++fn write_asset(path: &Path, values: &[i32]) {
++    let mut bytes = Vec::with_capacity(values.len() * 4);
++    for value in values {
++        bytes.extend_from_slice(&value.to_le_bytes());
++    }
++    fs::write(path, bytes).unwrap();
++}
++
++fn shape() -> IndexShape {
++    IndexShape {
++        code: CodeParams {
++            log_n: 5,
++            ell: 11,
++            r: 0,
++        },
++        v: 2,
++        answers: 1,
++        salt_bytes: 40,
++        distances: TableDistances {
++            radius: 0,
++            later_radius: 0,
++            m_once: 0,
++            m_later: 0,
++        },
++    }
++}
++
++fn spec() -> ModelAssetSpec {
++    ModelAssetSpec {
++        asset_id: ASSET_ID,
++        path: "asset.bin".into(),
++        element_count: 24,
++        row_width: 8,
++        encoding: "i32-le".into(),
++    }
++}
++
++fn params() -> AssetTableParams {
++    AssetTableParams {
++        asset_id: ASSET_ID,
++        path: "asset.bin".into(),
++        element_count: 24,
++        row_width: 8,
++        encoding: "i32-le".into(),
++        shape: shape(),
++        valid_min: -1000,
++        valid_max: 1000,
++        layout: AssetTableLayout {
++            row_width: 8,
++            message_len: 11,
++            tail_len: 0,
++            pads: 3,
++            valid_elements: 24,
++            padding_zero: true,
++        },
++    }
++}
++
++fn randomness() -> AssetTableRandomness {
++    AssetTableRandomness {
++        salts: (0..32)
++            .map(|position| vec![(position as u8) ^ 0x5a; 40])
++            .collect(),
++        tails: vec![Vec::new(); 4],
++    }
++}
++
++fn values() -> Vec<i32> {
++    (0..24).map(|index| (index as i32 - 12) * 3).collect()
++}
++
++fn input() -> AssetTableInput {
++    AssetTableInput {
++        params: params(),
++        randomness: randomness(),
++    }
++}
++
++fn commit(name: &str, values: &[i32]) -> (ModelCommitmentPublic, Vec<AssetTableMeta>) {
++    let root = temp_dir(name);
++    write_asset(&root.join("asset.bin"), values);
++    let commitment =
++        commit_assets_with_tables(&root, MODEL, PARAMS_DIGEST, &[spec()], &[input()]).unwrap();
++    assert_eq!(commitment.tables.len(), 1);
++    assert_eq!(commitment.anchor.record.leaf_count, 2);
++    (
++        ModelCommitmentPublic::from_commitment(&commitment),
++        commitment.tables,
++    )
++}
++
++#[test]
++fn table_commit_binds_the_anchor_and_verifies() {
++    let (public, metas) = commit("positive", &values());
++    let anchor = public.anchor.anchor_id;
++    verify_model_anchor_with_tables(
++        &public,
++        anchor,
++        MODEL,
++        PARAMS_DIGEST,
++        &[spec()],
++        &metas,
++        &[params()],
++    )
++    .unwrap();
++    let bytes = bincode::serialize(&public).unwrap();
++    let decoded: ModelCommitmentPublic = bincode::deserialize(&bytes).unwrap();
++    verify_model_anchor_with_tables(
++        &decoded,
++        anchor,
++        MODEL,
++        PARAMS_DIGEST,
++        &[spec()],
++        &metas,
++        &[params()],
++    )
++    .unwrap();
++    assert!(verify_model_anchor(&decoded, anchor, MODEL, PARAMS_DIGEST, &[spec()]).is_err());
++}
++
++#[test]
++fn changed_committed_table_is_rejected() {
++    let (base, metas) = commit("changed", &values());
++    let anchor = base.anchor.anchor_id;
++    let check = |public: &ModelCommitmentPublic, metas: &[AssetTableMeta]| {
++        verify_model_anchor_with_tables(
++            public,
++            anchor,
++            MODEL,
++            PARAMS_DIGEST,
++            &[spec()],
++            metas,
++            &[params()],
++        )
++    };
++    let mut cases: Vec<(&str, Box<dyn Fn(&mut Vec<AssetTableMeta>)>)> = Vec::new();
++    cases.push((
++        "root",
++        Box::new(|metas| metas[0].root.0[0] ^= 1),
++    ));
++    cases.push((
++        "configuration",
++        Box::new(|metas| metas[0].configuration.0[0] ^= 1),
++    ));
++    cases.push((
++        "identity",
++        Box::new(|metas| metas[0].identity.0[0] ^= 1),
++    ));
++    cases.push((
++        "shape-v",
++        Box::new(|metas| metas[0].shape.v += 1),
++    ));
++    cases.push((
++        "shape-code",
++        Box::new(|metas| metas[0].shape.code.log_n += 1),
++    ));
++    cases.push((
++        "record",
++        Box::new(|metas| metas[0].record.y.push(Fp3::ZERO)),
++    ));
++    cases.push((
++        "valid-range",
++        Box::new(|metas| metas[0].valid_min -= 1),
++    ));
++    cases.push((
++        "removed",
++        Box::new(|metas| metas.clear()),
++    ));
++    cases.push((
++        "duplicated",
++        Box::new(|metas| {
++            let table = metas[0].clone();
++            metas.push(table);
++        }),
++    ));
++    cases.push((
++        "asset-id",
++        Box::new(|metas| metas[0].asset_id += 1),
++    ));
++    cases.push((
++        "path",
++        Box::new(|metas| metas[0].path.push('x')),
++    ));
++    for (name, mutate) in cases {
++        let mut metas = metas.clone();
++        mutate(&mut metas);
++        assert!(
++            check(&base, &metas).is_err(),
++            "a changed table field must be rejected: {name}"
++        );
++    }
++}
++
++#[test]
++fn out_of_range_rows_are_rejected_at_commit() {
++    let root = temp_dir("range");
++    let mut out = values();
++    out[3] = 5000;
++    write_asset(&root.join("asset.bin"), &out);
++    assert!(commit_assets_with_tables(&root, MODEL, PARAMS_DIGEST, &[spec()], &[input()]).is_err());
++}
++
++#[test]
++fn wrong_random_material_is_rejected_at_commit() {
++    let root = temp_dir("random");
++    write_asset(&root.join("asset.bin"), &values());
++    let mut bad_salts = input();
++    bad_salts.randomness.salts.pop();
++    assert!(
++        commit_assets_with_tables(&root, MODEL, PARAMS_DIGEST, &[spec()], &[bad_salts]).is_err()
++    );
++    let mut bad_tails = input();
++    bad_tails.randomness.tails.pop();
++    assert!(
++        commit_assets_with_tables(&root, MODEL, PARAMS_DIGEST, &[spec()], &[bad_tails]).is_err()
++    );
++}
++
++#[test]
++fn params_must_describe_the_asset() {
++    let mut changed = params();
++    changed.element_count += 1;
++    assert!(validate_asset_table_params(&spec(), &changed).is_err());
++    let mut changed = params();
++    changed.layout.padding_zero = false;
++    assert!(validate_asset_table_params(&spec(), &changed).is_err());
++    let mut changed = params();
++    changed.valid_min = 1;
++    changed.valid_max = -1;
++    assert!(validate_asset_table_params(&spec(), &changed).is_err());
++    let mut changed = params();
++    changed.shape.v += 1;
++    assert!(validate_asset_table_params(&spec(), &changed).is_err());
++}
+diff --git a/zkie/src/provider.rs b/zkie/src/provider.rs
+index d04d4a23..a962ff0b 100644
+--- a/zkie/src/provider.rs
++++ b/zkie/src/provider.rs
+@@ -26,9 +26,10 @@ use zkie_ops::pipeline::{
+     ProofReceipt, ProveRequest, VerifyReceipt, VerifyRequest,
+ };
+ use zkie_ops::proof::model_commitment::{
+-    verify_model_anchor, verify_shared_trace, verify_shared_trace_output,
++    verify_model_anchor_with_tables, verify_shared_trace, verify_shared_trace_output,
+     ModelCommitmentPublic, SharedTrace,
+ };
++use zkie_ops::proof::asset_table::AssetTableMeta;
+ 
+ const PROTOCOL_ID: Digest = Digest([0xA1; 32]);
+ const PARAMETERS_DIGEST: Digest = Digest([0xA2; 32]);
+@@ -285,20 +286,24 @@ impl PipelineProvider for ProductionProvider {
+         let config_bytes = bincode::serialize(&config).map_err(|_| Error::InvalidEncoding)?;
+         let protocol_bytes = fs::read(&request.case_config).map_err(|_| Error::Io)?;
+         let parameters_bytes = fs::read(&request.parameters).map_err(|_| Error::Io)?;
++        let tables_bytes = bincode::serialize(&commitment.tables).map_err(|_| Error::InvalidEncoding)?;
+         let commitment_digest = digest_bytes(&commitment_bytes);
+         let config_digest = digest_bytes(&config_bytes);
+         let protocol_digest = digest_bytes(&protocol_bytes);
+         let parameters_digest = digest_bytes(&parameters_bytes);
++        let tables_digest = digest_bytes(&tables_bytes);
+         let files: Vec<(&str, &[u8])> = vec![
+             ("public/model-commitment.bin", commitment_bytes.as_slice()),
+             ("public/provider-config.bin", config_bytes.as_slice()),
+             ("public/protocol.bin", protocol_bytes.as_slice()),
++            ("public/asset-tables.bin", tables_bytes.as_slice()),
+             ("private/parameters.bin", parameters_bytes.as_slice()),
+         ];
+         let digests: Vec<(&str, Digest)> = vec![
+             ("public/model-commitment.bin", commitment_digest),
+             ("public/provider-config.bin", config_digest),
+             ("public/protocol.bin", protocol_digest),
++            ("public/asset-tables.bin", tables_digest),
+             ("private/parameters.bin", parameters_digest),
+         ];
+         let manifest = commit_manifest(
+@@ -307,6 +312,7 @@ impl PipelineProvider for ProductionProvider {
+                 ArtifactFile::new("public/model-commitment.bin", commitment_bytes.len() as u64, commitment_digest),
+                 ArtifactFile::new("public/provider-config.bin", config_bytes.len() as u64, config_digest),
+                 ArtifactFile::new("public/protocol.bin", protocol_bytes.len() as u64, protocol_digest),
++                ArtifactFile::new("public/asset-tables.bin", tables_bytes.len() as u64, tables_digest),
+                 ArtifactFile::new("private/parameters.bin", parameters_bytes.len() as u64, parameters_digest),
+             ],
+         );
+@@ -395,6 +401,11 @@ impl PipelineProvider for ProductionProvider {
+         let trace = read_proof_exact(&request.proof, ctx.runtime.memory_budget_bytes)?;
+         let public_inputs =
+             fs::read(&request.public_inputs).map_err(|_| Error::IncompleteArtifact)?;
++        let table_metas: Vec<AssetTableMeta> =
++            match fs::read(request.public_bundle_dir.join("asset-tables.bin")) {
++                Ok(bytes) => bincode::deserialize(&bytes).map_err(|_| Error::InvalidEncoding)?,
++                Err(_) => Vec::new(),
++            };
+ 
+         let trusted = crate::policy::select(
+             &policy,
+@@ -421,12 +432,14 @@ impl PipelineProvider for ProductionProvider {
+                 }
+                 let parameters = zkie_models_gpt2::plan::parameters_digest()?;
+                 let specs = zkie_models_gpt2::plan::asset_specs();
+-                verify_model_anchor(
++                verify_model_anchor_with_tables(
+                     &public,
+                     trusted.anchor_id,
+                     model_id,
+                     parameters,
+                     &specs,
++                    &table_metas,
++                    &[],
+                 )?;
+                 let argmax =
+                     verify_shared_trace(&public, &trace, &statement.tokens, &plan)?;
+@@ -454,12 +467,14 @@ impl PipelineProvider for ProductionProvider {
+                 }
+                 let parameters = zkie_models_gemma3::plan::parameters_digest()?;
+                 let specs = zkie_models_gemma3::plan::asset_specs();
+-                verify_model_anchor(
++                verify_model_anchor_with_tables(
+                     &public,
+                     trusted.anchor_id,
+                     model_id,
+                     parameters,
+                     &specs,
++                    &table_metas,
++                    &[],
+                 )?;
+                 let argmax =
+                     verify_shared_trace(&public, &trace, &statement.tokens, &plan)?;
+@@ -490,12 +505,14 @@ impl PipelineProvider for ProductionProvider {
+                 }
+                 let parameters = zkie_models_timesfm::plan::parameters_digest()?;
+                 let specs = zkie_models_timesfm::plan::asset_specs();
+-                verify_model_anchor(
++                verify_model_anchor_with_tables(
+                     &public,
+                     trusted.anchor_id,
+                     model_id,
+                     parameters,
+                     &specs,
++                    &table_metas,
++                    &[],
+                 )?;
+                 let output = verify_shared_trace_output(
+                     &public,
