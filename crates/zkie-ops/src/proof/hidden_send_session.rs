@@ -265,11 +265,13 @@ use crate::proof::output_closure::{
 use crate::registry::{RSQRT_COARSE, RSQRT_COARSE_END, RSQRT_FINE, RSQRT_HALF, RSQRT_SHIFT};
 use crate::proof::hidden_norm_psc::{
     NormFirstMessages, NormGroupPlan, NormGroupWitness, NormLookupMessage, NormLookupSecond,
-    NormMaskMessage, NormMaskPlan, NormMaskWitness, NormPlan, NormPositionBinding, NormPscSecond,
+    NormMaskMessage, NormMaskPlan, NormMaskWitness, NormParamMessage, NormParamOpenings, NormPlan,
+    NormPositionBinding, NormPscSecond,
     NormRowBinding, NormWitness, RSQRT_FINE_SLACK_WIDTH, RSQRT_INDEX_SLACK_WIDTH,
     RSQRT_INDEX_WIDTH, RSQRT_MID_HIGH_WIDTH, RSQRT_RAW_REMAINDER_WIDTH,
 };
 use crate::proof::committed_psc::CommittedPscGroup;
+use crate::proof::norm_param_table::NormParamKind;
 use crate::proof::base_final_session::{
     fold_identity, BaseFinalCheck, BaseFinalOutcome, BaseFinalRows, BaseFinalSession, BaseMessages,
     BaseCommitment, BaseOpening, BaseOpenings, BaseProver, FoldBasis, FoldMember,
@@ -5091,6 +5093,17 @@ pub trait HiddenTableProver: TableRowSource {
     fn open_columns(&mut self, positions: &[u64]) -> Result<Vec<ColumnOpening>>;
 }
 
+/// The prover-side handle of the norm gain/bias parameter tables. Each table
+/// is committed once and shared across positions; the verifier only holds the
+/// plan readers and checks the drawn openings against them.
+pub trait NormParamTableProver {
+    fn open_columns(
+        &mut self,
+        kind: NormParamKind,
+        positions: &[u64],
+    ) -> Result<Vec<ColumnOpening>>;
+}
+
 /// One committed member of a proximity group.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProximityMember {
@@ -6573,6 +6586,7 @@ fn prove_first(
     randomness: &WCommitRandomness,
     norm: Option<&NormWitness>,
     seed: &Digest,
+    param_tables: Option<&mut dyn NormParamTableProver>,
 ) -> Result<(HiddenSendMessages, Digest, HiddenSendWitness)> {
     let _profile_first = zkie_engine::profile::Scope::new("first.prove_first");
     plan.validate()?;
@@ -6693,7 +6707,7 @@ fn prove_first(
     let norm_first = match (&plan.norm, norm) {
         (Some(_), Some(norm_witness)) => {
             let (message, lookup_messages, rstd_messages) =
-                prove_norm_first(plan, &mut chain, norm_witness, seed)?;
+                prove_norm_first(plan, &mut chain, norm_witness, seed, param_tables)?;
             let mut owned = norm_witness.clone();
             if let Some(lookup) = owned.lookup.as_mut() {
                 lookup.messages = lookup_messages;
@@ -6704,7 +6718,12 @@ fn prove_first(
             witness.norm = Some(owned);
             Some(message)
         }
-        (None, None) => None,
+        (None, None) => {
+            if param_tables.is_some() {
+                return Err(Error::ShapeMismatch);
+            }
+            None
+        }
         _ => return Err(Error::ShapeMismatch),
     };
     let seeds = draw_seeds(&mut chain, &plan.send)?;
@@ -9424,6 +9443,8 @@ const NORM_RSTD_MASK_ANSWER_TAG: u64 = 102;
 const NORM_RSTD_BITS_POSITION_TAG: u64 = 103;
 const NORM_RSTD_MASK_POSITION_TAG: u64 = 104;
 const NORM_RSTD_SEED_TAG: u64 = 105;
+const NORM_PARAM_GAIN_POSITION_TAG: u64 = 106;
+const NORM_PARAM_BIAS_POSITION_TAG: u64 = 107;
 
 fn norm_group_plans(plan: &NormPlan) -> Vec<&NormGroupPlan> {
     let mut groups = vec![
@@ -9790,6 +9811,7 @@ fn prove_norm_first(
     chain: &mut Chain,
     witness: &NormWitness,
     seed: &Digest,
+    param_tables: Option<&mut dyn NormParamTableProver>,
 ) -> Result<(
     NormFirstMessages,
     Option<crate::proof::lookup_messages::LookupMessages>,
@@ -10302,6 +10324,45 @@ fn prove_norm_first(
         }
         None => (None, None),
     };
+    let params = match (&norm.params, param_tables) {
+        (Some(params_plan), Some(tables)) => {
+            let width = usize::try_from(norm.columns).map_err(|_| Error::ResourceLimit)?;
+            let values = witness.params.as_ref().ok_or(Error::ShapeMismatch)?;
+            if values.gain.len() != width || values.bias.len() != width {
+                return Err(Error::ShapeMismatch);
+            }
+            let gain_positions = draw_norm_param_positions(
+                chain,
+                NORM_PARAM_GAIN_POSITION_TAG,
+                params_plan.column_draws,
+                params_plan.gain.reader.shape.code.log_n,
+            )?;
+            let gain = NormParamOpenings {
+                openings: tables.open_columns(NormParamKind::Gain, &gain_positions)?,
+            };
+            let bias = if params_plan.bias.reader == params_plan.gain.reader {
+                None
+            } else {
+                let positions = draw_norm_param_positions(
+                    chain,
+                    NORM_PARAM_BIAS_POSITION_TAG,
+                    params_plan.column_draws,
+                    params_plan.bias.reader.shape.code.log_n,
+                )?;
+                Some(NormParamOpenings {
+                    openings: tables.open_columns(NormParamKind::Bias, &positions)?,
+                })
+            };
+            Some(NormParamMessage { gain, bias })
+        }
+        (None, None) => {
+            if witness.params.is_some() {
+                return Err(Error::ShapeMismatch);
+            }
+            None
+        }
+        _ => return Err(Error::ShapeMismatch),
+    };
     let mut iter = group_messages.into_iter();
     Ok((
         NormFirstMessages {
@@ -10314,7 +10375,7 @@ fn prove_norm_first(
             mask,
             lookup,
             rstd,
-            params: None,
+            params,
         },
         lookup_messages,
         rstd_messages,
@@ -10658,7 +10719,74 @@ fn verify_norm_first(
         (None, None) => {}
         _ => return Err(Error::ShapeMismatch),
     }
+    match (&norm.params, &message.params) {
+        (Some(params_plan), Some(params)) => {
+            params.check(params_plan)?;
+            let gain_positions = draw_norm_param_positions(
+                chain,
+                NORM_PARAM_GAIN_POSITION_TAG,
+                params_plan.column_draws,
+                params_plan.gain.reader.shape.code.log_n,
+            )?;
+            if params
+                .gain
+                .openings
+                .iter()
+                .map(|opening| opening.position)
+                .collect::<Vec<_>>()
+                != gain_positions
+            {
+                return Err(Error::StatementMismatch);
+            }
+            verify_columns(
+                &params_plan.gain.reader,
+                &gain_positions,
+                &params.gain.openings,
+            )?;
+            if let Some(bias) = &params.bias {
+                let positions = draw_norm_param_positions(
+                    chain,
+                    NORM_PARAM_BIAS_POSITION_TAG,
+                    params_plan.column_draws,
+                    params_plan.bias.reader.shape.code.log_n,
+                )?;
+                if bias
+                    .openings
+                    .iter()
+                    .map(|opening| opening.position)
+                    .collect::<Vec<_>>()
+                    != positions
+                {
+                    return Err(Error::StatementMismatch);
+                }
+                verify_columns(&params_plan.bias.reader, &positions, &bias.openings)?;
+            }
+        }
+        (None, None) => {}
+        _ => return Err(Error::ShapeMismatch),
+    }
     Ok(())
+}
+
+fn draw_norm_param_positions(
+    chain: &mut Chain,
+    tag: u64,
+    count: usize,
+    log_n: u32,
+) -> Result<Vec<u64>> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(tag);
+    message.push_u64(count as u64);
+    let prefix = message.prefix(KIND_POSITIONS, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    let mut drawn = Vec::with_capacity(count);
+    for _ in 0..count {
+        drawn.push(chain.draw_position(log_n)?);
+    }
+    Ok(unique_sorted(&drawn))
 }
 
 fn draw_rstd_seed(chain: &mut Chain) -> Result<u64> {
@@ -13705,6 +13833,7 @@ fn prove_hidden_lin_inner(
     bind_residual: bool,
     norm: Option<&NormWitness>,
     rstd_table: Option<&dyn crate::proof::lookup::LookupTable>,
+    param_tables: Option<&mut dyn NormParamTableProver>,
 ) -> Result<(HiddenLinMessages, HiddenLinWitness)> {
     let _profile_session = zkie_engine::profile::Scope::new("session.prove_hidden_lin_inner");
     plan.validate()?;
@@ -13721,7 +13850,16 @@ fn prove_hidden_lin_inner(
     )?;
     drop(_profile_randomness);
     let (first, first_seal, send_witness) =
-        prove_first(plan, activation, table, output, &randomness, norm, &seed)?;
+        prove_first(
+            plan,
+            activation,
+            table,
+            output,
+            &randomness,
+            norm,
+            &seed,
+            param_tables,
+        )?;
     let first_query = *first_chain(plan, &reader)?.value();
     let shared = prove_shared(plan, &reader, table, &first_seal, &seed)?;
     let own = prove_second(
@@ -13769,7 +13907,7 @@ pub fn prove_hidden_lin(
     if plan.weights.is_empty() {
         return Err(Error::InvalidConfig);
     }
-    prove_hidden_lin_inner(plan, activation, table, Some(output), seed, true, None, None)
+    prove_hidden_lin_inner(plan, activation, table, Some(output), seed, true, None, None, None)
 }
 
 /// Prover entry of the merged three-stage run in the hidden-input mode. The
@@ -13785,7 +13923,7 @@ pub fn prove_hidden_lin_hidden(
     if !plan.weights.is_empty() || plan.norm.is_some() {
         return Err(Error::InvalidConfig);
     }
-    prove_hidden_lin_inner(plan, activation, table, None, seed, true, None, None)
+    prove_hidden_lin_inner(plan, activation, table, None, seed, true, None, None, None)
 }
 
 /// Prover entry of the hidden-input mode with the private norm witness. The
@@ -13801,7 +13939,7 @@ pub fn prove_hidden_lin_hidden_with_norm(
     if !plan.weights.is_empty() || plan.norm.is_none() {
         return Err(Error::InvalidConfig);
     }
-    prove_hidden_lin_inner(plan, activation, table, None, seed, true, Some(norm), None)
+    prove_hidden_lin_inner(plan, activation, table, None, seed, true, Some(norm), None, None)
 }
 
 /// Test-only prover entry that omits the residual absorption before the
@@ -13818,7 +13956,7 @@ fn prove_hidden_lin_hidden_unbound_residual(
     if !plan.weights.is_empty() {
         return Err(Error::InvalidConfig);
     }
-    prove_hidden_lin_inner(plan, activation, table, None, seed, false, None, None)
+    prove_hidden_lin_inner(plan, activation, table, None, seed, false, None, None, None)
 }
 
 fn verify_hidden_lin_inner(
@@ -13935,6 +14073,34 @@ pub fn prove_hidden_lin_hidden_with_norm_and_rstd_table(
         true,
         Some(norm),
         Some(rstd_table),
+        None,
+    )
+}
+
+/// Proves the hidden chain with the norm parameter tables. The tables are the
+/// fixture's external trusted encoded tables; the verifier only holds the plan
+/// readers and checks the drawn openings against them.
+pub fn prove_hidden_lin_hidden_with_norm_and_params(
+    plan: &HiddenLinPlan,
+    activation: &CommittedActivation,
+    table: &mut dyn HiddenTableProver,
+    seed: Digest,
+    norm: &NormWitness,
+    param_tables: &mut dyn NormParamTableProver,
+) -> Result<(HiddenLinMessages, HiddenLinWitness)> {
+    if !plan.weights.is_empty() || plan.norm.is_none() {
+        return Err(Error::InvalidConfig);
+    }
+    prove_hidden_lin_inner(
+        plan,
+        activation,
+        table,
+        None,
+        seed,
+        true,
+        Some(norm),
+        None,
+        Some(param_tables),
     )
 }
 
@@ -16647,6 +16813,199 @@ mod merged_tests {
             }
             Ok(self.rows[start..end].to_vec())
         }
+    }
+
+    struct ParamTables {
+        gain: StreamingTable,
+        gain_source: VecTableSource,
+        bias: StreamingTable,
+        bias_source: VecTableSource,
+    }
+
+    impl NormParamTableProver for ParamTables {
+        fn open_columns(
+            &mut self,
+            kind: NormParamKind,
+            positions: &[u64],
+        ) -> Result<Vec<ColumnOpening>> {
+            match kind {
+                NormParamKind::Gain => self.gain.open_columns(&mut self.gain_source, positions),
+                NormParamKind::Bias => self.bias.open_columns(&mut self.bias_source, positions),
+            }
+        }
+    }
+
+    fn param_table(
+        values: &[i64],
+        configuration: u8,
+    ) -> (StreamingTable, VecTableSource, IndexReader) {
+        use zkie_engine::pcs::request::code::build_code_plan;
+
+        let shape = IndexShape {
+            code: build_code_plan(4, 7, 2).unwrap(),
+            v: 0,
+            answers: 1,
+            salt_bytes: SALT,
+            distances: TableDistances {
+                radius: 0,
+                later_radius: 0,
+                m_once: 0,
+                m_later: 0,
+            },
+        };
+        let ell = shape.code.ell as usize;
+        let mut message = vec![fp_from_signed_word(0); ell];
+        for (index, value) in values.iter().enumerate() {
+            message[index] = fp_from_signed_word(*value as u64);
+        }
+        let tails = vec![vec![fp_from_signed_word(0); shape.code.r as usize]];
+        let mut source = VecTableSource::new(vec![message], tails).unwrap();
+        let salts = vec![vec![0u8; shape.salt_bytes]; shape.code.n() as usize];
+        let table = commit_table_streaming(
+            &mut source,
+            shape,
+            Digest([configuration; 32]),
+            &salts,
+            8,
+            1 << 20,
+        )
+        .unwrap();
+        let reader = table.reader.clone();
+        (table, source, reader)
+    }
+
+    fn param_identity(
+        kind: NormParamKind,
+        reader: IndexReader,
+        width: u64,
+    ) -> crate::proof::norm_param_table::NormParamTableIdentity {
+        use crate::proof::norm_param_table::NORM_PARAM_TABLE_VERSION;
+
+        crate::proof::norm_param_table::NormParamTableIdentity {
+            version: NORM_PARAM_TABLE_VERSION,
+            kind,
+            model_identity: Digest([0x63; 32]),
+            asset_table_identity: Digest([0x64; 32]),
+            reader,
+            row: 0,
+            width,
+            valid_min: -128,
+            valid_max: 127,
+            trusted_i32_mapping: true,
+        }
+    }
+
+    fn norm_params_fixture(
+        activation: &CommittedActivation,
+    ) -> (HiddenLinPlan, NormWitness, ParamTables) {
+        use crate::proof::hidden_norm_psc::NormParamWitness;
+        use crate::proof::norm_param_table::NormParamTablesPlan;
+
+        let (mut plan, mut witness) = norm_fixture(activation);
+        let gain_values = vec![2i64, -1, 3, 1];
+        let bias_values = vec![1i64, 2, -1, 2];
+        let (gain_table, gain_source, gain_reader) = param_table(&gain_values, 0x61);
+        let (bias_table, bias_source, bias_reader) = param_table(&bias_values, 0x62);
+        let width = plan.norm.as_ref().unwrap().columns;
+        plan.norm.as_mut().unwrap().params = Some(NormParamTablesPlan {
+            gain: param_identity(NormParamKind::Gain, gain_reader, width),
+            bias: param_identity(NormParamKind::Bias, bias_reader, width),
+            column_draws: 2,
+            seed_budget: 1,
+        });
+        witness.params = Some(NormParamWitness {
+            gain: gain_values,
+            bias: bias_values,
+        });
+        plan.validate().unwrap();
+        (
+            plan,
+            witness,
+            ParamTables {
+                gain: gain_table,
+                gain_source,
+                bias: bias_table,
+                bias_source,
+            },
+        )
+    }
+
+    #[test]
+    fn norm_parameter_openings_prove_and_verify() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = norm_params_fixture(&activation);
+        let (messages, hidden_witness) = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+            &mut params,
+        )
+        .unwrap();
+        let mut verifier_plan = plan.clone();
+        verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        let outcome = verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &messages).unwrap();
+        assert_eq!(outcome.first_seal, messages.first_seal);
+    }
+
+    #[test]
+    fn norm_parameter_opening_tampering_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = norm_params_fixture(&activation);
+        let (messages, hidden_witness) = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+            &mut params,
+        )
+        .unwrap();
+        let mut verifier_plan = plan.clone();
+        verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        let bytes = messages.encode().unwrap();
+        let base = HiddenLinMessages::decode(&plan, &bytes).unwrap();
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &base).is_ok());
+
+        let mut changed = base.clone();
+        changed.first.norm.as_mut().unwrap().params.as_mut().unwrap().gain.openings[0].position += 1;
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = base.clone();
+        let symbol = &mut changed
+            .first
+            .norm
+            .as_mut()
+            .unwrap()
+            .params
+            .as_mut()
+            .unwrap()
+            .gain
+            .openings[0]
+            .symbols[0];
+        *symbol = *symbol + fp_from_signed_word(1);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = base.clone();
+        changed.first.norm.as_mut().unwrap().params.as_mut().unwrap().bias = None;
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut wrong_plan = plan.clone();
+        wrong_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        wrong_plan
+            .norm
+            .as_mut()
+            .unwrap()
+            .params
+            .as_mut()
+            .unwrap()
+            .gain
+            .reader
+            .root = Digest([0x99; 32]);
+        assert!(verify_hidden_lin_hidden(&wrong_plan, &table.reader(), &base).is_err());
     }
 
     fn rstd_bits_from_counts(
