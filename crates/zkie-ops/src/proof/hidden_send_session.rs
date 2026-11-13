@@ -293,6 +293,22 @@ use crate::proof::proximity_iopp::{
 /// trusted plan selects it, the presence-flagged output-closure block (the
 /// slack, packed-bit, product and mask messages and their samples).
 const HIDDEN_SEND_SCHEMA_VERSION: u64 = 4;
+
+/// The plan tag appended to the send statement when the Dot activation is the
+/// norm hidden-output object. The tag is absent on the independently
+/// committed activation path, whose statement bytes stay unchanged.
+const HD_ACTIVATION_MODE_TAG: u64 = 0x4E4F_524D_4844;
+
+/// The plan statement root of the norm hidden-output mode. The committed
+/// object itself is bound by the ordered roots in the first-stage norm
+/// message; this value only marks the mode and is never a second commitment.
+pub const HD_ACTIVATION_ROOT: Digest = Digest([0x48; 32]);
+
+/// The plan statement configuration of the norm hidden-output mode.
+pub const HD_ACTIVATION_CONFIGURATION: Digest = Digest([0x47; 32]);
+
+/// Version of the derived hidden-output object identity.
+const HD_ACTIVATION_IDENTITY_VERSION: u64 = 1;
 /// Domain tag of the public Dot residual in the second-stage transcript.
 const DOT_RESIDUAL_MESSAGE_TAG: u64 = 19;
 /// Version of the Dot residual relation. It fixes the sign convention
@@ -390,6 +406,31 @@ impl ActivationShape {
             return Err(Error::InvalidConfig);
         }
         Ok(shape)
+    }
+}
+
+/// The committed object that supplies the hidden Dot activation rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivationSource {
+    /// The activation is committed independently and pinned by the plan.
+    Commitment,
+    /// The activation is the norm hidden-output object. The Dot reads the
+    /// committed norm output messages; the plan carries no separate
+    /// activation commitment.
+    NormHd,
+}
+
+impl ActivationSource {
+    /// Appends the mode tag to a statement or parameter digest. The default
+    /// path appends nothing so its statement bytes are unchanged.
+    fn append(self, writer: &mut CanonicalWriter) {
+        if self == Self::NormHd {
+            writer.put_u64(HD_ACTIVATION_MODE_TAG);
+        }
+    }
+
+    pub fn is_norm_hd(self) -> bool {
+        self == Self::NormHd
     }
 }
 
@@ -1667,6 +1708,8 @@ pub struct HiddenSendPlan {
     pub activation: ActivationShape,
     pub activation_configuration: Digest,
     pub activation_root: Digest,
+    /// The committed object the Dot reads its activation rows from.
+    pub activation_source: ActivationSource,
     pub table_shape: IndexShape,
     pub table_identity: Digest,
     pub matrix_rows: u64,
@@ -1695,6 +1738,9 @@ impl HiddenSendPlan {
             || self.activation_configuration == Digest::ZERO
             || self.activation_root == Digest::ZERO
         {
+            return Err(Error::InvalidConfig);
+        }
+        if self.activation_source.is_norm_hd() && self.dot.is_none() {
             return Err(Error::InvalidConfig);
         }
         validate_index_shape(&self.table_shape)?;
@@ -1824,6 +1870,7 @@ impl HiddenSendPlan {
         self.activation.encode_into(&mut writer);
         writer.put_digest(&self.activation_configuration);
         writer.put_digest(&self.activation_root);
+        self.activation_source.append(&mut writer);
         put_index_shape(&mut writer, &self.table_shape);
         writer.put_digest(&self.table_identity);
         writer.put_u64(self.matrix_rows);
@@ -1859,6 +1906,7 @@ impl HiddenSendPlan {
         self.activation.encode_into(&mut writer);
         writer.put_digest(&self.activation_configuration);
         writer.put_digest(&self.activation_root);
+        self.activation_source.append(&mut writer);
         put_index_shape(&mut writer, &self.table_shape);
         writer.put_digest(&self.table_identity);
         writer.put_u64(self.matrix_rows);
@@ -1964,6 +2012,7 @@ impl WCommitRandomness {
                     return Err(Error::ShapeMismatch);
                 }
             }
+            (Some(_), None) if plan.activation_source.is_norm_hd() => {}
             (None, None) => {}
             _ => return Err(Error::ShapeMismatch),
         }
@@ -2042,6 +2091,7 @@ impl HiddenSendWitness {
                     salts: witness.salts.clone(),
                     pad: witness.pad,
                 }),
+                (Some(_), None) if plan.activation_source.is_norm_hd() => None,
                 (None, None) => None,
                 _ => return Err(Error::ShapeMismatch),
             },
@@ -2163,6 +2213,26 @@ pub fn derive_w_rows(
     plan.validate()?;
     check_table(plan, reader)?;
     check_activation(plan, activation)?;
+    if plan.activation_source.is_norm_hd() {
+        return Err(Error::InvalidConfig);
+    }
+    let positions = plan.positions() as usize;
+    let mut weights = Vec::with_capacity(positions);
+    for position in 0..positions {
+        weights.push(activation.weights(position as u32, plan.matrix_rows)?);
+    }
+    derive_w_rows_from_weights(plan, &weights, reader, source)
+}
+
+/// Derives the `W` rows from explicit private row-weight vectors. The caller
+/// owns the source of the rows: the committed activation, or the committed
+/// norm hidden-output messages.
+fn derive_w_rows_from_weights(
+    plan: &HiddenSendPlan,
+    weights: &[Vec<Fp3>],
+    reader: &IndexReader,
+    source: &mut dyn TableRowSource,
+) -> Result<Vec<Vec<Fp3>>> {
     if source.rows() != plan.table_shape.rows() {
         return Err(Error::ShapeMismatch);
     }
@@ -2174,10 +2244,8 @@ pub fn derive_w_rows(
     if !columns.is_power_of_two() || columns != (matrix_rows << plan.k_lo) {
         return Err(Error::InvalidConfig);
     }
-    // The row-weight vectors are fixed before the read; they stay private.
-    let mut weights = Vec::with_capacity(positions);
-    for position in 0..positions {
-        weights.push(activation.weights(position as u32, plan.matrix_rows)?);
+    if weights.len() != positions || weights.iter().any(|row| row.len() != matrix_rows) {
+        return Err(Error::ShapeMismatch);
     }
     let mut w = vec![vec![Fp3::ZERO; columns]; positions];
     let ell = usize::try_from(plan.table_shape.code.ell).map_err(|_| Error::ResourceLimit)?;
@@ -3313,6 +3381,84 @@ fn check_activation(plan: &HiddenSendPlan, activation: &CommittedActivation) -> 
         return Err(Error::StatementMismatch);
     }
     Ok(())
+}
+
+/// The activation rows of the norm hidden-output object. The rows are the
+/// first `matrix_rows` committed entries of every position's norm output
+/// message: the same committed cells the norm relation proves and the Dot
+/// consumes, not a second commitment.
+fn hd_activation_rows(
+    plan: &HiddenLinPlan,
+    norm: Option<&NormWitness>,
+) -> Result<Vec<Vec<Fp3>>> {
+    if !plan.send.activation_source.is_norm_hd() {
+        return Err(Error::InvalidConfig);
+    }
+    let norm_plan = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
+    let output_plan = norm_plan.output.as_ref().ok_or(Error::InvalidConfig)?;
+    let group = &output_plan.out;
+    let norm = norm.ok_or(Error::ShapeMismatch)?;
+    let output = norm.output.as_ref().ok_or(Error::ShapeMismatch)?;
+    let rows = usize::try_from(group.shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+    let ell = usize::try_from(group.shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let hidden = usize::try_from(plan.send.matrix_rows).map_err(|_| Error::ResourceLimit)?;
+    let positions = plan.send.positions() as usize;
+    if hidden == 0
+        || hidden > usize::try_from(group.columns).map_err(|_| Error::ResourceLimit)?
+        || output.out.messages.len() != positions
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut values = Vec::with_capacity(positions);
+    for message in &output.out.messages {
+        if message.len() != rows || message.iter().any(|row| row.len() != ell) {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut row = Vec::with_capacity(hidden);
+        for value_at in 0..hidden {
+            let entry = value_at;
+            row.push(message[entry % rows][entry / rows]);
+        }
+        values.push(row);
+    }
+    Ok(values)
+}
+
+/// The statement identity of the norm hidden-output object: the recorded plan
+/// numbers and the ordered committed roots of the norm output group. The
+/// verifier recomputes it from the first-stage norm message, so the Dot is
+/// bound to the object the norm relation proves.
+fn hd_activation_identity(
+    plan: &HiddenLinPlan,
+    entries: &[SendGroupEntry],
+) -> Result<Digest> {
+    let norm = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
+    let output = norm.output.as_ref().ok_or(Error::InvalidConfig)?;
+    let group = &output.out;
+    if entries.len() != plan.send.positions() as usize {
+        return Err(Error::ShapeMismatch);
+    }
+    for (position, entry) in entries.iter().enumerate() {
+        if entry.position != position as u32
+            || entry.oracle != group.oracle_base + position as u64
+            || entry.shape != group.shape.oracle_shape()
+        {
+            return Err(Error::StatementMismatch);
+        }
+    }
+    let mut writer = CanonicalWriter::new();
+    writer.put_u64(HD_ACTIVATION_IDENTITY_VERSION);
+    writer.put_u64(group.oracle_base);
+    writer.put_u64(group.group);
+    writer.put_u64(group.columns);
+    group.shape.encode_into(&mut writer);
+    writer.put_u64(entries.len() as u64);
+    for entry in entries {
+        writer.put_u64(entry.position as u64);
+        writer.put_u64(entry.oracle);
+        writer.put_digest(&entry.root);
+    }
+    hash_labeled(tag_word(PARAMETERS, 7), 0, None, &writer.into_bytes())
 }
 
 fn check_table(plan: &HiddenSendPlan, reader: &IndexReader) -> Result<()> {
@@ -4820,6 +4966,20 @@ impl HiddenLinPlan {
             norm.validate()?;
             if norm.shape.positions != self.send.activation.positions {
                 return Err(Error::ShapeMismatch);
+            }
+        }
+        if self.send.activation_source.is_norm_hd() {
+            let norm = self.norm.as_ref().ok_or(Error::InvalidConfig)?;
+            let output = norm.output.as_ref().ok_or(Error::InvalidConfig)?;
+            let out = &output.out;
+            if u64::from(norm.shape.valid) != self.send.matrix_rows
+                || norm.columns < self.send.matrix_rows
+                || out.columns != norm.columns
+                || out.oracle_base == 0
+                || out.shape.fault(out.columns, norm.shape.positions).is_some()
+                || self.send.activation.hidden as u64 != self.send.matrix_rows
+            {
+                return Err(Error::InvalidConfig);
             }
         }
         // An empty weights list selects the hidden-input mode. The verifier
@@ -6412,8 +6572,8 @@ impl WCommitRandomness {
             Some(index) => Some(IndexMaskRandomness::from_coins(coins, index)?),
             None => None,
         };
-        let dot = match &plan.dot {
-            Some(dot) => {
+        let dot = match (&plan.dot, plan.activation_source) {
+            (Some(dot), ActivationSource::Commitment) => {
                 let rows = usize::try_from(dot.shape.main_rows).map_err(|_| Error::ResourceLimit)?;
                 let tail_len = usize::try_from(dot.shape.code.r).map_err(|_| Error::ResourceLimit)?;
                 let columns = usize::try_from(dot.shape.code.n()).map_err(|_| Error::ResourceLimit)?;
@@ -6434,7 +6594,8 @@ impl WCommitRandomness {
                 }
                 Some(DotMapRandomness { tail, salts, pad })
             }
-            None => None,
+            (Some(_), ActivationSource::NormHd) => None,
+            (None, _) => None,
         };
         let closure = match closure {
             Some(closure_plan) => Some(ClosureRandomness::from_coins(
@@ -6583,7 +6744,7 @@ fn eval_targets(
 /// witness.
 fn prove_first(
     plan: &HiddenLinPlan,
-    activation: &CommittedActivation,
+    activation: Option<&CommittedActivation>,
     table: &mut dyn HiddenTableProver,
     output: Option<&[Vec<Fp3>]>,
     randomness: &WCommitRandomness,
@@ -6594,23 +6755,42 @@ fn prove_first(
     let _profile_first = zkie_engine::profile::Scope::new("first.prove_first");
     plan.validate()?;
     let reader = table.reader().clone();
-    check_activation(&plan.send, activation)?;
     check_table(&plan.send, &reader)?;
+    let weights = match plan.send.activation_source {
+        ActivationSource::Commitment => {
+            let activation = activation.ok_or(Error::InvalidConfig)?;
+            check_activation(&plan.send, activation)?;
+            let positions = plan.send.positions() as usize;
+            let mut weights = Vec::with_capacity(positions);
+            for position in 0..positions {
+                weights.push(activation.weights(position as u32, plan.send.matrix_rows)?);
+            }
+            weights
+        }
+        ActivationSource::NormHd => {
+            if activation.is_some() {
+                return Err(Error::InvalidConfig);
+            }
+            hd_activation_rows(plan, norm)?
+        }
+    };
     let _profile_derive = zkie_engine::profile::Scope::new("first.derive_w_rows");
-    let rows = derive_w_rows(&plan.send, activation, &reader, table)?;
+    let rows = derive_w_rows_from_weights(&plan.send, &weights, &reader, table)?;
     drop(_profile_derive);
     let _profile_commit_w = zkie_engine::profile::Scope::new("first.commit_w_rows");
     let (group, mut witness) = commit_w_rows(&plan.send, &rows, randomness)?;
     drop(_profile_commit_w);
-    let dot_root = match &plan.send.dot {
-        Some(_) => {
+    let dot_root = match (&plan.send.dot, plan.send.activation_source) {
+        (Some(_), ActivationSource::Commitment) => {
+            let activation = activation.ok_or(Error::InvalidConfig)?;
             let _profile_dot = zkie_engine::profile::Scope::new("first.commit_dot_map");
             let (root, map) = commit_dot_map(&plan.send, activation, randomness)?;
             drop(_profile_dot);
             witness.dot = Some(map);
             Some(root)
         }
-        None => None,
+        (Some(_), ActivationSource::NormHd) => None,
+        (None, _) => None,
     };
     let closure_commit = match (&plan.closure, &randomness.closure) {
         (Some(closure_plan), Some(closure_randomness)) => {
@@ -6696,9 +6876,12 @@ fn prove_first(
         (None, None) => None,
         _ => return Err(Error::ShapeMismatch),
     };
-    match (&plan.send.dot, dot_root) {
-        (Some(_), Some(root)) => absorb_dot_root(&mut chain, &plan.send, &root)?,
-        (None, None) => {}
+    match (&plan.send.dot, dot_root, plan.send.activation_source) {
+        (Some(_), Some(root), ActivationSource::Commitment) => {
+            absorb_dot_root(&mut chain, &plan.send, &root)?
+        }
+        (Some(_), None, ActivationSource::NormHd) => {}
+        (None, None, _) => {}
         _ => return Err(Error::ShapeMismatch),
     }
     if let Some(closure) = &witness.closure {
@@ -6735,9 +6918,11 @@ fn prove_first(
         _ => return Err(Error::ShapeMismatch),
     };
     let seeds = draw_seeds(&mut chain, &plan.send)?;
-    let dot_seeds = match &plan.send.dot {
-        Some(dot) => Some(draw_seed_set(&mut chain, dot.sample_bits()?, 1)?),
-        None => None,
+    let dot_seeds = match (&plan.send.dot, plan.send.activation_source) {
+        (Some(dot), ActivationSource::Commitment) => {
+            Some(draw_seed_set(&mut chain, dot.sample_bits()?, 1)?)
+        }
+        _ => None,
     };
     let _profile_answers = zkie_engine::profile::Scope::new("first.w_answers");
     let answers = witness.answers(&seeds)?;
@@ -6752,6 +6937,7 @@ fn prove_first(
                 answers: vec![answer],
             })
         }
+        (Some(_), None, None) if plan.send.activation_source.is_norm_hd() => None,
         (None, None, None) => None,
         _ => return Err(Error::InvalidProof),
     };
@@ -7058,11 +7244,26 @@ fn prove_first(
             root,
             sample,
         }),
+        (Some(_), None, None) if plan.send.activation_source.is_norm_hd() => None,
         (None, None, None) => None,
         _ => return Err(Error::InvalidProof),
     };
+    let activation_commitment = match plan.send.activation_source {
+        ActivationSource::Commitment => {
+            *activation.ok_or(Error::InvalidConfig)?.commitment()
+        }
+        ActivationSource::NormHd => {
+            let first_norm = norm_first.as_ref().ok_or(Error::InvalidConfig)?;
+            let output = first_norm.output.as_ref().ok_or(Error::InvalidConfig)?;
+            ActivationCommitment {
+                shape: plan.send.activation,
+                root: hd_activation_identity(plan, &output.out.message.group.entries)?,
+                configuration: plan.send.activation_configuration,
+            }
+        }
+    };
     let messages = HiddenSendMessages {
-        activation: *activation.commitment(),
+        activation: activation_commitment,
         group,
         samples: SendSamples { seed: seeds, answers },
         positions,
@@ -7096,9 +7297,10 @@ fn verify_first(
         }
     }
     if messages.activation.fault().is_some()
-        || messages.activation.root != plan.send.activation_root
         || messages.activation.shape != plan.send.activation
         || messages.activation.configuration != plan.send.activation_configuration
+        || (!plan.send.activation_source.is_norm_hd()
+            && messages.activation.root != plan.send.activation_root)
     {
         return Err(Error::StatementMismatch);
     }
@@ -7156,6 +7358,7 @@ fn verify_first(
             }
             absorb_dot_root(&mut chain, &plan.send, &message.root)?;
         }
+        (Some(_), None) if plan.send.activation_source.is_norm_hd() => {}
         (None, None) => {}
         _ => return Err(Error::ShapeMismatch),
     }
@@ -7234,12 +7437,20 @@ fn verify_first(
         (None, None) => {}
         _ => return Err(Error::ShapeMismatch),
     }
+    if plan.send.activation_source.is_norm_hd() {
+        let norm_first = messages.norm.as_ref().ok_or(Error::ShapeMismatch)?;
+        let output = norm_first.output.as_ref().ok_or(Error::ShapeMismatch)?;
+        let identity = hd_activation_identity(plan, &output.out.message.group.entries)?;
+        if identity != messages.activation.root {
+            return Err(Error::StatementMismatch);
+        }
+    }
     let seeds = draw_seeds(&mut chain, &plan.send)?;
     if seeds != messages.samples.seed {
         return Err(Error::InvalidProof);
     }
-    let dot_seeds = match &plan.send.dot {
-        Some(dot) => {
+    let dot_seeds = match (&plan.send.dot, plan.send.activation_source) {
+        (Some(dot), ActivationSource::Commitment) => {
             let drawn = draw_seed_set(&mut chain, dot.sample_bits()?, 1)?;
             let message = messages.dot.as_ref().ok_or(Error::ShapeMismatch)?;
             if drawn != message.sample.seed {
@@ -7247,7 +7458,7 @@ fn verify_first(
             }
             Some(drawn)
         }
-        None => None,
+        _ => None,
     };
     let answer_count = plan.send.positions() as usize * plan.send.w.answers as usize;
     if messages.samples.answers.len() != answer_count {
@@ -8799,7 +9010,7 @@ fn own_members(
         mask_message: Vec::new(),
         mask_tails: Vec::new(),
     });
-    if let Some(dot) = &plan.send.dot {
+    if let Some(dot) = plan.send.dot.as_ref().filter(|_| !plan.send.activation_source.is_norm_hd()) {
         let message = first.dot.as_ref().ok_or(Error::ShapeMismatch)?;
         if message.tree != dot.tree_plan()? {
             return Err(Error::StatementMismatch);
@@ -9701,7 +9912,7 @@ fn own_sample_rows(
                 return Ok(vec![index_mask_sample_row(index, message, target)?]);
             }
         }
-        if let Some(dot) = &plan.send.dot {
+        if let Some(dot) = plan.send.dot.as_ref().filter(|_| !plan.send.activation_source.is_norm_hd()) {
             if member.source_oracle == dot.oracle {
                 let message = first.dot.as_ref().ok_or(Error::ShapeMismatch)?;
                 let target = *message
@@ -15039,6 +15250,9 @@ fn dot_witness_values(
     plan: &HiddenLinPlan,
     witness: &HiddenSendWitness,
 ) -> Result<Vec<Vec<Fp3>>> {
+    if plan.send.activation_source.is_norm_hd() {
+        return hd_activation_rows(plan, witness.norm.as_ref());
+    }
     let dot = plan.send.dot.as_ref().ok_or(Error::InvalidConfig)?;
     let map = witness.dot.as_ref().ok_or(Error::ShapeMismatch)?;
     let rows = usize::try_from(dot.shape.main_rows).map_err(|_| Error::ResourceLimit)?;
@@ -15302,7 +15516,12 @@ fn dot_plain_rows(
     {
         return Err(Error::StatementMismatch);
     }
-    let dot_member = bat_of.get(&dot.oracle).ok_or(Error::StatementMismatch)?;
+    let dot_member = match plan.send.activation_source {
+        ActivationSource::Commitment => {
+            Some(bat_of.get(&dot.oracle).ok_or(Error::StatementMismatch)?)
+        }
+        ActivationSource::NormHd => None,
+    };
     let omega_member = bat_of
         .get(&plan.proximity.omega.oracle)
         .ok_or(Error::StatementMismatch)?;
@@ -15382,29 +15601,68 @@ fn dot_plain_rows(
     // end mask, against the first masked end value. A BAT term is indexed by
     // the message's virtual entry `row + place * 2^row_bits`, which is the
     // entry index of the shown-map message.
-    let dot_rows = usize::try_from(dot.shape.main_rows).map_err(|_| Error::ResourceLimit)?;
-    let dot_ell = usize::try_from(dot.shape.code.ell).map_err(|_| Error::ResourceLimit)?;
-    let mut coefficients = vec![Fp3::ZERO; dot_rows * dot_ell];
-    let mut power = Fp3::ONE;
-    for position in 0..positions as usize {
-        for value_at in 0..hidden {
-            let coefficient = power.mul(&eq_index(
-                &output.point,
-                value_at as u64,
-                variables as u32,
-            )?);
-            let entry = position
-                .checked_mul(hidden)
-                .and_then(|base| base.checked_add(value_at))
-                .ok_or(Error::ResourceLimit)?;
-            let slot = coefficients.get_mut(entry).ok_or(Error::ShapeMismatch)?;
-            *slot = slot.add(&coefficient);
-        }
-        power = power.mul(&binding.chi);
-    }
     let end_start = index.entries.end_range()?.start;
     let mut row = BatRow::new(BatRowKind::Plain);
-    row.add_term(dot_member.bat_oracle, BatPart::Main, coefficients);
+    match plan.send.activation_source {
+        ActivationSource::Commitment => {
+            let dot_member = dot_member.ok_or(Error::InvalidConfig)?;
+            let dot_rows =
+                usize::try_from(dot.shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+            let dot_ell = usize::try_from(dot.shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+            let mut coefficients = vec![Fp3::ZERO; dot_rows * dot_ell];
+            let mut power = Fp3::ONE;
+            for position in 0..positions as usize {
+                for value_at in 0..hidden {
+                    let coefficient = power.mul(&eq_index(
+                        &output.point,
+                        value_at as u64,
+                        variables as u32,
+                    )?);
+                    let entry = position
+                        .checked_mul(hidden)
+                        .and_then(|base| base.checked_add(value_at))
+                        .ok_or(Error::ResourceLimit)?;
+                    let slot = coefficients.get_mut(entry).ok_or(Error::ShapeMismatch)?;
+                    *slot = slot.add(&coefficient);
+                }
+                power = power.mul(&binding.chi);
+            }
+            row.add_term(dot_member.bat_oracle, BatPart::Main, coefficients);
+        }
+        ActivationSource::NormHd => {
+            let norm_plan = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
+            let output_plan = norm_plan.output.as_ref().ok_or(Error::InvalidConfig)?;
+            let group = &output_plan.out;
+            let out_rows =
+                usize::try_from(group.shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+            let out_ell = usize::try_from(group.shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+            let mut power = Fp3::ONE;
+            for position in 0..positions as usize {
+                let member = bat_of
+                    .get(
+                        &group
+                            .oracle_base
+                            .checked_add(position as u64)
+                            .ok_or(Error::ResourceLimit)?,
+                    )
+                    .ok_or(Error::StatementMismatch)?;
+                let mut coefficients = vec![Fp3::ZERO; out_rows * out_ell];
+                for value_at in 0..hidden {
+                    let coefficient = power.mul(&eq_index(
+                        &output.point,
+                        value_at as u64,
+                        variables as u32,
+                    )?);
+                    let slot = coefficients
+                        .get_mut(value_at)
+                        .ok_or(Error::ShapeMismatch)?;
+                    *slot = slot.add(&coefficient);
+                }
+                row.add_term(member.bat_oracle, BatPart::Main, coefficients);
+                power = power.mul(&binding.chi);
+            }
+        }
+    }
     row.add_unit(
         mask_member.bat_oracle,
         BatPart::Mask,
@@ -15780,7 +16038,7 @@ fn witness_tree_for(
             return Ok(Arc::new(mask_witness.tree(index)?));
         }
     }
-    if let Some(dot) = &plan.send.dot {
+    if let Some(dot) = plan.send.dot.as_ref().filter(|_| !plan.send.activation_source.is_norm_hd()) {
         if member.source_oracle == dot.oracle {
             let map = witness.dot.as_ref().ok_or(Error::ShapeMismatch)?;
             let _profile_tree = zkie_engine::profile::Scope::light("witness_tree.dot");
@@ -15984,7 +16242,7 @@ fn verify_second(
 
 fn prove_hidden_lin_inner(
     plan: &HiddenLinPlan,
-    activation: &CommittedActivation,
+    activation: Option<&CommittedActivation>,
     table: &mut dyn HiddenTableProver,
     output: Option<&[Vec<Fp3>]>,
     seed: Digest,
@@ -16073,7 +16331,7 @@ pub fn prove_hidden_lin(
     if plan.weights.is_empty() {
         return Err(Error::InvalidConfig);
     }
-    prove_hidden_lin_inner(plan, activation, table, Some(output), seed, true, None, None, None)
+    prove_hidden_lin_inner(plan, Some(activation), table, Some(output), seed, true, None, None, None)
 }
 
 /// Prover entry of the merged three-stage run in the hidden-input mode. The
@@ -16089,7 +16347,7 @@ pub fn prove_hidden_lin_hidden(
     if !plan.weights.is_empty() || plan.norm.is_some() {
         return Err(Error::InvalidConfig);
     }
-    prove_hidden_lin_inner(plan, activation, table, None, seed, true, None, None, None)
+    prove_hidden_lin_inner(plan, Some(activation), table, None, seed, true, None, None, None)
 }
 
 /// Prover entry of the hidden-input mode with the private norm witness. The
@@ -16105,7 +16363,27 @@ pub fn prove_hidden_lin_hidden_with_norm(
     if !plan.weights.is_empty() || plan.norm.is_none() {
         return Err(Error::InvalidConfig);
     }
-    prove_hidden_lin_inner(plan, activation, table, None, seed, true, Some(norm), None, None)
+    prove_hidden_lin_inner(plan, Some(activation), table, None, seed, true, Some(norm), None, None)
+}
+
+/// Prover entry of the hidden-input mode where the Dot activation is the norm
+/// hidden-output object. No activation matrix is supplied: the rows are the
+/// committed norm output messages, so the MatMul consumes the same object the
+/// norm relation proves. The norm witness carries those messages.
+pub fn prove_hidden_lin_hidden_with_norm_hd(
+    plan: &HiddenLinPlan,
+    table: &mut dyn HiddenTableProver,
+    seed: Digest,
+    norm: &NormWitness,
+    param_tables: Option<&mut dyn NormParamTableProver>,
+) -> Result<(HiddenLinMessages, HiddenLinWitness)> {
+    if !plan.weights.is_empty()
+        || plan.norm.is_none()
+        || !plan.send.activation_source.is_norm_hd()
+    {
+        return Err(Error::InvalidConfig);
+    }
+    prove_hidden_lin_inner(plan, None, table, None, seed, true, Some(norm), None, param_tables)
 }
 
 /// Test-only prover entry that omits the residual absorption before the
@@ -16122,7 +16400,7 @@ fn prove_hidden_lin_hidden_unbound_residual(
     if !plan.weights.is_empty() {
         return Err(Error::InvalidConfig);
     }
-    prove_hidden_lin_inner(plan, activation, table, None, seed, false, None, None, None)
+    prove_hidden_lin_inner(plan, Some(activation), table, None, seed, false, None, None, None)
 }
 
 fn verify_hidden_lin_inner(
@@ -16232,7 +16510,7 @@ pub fn prove_hidden_lin_hidden_with_norm_and_rstd_table(
     }
     prove_hidden_lin_inner(
         plan,
-        activation,
+        Some(activation),
         table,
         None,
         seed,
@@ -16259,7 +16537,7 @@ pub fn prove_hidden_lin_hidden_with_norm_and_params(
     }
     prove_hidden_lin_inner(
         plan,
-        activation,
+        Some(activation),
         table,
         None,
         seed,
@@ -17362,6 +17640,7 @@ mod tests {
             activation: activation.shape(),
             activation_configuration: ACTIVATION_CONFIGURATION,
             activation_root: activation.root(),
+            activation_source: ActivationSource::Commitment,
             table_shape: table_shape(),
             table_identity: reader_table_identity(&reader).unwrap(),
             matrix_rows: TABLE_ROWS,
@@ -18368,6 +18647,7 @@ mod merged_tests {
             activation: activation.shape(),
             activation_configuration: ACTIVATION_CONFIGURATION,
             activation_root: activation.root(),
+            activation_source: ActivationSource::Commitment,
             table_shape: table_shape(),
             table_identity: reader_table_identity(&table.reader).unwrap(),
             matrix_rows: MATRIX_ROWS,
@@ -23403,6 +23683,388 @@ mod merged_tests {
         assert!(
             proved.is_err(),
             "an output shift that differs from the committed tail rows must not prove"
+        );
+    }
+
+    fn norm_hd_fixture(
+        activation: &CommittedActivation,
+    ) -> (HiddenLinPlan, NormWitness, ParamTables) {
+        let (mut plan, witness, params) = slack_lookup_fixture(activation);
+        let norm = plan.norm.as_ref().unwrap();
+        assert_eq!(u64::from(norm.shape.valid), plan.send.matrix_rows);
+        assert!(norm.columns >= plan.send.matrix_rows);
+        plan.send.activation_source = ActivationSource::NormHd;
+        plan.send.activation =
+            ActivationShape::new(POSITIONS, plan.send.matrix_rows as u32, SALT).unwrap();
+        plan.send.activation_root = HD_ACTIVATION_ROOT;
+        plan.send.activation_configuration = HD_ACTIVATION_CONFIGURATION;
+        plan.validate().unwrap();
+        (plan, witness, params)
+    }
+
+    #[test]
+    fn norm_hd_feeds_the_hidden_dot() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = norm_hd_fixture(&activation);
+        let (messages, hidden_witness) = prove_hidden_lin_hidden_with_norm_hd(
+            &plan,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+            Some(&mut params),
+        )
+        .unwrap();
+        // The Dot has no shown-map commitment of its own; the activation
+        // statement is derived from the committed norm output object.
+        assert!(messages.first.dot.is_none());
+        let norm_first = messages.first.norm.as_ref().unwrap();
+        let entries = norm_first
+            .output
+            .as_ref()
+            .unwrap()
+            .out
+            .message
+            .group
+            .entries
+            .clone();
+        let identity = hd_activation_identity(&plan, &entries).unwrap();
+        assert_eq!(messages.first.activation.root, identity);
+        assert_eq!(messages.first.activation.shape, plan.send.activation);
+        let mut verifier_plan = plan.clone();
+        verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        let outcome = verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &messages).unwrap();
+        assert_eq!(outcome.first_seal, messages.first_seal);
+        assert_eq!(outcome.activation.root, identity);
+        assert!(outcome.dot.is_some());
+
+        let bytes = messages.encode().unwrap();
+        let decoded = HiddenLinMessages::decode(&plan, &bytes).unwrap();
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &decoded).is_ok());
+    }
+
+    #[test]
+    fn norm_hd_consumer_object_swap_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = norm_hd_fixture(&activation);
+        let (messages, hidden_witness) = prove_hidden_lin_hidden_with_norm_hd(
+            &plan,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+            Some(&mut params),
+        )
+        .unwrap();
+        let mut verifier_plan = plan.clone();
+        verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        let mut changed = HiddenLinMessages::decode(&plan, &messages.encode().unwrap()).unwrap();
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_ok());
+        // Another committed object in the same position: the derived identity
+        // no longer matches the statement, so the consumer reads a different
+        // object than the producer proved.
+        changed
+            .first
+            .norm
+            .as_mut()
+            .unwrap()
+            .output
+            .as_mut()
+            .unwrap()
+            .out
+            .message
+            .group
+            .entries[0]
+            .root = Digest([0x9c; 32]);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = HiddenLinMessages::decode(&plan, &messages.encode().unwrap()).unwrap();
+        changed.first.norm.as_mut().unwrap().output = None;
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+    }
+
+    #[test]
+    fn norm_hd_old_or_foreign_plan_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = norm_hd_fixture(&activation);
+        let (messages, hidden_witness) = prove_hidden_lin_hidden_with_norm_hd(
+            &plan,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+            Some(&mut params),
+        )
+        .unwrap();
+        let mut verifier_plan = plan.clone();
+        verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &messages).is_ok());
+
+        // The independent-activation statement cannot accept an object-derived
+        // activation root, and an old proof cannot satisfy the norm mode.
+        let mut old_plan = plan.clone();
+        old_plan.send.activation_source = ActivationSource::Commitment;
+        old_plan.send.activation_root = Digest([0x71; 32]);
+        assert!(old_plan.validate().is_ok());
+        assert!(verify_hidden_lin_hidden(&old_plan, &table.reader(), &messages).is_err());
+
+        let mut foreign = plan.clone();
+        foreign
+            .norm
+            .as_mut()
+            .unwrap()
+            .output
+            .as_mut()
+            .unwrap()
+            .out
+            .oracle_base += 1;
+        let mut foreign_verifier = foreign.clone();
+        foreign_verifier.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        assert!(
+            verify_hidden_lin_hidden(&foreign_verifier, &table.reader(), &messages).is_err(),
+            "a foreign hidden-output object must not verify"
+        );
+    }
+
+    #[test]
+    fn norm_hd_missing_dot_plan_is_rejected() {
+        let activation = activation();
+        let (mut plan, _, _) = norm_hd_fixture(&activation);
+        plan.send.dot = None;
+        assert!(plan.validate().is_err());
+
+        let (mut plan, _, _) = norm_hd_fixture(&activation);
+        plan.send.matrix_rows += 1;
+        assert!(plan.validate().is_err());
+    }
+
+    #[test]
+    fn norm_hd_committed_row_tampering_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = norm_hd_fixture(&activation);
+        let mut changed = witness.clone();
+        {
+            let output = changed.output.as_mut().unwrap();
+            let out = output.out.messages.clone();
+            let group = &plan.norm.as_ref().unwrap().output.as_ref().unwrap().out;
+            let rows = usize::try_from(group.shape.main_rows).unwrap();
+            let ell = usize::try_from(group.shape.code.ell).unwrap();
+            let columns = usize::try_from(group.columns).unwrap();
+            let mut values = Vec::with_capacity(out.len());
+            for message in &out {
+                let mut slots = vec![Fp3::ZERO; columns];
+                for (slot, value) in slots.iter_mut().enumerate() {
+                    if slot / rows < ell {
+                        *value = message[slot % rows][slot / rows];
+                    }
+                }
+                values.push(slots);
+            }
+            values[0][0] = values[0][0].add(&Fp3::ONE);
+            let mut coins = ByteMaskCoins::new(Digest([0x9d; 32])).unwrap();
+            let tampered = commit_norm_group(&group.clone(), &values, &mut coins);
+            output.out.committed = tampered.committed;
+        }
+        let proved = prove_hidden_lin_hidden_with_norm_hd(
+            &plan,
+            &mut table,
+            Digest([0x71; 32]),
+            &changed,
+            Some(&mut params),
+        );
+        assert!(
+            proved.is_err(),
+            "a committed hidden-output row that differs from the norm relation must not prove"
+        );
+    }
+
+    fn signed_value(value: &Fp3) -> Result<i128> {
+        use zkie_engine::pcs::request::field::MODULUS;
+        if value.c[1].as_canonical_u64() != 0 || value.c[2].as_canonical_u64() != 0 {
+            return Err(Error::BoundViolation);
+        }
+        let canonical = value.c[0].as_canonical_u64();
+        if canonical <= i64::MAX as u64 {
+            Ok(canonical as i128)
+        } else {
+            let magnitude = MODULUS.checked_sub(canonical).ok_or(Error::BoundViolation)?;
+            Ok(-(magnitude as i128))
+        }
+    }
+
+    fn norm_hd_closure_plan(
+        plan: &HiddenLinPlan,
+        winner: Vec<u32>,
+    ) -> crate::proof::output_closure::ClosurePlan {
+        use crate::proof::psc::psc_variables;
+        use zkie_engine::pcs::request::runtime_tree::{RuntimeTreePart, RuntimeTreePlan};
+
+        let range_bits = 16u32;
+        let slack_bits = 18u32;
+        let width = (range_bits as u64 + 1) * 2 + slack_bits as u64;
+        let bits_columns = (plan.send.columns * width).next_power_of_two();
+        let boolean_variables = bits_columns.trailing_zeros() as usize;
+        let variables = psc_variables(boolean_variables).unwrap();
+        let mask_code = plan.proximity.mask_code;
+        let mask_rows = 16u64;
+        let wshape = |columns: u64, tree: u64| {
+            WShape::new(
+                columns,
+                plan.send.w.code,
+                1,
+                POSITIONS,
+                SALT,
+                tree,
+                1,
+                W_RUN,
+                W_CONFIGURATION,
+            )
+            .unwrap()
+        };
+        crate::proof::output_closure::ClosurePlan {
+            range_bits,
+            slack_bits,
+            valid: 2,
+            vocab: plan.send.columns as usize,
+            mask_value: -65_536,
+            winner,
+            slack: wshape(plan.send.columns, 63_000),
+            slack_oracle_base: 42_000,
+            slack_openings: 1,
+            bits: wshape(bits_columns, 63_010),
+            bits_oracle_base: 42_010,
+            bits_openings: 1,
+            map: wshape(bits_columns, 63_020),
+            map_oracle_base: 42_020,
+            map_openings: 1,
+            bits_columns,
+            bits_per_cell: width as u32,
+            boolean_variables: boolean_variables as u32,
+            mask: crate::proof::output_closure::ClosureMaskPlan {
+                oracle: 42_030,
+                group: plan.send.group,
+                mask_code,
+                mask_rows,
+                answers: 1,
+                openings: 1,
+                tree: RuntimeTreePlan {
+                    tree_number: 63_030,
+                    leaf_class: 1,
+                    log_n: mask_code.log_n,
+                    log_n_zk: mask_code.log_n,
+                    parts: vec![RuntimeTreePart {
+                        main_symbols: 0,
+                        mask_symbols: mask_rows * E_DEGREE as u64,
+                    }],
+                    salt_bytes: SALT,
+                    run: W_RUN,
+                    configuration: W_CONFIGURATION,
+                },
+                positions: POSITIONS,
+                hiding: hp_entries(&variables).unwrap(),
+                shown: 5,
+            },
+        }
+    }
+
+    fn norm_hd_logits(
+        plan: &HiddenLinPlan,
+        witness: &NormWitness,
+        table: &mut Table,
+    ) -> Vec<Vec<i128>> {
+        let weights = hd_activation_rows(plan, Some(witness)).unwrap();
+        let reader = table.reader().clone();
+        let rows = derive_w_rows_from_weights(&plan.send, &weights, &reader, table).unwrap();
+        rows.iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| signed_value(value).unwrap())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn first_maximum(rows: &[Vec<i128>], valid: usize, mask: i128) -> Vec<u32> {
+        rows.iter()
+            .map(|row| {
+                let mut best = 0usize;
+                let mut best_value = i128::MIN;
+                for (column, value) in row.iter().enumerate() {
+                    let masked = if column >= valid { *value + mask } else { *value };
+                    if column == 0 || masked > best_value {
+                        best = column;
+                        best_value = masked;
+                    }
+                }
+                assert!(best < valid);
+                best as u32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn norm_hd_logits_close_to_argmax() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = norm_hd_fixture(&activation);
+        let logits = norm_hd_logits(&plan, &witness, &mut table);
+        let winner = first_maximum(&logits, 2, -65_536);
+        let mut plan = plan;
+        plan.closure = Some(norm_hd_closure_plan(&plan, winner.clone()));
+        plan.output_relation = Some(Digest([0x5a; 32]));
+        plan.validate().unwrap();
+        let (messages, hidden_witness) = prove_hidden_lin_hidden_with_norm_hd(
+            &plan,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+            Some(&mut params),
+        )
+        .unwrap();
+        let mut verifier_plan = plan.clone();
+        verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        let outcome = verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &messages).unwrap();
+        assert!(outcome.closure.is_some());
+        let rows = crate::proof::output_head_lin::witness_output_rows(&hidden_witness).unwrap();
+        let closed = first_maximum(
+            &rows
+                .iter()
+                .map(|row| row.iter().map(|value| *value as i128).collect())
+                .collect::<Vec<_>>(),
+            2,
+            -65_536,
+        );
+        assert_eq!(closed, winner);
+        assert!(messages.first.dot.is_none());
+        assert!(messages.first.norm.as_ref().unwrap().output.is_some());
+    }
+
+    #[test]
+    fn norm_hd_closure_wrong_winner_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = norm_hd_fixture(&activation);
+        let logits = norm_hd_logits(&plan, &witness, &mut table);
+        let winner = first_maximum(&logits, 2, -65_536);
+        let wrong = winner
+            .iter()
+            .map(|index| if *index == 0 { 1 } else { 0 })
+            .collect::<Vec<_>>();
+        let mut plan = plan;
+        plan.closure = Some(norm_hd_closure_plan(&plan, wrong));
+        plan.output_relation = Some(Digest([0x5a; 32]));
+        plan.validate().unwrap();
+        let proved = prove_hidden_lin_hidden_with_norm_hd(
+            &plan,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+            Some(&mut params),
+        );
+        assert!(
+            proved.is_err(),
+            "a closure winner that differs from the logits must not prove"
         );
     }
 

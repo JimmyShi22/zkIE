@@ -946,6 +946,8 @@ fn selected_gpt2_output_head_request_session() {
             activation,
             activation_configuration: ACTIVATION_CONFIGURATION,
             activation_root: Digest([0x71; 32]),
+            activation_source:
+                zkie_ops::proof::hidden_send_session::ActivationSource::Commitment,
             table_shape,
             table_identity: reader_table_identity(&reader).unwrap(),
             matrix_rows: OUTPUT_HEAD_HIDDEN as u64,

@@ -2230,6 +2230,7 @@ mod tests {
             activation: ActivationShape::new(TOY_POSITIONS as u32, TOY_HIDDEN as u32, SALT).unwrap(),
             activation_configuration: ACTIVATION_CONFIGURATION,
             activation_root: Digest([0x71; 32]),
+            activation_source: crate::proof::hidden_send_session::ActivationSource::Commitment,
             table_shape: encoded.reader.shape,
             table_identity: reader_table_identity(&encoded.reader).unwrap(),
             matrix_rows: TOY_HIDDEN as u64,
