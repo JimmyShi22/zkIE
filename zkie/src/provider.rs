@@ -29,7 +29,10 @@ use zkie_ops::proof::model_commitment::{
     verify_model_anchor_with_tables, verify_shared_trace, verify_shared_trace_output,
     ModelCommitmentPublic, SharedTrace,
 };
-use zkie_ops::proof::asset_table::AssetTableMeta;
+use zkie_ops::proof::asset_table::{
+    decode_asset_table_randomness_set, encode_asset_table_randomness_set,
+    sample_asset_table_inputs, AssetTableInput, AssetTableMeta, AssetTableParams,
+};
 
 const PROTOCOL_ID: Digest = Digest([0xA1; 32]);
 const PARAMETERS_DIGEST: Digest = Digest([0xA2; 32]);
@@ -226,14 +229,36 @@ fn proof_manifest(model: Digest, files: Vec<ArtifactFile>) -> ArtifactManifest {
     }
 }
 
-fn build_commitment(config: &ProviderConfig) -> Result<zkie_ops::proof::model_commitment::ModelCommitment> {
+fn commitment_table_params(config: &ProviderConfig) -> Result<Vec<AssetTableParams>> {
     match config.model.as_str() {
-        "gpt2" => gpt2::build_commitment(Path::new(&config.asset_root), &config.tokens),
-        "gemma3" => gemma3::build_commitment(Path::new(&config.case_root), &config.tokens),
-        "timesfm" => timesfm::build_commitment(
-            Path::new(&config.case_root),
-            &config.input.iter().map(|value| *value as i64).collect::<Vec<_>>(),
-        ),
+        "gpt2" => zkie_models_gpt2::plan::asset_table_params(),
+        "gemma3" => Ok(Vec::new()),
+        "timesfm" => Ok(Vec::new()),
+        _ => Err(Error::UnsupportedPrimitive),
+    }
+}
+
+fn build_commitment(
+    config: &ProviderConfig,
+    tables: &[AssetTableInput],
+) -> Result<zkie_ops::proof::model_commitment::ModelCommitment> {
+    match config.model.as_str() {
+        "gpt2" => gpt2::build_commitment(Path::new(&config.asset_root), &config.tokens, tables),
+        "gemma3" => {
+            if !tables.is_empty() {
+                return Err(Error::InvalidConfig);
+            }
+            gemma3::build_commitment(Path::new(&config.case_root), &config.tokens)
+        }
+        "timesfm" => {
+            if !tables.is_empty() {
+                return Err(Error::InvalidConfig);
+            }
+            timesfm::build_commitment(
+                Path::new(&config.case_root),
+                &config.input.iter().map(|value| *value as i64).collect::<Vec<_>>(),
+            )
+        }
         _ => Err(Error::UnsupportedPrimitive),
     }
 }
@@ -272,7 +297,9 @@ impl PipelineProvider for ProductionProvider {
         ctx: &mut PipelineContext<'_>,
     ) -> Result<CommitReceipt> {
         let config = parse_case(&request.case_config)?;
-        let commitment = build_commitment(&config)?;
+        let table_params = commitment_table_params(&config)?;
+        let tables = sample_asset_table_inputs(&table_params)?;
+        let commitment = build_commitment(&config, &tables)?;
         let asset_units = commitment.assets.len() as u64;
         let mut progress_event =
             ProgressEvent::new("commit", "commit", ProgressKind::WorkAdvanced);
@@ -287,17 +314,20 @@ impl PipelineProvider for ProductionProvider {
         let protocol_bytes = fs::read(&request.case_config).map_err(|_| Error::Io)?;
         let parameters_bytes = fs::read(&request.parameters).map_err(|_| Error::Io)?;
         let tables_bytes = bincode::serialize(&commitment.tables).map_err(|_| Error::InvalidEncoding)?;
+        let randomness_bytes = encode_asset_table_randomness_set(&tables)?;
         let commitment_digest = digest_bytes(&commitment_bytes);
         let config_digest = digest_bytes(&config_bytes);
         let protocol_digest = digest_bytes(&protocol_bytes);
         let parameters_digest = digest_bytes(&parameters_bytes);
         let tables_digest = digest_bytes(&tables_bytes);
+        let randomness_digest = digest_bytes(&randomness_bytes);
         let files: Vec<(&str, &[u8])> = vec![
             ("public/model-commitment.bin", commitment_bytes.as_slice()),
             ("public/provider-config.bin", config_bytes.as_slice()),
             ("public/protocol.bin", protocol_bytes.as_slice()),
             ("public/asset-tables.bin", tables_bytes.as_slice()),
             ("private/parameters.bin", parameters_bytes.as_slice()),
+            ("private/asset-table-randomness.bin", randomness_bytes.as_slice()),
         ];
         let digests: Vec<(&str, Digest)> = vec![
             ("public/model-commitment.bin", commitment_digest),
@@ -305,6 +335,7 @@ impl PipelineProvider for ProductionProvider {
             ("public/protocol.bin", protocol_digest),
             ("public/asset-tables.bin", tables_digest),
             ("private/parameters.bin", parameters_digest),
+            ("private/asset-table-randomness.bin", randomness_digest),
         ];
         let manifest = commit_manifest(
             model,
@@ -314,6 +345,7 @@ impl PipelineProvider for ProductionProvider {
                 ArtifactFile::new("public/protocol.bin", protocol_bytes.len() as u64, protocol_digest),
                 ArtifactFile::new("public/asset-tables.bin", tables_bytes.len() as u64, tables_digest),
                 ArtifactFile::new("private/parameters.bin", parameters_bytes.len() as u64, parameters_digest),
+                ArtifactFile::new("private/asset-table-randomness.bin", randomness_bytes.len() as u64, randomness_digest),
             ],
         );
         ArtifactPublisher::publish_with_digests(&request.output_dir, &manifest, &files, &digests)?;
@@ -332,7 +364,20 @@ impl PipelineProvider for ProductionProvider {
         let config_bytes = fs::read(request.commit_dir.join("public/provider-config.bin"))
             .map_err(|_| Error::MissingCommitArtifact)?;
         let config: ProviderConfig = bincode::deserialize(&config_bytes).map_err(|_| Error::InvalidEncoding)?;
-        let commitment = build_commitment(&config)?;
+        let table_params = commitment_table_params(&config)?;
+        let randomness_bytes =
+            fs::read(request.commit_dir.join("private/asset-table-randomness.bin"))
+                .map_err(|_| Error::MissingCommitArtifact)?;
+        let tables = decode_asset_table_randomness_set(&randomness_bytes, &table_params)?;
+        let commitment = build_commitment(&config, &tables)?;
+        let published_tables: Vec<AssetTableMeta> =
+            match fs::read(request.commit_dir.join("public/asset-tables.bin")) {
+                Ok(bytes) => bincode::deserialize(&bytes).map_err(|_| Error::InvalidEncoding)?,
+                Err(_) => return Err(Error::MissingCommitArtifact),
+            };
+        if published_tables != commitment.tables {
+            return Err(Error::StatementMismatch);
+        }
         let model = commitment.anchor.record.model_commitment;
         if request.expected_model_id != model {
             return Err(Error::StatementMismatch);

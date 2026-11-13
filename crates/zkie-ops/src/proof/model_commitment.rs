@@ -447,6 +447,26 @@ pub fn open_asset_reader(
     AssetReader::open(commitment, asset_id, &governor)
 }
 
+/// The complete leaf record list of the anchor: every committed asset followed
+/// by every committed encoded table. A link proof must be built over this list
+/// because the anchor registry covers both.
+fn commitment_leaf_records(commitment: &ModelCommitment) -> Vec<LeafRecord> {
+    let mut records: Vec<LeafRecord> = commitment
+        .assets
+        .iter()
+        .map(|asset| asset.leaf_record.clone())
+        .collect();
+    for (index, meta) in commitment.tables.iter().enumerate() {
+        records.push(LeafRecord {
+            leaf_id: commitment.assets.len() as u64 + index as u64,
+            generation: 0,
+            table_identity: asset_table_statement_identity(meta.identity, meta.root, &meta.record),
+            leaf_root: meta.root,
+        });
+    }
+    records
+}
+
 pub fn open_asset_from_reader(
     commitment: &ModelCommitment,
     reader: &AssetReader,
@@ -462,13 +482,10 @@ pub fn open_asset_from_reader(
     if row_start.checked_add(row_count).ok_or(Error::ResourceLimit)? > asset.rows || row_count == 0 {
         return Err(Error::InvalidIndex);
     }
+    let records = commitment_leaf_records(commitment);
     let link = prove_link(
         &commitment.anchor,
-        &commitment
-            .assets
-            .iter()
-            .map(|asset| asset.leaf_record.clone())
-            .collect::<Vec<_>>(),
+        &records,
         commitment
             .assets
             .iter()

@@ -394,7 +394,7 @@ fn transcript_digest(tag: u64, data: &[u8]) -> Result<Digest> {
     )
 }
 
-pub const MODEL_VERSION: u32 = 1;
+pub const MODEL_VERSION: u32 = 2;
 
 pub fn valid_vocab() -> usize {
     VALID_VOCAB
@@ -453,6 +453,15 @@ pub fn projection_table_params(path: &str) -> Option<AssetTableParams> {
     })
 }
 
+/// The trusted encoded-table list of the model plan. The layer-0 key
+/// projection weight is the first migrated consumer; every other asset keeps
+/// the raw row commitment until its own consumer relation closes.
+pub fn asset_table_params() -> Result<Vec<AssetTableParams>> {
+    const FIRST_PROJECTION: &str = "gpt2/weights/L0_k_w_i32.bin";
+    let params = projection_table_params(FIRST_PROJECTION).ok_or(Error::InvalidConfig)?;
+    Ok(vec![params])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +477,18 @@ mod tests {
         zkie_ops::proof::asset_table::validate_asset_table_params(&spec, &params).unwrap();
         assert_eq!(params.shape.rows(), 1024);
         assert_eq!(params.element_count, 1024 * 1024);
+    }
+
+    #[test]
+    fn the_plan_declares_the_first_projection_table() {
+        let tables = asset_table_params().unwrap();
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].path, "gpt2/weights/L0_k_w_i32.bin");
+        let spec = asset_specs()
+            .into_iter()
+            .find(|spec| spec.path == tables[0].path)
+            .expect("asset spec");
+        zkie_ops::proof::asset_table::validate_asset_table_params(&spec, &tables[0]).unwrap();
     }
 
     #[test]

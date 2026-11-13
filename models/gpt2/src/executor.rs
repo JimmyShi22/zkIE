@@ -15,9 +15,10 @@ use zkie_ops::index_gen::{EmbeddingIndexOp, TableIndexOp};
 use zkie_ops::matmul::MatMulOp;
 use zkie_ops::profile_norm::ProfileLayerNormOp;
 use zkie_ops::projection::ProjectionOp;
+use zkie_ops::proof::asset_table::AssetTableInput;
 use zkie_ops::proof::model_commitment::{
-    commit_assets, AssetOpening, AssetStore, ModelAssetSpec, ModelCommitment, SharedTrace,
-    SharedTraceStep,
+    commit_assets_with_tables, AssetOpening, AssetStore, ModelAssetSpec, ModelCommitment,
+    SharedTrace, SharedTraceStep,
 };
 use zkie_ops::proof::relations::{
     proof_output_values, prove_op_relation_shared, RelationConfig, RelationReceiptMessage,
@@ -491,7 +492,14 @@ pub fn execute_shared_with_progress(
     })
 }
 
-pub fn build_commitment(asset_root: &Path, tokens: &[u32]) -> Result<ModelCommitment> {
+/// Commits the raw asset rows and the encoded tables of the trusted table
+/// list. The committer owns the private table randomness; the same inputs
+/// rebuild the same anchor.
+pub fn build_commitment(
+    asset_root: &Path,
+    tokens: &[u32],
+    tables: &[AssetTableInput],
+) -> Result<ModelCommitment> {
     let parameters = zkie_engine::primitives::transcript::hash_labeled(
         zkie_engine::primitives::transcript::tag_word(
             zkie_engine::primitives::transcript::STATEMENT,
@@ -510,5 +518,5 @@ pub fn build_commitment(asset_root: &Path, tokens: &[u32]) -> Result<ModelCommit
         None,
         &tokens.iter().flat_map(|token| token.to_le_bytes()).collect::<Vec<_>>(),
     )?;
-    commit_assets(asset_root, model, parameters, &asset_specs())
+    commit_assets_with_tables(asset_root, model, parameters, &asset_specs(), tables)
 }

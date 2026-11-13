@@ -63,6 +63,29 @@ fn the_real_context_is_loaded_with_the_lm_head_identity() {
         return;
     };
     let statement_data = read_statement(&statement);
+    // The fixture artifact predates the current model version. The existing
+    // gate rejects a version mismatch; the historical artifact stays on disk.
+    let policy_document =
+        zkie::policy::parse(&fs::read(&policy).expect("policy bytes")).expect("policy");
+    let trusted = zkie::policy::select(
+        &policy_document,
+        &statement_data.case_id,
+        &statement_data.model,
+        statement_data.tokens.len(),
+    )
+    .expect("trusted policy");
+    if trusted.model_version != zkie_models_gpt2::plan::MODEL_VERSION {
+        let error = load_gpt2_lm_head_context(
+            &case,
+            &policy,
+            &public,
+            &statement,
+            statement_data.model_commitment,
+        )
+        .expect_err("an artifact of another model version must be rejected");
+        assert_eq!(error.code(), "invalid_config");
+        return;
+    }
     let context = load_gpt2_lm_head_context(
         &case,
         &policy,

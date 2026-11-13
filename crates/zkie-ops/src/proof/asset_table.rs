@@ -63,6 +63,15 @@ pub struct AssetTableInput {
     pub randomness: AssetTableRandomness,
 }
 
+/// One table's private randomness, keyed by asset identity, for the private
+/// commit artifact. The key binds the randomness to the asset whose rows it
+/// salts.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AssetTableRandomnessEntry {
+    pub asset_id: u64,
+    pub randomness: AssetTableRandomness,
+}
+
 /// The committed table, public. The identity, shape, configuration and valid
 /// range come from the trusted plan; the root and record are the committer's
 /// data and are bound by the anchor.
@@ -293,6 +302,38 @@ mod tests {
         assert_eq!(randomness.tails.len(), params.shape.rows() as usize);
         assert!(randomness.tails.iter().all(|tail| tail.len() == 2));
     }
+
+    #[test]
+    fn randomness_set_round_trips_and_rejects_bad_sets() {
+        let mut second = params();
+        second.asset_id = 2;
+        second.path = "other.bin".into();
+        let trusted = vec![params(), second];
+        let tables = sample_asset_table_inputs(&trusted).unwrap();
+        let bytes = encode_asset_table_randomness_set(&tables).unwrap();
+        let decoded = decode_asset_table_randomness_set(&bytes, &trusted).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].params.asset_id, trusted[0].asset_id);
+        assert_eq!(decoded[1].params.asset_id, trusted[1].asset_id);
+        let mut reversed = trusted.clone();
+        reversed.reverse();
+        let decoded = decode_asset_table_randomness_set(&bytes, &reversed).unwrap();
+        assert_eq!(decoded[0].params.asset_id, reversed[0].asset_id);
+        assert_eq!(decoded[1].params.asset_id, reversed[1].asset_id);
+
+        assert!(decode_asset_table_randomness_set(&bytes, &trusted[..1]).is_err());
+        assert!(decode_asset_table_randomness_set(&bytes, &[]).is_err());
+        let mut wrong_shape = trusted.clone();
+        wrong_shape[1].shape.code.r += 1;
+        assert!(decode_asset_table_randomness_set(&bytes, &wrong_shape).is_err());
+        let duplicate = vec![tables[0].clone(), tables[0].clone()];
+        let bytes = encode_asset_table_randomness_set(&duplicate).unwrap();
+        assert!(decode_asset_table_randomness_set(&bytes, &trusted).is_err());
+        let mut unknown = tables.clone();
+        unknown[1].params.asset_id = 3;
+        let bytes = encode_asset_table_randomness_set(&unknown).unwrap();
+        assert!(decode_asset_table_randomness_set(&bytes, &trusted).is_err());
+    }
 }
 
 
@@ -311,6 +352,14 @@ pub fn decode_asset_table_randomness(
 ) -> Result<AssetTableRandomness> {
     let randomness: AssetTableRandomness =
         bincode::deserialize(bytes).map_err(|_| ZkieError::InvalidEncoding)?;
+    check_asset_table_randomness(&randomness, params)?;
+    Ok(randomness)
+}
+
+fn check_asset_table_randomness(
+    randomness: &AssetTableRandomness,
+    params: &AssetTableParams,
+) -> Result<()> {
     let columns = usize::try_from(params.shape.code.n()).map_err(|_| ZkieError::ResourceLimit)?;
     let rows = usize::try_from(params.shape.rows()).map_err(|_| ZkieError::ResourceLimit)?;
     let tail_len = usize::try_from(params.shape.code.r).map_err(|_| ZkieError::ResourceLimit)?;
@@ -324,7 +373,69 @@ pub fn decode_asset_table_randomness(
     {
         return Err(ZkieError::ShapeMismatch);
     }
-    Ok(randomness)
+    Ok(())
+}
+
+/// Samples the private randomness of every trusted table. The result is
+/// aligned with `params` and is the input of the table commit.
+pub fn sample_asset_table_inputs(params: &[AssetTableParams]) -> Result<Vec<AssetTableInput>> {
+    params
+        .iter()
+        .map(|params| {
+            let randomness = sample_asset_table_randomness(params)?;
+            Ok(AssetTableInput {
+                params: params.clone(),
+                randomness,
+            })
+        })
+        .collect()
+}
+
+/// Encodes the private randomness of the given tables for the private commit
+/// artifact. The bytes are never part of the public bundle.
+pub fn encode_asset_table_randomness_set(tables: &[AssetTableInput]) -> Result<Vec<u8>> {
+    let entries: Vec<AssetTableRandomnessEntry> = tables
+        .iter()
+        .map(|table| AssetTableRandomnessEntry {
+            asset_id: table.params.asset_id,
+            randomness: table.randomness.clone(),
+        })
+        .collect();
+    bincode::serialize(&entries).map_err(|_| ZkieError::InvalidEncoding)
+}
+
+/// Decodes the private randomness set against the trusted table list and
+/// returns one table input per parameter. The set must match the trusted
+/// assets one to one; an unknown, duplicate or missing asset and a
+/// shape-mismatched randomness are rejected.
+pub fn decode_asset_table_randomness_set(
+    bytes: &[u8],
+    params: &[AssetTableParams],
+) -> Result<Vec<AssetTableInput>> {
+    let entries: Vec<AssetTableRandomnessEntry> =
+        bincode::deserialize(bytes).map_err(|_| ZkieError::InvalidEncoding)?;
+    if entries.len() != params.len() {
+        return Err(ZkieError::ShapeMismatch);
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for entry in &entries {
+        if !seen.insert(entry.asset_id) {
+            return Err(ZkieError::StatementMismatch);
+        }
+    }
+    let mut tables = Vec::with_capacity(params.len());
+    for params in params {
+        let entry = entries
+            .iter()
+            .find(|entry| entry.asset_id == params.asset_id)
+            .ok_or(ZkieError::StatementMismatch)?;
+        check_asset_table_randomness(&entry.randomness, params)?;
+        tables.push(AssetTableInput {
+            params: params.clone(),
+            randomness: entry.randomness.clone(),
+        });
+    }
+    Ok(tables)
 }
 
 struct AssetRowSource<'a> {

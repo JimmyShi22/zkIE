@@ -12,8 +12,8 @@ use zkie_ops::proof::asset_table::{
     AssetTableParams, AssetTableRandomness,
 };
 use zkie_ops::proof::model_commitment::{
-    commit_assets_with_tables, verify_model_anchor, verify_model_anchor_with_tables, ModelAssetSpec,
-    ModelCommitmentPublic,
+    commit_assets_with_tables, verify_asset_opening, verify_model_anchor,
+    verify_model_anchor_with_tables, AssetStore, ModelAssetSpec, ModelCommitmentPublic,
 };
 
 const MODEL: Digest = Digest([0x11; 32]);
@@ -221,6 +221,20 @@ fn changed_committed_table_is_rejected() {
             "a changed table field must be rejected: {name}"
         );
     }
+}
+
+#[test]
+fn asset_openings_prove_against_the_table_anchor() {
+    let root = temp_dir("opening");
+    write_asset(&root.join("asset.bin"), &values());
+    let commitment =
+        commit_assets_with_tables(&root, MODEL, PARAMS_DIGEST, &[spec()], &[input()]).unwrap();
+    let store = AssetStore::open(&commitment).unwrap();
+    let opening = store.open_asset(0).unwrap();
+    verify_asset_opening(&commitment, &opening).unwrap();
+    let mut changed = opening.clone();
+    changed.rows[0].values[0] ^= 1;
+    assert!(verify_asset_opening(&commitment, &changed).is_err());
 }
 
 #[test]
