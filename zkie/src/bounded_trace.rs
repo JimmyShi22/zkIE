@@ -2,7 +2,8 @@
 //!
 //! The wire format is materialized by one streaming decoder. Every declared
 //! collection is charged before its backing allocation and before its elements
-//! are visited. The decoder never rewinds or buffers the complete proof.
+//! are visited. The decoder never rewinds or buffers the complete proof;
+//! reads go through a fixed-size buffer.
 
 use std::cell::Cell;
 use std::fmt;
@@ -709,7 +710,12 @@ pub(crate) fn read_file(path: &Path, memory_budget_bytes: u64) -> Result<SharedT
     if metadata.len() > memory_budget_bytes {
         return Err(Error::ResourceLimit);
     }
-    read_from(&mut file, memory_budget_bytes)
+    // Decode through a bounded read buffer: the wire format is read as u64
+    // words one at a time, so an unbuffered file turns every word into a small
+    // read. The buffer is a fixed 64 KiB window; the full proof is never
+    // buffered and the budget checks above and in the visitors are unchanged.
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    read_from(&mut reader, memory_budget_bytes)
 }
 
 pub(crate) fn read_from<R: Read>(reader: &mut R, memory_budget_bytes: u64) -> Result<SharedTrace> {
