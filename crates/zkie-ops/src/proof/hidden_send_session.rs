@@ -16878,6 +16878,7 @@ mod merged_tests {
             lookup: None,
             rstd: None,
             params: None,
+            output: None,
             mask: None,
         }
     }
@@ -17159,6 +17160,7 @@ mod merged_tests {
             lookup: None,
             rstd: None,
             params: None,
+            output: None,
             mask: Some(mask_plan.clone()),
         };
         let round_widths = NormRoundWidths {

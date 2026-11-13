@@ -865,7 +865,7 @@ fn fp3_signed(value: i128) -> Result<Fp3> {
 // sumcheck and the row binding.
 
 /// Version of the integrated norm plan and first message.
-pub const NORM_BIND_VERSION: u64 = 7;
+pub const NORM_BIND_VERSION: u64 = 8;
 
 /// The relation indices the bound core supports. The map construction of
 /// every relation is fixed by the relation index; the plan may list only
@@ -1492,6 +1492,10 @@ pub struct NormPlan {
     pub rstd: Option<NormRstdPlan>,
     /// The norm gain/bias parameter tables; optional in this stage.
     pub params: Option<NormParamTablesPlan>,
+    /// The output tail groups (the broadcast rstd row, the rstd-times-gain
+    /// product, the centered-times-product image, and the output/hd rows);
+    /// optional in this stage.
+    pub output: Option<NormOutputPlan>,
     /// The committed mask group; optional in this stage.
     pub mask: Option<NormMaskPlan>,
 }
@@ -1603,6 +1607,12 @@ impl NormPlan {
                 return Err(Error::InvalidConfig);
             }
         }
+        if let Some(output) = &self.output {
+            if self.params.is_none() {
+                return Err(Error::InvalidConfig);
+            }
+            output.validate(self)?;
+        }
         if let Some(mask) = &self.mask {
             mask.validate(
                 self.shape.positions,
@@ -1667,6 +1677,13 @@ impl NormPlan {
             Some(params) => {
                 writer.put_u64(1);
                 writer.put_digest(&params.digest());
+            }
+            None => writer.put_u64(0),
+        }
+        match &self.output {
+            Some(output) => {
+                writer.put_u64(1);
+                output.encode_into(writer);
             }
             None => writer.put_u64(0),
         }
@@ -2126,6 +2143,83 @@ pub struct NormParamClaimWitness {
     pub message: Vec<Vec<Fp3>>,
     pub tails: Vec<Vec<Fp3>>,
     pub salts: Vec<Vec<u8>>,
+}
+
+/// The trusted plan of the norm output tail. The first three groups are the
+/// committed column vectors the two pointwise products chain through; the out
+/// group is the hd object the next layer consumes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormOutputPlan {
+    /// The rstd value repeated over every column of the position.
+    pub broadcast: NormGroupPlan,
+    /// The pointwise product of the broadcast row and the gain row.
+    pub product: NormGroupPlan,
+    /// The pointwise product of the centered row and the product row.
+    pub image: NormGroupPlan,
+    /// The rounded image after the output shift and the bias addition, clamped.
+    pub out: NormGroupPlan,
+    /// The output shift of the runtime rounding.
+    pub shift: u32,
+    /// The optional clamp interval of the runtime op.
+    pub clamp: Option<(i64, i64)>,
+}
+
+impl NormOutputPlan {
+    fn validate(&self, plan: &NormPlan) -> Result<()> {
+        for group in [&self.broadcast, &self.product, &self.image, &self.out] {
+            if group.columns != plan.columns
+                || group.fault(plan.shape.positions).is_some()
+                || group.shape.answers != 1
+            {
+                return Err(Error::InvalidConfig);
+            }
+        }
+        if self.shift >= 63 {
+            return Err(Error::InvalidConfig);
+        }
+        if let Some((low, high)) = self.clamp {
+            if low > high {
+                return Err(Error::InvalidConfig);
+            }
+        }
+        let mut bases = [
+            self.broadcast.oracle_base,
+            self.product.oracle_base,
+            self.image.oracle_base,
+            self.out.oracle_base,
+        ];
+        bases.sort_unstable();
+        if bases.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(Error::InvalidConfig);
+        }
+        let others = [
+            plan.x.oracle_base,
+            plan.sum.oracle_base,
+            plan.squares.oracle_base,
+            plan.mean.oracle_base,
+            plan.variance.oracle_base,
+        ];
+        if bases.iter().any(|base| others.contains(base)) {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(())
+    }
+
+    fn encode_into(&self, writer: &mut CanonicalWriter) {
+        put_norm_group(writer, &self.broadcast);
+        put_norm_group(writer, &self.product);
+        put_norm_group(writer, &self.image);
+        put_norm_group(writer, &self.out);
+        writer.put_u64(self.shift as u64);
+        match self.clamp {
+            Some((low, high)) => {
+                writer.put_u64(1);
+                writer.put_u64(low as u64);
+                writer.put_u64(high as u64);
+            }
+            None => writer.put_u64(0),
+        }
+    }
 }
 
 /// The prover-side parameter vectors and folded claim material.
@@ -4429,6 +4523,7 @@ mod tests {
             lookup: None,
             rstd: None,
             params: None,
+            output: None,
             mask: None,
         };
         let message = NormFirstMessages {
@@ -4560,6 +4655,109 @@ mod tests {
             },
             column_draws: 2,
         }
+    }
+
+    #[test]
+    fn output_tail_plan_binds_the_groups_and_the_runtime_parameters() {
+        use crate::proof::norm_param_table::{
+            NormParamKind, NormParamTableIdentity, NormParamTablesPlan,
+            NORM_PARAM_TABLE_VERSION,
+        };
+        use zkie_engine::pcs::request::code::build_code_plan;
+        use zkie_engine::pcs::request::field::Fp3;
+        use zkie_engine::pcs::request::params::LEAF_SALT_MIN_BYTES;
+        use zkie_engine::pcs::request::table::{
+            IndexReader, IndexRecord, IndexShape, TableDistances,
+        };
+
+        let (mut plan, _, _) = integrated_fixture();
+        let shape = || IndexShape {
+            code: build_code_plan(4, 7, 2).unwrap(),
+            v: 0,
+            answers: 1,
+            salt_bytes: LEAF_SALT_MIN_BYTES,
+            distances: TableDistances {
+                radius: 0,
+                later_radius: 0,
+                m_once: 0,
+                m_later: 0,
+            },
+        };
+        let reader = |root: u8, configuration: u8| IndexReader {
+            shape: shape(),
+            configuration: Digest([configuration; 32]),
+            root: Digest([root; 32]),
+            record: IndexRecord {
+                y: vec![Fp3::ZERO; 1],
+            },
+        };
+        let identity = |kind: NormParamKind, reader: IndexReader| NormParamTableIdentity {
+            version: NORM_PARAM_TABLE_VERSION,
+            kind,
+            model_identity: Digest([0x33; 32]),
+            asset_table_identity: Digest([0x34; 32]),
+            reader,
+            row: 0,
+            width: plan.columns,
+            valid_min: -128,
+            valid_max: 127,
+            trusted_i32_mapping: true,
+        };
+        plan.params = Some(NormParamTablesPlan {
+            gain: identity(NormParamKind::Gain, reader(0x32, 0x31)),
+            bias: identity(NormParamKind::Bias, reader(0x37, 0x38)),
+            column_draws: 2,
+            seed_budget: 1,
+            gain_claim: None,
+            bias_claim: None,
+        });
+        let group = |tree: u64, oracle: u64| NormGroupPlan {
+            shape: WShape::new(
+                plan.columns,
+                code(),
+                1,
+                2,
+                LEAF_SALT_MIN_BYTES,
+                tree,
+                1,
+                Digest([0x41; 32]),
+                Digest([0x51; 32]),
+            )
+            .unwrap(),
+            columns: plan.columns,
+            group: 7,
+            oracle_base: oracle,
+            openings: 1,
+        };
+        let output = NormOutputPlan {
+            broadcast: group(700, 7000),
+            product: group(701, 7100),
+            image: group(702, 7200),
+            out: group(703, 7300),
+            shift: 4,
+            clamp: Some((-5, 5)),
+        };
+        let digest = plan.digest();
+        plan.output = Some(output);
+        plan.validate().unwrap();
+        assert_ne!(plan.digest(), digest);
+
+        let mut changed = plan.clone();
+        changed.output.as_mut().unwrap().shift = 63;
+        assert!(changed.validate().is_err());
+
+        let mut changed = plan.clone();
+        changed.output.as_mut().unwrap().clamp = Some((6, 5));
+        assert!(changed.validate().is_err());
+
+        let mut changed = plan.clone();
+        changed.output.as_mut().unwrap().broadcast.columns = 2;
+        assert!(changed.validate().is_err());
+
+        let mut changed = plan.clone();
+        let base = changed.output.as_ref().unwrap().broadcast.oracle_base;
+        changed.output.as_mut().unwrap().product.oracle_base = base;
+        assert!(changed.validate().is_err());
     }
 
     #[test]
