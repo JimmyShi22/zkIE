@@ -112,6 +112,9 @@ pub struct LookupRoots {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LookupMessages {
     pub bits: CommittedValueGroup,
+    /// The flat encoding tails of the multiplicity-bit message rows:
+    /// `tails[row * r + i]`.
+    pub bits_tails: Vec<Fp3>,
     pub mask_root: Digest,
     pub mask_rows: Vec<Vec<Fp3>>,
     pub mask_tails: Vec<Vec<Fp3>>,
@@ -232,7 +235,7 @@ pub fn commit_lookup(
         plan.group,
         &[bit_values.to_vec()],
         &bits_pads,
-        &[bits_tails],
+        std::slice::from_ref(&bits_tails),
         &[bits_salts],
         1,
     )?;
@@ -257,6 +260,7 @@ pub fn commit_lookup(
         .collect::<Vec<_>>();
     let messages = LookupMessages {
         bits,
+        bits_tails,
         mask_root: Digest::ZERO,
         mask_rows,
         mask_tails,

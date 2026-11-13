@@ -1560,6 +1560,9 @@ pub struct NormPositionBinding {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormRowBinding {
     pub positions: Vec<NormPositionBinding>,
+    /// The checked lookup transcript and claims, when the plan carries the
+    /// lookup. The row builder consumes the claims on both sides.
+    pub lookup: Option<NormLookupSecond>,
 }
 
 /// The lookup commitments of the first stage: the multiplicity-bit group and

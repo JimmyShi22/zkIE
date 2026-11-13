@@ -49,12 +49,16 @@ impl TableAt for ByteTable {
         if point.len() != 8 {
             return Err(Error::ShapeMismatch);
         }
+        // The table index is little-endian: the first point coordinate is the
+        // least significant row bit, matching the leaf inner sumcheck and the
+        // equality weights. On the Boolean basis `e_j` the table therefore
+        // takes the value `2^j`.
         let mut values = (0..256u64).map(Fp3::from_u64).collect::<Vec<_>>();
         for coordinate in point {
             let half = values.len() / 2;
             for index in 0..half {
-                let low = values[index];
-                let high = values[index + half];
+                let low = values[2 * index];
+                let high = values[2 * index + 1];
                 values[index] = low.add(&coordinate.mul(&high.sub(&low)));
             }
             values.truncate(half);
@@ -290,7 +294,15 @@ impl LookupKeyPlan {
                 used = true;
             }
             if used {
-                row.add_term(member.bat_oracle, BatPart::Main, values);
+                row.add_term(
+                    member.bat_oracle,
+                    BatPart::Main,
+                    crate::proof::hidden_send_session::to_bat_table(
+                        &values,
+                        member.shape.main_rows,
+                        member.shape.code.ell,
+                    )?,
+                );
             }
         }
         for mask in &expansion.masks {
@@ -450,6 +462,10 @@ pub struct LookupOutcome {
     pub multiplicity: (Vec<Fp3>, Fp3),
     /// The `(U)` and end claims of every sumcheck, for the caller's rows.
     pub rows: Vec<GeneralOutput>,
+    /// The allocated mask slots of the shown maps, one list per output row.
+    pub end_slots: Vec<Vec<usize>>,
+    /// The allocated mask slots of the hiding entries, one list per row.
+    pub hiding_slots: Vec<Vec<usize>>,
 }
 
 fn tree_levels(values: &[Fp3], fixed: usize, variables: usize) -> Vec<Vec<Fp3>> {
@@ -514,6 +530,7 @@ struct ProverStep {
     proof: GeneralProof,
     output: GeneralOutput,
     shown: Vec<usize>,
+    hiding: Vec<usize>,
 }
 
 fn prove_step(
@@ -559,6 +576,7 @@ fn prove_step(
         proof,
         output,
         shown: shown_slots,
+        hiding: hiding_slots,
     })
 }
 
@@ -571,11 +589,11 @@ fn verify_step(
     summand: &Summand,
     table: Option<&dyn TableAt>,
     proof: &GeneralProof,
-) -> Result<(GeneralOutput, Vec<usize>)> {
+) -> Result<(GeneralOutput, Vec<usize>, Vec<usize>)> {
     let all_variables = general_variables(variables, summand)?;
     let hiding = crate::proof::psc::hp_entries(&all_variables)?;
     let shown = summand.shown();
-    let _hiding_slots = slots.take(hiding)?;
+    let hiding_slots = slots.take(hiding)?;
     let shown_slots = slots.take(shown)?;
     let output = verify_general(
         variables,
@@ -587,7 +605,7 @@ fn verify_step(
         hiding,
         challenges,
     )?;
-    Ok((output, shown_slots))
+    Ok((output, shown_slots, hiding_slots))
 }
 
 fn key_and_table_levels(
@@ -744,6 +762,8 @@ pub fn prove_lookup_with_messages(
     }
     let mut masks = ProverMasks::from_entries(mask_values);
     let mut rows_out = Vec::new();
+    let mut slots_out: Vec<Vec<usize>> = Vec::new();
+    let mut hiding_out: Vec<Vec<usize>> = Vec::new();
     let table = ByteTable;
 
     let plane_roots = &table_levels[0];
@@ -795,6 +815,8 @@ pub fn prove_lookup_with_messages(
         };
         tie_proofs.push(step.proof.clone());
         rows_out.push(step.output.clone());
+        slots_out.push(step.shown.clone());
+        hiding_out.push(step.hiding.clone());
         let mut at = 0;
         if index == 0 {
             on_root = Some(end_claim(&step.output, at, step.shown[at])?);
@@ -838,6 +860,8 @@ pub fn prove_lookup_with_messages(
             )?;
             key_proofs.push(step.proof.clone());
             rows_out.push(step.output.clone());
+            slots_out.push(step.shown.clone());
+            hiding_out.push(step.hiding.clone());
             let half0 = end_claim(&step.output, 0, step.shown[0])?;
             let half1 = end_claim(&step.output, 1, step.shown[1])?;
             key_claim = line(&mut challenges, half0, half1)?;
@@ -862,6 +886,8 @@ pub fn prove_lookup_with_messages(
         )?;
         key_proofs.push(step.proof.clone());
         rows_out.push(step.output.clone());
+        slots_out.push(step.shown.clone());
+        hiding_out.push(step.hiding.clone());
         let half0 = end_claim(&step.output, 0, step.shown[0])?;
         let half1 = end_claim(&step.output, 1, step.shown[1])?;
         key_claim = line(&mut challenges, half0, half1)?;
@@ -893,6 +919,8 @@ pub fn prove_lookup_with_messages(
         )?;
         table_proofs.push(step.proof.clone());
         rows_out.push(step.output.clone());
+        slots_out.push(step.shown.clone());
+        hiding_out.push(step.hiding.clone());
         let half0 = end_claim(&step.output, 0, step.shown[0])?;
         let half1 = end_claim(&step.output, 1, step.shown[1])?;
         table_claim = line(&mut challenges, half0, half1)?;
@@ -918,6 +946,8 @@ pub fn prove_lookup_with_messages(
         &mut leaves_inner,
     )?;
     rows_out.push(leaves_step.output.clone());
+    slots_out.push(leaves_step.shown.clone());
+    hiding_out.push(leaves_step.hiding.clone());
 
     let bit_point = {
         let mut point = Vec::with_capacity(plan.mu as usize + plan.table_log as usize);
@@ -939,6 +969,8 @@ pub fn prove_lookup_with_messages(
         &mut bits_inner,
     )?;
     rows_out.push(bits_step.output.clone());
+    slots_out.push(bits_step.shown.clone());
+    hiding_out.push(bits_step.hiding.clone());
 
     let mut coefficients = vec![Fp3::ZERO; planes * rows];
     for plane in 0..planes {
@@ -961,6 +993,8 @@ pub fn prove_lookup_with_messages(
             key,
             multiplicity,
             rows: rows_out,
+            end_slots: slots_out,
+            hiding_slots: hiding_out,
         },
     ))
 }
@@ -984,6 +1018,8 @@ pub fn verify_lookup(
     let alpha = challenges.draw()?;
     let mut slots = MaskSlots::default();
     let mut rows_out = Vec::new();
+    let mut slots_out: Vec<Vec<usize>> = Vec::new();
+    let mut hiding_out: Vec<Vec<usize>> = Vec::new();
     let table = ByteTable;
 
     if proof.tie.len() != planes - 1 {
@@ -1004,7 +1040,7 @@ pub fn verify_lookup(
             let claim = on_power.as_ref().ok_or(Error::InvalidSessionState)?;
             (claim.masks.clone(), claim.value)
         };
-        let (output, shown) = verify_step(
+        let (output, shown, hiding) = verify_step(
             &mut slots,
             &mut challenges,
             &[],
@@ -1015,6 +1051,8 @@ pub fn verify_lookup(
             &proof.tie[index],
         )?;
         rows_out.push(output.clone());
+        slots_out.push(shown.clone());
+        hiding_out.push(hiding.clone());
         let mut at = 0;
         if index == 0 {
             on_root = Some(end_claim(&output, at, shown[at])?);
@@ -1042,7 +1080,7 @@ pub fn verify_lookup(
     let mut key_claim = on_root;
     for level in 0..plan.key_bits as usize {
         let variables = equality_variables(&key_claim.point, 0)?;
-        let (output, shown) = verify_step(
+        let (output, shown, hiding) = verify_step(
             &mut slots,
             &mut challenges,
             &variables,
@@ -1053,6 +1091,8 @@ pub fn verify_lookup(
             &proof.key_levels[level],
         )?;
         rows_out.push(output.clone());
+        slots_out.push(shown.clone());
+        hiding_out.push(hiding.clone());
         let half0 = end_claim(&output, 0, shown[0])?;
         let half1 = end_claim(&output, 1, shown[1])?;
         key_claim = line(&mut challenges, half0, half1)?;
@@ -1066,7 +1106,7 @@ pub fn verify_lookup(
     let mut table_claim = on_table;
     for level in 0..plan.table_log as usize {
         let variables = equality_variables(&table_claim.point, 0)?;
-        let (output, shown) = verify_step(
+        let (output, shown, hiding) = verify_step(
             &mut slots,
             &mut challenges,
             &variables,
@@ -1077,12 +1117,14 @@ pub fn verify_lookup(
             &proof.table_levels[level],
         )?;
         rows_out.push(output.clone());
+        slots_out.push(shown.clone());
+        hiding_out.push(hiding.clone());
         let half0 = end_claim(&output, 0, shown[0])?;
         let half1 = end_claim(&output, 1, shown[1])?;
         table_claim = line(&mut challenges, half0, half1)?;
     }
     let leaves_variables = equality_variables(&table_claim.point, plan.mu as usize)?;
-    let (leaves_output, _) = verify_step(
+    let (leaves_output, leaves_shown, hiding) = verify_step(
         &mut slots,
         &mut challenges,
         &leaves_variables,
@@ -1093,6 +1135,8 @@ pub fn verify_lookup(
         &proof.leaves,
     )?;
     rows_out.push(leaves_output);
+    slots_out.push(leaves_shown);
+    hiding_out.push(hiding);
 
     let bit_point = {
         let mut point = Vec::with_capacity(plan.mu as usize + plan.table_log as usize);
@@ -1102,7 +1146,7 @@ pub fn verify_lookup(
         point
     };
     let bit_variables = equality_variables(&bit_point, 0)?;
-    let (bits_output, shown) = verify_step(
+    let (bits_output, shown, hiding) = verify_step(
         &mut slots,
         &mut challenges,
         &bit_variables,
@@ -1113,7 +1157,8 @@ pub fn verify_lookup(
         &proof.bits,
     )?;
     rows_out.push(bits_output);
-    let _ = shown;
+    slots_out.push(shown);
+    hiding_out.push(hiding);
 
     let mut coefficients = vec![Fp3::ZERO; planes * table_rows];
     for plane in 0..planes {
@@ -1131,6 +1176,8 @@ pub fn verify_lookup(
         key,
         multiplicity,
         rows: rows_out,
+        end_slots: slots_out,
+        hiding_slots: hiding_out,
     })
 }
 
@@ -1529,6 +1576,8 @@ impl LookupOutcome {
         let keys = plan.key_count()?;
         let count = mask_count(plan)?;
         if self.rows.len() != outcome_rows(plan)?
+            || self.end_slots.len() != self.rows.len()
+            || self.hiding_slots.len() != self.rows.len()
             || self.key.point.len() != plan.key_bits as usize
             || self.multiplicity.0.len() != planes * rows
             || self.multiplicity.1 != Fp3::from_u64(keys as u64)
@@ -1562,6 +1611,14 @@ impl LookupOutcome {
                     return Err(Error::ShapeMismatch);
                 }
             }
+            let slots = self.end_slots.get(index).ok_or(Error::ShapeMismatch)?;
+            if slots.len() != ends || slots.iter().any(|slot| *slot >= count) {
+                return Err(Error::ShapeMismatch);
+            }
+            let hiding = self.hiding_slots.get(index).ok_or(Error::ShapeMismatch)?;
+            if hiding.len() > count || hiding.iter().any(|slot| *slot >= count) {
+                return Err(Error::ShapeMismatch);
+            }
         }
         Ok(())
     }
@@ -1585,6 +1642,15 @@ impl LookupOutcome {
         writer.put_u64(self.rows.len() as u64);
         for output in &self.rows {
             put_general_output(&mut writer, output);
+        }
+        for slots in [&self.end_slots, &self.hiding_slots] {
+            writer.put_u64(slots.len() as u64);
+            for list in slots {
+                writer.put_u64(list.len() as u64);
+                for slot in list {
+                    writer.put_u64(*slot as u64);
+                }
+            }
         }
         writer.into_bytes()
     }
@@ -1621,11 +1687,38 @@ impl LookupOutcome {
         for _ in 0..row_count {
             outputs.push(get_general_output(&mut reader, max_point, count)?);
         }
+        let mut slot_groups = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let group_count =
+                usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+            if group_count != row_count {
+                return Err(Error::ShapeMismatch);
+            }
+            let mut lists = Vec::with_capacity(group_count);
+            for _ in 0..group_count {
+                let slot_count =
+                    usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+                if slot_count > count {
+                    return Err(Error::ShapeMismatch);
+                }
+                let mut list = Vec::with_capacity(slot_count);
+                for _ in 0..slot_count {
+                    list.push(
+                        usize::try_from(reader.get_u64()?)
+                            .map_err(|_| Error::ResourceLimit)?,
+                    );
+                }
+                lists.push(list);
+            }
+            slot_groups.push(lists);
+        }
         reader.finish()?;
         let outcome = Self {
             key,
             multiplicity: (coefficients, total),
             rows: outputs,
+            end_slots: slot_groups.remove(0),
+            hiding_slots: slot_groups.remove(0),
         };
         outcome.check(plan)?;
         Ok(outcome)
@@ -1798,6 +1891,132 @@ mod tests {
         assert_eq!(proven, verified);
         assert_eq!(proven.multiplicity.0.len(), plan.planes().unwrap() * 256);
         assert_eq!(proven.multiplicity.1, Fp3::from_u64(4));
+    }
+
+    #[test]
+    fn leaves_kept_row_matches_the_committed_bits() {
+        let plan = plan();
+        let keys = [0u64, 0, 1, 2];
+        let witness = witness(&keys, &plan);
+        let commit = commit_plan();
+        let (messages, _proof, outcome) = prove_lookup(
+            &plan,
+            &commit,
+            &key_plan(&keys),
+            &key_rows(&keys),
+            &witness,
+            21,
+        )
+        .unwrap();
+        let planes = plan.planes().unwrap();
+        let leaf_index = (planes - 1) + plan.key_bits as usize + plan.table_log as usize;
+        let leaf = &outcome.rows[leaf_index];
+        assert_eq!(leaf.row_maps.len(), 1);
+        let (map, map_coefficient) = leaf.row_maps[0];
+        assert_eq!(map, 0);
+        let eq = eq_weights(&leaf.point);
+        let mut kept = Fp3::ZERO;
+        for (weight, bit) in eq.iter().zip(&witness.bits) {
+            kept = kept.add(&weight.mul(bit));
+        }
+        let mut lhs = Fp3::ZERO;
+        for (slot, coefficient) in outcome.hiding_slots[leaf_index]
+            .iter()
+            .zip(&leaf.hiding_form)
+        {
+            lhs = lhs.add(
+                &coefficient.mul(&messages.mask_entry(&commit, *slot).unwrap()),
+            );
+        }
+        for term in &leaf.claim_masks {
+            lhs = lhs.add(
+                &term
+                    .coefficient
+                    .mul(&messages.mask_entry(&commit, term.slot).unwrap()),
+            );
+        }
+        lhs = lhs.add(&map_coefficient.mul(&kept));
+        assert_eq!(lhs, leaf.row_target, "the kept-map (U) row does not hold");
+
+        // A changed multiplicity bit breaks the row.
+        let mut flipped = witness.bits.clone();
+        let at = flipped
+            .iter()
+            .position(|bit| *bit == Fp3::ONE)
+            .expect("the fixture has a nonzero bit");
+        flipped[at] = Fp3::ZERO;
+        let mut changed_kept = Fp3::ZERO;
+        for (weight, bit) in eq.iter().zip(&flipped) {
+            changed_kept = changed_kept.add(&weight.mul(bit));
+        }
+        assert_ne!(lhs.add(&map_coefficient.mul(&kept.sub(&changed_kept))), leaf.row_target);
+
+        // A changed mask entry breaks the row.
+        let mut changed_messages = messages.clone();
+        let slot = outcome.hiding_slots[leaf_index][0];
+        let ell = usize::try_from(commit.mask_code.ell).unwrap();
+        changed_messages.mask_rows[slot / ell][slot % ell] =
+            changed_messages.mask_rows[slot / ell][slot % ell].add(&Fp3::ONE);
+        let mut changed_lhs = Fp3::ZERO;
+        for (slot, coefficient) in outcome.hiding_slots[leaf_index]
+            .iter()
+            .zip(&leaf.hiding_form)
+        {
+            changed_lhs = changed_lhs.add(
+                &coefficient.mul(&changed_messages.mask_entry(&commit, *slot).unwrap()),
+            );
+        }
+        for term in &leaf.claim_masks {
+            changed_lhs = changed_lhs.add(
+                &term
+                    .coefficient
+                    .mul(&changed_messages.mask_entry(&commit, term.slot).unwrap()),
+            );
+        }
+        changed_lhs = changed_lhs.add(&map_coefficient.mul(&kept));
+        assert_ne!(changed_lhs, leaf.row_target);
+    }
+
+    #[test]
+    fn byte_table_uses_the_sumcheck_index_order() {
+        let table = ByteTable;
+        for bit in 0..8usize {
+            let mut point = vec![Fp3::ZERO; 8];
+            point[bit] = Fp3::ONE;
+            assert_eq!(
+                table.at(&point).unwrap(),
+                Fp3::from_u64(1u64 << bit),
+                "the Boolean basis value is not the row index"
+            );
+        }
+        let point = [
+            Fp3::from_u64(3),
+            Fp3::from_u64(5),
+            Fp3::from_u64(7),
+            Fp3::from_u64(9),
+            Fp3::from_u64(11),
+            Fp3::from_u64(13),
+            Fp3::from_u64(15),
+            Fp3::from_u64(17),
+        ];
+        let eq = eq_weights(&point);
+        let mut direct = Fp3::ZERO;
+        for (weight, row) in eq.iter().zip(0..256u64) {
+            direct = direct.add(&weight.mul(&Fp3::from_u64(row)));
+        }
+        assert_eq!(table.at(&point).unwrap(), direct);
+        let mut msb = (0..256u64).map(Fp3::from_u64).collect::<Vec<_>>();
+        for coordinate in &point {
+            let half = msb.len() / 2;
+            for index in 0..half {
+                let low = msb[index];
+                let high = msb[index + half];
+                msb[index] = low.add(&coordinate.mul(&high.sub(&low)));
+            }
+            msb.truncate(half);
+        }
+        assert_ne!(msb[0], direct, "the reversed table order must not agree");
+        assert!(table.at(&point[..7]).is_err());
     }
 
     #[test]

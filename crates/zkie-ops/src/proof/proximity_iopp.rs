@@ -151,6 +151,9 @@ pub fn proximity_bound_ids(
             .and_then(|value| {
                 value.checked_add(if norm.mask.is_some() { 1 } else { 0 })
             })
+            .and_then(|value| {
+                value.checked_add(if norm.lookup.is_some() { 2 } else { 0 })
+            })
             .ok_or(Error::ResourceLimit)?;
         own_member_bound = own_member_bound
             .checked_add(norm_members)
@@ -190,6 +193,10 @@ pub fn proximity_bound_ids(
         if let Some(mask) = &norm.mask {
             oracles.push(mask.oracle);
         }
+        if let Some(lookup) = &norm.lookup {
+            oracles.push(lookup.commit.bits_oracle);
+            oracles.push(lookup.commit.mask_oracle);
+        }
     }
 
     let mut trees = vec![
@@ -226,6 +233,10 @@ pub fn proximity_bound_ids(
         }
         if let Some(mask) = &norm.mask {
             trees.push(mask.tree.tree_number);
+        }
+        if let Some(lookup) = &norm.lookup {
+            trees.push(lookup.commit.bits_shape.tree_number);
+            trees.push(lookup.commit.mask_tree.tree_number);
         }
     }
     Ok(IoppBoundIds::new(oracles, trees))
