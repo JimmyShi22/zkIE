@@ -23085,6 +23085,150 @@ mod merged_tests {
         );
     }
 
+    fn recommit_tail_from_rows(
+        plan: &HiddenLinPlan,
+        witness: &mut NormWitness,
+    ) -> Result<()> {
+        let tail_plan = plan
+            .norm
+            .as_ref()
+            .ok_or(Error::InvalidConfig)?
+            .output
+            .as_ref()
+            .ok_or(Error::InvalidConfig)?
+            .tail
+            .as_ref()
+            .ok_or(Error::InvalidConfig)?
+            .clone();
+        let rows = &witness
+            .output
+            .as_ref()
+            .ok_or(Error::ShapeMismatch)?
+            .rows;
+        let values = rows
+            .iter()
+            .map(|row| tail_plan.values(row, COLUMNS))
+            .collect::<Result<Vec<_>>>()?;
+        let mut coins = ByteMaskCoins::new(Digest([0x98; 32]))?;
+        let tail = commit_norm_group(&tail_plan.group, &values, &mut coins);
+        witness
+            .output
+            .as_mut()
+            .ok_or(Error::ShapeMismatch)?
+            .tail
+            .as_mut()
+            .ok_or(Error::ShapeMismatch)?
+            .committed = tail;
+        Ok(())
+    }
+
+    #[test]
+    fn norm_tail_padding_partition_tampering_is_rejected() {
+        let activation = activation();
+        let (mut plan, witness, mut params) = slack_lookup_fixture(&activation);
+        {
+            let norm = plan.norm.as_mut().unwrap();
+            assert!(u64::from(norm.shape.valid) < norm.columns);
+            norm.shape.valid -= 1;
+        }
+        let proved = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table(),
+            Digest([0x71; 32]),
+            &witness,
+            &mut params,
+        );
+        assert!(
+            proved.is_err(),
+            "a valid/padding partition that leaves a padded column inside the valid set must not prove"
+        );
+    }
+
+    #[test]
+    fn norm_tail_padding_out_tampering_is_rejected() {
+        let activation = activation();
+        let (mut plan, mut witness, mut params) = slack_lookup_fixture(&activation);
+        let output_plan = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .clone();
+        let valid = plan.norm.as_ref().unwrap().shape.valid as usize;
+        {
+            let row = &mut witness.output.as_mut().unwrap().rows[0];
+            row.out[valid] += 1;
+        }
+        let signed = |values: Vec<i128>| -> Vec<Fp3> {
+            values
+                .into_iter()
+                .map(|value| crate::proof::output_closure::fp3_signed(value).unwrap())
+                .collect()
+        };
+        let rows = &witness.output.as_ref().unwrap().rows;
+        let out_values = rows
+            .iter()
+            .map(|row| signed(row.out.iter().map(|value| *value as i128).collect()))
+            .collect::<Vec<_>>();
+        let mut coins = ByteMaskCoins::new(Digest([0x99; 32])).unwrap();
+        witness.output.as_mut().unwrap().out =
+            commit_norm_group(&output_plan.out, &out_values, &mut coins);
+        attach_slack_lookup(&mut plan, &mut witness);
+        let proved = prove_and_verify_with_slack(&activation, &plan, &witness, &mut params);
+        assert!(
+            proved.is_err(),
+            "a padded column whose output differs from clamp(bias) must not prove and verify"
+        );
+    }
+
+    #[test]
+    fn norm_tail_padding_pre_tampering_is_rejected() {
+        let activation = activation();
+        let (mut plan, mut witness, mut params) = slack_lookup_fixture(&activation);
+        let valid = plan.norm.as_ref().unwrap().shape.valid as usize;
+        {
+            let row = &mut witness.output.as_mut().unwrap().rows[0];
+            row.pre_clamp[valid] += 1;
+        }
+        recommit_tail_from_rows(&plan, &mut witness).unwrap();
+        attach_slack_lookup(&mut plan, &mut witness);
+        let proved = prove_and_verify_with_slack(&activation, &plan, &witness, &mut params);
+        assert!(
+            proved.is_err(),
+            "a padded column whose pre-clamp value differs from the committed bias must not prove and verify"
+        );
+    }
+
+    #[test]
+    fn norm_tail_padding_claim_swap_is_rejected() {
+        let activation = activation();
+        let (mut plan, _, _) = slack_lookup_fixture(&activation);
+        let gain = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .params
+            .as_ref()
+            .unwrap()
+            .gain_claim
+            .clone()
+            .unwrap();
+        plan.norm
+            .as_mut()
+            .unwrap()
+            .params
+            .as_mut()
+            .unwrap()
+            .bias_claim = Some(gain);
+        assert!(
+            plan.validate().is_err(),
+            "a bias claim that points at the gain table row must be rejected"
+        );
+    }
+
     #[test]
     fn norm_output_groups_prove_and_verify() {
         let activation = activation();
