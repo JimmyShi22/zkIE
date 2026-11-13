@@ -18629,7 +18629,7 @@ mod merged_tests {
             oracle: 9500,
             group: GROUP,
             mask_code: mask_code(),
-            mask_rows: 32,
+            mask_rows: 64,
             answers: 1,
             openings: 1,
             tree: RuntimeTreePlan {
@@ -18639,7 +18639,7 @@ mod merged_tests {
                 log_n_zk: CODE_LOG_N,
                 parts: vec![RuntimeTreePart {
                     main_symbols: 0,
-                    mask_symbols: 96,
+                    mask_symbols: 192,
                 }],
                 salt_bytes: SALT,
                 run: W_RUN,
@@ -22480,7 +22480,7 @@ mod merged_tests {
         // popped proof, a popped point value or a missing section is rejected.
         assert_eq!(
             base.second.norm.as_ref().unwrap().tail.as_ref().unwrap().psc.len(),
-            POSITIONS as usize * 7
+            POSITIONS as usize * crate::proof::hidden_norm_psc::NORM_OUTPUT_TAIL_RELATIONS
         );
         let mut changed = base.clone();
         changed

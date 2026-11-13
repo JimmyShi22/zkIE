@@ -3056,11 +3056,12 @@ impl NormOutputTailPlan {
 }
 
 /// The number of product slots one column uses in the tail relation packing.
-pub const NORM_OUTPUT_TAIL_PAIRS: usize = 16;
+pub const NORM_OUTPUT_TAIL_PAIRS: usize = 32;
 /// The number of tail relations: rounding reconstruction, shifted value,
 /// selector booleanity, doubled remainder, tie slack, clamp value, selector
-/// exclusivity.
-pub const NORM_OUTPUT_TAIL_RELATIONS: usize = 7;
+/// exclusivity, and the four sign-consistency relations of the clamp
+/// selectors.
+pub const NORM_OUTPUT_TAIL_RELATIONS: usize = 11;
 
 /// The product-sumcheck variable count of the tail relations.
 pub fn output_tail_variables(columns: u64) -> Result<usize> {
@@ -3312,6 +3313,75 @@ pub fn output_rel_terms(
                         left: slot(base + low_selector),
                         right: slot(base + low_selector + 1),
                     });
+                }
+            }
+            7..=10 => {
+                let Some(clamp_widths) = plan.clamp.as_ref() else {
+                    continue;
+                };
+                let pre_at = sh_at + plan.widths.shifted;
+                let low_at = pre_at + plan.widths.pre_clamp;
+                let high_at = low_at + clamp_widths.low;
+                let low_selector = high_at + clamp_widths.high;
+                let high_selector = low_selector + 1;
+                let low_strict_at = low_selector + 2;
+                let low_nonstrict_at = low_strict_at + clamp_widths.low_strict;
+                let high_strict_at = low_nonstrict_at + clamp_widths.low_nonstrict;
+                let high_nonstrict_at = high_strict_at + clamp_widths.high_strict;
+                let low_half = 1u128 << (8 * clamp_widths.low as u32 - 1);
+                let high_half = 1u128 << (8 * clamp_widths.high as u32 - 1);
+                let sel = |index: usize| slot(base + index);
+                let digit_at = |offset: usize, digit: usize| TailFactor::Slot {
+                    index: base + offset + digit,
+                    scale: times(1, digit).unwrap_or(Fp3::ZERO),
+                };
+                match relation {
+                    7 => {
+                        // s_lo * (u + 1 + alpha_lo) = 0, u = sum low digits - half_l
+                        for digit in 0..clamp_widths.low {
+                            terms.push(TailTerm { column, left: sel(low_selector), right: digit_at(low_at, digit) });
+                        }
+                        terms.push(TailTerm { column, left: sel(low_selector), right: TailFactor::Constant(neg(field(low_half)?)) });
+                        terms.push(TailTerm { column, left: sel(low_selector), right: TailFactor::Constant(Fp3::ONE) });
+                        for digit in 0..clamp_widths.low_strict {
+                            terms.push(TailTerm { column, left: sel(low_selector), right: digit_at(low_strict_at, digit) });
+                        }
+                    }
+                    8 => {
+                        // (1 - s_lo) * (u - beta_lo) = 0
+                        for digit in 0..clamp_widths.low {
+                            terms.push(TailTerm { column, left: slot(base + low_at + digit), right: TailFactor::Constant(times(1, digit)?) });
+                            terms.push(TailTerm { column, left: sel(low_selector), right: TailFactor::Slot { index: base + low_at + digit, scale: neg(times(1, digit)?) } });
+                        }
+                        for digit in 0..clamp_widths.low_nonstrict {
+                            terms.push(TailTerm { column, left: slot(base + low_nonstrict_at + digit), right: TailFactor::Constant(neg(times(1, digit)?)) });
+                            terms.push(TailTerm { column, left: sel(low_selector), right: digit_at(low_nonstrict_at, digit) });
+                        }
+                        terms.push(TailTerm { column, left: TailFactor::Constant(neg(field(low_half)?)), right: TailFactor::Constant(Fp3::ONE) });
+                    }
+                    9 => {
+                        // s_hi * (v - 1 - alpha_hi) = 0, v = sum high digits - half_h
+                        for digit in 0..clamp_widths.high {
+                            terms.push(TailTerm { column, left: sel(high_selector), right: digit_at(high_at, digit) });
+                        }
+                        terms.push(TailTerm { column, left: sel(high_selector), right: TailFactor::Constant(neg(field(high_half)?)) });
+                        terms.push(TailTerm { column, left: sel(high_selector), right: TailFactor::Constant(neg(Fp3::ONE)) });
+                        for digit in 0..clamp_widths.high_strict {
+                            terms.push(TailTerm { column, left: sel(high_selector), right: TailFactor::Slot { index: base + high_strict_at + digit, scale: neg(times(1, digit)?) } });
+                        }
+                    }
+                    _ => {
+                        // (1 - s_hi) * (v + beta_hi) = 0
+                        for digit in 0..clamp_widths.high {
+                            terms.push(TailTerm { column, left: slot(base + high_at + digit), right: TailFactor::Constant(times(1, digit)?) });
+                            terms.push(TailTerm { column, left: sel(high_selector), right: TailFactor::Slot { index: base + high_at + digit, scale: neg(times(1, digit)?) } });
+                        }
+                        for digit in 0..clamp_widths.high_nonstrict {
+                            terms.push(TailTerm { column, left: slot(base + high_nonstrict_at + digit), right: TailFactor::Constant(times(1, digit)?) });
+                            terms.push(TailTerm { column, left: sel(high_selector), right: TailFactor::Slot { index: base + high_nonstrict_at + digit, scale: neg(times(1, digit)?) } });
+                        }
+                        terms.push(TailTerm { column, left: TailFactor::Constant(neg(field(high_half)?)), right: TailFactor::Constant(Fp3::ONE) });
+                    }
                 }
             }
             _ => return Err(Error::UnsupportedPrimitive),
@@ -6412,7 +6482,7 @@ mod tests {
             let (left, right) = output_rel_map(&tail_plan, &changed, columns, 3, 0).unwrap();
             assert_ne!(inner(&left, &right), Fp3::ZERO);
         }
-        assert_eq!(output_tail_variables(columns).unwrap(), 6);
+        assert_eq!(output_tail_variables(columns).unwrap(), 7);
         let row = {
             let core = NormCoreRow::from_values(&[1, 2], 2).unwrap();
             NormOutputRow::from_core(&core, &[1, 2, 0, 0], 100, &weight, &bias, 2, 3, None)
