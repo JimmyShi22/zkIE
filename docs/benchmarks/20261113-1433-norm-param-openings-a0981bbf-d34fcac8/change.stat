@@ -1,0 +1,21 @@
+commit a0981bbf665ace31919bbc035bbcc1cf42d3d165
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Fri Nov 13 14:33:43 2026 +0800
+
+    Draw and verify the norm parameter table openings in the first stage
+    
+    The first norm stage now draws the parameter table column positions from the
+    chain after the table identity is fixed, opens them through the prover-side
+    parameter table handle, and the verifier redraws the same positions, compares
+    them with the message and verifies the openings against the plan's committed
+    readers. A separate bias table draws its own positions; a packed table reuses
+    the gain openings. The witness parameter vectors are length checked against the
+    column domain. The fixture builds two small encoded tables from bounded row
+    sources and commits them once; a positive chain and four negatives (changed
+    position, changed symbol, missing bias openings, changed reader) pass through
+    the real verifier.
+    
+    partial progress
+
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 377 ++++++++++++++++++++++-
+ 1 file changed, 368 insertions(+), 9 deletions(-)
