@@ -40,6 +40,7 @@ use crate::proof::lookup::{
 };
 use crate::proof::lookup_messages::LookupCommitPlan;
 use crate::proof::output_closure::{CommittedValueGroup, RetainedTrees};
+use crate::registry::{RSQRT_COARSE_END, RSQRT_HALF};
 use crate::proof::psc::{
     hp_entries, prove_dot_sumcheck, psc_variables, verify_psc_transcript, DotClaim,
     DotMaskEntries, DotOutput, DotProof, SHOWN_MAPS,
@@ -2008,6 +2009,13 @@ impl NormFirstMessages {
     }
 }
 
+/// The fixed byte widths of the rsqrt witness blocks.
+pub const RSQRT_RAW_REMAINDER_WIDTH: usize = 3;
+pub const RSQRT_FINE_SLACK_WIDTH: usize = 3;
+pub const RSQRT_MID_HIGH_WIDTH: usize = 4;
+pub const RSQRT_INDEX_WIDTH: usize = 4;
+pub const RSQRT_INDEX_SLACK_WIDTH: usize = 4;
+
 /// The fixed byte widths of the rounding witness rows.
 ///
 /// The widths are plan values. The offset width bounds both `u = r - lo` and
@@ -2041,6 +2049,22 @@ impl NormRoundWidths {
         None
     }
 
+    /// The byte width of the rsqrt raw index digits, derived from the
+    /// variance width and capped so the rounding product stays below `p/2`.
+    pub fn raw(&self) -> usize {
+        self.variance.saturating_sub(2).clamp(1, 5)
+    }
+
+    /// The byte width of the middle-segment quotient digits.
+    pub fn mid_q(&self) -> usize {
+        self.raw().saturating_sub(1).max(1)
+    }
+
+    /// The byte width of the coarse-segment quotient digits.
+    pub fn coarse_q(&self) -> usize {
+        self.raw().saturating_sub(2).max(1)
+    }
+
     pub fn slots(&self) -> Result<usize> {
         self.offset
             .checked_mul(4)
@@ -2049,6 +2073,20 @@ impl NormRoundWidths {
             .and_then(|value| value.checked_add(self.variance))
             .and_then(|value| value.checked_add(self.mean))
             .and_then(|value| value.checked_add(NormRoundLayout::FIXED_SLOTS))
+            .and_then(|value| value.checked_add(self.raw()))
+            .and_then(|value| value.checked_add(RSQRT_RAW_REMAINDER_WIDTH))
+            .and_then(|value| value.checked_add(RSQRT_RAW_REMAINDER_WIDTH))
+            .and_then(|value| value.checked_add(3))
+            .and_then(|value| value.checked_add(RSQRT_FINE_SLACK_WIDTH))
+            .and_then(|value| value.checked_add(self.mid_q()))
+            .and_then(|value| value.checked_add(1))
+            .and_then(|value| value.checked_add(RSQRT_MID_HIGH_WIDTH))
+            .and_then(|value| value.checked_add(self.coarse_q()))
+            .and_then(|value| value.checked_add(2))
+            .and_then(|value| value.checked_add(1))
+            .and_then(|value| value.checked_add(RSQRT_INDEX_WIDTH))
+            .and_then(|value| value.checked_add(RSQRT_INDEX_SLACK_WIDTH))
+            .and_then(|value| value.checked_add(1))
             .ok_or(Error::ResourceLimit)
     }
 
@@ -2097,6 +2135,22 @@ pub struct NormRoundSlots {
     pub mean_complement_digits: usize,
     pub variance_offset_digits: usize,
     pub variance_complement_digits: usize,
+    pub raw_digits: usize,
+    pub raw_remainder: usize,
+    pub raw_remainder_slack: usize,
+    pub fine_selector: usize,
+    pub mid_selector: usize,
+    pub coarse_selector: usize,
+    pub fine_slack: usize,
+    pub mid_q_digits: usize,
+    pub mid_r: usize,
+    pub mid_high_slack: usize,
+    pub coarse_q_digits: usize,
+    pub coarse_r: usize,
+    pub index_value: usize,
+    pub index_digits: usize,
+    pub index_slack: usize,
+    pub rstd: usize,
     pub total: usize,
 }
 
@@ -2178,6 +2232,54 @@ impl NormRoundLayout {
         next = next
             .checked_add(widths.offset)
             .ok_or(Error::ResourceLimit)?;
+        let raw_digits = next;
+        next = next.checked_add(widths.raw()).ok_or(Error::ResourceLimit)?;
+        let raw_remainder = next;
+        next = next
+            .checked_add(RSQRT_RAW_REMAINDER_WIDTH)
+            .ok_or(Error::ResourceLimit)?;
+        let raw_remainder_slack = next;
+        next = next
+            .checked_add(RSQRT_RAW_REMAINDER_WIDTH)
+            .ok_or(Error::ResourceLimit)?;
+        let fine_selector = next;
+        next = next.checked_add(1).ok_or(Error::ResourceLimit)?;
+        let mid_selector = next;
+        next = next.checked_add(1).ok_or(Error::ResourceLimit)?;
+        let coarse_selector = next;
+        next = next.checked_add(1).ok_or(Error::ResourceLimit)?;
+        let fine_slack = next;
+        next = next
+            .checked_add(RSQRT_FINE_SLACK_WIDTH)
+            .ok_or(Error::ResourceLimit)?;
+        let mid_q_digits = next;
+        next = next
+            .checked_add(widths.mid_q())
+            .ok_or(Error::ResourceLimit)?;
+        let mid_r = next;
+        next = next.checked_add(1).ok_or(Error::ResourceLimit)?;
+        let mid_high_slack = next;
+        next = next
+            .checked_add(RSQRT_MID_HIGH_WIDTH)
+            .ok_or(Error::ResourceLimit)?;
+        let coarse_q_digits = next;
+        next = next
+            .checked_add(widths.coarse_q())
+            .ok_or(Error::ResourceLimit)?;
+        let coarse_r = next;
+        next = next.checked_add(2).ok_or(Error::ResourceLimit)?;
+        let index_value = next;
+        next = next.checked_add(1).ok_or(Error::ResourceLimit)?;
+        let index_digits = next;
+        next = next
+            .checked_add(RSQRT_INDEX_WIDTH)
+            .ok_or(Error::ResourceLimit)?;
+        let index_slack = next;
+        next = next
+            .checked_add(RSQRT_INDEX_SLACK_WIDTH)
+            .ok_or(Error::ResourceLimit)?;
+        let rstd = next;
+        next = next.checked_add(1).ok_or(Error::ResourceLimit)?;
         if next != widths.slots()? {
             return Err(Error::InvalidConfig);
         }
@@ -2200,6 +2302,22 @@ impl NormRoundLayout {
                 mean_complement_digits,
                 variance_offset_digits,
                 variance_complement_digits,
+                raw_digits,
+                raw_remainder,
+                raw_remainder_slack,
+                fine_selector,
+                mid_selector,
+                coarse_selector,
+                fine_slack,
+                mid_q_digits,
+                mid_r,
+                mid_high_slack,
+                coarse_q_digits,
+                coarse_r,
+                index_value,
+                index_digits,
+                index_slack,
+                rstd,
                 total: next,
             },
         })
@@ -2219,6 +2337,17 @@ impl NormRoundLayout {
             (self.slots.mean_complement_digits, self.widths.offset),
             (self.slots.variance_offset_digits, self.widths.offset),
             (self.slots.variance_complement_digits, self.widths.offset),
+            (self.slots.raw_digits, self.widths.raw()),
+            (self.slots.raw_remainder, RSQRT_RAW_REMAINDER_WIDTH),
+            (self.slots.raw_remainder_slack, RSQRT_RAW_REMAINDER_WIDTH),
+            (self.slots.fine_slack, RSQRT_FINE_SLACK_WIDTH),
+            (self.slots.mid_q_digits, self.widths.mid_q()),
+            (self.slots.mid_r, 1),
+            (self.slots.mid_high_slack, RSQRT_MID_HIGH_WIDTH),
+            (self.slots.coarse_q_digits, self.widths.coarse_q()),
+            (self.slots.coarse_r, 2),
+            (self.slots.index_digits, RSQRT_INDEX_WIDTH),
+            (self.slots.index_slack, RSQRT_INDEX_SLACK_WIDTH),
         ];
         let mut slots = Vec::new();
         for (start, width) in ranges {
@@ -2285,6 +2414,70 @@ impl NormRoundLayout {
         )?;
         Ok(values)
     }
+
+    /// Writes the rsqrt witness slots on top of the rounding core row. The
+    /// slot widths are fixed by the plan; a value that does not fit fails
+    /// closed.
+    pub fn values_with_rsqrt(
+        &self,
+        core: &NormCoreRow,
+        rsqrt: &crate::proof::hidden_norm::RsqrtRow,
+        columns: u64,
+    ) -> Result<Vec<Fp3>> {
+        let mut values = self.values(core, columns)?;
+        write_digits(
+            &mut values[self.slots.raw_digits..self.slots.raw_digits + self.widths.raw()],
+            &rsqrt.raw_digits,
+        )?;
+        write_digits(
+            &mut values[self.slots.raw_remainder
+                ..self.slots.raw_remainder + RSQRT_RAW_REMAINDER_WIDTH],
+            &rsqrt.raw_remainder_digits,
+        )?;
+        write_digits(
+            &mut values[self.slots.raw_remainder_slack
+                ..self.slots.raw_remainder_slack + RSQRT_RAW_REMAINDER_WIDTH],
+            &rsqrt.raw_remainder_slack_digits,
+        )?;
+        values[self.slots.fine_selector] = Fp3::from_u64(rsqrt.fine as u64);
+        values[self.slots.mid_selector] = Fp3::from_u64(rsqrt.mid as u64);
+        values[self.slots.coarse_selector] = Fp3::from_u64(rsqrt.coarse as u64);
+        write_digits(
+            &mut values[self.slots.fine_slack..self.slots.fine_slack + RSQRT_FINE_SLACK_WIDTH],
+            &rsqrt.fine_slack_digits,
+        )?;
+        write_digits(
+            &mut values[self.slots.mid_q_digits..self.slots.mid_q_digits + self.widths.mid_q()],
+            &rsqrt.mid_q_digits,
+        )?;
+        values[self.slots.mid_r] = Fp3::from_u64(rsqrt.mid_r as u64);
+        write_digits(
+            &mut values[self.slots.mid_high_slack
+                ..self.slots.mid_high_slack + RSQRT_MID_HIGH_WIDTH],
+            &rsqrt.mid_high_slack_digits,
+        )?;
+        write_digits(
+            &mut values
+                [self.slots.coarse_q_digits..self.slots.coarse_q_digits + self.widths.coarse_q()],
+            &rsqrt.coarse_q_digits,
+        )?;
+        values[self.slots.coarse_r] = Fp3::from_u64((rsqrt.coarse_r & 0xff) as u64);
+        values[self.slots.coarse_r + 1] =
+            Fp3::from_u64(((rsqrt.coarse_r >> 8) & 0xffff) as u64);
+        values[self.slots.index_value] = fp3_signed(rsqrt.index as i128)?;
+        write_digits(
+            &mut values[self.slots.index_digits
+                ..self.slots.index_digits + RSQRT_INDEX_WIDTH],
+            &rsqrt.index_digits,
+        )?;
+        write_digits(
+            &mut values[self.slots.index_slack
+                ..self.slots.index_slack + RSQRT_INDEX_SLACK_WIDTH],
+            &rsqrt.index_slack_digits,
+        )?;
+        values[self.slots.rstd] = fp3_signed(rsqrt.rstd as i128)?;
+        Ok(values)
+    }
 }
 
 fn shifted_digits(value: i128, offset: u64) -> Result<Vec<u8>> {
@@ -2328,6 +2521,7 @@ pub struct NormNoWrap {
     pub reconstruction: u128,
     pub offsets: u128,
     pub remainder: u128,
+    pub rsqrt: u128,
 }
 
 pub fn norm_no_wrap(
@@ -2392,6 +2586,21 @@ pub fn norm_no_wrap(
         .and_then(|value| value.checked_add(d))
         .ok_or(Error::ResourceLimit)?;
     let remainder = d.checked_mul(3).ok_or(Error::ResourceLimit)?;
+    let raw_bound = digit_capacity(widths.variance)?
+        .checked_div(1u128 << 18)
+        .and_then(|value| value.checked_add(1))
+        .ok_or(Error::ResourceLimit)?;
+    let rounding = digit_capacity(widths.variance)?
+        .checked_add(RSQRT_HALF as u128)
+        .and_then(|value| value.checked_add((1u128 << 18).checked_mul(raw_bound)?))
+        .and_then(|value| value.checked_add(1u128 << 18))
+        .ok_or(Error::ResourceLimit)?;
+    let segment = raw_bound
+        .checked_add(RSQRT_COARSE_END as u128)
+        .and_then(|value| value.checked_add(1u128 << 32))
+        .and_then(|value| value.checked_add(1u128 << 32))
+        .ok_or(Error::ResourceLimit)?;
+    let rsqrt = rounding.max(segment);
     let half = (MODULUS as u128) / 2;
     if relation_sum >= half
         || relation_squares >= half
@@ -2400,6 +2609,7 @@ pub fn norm_no_wrap(
         || reconstruction >= half
         || offsets >= half
         || remainder >= half
+        || rsqrt >= half
     {
         return Err(Error::InvalidConfig);
     }
@@ -2411,6 +2621,7 @@ pub fn norm_no_wrap(
         reconstruction,
         offsets,
         remainder,
+        rsqrt,
     })
 }
 
@@ -2571,11 +2782,11 @@ mod tests {
     fn round_layout_fixes_the_slot_map_and_pads_digits() {
         let widths = real_widths();
         let layout = NormRoundLayout::new(widths, 768, SUM_OFFSET, MEAN_OFFSET).unwrap();
-        assert_eq!(layout.slots.total, 35);
-        assert_eq!(widths.columns().unwrap(), 64);
+        assert_eq!(layout.slots.total, 73);
+        assert_eq!(widths.columns().unwrap(), 128);
         let core = NormCoreRow::from_values(&[3, -2, 5, 1], 4).unwrap();
-        let values = layout.values(&core, 64).unwrap();
-        assert_eq!(values.len(), 64);
+        let values = layout.values(&core, widths.columns().unwrap()).unwrap();
+        assert_eq!(values.len(), 128);
         assert_eq!(
             values[layout.slots.mean_remainder],
             fp3_signed(core.mean_remainder).unwrap()
@@ -2609,7 +2820,7 @@ mod tests {
         {
             assert_eq!(values[slot], Fp3::ZERO);
         }
-        for slot in layout.slots.total..64 {
+        for slot in layout.slots.total..128 {
             assert_eq!(values[slot], Fp3::ZERO);
         }
     }
@@ -2769,7 +2980,21 @@ mod tests {
         let digits = layout.digit_slots().unwrap();
         assert_eq!(
             digits.len(),
-            widths.sum + widths.squares + widths.variance + widths.mean + 4 * widths.offset
+            widths.sum
+                + widths.squares
+                + widths.variance
+                + widths.mean
+                + 4 * widths.offset
+                + widths.raw()
+                + 2 * RSQRT_RAW_REMAINDER_WIDTH
+                + RSQRT_FINE_SLACK_WIDTH
+                + widths.mid_q()
+                + 1
+                + RSQRT_MID_HIGH_WIDTH
+                + widths.coarse_q()
+                + 2
+                + RSQRT_INDEX_WIDTH
+                + RSQRT_INDEX_SLACK_WIDTH
         );
         for slot in [
             layout.slots.mean_remainder,
@@ -2874,7 +3099,7 @@ mod tests {
             (vec![3i64, -2, 5, 1], SUM_OFFSET as i128 + 7),
         ] {
             let core = NormCoreRow::from_values(&row, 4).unwrap();
-            let values = layout.values(&core, 64).unwrap();
+            let values = layout.values(&core, widths.columns().unwrap()).unwrap();
             let mut rest = shifted_sum;
             for index in 0..widths.sum {
                 let digit = (rest & 0xff) as u64;
@@ -2897,6 +3122,62 @@ mod tests {
     }
 
     #[test]
+    fn rsqrt_slots_take_the_segmentation_values() {
+        use crate::proof::hidden_norm::RsqrtRow;
+
+        let widths = real_widths();
+        let layout = NormRoundLayout::new(widths, 768, SUM_OFFSET, MEAN_OFFSET).unwrap();
+        let core = NormCoreRow::from_values(&[3, -2, 5, 1], 4).unwrap();
+        let row = RsqrtRow::from_variance(core.variance, 7_340_032, 1_234).unwrap();
+        let columns = widths.columns().unwrap();
+        let values = layout
+            .values_with_rsqrt(&core, &row, columns)
+            .unwrap();
+        assert_eq!(
+            values[layout.slots.fine_selector],
+            Fp3::from_u64(row.fine as u64)
+        );
+        assert_eq!(
+            values[layout.slots.mid_selector],
+            Fp3::from_u64(row.mid as u64)
+        );
+        assert_eq!(
+            values[layout.slots.index_value],
+            fp3_signed(row.index as i128).unwrap()
+        );
+        assert_eq!(
+            values[layout.slots.rstd],
+            fp3_signed(row.rstd as i128).unwrap()
+        );
+        for (index, digit) in row.raw_digits.iter().enumerate() {
+            assert_eq!(
+                values[layout.slots.raw_digits + index],
+                Fp3::from_u64(*digit as u64)
+            );
+        }
+        for index in row.raw_digits.len()..widths.raw() {
+            assert_eq!(values[layout.slots.raw_digits + index], Fp3::ZERO);
+        }
+        for (index, digit) in row.index_digits.iter().enumerate() {
+            assert_eq!(
+                values[layout.slots.index_digits + index],
+                Fp3::from_u64(*digit as u64)
+            );
+        }
+
+        let mut narrow = widths;
+        narrow.variance = 3;
+        let layout = NormRoundLayout::new(narrow, 768, SUM_OFFSET, MEAN_OFFSET).unwrap();
+        let wide = RsqrtRow::from_variance(1 << 30, 7_340_032, 1).unwrap();
+        assert!(
+            layout
+                .values_with_rsqrt(&core, &wide, narrow.columns().unwrap())
+                .is_err(),
+            "a raw index wider than its plan block must fail closed"
+        );
+    }
+
+    #[test]
     fn round_widths_and_digit_rows_fail_closed() {
         let mut widths = real_widths();
         widths.squares = 8;
@@ -2909,7 +3190,7 @@ mod tests {
         let layout = NormRoundLayout::new(widths, 768, SUM_OFFSET, MEAN_OFFSET).unwrap();
         let core = NormCoreRow::from_values(&[22_855_985, -22_855_985], 2).unwrap();
         assert_eq!(core.squares_digits.len(), 7);
-        assert!(layout.values(&core, 64).is_err());
+        assert!(layout.values(&core, widths.columns().unwrap()).is_err());
         let layout = NormRoundLayout::new(real_widths(), 768, SUM_OFFSET, MEAN_OFFSET).unwrap();
         assert!(layout.values(&core, 32).is_err());
     }

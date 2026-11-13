@@ -450,19 +450,27 @@ pub fn exp_value(table: &[i64], distance: i64) -> Result<i64> {
     Ok(table[distance as usize])
 }
 
+/// Scale of the profile rsqrt coarse rounding step.
+pub const RSQRT_SHIFT: i64 = 1 << 18;
+/// Half of the profile rsqrt coarse rounding step, the round-half-up offset.
+pub const RSQRT_HALF: i64 = 1 << 17;
+/// First fine-table index bound of the profile rsqrt segmentation.
+pub const RSQRT_FINE: i64 = 1 << 20;
+/// Coarse segment span of the profile rsqrt segmentation.
+pub const RSQRT_COARSE: i64 = 1 << 22;
+/// End of the coarse segment of the profile rsqrt segmentation.
+pub const RSQRT_COARSE_END: i64 = RSQRT_FINE + RSQRT_COARSE * (1 << 8);
+
 /// Piecewise rsqrt table index shared by the frozen norm profiles.
 pub fn profile_rsqrt_index(var: i64) -> Result<u64> {
-    const FINE: i64 = 1 << 20;
-    const COARSE: i64 = 1 << 22;
-    const COARSE_END: i64 = FINE + COARSE * (1 << 8);
-    let raw = round_div_half_up(var as i128, 1 << 18)?;
+    let raw = round_div_half_up(var as i128, RSQRT_SHIFT as i128)?;
     let raw = i64::try_from(raw).map_err(|_| Error::BoundViolation)?;
-    if raw < FINE {
+    if raw < RSQRT_FINE {
         Ok(raw.max(0) as u64)
-    } else if raw < COARSE_END {
-        Ok((FINE + ((raw - FINE) >> 8)) as u64)
+    } else if raw < RSQRT_COARSE_END {
+        Ok((RSQRT_FINE + ((raw - RSQRT_FINE) >> 8)) as u64)
     } else {
-        Ok((FINE + COARSE + ((raw - COARSE_END) >> 16)) as u64)
+        Ok((RSQRT_FINE + RSQRT_COARSE + ((raw - RSQRT_COARSE_END) >> 16)) as u64)
     }
 }
 

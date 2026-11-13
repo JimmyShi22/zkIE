@@ -22,7 +22,9 @@ use zkie_core::error::{Error, Result};
 use crate::proof::hidden_send_session::{
     ActivationCommitment, ActivationShape, CommittedActivation,
 };
-use crate::registry::round_div_half_up;
+use crate::registry::{
+    round_div_half_up, RSQRT_COARSE, RSQRT_COARSE_END, RSQRT_FINE, RSQRT_HALF, RSQRT_SHIFT,
+};
 
 /// The row/column shape of the final norm's input and output matrices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -284,6 +286,188 @@ impl NormCoreRow {
         }
         Ok(())
     }
+}
+
+/// The private rsqrt index witness of one position, derived from the
+/// committed variance. The variance is nonnegative here: the core computes it
+/// as a round-half-up of nonnegative squares, so the runtime clamp at zero is
+/// not needed in this relation.
+///
+/// `raw` is `round_half_up(variance, 2^18)`. Exactly one segment selector is
+/// one, and the matching segment carries the nonnegative slack that proves its
+/// strict bounds: `raw < FINE`, `FINE <= raw < COARSE_END`, or
+/// `raw >= COARSE_END`. The segment quotient and remainder decompose the
+/// shifted raw value, and `index` follows the runtime piecewise formula.
+/// `index_slack` proves `index < table_real_len`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RsqrtRow {
+    pub variance: i64,
+    pub raw: i64,
+    pub raw_digits: Vec<u8>,
+    pub raw_remainder: i64,
+    pub raw_remainder_digits: Vec<u8>,
+    pub raw_remainder_slack: i64,
+    pub raw_remainder_slack_digits: Vec<u8>,
+    pub fine: bool,
+    pub mid: bool,
+    pub coarse: bool,
+    pub fine_slack: i64,
+    pub fine_slack_digits: Vec<u8>,
+    pub mid_q: i64,
+    pub mid_r: i64,
+    pub mid_q_digits: Vec<u8>,
+    pub mid_high_slack: i64,
+    pub mid_high_slack_digits: Vec<u8>,
+    pub coarse_q: i64,
+    pub coarse_r: i64,
+    pub coarse_q_digits: Vec<u8>,
+    pub index: i64,
+    pub index_digits: Vec<u8>,
+    pub index_slack: i64,
+    pub index_slack_digits: Vec<u8>,
+    /// The frozen table value at `index`.
+    pub rstd: i64,
+}
+
+impl RsqrtRow {
+    pub fn from_variance(variance: i64, table_real_len: u64, rstd: i64) -> Result<Self> {
+        if variance < 0 || table_real_len == 0 {
+            return Err(Error::BoundViolation);
+        }
+        let var = variance as i128;
+        let raw = (var + RSQRT_HALF as i128) >> 18;
+        let raw = i64::try_from(raw).map_err(|_| Error::BoundViolation)?;
+        let raw_remainder = var + RSQRT_HALF as i128 - (raw as i128) * (RSQRT_SHIFT as i128);
+        if raw_remainder < 0 || raw_remainder >= RSQRT_SHIFT as i128 {
+            return Err(Error::BoundViolation);
+        }
+        let raw_remainder_slack = RSQRT_SHIFT as i128 - 1 - raw_remainder;
+        let fine = raw < RSQRT_FINE;
+        let mid = !fine && raw < RSQRT_COARSE_END;
+        let coarse = raw >= RSQRT_COARSE_END;
+        let fine_slack = if fine {
+            RSQRT_FINE as i128 - 1 - raw as i128
+        } else {
+            0
+        };
+        let (mid_q, mid_r, mid_high_slack) = if mid {
+            let shifted = raw as i128 - RSQRT_FINE as i128;
+            (
+                shifted >> 8,
+                shifted & 0xff,
+                RSQRT_COARSE_END as i128 - 1 - raw as i128,
+            )
+        } else {
+            (0, 0, 0)
+        };
+        let (coarse_q, coarse_r) = if coarse {
+            let shifted = raw as i128 - RSQRT_COARSE_END as i128;
+            (shifted >> 16, shifted & 0xffff)
+        } else {
+            (0, 0)
+        };
+        if fine_slack < 0 || mid_q < 0 || mid_r < 0 || mid_high_slack < 0 || coarse_q < 0 {
+            return Err(Error::BoundViolation);
+        }
+        let index = if fine {
+            raw as i128
+        } else if mid {
+            RSQRT_FINE as i128 + mid_q
+        } else {
+            RSQRT_FINE as i128 + RSQRT_COARSE as i128 + coarse_q
+        };
+        let index = i64::try_from(index).map_err(|_| Error::BoundViolation)?;
+        let index_slack = table_real_len as i128 - 1 - index as i128;
+        if index_slack < 0 {
+            return Err(Error::BoundViolation);
+        }
+        let raw_digits = unsigned_digits(raw.unsigned_abs() as u128)?;
+        let raw_remainder_digits = fixed_digits(raw_remainder as u128, 3)?;
+        let raw_remainder_slack_digits = fixed_digits(raw_remainder_slack as u128, 3)?;
+        let fine_slack_digits = fixed_digits(fine_slack as u128, 3)?;
+        let mid_q_digits = unsigned_digits(mid_q as u128)?;
+        let mid_high_slack_digits = fixed_digits(mid_high_slack as u128, 4)?;
+        let coarse_q_digits = unsigned_digits(coarse_q as u128)?;
+        let index_digits = fixed_digits(index as u128, 4)?;
+        let index_slack_digits = fixed_digits(index_slack as u128, 4)?;
+        Ok(Self {
+            variance,
+            raw,
+            raw_digits,
+            raw_remainder: i64::try_from(raw_remainder).map_err(|_| Error::BoundViolation)?,
+            raw_remainder_digits,
+            raw_remainder_slack: i64::try_from(raw_remainder_slack)
+                .map_err(|_| Error::BoundViolation)?,
+            raw_remainder_slack_digits,
+            fine,
+            mid,
+            coarse,
+            fine_slack: i64::try_from(fine_slack).map_err(|_| Error::BoundViolation)?,
+            fine_slack_digits,
+            mid_q: i64::try_from(mid_q).map_err(|_| Error::BoundViolation)?,
+            mid_r: i64::try_from(mid_r).map_err(|_| Error::BoundViolation)?,
+            mid_q_digits,
+            mid_high_slack: i64::try_from(mid_high_slack)
+                .map_err(|_| Error::BoundViolation)?,
+            mid_high_slack_digits,
+            coarse_q: i64::try_from(coarse_q).map_err(|_| Error::BoundViolation)?,
+            coarse_r: i64::try_from(coarse_r).map_err(|_| Error::BoundViolation)?,
+            coarse_q_digits,
+            index,
+            index_digits,
+            index_slack: i64::try_from(index_slack).map_err(|_| Error::BoundViolation)?,
+            index_slack_digits,
+            rstd,
+        })
+    }
+
+    /// Rechecks the exact segmentation and index against the runtime formula.
+    pub fn check(&self) -> Result<()> {
+        if self.variance < 0 {
+            return Err(Error::InvalidProof);
+        }
+        let table_len = (self.index as u64)
+            .checked_add(self.index_slack as u64)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(Error::BoundViolation)?;
+        let expected = Self::from_variance(self.variance, table_len, self.rstd)?;
+        if *self != expected {
+            return Err(Error::InvalidProof);
+        }
+        if crate::registry::profile_rsqrt_index(self.variance)? != self.index as u64 {
+            return Err(Error::InvalidProof);
+        }
+        let digits = [
+            (&self.raw_digits, None),
+            (&self.raw_remainder_digits, Some(3usize)),
+            (&self.raw_remainder_slack_digits, Some(3)),
+            (&self.fine_slack_digits, Some(3)),
+            (&self.mid_q_digits, None),
+            (&self.mid_high_slack_digits, Some(4)),
+            (&self.coarse_q_digits, None),
+            (&self.index_digits, Some(4)),
+            (&self.index_slack_digits, Some(4)),
+        ];
+        for (row, limit) in digits {
+            if let Some(limit) = limit {
+                if row.len() > limit {
+                    return Err(Error::InvalidProof);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A little-endian fixed-width byte row; leading zero bytes beyond the value
+/// are allowed because the width is a plan value.
+fn fixed_digits(value: u128, width: usize) -> Result<Vec<u8>> {
+    let mut digits = unsigned_digits(value)?;
+    if digits.len() > width {
+        return Err(Error::BoundViolation);
+    }
+    digits.resize(width, 0);
+    Ok(digits)
 }
 
 /// Reconstructs a canonical byte-digit row. Empty rows and rows with a zero
@@ -588,6 +772,90 @@ mod tests {
         assert_eq!(unit.variance_offset, 0);
         assert_eq!(unit.variance_complement, 0);
         unit.check(&[5], 1).unwrap();
+    }
+
+    #[test]
+    fn rsqrt_row_matches_the_runtime_segmentation() {
+        let table_len = 7_340_032u64;
+        let rstd = 12_345i64;
+        let zero = RsqrtRow::from_variance(0, table_len, rstd).unwrap();
+        assert_eq!(zero.raw, 0);
+        assert!(zero.fine);
+        assert_eq!(zero.index, 0);
+        zero.check().unwrap();
+        let mut raw_values = vec![1i64, crate::registry::RSQRT_FINE - 1, crate::registry::RSQRT_FINE];
+        for offset in 0..4i64 {
+            raw_values.push(crate::registry::RSQRT_COARSE_END - offset);
+            raw_values.push(crate::registry::RSQRT_COARSE_END + offset);
+        }
+        raw_values.push(crate::registry::RSQRT_COARSE_END + 65_536);
+        for raw in raw_values {
+            let variance =
+                raw * crate::registry::RSQRT_SHIFT - crate::registry::RSQRT_HALF;
+            let row = RsqrtRow::from_variance(variance, table_len, rstd).unwrap();
+            assert_eq!(row.raw, raw);
+            assert_eq!(
+                row.index,
+                crate::registry::profile_rsqrt_index(variance).unwrap() as i64
+            );
+            let selected = [row.fine, row.mid, row.coarse]
+                .iter()
+                .filter(|value| **value)
+                .count();
+            assert_eq!(selected, 1);
+            if row.fine {
+                assert!(row.raw < crate::registry::RSQRT_FINE);
+                assert_eq!(row.fine_slack, crate::registry::RSQRT_FINE - 1 - raw);
+            }
+            if row.mid {
+                assert!(row.raw >= crate::registry::RSQRT_FINE);
+                assert!(row.raw < crate::registry::RSQRT_COARSE_END);
+                assert_eq!(row.mid_q, (raw - crate::registry::RSQRT_FINE) >> 8);
+                assert_eq!(row.mid_r, (raw - crate::registry::RSQRT_FINE) & 0xff);
+                assert_eq!(
+                    row.mid_high_slack,
+                    crate::registry::RSQRT_COARSE_END - 1 - raw
+                );
+            }
+            if row.coarse {
+                assert!(row.raw >= crate::registry::RSQRT_COARSE_END);
+                assert_eq!(
+                    row.coarse_q,
+                    (raw - crate::registry::RSQRT_COARSE_END) >> 16
+                );
+                assert_eq!(
+                    row.coarse_r,
+                    (raw - crate::registry::RSQRT_COARSE_END) & 0xffff
+                );
+            }
+            row.check().unwrap();
+        }
+        for delta in [
+            0i64,
+            1,
+            crate::registry::RSQRT_HALF - 1,
+            crate::registry::RSQRT_HALF,
+            crate::registry::RSQRT_HALF + 1,
+            crate::registry::RSQRT_SHIFT - 1,
+        ] {
+            let variance = 3 * crate::registry::RSQRT_SHIFT + delta;
+            let row = RsqrtRow::from_variance(variance, table_len, rstd).unwrap();
+            assert_eq!(row.raw, (variance + crate::registry::RSQRT_HALF) / crate::registry::RSQRT_SHIFT);
+            assert_eq!(
+                row.index,
+                crate::registry::profile_rsqrt_index(variance).unwrap() as i64
+            );
+            row.check().unwrap();
+        }
+        assert!(RsqrtRow::from_variance(-1, table_len, rstd).is_err());
+        assert!(RsqrtRow::from_variance(0, 0, rstd).is_err());
+        let beyond = (crate::registry::RSQRT_COARSE_END + 65_536)
+            * crate::registry::RSQRT_SHIFT
+            - crate::registry::RSQRT_HALF;
+        assert!(RsqrtRow::from_variance(beyond, 1_024, rstd).is_err());
+        let mut row = RsqrtRow::from_variance(1_000, table_len, rstd).unwrap();
+        row.index += 1;
+        assert!(row.check().is_err());
     }
 
     #[test]
