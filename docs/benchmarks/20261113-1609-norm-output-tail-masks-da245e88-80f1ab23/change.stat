@@ -1,0 +1,4 @@
+da245e88 Allocate the tail relation masks in the committed mask plan
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     | 121 ++++++++++++++++++++++-
+ crates/zkie-ops/src/proof/hidden_send_session.rs |  15 +++
+ 2 files changed, 132 insertions(+), 4 deletions(-)
