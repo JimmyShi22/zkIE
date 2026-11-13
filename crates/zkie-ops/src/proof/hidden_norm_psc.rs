@@ -40,7 +40,7 @@ use crate::proof::lookup::{
 };
 use crate::proof::lookup_messages::LookupCommitPlan;
 use crate::proof::output_closure::{CommittedValueGroup, RetainedTrees};
-use crate::registry::{RSQRT_COARSE_END, RSQRT_HALF};
+use crate::registry::{RSQRT_COARSE, RSQRT_COARSE_END, RSQRT_FINE, RSQRT_HALF, RSQRT_SHIFT};
 use crate::proof::psc::{
     hp_entries, prove_dot_sumcheck, psc_variables, verify_psc_transcript, DotClaim,
     DotMaskEntries, DotOutput, DotProof, SHOWN_MAPS,
@@ -458,6 +458,7 @@ pub(crate) fn rel_map(
     columns: usize,
     relation: usize,
     round: Option<&NormRoundPlan>,
+    rsqrt: Option<&crate::proof::hidden_norm::RsqrtRow>,
 ) -> Result<(Vec<Fp3>, Vec<Fp3>)> {
     let (mut left, mut right) = map_pair(columns);
     match relation {
@@ -599,6 +600,124 @@ pub(crate) fn rel_map(
             left[columns] = fp3_signed(-value)?;
             right[columns] = Fp3::ONE;
         }
+        16..=25 => {
+            let round = round.ok_or(Error::InvalidConfig)?;
+            let rsqrt = rsqrt.ok_or(Error::InvalidConfig)?;
+            let signed = fp3_signed;
+            match relation {
+                16 => {
+                    // variance + 2^17 - 2^18 * raw - raw_remainder = 0
+                    left[0] = signed(rsqrt.variance as i128)?;
+                    right[0] = Fp3::ONE;
+                    left[1] = Fp3::ONE;
+                    right[1] = signed(RSQRT_HALF as i128)?;
+                    left[2] = signed(rsqrt.raw as i128)?;
+                    right[2] = signed(-(RSQRT_SHIFT as i128))?;
+                    left[3] = signed(rsqrt.raw_remainder as i128)?;
+                    right[3] = signed(-1)?;
+                }
+                17 => {
+                    // raw_remainder + raw_remainder_slack = 2^18 - 1
+                    left[0] = signed(rsqrt.raw_remainder as i128)?;
+                    right[0] = Fp3::ONE;
+                    left[1] = signed(rsqrt.raw_remainder_slack as i128)?;
+                    right[1] = Fp3::ONE;
+                    left[2] = Fp3::ONE;
+                    right[2] = signed(-(RSQRT_SHIFT as i128 - 1))?;
+                }
+                18 => {
+                    // s * (1 - s) = 0 for every selector
+                    for (index, selector) in
+                        [rsqrt.fine, rsqrt.mid, rsqrt.coarse].iter().enumerate()
+                    {
+                        let value = signed(*selector as i128)?;
+                        left[index] = value;
+                        right[index] = Fp3::ONE.sub(&value);
+                    }
+                }
+                19 => {
+                    // fine + middle + coarse = 1
+                    for (index, selector) in
+                        [rsqrt.fine, rsqrt.mid, rsqrt.coarse].iter().enumerate()
+                    {
+                        left[index] = signed(*selector as i128)?;
+                        right[index] = Fp3::ONE;
+                    }
+                    left[3] = Fp3::ONE;
+                    right[3] = signed(-1)?;
+                }
+                20 => {
+                    // fine * (FINE - 1) - fine * raw - fine_slack = 0
+                    let fine = signed(rsqrt.fine as i128)?;
+                    left[0] = fine;
+                    right[0] = signed(RSQRT_FINE as i128 - 1)?;
+                    left[1] = fine;
+                    right[1] = signed(-(rsqrt.raw as i128))?;
+                    left[2] = signed(rsqrt.fine_slack as i128)?;
+                    right[2] = signed(-1)?;
+                }
+                21 => {
+                    // middle * raw - middle * FINE - 256 * q - r = 0
+                    let middle = signed(rsqrt.mid as i128)?;
+                    left[0] = middle;
+                    right[0] = signed(rsqrt.raw as i128)?;
+                    left[1] = middle;
+                    right[1] = signed(-(RSQRT_FINE as i128))?;
+                    left[2] = signed(rsqrt.mid_q as i128)?;
+                    right[2] = signed(-256)?;
+                    left[3] = signed(rsqrt.mid_r as i128)?;
+                    right[3] = signed(-1)?;
+                }
+                22 => {
+                    // middle * (COARSE_END - 1) - middle * raw - slack = 0
+                    let middle = signed(rsqrt.mid as i128)?;
+                    left[0] = middle;
+                    right[0] = signed(RSQRT_COARSE_END as i128 - 1)?;
+                    left[1] = middle;
+                    right[1] = signed(-(rsqrt.raw as i128))?;
+                    left[2] = signed(rsqrt.mid_high_slack as i128)?;
+                    right[2] = signed(-1)?;
+                }
+                23 => {
+                    // coarse * raw - coarse * END - 65536 * q - 256 * hi - lo = 0
+                    let coarse = signed(rsqrt.coarse as i128)?;
+                    left[0] = coarse;
+                    right[0] = signed(rsqrt.raw as i128)?;
+                    left[1] = coarse;
+                    right[1] = signed(-(RSQRT_COARSE_END as i128))?;
+                    left[2] = signed(rsqrt.coarse_q as i128)?;
+                    right[2] = signed(-65_536)?;
+                    left[3] = Fp3::from_u64((rsqrt.coarse_r & 0xff) as u64);
+                    right[3] = signed(-256)?;
+                    left[4] = Fp3::from_u64(((rsqrt.coarse_r >> 8) & 0xffff) as u64);
+                    right[4] = signed(-1)?;
+                }
+                24 => {
+                    // index = fine*raw + middle*(FINE+q) + coarse*(END+q)
+                    left[0] = signed(rsqrt.index as i128)?;
+                    right[0] = Fp3::ONE;
+                    left[1] = signed(rsqrt.fine as i128)?;
+                    right[1] = signed(-(rsqrt.raw as i128))?;
+                    left[2] = signed(rsqrt.mid as i128)?;
+                    right[2] = signed(-(rsqrt.mid_q as i128))?;
+                    left[3] = signed(rsqrt.coarse as i128)?;
+                    right[3] = signed(-(rsqrt.coarse_q as i128))?;
+                    left[4] = signed(rsqrt.mid as i128)?;
+                    right[4] = signed(-(RSQRT_FINE as i128))?;
+                    left[5] = signed(rsqrt.coarse as i128)?;
+                    right[5] = signed(-((RSQRT_FINE + RSQRT_COARSE) as i128))?;
+                }
+                _ => {
+                    // index + index_slack = table_real_len - 1
+                    left[0] = signed(rsqrt.index as i128)?;
+                    right[0] = Fp3::ONE;
+                    left[1] = signed(rsqrt.index_slack as i128)?;
+                    right[1] = Fp3::ONE;
+                    left[2] = Fp3::ONE;
+                    right[2] = signed(-((round.table_real_len - 1) as i128))?;
+                }
+            }
+        }
         _ => return Err(Error::InvalidConfig),
     }
     Ok((left, right))
@@ -642,6 +761,7 @@ pub fn prove_norm_psc(
                 valid,
                 columns,
                 relation,
+                None,
                 None,
             )?;
             let mut challenges = PositionPscChallenges::new(
@@ -723,8 +843,9 @@ pub const NORM_BIND_VERSION: u64 = 5;
 /// The relation indices the bound core supports. The map construction of
 /// every relation is fixed by the relation index; the plan may list only
 /// relations whose row binding is implemented.
-pub const NORM_BOUND_RELATIONS: [usize; 16] = [
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+pub const NORM_BOUND_RELATIONS: [usize; 26] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+    25,
 ];
 
 /// One committed witness group of the integrated norm plan.
@@ -759,6 +880,8 @@ pub struct NormRoundPlan {
     pub layout: NormRoundLayout,
     /// The trusted input bound `X` of the fixture contract, in integer units.
     pub input_bound: u64,
+    /// The real (unpadded) length of the frozen rsqrt table.
+    pub table_real_len: u64,
 }
 
 /// The lookup plan carried by the norm relation. The key vector is read from
@@ -1137,7 +1260,10 @@ impl NormPlan {
             }
         }
         if let Some(round) = &self.round {
-            if round.input_bound == 0 {
+            if round.input_bound == 0
+                || round.table_real_len == 0
+                || round.table_real_len > (1u64 << 32)
+            {
                 return Err(Error::InvalidConfig);
             }
             let columns = round.layout.widths.columns()?;
@@ -1201,6 +1327,7 @@ impl NormPlan {
             Some(round) => {
                 writer.put_u64(1);
                 writer.put_u64(round.input_bound);
+                writer.put_u64(round.table_real_len);
                 writer.put_u64(round.layout.widths.sum as u64);
                 writer.put_u64(round.layout.widths.squares as u64);
                 writer.put_u64(round.layout.widths.variance as u64);
@@ -1682,6 +1809,8 @@ pub struct NormWitness {
     pub mean: NormGroupWitness,
     pub variance: NormGroupWitness,
     pub round: Option<NormGroupWitness>,
+    /// The private rsqrt index rows, one per position.
+    pub rsqrt: Option<Vec<crate::proof::hidden_norm::RsqrtRow>>,
     pub mask: Option<NormMaskWitness>,
     /// The private lookup material, when the plan carries the lookup.
     pub lookup: Option<NormLookupWitness>,
@@ -2703,12 +2832,13 @@ mod tests {
             },
             layout,
             input_bound: 16,
+            table_real_len: 8,
         };
         for (row, valid) in [(vec![1i64, 2], 2usize), (vec![1i64, 2, 3, 4], 4usize)] {
             let core = NormCoreRow::from_values(&row, valid).unwrap();
             for relation in 8..=15 {
                 let (left, right) =
-                    rel_map(&core, &row, valid, columns, relation, Some(&round)).unwrap();
+                    rel_map(&core, &row, valid, columns, relation, Some(&round), None).unwrap();
                 let dot = left
                     .iter()
                     .zip(right.iter())
@@ -2849,6 +2979,7 @@ mod tests {
             },
             layout,
             input_bound: 8,
+            table_real_len: 8,
         };
         let params = NormLookupParams {
             // The parent main code must cover the multiplicity-bit message
@@ -2976,6 +3107,7 @@ mod tests {
             },
             layout,
             input_bound: 8,
+            table_real_len: 8,
         };
         let digits = layout.digit_slots().unwrap();
         assert_eq!(
@@ -3175,6 +3307,59 @@ mod tests {
                 .is_err(),
             "a raw index wider than its plan block must fail closed"
         );
+    }
+
+    #[test]
+    fn rsqrt_relation_maps_sum_to_zero_at_the_segment_boundaries() {
+        use crate::proof::hidden_norm::RsqrtRow;
+
+        let widths = NormRoundWidths {
+            sum: 1,
+            squares: 1,
+            variance: 1,
+            mean: 1,
+            offset: 1,
+        };
+        let layout = NormRoundLayout::new(widths, 2, 0, 0).unwrap();
+        let round = NormRoundPlan {
+            group: NormGroupPlan {
+                shape: group_shape(64, 1),
+                columns: 64,
+                group: 1,
+                oracle_base: 1,
+                openings: 1,
+            },
+            layout,
+            input_bound: 2,
+            table_real_len: 8_388_608,
+        };
+        let core = NormCoreRow::from_values(&[1, 3], 2).unwrap();
+        let rows = [1i64, 1i64, 1i64];
+        let mut variances = vec![0i64, 1, 1 << 18, 1 << 30];
+        for raw in [
+            RSQRT_FINE - 1,
+            RSQRT_FINE,
+            RSQRT_COARSE_END - 1,
+            RSQRT_COARSE_END,
+            RSQRT_COARSE_END + 65_536,
+        ] {
+            variances.push(raw * RSQRT_SHIFT - RSQRT_HALF);
+        }
+        for variance in variances {
+            let rsqrt = RsqrtRow::from_variance(variance, round.table_real_len, 7).unwrap();
+            for relation in 16..=25 {
+                let (left, right) =
+                    rel_map(&core, &rows, 2, 8, relation, Some(&round), Some(&rsqrt)).unwrap();
+                let dot = left
+                    .iter()
+                    .zip(right.iter())
+                    .fold(Fp3::ZERO, |sum, (a, b)| sum.add(&a.mul(b)));
+                assert_eq!(
+                    dot, Fp3::ZERO,
+                    "relation {relation} variance {variance} does not sum to zero"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3554,6 +3739,7 @@ mod tests {
             group,
             layout,
             input_bound: 1000,
+            table_real_len: 8,
         });
         plan.validate().unwrap();
         let with_round = plan.digest();
@@ -3575,6 +3761,7 @@ mod tests {
             },
             layout,
             input_bound: 1000,
+            table_real_len: 8,
         });
         assert!(wide.validate().is_err());
 

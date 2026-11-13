@@ -262,10 +262,12 @@ use crate::proof::output_closure::{
     ClosureRandomness, ClosureRowBinding, ClosureSecondMessages, ClosureWitness,
     CommittedClosureMask, CommittedGroupMessage, CommittedValueGroup, RetainedTrees,
 };
+use crate::registry::{RSQRT_COARSE, RSQRT_COARSE_END, RSQRT_FINE, RSQRT_HALF, RSQRT_SHIFT};
 use crate::proof::hidden_norm_psc::{
     NormFirstMessages, NormGroupPlan, NormGroupWitness, NormLookupMessage, NormLookupSecond,
     NormMaskMessage, NormMaskPlan, NormMaskWitness, NormPlan, NormPositionBinding, NormPscSecond,
-    NormRowBinding, NormWitness,
+    NormRowBinding, NormWitness, RSQRT_FINE_SLACK_WIDTH, RSQRT_INDEX_SLACK_WIDTH,
+    RSQRT_INDEX_WIDTH, RSQRT_MID_HIGH_WIDTH, RSQRT_RAW_REMAINDER_WIDTH,
 };
 use crate::proof::committed_psc::CommittedPscGroup;
 use crate::proof::base_final_session::{
@@ -9715,9 +9717,20 @@ fn prove_norm_first(
                 if message.len() != rows || message.iter().any(|row| row.len() != ell) {
                     return Err(Error::ShapeMismatch);
                 }
-                let expected = round_plan
-                    .layout
-                    .values(&witness.core[position], round_plan.group.columns)?;
+                let expected = match witness
+                    .rsqrt
+                    .as_ref()
+                    .and_then(|rows| rows.get(position))
+                {
+                    Some(rsqrt) => round_plan.layout.values_with_rsqrt(
+                        &witness.core[position],
+                        rsqrt,
+                        round_plan.group.columns,
+                    )?,
+                    None => round_plan
+                        .layout
+                        .values(&witness.core[position], round_plan.group.columns)?,
+                };
                 for slot in 0..columns {
                     let row = slot % rows;
                     let place = slot / rows;
@@ -10371,6 +10384,10 @@ fn prove_norm_second(
                 columns,
                 *relation,
                 plan.round.as_ref(),
+                witness
+                    .rsqrt
+                    .as_ref()
+                    .and_then(|rows| rows.get(position)),
             )?;
             let instance = position * relations.len() + relation_index;
             let entries = &mask_witness.entries[instance];
@@ -10783,6 +10800,19 @@ fn scalar_message_coefficients(shape: &WShape, coefficient: Fp3) -> Result<Vec<F
     let slot = values.first_mut().ok_or(Error::ShapeMismatch)?;
     *slot = coefficient;
     to_bat_table(&values, shape.main_rows, shape.code.ell)
+}
+
+fn push_digit_coefficients(
+    start: usize,
+    width: usize,
+    coefficient: Fp3,
+    slots: &mut Vec<(usize, Fp3)>,
+) {
+    let mut power = Fp3::ONE;
+    for index in 0..width {
+        slots.push((start + index, coefficient.mul(&power)));
+        power = power.mul(&Fp3::from_u64(256));
+    }
 }
 
 fn norm_plain_rows(
@@ -11375,6 +11405,271 @@ fn norm_plain_rows(
                     word.output.ends[1].mask_scale,
                 );
                 right.target = word.output.ends[1].value.sub(&constant);
+                rows.push(right);
+            }
+            16..=25 => {
+                let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
+                let round_member = round_member.ok_or(Error::StatementMismatch)?;
+                let layout = &round_plan.layout;
+                let widths = &layout.widths;
+                let signed = crate::proof::output_closure::fp3_signed;
+                let mut left_slots: Vec<(usize, Fp3)> = Vec::new();
+                let mut right_slots: Vec<(usize, Fp3)> = Vec::new();
+                let mut left_constant = Fp3::ZERO;
+                let mut right_constant = Fp3::ZERO;
+                let mut variance_term = None;
+                match word.relation {
+                    16 => {
+                        let variance_member = bat_of
+                            .get(
+                                &norm
+                                    .variance
+                                    .oracle_base
+                                    .checked_add(position as u64)
+                                    .ok_or(Error::ResourceLimit)?,
+                            )
+                            .ok_or(Error::StatementMismatch)?;
+                        variance_term = Some(variance_member);
+                        left_constant = left_constant.add(&eq[1]);
+                        push_digit_coefficients(
+                            layout.slots.raw_digits,
+                            widths.raw(),
+                            eq[2],
+                            &mut left_slots,
+                        );
+                        push_digit_coefficients(
+                            layout.slots.raw_remainder,
+                            RSQRT_RAW_REMAINDER_WIDTH,
+                            eq[3],
+                            &mut left_slots,
+                        );
+                        right_constant = right_constant
+                            .add(&eq[0])
+                            .add(&eq[1].mul(&signed(RSQRT_HALF as i128)?))
+                            .add(&eq[2].mul(&signed(-(RSQRT_SHIFT as i128))?))
+                            .add(&eq[3].mul(&signed(-1)?));
+                    }
+                    17 => {
+                        push_digit_coefficients(
+                            layout.slots.raw_remainder,
+                            RSQRT_RAW_REMAINDER_WIDTH,
+                            eq[0],
+                            &mut left_slots,
+                        );
+                        push_digit_coefficients(
+                            layout.slots.raw_remainder_slack,
+                            RSQRT_RAW_REMAINDER_WIDTH,
+                            eq[1],
+                            &mut left_slots,
+                        );
+                        left_constant = left_constant.add(&eq[2]);
+                        right_constant = eq[0]
+                            .add(&eq[1])
+                            .add(&eq[2].mul(&signed(-(RSQRT_SHIFT as i128 - 1))?));
+                    }
+                    18 => {
+                        for (index, slot) in [
+                            layout.slots.fine_selector,
+                            layout.slots.mid_selector,
+                            layout.slots.coarse_selector,
+                        ]
+                        .iter()
+                        .enumerate()
+                        {
+                            left_slots.push((*slot, eq[index]));
+                            right_slots.push((*slot, Fp3::ZERO.sub(&eq[index])));
+                            right_constant = right_constant.add(&eq[index]);
+                        }
+                    }
+                    19 => {
+                        for (index, slot) in [
+                            layout.slots.fine_selector,
+                            layout.slots.mid_selector,
+                            layout.slots.coarse_selector,
+                        ]
+                        .iter()
+                        .enumerate()
+                        {
+                            left_slots.push((*slot, eq[index]));
+                            right_constant = right_constant.add(&eq[index]);
+                        }
+                        left_constant = left_constant.add(&eq[3]);
+                        right_constant = right_constant.sub(&eq[3]);
+                    }
+                    20 => {
+                        let fine = layout.slots.fine_selector;
+                        left_slots.push((fine, eq[0]));
+                        left_slots.push((fine, eq[1]));
+                        push_digit_coefficients(
+                            layout.slots.fine_slack,
+                            RSQRT_FINE_SLACK_WIDTH,
+                            eq[2],
+                            &mut left_slots,
+                        );
+                        push_digit_coefficients(
+                            layout.slots.raw_digits,
+                            widths.raw(),
+                            Fp3::ZERO.sub(&eq[1]),
+                            &mut right_slots,
+                        );
+                        right_constant = right_constant
+                            .add(&eq[0].mul(&signed(RSQRT_FINE as i128 - 1)?))
+                            .sub(&eq[2]);
+                    }
+                    21 => {
+                        let middle = layout.slots.mid_selector;
+                        left_slots.push((middle, eq[0]));
+                        left_slots.push((middle, eq[1]));
+                        push_digit_coefficients(
+                            layout.slots.mid_q_digits,
+                            widths.mid_q(),
+                            eq[2],
+                            &mut left_slots,
+                        );
+                        left_slots.push((layout.slots.mid_r, eq[3]));
+                        push_digit_coefficients(
+                            layout.slots.raw_digits,
+                            widths.raw(),
+                            eq[0],
+                            &mut right_slots,
+                        );
+                        right_constant = right_constant
+                            .add(&eq[1].mul(&signed(-(RSQRT_FINE as i128))?))
+                            .add(&eq[2].mul(&signed(-256)?))
+                            .sub(&eq[3]);
+                    }
+                    22 => {
+                        let middle = layout.slots.mid_selector;
+                        left_slots.push((middle, eq[0]));
+                        left_slots.push((middle, eq[1]));
+                        push_digit_coefficients(
+                            layout.slots.mid_high_slack,
+                            RSQRT_MID_HIGH_WIDTH,
+                            eq[2],
+                            &mut left_slots,
+                        );
+                        push_digit_coefficients(
+                            layout.slots.raw_digits,
+                            widths.raw(),
+                            Fp3::ZERO.sub(&eq[1]),
+                            &mut right_slots,
+                        );
+                        right_constant = right_constant
+                            .add(&eq[0].mul(&signed(RSQRT_COARSE_END as i128 - 1)?))
+                            .sub(&eq[2]);
+                    }
+                    23 => {
+                        let coarse = layout.slots.coarse_selector;
+                        left_slots.push((coarse, eq[0]));
+                        left_slots.push((coarse, eq[1]));
+                        push_digit_coefficients(
+                            layout.slots.coarse_q_digits,
+                            widths.coarse_q(),
+                            eq[2],
+                            &mut left_slots,
+                        );
+                        left_slots.push((layout.slots.coarse_r + 1, eq[3]));
+                        left_slots.push((layout.slots.coarse_r, eq[4]));
+                        push_digit_coefficients(
+                            layout.slots.raw_digits,
+                            widths.raw(),
+                            eq[0],
+                            &mut right_slots,
+                        );
+                        right_constant = right_constant
+                            .add(&eq[1].mul(&signed(-(RSQRT_COARSE_END as i128))?))
+                            .add(&eq[2].mul(&signed(-65_536)?))
+                            .add(&eq[3].mul(&signed(-256)?))
+                            .sub(&eq[4]);
+                    }
+                    24 => {
+                        left_slots.push((layout.slots.index_value, eq[0]));
+                        left_slots.push((layout.slots.fine_selector, eq[1]));
+                        left_slots.push((layout.slots.mid_selector, eq[2]));
+                        left_slots.push((layout.slots.coarse_selector, eq[3]));
+                        left_slots.push((layout.slots.mid_selector, eq[4]));
+                        left_slots.push((layout.slots.coarse_selector, eq[5]));
+                        push_digit_coefficients(
+                            layout.slots.raw_digits,
+                            widths.raw(),
+                            Fp3::ZERO.sub(&eq[1]),
+                            &mut right_slots,
+                        );
+                        push_digit_coefficients(
+                            layout.slots.mid_q_digits,
+                            widths.mid_q(),
+                            Fp3::ZERO.sub(&eq[2]),
+                            &mut right_slots,
+                        );
+                        push_digit_coefficients(
+                            layout.slots.coarse_q_digits,
+                            widths.coarse_q(),
+                            Fp3::ZERO.sub(&eq[3]),
+                            &mut right_slots,
+                        );
+                        right_constant = right_constant
+                            .add(&eq[4].mul(&signed(-(RSQRT_FINE as i128))?))
+                            .add(&eq[5].mul(&signed(
+                                -((RSQRT_FINE + RSQRT_COARSE) as i128),
+                            )?));
+                    }
+                    _ => {
+                        left_slots.push((layout.slots.index_value, eq[0]));
+                        push_digit_coefficients(
+                            layout.slots.index_slack,
+                            RSQRT_INDEX_SLACK_WIDTH,
+                            eq[1],
+                            &mut left_slots,
+                        );
+                        left_constant = left_constant.add(&eq[2]);
+                        right_constant = eq[0]
+                            .add(&eq[1])
+                            .add(&eq[2].mul(&signed(
+                                -((round_plan.table_real_len - 1) as i128),
+                            )?));
+                    }
+                }
+                let mut left = BatRow::new(BatRowKind::Plain);
+                if !left_slots.is_empty() {
+                    left.add_term(
+                        round_member.bat_oracle,
+                        BatPart::Main,
+                        round_coefficients(&left_slots)?,
+                    );
+                }
+                if let Some(member) = variance_term {
+                    if eq[0] != Fp3::ZERO {
+                        left.add_term(
+                            member.bat_oracle,
+                            BatPart::Main,
+                            scalar_message_coefficients(&norm.variance.shape, eq[0])?,
+                        );
+                    }
+                }
+                left.target = word.output.ends[0].value.sub(&left_constant);
+                left.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown0)?,
+                    word.output.ends[0].mask_scale,
+                );
+                rows.push(left);
+
+                let mut right = BatRow::new(BatRowKind::Plain);
+                if !right_slots.is_empty() {
+                    right.add_term(
+                        round_member.bat_oracle,
+                        BatPart::Main,
+                        round_coefficients(&right_slots)?,
+                    );
+                }
+                right.target = word.output.ends[1].value.sub(&right_constant);
+                right.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown1)?,
+                    word.output.ends[1].mask_scale,
+                );
                 rows.push(right);
             }
             _ => return Err(Error::UnsupportedPrimitive),
@@ -15394,6 +15689,7 @@ mod merged_tests {
             group: norm_group(columns, GROUP, 9600, 60600),
             layout,
             input_bound: 2,
+            table_real_len: 8,
         });
         round_planned.validate().unwrap();
         let with_round =
@@ -15586,6 +15882,7 @@ mod merged_tests {
             group: group(round_columns, GROUP, 9600, 60600),
             layout: round_layout,
             input_bound: 2,
+            table_real_len: 8,
         });
         let mut coins = ByteMaskCoins::new(Digest([0x91; 32])).unwrap();
         let x_values = rows
@@ -15621,14 +15918,32 @@ mod merged_tests {
             &scalar_values(&|row| row.variance as i128),
             &mut coins,
         );
+        let table_real_len = norm
+            .round
+            .as_ref()
+            .ok_or(Error::InvalidConfig)
+            .unwrap()
+            .table_real_len;
+        let rsqrt_rows = core
+            .iter()
+            .map(|row| {
+                crate::proof::hidden_norm::RsqrtRow::from_variance(
+                    row.variance,
+                    table_real_len,
+                    (row.variance % 97) + 3,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
         let round = match &norm.round {
             Some(round_plan) => {
                 let values = core
                     .iter()
-                    .map(|row| {
+                    .zip(&rsqrt_rows)
+                    .map(|(row, rsqrt)| {
                         round_plan
                             .layout
-                            .values(row, round_plan.group.columns)
+                            .values_with_rsqrt(row, rsqrt, round_plan.group.columns)
                             .unwrap()
                     })
                     .collect::<Vec<_>>();
@@ -15693,6 +16008,7 @@ mod merged_tests {
             mean,
             variance,
             round,
+            rsqrt: Some(rsqrt_rows),
             mask: Some(mask_witness),
             lookup: None,
         };
