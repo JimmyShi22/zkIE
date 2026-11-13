@@ -265,8 +265,8 @@ use crate::proof::output_closure::{
 use crate::registry::{RSQRT_COARSE, RSQRT_COARSE_END, RSQRT_FINE, RSQRT_HALF, RSQRT_SHIFT};
 use crate::proof::hidden_norm_psc::{
     NormFirstMessages, NormGroupPlan, NormGroupWitness, NormLookupMessage, NormLookupSecond,
-    NormMaskMessage, NormMaskPlan, NormMaskWitness, NormParamClaimMessage, NormParamMessage,
-    NormPlan, NormPositionBinding, NormPscSecond,
+    NormMaskMessage, NormMaskPlan, NormMaskWitness, NormOutputMessage, NormParamClaimMessage,
+    NormParamMessage, NormPlan, NormPositionBinding, NormPscSecond,
     NormRowBinding, NormWitness, RSQRT_FINE_SLACK_WIDTH, RSQRT_INDEX_SLACK_WIDTH,
     RSQRT_INDEX_WIDTH, RSQRT_MID_HIGH_WIDTH, RSQRT_RAW_REMAINDER_WIDTH,
 };
@@ -9705,6 +9705,47 @@ const NORM_PARAM_GAIN_ROOT_TAG: u64 = 108;
 const NORM_PARAM_BIAS_ROOT_TAG: u64 = 109;
 const NORM_PARAM_GAIN_ANSWER_TAG: u64 = 110;
 const NORM_PARAM_BIAS_ANSWER_TAG: u64 = 111;
+const NORM_OUTPUT_BROADCAST_ROOT_TAG: u64 = 112;
+const NORM_OUTPUT_PRODUCT_ROOT_TAG: u64 = 113;
+const NORM_OUTPUT_IMAGE_ROOT_TAG: u64 = 114;
+const NORM_OUTPUT_OUT_ROOT_TAG: u64 = 115;
+const NORM_OUTPUT_BROADCAST_SEED_TAG: u64 = 116;
+const NORM_OUTPUT_PRODUCT_SEED_TAG: u64 = 117;
+const NORM_OUTPUT_IMAGE_SEED_TAG: u64 = 118;
+const NORM_OUTPUT_OUT_SEED_TAG: u64 = 119;
+const NORM_OUTPUT_BROADCAST_ANSWER_TAG: u64 = 120;
+const NORM_OUTPUT_PRODUCT_ANSWER_TAG: u64 = 121;
+const NORM_OUTPUT_IMAGE_ANSWER_TAG: u64 = 122;
+const NORM_OUTPUT_OUT_ANSWER_TAG: u64 = 123;
+const NORM_OUTPUT_BROADCAST_POSITION_TAG: u64 = 124;
+const NORM_OUTPUT_PRODUCT_POSITION_TAG: u64 = 125;
+const NORM_OUTPUT_IMAGE_POSITION_TAG: u64 = 126;
+const NORM_OUTPUT_OUT_POSITION_TAG: u64 = 127;
+
+const NORM_OUTPUT_ROOT_TAGS: [u64; 4] = [
+    NORM_OUTPUT_BROADCAST_ROOT_TAG,
+    NORM_OUTPUT_PRODUCT_ROOT_TAG,
+    NORM_OUTPUT_IMAGE_ROOT_TAG,
+    NORM_OUTPUT_OUT_ROOT_TAG,
+];
+const NORM_OUTPUT_SEED_TAGS: [u64; 4] = [
+    NORM_OUTPUT_BROADCAST_SEED_TAG,
+    NORM_OUTPUT_PRODUCT_SEED_TAG,
+    NORM_OUTPUT_IMAGE_SEED_TAG,
+    NORM_OUTPUT_OUT_SEED_TAG,
+];
+const NORM_OUTPUT_ANSWER_TAGS: [u64; 4] = [
+    NORM_OUTPUT_BROADCAST_ANSWER_TAG,
+    NORM_OUTPUT_PRODUCT_ANSWER_TAG,
+    NORM_OUTPUT_IMAGE_ANSWER_TAG,
+    NORM_OUTPUT_OUT_ANSWER_TAG,
+];
+const NORM_OUTPUT_POSITION_TAGS: [u64; 4] = [
+    NORM_OUTPUT_BROADCAST_POSITION_TAG,
+    NORM_OUTPUT_PRODUCT_POSITION_TAG,
+    NORM_OUTPUT_IMAGE_POSITION_TAG,
+    NORM_OUTPUT_OUT_POSITION_TAG,
+];
 
 fn norm_group_plans(plan: &NormPlan) -> Vec<&NormGroupPlan> {
     let mut groups = vec![
@@ -10064,6 +10105,45 @@ fn lookup_mask_sample_row(
         message,
         target,
     )
+}
+
+/// The four output tail groups of the first-stage commitment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NormOutputGroup {
+    Broadcast,
+    Product,
+    Image,
+    Out,
+}
+
+/// The committed column values of one output tail group, one row per
+/// position. The signed integers are encoded exactly like the other norm
+/// group values.
+fn norm_output_values(
+    rows: &[crate::proof::hidden_norm::NormOutputRow],
+    columns: u64,
+    group: NormOutputGroup,
+) -> Result<Vec<Vec<Fp3>>> {
+    use crate::proof::output_closure::fp3_signed;
+    let width = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    let mut values = Vec::with_capacity(rows.len());
+    for row in rows {
+        let signed: Vec<i128> = match group {
+            NormOutputGroup::Broadcast => row.broadcast.iter().map(|value| *value as i128).collect(),
+            NormOutputGroup::Product => row.product.clone(),
+            NormOutputGroup::Image => row.image.clone(),
+            NormOutputGroup::Out => row.out.iter().map(|value| *value as i128).collect(),
+        };
+        if signed.len() != width {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut message = Vec::with_capacity(width);
+        for value in signed {
+            message.push(fp3_signed(value)?);
+        }
+        values.push(message);
+    }
+    Ok(values)
 }
 
 fn prove_norm_first(
@@ -10648,6 +10728,155 @@ fn prove_norm_first(
         }
         _ => return Err(Error::ShapeMismatch),
     };
+    let output = match (&norm.output, &witness.output) {
+        (Some(output_plan), Some(output_witness)) => {
+            let output_groups = [
+                (
+                    &output_plan.broadcast,
+                    &output_witness.broadcast,
+                    NormOutputGroup::Broadcast,
+                ),
+                (
+                    &output_plan.product,
+                    &output_witness.product,
+                    NormOutputGroup::Product,
+                ),
+                (
+                    &output_plan.image,
+                    &output_witness.image,
+                    NormOutputGroup::Image,
+                ),
+                (&output_plan.out, &output_witness.out, NormOutputGroup::Out),
+            ];
+            if output_witness.rows.len() != positions as usize {
+                return Err(Error::ShapeMismatch);
+            }
+            for (group_plan, group_witness, kind) in &output_groups {
+                if group_witness.committed.group.group != group_plan.group
+                    || group_witness.committed.group.fault(positions).is_some()
+                    || group_witness.committed.roots.len() != positions as usize
+                    || group_witness.messages.len() != positions as usize
+                    || group_witness.tails.len() != positions as usize
+                    || group_witness.salts.len() != positions as usize
+                    || group_witness.pads.len() != positions as usize
+                {
+                    return Err(Error::ShapeMismatch);
+                }
+                for (position, entry) in group_witness.committed.group.entries.iter().enumerate() {
+                    if entry.position != position as u32
+                        || entry.oracle
+                            != group_plan
+                                .oracle_base
+                                .checked_add(position as u64)
+                                .ok_or(Error::ResourceLimit)?
+                        || entry.shape != group_plan.shape.oracle_shape()
+                        || entry.tree != group_plan.shape.tree_plan(position as u32)?
+                        || entry.root == Digest::ZERO
+                    {
+                        return Err(Error::StatementMismatch);
+                    }
+                }
+                let expected =
+                    norm_output_values(&output_witness.rows, group_plan.columns, *kind)?;
+                let row_count = usize::try_from(group_plan.shape.main_rows)
+                    .map_err(|_| Error::ResourceLimit)?;
+                let ell = usize::try_from(group_plan.shape.code.ell)
+                    .map_err(|_| Error::ResourceLimit)?;
+                let columns = usize::try_from(group_plan.columns)
+                    .map_err(|_| Error::ResourceLimit)?;
+                for (position, message) in group_witness.messages.iter().enumerate() {
+                    if message.len() != row_count || message.iter().any(|row| row.len() != ell) {
+                        return Err(Error::ShapeMismatch);
+                    }
+                    for slot in 0..columns {
+                        let row = slot % row_count;
+                        let place = slot / row_count;
+                        if place >= ell
+                            || message
+                                .get(row)
+                                .and_then(|row| row.get(place))
+                                .copied()
+                                .ok_or(Error::ShapeMismatch)?
+                                != expected[position][slot]
+                        {
+                            return Err(Error::StatementMismatch);
+                        }
+                    }
+                }
+            }
+            for (tag, (_, group_witness, _)) in
+                NORM_OUTPUT_ROOT_TAGS.iter().zip(output_groups.iter())
+            {
+                absorb_closure_group(chain, *tag, &group_witness.committed.group)?;
+            }
+            let mut output_seeds = Vec::with_capacity(output_groups.len());
+            for (tag, (group_plan, _, _)) in
+                NORM_OUTPUT_SEED_TAGS.iter().zip(output_groups.iter())
+            {
+                output_seeds.push(draw_closure_seed_set(
+                    chain,
+                    *tag,
+                    group_plan.shape.sample_bits()?,
+                    group_plan.shape.answers,
+                )?);
+            }
+            let mut output_answers = Vec::with_capacity(output_groups.len());
+            for ((group_plan, group_witness, _), seed_set) in
+                output_groups.iter().zip(output_seeds.iter())
+            {
+                output_answers.push(value_group_answers(
+                    &group_plan.shape,
+                    group_plan.oracle_base,
+                    group_plan.group,
+                    &group_witness.committed.messages,
+                    seed_set,
+                )?);
+            }
+            for (tag, answers) in NORM_OUTPUT_ANSWER_TAGS.iter().zip(output_answers.iter()) {
+                absorb_tagged_answers(chain, *tag, answers)?;
+            }
+            let mut output_messages = Vec::with_capacity(output_groups.len());
+            for (index, ((group_plan, group_witness, _), seed_set)) in output_groups
+                .iter()
+                .zip(output_seeds.iter())
+                .enumerate()
+            {
+                let drawn = draw_closure_group_positions(
+                    chain,
+                    NORM_OUTPUT_POSITION_TAGS[index],
+                    positions,
+                    group_plan.openings,
+                    group_plan.shape.code.log_n,
+                )?;
+                let openings = open_value_group_openings(
+                    &group_plan.shape,
+                    &group_witness.committed.messages,
+                    &group_witness.tails,
+                    &group_witness.salts,
+                    &drawn,
+                    &group_witness.committed.trees,
+                )?;
+                output_messages.push(CommittedPscGroup {
+                    message: CommittedGroupMessage::new(group_witness.committed.group.clone()),
+                    sample: SendSamples {
+                        seed: seed_set.clone(),
+                        answers: output_answers[index].clone(),
+                    },
+                    positions: drawn,
+                    openings,
+                });
+            }
+            let mut iter = output_messages.into_iter();
+            Some(NormOutputMessage {
+                broadcast: iter.next().ok_or(Error::ShapeMismatch)?,
+                product: iter.next().ok_or(Error::ShapeMismatch)?,
+                image: iter.next().ok_or(Error::ShapeMismatch)?,
+                out: iter.next().ok_or(Error::ShapeMismatch)?,
+            })
+        }
+        (None, None) => None,
+        _ => return Err(Error::ShapeMismatch),
+    };
     let mut iter = group_messages.into_iter();
     Ok((
         NormFirstMessages {
@@ -10661,6 +10890,7 @@ fn prove_norm_first(
             lookup,
             rstd,
             params,
+            output,
         },
         lookup_messages,
         rstd_messages,
@@ -11035,6 +11265,77 @@ fn verify_norm_first(
                     NORM_PARAM_BIAS_ANSWER_TAG,
                     NORM_PARAM_BIAS_POSITION_TAG,
                 )?;
+            }
+        }
+        (None, None) => {}
+        _ => return Err(Error::ShapeMismatch),
+    }
+    match (&norm.output, &message.output) {
+        (Some(output_plan), Some(output)) => {
+            output.check(output_plan, positions)?;
+            let output_groups = [
+                (&output.broadcast, &output_plan.broadcast),
+                (&output.product, &output_plan.product),
+                (&output.image, &output_plan.image),
+                (&output.out, &output_plan.out),
+            ];
+            for (tag, (group_message, _)) in
+                NORM_OUTPUT_ROOT_TAGS.iter().zip(output_groups.iter())
+            {
+                absorb_closure_group(chain, *tag, &group_message.message.group)?;
+            }
+            for (tag, (group_message, group_plan)) in
+                NORM_OUTPUT_SEED_TAGS.iter().zip(output_groups.iter())
+            {
+                let seed_set = draw_closure_seed_set(
+                    chain,
+                    *tag,
+                    group_plan.shape.sample_bits()?,
+                    group_plan.shape.answers,
+                )?;
+                if seed_set != group_message.sample.seed {
+                    return Err(Error::InvalidProof);
+                }
+            }
+            for (index, (group_message, _)) in output_groups.iter().enumerate() {
+                if group_message.sample.answers.len() != positions as usize {
+                    return Err(Error::ShapeMismatch);
+                }
+                absorb_tagged_answers(
+                    chain,
+                    NORM_OUTPUT_ANSWER_TAGS[index],
+                    &group_message.sample.answers,
+                )?;
+            }
+            for (index, (group_message, group_plan)) in output_groups.iter().enumerate() {
+                let drawn = draw_closure_group_positions(
+                    chain,
+                    NORM_OUTPUT_POSITION_TAGS[index],
+                    positions,
+                    group_plan.openings,
+                    group_plan.shape.code.log_n,
+                )?;
+                if drawn != group_message.positions
+                    || group_message.openings.len() != group_message.positions.len()
+                {
+                    return Err(Error::InvalidProof);
+                }
+                for (position, (list, opening)) in
+                    drawn.iter().zip(&group_message.openings).enumerate()
+                {
+                    if opening.positions != *list {
+                        return Err(Error::InvalidIndex);
+                    }
+                    let tree = group_plan.shape.tree_plan(position as u32)?;
+                    let root = group_message
+                        .message
+                        .group
+                        .entries
+                        .get(position)
+                        .map(|entry| entry.root)
+                        .ok_or(Error::ShapeMismatch)?;
+                    verify_runtime_opening(&tree, &root, list, opening)?;
+                }
             }
         }
         (None, None) => {}
@@ -17307,6 +17608,7 @@ mod merged_tests {
             lookup: None,
             rstd: None,
             params: None,
+            output: None,
         };
         let mut plan = hidden_plan(_activation);
         plan.norm = Some(norm);
@@ -20540,6 +20842,189 @@ mod merged_tests {
         assert!(proximity.fault(&shown, None, None).is_some());
         assert!(base.validate().is_ok());
     }
+
+    fn norm_output_plan() -> crate::proof::hidden_norm_psc::NormOutputPlan {
+        use crate::proof::hidden_norm_psc::NormGroupPlan;
+
+        let group = |id: u64, oracle: u64, tree: u64| NormGroupPlan {
+            shape: WShape::new(
+                COLUMNS,
+                code(),
+                1,
+                POSITIONS,
+                SALT,
+                tree,
+                1,
+                W_RUN,
+                W_CONFIGURATION,
+            )
+            .unwrap(),
+            columns: COLUMNS,
+            group: id,
+            oracle_base: oracle,
+            openings: 1,
+        };
+        crate::proof::hidden_norm_psc::NormOutputPlan {
+            broadcast: group(90, 20_000, 61_000),
+            product: group(91, 20_100, 61_100),
+            image: group(92, 20_200, 61_200),
+            out: group(93, 20_300, 61_300),
+            shift: 3,
+            clamp: Some((-1_000, 1_000)),
+        }
+    }
+
+    fn norm_output_fixture(
+        activation: &CommittedActivation,
+    ) -> (HiddenLinPlan, NormWitness, ParamTables) {
+        use crate::proof::hidden_norm::{NormCoreRow, NormOutputRow};
+        use crate::proof::hidden_norm_psc::NormOutputWitness;
+
+        let (mut plan, mut witness, params) = norm_params_fixture(activation);
+        let output_plan = norm_output_plan();
+        plan.norm.as_mut().unwrap().output = Some(output_plan.clone());
+        let gain = vec![2i64, -1, 3, 1];
+        let bias = vec![1i64, 2, -1, 2];
+        let shift = output_plan.shift;
+        let clamp = output_plan.clamp;
+        let mut rows = Vec::new();
+        for row in activation_rows() {
+            let core = NormCoreRow::from_values(&row, HIDDEN as usize).unwrap();
+            let mut padded = row.clone();
+            padded.resize(COLUMNS as usize, 0);
+            rows.push(
+                NormOutputRow::from_core(
+                    &core,
+                    &padded,
+                    100,
+                    &gain,
+                    &bias,
+                    HIDDEN as usize,
+                    shift,
+                    clamp,
+                )
+                .unwrap(),
+            );
+        }
+        let mut coins = ByteMaskCoins::new(Digest([0x92; 32])).unwrap();
+        let signed = |values: Vec<i128>| -> Vec<Fp3> {
+            values
+                .into_iter()
+                .map(|value| crate::proof::output_closure::fp3_signed(value).unwrap())
+                .collect()
+        };
+        let column = |values: &[i128]| signed(values.to_vec());
+        let broadcast_values = rows
+            .iter()
+            .map(|row| column(&row.broadcast.iter().map(|value| *value as i128).collect::<Vec<_>>()))
+            .collect::<Vec<_>>();
+        let product_values = rows
+            .iter()
+            .map(|row| column(&row.product))
+            .collect::<Vec<_>>();
+        let image_values = rows
+            .iter()
+            .map(|row| column(&row.image))
+            .collect::<Vec<_>>();
+        let out_values = rows
+            .iter()
+            .map(|row| column(&row.out.iter().map(|value| *value as i128).collect::<Vec<_>>()))
+            .collect::<Vec<_>>();
+        let output = NormOutputWitness {
+            broadcast: commit_norm_group(&output_plan.broadcast, &broadcast_values, &mut coins),
+            product: commit_norm_group(&output_plan.product, &product_values, &mut coins),
+            image: commit_norm_group(&output_plan.image, &image_values, &mut coins),
+            out: commit_norm_group(&output_plan.out, &out_values, &mut coins),
+            rows,
+        };
+        witness.output = Some(output);
+        plan.validate().unwrap();
+        (plan, witness, params)
+    }
+
+    #[test]
+    fn norm_output_groups_prove_and_verify() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = norm_output_fixture(&activation);
+        let (messages, hidden_witness) = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+            &mut params,
+        )
+        .unwrap();
+        let mut verifier_plan = plan.clone();
+        verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        let outcome = verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &messages).unwrap();
+        assert_eq!(outcome.first_seal, messages.first_seal);
+        let output_plan = plan.norm.as_ref().unwrap().output.as_ref().unwrap();
+        let output = messages.first.norm.as_ref().unwrap().output.as_ref().unwrap();
+        assert_eq!(
+            output.broadcast.message.group.group,
+            output_plan.broadcast.group
+        );
+        assert_eq!(output.out.message.group.group, output_plan.out.group);
+
+        let bytes = messages.encode().unwrap();
+        let base = HiddenLinMessages::decode(&plan, &bytes).unwrap();
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &base).is_ok());
+
+        let mut changed = base.clone();
+        changed
+            .first
+            .norm
+            .as_mut()
+            .unwrap()
+            .output
+            .as_mut()
+            .unwrap()
+            .product
+            .message
+            .group
+            .entries[0]
+            .root = Digest([0x99; 32]);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = base.clone();
+        let sample = &mut changed
+            .first
+            .norm
+            .as_mut()
+            .unwrap()
+            .output
+            .as_mut()
+            .unwrap()
+            .image
+            .sample
+            .answers[0];
+        *sample = sample.add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = base.clone();
+        changed
+            .first
+            .norm
+            .as_mut()
+            .unwrap()
+            .output
+            .as_mut()
+            .unwrap()
+            .out
+            .positions[0][0] += 1;
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = base.clone();
+        changed.first.norm.as_mut().unwrap().output = None;
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut wrong_plan = plan.clone();
+        wrong_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        wrong_plan.norm.as_mut().unwrap().output.as_mut().unwrap().out.group = 94;
+        assert!(verify_hidden_lin_hidden(&wrong_plan, &table.reader(), &base).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -20705,4 +21190,5 @@ mod iopp_stage_plan_tests {
         ];
         assert!(iopp_stage_fault(&wrong_last, main, mask, 2).is_some());
     }
+
 }

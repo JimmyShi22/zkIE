@@ -865,7 +865,7 @@ fn fp3_signed(value: i128) -> Result<Fp3> {
 // sumcheck and the row binding.
 
 /// Version of the integrated norm plan and first message.
-pub const NORM_BIND_VERSION: u64 = 8;
+pub const NORM_BIND_VERSION: u64 = 9;
 
 /// The relation indices the bound core supports. The map construction of
 /// every relation is fixed by the relation index; the plan may list only
@@ -2222,6 +2222,76 @@ impl NormOutputPlan {
     }
 }
 
+/// The public first-stage commitments of the four output tail groups.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormOutputMessage {
+    pub broadcast: CommittedPscGroup,
+    pub product: CommittedPscGroup,
+    pub image: CommittedPscGroup,
+    pub out: CommittedPscGroup,
+}
+
+impl NormOutputMessage {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut writer = CanonicalWriter::new();
+        for group in [&self.broadcast, &self.product, &self.image, &self.out] {
+            group.encode_into(&mut writer)?;
+        }
+        Ok(writer.into_bytes())
+    }
+
+    pub fn decode(plan: &NormOutputPlan, positions: u32, bytes: &[u8]) -> Result<Self> {
+        let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
+        let broadcast = CommittedPscGroup::decode(&mut reader, &plan.broadcast.shape, positions)?;
+        let product = CommittedPscGroup::decode(&mut reader, &plan.product.shape, positions)?;
+        let image = CommittedPscGroup::decode(&mut reader, &plan.image.shape, positions)?;
+        let out = CommittedPscGroup::decode(&mut reader, &plan.out.shape, positions)?;
+        reader.finish()?;
+        let message = Self {
+            broadcast,
+            product,
+            image,
+            out,
+        };
+        message.check(plan, positions)?;
+        Ok(message)
+    }
+
+    /// Checks every group declaration against the trusted output plan. The
+    /// roots are proof values; only the shape, oracle, tree and group
+    /// declarations are compared with the plan.
+    pub fn check(&self, plan: &NormOutputPlan, positions: u32) -> Result<()> {
+        for (message, group) in [
+            (&self.broadcast, &plan.broadcast),
+            (&self.product, &plan.product),
+            (&self.image, &plan.image),
+            (&self.out, &plan.out),
+        ] {
+            if message.message.group.group != group.group
+                || message.fault(&group.shape, positions).is_some()
+                || message.message.roots.len() != positions as usize
+            {
+                return Err(Error::StatementMismatch);
+            }
+            for (position, entry) in message.message.group.entries.iter().enumerate() {
+                if entry.position != position as u32
+                    || entry.oracle
+                        != group
+                            .oracle_base
+                            .checked_add(position as u64)
+                            .ok_or(Error::ResourceLimit)?
+                    || entry.shape != group.shape.oracle_shape()
+                    || entry.tree != group.shape.tree_plan(position as u32)?
+                    || entry.root == Digest::ZERO
+                {
+                    return Err(Error::StatementMismatch);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The prover-side parameter vectors and folded claim material.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormParamWitness {
@@ -2229,6 +2299,17 @@ pub struct NormParamWitness {
     pub bias: Vec<i64>,
     pub gain_claim: Option<NormParamClaimWitness>,
     pub bias_claim: Option<NormParamClaimWitness>,
+}
+
+/// The prover-side output tail: the exact integer rows and the committed
+/// column groups of the broadcast, product, image and out rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormOutputWitness {
+    pub rows: Vec<crate::proof::hidden_norm::NormOutputRow>,
+    pub broadcast: NormGroupWitness,
+    pub product: NormGroupWitness,
+    pub image: NormGroupWitness,
+    pub out: NormGroupWitness,
 }
 
 /// The prover-side witness of the integrated norm groups.
@@ -2253,6 +2334,9 @@ pub struct NormWitness {
     pub rstd: Option<NormLookupWitness>,
     /// The private parameter vectors, when the plan carries the tables.
     pub params: Option<NormParamWitness>,
+    /// The private output tail rows and commitments, when the plan carries
+    /// the output groups.
+    pub output: Option<NormOutputWitness>,
 }
 
 /// The private lookup material of one norm session. The multiplicity bits are
@@ -2681,6 +2765,8 @@ pub struct NormFirstMessages {
     pub rstd: Option<NormLookupMessage>,
     /// The norm parameter table openings, when the plan carries the tables.
     pub params: Option<NormParamMessage>,
+    /// The output tail group commitments, when the plan carries them.
+    pub output: Option<NormOutputMessage>,
 }
 
 impl NormFirstMessages {
@@ -2714,6 +2800,9 @@ impl NormFirstMessages {
         }
         if let Some(params) = &self.params {
             writer.put_bytes(&params.encode()?);
+        }
+        if let Some(output) = &self.output {
+            writer.put_bytes(&output.encode()?);
         }
         Ok(writer.into_bytes())
     }
@@ -2781,6 +2870,14 @@ impl NormFirstMessages {
             )?),
             None => None,
         };
+        let output = match &plan.output {
+            Some(output_plan) => Some(NormOutputMessage::decode(
+                output_plan,
+                positions,
+                reader.get_bytes()?,
+            )?),
+            None => None,
+        };
         reader.finish()?;
         let message = Self {
             x,
@@ -2793,6 +2890,7 @@ impl NormFirstMessages {
             lookup,
             rstd,
             params,
+            output,
         };
         message.check_trusted(plan)?;
         Ok(message)
@@ -2883,6 +2981,13 @@ impl NormFirstMessages {
         }
         match (&plan.params, &self.params) {
             (Some(params_plan), Some(message)) => message.check(params_plan)?,
+            (None, None) => {}
+            _ => return Err(Error::ShapeMismatch),
+        }
+        match (&plan.output, &self.output) {
+            (Some(output_plan), Some(message)) => {
+                message.check(output_plan, plan.shape.positions)?
+            }
             (None, None) => {}
             _ => return Err(Error::ShapeMismatch),
         }
@@ -4537,6 +4642,7 @@ mod tests {
             lookup: None,
             rstd: None,
             params: None,
+            output: None,
         };
         (plan, message, second)
     }
