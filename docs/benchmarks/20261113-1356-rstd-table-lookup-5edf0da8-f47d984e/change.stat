@@ -1,0 +1,33 @@
+commit 5edf0da83a61eddb0d359e1604999ad299ef448d
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Fri Nov 13 13:56:37 2026 +0800
+
+    Wire the frozen rstd table lookup into the hidden norm chain
+    
+    The norm first and second stages now commit, absorb and prove the frozen-table
+    lookup over the rounding rows: key column zero reads the committed index value
+    slot and column one the committed table value slot, the multiplicity bits and
+    mask go through the existing sample and tree machinery, the lookup challenge is
+    drawn after the plan, table identity and message roots, and the lookup claims
+    and rows join the hidden BAT, fold, mask budget and retained trees.
+    
+    The verifier binds the trusted table configuration (identity, content root,
+    real length, encoding, version) from the plan and checks that the table object
+    it reads hashes to the trusted content root; the table view check also compares
+    the public first-row padding pair. The rounding plan's trusted table length
+    keeps every committed index below the real length through the index-bound
+    relation. The hidden fixture builds a synthetic ranged table and commits
+    matching index and value slots.
+    
+    The positive chain plus nine negatives pass: committed value, committed index,
+    out-of-range index, table identity, table content, table length, padded row,
+    key-side padding, and tampered message roots and claims. Hard gate unchanged.
+    
+    partial progress
+
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     |   35 +
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 1245 +++++++++++++++++++++-
+ crates/zkie-ops/src/proof/lookup.rs              |   67 ++
+ crates/zkie-ops/src/proof/lookup_table.rs        |    8 +
+ crates/zkie-ops/src/proof/proximity_iopp.rs      |   11 +
+ 5 files changed, 1320 insertions(+), 46 deletions(-)
