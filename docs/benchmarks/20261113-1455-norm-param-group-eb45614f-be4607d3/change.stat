@@ -1,0 +1,21 @@
+commit eb45614fa5a73a5aac30d0b58321549e57c000b2
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Fri Nov 13 14:55:41 2026 +0800
+
+    Join the parameter claims into the shared proximity group
+    
+    The shared stage now adds one member per parameter claim to the proximity
+    group: the folded message committed as G_u with the group code, its sample row,
+    and the record and column declaration rows built from the same claim message
+    and plan reader on both sides. The prover supplies the committed folded
+    message material through the norm witness and rebuilds the tree; the verifier
+    builds the same members and rows from the first message. The member and row
+    counts, the fold shape and the base and mask budgets stay member derived. A
+    test checks that the shared claims carry the parameter sample, record and
+    column rows.
+    
+    partial progress
+
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     |  12 +-
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 294 +++++++++++++++++++++--
+ 2 files changed, 284 insertions(+), 22 deletions(-)
