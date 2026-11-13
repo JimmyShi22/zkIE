@@ -128,6 +128,8 @@ pub struct NormCoreRow {
     /// first.
     pub sum_negative: bool,
     pub sum_digits: Vec<u8>,
+    pub mean_negative: bool,
+    pub mean_digits: Vec<u8>,
     pub squares_digits: Vec<u8>,
     pub variance_digits: Vec<u8>,
     /// The exact rounding decomposition of the mean: `u = r - lo` and
@@ -176,19 +178,8 @@ impl NormCoreRow {
         let variance_remainder = squares
             .checked_sub((variance as i128) * divisor)
             .ok_or(Error::BoundViolation)?;
-        let magnitude = sum.unsigned_abs();
-        let mut sum_digits = Vec::new();
-        let mut rest = magnitude;
-        loop {
-            sum_digits.push((rest & 0xff) as u8);
-            rest >>= 8;
-            if rest == 0 {
-                break;
-            }
-        }
-        if sum_digits.is_empty() {
-            sum_digits.push(0);
-        }
+        let sum_digits = unsigned_digits(sum.unsigned_abs())?;
+        let mean_digits = unsigned_digits(mean.unsigned_abs() as u128)?;
         let squares_digits = unsigned_digits(squares.unsigned_abs() as u128)?;
         let variance_digits = unsigned_digits(variance.unsigned_abs() as u128)?;
         let half = (valid / 2) as i128;
@@ -224,6 +215,8 @@ impl NormCoreRow {
             variance_remainder,
             sum_negative: sum < 0,
             sum_digits,
+            mean_negative: mean < 0,
+            mean_digits,
             squares_digits,
             variance_digits,
             mean_offset,
@@ -272,6 +265,21 @@ impl NormCoreRow {
             return Err(Error::InvalidProof);
         }
         if self.squares < 0 || self.variance < 0 {
+            return Err(Error::InvalidProof);
+        }
+        let sum_digits = digits_value(&self.sum_digits).map_err(|_| Error::InvalidProof)?;
+        let mean_digits = digits_value(&self.mean_digits).map_err(|_| Error::InvalidProof)?;
+        let squares_digits =
+            digits_value(&self.squares_digits).map_err(|_| Error::InvalidProof)?;
+        let variance_digits =
+            digits_value(&self.variance_digits).map_err(|_| Error::InvalidProof)?;
+        if self.sum_negative != (self.sum < 0)
+            || self.mean_negative != (self.mean < 0)
+            || sum_digits != self.sum.unsigned_abs()
+            || mean_digits != self.mean.unsigned_abs() as u128
+            || squares_digits != self.squares as u128
+            || variance_digits != self.variance.unsigned_abs() as u128
+        {
             return Err(Error::InvalidProof);
         }
         Ok(())
@@ -543,6 +551,12 @@ mod tests {
         let mut changed = witness.clone();
         changed.rows[0].variance_complement_digits[0] ^= 1;
         assert!(changed.check(&plan).is_err());
+        let mut changed = witness.clone();
+        changed.rows[0].mean_digits[0] ^= 1;
+        assert!(changed.check(&plan).is_err());
+        let mut changed = witness.clone();
+        changed.rows[0].mean_negative = true;
+        assert!(changed.check(&plan).is_err());
     }
 
     #[test]
@@ -557,6 +571,8 @@ mod tests {
         assert_eq!(negative.mean_remainder, 1);
         assert_eq!(negative.mean_offset, 3);
         assert_eq!(negative.mean_complement, 0);
+        assert!(negative.mean_negative);
+        assert_eq!(negative.mean_digits, vec![1]);
         negative.check(&[-3, 0, 0, 0], 4).unwrap();
 
         let odd = NormCoreRow::from_values(&[1, 0, 0], 3).unwrap();
