@@ -75,7 +75,22 @@ pub fn run(args: &[String], provider: &dyn PipelineProvider) -> Result<VerifyRec
     let progress = Arc::new(JsonlProgressSink::create(&request.run_dir, "verify")?);
     let _heartbeat = HeartbeatGuard::start(Arc::clone(&progress));
     let mut metrics = Metrics::new();
-    let runtime = RuntimeConfig::default();
+    let mut runtime = RuntimeConfig::default();
+    // The bounded trace decoder refuses a proof file larger than the decode
+    // budget. Size the default budget from the proof file so a routine
+    // verification of a large production proof works without a flag, while a
+    // small proof keeps the default. The scaling leaves room for the decoded
+    // structure on top of the file bytes.
+    if let Ok(metadata) = fs::metadata(&request.proof) {
+        let scaled = metadata
+            .len()
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(1 << 30))
+            .unwrap_or(u64::MAX);
+        if scaled > runtime.memory_budget_bytes {
+            runtime.memory_budget_bytes = scaled;
+        }
+    }
     let mut services = PipelineServices::new(provider, progress.as_ref(), &mut metrics, &runtime);
     let result = pipeline::verify_request(&request, &mut services);
 
