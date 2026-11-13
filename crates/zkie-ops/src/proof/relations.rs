@@ -448,16 +448,39 @@ pub fn prove_op_relation(
     inputs: &[Vec<i64>],
     config: &[i64],
 ) -> Result<(OpRelationPublic, OpRelationProof)> {
-    prove_op_relation_shared(op, inputs, config, &[])
+    prove_op_relation_with_inputs(op, inputs, config, &[])
 }
 
-/// Prove a relation where selected inputs are supplied by a shared model
-/// commitment instead of a local oracle. External inputs carry no openings.
+/// Prove a relation with every input committed and opened in this proof. The
+/// request path keeps this form.
+pub fn prove_op_relation_with_inputs(
+    op: &dyn PureForward,
+    inputs: &[Vec<i64>],
+    config: &[i64],
+    external: &[usize],
+) -> Result<(OpRelationPublic, OpRelationProof)> {
+    prove_op_relation_inner(op, inputs, config, external, true)
+}
+
+/// Prove a relation where every input is supplied by the trusted plan and is
+/// materialized by the verifier: no input oracle is committed and no input
+/// opening is carried. The external list still marks the plan-mapped asset
+/// ports; those inputs carry no opening in either form.
 pub fn prove_op_relation_shared(
     op: &dyn PureForward,
     inputs: &[Vec<i64>],
     config: &[i64],
     external: &[usize],
+) -> Result<(OpRelationPublic, OpRelationProof)> {
+    prove_op_relation_inner(op, inputs, config, external, false)
+}
+
+fn prove_op_relation_inner(
+    op: &dyn PureForward,
+    inputs: &[Vec<i64>],
+    config: &[i64],
+    external: &[usize],
+    commit_inputs: bool,
 ) -> Result<(OpRelationPublic, OpRelationProof)> {
     let _profile = zkie_core::profile::Scope::operator(op.opcode() as u16);
     let record = op.forward_values(inputs)?;
@@ -469,7 +492,7 @@ pub fn prove_op_relation_shared(
     let mut input_openings = Vec::new();
     let mut input_oracles = Vec::new();
     for (index, values) in inputs.iter().enumerate() {
-        if external.contains(&index) {
+        if !commit_inputs || external.contains(&index) {
             input_oracles.push(OracleId(u64::MAX));
             input_openings.push(Vec::new());
             continue;

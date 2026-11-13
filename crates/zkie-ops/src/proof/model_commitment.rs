@@ -880,46 +880,21 @@ fn verify_shared_trace_steps(
             input_oracles,
             output_oracles,
         };
-        let mut external_values: Vec<Option<Vec<i64>>> = vec![None; input_count];
-        for (input, pool) in step.external.iter().enumerate() {
-            if let Some(pool) = pool {
-                let opening = trace.assets.get(*pool).ok_or(Error::StatementMismatch)?;
-                let mut values = Vec::with_capacity(opening.rows.len() * opening.rows.first().map(|row| row.values.len()).unwrap_or(0));
-                for row in &opening.rows {
-                    values.extend(row.values.iter().map(|value| *value as i64));
-                }
-                let slot = external_values
-                    .get_mut(input)
-                    .ok_or(Error::ShapeMismatch)?;
-                if slot.replace(values).is_some() {
-                    return Err(Error::StatementMismatch);
-                }
-            }
-        }
-        crate::proof::relations::verify_op_relation_with_external(
-            &public_relation,
-            &step.message.proof,
-            &step.message.config,
-            &external_values,
-        )?;
-        let inputs = crate::proof::relations::proof_input_values(&step.message.proof)?;
-        for (index, source) in step.sources.iter().enumerate() {
-            if let Some((step_index, output_index)) = source {
-                let expected = outputs
-                    .get(*step_index)
-                    .and_then(|values| values.get(*output_index))
-                    .ok_or(Error::StatementMismatch)?;
-                if inputs.get(index) != Some(expected) {
-                    return Err(Error::StatementMismatch);
-                }
-            }
-        }
-        crate::proof::plan::verify_step(
+        crate::proof::plan::check_shared_input_form(step)?;
+        let materialized = crate::proof::plan::verify_step(
             step,
             plan_step,
             &outputs,
             &assets,
             expected_tokens,
+        )?;
+        let external_values: Vec<Option<Vec<i64>>> =
+            materialized.into_iter().map(Some).collect();
+        crate::proof::relations::verify_op_relation_with_external(
+            &public_relation,
+            &step.message.proof,
+            &step.message.config,
+            &external_values,
         )?;
         outputs.push(crate::proof::relations::proof_output_values(&step.message.proof)?);
     }

@@ -16,7 +16,7 @@ use crate::op::OpCode;
 use crate::proof::model_commitment::{
     AssetMeta, AssetOpening, ModelCommitmentPublic, SharedTrace, SharedTraceStep,
 };
-use crate::proof::relations::{proof_input_values, proof_output_values};
+use crate::proof::relations::proof_output_values;
 
 /// One expected input source.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -936,15 +936,6 @@ impl<'a> AssetView<'a> {
         Ok(values)
     }
 
-    fn external_values(&self, pool: usize) -> Result<Vec<i64>> {
-        let opening = self.trace.assets.get(pool).ok_or(Error::StatementMismatch)?;
-        let mut values = Vec::new();
-        for row in &opening.rows {
-            values.extend(row.values.iter().map(|value| *value as i64));
-        }
-        Ok(values)
-    }
-
     fn asset_id(&self, path: &str) -> Result<u64> {
         Ok(self.meta(path)?.asset_id)
     }
@@ -1133,14 +1124,10 @@ pub(crate) fn verify_step(
     verified_outputs: &[Vec<Vec<i64>>],
     assets: &AssetView<'_>,
     tokens: &[u32],
-) -> Result<()> {
+) -> Result<Vec<Vec<i64>>> {
     verify_step_structure(step, plan_step, assets)?;
-    let input_count = step.message.proof.lengths.inputs.len();
     let output_count = step.message.proof.lengths.outputs.len();
-    let inputs = proof_input_values(&step.message.proof)?;
-    if inputs.len() != input_count {
-        return Err(Error::ShapeMismatch);
-    }
+    let mut inputs = Vec::with_capacity(plan_step.inputs.len());
     for (port, source) in plan_step.inputs.iter().enumerate() {
         let external = step.external.get(port).copied().flatten();
         let edge = step.sources.get(port).copied().flatten();
@@ -1152,10 +1139,9 @@ pub(crate) fn verify_step(
                 let pool = external.ok_or(Error::StatementMismatch)?;
                 let meta = assets.meta(path)?;
                 // A flat external asset is supplied by the verified opening
-                // itself. Check the planned identity and full coverage; value
-                // equality follows from the anchor-bound, Merkle-verified
-                // opening, so no materialization is needed. Partial rows keep
-                // the materialized comparison path below.
+                // itself. Check the planned identity and full coverage; the
+                // values are materialized from the same opening below, so no
+                // prover-supplied copy enters.
                 if meta.row_width != 0 && meta.element_count % meta.row_width as u64 == 0 {
                     let opening = assets
                         .trace
@@ -1170,7 +1156,6 @@ pub(crate) fn verify_step(
                     {
                         return Err(Error::IncompleteArtifact);
                     }
-                    continue;
                 }
             }
         }
@@ -1191,44 +1176,27 @@ pub(crate) fn verify_step(
                 } else if edge.is_some() {
                     return Err(Error::StatementMismatch);
                 }
-                if inputs.get(port).map(|values| values.as_slice())
-                    != Some(expected.as_slice())
-                {
-                    return Err(Error::StatementMismatch);
-                }
             }
             SourceKind::Asset => {
                 if edge.is_some() {
                     return Err(Error::StatementMismatch);
                 }
-                match external {
-                    Some(pool) => {
-                        let plan_asset = assets.asset_id(match source {
+                if let Some(pool) = external {
+                    let plan_asset = assets.asset_id(match source {
+                        PlanSource::Asset { path, .. } => path,
+                        PlanSource::Layout(inner, _) => match inner.as_ref() {
                             PlanSource::Asset { path, .. } => path,
-                            PlanSource::Layout(inner, _) => match inner.as_ref() {
-                                PlanSource::Asset { path, .. } => path,
-                                _ => return Err(Error::StatementMismatch),
-                            },
                             _ => return Err(Error::StatementMismatch),
-                        })?;
-                        let opening = assets
-                            .trace
-                            .assets
-                            .get(pool)
-                            .ok_or(Error::StatementMismatch)?;
-                        if opening.asset_id != plan_asset {
-                            return Err(Error::StatementMismatch);
-                        }
-                        if assets.external_values(pool)?.as_slice() != expected.as_slice() {
-                            return Err(Error::StatementMismatch);
-                        }
-                    }
-                    None => {
-                        if inputs.get(port).map(|values| values.as_slice())
-                            != Some(expected.as_slice())
-                        {
-                            return Err(Error::StatementMismatch);
-                        }
+                        },
+                        _ => return Err(Error::StatementMismatch),
+                    })?;
+                    let opening = assets
+                        .trace
+                        .assets
+                        .get(pool)
+                        .ok_or(Error::StatementMismatch)?;
+                    if opening.asset_id != plan_asset {
+                        return Err(Error::StatementMismatch);
                     }
                 }
             }
@@ -1236,15 +1204,26 @@ pub(crate) fn verify_step(
                 if external.is_some() || edge.is_some() {
                     return Err(Error::StatementMismatch);
                 }
-                if inputs.get(port).map(|values| values.as_slice()) != Some(expected.as_slice()) {
-                    return Err(Error::StatementMismatch);
-                }
             }
         }
+        inputs.push(expected.as_slice().to_vec());
     }
     let outputs = proof_output_values(&step.message.proof)?;
     if outputs.len() != output_count {
         return Err(Error::ShapeMismatch);
+    }
+    Ok(inputs)
+}
+
+/// Version of the shared-trace input binding. Version 2 materializes every
+/// relation input from its trusted plan source and carries no input openings.
+pub const SHARED_TRACE_INPUT_VERSION: u64 = 2;
+
+/// A shared-trace step carries no input openings. A step that still carries
+/// one was produced by the version 1 form and is rejected.
+pub(crate) fn check_shared_input_form(step: &SharedTraceStep) -> Result<()> {
+    if step.message.proof.inputs.iter().any(|group| !group.is_empty()) {
+        return Err(Error::UnsupportedVersion);
     }
     Ok(())
 }

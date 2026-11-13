@@ -864,7 +864,7 @@ mod tests {
     };
     use crate::proof::plan::{PlanStep, TracePlan};
     use crate::proof::relations::{
-        prove_op_relation_shared, OpRelationProof, RelationLengths, RelationReceiptMessage,
+        prove_op_relation_with_inputs, OpRelationProof, RelationLengths, RelationReceiptMessage,
     };
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -938,7 +938,7 @@ mod tests {
         let op = MatMulOp { m, n, k, shift };
         let config = vec![m as i64, n as i64, k as i64, shift as i64, 0];
         let (relation, proof) =
-            prove_op_relation_shared(&op, &[lhs, rhs.clone()], &config, &[1]).unwrap();
+            prove_op_relation_with_inputs(&op, &[lhs, rhs.clone()], &config, &[1]).unwrap();
         let mut roots = Vec::new();
         for id in relation.registry.ids() {
             let root = relation.registry.get(id).unwrap();

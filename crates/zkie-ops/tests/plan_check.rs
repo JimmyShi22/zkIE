@@ -12,7 +12,8 @@ use zkie_ops::proof::model_commitment::{
 };
 use zkie_ops::proof::plan::{config, PlanBuilder, PlanConstant, PlanLayout, PlanSource, TracePlan};
 use zkie_ops::proof::relations::{
-    proof_output_values, prove_op_relation_shared, RelationReceiptMessage,
+    proof_output_values, prove_op_relation_shared, prove_op_relation_with_inputs,
+    RelationReceiptMessage,
 };
 use zkie_ops::registry::PureForward;
 use zkie_ops::table_lookup::TableLookupOp;
@@ -287,6 +288,70 @@ fn negative_external_and_missing_ports() {
     negative.trace.steps[1].message.proof.outputs.clear();
     negative.trace.steps[1].message.proof.lengths.outputs.clear();
     assert_eq!(rejection_code(&negative), "shape_mismatch");
+}
+
+fn with_step_zero(
+    fixture: &Fixture,
+    proof: zkie_ops::proof::relations::OpRelationProof,
+    public: &zkie_ops::proof::relations::OpRelationPublic,
+) -> Fixture {
+    let mut roots = Vec::new();
+    for id in public.registry.ids() {
+        let root = public.registry.get(id).unwrap();
+        roots.push((root.root, root.start, root.count));
+    }
+    let mut changed = Fixture {
+        public: fixture.public.clone(),
+        trace: fixture.trace.clone(),
+        tokens: fixture.tokens.clone(),
+        plan: fixture.plan.clone(),
+    };
+    changed.trace.steps[0] = SharedTraceStep {
+        message: RelationReceiptMessage {
+            opcode: OpCode::EmbeddingIndex as u16,
+            config: vec![1, 4],
+            roots,
+            external_inputs: Vec::new(),
+            proof,
+        },
+        external: vec![None],
+        sources: vec![None],
+    };
+    changed
+}
+
+#[test]
+fn old_form_input_openings_are_rejected() {
+    let fixture = one_asset_fixture(&[2], true);
+    let op = EmbeddingIndexOp { hidden: 1, vocab: 4 };
+    let token_values: Vec<i64> = fixture.tokens.iter().map(|value| *value as i64).collect();
+    let (public, proof) =
+        prove_op_relation_with_inputs(&op, &[token_values], &[1, 4], &[]).unwrap();
+    let negative = with_step_zero(&fixture, proof, &public);
+    assert_eq!(rejection_code(&negative), "unsupported_version");
+}
+
+#[test]
+fn materialized_input_mismatch_is_rejected() {
+    let fixture = one_asset_fixture(&[2], true);
+    let op = EmbeddingIndexOp { hidden: 1, vocab: 4 };
+    // The plan materializes token 2; the step was proved for token 3.
+    let (public, proof) = prove_op_relation_shared(&op, &[vec![3]], &[1, 4], &[]).unwrap();
+    let negative = with_step_zero(&fixture, proof, &public);
+    assert_eq!(rejection_code(&negative), "invalid_proof");
+}
+
+#[test]
+fn step_output_opening_tamper_is_rejected() {
+    let fixture = one_asset_fixture(&[2], true);
+    let mut negative = Fixture {
+        public: fixture.public.clone(),
+        trace: fixture.trace.clone(),
+        tokens: fixture.tokens.clone(),
+        plan: fixture.plan.clone(),
+    };
+    negative.trace.steps[1].message.proof.outputs[0][0].values[0] ^= 1;
+    assert_eq!(rejection_code(&negative), "invalid_proof");
 }
 
 #[test]

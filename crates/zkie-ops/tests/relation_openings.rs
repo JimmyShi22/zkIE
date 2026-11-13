@@ -7,8 +7,9 @@ use zkie_ops::proof::binding::{
     commit_rows_with_openings, OracleId, OracleOpening, OracleRegistry,
 };
 use zkie_ops::proof::relations::{
-    proof_input_values, prove_op_relation_shared, verify_op_relation_with_external,
-    OpRelationProof, OpRelationPublic, RelationConfig, RelationLengths,
+    proof_input_values, prove_op_relation_shared, prove_op_relation_with_inputs,
+    verify_op_relation_with_external, OpRelationProof, OpRelationPublic, RelationConfig,
+    RelationLengths,
 };
 use zkie_ops::softmax::SoftmaxOp;
 
@@ -23,7 +24,7 @@ fn matmul_fixture() -> (OpRelationPublic, OpRelationProof, Vec<i64>) {
     let rhs = (1..=4).map(|value| value * 2).collect::<Vec<i64>>();
     let inputs = vec![lhs, rhs];
     let config = op.relation_config(&inputs).unwrap();
-    let (public, proof) = prove_op_relation_shared(&op, &inputs, &config, &[]).unwrap();
+    let (public, proof) = prove_op_relation_with_inputs(&op, &inputs, &config, &[]).unwrap();
     (public, proof, config)
 }
 
@@ -36,8 +37,23 @@ fn affine_fixture() -> (OpRelationPublic, OpRelationProof, Vec<i64>) {
     };
     let inputs = vec![vec![1, 2, 3]];
     let config = op.relation_config(&inputs).unwrap();
-    let (public, proof) = prove_op_relation_shared(&op, &inputs, &config, &[]).unwrap();
+    let (public, proof) = prove_op_relation_with_inputs(&op, &inputs, &config, &[]).unwrap();
     (public, proof, config)
+}
+
+fn shared_fixture() -> (OpRelationPublic, OpRelationProof, Vec<i64>, Vec<Vec<i64>>) {
+    let op = MatMulOp {
+        m: 3,
+        n: 2,
+        k: 2,
+        shift: 0,
+    };
+    let lhs = (1..=6).collect::<Vec<i64>>();
+    let rhs = (1..=4).map(|value| value * 2).collect::<Vec<i64>>();
+    let inputs = vec![lhs, rhs];
+    let config = op.relation_config(&inputs).unwrap();
+    let (public, proof) = prove_op_relation_shared(&op, &inputs, &config, &[]).unwrap();
+    (public, proof, config, inputs)
 }
 
 fn verify_code(public: &OpRelationPublic, proof: &OpRelationProof, config: &[i64]) -> String {
@@ -94,6 +110,38 @@ fn pathless_partial_coverage_is_rejected() {
     let mut reordered = proof.clone();
     reordered.outputs[0].swap(1, 2);
     assert_eq!(verify_code(&public, &reordered, &config), "invalid_index");
+}
+
+#[test]
+fn shared_form_carries_no_input_openings() {
+    let (public, proof, config, inputs) = shared_fixture();
+    assert!(proof.inputs.iter().all(|group| group.is_empty()));
+    assert!(public
+        .input_oracles
+        .iter()
+        .all(|oracle| oracle.0 == u64::MAX));
+    let values: Vec<Option<Vec<i64>>> = inputs.iter().cloned().map(Some).collect();
+    verify_op_relation_with_external(&public, &proof, &config, &values).unwrap();
+
+    // A materialized value that differs from the prover's input is rejected by
+    // the relation equation.
+    let mut changed = inputs.clone();
+    changed[0][0] ^= 1;
+    let wrong: Vec<Option<Vec<i64>>> = changed.into_iter().map(Some).collect();
+    assert_eq!(
+        verify_op_relation_with_external(&public, &proof, &config, &wrong)
+            .unwrap_err()
+            .code(),
+        "invalid_proof"
+    );
+
+    // Missing materialized values are missing authentication.
+    assert_eq!(
+        verify_op_relation_with_external(&public, &proof, &config, &[])
+            .unwrap_err()
+            .code(),
+        "statement_mismatch"
+    );
 }
 
 #[test]
@@ -281,7 +329,8 @@ fn softmax_raw_length_must_match_the_input() {
     let op = SoftmaxOp { shift: 4 };
     let inputs = vec![vec![1i64, 2, 3, 4], vec![1i64, 2, 3, 4]];
     let config = op.relation_config(&inputs).unwrap();
-    let (mut public, proof) = prove_op_relation_shared(&op, &inputs, &config, &[]).unwrap();
+    let (mut public, proof) =
+        prove_op_relation_with_inputs(&op, &inputs, &config, &[]).unwrap();
     verify_op_relation_with_external(&public, &proof, &config, &[]).unwrap();
 
     let words = proof.raw[0][0].values.clone();
