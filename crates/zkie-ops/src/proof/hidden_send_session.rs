@@ -14890,7 +14890,7 @@ mod merged_tests {
     const TABLE_LOG_N: u32 = 4;
     const TABLE_ELL: u64 = 8;
     const TABLE_R: u64 = 8;
-    const CODE_LOG_N: u32 = 6;
+    const CODE_LOG_N: u32 = 7;
     const CODE_ELL: u64 = 32;
     const CODE_R: u64 = 4;
     const INDEX_MASK_ORACLE: u64 = 30;
@@ -15307,8 +15307,8 @@ mod merged_tests {
             tree: zkie_engine::pcs::request::runtime_tree::RuntimeTreePlan {
                 tree_number: 60500,
                 leaf_class: 1,
-                log_n: 6,
-                log_n_zk: 6,
+                log_n: CODE_LOG_N,
+                log_n_zk: CODE_LOG_N,
                 parts: vec![zkie_engine::pcs::request::runtime_tree::RuntimeTreePart {
                     main_symbols: 0,
                     mask_symbols: 12,
@@ -15985,91 +15985,63 @@ mod merged_tests {
 
     #[test]
     fn norm_lookup_carrier_proves_and_verifies() {
-        use crate::proof::hidden_norm_psc::{NormLookupPlan, NormLookupWitness};
-        use crate::proof::lookup::{LookupKeyPlan, LookupKeySource, LookupPlan};
-        use crate::proof::lookup_messages::LookupCommitPlan;
-        use zkie_engine::pcs::request::runtime_tree::RuntimeTreePart;
+        use crate::proof::hidden_norm_psc::{
+            norm_own_mask_rows, NormLookupParams, NormLookupPlan, NormLookupWitness,
+        };
 
         let activation = activation();
         let mut table = table();
         let (mut plan, mut witness) = norm_fixture(&activation);
-        let (lookup_plan, commit_plan, key_plan, bits) = {
-            let norm = plan.norm.as_ref().unwrap();
-            let round = norm.round.as_ref().unwrap();
-            let slots = round.layout.slots;
-            let main_rows = round.group.shape.main_rows as u32;
-            let mut sources = Vec::new();
-            for position in 0..POSITIONS {
-                for slot in [slots.sum_digits, slots.mean_digits] {
-                    sources.push(LookupKeySource {
-                        oracle: round.group.oracle_base + position as u64,
-                        position,
-                        row: slot as u32 % main_rows,
-                        place: slot as u32 / main_rows,
-                        coefficient: Fp3::ONE,
-                        offset: Fp3::ZERO,
-                    });
-                }
-            }
-            let lookup_plan = LookupPlan {
-                key_bits: 2,
-                mu: 2,
-                table_log: 8,
-            };
-            let commit_plan = LookupCommitPlan {
-                bits_shape: WShape::new(
-                    1024,
-                    code(),
-                    1,
-                    1,
-                    SALT,
-                    60701,
-                    1,
-                    W_RUN,
-                    W_CONFIGURATION,
-                )
-                .unwrap(),
-                bits_oracle: 9700,
-                group: GROUP,
-                bits_openings: 1,
-                mask_oracle: 9701,
-                mask_code: mask_code(),
-                mask_rows: 16,
-                mask_openings: 1,
-                mask_tree: RuntimeTreePlan {
-                    tree_number: 60700,
-                    leaf_class: 1,
-                    log_n: CODE_LOG_N,
-                    log_n_zk: CODE_LOG_N,
-                    parts: vec![RuntimeTreePart {
-                        main_symbols: 0,
-                        mask_symbols: 48,
-                    }],
-                    salt_bytes: SALT,
-                    run: W_RUN,
-                    configuration: W_CONFIGURATION,
-                },
-            };
-            let key_plan = LookupKeyPlan {
-                sources,
-                padding_value: Fp3::ZERO,
-                table_identity: Digest([0x63; 32]),
-            };
-            let keys = key_plan
-                .read(
-                    &lookup_plan,
-                    &witness.round.as_ref().unwrap().messages,
-                )
-                .unwrap();
-            let bits = lookup_bits(&lookup_plan, &keys);
-            (lookup_plan, commit_plan, key_plan, bits)
+        let round = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .round
+            .clone()
+            .expect("the fixture carries the rounding rows");
+        let params = NormLookupParams {
+            code: code(),
+            mask_code: mask_code(),
+            group: GROUP,
+            bits_oracle: 9700,
+            mask_oracle: 9701,
+            bits_tree: 60701,
+            mask_tree: 60700,
+            leaf_class: 1,
+            salt_bytes: SALT,
+            run: W_RUN,
+            configuration: W_CONFIGURATION,
+            padding_byte: 0,
+            table_identity: Digest([0x63; 32]),
         };
-        plan.norm.as_mut().unwrap().lookup = Some(NormLookupPlan {
-            lookup: lookup_plan,
-            commit: commit_plan,
-            key: key_plan,
-        });
-        plan.proximity.own_mask_tree.mask_rows = 64;
+        let lookup_plan =
+            NormLookupPlan::from_round(&round, POSITIONS, &params).unwrap();
+        let keys = lookup_plan
+            .key
+            .read(
+                &lookup_plan.lookup,
+                &witness.round.as_ref().unwrap().messages,
+            )
+            .unwrap();
+        let bits = lookup_bits(&lookup_plan.lookup, &keys);
+        let mask_rows = lookup_plan.commit.mask_rows;
+        plan.norm.as_mut().unwrap().lookup = Some(lookup_plan);
+        let norm_mask_rows = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .mask
+            .as_ref()
+            .unwrap()
+            .mask_rows;
+        let index_rows = plan
+            .send
+            .index_mask
+            .as_ref()
+            .map(|index| index.tree_rows().unwrap())
+            .unwrap_or(0);
+        plan.proximity.own_mask_tree.mask_rows =
+            norm_own_mask_rows(index_rows, norm_mask_rows + mask_rows).unwrap();
         witness.lookup = Some(NormLookupWitness {
             bits,
             messages: None,
@@ -16126,7 +16098,15 @@ mod merged_tests {
         }
         assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
 
-        let leaf_index = (1usize << 2) - 1 + 2 + 8;
+        let (planes, key_bits, table_log) = {
+            let lookup_plan = plan.norm.as_ref().unwrap().lookup.as_ref().unwrap();
+            (
+                lookup_plan.lookup.planes().unwrap(),
+                lookup_plan.lookup.key_bits as usize,
+                lookup_plan.lookup.table_log as usize,
+            )
+        };
+        let leaf_index = (planes - 1) + key_bits + table_log;
         let bits_index = leaf_index + 1;
 
         let mut changed = decoded.clone();
@@ -16206,6 +16186,101 @@ mod merged_tests {
                 lookup.proof.leaves.rounds[0].coefficients[0].add(&Fp3::ONE);
         }
         assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        // First-message lookup material: a changed bit root, mask root,
+        // sample answer or opening position is rejected before the second
+        // stage.
+        let mut changed = decoded.clone();
+        {
+            let entry = &mut changed
+                .first
+                .norm
+                .as_mut()
+                .unwrap()
+                .lookup
+                .as_mut()
+                .unwrap()
+                .bits
+                .message
+                .group
+                .entries[0];
+            entry.root = Digest([0x77; 32]);
+        }
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = decoded.clone();
+        {
+            changed
+                .first
+                .norm
+                .as_mut()
+                .unwrap()
+                .lookup
+                .as_mut()
+                .unwrap()
+                .mask
+                .root = Digest([0x78; 32]);
+        }
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = decoded.clone();
+        {
+            let sample = &mut changed
+                .first
+                .norm
+                .as_mut()
+                .unwrap()
+                .lookup
+                .as_mut()
+                .unwrap()
+                .bits
+                .sample;
+            sample.answers[0] = sample.answers[0].add(&Fp3::ONE);
+        }
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = decoded.clone();
+        {
+            let mask = &mut changed
+                .first
+                .norm
+                .as_mut()
+                .unwrap()
+                .lookup
+                .as_mut()
+                .unwrap()
+                .mask;
+            mask.positions[0] = mask.positions[0].wrapping_add(1);
+        }
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        // A missing second-stage lookup carrier is rejected.
+        let mut changed = decoded.clone();
+        changed.second.norm.as_mut().unwrap().lookup = None;
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        // The verifier-visible proof does not carry the private key vector.
+        let key_pattern = {
+            let lookup_plan = plan.norm.as_ref().unwrap().lookup.as_ref().unwrap();
+            let keys = lookup_plan
+                .key
+                .read(
+                    &lookup_plan.lookup,
+                    &witness.round.as_ref().unwrap().messages,
+                )
+                .unwrap();
+            let mut pattern = Vec::new();
+            for key in keys.iter().take(4) {
+                for coefficient in key.c {
+                    pattern.extend_from_slice(&coefficient.as_canonical_u64().to_le_bytes());
+                }
+            }
+            pattern
+        };
+        assert!(!key_pattern.is_empty());
+        assert!(!bytes
+            .windows(key_pattern.len())
+            .any(|window| window == key_pattern.as_slice()));
     }
 
     #[test]

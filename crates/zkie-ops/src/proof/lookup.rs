@@ -2074,6 +2074,78 @@ mod tests {
     }
 
     #[test]
+    fn a_changed_digit_source_breaks_the_committed_transcript() {
+        let plan = plan();
+        let keys = [0u64, 1, 2, 255];
+        let witness = witness(&keys, &plan);
+        let commit = commit_plan();
+        let mut source = LookupRandomSource::new(7 ^ 0x5A5A_5A5A);
+        let messages = commit_lookup(
+            &commit,
+            &witness.bits,
+            mask_count(&plan).unwrap(),
+            &mut source,
+        )
+        .unwrap();
+        // The committed messages and bit witness follow `keys`; proving with a
+        // different committed digit changes the key product and must fail.
+        assert!(prove_lookup_with_messages(
+            &plan,
+            &commit,
+            &key_plan(&keys),
+            &key_rows(&[0, 1, 2, 254]),
+            &witness,
+            &messages,
+            7,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn duplicate_key_sources_are_rejected() {
+        let plan = plan();
+        let mut key = key_plan(&[0, 1, 2, 3]);
+        key.sources[1] = key.sources[0];
+        assert!(key.validate(&plan).is_err());
+    }
+
+    #[test]
+    fn keys_read_from_distinct_physical_messages() {
+        let plan = plan();
+        let key = LookupKeyPlan {
+            sources: vec![
+                LookupKeySource {
+                    oracle: 900,
+                    position: 0,
+                    row: 0,
+                    place: 0,
+                    coefficient: Fp3::ONE,
+                    offset: Fp3::ZERO,
+                },
+                LookupKeySource {
+                    oracle: 901,
+                    position: 1,
+                    row: 0,
+                    place: 0,
+                    coefficient: Fp3::ONE,
+                    offset: Fp3::ZERO,
+                },
+            ],
+            padding_value: Fp3::from_u64(3),
+            table_identity: Digest([0x44; 32]),
+        };
+        let rows = vec![
+            vec![vec![Fp3::from_u64(7)]],
+            vec![vec![Fp3::from_u64(9)]],
+        ];
+        let keys = key.read(&plan, &rows).unwrap();
+        assert_eq!(keys[0], Fp3::from_u64(7));
+        assert_eq!(keys[1], Fp3::from_u64(9));
+        assert_eq!(keys[2], Fp3::from_u64(3));
+        assert_eq!(keys[3], Fp3::from_u64(3));
+    }
+
+    #[test]
     fn duplicate_keys_prove_and_verify() {
         let plan = plan();
         let keys = [0u64, 0, 1, 2];

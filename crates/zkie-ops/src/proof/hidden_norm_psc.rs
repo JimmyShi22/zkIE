@@ -2701,6 +2701,41 @@ mod tests {
     }
 
     #[test]
+    fn unit_valid_row_has_zero_offset_digits() {
+        let core = NormCoreRow::from_values(&[5], 1).unwrap();
+        assert_eq!(core.mean_remainder, 0);
+        assert_eq!(core.mean_offset, 0);
+        assert_eq!(core.mean_complement, 0);
+        let widths = NormRoundWidths {
+            sum: 1,
+            squares: 1,
+            variance: 1,
+            mean: 1,
+            offset: 1,
+        };
+        let layout = NormRoundLayout::new(widths, 1, 0, 0).unwrap();
+        let columns = widths.columns().unwrap();
+        let values = layout.values(&core, columns).unwrap();
+        // d = 1 gives u = s = r = 0: the four offset/complement digit rows,
+        // the squares row and the variance row are all zero. The sum and mean
+        // magnitude rows still hold their values.
+        for (start, width) in [
+            (layout.slots.squares_digits, widths.squares),
+            (layout.slots.variance_digits, widths.variance),
+            (layout.slots.mean_offset_digits, widths.offset),
+            (layout.slots.mean_complement_digits, widths.offset),
+            (layout.slots.variance_offset_digits, widths.offset),
+            (layout.slots.variance_complement_digits, widths.offset),
+        ] {
+            for slot in start..start + width {
+                assert_eq!(values[slot], Fp3::ZERO, "a d=1 range digit is not zero");
+            }
+        }
+        assert_eq!(values[layout.slots.mean_digits], Fp3::from_u64(5));
+        assert_eq!(values[layout.slots.sum_digits], Fp3::from_u64(5));
+    }
+
+    #[test]
     fn round_digit_key_plan_covers_the_committed_digits() {
         use crate::proof::lookup::LookupPlan;
 
