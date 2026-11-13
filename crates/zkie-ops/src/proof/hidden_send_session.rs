@@ -14447,7 +14447,7 @@ mod merged_tests {
             mean: 1,
             offset: 1,
         };
-        let round_layout = NormRoundLayout::new(round_widths, HIDDEN).unwrap();
+        let round_layout = NormRoundLayout::new(round_widths, HIDDEN, 8, 4).unwrap();
         let round_columns = round_widths.columns().unwrap();
         norm.round = Some(NormRoundPlan {
             group: group(round_columns, GROUP, 9600, 60600),
