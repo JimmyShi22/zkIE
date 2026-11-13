@@ -1,0 +1,6 @@
+9f650d65 Generalize the lookup table and bind key columns under one challenge
+
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     |  20 +-
+ crates/zkie-ops/src/proof/hidden_send_session.rs |   9 +-
+ crates/zkie-ops/src/proof/lookup.rs              | 582 ++++++++++++++++++++---
+ 3 files changed, 535 insertions(+), 76 deletions(-)
