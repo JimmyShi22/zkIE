@@ -13,9 +13,13 @@
 //!   the variance; it also computes the exact offset/complement decomposition
 //!   of the mean and variance rounding and the byte digits of both.
 //!
-//! The module is prover/fixture-side. The verifier-side commitment binding,
-//! the rsqrt table, the weight product and the output rounding are later
-//! slices; this module does not claim a hidden verifier for the norm yet.
+//! The module also computes the exact integer output tail of every position:
+//! the rstd broadcast, the rstd-weighted product, the image, the half-up shift
+//! rounding decomposition and the bias/clamp output, with the non-valid
+//! columns fixed to image zero and the clamped bias output. The module is
+//! prover/fixture-side; the verifier-side commitment binding and the relations
+//! over these rows are later slices, so this module does not claim a hidden
+//! verifier for the norm yet.
 
 use zkie_core::error::{Error, Result};
 
@@ -622,6 +626,173 @@ impl NormCoreWitness {
     }
 }
 
+/// The exact half-up rounding of an image by `2^shift`, decomposed for the
+/// digit/selector relation: the Euclidean quotient and remainder by the
+/// divisor, the selector that adds one when twice the remainder reaches the
+/// divisor, and the rounded quotient.
+pub fn shift_round(image: i128, shift: u32) -> Result<(i128, i128, bool, i128)> {
+    if shift >= 63 {
+        return Err(Error::InvalidConfig);
+    }
+    let divisor = 1i128 << shift;
+    let quotient = image.div_euclid(divisor);
+    let remainder = image.rem_euclid(divisor);
+    let selector = remainder * 2 >= divisor;
+    let shifted = if selector {
+        quotient.checked_add(1).ok_or(Error::BoundViolation)?
+    } else {
+        quotient
+    };
+    Ok((quotient, remainder, selector, shifted))
+}
+
+/// The exact integer output tail of one position.
+///
+/// Every row is a column-domain row over `broadcast.len()` columns. The
+/// broadcast row repeats the rstd of the position; the product row is
+/// `rstd * weight` on every column; the image row is `centered * product` on
+/// valid columns and zero elsewhere, which is the runtime convention when the
+/// centered row is taken zero on the non-valid columns; the
+/// quotient/remainder/selector rows decompose the half-up shift rounding; the
+/// output row is the optional clamp of `shifted + bias`. The non-valid
+/// columns therefore keep `shifted = 0` and output the clamped bias, not zero.
+///
+/// The witness is prover/fixture-side: the verifier relations over these rows
+/// are a later slice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormOutputRow {
+    pub rstd: i64,
+    pub shift: u32,
+    pub clamp: Option<(i64, i64)>,
+    pub broadcast: Vec<i64>,
+    pub product: Vec<i128>,
+    pub image: Vec<i128>,
+    pub quotient: Vec<i128>,
+    pub remainder: Vec<i128>,
+    pub selector: Vec<bool>,
+    pub shifted: Vec<i128>,
+    pub pre_clamp: Vec<i128>,
+    pub out: Vec<i64>,
+}
+
+impl NormOutputRow {
+    pub fn from_core(
+        core: &NormCoreRow,
+        values: &[i64],
+        rstd: i64,
+        weight: &[i64],
+        bias: &[i64],
+        valid: usize,
+        shift: u32,
+        clamp: Option<(i64, i64)>,
+    ) -> Result<Self> {
+        if valid == 0
+            || valid > values.len()
+            || values.len() != weight.len()
+            || values.len() != bias.len()
+            || shift >= 63
+        {
+            return Err(Error::InvalidConfig);
+        }
+        if let Some((low, high)) = clamp {
+            if low > high {
+                return Err(Error::InvalidConfig);
+            }
+        }
+        let columns = values.len();
+        let mut row = Self {
+            rstd,
+            shift,
+            clamp,
+            broadcast: Vec::with_capacity(columns),
+            product: Vec::with_capacity(columns),
+            image: Vec::with_capacity(columns),
+            quotient: Vec::with_capacity(columns),
+            remainder: Vec::with_capacity(columns),
+            selector: Vec::with_capacity(columns),
+            shifted: Vec::with_capacity(columns),
+            pre_clamp: Vec::with_capacity(columns),
+            out: Vec::with_capacity(columns),
+        };
+        for column in 0..columns {
+            let product = (rstd as i128)
+                .checked_mul(weight[column] as i128)
+                .ok_or(Error::BoundViolation)?;
+            let image = if column < valid {
+                let centered = (values[column] as i128)
+                    .checked_sub(core.mean as i128)
+                    .ok_or(Error::BoundViolation)?;
+                centered
+                    .checked_mul(product)
+                    .ok_or(Error::BoundViolation)?
+            } else {
+                0
+            };
+            let (quotient, remainder, selector, shifted) = shift_round(image, shift)?;
+            let pre_clamp = shifted
+                .checked_add(bias[column] as i128)
+                .ok_or(Error::BoundViolation)?;
+            let mut value = i64::try_from(pre_clamp).map_err(|_| Error::BoundViolation)?;
+            if let Some((low, high)) = clamp {
+                value = value.clamp(low, high);
+            }
+            row.broadcast.push(rstd);
+            row.product.push(product);
+            row.image.push(image);
+            row.quotient.push(quotient);
+            row.remainder.push(remainder);
+            row.selector.push(selector);
+            row.shifted.push(shifted);
+            row.pre_clamp.push(pre_clamp);
+            row.out.push(value);
+        }
+        Ok(row)
+    }
+
+    /// Rechecks every column equation of the tail and the clamp semantics.
+    pub fn check(
+        &self,
+        core: &NormCoreRow,
+        values: &[i64],
+        weight: &[i64],
+        bias: &[i64],
+        valid: usize,
+    ) -> Result<()> {
+        let expected = Self::from_core(
+            core,
+            values,
+            self.rstd,
+            weight,
+            bias,
+            valid,
+            self.shift,
+            self.clamp,
+        )?;
+        if *self != expected {
+            return Err(Error::InvalidProof);
+        }
+        for column in 0..self.out.len() {
+            if self.broadcast[column] != self.rstd
+                || self.shifted[column] != self.quotient[column] + self.selector[column] as i128
+                || self.pre_clamp[column]
+                    != self.shifted[column] + bias[column] as i128
+            {
+                return Err(Error::InvalidProof);
+            }
+            let expected_out = match self.clamp {
+                Some((low, high)) => i64::try_from(self.pre_clamp[column])
+                    .map(|value| value.clamp(low, high))
+                    .map_err(|_| Error::InvalidProof)?,
+                None => i64::try_from(self.pre_clamp[column]).map_err(|_| Error::InvalidProof)?,
+            };
+            if self.out[column] != expected_out {
+                return Err(Error::InvalidProof);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -867,5 +1038,136 @@ mod tests {
         missing.input.root = Digest::ZERO;
         assert!(NormCorePlan::new(plan.shape, missing).is_err());
         assert!(witness.check(&plan).is_ok());
+    }
+
+    #[test]
+    fn shift_rounding_follows_the_half_up_discipline() {
+        assert_eq!(shift_round(400, 3).unwrap(), (50, 0, false, 50));
+        assert_eq!(shift_round(300, 3).unwrap(), (37, 4, true, 38));
+        assert_eq!(shift_round(-500, 3).unwrap(), (-63, 4, true, -62));
+        assert_eq!(shift_round(-1200, 3).unwrap(), (-150, 0, false, -150));
+        assert_eq!(shift_round(4, 3).unwrap(), (0, 4, true, 1));
+        assert_eq!(shift_round(-4, 3).unwrap(), (-1, 4, true, 0));
+        assert_eq!(shift_round(3, 3).unwrap(), (0, 3, false, 0));
+        assert_eq!(shift_round(-3, 3).unwrap(), (-1, 5, true, 0));
+        assert_eq!(shift_round(7, 0).unwrap(), (7, 0, false, 7));
+        assert!(shift_round(1, 63).is_err());
+    }
+
+    #[test]
+    fn output_tail_matches_the_runtime_operator() {
+        use crate::profile_norm::ProfileLayerNormOp;
+        use crate::registry::{profile_rsqrt_index, PureForward};
+
+        let values = vec![vec![3i64, -2], vec![-4, 7]];
+        let weight = vec![2i64, -1, 3, 1];
+        let bias = vec![1i64, 2, -1, 2];
+        let table = vec![100i64; 8];
+        let shift = 3u32;
+        let clamp = Some((-20i64, 20i64));
+        let valid = 2usize;
+        let columns = weight.len();
+        let op = ProfileLayerNormOp {
+            rows: values.len(),
+            cols: columns,
+            valid_cols: valid,
+            output_shift: shift,
+            clamp,
+        };
+        let flat = |rows: &[Vec<i64>]| -> Vec<i64> {
+            let mut flat = Vec::with_capacity(rows.len() * columns);
+            for row in rows {
+                flat.extend_from_slice(row);
+                flat.resize(flat.len() + columns - row.len(), 0);
+            }
+            flat
+        };
+        let x = flat(&values);
+        let padded = values
+            .iter()
+            .map(|row| {
+                let mut padded = row.clone();
+                padded.resize(columns, 0);
+                padded
+            })
+            .collect::<Vec<_>>();
+        let repeated = |row: &[i64]| -> Vec<i64> {
+            let mut flat = Vec::with_capacity(values.len() * columns);
+            for _ in 0..values.len() {
+                flat.extend_from_slice(row);
+            }
+            flat
+        };
+        let record = op
+            .forward_values(&[x.clone(), repeated(&weight), repeated(&bias), table.clone()])
+            .unwrap();
+        let outputs = &record.outputs[0];
+        let images = &record.raw_accumulators[0];
+        let rstds = &record.auxiliaries[2];
+        for (position, row) in values.iter().enumerate() {
+            let core = NormCoreRow::from_values(row, valid).unwrap();
+            let rstd = table[profile_rsqrt_index(core.variance).unwrap() as usize];
+            assert_eq!(rstd, rstds[position]);
+            let padded_row = &padded[position];
+            let tail = NormOutputRow::from_core(
+                &core, padded_row, rstd, &weight, &bias, valid, shift, clamp,
+            )
+            .unwrap();
+            tail.check(&core, padded_row, &weight, &bias, valid).unwrap();
+            let start = position * columns;
+            assert_eq!(&tail.image[..], &images[start..start + columns]);
+            assert_eq!(&tail.out[..], &outputs[start..start + columns]);
+            for column in 0..columns {
+                assert_eq!(tail.broadcast[column], rstd);
+                assert_eq!(tail.product[column], rstd as i128 * weight[column] as i128);
+                assert_eq!(
+                    tail.shifted[column],
+                    tail.quotient[column] + tail.selector[column] as i128
+                );
+                if column >= valid {
+                    assert_eq!(tail.image[column], 0);
+                    assert_eq!(tail.out[column], bias[column].clamp(-20, 20));
+                }
+            }
+        }
+        assert!(NormOutputRow::from_core(
+            &NormCoreRow::from_values(&values[0], valid).unwrap(),
+            &padded[0],
+            100,
+            &weight,
+            &bias,
+            valid,
+            shift,
+            Some((5, 4)),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn output_tail_tampering_is_rejected() {
+        let values = vec![3i64, -2, 0, 0];
+        let weight = vec![2i64, -1, 3, 1];
+        let bias = vec![1i64, 2, -1, 2];
+        let core = NormCoreRow::from_values(&values, 2).unwrap();
+        let tail =
+            NormOutputRow::from_core(&core, &values, 100, &weight, &bias, 2, 3, None).unwrap();
+        tail.check(&core, &values, &weight, &bias, 2).unwrap();
+        let mut changed = tail.clone();
+        changed.image[0] += 1;
+        assert!(changed.check(&core, &values, &weight, &bias, 2).is_err());
+        let mut changed = tail.clone();
+        changed.quotient[0] += 1;
+        assert!(changed.check(&core, &values, &weight, &bias, 2).is_err());
+        let mut changed = tail.clone();
+        changed.selector[1] = !changed.selector[1];
+        assert!(changed.check(&core, &values, &weight, &bias, 2).is_err());
+        let mut changed = tail.clone();
+        changed.out[3] -= 1;
+        assert!(changed.check(&core, &values, &weight, &bias, 2).is_err());
+        let mut changed = tail.clone();
+        changed.broadcast[0] = -100;
+        assert!(changed.check(&core, &values, &weight, &bias, 2).is_err());
+        assert!(NormOutputRow::from_core(&core, &values, 100, &weight, &bias[..3], 2, 3, None)
+            .is_err());
     }
 }
