@@ -32,7 +32,7 @@
 | Published table metas are data checked against the plan | `asset-tables.bin`; `verify_asset_table_meta` | metas read from the public bundle and checked | smoke: tampered table set rejected |
 | Old-version artifacts keep existing semantics | existing `model_version` gate | gate runs before the anchor rebuild | smoke: version-one policy rejected with `invalid_config` |
 | Context loader binds the same trusted list | anchor rebuild in the loader | metas read and trusted list passed | s7 context tests |
-| Policy registration, consumer relation | TURN 526 registration ruling; pending | **not yet** | gap |
+| Policy registration, consumer relation | registration ruling; pending | **not yet** | gap |
 
 ## Evidence
 
@@ -69,7 +69,7 @@
 
 - The tracked gpt2 policy still pins model version 1 and the old instance
   anchors. Registering the new instance and updating the policy is the next
-  step (TURN 526: one preprocessing instance, policy pins its public identity,
+  step (one preprocessing instance; the policy pins its public identity;
   verifier never depends on the private randomness).
 - `zkie anchor` still rebuilds without the encoded table, so it cannot yet
   produce the registered instance identity; the registration tool is the next

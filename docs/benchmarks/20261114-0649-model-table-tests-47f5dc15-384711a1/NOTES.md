@@ -86,7 +86,7 @@ registered commit per case; no commit stage exists in the run directories.
 | A new instance must be registered | expected anchor in the policy | unregistered instance rejected; policy unchanged | negatives |
 | Table identity, root, record, configuration, path are bound | anchor leaf; table meta checks | mutations rejected | negatives |
 | Missing or changed private material blocks proving | saved randomness is the rebuild input | prove rejects; existing proofs remain verifiable | negatives |
-| Consumer relation negatives (TURN 524 list) | production projection consumer | **not yet wired** | gap |
+| Consumer relation negatives (consumer proof chain) | production projection consumer | **not yet wired** | gap |
 
 ## Boundaries and gaps
 

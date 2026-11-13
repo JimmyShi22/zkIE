@@ -61,7 +61,7 @@
 | New commit must be registered explicitly | expected anchor in the policy | an unregistered instance is rejected; no policy backfill from proof | unregistered verify rejected `statement_mismatch` |
 | Same instance requires its private material | prove reads the saved material | missing material blocks proving; a changed material breaks the rebuilt tables | `missing_commit_artifact`; `statement_mismatch` |
 | Reuse path for reruns | matrix registered commit option | all runs reuse the registered commit | code; matrix run not executed in this step |
-| Consumer relation, record/mask separation, proximity checks | TURN 522/526 boundaries | **not yet** (consumer work) | gap |
+| Consumer relation, record/mask separation, proximity checks | consumer-chain boundaries | **not yet** (consumer work) | gap |
 
 ## Evidence
 
