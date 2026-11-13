@@ -11223,6 +11223,48 @@ fn verify_norm_param_claim(
     Ok(())
 }
 
+/// Scatters the equality weights of a column point into the BAT table layout of
+/// one parameter message. The coefficients bind the parameter vector
+/// evaluation to the committed folded message; the caller adds the term to a
+/// relation row. Nothing here reads a prover-supplied value.
+fn norm_param_eval_coefficients(
+    gu: &GuShape,
+    width: u64,
+    point: &[Fp3],
+) -> Result<Vec<Fp3>> {
+    if width == 0
+        || !width.is_power_of_two()
+        || point.len() != width.trailing_zeros() as usize
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    if !gu.rows_high {
+        return Err(Error::UnsupportedPrimitive);
+    }
+    let room = gu
+        .u
+        .main_rows
+        .checked_mul(gu.u.code.ell)
+        .and_then(|value| value.checked_sub(gu.u.answers as u64))
+        .ok_or(Error::ResourceLimit)?;
+    if width > room {
+        return Err(Error::ShapeMismatch);
+    }
+    let rows = usize::try_from(gu.u.main_rows).map_err(|_| Error::ResourceLimit)?;
+    let ell = usize::try_from(gu.u.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let eq = crate::proof::output_closure::eq_vector(point)?;
+    if eq.len() != width as usize {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut coefficients = vec![Fp3::ZERO; rows * ell];
+    for column in 0..width as usize {
+        let index = gu_vector_bat_index(gu, column as u64)?;
+        let slot = coefficients.get_mut(index).ok_or(Error::ShapeMismatch)?;
+        *slot = slot.add(&eq[column]);
+    }
+    Ok(coefficients)
+}
+
 /// The record and column declarations of one parameter table claim. Both the
 /// prover and the verifier build them from the same claim message and plan
 /// reader; the rows tie the folded message to the committed table through the
@@ -17607,6 +17649,40 @@ mod merged_tests {
             .reader
             .root = Digest([0x99; 32]);
         assert!(verify_hidden_lin_hidden(&wrong_plan, &table.reader(), &base).is_err());
+    }
+
+    #[test]
+    fn norm_parameter_eval_coefficients_follow_the_message_layout() {
+        let activation = activation();
+        let (plan, _, _) = norm_params_fixture(&activation);
+        let params_plan = plan.norm.as_ref().unwrap().params.as_ref().unwrap();
+        let width = params_plan.gain.width;
+        let point = vec![Fp3::ONE; width.trailing_zeros() as usize];
+        for claim in [params_plan.gain_claim.as_ref().unwrap(), params_plan.bias_claim.as_ref().unwrap()] {
+            let coefficients =
+                norm_param_eval_coefficients(&claim.gu, width, &point).unwrap();
+            let eq = crate::proof::output_closure::eq_vector(&point).unwrap();
+            let rows = usize::try_from(claim.gu.u.main_rows).unwrap();
+            let ell = usize::try_from(claim.gu.u.code.ell).unwrap();
+            assert_eq!(coefficients.len(), rows * ell);
+            for column in 0..width as usize {
+                let index = gu_vector_bat_index(&claim.gu, column as u64).unwrap();
+                assert_eq!(coefficients[index], eq[column]);
+            }
+            assert!(norm_param_eval_coefficients(
+                &claim.gu,
+                width,
+                &point[..point.len().saturating_sub(1)]
+            )
+            .is_err());
+        }
+        let too_wide = 128u64;
+        assert!(norm_param_eval_coefficients(
+            &params_plan.gain_claim.as_ref().unwrap().gu,
+            too_wide,
+            &vec![Fp3::ONE; too_wide.trailing_zeros() as usize]
+        )
+        .is_err());
     }
 
     #[test]
