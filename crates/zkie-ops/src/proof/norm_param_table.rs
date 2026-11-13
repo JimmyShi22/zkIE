@@ -88,20 +88,41 @@ impl NormParamTableIdentity {
     }
 
     /// The digest of the identity, including the committed table identity.
-    pub fn digest(&self) -> Result<Digest> {
-        self.validate()?;
+    /// The plan validation checks the reader before this value is absorbed.
+    pub fn digest(&self) -> Digest {
         let mut writer = CanonicalWriter::new();
         writer.put_u64(self.version);
         writer.put_u64(self.kind.encode());
         writer.put_digest(&self.model_identity);
         writer.put_digest(&self.asset_table_identity);
-        writer.put_digest(&reader_table_identity(&self.reader)?);
+        put_reader_identity(&mut writer, &self.reader);
         writer.put_u64(self.row);
         writer.put_u64(self.width);
         writer.put_u64(self.valid_min as u64);
         writer.put_u64(self.valid_max as u64);
         writer.put_u64(self.trusted_i32_mapping as u64);
-        Ok(digest_bytes(&writer.into_bytes()))
+        digest_bytes(&writer.into_bytes())
+    }
+}
+
+/// Encodes the committed reader identity: root, configuration, shape numbers,
+/// distances and the table record.
+fn put_reader_identity(writer: &mut CanonicalWriter, reader: &IndexReader) {
+    writer.put_digest(&reader.root);
+    writer.put_digest(&reader.configuration);
+    writer.put_u64(reader.shape.code.log_n as u64);
+    writer.put_u64(reader.shape.code.ell);
+    writer.put_u64(reader.shape.code.r);
+    writer.put_u64(reader.shape.v as u64);
+    writer.put_u64(reader.shape.answers as u64);
+    writer.put_u64(reader.shape.salt_bytes as u64);
+    writer.put_u64(reader.shape.distances.radius);
+    writer.put_u64(reader.shape.distances.later_radius);
+    writer.put_u64(reader.shape.distances.m_once);
+    writer.put_u64(reader.shape.distances.m_later);
+    writer.put_u64(reader.record.y.len() as u64);
+    for value in &reader.record.y {
+        writer.put_fp3(value);
     }
 }
 
@@ -137,14 +158,13 @@ impl NormParamTablesPlan {
         Ok(())
     }
 
-    pub fn digest(&self) -> Result<Digest> {
-        self.validate()?;
+    pub fn digest(&self) -> Digest {
         let mut writer = CanonicalWriter::new();
-        writer.put_digest(&self.gain.digest()?);
-        writer.put_digest(&self.bias.digest()?);
+        writer.put_digest(&self.gain.digest());
+        writer.put_digest(&self.bias.digest());
         writer.put_u64(self.column_draws as u64);
         writer.put_u64(self.seed_budget as u64);
-        Ok(digest_bytes(&writer.into_bytes()))
+        digest_bytes(&writer.into_bytes())
     }
 }
 
@@ -212,28 +232,28 @@ mod tests {
     fn identity_validates_and_binds_its_fields() {
         let identity = identity(NormParamKind::Gain, 0, reader(9, 7));
         identity.validate().unwrap();
-        let digest = identity.digest().unwrap();
+        let digest = identity.digest();
         assert_ne!(digest, Digest::ZERO);
 
         let mut changed = identity.clone();
         changed.row = 3;
-        assert_ne!(changed.digest().unwrap(), digest);
+        assert_ne!(changed.digest(), digest);
 
         let mut changed = identity.clone();
         changed.width = 4;
-        assert_ne!(changed.digest().unwrap(), digest);
+        assert_ne!(changed.digest(), digest);
 
         let mut changed = identity.clone();
         changed.reader.root = Digest([8; 32]);
-        assert_ne!(changed.digest().unwrap(), digest);
+        assert_ne!(changed.digest(), digest);
 
         let mut changed = identity.clone();
         changed.valid_max = 100;
-        assert_ne!(changed.digest().unwrap(), digest);
+        assert_ne!(changed.digest(), digest);
 
         let mut changed = identity.clone();
         changed.kind = NormParamKind::Bias;
-        assert_ne!(changed.digest().unwrap(), digest);
+        assert_ne!(changed.digest(), digest);
     }
 
     #[test]
@@ -287,7 +307,7 @@ mod tests {
     fn table_plan_requires_distinct_rows_in_one_table_and_bounds_the_draws() {
         let plan = packed_plan();
         plan.validate().unwrap();
-        assert_ne!(plan.digest().unwrap(), Digest::ZERO);
+        assert_ne!(plan.digest(), Digest::ZERO);
 
         let mut changed = plan.clone();
         changed.bias.row = 0;
@@ -297,7 +317,7 @@ mod tests {
         separate.bias.reader = reader(8, 7);
         separate.bias.row = 0;
         separate.validate().unwrap();
-        assert_ne!(separate.digest().unwrap(), plan.digest().unwrap());
+        assert_ne!(separate.digest(), plan.digest());
 
         let mut swapped = plan.clone();
         std::mem::swap(&mut swapped.gain, &mut swapped.bias);
@@ -317,6 +337,6 @@ mod tests {
 
         let mut changed = plan;
         changed.column_draws = 3;
-        assert_ne!(changed.digest().unwrap(), packed_plan().digest().unwrap());
+        assert_ne!(changed.digest(), packed_plan().digest());
     }
 }

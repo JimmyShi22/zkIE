@@ -40,6 +40,7 @@ use crate::proof::lookup::{
 };
 use crate::proof::lookup_table::{TableConfig, TABLE_ENCODING_VERSION};
 use crate::proof::lookup_messages::LookupCommitPlan;
+use crate::proof::norm_param_table::NormParamTablesPlan;
 use crate::proof::output_closure::{CommittedValueGroup, RetainedTrees};
 use crate::registry::{RSQRT_COARSE, RSQRT_COARSE_END, RSQRT_FINE, RSQRT_HALF, RSQRT_SHIFT};
 use crate::proof::psc::{
@@ -859,7 +860,7 @@ fn fp3_signed(value: i128) -> Result<Fp3> {
 // sumcheck and the row binding.
 
 /// Version of the integrated norm plan and first message.
-pub const NORM_BIND_VERSION: u64 = 6;
+pub const NORM_BIND_VERSION: u64 = 7;
 
 /// The relation indices the bound core supports. The map construction of
 /// every relation is fixed by the relation index; the plan may list only
@@ -1484,6 +1485,8 @@ pub struct NormPlan {
     /// The frozen-table lookup over the committed index and table-value slots;
     /// optional in this stage.
     pub rstd: Option<NormRstdPlan>,
+    /// The norm gain/bias parameter tables; optional in this stage.
+    pub params: Option<NormParamTablesPlan>,
     /// The committed mask group; optional in this stage.
     pub mask: Option<NormMaskPlan>,
 }
@@ -1589,6 +1592,12 @@ impl NormPlan {
                 }
             }
         }
+        if let Some(params) = &self.params {
+            params.validate()?;
+            if params.gain.width != self.columns || params.bias.width != self.columns {
+                return Err(Error::InvalidConfig);
+            }
+        }
         if let Some(mask) = &self.mask {
             mask.validate(
                 self.shape.positions,
@@ -1646,6 +1655,13 @@ impl NormPlan {
             Some(rstd) => {
                 writer.put_u64(1);
                 writer.put_digest(&rstd.digest());
+            }
+            None => writer.put_u64(0),
+        }
+        match &self.params {
+            Some(params) => {
+                writer.put_u64(1);
+                writer.put_digest(&params.digest());
             }
             None => writer.put_u64(0),
         }
@@ -4165,6 +4181,7 @@ mod tests {
             round: None,
             lookup: None,
             rstd: None,
+            params: None,
             mask: None,
         };
         let message = NormFirstMessages {
@@ -4179,6 +4196,74 @@ mod tests {
             rstd: None,
         };
         (plan, message, second)
+    }
+
+    #[test]
+    fn parameter_tables_are_bound_in_the_plan() {
+        use crate::proof::norm_param_table::{
+            NormParamKind, NormParamTableIdentity, NormParamTablesPlan,
+            NORM_PARAM_TABLE_VERSION,
+        };
+        use zkie_engine::pcs::request::code::build_code_plan;
+        use zkie_engine::pcs::request::field::Fp3;
+        use zkie_engine::pcs::request::params::LEAF_SALT_MIN_BYTES;
+        use zkie_engine::pcs::request::table::{
+            IndexReader, IndexRecord, IndexShape, TableDistances,
+        };
+
+        let (mut plan, _, _) = integrated_fixture();
+        let reader = || IndexReader {
+            shape: IndexShape {
+                code: build_code_plan(3, 4, 1).unwrap(),
+                v: 1,
+                answers: 1,
+                salt_bytes: LEAF_SALT_MIN_BYTES,
+                distances: TableDistances {
+                    radius: 0,
+                    later_radius: 0,
+                    m_once: 0,
+                    m_later: 0,
+                },
+            },
+            configuration: Digest([0x21; 32]),
+            root: Digest([0x22; 32]),
+            record: IndexRecord {
+                y: vec![Fp3::ZERO; 2],
+            },
+        };
+        let identity = |kind: NormParamKind, row: u64| NormParamTableIdentity {
+            version: NORM_PARAM_TABLE_VERSION,
+            kind,
+            model_identity: Digest([0x23; 32]),
+            asset_table_identity: Digest([0x24; 32]),
+            reader: reader(),
+            row,
+            width: plan.columns,
+            valid_min: -128,
+            valid_max: 127,
+            trusted_i32_mapping: true,
+        };
+        let digest = plan.digest();
+        plan.params = Some(NormParamTablesPlan {
+            gain: identity(NormParamKind::Gain, 0),
+            bias: identity(NormParamKind::Bias, 1),
+            column_draws: 2,
+            seed_budget: 1,
+        });
+        plan.validate().unwrap();
+        assert_ne!(plan.digest(), digest);
+
+        let mut changed = plan.clone();
+        changed.params.as_mut().unwrap().gain.width = 2;
+        assert!(changed.validate().is_err());
+
+        let mut changed = plan.clone();
+        changed.params.as_mut().unwrap().bias.kind = NormParamKind::Gain;
+        assert!(changed.validate().is_err());
+
+        let mut changed = plan;
+        changed.params.as_mut().unwrap().bias.row = 0;
+        assert!(changed.validate().is_err());
     }
 
     #[test]
