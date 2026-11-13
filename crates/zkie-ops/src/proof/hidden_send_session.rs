@@ -4567,19 +4567,17 @@ impl HiddenProximityPlan {
                 None => return Some("the own mask row count overflows"),
             };
         }
-        if let Some(norm) = norm {
-            if let Some(mask) = &norm.mask {
-                let rows = mask.mask_rows.next_power_of_two();
-                own_mask_rows = match own_mask_rows.checked_add(rows) {
-                    Some(rows) => rows,
-                    None => return Some("the own mask row count overflows"),
-                };
-            }
-        }
-        if own_mask_rows == 0 {
-            own_mask_rows = 1;
-        }
-        let own_mask_rows = own_mask_rows.next_power_of_two();
+        let norm_rows = match norm.and_then(|norm| norm.mask.as_ref()) {
+            Some(mask) => mask.mask_rows,
+            None => 0,
+        };
+        let own_mask_rows = match crate::proof::hidden_norm_psc::norm_own_mask_rows(
+            own_mask_rows,
+            norm_rows,
+        ) {
+            Ok(rows) => rows,
+            Err(_) => return Some("the own mask row count overflows"),
+        };
         if self.shared_mask_tree.mask_rows != 1
             || self.own_mask_tree.mask_rows != own_mask_rows
             || self.shared_mask_tree.log_n != self.mask_code.log_n

@@ -808,6 +808,19 @@ pub struct NormMaskPlan {
     pub claims: usize,
 }
 
+/// The power-of-two own-mask row count from the index-mask rows and the
+/// norm-mask rows. This is the single derivation used by the proximity plan
+/// check and by the tests.
+pub fn norm_own_mask_rows(index_rows: u64, norm_rows: u64) -> Result<u64> {
+    let sum = index_rows
+        .checked_add(norm_rows)
+        .ok_or(Error::ResourceLimit)?;
+    if sum == 0 {
+        return Ok(1);
+    }
+    sum.checked_next_power_of_two().ok_or(Error::ResourceLimit)
+}
+
 impl NormMaskPlan {
     /// The number of allocated entries of one product-sumcheck instance.
     pub fn per_instance(&self) -> Result<usize> {
@@ -905,9 +918,8 @@ impl NormMaskPlan {
             .ok_or(Error::ResourceLimit)
     }
 
-    /// The free entries of the mask rows, excluding the SEND pad.
-    pub fn free_entries(&self) -> Result<usize> {
-        let rows = usize::try_from(self.mask_rows).map_err(|_| Error::ResourceLimit)?;
+    /// The free entries of `rows` mask rows, excluding the SEND pads.
+    fn free_entries_for(&self, rows: usize) -> Result<usize> {
         let ell = usize::try_from(self.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
         let answers = self.answers as usize;
         if answers == 0 || answers > ell {
@@ -919,12 +931,38 @@ impl NormMaskPlan {
             .ok_or(Error::ResourceLimit)
     }
 
+    /// The free entries of the plan's mask rows, excluding the SEND pad.
+    pub fn free_entries(&self) -> Result<usize> {
+        let rows = usize::try_from(self.mask_rows).map_err(|_| Error::ResourceLimit)?;
+        self.free_entries_for(rows)
+    }
+
+    /// The smallest power-of-two row count whose free entries hold one mask
+    /// block per instance and the reserved claims. This is the single
+    /// derivation of the mask size from the relation count, the mask code
+    /// answers and the per-instance allocation.
+    pub fn required_rows(&self, relations: usize) -> Result<u64> {
+        let total = self.total_entries(relations)?;
+        let columns = 1u64
+            .checked_shl(self.mask_code.log_n)
+            .ok_or(Error::ResourceLimit)?;
+        let mut rows = 1usize;
+        while (rows as u64) <= columns {
+            if self.free_entries_for(rows)? >= total {
+                return Ok(rows as u64);
+            }
+            rows = rows.checked_mul(2).ok_or(Error::ResourceLimit)?;
+        }
+        Err(Error::ResourceLimit)
+    }
+
     fn validate(&self, positions: u32, variables: usize, relations: usize) -> Result<()> {
         if self.oracle == 0 || self.group == 0 {
             return Err(Error::InvalidConfig);
         }
         if self.mask_rows == 0
             || !self.mask_rows.is_power_of_two()
+            || self.mask_rows > (1u64 << self.mask_code.log_n)
             || self.answers != 1
             || self.openings == 0
         {
@@ -969,7 +1007,7 @@ impl NormMaskPlan {
         {
             return Err(Error::InvalidConfig);
         }
-        if self.total_entries(relations)? > self.free_entries()? {
+        if self.mask_rows < self.required_rows(relations)? {
             return Err(Error::InvalidConfig);
         }
         Ok(())
@@ -1768,6 +1806,43 @@ mod tests {
             mean: 3,
             offset: 2,
         }
+    }
+
+    #[test]
+    fn mask_rows_are_derived_from_the_relation_count() {
+        use zkie_engine::pcs::request::runtime_tree::RuntimeTreePlan;
+        let plan = NormMaskPlan {
+            oracle: 1,
+            group: 1,
+            mask_code: zkie_engine::pcs::request::code::build_code_plan(6, 32, 1).unwrap(),
+            mask_rows: 1,
+            answers: 1,
+            openings: 1,
+            tree: RuntimeTreePlan {
+                tree_number: 1,
+                leaf_class: 1,
+                log_n: 6,
+                log_n_zk: 6,
+                parts: vec![zkie_engine::pcs::request::runtime_tree::RuntimeTreePart {
+                    main_symbols: 0,
+                    mask_symbols: 3,
+                }],
+                salt_bytes: 8,
+                run: Digest([0x61; 32]),
+                configuration: Digest([0x62; 32]),
+            },
+            positions: 2,
+            hiding: 9,
+            shown: 2,
+            claims: 1,
+        };
+        assert_eq!(plan.required_rows(4).unwrap(), 4);
+        assert_eq!(plan.required_rows(8).unwrap(), 8);
+        assert_eq!(plan.required_rows(17).unwrap(), 16);
+        assert_eq!(norm_own_mask_rows(0, 4).unwrap(), 4);
+        assert_eq!(norm_own_mask_rows(0, 8).unwrap(), 8);
+        assert_eq!(norm_own_mask_rows(4, 8).unwrap(), 16);
+        assert_eq!(norm_own_mask_rows(0, 0).unwrap(), 1);
     }
 
     #[test]
