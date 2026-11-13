@@ -1,0 +1,4 @@
+e76cabde Read the lookup keys from committed rounding rows (partial progress)
+ crates/zkie-ops/src/proof/lookup.rs          | 146 ++++++++++++++++++++-------
+ crates/zkie-ops/src/proof/lookup_messages.rs |  58 +++--------
+ 2 files changed, 119 insertions(+), 85 deletions(-)
