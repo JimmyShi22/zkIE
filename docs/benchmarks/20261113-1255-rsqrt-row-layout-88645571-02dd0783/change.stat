@@ -1,0 +1,6 @@
+88645571 Add the rsqrt index witness row and its committed slots
+
+ crates/zkie-ops/src/proof/hidden_norm.rs     | 270 +++++++++++++++++++++++-
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs | 297 ++++++++++++++++++++++++++-
+ crates/zkie-ops/src/registry.rs              |  24 ++-
+ 3 files changed, 574 insertions(+), 17 deletions(-)
