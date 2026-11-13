@@ -9069,6 +9069,31 @@ fn own_members(
                 norm_witness.and_then(|witness| witness.round.as_ref()),
             ));
         }
+        if let (Some(output_message), Some(output_plan)) =
+            (&norm_first.output, &norm_plan.output)
+        {
+            let output_witness = norm_witness.and_then(|witness| witness.output.as_ref());
+            groups.push((
+                &output_message.broadcast,
+                &output_plan.broadcast,
+                output_witness.map(|witness| &witness.broadcast),
+            ));
+            groups.push((
+                &output_message.product,
+                &output_plan.product,
+                output_witness.map(|witness| &witness.product),
+            ));
+            groups.push((
+                &output_message.image,
+                &output_plan.image,
+                output_witness.map(|witness| &witness.image),
+            ));
+            groups.push((
+                &output_message.out,
+                &output_plan.out,
+                output_witness.map(|witness| &witness.out),
+            ));
+        }
         for (message, group_plan, group_witness) in groups {
             if message.message.group.group != group_plan.group
                 || message.message.roots.len() != positions as usize
@@ -9442,6 +9467,38 @@ fn own_sample_rows(
                         0,
                         target,
                     )?]);
+                }
+            }
+            if let (Some(output_message), Some(output_plan)) =
+                (&norm_first.output, &norm_plan.output)
+            {
+                let outputs = [
+                    (&output_message.broadcast, &output_plan.broadcast),
+                    (&output_message.product, &output_plan.product),
+                    (&output_message.image, &output_plan.image),
+                    (&output_message.out, &output_plan.out),
+                ];
+                let positions = plan.send.positions() as u64;
+                for (message, group_plan) in outputs {
+                    let base = group_plan.oracle_base;
+                    if member.source_oracle >= base
+                        && member.source_oracle < base.saturating_add(positions)
+                    {
+                        let position = (member.source_oracle - base) as usize;
+                        let target = *message
+                            .sample
+                            .answers
+                            .get(position)
+                            .ok_or(Error::ShapeMismatch)?;
+                        return Ok(vec![oracle_sample_row(
+                            member.source_oracle,
+                            plan.send.group,
+                            &group_plan.shape.oracle_shape(),
+                            &message.sample.seed,
+                            0,
+                            target,
+                        )?]);
+                    }
                 }
             }
             if let Some(mask_plan) = &norm_plan.mask {
@@ -11943,6 +12000,7 @@ fn prove_norm_second(
                     output_bindings.push(crate::proof::hidden_norm_psc::NormOutputBinding {
                         position: position as u32,
                         kind,
+                        point: point.clone(),
                         claim: target,
                         output: checked,
                     });
@@ -12154,6 +12212,7 @@ fn verify_norm_second(
                     output_bindings.push(crate::proof::hidden_norm_psc::NormOutputBinding {
                         position: position as u32,
                         kind,
+                        point: point.clone(),
                         claim,
                         output: checked,
                     });
@@ -13634,6 +13693,226 @@ fn closure_plain_rows(
     Ok(rows)
 }
 
+/// The committed column message of one output group as a BAT coefficient
+/// vector. Under the message layout the virtual BAT index of a column equals
+/// the column number, so the coefficients are the leading entries.
+fn output_message_coefficients(
+    shape: &WShape,
+    values: &[Fp3],
+    columns: usize,
+) -> Result<Vec<Fp3>> {
+    let rows = usize::try_from(shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+    let ell = usize::try_from(shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let room = rows.checked_mul(ell).ok_or(Error::ResourceLimit)?;
+    if values.len() != columns || columns > room {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut coefficients = vec![Fp3::ZERO; room];
+    coefficients[..columns].copy_from_slice(values);
+    Ok(coefficients)
+}
+
+/// The BAT rows of the pointwise product instances: the claim value on the
+/// committed product or image row at the original column point, the two shown
+/// end values on their committed maps at the transcript point (the centered
+/// end on the x and mean rows), and the hiding form of every instance against
+/// the committed mask entries.
+fn output_plain_rows(
+    plan: &HiddenLinPlan,
+    members: &[ProximityMember],
+    first: &HiddenSendMessages,
+    binding: &[crate::proof::hidden_norm_psc::NormOutputBinding],
+) -> Result<Vec<BatRow>> {
+    let norm = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
+    let output_plan = norm.output.as_ref().ok_or(Error::InvalidConfig)?;
+    let params_plan = norm.params.as_ref().ok_or(Error::InvalidConfig)?;
+    let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
+    if norm_first.output.is_none() {
+        return Err(Error::ShapeMismatch);
+    }
+    let mask_plan = norm.mask.as_ref().ok_or(Error::InvalidConfig)?;
+    let positions = norm.shape.positions as usize;
+    let relations = norm.relations.len();
+    let instances = positions
+        .checked_mul(relations)
+        .ok_or(Error::ResourceLimit)?;
+    let columns = usize::try_from(norm.columns).map_err(|_| Error::ResourceLimit)?;
+    let valid = norm.shape.valid as usize;
+    let bits = usize::try_from(norm.columns.trailing_zeros())
+        .map_err(|_| Error::ResourceLimit)?;
+    if binding.len() != positions.checked_mul(2).ok_or(Error::ResourceLimit)? {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut bat_of = std::collections::HashMap::new();
+    for member in members {
+        bat_of.insert(member.source_oracle, member);
+    }
+    let mask_member = bat_of
+        .get(&mask_plan.oracle)
+        .ok_or(Error::StatementMismatch)?;
+    if mask_member.mask_rows != mask_plan.mask_rows
+        || mask_member.mask_code != mask_plan.mask_code
+        || mask_member.answers != mask_plan.answers
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let member_for = |oracle: u64| -> Result<&ProximityMember> {
+        bat_of
+            .get(&oracle)
+            .copied()
+            .ok_or(Error::StatementMismatch)
+    };
+    let gain_claim = params_plan
+        .gain_claim
+        .as_ref()
+        .ok_or(Error::InvalidConfig)?;
+    let mut rows = Vec::with_capacity(binding.len() * 4);
+    for word in binding {
+        let position = word.position as usize;
+        if position >= positions || word.kind > 1 {
+            return Err(Error::InvalidProof);
+        }
+        let instance = position * 2 + word.kind as usize;
+        if word.point.len() != bits || word.output.point.len() != bits {
+            return Err(Error::InvalidProof);
+        }
+        let eq_claim = crate::proof::output_closure::eq_vector(&word.point)?;
+        if eq_claim.len() != columns {
+            return Err(Error::ShapeMismatch);
+        }
+        let (claim_group, claim_oracle) = match word.kind {
+            0 => (
+                &output_plan.product,
+                output_plan.product.oracle_base + position as u64,
+            ),
+            _ => (
+                &output_plan.image,
+                output_plan.image.oracle_base + position as u64,
+            ),
+        };
+        let claim_member = member_for(claim_oracle)?;
+        let mut row = BatRow::new(BatRowKind::Plain);
+        row.add_term(
+            claim_member.bat_oracle,
+            BatPart::Main,
+            output_message_coefficients(&claim_group.shape, &eq_claim, columns)?,
+        );
+        row.target = word.claim;
+        rows.push(row);
+
+        let shown0 = mask_plan.pointwise_shown_slot(instances, instance, 0)?;
+        let shown1 = mask_plan.pointwise_shown_slot(instances, instance, 1)?;
+        let end0 = &word.output.ends[0];
+        let end1 = &word.output.ends[1];
+        if end0.point != word.output.point
+            || end1.point != word.output.point
+            || end0.point.len() != bits
+        {
+            return Err(Error::InvalidProof);
+        }
+        let eq_end = crate::proof::output_closure::eq_vector(&end0.point)?;
+        if eq_end.len() != columns {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut row = BatRow::new(BatRowKind::Plain);
+        match word.kind {
+            0 => {
+                let oracle = output_plan.broadcast.oracle_base + position as u64;
+                let member = member_for(oracle)?;
+                row.add_term(
+                    member.bat_oracle,
+                    BatPart::Main,
+                    output_message_coefficients(
+                        &output_plan.broadcast.shape,
+                        &eq_end,
+                        columns,
+                    )?,
+                );
+            }
+            _ => {
+                let x_oracle = norm.x.oracle_base + position as u64;
+                let x_member = member_for(x_oracle)?;
+                let x_rows = usize::try_from(norm.x.shape.main_rows)
+                    .map_err(|_| Error::ResourceLimit)?;
+                let x_ell = usize::try_from(norm.x.shape.code.ell)
+                    .map_err(|_| Error::ResourceLimit)?;
+                if x_rows * x_ell < columns {
+                    return Err(Error::ShapeMismatch);
+                }
+                let mut coefficients = vec![Fp3::ZERO; x_rows * x_ell];
+                let mut eq_sum = Fp3::ZERO;
+                for index in 0..valid.min(columns) {
+                    let value = eq_end[index];
+                    eq_sum = eq_sum.add(&value);
+                    coefficients[index] = value;
+                }
+                row.add_term(x_member.bat_oracle, BatPart::Main, coefficients);
+                let mean_oracle = norm.mean.oracle_base + position as u64;
+                let mean_member = member_for(mean_oracle)?;
+                let mean_rows = usize::try_from(norm.mean.shape.main_rows)
+                    .map_err(|_| Error::ResourceLimit)?;
+                let mean_ell = usize::try_from(norm.mean.shape.code.ell)
+                    .map_err(|_| Error::ResourceLimit)?;
+                let mut coefficients = vec![Fp3::ZERO; mean_rows * mean_ell];
+                coefficients[0] = Fp3::ZERO.sub(&eq_sum);
+                row.add_term(mean_member.bat_oracle, BatPart::Main, coefficients);
+            }
+        }
+        row.target = end0.value;
+        row.add_unit(
+            mask_member.bat_oracle,
+            BatPart::Mask,
+            mask_plan.entry_virtual_index(shown0)?,
+            end0.mask_scale,
+        );
+        rows.push(row);
+
+        let mut row = BatRow::new(BatRowKind::Plain);
+        match word.kind {
+            0 => {
+                let coefficients = norm_param_eval_coefficients(
+                    &gain_claim.gu,
+                    norm.columns,
+                    &end1.point,
+                )?;
+                let gain_member = member_for(gain_claim.gu.oracle)?;
+                row.add_term(gain_member.bat_oracle, BatPart::Main, coefficients);
+            }
+            _ => {
+                let oracle = output_plan.product.oracle_base + position as u64;
+                let member = member_for(oracle)?;
+                row.add_term(
+                    member.bat_oracle,
+                    BatPart::Main,
+                    output_message_coefficients(&output_plan.product.shape, &eq_end, columns)?,
+                );
+            }
+        }
+        row.target = end1.value;
+        row.add_unit(
+            mask_member.bat_oracle,
+            BatPart::Mask,
+            mask_plan.entry_virtual_index(shown1)?,
+            end1.mask_scale,
+        );
+        rows.push(row);
+
+        let mut row = BatRow::new(BatRowKind::Plain);
+        for (index, coefficient) in word.output.hiding_form.iter().enumerate() {
+            let slot = mask_plan.pointwise_hiding_slot(instances, instance, index)?;
+            row.add_unit(
+                mask_member.bat_oracle,
+                BatPart::Mask,
+                mask_plan.entry_virtual_index(slot)?,
+                *coefficient,
+            );
+        }
+        row.target = word.output.row_target;
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
 fn own_plain_rows(
     plan: &HiddenLinPlan,
     members: &[ProximityMember],
@@ -13765,6 +14044,9 @@ fn own_plain_rows(
     }
     if let Some(binding) = norm {
         rows.extend(norm_plain_rows(plan, members, first, binding)?);
+        if let Some(output) = &binding.output {
+            rows.extend(output_plain_rows(plan, members, first, output)?);
+        }
         let norm_plan = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
         if let Some(lookup) = &binding.lookup {
             rows.extend(lookup_plain_rows(
@@ -14573,6 +14855,28 @@ fn witness_tree_for(
                     position,
                     member,
                 );
+            }
+        }
+        if let Some(output_plan) = &norm_plan.output {
+            let output_witness = norm_witness.output.as_ref().ok_or(Error::ShapeMismatch)?;
+            let outputs = [
+                (&output_plan.broadcast, &output_witness.broadcast),
+                (&output_plan.product, &output_witness.product),
+                (&output_plan.image, &output_witness.image),
+                (&output_plan.out, &output_witness.out),
+            ];
+            for (group_plan, group_witness) in outputs {
+                let base = group_plan.oracle_base;
+                if member.source_oracle >= base
+                    && member.source_oracle < base.saturating_add(positions)
+                {
+                    let position = (member.source_oracle - base) as usize;
+                    return retained_member_tree(
+                        &group_witness.committed.trees,
+                        position,
+                        member,
+                    );
+                }
             }
         }
         if let Some(mask_plan) = &norm_plan.mask {
@@ -21298,6 +21602,83 @@ mod merged_tests {
 
         let mut changed = base.clone();
         changed.second.norm.as_mut().unwrap().output = None;
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        // The claim value is now bound to the committed product/image row at
+        // the original column point; a changed claim is rejected.
+        let mut changed = base.clone();
+        let claim = &mut changed
+            .second
+            .norm
+            .as_mut()
+            .unwrap()
+            .output
+            .as_mut()
+            .unwrap()
+            .claims[0];
+        *claim = claim.add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        // The shown end values are bound to their committed maps; changed
+        // end values are rejected.
+        let mut changed = base.clone();
+        let end = &mut changed
+            .second
+            .norm
+            .as_mut()
+            .unwrap()
+            .output
+            .as_mut()
+            .unwrap()
+            .proofs[0]
+            .end_values[0];
+        *end = end.add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = base.clone();
+        let end = &mut changed
+            .second
+            .norm
+            .as_mut()
+            .unwrap()
+            .output
+            .as_mut()
+            .unwrap()
+            .proofs[1]
+            .end_values[1];
+        *end = end.add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        // A changed round coefficient changes the masked rounds and the
+        // hiding form; the bound rows reject it.
+        let mut changed = base.clone();
+        let round = &mut changed
+            .second
+            .norm
+            .as_mut()
+            .unwrap()
+            .output
+            .as_mut()
+            .unwrap()
+            .proofs[2]
+            .rounds[0]
+            .coefficients[0];
+        *round = round.add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        // A changed hiding sum is rejected by the hiding-form row.
+        let mut changed = base.clone();
+        let hiding_sum = &mut changed
+            .second
+            .norm
+            .as_mut()
+            .unwrap()
+            .output
+            .as_mut()
+            .unwrap()
+            .proofs[3]
+            .hiding_sum;
+        *hiding_sum = hiding_sum.add(&Fp3::ONE);
         assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
     }
 

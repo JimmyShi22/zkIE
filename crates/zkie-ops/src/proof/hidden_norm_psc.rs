@@ -2688,6 +2688,10 @@ pub struct NormOutputBinding {
     /// Zero is the broadcast/gain product; one is the centered/product
     /// image.
     pub kind: u8,
+    /// The original column point the instance claim was drawn at. The claim
+    /// row's equality coefficients come from this point, not from the
+    /// transcript's final challenge point.
+    pub point: Vec<Fp3>,
     /// The claim value the verifier was given.
     pub claim: Fp3,
     /// The checked transcript output claims.
