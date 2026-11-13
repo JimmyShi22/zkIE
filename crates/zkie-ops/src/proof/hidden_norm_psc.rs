@@ -24,7 +24,7 @@ use zkie_engine::pcs::request::chain::Chain;
 use zkie_engine::pcs::request::code::encode_row_fp3;
 use zkie_engine::pcs::request::fold::{ByteMaskCoins, MaskCoins};
 use zkie_engine::pcs::request::field::{Fp3, MODULUS};
-use zkie_engine::pcs::request::table::ColumnOpening;
+use zkie_engine::pcs::request::table::{ColumnOpening, SampleSeed};
 use zkie_engine::pcs::request::runtime_tree::{
     RuntimePartRows, RuntimeTree, RuntimeTreeOpening, RuntimeTreePart, RuntimeTreePlan,
 };
@@ -43,7 +43,9 @@ use crate::proof::lookup::{
 };
 use crate::proof::lookup_table::{TableConfig, TABLE_ENCODING_VERSION};
 use crate::proof::lookup_messages::LookupCommitPlan;
-use crate::proof::norm_param_table::{NormParamTableIdentity, NormParamTablesPlan};
+use crate::proof::norm_param_table::{
+    NormParamClaimPlan, NormParamTableIdentity, NormParamTablesPlan,
+};
 use crate::proof::output_closure::{CommittedValueGroup, RetainedTrees};
 use crate::registry::{RSQRT_COARSE, RSQRT_COARSE_END, RSQRT_FINE, RSQRT_HALF, RSQRT_SHIFT};
 use crate::proof::psc::{
@@ -2351,17 +2353,34 @@ impl NormLookupSecond {
     }
 }
 
-/// The first-stage column openings of one norm parameter table. The positions
-/// are drawn after the table identity is fixed, and the openings are checked
-/// against the plan's committed reader before any dependent challenge.
+/// The first-stage claim message of one norm parameter table: the committed
+/// folded row (G_u), its sample seeds and answers, and the openings of the
+/// drawn table columns. The table has one row, so the fold weights are the
+/// single entry one and there is no gamma.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NormParamOpenings {
+pub struct NormParamClaimMessage {
+    pub root: Digest,
+    pub seeds: Vec<SampleSeed>,
+    pub answers: Vec<Fp3>,
     pub openings: Vec<ColumnOpening>,
 }
 
-impl NormParamOpenings {
+impl NormParamClaimMessage {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut writer = CanonicalWriter::new();
+        writer.put_digest(&self.root);
+        writer.put_u64(self.seeds.len() as u64);
+        for seed in &self.seeds {
+            writer.put_u64(seed.z.len() as u64);
+            for coordinate in &seed.z {
+                writer.put_fp3(coordinate);
+            }
+            writer.put_fp3(&seed.beta);
+        }
+        writer.put_u64(self.answers.len() as u64);
+        for answer in &self.answers {
+            writer.put_fp3(answer);
+        }
         writer.put_u64(self.openings.len() as u64);
         for opening in &self.openings {
             put_column_opening(&mut writer, opening);
@@ -2369,19 +2388,60 @@ impl NormParamOpenings {
         Ok(writer.into_bytes())
     }
 
-    fn decode(identity: &NormParamTableIdentity, bytes: &[u8]) -> Result<Self> {
+    fn decode(
+        claim: &NormParamClaimPlan,
+        identity: &NormParamTableIdentity,
+        bytes: &[u8],
+    ) -> Result<Self> {
+        let gu = &claim.gu;
         let shape = &identity.reader.shape;
         let rows = shape.rows() as usize;
         let log_n = shape.code.log_n as usize;
         let n = shape.code.n();
+        let bits = gu.sample_bits()? as usize;
         let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
-        let count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
-        if count == 0 || count as u64 > n {
+        let root = reader.get_digest()?;
+        if root == Digest::ZERO {
+            return Err(Error::InvalidEncoding);
+        }
+        let seed_count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+        if seed_count != gu.u.answers as usize {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut seeds = Vec::with_capacity(seed_count);
+        for _ in 0..seed_count {
+            let z_len = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+            if z_len != bits {
+                return Err(Error::ShapeMismatch);
+            }
+            let mut z = Vec::with_capacity(z_len);
+            for _ in 0..z_len {
+                z.push(reader.get_fp3()?);
+            }
+            let beta = reader.get_fp3()?;
+            if beta == Fp3::ZERO {
+                return Err(Error::InvalidEncoding);
+            }
+            seeds.push(SampleSeed { z, beta });
+        }
+        let answer_count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+        if answer_count != gu.u.answers as usize {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut answers = Vec::with_capacity(answer_count);
+        for _ in 0..answer_count {
+            answers.push(reader.get_fp3()?);
+        }
+        let opening_count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+        if opening_count == 0
+            || opening_count > claim.column_draws
+            || opening_count as u64 > n
+        {
             return Err(Error::ResourceLimit);
         }
-        let mut openings = Vec::with_capacity(count);
+        let mut openings = Vec::with_capacity(opening_count);
         let mut previous = None;
-        for _ in 0..count {
+        for _ in 0..opening_count {
             let opening = get_column_opening(&mut reader, rows.max(log_n))?;
             if opening.symbols.len() != rows
                 || opening.path.len() != log_n
@@ -2399,24 +2459,49 @@ impl NormParamOpenings {
             openings.push(opening);
         }
         reader.finish()?;
-        Ok(Self { openings })
+        Ok(Self {
+            root,
+            seeds,
+            answers,
+            openings,
+        })
     }
 
-    pub fn check(&self, plan: &NormParamTablesPlan) -> Result<()> {
-        if self.openings.is_empty() || self.openings.len() > plan.column_draws {
+    pub fn check(
+        &self,
+        claim: &NormParamClaimPlan,
+        identity: &NormParamTableIdentity,
+    ) -> Result<()> {
+        let gu = &claim.gu;
+        let bits = gu.sample_bits()? as usize;
+        let shape = &identity.reader.shape;
+        if self.root == Digest::ZERO
+            || self.seeds.len() != gu.u.answers as usize
+            || self.answers.len() != gu.u.answers as usize
+            || self
+                .seeds
+                .iter()
+                .any(|seed| seed.z.len() != bits || seed.beta == Fp3::ZERO)
+            || self.openings.is_empty()
+            || self.openings.len() > claim.column_draws
+            || self
+                .openings
+                .iter()
+                .any(|opening| opening.symbols.len() != shape.rows() as usize)
+        {
             return Err(Error::ShapeMismatch);
         }
         Ok(())
     }
 }
 
-/// The first-stage openings of the norm parameter tables. The bias openings
-/// are absent when the bias row shares the gain table; one opening set then
-/// covers both rows.
+/// The first-stage claims of the norm parameter tables. The bias claim is
+/// absent when the bias row shares the gain table; one claim then covers both
+/// rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormParamMessage {
-    pub gain: NormParamOpenings,
-    pub bias: Option<NormParamOpenings>,
+    pub gain: NormParamClaimMessage,
+    pub bias: Option<NormParamClaimMessage>,
 }
 
 impl NormParamMessage {
@@ -2434,8 +2519,9 @@ impl NormParamMessage {
     }
 
     fn decode(plan: &NormParamTablesPlan, bytes: &[u8]) -> Result<Self> {
+        let gain_claim = plan.gain_claim.as_ref().ok_or(Error::ShapeMismatch)?;
         let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
-        let gain = NormParamOpenings::decode(&plan.gain, reader.get_bytes()?)?;
+        let gain = NormParamClaimMessage::decode(gain_claim, &plan.gain, reader.get_bytes()?)?;
         let bias = match reader.get_u64()? {
             0 => {
                 if plan.bias.reader != plan.gain.reader {
@@ -2443,7 +2529,14 @@ impl NormParamMessage {
                 }
                 None
             }
-            1 => Some(NormParamOpenings::decode(&plan.bias, reader.get_bytes()?)?),
+            1 => {
+                let bias_claim = plan.bias_claim.as_ref().ok_or(Error::ShapeMismatch)?;
+                Some(NormParamClaimMessage::decode(
+                    bias_claim,
+                    &plan.bias,
+                    reader.get_bytes()?,
+                )?)
+            }
             _ => return Err(Error::InvalidEncoding),
         };
         reader.finish()?;
@@ -2451,10 +2544,14 @@ impl NormParamMessage {
     }
 
     pub fn check(&self, plan: &NormParamTablesPlan) -> Result<()> {
-        self.gain.check(plan)?;
+        let gain_claim = plan.gain_claim.as_ref().ok_or(Error::ShapeMismatch)?;
+        self.gain.check(gain_claim, &plan.gain)?;
         match (&self.bias, plan.bias.reader == plan.gain.reader) {
             (None, true) => {}
-            (Some(bias), false) => bias.check(plan)?,
+            (Some(bias), false) => {
+                let bias_claim = plan.bias_claim.as_ref().ok_or(Error::ShapeMismatch)?;
+                bias.check(bias_claim, &plan.bias)?;
+            }
             _ => return Err(Error::ShapeMismatch),
         }
         Ok(())
@@ -4409,8 +4506,53 @@ mod tests {
         assert!(changed.validate().is_err());
     }
 
+    fn claim_gu(
+        kind: crate::proof::norm_param_table::NormParamKind,
+        shape: zkie_engine::pcs::request::table::IndexShape,
+    ) -> crate::proof::norm_param_table::NormParamClaimPlan {
+        use crate::proof::norm_param_table::NormParamClaimPlan;
+        use zkie_engine::pcs::request::field::E_DEGREE;
+        use zkie_engine::pcs::request::gu::GuOracleShape;
+        use zkie_engine::pcs::request::runtime_tree::{RuntimeTreePart, RuntimeTreePlan};
+        use zkie_engine::pcs::request::params::LEAF_SALT_MIN_BYTES;
+
+        let main_rows = 2u64;
+        NormParamClaimPlan {
+            kind,
+            gu: zkie_engine::pcs::request::gu::GuShape {
+                oracle: 0x8800 + kind.encode(),
+                group: 0x42,
+                tree: RuntimeTreePlan {
+                    tree_number: 0x1234,
+                    leaf_class: 1,
+                    log_n: shape.code.log_n,
+                    log_n_zk: shape.code.log_n,
+                    parts: vec![RuntimeTreePart {
+                        main_symbols: main_rows * E_DEGREE as u64,
+                        mask_symbols: 0,
+                    }],
+                    salt_bytes: LEAF_SALT_MIN_BYTES,
+                    run: Digest([0x71; 32]),
+                    configuration: Digest([0x72; 32]),
+                },
+                part: 0,
+                rows_high: true,
+                u: GuOracleShape {
+                    code: shape.code,
+                    main_rows,
+                    main_deg: E_DEGREE as u32,
+                    mask_rows: 0,
+                    mask_code: None,
+                    answers: 1,
+                },
+                index: shape,
+            },
+            column_draws: 2,
+        }
+    }
+
     #[test]
-    fn parameter_table_openings_round_trip_and_are_plan_gated() {
+    fn parameter_table_claims_round_trip_and_are_plan_gated() {
         use crate::proof::norm_param_table::{
             NormParamKind, NormParamTableIdentity, NormParamTablesPlan,
             NORM_PARAM_TABLE_VERSION,
@@ -4424,57 +4566,67 @@ mod tests {
         };
 
         let (mut plan, message, _) = integrated_fixture();
-        let reader = || IndexReader {
-            shape: IndexShape {
-                code: build_code_plan(4, 7, 2).unwrap(),
-                v: 1,
-                answers: 1,
-                salt_bytes: LEAF_SALT_MIN_BYTES,
-                distances: TableDistances {
-                    radius: 0,
-                    later_radius: 0,
-                    m_once: 0,
-                    m_later: 0,
-                },
-            },
-            configuration: Digest([0x31; 32]),
-            root: Digest([0x32; 32]),
-            record: IndexRecord {
-                y: vec![Fp3::ZERO; 2],
+        let shape = || IndexShape {
+            code: build_code_plan(4, 7, 2).unwrap(),
+            v: 0,
+            answers: 1,
+            salt_bytes: LEAF_SALT_MIN_BYTES,
+            distances: TableDistances {
+                radius: 0,
+                later_radius: 0,
+                m_once: 0,
+                m_later: 0,
             },
         };
-        let identity = |kind: NormParamKind, row: u64| NormParamTableIdentity {
+        let reader = |root: u8, configuration: u8| IndexReader {
+            shape: shape(),
+            configuration: Digest([configuration; 32]),
+            root: Digest([root; 32]),
+            record: IndexRecord {
+                y: vec![Fp3::ZERO; 1],
+            },
+        };
+        let identity = |kind: NormParamKind, reader: IndexReader| NormParamTableIdentity {
             version: NORM_PARAM_TABLE_VERSION,
             kind,
             model_identity: Digest([0x33; 32]),
             asset_table_identity: Digest([0x34; 32]),
-            reader: reader(),
-            row,
+            reader,
+            row: 0,
             width: plan.columns,
             valid_min: -128,
             valid_max: 127,
             trusted_i32_mapping: true,
         };
+        let gain = identity(NormParamKind::Gain, reader(0x32, 0x31));
+        let bias = identity(NormParamKind::Bias, reader(0x37, 0x38));
         plan.params = Some(NormParamTablesPlan {
-            gain: identity(NormParamKind::Gain, 0),
-            bias: identity(NormParamKind::Bias, 1),
+            gain: gain.clone(),
+            bias: bias.clone(),
             column_draws: 2,
             seed_budget: 1,
-            gain_claim: None,
-            bias_claim: None,
+            gain_claim: Some(claim_gu(NormParamKind::Gain, gain.reader.shape)),
+            bias_claim: Some(claim_gu(NormParamKind::Bias, bias.reader.shape)),
         });
         plan.validate().unwrap();
         let opening = |position: u64| ColumnOpening {
             position,
             salt: vec![0u8; LEAF_SALT_MIN_BYTES],
-            symbols: vec![Fp::from_u64(0); 2],
+            symbols: vec![Fp::from_u64(0); 1],
             path: vec![Digest::ZERO; 4],
         };
+        let claim_message = || NormParamClaimMessage {
+            root: Digest([0x77; 32]),
+            seeds: vec![SampleSeed {
+                z: vec![Fp3::ZERO; 4],
+                beta: Fp3::ONE,
+            }],
+            answers: vec![Fp3::ZERO],
+            openings: vec![opening(1), opening(3)],
+        };
         let params = NormParamMessage {
-            gain: NormParamOpenings {
-                openings: vec![opening(1), opening(3)],
-            },
-            bias: None,
+            gain: claim_message(),
+            bias: Some(claim_message()),
         };
         params.check(plan.params.as_ref().unwrap()).unwrap();
 
@@ -4490,19 +4642,21 @@ mod tests {
         let mut swapped = params.clone();
         swapped.gain.openings.swap(0, 1);
         let encoded = swapped.gain.encode().unwrap();
-        assert!(NormParamOpenings::decode(
+        assert!(NormParamClaimMessage::decode(
+            plan.params.as_ref().unwrap().gain_claim.as_ref().unwrap(),
             &plan.params.as_ref().unwrap().gain,
             &encoded
         )
         .is_err());
 
-        let mut separate = plan.clone();
-        separate.params.as_mut().unwrap().bias.reader = IndexReader {
-            configuration: Digest([0x35; 32]),
-            root: Digest([0x36; 32]),
-            ..reader()
-        };
-        assert!(params.check(separate.params.as_ref().unwrap()).is_err());
+        let mut packed = plan.clone();
+        packed.params.as_mut().unwrap().bias.reader = packed.params.as_ref().unwrap().gain.reader.clone();
+        packed.params.as_mut().unwrap().bias.row = 1;
+        assert!(packed.validate().is_err());
+
+        let mut missing = params;
+        missing.bias = None;
+        assert!(missing.check(plan.params.as_ref().unwrap()).is_err());
     }
 
     #[test]

@@ -265,13 +265,13 @@ use crate::proof::output_closure::{
 use crate::registry::{RSQRT_COARSE, RSQRT_COARSE_END, RSQRT_FINE, RSQRT_HALF, RSQRT_SHIFT};
 use crate::proof::hidden_norm_psc::{
     NormFirstMessages, NormGroupPlan, NormGroupWitness, NormLookupMessage, NormLookupSecond,
-    NormMaskMessage, NormMaskPlan, NormMaskWitness, NormParamMessage, NormParamOpenings, NormPlan,
-    NormPositionBinding, NormPscSecond,
+    NormMaskMessage, NormMaskPlan, NormMaskWitness, NormParamClaimMessage, NormParamMessage,
+    NormPlan, NormPositionBinding, NormPscSecond,
     NormRowBinding, NormWitness, RSQRT_FINE_SLACK_WIDTH, RSQRT_INDEX_SLACK_WIDTH,
     RSQRT_INDEX_WIDTH, RSQRT_MID_HIGH_WIDTH, RSQRT_RAW_REMAINDER_WIDTH,
 };
 use crate::proof::committed_psc::CommittedPscGroup;
-use crate::proof::norm_param_table::NormParamKind;
+use crate::proof::norm_param_table::{NormParamClaimPlan, NormParamKind, NormParamTableIdentity};
 use crate::proof::base_final_session::{
     fold_identity, BaseFinalCheck, BaseFinalOutcome, BaseFinalRows, BaseFinalSession, BaseMessages,
     BaseCommitment, BaseOpening, BaseOpenings, BaseProver, FoldBasis, FoldMember,
@@ -5097,6 +5097,9 @@ pub trait HiddenTableProver: TableRowSource {
 /// is committed once and shared across positions; the verifier only holds the
 /// plan readers and checks the drawn openings against them.
 pub trait NormParamTableProver {
+    /// The read-only row source of one parameter table, folded to its single
+    /// row message.
+    fn source(&mut self, kind: NormParamKind) -> &mut dyn TableRowSource;
     fn open_columns(
         &mut self,
         kind: NormParamKind,
@@ -9445,6 +9448,10 @@ const NORM_RSTD_MASK_POSITION_TAG: u64 = 104;
 const NORM_RSTD_SEED_TAG: u64 = 105;
 const NORM_PARAM_GAIN_POSITION_TAG: u64 = 106;
 const NORM_PARAM_BIAS_POSITION_TAG: u64 = 107;
+const NORM_PARAM_GAIN_ROOT_TAG: u64 = 108;
+const NORM_PARAM_BIAS_ROOT_TAG: u64 = 109;
+const NORM_PARAM_GAIN_ANSWER_TAG: u64 = 110;
+const NORM_PARAM_BIAS_ANSWER_TAG: u64 = 111;
 
 fn norm_group_plans(plan: &NormPlan) -> Vec<&NormGroupPlan> {
     let mut groups = vec![
@@ -10331,27 +10338,39 @@ fn prove_norm_first(
             if values.gain.len() != width || values.bias.len() != width {
                 return Err(Error::ShapeMismatch);
             }
-            let gain_positions = draw_norm_param_positions(
+            let gain_claim = params_plan
+                .gain_claim
+                .as_ref()
+                .ok_or(Error::ShapeMismatch)?;
+            let gain = prove_norm_param_claim(
                 chain,
+                &params_plan.gain,
+                gain_claim,
+                NormParamKind::Gain,
+                &mut *tables,
+                seed,
+                NORM_PARAM_GAIN_ROOT_TAG,
+                NORM_PARAM_GAIN_ANSWER_TAG,
                 NORM_PARAM_GAIN_POSITION_TAG,
-                params_plan.column_draws,
-                params_plan.gain.reader.shape.code.log_n,
             )?;
-            let gain = NormParamOpenings {
-                openings: tables.open_columns(NormParamKind::Gain, &gain_positions)?,
-            };
             let bias = if params_plan.bias.reader == params_plan.gain.reader {
                 None
             } else {
-                let positions = draw_norm_param_positions(
+                let bias_claim = params_plan
+                    .bias_claim
+                    .as_ref()
+                    .ok_or(Error::ShapeMismatch)?;
+                Some(prove_norm_param_claim(
                     chain,
+                    &params_plan.bias,
+                    bias_claim,
+                    NormParamKind::Bias,
+                    &mut *tables,
+                    seed,
+                    NORM_PARAM_BIAS_ROOT_TAG,
+                    NORM_PARAM_BIAS_ANSWER_TAG,
                     NORM_PARAM_BIAS_POSITION_TAG,
-                    params_plan.column_draws,
-                    params_plan.bias.reader.shape.code.log_n,
-                )?;
-                Some(NormParamOpenings {
-                    openings: tables.open_columns(NormParamKind::Bias, &positions)?,
-                })
+                )?)
             };
             Some(NormParamMessage { gain, bias })
         }
@@ -10722,44 +10741,33 @@ fn verify_norm_first(
     match (&norm.params, &message.params) {
         (Some(params_plan), Some(params)) => {
             params.check(params_plan)?;
-            let gain_positions = draw_norm_param_positions(
+            let gain_claim = params_plan
+                .gain_claim
+                .as_ref()
+                .ok_or(Error::ShapeMismatch)?;
+            verify_norm_param_claim(
                 chain,
+                &params_plan.gain,
+                gain_claim,
+                &params.gain,
+                NORM_PARAM_GAIN_ROOT_TAG,
+                NORM_PARAM_GAIN_ANSWER_TAG,
                 NORM_PARAM_GAIN_POSITION_TAG,
-                params_plan.column_draws,
-                params_plan.gain.reader.shape.code.log_n,
-            )?;
-            if params
-                .gain
-                .openings
-                .iter()
-                .map(|opening| opening.position)
-                .collect::<Vec<_>>()
-                != gain_positions
-            {
-                return Err(Error::StatementMismatch);
-            }
-            verify_columns(
-                &params_plan.gain.reader,
-                &gain_positions,
-                &params.gain.openings,
             )?;
             if let Some(bias) = &params.bias {
-                let positions = draw_norm_param_positions(
+                let bias_claim = params_plan
+                    .bias_claim
+                    .as_ref()
+                    .ok_or(Error::ShapeMismatch)?;
+                verify_norm_param_claim(
                     chain,
+                    &params_plan.bias,
+                    bias_claim,
+                    bias,
+                    NORM_PARAM_BIAS_ROOT_TAG,
+                    NORM_PARAM_BIAS_ANSWER_TAG,
                     NORM_PARAM_BIAS_POSITION_TAG,
-                    params_plan.column_draws,
-                    params_plan.bias.reader.shape.code.log_n,
                 )?;
-                if bias
-                    .openings
-                    .iter()
-                    .map(|opening| opening.position)
-                    .collect::<Vec<_>>()
-                    != positions
-                {
-                    return Err(Error::StatementMismatch);
-                }
-                verify_columns(&params_plan.bias.reader, &positions, &bias.openings)?;
             }
         }
         (None, None) => {}
@@ -10787,6 +10795,155 @@ fn draw_norm_param_positions(
         drawn.push(chain.draw_position(log_n)?);
     }
     Ok(unique_sorted(&drawn))
+}
+
+fn absorb_norm_param_root(chain: &mut Chain, tag: u64, root: &Digest) -> Result<()> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(tag);
+    push_digest_chain(&mut message, root);
+    let prefix = message.prefix(KIND_SEED, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
+fn absorb_norm_param_answers(chain: &mut Chain, tag: u64, answers: &[Fp3]) -> Result<()> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(tag);
+    message.push_u64(answers.len() as u64);
+    for answer in answers {
+        message.push_fp3(answer);
+    }
+    let prefix = message.prefix(KIND_EMPTY, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
+/// Proves one parameter table claim: fold the single table row, commit the
+/// folded message as G_u, absorb its root, sample and absorb its answers, then
+/// draw and open the table columns.
+fn prove_norm_param_claim(
+    chain: &mut Chain,
+    identity: &NormParamTableIdentity,
+    claim: &NormParamClaimPlan,
+    kind: NormParamKind,
+    table: &mut dyn NormParamTableProver,
+    seed: &Digest,
+    root_tag: u64,
+    answer_tag: u64,
+    column_tag: u64,
+) -> Result<NormParamClaimMessage> {
+    let gu = &claim.gu;
+    let mut coins = ByteMaskCoins::new(derive_run_seed(seed, 2, kind.encode())?)?;
+    let gu_pads = draw_values(&mut coins, gu.u.answers as usize)?;
+    let gu_tails = {
+        let rows = usize::try_from(gu.u.main_rows).map_err(|_| Error::ResourceLimit)?;
+        let tail_len = usize::try_from(gu.u.code.r).map_err(|_| Error::ResourceLimit)?;
+        let mut tails = Vec::with_capacity(rows);
+        for _ in 0..rows {
+            tails.push(draw_values(&mut coins, tail_len)?);
+        }
+        tails
+    };
+    let gu_salts = draw_salt_bytes(
+        &mut coins,
+        usize::try_from(gu.tree.columns()).map_err(|_| Error::ResourceLimit)?,
+        gu.tree.salt_bytes,
+    )?;
+    let (folded, folded_tail) = fold_table(table.source(kind), identity.reader.shape, &[])?;
+    let mut gu_witness = gu_table(gu, &folded, &folded_tail)?;
+    let (main_pads, mask_pads) = gu_sample_pad_offsets(gu)?;
+    if !mask_pads.is_empty() || main_pads.len() != gu_pads.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    for (offset, pad) in main_pads.iter().zip(&gu_pads) {
+        let slot = gu_witness
+            .main
+            .get_mut(*offset)
+            .ok_or(Error::ShapeMismatch)?;
+        *slot = *pad;
+    }
+    let gu_rows = usize::try_from(gu.u.main_rows).map_err(|_| Error::ResourceLimit)?;
+    let gu_ell = usize::try_from(gu.u.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let mut gu_message = Vec::with_capacity(gu_rows);
+    for row in 0..gu_rows {
+        let start = row.checked_mul(gu_ell).ok_or(Error::ResourceLimit)?;
+        let end = start.checked_add(gu_ell).ok_or(Error::ResourceLimit)?;
+        gu_message.push(
+            gu_witness
+                .main
+                .get(start..end)
+                .ok_or(Error::ShapeMismatch)?
+                .to_vec(),
+        );
+    }
+    let tree = commit_rows_tree(gu.tree.clone(), gu.u.code, &gu_message, &gu_tails, &gu_salts)?;
+    let root = *tree.root();
+    let mut registry = GuRegistry::new();
+    registry.receive(
+        gu,
+        &GuNotice {
+            root,
+            oracle: gu.oracle,
+            tree_number: gu.tree.tree_number,
+            part: gu.part,
+        },
+    )?;
+    absorb_norm_param_root(chain, root_tag, &root)?;
+    let seeds = draw_seed_set(chain, gu.sample_bits()?, gu.u.answers)?;
+    let answers = gu_answers(gu, &registry, &gu_witness, &seeds)?;
+    absorb_norm_param_answers(chain, answer_tag, &answers)?;
+    let positions = draw_norm_param_positions(
+        chain,
+        column_tag,
+        claim.column_draws,
+        gu.index.code.log_n,
+    )?;
+    let openings = table.open_columns(kind, &positions)?;
+    Ok(NormParamClaimMessage {
+        root,
+        seeds,
+        answers,
+        openings,
+    })
+}
+
+/// Verifies one parameter table claim in the fixed order: the root, the
+/// sample seeds, the answers, then the drawn columns and their openings.
+fn verify_norm_param_claim(
+    chain: &mut Chain,
+    identity: &NormParamTableIdentity,
+    claim: &NormParamClaimPlan,
+    message: &NormParamClaimMessage,
+    root_tag: u64,
+    answer_tag: u64,
+    column_tag: u64,
+) -> Result<()> {
+    let gu = &claim.gu;
+    absorb_norm_param_root(chain, root_tag, &message.root)?;
+    let seeds = draw_seed_set(chain, gu.sample_bits()?, gu.u.answers)?;
+    if seeds != message.seeds {
+        return Err(Error::InvalidProof);
+    }
+    absorb_norm_param_answers(chain, answer_tag, &message.answers)?;
+    let positions =
+        draw_norm_param_positions(chain, column_tag, claim.column_draws, gu.index.code.log_n)?;
+    if message
+        .openings
+        .iter()
+        .map(|opening| opening.position)
+        .collect::<Vec<_>>()
+        != positions
+    {
+        return Err(Error::StatementMismatch);
+    }
+    verify_columns(&identity.reader, &positions, &message.openings)?;
+    Ok(())
 }
 
 fn draw_rstd_seed(chain: &mut Chain) -> Result<u64> {
@@ -16823,6 +16980,13 @@ mod merged_tests {
     }
 
     impl NormParamTableProver for ParamTables {
+        fn source(&mut self, kind: NormParamKind) -> &mut dyn TableRowSource {
+            match kind {
+                NormParamKind::Gain => &mut self.gain_source,
+                NormParamKind::Bias => &mut self.bias_source,
+            }
+        }
+
         fn open_columns(
             &mut self,
             kind: NormParamKind,
@@ -16895,6 +17059,49 @@ mod merged_tests {
         }
     }
 
+    fn param_claim(
+        kind: NormParamKind,
+        shape: IndexShape,
+    ) -> crate::proof::norm_param_table::NormParamClaimPlan {
+        use crate::proof::norm_param_table::NormParamClaimPlan;
+        use zkie_engine::pcs::request::gu::GuOracleShape;
+        use zkie_engine::pcs::request::runtime_tree::{RuntimeTreePart, RuntimeTreePlan};
+
+        let main_rows = 2u64;
+        NormParamClaimPlan {
+            kind,
+            gu: GuShape {
+                oracle: 0x8800 + kind.encode(),
+                group: 0x42,
+                tree: RuntimeTreePlan {
+                    tree_number: 0x1234,
+                    leaf_class: 1,
+                    log_n: shape.code.log_n,
+                    log_n_zk: shape.code.log_n,
+                    parts: vec![RuntimeTreePart {
+                        main_symbols: main_rows * E_DEGREE as u64,
+                        mask_symbols: 0,
+                    }],
+                    salt_bytes: SALT,
+                    run: Digest([0x71; 32]),
+                    configuration: Digest([0x72; 32]),
+                },
+                part: 0,
+                rows_high: true,
+                u: GuOracleShape {
+                    code: shape.code,
+                    main_rows,
+                    main_deg: E_DEGREE as u32,
+                    mask_rows: 0,
+                    mask_code: None,
+                    answers: 1,
+                },
+                index: shape,
+            },
+            column_draws: 2,
+        }
+    }
+
     fn norm_params_fixture(
         activation: &CommittedActivation,
     ) -> (HiddenLinPlan, NormWitness, ParamTables) {
@@ -16907,13 +17114,21 @@ mod merged_tests {
         let (gain_table, gain_source, gain_reader) = param_table(&gain_values, 0x61);
         let (bias_table, bias_source, bias_reader) = param_table(&bias_values, 0x62);
         let width = plan.norm.as_ref().unwrap().columns;
+        let gain_identity = param_identity(NormParamKind::Gain, gain_reader, width);
+        let bias_identity = param_identity(NormParamKind::Bias, bias_reader, width);
         plan.norm.as_mut().unwrap().params = Some(NormParamTablesPlan {
-            gain: param_identity(NormParamKind::Gain, gain_reader, width),
-            bias: param_identity(NormParamKind::Bias, bias_reader, width),
+            gain_claim: Some(param_claim(
+                NormParamKind::Gain,
+                gain_identity.reader.shape,
+            )),
+            bias_claim: Some(param_claim(
+                NormParamKind::Bias,
+                bias_identity.reader.shape,
+            )),
+            gain: gain_identity,
+            bias: bias_identity,
             column_draws: 2,
             seed_budget: 1,
-            gain_claim: None,
-            bias_claim: None,
         });
         witness.params = Some(NormParamWitness {
             gain: gain_values,

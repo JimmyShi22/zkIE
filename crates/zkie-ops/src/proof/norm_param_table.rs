@@ -146,6 +146,7 @@ impl NormParamClaimPlan {
             || self.gu.oracle == 0
             || self.gu.group == 0
             || self.gu.index != identity.reader.shape
+            || self.gu.index.v != 0
             || self.gu.fault().is_some()
         {
             return Err(Error::InvalidConfig);
@@ -415,17 +416,65 @@ mod tests {
 
     #[test]
     fn parameter_claims_bind_the_table_and_the_message_shape() {
-        let plan = packed_plan();
-        let digest = plan.digest();
-        let mut claimed = plan.clone();
+        use zkie_engine::pcs::request::code::build_code_plan;
+        use zkie_engine::pcs::request::field::Fp3;
+        use zkie_engine::pcs::request::params::LEAF_SALT_MIN_BYTES;
+        use zkie_engine::pcs::request::table::{
+            IndexReader, IndexRecord, IndexShape, TableDistances,
+        };
+
+        let shape = || IndexShape {
+            code: build_code_plan(4, 8, 1).unwrap(),
+            v: 0,
+            answers: 1,
+            salt_bytes: LEAF_SALT_MIN_BYTES,
+            distances: TableDistances {
+                radius: 0,
+                later_radius: 0,
+                m_once: 0,
+                m_later: 0,
+            },
+        };
+        let reader = |root: u8, configuration: u8| IndexReader {
+            shape: shape(),
+            configuration: Digest([configuration; 32]),
+            root: Digest([root; 32]),
+            record: IndexRecord {
+                y: vec![Fp3::ZERO; 1],
+            },
+        };
+        let identity = |kind: NormParamKind, reader: IndexReader| NormParamTableIdentity {
+            version: NORM_PARAM_TABLE_VERSION,
+            kind,
+            model_identity: Digest([0x23; 32]),
+            asset_table_identity: Digest([0x24; 32]),
+            reader,
+            row: 0,
+            width: 4,
+            valid_min: -128,
+            valid_max: 127,
+            trusted_i32_mapping: true,
+        };
+        let gain = identity(NormParamKind::Gain, reader(9, 7));
+        let bias = identity(NormParamKind::Bias, reader(8, 6));
+        let base = NormParamTablesPlan {
+            gain: gain.clone(),
+            bias: bias.clone(),
+            column_draws: 2,
+            seed_budget: 1,
+            gain_claim: None,
+            bias_claim: None,
+        };
+        let digest = base.digest();
+        let mut claimed = base.clone();
         claimed.gain_claim = Some(NormParamClaimPlan {
             kind: NormParamKind::Gain,
-            gu: claim_gu(&plan.gain),
+            gu: claim_gu(&gain),
             column_draws: 2,
         });
         claimed.bias_claim = Some(NormParamClaimPlan {
             kind: NormParamKind::Bias,
-            gu: claim_gu(&plan.bias),
+            gu: claim_gu(&bias),
             column_draws: 2,
         });
         claimed.validate().unwrap();
