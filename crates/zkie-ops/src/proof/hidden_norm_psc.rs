@@ -2906,24 +2906,213 @@ pub fn output_tail_variables(columns: u64) -> Result<usize> {
     Ok(domain.trailing_zeros() as usize)
 }
 
-/// The value-level maps of one output tail relation. Relation 0 is the
-/// rounding reconstruction `image = q * 2^shift + r` with the offset
-/// quotient; 1 is `shifted = q + selector`; 2 is the selector booleanity;
-/// 3 is the doubled remainder `2 r`; 4 is the tie slack
-/// `2 r - 2^shift * selector`. Each relation is the inner product of the two
-/// maps: a zero sum for the exact witness. The row binding maps every product
-/// to its committed object.
+/// One factor of a tail relation product. Slot factors name a committed tail
+/// slot and an optional scalar; the image factor names the committed image
+/// value of the term's column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TailFactor {
+    Slot { index: usize, scale: Fp3 },
+    Image,
+    Constant(Fp3),
+}
+
+/// One product of a tail relation, at the column and the per-column pair
+/// position it occupies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TailTerm {
+    pub column: usize,
+    pub left: TailFactor,
+    pub right: TailFactor,
+}
+
+/// The products of one tail relation. Relation 0 is the rounding
+/// reconstruction, 1 the shifted value, 2 the selector booleanity, 3 the
+/// doubled remainder and 4 the tie slack.
+pub fn output_rel_terms(
+    plan: &NormOutputTailPlan,
+    columns: u64,
+    shift: u32,
+    relation: usize,
+) -> Result<Vec<TailTerm>> {
+    let count = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    let slots = plan.widths.slots()?;
+    let q_at = 0usize;
+    let r_at = plan.widths.quotient;
+    let u_at = r_at + plan.widths.remainder;
+    let w_at = u_at + plan.widths.doubled_remainder;
+    let s_at = w_at + plan.widths.tie_slack;
+    let sh_at = s_at + 1;
+    if shift >= 63 {
+        return Err(Error::InvalidConfig);
+    }
+    let divisor = 1u128 << shift;
+    let q_half = 1u128 << (8 * plan.widths.quotient as u32 - 1);
+    let s_half = 1u128 << (8 * plan.widths.shifted as u32 - 1);
+    let field = |value: u128| -> Result<Fp3> {
+        Ok(Fp3::from_u64(
+            u64::try_from(value).map_err(|_| Error::BoundViolation)?,
+        ))
+    };
+    let times = |base: u128, digits: usize| -> Result<Fp3> {
+        let mut value = field(base)?;
+        for _ in 0..digits {
+            value = value.mul(&Fp3::from_u64(256));
+        }
+        Ok(value)
+    };
+    let neg = |value: Fp3| Fp3::ZERO.sub(&value);
+    let slot = |index: usize| TailFactor::Slot {
+        index,
+        scale: Fp3::ONE,
+    };
+    let neg_slot = |index: usize| TailFactor::Slot {
+        index,
+        scale: neg(Fp3::ONE),
+    };
+    let mut terms = Vec::new();
+    for column in 0..count {
+        let base = column * slots;
+        match relation {
+            0 => {
+                terms.push(TailTerm {
+                    column,
+                    left: TailFactor::Image,
+                    right: TailFactor::Constant(Fp3::ONE),
+                });
+                for digit in 0..plan.widths.quotient {
+                    terms.push(TailTerm {
+                        column,
+                        left: slot(base + q_at + digit),
+                        right: TailFactor::Constant(neg(times(divisor, digit)?)),
+                    });
+                }
+                for digit in 0..plan.widths.remainder {
+                    terms.push(TailTerm {
+                        column,
+                        left: slot(base + r_at + digit),
+                        right: TailFactor::Constant(neg(times(1, digit)?)),
+                    });
+                }
+                terms.push(TailTerm {
+                    column,
+                    left: TailFactor::Constant(
+                        field(divisor)?.mul(&field(q_half)?),
+                    ),
+                    right: TailFactor::Constant(Fp3::ONE),
+                });
+            }
+            1 => {
+                for digit in 0..plan.widths.shifted {
+                    terms.push(TailTerm {
+                        column,
+                        left: slot(base + sh_at + digit),
+                        right: TailFactor::Constant(times(1, digit)?),
+                    });
+                }
+                for digit in 0..plan.widths.quotient {
+                    terms.push(TailTerm {
+                        column,
+                        left: slot(base + q_at + digit),
+                        right: TailFactor::Constant(neg(times(1, digit)?)),
+                    });
+                }
+                terms.push(TailTerm {
+                    column,
+                    left: slot(base + s_at),
+                    right: TailFactor::Constant(neg(Fp3::ONE)),
+                });
+                terms.push(TailTerm {
+                    column,
+                    left: TailFactor::Constant(field(q_half)?.sub(&field(s_half)?)),
+                    right: TailFactor::Constant(Fp3::ONE),
+                });
+            }
+            2 => {
+                terms.push(TailTerm {
+                    column,
+                    left: slot(base + s_at),
+                    right: TailFactor::Constant(Fp3::ONE),
+                });
+                terms.push(TailTerm {
+                    column,
+                    left: slot(base + s_at),
+                    right: neg_slot(base + s_at),
+                });
+            }
+            3 => {
+                for digit in 0..plan.widths.doubled_remainder {
+                    terms.push(TailTerm {
+                        column,
+                        left: slot(base + u_at + digit),
+                        right: TailFactor::Constant(times(1, digit)?),
+                    });
+                }
+                for digit in 0..plan.widths.remainder {
+                    terms.push(TailTerm {
+                        column,
+                        left: slot(base + r_at + digit),
+                        right: TailFactor::Constant(neg(times(2, digit)?)),
+                    });
+                }
+            }
+            4 => {
+                for digit in 0..plan.widths.tie_slack {
+                    terms.push(TailTerm {
+                        column,
+                        left: slot(base + w_at + digit),
+                        right: TailFactor::Constant(times(1, digit)?),
+                    });
+                }
+                for digit in 0..plan.widths.doubled_remainder {
+                    terms.push(TailTerm {
+                        column,
+                        left: slot(base + u_at + digit),
+                        right: TailFactor::Constant(neg(times(1, digit)?)),
+                    });
+                }
+                terms.push(TailTerm {
+                    column,
+                    left: slot(base + s_at),
+                    right: TailFactor::Constant(field(divisor)?),
+                });
+            }
+            _ => return Err(Error::UnsupportedPrimitive),
+        }
+    }
+    Ok(terms)
+}
+
+fn factor_value(
+    factor: &TailFactor,
+    column: usize,
+    values: &[Fp3],
+    image: &[Fp3],
+) -> Result<Fp3> {
+    Ok(match factor {
+        TailFactor::Slot { index, scale } => values
+            .get(*index)
+            .ok_or(Error::ShapeMismatch)?
+            .mul(scale),
+        TailFactor::Image => *image.get(column).ok_or(Error::ShapeMismatch)?,
+        TailFactor::Constant(value) => *value,
+    })
+}
+
+/// The value-level maps of one tail relation: the two product vectors whose
+/// inner product is zero on the exact witness. The row binding consumes the
+/// same term enumeration.
 pub fn output_rel_map(
     plan: &NormOutputTailPlan,
     row: &crate::proof::hidden_norm::NormOutputRow,
     columns: u64,
+    shift: u32,
     relation: usize,
 ) -> Result<(Vec<Fp3>, Vec<Fp3>)> {
     use crate::proof::output_closure::fp3_signed;
 
     let count = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
-    let slots = plan.widths.slots()?;
     let values = plan.values(row, columns)?;
+    let terms = output_rel_terms(plan, columns, shift, relation)?;
     let domain = usize::try_from(
         columns
             .checked_mul(NORM_OUTPUT_TAIL_PAIRS as u64)
@@ -2931,113 +3120,24 @@ pub fn output_rel_map(
             .ok_or(Error::ResourceLimit)?,
     )
     .map_err(|_| Error::ResourceLimit)?;
-    if values.len() != count.checked_mul(slots).ok_or(Error::ResourceLimit)?
-        || row.image.len() != count
-    {
-        return Err(Error::ShapeMismatch);
+    let mut image = Vec::with_capacity(count);
+    for column in 0..count {
+        image.push(fp3_signed(row.image[column])?);
     }
     let mut left = vec![Fp3::ZERO; domain];
     let mut right = vec![Fp3::ZERO; domain];
-    let at = |column: usize, offset: usize, digit: usize| column * slots + offset + digit;
-    let q_at = 0usize;
-    let r_at = plan.widths.quotient;
-    let u_at = r_at + plan.widths.remainder;
-    let w_at = u_at + plan.widths.doubled_remainder;
-    let s_at = w_at + plan.widths.tie_slack;
-    let sh_at = s_at + 1;
-    let pre_at = sh_at + plan.widths.shifted;
-    let _ = pre_at;
-    let divisor = 1u128 << row.shift;
-    let q_half = 1u128 << (8 * plan.widths.quotient as u32 - 1);
-    let s_half = 1u128 << (8 * plan.widths.shifted as u32 - 1);
-    let times = |base: u128, digits: usize| -> Result<Fp3> {
-        let mut value = Fp3::from_u64(u64::try_from(base).map_err(|_| Error::BoundViolation)?);
-        for _ in 0..digits {
-            value = value.mul(&Fp3::from_u64(256));
+    let mut used = vec![0usize; count];
+    for term in terms {
+        if term.column >= count {
+            return Err(Error::ShapeMismatch);
         }
-        Ok(value)
-    };
-    let neg = |value: Fp3| Fp3::ZERO.sub(&value);
-    for column in 0..count {
-        let pair_base = column * NORM_OUTPUT_TAIL_PAIRS;
-        match relation {
-            0 => {
-                let mut pair = pair_base;
-                left[pair] = fp3_signed(row.image[column])?;
-                right[pair] = Fp3::ONE;
-                pair += 1;
-                for digit in 0..plan.widths.quotient {
-                    left[pair] = values[at(column, q_at, digit)];
-                    right[pair] = neg(times(divisor, digit)?);
-                    pair += 1;
-                }
-                for digit in 0..plan.widths.remainder {
-                    left[pair] = values[at(column, r_at, digit)];
-                    right[pair] = neg(times(1, digit)?);
-                    pair += 1;
-                }
-                let constant = Fp3::from_u64(u64::try_from(divisor).map_err(|_| Error::BoundViolation)?)
-                    .mul(&Fp3::from_u64(u64::try_from(q_half).map_err(|_| Error::BoundViolation)?));
-                left[pair] = constant;
-                right[pair] = Fp3::ONE;
-            }
-            1 => {
-                let mut pair = pair_base;
-                for digit in 0..plan.widths.shifted {
-                    left[pair] = values[at(column, sh_at, digit)];
-                    right[pair] = times(1, digit)?;
-                    pair += 1;
-                }
-                for digit in 0..plan.widths.quotient {
-                    left[pair] = values[at(column, q_at, digit)];
-                    right[pair] = neg(times(1, digit)?);
-                    pair += 1;
-                }
-                left[pair] = values[at(column, s_at, 0)];
-                right[pair] = neg(Fp3::ONE);
-                pair += 1;
-                let constant = Fp3::from_u64(u64::try_from(q_half).map_err(|_| Error::BoundViolation)?)
-                    .sub(&Fp3::from_u64(u64::try_from(s_half).map_err(|_| Error::BoundViolation)?));
-                left[pair] = constant;
-                right[pair] = Fp3::ONE;
-            }
-            2 => {
-                let selector = values[at(column, s_at, 0)];
-                left[pair_base] = selector;
-                right[pair_base] = Fp3::ONE;
-                left[pair_base + 1] = selector;
-                right[pair_base + 1] = neg(selector);
-            }
-            3 => {
-                let mut pair = pair_base;
-                for digit in 0..plan.widths.doubled_remainder {
-                    left[pair] = values[at(column, u_at, digit)];
-                    right[pair] = times(1, digit)?;
-                    pair += 1;
-                }
-                for digit in 0..plan.widths.remainder {
-                    left[pair] = values[at(column, r_at, digit)];
-                    right[pair] = neg(times(2, digit)?);
-                    pair += 1;
-                }
-            }
-            4 => {
-                let mut pair = pair_base;
-                for digit in 0..plan.widths.tie_slack {
-                    left[pair] = values[at(column, w_at, digit)];
-                    right[pair] = times(1, digit)?;
-                    pair += 1;
-                }
-                for digit in 0..plan.widths.doubled_remainder {
-                    left[pair] = values[at(column, u_at, digit)];
-                    right[pair] = neg(times(1, digit)?);
-                    pair += 1;
-                }
-                left[pair] = values[at(column, s_at, 0)];
-                right[pair] = times(divisor, 0)?;
-            }
-            _ => return Err(Error::UnsupportedPrimitive),
+        let at = term.column * NORM_OUTPUT_TAIL_PAIRS + used[term.column];
+        used[term.column] += 1;
+        if used[term.column] > NORM_OUTPUT_TAIL_PAIRS {
+            return Err(Error::ShapeMismatch);
         }
+        left[at] = factor_value(&term.left, term.column, &values, &image)?;
+        right[at] = factor_value(&term.right, term.column, &values, &image)?;
     }
     Ok((left, right))
 }
@@ -3288,6 +3388,17 @@ pub struct NormRowBinding {
     /// The checked pointwise product instances, when the plan carries the
     /// output tail. The row builder consumes them on both sides.
     pub output: Option<Vec<NormOutputBinding>>,
+    /// The checked tail relation instances, when the plan carries the tail
+    /// section.
+    pub tail: Option<Vec<NormTailBinding>>,
+}
+
+/// One checked tail relation instance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormTailBinding {
+    pub position: u32,
+    pub relation: usize,
+    pub output: DotOutput,
 }
 
 /// One checked pointwise product instance.
@@ -6012,20 +6123,20 @@ mod tests {
             )
             .unwrap();
             for relation in 0..5usize {
-                let (left, right) = output_rel_map(&tail_plan, &row, columns, relation).unwrap();
+                let (left, right) = output_rel_map(&tail_plan, &row, columns, 3, relation).unwrap();
                 assert_eq!(inner(&left, &right), Fp3::ZERO, "relation {relation}");
             }
             let mut changed = row.clone();
             changed.image[0] += 1;
-            let (left, right) = output_rel_map(&tail_plan, &changed, columns, 0).unwrap();
+            let (left, right) = output_rel_map(&tail_plan, &changed, columns, 3, 0).unwrap();
             assert_ne!(inner(&left, &right), Fp3::ZERO);
             let mut changed = row.clone();
             changed.selector[1] = !changed.selector[1];
-            let (left, right) = output_rel_map(&tail_plan, &changed, columns, 1).unwrap();
+            let (left, right) = output_rel_map(&tail_plan, &changed, columns, 3, 1).unwrap();
             assert_ne!(inner(&left, &right), Fp3::ZERO);
             let mut changed = row.clone();
             changed.remainder[0] += 1;
-            let (left, right) = output_rel_map(&tail_plan, &changed, columns, 0).unwrap();
+            let (left, right) = output_rel_map(&tail_plan, &changed, columns, 3, 0).unwrap();
             assert_ne!(inner(&left, &right), Fp3::ZERO);
         }
         assert_eq!(output_tail_variables(columns).unwrap(), 5);
@@ -6034,7 +6145,7 @@ mod tests {
             NormOutputRow::from_core(&core, &[1, 2, 0, 0], 100, &weight, &bias, 2, 3, None)
                 .unwrap()
         };
-        assert!(output_rel_map(&tail_plan, &row, columns, 5).is_err());
+        assert!(output_rel_map(&tail_plan, &row, columns, 3, 5).is_err());
     }
 
     #[test]

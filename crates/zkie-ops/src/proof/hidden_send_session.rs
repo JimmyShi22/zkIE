@@ -9094,6 +9094,18 @@ fn own_members(
                 output_witness.map(|witness| &witness.out),
             ));
         }
+        if let (Some(tail_message), Some(output_plan)) = (&norm_first.tail, &norm_plan.output) {
+            if let Some(tail_plan) = &output_plan.tail {
+                let tail_witness = norm_witness
+                    .and_then(|witness| witness.output.as_ref())
+                    .and_then(|witness| witness.tail.as_ref());
+                groups.push((
+                    &tail_message.group,
+                    &tail_plan.group,
+                    tail_witness.map(|witness| &witness.committed),
+                ));
+            }
+        }
         for (message, group_plan, group_witness) in groups {
             if message.message.group.group != group_plan.group
                 || message.message.roots.len() != positions as usize
@@ -9495,6 +9507,33 @@ fn own_sample_rows(
                             plan.send.group,
                             &group_plan.shape.oracle_shape(),
                             &message.sample.seed,
+                            0,
+                            target,
+                        )?]);
+                    }
+                }
+            }
+            if let (Some(tail_message), Some(output_plan)) =
+                (&norm_first.tail, &norm_plan.output)
+            {
+                if let Some(tail_plan) = &output_plan.tail {
+                    let base = tail_plan.group.oracle_base;
+                    let positions = plan.send.positions() as u64;
+                    if member.source_oracle >= base
+                        && member.source_oracle < base.saturating_add(positions)
+                    {
+                        let position = (member.source_oracle - base) as usize;
+                        let target = *tail_message
+                            .group
+                            .sample
+                            .answers
+                            .get(position)
+                            .ok_or(Error::ShapeMismatch)?;
+                        return Ok(vec![oracle_sample_row(
+                            member.source_oracle,
+                            plan.send.group,
+                            &tail_plan.group.shape.oracle_shape(),
+                            &tail_message.group.sample.seed,
                             0,
                             target,
                         )?]);
@@ -12180,7 +12219,7 @@ fn prove_norm_second(
         (None, None) => (None, None),
         _ => return Err(Error::ShapeMismatch),
     };
-    let tail_message = match (
+    let (tail_message, tail_bindings) = match (
         plan.output.as_ref().and_then(|output| output.tail.as_ref()),
         &witness.output,
     ) {
@@ -12197,6 +12236,7 @@ fn prove_norm_second(
             };
             let mut psc = Vec::with_capacity(positions * 5);
             let mut point_values = Vec::with_capacity(positions * 5);
+            let mut tail_bindings = Vec::with_capacity(positions * 5);
             for position in 0..positions {
                 for relation in 0..5usize {
                     let instance = position * 5 + relation;
@@ -12204,6 +12244,7 @@ fn prove_norm_second(
                         tail_plan,
                         &output_witness.rows[position],
                         plan.columns,
+                        plan.output.as_ref().ok_or(Error::InvalidConfig)?.shift,
                         relation,
                     )?;
                     if left.len() != right.len() || left.len() != 1usize << variables {
@@ -12225,11 +12266,19 @@ fn prove_norm_second(
                     )?;
                     psc.push(proof);
                     point_values.push([output.ends[0].value, output.ends[1].value]);
+                    tail_bindings.push(crate::proof::hidden_norm_psc::NormTailBinding {
+                        position: position as u32,
+                        relation,
+                        output,
+                    });
                 }
             }
-            Some(crate::proof::hidden_norm_psc::NormTailPscSecond { psc, point_values })
+            (
+                Some(crate::proof::hidden_norm_psc::NormTailPscSecond { psc, point_values }),
+                Some(tail_bindings),
+            )
         }
-        (None, None) => None,
+        (None, None) => (None, None),
         _ => return Err(Error::ShapeMismatch),
     };
     Ok((
@@ -12246,6 +12295,7 @@ fn prove_norm_second(
             lookup,
             rstd,
             output: output_binding,
+            tail: tail_bindings,
         },
     ))
 }
@@ -12441,7 +12491,7 @@ fn verify_norm_second(
         (None, None) => None,
         _ => return Err(Error::ShapeMismatch),
     };
-    match (
+    let tail_binding = match (
         plan.output.as_ref().and_then(|output| output.tail.as_ref()),
         &messages.tail,
     ) {
@@ -12455,6 +12505,7 @@ fn verify_norm_second(
                 masks: Vec::new(),
                 target: Fp3::ZERO,
             };
+            let mut tail_bindings = Vec::with_capacity(positions * 5);
             for instance in 0..positions * 5 {
                 let proof = message.psc.get(instance).ok_or(Error::ShapeMismatch)?;
                 let mut challenges =
@@ -12480,17 +12531,24 @@ fn verify_norm_second(
                 {
                     return Err(Error::InvalidProof);
                 }
+                tail_bindings.push(crate::proof::hidden_norm_psc::NormTailBinding {
+                    position: (instance / 5) as u32,
+                    relation: instance % 5,
+                    output,
+                });
             }
             let _ = tail_plan;
+            Some(tail_bindings)
         }
-        (None, None) => {}
+        (None, None) => None,
         _ => return Err(Error::ShapeMismatch),
-    }
+    };
     Ok(NormRowBinding {
         positions: bindings,
         lookup: lookup_binding,
         rstd: rstd_binding,
         output: output_binding,
+        tail: tail_binding,
     })
 }
 
@@ -14176,6 +14234,190 @@ fn output_plain_rows(
     Ok(rows)
 }
 
+/// Adds one tail relation factor to its coefficient vector: a committed tail
+/// slot with its scale, the committed image value of the term's column, or a
+/// public constant.
+fn add_tail_factor(
+    weight: Fp3,
+    factor: &crate::proof::hidden_norm_psc::TailFactor,
+    tail: &mut [Fp3],
+    image: &mut [Fp3],
+    column: usize,
+    constant: &mut Fp3,
+) -> Result<()> {
+    use crate::proof::hidden_norm_psc::TailFactor;
+
+    match factor {
+        TailFactor::Slot { index, scale } => {
+            let slot = tail.get_mut(*index).ok_or(Error::ShapeMismatch)?;
+            *slot = slot.add(&weight.mul(scale));
+        }
+        TailFactor::Image => {
+            let slot = image.get_mut(column).ok_or(Error::ShapeMismatch)?;
+            *slot = slot.add(&weight);
+        }
+        TailFactor::Constant(value) => {
+            *constant = constant.add(&weight.mul(value));
+        }
+    }
+    Ok(())
+}
+
+/// The BAT rows of the tail relation instances: the two shown maps at the
+/// transcript point against the committed tail slots and image rows, and the
+/// hiding form against the committed tail mask entries.
+fn output_tail_plain_rows(
+    plan: &HiddenLinPlan,
+    members: &[ProximityMember],
+    first: &HiddenSendMessages,
+    binding: &[crate::proof::hidden_norm_psc::NormTailBinding],
+) -> Result<Vec<BatRow>> {
+    use crate::proof::hidden_norm_psc::{
+        output_rel_terms, output_tail_variables, NORM_OUTPUT_TAIL_PAIRS,
+    };
+
+    let norm = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
+    let output_plan = norm.output.as_ref().ok_or(Error::InvalidConfig)?;
+    let tail_plan = output_plan.tail.as_ref().ok_or(Error::InvalidConfig)?;
+    let mask_plan = norm.mask.as_ref().ok_or(Error::InvalidConfig)?;
+    let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
+    if norm_first.tail.is_none() {
+        return Err(Error::ShapeMismatch);
+    }
+    let positions = norm.shape.positions as usize;
+    let relations = norm.relations.len();
+    let instances = positions
+        .checked_mul(relations)
+        .ok_or(Error::ResourceLimit)?;
+    let columns = usize::try_from(norm.columns).map_err(|_| Error::ResourceLimit)?;
+    let variables = output_tail_variables(norm.columns)?;
+    let tail_rows = usize::try_from(tail_plan.group.shape.main_rows)
+        .map_err(|_| Error::ResourceLimit)?;
+    let tail_ell = usize::try_from(tail_plan.group.shape.code.ell)
+        .map_err(|_| Error::ResourceLimit)?;
+    let image_rows = usize::try_from(output_plan.image.shape.main_rows)
+        .map_err(|_| Error::ResourceLimit)?;
+    let image_ell = usize::try_from(output_plan.image.shape.code.ell)
+        .map_err(|_| Error::ResourceLimit)?;
+    if binding.len() != positions.checked_mul(5).ok_or(Error::ResourceLimit)? {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut bat_of = std::collections::HashMap::new();
+    for member in members {
+        bat_of.insert(member.source_oracle, member);
+    }
+    let mask_member = bat_of
+        .get(&mask_plan.oracle)
+        .ok_or(Error::StatementMismatch)?;
+    if mask_member.mask_rows != mask_plan.mask_rows
+        || mask_member.mask_code != mask_plan.mask_code
+        || mask_member.answers != mask_plan.answers
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let member_for = |oracle: u64| -> Result<&ProximityMember> {
+        bat_of
+            .get(&oracle)
+            .copied()
+            .ok_or(Error::StatementMismatch)
+    };
+    let mut rows = Vec::with_capacity(binding.len() * 3);
+    for word in binding {
+        let position = word.position as usize;
+        if position >= positions || word.relation >= 5 {
+            return Err(Error::InvalidProof);
+        }
+        let instance = position * 5 + word.relation;
+        let output = &word.output;
+        if output.point.len() != variables || output.ends.len() != 2 {
+            return Err(Error::InvalidProof);
+        }
+        let eq = crate::proof::output_closure::eq_vector(&output.point)?;
+        if eq.len() != columns * NORM_OUTPUT_TAIL_PAIRS {
+            return Err(Error::ShapeMismatch);
+        }
+        let terms = output_rel_terms(tail_plan, norm.columns, output_plan.shift, word.relation)?;
+        let tail_member = member_for(tail_plan.group.oracle_base + position as u64)?;
+        let image_member = member_for(output_plan.image.oracle_base + position as u64)?;
+        let mut tail_left = vec![Fp3::ZERO; tail_rows * tail_ell];
+        let mut image_left = vec![Fp3::ZERO; image_rows * image_ell];
+        let mut tail_right = vec![Fp3::ZERO; tail_rows * tail_ell];
+        let mut image_right = vec![Fp3::ZERO; image_rows * image_ell];
+        let mut left_constant = Fp3::ZERO;
+        let mut right_constant = Fp3::ZERO;
+        let mut used = vec![0usize; columns];
+        for term in terms {
+            if term.column >= columns {
+                return Err(Error::ShapeMismatch);
+            }
+            let at = term.column * NORM_OUTPUT_TAIL_PAIRS + used[term.column];
+            used[term.column] += 1;
+            if used[term.column] > NORM_OUTPUT_TAIL_PAIRS || at >= eq.len() {
+                return Err(Error::ShapeMismatch);
+            }
+            let weight = eq[at];
+            add_tail_factor(
+                weight,
+                &term.left,
+                &mut tail_left,
+                &mut image_left,
+                term.column,
+                &mut left_constant,
+            )?;
+            add_tail_factor(
+                weight,
+                &term.right,
+                &mut tail_right,
+                &mut image_right,
+                term.column,
+                &mut right_constant,
+            )?;
+        }
+        let shown0 = mask_plan.tail_shown_slot(instances, instance, 0)?;
+        let shown1 = mask_plan.tail_shown_slot(instances, instance, 1)?;
+        let end0 = &output.ends[0];
+        let end1 = &output.ends[1];
+        if end0.point != output.point || end1.point != output.point {
+            return Err(Error::InvalidProof);
+        }
+        let mut row = BatRow::new(BatRowKind::Plain);
+        row.add_term(tail_member.bat_oracle, BatPart::Main, tail_left);
+        row.add_term(image_member.bat_oracle, BatPart::Main, image_left);
+        row.add_unit(
+            mask_member.bat_oracle,
+            BatPart::Mask,
+            mask_plan.entry_virtual_index(shown0)?,
+            end0.mask_scale,
+        );
+        row.target = end0.value.sub(&left_constant);
+        rows.push(row);
+        let mut row = BatRow::new(BatRowKind::Plain);
+        row.add_term(tail_member.bat_oracle, BatPart::Main, tail_right);
+        row.add_term(image_member.bat_oracle, BatPart::Main, image_right);
+        row.add_unit(
+            mask_member.bat_oracle,
+            BatPart::Mask,
+            mask_plan.entry_virtual_index(shown1)?,
+            end1.mask_scale,
+        );
+        row.target = end1.value.sub(&right_constant);
+        rows.push(row);
+        let mut row = BatRow::new(BatRowKind::Plain);
+        for (index, coefficient) in output.hiding_form.iter().enumerate() {
+            let slot = mask_plan.tail_hiding_slot(instances, instance, index)?;
+            row.add_unit(
+                mask_member.bat_oracle,
+                BatPart::Mask,
+                mask_plan.entry_virtual_index(slot)?,
+                *coefficient,
+            );
+        }
+        row.target = output.row_target;
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
 fn own_plain_rows(
     plan: &HiddenLinPlan,
     members: &[ProximityMember],
@@ -14309,6 +14551,9 @@ fn own_plain_rows(
         rows.extend(norm_plain_rows(plan, members, first, binding)?);
         if let Some(output) = &binding.output {
             rows.extend(output_plain_rows(plan, members, first, output)?);
+        }
+        if let Some(tail) = &binding.tail {
+            rows.extend(output_tail_plain_rows(plan, members, first, tail)?);
         }
         let norm_plan = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
         if let Some(lookup) = &binding.lookup {
@@ -15136,6 +15381,24 @@ fn witness_tree_for(
                     let position = (member.source_oracle - base) as usize;
                     return retained_member_tree(
                         &group_witness.committed.trees,
+                        position,
+                        member,
+                    );
+                }
+            }
+            if let Some(tail_plan) = norm_plan
+                .output
+                .as_ref()
+                .and_then(|output| output.tail.as_ref())
+            {
+                let tail_witness = output_witness.tail.as_ref().ok_or(Error::ShapeMismatch)?;
+                let base = tail_plan.group.oracle_base;
+                if member.source_oracle >= base
+                    && member.source_oracle < base.saturating_add(positions)
+                {
+                    let position = (member.source_oracle - base) as usize;
+                    return retained_member_tree(
+                        &tail_witness.committed.committed.trees,
                         position,
                         member,
                     );
@@ -22083,6 +22346,21 @@ mod merged_tests {
 
         let mut changed = base.clone();
         changed.second.norm.as_mut().unwrap().tail = None;
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        // The tail shown values are bound to the committed slots by the rows:
+        // a changed point value is rejected.
+        let mut changed = base.clone();
+        let value = &mut changed
+            .second
+            .norm
+            .as_mut()
+            .unwrap()
+            .tail
+            .as_mut()
+            .unwrap()
+            .point_values[0][0];
+        *value = value.add(&Fp3::ONE);
         assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
     }
 
