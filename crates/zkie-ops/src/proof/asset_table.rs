@@ -50,7 +50,7 @@ pub struct AssetTableParams {
 
 /// The committer's private random material for one table. The salts and tails
 /// never enter the public bundle; the table root commits them.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AssetTableRandomness {
     pub salts: Vec<Vec<u8>>,
     pub tails: Vec<Vec<Fp>>,
@@ -272,6 +272,19 @@ mod tests {
     }
 
     #[test]
+    fn randomness_round_trips_and_rejects_a_mismatched_shape() {
+        let params = params();
+        let randomness = sample_asset_table_randomness(&params).unwrap();
+        let bytes = encode_asset_table_randomness(&randomness).unwrap();
+        let decoded = decode_asset_table_randomness(&bytes, &params).unwrap();
+        assert_eq!(decoded.salts.len(), randomness.salts.len());
+        assert_eq!(decoded.tails.len(), randomness.tails.len());
+        let mut wrong = params.clone();
+        wrong.shape.code.r += 1;
+        assert!(decode_asset_table_randomness(&bytes, &wrong).is_err());
+    }
+
+    #[test]
     fn sampled_randomness_has_the_table_shape() {
         let params = params();
         let randomness = sample_asset_table_randomness(&params).unwrap();
@@ -280,6 +293,38 @@ mod tests {
         assert_eq!(randomness.tails.len(), params.shape.rows() as usize);
         assert!(randomness.tails.iter().all(|tail| tail.len() == 2));
     }
+}
+
+
+/// Encodes the private table randomness for the commit artifact. The bytes
+/// are never part of the public bundle.
+pub fn encode_asset_table_randomness(randomness: &AssetTableRandomness) -> Result<Vec<u8>> {
+    bincode::serialize(randomness).map_err(|_| ZkieError::InvalidEncoding)
+}
+
+/// Decodes private table randomness and checks it against the trusted table
+/// parameters, so a truncated or mismatched private file is rejected before
+/// it can produce a table root.
+pub fn decode_asset_table_randomness(
+    bytes: &[u8],
+    params: &AssetTableParams,
+) -> Result<AssetTableRandomness> {
+    let randomness: AssetTableRandomness =
+        bincode::deserialize(bytes).map_err(|_| ZkieError::InvalidEncoding)?;
+    let columns = usize::try_from(params.shape.code.n()).map_err(|_| ZkieError::ResourceLimit)?;
+    let rows = usize::try_from(params.shape.rows()).map_err(|_| ZkieError::ResourceLimit)?;
+    let tail_len = usize::try_from(params.shape.code.r).map_err(|_| ZkieError::ResourceLimit)?;
+    if randomness.salts.len() != columns
+        || randomness
+            .salts
+            .iter()
+            .any(|salt| salt.len() != params.shape.salt_bytes)
+        || randomness.tails.len() != rows
+        || randomness.tails.iter().any(|tail| tail.len() != tail_len)
+    {
+        return Err(ZkieError::ShapeMismatch);
+    }
+    Ok(randomness)
 }
 
 struct AssetRowSource<'a> {
