@@ -2496,9 +2496,12 @@ impl NormOutputTailWidths {
             .ok_or(Error::ResourceLimit)
     }
 
-    pub fn columns(&self) -> Result<u64> {
-        u64::try_from(self.slots()?)
-            .ok()
+    /// The message width of one tail row: every column carries all of its
+    /// slots, so the width is the column count times the slot count rounded
+    /// up to a power of two.
+    pub fn columns(&self, columns: u64) -> Result<u64> {
+        columns
+            .checked_mul(u64::try_from(self.slots()?).map_err(|_| Error::ResourceLimit)?)
             .and_then(|value| value.checked_next_power_of_two())
             .ok_or(Error::ResourceLimit)
     }
@@ -2519,7 +2522,7 @@ impl NormOutputTailPlan {
         if self.widths.fault(output.shift).is_some() {
             return Err(Error::InvalidConfig);
         }
-        if self.group.columns != self.widths.columns()?
+        if self.group.columns != self.widths.columns(plan.columns)?
             || self.group.fault(plan.shape.positions).is_some()
             || self.group.shape.answers != 1
         {
@@ -5318,8 +5321,8 @@ mod tests {
             shifted: 3,
             pre_clamp: 3,
         };
-        let tail_columns = widths.columns().unwrap();
-        assert_eq!(tail_columns, 16);
+        let tail_columns = widths.columns(plan.columns).unwrap();
+        assert_eq!(tail_columns, 64);
         let tail_group = NormGroupPlan {
             shape: WShape::new(
                 tail_columns,
@@ -5346,7 +5349,7 @@ mod tests {
         with_tail.validate().unwrap();
 
         let mut changed = with_tail.clone();
-        changed.output.as_mut().unwrap().tail.as_mut().unwrap().group.columns = 8;
+        changed.output.as_mut().unwrap().tail.as_mut().unwrap().group.columns = 16;
         assert!(changed.validate().is_err());
 
         let mut changed = with_tail.clone();
