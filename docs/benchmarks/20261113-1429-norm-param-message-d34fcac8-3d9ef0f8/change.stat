@@ -1,0 +1,22 @@
+commit d34fcac8a39f71eb10c88bbafc8847f5df5cea00
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Fri Nov 13 14:29:54 2026 +0800
+
+    Carry the norm parameter table openings in the first norm message
+    
+    The first norm message gains the optional parameter table openings: the gain
+    openings and, for a separate bias table, the bias openings, each carrying the
+    position, salt, one symbol per table row and the Merkle path. The wire section
+    is present only when the plan carries the parameter tables, so the existing
+    norm messages are unchanged. The witness gains the private parameter vectors
+    for the later relation rows. The parameter width now has to fit the usable
+    plain message region of the table instead of the codeword length, and the
+    opening codec enforces the reader's row count, code depth, salt length, column
+    range and strictly increasing positions.
+    
+    partial progress
+
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     | 241 ++++++++++++++++++++++-
+ crates/zkie-ops/src/proof/hidden_send_session.rs |   9 +-
+ crates/zkie-ops/src/proof/norm_param_table.rs    |   8 +-
+ 3 files changed, 249 insertions(+), 9 deletions(-)
