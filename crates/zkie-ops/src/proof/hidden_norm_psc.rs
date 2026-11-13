@@ -4390,6 +4390,8 @@ mod tests {
             bias: identity(NormParamKind::Bias, 1),
             column_draws: 2,
             seed_budget: 1,
+            gain_claim: None,
+            bias_claim: None,
         });
         plan.validate().unwrap();
         assert_ne!(plan.digest(), digest);
@@ -4458,6 +4460,8 @@ mod tests {
             bias: identity(NormParamKind::Bias, 1),
             column_draws: 2,
             seed_budget: 1,
+            gain_claim: None,
+            bias_claim: None,
         });
         plan.validate().unwrap();
         let opening = |position: u64| ColumnOpening {

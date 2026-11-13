@@ -16912,6 +16912,8 @@ mod merged_tests {
             bias: param_identity(NormParamKind::Bias, bias_reader, width),
             column_draws: 2,
             seed_budget: 1,
+            gain_claim: None,
+            bias_claim: None,
         });
         witness.params = Some(NormParamWitness {
             gain: gain_values,

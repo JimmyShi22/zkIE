@@ -16,6 +16,7 @@ use zkie_core::artifact::digest_bytes;
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
 use zkie_engine::pcs::request::foldeq::reader_table_identity;
+use zkie_engine::pcs::request::gu::GuShape;
 use zkie_engine::pcs::request::table::IndexReader;
 use zkie_engine::primitives::codec::CanonicalWriter;
 
@@ -126,6 +127,52 @@ fn put_reader_identity(writer: &mut CanonicalWriter, reader: &IndexReader) {
     }
 }
 
+/// The trusted plan of one parameter table's folded-message claim. The table
+/// has one row, so the fold weights are the single entry one and there is no
+/// gamma; G_u is the committed folded row message, and the claim keeps the
+/// record declaration and the sampled column declarations that tie it to the
+/// committed table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormParamClaimPlan {
+    pub kind: NormParamKind,
+    pub gu: GuShape,
+    pub column_draws: usize,
+}
+
+impl NormParamClaimPlan {
+    fn validate(&self, identity: &NormParamTableIdentity) -> Result<()> {
+        let plain = self.gu.u.code.ell;
+        if self.kind != identity.kind
+            || self.gu.oracle == 0
+            || self.gu.group == 0
+            || self.gu.index != identity.reader.shape
+            || self.gu.fault().is_some()
+        {
+            return Err(Error::InvalidConfig);
+        }
+        if self.column_draws == 0 || self.column_draws as u64 > self.gu.index.code.n() {
+            return Err(Error::InvalidConfig);
+        }
+        let room = self
+            .gu
+            .u
+            .main_rows
+            .checked_mul(plain)
+            .and_then(|value| value.checked_sub(self.gu.u.answers as u64))
+            .ok_or(Error::ResourceLimit)?;
+        if identity.width > room {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(())
+    }
+
+    fn encode_into(&self, writer: &mut CanonicalWriter) {
+        writer.put_u64(self.kind.encode());
+        writer.put_bytes(&self.gu.encode());
+        writer.put_u64(self.column_draws as u64);
+    }
+}
+
 /// The plan values of the two parameter tables. Two identities with the same
 /// reader are two rows of one committed table; two different readers are two
 /// separate tables. The counts are per table and come from the trusted plan.
@@ -135,6 +182,9 @@ pub struct NormParamTablesPlan {
     pub bias: NormParamTableIdentity,
     pub column_draws: usize,
     pub seed_budget: usize,
+    /// The folded-message claims, when the plan carries them.
+    pub gain_claim: Option<NormParamClaimPlan>,
+    pub bias_claim: Option<NormParamClaimPlan>,
 }
 
 impl NormParamTablesPlan {
@@ -155,6 +205,19 @@ impl NormParamTablesPlan {
                 return Err(Error::InvalidConfig);
             }
         }
+        match (&self.gain_claim, &self.bias_claim) {
+            (None, None) => {}
+            (Some(gain), Some(bias)) => {
+                gain.validate(&self.gain)?;
+                bias.validate(&self.bias)?;
+                if gain.column_draws != self.column_draws
+                    || bias.column_draws != self.column_draws
+                {
+                    return Err(Error::InvalidConfig);
+                }
+            }
+            _ => return Err(Error::InvalidConfig),
+        }
         Ok(())
     }
 
@@ -164,6 +227,15 @@ impl NormParamTablesPlan {
         writer.put_digest(&self.bias.digest());
         writer.put_u64(self.column_draws as u64);
         writer.put_u64(self.seed_budget as u64);
+        for claim in [&self.gain_claim, &self.bias_claim] {
+            match claim {
+                Some(claim) => {
+                    writer.put_u64(1);
+                    claim.encode_into(&mut writer);
+                }
+                None => writer.put_u64(0),
+            }
+        }
         digest_bytes(&writer.into_bytes())
     }
 }
@@ -225,6 +297,8 @@ mod tests {
             bias: identity(NormParamKind::Bias, 1, reader(9, 7)),
             column_draws: 2,
             seed_budget: 1,
+            gain_claim: None,
+            bias_claim: None,
         }
     }
 
@@ -300,6 +374,85 @@ mod tests {
 
         let mut changed = identity.clone();
         changed.valid_max = i32::MAX as i64 + 1;
+        assert!(changed.validate().is_err());
+    }
+
+    fn claim_gu(identity: &NormParamTableIdentity) -> GuShape {
+        use zkie_engine::pcs::request::field::E_DEGREE;
+        use zkie_engine::pcs::request::gu::GuOracleShape;
+        use zkie_engine::pcs::request::runtime_tree::{RuntimeTreePart, RuntimeTreePlan};
+
+        let main_rows = 2u64;
+        GuShape {
+            oracle: 0x8800,
+            group: 0x42,
+            tree: RuntimeTreePlan {
+                tree_number: 0x1234,
+                leaf_class: 1,
+                log_n: identity.reader.shape.code.log_n,
+                log_n_zk: identity.reader.shape.code.log_n,
+                parts: vec![RuntimeTreePart {
+                    main_symbols: main_rows * E_DEGREE as u64,
+                    mask_symbols: 0,
+                }],
+                salt_bytes: LEAF_SALT_MIN_BYTES,
+                run: Digest([0x71; 32]),
+                configuration: Digest([0x72; 32]),
+            },
+            part: 0,
+            rows_high: true,
+            u: GuOracleShape {
+                code: identity.reader.shape.code,
+                main_rows,
+                main_deg: E_DEGREE as u32,
+                mask_rows: 0,
+                mask_code: None,
+                answers: 1,
+            },
+            index: identity.reader.shape,
+        }
+    }
+
+    #[test]
+    fn parameter_claims_bind_the_table_and_the_message_shape() {
+        let plan = packed_plan();
+        let digest = plan.digest();
+        let mut claimed = plan.clone();
+        claimed.gain_claim = Some(NormParamClaimPlan {
+            kind: NormParamKind::Gain,
+            gu: claim_gu(&plan.gain),
+            column_draws: 2,
+        });
+        claimed.bias_claim = Some(NormParamClaimPlan {
+            kind: NormParamKind::Bias,
+            gu: claim_gu(&plan.bias),
+            column_draws: 2,
+        });
+        claimed.validate().unwrap();
+        assert_ne!(claimed.digest(), digest);
+
+        let mut changed = claimed.clone();
+        changed.gain_claim.as_mut().unwrap().kind = NormParamKind::Bias;
+        assert!(changed.validate().is_err());
+
+        let mut changed = claimed.clone();
+        changed.gain_claim.as_mut().unwrap().gu.index.v += 1;
+        assert!(changed.validate().is_err());
+
+        let mut changed = claimed.clone();
+        changed.gain_claim.as_mut().unwrap().column_draws = 0;
+        assert!(changed.validate().is_err());
+
+        let mut changed = claimed.clone();
+        changed.gain_claim.as_mut().unwrap().gu.u.main_rows = 1;
+        assert!(changed.validate().is_err());
+
+        let mut changed = claimed.clone();
+        changed.bias_claim = None;
+        assert!(changed.validate().is_err());
+
+        let mut changed = claimed;
+        changed.gain_claim.as_mut().unwrap().gu.oracle = 0;
         assert!(changed.validate().is_err());
     }
 
