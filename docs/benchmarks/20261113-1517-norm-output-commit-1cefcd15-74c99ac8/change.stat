@@ -1,0 +1,4 @@
+1cefcd15 Commit the output tail groups in the norm message
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     | 108 ++++-
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 490 ++++++++++++++++++++++-
+ 2 files changed, 595 insertions(+), 3 deletions(-)
