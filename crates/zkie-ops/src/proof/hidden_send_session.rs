@@ -10946,6 +10946,68 @@ fn verify_norm_param_claim(
     Ok(())
 }
 
+/// The record and column declarations of one parameter table claim. Both the
+/// prover and the verifier build them from the same claim message and plan
+/// reader; the rows tie the folded message to the committed table through the
+/// record answers and the opened columns.
+pub(crate) struct NormParamClaimRows {
+    pub record: Vec<GuRelationRow>,
+    pub column: Vec<GuRelationRow>,
+}
+
+fn norm_param_claim_rows(
+    identity: &NormParamTableIdentity,
+    claim: &NormParamClaimPlan,
+    message: &NormParamClaimMessage,
+) -> Result<NormParamClaimRows> {
+    let gu = &claim.gu;
+    let reader = &identity.reader;
+    if gu.index != reader.shape {
+        return Err(Error::StatementMismatch);
+    }
+    let positions: Vec<u64> = message
+        .openings
+        .iter()
+        .map(|opening| opening.position)
+        .collect();
+    if positions.is_empty() {
+        return Err(Error::ShapeMismatch);
+    }
+    let column_map = table_column_map(reader, &positions, &message.openings)?;
+    let mut registry = GuRegistry::new();
+    registry.receive(
+        gu,
+        &GuNotice {
+            root: message.root,
+            oracle: gu.oracle,
+            tree_number: gu.tree.tree_number,
+            part: gu.part,
+        },
+    )?;
+    let eq_gamma = foldeq_weights(&[], reader.shape.v)?;
+    let name = reader.name();
+    let record_seeds =
+        record_seeds(&reader.shape, &name, reader.shape.answers as usize)?;
+    let mut record = Vec::with_capacity(reader.shape.answers as usize);
+    for answer in 0..reader.shape.answers {
+        record.push(record_row(
+            gu,
+            &registry,
+            &reader.record,
+            &name,
+            &record_seeds,
+            &eq_gamma,
+            answer,
+        )?);
+    }
+    let mut column = Vec::with_capacity(positions.len());
+    for position in &positions {
+        let values = column_for(&column_map, *position)?;
+        column.push(column_row(gu, &registry, *position, &values, &eq_gamma)?);
+    }
+    Ok(NormParamClaimRows { record, column })
+}
+
 fn draw_rstd_seed(chain: &mut Chain) -> Result<u64> {
     let mut message = chain.message();
     message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
@@ -17076,8 +17138,8 @@ mod merged_tests {
                 tree: RuntimeTreePlan {
                     tree_number: 0x1234,
                     leaf_class: 1,
-                    log_n: shape.code.log_n,
-                    log_n_zk: shape.code.log_n,
+                    log_n: code().log_n,
+                    log_n_zk: code().log_n,
                     parts: vec![RuntimeTreePart {
                         main_symbols: main_rows * E_DEGREE as u64,
                         mask_symbols: 0,
@@ -17089,7 +17151,7 @@ mod merged_tests {
                 part: 0,
                 rows_high: true,
                 u: GuOracleShape {
-                    code: shape.code,
+                    code: code(),
                     main_rows,
                     main_deg: E_DEGREE as u32,
                     mask_rows: 0,
@@ -17223,6 +17285,58 @@ mod merged_tests {
             .reader
             .root = Digest([0x99; 32]);
         assert!(verify_hidden_lin_hidden(&wrong_plan, &table.reader(), &base).is_err());
+    }
+
+    #[test]
+    fn norm_parameter_claim_rows_are_shared_by_both_sides() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = norm_params_fixture(&activation);
+        let (messages, _) = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+            &mut params,
+        )
+        .unwrap();
+        let plan_params = plan.norm.as_ref().unwrap().params.as_ref().unwrap();
+        let message_params = messages.first.norm.as_ref().unwrap().params.as_ref().unwrap();
+        let rows = norm_param_claim_rows(
+            &plan_params.gain,
+            plan_params.gain_claim.as_ref().unwrap(),
+            &message_params.gain,
+        )
+        .unwrap();
+        assert_eq!(rows.record.len(), 1);
+        assert_eq!(rows.column.len(), message_params.gain.openings.len());
+        let again = norm_param_claim_rows(
+            &plan_params.gain,
+            plan_params.gain_claim.as_ref().unwrap(),
+            &message_params.gain,
+        )
+        .unwrap();
+        assert_eq!(rows.record, again.record);
+        assert_eq!(rows.column, again.column);
+
+        let mut swapped = message_params.gain.clone();
+        swapped.openings.swap(0, 1);
+        assert!(norm_param_claim_rows(
+            &plan_params.gain,
+            plan_params.gain_claim.as_ref().unwrap(),
+            &swapped,
+        )
+        .is_err());
+
+        let mut tampered = message_params.gain.clone();
+        tampered.openings[0].symbols[0] = tampered.openings[0].symbols[0] + fp_from_signed_word(1);
+        assert!(norm_param_claim_rows(
+            &plan_params.gain,
+            plan_params.gain_claim.as_ref().unwrap(),
+            &tampered,
+        )
+        .is_err());
     }
 
     fn rstd_bits_from_counts(

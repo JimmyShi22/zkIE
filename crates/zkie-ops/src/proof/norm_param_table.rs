@@ -384,14 +384,15 @@ mod tests {
         use zkie_engine::pcs::request::runtime_tree::{RuntimeTreePart, RuntimeTreePlan};
 
         let main_rows = 2u64;
+        let group_code = zkie_engine::pcs::request::code::build_code_plan(7, 32, 4).unwrap();
         GuShape {
             oracle: 0x8800,
             group: 0x42,
             tree: RuntimeTreePlan {
                 tree_number: 0x1234,
                 leaf_class: 1,
-                log_n: identity.reader.shape.code.log_n,
-                log_n_zk: identity.reader.shape.code.log_n,
+                log_n: group_code.log_n,
+                log_n_zk: group_code.log_n,
                 parts: vec![RuntimeTreePart {
                     main_symbols: main_rows * E_DEGREE as u64,
                     mask_symbols: 0,
@@ -403,7 +404,7 @@ mod tests {
             part: 0,
             rows_high: true,
             u: GuOracleShape {
-                code: identity.reader.shape.code,
+                code: group_code,
                 main_rows,
                 main_deg: E_DEGREE as u32,
                 mask_rows: 0,

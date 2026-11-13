@@ -4517,6 +4517,7 @@ mod tests {
         use zkie_engine::pcs::request::params::LEAF_SALT_MIN_BYTES;
 
         let main_rows = 2u64;
+        let group_code = zkie_engine::pcs::request::code::build_code_plan(7, 32, 4).unwrap();
         NormParamClaimPlan {
             kind,
             gu: zkie_engine::pcs::request::gu::GuShape {
@@ -4525,8 +4526,8 @@ mod tests {
                 tree: RuntimeTreePlan {
                     tree_number: 0x1234,
                     leaf_class: 1,
-                    log_n: shape.code.log_n,
-                    log_n_zk: shape.code.log_n,
+                    log_n: group_code.log_n,
+                    log_n_zk: group_code.log_n,
                     parts: vec![RuntimeTreePart {
                         main_symbols: main_rows * E_DEGREE as u64,
                         mask_symbols: 0,
@@ -4538,7 +4539,7 @@ mod tests {
                 part: 0,
                 rows_high: true,
                 u: GuOracleShape {
-                    code: shape.code,
+                    code: group_code,
                     main_rows,
                     main_deg: E_DEGREE as u32,
                     mask_rows: 0,
@@ -4618,7 +4619,7 @@ mod tests {
         let claim_message = || NormParamClaimMessage {
             root: Digest([0x77; 32]),
             seeds: vec![SampleSeed {
-                z: vec![Fp3::ZERO; 4],
+                z: vec![Fp3::ZERO; 6],
                 beta: Fp3::ONE,
             }],
             answers: vec![Fp3::ZERO],
