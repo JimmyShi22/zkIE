@@ -1,0 +1,502 @@
+commit 6a93660a5bedba62d862533b5143dd18b14493f2
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Sat Nov 14 06:13:03 2026 +0800
+
+    Attach the encoded projection table to the gpt2 model commitment
+    
+    The gpt2 plan now declares the trusted table list of the first migrated
+    weight and the model version is two. The commit builds the raw row commitment
+    and the encoded table over the same rows; the provider samples the private
+    salts and tails, publishes the table leaves in the commit artifact, and writes
+    the private randomness to the artifact with its digest. Prove reads the
+    private randomness back, decodes it against the trusted parameters, rebuilds
+    the same table commitment, and rejects a rebuilt table set that differs from
+    the published one. The asset link proof is built over the full anchor record
+    list, so a table leaf cannot break asset openings.
+    
+    The historical context fixture now asserts that the existing model-version
+    gate rejects the old-version artifact; the artifact stays on disk. The
+    verifier table wiring, the policy regeneration and the consumer relation are
+    the next step. No plaintext was removed and every existing asset check
+    remains.
+
+diff --git a/crates/zkie-ops/src/proof/asset_table.rs b/crates/zkie-ops/src/proof/asset_table.rs
+index fb944c29..26a527f3 100644
+--- a/crates/zkie-ops/src/proof/asset_table.rs
++++ b/crates/zkie-ops/src/proof/asset_table.rs
+@@ -63,6 +63,15 @@ pub struct AssetTableInput {
+     pub randomness: AssetTableRandomness,
+ }
+ 
++/// One table's private randomness, keyed by asset identity, for the private
++/// commit artifact. The key binds the randomness to the asset whose rows it
++/// salts.
++#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
++pub struct AssetTableRandomnessEntry {
++    pub asset_id: u64,
++    pub randomness: AssetTableRandomness,
++}
++
+ /// The committed table, public. The identity, shape, configuration and valid
+ /// range come from the trusted plan; the root and record are the committer's
+ /// data and are bound by the anchor.
+@@ -293,6 +302,38 @@ mod tests {
+         assert_eq!(randomness.tails.len(), params.shape.rows() as usize);
+         assert!(randomness.tails.iter().all(|tail| tail.len() == 2));
+     }
++
++    #[test]
++    fn randomness_set_round_trips_and_rejects_bad_sets() {
++        let mut second = params();
++        second.asset_id = 2;
++        second.path = "other.bin".into();
++        let trusted = vec![params(), second];
++        let tables = sample_asset_table_inputs(&trusted).unwrap();
++        let bytes = encode_asset_table_randomness_set(&tables).unwrap();
++        let decoded = decode_asset_table_randomness_set(&bytes, &trusted).unwrap();
++        assert_eq!(decoded.len(), 2);
++        assert_eq!(decoded[0].params.asset_id, trusted[0].asset_id);
++        assert_eq!(decoded[1].params.asset_id, trusted[1].asset_id);
++        let mut reversed = trusted.clone();
++        reversed.reverse();
++        let decoded = decode_asset_table_randomness_set(&bytes, &reversed).unwrap();
++        assert_eq!(decoded[0].params.asset_id, reversed[0].asset_id);
++        assert_eq!(decoded[1].params.asset_id, reversed[1].asset_id);
++
++        assert!(decode_asset_table_randomness_set(&bytes, &trusted[..1]).is_err());
++        assert!(decode_asset_table_randomness_set(&bytes, &[]).is_err());
++        let mut wrong_shape = trusted.clone();
++        wrong_shape[1].shape.code.r += 1;
++        assert!(decode_asset_table_randomness_set(&bytes, &wrong_shape).is_err());
++        let duplicate = vec![tables[0].clone(), tables[0].clone()];
++        let bytes = encode_asset_table_randomness_set(&duplicate).unwrap();
++        assert!(decode_asset_table_randomness_set(&bytes, &trusted).is_err());
++        let mut unknown = tables.clone();
++        unknown[1].params.asset_id = 3;
++        let bytes = encode_asset_table_randomness_set(&unknown).unwrap();
++        assert!(decode_asset_table_randomness_set(&bytes, &trusted).is_err());
++    }
+ }
+ 
+ 
+@@ -311,6 +352,14 @@ pub fn decode_asset_table_randomness(
+ ) -> Result<AssetTableRandomness> {
+     let randomness: AssetTableRandomness =
+         bincode::deserialize(bytes).map_err(|_| ZkieError::InvalidEncoding)?;
++    check_asset_table_randomness(&randomness, params)?;
++    Ok(randomness)
++}
++
++fn check_asset_table_randomness(
++    randomness: &AssetTableRandomness,
++    params: &AssetTableParams,
++) -> Result<()> {
+     let columns = usize::try_from(params.shape.code.n()).map_err(|_| ZkieError::ResourceLimit)?;
+     let rows = usize::try_from(params.shape.rows()).map_err(|_| ZkieError::ResourceLimit)?;
+     let tail_len = usize::try_from(params.shape.code.r).map_err(|_| ZkieError::ResourceLimit)?;
+@@ -324,7 +373,69 @@ pub fn decode_asset_table_randomness(
+     {
+         return Err(ZkieError::ShapeMismatch);
+     }
+-    Ok(randomness)
++    Ok(())
++}
++
++/// Samples the private randomness of every trusted table. The result is
++/// aligned with `params` and is the input of the table commit.
++pub fn sample_asset_table_inputs(params: &[AssetTableParams]) -> Result<Vec<AssetTableInput>> {
++    params
++        .iter()
++        .map(|params| {
++            let randomness = sample_asset_table_randomness(params)?;
++            Ok(AssetTableInput {
++                params: params.clone(),
++                randomness,
++            })
++        })
++        .collect()
++}
++
++/// Encodes the private randomness of the given tables for the private commit
++/// artifact. The bytes are never part of the public bundle.
++pub fn encode_asset_table_randomness_set(tables: &[AssetTableInput]) -> Result<Vec<u8>> {
++    let entries: Vec<AssetTableRandomnessEntry> = tables
++        .iter()
++        .map(|table| AssetTableRandomnessEntry {
++            asset_id: table.params.asset_id,
++            randomness: table.randomness.clone(),
++        })
++        .collect();
++    bincode::serialize(&entries).map_err(|_| ZkieError::InvalidEncoding)
++}
++
++/// Decodes the private randomness set against the trusted table list and
++/// returns one table input per parameter. The set must match the trusted
++/// assets one to one; an unknown, duplicate or missing asset and a
++/// shape-mismatched randomness are rejected.
++pub fn decode_asset_table_randomness_set(
++    bytes: &[u8],
++    params: &[AssetTableParams],
++) -> Result<Vec<AssetTableInput>> {
++    let entries: Vec<AssetTableRandomnessEntry> =
++        bincode::deserialize(bytes).map_err(|_| ZkieError::InvalidEncoding)?;
++    if entries.len() != params.len() {
++        return Err(ZkieError::ShapeMismatch);
++    }
++    let mut seen = std::collections::BTreeSet::new();
++    for entry in &entries {
++        if !seen.insert(entry.asset_id) {
++            return Err(ZkieError::StatementMismatch);
++        }
++    }
++    let mut tables = Vec::with_capacity(params.len());
++    for params in params {
++        let entry = entries
++            .iter()
++            .find(|entry| entry.asset_id == params.asset_id)
++            .ok_or(ZkieError::StatementMismatch)?;
++        check_asset_table_randomness(&entry.randomness, params)?;
++        tables.push(AssetTableInput {
++            params: params.clone(),
++            randomness: entry.randomness.clone(),
++        });
++    }
++    Ok(tables)
+ }
+ 
+ struct AssetRowSource<'a> {
+diff --git a/crates/zkie-ops/src/proof/model_commitment.rs b/crates/zkie-ops/src/proof/model_commitment.rs
+index 53cbc9d4..cd223d9f 100644
+--- a/crates/zkie-ops/src/proof/model_commitment.rs
++++ b/crates/zkie-ops/src/proof/model_commitment.rs
+@@ -447,6 +447,26 @@ pub fn open_asset_reader(
+     AssetReader::open(commitment, asset_id, &governor)
+ }
+ 
++/// The complete leaf record list of the anchor: every committed asset followed
++/// by every committed encoded table. A link proof must be built over this list
++/// because the anchor registry covers both.
++fn commitment_leaf_records(commitment: &ModelCommitment) -> Vec<LeafRecord> {
++    let mut records: Vec<LeafRecord> = commitment
++        .assets
++        .iter()
++        .map(|asset| asset.leaf_record.clone())
++        .collect();
++    for (index, meta) in commitment.tables.iter().enumerate() {
++        records.push(LeafRecord {
++            leaf_id: commitment.assets.len() as u64 + index as u64,
++            generation: 0,
++            table_identity: asset_table_statement_identity(meta.identity, meta.root, &meta.record),
++            leaf_root: meta.root,
++        });
++    }
++    records
++}
++
+ pub fn open_asset_from_reader(
+     commitment: &ModelCommitment,
+     reader: &AssetReader,
+@@ -462,13 +482,10 @@ pub fn open_asset_from_reader(
+     if row_start.checked_add(row_count).ok_or(Error::ResourceLimit)? > asset.rows || row_count == 0 {
+         return Err(Error::InvalidIndex);
+     }
++    let records = commitment_leaf_records(commitment);
+     let link = prove_link(
+         &commitment.anchor,
+-        &commitment
+-            .assets
+-            .iter()
+-            .map(|asset| asset.leaf_record.clone())
+-            .collect::<Vec<_>>(),
++        &records,
+         commitment
+             .assets
+             .iter()
+diff --git a/crates/zkie-ops/tests/asset_table.rs b/crates/zkie-ops/tests/asset_table.rs
+index 2481b413..01ccbbc1 100644
+--- a/crates/zkie-ops/tests/asset_table.rs
++++ b/crates/zkie-ops/tests/asset_table.rs
+@@ -12,8 +12,8 @@ use zkie_ops::proof::asset_table::{
+     AssetTableParams, AssetTableRandomness,
+ };
+ use zkie_ops::proof::model_commitment::{
+-    commit_assets_with_tables, verify_model_anchor, verify_model_anchor_with_tables, ModelAssetSpec,
+-    ModelCommitmentPublic,
++    commit_assets_with_tables, verify_asset_opening, verify_model_anchor,
++    verify_model_anchor_with_tables, AssetStore, ModelAssetSpec, ModelCommitmentPublic,
+ };
+ 
+ const MODEL: Digest = Digest([0x11; 32]);
+@@ -223,6 +223,20 @@ fn changed_committed_table_is_rejected() {
+     }
+ }
+ 
++#[test]
++fn asset_openings_prove_against_the_table_anchor() {
++    let root = temp_dir("opening");
++    write_asset(&root.join("asset.bin"), &values());
++    let commitment =
++        commit_assets_with_tables(&root, MODEL, PARAMS_DIGEST, &[spec()], &[input()]).unwrap();
++    let store = AssetStore::open(&commitment).unwrap();
++    let opening = store.open_asset(0).unwrap();
++    verify_asset_opening(&commitment, &opening).unwrap();
++    let mut changed = opening.clone();
++    changed.rows[0].values[0] ^= 1;
++    assert!(verify_asset_opening(&commitment, &changed).is_err());
++}
++
+ #[test]
+ fn out_of_range_rows_are_rejected_at_commit() {
+     let root = temp_dir("range");
+diff --git a/models/gpt2/src/executor.rs b/models/gpt2/src/executor.rs
+index 0bb754d2..6a7ddc61 100644
+--- a/models/gpt2/src/executor.rs
++++ b/models/gpt2/src/executor.rs
+@@ -15,9 +15,10 @@ use zkie_ops::index_gen::{EmbeddingIndexOp, TableIndexOp};
+ use zkie_ops::matmul::MatMulOp;
+ use zkie_ops::profile_norm::ProfileLayerNormOp;
+ use zkie_ops::projection::ProjectionOp;
++use zkie_ops::proof::asset_table::AssetTableInput;
+ use zkie_ops::proof::model_commitment::{
+-    commit_assets, AssetOpening, AssetStore, ModelAssetSpec, ModelCommitment, SharedTrace,
+-    SharedTraceStep,
++    commit_assets_with_tables, AssetOpening, AssetStore, ModelAssetSpec, ModelCommitment,
++    SharedTrace, SharedTraceStep,
+ };
+ use zkie_ops::proof::relations::{
+     proof_output_values, prove_op_relation_shared, RelationConfig, RelationReceiptMessage,
+@@ -491,7 +492,14 @@ pub fn execute_shared_with_progress(
+     })
+ }
+ 
+-pub fn build_commitment(asset_root: &Path, tokens: &[u32]) -> Result<ModelCommitment> {
++/// Commits the raw asset rows and the encoded tables of the trusted table
++/// list. The committer owns the private table randomness; the same inputs
++/// rebuild the same anchor.
++pub fn build_commitment(
++    asset_root: &Path,
++    tokens: &[u32],
++    tables: &[AssetTableInput],
++) -> Result<ModelCommitment> {
+     let parameters = zkie_engine::primitives::transcript::hash_labeled(
+         zkie_engine::primitives::transcript::tag_word(
+             zkie_engine::primitives::transcript::STATEMENT,
+@@ -510,5 +518,5 @@ pub fn build_commitment(asset_root: &Path, tokens: &[u32]) -> Result<ModelCommit
+         None,
+         &tokens.iter().flat_map(|token| token.to_le_bytes()).collect::<Vec<_>>(),
+     )?;
+-    commit_assets(asset_root, model, parameters, &asset_specs())
++    commit_assets_with_tables(asset_root, model, parameters, &asset_specs(), tables)
+ }
+diff --git a/models/gpt2/src/plan.rs b/models/gpt2/src/plan.rs
+index 4cc48185..98ede8ce 100644
+--- a/models/gpt2/src/plan.rs
++++ b/models/gpt2/src/plan.rs
+@@ -394,7 +394,7 @@ fn transcript_digest(tag: u64, data: &[u8]) -> Result<Digest> {
+     )
+ }
+ 
+-pub const MODEL_VERSION: u32 = 1;
++pub const MODEL_VERSION: u32 = 2;
+ 
+ pub fn valid_vocab() -> usize {
+     VALID_VOCAB
+@@ -453,6 +453,15 @@ pub fn projection_table_params(path: &str) -> Option<AssetTableParams> {
+     })
+ }
+ 
++/// The trusted encoded-table list of the model plan. The layer-0 key
++/// projection weight is the first migrated consumer; every other asset keeps
++/// the raw row commitment until its own consumer relation closes.
++pub fn asset_table_params() -> Result<Vec<AssetTableParams>> {
++    const FIRST_PROJECTION: &str = "gpt2/weights/L0_k_w_i32.bin";
++    let params = projection_table_params(FIRST_PROJECTION).ok_or(Error::InvalidConfig)?;
++    Ok(vec![params])
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -470,6 +479,18 @@ mod tests {
+         assert_eq!(params.element_count, 1024 * 1024);
+     }
+ 
++    #[test]
++    fn the_plan_declares_the_first_projection_table() {
++        let tables = asset_table_params().unwrap();
++        assert_eq!(tables.len(), 1);
++        assert_eq!(tables[0].path, "gpt2/weights/L0_k_w_i32.bin");
++        let spec = asset_specs()
++            .into_iter()
++            .find(|spec| spec.path == tables[0].path)
++            .expect("asset spec");
++        zkie_ops::proof::asset_table::validate_asset_table_params(&spec, &tables[0]).unwrap();
++    }
++
+     #[test]
+     fn plan_step_counts_match_executor() {
+         assert_eq!(trace_plan(16).unwrap().steps.len(), 4462);
+diff --git a/zkie/src/provider.rs b/zkie/src/provider.rs
+index a962ff0b..53a57443 100644
+--- a/zkie/src/provider.rs
++++ b/zkie/src/provider.rs
+@@ -29,7 +29,10 @@ use zkie_ops::proof::model_commitment::{
+     verify_model_anchor_with_tables, verify_shared_trace, verify_shared_trace_output,
+     ModelCommitmentPublic, SharedTrace,
+ };
+-use zkie_ops::proof::asset_table::AssetTableMeta;
++use zkie_ops::proof::asset_table::{
++    decode_asset_table_randomness_set, encode_asset_table_randomness_set,
++    sample_asset_table_inputs, AssetTableInput, AssetTableMeta, AssetTableParams,
++};
+ 
+ const PROTOCOL_ID: Digest = Digest([0xA1; 32]);
+ const PARAMETERS_DIGEST: Digest = Digest([0xA2; 32]);
+@@ -226,14 +229,36 @@ fn proof_manifest(model: Digest, files: Vec<ArtifactFile>) -> ArtifactManifest {
+     }
+ }
+ 
+-fn build_commitment(config: &ProviderConfig) -> Result<zkie_ops::proof::model_commitment::ModelCommitment> {
++fn commitment_table_params(config: &ProviderConfig) -> Result<Vec<AssetTableParams>> {
+     match config.model.as_str() {
+-        "gpt2" => gpt2::build_commitment(Path::new(&config.asset_root), &config.tokens),
+-        "gemma3" => gemma3::build_commitment(Path::new(&config.case_root), &config.tokens),
+-        "timesfm" => timesfm::build_commitment(
+-            Path::new(&config.case_root),
+-            &config.input.iter().map(|value| *value as i64).collect::<Vec<_>>(),
+-        ),
++        "gpt2" => zkie_models_gpt2::plan::asset_table_params(),
++        "gemma3" => Ok(Vec::new()),
++        "timesfm" => Ok(Vec::new()),
++        _ => Err(Error::UnsupportedPrimitive),
++    }
++}
++
++fn build_commitment(
++    config: &ProviderConfig,
++    tables: &[AssetTableInput],
++) -> Result<zkie_ops::proof::model_commitment::ModelCommitment> {
++    match config.model.as_str() {
++        "gpt2" => gpt2::build_commitment(Path::new(&config.asset_root), &config.tokens, tables),
++        "gemma3" => {
++            if !tables.is_empty() {
++                return Err(Error::InvalidConfig);
++            }
++            gemma3::build_commitment(Path::new(&config.case_root), &config.tokens)
++        }
++        "timesfm" => {
++            if !tables.is_empty() {
++                return Err(Error::InvalidConfig);
++            }
++            timesfm::build_commitment(
++                Path::new(&config.case_root),
++                &config.input.iter().map(|value| *value as i64).collect::<Vec<_>>(),
++            )
++        }
+         _ => Err(Error::UnsupportedPrimitive),
+     }
+ }
+@@ -272,7 +297,9 @@ impl PipelineProvider for ProductionProvider {
+         ctx: &mut PipelineContext<'_>,
+     ) -> Result<CommitReceipt> {
+         let config = parse_case(&request.case_config)?;
+-        let commitment = build_commitment(&config)?;
++        let table_params = commitment_table_params(&config)?;
++        let tables = sample_asset_table_inputs(&table_params)?;
++        let commitment = build_commitment(&config, &tables)?;
+         let asset_units = commitment.assets.len() as u64;
+         let mut progress_event =
+             ProgressEvent::new("commit", "commit", ProgressKind::WorkAdvanced);
+@@ -287,17 +314,20 @@ impl PipelineProvider for ProductionProvider {
+         let protocol_bytes = fs::read(&request.case_config).map_err(|_| Error::Io)?;
+         let parameters_bytes = fs::read(&request.parameters).map_err(|_| Error::Io)?;
+         let tables_bytes = bincode::serialize(&commitment.tables).map_err(|_| Error::InvalidEncoding)?;
++        let randomness_bytes = encode_asset_table_randomness_set(&tables)?;
+         let commitment_digest = digest_bytes(&commitment_bytes);
+         let config_digest = digest_bytes(&config_bytes);
+         let protocol_digest = digest_bytes(&protocol_bytes);
+         let parameters_digest = digest_bytes(&parameters_bytes);
+         let tables_digest = digest_bytes(&tables_bytes);
++        let randomness_digest = digest_bytes(&randomness_bytes);
+         let files: Vec<(&str, &[u8])> = vec![
+             ("public/model-commitment.bin", commitment_bytes.as_slice()),
+             ("public/provider-config.bin", config_bytes.as_slice()),
+             ("public/protocol.bin", protocol_bytes.as_slice()),
+             ("public/asset-tables.bin", tables_bytes.as_slice()),
+             ("private/parameters.bin", parameters_bytes.as_slice()),
++            ("private/asset-table-randomness.bin", randomness_bytes.as_slice()),
+         ];
+         let digests: Vec<(&str, Digest)> = vec![
+             ("public/model-commitment.bin", commitment_digest),
+@@ -305,6 +335,7 @@ impl PipelineProvider for ProductionProvider {
+             ("public/protocol.bin", protocol_digest),
+             ("public/asset-tables.bin", tables_digest),
+             ("private/parameters.bin", parameters_digest),
++            ("private/asset-table-randomness.bin", randomness_digest),
+         ];
+         let manifest = commit_manifest(
+             model,
+@@ -314,6 +345,7 @@ impl PipelineProvider for ProductionProvider {
+                 ArtifactFile::new("public/protocol.bin", protocol_bytes.len() as u64, protocol_digest),
+                 ArtifactFile::new("public/asset-tables.bin", tables_bytes.len() as u64, tables_digest),
+                 ArtifactFile::new("private/parameters.bin", parameters_bytes.len() as u64, parameters_digest),
++                ArtifactFile::new("private/asset-table-randomness.bin", randomness_bytes.len() as u64, randomness_digest),
+             ],
+         );
+         ArtifactPublisher::publish_with_digests(&request.output_dir, &manifest, &files, &digests)?;
+@@ -332,7 +364,20 @@ impl PipelineProvider for ProductionProvider {
+         let config_bytes = fs::read(request.commit_dir.join("public/provider-config.bin"))
+             .map_err(|_| Error::MissingCommitArtifact)?;
+         let config: ProviderConfig = bincode::deserialize(&config_bytes).map_err(|_| Error::InvalidEncoding)?;
+-        let commitment = build_commitment(&config)?;
++        let table_params = commitment_table_params(&config)?;
++        let randomness_bytes =
++            fs::read(request.commit_dir.join("private/asset-table-randomness.bin"))
++                .map_err(|_| Error::MissingCommitArtifact)?;
++        let tables = decode_asset_table_randomness_set(&randomness_bytes, &table_params)?;
++        let commitment = build_commitment(&config, &tables)?;
++        let published_tables: Vec<AssetTableMeta> =
++            match fs::read(request.commit_dir.join("public/asset-tables.bin")) {
++                Ok(bytes) => bincode::deserialize(&bytes).map_err(|_| Error::InvalidEncoding)?,
++                Err(_) => return Err(Error::MissingCommitArtifact),
++            };
++        if published_tables != commitment.tables {
++            return Err(Error::StatementMismatch);
++        }
+         let model = commitment.anchor.record.model_commitment;
+         if request.expected_model_id != model {
+             return Err(Error::StatementMismatch);
+diff --git a/zkie/tests/s7_context.rs b/zkie/tests/s7_context.rs
+index e0be6b04..db1d0d6c 100644
+--- a/zkie/tests/s7_context.rs
++++ b/zkie/tests/s7_context.rs
+@@ -63,6 +63,29 @@ fn the_real_context_is_loaded_with_the_lm_head_identity() {
+         return;
+     };
+     let statement_data = read_statement(&statement);
++    // The fixture artifact predates the current model version. The existing
++    // gate rejects a version mismatch; the historical artifact stays on disk.
++    let policy_document =
++        zkie::policy::parse(&fs::read(&policy).expect("policy bytes")).expect("policy");
++    let trusted = zkie::policy::select(
++        &policy_document,
++        &statement_data.case_id,
++        &statement_data.model,
++        statement_data.tokens.len(),
++    )
++    .expect("trusted policy");
++    if trusted.model_version != zkie_models_gpt2::plan::MODEL_VERSION {
++        let error = load_gpt2_lm_head_context(
++            &case,
++            &policy,
++            &public,
++            &statement,
++            statement_data.model_commitment,
++        )
++        .expect_err("an artifact of another model version must be rejected");
++        assert_eq!(error.code(), "invalid_config");
++        return;
++    }
+     let context = load_gpt2_lm_head_context(
+         &case,
+         &policy,
