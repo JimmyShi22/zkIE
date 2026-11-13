@@ -1,0 +1,3 @@
+0a09f845 Add the exact output tail witness for the norm
+ crates/zkie-ops/src/proof/hidden_norm.rs | 308 ++++++++++++++++++++++++++++++-
+ 1 file changed, 305 insertions(+), 3 deletions(-)
