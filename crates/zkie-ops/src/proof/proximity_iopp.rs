@@ -145,8 +145,9 @@ pub fn proximity_bound_ids(
             .ok_or(Error::ResourceLimit)?;
     }
     if let Some(norm) = norm {
+        let norm_groups = if norm.round.is_some() { 6 } else { 5 };
         let norm_members = positions
-            .checked_mul(5)
+            .checked_mul(norm_groups)
             .and_then(|value| {
                 value.checked_add(if norm.mask.is_some() { 1 } else { 0 })
             })
@@ -183,6 +184,9 @@ pub fn proximity_bound_ids(
         ] {
             push_range(&mut oracles, group.oracle_base, positions)?;
         }
+        if let Some(round) = &norm.round {
+            push_range(&mut oracles, round.group.oracle_base, positions)?;
+        }
         if let Some(mask) = &norm.mask {
             oracles.push(mask.oracle);
         }
@@ -216,6 +220,9 @@ pub fn proximity_bound_ids(
             &norm.variance,
         ] {
             push_range(&mut trees, group.shape.tree_number, positions)?;
+        }
+        if let Some(round) = &norm.round {
+            push_range(&mut trees, round.group.shape.tree_number, positions)?;
         }
         if let Some(mask) = &norm.mask {
             trees.push(mask.tree.tree_number);

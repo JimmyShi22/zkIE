@@ -8920,13 +8920,16 @@ fn own_sample_rows(
         if let Some(norm_plan) = &plan.norm {
             let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
             let groups = norm_group_plans(norm_plan);
-            let messages = [
+            let mut messages = vec![
                 &norm_first.x,
                 &norm_first.sum,
                 &norm_first.squares,
                 &norm_first.mean,
                 &norm_first.variance,
             ];
+            if let Some(round) = &norm_first.round {
+                messages.push(round);
+            }
             let positions = plan.send.positions() as u64;
             for (group_plan, message) in groups.iter().zip(messages.iter()) {
                 let base = group_plan.oracle_base;
@@ -9124,18 +9127,32 @@ const NORM_ROUND_SEED_TAG: u64 = 85;
 const NORM_ROUND_ANSWER_TAG: u64 = 86;
 const NORM_ROUND_POSITION_TAG: u64 = 87;
 
-fn norm_group_plans(plan: &NormPlan) -> [&NormGroupPlan; 5] {
-    [&plan.x, &plan.sum, &plan.squares, &plan.mean, &plan.variance]
+fn norm_group_plans(plan: &NormPlan) -> Vec<&NormGroupPlan> {
+    let mut groups = vec![
+        &plan.x,
+        &plan.sum,
+        &plan.squares,
+        &plan.mean,
+        &plan.variance,
+    ];
+    if let Some(round) = &plan.round {
+        groups.push(&round.group);
+    }
+    groups
 }
 
-fn norm_group_witnesses(witness: &NormWitness) -> [&NormGroupWitness; 5] {
-    [
+fn norm_group_witnesses(witness: &NormWitness) -> Vec<&NormGroupWitness> {
+    let mut groups = vec![
         &witness.x,
         &witness.sum,
         &witness.squares,
         &witness.mean,
         &witness.variance,
-    ]
+    ];
+    if let Some(round) = &witness.round {
+        groups.push(round);
+    }
+    groups
 }
 
 fn absorb_norm_mask_root(
@@ -14271,6 +14288,32 @@ mod merged_tests {
         assert!(with_mask.trees.contains(&60500));
         assert!(!with.oracles.contains(&9500));
         assert!(!with.trees.contains(&60500));
+
+        let mut round_planned = norm.clone();
+        let widths = crate::proof::hidden_norm_psc::NormRoundWidths {
+            sum: 1,
+            squares: 1,
+            variance: 1,
+            mean: 1,
+            offset: 1,
+        };
+        let layout =
+            crate::proof::hidden_norm_psc::NormRoundLayout::new(widths, HIDDEN, 8, 4)
+                .unwrap();
+        let columns = widths.columns().unwrap();
+        round_planned.round = Some(crate::proof::hidden_norm_psc::NormRoundPlan {
+            group: norm_group(columns, GROUP, 9600, 60600),
+            layout,
+            input_bound: 2,
+        });
+        round_planned.validate().unwrap();
+        let with_round =
+            proximity_bound_ids(&plan.proximity, &plan.send, None, Some(&round_planned))
+                .unwrap();
+        assert!(with_round.oracles.contains(&9600));
+        assert!(with_round.trees.contains(&60600));
+        assert!(!with.oracles.contains(&9600));
+        assert!(!with.trees.contains(&60600));
     }
 
     fn norm_values(row: &[i64], columns: u64) -> Vec<Fp3> {
