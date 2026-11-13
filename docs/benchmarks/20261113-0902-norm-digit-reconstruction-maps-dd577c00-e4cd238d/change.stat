@@ -1,0 +1,4 @@
+dd577c00 Add the norm digit reconstruction maps (partial progress)
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     | 115 ++++++++++++++++++++++-
+ crates/zkie-ops/src/proof/hidden_send_session.rs |   1 +
+ 2 files changed, 115 insertions(+), 1 deletion(-)
