@@ -1,0 +1,4 @@
+5721699c Carry the halfway selector slack slots in the tail layout
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     | 50 ++++++++++++++++++++++--
+ crates/zkie-ops/src/proof/hidden_send_session.rs |  2 +
+ 2 files changed, 48 insertions(+), 4 deletions(-)
