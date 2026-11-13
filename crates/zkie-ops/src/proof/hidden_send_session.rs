@@ -14503,6 +14503,7 @@ mod merged_tests {
             mean: norm_group(1, 83, 9300, 60300),
             variance: norm_group(1, 84, 9400, 60400),
             round: None,
+            lookup: None,
             mask: None,
         }
     }
@@ -14777,6 +14778,7 @@ mod merged_tests {
             mean: group(1, GROUP, 9300, 60300),
             variance: group(1, GROUP, 9400, 60400),
             round: None,
+            lookup: None,
             mask: Some(mask_plan.clone()),
         };
         let round_widths = NormRoundWidths {

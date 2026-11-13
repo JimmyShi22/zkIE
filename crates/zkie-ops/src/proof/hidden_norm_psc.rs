@@ -680,7 +680,7 @@ fn fp3_signed(value: i128) -> Result<Fp3> {
 // sumcheck and the row binding.
 
 /// Version of the integrated norm plan and first message.
-pub const NORM_BIND_VERSION: u64 = 4;
+pub const NORM_BIND_VERSION: u64 = 5;
 
 /// The relation indices the bound core supports. The map construction of
 /// every relation is fixed by the relation index; the plan may list only
@@ -723,6 +723,57 @@ pub struct NormRoundPlan {
     pub input_bound: u64,
 }
 
+/// The lookup plan carried by the norm relation. The key vector is read from
+/// the committed rounding rows according to `key`; only the multiplicity-bit
+/// and mask messages are committed for the lookup itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormLookupPlan {
+    pub lookup: crate::proof::lookup::LookupPlan,
+    pub commit: crate::proof::lookup_messages::LookupCommitPlan,
+    pub key: crate::proof::lookup::LookupKeyPlan,
+}
+
+impl NormLookupPlan {
+    pub fn validate(&self) -> Result<()> {
+        self.lookup.validate()?;
+        self.key.validate(&self.lookup)?;
+        let planes = self.lookup.planes()?;
+        let rows = self.lookup.table_rows()?;
+        self.commit.validate(
+            planes.checked_mul(rows).ok_or(Error::ResourceLimit)?,
+            crate::proof::lookup::mask_count(&self.lookup)?,
+        )?;
+        Ok(())
+    }
+
+    /// Binds the lookup plan, the key map and the committed message plans.
+    pub fn digest(&self) -> Digest {
+        let mut writer = CanonicalWriter::new();
+        writer.put_bytes(&self.lookup.digest());
+        writer.put_u64(self.key.sources.len() as u64);
+        for source in &self.key.sources {
+            writer.put_u64(source.oracle);
+            writer.put_u64(source.position as u64);
+            writer.put_u64(source.row as u64);
+            writer.put_u64(source.place as u64);
+            writer.put_fp3(&source.coefficient);
+            writer.put_fp3(&source.offset);
+        }
+        writer.put_fp3(&self.key.padding_value);
+        writer.put_digest(&self.key.table_identity);
+        writer.put_u64(self.commit.bits_oracle);
+        writer.put_u64(self.commit.group);
+        writer.put_u64(self.commit.mask_oracle);
+        put_wshape(&mut writer, &self.commit.bits_shape);
+        writer.put_u64(self.commit.mask_code.log_n as u64);
+        writer.put_u64(self.commit.mask_code.ell);
+        writer.put_u64(self.commit.mask_code.r);
+        writer.put_u64(self.commit.mask_rows);
+        put_tree_plan(&mut writer, &self.commit.mask_tree);
+        digest_bytes(&writer.into_bytes())
+    }
+}
+
 /// The trusted plan of the integrated norm relation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormPlan {
@@ -743,6 +794,8 @@ pub struct NormPlan {
     pub variance: NormGroupPlan,
     /// The committed rounding witness group; optional in this stage.
     pub round: Option<NormRoundPlan>,
+    /// The lookup plan over the committed digit rows; optional in this stage.
+    pub lookup: Option<NormLookupPlan>,
     /// The committed mask group; optional in this stage.
     pub mask: Option<NormMaskPlan>,
 }
@@ -834,6 +887,9 @@ impl NormPlan {
                 }
             }
         }
+        if let Some(lookup) = &self.lookup {
+            lookup.validate()?;
+        }
         if let Some(mask) = &self.mask {
             mask.validate(
                 self.shape.positions,
@@ -876,6 +932,13 @@ impl NormPlan {
                 writer.put_u64(round.layout.sum_offset);
                 writer.put_u64(round.layout.mean_offset);
                 put_norm_group(writer, &round.group);
+            }
+            None => writer.put_u64(0),
+        }
+        match &self.lookup {
+            Some(lookup) => {
+                writer.put_u64(1);
+                writer.put_digest(&lookup.digest());
             }
             None => writer.put_u64(0),
         }
@@ -1938,7 +2001,7 @@ mod tests {
                     main_symbols: 0,
                     mask_symbols: 3,
                 }],
-                salt_bytes: 8,
+                salt_bytes: 40,
                 run: Digest([0x61; 32]),
                 configuration: Digest([0x62; 32]),
             },
@@ -1993,6 +2056,63 @@ mod tests {
                 assert_eq!(dot, Fp3::ZERO, "relation {relation} row {row:?}");
             }
         }
+    }
+
+    #[test]
+    fn norm_plan_accepts_and_binds_a_lookup_carrier() {
+        use crate::proof::lookup::{LookupKeyPlan, LookupPlan};
+        use crate::proof::lookup_messages::LookupCommitPlan;
+        use zkie_engine::pcs::request::code::build_code_plan;
+        use zkie_engine::pcs::request::runtime_tree::{RuntimeTreePlan, RuntimeTreePart};
+
+        let (mut plan, _, _) = integrated_fixture();
+        let lookup = LookupPlan {
+            key_bits: 2,
+            mu: 2,
+            table_log: 8,
+        };
+        let commit = LookupCommitPlan {
+            bits_shape: WShape::new(
+                1024,
+                build_code_plan(12, 2048, 1).unwrap(),
+                1,
+                1,
+                40,
+                60701,
+                1,
+                Digest([0x64; 32]),
+                Digest([0x62; 32]),
+            )
+            .unwrap(),
+            bits_oracle: 9700,
+            group: 1,
+            mask_oracle: 9701,
+            mask_code: build_code_plan(6, 32, 1).unwrap(),
+            mask_rows: 8,
+            mask_tree: RuntimeTreePlan {
+                tree_number: 60700,
+                leaf_class: 1,
+                log_n: 6,
+                log_n_zk: 6,
+                parts: vec![RuntimeTreePart {
+                    main_symbols: 0,
+                    mask_symbols: 24,
+                }],
+                salt_bytes: 40,
+                run: Digest([0x61; 32]),
+                configuration: Digest([0x62; 32]),
+            },
+        };
+        let key = LookupKeyPlan {
+            sources: Vec::new(),
+            padding_value: Fp3::ZERO,
+            table_identity: Digest([0x63; 32]),
+        };
+        plan.lookup = Some(NormLookupPlan { lookup, commit, key });
+        plan.validate().unwrap();
+        let with = plan.digest();
+        plan.lookup = None;
+        assert_ne!(with, plan.digest());
     }
 
     #[test]
@@ -2411,6 +2531,7 @@ mod tests {
             mean: integrated_group(&psc.groups.mean),
             variance: integrated_group(&psc.groups.variance),
             round: None,
+            lookup: None,
             mask: None,
         };
         let message = NormFirstMessages {
