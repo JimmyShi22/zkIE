@@ -1,0 +1,250 @@
+commit 2959e7f2a8b0e5460644dd10a30296009c58ebcb
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Sat Nov 14 05:15:37 2026 +0800
+
+    Add the projection reduction claim core
+    
+    Add the trusted projection geometry, the row-weight and output claim construction from verified activation and output rows, and the verifier-side reduction check against the encoded table layout. The real-size test covers a 1024 by 1024 matrix; the hidden LIN session closure and the production consumer are separate steps.
+
+diff --git a/crates/zkie-ops/src/proof/mod.rs b/crates/zkie-ops/src/proof/mod.rs
+index 78ec4afd..0f7d2ff9 100644
+--- a/crates/zkie-ops/src/proof/mod.rs
++++ b/crates/zkie-ops/src/proof/mod.rs
+@@ -34,6 +34,7 @@ pub mod interval;
+ pub mod proximity_planner;
+ pub mod asset_table;
+ pub mod model_commitment;
++pub mod projection_claim;
+ pub mod norm_param_table;
+ 
+ #[cfg(test)]
+diff --git a/crates/zkie-ops/src/proof/projection_claim.rs b/crates/zkie-ops/src/proof/projection_claim.rs
+new file mode 100644
+index 00000000..2f024a05
+--- /dev/null
++++ b/crates/zkie-ops/src/proof/projection_claim.rs
+@@ -0,0 +1,224 @@
++//! Projection consumer claims.
++//!
++//! A projection consumer reduces its activation rows against one weight
++//! matrix in the encoded table layout. This module keeps the two directions of
++//! that reduction in one place: the prover side turns the verified activation
++//! rows and the operator's actual output rows into the row-weight and output
++//! claims, and the verifier side recomputes the same reduction from those
++//! claims and the trusted table rows. No prover-supplied equation is trusted:
++//! both sides derive the row weights from the activation values.
++
++use zkie_core::error::{Error, Result};
++use zkie_engine::pcs::request::field::Fp3;
++
++/// The trusted geometry of one projection consumer.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct ProjectionShape {
++    /// Rows of the weight matrix, which are also the table's row count.
++    pub matrix_rows: u64,
++    /// The low column bits that select a table row; `columns = matrix_rows << k_lo`.
++    pub k_lo: u32,
++    /// Output columns per position.
++    pub columns: u64,
++    /// Activation/output positions.
++    pub positions: u32,
++}
++
++impl ProjectionShape {
++    pub fn check(&self) -> Result<()> {
++        if self.matrix_rows == 0 || self.columns == 0 || self.positions == 0 || self.k_lo >= 32 {
++            return Err(Error::InvalidConfig);
++        }
++        let expected = self
++            .matrix_rows
++            .checked_shl(self.k_lo)
++            .ok_or(Error::ResourceLimit)?;
++        if expected != self.columns {
++            return Err(Error::InvalidConfig);
++        }
++        Ok(())
++    }
++
++    /// The number of entries of each table row message used by the reduction.
++    pub fn entries(&self) -> u64 {
++        self.columns
++    }
++
++    /// The number of table rows.
++    pub fn table_rows(&self) -> u64 {
++        self.columns >> self.k_lo
++    }
++}
++
++/// The claims of one projection consumer: one row-weight vector per position
++/// and one output row per position.
++#[derive(Clone, Debug)]
++pub struct ProjectionClaims {
++    pub weights: Vec<Vec<Fp3>>,
++    pub output: Vec<Vec<Fp3>>,
++}
++
++fn rows<T: Clone>(values: &[T], width: usize, count: usize) -> Result<Vec<Vec<T>>> {
++    if width == 0 || values.len() != width.checked_mul(count).ok_or(Error::ResourceLimit)? {
++        return Err(Error::ShapeMismatch);
++    }
++    Ok(values.chunks_exact(width).map(|row| row.to_vec()).collect())
++}
++
++/// Builds the claims from the verified activation rows and the operator's
++/// actual output rows. The caller passes values that were verified elsewhere;
++/// this function never accepts a prover-chosen equation.
++pub fn projection_claims(
++    shape: ProjectionShape,
++    activation: &[Fp3],
++    output: &[Fp3],
++) -> Result<ProjectionClaims> {
++    shape.check()?;
++    let matrix_rows = usize::try_from(shape.matrix_rows).map_err(|_| Error::ResourceLimit)?;
++    let columns = usize::try_from(shape.columns).map_err(|_| Error::ResourceLimit)?;
++    let weights = rows(activation, matrix_rows, shape.positions as usize)?;
++    let output = rows(output, columns, shape.positions as usize)?;
++    Ok(ProjectionClaims { weights, output })
++}
++
++fn entry(shape: &ProjectionShape, column: u64, row: u64) -> Result<u64> {
++    let low_mask = (1u64 << shape.k_lo) - 1;
++    let low = column & low_mask;
++    let shifted = row.checked_shl(shape.k_lo).ok_or(Error::ResourceLimit)?;
++    low.checked_add(shifted).ok_or(Error::ResourceLimit)
++}
++
++/// Recomputes every output entry from the row weights and the trusted table
++/// rows in the encoded layout, and compares it with the claimed output.
++pub fn check_projection_reduction(
++    shape: ProjectionShape,
++    weights: &[Vec<Fp3>],
++    table: &[Vec<Fp3>],
++    output: &[Vec<Fp3>],
++) -> Result<()> {
++    shape.check()?;
++    let matrix_rows = usize::try_from(shape.matrix_rows).map_err(|_| Error::ResourceLimit)?;
++    let columns = usize::try_from(shape.columns).map_err(|_| Error::ResourceLimit)?;
++    let table_rows = usize::try_from(shape.table_rows()).map_err(|_| Error::ResourceLimit)?;
++    if weights.len() != shape.positions as usize
++        || output.len() != shape.positions as usize
++        || table.len() != table_rows
++    {
++        return Err(Error::ShapeMismatch);
++    }
++    if weights.iter().any(|row| row.len() != matrix_rows)
++        || output.iter().any(|row| row.len() != columns)
++        || table.iter().any(|row| row.len() < columns)
++    {
++        return Err(Error::ShapeMismatch);
++    }
++    for position in 0..shape.positions as usize {
++        for column in 0..columns {
++            let table_row = column >> shape.k_lo as usize;
++            let mut sum = Fp3::ZERO;
++            for row in 0..matrix_rows {
++                let index = entry(&shape, column as u64, row as u64)?;
++                let index = usize::try_from(index).map_err(|_| Error::ResourceLimit)?;
++                let value = table[table_row]
++                    .get(index)
++                    .copied()
++                    .ok_or(Error::ShapeMismatch)?;
++                sum = sum.add(&weights[position][row].mul(&value));
++            }
++            if sum != output[position][column] {
++                return Err(Error::InvalidProof);
++            }
++            let _ = table_rows;
++        }
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use zkie_engine::pcs::request::field::fp_from_u64;
++
++    fn value(word: u64) -> Fp3 {
++        Fp3::from_base(fp_from_u64(word))
++    }
++
++    fn real_size_shape() -> ProjectionShape {
++        ProjectionShape {
++            matrix_rows: 1024,
++            k_lo: 0,
++            columns: 1024,
++            positions: 2,
++        }
++    }
++
++    fn activation(shape: &ProjectionShape) -> Vec<Fp3> {
++        let count = shape.positions as usize * shape.matrix_rows as usize;
++        (0..count).map(|index| value((index as u64) % 17)).collect()
++    }
++
++    fn table(shape: &ProjectionShape) -> Vec<Vec<Fp3>> {
++        let rows = shape.table_rows() as usize;
++        let entries = shape.entries() as usize;
++        (0..rows)
++            .map(|row| {
++                (0..entries)
++                    .map(|column| value(((row * 7 + column * 3) % 19) as u64))
++                    .collect()
++            })
++            .collect()
++    }
++
++    fn reduce(shape: &ProjectionShape, activation: &[Fp3], table: &[Vec<Fp3>]) -> Vec<Fp3> {
++        let matrix_rows = shape.matrix_rows as usize;
++        let columns = shape.columns as usize;
++        let mut output = vec![Fp3::ZERO; shape.positions as usize * columns];
++        for position in 0..shape.positions as usize {
++            for column in 0..columns {
++                let table_row = column >> shape.k_lo as usize;
++                let mut sum = Fp3::ZERO;
++                for row in 0..matrix_rows {
++                    let index = entry(shape, column as u64, row as u64).unwrap() as usize;
++                    sum = sum.add(
++                        &activation[position * matrix_rows + row]
++                            .mul(&table[table_row][index]),
++                    );
++                }
++                output[position * columns + column] = sum;
++            }
++        }
++        output
++    }
++
++    #[test]
++    fn real_size_projection_reduction_round_trips() {
++        let shape = real_size_shape();
++        let activation = activation(&shape);
++        let table = table(&shape);
++        let output = reduce(&shape, &activation, &table);
++        let claims = projection_claims(shape, &activation, &output).unwrap();
++        check_projection_reduction(shape, &claims.weights, &table, &claims.output).unwrap();
++    }
++
++    #[test]
++    fn changed_output_or_shape_is_rejected() {
++        let shape = real_size_shape();
++        let activation = activation(&shape);
++        let table = table(&shape);
++        let output = reduce(&shape, &activation, &table);
++        let mut claims = projection_claims(shape, &activation, &output).unwrap();
++        claims.output[0][0] = claims.output[0][0].add(&value(1));
++        assert!(check_projection_reduction(shape, &claims.weights, &table, &claims.output).is_err());
++
++        let mut bad_shape = shape;
++        bad_shape.columns += 1;
++        assert!(bad_shape.check().is_err());
++
++        let mut short_activation = activation.clone();
++        short_activation.pop();
++        assert!(projection_claims(shape, &short_activation, &output).is_err());
++        let mut short_output = output.clone();
++        short_output.pop();
++        assert!(projection_claims(shape, &activation, &short_output).is_err());
++    }
++}
