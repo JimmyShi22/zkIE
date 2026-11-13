@@ -17894,6 +17894,13 @@ mod merged_tests {
             pointwise_shown: crate::proof::hidden_norm_psc::norm_pointwise_masks(3)
                 .unwrap()
                 .1,
+            tail: 0,
+            tail_hiding: crate::proof::hidden_norm_psc::norm_tail_mask_masks(4)
+                .unwrap()
+                .0,
+            tail_shown: crate::proof::hidden_norm_psc::norm_tail_mask_masks(4)
+                .unwrap()
+                .1,
         }
     }
 
@@ -18131,6 +18138,13 @@ mod merged_tests {
                 .unwrap()
                 .0,
             pointwise_shown: crate::proof::hidden_norm_psc::norm_pointwise_masks(3)
+                .unwrap()
+                .1,
+            tail: 0,
+            tail_hiding: crate::proof::hidden_norm_psc::norm_tail_mask_masks(4)
+                .unwrap()
+                .0,
+            tail_shown: crate::proof::hidden_norm_psc::norm_tail_mask_masks(4)
                 .unwrap()
                 .1,
         };
@@ -21606,6 +21620,7 @@ mod merged_tests {
             let norm = plan.norm.as_mut().unwrap();
             norm.output = Some(output_plan.clone());
             norm.mask.as_mut().unwrap().pointwise = 2;
+            norm.mask.as_mut().unwrap().tail = 5;
         }
         let gain = vec![2i64, -1, 3, 1];
         let bias = vec![1i64, 2, -1, 2];

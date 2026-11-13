@@ -1791,6 +1791,19 @@ impl NormPlan {
             if mask.pointwise != expected {
                 return Err(Error::InvalidConfig);
             }
+            let tail_expected = if self
+                .output
+                .as_ref()
+                .and_then(|output| output.tail.as_ref())
+                .is_some()
+            {
+                5
+            } else {
+                0
+            };
+            if mask.tail != tail_expected {
+                return Err(Error::InvalidConfig);
+            }
         }
         Ok(())
     }
@@ -1904,6 +1917,13 @@ pub struct NormMaskPlan {
     pub pointwise_hiding: usize,
     /// The shown-map masks of one pointwise instance.
     pub pointwise_shown: usize,
+    /// The number of tail relation instances per position; zero when the
+    /// plan carries no tail section.
+    pub tail: usize,
+    /// The hiding entries of one tail relation instance.
+    pub tail_hiding: usize,
+    /// The shown-map masks of one tail relation instance.
+    pub tail_shown: usize,
 }
 
 /// The hiding and shown mask counts of one equality-weighted pointwise
@@ -1919,6 +1939,14 @@ pub fn norm_pointwise_masks(variables: usize) -> Result<(usize, usize)> {
     let summand = crate::proof::psc_general::Summand::Product;
     let all = crate::proof::psc_general::general_variables(&weights, &summand)?;
     Ok((hp_entries(&all)?, summand.shown()))
+}
+
+/// The hiding and shown mask counts of one tail relation instance over the
+/// column domain.
+pub fn norm_tail_mask_masks(columns: u64) -> Result<(usize, usize)> {
+    let variables = output_tail_variables(columns)?;
+    let weights = psc_variables(variables).map_err(|_| Error::InvalidConfig)?;
+    Ok((hp_entries(&weights)?, SHOWN_MAPS))
 }
 
 /// The power-of-two own-mask row count from the index-mask rows and the
@@ -1966,6 +1994,73 @@ impl NormMaskPlan {
     fn pointwise_entries(&self) -> Result<usize> {
         self.pointwise_instances()?
             .checked_mul(self.pointwise_per_instance()?)
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// The number of tail relation instances of the plan.
+    pub fn tail_instances(&self) -> Result<usize> {
+        (self.positions as usize)
+            .checked_mul(self.tail)
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// The allocated entries of one tail instance.
+    pub fn tail_per_instance(&self) -> Result<usize> {
+        self.tail_hiding
+            .checked_add(self.tail_shown)
+            .ok_or(Error::ResourceLimit)
+    }
+
+    fn tail_entries(&self) -> Result<usize> {
+        self.tail_instances()?
+            .checked_mul(self.tail_per_instance()?)
+            .ok_or(Error::ResourceLimit)
+    }
+
+    fn tail_base(&self, instances: usize) -> Result<usize> {
+        self.pointwise_base(instances)?
+            .checked_add(self.pointwise_entries()?)
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// The compact slot of one hiding entry of one tail instance.
+    pub fn tail_hiding_slot(
+        &self,
+        instances: usize,
+        instance: usize,
+        index: usize,
+    ) -> Result<usize> {
+        if self.tail == 0 || instance >= self.tail_instances()? || index >= self.tail_hiding {
+            return Err(Error::InvalidIndex);
+        }
+        self.tail_base(instances)?
+            .checked_add(
+                instance
+                    .checked_mul(self.tail_per_instance()?)
+                    .ok_or(Error::ResourceLimit)?,
+            )
+            .and_then(|base| base.checked_add(index))
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// The compact slot of one shown-value mask of one tail instance.
+    pub fn tail_shown_slot(
+        &self,
+        instances: usize,
+        instance: usize,
+        index: usize,
+    ) -> Result<usize> {
+        if self.tail == 0 || instance >= self.tail_instances()? || index >= self.tail_shown {
+            return Err(Error::InvalidIndex);
+        }
+        self.tail_base(instances)?
+            .checked_add(
+                instance
+                    .checked_mul(self.tail_per_instance()?)
+                    .ok_or(Error::ResourceLimit)?,
+            )
+            .and_then(|base| base.checked_add(self.tail_hiding))
+            .and_then(|base| base.checked_add(index))
             .ok_or(Error::ResourceLimit)
     }
 
@@ -2027,8 +2122,8 @@ impl NormMaskPlan {
     /// entries.
     pub fn total_entries(&self, relations: usize) -> Result<usize> {
         let instances = self.instances(relations)?;
-        self.pointwise_base(instances)?
-            .checked_add(self.pointwise_entries()?)
+        self.tail_base(instances)?
+            .checked_add(self.tail_entries()?)
             .and_then(|value| value.checked_add(self.claims))
             .ok_or(Error::ResourceLimit)
     }
@@ -2061,8 +2156,8 @@ impl NormMaskPlan {
         if index >= self.claims {
             return Err(Error::InvalidIndex);
         }
-        self.pointwise_base(instance_count)?
-            .checked_add(self.pointwise_entries()?)
+        self.tail_base(instance_count)?
+            .checked_add(self.tail_entries()?)
             .and_then(|base| base.checked_add(index))
             .ok_or(Error::ResourceLimit)
     }
@@ -2162,6 +2257,15 @@ impl NormMaskPlan {
         if self.positions != positions || self.shown != SHOWN_MAPS || self.claims == 0 {
             return Err(Error::InvalidConfig);
         }
+        if variables < 2 {
+            return Err(Error::InvalidConfig);
+        }
+        let columns = 1u64 << (variables as u32 - 1);
+        let (tail_hiding, tail_shown) = norm_tail_mask_masks(columns)
+            .map_err(|_| Error::InvalidConfig)?;
+        if self.tail_hiding != tail_hiding || self.tail_shown != tail_shown || self.tail > 5 {
+            return Err(Error::InvalidConfig);
+        }
         let (pointwise_hiding, pointwise_shown) =
             norm_pointwise_masks(variables).map_err(|_| Error::InvalidConfig)?;
         let variables = psc_variables(variables).map_err(|_| Error::InvalidConfig)?;
@@ -2226,6 +2330,9 @@ impl NormMaskPlan {
         writer.put_u64(self.pointwise as u64);
         writer.put_u64(self.pointwise_hiding as u64);
         writer.put_u64(self.pointwise_shown as u64);
+        writer.put_u64(self.tail as u64);
+        writer.put_u64(self.tail_hiding as u64);
+        writer.put_u64(self.tail_shown as u64);
     }
 }
 
@@ -4454,6 +4561,9 @@ mod tests {
             pointwise: 0,
             pointwise_hiding: norm_pointwise_masks(3).unwrap().0,
             pointwise_shown: norm_pointwise_masks(3).unwrap().1,
+            tail: 0,
+            tail_hiding: norm_tail_mask_masks(4).unwrap().0,
+            tail_shown: norm_tail_mask_masks(4).unwrap().1,
         };
         assert_eq!(plan.required_rows(4).unwrap(), 4);
         assert_eq!(plan.required_rows(8).unwrap(), 8);
@@ -6055,6 +6165,9 @@ mod tests {
             pointwise: 0,
             pointwise_hiding: norm_pointwise_masks(3).unwrap().0,
             pointwise_shown: norm_pointwise_masks(3).unwrap().1,
+            tail: 0,
+            tail_hiding: norm_tail_mask_masks(4).unwrap().0,
+            tail_shown: norm_tail_mask_masks(4).unwrap().1,
         }
     }
 
