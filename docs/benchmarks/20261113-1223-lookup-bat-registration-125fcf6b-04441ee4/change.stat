@@ -1,0 +1,10 @@
+commit 125fcf6bcfe168ff21c09f2dd0c70d7d29e68365
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Fri Nov 13 12:23:29 2026 +0800
+
+    Cover the kept-map row at a second plane count (partial progress)
+    
+    The leaf kept-map identity, the changed-bit negative and the changed-mask-entry negative now run for both the two-plane and the three-plane multiplicity layouts.
+
+ crates/zkie-ops/src/proof/lookup.rs | 86 ++++++++++++++++++++++++++++++-------
+ 1 file changed, 70 insertions(+), 16 deletions(-)
