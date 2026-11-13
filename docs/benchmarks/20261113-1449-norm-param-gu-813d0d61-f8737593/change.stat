@@ -1,0 +1,22 @@
+commit 813d0d614b1f00253cbadf497d6e9a914854f417
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Fri Nov 13 14:49:26 2026 +0800
+
+    Commit and sample the folded parameter row before drawing its columns
+    
+    Each parameter table claim now folds the single table row, commits the folded
+    message as G_u with its own code, pads, tails, salts and runtime tree, absorbs
+    the root, draws and absorbs the sample answers, and only then draws the table
+    columns and opens them. The verifier replays the same order, compares the
+    seeds and positions and verifies the openings against the plan reader. The
+    claims are single-row only in this stage; a packed multi-row table is rejected
+    at plan validation. The fixture attaches a legal fold shape to both parameter
+    tables, and the positive chain plus the tampering negatives pass through the
+    real verifier.
+    
+    partial progress
+
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     | 274 +++++++++++++++-----
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 317 +++++++++++++++++++----
+ crates/zkie-ops/src/proof/norm_param_table.rs    |  59 ++++-
+ 3 files changed, 534 insertions(+), 116 deletions(-)
