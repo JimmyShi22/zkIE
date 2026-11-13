@@ -25,7 +25,7 @@ use zkie_engine::pcs::request::code::encode_row_fp3;
 use zkie_engine::pcs::request::fold::{ByteMaskCoins, MaskCoins};
 use zkie_engine::pcs::request::field::{Fp3, MODULUS};
 use zkie_engine::pcs::request::runtime_tree::{
-    RuntimePartRows, RuntimeTree, RuntimeTreeOpening, RuntimeTreePlan,
+    RuntimePartRows, RuntimeTree, RuntimeTreeOpening, RuntimeTreePart, RuntimeTreePlan,
 };
 use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
 
@@ -899,6 +899,149 @@ pub fn round_digit_lookup_key(
         padding_value: Fp3::from_u64(padding_byte),
         table_identity,
     })
+}
+
+/// The parent-plan values a lookup plan inherits: the main and mask codes of
+/// the own proximity group, the message and tree identifiers, the tree
+/// material, and the public padding and table identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormLookupParams {
+    pub code: zkie_engine::pcs::request::code::CodeParams,
+    pub mask_code: zkie_engine::pcs::request::code::CodeParams,
+    pub group: u64,
+    pub bits_oracle: u64,
+    pub mask_oracle: u64,
+    pub bits_tree: u64,
+    pub mask_tree: u64,
+    pub leaf_class: u32,
+    pub salt_bytes: usize,
+    pub run: Digest,
+    pub configuration: Digest,
+    pub padding_byte: u64,
+    pub table_identity: Digest,
+}
+
+impl NormLookupPlan {
+    /// Sizes and builds the lookup plan from the rounding layout and the
+    /// parent plan values. The key map covers every committed digit slot; the
+    /// multiplicity-bit shape and mask rows follow from the derived key and
+    /// plane counts, the parent codes and the mask budget.
+    pub fn from_round(
+        round: &NormRoundPlan,
+        positions: u32,
+        params: &NormLookupParams,
+    ) -> Result<Self> {
+        if params.bits_oracle == 0
+            || params.mask_oracle == 0
+            || params.bits_oracle == params.mask_oracle
+            || params.group == 0
+            || params.bits_tree == params.mask_tree
+        {
+            return Err(Error::InvalidConfig);
+        }
+        if params.code.r < 1 || params.mask_code.r < 1 {
+            return Err(Error::InvalidConfig);
+        }
+        let digits = round.layout.digit_slots()?;
+        let slots = digits
+            .len()
+            .checked_mul(positions as usize)
+            .ok_or(Error::ResourceLimit)?;
+        let (key_bits, mu) = lookup_parameters(slots)?;
+        let lookup = LookupPlan {
+            key_bits,
+            mu,
+            table_log: 8,
+        };
+        lookup.validate()?;
+        let key = round_digit_lookup_key(
+            round,
+            positions,
+            key_bits,
+            params.padding_byte,
+            params.table_identity,
+        )?;
+        let bit_count = lookup
+            .planes()?
+            .checked_mul(lookup.table_rows()?)
+            .ok_or(Error::ResourceLimit)?;
+        let bits_shape = WShape::new(
+            bit_count as u64,
+            params.code,
+            1,
+            1,
+            params.salt_bytes,
+            params.bits_tree,
+            params.leaf_class,
+            params.run,
+            params.configuration,
+        )?;
+        if bits_shape.main_rows > (1u64 << params.code.log_n) {
+            return Err(Error::InvalidConfig);
+        }
+        let mask_rows = lookup_mask_rows(&lookup, params.mask_code)?;
+        let mask_symbols = mask_rows
+            .checked_mul(zkie_engine::pcs::request::field::E_DEGREE as u64)
+            .ok_or(Error::ResourceLimit)?;
+        let mask_tree = RuntimeTreePlan {
+            tree_number: params.mask_tree,
+            leaf_class: params.leaf_class,
+            log_n: params.mask_code.log_n,
+            log_n_zk: params.mask_code.log_n,
+            parts: vec![RuntimeTreePart {
+                main_symbols: 0,
+                mask_symbols,
+            }],
+            salt_bytes: params.salt_bytes,
+            run: params.run,
+            configuration: params.configuration,
+        };
+        let plan = Self {
+            lookup,
+            commit: LookupCommitPlan {
+                bits_shape,
+                bits_oracle: params.bits_oracle,
+                group: params.group,
+                bits_openings: 1,
+                mask_oracle: params.mask_oracle,
+                mask_code: params.mask_code,
+                mask_rows,
+                mask_openings: 1,
+                mask_tree,
+            },
+            key,
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+}
+
+/// The smallest power-of-two mask row count whose free entries hold every
+/// allocated lookup mask entry.
+pub fn lookup_mask_rows(
+    plan: &LookupPlan,
+    mask_code: zkie_engine::pcs::request::code::CodeParams,
+) -> Result<u64> {
+    let count = crate::proof::lookup::mask_count(plan)?;
+    let ell = mask_code.ell;
+    if ell < 2 {
+        return Err(Error::InvalidConfig);
+    }
+    let columns = 1u64
+        .checked_shl(mask_code.log_n)
+        .ok_or(Error::ResourceLimit)?;
+    let mut rows = 1u64;
+    while rows <= columns {
+        let free = rows
+            .checked_mul(ell - 1)
+            .and_then(|value| value.checked_add(rows - 1))
+            .ok_or(Error::ResourceLimit)?;
+        if free >= count as u64 {
+            return Ok(rows);
+        }
+        rows = rows.checked_mul(2).ok_or(Error::ResourceLimit)?;
+    }
+    Err(Error::ResourceLimit)
 }
 
 /// The trusted plan of the integrated norm relation.
@@ -2462,6 +2605,99 @@ mod tests {
         for slot in layout.slots.total..64 {
             assert_eq!(values[slot], Fp3::ZERO);
         }
+    }
+
+    #[test]
+    fn lookup_plan_is_sized_from_the_parent_plan() {
+        use crate::proof::lookup::mask_count;
+        use crate::proof::lookup_messages::{commit_lookup, LookupRandomSource};
+
+        let widths = NormRoundWidths {
+            sum: 2,
+            squares: 3,
+            variance: 2,
+            mean: 2,
+            offset: 2,
+        };
+        let layout = NormRoundLayout::new(widths, 8, 5, 3).unwrap();
+        let columns = widths.columns().unwrap();
+        let round = NormRoundPlan {
+            group: NormGroupPlan {
+                shape: group_shape(columns, 1),
+                columns,
+                group: 1,
+                oracle_base: 9000,
+                openings: 1,
+            },
+            layout,
+            input_bound: 8,
+        };
+        let params = NormLookupParams {
+            // The parent main code must cover the multiplicity-bit message
+            // rows; a digit-heavy round needs one more tree level.
+            code: zkie_engine::pcs::request::code::build_code_plan(7, 32, 4).unwrap(),
+            mask_code: zkie_engine::pcs::request::code::build_code_plan(6, 32, 4).unwrap(),
+            group: 7,
+            bits_oracle: 9700,
+            mask_oracle: 9701,
+            bits_tree: 60701,
+            mask_tree: 60700,
+            leaf_class: 1,
+            salt_bytes: 40,
+            run: Digest([0x41; 32]),
+            configuration: Digest([0x51; 32]),
+            padding_byte: 0,
+            table_identity: Digest([0x63; 32]),
+        };
+        let plan = NormLookupPlan::from_round(&round, 2, &params).unwrap();
+        let digits = layout.digit_slots().unwrap();
+        let (key_bits, mu) = lookup_parameters(digits.len() * 2).unwrap();
+        assert_eq!(plan.lookup.key_bits, key_bits);
+        assert_eq!(plan.lookup.mu, mu);
+        assert_eq!(plan.lookup.table_log, 8);
+        assert_eq!(plan.key.sources.len(), digits.len() * 2);
+        let bit_count = plan.lookup.planes().unwrap() * plan.lookup.table_rows().unwrap();
+        assert_eq!(plan.commit.bits_shape.fault(bit_count as u64, 1), None);
+        assert!(plan.commit.bits_shape.main_rows <= (1u64 << params.code.log_n));
+        let expected_rows = lookup_mask_rows(&plan.lookup, params.mask_code).unwrap();
+        assert_eq!(plan.commit.mask_rows, expected_rows);
+        let free = plan.commit.mask_rows * (params.mask_code.ell - 1)
+            + plan.commit.mask_rows
+            - 1;
+        assert!(free >= mask_count(&plan.lookup).unwrap() as u64);
+        assert_eq!(
+            plan.commit.mask_tree.parts[0].mask_symbols,
+            plan.commit.mask_rows
+                * zkie_engine::pcs::request::field::E_DEGREE as u64
+        );
+        let digest = plan.digest();
+        let mut changed = plan.clone();
+        changed.key.padding_value = Fp3::ONE;
+        assert_ne!(changed.digest(), digest);
+
+        // The constructed message plans commit from a synthetic bit witness.
+        let bits = vec![Fp3::ZERO; bit_count];
+        let mut source = LookupRandomSource::new(5);
+        let messages = commit_lookup(
+            &plan.commit,
+            &bits,
+            mask_count(&plan.lookup).unwrap(),
+            &mut source,
+        );
+        assert!(messages.is_ok());
+
+        let mut bad = params.clone();
+        bad.bits_tree = bad.mask_tree;
+        assert!(NormLookupPlan::from_round(&round, 2, &bad).is_err());
+        bad = params.clone();
+        bad.padding_byte = 256;
+        assert!(NormLookupPlan::from_round(&round, 2, &bad).is_err());
+        bad = params.clone();
+        bad.table_identity = Digest::ZERO;
+        assert!(NormLookupPlan::from_round(&round, 2, &bad).is_err());
+        bad = params.clone();
+        bad.code = zkie_engine::pcs::request::code::build_code_plan(6, 32, 4).unwrap();
+        assert!(NormLookupPlan::from_round(&round, 2, &bad).is_err());
     }
 
     #[test]
