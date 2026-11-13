@@ -79,6 +79,14 @@ pub(crate) const NORM_OUTPUT_PSC_TAGS: PscTranscriptTags = PscTranscriptTags {
 };
 /// The prefix tag of the pointwise column point.
 pub(crate) const NORM_OUTPUT_POINT_TAG: u64 = 63;
+/// Transcript tags of the tail relation instances, distinct from the relation
+/// and pointwise tags.
+pub(crate) const NORM_TAIL_PSC_TAGS: PscTranscriptTags = PscTranscriptTags {
+    version: NORM_PSC_VERSION,
+    hiding_sum: 64,
+    round: 65,
+    end: 66,
+};
 /// Version of the pointwise transcript section.
 pub const NORM_OUTPUT_PSC_VERSION: u64 = 1;
 
@@ -446,6 +454,62 @@ impl NormOutputSecond {
     }
 }
 
+/// The public second-stage transcript of the tail relations: one
+/// product-sumcheck instance and its two shown point values per position and
+/// relation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormTailPscSecond {
+    pub psc: Vec<DotProof>,
+    pub point_values: Vec<[Fp3; 2]>,
+}
+
+impl NormTailPscSecond {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut writer = CanonicalWriter::new();
+        put_psc_transcript(&mut writer, NORM_PSC_VERSION, &self.psc, &self.point_values)?;
+        Ok(writer.into_bytes())
+    }
+
+    pub fn decode(plan: &NormPlan, bytes: &[u8]) -> Result<Self> {
+        let tail_plan = plan
+            .output
+            .as_ref()
+            .and_then(|output| output.tail.as_ref())
+            .ok_or(Error::InvalidConfig)?;
+        let instances = usize::try_from(plan.shape.positions)
+            .map_err(|_| Error::ResourceLimit)?
+            .checked_mul(5)
+            .ok_or(Error::ResourceLimit)?;
+        let variables = output_tail_variables(plan.columns)?;
+        let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
+        let (psc, point_values) = get_psc_transcript::<2>(
+            &mut reader,
+            NORM_PSC_VERSION,
+            instances as u32,
+            variables,
+        )?;
+        reader.finish()?;
+        let message = Self { psc, point_values };
+        message.check(plan, tail_plan)?;
+        Ok(message)
+    }
+
+    pub fn check(&self, plan: &NormPlan, tail_plan: &NormOutputTailPlan) -> Result<()> {
+        let instances = plan.shape.positions as usize * 5;
+        let variables = output_tail_variables(plan.columns)?;
+        let _ = tail_plan;
+        if self.psc.len() != instances || self.point_values.len() != instances {
+            return Err(Error::ShapeMismatch);
+        }
+        for proof in &self.psc {
+            if proof.rounds.len() != variables || proof.y_round.coefficients.len() != 2 {
+                return Err(Error::ShapeMismatch);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The public second-stage norm message: one product-sumcheck transcript and
 /// its two shown point values per instance, in position-major and
 /// sum/squares/mean/variance-major order.
@@ -461,6 +525,8 @@ pub struct NormPscSecond {
     /// The pointwise product transcripts, when the plan carries the output
     /// tail.
     pub output: Option<NormOutputSecond>,
+    /// The tail relation transcripts, when the plan carries the tail section.
+    pub tail: Option<NormTailPscSecond>,
 }
 
 impl NormPscSecond {
@@ -480,6 +546,9 @@ impl NormPscSecond {
         }
         if let Some(output) = &self.output {
             writer.put_bytes(&output.encode()?);
+        }
+        if let Some(tail) = &self.tail {
+            writer.put_bytes(&tail.encode()?);
         }
         Ok(writer.into_bytes())
     }
@@ -505,6 +574,7 @@ impl NormPscSecond {
             lookup: None,
             rstd: None,
             output: None,
+            tail: None,
         };
         message.check(plan)?;
         Ok(message)
@@ -546,6 +616,10 @@ impl NormPscSecond {
             )?),
             None => None,
         };
+        let tail = match plan.output.as_ref().and_then(|output| output.tail.as_ref()) {
+            Some(_) => Some(NormTailPscSecond::decode(plan, reader.get_bytes()?)?),
+            None => None,
+        };
         reader.finish()?;
         let message = Self {
             psc,
@@ -553,6 +627,7 @@ impl NormPscSecond {
             lookup,
             rstd,
             output,
+            tail,
         };
         message.check_for(plan)?;
         Ok(message)
@@ -583,6 +658,12 @@ impl NormPscSecond {
             (Some(output_plan), Some(output)) => {
                 output.check(output_plan, plan.shape.positions)?
             }
+            (None, None) => {}
+            _ => return Err(Error::ShapeMismatch),
+        }
+        let tail_plan = plan.output.as_ref().and_then(|output| output.tail.as_ref());
+        match (tail_plan, &self.tail) {
+            (Some(tail_plan), Some(tail)) => tail.check(plan, tail_plan)?,
             (None, None) => {}
             _ => return Err(Error::ShapeMismatch),
         }
@@ -975,6 +1056,7 @@ pub fn prove_norm_psc(
         lookup: None,
         rstd: None,
         output: None,
+        tail: None,
     })
 }
 
@@ -2541,6 +2623,29 @@ pub fn norm_pointwise_entries(
             )?);
         }
         entries.push(crate::proof::psc_general::GeneralMaskEntries { hiding, shown });
+    }
+    Ok(entries)
+}
+
+/// The committed mask entries of the tail relation instances, in
+/// position-major and relation order.
+pub fn norm_tail_entries(
+    plan: &NormMaskPlan,
+    mask: &CommittedNormMask,
+    instances: usize,
+) -> Result<Vec<DotMaskEntries>> {
+    let count = plan.tail_instances()?;
+    let mut entries = Vec::with_capacity(count);
+    for instance in 0..count {
+        let mut hiding = Vec::with_capacity(plan.tail_hiding);
+        for index in 0..plan.tail_hiding {
+            hiding.push(mask.entry(plan, plan.tail_hiding_slot(instances, instance, index)?)?);
+        }
+        let shown = [
+            mask.entry(plan, plan.tail_shown_slot(instances, instance, 0)?)?,
+            mask.entry(plan, plan.tail_shown_slot(instances, instance, 1)?)?,
+        ];
+        entries.push(DotMaskEntries { hiding, shown });
     }
     Ok(entries)
 }

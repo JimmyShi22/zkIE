@@ -12180,6 +12180,58 @@ fn prove_norm_second(
         (None, None) => (None, None),
         _ => return Err(Error::ShapeMismatch),
     };
+    let tail_message = match (
+        plan.output.as_ref().and_then(|output| output.tail.as_ref()),
+        &witness.output,
+    ) {
+        (Some(tail_plan), Some(output_witness)) => {
+            let entries = crate::proof::hidden_norm_psc::norm_tail_entries(
+                mask_plan,
+                &mask_witness.committed,
+                instances,
+            )?;
+            let variables = crate::proof::hidden_norm_psc::output_tail_variables(plan.columns)?;
+            let claim = DotClaim {
+                masks: Vec::new(),
+                target: Fp3::ZERO,
+            };
+            let mut psc = Vec::with_capacity(positions * 5);
+            let mut point_values = Vec::with_capacity(positions * 5);
+            for position in 0..positions {
+                for relation in 0..5usize {
+                    let instance = position * 5 + relation;
+                    let (left, right) = crate::proof::hidden_norm_psc::output_rel_map(
+                        tail_plan,
+                        &output_witness.rows[position],
+                        plan.columns,
+                        relation,
+                    )?;
+                    if left.len() != right.len() || left.len() != 1usize << variables {
+                        return Err(Error::ShapeMismatch);
+                    }
+                    let entry = entries.get(instance).ok_or(Error::ShapeMismatch)?;
+                    let mut challenges =
+                        crate::proof::committed_psc::PositionPscChallenges::new(
+                            chain,
+                            crate::proof::hidden_norm_psc::NORM_TAIL_PSC_TAGS,
+                            instance as u64,
+                        );
+                    let (proof, output) = crate::proof::psc::prove_dot_sumcheck(
+                        &left,
+                        &right,
+                        &claim,
+                        entry,
+                        &mut challenges,
+                    )?;
+                    psc.push(proof);
+                    point_values.push([output.ends[0].value, output.ends[1].value]);
+                }
+            }
+            Some(crate::proof::hidden_norm_psc::NormTailPscSecond { psc, point_values })
+        }
+        (None, None) => None,
+        _ => return Err(Error::ShapeMismatch),
+    };
     Ok((
         NormPscSecond {
             psc,
@@ -12187,6 +12239,7 @@ fn prove_norm_second(
             lookup: lookup.clone(),
             rstd: rstd.clone(),
             output: output_message,
+            tail: tail_message,
         },
         NormRowBinding {
             positions: bindings,
@@ -12388,6 +12441,51 @@ fn verify_norm_second(
         (None, None) => None,
         _ => return Err(Error::ShapeMismatch),
     };
+    match (
+        plan.output.as_ref().and_then(|output| output.tail.as_ref()),
+        &messages.tail,
+    ) {
+        (Some(tail_plan), Some(message)) => {
+            let variables = crate::proof::hidden_norm_psc::output_tail_variables(plan.columns)?;
+            let entries = DotMaskEntries {
+                hiding: vec![Fp3::ZERO; mask_plan.tail_hiding],
+                shown: [Fp3::ZERO; SHOWN_MAPS],
+            };
+            let claim = DotClaim {
+                masks: Vec::new(),
+                target: Fp3::ZERO,
+            };
+            for instance in 0..positions * 5 {
+                let proof = message.psc.get(instance).ok_or(Error::ShapeMismatch)?;
+                let mut challenges =
+                    crate::proof::committed_psc::PositionPscChallenges::new(
+                        chain,
+                        crate::proof::hidden_norm_psc::NORM_TAIL_PSC_TAGS,
+                        instance as u64,
+                    );
+                let output = crate::proof::psc::verify_psc_transcript(
+                    &claim,
+                    &entries,
+                    proof,
+                    variables,
+                    &mut challenges,
+                )?;
+                let expected = [output.ends[0].value, output.ends[1].value];
+                if message
+                    .point_values
+                    .get(instance)
+                    .copied()
+                    .ok_or(Error::ShapeMismatch)?
+                    != expected
+                {
+                    return Err(Error::InvalidProof);
+                }
+            }
+            let _ = tail_plan;
+        }
+        (None, None) => {}
+        _ => return Err(Error::ShapeMismatch),
+    }
     Ok(NormRowBinding {
         positions: bindings,
         lookup: lookup_binding,
@@ -21949,6 +22047,42 @@ mod merged_tests {
 
         let mut changed = base.clone();
         changed.first.norm.as_mut().unwrap().tail = None;
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        // The tail relation transcripts are sectioned and structural: a
+        // popped proof, a popped point value or a missing section is rejected.
+        assert_eq!(
+            base.second.norm.as_ref().unwrap().tail.as_ref().unwrap().psc.len(),
+            POSITIONS as usize * 5
+        );
+        let mut changed = base.clone();
+        changed
+            .second
+            .norm
+            .as_mut()
+            .unwrap()
+            .tail
+            .as_mut()
+            .unwrap()
+            .psc
+            .pop();
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = base.clone();
+        changed
+            .second
+            .norm
+            .as_mut()
+            .unwrap()
+            .tail
+            .as_mut()
+            .unwrap()
+            .point_values
+            .pop();
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = base.clone();
+        changed.second.norm.as_mut().unwrap().tail = None;
         assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
     }
 
