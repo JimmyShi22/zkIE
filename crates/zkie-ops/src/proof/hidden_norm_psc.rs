@@ -1117,7 +1117,7 @@ fn fp3_signed(value: i128) -> Result<Fp3> {
 // sumcheck and the row binding.
 
 /// Version of the integrated norm plan and first message.
-pub const NORM_BIND_VERSION: u64 = 12;
+pub const NORM_BIND_VERSION: u64 = 13;
 
 /// The relation indices the bound core supports. The map construction of
 /// every relation is fixed by the relation index; the plan may list only
@@ -1722,6 +1722,109 @@ impl NormLookupPlan {
         plan.validate()?;
         Ok(plan)
     }
+
+    /// Sizes and builds the byte-table lookup over the committed clamp slack
+    /// digits of the output tail. Every key reads one strict or non-strict
+    /// sign-consistency slack digit cell of the tail group, so the key group
+    /// is the tail group: the key-claim rows and the prover key-row selection
+    /// address the committed tail messages. The table is the public byte
+    /// table; the clamp widths and the table identity are trusted plan values.
+    pub fn from_tail_slack(
+        tail: &NormOutputTailPlan,
+        columns: u64,
+        positions: u32,
+        params: &NormLookupParams,
+    ) -> Result<Self> {
+        if params.bits_oracle == 0
+            || params.mask_oracle == 0
+            || params.bits_oracle == params.mask_oracle
+            || params.group == 0
+            || params.bits_tree == params.mask_tree
+        {
+            return Err(Error::InvalidConfig);
+        }
+        if params.code.r < 1 || params.mask_code.r < 1 || positions == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        if params.table_identity != crate::proof::lookup::BYTE_TABLE_IDENTITY {
+            return Err(Error::InvalidConfig);
+        }
+        let clamp = tail.clamp.as_ref().ok_or(Error::InvalidConfig)?;
+        if tail.group.columns != tail.columns(columns)?
+            || tail.group.fault(positions).is_some()
+        {
+            return Err(Error::InvalidConfig);
+        }
+        let digits = clamp
+            .low_strict
+            .checked_add(clamp.low_nonstrict)
+            .and_then(|value| value.checked_add(clamp.high_strict))
+            .and_then(|value| value.checked_add(clamp.high_nonstrict))
+            .ok_or(Error::ResourceLimit)?;
+        let slots = usize::try_from(columns)
+            .map_err(|_| Error::ResourceLimit)?
+            .checked_mul(digits)
+            .and_then(|value| value.checked_mul(positions as usize))
+            .ok_or(Error::ResourceLimit)?;
+        let (_, mu) = lookup_parameters(slots)?;
+        let (lookup, key) =
+            tail_slack_lookup_plan(tail, positions, columns, params.table_identity, mu)?;
+        let bit_count = lookup
+            .planes()?
+            .checked_mul(lookup.table_rows()?)
+            .ok_or(Error::ResourceLimit)?;
+        let bits_shape = WShape::new(
+            bit_count as u64,
+            params.code,
+            1,
+            1,
+            params.salt_bytes,
+            params.bits_tree,
+            params.leaf_class,
+            params.run,
+            params.configuration,
+        )?;
+        if bits_shape.main_rows > (1u64 << params.code.log_n) {
+            return Err(Error::InvalidConfig);
+        }
+        let mask_rows = lookup_mask_rows(&lookup, params.mask_code)?;
+        let mask_symbols = mask_rows
+            .checked_mul(zkie_engine::pcs::request::field::E_DEGREE as u64)
+            .ok_or(Error::ResourceLimit)?;
+        let mask_tree = RuntimeTreePlan {
+            tree_number: params.mask_tree,
+            leaf_class: params.leaf_class,
+            log_n: params.mask_code.log_n,
+            log_n_zk: params.mask_code.log_n,
+            parts: vec![RuntimeTreePart {
+                main_symbols: 0,
+                mask_symbols,
+            }],
+            salt_bytes: params.salt_bytes,
+            run: params.run,
+            configuration: params.configuration,
+        };
+        let plan = Self {
+            lookup,
+            commit: LookupCommitPlan {
+                bits_shape,
+                bits_oracle: params.bits_oracle,
+                group: params.group,
+                bits_openings: 1,
+                mask_oracle: params.mask_oracle,
+                mask_code: params.mask_code,
+                mask_rows,
+                mask_openings: 1,
+                mask_tree,
+            },
+            key,
+            key_oracle_base: tail.group.oracle_base,
+            key_shape: tail.group.shape,
+            key_columns: tail.group.columns,
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
 }
 
 /// The smallest power-of-two mask row count whose free entries hold every
@@ -1879,6 +1982,26 @@ impl NormPlan {
         }
         if let Some(lookup) = &self.lookup {
             lookup.validate()?;
+            let round_group = self.round.as_ref().map(|round| &round.group);
+            let tail_group = self
+                .output
+                .as_ref()
+                .and_then(|output| output.tail.as_ref())
+                .map(|tail| &tail.group);
+            let matches = |group: Option<&NormGroupPlan>| match group {
+                Some(group) => {
+                    lookup.key_oracle_base == group.oracle_base
+                        && lookup.key_columns == group.columns
+                        && lookup.key_shape == group.shape
+                }
+                None => false,
+            };
+            if !lookup.key.sources.is_empty()
+                && !matches(round_group)
+                && !matches(tail_group)
+            {
+                return Err(Error::InvalidConfig);
+            }
         }
         if let Some(rstd) = &self.rstd {
             rstd.validate()?;
@@ -3030,8 +3153,6 @@ impl NormOutputTailPlan {
         row: &crate::proof::hidden_norm::NormOutputRow,
         columns: u64,
     ) -> Result<Vec<Fp3>> {
-        use crate::proof::output_closure::fp3_signed;
-
         let width = usize::try_from(self.group.columns).map_err(|_| Error::ResourceLimit)?;
         let count = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
         let slots = self.slots()?;
@@ -3060,7 +3181,7 @@ impl NormOutputTailPlan {
             let mut remaining = value as u128;
             let mut used = 0usize;
             while used < bytes {
-                values[at + used] = fp3_signed((remaining & 0xff) as i128)?;
+                values[at + used] = Fp3::from_u64((remaining & 0xff) as u64);
                 remaining >>= 8;
                 used += 1;
             }

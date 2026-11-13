@@ -22323,6 +22323,499 @@ mod merged_tests {
         (plan, witness, params)
     }
 
+    fn slack_lookup_bits(
+        plan: &crate::proof::lookup::LookupPlan,
+        keys: &[Fp3],
+    ) -> Vec<Fp3> {
+        let planes = plan.planes().unwrap();
+        let rows = plan.table_rows().unwrap();
+        let mut counts = vec![0u64; rows];
+        for key in keys {
+            let mut found = false;
+            for (row, count) in counts.iter_mut().enumerate() {
+                if *key == Fp3::from_u64(row as u64) {
+                    *count += 1;
+                    found = true;
+                    break;
+                }
+            }
+            assert!(found, "a committed slack digit is not a byte");
+        }
+        let mut bits = vec![Fp3::ZERO; planes * rows];
+        for row in 0..rows {
+            for plane in 0..planes {
+                if (counts[row] >> plane) & 1 == 1 {
+                    bits[plane + planes * row] = Fp3::ONE;
+                }
+            }
+        }
+        bits
+    }
+
+    fn slack_lookup_params() -> crate::proof::hidden_norm_psc::NormLookupParams {
+        crate::proof::hidden_norm_psc::NormLookupParams {
+            code: code(),
+            mask_code: mask_code(),
+            group: GROUP,
+            bits_oracle: 9900,
+            mask_oracle: 9901,
+            bits_tree: 60980,
+            mask_tree: 60981,
+            leaf_class: 1,
+            salt_bytes: SALT,
+            run: W_RUN,
+            configuration: W_CONFIGURATION,
+            padding_byte: 0,
+            table_identity: crate::proof::lookup::BYTE_TABLE_IDENTITY,
+        }
+    }
+
+    /// Attaches the byte-table lookup over the committed clamp slack digits of
+    /// the output tail. The multiplicity bits are counted from the committed
+    /// tail messages, so the honest fixture commits the same keys the lookup
+    /// argument proves.
+    fn slack_lookup_fixture(
+        activation: &CommittedActivation,
+    ) -> (HiddenLinPlan, NormWitness, ParamTables) {
+        use crate::proof::hidden_norm_psc::{
+            norm_own_mask_rows, NormLookupPlan, NormLookupWitness,
+        };
+
+        let (mut plan, mut witness, params) = norm_output_fixture(activation);
+        let norm = plan.norm.as_ref().unwrap();
+        let tail_plan = norm
+            .output
+            .as_ref()
+            .and_then(|output| output.tail.as_ref())
+            .expect("the output fixture carries the tail")
+            .clone();
+        let lookup_plan =
+            NormLookupPlan::from_tail_slack(&tail_plan, norm.columns, POSITIONS, &slack_lookup_params())
+                .unwrap();
+        let keys = lookup_plan
+            .key
+            .read(
+                &lookup_plan.lookup,
+                &witness
+                    .output
+                    .as_ref()
+                    .unwrap()
+                    .tail
+                    .as_ref()
+                    .unwrap()
+                    .committed
+                    .messages,
+                Fp3::ONE,
+            )
+            .unwrap();
+        let bits = slack_lookup_bits(&lookup_plan.lookup, &keys);
+        let lookup_mask_rows = lookup_plan.commit.mask_rows;
+        plan.norm.as_mut().unwrap().lookup = Some(lookup_plan);
+        let norm_mask_rows = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .mask
+            .as_ref()
+            .unwrap()
+            .mask_rows;
+        let index_rows = plan
+            .send
+            .index_mask
+            .as_ref()
+            .map(|index| index.tree_rows().unwrap())
+            .unwrap_or(0);
+        plan.proximity.own_mask_tree.mask_rows =
+            norm_own_mask_rows(index_rows, norm_mask_rows + lookup_mask_rows).unwrap();
+        witness.lookup = Some(NormLookupWitness {
+            bits,
+            messages: None,
+        });
+        plan.validate().unwrap();
+        (plan, witness, params)
+    }
+
+    #[test]
+    fn norm_tail_slack_lookup_proves_and_verifies() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = slack_lookup_fixture(&activation);
+        let lookup_plan = plan.norm.as_ref().unwrap().lookup.as_ref().unwrap();
+        let tail_group = &plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .tail
+            .as_ref()
+            .unwrap()
+            .group;
+        assert_eq!(lookup_plan.key_oracle_base, tail_group.oracle_base);
+        assert_eq!(lookup_plan.key_shape, tail_group.shape);
+        assert_eq!(lookup_plan.key_columns, tail_group.columns);
+        assert_eq!(lookup_plan.key.sources.len() % 4, 0);
+
+        let (messages, hidden_witness) = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+            &mut params,
+        )
+        .unwrap();
+        assert!(messages.first.norm.as_ref().unwrap().lookup.is_some());
+        let second = messages
+            .second
+            .norm
+            .as_ref()
+            .unwrap()
+            .lookup
+            .as_ref()
+            .unwrap();
+        assert!(!second.claims.rows.is_empty());
+
+        let mut verifier_plan = plan.clone();
+        verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        let outcome = verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &messages).unwrap();
+        assert_eq!(outcome.first_seal, messages.first_seal);
+
+        let bytes = messages.encode().unwrap();
+        let decoded = HiddenLinMessages::decode(&plan, &bytes).unwrap();
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &decoded).is_ok());
+    }
+
+    #[test]
+    fn norm_tail_slack_lookup_claim_and_message_tampering_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = slack_lookup_fixture(&activation);
+        let (messages, hidden_witness) = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+            &mut params,
+        )
+        .unwrap();
+        let mut verifier_plan = plan.clone();
+        verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        let base = HiddenLinMessages::decode(&plan, &messages.encode().unwrap()).unwrap();
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &base).is_ok());
+
+        let mut changed = base.clone();
+        let claim = &mut changed
+            .second
+            .norm
+            .as_mut()
+            .unwrap()
+            .lookup
+            .as_mut()
+            .unwrap()
+            .claims
+            .key;
+        claim.value = claim.value.add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = base.clone();
+        let multiplicity = &mut changed
+            .second
+            .norm
+            .as_mut()
+            .unwrap()
+            .lookup
+            .as_mut()
+            .unwrap()
+            .claims
+            .multiplicity;
+        multiplicity.1 = multiplicity.1.add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let (planes, key_bits, table_log) = {
+            let lookup_plan = plan.norm.as_ref().unwrap().lookup.as_ref().unwrap();
+            (
+                lookup_plan.lookup.planes().unwrap(),
+                lookup_plan.lookup.key_bits as usize,
+                lookup_plan.lookup.table_log as usize,
+            )
+        };
+        let leaf_index = (planes - 1) + key_bits + table_log;
+        let mut changed = base.clone();
+        let leaf = &mut changed
+            .second
+            .norm
+            .as_mut()
+            .unwrap()
+            .lookup
+            .as_mut()
+            .unwrap()
+            .claims
+            .rows[leaf_index];
+        leaf.row_target = leaf.row_target.add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = base.clone();
+        changed
+            .first
+            .norm
+            .as_mut()
+            .unwrap()
+            .lookup
+            .as_mut()
+            .unwrap()
+            .bits
+            .message
+            .group
+            .entries[0]
+            .root = Digest([0x97; 32]);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = base.clone();
+        let answer = &mut changed
+            .first
+            .norm
+            .as_mut()
+            .unwrap()
+            .lookup
+            .as_mut()
+            .unwrap()
+            .bits
+            .sample
+            .answers[0];
+        *answer = answer.add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = base.clone();
+        changed
+            .first
+            .norm
+            .as_mut()
+            .unwrap()
+            .lookup
+            .as_mut()
+            .unwrap()
+            .mask
+            .root = Digest([0x96; 32]);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = base.clone();
+        changed.second.norm.as_mut().unwrap().lookup = None;
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+    }
+
+    #[test]
+    fn norm_tail_slack_lookup_plan_gates() {
+        use crate::proof::hidden_norm_psc::NormLookupPlan;
+
+        let activation = activation();
+        let (plan, _, _) = slack_lookup_fixture(&activation);
+        let tail = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .tail
+            .as_ref()
+            .unwrap()
+            .clone();
+
+        let mut params = slack_lookup_params();
+        params.table_identity = Digest([0x11; 32]);
+        assert!(NormLookupPlan::from_tail_slack(&tail, COLUMNS, POSITIONS, &params).is_err());
+
+        let mut params = slack_lookup_params();
+        params.mask_oracle = params.bits_oracle;
+        assert!(NormLookupPlan::from_tail_slack(&tail, COLUMNS, POSITIONS, &params).is_err());
+
+        let mut params = slack_lookup_params();
+        params.group = 0;
+        assert!(NormLookupPlan::from_tail_slack(&tail, COLUMNS, POSITIONS, &params).is_err());
+
+        let mut without_clamp = tail.clone();
+        without_clamp.clamp = None;
+        assert!(NormLookupPlan::from_tail_slack(
+            &without_clamp,
+            COLUMNS,
+            POSITIONS,
+            &slack_lookup_params()
+        )
+        .is_err());
+
+        let mut changed = plan.clone();
+        let out_base = changed
+            .norm
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .out
+            .oracle_base;
+        changed
+            .norm
+            .as_mut()
+            .unwrap()
+            .lookup
+            .as_mut()
+            .unwrap()
+            .key_oracle_base = out_base;
+        assert!(changed.validate().is_err());
+    }
+
+    #[test]
+    fn norm_tail_slack_lookup_committed_cell_tampering_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = slack_lookup_fixture(&activation);
+        let lookup_plan = plan.norm.as_ref().unwrap().lookup.as_ref().unwrap();
+        let source = lookup_plan.key.sources[0];
+        let tail_plan = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .tail
+            .as_ref()
+            .unwrap()
+            .clone();
+        let mut changed = witness.clone();
+        let messages = changed
+            .output
+            .as_ref()
+            .unwrap()
+            .tail
+            .as_ref()
+            .unwrap()
+            .committed
+            .messages
+            .clone();
+        let mut coins = ByteMaskCoins::new(Digest([0x93; 32])).unwrap();
+        let rows = usize::try_from(tail_plan.group.shape.main_rows).unwrap();
+        let ell = usize::try_from(tail_plan.group.shape.code.ell).unwrap();
+        let columns = usize::try_from(tail_plan.group.columns).unwrap();
+        let slots_of = |message: &[Vec<Fp3>]| {
+            let mut slots = vec![Fp3::ZERO; columns];
+            for (slot, entry) in slots.iter_mut().enumerate() {
+                let row = slot % rows;
+                let place = slot / rows;
+                if place >= ell {
+                    break;
+                }
+                *entry = message[row][place];
+            }
+            slots
+        };
+        let mut values = messages.iter().map(|message| slots_of(message)).collect::<Vec<_>>();
+        let mut tampered_message = messages[source.position as usize].clone();
+        tampered_message[source.row as usize][source.place as usize] =
+            tampered_message[source.row as usize][source.place as usize].add(&Fp3::from_u64(200));
+        values[source.position as usize] = slots_of(&tampered_message);
+        let tampered = commit_norm_group(&tail_plan.group, &values, &mut coins);
+        changed
+            .output
+            .as_mut()
+            .unwrap()
+            .tail
+            .as_mut()
+            .unwrap()
+            .committed
+            .committed = tampered.committed;
+        let proved = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &changed,
+            &mut params,
+        );
+        match proved {
+            Err(_) => {}
+            Ok((messages, hidden_witness)) => {
+                let mut verifier_plan = plan.clone();
+                verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+                assert!(
+                    verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &messages).is_err(),
+                    "a committed slack cell that differs from the proven key must not verify"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn norm_tail_slack_lookup_committed_digit_tampering_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = slack_lookup_fixture(&activation);
+        let lookup_plan = plan.norm.as_ref().unwrap().lookup.as_ref().unwrap();
+        let source = lookup_plan.key.sources[0];
+        let mut changed = witness.clone();
+        {
+            let tail = changed
+                .output
+                .as_mut()
+                .unwrap()
+                .tail
+                .as_mut()
+                .unwrap();
+            let value = &mut tail.committed.messages[source.position as usize]
+                [source.row as usize][source.place as usize];
+            *value = value.add(&Fp3::ONE);
+        }
+        let proved = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &changed,
+            &mut params,
+        );
+        assert!(
+            proved.is_err(),
+            "a committed slack digit that differs from the exact tail row must not prove"
+        );
+    }
+
+    #[test]
+    fn norm_tail_slack_lookup_out_of_range_digit_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = slack_lookup_fixture(&activation);
+        let mut changed = witness.clone();
+        {
+            let high = plan
+                .norm
+                .as_ref()
+                .unwrap()
+                .output
+                .as_ref()
+                .unwrap()
+                .clamp
+                .expect("the fixture clamps")
+                .1;
+            let row = &mut changed.output.as_mut().unwrap().rows[0];
+            row.pre_clamp[0] = high as i128 + (1i128 << 32) + 5;
+        }
+        let proved = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &changed,
+            &mut params,
+        );
+        assert!(
+            proved.is_err(),
+            "a slack value that does not fit its byte width must not prove"
+        );
+    }
+
     #[test]
     fn norm_output_groups_prove_and_verify() {
         let activation = activation();
