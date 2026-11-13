@@ -1,0 +1,4 @@
+# No source change in this round; the tested tree is 47f5dc15.
+# The policy registration diff lives in the registration trace
+# docs/benchmarks/20261114-0637-model-table-instance-d1824d49-a5de37d8/policy.diff.
+policy: ab0ae6d42fb3f148e3d956320d9bf0e4273d8ad63766723ab66c3d3ff1e2d767  models/gpt2/case.policy

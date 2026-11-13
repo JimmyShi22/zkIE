@@ -1,0 +1,23 @@
+	Command being timed: "target/release/zkie matrix --cases models/gpt2/case.toml --cold-runs 1 --warm-runs 1 --commit-dir gpt2-seq16=docs/benchmarks/20261114-0637-model-table-instance-d1824d49-a5de37d8/smoke/gpt2-seq16/commit --commit-dir gpt2-seq512=docs/benchmarks/20261114-0637-model-table-instance-d1824d49-a5de37d8/smoke/gpt2-seq512/commit --out docs/benchmarks/20261114-0649-model-table-tests-47f5dc15-384711a1/matrix"
+	User time (seconds): 1067.41
+	System time (seconds): 317.44
+	Percent of CPU this job got: 513%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 4:29.59
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 27378252
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 1
+	Minor (reclaiming a frame) page faults: 17408572
+	Voluntary context switches: 2137518
+	Involuntary context switches: 111711
+	Swaps: 0
+	File system inputs: 760
+	File system outputs: 52023264
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

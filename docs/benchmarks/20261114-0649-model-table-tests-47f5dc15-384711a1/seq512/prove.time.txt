@@ -1,0 +1,23 @@
+	Command being timed: "target/release/zkie prove --commit docs/benchmarks/20261114-0637-model-table-instance-d1824d49-a5de37d8/smoke/gpt2-seq512/commit --input /data/zkie-assets/cases/gpt2/tokens_512_i32.bin --model-id 6d35b05739f33e2d2c969f55fafd79c22a96d2264683a4d9a63ecb842438d271 --out docs/benchmarks/20261114-0649-model-table-tests-47f5dc15-384711a1/seq512/proof --run-dir docs/benchmarks/20261114-0649-model-table-tests-47f5dc15-384711a1/seq512/prove"
+	User time (seconds): 231.13
+	System time (seconds): 13.20
+	Percent of CPU this job got: 394%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:01.95
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 27376900
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 2467713
+	Voluntary context switches: 113302
+	Involuntary context switches: 18258
+	Swaps: 0
+	File system inputs: 64
+	File system outputs: 21733824
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

@@ -1,0 +1,162 @@
+{
+  "cases": [
+    {
+      "case_id": "gpt2-seq16",
+      "input": "/data/zkie-assets/cases/gpt2/tokens_16_i32.bin",
+      "registered_commit": "docs/benchmarks/20261114-0637-model-table-instance-d1824d49-a5de37d8/smoke/gpt2-seq16/commit",
+      "runs": [
+        {
+          "exit_code": 0,
+          "prove": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 75,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "docs/benchmarks/20261114-0649-model-table-tests-47f5dc15-384711a1/matrix/gpt2-seq16/cold-0/prove/progress.jsonl",
+            "proof_bytes": 2190159493,
+            "protocol_wall_ms": 14712,
+            "run_id": "prove",
+            "stage_wall_ms": 14712,
+            "vmhwm_kib": 4498240
+          },
+          "verify": {
+            "authenticated_output_digest": "135c4d1c47aee4fd1985fa862afefbedde9d59beaf112bd2cf0dcfff03339280",
+            "authenticated_output_elements": 16,
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 6,
+            "outcome": "PASS",
+            "output_binding": "expected",
+            "progress_path": "docs/benchmarks/20261114-0649-model-table-tests-47f5dc15-384711a1/matrix/gpt2-seq16/cold-0/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 17757,
+            "run_id": "verify",
+            "stage_wall_ms": 17757,
+            "vmhwm_kib": 4120036
+          }
+        },
+        {
+          "exit_code": 0,
+          "prove": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 75,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "docs/benchmarks/20261114-0649-model-table-tests-47f5dc15-384711a1/matrix/gpt2-seq16/warm-0/prove/progress.jsonl",
+            "proof_bytes": 2190159493,
+            "protocol_wall_ms": 14717,
+            "run_id": "prove",
+            "stage_wall_ms": 14717,
+            "vmhwm_kib": 4496864
+          },
+          "verify": {
+            "authenticated_output_digest": "135c4d1c47aee4fd1985fa862afefbedde9d59beaf112bd2cf0dcfff03339280",
+            "authenticated_output_elements": 16,
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 6,
+            "outcome": "PASS",
+            "output_binding": "expected",
+            "progress_path": "docs/benchmarks/20261114-0649-model-table-tests-47f5dc15-384711a1/matrix/gpt2-seq16/warm-0/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 17943,
+            "run_id": "verify",
+            "stage_wall_ms": 17943,
+            "vmhwm_kib": 4123144
+          }
+        }
+      ],
+      "seq_tokens": 16
+    },
+    {
+      "case_id": "gpt2-seq512",
+      "input": "/data/zkie-assets/cases/gpt2/tokens_512_i32.bin",
+      "registered_commit": "docs/benchmarks/20261114-0637-model-table-instance-d1824d49-a5de37d8/smoke/gpt2-seq512/commit",
+      "runs": [
+        {
+          "exit_code": 0,
+          "prove": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 59,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "docs/benchmarks/20261114-0649-model-table-tests-47f5dc15-384711a1/matrix/gpt2-seq512/cold-0/prove/progress.jsonl",
+            "proof_bytes": 11127652976,
+            "protocol_wall_ms": 62143,
+            "run_id": "prove",
+            "stage_wall_ms": 62143,
+            "vmhwm_kib": 27378252
+          },
+          "verify": {
+            "authenticated_output_digest": "eac0949d6463927eb9a961d61d618fb703e4b02169e89db10dbada94a5f0dfdd",
+            "authenticated_output_elements": 512,
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 10,
+            "outcome": "PASS",
+            "output_binding": "expected",
+            "progress_path": "docs/benchmarks/20261114-0649-model-table-tests-47f5dc15-384711a1/matrix/gpt2-seq512/cold-0/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 39472,
+            "run_id": "verify",
+            "stage_wall_ms": 39472,
+            "vmhwm_kib": 18869060
+          }
+        },
+        {
+          "exit_code": 0,
+          "prove": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 59,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "docs/benchmarks/20261114-0649-model-table-tests-47f5dc15-384711a1/matrix/gpt2-seq512/warm-0/prove/progress.jsonl",
+            "proof_bytes": 11127652976,
+            "protocol_wall_ms": 61546,
+            "run_id": "prove",
+            "stage_wall_ms": 61546,
+            "vmhwm_kib": 27377804
+          },
+          "verify": {
+            "authenticated_output_digest": "eac0949d6463927eb9a961d61d618fb703e4b02169e89db10dbada94a5f0dfdd",
+            "authenticated_output_elements": 512,
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 10,
+            "outcome": "PASS",
+            "output_binding": "expected",
+            "progress_path": "docs/benchmarks/20261114-0649-model-table-tests-47f5dc15-384711a1/matrix/gpt2-seq512/warm-0/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 39855,
+            "run_id": "verify",
+            "stage_wall_ms": 39855,
+            "vmhwm_kib": 18868552
+          }
+        }
+      ],
+      "seq_tokens": 512
+    }
+  ],
+  "kind": "matrix",
+  "schema": 1
+}
