@@ -1,0 +1,21 @@
+commit 5ecaaa380f8a69a5c161f7fd0c3093ebb6c7c14e
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Fri Nov 13 14:03:06 2026 +0800
+
+    Add the TURN 492 acceptance negatives for the rsqrt index and rstd lookup
+    
+    The hidden verifier now rejects two active segment selectors, no active
+    selector, a shifted rounding quotient, a shifted rounding remainder and a
+    shifted segment quotient, each re-committed so the only inconsistency is the
+    edited field. A table whose encoding differs from the trusted plan is rejected
+    by the verifier configuration compare, and the message tampering test also
+    covers a changed sample answer and a changed lookup proof value.
+    
+    The plaintext check scans the fixed-width buffers of the rstd lookup proof,
+    outcome and sample messages at eight-byte boundaries for the little-endian
+    bytes of every table value followed by sixteen zero bytes; none appears.
+    
+    partial progress
+
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 211 ++++++++++++++++++++++-
+ 1 file changed, 204 insertions(+), 7 deletions(-)
