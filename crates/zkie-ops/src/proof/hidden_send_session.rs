@@ -10440,6 +10440,177 @@ fn norm_plain_rows(
                 right.target = word.output.ends[1].value.sub(&constant);
                 rows.push(right);
             }
+            8..=15 => {
+                let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
+                let round_member = round_member.ok_or(Error::StatementMismatch)?;
+                let layout = &round_plan.layout;
+                let (start, width, value_slot, value_member, offset) =
+                    match word.relation {
+                        8 => (
+                            layout.slots.sum_digits,
+                            layout.widths.sum,
+                            None,
+                            Some((
+                                bat_of
+                                    .get(
+                                        &norm
+                                            .sum
+                                            .oracle_base
+                                            .checked_add(position as u64)
+                                            .ok_or(Error::ResourceLimit)?,
+                                    )
+                                    .ok_or(Error::StatementMismatch)?,
+                                &norm.sum.shape,
+                            )),
+                            layout.sum_offset,
+                        ),
+                        9 => (
+                            layout.slots.squares_digits,
+                            layout.widths.squares,
+                            None,
+                            Some((
+                                bat_of
+                                    .get(
+                                        &norm
+                                            .squares
+                                            .oracle_base
+                                            .checked_add(position as u64)
+                                            .ok_or(Error::ResourceLimit)?,
+                                    )
+                                    .ok_or(Error::StatementMismatch)?,
+                                &norm.squares.shape,
+                            )),
+                            0,
+                        ),
+                        10 => (
+                            layout.slots.variance_digits,
+                            layout.widths.variance,
+                            None,
+                            Some((
+                                bat_of
+                                    .get(
+                                        &norm
+                                            .variance
+                                            .oracle_base
+                                            .checked_add(position as u64)
+                                            .ok_or(Error::ResourceLimit)?,
+                                    )
+                                    .ok_or(Error::StatementMismatch)?,
+                                &norm.variance.shape,
+                            )),
+                            0,
+                        ),
+                        11 => (
+                            layout.slots.mean_digits,
+                            layout.widths.mean,
+                            None,
+                            Some((
+                                bat_of
+                                    .get(
+                                        &norm
+                                            .mean
+                                            .oracle_base
+                                            .checked_add(position as u64)
+                                            .ok_or(Error::ResourceLimit)?,
+                                    )
+                                    .ok_or(Error::StatementMismatch)?,
+                                &norm.mean.shape,
+                            )),
+                            layout.mean_offset,
+                        ),
+                        12 => (
+                            layout.slots.mean_offset_digits,
+                            layout.widths.offset,
+                            Some(layout.slots.mean_offset),
+                            None,
+                            0,
+                        ),
+                        13 => (
+                            layout.slots.mean_complement_digits,
+                            layout.widths.offset,
+                            Some(layout.slots.mean_complement),
+                            None,
+                            0,
+                        ),
+                        14 => (
+                            layout.slots.variance_offset_digits,
+                            layout.widths.offset,
+                            Some(layout.slots.variance_offset),
+                            None,
+                            0,
+                        ),
+                        _ => (
+                            layout.slots.variance_complement_digits,
+                            layout.widths.offset,
+                            Some(layout.slots.variance_complement),
+                            None,
+                            0,
+                        ),
+                    };
+                if width >= columns {
+                    return Err(Error::ShapeMismatch);
+                }
+                let round_columns = usize::try_from(round_plan.group.columns)
+                    .map_err(|_| Error::ResourceLimit)?;
+                let mut dense = vec![Fp3::ZERO; round_columns];
+                let mut power = Fp3::ONE;
+                for index in 0..width {
+                    let entry = dense.get_mut(start + index).ok_or(Error::ShapeMismatch)?;
+                    *entry = power.mul(&eq[index]);
+                    power = power.add(&power);
+                }
+                if let Some(slot) = value_slot {
+                    let entry = dense.get_mut(slot).ok_or(Error::ShapeMismatch)?;
+                    *entry = entry.sub(&eq[columns]);
+                }
+                let coefficients = scatter_message_coefficients(
+                    &round_plan.group.shape,
+                    round_plan.group.columns,
+                    &dense,
+                )?;
+                let mut constant = eq[..width]
+                    .iter()
+                    .fold(Fp3::ZERO, |sum, value| sum.add(value))
+                    .add(&eq[columns]);
+                let mut left = BatRow::new(BatRowKind::Plain);
+                left.add_term(round_member.bat_oracle, BatPart::Main, coefficients);
+                if let Some((member, shape)) = value_member {
+                    left.add_term(
+                        member.bat_oracle,
+                        BatPart::Main,
+                        scalar_message_coefficients(
+                            shape,
+                            Fp3::ZERO.sub(&eq[columns]),
+                        )?,
+                    );
+                }
+                if offset != 0 {
+                    left.target = word.output.ends[0].value.add(
+                        &crate::proof::output_closure::fp3_signed(offset as i128)?
+                            .mul(&eq[width]),
+                    );
+                    constant = constant.add(&eq[width]);
+                } else {
+                    left.target = word.output.ends[0].value;
+                }
+                left.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown0)?,
+                    word.output.ends[0].mask_scale,
+                );
+                rows.push(left);
+
+                let mut right = BatRow::new(BatRowKind::Plain);
+                right.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown1)?,
+                    word.output.ends[1].mask_scale,
+                );
+                right.target = word.output.ends[1].value.sub(&constant);
+                rows.push(right);
+            }
             _ => return Err(Error::UnsupportedPrimitive),
         }
         let mut row = BatRow::new(BatRowKind::Plain);
@@ -14572,7 +14743,7 @@ mod merged_tests {
             oracle: 9500,
             group: GROUP,
             mask_code: mask_code(),
-            mask_rows: 8,
+            mask_rows: 16,
             answers: 1,
             openings: 1,
             tree: RuntimeTreePlan {
@@ -14582,7 +14753,7 @@ mod merged_tests {
                 log_n_zk: CODE_LOG_N,
                 parts: vec![RuntimeTreePart {
                     main_symbols: 0,
-                    mask_symbols: 24,
+                    mask_symbols: 48,
                 }],
                 salt_bytes: SALT,
                 run: W_RUN,
@@ -14598,7 +14769,7 @@ mod merged_tests {
                 .unwrap(),
             columns,
             variables: columns.trailing_zeros() as usize + 1,
-            relations: vec![0, 1, 2, 3, 4, 5, 6, 7],
+            relations: vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
             x: group(columns, GROUP, 9000, 60000),
             x_roots: Vec::new(),
             sum: group(1, GROUP, 9100, 60100),
@@ -14731,7 +14902,7 @@ mod merged_tests {
             mask: Some(mask_witness),
         };
         let mut plan = hidden_plan(_activation);
-        plan.proximity.own_mask_tree.mask_rows = 16;
+        plan.proximity.own_mask_tree.mask_rows = 32;
         plan.norm = Some(norm);
         plan.validate().unwrap();
         (plan, witness)
@@ -14852,7 +15023,7 @@ mod merged_tests {
         verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
         assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &base).is_ok());
         let instances = base.second.norm.as_ref().unwrap().psc.len();
-        assert_eq!(instances, POSITIONS as usize * 8);
+        assert_eq!(instances, POSITIONS as usize * 16);
 
         // Endpoint values of every relation instance.
         for instance in 0..instances {
