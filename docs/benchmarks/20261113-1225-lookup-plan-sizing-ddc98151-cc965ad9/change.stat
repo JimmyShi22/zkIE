@@ -1,0 +1,12 @@
+commit ddc98151bd58b328f619f8e274549e890d922940
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Fri Nov 13 12:25:59 2026 +0800
+
+    Size the lookup plan from the parent plan (partial progress)
+    
+    The lookup plan now derives its key and plane counts, multiplicity-bit message shape, mask row count and mask tree from the rounding layout and the parent plan values: the main and mask codes, the message and tree identifiers, the tree material and the public padding and table identity. The constructor fails closed when the parent main code cannot hold the bit message rows or when a parameter collides. A test commits the constructed message plans from a synthetic bit witness and checks the derived mask budget.
+    
+    The rounding claim itself and the production model wiring are not part of this step.
+
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs | 238 ++++++++++++++++++++++++++-
+ 1 file changed, 237 insertions(+), 1 deletion(-)
