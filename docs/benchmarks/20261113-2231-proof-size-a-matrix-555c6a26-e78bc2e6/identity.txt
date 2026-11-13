@@ -1,0 +1,11 @@
+head: 555c6a268217aae1b79ebca2a31ea259416779d2
+parent: e78bc2e6212a559a47e44ece4aad2e455dbd72a9
+branch: refactor/v2
+status-begin
+?? docs/benchmarks/20261113-2231-proof-size-a-matrix-555c6a26-e78bc2e6/
+status-end
+Fri Nov 13 22:31:52 CST 2026
+64
+               total        used        free      shared  buff/cache   available
+Mem:             495         150         206         142         285         344
+/dev/nvme0n1p3  2.0T  984G  951G  51% /

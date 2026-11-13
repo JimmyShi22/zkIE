@@ -1,0 +1,31 @@
+PASS model=timesfm tokens=512 plan_tokens=16 steps=6683 checked=32768 proof_bytes=3824637660
+NEGATIVE object: REJECTED (invalid_proof)
+NEGATIVE root: REJECTED (invalid_proof)
+
+thread 'main' (3938208) panicked at src/main.rs:308:52:
+index out of bounds: the len is 1 but the index is 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+Command exited with non-zero status 101
+	Command being timed: "/data/zkie-a-verify/target/release/zkie-a-verify --model timesfm --policy docs/benchmarks/20261113-2231-proof-size-a-matrix-555c6a26-e78bc2e6/matrix/timesfm-16patch/cold-0/policy.toml --public docs/benchmarks/20261113-2231-proof-size-a-matrix-555c6a26-e78bc2e6/matrix/timesfm-16patch/cold-0/commit/public/model-commitment.bin --proof docs/benchmarks/20261113-2231-proof-size-a-matrix-555c6a26-e78bc2e6/matrix/timesfm-16patch/cold-0/proof/proof.bin --tokens /data/zkie-assets/cases/timesfm/input_ts_i32.bin --gt /data/zkie-assets/cases/timesfm/gt_int_output_i32.bin --negative"
+	User time (seconds): 56.97
+	System time (seconds): 262.39
+	Percent of CPU this job got: 1205%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:26.48
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 7573440
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 1368769
+	Voluntary context switches: 1412881
+	Involuntary context switches: 6631
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 8
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 101

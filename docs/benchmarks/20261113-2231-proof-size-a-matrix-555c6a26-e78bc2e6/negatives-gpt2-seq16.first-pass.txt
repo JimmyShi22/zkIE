@@ -1,0 +1,30 @@
+PASS model=gpt2 tokens=16 plan_tokens=16 steps=4462 checked=16 proof_bytes=2190155518
+NEGATIVE object: REJECTED (invalid_proof)
+NEGATIVE root: REJECTED (invalid_proof)
+NEGATIVE position: REJECTED (invalid_index)
+NEGATIVE mapping: REJECTED (statement_mismatch)
+NEGATIVE missing-authentication: REJECTED (statement_mismatch)
+NEGATIVE matrix: 5/5 rejected
+	Command being timed: "/data/zkie-a-verify/target/release/zkie-a-verify --model gpt2 --policy docs/benchmarks/20261113-2231-proof-size-a-matrix-555c6a26-e78bc2e6/matrix/gpt2-seq16/cold-0/policy.toml --public docs/benchmarks/20261113-2231-proof-size-a-matrix-555c6a26-e78bc2e6/matrix/gpt2-seq16/cold-0/commit/public/model-commitment.bin --proof docs/benchmarks/20261113-2231-proof-size-a-matrix-555c6a26-e78bc2e6/matrix/gpt2-seq16/cold-0/proof/proof.bin --tokens /data/zkie-assets/cases/gpt2/tokens_16_i32.bin --gt /data/zkie-assets/cases/gpt2/gt_int_argmax_16_i32.bin --negative"
+	User time (seconds): 57.03
+	System time (seconds): 252.22
+	Percent of CPU this job got: 1217%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:25.39
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 4316648
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 2934399
+	Voluntary context switches: 2169985
+	Involuntary context switches: 9202
+	Swaps: 0
+	File system inputs: 104
+	File system outputs: 16
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
