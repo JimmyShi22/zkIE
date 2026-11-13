@@ -34,6 +34,7 @@ pub mod interval;
 pub mod proximity_planner;
 pub mod asset_table;
 pub mod model_commitment;
+pub mod projection_claim;
 pub mod norm_param_table;
 
 #[cfg(test)]
