@@ -13981,6 +13981,7 @@ mod merged_tests {
             squares: norm_group(1, 82, 9200, 60200),
             mean: norm_group(1, 83, 9300, 60300),
             variance: norm_group(1, 84, 9400, 60400),
+            round: None,
             mask: None,
         }
     }
@@ -14228,6 +14229,7 @@ mod merged_tests {
             squares: group(1, GROUP, 9200, 60200),
             mean: group(1, GROUP, 9300, 60300),
             variance: group(1, GROUP, 9400, 60400),
+            round: None,
             mask: Some(mask_plan.clone()),
         };
         let mut coins = ByteMaskCoins::new(Digest([0x91; 32])).unwrap();

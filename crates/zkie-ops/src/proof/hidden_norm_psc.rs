@@ -23,7 +23,7 @@ use zkie_core::types::Digest;
 use zkie_engine::pcs::request::chain::Chain;
 use zkie_engine::pcs::request::code::encode_row_fp3;
 use zkie_engine::pcs::request::fold::{ByteMaskCoins, MaskCoins};
-use zkie_engine::pcs::request::field::Fp3;
+use zkie_engine::pcs::request::field::{Fp3, MODULUS};
 use zkie_engine::pcs::request::runtime_tree::{
     RuntimePartRows, RuntimeTree, RuntimeTreeOpening, RuntimeTreePlan,
 };
@@ -574,7 +574,7 @@ fn fp3_signed(value: i128) -> Result<Fp3> {
 // sumcheck and the row binding.
 
 /// Version of the integrated norm plan and first message.
-pub const NORM_BIND_VERSION: u64 = 2;
+pub const NORM_BIND_VERSION: u64 = 3;
 
 /// The relation indices the bound core supports. The map construction of
 /// every relation is fixed by the relation index; the plan may list only
@@ -606,6 +606,15 @@ impl NormGroupPlan {
     }
 }
 
+/// The trusted plan of the rounding witness group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormRoundPlan {
+    pub group: NormGroupPlan,
+    pub layout: NormRoundLayout,
+    /// The trusted input bound `X` of the fixture contract, in integer units.
+    pub input_bound: u64,
+}
+
 /// The trusted plan of the integrated norm relation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormPlan {
@@ -624,6 +633,8 @@ pub struct NormPlan {
     pub squares: NormGroupPlan,
     pub mean: NormGroupPlan,
     pub variance: NormGroupPlan,
+    /// The committed rounding witness group; optional in this stage.
+    pub round: Option<NormRoundPlan>,
     /// The committed mask group; optional in this stage.
     pub mask: Option<NormMaskPlan>,
 }
@@ -684,6 +695,27 @@ impl NormPlan {
                 }
             }
         }
+        if let Some(round) = &self.round {
+            if round.input_bound == 0 {
+                return Err(Error::InvalidConfig);
+            }
+            let columns = round.layout.widths.columns()?;
+            if round.group.columns != columns
+                || round.group.fault(self.shape.positions).is_some()
+                || round.group.shape.answers != 1
+            {
+                return Err(Error::InvalidConfig);
+            }
+            if norm_no_wrap(round.input_bound, self.shape.valid, &round.layout.widths).is_err()
+            {
+                return Err(Error::InvalidConfig);
+            }
+            for group in [&self.x, &self.sum, &self.squares, &self.mean, &self.variance] {
+                if round.group.oracle_base == group.oracle_base {
+                    return Err(Error::InvalidConfig);
+                }
+            }
+        }
         if let Some(mask) = &self.mask {
             mask.validate(
                 self.shape.positions,
@@ -714,6 +746,19 @@ impl NormPlan {
         put_norm_group(writer, &self.squares);
         put_norm_group(writer, &self.mean);
         put_norm_group(writer, &self.variance);
+        match &self.round {
+            Some(round) => {
+                writer.put_u64(1);
+                writer.put_u64(round.input_bound);
+                writer.put_u64(round.layout.widths.sum as u64);
+                writer.put_u64(round.layout.widths.squares as u64);
+                writer.put_u64(round.layout.widths.variance as u64);
+                writer.put_u64(round.layout.widths.mean as u64);
+                writer.put_u64(round.layout.widths.offset as u64);
+                put_norm_group(writer, &round.group);
+            }
+            None => writer.put_u64(0),
+        }
         match &self.mask {
             Some(mask) => {
                 writer.put_u64(1);
@@ -1217,6 +1262,9 @@ impl NormFirstMessages {
     /// witness group roots are proof values and are not compared with the plan.
     pub fn check_trusted(&self, plan: &NormPlan) -> Result<()> {
         plan.validate()?;
+        if plan.round.is_some() {
+            return Err(Error::UnsupportedPrimitive);
+        }
         let groups = [
             (&self.x, &plan.x, true),
             (&self.sum, &plan.sum, false),
@@ -1263,9 +1311,413 @@ impl NormFirstMessages {
     }
 }
 
+/// The fixed byte widths of the rounding witness rows.
+///
+/// The widths are plan values. The offset width bounds both `u = r - lo` and
+/// `s = valid - 1 - u`; the other widths bound the sum, squares, variance and
+/// mean magnitudes. A width may not exceed seven bytes: a wider row could
+/// exceed the base modulus and the digit reconstruction would stop being a
+/// canonical field representative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NormRoundWidths {
+    pub sum: usize,
+    pub squares: usize,
+    pub variance: usize,
+    pub mean: usize,
+    pub offset: usize,
+}
+
+impl NormRoundWidths {
+    pub fn fault(&self, valid: u32) -> Option<&'static str> {
+        for width in [self.sum, self.squares, self.variance, self.mean, self.offset] {
+            if width == 0 || width > 7 {
+                return Some("a rounding witness width is out of range");
+            }
+            if digit_bound(width).ok()? >= MODULUS as u128 {
+                return Some("a rounding witness width does not fit the modulus");
+            }
+        }
+        let capacity = digit_bound(self.offset).ok()? + 1;
+        if capacity < valid as u128 {
+            return Some("the offset width does not cover the valid column range");
+        }
+        None
+    }
+
+    pub fn slots(&self) -> Result<usize> {
+        self.offset
+            .checked_mul(4)
+            .and_then(|offset| offset.checked_add(self.sum))
+            .and_then(|value| value.checked_add(self.squares))
+            .and_then(|value| value.checked_add(self.variance))
+            .and_then(|value| value.checked_add(self.mean))
+            .and_then(|value| value.checked_add(NormRoundLayout::FIXED_SLOTS))
+            .ok_or(Error::ResourceLimit)
+    }
+
+    pub fn columns(&self) -> Result<u64> {
+        let slots = self.slots()?;
+        u64::try_from(slots)
+            .ok()
+            .and_then(|value| value.checked_next_power_of_two())
+            .ok_or(Error::ResourceLimit)
+    }
+}
+
+fn digit_bound(width: usize) -> Result<u128> {
+    256u128
+        .checked_pow(u32::try_from(width).map_err(|_| Error::ResourceLimit)?)
+        .and_then(|value| value.checked_sub(1))
+        .ok_or(Error::ResourceLimit)
+}
+
+fn digit_capacity(width: usize) -> Result<u128> {
+    256u128
+        .checked_pow(u32::try_from(width).map_err(|_| Error::ResourceLimit)?)
+        .ok_or(Error::ResourceLimit)
+}
+
+/// The slot positions of the rounding witness message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NormRoundSlots {
+    pub mean_remainder: usize,
+    pub mean_offset: usize,
+    pub mean_complement: usize,
+    pub variance_remainder: usize,
+    pub variance_offset: usize,
+    pub variance_complement: usize,
+    pub mean_negative: usize,
+    pub sum_negative: usize,
+    pub sum_digits: usize,
+    pub mean_digits: usize,
+    pub squares_digits: usize,
+    pub variance_digits: usize,
+    pub mean_offset_digits: usize,
+    pub mean_complement_digits: usize,
+    pub variance_offset_digits: usize,
+    pub variance_complement_digits: usize,
+    pub total: usize,
+}
+
+/// The plan-fixed layout of one rounding witness message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NormRoundLayout {
+    pub widths: NormRoundWidths,
+    pub slots: NormRoundSlots,
+}
+
+impl NormRoundLayout {
+    pub const FIXED_SLOTS: usize = 8;
+
+    pub fn new(widths: NormRoundWidths, valid: u32) -> Result<Self> {
+        if widths.fault(valid).is_some() {
+            return Err(Error::InvalidConfig);
+        }
+        let mean_remainder = 0;
+        let mean_offset = 1;
+        let mean_complement = 2;
+        let variance_remainder = 3;
+        let variance_offset = 4;
+        let variance_complement = 5;
+        let mean_negative = 6;
+        let sum_negative = 7;
+        let mut next = Self::FIXED_SLOTS;
+        let sum_digits = next;
+        next = next.checked_add(widths.sum).ok_or(Error::ResourceLimit)?;
+        let squares_digits = next;
+        next = next
+            .checked_add(widths.squares)
+            .ok_or(Error::ResourceLimit)?;
+        let variance_digits = next;
+        next = next
+            .checked_add(widths.variance)
+            .ok_or(Error::ResourceLimit)?;
+        let mean_digits = next;
+        next = next
+            .checked_add(widths.mean)
+            .ok_or(Error::ResourceLimit)?;
+        let mean_offset_digits = next;
+        next = next
+            .checked_add(widths.offset)
+            .ok_or(Error::ResourceLimit)?;
+        let mean_complement_digits = next;
+        next = next
+            .checked_add(widths.offset)
+            .ok_or(Error::ResourceLimit)?;
+        let variance_offset_digits = next;
+        next = next
+            .checked_add(widths.offset)
+            .ok_or(Error::ResourceLimit)?;
+        let variance_complement_digits = next;
+        next = next
+            .checked_add(widths.offset)
+            .ok_or(Error::ResourceLimit)?;
+        if next != widths.slots()? {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(Self {
+            widths,
+            slots: NormRoundSlots {
+                mean_remainder,
+                mean_offset,
+                mean_complement,
+                variance_remainder,
+                variance_offset,
+                variance_complement,
+                mean_negative,
+                sum_negative,
+                sum_digits,
+                mean_digits,
+                squares_digits,
+                variance_digits,
+                mean_offset_digits,
+                mean_complement_digits,
+                variance_offset_digits,
+                variance_complement_digits,
+                total: next,
+            },
+        })
+    }
+
+    /// Writes one integer core row into the fixed slot vector. Digit rows are
+    /// zero padded to their fixed width.
+    pub fn values(&self, core: &NormCoreRow, columns: u64) -> Result<Vec<Fp3>> {
+        let columns = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+        if columns < self.slots.total || !columns.is_power_of_two() {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut values = vec![Fp3::ZERO; columns];
+        values[self.slots.mean_remainder] = fp3_signed(core.mean_remainder)?;
+        values[self.slots.mean_offset] = fp3_signed(core.mean_offset)?;
+        values[self.slots.mean_complement] = fp3_signed(core.mean_complement)?;
+        values[self.slots.variance_remainder] = fp3_signed(core.variance_remainder)?;
+        values[self.slots.variance_offset] = fp3_signed(core.variance_offset)?;
+        values[self.slots.variance_complement] = fp3_signed(core.variance_complement)?;
+        values[self.slots.mean_negative] = if core.mean_negative {
+            Fp3::ONE
+        } else {
+            Fp3::ZERO
+        };
+        values[self.slots.sum_negative] = if core.sum_negative {
+            Fp3::ONE
+        } else {
+            Fp3::ZERO
+        };
+        write_digits(
+            &mut values[self.slots.sum_digits..self.slots.sum_digits + self.widths.sum],
+            &core.sum_digits,
+        )?;
+        write_digits(
+            &mut values[self.slots.squares_digits..self.slots.squares_digits + self.widths.squares],
+            &core.squares_digits,
+        )?;
+        write_digits(
+            &mut values
+                [self.slots.variance_digits..self.slots.variance_digits + self.widths.variance],
+            &core.variance_digits,
+        )?;
+        write_digits(
+            &mut values[self.slots.mean_digits..self.slots.mean_digits + self.widths.mean],
+            &core.mean_digits,
+        )?;
+        write_digits(
+            &mut values
+                [self.slots.mean_offset_digits..self.slots.mean_offset_digits + self.widths.offset],
+            &core.mean_offset_digits,
+        )?;
+        write_digits(
+            &mut values[self.slots.mean_complement_digits
+                ..self.slots.mean_complement_digits + self.widths.offset],
+            &core.mean_complement_digits,
+        )?;
+        write_digits(
+            &mut values[self.slots.variance_offset_digits
+                ..self.slots.variance_offset_digits + self.widths.offset],
+            &core.variance_offset_digits,
+        )?;
+        write_digits(
+            &mut values[self.slots.variance_complement_digits
+                ..self.slots.variance_complement_digits + self.widths.offset],
+            &core.variance_complement_digits,
+        )?;
+        Ok(values)
+    }
+}
+
+fn write_digits(slot: &mut [Fp3], digits: &[u8]) -> Result<()> {
+    if digits.len() > slot.len() {
+        return Err(Error::BoundViolation);
+    }
+    for (target, digit) in slot.iter_mut().zip(digits) {
+        *target = Fp3::from_u64(*digit as u64);
+    }
+    Ok(())
+}
+
+/// The integer no-wrap bounds of one position with the trusted input bound
+/// `X`, the valid width `d` and the fixed digit widths. Every bound must stay
+/// below `p/2`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NormNoWrap {
+    pub relation_sum: u128,
+    pub relation_squares: u128,
+    pub relation_mean: u128,
+    pub relation_variance: u128,
+    pub reconstruction: u128,
+    pub offsets: u128,
+    pub remainder: u128,
+}
+
+pub fn norm_no_wrap(
+    input_bound: u64,
+    valid: u32,
+    widths: &NormRoundWidths,
+) -> Result<NormNoWrap> {
+    if valid == 0 || widths.fault(valid).is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let x = input_bound as u128;
+    let d = valid as u128;
+    let bv = digit_bound(widths.sum)?;
+    let bs = digit_bound(widths.squares)?;
+    let bvar = digit_bound(widths.variance)?;
+    let bq = digit_bound(widths.mean)?;
+    let bu = digit_bound(widths.offset)?;
+    let relation_sum = d
+        .checked_mul(x)
+        .and_then(|value| value.checked_add(bv))
+        .ok_or(Error::ResourceLimit)?;
+    let sum_x_q = x.checked_add(bq).ok_or(Error::ResourceLimit)?;
+    let relation_squares = d
+        .checked_mul(sum_x_q.checked_mul(sum_x_q).ok_or(Error::ResourceLimit)?)
+        .and_then(|value| value.checked_add(bs))
+        .ok_or(Error::ResourceLimit)?;
+    let relation_mean = bv
+        .checked_add(bq.checked_mul(d).ok_or(Error::ResourceLimit)?)
+        .and_then(|value| value.checked_add(d))
+        .ok_or(Error::ResourceLimit)?;
+    let relation_variance = bs
+        .checked_add(bvar.checked_mul(d).ok_or(Error::ResourceLimit)?)
+        .and_then(|value| value.checked_add(d))
+        .ok_or(Error::ResourceLimit)?;
+    let reconstruction = [
+        digit_capacity(widths.sum)?,
+        digit_capacity(widths.squares)?,
+        digit_capacity(widths.variance)?,
+        digit_capacity(widths.mean)?,
+        digit_capacity(widths.offset)?,
+    ]
+    .into_iter()
+    .max()
+    .ok_or(Error::InvalidConfig)?;
+    let offsets = bu
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(d))
+        .ok_or(Error::ResourceLimit)?;
+    let remainder = d.checked_mul(3).ok_or(Error::ResourceLimit)?;
+    let half = (MODULUS as u128) / 2;
+    if relation_sum >= half
+        || relation_squares >= half
+        || relation_mean >= half
+        || relation_variance >= half
+        || reconstruction >= half
+        || offsets >= half
+        || remainder >= half
+    {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(NormNoWrap {
+        relation_sum,
+        relation_squares,
+        relation_mean,
+        relation_variance,
+        reconstruction,
+        offsets,
+        remainder,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn real_widths() -> NormRoundWidths {
+        NormRoundWidths {
+            sum: 5,
+            squares: 7,
+            variance: 6,
+            mean: 3,
+            offset: 2,
+        }
+    }
+
+    #[test]
+    fn round_layout_fixes_the_slot_map_and_pads_digits() {
+        let widths = real_widths();
+        let layout = NormRoundLayout::new(widths, 768).unwrap();
+        assert_eq!(layout.slots.total, 37);
+        assert_eq!(widths.columns().unwrap(), 64);
+        let core = NormCoreRow::from_values(&[3, -2, 5, 1], 4).unwrap();
+        let values = layout.values(&core, 64).unwrap();
+        assert_eq!(values.len(), 64);
+        assert_eq!(
+            values[layout.slots.mean_remainder],
+            fp3_signed(core.mean_remainder).unwrap()
+        );
+        assert_eq!(
+            values[layout.slots.variance_complement],
+            fp3_signed(core.variance_complement).unwrap()
+        );
+        assert_eq!(values[layout.slots.sum_negative], Fp3::ZERO);
+        for (offset, digit) in core.mean_digits.iter().enumerate() {
+            assert_eq!(
+                values[layout.slots.mean_digits + offset],
+                Fp3::from_u64(*digit as u64)
+            );
+        }
+        for slot in layout.slots.mean_digits + core.mean_digits.len()
+            ..layout.slots.mean_digits + widths.mean
+        {
+            assert_eq!(values[slot], Fp3::ZERO);
+        }
+        for slot in layout.slots.total..64 {
+            assert_eq!(values[slot], Fp3::ZERO);
+        }
+    }
+
+    #[test]
+    fn round_widths_and_digit_rows_fail_closed() {
+        let mut widths = real_widths();
+        widths.squares = 8;
+        assert!(NormRoundLayout::new(widths, 768).is_err());
+        let mut widths = real_widths();
+        widths.offset = 1;
+        assert!(NormRoundLayout::new(widths, 768).is_err());
+        let mut widths = real_widths();
+        widths.squares = 6;
+        let layout = NormRoundLayout::new(widths, 768).unwrap();
+        let core = NormCoreRow::from_values(&[22_855_985, -22_855_985], 2).unwrap();
+        assert_eq!(core.squares_digits.len(), 7);
+        assert!(layout.values(&core, 64).is_err());
+        let layout = NormRoundLayout::new(real_widths(), 768).unwrap();
+        assert!(layout.values(&core, 32).is_err());
+    }
+
+    #[test]
+    fn real_bounds_stay_below_the_modulus_half() {
+        let bounds = norm_no_wrap(22_855_985, 768, &real_widths()).unwrap();
+        assert_eq!(bounds.relation_sum, 1_117_065_024_255);
+        assert_eq!(bounds.relation_squares, 1_278_424_730_478_247_935);
+        assert_eq!(bounds.relation_mean, 1_112_396_529_663);
+        assert_eq!(bounds.relation_variance, 288_230_376_151_711_743);
+        assert_eq!(bounds.reconstruction, 72_057_594_037_927_936);
+        assert_eq!(bounds.offsets, 131_838);
+        assert_eq!(bounds.remainder, 2_304);
+        let mut widths = real_widths();
+        widths.mean = 4;
+        assert!(norm_no_wrap(22_855_985, 768, &widths).is_err());
+    }
+
     use zkie_engine::pcs::request::code::build_code_plan;
     use zkie_engine::pcs::request::runtime_tree::RuntimeTreePart;
     use zkie_engine::pcs::request::fold::{ByteMaskCoins, MaskCoins};
@@ -1568,6 +2020,7 @@ mod tests {
             squares: integrated_group(&psc.groups.squares),
             mean: integrated_group(&psc.groups.mean),
             variance: integrated_group(&psc.groups.variance),
+            round: None,
             mask: None,
         };
         let message = NormFirstMessages {
@@ -1582,6 +2035,66 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn round_plan_fixes_the_layout_and_the_input_bound() {
+        let (mut plan, _, _) = integrated_fixture();
+        let widths = NormRoundWidths {
+            sum: 2,
+            squares: 2,
+            variance: 2,
+            mean: 2,
+            offset: 1,
+        };
+        let layout = NormRoundLayout::new(widths, plan.shape.valid).unwrap();
+        let columns = widths.columns().unwrap();
+        let group = NormGroupPlan {
+            shape: group_shape(columns, 6),
+            columns,
+            group: plan.variance.group,
+            oracle_base: 9500,
+            openings: 1,
+        };
+        plan.round = Some(NormRoundPlan {
+            group,
+            layout,
+            input_bound: 1000,
+        });
+        plan.validate().unwrap();
+        let with_round = plan.digest();
+
+        let mut wide = plan.clone();
+        let widths = NormRoundWidths {
+            mean: 4,
+            ..widths
+        };
+        let layout = NormRoundLayout::new(widths, plan.shape.valid).unwrap();
+        let columns = widths.columns().unwrap();
+        wide.round = Some(NormRoundPlan {
+            group: NormGroupPlan {
+                shape: group_shape(columns, 7),
+                columns,
+                group: wide.variance.group,
+                oracle_base: 9501,
+                openings: 1,
+            },
+            layout,
+            input_bound: 1000,
+        });
+        assert!(wide.validate().is_err());
+
+        let mut colliding = plan.clone();
+        let x_oracle = colliding.x.oracle_base;
+        if let Some(round) = &mut colliding.round {
+            round.group.oracle_base = x_oracle;
+        }
+        assert!(colliding.validate().is_err());
+        assert_ne!(with_round, {
+            let mut plain = plan.clone();
+            plain.round = None;
+            plain.digest()
+        });
+    }
+
     fn integrated_first_round_trips_with_trusted_x_and_witness_roots() {
         let (plan, message, second) = integrated_fixture();
         let bytes = message.encode().unwrap();
