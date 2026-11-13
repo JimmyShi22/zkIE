@@ -1,0 +1,22 @@
+commit f873759365d28a88de6f42673bfba258d38face4
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Fri Nov 13 14:45:44 2026 +0800
+
+    Add the folded-message claim plans for the norm parameter tables
+    
+    The tables plan can carry one claim per parameter: the G_u shape of the
+    single-row fold (the folded row message committed with its own code, sample and
+    runtime tree, folding the committed table's index), the column draw count and
+    the claim kind. The claim requires the table index shape, the fit of the
+    parameter width in the G_u message beside its pads, the own oracle and group
+    ids and the column budget; attaching the claims changes the plan digest, and
+    the claims are either both present or both absent. A unit test builds a legal
+    single-row fold shape (two main message rows, one fold weight, no gamma) and
+    checks the plan binding and the rejections.
+    
+    partial progress
+
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     |   4 +
+ crates/zkie-ops/src/proof/hidden_send_session.rs |   2 +
+ crates/zkie-ops/src/proof/norm_param_table.rs    | 153 +++++++++++++++++++++++
+ 3 files changed, 159 insertions(+)
