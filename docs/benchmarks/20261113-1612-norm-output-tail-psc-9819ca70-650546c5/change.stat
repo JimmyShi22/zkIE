@@ -1,0 +1,4 @@
+9819ca70 Prove the tail relation instances in the second stage
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     | 105 ++++++++++++++++++
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 134 +++++++++++++++++++++++
+ 2 files changed, 239 insertions(+)
