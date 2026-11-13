@@ -1,0 +1,4 @@
+5794f907 Carry the clamp comparison rows in the tail layout
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     | 123 +++++++++++++++++++++--
+ crates/zkie-ops/src/proof/hidden_send_session.rs |  10 +-
+ 2 files changed, 121 insertions(+), 12 deletions(-)
