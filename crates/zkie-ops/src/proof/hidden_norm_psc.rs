@@ -68,6 +68,7 @@ pub(crate) const NORM_PSC_TAGS: PscTranscriptTags = PscTranscriptTags {
     hiding_sum: 50,
     round: 51,
     end: 52,
+    claim: 53,
 };
 /// Transcript tags of the pointwise product instances, distinct from the
 /// relation transcript tags.
@@ -76,6 +77,7 @@ pub(crate) const NORM_OUTPUT_PSC_TAGS: PscTranscriptTags = PscTranscriptTags {
     hiding_sum: 60,
     round: 61,
     end: 62,
+    claim: 68,
 };
 /// The prefix tag of the pointwise column point.
 pub(crate) const NORM_OUTPUT_POINT_TAG: u64 = 63;
@@ -88,6 +90,7 @@ pub(crate) const NORM_TAIL_PSC_TAGS: PscTranscriptTags = PscTranscriptTags {
     hiding_sum: 64,
     round: 65,
     end: 66,
+    claim: 69,
 };
 /// Version of the pointwise transcript section.
 pub const NORM_OUTPUT_PSC_VERSION: u64 = 1;
@@ -1856,9 +1859,10 @@ impl NormLookupPlan {
 }
 
 /// The digit cells of one tail column: quotient, remainder, doubled remainder,
-/// tie slack, shifted value, pre-clamp value and the two clamp distance rows.
-/// The selectors are excluded because the booleanity and sign-consistency
-/// relations force them to zero or one.
+/// tie slack, shifted value, pre-clamp value, the two clamp distance rows and
+/// the four clamp slack rows (strict and non-strict per side). The selectors
+/// are excluded because the booleanity and sign-consistency relations force
+/// them to zero or one once every slack word is a byte.
 pub fn tail_digit_groups(tail: &NormOutputTailPlan) -> Result<Vec<(usize, usize)>> {
     let clamp = tail.clamp.as_ref().ok_or(Error::InvalidConfig)?;
     let widths = &tail.widths;
@@ -1870,6 +1874,11 @@ pub fn tail_digit_groups(tail: &NormOutputTailPlan) -> Result<Vec<(usize, usize)
     let pre_at = sh_at + widths.shifted;
     let low_at = pre_at + widths.pre_clamp;
     let high_at = low_at + clamp.low;
+    let low_selector = high_at + clamp.high;
+    let low_strict_at = low_selector + 2;
+    let low_nonstrict_at = low_strict_at + clamp.low_strict;
+    let high_strict_at = low_nonstrict_at + clamp.low_nonstrict;
+    let high_nonstrict_at = high_strict_at + clamp.high_strict;
     Ok(vec![
         (q_at, widths.quotient),
         (r_at, widths.remainder),
@@ -1879,6 +1888,10 @@ pub fn tail_digit_groups(tail: &NormOutputTailPlan) -> Result<Vec<(usize, usize)
         (pre_at, widths.pre_clamp),
         (low_at, clamp.low),
         (high_at, clamp.high),
+        (low_strict_at, clamp.low_strict),
+        (low_nonstrict_at, clamp.low_nonstrict),
+        (high_strict_at, clamp.high_strict),
+        (high_nonstrict_at, clamp.high_nonstrict),
     ])
 }
 

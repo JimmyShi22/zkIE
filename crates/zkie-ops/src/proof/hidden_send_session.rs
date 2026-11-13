@@ -12542,6 +12542,7 @@ fn prove_norm_second(
                             crate::proof::hidden_norm_psc::NORM_OUTPUT_PSC_TAGS,
                             instance as u64,
                         );
+                    challenges.send_claim(sent)?;
                     let (proof, checked) = crate::proof::psc_general::prove_general(
                         &variables,
                         &claim_masks,
@@ -12834,6 +12835,7 @@ fn verify_norm_second(
                             crate::proof::hidden_norm_psc::NORM_OUTPUT_PSC_TAGS,
                             instance as u64,
                         );
+                    challenges.send_claim(claim)?;
                     let claim_slot = mask_plan.claim_slot(instances, instance)?;
                     let claim_masks = [crate::proof::psc_general::MaskTerm {
                         slot: claim_slot,
@@ -22961,6 +22963,21 @@ mod merged_tests {
         assert_eq!(lookup_plan.key_groups[1].oracle_base, tail_group.oracle_base);
         assert_eq!(lookup_plan.key_groups[1].shape, tail_group.shape);
         assert_eq!(lookup_plan.key_groups[1].columns, tail_group.columns);
+        let tail_plan = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .tail
+            .as_ref()
+            .unwrap()
+            .clone();
+        let digit_groups = crate::proof::hidden_norm_psc::tail_digit_groups(&tail_plan).unwrap();
+        assert_eq!(digit_groups.len(), 12);
+        let tail_width: usize = digit_groups.iter().map(|(_, width)| *width).sum();
+        let norm_columns = usize::try_from(plan.norm.as_ref().unwrap().columns).unwrap();
         let positions = plan.norm.as_ref().unwrap().shape.positions as u64;
         let within = |source: &crate::proof::lookup::LookupKeySource, base: u64| {
             source.oracle >= base && source.oracle < base.saturating_add(positions)
@@ -22973,13 +22990,16 @@ mod merged_tests {
                 .any(|source| within(source, round_group.oracle_base)),
             "the lookup keys must cover the rounding digits"
         );
-        assert!(
-            lookup_plan
-                .key
-                .sources
-                .iter()
-                .any(|source| within(source, tail_group.oracle_base)),
-            "the lookup keys must cover the tail digits"
+        let tail_sources = lookup_plan
+            .key
+            .sources
+            .iter()
+            .filter(|source| within(source, tail_group.oracle_base))
+            .count();
+        assert_eq!(
+            tail_sources,
+            positions as usize * norm_columns * tail_width,
+            "the lookup keys must cover every tail digit cell"
         );
 
         let (messages, hidden_witness) = prove_hidden_lin_hidden_with_norm_and_params(
@@ -24997,6 +25017,341 @@ mod merged_tests {
         }
     }
 
+    fn clamp_attack_fixture(
+        activation: &CommittedActivation,
+        low: i64,
+        high: i64,
+        column: usize,
+        coin: u8,
+    ) -> (HiddenLinPlan, NormWitness, ParamTables) {
+        use crate::proof::output_closure::fp3_signed;
+
+        let (plan, witness, params) = clamp_boundary_fixture(activation, low, high);
+        let output_plan = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .clone();
+        let tail_plan = output_plan.tail.clone().unwrap();
+        let clamp = tail_plan.clamp.clone().unwrap();
+        let groups = crate::proof::hidden_norm_psc::tail_digit_groups(&tail_plan).unwrap();
+        let high_at = groups[7].0;
+        let low_selector = high_at + clamp.high;
+        let low_strict_at = groups[8].0;
+        let low_nonstrict_at = groups[9].0;
+        let high_strict_at = groups[10].0;
+        let high_nonstrict_at = groups[11].0;
+        let slots = tail_plan.slots().unwrap();
+        let mut changed = witness;
+        let mut values = group_slots(
+            &tail_plan.group.shape,
+            &changed
+                .output
+                .as_ref()
+                .unwrap()
+                .tail
+                .as_ref()
+                .unwrap()
+                .committed
+                .messages,
+            tail_plan.group.columns,
+        );
+        let base = column * slots;
+        let pre = changed.output.as_ref().unwrap().rows[0].pre_clamp[column];
+        let u = pre - low as i128;
+        let v = pre - high as i128;
+        let selector = if u < 0 { low_selector } else { low_selector + 1 };
+        values[0][base + selector] = Fp3::from_u64(2);
+        if u < 0 {
+            // Relation 7: alpha = -u - 1 must hold; relation 8: beta = u as a
+            // field element, which is not a byte when u is negative.
+            for digit in 0..clamp.low_strict {
+                values[0][base + low_strict_at + digit] = Fp3::ZERO;
+            }
+            values[0][base + low_strict_at] = fp3_signed(-u - 1).unwrap();
+            for digit in 0..clamp.low_nonstrict {
+                values[0][base + low_nonstrict_at + digit] = Fp3::ZERO;
+            }
+            values[0][base + low_nonstrict_at] = fp3_signed(u).unwrap();
+        } else {
+            // Relation 9: alpha = v - 1; relation 10: beta = -v as a field
+            // element, which is not a byte when v is positive.
+            for digit in 0..clamp.high_strict {
+                values[0][base + high_strict_at + digit] = Fp3::ZERO;
+            }
+            values[0][base + high_strict_at] = fp3_signed(v - 1).unwrap();
+            for digit in 0..clamp.high_nonstrict {
+                values[0][base + high_nonstrict_at + digit] = Fp3::ZERO;
+            }
+            values[0][base + high_nonstrict_at] = fp3_signed(-v).unwrap();
+        }
+        let mut coins = ByteMaskCoins::new(Digest([coin; 32])).unwrap();
+        let tampered = commit_norm_group(&tail_plan.group, &values, &mut coins);
+        changed
+            .output
+            .as_mut()
+            .unwrap()
+            .tail
+            .as_mut()
+            .unwrap()
+            .committed = tampered;
+        // Relation 5 with the flipped selector: out = pre - selector * distance.
+        let out_star = if u < 0 {
+            pre - 2 * u
+        } else {
+            pre - 2 * v
+        };
+        let mut out_values = group_slots(
+            &output_plan.out.shape,
+            &changed.output.as_ref().unwrap().out.committed.messages,
+            output_plan.out.columns,
+        );
+        out_values[0][column] = fp3_signed(out_star).unwrap();
+        let mut coins = ByteMaskCoins::new(Digest([coin.wrapping_add(1); 32])).unwrap();
+        let tampered = commit_norm_group(&output_plan.out, &out_values, &mut coins);
+        changed.output.as_mut().unwrap().out.committed = tampered.committed;
+        changed.output.as_mut().unwrap().rows[0].out[column] =
+            i64::try_from(out_star).unwrap();
+        (plan, changed, params)
+    }
+
+    #[test]
+    fn norm_malicious_clamp_selector_attack_is_rejected() {
+        let activation = activation();
+        let (_, base, _) = norm_output_fixture(&activation);
+        let pre = base.output.as_ref().unwrap().rows[0].pre_clamp[0];
+        let pre = i64::try_from(pre).unwrap();
+        let cases = [
+            ("the low selector attack", (pre + 2, pre + 3)),
+            ("the high selector attack", (pre - 3, pre - 2)),
+        ];
+        for (index, (context, (low, high))) in cases.iter().enumerate() {
+            let (plan, witness, mut params) = clamp_attack_fixture(
+                &activation,
+                *low,
+                *high,
+                0,
+                0xd4 + index as u8,
+            );
+            let mut table = table();
+            let proved = prove_hidden_lin_hidden_with_norm_and_params(
+                &plan,
+                &activation,
+                &mut table,
+                Digest([0x71; 32]),
+                &witness,
+                &mut params,
+            );
+            match proved {
+                Err(_) => {}
+                Ok((messages, hidden_witness)) => {
+                    let mut verifier_plan = plan.clone();
+                    verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+                    assert!(
+                        verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &messages)
+                            .is_err(),
+                        "{context} must not verify"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn norm_malicious_padding_selector_attack_is_rejected() {
+        let activation = activation();
+        let (plan, _, _) = slack_lookup_fixture(&activation);
+        let valid = usize::try_from(plan.norm.as_ref().unwrap().shape.valid).unwrap();
+        let low = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .clamp
+            .unwrap()
+            .0;
+        let high = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .clamp
+            .unwrap()
+            .1;
+        let (plan, witness, mut params) =
+            clamp_attack_fixture(&activation, low, high, valid, 0xd8);
+        let mut table = table();
+        let proved = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+            &mut params,
+        );
+        match proved {
+            Err(_) => {}
+            Ok((messages, hidden_witness)) => {
+                let mut verifier_plan = plan.clone();
+                verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+                assert!(
+                    verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &messages).is_err(),
+                    "a flipped clamp selector on a padding column must not verify"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn norm_malicious_slack_digit_out_of_byte_is_rejected() {
+        let activation = activation();
+        let (base_plan, _, _) = slack_lookup_fixture(&activation);
+        let tail_plan = base_plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .tail
+            .as_ref()
+            .unwrap()
+            .clone();
+        let groups = crate::proof::hidden_norm_psc::tail_digit_groups(&tail_plan).unwrap();
+        for (index, (context, at)) in [
+            ("a low strict slack digit that is not a byte", groups[8].0),
+            ("a low non strict slack digit that is not a byte", groups[9].0),
+            ("a high strict slack digit that is not a byte", groups[10].0),
+            ("a high non strict slack digit that is not a byte", groups[11].0),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (plan, witness, mut params) =
+                tampered_tail_digits_fixture(&activation, *at, 300, 0xdc + index as u8);
+            rejects_malicious_witness(&activation, &plan, &witness, &mut params, context);
+        }
+    }
+    fn lookup_bits_skipping_foreign_keys(
+        plan: &crate::proof::lookup::LookupPlan,
+        keys: &[Fp3],
+    ) -> Vec<Fp3> {
+        let planes = plan.planes().unwrap();
+        let rows = plan.table_rows().unwrap();
+        let mut counts = vec![0u64; rows];
+        for key in keys {
+            for (row, count) in counts.iter_mut().enumerate() {
+                if *key == Fp3::from_u64(row as u64) {
+                    *count += 1;
+                    break;
+                }
+            }
+        }
+        let mut bits = vec![Fp3::ZERO; planes * rows];
+        for row in 0..rows {
+            for plane in 0..planes {
+                if (counts[row] >> plane) & 1 == 1 {
+                    bits[plane + planes * row] = Fp3::ONE;
+                }
+            }
+        }
+        bits
+    }
+
+    #[test]
+    fn norm_malicious_slack_key_cannot_pass_the_byte_lookup() {
+        use crate::proof::lookup::{
+            prove_lookup_with_key_values, verify_lookup, ByteTable, LookupWitness,
+        };
+        use crate::proof::lookup_messages::{
+            commit_lookup, LookupRandomSource, LookupRoots,
+        };
+
+        let activation = activation();
+        let (plan, witness, _) = slack_lookup_fixture(&activation);
+        let norm = plan.norm.as_ref().unwrap();
+        let lookup_plan = norm.lookup.as_ref().unwrap();
+        let tail_plan = norm
+            .output
+            .as_ref()
+            .unwrap()
+            .tail
+            .as_ref()
+            .unwrap()
+            .clone();
+        let groups = crate::proof::hidden_norm_psc::tail_digit_groups(&tail_plan).unwrap();
+        let low_nonstrict_at = groups[9].0;
+        let round_rows = witness.round.as_ref().unwrap().committed.messages.clone();
+        let mut tail_rows = witness
+            .output
+            .as_ref()
+            .unwrap()
+            .tail
+            .as_ref()
+            .unwrap()
+            .committed
+            .messages
+            .clone();
+        let tail_rows_in_group = usize::try_from(tail_plan.group.shape.main_rows).unwrap();
+        let ell = usize::try_from(tail_plan.group.shape.code.ell).unwrap();
+        let slot = low_nonstrict_at;
+        let row = slot % tail_rows_in_group;
+        let place = slot / tail_rows_in_group;
+        assert!(place < ell);
+        tail_rows[0][row][place] =
+            crate::proof::output_closure::fp3_signed(-2).unwrap();
+        let keys = norm_lookup_key_values(norm, lookup_plan, &round_rows, &tail_rows).unwrap();
+        let bits = lookup_bits_skipping_foreign_keys(&lookup_plan.lookup, &keys);
+        let mask_entries = crate::proof::lookup::mask_count(&lookup_plan.lookup).unwrap();
+        let mut source = LookupRandomSource::new(11);
+        let messages = commit_lookup(
+            &lookup_plan.commit,
+            &bits,
+            mask_entries,
+            &mut source,
+        )
+        .unwrap();
+        let seed = 23u64;
+        let proved = prove_lookup_with_key_values(
+            &lookup_plan.lookup,
+            &lookup_plan.commit,
+            &lookup_plan.key,
+            &keys,
+            &LookupWitness { bits },
+            &messages,
+            &ByteTable,
+            seed,
+        );
+        match proved {
+            Err(_) => {}
+            Ok((proof, _)) => {
+                let roots = LookupRoots {
+                    bits: messages.bits_root(),
+                    mask: messages.mask_root,
+                };
+                assert!(
+                    verify_lookup(
+                        &lookup_plan.lookup,
+                        &lookup_plan.commit,
+                        &lookup_plan.key,
+                        &roots,
+                        &proof,
+                        &ByteTable,
+                        seed,
+                    )
+                    .is_err(),
+                    "a non-byte slack key must not pass the byte lookup"
+                );
+            }
+        }
+    }
     #[test]
     fn norm_output_groups_prove_and_verify() {
         let activation = activation();

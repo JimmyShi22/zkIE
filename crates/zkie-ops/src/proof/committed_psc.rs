@@ -410,6 +410,9 @@ pub struct PscTranscriptTags {
     pub hiding_sum: u64,
     pub round: u64,
     pub end: u64,
+    /// The masked claim of a general sumcheck, absorbed before the first
+    /// challenge that multiplies the target.
+    pub claim: u64,
 }
 
 /// One position's chain-backed challenge source. The position is part of
@@ -427,6 +430,25 @@ impl<'a> PositionPscChallenges<'a> {
             tags,
             position,
         }
+    }
+}
+
+impl PositionPscChallenges<'_> {
+    /// Absorbs the masked claim before the first sumcheck challenge. The
+    /// general sumcheck's first challenge multiplies the target, so every
+    /// value that enters the target must be fixed in the transcript first.
+    pub fn send_claim(&mut self, value: Fp3) -> Result<()> {
+        let mut message = self.chain.message();
+        message.push_u64(self.tags.version);
+        message.push_u64(self.tags.claim);
+        message.push_u64(self.position);
+        message.push_fp3(&value);
+        let prefix =
+            message.prefix(zkie_engine::pcs::request::chain::KIND_ALGEBRAIC, 0)?;
+        if !self.chain.step(&prefix, 0)? {
+            return Err(Error::InvalidProof);
+        }
+        Ok(())
     }
 }
 
@@ -776,6 +798,7 @@ mod tests {
             hiding_sum: 20,
             round: 21,
             end: 22,
+            claim: 23,
         };
         let mut first = Chain::begin(41, &Digest::ZERO, b"committed psc", &[], None).unwrap();
         let first = run_challenges(&mut first, tags, 0);
@@ -792,6 +815,110 @@ mod tests {
             ..tags
         };
         assert_ne!(first, run_challenges(&mut other_tags, changed, 0));
+    }
+
+    #[test]
+    fn claim_absorption_precedes_the_first_challenge() {
+        use crate::proof::psc::Weight;
+        use crate::proof::psc_general::{
+            general_masks, general_variables, prove_general, verify_general,
+            GeneralMaskEntries, Summand, WeightedProductInner,
+        };
+
+        let z = [Fp3::from_u64(2), Fp3::from_u64(3)];
+        let x = [1u64, 2, 3, 4].map(Fp3::from_u64);
+        let omega = [5u64, 6, 7, 8].map(Fp3::from_u64);
+        let eq = |value: Fp3, bit: bool| {
+            if bit {
+                value
+            } else {
+                Fp3::ONE.sub(&value)
+            }
+        };
+        let mut target = Fp3::ZERO;
+        for index in 0..4 {
+            let factor = eq(z[0], index & 1 == 1).mul(&eq(z[1], index & 2 == 2));
+            target = target.add(&factor.mul(&x[index]).mul(&omega[index]));
+        }
+        let variables = [
+            Weight::equality(z[0], 3).unwrap(),
+            Weight::equality(z[1], 3).unwrap(),
+        ];
+        let entries = crate::proof::psc::hp_entries(
+            &general_variables(&variables, &Summand::Product).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            entries + 2,
+            general_masks(&Summand::Product, &variables).unwrap()
+        );
+        let hiding = (0..entries)
+            .map(|index| Fp3::from_u64(100 + index as u64))
+            .collect::<Vec<_>>();
+        let masks = GeneralMaskEntries {
+            hiding,
+            shown: vec![Fp3::from_u64(200), Fp3::from_u64(201)],
+        };
+        let tags = PscTranscriptTags {
+            version: 1,
+            hiding_sum: 60,
+            round: 61,
+            end: 62,
+            claim: 63,
+        };
+        let mut inner = WeightedProductInner::new(&x, &omega, &z).unwrap();
+        let mut prover_chain =
+            Chain::begin(88, &Digest::ZERO, b"claim order", &[], None).unwrap();
+        let mut prover = PositionPscChallenges::new(&mut prover_chain, tags, 0);
+        prover.send_claim(target).unwrap();
+        let (proof, proven) = prove_general(
+            &variables,
+            &[],
+            &|_| Ok(Fp3::ZERO),
+            target,
+            &Summand::Product,
+            None,
+            &mut inner,
+            &masks,
+            &mut prover,
+        )
+        .unwrap();
+
+        let mut verifier_chain =
+            Chain::begin(88, &Digest::ZERO, b"claim order", &[], None).unwrap();
+        let mut verifier = PositionPscChallenges::new(&mut verifier_chain, tags, 0);
+        verifier.send_claim(target).unwrap();
+        let verified = verify_general(
+            &variables,
+            &[],
+            target,
+            &Summand::Product,
+            None,
+            &proof,
+            masks.hiding.len(),
+            &mut verifier,
+        )
+        .unwrap();
+        assert_eq!(proven, verified);
+
+        // The old form leaves the claim out of the pre-challenge transcript:
+        // the challenges differ, so the verifier derives a different output
+        // claim set. In the chain the committed claim binding then rejects it.
+        let mut old_chain =
+            Chain::begin(88, &Digest::ZERO, b"claim order", &[], None).unwrap();
+        let mut old = PositionPscChallenges::new(&mut old_chain, tags, 0);
+        let replayed = verify_general(
+            &variables,
+            &[],
+            target,
+            &Summand::Product,
+            None,
+            &proof,
+            masks.hiding.len(),
+            &mut old,
+        )
+        .unwrap();
+        assert_ne!(proven, replayed);
     }
 
     #[test]

@@ -101,6 +101,7 @@ const CLOSURE_PSC_TAGS: PscTranscriptTags = PscTranscriptTags {
     hiding_sum: CLOSURE_HIDING_SUM_TAG,
     round: CLOSURE_ROUND_TAG,
     end: CLOSURE_END_TAG,
+    claim: 23,
 };
 
 /// The trusted plan of the mask-only closure message. Its rows carry the
