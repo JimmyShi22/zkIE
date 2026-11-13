@@ -21398,6 +21398,7 @@ mod merged_tests {
             out: group(93, 20_300, 61_300),
             shift: 3,
             clamp: Some((-1_000, 1_000)),
+            tail: None,
         }
     }
 

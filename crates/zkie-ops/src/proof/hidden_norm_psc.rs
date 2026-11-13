@@ -1033,7 +1033,7 @@ fn fp3_signed(value: i128) -> Result<Fp3> {
 // sumcheck and the row binding.
 
 /// Version of the integrated norm plan and first message.
-pub const NORM_BIND_VERSION: u64 = 10;
+pub const NORM_BIND_VERSION: u64 = 11;
 
 /// The relation indices the bound core supports. The map construction of
 /// every relation is fixed by the relation index; the plan may list only
@@ -2454,6 +2454,108 @@ pub struct NormParamClaimWitness {
     pub salts: Vec<Vec<u8>>,
 }
 
+/// The fixed byte widths of the output tail witness rows. The quotient,
+/// shifted and pre-clamp values are carried as offset digit rows; the
+/// remainder is nonnegative and bounded by the shift divisor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NormOutputTailWidths {
+    pub quotient: usize,
+    pub remainder: usize,
+    pub shifted: usize,
+    pub pre_clamp: usize,
+}
+
+impl NormOutputTailWidths {
+    pub fn fault(&self, shift: u32) -> Option<&'static str> {
+        for width in [self.quotient, self.remainder, self.shifted, self.pre_clamp] {
+            if width == 0 || width > 7 {
+                return Some("an output tail width is out of range");
+            }
+            if digit_bound(width).ok()? >= MODULUS as u128 {
+                return Some("an output tail width does not fit the modulus");
+            }
+        }
+        if shift >= 63 {
+            return Some("the output shift is too large");
+        }
+        let divisor = 1u128 << shift;
+        if digit_bound(self.remainder).ok()? + 1 < divisor {
+            return Some("the remainder width does not cover the shift divisor");
+        }
+        None
+    }
+
+    /// The slots of one column: quotient, remainder, half selector, shifted
+    /// value and pre-clamp value.
+    pub fn slots(&self) -> Result<usize> {
+        self.quotient
+            .checked_add(self.remainder)
+            .and_then(|value| value.checked_add(1))
+            .and_then(|value| value.checked_add(self.shifted))
+            .and_then(|value| value.checked_add(self.pre_clamp))
+            .ok_or(Error::ResourceLimit)
+    }
+
+    pub fn columns(&self) -> Result<u64> {
+        u64::try_from(self.slots()?)
+            .ok()
+            .and_then(|value| value.checked_next_power_of_two())
+            .ok_or(Error::ResourceLimit)
+    }
+}
+
+/// The trusted plan of the output tail witness rows: the quotient, remainder,
+/// half selector, shifted value and pre-clamp value of every column, with the
+/// byte widths of their digit rows. The shift and clamp are the output plan's
+/// trusted values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormOutputTailPlan {
+    pub group: NormGroupPlan,
+    pub widths: NormOutputTailWidths,
+}
+
+impl NormOutputTailPlan {
+    fn validate(&self, output: &NormOutputPlan, plan: &NormPlan) -> Result<()> {
+        if self.widths.fault(output.shift).is_some() {
+            return Err(Error::InvalidConfig);
+        }
+        if self.group.columns != self.widths.columns()?
+            || self.group.fault(plan.shape.positions).is_some()
+            || self.group.shape.answers != 1
+        {
+            return Err(Error::InvalidConfig);
+        }
+        let mut bases = vec![
+            plan.x.oracle_base,
+            plan.sum.oracle_base,
+            plan.squares.oracle_base,
+            plan.mean.oracle_base,
+            plan.variance.oracle_base,
+            output.broadcast.oracle_base,
+            output.product.oracle_base,
+            output.image.oracle_base,
+            output.out.oracle_base,
+            self.group.oracle_base,
+        ];
+        if let Some(round) = &plan.round {
+            bases.push(round.group.oracle_base);
+        }
+        bases.sort_unstable();
+        if bases.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(())
+    }
+
+    fn encode_into(&self, writer: &mut CanonicalWriter) {
+        put_norm_group(writer, &self.group);
+        writer.put_u64(self.widths.quotient as u64);
+        writer.put_u64(self.widths.remainder as u64);
+        writer.put_u64(self.widths.shifted as u64);
+        writer.put_u64(self.widths.pre_clamp as u64);
+    }
+}
+
 /// The trusted plan of the norm output tail. The first three groups are the
 /// committed column vectors the two pointwise products chain through; the out
 /// group is the hd object the next layer consumes.
@@ -2471,6 +2573,8 @@ pub struct NormOutputPlan {
     pub shift: u32,
     /// The optional clamp interval of the runtime op.
     pub clamp: Option<(i64, i64)>,
+    /// The committed witness rows of the rounding, bias and clamp tail.
+    pub tail: Option<NormOutputTailPlan>,
 }
 
 impl NormOutputPlan {
@@ -2511,6 +2615,9 @@ impl NormOutputPlan {
         if bases.iter().any(|base| others.contains(base)) {
             return Err(Error::InvalidConfig);
         }
+        if let Some(tail) = &self.tail {
+            tail.validate(self, plan)?;
+        }
         Ok(())
     }
 
@@ -2525,6 +2632,13 @@ impl NormOutputPlan {
                 writer.put_u64(1);
                 writer.put_u64(low as u64);
                 writer.put_u64(high as u64);
+            }
+            None => writer.put_u64(0),
+        }
+        match &self.tail {
+            Some(tail) => {
+                writer.put_u64(1);
+                tail.encode_into(writer);
             }
             None => writer.put_u64(0),
         }
@@ -5174,6 +5288,7 @@ mod tests {
             out: group(703, 7300),
             shift: 4,
             clamp: Some((-5, 5)),
+            tail: None,
         };
         let digest = plan.digest();
         plan.output = Some(output);
@@ -5196,6 +5311,74 @@ mod tests {
         let base = changed.output.as_ref().unwrap().broadcast.oracle_base;
         changed.output.as_mut().unwrap().product.oracle_base = base;
         assert!(changed.validate().is_err());
+
+        let widths = NormOutputTailWidths {
+            quotient: 3,
+            remainder: 2,
+            shifted: 3,
+            pre_clamp: 3,
+        };
+        let tail_columns = widths.columns().unwrap();
+        assert_eq!(tail_columns, 16);
+        let tail_group = NormGroupPlan {
+            shape: WShape::new(
+                tail_columns,
+                code(),
+                1,
+                2,
+                LEAF_SALT_MIN_BYTES,
+                704,
+                1,
+                Digest([0x42; 32]),
+                Digest([0x52; 32]),
+            )
+            .unwrap(),
+            columns: tail_columns,
+            group: 8,
+            oracle_base: 7400,
+            openings: 1,
+        };
+        let mut with_tail = plan.clone();
+        with_tail.output.as_mut().unwrap().tail = Some(NormOutputTailPlan {
+            group: tail_group.clone(),
+            widths,
+        });
+        with_tail.validate().unwrap();
+
+        let mut changed = with_tail.clone();
+        changed.output.as_mut().unwrap().tail.as_mut().unwrap().group.columns = 8;
+        assert!(changed.validate().is_err());
+
+        let mut changed = with_tail.clone();
+        changed.output.as_mut().unwrap().shift = 30;
+        assert!(changed.validate().is_err());
+
+        let mut changed = with_tail.clone();
+        let base = changed.output.as_ref().unwrap().out.oracle_base;
+        changed
+            .output
+            .as_mut()
+            .unwrap()
+            .tail
+            .as_mut()
+            .unwrap()
+            .group
+            .oracle_base = base;
+        assert!(changed.validate().is_err());
+
+        let mut changed = with_tail.clone();
+        changed
+            .output
+            .as_mut()
+            .unwrap()
+            .tail
+            .as_mut()
+            .unwrap()
+            .widths
+            .quotient = 8;
+        assert!(changed.validate().is_err());
+
+        assert!(widths.slots().unwrap() == 12);
     }
 
     #[test]
