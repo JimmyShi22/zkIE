@@ -11941,6 +11941,23 @@ fn draw_norm_output_point(chain: &mut Chain, instance: u64, bits: usize) -> Resu
     Ok(point)
 }
 
+/// Draws a tail-section point with its own prefix tag.
+fn draw_norm_tail_point(chain: &mut Chain, tag: u64, bits: usize) -> Result<Vec<Fp3>> {
+    let mut message = chain.message();
+    message.push_u64(crate::proof::hidden_norm_psc::NORM_PSC_VERSION);
+    message.push_u64(tag);
+    message.push_u64(0);
+    let prefix = message.prefix(KIND_SEED, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    let mut point = Vec::with_capacity(bits);
+    for _ in 0..bits {
+        point.push(chain.draw_e()?);
+    }
+    Ok(point)
+}
+
 /// The two committed column maps of one pointwise product instance: the
 /// broadcast row against the gain vector, or the centered row against the
 /// product row. The centered row is zero on non-valid columns.
@@ -12281,6 +12298,18 @@ fn prove_norm_second(
         (None, None) => (None, None),
         _ => return Err(Error::ShapeMismatch),
     };
+    let bias_point = match &tail_message {
+        Some(_) => {
+            let bits = usize::try_from(plan.columns.trailing_zeros())
+                .map_err(|_| Error::ResourceLimit)?;
+            Some(draw_norm_tail_point(
+                chain,
+                crate::proof::hidden_norm_psc::NORM_BIAS_POINT_TAG,
+                bits,
+            )?)
+        }
+        None => None,
+    };
     Ok((
         NormPscSecond {
             psc,
@@ -12296,6 +12325,7 @@ fn prove_norm_second(
             rstd,
             output: output_binding,
             tail: tail_bindings,
+            bias_point,
         },
     ))
 }
@@ -12543,12 +12573,25 @@ fn verify_norm_second(
         (None, None) => None,
         _ => return Err(Error::ShapeMismatch),
     };
+    let bias_point = match &tail_binding {
+        Some(_) => {
+            let bits = usize::try_from(plan.columns.trailing_zeros())
+                .map_err(|_| Error::ResourceLimit)?;
+            Some(draw_norm_tail_point(
+                chain,
+                crate::proof::hidden_norm_psc::NORM_BIAS_POINT_TAG,
+                bits,
+            )?)
+        }
+        None => None,
+    };
     Ok(NormRowBinding {
         positions: bindings,
         lookup: lookup_binding,
         rstd: rstd_binding,
         output: output_binding,
         tail: tail_binding,
+        bias_point,
     })
 }
 
@@ -14418,6 +14461,99 @@ fn output_tail_plain_rows(
     Ok(rows)
 }
 
+/// The BAT rows of the bias addition: `pre_clamp = shifted + bias` at one
+/// fresh point per position, with the bias evaluation taken from the
+/// parameter member and the public half-range offsets folded into the target.
+fn output_tail_bias_rows(
+    plan: &HiddenLinPlan,
+    members: &[ProximityMember],
+    point: &[Fp3],
+) -> Result<Vec<BatRow>> {
+    let norm = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
+    let output_plan = norm.output.as_ref().ok_or(Error::InvalidConfig)?;
+    let tail_plan = output_plan.tail.as_ref().ok_or(Error::InvalidConfig)?;
+    let params_plan = norm.params.as_ref().ok_or(Error::InvalidConfig)?;
+    let bias_claim = params_plan
+        .bias_claim
+        .as_ref()
+        .ok_or(Error::InvalidConfig)?;
+    let positions = norm.shape.positions as usize;
+    let columns = usize::try_from(norm.columns).map_err(|_| Error::ResourceLimit)?;
+    let slots = tail_plan.widths.slots()?;
+    let q_at = 0usize;
+    let r_at = tail_plan.widths.quotient;
+    let u_at = r_at + tail_plan.widths.remainder;
+    let w_at = u_at + tail_plan.widths.doubled_remainder;
+    let s_at = w_at + tail_plan.widths.tie_slack;
+    let sh_at = s_at + 1;
+    let pre_at = sh_at + tail_plan.widths.shifted;
+    let tail_rows = usize::try_from(tail_plan.group.shape.main_rows)
+        .map_err(|_| Error::ResourceLimit)?;
+    let tail_ell = usize::try_from(tail_plan.group.shape.code.ell)
+        .map_err(|_| Error::ResourceLimit)?;
+    let eq = crate::proof::output_closure::eq_vector(point)?;
+    if eq.len() != columns {
+        return Err(Error::ShapeMismatch);
+    }
+    let half_of = |width: usize| -> Result<u128> {
+        if width == 0 || width > 7 {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(1u128 << (8 * width as u32 - 1))
+    };
+    let field = |value: u128| -> Result<Fp3> {
+        Ok(Fp3::from_u64(
+            u64::try_from(value).map_err(|_| Error::BoundViolation)?,
+        ))
+    };
+    let target = field(half_of(tail_plan.widths.pre_clamp)?)?
+        .sub(&field(half_of(tail_plan.widths.shifted)?)?);
+    let bias_coefficients =
+        norm_param_eval_coefficients(&bias_claim.gu, norm.columns, point)?;
+    let negated: Vec<Fp3> = bias_coefficients
+        .iter()
+        .map(|value| Fp3::ZERO.sub(value))
+        .collect();
+    let mut bat_of = std::collections::HashMap::new();
+    for member in members {
+        bat_of.insert(member.source_oracle, member);
+    }
+    let member_for = |oracle: u64| -> Result<&ProximityMember> {
+        bat_of
+            .get(&oracle)
+            .copied()
+            .ok_or(Error::StatementMismatch)
+    };
+    let bias_member = member_for(bias_claim.gu.oracle)?;
+    let mut rows = Vec::with_capacity(positions);
+    for position in 0..positions {
+        let tail_member = member_for(tail_plan.group.oracle_base + position as u64)?;
+        let mut coefficients = vec![Fp3::ZERO; tail_rows * tail_ell];
+        for column in 0..columns {
+            let weight = eq[column];
+            let base = column * slots;
+            let mut power = weight;
+            for digit in 0..tail_plan.widths.pre_clamp {
+                let at = base + pre_at + digit;
+                coefficients[at] = coefficients[at].add(&power);
+                power = power.mul(&Fp3::from_u64(256));
+            }
+            let mut power = weight;
+            for digit in 0..tail_plan.widths.shifted {
+                let at = base + sh_at + digit;
+                coefficients[at] = coefficients[at].sub(&power);
+                power = power.mul(&Fp3::from_u64(256));
+            }
+        }
+        let mut row = BatRow::new(BatRowKind::Plain);
+        row.add_term(tail_member.bat_oracle, BatPart::Main, coefficients);
+        row.add_term(bias_member.bat_oracle, BatPart::Main, negated.clone());
+        row.target = target;
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
 fn own_plain_rows(
     plan: &HiddenLinPlan,
     members: &[ProximityMember],
@@ -14554,6 +14690,9 @@ fn own_plain_rows(
         }
         if let Some(tail) = &binding.tail {
             rows.extend(output_tail_plain_rows(plan, members, first, tail)?);
+        }
+        if let Some(point) = &binding.bias_point {
+            rows.extend(output_tail_bias_rows(plan, members, point)?);
         }
         let norm_plan = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
         if let Some(lookup) = &binding.lookup {

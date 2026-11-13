@@ -79,6 +79,8 @@ pub(crate) const NORM_OUTPUT_PSC_TAGS: PscTranscriptTags = PscTranscriptTags {
 };
 /// The prefix tag of the pointwise column point.
 pub(crate) const NORM_OUTPUT_POINT_TAG: u64 = 63;
+/// The prefix tag of the bias addition point.
+pub(crate) const NORM_BIAS_POINT_TAG: u64 = 67;
 /// Transcript tags of the tail relation instances, distinct from the relation
 /// and pointwise tags.
 pub(crate) const NORM_TAIL_PSC_TAGS: PscTranscriptTags = PscTranscriptTags {
@@ -3391,6 +3393,8 @@ pub struct NormRowBinding {
     /// The checked tail relation instances, when the plan carries the tail
     /// section.
     pub tail: Option<Vec<NormTailBinding>>,
+    /// The bias addition point, when the plan carries the tail section.
+    pub bias_point: Option<Vec<Fp3>>,
 }
 
 /// One checked tail relation instance.
