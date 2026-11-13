@@ -1,0 +1,19 @@
+commit b7e5114bca739b2b4c08baa92ed4fe3028627b10
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Fri Nov 13 15:05:37 2026 +0800
+
+    Add the output tail plan for the norm groups
+    
+    The norm plan can carry the four output tail groups and the runtime rounding
+    parameters: the broadcast rstd row, the pointwise product row, the centered
+    image row and the output hd row, with the output shift and the optional clamp
+    interval. Validation binds every group to the padded column domain, requires
+    distinct oracle bases against each other and the five norm groups, and checks
+    the shift and clamp bounds. The plan digest absorbs the section and the bind
+    version moves to 8. A plan test checks the binding and the rejections.
+    
+    partial progress
+
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     | 200 ++++++++++++++++++++++-
+ crates/zkie-ops/src/proof/hidden_send_session.rs |   2 +
+ 2 files changed, 201 insertions(+), 1 deletion(-)
