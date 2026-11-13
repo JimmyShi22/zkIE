@@ -1,0 +1,3 @@
+21773d0e Register the expanded lookup key claim on its members (partial progress)
+ crates/zkie-ops/src/proof/lookup.rs | 90 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 90 insertions(+)
