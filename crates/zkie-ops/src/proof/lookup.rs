@@ -22,9 +22,11 @@
 use zkie_core::common::field::PrimeField64;
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
+use zkie_engine::pcs::request::bat::{BatPart, BatRow, BatRowKind};
 use zkie_engine::pcs::request::field::Fp3;
 use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
 
+use crate::proof::hidden_send_session::WShape;
 use crate::proof::lookup_messages::{
     commit_lookup, LookupCommitPlan, LookupMessages, LookupRandomSource, LookupRoots,
 };
@@ -242,6 +244,65 @@ impl LookupKeyPlan {
             masks: claim.masks.clone(),
             value: claim.value,
         })
+    }
+}
+
+/// The physical member a key source is registered on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyClaimMember {
+    pub source_oracle: u64,
+    pub bat_oracle: u64,
+    pub shape: WShape,
+    pub columns: u64,
+}
+
+impl LookupKeyPlan {
+    /// Builds the actual BAT row that carries the expanded key claim. Each
+    /// source term is written on its physical member table; the public
+    /// constant is moved into the target and every mask term becomes a unit
+    /// on the mask member. The verifier builds the same row from the same
+    /// plan and claim.
+    pub fn registration_row(
+        &self,
+        plan: &LookupPlan,
+        claim: &GeneralClaim,
+        members: &[KeyClaimMember],
+        mask_bat_oracle: u64,
+        mask_index: &dyn Fn(usize) -> Result<u64>,
+    ) -> Result<BatRow> {
+        let expansion = self.expand_claim(plan, claim)?;
+        let mut row = BatRow::new(BatRowKind::Plain);
+        for member in members {
+            let rows = usize::try_from(member.shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+            let ell = usize::try_from(member.shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+            let mut values = vec![Fp3::ZERO; rows * ell];
+            let mut used = false;
+            for term in &expansion.terms {
+                if term.oracle != member.source_oracle {
+                    continue;
+                }
+                let index = (term.row as usize)
+                    .checked_mul(ell)
+                    .and_then(|base| base.checked_add(term.place as usize))
+                    .ok_or(Error::ResourceLimit)?;
+                let entry = values.get_mut(index).ok_or(Error::ShapeMismatch)?;
+                *entry = entry.add(&term.coefficient);
+                used = true;
+            }
+            if used {
+                row.add_term(member.bat_oracle, BatPart::Main, values);
+            }
+        }
+        for mask in &expansion.masks {
+            row.add_unit(
+                mask_bat_oracle,
+                BatPart::Mask,
+                mask_index(mask.slot)?,
+                mask.coefficient,
+            );
+        }
+        row.target = expansion.value.sub(&expansion.constant);
+        Ok(row)
     }
 }
 
@@ -1292,6 +1353,35 @@ mod tests {
 
     fn key_rows(keys: &[u64]) -> Vec<Vec<Vec<Fp3>>> {
         vec![vec![keys.iter().map(|key| Fp3::from_u64(*key)).collect()]]
+    }
+
+    #[test]
+    fn key_claim_registers_one_row_on_its_member() {
+        let plan = plan();
+        let keys = [0u64, 1, 2];
+        let mut key_plan = key_plan(&keys);
+        key_plan.sources[0].coefficient = Fp3::from_u64(2);
+        key_plan.sources[0].offset = Fp3::from_u64(3);
+        key_plan.sources.truncate(1);
+        key_plan.padding_value = Fp3::ZERO;
+        let point = [Fp3::from_u64(5), Fp3::from_u64(7)];
+        let cell = Fp3::from_u64(11);
+        let eq = eq_weights(&point);
+        let value = eq[0].mul(&Fp3::from_u64(2).mul(&cell).add(&Fp3::from_u64(3)));
+        let claim = GeneralClaim { point: point.to_vec(), value, masks: Vec::new() };
+        let member = KeyClaimMember {
+            source_oracle: 900,
+            bat_oracle: 77,
+            shape: WShape::new(4, build_code_plan(4, 8, 1).unwrap(), 1, 1, 40, 700, 1, Digest([0x41; 32]), Digest([0x51; 32])).unwrap(),
+            columns: 4,
+        };
+        let row = key_plan
+            .registration_row(&plan, &claim, &[member], 88, &|slot| Ok(slot as u64))
+            .unwrap();
+        assert_eq!(row.terms.len(), 1);
+        assert_eq!(row.terms[0].oracle, 77);
+        assert_eq!(row.terms[0].values[0], eq[0].mul(&Fp3::from_u64(2)));
+        assert_eq!(row.target, value.sub(&eq[0].mul(&Fp3::from_u64(3))));
     }
 
     #[test]
