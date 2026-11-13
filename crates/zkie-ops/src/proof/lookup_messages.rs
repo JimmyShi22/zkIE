@@ -1,10 +1,11 @@
 //! Committed messages and roots for the byte lookup.
 //!
-//! The lookup plan fixes the key-message shape, the multiplicity-bit-message
-//! shape and the mask-only message shape. This module commits one key message,
-//! one multiplicity-bit message and one mask message from private encoding
-//! material, returns their roots before any lookup challenge is drawn, and
-//! exposes the mask entries by slot. Opening sampling and the ledger entries are
+//! The lookup plan fixes the multiplicity-bit-message shape and the mask-only
+//! message shape. This module commits one multiplicity-bit message and one mask
+//! message from private encoding material, returns their roots before any
+//! lookup challenge is drawn, and exposes the mask entries by slot. The key
+//! vector is not committed here: it is read from already committed rounding
+//! rows through the plan's key map. Opening sampling and the ledger entries are
 //! the next step; this module is the commitment side only.
 
 use zkie_core::error::{Error, Result};
@@ -19,9 +20,7 @@ use crate::proof::output_closure::{commit_value_group, CommittedValueGroup};
 /// The shapes, identifiers and tree plans of the lookup messages.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LookupCommitPlan {
-    pub key_shape: WShape,
     pub bits_shape: WShape,
-    pub key_oracle: u64,
     pub bits_oracle: u64,
     pub group: u64,
     pub mask_oracle: u64,
@@ -31,23 +30,18 @@ pub struct LookupCommitPlan {
 }
 
 impl LookupCommitPlan {
-    pub fn validate(&self, key_count: usize, bit_count: usize, mask_count: usize) -> Result<()> {
-        if self.key_oracle == 0
-            || self.bits_oracle == 0
+    pub fn validate(&self, bit_count: usize, mask_count: usize) -> Result<()> {
+        if self.bits_oracle == 0
             || self.mask_oracle == 0
             || self.group == 0
-            || self.key_oracle == self.bits_oracle
-            || self.key_oracle == self.mask_oracle
             || self.bits_oracle == self.mask_oracle
         {
             return Err(Error::InvalidConfig);
         }
-        if self.key_shape.fault(key_count as u64, 1).is_some()
-            || self.bits_shape.fault(bit_count as u64, 1).is_some()
-        {
+        if self.bits_shape.fault(bit_count as u64, 1).is_some() {
             return Err(Error::InvalidConfig);
         }
-        if self.key_shape.answers != 1 || self.bits_shape.answers != 1 {
+        if self.bits_shape.answers != 1 {
             return Err(Error::InvalidConfig);
         }
         if zkie_engine::pcs::request::code::build_code_plan(
@@ -80,10 +74,7 @@ impl LookupCommitPlan {
         {
             return Err(Error::InvalidConfig);
         }
-        if self.key_shape.tree_number == self.bits_shape.tree_number
-            || self.key_shape.tree_number == self.mask_tree.tree_number
-            || self.bits_shape.tree_number == self.mask_tree.tree_number
-        {
+        if self.bits_shape.tree_number == self.mask_tree.tree_number {
             return Err(Error::InvalidConfig);
         }
         let ell = usize::try_from(self.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
@@ -102,7 +93,6 @@ impl LookupCommitPlan {
 /// The public roots of the lookup messages, fixed before the lookup alpha.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LookupRoots {
-    pub key: Digest,
     pub bits: Digest,
     pub mask: Digest,
 }
@@ -110,7 +100,6 @@ pub struct LookupRoots {
 /// The committed lookup messages.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LookupMessages {
-    pub key: CommittedValueGroup,
     pub bits: CommittedValueGroup,
     pub mask_root: Digest,
     pub mask_rows: Vec<Vec<Fp3>>,
@@ -119,17 +108,12 @@ pub struct LookupMessages {
 }
 
 impl LookupMessages {
-    pub fn key_root(&self) -> Digest {
-        self.key.roots.first().copied().unwrap_or(Digest::ZERO)
-    }
-
     pub fn bits_root(&self) -> Digest {
         self.bits.roots.first().copied().unwrap_or(Digest::ZERO)
     }
 
     pub fn roots(&self) -> LookupRoots {
         LookupRoots {
-            key: self.key_root(),
             bits: self.bits_root(),
             mask: self.mask_root,
         }
@@ -224,28 +208,11 @@ fn shape_randomness(
 /// sampling and ledger entries are added when the lookup joins the session.
 pub fn commit_lookup(
     plan: &LookupCommitPlan,
-    key_count: usize,
-    key_values: &[Fp3],
     bit_values: &[Fp3],
     mask_count: usize,
     source: &mut LookupRandomSource,
 ) -> Result<LookupMessages> {
-    plan.validate(key_count, bit_values.len(), mask_count)?;
-    if key_values.len() != key_count {
-        return Err(Error::ShapeMismatch);
-    }
-    let (key_tails, key_pads, key_salts) = shape_randomness(&plan.key_shape, source);
-    let key = commit_value_group(
-        &plan.key_shape,
-        key_count as u64,
-        plan.key_oracle,
-        plan.group,
-        &[key_values.to_vec()],
-        &key_pads,
-        &[key_tails],
-        &[key_salts],
-        1,
-    )?;
+    plan.validate(bit_values.len(), mask_count)?;
     let (bits_tails, bits_pads, bits_salts) = shape_randomness(&plan.bits_shape, source);
     let bits = commit_value_group(
         &plan.bits_shape,
@@ -278,7 +245,6 @@ pub fn commit_lookup(
         .map(|_| source.bytes(plan.mask_tree.salt_bytes))
         .collect::<Vec<_>>();
     let messages = LookupMessages {
-        key,
         bits,
         mask_root: Digest::ZERO,
         mask_rows,
