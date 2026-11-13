@@ -1,0 +1,4 @@
+8d86836d Derive the norm mask row count from the plan (partial progress)
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     | 83 ++++++++++++++++++++++--
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 24 ++++---
+ 2 files changed, 90 insertions(+), 17 deletions(-)
