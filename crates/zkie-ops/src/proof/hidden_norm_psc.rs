@@ -3618,6 +3618,7 @@ pub fn output_rel_terms(
                             terms.push(TailTerm { column, left: sel(low_selector), right: digit_at(low_nonstrict_at, digit) });
                         }
                         terms.push(TailTerm { column, left: TailFactor::Constant(neg(field(low_half)?)), right: TailFactor::Constant(Fp3::ONE) });
+                        terms.push(TailTerm { column, left: sel(low_selector), right: TailFactor::Constant(field(low_half)?) });
                     }
                     9 => {
                         // s_hi * (v - 1 - alpha_hi) = 0, v = sum high digits - half_h
@@ -3641,6 +3642,7 @@ pub fn output_rel_terms(
                             terms.push(TailTerm { column, left: sel(high_selector), right: TailFactor::Slot { index: base + high_nonstrict_at + digit, scale: neg(times(1, digit)?) } });
                         }
                         terms.push(TailTerm { column, left: TailFactor::Constant(neg(field(high_half)?)), right: TailFactor::Constant(Fp3::ONE) });
+                        terms.push(TailTerm { column, left: sel(high_selector), right: TailFactor::Constant(field(high_half)?) });
                     }
                 }
             }

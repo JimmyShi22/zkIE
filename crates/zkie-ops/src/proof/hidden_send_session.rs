@@ -22243,11 +22243,20 @@ mod merged_tests {
     fn norm_output_fixture(
         activation: &CommittedActivation,
     ) -> (HiddenLinPlan, NormWitness, ParamTables) {
+        let clamp = norm_output_plan().clamp;
+        norm_output_fixture_with_clamp(activation, clamp)
+    }
+
+    fn norm_output_fixture_with_clamp(
+        activation: &CommittedActivation,
+        clamp: Option<(i64, i64)>,
+    ) -> (HiddenLinPlan, NormWitness, ParamTables) {
         use crate::proof::hidden_norm::{NormCoreRow, NormOutputRow};
         use crate::proof::hidden_norm_psc::{NormOutputTailWitness, NormOutputWitness};
 
         let (mut plan, mut witness, params) = norm_params_fixture(activation);
-        let output_plan = norm_output_plan();
+        let mut output_plan = norm_output_plan();
+        output_plan.clamp = clamp;
         {
             let norm = plan.norm.as_mut().unwrap();
             norm.output = Some(output_plan.clone());
@@ -22374,14 +22383,11 @@ mod merged_tests {
     /// the output tail. The multiplicity bits are counted from the committed
     /// tail messages, so the honest fixture commits the same keys the lookup
     /// argument proves.
-    fn slack_lookup_fixture(
-        activation: &CommittedActivation,
-    ) -> (HiddenLinPlan, NormWitness, ParamTables) {
+    fn attach_slack_lookup(plan: &mut HiddenLinPlan, witness: &mut NormWitness) {
         use crate::proof::hidden_norm_psc::{
             norm_own_mask_rows, NormLookupPlan, NormLookupWitness,
         };
 
-        let (mut plan, mut witness, params) = norm_output_fixture(activation);
         let norm = plan.norm.as_ref().unwrap();
         let tail_plan = norm
             .output
@@ -22432,6 +22438,24 @@ mod merged_tests {
             messages: None,
         });
         plan.validate().unwrap();
+    }
+
+    fn slack_lookup_fixture(
+        activation: &CommittedActivation,
+    ) -> (HiddenLinPlan, NormWitness, ParamTables) {
+        let (mut plan, mut witness, params) = norm_output_fixture(activation);
+        attach_slack_lookup(&mut plan, &mut witness);
+        (plan, witness, params)
+    }
+
+    fn clamp_boundary_fixture(
+        activation: &CommittedActivation,
+        low: i64,
+        high: i64,
+    ) -> (HiddenLinPlan, NormWitness, ParamTables) {
+        let (mut plan, mut witness, params) =
+            norm_output_fixture_with_clamp(activation, Some((low, high)));
+        attach_slack_lookup(&mut plan, &mut witness);
         (plan, witness, params)
     }
 
@@ -22813,6 +22837,251 @@ mod merged_tests {
         assert!(
             proved.is_err(),
             "a slack value that does not fit its byte width must not prove"
+        );
+    }
+
+    fn prove_and_verify_with_slack(
+        activation: &CommittedActivation,
+        plan: &HiddenLinPlan,
+        witness: &crate::proof::hidden_norm_psc::NormWitness,
+        params: &mut ParamTables,
+    ) -> Result<()> {
+        let mut table = table();
+        let (messages, hidden_witness) = prove_hidden_lin_hidden_with_norm_and_params(
+            plan,
+            activation,
+            &mut table,
+            Digest([0x71; 32]),
+            witness,
+            params,
+        )?;
+        let mut verifier_plan = plan.clone();
+        verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+        verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &messages).map(|_| ())
+    }
+
+    #[test]
+    fn norm_tail_clamp_boundaries_prove_and_verify() {
+        let activation = activation();
+        let (_, base, _) = norm_output_fixture(&activation);
+        let pre = base
+            .output
+            .as_ref()
+            .unwrap()
+            .rows[0]
+            .pre_clamp[0];
+        assert!(pre.abs() < i64::MAX as i128);
+        let pre = pre as i64;
+        let cases = [
+            (pre + 1, pre + 2),
+            (pre, pre + 2),
+            (pre - 1, pre + 2),
+            (pre - 2, pre + 1),
+            (pre - 2, pre),
+            (pre - 2, pre - 1),
+            (pre, pre),
+        ];
+        for (low, high) in cases {
+            let (plan, witness, mut params) = clamp_boundary_fixture(&activation, low, high);
+            prove_and_verify_with_slack(&activation, &plan, &witness, &mut params).unwrap_or_else(
+                |error| panic!("the clamp boundary {low}..{high} must prove and verify: {error:?}"),
+            );
+        }
+    }
+
+    #[test]
+    fn norm_tail_clamp_selector_flip_is_rejected() {
+        let activation = activation();
+        let (plan, witness, mut params) = clamp_boundary_fixture(&activation, -2, 2);
+        let tail_plan = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .tail
+            .as_ref()
+            .unwrap()
+            .clone();
+        let paths = &tail_plan.widths;
+        let clamp = tail_plan.clamp.as_ref().unwrap();
+        let pre_at = paths.quotient
+            + paths.remainder
+            + paths.doubled_remainder
+            + paths.tie_slack
+            + 1
+            + paths.shifted
+            + paths.pre_clamp;
+        let low_at = pre_at + paths.pre_clamp;
+        let low_selector = low_at + clamp.low + clamp.high;
+        let columns = usize::try_from(tail_plan.group.columns).unwrap();
+        let rows = usize::try_from(tail_plan.group.shape.main_rows).unwrap();
+        let ell = usize::try_from(tail_plan.group.shape.code.ell).unwrap();
+        let messages = witness
+            .output
+            .as_ref()
+            .unwrap()
+            .tail
+            .as_ref()
+            .unwrap()
+            .committed
+            .messages
+            .clone();
+        let mut values = Vec::with_capacity(messages.len());
+        for message in &messages {
+            let mut slots = vec![Fp3::ZERO; columns];
+            for (slot, value) in slots.iter_mut().enumerate() {
+                if slot / rows < ell {
+                    *value = message[slot % rows][slot / rows];
+                }
+            }
+            values.push(slots);
+        }
+        // Flip the low selector of column zero while the distances stay.
+        values[0][low_selector] = Fp3::ONE.sub(&values[0][low_selector]);
+        let mut coins = ByteMaskCoins::new(Digest([0x97; 32])).unwrap();
+        let tail = commit_norm_group(&tail_plan.group, &values, &mut coins);
+        let mut changed = witness.clone();
+        changed.output.as_mut().unwrap().tail.as_mut().unwrap().committed = tail;
+        let proved = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table(),
+            Digest([0x71; 32]),
+            &changed,
+            &mut params,
+        );
+        assert!(
+            proved.is_err(),
+            "a flipped clamp selector must not prove"
+        );
+    }
+
+    #[test]
+    fn norm_tail_clamp_out_tampering_is_rejected() {
+        let activation = activation();
+        let (mut plan, mut witness, mut params) = slack_lookup_fixture(&activation);
+        let output_plan = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .clone();
+        {
+            let row = &mut witness.output.as_mut().unwrap().rows[0];
+            row.out[0] += 1;
+        }
+        let signed = |values: Vec<i128>| -> Vec<Fp3> {
+            values
+                .into_iter()
+                .map(|value| crate::proof::output_closure::fp3_signed(value).unwrap())
+                .collect()
+        };
+        let rows = &witness.output.as_ref().unwrap().rows;
+        let out_values = rows
+            .iter()
+            .map(|row| signed(row.out.iter().map(|value| *value as i128).collect()))
+            .collect::<Vec<_>>();
+        let mut coins = ByteMaskCoins::new(Digest([0x95; 32])).unwrap();
+        witness.output.as_mut().unwrap().out =
+            commit_norm_group(&output_plan.out, &out_values, &mut coins);
+        attach_slack_lookup(&mut plan, &mut witness);
+        let proved = prove_and_verify_with_slack(&activation, &plan, &witness, &mut params);
+        assert!(
+            proved.is_err(),
+            "a changed clamped output must not prove and verify"
+        );
+    }
+
+    #[test]
+    fn norm_tail_clamp_distance_slot_tampering_is_rejected() {
+        let activation = activation();
+        let (plan, witness, mut params) = clamp_boundary_fixture(&activation, -2, 2);
+        let tail_plan = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .tail
+            .as_ref()
+            .unwrap()
+            .clone();
+        let widths = tail_plan.widths;
+        let pre_at = widths.quotient
+            + widths.remainder
+            + widths.doubled_remainder
+            + widths.tie_slack
+            + 1
+            + widths.shifted
+            + widths.pre_clamp;
+        let low_at = pre_at + widths.pre_clamp;
+        let columns = usize::try_from(tail_plan.group.columns).unwrap();
+        let rows = usize::try_from(tail_plan.group.shape.main_rows).unwrap();
+        let ell = usize::try_from(tail_plan.group.shape.code.ell).unwrap();
+        let messages = witness
+            .output
+            .as_ref()
+            .unwrap()
+            .tail
+            .as_ref()
+            .unwrap()
+            .committed
+            .messages
+            .clone();
+        let mut values = Vec::with_capacity(messages.len());
+        for message in &messages {
+            let mut slots = vec![Fp3::ZERO; columns];
+            for (slot, value) in slots.iter_mut().enumerate() {
+                if slot / rows < ell {
+                    *value = message[slot % rows][slot / rows];
+                }
+            }
+            values.push(slots);
+        }
+        // Change one byte of the low distance of column zero.
+        values[0][low_at] = values[0][low_at].add(&Fp3::ONE);
+        let mut coins = ByteMaskCoins::new(Digest([0x96; 32])).unwrap();
+        let tail = commit_norm_group(&tail_plan.group, &values, &mut coins);
+        let mut changed = witness.clone();
+        changed.output.as_mut().unwrap().tail.as_mut().unwrap().committed = tail;
+        let proved = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table(),
+            Digest([0x71; 32]),
+            &changed,
+            &mut params,
+        );
+        assert!(
+            proved.is_err(),
+            "a changed clamp distance slot must not prove"
+        );
+    }
+
+    #[test]
+    fn norm_tail_clamp_distance_width_gate_is_enforced() {
+        let activation = activation();
+        let (plan, _, _) = clamp_boundary_fixture(&activation, -2, 2);
+        let mut changed = plan.clone();
+        let tail = changed
+            .norm
+            .as_mut()
+            .unwrap()
+            .output
+            .as_mut()
+            .unwrap()
+            .tail
+            .as_mut()
+            .unwrap();
+        tail.clamp.as_mut().unwrap().low = 1;
+        assert!(
+            changed.validate().is_err(),
+            "a clamp distance width that cannot hold the span must be rejected"
         );
     }
 
