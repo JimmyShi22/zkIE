@@ -35,7 +35,9 @@ use crate::proof::committed_psc::{
 };
 use crate::proof::hidden_norm::{NormCoreRow, NormShape};
 use crate::proof::hidden_send_session::{SendSamples, WShape};
-use crate::proof::lookup::{LookupOutcome, LookupPlan, LookupProof};
+use crate::proof::lookup::{
+    LookupKeyPlan, LookupKeySource, LookupOutcome, LookupPlan, LookupProof,
+};
 use crate::proof::lookup_messages::LookupCommitPlan;
 use crate::proof::output_closure::{CommittedValueGroup, RetainedTrees};
 use crate::proof::psc::{
@@ -809,6 +811,94 @@ impl NormLookupPlan {
         put_tree_plan(&mut writer, &self.commit.mask_tree);
         digest_bytes(&writer.into_bytes())
     }
+}
+
+/// The smallest key-bit count and multiplicity-plane count of a byte lookup
+/// over `slots` key entries: `2^key_bits >= slots` and `2^(2^mu) > 2^key_bits`.
+pub fn lookup_parameters(slots: usize) -> Result<(u32, u32)> {
+    if slots == 0 || slots > (1usize << 30) {
+        return Err(Error::InvalidConfig);
+    }
+    let key_bits = ceil_log2_u64(slots as u64);
+    let keys = 1u64.checked_shl(key_bits).ok_or(Error::ResourceLimit)?;
+    let mut mu = 1u32;
+    loop {
+        let planes = 1u64.checked_shl(mu).ok_or(Error::ResourceLimit)?;
+        if planes >= 63 || keys < (1u64 << planes) {
+            break;
+        }
+        mu = mu.checked_add(1).ok_or(Error::ResourceLimit)?;
+        if mu >= 63 {
+            return Err(Error::ResourceLimit);
+        }
+    }
+    Ok((key_bits, mu))
+}
+
+/// The trusted key map of the byte lookup over every committed digit slot of
+/// the rounding rows. Key `position * digits + digit` reads that digit cell of
+/// the position's rounding message; the remaining keys are the public padding
+/// byte. The table identity is a plan value.
+pub fn round_digit_lookup_key(
+    round: &NormRoundPlan,
+    positions: u32,
+    key_bits: u32,
+    padding_byte: u64,
+    table_identity: Digest,
+) -> Result<LookupKeyPlan> {
+    if positions == 0 || padding_byte > 255 || table_identity == Digest::ZERO {
+        return Err(Error::InvalidConfig);
+    }
+    let keys = 1u64.checked_shl(key_bits).ok_or(Error::ResourceLimit)?;
+    let digits = round.layout.digit_slots()?;
+    let count = digits
+        .len()
+        .checked_mul(positions as usize)
+        .ok_or(Error::ResourceLimit)?;
+    if count == 0 || count as u64 > keys {
+        return Err(Error::InvalidConfig);
+    }
+    let rows = round.group.shape.main_rows;
+    let ell = round.group.shape.code.ell;
+    if rows == 0 || ell == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let mut sources = Vec::with_capacity(count);
+    let mut seen = std::collections::HashSet::new();
+    for position in 0..positions {
+        let oracle = round
+            .group
+            .oracle_base
+            .checked_add(position as u64)
+            .ok_or(Error::ResourceLimit)?;
+        for slot in &digits {
+            let slot = *slot as u64;
+            if slot >= round.group.columns {
+                return Err(Error::ShapeMismatch);
+            }
+            let row = slot % rows;
+            let place = slot / rows;
+            if place >= ell {
+                return Err(Error::ShapeMismatch);
+            }
+            if !seen.insert((oracle, position, row as u32, place as u32)) {
+                return Err(Error::InvalidConfig);
+            }
+            sources.push(LookupKeySource {
+                oracle,
+                position,
+                row: row as u32,
+                place: place as u32,
+                coefficient: Fp3::ONE,
+                offset: Fp3::ZERO,
+            });
+        }
+    }
+    Ok(LookupKeyPlan {
+        sources,
+        padding_value: Fp3::from_u64(padding_byte),
+        table_identity,
+    })
 }
 
 /// The trusted plan of the integrated norm relation.
@@ -1963,6 +2053,30 @@ impl NormRoundLayout {
         })
     }
 
+    /// The committed digit slots the byte lookup covers, in plan order: the
+    /// fixed-offset sum and mean rows, the squares and variance rows, and the
+    /// four offset/complement digit rows. The six value slots (remainders,
+    /// offsets and complements) are not digits and are not keys.
+    pub fn digit_slots(&self) -> Result<Vec<usize>> {
+        let ranges = [
+            (self.slots.sum_digits, self.widths.sum),
+            (self.slots.squares_digits, self.widths.squares),
+            (self.slots.variance_digits, self.widths.variance),
+            (self.slots.mean_digits, self.widths.mean),
+            (self.slots.mean_offset_digits, self.widths.offset),
+            (self.slots.mean_complement_digits, self.widths.offset),
+            (self.slots.variance_offset_digits, self.widths.offset),
+            (self.slots.variance_complement_digits, self.widths.offset),
+        ];
+        let mut slots = Vec::new();
+        for (start, width) in ranges {
+            for index in 0..width {
+                slots.push(start.checked_add(index).ok_or(Error::ResourceLimit)?);
+            }
+        }
+        Ok(slots)
+    }
+
     /// Writes one integer core row into the fixed slot vector. The sum and mean
     /// digit blocks hold the fixed-offset quantities; the other digit rows are
     /// zero padded to their fixed width.
@@ -2345,6 +2459,127 @@ mod tests {
         for slot in layout.slots.total..64 {
             assert_eq!(values[slot], Fp3::ZERO);
         }
+    }
+
+    #[test]
+    fn round_digit_key_plan_covers_the_committed_digits() {
+        use crate::proof::lookup::LookupPlan;
+
+        let widths = NormRoundWidths {
+            sum: 2,
+            squares: 3,
+            variance: 2,
+            mean: 2,
+            offset: 2,
+        };
+        let layout = NormRoundLayout::new(widths, 8, 5, 3).unwrap();
+        let columns = widths.columns().unwrap();
+        let round = NormRoundPlan {
+            group: NormGroupPlan {
+                shape: group_shape(columns, 1),
+                columns,
+                group: 1,
+                oracle_base: 9000,
+                openings: 1,
+            },
+            layout,
+            input_bound: 8,
+        };
+        let digits = layout.digit_slots().unwrap();
+        assert_eq!(
+            digits.len(),
+            widths.sum + widths.squares + widths.variance + widths.mean + 4 * widths.offset
+        );
+        for slot in [
+            layout.slots.mean_remainder,
+            layout.slots.mean_offset,
+            layout.slots.mean_complement,
+            layout.slots.variance_remainder,
+            layout.slots.variance_offset,
+            layout.slots.variance_complement,
+        ] {
+            assert!(!digits.contains(&slot), "a value slot is a lookup key");
+        }
+        for pair in digits.windows(2) {
+            assert!(pair[0] < pair[1], "the digit slots are not in plan order");
+        }
+
+        let positions = 2u32;
+        let (key_bits, mu) = lookup_parameters(digits.len() * positions as usize).unwrap();
+        let key = round_digit_lookup_key(
+            &round,
+            positions,
+            key_bits,
+            0,
+            Digest([0x63; 32]),
+        )
+        .unwrap();
+        let plan = LookupPlan {
+            key_bits,
+            mu,
+            table_log: 8,
+        };
+        plan.validate().unwrap();
+        assert_eq!(key.sources.len(), digits.len() * positions as usize);
+        let rows = usize::try_from(round.group.shape.main_rows).unwrap();
+        let ell = usize::try_from(round.group.shape.code.ell).unwrap();
+        for position in 0..positions {
+            for (index, slot) in digits.iter().enumerate() {
+                let source = &key.sources[position as usize * digits.len() + index];
+                assert_eq!(source.oracle, 9000 + position as u64);
+                assert_eq!(source.position, position);
+                assert_eq!(source.row as usize, slot % rows);
+                assert_eq!(source.place as usize, slot / rows);
+                assert_eq!(source.coefficient, Fp3::ONE);
+                assert_eq!(source.offset, Fp3::ZERO);
+            }
+        }
+
+        // The key vector reads the digit cells of the real message layout.
+        let digit_of = |position: usize, index: usize| {
+            Fp3::from_u64(((position * 37 + index * 11 + 3) % 256) as u64)
+        };
+        let messages = (0..positions as usize)
+            .map(|position| {
+                let mut message = vec![vec![Fp3::ZERO; ell]; rows];
+                for (index, slot) in digits.iter().enumerate() {
+                    message[slot % rows][slot / rows] = digit_of(position, index);
+                }
+                message
+            })
+            .collect::<Vec<_>>();
+        let keys = key.read(&plan, &messages).unwrap();
+        let key_count = plan.key_count().unwrap();
+        assert_eq!(keys.len(), key_count);
+        for position in 0..positions as usize {
+            for index in 0..digits.len() {
+                assert_eq!(
+                    keys[position * digits.len() + index],
+                    digit_of(position, index)
+                );
+            }
+        }
+        for extra in keys.iter().skip(key.sources.len()) {
+            assert_eq!(*extra, Fp3::ZERO);
+        }
+        assert!(round_digit_lookup_key(
+            &round,
+            positions,
+            key_bits,
+            256,
+            Digest([0x63; 32]),
+        )
+        .is_err());
+        assert!(round_digit_lookup_key(
+            &round,
+            positions,
+            key_bits,
+            0,
+            Digest::ZERO,
+        )
+        .is_err());
+        assert!(round_digit_lookup_key(&round, positions, 3, 0, Digest([0x63; 32]))
+            .is_err());
     }
 
     #[test]

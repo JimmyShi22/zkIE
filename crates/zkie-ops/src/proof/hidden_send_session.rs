@@ -15693,6 +15693,47 @@ mod merged_tests {
         assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
     }
 
+    #[test]
+    fn production_key_map_reads_the_round_digits() {
+        use crate::proof::hidden_norm_psc::{lookup_parameters, round_digit_lookup_key};
+        use crate::proof::lookup::LookupPlan;
+
+        let activation = activation();
+        let (plan, witness) = norm_fixture(&activation);
+        let norm = plan.norm.as_ref().expect("the fixture carries the norm");
+        let round = norm.round.as_ref().expect("the fixture carries the round rows");
+        let digits = round.layout.digit_slots().unwrap();
+        let positions = plan.send.positions();
+        let (key_bits, mu) = lookup_parameters(digits.len() * positions as usize).unwrap();
+        let key = round_digit_lookup_key(
+            round,
+            positions,
+            key_bits,
+            0,
+            Digest([0x63; 32]),
+        )
+        .unwrap();
+        let lookup = LookupPlan {
+            key_bits,
+            mu,
+            table_log: 8,
+        };
+        lookup.validate().unwrap();
+        let round_messages = &witness.round.as_ref().unwrap().messages;
+        let keys = key.read(&lookup, round_messages).unwrap();
+        assert_eq!(keys.len(), lookup.key_count().unwrap());
+        let rows = usize::try_from(round.group.shape.main_rows).unwrap();
+        for position in 0..positions as usize {
+            for (index, slot) in digits.iter().enumerate() {
+                let value = round_messages[position][slot % rows][slot / rows];
+                assert_eq!(keys[position * digits.len() + index], value);
+            }
+        }
+        for extra in keys.iter().skip(key.sources.len()) {
+            assert_eq!(*extra, Fp3::ZERO);
+        }
+    }
+
     fn staged_plan(plan: &HiddenLinPlan) -> HiddenLinPlan {
         let mut staged = plan.clone();
         let main = plan.proximity.code;
