@@ -50,8 +50,9 @@ use crate::proof::output_closure::{CommittedValueGroup, RetainedTrees};
 use crate::registry::{RSQRT_COARSE, RSQRT_COARSE_END, RSQRT_FINE, RSQRT_HALF, RSQRT_SHIFT};
 use crate::proof::psc::{
     hp_entries, prove_dot_sumcheck, psc_variables, verify_psc_transcript, DotClaim,
-    DotMaskEntries, DotOutput, DotProof, SHOWN_MAPS,
+    DotMaskEntries, DotOutput, DotProof, PscRound, SHOWN_MAPS,
 };
+use crate::proof::psc_general::GeneralProof;
 
 /// Version of the norm PSC message skeleton.
 pub const NORM_PSC_VERSION: u64 = 1;
@@ -68,6 +69,18 @@ pub(crate) const NORM_PSC_TAGS: PscTranscriptTags = PscTranscriptTags {
     round: 51,
     end: 52,
 };
+/// Transcript tags of the pointwise product instances, distinct from the
+/// relation transcript tags.
+pub(crate) const NORM_OUTPUT_PSC_TAGS: PscTranscriptTags = PscTranscriptTags {
+    version: NORM_PSC_VERSION,
+    hiding_sum: 60,
+    round: 61,
+    end: 62,
+};
+/// The prefix tag of the pointwise column point.
+pub(crate) const NORM_OUTPUT_POINT_TAG: u64 = 63;
+/// Version of the pointwise transcript section.
+pub const NORM_OUTPUT_PSC_VERSION: u64 = 1;
 
 /// The trusted plan of one committed value group.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -302,6 +315,137 @@ impl NormPscFirst {
     }
 }
 
+/// The public second-stage transcript of the pointwise product instances:
+/// the claim value and the general product-sumcheck proof of every instance,
+/// in position-major order (broadcast/gain product, then centered/product
+/// image).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormOutputSecond {
+    pub claims: Vec<Fp3>,
+    pub proofs: Vec<GeneralProof>,
+}
+
+fn put_general_proof(writer: &mut CanonicalWriter, proof: &GeneralProof) {
+    writer.put_fp3(&proof.hiding_sum);
+    writer.put_u64(proof.rounds.len() as u64);
+    for round in &proof.rounds {
+        writer.put_u64(round.coefficients.len() as u64);
+        for coefficient in &round.coefficients {
+            writer.put_fp3(coefficient);
+        }
+    }
+    writer.put_u64(proof.y_round.coefficients.len() as u64);
+    for coefficient in &proof.y_round.coefficients {
+        writer.put_fp3(coefficient);
+    }
+    writer.put_u64(proof.end_values.len() as u64);
+    for value in &proof.end_values {
+        writer.put_fp3(value);
+    }
+}
+
+fn get_general_proof(reader: &mut CanonicalReader, rounds: usize) -> Result<GeneralProof> {
+    let hiding_sum = reader.get_fp3()?;
+    if reader.get_u64()? != rounds as u64 {
+        return Err(Error::InvalidEncoding);
+    }
+    let mut round_values = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        let count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+        if count > 8 {
+            return Err(Error::InvalidEncoding);
+        }
+        let mut coefficients = Vec::with_capacity(count);
+        for _ in 0..count {
+            coefficients.push(reader.get_fp3()?);
+        }
+        round_values.push(PscRound { coefficients });
+    }
+    let count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+    if count > 8 {
+        return Err(Error::InvalidEncoding);
+    }
+    let mut y_round = Vec::with_capacity(count);
+    for _ in 0..count {
+        y_round.push(reader.get_fp3()?);
+    }
+    let count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+    if count != 2 {
+        return Err(Error::InvalidEncoding);
+    }
+    let mut end_values = Vec::with_capacity(count);
+    for _ in 0..count {
+        end_values.push(reader.get_fp3()?);
+    }
+    Ok(GeneralProof {
+        hiding_sum,
+        rounds: round_values,
+        y_round: PscRound {
+            coefficients: y_round,
+        },
+        end_values,
+    })
+}
+
+impl NormOutputSecond {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        if self.claims.len() != self.proofs.len() {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut writer = CanonicalWriter::new();
+        writer.put_u64(NORM_OUTPUT_PSC_VERSION);
+        writer.put_u64(self.claims.len() as u64);
+        for (claim, proof) in self.claims.iter().zip(&self.proofs) {
+            writer.put_fp3(claim);
+            put_general_proof(&mut writer, proof);
+        }
+        Ok(writer.into_bytes())
+    }
+
+    pub fn decode(plan: &NormOutputPlan, positions: u32, bytes: &[u8]) -> Result<Self> {
+        let variables = plan.broadcast.columns.trailing_zeros() as usize;
+        let instances = usize::try_from(positions)
+            .map_err(|_| Error::ResourceLimit)?
+            .checked_mul(2)
+            .ok_or(Error::ResourceLimit)?;
+        let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
+        if reader.get_u64()? != NORM_OUTPUT_PSC_VERSION {
+            return Err(Error::InvalidEncoding);
+        }
+        if reader.get_u64()? != instances as u64 {
+            return Err(Error::InvalidEncoding);
+        }
+        let mut claims = Vec::with_capacity(instances);
+        let mut proofs = Vec::with_capacity(instances);
+        for _ in 0..instances {
+            claims.push(reader.get_fp3()?);
+            proofs.push(get_general_proof(&mut reader, variables)?);
+        }
+        reader.finish()?;
+        let message = Self { claims, proofs };
+        message.check(plan, positions)?;
+        Ok(message)
+    }
+
+    pub fn check(&self, plan: &NormOutputPlan, positions: u32) -> Result<()> {
+        let variables = plan.broadcast.columns.trailing_zeros() as usize;
+        let instances = positions as usize * 2;
+        if self.claims.len() != instances || self.proofs.len() != instances {
+            return Err(Error::ShapeMismatch);
+        }
+        for proof in &self.proofs {
+            if proof.rounds.len() != variables
+                || proof.rounds.iter().any(|round| round.coefficients.len() >= 8)
+                || proof.y_round.coefficients.len() != 2
+                || proof.end_values.len() != 2
+            {
+                return Err(Error::ShapeMismatch);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The public second-stage norm message: one product-sumcheck transcript and
 /// its two shown point values per instance, in position-major and
 /// sum/squares/mean/variance-major order.
@@ -314,6 +458,9 @@ pub struct NormPscSecond {
     pub lookup: Option<NormLookupSecond>,
     /// The frozen-table lookup transcript and claims, when the plan carries it.
     pub rstd: Option<NormLookupSecond>,
+    /// The pointwise product transcripts, when the plan carries the output
+    /// tail.
+    pub output: Option<NormOutputSecond>,
 }
 
 impl NormPscSecond {
@@ -330,6 +477,9 @@ impl NormPscSecond {
         }
         if let Some(rstd) = &self.rstd {
             writer.put_bytes(&rstd.encode()?);
+        }
+        if let Some(output) = &self.output {
+            writer.put_bytes(&output.encode()?);
         }
         Ok(writer.into_bytes())
     }
@@ -354,6 +504,7 @@ impl NormPscSecond {
             point_values,
             lookup: None,
             rstd: None,
+            output: None,
         };
         message.check(plan)?;
         Ok(message)
@@ -387,12 +538,21 @@ impl NormPscSecond {
             )?),
             None => None,
         };
+        let output = match &plan.output {
+            Some(output_plan) => Some(NormOutputSecond::decode(
+                output_plan,
+                plan.shape.positions,
+                reader.get_bytes()?,
+            )?),
+            None => None,
+        };
         reader.finish()?;
         let message = Self {
             psc,
             point_values,
             lookup,
             rstd,
+            output,
         };
         message.check_for(plan)?;
         Ok(message)
@@ -416,6 +576,13 @@ impl NormPscSecond {
         }
         match (&plan.rstd, &self.rstd) {
             (Some(rstd_plan), Some(rstd)) => rstd.check_rstd(rstd_plan)?,
+            (None, None) => {}
+            _ => return Err(Error::ShapeMismatch),
+        }
+        match (&plan.output, &self.output) {
+            (Some(output_plan), Some(output)) => {
+                output.check(output_plan, plan.shape.positions)?
+            }
             (None, None) => {}
             _ => return Err(Error::ShapeMismatch),
         }
@@ -807,6 +974,7 @@ pub fn prove_norm_psc(
         point_values,
         lookup: None,
         rstd: None,
+        output: None,
     })
 }
 
@@ -2508,6 +2676,22 @@ pub struct NormRowBinding {
     pub lookup: Option<NormLookupSecond>,
     /// The checked frozen-table lookup transcript and claims.
     pub rstd: Option<NormLookupSecond>,
+    /// The checked pointwise product instances, when the plan carries the
+    /// output tail. The row builder consumes them on both sides.
+    pub output: Option<Vec<NormOutputBinding>>,
+}
+
+/// One checked pointwise product instance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormOutputBinding {
+    pub position: u32,
+    /// Zero is the broadcast/gain product; one is the centered/product
+    /// image.
+    pub kind: u8,
+    /// The claim value the verifier was given.
+    pub claim: Fp3,
+    /// The checked transcript output claims.
+    pub output: crate::proof::psc_general::GeneralOutput,
 }
 
 /// The lookup commitments of the first stage: the multiplicity-bit group and

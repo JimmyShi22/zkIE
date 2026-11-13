@@ -11663,6 +11663,73 @@ fn check_rstd_table_view(
     Ok(())
 }
 
+/// Draws the column point of one pointwise product instance.
+fn draw_norm_output_point(chain: &mut Chain, instance: u64, bits: usize) -> Result<Vec<Fp3>> {
+    let mut message = chain.message();
+    message.push_u64(crate::proof::hidden_norm_psc::NORM_PSC_VERSION);
+    message.push_u64(crate::proof::hidden_norm_psc::NORM_OUTPUT_POINT_TAG);
+    message.push_u64(instance);
+    let prefix = message.prefix(KIND_SEED, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    let mut point = Vec::with_capacity(bits);
+    for _ in 0..bits {
+        point.push(chain.draw_e()?);
+    }
+    Ok(point)
+}
+
+/// The two committed column maps of one pointwise product instance: the
+/// broadcast row against the gain vector, or the centered row against the
+/// product row. The centered row is zero on non-valid columns.
+fn norm_pointwise_maps(
+    plan: &NormPlan,
+    row: &[i64],
+    core: &crate::proof::hidden_norm::NormCoreRow,
+    gain: &[i64],
+    output_row: &crate::proof::hidden_norm::NormOutputRow,
+    kind: u8,
+) -> Result<(Vec<Fp3>, Vec<Fp3>)> {
+    use crate::proof::output_closure::fp3_signed;
+
+    let columns = usize::try_from(plan.columns).map_err(|_| Error::ResourceLimit)?;
+    let valid = plan.shape.valid as usize;
+    if row.len() != plan.shape.hidden as usize
+        || gain.len() != columns
+        || output_row.broadcast.len() != columns
+        || output_row.product.len() != columns
+        || output_row.out.len() != columns
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut left = Vec::with_capacity(columns);
+    let mut right = Vec::with_capacity(columns);
+    match kind {
+        0 => {
+            for index in 0..columns {
+                left.push(fp3_signed(output_row.broadcast[index] as i128)?);
+                right.push(fp3_signed(gain[index] as i128)?);
+            }
+        }
+        1 => {
+            for index in 0..columns {
+                let centered = if index < valid {
+                    (row[index] as i128)
+                        .checked_sub(core.mean as i128)
+                        .ok_or(Error::BoundViolation)?
+                } else {
+                    0
+                };
+                left.push(fp3_signed(centered)?);
+                right.push(fp3_signed(output_row.product[index])?);
+            }
+        }
+        _ => return Err(Error::InvalidConfig),
+    }
+    Ok((left, right))
+}
+
 fn prove_norm_second(
     chain: &mut Chain,
     plan: &NormPlan,
@@ -11801,17 +11868,108 @@ fn prove_norm_second(
             });
         }
     }
+    let (output_message, output_binding) = match (&plan.output, &witness.output) {
+        (Some(output_plan), Some(output_witness)) => {
+            let params = witness.params.as_ref().ok_or(Error::ShapeMismatch)?;
+            let width = usize::try_from(plan.columns).map_err(|_| Error::ResourceLimit)?;
+            let bits = usize::try_from(plan.columns.trailing_zeros())
+                .map_err(|_| Error::ResourceLimit)?;
+            if params.gain.len() != width
+                || output_witness.rows.len() != positions
+                || output_witness
+                    .rows
+                    .iter()
+                    .any(|row| row.broadcast.len() != width)
+            {
+                return Err(Error::ShapeMismatch);
+            }
+            let pointwise_entries = crate::proof::hidden_norm_psc::norm_pointwise_entries(
+                mask_plan,
+                &mask_witness.committed,
+                instances,
+            )?;
+            let mut claims = Vec::with_capacity(positions * 2);
+            let mut proofs = Vec::with_capacity(positions * 2);
+            let mut output_bindings = Vec::with_capacity(positions * 2);
+            for position in 0..positions {
+                for kind in 0..2u8 {
+                    let instance = position * 2 + kind as usize;
+                    let point = draw_norm_output_point(chain, instance as u64, bits)?;
+                    let (left, right) = norm_pointwise_maps(
+                        plan,
+                        &witness.rows[position],
+                        &witness.core[position],
+                        &params.gain,
+                        &output_witness.rows[position],
+                        kind,
+                    )?;
+                    let eq = crate::proof::output_closure::eq_vector(&point)?;
+                    if eq.len() != width {
+                        return Err(Error::ShapeMismatch);
+                    }
+                    let mut target = Fp3::ZERO;
+                    for index in 0..width {
+                        target = target.add(&eq[index].mul(&left[index]).mul(&right[index]));
+                    }
+                    let variables = (0..bits)
+                        .map(|index| crate::proof::psc::Weight::equality(point[index], 3))
+                        .collect::<Result<Vec<_>>>()?;
+                    let mut inner = crate::proof::psc_general::WeightedProductInner::new(
+                        &left, &right, &point,
+                    )?;
+                    let entries = pointwise_entries
+                        .get(instance)
+                        .ok_or(Error::ShapeMismatch)?;
+                    let mut challenges =
+                        crate::proof::committed_psc::PositionPscChallenges::new(
+                            chain,
+                            crate::proof::hidden_norm_psc::NORM_OUTPUT_PSC_TAGS,
+                            instance as u64,
+                        );
+                    let no_masks = |_: usize| -> Result<Fp3> { Err(Error::InvalidIndex) };
+                    let (proof, checked) = crate::proof::psc_general::prove_general(
+                        &variables,
+                        &[],
+                        &no_masks,
+                        target,
+                        &crate::proof::psc_general::Summand::Product,
+                        None,
+                        &mut inner,
+                        entries,
+                        &mut challenges,
+                    )?;
+                    claims.push(target);
+                    proofs.push(proof);
+                    output_bindings.push(crate::proof::hidden_norm_psc::NormOutputBinding {
+                        position: position as u32,
+                        kind,
+                        claim: target,
+                        output: checked,
+                    });
+                }
+            }
+            let _ = output_plan;
+            (
+                Some(crate::proof::hidden_norm_psc::NormOutputSecond { claims, proofs }),
+                Some(output_bindings),
+            )
+        }
+        (None, None) => (None, None),
+        _ => return Err(Error::ShapeMismatch),
+    };
     Ok((
         NormPscSecond {
             psc,
             point_values,
             lookup: lookup.clone(),
             rstd: rstd.clone(),
+            output: output_message,
         },
         NormRowBinding {
             positions: bindings,
             lookup,
             rstd,
+            output: output_binding,
         },
     ))
 }
@@ -11956,10 +12114,61 @@ fn verify_norm_second(
             });
         }
     }
+    let output_binding = match (&plan.output, &messages.output) {
+        (Some(_output_plan), Some(message)) => {
+            let bits = usize::try_from(plan.columns.trailing_zeros())
+                .map_err(|_| Error::ResourceLimit)?;
+            let hiding = crate::proof::hidden_norm_psc::norm_pointwise_masks(plan.variables)?.0;
+            let mut output_bindings = Vec::with_capacity(positions * 2);
+            for position in 0..positions {
+                for kind in 0..2u8 {
+                    let instance = position * 2 + kind as usize;
+                    let point = draw_norm_output_point(chain, instance as u64, bits)?;
+                    let variables = (0..bits)
+                        .map(|index| crate::proof::psc::Weight::equality(point[index], 3))
+                        .collect::<Result<Vec<_>>>()?;
+                    let claim = *message
+                        .claims
+                        .get(instance)
+                        .ok_or(Error::ShapeMismatch)?;
+                    let proof = message
+                        .proofs
+                        .get(instance)
+                        .ok_or(Error::ShapeMismatch)?;
+                    let mut challenges =
+                        crate::proof::committed_psc::PositionPscChallenges::new(
+                            chain,
+                            crate::proof::hidden_norm_psc::NORM_OUTPUT_PSC_TAGS,
+                            instance as u64,
+                        );
+                    let checked = crate::proof::psc_general::verify_general(
+                        &variables,
+                        &[],
+                        claim,
+                        &crate::proof::psc_general::Summand::Product,
+                        None,
+                        proof,
+                        hiding,
+                        &mut challenges,
+                    )?;
+                    output_bindings.push(crate::proof::hidden_norm_psc::NormOutputBinding {
+                        position: position as u32,
+                        kind,
+                        claim,
+                        output: checked,
+                    });
+                }
+            }
+            Some(output_bindings)
+        }
+        (None, None) => None,
+        _ => return Err(Error::ShapeMismatch),
+    };
     Ok(NormRowBinding {
         positions: bindings,
         lookup: lookup_binding,
         rstd: rstd_binding,
+        output: output_binding,
     })
 }
 
@@ -21042,6 +21251,54 @@ mod merged_tests {
         wrong_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
         wrong_plan.norm.as_mut().unwrap().output.as_mut().unwrap().out.group = 94;
         assert!(verify_hidden_lin_hidden(&wrong_plan, &table.reader(), &base).is_err());
+
+        let second = base.second.norm.as_ref().unwrap().output.as_ref().unwrap();
+        assert_eq!(second.claims.len(), POSITIONS as usize * 2);
+        assert_eq!(second.proofs.len(), POSITIONS as usize * 2);
+        let mut changed = base.clone();
+        changed
+            .second
+            .norm
+            .as_mut()
+            .unwrap()
+            .output
+            .as_mut()
+            .unwrap()
+            .proofs[0]
+            .rounds
+            .pop();
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = base.clone();
+        changed
+            .second
+            .norm
+            .as_mut()
+            .unwrap()
+            .output
+            .as_mut()
+            .unwrap()
+            .proofs[1]
+            .end_values
+            .pop();
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = base.clone();
+        changed
+            .second
+            .norm
+            .as_mut()
+            .unwrap()
+            .output
+            .as_mut()
+            .unwrap()
+            .claims
+            .pop();
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = base.clone();
+        changed.second.norm.as_mut().unwrap().output = None;
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
     }
 
     #[test]

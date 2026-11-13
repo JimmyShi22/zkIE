@@ -486,6 +486,40 @@ impl PscChallenges for PositionPscChallenges<'_> {
     }
 }
 
+impl crate::proof::psc_general::GeneralChallenges for PositionPscChallenges<'_> {
+    fn draw(&mut self) -> Result<Fp3> {
+        PscChallenges::draw(self)
+    }
+
+    fn draw_nonzero(&mut self) -> Result<Fp3> {
+        PscChallenges::draw_nonzero(self)
+    }
+
+    fn send_hiding_sum(&mut self, value: Fp3) -> Result<()> {
+        PscChallenges::send_hiding_sum(self, value)
+    }
+
+    fn send_round(&mut self, index: usize, round: &PscRound) -> Result<()> {
+        PscChallenges::send_round(self, index, round)
+    }
+
+    fn send_end_values(&mut self, values: &[Fp3]) -> Result<()> {
+        let mut message = self.chain.message();
+        message.push_u64(self.tags.version);
+        message.push_u64(self.tags.end);
+        message.push_u64(self.position);
+        message.push_u64(values.len() as u64);
+        for value in values {
+            message.push_fp3(value);
+        }
+        let prefix = message.prefix(KIND_EMPTY, 0)?;
+        if !self.chain.step(&prefix, 0)? {
+            return Err(Error::InvalidProof);
+        }
+        Ok(())
+    }
+}
+
 /// Absorbs one position's masked point values before the relation draws the
 /// next point.
 pub fn absorb_point(
