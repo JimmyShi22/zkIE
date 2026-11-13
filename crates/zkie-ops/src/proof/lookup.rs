@@ -1893,19 +1893,20 @@ mod tests {
         assert_eq!(proven.multiplicity.1, Fp3::from_u64(4));
     }
 
-    #[test]
-    fn leaves_kept_row_matches_the_committed_bits() {
-        let plan = plan();
-        let keys = [0u64, 0, 1, 2];
-        let witness = witness(&keys, &plan);
-        let commit = commit_plan();
+    fn check_leaves_row(
+        plan: &LookupPlan,
+        commit: &LookupCommitPlan,
+        keys: &[u64],
+        seed: u64,
+    ) {
+        let witness = witness(keys, plan);
         let (messages, _proof, outcome) = prove_lookup(
-            &plan,
-            &commit,
-            &key_plan(&keys),
-            &key_rows(&keys),
+            plan,
+            commit,
+            &key_plan(keys),
+            &key_rows(keys),
             &witness,
-            21,
+            seed,
         )
         .unwrap();
         let planes = plan.planes().unwrap();
@@ -1925,14 +1926,14 @@ mod tests {
             .zip(&leaf.hiding_form)
         {
             lhs = lhs.add(
-                &coefficient.mul(&messages.mask_entry(&commit, *slot).unwrap()),
+                &coefficient.mul(&messages.mask_entry(commit, *slot).unwrap()),
             );
         }
         for term in &leaf.claim_masks {
             lhs = lhs.add(
                 &term
                     .coefficient
-                    .mul(&messages.mask_entry(&commit, term.slot).unwrap()),
+                    .mul(&messages.mask_entry(commit, term.slot).unwrap()),
             );
         }
         lhs = lhs.add(&map_coefficient.mul(&kept));
@@ -1949,7 +1950,10 @@ mod tests {
         for (weight, bit) in eq.iter().zip(&flipped) {
             changed_kept = changed_kept.add(&weight.mul(bit));
         }
-        assert_ne!(lhs.add(&map_coefficient.mul(&kept.sub(&changed_kept))), leaf.row_target);
+        assert_ne!(
+            lhs.add(&map_coefficient.mul(&kept.sub(&changed_kept))),
+            leaf.row_target
+        );
 
         // A changed mask entry breaks the row.
         let mut changed_messages = messages.clone();
@@ -1963,18 +1967,68 @@ mod tests {
             .zip(&leaf.hiding_form)
         {
             changed_lhs = changed_lhs.add(
-                &coefficient.mul(&changed_messages.mask_entry(&commit, *slot).unwrap()),
+                &coefficient.mul(&changed_messages.mask_entry(commit, *slot).unwrap()),
             );
         }
         for term in &leaf.claim_masks {
             changed_lhs = changed_lhs.add(
                 &term
                     .coefficient
-                    .mul(&changed_messages.mask_entry(&commit, term.slot).unwrap()),
+                    .mul(&changed_messages.mask_entry(commit, term.slot).unwrap()),
             );
         }
         changed_lhs = changed_lhs.add(&map_coefficient.mul(&kept));
         assert_ne!(changed_lhs, leaf.row_target);
+    }
+
+    fn commit_plan_mu_three() -> LookupCommitPlan {
+        let bits_shape = WShape::new(
+            2048,
+            build_code_plan(13, 2048, 1).unwrap(),
+            1,
+            1,
+            40,
+            703,
+            1,
+            Digest([0x42; 32]),
+            Digest([0x51; 32]),
+        )
+        .unwrap();
+        LookupCommitPlan {
+            bits_shape,
+            bits_oracle: 903,
+            group: 7,
+            bits_openings: 1,
+            mask_oracle: 904,
+            mask_code: build_code_plan(6, 32, 1).unwrap(),
+            mask_rows: 8,
+            mask_openings: 1,
+            mask_tree: RuntimeTreePlan {
+                tree_number: 704,
+                leaf_class: 1,
+                log_n: 6,
+                log_n_zk: 6,
+                parts: vec![RuntimeTreePart {
+                    main_symbols: 0,
+                    mask_symbols: 24,
+                }],
+                salt_bytes: 40,
+                run: Digest([0x43; 32]),
+                configuration: Digest([0x51; 32]),
+            },
+        }
+    }
+
+    #[test]
+    fn leaves_kept_row_matches_the_committed_bits() {
+        let plan = plan();
+        check_leaves_row(&plan, &commit_plan(), &[0, 0, 1, 2], 21);
+        let wide = LookupPlan {
+            key_bits: 2,
+            mu: 3,
+            table_log: 8,
+        };
+        check_leaves_row(&wide, &commit_plan_mu_three(), &[0, 0, 1, 2], 23);
     }
 
     #[test]
