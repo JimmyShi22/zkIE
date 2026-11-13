@@ -1,0 +1,18 @@
+commit 58654802bc9c3959dec6975c196b020d0a6b80b1
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Fri Nov 13 15:03:03 2026 +0800
+
+    Bind the parameter message evaluations to row coefficients
+    
+    The own relation rows can now bind a parameter vector evaluation to the
+    committed folded message: the equality weights of the column point are
+    scattered through the Gu message layout into the member's BAT table
+    coefficients, with the width, point length and message room checked. Nothing
+    reads a prover-supplied value. A test checks the coefficient mapping for both
+    parameters and rejects a wrong point length and a vector that does not fit the
+    message.
+    
+    partial progress
+
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 76 ++++++++++++++++++++++++
+ 1 file changed, 76 insertions(+)
