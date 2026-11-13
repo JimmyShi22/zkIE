@@ -9876,6 +9876,7 @@ fn prove_norm_second(
                 valid,
                 columns,
                 *relation,
+                plan.round.as_ref(),
             )?;
             let instance = position * relations.len() + relation_index;
             let entries = &mask_witness.entries[instance];

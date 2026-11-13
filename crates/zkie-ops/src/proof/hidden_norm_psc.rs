@@ -423,6 +423,7 @@ pub(crate) fn rel_map(
     valid: usize,
     columns: usize,
     relation: usize,
+    round: Option<&NormRoundPlan>,
 ) -> Result<(Vec<Fp3>, Vec<Fp3>)> {
     let (mut left, mut right) = map_pair(columns);
     match relation {
@@ -494,6 +495,76 @@ pub(crate) fn rel_map(
             right[1] = Fp3::ONE;
             right[2] = Fp3::ONE;
         }
+        8..=15 => {
+            let round = round.ok_or(Error::InvalidConfig)?;
+            let layout = &round.layout;
+            let (width, digits, value, offset) = match relation {
+                8 => (
+                    layout.widths.sum,
+                    shifted_digits(row.sum, layout.sum_offset)?,
+                    row.sum,
+                    layout.sum_offset,
+                ),
+                9 => (
+                    layout.widths.squares,
+                    row.squares_digits.clone(),
+                    row.squares,
+                    0,
+                ),
+                10 => (
+                    layout.widths.variance,
+                    row.variance_digits.clone(),
+                    row.variance as i128,
+                    0,
+                ),
+                11 => (
+                    layout.widths.mean,
+                    shifted_digits(row.mean as i128, layout.mean_offset)?,
+                    row.mean as i128,
+                    layout.mean_offset,
+                ),
+                12 => (
+                    layout.widths.offset,
+                    row.mean_offset_digits.clone(),
+                    row.mean_offset,
+                    0,
+                ),
+                13 => (
+                    layout.widths.offset,
+                    row.mean_complement_digits.clone(),
+                    row.mean_complement,
+                    0,
+                ),
+                14 => (
+                    layout.widths.offset,
+                    row.variance_offset_digits.clone(),
+                    row.variance_offset,
+                    0,
+                ),
+                _ => (
+                    layout.widths.offset,
+                    row.variance_complement_digits.clone(),
+                    row.variance_complement,
+                    0,
+                ),
+            };
+            if width >= columns || digits.len() > width {
+                return Err(Error::ShapeMismatch);
+            }
+            let mut power: i128 = 1;
+            for index in 0..width {
+                let digit = digits.get(index).copied().unwrap_or(0) as i128;
+                left[index] = fp3_signed(power * digit)?;
+                right[index] = Fp3::ONE;
+                power = power.checked_mul(256).ok_or(Error::ResourceLimit)?;
+            }
+            if offset != 0 {
+                left[width] = fp3_signed(-(offset as i128))?;
+                right[width] = Fp3::ONE;
+            }
+            left[columns] = fp3_signed(-value)?;
+            right[columns] = Fp3::ONE;
+        }
         _ => return Err(Error::InvalidConfig),
     }
     Ok((left, right))
@@ -537,6 +608,7 @@ pub fn prove_norm_psc(
                 valid,
                 columns,
                 relation,
+                None,
             )?;
             let mut challenges = PositionPscChallenges::new(
                 &mut chain,
@@ -613,7 +685,9 @@ pub const NORM_BIND_VERSION: u64 = 4;
 /// The relation indices the bound core supports. The map construction of
 /// every relation is fixed by the relation index; the plan may list only
 /// relations whose row binding is implemented.
-pub const NORM_BOUND_RELATIONS: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+pub const NORM_BOUND_RELATIONS: [usize; 16] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+];
 
 /// One committed witness group of the integrated norm plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1880,6 +1954,45 @@ mod tests {
         assert_eq!(norm_own_mask_rows(0, 8).unwrap(), 8);
         assert_eq!(norm_own_mask_rows(4, 8).unwrap(), 16);
         assert_eq!(norm_own_mask_rows(0, 0).unwrap(), 1);
+    }
+
+    #[test]
+    fn digit_reconstruction_maps_sum_to_zero() {
+        use crate::proof::hidden_norm_psc::{
+            rel_map, NormGroupPlan, NormRoundLayout, NormRoundPlan, NormRoundWidths,
+        };
+        let widths = NormRoundWidths {
+            sum: 2,
+            squares: 2,
+            variance: 2,
+            mean: 2,
+            offset: 1,
+        };
+        let layout = NormRoundLayout::new(widths, 4, 8, 4).unwrap();
+        let columns = 8usize;
+        let round = NormRoundPlan {
+            group: NormGroupPlan {
+                shape: group_shape(2, 1),
+                columns: 2,
+                group: 1,
+                oracle_base: 1,
+                openings: 1,
+            },
+            layout,
+            input_bound: 16,
+        };
+        for (row, valid) in [(vec![1i64, 2], 2usize), (vec![1i64, 2, 3, 4], 4usize)] {
+            let core = NormCoreRow::from_values(&row, valid).unwrap();
+            for relation in 8..=15 {
+                let (left, right) =
+                    rel_map(&core, &row, valid, columns, relation, Some(&round)).unwrap();
+                let dot = left
+                    .iter()
+                    .zip(right.iter())
+                    .fold(Fp3::ZERO, |sum, (a, b)| sum.add(&a.mul(b)));
+                assert_eq!(dot, Fp3::ZERO, "relation {relation} row {row:?}");
+            }
+        }
     }
 
     #[test]
