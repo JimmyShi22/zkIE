@@ -9331,6 +9331,28 @@ fn own_members(
             });
         }
     }
+    for input in norm_param_claim_inputs(plan, first, witness.and_then(|w| w.norm.as_ref()))? {
+        let gu = &input.claim.gu;
+        let (message, tails) = match &input.material {
+            Some(material) => (material.message.clone(), material.tails.clone()),
+            None => (Vec::new(), Vec::new()),
+        };
+        members.push(ProximityMember {
+            bat_oracle: 0,
+            source_oracle: gu.oracle,
+            main_code: gu.u.code,
+            mask_code: plan.proximity.mask_code,
+            main_rows: gu.u.main_rows,
+            mask_rows: 0,
+            answers: gu.u.answers,
+            root: input.message.root,
+            tree_plan: gu.tree.clone(),
+            message,
+            tails,
+            mask_message: Vec::new(),
+            mask_tails: Vec::new(),
+        });
+    }
     // The isolated FOLD fixture places blocks in registration order, so the
     // member order must follow the BAT block order: larger main blocks first,
     // and among mask-only members the larger mask block first.
@@ -9356,6 +9378,37 @@ fn own_sample_rows(
         members,
         zkie_engine::scheduling::DEFAULT_UNITS_IN_FLIGHT,
         |member| -> Result<Vec<GuRelationRow>> {
+        if let Some(norm_plan) = &plan.norm {
+            if let Some(params_plan) = &norm_plan.params {
+                let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
+                let message_params = norm_first.params.as_ref().ok_or(Error::ShapeMismatch)?;
+                let claims = [
+                    (
+                        params_plan.gain_claim.as_ref(),
+                        Some(&message_params.gain),
+                    ),
+                    (
+                        params_plan.bias_claim.as_ref(),
+                        message_params.bias.as_ref(),
+                    ),
+                ];
+                for (claim, message) in claims {
+                    let (claim, message) = match (claim, message) {
+                        (Some(claim), Some(message)) => (claim, message),
+                        _ => continue,
+                    };
+                    if member.source_oracle == claim.gu.oracle {
+                        let registry = norm_param_registry(claim, message)?;
+                        return Ok(sample_rows_of(
+                            &claim.gu,
+                            &registry,
+                            &message.seeds,
+                            &message.answers,
+                        )?);
+                    }
+                }
+            }
+        }
         if let Some(norm_plan) = &plan.norm {
             let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
             let groups = norm_group_plans(norm_plan);
@@ -14019,6 +14072,23 @@ fn witness_tree_for(
                     return Ok(tree.clone());
                 }
                 let tree = messages.mask_tree(commit)?;
+                if tree.plan() != &member.tree_plan || *tree.root() != member.root {
+                    return Err(Error::StatementMismatch);
+                }
+                return Ok(Arc::new(tree));
+            }
+        }
+        for input in norm_param_claim_inputs(plan, first, Some(norm_witness))? {
+            if member.source_oracle == input.claim.gu.oracle {
+                let gu = &input.claim.gu;
+                let material = input.material.as_ref().ok_or(Error::ShapeMismatch)?;
+                let tree = commit_rows_tree(
+                    gu.tree.clone(),
+                    gu.u.code,
+                    &material.message,
+                    &material.tails,
+                    &material.salts,
+                )?;
                 if tree.plan() != &member.tree_plan || *tree.root() != member.root {
                     return Err(Error::StatementMismatch);
                 }
