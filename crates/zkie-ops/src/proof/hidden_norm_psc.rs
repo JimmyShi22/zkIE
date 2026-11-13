@@ -38,6 +38,7 @@ use crate::proof::hidden_send_session::{SendSamples, WShape};
 use crate::proof::lookup::{
     LookupKeyPlan, LookupKeySource, LookupOutcome, LookupPlan, LookupProof,
 };
+use crate::proof::lookup_table::{TableConfig, TABLE_ENCODING_VERSION};
 use crate::proof::lookup_messages::LookupCommitPlan;
 use crate::proof::output_closure::{CommittedValueGroup, RetainedTrees};
 use crate::registry::{RSQRT_COARSE, RSQRT_COARSE_END, RSQRT_FINE, RSQRT_HALF, RSQRT_SHIFT};
@@ -305,6 +306,8 @@ pub struct NormPscSecond {
     /// The lookup transcript and claims, when the plan carries the lookup.
     /// The wire layout omits the field when the plan has no lookup.
     pub lookup: Option<NormLookupSecond>,
+    /// The frozen-table lookup transcript and claims, when the plan carries it.
+    pub rstd: Option<NormLookupSecond>,
 }
 
 impl NormPscSecond {
@@ -318,6 +321,9 @@ impl NormPscSecond {
         )?;
         if let Some(lookup) = &self.lookup {
             writer.put_bytes(&lookup.encode()?);
+        }
+        if let Some(rstd) = &self.rstd {
+            writer.put_bytes(&rstd.encode()?);
         }
         Ok(writer.into_bytes())
     }
@@ -341,6 +347,7 @@ impl NormPscSecond {
             psc,
             point_values,
             lookup: None,
+            rstd: None,
         };
         message.check(plan)?;
         Ok(message)
@@ -367,11 +374,19 @@ impl NormPscSecond {
             )?),
             None => None,
         };
+        let rstd = match &plan.rstd {
+            Some(rstd_plan) => Some(NormLookupSecond::decode_for_rstd(
+                rstd_plan,
+                reader.get_bytes()?,
+            )?),
+            None => None,
+        };
         reader.finish()?;
         let message = Self {
             psc,
             point_values,
             lookup,
+            rstd,
         };
         message.check_for(plan)?;
         Ok(message)
@@ -393,6 +408,11 @@ impl NormPscSecond {
             (None, None) => {}
             _ => return Err(Error::ShapeMismatch),
         }
+        match (&plan.rstd, &self.rstd) {
+            (Some(rstd_plan), Some(rstd)) => rstd.check_rstd(rstd_plan)?,
+            (None, None) => {}
+            _ => return Err(Error::ShapeMismatch),
+        }
         Ok(())
     }
 
@@ -409,7 +429,7 @@ impl NormPscSecond {
                 return Err(Error::ShapeMismatch);
             }
         }
-        if self.lookup.is_some() {
+        if self.lookup.is_some() || self.rstd.is_some() {
             return Err(Error::ShapeMismatch);
         }
         Ok(())
@@ -780,6 +800,7 @@ pub fn prove_norm_psc(
         psc,
         point_values,
         lookup: None,
+        rstd: None,
     })
 }
 
@@ -838,7 +859,7 @@ fn fp3_signed(value: i128) -> Result<Fp3> {
 // sumcheck and the row binding.
 
 /// Version of the integrated norm plan and first message.
-pub const NORM_BIND_VERSION: u64 = 5;
+pub const NORM_BIND_VERSION: u64 = 6;
 
 /// The relation indices the bound core supports. The map construction of
 /// every relation is fixed by the relation index; the plan may list only
@@ -939,6 +960,235 @@ impl NormLookupPlan {
         put_tree_plan(&mut writer, &self.commit.mask_tree);
         digest_bytes(&writer.into_bytes())
     }
+}
+
+/// The trusted plan of the frozen-table lookup. The key vector is the pair
+/// (committed index, committed table value); the table view fixes the trusted
+/// identity, content root, real length and encoding, and the key plan fixes
+/// the two committed round slots and the public first-row padding pair.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormRstdPlan {
+    pub lookup: LookupPlan,
+    pub commit: LookupCommitPlan,
+    pub key: crate::proof::lookup::LookupKeyPlan,
+    pub table: TableConfig,
+}
+
+impl NormRstdPlan {
+    pub fn validate(&self) -> Result<()> {
+        self.lookup.validate()?;
+        if self.lookup.columns != 2 {
+            return Err(Error::InvalidConfig);
+        }
+        self.key.validate(&self.lookup)?;
+        let planes = self.lookup.planes()?;
+        let rows = self.lookup.table_rows()?;
+        self.commit.validate(
+            planes.checked_mul(rows).ok_or(Error::ResourceLimit)?,
+            crate::proof::lookup::mask_count(&self.lookup)?,
+        )?;
+        if self.table.version != TABLE_ENCODING_VERSION
+            || self.table.identity == Digest::ZERO
+            || self.table.content_root == Digest::ZERO
+            || self.table.real_len == 0
+            || self.table.real_len > rows
+            || self.key.table_identity != self.table.identity
+            || self.key.padding_values.len() != 2
+        {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(())
+    }
+
+    /// Binds the lookup plan, the key map, the committed message plans, the
+    /// trusted table configuration and the first-row padding pair.
+    pub fn digest(&self) -> Digest {
+        let mut writer = CanonicalWriter::new();
+        writer.put_bytes(&self.lookup.digest());
+        writer.put_u64(self.key.sources.len() as u64);
+        for source in &self.key.sources {
+            writer.put_u64(source.column as u64);
+            writer.put_u64(source.oracle);
+            writer.put_u64(source.position as u64);
+            writer.put_u64(source.row as u64);
+            writer.put_u64(source.place as u64);
+            writer.put_fp3(&source.coefficient);
+            writer.put_fp3(&source.offset);
+        }
+        writer.put_u64(self.key.padding_values.len() as u64);
+        for padding in &self.key.padding_values {
+            writer.put_fp3(padding);
+        }
+        writer.put_digest(&self.key.table_identity);
+        writer.put_u64(self.commit.bits_oracle);
+        writer.put_u64(self.commit.bits_openings as u64);
+        writer.put_u64(self.commit.group);
+        writer.put_u64(self.commit.mask_oracle);
+        writer.put_u64(self.commit.mask_openings as u64);
+        put_wshape(&mut writer, &self.commit.bits_shape);
+        writer.put_u64(self.commit.mask_code.log_n as u64);
+        writer.put_u64(self.commit.mask_code.ell);
+        writer.put_u64(self.commit.mask_code.r);
+        writer.put_u64(self.commit.mask_rows);
+        put_tree_plan(&mut writer, &self.commit.mask_tree);
+        writer.put_digest(&self.table.identity);
+        writer.put_digest(&self.table.content_root);
+        writer.put_u64(self.table.real_len as u64);
+        writer.put_u64(self.table.version);
+        writer.put_u64(match self.table.encoding {
+            crate::proof::lookup_table::TableEncoding::I32Le => 4,
+            crate::proof::lookup_table::TableEncoding::I64Le => 8,
+        });
+        digest_bytes(&writer.into_bytes())
+    }
+
+    /// Sizes and builds the frozen-table lookup from the round value slots.
+    /// Column zero reads the committed index value slot, column one the
+    /// committed table value slot; the padding pair is the first table row.
+    pub fn from_round(
+        round: &NormRoundPlan,
+        positions: u32,
+        table: TableConfig,
+        first_value: Fp3,
+        params: &NormRstdParams,
+    ) -> Result<Self> {
+        if positions == 0
+            || table.real_len == 0
+            || table.version != TABLE_ENCODING_VERSION
+            || table.identity == Digest::ZERO
+            || table.content_root == Digest::ZERO
+            || params.bits_oracle == 0
+            || params.mask_oracle == 0
+            || params.bits_oracle == params.mask_oracle
+            || params.group == 0
+            || params.bits_tree == params.mask_tree
+            || params.code.r < 1
+            || params.mask_code.r < 1
+        {
+            return Err(Error::InvalidConfig);
+        }
+        let table_log = ceil_log2_u64(table.real_len as u64);
+        let (key_bits, mu) = lookup_parameters(positions as usize)?;
+        let lookup = LookupPlan {
+            key_bits,
+            mu,
+            table_log,
+            columns: 2,
+        };
+        lookup.validate()?;
+        let rows = lookup.table_rows()?;
+        if table.real_len > rows {
+            return Err(Error::InvalidConfig);
+        }
+        let round_rows = usize::try_from(round.group.shape.main_rows)
+            .map_err(|_| Error::ResourceLimit)?;
+        let ell = usize::try_from(round.group.shape.code.ell)
+            .map_err(|_| Error::ResourceLimit)?;
+        if round_rows == 0 || ell == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        let mut sources = Vec::with_capacity(positions as usize * 2);
+        for position in 0..positions {
+            let oracle = round
+                .group
+                .oracle_base
+                .checked_add(position as u64)
+                .ok_or(Error::ResourceLimit)?;
+            for (column, slot) in [
+                (0u8, round.layout.slots.index_value),
+                (1u8, round.layout.slots.rstd),
+            ] {
+                let row = slot % round_rows;
+                let place = slot / round_rows;
+                if place >= ell {
+                    return Err(Error::ShapeMismatch);
+                }
+                sources.push(LookupKeySource {
+                    column,
+                    oracle,
+                    position,
+                    row: row as u32,
+                    place: place as u32,
+                    coefficient: Fp3::ONE,
+                    offset: Fp3::ZERO,
+                });
+            }
+        }
+        let key = LookupKeyPlan {
+            sources,
+            padding_values: vec![Fp3::ZERO, first_value],
+            table_identity: table.identity,
+        };
+        let bit_count = lookup
+            .planes()?
+            .checked_mul(rows)
+            .ok_or(Error::ResourceLimit)?;
+        let bits_shape = WShape::new(
+            bit_count as u64,
+            params.code,
+            1,
+            1,
+            params.salt_bytes,
+            params.bits_tree,
+            params.leaf_class,
+            params.run,
+            params.configuration,
+        )?;
+        if bits_shape.main_rows > (1u64 << params.code.log_n) {
+            return Err(Error::InvalidConfig);
+        }
+        let mask_rows = lookup_mask_rows(&lookup, params.mask_code)?;
+        let mask_tree = RuntimeTreePlan {
+            tree_number: params.mask_tree,
+            leaf_class: params.leaf_class,
+            log_n: params.mask_code.log_n,
+            log_n_zk: params.mask_code.log_n,
+            parts: vec![RuntimeTreePart {
+                main_symbols: 0,
+                mask_symbols: mask_rows
+                    .checked_mul(zkie_engine::pcs::request::field::E_DEGREE as u64)
+                    .ok_or(Error::ResourceLimit)?,
+            }],
+            salt_bytes: params.salt_bytes,
+            run: params.run,
+            configuration: params.configuration,
+        };
+        let commit = LookupCommitPlan {
+            bits_shape,
+            bits_oracle: params.bits_oracle,
+            group: params.group,
+            bits_openings: 1,
+            mask_oracle: params.mask_oracle,
+            mask_code: params.mask_code,
+            mask_rows,
+            mask_openings: 1,
+            mask_tree,
+        };
+        let plan = Self {
+            lookup,
+            commit,
+            key,
+            table,
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+}
+
+/// The parent-plan values of the frozen-table lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NormRstdParams {
+    pub code: zkie_engine::pcs::request::code::CodeParams,
+    pub mask_code: zkie_engine::pcs::request::code::CodeParams,
+    pub group: u64,
+    pub bits_oracle: u64,
+    pub mask_oracle: u64,
+    pub bits_tree: u64,
+    pub mask_tree: u64,
+    pub leaf_class: u32,
+    pub salt_bytes: usize,
+    pub run: Digest,
+    pub configuration: Digest,
 }
 
 /// The smallest key-bit count and multiplicity-plane count of a byte lookup
@@ -1196,6 +1446,9 @@ pub struct NormPlan {
     pub round: Option<NormRoundPlan>,
     /// The lookup plan over the committed digit rows; optional in this stage.
     pub lookup: Option<NormLookupPlan>,
+    /// The frozen-table lookup over the committed index and table-value slots;
+    /// optional in this stage.
+    pub rstd: Option<NormRstdPlan>,
     /// The committed mask group; optional in this stage.
     pub mask: Option<NormMaskPlan>,
 }
@@ -1293,6 +1546,14 @@ impl NormPlan {
         if let Some(lookup) = &self.lookup {
             lookup.validate()?;
         }
+        if let Some(rstd) = &self.rstd {
+            rstd.validate()?;
+            if let Some(round) = &self.round {
+                if rstd.table.real_len as u64 != round.table_real_len {
+                    return Err(Error::InvalidConfig);
+                }
+            }
+        }
         if let Some(mask) = &self.mask {
             mask.validate(
                 self.shape.positions,
@@ -1343,6 +1604,13 @@ impl NormPlan {
             Some(lookup) => {
                 writer.put_u64(1);
                 writer.put_digest(&lookup.digest());
+            }
+            None => writer.put_u64(0),
+        }
+        match &self.rstd {
+            Some(rstd) => {
+                writer.put_u64(1);
+                writer.put_digest(&rstd.digest());
             }
             None => writer.put_u64(0),
         }
@@ -1814,6 +2082,8 @@ pub struct NormWitness {
     pub mask: Option<NormMaskWitness>,
     /// The private lookup material, when the plan carries the lookup.
     pub lookup: Option<NormLookupWitness>,
+    /// The private frozen-table lookup material, when the plan carries it.
+    pub rstd: Option<NormLookupWitness>,
 }
 
 /// The private lookup material of one norm session. The multiplicity bits are
@@ -1842,6 +2112,8 @@ pub struct NormRowBinding {
     /// The checked lookup transcript and claims, when the plan carries the
     /// lookup. The row builder consumes the claims on both sides.
     pub lookup: Option<NormLookupSecond>,
+    /// The checked frozen-table lookup transcript and claims.
+    pub rstd: Option<NormLookupSecond>,
 }
 
 /// The lookup commitments of the first stage: the multiplicity-bit group and
@@ -1876,6 +2148,63 @@ impl NormLookupMessage {
         let message = Self { bits, mask };
         message.check(plan)?;
         Ok(message)
+    }
+
+    fn encode_rstd(&self) -> Result<Vec<u8>> {
+        self.encode()
+    }
+
+    fn decode_rstd_for(plan: &NormRstdPlan, bytes: &[u8]) -> Result<Self> {
+        let commit = &plan.commit;
+        let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
+        let bits = CommittedPscGroup::decode(&mut reader, &commit.bits_shape, 1)?;
+        let mask = NormMaskMessage::decode_with(
+            &commit.mask_tree,
+            1,
+            commit.mask_openings,
+            reader.get_bytes()?,
+        )?;
+        reader.finish()?;
+        let message = Self { bits, mask };
+        message.check_rstd_for(plan)?;
+        Ok(message)
+    }
+
+    fn check_rstd_for(&self, plan: &NormRstdPlan) -> Result<()> {
+        let commit = &plan.commit;
+        if self.bits.fault(&commit.bits_shape, 1).is_some() {
+            return Err(Error::ShapeMismatch);
+        }
+        let entry = self
+            .bits
+            .message
+            .group
+            .entries
+            .first()
+            .ok_or(Error::ShapeMismatch)?;
+        if self.bits.message.group.group != commit.group
+            || entry.position != 0
+            || entry.oracle != commit.bits_oracle
+            || entry.shape != commit.bits_shape.oracle_shape()
+            || entry.tree != commit.bits_shape.tree_plan(0)?
+            || entry.root == Digest::ZERO
+            || self.bits.message.roots.len() != 1
+            || self.bits.sample.seed.len() != commit.bits_shape.answers as usize
+            || self.bits.sample.answers.len() != 1
+            || self.bits.positions.len() != 1
+            || self.bits.positions[0].len() != commit.bits_openings
+            || self.bits.openings.len() != 1
+            || self.bits.openings[0].positions != self.bits.positions[0]
+            || self.mask.tree != commit.mask_tree
+            || self.mask.root == Digest::ZERO
+            || self.mask.sample.seed.len() != 1
+            || self.mask.sample.answers.len() != 1
+            || self.mask.positions.len() != commit.mask_openings
+            || self.mask.opening.positions != self.mask.positions
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        Ok(())
     }
 
     fn check(&self, plan: &NormLookupPlan) -> Result<()> {
@@ -1945,6 +2274,18 @@ impl NormLookupSecond {
     fn check(&self, plan: &NormLookupPlan) -> Result<()> {
         self.claims.check(&plan.lookup)
     }
+
+    fn decode_for_rstd(plan: &NormRstdPlan, bytes: &[u8]) -> Result<Self> {
+        let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
+        let proof = LookupProof::decode(&plan.lookup, reader.get_bytes()?)?;
+        let claims = LookupOutcome::decode(&plan.lookup, reader.get_bytes()?)?;
+        reader.finish()?;
+        Ok(Self { proof, claims })
+    }
+
+    fn check_rstd(&self, plan: &NormRstdPlan) -> Result<()> {
+        self.claims.check(&plan.lookup)
+    }
 }
 
 /// The public first-stage message of the integrated norm relation.
@@ -1961,6 +2302,9 @@ pub struct NormFirstMessages {
     /// the lookup. The wire layout omits the field entirely when the plan has
     /// no lookup, so the lookup-free bytes stay unchanged.
     pub lookup: Option<NormLookupMessage>,
+    /// The frozen-table lookup commitments, samples and openings, when the
+    /// plan carries it.
+    pub rstd: Option<NormLookupMessage>,
 }
 
 impl NormFirstMessages {
@@ -1988,6 +2332,9 @@ impl NormFirstMessages {
         }
         if let Some(lookup) = &self.lookup {
             writer.put_bytes(&lookup.encode()?);
+        }
+        if let Some(rstd) = &self.rstd {
+            writer.put_bytes(&rstd.encode_rstd()?);
         }
         Ok(writer.into_bytes())
     }
@@ -2041,6 +2388,13 @@ impl NormFirstMessages {
             )?),
             None => None,
         };
+        let rstd = match &plan.rstd {
+            Some(rstd_plan) => Some(NormLookupMessage::decode_rstd_for(
+                rstd_plan,
+                reader.get_bytes()?,
+            )?),
+            None => None,
+        };
         reader.finish()?;
         let message = Self {
             x,
@@ -2051,6 +2405,7 @@ impl NormFirstMessages {
             round,
             mask,
             lookup,
+            rstd,
         };
         message.check_trusted(plan)?;
         Ok(message)
@@ -2131,6 +2486,11 @@ impl NormFirstMessages {
         }
         match (&plan.lookup, &self.lookup) {
             (Some(lookup_plan), Some(message)) => message.check(lookup_plan)?,
+            (None, None) => {}
+            _ => return Err(Error::ShapeMismatch),
+        }
+        match (&plan.rstd, &self.rstd) {
+            (Some(rstd_plan), Some(message)) => message.check_rstd_for(rstd_plan)?,
             (None, None) => {}
             _ => return Err(Error::ShapeMismatch),
         }
@@ -3254,6 +3614,75 @@ mod tests {
     }
 
     #[test]
+    fn rstd_plan_reads_the_committed_index_and_value_slots() {
+        use crate::proof::lookup_table::{TableConfig, TableEncoding, TABLE_ENCODING_VERSION};
+
+        let widths = NormRoundWidths {
+            sum: 1,
+            squares: 1,
+            variance: 1,
+            mean: 1,
+            offset: 1,
+        };
+        let layout = NormRoundLayout::new(widths, 4, 8, 4).unwrap();
+        let columns = widths.columns().unwrap();
+        let round = NormRoundPlan {
+            group: NormGroupPlan {
+                shape: group_shape(columns, 1),
+                columns,
+                group: 1,
+                oracle_base: 9000,
+                openings: 1,
+            },
+            layout,
+            input_bound: 8,
+            table_real_len: 8,
+        };
+        let table = TableConfig {
+            identity: Digest([0x71; 32]),
+            content_root: Digest([0x72; 32]),
+            real_len: 8,
+            encoding: TableEncoding::I32Le,
+            version: TABLE_ENCODING_VERSION,
+        };
+        let params = NormRstdParams {
+            code: build_code_plan(6, 32, 4).unwrap(),
+            mask_code: build_code_plan(6, 32, 4).unwrap(),
+            group: 7,
+            bits_oracle: 9800,
+            mask_oracle: 9801,
+            bits_tree: 60800,
+            mask_tree: 60801,
+            leaf_class: 1,
+            salt_bytes: 40,
+            run: Digest([0x73; 32]),
+            configuration: Digest([0x74; 32]),
+        };
+        let plan = NormRstdPlan::from_round(&round, 2, table, Fp3::from_u64(100), &params)
+            .unwrap();
+        assert_eq!(plan.lookup.columns, 2);
+        assert_eq!(plan.lookup.table_log, 3);
+        assert_eq!(plan.key.sources.len(), 4);
+        assert_eq!(plan.key.sources[0].column, 0);
+        assert_eq!(plan.key.sources[1].column, 1);
+        assert_eq!(plan.key.sources[2].column, 0);
+        assert_eq!(plan.key.sources[3].column, 1);
+        assert_eq!(
+            plan.key.padding_values,
+            vec![Fp3::ZERO, Fp3::from_u64(100)]
+        );
+        assert_eq!(plan.key.table_identity, table.identity);
+        plan.validate().unwrap();
+
+        let mut bad = table;
+        bad.identity = Digest::ZERO;
+        assert!(NormRstdPlan::from_round(&round, 2, bad, Fp3::ZERO, &params).is_err());
+        let mut bad = plan.clone();
+        bad.lookup.columns = 1;
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
     fn rsqrt_slots_take_the_segmentation_values() {
         use crate::proof::hidden_norm::RsqrtRow;
 
@@ -3700,6 +4129,7 @@ mod tests {
             variance: integrated_group(&psc.groups.variance),
             round: None,
             lookup: None,
+            rstd: None,
             mask: None,
         };
         let message = NormFirstMessages {
@@ -3711,6 +4141,7 @@ mod tests {
             round: None,
             mask: None,
             lookup: None,
+            rstd: None,
         };
         (plan, message, second)
     }

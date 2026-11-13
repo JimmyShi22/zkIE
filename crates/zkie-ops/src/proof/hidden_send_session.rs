@@ -10031,6 +10031,7 @@ fn prove_norm_first(
             round: round_message,
             mask,
             lookup,
+            rstd: None,
         },
         lookup_messages,
     ))
@@ -10422,10 +10423,12 @@ fn prove_norm_second(
             psc,
             point_values,
             lookup: lookup.clone(),
+            rstd: None,
         },
         NormRowBinding {
             positions: bindings,
             lookup,
+            rstd: None,
         },
     ))
 }
@@ -10537,6 +10540,7 @@ fn verify_norm_second(
     Ok(NormRowBinding {
         positions: bindings,
         lookup: lookup_binding,
+        rstd: None,
     })
 }
 
@@ -15597,6 +15601,7 @@ mod merged_tests {
             variance: norm_group(1, 84, 9400, 60400),
             round: None,
             lookup: None,
+            rstd: None,
             mask: None,
         }
     }
@@ -15876,6 +15881,7 @@ mod merged_tests {
             variance: group(1, GROUP, 9400, 60400),
             round: None,
             lookup: None,
+            rstd: None,
             mask: Some(mask_plan.clone()),
         };
         let round_widths = NormRoundWidths {
@@ -16020,6 +16026,7 @@ mod merged_tests {
             rsqrt: Some(rsqrt_rows),
             mask: Some(mask_witness),
             lookup: None,
+            rstd: None,
         };
         let mut plan = hidden_plan(_activation);
         plan.norm = Some(norm);
