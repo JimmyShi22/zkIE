@@ -14570,6 +14570,94 @@ fn output_tail_bias_rows(
     Ok(rows)
 }
 
+/// The BAT rows of the padding rule: every non-valid column's pre-clamp
+/// value equals the bias entry of the same column read from the committed
+/// G_u message at the unit point of that column. The clamp value relation
+/// then yields `out = clamp(bias)` on those columns. The valid count is the
+/// trusted plan value; the rows enumerate exactly the non-valid columns.
+fn output_tail_padding_rows(
+    plan: &HiddenLinPlan,
+    members: &[ProximityMember],
+) -> Result<Vec<BatRow>> {
+    let norm = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
+    let output_plan = norm.output.as_ref().ok_or(Error::InvalidConfig)?;
+    let tail_plan = output_plan.tail.as_ref().ok_or(Error::InvalidConfig)?;
+    let params_plan = norm.params.as_ref().ok_or(Error::InvalidConfig)?;
+    let bias_claim = params_plan
+        .bias_claim
+        .as_ref()
+        .ok_or(Error::InvalidConfig)?;
+    let positions = norm.shape.positions as usize;
+    let columns = usize::try_from(norm.columns).map_err(|_| Error::ResourceLimit)?;
+    let valid = norm.shape.valid as usize;
+    if valid >= columns {
+        return Ok(Vec::new());
+    }
+    let bits = usize::try_from(norm.columns.trailing_zeros())
+        .map_err(|_| Error::ResourceLimit)?;
+    let slots = tail_plan.slots()?;
+    let q_at = 0usize;
+    let r_at = tail_plan.widths.quotient;
+    let u_at = r_at + tail_plan.widths.remainder;
+    let w_at = u_at + tail_plan.widths.doubled_remainder;
+    let s_at = w_at + tail_plan.widths.tie_slack;
+    let sh_at = s_at + 1;
+    let pre_at = sh_at + tail_plan.widths.shifted;
+    let tail_rows = usize::try_from(tail_plan.group.shape.main_rows)
+        .map_err(|_| Error::ResourceLimit)?;
+    let tail_ell = usize::try_from(tail_plan.group.shape.code.ell)
+        .map_err(|_| Error::ResourceLimit)?;
+    let half_p = 1u128 << (8 * tail_plan.widths.pre_clamp as u32 - 1);
+    // pre_off - bias = half_p: the digit reconstruction minus the unit-point
+    // bias read equals the public half-range offset.
+    let target = Fp3::from_u64(u64::try_from(half_p).map_err(|_| Error::BoundViolation)?);
+    let mut bat_of = std::collections::HashMap::new();
+    for member in members {
+        bat_of.insert(member.source_oracle, member);
+    }
+    let member_for = |oracle: u64| -> Result<&ProximityMember> {
+        bat_of
+            .get(&oracle)
+            .copied()
+            .ok_or(Error::StatementMismatch)
+    };
+    let bias_member = member_for(bias_claim.gu.oracle)?;
+    let mut rows = Vec::with_capacity(positions * (columns - valid));
+    for position in 0..positions {
+        let tail_member = member_for(tail_plan.group.oracle_base + position as u64)?;
+        for column in valid..columns {
+            if column * slots + pre_at + tail_plan.widths.pre_clamp > tail_rows * tail_ell {
+                return Err(Error::ShapeMismatch);
+            }
+            let mut coefficients = vec![Fp3::ZERO; tail_rows * tail_ell];
+            let base = column * slots + pre_at;
+            let mut power = Fp3::ONE;
+            for digit in 0..tail_plan.widths.pre_clamp {
+                coefficients[base + digit] = power;
+                power = power.mul(&Fp3::from_u64(256));
+            }
+            let mut unit = vec![Fp3::ZERO; bits];
+            for bit in 0..bits {
+                if (column >> bit) & 1 == 1 {
+                    unit[bit] = Fp3::ONE;
+                }
+            }
+            let bias_coefficients =
+                norm_param_eval_coefficients(&bias_claim.gu, norm.columns, &unit)?;
+            let negated: Vec<Fp3> = bias_coefficients
+                .iter()
+                .map(|value| Fp3::ZERO.sub(value))
+                .collect();
+            let mut row = BatRow::new(BatRowKind::Plain);
+            row.add_term(tail_member.bat_oracle, BatPart::Main, coefficients);
+            row.add_term(bias_member.bat_oracle, BatPart::Main, negated);
+            row.target = target;
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
 fn own_plain_rows(
     plan: &HiddenLinPlan,
     members: &[ProximityMember],
@@ -14709,6 +14797,7 @@ fn own_plain_rows(
         }
         if let Some(point) = &binding.bias_point {
             rows.extend(output_tail_bias_rows(plan, members, point)?);
+            rows.extend(output_tail_padding_rows(plan, members)?);
         }
         let norm_plan = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
         if let Some(lookup) = &binding.lookup {
