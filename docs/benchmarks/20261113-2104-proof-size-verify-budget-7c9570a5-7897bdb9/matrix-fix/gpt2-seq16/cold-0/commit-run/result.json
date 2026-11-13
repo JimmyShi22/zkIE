@@ -1,0 +1,1 @@
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"commit","error_code":null,"last_completed_stage":"commit","last_event_seq":3,"outcome":"PASS","output_binding":null,"progress_path":"/data/i1b-fix/gpt2-seq16/cold-0/commit-run/progress.jsonl","proof_bytes":null,"protocol_wall_ms":3407,"run_id":"commit","stage_wall_ms":3407,"vmhwm_kib":356448}

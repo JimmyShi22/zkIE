@@ -1,0 +1,4 @@
+7c9570a5 Size the verify decode budget from the proof file
+
+ zkie/src/verify.rs | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
