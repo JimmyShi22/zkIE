@@ -480,7 +480,7 @@ impl NormTailPscSecond {
             .ok_or(Error::InvalidConfig)?;
         let instances = usize::try_from(plan.shape.positions)
             .map_err(|_| Error::ResourceLimit)?
-            .checked_mul(5)
+            .checked_mul(NORM_OUTPUT_TAIL_RELATIONS)
             .ok_or(Error::ResourceLimit)?;
         let variables = output_tail_variables(plan.columns)?;
         let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
@@ -497,7 +497,7 @@ impl NormTailPscSecond {
     }
 
     pub fn check(&self, plan: &NormPlan, tail_plan: &NormOutputTailPlan) -> Result<()> {
-        let instances = plan.shape.positions as usize * 5;
+        let instances = plan.shape.positions as usize * NORM_OUTPUT_TAIL_RELATIONS;
         let variables = output_tail_variables(plan.columns)?;
         let _ = tail_plan;
         if self.psc.len() != instances || self.point_values.len() != instances {
@@ -1881,7 +1881,7 @@ impl NormPlan {
                 .and_then(|output| output.tail.as_ref())
                 .is_some()
             {
-                5
+                NORM_OUTPUT_TAIL_RELATIONS
             } else {
                 0
             };
@@ -2347,7 +2347,10 @@ impl NormMaskPlan {
         let columns = 1u64 << (variables as u32 - 1);
         let (tail_hiding, tail_shown) = norm_tail_mask_masks(columns)
             .map_err(|_| Error::InvalidConfig)?;
-        if self.tail_hiding != tail_hiding || self.tail_shown != tail_shown || self.tail > 5 {
+        if self.tail_hiding != tail_hiding
+            || self.tail_shown != tail_shown
+            || self.tail > NORM_OUTPUT_TAIL_RELATIONS
+        {
             return Err(Error::InvalidConfig);
         }
         let (pointwise_hiding, pointwise_shown) =
@@ -2984,7 +2987,11 @@ impl NormOutputTailPlan {
 }
 
 /// The number of product slots one column uses in the tail relation packing.
-pub const NORM_OUTPUT_TAIL_PAIRS: usize = 8;
+pub const NORM_OUTPUT_TAIL_PAIRS: usize = 16;
+/// The number of tail relations: rounding reconstruction, shifted value,
+/// selector booleanity, doubled remainder, tie slack, clamp value, selector
+/// exclusivity.
+pub const NORM_OUTPUT_TAIL_RELATIONS: usize = 7;
 
 /// The product-sumcheck variable count of the tail relations.
 pub fn output_tail_variables(columns: u64) -> Result<usize> {
@@ -3003,6 +3010,7 @@ pub fn output_tail_variables(columns: u64) -> Result<usize> {
 pub enum TailFactor {
     Slot { index: usize, scale: Fp3 },
     Image,
+    Out,
     Constant(Fp3),
 }
 
@@ -3166,17 +3174,91 @@ pub fn output_rel_terms(
                     right: TailFactor::Constant(field(divisor)?),
                 });
             }
+            5 => {
+                terms.push(TailTerm {
+                    column,
+                    left: TailFactor::Out,
+                    right: TailFactor::Constant(Fp3::ONE),
+                });
+                let pre_at = sh_at + plan.widths.shifted;
+                for digit in 0..plan.widths.pre_clamp {
+                    terms.push(TailTerm {
+                        column,
+                        left: slot(base + pre_at + digit),
+                        right: TailFactor::Constant(neg(times(1, digit)?)),
+                    });
+                }
+                if let Some(clamp) = &plan.clamp {
+                    let low_at = pre_at + plan.widths.pre_clamp;
+                    let high_at = low_at + clamp.low;
+                    let low_half = 1u128 << (8 * clamp.low as u32 - 1);
+                    let high_half = 1u128 << (8 * clamp.high as u32 - 1);
+                    let low_selector = high_at + clamp.high;
+                    for digit in 0..clamp.low {
+                        terms.push(TailTerm {
+                            column,
+                            left: slot(base + low_selector),
+                            right: TailFactor::Slot {
+                                index: base + low_at + digit,
+                                scale: times(1, digit)?,
+                            },
+                        });
+                    }
+                    for digit in 0..clamp.high {
+                        terms.push(TailTerm {
+                            column,
+                            left: slot(base + low_selector + 1),
+                            right: TailFactor::Slot {
+                                index: base + high_at + digit,
+                                scale: times(1, digit)?,
+                            },
+                        });
+                    }
+                    terms.push(TailTerm {
+                        column,
+                        left: slot(base + low_selector),
+                        right: TailFactor::Constant(neg(field(low_half)?)),
+                    });
+                    terms.push(TailTerm {
+                        column,
+                        left: slot(base + low_selector + 1),
+                        right: TailFactor::Constant(neg(field(high_half)?)),
+                    });
+                }
+                terms.push(TailTerm {
+                    column,
+                    left: TailFactor::Constant(field(1u128 << (8 * plan.widths.pre_clamp as u32 - 1))?),
+                    right: TailFactor::Constant(Fp3::ONE),
+                });
+            }
+            6 => {
+                if plan.clamp.is_some() {
+                    let pre_at = sh_at + plan.widths.shifted;
+                    let low_at = pre_at + plan.widths.pre_clamp;
+                    let clamp = plan.clamp.as_ref().ok_or(Error::InvalidConfig)?;
+                    let high_at = low_at + clamp.low;
+                    let low_selector = high_at + clamp.high;
+                    terms.push(TailTerm {
+                        column,
+                        left: slot(base + low_selector),
+                        right: slot(base + low_selector + 1),
+                    });
+                }
+            }
             _ => return Err(Error::UnsupportedPrimitive),
         }
     }
     Ok(terms)
 }
 
+
+
 fn factor_value(
     factor: &TailFactor,
     column: usize,
     values: &[Fp3],
     image: &[Fp3],
+    out: &[Fp3],
 ) -> Result<Fp3> {
     Ok(match factor {
         TailFactor::Slot { index, scale } => values
@@ -3184,6 +3266,7 @@ fn factor_value(
             .ok_or(Error::ShapeMismatch)?
             .mul(scale),
         TailFactor::Image => *image.get(column).ok_or(Error::ShapeMismatch)?,
+        TailFactor::Out => *out.get(column).ok_or(Error::ShapeMismatch)?,
         TailFactor::Constant(value) => *value,
     })
 }
@@ -3211,8 +3294,13 @@ pub fn output_rel_map(
     )
     .map_err(|_| Error::ResourceLimit)?;
     let mut image = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(count);
+    if row.out.len() != count {
+        return Err(Error::ShapeMismatch);
+    }
     for column in 0..count {
         image.push(fp3_signed(row.image[column])?);
+        out.push(fp3_signed(row.out[column] as i128)?);
     }
     let mut left = vec![Fp3::ZERO; domain];
     let mut right = vec![Fp3::ZERO; domain];
@@ -3226,8 +3314,8 @@ pub fn output_rel_map(
         if used[term.column] > NORM_OUTPUT_TAIL_PAIRS {
             return Err(Error::ShapeMismatch);
         }
-        left[at] = factor_value(&term.left, term.column, &values, &image)?;
-        right[at] = factor_value(&term.right, term.column, &values, &image)?;
+        left[at] = factor_value(&term.left, term.column, &values, &image, &out)?;
+        right[at] = factor_value(&term.right, term.column, &values, &image, &out)?;
     }
     Ok((left, right))
 }
@@ -6228,10 +6316,10 @@ mod tests {
                 &bias,
                 2,
                 3,
-                Some((-20, 20)),
+                None,
             )
             .unwrap();
-            for relation in 0..5usize {
+            for relation in 0..NORM_OUTPUT_TAIL_RELATIONS {
                 let (left, right) = output_rel_map(&tail_plan, &row, columns, 3, relation).unwrap();
                 assert_eq!(inner(&left, &right), Fp3::ZERO, "relation {relation}");
             }
@@ -6248,13 +6336,13 @@ mod tests {
             let (left, right) = output_rel_map(&tail_plan, &changed, columns, 3, 0).unwrap();
             assert_ne!(inner(&left, &right), Fp3::ZERO);
         }
-        assert_eq!(output_tail_variables(columns).unwrap(), 5);
+        assert_eq!(output_tail_variables(columns).unwrap(), 6);
         let row = {
             let core = NormCoreRow::from_values(&[1, 2], 2).unwrap();
             NormOutputRow::from_core(&core, &[1, 2, 0, 0], 100, &weight, &bias, 2, 3, None)
                 .unwrap()
         };
-        assert!(output_rel_map(&tail_plan, &row, columns, 3, 5).is_err());
+        assert!(output_rel_map(&tail_plan, &row, columns, 3, NORM_OUTPUT_TAIL_RELATIONS).is_err());
     }
 
     #[test]

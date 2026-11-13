@@ -12251,12 +12251,12 @@ fn prove_norm_second(
                 masks: Vec::new(),
                 target: Fp3::ZERO,
             };
-            let mut psc = Vec::with_capacity(positions * 5);
-            let mut point_values = Vec::with_capacity(positions * 5);
-            let mut tail_bindings = Vec::with_capacity(positions * 5);
+            let mut psc = Vec::with_capacity(positions * crate::proof::hidden_norm_psc::NORM_OUTPUT_TAIL_RELATIONS);
+            let mut point_values = Vec::with_capacity(positions * crate::proof::hidden_norm_psc::NORM_OUTPUT_TAIL_RELATIONS);
+            let mut tail_bindings = Vec::with_capacity(positions * crate::proof::hidden_norm_psc::NORM_OUTPUT_TAIL_RELATIONS);
             for position in 0..positions {
-                for relation in 0..5usize {
-                    let instance = position * 5 + relation;
+                for relation in 0..crate::proof::hidden_norm_psc::NORM_OUTPUT_TAIL_RELATIONS {
+                    let instance = position * crate::proof::hidden_norm_psc::NORM_OUTPUT_TAIL_RELATIONS + relation;
                     let (left, right) = crate::proof::hidden_norm_psc::output_rel_map(
                         tail_plan,
                         &output_witness.rows[position],
@@ -12535,8 +12535,8 @@ fn verify_norm_second(
                 masks: Vec::new(),
                 target: Fp3::ZERO,
             };
-            let mut tail_bindings = Vec::with_capacity(positions * 5);
-            for instance in 0..positions * 5 {
+            let mut tail_bindings = Vec::with_capacity(positions * crate::proof::hidden_norm_psc::NORM_OUTPUT_TAIL_RELATIONS);
+            for instance in 0..positions * crate::proof::hidden_norm_psc::NORM_OUTPUT_TAIL_RELATIONS {
                 let proof = message.psc.get(instance).ok_or(Error::ShapeMismatch)?;
                 let mut challenges =
                     crate::proof::committed_psc::PositionPscChallenges::new(
@@ -12562,8 +12562,8 @@ fn verify_norm_second(
                     return Err(Error::InvalidProof);
                 }
                 tail_bindings.push(crate::proof::hidden_norm_psc::NormTailBinding {
-                    position: (instance / 5) as u32,
-                    relation: instance % 5,
+                    position: (instance / crate::proof::hidden_norm_psc::NORM_OUTPUT_TAIL_RELATIONS) as u32,
+                    relation: instance % crate::proof::hidden_norm_psc::NORM_OUTPUT_TAIL_RELATIONS,
                     output,
                 });
             }
@@ -14285,6 +14285,7 @@ fn add_tail_factor(
     factor: &crate::proof::hidden_norm_psc::TailFactor,
     tail: &mut [Fp3],
     image: &mut [Fp3],
+    out: &mut [Fp3],
     column: usize,
     constant: &mut Fp3,
 ) -> Result<()> {
@@ -14297,6 +14298,10 @@ fn add_tail_factor(
         }
         TailFactor::Image => {
             let slot = image.get_mut(column).ok_or(Error::ShapeMismatch)?;
+            *slot = slot.add(&weight);
+        }
+        TailFactor::Out => {
+            let slot = out.get_mut(column).ok_or(Error::ShapeMismatch)?;
             *slot = slot.add(&weight);
         }
         TailFactor::Constant(value) => {
@@ -14342,7 +14347,11 @@ fn output_tail_plain_rows(
         .map_err(|_| Error::ResourceLimit)?;
     let image_ell = usize::try_from(output_plan.image.shape.code.ell)
         .map_err(|_| Error::ResourceLimit)?;
-    if binding.len() != positions.checked_mul(5).ok_or(Error::ResourceLimit)? {
+    let out_rows = usize::try_from(output_plan.out.shape.main_rows)
+        .map_err(|_| Error::ResourceLimit)?;
+    let out_ell = usize::try_from(output_plan.out.shape.code.ell)
+        .map_err(|_| Error::ResourceLimit)?;
+    if binding.len() != positions.checked_mul(crate::proof::hidden_norm_psc::NORM_OUTPUT_TAIL_RELATIONS).ok_or(Error::ResourceLimit)? {
         return Err(Error::ShapeMismatch);
     }
     let mut bat_of = std::collections::HashMap::new();
@@ -14367,10 +14376,10 @@ fn output_tail_plain_rows(
     let mut rows = Vec::with_capacity(binding.len() * 3);
     for word in binding {
         let position = word.position as usize;
-        if position >= positions || word.relation >= 5 {
+        if position >= positions || word.relation >= crate::proof::hidden_norm_psc::NORM_OUTPUT_TAIL_RELATIONS {
             return Err(Error::InvalidProof);
         }
-        let instance = position * 5 + word.relation;
+        let instance = position * crate::proof::hidden_norm_psc::NORM_OUTPUT_TAIL_RELATIONS + word.relation;
         let output = &word.output;
         if output.point.len() != variables || output.ends.len() != 2 {
             return Err(Error::InvalidProof);
@@ -14382,10 +14391,13 @@ fn output_tail_plain_rows(
         let terms = output_rel_terms(tail_plan, norm.columns, output_plan.shift, word.relation)?;
         let tail_member = member_for(tail_plan.group.oracle_base + position as u64)?;
         let image_member = member_for(output_plan.image.oracle_base + position as u64)?;
+        let out_member = member_for(output_plan.out.oracle_base + position as u64)?;
         let mut tail_left = vec![Fp3::ZERO; tail_rows * tail_ell];
         let mut image_left = vec![Fp3::ZERO; image_rows * image_ell];
         let mut tail_right = vec![Fp3::ZERO; tail_rows * tail_ell];
         let mut image_right = vec![Fp3::ZERO; image_rows * image_ell];
+        let mut out_left = vec![Fp3::ZERO; out_rows * out_ell];
+        let mut out_right = vec![Fp3::ZERO; out_rows * out_ell];
         let mut left_constant = Fp3::ZERO;
         let mut right_constant = Fp3::ZERO;
         let mut used = vec![0usize; columns];
@@ -14404,6 +14416,7 @@ fn output_tail_plain_rows(
                 &term.left,
                 &mut tail_left,
                 &mut image_left,
+                &mut out_left,
                 term.column,
                 &mut left_constant,
             )?;
@@ -14412,6 +14425,7 @@ fn output_tail_plain_rows(
                 &term.right,
                 &mut tail_right,
                 &mut image_right,
+                &mut out_right,
                 term.column,
                 &mut right_constant,
             )?;
@@ -14426,6 +14440,7 @@ fn output_tail_plain_rows(
         let mut row = BatRow::new(BatRowKind::Plain);
         row.add_term(tail_member.bat_oracle, BatPart::Main, tail_left);
         row.add_term(image_member.bat_oracle, BatPart::Main, image_left);
+        row.add_term(out_member.bat_oracle, BatPart::Main, out_left);
         row.add_unit(
             mask_member.bat_oracle,
             BatPart::Mask,
@@ -14437,6 +14452,7 @@ fn output_tail_plain_rows(
         let mut row = BatRow::new(BatRowKind::Plain);
         row.add_term(tail_member.bat_oracle, BatPart::Main, tail_right);
         row.add_term(image_member.bat_oracle, BatPart::Main, image_right);
+        row.add_term(out_member.bat_oracle, BatPart::Main, out_right);
         row.add_unit(
             mask_member.bat_oracle,
             BatPart::Mask,
@@ -22124,7 +22140,8 @@ mod merged_tests {
             let norm = plan.norm.as_mut().unwrap();
             norm.output = Some(output_plan.clone());
             norm.mask.as_mut().unwrap().pointwise = 2;
-            norm.mask.as_mut().unwrap().tail = 5;
+            norm.mask.as_mut().unwrap().tail =
+                crate::proof::hidden_norm_psc::NORM_OUTPUT_TAIL_RELATIONS;
         }
         let gain = vec![2i64, -1, 3, 1];
         let bias = vec![1i64, 2, -1, 2];
@@ -22459,7 +22476,7 @@ mod merged_tests {
         // popped proof, a popped point value or a missing section is rejected.
         assert_eq!(
             base.second.norm.as_ref().unwrap().tail.as_ref().unwrap().psc.len(),
-            POSITIONS as usize * 5
+            POSITIONS as usize * 7
         );
         let mut changed = base.clone();
         changed
