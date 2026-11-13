@@ -1,0 +1,21 @@
+commit be4607d3829dfd4e0eb1430ea402cd682b7017b7
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Fri Nov 13 14:52:48 2026 +0800
+
+    Build the parameter claim declaration rows on both sides
+    
+    The parameter claim message code is aligned with the shared proximity group
+    code while the committed table index keeps its single-row shape; the folded row
+    still fits the group message beside its pads. A new helper builds the record and
+    column declarations of one claim from the same message and plan reader on both
+    sides: it registers the folded message root, recomputes the record seeds from
+    the table name and shape, and turns each record answer and each opened column
+    into a relation row. A test proves a chain, builds the rows twice and checks
+    they agree, and rejects swapped and tampered openings.
+    
+    partial progress
+
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     |   9 +-
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 120 ++++++++++++++++++++++-
+ crates/zkie-ops/src/proof/norm_param_table.rs    |   7 +-
+ 3 files changed, 126 insertions(+), 10 deletions(-)
