@@ -1,0 +1,560 @@
+commit 76de1cc05a1deaf40d0fcd2fbfa6103b2e01b2c7
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Sat Nov 14 07:47:59 2026 +0800
+
+    Wire the projection reduction core into the production diagnostic path
+    
+    The production diagnostic test rebuilds the registered model commitment from
+    the saved private table randomness, verifies the real gpt2-seq16 trace, takes
+    the verified activation and output rows of the layer-0 key projection
+    consumer, and recomputes the raw accumulator from the trusted weight rows and
+    the verified activation. It then arranges the real weight rows in the hidden
+    session's table layout and runs the production diagnostic hidden LIN prover
+    and verifier on that table, with the projection reduction core checked against
+    the same values. Changed output, changed coefficients and a changed table
+    identity are rejected by the same session.
+    
+    This is the diagnostic transition only: it keeps every existing full-weight
+    relation check, adds no protocol object or message, and does not claim the
+    hidden-input consumer closure.
+
+diff --git a/zkie/tests/projection_consumer_diagnostic.rs b/zkie/tests/projection_consumer_diagnostic.rs
+new file mode 100644
+index 00000000..7eb93803
+--- /dev/null
++++ b/zkie/tests/projection_consumer_diagnostic.rs
+@@ -0,0 +1,534 @@
++//! Diagnostic closure of one real projection consumer.
++//!
++//! The test rebuilds the registered model commitment from the saved private
++//! table randomness, verifies the real gpt2-seq16 trace, takes the verified
++//! activation and output rows of one layer-0 key projection consumer, arranges
++//! the real weight rows in the table layout the hidden session reduces, and
++//! runs the production diagnostic hidden LIN prover and verifier on that
++//! table. The full-weight relation checks stay in place; this is evidence for
++//! the projection reduction core on real consumer values, not a protocol
++//! change.
++
++use std::cell::RefCell;
++use std::fs;
++use std::path::{Path, PathBuf};
++
++use zkie_core::common::field::PrimeCharacteristicRing;
++use zkie_core::types::Digest;
++use zkie_engine::pcs::request::code::{build_code_plan, CodeParams};
++use zkie_engine::pcs::request::field::{fp_from_u64, Fp, Fp3, E_DEGREE};
++use zkie_engine::pcs::request::foldeq::{reader_table_identity, OmegaShapePlan};
++use zkie_engine::pcs::request::gu::{GuOracleShape, GuShape};
++use zkie_engine::pcs::request::runtime_tree::{MaskTreePlan, RuntimeTreePart, RuntimeTreePlan};
++use zkie_engine::pcs::request::table::{
++    commit_table_streaming, ColumnOpening, IndexReader, IndexShape, StreamingTable, TableDistances,
++    TableRowSource, VecTableSource,
++};
++use zkie_ops::op::OpCode;
++use zkie_ops::proof::asset_table::decode_asset_table_randomness_set;
++use zkie_ops::proof::column_session::fp_from_signed_word;
++use zkie_ops::proof::hidden_send_session::{
++    prove_hidden_lin, verify_hidden_lin, ActivationShape, CommittedActivation, HiddenLinPlan,
++    HiddenOutputShape, HiddenProximityPlan, HiddenSendPlan, HiddenTableProver, WShape,
++};
++use zkie_ops::proof::model_commitment::{
++    verify_shared_trace_outputs, ModelCommitmentPublic, SharedTrace,
++};
++use zkie_ops::proof::plan::{PlanConfigValue, PlanSource};
++use zkie_ops::proof::projection_claim::{
++    check_projection_reduction, projection_claims, ProjectionShape,
++};
++use zkie_ops::registry::requantize;
++
++const HIDDEN: usize = 1024;
++const HEAD_DIM: usize = 64;
++const HEADS: usize = 12;
++const MATRIX_ROWS: u64 = 1024;
++const K_LO: u32 = 0;
++const COLUMNS: u64 = 1024;
++const TABLE_LOG_N: u32 = 12;
++const TABLE_ELL: u64 = 2048;
++const TABLE_R: u64 = 8;
++const CODE_LOG_N: u32 = 14;
++const CODE_ELL: u64 = 8192;
++const CODE_R: u64 = 4;
++const SALT: usize = 40;
++const GROUP: u64 = 7;
++const ORACLE_BASE: u64 = 20;
++const TABLE_ROWS: u64 = 1024;
++const TABLE_CONFIGURATION: Digest = Digest([0x21; 32]);
++const ACTIVATION_CONFIGURATION: Digest = Digest([0x31; 32]);
++const W_CONFIGURATION: Digest = Digest([0x51; 32]);
++const W_RUN: Digest = Digest([0x41; 32]);
++const GU_ORACLE: u64 = 10;
++const OMEGA_ORACLE: u64 = 11;
++const GU_GROUP: u64 = 5;
++const SEED: Digest = Digest([0x71; 32]);
++const SEQUENCE_TOKENS: usize = 16;
++
++fn repo_root() -> PathBuf {
++    Path::new(env!("CARGO_MANIFEST_DIR"))
++        .parent()
++        .expect("workspace root")
++        .to_path_buf()
++}
++
++/// The registered instance trace: a seq16 commit/public bundle and a verified
++/// statement and proof on disk. A checkout without them skips the test.
++fn artifacts() -> Option<PathBuf> {
++    let root = repo_root();
++    if let Ok(dir) = std::env::var("ZKIE_PROJECTION_DIAGNOSTIC_DIR") {
++        let dir = PathBuf::from(dir);
++        if complete(&dir) {
++            return Some(dir);
++        }
++        return None;
++    }
++    let mut dirs: Vec<PathBuf> = fs::read_dir(root.join("docs/benchmarks"))
++        .ok()?
++        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
++        .filter(|path| {
++            path.file_name()
++                .and_then(|name| name.to_str())
++                .map_or(false, |name| name.contains("-model-table-instance-"))
++        })
++        .collect();
++    dirs.sort();
++    dirs.into_iter()
++        .rev()
++        .find(|dir| complete(&dir.join("smoke/gpt2-seq16")))
++}
++
++fn complete(base: &Path) -> bool {
++    base.join("commit/public/model-commitment.bin").exists()
++        && base.join("commit/public/provider-config.bin").exists()
++        && base.join("commit/private/asset-table-randomness.bin").exists()
++        && base.join("proof/statement.bin").exists()
++        && base.join("proof/proof.bin").exists()
++}
++
++fn table_code() -> CodeParams {
++    build_code_plan(TABLE_LOG_N, TABLE_ELL, TABLE_R).unwrap()
++}
++
++fn code() -> CodeParams {
++    build_code_plan(CODE_LOG_N, CODE_ELL, CODE_R).unwrap()
++}
++
++fn table_shape() -> IndexShape {
++    IndexShape {
++        code: table_code(),
++        v: 10,
++        answers: 1,
++        salt_bytes: SALT,
++        distances: TableDistances {
++            radius: 0,
++            later_radius: 0,
++            m_once: 0,
++            m_later: 0,
++        },
++    }
++}
++
++fn w_shape(positions: u32) -> WShape {
++    WShape::new(COLUMNS, code(), 1, positions, SALT, 100, 1, W_RUN, W_CONFIGURATION).unwrap()
++}
++
++fn tree_plan(tree_number: u64, leaf_class: u32, main_rows: u64) -> RuntimeTreePlan {
++    RuntimeTreePlan {
++        tree_number,
++        leaf_class,
++        log_n: CODE_LOG_N,
++        log_n_zk: CODE_LOG_N,
++        parts: vec![RuntimeTreePart {
++            main_symbols: main_rows * E_DEGREE as u64,
++            mask_symbols: 0,
++        }],
++        salt_bytes: SALT,
++        run: Digest([0x61; 32]),
++        configuration: Digest([0x62; 32]),
++    }
++}
++
++fn gu_shape() -> GuShape {
++    GuShape {
++        oracle: GU_ORACLE,
++        group: GU_GROUP,
++        tree: tree_plan(300, 2, 1),
++        part: 0,
++        rows_high: true,
++        u: GuOracleShape {
++            code: code(),
++            main_rows: 1,
++            main_deg: E_DEGREE as u32,
++            mask_rows: 0,
++            mask_code: None,
++            answers: 1,
++        },
++        index: table_shape(),
++    }
++}
++
++fn omega_shape() -> OmegaShapePlan {
++    OmegaShapePlan {
++        oracle: OMEGA_ORACLE,
++        group: GU_GROUP,
++        tree: tree_plan(301, 2, 1),
++        u: GuOracleShape {
++            code: code(),
++            main_rows: 1,
++            main_deg: E_DEGREE as u32,
++            mask_rows: 0,
++            mask_code: None,
++            answers: 1,
++        },
++        rows_high: true,
++        matrix_rows: MATRIX_ROWS,
++        k_lo: K_LO,
++    }
++}
++
++fn mask_tree(tree_number: u64) -> MaskTreePlan {
++    MaskTreePlan {
++        tree_number,
++        leaf_class: 3,
++        log_n: CODE_LOG_N,
++        mask_rows: 1,
++        salt_bytes: SALT,
++        run: Digest([0x63; 32]),
++        configuration: Digest([0x64; 32]),
++    }
++}
++
++struct Table {
++    table: StreamingTable,
++    source: RefCell<VecTableSource>,
++    reader: IndexReader,
++}
++
++impl TableRowSource for Table {
++    fn rows(&self) -> u64 {
++        self.source.borrow().rows()
++    }
++
++    fn row(
++        &mut self,
++        index: u64,
++        message: &mut [Fp],
++        tail: &mut [Fp],
++    ) -> zkie_core::error::Result<()> {
++        self.source.borrow_mut().row(index, message, tail)
++    }
++}
++
++impl HiddenTableProver for Table {
++    fn reader(&self) -> &IndexReader {
++        &self.reader
++    }
++
++    fn open_columns(&mut self, positions: &[u64]) -> zkie_core::error::Result<Vec<ColumnOpening>> {
++        let mut source = self.source.borrow_mut();
++        self.table.open_columns(&mut *source, positions)
++    }
++}
++
++/// The session table holds, in row `c`, the weights of output column `c` over
++/// the input rows: `message[c][i] = W[i][c]`. The production weight asset is
++/// stored input-major, so the diagnostic test writes the transposed rows; this
++/// is the layout the hidden session reduces.
++fn diagnostic_table(weights: &[i64]) -> Table {
++    let shape = table_shape();
++    let rows = shape.rows() as usize;
++    let ell = shape.code.ell as usize;
++    let mut messages = vec![vec![Fp::ZERO; ell]; rows];
++    for (row, message) in messages.iter_mut().enumerate() {
++        for input in 0..HIDDEN {
++            let value = weights[input * HIDDEN + row] as i64;
++            message[input] = fp_from_signed_word(value as u64);
++        }
++    }
++    let tails = vec![vec![Fp::ZERO; TABLE_R as usize]; TABLE_ROWS as usize];
++    let mut source = VecTableSource::new(messages, tails).unwrap();
++    let salts: Vec<Vec<u8>> = (0..table_code().n())
++        .map(|position| vec![(position as u8) ^ 0x5A; SALT])
++        .collect();
++    let table = commit_table_streaming(
++        &mut source,
++        shape,
++        TABLE_CONFIGURATION,
++        &salts,
++        64,
++        u64::MAX,
++    )
++    .unwrap();
++    let reader = table.reader.clone();
++    Table {
++        table,
++        source: RefCell::new(source),
++        reader,
++    }
++}
++
++
++fn activation(activation_rows: &[Vec<i64>], positions: u32) -> CommittedActivation {
++    let salts: Vec<Vec<u8>> = (0..positions)
++        .map(|position| vec![(position as u8).wrapping_mul(7) ^ 0x3C; SALT])
++        .collect();
++    CommittedActivation::commit_signed(
++        ActivationShape::new(positions, HIDDEN as u32, SALT).unwrap(),
++        activation_rows,
++        &salts,
++        ACTIVATION_CONFIGURATION,
++    )
++    .unwrap()
++}
++
++fn field_rows(rows: &[Vec<i64>]) -> Vec<Vec<Fp3>> {
++    rows.iter()
++        .map(|row| {
++            row.iter()
++                .map(|value| Fp3::from_base(fp_from_signed_word(*value as u64)))
++                .collect()
++        })
++        .collect()
++}
++
++#[test]
++#[ignore = "runs against the registered production trace artifacts"]
++fn real_projection_consumer_closes_on_the_diagnostic_hidden_session() {
++    let Some(base) = artifacts() else {
++        return;
++    };
++    let public_bytes =
++        fs::read(base.join("commit/public/model-commitment.bin")).expect("public bundle");
++    let public: ModelCommitmentPublic = bincode::deserialize(&public_bytes).expect("public bundle");
++    let config_bytes =
++        fs::read(base.join("commit/public/provider-config.bin")).expect("provider config");
++    let config: zkie::provider::ProviderConfig =
++        bincode::deserialize(&config_bytes).expect("provider config");
++    let statement_bytes = fs::read(base.join("proof/statement.bin")).expect("statement");
++    let statement: zkie::provider::StatementData =
++        bincode::deserialize(&statement_bytes).expect("statement");
++    assert_eq!(statement.tokens.len(), SEQUENCE_TOKENS);
++
++    let params = zkie_models_gpt2::plan::asset_table_params().expect("table params");
++    let randomness =
++        fs::read(base.join("commit/private/asset-table-randomness.bin")).expect("randomness");
++    let tables = decode_asset_table_randomness_set(&randomness, &params).expect("randomness set");
++    let commitment = zkie_models_gpt2::executor::build_commitment(
++        Path::new(&config.asset_root),
++        &config.tokens,
++        &tables,
++    )
++    .expect("commitment");
++    assert_eq!(
++        commitment.anchor.record.anchor_id, public.anchor.anchor_id,
++        "the rebuilt instance must be the registered one"
++    );
++
++    let trace_bytes = fs::read(base.join("proof/proof.bin")).expect("proof bytes");
++    let trace: SharedTrace = bincode::deserialize(&trace_bytes).expect("trace");
++    let plan = zkie_models_gpt2::plan::trace_plan(statement.tokens.len()).expect("plan");
++    let outputs = verify_shared_trace_outputs(&public, &trace, &statement.tokens, &plan)
++        .expect("verified trace outputs");
++
++    let mut consumers = Vec::new();
++    for (index, step) in plan.steps.iter().enumerate() {
++        if step.opcode != OpCode::Projection {
++            continue;
++        }
++        let Some(PlanSource::Asset { path, .. }) = step.inputs.get(1) else {
++            continue;
++        };
++        if path != "gpt2/weights/L0_k_w_i32.bin" {
++            continue;
++        }
++        let Some(PlanSource::Prev { step: activation_step, .. }) = step.inputs.first() else {
++            panic!("the consumer activation is a previous step");
++        };
++        consumers.push((index, *activation_step));
++    }
++    assert_eq!(consumers.len(), HEADS);
++    let activation_step = consumers[0].1;
++    assert!(consumers.iter().all(|(_, step)| *step == activation_step));
++
++    let positions = std::env::var("ZKIE_PROJECTION_DIAGNOSTIC_POSITIONS")
++        .ok()
++        .and_then(|value| value.parse::<usize>().ok())
++        .unwrap_or(2)
++        .min(statement.tokens.len());
++    let positions = positions as u32;
++
++    let mut activation_rows = Vec::with_capacity(positions as usize);
++    for position in 0..positions as usize {
++        let row = outputs[activation_step][0]
++            [position * HIDDEN..(position + 1) * HIDDEN]
++            .to_vec();
++        activation_rows.push(row);
++    }
++
++    let mut head_outputs = vec![vec![0i64; HIDDEN]; positions as usize];
++    for (head, (step, _)) in consumers.iter().enumerate() {
++        let values = &outputs[*step][0];
++        for position in 0..positions as usize {
++            head_outputs[position][head * HEAD_DIM..(head + 1) * HEAD_DIM]
++                .copy_from_slice(&values[position * HEAD_DIM..(position + 1) * HEAD_DIM]);
++        }
++    }
++
++    let store = zkie_ops::proof::model_commitment::AssetStore::open(&commitment).expect("store");
++    let weights = store
++        .value("gpt2/weights/L0_k_w_i32.bin")
++        .expect("weight rows");
++    assert_eq!(weights.len(), HIDDEN * HIDDEN);
++
++    // The raw integer accumulator of the consumer, recomputed from the
++    // verified activation rows and the trusted weight rows, must requantize to
++    // the verified trace output.
++    let shift = match plan.steps[consumers[0].0].config.get(3) {
++        Some(PlanConfigValue::Literal(value)) => *value as u32,
++        _ => panic!("the consumer shift is a literal"),
++    };
++    let mut raw = vec![vec![0i128; HIDDEN]; positions as usize];
++    for position in 0..positions as usize {
++        for input in 0..HIDDEN {
++            let value = activation_rows[position][input] as i128;
++            if value == 0 {
++                continue;
++            }
++            for output in 0..HIDDEN {
++                raw[position][output] += value * weights[input * HIDDEN + output] as i128;
++            }
++        }
++    }
++    for position in 0..positions as usize {
++        for output in 0..HIDDEN {
++            let expected = requantize(raw[position][output], shift).expect("requantize") as i64;
++            assert_eq!(
++                expected, head_outputs[position][output],
++                "the verified trace output must be the requantized real reduction"
++            );
++        }
++    }
++
++    let mut session_table = diagnostic_table(&weights);
++    let activation = activation(&activation_rows, positions);
++    let plan = plan_for(&activation, &session_table, positions, &activation_rows);
++    plan.send.validate().expect("send plan");
++    if let Some(reason) = plan.proximity.fault(&plan.send, None, None) {
++        panic!("proximity fault: {reason}");
++    }
++    plan.validate().expect("lin plan");
++
++    let output: Vec<Vec<Fp3>> = raw
++        .iter()
++        .map(|row| {
++            row.iter()
++                .map(|value| Fp3::from_base(fp_from_signed_word(*value as i64 as u64)))
++                .collect()
++        })
++        .collect();
++    let (messages, witness) =
++        prove_hidden_lin(&plan, &activation, &mut session_table, &output, SEED).expect("prove");
++    let mut verifier_plan = plan.clone();
++    verifier_plan.send.expected_roots = Some(witness.send.roots.clone());
++    let outcome = verify_hidden_lin(&verifier_plan, session_table.reader(), &output, &messages)
++        .expect("verify");
++    assert!(!outcome.eval_rows.is_empty());
++
++    let shape = ProjectionShape {
++        matrix_rows: MATRIX_ROWS,
++        k_lo: K_LO,
++        columns: COLUMNS,
++        positions,
++    };
++    let flat_activation: Vec<Fp3> = field_rows(&activation_rows).into_iter().flatten().collect();
++    let flat_output: Vec<Fp3> = output.iter().flatten().copied().collect();
++    let claims = projection_claims(shape, &flat_activation, &flat_output).expect("claims");
++    let plain_table: Vec<Vec<Fp3>> = table_messages(&weights);
++    check_projection_reduction(shape, &claims.weights, &plain_table, &claims.output)
++        .expect("reduction");
++
++    // Negatives through the same diagnostic session.
++    let mut changed = output.clone();
++    changed[0][0] = changed[0][0].add(&Fp3::from_base(fp_from_u64(1)));
++    assert!(verify_hidden_lin(&verifier_plan, session_table.reader(), &changed, &messages).is_err());
++
++    let mut changed_plan = verifier_plan.clone();
++    changed_plan.weights[0][0] = changed_plan.weights[0][0].add(&Fp3::from_base(fp_from_u64(1)));
++    assert!(verify_hidden_lin(&changed_plan, session_table.reader(), &output, &messages).is_err());
++
++    let mut changed_identity = plan.clone();
++    changed_identity.send.table_identity.0[0] ^= 1;
++    let mut source_table = diagnostic_table(&weights);
++    assert!(prove_hidden_lin(&changed_identity, &activation, &mut source_table, &output, SEED)
++        .is_err());
++}
++
++fn plan_for(
++    activation: &CommittedActivation,
++    table: &Table,
++    positions: u32,
++    activation_rows: &[Vec<i64>],
++) -> HiddenLinPlan {
++    HiddenLinPlan {
++        norm: None,
++        send: HiddenSendPlan {
++            activation: activation.shape(),
++            activation_configuration: ACTIVATION_CONFIGURATION,
++            activation_root: activation.root(),
++            activation_source: zkie_ops::proof::hidden_send_session::ActivationSource::Commitment,
++            table_shape: table_shape(),
++            table_identity: reader_table_identity(&table.reader).unwrap(),
++            matrix_rows: MATRIX_ROWS,
++            k_lo: K_LO,
++            columns: COLUMNS,
++            group: GROUP,
++            oracle_base: ORACLE_BASE,
++            openings_per_oracle: 2,
++            w: w_shape(positions),
++            index_mask: None,
++            dot: None,
++            expected_dot_root: None,
++            expected_roots: None,
++        },
++        output: HiddenOutputShape {
++            positions,
++            columns: COLUMNS,
++        },
++        masks: vec![Vec::new(); positions as usize],
++        weights: field_rows(activation_rows),
++        proximity: HiddenProximityPlan {
++            gu: gu_shape(),
++            omega: omega_shape(),
++            code: code(),
++            mask_code: code(),
++            shared_mask_tree: mask_tree(200),
++            own_mask_tree: mask_tree(201),
++            shared_fresh: 90,
++            own_fresh: 91,
++            column_draws: 2,
++            column_budget: 4,
++            column_work_bits: 0,
++            shared_base_positions: 2,
++            own_base_positions: 2,
++            shared_stages: Vec::new(),
++            own_stages: Vec::new(),
++            planner_checked: false,
++        },
++        output_relation: None,
++        closure: None,
++    }
++}
++
++fn table_messages(weights: &[i64]) -> Vec<Vec<Fp3>> {
++    (0..HIDDEN)
++        .map(|output| {
++            (0..HIDDEN)
++                .map(|input| {
++                    Fp3::from_base(fp_from_signed_word(weights[input * HIDDEN + output] as u64))
++                })
++                .collect()
++        })
++        .collect()
++}

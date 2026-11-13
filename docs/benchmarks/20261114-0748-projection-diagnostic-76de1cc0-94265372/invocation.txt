@@ -1,0 +1,4 @@
+cd /data/zkIE
+ZKIE_PROJECTION_DIAGNOSTIC_DIR=/data/zkIE/docs/benchmarks/20261114-0637-model-table-instance-d1824d49-a5de37d8/smoke/gpt2-seq16 \
+ZKIE_PROJECTION_DIAGNOSTIC_POSITIONS=16 \
+cargo test --release -p zkie --test projection_consumer_diagnostic -- --ignored --nocapture
