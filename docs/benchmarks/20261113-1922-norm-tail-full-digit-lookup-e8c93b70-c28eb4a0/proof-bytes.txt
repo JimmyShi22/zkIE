@@ -1,0 +1,16 @@
+hard gate: norm-free toy proof
+
+7a5da6ebcbfdb61d5ee88ab60e67f45613906959b0c5de998cb870f5e1de4cfb  /tmp/zkie-proof-after.bin
+7a5da6ebcbfdb61d5ee88ab60e67f45613906959b0c5de998cb870f5e1de4cfb  /tmp/zkie-proof-before.bin
+PROOF_IDENTICAL
+
+-rw-r--r-- 1 root root 45080 Nov 13 19:21 /tmp/zkie-proof-after.bin
+-rw-r--r-- 1 root root 45080 Nov 13 05:36 /tmp/zkie-proof-before.bin
+
+gate test:
+
+running 1 test
+test proof::output_head_lin::tests::merged_request_accepts_and_round_trips ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 403 filtered out; finished in 0.41s
+

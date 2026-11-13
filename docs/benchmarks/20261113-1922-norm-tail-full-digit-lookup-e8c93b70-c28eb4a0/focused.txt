@@ -1,0 +1,832 @@
+focused runs: cargo test -p zkie-ops --lib <filter>
+
+== proof__hidden_norm_psc
+warning: unused variable: `number`
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1513:9
+     |
+1513 |         number: u32,
+     |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_number`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `target`
+   --> crates/zkie-engine/src/pcs/request/relation.rs:881:5
+    |
+881 |     target: Fp3,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+
+warning: unused variable: `columns_usize`
+   --> crates/zkie-engine/src/pcs/request/table.rs:952:13
+    |
+952 |         let columns_usize = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_columns_usize`
+
+warning: field `target` is never read
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1118:5
+     |
+1112 | struct FoldOutputMeta {
+     |        -------------- field in this struct
+...
+1118 |     target: Fp3,
+     |     ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-engine` (lib) generated 4 warnings (run `cargo fix --lib -p zkie-engine` to apply 3 suggestions)
+   Compiling zkie-ops v0.1.0 (/data/zkIE/crates/zkie-ops)
+warning: unused import: `MODULUS`
+   --> crates/zkie-ops/src/proof/bat_fold_session.rs:147:59
+    |
+147 | use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE, MODULUS};
+    |                                                           ^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `zkie_core::common::field::PrimeField64`
+   --> crates/zkie-ops/src/proof/committed_psc.rs:551:9
+    |
+551 |     use zkie_core::common::field::PrimeField64;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: duplicated attribute
+    --> crates/zkie-ops/src/proof/hidden_norm_psc.rs:7289:5
+     |
+7289 |     #[test]
+     |     ^^^^^^^
+     |
+     = note: `#[warn(duplicate_macro_attributes)]` on by default
+
+warning: unused import: `PrimeField64`
+    --> crates/zkie-ops/src/proof/hidden_norm_psc.rs:7186:65
+     |
+7186 |         use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
+     |                                                                 ^^^^^^^^^^^^
+
+warning: unused import: `ClosurePlan`
+    --> crates/zkie-ops/src/proof/output_head_lin.rs:1597:57
+     |
+1597 |     use crate::proof::output_closure::{ClosureMaskPlan, ClosurePlan};
+     |                                                         ^^^^^^^^^^^
+
+warning: unused import: `PrimeField64`
+    --> crates/zkie-ops/src/proof/output_head_lin.rs:1604:61
+     |
+1604 |     use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
+     |                                                             ^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/base_last_session.rs:589:13
+    |
+589 |         let mut message = self.chain.message();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reader`
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:2233:5
+     |
+2233 |     reader: &IndexReader,
+     |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_reader`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `first`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:14106:5
+      |
+14106 |     first: &HiddenSendMessages,
+      |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_first`
+
+warning: unused variable: `q_at`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:14912:9
+      |
+14912 |     let q_at = 0usize;
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_q_at`
+
+warning: unused variable: `q_at`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:15012:9
+      |
+15012 |     let q_at = 0usize;
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_q_at`
+
+warning: unused variable: `i`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:16004:10
+      |
+16004 |     for (i, m) in members.iter().enumerate() {
+      |          ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `m`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:16004:13
+      |
+16004 |     for (i, m) in members.iter().enumerate() {
+      |             ^ help: if this is intentional, prefix it with an underscore: `_m`
+
+warning: unused variable: `key_shape`
+    --> crates/zkie-ops/src/proof/hidden_norm_psc.rs:5759:13
+     |
+5759 |         let key_shape = WShape::new(
+     |             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_key_shape`
+
+warning: unused variable: `n`
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:214:9
+    |
+214 |     let n = word_n(word)?;
+    |         ^ help: if this is intentional, prefix it with an underscore: `_n`
+
+warning: unused variable: `group`
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:376:15
+    |
+376 | fn base_error(group: &GroupShape, analysis: &Analysis) -> Bound {
+    |               ^^^^^ help: if this is intentional, prefix it with an underscore: `_group`
+
+warning: field `plan` is never read
+   --> crates/zkie-ops/src/proof/cs_multi_session.rs:201:5
+    |
+195 | pub struct CsMultiSession {
+    |            -------------- field in this struct
+...
+201 |     plan: RuntimeTreePlan,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `integrated_first_round_trips_with_trusted_x_and_witness_roots` is never used
+    --> crates/zkie-ops/src/proof/hidden_norm_psc.rs:7351:8
+     |
+7351 |     fn integrated_first_round_trips_with_trusted_x_and_witness_roots() {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `m` is never read
+  --> crates/zkie-ops/src/proof/proximity_planner.rs:57:5
+   |
+52 | struct Proximity {
+   |        --------- field in this struct
+...
+57 |     m: u64,
+   |     ^
+   |
+   = note: `Proximity` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: function `batched_rows` is never used
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:516:4
+    |
+516 | fn batched_rows(word: &Word) -> u64 {
+    |    ^^^^^^^^^^^^
+
+warning: `zkie-ops` (lib test) generated 20 warnings (run `cargo fix --lib -p zkie-ops --tests` to apply 15 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.80s
+     Running unittests src/lib.rs (target/debug/deps/zkie_ops-d20b4f9af95f6295)
+
+running 27 tests
+test proof::hidden_norm_psc::tests::digit_reconstruction_maps_sum_to_zero ... ok
+test proof::hidden_norm_psc::tests::mask_rows_are_derived_from_the_relation_count ... ok
+test proof::hidden_norm_psc::tests::offset_rows_cover_zero_negative_and_the_fixed_offset ... ok
+test proof::hidden_norm_psc::tests::real_bounds_stay_below_the_modulus_half ... ok
+test proof::hidden_norm_psc::tests::round_layout_fixes_the_slot_map_and_pads_digits ... ok
+test proof::hidden_norm_psc::tests::round_widths_and_digit_rows_fail_closed ... ok
+test proof::hidden_norm_psc::tests::rsqrt_slots_take_the_segmentation_values ... ok
+test proof::hidden_norm_psc::tests::round_digit_key_plan_covers_the_committed_digits ... ok
+test proof::hidden_norm_psc::tests::rstd_plan_reads_the_committed_index_and_value_slots ... ok
+test proof::hidden_norm_psc::tests::unit_valid_row_has_zero_offset_digits ... ok
+test proof::hidden_norm_psc::tests::rsqrt_relation_maps_sum_to_zero_at_the_segment_boundaries ... ok
+test proof::hidden_norm_psc::tests::integrated_trusted_x_root_and_opening_budget_are_checked ... ok
+test proof::hidden_norm_psc::tests::integrated_mask_root_and_opening_shape_are_checked ... ok
+test proof::hidden_norm_psc::tests::norm_plan_accepts_and_binds_a_lookup_carrier ... ok
+test proof::hidden_norm_psc::tests::round_plan_fixes_the_layout_and_the_input_bound ... ok
+test proof::hidden_norm_psc::tests::parameter_tables_are_bound_in_the_plan ... ok
+test proof::hidden_norm_psc::tests::round_plan_fixes_the_layout_and_the_input_bound ... ok
+test proof::hidden_norm_psc::tests::output_tail_plan_binds_the_groups_and_the_runtime_parameters ... ok
+test proof::hidden_norm_psc::tests::wrong_root_or_opening_is_rejected ... ok
+test proof::hidden_norm_psc::tests::encoded_messages_round_trip_and_still_verify ... ok
+test proof::hidden_norm_psc::tests::slack_digit_lookup_plan_addresses_the_tail_cells ... ok
+test proof::hidden_norm_psc::tests::skeleton_accepts_the_honest_toy_messages ... ok
+test proof::hidden_norm_psc::tests::tampered_point_or_end_value_is_rejected ... ok
+test proof::hidden_norm_psc::tests::output_tail_relations_hold_on_the_exact_rows ... ok
+test proof::hidden_norm_psc::tests::changed_plan_or_version_is_rejected ... ok
+test proof::hidden_norm_psc::tests::parameter_table_claims_round_trip_and_are_plan_gated ... ok
+test proof::hidden_norm_psc::tests::lookup_plan_is_sized_from_the_parent_plan ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 377 filtered out; finished in 0.02s
+
+
+== proof__hidden_norm__
+warning: unused variable: `number`
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1513:9
+     |
+1513 |         number: u32,
+     |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_number`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `target`
+   --> crates/zkie-engine/src/pcs/request/relation.rs:881:5
+    |
+881 |     target: Fp3,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+
+warning: unused variable: `columns_usize`
+   --> crates/zkie-engine/src/pcs/request/table.rs:952:13
+    |
+952 |         let columns_usize = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_columns_usize`
+
+warning: field `target` is never read
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1118:5
+     |
+1112 | struct FoldOutputMeta {
+     |        -------------- field in this struct
+...
+1118 |     target: Fp3,
+     |     ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-engine` (lib) generated 4 warnings (run `cargo fix --lib -p zkie-engine` to apply 3 suggestions)
+warning: unused import: `MODULUS`
+   --> crates/zkie-ops/src/proof/bat_fold_session.rs:147:59
+    |
+147 | use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE, MODULUS};
+    |                                                           ^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `zkie_core::common::field::PrimeField64`
+   --> crates/zkie-ops/src/proof/committed_psc.rs:551:9
+    |
+551 |     use zkie_core::common::field::PrimeField64;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: duplicated attribute
+    --> crates/zkie-ops/src/proof/hidden_norm_psc.rs:7289:5
+     |
+7289 |     #[test]
+     |     ^^^^^^^
+     |
+     = note: `#[warn(duplicate_macro_attributes)]` on by default
+
+warning: unused import: `PrimeField64`
+    --> crates/zkie-ops/src/proof/hidden_norm_psc.rs:7186:65
+     |
+7186 |         use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
+     |                                                                 ^^^^^^^^^^^^
+
+warning: unused import: `ClosurePlan`
+    --> crates/zkie-ops/src/proof/output_head_lin.rs:1597:57
+     |
+1597 |     use crate::proof::output_closure::{ClosureMaskPlan, ClosurePlan};
+     |                                                         ^^^^^^^^^^^
+
+warning: unused import: `PrimeField64`
+    --> crates/zkie-ops/src/proof/output_head_lin.rs:1604:61
+     |
+1604 |     use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
+     |                                                             ^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/base_last_session.rs:589:13
+    |
+589 |         let mut message = self.chain.message();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reader`
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:2233:5
+     |
+2233 |     reader: &IndexReader,
+     |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_reader`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `first`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:14106:5
+      |
+14106 |     first: &HiddenSendMessages,
+      |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_first`
+
+warning: unused variable: `q_at`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:14912:9
+      |
+14912 |     let q_at = 0usize;
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_q_at`
+
+warning: unused variable: `q_at`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:15012:9
+      |
+15012 |     let q_at = 0usize;
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_q_at`
+
+warning: unused variable: `i`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:16004:10
+      |
+16004 |     for (i, m) in members.iter().enumerate() {
+      |          ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `m`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:16004:13
+      |
+16004 |     for (i, m) in members.iter().enumerate() {
+      |             ^ help: if this is intentional, prefix it with an underscore: `_m`
+
+warning: unused variable: `key_shape`
+    --> crates/zkie-ops/src/proof/hidden_norm_psc.rs:5759:13
+     |
+5759 |         let key_shape = WShape::new(
+     |             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_key_shape`
+
+warning: unused variable: `n`
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:214:9
+    |
+214 |     let n = word_n(word)?;
+    |         ^ help: if this is intentional, prefix it with an underscore: `_n`
+
+warning: unused variable: `group`
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:376:15
+    |
+376 | fn base_error(group: &GroupShape, analysis: &Analysis) -> Bound {
+    |               ^^^^^ help: if this is intentional, prefix it with an underscore: `_group`
+
+warning: field `plan` is never read
+   --> crates/zkie-ops/src/proof/cs_multi_session.rs:201:5
+    |
+195 | pub struct CsMultiSession {
+    |            -------------- field in this struct
+...
+201 |     plan: RuntimeTreePlan,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `integrated_first_round_trips_with_trusted_x_and_witness_roots` is never used
+    --> crates/zkie-ops/src/proof/hidden_norm_psc.rs:7351:8
+     |
+7351 |     fn integrated_first_round_trips_with_trusted_x_and_witness_roots() {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `m` is never read
+  --> crates/zkie-ops/src/proof/proximity_planner.rs:57:5
+   |
+52 | struct Proximity {
+   |        --------- field in this struct
+...
+57 |     m: u64,
+   |     ^
+   |
+   = note: `Proximity` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: function `batched_rows` is never used
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:516:4
+    |
+516 | fn batched_rows(word: &Word) -> u64 {
+    |    ^^^^^^^^^^^^
+
+warning: `zkie-ops` (lib test) generated 20 warnings (run `cargo fix --lib -p zkie-ops --tests` to apply 15 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/zkie_ops-d20b4f9af95f6295)
+
+running 9 tests
+test proof::hidden_norm::tests::output_tail_tampering_is_rejected ... ok
+test proof::hidden_norm::tests::output_tail_matches_the_runtime_operator ... ok
+test proof::hidden_norm::tests::rounding_decomposition_covers_ties_negatives_and_unit_divisor ... ok
+test proof::hidden_norm::tests::shift_rounding_follows_the_half_up_discipline ... ok
+test proof::hidden_norm::tests::invalid_shape_or_roots_are_rejected ... ok
+test proof::hidden_norm::tests::positive_core_checks_the_exact_integer_equations ... ok
+test proof::hidden_norm::tests::rsqrt_row_matches_the_runtime_segmentation ... ok
+test proof::hidden_norm::tests::tampered_intermediate_digits_or_ranges_are_rejected ... ok
+test proof::hidden_norm::tests::wrong_input_or_output_commitment_is_rejected ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 395 filtered out; finished in 0.00s
+
+
+== proof__lookup__
+warning: unused variable: `number`
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1513:9
+     |
+1513 |         number: u32,
+     |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_number`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `target`
+   --> crates/zkie-engine/src/pcs/request/relation.rs:881:5
+    |
+881 |     target: Fp3,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+
+warning: unused variable: `columns_usize`
+   --> crates/zkie-engine/src/pcs/request/table.rs:952:13
+    |
+952 |         let columns_usize = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_columns_usize`
+
+warning: field `target` is never read
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1118:5
+     |
+1112 | struct FoldOutputMeta {
+     |        -------------- field in this struct
+...
+1118 |     target: Fp3,
+     |     ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-engine` (lib) generated 4 warnings (run `cargo fix --lib -p zkie-engine` to apply 3 suggestions)
+warning: unused import: `MODULUS`
+   --> crates/zkie-ops/src/proof/bat_fold_session.rs:147:59
+    |
+147 | use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE, MODULUS};
+    |                                                           ^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `zkie_core::common::field::PrimeField64`
+   --> crates/zkie-ops/src/proof/committed_psc.rs:551:9
+    |
+551 |     use zkie_core::common::field::PrimeField64;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: duplicated attribute
+    --> crates/zkie-ops/src/proof/hidden_norm_psc.rs:7289:5
+     |
+7289 |     #[test]
+     |     ^^^^^^^
+     |
+     = note: `#[warn(duplicate_macro_attributes)]` on by default
+
+warning: unused import: `PrimeField64`
+    --> crates/zkie-ops/src/proof/hidden_norm_psc.rs:7186:65
+     |
+7186 |         use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
+     |                                                                 ^^^^^^^^^^^^
+
+warning: unused import: `ClosurePlan`
+    --> crates/zkie-ops/src/proof/output_head_lin.rs:1597:57
+     |
+1597 |     use crate::proof::output_closure::{ClosureMaskPlan, ClosurePlan};
+     |                                                         ^^^^^^^^^^^
+
+warning: unused import: `PrimeField64`
+    --> crates/zkie-ops/src/proof/output_head_lin.rs:1604:61
+     |
+1604 |     use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
+     |                                                             ^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/base_last_session.rs:589:13
+    |
+589 |         let mut message = self.chain.message();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reader`
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:2233:5
+     |
+2233 |     reader: &IndexReader,
+     |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_reader`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `first`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:14106:5
+      |
+14106 |     first: &HiddenSendMessages,
+      |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_first`
+
+warning: unused variable: `q_at`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:14912:9
+      |
+14912 |     let q_at = 0usize;
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_q_at`
+
+warning: unused variable: `q_at`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:15012:9
+      |
+15012 |     let q_at = 0usize;
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_q_at`
+
+warning: unused variable: `i`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:16004:10
+      |
+16004 |     for (i, m) in members.iter().enumerate() {
+      |          ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `m`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:16004:13
+      |
+16004 |     for (i, m) in members.iter().enumerate() {
+      |             ^ help: if this is intentional, prefix it with an underscore: `_m`
+
+warning: unused variable: `key_shape`
+    --> crates/zkie-ops/src/proof/hidden_norm_psc.rs:5759:13
+     |
+5759 |         let key_shape = WShape::new(
+     |             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_key_shape`
+
+warning: unused variable: `n`
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:214:9
+    |
+214 |     let n = word_n(word)?;
+    |         ^ help: if this is intentional, prefix it with an underscore: `_n`
+
+warning: unused variable: `group`
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:376:15
+    |
+376 | fn base_error(group: &GroupShape, analysis: &Analysis) -> Bound {
+    |               ^^^^^ help: if this is intentional, prefix it with an underscore: `_group`
+
+warning: field `plan` is never read
+   --> crates/zkie-ops/src/proof/cs_multi_session.rs:201:5
+    |
+195 | pub struct CsMultiSession {
+    |            -------------- field in this struct
+...
+201 |     plan: RuntimeTreePlan,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `integrated_first_round_trips_with_trusted_x_and_witness_roots` is never used
+    --> crates/zkie-ops/src/proof/hidden_norm_psc.rs:7351:8
+     |
+7351 |     fn integrated_first_round_trips_with_trusted_x_and_witness_roots() {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `m` is never read
+  --> crates/zkie-ops/src/proof/proximity_planner.rs:57:5
+   |
+52 | struct Proximity {
+   |        --------- field in this struct
+...
+57 |     m: u64,
+   |     ^
+   |
+   = note: `Proximity` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: function `batched_rows` is never used
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:516:4
+    |
+516 | fn batched_rows(word: &Word) -> u64 {
+    |    ^^^^^^^^^^^^
+
+warning: `zkie-ops` (lib test) generated 20 warnings (run `cargo fix --lib -p zkie-ops --tests` to apply 15 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/zkie_ops-d20b4f9af95f6295)
+
+running 14 tests
+test proof::lookup::tests::duplicate_key_sources_are_rejected ... ok
+test proof::lookup::tests::key_claim_expands_to_linear_terms ... ok
+test proof::lookup::tests::key_claim_registers_one_row_on_its_member ... ok
+test proof::lookup::tests::keys_read_from_distinct_physical_messages ... ok
+test proof::lookup::tests::byte_table_uses_the_sumcheck_index_order ... ok
+test proof::lookup::tests::a_changed_digit_source_breaks_the_committed_transcript ... ok
+test proof::lookup::tests::an_out_of_table_key_cannot_be_proved ... ok
+test proof::lookup::tests::duplicate_keys_prove_and_verify ... ok
+test proof::lookup::tests::honest_byte_lookup_proves_and_verifies ... ok
+test proof::lookup::tests::lookup_messages_round_trip_and_reject_bad_versions ... ok
+test proof::lookup::tests::committed_lookup_messages_prove_without_recommitting ... ok
+test proof::lookup::tests::malformed_lookup_messages_are_rejected ... ok
+test proof::lookup::tests::two_column_lookup_binds_the_index_value_correspondence ... ok
+test proof::lookup::tests::leaves_kept_row_matches_the_committed_bits ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 390 filtered out; finished in 0.14s
+
+
+== proof__hidden_send_session__merged_tests__norm
+warning: unused variable: `number`
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1513:9
+     |
+1513 |         number: u32,
+     |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_number`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `target`
+   --> crates/zkie-engine/src/pcs/request/relation.rs:881:5
+    |
+881 |     target: Fp3,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+
+warning: unused variable: `columns_usize`
+   --> crates/zkie-engine/src/pcs/request/table.rs:952:13
+    |
+952 |         let columns_usize = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_columns_usize`
+
+warning: field `target` is never read
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1118:5
+     |
+1112 | struct FoldOutputMeta {
+     |        -------------- field in this struct
+...
+1118 |     target: Fp3,
+     |     ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-engine` (lib) generated 4 warnings (run `cargo fix --lib -p zkie-engine` to apply 3 suggestions)
+warning: unused import: `MODULUS`
+   --> crates/zkie-ops/src/proof/bat_fold_session.rs:147:59
+    |
+147 | use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE, MODULUS};
+    |                                                           ^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `zkie_core::common::field::PrimeField64`
+   --> crates/zkie-ops/src/proof/committed_psc.rs:551:9
+    |
+551 |     use zkie_core::common::field::PrimeField64;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: duplicated attribute
+    --> crates/zkie-ops/src/proof/hidden_norm_psc.rs:7289:5
+     |
+7289 |     #[test]
+     |     ^^^^^^^
+     |
+     = note: `#[warn(duplicate_macro_attributes)]` on by default
+
+warning: unused import: `PrimeField64`
+    --> crates/zkie-ops/src/proof/hidden_norm_psc.rs:7186:65
+     |
+7186 |         use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
+     |                                                                 ^^^^^^^^^^^^
+
+warning: unused import: `ClosurePlan`
+    --> crates/zkie-ops/src/proof/output_head_lin.rs:1597:57
+     |
+1597 |     use crate::proof::output_closure::{ClosureMaskPlan, ClosurePlan};
+     |                                                         ^^^^^^^^^^^
+
+warning: unused import: `PrimeField64`
+    --> crates/zkie-ops/src/proof/output_head_lin.rs:1604:61
+     |
+1604 |     use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
+     |                                                             ^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/base_last_session.rs:589:13
+    |
+589 |         let mut message = self.chain.message();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reader`
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:2233:5
+     |
+2233 |     reader: &IndexReader,
+     |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_reader`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `first`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:14106:5
+      |
+14106 |     first: &HiddenSendMessages,
+      |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_first`
+
+warning: unused variable: `q_at`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:14912:9
+      |
+14912 |     let q_at = 0usize;
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_q_at`
+
+warning: unused variable: `q_at`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:15012:9
+      |
+15012 |     let q_at = 0usize;
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_q_at`
+
+warning: unused variable: `i`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:16004:10
+      |
+16004 |     for (i, m) in members.iter().enumerate() {
+      |          ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `m`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:16004:13
+      |
+16004 |     for (i, m) in members.iter().enumerate() {
+      |             ^ help: if this is intentional, prefix it with an underscore: `_m`
+
+warning: unused variable: `key_shape`
+    --> crates/zkie-ops/src/proof/hidden_norm_psc.rs:5759:13
+     |
+5759 |         let key_shape = WShape::new(
+     |             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_key_shape`
+
+warning: unused variable: `n`
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:214:9
+    |
+214 |     let n = word_n(word)?;
+    |         ^ help: if this is intentional, prefix it with an underscore: `_n`
+
+warning: unused variable: `group`
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:376:15
+    |
+376 | fn base_error(group: &GroupShape, analysis: &Analysis) -> Bound {
+    |               ^^^^^ help: if this is intentional, prefix it with an underscore: `_group`
+
+warning: field `plan` is never read
+   --> crates/zkie-ops/src/proof/cs_multi_session.rs:201:5
+    |
+195 | pub struct CsMultiSession {
+    |            -------------- field in this struct
+...
+201 |     plan: RuntimeTreePlan,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `integrated_first_round_trips_with_trusted_x_and_witness_roots` is never used
+    --> crates/zkie-ops/src/proof/hidden_norm_psc.rs:7351:8
+     |
+7351 |     fn integrated_first_round_trips_with_trusted_x_and_witness_roots() {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `m` is never read
+  --> crates/zkie-ops/src/proof/proximity_planner.rs:57:5
+   |
+52 | struct Proximity {
+   |        --------- field in this struct
+...
+57 |     m: u64,
+   |     ^
+   |
+   = note: `Proximity` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: function `batched_rows` is never used
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:516:4
+    |
+516 | fn batched_rows(word: &Word) -> u64 {
+    |    ^^^^^^^^^^^^
+
+warning: `zkie-ops` (lib test) generated 20 warnings (run `cargo fix --lib -p zkie-ops --tests` to apply 15 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/zkie_ops-d20b4f9af95f6295)
+
+running 52 tests
+test proof::hidden_send_session::merged_tests::norm_groups_are_counted_in_the_proximity_bound ... ok
+test proof::hidden_send_session::merged_tests::norm_parameter_eval_coefficients_follow_the_message_layout ... ok
+test proof::hidden_send_session::merged_tests::norm_hd_closure_wrong_winner_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_inconsistent_remainder_witness_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_pointwise_masks_are_allocated_after_the_relation_blocks ... ok
+test proof::hidden_send_session::merged_tests::norm_tail_clamp_distance_width_gate_is_enforced ... ok
+test proof::hidden_send_session::merged_tests::norm_tail_padding_claim_swap_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_tail_slack_lookup_plan_gates ... ok
+test proof::hidden_send_session::merged_tests::norm_hd_missing_dot_plan_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_output_hd_shift_mismatch_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_inconsistent_sum_witness_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_tail_slack_lookup_committed_digit_tampering_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_bound_relations_accept_the_hidden_fixture ... ok
+test proof::hidden_send_session::merged_tests::norm_malicious_variance_digit_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_tail_clamp_out_tampering_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_malicious_tail_digit_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_tail_slack_lookup_out_of_range_digit_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_malicious_distance_slot_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_tail_clamp_distance_slot_tampering_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_tail_clamp_selector_flip_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_parameter_opening_tampering_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_parameter_openings_prove_and_verify ... ok
+test proof::hidden_send_session::merged_tests::norm_parameter_claim_rows_are_shared_by_both_sides ... ok
+test proof::hidden_send_session::merged_tests::norm_message_tampering_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_lookup_carrier_proves_and_verifies ... ok
+test proof::hidden_send_session::merged_tests::norm_malicious_round_digit_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_hd_committed_row_tampering_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_output_hd_cross_position_substitution_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_tail_padding_out_tampering_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_tail_padding_partition_tampering_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_tail_padding_pre_tampering_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_output_hd_is_the_committed_out_object ... ok
+test proof::hidden_send_session::merged_tests::norm_malicious_tie_slack_digit_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_output_claim_mask_entry_tampering_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_hd_old_or_foreign_plan_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_hd_consumer_object_swap_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_output_claims_are_masked ... ok
+test proof::hidden_send_session::merged_tests::norm_malicious_out_shift_at_the_collapsed_interval_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_tail_slack_lookup_proves_and_verifies ... ok
+test proof::hidden_send_session::merged_tests::norm_output_claim_mask_tampering_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_malicious_out_shift_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_hd_feeds_the_hidden_dot ... ok
+test proof::hidden_send_session::merged_tests::norm_output_hd_root_tampering_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_output_claim_tampering_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_tail_slack_lookup_claim_and_message_tampering_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_tail_slack_lookup_committed_cell_tampering_is_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_hd_logits_close_to_argmax ... ok
+test proof::hidden_send_session::merged_tests::norm_output_groups_prove_and_verify ... ok
+test proof::hidden_send_session::merged_tests::norm_malicious_tail_digit_classes_are_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_four_relation_negative_matrix ... ok
+test proof::hidden_send_session::merged_tests::norm_malicious_boundary_and_collapsed_clamp_witnesses_are_rejected ... ok
+test proof::hidden_send_session::merged_tests::norm_tail_clamp_boundaries_prove_and_verify ... ok
+
+test result: ok. 52 passed; 0 failed; 0 ignored; 0 measured; 352 filtered out; finished in 4.91s
+

@@ -1,0 +1,7 @@
+e8c93b70 Prove every tail digit and derive the output tail bounds in the plan
+
+ crates/zkie-ops/src/proof/hidden_norm.rs         |  143 ---
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     |  868 ++++++++++------
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 1143 ++++++++++++++++++----
+ crates/zkie-ops/src/proof/lookup.rs              |  113 ++-
+ 4 files changed, 1627 insertions(+), 640 deletions(-)
