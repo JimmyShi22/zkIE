@@ -292,6 +292,19 @@ pub fn commit_assets_with_tables(
         .map(|(commitment, _)| commitment)
 }
 
+/// Like `commit_assets_with_tables`, and returns one SHA-256 per asset. The
+/// operator identity check uses it to rebuild the same table commitment from
+/// the saved private randomness.
+pub fn commit_assets_with_digests_and_tables(
+    root: &Path,
+    model_commitment: Digest,
+    parameters_digest: Digest,
+    specs: &[ModelAssetSpec],
+    tables: &[AssetTableInput],
+) -> Result<(ModelCommitment, Vec<AssetDigest>)> {
+    commit_assets_inner(root, model_commitment, parameters_digest, specs, true, tables)
+}
+
 fn commit_assets_inner(
     root: &Path,
     model_commitment: Digest,

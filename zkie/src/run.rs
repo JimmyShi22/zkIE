@@ -336,6 +336,8 @@ fn run_one(
 fn collect(args: &[String], decode: bool) -> Result<serde_json::Value> {
     let mut cases: Vec<String> = Vec::new();
     let mut out: Option<std::path::PathBuf> = None;
+    let mut commit_dirs: std::collections::BTreeMap<String, std::path::PathBuf> =
+        std::collections::BTreeMap::new();
     let mut cold_runs = 1u32;
     let mut warm_runs = 3u32;
     let mut index = 0;
@@ -368,6 +370,27 @@ fn collect(args: &[String], decode: bool) -> Result<serde_json::Value> {
                     .get(index)
                     .and_then(|value| value.parse().ok())
                     .ok_or(Error::InvalidConfig)?;
+            }
+            "--commit-dir" => {
+                // A registered commit instance for this case: every run reuses
+                // it. The instance is provisioned and registered separately;
+                // its cost is measured there, not in the matrix.
+                index += 1;
+                while index < args.len() && !args[index].starts_with("--") {
+                    let (case_id, path) = args[index]
+                        .split_once('=')
+                        .ok_or(Error::InvalidConfig)?;
+                    if case_id.is_empty()
+                        || path.is_empty()
+                        || commit_dirs
+                            .insert(case_id.to_owned(), std::path::PathBuf::from(path))
+                            .is_some()
+                    {
+                        return Err(Error::InvalidConfig);
+                    }
+                    index += 1;
+                }
+                continue;
             }
             "--prompt-len" | "--decode-lengths" | "--compute" | "--asset-root" => {
                 index += 1;
@@ -403,22 +426,25 @@ fn collect(args: &[String], decode: bool) -> Result<serde_json::Value> {
             }
             let case_dir = out.join(&entry.id);
             fs::create_dir_all(&case_dir).map_err(|_| Error::Io)?;
+            let registered = commit_dirs.get(&entry.id).cloned();
             let commit_dir = case_dir.join("cold-0").join("commit");
             let mut runs = Vec::new();
             for run in 0..cold_runs {
                 let run_dir = case_dir.join(format!("cold-{run}"));
+                let registered_dir = registered.clone();
                 runs.push(run_one(
                     &executable,
                     &case_path,
                     &entry.id,
                     &input,
                     &run_dir,
-                    "create",
-                    None,
+                    if registered_dir.is_some() { "reuse" } else { "create" },
+                    registered_dir.as_deref(),
                 )?);
             }
             for run in 0..warm_runs {
                 let run_dir = case_dir.join(format!("warm-{run}"));
+                let registered_dir = registered.clone().unwrap_or_else(|| commit_dir.clone());
                 runs.push(run_one(
                     &executable,
                     &case_path,
@@ -426,15 +452,19 @@ fn collect(args: &[String], decode: bool) -> Result<serde_json::Value> {
                     &input,
                     &run_dir,
                     "reuse",
-                    Some(&commit_dir),
+                    Some(registered_dir.as_path()),
                 )?);
             }
-            report.push(serde_json::json!({
+            let mut case_report = serde_json::json!({
                 "case_id": entry.id,
                 "seq_tokens": entry.seq_tokens,
                 "input": input,
                 "runs": runs,
-            }));
+            });
+            if let Some(dir) = &registered {
+                case_report["registered_commit"] = serde_json::json!(dir.to_string_lossy());
+            }
+            report.push(case_report);
         }
     }
     let body = serde_json::to_string_pretty(&serde_json::json!({

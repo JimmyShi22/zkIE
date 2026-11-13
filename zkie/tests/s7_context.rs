@@ -14,7 +14,7 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn artifacts() -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
+fn legacy_artifacts() -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
     let root = repo_root();
     let case = root.join("models/gpt2/case.toml");
     let policy = root.join("models/gpt2/case.policy");
@@ -32,6 +32,44 @@ fn artifacts() -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
     } else {
         None
     }
+}
+
+/// The most recent registered table-instance run that kept a seq16 commit and
+/// statement on disk. The registration archive holds the instance artifacts;
+/// a checkout without them skips the positive context test.
+fn registered_artifacts() -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
+    let root = repo_root();
+    let case = root.join("models/gpt2/case.toml");
+    let policy = root.join("models/gpt2/case.policy");
+    let mut dirs: Vec<PathBuf> = fs::read_dir(root.join("docs/benchmarks"))
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map_or(false, |name| name.contains("-model-table-instance-"))
+        })
+        .collect();
+    dirs.sort();
+    for dir in dirs.into_iter().rev() {
+        let base = dir.join("smoke/gpt2-seq16");
+        let public = base.join("commit/public");
+        let statement = base.join("proof/statement.bin");
+        if case.exists()
+            && policy.exists()
+            && public.join("model-commitment.bin").exists()
+            && statement.exists()
+        {
+            return Some((case, policy, public, statement));
+        }
+    }
+    None
+}
+
+fn first_anchor_hex(text: &str) -> Option<String> {
+    let start = text.find("anchor_id = \"")? + "anchor_id = \"".len();
+    let end = start.checked_add(64)?;
+    text.get(start..end).map(str::to_owned)
 }
 
 fn read_statement(path: &Path) -> StatementData {
@@ -59,33 +97,10 @@ fn the_compiled_plan_has_one_lm_head_matmul_step() {
 
 #[test]
 fn the_real_context_is_loaded_with_the_lm_head_identity() {
-    let Some((case, policy, public, statement)) = artifacts() else {
+    let Some((case, policy, public, statement)) = registered_artifacts() else {
         return;
     };
     let statement_data = read_statement(&statement);
-    // The fixture artifact predates the current model version. The existing
-    // gate rejects a version mismatch; the historical artifact stays on disk.
-    let policy_document =
-        zkie::policy::parse(&fs::read(&policy).expect("policy bytes")).expect("policy");
-    let trusted = zkie::policy::select(
-        &policy_document,
-        &statement_data.case_id,
-        &statement_data.model,
-        statement_data.tokens.len(),
-    )
-    .expect("trusted policy");
-    if trusted.model_version != zkie_models_gpt2::plan::MODEL_VERSION {
-        let error = load_gpt2_lm_head_context(
-            &case,
-            &policy,
-            &public,
-            &statement,
-            statement_data.model_commitment,
-        )
-        .expect_err("an artifact of another model version must be rejected");
-        assert_eq!(error.code(), "invalid_config");
-        return;
-    }
     let context = load_gpt2_lm_head_context(
         &case,
         &policy,
@@ -136,8 +151,28 @@ fn the_real_context_is_loaded_with_the_lm_head_identity() {
 }
 
 #[test]
+fn legacy_artifacts_are_rejected_by_the_version_gate() {
+    let Some((case, policy, public, statement)) = legacy_artifacts() else {
+        return;
+    };
+    let statement_data = read_statement(&statement);
+    let policy_text = fs::read_to_string(&policy).expect("policy text");
+    let old_policy = policy_text.replace("model_version = 2", "model_version = 1");
+    let old_policy = temp_file("policy-v1.toml", old_policy.as_bytes());
+    let error = load_gpt2_lm_head_context(
+        &case,
+        &old_policy,
+        &public,
+        &statement,
+        statement_data.model_commitment,
+    )
+    .expect_err("an artifact of another model version must be rejected");
+    assert_eq!(error.code(), "invalid_config");
+}
+
+#[test]
 fn wrong_identities_and_shapes_are_rejected() {
-    let Some((case, policy, public, statement)) = artifacts() else {
+    let Some((case, policy, public, statement)) = registered_artifacts() else {
         return;
     };
     let statement_data = read_statement(&statement);
@@ -146,10 +181,8 @@ fn wrong_identities_and_shapes_are_rejected() {
     assert!(load_gpt2_lm_head_context(&case, &policy, &public, &statement, Digest::ZERO).is_err());
 
     let policy_text = fs::read_to_string(&policy).expect("policy text");
-    let wrong_policy = policy_text.replace(
-        "dd08df8bcbba41adea6182709e00adb2f897fde4abc241d1ba09c552fd77ae36",
-        &"00".repeat(32),
-    );
+    let anchor = first_anchor_hex(&policy_text).expect("policy anchor");
+    let wrong_policy = policy_text.replace(&anchor, &"00".repeat(32));
     let wrong_policy = temp_file("policy.toml", wrong_policy.as_bytes());
     assert!(
         load_gpt2_lm_head_context(&case, &wrong_policy, &public, &statement, model_id).is_err()

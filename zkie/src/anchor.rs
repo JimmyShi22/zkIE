@@ -12,8 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use zkie_core::artifact::{digest_bytes, digest_from_hex, digest_to_hex};
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
+use zkie_ops::proof::asset_table::decode_asset_table_randomness_set;
 use zkie_ops::proof::model_commitment::{
-    commit_assets_with_digests, AssetDigest, ModelCommitment,
+    commit_assets_with_digests_and_tables, AssetDigest, ModelCommitment,
 };
 
 use crate::report::{parse_flags, path_flag};
@@ -25,13 +26,22 @@ pub struct AnchorArgs {
     pub out: Option<PathBuf>,
     pub asset_hashes: Option<PathBuf>,
     pub policy: Option<PathBuf>,
+    pub table_randomness: Option<PathBuf>,
 }
 
 impl AnchorArgs {
     pub fn parse(args: &[String]) -> Result<Self> {
         let flags = parse_flags(
             args,
-            &["case", "input", "asset-root", "out", "asset-hashes", "policy"],
+            &[
+                "case",
+                "input",
+                "asset-root",
+                "out",
+                "asset-hashes",
+                "policy",
+                "table-randomness",
+            ],
         )?;
         Ok(Self {
             case: path_flag(&flags, "case")?,
@@ -40,6 +50,7 @@ impl AnchorArgs {
             out: flags.get("out").map(PathBuf::from),
             asset_hashes: flags.get("asset-hashes").map(PathBuf::from),
             policy: flags.get("policy").map(PathBuf::from),
+            table_randomness: flags.get("table-randomness").map(PathBuf::from),
         })
     }
 }
@@ -152,36 +163,54 @@ fn confirmation(
     model: &str,
     asset_root: &Path,
     values: &[i32],
+    table_randomness: Option<&Path>,
 ) -> Result<Confirmation> {
     let tokens: Vec<u32> = values.iter().map(|value| *value as u32).collect();
-    let (model_id, parameters, specs, spec_version) = match model {
+    let (model_id, parameters, specs, spec_version, table_params) = match model {
         "gpt2" => (
             zkie_models_gpt2::plan::model_commitment(&tokens)?,
             zkie_models_gpt2::plan::parameters_digest()?,
             zkie_models_gpt2::plan::asset_specs(),
             zkie_models_gpt2::plan::MODEL_VERSION,
+            zkie_models_gpt2::plan::asset_table_params()?,
         ),
         "gemma3" => (
             zkie_models_gemma3::plan::model_commitment(&tokens)?,
             zkie_models_gemma3::plan::parameters_digest()?,
             zkie_models_gemma3::plan::asset_specs(),
             zkie_models_gemma3::plan::MODEL_VERSION,
+            Vec::new(),
         ),
         "timesfm" => (
             zkie_models_timesfm::plan::model_commitment(&tokens)?,
             zkie_models_timesfm::plan::parameters_digest()?,
             zkie_models_timesfm::plan::asset_specs(),
             zkie_models_timesfm::plan::MODEL_VERSION,
+            Vec::new(),
         ),
         _ => return Err(Error::UnsupportedPrimitive),
     };
+    // The encoded-table instance is rebuilt from the saved private material,
+    // so the operator identity check names the same public commitment the
+    // commit published. A model without trusted tables must not receive one.
+    let tables = if table_params.is_empty() {
+        if table_randomness.is_some() {
+            return Err(Error::InvalidConfig);
+        }
+        Vec::new()
+    } else {
+        let path = table_randomness.ok_or(Error::MissingCommitArtifact)?;
+        let bytes = std::fs::read(path).map_err(|_| Error::Io)?;
+        decode_asset_table_randomness_set(&bytes, &table_params)?
+    };
     let spec_count = specs.len();
     let (commitment, digests) =
-        commit_assets_with_digests(asset_root, model_id, parameters, &specs)?;
+        commit_assets_with_digests_and_tables(asset_root, model_id, parameters, &specs, &tables)?;
     if commitment.anchor.record.model_commitment != model_id
         || commitment.anchor.record.parameters_digest != parameters
         || commitment.assets.len() != spec_count
         || digests.len() != spec_count
+        || commitment.tables.len() != tables.len()
     {
         return Err(Error::StatementMismatch);
     }
@@ -327,7 +356,12 @@ pub fn run(args: &[String]) -> Result<()> {
     } else {
         "argmax"
     };
-    let confirmed = confirmation(&case.model, &asset_root, &values)?;
+    let confirmed = confirmation(
+        &case.model,
+        &asset_root,
+        &values,
+        parsed.table_randomness.as_deref(),
+    )?;
     if let Some(previous) = &parsed.asset_hashes {
         let bytes = std::fs::read(previous).map_err(|_| Error::Io)?;
         let value: serde_json::Value =
@@ -360,6 +394,24 @@ pub fn run(args: &[String]) -> Result<()> {
             })
         })
         .collect();
+    let table_instances: Vec<serde_json::Value> = confirmed
+        .commitment
+        .tables
+        .iter()
+        .map(|meta| {
+            serde_json::json!({
+                "asset_id": meta.asset_id,
+                "path": meta.path,
+                "identity": digest_to_hex(&meta.identity),
+                "configuration": digest_to_hex(&meta.configuration),
+                "root": digest_to_hex(&meta.root),
+                "record_digest": digest_to_hex(&digest_bytes(&meta.record.encode())),
+                "valid_min": meta.valid_min,
+                "valid_max": meta.valid_max,
+                "valid_elements": meta.valid_elements,
+            })
+        })
+        .collect();
     let registered_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
@@ -374,7 +426,9 @@ pub fn run(args: &[String]) -> Result<()> {
         "spec_version": confirmed.spec_version,
         "model_id": digest_to_hex(&confirmed.model_id),
         "anchor_id": digest_to_hex(&confirmed.commitment.anchor.record.anchor_id),
+        "anchor_leaf_count": confirmed.commitment.anchor.record.leaf_count,
         "parameters_digest": digest_to_hex(&confirmed.parameters),
+        "table_instances": table_instances,
         "assets_checked": confirmed.digests.len(),
         "input_elements": values.len(),
         "registered_at_unix": registered_at,
