@@ -1,0 +1,24 @@
+VERIFY_TIMING decode_ms=5735 rest_ms=26329 total_ms=32064
+	Command being timed: "target/release/zkie verify --public docs/benchmarks/20261113-2231-proof-size-a-matrix-555c6a26-e78bc2e6/matrix/gemma3-seq16/cold-0/commit/public --statement docs/benchmarks/20261113-2231-proof-size-a-matrix-555c6a26-e78bc2e6/matrix/gemma3-seq16/cold-0/proof/statement.bin --proof docs/benchmarks/20261113-2231-proof-size-a-matrix-555c6a26-e78bc2e6/matrix/gemma3-seq16/cold-0/proof/proof.bin --public-inputs docs/benchmarks/20261113-2231-proof-size-a-matrix-555c6a26-e78bc2e6/matrix/gemma3-seq16/cold-0/proof/public-inputs.bin --model-id 39b607c9f6156a8df155ca1a97e1fa70f0adf74730cc670ec67b5c8fd6410e34 --policy docs/benchmarks/20261113-2231-proof-size-a-matrix-555c6a26-e78bc2e6/matrix/gemma3-seq16/cold-0/policy.toml --run-dir /tmp/vt2-gemma3-seq16"
+	User time (seconds): 41.96
+	System time (seconds): 72.31
+	Percent of CPU this job got: 352%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:32.39
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 10950548
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 3251046
+	Voluntary context switches: 352145
+	Involuntary context switches: 8222
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 0
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
