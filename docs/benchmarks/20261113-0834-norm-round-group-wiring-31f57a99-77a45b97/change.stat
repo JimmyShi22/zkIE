@@ -1,0 +1,4 @@
+31f57a99 Count the optional rounding group in the norm wiring (partial progress)
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 55 +++++++++++++++++++++---
+ crates/zkie-ops/src/proof/proximity_iopp.rs      |  9 +++-
+ 2 files changed, 57 insertions(+), 7 deletions(-)
