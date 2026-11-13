@@ -17006,15 +17006,19 @@ mod merged_tests {
         );
     }
 
-    /// A source that claims the trusted metadata but returns a different first
-    /// row, so only the content check can catch it.
-    struct LyingRows {
+    /// A source with explicit metadata. With `lie_first` it claims the trusted
+    /// metadata but returns a different first row, so only the content check
+    /// can catch it; with a different encoding it opens but the verifier's
+    /// configuration compare must reject it.
+    struct RowsView {
         identity: Digest,
         root: Digest,
         rows: Vec<i64>,
+        encoding: crate::proof::lookup_table::TableEncoding,
+        lie_first: bool,
     }
 
-    impl crate::proof::lookup_table::TableRowSource for LyingRows {
+    impl crate::proof::lookup_table::TableRowSource for RowsView {
         fn identity(&self) -> Digest {
             self.identity
         }
@@ -17028,7 +17032,7 @@ mod merged_tests {
         }
 
         fn encoding(&self) -> crate::proof::lookup_table::TableEncoding {
-            crate::proof::lookup_table::TableEncoding::I64Le
+            self.encoding
         }
 
         fn read_rows(&self, start: usize, count: usize) -> Result<Vec<i64>> {
@@ -17037,7 +17041,7 @@ mod merged_tests {
                 return Err(Error::ShapeMismatch);
             }
             let mut rows = self.rows[start..end].to_vec();
-            if start == 0 {
+            if self.lie_first && start == 0 {
                 rows[0] += 1;
             }
             Ok(rows)
@@ -17061,16 +17065,105 @@ mod merged_tests {
             .table_log;
         let values = rstd_values();
         let root = content_digest(TableEncoding::I64Le, &values).unwrap();
-        let source = LyingRows {
+        let source = RowsView {
             identity: Digest([0x81; 32]),
             root,
             rows: values,
+            encoding: TableEncoding::I64Le,
+            lie_first: true,
         };
         let verified = verify_with_rstd_table(&activation, table_log, source);
         assert!(
             verified.is_err(),
             "a padded table whose read rows do not match the trusted content must be rejected"
         );
+    }
+
+    #[test]
+    fn rstd_table_encoding_tampering_is_rejected() {
+        use crate::proof::lookup_table::{content_digest, TableEncoding};
+
+        let activation = activation();
+        let (plan, _, _) = rstd_fixture(&activation);
+        let table_log = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .rstd
+            .as_ref()
+            .unwrap()
+            .lookup
+            .table_log;
+        let values = rstd_values();
+        // The trusted fixture table is an i32-le source; i64-le is the wrong
+        // encoding that still encodes the same numbers.
+        let root = content_digest(TableEncoding::I64Le, &values).unwrap();
+        let source = RowsView {
+            identity: Digest([0x81; 32]),
+            root,
+            rows: values,
+            encoding: TableEncoding::I64Le,
+            lie_first: false,
+        };
+        let verified = verify_with_rstd_table(&activation, table_log, source);
+        assert!(
+            verified.is_err(),
+            "a table whose encoding differs from the trusted plan must be rejected"
+        );
+    }
+
+    #[test]
+    fn rstd_proof_does_not_carry_plaintext_values() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, rstd_table) = rstd_fixture(&activation);
+        let (messages, _) = prove_hidden_lin_hidden_with_norm_and_rstd_table(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+            &rstd_table,
+        )
+        .unwrap();
+        let norm = messages.second.norm.as_ref().unwrap();
+        let rstd = norm.rstd.as_ref().unwrap();
+        let first_rstd = messages
+            .first
+            .norm
+            .as_ref()
+            .unwrap()
+            .rstd
+            .as_ref()
+            .unwrap();
+        // The lookup proof and its outcome contain only fixed-width fields
+        // (u64 and canonical field elements), and the sample messages contain
+        // only fixed-width fields too, so their eight-byte alignment is kept:
+        // a plaintext field value would appear there as its little-endian
+        // bytes followed by sixteen zero bytes at an eight-byte boundary.
+        // Digests, salts, Merkle paths, public positions and slot lists are
+        // not field values and are not scanned.
+        let buffers = [
+            ("rstd proof", rstd.proof.encode().unwrap()),
+            ("rstd claims", rstd.claims.encode_unchecked()),
+            ("rstd bits sample", first_rstd.bits.sample.encode()),
+            ("rstd mask sample", first_rstd.mask.sample.encode()),
+        ];
+        for value in rstd_values() {
+            let mut needle = Vec::with_capacity(24);
+            needle.extend_from_slice(&(value as u64).to_le_bytes());
+            needle.extend_from_slice(&[0u8; 16]);
+            for (name, buffer) in &buffers {
+                let hit = buffer
+                    .windows(needle.len())
+                    .enumerate()
+                    .any(|(offset, window)| offset % 8 == 0 && window == needle.as_slice());
+                assert!(
+                    !hit,
+                    "the {name} must not carry the plaintext rstd value {value}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -17195,6 +17288,110 @@ mod merged_tests {
             )
             .is_err(),
             "a changed rstd key claim must be rejected"
+        );
+
+        let mut changed = base.clone();
+        let answers = &mut changed
+            .first
+            .norm
+            .as_mut()
+            .unwrap()
+            .rstd
+            .as_mut()
+            .unwrap()
+            .bits
+            .sample
+            .answers;
+        assert!(!answers.is_empty());
+        answers[0] = answers[0].add(&Fp3::ONE);
+        assert!(
+            verify_hidden_lin_hidden_with_rstd_table(
+                &verifier_plan,
+                &table.reader(),
+                &changed,
+                &rstd_table
+            )
+            .is_err(),
+            "a changed rstd sample answer must be rejected"
+        );
+
+        let mut changed = base.clone();
+        let tie = &mut changed
+            .second
+            .norm
+            .as_mut()
+            .unwrap()
+            .rstd
+            .as_mut()
+            .unwrap()
+            .proof
+            .tie;
+        assert!(!tie.is_empty() && !tie[0].end_values.is_empty());
+        tie[0].end_values[0] = tie[0].end_values[0].add(&Fp3::ONE);
+        assert!(
+            verify_hidden_lin_hidden_with_rstd_table(
+                &verifier_plan,
+                &table.reader(),
+                &changed,
+                &rstd_table
+            )
+            .is_err(),
+            "a changed rstd lookup proof value must be rejected"
+        );
+    }
+
+    #[test]
+    fn rstd_selector_tampering_is_rejected() {
+        let activation = activation();
+        let (plan, witness, rstd_table) = rstd_fixture(&activation);
+        let two_segments =
+            prove_with_tampered_rstd(&activation, &plan, &witness, &rstd_table, |row| {
+                row.mid = true;
+            });
+        assert!(
+            two_segments.is_err(),
+            "two active rsqrt segments must not produce a proof"
+        );
+        let no_segment =
+            prove_with_tampered_rstd(&activation, &plan, &witness, &rstd_table, |row| {
+                row.fine = false;
+            });
+        assert!(
+            no_segment.is_err(),
+            "no active rsqrt segment must not produce a proof"
+        );
+    }
+
+    #[test]
+    fn rstd_rounding_remainder_tampering_is_rejected() {
+        let activation = activation();
+        let (plan, witness, rstd_table) = rstd_fixture(&activation);
+        let shifted = prove_with_tampered_rstd(&activation, &plan, &witness, &rstd_table, |row| {
+            row.raw += 1;
+        });
+        assert!(
+            shifted.is_err(),
+            "a shifted rounding quotient must not produce a proof"
+        );
+        let remainder = prove_with_tampered_rstd(&activation, &plan, &witness, &rstd_table, |row| {
+            row.raw_remainder += 1;
+        });
+        assert!(
+            remainder.is_err(),
+            "a shifted rounding remainder must not produce a proof"
+        );
+    }
+
+    #[test]
+    fn rstd_index_quotient_tampering_is_rejected() {
+        let activation = activation();
+        let (plan, witness, rstd_table) = rstd_fixture(&activation);
+        let proved = prove_with_tampered_rstd(&activation, &plan, &witness, &rstd_table, |row| {
+            row.mid_q += 1;
+        });
+        assert!(
+            proved.is_err(),
+            "a shifted segment quotient must not produce a proof"
         );
     }
 
