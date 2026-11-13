@@ -2632,6 +2632,110 @@ pub fn norm_pointwise_entries(
     Ok(entries)
 }
 
+/// The trusted byte-table lookup plan of the committed clamp slack digits:
+/// one value column, one key per slack digit slot of every position, the byte
+/// table fixed at eight address bits, and every source addressing the tail
+/// group cell of its position. The multiplicity plane count is a plan value
+/// bounded by the key count.
+pub fn tail_slack_lookup_plan(
+    tail: &NormOutputTailPlan,
+    positions: u32,
+    columns: u64,
+    table_identity: Digest,
+    mu: u32,
+) -> Result<(crate::proof::lookup::LookupPlan, crate::proof::lookup::LookupKeyPlan)> {
+    use crate::proof::lookup::{LookupKeyPlan, LookupKeySource, LookupPlan};
+
+    let clamp = tail.clamp.as_ref().ok_or(Error::InvalidConfig)?;
+    if positions == 0 || tail.group.fault(positions).is_some() || table_identity == Digest::ZERO
+    {
+        return Err(Error::InvalidConfig);
+    }
+    let count = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    let slots = tail.slots()?;
+    let q_at = 0usize;
+    let r_at = tail.widths.quotient;
+    let u_at = r_at + tail.widths.remainder;
+    let w_at = u_at + tail.widths.doubled_remainder;
+    let s_at = w_at + tail.widths.tie_slack;
+    let sh_at = s_at + 1;
+    let pre_at = sh_at + tail.widths.shifted;
+    let low_at = pre_at + tail.widths.pre_clamp;
+    let high_at = low_at + clamp.low;
+    let low_selector = high_at + clamp.high;
+    let low_strict_at = low_selector + 2;
+    let low_nonstrict_at = low_strict_at + clamp.low_strict;
+    let high_strict_at = low_nonstrict_at + clamp.low_nonstrict;
+    let high_nonstrict_at = high_strict_at + clamp.high_strict;
+    let groups = [
+        (low_strict_at, clamp.low_strict),
+        (low_nonstrict_at, clamp.low_nonstrict),
+        (high_strict_at, clamp.high_strict),
+        (high_nonstrict_at, clamp.high_nonstrict),
+    ];
+    let per_position = count
+        .checked_mul(groups.iter().map(|(_, width)| *width).sum::<usize>())
+        .ok_or(Error::ResourceLimit)?;
+    let total = usize::try_from(positions)
+        .map_err(|_| Error::ResourceLimit)?
+        .checked_mul(per_position)
+        .ok_or(Error::ResourceLimit)?;
+    if total == 0 || total > (1usize << 30) {
+        return Err(Error::ResourceLimit);
+    }
+    let key_bits = ceil_log2_u64(total as u64);
+    let rows = usize::try_from(tail.group.shape.main_rows)
+        .map_err(|_| Error::ResourceLimit)?;
+    let ell = usize::try_from(tail.group.shape.code.ell)
+        .map_err(|_| Error::ResourceLimit)?;
+    let mut sources = Vec::with_capacity(total);
+    for position in 0..positions {
+        let oracle = tail
+            .group
+            .oracle_base
+            .checked_add(position as u64)
+            .ok_or(Error::ResourceLimit)?;
+        for column in 0..count {
+            let base = column.checked_mul(slots).ok_or(Error::ResourceLimit)?;
+            for (offset, width) in groups {
+                for digit in 0..width {
+                    let slot = base
+                        .checked_add(offset)
+                        .and_then(|value| value.checked_add(digit))
+                        .ok_or(Error::ResourceLimit)?;
+                    let row = slot % rows;
+                    let place = slot / rows;
+                    if place >= ell {
+                        return Err(Error::ShapeMismatch);
+                    }
+                    sources.push(LookupKeySource {
+                        column: 0,
+                        oracle,
+                        position,
+                        row: row as u32,
+                        place: place as u32,
+                        coefficient: Fp3::ONE,
+                        offset: Fp3::ZERO,
+                    });
+                }
+            }
+        }
+    }
+    let plan = LookupPlan {
+        key_bits,
+        mu,
+        table_log: 8,
+        columns: 1,
+    };
+    let key = LookupKeyPlan {
+        sources,
+        padding_values: vec![Fp3::ZERO],
+        table_identity,
+    };
+    key.validate(&plan)?;
+    Ok((plan, key))
+}
+
 /// The committed mask entries of the tail relation instances, in
 /// position-major and relation order.
 pub fn norm_tail_entries(
@@ -6400,6 +6504,84 @@ mod tests {
         assert!(changed.validate().is_err());
 
         assert_eq!(widths.slots().unwrap(), 16);
+    }
+
+    #[test]
+    fn slack_digit_lookup_plan_addresses_the_tail_cells() {
+        let (plan, _, _) = integrated_fixture();
+        let widths = NormOutputTailWidths {
+            quotient: 3,
+            remainder: 2,
+            doubled_remainder: 2,
+            tie_slack: 2,
+            shifted: 3,
+            pre_clamp: 3,
+        };
+        let clamp_widths = NormClampWidths {
+            low: 4,
+            high: 4,
+            low_strict: 4,
+            low_nonstrict: 4,
+            high_strict: 4,
+            high_nonstrict: 4,
+        };
+        let tail_columns = 256u64;
+        let tail_group = NormGroupPlan {
+            shape: WShape::new(
+                tail_columns,
+                code(),
+                1,
+                2,
+                zkie_engine::pcs::request::params::LEAF_SALT_MIN_BYTES,
+                720,
+                1,
+                Digest([0x44; 32]),
+                Digest([0x54; 32]),
+            )
+            .unwrap(),
+            columns: tail_columns,
+            group: 10,
+            oracle_base: 7600,
+            openings: 1,
+        };
+        let tail = NormOutputTailPlan {
+            group: tail_group,
+            widths,
+            clamp: Some(clamp_widths),
+        };
+        let identity = Digest([0x55; 32]);
+        let (lookup, key) =
+            tail_slack_lookup_plan(&tail, plan.shape.positions, plan.columns, identity, 3)
+                .unwrap();
+        let slack_digits = 4 * 4;
+        let per_position = plan.columns as usize * slack_digits;
+        assert_eq!(key.sources.len(), plan.shape.positions as usize * per_position);
+        assert_eq!(lookup.columns, 1);
+        assert_eq!(lookup.table_log, 8);
+        assert_eq!(
+            lookup.key_count().unwrap(),
+            (key.sources.len() as u64).next_power_of_two() as usize
+        );
+        for source in &key.sources {
+            assert_eq!(source.column, 0);
+            assert_eq!(
+                source.oracle,
+                tail.group.oracle_base + source.position as u64
+            );
+        }
+        assert_eq!(key.padding_values, vec![Fp3::ZERO]);
+        key.validate(&lookup).unwrap();
+
+        let mut without_clamp = tail.clone();
+        without_clamp.clamp = None;
+        assert!(tail_slack_lookup_plan(
+            &without_clamp,
+            plan.shape.positions,
+            plan.columns,
+            identity,
+            3
+        )
+        .is_err());
     }
 
     #[test]
