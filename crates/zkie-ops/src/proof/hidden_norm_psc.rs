@@ -2120,11 +2120,21 @@ pub struct NormMaskWitness {
     pub entries: Vec<DotMaskEntries>,
 }
 
-/// The prover-side parameter vectors of the two norm parameter tables.
+/// The prover-side committed material of one folded parameter claim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormParamClaimWitness {
+    pub message: Vec<Vec<Fp3>>,
+    pub tails: Vec<Vec<Fp3>>,
+    pub salts: Vec<Vec<u8>>,
+}
+
+/// The prover-side parameter vectors and folded claim material.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormParamWitness {
     pub gain: Vec<i64>,
     pub bias: Vec<i64>,
+    pub gain_claim: Option<NormParamClaimWitness>,
+    pub bias_claim: Option<NormParamClaimWitness>,
 }
 
 /// The prover-side witness of the integrated norm groups.

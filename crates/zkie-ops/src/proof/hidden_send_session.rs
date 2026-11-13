@@ -6709,7 +6709,7 @@ fn prove_first(
     }
     let norm_first = match (&plan.norm, norm) {
         (Some(_), Some(norm_witness)) => {
-            let (message, lookup_messages, rstd_messages) =
+            let (message, lookup_messages, rstd_messages, param_claims) =
                 prove_norm_first(plan, &mut chain, norm_witness, seed, param_tables)?;
             let mut owned = norm_witness.clone();
             if let Some(lookup) = owned.lookup.as_mut() {
@@ -6717,6 +6717,11 @@ fn prove_first(
             }
             if let Some(rstd) = owned.rstd.as_mut() {
                 rstd.messages = rstd_messages;
+            }
+            if let Some((gain_claim, bias_claim)) = param_claims {
+                let params = owned.params.as_mut().ok_or(Error::ShapeMismatch)?;
+                params.gain_claim = Some(gain_claim);
+                params.bias_claim = bias_claim;
             }
             witness.norm = Some(owned);
             Some(message)
@@ -7814,13 +7819,93 @@ fn shared_point_bits(plan: &HiddenLinPlan) -> Result<u32> {
     Ok(k_col)
 }
 
+/// The inputs of the parameter claim members that join the shared proximity
+/// group. The prover also supplies the committed folded message material.
+struct NormParamClaimInput {
+    identity: NormParamTableIdentity,
+    claim: NormParamClaimPlan,
+    message: NormParamClaimMessage,
+    material: Option<crate::proof::hidden_norm_psc::NormParamClaimWitness>,
+}
+
+fn norm_param_claim_inputs(
+    plan: &HiddenLinPlan,
+    first: &HiddenSendMessages,
+    witness: Option<&NormWitness>,
+) -> Result<Vec<NormParamClaimInput>> {
+    let norm = match &plan.norm {
+        Some(norm) => norm,
+        None => return Ok(Vec::new()),
+    };
+    let params_plan = match &norm.params {
+        Some(params) => params,
+        None => return Ok(Vec::new()),
+    };
+    let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
+    let message = norm_first.params.as_ref().ok_or(Error::ShapeMismatch)?;
+    let (gain_material, bias_material) = match witness {
+        Some(witness) => {
+            let params = witness.params.as_ref().ok_or(Error::ShapeMismatch)?;
+            (
+                Some(params.gain_claim.clone().ok_or(Error::ShapeMismatch)?),
+                params.bias_claim.clone(),
+            )
+        }
+        None => (None, None),
+    };
+    let mut inputs = Vec::new();
+    inputs.push(NormParamClaimInput {
+        identity: params_plan.gain.clone(),
+        claim: params_plan
+            .gain_claim
+            .clone()
+            .ok_or(Error::ShapeMismatch)?,
+        message: message.gain.clone(),
+        material: gain_material,
+    });
+    if let Some(bias) = &message.bias {
+        inputs.push(NormParamClaimInput {
+            identity: params_plan.bias.clone(),
+            claim: params_plan
+                .bias_claim
+                .clone()
+                .ok_or(Error::ShapeMismatch)?,
+            message: bias.clone(),
+            material: bias_material,
+        });
+    } else if bias_material.is_some() {
+        return Err(Error::ShapeMismatch);
+    }
+    Ok(inputs)
+}
+
+fn norm_param_registry(
+    claim: &NormParamClaimPlan,
+    message: &NormParamClaimMessage,
+) -> Result<GuRegistry> {
+    let gu = &claim.gu;
+    let mut registry = GuRegistry::new();
+    registry.receive(
+        gu,
+        &GuNotice {
+            root: message.root,
+            oracle: gu.oracle,
+            tree_number: gu.tree.tree_number,
+            part: gu.part,
+        },
+    )?;
+    Ok(registry)
+}
+
 /// Prover side of the shared stage.
 fn prove_shared(
     plan: &HiddenLinPlan,
     reader: &IndexReader,
     table: &mut dyn HiddenTableProver,
+    first: &HiddenSendMessages,
     first_seal: &Digest,
     seed: &Digest,
+    norm_witness: Option<&NormWitness>,
 ) -> Result<SharedProveResult> {
     let _profile_shared = zkie_engine::profile::Scope::new("shared.prove_shared");
     let k_col = shared_point_bits(plan)?;
@@ -8052,6 +8137,38 @@ fn prove_shared(
             mask_tails: Vec::new(),
         },
     ];
+    let param_inputs = norm_param_claim_inputs(plan, first, norm_witness)?;
+    let mut param_trees = Vec::new();
+    for input in &param_inputs {
+        let gu = &input.claim.gu;
+        let material = input.material.as_ref().ok_or(Error::ShapeMismatch)?;
+        let tree = commit_rows_tree(
+            gu.tree.clone(),
+            gu.u.code,
+            &material.message,
+            &material.tails,
+            &material.salts,
+        )?;
+        if *tree.root() != input.message.root {
+            return Err(Error::StatementMismatch);
+        }
+        param_trees.push((gu.oracle, Arc::new(tree)));
+        members.push(ProximityMember {
+            bat_oracle: 0,
+            source_oracle: gu.oracle,
+            main_code: gu.u.code,
+            mask_code: plan.proximity.mask_code,
+            main_rows: gu.u.main_rows,
+            mask_rows: 0,
+            answers: gu.u.answers,
+            root: input.message.root,
+            tree_plan: gu.tree.clone(),
+            message: material.message.clone(),
+            tails: material.tails.clone(),
+            mask_message: Vec::new(),
+            mask_tails: Vec::new(),
+        });
+    }
     members.sort_by_key(|member| std::cmp::Reverse((member.main_rows, member.source_oracle)));
     let mut gu_bat = None;
     let mut omega_bat = None;
@@ -8066,6 +8183,15 @@ fn prove_shared(
     }
     let gu_bat = gu_bat.ok_or(Error::StatementMismatch)?;
     let omega_bat = omega_bat.ok_or(Error::StatementMismatch)?;
+    let mut param_registries = Vec::with_capacity(param_inputs.len());
+    for input in &param_inputs {
+        param_registries.push(norm_param_registry(&input.claim, &input.message)?);
+    }
+    let param_of = |oracle: u64| {
+        param_inputs
+            .iter()
+            .position(|input| input.claim.gu.oracle == oracle)
+    };
     let mut sample_rows = Vec::with_capacity(members.len());
     for member in &members {
         if member.source_oracle == gu.oracle {
@@ -8076,6 +8202,14 @@ fn prove_shared(
                 0,
                 gu_answers[0],
             )?]);
+        } else if let Some(index) = param_of(member.source_oracle) {
+            let input = &param_inputs[index];
+            sample_rows.push(sample_rows_of(
+                &input.claim.gu,
+                &param_registries[index],
+                &input.message.seeds,
+                &input.message.answers,
+            )?);
         } else {
             sample_rows.push(vec![oracle_sample_row(
                 omega.oracle,
@@ -8105,14 +8239,27 @@ fn prove_shared(
         matrix_rows,
         k_lo,
     )?);
+    for (index, input) in param_inputs.iter().enumerate() {
+        let member = members
+            .iter()
+            .find(|member| member.source_oracle == input.claim.gu.oracle)
+            .ok_or(Error::StatementMismatch)?;
+        let rows = norm_param_claim_rows(&input.identity, &input.claim, &input.message)?;
+        for row in rows.record.iter().chain(rows.column.iter()) {
+            plain_rows.push(relation_row_bat(row, member)?);
+        }
+        let _ = index;
+    }
     drop(_profile_plain_rows);
-    let trees = ProximityTreeSource::Ready(vec![
+    let mut trees = vec![
         (members[gu_bat as usize].source_oracle, Arc::new(gu_tree)),
         (
             members[omega_bat as usize].source_oracle,
             Arc::new(omega_tree),
         ),
-    ]);
+    ];
+    trees.extend(param_trees);
+    let trees = ProximityTreeSource::Ready(trees);
     let fold = member_fold_shape(
         plan.proximity.code,
         plan.proximity.mask_code,
@@ -8218,6 +8365,7 @@ fn commit_rows_tree(
 fn verify_shared(
     plan: &HiddenLinPlan,
     reader: &IndexReader,
+    first: &HiddenSendMessages,
     first_seal: &Digest,
     messages: &HiddenSharedMessages,
 ) -> Result<(Digest, Vec<GuRelationRow>, SharedPoints, ProximityBaseOutcome)> {
@@ -8343,6 +8491,25 @@ fn verify_shared(
             mask_tails: Vec::new(),
         },
     ];
+    let param_inputs = norm_param_claim_inputs(plan, first, None)?;
+    for input in &param_inputs {
+        let gu = &input.claim.gu;
+        members.push(ProximityMember {
+            bat_oracle: 0,
+            source_oracle: gu.oracle,
+            main_code: gu.u.code,
+            mask_code: plan.proximity.mask_code,
+            main_rows: gu.u.main_rows,
+            mask_rows: 0,
+            answers: gu.u.answers,
+            root: input.message.root,
+            tree_plan: gu.tree.clone(),
+            message: Vec::new(),
+            tails: Vec::new(),
+            mask_message: Vec::new(),
+            mask_tails: Vec::new(),
+        });
+    }
     members.sort_by_key(|member| std::cmp::Reverse((member.main_rows, member.source_oracle)));
     let mut gu_bat = None;
     let mut omega_bat = None;
@@ -8357,10 +8524,27 @@ fn verify_shared(
     }
     let gu_bat = gu_bat.ok_or(Error::StatementMismatch)?;
     let omega_bat = omega_bat.ok_or(Error::StatementMismatch)?;
+    let mut param_registries = Vec::with_capacity(param_inputs.len());
+    for input in &param_inputs {
+        param_registries.push(norm_param_registry(&input.claim, &input.message)?);
+    }
+    let param_of = |oracle: u64| {
+        param_inputs
+            .iter()
+            .position(|input| input.claim.gu.oracle == oracle)
+    };
     let mut sample_rows = Vec::with_capacity(members.len());
     for member in &members {
         if member.source_oracle == gu.oracle {
             sample_rows.push(sample_rows_of(&gu, &registry, &gu_seeds, &messages.gu_answers)?);
+        } else if let Some(index) = param_of(member.source_oracle) {
+            let input = &param_inputs[index];
+            sample_rows.push(sample_rows_of(
+                &input.claim.gu,
+                &param_registries[index],
+                &input.message.seeds,
+                &input.message.answers,
+            )?);
         } else {
             let mut rows = Vec::with_capacity(messages.omega_answers.len());
             for (answer, target) in messages.omega_answers.iter().enumerate() {
@@ -8394,6 +8578,18 @@ fn verify_shared(
         omega.matrix_rows,
         omega.k_lo,
     )?);
+    let mut param_claim_rows = Vec::new();
+    for input in &param_inputs {
+        let member = members
+            .iter()
+            .find(|member| member.source_oracle == input.claim.gu.oracle)
+            .ok_or(Error::StatementMismatch)?;
+        let rows = norm_param_claim_rows(&input.identity, &input.claim, &input.message)?;
+        for row in rows.record.iter().chain(rows.column.iter()) {
+            plain_rows.push(relation_row_bat(row, member)?);
+        }
+        param_claim_rows.push(rows);
+    }
     drop(_profile_plain_rows);
     let fold = member_fold_shape(
         plan.proximity.code,
@@ -8432,6 +8628,10 @@ fn verify_shared(
     let mut claims = sample_rows.into_iter().flatten().collect::<Vec<_>>();
     claims.extend(record_rows);
     claims.extend(column_rows);
+    for rows in param_claim_rows {
+        claims.extend(rows.record);
+        claims.extend(rows.column);
+    }
     Ok((
         proximity.seal,
         claims,
@@ -9819,11 +10019,15 @@ fn prove_norm_first(
     witness: &NormWitness,
     seed: &Digest,
     param_tables: Option<&mut dyn NormParamTableProver>,
-) -> Result<(
-    NormFirstMessages,
-    Option<crate::proof::lookup_messages::LookupMessages>,
-    Option<crate::proof::lookup_messages::LookupMessages>,
-)> {
+    ) -> Result<(
+        NormFirstMessages,
+        Option<crate::proof::lookup_messages::LookupMessages>,
+        Option<crate::proof::lookup_messages::LookupMessages>,
+        Option<(
+            crate::proof::hidden_norm_psc::NormParamClaimWitness,
+            Option<crate::proof::hidden_norm_psc::NormParamClaimWitness>,
+        )>,
+    )> {
     let norm = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
     let positions = norm.shape.positions;
     let groups = norm_group_plans(norm);
@@ -10331,6 +10535,7 @@ fn prove_norm_first(
         }
         None => (None, None),
     };
+    let mut param_claims = None;
     let params = match (&norm.params, param_tables) {
         (Some(params_plan), Some(tables)) => {
             let width = usize::try_from(norm.columns).map_err(|_| Error::ResourceLimit)?;
@@ -10342,7 +10547,7 @@ fn prove_norm_first(
                 .gain_claim
                 .as_ref()
                 .ok_or(Error::ShapeMismatch)?;
-            let gain = prove_norm_param_claim(
+            let (gain, gain_material) = prove_norm_param_claim(
                 chain,
                 &params_plan.gain,
                 gain_claim,
@@ -10360,7 +10565,7 @@ fn prove_norm_first(
                     .bias_claim
                     .as_ref()
                     .ok_or(Error::ShapeMismatch)?;
-                Some(prove_norm_param_claim(
+                let (bias, bias_material) = prove_norm_param_claim(
                     chain,
                     &params_plan.bias,
                     bias_claim,
@@ -10370,9 +10575,17 @@ fn prove_norm_first(
                     NORM_PARAM_BIAS_ROOT_TAG,
                     NORM_PARAM_BIAS_ANSWER_TAG,
                     NORM_PARAM_BIAS_POSITION_TAG,
-                )?)
+                )?;
+                param_claims = Some((gain_material.clone(), Some(bias_material)));
+                Some(bias)
             };
-            Some(NormParamMessage { gain, bias })
+            if param_claims.is_none() {
+                param_claims = Some((gain_material, None));
+            }
+            Some(NormParamMessage {
+                gain: gain.clone(),
+                bias,
+            })
         }
         (None, None) => {
             if witness.params.is_some() {
@@ -10398,6 +10611,7 @@ fn prove_norm_first(
         },
         lookup_messages,
         rstd_messages,
+        param_claims,
     ))
 }
 
@@ -10837,7 +11051,10 @@ fn prove_norm_param_claim(
     root_tag: u64,
     answer_tag: u64,
     column_tag: u64,
-) -> Result<NormParamClaimMessage> {
+) -> Result<(
+    NormParamClaimMessage,
+    crate::proof::hidden_norm_psc::NormParamClaimWitness,
+)> {
     let gu = &claim.gu;
     let mut coins = ByteMaskCoins::new(derive_run_seed(seed, 2, kind.encode())?)?;
     let gu_pads = draw_values(&mut coins, gu.u.answers as usize)?;
@@ -10905,12 +11122,19 @@ fn prove_norm_param_claim(
         gu.index.code.log_n,
     )?;
     let openings = table.open_columns(kind, &positions)?;
-    Ok(NormParamClaimMessage {
-        root,
-        seeds,
-        answers,
-        openings,
-    })
+    Ok((
+        NormParamClaimMessage {
+            root,
+            seeds,
+            answers,
+            openings,
+        },
+        crate::proof::hidden_norm_psc::NormParamClaimWitness {
+            message: gu_message,
+            tails: gu_tails,
+            salts: gu_salts,
+        },
+    ))
 }
 
 /// Verifies one parameter table claim in the fixed order: the root, the
@@ -14080,7 +14304,15 @@ fn prove_hidden_lin_inner(
             param_tables,
         )?;
     let first_query = *first_chain(plan, &reader)?.value();
-    let shared = prove_shared(plan, &reader, table, &first_seal, &seed)?;
+    let shared = prove_shared(
+        plan,
+        &reader,
+        table,
+        &first,
+        &first_seal,
+        &seed,
+        send_witness.norm.as_ref(),
+    )?;
     let own = prove_second(
         plan,
         &reader,
@@ -14199,7 +14431,7 @@ fn verify_hidden_lin_inner(
     drop(_profile_first_query);
     let _profile_shared = zkie_engine::profile::Scope::new("verify.hidden_lin.shared");
     let (shared_seal, shared_claims, points, shared_base) =
-        verify_shared(plan, reader, &first_seal, &messages.shared)?;
+        verify_shared(plan, reader, &messages.first, &first_seal, &messages.shared)?;
     drop(_profile_shared);
     if shared_seal != messages.shared.seal {
         return Err(Error::InvalidProof);
@@ -17195,6 +17427,8 @@ mod merged_tests {
         witness.params = Some(NormParamWitness {
             gain: gain_values,
             bias: bias_values,
+            gain_claim: None,
+            bias_claim: None,
         });
         plan.validate().unwrap();
         (
@@ -17227,6 +17461,24 @@ mod merged_tests {
         verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
         let outcome = verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &messages).unwrap();
         assert_eq!(outcome.first_seal, messages.first_seal);
+        let plan_params = plan.norm.as_ref().unwrap().params.as_ref().unwrap();
+        let openings = messages
+            .first
+            .norm
+            .as_ref()
+            .unwrap()
+            .params
+            .as_ref()
+            .unwrap()
+            .gain
+            .openings
+            .len();
+        let gain_rows = outcome
+            .shared_claims
+            .iter()
+            .filter(|row| row.oracle == plan_params.gain_claim.as_ref().unwrap().gu.oracle)
+            .count();
+        assert_eq!(gain_rows, 2 + openings);
     }
 
     #[test]
