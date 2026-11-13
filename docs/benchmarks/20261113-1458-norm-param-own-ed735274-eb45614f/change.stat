@@ -1,0 +1,18 @@
+commit ed73527440efbacd084dbf045d9f0196c6fc7c50
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Fri Nov 13 14:58:02 2026 +0800
+
+    Register the folded parameter members in the own group
+    
+    The own proximity group now carries the same physical parameter claim members
+    as the shared group: the same roots and runtime trees, registered by physical
+    identity, with their sample rows built from the same claim message. The tree
+    source rebuilds the folded message tree from the norm witness and checks the
+    plan and the root. The member and row counts stay member derived; the fixture
+    budgets accommodate the reuse, so the claim object is available to the own
+    group without a second commitment.
+    
+    partial progress
+
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 70 ++++++++++++++++++++++++
+ 1 file changed, 70 insertions(+)
