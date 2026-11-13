@@ -1,0 +1,332 @@
+{
+  "cases": [
+    {
+      "case_id": "gpt2-seq16",
+      "input": "/data/zkie-assets/cases/gpt2/tokens_16_i32.bin",
+      "runs": [
+        {
+          "commit": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "commit",
+            "error_code": null,
+            "last_completed_stage": "commit",
+            "last_event_seq": 3,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "/data/i2-after/gpt2-seq16/cold-0/commit-run/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 3367,
+            "run_id": "commit",
+            "stage_wall_ms": 3367,
+            "vmhwm_kib": 355428
+          },
+          "exit_code": 0,
+          "prove": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 75,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "/data/i2-after/gpt2-seq16/cold-0/prove/progress.jsonl",
+            "proof_bytes": 2190159492,
+            "protocol_wall_ms": 14430,
+            "run_id": "prove",
+            "stage_wall_ms": 14430,
+            "vmhwm_kib": 4496312
+          },
+          "verify": {
+            "authenticated_output_digest": "135c4d1c47aee4fd1985fa862afefbedde9d59beaf112bd2cf0dcfff03339280",
+            "authenticated_output_elements": 16,
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 17,
+            "outcome": "PASS",
+            "output_binding": "expected",
+            "progress_path": "/data/i2-after/gpt2-seq16/cold-0/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 71662,
+            "run_id": "verify",
+            "stage_wall_ms": 71662,
+            "vmhwm_kib": 4100780
+          }
+        },
+        {
+          "exit_code": 0,
+          "prove": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 75,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "/data/i2-after/gpt2-seq16/warm-0/prove/progress.jsonl",
+            "proof_bytes": 2190159492,
+            "protocol_wall_ms": 14293,
+            "run_id": "prove",
+            "stage_wall_ms": 14293,
+            "vmhwm_kib": 4488360
+          },
+          "verify": {
+            "authenticated_output_digest": "135c4d1c47aee4fd1985fa862afefbedde9d59beaf112bd2cf0dcfff03339280",
+            "authenticated_output_elements": 16,
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 17,
+            "outcome": "PASS",
+            "output_binding": "expected",
+            "progress_path": "/data/i2-after/gpt2-seq16/warm-0/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 72047,
+            "run_id": "verify",
+            "stage_wall_ms": 72047,
+            "vmhwm_kib": 4103892
+          }
+        },
+        {
+          "exit_code": 0,
+          "prove": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 75,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "/data/i2-after/gpt2-seq16/warm-1/prove/progress.jsonl",
+            "proof_bytes": 2190159492,
+            "protocol_wall_ms": 14349,
+            "run_id": "prove",
+            "stage_wall_ms": 14349,
+            "vmhwm_kib": 4496152
+          },
+          "verify": {
+            "authenticated_output_digest": "135c4d1c47aee4fd1985fa862afefbedde9d59beaf112bd2cf0dcfff03339280",
+            "authenticated_output_elements": 16,
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 17,
+            "outcome": "PASS",
+            "output_binding": "expected",
+            "progress_path": "/data/i2-after/gpt2-seq16/warm-1/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 71407,
+            "run_id": "verify",
+            "stage_wall_ms": 71407,
+            "vmhwm_kib": 4118628
+          }
+        },
+        {
+          "exit_code": 0,
+          "prove": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 75,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "/data/i2-after/gpt2-seq16/warm-2/prove/progress.jsonl",
+            "proof_bytes": 2190159492,
+            "protocol_wall_ms": 14413,
+            "run_id": "prove",
+            "stage_wall_ms": 14413,
+            "vmhwm_kib": 4488832
+          },
+          "verify": {
+            "authenticated_output_digest": "135c4d1c47aee4fd1985fa862afefbedde9d59beaf112bd2cf0dcfff03339280",
+            "authenticated_output_elements": 16,
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 17,
+            "outcome": "PASS",
+            "output_binding": "expected",
+            "progress_path": "/data/i2-after/gpt2-seq16/warm-2/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 72736,
+            "run_id": "verify",
+            "stage_wall_ms": 72736,
+            "vmhwm_kib": 4120312
+          }
+        }
+      ],
+      "seq_tokens": 16
+    },
+    {
+      "case_id": "gemma3-seq16",
+      "input": "/data/zkie-assets/cases/gemma3/tokens_16_i32.bin",
+      "runs": [
+        {
+          "commit": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "commit",
+            "error_code": null,
+            "last_completed_stage": "commit",
+            "last_event_seq": 4,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "/data/i2-after/gemma3-seq16/cold-0/commit-run/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 9404,
+            "run_id": "commit",
+            "stage_wall_ms": 9404,
+            "vmhwm_kib": 1085384
+          },
+          "exit_code": 0,
+          "prove": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 43,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "/data/i2-after/gemma3-seq16/cold-0/prove/progress.jsonl",
+            "proof_bytes": 6223297337,
+            "protocol_wall_ms": 35902,
+            "run_id": "prove",
+            "stage_wall_ms": 35902,
+            "vmhwm_kib": 12718616
+          },
+          "verify": {
+            "authenticated_output_digest": "8683f5e22e51d1405fe3efcc7487a9a4df2e694c5d9f0bed64e921810d77c562",
+            "authenticated_output_elements": 16,
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 39,
+            "outcome": "PASS",
+            "output_binding": "expected",
+            "progress_path": "/data/i2-after/gemma3-seq16/cold-0/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 182890,
+            "run_id": "verify",
+            "stage_wall_ms": 182890,
+            "vmhwm_kib": 10943996
+          }
+        },
+        {
+          "exit_code": 0,
+          "prove": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 43,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "/data/i2-after/gemma3-seq16/warm-0/prove/progress.jsonl",
+            "proof_bytes": 6223297337,
+            "protocol_wall_ms": 35391,
+            "run_id": "prove",
+            "stage_wall_ms": 35391,
+            "vmhwm_kib": 12718916
+          },
+          "verify": {
+            "authenticated_output_digest": "8683f5e22e51d1405fe3efcc7487a9a4df2e694c5d9f0bed64e921810d77c562",
+            "authenticated_output_elements": 16,
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 39,
+            "outcome": "PASS",
+            "output_binding": "expected",
+            "progress_path": "/data/i2-after/gemma3-seq16/warm-0/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 182921,
+            "run_id": "verify",
+            "stage_wall_ms": 182921,
+            "vmhwm_kib": 10950188
+          }
+        },
+        {
+          "exit_code": 0,
+          "prove": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 43,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "/data/i2-after/gemma3-seq16/warm-1/prove/progress.jsonl",
+            "proof_bytes": 6223297337,
+            "protocol_wall_ms": 35357,
+            "run_id": "prove",
+            "stage_wall_ms": 35357,
+            "vmhwm_kib": 12718828
+          },
+          "verify": {
+            "authenticated_output_digest": "8683f5e22e51d1405fe3efcc7487a9a4df2e694c5d9f0bed64e921810d77c562",
+            "authenticated_output_elements": 16,
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 39,
+            "outcome": "PASS",
+            "output_binding": "expected",
+            "progress_path": "/data/i2-after/gemma3-seq16/warm-1/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 182731,
+            "run_id": "verify",
+            "stage_wall_ms": 182731,
+            "vmhwm_kib": 10968760
+          }
+        },
+        {
+          "exit_code": 0,
+          "prove": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 43,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "/data/i2-after/gemma3-seq16/warm-2/prove/progress.jsonl",
+            "proof_bytes": 6223297337,
+            "protocol_wall_ms": 35423,
+            "run_id": "prove",
+            "stage_wall_ms": 35423,
+            "vmhwm_kib": 12718724
+          },
+          "verify": {
+            "authenticated_output_digest": "8683f5e22e51d1405fe3efcc7487a9a4df2e694c5d9f0bed64e921810d77c562",
+            "authenticated_output_elements": 16,
+            "command": "verify",
+            "error_code": null,
+            "last_completed_stage": "verify",
+            "last_event_seq": 40,
+            "outcome": "PASS",
+            "output_binding": "expected",
+            "progress_path": "/data/i2-after/gemma3-seq16/warm-2/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 186004,
+            "run_id": "verify",
+            "stage_wall_ms": 186004,
+            "vmhwm_kib": 10966596
+          }
+        }
+      ],
+      "seq_tokens": 16
+    }
+  ],
+  "kind": "matrix",
+  "schema": 1
+}

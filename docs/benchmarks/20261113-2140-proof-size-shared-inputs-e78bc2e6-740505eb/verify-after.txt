@@ -1,0 +1,13 @@
+independent verifier, interval-2 gpt2-seq16
+PASS model=gpt2 tokens=16 steps=4462 argmax=16 proof_bytes=2190155518
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:18.18
+	Maximum resident set size (kbytes): 6237928
+
+independent verifier, interval-2 gemma3-seq16
+PASS model=gemma3 tokens=16 steps=2090 argmax=16 proof_bytes=6223293366
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:30.80
+	Maximum resident set size (kbytes): 17047776
+
+matrix warm-0 verify results:
+{"authenticated_output_digest":"135c4d1c47aee4fd1985fa862afefbedde9d59beaf112bd2cf0dcfff03339280","authenticated_output_elements":16,"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":17,"outcome":"PASS","output_binding":"expected","progress_path":"/data/i2-after/gpt2-seq16/warm-0/verify/progress.jsonl","proof_bytes":null,"protocol_wall_ms":72047,"run_id":"verify","stage_wall_ms":72047,"vmhwm_kib":4103892}
+{"authenticated_output_digest":"8683f5e22e51d1405fe3efcc7487a9a4df2e694c5d9f0bed64e921810d77c562","authenticated_output_elements":16,"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":39,"outcome":"PASS","output_binding":"expected","progress_path":"/data/i2-after/gemma3-seq16/warm-0/verify/progress.jsonl","proof_bytes":null,"protocol_wall_ms":182921,"run_id":"verify","stage_wall_ms":182921,"vmhwm_kib":10950188}

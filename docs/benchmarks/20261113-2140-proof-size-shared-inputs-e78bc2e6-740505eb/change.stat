@@ -1,0 +1,9 @@
+e78bc2e6 Materialize relation inputs from the trusted plan
+
+ crates/zkie-ops/src/proof/model_commitment.rs | 45 +++-----------
+ crates/zkie-ops/src/proof/plan.rs             | 89 ++++++++++-----------------
+ crates/zkie-ops/src/proof/relations.rs        | 31 ++++++++--
+ crates/zkie-ops/src/proof/session_baseline.rs |  4 +-
+ crates/zkie-ops/tests/plan_check.rs           | 67 +++++++++++++++++++-
+ crates/zkie-ops/tests/relation_openings.rs    | 59 ++++++++++++++++--
+ 6 files changed, 193 insertions(+), 102 deletions(-)

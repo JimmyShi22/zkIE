@@ -1,0 +1,7 @@
+old-form (interval-1) proof through the interval-2 verifier
+
+harness:
+Error: UnsupportedVersion
+
+CLI result:
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"verify","error_code":"unsupported_version","last_completed_stage":"verify","last_event_seq":20,"outcome":"FAIL","output_binding":null,"progress_path":"/tmp/verify_oldform/progress.jsonl","proof_bytes":null,"protocol_wall_ms":91914,"run_id":"verify","stage_wall_ms":91914,"vmhwm_kib":3779824}
