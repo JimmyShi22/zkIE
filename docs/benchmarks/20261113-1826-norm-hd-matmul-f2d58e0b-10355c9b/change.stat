@@ -1,0 +1,5 @@
+f2d58e0b Consume the norm hidden-output object in the MatMul dot
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 774 +++++++++++++++++++++--
+ crates/zkie-ops/src/proof/output_head_lin.rs     |   1 +
+ zkie/tests/lin_session.rs                        |   2 +
+ 3 files changed, 721 insertions(+), 56 deletions(-)
