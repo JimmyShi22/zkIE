@@ -128,7 +128,6 @@ pub fn check_projection_reduction(
             if sum != output[position][column] {
                 return Err(Error::InvalidProof);
             }
-            let _ = table_rows;
         }
     }
     Ok(())
