@@ -1,0 +1,7 @@
+38ae6a25 Share authentication paths for fully opened oracles
+
+ crates/zkie-ops/src/proof/model_commitment.rs | 66 +++++++++++++++++--------
+ crates/zkie-ops/src/proof/relations.rs        | 37 +++++++++++---
+ crates/zkie-ops/src/proof/session_baseline.rs | 69 ++++++++++-----------------
+ crates/zkie-ops/tests/relation_openings.rs    | 37 ++++++++++++++
+ 4 files changed, 140 insertions(+), 69 deletions(-)

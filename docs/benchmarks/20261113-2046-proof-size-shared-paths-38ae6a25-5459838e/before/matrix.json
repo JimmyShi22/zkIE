@@ -1,0 +1,332 @@
+{
+  "cases": [
+    {
+      "case_id": "gpt2-seq16",
+      "input": "/data/zkie-assets/cases/gpt2/tokens_16_i32.bin",
+      "runs": [
+        {
+          "commit": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "commit",
+            "error_code": null,
+            "last_completed_stage": "commit",
+            "last_event_seq": 3,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "/data/i1-before/gpt2-seq16/cold-0/commit-run/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 3457,
+            "run_id": "commit",
+            "stage_wall_ms": 3457,
+            "vmhwm_kib": 356540
+          },
+          "exit_code": 1,
+          "prove": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 77,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "/data/i1-before/gpt2-seq16/cold-0/prove/progress.jsonl",
+            "proof_bytes": 4161786553,
+            "protocol_wall_ms": 22264,
+            "run_id": "prove",
+            "stage_wall_ms": 22264,
+            "vmhwm_kib": 8316644
+          },
+          "verify": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "verify",
+            "error_code": "resource_limit",
+            "last_completed_stage": "verify",
+            "last_event_seq": 2,
+            "outcome": "BLOCKED",
+            "output_binding": null,
+            "progress_path": "/data/i1-before/gpt2-seq16/cold-0/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 0,
+            "run_id": "verify",
+            "stage_wall_ms": 0,
+            "vmhwm_kib": 3444
+          }
+        },
+        {
+          "exit_code": 1,
+          "prove": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 77,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "/data/i1-before/gpt2-seq16/warm-0/prove/progress.jsonl",
+            "proof_bytes": 4161786553,
+            "protocol_wall_ms": 21965,
+            "run_id": "prove",
+            "stage_wall_ms": 21965,
+            "vmhwm_kib": 8317036
+          },
+          "verify": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "verify",
+            "error_code": "resource_limit",
+            "last_completed_stage": "verify",
+            "last_event_seq": 2,
+            "outcome": "BLOCKED",
+            "output_binding": null,
+            "progress_path": "/data/i1-before/gpt2-seq16/warm-0/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 0,
+            "run_id": "verify",
+            "stage_wall_ms": 0,
+            "vmhwm_kib": 3444
+          }
+        },
+        {
+          "exit_code": 1,
+          "prove": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 77,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "/data/i1-before/gpt2-seq16/warm-1/prove/progress.jsonl",
+            "proof_bytes": 4161786553,
+            "protocol_wall_ms": 21866,
+            "run_id": "prove",
+            "stage_wall_ms": 21866,
+            "vmhwm_kib": 8316648
+          },
+          "verify": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "verify",
+            "error_code": "resource_limit",
+            "last_completed_stage": "verify",
+            "last_event_seq": 2,
+            "outcome": "BLOCKED",
+            "output_binding": null,
+            "progress_path": "/data/i1-before/gpt2-seq16/warm-1/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 0,
+            "run_id": "verify",
+            "stage_wall_ms": 0,
+            "vmhwm_kib": 3440
+          }
+        },
+        {
+          "exit_code": 1,
+          "prove": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 77,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "/data/i1-before/gpt2-seq16/warm-2/prove/progress.jsonl",
+            "proof_bytes": 4161786553,
+            "protocol_wall_ms": 21919,
+            "run_id": "prove",
+            "stage_wall_ms": 21919,
+            "vmhwm_kib": 8315224
+          },
+          "verify": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "verify",
+            "error_code": "resource_limit",
+            "last_completed_stage": "verify",
+            "last_event_seq": 2,
+            "outcome": "BLOCKED",
+            "output_binding": null,
+            "progress_path": "/data/i1-before/gpt2-seq16/warm-2/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 0,
+            "run_id": "verify",
+            "stage_wall_ms": 0,
+            "vmhwm_kib": 3444
+          }
+        }
+      ],
+      "seq_tokens": 16
+    },
+    {
+      "case_id": "gemma3-seq16",
+      "input": "/data/zkie-assets/cases/gemma3/tokens_16_i32.bin",
+      "runs": [
+        {
+          "commit": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "commit",
+            "error_code": null,
+            "last_completed_stage": "commit",
+            "last_event_seq": 4,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "/data/i1-before/gemma3-seq16/cold-0/commit-run/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 9542,
+            "run_id": "commit",
+            "stage_wall_ms": 9542,
+            "vmhwm_kib": 1085440
+          },
+          "exit_code": 1,
+          "prove": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 45,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "/data/i1-before/gemma3-seq16/cold-0/prove/progress.jsonl",
+            "proof_bytes": 8766306050,
+            "protocol_wall_ms": 45565,
+            "run_id": "prove",
+            "stage_wall_ms": 45565,
+            "vmhwm_kib": 17523288
+          },
+          "verify": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "verify",
+            "error_code": "resource_limit",
+            "last_completed_stage": "verify",
+            "last_event_seq": 2,
+            "outcome": "BLOCKED",
+            "output_binding": null,
+            "progress_path": "/data/i1-before/gemma3-seq16/cold-0/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 0,
+            "run_id": "verify",
+            "stage_wall_ms": 0,
+            "vmhwm_kib": 3460
+          }
+        },
+        {
+          "exit_code": 1,
+          "prove": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 45,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "/data/i1-before/gemma3-seq16/warm-0/prove/progress.jsonl",
+            "proof_bytes": 8766306050,
+            "protocol_wall_ms": 45289,
+            "run_id": "prove",
+            "stage_wall_ms": 45289,
+            "vmhwm_kib": 17523856
+          },
+          "verify": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "verify",
+            "error_code": "resource_limit",
+            "last_completed_stage": "verify",
+            "last_event_seq": 2,
+            "outcome": "BLOCKED",
+            "output_binding": null,
+            "progress_path": "/data/i1-before/gemma3-seq16/warm-0/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 0,
+            "run_id": "verify",
+            "stage_wall_ms": 0,
+            "vmhwm_kib": 3460
+          }
+        },
+        {
+          "exit_code": 1,
+          "prove": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 45,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "/data/i1-before/gemma3-seq16/warm-1/prove/progress.jsonl",
+            "proof_bytes": 8766306050,
+            "protocol_wall_ms": 45853,
+            "run_id": "prove",
+            "stage_wall_ms": 45853,
+            "vmhwm_kib": 17523768
+          },
+          "verify": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "verify",
+            "error_code": "resource_limit",
+            "last_completed_stage": "verify",
+            "last_event_seq": 2,
+            "outcome": "BLOCKED",
+            "output_binding": null,
+            "progress_path": "/data/i1-before/gemma3-seq16/warm-1/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 0,
+            "run_id": "verify",
+            "stage_wall_ms": 0,
+            "vmhwm_kib": 3452
+          }
+        },
+        {
+          "exit_code": 1,
+          "prove": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "prove",
+            "error_code": null,
+            "last_completed_stage": "prove",
+            "last_event_seq": 45,
+            "outcome": "PASS",
+            "output_binding": null,
+            "progress_path": "/data/i1-before/gemma3-seq16/warm-2/prove/progress.jsonl",
+            "proof_bytes": 8766306050,
+            "protocol_wall_ms": 45260,
+            "run_id": "prove",
+            "stage_wall_ms": 45260,
+            "vmhwm_kib": 17523776
+          },
+          "verify": {
+            "authenticated_output_digest": null,
+            "authenticated_output_elements": null,
+            "command": "verify",
+            "error_code": "resource_limit",
+            "last_completed_stage": "verify",
+            "last_event_seq": 2,
+            "outcome": "BLOCKED",
+            "output_binding": null,
+            "progress_path": "/data/i1-before/gemma3-seq16/warm-2/verify/progress.jsonl",
+            "proof_bytes": null,
+            "protocol_wall_ms": 0,
+            "run_id": "verify",
+            "stage_wall_ms": 0,
+            "vmhwm_kib": 3460
+          }
+        }
+      ],
+      "seq_tokens": 16
+    }
+  ],
+  "kind": "matrix",
+  "schema": 1
+}
