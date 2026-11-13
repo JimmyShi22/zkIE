@@ -1,0 +1,4 @@
+f0e9ce1a Bind the norm offset and remainder relations (partial progress)
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     |  39 ++++++-
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 142 +++++++++++++++++++++--
+ 2 files changed, 172 insertions(+), 9 deletions(-)
