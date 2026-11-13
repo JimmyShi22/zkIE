@@ -1,0 +1,13 @@
+commit 81207d3625064b5f0a4838c86b9acc9946932757
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Fri Nov 13 12:16:01 2026 +0800
+
+    Map the lookup keys to the committed rounding digits (partial progress)
+    
+    The lookup key plan now comes from the trusted rounding layout: every committed digit slot of every position becomes a key entry that reads the physical cell of that position rounding message, the six value slots are excluded, and the remaining keys use the public padding byte. A helper derives the minimal key-bit and multiplicity-plane counts from the digit count. The hidden fixture reads the real rounding messages through this map.
+    
+    The lookup commit-plan sizing from the parent plan and the BAT/FOLD registration of the lookup claims are not part of this step.
+
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     | 237 ++++++++++++++++++++++-
+ crates/zkie-ops/src/proof/hidden_send_session.rs |  41 ++++
+ 2 files changed, 277 insertions(+), 1 deletion(-)
