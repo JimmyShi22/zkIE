@@ -1171,12 +1171,28 @@ pub struct NormLookupPlan {
     pub lookup: LookupPlan,
     pub commit: LookupCommitPlan,
     pub key: crate::proof::lookup::LookupKeyPlan,
+    /// The committed group the key sources address: its first oracle, its
+    /// message shape and its column count.
+    pub key_oracle_base: u64,
+    pub key_shape: WShape,
+    pub key_columns: u64,
 }
 
 impl NormLookupPlan {
     pub fn validate(&self) -> Result<()> {
         self.lookup.validate()?;
         self.key.validate(&self.lookup)?;
+        if self.key_oracle_base == 0
+            || self.key_columns == 0
+            || self.key_shape.fault(self.key_columns, 1).is_some()
+        {
+            return Err(Error::InvalidConfig);
+        }
+        for source in &self.key.sources {
+            if source.oracle < self.key_oracle_base {
+                return Err(Error::InvalidConfig);
+            }
+        }
         let planes = self.lookup.planes()?;
         let rows = self.lookup.table_rows()?;
         self.commit.validate(
@@ -1190,6 +1206,9 @@ impl NormLookupPlan {
     pub fn digest(&self) -> Digest {
         let mut writer = CanonicalWriter::new();
         writer.put_bytes(&self.lookup.digest());
+        writer.put_u64(self.key_oracle_base);
+        put_wshape(&mut writer, &self.key_shape);
+        writer.put_u64(self.key_columns);
         writer.put_u64(self.key.sources.len() as u64);
         for source in &self.key.sources {
             writer.put_u64(source.column as u64);
@@ -1438,6 +1457,8 @@ pub trait NormLookupView {
     fn lookup_plan(&self) -> &LookupPlan;
     fn commit_plan(&self) -> &LookupCommitPlan;
     fn key_plan(&self) -> &LookupKeyPlan;
+    /// The committed group the key sources address, when the plan fixes one.
+    fn key_group(&self) -> Option<(u64, &WShape, u64)>;
 }
 
 impl NormLookupView for NormLookupPlan {
@@ -1452,6 +1473,10 @@ impl NormLookupView for NormLookupPlan {
     fn key_plan(&self) -> &LookupKeyPlan {
         &self.key
     }
+
+    fn key_group(&self) -> Option<(u64, &WShape, u64)> {
+        Some((self.key_oracle_base, &self.key_shape, self.key_columns))
+    }
 }
 
 impl NormLookupView for NormRstdPlan {
@@ -1465,6 +1490,10 @@ impl NormLookupView for NormRstdPlan {
 
     fn key_plan(&self) -> &LookupKeyPlan {
         &self.key
+    }
+
+    fn key_group(&self) -> Option<(u64, &WShape, u64)> {
+        None
     }
 }
 
@@ -1669,6 +1698,9 @@ impl NormLookupPlan {
             run: params.run,
             configuration: params.configuration,
         };
+        let key_oracle_base = round.group.oracle_base;
+        let key_shape = round.group.shape;
+        let key_columns = round.group.columns;
         let plan = Self {
             lookup,
             commit: LookupCommitPlan {
@@ -1683,6 +1715,9 @@ impl NormLookupPlan {
                 mask_tree,
             },
             key,
+            key_oracle_base,
+            key_shape,
+            key_columns,
         };
         plan.validate()?;
         Ok(plan)
@@ -5306,7 +5341,26 @@ mod tests {
             padding_values: vec![Fp3::ZERO],
             table_identity: crate::proof::lookup::BYTE_TABLE_IDENTITY,
         };
-        plan.lookup = Some(NormLookupPlan { lookup, commit, key });
+        let key_shape = WShape::new(
+            4,
+            build_code_plan(4, 7, 2).unwrap(),
+            1,
+            1,
+            40,
+            1,
+            1,
+            Digest([0x61; 32]),
+            Digest([0x62; 32]),
+        )
+        .unwrap();
+        plan.lookup = Some(NormLookupPlan {
+            lookup,
+            commit,
+            key,
+            key_oracle_base: 1,
+            key_shape,
+            key_columns: 4,
+        });
         plan.validate().unwrap();
         let with = plan.digest();
         plan.lookup = None;

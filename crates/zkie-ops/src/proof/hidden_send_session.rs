@@ -12052,11 +12052,26 @@ fn prove_norm_second(
                 return Err(Error::StatementMismatch);
             }
             let seed = draw_lookup_seed(chain)?;
+            let tail_base = plan
+                .output
+                .as_ref()
+                .and_then(|output| output.tail.as_ref())
+                .map(|tail| tail.group.oracle_base);
+            let key_rows: &[Vec<Vec<Fp3>>] = if Some(lookup_plan.key_oracle_base) == tail_base {
+                let tail = witness
+                    .output
+                    .as_ref()
+                    .and_then(|output| output.tail.as_ref())
+                    .ok_or(Error::ShapeMismatch)?;
+                &tail.committed.messages
+            } else {
+                &round_witness.messages
+            };
             let (proof, claims) = crate::proof::lookup::prove_lookup_with_messages(
                 &lookup_plan.lookup,
                 &lookup_plan.commit,
                 &lookup_plan.key,
-                &round_witness.messages,
+                key_rows,
                 &crate::proof::lookup::LookupWitness {
                     bits: lookup_witness.bits.clone(),
                 },
@@ -12657,18 +12672,22 @@ fn lookup_plain_rows(
     }
     let mut rows = Vec::new();
 
-    // The key-leaf claim expanded on the committed rounding cells.
+    // The key-leaf claim expanded on the committed key group cells.
+    let (key_base, key_shape, key_columns) = match lookup_plan.key_group() {
+        Some((base, shape, columns)) => (base, shape, columns),
+        None => (
+            round_plan.group.oracle_base,
+            &round_plan.group.shape,
+            round_plan.group.columns,
+        ),
+    };
     let mut key_members = Vec::new();
     for source in &lookup_plan.key_plan().sources {
         let member = bat_of
             .get(&source.oracle)
             .ok_or(Error::StatementMismatch)?;
-        if source.oracle < round_plan.group.oracle_base
-            || source.oracle
-                >= round_plan
-                    .group
-                    .oracle_base
-                    .saturating_add(norm.shape.positions as u64)
+        if source.oracle < key_base
+            || source.oracle >= key_base.saturating_add(norm.shape.positions as u64)
         {
             return Err(Error::StatementMismatch);
         }
@@ -12683,8 +12702,8 @@ fn lookup_plain_rows(
         key_members.push(crate::proof::lookup::KeyClaimMember {
             source_oracle: member.source_oracle,
             bat_oracle: member.bat_oracle,
-            shape: round_plan.group.shape.clone(),
-            columns: round_plan.group.columns,
+            shape: key_shape.clone(),
+            columns: key_columns,
         });
     }
     rows.push(lookup_plan.key_plan().registration_row(
