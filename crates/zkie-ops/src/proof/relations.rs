@@ -13,8 +13,10 @@ use zkie_core::types::Digest;
 
 use crate::op::OpCode;
 use crate::proof::binding::{
-    commit_rows_with_openings, verify_opening, OracleId, OracleOpening, OracleRegistry,
+    commit_rows_with_openings, oracle_leaf, verify_opening, OracleId, OracleOpening,
+    OracleRegistry,
 };
+use zkie_engine::compute::cpu::merkle_build;
 use crate::registry::{exp_profile_value, isqrt_u128, profile_rsqrt_index, round_div_half_up, PureForward};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,7 +248,10 @@ fn commit_group_width(
             .map(|chunk| chunk.iter().map(|value| *value as u64).collect())
             .collect(),
     );
-    let (_, openings) = commit_rows_with_openings(registry, label, &rows)?;
+    let (_, mut openings) = commit_rows_with_openings(registry, label, &rows)?;
+    for opening in &mut openings {
+        opening.path.clear();
+    }
     Ok(openings)
 }
 
@@ -260,7 +265,10 @@ fn commit_group_wide(
         words.push(*value as u64);
         words.push((*value >> 64) as u64);
     }
-    let (_, openings) = commit_rows_with_openings(registry, label, &[words])?;
+    let (_, mut openings) = commit_rows_with_openings(registry, label, &[words])?;
+    for opening in &mut openings {
+        opening.path.clear();
+    }
     Ok(openings)
 }
 
@@ -533,7 +541,7 @@ pub fn prove_op_relation_shared(
     ))
 }
 
-fn verify_group(
+pub(crate) fn verify_group(
     registry: &OracleRegistry,
     openings: &[OracleOpening],
     len: usize,
@@ -600,7 +608,7 @@ fn verify_group(
         if opening.values.len() != width {
             return Err(Error::ShapeMismatch);
         }
-        if opening.path.len() != depth {
+        if !opening.path.is_empty() && opening.path.len() != depth {
             return Err(Error::InvalidProof);
         }
         if position as u64 >= data_rows
@@ -608,7 +616,24 @@ fn verify_group(
         {
             return Err(Error::StatementMismatch);
         }
-        verify_opening(registry, opening, count)?;
+    }
+    if openings.iter().all(|opening| opening.path.is_empty()) {
+        // Every leaf of the tree is present and ordered by position, so the
+        // root follows from the leaves alone: one root recomputation replaces
+        // one Merkle path per opening. The order and padding checks above are
+        // the same as those of the path form.
+        let mut leaves = Vec::with_capacity(openings.len());
+        for opening in openings {
+            leaves.push(oracle_leaf(opening.index, &opening.values));
+        }
+        let rebuilt = merkle_build(&root.start, &leaves)?;
+        if rebuilt.root != root.root {
+            return Err(Error::InvalidProof);
+        }
+    } else {
+        for opening in openings {
+            verify_opening(registry, opening, count)?;
+        }
     }
     Ok(())
 }

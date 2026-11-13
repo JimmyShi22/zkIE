@@ -54,9 +54,46 @@ fn positive_group_openings_verify() {
     let inputs = proof_input_values(&proof).unwrap();
     assert_eq!(inputs[0].len(), 6);
     assert_eq!(inputs[1].len(), 4);
+    // The prover writes the full-open form: every leaf is present and no
+    // Merkle path is carried; the verifier rebuilds each root from the leaves.
+    for group in proof
+        .inputs
+        .iter()
+        .chain(proof.outputs.iter())
+        .chain(proof.quotients.iter())
+        .chain(proof.helpers.iter())
+        .chain(proof.aux.iter())
+    {
+        assert!(group.iter().all(|opening| opening.path.is_empty()));
+    }
+    assert!(proof.raw.iter().all(|group| group.iter().all(|opening| opening.path.is_empty())));
 
     let (public, proof, config) = affine_fixture();
     verify_op_relation_with_external(&public, &proof, &config, &[]).unwrap();
+}
+
+#[test]
+fn pathless_leaf_tamper_is_rejected() {
+    let (public, proof, config) = matmul_fixture();
+    let mut changed = proof.clone();
+    changed.inputs[0][0].values[0] ^= 1;
+    assert_eq!(verify_code(&public, &changed, &config), "invalid_proof");
+
+    let mut changed = proof.clone();
+    changed.outputs[0][1].values[1] ^= 1;
+    assert_eq!(verify_code(&public, &changed, &config), "invalid_proof");
+}
+
+#[test]
+fn pathless_partial_coverage_is_rejected() {
+    let (public, proof, config) = matmul_fixture();
+    let mut missing = proof.clone();
+    missing.outputs[0].pop();
+    assert_eq!(verify_code(&public, &missing, &config), "statement_mismatch");
+
+    let mut reordered = proof.clone();
+    reordered.outputs[0].swap(1, 2);
+    assert_eq!(verify_code(&public, &reordered, &config), "invalid_index");
 }
 
 #[test]

@@ -417,13 +417,18 @@ pub fn open_asset_from_reader(
             .position(|candidate| candidate.asset_id == asset_id)
             .ok_or(Error::StatementMismatch)?,
     )?;
+    let full = row_start == 0 && row_count == asset.rows;
     let mut rows = Vec::with_capacity(row_count as usize);
     for row in row_start..row_start + row_count {
         let values = reader.read_row(row, asset.row_width)?;
         rows.push(RowOpening {
             row,
             values,
-            path: asset.tree.open(row as usize)?,
+            path: if full {
+                Vec::new()
+            } else {
+                asset.tree.open(row as usize)?
+            },
         });
     }
     Ok(AssetOpening {
@@ -564,7 +569,44 @@ impl<'a> AssetStore<'a> {
         Ok(openings)
     }
 }
-
+/// Authenticates the rows of one asset tree. When every leaf of the tree is
+/// present with an empty path, the root is recomputed from the leaves; a
+/// partial opening carries one path per row. Both forms check the same root.
+fn authenticate_asset_rows(
+    start: &Digest,
+    root: &Digest,
+    rows: &[RowOpening],
+    tree_rows: u64,
+) -> Result<()> {
+    if tree_rows == 0 || !tree_rows.is_power_of_two() || rows.is_empty() {
+        return Err(Error::InvalidConfig);
+    }
+    let depth = tree_rows.trailing_zeros() as usize;
+    if rows.len() as u64 == tree_rows && rows.iter().all(|row| row.path.is_empty()) {
+        let mut leaves = Vec::with_capacity(rows.len());
+        for (position, row) in rows.iter().enumerate() {
+            if row.row != position as u64 {
+                return Err(Error::InvalidIndex);
+            }
+            leaves.push(oracle_leaf(row.row, &row.values));
+        }
+        let rebuilt = merkle_build(start, &leaves)?;
+        if rebuilt.root != *root {
+            return Err(Error::InvalidProof);
+        }
+        return Ok(());
+    }
+    rows.par_iter().try_for_each(|row| {
+        if row.path.len() != depth {
+            return Err(Error::InvalidProof);
+        }
+        let leaf = oracle_leaf(row.row, &row.values);
+        if !merkle_verify(start, root, row.row as usize, &leaf, &row.path)? {
+            return Err(Error::InvalidProof);
+        }
+        Ok(())
+    })
+}
 
 pub fn verify_asset_opening(
     commitment: &ModelCommitment,
@@ -588,12 +630,9 @@ pub fn verify_asset_opening(
         if row.row >= asset.rows {
             return Err(Error::InvalidIndex);
         }
-        let leaf = oracle_leaf(row.row, &row.values);
-        if !merkle_verify(&opening.start, &opening.root, row.row as usize, &leaf, &row.path)? {
-            return Err(Error::InvalidProof);
-        }
         Ok(())
     })?;
+    authenticate_asset_rows(&opening.start, &opening.root, &opening.rows, asset.rows)?;
     Ok(())
 }
 
@@ -675,7 +714,6 @@ impl ModelCommitmentPublic {
         if asset.rows != expected_rows {
             return Err(Error::StatementMismatch);
         }
-        let depth = asset.rows.trailing_zeros() as usize;
         verify_link(
             &self.anchor,
             &opening.link,
@@ -707,21 +745,9 @@ impl ModelCommitmentPublic {
                         return Err(Error::StatementMismatch);
                     }
                 }
-                if row.path.len() != depth {
-                    return Err(Error::InvalidProof);
-                }
-                let leaf = oracle_leaf(row.row, &row.values);
-                if !merkle_verify(
-                    &opening.start,
-                    &opening.root,
-                    row.row as usize,
-                    &leaf,
-                    &row.path,
-                )? {
-                    return Err(Error::InvalidProof);
-                }
                 Ok(())
             })?;
+        authenticate_asset_rows(&opening.start, &opening.root, &opening.rows, asset.rows)?;
         Ok(())
     }
 }

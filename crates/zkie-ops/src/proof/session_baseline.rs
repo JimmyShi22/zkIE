@@ -31,13 +31,15 @@ use zkie_engine::pcs::request::params::{RequestParams, REQUEST_CHAIN_LABEL};
 use zkie_engine::primitives::codec::CanonicalWriter;
 
 use crate::op::OpCode;
-use crate::proof::binding::{verify_opening, OracleId, OracleRegistry};
+use crate::proof::binding::{OracleId, OracleRegistry};
 use crate::proof::model_commitment::{
     verify_model_anchor, AssetMeta, AssetOpening, ModelAssetSpec, ModelCommitmentPublic, SharedTrace,
     SharedTraceStep,
 };
 use crate::proof::plan::{PlanConfigValue, PlanLayout, PlanSource, TracePlan};
-use crate::proof::relations::{verify_op_relation_with_external, OpRelationPublic};
+use crate::proof::relations::{
+    verify_group, verify_op_relation_with_external, OpRelationPublic,
+};
 
 const SESSION_SCHEMA_VERSION: u64 = 1;
 
@@ -509,44 +511,6 @@ fn check_relation_shape(
     Ok(())
 }
 
-fn verify_group_authentication(
-    registry: &OracleRegistry,
-    openings: &[crate::proof::binding::OracleOpening],
-    width: usize,
-    wide: bool,
-) -> Result<()> {
-    if wide {
-        if openings.len() != 1 {
-            return Err(Error::ShapeMismatch);
-        }
-        let opening = &openings[0];
-        if opening.index != 0 || !opening.path.is_empty() {
-            return Err(Error::InvalidProof);
-        }
-        return verify_opening(registry, opening, 1);
-    }
-    if openings.is_empty() {
-        return Err(Error::ShapeMismatch);
-    }
-    let oracle = openings[0].oracle;
-    let count = openings.len() as u64;
-    if !count.is_power_of_two() {
-        return Err(Error::InvalidConfig);
-    }
-    let depth = count.trailing_zeros() as usize;
-    for (position, opening) in openings.iter().enumerate() {
-        if opening.oracle != oracle
-            || opening.index != position as u64
-            || opening.values.len() != width
-            || opening.path.len() != depth
-        {
-            return Err(Error::ShapeMismatch);
-        }
-        verify_opening(registry, opening, count)?;
-    }
-    Ok(())
-}
-
 fn verify_oracle_authentication(
     step: &SharedTraceStep,
     selection: &SelectedMatmulStep,
@@ -556,9 +520,28 @@ fn verify_oracle_authentication(
         registry.insert(*root, *start, *count)?;
     }
     let proof = &step.message.proof;
-    verify_group_authentication(&registry, &proof.inputs[0], selection.k, false)?;
-    verify_group_authentication(&registry, &proof.outputs[0], selection.n, false)?;
-    verify_group_authentication(&registry, &proof.raw[0], 0, true)?;
+    let lengths = &proof.lengths;
+    verify_group(
+        &registry,
+        &proof.inputs[0],
+        *lengths.inputs.first().ok_or(Error::ShapeMismatch)?,
+        selection.k,
+        false,
+    )?;
+    verify_group(
+        &registry,
+        &proof.outputs[0],
+        *lengths.outputs.first().ok_or(Error::ShapeMismatch)?,
+        selection.n,
+        false,
+    )?;
+    verify_group(
+        &registry,
+        &proof.raw[0],
+        *lengths.raw.first().ok_or(Error::ShapeMismatch)?,
+        0,
+        true,
+    )?;
     let used: BTreeSet<u64> = proof
         .inputs
         .iter()
