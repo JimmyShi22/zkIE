@@ -1,0 +1,4 @@
+c4577182 Enable the rsqrt relations in the hidden fixture
+
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 128 +++++++++++++++++++++--
+ 1 file changed, 120 insertions(+), 8 deletions(-)
