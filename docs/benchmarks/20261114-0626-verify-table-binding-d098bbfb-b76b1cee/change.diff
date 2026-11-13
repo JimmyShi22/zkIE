@@ -1,0 +1,146 @@
+commit d098bbfba5cc11355fdda64a3fe01632b590c9e8
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Sat Nov 14 06:26:29 2026 +0800
+
+    Bind the trusted table set in verification and keep the version gate
+    
+    The verifier now rebuilds the anchor with the trusted encoded-table list of
+    the selected model, so a version-two gpt2 commitment is checked against its
+    published table leaves instead of rejecting the extra anchor leaf. The
+    context loader reads the published table metas, binds them to the same trusted
+    list, and runs the model-version gate before the anchor rebuild, so an
+    old-version artifact keeps the existing rejection semantics while the
+    historical artifacts stay on disk. gemma3 and timesfm keep an empty table
+    list.
+    
+    This is the verifier wiring only; the policy registration and the consumer
+    relation are the next step.
+
+diff --git a/zkie/src/provider.rs b/zkie/src/provider.rs
+index 53a57443..8e6f7f06 100644
+--- a/zkie/src/provider.rs
++++ b/zkie/src/provider.rs
+@@ -229,8 +229,8 @@ fn proof_manifest(model: Digest, files: Vec<ArtifactFile>) -> ArtifactManifest {
+     }
+ }
+ 
+-fn commitment_table_params(config: &ProviderConfig) -> Result<Vec<AssetTableParams>> {
+-    match config.model.as_str() {
++fn trusted_table_params(model: &str) -> Result<Vec<AssetTableParams>> {
++    match model {
+         "gpt2" => zkie_models_gpt2::plan::asset_table_params(),
+         "gemma3" => Ok(Vec::new()),
+         "timesfm" => Ok(Vec::new()),
+@@ -297,7 +297,7 @@ impl PipelineProvider for ProductionProvider {
+         ctx: &mut PipelineContext<'_>,
+     ) -> Result<CommitReceipt> {
+         let config = parse_case(&request.case_config)?;
+-        let table_params = commitment_table_params(&config)?;
++        let table_params = trusted_table_params(&config.model)?;
+         let tables = sample_asset_table_inputs(&table_params)?;
+         let commitment = build_commitment(&config, &tables)?;
+         let asset_units = commitment.assets.len() as u64;
+@@ -364,7 +364,7 @@ impl PipelineProvider for ProductionProvider {
+         let config_bytes = fs::read(request.commit_dir.join("public/provider-config.bin"))
+             .map_err(|_| Error::MissingCommitArtifact)?;
+         let config: ProviderConfig = bincode::deserialize(&config_bytes).map_err(|_| Error::InvalidEncoding)?;
+-        let table_params = commitment_table_params(&config)?;
++        let table_params = trusted_table_params(&config.model)?;
+         let randomness_bytes =
+             fs::read(request.commit_dir.join("private/asset-table-randomness.bin"))
+                 .map_err(|_| Error::MissingCommitArtifact)?;
+@@ -465,6 +465,7 @@ impl PipelineProvider for ProductionProvider {
+         {
+             return Err(Error::StatementMismatch);
+         }
++        let table_params = trusted_table_params(&trusted.model)?;
+ 
+         let (bound, statement_matches) = match trusted.model.as_str() {
+             "gpt2" => {
+@@ -484,7 +485,7 @@ impl PipelineProvider for ProductionProvider {
+                     parameters,
+                     &specs,
+                     &table_metas,
+-                    &[],
++                    &table_params,
+                 )?;
+                 let argmax =
+                     verify_shared_trace(&public, &trace, &statement.tokens, &plan)?;
+@@ -519,7 +520,7 @@ impl PipelineProvider for ProductionProvider {
+                     parameters,
+                     &specs,
+                     &table_metas,
+-                    &[],
++                    &table_params,
+                 )?;
+                 let argmax =
+                     verify_shared_trace(&public, &trace, &statement.tokens, &plan)?;
+@@ -557,7 +558,7 @@ impl PipelineProvider for ProductionProvider {
+                     parameters,
+                     &specs,
+                     &table_metas,
+-                    &[],
++                    &table_params,
+                 )?;
+                 let output = verify_shared_trace_output(
+                     &public,
+diff --git a/zkie/src/s7_context.rs b/zkie/src/s7_context.rs
+index bc3179ea..b895511d 100644
+--- a/zkie/src/s7_context.rs
++++ b/zkie/src/s7_context.rs
+@@ -32,8 +32,9 @@ use zkie_engine::pcs::request::table::IndexReader;
+ use zkie_engine::storage::mmap::MmapTensorReader;
+ use zkie_ops::op::OpCode;
+ use zkie_ops::proof::binding::oracle_start;
++use zkie_ops::proof::asset_table::AssetTableMeta;
+ use zkie_ops::proof::model_commitment::{
+-    asset_table_identity, expected_asset_rows, verify_model_anchor, ModelAssetSpec,
++    asset_table_identity, expected_asset_rows, verify_model_anchor_with_tables, ModelAssetSpec,
+     ModelCommitmentPublic,
+ };
+ use zkie_ops::proof::plan::{PlanConfigValue, PlanSource, TracePlan};
+@@ -227,13 +228,33 @@ pub fn load_gpt2_lm_head_context(
+     {
+         return Err(Error::StatementMismatch);
+     }
++    // The version gate runs before the anchor check, so an old-version
++    // artifact keeps the existing rejection semantics even though the anchor
++    // now also covers the encoded table leaves.
++    if trusted.model_version != zkie_models_gpt2::plan::MODEL_VERSION {
++        return Err(Error::InvalidConfig);
++    }
+     let plan = zkie_models_gpt2::plan::trace_plan(statement.tokens.len())?;
+     if zkie_models_gpt2::plan::model_commitment(&statement.tokens)? != model_id {
+         return Err(Error::StatementMismatch);
+     }
+     let parameters = zkie_models_gpt2::plan::parameters_digest()?;
+     let specs = zkie_models_gpt2::plan::asset_specs();
+-    verify_model_anchor(&public, trusted.anchor_id, model_id, parameters, &specs)?;
++    let table_metas: Vec<AssetTableMeta> =
++        match fs::read(public_bundle_dir.join("asset-tables.bin")) {
++            Ok(bytes) => deserialize_exact(&bytes)?,
++            Err(_) => Vec::new(),
++        };
++    let table_params = zkie_models_gpt2::plan::asset_table_params()?;
++    verify_model_anchor_with_tables(
++        &public,
++        trusted.anchor_id,
++        model_id,
++        parameters,
++        &specs,
++        &table_metas,
++        &table_params,
++    )?;
+     let matmul = find_lm_head_matmul(&plan)?;
+     let selection = SelectedMatmulStep::select(&plan, matmul.index)?;
+     let plan_identifier = selected_plan_identifier(&public, &plan, &selection)?;
+@@ -254,9 +275,6 @@ pub fn load_gpt2_lm_head_context(
+     {
+         return Err(Error::StatementMismatch);
+     }
+-    if trusted.model_version != zkie_models_gpt2::plan::MODEL_VERSION {
+-        return Err(Error::InvalidConfig);
+-    }
+     let limited_table_identity = trusted.trusted_limited_table_identity()?.clone();
+     // The activation commitment pin is an operator value, never a proof value.
+     // When present it must cover the request's position count and the MatMul
