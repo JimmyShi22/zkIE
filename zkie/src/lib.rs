@@ -1,6 +1,7 @@
 //! zkie library: three-stage command implementations and measurement.
 
 pub mod anchor;
+mod bounded_trace;
 pub mod commitment_ledger;
 pub mod commit;
 pub mod output;
