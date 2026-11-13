@@ -7,7 +7,7 @@
 use std::cell::Cell;
 use std::fmt;
 use std::fs;
-use std::io::Read;
+use std::io::{BufReader, Read};
 use std::marker::PhantomData;
 use std::mem::size_of;
 use std::path::Path;
@@ -701,7 +701,7 @@ pub(crate) fn read_file(path: &Path, memory_budget_bytes: u64) -> Result<SharedT
     if memory_budget_bytes == 0 {
         return Err(Error::ResourceLimit);
     }
-    let mut file = fs::File::open(path).map_err(|_| Error::IncompleteArtifact)?;
+    let file = fs::File::open(path).map_err(|_| Error::IncompleteArtifact)?;
     let metadata = file.metadata().map_err(|_| Error::IncompleteArtifact)?;
     if !metadata.is_file() {
         return Err(Error::IncompleteArtifact);
@@ -709,7 +709,8 @@ pub(crate) fn read_file(path: &Path, memory_budget_bytes: u64) -> Result<SharedT
     if metadata.len() > memory_budget_bytes {
         return Err(Error::ResourceLimit);
     }
-    read_from(&mut file, memory_budget_bytes)
+    let mut reader = BufReader::new(file);
+    read_from(&mut reader, memory_budget_bytes)
 }
 
 pub(crate) fn read_from<R: Read>(reader: &mut R, memory_budget_bytes: u64) -> Result<SharedTrace> {
