@@ -789,6 +789,7 @@ impl NormLookupPlan {
         writer.put_bytes(&self.lookup.digest());
         writer.put_u64(self.key.sources.len() as u64);
         for source in &self.key.sources {
+            writer.put_u64(source.column as u64);
             writer.put_u64(source.oracle);
             writer.put_u64(source.position as u64);
             writer.put_u64(source.row as u64);
@@ -796,7 +797,10 @@ impl NormLookupPlan {
             writer.put_fp3(&source.coefficient);
             writer.put_fp3(&source.offset);
         }
-        writer.put_fp3(&self.key.padding_value);
+        writer.put_u64(self.key.padding_values.len() as u64);
+        for padding in &self.key.padding_values {
+            writer.put_fp3(padding);
+        }
         writer.put_digest(&self.key.table_identity);
         writer.put_u64(self.commit.bits_oracle);
         writer.put_u64(self.commit.bits_openings as u64);
@@ -885,6 +889,7 @@ pub fn round_digit_lookup_key(
                 return Err(Error::InvalidConfig);
             }
             sources.push(LookupKeySource {
+                column: 0,
                 oracle,
                 position,
                 row: row as u32,
@@ -896,7 +901,7 @@ pub fn round_digit_lookup_key(
     }
     Ok(LookupKeyPlan {
         sources,
-        padding_value: Fp3::from_u64(padding_byte),
+        padding_values: vec![Fp3::from_u64(padding_byte)],
         table_identity,
     })
 }
@@ -952,6 +957,7 @@ impl NormLookupPlan {
             key_bits,
             mu,
             table_log: 8,
+            columns: 1,
         };
         lookup.validate()?;
         let key = round_digit_lookup_key(
@@ -2513,6 +2519,7 @@ mod tests {
             key_bits: 2,
             mu: 2,
             table_log: 8,
+            columns: 1,
         };
         let commit = LookupCommitPlan {
             bits_shape: WShape::new(
@@ -2550,8 +2557,8 @@ mod tests {
         };
         let key = LookupKeyPlan {
             sources: Vec::new(),
-            padding_value: Fp3::ZERO,
-            table_identity: Digest([0x63; 32]),
+            padding_values: vec![Fp3::ZERO],
+            table_identity: crate::proof::lookup::BYTE_TABLE_IDENTITY,
         };
         plan.lookup = Some(NormLookupPlan { lookup, commit, key });
         plan.validate().unwrap();
@@ -2672,7 +2679,7 @@ mod tests {
         );
         let digest = plan.digest();
         let mut changed = plan.clone();
-        changed.key.padding_value = Fp3::ONE;
+        changed.key.padding_values = vec![Fp3::ONE];
         assert_ne!(changed.digest(), digest);
 
         // The constructed message plans commit from a synthetic bit witness.
@@ -2792,6 +2799,7 @@ mod tests {
             key_bits,
             mu,
             table_log: 8,
+            columns: 1,
         };
         plan.validate().unwrap();
         assert_eq!(key.sources.len(), digits.len() * positions as usize);
@@ -2822,7 +2830,7 @@ mod tests {
                 message
             })
             .collect::<Vec<_>>();
-        let keys = key.read(&plan, &messages).unwrap();
+        let keys = key.read(&plan, &messages, Fp3::ONE).unwrap();
         let key_count = plan.key_count().unwrap();
         assert_eq!(keys.len(), key_count);
         for position in 0..positions as usize {

@@ -10348,6 +10348,7 @@ fn prove_norm_second(
                     bits: lookup_witness.bits.clone(),
                 },
                 messages,
+                &crate::proof::lookup::ByteTable,
                 seed,
             )?;
             Some(NormLookupSecond { proof, claims })
@@ -10438,8 +10439,10 @@ fn verify_norm_second(
             let claims = crate::proof::lookup::verify_lookup(
                 &lookup_plan.lookup,
                 &lookup_plan.commit,
+                &lookup_plan.key,
                 &roots,
                 &lookup.proof,
+                &crate::proof::lookup::ByteTable,
                 seed,
             )?;
             if claims != lookup.claims {
@@ -10610,6 +10613,7 @@ fn lookup_plain_rows(
     rows.push(lookup_plan.key.registration_row(
         lookup,
         &claims.key,
+        claims.theta,
         &key_members,
         mask_member.bat_oracle,
         &|slot| lookup_mask_virtual_index(commit, slot),
@@ -16021,6 +16025,7 @@ mod merged_tests {
             .read(
                 &lookup_plan.lookup,
                 &witness.round.as_ref().unwrap().messages,
+                Fp3::ONE,
             )
             .unwrap();
         let bits = lookup_bits(&lookup_plan.lookup, &keys);
@@ -16267,6 +16272,7 @@ mod merged_tests {
                 .read(
                     &lookup_plan.lookup,
                     &witness.round.as_ref().unwrap().messages,
+                    Fp3::ONE,
                 )
                 .unwrap();
             let mut pattern = Vec::new();
@@ -16307,10 +16313,11 @@ mod merged_tests {
             key_bits,
             mu,
             table_log: 8,
+            columns: 1,
         };
         lookup.validate().unwrap();
         let round_messages = &witness.round.as_ref().unwrap().messages;
-        let keys = key.read(&lookup, round_messages).unwrap();
+        let keys = key.read(&lookup, round_messages, Fp3::ONE).unwrap();
         assert_eq!(keys.len(), lookup.key_count().unwrap());
         let rows = usize::try_from(round.group.shape.main_rows).unwrap();
         for position in 0..positions as usize {

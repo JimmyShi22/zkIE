@@ -38,11 +38,62 @@ use crate::proof::psc_general::{
 };
 
 /// Version of the lookup plan and messages.
-pub const LOOKUP_VERSION: u64 = 1;
+pub const LOOKUP_VERSION: u64 = 2;
+
+/// The trusted identity of the public byte table `0, 1, .., 255`.
+pub const BYTE_TABLE_IDENTITY: Digest = Digest([0x63; 32]);
+
+/// The transcript tag of the trusted table identity.
+const TABLE_IDENTITY_TAG: u64 = 0x5441_424C;
+
+/// A public lookup table: a fixed number of value columns over `2^log` rows,
+/// with a trusted identity. The verifier only evaluates a column at a random
+/// point; the prover also reads row values to build the table product tree.
+/// The table never enters the proof.
+pub trait LookupTable {
+    /// Number of value columns the key combination binds.
+    fn columns(&self) -> usize;
+    /// Number of rows of the padded table, `2^table_log`.
+    fn row_count(&self) -> usize;
+    /// The trusted table identity bound into the transcript.
+    fn identity(&self) -> Digest;
+    /// Evaluates one column's multilinear extension at a point.
+    fn column_at(&self, column: usize, point: &[Fp3]) -> Result<Fp3>;
+    /// Reads one column's row values in row order (prover side).
+    fn column_rows(&self, column: usize) -> Result<Vec<Fp3>>;
+}
 
 /// The public byte table, as a multilinear extension over eight coordinates.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ByteTable;
+
+impl LookupTable for ByteTable {
+    fn columns(&self) -> usize {
+        1
+    }
+
+    fn row_count(&self) -> usize {
+        256
+    }
+
+    fn identity(&self) -> Digest {
+        BYTE_TABLE_IDENTITY
+    }
+
+    fn column_at(&self, column: usize, point: &[Fp3]) -> Result<Fp3> {
+        if column != 0 {
+            return Err(Error::InvalidIndex);
+        }
+        TableAt::at(self, point)
+    }
+
+    fn column_rows(&self, column: usize) -> Result<Vec<Fp3>> {
+        if column != 0 {
+            return Err(Error::InvalidIndex);
+        }
+        Ok((0..256u64).map(Fp3::from_u64).collect())
+    }
+}
 
 impl TableAt for ByteTable {
     fn at(&self, point: &[Fp3]) -> Result<Fp3> {
@@ -67,6 +118,59 @@ impl TableAt for ByteTable {
     }
 }
 
+/// The random linear combination of a table's value columns over the same row
+/// index. The key vector uses the same combination, so the lookup binds the
+/// whole row (index and value), not a single column.
+pub struct CombinedTable<'a> {
+    table: &'a dyn LookupTable,
+    theta: Fp3,
+}
+
+impl<'a> CombinedTable<'a> {
+    pub fn new(table: &'a dyn LookupTable, theta: Fp3) -> Self {
+        Self { table, theta }
+    }
+
+    fn weight(&self, column: usize) -> Result<Fp3> {
+        let mut weight = Fp3::ONE;
+        for _ in 0..column {
+            weight = weight.mul(&self.theta);
+        }
+        Ok(weight)
+    }
+
+    /// Reads the combined row values, one per row (prover side).
+    pub fn row_values(&self) -> Result<Vec<Fp3>> {
+        let rows = self.table.row_count();
+        let mut values = vec![Fp3::ZERO; rows];
+        for column in 0..self.table.columns() {
+            let weight = self.weight(column)?;
+            let column_values = self.table.column_rows(column)?;
+            if column_values.len() != rows {
+                return Err(Error::ShapeMismatch);
+            }
+            for (value, entry) in values.iter_mut().zip(column_values) {
+                *value = value.add(&weight.mul(&entry));
+            }
+        }
+        Ok(values)
+    }
+}
+
+impl TableAt for CombinedTable<'_> {
+    fn at(&self, point: &[Fp3]) -> Result<Fp3> {
+        let mut value = Fp3::ZERO;
+        for column in 0..self.table.columns() {
+            value = value.add(
+                &self
+                    .weight(column)?
+                    .mul(&self.table.column_at(column, point)?),
+            );
+        }
+        Ok(value)
+    }
+}
+
 /// The public plan of one lookup.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LookupPlan {
@@ -75,13 +179,22 @@ pub struct LookupPlan {
     /// Multiplicity planes are `2^mu`; each multiplicity must be below
     /// `2^(2^mu)`.
     pub mu: u32,
-    /// The table has `2^table_log` rows; the byte table fixes eight.
+    /// The table has `2^table_log` rows; the byte table fixes eight. Larger
+    /// tables are read range by range and never materialized whole.
     pub table_log: u32,
+    /// Number of value columns combined under the lookup challenge theta. The
+    /// byte lookup uses one column; an index-to-value table uses two.
+    pub columns: u8,
 }
 
 impl LookupPlan {
     pub fn validate(&self) -> Result<()> {
-        if self.table_log != 8 || self.key_bits == 0 || self.mu == 0 {
+        if !(1..=4).contains(&self.columns)
+            || self.key_bits == 0
+            || self.mu == 0
+            || self.table_log == 0
+            || self.table_log > 30
+        {
             return Err(Error::InvalidConfig);
         }
         let keys = 1u64
@@ -126,6 +239,7 @@ impl LookupPlan {
         bytes[8..12].copy_from_slice(&self.key_bits.to_le_bytes());
         bytes[12..16].copy_from_slice(&self.mu.to_le_bytes());
         bytes[16..20].copy_from_slice(&self.table_log.to_le_bytes());
+        bytes[20] = self.columns;
         bytes
     }
 }
@@ -133,6 +247,8 @@ impl LookupPlan {
 /// One key's physical source in a committed rounding message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LookupKeySource {
+    /// The value column this source fills.
+    pub column: u8,
     pub oracle: u64,
     pub position: u32,
     pub row: u32,
@@ -141,25 +257,39 @@ pub struct LookupKeySource {
     pub offset: Fp3,
 }
 
-/// The trusted map from each key index to a committed rounding cell, plus the
-/// padding value. The key vector itself is never committed as a message.
+/// The trusted map from each key index to the committed cells of every value
+/// column, plus the public padding value of each column. The key vector itself
+/// is never committed as a message. Sources are ordered key-major: the
+/// `columns` sources of key `i` occupy `i * columns .. (i + 1) * columns`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LookupKeyPlan {
     pub sources: Vec<LookupKeySource>,
-    pub padding_value: Fp3,
+    pub padding_values: Vec<Fp3>,
     pub table_identity: Digest,
 }
 
 impl LookupKeyPlan {
     pub fn validate(&self, plan: &LookupPlan) -> Result<()> {
         let keys = plan.key_count()?;
-        if self.sources.len() > keys || self.table_identity == Digest::ZERO {
+        let columns = plan.columns as usize;
+        if self.sources.len() > keys.saturating_mul(columns)
+            || self.padding_values.len() != columns
+            || self.table_identity == Digest::ZERO
+            || self.sources.len() % columns != 0
+        {
             return Err(Error::InvalidConfig);
         }
         let mut seen = std::collections::HashSet::new();
-        for source in &self.sources {
-            if source.oracle == 0
-                || !seen.insert((source.oracle, source.position, source.row, source.place))
+        for (index, source) in self.sources.iter().enumerate() {
+            if source.column as usize != index % columns
+                || source.oracle == 0
+                || !seen.insert((
+                    source.column,
+                    source.oracle,
+                    source.position,
+                    source.row,
+                    source.place,
+                ))
             {
                 return Err(Error::InvalidConfig);
             }
@@ -167,24 +297,57 @@ impl LookupKeyPlan {
         Ok(())
     }
 
-    /// Reads the key vector from the committed rounding rows. `rows[position]`
-    /// is the unencoded message of that position; a source names its row and
-    /// place directly.
-    pub fn read(&self, plan: &LookupPlan, rows: &[Vec<Vec<Fp3>>]) -> Result<Vec<Fp3>> {
+    /// Reads one vector per value column from the committed rounding rows.
+    /// `rows[position]` is the unencoded message of that position; a source
+    /// names its row and place directly. Keys without sources carry the
+    /// public padding value of their column.
+    pub fn read_columns(
+        &self,
+        plan: &LookupPlan,
+        rows: &[Vec<Vec<Fp3>>],
+    ) -> Result<Vec<Vec<Fp3>>> {
         self.validate(plan)?;
         let count = plan.key_count()?;
-        let mut keys = Vec::with_capacity(count);
-        for source in &self.sources {
+        let columns = plan.columns as usize;
+        let entries = self.sources.len() / columns;
+        let mut out = vec![vec![Fp3::ZERO; count]; columns];
+        for (index, source) in self.sources.iter().enumerate() {
+            let key = index / columns;
+            let column = source.column as usize;
             let value = rows
                 .get(source.position as usize)
                 .and_then(|message| message.get(source.row as usize))
                 .and_then(|row| row.get(source.place as usize))
                 .copied()
                 .ok_or(Error::ShapeMismatch)?;
-            keys.push(source.coefficient.mul(&value).add(&source.offset));
+            out[column][key] = source.coefficient.mul(&value).add(&source.offset);
         }
-        while keys.len() < count {
-            keys.push(self.padding_value);
+        for column in 0..columns {
+            for key in entries..count {
+                out[column][key] = self.padding_values[column];
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reads the combined key vector `sum_j theta^j * column_j[i]`.
+    pub fn read(
+        &self,
+        plan: &LookupPlan,
+        rows: &[Vec<Vec<Fp3>>],
+        theta: Fp3,
+    ) -> Result<Vec<Fp3>> {
+        let columns = self.read_columns(plan, rows)?;
+        let count = plan.key_count()?;
+        let mut keys = vec![Fp3::ZERO; count];
+        for (column, values) in columns.iter().enumerate() {
+            let mut weight = Fp3::ONE;
+            for _ in 0..column {
+                weight = weight.mul(&theta);
+            }
+            for (key, value) in keys.iter_mut().zip(values) {
+                *key = key.add(&weight.mul(value));
+            }
         }
         Ok(keys)
     }
@@ -214,33 +377,48 @@ pub struct KeyClaimExpansion {
 
 impl LookupKeyPlan {
     /// Expands the key-leaf claim at its random point into linear claims on the
-    /// committed rounding cells named by this plan.
+    /// committed rounding cells named by this plan. The combined key at index
+    /// `i` is `sum_j theta^j cell_j`, so a source in column `j` carries the
+    /// weight `eq[i] * theta^j`.
     pub fn expand_claim(
         &self,
         plan: &LookupPlan,
         claim: &GeneralClaim,
+        theta: Fp3,
     ) -> Result<KeyClaimExpansion> {
         self.validate(plan)?;
         let keys = plan.key_count()?;
+        let columns = plan.columns as usize;
+        let entries = self.sources.len() / columns;
         let eq = eq_weights(&claim.point);
         if eq.len() != keys {
             return Err(Error::ShapeMismatch);
         }
+        let mut weight = vec![Fp3::ONE; columns];
+        for column in 1..columns {
+            weight[column] = weight[column - 1].mul(&theta);
+        }
         let mut terms = Vec::with_capacity(self.sources.len());
         let mut constant = Fp3::ZERO;
         for (index, source) in self.sources.iter().enumerate() {
-            let weight = eq[index];
+            let key = index / columns;
+            let column_weight = weight[source.column as usize];
+            let source_weight = eq[key].mul(&column_weight);
             terms.push(KeyLinearTerm {
                 oracle: source.oracle,
                 position: source.position,
                 row: source.row,
                 place: source.place,
-                coefficient: weight.mul(&source.coefficient),
+                coefficient: source_weight.mul(&source.coefficient),
             });
-            constant = constant.add(&weight.mul(&source.offset));
+            constant = constant.add(&source_weight.mul(&source.offset));
         }
-        for weight in eq.iter().skip(self.sources.len()) {
-            constant = constant.add(&weight.mul(&self.padding_value));
+        let mut padding = Fp3::ZERO;
+        for (column, value) in self.padding_values.iter().enumerate() {
+            padding = padding.add(&weight[column].mul(value));
+        }
+        for weight in eq.iter().skip(entries) {
+            constant = constant.add(&weight.mul(&padding));
         }
         Ok(KeyClaimExpansion {
             terms,
@@ -270,11 +448,12 @@ impl LookupKeyPlan {
         &self,
         plan: &LookupPlan,
         claim: &GeneralClaim,
+        theta: Fp3,
         members: &[KeyClaimMember],
         mask_bat_oracle: u64,
         mask_index: &dyn Fn(usize) -> Result<u64>,
     ) -> Result<BatRow> {
-        let expansion = self.expand_claim(plan, claim)?;
+        let expansion = self.expand_claim(plan, claim, theta)?;
         let mut row = BatRow::new(BatRowKind::Plain);
         for member in members {
             let rows = usize::try_from(member.shape.main_rows).map_err(|_| Error::ResourceLimit)?;
@@ -458,6 +637,8 @@ pub struct LookupProof {
 pub struct LookupOutcome {
     /// `sum_i eq(point, i) K[i] + <masks> = value`, after the shift of alpha.
     pub key: GeneralClaim,
+    /// The column combination challenge, one for a single-column table.
+    pub theta: Fp3,
     /// Coefficients on the multiplicity bits and the number of keys.
     pub multiplicity: (Vec<Fp3>, Fp3),
     /// The `(U)` and end claims of every sumcheck, for the caller's rows.
@@ -613,11 +794,13 @@ fn key_and_table_levels(
     keys_vec: &[Fp3],
     witness: &LookupWitness,
     alpha: Fp3,
+    table_values: &[Fp3],
 ) -> Result<(Vec<Vec<Fp3>>, Vec<Vec<Fp3>>)> {
     let keys = plan.key_count()?;
     let planes = plan.planes()?;
     let rows = plan.table_rows()?;
     if keys_vec.len() != keys
+        || table_values.len() != rows
         || witness.bits.len() != planes * rows
         || witness.bits.iter().any(|bit| *bit != Fp3::ZERO && *bit != Fp3::ONE)
     {
@@ -628,13 +811,12 @@ fn key_and_table_levels(
         .map(|key| alpha.sub(key))
         .collect::<Vec<_>>();
     let key_levels = tree_levels(&key_values, 0, plan.key_bits as usize);
-    let table = (0..rows).map(|index| Fp3::from_u64(index as u64)).collect::<Vec<_>>();
     let mut leaves = vec![Fp3::ZERO; planes * rows];
     for plane in 0..planes {
         for row in 0..rows {
             let bit = witness.bits[plane + planes * row];
             leaves[plane + planes * row] = Fp3::ONE.add(
-                &bit.mul(&alpha.sub(&Fp3::ONE).sub(&table[row])),
+                &bit.mul(&alpha.sub(&Fp3::ONE).sub(&table_values[row])),
             );
         }
     }
@@ -679,13 +861,15 @@ fn equality_variables(point: &[Fp3], plane_count: usize) -> Result<Vec<Weight>> 
         .collect()
 }
 
-/// Commits the lookup messages and proves the byte lookup for one key vector.
+/// Commits the lookup messages and proves the lookup for one key vector over
+/// the given public table.
 pub fn prove_lookup(
     plan: &LookupPlan,
     commit_plan: &LookupCommitPlan,
     key_plan: &LookupKeyPlan,
     key_rows: &[Vec<Vec<Fp3>>],
     witness: &LookupWitness,
+    table: &dyn LookupTable,
     seed: u64,
 ) -> Result<(LookupMessages, LookupProof, LookupOutcome)> {
     plan.validate()?;
@@ -705,15 +889,17 @@ pub fn prove_lookup(
         key_rows,
         witness,
         &messages,
+        table,
         seed,
     )?;
     Ok((messages, proof, outcome))
 }
 
-/// Proves the byte lookup on messages that are already committed and sampled
-/// by the enclosing session. The challenges are drawn from the transcript in
-/// the fixed order: plan and message roots first, then the lookup challenge,
-/// then the product-sumcheck transcript.
+/// Proves the lookup on messages that are already committed and sampled by the
+/// enclosing session. The challenges are drawn from the transcript in the fixed
+/// order: plan and trusted table identity first, then the message roots, then
+/// the column combination theta (multi-column tables), then the lookup
+/// challenge, then the product-sumcheck transcript.
 pub fn prove_lookup_with_messages(
     plan: &LookupPlan,
     commit_plan: &LookupCommitPlan,
@@ -721,15 +907,19 @@ pub fn prove_lookup_with_messages(
     key_rows: &[Vec<Vec<Fp3>>],
     witness: &LookupWitness,
     messages: &LookupMessages,
+    table: &dyn LookupTable,
     seed: u64,
 ) -> Result<(LookupProof, LookupOutcome)> {
     plan.validate()?;
     let keys = plan.key_count()?;
     let planes = plan.planes()?;
     let rows = plan.table_rows()?;
-    let key_values = key_plan.read(plan, key_rows)?;
-    if key_values.len() != keys {
-        return Err(Error::ShapeMismatch);
+    if table.columns() != plan.columns as usize
+        || table.row_count() != rows
+        || table.identity() != key_plan.table_identity
+        || key_plan.table_identity == Digest::ZERO
+    {
+        return Err(Error::StatementMismatch);
     }
     let mask_entries = mask_count(plan)?;
     commit_plan.validate(witness.bits.len(), mask_entries)?;
@@ -752,10 +942,23 @@ pub fn prove_lookup_with_messages(
     }
     let mut challenges = LookupChallenges::new(seed);
     challenges.absorb(LOOKUP_VERSION, &plan.digest());
+    challenges.absorb(TABLE_IDENTITY_TAG, &table.identity().0);
     challenges.absorb(commit_plan.bits_oracle, &messages.bits_root().0);
     challenges.absorb(commit_plan.mask_oracle, &messages.mask_root.0);
+    let theta = if plan.columns > 1 {
+        challenges.draw()?
+    } else {
+        Fp3::ONE
+    };
     let alpha = challenges.draw()?;
-    let (key_levels, table_levels) = key_and_table_levels(plan, &key_values, witness, alpha)?;
+    let key_values = key_plan.read(plan, key_rows, theta)?;
+    if key_values.len() != keys {
+        return Err(Error::ShapeMismatch);
+    }
+    let combined = CombinedTable::new(table, theta);
+    let table_values = combined.row_values()?;
+    let (key_levels, table_levels) =
+        key_and_table_levels(plan, &key_values, witness, alpha, &table_values)?;
     let mut mask_values = Vec::with_capacity(mask_entries);
     for slot in 0..mask_entries {
         mask_values.push(messages.mask_entry(commit_plan, slot)?);
@@ -764,7 +967,6 @@ pub fn prove_lookup_with_messages(
     let mut rows_out = Vec::new();
     let mut slots_out: Vec<Vec<usize>> = Vec::new();
     let mut hiding_out: Vec<Vec<usize>> = Vec::new();
-    let table = ByteTable;
 
     let plane_roots = &table_levels[0];
     let planes_count = plane_roots.len();
@@ -930,7 +1132,7 @@ pub fn prove_lookup_with_messages(
     let mut leaves_inner = crate::proof::psc_general::LeavesInner::new(
         &witness.bits,
         &(0..witness.bits.len())
-            .map(|index| Fp3::from_u64((index / planes) as u64))
+            .map(|index| table_values[index / planes])
             .collect::<Vec<_>>(),
         &table_claim.point,
         alpha,
@@ -942,7 +1144,7 @@ pub fn prove_lookup_with_messages(
         &table_claim.masks,
         table_claim.value,
         &Summand::Leaves { alpha, mu: plan.mu as usize },
-        Some(&table),
+        Some(&combined),
         &mut leaves_inner,
     )?;
     rows_out.push(leaves_step.output.clone());
@@ -991,6 +1193,7 @@ pub fn prove_lookup_with_messages(
         },
         LookupOutcome {
             key,
+            theta,
             multiplicity,
             rows: rows_out,
             end_slots: slots_out,
@@ -1003,24 +1206,39 @@ pub fn prove_lookup_with_messages(
 pub fn verify_lookup(
     plan: &LookupPlan,
     commit_plan: &LookupCommitPlan,
+    key_plan: &LookupKeyPlan,
     roots: &LookupRoots,
     proof: &LookupProof,
+    table: &dyn LookupTable,
     seed: u64,
 ) -> Result<LookupOutcome> {
     plan.validate()?;
     let planes = plan.planes()?;
     let table_rows = plan.table_rows()?;
+    if table.columns() != plan.columns as usize
+        || table.row_count() != table_rows
+        || table.identity() != key_plan.table_identity
+        || key_plan.table_identity == Digest::ZERO
+    {
+        return Err(Error::StatementMismatch);
+    }
     commit_plan.validate(planes * table_rows, mask_count(plan)?)?;
     let mut challenges = LookupChallenges::new(seed);
     challenges.absorb(LOOKUP_VERSION, &plan.digest());
+    challenges.absorb(TABLE_IDENTITY_TAG, &table.identity().0);
     challenges.absorb(commit_plan.bits_oracle, &roots.bits.0);
     challenges.absorb(commit_plan.mask_oracle, &roots.mask.0);
+    let theta = if plan.columns > 1 {
+        challenges.draw()?
+    } else {
+        Fp3::ONE
+    };
     let alpha = challenges.draw()?;
     let mut slots = MaskSlots::default();
     let mut rows_out = Vec::new();
     let mut slots_out: Vec<Vec<usize>> = Vec::new();
     let mut hiding_out: Vec<Vec<usize>> = Vec::new();
-    let table = ByteTable;
+    let combined = CombinedTable::new(table, theta);
 
     if proof.tie.len() != planes - 1 {
         return Err(Error::ShapeMismatch);
@@ -1131,7 +1349,7 @@ pub fn verify_lookup(
         &table_claim.masks,
         table_claim.value,
         &Summand::Leaves { alpha, mu: plan.mu as usize },
-        Some(&table),
+        Some(&combined),
         &proof.leaves,
     )?;
     rows_out.push(leaves_output);
@@ -1174,6 +1392,7 @@ pub fn verify_lookup(
 
     Ok(LookupOutcome {
         key,
+        theta,
         multiplicity,
         rows: rows_out,
         end_slots: slots_out,
@@ -1634,6 +1853,7 @@ impl LookupOutcome {
         let mut writer = CanonicalWriter::new();
         writer.put_u64(LOOKUP_VERSION);
         put_claim(&mut writer, &self.key);
+        writer.put_fp3(&self.theta);
         writer.put_u64(self.multiplicity.0.len() as u64);
         for coefficient in &self.multiplicity.0 {
             writer.put_fp3(coefficient);
@@ -1667,6 +1887,7 @@ impl LookupOutcome {
         let max_point = plan.key_bits as usize + plan.mu as usize + plan.table_log as usize;
         let count = mask_count(plan)?;
         let key = get_claim(&mut reader, plan.key_bits as usize, count)?;
+        let theta = reader.get_fp3()?;
         let coefficient_count =
             usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
         let planes = plan.planes()?;
@@ -1715,6 +1936,7 @@ impl LookupOutcome {
         reader.finish()?;
         let outcome = Self {
             key,
+            theta,
             multiplicity: (coefficients, total),
             rows: outputs,
             end_slots: slot_groups.remove(0),
@@ -1759,7 +1981,8 @@ mod tests {
             sources: keys
                 .iter()
                 .enumerate()
-                .map(|(index, key)| LookupKeySource {
+                .map(|(index, _key)| LookupKeySource {
+                    column: 0,
                     oracle: 900 + index as u64,
                     position: 0,
                     row: 0,
@@ -1768,8 +1991,8 @@ mod tests {
                     offset: Fp3::ZERO,
                 })
                 .collect(),
-            padding_value: Fp3::ZERO,
-            table_identity: Digest([0x44; 32]),
+            padding_values: vec![Fp3::ZERO],
+            table_identity: BYTE_TABLE_IDENTITY,
         }
     }
 
@@ -1785,7 +2008,7 @@ mod tests {
         key_plan.sources[0].coefficient = Fp3::from_u64(2);
         key_plan.sources[0].offset = Fp3::from_u64(3);
         key_plan.sources.truncate(1);
-        key_plan.padding_value = Fp3::ZERO;
+        key_plan.padding_values = vec![Fp3::ZERO];
         let point = [Fp3::from_u64(5), Fp3::from_u64(7)];
         let cell = Fp3::from_u64(11);
         let eq = eq_weights(&point);
@@ -1798,7 +2021,7 @@ mod tests {
             columns: 4,
         };
         let row = key_plan
-            .registration_row(&plan, &claim, &[member], 88, &|slot| Ok(slot as u64))
+            .registration_row(&plan, &claim, Fp3::ONE, &[member], 88, &|slot| Ok(slot as u64))
             .unwrap();
         assert_eq!(row.terms.len(), 1);
         assert_eq!(row.terms[0].oracle, 77);
@@ -1812,7 +2035,7 @@ mod tests {
         let keys = [0u64, 1, 2];
         let cells = [Fp3::from_u64(3), Fp3::from_u64(5), Fp3::from_u64(7)];
         let mut key_plan = key_plan(&keys);
-        key_plan.padding_value = Fp3::from_u64(11);
+        key_plan.padding_values = vec![Fp3::from_u64(11)];
         key_plan.sources[0].coefficient = Fp3::from_u64(2);
         key_plan.sources[1].offset = Fp3::from_u64(4);
         let point = [Fp3::from_u64(9), Fp3::from_u64(13)];
@@ -1825,9 +2048,9 @@ mod tests {
                 .add(&key_plan.sources[index].offset);
             value = value.add(&eq[index].mul(&key));
         }
-        value = value.add(&eq[3].mul(&key_plan.padding_value));
+        value = value.add(&eq[3].mul(&key_plan.padding_values[0]));
         let claim = GeneralClaim { point: point.to_vec(), value, masks: Vec::new() };
-        let expansion = key_plan.expand_claim(&plan, &claim).unwrap();
+        let expansion = key_plan.expand_claim(&plan, &claim, Fp3::ONE).unwrap();
         let mut lhs = expansion.constant;
         for (index, term) in expansion.terms.iter().enumerate() {
             lhs = lhs.add(&term.coefficient.mul(&cells[index]));
@@ -1840,6 +2063,7 @@ mod tests {
             key_bits: 2,
             mu: 2,
             table_log: 8,
+            columns: 1,
         }
     }
 
@@ -1886,8 +2110,8 @@ mod tests {
         let plan = plan();
         let keys = [0u64, 1, 2, 255];
         let witness = witness(&keys, &plan);
-        let (messages, proof, proven) = prove_lookup(&plan, &commit_plan(), &key_plan(&keys), &key_rows(&keys), &witness, 7).unwrap();
-        let verified = verify_lookup(&plan, &commit_plan(), &messages.roots(), &proof, 7).unwrap();
+        let (messages, proof, proven) = prove_lookup(&plan, &commit_plan(), &key_plan(&keys), &key_rows(&keys), &witness, &ByteTable, 7).unwrap();
+        let verified = verify_lookup(&plan, &commit_plan(), &key_plan(&keys), &messages.roots(), &proof, &ByteTable, 7).unwrap();
         assert_eq!(proven, verified);
         assert_eq!(proven.multiplicity.0.len(), plan.planes().unwrap() * 256);
         assert_eq!(proven.multiplicity.1, Fp3::from_u64(4));
@@ -1906,6 +2130,7 @@ mod tests {
             &key_plan(keys),
             &key_rows(keys),
             &witness,
+            &ByteTable,
             seed,
         )
         .unwrap();
@@ -2027,6 +2252,7 @@ mod tests {
             key_bits: 2,
             mu: 3,
             table_log: 8,
+            columns: 1,
         };
         check_leaves_row(&wide, &commit_plan_mu_three(), &[0, 0, 1, 2], 23);
     }
@@ -2073,6 +2299,219 @@ mod tests {
         assert!(table.at(&point[..7]).is_err());
     }
 
+    fn fold_table(values: &[Fp3], point: &[Fp3]) -> Result<Fp3> {
+        let expected = 1usize
+            .checked_shl(point.len() as u32)
+            .ok_or(Error::ShapeMismatch)?;
+        if values.len() != expected {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut values = values.to_vec();
+        for coordinate in point {
+            let half = values.len() / 2;
+            for index in 0..half {
+                let low = values[2 * index];
+                let high = values[2 * index + 1];
+                values[index] = low.add(&coordinate.mul(&high.sub(&low)));
+            }
+            values.truncate(half);
+        }
+        values.first().copied().ok_or(Error::ShapeMismatch)
+    }
+
+    /// A public two-column table of (index, value) rows. Its padded rows copy
+    /// the first row, and the key-side padding names that same copy.
+    struct PairTable {
+        identity: Digest,
+        rows: Vec<(u64, u64)>,
+    }
+
+    impl LookupTable for PairTable {
+        fn columns(&self) -> usize {
+            2
+        }
+
+        fn row_count(&self) -> usize {
+            self.rows.len()
+        }
+
+        fn identity(&self) -> Digest {
+            self.identity
+        }
+
+        fn column_at(&self, column: usize, point: &[Fp3]) -> Result<Fp3> {
+            column_rows(self, column)
+                .and_then(|values| fold_table(&values, point))
+        }
+
+        fn column_rows(&self, column: usize) -> Result<Vec<Fp3>> {
+            column_rows(self, column)
+        }
+    }
+
+    fn column_rows(table: &PairTable, column: usize) -> Result<Vec<Fp3>> {
+        match column {
+            0 => Ok(table
+                .rows
+                .iter()
+                .map(|row| Fp3::from_u64(row.0))
+                .collect()),
+            1 => Ok(table
+                .rows
+                .iter()
+                .map(|row| Fp3::from_u64(row.1))
+                .collect()),
+            _ => Err(Error::InvalidIndex),
+        }
+    }
+
+    fn two_column_plan() -> LookupPlan {
+        LookupPlan {
+            key_bits: 2,
+            mu: 2,
+            table_log: 2,
+            columns: 2,
+        }
+    }
+
+    fn pair_key_plan() -> LookupKeyPlan {
+        let mut sources = Vec::new();
+        for key in 0..4u32 {
+            for column in 0..2u8 {
+                sources.push(LookupKeySource {
+                    column,
+                    oracle: 900,
+                    position: 0,
+                    row: 0,
+                    place: 2 * key + column as u32,
+                    coefficient: Fp3::ONE,
+                    offset: Fp3::ZERO,
+                });
+            }
+        }
+        LookupKeyPlan {
+            sources,
+            padding_values: vec![Fp3::ZERO, Fp3::from_u64(100)],
+            table_identity: Digest([0x71; 32]),
+        }
+    }
+
+    fn pair_rows(cells: &[(u64, u64)]) -> Vec<Vec<Vec<Fp3>>> {
+        vec![vec![cells
+            .iter()
+            .flat_map(|(index, value)| [Fp3::from_u64(*index), Fp3::from_u64(*value)])
+            .collect()]]
+    }
+
+    fn witness_for_counts(counts: &[u64], plan: &LookupPlan) -> LookupWitness {
+        let planes = plan.planes().unwrap();
+        let rows = plan.table_rows().unwrap();
+        assert_eq!(counts.len(), rows);
+        let mut bits = vec![Fp3::ZERO; planes * rows];
+        for row in 0..rows {
+            for plane in 0..planes {
+                if (counts[row] >> plane) & 1 == 1 {
+                    bits[plane + planes * row] = Fp3::ONE;
+                }
+            }
+        }
+        LookupWitness { bits }
+    }
+
+    #[test]
+    fn two_column_lookup_binds_the_index_value_correspondence() {
+        let plan = two_column_plan();
+        let table = PairTable {
+            identity: Digest([0x71; 32]),
+            rows: vec![(0, 100), (1, 103), (2, 106), (0, 100)],
+        };
+        let key_plan = pair_key_plan();
+        // Two real queries against rows 1 and 2; the two padded keys are the
+        // public first-row copy, so the padding is a valid table row.
+        let cells = [(1u64, 103u64), (2, 106), (0, 100), (0, 100)];
+        let rows = pair_rows(&cells);
+        let witness = witness_for_counts(&[2, 1, 1, 0], &plan);
+        let (messages, proof, outcome) = prove_lookup(
+            &plan,
+            &commit_plan(),
+            &key_plan,
+            &rows,
+            &witness,
+            &table,
+            31,
+        )
+        .unwrap();
+        let verified = verify_lookup(
+            &plan,
+            &commit_plan(),
+            &key_plan,
+            &messages.roots(),
+            &proof,
+            &table,
+            31,
+        )
+        .unwrap();
+        assert_eq!(outcome, verified);
+        assert_eq!(outcome.theta, verified.theta);
+
+        // The expanded key claim reconstructs the combined key vector.
+        let point = [Fp3::from_u64(7), Fp3::from_u64(11)];
+        let eq = eq_weights(&point);
+        let mut value = Fp3::ZERO;
+        for (index, (cell_index, cell_value)) in cells.iter().enumerate() {
+            let key = Fp3::from_u64(*cell_index)
+                .add(&outcome.theta.mul(&Fp3::from_u64(*cell_value)));
+            value = value.add(&eq[index].mul(&key));
+        }
+        let claim = GeneralClaim {
+            point: point.to_vec(),
+            value,
+            masks: Vec::new(),
+        };
+        let expansion = key_plan.expand_claim(&plan, &claim, outcome.theta).unwrap();
+        let mut lhs = expansion.constant;
+        for (index, term) in expansion.terms.iter().enumerate() {
+            let cell = if key_plan.sources[index].column == 0 {
+                cells[index / 2].0
+            } else {
+                cells[index / 2].1
+            };
+            lhs = lhs.add(&term.coefficient.mul(&Fp3::from_u64(cell)));
+        }
+        assert_eq!(lhs, expansion.value);
+
+        // Moving a value to another index breaks the correspondence and is not
+        // a table row, so it cannot be proved.
+        let wrong = [(1u64, 106u64), (2, 106), (0, 100), (0, 100)];
+        let wrong_witness = witness_for_counts(&[2, 0, 2, 0], &plan);
+        assert!(prove_lookup(
+            &plan,
+            &commit_plan(),
+            &key_plan,
+            &pair_rows(&wrong),
+            &wrong_witness,
+            &table,
+            31,
+        )
+        .is_err());
+
+        // A different trusted table identity is rejected before any proof.
+        let other = PairTable {
+            identity: Digest([0x72; 32]),
+            rows: table.rows.clone(),
+        };
+        assert!(prove_lookup(
+            &plan,
+            &commit_plan(),
+            &key_plan,
+            &rows,
+            &witness,
+            &other,
+            31,
+        )
+        .is_err());
+    }
+
     #[test]
     fn a_changed_digit_source_breaks_the_committed_transcript() {
         let plan = plan();
@@ -2096,6 +2535,7 @@ mod tests {
             &key_rows(&[0, 1, 2, 254]),
             &witness,
             &messages,
+            &ByteTable,
             7,
         )
         .is_err());
@@ -2115,6 +2555,7 @@ mod tests {
         let key = LookupKeyPlan {
             sources: vec![
                 LookupKeySource {
+                    column: 0,
                     oracle: 900,
                     position: 0,
                     row: 0,
@@ -2123,6 +2564,7 @@ mod tests {
                     offset: Fp3::ZERO,
                 },
                 LookupKeySource {
+                    column: 0,
                     oracle: 901,
                     position: 1,
                     row: 0,
@@ -2131,14 +2573,14 @@ mod tests {
                     offset: Fp3::ZERO,
                 },
             ],
-            padding_value: Fp3::from_u64(3),
-            table_identity: Digest([0x44; 32]),
+            padding_values: vec![Fp3::from_u64(3)],
+            table_identity: BYTE_TABLE_IDENTITY,
         };
         let rows = vec![
             vec![vec![Fp3::from_u64(7)]],
             vec![vec![Fp3::from_u64(9)]],
         ];
-        let keys = key.read(&plan, &rows).unwrap();
+        let keys = key.read(&plan, &rows, Fp3::ONE).unwrap();
         assert_eq!(keys[0], Fp3::from_u64(7));
         assert_eq!(keys[1], Fp3::from_u64(9));
         assert_eq!(keys[2], Fp3::from_u64(3));
@@ -2156,11 +2598,12 @@ mod tests {
             &key_plan(&keys),
             &key_rows(&keys),
             &witness,
+            &ByteTable,
             7,
         )
         .unwrap();
         let verified =
-            verify_lookup(&plan, &commit_plan(), &messages.roots(), &proof, 7).unwrap();
+            verify_lookup(&plan, &commit_plan(), &key_plan(&keys), &messages.roots(), &proof, &ByteTable, 7).unwrap();
         assert_eq!(proven, verified);
     }
 
@@ -2186,11 +2629,12 @@ mod tests {
             &key_rows(&keys),
             &witness,
             &messages,
+            &ByteTable,
             7,
         )
         .unwrap();
         let verified =
-            verify_lookup(&plan, &commit_plan, &messages.roots(), &proof, 7).unwrap();
+            verify_lookup(&plan, &commit_plan, &key_plan(&keys), &messages.roots(), &proof, &ByteTable, 7).unwrap();
         assert_eq!(proven, verified);
         let bytes = proven.encode(&plan).unwrap();
         assert_eq!(LookupOutcome::decode(&plan, &bytes).unwrap(), proven);
@@ -2201,11 +2645,11 @@ mod tests {
         let plan = plan();
         let keys = [0u64, 1, 2, 255];
         let witness = witness(&keys, &plan);
-        let (messages, proof, _) = prove_lookup(&plan, &commit_plan(), &key_plan(&keys), &key_rows(&keys), &witness, 13).unwrap();
+        let (messages, proof, _) = prove_lookup(&plan, &commit_plan(), &key_plan(&keys), &key_rows(&keys), &witness, &ByteTable, 13).unwrap();
         let bytes = proof.encode().unwrap();
         let decoded = LookupProof::decode(&plan, &bytes).unwrap();
         assert_eq!(decoded, proof);
-        assert!(verify_lookup(&plan, &commit_plan(), &messages.roots(), &decoded, 13).is_ok());
+        assert!(verify_lookup(&plan, &commit_plan(), &key_plan(&keys), &messages.roots(), &decoded, &ByteTable, 13).is_ok());
         let mut changed = bytes.clone();
         changed[0] ^= 1;
         assert!(LookupProof::decode(&plan, &changed).is_err());
@@ -2222,36 +2666,36 @@ mod tests {
         let plan = plan();
         let keys = [0u64, 1, 2, 255];
         let witness = witness(&keys, &plan);
-        let (messages, proof, _) = prove_lookup(&plan, &commit_plan(), &key_plan(&keys), &key_rows(&keys), &witness, 9).unwrap();
-        assert!(verify_lookup(&plan, &commit_plan(), &messages.roots(), &proof, 9).is_ok());
+        let (messages, proof, _) = prove_lookup(&plan, &commit_plan(), &key_plan(&keys), &key_rows(&keys), &witness, &ByteTable, 9).unwrap();
+        assert!(verify_lookup(&plan, &commit_plan(), &key_plan(&keys), &messages.roots(), &proof, &ByteTable, 9).is_ok());
 
         let mut changed = proof.clone();
         changed.tie[0].y_round.coefficients.pop();
-        assert!(verify_lookup(&plan, &commit_plan(), &messages.roots(), &changed, 9).is_err());
+        assert!(verify_lookup(&plan, &commit_plan(), &key_plan(&keys), &messages.roots(), &changed, &ByteTable, 9).is_err());
 
         let mut changed = proof.clone();
         changed.table_levels[0].rounds[0].coefficients.clear();
-        assert!(verify_lookup(&plan, &commit_plan(), &messages.roots(), &changed, 9).is_err());
+        assert!(verify_lookup(&plan, &commit_plan(), &key_plan(&keys), &messages.roots(), &changed, &ByteTable, 9).is_err());
 
         let mut changed = proof.clone();
         changed.bits.end_values.clear();
-        assert!(verify_lookup(&plan, &commit_plan(), &messages.roots(), &changed, 9).is_err());
+        assert!(verify_lookup(&plan, &commit_plan(), &key_plan(&keys), &messages.roots(), &changed, &ByteTable, 9).is_err());
 
         let mut changed = proof.clone();
         changed.key_levels.pop();
-        assert!(verify_lookup(&plan, &commit_plan(), &messages.roots(), &changed, 9).is_err());
+        assert!(verify_lookup(&plan, &commit_plan(), &key_plan(&keys), &messages.roots(), &changed, &ByteTable, 9).is_err());
 
         let honest =
-            verify_lookup(&plan, &commit_plan(), &messages.roots(), &proof, 9).unwrap();
+            verify_lookup(&plan, &commit_plan(), &key_plan(&keys), &messages.roots(), &proof, &ByteTable, 9).unwrap();
         let mut changed = messages.clone();
         changed.bits.roots[0] = Digest([0x99; 32]);
         let tampered =
-            verify_lookup(&plan, &commit_plan(), &changed.roots(), &proof, 9).unwrap();
+            verify_lookup(&plan, &commit_plan(), &key_plan(&keys), &changed.roots(), &proof, &ByteTable, 9).unwrap();
         assert_ne!(honest.key, tampered.key);
         let mut changed = messages.clone();
         changed.mask_root = Digest([0x98; 32]);
         let tampered =
-            verify_lookup(&plan, &commit_plan(), &changed.roots(), &proof, 9).unwrap();
+            verify_lookup(&plan, &commit_plan(), &key_plan(&keys), &changed.roots(), &proof, &ByteTable, 9).unwrap();
         assert_ne!(honest.key, tampered.key);
     }
 
@@ -2260,6 +2704,6 @@ mod tests {
         let plan = plan();
         let keys = [0u64, 1, 2, 999];
         let witness = witness(&keys, &plan);
-        assert!(prove_lookup(&plan, &commit_plan(), &key_plan(&keys), &key_rows(&keys), &witness, 11).is_err());
+        assert!(prove_lookup(&plan, &commit_plan(), &key_plan(&keys), &key_rows(&keys), &witness, &ByteTable, 11).is_err());
     }
 }
