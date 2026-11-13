@@ -9119,6 +9119,10 @@ const NORM_ANSWER_TAGS: [u64; 5] = [72, 73, 74, 75, 76];
 const NORM_MASK_ANSWER_TAG: u64 = 77;
 const NORM_POSITION_TAGS: [u64; 5] = [78, 79, 80, 81, 82];
 const NORM_MASK_POSITION_TAG: u64 = 83;
+const NORM_ROUND_ROOT_TAG: u64 = 84;
+const NORM_ROUND_SEED_TAG: u64 = 85;
+const NORM_ROUND_ANSWER_TAG: u64 = 86;
+const NORM_ROUND_POSITION_TAG: u64 = 87;
 
 fn norm_group_plans(plan: &NormPlan) -> [&NormGroupPlan; 5] {
     [&plan.x, &plan.sum, &plan.squares, &plan.mean, &plan.variance]
@@ -9339,6 +9343,71 @@ fn prove_norm_first(
     for (tag, group_witness) in NORM_ROOT_TAGS.iter().zip(group_witnesses.iter()) {
         absorb_closure_group(chain, *tag, &group_witness.committed.group)?;
     }
+    let round_group = match (&norm.round, &witness.round) {
+        (Some(round_plan), Some(round_witness)) => {
+            if round_witness.committed.group.group != round_plan.group.group
+                || round_witness
+                    .committed
+                    .group
+                    .fault(positions)
+                    .is_some()
+                || round_witness.committed.roots.len() != positions as usize
+                || round_witness.messages.len() != positions as usize
+                || round_witness.tails.len() != positions as usize
+                || round_witness.salts.len() != positions as usize
+                || round_witness.pads.len() != positions as usize
+            {
+                return Err(Error::ShapeMismatch);
+            }
+            for (position, entry) in round_witness.committed.group.entries.iter().enumerate() {
+                if entry.position != position as u32
+                    || entry.oracle
+                        != round_plan
+                            .group
+                            .oracle_base
+                            .checked_add(position as u64)
+                            .ok_or(Error::ResourceLimit)?
+                    || entry.shape != round_plan.group.shape.oracle_shape()
+                    || entry.tree != round_plan.group.shape.tree_plan(position as u32)?
+                    || entry.root == Digest::ZERO
+                {
+                    return Err(Error::StatementMismatch);
+                }
+            }
+            let rows = usize::try_from(round_plan.group.shape.main_rows)
+                .map_err(|_| Error::ResourceLimit)?;
+            let ell = usize::try_from(round_plan.group.shape.code.ell)
+                .map_err(|_| Error::ResourceLimit)?;
+            let columns = usize::try_from(round_plan.group.columns)
+                .map_err(|_| Error::ResourceLimit)?;
+            for (position, message) in round_witness.messages.iter().enumerate() {
+                if message.len() != rows || message.iter().any(|row| row.len() != ell) {
+                    return Err(Error::ShapeMismatch);
+                }
+                let expected = round_plan
+                    .layout
+                    .values(&witness.core[position], round_plan.group.columns)?;
+                for slot in 0..columns {
+                    let row = slot % rows;
+                    let place = slot / rows;
+                    if place >= ell
+                        || message
+                            .get(row)
+                            .and_then(|row| row.get(place))
+                            .copied()
+                            .ok_or(Error::ShapeMismatch)?
+                            != expected[slot]
+                    {
+                        return Err(Error::StatementMismatch);
+                    }
+                }
+            }
+            absorb_closure_group(chain, NORM_ROUND_ROOT_TAG, &round_witness.committed.group)?;
+            Some(round_witness)
+        }
+        (None, None) => None,
+        _ => return Err(Error::ShapeMismatch),
+    };
     if let (Some(mask_plan), Some(mask_witness)) = (&norm.mask, mask_witness) {
         absorb_norm_mask_root(chain, mask_plan, &mask_witness.committed.root)?;
     }
@@ -9351,6 +9420,16 @@ fn prove_norm_first(
             group_plan.shape.answers,
         )?);
     }
+    let round_seed = match (&norm.round, round_group) {
+        (Some(round_plan), Some(_)) => Some(draw_closure_seed_set(
+            chain,
+            NORM_ROUND_SEED_TAG,
+            round_plan.group.shape.sample_bits()?,
+            round_plan.group.shape.answers,
+        )?),
+        (None, None) => None,
+        _ => return Err(Error::ShapeMismatch),
+    };
     let mask_seeds = match norm.mask.as_ref() {
         Some(mask_plan) => Some(draw_closure_seed_set(
             chain,
@@ -9377,6 +9456,21 @@ fn prove_norm_first(
         absorb_tagged_answers(chain, NORM_ANSWER_TAGS[index], &values)?;
         answers.push(values);
     }
+    let round_answers = match (&norm.round, round_group, round_seed.as_ref()) {
+        (Some(round_plan), Some(round_witness), Some(seed_set)) => {
+            let values = value_group_answers(
+                &round_plan.group.shape,
+                round_plan.group.oracle_base,
+                round_plan.group.group,
+                &round_witness.committed.messages,
+                seed_set,
+            )?;
+            absorb_tagged_answers(chain, NORM_ROUND_ANSWER_TAG, &values)?;
+            Some(values)
+        }
+        (None, None, None) => None,
+        _ => return Err(Error::ShapeMismatch),
+    };
     let mask_sample = match (
         norm.mask.as_ref(),
         mask_witness,
@@ -9423,6 +9517,41 @@ fn prove_norm_first(
             openings,
         });
     }
+    let round_message = match (
+        &norm.round,
+        round_group,
+        round_seed.as_ref(),
+        round_answers.as_ref(),
+    ) {
+        (Some(round_plan), Some(round_witness), Some(seed_set), Some(answers)) => {
+            let round_positions = draw_closure_group_positions(
+                chain,
+                NORM_ROUND_POSITION_TAG,
+                positions,
+                round_plan.group.openings,
+                round_plan.group.shape.code.log_n,
+            )?;
+            let openings = open_value_group_openings(
+                &round_plan.group.shape,
+                &round_witness.committed.messages,
+                &round_witness.tails,
+                &round_witness.salts,
+                &round_positions,
+                &round_witness.committed.trees,
+            )?;
+            Some(CommittedPscGroup {
+                message: CommittedGroupMessage::new(round_witness.committed.group.clone()),
+                sample: SendSamples {
+                    seed: seed_set.clone(),
+                    answers: answers.clone(),
+                },
+                positions: round_positions,
+                openings,
+            })
+        }
+        (None, None, None, None) => None,
+        _ => return Err(Error::ShapeMismatch),
+    };
     let (mask_positions, mask_opening) = match (norm.mask.as_ref(), mask_witness) {
         (Some(mask_plan), Some(mask_witness)) => {
             let positions = draw_norm_mask_positions(chain, mask_plan)?;
@@ -9460,6 +9589,7 @@ fn prove_norm_first(
         squares: iter.next().ok_or(Error::ShapeMismatch)?,
         mean: iter.next().ok_or(Error::ShapeMismatch)?,
         variance: iter.next().ok_or(Error::ShapeMismatch)?,
+        round: round_message,
         mask,
     })
 }
@@ -9504,6 +9634,36 @@ fn verify_norm_first(
     if message.x.message.roots != norm.x_roots {
         return Err(Error::StatementMismatch);
     }
+    let round = match (&norm.round, &message.round) {
+        (Some(round_plan), Some(message)) => {
+            if message.message.group.group != round_plan.group.group
+                || message
+                    .fault(&round_plan.group.shape, positions)
+                    .is_some()
+                || message.message.roots.len() != positions as usize
+            {
+                return Err(Error::StatementMismatch);
+            }
+            for (position, entry) in message.message.group.entries.iter().enumerate() {
+                if entry.position != position as u32
+                    || entry.oracle
+                        != round_plan
+                            .group
+                            .oracle_base
+                            .checked_add(position as u64)
+                            .ok_or(Error::ResourceLimit)?
+                    || entry.shape != round_plan.group.shape.oracle_shape()
+                    || entry.tree != round_plan.group.shape.tree_plan(position as u32)?
+                    || entry.root == Digest::ZERO
+                {
+                    return Err(Error::StatementMismatch);
+                }
+            }
+            Some(message)
+        }
+        (None, None) => None,
+        _ => return Err(Error::ShapeMismatch),
+    };
     match (&norm.mask, &message.mask) {
         (Some(mask_plan), Some(mask)) => {
             if mask.tree != mask_plan.tree
@@ -9522,6 +9682,10 @@ fn verify_norm_first(
     for (tag, message) in NORM_ROOT_TAGS.iter().zip(messages.iter()) {
         absorb_closure_group(chain, *tag, &message.message.group)?;
     }
+    if let (Some(round_plan), Some(message)) = (&norm.round, round) {
+        absorb_closure_group(chain, NORM_ROUND_ROOT_TAG, &message.message.group)?;
+        let _ = round_plan;
+    }
     if let (Some(mask_plan), Some(mask)) = (&norm.mask, &message.mask) {
         absorb_norm_mask_root(chain, mask_plan, &mask.root)?;
     }
@@ -9534,6 +9698,17 @@ fn verify_norm_first(
             *tag,
             group_plan.shape.sample_bits()?,
             group_plan.shape.answers,
+        )?;
+        if seed_set != message.sample.seed {
+            return Err(Error::InvalidProof);
+        }
+    }
+    if let (Some(round_plan), Some(message)) = (&norm.round, round) {
+        let seed_set = draw_closure_seed_set(
+            chain,
+            NORM_ROUND_SEED_TAG,
+            round_plan.group.shape.sample_bits()?,
+            round_plan.group.shape.answers,
         )?;
         if seed_set != message.sample.seed {
             return Err(Error::InvalidProof);
@@ -9556,6 +9731,9 @@ fn verify_norm_first(
         }
         absorb_tagged_answers(chain, NORM_ANSWER_TAGS[index], &message.sample.answers)?;
     }
+    if let Some(round) = round {
+        absorb_tagged_answers(chain, NORM_ROUND_ANSWER_TAG, &round.sample.answers)?;
+    }
     if let Some(mask) = &message.mask {
         absorb_tagged_answers(chain, NORM_MASK_ANSWER_TAG, &mask.sample.answers)?;
     }
@@ -9577,6 +9755,36 @@ fn verify_norm_first(
                 return Err(Error::InvalidIndex);
             }
             let tree = group_plan.shape.tree_plan(position as u32)?;
+            let root = message
+                .message
+                .group
+                .entries
+                .get(position)
+                .map(|entry| entry.root)
+                .ok_or(Error::ShapeMismatch)?;
+            verify_runtime_opening(&tree, &root, list, opening)?;
+        }
+    }
+    if let (Some(round_plan), Some(message)) = (&norm.round, round) {
+        let round_positions = draw_closure_group_positions(
+            chain,
+            NORM_ROUND_POSITION_TAG,
+            positions,
+            round_plan.group.openings,
+            round_plan.group.shape.code.log_n,
+        )?;
+        if round_positions != message.positions
+            || message.openings.len() != message.positions.len()
+        {
+            return Err(Error::InvalidProof);
+        }
+        for (position, (list, opening)) in
+            round_positions.iter().zip(&message.openings).enumerate()
+        {
+            if opening.positions != *list {
+                return Err(Error::InvalidIndex);
+            }
+            let tree = round_plan.group.shape.tree_plan(position as u32)?;
             let root = message
                 .message
                 .group
@@ -14164,7 +14372,7 @@ mod merged_tests {
     ) {
         use crate::proof::hidden_norm_psc::{
             commit_norm_mask, norm_mask_entries, NormGroupPlan, NormMaskPlan, NormMaskWitness,
-            NormPlan, NormWitness,
+            NormPlan, NormRoundLayout, NormRoundPlan, NormRoundWidths, NormWitness,
         };
         use crate::proof::hidden_norm::NormCoreRow;
 
@@ -14232,6 +14440,20 @@ mod merged_tests {
             round: None,
             mask: Some(mask_plan.clone()),
         };
+        let round_widths = NormRoundWidths {
+            sum: 1,
+            squares: 1,
+            variance: 1,
+            mean: 1,
+            offset: 1,
+        };
+        let round_layout = NormRoundLayout::new(round_widths, HIDDEN).unwrap();
+        let round_columns = round_widths.columns().unwrap();
+        norm.round = Some(NormRoundPlan {
+            group: group(round_columns, GROUP, 9600, 60600),
+            layout: round_layout,
+            input_bound: 2,
+        });
         let mut coins = ByteMaskCoins::new(Digest([0x91; 32])).unwrap();
         let x_values = rows
             .iter()
@@ -14266,6 +14488,21 @@ mod merged_tests {
             &scalar_values(&|row| row.variance as i128),
             &mut coins,
         );
+        let round = match &norm.round {
+            Some(round_plan) => {
+                let values = core
+                    .iter()
+                    .map(|row| {
+                        round_plan
+                            .layout
+                            .values(row, round_plan.group.columns)
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                Some(commit_norm_group(&round_plan.group, &values, &mut coins))
+            }
+            None => None,
+        };
         let mask_rows = mask_plan.mask_rows as usize;
         let ell = mask_plan.mask_code.ell as usize;
         let mut mask_values = Vec::with_capacity(mask_rows);
@@ -14322,6 +14559,7 @@ mod merged_tests {
             squares,
             mean,
             variance,
+            round,
             mask: Some(mask_witness),
         };
         let mut plan = hidden_plan(_activation);
@@ -14387,6 +14625,29 @@ mod merged_tests {
 
         let mut changed = base.clone();
         changed.first.norm.as_mut().unwrap().mask.as_mut().unwrap().root = Digest::ZERO;
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = base.clone();
+        changed.first.norm.as_mut().unwrap().round.as_mut().unwrap().message.group.entries[0].root =
+            Digest::ZERO;
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = base.clone();
+        let answer = &mut changed
+            .first
+            .norm
+            .as_mut()
+            .unwrap()
+            .round
+            .as_mut()
+            .unwrap()
+            .sample
+            .answers[0];
+        *answer = answer.add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
+
+        let mut changed = base.clone();
+        changed.first.norm.as_mut().unwrap().round.as_mut().unwrap().positions[0][0] ^= 1;
         assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
 
         let mut changed = base.clone();

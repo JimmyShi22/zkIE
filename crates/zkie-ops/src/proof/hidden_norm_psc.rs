@@ -1172,6 +1172,7 @@ pub struct NormWitness {
     pub squares: NormGroupWitness,
     pub mean: NormGroupWitness,
     pub variance: NormGroupWitness,
+    pub round: Option<NormGroupWitness>,
     pub mask: Option<NormMaskWitness>,
 }
 
@@ -1198,6 +1199,7 @@ pub struct NormFirstMessages {
     pub squares: CommittedPscGroup,
     pub mean: CommittedPscGroup,
     pub variance: CommittedPscGroup,
+    pub round: Option<CommittedPscGroup>,
     pub mask: Option<NormMaskMessage>,
 }
 
@@ -1210,6 +1212,13 @@ impl NormFirstMessages {
         self.squares.encode_into(&mut writer)?;
         self.mean.encode_into(&mut writer)?;
         self.variance.encode_into(&mut writer)?;
+        match &self.round {
+            Some(round) => {
+                writer.put_u64(1);
+                round.encode_into(&mut writer)?;
+            }
+            None => writer.put_u64(0),
+        }
         match &self.mask {
             Some(mask) => {
                 writer.put_u64(1);
@@ -1232,6 +1241,23 @@ impl NormFirstMessages {
         let squares = CommittedPscGroup::decode(&mut reader, &plan.squares.shape, positions)?;
         let mean = CommittedPscGroup::decode(&mut reader, &plan.mean.shape, positions)?;
         let variance = CommittedPscGroup::decode(&mut reader, &plan.variance.shape, positions)?;
+        let round = match reader.get_u64()? {
+            0 => {
+                if plan.round.is_some() {
+                    return Err(Error::ShapeMismatch);
+                }
+                None
+            }
+            1 => {
+                let round_plan = plan.round.as_ref().ok_or(Error::ShapeMismatch)?;
+                Some(CommittedPscGroup::decode(
+                    &mut reader,
+                    &round_plan.group.shape,
+                    positions,
+                )?)
+            }
+            _ => return Err(Error::InvalidEncoding),
+        };
         let mask = match reader.get_u64()? {
             0 => {
                 if plan.mask.is_some() {
@@ -1252,6 +1278,7 @@ impl NormFirstMessages {
             squares,
             mean,
             variance,
+            round,
             mask,
         };
         message.check_trusted(plan)?;
@@ -1262,9 +1289,6 @@ impl NormFirstMessages {
     /// witness group roots are proof values and are not compared with the plan.
     pub fn check_trusted(&self, plan: &NormPlan) -> Result<()> {
         plan.validate()?;
-        if plan.round.is_some() {
-            return Err(Error::UnsupportedPrimitive);
-        }
         let groups = [
             (&self.x, &plan.x, true),
             (&self.sum, &plan.sum, false),
@@ -1292,6 +1316,33 @@ impl NormFirstMessages {
                     return Err(Error::StatementMismatch);
                 }
             }
+        }
+        match (&plan.round, &self.round) {
+            (Some(round_plan), Some(message)) => {
+                if message.message.group.group != round_plan.group.group
+                    || message.fault(&round_plan.group.shape, plan.shape.positions).is_some()
+                    || message.message.roots.len() != plan.shape.positions as usize
+                {
+                    return Err(Error::ShapeMismatch);
+                }
+                for (position, entry) in message.message.group.entries.iter().enumerate() {
+                    if entry.position != position as u32
+                        || entry.oracle
+                            != round_plan
+                                .group
+                                .oracle_base
+                                .checked_add(position as u64)
+                                .ok_or(Error::ResourceLimit)?
+                        || entry.shape != round_plan.group.shape.oracle_shape()
+                        || entry.tree != round_plan.group.shape.tree_plan(position as u32)?
+                        || entry.root == Digest::ZERO
+                    {
+                        return Err(Error::StatementMismatch);
+                    }
+                }
+            }
+            (None, None) => {}
+            _ => return Err(Error::ShapeMismatch),
         }
         if let (Some(plan_mask), Some(message_mask)) = (&plan.mask, &self.mask) {
             if message_mask.root == Digest::ZERO
@@ -2029,6 +2080,7 @@ mod tests {
             squares: first.squares.clone(),
             mean: first.mean.clone(),
             variance: first.variance.clone(),
+            round: None,
             mask: None,
         };
         (plan, message, second)
