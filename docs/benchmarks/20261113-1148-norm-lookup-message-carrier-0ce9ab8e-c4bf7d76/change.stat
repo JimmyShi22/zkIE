@@ -1,0 +1,17 @@
+commit 0ce9ab8ec9b46da10faae6c5392fa646313901c8
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Fri Nov 13 11:48:10 2026 +0800
+
+    Carry the norm lookup commitments and transcript (partial progress)
+    
+    The norm first message now carries the lookup multiplicity-bit group and the lookup mask message with their SEND samples, opening positions and runtime openings. The norm second message carries the lookup transcript and the claims it leaves. The first stage absorbs the lookup roots and samples before the second stage draws the lookup seed, which drives the lookup challenge and the product-sumcheck transcript; the lookup-free wire layout is unchanged. The lookup plan fixes the two opening counts and the plan digest binds them.
+    
+    Equality weights now follow the sumcheck index order, where the first point coordinate is the least significant map bit; the previous order only agreed when the swapped coordinates had equal values, which duplicate multiplicities violate.
+    
+    The BAT/FOLD registration of the lookup claims and the real round key rows are not part of this step.
+
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     | 204 ++++++++-
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 557 ++++++++++++++++++++++-
+ crates/zkie-ops/src/proof/lookup.rs              | 402 +++++++++++++++-
+ crates/zkie-ops/src/proof/lookup_messages.rs     |  11 +
+ 4 files changed, 1139 insertions(+), 35 deletions(-)
