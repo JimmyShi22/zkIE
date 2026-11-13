@@ -2741,22 +2741,79 @@ impl NormOutputTailWidths {
     }
 }
 
+/// The byte widths of the clamp comparison rows: the offset distances to the
+/// low and high bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NormClampWidths {
+    pub low: usize,
+    pub high: usize,
+}
+
 /// The trusted plan of the output tail witness rows: the quotient, remainder,
-/// half selector, shifted value and pre-clamp value of every column, with the
-/// byte widths of their digit rows. The shift and clamp are the output plan's
-/// trusted values.
+/// half selector, shifted value and pre-clamp value of every column, the
+/// optional clamp rows, and the byte widths of their digit rows. The shift and
+/// clamp bounds are the output plan's trusted values.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormOutputTailPlan {
     pub group: NormGroupPlan,
     pub widths: NormOutputTailWidths,
+    pub clamp: Option<NormClampWidths>,
 }
 
 impl NormOutputTailPlan {
+    /// The slots of one column including the clamp rows.
+    pub fn slots(&self) -> Result<usize> {
+        let clamp = match &self.clamp {
+            Some(clamp) => clamp
+                .low
+                .checked_add(clamp.high)
+                .and_then(|value| value.checked_add(2))
+                .ok_or(Error::ResourceLimit)?,
+            None => 0,
+        };
+        self.widths
+            .slots()?
+            .checked_add(clamp)
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// The message width of one tail row over the column domain.
+    pub fn columns(&self, columns: u64) -> Result<u64> {
+        columns
+            .checked_mul(u64::try_from(self.slots()?).map_err(|_| Error::ResourceLimit)?)
+            .and_then(|value| value.checked_next_power_of_two())
+            .ok_or(Error::ResourceLimit)
+    }
+
     fn validate(&self, output: &NormOutputPlan, plan: &NormPlan) -> Result<()> {
         if self.widths.fault(output.shift).is_some() {
             return Err(Error::InvalidConfig);
         }
-        if self.group.columns != self.widths.columns(plan.columns)?
+        match (&self.clamp, output.clamp) {
+            (Some(clamp), Some((low, high))) => {
+                for width in [clamp.low, clamp.high] {
+                    if width == 0 || width > 7 {
+                        return Err(Error::InvalidConfig);
+                    }
+                    if digit_bound(width).map_err(|_| Error::InvalidConfig)? >= MODULUS as u128 {
+                        return Err(Error::InvalidConfig);
+                    }
+                }
+                let pre_capacity = 1u128 << (8 * self.widths.pre_clamp as u32);
+                let bound = (low.unsigned_abs() as u128).max(high.unsigned_abs() as u128);
+                let span = pre_capacity
+                    .checked_add(bound)
+                    .ok_or(Error::InvalidConfig)?;
+                if digit_bound(clamp.low).map_err(|_| Error::InvalidConfig)? + 1 < span
+                    || digit_bound(clamp.high).map_err(|_| Error::InvalidConfig)? + 1 < span
+                {
+                    return Err(Error::InvalidConfig);
+                }
+            }
+            (None, None) => {}
+            _ => return Err(Error::InvalidConfig),
+        }
+        if self.group.columns != self.columns(plan.columns)?
             || self.group.fault(plan.shape.positions).is_some()
             || self.group.shape.answers != 1
         {
@@ -2792,6 +2849,14 @@ impl NormOutputTailPlan {
         writer.put_u64(self.widths.tie_slack as u64);
         writer.put_u64(self.widths.shifted as u64);
         writer.put_u64(self.widths.pre_clamp as u64);
+        match &self.clamp {
+            Some(clamp) => {
+                writer.put_u64(1);
+                writer.put_u64(clamp.low as u64);
+                writer.put_u64(clamp.high as u64);
+            }
+            None => writer.put_u64(0),
+        }
     }
 
     /// The slot values of one position, position-major over the column
@@ -2807,7 +2872,7 @@ impl NormOutputTailPlan {
 
         let width = usize::try_from(self.group.columns).map_err(|_| Error::ResourceLimit)?;
         let count = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
-        let slots = self.widths.slots()?;
+        let slots = self.slots()?;
         let needed = count.checked_mul(slots).ok_or(Error::ResourceLimit)?;
         if width < needed {
             return Err(Error::ShapeMismatch);
@@ -2890,6 +2955,29 @@ impl NormOutputTailPlan {
                 .checked_add(half_p)
                 .ok_or(Error::BoundViolation)?;
             put(&mut values, pre_at, pre_clamp, self.widths.pre_clamp)?;
+            if let (Some(clamp_widths), Some((low, high))) = (&self.clamp, row.clamp) {
+                let low_at = pre_at + self.widths.pre_clamp;
+                let high_at = low_at + clamp_widths.low;
+                let low_half = 1i128 << (8 * clamp_widths.low as u32 - 1);
+                let high_half = 1i128 << (8 * clamp_widths.high as u32 - 1);
+                let below = row.pre_clamp[column].checked_sub(low as i128);
+                let above = row.pre_clamp[column].checked_sub(high as i128);
+                let low_value = below
+                    .and_then(|value| value.checked_add(low_half))
+                    .ok_or(Error::BoundViolation)?;
+                let high_value = above
+                    .and_then(|value| value.checked_add(high_half))
+                    .ok_or(Error::BoundViolation)?;
+                put(&mut values, low_at, low_value, clamp_widths.low)?;
+                put(&mut values, high_at, high_value, clamp_widths.high)?;
+                let low_selector = high_at + clamp_widths.high;
+                if row.pre_clamp[column] < low as i128 {
+                    values[low_selector] = Fp3::ONE;
+                }
+                if row.pre_clamp[column] > high as i128 {
+                    values[low_selector + 1] = Fp3::ONE;
+                }
+            }
         }
         Ok(values)
     }
@@ -2937,7 +3025,7 @@ pub fn output_rel_terms(
     relation: usize,
 ) -> Result<Vec<TailTerm>> {
     let count = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
-    let slots = plan.widths.slots()?;
+    let slots = plan.slots()?;
     let q_at = 0usize;
     let r_at = plan.widths.quotient;
     let u_at = r_at + plan.widths.remainder;
@@ -6004,8 +6092,8 @@ mod tests {
             shifted: 3,
             pre_clamp: 3,
         };
-        let tail_columns = widths.columns(plan.columns).unwrap();
-        assert_eq!(tail_columns, 64);
+        let clamp_widths = NormClampWidths { low: 4, high: 4 };
+        let tail_columns = 128u64;
         let tail_group = NormGroupPlan {
             shape: WShape::new(
                 tail_columns,
@@ -6028,8 +6116,21 @@ mod tests {
         with_tail.output.as_mut().unwrap().tail = Some(NormOutputTailPlan {
             group: tail_group.clone(),
             widths,
+            clamp: Some(clamp_widths),
         });
         with_tail.validate().unwrap();
+        assert_eq!(
+            with_tail
+                .output
+                .as_ref()
+                .unwrap()
+                .tail
+                .as_ref()
+                .unwrap()
+                .columns(plan.columns)
+                .unwrap(),
+            128
+        );
 
         let mut changed = with_tail.clone();
         changed.output.as_mut().unwrap().tail.as_mut().unwrap().group.columns = 16;
@@ -6101,7 +6202,11 @@ mod tests {
             oracle_base: 7500,
             openings: 1,
         };
-        let tail_plan = NormOutputTailPlan { group, widths };
+        let tail_plan = NormOutputTailPlan {
+            group,
+            widths,
+            clamp: None,
+        };
         let weight = vec![2i64, -1, 3, 1];
         let bias = vec![1i64, 2, -1, 2];
         let inner = |left: &[Fp3], right: &[Fp3]| -> Fp3 {

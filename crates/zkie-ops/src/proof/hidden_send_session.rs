@@ -14479,7 +14479,7 @@ fn output_tail_bias_rows(
         .ok_or(Error::InvalidConfig)?;
     let positions = norm.shape.positions as usize;
     let columns = usize::try_from(norm.columns).map_err(|_| Error::ResourceLimit)?;
-    let slots = tail_plan.widths.slots()?;
+    let slots = tail_plan.slots()?;
     let q_at = 0usize;
     let r_at = tail_plan.widths.quotient;
     let u_at = r_at + tail_plan.widths.remainder;
@@ -22080,7 +22080,7 @@ mod merged_tests {
             tail: Some(crate::proof::hidden_norm_psc::NormOutputTailPlan {
                 group: NormGroupPlan {
                     shape: WShape::new(
-                        64,
+                        128,
                         code(),
                         1,
                         POSITIONS,
@@ -22091,7 +22091,7 @@ mod merged_tests {
                         W_CONFIGURATION,
                     )
                     .unwrap(),
-                    columns: 64,
+                    columns: 128,
                     group: 94,
                     oracle_base: 20_400,
                     openings: 1,
@@ -22104,6 +22104,10 @@ mod merged_tests {
                     shifted: 3,
                     pre_clamp: 3,
                 },
+                clamp: Some(crate::proof::hidden_norm_psc::NormClampWidths {
+                    low: 4,
+                    high: 4,
+                }),
             }),
         }
     }
