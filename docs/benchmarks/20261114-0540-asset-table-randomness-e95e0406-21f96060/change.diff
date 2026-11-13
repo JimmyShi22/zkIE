@@ -1,0 +1,108 @@
+commit e95e04069bf9fcd8507c17625e2c7ecf10e97fcf
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Sat Nov 14 05:40:04 2026 +0800
+
+    Sample private randomness for encoded asset tables
+    
+    Add the per-column salts and per-row code tails with a canonical field rejection sample. The randomness stays private and is not serialized into the public meta; the commit and prove wiring follows.
+
+diff --git a/crates/zkie-ops/src/proof/asset_table.rs b/crates/zkie-ops/src/proof/asset_table.rs
+index 8e821544..478b0f87 100644
+--- a/crates/zkie-ops/src/proof/asset_table.rs
++++ b/crates/zkie-ops/src/proof/asset_table.rs
+@@ -11,7 +11,7 @@
+ 
+ use zkie_core::error::{Error as ZkieError, Result};
+ use zkie_core::types::Digest;
+-use zkie_engine::pcs::request::field::{fp_from_u64, Fp};
++use zkie_engine::pcs::request::field::{fp_from_u64, Fp, MODULUS};
+ use zkie_engine::pcs::request::table::{
+     commit_table_streaming, validate_index_shape, IndexRecord, IndexReader, IndexShape,
+     TableRowSource,
+@@ -202,6 +202,86 @@ pub fn validate_asset_table_params(spec: &ModelAssetSpec, params: &AssetTablePar
+     Ok(())
+ }
+ 
++
++/// Samples fresh private randomness for one table: one salt per column and
++/// one random tail element per row. The salts and tails stay private; only
++/// the table root is public.
++pub fn sample_asset_table_randomness(
++    params: &AssetTableParams,
++) -> Result<AssetTableRandomness> {
++    let columns = usize::try_from(params.shape.code.n()).map_err(|_| ZkieError::ResourceLimit)?;
++    let rows = usize::try_from(params.shape.rows()).map_err(|_| ZkieError::ResourceLimit)?;
++    let salt_bytes = params.shape.salt_bytes;
++    let tail_len = usize::try_from(params.shape.code.r).map_err(|_| ZkieError::ResourceLimit)?;
++    let mut salts = Vec::with_capacity(columns);
++    for _ in 0..columns {
++        let mut salt = vec![0u8; salt_bytes];
++        getrandom::fill(&mut salt).map_err(|_| ZkieError::EntropyUnavailable)?;
++        salts.push(salt);
++    }
++    let mut tails = Vec::with_capacity(rows);
++    for _ in 0..rows {
++        let mut tail = Vec::with_capacity(tail_len);
++        for _ in 0..tail_len {
++            let mut bytes = [0u8; 8];
++            loop {
++                getrandom::fill(&mut bytes).map_err(|_| ZkieError::EntropyUnavailable)?;
++                let word = u64::from_le_bytes(bytes);
++                if word < MODULUS {
++                    tail.push(fp_from_u64(word));
++                    break;
++                }
++            }
++        }
++        tails.push(tail);
++    }
++    Ok(AssetTableRandomness { salts, tails })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use zkie_engine::pcs::request::code::CodeParams;
++    use zkie_engine::pcs::request::table::{IndexShape, TableDistances};
++
++    fn params() -> AssetTableParams {
++        AssetTableParams {
++            asset_id: 1,
++            path: "asset.bin".into(),
++            element_count: 4,
++            row_width: 2,
++            encoding: "i32-le".into(),
++            shape: IndexShape {
++                code: CodeParams { log_n: 5, ell: 11, r: 2 },
++                v: 2,
++                answers: 1,
++                salt_bytes: 40,
++                distances: TableDistances { radius: 0, later_radius: 0, m_once: 0, m_later: 0 },
++            },
++            valid_min: -100,
++            valid_max: 100,
++            layout: AssetTableLayout {
++                row_width: 2,
++                message_len: 11,
++                tail_len: 2,
++                pads: 3,
++                valid_elements: 4,
++                padding_zero: true,
++            },
++        }
++    }
++
++    #[test]
++    fn sampled_randomness_has_the_table_shape() {
++        let params = params();
++        let randomness = sample_asset_table_randomness(&params).unwrap();
++        assert_eq!(randomness.salts.len(), params.shape.code.n() as usize);
++        assert!(randomness.salts.iter().all(|salt| salt.len() == 40));
++        assert_eq!(randomness.tails.len(), params.shape.rows() as usize);
++        assert!(randomness.tails.iter().all(|tail| tail.len() == 2));
++    }
++}
++
+ struct AssetRowSource<'a> {
+     reader: &'a AssetReader,
+     rows: u64,
