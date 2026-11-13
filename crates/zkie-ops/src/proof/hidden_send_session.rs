@@ -4819,11 +4819,11 @@ impl HiddenLinPlan {
             (Some(_), false) => return Err(Error::InvalidConfig),
             (None, true) => return Err(Error::InvalidConfig),
         }
-        if self
+        if let Some(reason) = self
             .proximity
             .fault(&self.send, self.closure.as_ref(), self.norm.as_ref())
-            .is_some()
         {
+            let _ = reason;
             return Err(Error::InvalidConfig);
         }
         if self.output_relation == Some(Digest::ZERO) {
@@ -8798,13 +8798,22 @@ fn own_members(
         let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
         let norm_witness = witness.and_then(|witness| witness.norm.as_ref());
         let positions = plan.send.positions();
-        let groups = [
+        let mut groups = vec![
             (&norm_first.x, &norm_plan.x, norm_witness.map(|w| &w.x)),
             (&norm_first.sum, &norm_plan.sum, norm_witness.map(|w| &w.sum)),
             (&norm_first.squares, &norm_plan.squares, norm_witness.map(|w| &w.squares)),
             (&norm_first.mean, &norm_plan.mean, norm_witness.map(|w| &w.mean)),
             (&norm_first.variance, &norm_plan.variance, norm_witness.map(|w| &w.variance)),
         ];
+        if let (Some(round_message), Some(round_plan)) =
+            (&norm_first.round, &norm_plan.round)
+        {
+            groups.push((
+                round_message,
+                &round_plan.group,
+                norm_witness.and_then(|witness| witness.round.as_ref()),
+            ));
+        }
         for (message, group_plan, group_witness) in groups {
             if message.message.group.group != group_plan.group
                 || message.message.roots.len() != positions as usize
@@ -10079,6 +10088,36 @@ fn norm_plain_rows(
         let eq_sum = eq[..valid.min(columns)]
             .iter()
             .fold(Fp3::ZERO, |sum, value| sum.add(value));
+        let round_plan = norm.round.as_ref();
+        let round_member = match round_plan {
+            Some(plan) => Some(
+                bat_of
+                    .get(
+                        &plan
+                            .group
+                            .oracle_base
+                            .checked_add(position as u64)
+                            .ok_or(Error::ResourceLimit)?,
+                    )
+                    .ok_or(Error::StatementMismatch)?,
+            ),
+            None => None,
+        };
+        let round_coefficients = |slots: &[(usize, Fp3)]| -> Result<Vec<Fp3>> {
+            let plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
+            let round_columns = usize::try_from(plan.group.columns)
+                .map_err(|_| Error::ResourceLimit)?;
+            let mut dense = vec![Fp3::ZERO; round_columns];
+            for (slot, coefficient) in slots {
+                let entry = dense.get_mut(*slot).ok_or(Error::ShapeMismatch)?;
+                *entry = coefficient.add(entry);
+            }
+            scatter_message_coefficients(
+                &plan.group.shape,
+                plan.group.columns,
+                &dense,
+            )
+        };
         match word.relation {
             0 => {
                 let sum_member = bat_of
@@ -10300,6 +10339,93 @@ fn norm_plain_rows(
                     word.output.ends[0].mask_scale,
                 );
                 left.target = word.output.ends[0].value;
+                rows.push(left);
+
+                let constant = eq[0].add(&eq[1]).add(&eq[2]);
+                let mut right = BatRow::new(BatRowKind::Plain);
+                right.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown1)?,
+                    word.output.ends[1].mask_scale,
+                );
+                right.target = word.output.ends[1].value.sub(&constant);
+                rows.push(right);
+            }
+            4 | 5 => {
+                let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
+                let round_member = round_member.ok_or(Error::StatementMismatch)?;
+                let (offset_slot, complement_slot) = if word.relation == 4 {
+                    (
+                        round_plan.layout.slots.mean_offset,
+                        round_plan.layout.slots.mean_complement,
+                    )
+                } else {
+                    (
+                        round_plan.layout.slots.variance_offset,
+                        round_plan.layout.slots.variance_complement,
+                    )
+                };
+                let coefficients = round_coefficients(&[
+                    (offset_slot, eq[0]),
+                    (complement_slot, eq[1]),
+                ])?;
+                let constant = crate::proof::output_closure::fp3_signed(
+                    valid as i128 - 1,
+                )?
+                .mul(&eq[2]);
+                let mut left = BatRow::new(BatRowKind::Plain);
+                left.add_term(round_member.bat_oracle, BatPart::Main, coefficients);
+                left.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown0)?,
+                    word.output.ends[0].mask_scale,
+                );
+                left.target = word.output.ends[0].value.add(&constant);
+                rows.push(left);
+
+                let constant = eq[0].add(&eq[1]).add(&eq[2]);
+                let mut right = BatRow::new(BatRowKind::Plain);
+                right.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown1)?,
+                    word.output.ends[1].mask_scale,
+                );
+                right.target = word.output.ends[1].value.sub(&constant);
+                rows.push(right);
+            }
+            6 | 7 => {
+                let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
+                let round_member = round_member.ok_or(Error::StatementMismatch)?;
+                let (remainder_slot, offset_slot) = if word.relation == 6 {
+                    (
+                        round_plan.layout.slots.mean_remainder,
+                        round_plan.layout.slots.mean_offset,
+                    )
+                } else {
+                    (
+                        round_plan.layout.slots.variance_remainder,
+                        round_plan.layout.slots.variance_offset,
+                    )
+                };
+                let coefficients = round_coefficients(&[
+                    (remainder_slot, eq[0]),
+                    (offset_slot, Fp3::ZERO.sub(&eq[1])),
+                ])?;
+                let low = -((valid / 2) as i128);
+                let constant = crate::proof::output_closure::fp3_signed(low)?
+                    .mul(&eq[2]);
+                let mut left = BatRow::new(BatRowKind::Plain);
+                left.add_term(round_member.bat_oracle, BatPart::Main, coefficients);
+                left.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown0)?,
+                    word.output.ends[0].mask_scale,
+                );
+                left.target = word.output.ends[0].value.add(&constant);
                 rows.push(left);
 
                 let constant = eq[0].add(&eq[1]).add(&eq[2]);
@@ -14445,7 +14571,7 @@ mod merged_tests {
             oracle: 9500,
             group: GROUP,
             mask_code: mask_code(),
-            mask_rows: 4,
+            mask_rows: 8,
             answers: 1,
             openings: 1,
             tree: RuntimeTreePlan {
@@ -14455,7 +14581,7 @@ mod merged_tests {
                 log_n_zk: CODE_LOG_N,
                 parts: vec![RuntimeTreePart {
                     main_symbols: 0,
-                    mask_symbols: 12,
+                    mask_symbols: 24,
                 }],
                 salt_bytes: SALT,
                 run: W_RUN,
@@ -14471,7 +14597,7 @@ mod merged_tests {
                 .unwrap(),
             columns,
             variables: columns.trailing_zeros() as usize + 1,
-            relations: vec![0, 1, 2, 3],
+            relations: vec![0, 1, 2, 3, 4, 5, 6, 7],
             x: group(columns, GROUP, 9000, 60000),
             x_roots: Vec::new(),
             sum: group(1, GROUP, 9100, 60100),
@@ -14604,7 +14730,7 @@ mod merged_tests {
             mask: Some(mask_witness),
         };
         let mut plan = hidden_plan(_activation);
-        plan.proximity.own_mask_tree.mask_rows = 8;
+        plan.proximity.own_mask_tree.mask_rows = 16;
         plan.norm = Some(norm);
         plan.validate().unwrap();
         (plan, witness)
@@ -14725,7 +14851,7 @@ mod merged_tests {
         verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
         assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &base).is_ok());
         let instances = base.second.norm.as_ref().unwrap().psc.len();
-        assert_eq!(instances, POSITIONS as usize * 4);
+        assert_eq!(instances, POSITIONS as usize * 8);
 
         // Endpoint values of every relation instance.
         for instance in 0..instances {

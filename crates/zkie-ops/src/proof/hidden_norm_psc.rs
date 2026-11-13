@@ -460,6 +460,40 @@ pub(crate) fn rel_map(
             right[1] = Fp3::ONE;
             right[2] = Fp3::ONE;
         }
+        4 => {
+            left[0] = fp3_signed(row.mean_offset)?;
+            left[1] = fp3_signed(row.mean_complement)?;
+            left[2] = fp3_signed(-(valid as i128 - 1))?;
+            right[0] = Fp3::ONE;
+            right[1] = Fp3::ONE;
+            right[2] = Fp3::ONE;
+        }
+        5 => {
+            left[0] = fp3_signed(row.variance_offset)?;
+            left[1] = fp3_signed(row.variance_complement)?;
+            left[2] = fp3_signed(-(valid as i128 - 1))?;
+            right[0] = Fp3::ONE;
+            right[1] = Fp3::ONE;
+            right[2] = Fp3::ONE;
+        }
+        6 => {
+            let low = -((valid / 2) as i128);
+            left[0] = fp3_signed(row.mean_remainder)?;
+            left[1] = fp3_signed(-row.mean_offset)?;
+            left[2] = fp3_signed(-low)?;
+            right[0] = Fp3::ONE;
+            right[1] = Fp3::ONE;
+            right[2] = Fp3::ONE;
+        }
+        7 => {
+            let low = -((valid / 2) as i128);
+            left[0] = fp3_signed(row.variance_remainder)?;
+            left[1] = fp3_signed(-row.variance_offset)?;
+            left[2] = fp3_signed(-low)?;
+            right[0] = Fp3::ONE;
+            right[1] = Fp3::ONE;
+            right[2] = Fp3::ONE;
+        }
         _ => return Err(Error::InvalidConfig),
     }
     Ok((left, right))
@@ -579,7 +613,7 @@ pub const NORM_BIND_VERSION: u64 = 4;
 /// The relation indices the bound core supports. The map construction of
 /// every relation is fixed by the relation index; the plan may list only
 /// relations whose row binding is implemented.
-pub const NORM_BOUND_RELATIONS: [usize; 4] = [0, 1, 2, 3];
+pub const NORM_BOUND_RELATIONS: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
 
 /// One committed witness group of the integrated norm plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -657,6 +691,9 @@ impl NormPlan {
         if self.relations.is_empty()
             || self.relations.windows(2).any(|pair| pair[0] >= pair[1])
         {
+            return Err(Error::InvalidConfig);
+        }
+        if self.relations.iter().any(|relation| *relation >= 4) && self.round.is_none() {
             return Err(Error::InvalidConfig);
         }
         if self
