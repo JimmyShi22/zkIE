@@ -68,7 +68,7 @@
 
 ## Scope and next
 
-- No claim that batch 2 is complete; the production source closure for the gain
+- No claim that the full local chain or topic is complete; the production source closure for the gain
   and bias tables remains a dependency.
 - Open: switching the model-level output-head entry to build the norm mode
   (the hidden session path itself is wired), the real-path ledger and opening
