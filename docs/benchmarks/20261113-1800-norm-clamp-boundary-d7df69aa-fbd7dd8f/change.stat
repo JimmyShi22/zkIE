@@ -1,0 +1,4 @@
+d7df69aa Accept the clamp boundary matrix on the hidden chain
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     |   2 +
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 279 ++++++++++++++++++++++-
+ 2 files changed, 276 insertions(+), 5 deletions(-)
