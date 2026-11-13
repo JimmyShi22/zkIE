@@ -1,0 +1,25 @@
+commit c0ee68bd02827125a25f930771b1a91bc583a16f
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Fri Nov 13 14:21:51 2026 +0800
+
+    Add the frozen interface of the norm gain and bias parameter tables
+    
+    The new module fixes the identity, the row mapping and the plan counts of the
+    two parameter tables the norm output tail will consume. Each identity binds the
+    external model identity, the asset-table identity, the committed encoded-table
+    reader, the parameter row and width, the admitted i32 range and the explicit
+    mapping-assumption flag; the digest covers every field. The tables plan carries
+    the gain and bias identities with the per-table column draw and seed counts,
+    allows two rows of one committed table or two separate tables, and rejects
+    wrong versions, malformed shapes, duplicated rows, out-of-domain ranges and
+    out-of-budget counts.
+    
+    The module neither builds a table nor consumes an evaluation yet; the frozen
+    contract for asset binding, opening and ledger accounting, transcript order and
+    the relation consumption hooks is recorded in the task records.
+    
+    partial progress
+
+ crates/zkie-ops/src/proof/mod.rs              |   1 +
+ crates/zkie-ops/src/proof/norm_param_table.rs | 322 ++++++++++++++++++++++++++
+ 2 files changed, 323 insertions(+)
