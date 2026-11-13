@@ -1,0 +1,7 @@
+eb8fcde2 Cover the clamp slack digits and fix the masked claim transcript order
+
+ crates/zkie-ops/src/proof/committed_psc.rs       | 127 ++++++++
+ crates/zkie-ops/src/proof/hidden_norm_psc.rs     |  19 +-
+ crates/zkie-ops/src/proof/hidden_send_session.rs | 369 ++++++++++++++++++++++-
+ crates/zkie-ops/src/proof/output_closure.rs      |   1 +
+ 4 files changed, 506 insertions(+), 10 deletions(-)
