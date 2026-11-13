@@ -51,7 +51,7 @@
 - `cargo test --workspace`: 50 suites, 984 passed, 0 failed, 17 ignored.
 - Hard gate: 45,080 B, sha256
   `7a5da6ebcbfdb61d5ee88ab60e67f45613906959b0c5de998cb870f5e1de4cfb`,
-  `cmp` identical to the A reference on the final tree.
+  `cmp` identical to the earlier acceptance reference on the final tree.
 - No push.
 
 ## Boundaries

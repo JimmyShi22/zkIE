@@ -44,7 +44,7 @@
 - `cargo test --workspace`: 49 suites, 980 passed, 0 failed, 17 ignored.
 - Hard gate: 45,080 B, sha256
   `7a5da6ebcbfdb61d5ee88ab60e67f45613906959b0c5de998cb870f5e1de4cfb`,
-  `cmp` identical to the A reference; the temporary dump was reverted.
+  `cmp` identical to the earlier acceptance reference; the temporary dump was reverted.
 
 ## Boundaries
 
