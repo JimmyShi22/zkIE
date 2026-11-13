@@ -344,14 +344,14 @@ impl LookupKeyPlan {
         Ok(())
     }
 
-    /// Reads one vector per value column from the committed rounding rows.
-    /// `rows[position]` is the unencoded message of that position; a source
-    /// names its row and place directly. Keys without sources carry the
-    /// public padding value of their column.
-    pub fn read_columns(
+    /// Reads one vector per value column, resolving every source cell with
+    /// the caller. The resolver names the committed message the source
+    /// addresses, so one key plan can span several committed groups. Keys
+    /// without sources carry the public padding value of their column.
+    pub fn read_columns_with(
         &self,
         plan: &LookupPlan,
-        rows: &[Vec<Vec<Fp3>>],
+        resolve: &dyn Fn(&LookupKeySource) -> Result<Fp3>,
     ) -> Result<Vec<Vec<Fp3>>> {
         self.validate(plan)?;
         let count = plan.key_count()?;
@@ -361,12 +361,7 @@ impl LookupKeyPlan {
         for (index, source) in self.sources.iter().enumerate() {
             let key = index / columns;
             let column = source.column as usize;
-            let value = rows
-                .get(source.position as usize)
-                .and_then(|message| message.get(source.row as usize))
-                .and_then(|row| row.get(source.place as usize))
-                .copied()
-                .ok_or(Error::ShapeMismatch)?;
+            let value = resolve(source)?;
             out[column][key] = source.coefficient.mul(&value).add(&source.offset);
         }
         for column in 0..columns {
@@ -377,6 +372,24 @@ impl LookupKeyPlan {
         Ok(out)
     }
 
+    /// Reads one vector per value column from the committed rows.
+    /// `rows[position]` is the unencoded message of that position; a source
+    /// names its row and place directly.
+    pub fn read_columns(
+        &self,
+        plan: &LookupPlan,
+        rows: &[Vec<Vec<Fp3>>],
+    ) -> Result<Vec<Vec<Fp3>>> {
+        let resolve = |source: &LookupKeySource| -> Result<Fp3> {
+            rows.get(source.position as usize)
+                .and_then(|message| message.get(source.row as usize))
+                .and_then(|row| row.get(source.place as usize))
+                .copied()
+                .ok_or(Error::ShapeMismatch)
+        };
+        self.read_columns_with(plan, &resolve)
+    }
+
     /// Reads the combined key vector `sum_j theta^j * column_j[i]`.
     pub fn read(
         &self,
@@ -384,7 +397,24 @@ impl LookupKeyPlan {
         rows: &[Vec<Vec<Fp3>>],
         theta: Fp3,
     ) -> Result<Vec<Fp3>> {
-        let columns = self.read_columns(plan, rows)?;
+        let resolve = |source: &LookupKeySource| -> Result<Fp3> {
+            rows.get(source.position as usize)
+                .and_then(|message| message.get(source.row as usize))
+                .and_then(|row| row.get(source.place as usize))
+                .copied()
+                .ok_or(Error::ShapeMismatch)
+        };
+        self.read_with(plan, theta, &resolve)
+    }
+
+    /// Reads the combined key vector with a source resolver.
+    pub fn read_with(
+        &self,
+        plan: &LookupPlan,
+        theta: Fp3,
+        resolve: &dyn Fn(&LookupKeySource) -> Result<Fp3>,
+    ) -> Result<Vec<Fp3>> {
+        let columns = self.read_columns_with(plan, resolve)?;
         let count = plan.key_count()?;
         let mut keys = vec![Fp3::ZERO; count];
         for (column, values) in columns.iter().enumerate() {
@@ -957,6 +987,57 @@ pub fn prove_lookup_with_messages(
     table: &dyn LookupTable,
     seed: u64,
 ) -> Result<(LookupProof, LookupOutcome)> {
+    prove_lookup_inner(
+        plan,
+        commit_plan,
+        key_plan,
+        None,
+        Some(key_rows),
+        witness,
+        messages,
+        table,
+        seed,
+    )
+}
+
+/// Proves one lookup with an already resolved key vector. The caller owns the
+/// source of the keys; this is the entry for key maps that address more than
+/// one committed message group. The vector must already be combined across
+/// the value columns, in key order.
+pub fn prove_lookup_with_key_values(
+    plan: &LookupPlan,
+    commit_plan: &LookupCommitPlan,
+    key_plan: &LookupKeyPlan,
+    key_values: &[Fp3],
+    witness: &LookupWitness,
+    messages: &LookupMessages,
+    table: &dyn LookupTable,
+    seed: u64,
+) -> Result<(LookupProof, LookupOutcome)> {
+    prove_lookup_inner(
+        plan,
+        commit_plan,
+        key_plan,
+        Some(key_values),
+        None,
+        witness,
+        messages,
+        table,
+        seed,
+    )
+}
+
+fn prove_lookup_inner(
+    plan: &LookupPlan,
+    commit_plan: &LookupCommitPlan,
+    key_plan: &LookupKeyPlan,
+    key_values: Option<&[Fp3]>,
+    key_rows: Option<&[Vec<Vec<Fp3>>]>,
+    witness: &LookupWitness,
+    messages: &LookupMessages,
+    table: &dyn LookupTable,
+    seed: u64,
+) -> Result<(LookupProof, LookupOutcome)> {
     plan.validate()?;
     let keys = plan.key_count()?;
     let planes = plan.planes()?;
@@ -998,7 +1079,11 @@ pub fn prove_lookup_with_messages(
         Fp3::ONE
     };
     let alpha = challenges.draw()?;
-    let key_values = key_plan.read(plan, key_rows, theta)?;
+    let key_values = match (key_values, key_rows) {
+        (Some(values), None) => values.to_vec(),
+        (None, Some(rows)) => key_plan.read(plan, rows, theta)?,
+        _ => return Err(Error::InvalidConfig),
+    };
     if key_values.len() != keys {
         return Err(Error::ShapeMismatch);
     }

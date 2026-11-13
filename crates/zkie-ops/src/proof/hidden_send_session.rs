@@ -265,10 +265,10 @@ use crate::proof::output_closure::{
 use crate::registry::{RSQRT_COARSE, RSQRT_COARSE_END, RSQRT_FINE, RSQRT_HALF, RSQRT_SHIFT};
 use crate::proof::hidden_norm_psc::{
     NormFirstMessages, NormGroupPlan, NormGroupWitness, NormLookupMessage, NormLookupSecond,
-    NormMaskMessage, NormMaskPlan, NormMaskWitness, NormOutputMessage, NormParamClaimMessage,
+    NormMaskMessage, NormMaskPlan, NormOutputMessage, NormParamClaimMessage,
     NormParamMessage, NormPlan, NormPositionBinding, NormPscSecond,
     NormRowBinding, NormWitness, RSQRT_FINE_SLACK_WIDTH, RSQRT_INDEX_SLACK_WIDTH,
-    RSQRT_INDEX_WIDTH, RSQRT_MID_HIGH_WIDTH, RSQRT_RAW_REMAINDER_WIDTH,
+    RSQRT_MID_HIGH_WIDTH, RSQRT_RAW_REMAINDER_WIDTH,
 };
 use crate::proof::committed_psc::CommittedPscGroup;
 use crate::proof::norm_param_table::{NormParamClaimPlan, NormParamKind, NormParamTableIdentity};
@@ -10132,6 +10132,193 @@ fn draw_norm_mask_positions(chain: &mut Chain, plan: &NormMaskPlan) -> Result<Ve
     Ok(unique_sorted(&positions))
 }
 
+/// The transcript tags of one norm lookup section.
+#[derive(Clone, Copy)]
+struct NormLookupTags {
+    bits_root: u64,
+    mask_root: u64,
+    bits_seed: u64,
+    mask_seed: u64,
+    bits_answer: u64,
+    mask_answer: u64,
+    bits_position: u64,
+    mask_position: u64,
+}
+
+const NORM_LOOKUP_TAGS: NormLookupTags = NormLookupTags {
+    bits_root: NORM_LOOKUP_BITS_ROOT_TAG,
+    mask_root: NORM_LOOKUP_MASK_ROOT_TAG,
+    bits_seed: NORM_LOOKUP_BITS_SEED_TAG,
+    mask_seed: NORM_LOOKUP_MASK_SEED_TAG,
+    bits_answer: NORM_LOOKUP_BITS_ANSWER_TAG,
+    mask_answer: NORM_LOOKUP_MASK_ANSWER_TAG,
+    bits_position: NORM_LOOKUP_BITS_POSITION_TAG,
+    mask_position: NORM_LOOKUP_MASK_POSITION_TAG,
+};
+
+/// Prover side of one norm lookup first-stage section: commit the multiplicity
+/// bit and mask messages, absorb their roots and answers, draw the positions
+/// and open them. The tag bundle names the section in the transcript.
+fn prove_norm_lookup_first(
+    chain: &mut Chain,
+    lookup_plan: &crate::proof::hidden_norm_psc::NormLookupPlan,
+    lookup_witness: &crate::proof::hidden_norm_psc::NormLookupWitness,
+    commit_seed: u64,
+    tags: &NormLookupTags,
+) -> Result<(
+    NormLookupMessage,
+    crate::proof::lookup_messages::LookupMessages,
+)> {
+    let mask_entries = crate::proof::lookup::mask_count(&lookup_plan.lookup)?;
+    let mut source =
+        crate::proof::lookup_messages::LookupRandomSource::new(commit_seed);
+    let messages = crate::proof::lookup_messages::commit_lookup(
+        &lookup_plan.commit,
+        &lookup_witness.bits,
+        mask_entries,
+        &mut source,
+    )?;
+    absorb_closure_group(chain, tags.bits_root, &messages.bits.group)?;
+    absorb_lookup_mask_root(chain, lookup_plan, &messages.mask_root, tags.mask_root)?;
+    let bits_shape = &lookup_plan.commit.bits_shape;
+    let bits_seed = draw_closure_seed_set(
+        chain,
+        tags.bits_seed,
+        bits_shape.sample_bits()?,
+        bits_shape.answers,
+    )?;
+    let bits_answers = value_group_answers(
+        bits_shape,
+        lookup_plan.commit.bits_oracle,
+        lookup_plan.commit.group,
+        &messages.bits.messages,
+        &bits_seed,
+    )?;
+    absorb_tagged_answers(chain, tags.bits_answer, &bits_answers)?;
+    let mask_seed = draw_closure_seed_set(
+        chain,
+        tags.mask_seed,
+        lookup_mask_sample_bits(&lookup_plan.commit)?,
+        1,
+    )?;
+    let mask_answer = lookup_mask_answer(
+        &lookup_plan.commit,
+        &messages.mask_rows,
+        &mask_seed[0],
+    )?;
+    absorb_tagged_answers(chain, tags.mask_answer, &[mask_answer])?;
+    let bits_positions = draw_closure_group_positions(
+        chain,
+        tags.bits_position,
+        1,
+        lookup_plan.commit.bits_openings,
+        bits_shape.code.log_n,
+    )?;
+    let bits_tree = messages
+        .bits
+        .trees
+        .get(0)
+        .ok_or(Error::ShapeMismatch)?;
+    if bits_tree.plan() != &bits_shape.tree_plan(0)? {
+        return Err(Error::StatementMismatch);
+    }
+    let bits_opening = bits_tree.open(&bits_positions[0])?;
+    let mask_positions = draw_lookup_mask_positions(chain, lookup_plan, tags.mask_position)?;
+    let mask_tree = messages.mask_tree(&lookup_plan.commit)?;
+    if *mask_tree.root() != messages.mask_root {
+        return Err(Error::StatementMismatch);
+    }
+    let mask_opening = mask_tree.open(&mask_positions)?;
+    let message = NormLookupMessage {
+        bits: CommittedPscGroup {
+            message: CommittedGroupMessage::new(messages.bits.group.clone()),
+            sample: SendSamples {
+                seed: bits_seed,
+                answers: bits_answers,
+            },
+            positions: bits_positions,
+            openings: vec![bits_opening],
+        },
+        mask: NormMaskMessage {
+            tree: lookup_plan.commit.mask_tree.clone(),
+            root: messages.mask_root,
+            sample: SendSamples {
+                seed: mask_seed,
+                answers: vec![mask_answer],
+            },
+            positions: mask_positions,
+            opening: mask_opening,
+        },
+    };
+    Ok((message, messages))
+}
+
+/// Verifier side of one norm lookup first-stage section.
+fn verify_norm_lookup_first(
+    chain: &mut Chain,
+    lookup_plan: &crate::proof::hidden_norm_psc::NormLookupPlan,
+    lookup: &NormLookupMessage,
+    tags: &NormLookupTags,
+) -> Result<()> {
+    absorb_closure_group(chain, tags.bits_root, &lookup.bits.message.group)?;
+    absorb_lookup_mask_root(chain, lookup_plan, &lookup.mask.root, tags.mask_root)?;
+    let bits_shape = &lookup_plan.commit.bits_shape;
+    let bits_seed = draw_closure_seed_set(
+        chain,
+        tags.bits_seed,
+        bits_shape.sample_bits()?,
+        bits_shape.answers,
+    )?;
+    if bits_seed != lookup.bits.sample.seed {
+        return Err(Error::InvalidProof);
+    }
+    absorb_tagged_answers(chain, tags.bits_answer, &lookup.bits.sample.answers)?;
+    let mask_seed = draw_closure_seed_set(
+        chain,
+        tags.mask_seed,
+        lookup_mask_sample_bits(&lookup_plan.commit)?,
+        1,
+    )?;
+    if mask_seed != lookup.mask.sample.seed {
+        return Err(Error::InvalidProof);
+    }
+    absorb_tagged_answers(chain, tags.mask_answer, &lookup.mask.sample.answers)?;
+    let bits_positions = draw_closure_group_positions(
+        chain,
+        tags.bits_position,
+        1,
+        lookup_plan.commit.bits_openings,
+        bits_shape.code.log_n,
+    )?;
+    if bits_positions != lookup.bits.positions {
+        return Err(Error::InvalidProof);
+    }
+    let bits_entry = lookup
+        .bits
+        .message
+        .group
+        .entries
+        .first()
+        .ok_or(Error::ShapeMismatch)?;
+    verify_runtime_opening(
+        &bits_entry.tree,
+        &bits_entry.root,
+        &bits_positions[0],
+        &lookup.bits.openings[0],
+    )?;
+    let mask_positions = draw_lookup_mask_positions(chain, lookup_plan, tags.mask_position)?;
+    if mask_positions != lookup.mask.positions {
+        return Err(Error::InvalidProof);
+    }
+    verify_runtime_opening(
+        &lookup_plan.commit.mask_tree,
+        &lookup.mask.root,
+        &mask_positions,
+        &lookup.mask.opening,
+    )?;
+    Ok(())
+}
+
 /// Derives the private lookup commitment seed from the run seed.
 fn lookup_commit_seed(seed: &Digest) -> Result<u64> {
     let digest = derive_run_seed(seed, 10, 0)?;
@@ -10156,11 +10343,12 @@ fn absorb_lookup_mask_root(
     chain: &mut Chain,
     plan: &crate::proof::hidden_norm_psc::NormLookupPlan,
     root: &Digest,
+    tag: u64,
 ) -> Result<()> {
     let commit = &plan.commit;
     let mut message = chain.message();
     message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
-    message.push_u64(NORM_LOOKUP_MASK_ROOT_TAG);
+    message.push_u64(tag);
     message.push_u64(commit.mask_oracle);
     message.push_u64(commit.group);
     message.push_u64(commit.mask_rows);
@@ -10274,10 +10462,11 @@ fn lookup_mask_answer(
 fn draw_lookup_mask_positions(
     chain: &mut Chain,
     plan: &crate::proof::hidden_norm_psc::NormLookupPlan,
+    tag: u64,
 ) -> Result<Vec<u64>> {
     let mut message = chain.message();
     message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
-    message.push_u64(NORM_LOOKUP_MASK_POSITION_TAG);
+    message.push_u64(tag);
     message.push_u64(1);
     message.push_u64(plan.commit.mask_openings as u64);
     let prefix = message.prefix(KIND_POSITIONS, 0)?;
@@ -10292,10 +10481,10 @@ fn draw_lookup_mask_positions(
 }
 
 /// Draws the lookup sub-transcript seed after the first message is fixed.
-fn draw_lookup_seed(chain: &mut Chain) -> Result<u64> {
+fn draw_lookup_seed(chain: &mut Chain, tag: u64) -> Result<u64> {
     let mut message = chain.message();
     message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
-    message.push_u64(NORM_LOOKUP_SEED_TAG);
+    message.push_u64(tag);
     let prefix = message.prefix(KIND_SEED, 0)?;
     if !chain.step(&prefix, 0)? {
         return Err(Error::InvalidProof);
@@ -10809,88 +10998,13 @@ fn prove_norm_first(
     let (lookup, lookup_messages) = match &norm.lookup {
         Some(lookup_plan) => {
             let lookup_witness = witness.lookup.as_ref().ok_or(Error::ShapeMismatch)?;
-            let mask_entries = crate::proof::lookup::mask_count(&lookup_plan.lookup)?;
-            let mut source = crate::proof::lookup_messages::LookupRandomSource::new(
+            let (message, messages) = prove_norm_lookup_first(
+                chain,
+                lookup_plan,
+                lookup_witness,
                 lookup_commit_seed(seed)?,
-            );
-            let messages = crate::proof::lookup_messages::commit_lookup(
-                &lookup_plan.commit,
-                &lookup_witness.bits,
-                mask_entries,
-                &mut source,
+                &NORM_LOOKUP_TAGS,
             )?;
-            absorb_closure_group(chain, NORM_LOOKUP_BITS_ROOT_TAG, &messages.bits.group)?;
-            absorb_lookup_mask_root(chain, lookup_plan, &messages.mask_root)?;
-            let bits_shape = &lookup_plan.commit.bits_shape;
-            let bits_seed = draw_closure_seed_set(
-                chain,
-                NORM_LOOKUP_BITS_SEED_TAG,
-                bits_shape.sample_bits()?,
-                bits_shape.answers,
-            )?;
-            let bits_answers = value_group_answers(
-                bits_shape,
-                lookup_plan.commit.bits_oracle,
-                lookup_plan.commit.group,
-                &messages.bits.messages,
-                &bits_seed,
-            )?;
-            absorb_tagged_answers(chain, NORM_LOOKUP_BITS_ANSWER_TAG, &bits_answers)?;
-            let mask_seed = draw_closure_seed_set(
-                chain,
-                NORM_LOOKUP_MASK_SEED_TAG,
-                lookup_mask_sample_bits(&lookup_plan.commit)?,
-                1,
-            )?;
-            let mask_answer = lookup_mask_answer(
-                &lookup_plan.commit,
-                &messages.mask_rows,
-                &mask_seed[0],
-            )?;
-            absorb_tagged_answers(chain, NORM_LOOKUP_MASK_ANSWER_TAG, &[mask_answer])?;
-            let bits_positions = draw_closure_group_positions(
-                chain,
-                NORM_LOOKUP_BITS_POSITION_TAG,
-                1,
-                lookup_plan.commit.bits_openings,
-                bits_shape.code.log_n,
-            )?;
-            let bits_tree = messages
-                .bits
-                .trees
-                .get(0)
-                .ok_or(Error::ShapeMismatch)?;
-            if bits_tree.plan() != &bits_shape.tree_plan(0)? {
-                return Err(Error::StatementMismatch);
-            }
-            let bits_opening = bits_tree.open(&bits_positions[0])?;
-            let mask_positions = draw_lookup_mask_positions(chain, lookup_plan)?;
-            let mask_tree = messages.mask_tree(&lookup_plan.commit)?;
-            if *mask_tree.root() != messages.mask_root {
-                return Err(Error::StatementMismatch);
-            }
-            let mask_opening = mask_tree.open(&mask_positions)?;
-            let message = NormLookupMessage {
-                bits: CommittedPscGroup {
-                    message: CommittedGroupMessage::new(messages.bits.group.clone()),
-                    sample: SendSamples {
-                        seed: bits_seed,
-                        answers: bits_answers,
-                    },
-                    positions: bits_positions,
-                    openings: vec![bits_opening],
-                },
-                mask: NormMaskMessage {
-                    tree: lookup_plan.commit.mask_tree.clone(),
-                    root: messages.mask_root,
-                    sample: SendSamples {
-                        seed: mask_seed,
-                        answers: vec![mask_answer],
-                    },
-                    positions: mask_positions,
-                    opening: mask_opening,
-                },
-            };
             (Some(message), Some(messages))
         }
         None => (None, None),
@@ -11537,62 +11651,7 @@ fn verify_norm_first(
     }
     match (&norm.lookup, &message.lookup) {
         (Some(lookup_plan), Some(lookup)) => {
-            absorb_closure_group(chain, NORM_LOOKUP_BITS_ROOT_TAG, &lookup.bits.message.group)?;
-            absorb_lookup_mask_root(chain, lookup_plan, &lookup.mask.root)?;
-            let bits_shape = &lookup_plan.commit.bits_shape;
-            let bits_seed = draw_closure_seed_set(
-                chain,
-                NORM_LOOKUP_BITS_SEED_TAG,
-                bits_shape.sample_bits()?,
-                bits_shape.answers,
-            )?;
-            if bits_seed != lookup.bits.sample.seed {
-                return Err(Error::InvalidProof);
-            }
-            absorb_tagged_answers(chain, NORM_LOOKUP_BITS_ANSWER_TAG, &lookup.bits.sample.answers)?;
-            let mask_seed = draw_closure_seed_set(
-                chain,
-                NORM_LOOKUP_MASK_SEED_TAG,
-                lookup_mask_sample_bits(&lookup_plan.commit)?,
-                1,
-            )?;
-            if mask_seed != lookup.mask.sample.seed {
-                return Err(Error::InvalidProof);
-            }
-            absorb_tagged_answers(chain, NORM_LOOKUP_MASK_ANSWER_TAG, &lookup.mask.sample.answers)?;
-            let bits_positions = draw_closure_group_positions(
-                chain,
-                NORM_LOOKUP_BITS_POSITION_TAG,
-                1,
-                lookup_plan.commit.bits_openings,
-                bits_shape.code.log_n,
-            )?;
-            if bits_positions != lookup.bits.positions {
-                return Err(Error::InvalidProof);
-            }
-            let bits_entry = lookup
-                .bits
-                .message
-                .group
-                .entries
-                .first()
-                .ok_or(Error::ShapeMismatch)?;
-            verify_runtime_opening(
-                &bits_entry.tree,
-                &bits_entry.root,
-                &bits_positions[0],
-                &lookup.bits.openings[0],
-            )?;
-            let mask_positions = draw_lookup_mask_positions(chain, lookup_plan)?;
-            if mask_positions != lookup.mask.positions {
-                return Err(Error::InvalidProof);
-            }
-            verify_runtime_opening(
-                &lookup_plan.commit.mask_tree,
-                &lookup.mask.root,
-                &mask_positions,
-                &lookup.mask.opening,
-            )?;
+            verify_norm_lookup_first(chain, lookup_plan, lookup, &NORM_LOOKUP_TAGS)?
         }
         (None, None) => {}
         _ => return Err(Error::ShapeMismatch),
@@ -12224,6 +12283,46 @@ fn norm_pointwise_maps(
     Ok((left, right))
 }
 
+/// Resolves the key cells of the norm digit lookup across the committed
+/// rounding and tail messages. The key groups name the message each source
+/// addresses; the caller supplies the unencoded message rows of both groups.
+fn norm_lookup_key_values(
+    plan: &NormPlan,
+    lookup: &crate::proof::hidden_norm_psc::NormLookupPlan,
+    round_rows: &[Vec<Vec<Fp3>>],
+    tail_rows: &[Vec<Vec<Fp3>>],
+) -> Result<Vec<Fp3>> {
+    if lookup.lookup.columns != 1 {
+        return Err(Error::InvalidConfig);
+    }
+    let positions = plan.shape.positions as u64;
+    let round_base = plan.round.as_ref().map(|round| round.group.oracle_base);
+    let tail_base = plan
+        .output
+        .as_ref()
+        .and_then(|output| output.tail.as_ref())
+        .map(|tail| tail.group.oracle_base);
+    let resolve = |source: &crate::proof::lookup::LookupKeySource| -> Result<Fp3> {
+        let in_round = round_base
+            .map(|base| source.oracle >= base && source.oracle < base.saturating_add(positions))
+            .unwrap_or(false);
+        let in_tail = tail_base
+            .map(|base| source.oracle >= base && source.oracle < base.saturating_add(positions))
+            .unwrap_or(false);
+        let rows = match (in_round, in_tail) {
+            (true, false) => round_rows,
+            (false, true) => tail_rows,
+            _ => return Err(Error::StatementMismatch),
+        };
+        rows.get(source.position as usize)
+            .and_then(|message| message.get(source.row as usize))
+            .and_then(|row| row.get(source.place as usize))
+            .copied()
+            .ok_or(Error::ShapeMismatch)
+    };
+    lookup.key.read_with(&lookup.lookup, Fp3::ONE, &resolve)
+}
+
 fn prove_norm_second(
     chain: &mut Chain,
     plan: &NormPlan,
@@ -12267,27 +12366,24 @@ fn prove_norm_second(
             {
                 return Err(Error::StatementMismatch);
             }
-            let seed = draw_lookup_seed(chain)?;
-            let tail_base = plan
+            let seed = draw_lookup_seed(chain, NORM_LOOKUP_SEED_TAG)?;
+            let tail_rows: &[Vec<Vec<Fp3>>] = witness
                 .output
                 .as_ref()
                 .and_then(|output| output.tail.as_ref())
-                .map(|tail| tail.group.oracle_base);
-            let key_rows: &[Vec<Vec<Fp3>>] = if Some(lookup_plan.key_oracle_base) == tail_base {
-                let tail = witness
-                    .output
-                    .as_ref()
-                    .and_then(|output| output.tail.as_ref())
-                    .ok_or(Error::ShapeMismatch)?;
-                &tail.committed.messages
-            } else {
-                &round_witness.messages
-            };
-            let (proof, claims) = crate::proof::lookup::prove_lookup_with_messages(
+                .map(|tail| tail.committed.messages.as_slice())
+                .unwrap_or(&[]);
+            let key_values = norm_lookup_key_values(
+                plan,
+                lookup_plan,
+                &round_witness.committed.messages,
+                tail_rows,
+            )?;
+            let (proof, claims) = crate::proof::lookup::prove_lookup_with_key_values(
                 &lookup_plan.lookup,
                 &lookup_plan.commit,
                 &lookup_plan.key,
-                key_rows,
+                &key_values,
                 &crate::proof::lookup::LookupWitness {
                     bits: lookup_witness.bits.clone(),
                 },
@@ -12599,7 +12695,7 @@ fn verify_norm_second(
                     .ok_or(Error::ShapeMismatch)?,
                 mask: first_lookup.mask.root,
             };
-            let seed = draw_lookup_seed(chain)?;
+            let seed = draw_lookup_seed(chain, NORM_LOOKUP_SEED_TAG)?;
             let claims = crate::proof::lookup::verify_lookup(
                 &lookup_plan.lookup,
                 &lookup_plan.commit,
@@ -12903,25 +12999,28 @@ fn lookup_plain_rows(
     }
     let mut rows = Vec::new();
 
-    // The key-leaf claim expanded on the committed key group cells.
-    let (key_base, key_shape, key_columns) = match lookup_plan.key_group() {
-        Some((base, shape, columns)) => (base, shape, columns),
-        None => (
-            round_plan.group.oracle_base,
-            &round_plan.group.shape,
-            round_plan.group.columns,
-        ),
+    // The key-leaf claim expanded on the committed key group cells. The
+    // frozen-table view keeps no group of its own and uses the rounding group;
+    // the digit lookup names the rounding and tail groups.
+    let groups = if lookup_plan.key_groups().is_empty() {
+        vec![crate::proof::hidden_norm_psc::LookupKeyGroup {
+            oracle_base: round_plan.group.oracle_base,
+            shape: round_plan.group.shape,
+            columns: round_plan.group.columns,
+            positions: norm.shape.positions,
+        }]
+    } else {
+        lookup_plan.key_groups().to_vec()
     };
     let mut key_members = Vec::new();
     for source in &lookup_plan.key_plan().sources {
+        let group = groups
+            .iter()
+            .find(|group| group.covers(source.oracle))
+            .ok_or(Error::StatementMismatch)?;
         let member = bat_of
             .get(&source.oracle)
             .ok_or(Error::StatementMismatch)?;
-        if source.oracle < key_base
-            || source.oracle >= key_base.saturating_add(norm.shape.positions as u64)
-        {
-            return Err(Error::StatementMismatch);
-        }
         if key_members
             .iter()
             .any(|entry: &crate::proof::lookup::KeyClaimMember| {
@@ -12933,8 +13032,8 @@ fn lookup_plain_rows(
         key_members.push(crate::proof::lookup::KeyClaimMember {
             source_oracle: member.source_oracle,
             bat_oracle: member.bat_oracle,
-            shape: key_shape.clone(),
-            columns: key_columns,
+            shape: group.shape.clone(),
+            columns: group.columns,
         });
     }
     rows.push(lookup_plan.key_plan().registration_row(
@@ -14738,6 +14837,55 @@ fn output_tail_plain_rows(
         }
         row.target = output.row_target;
         rows.push(row);
+    }
+    // The clamp distance rows: one per position and column binds each
+    // committed distance row to pre_clamp minus low (and the high side) over
+    // the same committed tail cells. The half-range constants are public.
+    if let Some(clamp) = &tail_plan.clamp {
+        let widths = &tail_plan.widths;
+        let slots = tail_plan.slots()?;
+        let pre_at = widths.quotient
+            + widths.remainder
+            + widths.doubled_remainder
+            + widths.tie_slack
+            + 1
+            + widths.shifted;
+        let low_at = pre_at + widths.pre_clamp;
+        let high_at = low_at + clamp.low;
+        let pre_half = 1u128 << (8 * widths.pre_clamp as u32 - 1);
+        let low_half = 1u128 << (8 * clamp.low as u32 - 1);
+        let high_half = 1u128 << (8 * clamp.high as u32 - 1);
+        let (low, high) = output_plan.clamp.ok_or(Error::InvalidConfig)?;
+        for position in 0..positions {
+            let tail_member = member_for(tail_plan.group.oracle_base + position as u64)?;
+            for column in 0..columns {
+                let base = column * slots;
+                for (bound_at, bound_width, bound_half, bound) in [
+                    (low_at, clamp.low, low_half, low as i128),
+                    (high_at, clamp.high, high_half, high as i128),
+                ] {
+                    let mut coefficients = vec![Fp3::ZERO; tail_rows * tail_ell];
+                    let mut power = Fp3::ONE;
+                    for digit in 0..bound_width {
+                        let at = base + bound_at + digit;
+                        coefficients[at] = coefficients[at].add(&power);
+                        power = power.mul(&Fp3::from_u64(256));
+                    }
+                    let mut power = Fp3::ONE;
+                    for digit in 0..widths.pre_clamp {
+                        let at = base + pre_at + digit;
+                        coefficients[at] = coefficients[at].sub(&power);
+                        power = power.mul(&Fp3::from_u64(256));
+                    }
+                    let mut row = BatRow::new(BatRowKind::Plain);
+                    row.add_term(tail_member.bat_oracle, BatPart::Main, coefficients);
+                    row.target = crate::proof::output_closure::fp3_signed(
+                        bound_half as i128 - pre_half as i128 - bound,
+                    )?;
+                    rows.push(row);
+                }
+            }
+        }
     }
     Ok(rows)
 }
@@ -18394,7 +18542,7 @@ mod merged_tests {
     const TABLE_LOG_N: u32 = 4;
     const TABLE_ELL: u64 = 8;
     const TABLE_R: u64 = 8;
-    const CODE_LOG_N: u32 = 7;
+    const CODE_LOG_N: u32 = 8;
     const CODE_ELL: u64 = 32;
     const CODE_R: u64 = 4;
     const INDEX_MASK_ORACLE: u64 = 30;
@@ -22701,41 +22849,48 @@ mod merged_tests {
         }
     }
 
-    /// Attaches the byte-table lookup over the committed clamp slack digits of
-    /// the output tail. The multiplicity bits are counted from the committed
-    /// tail messages, so the honest fixture commits the same keys the lookup
-    /// argument proves.
+    /// Attaches the byte-table lookup over the committed rounding digits and
+    /// every committed tail digit cell. The multiplicity bits are counted
+    /// from the committed messages, so the honest fixture commits the same
+    /// keys the lookup argument proves.
     fn attach_slack_lookup(plan: &mut HiddenLinPlan, witness: &mut NormWitness) {
         use crate::proof::hidden_norm_psc::{
             norm_own_mask_rows, NormLookupPlan, NormLookupWitness,
         };
 
         let norm = plan.norm.as_ref().unwrap();
+        let round_plan = norm
+            .round
+            .clone()
+            .expect("the fixture carries the rounding rows");
         let tail_plan = norm
             .output
             .as_ref()
             .and_then(|output| output.tail.as_ref())
             .expect("the output fixture carries the tail")
             .clone();
-        let lookup_plan =
-            NormLookupPlan::from_tail_slack(&tail_plan, norm.columns, POSITIONS, &slack_lookup_params())
-                .unwrap();
-        let keys = lookup_plan
-            .key
-            .read(
-                &lookup_plan.lookup,
-                &witness
-                    .output
-                    .as_ref()
-                    .unwrap()
-                    .tail
-                    .as_ref()
-                    .unwrap()
-                    .committed
-                    .messages,
-                Fp3::ONE,
-            )
-            .unwrap();
+        let lookup_plan = NormLookupPlan::from_round_and_tail(
+            &round_plan,
+            &tail_plan,
+            norm.columns,
+            POSITIONS,
+            &slack_lookup_params(),
+        )
+        .unwrap();
+        let keys = {
+            let round_rows = &witness.round.as_ref().unwrap().messages;
+            let tail_rows = &witness
+                .output
+                .as_ref()
+                .unwrap()
+                .tail
+                .as_ref()
+                .unwrap()
+                .committed
+                .messages;
+            norm_lookup_key_values(plan.norm.as_ref().unwrap(), &lookup_plan, round_rows, tail_rows)
+                .unwrap()
+        };
         let bits = slack_lookup_bits(&lookup_plan.lookup, &keys);
         let lookup_mask_rows = lookup_plan.commit.mask_rows;
         plan.norm.as_mut().unwrap().lookup = Some(lookup_plan);
@@ -22798,10 +22953,34 @@ mod merged_tests {
             .as_ref()
             .unwrap()
             .group;
-        assert_eq!(lookup_plan.key_oracle_base, tail_group.oracle_base);
-        assert_eq!(lookup_plan.key_shape, tail_group.shape);
-        assert_eq!(lookup_plan.key_columns, tail_group.columns);
-        assert_eq!(lookup_plan.key.sources.len() % 4, 0);
+        let round_group = &plan.norm.as_ref().unwrap().round.as_ref().unwrap().group;
+        assert_eq!(lookup_plan.key_groups.len(), 2);
+        assert_eq!(lookup_plan.key_groups[0].oracle_base, round_group.oracle_base);
+        assert_eq!(lookup_plan.key_groups[0].shape, round_group.shape);
+        assert_eq!(lookup_plan.key_groups[0].columns, round_group.columns);
+        assert_eq!(lookup_plan.key_groups[1].oracle_base, tail_group.oracle_base);
+        assert_eq!(lookup_plan.key_groups[1].shape, tail_group.shape);
+        assert_eq!(lookup_plan.key_groups[1].columns, tail_group.columns);
+        let positions = plan.norm.as_ref().unwrap().shape.positions as u64;
+        let within = |source: &crate::proof::lookup::LookupKeySource, base: u64| {
+            source.oracle >= base && source.oracle < base.saturating_add(positions)
+        };
+        assert!(
+            lookup_plan
+                .key
+                .sources
+                .iter()
+                .any(|source| within(source, round_group.oracle_base)),
+            "the lookup keys must cover the rounding digits"
+        );
+        assert!(
+            lookup_plan
+                .key
+                .sources
+                .iter()
+                .any(|source| within(source, tail_group.oracle_base)),
+            "the lookup keys must cover the tail digits"
+        );
 
         let (messages, hidden_witness) = prove_hidden_lin_hidden_with_norm_and_params(
             &plan,
@@ -22970,21 +23149,39 @@ mod merged_tests {
             .unwrap()
             .clone();
 
+        let round = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .round
+            .as_ref()
+            .unwrap()
+            .clone();
         let mut params = slack_lookup_params();
         params.table_identity = Digest([0x11; 32]);
-        assert!(NormLookupPlan::from_tail_slack(&tail, COLUMNS, POSITIONS, &params).is_err());
+        assert!(
+            NormLookupPlan::from_round_and_tail(&round, &tail, COLUMNS, POSITIONS, &params)
+                .is_err()
+        );
 
         let mut params = slack_lookup_params();
         params.mask_oracle = params.bits_oracle;
-        assert!(NormLookupPlan::from_tail_slack(&tail, COLUMNS, POSITIONS, &params).is_err());
+        assert!(
+            NormLookupPlan::from_round_and_tail(&round, &tail, COLUMNS, POSITIONS, &params)
+                .is_err()
+        );
 
         let mut params = slack_lookup_params();
         params.group = 0;
-        assert!(NormLookupPlan::from_tail_slack(&tail, COLUMNS, POSITIONS, &params).is_err());
+        assert!(
+            NormLookupPlan::from_round_and_tail(&round, &tail, COLUMNS, POSITIONS, &params)
+                .is_err()
+        );
 
         let mut without_clamp = tail.clone();
         without_clamp.clamp = None;
-        assert!(NormLookupPlan::from_tail_slack(
+        assert!(NormLookupPlan::from_round_and_tail(
+            &round,
             &without_clamp,
             COLUMNS,
             POSITIONS,
@@ -23009,7 +23206,50 @@ mod merged_tests {
             .lookup
             .as_mut()
             .unwrap()
-            .key_oracle_base = out_base;
+            .key_groups[0]
+            .oracle_base = out_base;
+        assert!(changed.validate().is_err());
+
+        // The key map must address every digit cell of both groups in the
+        // canonical order; dropping or redirecting one cell is a plan fault.
+        let mut changed = plan.clone();
+        changed
+            .norm
+            .as_mut()
+            .unwrap()
+            .lookup
+            .as_mut()
+            .unwrap()
+            .key
+            .sources
+            .pop();
+        assert!(changed.validate().is_err());
+
+        let mut changed = plan.clone();
+        changed
+            .norm
+            .as_mut()
+            .unwrap()
+            .lookup
+            .as_mut()
+            .unwrap()
+            .key
+            .sources[0]
+            .place ^= 1;
+        assert!(changed.validate().is_err());
+
+        let mut changed = plan.clone();
+        let sources = &mut changed
+            .norm
+            .as_mut()
+            .unwrap()
+            .lookup
+            .as_mut()
+            .unwrap()
+            .key
+            .sources;
+        let last = sources.len() - 1;
+        sources[last].row ^= 1;
         assert!(changed.validate().is_err());
     }
 
@@ -24266,6 +24506,495 @@ mod merged_tests {
             proved.is_err(),
             "a claim mask entry that differs from the committed mask message must not prove"
         );
+    }
+
+    fn group_slots(
+        shape: &WShape,
+        messages: &[Vec<Vec<Fp3>>],
+        columns: u64,
+    ) -> Vec<Vec<Fp3>> {
+        let rows = usize::try_from(shape.main_rows).unwrap();
+        let ell = usize::try_from(shape.code.ell).unwrap();
+        let columns = usize::try_from(columns).unwrap();
+        messages
+            .iter()
+            .map(|message| {
+                let mut slots = vec![Fp3::ZERO; columns];
+                for (slot, value) in slots.iter_mut().enumerate() {
+                    if slot / rows < ell {
+                        *value = message[slot % rows][slot / rows];
+                    }
+                }
+                slots
+            })
+            .collect()
+    }
+
+    #[test]
+    fn norm_malicious_tail_digit_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = slack_lookup_fixture(&activation);
+        let tail_plan = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .tail
+            .as_ref()
+            .unwrap()
+            .clone();
+        let mut changed = witness.clone();
+        let mut values = group_slots(
+            &tail_plan.group.shape,
+            &changed
+                .output
+                .as_ref()
+                .unwrap()
+                .tail
+                .as_ref()
+                .unwrap()
+                .committed
+                .messages,
+            tail_plan.group.columns,
+        );
+        values[0][0] = Fp3::from_u64(300);
+        let mut coins = ByteMaskCoins::new(Digest([0xaa; 32])).unwrap();
+        let tampered = commit_norm_group(&tail_plan.group, &values, &mut coins);
+        changed
+            .output
+            .as_mut()
+            .unwrap()
+            .tail
+            .as_mut()
+            .unwrap()
+            .committed = tampered;
+        let proved = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &changed,
+            &mut params,
+        );
+        assert!(
+            proved.is_err(),
+            "a tail digit that is not a byte must not prove"
+        );
+    }
+
+    #[test]
+    fn norm_malicious_round_digit_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = slack_lookup_fixture(&activation);
+        let round_plan = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .round
+            .as_ref()
+            .unwrap()
+            .clone();
+        let mut changed = witness.clone();
+        let mut values = group_slots(
+            &round_plan.group.shape,
+            &changed
+                .round
+                .as_ref()
+                .unwrap()
+                .committed
+                .messages,
+            round_plan.group.columns,
+        );
+        values[0][round_plan.layout.slots.mean_digits] = Fp3::from_u64(300);
+        let mut coins = ByteMaskCoins::new(Digest([0xab; 32])).unwrap();
+        let tampered = commit_norm_group(&round_plan.group, &values, &mut coins);
+        changed.round.as_mut().unwrap().committed = tampered.committed;
+        let proved = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &changed,
+            &mut params,
+        );
+        assert!(
+            proved.is_err(),
+            "a rounding digit that is not a byte must not prove"
+        );
+    }
+
+    #[test]
+    fn norm_malicious_distance_slot_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = slack_lookup_fixture(&activation);
+        let tail_plan = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .tail
+            .as_ref()
+            .unwrap()
+            .clone();
+        let groups = crate::proof::hidden_norm_psc::tail_digit_groups(&tail_plan).unwrap();
+        let low_at = groups[6].0;
+        let mut changed = witness.clone();
+        let mut values = group_slots(
+            &tail_plan.group.shape,
+            &changed
+                .output
+                .as_ref()
+                .unwrap()
+                .tail
+                .as_ref()
+                .unwrap()
+                .committed
+                .messages,
+            tail_plan.group.columns,
+        );
+        values[0][low_at] = values[0][low_at].add(&Fp3::ONE);
+        let mut coins = ByteMaskCoins::new(Digest([0xac; 32])).unwrap();
+        let tampered = commit_norm_group(&tail_plan.group, &values, &mut coins);
+        changed
+            .output
+            .as_mut()
+            .unwrap()
+            .tail
+            .as_mut()
+            .unwrap()
+            .committed = tampered;
+        let proved = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &changed,
+            &mut params,
+        );
+        assert!(
+            proved.is_err(),
+            "a distance slot that differs from pre_clamp minus low must not prove"
+        );
+    }
+
+    #[test]
+    fn norm_malicious_out_shift_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = slack_lookup_fixture(&activation);
+        let output_plan = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .clone();
+        let mut changed = witness.clone();
+        let mut values = group_slots(
+            &output_plan.out.shape,
+            &changed.output.as_ref().unwrap().out.committed.messages,
+            output_plan.out.columns,
+        );
+        values[0][0] = values[0][0].add(&Fp3::ONE);
+        let mut coins = ByteMaskCoins::new(Digest([0xad; 32])).unwrap();
+        let tampered = commit_norm_group(&output_plan.out, &values, &mut coins);
+        changed.output.as_mut().unwrap().out.committed = tampered.committed;
+        let proved = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &changed,
+            &mut params,
+        );
+        match proved {
+            Err(_) => {}
+            Ok((messages, hidden_witness)) => {
+                let mut verifier_plan = plan.clone();
+                verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+                assert!(
+                    verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &messages).is_err(),
+                    "a shifted hidden output must not verify"
+                );
+            }
+        }
+    }
+
+    fn malicious_out_shift_fixture(
+        activation: &CommittedActivation,
+    ) -> (HiddenLinPlan, NormWitness, ParamTables) {
+        let (plan, witness, params) = clamp_boundary_fixture(activation, -2, 2);
+        let output_plan = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .clone();
+        let mut changed = witness;
+        let mut values = group_slots(
+            &output_plan.out.shape,
+            &changed.output.as_ref().unwrap().out.committed.messages,
+            output_plan.out.columns,
+        );
+        values[0][0] = values[0][0].add(&Fp3::ONE);
+        let mut coins = ByteMaskCoins::new(Digest([0xae; 32])).unwrap();
+        let tampered = commit_norm_group(&output_plan.out, &values, &mut coins);
+        changed.output.as_mut().unwrap().out.committed = tampered.committed;
+        (plan, changed, params)
+    }
+
+    #[test]
+    fn norm_malicious_out_shift_at_the_collapsed_interval_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = malicious_out_shift_fixture(&activation);
+        let proved = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+            &mut params,
+        );
+        match proved {
+            Err(_) => {}
+            Ok((messages, hidden_witness)) => {
+                let mut verifier_plan = plan.clone();
+                verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+                assert!(
+                    verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &messages).is_err(),
+                    "a shifted hidden output at the collapsed interval must not verify"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn norm_malicious_variance_digit_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness, mut params) = slack_lookup_fixture(&activation);
+        let round_plan = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .round
+            .as_ref()
+            .unwrap()
+            .clone();
+        let mut changed = witness.clone();
+        let mut values = group_slots(
+            &round_plan.group.shape,
+            &changed.round.as_ref().unwrap().committed.messages,
+            round_plan.group.columns,
+        );
+        values[0][round_plan.layout.slots.variance_digits] = Fp3::from_u64(300);
+        let mut coins = ByteMaskCoins::new(Digest([0xaf; 32])).unwrap();
+        let tampered = commit_norm_group(&round_plan.group, &values, &mut coins);
+        changed.round.as_mut().unwrap().committed = tampered.committed;
+        let proved = prove_hidden_lin_hidden_with_norm_and_params(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &changed,
+            &mut params,
+        );
+        assert!(
+            proved.is_err(),
+            "a variance digit that is not a byte must not prove"
+        );
+    }
+
+    fn rejects_malicious_witness(
+        activation: &CommittedActivation,
+        plan: &HiddenLinPlan,
+        witness: &NormWitness,
+        params: &mut ParamTables,
+        context: &str,
+    ) {
+        let mut table = table();
+        let proved = prove_hidden_lin_hidden_with_norm_and_params(
+            plan,
+            activation,
+            &mut table,
+            Digest([0x71; 32]),
+            witness,
+            params,
+        );
+        match proved {
+            Err(_) => {}
+            Ok((messages, hidden_witness)) => {
+                let mut verifier_plan = plan.clone();
+                verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
+                assert!(
+                    verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &messages).is_err(),
+                    "{context}"
+                );
+            }
+        }
+    }
+
+    fn tampered_tail_digits_fixture(
+        activation: &CommittedActivation,
+        at: usize,
+        delta: u64,
+        coin: u8,
+    ) -> (HiddenLinPlan, NormWitness, ParamTables) {
+        let (plan, witness, params) = slack_lookup_fixture(activation);
+        let tail_plan = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .tail
+            .as_ref()
+            .unwrap()
+            .clone();
+        let mut changed = witness;
+        let mut values = group_slots(
+            &tail_plan.group.shape,
+            &changed
+                .output
+                .as_ref()
+                .unwrap()
+                .tail
+                .as_ref()
+                .unwrap()
+                .committed
+                .messages,
+            tail_plan.group.columns,
+        );
+        values[0][at] = values[0][at].add(&Fp3::from_u64(delta));
+        let mut coins = ByteMaskCoins::new(Digest([coin; 32])).unwrap();
+        let tampered = commit_norm_group(&tail_plan.group, &values, &mut coins);
+        changed
+            .output
+            .as_mut()
+            .unwrap()
+            .tail
+            .as_mut()
+            .unwrap()
+            .committed = tampered;
+        (plan, changed, params)
+    }
+
+    #[test]
+    fn norm_malicious_tail_digit_classes_are_rejected() {
+        let activation = activation();
+        let (base_plan, _, _) = slack_lookup_fixture(&activation);
+        let tail_plan = base_plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .tail
+            .as_ref()
+            .unwrap()
+            .clone();
+        let groups = crate::proof::hidden_norm_psc::tail_digit_groups(&tail_plan).unwrap();
+        let cases = [
+            ("a quotient digit that is not a byte", groups[0].0),
+            ("a remainder digit that is not a byte", groups[1].0),
+            ("a pre clamp digit that is not a byte", groups[5].0),
+        ];
+        for (index, (context, at)) in cases.iter().enumerate() {
+            let (plan, witness, mut params) =
+                tampered_tail_digits_fixture(&activation, *at, 300, 0xb0 + index as u8);
+            rejects_malicious_witness(&activation, &plan, &witness, &mut params, context);
+        }
+    }
+
+    #[test]
+    fn norm_malicious_tie_slack_digit_is_rejected() {
+        let activation = activation();
+        let (base_plan, _, _) = slack_lookup_fixture(&activation);
+        let tail_plan = base_plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .tail
+            .as_ref()
+            .unwrap()
+            .clone();
+        let groups = crate::proof::hidden_norm_psc::tail_digit_groups(&tail_plan).unwrap();
+        let (plan, witness, mut params) =
+            tampered_tail_digits_fixture(&activation, groups[3].0, 1, 0xb8);
+        rejects_malicious_witness(
+            &activation,
+            &plan,
+            &witness,
+            &mut params,
+            "a tie slack digit that breaks the doubled remainder relation",
+        );
+    }
+
+    fn tampered_out_fixture(
+        activation: &CommittedActivation,
+        low: i64,
+        high: i64,
+        delta: i64,
+        coin: u8,
+    ) -> (HiddenLinPlan, NormWitness, ParamTables) {
+        let (plan, witness, params) = clamp_boundary_fixture(activation, low, high);
+        let output_plan = plan
+            .norm
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .clone();
+        let mut changed = witness;
+        let mut values = group_slots(
+            &output_plan.out.shape,
+            &changed.output.as_ref().unwrap().out.committed.messages,
+            output_plan.out.columns,
+        );
+        values[0][0] = if delta >= 0 {
+            values[0][0].add(&Fp3::from_u64(delta as u64))
+        } else {
+            values[0][0].sub(&Fp3::from_u64(delta.unsigned_abs()))
+        };
+        let mut coins = ByteMaskCoins::new(Digest([coin; 32])).unwrap();
+        let tampered = commit_norm_group(&output_plan.out, &values, &mut coins);
+        changed.output.as_mut().unwrap().out.committed = tampered.committed;
+        (plan, changed, params)
+    }
+
+    #[test]
+    fn norm_malicious_boundary_and_collapsed_clamp_witnesses_are_rejected() {
+        let activation = activation();
+        let (_, base, _) = norm_output_fixture(&activation);
+        let pre = base.output.as_ref().unwrap().rows[0].pre_clamp[0];
+        let pre = i64::try_from(pre).unwrap();
+        let cases = [
+            ("a collapsed interval admits only the bound", (pre, pre, 1i64)),
+            ("a value one below the low bound must clamp", (pre + 1, pre + 2, -1)),
+            ("a value one above the high bound must clamp", (pre - 2, pre - 1, 1)),
+        ];
+        for (index, (context, (low, high, delta))) in cases.iter().enumerate() {
+            let (plan, witness, mut params) =
+                tampered_out_fixture(&activation, *low, *high, *delta, 0xbc + index as u8);
+            rejects_malicious_witness(&activation, &plan, &witness, &mut params, context);
+        }
     }
 
     #[test]

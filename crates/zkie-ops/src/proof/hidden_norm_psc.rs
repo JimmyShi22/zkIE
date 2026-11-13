@@ -26,7 +26,7 @@ use zkie_engine::pcs::request::fold::{ByteMaskCoins, MaskCoins};
 use zkie_engine::pcs::request::field::{Fp3, MODULUS};
 use zkie_engine::pcs::request::table::{ColumnOpening, SampleSeed};
 use zkie_engine::pcs::request::runtime_tree::{
-    RuntimePartRows, RuntimeTree, RuntimeTreeOpening, RuntimeTreePart, RuntimeTreePlan,
+    RuntimePartRows, RuntimeTree, RuntimeTreePart, RuntimeTreePlan,
 };
 use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
 
@@ -46,7 +46,7 @@ use crate::proof::lookup_messages::LookupCommitPlan;
 use crate::proof::norm_param_table::{
     NormParamClaimPlan, NormParamTableIdentity, NormParamTablesPlan,
 };
-use crate::proof::output_closure::{CommittedValueGroup, RetainedTrees};
+use crate::proof::output_closure::CommittedValueGroup;
 use crate::registry::{RSQRT_COARSE, RSQRT_COARSE_END, RSQRT_FINE, RSQRT_HALF, RSQRT_SHIFT};
 use crate::proof::psc::{
     hp_entries, prove_dot_sumcheck, psc_variables, verify_psc_transcript, DotClaim,
@@ -1117,7 +1117,7 @@ fn fp3_signed(value: i128) -> Result<Fp3> {
 // sumcheck and the row binding.
 
 /// Version of the integrated norm plan and first message.
-pub const NORM_BIND_VERSION: u64 = 13;
+pub const NORM_BIND_VERSION: u64 = 14;
 
 /// The relation indices the bound core supports. The map construction of
 /// every relation is fixed by the relation index; the plan may list only
@@ -1171,25 +1171,60 @@ pub struct NormLookupPlan {
     pub lookup: LookupPlan,
     pub commit: LookupCommitPlan,
     pub key: crate::proof::lookup::LookupKeyPlan,
-    /// The committed group the key sources address: its first oracle, its
-    /// message shape and its column count.
-    pub key_oracle_base: u64,
-    pub key_shape: WShape,
-    pub key_columns: u64,
+    /// The committed groups the key sources address. A key map that covers the
+    /// rounding digits and the tail digits has two groups; the frozen-table
+    /// view keeps none and falls back to the rounding group at the row
+    /// registration.
+    pub key_groups: Vec<LookupKeyGroup>,
+}
+
+/// One committed message group a lookup key map addresses: its first oracle,
+/// its message shape, its column count and its position count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LookupKeyGroup {
+    pub oracle_base: u64,
+    pub shape: WShape,
+    pub columns: u64,
+    pub positions: u32,
+}
+
+impl LookupKeyGroup {
+    pub fn covers(&self, oracle: u64) -> bool {
+        oracle >= self.oracle_base
+            && oracle < self.oracle_base.saturating_add(self.positions as u64)
+    }
+
+    fn fault(&self) -> Option<&'static str> {
+        if self.oracle_base == 0
+            || self.positions == 0
+            || self.columns == 0
+            || self.shape.fault(self.columns, self.positions).is_some()
+        {
+            return Some("a lookup key group is not a message group");
+        }
+        None
+    }
 }
 
 impl NormLookupPlan {
     pub fn validate(&self) -> Result<()> {
         self.lookup.validate()?;
         self.key.validate(&self.lookup)?;
-        if self.key_oracle_base == 0
-            || self.key_columns == 0
-            || self.key_shape.fault(self.key_columns, 1).is_some()
-        {
+        if self.key_groups.is_empty() {
+            if !self.key.sources.is_empty() {
+                return Err(Error::InvalidConfig);
+            }
+        } else if self.key_groups.iter().any(|group| group.fault().is_some()) {
             return Err(Error::InvalidConfig);
         }
         for source in &self.key.sources {
-            if source.oracle < self.key_oracle_base {
+            if self
+                .key_groups
+                .iter()
+                .filter(|group| group.covers(source.oracle))
+                .count()
+                != 1
+            {
                 return Err(Error::InvalidConfig);
             }
         }
@@ -1206,9 +1241,13 @@ impl NormLookupPlan {
     pub fn digest(&self) -> Digest {
         let mut writer = CanonicalWriter::new();
         writer.put_bytes(&self.lookup.digest());
-        writer.put_u64(self.key_oracle_base);
-        put_wshape(&mut writer, &self.key_shape);
-        writer.put_u64(self.key_columns);
+        writer.put_u64(self.key_groups.len() as u64);
+        for group in &self.key_groups {
+            writer.put_u64(group.oracle_base);
+            writer.put_u64(group.columns);
+            writer.put_u64(group.positions as u64);
+            put_wshape(&mut writer, &group.shape);
+        }
         writer.put_u64(self.key.sources.len() as u64);
         for source in &self.key.sources {
             writer.put_u64(source.column as u64);
@@ -1457,8 +1496,10 @@ pub trait NormLookupView {
     fn lookup_plan(&self) -> &LookupPlan;
     fn commit_plan(&self) -> &LookupCommitPlan;
     fn key_plan(&self) -> &LookupKeyPlan;
-    /// The committed group the key sources address, when the plan fixes one.
-    fn key_group(&self) -> Option<(u64, &WShape, u64)>;
+    /// The committed groups the key sources address, when the plan fixes
+    /// them. The frozen-table view keeps none and falls back to the rounding
+    /// group at the row registration.
+    fn key_groups(&self) -> &[LookupKeyGroup];
 }
 
 impl NormLookupView for NormLookupPlan {
@@ -1474,8 +1515,8 @@ impl NormLookupView for NormLookupPlan {
         &self.key
     }
 
-    fn key_group(&self) -> Option<(u64, &WShape, u64)> {
-        Some((self.key_oracle_base, &self.key_shape, self.key_columns))
+    fn key_groups(&self) -> &[LookupKeyGroup] {
+        &self.key_groups
     }
 }
 
@@ -1492,8 +1533,8 @@ impl NormLookupView for NormRstdPlan {
         &self.key
     }
 
-    fn key_group(&self) -> Option<(u64, &WShape, u64)> {
-        None
+    fn key_groups(&self) -> &[LookupKeyGroup] {
+        &[]
     }
 }
 
@@ -1623,15 +1664,7 @@ pub struct NormLookupParams {
 }
 
 impl NormLookupPlan {
-    /// Sizes and builds the lookup plan from the rounding layout and the
-    /// parent plan values. The key map covers every committed digit slot; the
-    /// multiplicity-bit shape and mask rows follow from the derived key and
-    /// plane counts, the parent codes and the mask budget.
-    pub fn from_round(
-        round: &NormRoundPlan,
-        positions: u32,
-        params: &NormLookupParams,
-    ) -> Result<Self> {
+    fn check_params(params: &NormLookupParams) -> Result<()> {
         if params.bits_oracle == 0
             || params.mask_oracle == 0
             || params.bits_oracle == params.mask_oracle
@@ -1643,6 +1676,82 @@ impl NormLookupPlan {
         if params.code.r < 1 || params.mask_code.r < 1 {
             return Err(Error::InvalidConfig);
         }
+        Ok(())
+    }
+
+    fn from_parts(
+        lookup: LookupPlan,
+        key: crate::proof::lookup::LookupKeyPlan,
+        key_groups: Vec<LookupKeyGroup>,
+        params: &NormLookupParams,
+    ) -> Result<Self> {
+        Self::check_params(params)?;
+        lookup.validate()?;
+        let bit_count = lookup
+            .planes()?
+            .checked_mul(lookup.table_rows()?)
+            .ok_or(Error::ResourceLimit)?;
+        let bits_shape = WShape::new(
+            bit_count as u64,
+            params.code,
+            1,
+            1,
+            params.salt_bytes,
+            params.bits_tree,
+            params.leaf_class,
+            params.run,
+            params.configuration,
+        )?;
+        if bits_shape.main_rows > (1u64 << params.code.log_n) {
+            return Err(Error::InvalidConfig);
+        }
+        let mask_rows = lookup_mask_rows(&lookup, params.mask_code)?;
+        let mask_symbols = mask_rows
+            .checked_mul(zkie_engine::pcs::request::field::E_DEGREE as u64)
+            .ok_or(Error::ResourceLimit)?;
+        let mask_tree = RuntimeTreePlan {
+            tree_number: params.mask_tree,
+            leaf_class: params.leaf_class,
+            log_n: params.mask_code.log_n,
+            log_n_zk: params.mask_code.log_n,
+            parts: vec![RuntimeTreePart {
+                main_symbols: 0,
+                mask_symbols,
+            }],
+            salt_bytes: params.salt_bytes,
+            run: params.run,
+            configuration: params.configuration,
+        };
+        let plan = Self {
+            lookup,
+            commit: LookupCommitPlan {
+                bits_shape,
+                bits_oracle: params.bits_oracle,
+                group: params.group,
+                bits_openings: 1,
+                mask_oracle: params.mask_oracle,
+                mask_code: params.mask_code,
+                mask_rows,
+                mask_openings: 1,
+                mask_tree,
+            },
+            key,
+            key_groups,
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    /// Sizes and builds the lookup plan from the rounding layout and the
+    /// parent plan values. The key map covers every committed digit slot; the
+    /// multiplicity-bit shape and mask rows follow from the derived key and
+    /// plane counts, the parent codes and the mask budget.
+    pub fn from_round(
+        round: &NormRoundPlan,
+        positions: u32,
+        params: &NormLookupParams,
+    ) -> Result<Self> {
+        Self::check_params(params)?;
         let digits = round.layout.digit_slots()?;
         let slots = digits
             .len()
@@ -1655,7 +1764,6 @@ impl NormLookupPlan {
             table_log: 8,
             columns: 1,
         };
-        lookup.validate()?;
         let key = round_digit_lookup_key(
             round,
             positions,
@@ -1663,168 +1771,203 @@ impl NormLookupPlan {
             params.padding_byte,
             params.table_identity,
         )?;
-        let bit_count = lookup
-            .planes()?
-            .checked_mul(lookup.table_rows()?)
-            .ok_or(Error::ResourceLimit)?;
-        let bits_shape = WShape::new(
-            bit_count as u64,
-            params.code,
-            1,
-            1,
-            params.salt_bytes,
-            params.bits_tree,
-            params.leaf_class,
-            params.run,
-            params.configuration,
-        )?;
-        if bits_shape.main_rows > (1u64 << params.code.log_n) {
-            return Err(Error::InvalidConfig);
-        }
-        let mask_rows = lookup_mask_rows(&lookup, params.mask_code)?;
-        let mask_symbols = mask_rows
-            .checked_mul(zkie_engine::pcs::request::field::E_DEGREE as u64)
-            .ok_or(Error::ResourceLimit)?;
-        let mask_tree = RuntimeTreePlan {
-            tree_number: params.mask_tree,
-            leaf_class: params.leaf_class,
-            log_n: params.mask_code.log_n,
-            log_n_zk: params.mask_code.log_n,
-            parts: vec![RuntimeTreePart {
-                main_symbols: 0,
-                mask_symbols,
-            }],
-            salt_bytes: params.salt_bytes,
-            run: params.run,
-            configuration: params.configuration,
+        let group = LookupKeyGroup {
+            oracle_base: round.group.oracle_base,
+            shape: round.group.shape,
+            columns: round.group.columns,
+            positions,
         };
-        let key_oracle_base = round.group.oracle_base;
-        let key_shape = round.group.shape;
-        let key_columns = round.group.columns;
-        let plan = Self {
-            lookup,
-            commit: LookupCommitPlan {
-                bits_shape,
-                bits_oracle: params.bits_oracle,
-                group: params.group,
-                bits_openings: 1,
-                mask_oracle: params.mask_oracle,
-                mask_code: params.mask_code,
-                mask_rows,
-                mask_openings: 1,
-                mask_tree,
-            },
-            key,
-            key_oracle_base,
-            key_shape,
-            key_columns,
-        };
-        plan.validate()?;
-        Ok(plan)
+        Self::from_parts(lookup, key, vec![group], params)
     }
 
-    /// Sizes and builds the byte-table lookup over the committed clamp slack
-    /// digits of the output tail. Every key reads one strict or non-strict
-    /// sign-consistency slack digit cell of the tail group, so the key group
-    /// is the tail group: the key-claim rows and the prover key-row selection
-    /// address the committed tail messages. The table is the public byte
-    /// table; the clamp widths and the table identity are trusted plan values.
-    pub fn from_tail_slack(
+    /// Sizes and builds one byte-table lookup that covers the rounding digits
+    /// and every tail digit cell. The key map spans two committed groups: the
+    /// rounding group and the output tail group. Both groups are bound in the
+    /// plan digest, so the integrated chain proves every digit of both
+    /// messages is a byte.
+    pub fn from_round_and_tail(
+        round: &NormRoundPlan,
         tail: &NormOutputTailPlan,
         columns: u64,
         positions: u32,
         params: &NormLookupParams,
     ) -> Result<Self> {
-        if params.bits_oracle == 0
-            || params.mask_oracle == 0
-            || params.bits_oracle == params.mask_oracle
-            || params.group == 0
-            || params.bits_tree == params.mask_tree
+        Self::check_params(params)?;
+        if params.table_identity != crate::proof::lookup::BYTE_TABLE_IDENTITY
+            || params.padding_byte > 255
+            || positions == 0
         {
             return Err(Error::InvalidConfig);
         }
-        if params.code.r < 1 || params.mask_code.r < 1 || positions == 0 {
-            return Err(Error::InvalidConfig);
-        }
-        if params.table_identity != crate::proof::lookup::BYTE_TABLE_IDENTITY {
-            return Err(Error::InvalidConfig);
-        }
-        let clamp = tail.clamp.as_ref().ok_or(Error::InvalidConfig)?;
         if tail.group.columns != tail.columns(columns)?
             || tail.group.fault(positions).is_some()
         {
             return Err(Error::InvalidConfig);
         }
-        let digits = clamp
-            .low_strict
-            .checked_add(clamp.low_nonstrict)
-            .and_then(|value| value.checked_add(clamp.high_strict))
-            .and_then(|value| value.checked_add(clamp.high_nonstrict))
+        let round_slots = round
+            .layout
+            .digit_slots()?
+            .len()
+            .checked_mul(positions as usize)
             .ok_or(Error::ResourceLimit)?;
-        let slots = usize::try_from(columns)
-            .map_err(|_| Error::ResourceLimit)?
-            .checked_mul(digits)
-            .and_then(|value| value.checked_mul(positions as usize))
+        let tail_slots = tail_digit_count(tail, positions, columns)?;
+        let total = round_slots
+            .checked_add(tail_slots)
             .ok_or(Error::ResourceLimit)?;
-        let (_, mu) = lookup_parameters(slots)?;
-        let (lookup, key) =
-            tail_slack_lookup_plan(tail, positions, columns, params.table_identity, mu)?;
-        let bit_count = lookup
-            .planes()?
-            .checked_mul(lookup.table_rows()?)
-            .ok_or(Error::ResourceLimit)?;
-        let bits_shape = WShape::new(
-            bit_count as u64,
-            params.code,
-            1,
-            1,
-            params.salt_bytes,
-            params.bits_tree,
-            params.leaf_class,
-            params.run,
-            params.configuration,
+        let (key_bits, mu) = lookup_parameters(total)?;
+        let lookup = LookupPlan {
+            key_bits,
+            mu,
+            table_log: 8,
+            columns: 1,
+        };
+        let mut key = round_digit_lookup_key(
+            round,
+            positions,
+            key_bits,
+            params.padding_byte,
+            params.table_identity,
         )?;
-        if bits_shape.main_rows > (1u64 << params.code.log_n) {
-            return Err(Error::InvalidConfig);
-        }
-        let mask_rows = lookup_mask_rows(&lookup, params.mask_code)?;
-        let mask_symbols = mask_rows
-            .checked_mul(zkie_engine::pcs::request::field::E_DEGREE as u64)
-            .ok_or(Error::ResourceLimit)?;
-        let mask_tree = RuntimeTreePlan {
-            tree_number: params.mask_tree,
-            leaf_class: params.leaf_class,
-            log_n: params.mask_code.log_n,
-            log_n_zk: params.mask_code.log_n,
-            parts: vec![RuntimeTreePart {
-                main_symbols: 0,
-                mask_symbols,
-            }],
-            salt_bytes: params.salt_bytes,
-            run: params.run,
-            configuration: params.configuration,
-        };
-        let plan = Self {
-            lookup,
-            commit: LookupCommitPlan {
-                bits_shape,
-                bits_oracle: params.bits_oracle,
-                group: params.group,
-                bits_openings: 1,
-                mask_oracle: params.mask_oracle,
-                mask_code: params.mask_code,
-                mask_rows,
-                mask_openings: 1,
-                mask_tree,
+        let tail_key = tail_digit_lookup_key(
+            tail,
+            positions,
+            columns,
+            key_bits,
+            params.padding_byte,
+            params.table_identity,
+        )?;
+        key.sources.extend(tail_key.sources);
+        let groups = vec![
+            LookupKeyGroup {
+                oracle_base: round.group.oracle_base,
+                shape: round.group.shape,
+                columns: round.group.columns,
+                positions,
             },
-            key,
-            key_oracle_base: tail.group.oracle_base,
-            key_shape: tail.group.shape,
-            key_columns: tail.group.columns,
-        };
-        plan.validate()?;
-        Ok(plan)
+            LookupKeyGroup {
+                oracle_base: tail.group.oracle_base,
+                shape: tail.group.shape,
+                columns: tail.group.columns,
+                positions,
+            },
+        ];
+        Self::from_parts(lookup, key, groups, params)
     }
+}
+
+/// The digit cells of one tail column: quotient, remainder, doubled remainder,
+/// tie slack, shifted value, pre-clamp value and the two clamp distance rows.
+/// The selectors are excluded because the booleanity and sign-consistency
+/// relations force them to zero or one.
+pub fn tail_digit_groups(tail: &NormOutputTailPlan) -> Result<Vec<(usize, usize)>> {
+    let clamp = tail.clamp.as_ref().ok_or(Error::InvalidConfig)?;
+    let widths = &tail.widths;
+    let q_at = 0usize;
+    let r_at = widths.quotient;
+    let u_at = r_at + widths.remainder;
+    let w_at = u_at + widths.doubled_remainder;
+    let sh_at = w_at + widths.tie_slack + 1;
+    let pre_at = sh_at + widths.shifted;
+    let low_at = pre_at + widths.pre_clamp;
+    let high_at = low_at + clamp.low;
+    Ok(vec![
+        (q_at, widths.quotient),
+        (r_at, widths.remainder),
+        (u_at, widths.doubled_remainder),
+        (w_at, widths.tie_slack),
+        (sh_at, widths.shifted),
+        (pre_at, widths.pre_clamp),
+        (low_at, clamp.low),
+        (high_at, clamp.high),
+    ])
+}
+
+/// The number of digit key cells of the tail group and column domain.
+pub fn tail_digit_count(
+    tail: &NormOutputTailPlan,
+    positions: u32,
+    columns: u64,
+) -> Result<usize> {
+    let groups = tail_digit_groups(tail)?;
+    let digits = groups
+        .iter()
+        .try_fold(0usize, |sum, (_, width)| sum.checked_add(*width))
+        .ok_or(Error::ResourceLimit)?;
+    usize::try_from(columns)
+        .map_err(|_| Error::ResourceLimit)?
+        .checked_mul(digits)
+        .and_then(|value| value.checked_mul(positions as usize))
+        .ok_or(Error::ResourceLimit)
+}
+
+/// The trusted key map of the byte lookup over every tail digit cell. The keys
+/// are ordered position-major, then column-major, then by the digit groups.
+pub fn tail_digit_lookup_key(
+    tail: &NormOutputTailPlan,
+    positions: u32,
+    columns: u64,
+    key_bits: u32,
+    padding_byte: u64,
+    table_identity: Digest,
+) -> Result<crate::proof::lookup::LookupKeyPlan> {
+    use crate::proof::lookup::LookupKeySource;
+
+    if positions == 0 || padding_byte > 255 || table_identity == Digest::ZERO {
+        return Err(Error::InvalidConfig);
+    }
+    let keys = 1u64.checked_shl(key_bits).ok_or(Error::ResourceLimit)?;
+    let count = tail_digit_count(tail, positions, columns)?;
+    if count == 0 || count as u64 > keys {
+        return Err(Error::InvalidConfig);
+    }
+    let groups = tail_digit_groups(tail)?;
+    let slots = tail.slots()?;
+    let rows = usize::try_from(tail.group.shape.main_rows)
+        .map_err(|_| Error::ResourceLimit)?;
+    let ell = usize::try_from(tail.group.shape.code.ell)
+        .map_err(|_| Error::ResourceLimit)?;
+    let columns = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    if rows == 0 || ell == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let mut sources = Vec::with_capacity(count);
+    for position in 0..positions {
+        let oracle = tail
+            .group
+            .oracle_base
+            .checked_add(position as u64)
+            .ok_or(Error::ResourceLimit)?;
+        for column in 0..columns {
+            let base = column.checked_mul(slots).ok_or(Error::ResourceLimit)?;
+            for (offset, width) in &groups {
+                for digit in 0..*width {
+                    let slot = base
+                        .checked_add(*offset)
+                        .and_then(|value| value.checked_add(digit))
+                        .ok_or(Error::ResourceLimit)?;
+                    let row = slot % rows;
+                    let place = slot / rows;
+                    if place >= ell {
+                        return Err(Error::ShapeMismatch);
+                    }
+                    sources.push(LookupKeySource {
+                        column: 0,
+                        oracle,
+                        position,
+                        row: row as u32,
+                        place: place as u32,
+                        coefficient: Fp3::ONE,
+                        offset: Fp3::ZERO,
+                    });
+                }
+            }
+        }
+    }
+    Ok(crate::proof::lookup::LookupKeyPlan {
+        sources,
+        padding_values: vec![Fp3::from_u64(padding_byte)],
+        table_identity,
+    })
 }
 
 /// The smallest power-of-two mask row count whose free entries hold every
@@ -1875,7 +2018,8 @@ pub struct NormPlan {
     pub variance: NormGroupPlan,
     /// The committed rounding witness group; optional in this stage.
     pub round: Option<NormRoundPlan>,
-    /// The lookup plan over the committed digit rows; optional in this stage.
+    /// The lookup plan over the committed rounding digit rows; optional in
+    /// this stage.
     pub lookup: Option<NormLookupPlan>,
     /// The frozen-table lookup over the committed index and table-value slots;
     /// optional in this stage.
@@ -1982,25 +2126,89 @@ impl NormPlan {
         }
         if let Some(lookup) = &self.lookup {
             lookup.validate()?;
-            let round_group = self.round.as_ref().map(|round| &round.group);
-            let tail_group = self
+            let plan_group = |group: &NormGroupPlan| LookupKeyGroup {
+                oracle_base: group.oracle_base,
+                shape: group.shape,
+                columns: group.columns,
+                positions: self.shape.positions,
+            };
+            let round_group = self.round.as_ref().map(|round| plan_group(&round.group));
+            let tail_plan = self
                 .output
                 .as_ref()
-                .and_then(|output| output.tail.as_ref())
-                .map(|tail| &tail.group);
-            let matches = |group: Option<&NormGroupPlan>| match group {
-                Some(group) => {
-                    lookup.key_oracle_base == group.oracle_base
-                        && lookup.key_columns == group.columns
-                        && lookup.key_shape == group.shape
+                .and_then(|output| output.tail.as_ref());
+            let tail_group = tail_plan.map(|tail| plan_group(&tail.group));
+            for group in &lookup.key_groups {
+                let known = round_group
+                    .as_ref()
+                    .map(|plan| plan == group)
+                    .unwrap_or(false)
+                    || tail_group
+                        .as_ref()
+                        .map(|plan| plan == group)
+                        .unwrap_or(false);
+                if !known {
+                    return Err(Error::InvalidConfig);
                 }
-                None => false,
-            };
-            if !lookup.key.sources.is_empty()
-                && !matches(round_group)
-                && !matches(tail_group)
-            {
-                return Err(Error::InvalidConfig);
+            }
+            // The integrated chain must prove the byte range of every digit
+            // of both committed message groups.
+            if !lookup.key.sources.is_empty() {
+                if round_group
+                    .as_ref()
+                    .map(|group| !lookup.key_groups.contains(group))
+                    .unwrap_or(false)
+                {
+                    return Err(Error::InvalidConfig);
+                }
+                if tail_group
+                    .as_ref()
+                    .map(|group| !lookup.key_groups.contains(group))
+                    .unwrap_or(false)
+                {
+                    return Err(Error::InvalidConfig);
+                }
+            }
+            // The key map is canonical: it addresses every digit cell of the
+            // committed rounding message and, when the tail exists, every
+            // digit cell of the tail message. A lookup that drops or
+            // redirects a cell would leave that cell without a byte-range
+            // proof, so the plan is rejected.
+            if let Some(round) = &self.round {
+                let key_bits = lookup.lookup.key_bits;
+                let expected = round_digit_lookup_key(
+                    round,
+                    self.shape.positions,
+                    key_bits,
+                    0,
+                    lookup.key.table_identity,
+                )?;
+                let round_sources = expected.sources.len();
+                if lookup.key.sources.len() < round_sources
+                    || lookup.key.sources[..round_sources] != expected.sources[..]
+                {
+                    return Err(Error::InvalidConfig);
+                }
+                match tail_plan {
+                    Some(tail) => {
+                        let expected_tail = tail_digit_lookup_key(
+                            tail,
+                            self.shape.positions,
+                            self.columns,
+                            key_bits,
+                            0,
+                            lookup.key.table_identity,
+                        )?;
+                        if lookup.key.sources[round_sources..] != expected_tail.sources[..] {
+                            return Err(Error::InvalidConfig);
+                        }
+                    }
+                    None => {
+                        if lookup.key.sources.len() != round_sources {
+                            return Err(Error::InvalidConfig);
+                        }
+                    }
+                }
             }
         }
         if let Some(rstd) = &self.rstd {
@@ -2022,6 +2230,9 @@ impl NormPlan {
                 return Err(Error::InvalidConfig);
             }
             output.validate(self)?;
+            if output.tail.is_some() {
+                self.tail_no_wrap()?;
+            }
         }
         if let Some(mask) = &self.mask {
             mask.validate(
@@ -2046,6 +2257,180 @@ impl NormPlan {
             if mask.tail != tail_expected {
                 return Err(Error::InvalidConfig);
             }
+        }
+        Ok(())
+    }
+
+    /// The plan-level no-wrap derivation of the output tail. Every integer
+    /// magnitude is bounded from the trusted widths, the shift, the input
+    /// bound and the published parameter ranges; each reconstruction and
+    /// relation term must stay below half the base modulus. The witness-level
+    /// bound is not a substitute for this plan check.
+    fn tail_no_wrap(&self) -> Result<()> {
+        let output = self.output.as_ref().ok_or(Error::InvalidConfig)?;
+        let tail = output.tail.as_ref().ok_or(Error::InvalidConfig)?;
+        let round = self.round.as_ref().ok_or(Error::InvalidConfig)?;
+        let params = self.params.as_ref().ok_or(Error::InvalidConfig)?;
+        let widths = &tail.widths;
+        let half = (MODULUS as u128) / 2;
+        let capacity = |width: usize| -> Result<u128> {
+            if width == 0 || width > 7 {
+                return Err(Error::InvalidConfig);
+            }
+            1u128
+                .checked_shl(8 * width as u32)
+                .ok_or(Error::ResourceLimit)
+        };
+        let half_range = |width: usize| -> Result<u128> {
+            capacity(width)?
+                .checked_div(2)
+                .ok_or(Error::ResourceLimit)
+        };
+        if output.shift >= 63 {
+            return Err(Error::InvalidConfig);
+        }
+        let divisor = 1u128 << output.shift;
+        let q_cap = capacity(widths.quotient)?;
+        let q_half = half_range(widths.quotient)?;
+        let r_cap = capacity(widths.remainder)?;
+        let u_cap = capacity(widths.doubled_remainder)?;
+        let w_cap = capacity(widths.tie_slack)?;
+        let sh_cap = capacity(widths.shifted)?;
+        let pre_cap = capacity(widths.pre_clamp)?;
+        let pre_half = half_range(widths.pre_clamp)?;
+        let round_bounds = norm_no_wrap(
+            round.input_bound,
+            self.shape.valid,
+            &round.layout.widths,
+            round.layout.sum_offset,
+            round.layout.mean_offset,
+        )?;
+        let gain = params
+            .gain
+            .valid_max
+            .unsigned_abs()
+            .max(params.gain.valid_min.unsigned_abs())
+            as u128;
+        let bias = params
+            .bias
+            .valid_max
+            .unsigned_abs()
+            .max(params.bias.valid_min.unsigned_abs())
+            as u128;
+        let centered = (round.input_bound as u128)
+            .checked_mul(2)
+            .ok_or(Error::ResourceLimit)?;
+        // The normalized image: the centered input times the reciprocal
+        // standard deviation and the gain, at the committed fixed-point
+        // scale. The scale division only shrinks the true value, so the
+        // product of the three published magnitudes plus the rounding term
+        // is a safe integer bound over the tile.
+        let image = (self.shape.valid as u128)
+            .checked_mul(centered)
+            .and_then(|value| value.checked_mul(round_bounds.rsqrt))
+            .and_then(|value| value.checked_mul(gain))
+            .and_then(|value| value.checked_add(1))
+            .ok_or(Error::ResourceLimit)?;
+        let shifted = q_half
+            .checked_add(1)
+            .ok_or(Error::ResourceLimit)?;
+        let bias_sum = shifted
+            .checked_add(bias)
+            .ok_or(Error::ResourceLimit)?;
+        if shifted >= half || bias_sum >= half || image >= half {
+            return Err(Error::InvalidConfig);
+        }
+        // Relation 0: image plus the quotient and remainder reconstruction.
+        let reconstruction = (q_cap - 1)
+            .checked_mul(divisor)
+            .and_then(|value| value.checked_add(r_cap - 1))
+            .and_then(|value| value.checked_add(divisor.checked_mul(q_half)?))
+            .and_then(|value| value.checked_add(image))
+            .ok_or(Error::ResourceLimit)?;
+        if reconstruction >= half {
+            return Err(Error::InvalidConfig);
+        }
+        // Relation 1: shifted value from the quotient and the half selector.
+        let shifted_relation = (q_cap - 1)
+            .checked_add(sh_cap - 1)
+            .and_then(|value| value.checked_add(q_half))
+            .and_then(|value| value.checked_add(1))
+            .ok_or(Error::ResourceLimit)?;
+        if shifted_relation >= half {
+            return Err(Error::InvalidConfig);
+        }
+        // Relations 3 and 4: doubled remainder and tie slack.
+        let doubled = (r_cap - 1)
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(u_cap - 1))
+            .ok_or(Error::ResourceLimit)?;
+        let tie = (u_cap - 1)
+            .checked_add(w_cap - 1)
+            .and_then(|value| value.checked_add(divisor))
+            .ok_or(Error::ResourceLimit)?;
+        if doubled >= half || tie >= half {
+            return Err(Error::InvalidConfig);
+        }
+        // Relation 5 without a clamp interval: out from pre and the half.
+        let clamp_relation = bias_sum
+            .checked_add(pre_cap - 1)
+            .and_then(|value| value.checked_add(pre_half))
+            .ok_or(Error::ResourceLimit)?;
+        if clamp_relation >= half {
+            return Err(Error::InvalidConfig);
+        }
+        let Some(clamp) = tail.clamp.as_ref() else {
+            return Ok(());
+        };
+        let (low_bound, high_bound) = output.clamp.ok_or(Error::InvalidConfig)?;
+        let low_cap = capacity(clamp.low)?;
+        let high_cap = capacity(clamp.high)?;
+        let low_half = half_range(clamp.low)?;
+        let high_half = half_range(clamp.high)?;
+        // The clamped form of relation 5 adds both distance words.
+        let clamped_relation = clamp_relation
+            .checked_add(low_cap - 1)
+            .and_then(|value| value.checked_add(high_cap - 1))
+            .ok_or(Error::ResourceLimit)?;
+        if clamped_relation >= half {
+            return Err(Error::InvalidConfig);
+        }
+        // Relations 7 to 10: one selector times one distance and one slack.
+        let low_slack = capacity(clamp.low_strict)?
+            .max(capacity(clamp.low_nonstrict)?)
+            .checked_sub(1)
+            .ok_or(Error::ResourceLimit)?;
+        let high_slack = capacity(clamp.high_strict)?
+            .max(capacity(clamp.high_nonstrict)?)
+            .checked_sub(1)
+            .ok_or(Error::ResourceLimit)?;
+        let sign_low = (low_cap - 1)
+            .checked_add(low_slack)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(Error::ResourceLimit)?;
+        let sign_high = (high_cap - 1)
+            .checked_add(high_slack)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(Error::ResourceLimit)?;
+        if sign_low >= half || sign_high >= half {
+            return Err(Error::InvalidConfig);
+        }
+        // The distance rows: the bound word, the pre word and the public
+        // target (the two half ranges and the clamp constant) in one row.
+        let distance_low = (low_cap - 1)
+            .checked_add(pre_cap - 1)
+            .and_then(|value| value.checked_add(low_half))
+            .and_then(|value| value.checked_add(pre_half))
+            .and_then(|value| value.checked_add(low_bound.unsigned_abs() as u128))
+            .ok_or(Error::ResourceLimit)?;
+        let distance_high = (high_cap - 1)
+            .checked_add(pre_cap - 1)
+            .and_then(|value| value.checked_add(high_half))
+            .and_then(|value| value.checked_add(pre_half))
+            .and_then(|value| value.checked_add(high_bound.unsigned_abs() as u128))
+            .ok_or(Error::ResourceLimit)?;
+        if distance_low >= half || distance_high >= half {
+            return Err(Error::InvalidConfig);
         }
         Ok(())
     }
@@ -2791,110 +3176,6 @@ pub fn norm_pointwise_entries(
         entries.push(crate::proof::psc_general::GeneralMaskEntries { hiding, shown });
     }
     Ok(entries)
-}
-
-/// The trusted byte-table lookup plan of the committed clamp slack digits:
-/// one value column, one key per slack digit slot of every position, the byte
-/// table fixed at eight address bits, and every source addressing the tail
-/// group cell of its position. The multiplicity plane count is a plan value
-/// bounded by the key count.
-pub fn tail_slack_lookup_plan(
-    tail: &NormOutputTailPlan,
-    positions: u32,
-    columns: u64,
-    table_identity: Digest,
-    mu: u32,
-) -> Result<(crate::proof::lookup::LookupPlan, crate::proof::lookup::LookupKeyPlan)> {
-    use crate::proof::lookup::{LookupKeyPlan, LookupKeySource, LookupPlan};
-
-    let clamp = tail.clamp.as_ref().ok_or(Error::InvalidConfig)?;
-    if positions == 0 || tail.group.fault(positions).is_some() || table_identity == Digest::ZERO
-    {
-        return Err(Error::InvalidConfig);
-    }
-    let count = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
-    let slots = tail.slots()?;
-    let q_at = 0usize;
-    let r_at = tail.widths.quotient;
-    let u_at = r_at + tail.widths.remainder;
-    let w_at = u_at + tail.widths.doubled_remainder;
-    let s_at = w_at + tail.widths.tie_slack;
-    let sh_at = s_at + 1;
-    let pre_at = sh_at + tail.widths.shifted;
-    let low_at = pre_at + tail.widths.pre_clamp;
-    let high_at = low_at + clamp.low;
-    let low_selector = high_at + clamp.high;
-    let low_strict_at = low_selector + 2;
-    let low_nonstrict_at = low_strict_at + clamp.low_strict;
-    let high_strict_at = low_nonstrict_at + clamp.low_nonstrict;
-    let high_nonstrict_at = high_strict_at + clamp.high_strict;
-    let groups = [
-        (low_strict_at, clamp.low_strict),
-        (low_nonstrict_at, clamp.low_nonstrict),
-        (high_strict_at, clamp.high_strict),
-        (high_nonstrict_at, clamp.high_nonstrict),
-    ];
-    let per_position = count
-        .checked_mul(groups.iter().map(|(_, width)| *width).sum::<usize>())
-        .ok_or(Error::ResourceLimit)?;
-    let total = usize::try_from(positions)
-        .map_err(|_| Error::ResourceLimit)?
-        .checked_mul(per_position)
-        .ok_or(Error::ResourceLimit)?;
-    if total == 0 || total > (1usize << 30) {
-        return Err(Error::ResourceLimit);
-    }
-    let key_bits = ceil_log2_u64(total as u64);
-    let rows = usize::try_from(tail.group.shape.main_rows)
-        .map_err(|_| Error::ResourceLimit)?;
-    let ell = usize::try_from(tail.group.shape.code.ell)
-        .map_err(|_| Error::ResourceLimit)?;
-    let mut sources = Vec::with_capacity(total);
-    for position in 0..positions {
-        let oracle = tail
-            .group
-            .oracle_base
-            .checked_add(position as u64)
-            .ok_or(Error::ResourceLimit)?;
-        for column in 0..count {
-            let base = column.checked_mul(slots).ok_or(Error::ResourceLimit)?;
-            for (offset, width) in groups {
-                for digit in 0..width {
-                    let slot = base
-                        .checked_add(offset)
-                        .and_then(|value| value.checked_add(digit))
-                        .ok_or(Error::ResourceLimit)?;
-                    let row = slot % rows;
-                    let place = slot / rows;
-                    if place >= ell {
-                        return Err(Error::ShapeMismatch);
-                    }
-                    sources.push(LookupKeySource {
-                        column: 0,
-                        oracle,
-                        position,
-                        row: row as u32,
-                        place: place as u32,
-                        coefficient: Fp3::ONE,
-                        offset: Fp3::ZERO,
-                    });
-                }
-            }
-        }
-    }
-    let plan = LookupPlan {
-        key_bits,
-        mu,
-        table_log: 8,
-        columns: 1,
-    };
-    let key = LookupKeyPlan {
-        sources,
-        padding_values: vec![Fp3::ZERO],
-        table_identity,
-    };
-    key.validate(&plan)?;
-    Ok((plan, key))
 }
 
 /// The committed mask entries of the tail relation instances, in
@@ -5491,9 +5772,7 @@ mod tests {
             lookup,
             commit,
             key,
-            key_oracle_base: 1,
-            key_shape,
-            key_columns: 4,
+            key_groups: Vec::new(),
         });
         plan.validate().unwrap();
         let with = plan.digest();
@@ -6585,6 +6864,29 @@ mod tests {
         plan.output = Some(output);
         plan.validate().unwrap();
         assert_ne!(plan.digest(), digest);
+        let round_widths = NormRoundWidths {
+            sum: 2,
+            squares: 2,
+            variance: 2,
+            mean: 2,
+            offset: 1,
+        };
+        let round_layout =
+            NormRoundLayout::new(round_widths, plan.shape.valid, 64, 64).unwrap();
+        let round_columns = round_widths.columns().unwrap();
+        plan.round = Some(NormRoundPlan {
+            group: NormGroupPlan {
+                shape: group_shape(round_columns, 6),
+                columns: round_columns,
+                group: plan.variance.group,
+                oracle_base: 9500,
+                openings: 1,
+            },
+            layout: round_layout,
+            input_bound: 1000,
+            table_real_len: 8,
+        });
+        plan.validate().unwrap();
 
         let mut changed = plan.clone();
         changed.output.as_mut().unwrap().shift = 63;
@@ -6645,6 +6947,13 @@ mod tests {
             clamp: Some(clamp_widths),
         });
         with_tail.validate().unwrap();
+        // The plan-level no-wrap derivation rejects a plan whose trusted
+        // input bound and parameter range push the normalized image past the
+        // safe magnitude.
+        let mut huge = with_tail.clone();
+        huge.round.as_mut().unwrap().input_bound = 1u64 << 42;
+        huge.params.as_mut().unwrap().gain.valid_max = i64::MAX;
+        assert!(huge.validate().is_err());
         assert_eq!(
             with_tail
                 .output
@@ -6738,12 +7047,26 @@ mod tests {
             clamp: Some(clamp_widths),
         };
         let identity = Digest([0x55; 32]);
-        let (lookup, key) =
-            tail_slack_lookup_plan(&tail, plan.shape.positions, plan.columns, identity, 3)
+        let positions = plan.shape.positions;
+        let count = tail_digit_count(&tail, positions, plan.columns).unwrap();
+        let (key_bits, mu) = lookup_parameters(count).unwrap();
+        let lookup = crate::proof::lookup::LookupPlan {
+            key_bits,
+            mu,
+            table_log: 8,
+            columns: 1,
+        };
+        lookup.validate().unwrap();
+        let key =
+            tail_digit_lookup_key(&tail, positions, plan.columns, key_bits, 0, identity)
                 .unwrap();
-        let slack_digits = 4 * 4;
+        let slack_digits = tail_digit_groups(&tail)
+            .unwrap()
+            .iter()
+            .map(|(_, width)| *width)
+            .sum::<usize>();
         let per_position = plan.columns as usize * slack_digits;
-        assert_eq!(key.sources.len(), plan.shape.positions as usize * per_position);
+        assert_eq!(key.sources.len(), positions as usize * per_position);
         assert_eq!(lookup.columns, 1);
         assert_eq!(lookup.table_log, 8);
         assert_eq!(
@@ -6762,14 +7085,7 @@ mod tests {
 
         let mut without_clamp = tail.clone();
         without_clamp.clamp = None;
-        assert!(tail_slack_lookup_plan(
-            &without_clamp,
-            plan.shape.positions,
-            plan.columns,
-            identity,
-            3
-        )
-        .is_err());
+        assert!(tail_digit_count(&without_clamp, positions, plan.columns).is_err());
     }
 
     #[test]
