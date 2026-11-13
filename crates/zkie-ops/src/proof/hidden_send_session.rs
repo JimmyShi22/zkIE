@@ -9012,7 +9012,12 @@ fn own_members(
             });
         }
     }
-    members.sort_by_key(|member| std::cmp::Reverse((member.main_rows, member.source_oracle)));
+    // The isolated FOLD fixture places blocks in registration order, so the
+    // member order must follow the BAT block order: larger main blocks first,
+    // and among mask-only members the larger mask block first.
+    members.sort_by_key(|member| {
+        std::cmp::Reverse((member.main_rows, member.mask_rows, member.source_oracle))
+    });
     let mut order = Vec::with_capacity(members.len());
     for (index, member) in members.iter_mut().enumerate() {
         member.bat_oracle = index as u64;
@@ -11608,6 +11613,7 @@ fn norm_plain_rows(
                             &mut right_slots,
                         );
                         right_constant = right_constant
+                            .add(&eq[0])
                             .add(&eq[4].mul(&signed(-(RSQRT_FINE as i128))?))
                             .add(&eq[5].mul(&signed(
                                 -((RSQRT_FINE + RSQRT_COARSE) as i128),
@@ -15319,7 +15325,7 @@ mod merged_tests {
             oracle: INDEX_MASK_ORACLE,
             group: GROUP,
             mask_code: mask_code(),
-            mask_rows: 3,
+            mask_rows: 4,
             answers: 1,
             openings: 1,
             tree: RuntimeTreePlan {
@@ -15329,7 +15335,7 @@ mod merged_tests {
                 log_n_zk: CODE_LOG_N,
                 parts: vec![RuntimeTreePart {
                     main_symbols: 0,
-                    mask_symbols: 3 * E_DEGREE as u64,
+                    mask_symbols: 4 * E_DEGREE as u64,
                 }],
                 salt_bytes: SALT,
                 run: INDEX_MASK_RUN,
@@ -15832,7 +15838,7 @@ mod merged_tests {
             oracle: 9500,
             group: GROUP,
             mask_code: mask_code(),
-            mask_rows: 16,
+            mask_rows: 32,
             answers: 1,
             openings: 1,
             tree: RuntimeTreePlan {
@@ -15842,7 +15848,7 @@ mod merged_tests {
                 log_n_zk: CODE_LOG_N,
                 parts: vec![RuntimeTreePart {
                     main_symbols: 0,
-                    mask_symbols: 48,
+                    mask_symbols: 96,
                 }],
                 salt_bytes: SALT,
                 run: W_RUN,
@@ -15858,7 +15864,10 @@ mod merged_tests {
                 .unwrap(),
             columns,
             variables: columns.trailing_zeros() as usize + 1,
-            relations: vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            relations: vec![
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                23, 24, 25,
+            ],
             x: group(columns, GROUP, 9000, 60000),
             x_roots: Vec::new(),
             sum: group(1, GROUP, 9100, 60100),
@@ -16013,8 +16022,18 @@ mod merged_tests {
             lookup: None,
         };
         let mut plan = hidden_plan(_activation);
-        plan.proximity.own_mask_tree.mask_rows = 32;
         plan.norm = Some(norm);
+        let index_rows = plan
+            .send
+            .index_mask
+            .as_ref()
+            .map(|index| index.tree_rows().unwrap())
+            .unwrap_or(0);
+        plan.proximity.own_mask_tree.mask_rows = crate::proof::hidden_norm_psc::norm_own_mask_rows(
+            index_rows,
+            mask_plan.mask_rows,
+        )
+        .unwrap();
         plan.validate().unwrap();
         (plan, witness)
     }
@@ -16045,6 +16064,96 @@ mod merged_tests {
         assert!(
             proved.is_err(),
             "an inconsistent committed sum must not produce a proof"
+        );
+    }
+
+    #[test]
+    fn rsqrt_witness_value_tampering_is_rejected() {
+        use zkie_engine::pcs::request::fold::ByteMaskCoins;
+
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness) = norm_fixture(&activation);
+        let norm = plan.norm.as_ref().unwrap();
+        let round_plan = norm.round.as_ref().unwrap();
+        let mut changed = witness.clone();
+        let mut rows = changed.rsqrt.clone().unwrap();
+        rows[0].fine_slack += 1;
+        changed.rsqrt = Some(rows.clone());
+        let values = changed
+            .core
+            .iter()
+            .zip(&rows)
+            .map(|(core, rsqrt)| {
+                round_plan
+                    .layout
+                    .values_with_rsqrt(core, rsqrt, round_plan.group.columns)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut coins = ByteMaskCoins::new(Digest([0x93; 32])).unwrap();
+        changed.round = Some(commit_norm_group(&round_plan.group, &values, &mut coins));
+        let proved = prove_hidden_lin_hidden_with_norm(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &changed,
+        );
+        assert!(
+            proved.is_err(),
+            "a tampered rsqrt slack must not produce a proof"
+        );
+    }
+
+    #[test]
+    fn rsqrt_plan_table_length_tampering_is_rejected() {
+        let activation = activation();
+        let mut table = table();
+        let (mut plan, witness) = norm_fixture(&activation);
+        plan.norm
+            .as_mut()
+            .unwrap()
+            .round
+            .as_mut()
+            .unwrap()
+            .table_real_len += 1;
+        let proved = prove_hidden_lin_hidden_with_norm(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &witness,
+        );
+        assert!(
+            proved.is_err(),
+            "a changed rsqrt table length must not produce a proof"
+        );
+    }
+
+    #[test]
+    fn rsqrt_mask_entry_tampering_is_rejected() {
+        use zkie_engine::pcs::request::field::Fp3;
+
+        let activation = activation();
+        let mut table = table();
+        let (plan, witness) = norm_fixture(&activation);
+        let mut changed = witness.clone();
+        let relations = plan.norm.as_ref().unwrap().relations.len();
+        let instance = relations + 24;
+        let mask = changed.mask.as_mut().unwrap();
+        mask.entries[instance].shown[0] =
+            mask.entries[instance].shown[0].add(&Fp3::ONE);
+        let proved = prove_hidden_lin_hidden_with_norm(
+            &plan,
+            &activation,
+            &mut table,
+            Digest([0x71; 32]),
+            &changed,
+        );
+        assert!(
+            proved.is_err(),
+            "a tampered rsqrt instance mask must not produce a proof"
         );
     }
 
@@ -16134,7 +16243,10 @@ mod merged_tests {
         verifier_plan.send.expected_roots = Some(hidden_witness.send.roots.clone());
         assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &base).is_ok());
         let instances = base.second.norm.as_ref().unwrap().psc.len();
-        assert_eq!(instances, POSITIONS as usize * 16);
+        assert_eq!(
+            instances,
+            POSITIONS as usize * plan.norm.as_ref().unwrap().relations.len()
+        );
 
         // Endpoint values of every relation instance.
         for instance in 0..instances {
