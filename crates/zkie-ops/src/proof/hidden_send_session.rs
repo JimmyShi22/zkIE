@@ -2184,9 +2184,9 @@ pub struct HiddenSendWitness {
     pub closure: Option<ClosureWitness>,
     /// The private norm group messages, when the plan carries the norm.
     pub norm: Option<NormWitness>,
-    /// The request-level W's committed value message, when the plan commits
-    /// it: its tree and value messages stay here for the later openings.
-    pub request_w: Option<crate::proof::output_closure::CommittedValueGroup>,
+    /// The request-level W's committed value message with the private tail
+    /// and salts the sampling needs, when the plan commits it.
+    pub request_w: Option<RequestWWitness>,
 }
 
 impl HiddenSendWitness {
@@ -2869,6 +2869,15 @@ pub struct DotMapMessage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RequestWMessage {
     pub root: Digest,
+}
+
+/// The request W's committed message and the private values the sampling
+/// needs: one tail and the salts of the single value message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestWWitness {
+    pub committed: crate::proof::output_closure::CommittedValueGroup,
+    pub tails: Vec<Fp3>,
+    pub salts: Vec<Vec<u8>>,
 }
 
 /// The complete public message of one hidden SEND-sample run.
@@ -7557,7 +7566,11 @@ fn prove_first(
                 std::slice::from_ref(&rw_randomness.tail),
                 std::slice::from_ref(&rw_randomness.salts),
             )?;
-            Some(committed)
+            Some(RequestWWitness {
+                committed,
+                tails: rw_randomness.tail.clone(),
+                salts: rw_randomness.salts.clone(),
+            })
         }
         None => None,
     };
@@ -7676,9 +7689,9 @@ fn prove_first(
     if let (Some(member), Some(root)) = (&plan.send.member, &reduction_root) {
         absorb_reduction_root(&mut chain, member, root)?;
     }
-    if let Some(committed) = &request_w_commit {
+    if let Some(witness) = &request_w_commit {
         let rw = plan.send.request_w.as_ref().ok_or(Error::InvalidConfig)?;
-        let root = *committed.roots.first().ok_or(Error::ShapeMismatch)?;
+        let root = *witness.committed.roots.first().ok_or(Error::ShapeMismatch)?;
         absorb_request_w_root(&mut chain, &rw.shape, root)?;
     }
     let index_mask = match (&plan.send.index_mask, &witness.index_mask) {
@@ -8080,8 +8093,8 @@ fn prove_first(
         group,
         reduction_root,
         request_w: match &request_w_commit {
-            Some(committed) => Some(RequestWMessage {
-                root: *committed.roots.first().ok_or(Error::ShapeMismatch)?,
+            Some(witness) => Some(RequestWMessage {
+                root: *witness.committed.roots.first().ok_or(Error::ShapeMismatch)?,
             }),
             None => None,
         },
