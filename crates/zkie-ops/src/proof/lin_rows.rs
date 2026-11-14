@@ -153,6 +153,47 @@ mod tests {
     }
 
     #[test]
+    fn the_eval_row_matches_the_pending_claim() {
+        use crate::proof::hidden_member::{
+            pending_value, stretch_weights, MaskTerm, PendingRow,
+        };
+        // Two matrix rows of four columns; the row weights combine them into
+        // W = g^T M, and the pending claim reads the same combination at the
+        // column point.
+        let matrix = vec![
+            vec![f(1), f(2), f(3), f(4)],
+            vec![f(5), f(6), f(7), f(8)],
+        ];
+        let g = [f(2), f(3)];
+        let psi = [f(4), f(5)];
+        let mut w = vec![Fp3::ZERO; 4];
+        for (row, weight) in g.iter().enumerate() {
+            for (slot, value) in w.iter_mut().zip(&matrix[row]) {
+                *slot = slot.add(&weight.mul(value));
+            }
+        }
+        let eval = lin_eval(&w, &psi).unwrap();
+        let pending = PendingRow {
+            weights: stretch_weights(1, 0, &g).unwrap(),
+            psi: psi.to_vec(),
+            target: eval,
+            masks: Vec::<MaskTerm>::new(),
+        };
+        assert_eq!(
+            pending_value(&pending, &matrix, &|_, _| Ok(Fp3::ZERO)).unwrap(),
+            eval
+        );
+        // Another weight or matrix row moves both sides together only when
+        // the pending target is recomputed; the fixed target refuses it.
+        let mut changed = matrix.clone();
+        changed[0][0] = changed[0][0].add(&Fp3::ONE);
+        assert_ne!(
+            pending_value(&pending, &changed, &|_, _| Ok(Fp3::ZERO)).unwrap(),
+            eval
+        );
+    }
+
+    #[test]
     fn the_fold_row_binds_omega_to_the_folded_row() {
         let psi_lo = [f(2)];
         let zeta = [f(3)];
