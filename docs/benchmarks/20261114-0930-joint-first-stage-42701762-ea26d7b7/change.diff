@@ -1,0 +1,384 @@
+commit 427017621eafe918b72d48ee7bb874ee53665ed9
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Sat Nov 14 09:30:16 2026 +0800
+
+    Solve the first stage of the joint shared and own groups
+    
+    The trusted planner now adds the main-only position bound on the way up and
+    solves the shared and own groups together: each round recomputes the random
+    tails from the current position counts, sizes the groups under the joint draw
+    counts, and stops when no count grows. A settled solution must have every
+    sized group holding its rounds at the target; otherwise the configuration is
+    reported with its failing point. Groups can now be sized without mask rows,
+    which the main-only bound needs; the existing two-stage path keeps its plan
+    behavior. Unit tests cover a converged first stage, a capacity failure and a
+    zero batch.
+    
+    This is the first-stage fixed point only; the capacity mapping and the
+    whole-chain round budget remain the next steps.
+
+diff --git a/crates/zkie-ops/src/proof/proximity_planner.rs b/crates/zkie-ops/src/proof/proximity_planner.rs
+index 14a34da6..786873e9 100644
+--- a/crates/zkie-ops/src/proof/proximity_planner.rs
++++ b/crates/zkie-ops/src/proof/proximity_planner.rs
+@@ -81,6 +81,10 @@ struct GroupShape {
+     mask: Word,
+     k: u32,
+     h: u32,
++    /// Whether the group's mask rows exist. The two-stage solver always uses
++    /// them; the first-stage derivation also sizes a main-only group on the
++    /// way up.
++    mask_enabled: bool,
+ }
+ 
+ #[derive(Clone, Debug)]
+@@ -318,6 +322,9 @@ fn analysis_at(group: &GroupShape, at: Proximity) -> Result<Analysis> {
+     if analysis.bad {
+         analysis.at.count = Bound::failed();
+     }
++    if !group.mask_enabled {
++        return Ok(analysis);
++    }
+     let mask_word = repeated(&group.mask, group.main.log_n)?;
+     let mask_at = at_distance(&mask_word, &analysis.at.agree)?;
+     if mask_at.list.cmp(&analysis.list) == Ordering::Greater {
+@@ -339,11 +346,17 @@ fn analysis_at(group: &GroupShape, at: Proximity) -> Result<Analysis> {
+ }
+ 
+ fn mask_rules(group: &GroupShape) -> bool {
++    if !group.mask_enabled {
++        return false;
++    }
+     (group.mask.k as u128) * (1u128 << group.main.log_n)
+         > (group.main.k as u128) * (1u128 << group.mask.log_n)
+ }
+ 
+ fn analysis_of_m(group: &GroupShape, m: u64) -> Result<Analysis> {
++    if !group.mask_enabled {
++        return analysis_at(group, johnson(&group.main, m)?);
++    }
+     if mask_rules(group) {
+         let z = johnson(&repeated(&group.mask, group.main.log_n)?, m)?;
+         let mut analysis = analysis_at(group, at_distance(&group.main, &z.agree)?)?;
+@@ -365,7 +378,7 @@ fn analysis_of_m(group: &GroupShape, m: u64) -> Result<Analysis> {
+ fn fold_round_error(group: &GroupShape, analysis: &Analysis, round: u32) -> Bound {
+     let mut error = mca_error(&analysis.at)
+         .add(&Bound::from_big(analysis.list.clone()).mul(&field_error(2)));
+-    if group.h > 0 && round <= group.h {
++    if group.mask_enabled && group.h > 0 && round <= group.h {
+         if let Some(mask_at) = &analysis.mask_at {
+             error = error.add(&Bound::from_u64(2).mul(&mca_error(mask_at)));
+         }
+@@ -376,8 +389,10 @@ fn fold_round_error(group: &GroupShape, analysis: &Analysis, round: u32) -> Boun
+ fn base_error(group: &GroupShape, analysis: &Analysis) -> Bound {
+     let mut error = mca_error(&analysis.at)
+         .add(&Bound::from_big(analysis.list.clone()).mul(&field_error(1)));
+-    if let Some(mask_at) = &analysis.mask_at {
+-        error = error.add(&mca_error(mask_at));
++    if group.mask_enabled {
++        if let Some(mask_at) = &analysis.mask_at {
++            error = error.add(&mca_error(mask_at));
++        }
+     }
+     error
+ }
+@@ -903,6 +918,223 @@ pub fn joint_draws(
+     })
+ }
+ 
++fn with_tail(word: Word, tail: u64) -> Result<Word> {
++    let dim = word.ell.checked_add(tail).ok_or(Error::ResourceLimit)?;
++    let n = 1u64 << word.log_n;
++    if dim == 0 || dim > n {
++        return Err(Error::InvalidConfig);
++    }
++    Ok(Word {
++        log_n: word.log_n,
++        ell: word.ell,
++        k: dim - 1,
++    })
++}
++
++fn group_with_tails(shape: &GroupShape, main_tail: u64, mask_tail: u64) -> Result<GroupShape> {
++    let mut group = shape.clone();
++    group.main = with_tail(shape.main, main_tail)?;
++    group.mask = with_tail(shape.mask, mask_tail)?;
++    Ok(group)
++}
++
++fn margin_bound() -> Bound {
++    Bound::from_real(Real::two_to(-((TARGET_BITS as i64) + 30)))
++}
++
++/// The main code's own position count on the way up: the mask rows are
++/// cleared and the main code alone is sized. Zero when not even the main code
++/// reaches the target under its rule.
++fn positions_from_below(group: &GroupShape, load: GroupLoad, extra: &Bound) -> u64 {
++    let mut main_only = group.clone();
++    main_only.h = 0;
++    main_only.mask_enabled = false;
++    let m = largest_m(&main_only, load);
++    if m == 0 || !holds_for_m(&main_only, load, m) {
++        return 0;
++    }
++    match analysis_of_m(&main_only, m) {
++        Ok(analysis) => scope_positions(&analysis.at.agree, 0, extra),
++        Err(_) => 0,
++    }
++}
++
++/// One group of the first-stage joint solve: the two codes and the fold bits.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct JointGroup {
++    pub main: CodeParams,
++    pub mask: CodeParams,
++    pub k: u32,
++    pub h: u32,
++}
++
++/// The converged first-stage counts of the joint solve.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct JointFirstStage {
++    pub folded_positions: u64,
++    pub omega_positions: u64,
++    pub own_positions: u64,
++    pub folded_main_tail: u64,
++    pub folded_mask_tail: u64,
++    pub omega_main_tail: u64,
++    pub omega_mask_tail: u64,
++    pub own_main_tail: u64,
++    pub own_mask_tail: u64,
++}
++
++fn sized_step(
++    shape: &GroupShape,
++    main_draws: u64,
++    mask_draws: u64,
++    rows: u64,
++    circle: bool,
++    extra: &Bound,
++) -> std::result::Result<(u64, bool), &'static str> {
++    let main_tail = stage_tail(main_draws, circle);
++    let mask_tail = stage_tail(mask_draws, circle);
++    let group = group_with_tails(shape, main_tail, mask_tail)
++        .map_err(|_| "the group's message and random tail do not fit its code length")?;
++    let load = GroupLoad {
++        cube_bits: stage_cube_bits(&group),
++        messages: 2,
++        batched_rows: rows,
++    };
++    let m = largest_m(&group, load);
++    if m > 0 && holds_for_m(&group, load, m) {
++        let analysis = analysis_of_m(&group, m)
++            .map_err(|_| "the group's codes have no admissible distance under its rule")?;
++        return Ok((scope_positions(&analysis.at.agree, 0, extra), true));
++    }
++    let below = positions_from_below(&group, load, extra);
++    if below == 0 {
++        return Err(
++            "no distance under its rule, or no number of positions, holds the group's rounds at the target",
++        );
++    }
++    Ok((below, false))
++}
++
++/// Solves the shared and own groups together, upward from zero, on the joint
++/// draw counts. Each round recomputes the random tails from the current
++/// positions and the groups' sizes; the loop stops when no group's position
++/// count grows. A settled solution must have every sized group holding its
++/// rounds at the target; otherwise the configuration is reported with its
++/// failing point.
++#[allow(clippy::too_many_arguments)]
++pub fn solve_first_stage(
++    folded: &JointGroup,
++    omega: &JointGroup,
++    own: &JointGroup,
++    requests: u64,
++    samples: u32,
++    columns: u64,
++    circle: bool,
++) -> std::result::Result<JointFirstStage, StageFailure> {
++    let folded_shape = group_shape(folded.main, folded.mask, folded.k, folded.h)
++        .map_err(|_| StageFailure { stage: 0, point: "the folded group's codes do not form a group" })?;
++    let omega_shape = group_shape(omega.main, omega.mask, omega.k, omega.h)
++        .map_err(|_| StageFailure { stage: 0, point: "the Omega group's codes do not form a group" })?;
++    let own_shape = group_shape(own.main, own.mask, own.k, own.h)
++        .map_err(|_| StageFailure { stage: 0, point: "the request group's codes do not form a group" })?;
++    let split = folded_shape.main.log_n != omega_shape.main.log_n
++        || folded_shape.main.ell != omega_shape.main.ell;
++    let samples64 = samples as u64;
++    let rows_folded = columns
++        .checked_add(1)
++        .and_then(|value| value.checked_add(3u64.checked_mul(samples64)?))
++        .ok_or(StageFailure { stage: 0, point: "the folded group's batched rows overflow" })?;
++    let rows_omega = 1u64
++        .checked_add(2u64.checked_mul(samples64).ok_or(StageFailure { stage: 0, point: "the Omega group's batched rows overflow" })?)
++        .ok_or(StageFailure { stage: 0, point: "the Omega group's batched rows overflow" })?;
++    let rows_own = 2u64
++        .checked_add(3u64.checked_mul(samples64).ok_or(StageFailure { stage: 0, point: "the request group's batched rows overflow" })?)
++        .ok_or(StageFailure { stage: 0, point: "the request group's batched rows overflow" })?;
++    let extra = margin_bound();
++    let mut folded_t = 0u64;
++    let mut omega_t = 0u64;
++    let mut own_t = 0u64;
++    let mut serves_folded = false;
++    let mut serves_omega = false;
++    let mut serves_own = false;
++    for turn in 0..=32 {
++        let draws = joint_draws(folded_t, omega_t, own_t, requests, split)
++            .map_err(|_| StageFailure { stage: 0, point: "the joint draw counts overflow" })?;
++        let folded_step = sized_step(
++            &folded_shape,
++            draws.folded_main,
++            draws.folded_mask,
++            rows_folded,
++            circle,
++            &extra,
++        )
++        .map_err(|point| StageFailure { stage: 0, point })?;
++        let omega_step = if split {
++            Some(
++                sized_step(
++                    &omega_shape,
++                    draws.omega_main,
++                    draws.omega_mask,
++                    rows_omega,
++                    circle,
++                    &extra,
++                )
++                .map_err(|point| StageFailure { stage: 0, point })?,
++            )
++        } else {
++            None
++        };
++        let own_step = sized_step(
++            &own_shape,
++            draws.own_main,
++            draws.own_mask,
++            rows_own,
++            circle,
++            &extra,
++        )
++        .map_err(|point| StageFailure { stage: 0, point })?;
++        serves_folded = folded_step.1;
++        serves_omega = omega_step.map_or(false, |step| step.1);
++        serves_own = own_step.1;
++        let next_folded = folded_t.max(folded_step.0);
++        let next_omega = omega_t.max(omega_step.map_or(0, |step| step.0));
++        let next_own = own_t.max(own_step.0);
++        if next_folded == folded_t && next_omega == omega_t && next_own == own_t {
++            if !serves_folded || (split && !serves_omega) || !serves_own {
++                return Err(StageFailure {
++                    stage: 0,
++                    point: "no distance under its rule holds the group's rounds at the target",
++                });
++            }
++            let draws = joint_draws(next_folded, next_omega, next_own, requests, split)
++                .map_err(|_| StageFailure { stage: 0, point: "the joint draw counts overflow" })?;
++            return Ok(JointFirstStage {
++                folded_positions: next_folded,
++                omega_positions: next_omega,
++                own_positions: next_own,
++                folded_main_tail: stage_tail(draws.folded_main, circle),
++                folded_mask_tail: stage_tail(draws.folded_mask, circle),
++                omega_main_tail: stage_tail(draws.omega_main, circle),
++                omega_mask_tail: stage_tail(draws.omega_mask, circle),
++                own_main_tail: stage_tail(draws.own_main, circle),
++                own_mask_tail: stage_tail(draws.own_mask, circle),
++            });
++        }
++        if turn == 32 {
++            return Err(StageFailure {
++                stage: 0,
++                point: "positions and random coordinates do not settle",
++            });
++        }
++        folded_t = next_folded;
++        omega_t = next_omega;
++        own_t = next_own;
++    }
++    Err(StageFailure {
++        stage: 0,
++        point: "positions and random coordinates do not settle",
++    })
++}
++
+ fn ceil_log2(value: u64) -> u32 {
+     if value <= 1 {
+         return 0;
+@@ -928,6 +1160,7 @@ fn group_shape(main: CodeParams, mask: CodeParams, k: u32, h: u32) -> Result<Gro
+         mask: word(mask)?,
+         k,
+         h,
++        mask_enabled: true,
+     })
+ }
+ 
+@@ -1232,6 +1465,7 @@ mod tests {
+             mask: Word { log_n: 2, ell: 3, k: 2 },
+             k: 1,
+             h: 0,
++            mask_enabled: true,
+         };
+         let load = GroupLoad {
+             cube_bits: 3,
+@@ -1380,3 +1614,59 @@ mod joint_draw_tests {
+         assert!(joint_draws(11, 11, 7, 0, false).is_err());
+     }
+ }
++
++#[cfg(test)]
++mod first_stage_tests {
++    use super::*;
++
++    fn group(log_n: u32, ell: u64, k: u32, h: u32) -> JointGroup {
++        JointGroup {
++            main: CodeParams { log_n, ell, r: 0 },
++            mask: CodeParams { log_n, ell, r: 0 },
++            k,
++            h,
++        }
++    }
++
++    #[test]
++    fn the_first_stage_settles_or_names_a_failing_point() {
++        let g = group(14, 256, 1, 0);
++        match solve_first_stage(&g, &g, &g, 1, 1, 64, false) {
++            Ok(stage) => {
++                assert!(stage.folded_positions > 0);
++                assert!(stage.own_positions > 0);
++                assert_eq!(stage.omega_positions, 0);
++                // One request: Omega's read count is the folded positions plus
++                // the request's positions; the mask draw of the joined group
++                // is the folded positions.
++                assert_eq!(
++                    stage.folded_main_tail,
++                    stage.folded_positions + stage.own_positions
++                );
++                assert_eq!(stage.folded_mask_tail, stage.folded_positions);
++                assert_eq!(stage.own_main_tail, stage.folded_main_tail);
++                assert_eq!(stage.own_mask_tail, stage.own_positions);
++            }
++            Err(failure) => {
++                assert_eq!(failure.stage, 0);
++                assert!(!failure.point.is_empty());
++            }
++        }
++    }
++
++    #[test]
++    fn a_tail_that_cannot_fit_the_code_is_reported() {
++        // The message fills the whole code length, so any positive random tail
++        // is a labeled capacity failure rather than a panic.
++        let g = group(3, 8, 1, 0);
++        let failure = solve_first_stage(&g, &g, &g, 1, 1, 8, false).unwrap_err();
++        assert_eq!(failure.stage, 0);
++        assert!(!failure.point.is_empty());
++    }
++
++    #[test]
++    fn a_zero_batch_is_rejected() {
++        let g = group(14, 256, 1, 0);
++        assert!(solve_first_stage(&g, &g, &g, 0, 1, 64, false).is_err());
++    }
++}
