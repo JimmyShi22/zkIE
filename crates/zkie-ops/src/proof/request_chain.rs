@@ -49,7 +49,8 @@ pub struct RequestChainShape {
 }
 
 impl RequestChainMessages {
-    pub fn encode(&self, shape: RequestChainShape) -> Result<Vec<u8>> {
+    /// Checks the stored counts against the plan's shape.
+    pub fn check_shape(&self, shape: RequestChainShape) -> Result<()> {
         if self.token.rounds.len() != shape.token_rounds
             || self.token.end_values.len() != shape.token_ends
             || self.stack.rounds.len() != shape.stack_rounds
@@ -59,6 +60,11 @@ impl RequestChainMessages {
         {
             return Err(Error::InvalidConfig);
         }
+        Ok(())
+    }
+
+    pub fn encode(&self, shape: RequestChainShape) -> Result<Vec<u8>> {
+        self.check_shape(shape)?;
         let mut writer = CanonicalWriter::new();
         self.encode_into(&mut writer);
         Ok(writer.into_bytes())
@@ -496,10 +502,12 @@ mod tests {
         let mut reader = CanonicalReader::new(&bytes, DecodeLimits::unlimited());
         assert!(RequestChainMessages::decode(&mut reader, shape()).is_err());
         let bytes = messages.encode(shape()).unwrap();
-        // The encoder refuses proofs of another shape.
+        // The encoder and the shape check refuse proofs of another shape.
         let mut wrong = shape();
         wrong.stack_rounds = 2;
         assert!(messages.encode(wrong).is_err());
+        assert!(messages.check_shape(wrong).is_err());
+        assert!(messages.check_shape(shape()).is_ok());
         // The decoder refuses stored counts that differ from the plan's.
         let mut reader = CanonicalReader::new(&bytes, DecodeLimits::unlimited());
         let mut wrong = shape();

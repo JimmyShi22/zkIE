@@ -3025,6 +3025,44 @@ impl HiddenSendMessages {
     }
 }
 
+/// Proves the request chain's transcript section and returns the message it
+/// carries. The plan must carry the chain's shapes; the proofs must match them.
+pub fn prove_request_chain_section(
+    plan: &HiddenSendPlan,
+    inputs: &crate::proof::request_chain::ChainInputs,
+    challenges: &mut dyn crate::proof::psc_general::GeneralChallenges,
+) -> Result<crate::proof::request_chain::RequestChainMessages> {
+    let shape = plan.request_chain.ok_or(Error::InvalidConfig)?;
+    let proof = crate::proof::request_chain::prove_request_chain(inputs, challenges)?;
+    let messages = crate::proof::request_chain::RequestChainMessages {
+        token: proof.token,
+        stack: proof.stack,
+        merge: proof.merge,
+    };
+    messages.check_shape(shape)?;
+    Ok(messages)
+}
+
+/// Verifies the request chain's transcript section. The plan must carry the
+/// chain's shapes and the message its proofs; the proofs are checked against
+/// the plan before the chain's arithmetic entry runs.
+pub fn verify_request_chain_section(
+    plan: &HiddenSendPlan,
+    messages: &HiddenSendMessages,
+    inputs: &crate::proof::request_chain::ChainInputs,
+    challenges: &mut dyn crate::proof::psc_general::GeneralChallenges,
+) -> Result<crate::proof::request_chain::ChainOutputs> {
+    let shape = plan.request_chain.ok_or(Error::InvalidConfig)?;
+    let request = messages.request.as_ref().ok_or(Error::ShapeMismatch)?;
+    request.check_shape(shape)?;
+    let proof = crate::proof::request_chain::ChainProof {
+        token: request.token.clone(),
+        stack: request.stack.clone(),
+        merge: request.merge.clone(),
+    };
+    crate::proof::request_chain::verify_request_chain(inputs, &proof, challenges)
+}
+
 /// The verifier outcome: every public value plus the pending sample rows and
 /// the Eval rows the later stages consume.
 #[derive(Clone, Debug, PartialEq, Eq)]
