@@ -2765,6 +2765,14 @@ pub struct DotMapMessage {
     pub sample: SendSamples,
 }
 
+/// The request-level W's first-part message: its committed root. The plan names
+/// its oracle, shape and group; the witness keeps the tree and the value
+/// messages for the later openings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestWMessage {
+    pub root: Digest,
+}
+
 /// The complete public message of one hidden SEND-sample run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HiddenSendMessages {
@@ -2774,6 +2782,10 @@ pub struct HiddenSendMessages {
     /// consumer's reduced witness. It is committed before any sample seed is
     /// drawn; the session encoding carries it only for such a plan.
     pub reduction_root: Option<Digest>,
+    /// The request-level W's committed root, when the plan commits it. It is
+    /// absorbed in the first part before the request seals and encoded only
+    /// for such a plan, so the old bytes are unchanged.
+    pub request_w: Option<RequestWMessage>,
     pub samples: SendSamples,
     /// The opening positions per oracle, drawn after the answers.
     pub positions: Vec<Vec<u64>>,
@@ -2818,6 +2830,12 @@ impl HiddenSendMessages {
                 return Err(Error::InvalidEncoding);
             }
             writer.put_digest(&root);
+        }
+        if let Some(request_w) = &self.request_w {
+            if request_w.root == Digest::ZERO {
+                return Err(Error::InvalidEncoding);
+            }
+            writer.put_digest(&request_w.root);
         }
         writer.put_bytes(&self.samples.encode());
         writer.put_u64(self.positions.len() as u64);
@@ -2902,6 +2920,16 @@ impl HiddenSendMessages {
             Some(root)
         } else {
             None
+        };
+        let request_w = match plan.request_w {
+            Some(_) => {
+                let root = reader.get_digest()?;
+                if root == Digest::ZERO {
+                    return Err(Error::InvalidEncoding);
+                }
+                Some(RequestWMessage { root })
+            }
+            None => None,
         };
         let samples = SendSamples::decode(reader.get_bytes()?)?;
         let position_count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
@@ -3052,6 +3080,7 @@ impl HiddenSendMessages {
             activation,
             group,
             reduction_root,
+            request_w,
             samples,
             positions,
             openings,
@@ -3456,6 +3485,7 @@ pub fn prove_hidden_send(
         activation: *activation.commitment(),
         group,
         reduction_root,
+        request_w: None,
         samples: SendSamples { seed: seeds, answers },
         positions,
         openings,
@@ -7895,6 +7925,7 @@ fn prove_first(
         activation: activation_commitment,
         group,
         reduction_root,
+        request_w: None,
         samples: SendSamples { seed: seeds, answers },
         positions,
         openings,
@@ -19321,6 +19352,30 @@ mod tests {
         );
         // A point wider than the vector is refused.
         assert!(super::request_eval_row(&shape, 1, 123, &psi, &[], Fp3::ONE).is_err());
+    }
+
+    #[test]
+    fn the_request_w_root_travels_in_the_message() {
+        let fixture = fixture();
+        let mut plan = fixture.plan.clone();
+        plan.request_w = Some(super::RequestWPlan {
+            shape: plan.w,
+            oracle: plan.oracle_base + 1_000,
+            group: plan.group,
+            columns: plan.columns,
+        });
+        plan.validate().unwrap();
+        let mut messages = fixture.messages.clone();
+        messages.request_w = Some(super::RequestWMessage {
+            root: Digest([0x77; 32]),
+        });
+        let bytes = messages.encode().unwrap();
+        let decoded = super::HiddenSendMessages::decode(&plan, None, None, &bytes).unwrap();
+        assert_eq!(decoded.request_w, messages.request_w);
+        // The plan carries the field, the message does not: the parse shifts
+        // and the message is refused.
+        let bytes = fixture.messages.encode().unwrap();
+        assert!(super::HiddenSendMessages::decode(&plan, None, None, &bytes).is_err());
     }
 
     #[test]
