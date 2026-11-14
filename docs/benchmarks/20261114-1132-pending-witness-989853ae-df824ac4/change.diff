@@ -1,0 +1,703 @@
+commit 989853aec1826a6a7286733fd3c9179099ad1436
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Sat Nov 14 11:32:38 2026 +0800
+
+    Add the pending claim and reduced-witness foundation
+    
+    The hidden consumer chain's first piece: a pending claim carries row weights as aligned row blocks, a column point, the index-mask slots with their coefficients and the masked target. A chain of one pending row passes through with coefficient one; a batch is refused rather than batched here. The rows-fit check pins the index-mask message's shape and mask code, the point width, the mask slots' oracle and the weight cube.
+    
+    The reduced-witness plan fixes each table's matrix, run length, point and offsets, and enforces the order: every point before the witness root, the root before the batching challenge, no read before the root. Its coverage check requires every table entry to be read exactly once with a non-zero weight and nothing outside. Unit tests cover the block cut, the rows-fit rejections, the pass-through and the ordering and coverage rules.
+    
+    This is partial progress: the merge and the first-chain wiring are the next step.
+
+diff --git a/crates/zkie-ops/src/proof/hidden_member.rs b/crates/zkie-ops/src/proof/hidden_member.rs
+new file mode 100644
+index 00000000..76251d4e
+--- /dev/null
++++ b/crates/zkie-ops/src/proof/hidden_member.rs
+@@ -0,0 +1,673 @@
++//! Pending claims and reduced-witness tables of the hidden consumer chain.
++//!
++//! A consumer's sub-proof leaves linear claims on the committed matrix: row
++//! weights over the matrix rows, one equality point over the columns, a
++//! masked target and the index-mask entries that hide the target. One claim
++//! is `<g (x) eq(psi, .), M> + sum beta_j c_j = v`. A batch of one passes the
++//! claim through unchanged; this chain's consumer is a batch of one, so no
++//! batching sumcheck runs and the coefficient is one.
++//!
++//! The consumer's other claims read the matrix only through one reduced
++//! witness: a table whose entries are the scalar products of a run of matrix
++//! cells with a point. The table fixes per entry the matrix, the run length,
++//! the point and the entry's offset; the points are set before the witness
++//! root is committed, no entry may be read before the root, and the batching
++//! challenge is drawn only after it. Every cell of a table's matrix part is
++//! covered by exactly one read with a non-zero weight.
++
++use zkie_core::error::{Error, Result};
++use zkie_core::types::Digest;
++use zkie_engine::pcs::request::code::CodeParams;
++use zkie_engine::pcs::request::field::Fp3;
++
++/// One block of row weights inside the matrix row cube: a single row's weight,
++/// or an aligned block of rows whose values are a slice of the consumer's
++/// weight vector.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum WeightBlock {
++    /// One row, with its weight read at construction.
++    Scalar { row: u64, value: Fp3 },
++    /// `2^log_rows` consecutive rows beginning at an aligned `first_row`.
++    Dense {
++        first_row: u64,
++        log_rows: u32,
++        values: Vec<Fp3>,
++    },
++}
++
++impl WeightBlock {
++    fn rows(&self) -> u64 {
++        match self {
++            WeightBlock::Scalar { .. } => 1,
++            WeightBlock::Dense { log_rows, .. } => 1u64 << log_rows,
++        }
++    }
++}
++
++/// Cuts a dense weight range into aligned blocks of rows, at most two of each
++/// size: a block of two or more rows keeps a slice of the shared vector, and a
++/// block of one row keeps its value. The range must lie inside the row cube.
++pub fn stretch_weights(k_row: u32, first_row: u64, values: &[Fp3]) -> Result<Vec<WeightBlock>> {
++    if k_row >= 63 || values.is_empty() {
++        return Err(Error::InvalidConfig);
++    }
++    let cube = 1u64 << k_row;
++    let end = first_row
++        .checked_add(values.len() as u64)
++        .ok_or(Error::ResourceLimit)?;
++    if end > cube {
++        return Err(Error::BoundViolation);
++    }
++    let mut blocks = Vec::new();
++    let mut at = first_row;
++    while at < end {
++        let mut log_rows = 0u32;
++        while log_rows < k_row
++            && at & ((2u64 << log_rows) - 1) == 0
++            && at + (2u64 << log_rows) <= end
++        {
++            log_rows += 1;
++        }
++        if log_rows == 0 {
++            blocks.push(WeightBlock::Scalar {
++                row: at,
++                value: values[(at - first_row) as usize],
++            });
++            at += 1;
++        } else {
++            let length = 1usize << log_rows;
++            let start = (at - first_row) as usize;
++            blocks.push(WeightBlock::Dense {
++                first_row: at,
++                log_rows,
++                values: values[start..start + length].to_vec(),
++            });
++            at += length as u64;
++        }
++    }
++    Ok(blocks)
++}
++
++/// One index-mask entry consumed by a pending claim: the entry's oracle, its
++/// slot in that message, and the coefficient that multiplies it.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct MaskTerm {
++    pub oracle: u64,
++    pub slot: u64,
++    pub coeff: Fp3,
++}
++
++/// One pending claim left by a consumer's sub-proof.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct PendingRow {
++    pub weights: Vec<WeightBlock>,
++    pub psi: Vec<Fp3>,
++    pub target: Fp3,
++    pub masks: Vec<MaskTerm>,
++}
++
++impl PendingRow {
++    /// The row cube's size in bits, from the weights' extent: the smallest
++    /// cube that holds every block.
++    pub fn row_bits(&self) -> Result<u32> {
++        let mut bits = 0u32;
++        for block in &self.weights {
++            let end = match block {
++                WeightBlock::Scalar { row, .. } => row.saturating_add(1),
++                WeightBlock::Dense {
++                    first_row,
++                    log_rows,
++                    ..
++                } => first_row.saturating_add(1u64 << log_rows),
++            };
++            let need = if end <= 1 {
++                0
++            } else {
++                64 - (end - 1).leading_zeros()
++            };
++            bits = bits.max(need);
++        }
++        Ok(bits)
++    }
++}
++
++/// The index-mask message's trusted shape, as the pending claims must name it.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct IndexMaskRef {
++    pub oracle: u64,
++    pub main_rows: u64,
++    pub mask_rows: u64,
++    pub answers: u32,
++    pub mask_code: CodeParams,
++}
++
++/// Checks the pending claims against the matrix geometry and the index-mask
++/// message. Both sides run this first; a mismatch is reported with the rule
++/// that failed.
++pub fn rows_fit(
++    index: &IndexMaskRef,
++    own_mask_code: CodeParams,
++    k_row: u32,
++    k_col: u32,
++    pending: &[PendingRow],
++) -> std::result::Result<(), &'static str> {
++    if index.main_rows != 0
++        || index.mask_rows == 0
++        || index.answers == 0
++        || index.mask_code != own_mask_code
++    {
++        return Err("the index-mask message is no sampled message of mask rows alone under the own group's mask code");
++    }
++    if pending.is_empty() {
++        return Err("no pending row");
++    }
++    for row in pending {
++        if row.psi.len() != k_col as usize {
++            return Err("a pending row's column point does not fit the matrix's columns");
++        }
++        if row.weights.iter().map(WeightBlock::rows).sum::<u64>() == 0 {
++            return Err("a pending row has no row weights");
++        }
++        for block in &row.weights {
++            match block {
++                WeightBlock::Scalar { row, .. } => {
++                    if *row >= (1u64 << k_row) {
++                        return Err("a pending row's weights do not fit the matrix's rows");
++                    }
++                }
++                WeightBlock::Dense {
++                    first_row,
++                    log_rows,
++                    values,
++                } => {
++                    if *log_rows >= k_row
++                        || *first_row & ((1u64 << log_rows) - 1) != 0
++                        || first_row
++                            .checked_add(1u64 << log_rows)
++                            .map(|end| end > (1u64 << k_row))
++                            .unwrap_or(true)
++                        || values.len() != (1usize << log_rows)
++                    {
++                        return Err("a pending row's weights do not fit the matrix's rows");
++                    }
++                }
++            }
++        }
++        for term in &row.masks {
++            if term.oracle != index.oracle {
++                return Err("a pending row names a mask entry outside the index-mask message");
++            }
++        }
++    }
++    Ok(())
++}
++
++/// The claim that LIN's first part consumes: one row-weight vector, one
++/// column point, one target and the mask terms.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct CombinedClaim {
++    pub weights: Vec<WeightBlock>,
++    pub psi: Vec<Fp3>,
++    pub target: Fp3,
++    pub masks: Vec<MaskTerm>,
++}
++
++/// The claim a batch leaves. A chain of one pending row passes it through
++/// with coefficient one; more than one is not part of this consumer's chain
++/// and is refused instead of being batched here.
++pub fn claim_of(pending: &[PendingRow], coefficients: &[Fp3]) -> Result<CombinedClaim> {
++    if pending.is_empty() || coefficients.len() != pending.len() {
++        return Err(Error::InvalidConfig);
++    }
++    if pending.len() > 1 {
++        return Err(Error::UnsupportedPrimitive);
++    }
++    if coefficients[0] != Fp3::from_u64(1) {
++        return Err(Error::InvalidConfig);
++    }
++    let row = &pending[0];
++    Ok(CombinedClaim {
++        weights: row.weights.clone(),
++        psi: row.psi.clone(),
++        target: row.target,
++        masks: row.masks.clone(),
++    })
++}
++
++/// One reduced-witness table: a matrix part whose entries are the run scalar
++/// products. `phi` is the point of the run; it is empty until the point is
++/// known, and every table's point must be set before the witness root.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct ReductionTable {
++    pub matrix: u64,
++    pub parts: u64,
++    pub run_length: u64,
++    pub rows_per_part: u64,
++    pub columns: u64,
++    pub at: u64,
++    pub entries: u64,
++    pub phi: Vec<Fp3>,
++    pub later: bool,
++}
++
++/// One read of the reduced witness: `weights[i]` multiplies entry
++/// `first_entry + i` of the table.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct ReductionRead {
++    pub table: usize,
++    pub first_entry: u64,
++    pub weights: Vec<Fp3>,
++}
++
++/// Where the reduced witness is in its order: built, points set, root
++/// committed, batching challenge drawn.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum WitnessPhase {
++    Built,
++    Points,
++    Committed,
++    Batched,
++}
++
++/// The reduced witness's trusted plan and order. The plan allocates each
++/// table's offsets, fixes the points, enforces that the root follows every
++/// point and that the batching challenge follows the root, and checks that
++/// the reads cover each table exactly once with a non-zero weight.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct ReductionWitnessPlan {
++    tables: Vec<ReductionTable>,
++    next_at: u64,
++    phase: WitnessPhase,
++    root: Option<Digest>,
++    batch_challenge: Option<Fp3>,
++}
++
++impl ReductionWitnessPlan {
++    pub fn new() -> Self {
++        Self {
++            tables: Vec::new(),
++            next_at: 0,
++            phase: WitnessPhase::Built,
++            root: None,
++            batch_challenge: None,
++        }
++    }
++
++    pub fn tables(&self) -> &[ReductionTable] {
++        &self.tables
++    }
++
++    pub fn root(&self) -> Option<Digest> {
++        self.root
++    }
++
++    pub fn batch_challenge(&self) -> Option<Fp3> {
++        self.batch_challenge
++    }
++
++    /// Adds one table. Its point is supplied now for a table whose point is
++    /// already known, or left empty and set later; `later` records which.
++    pub fn add_table(
++        &mut self,
++        matrix: u64,
++        parts: u64,
++        run_length: u64,
++        rows_per_part: u64,
++        columns: u64,
++        phi: Vec<Fp3>,
++        later: bool,
++    ) -> Result<usize> {
++        if self.phase != WitnessPhase::Built {
++            return Err(Error::InvalidConfig);
++        }
++        if parts == 0
++            || run_length == 0
++            || columns == 0
++            || columns % run_length != 0
++            || rows_per_part == 0
++            || (!phi.is_empty() && phi.len() as u64 != run_length)
++        {
++            return Err(Error::InvalidConfig);
++        }
++        let per_part = rows_per_part
++            .checked_mul(columns / run_length)
++            .ok_or(Error::ResourceLimit)?;
++        let entries = per_part
++            .checked_mul(parts)
++            .ok_or(Error::ResourceLimit)?;
++        let at = self.next_at;
++        self.next_at = self
++            .next_at
++            .checked_add(entries)
++            .ok_or(Error::ResourceLimit)?;
++        self.tables.push(ReductionTable {
++            matrix,
++            parts,
++            run_length,
++            rows_per_part,
++            columns,
++            at,
++            entries,
++            phi,
++            later,
++        });
++        Ok(self.tables.len() - 1)
++    }
++
++    /// Sets the point of a table that was added without one. Only before the
++    /// root; a table whose point is already set is not overwritten.
++    pub fn set_point(&mut self, table: usize, phi: Vec<Fp3>) -> Result<()> {
++        if self.phase != WitnessPhase::Built {
++            return Err(Error::InvalidConfig);
++        }
++        let entry = self.tables.get_mut(table).ok_or(Error::InvalidIndex)?;
++        if !entry.phi.is_empty()
++            || phi.len() as u64 != entry.run_length
++            || !entry.later
++        {
++            return Err(Error::InvalidConfig);
++        }
++        entry.phi = phi;
++        Ok(())
++    }
++
++    /// Every point is known: fixes the order so the root can follow. A table
++    /// whose point is still empty refuses here.
++    pub fn points_known(&mut self) -> Result<()> {
++        if self.phase != WitnessPhase::Built {
++            return Err(Error::InvalidConfig);
++        }
++        if self.tables.iter().any(|table| table.phi.is_empty()) {
++            return Err(Error::InvalidConfig);
++        }
++        self.phase = WitnessPhase::Points;
++        Ok(())
++    }
++
++    /// Commits the witness root. Only after every point, and only once.
++    pub fn commit_root(&mut self, root: Digest) -> Result<()> {
++        if self.phase != WitnessPhase::Points || root == Digest::ZERO {
++            return Err(Error::InvalidConfig);
++        }
++        self.root = Some(root);
++        self.phase = WitnessPhase::Committed;
++        Ok(())
++    }
++
++    /// Draws the challenge that batches the claims. Only after the root.
++    pub fn draw_batch(&mut self, challenge: Fp3) -> Result<()> {
++        if self.phase != WitnessPhase::Committed || challenge.is_zero() {
++            return Err(Error::InvalidConfig);
++        }
++        self.batch_challenge = Some(challenge);
++        self.phase = WitnessPhase::Batched;
++        Ok(())
++    }
++
++    /// The witness entry a claim reads, as an absolute offset. Only after the
++    /// root, and only inside a table.
++    pub fn read(&self, table: usize, entry: u64) -> Result<u64> {
++        if self.phase != WitnessPhase::Committed && self.phase != WitnessPhase::Batched {
++            return Err(Error::InvalidConfig);
++        }
++        let table = self.tables.get(table).ok_or(Error::InvalidIndex)?;
++        if entry >= table.entries {
++            return Err(Error::InvalidIndex);
++        }
++        Ok(table.at + entry)
++    }
++
++    /// Checks that the reads cover every entry of every table exactly once
++    /// with a non-zero weight, and that no read leaves its table.
++    pub fn check_reads(&self, reads: &[ReductionRead]) -> Result<()> {
++        if self.phase != WitnessPhase::Committed && self.phase != WitnessPhase::Batched {
++            return Err(Error::InvalidConfig);
++        }
++        let total = usize::try_from(self.next_at).map_err(|_| Error::ResourceLimit)?;
++        let mut covered = vec![0u32; total];
++        for read in reads {
++            let table = self.tables.get(read.table).ok_or(Error::InvalidIndex)?;
++            if read.weights.is_empty() {
++                return Err(Error::InvalidConfig);
++            }
++            let end = read
++                .first_entry
++                .checked_add(read.weights.len() as u64)
++                .ok_or(Error::ResourceLimit)?;
++            if end > table.entries {
++                return Err(Error::InvalidIndex);
++            }
++            for (index, weight) in read.weights.iter().enumerate() {
++                if weight.is_zero() {
++                    return Err(Error::InvalidConfig);
++                }
++                let at = usize::try_from(table.at + read.first_entry + index as u64)
++                    .map_err(|_| Error::ResourceLimit)?;
++                let slot = covered.get_mut(at).ok_or(Error::InvalidIndex)?;
++                *slot = slot.checked_add(1).ok_or(Error::ResourceLimit)?;
++            }
++        }
++        if covered.iter().any(|count| *count != 1) {
++            return Err(Error::InvalidConfig);
++        }
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn fp(value: u64) -> Fp3 {
++        Fp3::from_u64(value)
++    }
++
++    fn mask() -> IndexMaskRef {
++        IndexMaskRef {
++            oracle: 60,
++            main_rows: 0,
++            mask_rows: 4,
++            answers: 1,
++            mask_code: CodeParams {
++                log_n: 14,
++                ell: 256,
++                r: 8,
++            },
++        }
++    }
++
++    fn pending() -> PendingRow {
++        PendingRow {
++            weights: vec![WeightBlock::Dense {
++                first_row: 0,
++                log_rows: 1,
++                values: vec![fp(1), fp(2)],
++            }],
++            psi: vec![fp(5), fp(6), fp(7)],
++            target: fp(9),
++            masks: vec![MaskTerm {
++                oracle: 60,
++                slot: 3,
++                coeff: fp(11),
++            }],
++        }
++    }
++
++    #[test]
++    fn weights_are_cut_into_aligned_blocks() {
++        let values: Vec<Fp3> = (0..6).map(fp).collect();
++        let blocks = stretch_weights(4, 0, &values).unwrap();
++        // 0..4 is one aligned block of four, 4 is aligned to two, 5 is one row.
++        assert_eq!(
++            blocks,
++            vec![
++                WeightBlock::Dense {
++                    first_row: 0,
++                    log_rows: 2,
++                    values: vec![fp(0), fp(1), fp(2), fp(3)],
++                },
++                WeightBlock::Dense {
++                    first_row: 4,
++                    log_rows: 1,
++                    values: vec![fp(4), fp(5)],
++                },
++            ]
++        );
++        let blocks = stretch_weights(3, 5, &[fp(7), fp(8), fp(9)]).unwrap();
++        // Row 5 is aligned to one row only; rows 6 and 7 begin an aligned block
++        // of two.
++        assert_eq!(
++            blocks,
++            vec![
++                WeightBlock::Scalar {
++                    row: 5,
++                    value: fp(7)
++                },
++                WeightBlock::Dense {
++                    first_row: 6,
++                    log_rows: 1,
++                    values: vec![fp(8), fp(9)],
++                },
++            ]
++        );
++        // A range outside the row cube is refused.
++        assert!(stretch_weights(2, 2, &[fp(1), fp(2), fp(3)]).is_err());
++        assert!(stretch_weights(4, 15, &[fp(1), fp(2)]).is_err());
++    }
++
++    #[test]
++    fn pending_rows_fit_the_geometry_and_the_mask() {
++        let rows = [pending()];
++        assert!(rows_fit(&mask(), mask().mask_code, 2, 3, &rows).is_ok());
++        // The index-mask message must be mask rows only, sampled, under the own
++        // group's mask code.
++        let mut bad = mask();
++        bad.main_rows = 1;
++        assert!(rows_fit(&bad, mask().mask_code, 2, 3, &rows).is_err());
++        let mut bad = mask();
++        bad.mask_rows = 0;
++        assert!(rows_fit(&bad, mask().mask_code, 2, 3, &rows).is_err());
++        let mut bad = mask();
++        bad.answers = 0;
++        assert!(rows_fit(&bad, mask().mask_code, 2, 3, &rows).is_err());
++        let mut bad = mask();
++        bad.mask_code.r += 1;
++        assert!(rows_fit(&bad, mask().mask_code, 2, 3, &rows).is_err());
++        // No pending row, a point of another width, a mask entry of another
++        // message, and a weight range outside the cube are each refused.
++        assert!(rows_fit(&mask(), mask().mask_code, 2, 3, &[]).is_err());
++        assert!(rows_fit(&mask(), mask().mask_code, 2, 4, &rows).is_err());
++        let mut bad = pending();
++        bad.masks[0].oracle = 61;
++        assert!(rows_fit(&mask(), mask().mask_code, 2, 3, &[bad.clone()]).is_err());
++        let mut bad = pending();
++        bad.weights[0] = WeightBlock::Dense {
++            first_row: 0,
++            log_rows: 3,
++            values: vec![fp(1); 8],
++        };
++        assert!(rows_fit(&mask(), mask().mask_code, 2, 3, &[bad]).is_err());
++    }
++
++    #[test]
++    fn one_pending_row_passes_through_and_a_batch_is_refused() {
++        let claim = claim_of(&[pending()], &[fp(1)]).unwrap();
++        assert_eq!(claim.target, fp(9));
++        assert_eq!(claim.psi.len(), 3);
++        assert_eq!(claim.masks.len(), 1);
++        // The coefficient of a chain of one is one; another coefficient, and a
++        // second claim, are not this consumer's chain.
++        assert!(claim_of(&[pending()], &[fp(2)]).is_err());
++        assert!(claim_of(&[pending(), pending()], &[fp(1), fp(1)]).is_err());
++        assert!(claim_of(&[], &[]).is_err());
++    }
++
++    fn witness() -> ReductionWitnessPlan {
++        let mut plan = ReductionWitnessPlan::new();
++        // One table of two parts, runs of four cells over two rows of eight.
++        let at = plan
++            .add_table(0, 2, 4, 2, 8, vec![fp(1), fp(2), fp(3), fp(4)], false)
++            .unwrap();
++        assert_eq!(at, 0);
++        assert_eq!(plan.tables()[0].entries, 8);
++        plan.points_known().unwrap();
++        plan
++    }
++
++    #[test]
++    fn the_witness_order_holds() {
++        let mut plan = witness();
++        assert!(plan.read(0, 0).is_err());
++        assert!(plan.commit_root(Digest([0x11; 32])).is_ok());
++        assert!(plan.read(0, 7).is_ok());
++        assert!(plan.read(0, 8).is_err());
++        assert!(plan.draw_batch(fp(3)).is_ok());
++        assert_eq!(plan.batch_challenge(), Some(fp(3)));
++        // The root is fixed once, and the challenge only after it.
++        assert!(plan.commit_root(Digest([0x12; 32])).is_err());
++        assert!(plan.draw_batch(fp(4)).is_err());
++    }
++
++    #[test]
++    fn a_later_point_must_be_set_before_the_root() {
++        let mut plan = ReductionWitnessPlan::new();
++        plan.add_table(1, 1, 2, 1, 4, Vec::new(), true).unwrap();
++        assert!(plan.points_known().is_err());
++        assert!(plan.commit_root(Digest([0x21; 32])).is_err());
++        assert!(plan.set_point(0, vec![fp(1)]).is_err());
++        plan.set_point(0, vec![fp(1), fp(2)]).unwrap();
++        plan.points_known().unwrap();
++        assert!(plan.commit_root(Digest([0x22; 32])).is_ok());
++        // A point of another length and a table whose point is already set are
++        // not overwritten.
++        let mut plan = ReductionWitnessPlan::new();
++        plan.add_table(1, 1, 2, 1, 4, Vec::new(), true).unwrap();
++        assert!(plan.set_point(0, vec![fp(1)]).is_err());
++        let mut plan = ReductionWitnessPlan::new();
++        plan.add_table(1, 1, 2, 1, 4, vec![fp(1), fp(2)], false)
++            .unwrap();
++        assert!(plan.set_point(0, vec![fp(3), fp(4)]).is_err());
++    }
++
++    #[test]
++    fn reads_must_cover_each_entry_once_with_a_weight() {
++        let mut plan = witness();
++        plan.commit_root(Digest([0x31; 32])).unwrap();
++        let ones = vec![fp(1); 8];
++        let read = ReductionRead {
++            table: 0,
++            first_entry: 0,
++            weights: ones.clone(),
++        };
++        assert!(plan.check_reads(&[read.clone()]).is_ok());
++        // A missing entry, a duplicate, a zero weight, an out-of-table read and
++        // a missing table are each refused.
++        let mut short = read.clone();
++        short.weights.pop();
++        assert!(plan.check_reads(&[short]).is_err());
++        assert!(plan
++            .check_reads(&[read.clone(), ReductionRead {
++                table: 0,
++                first_entry: 0,
++                weights: vec![fp(1)],
++            }])
++            .is_err());
++        let mut zero = read.clone();
++        zero.weights[3] = Fp3::ZERO;
++        assert!(plan.check_reads(&[zero]).is_err());
++        assert!(plan
++            .check_reads(&[ReductionRead {
++                table: 0,
++                first_entry: 1,
++                weights: vec![fp(1); 8],
++            }])
++            .is_err());
++        assert!(plan
++            .check_reads(&[ReductionRead {
++                table: 1,
++                first_entry: 0,
++                weights: vec![fp(1)],
++            }])
++            .is_err());
++    }
++}
+diff --git a/crates/zkie-ops/src/proof/mod.rs b/crates/zkie-ops/src/proof/mod.rs
+index 0f7d2ff9..f47ce842 100644
+--- a/crates/zkie-ops/src/proof/mod.rs
++++ b/crates/zkie-ops/src/proof/mod.rs
+@@ -12,6 +12,7 @@ pub mod fold_handoff;
+ pub mod group_commitment_session;
+ pub mod group_row_session;
+ pub mod gu_combine_session;
++pub mod hidden_member;
+ pub mod hidden_send_session;
+ pub mod hidden_norm;
+ pub mod hidden_norm_psc;
