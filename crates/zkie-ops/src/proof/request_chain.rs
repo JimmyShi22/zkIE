@@ -292,6 +292,22 @@ impl ChainMaskReads {
 }
 
 impl ChainMaskPlan {
+    /// The number of seed coordinates the mask sample form reads: the row bits
+    /// of the mask table plus the mask code message bits.
+    pub fn sample_bits(&self) -> Result<u32> {
+        if self.fault().is_some() {
+            return Err(Error::InvalidConfig);
+        }
+        let row_bits = if self.mask_rows <= 1 {
+            0
+        } else {
+            64 - (self.mask_rows - 1).leading_zeros()
+        };
+        row_bits
+            .checked_add(self.mask_code.log_ell())
+            .ok_or(Error::ResourceLimit)
+    }
+
     /// Checks one test's opening list of the table and records it in the
     /// table's read ledger: the count is the plan's openings, every position
     /// lies in the tree's columns, no position repeats, and the accumulated
@@ -1177,6 +1193,9 @@ mod chain_mask_tests {
         assert!(zero.open(&plan, 0).is_err());
         // One test's opening list: the plan count, positions inside the tree,
         // no repeats, and the table's own read ledger.
+        // The sample form reads the mask table row bits and the mask code
+        // message bits.
+        assert_eq!(plan.sample_bits().unwrap(), 2 + 4);
         let mut fresh = ChainMaskReads::default();
         plan.check_positions(&[0, 1, 2, 3], &mut fresh).unwrap();
         assert_eq!(fresh.used, 4);
