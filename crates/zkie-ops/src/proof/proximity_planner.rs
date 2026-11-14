@@ -506,6 +506,35 @@ fn stage_cube_bits(group: &GroupShape) -> u32 {
     main.max(mask) + 1
 }
 
+/// The row bits of one group of oracle members. Each member occupies an
+/// aligned power-of-two block of main rows and of mask rows; the group has
+/// `2^k` main rows and `2^h` mask rows, with `k >= h` and `k >= 1`. The
+/// members are the oracle messages that actually join the group, in any
+/// order: the sums only depend on the aligned block sizes.
+pub fn lin_group_bits(main_rows: &[u64], mask_rows: &[u64]) -> Result<(u32, u32)> {
+    use zkie_engine::pcs::request::plan::{ceil_log2 as plan_ceil_log2, pow2_at_least};
+    if main_rows.is_empty() || main_rows.len() != mask_rows.len() {
+        return Err(Error::InvalidConfig);
+    }
+    let mut main = 0u64;
+    let mut mask = 0u64;
+    for (rows, mask_rows) in main_rows.iter().zip(mask_rows) {
+        if *rows > 0 {
+            main = main
+                .checked_add(pow2_at_least(*rows)?)
+                .ok_or(Error::ResourceLimit)?;
+        }
+        if *mask_rows > 0 {
+            mask = mask
+                .checked_add(pow2_at_least(*mask_rows)?)
+                .ok_or(Error::ResourceLimit)?;
+        }
+    }
+    let h = if mask > 0 { plan_ceil_log2(mask)? } else { 0 };
+    let main_bits = if main > 0 { plan_ceil_log2(main)? } else { 0 };
+    Ok((main_bits.max(h).max(1), h))
+}
+
 fn ceil_log2(value: u64) -> u32 {
     if value <= 1 {
         return 0;
@@ -844,4 +873,25 @@ mod tests {
         assert_eq!(largest_m(&tiny, load), 0);
     }
 
+}
+
+#[cfg(test)]
+mod lin_group_bits_tests {
+    use super::*;
+
+    #[test]
+    fn group_bits_follow_the_member_row_blocks() {
+        // A request's group of an input mask message, W and Omega with one
+        // main row each: two main rows and one mask row.
+        assert_eq!(lin_group_bits(&[1, 1, 0], &[0, 0, 1]).unwrap(), (1, 0));
+        // Unaligned main rows are rounded up to their aligned blocks.
+        assert_eq!(lin_group_bits(&[3, 2, 0], &[0, 0, 1]).unwrap(), (3, 0));
+        // The table-sized shape: a 1024-row W, a 513-row Omega and a four-row
+        // mask message.
+        assert_eq!(lin_group_bits(&[1024, 513, 0], &[0, 0, 4]).unwrap(), (11, 2));
+        // A group with only mask rows still needs one main row bit.
+        assert_eq!(lin_group_bits(&[0], &[1]).unwrap(), (1, 0));
+        assert!(lin_group_bits(&[], &[]).is_err());
+        assert!(lin_group_bits(&[1], &[1, 1]).is_err());
+    }
 }
