@@ -8,9 +8,21 @@
 //! is refused rather than reinterpreted.
 
 use zkie_core::error::{Error, Result};
+use zkie_engine::pcs::request::field::Fp3;
 use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
 
-use crate::proof::psc_general::GeneralProof;
+use crate::proof::hidden_member::PendingRow;
+use crate::proof::psc::PscRound;
+use crate::proof::psc_general::{
+    GeneralChallenges, GeneralMaskEntries, GeneralOutput, GeneralProof, MaskTerm,
+};
+use crate::proof::request_reduction::{prove_token_kept, verify_token_kept};
+use crate::proof::request_stack::{prove_stack, verify_stack, StackReduction};
+use crate::proof::request_start::{token_start, StartForm};
+use crate::proof::request_weights::{
+    prove_merge, verify_merge, MergeValue, WeightClaim, WeightLayout,
+};
+use crate::proof::row_claim::RowForm;
 
 /// The section's version.
 pub const REQUEST_CHAIN_VERSION: u64 = 1;
@@ -72,6 +84,266 @@ impl RequestChainMessages {
             merge,
         })
     }
+}
+
+/// Mask slots at and above this one name the start form's hiding entries.
+pub const START_HIDING_SLOT: usize = 1 << 24;
+
+/// Everything the chain proves and checks, in one place. The witnesses are the
+/// maps of the three sumchecks; the verifier supplies the same values except
+/// the kept map of the token sumcheck.
+pub struct ChainInputs<'a> {
+    pub token_point: &'a [Fp3],
+    pub token_shown: &'a [Fp3],
+    pub token_kept: &'a [Fp3],
+    pub token_claim_masks: &'a [MaskTerm],
+    pub token_shown_claim: Fp3,
+    pub token_claim_slot: usize,
+    pub token_masks: &'a GeneralMaskEntries,
+    pub reduction: &'a StackReduction,
+    pub stack_left: &'a [Vec<Fp3>],
+    pub stack_right: &'a [Vec<Fp3>],
+    pub om: &'a [Fp3],
+    pub stack_masks: &'a GeneralMaskEntries,
+    pub layout: &'a WeightLayout,
+    pub claims: &'a [WeightClaim],
+    pub claim_maps: &'a [Vec<Fp3>],
+    pub values: &'a [MergeValue],
+    pub merge_masks: &'a GeneralMaskEntries,
+    pub mask_value: &'a dyn Fn(usize) -> Result<Fp3>,
+    pub index_oracle: u64,
+    pub index_slot: u64,
+}
+
+/// One request chain's proofs, in the order the chain runs them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChainProof {
+    pub token: GeneralProof,
+    pub stack: GeneralProof,
+    pub merge: GeneralProof,
+}
+
+/// What the chain's verifier returns: the sub-proofs' outputs, the merge's row
+/// weights and the pending claim the request's member chain consumes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChainOutputs {
+    pub token: GeneralOutput,
+    pub stack: GeneralOutput,
+    pub merge: GeneralOutput,
+    pub gamma: Vec<Fp3>,
+    pub pending: PendingRow,
+}
+
+/// Records the challenges drawn while one sub-proof runs, so the token
+/// sumcheck's discount factor is available to the start form.
+struct Recorder<'a> {
+    inner: &'a mut dyn GeneralChallenges,
+    draws: Vec<Fp3>,
+}
+
+impl Recorder<'_> {
+    fn epsilon(&self) -> Result<Fp3> {
+        self.draws
+            .first()
+            .copied()
+            .filter(|value| !value.is_zero())
+            .ok_or(Error::InvalidConfig)
+    }
+}
+
+impl GeneralChallenges for Recorder<'_> {
+    fn draw(&mut self) -> Result<Fp3> {
+        let value = self.inner.draw()?;
+        self.draws.push(value);
+        Ok(value)
+    }
+    fn draw_nonzero(&mut self) -> Result<Fp3> {
+        let value = self.inner.draw_nonzero()?;
+        self.draws.push(value);
+        Ok(value)
+    }
+    fn send_hiding_sum(&mut self, value: Fp3) -> Result<()> {
+        self.inner.send_hiding_sum(value)
+    }
+    fn send_round(&mut self, index: usize, round: &PscRound) -> Result<()> {
+        self.inner.send_round(index, round)
+    }
+    fn send_end_values(&mut self, values: &[Fp3]) -> Result<()> {
+        self.inner.send_end_values(values)
+    }
+}
+
+/// The token claim's factor: the coefficient of its slot in the token claim
+/// masks. Exactly one term may name the slot.
+fn claim_factor(inputs: &ChainInputs) -> Result<Fp3> {
+    let mut factor = None;
+    for term in inputs.token_claim_masks {
+        if term.slot == inputs.token_claim_slot {
+            if factor.is_some() {
+                return Err(Error::InvalidConfig);
+            }
+            factor = Some(term.coefficient);
+        }
+    }
+    factor.ok_or(Error::InvalidConfig)
+}
+
+/// The stack's claim masks: the start form's slot terms, then its hiding
+/// coefficients at `START_HIDING_SLOT..`.
+fn start_terms(start: &StartForm) -> Vec<MaskTerm> {
+    let mut terms: Vec<MaskTerm> = start
+        .claims
+        .iter()
+        .map(|term| MaskTerm {
+            slot: term.slot,
+            coefficient: term.coefficient,
+        })
+        .collect();
+    for (index, coefficient) in start.hiding.iter().enumerate() {
+        terms.push(MaskTerm {
+            slot: START_HIDING_SLOT + index,
+            coefficient: *coefficient,
+        });
+    }
+    terms
+}
+
+fn start_form(token: &GeneralOutput, epsilon: Fp3, inputs: &ChainInputs) -> Result<StartForm> {
+    token_start(
+        token,
+        epsilon,
+        inputs.token_claim_slot,
+        inputs.token_shown_claim,
+        claim_factor(inputs)?,
+        inputs.om.first().copied().ok_or(Error::InvalidConfig)?,
+    )
+}
+
+/// Proves one request chain in the order the transcript carries it: the kept
+/// token sumcheck, the batched stack whose start absorbs the token claim, and
+/// the weight merge. The prover checks its own row claims before handing them
+/// on.
+pub fn prove_request_chain(
+    inputs: &ChainInputs,
+    challenges: &mut dyn GeneralChallenges,
+) -> Result<ChainProof> {
+    let (token, token_output, epsilon) = {
+        let mut recorder = Recorder {
+            inner: challenges,
+            draws: Vec::new(),
+        };
+        let (proof, output) = prove_token_kept(
+            inputs.token_point,
+            inputs.token_shown,
+            inputs.token_kept,
+            inputs.token_claim_masks,
+            inputs.mask_value,
+            inputs.token_shown_claim,
+            inputs.token_masks,
+            &mut recorder,
+        )?;
+        let epsilon = recorder.epsilon()?;
+        (proof, output, epsilon)
+    };
+    let start = start_form(&token_output, epsilon, inputs)?;
+    let terms = start_terms(&start);
+    let (stack, stack_output) = prove_stack(
+        inputs.reduction,
+        inputs.stack_left,
+        inputs.stack_right,
+        inputs.om,
+        &terms,
+        inputs.mask_value,
+        start.constant,
+        inputs.stack_masks,
+        challenges,
+    )?;
+    let outcome = prove_merge(
+        inputs.layout,
+        inputs.claims,
+        inputs.claim_maps,
+        inputs.values,
+        inputs.mask_value,
+        inputs.merge_masks,
+        challenges,
+    )?;
+    RowForm::from_output(&stack_output).check(
+        &inputs.stack_masks.hiding,
+        inputs.mask_value,
+        &[],
+    )?;
+    RowForm::from_output(&outcome.output).check(
+        &inputs.merge_masks.hiding,
+        inputs.mask_value,
+        &[],
+    )?;
+    Ok(ChainProof {
+        token,
+        stack,
+        merge: outcome.proof,
+    })
+}
+
+/// Verifies one request chain: the three sub-proofs in transcript order, the
+/// two row claims on the transcript's mask entries, and the pending claim the
+/// merge leaves.
+pub fn verify_request_chain(
+    inputs: &ChainInputs,
+    proof: &ChainProof,
+    challenges: &mut dyn GeneralChallenges,
+) -> Result<ChainOutputs> {
+    let (token, epsilon) = {
+        let mut recorder = Recorder {
+            inner: challenges,
+            draws: Vec::new(),
+        };
+        let output = verify_token_kept(
+            inputs.token_point,
+            inputs.token_claim_masks,
+            inputs.token_shown_claim,
+            &proof.token,
+            inputs.token_masks.hiding.len(),
+            &mut recorder,
+        )?;
+        let epsilon = recorder.epsilon()?;
+        (output, epsilon)
+    };
+    let start = start_form(&token, epsilon, inputs)?;
+    let terms = start_terms(&start);
+    let stack = verify_stack(
+        inputs.reduction,
+        &terms,
+        start.constant,
+        &proof.stack,
+        inputs.stack_masks.hiding.len(),
+        challenges,
+    )?;
+    let (merge, _rows, gamma) = verify_merge(
+        inputs.layout,
+        inputs.claims,
+        inputs.values,
+        &proof.merge,
+        inputs.merge_masks.hiding.len(),
+        challenges,
+    )?;
+    RowForm::from_output(&stack).check(&inputs.stack_masks.hiding, inputs.mask_value, &[])?;
+    RowForm::from_output(&merge).check(&inputs.merge_masks.hiding, inputs.mask_value, &[])?;
+    let end = merge.ends.first().ok_or(Error::ShapeMismatch)?;
+    let pending = inputs.layout.pending_row(
+        &gamma,
+        &merge.point,
+        end.mask_scale,
+        end.value,
+        inputs.index_oracle,
+        inputs.index_slot,
+    )?;
+    Ok(ChainOutputs {
+        token,
+        stack,
+        merge,
+        gamma,
+        pending,
+    })
 }
 
 #[cfg(test)]
@@ -154,5 +426,235 @@ mod tests {
         // Truncated bytes are refused.
         let mut reader = CanonicalReader::new(&bytes[..bytes.len() - 4], DecodeLimits::unlimited());
         assert!(RequestChainMessages::decode(&mut reader, shape()).is_err());
+    }
+
+    use crate::proof::psc_general::{
+        general_variables, GeneralMaskEntries, Summand,
+    };
+    use crate::proof::request_reduction::{prove_token_kept, token_kept_claim, verify_token_kept};
+    use crate::proof::request_stack::StackPanel;
+    use crate::proof::request_start::token_start;
+    use crate::proof::request_weights::{
+        ClaimFactor, MergeValue, WeightClaim, WeightGroup, WeightLayout,
+    };
+
+    struct Source(u64);
+
+    impl GeneralChallenges for Source {
+        fn draw(&mut self) -> Result<Fp3> {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+            Ok(Fp3::from_u64(self.0))
+        }
+        fn draw_nonzero(&mut self) -> Result<Fp3> {
+            for _ in 0..64 {
+                let value = self.draw()?;
+                if value != Fp3::ZERO {
+                    return Ok(value);
+                }
+            }
+            Err(Error::EntropyUnavailable)
+        }
+        fn send_hiding_sum(&mut self, _value: Fp3) -> Result<()> {
+            Ok(())
+        }
+        fn send_round(&mut self, _index: usize, _round: &PscRound) -> Result<()> {
+            Ok(())
+        }
+        fn send_end_values(&mut self, _values: &[Fp3]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn chain_mask(slot: usize) -> Result<Fp3> {
+        if slot == 3 {
+            Ok(f(953))
+        } else if slot == 0 || slot == 1 {
+            Ok(Fp3::ZERO)
+        } else if slot >= START_HIDING_SLOT {
+            Ok(f(700 + (slot - START_HIDING_SLOT) as u64))
+        } else {
+            Ok(f(950 + slot as u64))
+        }
+    }
+
+    fn index_mask(_oracle: u64, slot: u64) -> Result<Fp3> {
+        Ok(f(600 + slot))
+    }
+
+    fn hiding_count(variables: &[crate::proof::psc::Weight], summand: &Summand) -> usize {
+        crate::proof::psc::hp_entries(&general_variables(variables, summand).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn the_chain_verifies_and_leaves_the_pending_claim() {
+        let point = [f(2), f(3)];
+        let token_shown = vec![f(1), f(2), f(3), f(4)];
+        let token_kept = vec![f(5), f(6), f(7), f(8)];
+        let hidden = token_kept_claim(&point, &token_shown, &token_kept).unwrap();
+        let factor = f(11);
+        let shown_claim = hidden.add(&factor.mul(&f(953)));
+        let claim_masks = [MaskTerm {
+            slot: 3,
+            coefficient: factor,
+        }];
+        let token_variables = crate::proof::request_reduction::token_variables(&point).unwrap();
+        let token_masks = GeneralMaskEntries {
+            hiding: (0..hiding_count(&token_variables, &Summand::ShownKept))
+                .map(|i| f(700 + i as u64))
+                .collect(),
+            shown: vec![f(800)],
+        };
+        // The token proof at the dry run gives the start form the stack needs.
+        let (token_proof, _) = prove_token_kept(
+            &point,
+            &token_shown,
+            &token_kept,
+            &claim_masks,
+            &chain_mask,
+            shown_claim,
+            &token_masks,
+            &mut Source(61),
+        )
+        .unwrap();
+        let token_output = verify_token_kept(
+            &point,
+            &claim_masks,
+            shown_claim,
+            &token_proof,
+            token_masks.hiding.len(),
+            &mut Source(61),
+        )
+        .unwrap();
+        let mut source = Source(61);
+        let epsilon = source.draw().unwrap();
+        let batch = f(5);
+        let start = token_start(&token_output, epsilon, 3, shown_claim, factor, batch).unwrap();
+        let terms = start_terms(&start);
+        let mut hidden_cstart = start.constant;
+        for term in &terms {
+            hidden_cstart =
+                hidden_cstart.sub(&term.coefficient.mul(&chain_mask(term.slot).unwrap()));
+        }
+        let panel_value = hidden_cstart.mul(&batch.inverse().unwrap());
+        let reduction = StackReduction::new(vec![StackPanel {
+            claim: 0,
+            ec: Fp3::ONE,
+            ni: 2,
+            ny: 1,
+            weight: vec![Fp3::ONE, Fp3::ONE],
+            first_claim: None,
+            w: 0,
+            off: 0,
+        }])
+        .unwrap();
+        let stack_left = vec![vec![panel_value, Fp3::ZERO]];
+        let stack_right = vec![vec![Fp3::ONE, Fp3::ONE]];
+        let om = vec![batch];
+        let stack_variables = (0..reduction.lam)
+            .map(|_| crate::proof::psc::Weight::plain(3))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let stack_masks = GeneralMaskEntries {
+            hiding: (0..hiding_count(&stack_variables, &Summand::Product))
+                .map(|i| f(600 + i as u64))
+                .collect(),
+            shown: vec![f(810), f(811)],
+        };
+        // The weight merge: two claims over a two-bit column cube.
+        let mut layout = WeightLayout::new(2).unwrap();
+        layout
+            .add(0, 0, 1, vec![WeightGroup::e("x", 4, false).unwrap()])
+            .unwrap();
+        let claims = vec![
+            WeightClaim {
+                unit: 0,
+                factors: vec![ClaimFactor::e(vec![f(2)], vec![f(3), f(5)])],
+            },
+            WeightClaim {
+                unit: 0,
+                factors: vec![ClaimFactor::e(vec![f(7)], vec![f(11), f(13)])],
+            },
+        ];
+        let maps = vec![
+            vec![f(1), f(2), f(3), f(4)],
+            vec![f(4), f(6), f(4), f(6)],
+        ];
+        let values = vec![
+            MergeValue {
+                shown: f(10),
+                mask_slot: 0,
+                mask_factor: f(3),
+            },
+            MergeValue {
+                shown: f(20),
+                mask_slot: 1,
+                mask_factor: f(5),
+            },
+        ];
+        let merge_variables = (0..layout.lk)
+            .map(|_| crate::proof::psc::Weight::plain(2))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let merge_masks = GeneralMaskEntries {
+            hiding: (0..hiding_count(&merge_variables, &Summand::Map))
+                .map(|i| f(500 + i as u64))
+                .collect(),
+            shown: vec![f(801)],
+        };
+        let inputs = ChainInputs {
+            token_point: &point,
+            token_shown: &token_shown,
+            token_kept: &token_kept,
+            token_claim_masks: &claim_masks,
+            token_shown_claim: shown_claim,
+            token_claim_slot: 3,
+            token_masks: &token_masks,
+            reduction: &reduction,
+            stack_left: &stack_left,
+            stack_right: &stack_right,
+            om: &om,
+            stack_masks: &stack_masks,
+            layout: &layout,
+            claims: &claims,
+            claim_maps: &maps,
+            values: &values,
+            merge_masks: &merge_masks,
+            mask_value: &chain_mask,
+            index_oracle: 60,
+            index_slot: 7,
+        };
+        let proof = prove_request_chain(&inputs, &mut Source(61)).unwrap();
+        let outputs = verify_request_chain(&inputs, &proof, &mut Source(61)).unwrap();
+        // The pending claim holds on a matrix built to satisfy it.
+        let mut mask_total = Fp3::ZERO;
+        for term in &outputs.pending.masks {
+            mask_total = mask_total.add(&term.coeff.mul(&index_mask(term.oracle, term.slot).unwrap()));
+        }
+        let needed = outputs.pending.target.sub(&mask_total);
+        let mut matrix = vec![vec![Fp3::ZERO; 4]; outputs.gamma.len()];
+        let row = outputs
+            .gamma
+            .iter()
+            .position(|value| *value != Fp3::ZERO)
+            .unwrap();
+        let cell = needed.mul(&outputs.gamma[row].inverse().unwrap());
+        matrix[row] = vec![cell; 4];
+        crate::proof::hidden_member::check_pending(&outputs.pending, &matrix, &index_mask).unwrap();
+        // Another matrix value or mask value breaks the pending claim.
+        let mut changed = matrix.clone();
+        changed[row][0] = changed[row][0].add(&Fp3::ONE);
+        assert!(crate::proof::hidden_member::check_pending(&outputs.pending, &changed, &index_mask).is_err());
+        let other_mask = |_oracle: u64, slot: u64| Ok(f(601 + slot));
+        assert!(crate::proof::hidden_member::check_pending(&outputs.pending, &matrix, &other_mask).is_err());
+        // A changed token proof breaks the stack's start.
+        let mut tampered = proof.clone();
+        tampered.token.rounds[0].coefficients[0] =
+            tampered.token.rounds[0].coefficients[0].add(&Fp3::ONE);
+        assert!(verify_request_chain(&inputs, &tampered, &mut Source(61)).is_err());
+        // A changed merge proof fails the merge's own row claim.
+        let mut tampered = proof.clone();
+        tampered.merge.rounds[0].coefficients[0] =
+            tampered.merge.rounds[0].coefficients[0].add(&Fp3::ONE);
+        assert!(verify_request_chain(&inputs, &tampered, &mut Source(61)).is_err());
     }
 }
