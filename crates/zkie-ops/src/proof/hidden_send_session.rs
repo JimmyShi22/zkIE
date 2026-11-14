@@ -3741,7 +3741,7 @@ pub fn verify_request_chain_section(
         stack: request.stack.clone(),
         merge: request.merge.clone(),
     };
-    crate::proof::request_chain::verify_request_chain(inputs, &proof, challenges)
+    crate::proof::request_chain::verify_request_chain_direct(inputs, &proof, challenges)
 }
 
 /// The verifier outcome: every public value plus the pending sample rows and
@@ -5071,6 +5071,8 @@ fn draw_chain_mask_positions(
 /// free entries. No entry number is a bare constant.
 struct SegmentSlotLayout {
     token_hiding: usize,
+    stack_hiding: usize,
+    stack_base: usize,
     end_base: usize,
     merge_base: usize,
     claim_base: usize,
@@ -5088,7 +5090,10 @@ impl SegmentSlotLayout {
         {
             return Err(Error::InvalidConfig);
         }
-        let end_base = inputs.token_masks.hiding.len();
+        let stack_base = inputs.token_masks.hiding.len();
+        let end_base = stack_base
+            .checked_add(inputs.stack_masks.hiding.len())
+            .ok_or(Error::ResourceLimit)?;
         let merge_base = end_base
             .checked_add(inputs.end_slots.len())
             .ok_or(Error::ResourceLimit)?;
@@ -5103,6 +5108,8 @@ impl SegmentSlotLayout {
         }
         Ok(Self {
             token_hiding: inputs.token_masks.hiding.len(),
+            stack_hiding: inputs.stack_masks.hiding.len(),
+            stack_base,
             end_base,
             merge_base,
             claim_base,
@@ -5132,6 +5139,12 @@ impl SegmentSlotLayout {
                 .checked_add(index)
                 .ok_or(Error::ResourceLimit);
         }
+        // The stack's start terms carry the token sumcheck's hiding entries at
+        // the start-hiding slots; those entries live in the token region.
+        let hiding = crate::proof::request_chain::START_HIDING_SLOT;
+        if slot >= hiding && slot - hiding < self.token_hiding {
+            return Ok(slot - hiding);
+        }
         Err(Error::InvalidIndex)
     }
 }
@@ -5156,6 +5169,9 @@ fn segment_mask_rows(
     };
     for (index, value) in inputs.token_masks.hiding.iter().enumerate() {
         put(index, *value)?;
+    }
+    for (index, value) in inputs.stack_masks.hiding.iter().enumerate() {
+        put(layout.stack_base + index, *value)?;
     }
     for (index, value) in inputs.stack_masks.shown.iter().enumerate() {
         put(layout.end_base + index, *value)?;
@@ -5554,6 +5570,34 @@ fn chain_relation_rows(
     }
     token_row.target = token.constant;
 
+    // The stack's remaining row: the PSC's hiding form and its count-weighted
+    // claim slots, including the token start's hiding terms.
+    let stack = RowForm::from_output(&outputs.stack);
+    if stack.hiding.len() != inputs.stack_masks.hiding.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut stack_row = BatRow::new(BatRowKind::Plain);
+    for (index, coefficient) in stack.hiding.iter().enumerate() {
+        stack_row.add_unit(
+            mask.oracle,
+            BatPart::Mask,
+            entry(layout.stack_base + index)?,
+            *coefficient,
+        );
+    }
+    for term in &stack.slots {
+        stack_row.add_unit(
+            mask.oracle,
+            BatPart::Mask,
+            mapped(term.slot)?,
+            term.coefficient,
+        );
+    }
+    if !stack.kept.is_empty() {
+        return Err(Error::InvalidConfig);
+    }
+    stack_row.target = stack.constant;
+
     let affines = stack_affines(
         &inputs.reduction.panels,
         &outputs.stack.point,
@@ -5627,7 +5671,7 @@ fn chain_relation_rows(
         return Err(Error::InvalidConfig);
     }
     merge_row.target = merge.constant;
-    Ok(vec![token_row, a_row, b_row, merge_row])
+    Ok(vec![token_row, stack_row, a_row, b_row, merge_row])
 }
 
 // ---------------------------------------------------------------------------
@@ -25733,7 +25777,7 @@ mod merged_tests {
         let mut chain = segment_chain(&plan, &table.reader, &setup_messages, &inputs, seed).unwrap();
         let outputs = {
             let mut challenges = super::ChainSegmentChallenges { chain: &mut chain };
-            crate::proof::request_chain::verify_request_chain(&inputs, &proof, &mut challenges)
+            crate::proof::request_chain::verify_request_chain_direct(&inputs, &proof, &mut challenges)
                 .unwrap()
         };
         // The prover's pending claim is the verifier's.
@@ -25905,7 +25949,7 @@ mod merged_tests {
         let mut chain = segment_chain(&plan, &table.reader, &setup_messages, &inputs, seed).unwrap();
         let changed_cell_result = {
             let mut challenges = super::ChainSegmentChallenges { chain: &mut chain };
-            crate::proof::request_chain::verify_request_chain(
+            crate::proof::request_chain::verify_request_chain_direct(
                 &changed_cell_inputs,
                 &proof,
                 &mut challenges,
@@ -25921,7 +25965,7 @@ mod merged_tests {
         let mut chain = segment_chain(&plan, &table.reader, &setup_messages, &inputs, seed).unwrap();
         let short_result = {
             let mut challenges = super::ChainSegmentChallenges { chain: &mut chain };
-            crate::proof::request_chain::verify_request_chain(
+            crate::proof::request_chain::verify_request_chain_direct(
                 &short_inputs,
                 &proof,
                 &mut challenges,
@@ -25936,7 +25980,7 @@ mod merged_tests {
         let mut chain = segment_chain(&plan, &table.reader, &setup_messages, &inputs, seed).unwrap();
         let repeated_result = {
             let mut challenges = super::ChainSegmentChallenges { chain: &mut chain };
-            crate::proof::request_chain::verify_request_chain(
+            crate::proof::request_chain::verify_request_chain_direct(
                 &repeated_inputs,
                 &proof,
                 &mut challenges,
@@ -25964,7 +26008,7 @@ mod merged_tests {
         let mut chain = segment_chain(&plan, &table.reader, &setup_messages, &inputs, seed).unwrap();
         let swapped = {
             let mut challenges = super::ChainSegmentChallenges { chain: &mut chain };
-            crate::proof::request_chain::verify_request_chain(
+            crate::proof::request_chain::verify_request_chain_direct(
                 &swapped_inputs,
                 &proof,
                 &mut challenges,

@@ -833,6 +833,90 @@ pub fn verify_request_chain(
         inputs.stack_masks.hiding.len(),
         challenges,
     )?;
+    // The verifier reads only the received shown end values: each carries the
+    // stack's public factor and its own slot. No private mask value is
+    // recovered here; the relation rows bind these values to the committed
+    // members.
+    if stack.ends.len() != inputs.end_slots.len() || stack.ends.len() < 3 {
+        return Err(Error::ShapeMismatch);
+    }
+    let beta = stack.ends[0].mask_scale;
+    let mut unique = inputs.end_slots.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    if unique.len() != inputs.end_slots.len() {
+        return Err(Error::InvalidConfig);
+    }
+    if stack.ends.iter().any(|end| end.mask_scale != beta) {
+        return Err(Error::StatementMismatch);
+    }
+    let values: Vec<MergeValue> = stack.ends[2..]
+        .iter()
+        .zip(&inputs.end_slots[2..])
+        .map(|(end, slot)| MergeValue::from_stack_end(end.value, *slot, beta))
+        .collect();
+    let (merge, _rows, gamma) = verify_merge(
+        inputs.layout,
+        inputs.claims,
+        &values,
+        &proof.merge,
+        inputs.merge_masks.hiding.len(),
+        challenges,
+    )?;
+    let end = merge.ends.first().ok_or(Error::ShapeMismatch)?;
+    let pending = inputs.layout.pending_row(
+        &gamma,
+        &merge.point,
+        end.mask_scale,
+        end.value,
+        inputs.index_oracle,
+        inputs.index_slot,
+    )?;
+    Ok(ChainOutputs {
+        token,
+        stack,
+        merge,
+        gamma,
+        pending,
+    })
+}
+
+/// The direct-evaluation verifier used by the prover and the fixtures only:
+/// it recovers the hidden end group from the caller's mask entries, checks the
+/// two row forms against them and the source ties with the read cells. The
+/// formal session verifier never calls this; the committed relation rows carry
+/// the same checks.
+pub fn verify_request_chain_direct(
+    inputs: &ChainInputs,
+    proof: &ChainProof,
+    challenges: &mut dyn GeneralChallenges,
+) -> Result<ChainOutputs> {
+    let (token, epsilon) = {
+        let mut recorder = Recorder {
+            inner: challenges,
+            draws: Vec::new(),
+        };
+        let output = verify_token_kept(
+            inputs.token_point,
+            inputs.token_claim_masks,
+            inputs.token_shown_claim,
+            &proof.token,
+            inputs.token_masks.hiding.len(),
+            &mut recorder,
+        )?;
+        let epsilon = recorder.epsilon()?;
+        (output, epsilon)
+    };
+    let start = start_form(&token, epsilon, inputs)?;
+    let terms = start_terms(&start);
+    let stack = verify_stack_group(
+        inputs.reduction,
+        &terms,
+        start.constant,
+        &proof.stack,
+        inputs.stack_masks.hiding.len(),
+        challenges,
+    )?;
     let (group, values, _beta) = group_from_ends(
         &stack,
         inputs.stack_masks,
@@ -1205,7 +1289,11 @@ mod tests {
             index_slot: 7,
         };
         let (proof, proven) = prove_request_chain(&inputs, &mut Source(61)).unwrap();
-        let outputs = verify_request_chain(&inputs, &proof, &mut Source(61)).unwrap();
+        let outputs = verify_request_chain_direct(&inputs, &proof, &mut Source(61)).unwrap();
+        // The formal verifier reads no private mask value and leaves the same
+        // pending claim.
+        let formal = verify_request_chain(&inputs, &proof, &mut Source(61)).unwrap();
+        assert_eq!(formal, outputs);
         // The prover's pending claim is the verifier's: same transcript, same
         // row weights and mask slot.
         assert_eq!(proven, outputs);
@@ -1263,13 +1351,13 @@ mod tests {
         };
         let other_ptr: &dyn Fn(usize) -> Result<Fp3> = &other_chain_mask;
         other_inputs.mask_value = other_ptr;
-        assert!(verify_request_chain(&other_inputs, &proof, &mut Source(61)).is_err());
+        assert!(verify_request_chain_direct(&other_inputs, &proof, &mut Source(61)).is_err());
         // The repeated slot: two end values naming the same mask slot.
         let repeated = [20usize, 21, 22, 22];
         let mut repeated_inputs = ChainInputs { end_slots: &repeated, ..other_inputs };
         repeated_inputs.mask_value = &chain_mask;
         repeated_inputs.end_slots = &repeated;
-        assert!(verify_request_chain(&repeated_inputs, &proof, &mut Source(61)).is_err());
+        assert!(verify_request_chain_direct(&repeated_inputs, &proof, &mut Source(61)).is_err());
         // Another read cell, swapped weight rows, or another weight cell
         // breaks the group's source ties or the merge's claim: these are the
         // changed-cell, swapped-row and swapped-object negatives at the chain.
@@ -1279,7 +1367,7 @@ mod tests {
             stack_left: &changed_left,
             ..inputs
         };
-        assert!(verify_request_chain(&changed_left_inputs, &proof, &mut Source(61)).is_err());
+        assert!(verify_request_chain_direct(&changed_left_inputs, &proof, &mut Source(61)).is_err());
         // The read panel's second side is the verifier's read; swapping its
         // rows or changing a cell breaks the same tie. The weight cells are
         // the prover's maps; a changed weight cell is the matrix negative the
@@ -1290,32 +1378,32 @@ mod tests {
             stack_right: &swapped_right,
             ..inputs
         };
-        assert!(verify_request_chain(&swapped_inputs, &proof, &mut Source(61)).is_err());
+        assert!(verify_request_chain_direct(&swapped_inputs, &proof, &mut Source(61)).is_err());
         let mut changed_read = stack_right.clone();
         changed_read[0][1] = changed_read[0][1].add(&Fp3::ONE);
         let changed_read_inputs = ChainInputs {
             stack_right: &changed_read,
             ..inputs
         };
-        assert!(verify_request_chain(&changed_read_inputs, &proof, &mut Source(61)).is_err());
+        assert!(verify_request_chain_direct(&changed_read_inputs, &proof, &mut Source(61)).is_err());
         // Another batch coefficient or a swapped weight slot is refused: the
         // batch is public plan data and each slot names its own entry.
         let changed_om = [batch.add(&Fp3::ONE)];
         let changed_om_inputs = ChainInputs { om: &changed_om, ..inputs };
-        assert!(verify_request_chain(&changed_om_inputs, &proof, &mut Source(61)).is_err());
+        assert!(verify_request_chain_direct(&changed_om_inputs, &proof, &mut Source(61)).is_err());
         let swapped_slots = [20usize, 21, 23, 22];
         let swapped_slot_inputs = ChainInputs { end_slots: &swapped_slots, ..inputs };
-        assert!(verify_request_chain(&swapped_slot_inputs, &proof, &mut Source(61)).is_err());
+        assert!(verify_request_chain_direct(&swapped_slot_inputs, &proof, &mut Source(61)).is_err());
         // A changed token proof breaks the stack's start.
         let mut tampered = proof.clone();
         tampered.token.rounds[0].coefficients[0] =
             tampered.token.rounds[0].coefficients[0].add(&Fp3::ONE);
-        assert!(verify_request_chain(&inputs, &tampered, &mut Source(61)).is_err());
+        assert!(verify_request_chain_direct(&inputs, &tampered, &mut Source(61)).is_err());
         // A changed merge proof fails the merge's own row claim.
         let mut tampered = proof.clone();
         tampered.merge.rounds[0].coefficients[0] =
             tampered.merge.rounds[0].coefficients[0].add(&Fp3::ONE);
-        assert!(verify_request_chain(&inputs, &tampered, &mut Source(61)).is_err());
+        assert!(verify_request_chain_direct(&inputs, &tampered, &mut Source(61)).is_err());
     }
 }
 
