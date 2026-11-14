@@ -2020,6 +2020,11 @@ impl HiddenSendPlan {
                 return Err(Error::ShapeMismatch);
             }
         }
+        // The chain section leaves the request member's pending claim: a plan
+        // that carries the section without a member has nowhere to bind it.
+        if self.request_chain.is_some() && self.member.is_none() {
+            return Err(Error::InvalidConfig);
+        }
         Ok(())
     }
 
@@ -3313,16 +3318,19 @@ pub fn prove_request_chain_section(
     plan: &HiddenSendPlan,
     inputs: &crate::proof::request_chain::ChainInputs,
     challenges: &mut dyn crate::proof::psc_general::GeneralChallenges,
-) -> Result<crate::proof::request_chain::RequestChainMessages> {
+) -> Result<(
+    crate::proof::request_chain::RequestChainMessages,
+    crate::proof::request_chain::ChainOutputs,
+)> {
     let shape = plan.request_chain.ok_or(Error::InvalidConfig)?;
-    let proof = crate::proof::request_chain::prove_request_chain(inputs, challenges)?;
+    let (proof, outputs) = crate::proof::request_chain::prove_request_chain(inputs, challenges)?;
     let messages = crate::proof::request_chain::RequestChainMessages {
         token: proof.token,
         stack: proof.stack,
         merge: proof.merge,
     };
     messages.check_shape(shape)?;
-    Ok(messages)
+    Ok((messages, outputs))
 }
 
 /// Verifies the request chain's transcript section. The plan must carry the
@@ -4369,16 +4377,33 @@ fn prove_first_chain_segment(
     chain: &mut Chain,
     plan: &HiddenSendPlan,
     inputs: &crate::proof::request_chain::ChainInputs,
-) -> Result<crate::proof::request_chain::RequestChainMessages> {
-    use crate::proof::request_chain::RequestChainMessages;
+) -> Result<(
+    crate::proof::request_chain::RequestChainMessages,
+    crate::proof::request_chain::ChainOutputs,
+)> {
     let shape = plan.request_chain.ok_or(Error::InvalidConfig)?;
-    let messages = {
+    let (messages, outputs) = {
         let mut challenges = ChainSegmentChallenges { chain };
         prove_request_chain_section(plan, inputs, &mut challenges)?
     };
     messages.check_shape(shape)?;
     absorb_request_chain_section(chain, shape, &messages)?;
-    Ok(messages)
+    Ok((messages, outputs))
+}
+
+/// Binds the segment's pending claim to the request member the plan declares:
+/// the member is the segment's output, so the two must be the same row. A plan
+/// whose declared pending differs from the one the segment leaves is refused
+/// before the LIN first commit and the seal on both sides.
+fn bind_chain_pending(
+    plan: &HiddenSendPlan,
+    pending: &crate::proof::hidden_member::PendingRow,
+) -> Result<()> {
+    let member = plan.member.as_ref().ok_or(Error::InvalidConfig)?;
+    if &member.pending != pending {
+        return Err(Error::StatementMismatch);
+    }
+    Ok(())
 }
 
 /// Verifies the request chain's sub-proof segment on the first chain with the
@@ -7996,7 +8021,12 @@ fn prove_first(
     // claim the plan carries is the segment's output.
     let request_section = match (&plan.send.request_chain, chain_inputs) {
         (Some(_), Some(inputs)) => {
-            Some(prove_first_chain_segment(&mut chain, &plan.send, inputs)?)
+            // The pending claim the segment leaves is the request member's
+            // claim; the plan carries the same row and a difference is refused
+            // before the LIN first commit and the seal.
+            let (section, outputs) = prove_first_chain_segment(&mut chain, &plan.send, inputs)?;
+            bind_chain_pending(&plan.send, &outputs.pending)?;
+            Some(section)
         }
         (None, None) => None,
         _ => return Err(Error::InvalidConfig),
@@ -8520,7 +8550,10 @@ fn verify_first(
     }
     match (&plan.send.request_chain, &messages.request, chain_inputs) {
         (Some(_), Some(section), Some(inputs)) => {
-            verify_first_chain_segment(&mut chain, &plan.send, section, inputs)?;
+            // The verifier derives the pending from the received section and
+            // binds it to the plan's member row before the seal.
+            let outputs = verify_first_chain_segment(&mut chain, &plan.send, section, inputs)?;
+            bind_chain_pending(&plan.send, &outputs.pending)?;
         }
         (None, None, None) => {}
         _ => return Err(Error::InvalidProof),
@@ -24091,6 +24124,475 @@ mod merged_tests {
         let mut foreign = plan.clone();
         foreign.send.member.as_mut().unwrap().pending.masks[0].oracle = INDEX_MASK_ORACLE + 1;
         assert!(foreign.validate().is_err());
+    }
+
+    /// The fixture's trusted mask entries: the token claim's slot, the start
+    /// form's hiding entries, the stack's end slots and the merge's claim
+    /// slot. Only the fixture reads this closure; the session verifier never
+    /// receives a private mask value.
+    fn chain_mask(slot: usize) -> Result<Fp3> {
+        if (20..23).contains(&slot) {
+            return Ok(Fp3::from_u64(800 + (slot - 20) as u64));
+        }
+        if slot == 3 {
+            return Ok(Fp3::from_u64(953));
+        }
+        let hiding = crate::proof::request_chain::START_HIDING_SLOT;
+        if slot >= hiding {
+            return Ok(Fp3::from_u64(700 + (slot - hiding) as u64));
+        }
+        Ok(Fp3::from_u64(950 + slot as u64))
+    }
+
+    /// Records the challenges the token sumcheck draws, so the fixture can
+    /// build the start form with the same epsilon the chain gives the prover.
+    struct FirstDraws<'a> {
+        inner: &'a mut dyn crate::proof::psc_general::GeneralChallenges,
+        draws: Vec<Fp3>,
+    }
+
+    impl crate::proof::psc_general::GeneralChallenges for FirstDraws<'_> {
+        fn draw(&mut self) -> Result<Fp3> {
+            let value = self.inner.draw()?;
+            self.draws.push(value);
+            Ok(value)
+        }
+        fn draw_nonzero(&mut self) -> Result<Fp3> {
+            let value = self.inner.draw_nonzero()?;
+            self.draws.push(value);
+            Ok(value)
+        }
+        fn send_hiding_sum(&mut self, value: Fp3) -> Result<()> {
+            self.inner.send_hiding_sum(value)
+        }
+        fn send_round(
+            &mut self,
+            index: usize,
+            round: &crate::proof::psc::PscRound,
+        ) -> Result<()> {
+            self.inner.send_round(index, round)
+        }
+        fn send_end_values(&mut self, values: &[Fp3]) -> Result<()> {
+            self.inner.send_end_values(values)
+        }
+    }
+
+    /// The first chain up to the request segment: the same absorbs the session
+    /// runs before its sub-proof.
+    fn segment_chain(
+        plan: &HiddenLinPlan,
+        reader: &IndexReader,
+        messages: &HiddenSendMessages,
+    ) -> Result<Chain> {
+        let mut chain = first_chain(plan, reader)?;
+        absorb_group(&mut chain, &messages.group)?;
+        absorb_claim(&mut chain, plan)?;
+        match (&plan.send.member, &messages.reduction_root) {
+            (Some(member), Some(root)) => absorb_reduction_root(&mut chain, member, root)?,
+            (None, None) => {}
+            _ => return Err(Error::InvalidConfig),
+        }
+        Ok(chain)
+    }
+
+    /// The table with zero matrix cells: the request W is the zero vector and
+    /// the merge's claim map is zero, so the Eval identity holds for every
+    /// drawn point. The table object itself is still committed under the
+    /// plan's identity.
+    fn zero_table() -> Table {
+        let rows = table_shape().rows() as usize;
+        let ell = TABLE_ELL as usize;
+        let messages = vec![vec![Fp::ZERO; ell]; rows];
+        let tails = table_tails();
+        let mut source = VecTableSource::new(messages, tails).unwrap();
+        let salts: Vec<Vec<u8>> = (0..table_code().n())
+            .map(|position| vec![(position as u8) ^ 0x5A; SALT])
+            .collect();
+        let table = commit_table_streaming(
+            &mut source,
+            table_shape(),
+            TABLE_CONFIGURATION,
+            &salts,
+            64,
+            u64::MAX,
+        )
+        .unwrap();
+        let reader = table.reader.clone();
+        Table {
+            table,
+            source: RefCell::new(source),
+            reader,
+        }
+    }
+
+    #[test]
+    fn the_chain_segment_runs_inside_the_first_chain() {
+        use crate::proof::psc_general::{GeneralMaskEntries, MaskTerm, Summand};
+        use crate::proof::request_chain::{
+            ChainInputs, ChainProof, RequestChainShape, START_HIDING_SLOT,
+        };
+        use crate::proof::request_stack::{StackPanel, StackReduction};
+        use crate::proof::request_weights::{
+            ClaimFactor, WeightClaim, WeightGroup, WeightLayout,
+        };
+        use zkie_engine::pcs::request::field::fp_from_u64;
+
+        let f = |value: u64| Fp3::from_base(fp_from_u64(value));
+        let activation = activation();
+        let (mut plan, seed) = member_plan_for(&activation);
+        {
+            let table = zero_table();
+            plan.send.table_identity = reader_table_identity(&table.reader).unwrap();
+        }
+        // The first chain up to the segment: the group and the reduction root.
+        // Only the first part runs; the second session's rows depend on the
+        // member target, which the segment replaces.
+        let setup_plan = plan.clone();
+        let mut setup_table = zero_table();
+        let mut setup_coins =
+            ByteMaskCoins::new(derive_run_seed(&seed, 1, 0).unwrap()).unwrap();
+        let setup_randomness =
+            WCommitRandomness::from_coins(&mut setup_coins, &setup_plan.send, None).unwrap();
+        let (setup_messages, _, _) = super::prove_first(
+            &setup_plan,
+            Some(&activation),
+            &mut setup_table,
+            None,
+            &setup_randomness,
+            None,
+            &seed,
+            None,
+            None,
+        )
+        .unwrap();
+        let table = zero_table();
+
+        // The token sub-proof fixes the start form and its hidden constant;
+        // the read panel's cell carries that constant into the stack.
+        let point = [f(2), f(3)];
+        let token_shown = [f(1), f(2), f(3), f(4)];
+        let token_kept = [f(5), f(6), f(7), f(8)];
+        let hidden_claim = crate::proof::request_reduction::token_kept_claim(
+            &point,
+            &token_shown,
+            &token_kept,
+        )
+        .unwrap();
+        let factor = f(11);
+        let claim_masks = [MaskTerm {
+            slot: 3,
+            coefficient: factor,
+        }];
+        let shown_claim = hidden_claim.add(&factor.mul(&chain_mask(3).unwrap()));
+        let token_variables =
+            crate::proof::request_reduction::token_variables(&point).unwrap();
+        let token_hiding = hp_entries(
+            &crate::proof::psc_general::general_variables(
+                &token_variables,
+                &Summand::ShownKept,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let token_masks = GeneralMaskEntries {
+            hiding: (0..token_hiding)
+                .map(|index| f(700 + index as u64))
+                .collect(),
+            shown: vec![f(800)],
+        };
+        let mut chain = segment_chain(&plan, &table.reader, &setup_messages).unwrap();
+        let (token_output, epsilon) = {
+            let mut challenges = super::ChainSegmentChallenges { chain: &mut chain };
+            let mut recorder = FirstDraws {
+                inner: &mut challenges,
+                draws: Vec::new(),
+            };
+            let (_, output) = crate::proof::request_reduction::prove_token_kept(
+                &point,
+                &token_shown,
+                &token_kept,
+                &claim_masks,
+                &chain_mask,
+                shown_claim,
+                &token_masks,
+                &mut recorder,
+            )
+            .unwrap();
+            let epsilon = recorder.draws.first().copied().unwrap();
+            (output, epsilon)
+        };
+        let om = [Fp3::ONE];
+        let start = crate::proof::request_start::token_start(
+            &token_output,
+            epsilon,
+            3,
+            shown_claim,
+            factor,
+            om[0],
+        )
+        .unwrap();
+        // The stack's visible target is the start's hidden constant: the
+        // claim masks' entries are subtracted back out.
+        let mut hidden_cstart = start.constant;
+        for term in &start.claims {
+            hidden_cstart =
+                hidden_cstart.sub(&term.coefficient.mul(&chain_mask(term.slot).unwrap()));
+        }
+        for (index, coefficient) in start.hiding.iter().enumerate() {
+            hidden_cstart = hidden_cstart.sub(
+                &coefficient.mul(&chain_mask(START_HIDING_SLOT + index).unwrap()),
+            );
+        }
+        // One read panel carries the start value; one weight panel carries the
+        // merge's single claim, whose hidden value is zero.
+        let reduction = StackReduction::new(vec![
+            StackPanel {
+                claim: 0,
+                ec: Fp3::ONE,
+                ni: 1,
+                ny: 1,
+                weight: vec![Fp3::ONE],
+                first_claim: None,
+                w: 0,
+                off: 0,
+            },
+            StackPanel {
+                claim: 0,
+                ec: Fp3::ONE,
+                ni: 1,
+                ny: 1,
+                weight: vec![Fp3::ONE],
+                first_claim: Some(0),
+                w: 0,
+                off: 0,
+            },
+        ])
+        .unwrap();
+        let read_cell = hidden_cstart.mul(&om[0].inverse().unwrap());
+        let stack_left = vec![vec![read_cell], vec![Fp3::ONE]];
+        let stack_right = vec![vec![Fp3::ONE], vec![Fp3::ZERO]];
+        let stack_variables = (0..reduction.lam)
+            .map(|_| crate::proof::psc::Weight::plain(3))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let stack_hiding = hp_entries(
+            &crate::proof::psc_general::general_variables(
+                &stack_variables,
+                &Summand::PanelProduct {
+                    lam: reduction.lam,
+                    panels: reduction.panel_ends(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let stack_masks = GeneralMaskEntries {
+            hiding: (0..stack_hiding)
+                .map(|index| f(600 + index as u64))
+                .collect(),
+            shown: vec![f(800), f(801), f(802)],
+        };
+        let end_slots = [20usize, 21, 22];
+        // One weight claim over a two-column-bit cube. Its map is zero: the
+        // zero table leaves the request W zero, so the pending identity holds
+        // for every draw.
+        let mut layout = WeightLayout::new(2).unwrap();
+        layout
+            .add(0, 0, 1, vec![WeightGroup::e("x", 8, false).unwrap()])
+            .unwrap();
+        let claims = vec![WeightClaim {
+            unit: 0,
+            factors: vec![ClaimFactor::e(vec![f(2)], vec![f(3), f(5), f(7)])],
+        }];
+        let maps = vec![vec![Fp3::ZERO; 4]];
+        let merge_variables = (0..layout.lk)
+            .map(|_| crate::proof::psc::Weight::plain(2))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let merge_hiding = hp_entries(
+            &crate::proof::psc_general::general_variables(&merge_variables, &Summand::Map)
+                .unwrap(),
+        )
+        .unwrap();
+        // The merge's final mask entry is the index-mask entry the pending
+        // claim names, so the second chain's Eval row ties the same slot.
+        let index = plan.send.index_mask.clone().unwrap();
+        let index_slot = index.entries.total().unwrap();
+        let mut coins = ByteMaskCoins::new(derive_run_seed(&seed, 1, 0).unwrap()).unwrap();
+        let randomness = WCommitRandomness::from_coins(&mut coins, &plan.send, None).unwrap();
+        let mask_rows = randomness.index_mask.as_ref().unwrap().rows.clone();
+        let ell = usize::try_from(index.mask_code.ell).unwrap();
+        let offset = index.entry_offset(index_slot).unwrap();
+        let index_entry = mask_rows[offset / ell][offset % ell];
+        let merge_masks = GeneralMaskEntries {
+            hiding: (0..merge_hiding)
+                .map(|index| f(500 + index as u64))
+                .collect(),
+            shown: vec![index_entry],
+        };
+        let inputs = ChainInputs {
+            token_point: &point,
+            token_shown: &token_shown,
+            token_kept: &token_kept,
+            token_claim_masks: &claim_masks,
+            token_shown_claim: shown_claim,
+            token_claim_slot: 3,
+            token_masks: &token_masks,
+            reduction: &reduction,
+            stack_left: &stack_left,
+            stack_right: &stack_right,
+            om: &om,
+            stack_masks: &stack_masks,
+            layout: &layout,
+            claims: &claims,
+            claim_maps: &maps,
+            end_slots: &end_slots,
+            merge_masks: &merge_masks,
+            mask_value: &chain_mask,
+            index_oracle: index.oracle,
+            index_slot: index_slot as u64,
+        };
+        let shape = RequestChainShape {
+            token_rounds: point.len(),
+            token_ends: 1,
+            stack_rounds: reduction.lam as usize,
+            stack_ends: 3,
+            merge_rounds: layout.lk as usize,
+            merge_ends: 1,
+        };
+        plan.send.request_chain = Some(shape);
+        let mut chain = segment_chain(&plan, &table.reader, &setup_messages).unwrap();
+        let (section, proven) = {
+            let mut challenges = super::ChainSegmentChallenges { chain: &mut chain };
+            super::prove_request_chain_section(&plan.send, &inputs, &mut challenges).unwrap()
+        };
+        let proof = ChainProof {
+            token: section.token.clone(),
+            stack: section.stack.clone(),
+            merge: section.merge.clone(),
+        };
+        let mut chain = segment_chain(&plan, &table.reader, &setup_messages).unwrap();
+        let outputs = {
+            let mut challenges = super::ChainSegmentChallenges { chain: &mut chain };
+            crate::proof::request_chain::verify_request_chain(&inputs, &proof, &mut challenges)
+                .unwrap()
+        };
+        // The prover's pending claim is the verifier's.
+        assert_eq!(proven, outputs);
+        section.check_shape(shape).unwrap();
+        // The plan's member row is the segment's pending claim, and the first
+        // chain's section rides under the plan's shape.
+        plan.send.member.as_mut().unwrap().pending = outputs.pending.clone();
+        let mut prover_table = zero_table();
+        let (messages, _) = super::prove_hidden_lin_hidden_with_chain_segment(
+            &plan,
+            &activation,
+            &mut prover_table,
+            seed,
+            &inputs,
+        )
+        .unwrap();
+        let verifier_table = zero_table();
+        let outcome = super::verify_hidden_lin_hidden_with_chain_segment(
+            &plan,
+            &verifier_table.reader,
+            &messages,
+            &inputs,
+        )
+        .unwrap();
+        assert_eq!(outcome.eval_rows.len(), POSITIONS as usize);
+        // The session runs the same segment at the same transcript position:
+        // its section is the one the discovery proved.
+        assert_eq!(messages.first.request.as_ref(), Some(&section));
+        // The section is absorbed before the seal: a changed section changes
+        // the first chain's value at that position.
+        let mut changed_section = section.clone();
+        changed_section.stack.rounds[0].coefficients[0] = changed_section.stack.rounds[0]
+            .coefficients[0]
+            .add(&Fp3::ONE);
+        let mut fixed = segment_chain(&plan, &table.reader, &setup_messages).unwrap();
+        super::absorb_request_chain_section(&mut fixed, shape, &section).unwrap();
+        let mut changed_chain = segment_chain(&plan, &table.reader, &setup_messages).unwrap();
+        super::absorb_request_chain_section(&mut changed_chain, shape, &changed_section).unwrap();
+        assert_ne!(*fixed.value(), *changed_chain.value());
+        // The section is fixed before the seal: a changed stack proof is
+        // refused by the segment's own checks.
+        let mut changed = messages.clone();
+        changed.first.request.as_mut().unwrap().stack.rounds[0].coefficients[0] = changed
+            .first
+            .request
+            .as_ref()
+            .unwrap()
+            .stack
+            .rounds[0]
+            .coefficients[0]
+            .add(&Fp3::ONE);
+        assert!(super::verify_hidden_lin_hidden_with_chain_segment(
+            &plan,
+            &verifier_table.reader,
+            &changed,
+            &inputs,
+        )
+        .is_err());
+        // A plan whose member row differs from the segment's output is
+        // refused on both sides, after the segment and before the seal.
+        let mut changed_plan = plan.clone();
+        changed_plan.send.member.as_mut().unwrap().pending.target = changed_plan
+            .send
+            .member
+            .as_ref()
+            .unwrap()
+            .pending
+            .target
+            .add(&Fp3::ONE);
+        let mut prover_table = zero_table();
+        assert!(super::prove_hidden_lin_hidden_with_chain_segment(
+            &changed_plan,
+            &activation,
+            &mut prover_table,
+            seed,
+            &inputs,
+        )
+        .is_err());
+        assert!(super::verify_hidden_lin_hidden_with_chain_segment(
+            &changed_plan,
+            &verifier_table.reader,
+            &messages,
+            &inputs,
+        )
+        .is_err());
+        // The section's shape is the plan's: another round count is refused.
+        let mut changed_plan = plan.clone();
+        changed_plan.send.request_chain = Some(RequestChainShape {
+            stack_rounds: 2,
+            ..shape
+        });
+        let mut prover_table = zero_table();
+        assert!(super::prove_hidden_lin_hidden_with_chain_segment(
+            &changed_plan,
+            &activation,
+            &mut prover_table,
+            seed,
+            &inputs,
+        )
+        .is_err());
+        // An end value's slot must carry the mask the stack used: swapping
+        // two weight slots breaks the group's source tie.
+        let swapped = [20usize, 22, 21];
+        let swapped_inputs = ChainInputs {
+            end_slots: &swapped,
+            ..inputs
+        };
+        let mut chain = segment_chain(&plan, &table.reader, &setup_messages).unwrap();
+        let swapped = {
+            let mut challenges = super::ChainSegmentChallenges { chain: &mut chain };
+            crate::proof::request_chain::verify_request_chain(
+                &swapped_inputs,
+                &proof,
+                &mut challenges,
+            )
+        };
+        assert!(swapped.is_err());
     }
 
     #[test]

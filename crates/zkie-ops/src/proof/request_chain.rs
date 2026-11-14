@@ -707,7 +707,7 @@ fn group_from_ends(
 pub fn prove_request_chain(
     inputs: &ChainInputs,
     challenges: &mut dyn GeneralChallenges,
-) -> Result<ChainProof> {
+) -> Result<(ChainProof, ChainOutputs)> {
     let (token, token_output, epsilon) = {
         let mut recorder = Recorder {
             inner: challenges,
@@ -771,11 +771,31 @@ pub fn prove_request_chain(
         inputs.mask_value,
         &[],
     )?;
-    Ok(ChainProof {
+    // The prover derives the same pending claim the verifier will: the merge's
+    // row weights at its point, the final masked value and the request's
+    // index-mask slot. The request chain's member consumes this row.
+    let end = outcome.output.ends.first().ok_or(Error::ShapeMismatch)?;
+    let pending = inputs.layout.pending_row(
+        &outcome.gamma,
+        &outcome.output.point,
+        end.mask_scale,
+        end.value,
+        inputs.index_oracle,
+        inputs.index_slot,
+    )?;
+    let proof = ChainProof {
         token,
         stack,
         merge: outcome.proof,
-    })
+    };
+    let outputs = ChainOutputs {
+        token: token_output,
+        stack: stack_output,
+        merge: outcome.output,
+        gamma: outcome.gamma,
+        pending,
+    };
+    Ok((proof, outputs))
 }
 
 /// Verifies one request chain: the three sub-proofs in transcript order, the
@@ -1183,8 +1203,11 @@ mod tests {
             index_oracle: 60,
             index_slot: 7,
         };
-        let proof = prove_request_chain(&inputs, &mut Source(61)).unwrap();
+        let (proof, proven) = prove_request_chain(&inputs, &mut Source(61)).unwrap();
         let outputs = verify_request_chain(&inputs, &proof, &mut Source(61)).unwrap();
+        // The prover's pending claim is the verifier's: same transcript, same
+        // row weights and mask slot.
+        assert_eq!(proven, outputs);
         // The pending claim holds on a matrix built to satisfy it.
         let mut mask_total = Fp3::ZERO;
         for term in &outputs.pending.masks {
