@@ -187,6 +187,62 @@ pub fn verify_token(
     )
 }
 
+/// The kept command's claim: the equality-weighted product of the shown map
+/// and the kept map.
+pub fn token_kept_claim(point: &[Fp3], shown: &[Fp3], kept: &[Fp3]) -> Result<Fp3> {
+    inner_claim(point, shown, kept)
+}
+
+/// Proves the kept token claim. The kept map's value is not sent: the output
+/// leaves it with the coefficient of the shown end value as it was sent.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_token_kept(
+    point: &[Fp3],
+    shown: &[Fp3],
+    kept: &[Fp3],
+    claim_masks: &[MaskTerm],
+    mask_value: &dyn Fn(usize) -> Result<Fp3>,
+    shown_claim: Fp3,
+    masks: &GeneralMaskEntries,
+    challenges: &mut dyn GeneralChallenges,
+) -> Result<(GeneralProof, GeneralOutput)> {
+    let variables = token_variables(point)?;
+    let mut inner = crate::proof::psc_general::WeightedProductInner::new(shown, kept, point)?;
+    prove_general(
+        &variables,
+        claim_masks,
+        mask_value,
+        shown_claim,
+        &Summand::ShownKept,
+        None,
+        &mut inner,
+        masks,
+        challenges,
+    )
+}
+
+/// Verifies the kept token claim and returns its output claims.
+pub fn verify_token_kept(
+    point: &[Fp3],
+    claim_masks: &[MaskTerm],
+    shown_claim: Fp3,
+    proof: &GeneralProof,
+    hiding_entries: usize,
+    challenges: &mut dyn GeneralChallenges,
+) -> Result<GeneralOutput> {
+    let variables = token_variables(point)?;
+    verify_general(
+        &variables,
+        claim_masks,
+        shown_claim,
+        &Summand::ShownKept,
+        None,
+        proof,
+        hiding_entries,
+        challenges,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,6 +453,84 @@ mod tests {
             claim,
             &masks,
             &mut Source(29),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_kept_token_sumcheck_leaves_the_kept_coefficient() {
+        let point = [fp(2), fp(3)];
+        let shown = [fp(1), fp(2), fp(3), fp(4)];
+        let kept = [fp(5), fp(6), fp(7), fp(8)];
+        let claim = token_kept_claim(&point, &shown, &kept).unwrap();
+        let variables = token_variables(&point).unwrap();
+        let hiding_count =
+            crate::proof::psc::hp_entries(&crate::proof::psc_general::general_variables(
+                &variables,
+                &Summand::ShownKept,
+            )
+            .unwrap())
+            .unwrap();
+        let masks = GeneralMaskEntries {
+            hiding: (0..hiding_count).map(|index| fp(700 + index as u64)).collect(),
+            shown: vec![fp(800)],
+        };
+        let (proof, proven) = prove_token_kept(
+            &point,
+            &shown,
+            &kept,
+            &[],
+            &|_| Ok(Fp3::ZERO),
+            claim,
+            &masks,
+            &mut Source(43),
+        )
+        .unwrap();
+        let verified = verify_token_kept(
+            &point,
+            &[],
+            claim,
+            &proof,
+            masks.hiding.len(),
+            &mut Source(43),
+        )
+        .unwrap();
+        assert_eq!(proven, verified);
+        // Only the shown end value is sent; the kept map stays a coefficient.
+        assert_eq!(proven.ends.len(), 1);
+        assert_eq!(proven.row_maps.len(), 1);
+        assert_eq!(proven.row_maps[0].0, 0);
+        // The coefficient is eps times the shown end value as it was sent.
+        let mut source = Source(43);
+        let eps = source.draw().unwrap();
+        assert_eq!(
+            proven.row_maps[0].1,
+            eps.mul(&proven.ends[0].value)
+        );
+        // A changed round leaves another output claim.
+        let mut changed = proof.clone();
+        changed.rounds[0].coefficients[0] =
+            changed.rounds[0].coefficients[0].add(&Fp3::ONE);
+        let tampered = verify_token_kept(
+            &point,
+            &[],
+            claim,
+            &changed,
+            masks.hiding.len(),
+            &mut Source(43),
+        )
+        .unwrap();
+        assert_ne!(tampered, verified);
+        // Another kept map does not sum to the claim.
+        assert!(prove_token_kept(
+            &point,
+            &shown,
+            &[fp(9), fp(8), fp(7), fp(6)],
+            &[],
+            &|_| Ok(Fp3::ZERO),
+            claim,
+            &masks,
+            &mut Source(43),
         )
         .is_err());
     }

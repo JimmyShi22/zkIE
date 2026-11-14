@@ -55,6 +55,10 @@ pub enum Summand {
     Leaves { alpha: Fp3, mu: usize },
     /// `y_0`: one shown map, degree one. The map is summed over the cube.
     Map,
+    /// `y_0 k_0`: one shown map and one kept map, degree one in the shown map.
+    /// The kept map's value is not sent: its coefficient is the shown value as
+    /// it was sent, and it stays a term of the row claim.
+    ShownKept,
     /// `sum_t coeff_t * prod_{j in t} y_j`: a sum of products of shown maps.
     ProductSum { terms: Vec<(Fp3, Vec<usize>)> },
 }
@@ -67,7 +71,7 @@ impl Summand {
             Self::TieNext => 2,
             Self::Bits => 1,
             Self::Leaves { .. } => 0,
-            Self::Map => 1,
+            Self::Map | Self::ShownKept => 1,
             Self::ProductSum { terms } => terms
                 .iter()
                 .flat_map(|(_, indices)| indices.iter())
@@ -78,7 +82,7 @@ impl Summand {
 
     pub fn kept(&self) -> usize {
         match self {
-            Self::Leaves { .. } => 1,
+            Self::Leaves { .. } | Self::ShownKept => 1,
             _ => 0,
         }
     }
@@ -89,7 +93,7 @@ impl Summand {
             Self::TieFirst { .. } | Self::TieNext => 3,
             Self::Bits => 2,
             Self::Leaves { .. } => 0,
-            Self::Map => 1,
+            Self::Map | Self::ShownKept => 1,
             Self::ProductSum { terms } => terms
                 .iter()
                 .map(|(_, indices)| indices.len())
@@ -126,6 +130,7 @@ impl Summand {
                 Ok(vec![Fp3::ONE, alpha.sub(&Fp3::ONE).sub(&table_at)])
             }
             Self::Map => Ok(vec![shown[0]]),
+            Self::ShownKept => Ok(vec![Fp3::ZERO, shown[0]]),
             Self::ProductSum { terms } => {
                 let mut sum = Fp3::ZERO;
                 for (coefficient, indices) in terms {
@@ -999,7 +1004,12 @@ pub fn prove_general(
                 .enumerate()
                 .map(|(index, value)| value.add(&masks.shown[index].mul(&point)))
                 .collect();
-            values.push(summand.at(&drawn, &shown, kept, table)?[0]);
+            let coefficients = summand.at(&drawn, &shown, kept, table)?;
+            let mut value = coefficients[0];
+            for (index, kept_value) in kept.iter().enumerate() {
+                value = value.add(&coefficients[1 + index].mul(kept_value));
+            }
+            values.push(value);
         }
         let summand_round = interpolate(&values)?;
         let mut round = hiding.round()?;
