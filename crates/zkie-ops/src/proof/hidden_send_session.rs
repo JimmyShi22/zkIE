@@ -28924,6 +28924,46 @@ mod merged_tests {
         )
         .unwrap();
         assert_eq!(outcome.eval_rows.len(), POSITIONS as usize);
+        // The lookup messages ride the segment transcript: a changed bit root,
+        // a changed claim, a changed mask position list or a missing lookup is
+        // refused by the formal verifier.
+        let mut changed = messages.clone();
+        changed.first.digit_lookups[0].bits_root = Digest([0x5F; 32]);
+        assert!(super::verify_hidden_lin_hidden_with_chain_segment(
+            &plan,
+            &verifier_table.reader,
+            &changed,
+            &inputs,
+        )
+        .is_err());
+        let mut changed = messages.clone();
+        changed.first.digit_lookups[1].claims.multiplicity.1 =
+            changed.first.digit_lookups[1].claims.multiplicity.1.add(&Fp3::ONE);
+        assert!(super::verify_hidden_lin_hidden_with_chain_segment(
+            &plan,
+            &verifier_table.reader,
+            &changed,
+            &inputs,
+        )
+        .is_err());
+        let mut changed = messages.clone();
+        changed.first.digit_lookups[0].mask_positions.clear();
+        assert!(super::verify_hidden_lin_hidden_with_chain_segment(
+            &plan,
+            &verifier_table.reader,
+            &changed,
+            &inputs,
+        )
+        .is_err());
+        let mut changed = messages.clone();
+        changed.first.digit_lookups.clear();
+        assert!(super::verify_hidden_lin_hidden_with_chain_segment(
+            &plan,
+            &verifier_table.reader,
+            &changed,
+            &inputs,
+        )
+        .is_err());
         // The session runs the same segment at the same transcript position:
         // its section is the one the discovery proved.
         assert_eq!(messages.first.request.as_ref(), Some(&section));
