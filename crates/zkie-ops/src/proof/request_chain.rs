@@ -24,6 +24,7 @@ use crate::proof::request_start::{token_start, StartForm};
 use crate::proof::request_weights::{
     prove_merge, verify_merge, MergeValue, WeightClaim, WeightLayout,
 };
+use crate::proof::packed_matrix::{PackedMatrixPlan, RangeCombinationPlan};
 use crate::proof::row_claim::RowForm;
 
 /// One named layout quantity of the request chain.
@@ -97,7 +98,7 @@ impl RequestLayout {
 }
 
 /// The section's version.
-pub const REQUEST_CHAIN_VERSION: u64 = 2;
+pub const REQUEST_CHAIN_VERSION: u64 = 3;
 
 /// One request chain's proofs, in the order the chain runs them.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -264,6 +265,93 @@ impl ChainMaskPlan {
         (row as u64)
             .checked_add((place as u64) << row_bits)
             .ok_or(Error::ResourceLimit)
+    }
+}
+
+/// The range-check objects of one request chain's segment: the original
+/// compute matrix's packed symbol array and the low/high digit combination
+/// object over its columns. Both are committed and fixed in the transcript
+/// before the challenges that read them, and both are separate objects from
+/// the segment's mask table and the request index-mask: an oracle or tree
+/// number is never read across two of them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RangePlan {
+    /// The original compute matrix: `m` cell rows, `k` columns and
+    /// `ceil(m / 3)` packed groups.
+    pub matrix: PackedMatrixPlan,
+    /// The symbol array's own SEND identity and its one-row tree.
+    pub array_oracle: u64,
+    pub array_tree: zkie_engine::pcs::request::runtime_tree::RuntimeTreePlan,
+    /// The combination object's addresses, its SEND identity and its one-row
+    /// tree. Its stored digits sit at the plan's offset.
+    pub combination: RangeCombinationPlan,
+    pub oracle: u64,
+    pub tree: zkie_engine::pcs::request::runtime_tree::RuntimeTreePlan,
+    /// The SEND group both objects belong to.
+    pub group: u64,
+    /// One opening list per object, in each object's own column space. Both
+    /// lists are plan data; a proof byte never chooses them.
+    pub array_openings: usize,
+    pub openings: usize,
+}
+
+impl RangePlan {
+    /// The structural checks that bind the two objects to their trees: the
+    /// packed entries and the stored digits must fit one main row of the
+    /// plan's width, each tree must carry exactly one symbol per column, and
+    /// the two identities must be distinct.
+    pub fn fault(&self) -> Option<&'static str> {
+        if self.group == 0
+            || self.array_oracle == 0
+            || self.oracle == 0
+            || self.array_oracle == self.oracle
+        {
+            return Some("the range objects have no distinct identity");
+        }
+        if self.array_openings == 0 || self.openings == 0 {
+            return Some("a range object has no opening list");
+        }
+        if self.matrix.rows == 0 || self.matrix.columns == 0 || self.matrix.groups == 0 {
+            return Some("the packed array has no geometry");
+        }
+        let entries = match self.matrix.groups.checked_mul(self.matrix.columns) {
+            Some(entries) => entries,
+            None => return Some("the packed array size overflows"),
+        };
+        if self.array_tree.fault().is_some()
+            || self.array_tree.parts.len() != 1
+            || self.array_tree.parts[0].mask_symbols != 0
+            || self.array_tree.parts[0].main_symbols
+                != zkie_engine::pcs::request::field::E_DEGREE as u64
+            || entries > self.array_tree.columns()
+        {
+            return Some("the packed array tree does not carry its entries");
+        }
+        if self.combination.columns != self.matrix.columns {
+            return Some("the combination object has another column count");
+        }
+        let stored = match self
+            .combination
+            .planes
+            .checked_mul(self.combination.columns)
+            .and_then(|stored| stored.checked_add(self.combination.offset))
+        {
+            Some(stored) => stored,
+            None => return Some("the combination object size overflows"),
+        };
+        if self.tree.fault().is_some()
+            || self.tree.parts.len() != 1
+            || self.tree.parts[0].mask_symbols != 0
+            || self.tree.parts[0].main_symbols
+                != zkie_engine::pcs::request::field::E_DEGREE as u64
+            || stored > self.tree.columns()
+        {
+            return Some("the combination tree does not carry its entries");
+        }
+        if self.array_tree.tree_number == self.tree.tree_number {
+            return Some("the range objects share one tree number");
+        }
+        None
     }
 }
 
@@ -1023,6 +1111,55 @@ mod tests {
     }
 
     #[test]
+    fn the_range_plan_binds_the_two_arrays_to_their_trees() {
+        use zkie_engine::pcs::request::field::E_DEGREE;
+        use zkie_engine::pcs::request::runtime_tree::{RuntimeTreePart, RuntimeTreePlan};
+        let tree = |number: u64| RuntimeTreePlan {
+            tree_number: number,
+            leaf_class: 4,
+            log_n: 4,
+            log_n_zk: 4,
+            parts: vec![RuntimeTreePart {
+                main_symbols: E_DEGREE as u64,
+                mask_symbols: 0,
+            }],
+            salt_bytes: 40,
+            run: zkie_core::types::Digest([0x81; 32]),
+            configuration: zkie_core::types::Digest([0x82; 32]),
+        };
+        let plan = RangePlan {
+            matrix: PackedMatrixPlan::new(4, 8).unwrap(),
+            array_oracle: 71,
+            array_tree: tree(910),
+            combination: RangeCombinationPlan::new(8, 2, 20, 0).unwrap(),
+            oracle: 72,
+            tree: tree(911),
+            group: 7,
+            array_openings: 2,
+            openings: 2,
+        };
+        assert!(plan.fault().is_none());
+        // A shared identity, a tree too short for the entries, an empty
+        // opening list and a combination object that overruns its tree are
+        // refused.
+        let mut broken = plan.clone();
+        broken.array_oracle = broken.oracle;
+        assert!(broken.fault().is_some());
+        let mut broken = plan.clone();
+        broken.array_tree.log_n = 3;
+        assert!(broken.fault().is_some());
+        let mut broken = plan.clone();
+        broken.openings = 0;
+        assert!(broken.fault().is_some());
+        let mut broken = plan.clone();
+        broken.combination = RangeCombinationPlan::new(8, 2, 20, 8).unwrap();
+        assert!(broken.fault().is_some());
+        let mut broken = plan;
+        broken.tree.tree_number = broken.array_tree.tree_number;
+        assert!(broken.fault().is_some());
+    }
+
+    #[test]
     fn the_section_round_trips_with_its_shape() {
         let messages = messages();
         let bytes = messages.encode(shape()).unwrap();
@@ -1039,11 +1176,11 @@ mod tests {
         let mut bytes = messages.encode(shape()).unwrap();
         // The first eight bytes are the version: the current one decodes, the
         // previous one and any other value are refused.
-        assert_eq!(REQUEST_CHAIN_VERSION, 2);
+        assert_eq!(REQUEST_CHAIN_VERSION, 3);
         let mut reader = CanonicalReader::new(&bytes, DecodeLimits::unlimited());
         assert!(RequestChainMessages::decode(&mut reader, shape()).is_ok());
         let mut previous = bytes.clone();
-        previous[..8].copy_from_slice(&1u64.to_le_bytes());
+        previous[..8].copy_from_slice(&2u64.to_le_bytes());
         let mut reader = CanonicalReader::new(&previous, DecodeLimits::unlimited());
         assert!(RequestChainMessages::decode(&mut reader, shape()).is_err());
         bytes[7] = 9;

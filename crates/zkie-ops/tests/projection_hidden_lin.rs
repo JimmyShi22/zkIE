@@ -291,6 +291,7 @@ fn plan(activation: &CommittedActivation, table: &Table) -> HiddenLinPlan {
         request_w: None,
         source_data: None,
             segment_mask_tree: None,
+            range: None,
     };
     HiddenLinPlan {
         norm: None,

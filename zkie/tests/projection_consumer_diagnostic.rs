@@ -649,6 +649,7 @@ fn plan_for(
             request_w: None,
             source_data: None,
             segment_mask_tree: None,
+            range: None,
         },
         output: HiddenOutputShape {
             positions,
@@ -868,6 +869,7 @@ fn hidden_plan_for(
             request_w: None,
             source_data: None,
             segment_mask_tree: None,
+            range: None,
         },
         output: HiddenOutputShape {
             positions,

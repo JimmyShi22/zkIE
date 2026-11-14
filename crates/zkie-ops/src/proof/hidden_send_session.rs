@@ -1976,6 +1976,10 @@ pub struct HiddenSendPlan {
     /// The fresh mask tree of the first-chain segment proximity test, when the
     /// plan carries the segment.
     pub segment_mask_tree: Option<MaskTreePlan>,
+    /// The range-check objects of the segment: the original compute matrix's
+    /// packed symbol array and the low/high digit combination object over its
+    /// columns, both fixed before the challenges that read them.
+    pub range: Option<crate::proof::request_chain::RangePlan>,
 }
 
 impl HiddenSendPlan {
@@ -2158,6 +2162,66 @@ impl HiddenSendPlan {
                 return Err(Error::InvalidConfig);
             }
         }
+        // The range objects follow the trusted geometry and keep their own
+        // identities: no oracle or tree number is shared with another object
+        // of the session.
+        if let Some(range) = &self.range {
+            if range.fault().is_some()
+                || range.matrix.rows != self.matrix_rows
+                || range.matrix.columns != self.columns
+                || range.group != self.group
+            {
+                return Err(Error::InvalidConfig);
+            }
+            let per_position_end = self
+                .oracle_base
+                .checked_add(self.activation.positions as u64)
+                .ok_or(Error::ResourceLimit)?;
+            let clashes = |oracle: u64| {
+                (oracle >= self.oracle_base && oracle < per_position_end)
+                    || self.request_w.as_ref().map_or(false, |rw| rw.oracle == oracle)
+                    || self
+                        .source_data
+                        .as_ref()
+                        .map_or(false, |source| source.oracle == oracle)
+                    || self.index_mask.as_ref().map_or(false, |index| index.oracle == oracle)
+                    || self.dot.as_ref().map_or(false, |dot| dot.oracle == oracle)
+                    || self
+                        .chain_mask
+                        .as_ref()
+                        .map_or(false, |mask| mask.oracle == oracle)
+            };
+            let w_tree_end = self
+                .w
+                .tree_number
+                .checked_add(self.activation.positions as u64)
+                .ok_or(Error::ResourceLimit)?;
+            let tree_clashes = |tree: u64| {
+                (tree >= self.w.tree_number && tree < w_tree_end)
+                    || self.dot.as_ref().map_or(false, |dot| dot.shape.tree_number == tree)
+                    || self.request_w.as_ref().map_or(false, |rw| rw.shape.tree_number == tree)
+                    || self
+                        .source_data
+                        .as_ref()
+                        .map_or(false, |source| source.shape.tree_number == tree)
+                    || self
+                        .index_mask
+                        .as_ref()
+                        .map_or(false, |index| index.tree.tree_number == tree)
+                    || self
+                        .chain_mask
+                        .as_ref()
+                        .map_or(false, |mask| mask.tree.tree_number == tree)
+                    || self.member.as_ref().map_or(false, |member| member.tree.tree_number == tree)
+            };
+            if clashes(range.array_oracle)
+                || clashes(range.oracle)
+                || tree_clashes(range.array_tree.tree_number)
+                || tree_clashes(range.tree.tree_number)
+            {
+                return Err(Error::InvalidConfig);
+            }
+        }
         if self.activation.hidden as u64 > self.matrix_rows {
             return Err(Error::ShapeMismatch);
         }
@@ -2243,6 +2307,13 @@ impl HiddenSendPlan {
             let parameters = RequestParameters::derive(self)?.ok_or(Error::InvalidConfig)?;
             parameters.check(self.member.as_ref().ok_or(Error::InvalidConfig)?)?;
             parameters.check_chain(self)?;
+        }
+        // The range objects are planned and messaged, but the segment does not
+        // commit them yet: a chain plan that names them would produce a
+        // section without their messages, so the plan is refused until the
+        // segment commits and absorbs them.
+        if self.request_chain.is_some() && self.range.is_some() {
+            return Err(Error::UnsupportedPrimitive);
         }
         if let Some(chain_mask) = &self.chain_mask {
             if chain_mask.fault().is_some() || chain_mask.group != self.group {
@@ -3357,6 +3428,11 @@ pub struct HiddenSendMessages {
     /// The sub-proof mask table's committed message, when the plan carries
     /// it: its root, sample, drawn positions and opening.
     pub chain_mask: Option<ChainMaskMessage>,
+    /// The packed symbol array's committed message, when the plan carries the
+    /// range objects: its tree, root, drawn positions and opening.
+    pub packed_array: Option<crate::proof::packed_matrix::RangeMessage>,
+    /// The combination object's committed message, in the same form.
+    pub range: Option<crate::proof::packed_matrix::RangeMessage>,
     /// The first-chain segment proximity transcript, when the plan carries the
     /// segment.
     pub segment_proximity: Option<SegmentProximityMessages>,
@@ -3407,6 +3483,12 @@ impl HiddenSendMessages {
                 writer.put_u64(*position);
             }
             writer.put_bytes(&encode_runtime_opening(&message.tree, &message.opening)?);
+        }
+        if let Some(message) = &self.packed_array {
+            put_range_message(&mut writer, message)?;
+        }
+        if let Some(message) = &self.range {
+            put_range_message(&mut writer, message)?;
         }
         if let Some(proximity) = &self.segment_proximity {
             put_segment_proximity(&mut writer, proximity);
@@ -3554,6 +3636,20 @@ impl HiddenSendMessages {
                 })
             }
             None => None,
+        };
+        let (packed_array, range) = match &plan.range {
+            Some(range_plan) => {
+                let packed = get_range_message(&mut reader, &range_plan.array_tree)?;
+                if packed.positions.len() != range_plan.array_openings {
+                    return Err(Error::ShapeMismatch);
+                }
+                let message = get_range_message(&mut reader, &range_plan.tree)?;
+                if message.positions.len() != range_plan.openings {
+                    return Err(Error::ShapeMismatch);
+                }
+                (Some(packed), Some(message))
+            }
+            None => (None, None),
         };
         let segment_proximity = if plan.request_chain.is_some() {
             Some(get_segment_proximity(&mut reader)?)
@@ -3722,6 +3818,8 @@ impl HiddenSendMessages {
             norm,
             request,
             chain_mask,
+            packed_array,
+            range,
             segment_proximity,
             chain_value,
         })
@@ -4134,6 +4232,8 @@ pub fn prove_hidden_send(
         norm: None,
         request: None,
         chain_mask: None,
+        packed_array: None,
+        range: None,
         segment_proximity: None,
     };
     Ok((messages, witness))
@@ -6401,6 +6501,56 @@ fn get_oracle_shape(reader: &mut CanonicalReader<'_>) -> Result<GuOracleShape> {
         return Err(Error::InvalidConfig);
     }
     Ok(shape)
+}
+
+/// Writes one plan-positioned symbol-array message: its tree, root, positions
+/// and opening.
+fn put_range_message(
+    writer: &mut CanonicalWriter,
+    message: &crate::proof::packed_matrix::RangeMessage,
+) -> Result<()> {
+    put_tree_plan(writer, &message.tree);
+    writer.put_digest(&message.root);
+    writer.put_u64(message.positions.len() as u64);
+    for position in &message.positions {
+        writer.put_u64(*position);
+    }
+    writer.put_bytes(&encode_runtime_opening(&message.tree, &message.opening)?);
+    Ok(())
+}
+
+/// Reads one plan-positioned symbol-array message under the plan's tree: the
+/// tree, root, positions and opening must agree with it.
+fn get_range_message(
+    reader: &mut CanonicalReader,
+    tree: &RuntimeTreePlan,
+) -> Result<crate::proof::packed_matrix::RangeMessage> {
+    let decoded = get_tree_plan(reader)?;
+    if decoded != *tree {
+        return Err(Error::StatementMismatch);
+    }
+    let root = reader.get_digest()?;
+    if root == Digest::ZERO {
+        return Err(Error::InvalidEncoding);
+    }
+    let count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+    if count == 0 || count > tree.columns() as usize {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut positions = Vec::with_capacity(count);
+    for _ in 0..count {
+        positions.push(reader.get_u64()?);
+    }
+    let opening = decode_runtime_opening(tree, &positions, reader.get_bytes()?)?;
+    if opening.positions != positions {
+        return Err(Error::InvalidEncoding);
+    }
+    Ok(crate::proof::packed_matrix::RangeMessage {
+        tree: decoded,
+        root,
+        positions,
+        opening,
+    })
 }
 
 fn put_tree_plan(writer: &mut CanonicalWriter, tree: &RuntimeTreePlan) {
@@ -9894,6 +10044,8 @@ fn prove_first(
         norm: norm_first,
         request: request_section,
         chain_mask: chain_mask_message,
+        packed_array: None,
+        range: None,
         segment_proximity,
     };
     witness.request_w = request_w_commit;
@@ -21103,6 +21255,7 @@ mod tests {
             request_w: None,
             source_data: None,
             segment_mask_tree: None,
+            range: None,
         };
         let mut source = VecTableSource::new(messages, tails).unwrap();
         let randomness = randomness();
@@ -22571,6 +22724,7 @@ mod merged_tests {
             request_w: None,
             source_data: None,
             segment_mask_tree: None,
+            range: None,
         };
         let weights: Vec<Vec<Fp3>> = (0..POSITIONS)
             .map(|position| activation.weights(position, MATRIX_ROWS).unwrap())
@@ -25380,6 +25534,142 @@ mod merged_tests {
             prove_hidden_lin_hidden(&plan, &activation, &mut setup, seed).unwrap();
         plan.send.expected_dot_root = witness.send.dot.as_ref().map(|map| map.root);
         (plan, messages, witness)
+    }
+
+    /// One range plan over the fixture's matrix geometry: the packed symbol
+    /// array and the low/high digit combination object, each with its own
+    /// oracle and one-row tree.
+    fn range_plan() -> crate::proof::request_chain::RangePlan {
+        let tree = |number: u64, log_n: u32| RuntimeTreePlan {
+            tree_number: number,
+            leaf_class: 6,
+            log_n,
+            log_n_zk: log_n,
+            parts: vec![RuntimeTreePart {
+                main_symbols: E_DEGREE as u64,
+                mask_symbols: 0,
+            }],
+            salt_bytes: SALT,
+            run: Digest([0x6A; 32]),
+            configuration: W_CONFIGURATION,
+        };
+        crate::proof::request_chain::RangePlan {
+            matrix: crate::proof::packed_matrix::PackedMatrixPlan::new(MATRIX_ROWS, COLUMNS)
+                .unwrap(),
+            array_oracle: ORACLE_BASE + 1_100,
+            array_tree: tree(910, 2),
+            combination: crate::proof::packed_matrix::RangeCombinationPlan::new(
+                COLUMNS, 2, 20, 0,
+            )
+            .unwrap(),
+            oracle: ORACLE_BASE + 1_101,
+            tree: tree(911, 3),
+            group: GROUP,
+            array_openings: 2,
+            openings: 2,
+        }
+    }
+
+    #[test]
+    fn the_range_messages_are_plan_gated_and_round_trip() {
+        use crate::proof::packed_matrix::{
+            combination_values, commit_packed_array, commit_range_values, pack_columns,
+            RangeMessage,
+        };
+        let (mut plan, messages, _) = member_run();
+        let range = range_plan();
+        // The matrix cells are small nonnegative integers, so the packing and
+        // the digit split are the integer identities.
+        let cells: Vec<i128> = (1..=(MATRIX_ROWS * COLUMNS) as i128).collect();
+        let packed = pack_columns(&cells, &range.matrix).unwrap();
+        let salts = vec![vec![0x3C; SALT]; range.array_tree.columns() as usize];
+        let array =
+            commit_packed_array(&range.matrix, &packed, range.array_tree.clone(), &salts).unwrap();
+        let positions = [0u64, 2];
+        let array_message = RangeMessage {
+            tree: range.array_tree.clone(),
+            root: *array.root(),
+            positions: positions.to_vec(),
+            opening: array.open(&positions).unwrap(),
+        };
+        let coefficients = vec![1i128; MATRIX_ROWS as usize];
+        let values = combination_values(&range.matrix, &cells, &coefficients, 5).unwrap();
+        let mut stored = Vec::with_capacity(values.len() * 2);
+        for plane in 0..2u64 {
+            for value in &values {
+                let digits = range.combination.split(*value).unwrap();
+                stored.push(if plane == 0 { digits.0 } else { digits.1 });
+            }
+        }
+        let salts = vec![vec![0x4D; SALT]; range.tree.columns() as usize];
+        let (_, combination_message) =
+            commit_range_values(&range.combination, &stored, range.tree.clone(), &salts, &[0, 3])
+                .unwrap();
+        // The plan carries the range objects and the message carries both
+        // arrays; the wire form round-trips under the same plan.
+        plan.send.range = Some(range.clone());
+        let mut with_range = messages.clone();
+        with_range.first.packed_array = Some(array_message.clone());
+        with_range.first.range = Some(combination_message.clone());
+        let bytes = with_range.first.encode().unwrap();
+        let decoded = super::HiddenSendMessages::decode(&plan.send, None, None, &bytes).unwrap();
+        assert_eq!(decoded.packed_array, Some(array_message.clone()));
+        assert_eq!(decoded.range, Some(combination_message.clone()));
+        // A plan without the range objects does not expect the bytes and
+        // refuses the encoding; a plan with them refuses a message without.
+        let mut without = plan.clone();
+        without.send.range = None;
+        assert!(super::HiddenSendMessages::decode(&without.send, None, None, &bytes).is_err());
+        let bytes = messages.first.encode().unwrap();
+        assert!(super::HiddenSendMessages::decode(&plan.send, None, None, &bytes).is_err());
+        // A changed tree, an empty root and a changed position count are
+        // refused before the range message is used.
+        let mut changed = with_range.clone();
+        changed.first.packed_array.as_mut().unwrap().tree.tree_number = 912;
+        assert!(super::HiddenSendMessages::decode(
+            &plan.send,
+            None,
+            None,
+            &changed.first.encode().unwrap()
+        )
+        .is_err());
+        let mut changed = with_range.clone();
+        changed.first.range.as_mut().unwrap().root = Digest::ZERO;
+        assert!(super::HiddenSendMessages::decode(
+            &plan.send,
+            None,
+            None,
+            &changed.first.encode().unwrap()
+        )
+        .is_err());
+        let mut changed = with_range.clone();
+        let count = changed.first.packed_array.as_mut().unwrap().positions.len();
+        changed
+            .first
+            .packed_array
+            .as_mut()
+            .unwrap()
+            .positions
+            .truncate(count - 1);
+        assert!(super::HiddenSendMessages::decode(
+            &plan.send,
+            None,
+            None,
+            &changed.first.encode().unwrap()
+        )
+        .is_err());
+        // The range geometry must be the matrix's: another row count is
+        // refused by the plan before the message is read.
+        let mut changed = plan.clone();
+        changed.send.range.as_mut().unwrap().matrix =
+            crate::proof::packed_matrix::PackedMatrixPlan::new(MATRIX_ROWS + 2, COLUMNS).unwrap();
+        assert!(super::HiddenSendMessages::decode(
+            &changed.send,
+            None,
+            None,
+            &with_range.first.encode().unwrap()
+        )
+        .is_err());
     }
 
     /// The first-stage codes the planner solves for the staged member fixture:

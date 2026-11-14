@@ -312,6 +312,9 @@ impl RangeCombinationPlan {
 /// object's stored entries, low and high digits in one integer each.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RangeMessage {
+    /// The tree the array was committed under; it travels with the message and
+    /// must equal the plan's tree for that object.
+    pub tree: RuntimeTreePlan,
     pub root: Digest,
     pub positions: Vec<u64>,
     pub opening: RuntimeTreeOpening,
@@ -374,12 +377,15 @@ pub fn commit_range_values(
             return Err(Error::BoundViolation);
         }
     }
+    let offset = usize::try_from(range.offset).map_err(|_| Error::ResourceLimit)?;
     let columns = usize::try_from(tree.columns()).map_err(|_| Error::ResourceLimit)?;
-    if stored > columns || salts.len() != columns {
+    if stored.checked_add(offset).ok_or(Error::ResourceLimit)? > columns || salts.len() != columns {
         return Err(Error::ShapeMismatch);
     }
+    // The stored digits sit at the plan's offset; the columns before it are
+    // other objects of the same array and stay zero here.
     let mut row = vec![Fp3::ZERO; columns];
-    for (slot, value) in row.iter_mut().zip(values) {
+    for (slot, value) in row.iter_mut().skip(offset).zip(values) {
         *slot = Fp3::from_base(fp_from_u64(*value as u64));
     }
     let parts = [RuntimePartRows {
@@ -387,9 +393,10 @@ pub fn commit_range_values(
         mask: Vec::new(),
         main_deg: E_DEGREE as u32,
     }];
-    let committed = RuntimeTree::commit(tree, &parts, salts)?;
+    let committed = RuntimeTree::commit(tree.clone(), &parts, salts)?;
     let opening = committed.open(positions)?;
     let message = RangeMessage {
+        tree,
         root: *committed.root(),
         positions: positions.to_vec(),
         opening,
@@ -409,11 +416,17 @@ pub fn verify_range_message(
         .checked_mul(range.columns)
         .and_then(|value| value.checked_add(range.offset))
         .ok_or(Error::ResourceLimit)?;
+    if message.tree != *tree {
+        return Err(Error::StatementMismatch);
+    }
     if message
         .positions
         .windows(2)
         .any(|pair| pair[0] >= pair[1])
-        || message.positions.iter().any(|position| *position >= total)
+        || message
+            .positions
+            .iter()
+            .any(|position| *position < range.offset || *position >= total)
     {
         return Err(Error::InvalidIndex);
     }
@@ -424,7 +437,6 @@ pub fn verify_range_message(
         &message.positions,
         &message.opening,
     )?;
-    let _ = total;
     values.into_iter().map(|value| range.split(value)).collect()
 }
 
@@ -504,6 +516,10 @@ mod tests {
         assert_eq!(digits.len(), 2);
         assert_eq!(digits[0], range.split(stored[0]).unwrap());
         assert_eq!(digits[1], range.split(stored[3]).unwrap());
+        // The message carries its tree: another tree is refused.
+        let mut wrong_tree = message.clone();
+        wrong_tree.tree.tree_number = 902;
+        assert!(verify_range_message(&range, &tree, &wrong_tree).is_err());
         let mut changed = message.clone();
         changed.positions = vec![0, 0];
         assert!(verify_range_message(&range, &tree, &changed).is_err());
