@@ -2866,9 +2866,12 @@ pub struct DotMapMessage {
 /// The request-level W's first-part message: its committed root. The plan names
 /// its oracle, shape and group; the witness keeps the tree and the value
 /// messages for the later openings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequestWMessage {
     pub root: Digest,
+    /// The message's SEND sample: the seeds drawn after the root's absorb and
+    /// the answers the own group's test checks.
+    pub sample: SendSamples,
 }
 
 /// The request W's committed message and the private values the sampling
@@ -2943,6 +2946,7 @@ impl HiddenSendMessages {
                 return Err(Error::InvalidEncoding);
             }
             writer.put_digest(&request_w.root);
+            writer.put_bytes(&request_w.sample.encode());
         }
         writer.put_bytes(&self.samples.encode());
         writer.put_u64(self.positions.len() as u64);
@@ -3034,7 +3038,8 @@ impl HiddenSendMessages {
                 if root == Digest::ZERO {
                     return Err(Error::InvalidEncoding);
                 }
-                Some(RequestWMessage { root })
+                let sample = SendSamples::decode(reader.get_bytes()?)?;
+                Some(RequestWMessage { root, sample })
             }
             None => None,
         };
@@ -7689,11 +7694,40 @@ fn prove_first(
     if let (Some(member), Some(root)) = (&plan.send.member, &reduction_root) {
         absorb_reduction_root(&mut chain, member, root)?;
     }
-    if let Some(witness) = &request_w_commit {
+    let request_w_sample = if let Some(witness) = &request_w_commit {
         let rw = plan.send.request_w.as_ref().ok_or(Error::InvalidConfig)?;
         let root = *witness.committed.roots.first().ok_or(Error::ShapeMismatch)?;
         absorb_request_w_root(&mut chain, &rw.shape, root)?;
-    }
+        let seeds = draw_seed_set(&mut chain, rw.shape.sample_bits()?, rw.shape.answers)?;
+        let main = witness
+            .committed
+            .messages
+            .first()
+            .ok_or(Error::ShapeMismatch)?
+            .concat();
+        let gu = GuWitness {
+            main,
+            mask: Vec::new(),
+        };
+        let mut answers = Vec::with_capacity(seeds.len());
+        for seed in &seeds {
+            let row = oracle_sample_row(
+                rw.oracle,
+                rw.group,
+                &rw.shape.oracle_shape(),
+                std::slice::from_ref(seed),
+                0,
+                Fp3::ZERO,
+            )?;
+            answers.push(row.evaluate(&gu)?);
+        }
+        Some(SendSamples {
+            seed: seeds,
+            answers,
+        })
+    } else {
+        None
+    };
     let index_mask = match (&plan.send.index_mask, &witness.index_mask) {
         (Some(index), Some(mask_witness)) => {
             absorb_index_mask_root(&mut chain, index, &mask_witness.root)?;
@@ -8092,11 +8126,13 @@ fn prove_first(
         activation: activation_commitment,
         group,
         reduction_root,
-        request_w: match &request_w_commit {
-            Some(witness) => Some(RequestWMessage {
+        request_w: match (&request_w_commit, &request_w_sample) {
+            (Some(witness), Some(sample)) => Some(RequestWMessage {
                 root: *witness.committed.roots.first().ok_or(Error::ShapeMismatch)?,
+                sample: sample.clone(),
             }),
-            None => None,
+            (None, None) => None,
+            _ => return Err(Error::InvalidConfig),
         },
         samples: SendSamples { seed: seeds, answers },
         positions,
@@ -8176,6 +8212,12 @@ fn verify_first(
     match (&plan.send.request_w, &messages.request_w) {
         (Some(rw), Some(request_w)) => {
             absorb_request_w_root(&mut chain, &rw.shape, request_w.root)?;
+            let seeds = draw_seed_set(&mut chain, rw.shape.sample_bits()?, rw.shape.answers)?;
+            if request_w.sample.seed != seeds
+                || request_w.sample.answers.len() != seeds.len()
+            {
+                return Err(Error::InvalidProof);
+            }
         }
         (None, None) => {}
         _ => return Err(Error::InvalidProof),
@@ -19645,6 +19687,13 @@ mod tests {
         let mut messages = fixture.messages.clone();
         messages.request_w = Some(super::RequestWMessage {
             root: Digest([0x77; 32]),
+            sample: SendSamples {
+                seed: vec![super::SampleSeed {
+                    z: vec![Fp3::ONE, Fp3::ONE],
+                    beta: Fp3::ONE,
+                }],
+                answers: vec![Fp3::ONE],
+            },
         });
         let bytes = messages.encode().unwrap();
         let decoded = super::HiddenSendMessages::decode(&plan, None, None, &bytes).unwrap();
