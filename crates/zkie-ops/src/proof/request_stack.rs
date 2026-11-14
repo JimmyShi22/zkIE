@@ -40,13 +40,17 @@ fn ceil_log2(value: u64) -> u32 {
 }
 
 /// Assigns every panel its width and offset: largest panels first, each
-/// aligned to its own size. Returns the stack's total width in bits.
+/// aligned to its own size, over whole powers of two. Returns the stack's total
+/// width in bits.
 pub fn panel_layout(panels: &mut [StackPanel]) -> Result<u32> {
     if panels.is_empty() {
         return Err(Error::InvalidConfig);
     }
     for panel in panels.iter() {
-        if panel.ni == 0 || panel.ny == 0 || panel.weight.len() as u64 != panel.ni {
+        if !panel.ni.is_power_of_two()
+            || !panel.ny.is_power_of_two()
+            || panel.weight.len() as u64 != panel.ni
+        {
             return Err(Error::InvalidConfig);
         }
     }
@@ -192,6 +196,202 @@ pub fn stack_affines(
     Ok(StackAffines { alin, blin, shown })
 }
 
+/// The stack as the reduction uses it: the panels, their layout and the two
+/// sides' packed cube values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StackReduction {
+    pub lam: u32,
+    pub panels: Vec<StackPanel>,
+}
+
+impl StackReduction {
+    pub fn new(mut panels: Vec<StackPanel>) -> Result<Self> {
+        let lam = panel_layout(&mut panels)?;
+        Ok(Self { lam, panels })
+    }
+
+    /// The stack's claim: every panel's weighted operand product, with the
+    /// call and batch factors.
+    pub fn sum(
+        &self,
+        left: &[Vec<Fp3>],
+        right: &[Vec<Fp3>],
+        om: &[Fp3],
+    ) -> Result<Fp3> {
+        let (left_map, right_map) = self.side_maps(left, right, om)?;
+        let mut sum = Fp3::ZERO;
+        for (left, right) in left_map.iter().zip(&right_map) {
+            sum = sum.add(&left.mul(right));
+        }
+        Ok(sum)
+    }
+
+    /// The two sides as cube vectors over the stack's `2^lam` points: a panel's
+    /// cell `(i, yv)` sits at `off + (i << wy) + yv`, the first side carries the
+    /// call factor, the batch coefficient and the row weight.
+    pub fn side_maps(
+        &self,
+        left: &[Vec<Fp3>],
+        right: &[Vec<Fp3>],
+        om: &[Fp3],
+    ) -> Result<(Vec<Fp3>, Vec<Fp3>)> {
+        if left.len() != self.panels.len() || right.len() != self.panels.len() {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut left_map = vec![Fp3::ZERO; 1usize << self.lam];
+        let mut right_map = vec![Fp3::ZERO; 1usize << self.lam];
+        for (index, panel) in self.panels.iter().enumerate() {
+            let cells = (panel.ni as usize)
+                .checked_mul(panel.ny as usize)
+                .ok_or(Error::ResourceLimit)?;
+            if left[index].len() != cells || right[index].len() != cells {
+                return Err(Error::ShapeMismatch);
+            }
+            let wy = ceil_log2(panel.ny) as usize;
+            let batch = *om.get(panel.claim).ok_or(Error::InvalidIndex)?;
+            let co = panel.ec.mul(&batch);
+            for i in 0..panel.ni as usize {
+                for yv in 0..panel.ny as usize {
+                    let at = usize::try_from(panel.off).map_err(|_| Error::ResourceLimit)?
+                        + (i << wy)
+                        + yv;
+                    let cell = i * panel.ny as usize + yv;
+                    let slot = left_map.get_mut(at).ok_or(Error::InvalidIndex)?;
+                    *slot = co.mul(&panel.weight[i]).mul(&left[index][cell]);
+                    right_map[at] = right[index][cell];
+                }
+            }
+        }
+        Ok((left_map, right_map))
+    }
+
+    /// The multilinear extension of a cube vector at a point: bit `j` of the
+    /// index pairs with `point[j]`.
+    pub fn mle(&self, values: &[Fp3], point: &[Fp3]) -> Result<Fp3> {
+        if point.len() != self.lam as usize || values.len() != 1usize << self.lam {
+            return Err(Error::InvalidConfig);
+        }
+        let mut sum = Fp3::ZERO;
+        for (index, value) in values.iter().enumerate() {
+            let mut factor = Fp3::ONE;
+            for (bit, coordinate) in point.iter().enumerate() {
+                let chosen = if (index >> bit) & 1 == 1 {
+                    *coordinate
+                } else {
+                    Fp3::ONE.sub(coordinate)
+                };
+                factor = factor.mul(&chosen);
+            }
+            sum = sum.add(&factor.mul(value));
+        }
+        Ok(sum)
+    }
+
+    /// The end values the prover sends: each side's packed map at the stack
+    /// point.
+    pub fn end_values(
+        &self,
+        left: &[Vec<Fp3>],
+        right: &[Vec<Fp3>],
+        om: &[Fp3],
+        point: &[Fp3],
+    ) -> Result<(Fp3, Fp3)> {
+        let (left_map, right_map) = self.side_maps(left, right, om)?;
+        Ok((self.mle(&left_map, point)?, self.mle(&right_map, point)?))
+    }
+
+    /// Checks the two row ties at the stack point: each sent end value equals
+    /// its affine recombination of the panels' operand values.
+    pub fn check_row_ties(
+        &self,
+        left: &[Vec<Fp3>],
+        right: &[Vec<Fp3>],
+        om: &[Fp3],
+        point: &[Fp3],
+        left_end: Fp3,
+        right_end: Fp3,
+    ) -> Result<()> {
+        let affines = stack_affines(&self.panels, point, self.lam, om)?;
+        let mut alin = Fp3::ZERO;
+        for term in &affines.alin {
+            let panel = &self.panels[term.panel];
+            let cell = (term.i * panel.ny + term.yv) as usize;
+            alin = alin.add(&term.coefficient.mul(&left[term.panel][cell]));
+        }
+        let mut blin = Fp3::ZERO;
+        for term in &affines.blin {
+            let panel = &self.panels[term.panel];
+            let cell = (term.i * panel.ny + term.yv) as usize;
+            blin = blin.add(&term.coefficient.mul(&right[term.panel][cell]));
+        }
+        for (panel_index, i, coefficient) in &affines.shown {
+            let panel = &self.panels[*panel_index];
+            let cell = (*i * panel.ny) as usize;
+            blin = blin.add(&coefficient.mul(&right[*panel_index][cell]));
+        }
+        if left_end != alin || right_end != blin {
+            return Err(Error::StatementMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Proves the stack's batched sumcheck. The summand is the product of the two
+/// sides' end values; the stack's variables are plain sums.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_stack(
+    reduction: &StackReduction,
+    left: &[Vec<Fp3>],
+    right: &[Vec<Fp3>],
+    om: &[Fp3],
+    claim_masks: &[crate::proof::psc_general::MaskTerm],
+    mask_value: &dyn Fn(usize) -> Result<Fp3>,
+    shown: Fp3,
+    masks: &crate::proof::psc_general::GeneralMaskEntries,
+    challenges: &mut dyn crate::proof::psc_general::GeneralChallenges,
+) -> Result<(crate::proof::psc_general::GeneralProof, crate::proof::psc_general::GeneralOutput)> {
+    let (left_map, right_map) = reduction.side_maps(left, right, om)?;
+    let variables = (0..reduction.lam)
+        .map(|_| crate::proof::psc::Weight::plain(3))
+        .collect::<Result<Vec<_>>>()?;
+    let mut inner = crate::proof::psc_general::ProductInner::new(&left_map, &right_map)?;
+    crate::proof::psc_general::prove_general(
+        &variables,
+        claim_masks,
+        mask_value,
+        shown,
+        &crate::proof::psc_general::Summand::Product,
+        None,
+        &mut inner,
+        masks,
+        challenges,
+    )
+}
+
+/// Verifies the stack's batched sumcheck and returns its output claim.
+pub fn verify_stack(
+    reduction: &StackReduction,
+    claim_masks: &[crate::proof::psc_general::MaskTerm],
+    shown: Fp3,
+    proof: &crate::proof::psc_general::GeneralProof,
+    hiding_entries: usize,
+    challenges: &mut dyn crate::proof::psc_general::GeneralChallenges,
+) -> Result<crate::proof::psc_general::GeneralOutput> {
+    let variables = (0..reduction.lam)
+        .map(|_| crate::proof::psc::Weight::plain(3))
+        .collect::<Result<Vec<_>>>()?;
+    crate::proof::psc_general::verify_general(
+        &variables,
+        claim_masks,
+        shown,
+        &crate::proof::psc_general::Summand::Product,
+        None,
+        proof,
+        hiding_entries,
+        challenges,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,7 +430,7 @@ mod tests {
         assert_eq!(panels[1].w, 3);
         assert_eq!(panels[0].off, 8);
         assert_eq!(panels[0].w, 2);
-        // A row weight per row and nonzero sizes are required.
+        // A row weight per row and whole powers of two are required.
         let mut bad = vec![StackPanel {
             claim: 0,
             ec: fp(1),
@@ -242,6 +442,17 @@ mod tests {
             off: 0,
         }];
         assert!(panel_layout(&mut bad).is_err());
+        let mut bad_rows = vec![StackPanel {
+            claim: 0,
+            ec: fp(1),
+            ni: 3,
+            ny: 2,
+            weight: vec![fp(1); 3],
+            first_claim: None,
+            w: 0,
+            off: 0,
+        }];
+        assert!(panel_layout(&mut bad_rows).is_err());
     }
 
     #[test]
@@ -296,5 +507,242 @@ mod tests {
         }
         assert!(eq_low(&rs, 2, 2).is_err());
         assert!(eq_low(&rs, 1, 4).is_err());
+    }
+
+    use crate::proof::psc::PscRound;
+    use crate::proof::psc_general::{
+        general_variables, GeneralChallenges, GeneralMaskEntries, Summand,
+    };
+
+    struct Source(u64);
+
+    impl GeneralChallenges for Source {
+        fn draw(&mut self) -> Result<Fp3> {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+            Ok(Fp3::from_u64(self.0))
+        }
+        fn draw_nonzero(&mut self) -> Result<Fp3> {
+            for _ in 0..64 {
+                let value = self.draw()?;
+                if value != Fp3::ZERO {
+                    return Ok(value);
+                }
+            }
+            Err(Error::EntropyUnavailable)
+        }
+        fn send_hiding_sum(&mut self, _value: Fp3) -> Result<()> {
+            Ok(())
+        }
+        fn send_round(&mut self, _index: usize, _round: &PscRound) -> Result<()> {
+            Ok(())
+        }
+        fn send_end_values(&mut self, _values: &[Fp3]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn panel(claim: usize, ec: u64, ni: u64, ny: u64, weight: Vec<Fp3>) -> StackPanel {
+        StackPanel {
+            claim,
+            ec: fp(ec),
+            ni,
+            ny,
+            weight,
+            first_claim: None,
+            w: 0,
+            off: 0,
+        }
+    }
+
+    fn cells(count: u64, base: u64) -> Vec<Fp3> {
+        (0..count).map(|index| fp(base + index)).collect()
+    }
+
+    fn two_panels() -> (StackReduction, Vec<Fp3>, Vec<Fp3>) {
+        let small = panel(0, 5, 2, 2, vec![fp(7), fp(11)]);
+        let large = panel(1, 3, 4, 4, vec![fp(1), fp(2), fp(3), fp(4)]);
+        let reduction = StackReduction::new(vec![small, large]).unwrap();
+        let om = vec![fp(2), fp(5)];
+        (reduction, om, vec![fp(2), fp(3), fp(4), fp(5), fp(6)])
+    }
+
+    #[test]
+    fn the_stack_maps_pack_the_panels_at_their_offsets() {
+        let (reduction, om, _) = two_panels();
+        // The larger panel comes first at offset zero; the smaller one is
+        // aligned above it.
+        assert_eq!(reduction.lam, 5);
+        assert_eq!(reduction.panels[1].off, 0);
+        assert_eq!(reduction.panels[0].off, 16);
+        let left = vec![cells(4, 1), cells(16, 101)];
+        let right = vec![cells(4, 201), cells(16, 301)];
+        let (left_map, right_map) = reduction.side_maps(&left, &right, &om).unwrap();
+        // The large panel's first row: call factor three, batch five, weight
+        // one, entry one.
+        assert_eq!(left_map[0], fp(15).mul(&left[1][0]));
+        assert_eq!(left_map[1], fp(15).mul(&left[1][1]));
+        assert_eq!(left_map[4], fp(30).mul(&left[1][4]));
+        // The small panel sits at its own offset with call factor five and
+        // batch two.
+        assert_eq!(left_map[16], fp(70).mul(&left[0][0]));
+        assert_eq!(left_map[19], fp(110).mul(&left[0][3]));
+        for index in 0..4 {
+            assert_eq!(right_map[16 + index], right[0][index]);
+            assert_eq!(right_map[index % 4 + 4 * (index % 4)], right[1][(index % 4) * 4 + index % 4]);
+        }
+        assert_eq!(right_map[0], right[1][0]);
+        assert_eq!(right_map[15], right[1][15]);
+        // Only the panels' cells are nonempty.
+        assert_eq!(right_map[20], Fp3::ZERO);
+        // Shapes and batch coefficients are checked.
+        assert!(reduction.side_maps(&left, &right[..1], &om).is_err());
+        assert!(reduction.side_maps(&left, &right, &om[..1]).is_err());
+    }
+
+    #[test]
+    fn the_stack_claim_sums_the_panel_products() {
+        let (reduction, om, _) = two_panels();
+        let left = vec![cells(4, 1), cells(16, 101)];
+        let right = vec![cells(4, 201), cells(16, 301)];
+        let mut expected = Fp3::ZERO;
+        for (index, panel) in reduction.panels.iter().enumerate() {
+            let batch = om[panel.claim];
+            for i in 0..panel.ni as usize {
+                for yv in 0..panel.ny as usize {
+                    let cell = i * panel.ny as usize + yv;
+                    expected = expected.add(
+                        &panel
+                            .ec
+                            .mul(&batch)
+                            .mul(&panel.weight[i])
+                            .mul(&left[index][cell])
+                            .mul(&right[index][cell]),
+                    );
+                }
+            }
+        }
+        assert_eq!(reduction.sum(&left, &right, &om).unwrap(), expected);
+    }
+
+    #[test]
+    fn the_row_ties_tie_the_end_values_to_the_reads() {
+        // One read panel and one weight panel: the weight panel's second
+        // side repeats the shown row weight across its entries.
+        let read = panel(0, 5, 2, 2, vec![fp(7), fp(11)]);
+        let weight = StackPanel {
+            first_claim: Some(0),
+            ..panel(0, 3, 2, 2, vec![fp(1), fp(1)])
+        };
+        let reduction = StackReduction::new(vec![read, weight]).unwrap();
+        let om = vec![fp(2)];
+        let left = vec![cells(4, 1), cells(4, 51)];
+        let row_weight = |row: usize| fp(13 + row as u64);
+        let right = vec![
+            cells(4, 201),
+            vec![
+                row_weight(0), row_weight(0), row_weight(1), row_weight(1),
+            ],
+        ];
+        let (_, point) = {
+            let (reduction_ref, _, point) = two_panels();
+            (reduction_ref, point)
+        };
+        let point = point[..reduction.lam as usize].to_vec();
+        let (left_end, right_end) = reduction.end_values(&left, &right, &om, &point).unwrap();
+        reduction
+            .check_row_ties(&left, &right, &om, &point, left_end, right_end)
+            .unwrap();
+        // A changed read moves the recomposed value away from the sent end
+        // value.
+        let mut changed = left.clone();
+        changed[0][2] = changed[0][2].add(&Fp3::ONE);
+        assert!(reduction
+            .check_row_ties(&changed, &right, &om, &point, left_end, right_end)
+            .is_err());
+        // So does a changed second-side read or a changed shown weight.
+        let mut changed = right.clone();
+        changed[0][1] = changed[0][1].add(&Fp3::ONE);
+        assert!(reduction
+            .check_row_ties(&left, &changed, &om, &point, left_end, right_end)
+            .is_err());
+        let mut changed = right.clone();
+        changed[1][0] = changed[1][0].add(&Fp3::ONE);
+        assert!(reduction
+            .check_row_ties(&left, &changed, &om, &point, left_end, right_end)
+            .is_err());
+    }
+
+    #[test]
+    fn the_stack_sumcheck_proves_and_verifies_its_claim() {
+        let read = panel(0, 5, 2, 2, vec![fp(7), fp(11)]);
+        let reduction = StackReduction::new(vec![read]).unwrap();
+        let om = vec![fp(2), fp(3)];
+        let left = vec![cells(4, 1)];
+        let right = vec![cells(4, 201)];
+        let claim = reduction.sum(&left, &right, &om).unwrap();
+        let variables = (0..reduction.lam)
+            .map(|_| crate::proof::psc::Weight::plain(3))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let hiding_count = crate::proof::psc::hp_entries(&general_variables(
+            &variables,
+            &Summand::Product,
+        )
+        .unwrap())
+        .unwrap();
+        let masks = GeneralMaskEntries {
+            hiding: (0..hiding_count).map(|index| fp(700 + index as u64)).collect(),
+            shown: vec![fp(800), fp(801)],
+        };
+        let (proof, proven) = prove_stack(
+            &reduction,
+            &left,
+            &right,
+            &om,
+            &[],
+            &|_| Ok(Fp3::ZERO),
+            claim,
+            &masks,
+            &mut Source(41),
+        )
+        .unwrap();
+        let verified = verify_stack(
+            &reduction,
+            &[],
+            claim,
+            &proof,
+            masks.hiding.len(),
+            &mut Source(41),
+        )
+        .unwrap();
+        assert_eq!(proven, verified);
+        assert_eq!(proven.point.len(), reduction.lam as usize);
+        // A changed round leaves another output claim.
+        let mut changed = proof.clone();
+        changed.rounds[0].coefficients[0] =
+            changed.rounds[0].coefficients[0].add(&Fp3::ONE);
+        let tampered = verify_stack(
+            &reduction,
+            &[],
+            claim,
+            &changed,
+            masks.hiding.len(),
+            &mut Source(41),
+        )
+        .unwrap();
+        assert_ne!(tampered, verified);
+        // Another target does not match the first round.
+        assert!(prove_stack(
+            &reduction,
+            &left,
+            &right,
+            &om,
+            &[],
+            &|_| Ok(Fp3::ZERO),
+            claim.add(&Fp3::ONE),
+            &masks,
+            &mut Source(41),
+        )
+        .is_err());
     }
 }
