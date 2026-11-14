@@ -292,6 +292,7 @@ fn plan(activation: &CommittedActivation, table: &Table) -> HiddenLinPlan {
         source_data: None,
             segment_mask_tree: None,
             range: None,
+        digit_lookups: Vec::new(),
     };
     HiddenLinPlan {
         norm: None,

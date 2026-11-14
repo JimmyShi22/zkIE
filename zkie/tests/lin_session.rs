@@ -985,6 +985,7 @@ fn selected_gpt2_output_head_request_session() {
             source_data: None,
             segment_mask_tree: None,
             range: None,
+            digit_lookups: Vec::new(),
         },
         proximity,
         index_mask: Some(index_mask),

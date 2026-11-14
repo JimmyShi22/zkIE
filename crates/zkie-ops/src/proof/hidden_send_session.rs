@@ -1984,6 +1984,11 @@ pub struct HiddenSendPlan {
     /// read cells and the kept owner entry. It is committed after the segment
     /// runs, so the mask table itself carries no segment output.
     pub source_data: Option<RequestWPlan>,
+    /// The range object's two digit lookups: the low plane over `0..1023` and
+    /// the high plane over `0..255`. Empty when the plan carries no range
+    /// objects; a non-empty list is exactly the two planes of the committed
+    /// digit message, each with its own multiplicity-bit and mask messages.
+    pub digit_lookups: Vec<crate::proof::digit_lookup::DigitLookupPlan>,
     /// The fresh mask tree of the first-chain segment proximity test, when the
     /// plan carries the segment.
     pub segment_mask_tree: Option<MaskTreePlan>,
@@ -2179,6 +2184,9 @@ impl HiddenSendPlan {
                 return Err(Error::InvalidConfig);
             }
         }
+        if !self.digit_lookups.is_empty() && self.range.is_none() {
+            return Err(Error::InvalidConfig);
+        }
         // The range objects follow the trusted geometry and keep their own
         // identities: no oracle or tree number is shared with another object
         // of the session. The reduced read table is the member's read table,
@@ -2194,6 +2202,17 @@ impl HiddenSendPlan {
                 || self.activation_source != ActivationSource::Commitment
             {
                 return Err(Error::InvalidConfig);
+            }
+            if !self.digit_lookups.is_empty() {
+                if self.digit_lookups.len() != 2 {
+                    return Err(Error::InvalidConfig);
+                }
+                for (plane, lookup) in self.digit_lookups.iter().enumerate() {
+                    if lookup.plane as usize != plane {
+                        return Err(Error::InvalidConfig);
+                    }
+                    lookup.validate(range)?;
+                }
             }
             let member = self.member.as_ref().ok_or(Error::InvalidConfig)?;
             // One packed symbol array per limb: the member's read tables are
@@ -2272,6 +2291,15 @@ impl HiddenSendPlan {
                             .as_ref()
                             .map_or(false, |member| member.tree.tree_number == tree))
             };
+            for lookup in &self.digit_lookups {
+                if clashes(lookup.commit.bits_oracle)
+                    || clashes(lookup.commit.mask_oracle)
+                    || tree_clashes(lookup.commit.bits_shape.tree_number, false)
+                    || tree_clashes(lookup.commit.mask_tree.tree_number, false)
+                {
+                    return Err(Error::InvalidConfig);
+                }
+            }
             if clashes(range.unit_oracle)
                 || clashes(range.digit_oracle)
                 || range
@@ -3500,6 +3528,10 @@ pub struct HiddenSendMessages {
     pub range_units: Option<RequestWMessage>,
     /// The digit object's SEND message, in the same form.
     pub range_digits: Option<RequestWMessage>,
+    /// The two digit lookups' messages: the multiplicity-bit and mask roots,
+    /// the proof and the claims the plan's lookups leave. Empty when the plan
+    /// carries no lookup.
+    pub digit_lookups: Vec<DigitLookupMessages>,
     /// The first-chain segment proximity transcript, when the plan carries the
     /// segment.
     pub segment_proximity: Option<SegmentProximityMessages>,
@@ -3562,6 +3594,15 @@ impl HiddenSendMessages {
         if let Some(message) = &self.range_digits {
             writer.put_digest(&message.root);
             writer.put_bytes(&message.sample.encode());
+        }
+        for message in &self.digit_lookups {
+            if message.bits_root == Digest::ZERO || message.mask_root == Digest::ZERO {
+                return Err(Error::InvalidEncoding);
+            }
+            writer.put_digest(&message.bits_root);
+            writer.put_digest(&message.mask_root);
+            writer.put_bytes(&message.proof.encode()?);
+            writer.put_bytes(&message.claims.encode_unchecked());
         }
         if let Some(proximity) = &self.segment_proximity {
             put_segment_proximity(&mut writer, proximity);
@@ -3735,6 +3776,31 @@ impl HiddenSendMessages {
             }
             None => (Vec::new(), None, None),
         };
+        let digit_lookups = {
+            let mut lookups = Vec::with_capacity(plan.digit_lookups.len());
+            for lookup in &plan.digit_lookups {
+                let bits_root = reader.get_digest()?;
+                let mask_root = reader.get_digest()?;
+                if bits_root == Digest::ZERO || mask_root == Digest::ZERO {
+                    return Err(Error::InvalidEncoding);
+                }
+                let proof = crate::proof::lookup::LookupProof::decode(
+                    &lookup.lookup,
+                    reader.get_bytes()?,
+                )?;
+                let claims = crate::proof::lookup::LookupOutcome::decode(
+                    &lookup.lookup,
+                    reader.get_bytes()?,
+                )?;
+                lookups.push(DigitLookupMessages {
+                    bits_root,
+                    mask_root,
+                    proof,
+                    claims,
+                });
+            }
+            lookups
+        };
         let segment_proximity = if plan.request_chain.is_some() {
             Some(get_segment_proximity(&mut reader)?)
         } else {
@@ -3905,6 +3971,7 @@ impl HiddenSendMessages {
             range_array,
             range_units,
             range_digits,
+            digit_lookups,
             segment_proximity,
             chain_value,
         })
@@ -4372,6 +4439,7 @@ pub fn prove_hidden_send(
         range_array: Vec::new(),
         range_units: None,
         range_digits: None,
+        digit_lookups: Vec::new(),
         segment_proximity: None,
     };
     Ok((messages, witness))
@@ -5070,6 +5138,16 @@ struct RangeMessages {
     arrays: Vec<RequestWMessage>,
     units: RequestWMessage,
     digits: RequestWMessage,
+}
+
+/// One digit lookup's wire form: the roots of its two messages, its proof
+/// and the claims it leaves to the segment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DigitLookupMessages {
+    pub bits_root: Digest,
+    pub mask_root: Digest,
+    pub proof: crate::proof::lookup::LookupProof,
+    pub claims: crate::proof::lookup::LookupOutcome,
 }
 
 /// The private randomness and public messages of the three range messages.
@@ -11150,6 +11228,7 @@ fn prove_first(
         range_units: range_messages_out.as_ref().map(|messages| messages.units.clone()),
         range_digits: range_messages_out.as_ref().map(|messages| messages.digits.clone()),
         segment_proximity,
+        digit_lookups: Vec::new(),
     };
     witness.request_w = request_w_commit;
     witness.chain_mask = chain_mask_witness;
@@ -22355,6 +22434,7 @@ mod tests {
             source_data: None,
             segment_mask_tree: None,
             range: None,
+            digit_lookups: Vec::new(),
         };
         let mut source = VecTableSource::new(messages, tails).unwrap();
         let randomness = randomness();
@@ -23824,6 +23904,7 @@ mod merged_tests {
             source_data: None,
             segment_mask_tree: None,
             range: None,
+            digit_lookups: Vec::new(),
         };
         let weights: Vec<Vec<Fp3>> = (0..POSITIONS)
             .map(|position| activation.weights(position, MATRIX_ROWS).unwrap())

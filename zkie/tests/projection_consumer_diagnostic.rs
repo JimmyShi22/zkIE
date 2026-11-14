@@ -650,6 +650,7 @@ fn plan_for(
             source_data: None,
             segment_mask_tree: None,
             range: None,
+            digit_lookups: Vec::new(),
         },
         output: HiddenOutputShape {
             positions,
@@ -870,6 +871,7 @@ fn hidden_plan_for(
             source_data: None,
             segment_mask_tree: None,
             range: None,
+            digit_lookups: Vec::new(),
         },
         output: HiddenOutputShape {
             positions,
