@@ -1708,6 +1708,15 @@ pub struct MemberPlan {
     pub tree: RuntimeTreePlan,
 }
 
+/// The request chain's planned table cells: one (row, column) pair per cell of
+/// each side, in panel and cell order. Trusted plan data; the cells are read on
+/// the witness stream by the same path as the reduced witness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestReadPlan {
+    pub left: Vec<(u64, u64)>,
+    pub right: Vec<(u64, u64)>,
+}
+
 /// The trusted plan of one hidden SEND-sample message. It carries the public
 /// shapes, the encoded table identity, the activation commitment pin and, for
 /// a verifier plan, the expected `W` roots. The expected roots are a fixture
@@ -1746,6 +1755,9 @@ pub struct HiddenSendPlan {
     /// The request chain's proof shapes, when this session carries the
     /// request reduction's transcript section.
     pub request_chain: Option<crate::proof::request_chain::RequestChainShape>,
+    /// The request chain's planned table cells, when the chain reads the
+    /// table on the witness stream.
+    pub request_reads: Option<RequestReadPlan>,
 }
 
 impl HiddenSendPlan {
@@ -18413,6 +18425,7 @@ mod tests {
             expected_roots: None,
             member: None,
             request_chain: None,
+            request_reads: None,
         };
         let mut source = VecTableSource::new(messages, tails).unwrap();
         let randomness = randomness();
@@ -19233,6 +19246,45 @@ mod tests {
     }
 
     #[test]
+    fn the_plan_names_the_chain_read_cells() {
+        let fixture = fixture();
+        let messages = table_messages();
+        let mut plan = fixture.plan.clone();
+        plan.request_reads = Some(super::RequestReadPlan {
+            left: vec![(0, 0), (1, 1)],
+            right: vec![(2, 2), (3, 3)],
+        });
+        let reduction = crate::proof::request_stack::StackReduction::new(vec![
+            crate::proof::request_stack::StackPanel {
+                claim: 0,
+                ec: Fp3::ONE,
+                ni: 2,
+                ny: 1,
+                weight: vec![Fp3::ONE, Fp3::ONE],
+                first_claim: None,
+                w: 0,
+                off: 0,
+            },
+        ])
+        .unwrap();
+        let reads = plan.request_reads.as_ref().unwrap();
+        let mut source = VecTableSource::new(messages.clone(), table_tails()).unwrap();
+        let (left, right) =
+            super::stack_reads(&plan, &reduction, &reads.left, &reads.right, &mut source).unwrap();
+        assert_eq!(left[0][0], Fp3::from_base(messages[0][0]));
+        assert_eq!(left[0][1], Fp3::from_base(messages[1][1]));
+        assert_eq!(right[0][0], Fp3::from_base(messages[2][2]));
+        assert_eq!(right[0][1], Fp3::from_base(messages[3][3]));
+        // Another cell list is another read set and another value.
+        let mut changed = reads.clone();
+        changed.left[0] = (0, 1);
+        let mut source = VecTableSource::new(messages.clone(), table_tails()).unwrap();
+        let (other, _) =
+            super::stack_reads(&plan, &reduction, &changed.left, &reads.right, &mut source).unwrap();
+        assert_ne!(other[0][0], left[0][0]);
+    }
+
+    #[test]
     fn the_stack_reads_follow_the_panels_and_the_stream() {
         let fixture = fixture();
         let messages = table_messages();
@@ -19630,6 +19682,7 @@ mod merged_tests {
             expected_roots: None,
             member: None,
             request_chain: None,
+            request_reads: None,
         };
         let weights: Vec<Vec<Fp3>> = (0..POSITIONS)
             .map(|position| activation.weights(position, MATRIX_ROWS).unwrap())

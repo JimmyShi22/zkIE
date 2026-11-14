@@ -979,6 +979,7 @@ fn selected_gpt2_output_head_request_session() {
             expected_roots: None,
             member: None,
             request_chain: None,
+            request_reads: None,
         },
         proximity,
         index_mask: Some(index_mask),
