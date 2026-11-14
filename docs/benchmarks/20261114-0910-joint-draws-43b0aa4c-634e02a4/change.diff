@@ -1,0 +1,112 @@
+commit 43b0aa4c4c18efb607f4c724d1a7ca403b1639db
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Sat Nov 14 09:10:19 2026 +0800
+
+    Account the joint draw counts of the shared and own groups
+    
+    The trusted planner now accounts the positions every code's random
+    coordinates must cover when the shared and own groups are solved together:
+    Omega is read by the shared test and by every request's test, a split shared
+    group reads Omega's own message in both tests, and the batch term multiplies
+    only the request's positions. A single request fixes the public batch size at
+    one instead of omitting the term. Unit tests cover the joined group, the
+    split group and a batch of two.
+    
+    The position and distance fixed point over these counts and the capacity
+    mapping remain the next steps.
+
+diff --git a/crates/zkie-ops/src/proof/proximity_planner.rs b/crates/zkie-ops/src/proof/proximity_planner.rs
+index c3fd0169..14a34da6 100644
+--- a/crates/zkie-ops/src/proof/proximity_planner.rs
++++ b/crates/zkie-ops/src/proof/proximity_planner.rs
+@@ -850,6 +850,59 @@ pub fn derive_stage_list(
+     Ok(stages)
+ }
+ 
++/// The positions every code's random coordinates must cover when the shared
++/// and own groups are solved together. `folded` and `omega` are the shared
++/// group's position counts, `own` a request's, and `requests` the batch size.
++/// Omega is read by the shared test and by every request's test; a split
++/// shared group reads Omega's own message as well.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct JointDraws {
++    pub folded_main: u64,
++    pub folded_mask: u64,
++    pub omega_main: u64,
++    pub omega_mask: u64,
++    pub own_main: u64,
++    pub own_mask: u64,
++}
++
++/// The joint draw counts of the shared and own groups. `requests` is the
++/// public batch size of the request under test: a single request has
++/// `requests = 1`, which is not the same as omitting the batch term.
++pub fn joint_draws(
++    folded: u64,
++    omega: u64,
++    own: u64,
++    requests: u64,
++    split: bool,
++) -> Result<JointDraws> {
++    if requests == 0 {
++        return Err(Error::InvalidConfig);
++    }
++    let own_total = requests
++        .checked_mul(own)
++        .ok_or(Error::ResourceLimit)?;
++    let omega_reads = if split { omega } else { folded };
++    let omega_main = omega_reads
++        .checked_add(own_total)
++        .ok_or(Error::ResourceLimit)?;
++    Ok(JointDraws {
++        folded_main: if split { folded } else { omega_main },
++        folded_mask: if split {
++            folded.checked_add(omega).ok_or(Error::ResourceLimit)?
++        } else {
++            folded
++        },
++        omega_main,
++        omega_mask: if split {
++            folded.checked_add(omega).ok_or(Error::ResourceLimit)?
++        } else {
++            folded
++        },
++        own_main: omega_main,
++        own_mask: own,
++    })
++}
++
+ fn ceil_log2(value: u64) -> u32 {
+     if value <= 1 {
+         return 0;
+@@ -1300,3 +1353,30 @@ mod stage_list_tests {
+         assert!(failure.point.contains("fit its code length"));
+     }
+ }
++
++#[cfg(test)]
++mod joint_draw_tests {
++    use super::*;
++
++    #[test]
++    fn joint_draws_account_every_reader() {
++        // One shared code: Omega is read by the shared test and by the one
++        // request's test.
++        let draws = joint_draws(11, 11, 7, 1, false).unwrap();
++        assert_eq!(draws.omega_main, 18);
++        assert_eq!(draws.folded_main, 18);
++        assert_eq!(draws.own_main, 18);
++        assert_eq!(draws.own_mask, 7);
++        // A split shared group reads Omega's own message in both tests.
++        let draws = joint_draws(11, 13, 7, 1, true).unwrap();
++        assert_eq!(draws.omega_main, 20);
++        assert_eq!(draws.folded_main, 11);
++        assert_eq!(draws.folded_mask, 24);
++        assert_eq!(draws.omega_mask, 24);
++        // A batch multiplies only the request term.
++        let draws = joint_draws(11, 11, 7, 2, false).unwrap();
++        assert_eq!(draws.omega_main, 25);
++        assert_eq!(draws.own_mask, 7);
++        assert!(joint_draws(11, 11, 7, 0, false).is_err());
++    }
++}
