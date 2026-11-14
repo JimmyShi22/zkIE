@@ -5090,7 +5090,7 @@ impl HiddenProximityPlan {
         norm: Option<&NormPlan>,
     ) -> Option<&'static str> {
         if self.gu.fault().is_some() || self.omega.fault().is_some() {
-            return Some("a proximity message shape is not valid");
+return Some("a proximity message shape is not valid");
         }
         if build_code_plan(self.code.log_n, self.code.ell, self.code.r).is_err()
             || build_code_plan(
@@ -5100,21 +5100,21 @@ impl HiddenProximityPlan {
             )
             .is_err()
         {
-            return Some("a proximity code is not a code");
+return Some("a proximity code is not a code");
         }
         if self.gu.u.code != self.code || self.omega.u.code != self.code || send.w.code != self.code
         {
-            return Some("the proximity members do not share one main code");
+return Some("the proximity members do not share one main code");
         }
         if let Some(norm) = norm {
             for group in [&norm.x, &norm.sum, &norm.squares, &norm.mean, &norm.variance] {
                 if group.shape.code != self.code || group.group != send.group {
-                    return Some("a norm group does not share the proximity group");
+return Some("a norm group does not share the proximity group");
                 }
             }
             if let Some(mask) = &norm.mask {
                 if mask.mask_code != self.mask_code || mask.group != send.group {
-                    return Some("the norm mask does not share the proximity mask group");
+return Some("the norm mask does not share the proximity mask group");
                 }
             }
             if let Some(lookup) = &norm.lookup {
@@ -5122,7 +5122,7 @@ impl HiddenProximityPlan {
                     || lookup.commit.mask_code != self.mask_code
                     || lookup.commit.group != send.group
                 {
-                    return Some("the lookup messages do not share the proximity groups");
+return Some("the lookup messages do not share the proximity groups");
                 }
             }
         }
@@ -5130,12 +5130,12 @@ impl HiddenProximityPlan {
             || self.omega.tree.log_n_zk != self.mask_code.log_n
             || self.mask_code.log_n != self.code.log_n
         {
-            return Some("a proximity member tree does not match the fold mask code");
+return Some("a proximity member tree does not match the fold mask code");
         }
         if self.gu.tree.log_n != self.code.log_n
             || self.omega.tree.log_n != self.code.log_n
         {
-            return Some("a proximity member tree has another depth than its code");
+return Some("a proximity member tree has another depth than its code");
         }
         if self.gu.u.main_rows == 0
             || !self.gu.u.main_rows.is_power_of_two()
@@ -5144,7 +5144,7 @@ impl HiddenProximityPlan {
             || send.w.main_rows == 0
             || !send.w.main_rows.is_power_of_two()
         {
-            return Some("a proximity member does not have power-of-two main rows");
+return Some("a proximity member does not have power-of-two main rows");
         }
         if self.gu.u.mask_rows != 0
             || self.omega.u.mask_rows != 0
@@ -5152,7 +5152,7 @@ impl HiddenProximityPlan {
             || self.omega.u.answers != 1
             || send.w.answers != 1
         {
-            return Some("a proximity member is not a maskless single-answer message");
+return Some("a proximity member is not a maskless single-answer message");
         }
         // The hiding budget of every member is the union of its distinct
         // opened positions against the code tail rank. The declared counts are
@@ -5178,54 +5178,54 @@ impl HiddenProximityPlan {
             .unwrap_or(shared_base);
         if self.own_stages.is_empty() {
             if send.openings_per_oracle as u64 + own_base > send.w.code.r {
-                return Some("the W SEND and own-BASE openings exceed the code tail");
+return Some("the W SEND and own-BASE openings exceed the code tail");
             }
             if let Some(index) = &send.index_mask {
                 if index.openings as u64 + own_base > index.mask_code.r {
-                    return Some("the index-mask SEND and own-BASE openings exceed the mask tail");
+return Some("the index-mask SEND and own-BASE openings exceed the mask tail");
                 }
             }
             if let Some(dot) = &send.dot {
                 if own_base > dot.shape.code.r {
-                    return Some("the shown-map own-BASE openings exceed the code tail");
+return Some("the shown-map own-BASE openings exceed the code tail");
                 }
             }
             if own_base > self.mask_code.r {
-                return Some("the fresh-mask BASE openings exceed the mask tail");
+return Some("the fresh-mask BASE openings exceed the mask tail");
             }
         } else {
             if send.openings_per_oracle as u64 + own_switch > send.w.code.r
                 || own_switch > self.code.r
                 || own_switch > self.mask_code.r
             {
-                return Some("the own stage-0 switch openings exceed a group tail");
+return Some("the own stage-0 switch openings exceed a group tail");
             }
             if let Some(index) = &send.index_mask {
                 if index.openings as u64 + own_switch > index.mask_code.r {
-                    return Some("the index-mask stage-0 openings exceed the mask tail");
+return Some("the index-mask stage-0 openings exceed the mask tail");
                 }
             }
             if let Some(dot) = &send.dot {
                 if own_switch > dot.shape.code.r {
-                    return Some("the shown-map stage-0 openings exceed the code tail");
+return Some("the shown-map stage-0 openings exceed the code tail");
                 }
             }
         }
         if self.shared_stages.is_empty() {
             if shared_base + own_base > self.code.r {
-                return Some("the Omega shared and own-BASE openings exceed the code tail");
+return Some("the Omega shared and own-BASE openings exceed the code tail");
             }
             if shared_base > self.code.r {
-                return Some("the G_u shared-BASE openings exceed the code tail");
+return Some("the G_u shared-BASE openings exceed the code tail");
             }
             if shared_base > self.mask_code.r {
-                return Some("the fresh-mask BASE openings exceed the mask tail");
+return Some("the fresh-mask BASE openings exceed the mask tail");
             }
         } else if shared_switch > self.code.r || shared_switch > self.mask_code.r {
-            return Some("the shared stage-0 switch openings exceed a group tail");
+return Some("the shared stage-0 switch openings exceed a group tail");
         }
         if self.column_budget as u64 > send.table_shape.code.r {
-            return Some("the table column budget exceeds the table code tail");
+return Some("the table column budget exceeds the table code tail");
         }
         if let Some(closure) = closure {
             let own_open = if self.own_stages.is_empty() {
@@ -5234,24 +5234,24 @@ impl HiddenProximityPlan {
                 own_switch
             };
             if closure.slack_openings as u64 + own_open > closure.slack.code.r {
-                return Some("the slack SEND and own openings exceed the code tail");
+return Some("the slack SEND and own openings exceed the code tail");
             }
             if closure.bits_openings as u64 + own_open > closure.bits.code.r {
-                return Some("the packed-bit SEND and own openings exceed the code tail");
+return Some("the packed-bit SEND and own openings exceed the code tail");
             }
             if closure.map_openings as u64 + own_open > closure.map.code.r {
-                return Some("the product-map SEND and own openings exceed the code tail");
+return Some("the product-map SEND and own openings exceed the code tail");
             }
             if closure.mask.openings as u64 + own_open > closure.mask.mask_code.r {
-                return Some("the closure-mask SEND and own openings exceed the mask tail");
+return Some("the closure-mask SEND and own openings exceed the mask tail");
             }
         }
         if !self.shared_stages.is_empty() || !self.own_stages.is_empty() {
             if proximity_iopp_plan(self, send, closure, norm, ProximityGroupRole::Shared).is_err() {
-                return Some("the shared IOPP chain cannot be derived from the trusted plan");
+return Some("the shared IOPP chain cannot be derived from the trusted plan");
             }
             if proximity_iopp_plan(self, send, closure, norm, ProximityGroupRole::Own).is_err() {
-                return Some("the own IOPP chain cannot be derived from the trusted plan");
+return Some("the own IOPP chain cannot be derived from the trusted plan");
             }
         }
         if self.planner_checked {
@@ -5266,7 +5266,7 @@ impl HiddenProximityPlan {
         // count changes the plan semantics and is rejected here.
 
         if self.shared_mask_tree.fault().is_some() || self.own_mask_tree.fault().is_some() {
-            return Some("a fresh mask tree is not valid");
+return Some("a fresh mask tree is not valid");
         }
         let mut own_mask_rows = match &send.index_mask {
             Some(index) => match index.tree_rows() {
@@ -5312,7 +5312,7 @@ impl HiddenProximityPlan {
             || self.shared_mask_tree.log_n != self.mask_code.log_n
             || self.own_mask_tree.log_n != self.mask_code.log_n
         {
-            return Some("a fresh mask tree does not match the fold mask code");
+return Some("a fresh mask tree does not match the fold mask code");
         }
         if let Some(index) = &send.index_mask {
             if index.mask_code != self.mask_code
@@ -5324,21 +5324,21 @@ impl HiddenProximityPlan {
                 || index.tree.tree_number == self.shared_mask_tree.tree_number
                 || index.tree.tree_number == self.own_mask_tree.tree_number
             {
-                return Some("the index-mask member does not match the own group");
+return Some("the index-mask member does not match the own group");
             }
             match send.w.tree_number.checked_add(send.activation.positions as u64) {
                 Some(end)
                     if index.tree.tree_number >= send.w.tree_number
                         && index.tree.tree_number < end =>
                 {
-                    return Some("the index-mask tree collides with a W tree");
+return Some("the index-mask tree collides with a W tree");
                 }
                 Some(_) => {}
                 None => return Some("the W tree range overflows"),
             }
         }
         if self.shared_mask_tree.tree_number == self.own_mask_tree.tree_number {
-            return Some("the two fresh masks share one tree number");
+return Some("the two fresh masks share one tree number");
         }
         if let Some(dot) = &send.dot {
             if dot.shape.code != self.code
@@ -5349,7 +5349,7 @@ impl HiddenProximityPlan {
                 || dot.shape.tree_number == self.shared_mask_tree.tree_number
                 || dot.shape.tree_number == self.own_mask_tree.tree_number
             {
-                return Some("the shown-map message does not match the own group");
+return Some("the shown-map message does not match the own group");
             }
         }
         if let Some(closure) = closure {
@@ -5358,7 +5358,7 @@ impl HiddenProximityPlan {
                 || closure.slack.code != self.code
                 || closure.bits.code != self.code
             {
-                return Some("the closure messages do not match the own group");
+return Some("the closure messages do not match the own group");
             }
             let positions = send.positions() as u64;
             let mut oracle_ranges = vec![
@@ -5390,7 +5390,7 @@ impl HiddenProximityPlan {
                     let (a0, a1) = oracle_ranges[first];
                     let (b0, b1) = oracle_ranges[second];
                     if a1 == 0 || b1 == 0 || (a0 < b1 && b0 < a1) {
-                        return Some("a closure oracle collides with another oracle");
+return Some("a closure oracle collides with another oracle");
                     }
                 }
             }
@@ -5440,16 +5440,16 @@ impl HiddenProximityPlan {
                     let (a0, a1) = tree_ranges[first];
                     let (b0, b1) = tree_ranges[second];
                     if a1 == 0 || b1 == 0 || (a0 < b1 && b0 < a1) {
-                        return Some("a closure tree collides with another tree");
+return Some("a closure tree collides with another tree");
                     }
                 }
             }
         }
         if self.shared_fresh == self.own_fresh {
-            return Some("the two fresh masks share one oracle id");
+return Some("the two fresh masks share one oracle id");
         }
         if self.shared_fresh < 2 {
-            return Some("the shared fresh mask id collides with a group member id");
+return Some("the shared fresh mask id collides with a group member id");
         }
         // Upper bound of the own BAT member set: one W member per position,
         // one Omega member, optional Dot and index-mask members, three
@@ -5459,19 +5459,19 @@ impl HiddenProximityPlan {
             .and_then(|value| value.checked_add(4))
             .unwrap_or(u64::MAX);
         if self.own_fresh < own_member_bound {
-            return Some("the own fresh mask id collides with a group member id");
+return Some("the own fresh mask id collides with a group member id");
         }
         if self.column_draws == 0 || self.column_budget == 0 {
-            return Some("the shared stage has no table column budget");
+return Some("the shared stage has no table column budget");
         }
         if self.column_draws > self.column_budget {
-            return Some("the shared stage draw count exceeds its column budget");
+return Some("the shared stage draw count exceeds its column budget");
         }
         if self.column_work_bits > 64 {
-            return Some("the column work target does not fit");
+return Some("the column work target does not fit");
         }
         if self.shared_base_positions == 0 || self.own_base_positions == 0 {
-            return Some("a proximity test has no BASE position");
+return Some("a proximity test has no BASE position");
         }
         None
     }
@@ -5517,7 +5517,7 @@ impl HiddenProximityPlan {
             },
         ];
         if shared_members.iter().any(|member| member == &AssemblyMember::Fixed { main_rows: 0, mask_rows: 0 }) {
-            return Some("a shared proximity member is empty");
+return Some("a shared proximity member is empty");
         }
         let mut own_objects = Vec::new();
         for _ in 0..send.positions() {
@@ -5540,7 +5540,7 @@ impl HiddenProximityPlan {
         });
         if let Some(index) = &send.index_mask {
             if index.mask_code != self.mask_code {
-                return Some("the index-mask code differs from the proximity mask code");
+return Some("the index-mask code differs from the proximity mask code");
             }
             own_objects.push(AssemblyOwnObject {
                 member: AssemblyMember::Fixed {
@@ -5553,7 +5553,7 @@ impl HiddenProximityPlan {
         }
         if let Some(dot) = &send.dot {
             if dot.shape.code != self.code {
-                return Some("the shown-map code differs from the proximity main code");
+return Some("the shown-map code differs from the proximity main code");
             }
             own_objects.push(AssemblyOwnObject {
                 member: AssemblyMember::Fixed {
@@ -5568,7 +5568,7 @@ impl HiddenProximityPlan {
         // through its own SEND oracle and opened only by the own tests.
         if let Some(rw) = &send.request_w {
             if rw.shape.code != self.code {
-                return Some("the request W code differs from the proximity main code");
+return Some("the request W code differs from the proximity main code");
             }
             own_objects.push(AssemblyOwnObject {
                 member: AssemblyMember::Fixed {
@@ -5580,7 +5580,7 @@ impl HiddenProximityPlan {
             });
         }
         if self.shared_stages.len() < 2 || self.own_stages.len() < 2 {
-            return Some("the planner-checked plan has no complete stage list");
+return Some("the planner-checked plan has no complete stage list");
         }
         if self
             .shared_stages
@@ -5588,7 +5588,7 @@ impl HiddenProximityPlan {
             .chain(self.own_stages.iter())
             .any(|stage| stage.samples != 1 || stage.work_bits != 0)
         {
-            return Some("a planner-checked stage changes the fixed samples or work");
+return Some("a planner-checked stage changes the fixed samples or work");
         }
         let shared_choices: Vec<StageChoice> = self
             .shared_stages
@@ -5634,12 +5634,12 @@ impl HiddenProximityPlan {
             Err(_) => return Some("the trusted planner rejects the planner-checked stage lists"),
         };
         if assembled.first_main != self.code || assembled.first_mask != self.mask_code {
-            return Some("the planner-checked codes differ from the trusted derivation");
+return Some("the planner-checked codes differ from the trusted derivation");
         }
         if !planner_stages_match(&assembled.shared, &self.shared_stages)
             || !planner_stages_match(&assembled.own, &self.own_stages)
         {
-            return Some("the planner-checked stage lists differ from the trusted derivation");
+return Some("the planner-checked stage lists differ from the trusted derivation");
         }
         if self.shared_base_positions
             != assembled
@@ -5654,7 +5654,7 @@ impl HiddenProximityPlan {
                     .map(|stage| stage.positions as usize)
                     .unwrap_or(0)
         {
-            return Some("the BASE position count differs from the trusted derivation");
+return Some("the BASE position count differs from the trusted derivation");
         }
         let shared_mask_rows = match 1u64.checked_shl(self.shared_stages[0].h) {
             Some(rows) => rows,
@@ -5669,7 +5669,7 @@ impl HiddenProximityPlan {
             || self.shared_mask_tree.log_n != self.mask_code.log_n
             || self.own_mask_tree.log_n != self.mask_code.log_n
         {
-            return Some("a fresh mask tree does not match its first stage");
+return Some("a fresh mask tree does not match its first stage");
         }
         None
     }
@@ -20330,7 +20330,7 @@ mod merged_tests {
     const TABLE_LOG_N: u32 = 4;
     const TABLE_ELL: u64 = 8;
     const TABLE_R: u64 = 8;
-    const CODE_LOG_N: u32 = 8;
+    const CODE_LOG_N: u32 = 12;
     const CODE_ELL: u64 = 32;
     const CODE_R: u64 = 4;
     const INDEX_MASK_ORACLE: u64 = 30;
@@ -23394,15 +23394,13 @@ mod merged_tests {
         target
     }
 
-    /// One hidden session carrying the consumer member, the request-level W
-    /// and the chain's read cells. The claim target is computed from the same
+    /// The member-carrying plan with its claim target filled from the same
     /// drew randomness the session uses, so the committed rows hold.
-    fn member_run() -> (HiddenLinPlan, HiddenLinMessages, HiddenLinWitness) {
-        let activation = activation();
-        let mut plan = hidden_plan(&activation);
+    fn member_plan_for(activation: &CommittedActivation) -> (HiddenLinPlan, Digest) {
+        let mut plan = hidden_plan(activation);
         // With the consumer member present, the at_start index-mask tree's
         // leaf class must be the greatest of every tree the own group names.
-        plan.send.index_mask.as_mut().unwrap().tree.leaf_class = 5;
+        plan.send.index_mask.as_mut().unwrap().tree.leaf_class = 100;
         let index = plan.send.index_mask.clone().unwrap();
         let total = index.entries.total().unwrap();
         let free = index.free_entries().unwrap();
@@ -23437,11 +23435,178 @@ mod merged_tests {
         let mask_rows = randomness.index_mask.as_ref().unwrap().rows.clone();
         let target = member_target(&plan, &mask_rows);
         plan.send.member.as_mut().unwrap().pending.target = target;
+        (plan, seed)
+    }
+
+    /// One hidden session carrying the consumer member, the request-level W
+    /// and the chain's read cells.
+    fn member_run() -> (HiddenLinPlan, HiddenLinMessages, HiddenLinWitness) {
+        let activation = activation();
+        let (mut plan, seed) = member_plan_for(&activation);
         let mut setup = table();
         let (messages, witness) =
             prove_hidden_lin_hidden(&plan, &activation, &mut setup, seed).unwrap();
         plan.send.expected_dot_root = witness.send.dot.as_ref().map(|map| map.root);
         (plan, messages, witness)
+    }
+
+    /// The first-stage codes the planner solves for the staged member fixture:
+    /// the joint tails the member layout needs (main 106, mask 54) on the
+    /// fixture's code length. Every code-carrying shape keeps its own number
+    /// and message geometry; only the random tail grows.
+    fn staged_codes(plan: &mut HiddenLinPlan) {
+        let main = build_code_plan(CODE_LOG_N, CODE_ELL, 106).unwrap();
+        let mask = build_code_plan(CODE_LOG_N, CODE_ELL, 54).unwrap();
+        plan.proximity.code = main;
+        plan.proximity.mask_code = mask;
+        plan.send.w.code = main;
+        plan.proximity.gu.u.code = main;
+        plan.proximity.omega.u.code = main;
+        if let Some(dot) = plan.send.dot.as_mut() {
+            dot.shape.code = main;
+        }
+        if let Some(index) = plan.send.index_mask.as_mut() {
+            index.mask_code = mask;
+        }
+        if let Some(rw) = plan.send.request_w.as_mut() {
+            rw.shape.code = main;
+        }
+    }
+
+    /// The trusted planner's staged assembly for the member plan: the same
+    /// assembly input the proximity fault rebuilds, one deterministic
+    /// candidate, and the solved stage lists written back into the plan.
+    fn planned_stages(plan: HiddenLinPlan) -> HiddenLinPlan {
+        let mut plan = plan;
+        staged_codes(&mut plan);
+        // The staged codes change the drawn tail lengths, so the claim target
+        // is re-derived from the mutated plan's own randomness stream.
+        let seed = Digest([0x71; 32]);
+        let mut coins = ByteMaskCoins::new(derive_run_seed(&seed, 1, 0).unwrap()).unwrap();
+        let randomness = WCommitRandomness::from_coins(&mut coins, &plan.send, None).unwrap();
+        let mask_rows = randomness.index_mask.as_ref().unwrap().rows.clone();
+        let target = member_target(&plan, &mask_rows);
+        plan.send.member.as_mut().unwrap().pending.target = target;
+        use crate::proof::proximity_planner::{
+            validate_assembled, AssemblyCandidate, AssemblyInput, AssemblyMember,
+            AssemblyOwnObject, StageChoice,
+        };
+        let send = &plan.send;
+        let positions = send.positions();
+        let mut own_objects = Vec::new();
+        for _ in 0..positions {
+            own_objects.push(AssemblyOwnObject {
+                member: AssemblyMember::Fixed {
+                    main_rows: send.w.main_rows,
+                    mask_rows: 0,
+                },
+                shared_too: false,
+                spent: send.openings_per_oracle as u64,
+            });
+        }
+        own_objects.push(AssemblyOwnObject {
+            member: AssemblyMember::Fixed {
+                main_rows: plan.proximity.omega.u.main_rows,
+                mask_rows: plan.proximity.omega.u.mask_rows,
+            },
+            shared_too: true,
+            spent: 0,
+        });
+        if let Some(index) = &send.index_mask {
+            own_objects.push(AssemblyOwnObject {
+                member: AssemblyMember::Fixed {
+                    main_rows: 0,
+                    mask_rows: index.mask_rows,
+                },
+                shared_too: false,
+                spent: index.openings as u64,
+            });
+        }
+        if let Some(dot) = &send.dot {
+            own_objects.push(AssemblyOwnObject {
+                member: AssemblyMember::Fixed {
+                    main_rows: dot.shape.main_rows,
+                    mask_rows: 0,
+                },
+                shared_too: false,
+                spent: 0,
+            });
+        }
+        if let Some(rw) = &send.request_w {
+            own_objects.push(AssemblyOwnObject {
+                member: AssemblyMember::Fixed {
+                    main_rows: rw.shape.main_rows,
+                    mask_rows: 0,
+                },
+                shared_too: false,
+                spent: 0,
+            });
+        }
+        let input = AssemblyInput {
+            shared_members: vec![
+                AssemblyMember::Fixed {
+                    main_rows: plan.proximity.gu.u.main_rows,
+                    mask_rows: plan.proximity.gu.u.mask_rows,
+                },
+                AssemblyMember::Fixed {
+                    main_rows: plan.proximity.omega.u.main_rows,
+                    mask_rows: plan.proximity.omega.u.mask_rows,
+                },
+            ],
+            own_objects,
+            shared_mask_spent: 0,
+            requests: 1,
+            samples: send.w.answers,
+            columns: send.columns,
+            circle: false,
+        };
+        let choice = StageChoice {
+            log_n: CODE_LOG_N,
+            mask_log_n: CODE_LOG_N,
+            k: 0,
+            h: 0,
+        };
+        let candidate = AssemblyCandidate {
+            first_log_n: plan.proximity.code.log_n,
+            first_log_ell: plan.proximity.code.ell.trailing_zeros(),
+            first_mask_log_n: plan.proximity.mask_code.log_n,
+            first_mask_log_ell: plan.proximity.mask_code.ell.trailing_zeros(),
+            shared_choices: vec![choice],
+            own_choices: vec![choice],
+        };
+        let assembled = validate_assembled(&input, &candidate).expect("the trusted assembly");
+        let stage = |solved: &crate::proof::proximity_planner::SolvedStage| super::IoppStagePlan {
+            main: CodeParams {
+                log_n: solved.log_n,
+                ell: solved.main_ell,
+                r: solved.main_r,
+            },
+            mask: CodeParams {
+                log_n: solved.mask_log_n,
+                ell: solved.mask_ell,
+                r: solved.mask_r,
+            },
+            k: solved.k,
+            h: solved.h,
+            positions: solved.positions as usize,
+            samples: 1,
+            work_bits: 0,
+        };
+        let mut plan = plan;
+        plan.proximity.shared_stages = assembled.shared.iter().map(stage).collect();
+        plan.proximity.own_stages = assembled.own.iter().map(stage).collect();
+        plan.proximity.shared_base_positions = assembled
+            .shared
+            .last()
+            .map(|stage| stage.positions as usize)
+            .unwrap_or(0);
+        plan.proximity.own_base_positions = assembled
+            .own
+            .last()
+            .map(|stage| stage.positions as usize)
+            .unwrap_or(0);
+        plan.proximity.planner_checked = true;
+        plan
     }
 
     #[test]
@@ -23521,6 +23686,26 @@ mod merged_tests {
                 .unwrap();
         assert_eq!(left[0][0], Fp3::from_base(messages_table[0][0]));
         assert_eq!(right[0][0], Fp3::from_base(messages_table[1][1]));
+    }
+
+    #[test]
+    fn the_member_and_the_request_rows_run_in_a_staged_session() {
+        let activation = activation();
+        let (plan, seed) = member_plan_for(&activation);
+        let mut plan = planned_stages(plan);
+        plan.validate().unwrap();
+        let mut setup = table();
+        let (messages, witness) =
+            prove_hidden_lin_hidden(&plan, &activation, &mut setup, seed).unwrap();
+        plan.send.expected_dot_root = witness.send.dot.as_ref().map(|map| map.root);
+        let table = table();
+        let outcome = verify_hidden_lin_hidden(&plan, &table.reader, &messages).unwrap();
+        assert_eq!(outcome.eval_rows.len(), POSITIONS as usize);
+        assert!(!plan.proximity.own_stages.is_empty());
+        assert!(matches!(
+            messages.second.tail,
+            super::ProximityTail::Stages(_)
+        ));
     }
 
     #[test]
