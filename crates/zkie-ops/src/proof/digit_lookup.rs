@@ -17,9 +17,14 @@ use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
 use zkie_engine::pcs::request::field::{Fp, Fp3};
 
+use crate::proof::hidden_norm_psc::lookup_mask_rows;
+use crate::proof::hidden_send_session::WShape;
 use crate::proof::lookup::{
-    LookupKeyPlan, LookupKeySource, LookupPlan, LookupTable, BYTE_TABLE_IDENTITY,
+    mask_count, LookupKeyPlan, LookupKeySource, LookupPlan, LookupTable, BYTE_TABLE_IDENTITY,
 };
+use crate::proof::lookup_messages::LookupCommitPlan;
+use zkie_engine::pcs::request::code::CodeParams;
+use zkie_engine::pcs::request::runtime_tree::{RuntimeTreePart, RuntimeTreePlan};
 use crate::proof::lookup_table::{
     content_digest, TableConfig, TableEncoding, TABLE_ENCODING_VERSION,
 };
@@ -111,14 +116,33 @@ fn low_digit_config() -> TableConfig {
     }
 }
 
-/// One digit lookup of the range object: its plane, its public table and the
-/// key sources on the committed digit message.
+/// One digit lookup of the range object: its plane, its public table, the
+/// key sources on the committed digit message and the plans of its two
+/// messages.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DigitLookupPlan {
     /// 0 for the low digit, 1 for the high digit.
     pub plane: u32,
     pub lookup: LookupPlan,
+    pub commit: LookupCommitPlan,
     pub key: LookupKeyPlan,
+}
+
+/// The parent-plan values of one digit lookup: the codes, identities, group
+/// and the trusted tree numbers, salt and configuration of its two messages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DigitLookupParams {
+    pub code: CodeParams,
+    pub mask_code: CodeParams,
+    pub group: u64,
+    pub bits_oracle: u64,
+    pub mask_oracle: u64,
+    pub bits_tree: u64,
+    pub mask_tree: u64,
+    pub leaf_class: u32,
+    pub salt_bytes: usize,
+    pub run: Digest,
+    pub configuration: Digest,
 }
 
 impl DigitLookupPlan {
@@ -136,6 +160,23 @@ impl DigitLookupPlan {
 
     pub fn validate(&self, range: &RangePlan) -> Result<()> {
         self.lookup.validate()?;
+        let bits_columns = self
+            .lookup
+            .planes()?
+            .checked_mul(self.lookup.table_rows()?)
+            .ok_or(Error::ResourceLimit)?;
+        self.commit
+            .validate(bits_columns, mask_count(&self.lookup)?)?;
+        if self.commit.group != range.group
+            || self.commit.bits_oracle == 0
+            || self.commit.mask_oracle == 0
+            || self.commit.bits_oracle == self.commit.mask_oracle
+            || self.commit.mask_oracle == range.digit_oracle
+            || self.commit.bits_oracle == range.digit_oracle
+            || self.commit.bits_shape.fault(bits_columns as u64, 1).is_some()
+        {
+            return Err(Error::InvalidConfig);
+        }
         if self.plane > 1 {
             return Err(Error::InvalidConfig);
         }
@@ -180,10 +221,10 @@ pub fn digit_key_count(range: &RangePlan) -> Result<usize> {
         .ok_or(Error::ResourceLimit)
 }
 
-/// Builds one plane's lookup plan over the range object's digit message. The
-/// sources enumerate the plane's real cells in dense order, one per key, and
-/// the tail of the key vector is padding with the public value zero.
-pub fn digit_lookup_plan(range: &RangePlan, plane: u32) -> Result<DigitLookupPlan> {
+/// Sizes one plane's lookup and enumerates its key sources. The sources
+/// cover the plane's real cells in dense order, one per key; the tail of the
+/// key vector is padding with the public value zero.
+fn digit_lookup_sizing(range: &RangePlan, plane: u32) -> Result<(LookupPlan, LookupKeyPlan)> {
     if plane > 1 {
         return Err(Error::InvalidConfig);
     }
@@ -239,13 +280,103 @@ pub fn digit_lookup_plan(range: &RangePlan, plane: u32) -> Result<DigitLookupPla
             BYTE_TABLE_IDENTITY
         },
     };
+    Ok((lookup, key))
+}
+
+/// The multiplicity-bit message shape of one lookup: `planes * table_rows`
+/// entries over the parent code.
+fn lookup_shape(lookup: &LookupPlan, params: &DigitLookupParams) -> Result<WShape> {
+    let columns = (lookup.planes()? * lookup.table_rows()?)
+        .try_into()
+        .map_err(|_| Error::ResourceLimit)?;
+    let shape = WShape::new(
+        columns,
+        params.code,
+        1,
+        1,
+        params.salt_bytes,
+        params.bits_tree,
+        params.leaf_class,
+        params.run,
+        params.configuration,
+    )?;
+    if shape.main_rows > (1u64 << params.code.log_n) {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(shape)
+}
+
+/// The mask message's tree over the parent mask code.
+fn mask_tree(lookup: &LookupPlan, params: &DigitLookupParams) -> Result<RuntimeTreePlan> {
+    let mask_rows = lookup_mask_rows(lookup, params.mask_code)?;
+    let mask_symbols = mask_rows
+        .checked_mul(zkie_engine::pcs::request::field::E_DEGREE as u64)
+        .ok_or(Error::ResourceLimit)?;
+    Ok(RuntimeTreePlan {
+        tree_number: params.mask_tree,
+        leaf_class: params.leaf_class,
+        log_n: params.mask_code.log_n,
+        log_n_zk: params.mask_code.log_n,
+        parts: vec![RuntimeTreePart {
+            main_symbols: 0,
+            mask_symbols,
+        }],
+        salt_bytes: params.salt_bytes,
+        run: params.run,
+        configuration: params.configuration,
+    })
+}
+
+/// Builds one plane's complete lookup plan over the range object's digit
+/// message with the caller's message plans.
+pub fn digit_lookup_plan(
+    range: &RangePlan,
+    plane: u32,
+    params: &DigitLookupParams,
+) -> Result<DigitLookupPlan> {
+    let (lookup, key) = digit_lookup_sizing(range, plane)?;
+    let bits_shape = lookup_shape(&lookup, params)?;
+    let mask_rows = lookup_mask_rows(&lookup, params.mask_code)?;
+    let tree = mask_tree(&lookup, params)?;
+    let commit = LookupCommitPlan {
+        bits_shape,
+        bits_oracle: params.bits_oracle,
+        group: params.group,
+        bits_openings: 1,
+        mask_oracle: params.mask_oracle,
+        mask_code: params.mask_code,
+        mask_rows,
+        mask_openings: 1,
+        mask_tree: tree,
+    };
     let plan = DigitLookupPlan {
         plane,
         lookup,
+        commit,
         key,
     };
     plan.validate(range)?;
     Ok(plan)
+}
+
+/// The test plan's parent values: the fixture's group code, a mask code and
+/// distinct identities for the two messages.
+#[cfg(test)]
+fn test_params() -> DigitLookupParams {
+    use zkie_engine::pcs::request::code::build_code_plan;
+    DigitLookupParams {
+        code: build_code_plan(12, 32, 4).unwrap(),
+        mask_code: build_code_plan(12, 32, 4).unwrap(),
+        group: 7,
+        bits_oracle: 81,
+        mask_oracle: 82,
+        bits_tree: 921,
+        mask_tree: 922,
+        leaf_class: 4,
+        salt_bytes: 40,
+        run: Digest([0x83; 32]),
+        configuration: Digest([0x84; 32]),
+    }
 }
 
 /// The multiplicity bit planes of one plane's digit cells: the count of each
@@ -339,7 +470,7 @@ mod tests {
     fn the_digit_lookup_enumerates_every_cell_once() {
         let range = range();
         for plane in 0..2u32 {
-            let plan = digit_lookup_plan(&range, plane).unwrap();
+            let plan = digit_lookup_plan(&range, plane, &test_params()).unwrap();
             assert_eq!(plan.real_keys(), 16);
             assert_eq!(plan.padding_keys().unwrap(), 1024 - 16);
             assert_eq!(plan.lookup.key_bits, 10);
@@ -354,9 +485,24 @@ mod tests {
                 assert!(seen.insert((source.row, source.place)));
             }
             assert_eq!(seen.len(), 16);
+            // The message plans carry the multiplicity-bit values and the
+            // lookup's mask rows under distinct identities in the group.
+            let bits = 32usize * plan.lookup.table_rows().unwrap();
+            assert_eq!(plan.commit.group, range.group);
+            assert_eq!(plan.commit.bits_oracle, 81);
+            assert_eq!(plan.commit.mask_oracle, 82);
+            assert!(plan.commit.bits_shape.fault(bits as u64, 1).is_none());
+            assert_eq!(
+                plan.commit.mask_rows,
+                crate::proof::hidden_norm_psc::lookup_mask_rows(
+                    &plan.lookup,
+                    plan.commit.mask_code
+                )
+                .unwrap()
+            );
         }
         // A plan whose plane disagrees with its table identity is refused.
-        let mut broken = digit_lookup_plan(&range, 0).unwrap();
+        let mut broken = digit_lookup_plan(&range, 0, &test_params()).unwrap();
         broken.plane = 1;
         assert!(broken.validate(&range).is_err());
     }
@@ -364,7 +510,7 @@ mod tests {
     #[test]
     fn the_multiplicity_bits_count_every_table_row_once() {
         let range = range();
-        let plan = digit_lookup_plan(&range, 0).unwrap();
+        let plan = digit_lookup_plan(&range, 0, &test_params()).unwrap();
         let mut digits = vec![Fp3::from_u64(3); 16];
         digits[0] = Fp3::from_u64(0);
         digits[1] = Fp3::from_u64(0);
@@ -390,7 +536,7 @@ mod tests {
         let mut outside = vec![Fp3::from_u64(3); 16];
         outside[0] = Fp3::from_u64(1024);
         assert!(digit_multiplicity_bits(&plan, &outside).is_err());
-        let high = digit_lookup_plan(&range, 1).unwrap();
+        let high = digit_lookup_plan(&range, 1, &test_params()).unwrap();
         let mut outside = vec![Fp3::from_u64(200); 16];
         outside[0] = Fp3::from_u64(256);
         assert!(digit_multiplicity_bits(&high, &outside).is_err());
