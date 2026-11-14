@@ -119,6 +119,33 @@ fn complete(base: &Path) -> bool {
         && base.join("proof/proof.bin").exists()
 }
 
+/// The twelve K-projection consumers of the trusted plan and the shared
+/// activation step they read: the plan's own step order, not a rebuilt list.
+fn projection_consumers(
+    plan: &zkie_ops::proof::plan::TracePlan,
+) -> (usize, Vec<(usize, usize)>) {
+    let mut consumers = Vec::new();
+    for (index, step) in plan.steps.iter().enumerate() {
+        if step.opcode != OpCode::Projection {
+            continue;
+        }
+        let Some(PlanSource::Asset { path, .. }) = step.inputs.get(1) else {
+            continue;
+        };
+        if path != "gpt2/weights/L0_k_w_i32.bin" {
+            continue;
+        }
+        let Some(PlanSource::Prev { step, .. }) = step.inputs.first() else {
+            panic!("the consumer activation is a previous step");
+        };
+        consumers.push((index, *step));
+    }
+    assert_eq!(consumers.len(), HEADS);
+    let activation_step = consumers[0].1;
+    assert!(consumers.iter().all(|(_, step)| *step == activation_step));
+    (activation_step, consumers)
+}
+
 fn table_code() -> CodeParams {
     build_code_plan(TABLE_LOG_N, TABLE_ELL, TABLE_R).unwrap()
 }
@@ -350,25 +377,7 @@ fn real_projection_consumer_closes_on_the_diagnostic_hidden_session() {
     let outputs = verify_shared_trace_outputs(&public, &trace, &statement.tokens, &plan)
         .expect("verified trace outputs");
 
-    let mut consumers = Vec::new();
-    for (index, step) in plan.steps.iter().enumerate() {
-        if step.opcode != OpCode::Projection {
-            continue;
-        }
-        let Some(PlanSource::Asset { path, .. }) = step.inputs.get(1) else {
-            continue;
-        };
-        if path != "gpt2/weights/L0_k_w_i32.bin" {
-            continue;
-        }
-        let Some(PlanSource::Prev { step: activation_step, .. }) = step.inputs.first() else {
-            panic!("the consumer activation is a previous step");
-        };
-        consumers.push((index, *activation_step));
-    }
-    assert_eq!(consumers.len(), HEADS);
-    let activation_step = consumers[0].1;
-    assert!(consumers.iter().all(|(_, step)| *step == activation_step));
+    let (activation_step, consumers) = projection_consumers(&plan);
 
     let positions = std::env::var("ZKIE_PROJECTION_DIAGNOSTIC_POSITIONS")
         .ok()
@@ -481,6 +490,130 @@ fn real_projection_consumer_closes_on_the_diagnostic_hidden_session() {
     let mut source_table = diagnostic_table(&weights);
     assert!(prove_hidden_lin(&changed_identity, &activation, &mut source_table, &output, SEED)
         .is_err());
+}
+
+
+#[test]
+#[ignore = "runs against the registered production trace artifacts"]
+fn the_committed_source_follows_the_trusted_layout() {
+    let Some(base) = artifacts() else {
+        return;
+    };
+    let public_bytes =
+        fs::read(base.join("commit/public/model-commitment.bin")).expect("public bundle");
+    let public: ModelCommitmentPublic = bincode::deserialize(&public_bytes).expect("public bundle");
+    let config_bytes =
+        fs::read(base.join("commit/public/provider-config.bin")).expect("provider config");
+    let config: zkie::provider::ProviderConfig =
+        bincode::deserialize(&config_bytes).expect("provider config");
+    let statement_bytes = fs::read(base.join("proof/statement.bin")).expect("statement");
+    let statement: zkie::provider::StatementData =
+        bincode::deserialize(&statement_bytes).expect("statement");
+
+    let params = zkie_models_gpt2::plan::asset_table_params().expect("table params");
+    let randomness =
+        fs::read(base.join("commit/private/asset-table-randomness.bin")).expect("randomness");
+    let tables = decode_asset_table_randomness_set(&randomness, &params).expect("randomness set");
+    let commitment = zkie_models_gpt2::executor::build_commitment(
+        Path::new(&config.asset_root),
+        &config.tokens,
+        &tables,
+    )
+    .expect("commitment");
+    assert_eq!(commitment.anchor.record.anchor_id, public.anchor.anchor_id);
+
+    let trace_bytes = fs::read(base.join("proof/proof.bin")).expect("proof bytes");
+    let trace: SharedTrace = bincode::deserialize(&trace_bytes).expect("trace");
+    let plan = zkie_models_gpt2::plan::trace_plan(statement.tokens.len()).expect("plan");
+    let outputs = verify_shared_trace_outputs(&public, &trace, &statement.tokens, &plan)
+        .expect("verified trace outputs");
+    let (activation_step, consumers) = projection_consumers(&plan);
+
+    let positions = 2usize;
+    let mut activation_rows = Vec::with_capacity(positions);
+    for token in 0..positions {
+        activation_rows.push(
+            outputs[activation_step][0][token * HIDDEN..(token + 1) * HIDDEN].to_vec(),
+        );
+    }
+    // The committed activation layout: logical entry (token, input) reads the
+    // verified row at token * HIDDEN + input, padded to the matrix rows.
+    let activation = activation(&activation_rows, positions as u32);
+    for token in 0..positions {
+        let row = activation
+            .weights(token as u32, MATRIX_ROWS)
+            .expect("activation weights");
+        for input in [0usize, 1, HIDDEN - 1] {
+            assert_eq!(
+                row[input],
+                Fp3::from_base(fp_from_signed_word(activation_rows[token][input] as u64))
+            );
+        }
+    }
+
+    // The committed table layout: logical weight entry (input, output) is the
+    // table cell at row output and place input, i.e. the message value; the
+    // file's linear index input * HIDDEN + output is not a table column.
+    let store = zkie_ops::proof::model_commitment::AssetStore::open(&commitment).expect("store");
+    let weights = store
+        .value("gpt2/weights/L0_k_w_i32.bin")
+        .expect("weight rows");
+    let session_table = diagnostic_table(&weights);
+    let ell = table_shape().code.ell as usize;
+    let mut message = vec![Fp::ZERO; ell];
+    let mut tail = vec![Fp::ZERO; table_shape().code.r as usize];
+    for output in [0usize, 1, HIDDEN - 1] {
+        {
+            let mut source = session_table.source.borrow_mut();
+            source
+                .row(output as u64, &mut message, &mut tail)
+                .expect("table row");
+        }
+        for input in [0usize, 1, HIDDEN - 1] {
+            assert_eq!(
+                message[input],
+                fp_from_signed_word(weights[input * HIDDEN + output] as u64)
+            );
+        }
+    }
+    // The encoded column object is the same commitment the session opens.
+    let columns = [0u64, 1, (HIDDEN - 1) as u64];
+    let openings = {
+        let mut source = session_table.source.borrow_mut();
+        session_table
+            .table
+            .open_columns(&mut *source, &columns)
+            .expect("open columns")
+    };
+    zkie_engine::pcs::request::table::verify_columns(&session_table.reader, &columns, &openings)
+        .expect("table columns");
+
+    // Every head's verified output is the requantized reduction over its own
+    // slice, with the plan's consumer order and head width; the twelve heads
+    // share one activation step.
+    let shift = match plan.steps[consumers[0].0].config.get(3) {
+        Some(PlanConfigValue::Literal(value)) => *value as u32,
+        _ => panic!("the consumer shift is a literal"),
+    };
+    for (head, (step, source)) in consumers.iter().enumerate() {
+        assert_eq!(*source, activation_step);
+        let head_outputs = &outputs[*step][0];
+        for token in 0..positions {
+            for k in [0usize, 1, HEAD_DIM - 1] {
+                let output = head * HEAD_DIM + k;
+                let mut raw = 0i128;
+                for input in 0..HIDDEN {
+                    raw += activation_rows[token][input] as i128
+                        * weights[input * HIDDEN + output] as i128;
+                }
+                assert_eq!(
+                    requantize(raw, shift).expect("requantize") as i64,
+                    head_outputs[token * HEAD_DIM + k],
+                    "head {head} token {token} output {k}"
+                );
+            }
+        }
+    }
 }
 
 fn plan_for(
@@ -860,25 +993,7 @@ fn real_projection_consumer_closes_in_hidden_input_mode() {
     let outputs = verify_shared_trace_outputs(&public, &trace, &statement.tokens, &plan)
         .expect("verified trace outputs");
 
-    let mut consumers = Vec::new();
-    for (index, step) in plan.steps.iter().enumerate() {
-        if step.opcode != OpCode::Projection {
-            continue;
-        }
-        let Some(PlanSource::Asset { path, .. }) = step.inputs.get(1) else {
-            continue;
-        };
-        if path != "gpt2/weights/L0_k_w_i32.bin" {
-            continue;
-        }
-        let Some(PlanSource::Prev { step: activation_step, .. }) = step.inputs.first() else {
-            panic!("the consumer activation is a previous step");
-        };
-        consumers.push((index, *activation_step));
-    }
-    assert_eq!(consumers.len(), HEADS);
-    let activation_step = consumers[0].1;
-    assert!(consumers.iter().all(|(_, step)| *step == activation_step));
+    let (activation_step, consumers) = projection_consumers(&plan);
 
     let positions = std::env::var("ZKIE_PROJECTION_DIAGNOSTIC_POSITIONS")
         .ok()
