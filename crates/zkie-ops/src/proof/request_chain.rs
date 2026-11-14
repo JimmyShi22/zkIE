@@ -648,13 +648,15 @@ mod tests {
             },
         ])
         .unwrap();
-        // The weight panel's rows are the merge's hidden values.
-        let stack_right = vec![vec![Fp3::ONE, Fp3::ONE], vec![f(10), f(20)]];
-        // The packed product equals the hidden start: the read panel carries
-        // the balance after the weight rows' contribution.
+        // The weight panel's rows are the merge's hidden values; the read
+        // panel's second side is distinct per row so a swap is observable.
+        let stack_right = vec![vec![f(2), f(3)], vec![f(10), f(20)]];
+        // The packed product equals the hidden start: the read panel's first
+        // cell carries the balance after the weight rows' contribution.
+        let read_scale = batch.mul(&f(2));
         let panel_value = hidden_cstart
             .sub(&batch.mul(&f(30)))
-            .mul(&batch.inverse().unwrap());
+            .mul(&read_scale.inverse().unwrap());
         let stack_left = vec![
             vec![panel_value, Fp3::ZERO],
             vec![Fp3::ONE, Fp3::ONE],
@@ -801,6 +803,34 @@ mod tests {
         repeated_inputs.mask_value = &chain_mask;
         repeated_inputs.end_slots = &repeated;
         assert!(verify_request_chain(&repeated_inputs, &proof, &mut Source(61)).is_err());
+        // Another read cell, swapped weight rows, or another weight cell
+        // breaks the group's source ties or the merge's claim: these are the
+        // changed-cell, swapped-row and swapped-object negatives at the chain.
+        let mut changed_left = stack_left.clone();
+        changed_left[0][0] = changed_left[0][0].add(&Fp3::ONE);
+        let changed_left_inputs = ChainInputs {
+            stack_left: &changed_left,
+            ..inputs
+        };
+        assert!(verify_request_chain(&changed_left_inputs, &proof, &mut Source(61)).is_err());
+        // The read panel's second side is the verifier's read; swapping its
+        // rows or changing a cell breaks the same tie. The weight cells are
+        // the prover's maps; a changed weight cell is the matrix negative the
+        // pending check already refuses.
+        let mut swapped_right = stack_right.clone();
+        swapped_right[0].swap(0, 1);
+        let swapped_inputs = ChainInputs {
+            stack_right: &swapped_right,
+            ..inputs
+        };
+        assert!(verify_request_chain(&swapped_inputs, &proof, &mut Source(61)).is_err());
+        let mut changed_read = stack_right.clone();
+        changed_read[0][1] = changed_read[0][1].add(&Fp3::ONE);
+        let changed_read_inputs = ChainInputs {
+            stack_right: &changed_read,
+            ..inputs
+        };
+        assert!(verify_request_chain(&changed_read_inputs, &proof, &mut Source(61)).is_err());
         // A changed token proof breaks the stack's start.
         let mut tampered = proof.clone();
         tampered.token.rounds[0].coefficients[0] =
