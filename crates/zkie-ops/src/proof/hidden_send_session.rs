@@ -13784,6 +13784,85 @@ fn lookup_plain_rows(
     Ok(rows)
 }
 
+/// The equality coefficients of a point: entry `c` pairs bit `j` with
+/// `point[j]`.
+fn eq_vector(point: &[Fp3]) -> Result<Vec<Fp3>> {
+    if point.len() >= 32 {
+        return Err(Error::InvalidConfig);
+    }
+    let mut values = vec![Fp3::ONE; 1usize << point.len()];
+    for (bit, coordinate) in point.iter().enumerate() {
+        for (index, value) in values.iter_mut().enumerate() {
+            let chosen = if (index >> bit) & 1 == 1 {
+                *coordinate
+            } else {
+                Fp3::ONE.sub(coordinate)
+            };
+            *value = value.mul(&chosen);
+        }
+    }
+    Ok(values)
+}
+
+/// The request's (Eval) row: the request-level W at the claim's column point,
+/// on the W message's own layout, plus the claim's mask slots, against the
+/// claim's target.
+fn request_eval_row(
+    shape: &WShape,
+    columns: u64,
+    w_oracle: u64,
+    psi: &[Fp3],
+    masks: &[(u64, u64, Fp3)],
+    target: Fp3,
+) -> Result<BatRow> {
+    let eq = eq_vector(psi)?;
+    if eq.len() as u64 > columns {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut row = BatRow::new(BatRowKind::Plain);
+    row.add_term(
+        w_oracle,
+        BatPart::Main,
+        scatter_message_coefficients(shape, columns, &eq)?,
+    );
+    for (oracle, index, coefficient) in masks {
+        row.add_unit(*oracle, BatPart::Mask, *index, *coefficient);
+    }
+    row.target = target;
+    Ok(row)
+}
+
+/// The request's (Dot) row: the row weights against Omega plus the W at the
+/// shared point, against zero.
+#[allow(clippy::too_many_arguments)]
+fn request_dot_row(
+    omega_shape: &WShape,
+    omega_columns: u64,
+    omega_oracle: u64,
+    weights: &[Fp3],
+    w_shape: &WShape,
+    w_columns: u64,
+    w_oracle: u64,
+    psi_star: &[Fp3],
+) -> Result<BatRow> {
+    let eq = eq_vector(psi_star)?;
+    if eq.len() as u64 > w_columns {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut row = BatRow::new(BatRowKind::Plain);
+    row.add_term(
+        omega_oracle,
+        BatPart::Main,
+        scatter_message_coefficients(omega_shape, omega_columns, weights)?,
+    );
+    row.add_term(
+        w_oracle,
+        BatPart::Main,
+        scatter_message_coefficients(w_shape, w_columns, &eq)?,
+    );
+    Ok(row)
+}
+
 fn scatter_message_coefficients(
     shape: &WShape,
     columns: u64,
@@ -19166,6 +19245,51 @@ mod tests {
         fn send_end_values(&mut self, _values: &[Fp3]) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn the_request_rows_use_the_message_layouts() {
+        let fixture = fixture();
+        let shape = fixture.plan.w;
+        let psi = [Fp3::from_u64(2), Fp3::from_u64(3)];
+        let eq = super::eq_vector(&psi).unwrap();
+        let row = super::request_eval_row(
+            &shape,
+            4,
+            123,
+            &psi,
+            &[(60, 3, Fp3::from_u64(11))],
+            Fp3::from_u64(99),
+        )
+        .unwrap();
+        assert_eq!(row.terms.len(), 1);
+        assert_eq!(row.units.len(), 1);
+        assert_eq!(row.target, Fp3::from_u64(99));
+        assert_eq!(
+            row.terms[0].values,
+            super::scatter_message_coefficients(&shape, 4, &eq).unwrap()
+        );
+        let psi_star = [Fp3::from_u64(4), Fp3::from_u64(5)];
+        let dot = super::request_dot_row(
+            &shape,
+            4,
+            124,
+            &[Fp3::from_u64(1), Fp3::from_u64(2)],
+            &shape,
+            4,
+            123,
+            &psi_star,
+        )
+        .unwrap();
+        assert_eq!(dot.terms.len(), 2);
+        assert_eq!(dot.target, Fp3::ZERO);
+        assert_eq!(
+            dot.terms[1].values,
+            super::scatter_message_coefficients(&shape, 4, &super::eq_vector(&psi_star).unwrap())
+                .unwrap()
+        );
+        // A point wider than the vector is refused.
+        assert!(super::request_eval_row(&shape, 1, 123, &psi, &[], Fp3::ONE).is_err());
     }
 
     #[test]
