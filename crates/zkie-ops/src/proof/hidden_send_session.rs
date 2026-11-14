@@ -5770,6 +5770,11 @@ pub struct HiddenLinPlan {
 impl HiddenLinPlan {
     pub fn validate(&self) -> Result<()> {
         self.send.validate()?;
+        // The first-chain sub-proof segment is not wired yet: a plan that asks
+        // for it must be refused here, never silently proved without it.
+        if self.send.request_chain.is_some() {
+            return Err(Error::UnsupportedPrimitive);
+        }
         if self.output.fault().is_some()
             || self.output.positions != self.send.activation.positions
             || self.output.columns != self.send.columns
@@ -23754,6 +23759,25 @@ mod merged_tests {
         super::absorb_chain_mask_answer(&mut other, Fp3::from_u64(9)).unwrap();
         assert_ne!(*rooted.value(), *other.value());
 
+    }
+
+    #[test]
+    fn a_plan_with_a_chain_section_is_refused_until_the_segment_runs() {
+        let (plan, _, _) = member_run();
+        let mut changed = plan.clone();
+        changed.send.request_chain = Some(crate::proof::request_chain::RequestChainShape {
+            token_rounds: 1,
+            token_ends: 1,
+            stack_rounds: 1,
+            stack_ends: 1,
+            merge_rounds: 1,
+            merge_ends: 1,
+        });
+        assert!(changed.validate().is_err());
+        // V4: a pending mask term must reference the member index oracle.
+        let mut foreign = plan.clone();
+        foreign.send.member.as_mut().unwrap().pending.masks[0].oracle = INDEX_MASK_ORACLE + 1;
+        assert!(foreign.validate().is_err());
     }
 
     #[test]
