@@ -39,6 +39,7 @@ pub mod projection_claim;
 pub mod request_reduction;
 pub mod request_stack;
 pub mod request_start;
+pub mod row_claim;
 pub mod request_weights;
 pub mod norm_param_table;
 

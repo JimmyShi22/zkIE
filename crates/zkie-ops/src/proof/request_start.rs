@@ -13,12 +13,7 @@ use zkie_engine::pcs::request::field::Fp3;
 
 use crate::proof::psc_general::{GeneralOutput, MaskTerm};
 
-/// One coefficient on an index-mask slot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SlotTerm {
-    pub slot: usize,
-    pub coefficient: Fp3,
-}
+pub use crate::proof::row_claim::SlotTerm;
 
 /// The stack's start: one constant, one coefficient per hiding entry of the
 /// token sumcheck (in entry order), and one coefficient per index-mask slot.
