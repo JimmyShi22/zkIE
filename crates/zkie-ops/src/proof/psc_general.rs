@@ -21,6 +21,7 @@
 
 use zkie_core::error::{Error, Result};
 use zkie_engine::pcs::request::field::Fp3;
+use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
 
 use crate::proof::psc::{
     hp_entries, hp_form, HidingPolynomial, PointClaim, ProductSumcheckProver, PscRound, Weight,
@@ -756,6 +757,78 @@ pub struct GeneralProof {
     pub rounds: Vec<PscRound>,
     pub y_round: PscRound,
     pub end_values: Vec<Fp3>,
+}
+
+impl GeneralProof {
+    /// Writes the proof: the hiding sum, the rounds, the last round and the
+    /// end values, each with its count.
+    pub fn encode_into(&self, writer: &mut CanonicalWriter) {
+        writer.put_fp3(&self.hiding_sum);
+        writer.put_u64(self.rounds.len() as u64);
+        for round in &self.rounds {
+            writer.put_u64(round.coefficients.len() as u64);
+            for coefficient in &round.coefficients {
+                writer.put_fp3(coefficient);
+            }
+        }
+        writer.put_u64(self.y_round.coefficients.len() as u64);
+        for coefficient in &self.y_round.coefficients {
+            writer.put_fp3(coefficient);
+        }
+        writer.put_u64(self.end_values.len() as u64);
+        for value in &self.end_values {
+            writer.put_fp3(value);
+        }
+    }
+
+    /// Reads a proof. `rounds` is the number of X rounds the claim expects and
+    /// `end_values` the number of shown maps; both stored counts must match.
+    pub fn decode(
+        reader: &mut CanonicalReader,
+        rounds: usize,
+        end_values: usize,
+    ) -> Result<Self> {
+        let hiding_sum = reader.get_fp3()?;
+        if usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)? != rounds {
+            return Err(Error::InvalidEncoding);
+        }
+        let mut round_values = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            let count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+            if count > 8 {
+                return Err(Error::InvalidEncoding);
+            }
+            let mut coefficients = Vec::with_capacity(count);
+            for _ in 0..count {
+                coefficients.push(reader.get_fp3()?);
+            }
+            round_values.push(PscRound { coefficients });
+        }
+        let count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+        if count > 8 {
+            return Err(Error::InvalidEncoding);
+        }
+        let mut y_round = Vec::with_capacity(count);
+        for _ in 0..count {
+            y_round.push(reader.get_fp3()?);
+        }
+        let count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+        if count != end_values {
+            return Err(Error::InvalidEncoding);
+        }
+        let mut ends = Vec::with_capacity(count);
+        for _ in 0..count {
+            ends.push(reader.get_fp3()?);
+        }
+        Ok(Self {
+            hiding_sum,
+            rounds: round_values,
+            y_round: PscRound {
+                coefficients: y_round,
+            },
+            end_values: ends,
+        })
+    }
 }
 
 /// The output claims of one general sumcheck.
@@ -1566,5 +1639,52 @@ mod tests {
         assert!(Summand::Leaves { alpha: f(9), mu: 0 }
             .at(&[f(1)], &[], &[Fp3::ZERO], None)
             .is_err());
+    }
+
+    use zkie_core::common::codec::DecodeLimits;
+
+    #[test]
+    fn the_general_proof_round_trips_through_the_canonical_encoding() {
+        let proof = GeneralProof {
+            hiding_sum: f(1),
+            rounds: vec![
+                PscRound {
+                    coefficients: vec![f(2), f(3)],
+                },
+                PscRound {
+                    coefficients: vec![f(4)],
+                },
+            ],
+            y_round: PscRound {
+                coefficients: vec![f(5)],
+            },
+            end_values: vec![f(6), f(7)],
+        };
+        let mut writer = CanonicalWriter::new();
+        proof.encode_into(&mut writer);
+        let bytes = writer.into_bytes();
+        let mut reader = CanonicalReader::new(&bytes, DecodeLimits::unlimited());
+        assert_eq!(GeneralProof::decode(&mut reader, 2, 2).unwrap(), proof);
+        // Another round or end-value count does not decode.
+        let mut reader = CanonicalReader::new(&bytes, DecodeLimits::unlimited());
+        assert!(GeneralProof::decode(&mut reader, 1, 2).is_err());
+        let mut reader = CanonicalReader::new(&bytes, DecodeLimits::unlimited());
+        assert!(GeneralProof::decode(&mut reader, 2, 1).is_err());
+        // A round with too many coefficients does not decode.
+        let wide = GeneralProof {
+            hiding_sum: f(1),
+            rounds: vec![PscRound {
+                coefficients: vec![f(0); 9],
+            }],
+            y_round: PscRound {
+                coefficients: vec![f(0)],
+            },
+            end_values: vec![f(0); 2],
+        };
+        let mut writer = CanonicalWriter::new();
+        wide.encode_into(&mut writer);
+        let bytes = writer.into_bytes();
+        let mut reader = CanonicalReader::new(&bytes, DecodeLimits::unlimited());
+        assert!(GeneralProof::decode(&mut reader, 1, 2).is_err());
     }
 }
