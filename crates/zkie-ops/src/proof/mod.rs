@@ -36,6 +36,7 @@ pub mod proximity_planner;
 pub mod asset_table;
 pub mod model_commitment;
 pub mod projection_claim;
+pub mod request_chain;
 pub mod request_reduction;
 pub mod request_stack;
 pub mod request_start;
