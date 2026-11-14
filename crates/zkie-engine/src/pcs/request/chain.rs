@@ -284,4 +284,27 @@ impl Chain {
         let word = self.next_word()?;
         Ok(word & ((1u64 << log_n) - 1))
     }
+
+    /// The bits draw of the range check's combination matrix: two bits of the
+    /// next word make one entry, low bits first. The first bit says whether
+    /// the entry is non-zero and the second, if set, makes it -1; so zero has
+    /// probability one half and each of one and minus one one quarter.
+    pub fn draw_trits(&mut self, count: usize) -> Result<Vec<i8>> {
+        let mut entries = Vec::with_capacity(count);
+        while entries.len() < count {
+            let word = self.next_word()?;
+            for pair in 0..32 {
+                if entries.len() == count {
+                    break;
+                }
+                let bits = (word >> (2 * pair)) & 0x3;
+                entries.push(match bits {
+                    1 => 1,
+                    3 => -1,
+                    _ => 0,
+                });
+            }
+        }
+        Ok(entries)
+    }
 }

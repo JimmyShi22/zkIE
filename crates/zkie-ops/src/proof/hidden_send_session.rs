@@ -1881,6 +1881,9 @@ impl RequestParameters {
             );
             let _ = closure;
         }
+        if plan.send.range.is_some() {
+            trees = trees.saturating_add(3);
+        }
         let stages = plan.proximity.shared_stages.len() + plan.proximity.own_stages.len();
         layout.set("mask_rows", self.mask_rows.saturating_add(self.segment_mask_rows))?;
         layout.set("mask_slots", (self.mask_slots + self.segment_mask_entries) as u64)?;
@@ -1892,6 +1895,11 @@ impl RequestParameters {
             .saturating_add(index.openings as u64)
             .saturating_add(segment.openings as u64);
         layout.set("opening_budget", openings)?;
+        let range_samples = plan.send.range.as_ref().map_or(0, |range| {
+            range.array_shape.answers
+                + range.unit_shape.answers
+                + range.digit_shape.answers
+        });
         let samples = self
             .sample_answers
             .saturating_add(index.answers)
@@ -1901,7 +1909,8 @@ impl RequestParameters {
                     .source_data
                     .as_ref()
                     .map_or(0, |source| source.shape.answers),
-            );
+            )
+            .saturating_add(range_samples as u32);
         layout.set("sample_plan", samples as u64)?;
         layout.set("tree_layout", trees)?;
         layout.set("stage_plan", stages as u64)?;
@@ -2065,7 +2074,7 @@ impl HiddenSendPlan {
                 || member.tree.log_n_zk != member.tree.log_n
                 || columns < total
                 || total == 0
-                || columns != total.checked_next_power_of_two().ok_or(Error::ResourceLimit)?
+                || columns < total.checked_next_power_of_two().ok_or(Error::ResourceLimit)?
                 || member.tree.leaf_class == self.w.leaf_class
                 || member.tree.leaf_class == index.tree.leaf_class
             {
@@ -2164,12 +2173,33 @@ impl HiddenSendPlan {
         }
         // The range objects follow the trusted geometry and keep their own
         // identities: no oracle or tree number is shared with another object
-        // of the session.
+        // of the session. The reduced read table is the member's read table,
+        // so its tree is the member's tree and its entries are the witness's
+        // entries.
         if let Some(range) = &self.range {
             if range.fault().is_some()
-                || range.matrix.rows != self.matrix_rows
-                || range.matrix.columns != self.columns
+                || range.matrix.rows != self.columns
+                || range.matrix.columns != self.matrix_rows
                 || range.group != self.group
+            {
+                return Err(Error::InvalidConfig);
+            }
+            let array_columns = range
+                .array_columns()
+                .map_err(|_| Error::InvalidConfig)?;
+            if range.array_shape.fault(array_columns, 1).is_some() {
+                return Err(Error::InvalidConfig);
+            }
+            let member = self.member.as_ref().ok_or(Error::InvalidConfig)?;
+            let witness =
+                crate::proof::hidden_member::ReductionWitnessPlan::from_tables(member.tables.clone())
+                    .map_err(|_| Error::InvalidConfig)?;
+            let total = witness.total_entries();
+            let unit_columns = total
+                .checked_next_power_of_two()
+                .ok_or(Error::ResourceLimit)?;
+            if range.unit_shape.fault(unit_columns, 1).is_some()
+                || member.tree != range.unit_shape.tree_plan(0)?
             {
                 return Err(Error::InvalidConfig);
             }
@@ -2196,7 +2226,7 @@ impl HiddenSendPlan {
                 .tree_number
                 .checked_add(self.activation.positions as u64)
                 .ok_or(Error::ResourceLimit)?;
-            let tree_clashes = |tree: u64| {
+            let tree_clashes = |tree: u64, allow_member: bool| {
                 (tree >= self.w.tree_number && tree < w_tree_end)
                     || self.dot.as_ref().map_or(false, |dot| dot.shape.tree_number == tree)
                     || self.request_w.as_ref().map_or(false, |rw| rw.shape.tree_number == tree)
@@ -2212,12 +2242,18 @@ impl HiddenSendPlan {
                         .chain_mask
                         .as_ref()
                         .map_or(false, |mask| mask.tree.tree_number == tree)
-                    || self.member.as_ref().map_or(false, |member| member.tree.tree_number == tree)
+                    || (!allow_member
+                        && self
+                            .member
+                            .as_ref()
+                            .map_or(false, |member| member.tree.tree_number == tree))
             };
             if clashes(range.array_oracle)
-                || clashes(range.oracle)
-                || tree_clashes(range.array_tree.tree_number)
-                || tree_clashes(range.tree.tree_number)
+                || clashes(range.unit_oracle)
+                || clashes(range.digit_oracle)
+                || tree_clashes(range.array_shape.tree_number, false)
+                || tree_clashes(range.unit_shape.tree_number, true)
+                || tree_clashes(range.digit_shape.tree_number, false)
             {
                 return Err(Error::InvalidConfig);
             }
@@ -2308,12 +2344,11 @@ impl HiddenSendPlan {
             parameters.check(self.member.as_ref().ok_or(Error::InvalidConfig)?)?;
             parameters.check_chain(self)?;
         }
-        // The range objects are planned and messaged, but the segment does not
-        // commit them yet: a chain plan that names them would produce a
-        // section without their messages, so the plan is refused until the
-        // segment commits and absorbs them.
-        if self.request_chain.is_some() && self.range.is_some() {
-            return Err(Error::UnsupportedPrimitive);
+        // A chain plan carries the segment's range objects: the packed
+        // array, the reduced read table and the digit object are part of the
+        // segment's messages and checks.
+        if self.request_chain.is_some() && self.range.is_none() {
+            return Err(Error::InvalidConfig);
         }
         if let Some(chain_mask) = &self.chain_mask {
             if chain_mask.fault().is_some() || chain_mask.group != self.group {
@@ -3428,11 +3463,13 @@ pub struct HiddenSendMessages {
     /// The sub-proof mask table's committed message, when the plan carries
     /// it: its root, sample, drawn positions and opening.
     pub chain_mask: Option<ChainMaskMessage>,
-    /// The packed symbol array's committed message, when the plan carries the
-    /// range objects: its tree, root, drawn positions and opening.
-    pub packed_array: Option<crate::proof::packed_matrix::RangeMessage>,
-    /// The combination object's committed message, in the same form.
-    pub range: Option<crate::proof::packed_matrix::RangeMessage>,
+    /// The packed symbol array's SEND message, when the plan carries the range
+    /// objects: its root and sample answers.
+    pub range_array: Option<RequestWMessage>,
+    /// The reduced read table's SEND message, in the same form.
+    pub range_units: Option<RequestWMessage>,
+    /// The digit object's SEND message, in the same form.
+    pub range_digits: Option<RequestWMessage>,
     /// The first-chain segment proximity transcript, when the plan carries the
     /// segment.
     pub segment_proximity: Option<SegmentProximityMessages>,
@@ -3484,11 +3521,17 @@ impl HiddenSendMessages {
             }
             writer.put_bytes(&encode_runtime_opening(&message.tree, &message.opening)?);
         }
-        if let Some(message) = &self.packed_array {
-            put_range_message(&mut writer, message)?;
+        if let Some(message) = &self.range_array {
+            writer.put_digest(&message.root);
+            writer.put_bytes(&message.sample.encode());
         }
-        if let Some(message) = &self.range {
-            put_range_message(&mut writer, message)?;
+        if let Some(message) = &self.range_units {
+            writer.put_digest(&message.root);
+            writer.put_bytes(&message.sample.encode());
+        }
+        if let Some(message) = &self.range_digits {
+            writer.put_digest(&message.root);
+            writer.put_bytes(&message.sample.encode());
         }
         if let Some(proximity) = &self.segment_proximity {
             put_segment_proximity(&mut writer, proximity);
@@ -3637,19 +3680,27 @@ impl HiddenSendMessages {
             }
             None => None,
         };
-        let (packed_array, range) = match &plan.range {
+        let (range_array, range_units, range_digits) = match &plan.range {
             Some(range_plan) => {
-                let packed = get_range_message(&mut reader, &range_plan.array_tree)?;
-                if packed.positions.len() != range_plan.array_openings {
-                    return Err(Error::ShapeMismatch);
-                }
-                let message = get_range_message(&mut reader, &range_plan.tree)?;
-                if message.positions.len() != range_plan.openings {
-                    return Err(Error::ShapeMismatch);
-                }
-                (Some(packed), Some(message))
+                let mut get = |shape: &WShape| -> Result<RequestWMessage> {
+                    let root = reader.get_digest()?;
+                    if root == Digest::ZERO {
+                        return Err(Error::InvalidEncoding);
+                    }
+                    let sample = SendSamples::decode(reader.get_bytes()?)?;
+                    if sample.seed.len() != shape.answers as usize
+                        || sample.answers.len() != shape.answers as usize
+                    {
+                        return Err(Error::ShapeMismatch);
+                    }
+                    Ok(RequestWMessage { root, sample })
+                };
+                let array = get(&range_plan.array_shape)?;
+                let units = get(&range_plan.unit_shape)?;
+                let digits = get(&range_plan.digit_shape)?;
+                (Some(array), Some(units), Some(digits))
             }
-            None => (None, None),
+            None => (None, None, None),
         };
         let segment_proximity = if plan.request_chain.is_some() {
             Some(get_segment_proximity(&mut reader)?)
@@ -3818,8 +3869,9 @@ impl HiddenSendMessages {
             norm,
             request,
             chain_mask,
-            packed_array,
-            range,
+            range_array,
+            range_units,
+            range_digits,
             segment_proximity,
             chain_value,
         })
@@ -4021,15 +4073,24 @@ fn reduction_entries(
     let columns = usize::try_from(plan.columns).map_err(|_| Error::ResourceLimit)?;
     let mut message = vec![Fp::ZERO; ell];
     let mut tail = vec![Fp::ZERO; tail_len];
-    let mut entries = Vec::new();
+    // The witness plan gives each read table one contiguous block, in table
+    // order; the table stream is read once and the blocks are filled after it.
+    let mut rows_cells: Vec<Vec<Fp3>> = Vec::with_capacity(
+        usize::try_from(plan.matrix_rows).map_err(|_| Error::ResourceLimit)?,
+    );
     for row in 0..plan.matrix_rows {
         source.row(row, &mut message, &mut tail)?;
-        let cells: Vec<Fp3> = message[..columns]
-            .iter()
-            .map(|value| Fp3::from_base(*value))
-            .collect();
-        for table in &member.tables {
-            let run = usize::try_from(table.run_length).map_err(|_| Error::ResourceLimit)?;
+        rows_cells.push(
+            message[..columns]
+                .iter()
+                .map(|value| Fp3::from_base(*value))
+                .collect(),
+        );
+    }
+    let mut entries = Vec::new();
+    for table in &member.tables {
+        let run = usize::try_from(table.run_length).map_err(|_| Error::ResourceLimit)?;
+        for cells in &rows_cells {
             let mut start = 0usize;
             while start < columns {
                 entries.push(crate::proof::hidden_member::entry_value(
@@ -4232,8 +4293,9 @@ pub fn prove_hidden_send(
         norm: None,
         request: None,
         chain_mask: None,
-        packed_array: None,
-        range: None,
+        range_array: None,
+        range_units: None,
+        range_digits: None,
         segment_proximity: None,
     };
     Ok((messages, witness))
@@ -4926,10 +4988,536 @@ fn absorb_segment_tagged_fp3(
 /// the section message fixed under the plan shape before the seal.
 /// The first-chain segment group's members: the segment mask table and the
 /// source cells, ordered by descending main rows and registered by BAT id.
+/// The three SEND messages of the segment's range objects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RangeMessages {
+    array: RequestWMessage,
+    units: RequestWMessage,
+    digits: RequestWMessage,
+}
+
+/// The private randomness and public messages of the three range messages.
+#[derive(Clone, Debug)]
+struct RangeWitness {
+    array: RequestWWitness,
+    units: RequestWWitness,
+    digits: RequestWWitness,
+    messages: RangeMessages,
+}
+
+/// The packed symbol array of the range matrix from the table's cells. The
+/// range matrix is the functional's matrix: its cell rows are the table's
+/// columns. Three consecutive cell rows of one cell column (a table row) are
+/// packed at radix `2^20`, and every cell must lie in the signed window; a
+/// cell outside it is refused, never reduced.
+fn range_symbol_values(
+    plan: &HiddenSendPlan,
+    source: &mut dyn TableRowSource,
+) -> Result<Vec<Fp3>> {
+    use crate::proof::packed_matrix::{signed_cell, PACK_BASE};
+    let range = plan.range.as_ref().ok_or(Error::InvalidConfig)?;
+    let columns = usize::try_from(range.matrix.columns).map_err(|_| Error::ResourceLimit)?;
+    let groups = usize::try_from(range.matrix.groups).map_err(|_| Error::ResourceLimit)?;
+    if range.matrix.rows != plan.columns || range.matrix.columns != plan.matrix_rows {
+        return Err(Error::ShapeMismatch);
+    }
+    let ell = usize::try_from(plan.table_shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let tail_len = usize::try_from(plan.table_shape.code.r).map_err(|_| Error::ResourceLimit)?;
+    let mut message = vec![Fp::ZERO; ell];
+    let mut tail = vec![Fp::ZERO; tail_len];
+    let mut packed = vec![0i128; groups * columns];
+    for row in 0..plan.matrix_rows {
+        source.row(row, &mut message, &mut tail)?;
+        for column in 0..plan.columns {
+            let cell = signed_cell(message[column as usize])?;
+            let group = (column as usize) / 3;
+            let lane = (column as usize) % 3;
+            let scale = PACK_BASE.pow(lane as u32);
+            let entry = packed
+                .get_mut(group * columns + row as usize)
+                .ok_or(Error::ResourceLimit)?;
+            *entry = entry
+                .checked_add(scale.checked_mul(cell).ok_or(Error::ResourceLimit)?)
+                .ok_or(Error::ResourceLimit)?;
+        }
+    }
+    let mut values = vec![
+        Fp3::ZERO;
+        usize::try_from(range.array_columns()?).map_err(|_| Error::ResourceLimit)?
+    ];
+    for (slot, value) in values.iter_mut().zip(&packed) {
+        *slot = Fp3::from_base(crate::proof::column_session::fp_from_signed_word(
+            *value as i64 as u64,
+        ));
+    }
+    Ok(values)
+}
+
+/// The digit values of the range matrix under the combination matrix Cf: for
+/// each cell row and combination, the window value `Z + 2^LBZ` splits into a
+/// low and a high digit, stored at the plan's places. `Z` combines the matrix
+/// row over its columns with `Cf`.
+fn range_digit_values(
+    plan: &HiddenSendPlan,
+    cf: &[i8],
+    source: &mut dyn TableRowSource,
+) -> Result<Vec<Fp3>> {
+    use crate::proof::packed_matrix::signed_cell;
+    let range = plan.range.as_ref().ok_or(Error::InvalidConfig)?;
+    let rows = usize::try_from(range.matrix.rows).map_err(|_| Error::ResourceLimit)?;
+    let columns = usize::try_from(range.matrix.columns).map_err(|_| Error::ResourceLimit)?;
+    let combinations = range.combinations as usize;
+    if cf.len() != columns * combinations {
+        return Err(Error::ShapeMismatch);
+    }
+    let ell = usize::try_from(plan.table_shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let tail_len = usize::try_from(plan.table_shape.code.r).map_err(|_| Error::ResourceLimit)?;
+    let mut message = vec![Fp::ZERO; ell];
+    let mut tail = vec![Fp::ZERO; tail_len];
+    let mut z = vec![0i128; combinations * rows];
+    for row in 0..plan.matrix_rows {
+        source.row(row, &mut message, &mut tail)?;
+        for column in 0..plan.columns {
+            let cell = signed_cell(message[column as usize])?;
+            let at = column as usize;
+            for (u, coefficient) in cf[(row as usize) * combinations..(row as usize + 1) * combinations]
+                .iter()
+                .enumerate()
+            {
+                if *coefficient == 0 {
+                    continue;
+                }
+                let slot = &mut z[u * rows + at];
+                *slot = slot
+                    .checked_add(
+                        (*coefficient as i128)
+                            .checked_mul(cell)
+                            .ok_or(Error::ResourceLimit)?,
+                    )
+                    .ok_or(Error::ResourceLimit)?;
+            }
+        }
+    }
+    let mut values = vec![
+        Fp3::ZERO;
+        usize::try_from(range.digit_columns()?).map_err(|_| Error::ResourceLimit)?
+    ];
+    for u in 0..combinations {
+        for i in 0..rows {
+            let window = z[u * rows + i]
+                .checked_add(range.window)
+                .ok_or(Error::ResourceLimit)?;
+            let (low, high) = range
+                .combination
+                .split_window(window, range.high_bits)?;
+            let low_at = usize::try_from(range.digit_dense(0, i as u64, u as u32)?)
+                .map_err(|_| Error::ResourceLimit)?;
+            let high_at = usize::try_from(range.digit_dense(1, i as u64, u as u32)?)
+                .map_err(|_| Error::ResourceLimit)?;
+            if low_at >= values.len() || high_at >= values.len() {
+                return Err(Error::ShapeMismatch);
+            }
+            values[low_at] = Fp3::from_u64(low as u64);
+            values[high_at] = Fp3::from_u64(high as u64);
+        }
+    }
+    Ok(values)
+}
+
+/// Commits one range message with its own deterministic private randomness and
+/// returns the witness the segment group samples, with its public message.
+fn commit_range_message(
+    plan: &crate::proof::request_chain::RangePlan,
+    shape: &WShape,
+    oracle: u64,
+    values: &[Fp3],
+    seed: &Digest,
+    purpose: u64,
+) -> Result<(RequestWWitness, RequestWMessage)> {
+    let columns = values.len() as u64;
+    if columns == 0 || !columns.is_power_of_two() || shape.fault(columns, 1).is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let mut coins = ByteMaskCoins::new(derive_run_seed(seed, purpose, 0)?)?;
+    let answers = shape.answers as usize;
+    let mut pads = Vec::with_capacity(answers);
+    for _ in 0..answers {
+        let mut pad = coins.draw()?.0;
+        while pad.is_zero() {
+            pad = coins.draw()?.0;
+        }
+        pads.push(pad);
+    }
+    let tail_len = usize::try_from(shape.code.r).map_err(|_| Error::ResourceLimit)?;
+    let rows = usize::try_from(shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+    let mut tails = Vec::with_capacity(rows * tail_len);
+    for _ in 0..rows.checked_mul(tail_len).ok_or(Error::ResourceLimit)? {
+        tails.push(coins.draw()?.0);
+    }
+    let columns_n = usize::try_from(shape.code.n()).map_err(|_| Error::ResourceLimit)?;
+    let salts = draw_salt_bytes(&mut coins, columns_n, shape.salt_bytes)?;
+    let committed = commit_request_w(
+        shape,
+        oracle,
+        plan.group,
+        values,
+        &pads,
+        std::slice::from_ref(&tails),
+        std::slice::from_ref(&salts),
+    )?;
+    let message = RequestWMessage {
+        root: *committed.roots.first().ok_or(Error::ShapeMismatch)?,
+        sample: SendSamples {
+            seed: Vec::new(),
+            answers: Vec::new(),
+        },
+    };
+    Ok((
+        RequestWWitness {
+            committed,
+            tails,
+            salts,
+        },
+        message,
+    ))
+}
+
+/// The SEND sample answers of one committed range message.
+fn range_sample_answers(
+    shape: &WShape,
+    oracle: u64,
+    group: u64,
+    committed: &crate::proof::output_closure::CommittedValueGroup,
+    seeds: &[zkie_engine::pcs::request::table::SampleSeed],
+) -> Result<Vec<Fp3>> {
+    let main = committed
+        .messages
+        .first()
+        .ok_or(Error::ShapeMismatch)?
+        .concat();
+    let gu = GuWitness {
+        main,
+        mask: Vec::new(),
+    };
+    let mut answers = Vec::with_capacity(seeds.len());
+    for seed in seeds {
+        let row = oracle_sample_row(
+            oracle,
+            group,
+            &shape.oracle_shape(),
+            std::slice::from_ref(seed),
+            0,
+            Fp3::ZERO,
+        )?;
+        answers.push(row.evaluate(&gu)?);
+    }
+    Ok(answers)
+}
+
+/// Absorbs one range message's root before the challenges that read it.
+fn absorb_range_root(
+    chain: &mut Chain,
+    tag: u64,
+    plan: &crate::proof::request_chain::RangePlan,
+    shape: &WShape,
+    oracle: u64,
+    root: &Digest,
+) -> Result<()> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(tag);
+    message.push_u64(oracle);
+    message.push_u64(plan.group);
+    message.push_u64(shape.main_rows);
+    message.push_u64(shape.answers as u64);
+    message.push_u64(shape.code.log_n as u64);
+    message.push_u64(shape.code.ell);
+    message.push_u64(shape.code.r);
+    push_tree_plan(&mut message, &shape.tree_plan(0)?);
+    push_digest(&mut message, root);
+    let prefix = message.prefix(KIND_SEED, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
+/// Absorbs the sample answers of one range message.
+fn absorb_range_answers(chain: &mut Chain, tag: u64, answers: &[Fp3]) -> Result<()> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(tag);
+    message.push_u64(answers.len() as u64);
+    for answer in answers {
+        message.push_fp3(answer);
+    }
+    let prefix = message.prefix(KIND_EMPTY, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
+/// The sample rows of the three range members.
+fn range_sample_rows(
+    plan: &HiddenSendPlan,
+    messages: &RangeMessages,
+    members: &[ProximityMember],
+) -> Result<Vec<(u64, Vec<GuRelationRow>)>> {
+    let range = plan.range.as_ref().ok_or(Error::InvalidConfig)?;
+    let mut rows = Vec::new();
+    for (oracle, shape, message) in [
+        (range.array_oracle, &range.array_shape, &messages.array),
+        (range.unit_oracle, &range.unit_shape, &messages.units),
+        (range.digit_oracle, &range.digit_shape, &messages.digits),
+    ] {
+        if !members.iter().any(|member| member.source_oracle == oracle) {
+            return Err(Error::StatementMismatch);
+        }
+        let mut member_rows = Vec::with_capacity(message.sample.seed.len());
+        for (seed, answer) in message.sample.seed.iter().zip(&message.sample.answers) {
+            member_rows.push(oracle_sample_row(
+                oracle,
+                range.group,
+                &shape.oracle_shape(),
+                std::slice::from_ref(seed),
+                0,
+                *answer,
+            )?);
+        }
+        rows.push((oracle, member_rows));
+    }
+    Ok(rows)
+}
+
+/// The coefficient of a range claim: `theta^(claims + first)`, the product of
+/// the batching weight and the claim's lead.
+fn range_claim_scale(theta: Fp3, claims: usize, first: u64) -> Result<Fp3> {
+    let exponent = (claims as u64)
+        .checked_add(first)
+        .ok_or(Error::ResourceLimit)?;
+    Ok(theta_power(theta, exponent))
+}
+
+/// `base^exponent` in the field, by squaring and multiplying.
+fn theta_power(base: Fp3, mut exponent: u64) -> Fp3 {
+    let mut power = Fp3::ONE;
+    let mut factor = base;
+    while exponent > 0 {
+        if exponent & 1 == 1 {
+            power = power.mul(&factor);
+        }
+        factor = factor.mul(&factor);
+        exponent >>= 1;
+    }
+    power
+}
+
+/// The tie and read relations of the range objects, on the segment's three
+/// committed messages. The coefficients follow the challenge powers: `vt[u] =
+/// vp[u] = theta^u`, the column weight `g[c] = sum_u vt[u] Cf[c][u]`, the
+/// symbol row weight `rowX[i] = (theta^Np)^i`, and each claim is scaled by
+/// `theta^(claims + first)`. The equations are
+/// `sum wl (Zlo + d Zhi) - o sx sw - sum wr symbols = 0` for the tie and
+/// `sum phi (Zlo + d Zhi) - o sphi sv - sum g U = 0` for each read.
+fn range_relation_rows(
+    plan: &HiddenSendPlan,
+    member: &MemberPlan,
+    existing_claims: usize,
+    theta: Fp3,
+    cf: &[i8],
+) -> Result<Vec<BatRow>> {
+    use crate::proof::packed_matrix::PACK_BASE;
+    use zkie_engine::pcs::request::bat::{BatPart, BatRow, BatRowKind};
+    let range = plan.range.as_ref().ok_or(Error::InvalidConfig)?;
+    if range.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let combinations = range.combinations as usize;
+    let rows_cell = usize::try_from(range.matrix.rows).map_err(|_| Error::ResourceLimit)?;
+    let columns_cell = usize::try_from(range.matrix.columns).map_err(|_| Error::ResourceLimit)?;
+    let groups = usize::try_from(range.matrix.groups).map_err(|_| Error::ResourceLimit)?;
+    if cf.len() != columns_cell * combinations {
+        return Err(Error::ShapeMismatch);
+    }
+    let tau_pow = (combinations as u64)
+        .checked_next_power_of_two()
+        .ok_or(Error::ResourceLimit)?;
+    let v: Vec<Fp3> = (0..combinations)
+        .map(|u| theta_power(theta, u as u64))
+        .collect();
+    let sx = v.iter().fold(Fp3::ZERO, |sum, value| sum.add(value));
+    let sv = sx;
+    let mut gam = vec![Fp3::ZERO; columns_cell];
+    for (c, weight) in gam.iter_mut().enumerate() {
+        for (u, factor) in v.iter().enumerate() {
+            match cf[c * combinations + u] {
+                1 => *weight = weight.add(factor),
+                -1 => *weight = weight.sub(factor),
+                _ => {}
+            }
+        }
+        if weight.is_zero() {
+            return Err(Error::InvalidConfig);
+        }
+    }
+    let mut row_x = Vec::with_capacity(groups);
+    let step = theta_power(theta, tau_pow);
+    let mut power = Fp3::ONE;
+    for _ in 0..groups {
+        row_x.push(power);
+        power = power.mul(&step);
+    }
+    let lane = [
+        Fp3::ONE,
+        Fp3::from_u64(PACK_BASE as u64),
+        Fp3::from_u64((PACK_BASE * PACK_BASE) as u64),
+    ];
+    let mut wl = Vec::with_capacity(rows_cell);
+    for i in 0..rows_cell {
+        wl.push(row_x[i / 3].mul(&lane[i % 3]));
+    }
+    let sw = wl.iter().fold(Fp3::ZERO, |sum, value| sum.add(value));
+    // The read tables' geometry: one part per table, one block per run-length
+    // segment, every entry covered once.
+    let mut blocks_per_table = Vec::with_capacity(member.tables.len());
+    let mut reads = 0usize;
+    for table in &member.tables {
+        if table.parts != 1
+            || table.run_length == 0
+            || table.columns % table.run_length != 0
+            || table.rows_per_part as usize != columns_cell
+            || table.columns as usize != rows_cell
+            || table.phi.len() as u64 != table.run_length
+        {
+            return Err(Error::InvalidConfig);
+        }
+        let blocks = table.columns / table.run_length;
+        reads = reads
+            .checked_add(usize::try_from(blocks).map_err(|_| Error::ResourceLimit)?)
+            .ok_or(Error::ResourceLimit)?;
+        blocks_per_table.push(blocks);
+    }
+    let claims = existing_claims
+        .checked_add(1)
+        .and_then(|value| value.checked_add(reads))
+        .ok_or(Error::ResourceLimit)?;
+    let m_s = range.matrix.groups.max(1);
+    let m_s_bits = 64 - (m_s - 1).leading_zeros();
+    let eq_first = tau_pow
+        .checked_shl(m_s_bits)
+        .ok_or(Error::ResourceLimit)?;
+    let window = Fp3::from_u64(range.window as u64);
+    let d = Fp3::from_u64(range.combination.digit_base() as u64);
+    let mut rows = Vec::with_capacity(1 + reads);
+    // The tie of the one matrix.
+    let scale = range_claim_scale(theta, claims, 0)?;
+    let mut row = BatRow::new(BatRowKind::Plain);
+    for (u, factor) in v.iter().enumerate() {
+        for (i, weight) in wl.iter().enumerate() {
+            let low = range.digit_virtual(0, i as u64, u as u32)?;
+            row.add_unit(
+                range.digit_oracle,
+                BatPart::Main,
+                low,
+                scale.mul(weight).mul(factor),
+            );
+            let high = range.digit_virtual(1, i as u64, u as u32)?;
+            row.add_unit(
+                range.digit_oracle,
+                BatPart::Main,
+                high,
+                scale.mul(weight).mul(factor).mul(&d),
+            );
+        }
+    }
+    for (c, weight) in gam.iter().enumerate() {
+        for (s, row_weight) in row_x.iter().enumerate() {
+            let index = (s * columns_cell + c) as u64;
+            let virtual_index =
+                crate::proof::request_chain::RangePlan::message_virtual(&range.array_shape, index)?;
+            row.add_unit(
+                range.array_oracle,
+                BatPart::Main,
+                virtual_index,
+                Fp3::ZERO.sub(&scale.mul(weight).mul(row_weight)),
+            );
+        }
+    }
+    row.target = scale.mul(&window).mul(&sx).mul(&sw);
+    rows.push(row);
+    // One read per table and block.
+    let mut read = 0usize;
+    for (table, blocks) in member.tables.iter().zip(&blocks_per_table) {
+        let run = table.run_length;
+        let sphi = table.phi.iter().fold(Fp3::ZERO, |sum, value| sum.add(value));
+        for block in 0..*blocks {
+            let first = eq_first
+                .checked_add(
+                    (read as u64)
+                        .checked_mul(tau_pow)
+                        .ok_or(Error::ResourceLimit)?,
+                )
+                .ok_or(Error::ResourceLimit)?;
+            let scale = range_claim_scale(theta, claims, first)?;
+            let mut row = BatRow::new(BatRowKind::Plain);
+            for (u, factor) in v.iter().enumerate() {
+                for (i, weight) in table.phi.iter().enumerate() {
+                    let index = block
+                        .checked_mul(run)
+                        .and_then(|value| value.checked_add(i as u64))
+                        .ok_or(Error::ResourceLimit)?;
+                    let low = range.digit_virtual(0, index, u as u32)?;
+                    row.add_unit(
+                        range.digit_oracle,
+                        BatPart::Main,
+                        low,
+                        scale.mul(weight).mul(factor),
+                    );
+                    let high = range.digit_virtual(1, index, u as u32)?;
+                    row.add_unit(
+                        range.digit_oracle,
+                        BatPart::Main,
+                        high,
+                        scale.mul(weight).mul(factor).mul(&d),
+                    );
+                }
+            }
+            for (c, weight) in gam.iter().enumerate() {
+                let entry = table
+                    .at
+                    .checked_add(
+                        (c as u64)
+                            .checked_mul(*blocks)
+                            .and_then(|value| value.checked_add(block))
+                            .ok_or(Error::ResourceLimit)?,
+                    )
+                    .ok_or(Error::ResourceLimit)?;
+                let virtual_index =
+                    crate::proof::request_chain::RangePlan::message_virtual(&range.unit_shape, entry)?;
+                row.add_unit(
+                    range.unit_oracle,
+                    BatPart::Main,
+                    virtual_index,
+                    Fp3::ZERO.sub(&scale.mul(weight)),
+                );
+            }
+            row.target = scale.mul(&window).mul(&sphi).mul(&sv);
+            rows.push(row);
+            read += 1;
+        }
+    }
+    if rows.len() != 1usize.checked_add(reads).ok_or(Error::ResourceLimit)? || read != reads {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(rows)
+}
+
 fn segment_members(
     plan: &HiddenLinPlan,
     chain_mask: &ChainMaskMessage,
     source: &RequestWMessage,
+    range: Option<(&RangeMessages, Option<&RangeWitness>)>,
     mask_witness: Option<&ChainMaskWitness>,
     source_witness: Option<&RequestWWitness>,
 ) -> Result<Vec<ProximityMember>> {
@@ -4992,6 +5580,72 @@ fn segment_members(
             mask_tails: Vec::new(),
         },
     ];
+    if let Some(range_plan) = &plan.send.range {
+        let (messages, witness) = range.ok_or(Error::ShapeMismatch)?;
+        for (oracle, shape, message, committed) in [
+            (
+                range_plan.array_oracle,
+                &range_plan.array_shape,
+                &messages.array,
+                witness.map(|w| &w.array),
+            ),
+            (
+                range_plan.unit_oracle,
+                &range_plan.unit_shape,
+                &messages.units,
+                witness.map(|w| &w.units),
+            ),
+            (
+                range_plan.digit_oracle,
+                &range_plan.digit_shape,
+                &messages.digits,
+                witness.map(|w| &w.digits),
+            ),
+        ] {
+            let (message_rows, tails) = match committed {
+                Some(witness) => {
+                    let tail_len =
+                        usize::try_from(shape.code.r).map_err(|_| Error::ResourceLimit)?;
+                    let rows =
+                        usize::try_from(shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+                    if witness.tails.len()
+                        != rows.checked_mul(tail_len).ok_or(Error::ResourceLimit)?
+                    {
+                        return Err(Error::ShapeMismatch);
+                    }
+                    let mut tails = Vec::with_capacity(rows);
+                    for row in 0..rows {
+                        tails.push(witness.tails[row * tail_len..(row + 1) * tail_len].to_vec());
+                    }
+                    (
+                        witness
+                            .committed
+                            .messages
+                            .first()
+                            .ok_or(Error::ShapeMismatch)?
+                            .clone(),
+                        tails,
+                    )
+                }
+                None => (Vec::new(), Vec::new()),
+            };
+            members.push(ProximityMember {
+                bat_oracle: 0,
+                source_oracle: oracle,
+                main_code: shape.code,
+                mask_code: plan.proximity.mask_code,
+                main_rows: shape.main_rows,
+                mask_rows: 0,
+                answers: shape.answers,
+                root: message.root,
+                tree_plan: shape.tree_plan(0)?,
+                message: message_rows,
+                tails,
+                mask_message: Vec::new(),
+                mask_tails: Vec::new(),
+            });
+        }
+    }
     members.sort_by_key(|member| std::cmp::Reverse(member.main_rows));
     for (index, member) in members.iter_mut().enumerate() {
         member.bat_oracle = index as u64;
@@ -5004,44 +5658,54 @@ fn segment_sample_rows(
     plan: &HiddenLinPlan,
     chain_mask: &ChainMaskMessage,
     source: &RequestWMessage,
+    range: Option<&RangeMessages>,
     members: &[ProximityMember],
 ) -> Result<Vec<Vec<GuRelationRow>>> {
     let mask_plan = plan.send.chain_mask.as_ref().ok_or(Error::InvalidConfig)?;
     let source_plan = plan.send.source_data.as_ref().ok_or(Error::InvalidConfig)?;
-    members
-        .iter()
-        .map(|member| {
-            if member.source_oracle == mask_plan.oracle {
-                let target = *chain_mask.sample.answers.first().ok_or(Error::ShapeMismatch)?;
-                Ok(vec![chain_mask_sample_row(mask_plan, chain_mask, target)?])
-            } else if member.source_oracle == source_plan.oracle {
-                let mut rows = Vec::with_capacity(source.sample.seed.len());
-                for (seed, answer) in source.sample.seed.iter().zip(&source.sample.answers) {
-                    rows.push(oracle_sample_row(
-                        source_plan.oracle,
-                        source_plan.group,
-                        &source_plan.shape.oracle_shape(),
-                        std::slice::from_ref(seed),
-                        0,
-                        *answer,
-                    )?);
-                }
-                Ok(rows)
-            } else {
-                Err(Error::StatementMismatch)
+    let mut range_rows = match (&plan.send.range, range) {
+        (Some(_), Some(messages)) => range_sample_rows(&plan.send, messages, members)?,
+        (None, None) => Vec::new(),
+        _ => return Err(Error::InvalidConfig),
+    };
+    let mut rows = Vec::with_capacity(members.len());
+    for member in members {
+        if member.source_oracle == mask_plan.oracle {
+            let target = *chain_mask.sample.answers.first().ok_or(Error::ShapeMismatch)?;
+            rows.push(vec![chain_mask_sample_row(mask_plan, chain_mask, target)?]);
+        } else if member.source_oracle == source_plan.oracle {
+            let mut member_rows = Vec::with_capacity(source.sample.seed.len());
+            for (seed, answer) in source.sample.seed.iter().zip(&source.sample.answers) {
+                member_rows.push(oracle_sample_row(
+                    source_plan.oracle,
+                    source_plan.group,
+                    &source_plan.shape.oracle_shape(),
+                    std::slice::from_ref(seed),
+                    0,
+                    *answer,
+                )?);
             }
-        })
-        .collect()
+            rows.push(member_rows);
+        } else {
+            let at = range_rows
+                .iter()
+                .position(|(oracle, _)| *oracle == member.source_oracle)
+                .ok_or(Error::StatementMismatch)?;
+            let (_, member_rows) = range_rows.remove(at);
+            rows.push(member_rows);
+        }
+    }
+    if !range_rows.is_empty() {
+        return Err(Error::StatementMismatch);
+    }
+    Ok(rows)
 }
 
-/// The five relation rows rebound to the segment group's BAT ids.
+/// The relation rows rebound to the segment group's BAT ids.
 fn segment_plain_rows(
-    plan: &HiddenLinPlan,
-    inputs: &crate::proof::request_chain::ChainInputs,
-    outputs: &crate::proof::request_chain::ChainOutputs,
     members: &[ProximityMember],
+    mut rows: Vec<BatRow>,
 ) -> Result<Vec<BatRow>> {
-    let mut rows = chain_relation_rows(&plan.send, inputs, outputs)?;
     for row in &mut rows {
         for unit in &mut row.units {
             let member = members
@@ -5059,6 +5723,7 @@ fn segment_tree_source<'a>(
     plan: &HiddenLinPlan,
     mask_witness: &ChainMaskWitness,
     source_witness: &RequestWWitness,
+    range: Option<&RangeWitness>,
     members: &[ProximityMember],
 ) -> Result<ProximityTreeSource<'a>> {
     let mask_plan = plan.send.chain_mask.as_ref().ok_or(Error::InvalidConfig)?;
@@ -5068,15 +5733,31 @@ fn segment_tree_source<'a>(
         .find(|member| member.source_oracle == source_plan.oracle)
         .ok_or(Error::StatementMismatch)?;
     let source_tree = retained_member_tree(&source_witness.committed.trees, 0, source_member)?;
-    Ok(ProximityTreeSource::Ready(vec![
+    let mut trees = vec![
         (mask_plan.oracle, mask_witness.tree.clone()),
         (source_plan.oracle, source_tree),
-    ]))
+    ];
+    if let Some(range_plan) = &plan.send.range {
+        let witness = range.ok_or(Error::ShapeMismatch)?;
+        for (oracle, committed) in [
+            (range_plan.array_oracle, &witness.array.committed.trees),
+            (range_plan.unit_oracle, &witness.units.committed.trees),
+            (range_plan.digit_oracle, &witness.digits.committed.trees),
+        ] {
+            let member = members
+                .iter()
+                .find(|member| member.source_oracle == oracle)
+                .ok_or(Error::StatementMismatch)?;
+            trees.push((oracle, retained_member_tree(committed, 0, member)?));
+        }
+    }
+    Ok(ProximityTreeSource::Ready(trees))
 }
 
 fn prove_first_chain_segment(
     chain: Chain,
     plan: &HiddenLinPlan,
+    table: &mut dyn HiddenTableProver,
     inputs: &crate::proof::request_chain::ChainInputs,
     seed: &Digest,
 ) -> Result<(
@@ -5089,6 +5770,7 @@ fn prove_first_chain_segment(
     Option<RequestWWitness>,
     Option<SegmentProximityMessages>,
     Vec<BatRow>,
+    Option<RangeMessages>,
 )> {
     let mut chain = chain;
     let shape = plan.send.request_chain.ok_or(Error::InvalidConfig)?;
@@ -5118,9 +5800,56 @@ fn prove_first_chain_segment(
         }
         None => (None, None),
     };
+    // The packed symbol array is the original matrix's message: it is
+    // committed and sampled before the segment's challenges.
+    let mut range_array: Option<(RequestWWitness, RequestWMessage)> = None;
+    if let Some(range_plan) = &plan.send.range {
+        let values = {
+            let source: &mut dyn TableRowSource = &mut *table;
+            range_symbol_values(&plan.send, source)
+                ?
+        };
+        let (witness, mut message) = commit_range_message(
+            range_plan,
+            &range_plan.array_shape,
+            range_plan.array_oracle,
+            &values,
+            seed,
+            7,
+        )
+        ?;
+        absorb_range_root(
+            &mut chain,
+            28,
+            range_plan,
+            &range_plan.array_shape,
+            range_plan.array_oracle,
+            &message.root,
+        )
+        ?;
+        let seeds = draw_seed_set(
+            &mut chain,
+            range_plan.array_shape.sample_bits()?,
+            range_plan.array_shape.answers,
+        )
+        ?;
+        let answers = range_sample_answers(
+            &range_plan.array_shape,
+            range_plan.array_oracle,
+            range_plan.group,
+            &witness.committed,
+            &seeds,
+        )
+        ?;
+        absorb_range_answers(&mut chain, 29, &answers)
+            ?;
+        message.sample = SendSamples { seed: seeds, answers };
+        range_array = Some((witness, message));
+    }
     let (messages, outputs) = {
         let mut challenges = ChainSegmentChallenges { chain: &mut chain };
-        prove_request_chain_section(&plan.send, inputs, &mut challenges)?
+        prove_request_chain_section(&plan.send, inputs, &mut challenges)
+            ?
     };
     // The source cells are committed after the segment runs, so the mask table
     // itself carries no segment output; the source root is fixed before the
@@ -5140,28 +5869,13 @@ fn prove_first_chain_segment(
                 source_plan.shape.sample_bits()?,
                 source_plan.shape.answers,
             )?;
-            let main = witness
-                .committed
-                .messages
-                .first()
-                .ok_or(Error::ShapeMismatch)?
-                .concat();
-            let gu = GuWitness {
-                main,
-                mask: Vec::new(),
-            };
-            let mut answers = Vec::with_capacity(seeds.len());
-            for seed in &seeds {
-                let row = oracle_sample_row(
-                    source_plan.oracle,
-                    source_plan.group,
-                    &source_plan.shape.oracle_shape(),
-                    std::slice::from_ref(seed),
-                    0,
-                    Fp3::ZERO,
-                )?;
-                answers.push(row.evaluate(&gu)?);
-            }
+            let answers = range_sample_answers(
+                &source_plan.shape,
+                source_plan.oracle,
+                source_plan.group,
+                &witness.committed,
+                &seeds,
+            )?;
             let message = RequestWMessage {
                 root,
                 sample: SendSamples {
@@ -5173,10 +5887,107 @@ fn prove_first_chain_segment(
         }
         None => (None, None),
     };
-    // The segment relation closure: the five rows are checked by a proximity
-    // test that ends the request segment before the pending claim is handed to
-    // the member chain. The test continues the same first chain.
-    let (segment_proximity, mut chain) = match (
+    // The reduced read table is the member's table: its message is committed
+    // and sampled after the section's points, before the combination matrix is
+    // drawn.
+    let mut range_units: Option<(RequestWWitness, RequestWMessage)> = None;
+    if let (Some(range_plan), Some(_)) = (&plan.send.range, &range_array) {
+        let member = plan.send.member.as_ref().ok_or(Error::InvalidConfig)?;
+        let values = {
+            let source: &mut dyn TableRowSource = &mut *table;
+            let entries = reduction_entries(&plan.send, member, source)?;
+            let columns = entries
+                .len()
+                .checked_next_power_of_two()
+                .ok_or(Error::ResourceLimit)?;
+            let mut values = vec![Fp3::ZERO; columns];
+            values[..entries.len()].copy_from_slice(&entries);
+            values
+        };
+        let (witness, mut message) = commit_range_message(
+            range_plan,
+            &range_plan.unit_shape,
+            range_plan.unit_oracle,
+            &values,
+            seed,
+            8,
+        )?;
+        absorb_range_root(
+            &mut chain,
+            30,
+            range_plan,
+            &range_plan.unit_shape,
+            range_plan.unit_oracle,
+            &message.root,
+        )?;
+        let seeds = draw_seed_set(
+            &mut chain,
+            range_plan.unit_shape.sample_bits()?,
+            range_plan.unit_shape.answers,
+        )?;
+        let answers = range_sample_answers(
+            &range_plan.unit_shape,
+            range_plan.unit_oracle,
+            range_plan.group,
+            &witness.committed,
+            &seeds,
+        )?;
+        absorb_range_answers(&mut chain, 31, &answers)?;
+        message.sample = SendSamples { seed: seeds, answers };
+        range_units = Some((witness, message));
+    }
+    // The combination matrix, the digit object and the batching element.
+    let mut range_digits: Option<(RequestWWitness, RequestWMessage)> = None;
+    let mut range_trits: Option<Vec<i8>> = None;
+    if let (Some(range_plan), Some(_)) = (&plan.send.range, &range_units) {
+        let columns =
+            usize::try_from(range_plan.matrix.columns).map_err(|_| Error::ResourceLimit)?;
+        let trits = columns
+            .checked_mul(range_plan.combinations as usize)
+            .ok_or(Error::ResourceLimit)?;
+        let cf = chain.draw_trits(trits)?;
+        let values = {
+            let source: &mut dyn TableRowSource = &mut *table;
+            range_digit_values(&plan.send, &cf, source)?
+        };
+        let (witness, mut message) = commit_range_message(
+            range_plan,
+            &range_plan.digit_shape,
+            range_plan.digit_oracle,
+            &values,
+            seed,
+            9,
+        )?;
+        absorb_range_root(
+            &mut chain,
+            32,
+            range_plan,
+            &range_plan.digit_shape,
+            range_plan.digit_oracle,
+            &message.root,
+        )?;
+        let seeds = draw_seed_set(
+            &mut chain,
+            range_plan.digit_shape.sample_bits()?,
+            range_plan.digit_shape.answers,
+        )?;
+        let answers = range_sample_answers(
+            &range_plan.digit_shape,
+            range_plan.digit_oracle,
+            range_plan.group,
+            &witness.committed,
+            &seeds,
+        )?;
+        absorb_range_answers(&mut chain, 33, &answers)?;
+        message.sample = SendSamples { seed: seeds, answers };
+        range_digits = Some((witness, message));
+        range_trits = Some(cf);
+    }
+    let theta = chain.draw_e_nonzero()?;
+    // The segment relation closure: the relation rows are checked by a
+    // proximity test that ends the request segment before the pending claim is
+    // handed to the member chain. The test continues the same first chain.
+    let (segment_proximity, range_messages, mut chain) = match (
         &plan.send.segment_mask_tree,
         &chain_mask_message,
         &source_message,
@@ -5184,21 +5995,60 @@ fn prove_first_chain_segment(
         &source_witness,
     ) {
         (Some(mask_tree), Some(mask_message), Some(source_message), Some(mask_witness), Some(source_witness)) => {
+            let range_witness = match (range_array, range_units, range_digits) {
+                (Some((array, array_message)), Some((units, unit_message)), Some((digits, digit_message))) => {
+                    Some(RangeWitness {
+                        array,
+                        units,
+                        digits,
+                        messages: RangeMessages {
+                            array: array_message,
+                            units: unit_message,
+                            digits: digit_message,
+                        },
+                    })
+                }
+                (None, None, None) => None,
+                _ => return Err(Error::InvalidConfig),
+            };
             let members = segment_members(
                 plan,
                 mask_message,
                 source_message,
+                range_witness
+                    .as_ref()
+                    .map(|witness| (&witness.messages, Some(witness))),
                 Some(mask_witness),
                 Some(source_witness),
-            )?;
-            let sample_rows = segment_sample_rows(plan, mask_message, source_message, &members)?;
-            let rows = segment_plain_rows(plan, inputs, &outputs, &members)?;
+            )
+            ?;
+            let sample_rows = segment_sample_rows(
+                plan,
+                mask_message,
+                source_message,
+                range_witness.as_ref().map(|witness| &witness.messages),
+                &members,
+            )
+            ?;
+            let mut rows = chain_relation_rows(&plan.send, inputs, &outputs)
+                ?;
+            let existing = rows.len();
+            if let (Some(_), Some(cf)) = (&plan.send.range, &range_trits) {
+                let member = plan.send.member.as_ref().ok_or(Error::InvalidConfig)?;
+                let range_rows =
+                    range_relation_rows(&plan.send, member, existing, theta, cf)
+                        ?;
+                rows.extend(range_rows);
+            }
+            let rows = segment_plain_rows(&members, rows)
+                ?;
             let fold = member_fold_shape(
                 plan.proximity.code,
                 plan.proximity.mask_code,
                 &members,
                 mask_tree.leaf_class,
-            )?;
+            )
+            ?;
             let fresh = plan
                 .proximity
                 .own_fresh
@@ -5211,8 +6061,10 @@ fn prove_first_chain_segment(
                 plan,
                 mask_witness,
                 source_witness,
+                range_witness.as_ref(),
                 &members,
-            )?;
+            )
+            ?;
             let proof = proximity_prove(
                 chain,
                 fold,
@@ -5225,7 +6077,8 @@ fn prove_first_chain_segment(
                 derive_run_seed(seed, 6, 0)?,
                 plan.proximity.own_base_positions,
                 None,
-            )?;
+            )
+            ?;
             (
                 Some(SegmentProximityMessages {
                     fold_start: proof.messages.fold_start,
@@ -5233,6 +6086,7 @@ fn prove_first_chain_segment(
                     tail: proof.messages.tail,
                     seal: proof.seal,
                 }),
+                range_witness.map(|witness| witness.messages),
                 proof.chain,
             )
         }
@@ -5255,6 +6109,7 @@ fn prove_first_chain_segment(
         source_witness,
         segment_proximity,
         rows,
+        range_messages,
     ))
 }
 
@@ -5282,6 +6137,7 @@ fn verify_first_chain_segment(
     inputs: &crate::proof::request_chain::ChainInputs,
     chain_mask: Option<&ChainMaskMessage>,
     source_data: Option<&RequestWMessage>,
+    range: Option<&RangeMessages>,
     segment_proximity: Option<&SegmentProximityMessages>,
 ) -> Result<(
     Chain,
@@ -5324,6 +6180,35 @@ fn verify_first_chain_segment(
         (None, None) => {}
         _ => return Err(Error::InvalidProof),
     }
+    // The packed symbol array's root and sample are fixed before the segment's
+    // challenges.
+    match (&plan.send.range, range) {
+        (Some(range_plan), Some(messages)) => {
+            let array = &messages.array;
+            if array.root == Digest::ZERO {
+                return Err(Error::InvalidProof);
+            }
+            absorb_range_root(
+                &mut chain,
+                28,
+                range_plan,
+                &range_plan.array_shape,
+                range_plan.array_oracle,
+                &array.root,
+            )?;
+            let seeds = draw_seed_set(
+                &mut chain,
+                range_plan.array_shape.sample_bits()?,
+                range_plan.array_shape.answers,
+            )?;
+            if array.sample.seed != seeds || array.sample.answers.len() != seeds.len() {
+                return Err(Error::InvalidProof);
+            }
+            absorb_range_answers(&mut chain, 29, &array.sample.answers)?;
+        }
+        (None, None) => {}
+        _ => return Err(Error::InvalidProof),
+    }
     let proof = ChainProof {
         token: messages.token.clone(),
         stack: messages.stack.clone(),
@@ -5354,6 +6239,64 @@ fn verify_first_chain_segment(
         (None, None) => {}
         _ => return Err(Error::InvalidProof),
     }
+    // The reduced read table's root and sample follow the section, before the
+    // combination matrix is drawn.
+    if let (Some(range_plan), Some(messages)) = (&plan.send.range, range) {
+        let units = &messages.units;
+        if units.root == Digest::ZERO {
+            return Err(Error::InvalidProof);
+        }
+        absorb_range_root(
+            &mut chain,
+            30,
+            range_plan,
+            &range_plan.unit_shape,
+            range_plan.unit_oracle,
+            &units.root,
+        )?;
+        let seeds = draw_seed_set(
+            &mut chain,
+            range_plan.unit_shape.sample_bits()?,
+            range_plan.unit_shape.answers,
+        )?;
+        if units.sample.seed != seeds || units.sample.answers.len() != seeds.len() {
+            return Err(Error::InvalidProof);
+        }
+        absorb_range_answers(&mut chain, 31, &units.sample.answers)?;
+    }
+    // The combination matrix and the digit object.
+    let mut range_trits = None;
+    if let (Some(range_plan), Some(messages)) = (&plan.send.range, range) {
+        let columns =
+            usize::try_from(range_plan.matrix.columns).map_err(|_| Error::ResourceLimit)?;
+        let trits = columns
+            .checked_mul(range_plan.combinations as usize)
+            .ok_or(Error::ResourceLimit)?;
+        let cf = chain.draw_trits(trits)?;
+        let digits = &messages.digits;
+        if digits.root == Digest::ZERO {
+            return Err(Error::InvalidProof);
+        }
+        absorb_range_root(
+            &mut chain,
+            32,
+            range_plan,
+            &range_plan.digit_shape,
+            range_plan.digit_oracle,
+            &digits.root,
+        )?;
+        let seeds = draw_seed_set(
+            &mut chain,
+            range_plan.digit_shape.sample_bits()?,
+            range_plan.digit_shape.answers,
+        )?;
+        if digits.sample.seed != seeds || digits.sample.answers.len() != seeds.len() {
+            return Err(Error::InvalidProof);
+        }
+        absorb_range_answers(&mut chain, 33, &digits.sample.answers)?;
+        range_trits = Some(cf);
+    }
+    let theta = chain.draw_e_nonzero()?;
     // The segment relation closure: the same proximity test the prover ran,
     // continued on the same first chain.
     let mut chain = match (
@@ -5363,9 +6306,41 @@ fn verify_first_chain_segment(
         segment_proximity,
     ) {
         (Some(mask_tree), Some(mask_message), Some(source_message), Some(proximity)) => {
-            let members = segment_members(plan, mask_message, source_message, None, None)?;
-            let sample_rows = segment_sample_rows(plan, mask_message, source_message, &members)?;
-            let rows = segment_plain_rows(plan, inputs, &outputs, &members)?;
+            let range_for_members = match (&plan.send.range, range) {
+                (Some(_), Some(messages)) => Some((messages, None::<&RangeWitness>)),
+                (None, None) => None,
+                _ => return Err(Error::InvalidConfig),
+            };
+            let members = segment_members(
+                plan,
+                mask_message,
+                source_message,
+                range_for_members
+                    .as_ref()
+                    .map(|(messages, _)| (*messages, None::<&RangeWitness>)),
+                None,
+                None,
+            )?;
+            let sample_rows = segment_sample_rows(
+                plan,
+                mask_message,
+                source_message,
+                range_for_members.as_ref().map(|(messages, _)| *messages),
+                &members,
+            )?;
+            let mut rows = chain_relation_rows(&plan.send, inputs, &outputs)?;
+            let existing = rows.len();
+            if let (Some(_), Some(cf)) = (&plan.send.range, &range_trits) {
+                let member = plan.send.member.as_ref().ok_or(Error::InvalidConfig)?;
+                rows.extend(range_relation_rows(
+                    &plan.send,
+                    member,
+                    existing,
+                    theta,
+                    cf,
+                )?);
+            }
+            let rows = segment_plain_rows(&members, rows)?;
             let fold = member_fold_shape(
                 plan.proximity.code,
                 plan.proximity.mask_code,
@@ -6503,56 +7478,6 @@ fn get_oracle_shape(reader: &mut CanonicalReader<'_>) -> Result<GuOracleShape> {
     Ok(shape)
 }
 
-/// Writes one plan-positioned symbol-array message: its tree, root, positions
-/// and opening.
-fn put_range_message(
-    writer: &mut CanonicalWriter,
-    message: &crate::proof::packed_matrix::RangeMessage,
-) -> Result<()> {
-    put_tree_plan(writer, &message.tree);
-    writer.put_digest(&message.root);
-    writer.put_u64(message.positions.len() as u64);
-    for position in &message.positions {
-        writer.put_u64(*position);
-    }
-    writer.put_bytes(&encode_runtime_opening(&message.tree, &message.opening)?);
-    Ok(())
-}
-
-/// Reads one plan-positioned symbol-array message under the plan's tree: the
-/// tree, root, positions and opening must agree with it.
-fn get_range_message(
-    reader: &mut CanonicalReader,
-    tree: &RuntimeTreePlan,
-) -> Result<crate::proof::packed_matrix::RangeMessage> {
-    let decoded = get_tree_plan(reader)?;
-    if decoded != *tree {
-        return Err(Error::StatementMismatch);
-    }
-    let root = reader.get_digest()?;
-    if root == Digest::ZERO {
-        return Err(Error::InvalidEncoding);
-    }
-    let count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
-    if count == 0 || count > tree.columns() as usize {
-        return Err(Error::ShapeMismatch);
-    }
-    let mut positions = Vec::with_capacity(count);
-    for _ in 0..count {
-        positions.push(reader.get_u64()?);
-    }
-    let opening = decode_runtime_opening(tree, &positions, reader.get_bytes()?)?;
-    if opening.positions != positions {
-        return Err(Error::InvalidEncoding);
-    }
-    Ok(crate::proof::packed_matrix::RangeMessage {
-        tree: decoded,
-        root,
-        positions,
-        opening,
-    })
-}
-
 fn put_tree_plan(writer: &mut CanonicalWriter, tree: &RuntimeTreePlan) {
     writer.put_u64(tree.tree_number);
     writer.put_u64(tree.leaf_class as u64);
@@ -7444,6 +8369,16 @@ pub struct HiddenLinPlan {
 impl HiddenLinPlan {
     pub fn validate(&self) -> Result<()> {
         self.send.validate()?;
+        // The three range messages join the segment group, so they use the
+        // group's base code; the session derives no second code for them.
+        if let Some(range) = &self.send.range {
+            if range.array_shape.code != self.proximity.code
+                || range.unit_shape.code != self.proximity.code
+                || range.digit_shape.code != self.proximity.code
+            {
+                return Err(Error::InvalidConfig);
+            }
+        }
         if self.output.fault().is_some()
             || self.output.positions != self.send.activation.positions
             || self.output.columns != self.send.columns
@@ -8448,7 +9383,8 @@ fn proximity_prove(
     let _profile_bat = zkie_engine::profile::Scope::new("prox.bat");
     let mut statement = BatStatement::new();
     for member in &members {
-        statement.add_oracle(member_bat_shape(member))?;
+        statement.add_oracle(member_bat_shape(member))
+            ?;
     }
     for (index, member) in members.iter().enumerate() {
         let rows = sample_rows[index]
@@ -8458,29 +9394,38 @@ fn proximity_prove(
         if rows.len() != member.answers as usize {
             return Err(Error::ShapeMismatch);
         }
-        statement.sample(member.bat_oracle, rows)?;
+        statement.sample(member.bat_oracle, rows)
+            ?;
     }
-    let group = statement.new_group(fold.code, fold.mask_code)?;
+    let group = statement.new_group(fold.code, fold.mask_code)
+        ?;
     for member in &members {
-        statement.join(group, member.bat_oracle, false)?;
+        statement.join(group, member.bat_oracle, false)
+            ?;
     }
     let planned = plain_rows.len() as u64
         + members.iter().map(|member| member.answers as u64).sum::<u64>();
     for row in plain_rows {
-        statement.add_row(group, row)?;
+        statement.add_row(group, row)
+            ?;
     }
-    let layout = statement.layout(group)?;
-    let fold_layout = statement.to_fold_layout_checked(group, &fold)?;
+    let layout = statement.layout(group)
+        ?;
+    let fold_layout = statement.to_fold_layout_checked(group, &fold)
+        ?;
     let mut bat = BatSession::new(statement, chain, planned)?;
     let input = bat.begin_run(group)?;
     let combined = bat.finish_run(input)?;
     let fold_row = bat.statement().to_fold_input_row(combined, &layout)?;
-    let chain = bat.into_chain()?;
+    let chain = bat.into_chain()
+        ?;
     drop(_profile_bat);
 
     let _profile_group_tables = zkie_engine::profile::Scope::new("prox.group_tables");
-    let group_main = build_group_table(&fold_layout, &layout, &members)?;
-    let group_mask = build_group_mask(&fold_layout, &layout, &members)?;
+    let group_main = build_group_table(&fold_layout, &layout, &members)
+        ?;
+    let group_mask = build_group_mask(&fold_layout, &layout, &members)
+        ?;
     drop(_profile_group_tables);
 
     let _profile_fold_start = zkie_engine::profile::Scope::new("prox.fold_start");
@@ -8499,7 +9444,8 @@ fn proximity_prove(
     };
     let notice = fold_mask_notice(&fold)?;
     let oracle = MaskOracle::prover_view(fresh_id, group, &notice);
-    zkie_engine::pcs::request::fold::fold_mask_check(&fold, &oracle, &groups)?;
+    zkie_engine::pcs::request::fold::fold_mask_check(&fold, &oracle, &groups)
+        ?;
     let salts = draw_salt_bytes(
         &mut coins,
         usize::try_from(mask_tree.columns()).map_err(|_| Error::ResourceLimit)?,
@@ -9403,14 +10349,19 @@ fn prove_first(
     take_mask_slots(plan)?;
     let reader = table.reader().clone();
     check_table(&plan.send, &reader)?;
-    let (reduction_root, _reduction_tree) = match &plan.send.member {
-        Some(member) => {
-            let source: &mut dyn TableRowSource = &mut *table;
-            let entries = reduction_entries(&plan.send, member, source)?;
-            let tree = reduction_tree(&plan.send, member, &entries)?;
-            (Some(*tree.root()), Some(tree))
+    let (reduction_root, _reduction_tree) = if plan.send.range.is_some() {
+        // The reduced read table is the range segment's unit message.
+        (None, None)
+    } else {
+        match &plan.send.member {
+            Some(member) => {
+                let source: &mut dyn TableRowSource = &mut *table;
+                let entries = reduction_entries(&plan.send, member, source)?;
+                let tree = reduction_tree(&plan.send, member, &entries)?;
+                (Some(*tree.root()), Some(tree))
+            }
+            None => (None, None),
         }
-        None => (None, None),
     };
     let request_w_commit = match &plan.send.request_w {
         Some(rw) => {
@@ -9548,8 +10499,10 @@ fn prove_first(
     let mut chain = first_chain(plan, &reader)?;
     absorb_group(&mut chain, &group)?;
     absorb_claim(&mut chain, plan)?;
-    if let (Some(member), Some(root)) = (&plan.send.member, &reduction_root) {
-        absorb_reduction_root(&mut chain, member, root)?;
+    if plan.send.range.is_none() {
+        if let (Some(member), Some(root)) = (&plan.send.member, &reduction_root) {
+            absorb_reduction_root(&mut chain, member, root)?;
+        }
     }
     // The request chain's sub-proof segment runs before the LIN first W root:
     // its messages and challenges are fixed in the first chain, and the pending
@@ -9565,6 +10518,7 @@ fn prove_first(
     let mut source_data_witness = None;
     let mut segment_proximity = None;
     let mut chain_rows = Vec::new();
+    let mut range_messages_out = None;
     let request_section = match (&plan.send.request_chain, chain_inputs) {
         (Some(_), Some(inputs)) => {
             // The pending claim the segment leaves is the request member's
@@ -9580,7 +10534,8 @@ fn prove_first(
                 source_witness,
                 proximity,
                 rows,
-            ) = prove_first_chain_segment(chain, plan, inputs, seed)?;
+                range_messages,
+            ) = prove_first_chain_segment(chain, plan, table, inputs, seed)?;
             chain = next_chain;
             bind_chain_pending(plan, &outputs.pending)?;
             chain_mask_message = mask_message;
@@ -9589,6 +10544,7 @@ fn prove_first(
             source_data_witness = source_witness;
             segment_proximity = proximity;
             chain_rows = rows;
+            range_messages_out = range_messages;
             Some(section)
         }
         (None, None) => None,
@@ -10019,6 +10975,11 @@ fn prove_first(
             }
         }
     };
+    let reduction_root = match (&reduction_root, &range_messages_out) {
+        (Some(root), _) => Some(*root),
+        (None, Some(messages)) => Some(messages.units.root),
+        (None, None) => None,
+    };
     let messages = HiddenSendMessages {
         activation: activation_commitment,
         group,
@@ -10044,8 +11005,9 @@ fn prove_first(
         norm: norm_first,
         request: request_section,
         chain_mask: chain_mask_message,
-        packed_array: None,
-        range: None,
+        range_array: range_messages_out.as_ref().map(|messages| messages.array.clone()),
+        range_units: range_messages_out.as_ref().map(|messages| messages.units.clone()),
+        range_digits: range_messages_out.as_ref().map(|messages| messages.digits.clone()),
         segment_proximity,
     };
     witness.request_w = request_w_commit;
@@ -10105,15 +11067,17 @@ fn verify_first(
     let mut chain = first_chain(plan, reader)?;
     absorb_group(&mut chain, &messages.group)?;
     absorb_claim(&mut chain, plan)?;
-    match (&plan.send.member, messages.reduction_root) {
-        (Some(member), Some(root)) => {
-            if root == Digest::ZERO {
-                return Err(Error::InvalidProof);
+    if plan.send.range.is_none() {
+        match (&plan.send.member, messages.reduction_root) {
+            (Some(member), Some(root)) => {
+                if root == Digest::ZERO {
+                    return Err(Error::InvalidProof);
+                }
+                absorb_reduction_root(&mut chain, member, &root)?;
             }
-            absorb_reduction_root(&mut chain, member, &root)?;
+            (None, None) => {}
+            _ => return Err(Error::InvalidProof),
         }
-        (None, None) => {}
-        _ => return Err(Error::InvalidProof),
     }
     // The at_start index-mask root is fixed before the segment's PSC and merge
     // challenges; only its sample and opening follow the W seeds.
@@ -10128,6 +11092,27 @@ fn verify_first(
         (Some(_), Some(section), Some(inputs)) => {
             // The verifier derives the pending from the received section and
             // binds it to the plan's member row before the seal.
+            let range_messages = match (
+                &messages.range_array,
+                &messages.range_units,
+                &messages.range_digits,
+            ) {
+                (Some(array), Some(units), Some(digits)) => Some(RangeMessages {
+                    array: array.clone(),
+                    units: units.clone(),
+                    digits: digits.clone(),
+                }),
+                (None, None, None) => None,
+                _ => return Err(Error::InvalidProof),
+            };
+            if let (Some(range_plan), Some(range_messages)) =
+                (&plan.send.range, &range_messages)
+            {
+                if messages.reduction_root != Some(range_messages.units.root) {
+                    return Err(Error::InvalidProof);
+                }
+                let _ = range_plan;
+            }
             let (next_chain, outputs, rows) = verify_first_chain_segment(
                 chain,
                 plan,
@@ -10135,6 +11120,7 @@ fn verify_first(
                 inputs,
                 messages.chain_mask.as_ref(),
                 messages.source_data.as_ref(),
+                range_messages.as_ref(),
                 messages.segment_proximity.as_ref(),
             )?;
             chain = next_chain;
@@ -25434,8 +26420,8 @@ mod merged_tests {
             tree: RuntimeTreePlan {
                 tree_number: 500,
                 leaf_class: 2,
-                log_n: 2,
-                log_n_zk: 2,
+                log_n: 12,
+                log_n_zk: 12,
                 parts: vec![RuntimeTreePart {
                     main_symbols: E_DEGREE as u64,
                     mask_symbols: 0,
@@ -25536,85 +26522,72 @@ mod merged_tests {
         (plan, messages, witness)
     }
 
-    /// One range plan over the fixture's matrix geometry: the packed symbol
-    /// array and the low/high digit combination object, each with its own
-    /// oracle and one-row tree.
+    /// One range plan over the fixture's geometry: the functional's matrix is
+    /// the table's cells transposed, the reduced read table reuses the
+    /// member's tree, and each of the three messages has its own oracle.
     fn range_plan() -> crate::proof::request_chain::RangePlan {
-        let tree = |number: u64, log_n: u32| RuntimeTreePlan {
-            tree_number: number,
-            leaf_class: 6,
-            log_n,
-            log_n_zk: log_n,
-            parts: vec![RuntimeTreePart {
-                main_symbols: E_DEGREE as u64,
-                mask_symbols: 0,
-            }],
+        let matrix = crate::proof::packed_matrix::PackedMatrixPlan::new(COLUMNS, MATRIX_ROWS)
+            .unwrap();
+        let shape = |tree_number: u64, leaf_class: u32, run: Digest, main_rows: u64| WShape {
+            code: code(),
+            main_rows,
+            answers: 1,
             salt_bytes: SALT,
-            run: Digest([0x6A; 32]),
+            tree_number,
+            leaf_class,
+            run,
             configuration: W_CONFIGURATION,
         };
+        let unit = shape(500, 2, Digest([0x68; 32]), 1);
         crate::proof::request_chain::RangePlan {
-            matrix: crate::proof::packed_matrix::PackedMatrixPlan::new(MATRIX_ROWS, COLUMNS)
-                .unwrap(),
-            array_oracle: ORACLE_BASE + 1_100,
-            array_tree: tree(910, 2),
+            matrix,
             combination: crate::proof::packed_matrix::RangeCombinationPlan::new(
-                COLUMNS, 2, 20, 0,
+                matrix.rows, 2, 10, 0,
             )
             .unwrap(),
-            oracle: ORACLE_BASE + 1_101,
-            tree: tree(911, 3),
+            combinations: 32,
+            high_bits: 8,
+            window: 1i128 << 17,
             group: GROUP,
-            array_openings: 2,
-            openings: 2,
+            array_oracle: ORACLE_BASE + 1_100,
+            array_shape: shape(910, 6, Digest([0x6A; 32]), 1),
+            unit_oracle: ORACLE_BASE + 1_101,
+            unit_shape: unit,
+            digit_oracle: ORACLE_BASE + 1_102,
+            digit_shape: shape(911, 6, Digest([0x6A; 32]), 32),
+        }
+    }
+
+    fn range_message(root: u8, answer: u64) -> RequestWMessage {
+        use zkie_engine::pcs::request::table::SampleSeed;
+        RequestWMessage {
+            root: Digest([root; 32]),
+            sample: SendSamples {
+                seed: vec![SampleSeed {
+                    z: vec![Fp3::from_u64(2); 8],
+                    beta: Fp3::ONE,
+                }],
+                answers: vec![Fp3::from_u64(answer)],
+            },
         }
     }
 
     #[test]
     fn the_range_messages_are_plan_gated_and_round_trip() {
-        use crate::proof::packed_matrix::{
-            combination_values, commit_packed_array, commit_range_values, pack_columns,
-            RangeMessage,
-        };
         let (mut plan, messages, _) = member_run();
         let range = range_plan();
-        // The matrix cells are small nonnegative integers, so the packing and
-        // the digit split are the integer identities.
-        let cells: Vec<i128> = (1..=(MATRIX_ROWS * COLUMNS) as i128).collect();
-        let packed = pack_columns(&cells, &range.matrix).unwrap();
-        let salts = vec![vec![0x3C; SALT]; range.array_tree.columns() as usize];
-        let array =
-            commit_packed_array(&range.matrix, &packed, range.array_tree.clone(), &salts).unwrap();
-        let positions = [0u64, 2];
-        let array_message = RangeMessage {
-            tree: range.array_tree.clone(),
-            root: *array.root(),
-            positions: positions.to_vec(),
-            opening: array.open(&positions).unwrap(),
-        };
-        let coefficients = vec![1i128; MATRIX_ROWS as usize];
-        let values = combination_values(&range.matrix, &cells, &coefficients, 5).unwrap();
-        let mut stored = Vec::with_capacity(values.len() * 2);
-        for plane in 0..2u64 {
-            for value in &values {
-                let digits = range.combination.split(*value).unwrap();
-                stored.push(if plane == 0 { digits.0 } else { digits.1 });
-            }
-        }
-        let salts = vec![vec![0x4D; SALT]; range.tree.columns() as usize];
-        let (_, combination_message) =
-            commit_range_values(&range.combination, &stored, range.tree.clone(), &salts, &[0, 3])
-                .unwrap();
-        // The plan carries the range objects and the message carries both
-        // arrays; the wire form round-trips under the same plan.
+        // The plan carries the range objects and each message carries its root
+        // and sample answers; the wire form round-trips under the same plan.
         plan.send.range = Some(range.clone());
         let mut with_range = messages.clone();
-        with_range.first.packed_array = Some(array_message.clone());
-        with_range.first.range = Some(combination_message.clone());
+        with_range.first.range_array = Some(range_message(0x31, 3));
+        with_range.first.range_units = Some(range_message(0x32, 5));
+        with_range.first.range_digits = Some(range_message(0x33, 7));
         let bytes = with_range.first.encode().unwrap();
         let decoded = super::HiddenSendMessages::decode(&plan.send, None, None, &bytes).unwrap();
-        assert_eq!(decoded.packed_array, Some(array_message.clone()));
-        assert_eq!(decoded.range, Some(combination_message.clone()));
+        assert_eq!(decoded.range_array, with_range.first.range_array);
+        assert_eq!(decoded.range_units, with_range.first.range_units);
+        assert_eq!(decoded.range_digits, with_range.first.range_digits);
         // A plan without the range objects does not expect the bytes and
         // refuses the encoding; a plan with them refuses a message without.
         let mut without = plan.clone();
@@ -25622,10 +26595,9 @@ mod merged_tests {
         assert!(super::HiddenSendMessages::decode(&without.send, None, None, &bytes).is_err());
         let bytes = messages.first.encode().unwrap();
         assert!(super::HiddenSendMessages::decode(&plan.send, None, None, &bytes).is_err());
-        // A changed tree, an empty root and a changed position count are
-        // refused before the range message is used.
+        // A zero root and a sample of another answer count are refused.
         let mut changed = with_range.clone();
-        changed.first.packed_array.as_mut().unwrap().tree.tree_number = 912;
+        changed.first.range_array.as_mut().unwrap().root = Digest::ZERO;
         assert!(super::HiddenSendMessages::decode(
             &plan.send,
             None,
@@ -25634,7 +26606,7 @@ mod merged_tests {
         )
         .is_err());
         let mut changed = with_range.clone();
-        changed.first.range.as_mut().unwrap().root = Digest::ZERO;
+        changed.first.range_units.as_mut().unwrap().sample.answers.clear();
         assert!(super::HiddenSendMessages::decode(
             &plan.send,
             None,
@@ -25642,27 +26614,11 @@ mod merged_tests {
             &changed.first.encode().unwrap()
         )
         .is_err());
-        let mut changed = with_range.clone();
-        let count = changed.first.packed_array.as_mut().unwrap().positions.len();
-        changed
-            .first
-            .packed_array
-            .as_mut()
-            .unwrap()
-            .positions
-            .truncate(count - 1);
-        assert!(super::HiddenSendMessages::decode(
-            &plan.send,
-            None,
-            None,
-            &changed.first.encode().unwrap()
-        )
-        .is_err());
-        // The range geometry must be the matrix's: another row count is
-        // refused by the plan before the message is read.
+        // The range geometry is the matrix the functional reads: another
+        // column count is refused by the plan before the message is read.
         let mut changed = plan.clone();
         changed.send.range.as_mut().unwrap().matrix =
-            crate::proof::packed_matrix::PackedMatrixPlan::new(MATRIX_ROWS + 2, COLUMNS).unwrap();
+            crate::proof::packed_matrix::PackedMatrixPlan::new(COLUMNS, MATRIX_ROWS + 2).unwrap();
         assert!(super::HiddenSendMessages::decode(
             &changed.send,
             None,
@@ -25670,7 +26626,182 @@ mod merged_tests {
             &with_range.first.encode().unwrap()
         )
         .is_err());
+        // The reduced read table's message is the member's tree: another tree
+        // is refused.
+        let mut changed = plan.clone();
+        changed.send.range.as_mut().unwrap().unit_shape.tree_number = 501;
+        assert!(changed.send.validate().is_err());
     }
+
+    #[test]
+    fn the_range_relations_hold_on_the_committed_messages() {
+        use crate::proof::packed_matrix::PACK_BASE;
+        use zkie_engine::pcs::request::bat::BatRow;
+        let activation = activation();
+        let (mut plan, _) = member_plan_for(&activation);
+        plan.send.range = Some(range_plan());
+        let range = plan.send.range.as_ref().unwrap();
+        let member = plan.send.member.as_ref().unwrap();
+        // The table's cells, row-major: two rows of four.
+        let cells: [i128; 8] = [3, -1, 2, -4, -2, 5, -3, 1];
+        let unit = |row: usize, column: usize| cells[row * 4 + column];
+        // The read table's entries: row r, run q of two columns.
+        let table = &member.tables[0];
+        let phi = table.phi.clone();
+        let cells_field: Vec<Fp3> = cells
+            .iter()
+            .map(|value| {
+                Fp3::from_base(crate::proof::column_session::fp_from_signed_word(
+                    *value as i64 as u64,
+                ))
+            })
+            .collect();
+        let units = crate::proof::hidden_member::table_entries(
+            &cells_field,
+            table.rows_per_part,
+            table.columns,
+            table.run_length,
+            &phi,
+        )
+        .unwrap();
+        // The combination matrix and its digits.
+        let combinations = range.combinations as usize;
+        let rows_cell = range.matrix.rows as usize;
+        let columns_cell = range.matrix.columns as usize;
+        let cf: Vec<i8> = (0..columns_cell * combinations)
+            .map(|index| [1i8, -1, 0][(index * 7 + 3) % 3])
+            .collect();
+        let mut z = vec![0i128; combinations * rows_cell];
+        for (c, coefficient) in cf.chunks(combinations).enumerate() {
+            for (u, coefficient) in coefficient.iter().enumerate() {
+                for i in 0..rows_cell {
+                    z[u * rows_cell + i] += (*coefficient as i128) * unit(c, i);
+                }
+            }
+        }
+        let mut digits = vec![Fp3::ZERO; range.digit_columns().unwrap() as usize];
+        for u in 0..combinations {
+            for i in 0..rows_cell {
+                let (low, high) = range
+                    .combination
+                    .split_window(z[u * rows_cell + i] + range.window, range.high_bits)
+                    .unwrap();
+                digits[range.digit_dense(0, i as u64, u as u32).unwrap() as usize] =
+                    Fp3::from_u64(low as u64);
+                digits[range.digit_dense(1, i as u64, u as u32).unwrap() as usize] =
+                    Fp3::from_u64(high as u64);
+            }
+        }
+        // The packed symbol array of the transpose.
+        let mut packed = vec![0i128; range.array_entries().unwrap() as usize];
+        for s in 0..range.matrix.groups as usize {
+            for c in 0..columns_cell {
+                let mut value = 0i128;
+                let mut scale = 1i128;
+                for lane in 0..3usize {
+                    let i = 3 * s + lane;
+                    if i >= rows_cell {
+                        break;
+                    }
+                    value += scale * unit(c, i);
+                    scale *= PACK_BASE;
+                }
+                packed[s * columns_cell + c] = value;
+            }
+        }
+        let mut array = vec![Fp3::ZERO; range.array_columns().unwrap() as usize];
+        for (slot, value) in array.iter_mut().zip(&packed) {
+            *slot = Fp3::from_base(crate::proof::column_session::fp_from_signed_word(
+                *value as i64 as u64,
+            ));
+        }
+        let mut units_dense = vec![Fp3::ZERO; units.len().next_power_of_two()];
+        units_dense[..units.len()].copy_from_slice(&units);
+        let theta = Fp3::from_u64(7);
+        let rows =
+            super::range_relation_rows(&plan.send, member, 5, theta, &cf).unwrap();
+        // Evaluate every row on the committed message entries.
+        let mut virtual_of = |shape: &WShape, dense: &[Fp3], len: usize| {
+            let mut map = std::collections::BTreeMap::new();
+            for index in 0..len as u64 {
+                if index as usize >= dense.len() {
+                    break;
+                }
+                let virtual_index =
+                    crate::proof::request_chain::RangePlan::message_virtual(shape, index).unwrap();
+                map.insert(virtual_index, dense[index as usize]);
+            }
+            map
+        };
+        let array_map = virtual_of(&range.array_shape, &array, range.array_shape.main_rows as usize * range.array_shape.code.ell as usize);
+        let unit_map = virtual_of(&range.unit_shape, &units_dense, range.unit_shape.main_rows as usize * range.unit_shape.code.ell as usize);
+        let digit_map = virtual_of(&range.digit_shape, &digits, digits.len());
+        let value_at = |oracle: u64, index: u64| -> Fp3 {
+            if oracle == range.array_oracle {
+                *array_map.get(&index).unwrap_or(&Fp3::ZERO)
+            } else if oracle == range.unit_oracle {
+                *unit_map.get(&index).unwrap_or(&Fp3::ZERO)
+            } else {
+                *digit_map.get(&index).unwrap_or(&Fp3::ZERO)
+            }
+        };
+        let evaluate = |row: &BatRow| -> Fp3 {
+            let mut sum = Fp3::ZERO;
+            for unit in &row.units {
+                sum = sum.add(&unit.coefficient.mul(&value_at(unit.oracle, unit.index)));
+            }
+            sum
+        };
+        for row in &rows {
+            assert_eq!(evaluate(row), row.target);
+        }
+        // A changed digit, packed symbol or read entry breaks a relation.
+        let mut changed_digits = digits.clone();
+        let low = range.digit_dense(0, 0, 0).unwrap() as usize;
+        changed_digits[low] = changed_digits[low].add(&Fp3::ONE);
+        let digit_map_changed =
+            virtual_of(&range.digit_shape, &changed_digits, changed_digits.len());
+        let breaks = |map: &std::collections::BTreeMap<u64, Fp3>| -> bool {
+            rows.iter().any(|row| {
+                let mut sum = Fp3::ZERO;
+                for unit in &row.units {
+                    let value = if unit.oracle == range.digit_oracle {
+                        *map.get(&unit.index).unwrap_or(&Fp3::ZERO)
+                    } else {
+                        value_at(unit.oracle, unit.index)
+                    };
+                    sum = sum.add(&unit.coefficient.mul(&value));
+                }
+                sum != row.target
+            })
+        };
+        assert!(breaks(&digit_map_changed));
+        let mut changed_array = array.clone();
+        changed_array[0] = changed_array[0].add(&Fp3::ONE);
+        let array_map_changed =
+            virtual_of(&range.array_shape, &changed_array, range.array_shape.main_rows as usize * range.array_shape.code.ell as usize);
+        assert!(breaks(&array_map_changed));
+        let mut changed_units = units_dense.clone();
+        changed_units[0] = changed_units[0].add(&Fp3::ONE);
+        let unit_map_changed =
+            virtual_of(&range.unit_shape, &changed_units, range.unit_shape.main_rows as usize * range.unit_shape.code.ell as usize);
+        assert!(breaks(&unit_map_changed));
+        // Another combination matrix changes the ties and the reads.
+        let mut other_cf = cf.clone();
+        for entry in other_cf.iter_mut() {
+            *entry = -(*entry);
+        }
+        let other_rows =
+            super::range_relation_rows(&plan.send, member, 5, theta, &other_cf).unwrap();
+        assert!(other_rows.iter().zip(&rows).any(|(a, b)| {
+            a.units
+                .iter()
+                .map(|unit| unit.coefficient)
+                .ne(b.units.iter().map(|unit| unit.coefficient))
+                || a.target != b.target
+        }));
+    }
+
 
     /// The first-stage codes the planner solves for the staged member fixture:
     /// the joint tails the member layout needs (main 106, mask 54) on the
@@ -26131,10 +27262,12 @@ mod merged_tests {
         let mut chain = first_chain(plan, reader)?;
         absorb_group(&mut chain, &messages.group)?;
         absorb_claim(&mut chain, plan)?;
-        match (&plan.send.member, &messages.reduction_root) {
-            (Some(member), Some(root)) => absorb_reduction_root(&mut chain, member, root)?,
-            (None, None) => {}
-            _ => return Err(Error::InvalidConfig),
+        if plan.send.range.is_none() {
+            match (&plan.send.member, &messages.reduction_root) {
+                (Some(member), Some(root)) => absorb_reduction_root(&mut chain, member, root)?,
+                (None, None) => {}
+                _ => return Err(Error::InvalidConfig),
+            }
         }
         // The at_start index-mask root is fixed before the segment's
         // challenges, then the segment's own mask table.
@@ -26149,6 +27282,45 @@ mod merged_tests {
             super::absorb_chain_mask_answer(&mut chain, answer)?;
             let positions = super::draw_chain_mask_positions(&mut chain, chain_plan)?;
             let _opening = witness.tree.open(&positions)?;
+        }
+        if let Some(range_plan) = &plan.send.range {
+            // The fixture's table is zero, so the packed symbol array is the
+            // zero vector; the commit and the sample are deterministic from
+            // the shape and the seed, as in the session.
+            let values = vec![
+                Fp3::ZERO;
+                usize::try_from(range_plan.array_columns()?).map_err(|_| Error::ResourceLimit)?
+            ];
+            let (witness, mut message) = super::commit_range_message(
+                range_plan,
+                &range_plan.array_shape,
+                range_plan.array_oracle,
+                &values,
+                &seed,
+                7,
+            )?;
+            super::absorb_range_root(
+                &mut chain,
+                28,
+                range_plan,
+                &range_plan.array_shape,
+                range_plan.array_oracle,
+                &message.root,
+            )?;
+            let seeds = super::draw_seed_set(
+                &mut chain,
+                range_plan.array_shape.sample_bits()?,
+                range_plan.array_shape.answers,
+            )?;
+            let answers = super::range_sample_answers(
+                &range_plan.array_shape,
+                range_plan.array_oracle,
+                range_plan.group,
+                &witness.committed,
+                &seeds,
+            )?;
+            super::absorb_range_answers(&mut chain, 29, &answers)?;
+            message.sample = super::SendSamples { seed: seeds, answers };
         }
         Ok(chain)
     }
@@ -26354,6 +27526,19 @@ mod merged_tests {
             shown: vec![index_entry],
         };
         let empty_cells: [Vec<Fp3>; 0] = [];
+        // The plan carries the chain and its range objects before the first
+        // manual prefix, so every chain the fixture builds has the same
+        // messages as the session.
+        let shape = RequestChainShape {
+            token_rounds: point.len(),
+            token_ends: 1,
+            stack_rounds: reduction.lam as usize,
+            stack_ends: 3,
+            merge_rounds: layout.lk as usize,
+            merge_ends: 1,
+        };
+        plan.send.request_chain = Some(shape);
+        plan.send.range = Some(range_plan());
         let mask_inputs = ChainInputs {
             token_point: &point,
             token_shown: &token_shown,
@@ -26443,15 +27628,6 @@ mod merged_tests {
             index_oracle: index.oracle,
             index_slot: index_slot as u64,
         };
-        let shape = RequestChainShape {
-            token_rounds: point.len(),
-            token_ends: 1,
-            stack_rounds: reduction.lam as usize,
-            stack_ends: 3,
-            merge_rounds: layout.lk as usize,
-            merge_ends: 1,
-        };
-        plan.send.request_chain = Some(shape);
         let mut chain = segment_chain(&plan, &table.reader, &setup_messages, &inputs, seed).unwrap();
         let (section, proven) = {
             let mut challenges = super::ChainSegmentChallenges { chain: &mut chain };
@@ -26691,6 +27867,71 @@ mod merged_tests {
             &inputs,
         )
         .is_err());
+        // The three range objects are real messages of the segment: a missing
+        // one, a changed root, a changed sample answer and a read table root
+        // that differs from the first message's reduction root are refused.
+        let mut missing_array = messages.clone();
+        missing_array.first.range_array = None;
+        assert!(super::verify_hidden_lin_hidden_with_chain_segment(
+            &plan,
+            &verifier_table.reader,
+            &missing_array,
+            &inputs,
+        )
+        .is_err());
+        let mut missing_units = messages.clone();
+        missing_units.first.range_units = None;
+        assert!(super::verify_hidden_lin_hidden_with_chain_segment(
+            &plan,
+            &verifier_table.reader,
+            &missing_units,
+            &inputs,
+        )
+        .is_err());
+        let mut missing_digits = messages.clone();
+        missing_digits.first.range_digits = None;
+        assert!(super::verify_hidden_lin_hidden_with_chain_segment(
+            &plan,
+            &verifier_table.reader,
+            &missing_digits,
+            &inputs,
+        )
+        .is_err());
+        let mut changed_array = messages.clone();
+        changed_array.first.range_array.as_mut().unwrap().root = Digest([0x5D; 32]);
+        assert!(super::verify_hidden_lin_hidden_with_chain_segment(
+            &plan,
+            &verifier_table.reader,
+            &changed_array,
+            &inputs,
+        )
+        .is_err());
+        let mut changed_answer = messages.clone();
+        let range_answer = changed_answer
+            .first
+            .range_digits
+            .as_ref()
+            .unwrap()
+            .sample
+            .answers[0]
+            .add(&Fp3::ONE);
+        changed_answer.first.range_digits.as_mut().unwrap().sample.answers[0] = range_answer;
+        assert!(super::verify_hidden_lin_hidden_with_chain_segment(
+            &plan,
+            &verifier_table.reader,
+            &changed_answer,
+            &inputs,
+        )
+        .is_err());
+        let mut changed_reduction = messages.clone();
+        changed_reduction.first.reduction_root = Some(Digest([0x5E; 32]));
+        assert!(super::verify_hidden_lin_hidden_with_chain_segment(
+            &plan,
+            &verifier_table.reader,
+            &changed_reduction,
+            &inputs,
+        )
+        .is_err());
         // The terminal values ride the Y/rowS relations: a changed stack end
         // value or a changed source cell is refused.
         let mut changed_terminal = messages.clone();
@@ -26796,6 +28037,7 @@ mod merged_tests {
             merge_rounds: 2,
             merge_ends: 1,
         });
+        plan.send.range = Some(range_plan());
         plan.validate().unwrap();
         let parameters = super::RequestParameters::derive(&plan.send)
             .unwrap()
@@ -26823,8 +28065,8 @@ mod merged_tests {
         assert_eq!(layout.get("stack_rounds").unwrap(), 1);
         assert_eq!(layout.get("merge_rounds").unwrap(), 2);
         assert_eq!(layout.get("opening_budget").unwrap(), 9);
-        assert_eq!(layout.get("sample_plan").unwrap(), 4);
-        assert_eq!(layout.get("tree_layout").unwrap(), 10);
+        assert_eq!(layout.get("sample_plan").unwrap(), 7);
+        assert_eq!(layout.get("tree_layout").unwrap(), 13);
         assert_eq!(layout.get("stage_plan").unwrap(), 0);
         // The derivation is from shapes: a zero-row W message and a source
         // cell outside the committed table are refused.

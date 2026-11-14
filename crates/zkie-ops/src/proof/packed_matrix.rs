@@ -9,11 +9,12 @@
 //! `ceil(rows / 3)` and the number of columns is kept.
 //!
 //! The packing is an integer identity, not a field reduction: every cell must
-//! be in `[0, 2^20)` so that the packed value is injective and below
-//! `2^60`, and a cell outside that range is refused instead of being reduced
-//! into the field. The plan fixes the geometry before any challenge; the
-//! verifier consumes the packed array through the same plan and never
-//! receives the original cells.
+//! be in `(-2^18, 2^18)`, the range on which three signed cells packed at
+//! radix `2^20` stay injective, and a cell outside that range is refused
+//! instead of being reduced into the field. A signed value is embedded as its
+//! two's-complement field element. The plan fixes the geometry before any
+//! challenge; the verifier consumes the packed array through the same plan
+//! and never receives the original cells.
 
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
@@ -23,10 +24,18 @@ use zkie_engine::pcs::request::runtime_tree::{
     verify_runtime_opening, RuntimePartRows, RuntimeTree, RuntimeTreeOpening, RuntimeTreePlan,
 };
 
+use crate::proof::column_session::fp_from_signed_word;
+
 /// The base of the packing digit, `2^20`.
 pub const PACK_BASE: i128 = 1 << 20;
 /// The rows one packed group may hold.
 pub const PACK_ROWS: u64 = 3;
+/// The cell count of the window: a cell is a signed integer with
+/// `|cell| < 2^CELL_BITS`. Four lanes would break injectivity.
+pub const CELL_BITS: u32 = 18;
+pub const CELL_BOUND: i128 = 1 << CELL_BITS;
+/// The field modulus's low 64-bit word, `2^64 - 2^32 + 1`.
+const MODULUS_WORD: u64 = 0xFFFF_FFFF_0000_0001;
 
 /// The geometry of one packed symbol array: the original matrix's rows and
 /// columns, the group count and the packed value bound.
@@ -62,15 +71,32 @@ impl PackedMatrixPlan {
         Ok((group, column))
     }
 
-    /// The largest packed value the plan admits, `2^60 - 1`.
+    /// The largest absolute packed value the plan admits,
+    /// `(2^18 - 1) (1 + B + B^2)`.
     pub fn packed_bound(&self) -> i128 {
-        PACK_BASE * PACK_BASE * PACK_BASE - 1
+        (CELL_BOUND - 1) * (1 + PACK_BASE + PACK_BASE * PACK_BASE)
     }
 }
 
-/// Packs the row-major integer cells of the matrix into the symbol array,
-/// row-major over `(group, column)`. Each cell must be in `[0, 2^20)`; the
-/// last group holds only the valid rows. No field reduction is applied.
+/// The signed integer a table cell holds. Cells are embedded as signed
+/// words; a value outside the cell window is refused.
+pub fn signed_cell(value: Fp) -> Result<i128> {
+    let raw = value.as_canonical_u64();
+    let cell: i128 = if raw <= (1u64 << 63) {
+        raw as i128
+    } else {
+        -((MODULUS_WORD.wrapping_sub(raw)) as i128)
+    };
+    if cell <= -CELL_BOUND || cell >= CELL_BOUND {
+        return Err(Error::BoundViolation);
+    }
+    Ok(cell)
+}
+
+/// Packs the row-major signed integer cells of the matrix into the symbol
+/// array, row-major over `(group, column)`. Each cell must be in
+/// `(-2^18, 2^18)`; the last group holds only the valid rows. No field
+/// reduction is applied.
 pub fn pack_columns(cells: &[i128], plan: &PackedMatrixPlan) -> Result<Vec<i128>> {
     let rows = usize::try_from(plan.rows).map_err(|_| Error::ResourceLimit)?;
     let columns = usize::try_from(plan.columns).map_err(|_| Error::ResourceLimit)?;
@@ -80,7 +106,7 @@ pub fn pack_columns(cells: &[i128], plan: &PackedMatrixPlan) -> Result<Vec<i128>
         return Err(Error::ShapeMismatch);
     }
     for cell in cells {
-        if *cell < 0 || *cell >= PACK_BASE {
+        if *cell <= -CELL_BOUND || *cell >= CELL_BOUND {
             return Err(Error::BoundViolation);
         }
     }
@@ -105,8 +131,9 @@ pub fn pack_columns(cells: &[i128], plan: &PackedMatrixPlan) -> Result<Vec<i128>
 
 
 /// Commits the packed values under the plan's tree: one main row of the packed
-/// entries, padded with zeros to the tree's columns. The values are integers
-/// in `[0, 2^60)` embedded as base-field elements; no packed value is reduced.
+/// entries, padded with zeros to the tree's columns. The values are signed
+/// integers of absolute value at most `packed_bound`, embedded as
+/// two's-complement base-field elements; no packed value is reduced.
 pub fn commit_packed_array(
     plan: &PackedMatrixPlan,
     values: &[i128],
@@ -121,7 +148,7 @@ pub fn commit_packed_array(
         return Err(Error::ShapeMismatch);
     }
     for value in values {
-        if *value < 0 || *value > plan.packed_bound() {
+        if value.abs() > plan.packed_bound() {
             return Err(Error::BoundViolation);
         }
     }
@@ -131,7 +158,7 @@ pub fn commit_packed_array(
     }
     let mut row = vec![Fp3::ZERO; columns];
     for (slot, value) in row.iter_mut().zip(values) {
-        *slot = Fp3::from_base(fp_from_u64(*value as u64));
+        *slot = Fp3::from_base(fp_from_signed_word(*value as i64 as u64));
     }
     let parts = [RuntimePartRows {
         main: vec![row],
@@ -167,11 +194,19 @@ pub fn verify_packed_opening(
         if value.c[1] != Fp::ZERO || value.c[2] != Fp::ZERO {
             return Err(Error::InvalidProof);
         }
-        let packed = value.c[0].as_canonical_u64();
-        if packed > plan.packed_bound() as u64 {
+        // The field element of a negative value is `p - |value|`; the
+        // modulus's low word is `2^64 - 2^32 + 1`, so the magnitude comes
+        // back by subtracting from that word.
+        let raw = value.c[0].as_canonical_u64();
+        let packed: i128 = if raw <= (1u64 << 63) {
+            raw as i128
+        } else {
+            -((MODULUS_WORD.wrapping_sub(raw)) as i128)
+        };
+        if packed.abs() > plan.packed_bound() {
             return Err(Error::BoundViolation);
         }
-        values.push(packed as i128);
+        values.push(packed);
     }
     Ok(values)
 }
@@ -179,7 +214,6 @@ pub fn verify_packed_opening(
 #[cfg(test)]
 mod commit_tests {
     use super::*;
-    use zkie_engine::pcs::request::code::build_code_plan;
 
     pub(crate) fn tree() -> RuntimeTreePlan {
         RuntimeTreePlan {
@@ -234,7 +268,7 @@ mod commit_tests {
 
 #[cfg(test)]
 pub(crate) fn tests_cells() -> Vec<i128> {
-    vec![1, 2, 3, 4, 5, 6, 7, 8]
+    vec![1, -2, 3, 4, 5, -6, 7, 8]
 }
 
 
@@ -299,6 +333,28 @@ impl RangeCombinationPlan {
         let low = value % base;
         let high = value / base;
         if low + base * high != value {
+            return Err(Error::BoundViolation);
+        }
+        Ok((low, high))
+    }
+
+    /// Splits a window value `Z + 2^LBZ` into its low and high digits. The
+    /// value must lie in `[0, 2^(low_bits + high_bits))`; the high digit must
+    /// fit its own width. A value outside the window is refused rather than
+    /// reduced.
+    pub fn split_window(&self, value: i128, high_bits: u32) -> Result<(i128, i128)> {
+        if high_bits == 0 || self.low_bits.checked_add(high_bits).is_none() {
+            return Err(Error::InvalidConfig);
+        }
+        let total = self.low_bits + high_bits;
+        if total >= 62 {
+            return Err(Error::InvalidConfig);
+        }
+        if value < 0 || value >= (1i128 << total) {
+            return Err(Error::BoundViolation);
+        }
+        let (low, high) = self.split(value)?;
+        if high >= (1i128 << high_bits) {
             return Err(Error::BoundViolation);
         }
         Ok((low, high))
@@ -447,9 +503,9 @@ mod tests {
 
     fn cells() -> Vec<i128> {
         vec![
-            1, 2, // row 0
+            1, -2, // row 0
             3, 4, // row 1
-            5, 6, // row 2
+            -5, 6, // row 2
             7, 8, // row 3
         ]
     }
@@ -459,14 +515,14 @@ mod tests {
         let plan = PackedMatrixPlan::new(4, 2).unwrap();
         assert_eq!(plan.groups, 2);
         let packed = pack_columns(&cells(), &plan).unwrap();
-        // Group 0 packs rows 0..3: 1 + B*3 + B^2*5 and 2 + B*4 + B^2*6.
+        // Group 0 packs rows 0..3: 1 + B*3 + B^2*(-5) and -2 + B*4 + B^2*6.
         let b = PACK_BASE;
-        assert_eq!(packed[0], 1 + b * 3 + b * b * 5);
-        assert_eq!(packed[1], 2 + b * 4 + b * b * 6);
+        assert_eq!(packed[0], 1 + b * 3 - b * b * 5);
+        assert_eq!(packed[1], -2 + b * 4 + b * b * 6);
         // Group 1 holds the single valid row 3.
         assert_eq!(packed[2], 7);
         assert_eq!(packed[3], 8);
-        assert!(packed.iter().all(|value| *value <= plan.packed_bound()));
+        assert!(packed.iter().all(|value| value.abs() <= plan.packed_bound()));
         assert_eq!(plan.position(1, 1).unwrap(), (1, 1));
         assert!(plan.position(2, 0).is_err());
         assert!(plan.position(0, 2).is_err());
@@ -490,6 +546,18 @@ mod tests {
         assert_eq!(high, 9);
         assert_eq!(low + plan.digit_base() * high, value);
         assert_eq!(plan.split(-1).unwrap_err(), Error::BoundViolation);
+        // The window value Z + 2^LBZ splits into the two digit widths.
+        let window = RangeCombinationPlan::new(4, 2, 10, 0).unwrap();
+        assert_eq!(window.split_window(1 << 17, 8).unwrap(), (0, 128));
+        assert_eq!(window.split_window(0, 8).unwrap(), (0, 0));
+        assert_eq!(
+            window.split_window(1 << 18, 8).unwrap_err(),
+            Error::BoundViolation
+        );
+        assert_eq!(
+            window.split_window(-1, 8).unwrap_err(),
+            Error::BoundViolation
+        );
         assert!(RangeCombinationPlan::new(0, 1, 20, 0).is_err());
         assert!(RangeCombinationPlan::new(1, 0, 20, 0).is_err());
         assert!(RangeCombinationPlan::new(1, 1, 0, 0).is_err());
@@ -532,14 +600,26 @@ mod tests {
     fn out_of_range_cells_and_wrong_sizes_are_refused() {
         let plan = PackedMatrixPlan::new(4, 2).unwrap();
         let mut large = cells();
-        large[0] = PACK_BASE;
+        large[0] = CELL_BOUND;
         assert_eq!(pack_columns(&large, &plan).unwrap_err(), Error::BoundViolation);
         let mut negative = cells();
-        negative[3] = -1;
+        negative[3] = -CELL_BOUND;
         assert_eq!(
             pack_columns(&negative, &plan).unwrap_err(),
             Error::BoundViolation
         );
+        // A cell inside the window keeps its sign through the packing and the
+        // commitment.
+        let mut signed = cells();
+        signed[0] = -1;
+        let packed = pack_columns(&signed, &plan).unwrap();
+        let tree = super::commit_tests::tree();
+        let salts = super::commit_tests::salts();
+        let committed = commit_packed_array(&plan, &packed, tree.clone(), &salts).unwrap();
+        let opening = committed.open(&[0u64]).unwrap();
+        let values =
+            verify_packed_opening(&plan, &tree, committed.root(), &[0], &opening).unwrap();
+        assert_eq!(values, vec![packed[0]]);
         assert_eq!(
             pack_columns(&cells()[..7], &plan).unwrap_err(),
             Error::ShapeMismatch
