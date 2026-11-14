@@ -5349,6 +5349,64 @@ impl HiddenLinPlan {
             let _ = reason;
             return Err(Error::InvalidConfig);
         }
+        // When the chain carries the consumer's member relation, the index-mask
+        // message is the at_start message: it is sent in the first prover
+        // message, rides in no group of the frame, and shares no leaf with any
+        // other message or stage tree. Its mask entries must cover the pending
+        // claims' slots besides the allocation that the Eval masks use.
+        if let Some(member) = &self.send.member {
+            let index = self.send.index_mask.as_ref().ok_or(Error::InvalidConfig)?;
+            if self.norm.is_some() {
+                return Err(Error::UnsupportedPrimitive);
+            }
+            if index.mask_code != self.proximity.mask_code {
+                return Err(Error::InvalidConfig);
+            }
+            let total = index.entries.total().map_err(|_| Error::InvalidConfig)?;
+            let free = index.free_entries().map_err(|_| Error::InvalidConfig)?;
+            let needed = member.pending.masks.len();
+            if total
+                .checked_add(needed)
+                .map(|used| used > free)
+                .unwrap_or(true)
+            {
+                return Err(Error::InvalidConfig);
+            }
+            for term in &member.pending.masks {
+                let slot = usize::try_from(term.slot).map_err(|_| Error::ResourceLimit)?;
+                if slot < total || slot >= free {
+                    return Err(Error::InvalidConfig);
+                }
+            }
+            let mut most = self.send.w.leaf_class;
+            most = most.max(
+                self.send
+                    .dot
+                    .as_ref()
+                    .map_or(0, |dot| dot.shape.leaf_class),
+            );
+            most = most.max(self.proximity.gu.tree.leaf_class);
+            most = most.max(self.proximity.omega.tree.leaf_class);
+            most = most.max(self.proximity.shared_mask_tree.leaf_class);
+            most = most.max(self.proximity.own_mask_tree.leaf_class);
+            most = most.max(member.tree.leaf_class);
+            if let Some(closure) = &self.closure {
+                most = most.max(closure.slack.leaf_class);
+                most = most.max(closure.bits.leaf_class);
+                most = most.max(closure.map.leaf_class);
+                most = most.max(closure.mask.tree.leaf_class);
+            }
+            if !self.proximity.shared_stages.is_empty()
+                || !self.proximity.own_stages.is_empty()
+            {
+                most = most.max(crate::proof::multi_stage_iopp::IOPP_SWITCH_LEAF_CLASS);
+                most = most.max(crate::proof::multi_stage_iopp::IOPP_MASK_LEAF_CLASS);
+                most = most.max(crate::proof::proximity_iopp::PROXIMITY_BASE_STAR_LEAF_CLASS);
+            }
+            if index.tree.leaf_class <= most {
+                return Err(Error::InvalidConfig);
+            }
+        }
         if self.output_relation == Some(Digest::ZERO) {
             return Err(Error::InvalidConfig);
         }

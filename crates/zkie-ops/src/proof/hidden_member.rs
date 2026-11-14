@@ -458,6 +458,58 @@ pub struct ReductionRead {
     pub weights: Vec<Fp3>,
 }
 
+/// The reads of the reduced witness as one plan object: the caller fixes the
+/// per-entry weights, and the set is checked against the tables' geometry and
+/// coverage before any read is used.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReductionReadSet {
+    reads: Vec<ReductionRead>,
+}
+
+impl ReductionReadSet {
+    pub fn new(reads: Vec<ReductionRead>) -> Self {
+        Self { reads }
+    }
+
+    pub fn reads(&self) -> &[ReductionRead] {
+        &self.reads
+    }
+
+    /// One table's reads, cut into segments of `segment` entries: `weights[i]`
+    /// is the coefficient of entry `first_entry + i`. The caller supplies the
+    /// coefficients in entry order.
+    pub fn segmented(
+        table: usize,
+        first_entry: u64,
+        segment: u64,
+        weights: &[Fp3],
+    ) -> Result<Self> {
+        if segment == 0 || weights.is_empty() || weights.len() as u64 % segment != 0 {
+            return Err(Error::InvalidConfig);
+        }
+        let mut reads = Vec::with_capacity(weights.len() / segment as usize);
+        for (index, chunk) in weights.chunks(segment as usize).enumerate() {
+            let offset = (index as u64)
+                .checked_mul(segment)
+                .ok_or(Error::ResourceLimit)?;
+            reads.push(ReductionRead {
+                table,
+                first_entry: first_entry
+                    .checked_add(offset)
+                    .ok_or(Error::ResourceLimit)?,
+                weights: chunk.to_vec(),
+            });
+        }
+        Ok(Self { reads })
+    }
+
+    /// Checks the set against the witness plan: every entry of every table is
+    /// covered exactly once with a non-zero weight, and no read leaves a table.
+    pub fn cover(&self, plan: &ReductionWitnessPlan) -> Result<()> {
+        plan.check_reads(&self.reads)
+    }
+}
+
 /// Where the reduced witness is in its order: built, points set, root
 /// committed, batching challenge drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -953,6 +1005,29 @@ mod tests {
         assert!(table_entries(&cells, 0, 8, 4, &phi).is_err());
         assert!(entry_value(&[], &[]).is_err());
         assert!(entry_value(&[fp(1)], &[fp(1), fp(2)]).is_err());
+    }
+
+    #[test]
+    fn a_read_set_is_checked_against_the_witness() {
+        let mut plan = witness();
+        plan.commit_root(Digest([0x41; 32])).unwrap();
+        let weights: Vec<Fp3> = (0..8).map(|_| fp(2)).collect();
+        let reads = ReductionReadSet::segmented(0, 0, 4, &weights).unwrap();
+        assert_eq!(reads.reads().len(), 2);
+        reads.cover(&plan).unwrap();
+        // A set that stops short of the table's last entry, a read outside the
+        // table and a zero coefficient are each refused.
+        let short = ReductionReadSet::segmented(0, 0, 4, &weights[..4]).unwrap();
+        assert!(short.cover(&plan).is_err());
+        let outside = ReductionReadSet::segmented(0, 4, 4, &weights).unwrap();
+        assert!(outside.cover(&plan).is_err());
+        let mut zero = weights.clone();
+        zero[2] = Fp3::ZERO;
+        let zero = ReductionReadSet::segmented(0, 0, 4, &zero).unwrap();
+        assert!(zero.cover(&plan).is_err());
+        // A segment that does not divide the weight list is not a read set.
+        assert!(ReductionReadSet::segmented(0, 0, 3, &weights).is_err());
+        assert!(ReductionReadSet::segmented(0, 0, 0, &weights).is_err());
     }
 
     #[test]

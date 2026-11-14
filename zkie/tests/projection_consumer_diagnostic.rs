@@ -568,7 +568,7 @@ fn index_mask_plan(positions: u32, mask_code: CodeParams) -> IndexMaskPlan {
         openings: 1,
         tree: RuntimeTreePlan {
             tree_number: INDEX_MASK_TREE,
-            leaf_class: 1,
+            leaf_class: 8,
             log_n: mask_code.log_n,
             log_n_zk: mask_code.log_n,
             parts: vec![RuntimeTreePart {
@@ -755,7 +755,9 @@ fn hidden_plan_for(
         output_relation: None,
         closure: None,
     };
-    plan.send.index_mask = Some(index_mask_plan(positions, mask_code));
+    let index_plan = index_mask_plan(positions, mask_code);
+    let pending_mask_slot = index_plan.entries.total().expect("mask allocation") as u64;
+    plan.send.index_mask = Some(index_plan);
     plan.send.dot = Some(dot_plan(positions, code));
     // The consumer's pending claim and reduced witness. The claim's weights are
     // the first position's activation row over the matrix rows; the tables cut
@@ -771,7 +773,7 @@ fn hidden_plan_for(
         target: Fp3::from_u64(7),
         masks: vec![MaskTerm {
             oracle: INDEX_MASK_ORACLE,
-            slot: 0,
+            slot: pending_mask_slot,
             coeff: Fp3::from_u64(5),
         }],
     };
@@ -927,6 +929,34 @@ fn real_projection_consumer_closes_in_hidden_input_mode() {
     assert!(
         verify_hidden_lin_hidden(&changed_tree, session_table.reader(), &messages).is_err()
     );
+
+    // The at_start mask message shares no leaf class with any other tree, its
+    // mask code is the own group's, and its entries cover the pending slots
+    // besides the Eval allocation.
+    let mut shared_class = hidden_plan.clone();
+    if let Some(index) = shared_class.send.index_mask.as_mut() {
+        index.tree.leaf_class = 7;
+    }
+    assert!(shared_class.validate().is_err());
+    let mut wrong_code = hidden_plan.clone();
+    if let Some(index) = wrong_code.send.index_mask.as_mut() {
+        index.mask_code.r = index.mask_code.r.saturating_add(1);
+    }
+    assert!(wrong_code.validate().is_err());
+    let mut low_slot = hidden_plan.clone();
+    if let Some(member) = low_slot.send.member.as_mut() {
+        for term in &mut member.pending.masks {
+            term.slot = 0;
+        }
+    }
+    assert!(low_slot.validate().is_err());
+    let mut high_slot = hidden_plan.clone();
+    if let Some(member) = high_slot.send.member.as_mut() {
+        for term in &mut member.pending.masks {
+            term.slot = 1_000_000;
+        }
+    }
+    assert!(high_slot.validate().is_err());
 
     // The session slot after the trusted table: the canonical session
     // encoding enters the verification package as session.bin, and the
