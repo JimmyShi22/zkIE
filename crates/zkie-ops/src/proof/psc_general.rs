@@ -42,6 +42,62 @@ pub trait TableAt {
     fn at(&self, point: &[Fp3]) -> Result<Fp3>;
 }
 
+/// One weight panel's end geometry: its offset and width in the stack cube and
+/// its row and entry counts. The end coefficient of a row is the anchor's
+/// `cB = sb * EI[i]`, computed at the end point from this geometry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PanelEnd {
+    pub off: u64,
+    pub w: u32,
+    pub ni: u64,
+    pub ny: u64,
+}
+
+fn panel_ceil_log2(value: u64) -> u32 {
+    if value <= 1 {
+        0
+    } else {
+        64 - (value - 1).leading_zeros()
+    }
+}
+
+fn panel_eq1(coordinate: Fp3, bit: Fp3) -> Fp3 {
+    // (1 - coordinate)(1 - bit) + coordinate * bit
+    Fp3::ONE
+        .sub(&coordinate)
+        .mul(&Fp3::ONE.sub(&bit))
+        .add(&coordinate.mul(&bit))
+}
+
+fn panel_eq_low(point: &[Fp3], lo: usize, hi: usize) -> Vec<Fp3> {
+    let count = 1usize << (hi - lo);
+    let mut table = vec![Fp3::ONE; count];
+    for j in 0..(hi - lo) {
+        for (index, value) in table.iter_mut().enumerate() {
+            let chosen = if (index >> j) & 1 == 1 {
+                point[lo + j]
+            } else {
+                Fp3::ONE.sub(&point[lo + j])
+            };
+            *value = value.mul(&chosen);
+        }
+    }
+    table
+}
+
+fn panel_eq_at(point: &[Fp3], lo: usize, hi: usize, index: u64) -> Fp3 {
+    let mut value = Fp3::ONE;
+    for j in 0..(hi - lo) {
+        let bit = if (index >> j) & 1 == 1 {
+            Fp3::ONE
+        } else {
+            Fp3::ZERO
+        };
+        value = value.mul(&panel_eq1(point[lo + j], bit));
+    }
+    value
+}
+
 /// The summand of a general masked sumcheck.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Summand {
@@ -66,6 +122,11 @@ pub enum Summand {
     /// entry and the same factor. The last round in Y is
     /// `(A* + a1 Y)(B* + b1 Y)` with the masks folded in as the anchor states.
     StackProduct { ku: Vec<Fp3>, kv: Vec<Fp3> },
+    /// `A0 (B0 + sum_panels sum_i cB_i v_i)`: the whole end group is sent as
+    /// A0, B0 and then each weight panel's rows. `cB_i = sb * EI[i]` follows
+    /// from the geometry at the end point, so the weight values stay the
+    /// unpacked row values the anchor sends.
+    PanelProduct { lam: u32, panels: Vec<PanelEnd> },
     /// `sum_t coeff_t * prod_{j in t} y_j`: a sum of products of shown maps.
     ProductSum { terms: Vec<(Fp3, Vec<usize>)> },
 }
@@ -80,6 +141,9 @@ impl Summand {
             Self::Leaves { .. } => 0,
             Self::Map | Self::ShownKept => 1,
             Self::StackProduct { ku, kv } => 2 + ku.len() + kv.len(),
+            Self::PanelProduct { panels, .. } => {
+                2 + panels.iter().map(|panel| panel.ni as usize).sum::<usize>()
+            }
             Self::ProductSum { terms } => terms
                 .iter()
                 .flat_map(|(_, indices)| indices.iter())
@@ -102,7 +166,7 @@ impl Summand {
             Self::Bits => 2,
             Self::Leaves { .. } => 0,
             Self::Map | Self::ShownKept => 1,
-            Self::StackProduct { .. } => 2,
+            Self::StackProduct { .. } | Self::PanelProduct { .. } => 2,
             Self::ProductSum { terms } => terms
                 .iter()
                 .map(|(_, indices)| indices.len())
@@ -140,6 +204,37 @@ impl Summand {
             }
             Self::Map => Ok(vec![shown[0]]),
             Self::ShownKept => Ok(vec![Fp3::ZERO, shown[0]]),
+            Self::PanelProduct { lam, panels } => {
+                if point.len() != *lam as usize {
+                    return Err(Error::ShapeMismatch);
+                }
+                let mut bs = shown[1];
+                let mut index = 2usize;
+                for panel in panels {
+                    let wy = panel_ceil_log2(panel.ny) as usize;
+                    let w = panel.w as usize;
+                    if w < wy || w > *lam as usize {
+                        return Err(Error::InvalidConfig);
+                    }
+                    let sb = if panel.w == *lam {
+                        Fp3::ONE
+                    } else {
+                        panel_eq_at(point, w, *lam as usize, panel.off >> panel.w)
+                    };
+                    let ei = panel_eq_low(point, wy, w);
+                    if ei.len() as u64 != panel.ni {
+                        return Err(Error::InvalidConfig);
+                    }
+                    for coefficient in ei.iter().take(panel.ni as usize) {
+                        bs = bs.add(&sb.mul(coefficient).mul(&shown[index]));
+                        index += 1;
+                    }
+                }
+                if index != shown.len() {
+                    return Err(Error::ShapeMismatch);
+                }
+                Ok(vec![shown[0].mul(&bs)])
+            }
             Self::StackProduct { ku, kv } => {
                 let mut left = shown[0];
                 for (index, coefficient) in ku.iter().enumerate() {
@@ -1775,6 +1870,52 @@ mod tests {
             }
         }
         values
+    }
+
+    #[test]
+    fn the_panel_product_weights_the_group_rows() {
+        let summand = Summand::PanelProduct {
+            lam: 3,
+            panels: vec![PanelEnd {
+                off: 4,
+                w: 2,
+                ni: 2,
+                ny: 2,
+            }],
+        };
+        assert_eq!(summand.shown(), 4);
+        assert_eq!(summand.degree(), 2);
+        let point = [f(3), f(4), f(5)];
+        // sb: the panel sits at offset four, so its offset bits are one and
+        // pair with the point's last coordinate.
+        let sb = f(5);
+        let ey = [Fp3::ONE.sub(&f(4)), f(4)];
+        let shown = [f(2), f(7), f(11), f(13)];
+        let expected = f(2).mul(
+            &f(7)
+                .add(&sb.mul(&ey[0]).mul(&f(11)))
+                .add(&sb.mul(&ey[1]).mul(&f(13))),
+        );
+        assert_eq!(
+            summand
+                .at(&point, &shown, &[], None)
+                .unwrap(),
+            vec![expected]
+        );
+        // The point's width, the group's size and the panel's geometry are
+        // checked.
+        assert!(summand.at(&point[..2], &shown, &[], None).is_err());
+        assert!(summand.at(&point, &shown[..3], &[], None).is_err());
+        let bad = Summand::PanelProduct {
+            lam: 3,
+            panels: vec![PanelEnd {
+                off: 0,
+                w: 0,
+                ni: 1,
+                ny: 2,
+            }],
+        };
+        assert!(bad.at(&point, &[f(1), f(2), f(3)], &[], None).is_err());
     }
 
     #[test]
