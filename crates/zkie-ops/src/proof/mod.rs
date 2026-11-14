@@ -12,6 +12,7 @@ pub mod fold_handoff;
 pub mod group_commitment_session;
 pub mod group_row_session;
 pub mod gu_combine_session;
+pub mod hidden_member;
 pub mod hidden_send_session;
 pub mod hidden_norm;
 pub mod hidden_norm_psc;
