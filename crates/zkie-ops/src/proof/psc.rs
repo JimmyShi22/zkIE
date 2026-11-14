@@ -455,7 +455,7 @@ impl ProductSumcheckProver {
     }
 }
 
-fn product_round(x: &[Fp3], omega: &[Fp3]) -> Result<[Fp3; 3]> {
+pub(crate) fn product_round(x: &[Fp3], omega: &[Fp3]) -> Result<[Fp3; 3]> {
     if x.len() != omega.len() || x.len() % 2 != 0 {
         return Err(Error::ShapeMismatch);
     }
@@ -472,7 +472,7 @@ fn product_round(x: &[Fp3], omega: &[Fp3]) -> Result<[Fp3; 3]> {
     Ok(round)
 }
 
-fn fold_first(values: &mut Vec<Fp3>, challenge: Fp3) -> Result<()> {
+pub(crate) fn fold_first(values: &mut Vec<Fp3>, challenge: Fp3) -> Result<()> {
     if values.len() % 2 != 0 {
         return Err(Error::ShapeMismatch);
     }

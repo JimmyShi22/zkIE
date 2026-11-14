@@ -24,7 +24,8 @@ use zkie_engine::pcs::request::field::Fp3;
 use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
 
 use crate::proof::psc::{
-    hp_entries, hp_form, HidingPolynomial, PointClaim, ProductSumcheckProver, PscRound, Weight,
+    fold_first, hp_entries, hp_form, product_round, HidingPolynomial, PointClaim,
+    ProductSumcheckProver, PscRound, Weight,
 };
 
 /// A source of verifier challenges for a general sumcheck.
@@ -60,6 +61,11 @@ pub enum Summand {
     /// The kept map's value is not sent: its coefficient is the shown value as
     /// it was sent, and it stays a term of the row claim.
     ShownKept,
+    /// `(A0 + sum ku_i u_i)(B0 + sum kv_a v_a)`: the whole end group is sent,
+    /// in the order A0, the u values, B0, the v values, each with its own mask
+    /// entry and the same factor. The last round in Y is
+    /// `(A* + a1 Y)(B* + b1 Y)` with the masks folded in as the anchor states.
+    StackProduct { ku: Vec<Fp3>, kv: Vec<Fp3> },
     /// `sum_t coeff_t * prod_{j in t} y_j`: a sum of products of shown maps.
     ProductSum { terms: Vec<(Fp3, Vec<usize>)> },
 }
@@ -73,6 +79,7 @@ impl Summand {
             Self::Bits => 1,
             Self::Leaves { .. } => 0,
             Self::Map | Self::ShownKept => 1,
+            Self::StackProduct { ku, kv } => 2 + ku.len() + kv.len(),
             Self::ProductSum { terms } => terms
                 .iter()
                 .flat_map(|(_, indices)| indices.iter())
@@ -95,6 +102,7 @@ impl Summand {
             Self::Bits => 2,
             Self::Leaves { .. } => 0,
             Self::Map | Self::ShownKept => 1,
+            Self::StackProduct { .. } => 2,
             Self::ProductSum { terms } => terms
                 .iter()
                 .map(|(_, indices)| indices.len())
@@ -132,6 +140,18 @@ impl Summand {
             }
             Self::Map => Ok(vec![shown[0]]),
             Self::ShownKept => Ok(vec![Fp3::ZERO, shown[0]]),
+            Self::StackProduct { ku, kv } => {
+                let mut left = shown[0];
+                for (index, coefficient) in ku.iter().enumerate() {
+                    left = left.add(&coefficient.mul(&shown[1 + index]));
+                }
+                let base = 1 + ku.len();
+                let mut right = shown[base];
+                for (index, coefficient) in kv.iter().enumerate() {
+                    right = right.add(&coefficient.mul(&shown[base + 1 + index]));
+                }
+                Ok(vec![left.mul(&right)])
+            }
             Self::ProductSum { terms } => {
                 let mut sum = Fp3::ZERO;
                 for (coefficient, indices) in terms {
@@ -155,6 +175,110 @@ pub trait InnerSumcheck {
     fn bind(&mut self, challenge: Fp3) -> Result<()>;
     /// Shown map values first, then kept map values.
     fn end_values(&self) -> Result<Vec<Fp3>>;
+}
+
+/// The stack summand's inner: the aggregated maps' rounds and the whole end
+/// group at the point, with the rest values the anchor sends.
+pub struct StackInner {
+    a0: Vec<Fp3>,
+    u: Vec<Vec<Fp3>>,
+    b0: Vec<Fp3>,
+    v: Vec<Vec<Fp3>>,
+    ku: Vec<Fp3>,
+    kv: Vec<Fp3>,
+}
+
+impl StackInner {
+    pub fn new(
+        a0: &[Fp3],
+        u: &[Vec<Fp3>],
+        b0: &[Fp3],
+        v: &[Vec<Fp3>],
+        ku: Vec<Fp3>,
+        kv: Vec<Fp3>,
+    ) -> Result<Self> {
+        if a0.len() < 2
+            || !a0.len().is_power_of_two()
+            || b0.len() != a0.len()
+            || ku.len() != u.len()
+            || kv.len() != v.len()
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        if u.iter().chain(v.iter()).any(|map| map.len() != a0.len()) {
+            return Err(Error::ShapeMismatch);
+        }
+        Ok(Self {
+            a0: a0.to_vec(),
+            u: u.to_vec(),
+            b0: b0.to_vec(),
+            v: v.to_vec(),
+            ku,
+            kv,
+        })
+    }
+
+    fn left(&self) -> Vec<Fp3> {
+        let mut left = self.a0.clone();
+        for (coefficient, map) in self.ku.iter().zip(&self.u) {
+            for (slot, value) in left.iter_mut().zip(map) {
+                *slot = slot.add(&coefficient.mul(value));
+            }
+        }
+        left
+    }
+
+    fn right(&self) -> Vec<Fp3> {
+        let mut right = self.b0.clone();
+        for (coefficient, map) in self.kv.iter().zip(&self.v) {
+            for (slot, value) in right.iter_mut().zip(map) {
+                *slot = slot.add(&coefficient.mul(value));
+            }
+        }
+        right
+    }
+}
+
+impl InnerSumcheck for StackInner {
+    fn round(&self) -> Result<Vec<Fp3>> {
+        Ok(product_round(&self.left(), &self.right())?.to_vec())
+    }
+
+    fn bind(&mut self, challenge: Fp3) -> Result<()> {
+        fold_first(&mut self.a0, challenge)?;
+        for map in &mut self.u {
+            fold_first(map, challenge)?;
+        }
+        fold_first(&mut self.b0, challenge)?;
+        for map in &mut self.v {
+            fold_first(map, challenge)?;
+        }
+        Ok(())
+    }
+
+    fn end_values(&self) -> Result<Vec<Fp3>> {
+        if self.a0.len() != 1 || self.b0.len() != 1 || self.u.iter().chain(&self.v).any(|map| map.len() != 1) {
+            return Err(Error::InvalidSessionState);
+        }
+        let mut values = Vec::with_capacity(2 + self.ku.len() + self.kv.len());
+        let mut rest = self.left()[0];
+        for (coefficient, map) in self.ku.iter().zip(&self.u) {
+            rest = rest.sub(&coefficient.mul(&map[0]));
+        }
+        values.push(rest);
+        for map in &self.u {
+            values.push(map[0]);
+        }
+        let mut rest = self.right()[0];
+        for (coefficient, map) in self.kv.iter().zip(&self.v) {
+            rest = rest.sub(&coefficient.mul(&map[0]));
+        }
+        values.push(rest);
+        for map in &self.v {
+            values.push(map[0]);
+        }
+        Ok(values)
+    }
 }
 
 /// The product summand's inner sumcheck over two maps.
@@ -1642,6 +1766,125 @@ mod tests {
     }
 
     use zkie_core::common::codec::DecodeLimits;
+
+    fn aggregate(base: &[Fp3], maps: &[Vec<Fp3>], coefficients: &[Fp3]) -> Vec<Fp3> {
+        let mut values = base.to_vec();
+        for (coefficient, map) in coefficients.iter().zip(maps) {
+            for (slot, value) in values.iter_mut().zip(map) {
+                *slot = slot.add(&coefficient.mul(value));
+            }
+        }
+        values
+    }
+
+    #[test]
+    fn the_stack_end_group_proves_and_verifies() {
+        let a0 = [f(1), f(2), f(3), f(4)];
+        let u = [vec![f(5), f(6), f(7), f(8)]];
+        let b0 = [f(2), f(3), f(4), f(5)];
+        let v = [
+            vec![f(1), f(1), f(1), f(1)],
+            vec![f(0), f(1), f(0), f(1)],
+        ];
+        let ku = vec![f(3)];
+        let kv = vec![f(5), f(7)];
+        let summand = Summand::StackProduct {
+            ku: ku.clone(),
+            kv: kv.clone(),
+        };
+        assert_eq!(summand.shown(), 5);
+        assert_eq!(summand.degree(), 2);
+        // The claim is the sum of the aggregated product over the cube.
+        let left = aggregate(&a0, &u, &ku);
+        let right = aggregate(&b0, &v, &kv);
+        let mut target = Fp3::ZERO;
+        for (left, right) in left.iter().zip(&right) {
+            target = target.add(&left.mul(right));
+        }
+        let variables = [
+            crate::proof::psc::Weight::plain(3).unwrap(),
+            crate::proof::psc::Weight::plain(3).unwrap(),
+        ];
+        let hiding_count = crate::proof::psc::hp_entries(
+            &general_variables(&variables, &summand).unwrap(),
+        )
+        .unwrap();
+        let masks = GeneralMaskEntries {
+            hiding: (0..hiding_count).map(|index| f(700 + index as u64)).collect(),
+            shown: (0..5).map(|index| f(800 + index as u64)).collect(),
+        };
+        let mut inner = StackInner::new(&a0, &u, &b0, &v, ku.clone(), kv.clone()).unwrap();
+        let (proof, proven) = prove_general(
+            &variables,
+            &[],
+            &|_| Ok(Fp3::ZERO),
+            target,
+            &summand,
+            None,
+            &mut inner,
+            &masks,
+            &mut Source(67),
+        )
+        .unwrap();
+        let verified = verify_general(
+            &variables,
+            &[],
+            target,
+            &summand,
+            None,
+            &proof,
+            masks.hiding.len(),
+            &mut Source(67),
+        )
+        .unwrap();
+        assert_eq!(proven, verified);
+        assert_eq!(proven.ends.len(), 5);
+        // A changed last-round coefficient leaves another output claim.
+        let mut changed = proof.clone();
+        changed.y_round.coefficients[0] = changed.y_round.coefficients[0].add(&Fp3::ONE);
+        let tampered = verify_general(
+            &variables,
+            &[],
+            target,
+            &summand,
+            None,
+            &changed,
+            masks.hiding.len(),
+            &mut Source(67),
+        )
+        .unwrap();
+        assert_ne!(tampered, verified);
+        // The end group's size is fixed by the layout.
+        let mut short = masks.clone();
+        short.shown.pop();
+        assert!(prove_general(
+            &variables,
+            &[],
+            &|_| Ok(Fp3::ZERO),
+            target,
+            &summand,
+            None,
+            &mut StackInner::new(&a0, &u, &b0, &v, ku.clone(), kv.clone()).unwrap(),
+            &short,
+            &mut Source(67),
+        )
+        .is_err());
+        // A changed v map does not sum to the claim.
+        let mut changed_v = v.clone();
+        changed_v[1][1] = changed_v[1][1].add(&Fp3::ONE);
+        assert!(prove_general(
+            &variables,
+            &[],
+            &|_| Ok(Fp3::ZERO),
+            target,
+            &summand,
+            None,
+            &mut StackInner::new(&a0, &u, &b0, &changed_v, ku, kv).unwrap(),
+            &masks,
+            &mut Source(67),
+        )
+        .is_err());
+    }
 
     #[test]
     fn the_general_proof_round_trips_through_the_canonical_encoding() {
