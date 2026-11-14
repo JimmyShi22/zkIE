@@ -1,0 +1,207 @@
+commit 4bd2d321a0c75428f9a507b256724bd067ca4722
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Sat Nov 14 08:45:14 2026 +0800
+
+    Derive the stage mask capacity and the random tail
+    
+    The trusted planner now derives a middle stage's mask capacity and a last
+    stage's single-row capacity from the previous stage: the folded row is cut
+    into two-to-the-k rows after a divisibility check, the mask length is the
+    power of two that holds the carried entries, the samples and the pad, the
+    out-of-domain entries are what remains, and the row's random tail follows the
+    position count with the domain's parity rule. Unit tests cover the middle and
+    last stages, an indivisible cut and the parity rule.
+    
+    This is the second piece of the sizing derivation; the configuration
+    candidates, the stage lists, the joint shared and own solve, the capacity
+    mapping and the full round budget remain the next steps.
+
+diff --git a/crates/zkie-ops/src/proof/proximity_planner.rs b/crates/zkie-ops/src/proof/proximity_planner.rs
+index 77011836..c5a3cf2b 100644
+--- a/crates/zkie-ops/src/proof/proximity_planner.rs
++++ b/crates/zkie-ops/src/proof/proximity_planner.rs
+@@ -535,6 +535,139 @@ pub fn lin_group_bits(main_rows: &[u64], mask_rows: &[u64]) -> Result<(u32, u32)
+     Ok((main_bits.max(h).max(1), h))
+ }
+ 
++/// The random tail for `t` opened positions. A circle domain needs an odd
++/// tail, so an even count is raised by one; other domains use the count
++/// itself. The flag is plan data, never a proof value.
++pub fn stage_tail(t: u64, circle: bool) -> u64 {
++    if circle && t != 0 && t % 2 == 0 {
++        t + 1
++    } else {
++        t
++    }
++}
++
++/// The sizes of one middle stage of a proximity-test stage list, derived from
++/// the stage before it by the trusted rules.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct StageSizes {
++    pub k: u32,
++    pub h: u32,
++    pub main_ell: u64,
++    pub mask_ell: u64,
++    /// The out-of-domain entries a mask row carries, the pad included.
++    pub r_ood: u64,
++    /// The row's random tail at `positions` opened positions.
++    pub tail: u64,
++}
++
++fn pow2_at_least_u64(value: u64) -> Result<u64> {
++    if value == 0 {
++        return Ok(1);
++    }
++    let bits = 64 - (value - 1).leading_zeros();
++    if bits >= 64 {
++        return Err(Error::ResourceLimit);
++    }
++    Ok(1u64 << bits)
++}
++
++/// One middle stage: the folded row is cut into `2^k` rows, the mask capacity
++/// carries the previous stage's two tails and slots plus its own two tails,
++/// the mask length is the power of two that holds the carried entries, the
++/// samples and the pad, and the out-of-domain entries are what remains.
++#[allow(clippy::too_many_arguments)]
++pub fn solve_next_stage(
++    prev_main_ell: u64,
++    prev_mask_ell: u64,
++    prev_slots: u64,
++    prev_main_r: u64,
++    prev_mask_r: u64,
++    k: u32,
++    h: u32,
++    samples: u32,
++    positions: u64,
++    circle: bool,
++) -> Result<StageSizes> {
++    if k == 0 || k > 32 || h > k {
++        return Err(Error::InvalidConfig);
++    }
++    let divisor = 1u64.checked_shl(k).ok_or(Error::ResourceLimit)?;
++    let scaled = prev_main_ell
++        .checked_mul(prev_slots)
++        .ok_or(Error::ResourceLimit)?;
++    if scaled % divisor != 0 {
++        return Err(Error::InvalidConfig);
++    }
++    let main_ell = scaled / divisor;
++    let carried = 2u64
++        .checked_mul(prev_mask_ell)
++        .and_then(|value| value.checked_add(prev_slots.checked_mul(prev_main_r)?))
++        .and_then(|value| value.checked_add(2u64.checked_mul(prev_mask_r)?))
++        .ok_or(Error::ResourceLimit)?;
++    let own_fold = 2u64
++        .checked_mul(k as u64)
++        .and_then(|value| value.checked_add(1))
++        .and_then(|value| value.checked_sub(h as u64))
++        .ok_or(Error::ResourceLimit)?;
++    let per_row = 1u64.checked_shl(h).ok_or(Error::ResourceLimit)?;
++    let need = carried
++        .checked_add(samples as u64)
++        .and_then(|value| value.checked_add(per_row - 1))
++        .ok_or(Error::ResourceLimit)?;
++    let mask_ell = pow2_at_least_u64(need >> h)?.max(pow2_at_least_u64(own_fold)?);
++    let capacity = mask_ell.checked_shl(h).ok_or(Error::ResourceLimit)?;
++    if capacity < carried {
++        return Err(Error::ShapeMismatch);
++    }
++    Ok(StageSizes {
++        k,
++        h,
++        main_ell,
++        mask_ell,
++        r_ood: capacity - carried,
++        tail: stage_tail(positions, circle),
++    })
++}
++
++/// The last stage of a stage list: one row, no folding (`k = h = 0`). Its
++/// mask length is the power of two that holds the carried entries and the
++/// samples; the out-of-domain entries are what remains.
++pub fn solve_last_stage(
++    prev_main_ell: u64,
++    prev_mask_ell: u64,
++    prev_slots: u64,
++    prev_main_r: u64,
++    prev_mask_r: u64,
++    samples: u32,
++    positions: u64,
++    circle: bool,
++) -> Result<StageSizes> {
++    let main_ell = prev_main_ell
++        .checked_mul(prev_slots)
++        .ok_or(Error::ResourceLimit)?;
++    let carried = 2u64
++        .checked_mul(prev_mask_ell)
++        .and_then(|value| value.checked_add(prev_slots.checked_mul(prev_main_r)?))
++        .and_then(|value| value.checked_add(2u64.checked_mul(prev_mask_r)?))
++        .ok_or(Error::ResourceLimit)?;
++    let mask_ell = pow2_at_least_u64(
++        carried
++            .checked_add(samples as u64)
++            .ok_or(Error::ResourceLimit)?,
++    )?;
++    if mask_ell < carried {
++        return Err(Error::ShapeMismatch);
++    }
++    Ok(StageSizes {
++        k: 0,
++        h: 0,
++        main_ell,
++        mask_ell,
++        r_ood: mask_ell - carried,
++        tail: stage_tail(positions, circle),
++    })
++}
++
+ fn ceil_log2(value: u64) -> u32 {
+     if value <= 1 {
+         return 0;
+@@ -895,3 +1028,44 @@ mod lin_group_bits_tests {
+         assert!(lin_group_bits(&[1], &[1, 1]).is_err());
+     }
+ }
++
++#[cfg(test)]
++mod stage_sizes_tests {
++    use super::*;
++
++    #[test]
++    fn middle_stage_follows_the_capacity_rules() {
++        // A 1024-entry row cut into 2^1 rows leaves 512 entries; the mask
++        // carries two previous mask tails, one slot of the previous main tail
++        // and two of its own mask tails.
++        let sizes = solve_next_stage(1024, 32, 2, 3, 1, 1, 1, 1, 7, false).unwrap();
++        assert_eq!(sizes.main_ell, 1024);
++        assert_eq!(sizes.tail, 7);
++        let carried = 2 * 32 + 2 * 3 + 2 * 1;
++        let need = carried + 1;
++        let rows = (need + (1u64 << 1) - 1) >> 1;
++        let mask_ell = pow2_at_least_u64(rows).unwrap().max(2);
++        assert_eq!(sizes.mask_ell, mask_ell);
++        assert_eq!(sizes.r_ood, (mask_ell << 1) - carried);
++        // An indivisible cut is rejected.
++        assert!(solve_next_stage(1023, 32, 1, 3, 1, 1, 0, 1, 7, false).is_err());
++        // The mask bits cannot exceed the main bits.
++        assert!(solve_next_stage(1024, 32, 1, 3, 1, 1, 2, 1, 7, false).is_err());
++    }
++
++    #[test]
++    fn last_stage_is_one_row_and_the_tail_follows_the_domain() {
++        let sizes = solve_last_stage(512, 64, 2, 5, 1, 1, 9, false).unwrap();
++        assert_eq!(sizes.k, 0);
++        assert_eq!(sizes.h, 0);
++        assert_eq!(sizes.main_ell, 1024);
++        let carried = 2 * 64 + 2 * 5 + 2 * 1;
++        assert_eq!(sizes.mask_ell, pow2_at_least_u64(carried + 1).unwrap());
++        assert_eq!(sizes.r_ood, sizes.mask_ell - carried);
++        assert_eq!(sizes.tail, 9);
++        assert_eq!(stage_tail(8, false), 8);
++        assert_eq!(stage_tail(8, true), 9);
++        assert_eq!(stage_tail(9, true), 9);
++        assert_eq!(stage_tail(0, true), 0);
++    }
++}
