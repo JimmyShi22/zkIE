@@ -2430,17 +2430,32 @@ fn derive_request_w(
     }
     let ell = usize::try_from(plan.table_shape.code.ell).map_err(|_| Error::ResourceLimit)?;
     let tail_len = usize::try_from(plan.table_shape.code.r).map_err(|_| Error::ResourceLimit)?;
+    let table_rows = usize::try_from(plan.table_shape.rows()).map_err(|_| Error::ResourceLimit)?;
+    let factor = 1usize << plan.k_lo;
+    if columns != matrix_rows << plan.k_lo || source.rows() != table_rows as u64 {
+        return Err(Error::ShapeMismatch);
+    }
     let mut message = vec![Fp::ZERO; ell];
     let mut tail = vec![Fp::ZERO; tail_len];
     let mut w = vec![Fp3::ZERO; columns];
-    for row in 0..matrix_rows {
-        source.row(row as u64, &mut message, &mut tail)?;
-        let weight = weights[row];
-        if weight.is_zero() {
-            continue;
+    // The matrix entry (y, column) is the table's cell at `column >> k_lo`, place
+    // `low + y * 2^k_lo`, with low = column mod 2^k_lo. One pass over the rows.
+    for table_row in 0..table_rows {
+        source.row(table_row as u64, &mut message, &mut tail)?;
+        let base = table_row << plan.k_lo;
+        if base + factor > columns {
+            return Err(Error::ShapeMismatch);
         }
-        for (slot, cell) in w.iter_mut().zip(&message[..columns]) {
-            *slot = slot.add(&weight.mul(&Fp3::from_base(*cell)));
+        for low in 0..factor {
+            let mut sum = Fp3::ZERO;
+            for (row, weight) in weights.iter().enumerate() {
+                let entry = low + (row << plan.k_lo);
+                let value = *message.get(entry).ok_or(Error::ShapeMismatch)?;
+                if !weight.is_zero() {
+                    sum = sum.add(&weight.mul(&Fp3::from_base(value)));
+                }
+            }
+            w[base + low] = sum;
         }
     }
     Ok(w)
@@ -7366,9 +7381,9 @@ impl WCommitRandomness {
         };
         let request_w = match &plan.request_w {
             Some(rw) => {
-                let answers = plan.w.answers as usize;
-                let rows = usize::try_from(plan.w.main_rows).map_err(|_| Error::ResourceLimit)?;
-                let tail_len = usize::try_from(plan.w.code.r).map_err(|_| Error::ResourceLimit)?;
+                let answers = rw.shape.answers as usize;
+                let rows = usize::try_from(rw.shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+                let tail_len = usize::try_from(rw.shape.code.r).map_err(|_| Error::ResourceLimit)?;
                 let mut pads = Vec::with_capacity(answers);
                 for _ in 0..answers {
                     let mut pad = Fp3::ZERO;
@@ -7387,8 +7402,10 @@ impl WCommitRandomness {
                 for _ in 0..rows * tail_len {
                     tail.push(coins.draw()?.0);
                 }
-                let columns =
-                    usize::try_from(rw.columns).map_err(|_| Error::ResourceLimit)?;
+                // One salt per tree column: the runtime tree's column count is
+                // the code's, not the value vector's.
+                let columns = usize::try_from(rw.shape.code.n())
+                    .map_err(|_| Error::ResourceLimit)?;
                 let salts = draw_salt_bytes(coins, columns, rw.shape.salt_bytes)?;
                 Some(RequestWRandomness { pads, tail, salts })
             }
@@ -17428,6 +17445,11 @@ fn witness_tree_for(
             &omega_salts_of(shared_witness)?,
         )?));
     }
+    if let (Some(rw), Some(request_witness)) = (&plan.send.request_w, &witness.request_w) {
+        if member.source_oracle == rw.oracle {
+            return retained_member_tree(&request_witness.committed.trees, 0, member);
+        }
+    }
     let position = (member.source_oracle - plan.send.oracle_base) as usize;
     if position >= plan.send.positions() as usize {
         return Err(Error::StatementMismatch);
@@ -17499,10 +17521,10 @@ fn verify_second(
         _ => return Err(Error::InvalidConfig),
     }
     let _profile_members = zkie_engine::profile::Scope::new("verify.second.members");
-    let (members, _order) = own_members(plan, first, shared, None, None)?;
+    
     drop(_profile_members);
     let _profile_sample_rows = zkie_engine::profile::Scope::new("verify.second.sample_rows");
-    let sample_rows = own_sample_rows(plan, &members, first, shared)?;
+    
     drop(_profile_sample_rows);
     let mut chain = second_chain(
         plan,
@@ -17554,6 +17576,8 @@ fn verify_second(
         (None, None, None) => None,
         _ => return Err(Error::ShapeMismatch),
     };
+    let (members, _order) = own_members(plan, first, shared, None, None)?;
+    let sample_rows = own_sample_rows(plan, &members, first, shared)?;
     let _profile_plain_rows = zkie_engine::profile::Scope::new("verify.second.plain_rows");
     let request_bundle = request_rows_bundle(plan, &members, shared_point)?;
     let plain_rows = own_plain_rows(
@@ -17582,7 +17606,7 @@ fn verify_second(
         ProximityGroupRole::Own,
     )?;
     let _profile_proximity = zkie_engine::profile::Scope::new("verify.second.proximity");
-    let proximity = proximity_verify(
+        let proximity = proximity_verify(
         chain,
         fold,
         &members,
@@ -19848,9 +19872,12 @@ mod tests {
         let mut source = VecTableSource::new(messages.clone(), table_tails()).unwrap();
         let w = super::derive_request_w(&fixture.plan, &g, &mut source).unwrap();
         assert_eq!(w.len(), columns);
+        let factor = 1usize << fixture.plan.k_lo;
         for column in [0usize, 1, columns - 1] {
-            let expected = Fp3::from_base(messages[0][column])
-                .add(&Fp3::from_u64(2).mul(&Fp3::from_base(messages[1][column])));
+            let table_row = column >> fixture.plan.k_lo;
+            let low = column & (factor - 1);
+            let expected = Fp3::from_base(messages[table_row][low])
+                .add(&Fp3::from_u64(2).mul(&Fp3::from_base(messages[table_row][low + factor])));
             assert_eq!(w[column], expected);
         }
         // A row-weight vector of another length is refused.
@@ -23169,6 +23196,241 @@ mod merged_tests {
         .unwrap();
         plan.send.expected_dot_root = witness.send.dot.as_ref().map(|map| map.root);
         (plan, messages, witness)
+    }
+
+    /// The request-level consumer member: weights over the two matrix rows, a
+    /// two-bit column point, one mask entry from the index-mask message's
+    /// spare allocation, a target filled after a setup pass and one
+    /// reduced-witness table.
+    fn member_plan(index: &IndexMaskPlan, mask_slot: u64, target: Fp3) -> MemberPlan {
+        let mut tables = crate::proof::hidden_member::ReductionWitnessPlan::new();
+        tables
+            .add_table(
+                0,
+                1,
+                2,
+                MATRIX_ROWS,
+                COLUMNS,
+                vec![Fp3::from_u64(1), Fp3::from_u64(2)],
+                false,
+            )
+            .unwrap();
+        MemberPlan {
+            index_oracle: index.oracle,
+            row_bits: MATRIX_ROWS.trailing_zeros(),
+            column_bits: COLUMNS.trailing_zeros(),
+            pending: crate::proof::hidden_member::PendingRow {
+                weights: vec![
+                    crate::proof::hidden_member::WeightBlock::Scalar {
+                        row: 0,
+                        value: Fp3::ONE,
+                    },
+                    crate::proof::hidden_member::WeightBlock::Scalar {
+                        row: 1,
+                        value: Fp3::from_u64(2),
+                    },
+                ],
+                psi: vec![Fp3::from_u64(3), Fp3::from_u64(5)],
+                target,
+                masks: vec![crate::proof::hidden_member::MaskTerm {
+                    oracle: index.oracle,
+                    slot: mask_slot,
+                    coeff: Fp3::from_u64(7),
+                }],
+            },
+            tables: tables.tables().to_vec(),
+            tree: RuntimeTreePlan {
+                tree_number: 500,
+                leaf_class: 2,
+                log_n: 2,
+                log_n_zk: 2,
+                parts: vec![RuntimeTreePart {
+                    main_symbols: E_DEGREE as u64,
+                    mask_symbols: 0,
+                }],
+                salt_bytes: SALT,
+                run: Digest([0x68; 32]),
+                configuration: W_CONFIGURATION,
+            },
+        }
+    }
+
+    /// The Eval row's honest right-hand side: `W(psi)` from the committed
+    /// table rows plus the claim's mask entries, read from the index-mask
+    /// randomness the session derives from its seed.
+    fn member_target(plan: &HiddenLinPlan, mask_rows: &[Vec<Fp3>]) -> Fp3 {
+        let member = plan.send.member.as_ref().unwrap();
+        let index = plan.send.index_mask.as_ref().unwrap();
+        let g = super::pending_row_weights(&member.pending, plan.send.matrix_rows).unwrap();
+        let messages = table_messages();
+        let factor = 1usize << plan.send.k_lo;
+        let mut w = vec![Fp3::ZERO; COLUMNS as usize];
+        for column in 0..COLUMNS as usize {
+            let table_row = column >> plan.send.k_lo;
+            let low = column & (factor - 1);
+            for (row, weight) in g.iter().enumerate() {
+                w[column] = w[column].add(
+                    &weight.mul(&Fp3::from_base(messages[table_row][low + (row << plan.send.k_lo)])),
+                );
+            }
+        }
+        let eq = super::eq_vector(&member.pending.psi).unwrap();
+        let mut target = Fp3::ZERO;
+        for (column, coefficient) in eq.iter().enumerate() {
+            target = target.add(&coefficient.mul(&w[column]));
+        }
+        let ell = usize::try_from(index.mask_code.ell).unwrap();
+        for term in &member.pending.masks {
+            let offset = index.entry_offset(term.slot as usize).unwrap();
+            let value = mask_rows[offset / ell][offset % ell];
+            target = target.add(&term.coeff.mul(&value));
+        }
+        target
+    }
+
+    /// One hidden session carrying the consumer member, the request-level W
+    /// and the chain's read cells. The claim target is computed from the same
+    /// drew randomness the session uses, so the committed rows hold.
+    fn member_run() -> (HiddenLinPlan, HiddenLinMessages, HiddenLinWitness) {
+        let activation = activation();
+        let mut plan = hidden_plan(&activation);
+        // With the consumer member present, the at_start index-mask tree's
+        // leaf class must be the greatest of every tree the own group names.
+        plan.send.index_mask.as_mut().unwrap().tree.leaf_class = 5;
+        let index = plan.send.index_mask.clone().unwrap();
+        let total = index.entries.total().unwrap();
+        let free = index.free_entries().unwrap();
+        assert!(total < free, "the fixture needs one spare mask slot");
+        plan.send.member = Some(member_plan(&index, total as u64, Fp3::ZERO));
+        // The request W is its own oracle: a distinct tree number from the
+        // per-position W rows and every other member of the group.
+        plan.send.request_w = Some(super::RequestWPlan {
+            shape: WShape::new(
+                COLUMNS,
+                code(),
+                1,
+                POSITIONS,
+                SALT,
+                600,
+                1,
+                W_RUN,
+                W_CONFIGURATION,
+            )
+            .unwrap(),
+            oracle: ORACLE_BASE + 1_000,
+            group: GROUP,
+            columns: COLUMNS,
+        });
+        plan.send.request_reads = Some(super::RequestReadPlan {
+            left: vec![(0, 0)],
+            right: vec![(1, 1)],
+        });
+        let seed = Digest([0x71; 32]);
+        let mut coins = ByteMaskCoins::new(derive_run_seed(&seed, 1, 0).unwrap()).unwrap();
+        let randomness = WCommitRandomness::from_coins(&mut coins, &plan.send, None).unwrap();
+        let mask_rows = randomness.index_mask.as_ref().unwrap().rows.clone();
+        let target = member_target(&plan, &mask_rows);
+        plan.send.member.as_mut().unwrap().pending.target = target;
+        let mut setup = table();
+        let (messages, witness) =
+            prove_hidden_lin_hidden(&plan, &activation, &mut setup, seed).unwrap();
+        plan.send.expected_dot_root = witness.send.dot.as_ref().map(|map| map.root);
+        (plan, messages, witness)
+    }
+
+    #[test]
+    fn the_member_and_the_request_rows_join_the_second_session() {
+        let (plan, messages, witness) = member_run();
+        let table = table();
+        let outcome = verify_hidden_lin_hidden(&plan, &table.reader, &messages).unwrap();
+        assert_eq!(outcome.eval_rows.len(), POSITIONS as usize);
+        assert!(witness.send.request_w.is_some());
+        // The verifier's own-member list carries the request W root.
+        let rw = plan.send.request_w.unwrap();
+        let (members, _) =
+            own_members(&plan, &messages.first, &messages.shared, None, None).unwrap();
+        let request = members
+            .iter()
+            .find(|member| member.source_oracle == rw.oracle)
+            .expect("the request W is an own member");
+        assert_eq!(
+            request.root,
+            messages.first.request_w.as_ref().unwrap().root
+        );
+        // The planned read cells come off the same table stream.
+        let reduction = crate::proof::request_stack::StackReduction::new(vec![
+            crate::proof::request_stack::StackPanel {
+                claim: 0,
+                ec: Fp3::ONE,
+                ni: 1,
+                ny: 1,
+                weight: vec![Fp3::ONE],
+                first_claim: None,
+                w: 0,
+                off: 0,
+            },
+        ])
+        .unwrap();
+        let reads = plan.send.request_reads.as_ref().unwrap();
+        let messages_table = table_messages();
+        let mut source = VecTableSource::new(messages_table.clone(), table_tails()).unwrap();
+        let (left, right) =
+            super::stack_reads(&plan.send, &reduction, &reads.left, &reads.right, &mut source)
+                .unwrap();
+        assert_eq!(left[0][0], Fp3::from_base(messages_table[0][0]));
+        assert_eq!(right[0][0], Fp3::from_base(messages_table[1][1]));
+    }
+
+    #[test]
+    fn the_member_and_the_request_rows_are_bound_in_the_second_session() {
+        let (plan, messages, _) = member_run();
+        let table = table();
+        // A changed claim target breaks the Eval row.
+        let mut changed = plan.clone();
+        changed.send.member.as_mut().unwrap().pending.target =
+            changed.send.member.as_ref().unwrap().pending.target.add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&changed, &table.reader, &messages).is_err());
+        // A changed mask coefficient breaks the Eval row.
+        let mut changed = plan.clone();
+        changed.send.member.as_mut().unwrap().pending.masks[0].coeff =
+            changed.send.member.as_ref().unwrap().pending.masks[0].coeff.add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&changed, &table.reader, &messages).is_err());
+        // A changed claim point breaks the Eval row.
+        let mut changed = plan.clone();
+        changed.send.member.as_mut().unwrap().pending.psi[0] =
+            changed.send.member.as_ref().unwrap().pending.psi[0].add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&changed, &table.reader, &messages).is_err());
+        // A mask slot inside the Eval allocation is refused by the plan.
+        let mut changed = plan.clone();
+        let total = changed
+            .send
+            .index_mask
+            .as_ref()
+            .unwrap()
+            .entries
+            .total()
+            .unwrap();
+        changed.send.member.as_mut().unwrap().pending.masks[0].slot = total as u64 - 1;
+        assert!(verify_hidden_lin_hidden(&changed, &table.reader, &messages).is_err());
+        // A foreign mask oracle is refused by the plan.
+        let mut changed = plan.clone();
+        changed.send.member.as_mut().unwrap().pending.masks[0].oracle =
+            INDEX_MASK_ORACLE + 1;
+        assert!(verify_hidden_lin_hidden(&changed, &table.reader, &messages).is_err());
+        // The request W root travels in the first transcript.
+        let mut tampered = messages.clone();
+        tampered.first.request_w.as_mut().unwrap().root = Digest([0x5A; 32]);
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &tampered).is_err());
+        // The request W sample answers are bound to the message.
+        let mut tampered = messages.clone();
+        tampered.first.request_w.as_mut().unwrap().sample.answers[0] =
+            tampered.first.request_w.as_ref().unwrap().sample.answers[0].add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &tampered).is_err());
+        // The request W sample seeds are bound to the root.
+        let mut tampered = messages.clone();
+        tampered.first.request_w.as_mut().unwrap().sample.seed[0].beta =
+            tampered.first.request_w.as_ref().unwrap().sample.seed[0].beta.add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &tampered).is_err());
     }
 
     /// Gaussian-elimination rank over `Fp3`.
