@@ -398,13 +398,29 @@ impl WeightLayout {
     }
 }
 
-/// One claim's value at the merge: the scalar the sub-proof has already shown,
-/// the index-mask slot that hides it and the factor of that slot's mask entry.
+/// One claim's value at the merge: the scalar the stack sub-proof sent as an
+/// end value, the slot that value holds in the sub-proof's mask row and the
+/// stack sumcheck's end factor. The factor is the stack's, not the merge's:
+/// the merge's own masked target uses the request's index-mask entry and the
+/// merge's end factor instead, and the two must not be mixed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MergeValue {
     pub shown: Fp3,
     pub mask_slot: usize,
     pub mask_factor: Fp3,
+}
+
+impl MergeValue {
+    /// One weight value as the stack sub-proof sent it: its shown end value,
+    /// its slot in the sub-proof's mask row and the stack sumcheck's end
+    /// factor.
+    pub fn from_stack_end(shown: Fp3, mask_slot: usize, beta_stack: Fp3) -> Self {
+        Self {
+            shown,
+            mask_slot,
+            mask_factor: beta_stack,
+        }
+    }
 }
 
 /// What one merge produced: the masked sumcheck's proof, its output claim, the
