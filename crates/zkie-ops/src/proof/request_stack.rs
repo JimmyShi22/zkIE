@@ -336,6 +336,63 @@ impl StackReduction {
     }
 }
 
+/// One end value as it was sent: the shown value, its mask slot and the mask
+/// factor the sumcheck applied to every end value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EndValue {
+    pub value: Fp3,
+    pub slot: usize,
+    pub scale: Fp3,
+}
+
+impl StackReduction {
+    /// Checks the two end-value ties: an end value's hidden value (the shown
+    /// value minus the factor times its mask entry) must equal the affine
+    /// recombination of the panels' operand values, with the shown weights on
+    /// the second side. The stack sumcheck's own leftover row claim is the
+    /// third linear claim (`RowForm::from_output`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_end_ties(
+        &self,
+        left: &[Vec<Fp3>],
+        right: &[Vec<Fp3>],
+        om: &[Fp3],
+        point: &[Fp3],
+        left_end: EndValue,
+        right_end: EndValue,
+        mask_value: &dyn Fn(usize) -> Result<Fp3>,
+    ) -> Result<()> {
+        let affines = stack_affines(&self.panels, point, self.lam, om)?;
+        let mut alin = Fp3::ZERO;
+        for term in &affines.alin {
+            let panel = &self.panels[term.panel];
+            let cell = (term.i * panel.ny + term.yv) as usize;
+            alin = alin.add(&term.coefficient.mul(&left[term.panel][cell]));
+        }
+        let mut blin = Fp3::ZERO;
+        for term in &affines.blin {
+            let panel = &self.panels[term.panel];
+            let cell = (term.i * panel.ny + term.yv) as usize;
+            blin = blin.add(&term.coefficient.mul(&right[term.panel][cell]));
+        }
+        for (panel_index, i, coefficient) in &affines.shown {
+            let panel = &self.panels[*panel_index];
+            let cell = (*i * panel.ny) as usize;
+            blin = blin.add(&coefficient.mul(&right[*panel_index][cell]));
+        }
+        let left_hidden = left_end
+            .value
+            .sub(&left_end.scale.mul(&mask_value(left_end.slot)?));
+        let right_hidden = right_end
+            .value
+            .sub(&right_end.scale.mul(&mask_value(right_end.slot)?));
+        if left_hidden != alin || right_hidden != blin {
+            return Err(Error::StatementMismatch);
+        }
+        Ok(())
+    }
+}
+
 /// Proves the stack's batched sumcheck. The summand is the product of the two
 /// sides' end values; the stack's variables are plain sums.
 #[allow(clippy::too_many_arguments)]
@@ -669,6 +726,80 @@ mod tests {
         changed[1][0] = changed[1][0].add(&Fp3::ONE);
         assert!(reduction
             .check_row_ties(&left, &changed, &om, &point, left_end, right_end)
+            .is_err());
+    }
+
+    #[test]
+    fn the_end_ties_bind_the_hidden_end_values_to_the_panels() {
+        // One read panel and one weight panel.
+        let read = panel(0, 5, 2, 2, vec![fp(7), fp(11)]);
+        let weight = StackPanel {
+            first_claim: Some(0),
+            ..panel(0, 3, 2, 2, vec![fp(1), fp(1)])
+        };
+        let reduction = StackReduction::new(vec![read, weight]).unwrap();
+        let om = vec![fp(2)];
+        // Two panels of four cells fill a three-bit stack.
+        let point = vec![fp(3), fp(4), fp(5)];
+        let left = vec![cells(4, 1), cells(4, 51)];
+        let right = vec![cells(4, 201), cells(4, 301)];
+        let scale = fp(9);
+        let mask = |slot: usize| Ok(fp(700 + slot as u64));
+        let affines = stack_affines(&reduction.panels, &point, reduction.lam, &om).unwrap();
+        let mut alin = Fp3::ZERO;
+        for term in &affines.alin {
+            let panel = &reduction.panels[term.panel];
+            alin = alin.add(
+                &term
+                    .coefficient
+                    .mul(&left[term.panel][(term.i * panel.ny + term.yv) as usize]),
+            );
+        }
+        let mut blin = Fp3::ZERO;
+        for term in &affines.blin {
+            let panel = &reduction.panels[term.panel];
+            blin = blin.add(
+                &term
+                    .coefficient
+                    .mul(&right[term.panel][(term.i * panel.ny + term.yv) as usize]),
+            );
+        }
+        for (panel_index, i, coefficient) in &affines.shown {
+            let panel = &reduction.panels[*panel_index];
+            blin = blin.add(&coefficient.mul(&right[*panel_index][(*i * panel.ny) as usize]));
+        }
+        let left_end = EndValue {
+            value: alin.add(&scale.mul(&mask(0).unwrap())),
+            slot: 0,
+            scale,
+        };
+        let right_end = EndValue {
+            value: blin.add(&scale.mul(&mask(1).unwrap())),
+            slot: 1,
+            scale,
+        };
+        reduction
+            .check_end_ties(&left, &right, &om, &point, left_end, right_end, &mask)
+            .unwrap();
+        // A changed read, shown weight, end value or mask entry is refused.
+        let mut changed = left.clone();
+        changed[0][1] = changed[0][1].add(&Fp3::ONE);
+        assert!(reduction
+            .check_end_ties(&changed, &right, &om, &point, left_end, right_end, &mask)
+            .is_err());
+        let mut changed = right.clone();
+        changed[1][0] = changed[1][0].add(&Fp3::ONE);
+        assert!(reduction
+            .check_end_ties(&left, &changed, &om, &point, left_end, right_end, &mask)
+            .is_err());
+        let mut changed = right_end;
+        changed.value = changed.value.add(&Fp3::ONE);
+        assert!(reduction
+            .check_end_ties(&left, &right, &om, &point, left_end, changed, &mask)
+            .is_err());
+        let other_mask = |slot: usize| Ok(fp(701 + slot as u64));
+        assert!(reduction
+            .check_end_ties(&left, &right, &om, &point, left_end, right_end, &other_mask)
             .is_err());
     }
 
