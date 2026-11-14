@@ -2367,6 +2367,55 @@ pub fn derive_w_rows(
 /// Derives the `W` rows from explicit private row-weight vectors. The caller
 /// owns the source of the rows: the committed activation, or the committed
 /// norm hidden-output messages.
+/// The row-weight vector of a pending claim over the matrix's rows.
+fn pending_row_weights(
+    pending: &crate::proof::hidden_member::PendingRow,
+    matrix_rows: u64,
+) -> Result<Vec<Fp3>> {
+    let rows = usize::try_from(matrix_rows).map_err(|_| Error::ResourceLimit)?;
+    let mut weights = vec![Fp3::ZERO; rows];
+    for block in &pending.weights {
+        match block {
+            crate::proof::hidden_member::WeightBlock::Scalar { row, value } => {
+                let slot = weights
+                    .get_mut(usize::try_from(*row).map_err(|_| Error::ResourceLimit)?)
+                    .ok_or(Error::BoundViolation)?;
+                *slot = *value;
+            }
+            crate::proof::hidden_member::WeightBlock::Dense {
+                first_row,
+                log_rows,
+                values,
+            } => {
+                let start = usize::try_from(*first_row).map_err(|_| Error::ResourceLimit)?;
+                for (offset, value) in values.iter().enumerate() {
+                    let slot = weights
+                        .get_mut(start + offset)
+                        .ok_or(Error::BoundViolation)?;
+                    *slot = *value;
+                }
+                let _ = log_rows;
+            }
+        }
+    }
+    Ok(weights)
+}
+
+/// Absorbs the request W's committed root in the first chain, before the
+/// request seals and the samples are drawn.
+fn absorb_request_w_root(chain: &mut Chain, shape: &WShape, root: Digest) -> Result<()> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(17);
+    push_tree_plan(&mut message, &shape.tree_plan(0)?);
+    push_digest(&mut message, &root);
+    let prefix = message.prefix(KIND_SEED, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
 /// Derives the request-level W = g^T M: one entry per column, from the same
 /// table stream the witness uses. The row weights are public.
 fn derive_request_w(
@@ -7492,6 +7541,26 @@ fn prove_first(
         }
         None => (None, None),
     };
+    let request_w_commit = match &plan.send.request_w {
+        Some(rw) => {
+            let member = plan.send.member.as_ref().ok_or(Error::InvalidConfig)?;
+            let g = pending_row_weights(&member.pending, plan.send.matrix_rows)?;
+            let source: &mut dyn TableRowSource = &mut *table;
+            let w = derive_request_w(&plan.send, &g, source)?;
+            let rw_randomness = randomness.request_w.as_ref().ok_or(Error::InvalidConfig)?;
+            let committed = commit_request_w(
+                &rw.shape,
+                rw.oracle,
+                rw.group,
+                &w,
+                &rw_randomness.pads,
+                std::slice::from_ref(&rw_randomness.tail),
+                std::slice::from_ref(&rw_randomness.salts),
+            )?;
+            Some(committed)
+        }
+        None => None,
+    };
     let weights = match plan.send.activation_source {
         ActivationSource::Commitment => {
             let activation = activation.ok_or(Error::InvalidConfig)?;
@@ -7606,6 +7675,11 @@ fn prove_first(
     absorb_claim(&mut chain, plan)?;
     if let (Some(member), Some(root)) = (&plan.send.member, &reduction_root) {
         absorb_reduction_root(&mut chain, member, root)?;
+    }
+    if let Some(committed) = &request_w_commit {
+        let rw = plan.send.request_w.as_ref().ok_or(Error::InvalidConfig)?;
+        let root = *committed.roots.first().ok_or(Error::ShapeMismatch)?;
+        absorb_request_w_root(&mut chain, &rw.shape, root)?;
     }
     let index_mask = match (&plan.send.index_mask, &witness.index_mask) {
         (Some(index), Some(mask_witness)) => {
@@ -8005,7 +8079,12 @@ fn prove_first(
         activation: activation_commitment,
         group,
         reduction_root,
-        request_w: None,
+        request_w: match &request_w_commit {
+            Some(committed) => Some(RequestWMessage {
+                root: *committed.roots.first().ok_or(Error::ShapeMismatch)?,
+            }),
+            None => None,
+        },
         samples: SendSamples { seed: seeds, answers },
         positions,
         openings,
@@ -8018,6 +8097,7 @@ fn prove_first(
         norm: norm_first,
         request: None,
     };
+    witness.request_w = request_w_commit;
     Ok((messages, first_seal, witness))
 }
 
@@ -8076,6 +8156,13 @@ fn verify_first(
                 return Err(Error::InvalidProof);
             }
             absorb_reduction_root(&mut chain, member, &root)?;
+        }
+        (None, None) => {}
+        _ => return Err(Error::InvalidProof),
+    }
+    match (&plan.send.request_w, &messages.request_w) {
+        (Some(rw), Some(request_w)) => {
+            absorb_request_w_root(&mut chain, &rw.shape, request_w.root)?;
         }
         (None, None) => {}
         _ => return Err(Error::InvalidProof),
