@@ -393,6 +393,83 @@ impl StackReduction {
     }
 }
 
+/// The hidden values of the stack's end group: the two sides' rest values and
+/// the weight values. The order of `v` is the panels' order, rows within a
+/// panel in increasing order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupValues {
+    pub a0: Fp3,
+    pub b0: Fp3,
+    pub v: Vec<Fp3>,
+}
+
+impl GroupValues {
+    /// Derives the hidden values from the sent ones: `hidden = sent - factor *
+    /// mask entry`. `never_sent` is the number of the group's u values between
+    /// A0 and B0; this consumer's group has none.
+    pub fn from_sent(
+        sent: &[Fp3],
+        slots: &[usize],
+        factor: Fp3,
+        never_sent: usize,
+        mask_value: &dyn Fn(usize) -> Result<Fp3>,
+    ) -> Result<Self> {
+        if sent.len() != slots.len() || sent.len() < 2 + never_sent {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut hidden = Vec::with_capacity(sent.len());
+        for (value, slot) in sent.iter().zip(slots) {
+            hidden.push(value.sub(&factor.mul(&mask_value(*slot)?)));
+        }
+        Ok(Self {
+            a0: hidden[0],
+            b0: hidden[1 + never_sent],
+            v: hidden[2 + never_sent..].to_vec(),
+        })
+    }
+}
+
+impl StackReduction {
+    /// Checks the group's source ties and returns the two sides the terminal
+    /// relation multiplies: A0 against the reads' recombination on the first
+    /// side, B0 against the second side's reads, and the weight values against
+    /// the weight coefficients. The weight values' own claims are checked by
+    /// the merge, not here.
+    pub fn group_bases(
+        &self,
+        left: &[Vec<Fp3>],
+        right: &[Vec<Fp3>],
+        om: &[Fp3],
+        point: &[Fp3],
+        group: &GroupValues,
+    ) -> Result<(Fp3, Fp3)> {
+        let affines = stack_affines(&self.panels, point, self.lam, om)?;
+        if affines.shown.len() != group.v.len() {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut alin = Fp3::ZERO;
+        for term in &affines.alin {
+            let panel = &self.panels[term.panel];
+            let cell = (term.i * panel.ny + term.yv) as usize;
+            alin = alin.add(&term.coefficient.mul(&left[term.panel][cell]));
+        }
+        let mut blin = Fp3::ZERO;
+        for term in &affines.blin {
+            let panel = &self.panels[term.panel];
+            let cell = (term.i * panel.ny + term.yv) as usize;
+            blin = blin.add(&term.coefficient.mul(&right[term.panel][cell]));
+        }
+        if group.a0 != alin || group.b0 != blin {
+            return Err(Error::StatementMismatch);
+        }
+        let mut bs = group.b0;
+        for ((_, _, coefficient), value) in affines.shown.iter().zip(&group.v) {
+            bs = bs.add(&coefficient.mul(value));
+        }
+        Ok((group.a0, bs))
+    }
+}
+
 /// Proves the stack's batched sumcheck. The summand is the product of the two
 /// sides' end values; the stack's variables are plain sums.
 #[allow(clippy::too_many_arguments)]
@@ -726,6 +803,78 @@ mod tests {
         changed[1][0] = changed[1][0].add(&Fp3::ONE);
         assert!(reduction
             .check_row_ties(&left, &changed, &om, &point, left_end, right_end)
+            .is_err());
+    }
+
+    #[test]
+    fn the_group_ties_bind_the_rest_and_weight_values() {
+        let read = panel(0, 5, 2, 2, vec![fp(7), fp(11)]);
+        let weight = StackPanel {
+            first_claim: Some(0),
+            ..panel(0, 3, 2, 2, vec![fp(1), fp(1)])
+        };
+        let reduction = StackReduction::new(vec![read, weight]).unwrap();
+        let om = vec![fp(2)];
+        let point = vec![fp(3), fp(4), fp(5)];
+        let left = vec![cells(4, 1), cells(4, 51)];
+        let mut right = vec![cells(4, 201), vec![Fp3::ZERO; 4]];
+        let factor = fp(9);
+        let mask = |slot: usize| Ok(fp(700 + slot as u64));
+        let affines = stack_affines(&reduction.panels, &point, reduction.lam, &om).unwrap();
+        let mut alin = Fp3::ZERO;
+        for term in &affines.alin {
+            let panel = &reduction.panels[term.panel];
+            alin = alin.add(
+                &term
+                    .coefficient
+                    .mul(&left[term.panel][(term.i * panel.ny + term.yv) as usize]),
+            );
+        }
+        let mut blin = Fp3::ZERO;
+        for term in &affines.blin {
+            let panel = &reduction.panels[term.panel];
+            blin = blin.add(
+                &term
+                    .coefficient
+                    .mul(&right[term.panel][(term.i * panel.ny + term.yv) as usize]),
+            );
+        }
+        let v = vec![fp(13), fp(17)];
+        let mut sent = vec![alin, blin];
+        sent.extend(&v);
+        let sent: Vec<Fp3> = sent
+            .iter()
+            .enumerate()
+            .map(|(slot, value)| value.add(&factor.mul(&mask(slot).unwrap())))
+            .collect();
+        let slots: Vec<usize> = (0..sent.len()).collect();
+        let group = GroupValues::from_sent(&sent, &slots, factor, 0, &mask).unwrap();
+        assert_eq!(group.a0, alin);
+        assert_eq!(group.b0, blin);
+        assert_eq!(group.v, v);
+        let (as_, bs) = reduction
+            .group_bases(&left, &right, &om, &point, &group)
+            .unwrap();
+        assert_eq!(as_, alin);
+        let mut expected = blin;
+        for ((_, _, coefficient), value) in affines.shown.iter().zip(&v) {
+            expected = expected.add(&coefficient.mul(value));
+        }
+        assert_eq!(bs, expected);
+        // Changed reads or a short group break the ties.
+        let mut changed = left.clone();
+        changed[0][1] = changed[0][1].add(&Fp3::ONE);
+        assert!(reduction
+            .group_bases(&changed, &right, &om, &point, &group)
+            .is_err());
+        right[0][1] = right[0][1].add(&Fp3::ONE);
+        assert!(reduction
+            .group_bases(&left, &right, &om, &point, &group)
+            .is_err());
+        let mut short = group.clone();
+        short.v.pop();
+        assert!(reduction
+            .group_bases(&left, &right, &om, &point, &short)
             .is_err());
     }
 

@@ -935,6 +935,92 @@ mod tests {
     }
 
     #[test]
+    fn the_merge_takes_the_stack_group_values() {
+        let mut layout = WeightLayout::new(2).unwrap();
+        layout
+            .add(0, 0, 1, vec![WeightGroup::e("x", 4, false).unwrap()])
+            .unwrap();
+        let claims = vec![
+            WeightClaim {
+                unit: 0,
+                factors: vec![ClaimFactor::e(vec![fp(2)], vec![fp(3), fp(5)])],
+            },
+            WeightClaim {
+                unit: 0,
+                factors: vec![ClaimFactor::e(vec![fp(7)], vec![fp(11), fp(13)])],
+            },
+        ];
+        // The maps sum to the group's hidden weight values.
+        let maps = vec![
+            vec![fp(1), fp(2), fp(3), fp(4)],
+            vec![fp(4), fp(6), fp(4), fp(6)],
+        ];
+        let beta = fp(3);
+        let mask = |slot: usize| Ok(fp(5 * (slot as u64 - 9)));
+        let hidden = [fp(10), fp(20)];
+        let sent = [
+            hidden[0].add(&beta.mul(&mask(10).unwrap())),
+            hidden[1].add(&beta.mul(&mask(11).unwrap())),
+        ];
+        let values = vec![
+            MergeValue::from_stack_end(sent[0], 10, beta),
+            MergeValue::from_stack_end(sent[1], 11, beta),
+        ];
+        let variables = [
+            crate::proof::psc::Weight::plain(2).unwrap(),
+            crate::proof::psc::Weight::plain(2).unwrap(),
+        ];
+        let hiding_count =
+            crate::proof::psc::hp_entries(&crate::proof::psc_general::general_variables(
+                &variables,
+                &crate::proof::psc_general::Summand::Map,
+            )
+            .unwrap())
+            .unwrap();
+        let masks = crate::proof::psc_general::GeneralMaskEntries {
+            hiding: (0..hiding_count).map(|index| fp(900 + index as u64)).collect(),
+            shown: vec![fp(999)],
+        };
+        let outcome = prove_merge(
+            &layout,
+            &claims,
+            &maps,
+            &values,
+            &mask,
+            &masks,
+            &mut BatchSource(23),
+        )
+        .unwrap();
+        let (output, _rows, _gamma) = verify_merge(
+            &layout,
+            &claims,
+            &values,
+            &outcome.proof,
+            masks.hiding.len(),
+            &mut BatchSource(23),
+        )
+        .unwrap();
+        crate::proof::row_claim::RowForm::from_output(&output)
+            .check(&masks.hiding, &mask, &[])
+            .unwrap();
+        // The merge's own end factor does not belong on the input values.
+        let mixed = vec![
+            MergeValue::from_stack_end(sent[0], 10, beta.add(&Fp3::ONE)),
+            MergeValue::from_stack_end(sent[1], 11, beta.add(&Fp3::ONE)),
+        ];
+        assert!(prove_merge(
+            &layout,
+            &claims,
+            &maps,
+            &mixed,
+            &mask,
+            &masks,
+            &mut BatchSource(23),
+        )
+        .is_err());
+    }
+
+    #[test]
     fn the_merge_proves_its_sumcheck_and_derives_the_row_weights() {
         let mut layout = WeightLayout::new(2).unwrap();
         layout
