@@ -385,6 +385,24 @@ impl ChainMaskPlan {
     }
 }
 
+/// Verifies one opening of the sub-proof mask table against its root: the plan
+/// must be a tree, and the opening's positions and columns are checked against
+/// the root by the runtime tree. The read ledger and the position list policy
+/// are checked separately, so a proof byte never chooses the list.
+pub fn verify_chain_mask_opening(
+    plan: &ChainMaskPlan,
+    root: &zkie_core::types::Digest,
+    list: &[u64],
+    opening: &zkie_engine::pcs::request::runtime_tree::RuntimeTreeOpening,
+) -> Result<()> {
+    if plan.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    zkie_engine::pcs::request::runtime_tree::verify_runtime_opening(
+        &plan.tree, root, list, opening,
+    )
+}
+
 /// The owner binding of the sub-proof segment's mask slots: the committed
 /// member is the plan oracle and every slot maps through the chain mask
 /// layout. Duplicate slots are refused; the slots are the sub-proof's, never
@@ -1289,6 +1307,16 @@ mod chain_mask_tests {
         // The sample form reads the mask table row bits and the mask code
         // message bits.
         assert_eq!(plan.sample_bits().unwrap(), 2 + 4);
+        // A broken table plan is refused before any opening is checked.
+        let mut broken_plan = plan.clone();
+        broken_plan.openings = 0;
+        assert!(broken_plan.fault().is_some());
+        let opening = zkie_engine::pcs::request::runtime_tree::RuntimeTreeOpening {
+            positions: vec![0, 2],
+            columns: Vec::new(),
+            given: Vec::new(),
+        };
+        assert!(verify_chain_mask_opening(&broken_plan, &plan.tree.run, &[0, 2], &opening).is_err());
         let mut fresh = ChainMaskReads::default();
         plan.check_positions(&[0, 1, 2, 3], &mut fresh).unwrap();
         assert_eq!(fresh.used, 4);
