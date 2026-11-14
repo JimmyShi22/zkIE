@@ -26,6 +26,76 @@ use crate::proof::request_weights::{
 };
 use crate::proof::row_claim::RowForm;
 
+/// One named layout quantity of the request chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutValue {
+    pub name: &'static str,
+    pub value: u64,
+}
+
+/// The request chain's layout registration. One table names every quantity the
+/// layout fixes, so the request-level re-derivation fills values in one place
+/// instead of scattered constants. The skeleton starts with every value unset
+/// (zero); a zero is not a final parameter, and the frozen layout replaces it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestLayout {
+    values: Vec<LayoutValue>,
+}
+
+impl RequestLayout {
+    /// Every quantity the request chain's layout fixes.
+    pub const NAMES: [&'static str; 9] = [
+        "mask_rows",
+        "mask_slots",
+        "end_values",
+        "stack_rounds",
+        "merge_rounds",
+        "opening_budget",
+        "sample_plan",
+        "tree_layout",
+        "stage_plan",
+    ];
+
+    /// The skeleton: every value unset until the layout is frozen.
+    pub fn skeleton() -> Self {
+        Self {
+            values: Self::NAMES
+                .iter()
+                .map(|name| LayoutValue { name, value: 0 })
+                .collect(),
+        }
+    }
+
+    pub fn entries(&self) -> &[LayoutValue] {
+        &self.values
+    }
+
+    /// Sets one named quantity. An unknown name is refused, and the table
+    /// never grows: the layout's list is fixed by the skeleton.
+    pub fn set(&mut self, name: &str, value: u64) -> Result<()> {
+        let entry = self
+            .values
+            .iter_mut()
+            .find(|entry| entry.name == name)
+            .ok_or(Error::InvalidConfig)?;
+        entry.value = value;
+        Ok(())
+    }
+
+    pub fn get(&self, name: &str) -> Result<u64> {
+        self.values
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.value)
+            .ok_or(Error::InvalidConfig)
+    }
+
+    /// True while every value is unset: the skeleton, not the frozen layout.
+    pub fn is_skeleton(&self) -> bool {
+        self.values.iter().all(|entry| entry.value == 0)
+    }
+}
+
 /// The section's version.
 pub const REQUEST_CHAIN_VERSION: u64 = 1;
 
@@ -480,6 +550,22 @@ mod tests {
             stack: proof(3, 2, 20),
             merge: proof(4, 1, 30),
         }
+    }
+
+    #[test]
+    fn the_layout_registers_every_quantity_by_name() {
+        let mut layout = RequestLayout::skeleton();
+        assert_eq!(layout.entries().len(), RequestLayout::NAMES.len());
+        assert!(layout.is_skeleton());
+        layout.set("mask_rows", 64).unwrap();
+        layout.set("end_values", 4).unwrap();
+        assert_eq!(layout.get("mask_rows").unwrap(), 64);
+        assert_eq!(layout.get("end_values").unwrap(), 4);
+        assert!(!layout.is_skeleton());
+        // Unknown names are refused and the table does not grow.
+        assert!(layout.set("unknown", 1).is_err());
+        assert!(layout.get("unknown").is_err());
+        assert_eq!(layout.entries().len(), RequestLayout::NAMES.len());
     }
 
     #[test]
