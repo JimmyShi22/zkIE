@@ -385,6 +385,53 @@ impl ChainMaskPlan {
     }
 }
 
+/// The two source rows of the stack group: the shown A0 against the left table
+/// side with the equation weights, and the shown B0 against the right side,
+/// each carrying its own sub-proof mask slot with the stack end factor. The
+/// cell entries and the owner of the table are trusted plan data.
+pub fn stack_source_rows(
+    left_owner: u64,
+    left_entries: &[u64],
+    left_weights: &[Fp3],
+    right_owner: u64,
+    right_entries: &[u64],
+    right_weights: &[Fp3],
+    a0: Fp3,
+    b0: Fp3,
+    mask_member: u64,
+    a0_slot: u64,
+    b0_slot: u64,
+    beta_stack: Fp3,
+) -> Result<(
+    zkie_engine::pcs::request::bat::BatRow,
+    zkie_engine::pcs::request::bat::BatRow,
+)> {
+    use zkie_engine::pcs::request::bat::{BatPart, BatRow, BatRowKind};
+    if left_entries.len() != left_weights.len()
+        || right_entries.len() != right_weights.len()
+        || beta_stack.is_zero()
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let build = |owner: u64,
+                 entries: &[u64],
+                 weights: &[Fp3],
+                 shown: Fp3,
+                 slot: u64|
+     -> zkie_engine::pcs::request::bat::BatRow {
+        let mut row = BatRow::new(BatRowKind::Plain);
+        for (entry, weight) in entries.iter().zip(weights) {
+            row.add_unit(owner, BatPart::Main, *entry, *weight);
+        }
+        row.add_unit(mask_member, BatPart::Mask, slot, beta_stack);
+        row.target = shown;
+        row
+    };
+    let left = build(left_owner, left_entries, left_weights, a0, a0_slot);
+    let right = build(right_owner, right_entries, right_weights, b0, b0_slot);
+    Ok((left, right))
+}
+
 /// Lands one sub-proof row form on the chain mask table: the hiding entries
 /// live at the table's first entries in order, each counted mask slot maps
 /// through the trusted slot-to-entry list, and kept values keep their own
@@ -1336,6 +1383,46 @@ mod chain_mask_tests {
         // The sample form reads the mask table row bits and the mask code
         // message bits.
         assert_eq!(plan.sample_bits().unwrap(), 2 + 4);
+        // The stack source rows: the shown A0/B0 against the table sides with
+        // equation weights and their own mask slots.
+        let (left_row, right_row) = stack_source_rows(
+            21,
+            &[0, 2],
+            &[Fp3::from_u64(3), Fp3::from_u64(5)],
+            21,
+            &[1, 3],
+            &[Fp3::from_u64(7), Fp3::from_u64(11)],
+            Fp3::from_u64(31),
+            Fp3::from_u64(41),
+            41,
+            6,
+            9,
+            Fp3::from_u64(13),
+        )
+        .unwrap();
+        assert_eq!(left_row.target, Fp3::from_u64(31));
+        assert_eq!(left_row.units.len(), 3);
+        assert_eq!(left_row.units[2].index, 6);
+        assert_eq!(left_row.units[2].coefficient, Fp3::from_u64(13));
+        assert_eq!(right_row.target, Fp3::from_u64(41));
+        assert_eq!(right_row.units[1].index, 3);
+        assert_eq!(right_row.units[2].index, 9);
+        // A weights list of another length and a zero factor are refused.
+        assert!(stack_source_rows(
+            21,
+            &[0],
+            &[Fp3::ONE],
+            21,
+            &[1],
+            &[Fp3::ONE],
+            Fp3::ONE,
+            Fp3::ONE,
+            41,
+            6,
+            9,
+            Fp3::ZERO,
+        )
+        .is_err());
         // A sub-proof row form lands on the table: hiding entries at the first
         // entries, the counted slot through the plan slot list, the kept value
         // on its own owner.
