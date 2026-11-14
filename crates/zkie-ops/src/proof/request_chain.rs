@@ -284,7 +284,15 @@ impl ChainMaskPlan {
 /// values; every one of the three has its own oracle and tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RangePlan {
+    /// The original computation matrix in the functional's read orientation:
+    /// its cell rows are the activation tensor's hidden features, its cell
+    /// columns the positions. The range objects are derived from the
+    /// activation, not from the weight table.
     pub matrix: PackedMatrixPlan,
+    /// The number of balanced base-256 limbs of the activation cells. This
+    /// step lays one range object per limb and carries a single limb; a larger
+    /// count is refused until the per-limb messages land.
+    pub limbs: u32,
     /// The digit object's addresses: two planes over the matrix's cell rows.
     pub combination: RangeCombinationPlan,
     /// The number of random column combinations, a power of two.
@@ -398,6 +406,9 @@ impl RangePlan {
         }
         if self.matrix.rows == 0 || self.matrix.columns == 0 || self.matrix.groups == 0 {
             return Some("the range matrix has no geometry");
+        }
+        if self.limbs == 0 {
+            return Some("the range matrix has no limb");
         }
         if self.combination.columns != self.matrix.rows
             || self.combination.planes != 2
@@ -1223,6 +1234,7 @@ mod tests {
         };
         let plan = RangePlan {
             matrix: PackedMatrixPlan::new(4, 2).unwrap(),
+            limbs: 1,
             combination: RangeCombinationPlan::new(4, 2, 10, 0).unwrap(),
             combinations: 2,
             high_bits: 8,

@@ -907,10 +907,11 @@ fn hidden_plan_for(
     plan.send.index_mask = Some(index_plan);
     plan.send.dot = Some(dot_plan(positions, code));
     // The consumer's pending claim and reduced witness. The claim's weights are
-    // the first position's activation row over the matrix rows; the tables cut
-    // each row into eight runs of the columns. The pending claim is not yet
-    // consumed by the second chain; this run binds the witness root into the
-    // first message and the session encoding.
+    // the first position's activation row over the matrix rows. The reduced
+    // witness reduces the original computation matrix the functional reads:
+    // the activation tensor, positions by hidden features, one run per table
+    // cut. The pending claim is not yet consumed by the second chain; this run
+    // binds the witness root into the first message and the session encoding.
     let row = activation
         .weights(0, MATRIX_ROWS)
         .expect("activation row");
@@ -924,8 +925,8 @@ fn hidden_plan_for(
             coeff: Fp3::from_u64(5),
         }],
     };
-    let run_length = COLUMNS / 8;
-    let entries = MATRIX_ROWS * (COLUMNS / run_length);
+    let run_length = HIDDEN as u64 / 8;
+    let entries = positions as u64 * (HIDDEN as u64 / run_length);
     plan.send.member = Some(MemberPlan {
         index_oracle: INDEX_MASK_ORACLE,
         row_bits: MATRIX_ROWS.trailing_zeros(),
@@ -935,8 +936,8 @@ fn hidden_plan_for(
             matrix: 0,
             parts: 1,
             run_length,
-            rows_per_part: MATRIX_ROWS,
-            columns: COLUMNS,
+            rows_per_part: positions as u64,
+            columns: HIDDEN as u64,
             at: 0,
             entries,
             phi: (1..=run_length).map(Fp3::from_u64).collect(),

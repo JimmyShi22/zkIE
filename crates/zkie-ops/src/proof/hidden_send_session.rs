@@ -2054,11 +2054,17 @@ impl HiddenSendPlan {
             let witness =
                 crate::proof::hidden_member::ReductionWitnessPlan::from_tables(member.tables.clone())
                     .map_err(|_| Error::InvalidConfig)?;
+            // The reduced read tables reduce the original computation
+            // matrix the functional reads: the activation tensor, one table
+            // per limb, rows the positions, columns the hidden features. The
+            // weight table keeps its own commitment and consumption path.
             for table in &member.tables {
-                if table.matrix != 0
-                    || table.parts != 1
-                    || table.rows_per_part != self.matrix_rows
-                    || table.columns != self.columns
+                if table.parts != 1
+                    || table.rows_per_part != self.activation.positions as u64
+                    || table.columns != self.activation.hidden as u64
+                    || table.run_length == 0
+                    || table.columns % table.run_length != 0
+                    || table.phi.len() as u64 != table.run_length
                 {
                     return Err(Error::InvalidConfig);
                 }
@@ -2178,9 +2184,10 @@ impl HiddenSendPlan {
         // entries.
         if let Some(range) = &self.range {
             if range.fault().is_some()
-                || range.matrix.rows != self.columns
-                || range.matrix.columns != self.matrix_rows
+                || range.matrix.rows != self.activation.hidden as u64
+                || range.matrix.columns != self.activation.positions as u64
                 || range.group != self.group
+                || self.activation_source != ActivationSource::Commitment
             {
                 return Err(Error::InvalidConfig);
             }
@@ -2191,6 +2198,15 @@ impl HiddenSendPlan {
                 return Err(Error::InvalidConfig);
             }
             let member = self.member.as_ref().ok_or(Error::InvalidConfig)?;
+            // One range object per limb: this step carries a single limb, and
+            // a plan whose table count or limb count differs is refused rather
+            // than folded into one matrix.
+            if range.limbs != 1
+                || member.tables.len() != 1
+                || member.tables[0].matrix != 0
+            {
+                return Err(Error::InvalidConfig);
+            }
             let witness =
                 crate::proof::hidden_member::ReductionWitnessPlan::from_tables(member.tables.clone())
                     .map_err(|_| Error::InvalidConfig)?;
@@ -4061,42 +4077,106 @@ pub fn stack_reads(
 /// The salt-derivation purpose of the reduced-witness tree.
 const REDUCTION_SALT_PURPOSE: u64 = 16;
 
-/// Streams the table once and computes the reduced-witness entries: for each
-/// table, each row's runs with the table's point, in table order.
+/// The activation tensor's signed integer cells: row = position, column =
+/// hidden feature. The committed rows are signed-word embeddings, so every
+/// entry is the tensor's integer value; another encoding is refused.
+fn activation_cells(activation: &CommittedActivation) -> Result<Vec<Vec<i128>>> {
+    let shape = activation.shape();
+    let mut cells = Vec::with_capacity(shape.positions as usize);
+    for row in activation.rows() {
+        if row.len() != shape.hidden as usize {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut row_cells = Vec::with_capacity(row.len());
+        for value in row {
+            if value.c[1] != Fp::ZERO || value.c[2] != Fp::ZERO {
+                return Err(Error::StatementMismatch);
+            }
+            row_cells.push(crate::proof::packed_matrix::signed_cell(value.c[0])?);
+        }
+        cells.push(row_cells);
+    }
+    Ok(cells)
+}
+
+/// The balanced base-256 limbs of one integer: `b = ((v + 128) mod 256) - 128`
+/// and `v = (v - b) / 256` per limb, so each limb is a signed byte and the
+/// integer is `sum_l 256^l b_l`. A value that does not fit the declared limb
+/// count is refused, never reduced.
+fn balanced_limbs(value: i128, limbs: u32) -> Result<Vec<i128>> {
+    if limbs == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let mut rest = value;
+    let mut out = Vec::with_capacity(limbs as usize);
+    for _ in 0..limbs {
+        let digit = (rest + 128).rem_euclid(256) - 128;
+        out.push(digit);
+        rest = (rest - digit) / 256;
+    }
+    if rest != 0 {
+        return Err(Error::BoundViolation);
+    }
+    Ok(out)
+}
+
+/// The reduced-witness entries of the read tables over the original
+/// computation matrix: the activation tensor's limb cells are signed bytes,
+/// each table reduces one limb, and entry (position, run) is the run's scalar
+/// product with the table's point. The tables' blocks follow each other from
+/// zero, in table order.
 fn reduction_entries(
     plan: &HiddenSendPlan,
     member: &MemberPlan,
-    source: &mut dyn TableRowSource,
+    activation: &CommittedActivation,
 ) -> Result<Vec<Fp3>> {
-    let ell = usize::try_from(plan.table_shape.code.ell).map_err(|_| Error::ResourceLimit)?;
-    let tail_len = usize::try_from(plan.table_shape.code.r).map_err(|_| Error::ResourceLimit)?;
-    let columns = usize::try_from(plan.columns).map_err(|_| Error::ResourceLimit)?;
-    let mut message = vec![Fp::ZERO; ell];
-    let mut tail = vec![Fp::ZERO; tail_len];
-    // The witness plan gives each read table one contiguous block, in table
-    // order; the table stream is read once and the blocks are filled after it.
-    let mut rows_cells: Vec<Vec<Fp3>> = Vec::with_capacity(
-        usize::try_from(plan.matrix_rows).map_err(|_| Error::ResourceLimit)?,
-    );
-    for row in 0..plan.matrix_rows {
-        source.row(row, &mut message, &mut tail)?;
-        rows_cells.push(
-            message[..columns]
-                .iter()
-                .map(|value| Fp3::from_base(*value))
-                .collect(),
-        );
+    let shape = plan.activation;
+    let cells = activation_cells(activation)?;
+    if cells.len() != shape.positions as usize
+        || cells.iter().any(|row| row.len() != shape.hidden as usize)
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let limbs = member.tables.len() as u32;
+    if limbs == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    // The limb cells of every value, in the tensor's row-major order.
+    let mut digits = Vec::with_capacity(cells.len());
+    for row in &cells {
+        let mut row_limbs = Vec::with_capacity(row.len());
+        for value in row {
+            row_limbs.push(balanced_limbs(*value, limbs)?);
+        }
+        digits.push(row_limbs);
     }
     let mut entries = Vec::new();
-    for table in &member.tables {
+    for (limb, table) in member.tables.iter().enumerate() {
+        let hidden = usize::try_from(table.columns).map_err(|_| Error::ResourceLimit)?;
         let run = usize::try_from(table.run_length).map_err(|_| Error::ResourceLimit)?;
-        for cells in &rows_cells {
+        if table.parts != 1
+            || table.matrix as usize != limb
+            || table.rows_per_part as usize != digits.len()
+            || hidden == 0
+            || run == 0
+            || hidden % run != 0
+            || table.phi.len() != run
+        {
+            return Err(Error::InvalidConfig);
+        }
+        for row in &digits {
             let mut start = 0usize;
-            while start < columns {
-                entries.push(crate::proof::hidden_member::entry_value(
-                    &cells[start..start + run],
-                    &table.phi,
-                )?);
+            while start < hidden {
+                let mut sum = Fp3::ZERO;
+                for (offset, weight) in table.phi.iter().enumerate() {
+                    let digit = row[start + offset][limb];
+                    sum = sum.add(
+                        &weight.mul(&Fp3::from_base(
+                            crate::proof::column_session::fp_from_signed_word(digit as i64 as u64),
+                        )),
+                    );
+                }
+                entries.push(sum);
                 start += run;
             }
         }
@@ -4148,7 +4228,7 @@ pub fn prove_hidden_send(
     check_table(plan, table_reader)?;
     let (reduction_root, _reduction_tree) = match &plan.member {
         Some(member) => {
-            let entries = reduction_entries(plan, member, table_source)?;
+            let entries = reduction_entries(plan, member, activation)?;
             let tree = reduction_tree(plan, member, &entries)?;
             (Some(*tree.root()), Some(tree))
         }
@@ -5005,40 +5085,50 @@ struct RangeWitness {
     messages: RangeMessages,
 }
 
-/// The packed symbol array of the range matrix from the table's cells. The
-/// range matrix is the functional's matrix: its cell rows are the table's
-/// columns. Three consecutive cell rows of one cell column (a table row) are
-/// packed at radix `2^20`, and every cell must lie in the signed window; a
-/// cell outside it is refused, never reduced.
+/// The packed symbol array of the range object. The original computation
+/// matrix is the activation tensor in the functional's read orientation: cell
+/// rows are the hidden features, cell columns the positions. Every cell is a
+/// balanced byte of its limb, and three consecutive cell rows of one cell
+/// column are packed at radix `2^20`; a value outside the limb's range is
+/// refused, never reduced.
 fn range_symbol_values(
     plan: &HiddenSendPlan,
-    source: &mut dyn TableRowSource,
-) -> Result<Vec<Fp3>> {
-    use crate::proof::packed_matrix::{signed_cell, PACK_BASE};
+    activation: &CommittedActivation,
+) -> Result<Vec<Fp3>> {    use crate::proof::packed_matrix::PACK_BASE;
     let range = plan.range.as_ref().ok_or(Error::InvalidConfig)?;
+    let cells = activation_cells(activation)?;
+    let rows_cell = usize::try_from(range.matrix.rows).map_err(|_| Error::ResourceLimit)?;
     let columns = usize::try_from(range.matrix.columns).map_err(|_| Error::ResourceLimit)?;
     let groups = usize::try_from(range.matrix.groups).map_err(|_| Error::ResourceLimit)?;
-    if range.matrix.rows != plan.columns || range.matrix.columns != plan.matrix_rows {
+    if cells.len() != columns || cells.iter().any(|row| row.len() != rows_cell) {
         return Err(Error::ShapeMismatch);
     }
-    let ell = usize::try_from(plan.table_shape.code.ell).map_err(|_| Error::ResourceLimit)?;
-    let tail_len = usize::try_from(plan.table_shape.code.r).map_err(|_| Error::ResourceLimit)?;
-    let mut message = vec![Fp::ZERO; ell];
-    let mut tail = vec![Fp::ZERO; tail_len];
+    // The limb cells of every value, laid out as the read matrix: cell row =
+    // hidden feature, cell column = position.
+    let mut limb_cells = vec![0i128; rows_cell * columns];
+    for (position, row) in cells.iter().enumerate() {
+        for (feature, value) in row.iter().enumerate() {
+            let limbs = balanced_limbs(*value, range.limbs)?;
+            limb_cells[feature * columns + position] = limbs[0];
+        }
+    }
     let mut packed = vec![0i128; groups * columns];
-    for row in 0..plan.matrix_rows {
-        source.row(row, &mut message, &mut tail)?;
-        for column in 0..plan.columns {
-            let cell = signed_cell(message[column as usize])?;
-            let group = (column as usize) / 3;
-            let lane = (column as usize) % 3;
-            let scale = PACK_BASE.pow(lane as u32);
-            let entry = packed
-                .get_mut(group * columns + row as usize)
-                .ok_or(Error::ResourceLimit)?;
-            *entry = entry
-                .checked_add(scale.checked_mul(cell).ok_or(Error::ResourceLimit)?)
-                .ok_or(Error::ResourceLimit)?;
+    for s in 0..groups {
+        for c in 0..columns {
+            let mut value = 0i128;
+            let mut scale = 1i128;
+            for lane in 0..3usize {
+                let i = 3 * s + lane;
+                if i >= rows_cell {
+                    break;
+                }
+                let cell = limb_cells[i * columns + c];
+                value = value
+                    .checked_add(scale.checked_mul(cell).ok_or(Error::ResourceLimit)?)
+                    .ok_or(Error::ResourceLimit)?;
+                scale = scale.checked_mul(PACK_BASE).ok_or(Error::ResourceLimit)?;
+            }
+            packed[s * columns + c] = value;
         }
     }
     let mut values = vec![
@@ -5053,41 +5143,36 @@ fn range_symbol_values(
     Ok(values)
 }
 
-/// The digit values of the range matrix under the combination matrix Cf: for
+/// The digit values of the range object under the combination matrix Cf: for
 /// each cell row and combination, the window value `Z + 2^LBZ` splits into a
-/// low and a high digit, stored at the plan's places. `Z` combines the matrix
-/// row over its columns with `Cf`.
+/// low and a high digit, stored at the plan's places. `Z` combines the
+/// activation cells of one cell row over the cell columns with `Cf`.
 fn range_digit_values(
     plan: &HiddenSendPlan,
     cf: &[i8],
-    source: &mut dyn TableRowSource,
-) -> Result<Vec<Fp3>> {
-    use crate::proof::packed_matrix::signed_cell;
-    let range = plan.range.as_ref().ok_or(Error::InvalidConfig)?;
+    activation: &CommittedActivation,
+) -> Result<Vec<Fp3>> {    let range = plan.range.as_ref().ok_or(Error::InvalidConfig)?;
+    let cells = activation_cells(activation)?;
     let rows = usize::try_from(range.matrix.rows).map_err(|_| Error::ResourceLimit)?;
     let columns = usize::try_from(range.matrix.columns).map_err(|_| Error::ResourceLimit)?;
     let combinations = range.combinations as usize;
+    if cells.len() != columns || cells.iter().any(|row| row.len() != rows) {
+        return Err(Error::ShapeMismatch);
+    }
     if cf.len() != columns * combinations {
         return Err(Error::ShapeMismatch);
     }
-    let ell = usize::try_from(plan.table_shape.code.ell).map_err(|_| Error::ResourceLimit)?;
-    let tail_len = usize::try_from(plan.table_shape.code.r).map_err(|_| Error::ResourceLimit)?;
-    let mut message = vec![Fp::ZERO; ell];
-    let mut tail = vec![Fp::ZERO; tail_len];
     let mut z = vec![0i128; combinations * rows];
-    for row in 0..plan.matrix_rows {
-        source.row(row, &mut message, &mut tail)?;
-        for column in 0..plan.columns {
-            let cell = signed_cell(message[column as usize])?;
-            let at = column as usize;
-            for (u, coefficient) in cf[(row as usize) * combinations..(row as usize + 1) * combinations]
-                .iter()
-                .enumerate()
-            {
+    for (position, row) in cells.iter().enumerate() {
+        for (feature, value) in row.iter().enumerate() {
+            let limbs = balanced_limbs(*value, range.limbs)?;
+            let cell = limbs[0];
+            let coefficient = &cf[position * combinations..(position + 1) * combinations];
+            for (u, coefficient) in coefficient.iter().enumerate() {
                 if *coefficient == 0 {
                     continue;
                 }
-                let slot = &mut z[u * rows + at];
+                let slot = &mut z[u * rows + feature];
                 *slot = slot
                     .checked_add(
                         (*coefficient as i128)
@@ -5757,7 +5842,7 @@ fn segment_tree_source<'a>(
 fn prove_first_chain_segment(
     chain: Chain,
     plan: &HiddenLinPlan,
-    table: &mut dyn HiddenTableProver,
+    activation: Option<&CommittedActivation>,
     inputs: &crate::proof::request_chain::ChainInputs,
     seed: &Digest,
 ) -> Result<(
@@ -5804,11 +5889,8 @@ fn prove_first_chain_segment(
     // committed and sampled before the segment's challenges.
     let mut range_array: Option<(RequestWWitness, RequestWMessage)> = None;
     if let Some(range_plan) = &plan.send.range {
-        let values = {
-            let source: &mut dyn TableRowSource = &mut *table;
-            range_symbol_values(&plan.send, source)
-                ?
-        };
+        let activation = activation.ok_or(Error::InvalidConfig)?;
+        let values = range_symbol_values(&plan.send, activation)?;
         let (witness, mut message) = commit_range_message(
             range_plan,
             &range_plan.array_shape,
@@ -5893,9 +5975,9 @@ fn prove_first_chain_segment(
     let mut range_units: Option<(RequestWWitness, RequestWMessage)> = None;
     if let (Some(range_plan), Some(_)) = (&plan.send.range, &range_array) {
         let member = plan.send.member.as_ref().ok_or(Error::InvalidConfig)?;
+        let activation = activation.ok_or(Error::InvalidConfig)?;
         let values = {
-            let source: &mut dyn TableRowSource = &mut *table;
-            let entries = reduction_entries(&plan.send, member, source)?;
+            let entries = reduction_entries(&plan.send, member, activation)?;
             let columns = entries
                 .len()
                 .checked_next_power_of_two()
@@ -5946,10 +6028,8 @@ fn prove_first_chain_segment(
             .checked_mul(range_plan.combinations as usize)
             .ok_or(Error::ResourceLimit)?;
         let cf = chain.draw_trits(trits)?;
-        let values = {
-            let source: &mut dyn TableRowSource = &mut *table;
-            range_digit_values(&plan.send, &cf, source)?
-        };
+        let activation = activation.ok_or(Error::InvalidConfig)?;
+        let values = range_digit_values(&plan.send, &cf, activation)?;
         let (witness, mut message) = commit_range_message(
             range_plan,
             &range_plan.digit_shape,
@@ -10355,8 +10435,8 @@ fn prove_first(
     } else {
         match &plan.send.member {
             Some(member) => {
-                let source: &mut dyn TableRowSource = &mut *table;
-                let entries = reduction_entries(&plan.send, member, source)?;
+                let activation = activation.ok_or(Error::InvalidConfig)?;
+                let entries = reduction_entries(&plan.send, member, activation)?;
                 let tree = reduction_tree(&plan.send, member, &entries)?;
                 (Some(*tree.root()), Some(tree))
             }
@@ -10535,7 +10615,7 @@ fn prove_first(
                 proximity,
                 rows,
                 range_messages,
-            ) = prove_first_chain_segment(chain, plan, table, inputs, seed)?;
+            ) = prove_first_chain_segment(chain, plan, activation, inputs, seed)?;
             chain = next_chain;
             bind_chain_pending(plan, &outputs.pending)?;
             chain_mask_message = mask_message;
@@ -26387,8 +26467,8 @@ mod merged_tests {
                 0,
                 1,
                 2,
-                MATRIX_ROWS,
-                COLUMNS,
+                POSITIONS as u64,
+                HIDDEN as u64,
                 vec![Fp3::from_u64(1), Fp3::from_u64(2)],
                 false,
             )
@@ -26522,12 +26602,16 @@ mod merged_tests {
         (plan, messages, witness)
     }
 
-    /// One range plan over the fixture's geometry: the functional's matrix is
-    /// the table's cells transposed, the reduced read table reuses the
+    /// One range plan over the fixture's geometry: the original computation
+    /// matrix is the activation tensor in the functional's read orientation
+    /// (hidden features by positions), the reduced read table reuses the
     /// member's tree, and each of the three messages has its own oracle.
     fn range_plan() -> crate::proof::request_chain::RangePlan {
-        let matrix = crate::proof::packed_matrix::PackedMatrixPlan::new(COLUMNS, MATRIX_ROWS)
-            .unwrap();
+        let matrix = crate::proof::packed_matrix::PackedMatrixPlan::new(
+            HIDDEN as u64,
+            POSITIONS as u64,
+        )
+        .unwrap();
         let shape = |tree_number: u64, leaf_class: u32, run: Digest, main_rows: u64| WShape {
             code: code(),
             main_rows,
@@ -26541,6 +26625,7 @@ mod merged_tests {
         let unit = shape(500, 2, Digest([0x68; 32]), 1);
         crate::proof::request_chain::RangePlan {
             matrix,
+            limbs: 1,
             combination: crate::proof::packed_matrix::RangeCombinationPlan::new(
                 matrix.rows, 2, 10, 0,
             )
@@ -26642,9 +26727,11 @@ mod merged_tests {
         plan.send.range = Some(range_plan());
         let range = plan.send.range.as_ref().unwrap();
         let member = plan.send.member.as_ref().unwrap();
-        // The table's cells, row-major: two rows of four.
-        let cells: [i128; 8] = [3, -1, 2, -4, -2, 5, -3, 1];
-        let unit = |row: usize, column: usize| cells[row * 4 + column];
+        // The computation matrix's cells in the functional's read orientation:
+        // cell rows are the hidden features, cell columns the positions, and
+        // `cells` holds them row-major as positions by hidden features.
+        let cells: [i128; 4] = [3, -1, 2, -4];
+        let unit = |position: usize, feature: usize| cells[position * 2 + feature];
         // The read table's entries: row r, run q of two columns.
         let table = &member.tables[0];
         let phi = table.phi.clone();
@@ -27254,6 +27341,7 @@ mod merged_tests {
     /// runs before its sub-proof.
     fn segment_chain(
         plan: &HiddenLinPlan,
+        activation: &CommittedActivation,
         reader: &IndexReader,
         messages: &HiddenSendMessages,
         inputs: &crate::proof::request_chain::ChainInputs,
@@ -27284,13 +27372,9 @@ mod merged_tests {
             let _opening = witness.tree.open(&positions)?;
         }
         if let Some(range_plan) = &plan.send.range {
-            // The fixture's table is zero, so the packed symbol array is the
-            // zero vector; the commit and the sample are deterministic from
-            // the shape and the seed, as in the session.
-            let values = vec![
-                Fp3::ZERO;
-                usize::try_from(range_plan.array_columns()?).map_err(|_| Error::ResourceLimit)?
-            ];
+            // The packed symbol array is the original computation matrix's
+            // message, derived from the same activation the session reads.
+            let values = super::range_symbol_values(&plan.send, activation)?;
             let (witness, mut message) = super::commit_range_message(
                 range_plan,
                 &range_plan.array_shape,
@@ -27561,7 +27645,7 @@ mod merged_tests {
             index_oracle: index.oracle,
             index_slot: index_slot as u64,
         };
-        let mut chain = segment_chain(&plan, &table.reader, &setup_messages, &mask_inputs, seed).unwrap();
+        let mut chain = segment_chain(&plan, &activation, &table.reader, &setup_messages, &mask_inputs, seed).unwrap();
         let (token_output, epsilon) = {
             let mut challenges = super::ChainSegmentChallenges { chain: &mut chain };
             let mut recorder = FirstDraws {
@@ -27628,7 +27712,7 @@ mod merged_tests {
             index_oracle: index.oracle,
             index_slot: index_slot as u64,
         };
-        let mut chain = segment_chain(&plan, &table.reader, &setup_messages, &inputs, seed).unwrap();
+        let mut chain = segment_chain(&plan, &activation, &table.reader, &setup_messages, &inputs, seed).unwrap();
         let (section, proven) = {
             let mut challenges = super::ChainSegmentChallenges { chain: &mut chain };
             super::prove_request_chain_section(&plan.send, &inputs, &mut challenges).unwrap()
@@ -27638,7 +27722,7 @@ mod merged_tests {
             stack: section.stack.clone(),
             merge: section.merge.clone(),
         };
-        let mut chain = segment_chain(&plan, &table.reader, &setup_messages, &inputs, seed).unwrap();
+        let mut chain = segment_chain(&plan, &activation, &table.reader, &setup_messages, &inputs, seed).unwrap();
         let outputs = {
             let mut challenges = super::ChainSegmentChallenges { chain: &mut chain };
             crate::proof::request_chain::verify_request_chain_direct(&inputs, &proof, &mut challenges)
@@ -27677,9 +27761,9 @@ mod merged_tests {
         changed_section.stack.rounds[0].coefficients[0] = changed_section.stack.rounds[0]
             .coefficients[0]
             .add(&Fp3::ONE);
-        let mut fixed = segment_chain(&plan, &table.reader, &setup_messages, &inputs, seed).unwrap();
+        let mut fixed = segment_chain(&plan, &activation, &table.reader, &setup_messages, &inputs, seed).unwrap();
         super::absorb_request_chain_section(&mut fixed, shape, &section).unwrap();
-        let mut changed_chain = segment_chain(&plan, &table.reader, &setup_messages, &inputs, seed).unwrap();
+        let mut changed_chain = segment_chain(&plan, &activation, &table.reader, &setup_messages, &inputs, seed).unwrap();
         super::absorb_request_chain_section(&mut changed_chain, shape, &changed_section).unwrap();
         assert_ne!(*fixed.value(), *changed_chain.value());
         // The section is fixed before the seal: a changed stack proof is
@@ -27950,7 +28034,7 @@ mod merged_tests {
             stack_right: &changed_cell,
             ..inputs
         };
-        let mut chain = segment_chain(&plan, &table.reader, &setup_messages, &inputs, seed).unwrap();
+        let mut chain = segment_chain(&plan, &activation, &table.reader, &setup_messages, &inputs, seed).unwrap();
         let changed_cell_result = {
             let mut challenges = super::ChainSegmentChallenges { chain: &mut chain };
             crate::proof::request_chain::verify_request_chain_direct(
@@ -27966,7 +28050,7 @@ mod merged_tests {
             end_slots: &short,
             ..inputs
         };
-        let mut chain = segment_chain(&plan, &table.reader, &setup_messages, &inputs, seed).unwrap();
+        let mut chain = segment_chain(&plan, &activation, &table.reader, &setup_messages, &inputs, seed).unwrap();
         let short_result = {
             let mut challenges = super::ChainSegmentChallenges { chain: &mut chain };
             crate::proof::request_chain::verify_request_chain_direct(
@@ -27981,7 +28065,7 @@ mod merged_tests {
             end_slots: &repeated,
             ..inputs
         };
-        let mut chain = segment_chain(&plan, &table.reader, &setup_messages, &inputs, seed).unwrap();
+        let mut chain = segment_chain(&plan, &activation, &table.reader, &setup_messages, &inputs, seed).unwrap();
         let repeated_result = {
             let mut challenges = super::ChainSegmentChallenges { chain: &mut chain };
             crate::proof::request_chain::verify_request_chain_direct(
@@ -28009,7 +28093,7 @@ mod merged_tests {
             end_slots: &swapped,
             ..inputs
         };
-        let mut chain = segment_chain(&plan, &table.reader, &setup_messages, &inputs, seed).unwrap();
+        let mut chain = segment_chain(&plan, &activation, &table.reader, &setup_messages, &inputs, seed).unwrap();
         let swapped = {
             let mut challenges = super::ChainSegmentChallenges { chain: &mut chain };
             crate::proof::request_chain::verify_request_chain_direct(
