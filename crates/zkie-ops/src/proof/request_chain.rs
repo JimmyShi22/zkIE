@@ -175,6 +175,9 @@ pub struct ChainMaskPlan {
     pub mask_code: zkie_engine::pcs::request::code::CodeParams,
     pub mask_rows: u64,
     pub entries: usize,
+    /// The number of positions one test opens in the table; the table's code
+    /// tail must cover them.
+    pub openings: usize,
     pub tree: zkie_engine::pcs::request::runtime_tree::RuntimeTreePlan,
 }
 
@@ -198,6 +201,9 @@ impl ChainMaskPlan {
         }
         if self.entries == 0 {
             return Some("the sub-proof mask table has no entries");
+        }
+        if self.openings == 0 || self.openings as u64 > self.mask_code.r {
+            return Some("the sub-proof mask opening count exceeds its tail");
         }
         if self.tree.fault().is_some() {
             return Some("the sub-proof mask tree is not a tree");
@@ -258,6 +264,30 @@ impl ChainMaskPlan {
         (row as u64)
             .checked_add((place as u64) << row_bits)
             .ok_or(Error::ResourceLimit)
+    }
+}
+
+/// The read ledger of one sub-proof mask table: every test that opens the table
+/// adds its position count here, and the accumulated count may not pass the
+/// table's code tail. The ledger belongs to this object alone; another mask
+/// object's openings never enter it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChainMaskReads {
+    pub used: usize,
+}
+
+impl ChainMaskReads {
+    /// Records one test's openings against the table's tail.
+    pub fn open(&mut self, plan: &ChainMaskPlan, count: usize) -> Result<()> {
+        if plan.fault().is_some() || count == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        let used = self.used.checked_add(count).ok_or(Error::ResourceLimit)?;
+        if used as u64 > plan.mask_code.r {
+            return Err(Error::BoundViolation);
+        }
+        self.used = used;
+        Ok(())
     }
 }
 
@@ -1067,6 +1097,7 @@ mod chain_mask_tests {
             mask_code: build_code_plan(8, 16, 4).unwrap(),
             mask_rows: 4,
             entries: 8,
+            openings: 4,
             tree: RuntimeTreePlan {
                 tree_number: 700,
                 leaf_class: 9,
@@ -1105,5 +1136,13 @@ mod chain_mask_tests {
         broken.entries = 64;
         assert!(broken.fault().is_some());
         assert!(chain_mask_entries(&broken, &[0]).is_err());
+        // The read ledger: the table's own tail bounds the accumulated
+        // openings; another object never enters this count.
+        let mut reads = ChainMaskReads::default();
+        reads.open(&plan, 2).unwrap();
+        reads.open(&plan, 2).unwrap();
+        assert!(reads.open(&plan, 1).is_err());
+        let mut zero = reads;
+        assert!(zero.open(&plan, 0).is_err());
     }
 }

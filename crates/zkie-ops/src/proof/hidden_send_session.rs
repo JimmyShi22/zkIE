@@ -23715,6 +23715,7 @@ mod merged_tests {
             mask_code: mask_code(),
             mask_rows: 4,
             entries: 4,
+            openings: 4,
             tree: RuntimeTreePlan {
                 tree_number: 800,
                 leaf_class: 9,
