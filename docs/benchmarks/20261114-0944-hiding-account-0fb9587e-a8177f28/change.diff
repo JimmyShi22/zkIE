@@ -1,0 +1,128 @@
+commit 0fb9587e0bac8d61950aeee54e91739533860164
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Sat Nov 14 09:44:18 2026 +0800
+
+    Account the position hiding capacity per encoded object
+    
+    The trusted planner now keeps one position-hiding account per encoded object:
+    the random tail hides a fixed number of opened positions, already spent
+    listings are subtracted per object, and a main object and a mask object are
+    never pooled. A unified stage list must fit every affected object's remaining
+    capacity, and the first object that does not fit is named with its gap. The
+    sampled answers are counted separately: each answer takes a pad at the end of
+    its message's rows, and pads are not position-hiding capacity.
+    
+    This is the first piece of the capacity mapping; the table, range and link
+    conditions and the whole-chain round budget remain the next steps.
+
+diff --git a/crates/zkie-ops/src/proof/proximity_planner.rs b/crates/zkie-ops/src/proof/proximity_planner.rs
+index 786873e9..fb19410a 100644
+--- a/crates/zkie-ops/src/proof/proximity_planner.rs
++++ b/crates/zkie-ops/src/proof/proximity_planner.rs
+@@ -1135,6 +1135,67 @@ pub fn solve_first_stage(
+     })
+ }
+ 
++/// One encoded object's position-hiding account: the random tail hides
++/// `tail` opened positions in all, `spent` of them are already opened against
++/// this object. A main object and a mask object keep separate accounts: one
++/// object's tail never covers another's openings.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct HidingAccount {
++    pub tail: u64,
++    pub spent: u64,
++}
++
++impl HidingAccount {
++    /// The positions this object's tail can still hide.
++    pub fn remaining(&self) -> u64 {
++        self.tail.saturating_sub(self.spent)
++    }
++
++    /// Whether one opened list of `list_len` positions still fits.
++    pub fn covers(&self, list_len: u64) -> bool {
++        list_len > 0 && list_len <= self.remaining()
++    }
++}
++
++/// Checks that one unified stage list fits the remaining capacity of every
++/// affected object, each named. The first object that does not cover the list
++/// is named with the gap; the objects are never pooled.
++pub fn hiding_capacity(
++    names: &[&str],
++    accounts: &[HidingAccount],
++    list_len: u64,
++) -> std::result::Result<(), String> {
++    if names.len() != accounts.len() {
++        return Err("hiding accounting: the object list and the account list differ".into());
++    }
++    if list_len == 0 {
++        return Err("hiding accounting: empty stage list".into());
++    }
++    for (name, account) in names.iter().zip(accounts) {
++        if !account.covers(list_len) {
++            return Err(format!(
++                "{name}: the stage list of {list_len} positions exceeds the remaining capacity {}",
++                account.remaining()
++            ));
++        }
++    }
++    Ok(())
++}
++
++/// Whether the sampled answers fit their message: each answer takes a pad at
++/// the end of the message's rows. The pads are not position-hiding capacity
++/// and are counted on the message's own rows only.
++pub fn ood_pads_fit(entries: u64, rows: u64, ell: u64, answers: u32) -> bool {
++    if rows == 0 || ell == 0 {
++        return false;
++    }
++    let room = rows.checked_mul(ell).and_then(|value| value.checked_sub(entries));
++    match room {
++        Some(room) => room >= answers as u64,
++        None => false,
++    }
++}
++
+ fn ceil_log2(value: u64) -> u32 {
+     if value <= 1 {
+         return 0;
+@@ -1670,3 +1731,38 @@ mod first_stage_tests {
+         assert!(solve_first_stage(&g, &g, &g, 0, 1, 64, false).is_err());
+     }
+ }
++
++#[cfg(test)]
++mod hiding_account_tests {
++    use super::*;
++
++    #[test]
++    fn spent_and_remaining_are_per_object() {
++        let main = HidingAccount { tail: 100, spent: 40 };
++        let mask = HidingAccount { tail: 60, spent: 60 };
++        assert_eq!(main.remaining(), 60);
++        assert_eq!(mask.remaining(), 0);
++        assert!(hiding_capacity(&["main"], &[main], 60).is_ok());
++        // The two objects are not pooled: the main object cannot lend its
++        // remaining capacity to the mask object.
++        let error = hiding_capacity(&["main", "mask"], &[main, mask], 30).unwrap_err();
++        assert!(error.contains("mask"));
++        assert!(error.contains("remaining capacity 0"));
++        // A list longer than one object's remaining capacity is named.
++        let error = hiding_capacity(&["main"], &[main], 61).unwrap_err();
++        assert!(error.contains("main"));
++        assert!(hiding_capacity(&["main"], &[main], 0).is_err());
++    }
++
++    #[test]
++    fn pads_and_hiding_capacity_are_counted_separately() {
++        // The message has room for the entries and one answer pad.
++        assert!(ood_pads_fit(100, 2, 64, 1));
++        assert!(!ood_pads_fit(127, 2, 64, 2));
++        // A message with pads left can still fail the position account, and
++        // the reverse.
++        let spent = HidingAccount { tail: 10, spent: 10 };
++        assert!(!hiding_capacity(&["mask"], &[spent], 1).is_ok());
++        assert!(ood_pads_fit(10, 1, 16, 1));
++    }
++}
