@@ -1,0 +1,5 @@
+branch=refactor/v2
+head=47766e0a59bfb280c6f36fe83a6c25498fb786b0
+previous=bf4816340ee280cfede48854ac1f48e23d41c6ba
+origin	https://github.com/JimmyShi22/zkIE.git (fetch)
+origin	https://github.com/JimmyShi22/zkIE.git (push)

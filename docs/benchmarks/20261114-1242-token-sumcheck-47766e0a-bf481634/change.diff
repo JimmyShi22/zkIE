@@ -1,0 +1,442 @@
+commit 47766e0a59bfb280c6f36fe83a6c25498fb786b0
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Sat Nov 14 12:42:48 2026 +0800
+
+    Reduce the request relation over its tokens
+    
+    The request reduction starts with its token sumcheck: the claim is the equality-weighted sum of the token map at a token point, the sumcheck runs one equality weight per token bit, and the inner map rounds carry the equality factors of the later variables while the verifier weights the variable being bound. The general sumcheck also gains a sum-of-products summand over shown maps for the panel combinations of the layer relation. Focused tests compute the token claim by hand, prove and verify it, refuse a map whose sum does not match, and check the product-sum form.
+    
+    This is partial progress: the inner-dimension sumcheck, the stack and the row and affine claims are the next step.
+
+diff --git a/crates/zkie-ops/src/proof/mod.rs b/crates/zkie-ops/src/proof/mod.rs
+index 9c6de8ce..7422b3ff 100644
+--- a/crates/zkie-ops/src/proof/mod.rs
++++ b/crates/zkie-ops/src/proof/mod.rs
+@@ -36,6 +36,7 @@ pub mod proximity_planner;
+ pub mod asset_table;
+ pub mod model_commitment;
+ pub mod projection_claim;
++pub mod request_reduction;
+ pub mod request_weights;
+ pub mod norm_param_table;
+ 
+diff --git a/crates/zkie-ops/src/proof/psc_general.rs b/crates/zkie-ops/src/proof/psc_general.rs
+index 4ea917b5..20becfe8 100644
+--- a/crates/zkie-ops/src/proof/psc_general.rs
++++ b/crates/zkie-ops/src/proof/psc_general.rs
+@@ -55,6 +55,8 @@ pub enum Summand {
+     Leaves { alpha: Fp3, mu: usize },
+     /// `y_0`: one shown map, degree one. The map is summed over the cube.
+     Map,
++    /// `sum_t coeff_t * prod_{j in t} y_j`: a sum of products of shown maps.
++    ProductSum { terms: Vec<(Fp3, Vec<usize>)> },
+ }
+ 
+ impl Summand {
+@@ -66,6 +68,11 @@ impl Summand {
+             Self::Bits => 1,
+             Self::Leaves { .. } => 0,
+             Self::Map => 1,
++            Self::ProductSum { terms } => terms
++                .iter()
++                .flat_map(|(_, indices)| indices.iter())
++                .max()
++                .map_or(0, |index| index + 1),
+         }
+     }
+ 
+@@ -83,6 +90,11 @@ impl Summand {
+             Self::Bits => 2,
+             Self::Leaves { .. } => 0,
+             Self::Map => 1,
++            Self::ProductSum { terms } => terms
++                .iter()
++                .map(|(_, indices)| indices.len())
++                .max()
++                .unwrap_or(0),
+         }
+     }
+ 
+@@ -114,6 +126,18 @@ impl Summand {
+                 Ok(vec![Fp3::ONE, alpha.sub(&Fp3::ONE).sub(&table_at)])
+             }
+             Self::Map => Ok(vec![shown[0]]),
++            Self::ProductSum { terms } => {
++                let mut sum = Fp3::ZERO;
++                for (coefficient, indices) in terms {
++                    let mut term = *coefficient;
++                    for index in indices {
++                        let value = shown.get(*index).ok_or(Error::ShapeMismatch)?;
++                        term = term.mul(value);
++                    }
++                    sum = sum.add(&term);
++                }
++                Ok(vec![sum])
++            }
+         }
+     }
+ }
+@@ -590,6 +614,79 @@ impl InnerSumcheck for MapInner {
+     }
+ }
+ 
++/// A single map's inner sumcheck under equality weights on the X variables.
++/// The current round's polynomial carries the equality factors of the
++/// variables after it; the variable being bound is weighted by the verifier.
++pub struct WeightedMapInner {
++    values: Vec<Fp3>,
++    z: Vec<Fp3>,
++    variables: usize,
++    bound: usize,
++}
++
++impl WeightedMapInner {
++    pub fn new(values: &[Fp3], z: &[Fp3]) -> Result<Self> {
++        if values.len() < 2 || !values.len().is_power_of_two() {
++            return Err(Error::InvalidConfig);
++        }
++        let variables = values.len().trailing_zeros() as usize;
++        if z.len() != variables {
++            return Err(Error::ShapeMismatch);
++        }
++        Ok(Self {
++            values: values.to_vec(),
++            z: z.to_vec(),
++            variables,
++            bound: 0,
++        })
++    }
++}
++
++impl InnerSumcheck for WeightedMapInner {
++    fn round(&self) -> Result<Vec<Fp3>> {
++        if self.bound >= self.variables || self.values.len() % 2 != 0 {
++            return Err(Error::InvalidSessionState);
++        }
++        let future = self.variables - self.bound - 1;
++        let mut low = Fp3::ZERO;
++        let mut delta = Fp3::ZERO;
++        for (index, pair) in self.values.chunks_exact(2).enumerate() {
++            let mut weight = Fp3::ONE;
++            for bit in 0..future {
++                let value = if (index >> bit) & 1 == 1 {
++                    self.z[self.bound + 1 + bit]
++                } else {
++                    Fp3::ONE.sub(&self.z[self.bound + 1 + bit])
++                };
++                weight = weight.mul(&value);
++            }
++            low = low.add(&weight.mul(&pair[0]));
++            delta = delta.add(&weight.mul(&pair[1].sub(&pair[0])));
++        }
++        Ok(vec![low, delta])
++    }
++
++    fn bind(&mut self, challenge: Fp3) -> Result<()> {
++        if self.bound >= self.variables || self.values.len() % 2 != 0 {
++            return Err(Error::InvalidSessionState);
++        }
++        let mut next = Vec::with_capacity(self.values.len() / 2);
++        for pair in self.values.chunks_exact(2) {
++            next.push(pair[0].add(&challenge.mul(&pair[1].sub(&pair[0]))));
++        }
++        self.values = next;
++        self.bound += 1;
++        Ok(())
++    }
++
++    fn end_values(&self) -> Result<Vec<Fp3>> {
++        if self.bound != self.variables || self.values.len() != 1 {
++            return Err(Error::InvalidSessionState);
++        }
++        Ok(vec![self.values[0]])
++    }
++}
++
+ /// The mask entries of one general sumcheck: hiding coefficients first, then
+ /// one entry for each shown map.
+ #[derive(Clone, Debug, PartialEq, Eq)]
+@@ -1157,6 +1254,25 @@ mod tests {
+         assert_ne!(tampered, verified);
+     }
+ 
++    #[test]
++    fn the_product_sum_form_combines_shown_maps() {
++        let summand = Summand::ProductSum {
++            terms: vec![(f(2), vec![0, 1]), (f(3), vec![1])],
++        };
++        assert_eq!(summand.shown(), 2);
++        assert_eq!(summand.degree(), 2);
++        let shown = [f(5), f(7)];
++        assert_eq!(
++            summand.at(&[], &shown, &[], None).unwrap(),
++            vec![f(2).mul(&f(5)).mul(&f(7)).add(&f(3).mul(&f(7)))]
++        );
++        // An index outside the shown maps is refused.
++        let bad = Summand::ProductSum {
++            terms: vec![(f(1), vec![2])],
++        };
++        assert!(bad.at(&[], &shown, &[], None).is_err());
++    }
++
+     #[test]
+     fn bits_proves_booleanity_and_rejects_a_non_boolean_map() {
+         let variables = [Weight::plain(3).unwrap(), Weight::plain(3).unwrap()];
+diff --git a/crates/zkie-ops/src/proof/request_reduction.rs b/crates/zkie-ops/src/proof/request_reduction.rs
+new file mode 100644
+index 00000000..33604d3a
+--- /dev/null
++++ b/crates/zkie-ops/src/proof/request_reduction.rs
+@@ -0,0 +1,252 @@
++//! The token sumcheck of a request's relation reduction.
++//!
++//! A request's relation is reduced over its token positions first: the claim
++//! `sum_t eq(P, t) s(t)` runs over the token cube at the point `P`, with `s`
++//! the token map. The map's end value at the challenged tokens is sent masked;
++//! the caller's later rounds and end know what the end value is.
++//!
++//! Token bit `j` is the bit of weight `j` (`(t >> j) & 1`), and its equality
++//! factor is `(1 - P[j])` or `P[j]`. The sumcheck's variables carry exactly
++//! those equality weights, in bit order.
++
++use zkie_core::error::{Error, Result};
++use zkie_engine::pcs::request::field::Fp3;
++
++use crate::proof::psc::Weight;
++use crate::proof::psc_general::{
++    prove_general, verify_general, GeneralChallenges, GeneralMaskEntries, GeneralOutput,
++    GeneralProof, MaskTerm, Summand, WeightedMapInner,
++};
++
++/// The token claim: the equality-weighted sum of the token map.
++pub fn token_claim(point: &[Fp3], values: &[Fp3]) -> Result<Fp3> {
++    if point.len() >= 32 || values.len() != (1usize << point.len()) {
++        return Err(Error::InvalidConfig);
++    }
++    let mut sum = Fp3::ZERO;
++    for (index, value) in values.iter().enumerate() {
++        let mut factor = Fp3::ONE;
++        for (bit, coordinate) in point.iter().enumerate() {
++            let chosen = if (index >> bit) & 1 == 1 {
++                *coordinate
++            } else {
++                Fp3::ONE.sub(coordinate)
++            };
++            factor = factor.mul(&chosen);
++        }
++        sum = sum.add(&factor.mul(value));
++    }
++    Ok(sum)
++}
++
++/// The token sumcheck's variables: one equality weight per token bit, in bit
++/// order.
++pub fn token_variables(point: &[Fp3]) -> Result<Vec<Weight>> {
++    if point.is_empty() || point.len() >= 32 {
++        return Err(Error::InvalidConfig);
++    }
++    point
++        .iter()
++        .map(|coordinate| Weight::equality(*coordinate, 3))
++        .collect()
++}
++
++/// Proves the token claim over the token map. `shown` is the claim as it was
++/// sent (the hidden claim plus its mask entries); `claim_masks` names those
++/// entries, and the sumcheck's end value is masked by its last challenge.
++pub fn prove_token(
++    point: &[Fp3],
++    values: &[Fp3],
++    claim_masks: &[MaskTerm],
++    mask_value: &dyn Fn(usize) -> Result<Fp3>,
++    shown: Fp3,
++    masks: &GeneralMaskEntries,
++    challenges: &mut dyn GeneralChallenges,
++) -> Result<(GeneralProof, GeneralOutput)> {
++    let variables = token_variables(point)?;
++    let mut inner = WeightedMapInner::new(values, point)?;
++    prove_general(
++        &variables,
++        claim_masks,
++        mask_value,
++        shown,
++        &Summand::Map,
++        None,
++        &mut inner,
++        masks,
++        challenges,
++    )
++}
++
++/// Verifies the token claim and returns its output claim.
++#[allow(clippy::too_many_arguments)]
++pub fn verify_token(
++    point: &[Fp3],
++    claim_masks: &[MaskTerm],
++    shown: Fp3,
++    proof: &GeneralProof,
++    hiding_entries: usize,
++    challenges: &mut dyn GeneralChallenges,
++) -> Result<GeneralOutput> {
++    let variables = token_variables(point)?;
++    verify_general(
++        &variables,
++        claim_masks,
++        shown,
++        &Summand::Map,
++        None,
++        proof,
++        hiding_entries,
++        challenges,
++    )
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    struct Source(u64);
++
++    impl GeneralChallenges for Source {
++        fn draw(&mut self) -> Result<Fp3> {
++            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
++            Ok(Fp3::from_u64(self.0))
++        }
++        fn draw_nonzero(&mut self) -> Result<Fp3> {
++            for _ in 0..64 {
++                let value = self.draw()?;
++                if value != Fp3::ZERO {
++                    return Ok(value);
++                }
++            }
++            Err(Error::EntropyUnavailable)
++        }
++        fn send_hiding_sum(&mut self, _value: Fp3) -> Result<()> {
++            Ok(())
++        }
++        fn send_round(
++            &mut self,
++            _index: usize,
++            _round: &crate::proof::psc::PscRound,
++        ) -> Result<()> {
++            Ok(())
++        }
++        fn send_end_values(&mut self, _values: &[Fp3]) -> Result<()> {
++            Ok(())
++        }
++    }
++
++    fn fp(value: u64) -> Fp3 {
++        Fp3::from_u64(value)
++    }
++
++    fn eq_factor(coordinate: Fp3, bit: u64) -> Fp3 {
++        if bit == 1 {
++            coordinate
++        } else {
++            Fp3::ONE.sub(&coordinate)
++        }
++    }
++
++    #[test]
++    fn the_token_claim_is_the_equality_weighted_sum() {
++        let point = [fp(2), fp(3)];
++        let values = [fp(1), fp(2), fp(3), fp(4)];
++        let mut expected = Fp3::ZERO;
++        for (index, value) in values.iter().enumerate() {
++            expected = expected.add(
++                &eq_factor(point[0], index as u64 & 1)
++                    .mul(&eq_factor(point[1], (index as u64 >> 1) & 1))
++                    .mul(value),
++            );
++        }
++        assert_eq!(token_claim(&point, &values).unwrap(), expected);
++        assert!(token_claim(&point, &values[..3]).is_err());
++        assert!(token_variables(&[]).is_err());
++    }
++
++    #[test]
++    fn the_token_sumcheck_proves_and_verifies_the_claim() {
++        let point = [fp(2), fp(3)];
++        let values = [fp(1), fp(2), fp(3), fp(4)];
++        let claim = token_claim(&point, &values).unwrap();
++        let variables = token_variables(&point).unwrap();
++        let hiding_count =
++            crate::proof::psc::hp_entries(&crate::proof::psc_general::general_variables(
++                &variables,
++                &Summand::Map,
++            )
++            .unwrap())
++            .unwrap();
++        let masks = GeneralMaskEntries {
++            hiding: (0..hiding_count).map(|index| fp(700 + index as u64)).collect(),
++            shown: vec![fp(800)],
++        };
++        let (proof, proven) = prove_token(
++            &point,
++            &values,
++            &[],
++            &|_| Ok(Fp3::ZERO),
++            claim,
++            &masks,
++            &mut Source(23),
++        )
++        .unwrap();
++        let verified = verify_token(
++            &point,
++            &[],
++            claim,
++            &proof,
++            masks.hiding.len(),
++            &mut Source(23),
++        )
++        .unwrap();
++        assert_eq!(proven, verified);
++        assert_eq!(proven.point.len(), point.len());
++        // A changed round leaves another output claim.
++        let mut changed = proof.clone();
++        changed.rounds[0].coefficients[0] =
++            changed.rounds[0].coefficients[0].add(&Fp3::ONE);
++        let tampered = verify_token(
++            &point,
++            &[],
++            claim,
++            &changed,
++            masks.hiding.len(),
++            &mut Source(23),
++        )
++        .unwrap();
++        assert_ne!(tampered, verified);
++    }
++
++    #[test]
++    fn the_claim_of_another_map_does_not_match() {
++        let point = [fp(5)];
++        let values = [fp(1), fp(2)];
++        let claim = token_claim(&point, &values).unwrap();
++        let variables = token_variables(&point).unwrap();
++        let hiding_count =
++            crate::proof::psc::hp_entries(&crate::proof::psc_general::general_variables(
++                &variables,
++                &Summand::Map,
++            )
++            .unwrap())
++            .unwrap();
++        let masks = GeneralMaskEntries {
++            hiding: (0..hiding_count).map(|index| fp(900 + index as u64)).collect(),
++            shown: vec![fp(901)],
++        };
++        // The prover runs on another map; its first round does not match the
++        // claim, so the sumcheck refuses before any message is accepted.
++        assert!(prove_token(
++            &point,
++            &[fp(3), fp(4)],
++            &[],
++            &|_| Ok(Fp3::ZERO),
++            claim,
++            &masks,
++            &mut Source(29),
++        )
++        .is_err());
++    }
++}
