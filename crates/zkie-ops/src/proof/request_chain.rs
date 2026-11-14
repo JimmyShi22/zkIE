@@ -97,7 +97,7 @@ impl RequestLayout {
 }
 
 /// The section's version.
-pub const REQUEST_CHAIN_VERSION: u64 = 1;
+pub const REQUEST_CHAIN_VERSION: u64 = 2;
 
 /// One request chain's proofs, in the order the chain runs them.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -932,7 +932,15 @@ mod tests {
     fn another_version_or_shape_is_refused() {
         let messages = messages();
         let mut bytes = messages.encode(shape()).unwrap();
-        // The first eight bytes are the version.
+        // The first eight bytes are the version: the current one decodes, the
+        // previous one and any other value are refused.
+        assert_eq!(REQUEST_CHAIN_VERSION, 2);
+        let mut reader = CanonicalReader::new(&bytes, DecodeLimits::unlimited());
+        assert!(RequestChainMessages::decode(&mut reader, shape()).is_ok());
+        let mut previous = bytes.clone();
+        previous[..8].copy_from_slice(&1u64.to_le_bytes());
+        let mut reader = CanonicalReader::new(&previous, DecodeLimits::unlimited());
+        assert!(RequestChainMessages::decode(&mut reader, shape()).is_err());
         bytes[7] = 9;
         let mut reader = CanonicalReader::new(&bytes, DecodeLimits::unlimited());
         assert!(RequestChainMessages::decode(&mut reader, shape()).is_err());
