@@ -461,6 +461,21 @@ pub fn chain_mask_row_form(
     crate::proof::segment_slots::row_form_row(&binding, form)
 }
 
+/// Lands the merge sumcheck's remaining row on the sub-proof mask table: the
+/// output row form (hiding coefficients, counted mask slots, kept-map terms and
+/// the row target) goes through the same trusted slot list and kept owners as
+/// the token kept row. This is the wsForkLin remaining relation's landing
+/// point.
+pub fn merge_remaining_row(
+    plan: &ChainMaskPlan,
+    output: &crate::proof::psc_general::GeneralOutput,
+    slot_entries: &[usize],
+    kept: &[(u64, u64)],
+) -> Result<zkie_engine::pcs::request::bat::BatRow> {
+    let form = crate::proof::row_claim::RowForm::from_output(output);
+    chain_mask_row_form(plan, &form, slot_entries, kept)
+}
+
 /// Verifies one opening of the sub-proof mask table against its root: the plan
 /// must be a tree, and the opening's positions and columns are checked against
 /// the root by the runtime tree. The read ledger and the position list policy
@@ -1423,6 +1438,25 @@ mod chain_mask_tests {
             Fp3::ZERO,
         )
         .is_err());
+        // The merge remaining row: the output row form lands on the table
+        // through the same trusted slot list and kept owners.
+        let output = crate::proof::psc_general::GeneralOutput {
+            point: Vec::new(),
+            hiding_form: vec![Fp3::from_u64(2)],
+            claim_scale: Fp3::ONE,
+            row_target: Fp3::from_u64(21),
+            ends: Vec::new(),
+            row_maps: vec![(0, Fp3::from_u64(7))],
+            claim_masks: vec![crate::proof::psc_general::MaskTerm {
+                slot: 0,
+                coefficient: Fp3::from_u64(5),
+            }],
+        };
+        let merge_row = merge_remaining_row(&plan, &output, &[1], &[(9, 2)]).unwrap();
+        assert_eq!(merge_row.target, Fp3::from_u64(21));
+        assert_eq!(merge_row.units.len(), 3);
+        assert_eq!(merge_row.units[1].index, plan.entry_virtual_index(1).unwrap());
+        assert!(merge_remaining_row(&plan, &output, &[], &[(9, 2)]).is_err());
         // A sub-proof row form lands on the table: hiding entries at the first
         // entries, the counted slot through the plan slot list, the kept value
         // on its own owner.
