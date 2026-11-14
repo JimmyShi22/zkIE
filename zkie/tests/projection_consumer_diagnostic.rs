@@ -510,6 +510,7 @@ fn plan_for(
             expected_dot_root: None,
             expected_roots: None,
             member: None,
+            request_chain: None,
         },
         output: HiddenOutputShape {
             positions,
@@ -723,6 +724,7 @@ fn hidden_plan_for(
             expected_dot_root: None,
             expected_roots: None,
             member: None,
+            request_chain: None,
         },
         output: HiddenOutputShape {
             positions,

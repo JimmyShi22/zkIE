@@ -1743,6 +1743,9 @@ pub struct HiddenSendPlan {
     /// The pending claim and the reduced-witness tables, when this chain
     /// carries the consumer's member relation.
     pub member: Option<MemberPlan>,
+    /// The request chain's proof shapes, when this session carries the
+    /// request reduction's transcript section.
+    pub request_chain: Option<crate::proof::request_chain::RequestChainShape>,
 }
 
 impl HiddenSendPlan {
@@ -2747,6 +2750,8 @@ pub struct HiddenSendMessages {
     pub closure: Option<ClosureFirstMessages>,
     /// The integrated norm first message, when the plan carries the norm.
     pub norm: Option<NormFirstMessages>,
+    /// The request chain's proofs, when the plan carries the chain.
+    pub request: Option<crate::proof::request_chain::RequestChainMessages>,
     pub chain_value: Digest,
 }
 
@@ -2824,6 +2829,9 @@ impl HiddenSendMessages {
         }
         if let Some(norm) = &self.norm {
             writer.put_bytes(&norm.encode()?);
+        }
+        if let Some(request) = &self.request {
+            request.encode_into(&mut writer);
         }
         writer.put_digest(&self.chain_value);
         Ok(writer.into_bytes())
@@ -2989,6 +2997,13 @@ impl HiddenSendMessages {
             Some(norm_plan) => Some(NormFirstMessages::decode(norm_plan, reader.get_bytes()?)?),
             None => None,
         };
+        let request = match plan.request_chain {
+            Some(shape) => Some(crate::proof::request_chain::RequestChainMessages::decode(
+                &mut reader,
+                shape,
+            )?),
+            None => None,
+        };
         let chain_value = reader.get_digest()?;
         reader.finish()?;
         Ok(Self {
@@ -3004,6 +3019,7 @@ impl HiddenSendMessages {
             dot,
             closure,
             norm,
+            request,
             chain_value,
         })
     }
@@ -3251,6 +3267,7 @@ pub fn prove_hidden_send(
         chain_value,
         closure: None,
         norm: None,
+        request: None,
     };
     Ok((messages, witness))
 }
@@ -7689,6 +7706,7 @@ fn prove_first(
         chain_value: first_seal,
         closure,
         norm: norm_first,
+        request: None,
     };
     Ok((messages, first_seal, witness))
 }
@@ -18269,6 +18287,7 @@ mod tests {
             expected_dot_root: None,
             expected_roots: None,
             member: None,
+            request_chain: None,
         };
         let mut source = VecTableSource::new(messages, tails).unwrap();
         let randomness = randomness();
@@ -19277,6 +19296,7 @@ mod merged_tests {
             expected_dot_root: None,
             expected_roots: None,
             member: None,
+            request_chain: None,
         };
         let weights: Vec<Vec<Fp3>> = (0..POSITIONS)
             .map(|position| activation.weights(position, MATRIX_ROWS).unwrap())

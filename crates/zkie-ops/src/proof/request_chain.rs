@@ -46,11 +46,17 @@ impl RequestChainMessages {
             return Err(Error::InvalidConfig);
         }
         let mut writer = CanonicalWriter::new();
-        writer.put_u64(REQUEST_CHAIN_VERSION);
-        self.token.encode_into(&mut writer);
-        self.stack.encode_into(&mut writer);
-        self.merge.encode_into(&mut writer);
+        self.encode_into(&mut writer);
         Ok(writer.into_bytes())
+    }
+
+    /// Writes the section without the shape check; the decoder still checks
+    /// every stored count against the plan.
+    pub fn encode_into(&self, writer: &mut CanonicalWriter) {
+        writer.put_u64(REQUEST_CHAIN_VERSION);
+        self.token.encode_into(writer);
+        self.stack.encode_into(writer);
+        self.merge.encode_into(writer);
     }
 
     pub fn decode(reader: &mut CanonicalReader, shape: RequestChainShape) -> Result<Self> {
