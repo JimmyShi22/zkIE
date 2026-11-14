@@ -304,6 +304,21 @@ pub fn pending_value(
     Ok(value)
 }
 
+/// Checks that the plan's member claim is the claim the request chain derived
+/// from its verified prefix: the same row weights, the same column point, the
+/// same target and the same mask terms, in the same order. A plan claim that
+/// differs is another source and is refused rather than trusted.
+pub fn check_member_claim(plan: &PendingRow, chain: &PendingRow) -> Result<()> {
+    if plan.weights != chain.weights
+        || plan.psi != chain.psi
+        || plan.target != chain.target
+        || plan.masks != chain.masks
+    {
+        return Err(Error::StatementMismatch);
+    }
+    Ok(())
+}
+
 /// Checks the pending claim: the left side must equal the target.
 pub fn check_pending(
     pending: &PendingRow,
@@ -1165,6 +1180,24 @@ mod tests {
         assert_eq!(row_at(&row, &[one, one]).unwrap(), fp(40));
         assert!(row_at(&row, &[]).is_err());
         assert!(row_at(&row[..3], &[zero, zero]).is_err());
+    }
+
+    #[test]
+    fn the_plan_claim_must_be_the_chain_claim() {
+        let chain = pending();
+        check_member_claim(&chain, &chain).unwrap();
+        let mut changed = chain.clone();
+        changed.weights.pop();
+        assert!(check_member_claim(&changed, &chain).is_err());
+        let mut changed = chain.clone();
+        changed.psi[0] = changed.psi[0].add(&Fp3::ONE);
+        assert!(check_member_claim(&changed, &chain).is_err());
+        let mut changed = chain.clone();
+        changed.target = changed.target.add(&Fp3::ONE);
+        assert!(check_member_claim(&changed, &chain).is_err());
+        let mut changed = chain.clone();
+        changed.masks[0].coeff = changed.masks[0].coeff.add(&Fp3::ONE);
+        assert!(check_member_claim(&changed, &chain).is_err());
     }
 
     #[test]
