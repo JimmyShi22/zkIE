@@ -14091,6 +14091,45 @@ fn request_dot_row(
     Ok(row)
 }
 
+/// The inputs of the request's two LIN rows: the request W member and its
+/// claim, and the Omega member with the row weights and the shared point.
+struct RequestRows<'a> {
+    w_oracle: u64,
+    w_shape: &'a WShape,
+    w_columns: u64,
+    psi: &'a [Fp3],
+    masks: &'a [(u64, u64, Fp3)],
+    target: Fp3,
+    omega_oracle: u64,
+    omega_shape: &'a WShape,
+    omega_columns: u64,
+    weights: &'a [Fp3],
+    psi_star: &'a [Fp3],
+}
+
+fn request_rows(request: &RequestRows) -> Result<Vec<BatRow>> {
+    let mut rows = Vec::with_capacity(2);
+    rows.push(request_eval_row(
+        request.w_shape,
+        request.w_columns,
+        request.w_oracle,
+        request.psi,
+        request.masks,
+        request.target,
+    )?);
+    rows.push(request_dot_row(
+        request.omega_shape,
+        request.omega_columns,
+        request.omega_oracle,
+        request.weights,
+        request.w_shape,
+        request.w_columns,
+        request.w_oracle,
+        request.psi_star,
+    )?);
+    Ok(rows)
+}
+
 fn scatter_message_coefficients(
     shape: &WShape,
     columns: u64,
@@ -15995,6 +16034,7 @@ fn own_plain_rows(
     dot: Option<&DotRowBinding>,
     closure: Option<&ClosureRowBinding>,
     norm: Option<&NormRowBinding>,
+    request: Option<&RequestRows>,
 ) -> Result<Vec<BatRow>> {
     let mut bat_of = std::collections::HashMap::new();
     for member in members {
@@ -16111,6 +16151,9 @@ fn own_plain_rows(
     }
     if let Some(binding) = dot {
         rows.extend(dot_plain_rows(plan, members, binding)?);
+    }
+    if let Some(request) = request {
+        rows.extend(request_rows(request)?);
     }
     if let Some(binding) = closure {
         rows.extend(closure_plain_rows(plan, members, first, binding)?);
@@ -16901,6 +16944,7 @@ fn prove_second(
         dot_binding.as_ref(),
         closure_binding.as_ref(),
         norm_binding.as_ref(),
+        None,
     )?;
     drop(_profile_plain_rows);
     let fold = member_fold_shape(
@@ -17289,6 +17333,7 @@ fn verify_second(
         dot_binding.as_ref(),
         closure_binding.as_ref(),
         norm_binding.as_ref(),
+        None,
     )?;
     drop(_profile_plain_rows);
     let fold = member_fold_shape(
@@ -19475,6 +19520,36 @@ mod tests {
         fn send_end_values(&mut self, _values: &[Fp3]) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn the_own_group_can_take_the_request_rows() {
+        let fixture = fixture();
+        let shape = fixture.plan.w;
+        let psi = [Fp3::from_u64(2), Fp3::from_u64(3)];
+        let psi_star = [Fp3::from_u64(4), Fp3::from_u64(5)];
+        let masks = [(60u64, 3u64, Fp3::from_u64(11))];
+        let weights = [Fp3::from_u64(1), Fp3::from_u64(2)];
+        let request = super::RequestRows {
+            w_oracle: 123,
+            w_shape: &shape,
+            w_columns: 4,
+            psi: &psi,
+            masks: &masks,
+            target: Fp3::from_u64(99),
+            omega_oracle: 124,
+            omega_shape: &shape,
+            omega_columns: 4,
+            weights: &weights,
+            psi_star: &psi_star,
+        };
+        let rows = super::request_rows(&request).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].target, Fp3::from_u64(99));
+        assert_eq!(rows[0].terms.len(), 1);
+        assert_eq!(rows[0].units.len(), 1);
+        assert_eq!(rows[1].target, Fp3::ZERO);
+        assert_eq!(rows[1].terms.len(), 2);
     }
 
     #[test]
@@ -22902,6 +22977,7 @@ mod merged_tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let index = plan.send.index_mask.as_ref().unwrap();
@@ -23185,6 +23261,7 @@ mod merged_tests {
             &outcome.shared_point,
             &messages.second.tilde,
             Some(binding),
+            None,
             None,
             None,
         )
