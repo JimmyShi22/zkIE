@@ -1,0 +1,359 @@
+commit 5008f33b968380be3a1ee44ca886de5ef0b2b85b
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Sat Nov 14 12:52:41 2026 +0800
+
+    Lay out the panel stack and its affine recombination
+    
+    The layer relation reduces its panels together: the new module assigns every panel its width and aligned offset, largest panel first; computes the equality factors of the stack challenge ranges with the low-bit pairing of the reference form; and builds the verifier's affine recombination of the panels' operand values, folding the batch coefficient, the call factor and the row weights, with the shown weight terms for weight panels. Focused tests cover the layout order, the equality ranges and the coefficient of one panel entry.
+    
+    This is partial progress: the stack sumcheck's rounds and the row claims are the next step.
+
+diff --git a/crates/zkie-ops/src/proof/mod.rs b/crates/zkie-ops/src/proof/mod.rs
+index 7422b3ff..125ad670 100644
+--- a/crates/zkie-ops/src/proof/mod.rs
++++ b/crates/zkie-ops/src/proof/mod.rs
+@@ -37,6 +37,7 @@ pub mod asset_table;
+ pub mod model_commitment;
+ pub mod projection_claim;
+ pub mod request_reduction;
++pub mod request_stack;
+ pub mod request_weights;
+ pub mod norm_param_table;
+ 
+diff --git a/crates/zkie-ops/src/proof/request_stack.rs b/crates/zkie-ops/src/proof/request_stack.rs
+new file mode 100644
+index 00000000..d7f10ba6
+--- /dev/null
++++ b/crates/zkie-ops/src/proof/request_stack.rs
+@@ -0,0 +1,300 @@
++//! The batched stack of the request relation's panels.
++//!
++//! The layer relation reduces its panels together: one masked sumcheck over the
++//! union of the panels' variable cubes, their offsets assigned largest panel
++//! first, and one end value for each side. This module fixes the panel layout
++//! and the verifier's affine coefficients at the stack's challenge point:
++//! `A0` and `B0` are the shown end values, and the affine forms `Alin` and
++//! `Blin` recombine the panels' operand values so that the verifier can tie
++//! the end values to the reads.
++
++use zkie_core::error::{Error, Result};
++use zkie_engine::pcs::request::field::Fp3;
++
++use crate::proof::request_weights::eq1;
++
++/// One two-factor panel: `2^w` aligned points, `ni` rows of `ny` entries, a
++/// row weight each, and the claim it belongs to.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct StackPanel {
++    /// Index of the batched claim the panel belongs to.
++    pub claim: usize,
++    /// The panel's call factor.
++    pub ec: Fp3,
++    pub ni: u64,
++    pub ny: u64,
++    pub weight: Vec<Fp3>,
++    /// The first weight claim of a weight panel, if the second side is weights.
++    pub first_claim: Option<u32>,
++    /// Assigned by `panel_layout`.
++    pub w: u32,
++    pub off: u64,
++}
++
++fn ceil_log2(value: u64) -> u32 {
++    if value <= 1 {
++        0
++    } else {
++        64 - (value - 1).leading_zeros()
++    }
++}
++
++/// Assigns every panel its width and offset: largest panels first, each
++/// aligned to its own size. Returns the stack's total width in bits.
++pub fn panel_layout(panels: &mut [StackPanel]) -> Result<u32> {
++    if panels.is_empty() {
++        return Err(Error::InvalidConfig);
++    }
++    for panel in panels.iter() {
++        if panel.ni == 0 || panel.ny == 0 || panel.weight.len() as u64 != panel.ni {
++            return Err(Error::InvalidConfig);
++        }
++    }
++    let mut order: Vec<usize> = (0..panels.len()).collect();
++    order.sort_by_key(|index| std::cmp::Reverse(ceil_log2(panels[*index].ni) + ceil_log2(panels[*index].ny)));
++    let mut offset = 0u64;
++    for index in order {
++        let w = ceil_log2(panels[index].ni) + ceil_log2(panels[index].ny);
++        panels[index].w = w;
++        panels[index].off = offset;
++        offset = offset
++            .checked_add(1u64 << w)
++            .ok_or(Error::ResourceLimit)?;
++    }
++    if offset > (1u64 << 20) {
++        return Err(Error::ResourceLimit);
++    }
++    Ok(ceil_log2(offset))
++}
++
++/// The equality factors of a range of the challenge coordinates: entry `index`
++/// pairs bit `j` of `index` with `rs[lo + j]`.
++pub fn eq_low(rs: &[Fp3], lo: usize, hi: usize) -> Result<Vec<Fp3>> {
++    if lo >= hi || hi > rs.len() || hi - lo >= 32 {
++        return Err(Error::InvalidConfig);
++    }
++    let count = 1usize << (hi - lo);
++    let mut table = vec![Fp3::ONE; count];
++    for j in 0..(hi - lo) {
++        for (index, value) in table.iter_mut().enumerate() {
++            let chosen = if (index >> j) & 1 == 1 {
++                rs[lo + j]
++            } else {
++                Fp3::ONE.sub(&rs[lo + j])
++            };
++            *value = value.mul(&chosen);
++        }
++    }
++    Ok(table)
++}
++
++/// One equality factor of a range at an index.
++pub fn eq_low_at(rs: &[Fp3], lo: usize, hi: usize, index: u64) -> Result<Fp3> {
++    if lo >= hi || hi > rs.len() || lo >= 32 {
++        return Err(Error::InvalidConfig);
++    }
++    let mut value = Fp3::ONE;
++    for j in 0..(hi - lo) {
++        value = value.mul(&eq1(rs[lo + j], if (index >> j) & 1 == 1 { Fp3::ONE } else { Fp3::ZERO }));
++    }
++    Ok(value)
++}
++
++/// One term of an affine form: the coefficient of the panel's operand value at
++/// row `i` and entry `yv`.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct AffTerm {
++    pub panel: usize,
++    pub i: u64,
++    pub yv: u64,
++    pub coefficient: Fp3,
++}
++
++/// The verifier's recombination of the panels at the stack's point.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct StackAffines {
++    /// The first side's terms.
++    pub alin: Vec<AffTerm>,
++    /// The second side's terms for panels whose second side is a read.
++    pub blin: Vec<AffTerm>,
++    /// The second side's terms for weight panels: panel, row, coefficient of
++    /// the shown weight value.
++    pub shown: Vec<(usize, u64, Fp3)>,
++}
++
++/// Builds the stack's affine recombination. `rs` holds the stack's challenge
++/// coordinates, `lam` its width in bits, `om` the batch coefficients of the
++/// panels' claims.
++pub fn stack_affines(
++    panels: &[StackPanel],
++    rs: &[Fp3],
++    lam: u32,
++    om: &[Fp3],
++) -> Result<StackAffines> {
++    if lam as usize != rs.len() || om.is_empty() {
++        return Err(Error::InvalidConfig);
++    }
++    let mut alin = Vec::new();
++    let mut blin = Vec::new();
++    let mut shown = Vec::new();
++    for (index, panel) in panels.iter().enumerate() {
++        if panel.w > lam || panel.off >> panel.w >= (1u64 << (lam - panel.w).min(63)) {
++            return Err(Error::InvalidConfig);
++        }
++        let wy = ceil_log2(panel.ny) as usize;
++        let w = panel.w as usize;
++        if w < wy {
++            return Err(Error::InvalidConfig);
++        }
++        let ey = eq_low(rs, 0, wy)?;
++        let ei = eq_low(rs, wy, w)?;
++        if ei.len() as u64 != panel.ni {
++            return Err(Error::InvalidConfig);
++        }
++        let batch = *om.get(panel.claim).ok_or(Error::InvalidIndex)?;
++        let sb = if panel.w == lam {
++            Fp3::ONE
++        } else {
++            eq_low_at(rs, w, lam as usize, (panel.off >> panel.w) as u64)?
++        };
++        let co = sb.mul(&batch).mul(&panel.ec);
++        for i in 0..panel.ni {
++            for yv in 0..panel.ny {
++                let factor = ei[i as usize].mul(&ey[yv as usize]);
++                alin.push(AffTerm {
++                    panel: index,
++                    i,
++                    yv,
++                    coefficient: co.mul(&panel.weight[i as usize]).mul(&factor),
++                });
++            }
++        }
++        match panel.first_claim {
++            None => {
++                for i in 0..panel.ni {
++                    for yv in 0..panel.ny {
++                        blin.push(AffTerm {
++                            panel: index,
++                            i,
++                            yv,
++                            coefficient: sb.mul(&ei[i as usize]).mul(&ey[yv as usize]),
++                        });
++                    }
++                }
++            }
++            Some(_) => {
++                for i in 0..panel.ni {
++                    shown.push((index, i, sb.mul(&ei[i as usize])));
++                }
++            }
++        }
++    }
++    Ok(StackAffines { alin, blin, shown })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn fp(value: u64) -> Fp3 {
++        Fp3::from_u64(value)
++    }
++
++    #[test]
++    fn panels_are_laid_out_largest_first_and_aligned() {
++        let mut panels = vec![
++            StackPanel {
++                claim: 0,
++                ec: fp(1),
++                ni: 2,
++                ny: 2,
++                weight: vec![fp(1), fp(2)],
++                first_claim: None,
++                w: 0,
++                off: 0,
++            },
++            StackPanel {
++                claim: 0,
++                ec: fp(1),
++                ni: 4,
++                ny: 2,
++                weight: vec![fp(1); 4],
++                first_claim: None,
++                w: 0,
++                off: 0,
++            },
++        ];
++        let lam = panel_layout(&mut panels).unwrap();
++        assert_eq!(lam, 4);
++        assert_eq!(panels[1].off, 0);
++        assert_eq!(panels[1].w, 3);
++        assert_eq!(panels[0].off, 8);
++        assert_eq!(panels[0].w, 2);
++        // A row weight per row and nonzero sizes are required.
++        let mut bad = vec![StackPanel {
++            claim: 0,
++            ec: fp(1),
++            ni: 2,
++            ny: 2,
++            weight: vec![fp(1)],
++            first_claim: None,
++            w: 0,
++            off: 0,
++        }];
++        assert!(panel_layout(&mut bad).is_err());
++    }
++
++    #[test]
++    fn the_affine_terms_recombine_the_panels() {
++        // One panel of two rows and two entries (w = 2) at offset 0 of a
++        // two-bit stack; the batch coefficient is three and the call factor
++        // five.
++        let panel = StackPanel {
++            claim: 1,
++            ec: fp(5),
++            ni: 2,
++            ny: 2,
++            weight: vec![fp(7), fp(11)],
++            first_claim: Some(0),
++            w: 2,
++            off: 0,
++        };
++        let rs = [fp(2), fp(3)];
++        let om = [fp(1), fp(3)];
++        let affines = stack_affines(&[panel.clone()], &rs, 2, &om).unwrap();
++        // sb of the whole stack is one; the coordinates pair as rs[0] for the
++        // entry bit and rs[1] for the row bit.
++        let ey = eq_low(&rs, 0, 1).unwrap();
++        let ei = eq_low(&rs, 1, 2).unwrap();
++        let expected = fp(5)
++            .mul(&fp(3))
++            .mul(&fp(7))
++            .mul(&ei[0])
++            .mul(&ey[0]);
++        assert_eq!(affines.alin[0].coefficient, expected);
++        // The second side is weights: one shown term per row.
++        assert!(affines.blin.is_empty());
++        assert_eq!(affines.shown.len(), 2);
++        assert_eq!(affines.shown[0].2, ei[0]);
++        // A point of the wrong width and a missing batch coefficient are
++        // refused.
++        assert!(stack_affines(&[panel.clone()], &rs[..1], 2, &om).is_err());
++        assert!(stack_affines(&[panel], &rs, 2, &[]).is_err());
++    }
++
++    #[test]
++    fn equality_ranges_pair_bits_low_first() {
++        let rs = [fp(2), fp(3), fp(5)];
++        let table = eq_low(&rs, 1, 3).unwrap();
++        assert_eq!(table.len(), 4);
++        // Entry ce pairs bit 0 with rs[1] and bit 1 with rs[2].
++        for ce in 0..4u64 {
++            let expected = if ce & 1 == 1 { fp(3) } else { Fp3::ONE.sub(&fp(3)) };
++            let expected = expected.mul(&if ce & 2 == 2 { fp(5) } else { Fp3::ONE.sub(&fp(5)) });
++            assert_eq!(table[ce as usize], expected);
++            assert_eq!(eq_low_at(&rs, 1, 3, ce).unwrap(), expected);
++        }
++        assert!(eq_low(&rs, 2, 2).is_err());
++        assert!(eq_low(&rs, 1, 4).is_err());
++    }
++}
+diff --git a/crates/zkie-ops/src/proof/request_weights.rs b/crates/zkie-ops/src/proof/request_weights.rs
+index 69b0662e..6f429856 100644
+--- a/crates/zkie-ops/src/proof/request_weights.rs
++++ b/crates/zkie-ops/src/proof/request_weights.rs
+@@ -340,7 +340,7 @@ impl WeightLayout {
+             return Err(Error::InvalidConfig);
+         }
+         let mut values = Vec::with_capacity(unit.digits);
+-        let mut scale = weight.mul(&claim.coefficient);
++        let scale = weight.mul(&claim.coefficient);
+         let mut factor = Fp3::ONE;
+         for _ in 0..unit.digits {
+             values.push(scale.mul(&factor));
+@@ -658,7 +658,7 @@ pub struct RowClaim {
+     pub factors: Vec<RowFactor>,
+ }
+ 
+-fn eq1(p: Fp3, x: Fp3) -> Fp3 {
++pub(crate) fn eq1(p: Fp3, x: Fp3) -> Fp3 {
+     p.mul(&x).add(&Fp3::ONE.sub(&p).mul(&Fp3::ONE.sub(&x)))
+ }
+ 
+@@ -671,7 +671,7 @@ fn ceil_log2(value: u64) -> u32 {
+ }
+ 
+ /// `eq(point, index)` for every index, with coordinate 0 the top bit.
+-fn eq_table(point: &[Fp3]) -> Result<Vec<Fp3>> {
++pub(crate) fn eq_table(point: &[Fp3]) -> Result<Vec<Fp3>> {
+     if point.len() >= 32 {
+         return Err(Error::ResourceLimit);
+     }
