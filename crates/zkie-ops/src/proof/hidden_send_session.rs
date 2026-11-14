@@ -2465,10 +2465,15 @@ impl HiddenSendPlan {
         if self.request_chain.is_some() {
             let segment_tree = self.segment_mask_tree.as_ref().ok_or(Error::InvalidConfig)?;
             let mask = self.chain_mask.as_ref().ok_or(Error::InvalidConfig)?;
-            let expected = mask.mask_rows.max(1).next_power_of_two();
+            // The fresh mask covers the FOLD group's whole mask space, which
+            // grows with the members; the plan requires it to be a power of
+            // two that at least covers the chain mask's rows, and the fold
+            // handoff checks the exact `2^h` equality at run time.
+            let floor = mask.mask_rows.max(1).next_power_of_two();
             if segment_tree.fault().is_some()
                 || segment_tree.log_n != mask.mask_code.log_n
-                || segment_tree.mask_rows != expected
+                || !segment_tree.mask_rows.is_power_of_two()
+                || segment_tree.mask_rows < floor
             {
                 return Err(Error::InvalidConfig);
             }
@@ -5195,6 +5200,7 @@ struct RangeMessages {
     arrays: Vec<RequestWMessage>,
     units: RequestWMessage,
     digits: RequestWMessage,
+    lookups: Vec<DigitLookupMessages>,
 }
 
 /// One digit lookup's wire form: its two messages with their samples, the
@@ -5218,6 +5224,7 @@ struct RangeWitness {
     arrays: Vec<RequestWWitness>,
     units: RequestWWitness,
     digits: RequestWWitness,
+    lookups: Vec<crate::proof::lookup_messages::LookupMessages>,
     messages: RangeMessages,
 }
 
@@ -5523,6 +5530,36 @@ fn range_sample_rows(
             )?);
         }
         rows.push((oracle, member_rows));
+    }
+    // The lookups' samples: the multiplicity-bit message's main-row answers and
+    // the mask message's single mask-form answer.
+    for (lookup_plan, message) in plan.digit_lookups.iter().zip(&messages.lookups) {
+        let commit = &lookup_plan.commit;
+        let mut bits_rows = Vec::with_capacity(message.bits_sample.seed.len());
+        for (seed, answer) in message
+            .bits_sample
+            .seed
+            .iter()
+            .zip(&message.bits_sample.answers)
+        {
+            bits_rows.push(oracle_sample_row(
+                commit.bits_oracle,
+                commit.group,
+                &commit.bits_shape.oracle_shape(),
+                std::slice::from_ref(seed),
+                0,
+                *answer,
+            )?);
+        }
+        rows.push((commit.bits_oracle, bits_rows));
+        let mask_row = digit_lookup_mask_sample_row(
+            commit,
+            commit.mask_oracle,
+            commit.group,
+            message.mask_sample.seed.first().ok_or(Error::ShapeMismatch)?,
+            *message.mask_sample.answers.first().ok_or(Error::ShapeMismatch)?,
+        )?;
+        rows.push((commit.mask_oracle, vec![mask_row]));
     }
     Ok(rows)
 }
@@ -5901,8 +5938,85 @@ fn segment_members(
                 mask_tails: Vec::new(),
             });
         }
+        // The two digit lookups' messages join the same group: the
+        // multiplicity-bit message as a main-row member and the mask message
+        // as a mask-only member.
+        if !messages.lookups.is_empty() {
+            if messages.lookups.len() != plan.send.digit_lookups.len() {
+                return Err(Error::ShapeMismatch);
+            }
+            for (index, (lookup_plan, lookup_message)) in plan
+                .send
+                .digit_lookups
+                .iter()
+                .zip(&messages.lookups)
+                .enumerate()
+            {
+                let commit = &lookup_plan.commit;
+                let (bits_message, bits_tails) = match witness {
+                    Some(witness) => {
+                        let lookup = witness.lookups.get(index).ok_or(Error::ShapeMismatch)?;
+                        let tail_len = usize::try_from(commit.bits_shape.code.r)
+                            .map_err(|_| Error::ResourceLimit)?;
+                        let rows = usize::try_from(commit.bits_shape.main_rows)
+                            .map_err(|_| Error::ResourceLimit)?;
+                        if lookup.bits_tails.len()
+                            != rows.checked_mul(tail_len).ok_or(Error::ResourceLimit)?
+                            || lookup.bits.messages.len() != 1
+                        {
+                            return Err(Error::ShapeMismatch);
+                        }
+                        let mut tails = Vec::with_capacity(rows);
+                        for row in 0..rows {
+                            tails.push(
+                                lookup.bits_tails[row * tail_len..(row + 1) * tail_len].to_vec(),
+                            );
+                        }
+                        (lookup.bits.messages[0].clone(), tails)
+                    }
+                    None => (Vec::new(), Vec::new()),
+                };
+                members.push(ProximityMember {
+                    bat_oracle: 0,
+                    source_oracle: commit.bits_oracle,
+                    main_code: commit.bits_shape.code,
+                    mask_code: plan.proximity.mask_code,
+                    main_rows: commit.bits_shape.main_rows,
+                    mask_rows: 0,
+                    answers: commit.bits_shape.answers,
+                    root: lookup_message.bits_root,
+                    tree_plan: commit.bits_shape.tree_plan(0)?,
+                    message: bits_message,
+                    tails: bits_tails,
+                    mask_message: Vec::new(),
+                    mask_tails: Vec::new(),
+                });
+                let (mask_rows, mask_tails) = match witness {
+                    Some(witness) => {
+                        let lookup = witness.lookups.get(index).ok_or(Error::ShapeMismatch)?;
+                        (lookup.mask_rows.clone(), lookup.mask_tails.clone())
+                    }
+                    None => (Vec::new(), Vec::new()),
+                };
+                members.push(ProximityMember {
+                    bat_oracle: 0,
+                    source_oracle: commit.mask_oracle,
+                    main_code: plan.proximity.code,
+                    mask_code: commit.mask_code,
+                    main_rows: 0,
+                    mask_rows: commit.mask_rows,
+                    answers: 1,
+                    root: lookup_message.mask_root,
+                    tree_plan: commit.mask_tree.clone(),
+                    message: Vec::new(),
+                    tails: Vec::new(),
+                    mask_message: mask_rows,
+                    mask_tails,
+                });
+            }
+        }
     }
-    members.sort_by_key(|member| std::cmp::Reverse(member.main_rows));
+    members.sort_by_key(|member| std::cmp::Reverse((member.main_rows, member.mask_rows)));
     for (index, member) in members.iter_mut().enumerate() {
         member.bat_oracle = index as u64;
     }
@@ -6017,6 +6131,21 @@ fn segment_tree_source<'a>(
                 .find(|member| member.source_oracle == oracle)
                 .ok_or(Error::StatementMismatch)?;
             trees.push((oracle, retained_member_tree(committed, 0, member)?));
+        }
+        for (index, lookup_plan) in plan.send.digit_lookups.iter().enumerate() {
+            let lookup = witness.lookups.get(index).ok_or(Error::ShapeMismatch)?;
+            let bits_member = members
+                .iter()
+                .find(|member| member.source_oracle == lookup_plan.commit.bits_oracle)
+                .ok_or(Error::StatementMismatch)?;
+            trees.push((
+                lookup_plan.commit.bits_oracle,
+                retained_member_tree(&lookup.bits.trees, 0, bits_member)?,
+            ));
+            trees.push((
+                lookup_plan.commit.mask_oracle,
+                std::sync::Arc::new(digit_lookup_mask_tree(&lookup_plan.commit, lookup)?),
+            ));
         }
     }
     Ok(ProximityTreeSource::Ready(trees))
@@ -6254,6 +6383,7 @@ fn prove_first_chain_segment(
     // The two digit lookups: their messages are committed and sampled after
     // the digit object and before the batching element is drawn.
     let mut digit_lookup_messages: Vec<DigitLookupMessages> = Vec::new();
+    let mut lookup_commits: Vec<crate::proof::lookup_messages::LookupMessages> = Vec::new();
     if let (Some(range_plan), Some(_)) = (&plan.send.range, &range_digits) {
         if !plan.send.digit_lookups.is_empty() {
             let digits = range_digit_values_out
@@ -6338,6 +6468,7 @@ fn prove_first_chain_segment(
                     table,
                     &mut chain,
                 )?;
+                lookup_commits.push(lookup_messages);
                 digit_lookup_messages.push(DigitLookupMessages {
                     bits_root,
                     bits_sample,
@@ -6376,10 +6507,12 @@ fn prove_first_chain_segment(
                         arrays: witnesses,
                         units,
                         digits,
+                        lookups: lookup_commits,
                         messages: RangeMessages {
                             arrays: messages,
                             units: unit_message,
                             digits: digit_message,
+                            lookups: digit_lookup_messages.clone(),
                         },
                     })
                 }
@@ -6415,8 +6548,22 @@ fn prove_first_chain_segment(
                         ?;
                 rows.extend(range_rows);
             }
-            let rows = segment_plain_rows(&members, rows)
-                ?;
+            let mut rows = segment_plain_rows(&members, rows)?;
+            if let Some(witness) = range_witness.as_ref() {
+                for (lookup_plan, lookup_message) in plan
+                    .send
+                    .digit_lookups
+                    .iter()
+                    .zip(&witness.messages.lookups)
+                {
+                    rows.extend(digit_lookup_rows(
+                        &plan.send,
+                        lookup_plan,
+                        lookup_message,
+                        &members,
+                    )?);
+                }
+            }
             let fold = member_fold_shape(
                 plan.proximity.code,
                 plan.proximity.mask_code,
@@ -6808,7 +6955,19 @@ fn verify_first_chain_segment(
                     cf,
                 )?);
             }
-            let rows = segment_plain_rows(&members, rows)?;
+            let mut rows = segment_plain_rows(&members, rows)?;
+            if let (Some(_), Some(messages)) = (&plan.send.range, range) {
+                for (lookup_plan, lookup_message) in
+                    plan.send.digit_lookups.iter().zip(&messages.lookups)
+                {
+                    rows.extend(digit_lookup_rows(
+                        &plan.send,
+                        lookup_plan,
+                        lookup_message,
+                        &members,
+                    )?);
+                }
+            }
             let fold = member_fold_shape(
                 plan.proximity.code,
                 plan.proximity.mask_code,
@@ -11579,6 +11738,7 @@ fn verify_first(
                     arrays: messages.range_array.clone(),
                     units: units.clone(),
                     digits: digits.clone(),
+                    lookups: messages.digit_lookups.clone(),
                 }),
                 (true, None, None) => None,
                 _ => return Err(Error::InvalidProof),
@@ -17709,6 +17869,233 @@ fn lookup_plain_rows(
     row.target = bits_output.row_target;
     rows.push(row);
 
+    if bits_output.ends.len() != 1 {
+        return Err(Error::ShapeMismatch);
+    }
+    let end = &bits_output.ends[0];
+    let eq = crate::proof::output_closure::eq_vector(&end.point)?;
+    if eq.len() != bits_columns {
+        return Err(Error::ShapeMismatch);
+    }
+    let shown_slot = claims
+        .end_slots
+        .get(bits_index)
+        .and_then(|slots| slots.first())
+        .copied()
+        .ok_or(Error::ShapeMismatch)?;
+    let mut row = BatRow::new(BatRowKind::Plain);
+    row.add_term(
+        bits_member.bat_oracle,
+        BatPart::Main,
+        scatter_message_coefficients(&commit.bits_shape, bits_columns as u64, &eq)?,
+    );
+    row.add_unit(
+        mask_member.bat_oracle,
+        BatPart::Mask,
+        lookup_mask_virtual_index(commit, shown_slot)?,
+        end.mask_scale,
+    );
+    row.target = end.value;
+    rows.push(row);
+    Ok(rows)
+}
+
+/// The mask-form sample row of a lookup mask message: the equality table
+/// over the mask rows and places, with the last entry's factor `beta`.
+fn digit_lookup_mask_sample_row(
+    commit: &crate::proof::lookup_messages::LookupCommitPlan,
+    oracle: u64,
+    group: u64,
+    seed: &zkie_engine::pcs::request::table::SampleSeed,
+    target: Fp3,
+) -> Result<GuRelationRow> {
+    let bits = lookup_mask_sample_bits(commit)?;
+    if seed.z.len() < bits as usize || seed.beta == Fp3::ZERO {
+        return Err(Error::ShapeMismatch);
+    }
+    let ell = usize::try_from(commit.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
+    let mask_rows = usize::try_from(commit.mask_rows).map_err(|_| Error::ResourceLimit)?;
+    let mut mask = vec![Fp3::ZERO; mask_rows * ell];
+    let row_bits = ceil_log2_u64(commit.mask_rows);
+    let stride = 1usize
+        .checked_shl(row_bits)
+        .ok_or(Error::ResourceLimit)?;
+    let point = &seed.z[..bits as usize];
+    let eq = crate::proof::output_closure::eq_vector(point)?;
+    let count = 1u64.checked_shl(bits).ok_or(Error::ResourceLimit)?;
+    for index in 0..count {
+        let row = (index & (stride as u64 - 1)) as usize;
+        let place = (index >> row_bits) as usize;
+        if row >= mask_rows || place >= ell {
+            continue;
+        }
+        let coefficient = if row + 1 == mask_rows && place + 1 == ell {
+            seed.beta
+        } else {
+            *eq.get(index as usize).ok_or(Error::InvalidIndex)?
+        };
+        mask[row * ell + place] = coefficient;
+    }
+    Ok(GuRelationRow {
+        oracle,
+        group,
+        kind: GuRelationKind::Sample,
+        main: Vec::new(),
+        mask,
+        target,
+    })
+}
+
+/// The BAT rows of one digit lookup: the key claim registered on the committed
+/// digit message, the multiplicity row on the multiplicity-bit message, the
+/// leaf kept-map row, the bit summand's hiding/shown rows and its end row.
+fn digit_lookup_rows(
+    plan: &HiddenSendPlan,
+    lookup_plan: &crate::proof::digit_lookup::DigitLookupPlan,
+    message: &DigitLookupMessages,
+    members: &[ProximityMember],
+) -> Result<Vec<BatRow>> {
+    use zkie_engine::pcs::request::bat::{BatPart, BatRow, BatRowKind};
+    let range = plan.range.as_ref().ok_or(Error::InvalidConfig)?;
+    let commit = &lookup_plan.commit;
+    let lookup = &lookup_plan.lookup;
+    let claims = &message.claims;
+    let mut bat_of = std::collections::HashMap::new();
+    for member in members {
+        bat_of.insert(member.source_oracle, member);
+    }
+    let bits_member = bat_of
+        .get(&commit.bits_oracle)
+        .ok_or(Error::StatementMismatch)?;
+    let mask_member = bat_of
+        .get(&commit.mask_oracle)
+        .ok_or(Error::StatementMismatch)?;
+    let digit_member = bat_of
+        .get(&range.digit_oracle)
+        .ok_or(Error::StatementMismatch)?;
+    if bits_member.main_rows != commit.bits_shape.main_rows
+        || bits_member.main_code != commit.bits_shape.code
+        || bits_member.mask_rows != 0
+        || mask_member.mask_rows != commit.mask_rows
+        || mask_member.mask_code != commit.mask_code
+        || mask_member.main_rows != 0
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let planes = lookup.planes()?;
+    let table_rows = lookup.table_rows()?;
+    let bits_columns = planes
+        .checked_mul(table_rows)
+        .ok_or(Error::ResourceLimit)?;
+    let mut rows = Vec::new();
+    let key_members = [crate::proof::lookup::KeyClaimMember {
+        source_oracle: range.digit_oracle,
+        bat_oracle: digit_member.bat_oracle,
+        shape: range.digit_shape,
+        columns: 1,
+    }];
+    rows.push(lookup_plan.key.registration_row(
+        lookup,
+        &claims.key,
+        claims.theta,
+        &key_members,
+        mask_member.bat_oracle,
+        &|slot| lookup_mask_virtual_index(commit, slot),
+    )?);
+    let mut multiplicity = BatRow::new(BatRowKind::Plain);
+    multiplicity.add_term(
+        bits_member.bat_oracle,
+        BatPart::Main,
+        scatter_message_coefficients(
+            &commit.bits_shape,
+            bits_columns as u64,
+            &claims.multiplicity.0,
+        )?,
+    );
+    multiplicity.target = claims.multiplicity.1;
+    rows.push(multiplicity);
+    let leaf_index = (planes - 1)
+        .checked_add(lookup.key_bits as usize)
+        .and_then(|value| value.checked_add(lookup.table_log as usize))
+        .ok_or(Error::ResourceLimit)?;
+    let bits_index = leaf_index.checked_add(1).ok_or(Error::ResourceLimit)?;
+    if claims.rows.len() != bits_index + 1 {
+        return Err(Error::ShapeMismatch);
+    }
+    let leaf = &claims.rows[leaf_index];
+    if leaf.row_maps.len() != 1 {
+        return Err(Error::ShapeMismatch);
+    }
+    let (map_index, map_coefficient) = leaf.row_maps[0];
+    if map_index != 0 {
+        return Err(Error::ShapeMismatch);
+    }
+    let eq = crate::proof::output_closure::eq_vector(&leaf.point)?;
+    if eq.len() != bits_columns {
+        return Err(Error::ShapeMismatch);
+    }
+    let dense = eq
+        .iter()
+        .map(|value| map_coefficient.mul(value))
+        .collect::<Vec<_>>();
+    let mut row = BatRow::new(BatRowKind::Plain);
+    row.add_term(
+        bits_member.bat_oracle,
+        BatPart::Main,
+        scatter_message_coefficients(&commit.bits_shape, bits_columns as u64, &dense)?,
+    );
+    let leaf_hiding = claims
+        .hiding_slots
+        .get(leaf_index)
+        .ok_or(Error::ShapeMismatch)?;
+    if leaf_hiding.len() != leaf.hiding_form.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    for (slot, coefficient) in leaf_hiding.iter().zip(&leaf.hiding_form) {
+        row.add_unit(
+            mask_member.bat_oracle,
+            BatPart::Mask,
+            lookup_mask_virtual_index(commit, *slot)?,
+            *coefficient,
+        );
+    }
+    for term in &leaf.claim_masks {
+        row.add_unit(
+            mask_member.bat_oracle,
+            BatPart::Mask,
+            lookup_mask_virtual_index(commit, term.slot)?,
+            term.coefficient,
+        );
+    }
+    row.target = leaf.row_target;
+    rows.push(row);
+    let bits_output = &claims.rows[bits_index];
+    let bits_hiding = claims
+        .hiding_slots
+        .get(bits_index)
+        .ok_or(Error::ShapeMismatch)?;
+    if bits_hiding.len() != bits_output.hiding_form.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut row = BatRow::new(BatRowKind::Plain);
+    for (slot, coefficient) in bits_hiding.iter().zip(&bits_output.hiding_form) {
+        row.add_unit(
+            mask_member.bat_oracle,
+            BatPart::Mask,
+            lookup_mask_virtual_index(commit, *slot)?,
+            *coefficient,
+        );
+    }
+    for term in &bits_output.claim_masks {
+        row.add_unit(
+            mask_member.bat_oracle,
+            BatPart::Mask,
+            lookup_mask_virtual_index(commit, term.slot)?,
+            term.coefficient,
+        );
+    }
+    row.target = bits_output.row_target;
+    rows.push(row);
     if bits_output.ends.len() != 1 {
         return Err(Error::ShapeMismatch);
     }
@@ -28403,6 +28790,11 @@ mod merged_tests {
             )
             .unwrap(),
         ];
+        // The fresh mask covers the group's whole mask space `2^h`: the two
+        // lookup mask members pad the mask blocks to 4 + 32 + 32 entries.
+        if let Some(tree) = plan.send.segment_mask_tree.as_mut() {
+            tree.mask_rows = 128;
+        }
         let mask_inputs = ChainInputs {
             token_point: &point,
             token_shown: &token_shown,
