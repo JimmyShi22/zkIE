@@ -16,6 +16,12 @@
 //! receives the original cells.
 
 use zkie_core::error::{Error, Result};
+use zkie_core::types::Digest;
+use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
+use zkie_engine::pcs::request::field::{fp_from_u64, Fp, Fp3, E_DEGREE};
+use zkie_engine::pcs::request::runtime_tree::{
+    verify_runtime_opening, RuntimePartRows, RuntimeTree, RuntimeTreeOpening, RuntimeTreePlan,
+};
 
 /// The base of the packing digit, `2^20`.
 pub const PACK_BASE: i128 = 1 << 20;
@@ -95,6 +101,140 @@ pub fn pack_columns(cells: &[i128], plan: &PackedMatrixPlan) -> Result<Vec<i128>
         }
     }
     Ok(packed)
+}
+
+
+/// Commits the packed values under the plan's tree: one main row of the packed
+/// entries, padded with zeros to the tree's columns. The values are integers
+/// in `[0, 2^60)` embedded as base-field elements; no packed value is reduced.
+pub fn commit_packed_array(
+    plan: &PackedMatrixPlan,
+    values: &[i128],
+    tree: RuntimeTreePlan,
+    salts: &[Vec<u8>],
+) -> Result<RuntimeTree> {
+    let entries = usize::try_from(plan.groups)
+        .map_err(|_| Error::ResourceLimit)?
+        .checked_mul(usize::try_from(plan.columns).map_err(|_| Error::ResourceLimit)?)
+        .ok_or(Error::ResourceLimit)?;
+    if values.len() != entries {
+        return Err(Error::ShapeMismatch);
+    }
+    for value in values {
+        if *value < 0 || *value > plan.packed_bound() {
+            return Err(Error::BoundViolation);
+        }
+    }
+    let columns = usize::try_from(tree.columns()).map_err(|_| Error::ResourceLimit)?;
+    if entries > columns || salts.len() != columns {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut row = vec![Fp3::ZERO; columns];
+    for (slot, value) in row.iter_mut().zip(values) {
+        *slot = Fp3::from_base(fp_from_u64(*value as u64));
+    }
+    let parts = [RuntimePartRows {
+        main: vec![row],
+        mask: Vec::new(),
+        main_deg: E_DEGREE as u32,
+    }];
+    RuntimeTree::commit(tree, &parts, salts)
+}
+
+/// Verifies the packed array's opening at `positions` against `root` and
+/// returns the packed values at those positions in the opening's order.
+pub fn verify_packed_opening(
+    plan: &PackedMatrixPlan,
+    tree: &RuntimeTreePlan,
+    root: &Digest,
+    positions: &[u64],
+    opening: &RuntimeTreeOpening,
+) -> Result<Vec<i128>> {
+    verify_runtime_opening(tree, root, positions, opening)?;
+    let width = usize::try_from(tree.width()?).map_err(|_| Error::ResourceLimit)?;
+    if width != E_DEGREE as usize || opening.columns.len() != positions.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut values = Vec::with_capacity(positions.len());
+    for (at, column) in opening.columns.iter().enumerate() {
+        if column.position != positions[at]
+            || positions[at] >= tree.columns()
+            || column.symbols.len() != width
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        let value = Fp3::new(column.symbols[0], column.symbols[1], column.symbols[2]);
+        if value.c[1] != Fp::ZERO || value.c[2] != Fp::ZERO {
+            return Err(Error::InvalidProof);
+        }
+        let packed = value.c[0].as_canonical_u64();
+        if packed > plan.packed_bound() as u64 {
+            return Err(Error::BoundViolation);
+        }
+        values.push(packed as i128);
+    }
+    Ok(values)
+}
+
+#[cfg(test)]
+mod commit_tests {
+    use super::*;
+    use zkie_engine::pcs::request::code::build_code_plan;
+
+    fn tree() -> RuntimeTreePlan {
+        RuntimeTreePlan {
+            tree_number: 901,
+            leaf_class: 1,
+            log_n: 2,
+            log_n_zk: 2,
+            parts: vec![zkie_engine::pcs::request::runtime_tree::RuntimeTreePart {
+                main_symbols: E_DEGREE as u64,
+                mask_symbols: 0,
+            }],
+            salt_bytes: 40,
+            run: Digest([0x91; 32]),
+            configuration: Digest([0x92; 32]),
+        }
+    }
+
+    fn salts() -> Vec<Vec<u8>> {
+        (0..4).map(|index| vec![index as u8 ^ 0x5A; 40]).collect()
+    }
+
+    #[test]
+    fn the_packed_array_opens_at_the_planned_positions() {
+        let plan = PackedMatrixPlan::new(4, 2).unwrap();
+        let packed = pack_columns(&super::tests_cells(), &plan).unwrap();
+        let tree = tree();
+        let committed = commit_packed_array(&plan, &packed, tree.clone(), &salts()).unwrap();
+        let positions = [0u64, 2];
+        let opening = committed.open(&positions).unwrap();
+        let values = verify_packed_opening(&plan, &tree, committed.root(), &positions, &opening)
+            .unwrap();
+        assert_eq!(values, vec![packed[0], packed[2]]);
+        // A changed root, a changed position and a zero packed value outside
+        // the plan are refused.
+        assert!(verify_packed_opening(
+            &plan,
+            &tree,
+            &Digest([0xEE; 32]),
+            &positions,
+            &opening
+        )
+        .is_err());
+        assert!(verify_packed_opening(&plan, &tree, committed.root(), &[3], &opening).is_err());
+        let mut large = packed.clone();
+        large[0] = plan.packed_bound() + 1;
+        assert_eq!(
+            commit_packed_array(&plan, &large, tree, &salts()).unwrap_err(),
+            Error::BoundViolation
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn tests_cells() -> Vec<i128> {
+    vec![1, 2, 3, 4, 5, 6, 7, 8]
 }
 
 #[cfg(test)]
