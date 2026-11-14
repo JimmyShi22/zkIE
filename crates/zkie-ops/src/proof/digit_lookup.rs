@@ -210,12 +210,23 @@ impl DigitLookupPlan {
     }
 }
 
+impl DigitLookupPlan {
+    /// Pads one key vector with the public padding value to the key count.
+    /// The real keys keep their order; only the tail is padding.
+    pub fn pad_keys(&self, mut keys: Vec<Fp3>) -> Result<Vec<Fp3>> {
+        let count = self.lookup.key_count()?;
+        if keys.len() > count || self.key.padding_values.len() != 1 {
+            return Err(Error::ShapeMismatch);
+        }
+        keys.resize(count, self.key.padding_values[0]);
+        Ok(keys)
+    }
+}
+
 /// The number of real digit cells of one plane: `tau` combinations over
-/// `2 * cell_rows()` places.
+/// the plane's `cell_rows()` places.
 pub fn digit_key_count(range: &RangePlan) -> Result<usize> {
-    let places = 2usize
-        .checked_mul(usize::try_from(range.cell_rows()?).map_err(|_| Error::ResourceLimit)?)
-        .ok_or(Error::ResourceLimit)?;
+    let places = usize::try_from(range.cell_rows()?).map_err(|_| Error::ResourceLimit)?;
     (range.combinations as usize)
         .checked_mul(places)
         .ok_or(Error::ResourceLimit)
@@ -249,13 +260,16 @@ fn digit_lookup_sizing(range: &RangePlan, plane: u32) -> Result<(LookupPlan, Loo
     };
     lookup.validate()?;
     let combinations = range.combinations;
-    let places = 2u32
-        .checked_mul(u32::try_from(range.cell_rows()?).map_err(|_| Error::ResourceLimit)?)
+    let rows_cell = u32::try_from(range.cell_rows()?).map_err(|_| Error::ResourceLimit)?;
+    // The plane's stored columns are `plane * rows_cell .. (plane + 1) *
+    // rows_cell`; the dense digit index is `place * tau + combination`, so the
+    // key vector follows the dense order and the trusted plan fixes the
+    // coverage.
+    let first_place = plane
+        .checked_mul(rows_cell)
         .ok_or(Error::ResourceLimit)?;
-    // The dense digit index is `place * tau + combination`; the key vector
-    // follows the dense order, so the trusted plan fixes the coverage.
     let mut sources = Vec::with_capacity(real);
-    for place in 0..places {
+    for place in first_place..first_place.checked_add(rows_cell).ok_or(Error::ResourceLimit)? {
         for combination in 0..combinations {
             sources.push(LookupKeySource {
                 column: 0,
@@ -471,8 +485,8 @@ mod tests {
         let range = range();
         for plane in 0..2u32 {
             let plan = digit_lookup_plan(&range, plane, &test_params()).unwrap();
-            assert_eq!(plan.real_keys(), 16);
-            assert_eq!(plan.padding_keys().unwrap(), 1024 - 16);
+            assert_eq!(plan.real_keys(), 8);
+            assert_eq!(plan.padding_keys().unwrap(), 1024 - 8);
             assert_eq!(plan.lookup.key_bits, 10);
             let mut seen = std::collections::BTreeSet::new();
             for source in &plan.key.sources {
@@ -481,10 +495,11 @@ mod tests {
                 assert_eq!(source.coefficient, Fp3::ONE);
                 assert_eq!(source.offset, Fp3::ZERO);
                 assert!(source.row < range.combinations);
-                assert!(source.place < 8);
+                let first = (plane as u32) * (range.cell_rows().unwrap() as u32);
+                assert!(source.place >= first && source.place < first + range.cell_rows().unwrap() as u32);
                 assert!(seen.insert((source.row, source.place)));
             }
-            assert_eq!(seen.len(), 16);
+            assert_eq!(seen.len(), 8);
             // The message plans carry the multiplicity-bit values and the
             // lookup's mask rows under distinct identities in the group.
             let bits = 32usize * plan.lookup.table_rows().unwrap();
@@ -508,10 +523,129 @@ mod tests {
     }
 
     #[test]
+    fn the_digit_lookups_prove_and_verify_on_their_tables() {
+        use crate::proof::lookup::{
+            mask_count, prove_lookup_with_key_values, verify_lookup, ByteTable,
+            LookupTable, LookupWitness,
+        };
+        use crate::proof::lookup_messages::{commit_lookup, LookupRandomSource, LookupRoots};
+        use zkie_engine::pcs::request::chain::Chain;
+        let range = range();
+        for plane in 0..2u32 {
+            let plan = digit_lookup_plan(&range, plane, &test_params()).unwrap();
+            let rows = plan.lookup.table_rows().unwrap() as u64;
+            let real: Vec<Fp3> = (0..plan.real_keys())
+                .map(|index| Fp3::from_u64((index as u64 * 7 + plane as u64) % rows))
+                .collect();
+            let bits = digit_multiplicity_bits(&plan, &real).unwrap();
+            let values = plan.pad_keys(real).unwrap();
+            let masks = mask_count(&plan.lookup).unwrap();
+            let mut source = LookupRandomSource::new(9 + plane as u64);
+            let messages = commit_lookup(&plan.commit, &bits, masks, &mut source).unwrap();
+            let table: &dyn LookupTable = if plane == 0 {
+                &LowDigitTable
+            } else {
+                &ByteTable
+            };
+            let mut prover = Chain::begin(
+                0x4C4B_5550,
+                &Digest::ZERO,
+                &[],
+                &Digest::ZERO.0,
+                None,
+            )
+            .unwrap();
+            let (proof, proven) = prove_lookup_with_key_values(
+                &plan.lookup,
+                &plan.commit,
+                &plan.key,
+                &values,
+                &LookupWitness { bits },
+                &messages,
+                table,
+                &mut prover,
+            )
+            .unwrap();
+            let mut verifier = Chain::begin(
+                0x4C4B_5550,
+                &Digest::ZERO,
+                &[],
+                &Digest::ZERO.0,
+                None,
+            )
+            .unwrap();
+            let verified = verify_lookup(
+                &plan.lookup,
+                &plan.commit,
+                &plan.key,
+                &LookupRoots {
+                    bits: messages.bits_root(),
+                    mask: messages.mask_root,
+                },
+                &proof,
+                table,
+                &mut verifier,
+            )
+            .unwrap();
+            assert_eq!(proven, verified);
+        }
+        // A key outside the table cannot be proved: the product tie fails.
+        let plan = digit_lookup_plan(&range, 0, &test_params()).unwrap();
+        let rows = plan.lookup.table_rows().unwrap() as u64;
+        let mut real: Vec<Fp3> = (0..plan.real_keys())
+            .map(|index| Fp3::from_u64(index as u64 % rows))
+            .collect();
+        real[0] = Fp3::from_u64(rows);
+        let mut values = plan.pad_keys(real).unwrap();
+        values[0] = Fp3::from_u64(rows);
+        // The multiplicity bits count the in-table keys only; the foreign key
+        // stays in the key vector, so the product tie must fail.
+        let planes = plan.lookup.planes().unwrap();
+        let mut counts = vec![0u64; rows as usize];
+        for value in &values {
+            let index = value.c[0].as_canonical_u64();
+            if index < rows {
+                counts[index as usize] += 1;
+            }
+        }
+        counts[0] += (plan.lookup.key_count().unwrap() - values.len()) as u64;
+        let mut bits = vec![Fp3::ZERO; planes * rows as usize];
+        for row in 0..rows as usize {
+            for plane in 0..planes {
+                if (counts[row] >> plane) & 1 == 1 {
+                    bits[plane + planes * row] = Fp3::ONE;
+                }
+            }
+        }
+        let masks = mask_count(&plan.lookup).unwrap();
+        let mut source = LookupRandomSource::new(21);
+        let messages = commit_lookup(&plan.commit, &bits, masks, &mut source).unwrap();
+        let mut prover = Chain::begin(
+            0x4C4B_5550,
+            &Digest::ZERO,
+            &[],
+            &Digest::ZERO.0,
+            None,
+        )
+        .unwrap();
+        assert!(prove_lookup_with_key_values(
+            &plan.lookup,
+            &plan.commit,
+            &plan.key,
+            &values,
+            &LookupWitness { bits },
+            &messages,
+            &LowDigitTable,
+            &mut prover,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn the_multiplicity_bits_count_every_table_row_once() {
         let range = range();
         let plan = digit_lookup_plan(&range, 0, &test_params()).unwrap();
-        let mut digits = vec![Fp3::from_u64(3); 16];
+        let mut digits = vec![Fp3::from_u64(3); 8];
         digits[0] = Fp3::from_u64(0);
         digits[1] = Fp3::from_u64(0);
         let bits = digit_multiplicity_bits(&plan, &digits).unwrap();
@@ -530,17 +664,17 @@ mod tests {
         }
         // Row zero's count includes the padding keys, so the product trees
         // carry no extra padding factor.
-        assert_eq!(count0, 2 + (1024 - 16));
-        assert_eq!(count3, 14);
+        assert_eq!(count0, 2 + (1024 - 8));
+        assert_eq!(count3, 6);
         // A digit outside the table is refused by both planes.
-        let mut outside = vec![Fp3::from_u64(3); 16];
+        let mut outside = vec![Fp3::from_u64(3); 8];
         outside[0] = Fp3::from_u64(1024);
         assert!(digit_multiplicity_bits(&plan, &outside).is_err());
         let high = digit_lookup_plan(&range, 1, &test_params()).unwrap();
-        let mut outside = vec![Fp3::from_u64(200); 16];
+        let mut outside = vec![Fp3::from_u64(200); 8];
         outside[0] = Fp3::from_u64(256);
         assert!(digit_multiplicity_bits(&high, &outside).is_err());
         // Wrong key counts are refused before any count is taken.
-        assert!(digit_multiplicity_bits(&plan, &digits[..15]).is_err());
+        assert!(digit_multiplicity_bits(&plan, &digits[..7]).is_err());
     }
 }

@@ -2213,6 +2213,19 @@ impl HiddenSendPlan {
                     }
                     lookup.validate(range)?;
                 }
+                let first = &self.digit_lookups[0].commit;
+                let second = &self.digit_lookups[1].commit;
+                if first.bits_oracle == second.bits_oracle
+                    || first.bits_oracle == second.mask_oracle
+                    || first.mask_oracle == second.bits_oracle
+                    || first.mask_oracle == second.mask_oracle
+                    || first.bits_shape.tree_number == second.bits_shape.tree_number
+                    || first.bits_shape.tree_number == second.mask_tree.tree_number
+                    || first.mask_tree.tree_number == second.bits_shape.tree_number
+                    || first.mask_tree.tree_number == second.mask_tree.tree_number
+                {
+                    return Err(Error::InvalidConfig);
+                }
             }
             let member = self.member.as_ref().ok_or(Error::InvalidConfig)?;
             // One packed symbol array per limb: the member's read tables are
@@ -3600,7 +3613,20 @@ impl HiddenSendMessages {
                 return Err(Error::InvalidEncoding);
             }
             writer.put_digest(&message.bits_root);
+            writer.put_bytes(&message.bits_sample.encode());
+            put_tree_plan(&mut writer, &message.mask_tree);
             writer.put_digest(&message.mask_root);
+            writer.put_bytes(&message.mask_sample.encode());
+            writer.put_u64(message.mask_positions.len() as u64);
+            for position in &message.mask_positions {
+                writer.put_u64(*position);
+            }
+            writer.put_bytes(
+                &zkie_engine::pcs::request::runtime_tree::encode_runtime_opening(
+                    &message.mask_tree,
+                    &message.mask_opening,
+                )?,
+            );
             writer.put_bytes(&message.proof.encode()?);
             writer.put_bytes(&message.claims.encode_unchecked());
         }
@@ -3780,10 +3806,36 @@ impl HiddenSendMessages {
             let mut lookups = Vec::with_capacity(plan.digit_lookups.len());
             for lookup in &plan.digit_lookups {
                 let bits_root = reader.get_digest()?;
-                let mask_root = reader.get_digest()?;
-                if bits_root == Digest::ZERO || mask_root == Digest::ZERO {
+                let bits_sample = SendSamples::decode(reader.get_bytes()?)?;
+                if bits_sample.seed.len() != lookup.commit.bits_shape.answers as usize
+                    || bits_sample.answers.len() != lookup.commit.bits_shape.answers as usize
+                {
                     return Err(Error::InvalidEncoding);
                 }
+                let mask_tree = get_tree_plan(&mut reader)?;
+                if mask_tree != lookup.commit.mask_tree
+                    || mask_tree.tree_number != lookup.commit.mask_tree.tree_number
+                {
+                    return Err(Error::InvalidEncoding);
+                }
+                let mask_root = reader.get_digest()?;
+                let mask_sample = SendSamples::decode(reader.get_bytes()?)?;
+                if mask_sample.seed.len() != 1 || mask_sample.answers.len() != 1 {
+                    return Err(Error::InvalidEncoding);
+                }
+                let count = reader.get_u64()?;
+                if count != lookup.commit.mask_openings as u64 {
+                    return Err(Error::InvalidEncoding);
+                }
+                let mut mask_positions = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    mask_positions.push(reader.get_u64()?);
+                }
+                let mask_opening = zkie_engine::pcs::request::runtime_tree::decode_runtime_opening(
+                    &mask_tree,
+                    &mask_positions,
+                    reader.get_bytes()?,
+                )?;
                 let proof = crate::proof::lookup::LookupProof::decode(
                     &lookup.lookup,
                     reader.get_bytes()?,
@@ -3794,7 +3846,12 @@ impl HiddenSendMessages {
                 )?;
                 lookups.push(DigitLookupMessages {
                     bits_root,
+                    bits_sample,
+                    mask_tree,
                     mask_root,
+                    mask_sample,
+                    mask_positions,
+                    mask_opening,
                     proof,
                     claims,
                 });
@@ -5140,12 +5197,17 @@ struct RangeMessages {
     digits: RequestWMessage,
 }
 
-/// One digit lookup's wire form: the roots of its two messages, its proof
-/// and the claims it leaves to the segment.
+/// One digit lookup's wire form: its two messages with their samples, the
+/// mask message's opening, its proof and the claims it leaves to the segment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DigitLookupMessages {
     pub bits_root: Digest,
+    pub bits_sample: SendSamples,
+    pub mask_tree: zkie_engine::pcs::request::runtime_tree::RuntimeTreePlan,
     pub mask_root: Digest,
+    pub mask_sample: SendSamples,
+    pub mask_positions: Vec<u64>,
+    pub mask_opening: zkie_engine::pcs::request::runtime_tree::RuntimeTreeOpening,
     pub proof: crate::proof::lookup::LookupProof,
     pub claims: crate::proof::lookup::LookupOutcome,
 }
@@ -5977,6 +6039,7 @@ fn prove_first_chain_segment(
     Option<SegmentProximityMessages>,
     Vec<BatRow>,
     Option<RangeMessages>,
+    Vec<DigitLookupMessages>,
 )> {
     let mut chain = chain;
     let shape = plan.send.request_chain.ok_or(Error::InvalidConfig)?;
@@ -6144,6 +6207,7 @@ fn prove_first_chain_segment(
     // The combination matrix, the digit object and the batching element.
     let mut range_digits: Option<(RequestWWitness, RequestWMessage)> = None;
     let mut range_trits: Option<Vec<i8>> = None;
+    let mut range_digit_values_out: Option<Vec<Fp3>> = None;
     if let (Some(range_plan), Some(_)) = (&plan.send.range, &range_units) {
         let columns =
             usize::try_from(range_plan.columns_cell()?).map_err(|_| Error::ResourceLimit)?;
@@ -6153,6 +6217,7 @@ fn prove_first_chain_segment(
         let cf = chain.draw_trits(trits)?;
         let activation = activation.ok_or(Error::InvalidConfig)?;
         let values = range_digit_values(&plan.send, &cf, activation)?;
+        range_digit_values_out = Some(values.clone());
         let (witness, mut message) = commit_range_message(
             range_plan,
             &range_plan.digit_shape,
@@ -6185,6 +6250,107 @@ fn prove_first_chain_segment(
         message.sample = SendSamples { seed: seeds, answers };
         range_digits = Some((witness, message));
         range_trits = Some(cf);
+    }
+    // The two digit lookups: their messages are committed and sampled after
+    // the digit object and before the batching element is drawn.
+    let mut digit_lookup_messages: Vec<DigitLookupMessages> = Vec::new();
+    if let (Some(range_plan), Some(_)) = (&plan.send.range, &range_digits) {
+        if !plan.send.digit_lookups.is_empty() {
+            let digits = range_digit_values_out
+                .as_ref()
+                .ok_or(Error::InvalidSessionState)?;
+            let combinations = range_plan.combinations as usize;
+            for (plane, lookup_plan) in plan.send.digit_lookups.iter().enumerate() {
+                let mut plane_values = Vec::with_capacity(lookup_plan.key.sources.len());
+                for source in &lookup_plan.key.sources {
+                    let dense = (source.place as usize)
+                        .checked_mul(combinations)
+                        .and_then(|value| value.checked_add(source.row as usize))
+                        .ok_or(Error::ResourceLimit)?;
+                    plane_values.push(*digits.get(dense).ok_or(Error::ShapeMismatch)?);
+                }
+                let bits = crate::proof::digit_lookup::digit_multiplicity_bits(
+                    lookup_plan,
+                    &plane_values,
+                )?;
+                let plane_values = lookup_plan.pad_keys(plane_values)?;
+                let mask_entries = crate::proof::lookup::mask_count(&lookup_plan.lookup)?;
+                let words = derive_run_seed(seed, lookup_plan.commit.bits_oracle, 10)?;
+                let seed_word =
+                    u64::from_le_bytes(words.0[..8].try_into().map_err(|_| Error::InvalidConfig)?);
+                let mut source =
+                    crate::proof::lookup_messages::LookupRandomSource::new(seed_word);
+                let lookup_messages = crate::proof::lookup_messages::commit_lookup(
+                    &lookup_plan.commit,
+                    &bits,
+                    mask_entries,
+                    &mut source,
+                )?;
+                let bits_root = lookup_messages.bits_root();
+                absorb_digit_lookup_bits_root(&mut chain, 34, &lookup_plan.commit, &bits_root)?;
+                let seeds = draw_seed_set(
+                    &mut chain,
+                    lookup_plan.commit.bits_shape.sample_bits()?,
+                    lookup_plan.commit.bits_shape.answers,
+                )?;
+                let answers = range_sample_answers(
+                    &lookup_plan.commit.bits_shape,
+                    lookup_plan.commit.bits_oracle,
+                    lookup_plan.commit.group,
+                    &lookup_messages.bits,
+                    &seeds,
+                )?;
+                for answer in &answers {
+                    absorb_digit_lookup_answer(&mut chain, 35, *answer)?;
+                }
+                let bits_sample = SendSamples { seed: seeds, answers };
+                let mask_tree = digit_lookup_mask_tree(&lookup_plan.commit, &lookup_messages)?;
+                let mask_root = lookup_messages.mask_root;
+                absorb_digit_lookup_mask_root(&mut chain, 36, &lookup_plan.commit, &mask_root)?;
+                let mask_seeds = draw_seed_set(
+                    &mut chain,
+                    lookup_mask_sample_bits(&lookup_plan.commit)?,
+                    1,
+                )?;
+                let mask_answer = lookup_mask_answer(
+                    &lookup_plan.commit,
+                    &lookup_messages.mask_rows,
+                    &mask_seeds[0],
+                )?;
+                absorb_digit_lookup_answer(&mut chain, 37, mask_answer)?;
+                let mask_sample = SendSamples {
+                    seed: mask_seeds,
+                    answers: vec![mask_answer],
+                };
+                let positions = draw_lookup_positions(&mut chain, 38, &lookup_plan.commit)?;
+                let mask_opening = mask_tree.open(&positions)?;
+                let low_table = crate::proof::digit_lookup::LowDigitTable;
+                let high_table = crate::proof::lookup::ByteTable;
+                let table: &dyn crate::proof::lookup::LookupTable =
+                    if plane == 0 { &low_table } else { &high_table };
+                let (proof, claims) = crate::proof::lookup::prove_lookup_with_key_values(
+                    &lookup_plan.lookup,
+                    &lookup_plan.commit,
+                    &lookup_plan.key,
+                    &plane_values,
+                    &crate::proof::lookup::LookupWitness { bits },
+                    &lookup_messages,
+                    table,
+                    &mut chain,
+                )?;
+                digit_lookup_messages.push(DigitLookupMessages {
+                    bits_root,
+                    bits_sample,
+                    mask_tree: lookup_plan.commit.mask_tree.clone(),
+                    mask_root,
+                    mask_sample,
+                    mask_positions: positions,
+                    mask_opening,
+                    proof,
+                    claims,
+                });
+            }
+        }
     }
     let theta = chain.draw_e_nonzero()?;
     // The segment relation closure: the relation rows are checked by a
@@ -6319,6 +6485,7 @@ fn prove_first_chain_segment(
         segment_proximity,
         rows,
         range_messages,
+        digit_lookup_messages,
     ))
 }
 
@@ -6347,6 +6514,7 @@ fn verify_first_chain_segment(
     chain_mask: Option<&ChainMaskMessage>,
     source_data: Option<&RequestWMessage>,
     range: Option<&RangeMessages>,
+    lookups: &[DigitLookupMessages],
     segment_proximity: Option<&SegmentProximityMessages>,
 ) -> Result<(
     Chain,
@@ -6508,6 +6676,93 @@ fn verify_first_chain_segment(
         }
         absorb_range_answers(&mut chain, 33, &digits.sample.answers)?;
         range_trits = Some(cf);
+    }
+    // The two digit lookups, in the prover's order.
+    if let Some(_range_plan) = &plan.send.range {
+        if !plan.send.digit_lookups.is_empty() {
+            if lookups.len() != plan.send.digit_lookups.len() {
+                return Err(Error::InvalidProof);
+            }
+            let low_table = crate::proof::digit_lookup::LowDigitTable;
+            let high_table = crate::proof::lookup::ByteTable;
+            for (plane, (lookup_plan, message)) in plan
+                .send
+                .digit_lookups
+                .iter()
+                .zip(lookups)
+                .enumerate()
+            {
+                if message.bits_root == Digest::ZERO
+                    || message.mask_root == Digest::ZERO
+                    || message.mask_tree != lookup_plan.commit.mask_tree
+                {
+                    return Err(Error::InvalidProof);
+                }
+                absorb_digit_lookup_bits_root(
+                    &mut chain,
+                    34,
+                    &lookup_plan.commit,
+                    &message.bits_root,
+                )?;
+                let seeds = draw_seed_set(
+                    &mut chain,
+                    lookup_plan.commit.bits_shape.sample_bits()?,
+                    lookup_plan.commit.bits_shape.answers,
+                )?;
+                if message.bits_sample.seed != seeds
+                    || message.bits_sample.answers.len() != seeds.len()
+                {
+                    return Err(Error::InvalidProof);
+                }
+                for answer in &message.bits_sample.answers {
+                    absorb_digit_lookup_answer(&mut chain, 35, *answer)?;
+                }
+                absorb_digit_lookup_mask_root(
+                    &mut chain,
+                    36,
+                    &lookup_plan.commit,
+                    &message.mask_root,
+                )?;
+                let mask_seeds = draw_seed_set(
+                    &mut chain,
+                    lookup_mask_sample_bits(&lookup_plan.commit)?,
+                    1,
+                )?;
+                if message.mask_sample.seed != mask_seeds
+                    || message.mask_sample.answers.len() != 1
+                {
+                    return Err(Error::InvalidProof);
+                }
+                absorb_digit_lookup_answer(&mut chain, 37, message.mask_sample.answers[0])?;
+                let positions = draw_lookup_positions(&mut chain, 38, &lookup_plan.commit)?;
+                if message.mask_positions != positions {
+                    return Err(Error::InvalidProof);
+                }
+                zkie_engine::pcs::request::runtime_tree::verify_runtime_opening(
+                    &lookup_plan.commit.mask_tree,
+                    &message.mask_root,
+                    &positions,
+                    &message.mask_opening,
+                )?;
+                let table: &dyn crate::proof::lookup::LookupTable =
+                    if plane == 0 { &low_table } else { &high_table };
+                let claims = crate::proof::lookup::verify_lookup(
+                    &lookup_plan.lookup,
+                    &lookup_plan.commit,
+                    &lookup_plan.key,
+                    &crate::proof::lookup_messages::LookupRoots {
+                        bits: message.bits_root,
+                        mask: message.mask_root,
+                    },
+                    &message.proof,
+                    table,
+                    &mut chain,
+                )?;
+                if claims != message.claims {
+                    return Err(Error::InvalidProof);
+                }
+            }
+        }
     }
     let theta = chain.draw_e_nonzero()?;
     // The segment relation closure: the same proximity test the prover ran,
@@ -10735,6 +10990,7 @@ fn prove_first(
     let mut segment_proximity = None;
     let mut chain_rows = Vec::new();
     let mut range_messages_out = None;
+    let mut digit_lookups_out: Vec<DigitLookupMessages> = Vec::new();
     let request_section = match (&plan.send.request_chain, chain_inputs) {
         (Some(_), Some(inputs)) => {
             // The pending claim the segment leaves is the request member's
@@ -10751,6 +11007,7 @@ fn prove_first(
                 proximity,
                 rows,
                 range_messages,
+                digit_lookup_messages,
             ) = prove_first_chain_segment(chain, plan, activation, inputs, seed)?;
             chain = next_chain;
             bind_chain_pending(plan, &outputs.pending)?;
@@ -10761,6 +11018,7 @@ fn prove_first(
             segment_proximity = proximity;
             chain_rows = rows;
             range_messages_out = range_messages;
+            digit_lookups_out = digit_lookup_messages;
             Some(section)
         }
         (None, None) => None,
@@ -11228,7 +11486,7 @@ fn prove_first(
         range_units: range_messages_out.as_ref().map(|messages| messages.units.clone()),
         range_digits: range_messages_out.as_ref().map(|messages| messages.digits.clone()),
         segment_proximity,
-        digit_lookups: Vec::new(),
+        digit_lookups: digit_lookups_out,
     };
     witness.request_w = request_w_commit;
     witness.chain_mask = chain_mask_witness;
@@ -11341,6 +11599,7 @@ fn verify_first(
                 messages.chain_mask.as_ref(),
                 messages.source_data.as_ref(),
                 range_messages.as_ref(),
+                &messages.digit_lookups,
                 messages.segment_proximity.as_ref(),
             )?;
             chain = next_chain;
@@ -14631,6 +14890,121 @@ fn lookup_mask_sample_bits(
     ceil_log2_u64(commit.mask_rows)
         .checked_add(commit.mask_code.log_ell())
         .ok_or(Error::ResourceLimit)
+}
+
+/// Absorbs one lookup bits message root with its shape and tree.
+fn absorb_digit_lookup_bits_root(
+    chain: &mut Chain,
+    tag: u64,
+    commit: &crate::proof::lookup_messages::LookupCommitPlan,
+    root: &Digest,
+) -> Result<()> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(tag);
+    message.push_u64(commit.bits_oracle);
+    message.push_u64(commit.group);
+    message.push_u64(commit.bits_shape.main_rows);
+    message.push_u64(commit.bits_shape.answers as u64);
+    message.push_u64(commit.bits_shape.code.log_n as u64);
+    message.push_u64(commit.bits_shape.code.ell);
+    message.push_u64(commit.bits_shape.code.r);
+    push_tree_plan(&mut message, &commit.bits_shape.tree_plan(0)?);
+    push_digest(&mut message, root);
+    let prefix = message.prefix(KIND_SEED, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
+/// Absorbs one lookup mask message root with its rows, code and tree.
+fn absorb_digit_lookup_mask_root(
+    chain: &mut Chain,
+    tag: u64,
+    commit: &crate::proof::lookup_messages::LookupCommitPlan,
+    root: &Digest,
+) -> Result<()> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(tag);
+    message.push_u64(commit.mask_oracle);
+    message.push_u64(commit.group);
+    message.push_u64(commit.mask_rows);
+    message.push_u64(commit.mask_openings as u64);
+    message.push_u64(commit.mask_code.log_n as u64);
+    message.push_u64(commit.mask_code.ell);
+    message.push_u64(commit.mask_code.r);
+    push_tree_plan(&mut message, &commit.mask_tree);
+    push_digest(&mut message, root);
+    let prefix = message.prefix(KIND_SEED, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
+/// Absorbs one lookup sample answer.
+fn absorb_digit_lookup_answer(chain: &mut Chain, tag: u64, value: Fp3) -> Result<()> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(tag);
+    message.push_fp3(&value);
+    let prefix = message.prefix(KIND_SEED, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
+/// Draws the lookup mask message's opening positions.
+fn draw_lookup_positions(
+    chain: &mut Chain,
+    tag: u64,
+    commit: &crate::proof::lookup_messages::LookupCommitPlan,
+) -> Result<Vec<u64>> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(tag);
+    message.push_u64(1);
+    message.push_u64(commit.mask_openings as u64);
+    let prefix = message.prefix(KIND_POSITIONS, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    let mut positions = Vec::with_capacity(commit.mask_openings);
+    for _ in 0..commit.mask_openings {
+        positions.push(chain.draw_position(commit.mask_code.log_n)?);
+    }
+    Ok(unique_sorted(&positions))
+}
+
+/// Rebuilds the mask message's runtime tree from the committed rows and
+/// salts, so the prover can open it.
+fn digit_lookup_mask_tree(
+    commit: &crate::proof::lookup_messages::LookupCommitPlan,
+    messages: &crate::proof::lookup_messages::LookupMessages,
+) -> Result<zkie_engine::pcs::request::runtime_tree::RuntimeTree> {
+    let ell = usize::try_from(commit.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
+    if messages.mask_rows.len() != commit.mask_rows as usize
+        || messages.mask_tails.len() != messages.mask_rows.len()
+        || messages.mask_rows.iter().any(|row| row.len() != ell)
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut codewords = Vec::with_capacity(messages.mask_rows.len());
+    for (row, tail) in messages.mask_rows.iter().zip(&messages.mask_tails) {
+        codewords.push(encode_row_fp3(&commit.mask_code, row, tail)?);
+    }
+    zkie_engine::pcs::request::runtime_tree::RuntimeTree::commit(
+        commit.mask_tree.clone(),
+        &[zkie_engine::pcs::request::runtime_tree::RuntimePartRows {
+            main: Vec::new(),
+            mask: codewords,
+            main_deg: 1,
+        }],
+        &messages.mask_salts,
+    )
 }
 
 /// The sample answer of the lookup mask message: the `eq` form over the mask
@@ -27024,6 +27398,24 @@ mod merged_tests {
         }));
     }
 
+    /// The parent values of a digit lookup over the fixture's codes: distinct
+    /// identities and trees per plane.
+    fn digit_lookup_params(plane: u64) -> crate::proof::digit_lookup::DigitLookupParams {
+        crate::proof::digit_lookup::DigitLookupParams {
+            code: code(),
+            mask_code: mask_code(),
+            group: GROUP,
+            bits_oracle: ORACLE_BASE + 1_200 + 10 * plane,
+            mask_oracle: ORACLE_BASE + 1_202 + 10 * plane,
+            bits_tree: 920 + 5 * plane,
+            mask_tree: 923 + 5 * plane,
+            leaf_class: 4,
+            salt_bytes: SALT,
+            run: Digest([0x6B; 32]),
+            configuration: W_CONFIGURATION,
+        }
+    }
+
     /// The two-limb range plan over the fixture's geometry: one packed symbol
     /// array per limb and one digit object covering both limbs at their
     /// offsets.
@@ -27997,6 +28389,20 @@ mod merged_tests {
         };
         plan.send.request_chain = Some(shape);
         plan.send.range = Some(range_plan());
+        plan.send.digit_lookups = vec![
+            crate::proof::digit_lookup::digit_lookup_plan(
+                plan.send.range.as_ref().unwrap(),
+                0,
+                &digit_lookup_params(0),
+            )
+            .unwrap(),
+            crate::proof::digit_lookup::digit_lookup_plan(
+                plan.send.range.as_ref().unwrap(),
+                1,
+                &digit_lookup_params(1),
+            )
+            .unwrap(),
+        ];
         let mask_inputs = ChainInputs {
             token_point: &point,
             token_shown: &token_shown,
