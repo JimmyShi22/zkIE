@@ -250,6 +250,55 @@ pub struct ReductionTable {
     pub later: bool,
 }
 
+/// The scalar product of one run of matrix cells with the run's point.
+pub fn entry_value(cells: &[Fp3], phi: &[Fp3]) -> Result<Fp3> {
+    if cells.is_empty() || cells.len() != phi.len() {
+        return Err(Error::InvalidConfig);
+    }
+    let mut sum = Fp3::ZERO;
+    for (cell, weight) in cells.iter().zip(phi) {
+        sum = sum.add(&cell.mul(weight));
+    }
+    Ok(sum)
+}
+
+/// The entries of one table in row-major then run order: row `r`, run `q`
+/// covers columns `q * run_length .. (q + 1) * run_length` of that row. The
+/// matrix is row-major with `columns` entries per row; every entry is the run's
+/// scalar product with the point.
+pub fn table_entries(
+    cells: &[Fp3],
+    rows: u64,
+    columns: u64,
+    run_length: u64,
+    phi: &[Fp3],
+) -> Result<Vec<Fp3>> {
+    if rows == 0 || columns == 0 || run_length == 0 || columns % run_length != 0 {
+        return Err(Error::InvalidConfig);
+    }
+    if phi.len() as u64 != run_length {
+        return Err(Error::InvalidConfig);
+    }
+    let expected = rows
+        .checked_mul(columns)
+        .ok_or(Error::ResourceLimit)?;
+    if cells.len() as u64 != expected {
+        return Err(Error::ShapeMismatch);
+    }
+    let rows = usize::try_from(rows).map_err(|_| Error::ResourceLimit)?;
+    let columns = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    let run = usize::try_from(run_length).map_err(|_| Error::ResourceLimit)?;
+    let mut entries = Vec::with_capacity(rows * (columns / run));
+    for row in 0..rows {
+        let base = row.checked_mul(columns).ok_or(Error::ResourceLimit)?;
+        for q in 0..columns / run {
+            let start = base + q * run;
+            entries.push(entry_value(&cells[start..start + run], phi)?);
+        }
+    }
+    Ok(entries)
+}
+
 /// One read of the reduced witness: `weights[i]` multiplies entry
 /// `first_entry + i` of the table.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -627,6 +676,27 @@ mod tests {
         plan.add_table(1, 1, 2, 1, 4, vec![fp(1), fp(2)], false)
             .unwrap();
         assert!(plan.set_point(0, vec![fp(3), fp(4)]).is_err());
+    }
+
+    #[test]
+    fn table_entries_are_the_run_inner_products() {
+        // Two rows of eight cells, runs of four: four entries in row-major,
+        // then run order.
+        let cells: Vec<Fp3> = (1..=16).map(fp).collect();
+        let phi = [fp(1), fp(2), fp(3), fp(4)];
+        let entries = table_entries(&cells, 2, 8, 4, &phi).unwrap();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0], entry_value(&[fp(1), fp(2), fp(3), fp(4)], &phi).unwrap());
+        assert_eq!(entries[1], entry_value(&[fp(5), fp(6), fp(7), fp(8)], &phi).unwrap());
+        assert_eq!(entries[2], entry_value(&[fp(9), fp(10), fp(11), fp(12)], &phi).unwrap());
+        // A point of another length, a run that does not divide the columns, a
+        // wrong cell count and an empty matrix are each refused.
+        assert!(table_entries(&cells, 2, 8, 4, &phi[..3]).is_err());
+        assert!(table_entries(&cells, 2, 8, 3, &[fp(1), fp(2), fp(3)]).is_err());
+        assert!(table_entries(&cells[..15], 2, 8, 4, &phi).is_err());
+        assert!(table_entries(&cells, 0, 8, 4, &phi).is_err());
+        assert!(entry_value(&[], &[]).is_err());
+        assert!(entry_value(&[fp(1)], &[fp(1), fp(2)]).is_err());
     }
 
     #[test]
