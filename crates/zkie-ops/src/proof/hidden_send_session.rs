@@ -4292,6 +4292,45 @@ fn absorb_eval(chain: &mut Chain, plan: &HiddenSendPlan, targets: &[Fp3]) -> Res
     Ok(())
 }
 
+/// Absorbs the sub-proof mask table's root before the segment's challenges:
+/// the table is its own committed object, with its own identity and layout.
+fn absorb_chain_mask_root(
+    chain: &mut Chain,
+    plan: &crate::proof::request_chain::ChainMaskPlan,
+    root: &Digest,
+) -> Result<()> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(18);
+    message.push_u64(plan.oracle);
+    message.push_u64(plan.group);
+    message.push_u64(plan.mask_rows);
+    message.push_u64(plan.entries as u64);
+    message.push_u64(plan.mask_code.log_n as u64);
+    message.push_u64(plan.mask_code.ell);
+    message.push_u64(plan.mask_code.r);
+    push_tree_plan(&mut message, &plan.tree);
+    push_digest(&mut message, root);
+    let prefix = message.prefix(KIND_SEED, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
+/// Absorbs one sampled answer of the sub-proof mask table.
+fn absorb_chain_mask_answer(chain: &mut Chain, answer: Fp3) -> Result<()> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(19);
+    message.push_fp3(&answer);
+    let prefix = message.prefix(KIND_EMPTY, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
 fn absorb_index_mask_root(chain: &mut Chain, plan: &IndexMaskPlan, root: &Digest) -> Result<()> {
     let mut message = chain.message();
     message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
@@ -23667,6 +23706,53 @@ mod merged_tests {
         assert!(parameters
             .check(changed.send.member.as_ref().unwrap())
             .is_err());
+    }
+
+    fn chain_mask_plan() -> crate::proof::request_chain::ChainMaskPlan {
+        crate::proof::request_chain::ChainMaskPlan {
+            oracle: 50,
+            group: GROUP,
+            mask_code: mask_code(),
+            mask_rows: 4,
+            entries: 4,
+            tree: RuntimeTreePlan {
+                tree_number: 800,
+                leaf_class: 9,
+                log_n: CODE_LOG_N,
+                log_n_zk: CODE_LOG_N,
+                parts: vec![RuntimeTreePart {
+                    main_symbols: 0,
+                    mask_symbols: 4 * E_DEGREE as u64,
+                }],
+                salt_bytes: SALT,
+                run: Digest([0x71; 32]),
+                configuration: W_CONFIGURATION,
+            },
+        }
+    }
+
+    #[test]
+    fn the_sub_proof_mask_root_and_answer_enter_the_chain() {
+        let (plan, _, _) = member_run();
+        let table = table();
+        let mask_plan = chain_mask_plan();
+        assert!(mask_plan.fault().is_none());
+        let mut base = first_chain(&plan, &table.reader).unwrap();
+        let mut rooted = first_chain(&plan, &table.reader).unwrap();
+        super::absorb_chain_mask_root(&mut rooted, &mask_plan, &Digest([0x31; 32])).unwrap();
+        assert_ne!(*base.value(), *rooted.value());
+        // The same root and answer reproduce the same chain value, another
+        // root or answer changes it.
+        let mut same = first_chain(&plan, &table.reader).unwrap();
+        super::absorb_chain_mask_root(&mut same, &mask_plan, &Digest([0x31; 32])).unwrap();
+        assert_eq!(*rooted.value(), *same.value());
+        super::absorb_chain_mask_answer(&mut same, Fp3::from_u64(9)).unwrap();
+        super::absorb_chain_mask_answer(&mut rooted, Fp3::from_u64(9)).unwrap();
+        let mut other = first_chain(&plan, &table.reader).unwrap();
+        super::absorb_chain_mask_root(&mut other, &mask_plan, &Digest([0x32; 32])).unwrap();
+        super::absorb_chain_mask_answer(&mut other, Fp3::from_u64(9)).unwrap();
+        assert_ne!(*rooted.value(), *other.value());
+
     }
 
     #[test]
