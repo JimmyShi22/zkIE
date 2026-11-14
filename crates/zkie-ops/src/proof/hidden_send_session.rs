@@ -2184,6 +2184,9 @@ pub struct HiddenSendWitness {
     pub closure: Option<ClosureWitness>,
     /// The private norm group messages, when the plan carries the norm.
     pub norm: Option<NormWitness>,
+    /// The request-level W's committed value message, when the plan commits
+    /// it: its tree and value messages stay here for the later openings.
+    pub request_w: Option<crate::proof::output_closure::CommittedValueGroup>,
 }
 
 impl HiddenSendWitness {
@@ -2595,6 +2598,7 @@ pub fn commit_w_rows(
         _ => return Err(Error::ShapeMismatch),
     };
     let witness = HiddenSendWitness {
+        request_w: None,
         group: plan.group,
         w: plan.w,
         positions: plan.activation.positions,
