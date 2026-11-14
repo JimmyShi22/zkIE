@@ -1689,6 +1689,18 @@ pub struct IndexMaskMessage {
 // The hidden SEND plan
 // ---------------------------------------------------------------------------
 
+/// The request-level W's SEND oracle, when the plan carries the request
+/// chain's W: its message shape, its oracle number, its group and the padded
+/// column count the vector holds. The oracle must not sit in the per-position
+/// range, and the vector length must be a power of two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestWPlan {
+    pub shape: WShape,
+    pub oracle: u64,
+    pub group: u64,
+    pub columns: u64,
+}
+
 /// The trusted plan of one hidden SEND-sample message. It carries the public
 /// shapes, the encoded table identity, the activation commitment pin and, for
 /// a verifier plan, the expected `W` roots. The expected roots are a fixture
@@ -1758,6 +1770,8 @@ pub struct HiddenSendPlan {
     /// The request chain's planned table cells, when the chain reads the
     /// table on the witness stream.
     pub request_reads: Option<RequestReadPlan>,
+    /// The request-level W's SEND oracle, when this plan commits it.
+    pub request_w: Option<RequestWPlan>,
 }
 
 impl HiddenSendPlan {
@@ -1863,6 +1877,22 @@ impl HiddenSendPlan {
                     .as_ref()
                     .map_or(false, |dot| member.tree.tree_number == dot.shape.tree_number);
             if collides {
+                return Err(Error::InvalidConfig);
+            }
+        }
+        if let Some(w) = &self.request_w {
+            if w.columns == 0
+                || !w.columns.is_power_of_two()
+                || w.columns != self.columns
+            {
+                return Err(Error::InvalidConfig);
+            }
+            if w.shape.main_rows == 0 || w.shape.code.ell == 0 {
+                return Err(Error::InvalidConfig);
+            }
+            if w.oracle >= self.oracle_base
+                && w.oracle < self.oracle_base.saturating_add(self.activation.positions as u64)
+            {
                 return Err(Error::InvalidConfig);
             }
         }
@@ -18537,6 +18567,7 @@ mod tests {
             member: None,
             request_chain: None,
             request_reads: None,
+            request_w: None,
         };
         let mut source = VecTableSource::new(messages, tails).unwrap();
         let randomness = randomness();
@@ -19293,6 +19324,37 @@ mod tests {
     }
 
     #[test]
+    fn the_plan_names_the_request_w_oracle() {
+        let fixture = fixture();
+        let mut plan = fixture.plan.clone();
+        plan.request_w = Some(super::RequestWPlan {
+            shape: plan.w,
+            oracle: plan.oracle_base + 1_000,
+            group: plan.group,
+            columns: plan.columns,
+        });
+        plan.validate().unwrap();
+        // The oracle may not sit in the per-position range.
+        let mut inside = plan.clone();
+        inside.request_w = Some(super::RequestWPlan {
+            shape: plan.w,
+            oracle: plan.oracle_base,
+            group: plan.group,
+            columns: plan.columns,
+        });
+        assert!(inside.validate().is_err());
+        // The vector length must be the padded column count and a power of two.
+        let mut wrong = plan.clone();
+        wrong.request_w = Some(super::RequestWPlan {
+            shape: plan.w,
+            oracle: plan.oracle_base + 1_000,
+            group: plan.group,
+            columns: plan.columns >> 1,
+        });
+        assert!(wrong.validate().is_err());
+    }
+
+    #[test]
     fn the_request_w_commits_as_its_own_oracle() {
         let fixture = fixture();
         let plan = &fixture.plan;
@@ -19878,6 +19940,7 @@ mod merged_tests {
             member: None,
             request_chain: None,
             request_reads: None,
+            request_w: None,
         };
         let weights: Vec<Vec<Fp3>> = (0..POSITIONS)
             .map(|position| activation.weights(position, MATRIX_ROWS).unwrap())

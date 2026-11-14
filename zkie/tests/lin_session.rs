@@ -980,6 +980,7 @@ fn selected_gpt2_output_head_request_session() {
             member: None,
             request_chain: None,
             request_reads: None,
+            request_w: None,
         },
         proximity,
         index_mask: Some(index_mask),

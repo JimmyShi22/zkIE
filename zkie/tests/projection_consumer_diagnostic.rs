@@ -512,6 +512,7 @@ fn plan_for(
             member: None,
             request_chain: None,
             request_reads: None,
+            request_w: None,
         },
         output: HiddenOutputShape {
             positions,
@@ -727,6 +728,7 @@ fn hidden_plan_for(
             member: None,
             request_chain: None,
             request_reads: None,
+            request_w: None,
         },
         output: HiddenOutputShape {
             positions,

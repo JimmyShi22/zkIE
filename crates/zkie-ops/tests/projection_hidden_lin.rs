@@ -287,6 +287,7 @@ fn plan(activation: &CommittedActivation, table: &Table) -> HiddenLinPlan {
         member: None,
         request_chain: None,
         request_reads: None,
+        request_w: None,
     };
     HiddenLinPlan {
         norm: None,
