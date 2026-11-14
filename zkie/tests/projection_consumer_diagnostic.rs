@@ -514,6 +514,7 @@ fn plan_for(
             chain_mask: None,
             request_reads: None,
             request_w: None,
+            source_data: None,
         },
         output: HiddenOutputShape {
             positions,
@@ -731,6 +732,7 @@ fn hidden_plan_for(
             chain_mask: None,
             request_reads: None,
             request_w: None,
+            source_data: None,
         },
         output: HiddenOutputShape {
             positions,
