@@ -1721,9 +1721,10 @@ pub struct MemberPlan {
 }
 
 /// The request-level parameters re-derived from the trusted plan shapes: row
-/// and column bits, the request W's sample form, the opening and tree budget
-/// and the mask slots the pending claim consumes. The layout stays unfrozen:
-/// this is the derivation the final numbers follow, not a frozen constant set.
+/// and column bits, the request W's sample form and encoded rows, the opening
+/// and tree budget, the pending mask slots and the segment mask table's shape.
+/// Every value follows a trusted shape; `freeze_layout` fills the named
+/// request layout the prover and the verifier both check before any challenge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RequestParameters {
     pub row_bits: u32,
@@ -1735,6 +1736,17 @@ pub struct RequestParameters {
     pub tree_number: u64,
     pub mask_slots: usize,
     pub mask_rows: u64,
+    /// The request W's encoded rows and its one logical oracle.
+    pub w_encoded_rows: u64,
+    pub w_oracles: u64,
+    pub w_opening_capacity: u64,
+    /// The segment mask table's declared shape.
+    pub segment_mask_rows: u64,
+    pub segment_mask_entries: usize,
+    pub segment_mask_openings: usize,
+    /// The source-read cells on each side.
+    pub source_left_cells: usize,
+    pub source_right_cells: usize,
 }
 
 impl RequestParameters {
@@ -1747,6 +1759,16 @@ impl RequestParameters {
             _ => return Err(Error::InvalidConfig),
         };
         let index = plan.index_mask.as_ref().ok_or(Error::InvalidConfig)?;
+        let w_encoded_rows = rw.shape.main_rows;
+        let ell = rw.shape.code.ell;
+        if w_encoded_rows == 0
+            || rw.columns == 0
+            || rw.columns > w_encoded_rows.checked_mul(ell).ok_or(Error::ResourceLimit)?
+        {
+            return Err(Error::InvalidConfig);
+        }
+        let segment = plan.chain_mask.as_ref();
+        let reads = plan.request_reads.as_ref();
         Ok(Some(Self {
             row_bits: plan.matrix_rows.trailing_zeros(),
             column_bits: plan.columns.trailing_zeros(),
@@ -1757,6 +1779,14 @@ impl RequestParameters {
             tree_number: rw.shape.tree_number,
             mask_slots: member.pending.masks.len(),
             mask_rows: index.mask_rows,
+            w_encoded_rows,
+            w_oracles: 1,
+            w_opening_capacity: rw.shape.code.n(),
+            segment_mask_rows: segment.map_or(0, |mask| mask.mask_rows),
+            segment_mask_entries: segment.map_or(0, |mask| mask.entries),
+            segment_mask_openings: segment.map_or(0, |mask| mask.openings),
+            source_left_cells: reads.map_or(0, |reads| reads.left.len()),
+            source_right_cells: reads.map_or(0, |reads| reads.right.len()),
         }))
     }
 
@@ -1766,6 +1796,108 @@ impl RequestParameters {
             return Err(Error::InvalidConfig);
         }
         Ok(())
+    }
+
+    /// The request chain's own capacities and trusted owners: every object's
+    /// budget is its own, and the source cells lie in the committed table.
+    pub fn check_chain(&self, plan: &HiddenSendPlan) -> Result<()> {
+        let member = plan.member.as_ref().ok_or(Error::InvalidConfig)?;
+        let index = plan.index_mask.as_ref().ok_or(Error::InvalidConfig)?;
+        let segment = plan.chain_mask.as_ref().ok_or(Error::InvalidConfig)?;
+        let reads = plan.request_reads.as_ref().ok_or(Error::InvalidConfig)?;
+        let rw = plan.request_w.as_ref().ok_or(Error::InvalidConfig)?;
+        if self.openings == 0
+            || self.openings as u64 > rw.shape.code.n()
+            || self.w_encoded_rows == 0
+            || self.w_oracles != 1
+        {
+            return Err(Error::InvalidConfig);
+        }
+        if segment.fault().is_some()
+            || segment.entries == 0
+            || segment.entries > segment.free_entries()?
+            || segment.openings == 0
+            || segment.openings as u64 > segment.mask_code.r
+        {
+            return Err(Error::InvalidConfig);
+        }
+        let allocated = index.entries.total().map_err(|_| Error::InvalidConfig)?;
+        let free = index.free_entries().map_err(|_| Error::InvalidConfig)?;
+        if allocated
+            .checked_add(member.pending.masks.len())
+            .map(|used| used > free)
+            .unwrap_or(true)
+            || index.openings == 0
+            || index.openings as u64 > index.mask_code.r
+        {
+            return Err(Error::InvalidConfig);
+        }
+        let table_rows = plan.table_shape.rows_checked()?;
+        if reads.left.is_empty()
+            || reads.right.is_empty()
+            || reads
+                .left
+                .iter()
+                .chain(&reads.right)
+                .any(|(row, column)| *row >= table_rows || *column >= plan.columns)
+        {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(())
+    }
+
+    /// Fills the named request layout from the derived parameters. The values
+    /// are the frozen layout: the prover and the verifier derive the same set
+    /// before any challenge, and a skeleton or a shape mismatch is refused.
+    pub fn freeze_layout(&self, plan: &HiddenLinPlan) -> Result<crate::proof::request_chain::RequestLayout> {
+        let shape = plan.send.request_chain.ok_or(Error::InvalidConfig)?;
+        let index = plan.send.index_mask.as_ref().ok_or(Error::InvalidConfig)?;
+        let segment = plan.send.chain_mask.as_ref().ok_or(Error::InvalidConfig)?;
+        let mut layout = crate::proof::request_chain::RequestLayout::skeleton();
+        let positions = plan.send.positions() as u64;
+        let mut trees = positions;
+        for present in [
+            plan.send.request_w.is_some(),
+            plan.send.index_mask.is_some(),
+            plan.send.chain_mask.is_some(),
+            plan.send.dot.is_some(),
+            plan.send.member.is_some(),
+        ] {
+            if present {
+                trees = trees.saturating_add(1);
+            }
+        }
+        trees = trees.saturating_add(2); // the shared folded table and Omega
+        if let Some(closure) = &plan.closure {
+            trees = trees.saturating_add(
+                positions
+                    .saturating_mul(3)
+                    .saturating_add(1),
+            );
+            let _ = closure;
+        }
+        let stages = plan.proximity.shared_stages.len() + plan.proximity.own_stages.len();
+        layout.set("mask_rows", self.mask_rows.saturating_add(self.segment_mask_rows))?;
+        layout.set("mask_slots", (self.mask_slots + self.segment_mask_entries) as u64)?;
+        layout.set("end_values", shape.stack_ends as u64)?;
+        layout.set("stack_rounds", shape.stack_rounds as u64)?;
+        layout.set("merge_rounds", shape.merge_rounds as u64)?;
+        let openings = positions
+            .saturating_mul(self.openings as u64)
+            .saturating_add(index.openings as u64)
+            .saturating_add(segment.openings as u64);
+        layout.set("opening_budget", openings)?;
+        let samples = self
+            .sample_answers
+            .saturating_add(index.answers)
+            .saturating_add(1);
+        layout.set("sample_plan", samples as u64)?;
+        layout.set("tree_layout", trees)?;
+        layout.set("stage_plan", stages as u64)?;
+        if layout.is_skeleton() {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(layout)
     }
 }
 
@@ -2029,6 +2161,15 @@ impl HiddenSendPlan {
         // that carries the section without a member has nowhere to bind it.
         if self.request_chain.is_some() && self.member.is_none() {
             return Err(Error::InvalidConfig);
+        }
+        // The production chain derives its parameters from the trusted shapes:
+        // the request W's encoded rows and sample form, the pending and segment
+        // mask budgets, each opening list against its own code tail, and the
+        // source cells inside the committed table.
+        if self.request_chain.is_some() {
+            let parameters = RequestParameters::derive(self)?.ok_or(Error::InvalidConfig)?;
+            parameters.check(self.member.as_ref().ok_or(Error::InvalidConfig)?)?;
+            parameters.check_chain(self)?;
         }
         if let Some(chain_mask) = &self.chain_mask {
             if chain_mask.fault().is_some() || chain_mask.group != self.group {
@@ -4746,13 +4887,85 @@ fn draw_chain_mask_positions(
 /// slots: the token and merge hiding forms in their own regions, the stack end
 /// slots and the token claim slot at their input slots, and the stack source
 /// cells plus the kept owner entry in the data region.
+/// The segment table's slot layout, derived from the chain inputs and the
+/// table's own capacity: the token hiding form, the sent end values, the merge
+/// hiding form, the source cells and the counted mask slots occupy consecutive
+/// free entries. No entry number is a bare constant.
+struct SegmentSlotLayout {
+    token_hiding: usize,
+    end_base: usize,
+    merge_base: usize,
+    data_base: usize,
+    claim_base: usize,
+}
+
+impl SegmentSlotLayout {
+    fn derive(
+        plan: &crate::proof::request_chain::ChainMaskPlan,
+        inputs: &crate::proof::request_chain::ChainInputs,
+    ) -> Result<Self> {
+        if plan.fault().is_some()
+            || inputs.stack_masks.shown.len() != inputs.end_slots.len()
+            || inputs.stack_masks.shown.len() != 3
+            || inputs.token_claim_masks.is_empty()
+        {
+            return Err(Error::InvalidConfig);
+        }
+        let end_base = inputs.token_masks.hiding.len();
+        let merge_base = end_base
+            .checked_add(inputs.end_slots.len())
+            .ok_or(Error::ResourceLimit)?;
+        let data_base = merge_base
+            .checked_add(inputs.merge_masks.hiding.len())
+            .ok_or(Error::ResourceLimit)?;
+        let claim_base = data_base.checked_add(4).ok_or(Error::ResourceLimit)?;
+        let needed = claim_base
+            .checked_add(inputs.token_claim_masks.len())
+            .ok_or(Error::ResourceLimit)?;
+        if needed > plan.free_entries()? {
+            return Err(Error::ResourceLimit);
+        }
+        Ok(Self {
+            token_hiding: inputs.token_masks.hiding.len(),
+            end_base,
+            merge_base,
+            data_base,
+            claim_base,
+        })
+    }
+
+    /// The table slot of one counted mask slot: the token claim slots map to
+    /// their claim region in order, the sent end slots to the end region.
+    fn entry_for_slot(
+        &self,
+        inputs: &crate::proof::request_chain::ChainInputs,
+        slot: usize,
+    ) -> Result<usize> {
+        if let Some(index) = inputs
+            .token_claim_masks
+            .iter()
+            .position(|term| term.slot == slot)
+        {
+            return self
+                .claim_base
+                .checked_add(index)
+                .ok_or(Error::ResourceLimit);
+        }
+        if let Some(index) = inputs.end_slots.iter().position(|candidate| *candidate == slot) {
+            return self
+                .end_base
+                .checked_add(index)
+                .ok_or(Error::ResourceLimit);
+        }
+        Err(Error::InvalidIndex)
+    }
+}
+
 fn segment_mask_rows(
     plan: &crate::proof::request_chain::ChainMaskPlan,
     inputs: &crate::proof::request_chain::ChainInputs,
 ) -> Result<Vec<Vec<Fp3>>> {
-    if plan.fault().is_some() {
-        return Err(Error::InvalidConfig);
-    }
+    let layout = SegmentSlotLayout::derive(plan, inputs)?;
     let rows = usize::try_from(plan.mask_rows).map_err(|_| Error::ResourceLimit)?;
     let ell = usize::try_from(plan.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
     let mut table = vec![vec![Fp3::ZERO; ell]; rows];
@@ -4766,22 +4979,18 @@ fn segment_mask_rows(
         *entry = value;
         Ok(())
     };
-    if inputs.token_masks.hiding.len() > 20
-        || inputs.merge_masks.hiding.len() > 28
-        || inputs.stack_masks.shown.len() != 3
-    {
-        return Err(Error::InvalidConfig);
-    }
     for (index, value) in inputs.token_masks.hiding.iter().enumerate() {
         put(index, *value)?;
     }
-    for (index, value) in inputs.merge_masks.hiding.iter().enumerate() {
-        put(32 + index, *value)?;
-    }
     for (index, value) in inputs.stack_masks.shown.iter().enumerate() {
-        put(20 + index, *value)?;
+        put(layout.end_base + index, *value)?;
     }
-    put(96, (inputs.mask_value)(3)?)?;
+    for (index, value) in inputs.merge_masks.hiding.iter().enumerate() {
+        put(layout.merge_base + index, *value)?;
+    }
+    for (index, term) in inputs.token_claim_masks.iter().enumerate() {
+        put(layout.claim_base + index, (inputs.mask_value)(term.slot)?)?;
+    }
     if inputs.stack_left.len() != 2
         || inputs.stack_right.len() != 2
         || inputs.stack_left.iter().any(|cells| cells.len() != 1)
@@ -4789,10 +4998,10 @@ fn segment_mask_rows(
     {
         return Err(Error::InvalidConfig);
     }
-    put(64, inputs.stack_left[0][0])?;
-    put(65, inputs.stack_left[1][0])?;
-    put(66, inputs.stack_right[0][0])?;
-    put(67, Fp3::ZERO)?;
+    put(layout.data_base, inputs.stack_left[0][0])?;
+    put(layout.data_base + 1, inputs.stack_left[1][0])?;
+    put(layout.data_base + 2, inputs.stack_right[0][0])?;
+    put(layout.data_base + 3, Fp3::ZERO)?;
     Ok(table)
 }
 
@@ -5070,17 +5279,15 @@ fn chain_relation_rows(
     if mask.fault().is_some() {
         return Err(Error::InvalidConfig);
     }
+    let layout = SegmentSlotLayout::derive(mask, inputs)?;
     let entry = |slot: usize| -> Result<u64> { mask.entry_virtual_index(slot) };
-    let slot_entry = |slot: usize| -> Result<usize> {
-        match slot {
-            3 => Ok(96),
-            20 => Ok(20),
-            21 => Ok(21),
-            22 => Ok(22),
-            _ => Err(Error::InvalidIndex),
-        }
+    let mapped = |slot: usize| -> Result<u64> {
+        mask.entry_virtual_index(layout.entry_for_slot(inputs, slot)?)
     };
     let token = RowForm::from_output(&outputs.token);
+    if token.hiding.len() != layout.token_hiding {
+        return Err(Error::ShapeMismatch);
+    }
     let mut token_row = BatRow::new(BatRowKind::Plain);
     for (index, coefficient) in token.hiding.iter().enumerate() {
         token_row.add_unit(mask.oracle, BatPart::Mask, entry(index)?, *coefficient);
@@ -5089,7 +5296,7 @@ fn chain_relation_rows(
         token_row.add_unit(
             mask.oracle,
             BatPart::Mask,
-            entry(slot_entry(term.slot)?)?,
+            mapped(term.slot)?,
             term.coefficient,
         );
     }
@@ -5097,7 +5304,12 @@ fn chain_relation_rows(
         if *index != 0 {
             return Err(Error::ShapeMismatch);
         }
-        token_row.add_unit(mask.oracle, BatPart::Mask, entry(67)?, *coefficient);
+        token_row.add_unit(
+            mask.oracle,
+            BatPart::Mask,
+            entry(layout.data_base + 3)?,
+            *coefficient,
+        );
     }
     token_row.target = token.constant;
 
@@ -5121,14 +5333,14 @@ fn chain_relation_rows(
         a_row.add_unit(
             mask.oracle,
             BatPart::Mask,
-            entry(64 + term.panel)?,
+            entry(layout.data_base + term.panel)?,
             term.coefficient,
         );
     }
     a_row.add_unit(
         mask.oracle,
         BatPart::Mask,
-        entry(inputs.end_slots[0])?,
+        entry(layout.end_base)?,
         outputs.stack.ends[0].mask_scale,
     );
     a_row.target = outputs.stack.ends[0].value;
@@ -5137,28 +5349,36 @@ fn chain_relation_rows(
         b_row.add_unit(
             mask.oracle,
             BatPart::Mask,
-            entry(66 + term.panel)?,
+            entry(layout.data_base + 2 + term.panel)?,
             term.coefficient,
         );
     }
     b_row.add_unit(
         mask.oracle,
         BatPart::Mask,
-        entry(inputs.end_slots[1])?,
+        entry(layout.end_base + 1)?,
         outputs.stack.ends[1].mask_scale,
     );
     b_row.target = outputs.stack.ends[1].value;
 
     let merge = RowForm::from_output(&outputs.merge);
+    if merge.hiding.len() != inputs.merge_masks.hiding.len() {
+        return Err(Error::ShapeMismatch);
+    }
     let mut merge_row = BatRow::new(BatRowKind::Plain);
     for (index, coefficient) in merge.hiding.iter().enumerate() {
-        merge_row.add_unit(mask.oracle, BatPart::Mask, entry(32 + index)?, *coefficient);
+        merge_row.add_unit(
+            mask.oracle,
+            BatPart::Mask,
+            entry(layout.merge_base + index)?,
+            *coefficient,
+        );
     }
     for term in &merge.slots {
         merge_row.add_unit(
             mask.oracle,
             BatPart::Mask,
-            entry(slot_entry(term.slot)?)?,
+            mapped(term.slot)?,
             term.coefficient,
         );
     }
@@ -6598,6 +6818,13 @@ impl HiddenLinPlan {
             (None, false, _) => {}
             (None, true, None) => {}
             _ => return Err(Error::InvalidConfig),
+        }
+        // The request chain's frozen layout: both sides derive the same named
+        // quantities from the trusted shapes before any challenge.
+        if self.send.request_chain.is_some() {
+            let parameters = RequestParameters::derive(&self.send)?.ok_or(Error::InvalidConfig)?;
+            parameters.check(self.send.member.as_ref().ok_or(Error::InvalidConfig)?)?;
+            let _layout = parameters.freeze_layout(self)?;
         }
         Ok(())
     }
@@ -25335,6 +25562,64 @@ mod merged_tests {
             )
         };
         assert!(swapped.is_err());
+    }
+
+    #[test]
+    fn the_request_layout_is_frozen_from_the_trusted_shapes() {
+        let activation = activation();
+        let (mut plan, _) = member_plan_for(&activation);
+        plan.send.chain_mask = Some(chain_mask_plan());
+        plan.proximity.own_mask_tree.mask_rows = 8;
+        plan.send.request_chain = Some(crate::proof::request_chain::RequestChainShape {
+            token_rounds: 2,
+            token_ends: 1,
+            stack_rounds: 1,
+            stack_ends: 3,
+            merge_rounds: 2,
+            merge_ends: 1,
+        });
+        plan.validate().unwrap();
+        let parameters = super::RequestParameters::derive(&plan.send)
+            .unwrap()
+            .unwrap();
+        parameters.check(plan.send.member.as_ref().unwrap()).unwrap();
+        parameters.check_chain(&plan.send).unwrap();
+        let layout = parameters.freeze_layout(&plan).unwrap();
+        assert_eq!(parameters.row_bits, 1);
+        assert_eq!(parameters.column_bits, 2);
+        assert_eq!(parameters.w_oracles, 1);
+        assert_eq!(parameters.w_encoded_rows, 1);
+        assert_eq!(parameters.w_opening_capacity, 1u64 << CODE_LOG_N);
+        assert_eq!(parameters.sample_answers, 1);
+        assert_eq!(parameters.segment_mask_rows, 4);
+        assert_eq!(parameters.segment_mask_entries, 4);
+        assert_eq!(parameters.segment_mask_openings, 4);
+        assert_eq!(parameters.source_left_cells, 1);
+        assert_eq!(parameters.source_right_cells, 1);
+        // The frozen named quantities: the index-mask block plus the segment
+        // block, the chain's end/round counts, each opening list against its
+        // own object and the registered tree count.
+        assert_eq!(layout.get("mask_rows").unwrap(), 8);
+        assert_eq!(layout.get("mask_slots").unwrap(), 5);
+        assert_eq!(layout.get("end_values").unwrap(), 3);
+        assert_eq!(layout.get("stack_rounds").unwrap(), 1);
+        assert_eq!(layout.get("merge_rounds").unwrap(), 2);
+        assert_eq!(layout.get("opening_budget").unwrap(), 9);
+        assert_eq!(layout.get("sample_plan").unwrap(), 3);
+        assert_eq!(layout.get("tree_layout").unwrap(), 9);
+        assert_eq!(layout.get("stage_plan").unwrap(), 0);
+        // The derivation is from shapes: a zero-row W message and a source
+        // cell outside the committed table are refused.
+        let mut broken = plan.clone();
+        broken.send.request_w.as_mut().unwrap().shape.main_rows = 0;
+        assert!(super::RequestParameters::derive(&broken.send).is_err());
+        let mut broken = plan.clone();
+        let out_of_table = broken.send.columns;
+        broken.send.request_reads.as_mut().unwrap().left[0].1 = out_of_table;
+        let parameters = super::RequestParameters::derive(&broken.send)
+            .unwrap()
+            .unwrap();
+        assert!(parameters.check_chain(&broken.send).is_err());
     }
 
     #[test]
