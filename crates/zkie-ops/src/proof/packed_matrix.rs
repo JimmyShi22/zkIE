@@ -237,6 +237,75 @@ pub(crate) fn tests_cells() -> Vec<i128> {
     vec![1, 2, 3, 4, 5, 6, 7, 8]
 }
 
+
+/// The range transcript's combination object: for every column of the original
+/// matrix and every combination plane, one value is stored as a low digit and a
+/// high digit, `value = low + 2^low_bits * high`. The column coordinates are
+/// `plane * columns + offset + index`; the offset and the digit width are plan
+/// data, so the prover and the verifier address the same positions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangeCombinationPlan {
+    pub columns: u64,
+    pub planes: u64,
+    pub low_bits: u32,
+    pub offset: u64,
+}
+
+impl RangeCombinationPlan {
+    pub fn new(columns: u64, planes: u64, low_bits: u32, offset: u64) -> Result<Self> {
+        if columns == 0 || planes == 0 || low_bits == 0 || low_bits >= 63 {
+            return Err(Error::InvalidConfig);
+        }
+        let last = planes
+            .checked_mul(columns)
+            .and_then(|value| value.checked_add(offset))
+            .ok_or(Error::ResourceLimit)?;
+        if last.checked_add(columns).is_none() {
+            return Err(Error::ResourceLimit);
+        }
+        Ok(Self {
+            columns,
+            planes,
+            low_bits,
+            offset,
+        })
+    }
+
+    /// The digit base `d`, one above the low digit's range.
+    pub fn digit_base(&self) -> i128 {
+        1i128 << self.low_bits
+    }
+
+    /// The stored column of plane `plane`, original column `index`:
+    /// `plane * columns + offset + index`.
+    pub fn zz_column(&self, plane: u64, index: u64) -> Result<u64> {
+        if plane >= self.planes || index >= self.columns {
+            return Err(Error::InvalidIndex);
+        }
+        plane
+            .checked_mul(self.columns)
+            .and_then(|value| value.checked_add(self.offset))
+            .and_then(|value| value.checked_add(index))
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// Splits a nonnegative combination value into its low and high digits and
+    /// checks the integer identity `value = low + d * high`.
+    pub fn split(&self, value: i128) -> Result<(i128, i128)> {
+        if value < 0 {
+            return Err(Error::BoundViolation);
+        }
+        let base = self.digit_base();
+        let low = value % base;
+        let high = value / base;
+        if low + base * high != value {
+            return Err(Error::BoundViolation);
+        }
+        Ok((low, high))
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +335,30 @@ mod tests {
         assert_eq!(plan.position(1, 1).unwrap(), (1, 1));
         assert!(plan.position(2, 0).is_err());
         assert!(plan.position(0, 2).is_err());
+    }
+
+
+    #[test]
+    fn the_range_combination_object_addresses_and_splits() {
+        let plan = RangeCombinationPlan::new(4, 2, 20, 7).unwrap();
+        assert_eq!(plan.digit_base(), 1 << 20);
+        assert_eq!(plan.zz_column(0, 0).unwrap(), 7);
+        assert_eq!(plan.zz_column(1, 3).unwrap(), 4 + 7 + 3);
+        assert!(plan.zz_column(2, 0).is_err());
+        assert!(plan.zz_column(0, 4).is_err());
+        let (low, high) = plan.split(0x12345).unwrap();
+        assert_eq!(low, 0x12345);
+        assert_eq!(high, 0);
+        let value = 0x12345 + (1 << 20) * 9;
+        let (low, high) = plan.split(value).unwrap();
+        assert_eq!(low, 0x12345);
+        assert_eq!(high, 9);
+        assert_eq!(low + plan.digit_base() * high, value);
+        assert_eq!(plan.split(-1).unwrap_err(), Error::BoundViolation);
+        assert!(RangeCombinationPlan::new(0, 1, 20, 0).is_err());
+        assert!(RangeCombinationPlan::new(1, 0, 20, 0).is_err());
+        assert!(RangeCombinationPlan::new(1, 1, 0, 0).is_err());
+        assert!(RangeCombinationPlan::new(1, 1, 63, 0).is_err());
     }
 
     #[test]
