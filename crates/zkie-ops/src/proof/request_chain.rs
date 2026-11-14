@@ -239,6 +239,14 @@ fn group_from_ends(
     {
         return Err(Error::ShapeMismatch);
     }
+    // Each sent value has its own mask slot: a repeated slot would let one
+    // value stand in for another.
+    let mut unique = end_slots.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    if unique.len() != end_slots.len() {
+        return Err(Error::InvalidConfig);
+    }
     let beta = output.ends[0].mask_scale;
     let mut hidden = Vec::with_capacity(output.ends.len());
     for (index, (end, slot)) in output.ends.iter().zip(end_slots).enumerate() {
@@ -745,6 +753,46 @@ mod tests {
         assert!(crate::proof::hidden_member::check_pending(&outputs.pending, &changed, &index_mask).is_err());
         let other_mask = |_oracle: u64, slot: u64| Ok(f(601 + slot));
         assert!(crate::proof::hidden_member::check_pending(&outputs.pending, &matrix, &other_mask).is_err());
+        // Another mask source, or a repeated end slot, is refused: every end
+        // value has its own slot and its own entry.
+        let other_chain_mask = |slot: usize| -> Result<Fp3> {
+            let mut value = chain_mask(slot)?;
+            if (20..24).contains(&slot) {
+                value = value.add(&Fp3::ONE);
+            }
+            Ok(value)
+        };
+        let mut other_inputs = ChainInputs {
+            token_point: &point,
+            token_shown: &token_shown,
+            token_kept: &token_kept,
+            token_claim_masks: &claim_masks,
+            token_shown_claim: shown_claim,
+            token_claim_slot: 3,
+            token_masks: &token_masks,
+            reduction: &reduction,
+            stack_left: &stack_left,
+            stack_right: &stack_right,
+            om: &om,
+            stack_masks: &stack_masks,
+            layout: &layout,
+            claims: &claims,
+            claim_maps: &maps,
+            end_slots: &end_slots,
+            merge_masks: &merge_masks,
+            mask_value: &chain_mask,
+            index_oracle: 60,
+            index_slot: 7,
+        };
+        let other_ptr: &dyn Fn(usize) -> Result<Fp3> = &other_chain_mask;
+        other_inputs.mask_value = other_ptr;
+        assert!(verify_request_chain(&other_inputs, &proof, &mut Source(61)).is_err());
+        // The repeated slot: two end values naming the same mask slot.
+        let repeated = [20usize, 21, 22, 22];
+        let mut repeated_inputs = ChainInputs { end_slots: &repeated, ..other_inputs };
+        repeated_inputs.mask_value = &chain_mask;
+        repeated_inputs.end_slots = &repeated;
+        assert!(verify_request_chain(&repeated_inputs, &proof, &mut Source(61)).is_err());
         // A changed token proof breaks the stack's start.
         let mut tampered = proof.clone();
         tampered.token.rounds[0].coefficients[0] =
