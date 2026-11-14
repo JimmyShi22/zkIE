@@ -1,0 +1,567 @@
+diff --git a/crates/zkie-ops/src/proof/hidden_member.rs b/crates/zkie-ops/src/proof/hidden_member.rs
+index 026d12fb..78641f07 100644
+--- a/crates/zkie-ops/src/proof/hidden_member.rs
++++ b/crates/zkie-ops/src/proof/hidden_member.rs
+@@ -536,6 +536,11 @@ impl ReductionWitnessPlan {
+         &self.tables
+     }
+ 
++    /// The total number of entries of all tables.
++    pub fn total_entries(&self) -> u64 {
++        self.next_at
++    }
++
+     pub fn root(&self) -> Option<Digest> {
+         self.root
+     }
+diff --git a/crates/zkie-ops/src/proof/hidden_send_session.rs b/crates/zkie-ops/src/proof/hidden_send_session.rs
+index 85b6a2fe..08afc03c 100644
+--- a/crates/zkie-ops/src/proof/hidden_send_session.rs
++++ b/crates/zkie-ops/src/proof/hidden_send_session.rs
+@@ -1689,6 +1689,25 @@ pub struct IndexMaskMessage {
+ // The hidden SEND plan
+ // ---------------------------------------------------------------------------
+ 
++/// The trusted plan of one hidden SEND-sample message. It carries the public
++/// shapes, the encoded table identity, the activation commitment pin and, for
++/// a verifier plan, the expected `W` roots. The expected roots are a fixture
++/// expectation in this unit; in a production run they would be statement
++/// values received under their own binding.
++/// The consumer's pending-claim plan: the index-mask oracle that masks the
++/// target, the matrix geometry, the pending claim itself, the reduced-witness
++/// tables and the witness tree. The pending claim is plan data, not a
++/// commitment; no proof byte enters this struct.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct MemberPlan {
++    pub index_oracle: u64,
++    pub row_bits: u32,
++    pub column_bits: u32,
++    pub pending: crate::proof::hidden_member::PendingRow,
++    pub tables: Vec<crate::proof::hidden_member::ReductionTable>,
++    pub tree: RuntimeTreePlan,
++}
++
+ /// The trusted plan of one hidden SEND-sample message. It carries the public
+ /// shapes, the encoded table identity, the activation commitment pin and, for
+ /// a verifier plan, the expected `W` roots. The expected roots are a fixture
+@@ -1721,6 +1740,9 @@ pub struct HiddenSendPlan {
+     /// the operator policy that also pins the activation commitment.
+     pub expected_dot_root: Option<Digest>,
+     pub expected_roots: Option<Vec<Digest>>,
++    /// The pending claim and the reduced-witness tables, when this chain
++    /// carries the consumer's member relation.
++    pub member: Option<MemberPlan>,
+ }
+ 
+ impl HiddenSendPlan {
+@@ -1765,6 +1787,70 @@ impl HiddenSendPlan {
+         if self.w.fault(self.columns, self.activation.positions).is_some() {
+             return Err(Error::InvalidConfig);
+         }
++        if let Some(member) = &self.member {
++            if member.pending.psi.len() != member.column_bits as usize
++                || member.pending.weights.is_empty()
++                || member.pending.masks.is_empty()
++                || member.pending.masks.iter().any(|term| term.oracle != member.index_oracle)
++                || member.row_bits != self.matrix_rows.trailing_zeros()
++                || member.column_bits != self.columns.trailing_zeros()
++                || member.pending.row_bits().ok() != Some(member.row_bits)
++            {
++                return Err(Error::InvalidConfig);
++            }
++            let index = self.index_mask.as_ref().ok_or(Error::InvalidConfig)?;
++            if index.oracle != member.index_oracle {
++                return Err(Error::InvalidConfig);
++            }
++            let witness =
++                crate::proof::hidden_member::ReductionWitnessPlan::from_tables(member.tables.clone())
++                    .map_err(|_| Error::InvalidConfig)?;
++            for table in &member.tables {
++                if table.matrix != 0
++                    || table.parts != 1
++                    || table.rows_per_part != self.matrix_rows
++                    || table.columns != self.columns
++                {
++                    return Err(Error::InvalidConfig);
++                }
++            }
++            let total = witness.total_entries();
++            let columns = member
++                .tree
++                .columns();
++            if member.tree.fault().is_some()
++                || member.tree.parts.len() != 1
++                || member.tree.parts[0].main_symbols != E_DEGREE as u64
++                || member.tree.parts[0].mask_symbols != 0
++                || member.tree.log_n_zk != member.tree.log_n
++                || columns < total
++                || total == 0
++                || columns != total.checked_next_power_of_two().ok_or(Error::ResourceLimit)?
++                || member.tree.leaf_class == self.w.leaf_class
++                || member.tree.leaf_class == index.tree.leaf_class
++            {
++                return Err(Error::InvalidConfig);
++            }
++            let witness_end = member
++                .tree
++                .tree_number
++                .checked_add(1)
++                .ok_or(Error::ResourceLimit)?;
++            let w_end = self
++                .w
++                .tree_number
++                .checked_add(self.activation.positions as u64)
++                .ok_or(Error::ResourceLimit)?;
++            let collides = (member.tree.tree_number < w_end && self.w.tree_number < witness_end)
++                || member.tree.tree_number == index.tree.tree_number
++                || self
++                    .dot
++                    .as_ref()
++                    .map_or(false, |dot| member.tree.tree_number == dot.shape.tree_number);
++            if collides {
++                return Err(Error::InvalidConfig);
++            }
++        }
+         if self.activation.hidden as u64 > self.matrix_rows {
+             return Err(Error::ShapeMismatch);
+         }
+@@ -2639,6 +2725,10 @@ pub struct DotMapMessage {
+ pub struct HiddenSendMessages {
+     pub activation: ActivationCommitment,
+     pub group: SendGroup,
++    /// The root of the reduced-witness tree when the plan carries the
++    /// consumer's reduced witness. It is committed before any sample seed is
++    /// drawn; the session encoding carries it only for such a plan.
++    pub reduction_root: Option<Digest>,
+     pub samples: SendSamples,
+     /// The opening positions per oracle, drawn after the answers.
+     pub positions: Vec<Vec<u64>>,
+@@ -2676,6 +2766,12 @@ impl HiddenSendMessages {
+         writer.put_u64(HIDDEN_SEND_SCHEMA_VERSION);
+         writer.put_bytes(&self.activation.encode());
+         writer.put_bytes(&self.group.encode());
++        if let Some(root) = self.reduction_root {
++            if root == Digest::ZERO {
++                return Err(Error::InvalidEncoding);
++            }
++            writer.put_digest(&root);
++        }
+         writer.put_bytes(&self.samples.encode());
+         writer.put_u64(self.positions.len() as u64);
+         for positions in &self.positions {
+@@ -2748,6 +2844,15 @@ impl HiddenSendMessages {
+         }
+         let activation = ActivationCommitment::decode(reader.get_bytes()?)?;
+         let group = SendGroup::decode(reader.get_bytes()?)?;
++        let reduction_root = if plan.member.is_some() {
++            let root = reader.get_digest()?;
++            if root == Digest::ZERO {
++                return Err(Error::InvalidEncoding);
++            }
++            Some(root)
++        } else {
++            None
++        };
+         let samples = SendSamples::decode(reader.get_bytes()?)?;
+         let position_count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+         if position_count != plan.positions() as usize {
+@@ -2889,6 +2994,7 @@ impl HiddenSendMessages {
+         Ok(Self {
+             activation,
+             group,
++            reduction_root,
+             samples,
+             positions,
+             openings,
+@@ -2923,6 +3029,71 @@ pub struct HiddenSendOutcome {
+     pub chain_value: Digest,
+ }
+ 
++/// The salt-derivation purpose of the reduced-witness tree.
++const REDUCTION_SALT_PURPOSE: u64 = 16;
++
++/// Streams the table once and computes the reduced-witness entries: for each
++/// table, each row's runs with the table's point, in table order.
++fn reduction_entries(
++    plan: &HiddenSendPlan,
++    member: &MemberPlan,
++    source: &mut dyn TableRowSource,
++) -> Result<Vec<Fp3>> {
++    let ell = usize::try_from(plan.table_shape.code.ell).map_err(|_| Error::ResourceLimit)?;
++    let tail_len = usize::try_from(plan.table_shape.code.r).map_err(|_| Error::ResourceLimit)?;
++    let columns = usize::try_from(plan.columns).map_err(|_| Error::ResourceLimit)?;
++    let mut message = vec![Fp::ZERO; ell];
++    let mut tail = vec![Fp::ZERO; tail_len];
++    let mut entries = Vec::new();
++    for row in 0..plan.matrix_rows {
++        source.row(row, &mut message, &mut tail)?;
++        let cells: Vec<Fp3> = message[..columns]
++            .iter()
++            .map(|value| Fp3::from_base(*value))
++            .collect();
++        for table in &member.tables {
++            let run = usize::try_from(table.run_length).map_err(|_| Error::ResourceLimit)?;
++            let mut start = 0usize;
++            while start < columns {
++                entries.push(crate::proof::hidden_member::entry_value(
++                    &cells[start..start + run],
++                    &table.phi,
++                )?);
++                start += run;
++            }
++        }
++    }
++    Ok(entries)
++}
++
++/// Commits the reduced-witness entries under the plan's tree: one row whose
++/// columns are the entries, padded with zeros to the tree's width.
++fn reduction_tree(
++    plan: &HiddenSendPlan,
++    member: &MemberPlan,
++    entries: &[Fp3],
++) -> Result<RuntimeTree> {
++    let columns = usize::try_from(member.tree.columns()).map_err(|_| Error::ResourceLimit)?;
++    if entries.len() > columns {
++        return Err(Error::ShapeMismatch);
++    }
++    let mut row = vec![Fp3::ZERO; columns];
++    row[..entries.len()].copy_from_slice(entries);
++    let seed = derive_run_seed(
++        &plan.parameters_digest(),
++        member.tree.tree_number,
++        REDUCTION_SALT_PURPOSE,
++    )?;
++    let mut coins = ByteMaskCoins::new(seed)?;
++    let salts = draw_salt_bytes(&mut coins, columns, member.tree.salt_bytes)?;
++    let parts = [RuntimePartRows {
++        main: vec![row],
++        mask: Vec::new(),
++        main_deg: E_DEGREE as u32,
++    }];
++    RuntimeTree::commit(member.tree.clone(), &parts, &salts)
++}
++
+ /// Prover entry. The activation commitment must equal the plan's pin; the
+ /// encoded table identity must equal the plan's; the `W` rows are derived from
+ /// the table's row source. The returned messages are public, the witness is
+@@ -2937,6 +3108,14 @@ pub fn prove_hidden_send(
+     plan.validate()?;
+     check_activation(plan, activation)?;
+     check_table(plan, table_reader)?;
++    let (reduction_root, _reduction_tree) = match &plan.member {
++        Some(member) => {
++            let entries = reduction_entries(plan, member, table_source)?;
++            let tree = reduction_tree(plan, member, &entries)?;
++            (Some(*tree.root()), Some(tree))
++        }
++        None => (None, None),
++    };
+     let rows = derive_w_rows(plan, activation, table_reader, table_source)?;
+     let (group, mut witness) = commit_w_rows(plan, &rows, randomness)?;
+     let dot_map = match &plan.dot {
+@@ -2957,6 +3136,9 @@ pub fn prove_hidden_send(
+         None,
+     )?;
+     absorb_group(&mut chain, &group)?;
++    if let (Some(member), Some(root)) = (&plan.member, &reduction_root) {
++        absorb_reduction_root(&mut chain, member, root)?;
++    }
+     let index_mask = match (&plan.index_mask, &witness.index_mask) {
+         (Some(index), Some(mask_witness)) => {
+             absorb_index_mask_root(&mut chain, index, &mask_witness.root)?;
+@@ -3058,6 +3240,7 @@ pub fn prove_hidden_send(
+     let messages = HiddenSendMessages {
+         activation: *activation.commitment(),
+         group,
++        reduction_root,
+         samples: SendSamples { seed: seeds, answers },
+         positions,
+         openings,
+@@ -3179,6 +3362,16 @@ fn run_verify(plan: &HiddenSendPlan, messages: &HiddenSendMessages) -> Result<Hi
+         None,
+     )?;
+     absorb_group(&mut chain, &messages.group)?;
++    match (&plan.member, messages.reduction_root) {
++        (Some(member), Some(root)) => {
++            if root == Digest::ZERO {
++                return Err(Error::InvalidProof);
++            }
++            absorb_reduction_root(&mut chain, member, &root)?;
++        }
++        (None, None) => {}
++        _ => return Err(Error::InvalidProof),
++    }
+     match (&plan.index_mask, &messages.index_mask) {
+         (Some(index), Some(message)) => {
+             if message.tree != index.tree
+@@ -3693,6 +3886,21 @@ fn absorb_index_mask_root(chain: &mut Chain, plan: &IndexMaskPlan, root: &Digest
+     Ok(())
+ }
+ 
++/// Absorbs the reduced-witness root: the trusted tree plan and the root, in
++/// the first message right after the group roots.
++fn absorb_reduction_root(chain: &mut Chain, plan: &MemberPlan, root: &Digest) -> Result<()> {
++    let mut message = chain.message();
++    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
++    message.push_u64(16);
++    push_tree_plan(&mut message, &plan.tree);
++    push_digest(&mut message, root);
++    let prefix = message.prefix(KIND_SEED, 0)?;
++    if !chain.step(&prefix, 0)? {
++        return Err(Error::InvalidProof);
++    }
++    Ok(())
++}
++
+ fn absorb_index_mask_answer(chain: &mut Chain, answer: Fp3) -> Result<()> {
+     let mut message = chain.message();
+     message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+@@ -6891,6 +7099,15 @@ fn prove_first(
+     plan.validate()?;
+     let reader = table.reader().clone();
+     check_table(&plan.send, &reader)?;
++    let (reduction_root, _reduction_tree) = match &plan.send.member {
++        Some(member) => {
++            let source: &mut dyn TableRowSource = &mut *table;
++            let entries = reduction_entries(&plan.send, member, source)?;
++            let tree = reduction_tree(&plan.send, member, &entries)?;
++            (Some(*tree.root()), Some(tree))
++        }
++        None => (None, None),
++    };
+     let weights = match plan.send.activation_source {
+         ActivationSource::Commitment => {
+             let activation = activation.ok_or(Error::InvalidConfig)?;
+@@ -7003,6 +7220,9 @@ fn prove_first(
+     let mut chain = first_chain(plan, &reader)?;
+     absorb_group(&mut chain, &group)?;
+     absorb_claim(&mut chain, plan)?;
++    if let (Some(member), Some(root)) = (&plan.send.member, &reduction_root) {
++        absorb_reduction_root(&mut chain, member, root)?;
++    }
+     let index_mask = match (&plan.send.index_mask, &witness.index_mask) {
+         (Some(index), Some(mask_witness)) => {
+             absorb_index_mask_root(&mut chain, index, &mask_witness.root)?;
+@@ -7400,6 +7620,7 @@ fn prove_first(
+     let messages = HiddenSendMessages {
+         activation: activation_commitment,
+         group,
++        reduction_root,
+         samples: SendSamples { seed: seeds, answers },
+         positions,
+         openings,
+@@ -7463,6 +7684,16 @@ fn verify_first(
+     let mut chain = first_chain(plan, reader)?;
+     absorb_group(&mut chain, &messages.group)?;
+     absorb_claim(&mut chain, plan)?;
++    match (&plan.send.member, messages.reduction_root) {
++        (Some(member), Some(root)) => {
++            if root == Digest::ZERO {
++                return Err(Error::InvalidProof);
++            }
++            absorb_reduction_root(&mut chain, member, &root)?;
++        }
++        (None, None) => {}
++        _ => return Err(Error::InvalidProof),
++    }
+     match (&plan.send.index_mask, &messages.index_mask) {
+         (Some(index), Some(message)) => {
+             if message.tree != index.tree
+@@ -17734,7 +17965,11 @@ impl HiddenLinMessages {
+     pub fn encode(&self) -> Result<Vec<u8>> {
+         let mut writer = CanonicalWriter::new();
+         writer.put_u64(HIDDEN_SEND_SCHEMA_VERSION);
+-        writer.put_u64(14);
++        // Layout 15 adds the reduced-witness root to the first message; a
++        // session without the consumer's reduced witness keeps layout 14 and
++        // its exact bytes.
++        let layout = if self.first.reduction_root.is_some() { 15 } else { 14 };
++        writer.put_u64(layout);
+         writer.put_bytes(&self.first.encode()?);
+         writer.put_digest(&self.first_seal);
+         let mut shared = CanonicalWriter::new();
+@@ -17755,7 +17990,10 @@ impl HiddenLinMessages {
+         if layout < 14 {
+             return Err(Error::UnsupportedVersion);
+         }
+-        if layout != 14 {
++        if layout != 14 && layout != 15 {
++            return Err(Error::InvalidEncoding);
++        }
++        if (layout == 15) != plan.send.member.is_some() {
+             return Err(Error::InvalidEncoding);
+         }
+         let first = HiddenSendMessages::decode(
+@@ -17972,6 +18210,7 @@ mod tests {
+             dot: None,
+             expected_dot_root: None,
+             expected_roots: None,
++            member: None,
+         };
+         let mut source = VecTableSource::new(messages, tails).unwrap();
+         let randomness = randomness();
+@@ -18979,6 +19218,7 @@ mod merged_tests {
+             dot: None,
+             expected_dot_root: None,
+             expected_roots: None,
++            member: None,
+         };
+         let weights: Vec<Vec<Fp3>> = (0..POSITIONS)
+             .map(|position| activation.weights(position, MATRIX_ROWS).unwrap())
+diff --git a/crates/zkie-ops/src/proof/output_head_lin.rs b/crates/zkie-ops/src/proof/output_head_lin.rs
+index 9db7a001..29b71821 100644
+--- a/crates/zkie-ops/src/proof/output_head_lin.rs
++++ b/crates/zkie-ops/src/proof/output_head_lin.rs
+@@ -2244,6 +2244,7 @@ mod tests {
+             dot: Some(dot_plan()),
+             expected_dot_root: None,
+             expected_roots: None,
++            member: None,
+         };
+         let salts: Vec<Vec<u8>> = (0..TOY_POSITIONS)
+             .map(|position| vec![(position as u8).wrapping_mul(11) ^ 0x3C; SALT])
+diff --git a/crates/zkie-ops/tests/projection_hidden_lin.rs b/crates/zkie-ops/tests/projection_hidden_lin.rs
+index dbe8aa1f..246d6bf1 100644
+--- a/crates/zkie-ops/tests/projection_hidden_lin.rs
++++ b/crates/zkie-ops/tests/projection_hidden_lin.rs
+@@ -284,6 +284,7 @@ fn plan(activation: &CommittedActivation, table: &Table) -> HiddenLinPlan {
+         dot: None,
+         expected_dot_root: None,
+         expected_roots: None,
++        member: None,
+     };
+     HiddenLinPlan {
+         norm: None,
+diff --git a/zkie/tests/lin_session.rs b/zkie/tests/lin_session.rs
+index 83a543a6..03829946 100644
+--- a/zkie/tests/lin_session.rs
++++ b/zkie/tests/lin_session.rs
+@@ -977,6 +977,7 @@ fn selected_gpt2_output_head_request_session() {
+             }),
+             expected_dot_root: None,
+             expected_roots: None,
++            member: None,
+         },
+         proximity,
+         index_mask: Some(index_mask),
+diff --git a/zkie/tests/projection_consumer_diagnostic.rs b/zkie/tests/projection_consumer_diagnostic.rs
+index 154a4b35..d639a518 100644
+--- a/zkie/tests/projection_consumer_diagnostic.rs
++++ b/zkie/tests/projection_consumer_diagnostic.rs
+@@ -31,7 +31,10 @@ use zkie_ops::proof::hidden_send_session::{
+     prove_hidden_lin, prove_hidden_lin_hidden, verify_hidden_lin, verify_hidden_lin_hidden,
+     ActivationShape, CommittedActivation, DotMapPlan, HiddenLinPlan, HiddenOutputShape,
+     HiddenProximityPlan, HiddenSendPlan, HiddenTableProver, IndexMaskPlan, IoppStagePlan,
+-    MaskEntryAllocation, WShape,
++    MaskEntryAllocation, MemberPlan, WShape,
++};
++use zkie_ops::proof::hidden_member::{
++    stretch_weights, MaskTerm, PendingRow, ReductionTable,
+ };
+ use zkie_ops::proof::proximity_planner::{
+     assemble_proximity, AssemblyInput, AssemblyMember, AssemblyOwnObject, SolvedStage,
+@@ -506,6 +509,7 @@ fn plan_for(
+             dot: None,
+             expected_dot_root: None,
+             expected_roots: None,
++            member: None,
+         },
+         output: HiddenOutputShape {
+             positions,
+@@ -718,6 +722,7 @@ fn hidden_plan_for(
+             dot: None,
+             expected_dot_root: None,
+             expected_roots: None,
++            member: None,
+         },
+         output: HiddenOutputShape {
+             positions,
+@@ -752,6 +757,56 @@ fn hidden_plan_for(
+     };
+     plan.send.index_mask = Some(index_mask_plan(positions, mask_code));
+     plan.send.dot = Some(dot_plan(positions, code));
++    // The consumer's pending claim and reduced witness. The claim's weights are
++    // the first position's activation row over the matrix rows; the tables cut
++    // each row into eight runs of the columns. The pending claim is not yet
++    // consumed by the second chain; this run binds the witness root into the
++    // first message and the session encoding.
++    let row = activation
++        .weights(0, MATRIX_ROWS)
++        .expect("activation row");
++    let pending = PendingRow {
++        weights: stretch_weights(MATRIX_ROWS.trailing_zeros(), 0, &row).expect("weights"),
++        psi: vec![Fp3::from_u64(3); COLUMNS.trailing_zeros() as usize],
++        target: Fp3::from_u64(7),
++        masks: vec![MaskTerm {
++            oracle: INDEX_MASK_ORACLE,
++            slot: 0,
++            coeff: Fp3::from_u64(5),
++        }],
++    };
++    let run_length = COLUMNS / 8;
++    let entries = MATRIX_ROWS * (COLUMNS / run_length);
++    plan.send.member = Some(MemberPlan {
++        index_oracle: INDEX_MASK_ORACLE,
++        row_bits: MATRIX_ROWS.trailing_zeros(),
++        column_bits: COLUMNS.trailing_zeros(),
++        pending,
++        tables: vec![ReductionTable {
++            matrix: 0,
++            parts: 1,
++            run_length,
++            rows_per_part: MATRIX_ROWS,
++            columns: COLUMNS,
++            at: 0,
++            entries,
++            phi: (1..=run_length).map(Fp3::from_u64).collect(),
++            later: false,
++        }],
++        tree: RuntimeTreePlan {
++            tree_number: 700,
++            leaf_class: 4,
++            log_n: entries.trailing_zeros(),
++            log_n_zk: entries.trailing_zeros(),
++            parts: vec![RuntimeTreePart {
++                main_symbols: E_DEGREE as u64,
++                mask_symbols: 0,
++            }],
++            salt_bytes: SALT,
++            run: Digest([0x71; 32]),
++            configuration: Digest([0x72; 32]),
++        },
++    });
+     plan
+ }
+ 
+@@ -849,6 +904,30 @@ fn real_projection_consumer_closes_in_hidden_input_mode() {
+         .expect("hidden verify");
+     assert!(!outcome.eval_rows.is_empty());
+ 
++    // The reduced-witness root is a first-message commitment: a changed root, a
++    // missing root or a different witness tree in the plan is rejected.
++    let mut tampered_root = messages.clone();
++    if let Some(root) = tampered_root.first.reduction_root.as_mut() {
++        root.0[0] ^= 1;
++    } else {
++        panic!("the assembled plan carries the reduced witness");
++    }
++    assert!(
++        verify_hidden_lin_hidden(&verifier_plan, session_table.reader(), &tampered_root).is_err()
++    );
++    let mut missing_root = messages.clone();
++    missing_root.first.reduction_root = None;
++    assert!(
++        verify_hidden_lin_hidden(&verifier_plan, session_table.reader(), &missing_root).is_err()
++    );
++    let mut changed_tree = verifier_plan.clone();
++    if let Some(member) = changed_tree.send.member.as_mut() {
++        member.tree.tree_number += 1;
++    }
++    assert!(
++        verify_hidden_lin_hidden(&changed_tree, session_table.reader(), &messages).is_err()
++    );
++
+     // The session slot after the trusted table: the canonical session
+     // encoding enters the verification package as session.bin, and the
+     // verifier consumes it from the package, not from the in-memory proof.
