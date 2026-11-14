@@ -5905,11 +5905,6 @@ pub struct HiddenLinPlan {
 impl HiddenLinPlan {
     pub fn validate(&self) -> Result<()> {
         self.send.validate()?;
-        // The first-chain sub-proof segment is not wired yet: a plan that asks
-        // for it must be refused here, never silently proved without it.
-        if self.send.request_chain.is_some() {
-            return Err(Error::UnsupportedPrimitive);
-        }
         if self.output.fault().is_some()
             || self.output.positions != self.send.activation.positions
             || self.output.columns != self.send.columns
@@ -7841,6 +7836,7 @@ fn prove_first(
     norm: Option<&NormWitness>,
     seed: &Digest,
     param_tables: Option<&mut dyn NormParamTableProver>,
+    chain_inputs: Option<&crate::proof::request_chain::ChainInputs>,
 ) -> Result<(HiddenSendMessages, Digest, HiddenSendWitness)> {
     let _profile_first = zkie_engine::profile::Scope::new("first.prove_first");
     plan.validate()?;
@@ -7995,6 +7991,16 @@ fn prove_first(
     if let (Some(member), Some(root)) = (&plan.send.member, &reduction_root) {
         absorb_reduction_root(&mut chain, member, root)?;
     }
+    // The request chain's sub-proof segment runs before the LIN first W root:
+    // its messages and challenges are fixed in the first chain, and the pending
+    // claim the plan carries is the segment's output.
+    let request_section = match (&plan.send.request_chain, chain_inputs) {
+        (Some(_), Some(inputs)) => {
+            Some(prove_first_chain_segment(&mut chain, &plan.send, inputs)?)
+        }
+        (None, None) => None,
+        _ => return Err(Error::InvalidConfig),
+    };
     let request_w_sample = if let Some(witness) = &request_w_commit {
         let rw = plan.send.request_w.as_ref().ok_or(Error::InvalidConfig)?;
         let root = *witness.committed.roots.first().ok_or(Error::ShapeMismatch)?;
@@ -8445,7 +8451,7 @@ fn prove_first(
         chain_value: first_seal,
         closure,
         norm: norm_first,
-        request: None,
+        request: request_section,
     };
     witness.request_w = request_w_commit;
     Ok((messages, first_seal, witness))
@@ -8456,6 +8462,7 @@ fn verify_first(
     reader: &IndexReader,
     output: Option<&[Vec<Fp3>]>,
     messages: &HiddenSendMessages,
+    chain_inputs: Option<&crate::proof::request_chain::ChainInputs>,
 ) -> Result<(Vec<EvalSampleRow>, Digest, Option<Vec<Fp3>>)> {
     let _profile = zkie_engine::profile::Scope::new("verify.first");
     plan.validate()?;
@@ -8509,6 +8516,13 @@ fn verify_first(
             absorb_reduction_root(&mut chain, member, &root)?;
         }
         (None, None) => {}
+        _ => return Err(Error::InvalidProof),
+    }
+    match (&plan.send.request_chain, &messages.request, chain_inputs) {
+        (Some(_), Some(section), Some(inputs)) => {
+            verify_first_chain_segment(&mut chain, &plan.send, section, inputs)?;
+        }
+        (None, None, None) => {}
         _ => return Err(Error::InvalidProof),
     }
     match (&plan.send.request_w, &messages.request_w) {
@@ -17960,9 +17974,13 @@ fn prove_hidden_lin_inner(
     norm: Option<&NormWitness>,
     rstd_table: Option<&dyn crate::proof::lookup::LookupTable>,
     param_tables: Option<&mut dyn NormParamTableProver>,
+    chain_inputs: Option<&crate::proof::request_chain::ChainInputs>,
 ) -> Result<(HiddenLinMessages, HiddenLinWitness)> {
     let _profile_session = zkie_engine::profile::Scope::new("session.prove_hidden_lin_inner");
     plan.validate()?;
+    if plan.send.request_chain.is_some() != chain_inputs.is_some() {
+        return Err(Error::InvalidConfig);
+    }
     if seed == Digest::ZERO {
         return Err(Error::InvalidConfig);
     }
@@ -17985,6 +18003,7 @@ fn prove_hidden_lin_inner(
             norm,
             &seed,
             param_tables,
+            chain_inputs,
         )?;
     let first_query = *first_chain(plan, &reader)?.value();
     let shared = prove_shared(
@@ -18041,7 +18060,7 @@ pub fn prove_hidden_lin(
     if plan.weights.is_empty() {
         return Err(Error::InvalidConfig);
     }
-    prove_hidden_lin_inner(plan, Some(activation), table, Some(output), seed, true, None, None, None)
+    prove_hidden_lin_inner(plan, Some(activation), table, Some(output), seed, true, None, None, None, None)
 }
 
 /// Prover entry of the merged three-stage run in the hidden-input mode. The
@@ -18057,7 +18076,7 @@ pub fn prove_hidden_lin_hidden(
     if !plan.weights.is_empty() || plan.norm.is_some() {
         return Err(Error::InvalidConfig);
     }
-    prove_hidden_lin_inner(plan, Some(activation), table, None, seed, true, None, None, None)
+    prove_hidden_lin_inner(plan, Some(activation), table, None, seed, true, None, None, None, None)
 }
 
 /// Prover entry of the hidden-input mode with the private norm witness. The
@@ -18073,7 +18092,7 @@ pub fn prove_hidden_lin_hidden_with_norm(
     if !plan.weights.is_empty() || plan.norm.is_none() {
         return Err(Error::InvalidConfig);
     }
-    prove_hidden_lin_inner(plan, Some(activation), table, None, seed, true, Some(norm), None, None)
+    prove_hidden_lin_inner(plan, Some(activation), table, None, seed, true, Some(norm), None, None, None)
 }
 
 /// Prover entry of the hidden-input mode where the Dot activation is the norm
@@ -18093,7 +18112,7 @@ pub fn prove_hidden_lin_hidden_with_norm_hd(
     {
         return Err(Error::InvalidConfig);
     }
-    prove_hidden_lin_inner(plan, None, table, None, seed, true, Some(norm), None, param_tables)
+    prove_hidden_lin_inner(plan, None, table, None, seed, true, Some(norm), None, param_tables, None)
 }
 
 /// Test-only prover entry that omits the residual absorption before the
@@ -18110,7 +18129,7 @@ fn prove_hidden_lin_hidden_unbound_residual(
     if !plan.weights.is_empty() {
         return Err(Error::InvalidConfig);
     }
-    prove_hidden_lin_inner(plan, Some(activation), table, None, seed, false, None, None, None)
+    prove_hidden_lin_inner(plan, Some(activation), table, None, seed, false, None, None, None, None)
 }
 
 fn verify_hidden_lin_inner(
@@ -18119,12 +18138,16 @@ fn verify_hidden_lin_inner(
     output: Option<&[Vec<Fp3>]>,
     messages: &HiddenLinMessages,
     rstd_table: Option<&dyn crate::proof::lookup::LookupTable>,
+    chain_inputs: Option<&crate::proof::request_chain::ChainInputs>,
 ) -> Result<HiddenLinOutcome> {
     let _profile_verify = zkie_engine::profile::Scope::new("verify.hidden_lin");
     plan.validate()?;
+    if plan.send.request_chain.is_some() != chain_inputs.is_some() {
+        return Err(Error::InvalidConfig);
+    }
     let _profile_first = zkie_engine::profile::Scope::new("verify.hidden_lin.first");
     let (eval_rows, first_seal, closure_r) =
-        verify_first(plan, reader, output, &messages.first)?;
+        verify_first(plan, reader, output, &messages.first, chain_inputs)?;
     drop(_profile_first);
     if first_seal != messages.first_seal || messages.first.chain_value != first_seal {
         return Err(Error::InvalidProof);
@@ -18186,7 +18209,7 @@ pub fn verify_hidden_lin(
     if plan.weights.is_empty() {
         return Err(Error::InvalidConfig);
     }
-    verify_hidden_lin_inner(plan, reader, Some(output), messages, None)
+    verify_hidden_lin_inner(plan, reader, Some(output), messages, None, None)
 }
 
 /// Verifier entry of the merged three-stage run in the hidden-input mode. It
@@ -18205,10 +18228,18 @@ pub fn prove_hidden_lin_hidden_with_chain_segment(
     seed: Digest,
     _inputs: &crate::proof::request_chain::ChainInputs,
 ) -> Result<(HiddenLinMessages, HiddenLinWitness)> {
-    if plan.send.request_chain.is_some() {
-        return Err(Error::UnsupportedPrimitive);
-    }
-    prove_hidden_lin_hidden(plan, activation, table, seed)
+    prove_hidden_lin_inner(
+        plan,
+        Some(activation),
+        table,
+        None,
+        seed,
+        true,
+        None,
+        None,
+        None,
+        Some(_inputs),
+    )
 }
 
 /// Verifier counterpart of the chain segment entry: the same refusal until the
@@ -18219,10 +18250,7 @@ pub fn verify_hidden_lin_hidden_with_chain_segment(
     messages: &HiddenLinMessages,
     _inputs: &crate::proof::request_chain::ChainInputs,
 ) -> Result<HiddenLinOutcome> {
-    if plan.send.request_chain.is_some() {
-        return Err(Error::UnsupportedPrimitive);
-    }
-    verify_hidden_lin_hidden(plan, reader, messages)
+    verify_hidden_lin_inner(plan, reader, None, messages, None, Some(_inputs))
 }
 
 pub fn verify_hidden_lin_hidden(
@@ -18233,7 +18261,7 @@ pub fn verify_hidden_lin_hidden(
     if !plan.weights.is_empty() {
         return Err(Error::InvalidConfig);
     }
-    verify_hidden_lin_inner(plan, reader, None, messages, None)
+    verify_hidden_lin_inner(plan, reader, None, messages, None, None)
 }
 
 /// Proves the hidden chain with the frozen-table lookup witness and the
@@ -18258,6 +18286,7 @@ pub fn prove_hidden_lin_hidden_with_norm_and_rstd_table(
         true,
         Some(norm),
         Some(rstd_table),
+        None,
         None,
     )
 }
@@ -18286,6 +18315,7 @@ pub fn prove_hidden_lin_hidden_with_norm_and_params(
         Some(norm),
         None,
         Some(param_tables),
+        None,
     )
 }
 
@@ -18299,7 +18329,7 @@ pub fn verify_hidden_lin_hidden_with_rstd_table(
     if !plan.weights.is_empty() {
         return Err(Error::InvalidConfig);
     }
-    verify_hidden_lin_inner(plan, reader, None, messages, Some(rstd_table))
+    verify_hidden_lin_inner(plan, reader, None, messages, Some(rstd_table), None)
 }
 
 /// Auxiliary verifier for unit and fixture runs. It runs the public entry and
@@ -23973,17 +24003,9 @@ mod merged_tests {
     }
 
     #[test]
-    fn the_chain_segment_entry_refuses_until_the_order_is_wired() {
+    fn the_chain_segment_entry_requires_the_plan_section() {
         let (plan, _, _) = member_run();
-        let mut plan = plan;
-        plan.send.request_chain = Some(crate::proof::request_chain::RequestChainShape {
-            token_rounds: 1,
-            token_ends: 1,
-            stack_rounds: 1,
-            stack_ends: 1,
-            merge_rounds: 1,
-            merge_ends: 1,
-        });
+        let plan = plan;
         let reduction = crate::proof::request_stack::StackReduction::new(vec![
             crate::proof::request_stack::StackPanel {
                 claim: 0,
@@ -24055,7 +24077,16 @@ mod merged_tests {
             merge_rounds: 1,
             merge_ends: 1,
         });
-        assert!(changed.validate().is_err());
+        // The plan itself carries the section; the entry without the caller
+        // inputs refuses before any proof is produced.
+        let mut table = table();
+        assert!(prove_hidden_lin_hidden(
+            &changed,
+            &activation(),
+            &mut table,
+            Digest([0x31; 32])
+        )
+        .is_err());
         // V4: a pending mask term must reference the member index oracle.
         let mut foreign = plan.clone();
         foreign.send.member.as_mut().unwrap().pending.masks[0].oracle = INDEX_MASK_ORACLE + 1;
