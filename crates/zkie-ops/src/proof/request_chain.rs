@@ -308,6 +308,53 @@ impl ChainMaskPlan {
             .ok_or(Error::ResourceLimit)
     }
 
+    /// The sampled answer of the table under one seed: the mask rows are read
+    /// through the sample cube, the last entry takes the seed factor instead
+    /// of its cube coefficient, and the answer is the masked row sum.
+    pub fn answer(
+        &self,
+        rows: &[Vec<Fp3>],
+        seed: &zkie_engine::pcs::request::table::SampleSeed,
+    ) -> Result<Fp3> {
+        if self.fault().is_some() {
+            return Err(Error::InvalidConfig);
+        }
+        let bits = self.sample_bits()?;
+        if seed.z.len() < bits as usize || seed.beta == Fp3::ZERO {
+            return Err(Error::ShapeMismatch);
+        }
+        let ell = usize::try_from(self.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
+        let mask_rows = usize::try_from(self.mask_rows).map_err(|_| Error::ResourceLimit)?;
+        if rows.len() != mask_rows || rows.iter().any(|row| row.len() != ell) {
+            return Err(Error::ShapeMismatch);
+        }
+        let row_bits = if self.mask_rows <= 1 {
+            0
+        } else {
+            64 - (self.mask_rows - 1).leading_zeros()
+        };
+        let point = &seed.z[..bits as usize];
+        let count = 1u64
+            .checked_shl(bits)
+            .ok_or(Error::ResourceLimit)?;
+        let eq = crate::proof::output_closure::eq_vector(point)?;
+        let mut answer = Fp3::ZERO;
+        for index in 0..count {
+            let row = (index & ((1u64 << row_bits) - 1)) as usize;
+            let place = (index >> row_bits) as usize;
+            if row >= mask_rows || place >= ell {
+                continue;
+            }
+            let coefficient = if row + 1 == mask_rows && place + 1 == ell {
+                seed.beta
+            } else {
+                *eq.get(index as usize).ok_or(Error::InvalidIndex)?
+            };
+            answer = answer.add(&coefficient.mul(&rows[row][place]));
+        }
+        Ok(answer)
+    }
+
     /// Checks one test's opening list of the table and records it in the
     /// table's read ledger: the count is the plan's openings, every position
     /// lies in the tree's columns, no position repeats, and the accumulated
@@ -1191,6 +1238,52 @@ mod chain_mask_tests {
         assert!(reads.open(&plan, 1).is_err());
         let mut zero = reads;
         assert!(zero.open(&plan, 0).is_err());
+        // The sampled answer of a two-row table at a chosen seed: the cube
+        // coefficients on the two rows plus the seed factor on the last entry.
+        let mut small = plan.clone();
+        small.mask_rows = 2;
+        small.entries = 4;
+        small.tree.parts[0].mask_symbols = 2 * 3;
+        let seed = zkie_engine::pcs::request::table::SampleSeed {
+            z: vec![
+                Fp3::from_u64(2),
+                Fp3::from_u64(3),
+                Fp3::from_u64(5),
+                Fp3::from_u64(7),
+                Fp3::from_u64(9),
+            ],
+            beta: Fp3::from_u64(11),
+        };
+        let mut rows = vec![vec![Fp3::ZERO; 16]; 2];
+        rows[0][0] = Fp3::from_u64(13);
+        rows[1][3] = Fp3::from_u64(17);
+        let answer = small.answer(&rows, &seed).unwrap();
+        // Recompute the same cube independently.
+        let bits = 1 + 4;
+        let eq = crate::proof::output_closure::eq_vector(&seed.z[..bits]).unwrap();
+        let mut expected = Fp3::ZERO;
+        for index in 0u64..(1 << bits) {
+            let row = (index & 1) as usize;
+            let place = (index >> 1) as usize;
+            if place >= 16 {
+                continue;
+            }
+            let coefficient = if row == 1 && place == 15 {
+                seed.beta
+            } else {
+                eq[index as usize]
+            };
+            expected = expected.add(&coefficient.mul(&rows[row][place]));
+        }
+        assert_eq!(answer, expected);
+        // A zero factor, a short seed or rows of another shape are refused.
+        let mut zero_beta = seed.clone();
+        zero_beta.beta = Fp3::ZERO;
+        assert!(small.answer(&rows, &zero_beta).is_err());
+        let mut short = seed.clone();
+        short.z.truncate(3);
+        assert!(small.answer(&rows, &short).is_err());
+        assert!(small.answer(&rows[..1], &seed).is_err());
         // One test's opening list: the plan count, positions inside the tree,
         // no repeats, and the table's own read ledger.
         // The sample form reads the mask table row bits and the mask code
