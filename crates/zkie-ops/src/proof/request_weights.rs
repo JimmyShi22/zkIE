@@ -340,7 +340,7 @@ impl WeightLayout {
             return Err(Error::InvalidConfig);
         }
         let mut values = Vec::with_capacity(unit.digits);
-        let mut scale = weight.mul(&claim.coefficient);
+        let scale = weight.mul(&claim.coefficient);
         let mut factor = Fp3::ONE;
         for _ in 0..unit.digits {
             values.push(scale.mul(&factor));
@@ -658,7 +658,7 @@ pub struct RowClaim {
     pub factors: Vec<RowFactor>,
 }
 
-fn eq1(p: Fp3, x: Fp3) -> Fp3 {
+pub(crate) fn eq1(p: Fp3, x: Fp3) -> Fp3 {
     p.mul(&x).add(&Fp3::ONE.sub(&p).mul(&Fp3::ONE.sub(&x)))
 }
 
@@ -671,7 +671,7 @@ fn ceil_log2(value: u64) -> u32 {
 }
 
 /// `eq(point, index)` for every index, with coordinate 0 the top bit.
-fn eq_table(point: &[Fp3]) -> Result<Vec<Fp3>> {
+pub(crate) fn eq_table(point: &[Fp3]) -> Result<Vec<Fp3>> {
     if point.len() >= 32 {
         return Err(Error::ResourceLimit);
     }
