@@ -2244,6 +2244,7 @@ mod tests {
             dot: Some(dot_plan()),
             expected_dot_root: None,
             expected_roots: None,
+            member: None,
         };
         let salts: Vec<Vec<u8>> = (0..TOY_POSITIONS)
             .map(|position| vec![(position as u8).wrapping_mul(11) ^ 0x3C; SALT])
