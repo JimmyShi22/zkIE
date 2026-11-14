@@ -181,7 +181,7 @@ mod commit_tests {
     use super::*;
     use zkie_engine::pcs::request::code::build_code_plan;
 
-    fn tree() -> RuntimeTreePlan {
+    pub(crate) fn tree() -> RuntimeTreePlan {
         RuntimeTreePlan {
             tree_number: 901,
             leaf_class: 1,
@@ -197,7 +197,7 @@ mod commit_tests {
         }
     }
 
-    fn salts() -> Vec<Vec<u8>> {
+    pub(crate) fn salts() -> Vec<Vec<u8>> {
         (0..4).map(|index| vec![index as u8 ^ 0x5A; 40]).collect()
     }
 
@@ -306,6 +306,129 @@ impl RangeCombinationPlan {
 }
 
 
+
+/// One range message of the combination object: the committed root and the
+/// opening at the positions the plan samples. The values are the combination
+/// object's stored entries, low and high digits in one integer each.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RangeMessage {
+    pub root: Digest,
+    pub positions: Vec<u64>,
+    pub opening: RuntimeTreeOpening,
+}
+
+/// The per-column combination values of the original matrix:
+/// `offset + sum_row coeff[row] * A(row, column)`. Every coefficient and cell
+/// is an integer; the value must be nonnegative, so the digit split is the
+/// integer split. The coefficients come from the range transcript's
+/// challenges and are public inputs to this evaluation.
+pub fn combination_values(
+    plan: &PackedMatrixPlan,
+    cells: &[i128],
+    coefficients: &[i128],
+    offset: i128,
+) -> Result<Vec<i128>> {
+    let rows = usize::try_from(plan.rows).map_err(|_| Error::ResourceLimit)?;
+    let columns = usize::try_from(plan.columns).map_err(|_| Error::ResourceLimit)?;
+    if cells.len() != rows * columns || coefficients.len() != rows || offset < 0 {
+        return Err(Error::ShapeMismatch);
+    }
+    if cells.iter().any(|cell| *cell < 0 || *cell >= PACK_BASE) {
+        return Err(Error::BoundViolation);
+    }
+    let mut values = vec![offset; columns];
+    for row in 0..rows {
+        let coefficient = coefficients[row];
+        if coefficient < 0 {
+            return Err(Error::BoundViolation);
+        }
+        for (column, value) in values.iter_mut().enumerate() {
+            let cell = cells[row * columns + column];
+            *value = value
+                .checked_add(coefficient.checked_mul(cell).ok_or(Error::ResourceLimit)?)
+                .ok_or(Error::ResourceLimit)?;
+        }
+    }
+    Ok(values)
+}
+
+/// Commits the stored combination values under the range plan's tree and
+/// returns the opening at `positions` with the message that carries them.
+pub fn commit_range_values(
+    range: &RangeCombinationPlan,
+    values: &[i128],
+    tree: RuntimeTreePlan,
+    salts: &[Vec<u8>],
+    positions: &[u64],
+) -> Result<(RuntimeTree, RangeMessage)> {
+    let stored = usize::try_from(range.planes)
+        .map_err(|_| Error::ResourceLimit)?
+        .checked_mul(usize::try_from(range.columns).map_err(|_| Error::ResourceLimit)?)
+        .ok_or(Error::ResourceLimit)?;
+    if values.len() != stored {
+        return Err(Error::ShapeMismatch);
+    }
+    let bound = (1i128 << 62) - 1;
+    for value in values {
+        if *value < 0 || *value > bound {
+            return Err(Error::BoundViolation);
+        }
+    }
+    let columns = usize::try_from(tree.columns()).map_err(|_| Error::ResourceLimit)?;
+    if stored > columns || salts.len() != columns {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut row = vec![Fp3::ZERO; columns];
+    for (slot, value) in row.iter_mut().zip(values) {
+        *slot = Fp3::from_base(fp_from_u64(*value as u64));
+    }
+    let parts = [RuntimePartRows {
+        main: vec![row],
+        mask: Vec::new(),
+        main_deg: E_DEGREE as u32,
+    }];
+    let committed = RuntimeTree::commit(tree, &parts, salts)?;
+    let opening = committed.open(positions)?;
+    let message = RangeMessage {
+        root: *committed.root(),
+        positions: positions.to_vec(),
+        opening,
+    };
+    Ok((committed, message))
+}
+
+/// Verifies a range message against the plan, tree and root and returns the
+/// low/high digits of the stored columns at the message's positions.
+pub fn verify_range_message(
+    range: &RangeCombinationPlan,
+    tree: &RuntimeTreePlan,
+    message: &RangeMessage,
+) -> Result<Vec<(i128, i128)>> {
+    let total = range
+        .planes
+        .checked_mul(range.columns)
+        .and_then(|value| value.checked_add(range.offset))
+        .ok_or(Error::ResourceLimit)?;
+    if message
+        .positions
+        .windows(2)
+        .any(|pair| pair[0] >= pair[1])
+        || message.positions.iter().any(|position| *position >= total)
+    {
+        return Err(Error::InvalidIndex);
+    }
+    let values = verify_packed_opening(
+        &PackedMatrixPlan::new(range.planes * range.columns, 1)?,
+        tree,
+        &message.root,
+        &message.positions,
+        &message.opening,
+    )?;
+    let _ = total;
+    values.into_iter().map(|value| range.split(value)).collect()
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +482,34 @@ mod tests {
         assert!(RangeCombinationPlan::new(1, 0, 20, 0).is_err());
         assert!(RangeCombinationPlan::new(1, 1, 0, 0).is_err());
         assert!(RangeCombinationPlan::new(1, 1, 63, 0).is_err());
+    }
+
+
+    #[test]
+    fn the_range_values_are_combined_split_and_messaged() {
+        let plan = PackedMatrixPlan::new(2, 2).unwrap();
+        let cells = vec![1, 2, 3, 4];
+        let coefficients = vec![2, 1];
+        let values = combination_values(&plan, &cells, &coefficients, 5).unwrap();
+        assert_eq!(values, vec![5 + 2 * 1 + 3, 5 + 2 * 2 + 4]);
+        let range = RangeCombinationPlan::new(2, 2, 4, 0).unwrap();
+        let stored = vec![values[0], values[1], values[1], values[0]];
+        assert!(RangeCombinationPlan::new(2, 2, 4, 0).is_ok());
+        let tree = super::commit_tests::tree();
+        let salts = super::commit_tests::salts();
+        let positions = [0u64, 3];
+        let (_, message) =
+            commit_range_values(&range, &stored, tree.clone(), &salts, &positions).unwrap();
+        let digits = verify_range_message(&range, &tree, &message).unwrap();
+        assert_eq!(digits.len(), 2);
+        assert_eq!(digits[0], range.split(stored[0]).unwrap());
+        assert_eq!(digits[1], range.split(stored[3]).unwrap());
+        let mut changed = message.clone();
+        changed.positions = vec![0, 0];
+        assert!(verify_range_message(&range, &tree, &changed).is_err());
+        let mut negative = cells.clone();
+        negative[0] = -1;
+        assert!(combination_values(&plan, &negative, &coefficients, 0).is_err());
     }
 
     #[test]
