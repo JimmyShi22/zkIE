@@ -315,6 +315,29 @@ fn diagnostic_table(weights: &[i64]) -> Table {
 }
 
 
+/// The number of balanced base-256 limbs the tensor needs: the largest count
+/// any of its values requires. The trace outputs are public verified values,
+/// so both sides derive the same count from the tensor itself.
+fn tensor_limbs(rows: &[Vec<i64>]) -> u32 {
+    rows.iter()
+        .flatten()
+        .map(|value| {
+            zkie_ops::proof::packed_matrix::balanced_limb_count(*value as i128)
+                .expect("the value has a balanced limb count")
+        })
+        .max()
+        .unwrap_or(1)
+}
+
+#[test]
+fn the_tensor_limb_count_covers_every_value() {
+    assert_eq!(tensor_limbs(&[vec![0]]), 1);
+    assert_eq!(tensor_limbs(&[vec![127, -128]]), 1);
+    assert_eq!(tensor_limbs(&[vec![128, -129]]), 2);
+    assert_eq!(tensor_limbs(&[vec![300, -1], vec![-300, 0]]), 2);
+    assert_eq!(tensor_limbs(&[vec![1 << 20]]), 3);
+}
+
 fn activation(activation_rows: &[Vec<i64>], positions: u32) -> CommittedActivation {
     let salts: Vec<Vec<u8>> = (0..positions)
         .map(|position| vec![(position as u8).wrapping_mul(7) ^ 0x3C; SALT])
@@ -838,6 +861,7 @@ fn hidden_plan_for(
     activation: &CommittedActivation,
     table: &Table,
     positions: u32,
+    limbs: u32,
 ) -> HiddenLinPlan {
     let assembled = assemble_proximity(&assembly_input(positions))
         .expect("the trusted assembly finds the production proximity plan");
@@ -929,27 +953,34 @@ fn hidden_plan_for(
     };
     let run_length = HIDDEN as u64 / 8;
     let entries = positions as u64 * (HIDDEN as u64 / run_length);
+    // One read table per balanced byte limb of the activation tensor, each
+    // reducing the same functional over its limb's cells.
+    let mut tables = Vec::with_capacity(limbs as usize);
+    for limb in 0..limbs as u64 {
+        tables.push(ReductionTable {
+            matrix: limb,
+            parts: 1,
+            run_length,
+            rows_per_part: positions as u64,
+            columns: HIDDEN as u64,
+            at: limb * entries,
+            entries,
+            phi: (1..=run_length).map(Fp3::from_u64).collect(),
+            later: false,
+        });
+    }
+    let total = entries * limbs as u64;
     plan.send.member = Some(MemberPlan {
         index_oracle: INDEX_MASK_ORACLE,
         row_bits: MATRIX_ROWS.trailing_zeros(),
         column_bits: COLUMNS.trailing_zeros(),
         pending,
-        tables: vec![ReductionTable {
-            matrix: 0,
-            parts: 1,
-            run_length,
-            rows_per_part: positions as u64,
-            columns: HIDDEN as u64,
-            at: 0,
-            entries,
-            phi: (1..=run_length).map(Fp3::from_u64).collect(),
-            later: false,
-        }],
+        tables,
         tree: RuntimeTreePlan {
             tree_number: 700,
             leaf_class: 4,
-            log_n: entries.trailing_zeros(),
-            log_n_zk: entries.trailing_zeros(),
+            log_n: code.log_n,
+            log_n_zk: code.log_n,
             parts: vec![RuntimeTreePart {
                 main_symbols: E_DEGREE as u64,
                 mask_symbols: 0,
@@ -1022,7 +1053,8 @@ fn real_projection_consumer_closes_in_hidden_input_mode() {
 
     let mut session_table = diagnostic_table(&weights);
     let activation = activation(&activation_rows, positions);
-    let hidden_plan = hidden_plan_for(&activation, &session_table, positions);
+    let limbs = tensor_limbs(&activation_rows);
+    let hidden_plan = hidden_plan_for(&activation, &session_table, positions, limbs);
     hidden_plan
         .proximity
         .fault(&hidden_plan.send, None, None)
