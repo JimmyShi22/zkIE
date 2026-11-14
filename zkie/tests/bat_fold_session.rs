@@ -107,8 +107,8 @@ fn the_fixture_base_final_wiring_passes_but_stays_pending() {
     assert_eq!(run.base.entry_value, run.fold_exit_value);
     assert!(run.base.commit_rounds > run.base.entry_rounds);
     assert!(run.base.rows_rounds > run.base.commit_rounds);
-    assert_eq!(run.base.check_rounds, run.base.rows_rounds);
-    assert_eq!(run.base.check_value, run.base.rows_value);
+    assert_eq!(run.base.state_rounds, run.base.rows_rounds);
+    assert_eq!(run.base.state_value, run.base.rows_value);
     assert_eq!(run.base.base_positions.len(), 2);
     println!(
         "base fold_identity={:?} star_roots=[{:?},{:?}] member_roots={:?} fresh_root={:?} lambda={:?} target_star={:?} positions={:?}",

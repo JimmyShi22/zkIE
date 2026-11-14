@@ -309,10 +309,23 @@ pub fn verify_last_base_proof(
 /// drew. The ledger harness uses them to record the LastBase openings under
 /// the same external keys as the rest of the run.
 pub fn verify_last_base_proof_with_positions(
-    mut session: LastBaseSession,
+    session: LastBaseSession,
     positions_count: usize,
     bytes: &[u8],
 ) -> Result<(Digest, Vec<u64>)> {
+    let (sealed, positions, _chain) =
+        verify_last_base_proof_with_positions_and_chain(session, positions_count, bytes)?;
+    Ok((sealed, positions))
+}
+
+/// The same last-stage BASE check, returning the advanced chain so a caller
+/// that continues the same transcript keeps every absorbed message and
+/// challenge position.
+pub fn verify_last_base_proof_with_positions_and_chain(
+    mut session: LastBaseSession,
+    positions_count: usize,
+    bytes: &[u8],
+) -> Result<(Digest, Vec<u64>, Chain)> {
     let limits = DecodeLimits {
         max_bytes: bytes.len(),
         max_elements: bytes.len(),
@@ -342,7 +355,8 @@ pub fn verify_last_base_proof_with_positions(
     session.verify_openings(&star_opening, &final_opening)?;
     let sealed = session.finish()?;
     reader.finish()?;
-    Ok((sealed, positions))
+    let chain = session.into_chain()?;
+    Ok((sealed, positions, chain))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -594,6 +608,16 @@ impl LastBaseSession {
         self.stage = Stage::Sealed;
         Ok(*self.chain.value())
     }
+
+    /// Returns the advanced chain after a successful finish, so a caller that
+    /// continues the same transcript keeps every absorbed message and
+    /// challenge position. A session that has not finished is refused.
+    pub fn into_chain(self) -> zkie_core::error::Result<Chain> {
+        if self.stage != Stage::Sealed {
+            return Err(zkie_core::error::Error::InvalidSessionState);
+        }
+        Ok(self.chain)
+    }
 }
 
 #[cfg(test)]
@@ -769,6 +793,47 @@ mod tests {
         let fixed = LastBaseRandomness::Fixed(Digest([0x44; 32]));
         assert_eq!(fixed.seed().unwrap(), Digest([0x44; 32]));
         assert!(LastBaseRandomness::Private.seed().is_ok());
+    }
+
+    #[test]
+    fn the_chain_is_handed_back_only_after_the_seal() {
+        let rows = rows();
+        let oracle = final_oracle(&rows);
+        let (prover, final_root) = prover_session(&rows, &oracle, &randomness());
+        let messages = prover.messages().expect("messages");
+        let begin = || Chain::begin(99, &Digest::ZERO, b"last base test", &[], None).unwrap();
+        // An unfinished session is not continuable: the chain is consumed and
+        // an error, not a chain, comes back.
+        let unfinished = LastBaseSession::new(
+            begin(),
+            rows.clone(),
+            oracle.plan.clone(),
+            final_root,
+            prover.plan().clone(),
+        )
+        .unwrap();
+        assert!(unfinished.into_chain().is_err());
+        // A sealed session hands the advanced chain back; it is the same
+        // transcript, past its starting value, and its value is the seal.
+        let start = begin();
+        let start_value = *start.value();
+        let mut session =
+            LastBaseSession::new(start, rows.clone(), oracle.plan.clone(), final_root, prover.plan().clone())
+                .unwrap();
+        session
+            .receive_star(messages.star_root, messages.target_star)
+            .unwrap();
+        let lambda = session.draw_lambda().unwrap();
+        let prepared = prover.base_rows(lambda).unwrap();
+        session.receive_rows(prepared).unwrap();
+        let positions = session.draw_base_positions(2).unwrap();
+        let star_opening = prover.open_star(&positions).unwrap();
+        let final_opening = oracle.tree.open(&positions).unwrap();
+        session.verify_openings(&star_opening, &final_opening).unwrap();
+        let seal = session.finish().unwrap();
+        let advanced = session.into_chain().unwrap();
+        assert_ne!(*advanced.value(), start_value);
+        assert_eq!(*advanced.value(), seal);
     }
 
     #[test]

@@ -2253,8 +2253,8 @@ mod tests {
         assert_eq!(run.base.entry_value, run.fold_exit_value);
         assert!(run.base.commit_rounds > run.base.entry_rounds);
         assert!(run.base.rows_rounds > run.base.commit_rounds);
-        assert_eq!(run.base.check_rounds, run.base.rows_rounds);
-        assert_eq!(run.base.check_value, run.base.rows_value);
+        assert_eq!(run.base.state_rounds, run.base.rows_rounds);
+        assert_eq!(run.base.state_value, run.base.rows_value);
         assert_eq!(run.base.base_positions.len(), FIXTURE_BASE_POSITIONS);
         assert_eq!(run.base.member_roots.len(), 3);
         assert_eq!(run.base.fresh_root, run.fold.start.root);

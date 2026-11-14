@@ -194,9 +194,15 @@ pub struct BaseFinalOutcome {
     pub conditional_local_experiment: bool,
     pub cs_connected: bool,
     pub reference_iopp_path: bool,
+    /// The chain handed back by `finish_with_chain` continues the same
+    /// transcript. A true flag records that this proximity check completed;
+    /// it is not a claim that the first chain ended and it is not a seal.
     pub chain_handoff: bool,
-    pub check_rounds: u64,
-    pub check_value: Digest,
+    /// The chain's current round count and value at the point this proximity
+    /// check completed. They are a check-state summary, not a terminal seal
+    /// and not a substitute for the first chain's seal.
+    pub state_rounds: u64,
+    pub state_value: Digest,
     pub entry_rounds: u64,
     pub entry_value: Digest,
     pub commit_rounds: u64,
@@ -995,6 +1001,14 @@ impl BaseFinalSession {
     }
 
     pub fn finish(self) -> Result<BaseFinalCheck> {
+        Ok(self.finish_with_chain()?.0)
+    }
+
+    /// Finishes the BASE test and returns the advanced chain, so a caller
+    /// that continues the same transcript keeps every absorbed message and
+    /// challenge position. The check value is the current check-state digest,
+    /// not a terminal seal.
+    pub fn finish_with_chain(self) -> Result<(BaseFinalCheck, Chain)> {
         if self.stage != Stage::Openings {
             return Err(Error::InvalidSessionState);
         }
@@ -1002,8 +1016,8 @@ impl BaseFinalSession {
         let opened = self.opened.as_ref().ok_or(Error::InvalidSessionState)?;
         let lambda = self.lambda.ok_or(Error::InvalidSessionState)?;
         let target_star = self.target_star.ok_or(Error::InvalidSessionState)?;
-        let check_rounds = self.chain.rounds();
-        let check_value = *self.chain.value();
+        let state_rounds = self.chain.rounds();
+        let state_value = *self.chain.value();
         // The two-row BASE linear check is extended by the FOLD fresh row. The
         // fresh row's combined message is lambda times the fresh message. This
         // is the same FOLD target identity split into old and fresh components;
@@ -1074,7 +1088,7 @@ impl BaseFinalSession {
             .ok_or(Error::ProverStateMissing)?
             .root;
         if let Some(layer) = rejection {
-            return Ok(BaseFinalCheck::Rejected(BaseFinalRejection {
+            return Ok((BaseFinalCheck::Rejected(BaseFinalRejection {
                 layer,
                 fold_identity: self.expected_identity,
                 star_root,
@@ -1088,9 +1102,9 @@ impl BaseFinalSession {
                 fold_main,
                 fold_mask,
                 fold_fresh,
-            }));
+            }), self.chain));
         }
-        Ok(BaseFinalCheck::Passed(BaseFinalOutcome {
+        Ok((BaseFinalCheck::Passed(BaseFinalOutcome {
             fold_identity: self.expected_identity,
             star_root,
             star_mask_root,
@@ -1117,15 +1131,15 @@ impl BaseFinalSession {
             cs_connected: false,
             reference_iopp_path: false,
             chain_handoff: true,
-            check_rounds,
-            check_value,
+            state_rounds,
+            state_value,
             entry_rounds: self.entry_rounds,
             entry_value: self.entry_value,
             commit_rounds: self.commit_rounds,
             commit_value: self.commit_value,
             rows_rounds: self.rows_rounds,
             rows_value: self.rows_value,
-        }))
+        }), self.chain))
     }
 
     pub fn chain_value(&self) -> &Digest {

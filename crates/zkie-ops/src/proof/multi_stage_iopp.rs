@@ -43,7 +43,7 @@ use zkie_core::common::codec::DecodeLimits;
 
 use crate::proof::base_final_session::{fold_identity, FoldBasis, FoldMember};
 use crate::proof::base_last_session::{
-    encode_last_base_proof, verify_last_base_proof_with_positions, LastBaseProver,
+    encode_last_base_proof, verify_last_base_proof_with_positions, verify_last_base_proof_with_positions_and_chain, LastBaseProver,
     LastBaseRandomness, LastBaseSession,
 };
 use crate::proof::cs_multi_session::{CsMultiProver, CsMultiSession, OldMaskSource};
@@ -700,7 +700,7 @@ pub fn prove_multi_stage_iopp(
     switches: &[IoppSwitchPrivate],
     stage_folds: &[IoppStageFoldPrivate],
     base: &IoppBasePrivate,
-) -> Result<(IoppProof, Digest)> {
+) -> Result<(IoppProof, Digest, Chain)> {
     let switch_count = plan.stages.len() - 1;
     if switches.len() != switch_count || stage_folds.len() != switch_count - 1 {
         return Err(Error::ShapeMismatch);
@@ -838,6 +838,7 @@ pub fn prove_multi_stage_iopp(
             let final_opening = prover.open(&base_positions)?;
             base_session.verify_openings(&star_opening, &final_opening)?;
             let seal = base_session.finish()?;
+            let chain = base_session.into_chain()?;
             let bytes = encode_last_base_proof(
                 &messages,
                 &prepared,
@@ -853,6 +854,7 @@ pub fn prove_multi_stage_iopp(
                     base: bytes,
                 },
                 seal,
+                chain,
             ));
         }
         let fold = stage.fold.as_ref().ok_or(Error::InvalidConfig)?;
@@ -905,7 +907,7 @@ pub fn verify_multi_stage_iopp(
     proof: &IoppProof,
 ) -> Result<Digest> {
     verify_multi_stage_iopp_with_last_positions(chain, plan, stage_zero, proof)
-        .map(|(seal, _)| seal)
+        .map(|(seal, _, _)| seal)
 }
 
 /// Verifies the loop and also returns the last-stage BASE positions. The
@@ -915,7 +917,7 @@ pub fn verify_multi_stage_iopp_with_last_positions(
     plan: &IoppChain,
     stage_zero: IoppVerifyStageZero,
     proof: &IoppProof,
-) -> Result<(Digest, Vec<u64>)> {
+) -> Result<(Digest, Vec<u64>, Chain)> {
     let switch_count = plan.stages.len() - 1;
     if proof.switches.len() != switch_count {
         return Err(Error::StatementMismatch);
@@ -1015,7 +1017,7 @@ pub fn verify_multi_stage_iopp_with_last_positions(
                 declared_root,
                 plan.config.base_star.clone(),
             )?;
-            return verify_last_base_proof_with_positions(
+            return verify_last_base_proof_with_positions_and_chain(
                 base_session,
                 plan.base_positions(),
                 &proof.base,
@@ -2258,7 +2260,7 @@ mod tests {
     fn run_proof() -> (IoppChain, IoppProof, Digest, IoppVerifyStageZero) {
         let plan = IoppChain::derive(&stages(), &config()).unwrap();
         let (zero, verify_zero) = stage_zero();
-        let (proof, seal) = prove_multi_stage_iopp(
+        let (proof, seal, _) = prove_multi_stage_iopp(
             chain(),
             &plan,
             zero,
@@ -2278,6 +2280,33 @@ mod tests {
         assert!(proof.switches[1].stage_fold.is_none());
         let verified = verify_multi_stage_iopp(chain(), &plan, zero, &proof).unwrap();
         assert_eq!(verified, seal);
+    }
+
+    #[test]
+    fn the_staged_tail_hands_the_advanced_chain_back() {
+        let plan = IoppChain::derive(&stages(), &config()).unwrap();
+        let (zero, verify_zero) = stage_zero();
+        let start = chain();
+        let start_value = *start.value();
+        let (proof, seal, proven_chain) = prove_multi_stage_iopp(
+            start,
+            &plan,
+            zero,
+            &switches(&plan),
+            &stage_folds(&plan),
+            &base_private(&plan),
+        )
+        .unwrap();
+        let (verified_seal, _, verified_chain) =
+            verify_multi_stage_iopp_with_last_positions(chain(), &plan, verify_zero, &proof)
+                .unwrap();
+        assert_eq!(verified_seal, seal);
+        // The chain both sides continue is the same transcript: the staged
+        // messages advanced it past its starting value, and the prover's and
+        // verifier's states coincide at the same round count.
+        assert_ne!(*proven_chain.value(), start_value);
+        assert_eq!(*proven_chain.value(), *verified_chain.value());
+        assert_eq!(proven_chain.rounds(), verified_chain.rounds());
     }
 
     #[test]
@@ -2378,7 +2407,7 @@ mod tests {
     fn zero_old_mask_round_trips_without_a_tree() {
         let plan = IoppChain::derive(&stages(), &config()).unwrap();
         let (zero, verify_zero) = zero_mask_stage_zero();
-        let (proof, seal) = prove_multi_stage_iopp(
+        let (proof, seal, _) = prove_multi_stage_iopp(
             chain(),
             &plan,
             zero,

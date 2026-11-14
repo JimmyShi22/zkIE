@@ -2250,6 +2250,7 @@ mod tests {
             request_reads: None,
             request_w: None,
             source_data: None,
+            segment_mask_tree: None,
         };
         let salts: Vec<Vec<u8>> = (0..TOY_POSITIONS)
             .map(|position| vec![(position as u8).wrapping_mul(11) ^ 0x3C; SALT])
