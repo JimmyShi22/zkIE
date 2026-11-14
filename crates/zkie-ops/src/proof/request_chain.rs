@@ -385,6 +385,35 @@ impl ChainMaskPlan {
     }
 }
 
+/// Lands one sub-proof row form on the chain mask table: the hiding entries
+/// live at the table's first entries in order, each counted mask slot maps
+/// through the trusted slot-to-entry list, and kept values keep their own
+/// owners. This is the token kept relation's first landing point; the slot
+/// list is plan data, never a proof byte.
+pub fn chain_mask_row_form(
+    plan: &ChainMaskPlan,
+    form: &crate::proof::row_claim::RowForm,
+    slot_entries: &[usize],
+    kept: &[(u64, u64)],
+) -> Result<zkie_engine::pcs::request::bat::BatRow> {
+    if plan.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let hiding: Vec<u64> = (0..form.hiding.len() as u64).collect();
+    let mut slots = Vec::with_capacity(form.slots.len());
+    for term in &form.slots {
+        let entry = *slot_entries.get(term.slot).ok_or(Error::InvalidIndex)?;
+        slots.push(plan.entry_virtual_index(entry)?);
+    }
+    let binding = crate::proof::segment_slots::RowBinding {
+        mask_member: plan.oracle,
+        hiding_entries: &hiding,
+        slot_entries: &slots,
+        kept,
+    };
+    crate::proof::segment_slots::row_form_row(&binding, form)
+}
+
 /// Verifies one opening of the sub-proof mask table against its root: the plan
 /// must be a tree, and the opening's positions and columns are checked against
 /// the root by the runtime tree. The read ledger and the position list policy
@@ -1307,6 +1336,27 @@ mod chain_mask_tests {
         // The sample form reads the mask table row bits and the mask code
         // message bits.
         assert_eq!(plan.sample_bits().unwrap(), 2 + 4);
+        // A sub-proof row form lands on the table: hiding entries at the first
+        // entries, the counted slot through the plan slot list, the kept value
+        // on its own owner.
+        let form = crate::proof::row_claim::RowForm {
+            constant: Fp3::from_u64(21),
+            hiding: vec![Fp3::from_u64(2)],
+            slots: vec![crate::proof::row_claim::SlotTerm {
+                slot: 0,
+                coefficient: Fp3::from_u64(5),
+            }],
+            kept: vec![(0, Fp3::from_u64(7))],
+        };
+        let row = chain_mask_row_form(&plan, &form, &[1], &[(9, 2)]).unwrap();
+        assert_eq!(row.target, Fp3::from_u64(21));
+        assert_eq!(row.units.len(), 3);
+        assert_eq!(row.units[0].oracle, plan.oracle);
+        assert_eq!(row.units[1].index, plan.entry_virtual_index(1).unwrap());
+        assert_eq!(row.units[2].oracle, 9);
+        assert_eq!(row.units[2].index, 2);
+        // A slot without a trusted entry is refused.
+        assert!(chain_mask_row_form(&plan, &form, &[], &[(9, 2)]).is_err());
         // A committed mask-only tree opening verifies against its root; another
         // root is refused.
         use zkie_engine::pcs::request::runtime_tree::{RuntimePartRows, RuntimeTree};
