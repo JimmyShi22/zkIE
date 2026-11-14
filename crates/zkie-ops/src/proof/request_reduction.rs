@@ -39,6 +39,92 @@ pub fn token_claim(point: &[Fp3], values: &[Fp3]) -> Result<Fp3> {
     Ok(sum)
 }
 
+/// The inner-dimension claim: the equality-weighted product of two maps at an
+/// inner point.
+pub fn inner_claim(point: &[Fp3], left: &[Fp3], right: &[Fp3]) -> Result<Fp3> {
+    if point.len() >= 32
+        || left.len() != (1usize << point.len())
+        || right.len() != left.len()
+    {
+        return Err(Error::InvalidConfig);
+    }
+    let mut sum = Fp3::ZERO;
+    for (index, (left, right)) in left.iter().zip(right).enumerate() {
+        let mut factor = Fp3::ONE;
+        for (bit, coordinate) in point.iter().enumerate() {
+            let chosen = if (index >> bit) & 1 == 1 {
+                *coordinate
+            } else {
+                Fp3::ONE.sub(coordinate)
+            };
+            factor = factor.mul(&chosen);
+        }
+        sum = sum.add(&factor.mul(left).mul(right));
+    }
+    Ok(sum)
+}
+
+/// The inner sumcheck's variables: one equality weight per inner bit, in bit
+/// order.
+pub fn inner_variables(point: &[Fp3]) -> Result<Vec<Weight>> {
+    if point.is_empty() || point.len() >= 32 {
+        return Err(Error::InvalidConfig);
+    }
+    point
+        .iter()
+        .map(|coordinate| Weight::equality(*coordinate, 3))
+        .collect()
+}
+
+/// Proves the inner-dimension claim over the two maps.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_inner(
+    point: &[Fp3],
+    left: &[Fp3],
+    right: &[Fp3],
+    claim_masks: &[MaskTerm],
+    mask_value: &dyn Fn(usize) -> Result<Fp3>,
+    shown: Fp3,
+    masks: &GeneralMaskEntries,
+    challenges: &mut dyn GeneralChallenges,
+) -> Result<(GeneralProof, GeneralOutput)> {
+    let variables = inner_variables(point)?;
+    let mut inner = crate::proof::psc_general::WeightedProductInner::new(left, right, point)?;
+    prove_general(
+        &variables,
+        claim_masks,
+        mask_value,
+        shown,
+        &Summand::Product,
+        None,
+        &mut inner,
+        masks,
+        challenges,
+    )
+}
+
+/// Verifies the inner-dimension claim and returns its output claim.
+pub fn verify_inner(
+    point: &[Fp3],
+    claim_masks: &[MaskTerm],
+    shown: Fp3,
+    proof: &GeneralProof,
+    hiding_entries: usize,
+    challenges: &mut dyn GeneralChallenges,
+) -> Result<GeneralOutput> {
+    let variables = inner_variables(point)?;
+    verify_general(
+        &variables,
+        claim_masks,
+        shown,
+        &Summand::Product,
+        None,
+        proof,
+        hiding_entries,
+        challenges,
+    )
+}
+
 /// The token sumcheck's variables: one equality weight per token bit, in bit
 /// order.
 pub fn token_variables(point: &[Fp3]) -> Result<Vec<Weight>> {
@@ -217,6 +303,71 @@ mod tests {
         )
         .unwrap();
         assert_ne!(tampered, verified);
+    }
+
+    #[test]
+    fn the_inner_claim_is_the_equality_weighted_product() {
+        let point = [fp(2), fp(3)];
+        let left = [fp(1), fp(2), fp(3), fp(4)];
+        let right = [fp(5), fp(6), fp(7), fp(8)];
+        let mut expected = Fp3::ZERO;
+        for index in 0..4 {
+            expected = expected.add(
+                &eq_factor(point[0], index as u64 & 1)
+                    .mul(&eq_factor(point[1], (index as u64 >> 1) & 1))
+                    .mul(&left[index])
+                    .mul(&right[index]),
+            );
+        }
+        assert_eq!(inner_claim(&point, &left, &right).unwrap(), expected);
+        assert!(inner_claim(&point, &left, &right[..3]).is_err());
+        let claim = expected;
+        let variables = inner_variables(&point).unwrap();
+        let hiding_count =
+            crate::proof::psc::hp_entries(&crate::proof::psc_general::general_variables(
+                &variables,
+                &Summand::Product,
+            )
+            .unwrap())
+            .unwrap();
+        let masks = GeneralMaskEntries {
+            hiding: (0..hiding_count).map(|index| fp(850 + index as u64)).collect(),
+            shown: vec![fp(940), fp(941)],
+        };
+        let (proof, proven) = prove_inner(
+            &point,
+            &left,
+            &right,
+            &[],
+            &|_| Ok(Fp3::ZERO),
+            claim,
+            &masks,
+            &mut Source(31),
+        )
+        .unwrap();
+        let verified = verify_inner(
+            &point,
+            &[],
+            claim,
+            &proof,
+            masks.hiding.len(),
+            &mut Source(31),
+        )
+        .unwrap();
+        assert_eq!(proven, verified);
+        assert_eq!(proven.ends.len(), 2);
+        // A pair whose product sum does not match the claim is refused.
+        assert!(prove_inner(
+            &point,
+            &left,
+            &[fp(9), fp(8), fp(7), fp(6)],
+            &[],
+            &|_| Ok(Fp3::ZERO),
+            claim,
+            &masks,
+            &mut Source(31),
+        )
+        .is_err());
     }
 
     #[test]
