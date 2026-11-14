@@ -1,0 +1,163 @@
+commit 2fed9e65f860a0fd584ffe173dee7b95473f9bd8
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Sat Nov 14 09:54:58 2026 +0800
+
+    Map the opened lists to every encoded object
+    
+    The trusted planner now derives the positions each encoded object
+    accumulates over the whole stage list: the folded message and a split Omega
+    are opened by the shared test alone, Omega is also opened by every request's
+    test, and a request's own objects are opened by its tests alone; main and mask
+    objects keep separate counts. Each object's spent count is its opened list and
+    its remaining capacity is the tail minus that list; the first object that does
+    not fit is named with its gap, and no object's list is checked against
+    another's count.
+    
+    This is the position-capacity mapping; the table, range and link hiding
+    conditions and the whole-chain round budget remain the next steps.
+
+diff --git a/crates/zkie-ops/src/proof/proximity_planner.rs b/crates/zkie-ops/src/proof/proximity_planner.rs
+index fb19410a..815675d1 100644
+--- a/crates/zkie-ops/src/proof/proximity_planner.rs
++++ b/crates/zkie-ops/src/proof/proximity_planner.rs
+@@ -1196,6 +1196,93 @@ pub fn ood_pads_fit(entries: u64, rows: u64, ell: u64, answers: u32) -> bool {
+     }
+ }
+ 
++/// The opened position counts of one stage: the shared group opens `shared`
++/// positions and every request opens `own`.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct StagePositions {
++    pub shared: u64,
++    pub own: u64,
++}
++
++/// The positions each encoded object accumulates over the whole stage list.
++/// The folded message and, in a split shared group, Omega are opened by the
++/// shared test alone; Omega is also opened by every request's test; a
++/// request's own objects (W, the index mask and the shown map) are opened by
++/// the request's tests alone. Main and mask objects keep separate counts.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct OpenedLists {
++    pub folded_main: u64,
++    pub folded_mask: u64,
++    pub omega_main: u64,
++    pub omega_mask: u64,
++    pub own_main: u64,
++    pub own_mask: u64,
++}
++
++/// Sums the opened lists of the stage list. `requests` is the public batch
++/// size; a single request has one.
++pub fn opened_lists(
++    stages: &[StagePositions],
++    requests: u64,
++    split: bool,
++) -> Result<OpenedLists> {
++    if stages.is_empty() || requests == 0 {
++        return Err(Error::InvalidConfig);
++    }
++    let mut shared_total = 0u64;
++    let mut own_total = 0u64;
++    for stage in stages {
++        shared_total = shared_total
++            .checked_add(stage.shared)
++            .ok_or(Error::ResourceLimit)?;
++        own_total = own_total
++            .checked_add(stage.own)
++            .ok_or(Error::ResourceLimit)?;
++    }
++    let request_total = requests
++        .checked_mul(own_total)
++        .ok_or(Error::ResourceLimit)?;
++    let omega = shared_total
++        .checked_add(request_total)
++        .ok_or(Error::ResourceLimit)?;
++    Ok(OpenedLists {
++        folded_main: shared_total,
++        folded_mask: shared_total,
++        omega_main: if split { shared_total } else { omega },
++        omega_mask: if split { shared_total } else { omega },
++        own_main: own_total,
++        own_mask: own_total,
++    })
++}
++
++/// Checks the opened lists against each object's position account, one
++/// object per main and mask row set. Every affected object is checked; the
++/// first that does not fit is named with its gap.
++pub fn opened_capacity(
++    opened: &OpenedLists,
++    folded: HidingAccount,
++    omega: HidingAccount,
++    own: HidingAccount,
++) -> std::result::Result<(), String> {
++    let checks = [
++        ("folded main", folded, opened.folded_main),
++        ("folded mask", folded, opened.folded_mask),
++        ("Omega main", omega, opened.omega_main),
++        ("Omega mask", omega, opened.omega_mask),
++        ("request main", own, opened.own_main),
++        ("request mask", own, opened.own_mask),
++    ];
++    for (name, account, list) in checks {
++        if !account.covers(list) {
++            return Err(format!(
++                "{name}: the opened list of {list} positions exceeds the remaining capacity {}",
++                account.remaining()
++            ));
++        }
++    }
++    Ok(())
++}
++
+ fn ceil_log2(value: u64) -> u32 {
+     if value <= 1 {
+         return 0;
+@@ -1766,3 +1853,46 @@ mod hiding_account_tests {
+         assert!(ood_pads_fit(10, 1, 16, 1));
+     }
+ }
++
++#[cfg(test)]
++mod opened_list_tests {
++    use super::*;
++
++    #[test]
++    fn opened_lists_split_by_object() {
++        let stages = [
++            StagePositions { shared: 11, own: 7 },
++            StagePositions { shared: 5, own: 3 },
++        ];
++        let opened = opened_lists(&stages, 1, false).unwrap();
++        assert_eq!(opened.folded_main, 16);
++        assert_eq!(opened.omega_main, 26);
++        assert_eq!(opened.own_main, 10);
++        let split = opened_lists(&stages, 2, true).unwrap();
++        assert_eq!(split.folded_main, 16);
++        assert_eq!(split.omega_main, 16);
++        assert_eq!(split.own_main, 10);
++        assert!(opened_lists(&[], 1, false).is_err());
++        assert!(opened_lists(&stages, 0, false).is_err());
++    }
++
++    #[test]
++    fn opened_capacity_names_the_failing_object() {
++        let stages = [StagePositions { shared: 11, own: 7 }];
++        let opened = opened_lists(&stages, 1, false).unwrap();
++        let folded = HidingAccount { tail: 20, spent: 0 };
++        let omega = HidingAccount { tail: 17, spent: 0 };
++        let own = HidingAccount { tail: 7, spent: 0 };
++        // Omega needs 18 and has 17: named, with the gap.
++        let error = opened_capacity(&opened, folded, omega, own).unwrap_err();
++        assert!(error.contains("Omega"));
++        assert!(error.contains("18"));
++        // With enough tail everywhere the lists fit.
++        let omega = HidingAccount { tail: 18, spent: 0 };
++        assert!(opened_capacity(&opened, folded, omega, own).is_ok());
++        // The request object is checked on its own list, not Omega's.
++        let own = HidingAccount { tail: 6, spent: 0 };
++        let error = opened_capacity(&opened, folded, omega, own).unwrap_err();
++        assert!(error.contains("request"));
++    }
++}
