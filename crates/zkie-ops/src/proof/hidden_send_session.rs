@@ -14138,7 +14138,6 @@ const NORM_LOOKUP_BITS_ANSWER_TAG: u64 = 92;
 const NORM_LOOKUP_MASK_ANSWER_TAG: u64 = 93;
 const NORM_LOOKUP_BITS_POSITION_TAG: u64 = 94;
 const NORM_LOOKUP_MASK_POSITION_TAG: u64 = 95;
-const NORM_LOOKUP_SEED_TAG: u64 = 96;
 const NORM_RSTD_BITS_ROOT_TAG: u64 = 97;
 const NORM_RSTD_MASK_ROOT_TAG: u64 = 98;
 const NORM_RSTD_BITS_SEED_TAG: u64 = 99;
@@ -14147,7 +14146,6 @@ const NORM_RSTD_BITS_ANSWER_TAG: u64 = 101;
 const NORM_RSTD_MASK_ANSWER_TAG: u64 = 102;
 const NORM_RSTD_BITS_POSITION_TAG: u64 = 103;
 const NORM_RSTD_MASK_POSITION_TAG: u64 = 104;
-const NORM_RSTD_SEED_TAG: u64 = 105;
 const NORM_PARAM_GAIN_POSITION_TAG: u64 = 106;
 const NORM_PARAM_BIAS_POSITION_TAG: u64 = 107;
 const NORM_PARAM_GAIN_ROOT_TAG: u64 = 108;
@@ -14618,17 +14616,6 @@ fn draw_lookup_mask_positions(
 }
 
 /// Draws the lookup sub-transcript seed after the first message is fixed.
-fn draw_lookup_seed(chain: &mut Chain, tag: u64) -> Result<u64> {
-    let mut message = chain.message();
-    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
-    message.push_u64(tag);
-    let prefix = message.prefix(KIND_SEED, 0)?;
-    if !chain.step(&prefix, 0)? {
-        return Err(Error::InvalidProof);
-    }
-    Ok(chain.draw_f()?.as_canonical_u64())
-}
-
 fn norm_mask_answer(
     plan: &NormMaskPlan,
     rows: &[Vec<Fp3>],
@@ -16301,17 +16288,6 @@ fn norm_param_claim_rows(
     Ok(NormParamClaimRows { record, column })
 }
 
-fn draw_rstd_seed(chain: &mut Chain) -> Result<u64> {
-    let mut message = chain.message();
-    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
-    message.push_u64(NORM_RSTD_SEED_TAG);
-    let prefix = message.prefix(KIND_SEED, 0)?;
-    if !chain.step(&prefix, 0)? {
-        return Err(Error::InvalidProof);
-    }
-    Ok(chain.draw_f()?.as_canonical_u64())
-}
-
 /// Checks the trusted table view against the plan and the public first-row
 /// padding pair. The all-zero point evaluates each column at row zero.
 fn check_rstd_table_view(
@@ -16503,7 +16479,6 @@ fn prove_norm_second(
             {
                 return Err(Error::StatementMismatch);
             }
-            let seed = draw_lookup_seed(chain, NORM_LOOKUP_SEED_TAG)?;
             let tail_rows: &[Vec<Vec<Fp3>>] = witness
                 .output
                 .as_ref()
@@ -16526,7 +16501,7 @@ fn prove_norm_second(
                 },
                 messages,
                 &crate::proof::lookup::ByteTable,
-                seed,
+                chain,
             )?;
             Some(NormLookupSecond { proof, claims })
         }
@@ -16548,7 +16523,6 @@ fn prove_norm_second(
                 return Err(Error::StatementMismatch);
             }
             check_rstd_table_view(rstd_plan, table)?;
-            let seed = draw_rstd_seed(chain)?;
             let (proof, claims) = crate::proof::lookup::prove_lookup_with_messages(
                 &rstd_plan.lookup,
                 &rstd_plan.commit,
@@ -16559,7 +16533,7 @@ fn prove_norm_second(
                 },
                 messages,
                 table,
-                seed,
+                chain,
             )?;
             Some(NormLookupSecond { proof, claims })
         }
@@ -16833,7 +16807,6 @@ fn verify_norm_second(
                     .ok_or(Error::ShapeMismatch)?,
                 mask: first_lookup.mask.root,
             };
-            let seed = draw_lookup_seed(chain, NORM_LOOKUP_SEED_TAG)?;
             let claims = crate::proof::lookup::verify_lookup(
                 &lookup_plan.lookup,
                 &lookup_plan.commit,
@@ -16841,7 +16814,7 @@ fn verify_norm_second(
                 &roots,
                 &lookup.proof,
                 &crate::proof::lookup::ByteTable,
-                seed,
+                chain,
             )?;
             if claims != lookup.claims {
                 return Err(Error::InvalidProof);
@@ -16868,7 +16841,6 @@ fn verify_norm_second(
                 mask: first_rstd.mask.root,
             };
             check_rstd_table_view(rstd_plan, table)?;
-            let seed = draw_rstd_seed(chain)?;
             let claims = crate::proof::lookup::verify_lookup(
                 &rstd_plan.lookup,
                 &rstd_plan.commit,
@@ -16876,7 +16848,7 @@ fn verify_norm_second(
                 &roots,
                 &rstd.proof,
                 table,
-                seed,
+                chain,
             )?;
             if claims != rstd.claims {
                 return Err(Error::InvalidProof);
@@ -32488,7 +32460,14 @@ mod merged_tests {
             &mut source,
         )
         .unwrap();
-        let seed = 23u64;
+        let mut prover_chain = zkie_engine::pcs::request::chain::Chain::begin(
+            zkie_engine::pcs::request::chain::KIND_SEED as u64,
+            &zkie_core::types::Digest::ZERO,
+            &[],
+            &zkie_core::types::Digest::ZERO.0,
+            None,
+        )
+        .unwrap();
         let proved = prove_lookup_with_key_values(
             &lookup_plan.lookup,
             &lookup_plan.commit,
@@ -32497,7 +32476,7 @@ mod merged_tests {
             &LookupWitness { bits },
             &messages,
             &ByteTable,
-            seed,
+            &mut prover_chain,
         );
         match proved {
             Err(_) => {}
@@ -32506,6 +32485,14 @@ mod merged_tests {
                     bits: messages.bits_root(),
                     mask: messages.mask_root,
                 };
+                let mut verifier_chain = zkie_engine::pcs::request::chain::Chain::begin(
+                    zkie_engine::pcs::request::chain::KIND_SEED as u64,
+                    &zkie_core::types::Digest::ZERO,
+                    &[],
+                    &zkie_core::types::Digest::ZERO.0,
+                    None,
+                )
+                .unwrap();
                 assert!(
                     verify_lookup(
                         &lookup_plan.lookup,
@@ -32514,7 +32501,7 @@ mod merged_tests {
                         &roots,
                         &proof,
                         &ByteTable,
-                        seed,
+                        &mut verifier_chain,
                     )
                     .is_err(),
                     "a non-byte slack key must not pass the byte lookup"
