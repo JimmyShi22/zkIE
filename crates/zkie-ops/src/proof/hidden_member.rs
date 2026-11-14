@@ -536,6 +536,11 @@ impl ReductionWitnessPlan {
         &self.tables
     }
 
+    /// The total number of entries of all tables.
+    pub fn total_entries(&self) -> u64 {
+        self.next_at
+    }
+
     pub fn root(&self) -> Option<Digest> {
         self.root
     }

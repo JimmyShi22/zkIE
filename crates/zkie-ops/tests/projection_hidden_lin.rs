@@ -284,6 +284,7 @@ fn plan(activation: &CommittedActivation, table: &Table) -> HiddenLinPlan {
         dot: None,
         expected_dot_root: None,
         expected_roots: None,
+        member: None,
     };
     HiddenLinPlan {
         norm: None,

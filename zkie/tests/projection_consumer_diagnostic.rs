@@ -31,7 +31,10 @@ use zkie_ops::proof::hidden_send_session::{
     prove_hidden_lin, prove_hidden_lin_hidden, verify_hidden_lin, verify_hidden_lin_hidden,
     ActivationShape, CommittedActivation, DotMapPlan, HiddenLinPlan, HiddenOutputShape,
     HiddenProximityPlan, HiddenSendPlan, HiddenTableProver, IndexMaskPlan, IoppStagePlan,
-    MaskEntryAllocation, WShape,
+    MaskEntryAllocation, MemberPlan, WShape,
+};
+use zkie_ops::proof::hidden_member::{
+    stretch_weights, MaskTerm, PendingRow, ReductionTable,
 };
 use zkie_ops::proof::proximity_planner::{
     assemble_proximity, AssemblyInput, AssemblyMember, AssemblyOwnObject, SolvedStage,
@@ -506,6 +509,7 @@ fn plan_for(
             dot: None,
             expected_dot_root: None,
             expected_roots: None,
+            member: None,
         },
         output: HiddenOutputShape {
             positions,
@@ -718,6 +722,7 @@ fn hidden_plan_for(
             dot: None,
             expected_dot_root: None,
             expected_roots: None,
+            member: None,
         },
         output: HiddenOutputShape {
             positions,
@@ -752,6 +757,56 @@ fn hidden_plan_for(
     };
     plan.send.index_mask = Some(index_mask_plan(positions, mask_code));
     plan.send.dot = Some(dot_plan(positions, code));
+    // The consumer's pending claim and reduced witness. The claim's weights are
+    // the first position's activation row over the matrix rows; the tables cut
+    // each row into eight runs of the columns. The pending claim is not yet
+    // consumed by the second chain; this run binds the witness root into the
+    // first message and the session encoding.
+    let row = activation
+        .weights(0, MATRIX_ROWS)
+        .expect("activation row");
+    let pending = PendingRow {
+        weights: stretch_weights(MATRIX_ROWS.trailing_zeros(), 0, &row).expect("weights"),
+        psi: vec![Fp3::from_u64(3); COLUMNS.trailing_zeros() as usize],
+        target: Fp3::from_u64(7),
+        masks: vec![MaskTerm {
+            oracle: INDEX_MASK_ORACLE,
+            slot: 0,
+            coeff: Fp3::from_u64(5),
+        }],
+    };
+    let run_length = COLUMNS / 8;
+    let entries = MATRIX_ROWS * (COLUMNS / run_length);
+    plan.send.member = Some(MemberPlan {
+        index_oracle: INDEX_MASK_ORACLE,
+        row_bits: MATRIX_ROWS.trailing_zeros(),
+        column_bits: COLUMNS.trailing_zeros(),
+        pending,
+        tables: vec![ReductionTable {
+            matrix: 0,
+            parts: 1,
+            run_length,
+            rows_per_part: MATRIX_ROWS,
+            columns: COLUMNS,
+            at: 0,
+            entries,
+            phi: (1..=run_length).map(Fp3::from_u64).collect(),
+            later: false,
+        }],
+        tree: RuntimeTreePlan {
+            tree_number: 700,
+            leaf_class: 4,
+            log_n: entries.trailing_zeros(),
+            log_n_zk: entries.trailing_zeros(),
+            parts: vec![RuntimeTreePart {
+                main_symbols: E_DEGREE as u64,
+                mask_symbols: 0,
+            }],
+            salt_bytes: SALT,
+            run: Digest([0x71; 32]),
+            configuration: Digest([0x72; 32]),
+        },
+    });
     plan
 }
 
@@ -848,6 +903,30 @@ fn real_projection_consumer_closes_in_hidden_input_mode() {
     let outcome = verify_hidden_lin_hidden(&verifier_plan, session_table.reader(), &messages)
         .expect("hidden verify");
     assert!(!outcome.eval_rows.is_empty());
+
+    // The reduced-witness root is a first-message commitment: a changed root, a
+    // missing root or a different witness tree in the plan is rejected.
+    let mut tampered_root = messages.clone();
+    if let Some(root) = tampered_root.first.reduction_root.as_mut() {
+        root.0[0] ^= 1;
+    } else {
+        panic!("the assembled plan carries the reduced witness");
+    }
+    assert!(
+        verify_hidden_lin_hidden(&verifier_plan, session_table.reader(), &tampered_root).is_err()
+    );
+    let mut missing_root = messages.clone();
+    missing_root.first.reduction_root = None;
+    assert!(
+        verify_hidden_lin_hidden(&verifier_plan, session_table.reader(), &missing_root).is_err()
+    );
+    let mut changed_tree = verifier_plan.clone();
+    if let Some(member) = changed_tree.send.member.as_mut() {
+        member.tree.tree_number += 1;
+    }
+    assert!(
+        verify_hidden_lin_hidden(&changed_tree, session_table.reader(), &messages).is_err()
+    );
 
     // The session slot after the trusted table: the canonical session
     // encoding enters the verification package as session.bin, and the

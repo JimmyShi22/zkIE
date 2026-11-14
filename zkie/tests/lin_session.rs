@@ -977,6 +977,7 @@ fn selected_gpt2_output_head_request_session() {
             }),
             expected_dot_root: None,
             expected_roots: None,
+            member: None,
         },
         proximity,
         index_mask: Some(index_mask),
