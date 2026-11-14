@@ -1,0 +1,306 @@
+commit 651a8d56fe6b652a0b155b607eaf5b5a96e03511
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Sat Nov 14 12:25:11 2026 +0800
+
+    Prove the weight-claim merge over the column cube
+    
+    The merge draws the batch challenge first, folds its powers into the claims' shown values and mask slots, sums the batched map over the matrix's column cube with the one-map sumcheck, masks the end value with the sumcheck's last challenge, and derives the claims' row coefficients and the accumulated row weights from the verified point. The verifier rebuilds the target and the mask terms from the shown values, checks the sumcheck and derives the same rows and weights. A focused test proves and verifies the merge and shows that a changed round leaves another output claim.
+    
+    This is partial progress: the session transcript, the leftover claim's chain check and the source-layer reads are the next step.
+
+diff --git a/crates/zkie-ops/src/proof/request_weights.rs b/crates/zkie-ops/src/proof/request_weights.rs
+index f6fa4835..69b0662e 100644
+--- a/crates/zkie-ops/src/proof/request_weights.rs
++++ b/crates/zkie-ops/src/proof/request_weights.rs
+@@ -398,6 +398,150 @@ impl WeightLayout {
+     }
+ }
+ 
++/// One claim's value at the merge: the scalar the sub-proof has already shown,
++/// the index-mask slot that hides it and the factor of that slot's mask entry.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct MergeValue {
++    pub shown: Fp3,
++    pub mask_slot: usize,
++    pub mask_factor: Fp3,
++}
++
++/// What one merge produced: the masked sumcheck's proof, its output claim, the
++/// claims' row coefficients and the accumulated row weights.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct MergeOutcome {
++    pub proof: crate::proof::psc_general::GeneralProof,
++    pub output: crate::proof::psc_general::GeneralOutput,
++    pub rows: Vec<RowClaim>,
++    pub gamma: Vec<Fp3>,
++}
++
++fn batch_powers(theta: Fp3, count: usize) -> Result<Vec<Fp3>> {
++    let mut powers = Vec::with_capacity(count);
++    let mut value = Fp3::ONE;
++    for _ in 0..count {
++        powers.push(value);
++        value = value.mul(&theta);
++    }
++    Ok(powers)
++}
++
++fn merge_targets(
++    values: &[MergeValue],
++    rho: &[Fp3],
++) -> Result<(Fp3, Vec<crate::proof::psc_general::MaskTerm>)> {
++    if values.is_empty() || values.len() != rho.len() {
++        return Err(Error::InvalidConfig);
++    }
++    let mut target = Fp3::ZERO;
++    let mut masks = Vec::with_capacity(values.len());
++    for (value, rho) in values.iter().zip(rho) {
++        target = target.add(&rho.mul(&value.shown));
++        masks.push(crate::proof::psc_general::MaskTerm {
++            slot: value.mask_slot,
++            coefficient: rho.mul(&value.mask_factor),
++        });
++    }
++    Ok((target, masks))
++}
++
++/// Proves the merge of the weight claims. The batch challenge is drawn first;
++/// its powers batch the claims' shown values into the sumcheck's target and
++/// fold the claims' mask slots. The batched map is summed over the matrix's
++/// column cube, its end value is masked by the sumcheck's last challenge, and
++/// the claims' row coefficients and the accumulated row weights follow from
++/// the sumcheck's point.
++#[allow(clippy::too_many_arguments)]
++pub fn prove_merge(
++    layout: &WeightLayout,
++    claims: &[WeightClaim],
++    claim_maps: &[Vec<Fp3>],
++    values: &[MergeValue],
++    mask_value: &dyn Fn(usize) -> Result<Fp3>,
++    masks: &crate::proof::psc_general::GeneralMaskEntries,
++    challenges: &mut dyn crate::proof::psc_general::GeneralChallenges,
++) -> Result<MergeOutcome> {
++    if claims.is_empty()
++        || claims.len() != claim_maps.len()
++        || claims.len() != values.len()
++        || values.len() > 4096
++    {
++        return Err(Error::InvalidConfig);
++    }
++    let cube = 1usize << layout.lk;
++    if claim_maps.iter().any(|map| map.len() != cube) {
++        return Err(Error::ShapeMismatch);
++    }
++    let theta = challenges.draw()?;
++    let rho = batch_powers(theta, claims.len())?;
++    let (target, claim_masks) = merge_targets(values, &rho)?;
++    let mut map = vec![Fp3::ZERO; cube];
++    for (claim_map, rho) in claim_maps.iter().zip(&rho) {
++        for (slot, value) in map.iter_mut().zip(claim_map) {
++            *slot = slot.add(&rho.mul(value));
++        }
++    }
++    let variables = (0..layout.lk)
++        .map(|_| crate::proof::psc::Weight::plain(2))
++        .collect::<Result<Vec<_>>>()?;
++    let mut inner = crate::proof::psc_general::MapInner::new(&map)?;
++    let (proof, output) = crate::proof::psc_general::prove_general(
++        &variables,
++        &claim_masks,
++        mask_value,
++        target,
++        &crate::proof::psc_general::Summand::Map,
++        None,
++        &mut inner,
++        masks,
++        challenges,
++    )?;
++    let (rows, gamma) = layout.merge_claims(claims, &rho, &output.point)?;
++    Ok(MergeOutcome {
++        proof,
++        output,
++        rows,
++        gamma,
++    })
++}
++
++/// Verifies one merge. The verifier draws the same batch challenge, rebuilds
++/// the target and the claim's mask terms from the shown values, and checks the
++/// sumcheck's messages; the row coefficients and row weights follow from the
++/// verified point.
++#[allow(clippy::too_many_arguments)]
++pub fn verify_merge(
++    layout: &WeightLayout,
++    claims: &[WeightClaim],
++    values: &[MergeValue],
++    proof: &crate::proof::psc_general::GeneralProof,
++    hiding_entries: usize,
++    challenges: &mut dyn crate::proof::psc_general::GeneralChallenges,
++) -> Result<(crate::proof::psc_general::GeneralOutput, Vec<RowClaim>, Vec<Fp3>)> {
++    if claims.is_empty() || claims.len() != values.len() || values.len() > 4096 {
++        return Err(Error::InvalidConfig);
++    }
++    let theta = challenges.draw()?;
++    let rho = batch_powers(theta, claims.len())?;
++    let (target, claim_masks) = merge_targets(values, &rho)?;
++    let variables = (0..layout.lk)
++        .map(|_| crate::proof::psc::Weight::plain(2))
++        .collect::<Result<Vec<_>>>()?;
++    let output = crate::proof::psc_general::verify_general(
++        &variables,
++        &claim_masks,
++        target,
++        &crate::proof::psc_general::Summand::Map,
++        None,
++        proof,
++        hiding_entries,
++        challenges,
++    )?;
++    let (rows, gamma) = layout.merge_claims(claims, &rho, &output.point)?;
++    Ok((output, rows, gamma))
++}
++
+ /// One claim about a unit's weights: a sum over the unit's rows with a
+ /// product of factors, one per index group.
+ #[derive(Clone, Debug, PartialEq, Eq)]
+@@ -747,6 +891,140 @@ mod tests {
+             .is_err());
+     }
+ 
++    struct BatchSource(u64);
++
++    impl crate::proof::psc_general::GeneralChallenges for BatchSource {
++        fn draw(&mut self) -> Result<Fp3> {
++            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
++            Ok(Fp3::from_u64(self.0))
++        }
++        fn draw_nonzero(&mut self) -> Result<Fp3> {
++            for _ in 0..64 {
++                let value = self.draw()?;
++                if value != Fp3::ZERO {
++                    return Ok(value);
++                }
++            }
++            Err(Error::EntropyUnavailable)
++        }
++        fn send_hiding_sum(&mut self, _value: Fp3) -> Result<()> {
++            Ok(())
++        }
++        fn send_round(&mut self, _index: usize, _round: &crate::proof::psc::PscRound) -> Result<()> {
++            Ok(())
++        }
++        fn send_end_values(&mut self, _values: &[Fp3]) -> Result<()> {
++            Ok(())
++        }
++    }
++
++    #[test]
++    fn the_merge_proves_its_sumcheck_and_derives_the_row_weights() {
++        let mut layout = WeightLayout::new(2).unwrap();
++        layout
++            .add(0, 0, 1, vec![WeightGroup::e("x", 4, false).unwrap()])
++            .unwrap();
++        let claims = vec![
++            WeightClaim {
++                unit: 0,
++                factors: vec![ClaimFactor::e(vec![fp(2)], vec![fp(3), fp(5)])],
++            },
++            WeightClaim {
++                unit: 0,
++                factors: vec![ClaimFactor::e(vec![fp(7)], vec![fp(11), fp(13)])],
++            },
++        ];
++        // The maps sum to the claims' hidden values.
++        let maps = vec![
++            vec![fp(1), fp(2), fp(3), fp(4)],
++            vec![fp(4), fp(6), fp(4), fp(6)],
++        ];
++        let values = vec![
++            MergeValue {
++                shown: fp(10),
++                mask_slot: 0,
++                mask_factor: fp(1),
++            },
++            MergeValue {
++                shown: fp(20),
++                mask_slot: 1,
++                mask_factor: fp(1),
++            },
++        ];
++        let variables = [
++            crate::proof::psc::Weight::plain(2).unwrap(),
++            crate::proof::psc::Weight::plain(2).unwrap(),
++        ];
++        let hiding_entries = crate::proof::psc_general::general_masks(
++            &crate::proof::psc_general::Summand::Map,
++            &variables,
++        )
++        .unwrap();
++        let hiding_count =
++            crate::proof::psc::hp_entries(&crate::proof::psc_general::general_variables(
++                &variables,
++                &crate::proof::psc_general::Summand::Map,
++            )
++            .unwrap())
++            .unwrap();
++        assert_eq!(hiding_entries, hiding_count + 1);
++        let masks = crate::proof::psc_general::GeneralMaskEntries {
++            hiding: (0..hiding_count).map(|index| fp(900 + index as u64)).collect(),
++            shown: vec![fp(999)],
++        };
++        // The claims' mask entries are zero: their hidden values are the shown
++        // ones, so the batched map sums to the target.
++        let mask_value = |_slot: usize| Ok(Fp3::ZERO);
++        let outcome = prove_merge(
++            &layout,
++            &claims,
++            &maps,
++            &values,
++            &mask_value,
++            &masks,
++            &mut BatchSource(19),
++        )
++        .unwrap();
++        assert_eq!(outcome.output.point.len(), 2);
++        let (output, rows, gamma) = verify_merge(
++            &layout,
++            &claims,
++            &values,
++            &outcome.proof,
++            masks.hiding.len(),
++            &mut BatchSource(19),
++        )
++        .unwrap();
++        assert_eq!(output, outcome.output);
++        assert_eq!(rows, outcome.rows);
++        assert_eq!(gamma, outcome.gamma);
++        // The claim maps must fill the column cube.
++        assert!(prove_merge(
++            &layout,
++            &claims,
++            &[vec![fp(1)], vec![fp(2)]],
++            &values,
++            &mask_value,
++            &masks,
++            &mut BatchSource(19),
++        )
++        .is_err());
++        // A changed round leaves another output claim.
++        let mut changed = outcome.proof.clone();
++        changed.rounds[0].coefficients[0] =
++            changed.rounds[0].coefficients[0].add(&Fp3::ONE);
++        let tampered = verify_merge(
++            &layout,
++            &claims,
++            &values,
++            &changed,
++            masks.hiding.len(),
++            &mut BatchSource(19),
++        )
++        .unwrap();
++        assert_ne!(tampered.0, outcome.output);
++    }
++
+     #[test]
+     fn claim_shapes_are_checked_against_the_groups() {
+         let layout = layout();
