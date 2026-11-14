@@ -136,6 +136,32 @@ impl SegmentSlots {
     }
 }
 
+/// One settled segment relation bound to the committed member that owns the
+/// mask rows: the masked equation `constant + sum maskCoef[j]*mask[j] = 0`
+/// becomes a row whose units carry the member's mask entries and whose target
+/// is the negated constant. The entries are the owner layout's virtual indices,
+/// one per mask slot; the caller fixes the owner and the mapping as trusted
+/// plan data, so a bare slot number is never read against another object.
+pub fn relation_row(
+    member: u64,
+    entries: &[u64],
+    mask_coefficients: &[Fp3],
+    constant: Fp3,
+) -> Result<zkie_engine::pcs::request::bat::BatRow> {
+    if entries.len() != mask_coefficients.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut row = zkie_engine::pcs::request::bat::BatRow::new(zkie_engine::pcs::request::bat::BatRowKind::Plain);
+    for (entry, coefficient) in entries.iter().zip(mask_coefficients) {
+        if coefficient.is_zero() {
+            continue;
+        }
+        row.add_unit(member, zkie_engine::pcs::request::bat::BatPart::Mask, *entry, *coefficient);
+    }
+    row.target = Fp3::ZERO.sub(&constant);
+    Ok(row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +205,43 @@ mod tests {
             settled = settled.add(&coefficient.mul(&masks[slot]));
         }
         assert_eq!(settled, expected);
+    }
+
+    #[test]
+    fn a_settled_relation_becomes_one_owner_bound_row() {
+        let mut slots = SegmentSlots::new(2).unwrap();
+        slots.hide(0, f(7), f(2)).unwrap();
+        slots.hide(1, f(9), f(3)).unwrap();
+        let mut form = SlotForm::new();
+        form.constant = f(5);
+        form.add_term(0, f(4));
+        form.add_term(1, f(6));
+        slots.push(Fp3::ONE, &form).unwrap();
+        let (coefficients, constant) = slots.settle().unwrap();
+        // The owner layout maps slot 0 to entry 3 and slot 1 to entry 8.
+        let row = relation_row(21, &[3, 8], &coefficients, constant).unwrap();
+        assert_eq!(row.target, Fp3::ZERO.sub(&constant));
+        assert_eq!(row.units.len(), 2);
+        assert_eq!(row.units[0].index, 3);
+        assert_eq!(row.units[1].index, 8);
+        // The settled equation equals the hidden form at the slot mask
+        // entries: the owner table carries slot 0's entry at index 3 and slot
+        // 1's at index 8.
+        let masks = [f(1), f(11)];
+        let mut value = constant;
+        for (slot, coefficient) in coefficients.iter().enumerate() {
+            value = value.add(&coefficient.mul(&masks[slot]));
+        }
+        let hidden = [
+            f(7).sub(&f(2).mul(&masks[0])),
+            f(9).sub(&f(3).mul(&masks[1])),
+        ];
+        let expected = f(5)
+            .add(&f(4).mul(&hidden[0]))
+            .add(&f(6).mul(&hidden[1]));
+        assert_eq!(value, expected);
+        // A mapping of another length is refused.
+        assert!(relation_row(21, &[3], &coefficients, constant).is_err());
     }
 
     #[test]
