@@ -1,0 +1,8 @@
+first_main=(18,16384,130) first_mask=(18,256,66) max_zero=65 reserved_rounds=28
+shared[0]=k1 h0 n18 nz18 ell16384 ellz256 t65 r130 rz66
+shared[1]=k4 h2 n14 nz12 ell1024 ellz256 t71 r71 rz71
+shared[2]=k0 h0 n14 nz14 ell1024 ellz1024 t66 r66 rz66
+own[0]=k5 h2 n18 nz18 ell16384 ellz256 t65 r130 rz66
+own[1]=k4 h3 n14 nz13 ell1024 ellz128 t66 r66 rz66
+own[2]=k0 h0 n15 nz15 ell1024 ellz512 t53 r53 rz53
+shared_base_positions=66 own_base_positions=53

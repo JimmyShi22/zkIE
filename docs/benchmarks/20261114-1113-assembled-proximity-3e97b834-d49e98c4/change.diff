@@ -1,0 +1,2015 @@
+commit 3e97b8346745988f6653acc9b61c8787bbb635ad
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Sat Nov 14 11:13:18 2026 +0800
+
+    Assemble the production proximity plan and carry the session in the proof package
+    
+    The trusted planner now assembles the production proximity configuration from the reference production policy mapped to the one-main-code layout this executor supports: a bounded candidate choice, the first-stage fold bits from the real member rows, the stage-0 main and mask tails from the joint solve including the SEND and shared reads, each later stage's positions solved from its own rounds, and the exact frozen round count as the reserved budget. A planner-checked plan is re-derived on the verifier side from the same trusted shapes and public choices: a changed position, tail, code, BASE count or fold bit is rejected, and no configuration is searched for on the verifier.
+    
+    The projection consumer's hidden session now uses the assembled codes and stage lists with the planner check on. The canonical session encoding enters the verification package as session.bin next to the trusted commitment and the trace; the verifier decodes it from the package and checks the proof again from those bytes alone.
+    
+    Evidence: the workspace is green (1014 passed, 0 failed, 19 ignored); the norm-free toy output-head proof is unchanged at 45,080 bytes with digest 7a5da6ebcbfdb61d5ee88ab60e67f45613906959b0c5de998cb870f5e1de4cfb; the real registered seq16 consumer run proves and verifies with the assembled plan in 78.33 s and a 1,075,512-byte session.
+    
+    The closure and norm members of the planner-checked assembly are the next step.
+
+diff --git a/crates/zkie-ops/src/proof/hidden_send_session.rs b/crates/zkie-ops/src/proof/hidden_send_session.rs
+index 53d4897c..85b6a2fe 100644
+--- a/crates/zkie-ops/src/proof/hidden_send_session.rs
++++ b/crates/zkie-ops/src/proof/hidden_send_session.rs
+@@ -804,17 +804,8 @@ impl WShape {
+         if answers == 0 || answers as u64 > code.ell {
+             return Err(Error::InvalidConfig);
+         }
+-        let capacity = code.ell - answers as u64;
+-        if capacity == 0 {
+-            return Err(Error::InvalidConfig);
+-        }
+-        let rows_needed = columns
+-            .checked_add(capacity - 1)
+-            .ok_or(Error::ResourceLimit)?
+-            / capacity;
+-        let main_rows = rows_needed
+-            .checked_next_power_of_two()
+-            .ok_or(Error::ResourceLimit)?;
++        let main_rows =
++            crate::proof::proximity_planner::rows_for_columns(columns, code.ell, answers)?;
+         let shape = Self {
+             code,
+             main_rows,
+@@ -4631,55 +4622,8 @@ impl HiddenProximityPlan {
+             }
+         }
+         if self.planner_checked {
+-            let own = &self.own_stages;
+-            if own.len() != 2
+-                || own[0].main != self.code
+-                || own[0].mask != self.mask_code
+-                || own[0].k == 0
+-                || own[0].h > own[0].k
+-                || own[0].samples != 1
+-                || own[1].k != 0
+-                || own[1].h != 0
+-                || own[1].samples != 1
+-            {
+-                return Some("the planner-checked own stage list is not the two-stage shape");
+-            }
+-            let mut max_zero = self.code.r.min(self.mask_code.r);
+-            max_zero = max_zero
+-                .checked_sub(send.openings_per_oracle as u64)
+-                .unwrap_or(0);
+-            if let Some(index) = &send.index_mask {
+-                let room = index.mask_code.r.saturating_sub(index.openings as u64);
+-                max_zero = max_zero.min(room);
+-            }
+-            if let Some(closure) = closure {
+-                let room = closure
+-                    .mask
+-                    .mask_code
+-                    .r
+-                    .saturating_sub(closure.mask.openings as u64);
+-                max_zero = max_zero.min(room);
+-            }
+-            let planned = match crate::proof::proximity_planner::plan_own_two_stage(
+-                self.code,
+-                self.mask_code,
+-                own[1].main,
+-                own[1].mask,
+-                own[0].k,
+-                own[0].h,
+-                max_zero as usize,
+-            ) {
+-                Ok(planned) => planned,
+-                Err(_) => return Some("the trusted planner rejects the own two-stage stage list"),
+-            };
+-            if own[0].positions != planned.stage_zero_positions
+-                || own[0].work_bits != planned.stage_zero_work_bits
+-                || own[1].positions != planned.last_positions
+-                || own[1].main.r != planned.last_main_r
+-                || own[1].mask.r != planned.last_mask_r
+-                || self.own_base_positions != planned.last_positions
+-            {
+-                return Some("the own stage list differs from the trusted planner");
++            if let Some(reason) = self.planner_fault(send, closure, norm) {
++                return Some(reason);
+             }
+         }
+         // The shared group is a join over table-derived rows that the table
+@@ -4687,26 +4631,7 @@ impl HiddenProximityPlan {
+         // work are a fixed join count, not a proximity parameter: the
+         // proximity guarantee comes from the table column draws. Any other
+         // count changes the plan semantics and is rejected here.
+-        let shared = &self.shared_stages;
+-        if self.planner_checked
+-            && !shared.is_empty()
+-            && (shared.len() != 2
+-            || self.shared_base_positions != 2
+-            || shared[0].main != self.code
+-            || shared[0].mask != self.mask_code
+-            || shared[0].k != 2
+-            || shared[0].h != 0
+-            || shared[0].samples != 1
+-            || shared[0].positions != 2
+-            || shared[0].work_bits != 0
+-            || shared[1].k != 0
+-            || shared[1].h != 0
+-            || shared[1].samples != 1
+-            || shared[1].positions != 2
+-                || shared[1].work_bits != 0)
+-        {
+-            return Some("the shared join stage list differs from the trusted plan");
+-        }
++
+         if self.shared_mask_tree.fault().is_some() || self.own_mask_tree.fault().is_some() {
+             return Some("a fresh mask tree is not valid");
+         }
+@@ -4917,6 +4842,211 @@ impl HiddenProximityPlan {
+         }
+         None
+     }
++
++    /// The verifier's independent check of a planner-checked plan. Both sides
++    /// hold the same trusted plan and the same real member shapes; this
++    /// function rebuilds the assembly input from the plan's shapes and runs
++    /// the trusted derivation on the plan's public choices, without searching
++    /// for another configuration. Every derived value must equal the plan's.
++    fn planner_fault(
++        &self,
++        send: &HiddenSendPlan,
++        closure: Option<&ClosurePlan>,
++        norm: Option<&NormPlan>,
++    ) -> Option<&'static str> {
++        use crate::proof::proximity_planner::{
++            validate_assembled, AssemblyCandidate, AssemblyInput, AssemblyMember, AssemblyOwnObject,
++            StageChoice,
++        };
++        if closure.is_some() || norm.is_some() {
++            return Some("the planner-checked assembly covers the projection consumer's members only");
++        }
++        if send.w.answers != 1 {
++            return Some("the planner-checked plan does not fix the sample count at one");
++        }
++        if send.positions() == 0 || send.columns == 0 {
++            return Some("the planner-checked plan has no request message");
++        }
++        if send.w.code != self.code || self.gu.u.code != self.code || self.omega.u.code != self.code {
++            return Some("a proximity member does not share the main code");
++        }
++        if !self.code.ell.is_power_of_two() || !self.mask_code.ell.is_power_of_two() {
++            return Some("a proximity code message is not a power of two");
++        }
++        let mut shared_members = vec![
++            AssemblyMember::Fixed {
++                main_rows: self.gu.u.main_rows,
++                mask_rows: self.gu.u.mask_rows,
++            },
++            AssemblyMember::Fixed {
++                main_rows: self.omega.u.main_rows,
++                mask_rows: self.omega.u.mask_rows,
++            },
++        ];
++        if shared_members.iter().any(|member| member == &AssemblyMember::Fixed { main_rows: 0, mask_rows: 0 }) {
++            return Some("a shared proximity member is empty");
++        }
++        let mut own_objects = Vec::new();
++        for _ in 0..send.positions() {
++            own_objects.push(AssemblyOwnObject {
++                member: AssemblyMember::Fixed {
++                    main_rows: send.w.main_rows,
++                    mask_rows: 0,
++                },
++                shared_too: false,
++                spent: send.openings_per_oracle as u64,
++            });
++        }
++        own_objects.push(AssemblyOwnObject {
++            member: AssemblyMember::Fixed {
++                main_rows: self.omega.u.main_rows,
++                mask_rows: self.omega.u.mask_rows,
++            },
++            shared_too: true,
++            spent: 0,
++        });
++        if let Some(index) = &send.index_mask {
++            if index.mask_code != self.mask_code {
++                return Some("the index-mask code differs from the proximity mask code");
++            }
++            own_objects.push(AssemblyOwnObject {
++                member: AssemblyMember::Fixed {
++                    main_rows: 0,
++                    mask_rows: index.mask_rows,
++                },
++                shared_too: false,
++                spent: index.openings as u64,
++            });
++        }
++        if let Some(dot) = &send.dot {
++            if dot.shape.code != self.code {
++                return Some("the shown-map code differs from the proximity main code");
++            }
++            own_objects.push(AssemblyOwnObject {
++                member: AssemblyMember::Fixed {
++                    main_rows: dot.shape.main_rows,
++                    mask_rows: 0,
++                },
++                shared_too: false,
++                spent: 0,
++            });
++        }
++        if self.shared_stages.len() < 2 || self.own_stages.len() < 2 {
++            return Some("the planner-checked plan has no complete stage list");
++        }
++        if self
++            .shared_stages
++            .iter()
++            .chain(self.own_stages.iter())
++            .any(|stage| stage.samples != 1 || stage.work_bits != 0)
++        {
++            return Some("a planner-checked stage changes the fixed samples or work");
++        }
++        let shared_choices: Vec<StageChoice> = self
++            .shared_stages
++            .iter()
++            .skip(1)
++            .map(|stage| StageChoice {
++                log_n: stage.main.log_n,
++                mask_log_n: stage.mask.log_n,
++                k: stage.k,
++                h: stage.h,
++            })
++            .collect();
++        let own_choices: Vec<StageChoice> = self
++            .own_stages
++            .iter()
++            .skip(1)
++            .map(|stage| StageChoice {
++                log_n: stage.main.log_n,
++                mask_log_n: stage.mask.log_n,
++                k: stage.k,
++                h: stage.h,
++            })
++            .collect();
++        let candidate = AssemblyCandidate {
++            first_log_n: self.code.log_n,
++            first_log_ell: self.code.ell.trailing_zeros(),
++            first_mask_log_n: self.mask_code.log_n,
++            first_mask_log_ell: self.mask_code.ell.trailing_zeros(),
++            shared_choices,
++            own_choices,
++        };
++        let input = AssemblyInput {
++            shared_members: std::mem::take(&mut shared_members),
++            own_objects,
++            shared_mask_spent: 0,
++            requests: 1,
++            samples: send.w.answers,
++            columns: send.columns,
++            circle: false,
++        };
++        let assembled = match validate_assembled(&input, &candidate) {
++            Ok(assembled) => assembled,
++            Err(_) => return Some("the trusted planner rejects the planner-checked stage lists"),
++        };
++        if assembled.first_main != self.code || assembled.first_mask != self.mask_code {
++            return Some("the planner-checked codes differ from the trusted derivation");
++        }
++        if !planner_stages_match(&assembled.shared, &self.shared_stages)
++            || !planner_stages_match(&assembled.own, &self.own_stages)
++        {
++            return Some("the planner-checked stage lists differ from the trusted derivation");
++        }
++        if self.shared_base_positions
++            != assembled
++                .shared
++                .last()
++                .map(|stage| stage.positions as usize)
++                .unwrap_or(0)
++            || self.own_base_positions
++                != assembled
++                    .own
++                    .last()
++                    .map(|stage| stage.positions as usize)
++                    .unwrap_or(0)
++        {
++            return Some("the BASE position count differs from the trusted derivation");
++        }
++        let shared_mask_rows = match 1u64.checked_shl(self.shared_stages[0].h) {
++            Some(rows) => rows,
++            None => return Some("the shared first stage's mask rows overflow"),
++        };
++        let own_mask_rows = match 1u64.checked_shl(self.own_stages[0].h) {
++            Some(rows) => rows,
++            None => return Some("the own first stage's mask rows overflow"),
++        };
++        if self.shared_mask_tree.mask_rows != shared_mask_rows
++            || self.own_mask_tree.mask_rows != own_mask_rows
++            || self.shared_mask_tree.log_n != self.mask_code.log_n
++            || self.own_mask_tree.log_n != self.mask_code.log_n
++        {
++            return Some("a fresh mask tree does not match its first stage");
++        }
++        None
++    }
++}
++
++/// Whether a solved stage list equals a plan's stage list in every derived
++/// and chosen field.
++fn planner_stages_match(
++    solved: &[crate::proof::proximity_planner::SolvedStage],
++    planned: &[IoppStagePlan],
++) -> bool {
++    if solved.len() != planned.len() {
++        return false;
++    }
++    solved.iter().zip(planned).all(|(solved, planned)| {
++        solved.log_n == planned.main.log_n
++            && solved.mask_log_n == planned.mask.log_n
++            && solved.k == planned.k
++            && solved.h == planned.h
++            && solved.main_ell == planned.main.ell
++            && solved.mask_ell == planned.mask.ell
++            && solved.positions == planned.positions as u64
++            && solved.main_r == planned.main.r
++            && solved.mask_r == planned.mask.r
++    })
+ }
+ 
+ /// The complete trusted plan of one merged three-stage run.
+diff --git a/crates/zkie-ops/src/proof/proximity_planner.rs b/crates/zkie-ops/src/proof/proximity_planner.rs
+index 330006d1..ead3a9cb 100644
+--- a/crates/zkie-ops/src/proof/proximity_planner.rs
++++ b/crates/zkie-ops/src/proof/proximity_planner.rs
+@@ -865,6 +865,831 @@ pub fn derive_stage_list(
+     Ok(stages)
+ }
+ 
++/// The main rows of a `W`-like message of `entries` entries under a code of
++/// message length `ell` with `answers` sample pads: the smallest power of two
++/// that leaves the last row's pads free. This is the one row rule of every
++/// column message, so the shape constructor and the planner read it here.
++pub fn rows_for_columns(entries: u64, ell: u64, answers: u32) -> Result<u64> {
++    if entries == 0 || answers == 0 || answers as u64 > ell {
++        return Err(Error::InvalidConfig);
++    }
++    let capacity = ell - answers as u64;
++    if capacity == 0 {
++        return Err(Error::InvalidConfig);
++    }
++    let rows_needed = entries
++        .checked_add(capacity - 1)
++        .ok_or(Error::ResourceLimit)?
++        / capacity;
++    let main_rows = rows_needed
++        .checked_next_power_of_two()
++        .ok_or(Error::ResourceLimit)?;
++    let last_place = (entries - 1) / main_rows;
++    if last_place >= capacity {
++        return Err(Error::InvalidConfig);
++    }
++    Ok(main_rows)
++}
++
++/// One solved stage of a chain: the public choices with the derived message
++/// lengths, out-of-domain entries, position count and random tail. The
++/// position count and the tail follow from the stage rules; neither is a
++/// free parameter.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct SolvedStage {
++    pub log_n: u32,
++    pub mask_log_n: u32,
++    pub k: u32,
++    pub h: u32,
++    pub main_ell: u64,
++    pub mask_ell: u64,
++    pub r_ood: u64,
++    pub positions: u64,
++    /// The main code's random tail of this stage. The first stage's tail is
++    /// the code's joint tail; a later stage's tail is the solved position
++    /// count's tail, the same for both codes.
++    pub main_r: u64,
++    pub mask_r: u64,
++}
++
++/// The first stage of a chain as the trusted plan fixes it: the message
++/// lengths of both codes, the fold bits derived from the real member layout,
++/// and the number of positions the joint solve settled.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct ChainStart {
++    pub main_ell: u64,
++    pub mask_ell: u64,
++    pub k: u32,
++    pub h: u32,
++    pub positions: u64,
++    pub main_r: u64,
++    pub mask_r: u64,
++}
++
++/// How many positions one middle or last stage is opened at, and its random
++/// tail. The iteration mirrors the reference stage rule: start from zero, size
++/// the group with the tail that the current count implies, and raise the count
++/// until the round error at the target stops moving it. A group that cannot
++/// hold its rounds at the target, or a code that cannot hold message and tail,
++/// is reported at its stage.
++fn solve_stage_positions(
++    log_n: u32,
++    mask_log_n: u32,
++    sizes: StageSizes,
++    previous_main_r: u64,
++    circle: bool,
++) -> std::result::Result<(u64, u64), StageFailure> {
++    let mut t = 0u64;
++    for turn in 0..=32 {
++        let tail = stage_tail(t, circle);
++        let main = CodeParams {
++            log_n,
++            ell: sizes.main_ell,
++            r: tail,
++        };
++        let mask = CodeParams {
++            log_n: mask_log_n,
++            ell: sizes.mask_ell,
++            r: tail,
++        };
++        let shape = match group_shape(main, mask, sizes.k, sizes.h) {
++            Ok(shape) => shape,
++            Err(_) => {
++                return Err(StageFailure {
++                    stage: 0,
++                    point: "the stage's message and random tail do not fit its code length",
++                })
++            }
++        };
++        let load = GroupLoad {
++            cube_bits: stage_cube_bits(&shape),
++            messages: 1,
++            batched_rows: 4 + 3 * previous_main_r.max(1024),
++        };
++        let m = largest_m(&shape, load);
++        let serves = m > 0 && holds_for_m(&shape, load, m);
++        let extra = margin_bound();
++        let next = if serves {
++            match analysis_of_m(&shape, m) {
++                Ok(analysis) => scope_positions(&analysis.at.agree, 0, &extra),
++                Err(_) => 0,
++            }
++        } else {
++            positions_from_below(&shape, load, &extra)
++        };
++        if !serves && next <= t {
++            return Err(StageFailure {
++                stage: 0,
++                point: "no distance under its rule holds the stage's rounds at the target",
++            });
++        }
++        if next == 0 {
++            return Err(StageFailure {
++                stage: 0,
++                point: "no number of positions reaches the target",
++            });
++        }
++        if next <= t {
++            return Ok((t, stage_tail(t, circle)));
++        }
++        if turn == 32 {
++            return Err(StageFailure {
++                stage: 0,
++                point: "positions and random coordinates do not settle",
++            });
++        }
++        t = next;
++    }
++    Err(StageFailure {
++        stage: 0,
++        point: "positions and random coordinates do not settle",
++    })
++}
++
++/// One later stage's sizes from the choice and the stage before it. The error
++/// is reported at `stage` with the rule that failed.
++#[allow(clippy::too_many_arguments)]
++fn sized_choice(
++    prev: &FirstStage,
++    previous_positions: u64,
++    k: u32,
++    h: u32,
++    last: bool,
++    samples: u32,
++    circle: bool,
++    stage: usize,
++) -> std::result::Result<StageSizes, StageFailure> {
++    let sized = if last {
++        solve_last_stage(
++            prev.main_ell,
++            prev.mask_ell,
++            prev.slots,
++            prev.main_r,
++            prev.mask_r,
++            samples,
++            previous_positions,
++            circle,
++        )
++    } else {
++        solve_next_stage(
++            prev.main_ell,
++            prev.mask_ell,
++            prev.slots,
++            prev.main_r,
++            prev.mask_r,
++            k,
++            h,
++            samples,
++            previous_positions,
++            circle,
++        )
++    };
++    sized.map_err(|error| match error {
++        Error::InvalidConfig => StageFailure {
++            stage,
++            point: "the folded row cannot be cut into the chosen rows",
++        },
++        _ => StageFailure {
++            stage,
++            point: "the stage's capacities overflow",
++        },
++    })
++}
++
++/// Derives a complete chain and solves each stage's position count. The first
++/// choice carries the first stage's two code lengths; the first stage's fold
++/// bits, message lengths and position count come from `start`. Every later
++/// choice is one middle stage (`1 <= k`, `h <= k`) or, as the last choice, the
++/// single-row stage `k = h = 0`. Each later stage's message lengths, its
++/// out-of-domain entries and its position count follow from the stage rules.
++pub fn solve_chain_stages(
++    start: ChainStart,
++    samples: u32,
++    circle: bool,
++    choices: &[StageChoice],
++) -> std::result::Result<Vec<SolvedStage>, StageFailure> {
++    if choices.len() < 2 || start.positions == 0 || start.k == 0 {
++        return Err(StageFailure {
++            stage: 0,
++            point: "a chain folds at its first stage and has a last stage",
++        });
++    }
++    let first = FirstStage {
++        k: start.k,
++        h: start.h,
++        main_ell: start.main_ell,
++        mask_ell: start.mask_ell,
++        slots: 1,
++        main_r: start.main_r,
++        mask_r: start.mask_r,
++    };
++    if !code_fits(choices[0].log_n, first.main_ell, first.main_r)
++        || !code_fits(choices[0].mask_log_n, first.mask_ell, first.mask_r)
++    {
++        return Err(StageFailure {
++            stage: 0,
++            point: "the first stage's message and tail do not fit its code length",
++        });
++    }
++    let mut stages = Vec::with_capacity(choices.len());
++    stages.push(SolvedStage {
++        log_n: choices[0].log_n,
++        mask_log_n: choices[0].mask_log_n,
++        k: start.k,
++        h: start.h,
++        main_ell: start.main_ell,
++        mask_ell: start.mask_ell,
++        r_ood: 0,
++        positions: start.positions,
++        main_r: start.main_r,
++        mask_r: start.mask_r,
++    });
++    let mut prev = first;
++    for (index, choice) in choices.iter().enumerate() {
++        if index == 0 {
++            continue;
++        }
++        let last = index + 1 == choices.len();
++        if choice.k > 8
++            || choice.h > choice.k
++            || (last && (choice.k != 0 || choice.h != 0))
++            || (!last && choice.k == 0)
++        {
++            return Err(StageFailure {
++                stage: index,
++                point: if last {
++                    "the last stage has k = h = 0"
++                } else {
++                    "a middle stage has 1 <= k and h <= k"
++                },
++            });
++        }
++        let previous_positions = stages[index - 1].positions;
++        let sizes = sized_choice(&prev, previous_positions, choice.k, choice.h, last, samples, circle, index)?;
++        let (positions, tail) = solve_stage_positions(
++            choice.log_n,
++            choice.mask_log_n,
++            sizes,
++            prev.main_r,
++            circle,
++        )
++        .map_err(|failure| StageFailure {
++            stage: index,
++            point: failure.point,
++        })?;
++        prev = FirstStage {
++            k: sizes.k,
++            h: sizes.h,
++            main_ell: sizes.main_ell,
++            mask_ell: sizes.mask_ell,
++            slots: 1,
++            main_r: tail,
++            mask_r: tail,
++        };
++        stages.push(SolvedStage {
++            log_n: choice.log_n,
++            mask_log_n: choice.mask_log_n,
++            k: sizes.k,
++            h: sizes.h,
++            main_ell: sizes.main_ell,
++            mask_ell: sizes.mask_ell,
++            r_ood: sizes.r_ood,
++            positions,
++            main_r: tail,
++            mask_r: tail,
++        });
++    }
++    Ok(stages)
++}
++
++
++/// One member of a group as the assembly sizes it: a message with fixed rows,
++/// or a column message whose rows follow from the first-stage message length.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum AssemblyMember {
++    Fixed { main_rows: u64, mask_rows: u64 },
++    Columns { entries: u64, answers: u32 },
++}
++
++/// One object of the own group with what it has already spent before the
++/// stage-0 list: the SEND readings on its own tree, and whether the shared
++/// test opens this same physical object as well (the joined `Omega`).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct AssemblyOwnObject {
++    pub member: AssemblyMember,
++    pub shared_too: bool,
++    pub spent: u64,
++}
++
++/// The trusted inputs of one assembly: the real member layouts of both
++/// groups, the fixed request count, sample count and table width, and the
++/// circle flag. Every number here is plan data; no proof byte enters it.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct AssemblyInput {
++    pub shared_members: Vec<AssemblyMember>,
++    pub own_objects: Vec<AssemblyOwnObject>,
++    /// What the shared fresh mask has already spent before its list.
++    pub shared_mask_spent: u64,
++    pub requests: u64,
++    pub samples: u32,
++    pub columns: u64,
++    pub circle: bool,
++}
++
++/// One fully validated assembled proximity plan.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct AssembledProximity {
++    pub first_main: CodeParams,
++    pub first_mask: CodeParams,
++    pub shared: Vec<SolvedStage>,
++    pub own: Vec<SolvedStage>,
++    /// The smallest remaining openable capacity of the own group's stage-0
++    /// objects; the own stage-0 list fits it by construction.
++    pub max_zero: u64,
++    /// The exact round count of the frozen complete plan, formed before any
++    /// run. It is an output of the plan, never a search variable.
++    pub reserved_rounds: u64,
++    pub choices: AssemblyCandidate,
++}
++
++fn assembly_rows(member: AssemblyMember, ell: u64) -> std::result::Result<(u64, u64), StageFailure> {
++    match member {
++        AssemblyMember::Fixed {
++            main_rows,
++            mask_rows,
++        } => Ok((main_rows, mask_rows)),
++        AssemblyMember::Columns { entries, answers } => rows_for_columns(entries, ell, answers)
++            .map(|rows| (rows, 0))
++            .map_err(|_| StageFailure {
++                stage: 0,
++                point: "a column message does not fit the first-stage code length",
++            }),
++    }
++}
++
++fn derived_stage(stage: &SolvedStage) -> DerivedStage {
++    DerivedStage {
++        log_n: stage.log_n,
++        mask_log_n: stage.mask_log_n,
++        k: stage.k,
++        h: stage.h,
++        main_ell: stage.main_ell,
++        mask_ell: stage.mask_ell,
++        r_ood: stage.r_ood,
++        tail: stage.main_r.max(stage.mask_r),
++    }
++}
++
++/// Checks one solved chain against the stage-list rules a run enforces. The
++/// first stage's codes and fold bits were checked against the real layout by
++/// the caller; here every later stage's codes, fold bits, capacities and
++/// position counts are checked again on the solved values.
++fn validate_solved_chain(stages: &[SolvedStage], samples: u32) -> std::result::Result<(), StageFailure> {
++    if stages.len() < 2 {
++        return Err(StageFailure {
++            stage: 0,
++            point: "a proximity test has at least two stages",
++        });
++    }
++    for (index, stage) in stages.iter().enumerate() {
++        use zkie_engine::pcs::request::code::build_code_plan;
++        if build_code_plan(stage.log_n, stage.main_ell, stage.main_r).is_err()
++            || build_code_plan(stage.mask_log_n, stage.mask_ell, stage.mask_r).is_err()
++        {
++            return Err(StageFailure {
++                stage: index,
++                point: "a stage code is not a code",
++            });
++        }
++        if stage.mask_log_n > stage.log_n {
++            return Err(StageFailure {
++                stage: index,
++                point: "a stage mask code is longer than its main code",
++            });
++        }
++        if stage.positions == 0 || stage.positions > stage.main_r.min(stage.mask_r) {
++            return Err(StageFailure {
++                stage: index,
++                point: "a stage opens more positions than its tail hides",
++            });
++        }
++        let last = index + 1 == stages.len();
++        if last {
++            if stage.k != 0 || stage.h != 0 {
++                return Err(StageFailure {
++                    stage: index,
++                    point: "the last stage has k = h = 0",
++                });
++            }
++        } else {
++            if stage.k < 1 || stage.h > stage.k {
++                return Err(StageFailure {
++                    stage: index,
++                    point: "a middle stage has 1 <= k and h <= k",
++                });
++            }
++            if stage.mask_ell < 2 * stage.k as u64 + 1 - stage.h as u64 {
++                return Err(StageFailure {
++                    stage: index,
++                    point: "a stage mask message is too short for the fold hiding polynomial",
++                });
++            }
++        }
++        if index > 0 {
++            let previous = &stages[index - 1];
++            match stage.main_ell.checked_shl(stage.k) {
++                Some(folded) if folded == previous.main_ell => {}
++                _ => {
++                    return Err(StageFailure {
++                        stage: index,
++                        point: "the folded main message does not fill the next rows",
++                    })
++                }
++            }
++            let carried = 2u64
++                .checked_mul(previous.mask_ell)
++                .and_then(|value| value.checked_add(previous.main_r))
++                .and_then(|value| value.checked_add(2u64.checked_mul(previous.mask_r)?))
++                .ok_or(StageFailure {
++                    stage: index,
++                    point: "the stage's capacities overflow",
++                })?;
++            match stage.mask_ell.checked_shl(stage.h) {
++                Some(room) if room >= carried + samples as u64 => {}
++                _ => {
++                    return Err(StageFailure {
++                        stage: index,
++                        point: "the stage's mask rows have no room for the fold masks and randomness",
++                    })
++                }
++            }
++        }
++    }
++    Ok(())
++}
++
++/// One fully public configuration candidate: the first stage's two code
++/// lengths and each group's post-first stages, in the reference's public
++/// form `(k, h, log_n, mask_log_n)`. The first stage's fold bits are not here:
++/// they come from the real member layout.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct AssemblyCandidate {
++    pub first_log_n: u32,
++    pub first_log_ell: u32,
++    pub first_mask_log_n: u32,
++    pub first_mask_log_ell: u32,
++    pub shared_choices: Vec<StageChoice>,
++    pub own_choices: Vec<StageChoice>,
++}
++
++/// The reference production policy's group lines, expressed as candidates for
++/// the one-main-code layout. The folded line names another main code than the
++/// own and Omega lines, a split this executor does not support; the folded
++/// group therefore uses the own/Omega main code and the fold bits of its own
++/// line. The mask code is one for both groups, so the own line's mask code is
++/// tried first and the folded line's split mask code second.
++pub fn production_candidates() -> Vec<AssemblyCandidate> {
++    let shared_choices = vec![
++        StageChoice { log_n: 14, mask_log_n: 12, k: 4, h: 2 },
++        StageChoice { log_n: 14, mask_log_n: 14, k: 0, h: 0 },
++    ];
++    let own_choices = vec![
++        StageChoice { log_n: 14, mask_log_n: 13, k: 4, h: 3 },
++        StageChoice { log_n: 15, mask_log_n: 15, k: 0, h: 0 },
++    ];
++    vec![
++        AssemblyCandidate {
++            first_log_n: 18,
++            first_log_ell: 14,
++            first_mask_log_n: 18,
++            first_mask_log_ell: 8,
++            shared_choices: shared_choices.clone(),
++            own_choices: own_choices.clone(),
++        },
++        AssemblyCandidate {
++            first_log_n: 18,
++            first_log_ell: 14,
++            first_mask_log_n: 18,
++            first_mask_log_ell: 6,
++            shared_choices,
++            own_choices,
++        },
++    ]
++}
++
++/// Why one configuration was not assembled: a named failing point, or a
++/// search that could not be completed.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum AssemblyError {
++    Reject(StageFailure),
++    Exhausted,
++}
++
++impl From<StageFailure> for AssemblyError {
++    fn from(failure: StageFailure) -> Self {
++        AssemblyError::Reject(failure)
++    }
++}
++
++/// Validates one public configuration end to end. Every value the plan needs
++/// is derived here from the real member layout and the public choices; a
++/// configuration that violates any rule is reported with its stage and the
++/// failing point. The prover's assembly and the verifier's independent check
++/// both call this function on the same trusted inputs; the verifier does not
++/// search for another configuration.
++pub fn validate_assembled(
++    input: &AssemblyInput,
++    candidate: &AssemblyCandidate,
++) -> std::result::Result<AssembledProximity, AssemblyError> {
++    if candidate.first_log_ell >= 32
++        || candidate.first_mask_log_ell >= 32
++        || candidate.first_log_ell >= candidate.first_log_n
++        || candidate.first_mask_log_ell >= candidate.first_mask_log_n
++        || candidate.first_mask_log_n > candidate.first_log_n
++    {
++        return Err(AssemblyError::Reject(StageFailure {
++            stage: 0,
++            point: "the first-stage code lengths are not a legal candidate",
++        }));
++    }
++    let ell = 1u64 << candidate.first_log_ell;
++    let mask_ell = 1u64 << candidate.first_mask_log_ell;
++    let mut shared_main = Vec::with_capacity(input.shared_members.len());
++    let mut shared_mask = Vec::with_capacity(input.shared_members.len());
++    for member in &input.shared_members {
++        let (main_rows, mask_rows) = assembly_rows(*member, ell)?;
++        shared_main.push(main_rows);
++        shared_mask.push(mask_rows);
++    }
++    let mut own_main = Vec::with_capacity(input.own_objects.len());
++    let mut own_mask = Vec::with_capacity(input.own_objects.len());
++    for object in &input.own_objects {
++        let (main_rows, mask_rows) = assembly_rows(object.member, ell)?;
++        own_main.push(main_rows);
++        own_mask.push(mask_rows);
++    }
++    let (shared_k, shared_h) = lin_group_bits(&shared_main, &shared_mask).map_err(|_| StageFailure {
++        stage: 0,
++        point: "the shared group's member rows do not form a group",
++    })?;
++    let (own_k, own_h) = lin_group_bits(&own_main, &own_mask).map_err(|_| StageFailure {
++        stage: 0,
++        point: "the own group's member rows do not form a group",
++    })?;
++    // A stage that is not the last one needs mask room for the fold hiding
++    // polynomial; the first stage is never the last one, and its fold bits
++    // come from the real member layout. A mask message below the bound is
++    // rejected before any solve.
++    let shared_fold_min = 2u64
++        .checked_mul(shared_k as u64)
++        .and_then(|value| value.checked_add(1))
++        .and_then(|value| value.checked_sub(shared_h as u64))
++        .ok_or(StageFailure { stage: 0, point: "the first stage's fold bits overflow" })?;
++    let own_fold_min = 2u64
++        .checked_mul(own_k as u64)
++        .and_then(|value| value.checked_add(1))
++        .and_then(|value| value.checked_sub(own_h as u64))
++        .ok_or(StageFailure { stage: 0, point: "the first stage's fold bits overflow" })?;
++    if mask_ell < shared_fold_min || mask_ell < own_fold_min {
++        return Err(AssemblyError::Reject(StageFailure {
++            stage: 0,
++            point: "the first stage's mask message is too short for the fold hiding polynomial",
++        }));
++    }
++    if ell > (1u64 << candidate.first_log_n) || mask_ell > (1u64 << candidate.first_mask_log_n) {
++        return Err(AssemblyError::Reject(StageFailure {
++            stage: 0,
++            point: "the first stage's message does not fit its code length",
++        }));
++    }
++    let main_code = CodeParams {
++        log_n: candidate.first_log_n,
++        ell,
++        r: 0,
++    };
++    let mask_code = CodeParams {
++        log_n: candidate.first_mask_log_n,
++        ell: mask_ell,
++        r: 0,
++    };
++    let mut main_spends = Vec::new();
++    let mut mask_spends = Vec::new();
++    for object in &input.own_objects {
++        let (main_rows, mask_rows) = assembly_rows(object.member, ell)?;
++        if main_rows > 0 {
++            main_spends.push(object.spent);
++        } else if mask_rows > 0 {
++            mask_spends.push(object.spent);
++        }
++    }
++    let folded = JointGroup {
++        main: main_code,
++        mask: mask_code,
++        k: shared_k,
++        h: shared_h,
++    };
++    let own = JointGroup {
++        main: main_code,
++        mask: mask_code,
++        k: own_k,
++        h: own_h,
++    };
++    let stage = solve_first_stage_one_mask(
++        &folded,
++        &folded,
++        &own,
++        input.requests,
++        input.samples,
++        input.columns,
++        input.circle,
++        &main_spends,
++        &mask_spends,
++    )?;
++    let shared_positions = stage.folded_positions;
++    let own_positions = stage.own_positions;
++    let main_tail = stage.own_main_tail;
++    let mask_tail = stage.folded_mask_tail;
++    if shared_positions == 0 || own_positions == 0 {
++        return Err(AssemblyError::Reject(StageFailure {
++            stage: 0,
++            point: "the first stage opens no position",
++        }));
++    }
++    if !code_fits(candidate.first_log_n, ell, main_tail)
++        || !code_fits(candidate.first_mask_log_n, mask_ell, mask_tail)
++    {
++        return Err(AssemblyError::Reject(StageFailure {
++            stage: 0,
++            point: "the first stage's message and random tail do not fit its code length",
++        }));
++    }
++    let mut max_zero = u64::MAX;
++    for (index, object) in input.own_objects.iter().enumerate() {
++        let (main_rows, mask_rows) = assembly_rows(object.member, ell)?;
++        let (tail, spent) = if main_rows > 0 {
++            let shared_reads = if object.shared_too { shared_positions } else { 0 };
++            let spent = object.spent.checked_add(shared_reads).ok_or(StageFailure {
++                stage: 0,
++                point: "an own object's spent positions overflow",
++            })?;
++            (main_tail, spent)
++        } else if mask_rows > 0 {
++            (mask_tail, object.spent)
++        } else {
++            continue;
++        };
++        let remaining = tail.checked_sub(spent).ok_or(StageFailure {
++            stage: 0,
++            point: "an own object has spent more positions than its tail hides",
++        })?;
++        if own_positions > remaining {
++            return Err(AssemblyError::Reject(StageFailure {
++                stage: 0,
++                point: "the own stage-0 list exceeds an object's remaining capacity",
++            }));
++        }
++        max_zero = max_zero.min(remaining);
++        let _ = index;
++    }
++    if max_zero == u64::MAX {
++        return Err(AssemblyError::Reject(StageFailure {
++            stage: 0,
++            point: "the own group has no stage-0 object",
++        }));
++    }
++    for member in &input.shared_members {
++        let (main_rows, mask_rows) = assembly_rows(*member, ell)?;
++        let tail = if main_rows > 0 {
++            main_tail
++        } else if mask_rows > 0 {
++            mask_tail
++        } else {
++            continue;
++        };
++        if shared_positions > tail {
++            return Err(AssemblyError::Reject(StageFailure {
++                stage: 0,
++                point: "the shared stage-0 list exceeds a member's tail",
++            }));
++        }
++    }
++    if shared_positions > mask_tail.saturating_sub(input.shared_mask_spent) {
++        return Err(AssemblyError::Reject(StageFailure {
++            stage: 0,
++            point: "the shared stage-0 list exceeds the fresh mask's remaining capacity",
++        }));
++    }
++    let shared_start = ChainStart {
++        main_ell: ell,
++        mask_ell,
++        k: shared_k,
++        h: shared_h,
++        positions: shared_positions,
++        main_r: main_tail,
++        mask_r: mask_tail,
++    };
++    let own_start = ChainStart {
++        main_ell: ell,
++        mask_ell,
++        k: own_k,
++        h: own_h,
++        positions: own_positions,
++        main_r: main_tail,
++        mask_r: mask_tail,
++    };
++    let mut shared_choices = Vec::with_capacity(candidate.shared_choices.len() + 1);
++    shared_choices.push(StageChoice {
++        log_n: candidate.first_log_n,
++        mask_log_n: candidate.first_mask_log_n,
++        k: 0,
++        h: 0,
++    });
++    shared_choices.extend(candidate.shared_choices.iter().copied());
++    let shared = solve_chain_stages(shared_start, input.samples, input.circle, &shared_choices)?;
++    let mut own_choices = Vec::with_capacity(candidate.own_choices.len() + 1);
++    own_choices.push(StageChoice {
++        log_n: candidate.first_log_n,
++        mask_log_n: candidate.first_mask_log_n,
++        k: 0,
++        h: 0,
++    });
++    own_choices.extend(candidate.own_choices.iter().copied());
++    let own_stages = solve_chain_stages(own_start, input.samples, input.circle, &own_choices)?;
++    validate_solved_chain(&shared, input.samples)?;
++    validate_solved_chain(&own_stages, input.samples)?;
++    let shared_budget = chain_round_budget(
++        &shared.iter().map(derived_stage).collect::<Vec<_>>(),
++    )
++    .map_err(|failure| StageFailure {
++        stage: failure.stage,
++        point: failure.point,
++    })?;
++    let own_budget = chain_round_budget(
++        &own_stages.iter().map(derived_stage).collect::<Vec<_>>(),
++    )
++    .map_err(|failure| StageFailure {
++        stage: failure.stage,
++        point: failure.point,
++    })?;
++    let reserved_rounds = shared_budget
++        .total
++        .checked_add(own_budget.total)
++        .ok_or(StageFailure {
++            stage: 0,
++            point: "the chain round count overflows",
++        })?;
++    Ok(AssembledProximity {
++        first_main: CodeParams {
++            log_n: candidate.first_log_n,
++            ell,
++            r: main_tail,
++        },
++        first_mask: CodeParams {
++            log_n: candidate.first_mask_log_n,
++            ell: mask_ell,
++            r: mask_tail,
++        },
++        shared,
++        own: own_stages,
++        max_zero,
++        reserved_rounds,
++        choices: candidate.clone(),
++    })
++}
++
++/// Assembles the production proximity plan from the trusted public
++/// configuration. Every candidate is the reference production policy's group
++/// lines, mapped to the one-main-code layout this executor supports; each is
++/// validated end to end against the real member layout. The first candidate
++/// that passes every check is the plan. When none passes, the error names each
++/// candidate's failing stage and point: no configuration is invented to make
++/// one fit.
++pub fn assemble_proximity(
++    input: &AssemblyInput,
++) -> std::result::Result<AssembledProximity, String> {
++    let candidates = production_candidates();
++    if candidates.is_empty() {
++        return Err("no candidate found within the searched domain (the candidate list is empty)".into());
++    }
++    let mut failures = Vec::with_capacity(candidates.len());
++    for candidate in &candidates {
++        match validate_assembled(input, candidate) {
++            Ok(plan) => return Ok(plan),
++            Err(AssemblyError::Reject(failure)) => {
++                failures.push(format!("stage {}: {}", failure.stage, failure.point));
++            }
++            Err(AssemblyError::Exhausted) => {
++                failures.push("the candidate could not be fully checked".into());
++            }
++        }
++    }
++    Err(format!(
++        "no candidate found within the searched domain ({} candidates; failures: {})",
++        candidates.len(),
++        failures.join("; ")
++    ))
++}
++
+ /// The positions every code's random coordinates must cover when the shared
+ /// and own groups are solved together. `folded` and `omega` are the shared
+ /// group's position counts, `own` a request's, and `requests` the batch size.
+@@ -982,16 +1807,13 @@ pub struct JointFirstStage {
+     pub own_mask_tail: u64,
+ }
+ 
+-fn sized_step(
++fn sized_step_tails(
+     shape: &GroupShape,
+-    main_draws: u64,
+-    mask_draws: u64,
++    main_tail: u64,
++    mask_tail: u64,
+     rows: u64,
+-    circle: bool,
+     extra: &Bound,
+ ) -> std::result::Result<(u64, bool), &'static str> {
+-    let main_tail = stage_tail(main_draws, circle);
+-    let mask_tail = stage_tail(mask_draws, circle);
+     let group = group_with_tails(shape, main_tail, mask_tail)
+         .map_err(|_| "the group's message and random tail do not fit its code length")?;
+     let load = GroupLoad {
+@@ -1014,6 +1836,23 @@ fn sized_step(
+     Ok((below, false))
+ }
+ 
++fn sized_step(
++    shape: &GroupShape,
++    main_draws: u64,
++    mask_draws: u64,
++    rows: u64,
++    circle: bool,
++    extra: &Bound,
++) -> std::result::Result<(u64, bool), &'static str> {
++    sized_step_tails(
++        shape,
++        stage_tail(main_draws, circle),
++        stage_tail(mask_draws, circle),
++        rows,
++        extra,
++    )
++}
++
+ /// Solves the shared and own groups together, upward from zero, on the joint
+ /// draw counts. Each round recomputes the random tails from the current
+ /// positions and the groups' sizes; the loop stops when no group's position
+@@ -1135,6 +1974,114 @@ pub fn solve_first_stage(
+     })
+ }
+ 
++/// Solves the first stage of both groups when they share one mask code, as
++/// the current executor's layout requires. The mask code's random tail is one
++/// number: it must hide both groups' stage-0 lists, so the coupled solve uses
++/// the larger of the two mask draw counts for both groups' mask words. The
++/// main code is shared by construction; a split group is refused because this
++/// layout has no message for a second main code.
++#[allow(clippy::too_many_arguments)]
++pub fn solve_first_stage_one_mask(
++    folded: &JointGroup,
++    omega: &JointGroup,
++    own: &JointGroup,
++    requests: u64,
++    samples: u32,
++    columns: u64,
++    circle: bool,
++    main_spends: &[u64],
++    mask_spends: &[u64],
++) -> std::result::Result<JointFirstStage, StageFailure> {
++    if folded.main.log_n != omega.main.log_n
++        || folded.main.ell != omega.main.ell
++        || folded.mask.log_n != omega.mask.log_n
++        || folded.mask.ell != omega.mask.ell
++        || folded.main.log_n != own.main.log_n
++        || folded.main.ell != own.main.ell
++        || folded.mask.log_n != own.mask.log_n
++        || folded.mask.ell != own.mask.ell
++    {
++        return Err(StageFailure {
++            stage: 0,
++            point: "the groups do not share one main and one mask code",
++        });
++    }
++    let folded_shape = group_shape(folded.main, folded.mask, folded.k, folded.h)
++        .map_err(|_| StageFailure { stage: 0, point: "the folded group's codes do not form a group" })?;
++    let own_shape = group_shape(own.main, own.mask, own.k, own.h)
++        .map_err(|_| StageFailure { stage: 0, point: "the request group's codes do not form a group" })?;
++    let samples64 = samples as u64;
++    let rows_folded = columns
++        .checked_add(1)
++        .and_then(|value| value.checked_add(3u64.checked_mul(samples64)?))
++        .ok_or(StageFailure { stage: 0, point: "the folded group's batched rows overflow" })?;
++    let rows_own = 2u64
++        .checked_add(3u64.checked_mul(samples64).ok_or(StageFailure { stage: 0, point: "the request group's batched rows overflow" })?)
++        .ok_or(StageFailure { stage: 0, point: "the request group's batched rows overflow" })?;
++    let extra = margin_bound();
++    let mut folded_t = 0u64;
++    let mut own_t = 0u64;
++    for turn in 0..=32 {
++        let draws = joint_draws(folded_t, 0, own_t, requests, false)
++            .map_err(|_| StageFailure { stage: 0, point: "the joint draw counts overflow" })?;
++        // The one main code and the one mask code each carry every object that
++        // shares them. An object is opened at its SEND readings and at the
++        // request's stage-0 list; the code's random tail must hide every such
++        // object's openings, so it is the largest of the per-object tails.
++        let mut main_tail = stage_tail(draws.folded_main, circle).max(stage_tail(draws.own_main, circle));
++        for spend in main_spends {
++            let total = spend
++                .checked_add(own_t)
++                .ok_or(StageFailure { stage: 0, point: "an object's openings overflow" })?;
++            main_tail = main_tail.max(stage_tail(total, circle));
++        }
++        let mut mask_tail = stage_tail(draws.folded_mask.max(draws.own_mask), circle);
++        for spend in mask_spends {
++            let total = spend
++                .checked_add(own_t)
++                .ok_or(StageFailure { stage: 0, point: "an object's openings overflow" })?;
++            mask_tail = mask_tail.max(stage_tail(total, circle));
++        }
++        let folded_step = sized_step_tails(&folded_shape, main_tail, mask_tail, rows_folded, &extra)
++            .map_err(|point| StageFailure { stage: 0, point })?;
++        let own_step = sized_step_tails(&own_shape, main_tail, mask_tail, rows_own, &extra)
++            .map_err(|point| StageFailure { stage: 0, point })?;
++        let next_folded = folded_t.max(folded_step.0);
++        let next_own = own_t.max(own_step.0);
++        if next_folded == folded_t && next_own == own_t {
++            if !folded_step.1 || !own_step.1 {
++                return Err(StageFailure {
++                    stage: 0,
++                    point: "no distance under its rule holds the group's rounds at the target",
++                });
++            }
++            return Ok(JointFirstStage {
++                folded_positions: next_folded,
++                omega_positions: 0,
++                own_positions: next_own,
++                folded_main_tail: main_tail,
++                folded_mask_tail: mask_tail,
++                omega_main_tail: main_tail,
++                omega_mask_tail: mask_tail,
++                own_main_tail: main_tail,
++                own_mask_tail: mask_tail,
++            });
++        }
++        if turn == 32 {
++            return Err(StageFailure {
++                stage: 0,
++                point: "positions and random coordinates do not settle",
++            });
++        }
++        folded_t = next_folded;
++        own_t = next_own;
++    }
++    Err(StageFailure {
++        stage: 0,
++        point: "positions and random coordinates do not settle",
++    })
++}
++
+ /// One encoded object's position-hiding account: the random tail hides
+ /// `tail` opened positions in all, `spent` of them are already opened against
+ /// this object. A main object and a mask object keep separate accounts: one
+@@ -2150,3 +3097,246 @@ mod round_budget_tests {
+         assert!(error.contains("request"));
+     }
+ }
++
++#[cfg(test)]
++mod stage_solve_tests {
++    use super::*;
++
++    fn group(log_n: u32, ell: u64, k: u32, h: u32) -> JointGroup {
++        JointGroup {
++            main: CodeParams { log_n, ell, r: 0 },
++            mask: CodeParams { log_n, ell, r: 0 },
++            k,
++            h,
++        }
++    }
++
++    #[test]
++    fn one_mask_solution_uses_one_mask_tail() {
++        let g = group(14, 256, 1, 0);
++        let stage = solve_first_stage_one_mask(&g, &g, &g, 1, 1, 64, false, &[], &[]).unwrap();
++        assert_eq!(stage.folded_positions, 47);
++        assert_eq!(stage.own_positions, 47);
++        assert_eq!(stage.omega_positions, 0);
++        // The one mask code hides the larger of the two stage-0 lists; the one
++        // main code hides the shared list plus the request's list.
++        assert_eq!(stage.folded_mask_tail, stage_tail(47, false));
++        assert_eq!(stage.folded_mask_tail, stage.own_mask_tail);
++        assert_eq!(stage.omega_mask_tail, stage.folded_mask_tail);
++        assert_eq!(stage.folded_main_tail, stage_tail(94, false));
++        assert_eq!(stage.folded_main_tail, stage.own_main_tail);
++    }
++
++    #[test]
++    fn groups_with_other_mask_codes_are_refused() {
++        let g = group(14, 256, 1, 0);
++        let other = group(14, 128, 1, 0);
++        let failure = solve_first_stage_one_mask(&g, &g, &other, 1, 1, 64, false, &[], &[]).unwrap_err();
++        assert_eq!(failure.stage, 0);
++        assert!(failure.point.contains("one main and one mask code"));
++    }
++
++    #[test]
++    fn a_chain_solves_every_stage_from_its_choice() {
++        let choices = vec![
++            StageChoice { log_n: 14, mask_log_n: 14, k: 0, h: 0 },
++            StageChoice { log_n: 14, mask_log_n: 14, k: 2, h: 1 },
++            StageChoice { log_n: 14, mask_log_n: 14, k: 0, h: 0 },
++        ];
++        let start = ChainStart {
++            main_ell: 256,
++            mask_ell: 256,
++            k: 1,
++            h: 0,
++            positions: 4,
++            main_r: 4,
++            mask_r: 4,
++        };
++        let stages = solve_chain_stages(start, 1, false, &choices).unwrap();
++        assert_eq!(stages.len(), 3);
++        assert_eq!(stages[0].k, 1);
++        assert_eq!(stages[0].positions, 4);
++        assert_eq!(stages[0].main_r, 4);
++        assert_eq!(stages[0].mask_r, 4);
++        // The first choice carries the first stage's code lengths, not a
++        // post-first stage: the middle stage is choices[1].
++        assert_eq!(stages[1].k, 2);
++        assert_eq!(stages[1].h, 1);
++        assert_eq!(stages[1].main_ell, 64);
++        assert_eq!(stages[1].mask_ell, 512);
++        assert_eq!(stages[1].positions, 53);
++        assert_eq!(stages[1].main_r, 53);
++        assert_eq!(stages[1].mask_r, 53);
++        assert_eq!(stages[2].k, 0);
++        assert_eq!(stages[2].h, 0);
++        assert_eq!(stages[2].main_ell, 64);
++        assert_eq!(stages[2].mask_ell, 2048);
++        assert_eq!(stages[2].positions, 88);
++        assert_eq!(stages[2].main_r, 88);
++        assert_eq!(stages[2].mask_r, 88);
++        // Every stage opens no more positions than its random tail hides.
++        for stage in &stages {
++            assert!(stage.positions <= stage.main_r.min(stage.mask_r));
++        }
++    }
++
++    #[test]
++    fn an_infeasible_choice_names_its_stage() {
++        let choices = vec![
++            StageChoice { log_n: 14, mask_log_n: 14, k: 0, h: 0 },
++            StageChoice { log_n: 14, mask_log_n: 14, k: 1, h: 0 },
++            StageChoice { log_n: 14, mask_log_n: 14, k: 0, h: 0 },
++        ];
++        let start = ChainStart {
++            main_ell: 256,
++            mask_ell: 256,
++            k: 1,
++            h: 0,
++            positions: 4,
++            main_r: 4,
++            mask_r: 4,
++        };
++        let failure = solve_chain_stages(start, 1, false, &choices).unwrap_err();
++        assert_eq!(failure.stage, 1);
++        assert!(failure.point.contains("holds the stage's rounds"));
++    }
++
++    #[test]
++    fn a_chain_without_a_last_stage_is_refused() {
++        let choices = vec![StageChoice { log_n: 14, mask_log_n: 14, k: 1, h: 0 }];
++        let start = ChainStart {
++            main_ell: 256,
++            mask_ell: 256,
++            k: 1,
++            h: 0,
++            positions: 4,
++            main_r: 4,
++            mask_r: 4,
++        };
++        let failure = solve_chain_stages(start, 1, false, &choices).unwrap_err();
++        assert_eq!(failure.stage, 0);
++        assert!(failure.point.contains("last stage"));
++    }
++}
++
++
++#[cfg(test)]
++mod assembly_tests {
++    use super::*;
++
++    fn diagnostic_input() -> AssemblyInput {
++        let mut own_objects = Vec::new();
++        for _ in 0..16 {
++            own_objects.push(AssemblyOwnObject {
++                member: AssemblyMember::Columns {
++                    entries: 1024,
++                    answers: 1,
++                },
++                shared_too: false,
++                spent: 2,
++            });
++        }
++        own_objects.push(AssemblyOwnObject {
++            member: AssemblyMember::Fixed {
++                main_rows: 1,
++                mask_rows: 0,
++            },
++            shared_too: true,
++            spent: 0,
++        });
++        own_objects.push(AssemblyOwnObject {
++            member: AssemblyMember::Fixed {
++                main_rows: 0,
++                mask_rows: 4,
++            },
++            shared_too: false,
++            spent: 1,
++        });
++        own_objects.push(AssemblyOwnObject {
++            member: AssemblyMember::Columns {
++                entries: 16 * 1024,
++                answers: 1,
++            },
++            shared_too: false,
++            spent: 0,
++        });
++        AssemblyInput {
++            shared_members: vec![
++                AssemblyMember::Fixed {
++                    main_rows: 1,
++                    mask_rows: 0,
++                },
++                AssemblyMember::Fixed {
++                    main_rows: 1,
++                    mask_rows: 0,
++                },
++            ],
++            own_objects,
++            shared_mask_spent: 0,
++            requests: 1,
++            samples: 1,
++            columns: 1024,
++            circle: false,
++        }
++    }
++
++    #[test]
++    fn production_candidates_assemble_for_the_consumer_layout() {
++        let plan = assemble_proximity(&diagnostic_input()).unwrap();
++        // The first stage's codes are the production lines' own/Omega main
++        // code and own mask code; the fold bits come from the real members.
++        assert_eq!(plan.first_main.log_n, 18);
++        assert_eq!(plan.first_main.ell, 1 << 14);
++        assert_eq!(plan.first_mask.log_n, 18);
++        assert_eq!(plan.first_mask.ell, 1 << 8);
++        assert_eq!(plan.shared[0].k, 1);
++        assert_eq!(plan.shared[0].h, 0);
++        assert_eq!(plan.own[0].k, 5);
++        assert_eq!(plan.own[0].h, 2);
++        assert_eq!(plan.shared.len(), 3);
++        assert_eq!(plan.own.len(), 3);
++        // The own stage-0 list fits every object's remaining capacity, and the
++        // minimum is recorded.
++        assert!(plan.own[0].positions <= plan.max_zero);
++        assert!(plan.shared[0].positions <= plan.own[0].main_r.min(plan.own[0].mask_r));
++        assert_eq!(plan.first_main.r, plan.own[0].main_r);
++        assert_eq!(plan.first_mask.r, plan.own[0].mask_r);
++        // The reserved round count is the frozen plan's exact output.
++        let shared_budget = chain_round_budget(
++            &plan.shared.iter().map(|stage| DerivedStage {
++                log_n: stage.log_n,
++                mask_log_n: stage.mask_log_n,
++                k: stage.k,
++                h: stage.h,
++                main_ell: stage.main_ell,
++                mask_ell: stage.mask_ell,
++                r_ood: stage.r_ood,
++                tail: stage.main_r.max(stage.mask_r),
++            }).collect::<Vec<_>>(),
++        )
++        .unwrap();
++        let own_budget = chain_round_budget(
++            &plan.own.iter().map(|stage| DerivedStage {
++                log_n: stage.log_n,
++                mask_log_n: stage.mask_log_n,
++                k: stage.k,
++                h: stage.h,
++                main_ell: stage.main_ell,
++                mask_ell: stage.mask_ell,
++                r_ood: stage.r_ood,
++                tail: stage.main_r.max(stage.mask_r),
++            }).collect::<Vec<_>>(),
++        )
++        .unwrap();
++        assert_eq!(plan.reserved_rounds, shared_budget.total + own_budget.total);
++    }
++
++    #[test]
++    fn an_unformable_group_names_the_failure() {
++        let mut input = diagnostic_input();
++        input.own_objects.clear();
++        let error = assemble_proximity(&input).unwrap_err();
++        assert!(error.contains("no candidate found within the searched domain"));
++        assert!(error.contains("the own group's member rows do not form a group"));
++    }
++}
+diff --git a/zkie/tests/projection_consumer_diagnostic.rs b/zkie/tests/projection_consumer_diagnostic.rs
+index 6f82e10b..154a4b35 100644
+--- a/zkie/tests/projection_consumer_diagnostic.rs
++++ b/zkie/tests/projection_consumer_diagnostic.rs
+@@ -30,8 +30,14 @@ use zkie_ops::proof::column_session::fp_from_signed_word;
+ use zkie_ops::proof::hidden_send_session::{
+     prove_hidden_lin, prove_hidden_lin_hidden, verify_hidden_lin, verify_hidden_lin_hidden,
+     ActivationShape, CommittedActivation, DotMapPlan, HiddenLinPlan, HiddenOutputShape,
+-    HiddenProximityPlan, HiddenSendPlan, HiddenTableProver, IndexMaskPlan, MaskEntryAllocation,
+-    WShape,
++    HiddenProximityPlan, HiddenSendPlan, HiddenTableProver, IndexMaskPlan, IoppStagePlan,
++    MaskEntryAllocation, WShape,
++};
++use zkie_ops::proof::proximity_planner::{
++    assemble_proximity, AssemblyInput, AssemblyMember, AssemblyOwnObject, SolvedStage,
++};
++use zkie::lm_head_stage::{
++    read_manifest, write_manifest, ManifestFile, VerificationManifest,
+ };
+ use zkie_ops::proof::model_commitment::{
+     verify_shared_trace_outputs, ModelCommitmentPublic, SharedTrace,
+@@ -99,6 +105,7 @@ fn artifacts() -> Option<PathBuf> {
+     dirs.into_iter()
+         .rev()
+         .find(|dir| complete(&dir.join("smoke/gpt2-seq16")))
++        .map(|dir| dir.join("smoke/gpt2-seq16"))
+ }
+ 
+ fn complete(base: &Path) -> bool {
+@@ -136,31 +143,15 @@ fn w_shape(positions: u32) -> WShape {
+     WShape::new(COLUMNS, code(), 1, positions, SALT, 100, 1, W_RUN, W_CONFIGURATION).unwrap()
+ }
+ 
+-fn tree_plan(tree_number: u64, leaf_class: u32, main_rows: u64) -> RuntimeTreePlan {
+-    RuntimeTreePlan {
+-        tree_number,
+-        leaf_class,
+-        log_n: CODE_LOG_N,
+-        log_n_zk: CODE_LOG_N,
+-        parts: vec![RuntimeTreePart {
+-            main_symbols: main_rows * E_DEGREE as u64,
+-            mask_symbols: 0,
+-        }],
+-        salt_bytes: SALT,
+-        run: Digest([0x61; 32]),
+-        configuration: Digest([0x62; 32]),
+-    }
+-}
+-
+-fn gu_shape() -> GuShape {
++fn gu_shape(code: CodeParams, mask_log_n: u32) -> GuShape {
+     GuShape {
+         oracle: GU_ORACLE,
+         group: GU_GROUP,
+-        tree: tree_plan(300, 2, 1),
++        tree: tree_plan_with_depth(300, 2, 1, code.log_n, mask_log_n),
+         part: 0,
+         rows_high: true,
+         u: GuOracleShape {
+-            code: code(),
++            code,
+             main_rows: 1,
+             main_deg: E_DEGREE as u32,
+             mask_rows: 0,
+@@ -171,13 +162,13 @@ fn gu_shape() -> GuShape {
+     }
+ }
+ 
+-fn omega_shape() -> OmegaShapePlan {
++fn omega_shape(code: CodeParams, mask_log_n: u32) -> OmegaShapePlan {
+     OmegaShapePlan {
+         oracle: OMEGA_ORACLE,
+         group: GU_GROUP,
+-        tree: tree_plan(301, 2, 1),
++        tree: tree_plan_with_depth(301, 2, 1, code.log_n, mask_log_n),
+         u: GuOracleShape {
+-            code: code(),
++            code,
+             main_rows: 1,
+             main_deg: E_DEGREE as u32,
+             mask_rows: 0,
+@@ -190,12 +181,34 @@ fn omega_shape() -> OmegaShapePlan {
+     }
+ }
+ 
+-fn mask_tree(tree_number: u64) -> MaskTreePlan {
++fn tree_plan_with_depth(
++    tree_number: u64,
++    leaf_class: u32,
++    main_rows: u64,
++    log_n: u32,
++    log_n_zk: u32,
++) -> RuntimeTreePlan {
++    RuntimeTreePlan {
++        tree_number,
++        leaf_class,
++        log_n,
++        log_n_zk,
++        parts: vec![RuntimeTreePart {
++            main_symbols: main_rows * E_DEGREE as u64,
++            mask_symbols: 0,
++        }],
++        salt_bytes: SALT,
++        run: Digest([0x61; 32]),
++        configuration: Digest([0x62; 32]),
++    }
++}
++
++fn mask_tree(tree_number: u64, log_n: u32, mask_rows: u64) -> MaskTreePlan {
+     MaskTreePlan {
+         tree_number,
+         leaf_class: 3,
+-        log_n: CODE_LOG_N,
+-        mask_rows: 1,
++        log_n,
++        mask_rows,
+         salt_bytes: SALT,
+         run: Digest([0x63; 32]),
+         configuration: Digest([0x64; 32]),
+@@ -501,12 +514,12 @@ fn plan_for(
+         masks: vec![Vec::new(); positions as usize],
+         weights: field_rows(activation_rows),
+         proximity: HiddenProximityPlan {
+-            gu: gu_shape(),
+-            omega: omega_shape(),
++            gu: gu_shape(code(), CODE_LOG_N),
++            omega: omega_shape(code(), CODE_LOG_N),
+             code: code(),
+             mask_code: code(),
+-            shared_mask_tree: mask_tree(200),
+-            own_mask_tree: mask_tree(201),
++            shared_mask_tree: mask_tree(200, CODE_LOG_N, 1),
++            own_mask_tree: mask_tree(201, CODE_LOG_N, 1),
+             shared_fresh: 90,
+             own_fresh: 91,
+             column_draws: 2,
+@@ -541,19 +554,19 @@ const INDEX_MASK_RUN: Digest = Digest([0x66; 32]);
+ const DOT_ORACLE: u64 = 12;
+ const DOT_RUN: Digest = Digest([0x67; 32]);
+ 
+-fn index_mask_plan(positions: u32) -> IndexMaskPlan {
++fn index_mask_plan(positions: u32, mask_code: CodeParams) -> IndexMaskPlan {
+     IndexMaskPlan {
+         oracle: INDEX_MASK_ORACLE,
+         group: GROUP,
+-        mask_code: code(),
++        mask_code,
+         mask_rows: 4,
+         answers: 1,
+         openings: 1,
+         tree: RuntimeTreePlan {
+             tree_number: INDEX_MASK_TREE,
+             leaf_class: 1,
+-            log_n: CODE_LOG_N,
+-            log_n_zk: CODE_LOG_N,
++            log_n: mask_code.log_n,
++            log_n_zk: mask_code.log_n,
+             parts: vec![RuntimeTreePart {
+                 main_symbols: 0,
+                 mask_symbols: 4 * E_DEGREE as u64,
+@@ -570,13 +583,13 @@ fn index_mask_plan(positions: u32) -> IndexMaskPlan {
+     }
+ }
+ 
+-fn dot_plan(positions: u32) -> DotMapPlan {
++fn dot_plan(positions: u32, code: CodeParams) -> DotMapPlan {
+     DotMapPlan {
+         oracle: DOT_ORACLE,
+         group: GROUP,
+         shape: WShape::new(
+             positions as u64 * HIDDEN as u64,
+-            code(),
++            code,
+             1,
+             positions,
+             SALT,
+@@ -590,11 +603,101 @@ fn dot_plan(positions: u32) -> DotMapPlan {
+     }
+ }
+ 
++/// The production assembly input of the projection consumer's hidden
++/// session. The own group is one test over the request's W messages, so the
++/// request count is one; Omega is also opened by the shared test.
++fn assembly_input(positions: u32) -> AssemblyInput {
++    let mut own_objects = Vec::new();
++    for _ in 0..positions {
++        own_objects.push(AssemblyOwnObject {
++            member: AssemblyMember::Columns {
++                entries: COLUMNS,
++                answers: 1,
++            },
++            shared_too: false,
++            spent: 2,
++        });
++    }
++    own_objects.push(AssemblyOwnObject {
++        member: AssemblyMember::Fixed {
++            main_rows: 1,
++            mask_rows: 0,
++        },
++        shared_too: true,
++        spent: 0,
++    });
++    own_objects.push(AssemblyOwnObject {
++        member: AssemblyMember::Fixed {
++            main_rows: 0,
++            mask_rows: 4,
++        },
++        shared_too: false,
++        spent: 1,
++    });
++    own_objects.push(AssemblyOwnObject {
++        member: AssemblyMember::Columns {
++            entries: positions as u64 * HIDDEN as u64,
++            answers: 1,
++        },
++        shared_too: false,
++        spent: 0,
++    });
++    AssemblyInput {
++        shared_members: vec![
++            AssemblyMember::Fixed {
++                main_rows: 1,
++                mask_rows: 0,
++            },
++            AssemblyMember::Fixed {
++                main_rows: 1,
++                mask_rows: 0,
++            },
++        ],
++        own_objects,
++        shared_mask_spent: 0,
++        requests: 1,
++        samples: 1,
++        columns: COLUMNS,
++        circle: false,
++    }
++}
++
++fn stage_plan(stage: &SolvedStage) -> IoppStagePlan {
++    IoppStagePlan {
++        main: CodeParams {
++            log_n: stage.log_n,
++            ell: stage.main_ell,
++            r: stage.main_r,
++        },
++        mask: CodeParams {
++            log_n: stage.mask_log_n,
++            ell: stage.mask_ell,
++            r: stage.mask_r,
++        },
++        k: stage.k,
++        h: stage.h,
++        positions: stage.positions as usize,
++        samples: 1,
++        work_bits: 0,
++    }
++}
++
++fn w_shape_with(positions: u32, code: CodeParams) -> WShape {
++    WShape::new(COLUMNS, code, 1, positions, SALT, 100, 1, W_RUN, W_CONFIGURATION).unwrap()
++}
++
++/// The production hidden session plan: the trusted assembly fixes both codes,
++/// the fold bits, the position counts and the BASE counts from the real member
++/// layout. `planner_checked` is on, so the verifier re-derives every value.
+ fn hidden_plan_for(
+     activation: &CommittedActivation,
+     table: &Table,
+     positions: u32,
+ ) -> HiddenLinPlan {
++    let assembled = assemble_proximity(&assembly_input(positions))
++        .expect("the trusted assembly finds the production proximity plan");
++    let code = assembled.first_main;
++    let mask_code = assembled.first_mask;
+     let mut plan = HiddenLinPlan {
+         norm: None,
+         send: HiddenSendPlan {
+@@ -610,7 +713,7 @@ fn hidden_plan_for(
+             group: GROUP,
+             oracle_base: ORACLE_BASE,
+             openings_per_oracle: 2,
+-            w: w_shape(positions),
++            w: w_shape_with(positions, code),
+             index_mask: None,
+             dot: None,
+             expected_dot_root: None,
+@@ -623,29 +726,32 @@ fn hidden_plan_for(
+         masks: vec![Vec::new(); positions as usize],
+         weights: Vec::new(),
+         proximity: HiddenProximityPlan {
+-            gu: gu_shape(),
+-            omega: omega_shape(),
+-            code: code(),
+-            mask_code: code(),
+-            shared_mask_tree: mask_tree(200),
+-            own_mask_tree: mask_tree(201),
++            gu: gu_shape(code, mask_code.log_n),
++            omega: omega_shape(code, mask_code.log_n),
++            code,
++            mask_code,
++            shared_mask_tree: mask_tree(
++                200,
++                mask_code.log_n,
++                1u64 << assembled.shared[0].h,
++            ),
++            own_mask_tree: mask_tree(201, mask_code.log_n, 1u64 << assembled.own[0].h),
+             shared_fresh: 90,
+             own_fresh: 91,
+             column_draws: 2,
+             column_budget: 4,
+             column_work_bits: 0,
+-            shared_base_positions: 2,
+-            own_base_positions: 2,
+-            shared_stages: Vec::new(),
+-            own_stages: Vec::new(),
+-            planner_checked: false,
++            shared_base_positions: assembled.shared.last().unwrap().positions as usize,
++            own_base_positions: assembled.own.last().unwrap().positions as usize,
++            shared_stages: assembled.shared.iter().map(stage_plan).collect(),
++            own_stages: assembled.own.iter().map(stage_plan).collect(),
++            planner_checked: true,
+         },
+         output_relation: None,
+         closure: None,
+     };
+-    plan.send.index_mask = Some(index_mask_plan(positions));
+-    plan.send.dot = Some(dot_plan(positions));
+-    plan.proximity.own_mask_tree.mask_rows = 4;
++    plan.send.index_mask = Some(index_mask_plan(positions, mask_code));
++    plan.send.dot = Some(dot_plan(positions, code));
+     plan
+ }
+ 
+@@ -743,6 +849,102 @@ fn real_projection_consumer_closes_in_hidden_input_mode() {
+         .expect("hidden verify");
+     assert!(!outcome.eval_rows.is_empty());
+ 
++    // The session slot after the trusted table: the canonical session
++    // encoding enters the verification package as session.bin, and the
++    // verifier consumes it from the package, not from the in-memory proof.
++    let session_bytes = messages.encode().expect("session encoding");
++    if let Some(path) = std::env::var_os("ZKIE_PROJECTION_SESSION_DUMP") {
++        fs::write(path, &session_bytes).expect("write session dump");
++    }
++    let package_dir = base.join(format!(".session-package-{}", std::process::id()));
++    let _ = fs::remove_dir_all(&package_dir);
++    fs::create_dir_all(package_dir.join("public")).expect("package dir");
++    fs::hard_link(
++        base.join("commit/public/model-commitment.bin"),
++        package_dir.join("public/model-commitment.bin"),
++    )
++    .expect("link public commitment");
++    fs::hard_link(
++        base.join("proof/proof.bin"),
++        package_dir.join("proof.bin"),
++    )
++    .expect("link trace");
++    fs::write(package_dir.join("session.bin"), &session_bytes).expect("write session");
++    let entry = |role: &str, rel: &str| {
++        let data = fs::read(package_dir.join(rel)).expect("read package file");
++        ManifestFile {
++            role: role.to_string(),
++            path: rel.to_string(),
++            bytes: data.len() as u64,
++            digest: zkie_core::artifact::digest_bytes(&data),
++        }
++    };
++    let manifest = VerificationManifest::new(vec![
++        entry("public-commitment", "public/model-commitment.bin"),
++        entry("trace", "proof.bin"),
++        entry("lin-session", "session.bin"),
++    ])
++    .expect("session package manifest");
++    write_manifest(&package_dir, &manifest).expect("write session manifest");
++    read_manifest(&package_dir)
++        .expect("read session manifest")
++        .verify(&package_dir)
++        .expect("verify session manifest");
++    let package_total: u64 = manifest.files.iter().map(|file| file.bytes).sum();
++    println!("session_package_total_bytes={package_total}");
++    println!("session_bin_bytes={}", session_bytes.len());
++    // The verifier decodes the session from the package and checks the proof
++    // again from those bytes alone.
++    let packaged = fs::read(package_dir.join("session.bin")).expect("read session.bin");
++    let decoded =
++        zkie_ops::proof::hidden_send_session::HiddenLinMessages::decode(&hidden_plan, &packaged)
++            .expect("decode session.bin");
++    let from_package = verify_hidden_lin_hidden(&verifier_plan, session_table.reader(), &decoded)
++        .expect("verify from session.bin");
++    assert_eq!(from_package.seal, outcome.seal);
++    assert_eq!(from_package.eval_rows.len(), positions as usize);
++    let mut tampered_session = packaged.clone();
++    tampered_session[0] ^= 1;
++    fs::write(package_dir.join("session.bin"), &tampered_session).expect("tamper session");
++    assert!(manifest.verify(&package_dir).is_err());
++    let mut trailing_session = packaged.clone();
++    trailing_session.push(0);
++    assert!(
++        zkie_ops::proof::hidden_send_session::HiddenLinMessages::decode(
++            &hidden_plan,
++            &trailing_session
++        )
++        .is_err()
++    );
++    fs::write(package_dir.join("session.bin"), &packaged).expect("restore session");
++    manifest.verify(&package_dir).expect("restored session package");
++    fs::remove_dir_all(&package_dir).expect("remove package");
++
++    // The planner-checked stage lists are re-derived by the verifier: a
++    // changed position, tail, code or BASE count no longer matches.
++    let plan_fault = |plan: &HiddenLinPlan| plan.proximity.fault(&plan.send, None, None);
++    let mut changed = hidden_plan.clone();
++    changed.proximity.own_stages[0].positions += 1;
++    assert!(plan_fault(&changed).is_some());
++    let mut changed = hidden_plan.clone();
++    changed.proximity.code.r += 1;
++    assert!(plan_fault(&changed).is_some());
++    let mut changed = hidden_plan.clone();
++    changed.proximity.mask_code.r += 1;
++    assert!(plan_fault(&changed).is_some());
++    let mut changed = hidden_plan.clone();
++    changed.proximity.own_stages[1].main.ell *= 2;
++    assert!(plan_fault(&changed).is_some());
++    let mut changed = hidden_plan.clone();
++    changed.proximity.own_base_positions += 1;
++    assert!(plan_fault(&changed).is_some());
++    let mut changed = hidden_plan.clone();
++    changed.proximity.shared_stages[0].k = 2;
++    assert!(plan_fault(&changed).is_some());
++    let mut changed = hidden_plan.clone();
++    changed.proximity.planner_checked = false;
++    assert!(plan_fault(&changed).is_none());
++
+     // The hidden mode requires the sampled index-mask message.
+     let mut missing_mask = hidden_plan.clone();
+     missing_mask.send.index_mask = None;
