@@ -162,6 +162,47 @@ pub fn relation_row(
     Ok(row)
 }
 
+/// The owner binding of one sub-proof row form: the committed member whose
+/// mask rows hold the hiding entries and the counted slots, the virtual entry
+/// of each hiding entry in order, the virtual entry of each mask slot, and the
+/// owner and entry of every kept map value. Every number is trusted layout
+/// data, so a slot or kept index is never read against another object.
+#[derive(Clone, Copy, Debug)]
+pub struct RowBinding<'a> {
+    pub mask_member: u64,
+    pub hiding_entries: &'a [u64],
+    pub slot_entries: &'a [u64],
+    pub kept: &'a [(u64, u64)],
+}
+
+/// Converts one masked sumcheck's row claim into a plain row on the owners the
+/// binding names: the hiding coefficients and the slot coefficients become
+/// mask units of the mask member, the kept-map coefficients become main units
+/// of their members, and the form's constant is the row target.
+pub fn row_form_row(
+    binding: &RowBinding,
+    form: &crate::proof::row_claim::RowForm,
+) -> Result<zkie_engine::pcs::request::bat::BatRow> {
+    use zkie_engine::pcs::request::bat::{BatPart, BatRow, BatRowKind};
+    if binding.hiding_entries.len() != form.hiding.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut row = BatRow::new(BatRowKind::Plain);
+    for (entry, coefficient) in binding.hiding_entries.iter().zip(&form.hiding) {
+        row.add_unit(binding.mask_member, BatPart::Mask, *entry, *coefficient);
+    }
+    for term in &form.slots {
+        let entry = *binding.slot_entries.get(term.slot).ok_or(Error::InvalidIndex)?;
+        row.add_unit(binding.mask_member, BatPart::Mask, entry, term.coefficient);
+    }
+    for (index, coefficient) in &form.kept {
+        let (member, entry) = *binding.kept.get(*index).ok_or(Error::InvalidIndex)?;
+        row.add_unit(member, BatPart::Main, entry, *coefficient);
+    }
+    row.target = form.constant;
+    Ok(row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +283,53 @@ mod tests {
         assert_eq!(value, expected);
         // A mapping of another length is refused.
         assert!(relation_row(21, &[3], &coefficients, constant).is_err());
+    }
+
+    #[test]
+    fn a_row_form_lands_on_its_owners() {
+        // The form hides two entries, counts two mask slots and keeps one map
+        // value.
+        let form = crate::proof::row_claim::RowForm {
+            constant: f(31),
+            hiding: vec![f(2), f(3)],
+            slots: vec![
+                crate::proof::row_claim::SlotTerm {
+                    slot: 0,
+                    coefficient: f(5),
+                },
+                crate::proof::row_claim::SlotTerm {
+                    slot: 1,
+                    coefficient: f(7),
+                },
+            ],
+            kept: vec![(0, f(11))],
+        };
+        let binding = RowBinding {
+            mask_member: 4,
+            hiding_entries: &[0, 1],
+            slot_entries: &[9, 12],
+            kept: &[(2, 6)],
+        };
+        let row = row_form_row(&binding, &form).unwrap();
+        assert_eq!(row.target, f(31));
+        // Two hiding units, two slot units on the mask member, one kept unit
+        // on its main member.
+        assert_eq!(row.units.len(), 5);
+        assert_eq!(row.units[2].index, 9);
+        assert_eq!(row.units[4].oracle, 2);
+        assert_eq!(row.units[4].index, 6);
+        // A binding that does not cover the hiding entries or a slot is
+        // refused.
+        let short = RowBinding {
+            hiding_entries: &[0],
+            ..binding
+        };
+        assert!(row_form_row(&short, &form).is_err());
+        let missing_slot = RowBinding {
+            slot_entries: &[9],
+            ..binding
+        };
+        assert!(row_form_row(&missing_slot, &form).is_err());
     }
 
     #[test]
